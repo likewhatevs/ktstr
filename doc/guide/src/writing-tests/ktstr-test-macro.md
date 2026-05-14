@@ -55,7 +55,15 @@ the function inside it.
 
 ## Attributes
 
-All attributes are optional with defaults.
+All attributes are optional with defaults. Most take `key = value`;
+the ten bool attributes (`auto_repro`, `not_starved`, `isolation`,
+`performance_mode`, `no_perf_mode`, `requires_smt`, `expect_err`,
+`fail_on_stall`, `host_only`, `ignore`) also accept a bare form as
+shorthand for `= true` — `#[ktstr_test(host_only)]` is equivalent to
+`#[ktstr_test(host_only = true)]`. `auto_repro` is the only one with
+a `true` default, so bare `auto_repro` is a no-op; use `auto_repro =
+false` to disable. The other nine default to `false` (or `None`),
+so the bare form is the meaningful shorthand for those.
 
 ### Topology
 

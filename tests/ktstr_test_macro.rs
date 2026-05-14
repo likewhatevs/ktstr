@@ -39,6 +39,24 @@ fn host_only_attr_compile(ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
+/// Bare-form bool attribute (`host_only` without `= true`) must be
+/// accepted as syntactic sugar for `host_only = true`.
+#[ktstr_test(host_only)]
+fn bare_host_only_attr_compile(ctx: &Ctx) -> Result<AssertResult> {
+    let _ = ctx;
+    Ok(AssertResult::pass())
+}
+
+/// Bare and explicit bool attributes must coexist in the same attr
+/// list. Pairs `host_only` (bare) with `expect_err = false` (explicit)
+/// and `requires_smt` (bare) to pin that the parser does not require
+/// either form exclusively.
+#[ktstr_test(host_only, expect_err = false, requires_smt)]
+fn bare_mixed_bool_attrs_compile(ctx: &Ctx) -> Result<AssertResult> {
+    let _ = ctx;
+    Ok(AssertResult::pass())
+}
+
 /// `workloads = []` must compile cleanly. The macro accepts an
 /// empty array as "no additional binary workloads composed under
 /// the scheduler" — the same semantic as omitting the attribute.
@@ -118,6 +136,152 @@ fn entry_default_fields() {
 fn entry_host_only_attr() {
     let entry = ktstr::test_support::find_test("host_only_attr_compile").unwrap();
     assert!(entry.host_only);
+}
+
+/// Bare-form `host_only` must thread the same `host_only = true`
+/// onto KtstrTestEntry as the explicit `= true` spelling.
+#[test]
+fn entry_bare_host_only_attr() {
+    let entry = ktstr::test_support::find_test("bare_host_only_attr_compile").unwrap();
+    assert!(
+        entry.host_only,
+        "bare `host_only` must thread the same `host_only = true` onto the entry"
+    );
+}
+
+/// Mixed bare + explicit attribute forms must each thread their
+/// respective field. `host_only` bare must set host_only=true,
+/// `expect_err = false` explicit must keep expect_err=false, and
+/// `requires_smt` bare must set requires_smt=true.
+#[test]
+fn entry_bare_mixed_bool_attrs() {
+    let entry = ktstr::test_support::find_test("bare_mixed_bool_attrs_compile").unwrap();
+    assert!(entry.host_only, "bare `host_only` must set host_only=true");
+    assert!(
+        !entry.expect_err,
+        "explicit `expect_err = false` must keep expect_err=false"
+    );
+    assert!(
+        entry.constraints.requires_smt,
+        "bare `requires_smt` must set constraints.requires_smt=true"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bare-form coverage for every bool attribute. The macro's Meta::Path arm
+// routes each of the 10 bool attrs by string match — pin each one so a typo
+// regression in any arm gets caught by `cargo test --test ktstr_test_macro`.
+// ---------------------------------------------------------------------------
+
+#[ktstr_test(auto_repro, host_only = true)]
+fn bare_auto_repro_compile(_ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+
+#[ktstr_test(not_starved, host_only = true)]
+fn bare_not_starved_compile(_ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+
+#[ktstr_test(isolation, host_only = true)]
+fn bare_isolation_compile(_ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+
+#[ktstr_test(performance_mode, host_only = true)]
+fn bare_performance_mode_compile(_ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+
+#[ktstr_test(no_perf_mode, host_only = true)]
+fn bare_no_perf_mode_compile(_ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+
+#[ktstr_test(expect_err, host_only = true)]
+fn bare_expect_err_compile(_ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+
+#[ktstr_test(fail_on_stall, host_only = true)]
+fn bare_fail_on_stall_compile(_ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+
+#[ktstr_test(ignore, host_only = true)]
+fn bare_ignore_compile(_ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+
+#[test]
+fn entry_bare_auto_repro() {
+    let e = ktstr::test_support::find_test("bare_auto_repro_compile").unwrap();
+    assert!(e.auto_repro, "bare `auto_repro` must set entry.auto_repro=true");
+}
+
+#[test]
+fn entry_bare_not_starved() {
+    let e = ktstr::test_support::find_test("bare_not_starved_compile").unwrap();
+    assert_eq!(
+        e.assert.not_starved,
+        Some(true),
+        "bare `not_starved` must set entry.assert.not_starved=Some(true)"
+    );
+}
+
+#[test]
+fn entry_bare_isolation() {
+    let e = ktstr::test_support::find_test("bare_isolation_compile").unwrap();
+    assert_eq!(
+        e.assert.isolation,
+        Some(true),
+        "bare `isolation` must set entry.assert.isolation=Some(true)"
+    );
+}
+
+#[test]
+fn entry_bare_performance_mode() {
+    let e = ktstr::test_support::find_test("bare_performance_mode_compile").unwrap();
+    assert!(
+        e.performance_mode,
+        "bare `performance_mode` must set entry.performance_mode=true"
+    );
+}
+
+#[test]
+fn entry_bare_no_perf_mode() {
+    let e = ktstr::test_support::find_test("bare_no_perf_mode_compile").unwrap();
+    assert!(
+        e.no_perf_mode,
+        "bare `no_perf_mode` must set entry.no_perf_mode=true"
+    );
+}
+
+#[test]
+fn entry_bare_expect_err() {
+    let e = ktstr::test_support::find_test("bare_expect_err_compile").unwrap();
+    assert!(
+        e.expect_err,
+        "bare `expect_err` must set entry.expect_err=true"
+    );
+}
+
+#[test]
+fn entry_bare_fail_on_stall() {
+    let e = ktstr::test_support::find_test("bare_fail_on_stall_compile").unwrap();
+    assert_eq!(
+        e.assert.fail_on_stall,
+        Some(true),
+        "bare `fail_on_stall` must set entry.assert.fail_on_stall=Some(true)"
+    );
+}
+
+#[test]
+fn entry_bare_ignore_registered() {
+    assert!(
+        ktstr::test_support::find_test("bare_ignore_compile").is_some(),
+        "bare `ignore` must compile and register the test"
+    );
 }
 
 /// Stub `post_vm` callback used by the

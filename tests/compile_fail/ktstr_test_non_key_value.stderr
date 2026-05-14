@@ -1,5 +1,0 @@
-error: expected `key = value`
- --> tests/compile_fail/ktstr_test_non_key_value.rs:3:14
-  |
-3 | #[ktstr_test(something)]
-  |              ^^^^^^^^^

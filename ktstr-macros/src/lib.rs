@@ -21,6 +21,96 @@ const DEFAULT_CORES: u32 = 2;
 const DEFAULT_THREADS: u32 = 1;
 const DEFAULT_MEMORY_MB: u32 = 2048;
 
+/// Canonical list of bool attributes the `#[ktstr_test]` parser
+/// accepts. Used by the NameValue arm's group guard, the bare-form
+/// Path arm's error message, and the user-facing docstring + doc
+/// page; the dispatch table in [`BoolAttrSlots::assign`] is the
+/// matching per-attr behavior. Adding an 11th bool attribute touches:
+/// (1) this slice; (2) [`BoolAttrSlots::assign`]; (3) the matching
+/// field(s) on [`BoolAttrSlots`] plus the state-var declaration and
+/// `bool_slots` wiring inside `ktstr_test`; (4) the codegen gate
+/// that conditionally emits the new field; (5) `KtstrTestEntry` +
+/// its `DEFAULT` in `src/test_support/entry.rs` (cross-crate).
+const BOOL_ATTR_NAMES: &[&str] = &[
+    "auto_repro",
+    "not_starved",
+    "isolation",
+    "performance_mode",
+    "no_perf_mode",
+    "requires_smt",
+    "expect_err",
+    "fail_on_stall",
+    "host_only",
+    "ignore",
+];
+
+/// Mut-ref bundle for the ten bool attributes the `#[ktstr_test]`
+/// parser accepts. The bare-form ([`Meta::Path`]) arm and the
+/// explicit-form ([`Meta::NameValue`]) arm both dispatch on the same
+/// ten idents; routing through [`BoolAttrSlots::assign`] keeps the
+/// per-attr behavior table in a single place. The list of names
+/// itself lives in [`BOOL_ATTR_NAMES`].
+struct BoolAttrSlots<'a> {
+    auto_repro: &'a mut bool,
+    auto_repro_set: &'a mut bool,
+    not_starved: &'a mut Option<bool>,
+    isolation: &'a mut Option<bool>,
+    performance_mode: &'a mut bool,
+    performance_mode_set: &'a mut bool,
+    no_perf_mode: &'a mut bool,
+    no_perf_mode_set: &'a mut bool,
+    requires_smt: &'a mut bool,
+    requires_smt_set: &'a mut bool,
+    expect_err: &'a mut bool,
+    expect_err_set: &'a mut bool,
+    fail_on_stall: &'a mut Option<bool>,
+    host_only: &'a mut bool,
+    host_only_set: &'a mut bool,
+    ignore_test: &'a mut bool,
+}
+
+impl BoolAttrSlots<'_> {
+    /// Assign `value` to the bool slot named `ident`. Returns `true`
+    /// on a known bool ident, `false` otherwise (so the caller can
+    /// route the unknown case to a targeted error). Bare-form
+    /// callers pass `true`; explicit `key = value` callers pass the
+    /// parsed `lit_bool.value()`.
+    fn assign(&mut self, ident: &str, value: bool) -> bool {
+        match ident {
+            "auto_repro" => {
+                *self.auto_repro = value;
+                *self.auto_repro_set = true;
+            }
+            "not_starved" => *self.not_starved = Some(value),
+            "isolation" => *self.isolation = Some(value),
+            "performance_mode" => {
+                *self.performance_mode = value;
+                *self.performance_mode_set = true;
+            }
+            "no_perf_mode" => {
+                *self.no_perf_mode = value;
+                *self.no_perf_mode_set = true;
+            }
+            "requires_smt" => {
+                *self.requires_smt = value;
+                *self.requires_smt_set = true;
+            }
+            "expect_err" => {
+                *self.expect_err = value;
+                *self.expect_err_set = true;
+            }
+            "fail_on_stall" => *self.fail_on_stall = Some(value),
+            "host_only" => {
+                *self.host_only = value;
+                *self.host_only_set = true;
+            }
+            "ignore" => *self.ignore_test = value,
+            _ => return false,
+        }
+        true
+    }
+}
+
 /// Attribute macro that registers a function as a ktstr integration test.
 ///
 /// The annotated function must have signature `fn(&ktstr::scenario::Ctx) ->
@@ -31,8 +121,18 @@ const DEFAULT_MEMORY_MB: u32 = 2048;
 /// 3. Emits a `#[test]` wrapper that boots a VM and runs the function
 ///    inside it.
 ///
-/// Every key=value attribute is optional. The accepted attributes and
-/// their defaults are the fields of
+/// Every attribute is optional. Most take a `key = value` form; the
+/// ten boolean attributes (`auto_repro`, `not_starved`, `isolation`,
+/// `performance_mode`, `no_perf_mode`, `requires_smt`, `expect_err`,
+/// `fail_on_stall`, `host_only`, `ignore`) also accept a bare form
+/// as shorthand for `= true` — e.g. `#[ktstr_test(host_only)]` is
+/// equivalent to `#[ktstr_test(host_only = true)]`. Of the ten,
+/// `auto_repro` is the only one whose default is `true`, so bare
+/// `auto_repro` is a no-op; `auto_repro = false` is the only way
+/// to disable it. The other nine default to `false` (or `None`),
+/// so the bare form is the meaningful shorthand.
+///
+/// The accepted attributes and their defaults are the fields of
 /// [`ktstr::test_support::KtstrTestEntry`] (runtime metadata) and
 /// [`ktstr::assert::Assert`] (checking thresholds). A few are
 /// worth calling out because their names differ from the underlying
@@ -195,6 +295,30 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(e) => return e.to_compile_error().into(),
     };
 
+    // Bundle the ten bool-attr slots so the bare and explicit
+    // dispatch sites route through the same `BoolAttrSlots::assign`
+    // table. Scoped to the parse loop so the underlying vars are
+    // freely accessible to the validation and codegen passes that
+    // follow.
+    let mut bool_slots = BoolAttrSlots {
+        auto_repro: &mut auto_repro,
+        auto_repro_set: &mut auto_repro_set,
+        not_starved: &mut not_starved,
+        isolation: &mut isolation,
+        performance_mode: &mut performance_mode,
+        performance_mode_set: &mut performance_mode_set,
+        no_perf_mode: &mut no_perf_mode,
+        no_perf_mode_set: &mut no_perf_mode_set,
+        requires_smt: &mut requires_smt,
+        requires_smt_set: &mut requires_smt_set,
+        expect_err: &mut expect_err,
+        expect_err_set: &mut expect_err_set,
+        fail_on_stall: &mut fail_on_stall,
+        host_only: &mut host_only,
+        host_only_set: &mut host_only_set,
+        ignore_test: &mut ignore_test,
+    };
+
     for meta in &parsed_attrs {
         match meta {
             Meta::NameValue(MetaNameValue { path, value, .. }) => {
@@ -348,9 +472,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         config_expr = Some(tokens);
                         config_set = true;
                     }
-                    "auto_repro" | "not_starved" | "isolation" | "performance_mode"
-                    | "no_perf_mode" | "requires_smt" | "expect_err" | "fail_on_stall"
-                    | "host_only" | "ignore" => {
+                    _ if BOOL_ATTR_NAMES.contains(&ident.as_str()) => {
                         let lit_bool = match value {
                             syn::Expr::Lit(syn::ExprLit {
                                 lit: syn::Lit::Bool(lb),
@@ -365,39 +487,17 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 .into();
                             }
                         };
-                        match ident.as_str() {
-                            "auto_repro" => {
-                                auto_repro = lit_bool.value();
-                                auto_repro_set = true;
-                            }
-                            "not_starved" => not_starved = Some(lit_bool.value()),
-                            "isolation" => isolation = Some(lit_bool.value()),
-                            "performance_mode" => {
-                                performance_mode = lit_bool.value();
-                                performance_mode_set = true;
-                            }
-                            "no_perf_mode" => {
-                                no_perf_mode = lit_bool.value();
-                                no_perf_mode_set = true;
-                            }
-                            "requires_smt" => {
-                                requires_smt = lit_bool.value();
-                                requires_smt_set = true;
-                            }
-                            "expect_err" => {
-                                expect_err = lit_bool.value();
-                                expect_err_set = true;
-                            }
-                            "fail_on_stall" => fail_on_stall = Some(lit_bool.value()),
-                            "host_only" => {
-                                host_only = lit_bool.value();
-                                host_only_set = true;
-                            }
-                            "ignore" => {
-                                ignore_test = lit_bool.value();
-                            }
-                            _ => unreachable!(),
-                        }
+                        // Guard guarantees `ident` is in [`BOOL_ATTR_NAMES`], so
+                        // [`BoolAttrSlots::assign`] always hits a slot. The
+                        // `assert!` catches a soft invariant: a future bool
+                        // attribute added to [`BOOL_ATTR_NAMES`] but missing
+                        // from [`BoolAttrSlots::assign`] would silently drop
+                        // here without this gate.
+                        assert!(
+                            bool_slots.assign(&ident, lit_bool.value()),
+                            "internal: `{ident}` is in BOOL_ATTR_NAMES but \
+                             BoolAttrSlots::assign has no arm for it",
+                        );
                     }
                     "llcs"
                     | "cores"
@@ -676,15 +776,44 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mb, scheduler, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, extra_sched_args, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, bpf_map_write, expect_err, host_only, ignore, cleanup_budget_ms, post_vm, config, num_snapshots"),
+                            format!("unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mb, scheduler, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, extra_sched_args, extra_include_files, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, bpf_map_write, expect_err, host_only, ignore, cleanup_budget_ms, post_vm, config, num_snapshots"),
                         )
                         .to_compile_error()
                         .into();
                     }
                 }
             }
+            Meta::Path(p) => {
+                // Sugar: a bare bool attr (e.g. `#[ktstr_test(host_only)]`)
+                // is equivalent to `key = true`. Only the ten bool
+                // attributes accept this form; bare ints/floats/paths
+                // still error so a typo on a non-bool attr ("threads"
+                // instead of "threads = 4") routes to a targeted
+                // diagnostic rather than the generic Meta catch-all.
+                let ident = match p.get_ident() {
+                    Some(id) => id.to_string(),
+                    None => {
+                        return syn::Error::new_spanned(p, "expected identifier")
+                            .to_compile_error()
+                            .into();
+                    }
+                };
+                if !bool_slots.assign(&ident, true) {
+                    return syn::Error::new_spanned(
+                        p,
+                        format!(
+                            "bare attribute `{ident}` is not a bool flag; only \
+                             bool attributes accept the bare form. Other \
+                             attributes require `key = value`. Bool attrs: {}.",
+                            BOOL_ATTR_NAMES.join(", "),
+                        ),
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+            }
             other => {
-                return syn::Error::new_spanned(other, "expected `key = value`")
+                return syn::Error::new_spanned(other, "expected `key` or `key = value`")
                     .to_compile_error()
                     .into();
             }
