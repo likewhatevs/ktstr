@@ -1149,7 +1149,7 @@ fn run_step<'a>(
         };
     }
 
-    match &step.hold {
+    match step.hold {
         HoldSpec::Loop { interval } => {
             // Setup runs once before the loop.
             if !step.setup.is_empty() {
@@ -1163,7 +1163,7 @@ fn run_step<'a>(
             while std::time::Instant::now() < deadline {
                 drain_on_err!(scenario, apply_ops(ctx, &mut scenario, &step.ops));
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                if sleep_or_sched_died(remaining.min(*interval), ctx.sched_pid) {
+                if sleep_or_sched_died(remaining.min(interval), ctx.sched_pid) {
                     *sched_died_during_hold = true;
                     return Ok(());
                 }
@@ -1191,9 +1191,9 @@ fn run_step<'a>(
             if guest_comms::is_guest() {
                 crate::vmm::guest_comms::send_scenario_resume();
             }
-            let hold_dur = match &step.hold {
+            let hold_dur = match step.hold {
                 HoldSpec::Frac(f) => Duration::from_secs_f64(ctx.duration.as_secs_f64() * f),
-                HoldSpec::Fixed(d) => *d,
+                HoldSpec::Fixed(d) => d,
                 HoldSpec::Loop { .. } => unreachable!(),
             };
             let remaining = (scenario_start + ctx.duration)

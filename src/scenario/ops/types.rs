@@ -1739,7 +1739,15 @@ impl Step {
 /// How a step advances after its ops are applied. `Frac` and `Fixed`
 /// hold for a duration; `Loop` repeatedly re-applies `Step::ops` at a
 /// fixed interval instead of holding.
-#[derive(Clone, Debug)]
+///
+/// `Copy` because every variant carries only `Copy` types (`f64`,
+/// [`Duration`]); reuse the same `HoldSpec` value across multiple
+/// [`Step::new`] / [`Step::with_defs`] / [`Step::with_payload`]
+/// calls in a construction loop without an explicit `.clone()`.
+/// `Eq` / `Hash` remain impossible because `Frac(f64)` carries a
+/// float; `PartialEq` is not derived because no in-tree caller
+/// compares `HoldSpec` values directly.
+#[derive(Clone, Copy, Debug)]
 pub enum HoldSpec {
     /// Fraction of the total scenario duration.
     Frac(f64),
