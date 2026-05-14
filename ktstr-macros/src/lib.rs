@@ -143,7 +143,14 @@ impl BoolAttrSlots<'_> {
 ///   - `cores = N` (default: inherited from scheduler, or 2)
 ///   - `threads = N` (default: inherited from scheduler, or 1)
 ///   - `numa_nodes = N` (default: inherited from scheduler, or 1)
-///   - `memory_mb = N` (default: 2048)
+///   - `memory_mb = N` — per-test minimum memory in MB (default:
+///     2048). The framework picks `max(total_cpus * 64, 256,
+///     memory_mb)` MB at VM-launch time, so for tests with more
+///     than 32 vCPUs the cpu-based floor dominates the macro
+///     default. Below ~4 vCPUs the absolute 256-MB floor wins if
+///     `memory_mb` is also below it. Setting `memory_mb` above
+///     the cpu-based floor is only meaningful when the test needs
+///     more headroom than the per-cpu budget.
 ///   - `duration_s = N` — scenario run duration in seconds; maps
 ///     onto `KtstrTestEntry::duration`
 ///   - `watchdog_timeout_s = N` — watchdog fire threshold in

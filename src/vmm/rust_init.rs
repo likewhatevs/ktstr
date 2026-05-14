@@ -639,36 +639,52 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // boot the handshake can still be in flight when this
     // statement runs, so `send_sys_rdy()`'s lazy
     // `/dev/vport0p1` open returns `None` and the call returns
-    // `false`. Retry up to 100 × 100 ms (10 s) — generous
-    // enough to absorb cold-cache TRY 1 boots where the
-    // multiport handshake may take several seconds. The host
-    // monitor's pre-sample wait is bounded at 5 s; once that
-    // expires the monitor falls through to its `data_valid`
-    // gate and starts sampling, while THIS retry continues
-    // running in the guest's init thread to deliver SYS_RDY
-    // as soon as the device appears. Late delivery still
-    // promotes the eventfd, but the freeze coordinator's
+    // `false`. Retry for [`sys_rdy_budget_ms(vcpus)`] at 100 ms
+    // cadence (floor 10 s, cap 30 s, 150 ms/vCPU in between) —
+    // the per-vCPU rate absorbs cold-cache TRY 1 boots whose
+    // handshake time scales roughly linearly with topology size,
+    // and the cap prevents pathological topologies from blowing
+    // the watchdog budget. The host monitor's pre-sample wait is
+    // bounded at 5 s; once that expires the monitor falls through
+    // to its `data_valid` gate and starts sampling, while THIS
+    // retry continues running in the guest's init thread to
+    // deliver SYS_RDY as soon as the device appears. Late delivery
+    // still promotes the eventfd, but the freeze coordinator's
     // `Option::take` makes the promotion fire-once so a late
-    // SYS_RDY past the host wait is harmless. If the full 10 s
-    // budget exhausts, the guest continues with the rest of
-    // init and the monitor's `data_valid` gate keeps reads
+    // SYS_RDY past the host wait is harmless. If the full
+    // (scaled) budget exhausts, the guest continues with the rest
+    // of init and the monitor's `data_valid` gate keeps reads
     // safe — the BSS-zero rejection in
     // [`super::super::monitor::reader`]'s sample loop tolerates
     // pre-boot zeros for as long as needed.
     let kern_phys_base = crate::vmm::guest_comms::read_phys_base_from_iomem().unwrap_or(0);
-    for attempt in 0..100 {
+    // `count_online_cpus()` reads `/sys/devices/system/cpu/online`
+    // which `mount_filesystems()` mounted earlier in setup();
+    // fallback to 1 yields the floor budget if the read fails.
+    let vcpus = count_online_cpus().unwrap_or(1);
+    let budget_ms = crate::test_support::sys_rdy_budget_ms(vcpus);
+    // Ceiling division: guarantees retries * 100 ms >= budget_ms so the
+    // guest never exits early when the formula doesn't divide cleanly
+    // (e.g. 67 vCPUs → 10_050 ms → 101 retries / 10_100 ms wall, vs
+    // truncating-floor 100 retries / 10_000 ms wall).
+    let retries = budget_ms.div_ceil(100) as u32;
+    for attempt in 0..retries {
         crate::vmm::guest_comms::send_kern_addrs(kern_phys_base, 0);
         if crate::vmm::guest_comms::send_sys_rdy() {
             break;
         }
-        if attempt == 99 {
+        if attempt + 1 == retries {
             // The tracing subscriber was installed right after
             // `mount_filesystems()`, so this surfaces through the
             // subscriber — which writes to stderr. fd 2 here is
             // still the pre-redirect stderr (kernel console / COM2);
             // after `redirect_stdio_to_bulk_port` runs later, fd 2
             // is a pipe drained into the bulk port forwarder.
-            tracing::warn!("ktstr-init: send_sys_rdy retry budget exhausted (10 s)");
+            tracing::warn!(
+                "ktstr-init: send_sys_rdy retry budget exhausted ({} ms, {} vCPUs)",
+                budget_ms,
+                vcpus
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -1908,7 +1924,7 @@ fn create_cgroup_parent_from_sched_args() {
         Ok(s) => s,
         Err(_) => return,
     };
-    if let Some(path) = crate::test_support::args::parse_cell_parent_cgroup(
+    if let Some(path) = crate::test_support::parse_cell_parent_cgroup(
         sched_args.split_whitespace(),
     ) {
         let cgroup_dir = format!("/sys/fs/cgroup{path}");
@@ -4076,6 +4092,26 @@ mod tests {
         let count = count_online_cpus();
         assert!(count.is_some());
         assert!(count.unwrap() >= 1);
+    }
+
+    /// The send_sys_rdy retry loop bounds its retries by ceiling-
+    /// dividing the host-computed budget by the 100 ms sleep step.
+    /// Pin the budget→retries → wall-time invariant: total wall
+    /// time (retries * 100 ms) must always be `>= budget`, never
+    /// short-change the guest. Couples the host-side budget formula
+    /// to the guest-side retry loop.
+    #[test]
+    fn sys_rdy_retry_count_never_shortens_budget() {
+        use crate::test_support::sys_rdy_budget_ms;
+        for vcpus in [1u32, 32, 67, 126, 192, 200, 512] {
+            let budget_ms = sys_rdy_budget_ms(vcpus);
+            let retries = budget_ms.div_ceil(100);
+            let wall_ms = retries * 100;
+            assert!(
+                wall_ms >= budget_ms,
+                "vcpus={vcpus}: retries*100={wall_ms} must be >= budget={budget_ms}"
+            );
+        }
     }
 
     #[test]
