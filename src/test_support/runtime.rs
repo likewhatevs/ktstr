@@ -223,8 +223,27 @@ pub(crate) fn resolve_vm_topology(
 /// can skip it).
 pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<String>) {
     if let Some(cgroup_path) = entry.scheduler.cgroup_parent {
-        args.push("--cell-parent-cgroup".to_string());
-        args.push(cgroup_path.to_string());
+        // Skip the auto-inject when the user already passes
+        // `--cell-parent-cgroup` (in either form) via the scheduler-
+        // def's `sched_args` or the per-test `extra_sched_args`.
+        // Otherwise clap rejects the duplicate with `cannot be used
+        // multiple times`. The same parser is used guest-side by
+        // `resolve_cgroup_root` and `create_cgroup_parent_from_sched_args`,
+        // so user-supplied two-token AND combined `=` forms produce
+        // identical guest cgroup-tree creation.
+        let user_supplied = super::args::parse_cell_parent_cgroup(
+            entry
+                .scheduler
+                .sched_args
+                .iter()
+                .chain(entry.extra_sched_args.iter())
+                .copied(),
+        )
+        .is_some();
+        if !user_supplied {
+            args.push(super::args::CELL_PARENT_CGROUP_FLAG.to_string());
+            args.push(cgroup_path.to_string());
+        }
     }
     args.extend(entry.scheduler.sched_args.iter().map(|s| s.to_string()));
     args.extend(entry.extra_sched_args.iter().map(|s| s.to_string()));
@@ -596,6 +615,155 @@ mod tests {
                 "--flag".to_string(),
                 "--extra".to_string(),
             ],
+        );
+    }
+
+    /// User-passed `--cell-parent-cgroup /user` via `extra_sched_args`
+    /// suppresses the auto-inject so clap inside the scheduler binary
+    /// doesn't reject the duplicate.
+    #[test]
+    fn append_base_sched_args_dedupes_extra_split_form() {
+        static SCHED: Scheduler = Scheduler::new("s")
+            .cgroup_parent("/sys/fs/cgroup/ktstr");
+        let entry = KtstrTestEntry {
+            name: "sched",
+            scheduler: &SCHED,
+            extra_sched_args: &["--cell-parent-cgroup", "/user"],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+        assert_eq!(
+            args,
+            vec!["--cell-parent-cgroup".to_string(), "/user".to_string()],
+            "auto-inject must be skipped when extra_sched_args carries \
+             --cell-parent-cgroup in two-token form"
+        );
+    }
+
+    /// Combined form (`--cell-parent-cgroup=/user`) must also suppress
+    /// the auto-inject.
+    #[test]
+    fn append_base_sched_args_dedupes_extra_combined_form() {
+        static SCHED: Scheduler = Scheduler::new("s")
+            .cgroup_parent("/sys/fs/cgroup/ktstr");
+        let entry = KtstrTestEntry {
+            name: "sched",
+            scheduler: &SCHED,
+            extra_sched_args: &["--cell-parent-cgroup=/user"],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+        assert_eq!(
+            args,
+            vec!["--cell-parent-cgroup=/user".to_string()],
+            "auto-inject must be skipped when extra_sched_args carries \
+             --cell-parent-cgroup in combined `=` form"
+        );
+    }
+
+    /// Scheduler-def `sched_args` carrying `--cell-parent-cgroup`
+    /// also suppresses the auto-inject.
+    #[test]
+    fn append_base_sched_args_dedupes_scheduler_sched_args() {
+        static SCHED: Scheduler = Scheduler::new("s")
+            .cgroup_parent("/sys/fs/cgroup/ktstr")
+            .sched_args(&["--cell-parent-cgroup", "/user"]);
+        let entry = KtstrTestEntry {
+            name: "sched",
+            scheduler: &SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+        assert_eq!(
+            args,
+            vec!["--cell-parent-cgroup".to_string(), "/user".to_string()],
+            "auto-inject must be skipped when scheduler.sched_args carries \
+             --cell-parent-cgroup"
+        );
+    }
+
+    /// Scheduler-def `sched_args` carrying the combined `=` form also
+    /// suppresses the auto-inject — completes the {source × form}
+    /// 2×2 matrix.
+    #[test]
+    fn append_base_sched_args_dedupes_scheduler_sched_args_combined_form() {
+        static SCHED: Scheduler = Scheduler::new("s")
+            .cgroup_parent("/sys/fs/cgroup/ktstr")
+            .sched_args(&["--cell-parent-cgroup=/user"]);
+        let entry = KtstrTestEntry {
+            name: "sched",
+            scheduler: &SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+        assert_eq!(
+            args,
+            vec!["--cell-parent-cgroup=/user".to_string()],
+            "auto-inject must be skipped when scheduler.sched_args carries \
+             --cell-parent-cgroup in combined `=` form"
+        );
+    }
+
+    /// When BOTH scheduler.sched_args AND extra_sched_args carry
+    /// `--cell-parent-cgroup`, the framework's auto-inject is
+    /// suppressed (`.any()` short-circuits on first match) but the
+    /// user's duplicates flow through unchanged. The framework does
+    /// not dedupe user-supplied duplicates — clap inside the
+    /// scheduler binary will reject them with "cannot be used
+    /// multiple times", as it should. Pin: the framework correctly
+    /// avoids ADDING a third copy.
+    #[test]
+    fn append_base_sched_args_does_not_dedupe_user_dupes() {
+        static SCHED: Scheduler = Scheduler::new("s")
+            .cgroup_parent("/sys/fs/cgroup/ktstr")
+            .sched_args(&["--cell-parent-cgroup", "/sched"]);
+        let entry = KtstrTestEntry {
+            name: "sched",
+            scheduler: &SCHED,
+            extra_sched_args: &["--cell-parent-cgroup", "/extra"],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+        assert_eq!(
+            args,
+            vec![
+                "--cell-parent-cgroup".to_string(),
+                "/sched".to_string(),
+                "--cell-parent-cgroup".to_string(),
+                "/extra".to_string(),
+            ],
+            "framework auto-inject is suppressed; both user-supplied \
+             entries flow through unchanged (user owns the dup)"
+        );
+    }
+
+    /// Empty combined value (`--cell-parent-cgroup=`) suppresses the
+    /// auto-inject — the prefix anchor on `=` catches the empty
+    /// trailing value too. The user's empty value flows through;
+    /// clap inside the scheduler binary will reject it with its own
+    /// diagnostic.
+    #[test]
+    fn append_base_sched_args_treats_empty_value_as_user_supplied() {
+        static SCHED: Scheduler = Scheduler::new("s")
+            .cgroup_parent("/sys/fs/cgroup/ktstr");
+        let entry = KtstrTestEntry {
+            name: "sched",
+            scheduler: &SCHED,
+            extra_sched_args: &["--cell-parent-cgroup="],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+        assert_eq!(
+            args,
+            vec!["--cell-parent-cgroup=".to_string()],
+            "prefix anchors on `=`; empty trailing value still counts \
+             as user-supplied for dedup purposes"
         );
     }
 

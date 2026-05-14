@@ -101,32 +101,71 @@ pub(crate) fn extract_export_output_arg(args: &[String]) -> Option<&str> {
     None
 }
 
+/// Canonical name for the cgroup-parent flag scx schedulers accept.
+/// The auto-inject (`runtime::append_base_sched_args`), the guest's
+/// boot-time cgroup-tree creator (`vmm::rust_init`), and this guest-
+/// side resolver all read it through [`parse_cell_parent_cgroup`].
+pub(crate) const CELL_PARENT_CGROUP_FLAG: &str = "--cell-parent-cgroup";
+
+/// Compile-time guard: the literal `--cell-parent-cgroup=` prefix
+/// used inside [`parse_cell_parent_cgroup`] must equal
+/// [`CELL_PARENT_CGROUP_FLAG`] with a trailing `=`. A future rename
+/// of the flag that misses the literal would fail this const-eval
+/// instead of silently mismatching at runtime.
+const _: () = {
+    let flag = CELL_PARENT_CGROUP_FLAG.as_bytes();
+    let prefix = b"--cell-parent-cgroup=";
+    assert!(prefix.len() == flag.len() + 1);
+    let mut i = 0;
+    while i < flag.len() {
+        assert!(prefix[i] == flag[i]);
+        i += 1;
+    }
+    assert!(prefix[flag.len()] == b'=');
+};
+
+/// Find the value passed to `--cell-parent-cgroup` in an argv stream,
+/// accepting both the two-token form (`["--cell-parent-cgroup",
+/// "/path"]`) and the combined form (`["--cell-parent-cgroup=/path"]`).
+/// Returns `None` when the flag is absent. First match wins.
+pub(crate) fn parse_cell_parent_cgroup<'a>(
+    args: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    // The combined-form prefix is `CELL_PARENT_CGROUP_FLAG` plus `=`.
+    // Inlined here so the strip_prefix sees a const-foldable literal;
+    // keep the spellings in sync if the flag ever changes.
+    const COMBINED_PREFIX: &str = "--cell-parent-cgroup=";
+    let mut iter = args.into_iter();
+    while let Some(a) = iter.next() {
+        if a == CELL_PARENT_CGROUP_FLAG {
+            return iter.next();
+        }
+        if let Some(rest) = a.strip_prefix(COMBINED_PREFIX) {
+            return Some(rest);
+        }
+    }
+    None
+}
+
 /// Derive the CgroupManager root path for guest-side dispatch.
 ///
-/// Reads `/sched_args` to find `--cell-parent-cgroup <path>`. When
-/// found, constructs `/sys/fs/cgroup{path}`. Falls back to
-/// `/sys/fs/cgroup/ktstr` when the arg is absent.
+/// Reads `/sched_args` to find `--cell-parent-cgroup` (either form),
+/// then falls back to process argv. When found, constructs
+/// `/sys/fs/cgroup{path}`. Falls back to `/sys/fs/cgroup/ktstr` when
+/// the arg is absent.
 pub(crate) fn resolve_cgroup_root(args: &[String]) -> String {
     // Check guest args for --cell-parent-cgroup (passed via sched_args
     // which are written to /sched_args in the initramfs).
     let sched_args = std::fs::read_to_string("/sched_args").unwrap_or_default();
-    let parts: Vec<&str> = sched_args.split_whitespace().collect();
-    for i in 0..parts.len() {
-        if parts[i] == "--cell-parent-cgroup"
-            && let Some(&path) = parts.get(i + 1)
-        {
-            return format!("/sys/fs/cgroup{path}");
-        }
+    if let Some(path) =
+        parse_cell_parent_cgroup(sched_args.split_whitespace())
+    {
+        return format!("/sys/fs/cgroup{path}");
     }
     // Also check the process args in case --cell-parent-cgroup was
     // passed directly (e.g., via extra_sched_args on the test entry).
-    let mut iter = args.iter();
-    while let Some(a) = iter.next() {
-        if a == "--cell-parent-cgroup"
-            && let Some(path) = iter.next()
-        {
-            return format!("/sys/fs/cgroup{path}");
-        }
+    if let Some(path) = parse_cell_parent_cgroup(args.iter().map(String::as_str)) {
+        return format!("/sys/fs/cgroup{path}");
     }
     "/sys/fs/cgroup/ktstr".to_string()
 }
@@ -310,5 +349,79 @@ mod tests {
     fn extract_export_output_arg_empty_value() {
         let args = vec!["test_bin".into(), "--ktstr-export-output=".into()];
         assert!(extract_export_output_arg(&args).is_none());
+    }
+
+    // -- parse_cell_parent_cgroup --
+
+    #[test]
+    fn parse_cell_parent_cgroup_two_token_form() {
+        let argv = ["--cell-parent-cgroup", "/user", "--other-flag"];
+        assert_eq!(
+            parse_cell_parent_cgroup(argv.iter().copied()),
+            Some("/user")
+        );
+    }
+
+    #[test]
+    fn parse_cell_parent_cgroup_combined_form() {
+        let argv = ["--other-flag", "--cell-parent-cgroup=/user"];
+        assert_eq!(
+            parse_cell_parent_cgroup(argv.iter().copied()),
+            Some("/user")
+        );
+    }
+
+    #[test]
+    fn parse_cell_parent_cgroup_empty_combined_value() {
+        let argv = ["--cell-parent-cgroup="];
+        assert_eq!(parse_cell_parent_cgroup(argv.iter().copied()), Some(""));
+    }
+
+    #[test]
+    fn parse_cell_parent_cgroup_absent() {
+        let argv = ["--unrelated", "--other-flag=value"];
+        assert!(parse_cell_parent_cgroup(argv.iter().copied()).is_none());
+    }
+
+    #[test]
+    fn parse_cell_parent_cgroup_two_token_missing_value() {
+        let argv = ["--cell-parent-cgroup"];
+        assert_eq!(parse_cell_parent_cgroup(argv.iter().copied()), None);
+    }
+
+    #[test]
+    fn parse_cell_parent_cgroup_first_match_wins() {
+        let argv = [
+            "--cell-parent-cgroup=/first",
+            "--cell-parent-cgroup",
+            "/second",
+        ];
+        assert_eq!(
+            parse_cell_parent_cgroup(argv.iter().copied()),
+            Some("/first")
+        );
+    }
+
+    #[test]
+    fn parse_cell_parent_cgroup_first_match_wins_two_token_then_combined() {
+        let argv = [
+            "--cell-parent-cgroup",
+            "/first",
+            "--cell-parent-cgroup=/second",
+        ];
+        assert_eq!(
+            parse_cell_parent_cgroup(argv.iter().copied()),
+            Some("/first")
+        );
+    }
+
+    /// Sibling long flags like `--cell-parent-cgroup-extra=val` must
+    /// NOT match. The combined-form check anchors on `=` immediately
+    /// after the canonical name — a longer flag with the same prefix
+    /// followed by `-` falls through.
+    #[test]
+    fn parse_cell_parent_cgroup_no_match_on_sibling_long_flag() {
+        let argv = ["--cell-parent-cgroup-extra=val"];
+        assert!(parse_cell_parent_cgroup(argv.iter().copied()).is_none());
     }
 }

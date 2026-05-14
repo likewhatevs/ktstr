@@ -244,6 +244,14 @@ declare_scheduler!(MITOSIS, {
 This creates `/sys/fs/cgroup/ktstr` in the guest and passes
 `--cell-parent-cgroup /ktstr` to the scheduler binary.
 
+If the scheduler-def's `sched_args` or a test's `extra_sched_args`
+already contains `--cell-parent-cgroup` (either as
+`["--cell-parent-cgroup", "/path"]` or
+`["--cell-parent-cgroup=/path"]`), the framework's auto-inject is
+suppressed so the scheduler binary doesn't reject a duplicate flag.
+The user's value wins, and the guest-side cgroup directory is
+created at the user-specified path.
+
 ## Config file
 
 `Scheduler.config_file` specifies a host-side path to an opaque

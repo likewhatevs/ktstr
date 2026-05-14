@@ -1889,8 +1889,9 @@ fn write_com2(msg: &str) {
 }
 
 /// Create the cgroup parent directory specified by `--cell-parent-cgroup`
-/// in `/sched_args`. The directory must exist before the scheduler starts
-/// because the scheduler expects it at startup.
+/// (two-token or `=`-combined form) in `/sched_args`. The directory must
+/// exist before the scheduler starts because the scheduler expects it at
+/// startup.
 ///
 /// In cgroup v2, a controller is only visible inside a cgroup when its
 /// parent's `cgroup.subtree_control` enables it. The kernel enforces
@@ -1907,16 +1908,12 @@ fn create_cgroup_parent_from_sched_args() {
         Ok(s) => s,
         Err(_) => return,
     };
-    let args: Vec<&str> = sched_args.split_whitespace().collect();
-    for i in 0..args.len() {
-        if args[i] == "--cell-parent-cgroup"
-            && let Some(&path) = args.get(i + 1)
-        {
-            let cgroup_dir = format!("/sys/fs/cgroup{path}");
-            mkdir_p(&cgroup_dir);
-            enable_subtree_controllers_to(&cgroup_dir);
-            return;
-        }
+    if let Some(path) = crate::test_support::args::parse_cell_parent_cgroup(
+        sched_args.split_whitespace(),
+    ) {
+        let cgroup_dir = format!("/sys/fs/cgroup{path}");
+        mkdir_p(&cgroup_dir);
+        enable_subtree_controllers_to(&cgroup_dir);
     }
 }
 
