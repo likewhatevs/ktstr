@@ -37,6 +37,34 @@ use crate::verifier::{SCHED_OUTPUT_START, parse_sched_output};
 
 use super::runtime::{config_content_parts, config_file_parts, verbose, vm_timeout_from_entry};
 
+/// Marker error type attached as `anyhow::Context` to the failure
+/// `Err` produced when an scx_bpf_error matcher
+/// ([`crate::assert::Assert::expect_scx_bpf_error_contains`] or
+/// [`crate::assert::Assert::expect_scx_bpf_error_matches`]) mismatched
+/// the captured scheduler log / sched_ext dump corpus.
+///
+/// Dispatch (`crate::test_support::dispatch::result_to_exit_code`)
+/// downcasts the error chain for this marker in the `expect_err = true`
+/// branch and refuses to invert the verdict to a pass — a reproducer
+/// that fired the WRONG bug must fail loudly, not silently invert to
+/// "test passed" via `expect_err`. Without the marker, the matcher's
+/// diagnostic surfaces in stderr but the exit code follows the normal
+/// expect_err inversion path.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScxBpfErrorMatcherMismatch;
+
+impl std::fmt::Display for ScxBpfErrorMatcherMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "scx_bpf_error matcher mismatch — the reproducer matcher rejected \
+             this failure mode; expect_err inversion bypassed"
+        )
+    }
+}
+
+impl std::error::Error for ScxBpfErrorMatcherMismatch {}
+
 // ---------------------------------------------------------------------------
 // Failure-message constants
 // ---------------------------------------------------------------------------
@@ -1793,6 +1821,31 @@ fn evaluate_vm_result(
             )));
         }
 
+        // Reproducer-mode scx_bpf_error matcher. Runs the configured
+        // `expect_scx_bpf_error_contains` / `_matches` patterns against
+        // the combined scheduler log + sched_ext dump corpus — the two
+        // host-side surfaces where scx_bpf_error printk text lands.
+        // Matcher details (mismatch + misuse diagnostics) fold into
+        // `check_result.details` so the failure-message construction
+        // path renders them alongside the rest of the verdict.
+        //
+        // Gated on at least one matcher being configured so the
+        // common-path (no matcher) doesn't allocate the corpus string
+        // — the evaluator's own early-return covers the no-matcher
+        // case but only after the format! has already run.
+        let matcher_configured = merged_assert.expect_scx_bpf_error_contains.is_some()
+            || merged_assert.expect_scx_bpf_error_matches.is_some();
+        let matcher_details = if matcher_configured {
+            let matcher_corpus = format!("{sched_log_input}\n{dump_section}");
+            merged_assert.evaluate_scx_bpf_error_match(&matcher_corpus, entry.expect_err)
+        } else {
+            Vec::new()
+        };
+        let matcher_mismatch = !matcher_details.is_empty();
+        for d in matcher_details {
+            check_result.merge(AssertResult::fail(d));
+        }
+
         // Write sidecar before checking pass/fail so both outcomes are captured.
         // A sidecar write failure is logged but not propagated: the test
         // verdict itself is still valid — only post-run stats tooling
@@ -1907,7 +1960,19 @@ fn evaluate_vm_result(
                 dump_section,
                 repro_section,
             );
-            anyhow::bail!("{msg}");
+            // When the scx_bpf_error matcher contributed a mismatch
+            // detail, wrap the Err with [`ScxBpfErrorMatcherMismatch`]
+            // so the dispatch-time expect_err inversion bypasses this
+            // failure (a reproducer with a matcher mismatch fails the
+            // test even though expect_err = true would normally invert
+            // a failure into a pass). When the matcher matched (or was
+            // unset), the normal expect_err inversion path applies.
+            let err = anyhow::anyhow!("{msg}");
+            return Err(if matcher_mismatch {
+                err.context(ScxBpfErrorMatcherMismatch)
+            } else {
+                err
+            });
         }
 
         // Evaluate monitor data against thresholds when a scheduler is running.

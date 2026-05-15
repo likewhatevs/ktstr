@@ -214,6 +214,20 @@ impl BoolAttrSlots<'_> {
 ///     via a `const` assertion against `Payload::config_file_def`,
 ///     and again at runtime by `KtstrTestEntry::validate` so direct
 ///     programmatic-entry construction sees the same gate.
+///   - `expect_scx_bpf_error_contains = EXPR` — literal-substring
+///     matcher applied to the captured `scx_bpf_error` text in
+///     reproducer mode. `EXPR` is either a string literal or a path
+///     to a `const &'static str`. Maps onto
+///     `Assert::expect_scx_bpf_error_contains`. Requires
+///     `expect_err = true` (rejected at construction otherwise by
+///     `KtstrTestEntry::validate`). Empty strings panic at
+///     construction. When both `_contains` and `_matches` are set,
+///     the evaluator ANDs them — every set matcher must hit.
+///   - `expect_scx_bpf_error_matches = EXPR` — regex matcher with
+///     the same accepted forms and gating as `_contains`. Maps onto
+///     `Assert::expect_scx_bpf_error_matches`. Empty patterns panic
+///     at construction; invalid regex syntax fails the test loudly
+///     at evaluation rather than silently matching nothing.
 #[proc_macro_attribute]
 pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
@@ -259,6 +273,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut min_page_locality: Option<f64> = None;
     let mut max_cross_node_migration_ratio: Option<f64> = None;
     let mut max_slow_tier_ratio: Option<f64> = None;
+    let mut expect_scx_bpf_error_contains_tokens: Option<proc_macro2::TokenStream> = None;
+    let mut expect_scx_bpf_error_matches_tokens: Option<proc_macro2::TokenStream> = None;
     let mut extra_sched_args: Vec<String> = Vec::new();
     let mut extra_include_files: Vec<String> = Vec::new();
     let mut min_numa_nodes: u32 = 1;
@@ -478,6 +494,62 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         };
                         config_expr = Some(tokens);
                         config_set = true;
+                    }
+                    "expect_scx_bpf_error_contains" | "expect_scx_bpf_error_matches" => {
+                        // Both attrs take a string literal or a path to a
+                        // `const &'static str`. Field type is
+                        // `Option<&'static str>` so any other expression
+                        // shape would fail to borrow as `'static` or
+                        // coerce — reject early with a targeted error
+                        // rather than letting rustc surface a confusing
+                        // borrow/type-mismatch at the spread site.
+                        let tokens = match value {
+                            syn::Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Str(_),
+                                ..
+                            }) => quote! { #value },
+                            syn::Expr::Path(_) => quote! { #value },
+                            _ => {
+                                return syn::Error::new_spanned(
+                                    value,
+                                    format!(
+                                        "expected string literal or path to a \
+                                         `const &'static str` for `{ident}` (e.g. \
+                                         `{ident} = \"apply_cell_config returned \
+                                         -EINVAL\"` or `{ident} = MY_PATTERN`)",
+                                    ),
+                                )
+                                .to_compile_error()
+                                .into();
+                            }
+                        };
+                        match ident.as_str() {
+                            "expect_scx_bpf_error_contains" => {
+                                if expect_scx_bpf_error_contains_tokens.is_some() {
+                                    return syn::Error::new_spanned(
+                                        path,
+                                        "duplicate `expect_scx_bpf_error_contains = ...` — \
+                                         each test declares at most one literal matcher",
+                                    )
+                                    .to_compile_error()
+                                    .into();
+                                }
+                                expect_scx_bpf_error_contains_tokens = Some(tokens);
+                            }
+                            "expect_scx_bpf_error_matches" => {
+                                if expect_scx_bpf_error_matches_tokens.is_some() {
+                                    return syn::Error::new_spanned(
+                                        path,
+                                        "duplicate `expect_scx_bpf_error_matches = ...` — \
+                                         each test declares at most one regex matcher",
+                                    )
+                                    .to_compile_error()
+                                    .into();
+                                }
+                                expect_scx_bpf_error_matches_tokens = Some(tokens);
+                            }
+                            _ => unreachable!(),
+                        }
                     }
                     _ if BOOL_ATTR_NAMES.contains(&ident.as_str()) => {
                         let lit_bool = match value {
@@ -783,7 +855,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mb, scheduler, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, extra_sched_args, extra_include_files, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, bpf_map_write, expect_err, host_only, ignore, cleanup_budget_ms, post_vm, config, num_snapshots"),
+                            format!("unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mb, scheduler, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, expect_scx_bpf_error_contains, expect_scx_bpf_error_matches, extra_sched_args, extra_include_files, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, bpf_map_write, expect_err, host_only, ignore, cleanup_budget_ms, post_vm, config, num_snapshots"),
                         )
                         .to_compile_error()
                         .into();
@@ -1197,7 +1269,17 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         || max_keep_last_rate.is_some()
         || min_page_locality.is_some()
         || max_cross_node_migration_ratio.is_some()
-        || max_slow_tier_ratio.is_some();
+        || max_slow_tier_ratio.is_some()
+        || expect_scx_bpf_error_contains_tokens.is_some()
+        || expect_scx_bpf_error_matches_tokens.is_some();
+    let expect_scx_bpf_error_contains_field = match &expect_scx_bpf_error_contains_tokens {
+        Some(tokens) => quote! { Some(#tokens) },
+        None => quote! { None },
+    };
+    let expect_scx_bpf_error_matches_field = match &expect_scx_bpf_error_matches_tokens {
+        Some(tokens) => quote! { Some(#tokens) },
+        None => quote! { None },
+    };
     let assert_field = if any_assert_set {
         quote! {
             assert: ::ktstr::assert::Assert {
@@ -1221,6 +1303,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                 min_page_locality: #page_locality_tokens,
                 max_cross_node_migration_ratio: #cross_node_mig_tokens,
                 max_slow_tier_ratio: #slow_tier_tokens,
+                expect_scx_bpf_error_contains: #expect_scx_bpf_error_contains_field,
+                expect_scx_bpf_error_matches: #expect_scx_bpf_error_matches_field,
             },
         }
     } else {

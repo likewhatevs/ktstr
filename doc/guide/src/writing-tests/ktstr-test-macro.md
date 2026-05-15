@@ -144,6 +144,8 @@ reusable examples (`SCHBENCH`, `SCHBENCH_HINTED`, `SCHBENCH_JSON`).
 | `min_page_locality` | inherited | Min fraction of pages on expected NUMA nodes (0.0-1.0) |
 | `max_cross_node_migration_ratio` | inherited | Max ratio of NUMA-migrated pages to total pages (0.0-1.0) |
 | `max_slow_tier_ratio` | inherited | Max fraction of pages on memory-only (CXL) nodes (0.0-1.0) |
+| `expect_scx_bpf_error_contains = "literal"` | `None` | Reproducer-mode literal-substring matcher for the captured scx_bpf_error text. Requires `expect_err = true`. Empty strings panic at construction. Composes with `expect_scx_bpf_error_matches` via AND semantics. |
+| `expect_scx_bpf_error_matches = "regex"` | `None` | Reproducer-mode regex matcher for the captured scx_bpf_error text. Requires `expect_err = true`. Empty patterns panic at construction; invalid regex syntax fails the test loudly (no silent vacuous match). Composes with `expect_scx_bpf_error_contains` via AND semantics. |
 
 `not_starved = true` enables three distinct checks: starvation (any
 worker with zero work units), fairness spread (max-min off-CPU% below

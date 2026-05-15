@@ -1037,6 +1037,20 @@ impl KtstrTestEntry {
                 self.name,
             );
         }
+        if (self.assert.expect_scx_bpf_error_contains.is_some()
+            || self.assert.expect_scx_bpf_error_matches.is_some())
+            && !self.expect_err
+        {
+            anyhow::bail!(
+                "KtstrTestEntry '{}' sets an scx_bpf_error matcher \
+                 (expect_scx_bpf_error_contains or expect_scx_bpf_error_matches) \
+                 without expect_err = true — a reproducer matcher narrows \
+                 which failure counts as the expected bug and only \
+                 applies to expected-error tests. Set expect_err = true \
+                 or drop the matcher.",
+                self.name,
+            );
+        }
         // Periodic snapshots route through SnapshotBridge::store, which
         // FIFO-evicts at MAX_STORED_SNAPSHOTS. Allowing num_snapshots
         // past the cap would silently lose the earliest samples — a
@@ -2126,6 +2140,117 @@ mod tests {
         entry_none
             .validate()
             .expect("no config_file_def + no content must validate");
+    }
+
+    /// `validate()` rejects an entry that sets
+    /// `expect_scx_bpf_error_contains` without also setting
+    /// `expect_err = true`. The matcher narrows which failure counts
+    /// as the expected bug, so it only makes sense on expected-error
+    /// tests. Without the gate a matcher on a pass-expected entry
+    /// would be silently inert.
+    #[test]
+    fn validate_rejects_expect_scx_bpf_error_contains_without_expect_err() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "bad_contains",
+            func: good_test_func,
+            assert: crate::assert::Assert::NO_OVERRIDES
+                .expect_scx_bpf_error_contains("apply_cell_config"),
+            expect_err: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("matcher without expect_err must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("expect_scx_bpf_error_contains") && msg.contains("expect_err"),
+            "diagnostic must name BOTH the matcher field AND expect_err: {msg}",
+        );
+        assert!(
+            msg.contains("bad_contains"),
+            "error must name the offending entry: {msg}",
+        );
+    }
+
+    /// Symmetric with the `_contains` rejection: setting
+    /// `expect_scx_bpf_error_matches` without `expect_err = true`
+    /// must also reject. Pins that the gate triggers on either
+    /// matcher field — a future addition that only checked one
+    /// would leave the other silently inert.
+    #[test]
+    fn validate_rejects_expect_scx_bpf_error_matches_without_expect_err() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "bad_matches",
+            func: good_test_func,
+            assert: crate::assert::Assert::NO_OVERRIDES
+                .expect_scx_bpf_error_matches("apply_cell_config:[0-9]+"),
+            expect_err: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("matcher without expect_err must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("expect_scx_bpf_error_matches") && msg.contains("expect_err"),
+            "diagnostic must name BOTH the matcher field AND expect_err: {msg}",
+        );
+        assert!(
+            msg.contains("bad_matches"),
+            "error must name the offending entry: {msg}",
+        );
+    }
+
+    /// Happy path: scx_bpf_error matchers paired with
+    /// `expect_err = true` must validate cleanly. Pins the polarity
+    /// of the gate so a future tightening that rejected every entry
+    /// with a matcher would surface here instead of silently
+    /// breaking every reproducer test.
+    #[test]
+    fn validate_accepts_expect_scx_bpf_error_matchers_with_expect_err() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry_contains = KtstrTestEntry {
+            name: "good_contains",
+            func: good_test_func,
+            assert: crate::assert::Assert::NO_OVERRIDES
+                .expect_scx_bpf_error_contains("apply_cell_config"),
+            expect_err: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        entry_contains
+            .validate()
+            .expect("contains matcher + expect_err=true must validate");
+        let entry_matches = KtstrTestEntry {
+            name: "good_matches",
+            func: good_test_func,
+            assert: crate::assert::Assert::NO_OVERRIDES
+                .expect_scx_bpf_error_matches("apply_cell_config:[0-9]+"),
+            expect_err: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        entry_matches
+            .validate()
+            .expect("matches matcher + expect_err=true must validate");
+        let entry_both = KtstrTestEntry {
+            name: "good_both",
+            func: good_test_func,
+            assert: crate::assert::Assert::NO_OVERRIDES
+                .expect_scx_bpf_error_contains("apply_cell_config")
+                .expect_scx_bpf_error_matches("apply_cell_config:[0-9]+"),
+            expect_err: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        entry_both
+            .validate()
+            .expect("both matchers + expect_err=true must validate");
     }
 
     #[test]

@@ -1681,6 +1681,52 @@ pub struct Assert {
     /// this fraction of pages land on memory-only nodes. Requires
     /// `slow_tier_nodes` to be set at evaluation time.
     pub max_slow_tier_ratio: Option<f64>,
+
+    /// Reproducer-mode literal-substring matcher for the captured
+    /// `scx_bpf_error` text. When `Some(literal)`, the eval pipeline
+    /// scans the combined scheduler log + sched_ext dump for a
+    /// substring match against `literal` and fails the test if the
+    /// substring is absent.
+    ///
+    /// Use this for the common case of pinning an exact error
+    /// fragment like `apply_cell_config returned -EINVAL` without
+    /// having to escape regex metacharacters. For pattern matching
+    /// with anchors / character classes / wildcards, use
+    /// [`Self::expect_scx_bpf_error_matches`] instead — the two
+    /// fields are orthogonal and can both be set (both must match).
+    ///
+    /// Requires the entry's `expect_err = true` — a reproducer
+    /// matcher only fires on expected-error tests; setting this on
+    /// a passing test would assert "the test passed AND contained
+    /// this error text," which is contradictory. The eval-time
+    /// validation rejects that combination with a clear diagnostic.
+    ///
+    /// Stored as `&'static str` so the const-fn `Self::merge`
+    /// composes without cloning. Empty strings are rejected at
+    /// evaluation (an empty literal would silently match every
+    /// message and turn this assertion into a no-op).
+    pub expect_scx_bpf_error_contains: Option<&'static str>,
+
+    /// Reproducer-mode regex matcher for the captured `scx_bpf_error`
+    /// text. When `Some(pattern)`, the eval pipeline compiles the
+    /// pattern via the `regex` crate, scans the combined scheduler
+    /// log + sched_ext dump, and fails the test if the regex does
+    /// not match anywhere in the corpus.
+    ///
+    /// The pattern is a full regex — special characters
+    /// (`. * + ? ( ) [ ] { } | ^ $ \`) carry their regex meaning.
+    /// For literal-substring matching, prefer
+    /// [`Self::expect_scx_bpf_error_contains`] to avoid escape
+    /// footguns. Patterns are anchored as you write them: bare
+    /// `apply_cell_config` matches as a substring, `^apply_cell_config$`
+    /// matches the full message line.
+    ///
+    /// Requires the entry's `expect_err = true` — same rationale
+    /// as [`Self::expect_scx_bpf_error_contains`]. Invalid regex
+    /// syntax fails the test at evaluation time with a diagnostic
+    /// naming the pattern; the test is not silently passed. Empty
+    /// patterns are rejected (an empty regex matches everywhere).
+    pub expect_scx_bpf_error_matches: Option<&'static str>,
 }
 
 impl Assert {
@@ -1733,6 +1779,16 @@ impl Assert {
             &self.max_cross_node_migration_ratio,
         );
         row(&mut out, "max_slow_tier_ratio", &self.max_slow_tier_ratio);
+        row(
+            &mut out,
+            "expect_scx_bpf_error_contains",
+            &self.expect_scx_bpf_error_contains,
+        );
+        row(
+            &mut out,
+            "expect_scx_bpf_error_matches",
+            &self.expect_scx_bpf_error_matches,
+        );
         out
     }
 
@@ -1760,6 +1816,8 @@ impl Assert {
         min_page_locality: None,
         max_cross_node_migration_ratio: None,
         max_slow_tier_ratio: None,
+        expect_scx_bpf_error_contains: None,
+        expect_scx_bpf_error_matches: None,
     };
 
     /// Baseline of the runtime merge chain
@@ -2024,6 +2082,14 @@ impl Assert {
                 Some(v) => Some(v),
                 None => self.max_slow_tier_ratio,
             },
+            expect_scx_bpf_error_contains: match other.expect_scx_bpf_error_contains {
+                Some(v) => Some(v),
+                None => self.expect_scx_bpf_error_contains,
+            },
+            expect_scx_bpf_error_matches: match other.expect_scx_bpf_error_matches {
+                Some(v) => Some(v),
+                None => self.expect_scx_bpf_error_matches,
+            },
         }
     }
 
@@ -2157,6 +2223,147 @@ impl Assert {
         }
         self.enforce_monitor_thresholds = true;
         self
+    }
+
+    /// Const-fn builder for [`Self::expect_scx_bpf_error_contains`].
+    /// Chains with the other const-fn setters so a scheduler-def or
+    /// per-test assertion block can compose
+    /// `Assert::NO_OVERRIDES.expect_scx_bpf_error_contains(...).check_not_starved()`.
+    ///
+    /// Empty strings panic at construction (an empty literal would
+    /// silently match every message and turn this assertion into a
+    /// no-op); pass a non-empty fragment that should appear in the
+    /// expected `scx_bpf_error` message.
+    ///
+    /// # Panics
+    /// When `literal` is empty.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub const fn expect_scx_bpf_error_contains(mut self, literal: &'static str) -> Self {
+        assert!(
+            !literal.is_empty(),
+            "Assert::expect_scx_bpf_error_contains: literal must be non-empty",
+        );
+        self.expect_scx_bpf_error_contains = Some(literal);
+        self
+    }
+
+    /// Const-fn builder for [`Self::expect_scx_bpf_error_matches`].
+    /// The pattern is a regex; special characters retain their regex
+    /// meaning. For literal-substring matching, prefer
+    /// [`Self::expect_scx_bpf_error_contains`] to avoid escape
+    /// footguns.
+    ///
+    /// Empty patterns panic at construction (an empty regex matches
+    /// everywhere); pass a meaningful pattern. Regex syntax is
+    /// validated at evaluation time — an invalid pattern fails the
+    /// test with a diagnostic naming the offending pattern, not a
+    /// silent vacuous match.
+    ///
+    /// # Panics
+    /// When `pattern` is empty.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub const fn expect_scx_bpf_error_matches(mut self, pattern: &'static str) -> Self {
+        assert!(
+            !pattern.is_empty(),
+            "Assert::expect_scx_bpf_error_matches: pattern must be non-empty",
+        );
+        self.expect_scx_bpf_error_matches = Some(pattern);
+        self
+    }
+
+    /// Evaluate the reproducer-mode `scx_bpf_error` matchers against
+    /// the captured text corpus. Returns an empty Vec when no matcher
+    /// is configured or when every configured matcher matches; returns
+    /// a non-empty Vec of `AssertDetail` entries on failure.
+    ///
+    /// Each configured matcher contributes at most one detail. Both
+    /// fields can be set simultaneously (`AND` semantics — both must
+    /// match).
+    ///
+    /// Preconditions enforced by the evaluator:
+    /// 1. `expect_err = true` must be set when either matcher is
+    ///    configured. Setting the matcher on a passing-test contract
+    ///    is a misuse — surfaced with an `expect_err = true` reminder
+    ///    diagnostic.
+    /// 2. The regex pattern in
+    ///    [`Self::expect_scx_bpf_error_matches`] must compile via
+    ///    the `regex` crate. Invalid syntax surfaces as a diagnostic
+    ///    naming the pattern and the compile error.
+    ///
+    /// `captured_text` is the concatenation of the scheduler log
+    /// (SCHED_OUTPUT_START..SCHED_OUTPUT_END section of COM2) and the
+    /// `--- sched_ext dump ---` extract from COM1 — both surfaces
+    /// where `scx_bpf_error` printk lands.
+    pub fn evaluate_scx_bpf_error_match(
+        &self,
+        captured_text: &str,
+        expect_err: bool,
+    ) -> Vec<AssertDetail> {
+        let mut details = Vec::new();
+        if self.expect_scx_bpf_error_contains.is_none()
+            && self.expect_scx_bpf_error_matches.is_none()
+        {
+            return details;
+        }
+        if !expect_err {
+            details.push(AssertDetail::new(
+                DetailKind::Other,
+                "expect_scx_bpf_error_contains or expect_scx_bpf_error_matches \
+                 requires expect_err = true on the test entry — the matcher narrows \
+                 which failure counts as the expected bug, and only applies to \
+                 expected-error tests; set #[ktstr_test(expect_err = true, ...)] or \
+                 drop the matcher",
+            ));
+            return details;
+        }
+        let excerpt = || -> String { captured_text.chars().take(400).collect() };
+        if let Some(literal) = self.expect_scx_bpf_error_contains
+            && !captured_text.contains(literal)
+        {
+            details.push(AssertDetail::new(
+                DetailKind::Other,
+                format!(
+                    "expect_scx_bpf_error_contains({literal:?}): substring not found \
+                     in the scheduler log + sched_ext dump corpus (the expected bug \
+                     did not fire, or its message text changed). Captured corpus \
+                     {} bytes; first 400 bytes follow:\n{}",
+                    captured_text.len(),
+                    excerpt(),
+                ),
+            ));
+        }
+        if let Some(pattern) = self.expect_scx_bpf_error_matches {
+            match regex::Regex::new(pattern) {
+                Ok(re) => {
+                    if !re.is_match(captured_text) {
+                        details.push(AssertDetail::new(
+                            DetailKind::Other,
+                            format!(
+                                "expect_scx_bpf_error_matches({pattern:?}): regex did \
+                                 not match the scheduler log + sched_ext dump corpus \
+                                 (the expected bug did not fire, or its message text \
+                                 changed). Captured corpus {} bytes; first 400 bytes \
+                                 follow:\n{}",
+                                captured_text.len(),
+                                excerpt(),
+                            ),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    details.push(AssertDetail::new(
+                        DetailKind::Other,
+                        format!(
+                            "expect_scx_bpf_error_matches({pattern:?}): regex \
+                             compilation failed: {e}. Fix the pattern at the test \
+                             declaration site — the matcher cannot evaluate against an \
+                             invalid pattern",
+                        ),
+                    ));
+                }
+            }
+        }
+        details
     }
 }
 

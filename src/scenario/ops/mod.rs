@@ -1565,6 +1565,28 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
         }
         state.target_cgroups().add_cgroup_no_cpuset(&def.name)?;
         if let Some(ref cpuset_spec) = def.cpuset {
+            let resolved = cpuset_spec.resolve(ctx);
+            // workers_pct + empty cpuset combination produces a more
+            // actionable diagnostic than the generic CpusetSpec
+            // empty-mask rejection — surface "workers_pct(X) on a
+            // cpuset of 0 CPU(s) resolved to 0 workers" instead.
+            // Format mirrors WorkSpec::resolve_workers_pct's bail
+            // (src/workload/config.rs) so the rejection text is
+            // identical whether it fires here or in the per-WorkSpec
+            // resolution loop below.
+            if resolved.is_empty()
+                && let Some(pct) = def.merged_works().iter().find_map(|w| w.workers_pct)
+            {
+                anyhow::bail!(
+                    "cgroup '{}': workers_pct({pct}) on a cpuset of 0 \
+                     CPU(s) resolved to 0 workers (ceil(0 * {pct}) = 0); \
+                     the cgroup would have no workers and downstream \
+                     assertions would vacuously pass — narrow the \
+                     cpuset, raise the fraction, or use `workers(N)` \
+                     instead",
+                    def.name,
+                );
+            }
             if let Err(reason) = cpuset_spec.validate(ctx) {
                 anyhow::bail!(
                     "cgroup '{}': CpusetSpec validation failed: {}",
@@ -1572,7 +1594,6 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
                     reason
                 );
             }
-            let resolved = cpuset_spec.resolve(ctx);
             ctx.cgroups.set_cpuset(&def.name, &resolved)?;
             state.record_cpuset(&def.name, resolved);
         }

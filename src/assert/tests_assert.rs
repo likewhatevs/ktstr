@@ -824,3 +824,205 @@ fn assert_merge_all_field_categories() {
     // sched's monitor fields survive (test didn't set them).
     assert_eq!(merged.fail_on_stall, Some(true));
 }
+
+/// `Assert::expect_scx_bpf_error_contains` builder is `const fn` so
+/// it composes inside `Assert::NO_OVERRIDES.expect_..._contains(...)`
+/// const-context chains. Empty literals panic at construction (an
+/// empty literal would silently match every message via
+/// `str::contains`).
+#[test]
+fn expect_scx_bpf_error_contains_builder_sets_field() {
+    let a = Assert::NO_OVERRIDES.expect_scx_bpf_error_contains("apply_cell_config");
+    assert_eq!(a.expect_scx_bpf_error_contains, Some("apply_cell_config"));
+    assert_eq!(a.expect_scx_bpf_error_matches, None);
+}
+
+#[test]
+#[should_panic(expected = "must be non-empty")]
+fn expect_scx_bpf_error_contains_builder_panics_on_empty() {
+    let _ = Assert::NO_OVERRIDES.expect_scx_bpf_error_contains("");
+}
+
+#[test]
+fn expect_scx_bpf_error_matches_builder_sets_field() {
+    let a = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r"apply_cell_config.*-EINVAL");
+    assert_eq!(
+        a.expect_scx_bpf_error_matches,
+        Some(r"apply_cell_config.*-EINVAL"),
+    );
+    assert_eq!(a.expect_scx_bpf_error_contains, None);
+}
+
+#[test]
+#[should_panic(expected = "must be non-empty")]
+fn expect_scx_bpf_error_matches_builder_panics_on_empty() {
+    let _ = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches("");
+}
+
+/// No matchers set → evaluator returns empty Vec regardless of
+/// captured text or expect_err state. Existing tests that never opt
+/// into reproducer mode must see zero matcher-driven details.
+#[test]
+fn evaluate_scx_bpf_error_match_returns_empty_when_no_matcher_configured() {
+    let a = Assert::NO_OVERRIDES;
+    assert!(
+        a.evaluate_scx_bpf_error_match("some scheduler text", true)
+            .is_empty(),
+    );
+    assert!(
+        a.evaluate_scx_bpf_error_match("some scheduler text", false)
+            .is_empty(),
+    );
+    assert!(a.evaluate_scx_bpf_error_match("", true).is_empty());
+}
+
+/// Matcher set + expect_err = false → evaluator rejects with a
+/// misuse diagnostic naming the expect_err requirement. Catches
+/// runtime misuse even if the entry-time `KtstrTestEntry::validate`
+/// gate is somehow bypassed.
+#[test]
+fn evaluate_scx_bpf_error_match_rejects_when_expect_err_unset() {
+    let a = Assert::NO_OVERRIDES.expect_scx_bpf_error_contains("anything");
+    let details = a.evaluate_scx_bpf_error_match("text including anything substring", false);
+    assert_eq!(details.len(), 1);
+    let msg = &details[0].message;
+    assert!(
+        msg.contains("expect_err = true"),
+        "misuse diagnostic must name expect_err: {msg}",
+    );
+}
+
+/// Literal-substring matcher passes when the literal appears in the
+/// captured corpus.
+#[test]
+fn evaluate_scx_bpf_error_match_contains_passes_on_substring_present() {
+    let a = Assert::NO_OVERRIDES.expect_scx_bpf_error_contains("apply_cell_config returned -EINVAL");
+    let corpus =
+        "scx_mitosis: apply_cell_config returned -EINVAL at line:42; cell_id=3\n";
+    let details = a.evaluate_scx_bpf_error_match(corpus, true);
+    assert!(details.is_empty(), "matcher must pass on substring match: {details:?}");
+}
+
+/// Literal-substring matcher fails when the literal is absent, with
+/// a diagnostic naming the expected literal AND quoting the corpus
+/// so the operator can compare at a glance.
+#[test]
+fn evaluate_scx_bpf_error_match_contains_fails_on_absent_substring() {
+    let a = Assert::NO_OVERRIDES.expect_scx_bpf_error_contains("apply_cell_config returned -EINVAL");
+    let corpus = "scx_mitosis: a DIFFERENT bug fired: stuck task X for 5000ms\n";
+    let details = a.evaluate_scx_bpf_error_match(corpus, true);
+    assert_eq!(details.len(), 1);
+    let msg = &details[0].message;
+    assert!(
+        msg.contains("apply_cell_config returned -EINVAL"),
+        "diagnostic must name expected literal: {msg}",
+    );
+    assert!(
+        msg.contains("a DIFFERENT bug fired"),
+        "diagnostic must include the actual captured corpus: {msg}",
+    );
+}
+
+/// Regex matcher passes on match — anchors, character classes, and
+/// captures all work via the `regex` crate.
+#[test]
+fn evaluate_scx_bpf_error_match_regex_passes_on_match() {
+    let a = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r"apply_cell_config.*-E[A-Z]+");
+    let corpus = "scx_mitosis: apply_cell_config returned -EINVAL at line:42\n";
+    let details = a.evaluate_scx_bpf_error_match(corpus, true);
+    assert!(details.is_empty(), "regex matcher must pass: {details:?}");
+}
+
+#[test]
+fn evaluate_scx_bpf_error_match_regex_fails_on_mismatch() {
+    let a = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r"apply_cell_config.*-E[A-Z]+");
+    let corpus = "scx_mitosis: stuck task for 5000ms\n";
+    let details = a.evaluate_scx_bpf_error_match(corpus, true);
+    assert_eq!(details.len(), 1);
+    let msg = &details[0].message;
+    assert!(msg.contains("apply_cell_config"));
+    assert!(msg.contains("stuck task"));
+}
+
+/// Invalid regex syntax surfaces as a matcher-failure diagnostic
+/// naming the pattern AND the compile error. The matcher MUST NOT
+/// silently vacuously match (which would let a typo in the pattern
+/// turn the assertion into a no-op).
+#[test]
+fn evaluate_scx_bpf_error_match_regex_invalid_pattern_fails_loudly() {
+    let a = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches("[unclosed");
+    let details = a.evaluate_scx_bpf_error_match("corpus text", true);
+    assert_eq!(details.len(), 1);
+    let msg = &details[0].message;
+    assert!(
+        msg.contains("[unclosed"),
+        "invalid-pattern diagnostic must name the pattern: {msg}",
+    );
+    assert!(
+        msg.contains("regex compilation failed"),
+        "invalid-pattern diagnostic must say the pattern failed to compile: {msg}",
+    );
+}
+
+/// Both matchers set + both match → empty details.
+#[test]
+fn evaluate_scx_bpf_error_match_both_set_and_both_match_passes() {
+    let a = Assert::NO_OVERRIDES
+        .expect_scx_bpf_error_contains("apply_cell_config")
+        .expect_scx_bpf_error_matches(r"returned -E[A-Z]+");
+    let corpus = "scx_mitosis: apply_cell_config returned -EINVAL\n";
+    assert!(a.evaluate_scx_bpf_error_match(corpus, true).is_empty());
+}
+
+/// Both matchers set + only one matches → matcher fails with a
+/// diagnostic for the one that didn't.
+#[test]
+fn evaluate_scx_bpf_error_match_both_set_one_mismatches_fails() {
+    let a = Assert::NO_OVERRIDES
+        .expect_scx_bpf_error_contains("apply_cell_config")
+        .expect_scx_bpf_error_matches(r"returned -E[A-Z]+");
+    let corpus = "scx_mitosis: apply_cell_config but no errno here\n";
+    let details = a.evaluate_scx_bpf_error_match(corpus, true);
+    assert_eq!(details.len(), 1);
+    assert!(details[0].message.contains("returned -E"));
+}
+
+/// Multi-event scenario: when the upstream pipeline concatenates
+/// two or more `sched_ext: BPF scheduler "..." disabled (...)` exit
+/// events into one corpus (rapid load+disable cycles per
+/// `dmesg_scx.rs:157-159`), the matcher must scan the WHOLE
+/// concatenated string, not stop at the first event boundary.
+///
+/// The corpus below interleaves two distinct events; the matched
+/// pattern lives ONLY in the second event. A regression that
+/// scanned only the first event would treat the second as if it
+/// didn't exist — the matcher would fail despite the bug actually
+/// reproducing in the second cycle. Pin BOTH the literal and regex
+/// matchers since their corpus-scanning paths are independent
+/// (`str::contains` vs. `regex::Regex::is_match`).
+#[test]
+fn evaluate_scx_bpf_error_match_finds_pattern_in_later_event() {
+    let corpus = "scx_mitosis: first different error at line:1\n\
+                  sched_ext: BPF scheduler \"scx_mitosis\" disabled (Error)\n\
+                  scx_mitosis: apply_cell_config returned -EINVAL at line:42\n\
+                  sched_ext: BPF scheduler \"scx_mitosis\" disabled (Error)\n";
+
+    // Literal-substring matcher walks the whole corpus.
+    let a_lit = Assert::NO_OVERRIDES
+        .expect_scx_bpf_error_contains("apply_cell_config returned -EINVAL");
+    let lit_details = a_lit.evaluate_scx_bpf_error_match(corpus, true);
+    assert!(
+        lit_details.is_empty(),
+        "contains matcher must scan the WHOLE concatenated corpus, not stop \
+         at the first event boundary: {lit_details:?}",
+    );
+
+    // Regex matcher walks the whole corpus.
+    let a_re = Assert::NO_OVERRIDES
+        .expect_scx_bpf_error_matches(r"apply_cell_config.*-E[A-Z]+");
+    let re_details = a_re.evaluate_scx_bpf_error_match(corpus, true);
+    assert!(
+        re_details.is_empty(),
+        "regex matcher must scan the WHOLE concatenated corpus: {re_details:?}",
+    );
+}

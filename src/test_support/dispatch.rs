@@ -933,7 +933,24 @@ fn result_to_exit_code(result: Result<AssertResult>, expect_err: bool) -> i32 {
                 0
             }
         }
-        Err(_) if expect_err => 0,
+        Err(e) if expect_err => {
+            // expect_err inverts a failure into a pass — UNLESS the
+            // failure carries the
+            // [`crate::test_support::eval::ScxBpfErrorMatcherMismatch`]
+            // marker, which signals that the reproducer's scx_bpf_error
+            // matcher rejected this particular failure. A matcher-
+            // mismatch failure must surface even when expect_err = true:
+            // the user authored the matcher to pin THIS specific bug,
+            // and a different bug firing is itself a regression.
+            if e.chain()
+                .any(|c| c.is::<crate::test_support::eval::ScxBpfErrorMatcherMismatch>())
+            {
+                eprintln!("{e:#}");
+                1
+            } else {
+                0
+            }
+        }
         Err(e) => {
             eprintln!("{e:#}");
             1

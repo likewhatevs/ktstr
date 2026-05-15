@@ -61,11 +61,11 @@ fn assert_format_human_field_order_is_stable() {
 #[test]
 fn assert_format_human_no_overrides_renders_all_none() {
     let out = Assert::NO_OVERRIDES.format_human();
-    // 19 threshold fields; each rendered as "none" means 19
+    // 21 threshold fields; each rendered as "none" means 21
     // "none" occurrences in the output.
     let none_count = out.matches(": none").count();
     assert_eq!(
-        none_count, 19,
+        none_count, 21,
         "NO_OVERRIDES must render every field as `none`, got {none_count} `none` rows:\n{out}",
     );
     // `format_human` is header-free — the first line carries
@@ -92,7 +92,7 @@ fn assert_format_human_default_checks_shows_all_none() {
     let out = a.format_human();
     let none_count = out.matches(": none").count();
     assert_eq!(
-        none_count, 19,
+        none_count, 21,
         "default_checks must render every field as `none`, got {none_count}:\n{out}",
     );
 }
