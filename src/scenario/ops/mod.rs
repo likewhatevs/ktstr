@@ -1565,7 +1565,7 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
         }
         state.target_cgroups().add_cgroup_no_cpuset(&def.name)?;
         if let Some(ref cpuset_spec) = def.cpuset {
-            let resolved = cpuset_spec.resolve(ctx);
+            let resolved = cpuset_spec.resolve_quiet(ctx);
             // workers_pct + empty cpuset combinations produce more
             // actionable diagnostics than the generic CpusetSpec
             // empty-mask rejection — surface them here before
@@ -1639,6 +1639,41 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
                         def.name,
                     );
                 }
+                // Fall-through for cpusets that resolve to empty
+                // without workers_pct — i.e. cases where the slice
+                // math (or topology shape) yields an empty BTreeSet
+                // even though `validate` accepts the spec. Examples:
+                // `Range { 0.0, 0.1 }` on a small usable set (the
+                // truncated `(len * 0.1) as usize` rounds to 0, see
+                // the `op_set_cpuset_narrow_to_empty_bails` test),
+                // or `Llc(N)` on a pathological topology where LLC
+                // N has no associated CPUs (memory-only NUMA node
+                // attached to a separate LLC). Cases like
+                // `Range { 0.0, 0.0 }` or `Disjoint { of: 0 }` do
+                // NOT reach this branch in `Op::SetCpuset` — they
+                // get rejected by validate first — but they DO
+                // reach this branch here because apply_setup runs
+                // resolve before validate (intentional: the Bundle
+                // H workers_pct diagnostic at the dual_work / pcts
+                // probes above needs to fire on empty-Exact +
+                // workers_pct combinations before validate's
+                // generic empty-Exact rejection preempts it). An
+                // empty cpuset reaching `set_cpuset` silently
+                // writes an empty mask to the cgroup; subsequent
+                // worker spawns get no CPUs and every CPU-pinned
+                // assertion vacuously passes. Bail here with the
+                // cpuset_spec context so the operator sees which
+                // spec resolved to empty and can adjust.
+                anyhow::bail!(
+                    "cgroup '{}': cpuset_spec {:?} resolved to 0 \
+                     CPU(s); the cgroup would have no CPUs assigned \
+                     and downstream worker spawns would fail or \
+                     produce vacuous assertions — adjust the spec \
+                     so it resolves to a non-empty cpuset on this \
+                     topology",
+                    def.name,
+                    cpuset_spec,
+                );
             }
             if let Err(reason) = cpuset_spec.validate(ctx) {
                 anyhow::bail!(
@@ -2121,7 +2156,38 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                         reason
                     );
                 }
-                let resolved = cpus.resolve(ctx);
+                let resolved = cpus.resolve_quiet(ctx);
+                // Symmetric with apply_setup's empty-resolved bail.
+                // An Op::SetCpuset that narrows mid-scenario to 0
+                // CPUs would silently re-mask the cgroup to empty
+                // and break every running worker that depended on
+                // it. Example cases that pass validate but resolve
+                // to empty: `Range { start, end }` where the slice
+                // math truncates to an empty range on a small
+                // topology (the `op_set_cpuset_narrow_to_empty_bails`
+                // test exercises `Range { 0.0, 0.1 }` on 4 CPUs),
+                // or `Llc(N)` on a pathological topology where the
+                // Nth LLC has no associated CPUs (memory-only NUMA
+                // node attached to a separate LLC). Bail with the
+                // spec context so the operator can see which
+                // mid-scenario narrow produced the empty
+                // resolution.
+                if resolved.is_empty() {
+                    anyhow::bail!(
+                        "cgroup '{}': Op::SetCpuset spec {:?} \
+                         resolved to 0 CPU(s); narrowing a live \
+                         cgroup to empty would leave running \
+                         workers without CPUs and downstream \
+                         assertions would vacuously pass — adjust \
+                         the spec so it resolves to a non-empty \
+                         cpuset on this topology, or use \
+                         Op::ClearCpuset if the intent was to \
+                         release the cpuset restriction (allow all \
+                         CPUs)",
+                        cgroup,
+                        cpus,
+                    );
+                }
                 ctx.cgroups.set_cpuset(cgroup, &resolved)?;
                 state.record_cpuset(cgroup, resolved);
             }
@@ -8604,6 +8670,118 @@ mod tests {
             "dual-set bail must include the case-(1)-specific trailing context that \
              explains why this fired at apply_setup rather than at the deeper resolve \
              path: {msg}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// A cgroup whose `cpuset_spec` resolves to an empty CPU set
+    /// AND that does NOT use `workers_pct` must still bail at
+    /// apply_setup — silently writing an empty mask would leave the
+    /// cgroup with no CPUs assigned, downstream worker spawns would
+    /// fail or produce vacuous assertions, and the operator would
+    /// have no signal that they misconfigured the spec. Uses
+    /// `Range { 0.0, 0.1 }` on a 4-CPU mock topology: validate
+    /// accepts because `0.0 < 0.1` and both fracs are in `[0, 1]`,
+    /// but resolve computes `start = 4 * 0.0 = 0` and `end =
+    /// (4 * 0.1) as usize = 0`, yielding an empty slice. This is
+    /// the canonical "passes validate but resolves to empty" case
+    /// — `Range { 0.0, 0.0 }` would be rejected by validate's
+    /// `start_frac >= end_frac` guard at types.rs:2149, so the
+    /// fraction must be small but non-zero to thread the needle.
+    /// Distinct from the `workers_pct`-driven empty-cpuset bails:
+    /// no fraction is set, so the diagnostic should cite the
+    /// cpuset_spec itself rather than a fraction-on-zero-CPUs
+    /// framing.
+    #[test]
+    fn empty_resolved_cpuset_without_workers_pct_bails_in_apply_setup() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let def = CgroupDef::named("cg_empty_range").with_cpuset(CpusetSpec::Range {
+            start_frac: 0.0,
+            end_frac: 0.1,
+        });
+        let err = apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def))
+            .expect_err("empty-resolved cpuset must reject even without workers_pct");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("cg_empty_range"),
+            "diagnostic must name the cgroup: {msg}",
+        );
+        assert!(
+            msg.contains("resolved to 0 CPU(s)"),
+            "diagnostic must name the zero-CPU resolution: {msg}",
+        );
+        assert!(
+            !msg.contains("workers_pct"),
+            "diagnostic must NOT cite workers_pct when none is set; \
+             that would mis-direct the operator to a knob they didn't \
+             configure: {msg}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// `Op::SetCpuset` mid-scenario must also bail when the new spec
+    /// resolves to an empty CPU set, symmetric with apply_setup.
+    /// Silently re-masking a live cgroup to empty would leave its
+    /// running workers without CPUs and downstream assertions would
+    /// vacuously pass. The diagnostic must cite the target cgroup
+    /// and the spec that resolved to empty so the operator knows
+    /// which mid-scenario narrow produced the empty resolution.
+    #[test]
+    fn op_set_cpuset_narrow_to_empty_bails() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        // Establish a live cgroup with a valid cpuset first.
+        apply_setup_test(
+            &ctx,
+            &mut state,
+            std::slice::from_ref(
+                &CgroupDef::named("cg_narrow").with_cpuset(CpusetSpec::Llc(0)),
+            ),
+        )
+        .unwrap();
+        // Now try to narrow it via Op::SetCpuset to an empty range.
+        // `Range { 0.0, 0.1 }` passes validate (start < end, both in
+        // [0, 1]) but resolves empty on a 4-CPU topology: end =
+        // (4 * 0.1) as usize = 0, so the slice is [0..0] = empty.
+        let err = apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::SetCpuset {
+                cgroup: std::borrow::Cow::Borrowed("cg_narrow"),
+                cpus: CpusetSpec::Range {
+                    start_frac: 0.0,
+                    end_frac: 0.1,
+                },
+            }],
+        )
+        .expect_err("Op::SetCpuset narrowing to empty must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("cg_narrow"),
+            "diagnostic must name the target cgroup: {msg}",
+        );
+        assert!(
+            msg.contains("resolved to 0 CPU(s)"),
+            "diagnostic must name the zero-CPU resolution: {msg}",
+        );
+        assert!(
+            msg.contains("Op::SetCpuset"),
+            "diagnostic must identify the Op layer so the operator \
+             knows this came from a mid-scenario narrow, not setup: \
+             {msg}",
+        );
+        assert!(
+            msg.contains("Op::ClearCpuset"),
+            "diagnostic must point the operator at the right \
+             primitive for the 'release cpuset restriction' intent \
+             so a regression that drops the Op::ClearCpuset \
+             direction (leading users to the workaround \
+             `Range {{ 0.0, 1.0 }}` instead) is caught: {msg}",
         );
         cleanup_state(&mut state);
     }

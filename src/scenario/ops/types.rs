@@ -2199,8 +2199,10 @@ impl CpusetSpec {
 
     /// Resolve to a concrete CPU set given the topology.
     ///
-    /// **Callers MUST run [`Self::validate`] first and propagate its error.**
-    /// `apply_setup` and `apply_ops::SetCpuset` do so via `anyhow::bail!`.
+    /// **Callers SHOULD run [`Self::validate`] first and propagate
+    /// its error.** `apply_setup` and `apply_ops::SetCpuset` do so
+    /// via `anyhow::bail!`, then call [`Self::resolve_quiet`] which
+    /// skips the warns this method emits on degenerate inputs.
     ///
     /// Defense-in-depth: every malformed input that `validate`
     /// rejects (out-of-range `Llc`/`Numa`, partition `of == 0`,
@@ -2208,23 +2210,48 @@ impl CpusetSpec {
     /// `end_frac`, out-of-bounds `Overlap.frac`) also has a
     /// panic-free fallback here — out-of-range indices clamp to the
     /// last valid index with a `tracing::warn!`, `of == 0` returns
-    /// an empty set with a warn, and inverted/non-finite fracs clamp
-    /// to `[0, len]` so the resulting slice never inverts. Skipping
-    /// `validate` therefore degrades into a usable (possibly empty)
-    /// cpuset rather than crashing the caller.
+    /// an empty set with a warn, and inverted/non-finite fracs
+    /// clamp to `[0, len]` so the resulting slice never inverts.
+    /// Skipping `validate` therefore degrades into a usable
+    /// (possibly empty) cpuset rather than crashing the caller, but
+    /// the warns surface the silent-degradation case — a caller who
+    /// computed a CPU count via [`crate::scenario::Ctx::cpuset_cpus`]
+    /// (which doesn't validate) sees the warn instead of silently
+    /// planning against the wrong denominator.
     pub fn resolve(&self, ctx: &Ctx) -> BTreeSet<usize> {
+        self.resolve_inner(ctx, false)
+    }
+
+    /// Like [`Self::resolve`] but suppresses the degenerate-input
+    /// `tracing::warn!`s. Use this from call sites that pair the
+    /// resolution with a [`Self::validate`] call (either before or
+    /// after this one) and bail on its error — validate is the
+    /// canonical error channel for malformed specs, and a warn
+    /// here would be redundant noise on a path already known-
+    /// broken via the validate gate. `apply_setup` resolves first
+    /// (to keep the workers_pct empty-cpuset diagnostic ahead of
+    /// validate's generic empty-Exact rejection) and validates
+    /// after; `Op::SetCpuset` validates first and resolves after.
+    /// Both patterns satisfy the contract.
+    pub fn resolve_quiet(&self, ctx: &Ctx) -> BTreeSet<usize> {
+        self.resolve_inner(ctx, true)
+    }
+
+    fn resolve_inner(&self, ctx: &Ctx, quiet: bool) -> BTreeSet<usize> {
         let usable = ctx.topo.usable_cpus();
         match self {
             CpusetSpec::Llc(idx) => {
                 if *idx >= ctx.topo.num_llcs() {
                     // Graceful fallback: clamp to last LLC instead of panicking.
                     let clamped = ctx.topo.num_llcs().saturating_sub(1);
-                    tracing::warn!(
-                        llc_idx = idx,
-                        num_llcs = ctx.topo.num_llcs(),
-                        clamped,
-                        "CpusetSpec::Llc index out of range, clamping",
-                    );
+                    if !quiet {
+                        tracing::warn!(
+                            llc_idx = idx,
+                            num_llcs = ctx.topo.num_llcs(),
+                            clamped,
+                            "CpusetSpec::Llc index out of range, clamping",
+                        );
+                    }
                     ctx.topo.llc_aligned_cpuset(clamped)
                 } else {
                     ctx.topo.llc_aligned_cpuset(*idx)
@@ -2233,12 +2260,14 @@ impl CpusetSpec {
             CpusetSpec::Numa(idx) => {
                 if *idx >= ctx.topo.num_numa_nodes() {
                     let clamped = ctx.topo.num_numa_nodes().saturating_sub(1);
-                    tracing::warn!(
-                        numa_node = idx,
-                        num_numa_nodes = ctx.topo.num_numa_nodes(),
-                        clamped,
-                        "CpusetSpec::Numa index out of range, clamping",
-                    );
+                    if !quiet {
+                        tracing::warn!(
+                            numa_node = idx,
+                            num_numa_nodes = ctx.topo.num_numa_nodes(),
+                            clamped,
+                            "CpusetSpec::Numa index out of range, clamping",
+                        );
+                    }
                     ctx.topo.numa_aligned_cpuset(clamped)
                 } else {
                     ctx.topo.numa_aligned_cpuset(*idx)
@@ -2275,7 +2304,11 @@ impl CpusetSpec {
                     // of==0 anyway (skipped validate, or used a
                     // malformed programmatic spec), returning an empty
                     // set is safer than the div-by-zero panic.
-                    tracing::warn!("CpusetSpec::Disjoint with of=0 — returning empty cpuset");
+                    if !quiet {
+                        tracing::warn!(
+                            "CpusetSpec::Disjoint with of=0 — returning empty cpuset"
+                        );
+                    }
                     return BTreeSet::new();
                 }
                 let chunk = usable.len() / of;
@@ -2291,7 +2324,11 @@ impl CpusetSpec {
             }
             CpusetSpec::Overlap { index, of, frac } => {
                 if *of == 0 {
-                    tracing::warn!("CpusetSpec::Overlap with of=0 — returning empty cpuset");
+                    if !quiet {
+                        tracing::warn!(
+                            "CpusetSpec::Overlap with of=0 — returning empty cpuset"
+                        );
+                    }
                     return BTreeSet::new();
                 }
                 let chunk = usable.len() / of;
