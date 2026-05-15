@@ -325,9 +325,15 @@ mod tests {
     /// 3-element sibling above wouldn't surface — a swap of indices
     /// 1 and 2 there is invisible to a {0, len-1} assertion, but
     /// here every index is checked.
+    ///
+    /// Names are deliberately non-monotonic in ASCII order so a
+    /// regression that stably-sorts the input would produce a
+    /// different sequence and trip the per-index assertion. If
+    /// names were `["cg0", "cg1", ..., "cg6"]` (already sorted),
+    /// a sort_by_name regression would be invisible.
     #[test]
     fn with_cgroups_preserves_declaration_order_for_many_entries() {
-        const NAMES: [&str; 7] = ["cg0", "cg1", "cg2", "cg3", "cg4", "cg5", "cg6"];
+        const NAMES: [&str; 7] = ["cg5", "cg0", "cg3", "cg6", "cg1", "cg4", "cg2"];
         let b = Backdrop::new().with_cgroups(NAMES.map(CgroupDef::named));
         assert_eq!(b.cgroups.len(), NAMES.len());
         for (i, expected) in NAMES.iter().enumerate() {
@@ -367,25 +373,29 @@ mod tests {
     /// index. Catches arbitrary shuffle/sort/partition/reverse
     /// regressions across a larger collection than the 2-entry
     /// `with_payloads_extends_in_order` can surface.
+    ///
+    /// Inputs are deliberately non-monotonic in ASCII order of their
+    /// `name` field so a regression that stably-sorts the input would
+    /// produce a different sequence and trip the per-index assertion.
     #[test]
     fn with_payloads_preserves_declaration_order_for_many_entries() {
         let inputs = [
-            &TEST_PAYLOAD,
-            &TEST_PAYLOAD_2,
-            &TEST_PAYLOAD_3,
-            &TEST_PAYLOAD_4,
             &TEST_PAYLOAD_5,
-            &TEST_PAYLOAD_6,
+            &TEST_PAYLOAD,
+            &TEST_PAYLOAD_3,
             &TEST_PAYLOAD_7,
+            &TEST_PAYLOAD_2,
+            &TEST_PAYLOAD_6,
+            &TEST_PAYLOAD_4,
         ];
         let expected = [
-            "test_bin",
-            "test_bin_2",
-            "test_bin_3",
-            "test_bin_4",
             "test_bin_5",
-            "test_bin_6",
+            "test_bin",
+            "test_bin_3",
             "test_bin_7",
+            "test_bin_2",
+            "test_bin_6",
+            "test_bin_4",
         ];
         let b = Backdrop::new().with_payloads(inputs);
         assert_eq!(b.payloads.len(), expected.len());
