@@ -3683,6 +3683,153 @@ mod tests {
         );
     }
 
+    /// Drive `HoldSpec::Loop` end-to-end via `execute_steps` against
+    /// the mock CgroupOps. The Loop arm of `run_step` (mod.rs:1163-1180)
+    /// fires `apply_ops` repeatedly at `interval` until `ctx.duration`
+    /// elapses; each iteration's SetCpuset op records a
+    /// `CgroupCall::SetCpuset` in the mock. After the scenario
+    /// completes, the mock's SetCpuset count proves the loop actually
+    /// repeated — distinguishing the Loop path from the Fixed/Frac
+    /// single-apply path. `sched_pid = None` (inherited from `mock_ctx`)
+    /// makes `sleep_or_sched_died` a plain sleep with no liveness probe
+    /// (verified at mod.rs:993-996), so the loop exits cleanly on the
+    /// duration deadline rather than on a spurious dead-scheduler signal.
+    /// `duration` is overridden to 150ms (vs `mock_ctx`'s 1-second
+    /// default) to keep the unit-test runtime short. Lower bound is
+    /// loose (>= 2) to absorb CI timing variance — the contract being
+    /// pinned is "repeats at least once", not "fires exactly N times".
+    #[test]
+    fn holdspec_loop_apply_path_repeats_ops_until_duration_elapses() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let mut ctx = mock_ctx(&mock, &topo);
+        ctx.duration = Duration::from_millis(150);
+        let steps = vec![Step::new(
+            vec![Op::set_cpuset("loop_test", CpusetSpec::Llc(0))],
+            HoldSpec::loop_at(Duration::from_millis(30)),
+        )];
+        let result = execute_steps(&ctx, steps)
+            .expect("HoldSpec::Loop apply path must succeed against mock cgroups");
+        assert!(
+            result.passed,
+            "scenario must pass with no failing assertions; got: {:?}",
+            result.details,
+        );
+        let set_cpuset_calls = mock
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, CgroupCall::SetCpuset(name, _) if name == "loop_test"))
+            .count();
+        assert!(
+            set_cpuset_calls >= 2,
+            "HoldSpec::Loop with interval=30ms over duration=150ms must fire \
+             SetCpuset at least twice; got {set_cpuset_calls} calls. The Loop \
+             arm of run_step (mod.rs:1163) must invoke apply_ops repeatedly \
+             until the deadline; a regression that single-shotted the ops \
+             would surface here as exactly 1 call.",
+        );
+    }
+
+    /// The Loop arm's setup pass at mod.rs:1165-1168 runs `apply_setup`
+    /// ONCE before entering the while loop, NOT per-iteration. A
+    /// regression that moved the `if !step.setup.is_empty()` block
+    /// inside the loop would attempt to re-create the same cgroup
+    /// every iteration and bail on the second iteration's collision
+    /// check (apply_setup's `cgroup_name_is_tracked` at mod.rs:1568).
+    /// Test pins this by counting `CreateCgroup` calls — must be
+    /// exactly 1 even though the loop body iterates multiple times
+    /// (verified separately via the SetCpuset count).
+    #[test]
+    fn holdspec_loop_apply_path_setup_runs_once_not_per_iteration() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let mut ctx = mock_ctx(&mock, &topo);
+        ctx.duration = Duration::from_millis(150);
+        let steps = vec![
+            Step::with_defs(
+                vec![CgroupDef::named("setup_cg")],
+                HoldSpec::loop_at(Duration::from_millis(30)),
+            )
+            .set_ops(vec![Op::set_cpuset("setup_cg", CpusetSpec::Llc(0))]),
+        ];
+        let result = execute_steps(&ctx, steps)
+            .expect("HoldSpec::Loop with setup must succeed against mock cgroups");
+        assert!(
+            result.passed,
+            "scenario must pass with no failing assertions; got: {:?}",
+            result.details,
+        );
+        let create_calls = mock
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, CgroupCall::CreateCgroup(name) if name == "setup_cg"))
+            .count();
+        assert_eq!(
+            create_calls, 1,
+            "Loop arm's setup pass must run exactly ONCE before the loop body; \
+             got {create_calls} CreateCgroup calls. A regression that moved \
+             the `if !step.setup.is_empty()` block inside the while loop \
+             (mod.rs:1165) would surface here as N > 1 calls (the second \
+             iteration's apply_setup would also fail the collision check, \
+             but counting reveals the bug source).",
+        );
+        let set_cpuset_calls = mock
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, CgroupCall::SetCpuset(name, _) if name == "setup_cg"))
+            .count();
+        assert!(
+            set_cpuset_calls >= 2,
+            "Loop body must repeat SetCpuset >= 2 times despite setup running \
+             once; got {set_cpuset_calls}. Pairs with the create-once check \
+             above to pin the full setup-once + ops-many contract.",
+        );
+    }
+
+    /// `interval > duration` is a degenerate-but-valid Loop config:
+    /// the while loop body runs exactly ONCE (deadline reached after
+    /// the first apply_ops + sleep). Pins the exact-iteration
+    /// contract via `assert_eq!(..., 1)` — catches BOTH a regression
+    /// that skipped the first apply_ops (0 calls) AND a regression
+    /// in the deadline-min logic at mod.rs:1175 that let the second
+    /// iteration's sleep underflow (2+ calls). The boundary behavior
+    /// at mod.rs:1175-1179 (`sleep_or_sched_died(remaining.min(interval), ...)`)
+    /// ensures sleep is capped at the remaining time so the loop
+    /// exits promptly on the next deadline check.
+    #[test]
+    fn holdspec_loop_apply_path_fires_exactly_once_when_interval_exceeds_duration() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let mut ctx = mock_ctx(&mock, &topo);
+        ctx.duration = Duration::from_millis(30);
+        let steps = vec![Step::new(
+            vec![Op::set_cpuset("brief_loop", CpusetSpec::Llc(0))],
+            HoldSpec::loop_at(Duration::from_millis(100)),
+        )];
+        let result = execute_steps(&ctx, steps)
+            .expect("HoldSpec::Loop with interval > duration must succeed against mock");
+        assert!(
+            result.passed,
+            "scenario must pass with no failing assertions; got: {:?}",
+            result.details,
+        );
+        let set_cpuset_calls = mock
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, CgroupCall::SetCpuset(name, _) if name == "brief_loop"))
+            .count();
+        assert_eq!(
+            set_cpuset_calls, 1,
+            "interval (100ms) > duration (30ms) must fire SetCpuset exactly \
+             once; got {set_cpuset_calls}. The loop body should run a single \
+             iteration: enter loop (now < deadline) → apply_ops → sleep \
+             min(remaining, interval) = ~30ms → next deadline check fails. \
+             0 calls = a regression that skipped the first apply_ops; 2+ \
+             calls = a regression in the deadline-min logic at mod.rs:1175 \
+             that let the second iteration's sleep underflow.",
+        );
+    }
+
     // -- HoldSpec PartialEq (load-bearing semantic pins) --
 
     /// Payload participates in equality across every variant. A
