@@ -1822,10 +1822,10 @@ pub fn hugepages_free() -> u64 {
         .unwrap_or(0)
 }
 
-/// Estimate the number of 2MB hugepages needed for a given memory size in MB.
-pub fn hugepages_needed(memory_mb: u32) -> u64 {
-    // 2MB per hugepage.
-    (memory_mb as u64).div_ceil(2)
+/// Estimate the number of 2 MiB hugepages needed for a given memory size in MiB.
+pub fn hugepages_needed(memory_mib: u32) -> u64 {
+    // 2 MiB per hugepage.
+    (memory_mib as u64).div_ceil(2)
 }
 
 /// Estimate current host CPU load by checking /proc/stat.

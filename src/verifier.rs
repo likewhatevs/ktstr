@@ -607,7 +607,7 @@ pub fn collect_verifier_output(
             validated.cores_per_llc,
             validated.threads_per_core,
         )
-        .memory_mb(2048)
+        .memory_mib(2048)
         .timeout(std::time::Duration::from_secs(120))
         .no_perf_mode(no_perf_mode)
         .build()

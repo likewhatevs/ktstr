@@ -3243,30 +3243,30 @@ fn parse_locks_watch_rejects_malformed_duration() {
 /// `cargo ktstr shell --memory-mb 256` round-trips the value
 /// through clap's `value_parser!(u32).range(128..)` attribute.
 #[test]
-fn parse_shell_memory_mb_valid() {
+fn parse_shell_memory_mib_valid() {
     let Cargo {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--memory-mb", "256"])
         .unwrap_or_else(|e| panic!("{e}"));
-    let KtstrCommand::Shell { memory_mb, .. } = k.command else {
+    let KtstrCommand::Shell { memory_mib, .. } = k.command else {
         panic!("expected Shell");
     };
-    assert_eq!(memory_mb, Some(256), "--memory-mb 256 must round-trip");
+    assert_eq!(memory_mib, Some(256), "--memory-mb 256 must round-trip");
 }
 
 /// `cargo ktstr shell --memory-mb 128` accepts the range floor —
 /// the clap range is `128..` (inclusive).
 #[test]
-fn parse_shell_memory_mb_at_range_floor() {
+fn parse_shell_memory_mib_at_range_floor() {
     let Cargo {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--memory-mb", "128"])
         .unwrap_or_else(|e| panic!("{e}"));
-    let KtstrCommand::Shell { memory_mb, .. } = k.command else {
+    let KtstrCommand::Shell { memory_mib, .. } = k.command else {
         panic!("expected Shell");
     };
     assert_eq!(
-        memory_mb,
+        memory_mib,
         Some(128),
         "--memory-mb 128 must succeed at the inclusive range floor",
     );
@@ -3277,7 +3277,7 @@ fn parse_shell_memory_mb_at_range_floor() {
 /// a regression that dropped the range or relaxed the lower
 /// bound surfaces here.
 #[test]
-fn parse_shell_memory_mb_below_range_rejected() {
+fn parse_shell_memory_mib_below_range_rejected() {
     let rejected = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--memory-mb", "64"]);
     assert!(
         rejected.is_err(),
@@ -3290,7 +3290,7 @@ fn parse_shell_memory_mb_below_range_rejected() {
 /// type-level value parser. Pins the unsigned-integer
 /// constraint.
 #[test]
-fn parse_shell_memory_mb_negative_rejected() {
+fn parse_shell_memory_mib_negative_rejected() {
     let rejected = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--memory-mb", "-1"]);
     assert!(
         rejected.is_err(),

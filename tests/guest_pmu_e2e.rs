@@ -254,7 +254,7 @@ fn classify_perf_open_errno(raw: i32) -> PerfOpenResult {
 /// AssertDetail — CPUID is x86-only; the analogous aarch64
 /// PMUv3 surface is verified via FDT and KVM unit tests in
 /// `src/vmm/aarch64/`.
-#[ktstr_test(llcs = 1, cores = 1, threads = 1, memory_mb = 512)]
+#[ktstr_test(llcs = 1, cores = 1, threads = 1, memory_mib = 512)]
 fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
     if !cfg!(target_arch = "x86_64") {
         let mut result = AssertResult::pass();
@@ -442,7 +442,7 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
 ///     kernel/events/core.c::perf_event_open's `return -EINVAL` arms);
 ///     a regression in `src/vmm/x86_64/topology.rs::leaf_0xa` that
 ///     drops the synthesized v2 surface would surface as exactly that.
-#[ktstr_test(llcs = 1, cores = 1, threads = 1, memory_mb = 512)]
+#[ktstr_test(llcs = 1, cores = 1, threads = 1, memory_mib = 512)]
 fn guest_pmu_perf_event_open_counts_instructions(_ctx: &Ctx) -> Result<AssertResult> {
     use perf_event_open_sys as pes;
     use perf_event_open_sys::bindings::{PERF_COUNT_HW_INSTRUCTIONS, PERF_TYPE_HARDWARE};

@@ -22,7 +22,7 @@ const TOPO_1L_4C_1T: Topology = Topology {
     llcs = 1,
     cores = 2,
     threads = 1,
-    memory_mb = 2048,
+    memory_mib = 2048,
     max_spread_pct = 80.0
 )]
 fn cover_cgroup_pipe_io(ctx: &Ctx) -> Result<AssertResult> {
@@ -34,19 +34,19 @@ fn cover_cgroup_pipe_io(ctx: &Ctx) -> Result<AssertResult> {
 // fallback) that activate when ANY monitor threshold is set are
 // raised here to skip those checks while keeping sustained_samples
 // for the stall-pattern coverage.
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, max_keep_last_rate = 1000000000.0, max_fallback_rate = 1000000000.0)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mib = 2048, sustained_samples = 25, max_keep_last_rate = 1000000000.0, max_fallback_rate = 1000000000.0)]
 fn cover_sched_mixed(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::basic::custom_sched_mixed(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_host_cgroup_contention(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::basic::custom_host_cgroup_contention(ctx)
 }
 
 // -- affinity --
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cgroup_affinity_change(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::affinity::custom_cgroup_affinity_change(ctx)
 }
@@ -55,7 +55,7 @@ fn cover_cgroup_affinity_change(ctx: &Ctx) -> Result<AssertResult> {
     llcs = 1,
     cores = 4,
     threads = 1,
-    memory_mb = 2048,
+    memory_mib = 2048,
     max_spread_pct = 80.0
 )]
 fn cover_cgroup_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
@@ -66,7 +66,7 @@ fn cover_cgroup_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     llcs = 1,
     cores = 4,
     threads = 1,
-    memory_mb = 2048,
+    memory_mib = 2048,
     max_spread_pct = 80.0
 )]
 fn cover_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
@@ -75,32 +75,32 @@ fn cover_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
 
 // -- cpuset --
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cgroup_cpuset_apply_midrun(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::cpuset::custom_cgroup_cpuset_apply_midrun(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cgroup_cpuset_clear_midrun(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::cpuset::custom_cgroup_cpuset_clear_midrun(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cgroup_cpuset_resize(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::cpuset::custom_cgroup_cpuset_resize(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 2, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 2, memory_mib = 2048)]
 fn cover_cgroup_cpuset_swap_disjoint(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::cpuset::custom_cgroup_cpuset_swap_disjoint(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cgroup_cpuset_workload_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::cpuset::custom_cgroup_cpuset_workload_imbalance(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::cpuset::custom_cgroup_cpuset_change_imbalance(ctx)
 }
@@ -110,7 +110,7 @@ fn cover_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<AssertResult> {
 // are raised to skip those checks — see cover_sched_mixed for the
 // design rationale (toy scheduler trips the defaults whenever any
 // monitor threshold is set).
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, max_imbalance_ratio = 20.0, sustained_samples = 15, watchdog_timeout_s = 15, max_keep_last_rate = 1000000000.0, max_fallback_rate = 1000000000.0)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mib = 2048, max_imbalance_ratio = 20.0, sustained_samples = 15, watchdog_timeout_s = 15, max_keep_last_rate = 1000000000.0, max_fallback_rate = 1000000000.0)]
 fn cover_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::cpuset::custom_cgroup_cpuset_load_shift(ctx)
 }
@@ -118,12 +118,12 @@ fn cover_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<AssertResult> {
 // -- dynamic --
 
 // Fairness rate ceilings raised — see cover_sched_mixed for rationale.
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, watchdog_timeout_s = 15, max_keep_last_rate = 1000000000.0, max_fallback_rate = 1000000000.0)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mib = 2048, sustained_samples = 25, watchdog_timeout_s = 15, max_keep_last_rate = 1000000000.0, max_fallback_rate = 1000000000.0)]
 fn cover_cgroup_add_midrun(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::dynamic::custom_cgroup_add_midrun(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cgroup_remove_midrun(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::dynamic::custom_cgroup_remove_midrun(ctx)
 }
@@ -132,7 +132,7 @@ fn cover_cgroup_remove_midrun(ctx: &Ctx) -> Result<AssertResult> {
     llcs = 1,
     cores = 4,
     threads = 1,
-    memory_mb = 2048,
+    memory_mib = 2048,
     max_spread_pct = 80.0,
     max_gap_ms = 6000
 )]
@@ -140,24 +140,24 @@ fn cover_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::dynamic::custom_cgroup_rapid_churn(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cgroup_cpuset_add_remove(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::dynamic::custom_cgroup_cpuset_add_remove(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cgroup_add_during_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::dynamic::custom_cgroup_add_during_imbalance(ctx)
 }
 
 // -- interaction --
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cgroup_imbalance_mixed_workload(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_imbalance_mixed_workload(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048, max_gap_ms = 6000)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048, max_gap_ms = 6000)]
 fn cover_cgroup_add_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_add_load_imbalance(ctx)
 }
@@ -165,59 +165,59 @@ fn cover_cgroup_add_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
 // Test exercises workload generation (heavy/light load oscillation
 // across phases), not scheduler correctness. See cover_sched_mixed
 // for rate-ceiling rationale.
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, max_keep_last_rate = 1000000000.0, max_fallback_rate = 1000000000.0)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mib = 2048, sustained_samples = 25, max_keep_last_rate = 1000000000.0, max_fallback_rate = 1000000000.0)]
 fn cover_cgroup_load_oscillation(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_load_oscillation(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 2, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 2, memory_mib = 2048)]
 fn cover_cgroup_4way_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_4way_load_imbalance(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cgroup_cpuset_imbalance_combined(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_cpuset_imbalance_combined(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cgroup_cpuset_overlap_imbalance_combined(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_cpuset_overlap_imbalance_combined(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cgroup_no_ctrl_task_migration(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_no_ctrl_task_migration(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cgroup_no_ctrl_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_no_ctrl_imbalance(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cgroup_no_ctrl_cpuset_change(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_no_ctrl_cpuset_change(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048, max_gap_ms = 8000)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048, max_gap_ms = 8000)]
 fn cover_cgroup_no_ctrl_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_no_ctrl_load_imbalance(ctx)
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, watchdog_timeout_s = 15)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mib = 2048, sustained_samples = 25, watchdog_timeout_s = 15)]
 fn cover_cgroup_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_io_compute_imbalance(ctx)
 }
 
 // -- nested --
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_nested_cgroup_steady(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::nested::custom_nested_cgroup_steady(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_nested_cgroup_task_move(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::nested::custom_nested_cgroup_task_move(ctx)
 }
@@ -226,7 +226,7 @@ fn cover_nested_cgroup_task_move(ctx: &Ctx) -> Result<AssertResult> {
     llcs = 1,
     cores = 4,
     threads = 1,
-    memory_mb = 2048,
+    memory_mib = 2048,
     max_spread_pct = 80.0,
     max_gap_ms = 6000
 )]
@@ -234,34 +234,34 @@ fn cover_nested_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::nested::custom_nested_cgroup_rapid_churn(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_nested_cgroup_cpuset(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::nested::custom_nested_cgroup_cpuset(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_nested_cgroup_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::nested::custom_nested_cgroup_imbalance(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_nested_cgroup_no_ctrl(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::nested::custom_nested_cgroup_no_ctrl(ctx)
 }
 
 // -- stress --
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cgroup_per_cpu(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::stress::custom_cgroup_per_cpu(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cgroup_exhaust_reuse(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::stress::custom_cgroup_exhaust_reuse(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::stress::custom_cgroup_dsq_contention(ctx)
 }
@@ -270,7 +270,7 @@ fn cover_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
     llcs = 1,
     cores = 4,
     threads = 2,
-    memory_mb = 2048,
+    memory_mib = 2048,
     max_spread_pct = 80.0
 )]
 fn cover_cgroup_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
@@ -281,7 +281,7 @@ fn cover_cgroup_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
     llcs = 1,
     cores = 4,
     threads = 2,
-    memory_mb = 2048,
+    memory_mib = 2048,
     max_spread_pct = 80.0,
     duration_s = 10
 )]
@@ -293,41 +293,41 @@ fn cover_cgroup_cpuset_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
     llcs = 1,
     cores = 4,
     threads = 2,
-    memory_mb = 2048,
+    memory_mib = 2048,
     max_spread_pct = 80.0
 )]
 fn cover_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::stress::custom_cgroup_dynamic_workload_variety(ctx)
 }
 
-#[ktstr_test(llcs = 2, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 2, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cgroup_cpuset_cross_llc_race(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::stress::custom_cgroup_cpuset_cross_llc_race(ctx)
 }
 
 // -- performance --
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cache_pressure_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::performance::custom_cache_pressure_imbalance(ctx)
 }
 
-#[ktstr_test(llcs = 2, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 2, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cache_yield_wake_affine(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::performance::custom_cache_yield_wake_affine(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_cache_pipe_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::performance::custom_cache_pipe_io_compute_imbalance(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_fan_out_wake(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::performance::custom_fan_out_wake(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_fan_out_compute(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::performance::custom_fan_out_compute(ctx)
 }
@@ -336,7 +336,7 @@ fn cover_fan_out_compute(ctx: &Ctx) -> Result<AssertResult> {
 
 #[ktstr_test(
     scheduler = KTSTR_SCHED,
-    llcs = 1, cores = 4, threads = 1, memory_mb = 2048,
+    llcs = 1, cores = 4, threads = 1, memory_mib = 2048,
     watchdog_timeout_s = 60,
     duration_s = 30,
     max_imbalance_ratio = 10.0,
@@ -463,7 +463,7 @@ static __KTSTR_ENTRY_DEMO_BPF_CRASH: KtstrTestEntry = KtstrTestEntry {
     llcs = 1,
     cores = 4,
     threads = 1,
-    memory_mb = 2048,
+    memory_mib = 2048,
     bpf_map_write = BPF_CRASH,
     expect_err = true,
     expect_scx_bpf_error_matches = r"ktstr:\s+host-triggered\s+crash",
@@ -477,7 +477,7 @@ fn neg_expect_scx_bpf_error_matches_e2e(ctx: &Ctx) -> Result<AssertResult> {
     llcs = 1,
     cores = 4,
     threads = 1,
-    memory_mb = 2048,
+    memory_mib = 2048,
     bpf_map_write = BPF_CRASH,
     expect_err = true,
     expect_scx_bpf_error_contains = "ktstr: host-triggered crash",
@@ -513,7 +513,7 @@ static __KTSTR_ENTRY_DEMO_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
 
 #[ktstr_test(
     scheduler = KTSTR_SCHED,
-    llcs = 1, cores = 4, threads = 1, memory_mb = 2048,
+    llcs = 1, cores = 4, threads = 1, memory_mib = 2048,
     watchdog_timeout_s = 60,
     max_imbalance_ratio = 20.0,
     sustained_samples = 15,
@@ -531,7 +531,7 @@ fn cover_monitor_evaluation(ctx: &Ctx) -> Result<AssertResult> {
     llcs = 1,
     cores = 4,
     threads = 1,
-    memory_mb = 2048,
+    memory_mib = 2048,
     max_spread_pct = 80.0
 )]
 fn cover_op_move_all_tasks(ctx: &Ctx) -> Result<AssertResult> {
@@ -552,7 +552,7 @@ fn cover_op_move_all_tasks(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_op_spawn_host(ctx: &Ctx) -> Result<AssertResult> {
     use ktstr::scenario::ops::{CgroupDef, Op, Step, execute_steps};
     use ktstr::workload::{WorkSpec, WorkType};
@@ -570,7 +570,7 @@ fn cover_op_spawn_host(ctx: &Ctx) -> Result<AssertResult> {
 
 // -- workload coverage --
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_work_type_sequence(ctx: &Ctx) -> Result<AssertResult> {
     use ktstr::scenario::ops::{CgroupDef, Step, execute_steps};
     use ktstr::workload::{Phase, WorkType};
@@ -589,7 +589,7 @@ fn cover_work_type_sequence(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_execute_defs_two_cgroups(ctx: &Ctx) -> Result<AssertResult> {
     use ktstr::scenario::ops::{CgroupDef, execute_defs};
     use ktstr::workload::WorkType;

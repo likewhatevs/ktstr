@@ -167,7 +167,7 @@ pub(crate) fn read_kernel_init_size(kernel_path: &Path) -> Result<u64> {
 /// memory, BPF maps, and runtime allocations.
 const WORKLOAD_MB: u64 = 256;
 
-pub(crate) fn initramfs_min_memory_mb(budget: &MemoryBudget) -> u32 {
+pub(crate) fn initramfs_min_memory_mib(budget: &MemoryBudget) -> u32 {
     let ceil_mb = |bytes: u64| -> u64 { (bytes + (1 << 20) - 1) >> 20 };
 
     let init_size_mb = ceil_mb(budget.kernel_init_size);
@@ -214,13 +214,13 @@ mod tests {
     /// kernel, no initramfs. Pins the lower bound the deferred-memory
     /// path always allocates.
     #[test]
-    fn initramfs_min_memory_mb_zeros_returns_workload_budget() {
+    fn initramfs_min_memory_mib_zeros_returns_workload_budget() {
         let budget = MemoryBudget {
             uncompressed_initramfs_bytes: 0,
             compressed_initrd_bytes: 0,
             kernel_init_size: 0,
         };
-        assert_eq!(initramfs_min_memory_mb(&budget), WORKLOAD_MB as u32);
+        assert_eq!(initramfs_min_memory_mib(&budget), WORKLOAD_MB as u32);
     }
 
     /// `kernel_init_size` and `compressed_initrd_bytes` flow into
@@ -228,19 +228,19 @@ mod tests {
     /// circular-dependency factor. Verify the math against a
     /// hand-computed reference. Inputs:
     ///   uncompressed=10 MiB, init_size=5 MiB, compressed=2 MiB.
-    /// Hand trace per `initramfs_min_memory_mb`:
+    /// Hand trace per `initramfs_min_memory_mib`:
     ///   uncompressed_scaled = ceil(10*10/9) = ceil(11.111) = 12
     ///   content_mb         = 12 + 5 + 2 = 19
     ///   boot_mb            = ceil(19*64/63) = ceil(19.301) = 20
     ///   total              = 20 + 256 (WORKLOAD_MB) = 276
     #[test]
-    fn initramfs_min_memory_mb_known_input() {
+    fn initramfs_min_memory_mib_known_input() {
         let budget = MemoryBudget {
             uncompressed_initramfs_bytes: 10 * (1 << 20),
             compressed_initrd_bytes: 2 * (1 << 20),
             kernel_init_size: 5 * (1 << 20),
         };
-        assert_eq!(initramfs_min_memory_mb(&budget), 276);
+        assert_eq!(initramfs_min_memory_mib(&budget), 276);
     }
 
     /// Sub-MiB inputs round up to 1 MiB before participating in the
@@ -253,13 +253,13 @@ mod tests {
     ///   boot_mb            = ceil(2*64/63) = ceil(2.031) = 3
     ///   total              = 3 + 256 = 259
     #[test]
-    fn initramfs_min_memory_mb_subbyte_uncompressed_rounds_up() {
+    fn initramfs_min_memory_mib_subbyte_uncompressed_rounds_up() {
         let budget = MemoryBudget {
             uncompressed_initramfs_bytes: 1,
             compressed_initrd_bytes: 0,
             kernel_init_size: 0,
         };
-        assert_eq!(initramfs_min_memory_mb(&budget), 259);
+        assert_eq!(initramfs_min_memory_mib(&budget), 259);
     }
 
     /// Larger realistic-shape inputs: uncompressed=200 MiB,
@@ -272,13 +272,13 @@ mod tests {
     ///   boot_mb            = ceil(303*64/63) = ceil(307.809) = 308
     ///   total              = 308 + 256 = 564
     #[test]
-    fn initramfs_min_memory_mb_larger_input() {
+    fn initramfs_min_memory_mib_larger_input() {
         let budget = MemoryBudget {
             uncompressed_initramfs_bytes: 200 * (1 << 20),
             compressed_initrd_bytes: 50 * (1 << 20),
             kernel_init_size: 30 * (1 << 20),
         };
-        assert_eq!(initramfs_min_memory_mb(&budget), 564);
+        assert_eq!(initramfs_min_memory_mib(&budget), 564);
     }
 
     /// `read_kernel_init_size` on x86_64 reads 4 little-endian bytes

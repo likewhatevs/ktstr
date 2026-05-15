@@ -456,10 +456,10 @@ pub(crate) enum KtstrCommand {
         /// Files or directories to include in the guest. Repeatable.
         #[arg(short = 'i', long = "include-files", action = ArgAction::Append)]
         include_files: Vec<PathBuf>,
-        /// Guest memory in MB (minimum 128). When absent, estimated
+        /// Guest memory in MiB (minimum 128). When absent, estimated
         /// from payload and include file sizes.
         #[arg(long = "memory-mb", value_parser = clap::value_parser!(u32).range(128..))]
-        memory_mb: Option<u32>,
+        memory_mib: Option<u32>,
         /// Forward kernel console (COM1/dmesg) to stderr in real-time.
         /// Sets loglevel=7 for verbose kernel output.
         #[arg(long)]

@@ -213,9 +213,9 @@ pub struct KtstrVm {
     pub(crate) run_args: Vec<String>,
     pub(crate) sched_args: Vec<String>,
     pub(crate) topology: Topology,
-    /// Guest memory in MB. `None` = deferred: computed from actual
+    /// Guest memory in MiB. `None` = deferred: computed from actual
     /// initramfs size after the initramfs build completes.
-    pub(crate) memory_mb: Option<u32>,
+    pub(crate) memory_mib: Option<u32>,
     /// Minimum memory in MB for deferred allocation. When non-zero,
     /// the deferred path uses `max(computed, memory_min_mb)` so topology
     /// configs that need more memory than the initramfs floor are honored.
@@ -1392,7 +1392,7 @@ mod tests {
             KtstrVm::builder()
                 .kernel(&kernel)
                 .topology(1, 1, 1, 1)
-                .memory_mb(256)
+                .memory_mib(256)
                 .timeout(Duration::from_secs(10))
                 .cmdline("loglevel=7")
                 .build()
@@ -1413,7 +1413,7 @@ mod tests {
             KtstrVm::builder()
                 .kernel(&kernel)
                 .topology(1, 2, 2, 1) // 4 CPUs
-                .memory_mb(256)
+                .memory_mib(256)
                 .timeout(Duration::from_secs(10))
                 .cmdline("loglevel=7")
                 .build()
@@ -1436,7 +1436,7 @@ mod tests {
             let vm = match KtstrVm::builder()
                 .kernel(&kernel)
                 .topology(1, llcs, cores, threads)
-                .memory_mb(mem)
+                .memory_mib(mem)
                 .timeout(Duration::from_secs(10))
                 .build()
             {
@@ -1743,7 +1743,7 @@ mod tests {
             KtstrVm::builder()
                 .kernel(&kernel)
                 .topology(1, 1, 2, 1)
-                .memory_mb(256)
+                .memory_mib(256)
                 .timeout(Duration::from_secs(15))
                 .cmdline("init=/nonexistent panic=-1")
                 .build()
@@ -1881,7 +1881,7 @@ mod tests {
             KtstrVm::builder()
                 .kernel(&kernel)
                 .topology(1, 1, 1, 1)
-                .memory_mb(256)
+                .memory_mib(256)
                 .timeout(Duration::from_secs(5))
                 .scheduler_binary(&sched_bin)
                 .watchdog_timeout(Duration::from_secs(TIMEOUT_SECS))
@@ -1931,7 +1931,7 @@ mod tests {
             KtstrVm::builder()
                 .kernel(&kernel)
                 .topology(1, 1, 2, 1)
-                .memory_mb(256)
+                .memory_mib(256)
                 .timeout(Duration::from_secs(30))
                 .scheduler_binary(&sched_bin)
                 .watchdog_timeout(Duration::from_secs(300))

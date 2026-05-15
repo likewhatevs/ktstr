@@ -694,8 +694,7 @@ pub struct KtstrTestEntry {
     pub constraints: TopologyConstraints,
     /// Guest memory in MiB (binary mebibytes; conversion at
     /// VM-launch is `value << 20` bytes, not `value * 1_000_000`).
-    /// The `_mb` field suffix is historical.
-    pub memory_mb: u32,
+    pub memory_mib: u32,
     /// Primary scheduler that drives the test. Defaults to
     /// [`Scheduler::EEVDF`] (the no-scx-scheduler placeholder; tests
     /// then run under the kernel's default scheduling class).
@@ -987,7 +986,7 @@ impl KtstrTestEntry {
             distances: None,
         },
         constraints: TopologyConstraints::DEFAULT,
-        memory_mb: 2048,
+        memory_mib: 2048,
         scheduler: &crate::test_support::Scheduler::EEVDF,
         payload: None,
         workloads: &[],
@@ -1023,7 +1022,7 @@ impl KtstrTestEntry {
     ///   sidecar filenames and nextest test IDs; a separator would
     ///   create a synthetic subdirectory in sidecar output and
     ///   mangle `cargo nextest run -E 'test(name)'` filtering).
-    /// - `memory_mb` must be `> 0` (a VM with zero memory cannot boot).
+    /// - `memory_mib` must be `> 0` (a VM with zero memory cannot boot).
     /// - `duration` must be `> 0` (a zero-duration run never exercises
     ///   the scheduler and produces no telemetry).
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -1043,9 +1042,9 @@ impl KtstrTestEntry {
                 self.name,
             );
         }
-        if self.memory_mb == 0 {
+        if self.memory_mib == 0 {
             anyhow::bail!(
-                "KtstrTestEntry '{}'.memory_mb must be > 0 (a VM with \
+                "KtstrTestEntry '{}'.memory_mib must be > 0 (a VM with \
                  zero memory cannot boot)",
                 self.name,
             );
@@ -1601,7 +1600,7 @@ mod tests {
         assert!(d.topology.nodes.is_none());
         assert!(d.topology.distances.is_none());
         assert_eq!(d.constraints, TopologyConstraints::DEFAULT);
-        assert_eq!(d.memory_mb, 2048);
+        assert_eq!(d.memory_mib, 2048);
         // scheduler defaults to `&Scheduler::EEVDF`, whose
         // compile-time-fixed `.name = "eevdf"`. Read directly via
         // field access — no kind dispatch.
@@ -2421,7 +2420,7 @@ mod tests {
         let err = e.validate().unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("memory_mb") && msg.contains("> 0") && msg.contains("'t'"),
+            msg.contains("memory_mib") && msg.contains("> 0") && msg.contains("'t'"),
             "got: {msg}"
         );
     }

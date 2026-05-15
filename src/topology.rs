@@ -759,7 +759,7 @@ impl TestTopology {
     /// Populates LLCs, NUMA nodes, distances, per-node memory info,
     /// and memory-only node flags from the VM spec. Handles both
     /// uniform and explicit-node topologies. For uniform topologies,
-    /// pass `total_memory_mb` to populate per-node memory info; when
+    /// pass `total_memory_mib` to populate per-node memory info; when
     /// `None`, memory info is omitted.
     ///
     /// # Signature asymmetry with [`from_system`](Self::from_system)
@@ -782,7 +782,7 @@ impl TestTopology {
     /// Build a [`TestTopology`] with optional total memory for uniform topologies.
     pub fn from_vm_topology_with_memory(
         topo: &crate::vmm::topology::Topology,
-        total_memory_mb: Option<u32>,
+        total_memory_mib: Option<u32>,
     ) -> Self {
         // Construction-time invariant: every TestTopology has at
         // least one LLC, core, and thread. Downstream code
@@ -843,12 +843,12 @@ impl TestTopology {
         match topo.nodes {
             Some(nodes) => {
                 for (i, node) in nodes.iter().enumerate() {
-                    if node.memory_mb > 0 {
+                    if node.memory_mib > 0 {
                         node_mem.insert(
                             i,
                             NodeMemInfo {
-                                total_kb: (node.memory_mb as u64) * 1024,
-                                free_kb: (node.memory_mb as u64) * 1024,
+                                total_kb: (node.memory_mib as u64) * 1024,
+                                free_kb: (node.memory_mib as u64) * 1024,
                             },
                         );
                     }
@@ -858,7 +858,7 @@ impl TestTopology {
                 }
             }
             None => {
-                if let Some(total_mb) = total_memory_mb {
+                if let Some(total_mb) = total_memory_mib {
                     let per_node_mb = total_mb / numa_nodes;
                     for i in 0..n {
                         let mb = if i == n - 1 {

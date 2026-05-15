@@ -116,7 +116,7 @@ pub fn write_cmdline(guest_mem: &GuestMemoryMmap, cmdline: &str) -> Result<()> {
 pub fn write_boot_params(
     guest_mem: &GuestMemoryMmap,
     cmdline: &str,
-    memory_mb: u32,
+    memory_mib: u32,
     initrd_addr: Option<u64>,
     initrd_size: Option<u32>,
     hdr: Option<&linux_loader::loader::bootparam::setup_header>,
@@ -165,7 +165,7 @@ pub fn write_boot_params(
     // E820 memory map — Firecracker pattern:
     // Entry 0: low memory (0 to EBDA)
     // Entry 1+: high memory (1MB to end, split at MMIO gap if needed)
-    let mem_size = (memory_mb as u64) << 20;
+    let mem_size = (memory_mib as u64) << 20;
     let usable_size = mem_size;
 
     let mut e820_idx = 0;

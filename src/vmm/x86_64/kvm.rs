@@ -129,7 +129,7 @@ pub struct KtstrKvm {
     /// Stored so deferred memory allocation uses the same backing.
     use_hugepages: bool,
     /// Performance mode flag. Stored so deferred memory allocation
-    /// can check hugepage availability fresh when memory_mb was
+    /// can check hugepage availability fresh when memory_mib was
     /// unknown at construction time.
     performance_mode: bool,
     /// Owns the VA reservation for per-node MAP_FIXED mmaps.
@@ -171,17 +171,17 @@ impl Drop for KtstrKvm {
 
 impl KtstrKvm {
     /// Create a new KVM VM with the given topology and memory size.
-    pub fn new(topo: Topology, memory_mb: u32, performance_mode: bool) -> Result<Self> {
-        Self::new_inner(topo, Some(memory_mb), false, performance_mode)
+    pub fn new(topo: Topology, memory_mib: u32, performance_mode: bool) -> Result<Self> {
+        Self::new_inner(topo, Some(memory_mib), false, performance_mode)
     }
 
     /// Create a new KVM VM with hugepage-backed guest memory.
     pub fn new_with_hugepages(
         topo: Topology,
-        memory_mb: u32,
+        memory_mib: u32,
         performance_mode: bool,
     ) -> Result<Self> {
-        Self::new_inner(topo, Some(memory_mb), true, performance_mode)
+        Self::new_inner(topo, Some(memory_mib), true, performance_mode)
     }
 
     /// Create a KVM VM without allocating guest memory.
@@ -202,13 +202,13 @@ impl KtstrKvm {
     /// Should be called exactly once on a VM created with
     /// `new_deferred`; calling twice unconditionally replaces the
     /// backing memory. Replaces the placeholder guest memory with a
-    /// real allocation of `memory_mb` megabytes and sets
+    /// real allocation of `memory_mib` mebibytes and sets
     /// `numa_layout` to the computed per-node GPA layout. Re-checks
     /// hugepage availability when performance_mode is set, since
-    /// memory_mb was unknown at construction time and `use_hugepages`
+    /// memory_mib was unknown at construction time and `use_hugepages`
     /// may have been false.
-    pub fn allocate_and_register_memory(&mut self, memory_mb: u32) -> Result<()> {
-        let layout = NumaMemoryLayout::compute(&self.topology, memory_mb, 0)?;
+    pub fn allocate_and_register_memory(&mut self, memory_mib: u32) -> Result<()> {
+        let layout = NumaMemoryLayout::compute(&self.topology, memory_mib, 0)?;
         let alloc =
             layout.allocate_and_register(&self.vm_fd, self.use_hugepages, self.performance_mode)?;
         // SAFETY: this is the only call to ManuallyDrop::drop on
@@ -223,7 +223,7 @@ impl KtstrKvm {
 
     fn new_inner(
         topo: Topology,
-        memory_mb: Option<u32>,
+        memory_mib: Option<u32>,
         use_hugepages: bool,
         performance_mode: bool,
     ) -> Result<Self> {
@@ -369,7 +369,7 @@ impl KtstrKvm {
             }
         }
 
-        let (guest_mem, numa_layout, reservation) = match memory_mb {
+        let (guest_mem, numa_layout, reservation) = match memory_mib {
             Some(mb) => {
                 let layout = NumaMemoryLayout::compute(&topo, mb, 0)?;
                 let alloc =

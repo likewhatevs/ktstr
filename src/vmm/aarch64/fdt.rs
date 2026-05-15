@@ -59,7 +59,7 @@ const IRQ_TYPE_LEVEL_HIGH: u32 = 4;
 pub fn create_fdt(
     topo: &Topology,
     mpidrs: &[u64],
-    memory_mb: u32,
+    memory_mib: u32,
     cmdline: &str,
     initrd_addr: Option<u64>,
     initrd_size: Option<u32>,
@@ -87,7 +87,7 @@ pub fn create_fdt(
 
     // /memory — guest physical RAM. When numa_nodes > 1, one memory
     // node per NUMA node with disjoint address ranges and numa-node-id.
-    write_memory(&mut fdt, topo, memory_mb, numa_layout)?;
+    write_memory(&mut fdt, topo, memory_mib, numa_layout)?;
 
     // /cpus — one node per vCPU with MPIDR from KVM, plus cache
     // topology nodes when the topology has multiple LLCs.
@@ -179,8 +179,8 @@ pub fn create_fdt(
 ///
 /// The FDT is placed in the last `FDT_MAX_SIZE` bytes of the usable
 /// DRAM region. The address must be 8-byte aligned (FDT spec requirement).
-pub fn fdt_address(memory_mb: u32) -> u64 {
-    let mem_size = (memory_mb as u64) << 20;
+pub fn fdt_address(memory_mib: u32) -> u64 {
+    let mem_size = (memory_mib as u64) << 20;
     let dram_end = DRAM_START + mem_size;
     (dram_end - FDT_MAX_SIZE) & !7
 }
@@ -211,10 +211,10 @@ fn write_chosen(
 fn write_memory(
     fdt: &mut FdtWriter,
     topo: &Topology,
-    memory_mb: u32,
+    memory_mib: u32,
     numa_layout: &NumaMemoryLayout,
 ) -> Result<()> {
-    let mem_size = (memory_mb as u64) << 20;
+    let mem_size = (memory_mib as u64) << 20;
 
     if topo.numa_nodes <= 1 {
         let name = format!("memory@{DRAM_START:x}");
@@ -581,18 +581,18 @@ mod tests {
     fn test_fdt(
         topo: &Topology,
         mpidrs: &[u64],
-        memory_mb: u32,
+        memory_mib: u32,
         cmdline: &str,
         initrd_addr: Option<u64>,
         initrd_size: Option<u32>,
         hw_cache_level: u32,
         guest_l1_unified: bool,
     ) -> Result<Vec<u8>> {
-        let layout = test_layout(topo, memory_mb);
+        let layout = test_layout(topo, memory_mib);
         create_fdt(
             topo,
             mpidrs,
-            memory_mb,
+            memory_mib,
             cmdline,
             initrd_addr,
             initrd_size,
@@ -919,9 +919,9 @@ mod tests {
     }
 
     /// Check multi-NUMA memory nodes: numa-node-id, reg, contiguity, total size.
-    fn check_memory_nodes(topo: &Topology, props: &[(String, String, Vec<u8>)], memory_mb: u32) {
-        let mem_size = (memory_mb as u64) << 20;
-        let layout = NumaMemoryLayout::compute(topo, memory_mb, DRAM_START).unwrap();
+    fn check_memory_nodes(topo: &Topology, props: &[(String, String, Vec<u8>)], memory_mib: u32) {
+        let mem_size = (memory_mib as u64) << 20;
+        let layout = NumaMemoryLayout::compute(topo, memory_mib, DRAM_START).unwrap();
         let regions = layout.regions();
 
         let mut prev_end: Option<u64> = None;
@@ -977,11 +977,11 @@ mod tests {
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
 
-        let memory_mb: u32 = 512;
+        let memory_mib: u32 = 512;
         let dtb = test_fdt(
             &topo,
             &mpidrs,
-            memory_mb,
+            memory_mib,
             "console=ttyS0",
             None,
             None,
@@ -989,7 +989,7 @@ mod tests {
             false,
         )
         .unwrap();
-        check_memory_nodes(&topo, &parse_dtb_props(&dtb), memory_mb);
+        check_memory_nodes(&topo, &parse_dtb_props(&dtb), memory_mib);
     }
 
     #[test]

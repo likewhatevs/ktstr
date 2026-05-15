@@ -23,7 +23,7 @@ use std::time::Duration;
 /// duration is persisted to the sidecar by
 /// [`ktstr::vmm::VmResult::cleanup_duration`], so stats tooling can
 /// spot drift across runs even without a per-test budget assertion.
-#[ktstr_test(llcs = 1, cores = 1, threads = 1, memory_mb = 256)]
+#[ktstr_test(llcs = 1, cores = 1, threads = 1, memory_mib = 256)]
 fn eevdf_empty_run_exits_under_watchdog(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }

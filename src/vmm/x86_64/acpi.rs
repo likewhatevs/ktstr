@@ -1852,8 +1852,8 @@ mod tests {
     fn srat_memory_split_remainder() {
         // 257 MB / 3 nodes: NumaMemoryLayout divides MiB first.
         // per_node_mb = 257/3 = 85, last = 257 - 85*2 = 87.
-        let memory_mb = 257u32;
-        let mem = test_mem(memory_mb);
+        let memory_mib = 257u32;
+        let mem = test_mem(memory_mib);
         let topo = Topology {
             llcs: 3,
             cores_per_llc: 1,
@@ -1862,12 +1862,12 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let mem_bytes = (memory_mb as u64) << 20;
-        let per_node_mb = memory_mb / 3;
+        let mem_bytes = (memory_mib as u64) << 20;
+        let per_node_mb = memory_mib / 3;
         let per_node = (per_node_mb as u64) << 20;
-        let last = (memory_mb - per_node_mb * 2) as u64;
+        let last = (memory_mib - per_node_mb * 2) as u64;
         let last_bytes = last << 20;
-        let l = test_setup(&mem, &topo, memory_mb);
+        let l = test_setup(&mem, &topo, memory_mib);
         let srat = read_table(&mem, l.srat_addr);
         let entries = walk_srat_entries(&srat);
         let mem_entries: Vec<_> = entries.iter().filter(|(t, _, _)| *t == 1).collect();

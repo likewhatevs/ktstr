@@ -119,8 +119,8 @@ See [Budget-based test selection](../running-tests.md#budget-based-test-selectio
 
 ## Memory allocation
 
-Each gauntlet VM gets `max(topology_mb, initramfs_floor)` MiB of RAM,
-where `topology_mb = max(cpus * 64, 256, entry.memory_mb)` is the
+Each gauntlet VM gets `max(topology_mib, initramfs_floor)` MiB of RAM,
+where `topology_mib = max(cpus * 64, 256, entry.memory_mib)` is the
 topology-requested minimum and `initramfs_floor` is computed from
 the actual initramfs size after build. For `max-cpu` (252 CPUs) the
 topology minimum is at least 16128 MiB.

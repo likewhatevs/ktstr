@@ -5,7 +5,7 @@
 //! The builder is the only path that constructs a VM — every field on
 //! the runtime [`super::KtstrVm`] struct flows through one of the setters
 //! plus the `build()` validator, which performs host-resource gating
-//! (LLC reservation, hugepage probe, memory_mb sanity check) before
+//! (LLC reservation, hugepage probe, memory_mib sanity check) before
 //! handing the VM back to the caller.
 //!
 //! Helpers `build_per_node_map` and `acquire_slot_with_locks` live next
@@ -36,7 +36,7 @@ use super::{KtstrVm, disk_config};
 /// # Defaults
 ///
 /// Field defaults applied by [`Default::default`]:
-/// - `memory_mb` — 256 MB (overridden by [`memory_mb`](Self::memory_mb))
+/// - `memory_mib` — 256 MiB (overridden by [`memory_mib`](Self::memory_mib))
 /// - `timeout` — 12 s (overridden by [`timeout`](Self::timeout))
 /// - `watchdog_timeout` — 5 s (overridden by [`watchdog_timeout`](Self::watchdog_timeout))
 /// - `topology` — 1 NUMA node × 1 LLC × 1 core × 1 thread (overridden
@@ -50,7 +50,7 @@ pub struct KtstrVmBuilder {
     run_args: Vec<String>,
     sched_args: Vec<String>,
     pub(crate) topology: Topology,
-    pub(crate) memory_mb: Option<u32>,
+    pub(crate) memory_mib: Option<u32>,
     memory_min_mb: u32,
     pub(crate) cmdline_extra: String,
     pub(crate) timeout: Duration,
@@ -149,7 +149,7 @@ impl Default for KtstrVmBuilder {
                 nodes: None,
                 distances: None,
             },
-            memory_mb: Some(256),
+            memory_mib: Some(256),
             memory_min_mb: 0,
             cmdline_extra: String::new(),
             timeout: Duration::from_secs(12),
@@ -255,8 +255,8 @@ impl KtstrVmBuilder {
     /// Pin guest memory to an explicit MB value and clear the
     /// deferred-sizing hint. Use `memory_deferred` when the payload
     /// size should drive the allocation.
-    pub fn memory_mb(mut self, mb: u32) -> Self {
-        self.memory_mb = Some(mb);
+    pub fn memory_mib(mut self, mb: u32) -> Self {
+        self.memory_mib = Some(mb);
         self.memory_min_mb = 0;
         self
     }
@@ -266,7 +266,7 @@ impl KtstrVmBuilder {
     /// Memory will be computed from the actual initramfs size. Use this
     /// when no explicit `--memory` override is provided.
     pub fn memory_deferred(mut self) -> Self {
-        self.memory_mb = None;
+        self.memory_mib = None;
         self.memory_min_mb = 0;
         self
     }
@@ -276,7 +276,7 @@ impl KtstrVmBuilder {
     /// of that and `min_mb`. Use when the topology needs more memory
     /// than the initramfs alone requires (e.g. NUMA tests with 4096 MB).
     pub fn memory_deferred_min(mut self, min_mb: u32) -> Self {
-        self.memory_mb = None;
+        self.memory_mib = None;
         self.memory_min_mb = min_mb;
         self
     }
@@ -827,15 +827,15 @@ impl KtstrVmBuilder {
         anyhow::ensure!(t.cores_per_llc > 0, "cores_per_llc must be > 0");
         anyhow::ensure!(t.threads_per_core > 0, "threads_per_core must be > 0");
         anyhow::ensure!(t.numa_nodes > 0, "numa_nodes must be > 0");
-        // `memory_mb == Some(0)` would forward a literal `-m 0` to the
+        // `memory_mib == Some(0)` would forward a literal `-m 0` to the
         // VMM backend (KVM rejects it at ioctl time with an opaque
         // error). Catch it here with a clear message so the caller
         // learns they set 0 explicitly rather than seeing a generic
-        // kvm failure later. `None` falls back to the default (256 MB).
-        if matches!(self.memory_mb, Some(0)) {
+        // kvm failure later. `None` falls back to the default (256 MiB).
+        if matches!(self.memory_mib, Some(0)) {
             anyhow::bail!(
-                "memory_mb must be > 0 (a VM with zero memory cannot boot); \
-                 omit `.memory_mb(...)` to use the builder default"
+                "memory_mib must be > 0 (a VM with zero memory cannot boot); \
+                 omit `.memory_mib(...)` to use the builder default"
             );
         }
         if let Some(ref bin) = self.init_binary
@@ -885,7 +885,7 @@ impl KtstrVmBuilder {
             run_args: self.run_args,
             sched_args: self.sched_args,
             topology: self.topology,
-            memory_mb: self.memory_mb,
+            memory_mib: self.memory_mib,
             memory_min_mb: self.memory_min_mb,
             cmdline_extra: self.cmdline_extra,
             timeout: self.timeout,
@@ -960,7 +960,7 @@ impl KtstrVmBuilder {
         let plan = acquire_slot_with_locks(&host_topo, t)?;
 
         // WARN: hugepages (only when memory is known upfront).
-        if let Some(mb) = self.memory_mb {
+        if let Some(mb) = self.memory_mib {
             let free = host_topology::hugepages_free();
             let needed = host_topology::hugepages_needed(mb);
             if free == 0 {
@@ -1063,32 +1063,32 @@ mod tests {
     #[test]
     fn builder_default() {
         let b = KtstrVmBuilder::default();
-        assert_eq!(b.memory_mb, Some(256));
+        assert_eq!(b.memory_mib, Some(256));
         assert_eq!(b.topology.total_cpus(), 1);
     }
 
-    /// Explicit `memory_mb(0)` must be rejected at build time rather
+    /// Explicit `memory_mib(0)` must be rejected at build time rather
     /// than surfacing as an opaque KVM ioctl failure later. The
     /// builder default (None→256) passes.
     #[test]
     fn builder_rejects_explicit_zero_memory() {
         // Point at a real file so the kernel-existence check
-        // (which runs before the memory_mb guard) does not short-
+        // (which runs before the memory_mib guard) does not short-
         // circuit. /bin/true exists on every host the tests care
         // about; its contents don't matter for this check.
         let kernel = std::path::PathBuf::from("/bin/true");
         let result = KtstrVmBuilder::default()
             .kernel(&kernel)
-            .memory_mb(0)
+            .memory_mib(0)
             .no_perf_mode(true)
             .build();
         let err = match result {
             Err(e) => e,
-            Ok(_) => panic!("build() must reject memory_mb(0)"),
+            Ok(_) => panic!("build() must reject memory_mib(0)"),
         };
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("memory_mb") && msg.contains("> 0"),
+            msg.contains("memory_mib") && msg.contains("> 0"),
             "error must name the field and constraint: {msg}"
         );
     }
@@ -1118,10 +1118,10 @@ mod tests {
     fn builder_chain() {
         let b = KtstrVmBuilder::default()
             .topology(1, 2, 2, 2)
-            .memory_mb(4096)
+            .memory_mib(4096)
             .cmdline("root=/dev/sda")
             .timeout(Duration::from_secs(300));
-        assert_eq!(b.memory_mb, Some(4096));
+        assert_eq!(b.memory_mib, Some(4096));
         assert_eq!(b.topology.total_cpus(), 8);
         assert_eq!(b.cmdline_extra, "root=/dev/sda");
         assert_eq!(b.timeout, Duration::from_secs(300));

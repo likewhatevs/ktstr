@@ -18,7 +18,7 @@ use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use super::KtstrVm;
 use super::initramfs_cache::{BaseKey, BaseRef, get_or_build_base};
-use super::memory_budget::{MemoryBudget, initramfs_min_memory_mb, read_kernel_init_size};
+use super::memory_budget::{MemoryBudget, initramfs_min_memory_mib, read_kernel_init_size};
 use super::pi_mutex::PiMutex;
 use super::{disk_config, disk_template, host_topology, initramfs, virtio_blk, virtio_net};
 
@@ -50,8 +50,8 @@ const INITRD_ADDR: u64 = 0x800_0000; // 128 MB
 /// the overlay path reaches `mmap` with a valid alignment regardless
 /// of host page size.
 #[cfg(target_arch = "aarch64")]
-fn aarch64_initrd_addr(memory_mb: u32, initrd_max_size: u64) -> u64 {
-    let fdt_addr = aarch64::fdt::fdt_address(memory_mb);
+fn aarch64_initrd_addr(memory_mib: u32, initrd_max_size: u64) -> u64 {
+    let fdt_addr = aarch64::fdt::fdt_address(memory_mib);
     let page_size = host_page_size();
     let mask = !(page_size - 1);
     // Place initrd just below FDT, host-page-aligned.
@@ -408,7 +408,7 @@ impl KtstrVm {
 
     /// Create the KVM VM and optionally load the kernel.
     ///
-    /// When `memory_mb` is `Some`, allocates guest memory and loads the
+    /// When `memory_mib` is `Some`, allocates guest memory and loads the
     /// kernel immediately (existing path). When `None` (deferred), creates
     /// the VM without memory — allocation and kernel loading happen later
     /// in `setup_memory` after the actual initramfs size is known.
@@ -417,11 +417,11 @@ impl KtstrVm {
     ) -> Result<(kvm::KtstrKvm, Option<boot::KernelLoadResult>)> {
         let t0 = Instant::now();
         let use_hugepages = self.performance_mode
-            && self.memory_mb.is_some_and(|mb| {
+            && self.memory_mib.is_some_and(|mb| {
                 host_topology::hugepages_free() >= host_topology::hugepages_needed(mb)
             });
 
-        let vm = match self.memory_mb {
+        let vm = match self.memory_mib {
             Some(mb) => {
                 if use_hugepages {
                     kvm::KtstrKvm::new_with_hugepages(self.topology, mb, self.performance_mode)
@@ -440,12 +440,12 @@ impl KtstrVm {
 
         // When memory is already allocated (non-deferred path), do mbind
         // and load kernel now. Deferred path does this in setup_memory.
-        let kernel_result = if self.memory_mb.is_some() {
+        let kernel_result = if self.memory_mib.is_some() {
             if self.performance_mode && !self.mbind_node_map.is_empty() {
                 let layout = vm.numa_layout.as_ref().expect(
                     "numa_layout is Some on the non-deferred allocation path: \
                      allocate_and_register_memory ran during `vm_new` because \
-                     memory_mb was provided up front, and that call sets \
+                     memory_mib was provided up front, and that call sets \
                      numa_layout to Some(...) in src/vmm/{x86_64,aarch64}/kvm.rs",
                 );
                 layout.mbind_regions(&vm.guest_mem, &self.mbind_node_map);
@@ -670,7 +670,7 @@ impl KtstrVm {
     /// x86_64-only: aarch64 uses
     /// [`Self::join_and_load_initramfs_aarch64`], which computes the
     /// FDT-relative load address from the compressed size after the
-    /// suffix is built (the address depends on `memory_mb` AND the
+    /// suffix is built (the address depends on `memory_mib` AND the
     /// total compressed size, neither of which is known until after
     /// the suffix and compression run).
     #[cfg(target_arch = "x86_64")]
@@ -698,8 +698,8 @@ impl KtstrVm {
         );
 
         // Enforce minimum memory for initramfs extraction.
-        // This path is only reached when memory_mb was set explicitly.
-        let memory_mb = self.memory_mb.expect(
+        // This path is only reached when memory_mib was set explicitly.
+        let memory_mib = self.memory_mib.expect(
             "join_and_load_initramfs called in deferred mode; \
              use join_compute_memory_and_load instead",
         );
@@ -713,13 +713,13 @@ impl KtstrVm {
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
         };
-        let min_mb = initramfs_min_memory_mb(&budget);
-        if memory_mb < min_mb {
+        let min_mb = initramfs_min_memory_mib(&budget);
+        if memory_mib < min_mb {
             anyhow::bail!(
                 "VM memory {}MB insufficient for initramfs \
                  (uncompressed={}MB, compressed={}MB, \
                  init_size={}MB): need {}MB",
-                memory_mb,
+                memory_mib,
                 uncompressed_size >> 20,
                 compressed_size >> 20,
                 kernel_init_size >> 20,
@@ -734,12 +734,12 @@ impl KtstrVm {
     /// Deferred memory path: join initramfs, compute memory from actual
     /// size, allocate guest memory, then load initramfs.
     ///
-    /// Returns `(initrd_addr, initrd_size, memory_mb)`.
+    /// Returns `(initrd_addr, initrd_size, memory_mib)`.
     ///
     /// x86_64-only: aarch64 uses
     /// [`Self::join_compute_memory_and_load_aarch64`], which orders
     /// the load_addr computation after `allocate_and_register_memory`
-    /// (the FDT-relative initrd address depends on `memory_mb`,
+    /// (the FDT-relative initrd address depends on `memory_mib`,
     /// which is itself computed from the post-compress total size).
     #[cfg(target_arch = "x86_64")]
     fn join_compute_memory_and_load(
@@ -785,30 +785,30 @@ impl KtstrVm {
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
         };
-        let memory_mb = initramfs_min_memory_mb(&budget).max(self.memory_min_mb);
+        let memory_mib = initramfs_min_memory_mib(&budget).max(self.memory_min_mb);
         tracing::debug!(
             uncompressed_mb = uncompressed_size >> 20,
             compressed_mb = compressed_size >> 20,
             init_size_mb = kernel_init_size >> 20,
             memory_min_mb = self.memory_min_mb,
-            memory_mb,
+            memory_mib,
             "deferred_memory_computed",
         );
 
         // Allocate and register guest memory.
-        vm.allocate_and_register_memory(memory_mb)
-            .with_context(|| format!("allocate deferred memory ({memory_mb}MB)"))?;
+        vm.allocate_and_register_memory(memory_mib)
+            .with_context(|| format!("allocate deferred memory ({memory_mib}MiB)"))?;
 
         // Load pre-compressed data into guest memory. The base is already
         // in the LZ4 SHM cache from get_or_compress_base above, so
         // compress_and_load_initrd will hit the cache.
         let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
-        Ok((Some(load_addr), Some(size), memory_mb))
+        Ok((Some(load_addr), Some(size), memory_mib))
     }
 
-    pub(super) fn effective_memory_mb(&self, guest_mem: &GuestMemoryMmap) -> u32 {
+    pub(super) fn effective_memory_mib(&self, guest_mem: &GuestMemoryMmap) -> u32 {
         use vm_memory::GuestMemoryRegion;
-        match self.memory_mb {
+        match self.memory_mib {
             Some(mb) => mb,
             None => {
                 let total_bytes: u64 = guest_mem.iter().map(|r| r.len()).sum();
@@ -1040,14 +1040,14 @@ impl KtstrVm {
             // Deferred memory path: join initramfs first to learn its size,
             // then allocate memory, load kernel, and load initramfs — all in
             // one shot with no estimation.
-            let (initrd_addr, initrd_size, _memory_mb) = match initramfs_handle {
+            let (initrd_addr, initrd_size, _memory_mib) = match initramfs_handle {
                 Some(handle) => self.join_compute_memory_and_load(vm, handle, INITRD_ADDR)?,
                 None => {
                     // No initramfs — allocate minimum memory.
-                    let memory_mb = 256u32;
-                    vm.allocate_and_register_memory(memory_mb)
+                    let memory_mib = 256u32;
+                    vm.allocate_and_register_memory(memory_mib)
                         .context("allocate deferred memory (no initramfs)")?;
-                    (None, None, memory_mb)
+                    (None, None, memory_mib)
                 }
             };
 
@@ -1068,8 +1068,8 @@ impl KtstrVm {
             (kr, initrd_addr, initrd_size)
         };
 
-        // Resolve effective memory_mb for boot params / ACPI / SHM.
-        let memory_mb = self.effective_memory_mb(&vm.guest_mem);
+        // Resolve effective memory_mib for boot params / ACPI / SHM.
+        let memory_mib = self.effective_memory_mib(&vm.guest_mem);
 
         // Kernel cmdline rationale (per flag):
         //   console=ttyS0        — serial console for host-visible output.
@@ -1225,7 +1225,7 @@ impl KtstrVm {
         boot::write_boot_params(
             &vm.guest_mem,
             &cmdline,
-            memory_mb,
+            memory_mib,
             initrd_addr,
             initrd_size,
             kernel_result.setup_header.as_ref(),
@@ -1313,17 +1313,17 @@ impl KtstrVm {
             // before the COW VMAs are torn down.
             let (initrd_addr, initrd_size) = match initramfs_handle {
                 Some(handle) => {
-                    // `self.memory_mb` is required on the non-deferred
+                    // `self.memory_mib` is required on the non-deferred
                     // path: deferred boots take the early-return branch
                     // below, so we only reach this site after the builder
-                    // accepted a concrete `memory_mb`. Surface it as an
+                    // accepted a concrete `memory_mib`. Surface it as an
                     // error rather than `unwrap()` so a future refactor
                     // that drops the deferred guard fails loudly with an
                     // actionable diagnostic instead of an opaque panic.
-                    let memory_mb = self.memory_mb.context(
-                        "internal: non-deferred aarch64 path requires memory_mb to be set",
+                    let memory_mib = self.memory_mib.context(
+                        "internal: non-deferred aarch64 path requires memory_mib to be set",
                     )?;
-                    self.join_and_load_initramfs_aarch64(vm, handle, memory_mb)?
+                    self.join_and_load_initramfs_aarch64(vm, handle, memory_mib)?
                 }
                 None => (None, None),
             };
@@ -1335,8 +1335,8 @@ impl KtstrVm {
                 Some(handle) => self.join_compute_memory_and_load_aarch64(vm, handle)?,
                 None => {
                     // No initramfs — allocate minimum memory.
-                    let memory_mb = 256u32;
-                    vm.allocate_and_register_memory(memory_mb)
+                    let memory_mib = 256u32;
+                    vm.allocate_and_register_memory(memory_mib)
                         .context("allocate deferred memory (no initramfs, aarch64)")?;
                     (None, None)
                 }
@@ -1356,7 +1356,7 @@ impl KtstrVm {
 
     /// Non-deferred aarch64 initramfs load: join handle, build suffix,
     /// compress base+suffix via the LZ4 SHM cache to learn the
-    /// compressed size, validate that `memory_mb` is sufficient, compute
+    /// compressed size, validate that `memory_mib` is sufficient, compute
     /// the FDT-relative load address, then COW-or-copy the compressed
     /// stream into guest memory via the shared
     /// [`Self::compress_and_load_initrd`] path.
@@ -1364,7 +1364,7 @@ impl KtstrVm {
         &self,
         vm: &mut kvm::KtstrKvm,
         handle: JoinHandle<Result<(BaseRef, BaseKey)>>,
-        memory_mb: u32,
+        memory_mib: u32,
     ) -> Result<(Option<u64>, Option<u32>)> {
         let t0 = Instant::now();
         let (base, key) = handle
@@ -1391,9 +1391,9 @@ impl KtstrVm {
         let lz4_suffix = initramfs::lz4_legacy_compress(&suffix);
         let compressed_size = lz4_base.len() + lz4_suffix.len();
 
-        // Validate the operator-supplied memory_mb against the
+        // Validate the operator-supplied memory_mib against the
         // initramfs budget. Mirrors the x86_64 join_and_load_initramfs
-        // contract: a builder with too-small memory_mb fails fast here
+        // contract: a builder with too-small memory_mib fails fast here
         // instead of OOMing during boot.
         let kernel_init_size = read_kernel_init_size(&self.kernel).unwrap_or(0) as u64;
         let budget = MemoryBudget {
@@ -1401,13 +1401,13 @@ impl KtstrVm {
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
         };
-        let min_mb = initramfs_min_memory_mb(&budget);
-        if memory_mb < min_mb {
+        let min_mb = initramfs_min_memory_mib(&budget);
+        if memory_mib < min_mb {
             anyhow::bail!(
                 "VM memory {}MB insufficient for initramfs \
                  (uncompressed={}MB, compressed={}MB, \
                  init_size={}MB): need {}MB",
-                memory_mb,
+                memory_mib,
                 uncompressed_size >> 20,
                 compressed_size >> 20,
                 kernel_init_size >> 20,
@@ -1415,7 +1415,7 @@ impl KtstrVm {
             );
         }
 
-        let load_addr = aarch64_initrd_addr(memory_mb, compressed_size as u64);
+        let load_addr = aarch64_initrd_addr(memory_mib, compressed_size as u64);
         let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
         Ok((Some(load_addr), Some(size)))
     }
@@ -1467,22 +1467,22 @@ impl KtstrVm {
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
         };
-        let memory_mb = initramfs_min_memory_mb(&budget).max(self.memory_min_mb);
+        let memory_mib = initramfs_min_memory_mib(&budget).max(self.memory_min_mb);
         tracing::debug!(
             uncompressed_mb = uncompressed_size >> 20,
             compressed_mb = compressed_size >> 20,
             init_size_mb = kernel_init_size >> 20,
             memory_min_mb = self.memory_min_mb,
-            memory_mb,
+            memory_mib,
             "deferred_memory_computed",
         );
 
-        vm.allocate_and_register_memory(memory_mb)
-            .with_context(|| format!("allocate deferred memory ({memory_mb}MB, aarch64)"))?;
+        vm.allocate_and_register_memory(memory_mib)
+            .with_context(|| format!("allocate deferred memory ({memory_mib}MiB, aarch64)"))?;
 
-        // Compute load_addr only AFTER memory_mb is known (it determines
+        // Compute load_addr only AFTER memory_mib is known (it determines
         // the FDT position, and the initrd sits just below FDT).
-        let load_addr = aarch64_initrd_addr(memory_mb, compressed_size as u64);
+        let load_addr = aarch64_initrd_addr(memory_mib, compressed_size as u64);
 
         let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
         Ok((Some(load_addr), Some(size)))
@@ -1496,7 +1496,7 @@ impl KtstrVm {
         initrd_addr: Option<u64>,
         initrd_size: Option<u32>,
     ) -> Result<boot::KernelLoadResult> {
-        let memory_mb = self.effective_memory_mb(&vm.guest_mem);
+        let memory_mib = self.effective_memory_mib(&vm.guest_mem);
 
         // Kernel cmdline rationale (per flag) — aarch64 subset of the
         // x86_64 block above. Flags present on both arches carry the
@@ -1561,7 +1561,7 @@ impl KtstrVm {
         let t0 = Instant::now();
         boot::validate_cmdline(&cmdline)?;
 
-        let fdt_addr = aarch64::fdt::fdt_address(memory_mb);
+        let fdt_addr = aarch64::fdt::fdt_address(memory_mib);
         let mpidrs =
             aarch64::topology::read_mpidrs(&vm.vcpus).context("read vCPU MPIDRs for FDT")?;
         let hw_cache_level = aarch64::topology::host_cache_levels();
@@ -1569,7 +1569,7 @@ impl KtstrVm {
         let dtb = aarch64::fdt::create_fdt(
             &self.topology,
             &mpidrs,
-            memory_mb,
+            memory_mib,
             &cmdline,
             initrd_addr,
             initrd_size,
@@ -1602,8 +1602,8 @@ impl KtstrVm {
     #[cfg(target_arch = "aarch64")]
     pub(super) fn setup_vcpus_aarch64(&self, vm: &kvm::KtstrKvm, kernel_entry: u64) -> Result<()> {
         let t0 = Instant::now();
-        let memory_mb = self.effective_memory_mb(&vm.guest_mem);
-        let fdt_addr = aarch64::fdt::fdt_address(memory_mb);
+        let memory_mib = self.effective_memory_mib(&vm.guest_mem);
+        let fdt_addr = aarch64::fdt::fdt_address(memory_mib);
         boot::setup_regs(&vm.vcpus[0], kernel_entry, fdt_addr)?;
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "bsp_setup");
         // APs start powered off via PSCI — no register setup needed.

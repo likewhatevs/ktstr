@@ -554,7 +554,7 @@ pub(crate) fn attempt_auto_repro(
 
     let cmdline_extra = super::runtime::build_cmdline_extra(entry);
 
-    let (vm_topology, memory_mb) = super::runtime::resolve_vm_topology(entry, topo);
+    let (vm_topology, memory_mib) = super::runtime::resolve_vm_topology(entry, topo);
 
     let no_perf_mode = super::runtime::no_perf_mode_for_entry(entry);
     let mut builder = super::runtime::build_vm_builder_base(
@@ -563,7 +563,7 @@ pub(crate) fn attempt_auto_repro(
         ktstr_bin,
         scheduler,
         vm_topology,
-        memory_mb,
+        memory_mib,
         &cmdline_extra,
         &guest_args,
         no_perf_mode,

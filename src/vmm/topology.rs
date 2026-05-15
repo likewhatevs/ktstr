@@ -40,7 +40,7 @@ pub struct NumaNode {
     /// Number of LLCs owned by this node. Zero means memory-only (CXL).
     pub llcs: u32,
     /// Memory attached to this node in MiB.
-    pub memory_mb: u32,
+    pub memory_mib: u32,
     /// HMAT access latency in nanoseconds. `None` uses the default
     /// (100ns for CPU-bearing, 300ns for memory-only). Emitted as
     /// an SLLBI access_latency entry in the HMAT table by
@@ -121,10 +121,10 @@ impl MemSideCache {
 
 impl NumaNode {
     /// Const constructor.
-    pub const fn new(llcs: u32, memory_mb: u32) -> Self {
+    pub const fn new(llcs: u32, memory_mib: u32) -> Self {
         Self {
             llcs,
-            memory_mb,
+            memory_mib,
             latency_ns: None,
             bandwidth_mbs: None,
             mem_side_cache: None,
@@ -132,10 +132,15 @@ impl NumaNode {
     }
 
     /// Const constructor with HMAT attributes.
-    pub const fn with_hmat(llcs: u32, memory_mb: u32, latency_ns: u32, bandwidth_mbs: u32) -> Self {
+    pub const fn with_hmat(
+        llcs: u32,
+        memory_mib: u32,
+        latency_ns: u32,
+        bandwidth_mbs: u32,
+    ) -> Self {
         Self {
             llcs,
-            memory_mb,
+            memory_mib,
             latency_ns: Some(latency_ns),
             bandwidth_mbs: Some(bandwidth_mbs),
             mem_side_cache: None,
@@ -359,7 +364,7 @@ impl Topology {
     /// - `cores_per_llc == 0`
     /// - `threads_per_core == 0`
     /// - node LLC sum overflows `u32`
-    /// - a CPU-bearing node (`llcs > 0`) has `memory_mb == 0`
+    /// - a CPU-bearing node (`llcs > 0`) has `memory_mib == 0`
     /// - total CPU count overflows `u32`
     /// - no node has LLCs (at least one must have `llcs > 0`)
     pub const fn with_nodes(
@@ -388,7 +393,7 @@ impl Topology {
                 None => panic!("invalid Topology: node LLC sum overflows u32"),
             };
             assert!(
-                !(nodes[i].llcs > 0 && nodes[i].memory_mb == 0),
+                !(nodes[i].llcs > 0 && nodes[i].memory_mib == 0),
                 "invalid Topology: CPU-bearing node has zero memory"
             );
             i += 1;
@@ -474,7 +479,7 @@ impl Topology {
                     ));
                 }
                 for (i, node) in nodes.iter().enumerate() {
-                    if node.llcs > 0 && node.memory_mb == 0 {
+                    if node.llcs > 0 && node.memory_mib == 0 {
                         return Err(format!("node {i} has {} LLCs but zero memory", node.llcs,));
                     }
                 }
@@ -589,17 +594,17 @@ impl Topology {
 
     /// Memory in MiB for NUMA node `node_id`.
     ///
-    /// With explicit nodes, returns `nodes[node_id].memory_mb`.
+    /// With explicit nodes, returns `nodes[node_id].memory_mib`.
     /// With uniform distribution, returns `None` (caller must divide
     /// total memory evenly).
-    pub fn node_memory_mb(&self, node_id: u32) -> Option<u32> {
-        self.nodes.map(|nodes| nodes[node_id as usize].memory_mb)
+    pub fn node_memory_mib(&self, node_id: u32) -> Option<u32> {
+        self.nodes.map(|nodes| nodes[node_id as usize].memory_mib)
     }
 
     /// Total memory across all explicit nodes, or `None` for uniform.
-    pub fn total_node_memory_mb(&self) -> Option<u32> {
+    pub fn total_node_memory_mib(&self) -> Option<u32> {
         self.nodes
-            .map(|nodes| nodes.iter().map(|n| n.memory_mb).sum())
+            .map(|nodes| nodes.iter().map(|n| n.memory_mib).sum())
     }
 
     /// Distance from node `i` to node `j`.
@@ -1101,9 +1106,9 @@ mod tests {
     #[test]
     fn with_nodes_memory() {
         let t = Topology::with_nodes(2, 1, &ASYMMETRIC_NODES);
-        assert_eq!(t.node_memory_mb(0), Some(256));
-        assert_eq!(t.node_memory_mb(1), Some(768));
-        assert_eq!(t.total_node_memory_mb(), Some(1024));
+        assert_eq!(t.node_memory_mib(0), Some(256));
+        assert_eq!(t.node_memory_mib(1), Some(768));
+        assert_eq!(t.total_node_memory_mib(), Some(1024));
     }
 
     // -- CXL memory-only node tests --
@@ -1121,7 +1126,7 @@ mod tests {
         assert!(t.has_memory_only_nodes());
         assert_eq!(t.cpu_bearing_nodes(), 2);
         assert_eq!(t.llcs_in_node(2), 0);
-        assert_eq!(t.node_memory_mb(2), Some(1024));
+        assert_eq!(t.node_memory_mib(2), Some(1024));
     }
 
     #[test]
@@ -1318,8 +1323,8 @@ mod tests {
     #[test]
     fn uniform_no_node_memory() {
         let t = Topology::new(2, 4, 2, 1);
-        assert!(t.node_memory_mb(0).is_none());
-        assert!(t.total_node_memory_mb().is_none());
+        assert!(t.node_memory_mib(0).is_none());
+        assert!(t.total_node_memory_mib().is_none());
     }
 
     // -- const construction smoke tests --

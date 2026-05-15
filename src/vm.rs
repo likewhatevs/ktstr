@@ -17,7 +17,7 @@ pub struct TopoPreset {
     pub topology: Topology,
     /// Memory budget for this preset's VM; read by preset-audit tests only.
     #[allow(dead_code)]
-    pub memory_mb: usize,
+    pub memory_mib: usize,
 }
 
 /// Topology presets used by gauntlet mode.
@@ -170,7 +170,7 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
                 nodes: None,
                 distances: None,
             },
-            memory_mb: m,
+            memory_mib: m,
         })
         .chain(numa_defs.iter().map(|&(n, d, nn, s, c, t, m)| TopoPreset {
             name: n,
@@ -183,7 +183,7 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
                 nodes: None,
                 distances: None,
             },
-            memory_mb: m,
+            memory_mib: m,
         }))
         .collect();
 
@@ -225,17 +225,17 @@ mod tests {
     fn gauntlet_presets_memory_sane() {
         for p in &gauntlet_presets() {
             assert!(
-                p.memory_mb >= 512,
+                p.memory_mib >= 512,
                 "{} has too little memory: {}MB",
                 p.name,
-                p.memory_mb
+                p.memory_mib
             );
             let cpus = p.topology.total_cpus() as usize;
             assert!(
-                p.memory_mb >= cpus * 8,
+                p.memory_mib >= cpus * 8,
                 "{} has {}MB for {} CPUs",
                 p.name,
-                p.memory_mb,
+                p.memory_mib,
                 cpus
             );
         }

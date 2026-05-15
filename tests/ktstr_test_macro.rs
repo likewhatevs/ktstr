@@ -9,7 +9,7 @@ use ktstr::scenario::Ctx;
 ///
 /// The generated `#[test]` wrapper calls `run_ktstr_test`, which requires
 /// KVM and a kernel image — it errors if either is unavailable.
-#[ktstr_test(llcs = 1, cores = 2, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 2, threads = 1, memory_mib = 2048)]
 fn basic_topology_check(ctx: &Ctx) -> Result<AssertResult> {
     let total = ctx.topo.total_cpus();
     if total == 0 {
@@ -110,7 +110,7 @@ fn entry_fields_match_attrs() {
     assert_eq!(entry.topology.llcs, 1);
     assert_eq!(entry.topology.cores_per_llc, 2);
     assert_eq!(entry.topology.threads_per_core, 1);
-    assert_eq!(entry.memory_mb, 2048);
+    assert_eq!(entry.memory_mib, 2048);
 }
 
 /// Check default attribute values.
@@ -120,7 +120,7 @@ fn entry_default_fields() {
     assert_eq!(entry.topology.llcs, 1);
     assert_eq!(entry.topology.cores_per_llc, 2);
     assert_eq!(entry.topology.threads_per_core, 1);
-    assert_eq!(entry.memory_mb, 2048);
+    assert_eq!(entry.memory_mib, 2048);
     assert_eq!(entry.constraints.min_numa_nodes, 1);
     assert_eq!(entry.constraints.min_llcs, 1);
     assert!(!entry.constraints.requires_smt);
@@ -641,7 +641,7 @@ fn declare_scheduler_empty_binary() {
     llcs = 2,
     cores = 2,
     threads = 1,
-    memory_mb = 2048,
+    memory_mib = 2048,
     min_numa_nodes = 2,
     max_numa_nodes = 4,
     min_llcs = 2,

@@ -223,7 +223,7 @@ fn zeroed_report(tid: libc::pid_t, start: Instant) -> WorkerReport {
 /// compare `total_iterations` and `schedstat_run_delay_ns` from the
 /// worker reports. A regression shows as lower throughput and higher
 /// run delay on the affected kernel.
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn preempt_regression_fault_under_load(ctx: &Ctx) -> Result<AssertResult> {
     init_shared_futex();
     let fault_lock_wt = WorkType::custom("fault_under_lock", fault_under_lock);

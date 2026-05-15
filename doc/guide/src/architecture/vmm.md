@@ -10,7 +10,7 @@ let result = vmm::KtstrVm::builder()
     .kernel(&kernel_path)
     .init_binary(&ktstr_binary)
     .topology(numa_nodes, llcs, cores_per_llc, threads_per_core)
-    .memory_mb(4096)
+    .memory_mib(4096)
     .run_args(&["run".into(), "--ktstr-test-fn".into(), "my_test".into()])
     .build()?
     .run()?;

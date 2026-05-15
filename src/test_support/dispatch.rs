@@ -770,13 +770,13 @@ fn maybe_dispatch_host_test() -> Option<i32> {
     };
 
     let cpus = llcs * cores * threads;
-    let memory_mb = (cpus * 64).max(256).max(entry.memory_mb);
+    let memory_mib = (cpus * 64).max(256).max(entry.memory_mib);
     let topo = TopoOverride {
         numa_nodes,
         llcs,
         cores,
         threads,
-        memory_mb,
+        memory_mib,
     };
 
     match run_ktstr_test_with_topo(entry, &topo) {
@@ -847,13 +847,13 @@ fn run_deferred_dispatch(_entry: &KtstrTestEntry, deferred_name: &str) -> Result
             .find(|p| p.name == preset_name)
             .ok_or_else(|| anyhow::anyhow!("unknown preset: {preset_name}"))?;
         let t = &preset.topology;
-        let memory_mb = (t.total_cpus() * 64).max(256).max(entry.memory_mb);
+        let memory_mib = (t.total_cpus() * 64).max(256).max(entry.memory_mib);
         let topo = TopoOverride {
             numa_nodes: t.numa_nodes,
             llcs: t.llcs,
             cores: t.cores_per_llc,
             threads: t.threads_per_core,
-            memory_mb,
+            memory_mib,
         };
         return run_ktstr_test_inner(entry, Some(&topo));
     }
@@ -1939,13 +1939,13 @@ pub(crate) fn run_gauntlet_test(rest: &str) -> i32 {
     let t = &preset.topology;
     let cpus = t.total_cpus();
 
-    let memory_mb = (cpus * 64).max(256).max(entry.memory_mb);
+    let memory_mib = (cpus * 64).max(256).max(entry.memory_mib);
     let topo = TopoOverride {
         numa_nodes: t.numa_nodes,
         llcs: t.llcs,
         cores: t.cores_per_llc,
         threads: t.threads_per_core,
-        memory_mb,
+        memory_mib,
     };
 
     if entry.performance_mode && super::runtime::no_perf_mode_active() {

@@ -189,22 +189,22 @@ pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
 /// Resolve the VM topology and memory size from an optional
 /// TopoOverride.
 ///
-/// Returns `(topology, memory_mb)` where `topology` is the
-/// `vmm::topology::Topology` passed to the VM builder and `memory_mb`
+/// Returns `(topology, memory_mib)` where `topology` is the
+/// `vmm::topology::Topology` passed to the VM builder and `memory_mib`
 /// is the memory allocation in megabytes. When `topo` is `Some`, both
 /// come from the override. When `topo` is `None`, the topology comes
 /// from `entry.topology` and memory is `max(total_cpus * 64, 256,
-/// entry.memory_mb)`. Shared with `attempt_auto_repro` so the repro
+/// entry.memory_mib)`. Shared with `attempt_auto_repro` so the repro
 /// VM always sizes memory the same way as the first VM.
 pub(crate) fn resolve_vm_topology(
     entry: &KtstrTestEntry,
     topo: Option<&super::topo::TopoOverride>,
 ) -> (crate::vmm::topology::Topology, u32) {
     match topo {
-        Some(t) => (crate::vmm::topology::Topology::from(t), t.memory_mb),
+        Some(t) => (crate::vmm::topology::Topology::from(t), t.memory_mib),
         None => {
             let cpus = entry.topology.total_cpus();
-            let mem = (cpus * 64).max(256).max(entry.memory_mb);
+            let mem = (cpus * 64).max(256).max(entry.memory_mib);
             (entry.topology, mem)
         }
     }
@@ -427,7 +427,7 @@ pub(crate) fn build_vm_builder_base(
     ktstr_bin: &Path,
     scheduler: Option<&Path>,
     vm_topology: crate::vmm::topology::Topology,
-    memory_mb: u32,
+    memory_mib: u32,
     cmdline_extra: &str,
     guest_args: &[String],
     no_perf_mode: bool,
@@ -446,7 +446,7 @@ pub(crate) fn build_vm_builder_base(
         .kernel(kernel)
         .init_binary(ktstr_bin)
         .with_topology(vm_topology)
-        .memory_deferred_min(memory_mb)
+        .memory_deferred_min(memory_mib)
         .cmdline(cmdline_extra)
         .run_args(guest_args)
         .timeout(vm_timeout_from_entry(entry))
@@ -675,7 +675,7 @@ mod tests {
             llcs: 4,
             cores: 8,
             threads: 2,
-            memory_mb: 4096,
+            memory_mib: 4096,
         };
         let (topo, mem) = resolve_vm_topology(&entry, Some(&over));
         assert_eq!(mem, 4096);
@@ -687,17 +687,17 @@ mod tests {
 
     #[test]
     fn resolve_vm_topology_none_floors_memory_at_256() {
-        // Tiny topology: 1*1*1=1 cpu -> 64 MB raw, entry.memory_mb=0,
+        // Tiny topology: 1*1*1=1 cpu -> 64 MB raw, entry.memory_mib=0,
         // floor = max(64, 256, 0) = 256.
         //
-        // Override memory_mb explicitly to 0 — KtstrTestEntry::DEFAULT
-        // sets memory_mb=2048, which would bypass the floor entirely
+        // Override memory_mib explicitly to 0 — KtstrTestEntry::DEFAULT
+        // sets memory_mib=2048, which would bypass the floor entirely
         // and leave this test vacuously passing regardless of the
-        // max(…, 256, …) branch. Setting memory_mb=0 makes the 256
+        // max(…, 256, …) branch. Setting memory_mib=0 makes the 256
         // floor the exact lower bound the assertion verifies.
         let entry = KtstrTestEntry {
             name: "tiny",
-            memory_mb: 0,
+            memory_mib: 0,
             ..KtstrTestEntry::DEFAULT
         };
         let (_topo, mem) = resolve_vm_topology(&entry, None);
@@ -705,11 +705,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_vm_topology_none_honors_entry_memory_mb() {
-        // Entry with explicit memory_mb above the cpu*64 and 256 floors.
+    fn resolve_vm_topology_none_honors_entry_memory_mib() {
+        // Entry with explicit memory_mib above the cpu*64 and 256 floors.
         let entry = KtstrTestEntry {
             name: "mem",
-            memory_mb: 8192,
+            memory_mib: 8192,
             ..KtstrTestEntry::DEFAULT
         };
         let (_topo, mem) = resolve_vm_topology(&entry, None);

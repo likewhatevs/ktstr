@@ -1010,7 +1010,7 @@ fn run_ktstr_test_inner_impl(
 
     let cmdline_extra = super::runtime::build_cmdline_extra(entry);
 
-    let (vm_topology, memory_mb) = super::runtime::resolve_vm_topology(entry, topo);
+    let (vm_topology, memory_mib) = super::runtime::resolve_vm_topology(entry, topo);
 
     let no_perf_mode = super::runtime::no_perf_mode_for_entry(entry);
 
@@ -1061,7 +1061,7 @@ fn run_ktstr_test_inner_impl(
         &ktstr_bin,
         scheduler.as_deref(),
         vm_topology,
-        memory_mb,
+        memory_mib,
         &cmdline_extra,
         &guest_args,
         no_perf_mode,

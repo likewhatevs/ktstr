@@ -37,7 +37,7 @@ const SCX_CLEANUP_SCHED: Scheduler =
     llcs = 1,
     cores = 1,
     threads = 1,
-    memory_mb = 256,
+    memory_mib = 256,
     cleanup_budget_ms = 5000,
 )]
 fn scx_empty_run_exits_under_watchdog(_ctx: &Ctx) -> Result<AssertResult> {

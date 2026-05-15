@@ -69,7 +69,7 @@ use std::time::Duration;
     llcs = 1,
     cores = 2,
     threads = 1,
-    memory_mb = 1024,
+    memory_mib = 1024,
     max_spread_pct = 80.0,
     duration_s = 5,
     watchdog_timeout_s = 15
@@ -145,7 +145,7 @@ fn validation_wake_chain_pipe_populates_resume_latencies(ctx: &Ctx) -> Result<As
     llcs = 1,
     cores = 2,
     threads = 1,
-    memory_mb = 1024,
+    memory_mib = 1024,
     max_spread_pct = 80.0,
     duration_s = 5,
     watchdog_timeout_s = 15
@@ -227,7 +227,7 @@ fn validation_futex_ping_pong_populates_resume_latencies(ctx: &Ctx) -> Result<As
     llcs = 1,
     cores = 4,
     threads = 1,
-    memory_mb = 1024,
+    memory_mib = 1024,
     max_spread_pct = 80.0,
     duration_s = 5,
     watchdog_timeout_s = 15
@@ -316,7 +316,7 @@ fn validation_mutex_contention_populates_iterations(ctx: &Ctx) -> Result<AssertR
     llcs = 1,
     cores = 2,
     threads = 1,
-    memory_mb = 1024,
+    memory_mib = 1024,
     max_spread_pct = 80.0,
     duration_s = 5,
     watchdog_timeout_s = 15
@@ -404,7 +404,7 @@ fn validation_page_fault_churn_populates_iterations(ctx: &Ctx) -> Result<AssertR
     llcs = 1,
     cores = 1,
     threads = 1,
-    memory_mb = 512,
+    memory_mib = 512,
     max_spread_pct = 80.0,
     duration_s = 5,
     watchdog_timeout_s = 15

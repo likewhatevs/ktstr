@@ -35,7 +35,7 @@ pub(crate) struct AllocatedMemory {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeRegion {
     /// NUMA node index (0-based), matching the index into
-    /// `Topology::nodes`. Nodes with `memory_mb == 0` are omitted.
+    /// `Topology::nodes`. Nodes with `memory_mib == 0` are omitted.
     pub node_id: u32,
     /// Guest physical address where this node's memory starts.
     pub gpa_start: u64,
@@ -70,28 +70,28 @@ impl NumaMemoryLayout {
     /// `dram_base`: GPA where guest RAM starts (0 on x86_64,
     /// `DRAM_START` on aarch64).
     ///
-    /// `total_memory_mb`: total guest memory in MiB. For `with_nodes`
-    /// topologies, must equal the sum of all `NumaNode::memory_mb`.
+    /// `total_memory_mib`: total guest memory in MiB. For `with_nodes`
+    /// topologies, must equal the sum of all `NumaNode::memory_mib`.
     /// For uniform topologies, memory is divided evenly across
     /// `numa_nodes` nodes.
-    pub fn compute(topo: &Topology, total_memory_mb: u32, dram_base: u64) -> Result<Self> {
-        let total_bytes = (total_memory_mb as u64) << 20;
+    pub fn compute(topo: &Topology, total_memory_mib: u32, dram_base: u64) -> Result<Self> {
+        let total_bytes = (total_memory_mib as u64) << 20;
         let numa_nodes = topo.numa_nodes;
 
         match topo.nodes {
             Some(nodes) => {
-                let node_total_mb: u32 = nodes.iter().map(|n| n.memory_mb).sum();
+                let node_total_mb: u32 = nodes.iter().map(|n| n.memory_mib).sum();
                 anyhow::ensure!(
-                    total_memory_mb == node_total_mb,
-                    "total_memory_mb ({total_memory_mb}) must equal \
-                     sum of node memory_mb ({node_total_mb})"
+                    total_memory_mib == node_total_mb,
+                    "total_memory_mib ({total_memory_mib}) must equal \
+                     sum of node memory_mib ({node_total_mb})"
                 );
 
                 let mut regions = Vec::with_capacity(numa_nodes as usize);
                 let mut gpa = dram_base;
 
                 for (i, node) in nodes.iter().enumerate() {
-                    let size = (node.memory_mb as u64) << 20;
+                    let size = (node.memory_mib as u64) << 20;
                     if size == 0 {
                         continue;
                     }
@@ -124,12 +124,12 @@ impl NumaMemoryLayout {
                     });
                 }
 
-                let per_node_mb = total_memory_mb / numa_nodes;
+                let per_node_mb = total_memory_mib / numa_nodes;
                 let mut regions = Vec::with_capacity(numa_nodes as usize);
                 let mut gpa = dram_base;
                 for i in 0..numa_nodes {
                     let mb = if i == numa_nodes - 1 {
-                        total_memory_mb - per_node_mb * (numa_nodes - 1)
+                        total_memory_mib - per_node_mb * (numa_nodes - 1)
                     } else {
                         per_node_mb
                     };
@@ -198,12 +198,12 @@ impl NumaMemoryLayout {
         performance_mode: bool,
     ) -> Result<AllocatedMemory> {
         let total = self.total_bytes() as usize;
-        let memory_mb = (total >> 20) as u32;
+        let memory_mib = (total >> 20) as u32;
 
         let use_hugepages = use_hugepages
             || (performance_mode
                 && super::host_topology::hugepages_free()
-                    >= super::host_topology::hugepages_needed(memory_mb));
+                    >= super::host_topology::hugepages_needed(memory_mib));
 
         // Step 1: Reserve contiguous VA with PROT_NONE.
         let reservation = unsafe {

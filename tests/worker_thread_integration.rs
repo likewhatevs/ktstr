@@ -66,7 +66,7 @@ use ktstr::workload::{
     llcs = 1,
     cores = 2,
     threads = 1,
-    memory_mb = 1024,
+    memory_mib = 1024,
     duration_s = 5,
     watchdog_timeout_s = 15
 )]
@@ -165,7 +165,7 @@ fn thread_integration_spin_wait(ctx: &Ctx) -> Result<AssertResult> {
     llcs = 1,
     cores = 2,
     threads = 1,
-    memory_mb = 1024,
+    memory_mib = 1024,
     duration_s = 5,
     watchdog_timeout_s = 15
 )]
@@ -251,7 +251,7 @@ fn thread_integration_futex_ping_pong(ctx: &Ctx) -> Result<AssertResult> {
     llcs = 1,
     cores = 2,
     threads = 1,
-    memory_mb = 1024,
+    memory_mib = 1024,
     duration_s = 5,
     watchdog_timeout_s = 15
 )]
@@ -334,7 +334,7 @@ fn thread_integration_page_fault_churn(ctx: &Ctx) -> Result<AssertResult> {
     llcs = 1,
     cores = 4,
     threads = 1,
-    memory_mb = 1024,
+    memory_mib = 1024,
     duration_s = 5,
     watchdog_timeout_s = 15
 )]

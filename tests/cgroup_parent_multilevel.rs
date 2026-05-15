@@ -68,7 +68,7 @@ const MULTI_LEVEL_SCHED: Scheduler = Scheduler::new("ktstr_sched")
     llcs = 1,
     cores = 1,
     threads = 1,
-    memory_mb = 256,
+    memory_mib = 256,
 )]
 fn cgroup_parent_three_levels_writes_subtree_control_at_every_ancestor(
     _ctx: &Ctx,

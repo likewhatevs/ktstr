@@ -19,12 +19,12 @@ pub(crate) struct TopoOverride {
     pub llcs: u32,
     pub cores: u32,
     pub threads: u32,
-    pub memory_mb: u32,
+    pub memory_mib: u32,
 }
 
 impl From<&TopoOverride> for crate::vmm::topology::Topology {
     /// Construct a VM-builder [`Topology`](crate::vmm::topology::Topology)
-    /// from an override's four topology axes. `memory_mb` is discarded —
+    /// from an override's four topology axes. `memory_mib` is discarded —
     /// VM memory lives on [`vmm::KtstrVm::builder().memory_deferred_min()`]
     /// which the dispatcher sets separately from the topology.
     fn from(t: &TopoOverride) -> Self {
@@ -38,9 +38,9 @@ impl TopoOverride {
     /// covers runtime-constructed overrides (topology gauntlet
     /// presets, CLI flags that bypass the macro).
     ///
-    /// Unlike the auto-derived `entry.memory_mb` path, which floors
+    /// Unlike the auto-derived `entry.memory_mib` path, which floors
     /// to `max(256, cpus*64)`, an explicit override is used verbatim
-    /// — so `memory_mb == 0` would instruct the VM builder to boot
+    /// — so `memory_mib == 0` would instruct the VM builder to boot
     /// with zero memory, which is a silent configuration error.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.numa_nodes == 0 {
@@ -73,9 +73,9 @@ impl TopoOverride {
                  addressable processors)"
             );
         }
-        if self.memory_mb == 0 {
+        if self.memory_mib == 0 {
             anyhow::bail!(
-                "TopoOverride.memory_mb must be > 0 (a VM with zero memory \
+                "TopoOverride.memory_mib must be > 0 (a VM with zero memory \
                  cannot boot); no implicit floor is applied to override path"
             );
         }
@@ -325,13 +325,13 @@ mod tests {
             llcs: 2,
             cores: 4,
             threads: 2,
-            memory_mb: 8192,
+            memory_mib: 8192,
         };
         assert_eq!(t.numa_nodes, 1);
         assert_eq!(t.llcs, 2);
         assert_eq!(t.cores, 4);
         assert_eq!(t.threads, 2);
-        assert_eq!(t.memory_mb, 8192);
+        assert_eq!(t.memory_mib, 8192);
     }
 
     #[test]
@@ -341,7 +341,7 @@ mod tests {
             llcs: 2,
             cores: 4,
             threads: 2,
-            memory_mb: 8192,
+            memory_mib: 8192,
         };
         t.validate().unwrap();
     }
@@ -353,13 +353,13 @@ mod tests {
             llcs: 2,
             cores: 4,
             threads: 2,
-            memory_mb: 0,
+            memory_mib: 0,
         };
         let err = t.validate().unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("memory_mb") && msg.contains("> 0"),
-            "error must name memory_mb: {msg}"
+            msg.contains("memory_mib") && msg.contains("> 0"),
+            "error must name memory_mib: {msg}"
         );
     }
 
@@ -370,7 +370,7 @@ mod tests {
             llcs: 2,
             cores: 4,
             threads: 2,
-            memory_mb: 8192,
+            memory_mib: 8192,
         };
         assert!(t.validate().is_err());
     }
@@ -382,7 +382,7 @@ mod tests {
             llcs: 0,
             cores: 4,
             threads: 2,
-            memory_mb: 8192,
+            memory_mib: 8192,
         };
         assert!(t.validate().is_err());
     }
@@ -394,7 +394,7 @@ mod tests {
             llcs: 2,
             cores: 0,
             threads: 2,
-            memory_mb: 8192,
+            memory_mib: 8192,
         };
         assert!(t.validate().is_err());
     }
@@ -406,7 +406,7 @@ mod tests {
             llcs: 2,
             cores: 4,
             threads: 0,
-            memory_mb: 8192,
+            memory_mib: 8192,
         };
         assert!(t.validate().is_err());
     }
@@ -420,7 +420,7 @@ mod tests {
             llcs: 1,
             cores: 0x1_0001,
             threads: 0x1_0000,
-            memory_mb: 8192,
+            memory_mib: 8192,
         };
         let err = t.validate().unwrap_err();
         let msg = format!("{err}");
@@ -439,7 +439,7 @@ mod tests {
             llcs: u32::MAX,
             cores: 2,
             threads: 2,
-            memory_mb: 8192,
+            memory_mib: 8192,
         };
         let err = t.validate().unwrap_err();
         let msg = format!("{err}");
@@ -460,7 +460,7 @@ mod tests {
             llcs: u32::MAX,
             cores: 1,
             threads: 1,
-            memory_mb: 8192,
+            memory_mib: 8192,
         };
         t.validate().unwrap();
     }

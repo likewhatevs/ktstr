@@ -78,7 +78,7 @@ fn duplicate_attr_error(ident: &str, span: &dyn ToTokens) -> TokenStream {
 const DEFAULT_LLCS: u32 = 1;
 const DEFAULT_CORES: u32 = 2;
 const DEFAULT_THREADS: u32 = 1;
-const DEFAULT_MEMORY_MB: u32 = 2048;
+const DEFAULT_MEMORY_MIB: u32 = 2048;
 
 /// Canonical list of bool attributes the `#[ktstr_test]` parser
 /// accepts. Used by the NameValue arm's group guard, the bare-form
@@ -202,16 +202,16 @@ impl BoolAttrSlots<'_> {
 ///   - `cores = N` (default: inherited from scheduler, or 2)
 ///   - `threads = N` (default: inherited from scheduler, or 1)
 ///   - `numa_nodes = N` (default: inherited from scheduler, or 1)
-///   - `memory_mb = N` — per-test minimum memory in MiB (default:
+///   - `memory_mib = N` — per-test minimum memory in MiB (default:
 ///     2048). The framework picks `max(total_cpus * 64, 256,
-///     memory_mb)` MiB at VM-launch time, so for tests with more
+///     memory_mib)` MiB at VM-launch time, so for tests with more
 ///     than 32 vCPUs the cpu-based floor dominates the macro
 ///     default. Below ~4 vCPUs the absolute 256-MiB floor wins if
-///     `memory_mb` is also below it. Setting `memory_mb` above
+///     `memory_mib` is also below it. Setting `memory_mib` above
 ///     the cpu-based floor is only meaningful when the test needs
-///     more headroom than the per-cpu budget. The `_mb` suffix
-///     is historical; the conversion at VM-launch is `value << 20`
-///     bytes (binary mebibytes), not decimal megabytes.
+///     more headroom than the per-cpu budget. The unit is binary
+///     mebibytes; the conversion at VM-launch is `value << 20`
+///     bytes, not decimal megabytes.
 ///   - `duration_s = N` — scenario run duration in seconds; maps
 ///     onto `KtstrTestEntry::duration`
 ///   - `watchdog_timeout_s = N` — watchdog fire threshold in
@@ -361,8 +361,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut cores_set = false;
     let mut threads_set = false;
     let mut numa_nodes_set = false;
-    let mut memory_mb = DEFAULT_MEMORY_MB;
-    let mut memory_mb_set = false;
+    let mut memory_mib = DEFAULT_MEMORY_MIB;
+    let mut memory_mib_set = false;
     let mut scheduler: Option<syn::Path> = None;
     let mut payload: Option<syn::Path> = None;
     let mut workloads: Option<Vec<syn::Path>> = None;
@@ -658,7 +658,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     | "cores"
                     | "threads"
                     | "numa_nodes"
-                    | "memory_mb"
+                    | "memory_mib"
                     | "sustained_samples"
                     | "max_gap_ms"
                     | "watchdog_timeout_s"
@@ -709,11 +709,11 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     .unwrap_or_else(|e| panic!("{e}"));
                                 threads_set = true;
                             }
-                            "memory_mb" => {
-                                memory_mb = lit_int
+                            "memory_mib" => {
+                                memory_mib = lit_int
                                     .base10_parse::<u32>()
                                     .unwrap_or_else(|e| panic!("{e}"));
-                                memory_mb_set = true;
+                                memory_mib_set = true;
                             }
                             "sustained_samples" => {
                                 sustained_samples = Some(
@@ -928,10 +928,20 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .to_compile_error()
                         .into();
                     }
+                    "memory_mb" => {
+                        return syn::Error::new_spanned(
+                            path,
+                            "`memory_mb` was renamed to `memory_mib` (the value \
+                             has always been mebibytes; the name now reflects \
+                             the unit).",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mb, scheduler, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, expect_scx_bpf_error_contains, expect_scx_bpf_error_matches, extra_sched_args, extra_include_files, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, bpf_map_write, expect_err, host_only, ignore, cleanup_budget_ms, post_vm, config, num_snapshots"),
+                            format!("unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mib, scheduler, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, expect_scx_bpf_error_contains, expect_scx_bpf_error_matches, extra_sched_args, extra_include_files, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, bpf_map_write, expect_err, host_only, ignore, cleanup_budget_ms, post_vm, config, num_snapshots"),
                         )
                         .to_compile_error()
                         .into();
@@ -1098,10 +1108,10 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error()
         .into();
     }
-    if memory_mb == 0 {
+    if memory_mib == 0 {
         return syn::Error::new(
             proc_macro2::Span::call_site(),
-            "memory_mb must be > 0 (a VM with zero memory cannot boot)",
+            "memory_mib must be > 0 (a VM with zero memory cannot boot)",
         )
         .to_compile_error()
         .into();
@@ -1338,8 +1348,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     // pair when the macro must override the default. This pattern
     // means new struct fields with sane defaults need no macro
     // change — adding to KtstrTestEntry::DEFAULT alone is enough.
-    let memory_mb_field = if memory_mb_set {
-        quote! { memory_mb: #memory_mb, }
+    let memory_mib_field = if memory_mib_set {
+        quote! { memory_mib: #memory_mib, }
     } else {
         quote! {}
     };
@@ -1700,7 +1710,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             // recover; `scheduler` substitutes
             // `Scheduler::EEVDF` when no `scheduler = ...`
             // attribute was supplied. Every remaining field below
-            // (memory_mb, payload, workloads, auto_repro, assert,
+            // (memory_mib, payload, workloads, auto_repro, assert,
             // extra_sched_args, ..., disk, and any future addition)
             // falls through to `..KtstrTestEntry::DEFAULT` when the
             // attribute did not specify a value, so future fields
@@ -1718,7 +1728,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                 max_cpus: #max_cpus_tokens,
             },
             scheduler: #scheduler_tokens,
-            #memory_mb_field
+            #memory_mib_field
             #payload_field
             #workloads_field
             #auto_repro_field

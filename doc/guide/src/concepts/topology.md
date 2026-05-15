@@ -132,7 +132,7 @@ against the cgroup's own cpuset at apply-setup time.
 `Topology` (the VMM's topology spec). Populates LLCs, NUMA nodes,
 distances, per-node memory info, and memory-only node flags.
 
-**`from_vm_topology_with_memory(topo, total_memory_mb) -> Self`** --
+**`from_vm_topology_with_memory(topo, total_memory_mib) -> Self`** --
 same as `from_vm_topology` but accepts an optional total memory size
 for uniform topologies. When `Some`, divides memory evenly across
 nodes to populate `NodeMemInfo`. When `None`, memory info is omitted.

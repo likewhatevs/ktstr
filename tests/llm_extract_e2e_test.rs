@@ -83,10 +83,10 @@ use ktstr::scenario::Ctx;
 /// [`OutputFormat::LlmExtract`](ktstr::test_support::OutputFormat::LlmExtract)
 /// pipeline.
 ///
-/// `llcs = 1, cores = 2, threads = 1, memory_mb = 2048`: schbench
+/// `llcs = 1, cores = 2, threads = 1, memory_mib = 2048`: schbench
 /// wants at least one messenger + one worker thread, so two logical
 /// CPUs is the minimum topology that gives it room to measure wake
-/// latency. 2048 MiB memory_mb matches the other in-VM benchmark
+/// latency. 2048 MiB memory_mib matches the other in-VM benchmark
 /// tests and leaves headroom for schbench's 2 MiB per-thread shm
 /// allocations plus kernel overhead.
 ///
@@ -96,7 +96,7 @@ use ktstr::scenario::Ctx;
 /// extraction is deferred until after VM exit because the model
 /// does not fit in guest RAM. See the module doc for the universal
 /// invariants the host applies.
-#[ktstr_test(llcs = 1, cores = 2, threads = 1, memory_mb = 2048, payload = SCHBENCH, ignore = true)]
+#[ktstr_test(llcs = 1, cores = 2, threads = 1, memory_mib = 2048, payload = SCHBENCH, ignore = true)]
 fn model_loaded_llm_extract_schbench(ctx: &Ctx) -> Result<AssertResult> {
     let (assert_result, _metrics) = ctx.payload(&SCHBENCH).run()?;
     // For `OutputFormat::LlmExtract` payloads, `metrics.metrics` is

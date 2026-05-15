@@ -148,7 +148,7 @@ let vm = vmm::KtstrVm::builder()
     .kernel(&kernel_path)
     .init_binary(&ktstr_binary)
     .topology(1, 2, 4, 2)
-    .memory_mb(4096)
+    .memory_mib(4096)
     .performance_mode(true)
     .build()?
     .run()?;

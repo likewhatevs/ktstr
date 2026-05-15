@@ -1286,7 +1286,7 @@ fn build_template_via_vm(
     let build_result = crate::vmm::KtstrVm::builder()
         .kernel(kernel)
         .topology(1, 1, 1, 1)
-        .memory_mb(256)
+        .memory_mib(256)
         .timeout(std::time::Duration::from_secs(120))
         .cmdline("KTSTR_MODE=disk_template")
         .disk(disk)

@@ -101,7 +101,7 @@ static __KTSTR_ENTRY_CXL_MEM_ONLY: KtstrTestEntry = KtstrTestEntry {
         max_numa_nodes: Some(3),
         ..TopologyConstraints::DEFAULT
     },
-    memory_mb: 640,
+    memory_mib: 640,
     auto_repro: false,
     duration: std::time::Duration::from_secs(3),
     ..KtstrTestEntry::DEFAULT

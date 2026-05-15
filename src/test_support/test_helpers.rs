@@ -357,12 +357,12 @@ pub(crate) fn lifecycle_drain(
 /// `DEFAULT`.
 pub(crate) fn validate_entry(
     name: &'static str,
-    memory_mb: u32,
+    memory_mib: u32,
     duration: Duration,
 ) -> KtstrTestEntry {
     KtstrTestEntry {
         name,
-        memory_mb,
+        memory_mib,
         duration,
         ..KtstrTestEntry::DEFAULT
     }
