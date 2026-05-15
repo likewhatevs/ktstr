@@ -821,16 +821,14 @@ fn write_placeholder_failure_dump_if_missing(path: &std::path::Path, result: &vm
     // Fold BUG SUMMARY into the on-disk reason so the disk artifact
     // matches the stderr summary (the design's stated goal — see
     // src/test_support/output.rs::extract_bug_summary).
-    let sched_log_merged =
-        crate::verifier::concat_sched_log_chunks(result.guest_messages.as_ref());
+    let sched_log_merged = crate::verifier::concat_sched_log_chunks(result.guest_messages.as_ref());
     let sched_log_input: &str = if !sched_log_merged.is_empty() {
         &sched_log_merged
     } else {
         &result.output
     };
     let raw_dump = extract_sched_ext_dump(&result.stderr).unwrap_or_default();
-    let bug_summary =
-        crate::test_support::output::extract_bug_summary(sched_log_input, &raw_dump);
+    let bug_summary = crate::test_support::output::extract_bug_summary(sched_log_input, &raw_dump);
     let reason = match bug_summary {
         Some(s) => format!(
             "test failed at stage `{stage_label}`; no BPF state captured \
@@ -6008,10 +6006,7 @@ mod tests {
         let body = std::fs::read_to_string(&path).expect("readable");
         let report: crate::monitor::dump::FailureDumpReport =
             serde_json::from_str(&body).expect("valid FailureDumpReport JSON");
-        assert!(
-            report.is_placeholder,
-            "stub must carry is_placeholder=true",
-        );
+        assert!(report.is_placeholder, "stub must carry is_placeholder=true",);
         let reason = report
             .sdt_alloc_unavailable
             .as_deref()
@@ -6082,8 +6077,7 @@ mod tests {
         };
         write_placeholder_failure_dump_if_missing(&path, &result);
         let body = std::fs::read_to_string(&path).unwrap();
-        let report: crate::monitor::dump::FailureDumpReport =
-            serde_json::from_str(&body).unwrap();
+        let report: crate::monitor::dump::FailureDumpReport = serde_json::from_str(&body).unwrap();
         let reason = report.sdt_alloc_unavailable.as_deref().unwrap();
         assert!(
             reason.contains(STAGE_INIT_STARTED_NO_PAYLOAD),
@@ -6093,8 +6087,8 @@ mod tests {
     }
 
     /// Reason folds the `BUG SUMMARY` extraction (per phd Finding 3
-    /// + design intent) so the on-disk artifact matches the stderr
-    /// summary instead of being less informative. Synthesize a
+    /// and the design intent) so the on-disk artifact matches the
+    /// stderr summary instead of being less informative. Synthesize a
     /// `result.output` carrying a `scx_bpf_error` line; the
     /// extract_bug_summary fallback path picks it up and the
     /// reason includes a `BUG SUMMARY: ...` clause.
@@ -6109,8 +6103,7 @@ mod tests {
         };
         write_placeholder_failure_dump_if_missing(&path, &result);
         let body = std::fs::read_to_string(&path).unwrap();
-        let report: crate::monitor::dump::FailureDumpReport =
-            serde_json::from_str(&body).unwrap();
+        let report: crate::monitor::dump::FailureDumpReport = serde_json::from_str(&body).unwrap();
         let reason = report.sdt_alloc_unavailable.as_deref().unwrap();
         assert!(
             reason.contains("BUG SUMMARY:"),
@@ -6136,12 +6129,123 @@ mod tests {
         };
         write_placeholder_failure_dump_if_missing(&path, &result);
         let body = std::fs::read_to_string(&path).unwrap();
-        let report: crate::monitor::dump::FailureDumpReport =
-            serde_json::from_str(&body).unwrap();
+        let report: crate::monitor::dump::FailureDumpReport = serde_json::from_str(&body).unwrap();
         let reason = report.sdt_alloc_unavailable.as_deref().unwrap();
         assert!(
             !reason.contains("BUG SUMMARY"),
             "reason must not mention BUG SUMMARY when no actionable text was extracted: {reason}",
+        );
+    }
+
+    /// Pin both production call sites of
+    /// `write_placeholder_failure_dump_if_missing` against regression
+    /// that removes the failure-gating. The helper has no internal
+    /// success check — callers are responsible for never invoking it
+    /// on a successful run. A regression that:
+    ///   - removes the `if !result.success` gate at the post-`vm.run`
+    ///     site → would write a stub on every test, including passing
+    ///     ones (a stub never overwrites a real dump thanks to the
+    ///     `_if_missing` early-return, but a stub on a passing test
+    ///     means sidecar walkers see a placeholder `FailureDumpReport`
+    ///     where none should exist), OR
+    ///   - drops the call in the `post_vm` Err branch → spec-promise
+    ///     parity breaks: host-side-overruled failures
+    ///     (result.success=true but post_vm callback returned Err)
+    ///     would land with no failure-dump artifact at all.
+    ///
+    /// The 6 helper-only unit tests above (`placeholder_dump_*`) cover
+    /// what the helper does once invoked; this test covers when the
+    /// helper is invoked. Interim coverage until an
+    /// `evaluate_vm_result` mock harness lands. Once that harness
+    /// exists, replace this with an E2E test that asserts no stub
+    /// lands when `result.success = true`.
+    ///
+    /// Fragile to source refactors: if production code wraps the call
+    /// sites in a helper function, or spells either gate keyword
+    /// differently (`if result.failed()` vs `if !result.success`,
+    /// `match post_vm(&result) { Err(...) => ... }` vs
+    /// `if let Err(e) = post_vm(&result)`), this test fails even
+    /// when the failure-gating semantics are preserved. Update the
+    /// patterns or migrate to the E2E mock-harness test in that
+    /// case. Site lookup is pattern-based (not order-based) so
+    /// swapping the source-line order of the two sites does not
+    /// false-positive — each gate is searched across all call sites.
+    #[test]
+    fn placeholder_dump_production_call_sites_are_failure_gated() {
+        let src = include_str!("eval.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        // Stop scanning at this test's own fn line so the
+        // include_str! self-reference (the filter literal below)
+        // doesn't match itself as a third production call site.
+        // The helper definition uses `path` (no `&primary_dump_path`
+        // substring), and the 6 sibling unit tests above all use
+        // `&path` — so the `&primary_dump_path` filter naturally
+        // isolates the production sites, except this test which
+        // names the literal verbatim. Bounding the scan to lines
+        // before this fn is the simplest robust exclusion.
+        let test_fn_marker = "fn placeholder_dump_production_call_sites_are_failure_gated";
+        let scan_end = lines
+            .iter()
+            .position(|l| l.contains(test_fn_marker))
+            .expect("test fn must exist (it's this test)");
+        let call_lines: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .take(scan_end)
+            .filter_map(|(i, l)| {
+                l.contains("write_placeholder_failure_dump_if_missing(&primary_dump_path")
+                    .then_some(i)
+            })
+            .collect();
+        let display_lines: Vec<usize> = call_lines.iter().map(|i| i + 1).collect();
+        assert_eq!(
+            call_lines.len(),
+            2,
+            "expected exactly 2 production call sites (matched on &primary_dump_path \
+             to exclude helper definition and unit-test call sites which use &path); \
+             found {} at lines {:?}",
+            call_lines.len(),
+            display_lines,
+        );
+        // Pattern-based site lookup: find the call line whose 10-line
+        // lookback contains `if !result.success` (post-`vm.run` site)
+        // and the call line whose 20-line lookback contains BOTH
+        // halves of the post_vm Err branch gate. Robust to source
+        // reordering — neither site is identified by its position
+        // in the call_lines vec.
+        let success_gated = call_lines.iter().copied().find(|&i| {
+            lines[i.saturating_sub(10)..=i]
+                .join("\n")
+                .contains("if !result.success")
+        });
+        let post_vm_gated = call_lines.iter().copied().find(|&i| {
+            let window = lines[i.saturating_sub(20)..=i].join("\n");
+            window.contains("if let Some(post_vm) = entry.post_vm")
+                && window.contains("let Err(e) = post_vm(&result)")
+        });
+        let success_gated = success_gated.unwrap_or_else(|| {
+            panic!(
+                "no production call site is gated by `if !result.success` (post-`vm.run` \
+                 placeholder emission); production sites at lines: {display_lines:?}",
+            )
+        });
+        let post_vm_gated = post_vm_gated.unwrap_or_else(|| {
+            panic!(
+                "no production call site is gated by \
+                 `if let Some(post_vm) = entry.post_vm && let Err(e) = post_vm(&result)` \
+                 (post_vm Err branch); production sites at lines: {display_lines:?}",
+            )
+        });
+        // Each gate guards a distinct call site. If the same site
+        // satisfies both patterns, one of the two semantic gates is
+        // missing from the OTHER site even though both gate keywords
+        // are present in the file.
+        assert_ne!(
+            success_gated,
+            post_vm_gated,
+            "the same call site (line {}) satisfies both gate patterns; \
+             each gate should guard a different call site (sites: {display_lines:?})",
+            success_gated + 1,
         );
     }
 }
