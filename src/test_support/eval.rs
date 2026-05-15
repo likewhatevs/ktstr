@@ -1576,6 +1576,13 @@ fn run_ktstr_test_inner_impl(
                     .and_then(|k| k.as_u64())
             })
     };
+    // Did the primary VM emit its `PayloadStarting` lifecycle frame?
+    // Computed before constructing repro_fn so the closure can capture
+    // it. The flag gates the "PRIMARY DID NOT REACH WORKLOAD" label
+    // on the auto-repro verdict — see
+    // `label_repro_verdict_when_workload_not_reached` in probe.rs.
+    let primary_reached_workload =
+        crate::test_support::output::primary_reached_workload(result.guest_messages.as_ref());
     let repro_fn = |output: &str| -> Option<String> {
         if !effective_auto_repro {
             return None;
@@ -1589,6 +1596,7 @@ fn run_ktstr_test_inner_impl(
             &result.stderr,
             topo,
             primary_exit_kind,
+            primary_reached_workload,
         );
         // When auto-repro was attempted but produced no data, return a
         // diagnostic so the user knows it was tried.

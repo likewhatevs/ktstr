@@ -238,13 +238,58 @@ pub(crate) fn classify_init_stage(
             latest = Some(phase);
         }
     }
+    // Check for PayloadStarting EXPLICITLY via `primary_reached_workload`
+    // rather than relying on `latest` — both `SchedulerDied` and
+    // `SchedulerNotAttached` lifecycle frames fire BEFORE
+    // `PayloadStarting` (the only emit paths are inside
+    // `start_scheduler` in `vmm::rust_init`, which force-reboots
+    // before the phase-5 PayloadStarting emit). A scheduler that
+    // exits POST-PayloadStarting is reported on a different wire
+    // channel (`MsgType::SchedExit`), not as a `LifecyclePhase`
+    // frame. The "deepest stage reached" is about the workload-entry
+    // threshold (PayloadStarting), not about the most-recent
+    // lifecycle frame; lumping the pre-PayloadStarting failure
+    // phases into STAGE_PAYLOAD_STARTED_NO_RESULT was a pre-existing
+    // bug that mislabeled scheduler-attach failures as "workload
+    // ran."
+    if primary_reached_workload(Some(drain)) {
+        return STAGE_PAYLOAD_STARTED_NO_RESULT;
+    }
     match latest {
-        Some(LifecyclePhase::PayloadStarting)
-        | Some(LifecyclePhase::SchedulerDied)
-        | Some(LifecyclePhase::SchedulerNotAttached) => STAGE_PAYLOAD_STARTED_NO_RESULT,
-        Some(LifecyclePhase::InitStarted) => STAGE_INIT_STARTED_NO_PAYLOAD,
+        Some(_) => STAGE_INIT_STARTED_NO_PAYLOAD,
         None => STAGE_INIT_NOT_STARTED,
     }
+}
+
+/// True when the primary VM emitted a
+/// [`crate::vmm::wire::LifecyclePhase::PayloadStarting`] frame on
+/// its bulk-port drain — the marker that the test workload was
+/// reached.
+///
+/// The auto-repro pipeline uses this directly as a bool gate (see
+/// `label_repro_verdict_when_workload_not_reached`) rather than
+/// inferring "reached workload?" from
+/// [`classify_init_stage`]'s stage string. The bool form decouples
+/// the auto-repro gate from any future bucketing change in the
+/// stage classifier, so a regression to the classifier can't
+/// silently re-introduce the SchedulerNotAttached-misclassification
+/// bug at the auto-repro site. [`classify_init_stage`] in turn
+/// consumes this helper for its own `PayloadStarting` test, keeping
+/// the two functions on a single source of truth for "did the
+/// workload start?"
+pub(crate) fn primary_reached_workload(
+    drain: Option<&vmm::host_comms::BulkDrainResult>,
+) -> bool {
+    use crate::vmm::wire::{LifecyclePhase, MSG_TYPE_LIFECYCLE};
+    let Some(drain) = drain else {
+        return false;
+    };
+    drain.entries.iter().any(|e| {
+        e.msg_type == MSG_TYPE_LIFECYCLE
+            && e.crc_ok
+            && !e.payload.is_empty()
+            && LifecyclePhase::from_wire(e.payload[0]) == Some(LifecyclePhase::PayloadStarting)
+    })
 }
 
 /// Format diagnostic info from COM1 kernel console output, VM exit code,
@@ -843,19 +888,24 @@ mod tests {
     }
 
     #[test]
-    fn classify_scheduler_died_after_init() {
-        // SchedulerDied / SchedulerNotAttached fire AFTER init has
-        // started — both map to the "payload started but no
-        // result" stage so the operator sees the deepest stage
-        // reached. Pin both so a future regression that flipped
-        // either to a shallower stage would trip here.
+    fn classify_scheduler_died_without_payload_starting_is_init_no_payload() {
+        // SchedulerDied / SchedulerNotAttached without a preceding
+        // PayloadStarting frame mean init ran but the workload was
+        // never entered — the scheduler-setup phase failed before
+        // PayloadStarting could fire (rust_init.rs force_reboot
+        // paths at the SchedulerDied / SchedulerNotAttached arms
+        // never reach the workload-launch site). The stage is
+        // STAGE_INIT_STARTED_NO_PAYLOAD, not the deeper
+        // PAYLOAD_STARTED_NO_RESULT bucket — lumping these into
+        // the payload bucket misleads operators into thinking the
+        // workload ran and failed mid-test.
         let died = lifecycle_only_drain(&[
             crate::vmm::wire::LifecyclePhase::InitStarted,
             crate::vmm::wire::LifecyclePhase::SchedulerDied,
         ]);
         assert_eq!(
             classify_init_stage(Some(&died)),
-            STAGE_PAYLOAD_STARTED_NO_RESULT,
+            STAGE_INIT_STARTED_NO_PAYLOAD,
         );
         let not_attached = lifecycle_only_drain(&[
             crate::vmm::wire::LifecyclePhase::InitStarted,
@@ -863,6 +913,25 @@ mod tests {
         ]);
         assert_eq!(
             classify_init_stage(Some(&not_attached)),
+            STAGE_INIT_STARTED_NO_PAYLOAD,
+        );
+    }
+
+    #[test]
+    fn classify_scheduler_died_after_payload_starting_is_payload_no_result() {
+        // SchedulerDied AFTER PayloadStarting means the workload
+        // DID enter — the scheduler died mid-test. This is the
+        // bug-exercised path, correctly classified as
+        // STAGE_PAYLOAD_STARTED_NO_RESULT. Pin so the new
+        // PayloadStarting-explicit gate doesn't accidentally
+        // demote this case.
+        let died_mid_test = lifecycle_only_drain(&[
+            crate::vmm::wire::LifecyclePhase::InitStarted,
+            crate::vmm::wire::LifecyclePhase::PayloadStarting,
+            crate::vmm::wire::LifecyclePhase::SchedulerDied,
+        ]);
+        assert_eq!(
+            classify_init_stage(Some(&died_mid_test)),
             STAGE_PAYLOAD_STARTED_NO_RESULT,
         );
     }

@@ -8168,7 +8168,12 @@ mod tests {
         // Now Spawn a WorkSpec that uses workers_pct(0.5).
         // Llc(0) = 4 CPUs → ceil(4 * 0.5) = 2 workers.
         let work = crate::workload::WorkSpec::default().workers_pct(0.5);
-        apply_ops_test(&ctx, &mut state, &[Op::Spawn { cgroup: "cg_spawn", work }]).unwrap();
+        apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::Spawn { cgroup: std::borrow::Cow::Borrowed("cg_spawn"), work }],
+        )
+        .unwrap();
         let handle = &state
             .handles
             .iter()
@@ -8204,8 +8209,12 @@ mod tests {
         let work = crate::workload::WorkSpec::default()
             .workers(2)
             .workers_pct(0.5);
-        let err = apply_ops_test(&ctx, &mut state, &[Op::Spawn { cgroup: "cg_x", work }])
-            .expect_err("Op::Spawn dual-set must reject");
+        let err = apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::Spawn { cgroup: std::borrow::Cow::Borrowed("cg_x"), work }],
+        )
+        .expect_err("Op::Spawn dual-set must reject");
         let msg = format!("{err}");
         assert!(
             msg.contains("workers_pct") && msg.contains("workers(2)"),

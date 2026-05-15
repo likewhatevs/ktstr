@@ -272,6 +272,48 @@ fn render_failure_dump_file(path: &std::path::Path) -> Option<String> {
     Some(buf)
 }
 
+/// Prepend "PRIMARY DID NOT REACH WORKLOAD" to a repro VM verdict
+/// when the primary VM failed before emitting its `PayloadStarting`
+/// lifecycle frame — the marker that the test workload was reached.
+/// When the primary DID reach the workload (`PayloadStarting` was
+/// emitted) the verdict passes through unchanged: a clean repro run
+/// is load-bearing evidence about reproducibility.
+///
+/// Uses [`primary_reached_workload`] directly rather than
+/// piggybacking on [`classify_init_stage`]'s stage-string bucketing,
+/// because that bucketing lumps `SchedulerNotAttached`
+/// (pre-workload failure) into the same string as `PayloadStarting`
+/// — the bucketed test would mislabel a "scheduler failed to attach"
+/// primary as "reached workload."
+///
+/// The wrap preserves the original verdict on a following line so
+/// operators can still see whether the repro VM itself booted
+/// successfully — useful for distinguishing "primary AND repro both
+/// failed to reach workload" from "primary failed to reach workload
+/// but the repro completed cleanly" (the latter still confirms the
+/// repro VM's boot path works, just on a topology/timing the primary
+/// couldn't survive).
+///
+/// [`primary_reached_workload`]: crate::test_support::output::primary_reached_workload
+/// [`classify_init_stage`]: crate::test_support::output::classify_init_stage
+fn label_repro_verdict_when_workload_not_reached(
+    primary_reached_workload: bool,
+    repro_verdict: &str,
+) -> String {
+    if primary_reached_workload {
+        repro_verdict.to_string()
+    } else {
+        format!(
+            "PRIMARY DID NOT REACH WORKLOAD — auto-repro is not \
+             load-bearing (the primary VM's failure prevented the bug \
+             from being exercised, so the repro's verdict below should \
+             not be read as evidence about bug reproducibility — the \
+             bug was never exercised by either run)\n\
+             {repro_verdict}"
+        )
+    }
+}
+
 /// Classify the repro VM outcome into a single human-readable status
 /// line, used when the probe pipeline produced no events and the
 /// caller needs to tell the user *why* the repro VM did not yield
@@ -421,6 +463,7 @@ pub(crate) fn attempt_auto_repro(
     console_output: &str,
     topo: Option<&TopoOverride>,
     primary_exit_kind: Option<u64>,
+    primary_reached_workload: bool,
 ) -> Option<String> {
     use crate::probe::stack::extract_stack_functions_all;
 
@@ -766,14 +809,24 @@ pub(crate) fn attempt_auto_repro(
     let has_probe = probe_section.is_some();
     let mut out = probe_section.unwrap_or_default();
 
-    // Crash reproduction status when probe data is absent.
+    // Crash reproduction status when probe data is absent. Wrap the
+    // verdict in a "PRIMARY DID NOT REACH WORKLOAD" prefix when the
+    // primary VM failed before the workload could fire — without it,
+    // a clean repro run reads as "bug is gone" when reality is "the
+    // bug was never exercised on either run." The prefix preserves
+    // the repro VM's own diagnostic on the following line so operators
+    // can still see whether the repro VM itself booted successfully.
     if !has_probe {
-        out.push_str(&classify_repro_vm_status(
+        let verdict = classify_repro_vm_status(
             repro_result.timed_out,
             repro_result.crash_message.is_some(),
             &repro_result.output,
             repro_result.exit_code,
             repro_result.guest_messages.as_ref(),
+        );
+        out.push_str(&label_repro_verdict_when_workload_not_reached(
+            primary_reached_workload,
+            &verdict,
         ));
     }
 
@@ -4423,5 +4476,136 @@ mod tests {
 
         // Final drain so a subsequent test (if any) starts clean.
         let _ = take_deferred_probe();
+    }
+
+    /// `label_repro_verdict_when_workload_not_reached` prepends the
+    /// cautionary label when the primary VM did NOT reach its
+    /// workload (no `PayloadStarting` frame). The repro verdict text
+    /// appears on the following line so operators see both.
+    #[test]
+    fn label_repro_verdict_wraps_when_primary_did_not_reach_workload() {
+        use super::label_repro_verdict_when_workload_not_reached;
+        let verdict = "repro VM: scheduler ran normally (crash did not reproduce)";
+        let wrapped = label_repro_verdict_when_workload_not_reached(false, verdict);
+        let lines: Vec<&str> = wrapped.lines().collect();
+        assert!(
+            lines.len() >= 2,
+            "wrap must put the original verdict on a new line: {wrapped}",
+        );
+        assert!(
+            lines[0].starts_with("PRIMARY DID NOT REACH WORKLOAD"),
+            "first line must lead with the cautionary label: {wrapped}",
+        );
+        assert!(
+            wrapped.contains("not load-bearing"),
+            "wrap must call out that auto-repro is not load-bearing: {wrapped}",
+        );
+        assert_eq!(
+            *lines.last().unwrap(),
+            verdict,
+            "last line must be the unmodified original verdict: {wrapped}",
+        );
+    }
+
+    /// False-positive guard: when the primary DID reach its workload
+    /// (the `PayloadStarting` lifecycle frame fired), the repro
+    /// verdict passes through unchanged — a clean repro run is
+    /// load-bearing evidence about reproducibility in that case.
+    #[test]
+    fn label_repro_verdict_passthrough_when_primary_reached_workload() {
+        use super::label_repro_verdict_when_workload_not_reached;
+        let verdict = "repro VM: scheduler ran normally (crash did not reproduce)";
+        let wrapped = label_repro_verdict_when_workload_not_reached(true, verdict);
+        assert_eq!(
+            wrapped, verdict,
+            "primary reached workload; verdict must NOT be wrapped: got {wrapped}",
+        );
+    }
+
+    /// `primary_reached_workload` returns true iff a
+    /// `LifecyclePhase::PayloadStarting` frame is present on the
+    /// primary's bulk-port drain. The check operates DIRECTLY on the
+    /// frame, NOT on `classify_init_stage`'s stage-string bucketing
+    /// — the bucketing lumps `SchedulerNotAttached` (pre-workload
+    /// failure) with `PayloadStarting`, so a stage-string-based gate
+    /// would mislabel "scheduler failed to attach" as "reached
+    /// workload."
+    #[test]
+    fn primary_reached_workload_distinguishes_payload_starting_from_scheduler_not_attached() {
+        use crate::test_support::output::primary_reached_workload;
+        use crate::vmm::host_comms::BulkDrainResult;
+        use crate::vmm::wire::{LifecyclePhase, MSG_TYPE_LIFECYCLE, ShmEntry};
+
+        let phase_entry = |phase: LifecyclePhase| ShmEntry {
+            msg_type: MSG_TYPE_LIFECYCLE,
+            crc_ok: true,
+            payload: vec![phase.wire_value()],
+        };
+
+        // Drain with SchedulerNotAttached only — no PayloadStarting.
+        // primary_reached_workload uses the PayloadStarting frame
+        // DIRECTLY, not classify_init_stage's stage string. Decoupling
+        // the auto-repro gate from the classifier ensures a future
+        // regression to the classifier's bucketing can't silently
+        // re-introduce the SchedulerNotAttached-misclassification bug
+        // here.
+        let drain_only_not_attached = BulkDrainResult {
+            entries: vec![phase_entry(LifecyclePhase::SchedulerNotAttached)],
+        };
+        assert!(
+            !primary_reached_workload(Some(&drain_only_not_attached)),
+            "SchedulerNotAttached without PayloadStarting must NOT count as \
+             reached workload — the auto-repro gate must check the frame \
+             directly, not via any future stage-string bucketing",
+        );
+
+        // Drain with PayloadStarting present — DID reach workload.
+        let drain_with_payload = BulkDrainResult {
+            entries: vec![phase_entry(LifecyclePhase::PayloadStarting)],
+        };
+        assert!(
+            primary_reached_workload(Some(&drain_with_payload)),
+            "PayloadStarting frame must count as reached workload",
+        );
+
+        // No drain — counts as not reached.
+        assert!(
+            !primary_reached_workload(None),
+            "missing drain must NOT count as reached workload",
+        );
+
+        // Drain with InitStarted only — not reached.
+        let drain_only_init = BulkDrainResult {
+            entries: vec![phase_entry(LifecyclePhase::InitStarted)],
+        };
+        assert!(
+            !primary_reached_workload(Some(&drain_only_init)),
+            "InitStarted without PayloadStarting must NOT count as reached workload",
+        );
+
+        // Empty drain (Some, no entries) — not reached. The
+        // `.any()` predicate on an empty iter is false, so this
+        // works by construction, but pin it so a future refactor
+        // that adds a "fallback" branch for the empty case can't
+        // silently flip the answer.
+        let empty_drain = BulkDrainResult { entries: vec![] };
+        assert!(
+            !primary_reached_workload(Some(&empty_drain)),
+            "empty drain (Some, but no entries) must NOT count as reached workload",
+        );
+
+        // CRC-bad PayloadStarting frame — not reached. The
+        // predicate filters on `crc_ok` (output.rs:283) so a
+        // corrupted PayloadStarting frame must not satisfy the
+        // gate. Mirrors classify_init_stage_skips_crc_bad_lifecycle_frames
+        // for primary_reached_workload's parallel filter.
+        let mut crc_bad = BulkDrainResult {
+            entries: vec![phase_entry(LifecyclePhase::PayloadStarting)],
+        };
+        crc_bad.entries[0].crc_ok = false;
+        assert!(
+            !primary_reached_workload(Some(&crc_bad)),
+            "CRC-bad PayloadStarting frame must NOT count as reached workload",
+        );
     }
 }
