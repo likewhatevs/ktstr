@@ -1566,26 +1566,79 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
         state.target_cgroups().add_cgroup_no_cpuset(&def.name)?;
         if let Some(ref cpuset_spec) = def.cpuset {
             let resolved = cpuset_spec.resolve(ctx);
-            // workers_pct + empty cpuset combination produces a more
-            // actionable diagnostic than the generic CpusetSpec
-            // empty-mask rejection — surface "workers_pct(X) on a
-            // cpuset of 0 CPU(s) resolved to 0 workers" instead.
-            // Format mirrors WorkSpec::resolve_workers_pct's bail
-            // (src/workload/config.rs) so the rejection text is
-            // identical whether it fires here or in the per-WorkSpec
-            // resolution loop below.
-            if resolved.is_empty()
-                && let Some(pct) = def.merged_works().iter().find_map(|w| w.workers_pct)
-            {
-                anyhow::bail!(
-                    "cgroup '{}': workers_pct({pct}) on a cpuset of 0 \
-                     CPU(s) resolved to 0 workers (ceil(0 * {pct}) = 0); \
-                     the cgroup would have no workers and downstream \
-                     assertions would vacuously pass — narrow the \
-                     cpuset, raise the fraction, or use `workers(N)` \
-                     instead",
-                    def.name,
-                );
+            // workers_pct + empty cpuset combinations produce more
+            // actionable diagnostics than the generic CpusetSpec
+            // empty-mask rejection — surface them here before
+            // validate's broader empty-Exact reject preempts the
+            // per-pct context.
+            //
+            // Two distinct empty-cpuset misconfigurations:
+            //
+            //   (1) any WorkSpec sets BOTH workers(N) and
+            //       workers_pct(P): the dual-set is the more
+            //       fundamental error and must be resolved before
+            //       the cpuset semantics matter. Surface "BOTH
+            //       workers ... workers_pct" here rather than letting
+            //       validate's empty-mask rejection mask it.
+            //
+            //   (2) one or more WorkSpecs set workers_pct only:
+            //       enumerate every configured pct value so a
+            //       multi-WorkSpec cgroup doesn't silently drop all
+            //       but the first.
+            if resolved.is_empty() {
+                let works = def.merged_works();
+                if let Some(dual_work) = works
+                    .iter()
+                    .find(|w| w.workers_pct.is_some() && w.num_workers.is_some())
+                {
+                    let n = dual_work
+                        .num_workers
+                        .expect("dual_work selected via num_workers.is_some()");
+                    let pct = dual_work
+                        .workers_pct
+                        .expect("dual_work selected via workers_pct.is_some()");
+                    anyhow::bail!(
+                        "cgroup '{}': WorkSpec sets BOTH workers({n}) \
+                         and workers_pct({pct}); pick one — \
+                         workers_pct resolves the cpuset fraction at \
+                         apply-setup time and is incompatible with an \
+                         explicit count. The empty cpuset would \
+                         otherwise mask this conflict; resolve the \
+                         workers/workers_pct conflict first",
+                        def.name,
+                    );
+                }
+                let pcts: Vec<(usize, f64)> = works
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, w)| w.workers_pct.map(|p| (i, p)))
+                    .collect();
+                if !pcts.is_empty() {
+                    let pct_display = if pcts.len() == 1 {
+                        format!("workers_pct({})", pcts[0].1)
+                    } else {
+                        // Include positional indices so the operator
+                        // can disambiguate when the same fraction is
+                        // configured on multiple WorkSpecs (e.g.
+                        // `[works[0]=0.5, works[2]=0.5]` shows which
+                        // entries to adjust without grepping the test).
+                        let list = pcts
+                            .iter()
+                            .map(|(i, p)| format!("works[{i}]={p}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("workers_pct values [{list}]")
+                    };
+                    anyhow::bail!(
+                        "cgroup '{}': {pct_display} on a cpuset of 0 \
+                         CPU(s) would resolve to 0 workers; the cgroup \
+                         would have no workers and downstream \
+                         assertions would vacuously pass — narrow the \
+                         cpuset, raise the fraction, or use \
+                         `workers(N)` instead",
+                        def.name,
+                    );
+                }
             }
             if let Err(reason) = cpuset_spec.validate(ctx) {
                 anyhow::bail!(
@@ -8482,6 +8535,77 @@ mod tests {
              float-to-int `as` cast (RFC 2484); got {:?}",
             resolved.num_workers,
         );
+    }
+
+    /// Empty cpuset + MULTIPLE `WorkSpec`s with distinct `workers_pct`
+    /// values: the diagnostic must enumerate ALL pct values, not just
+    /// the first. An earlier diagnostic used
+    /// `find_map(|w| w.workers_pct)` which dropped subsequent pcts and
+    /// hid that other WorkSpecs in the cgroup also had pct configured.
+    #[test]
+    fn workers_pct_empty_cpuset_multi_workspec_lists_all_pcts() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let def = CgroupDef::named("cg_multi")
+            .with_cpuset(CpusetSpec::Exact(std::collections::BTreeSet::new()))
+            .workers_pct(0.3)
+            .work(crate::workload::WorkSpec::default().workers_pct(0.7))
+            .work(crate::workload::WorkSpec::default().workers_pct(0.5));
+        let err = apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def))
+            .expect_err("multi-workspec workers_pct on empty cpuset must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("0.3") && msg.contains("0.7") && msg.contains("0.5"),
+            "diagnostic must name ALL configured workers_pct values, not just the first: {msg}",
+        );
+        assert!(
+            msg.contains("cpuset of 0"),
+            "diagnostic must still name the empty cpuset size: {msg}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// Empty cpuset + a single `WorkSpec` that sets BOTH `workers(N)`
+    /// AND `workers_pct(p)`: the framework must emit a dual-set-specific
+    /// bail (the more fundamental misconfiguration) rather than letting
+    /// validate's empty-Exact mask preempt it OR the workers_pct-only
+    /// empty-cpuset diagnostic claim "would resolve to 0 workers" (which
+    /// is misleading when workers(N) explicitly sets the count). The
+    /// operator must pick one of `workers` or `workers_pct` before the
+    /// empty-cpuset question is meaningful. Case (1) of the
+    /// empty-cpuset handling in apply_setup surfaces this bail inline
+    /// with the "BOTH workers ... empty cpuset would otherwise mask"
+    /// wording.
+    #[test]
+    fn workers_pct_empty_cpuset_dual_set_bails_with_dedicated_error() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let def = CgroupDef::named("cg_both")
+            .with_cpuset(CpusetSpec::Exact(std::collections::BTreeSet::new()))
+            .workers(2)
+            .workers_pct(0.5);
+        let err = apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def))
+            .expect_err("workers + workers_pct on empty cpuset must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("BOTH workers"),
+            "dual-set error must fire first; got the empty-cpuset diagnostic instead: {msg}",
+        );
+        assert!(
+            !msg.contains("cpuset of 0"),
+            "workers_pct-only empty-cpuset diagnostic must NOT preempt the more fundamental dual-set error: {msg}",
+        );
+        assert!(
+            msg.contains("empty cpuset would otherwise mask"),
+            "dual-set bail must include the case-(1)-specific trailing context that \
+             explains why this fired at apply_setup rather than at the deeper resolve \
+             path: {msg}",
+        );
+        cleanup_state(&mut state);
     }
 
     /// `workers_pct` against an empty cpuset (Exact({})) resolves to
