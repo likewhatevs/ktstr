@@ -458,7 +458,7 @@ pub(crate) enum KtstrCommand {
         include_files: Vec<PathBuf>,
         /// Guest memory in MiB (minimum 128). When absent, estimated
         /// from payload and include file sizes.
-        #[arg(long = "memory-mb", value_parser = clap::value_parser!(u32).range(128..))]
+        #[arg(long = "memory-mib", value_parser = clap::value_parser!(u32).range(128..))]
         memory_mib: Option<u32>,
         /// Forward kernel console (COM1/dmesg) to stderr in real-time.
         /// Sets loglevel=7 for verbose kernel output.

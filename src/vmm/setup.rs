@@ -35,7 +35,7 @@ use super::x86_64::{acpi, boot, kvm, mptable};
 
 /// Address where initramfs is loaded in guest memory.
 #[cfg(target_arch = "x86_64")]
-const INITRD_ADDR: u64 = 0x800_0000; // 128 MB
+const INITRD_ADDR: u64 = 0x800_0000; // 128 MiB
 
 /// Compute initramfs load address at the high end of DRAM, just below
 /// the FDT. Matches Firecracker/Cloud Hypervisor placement pattern —
@@ -417,17 +417,17 @@ impl KtstrVm {
     ) -> Result<(kvm::KtstrKvm, Option<boot::KernelLoadResult>)> {
         let t0 = Instant::now();
         let use_hugepages = self.performance_mode
-            && self.memory_mib.is_some_and(|mb| {
-                host_topology::hugepages_free() >= host_topology::hugepages_needed(mb)
+            && self.memory_mib.is_some_and(|mib| {
+                host_topology::hugepages_free() >= host_topology::hugepages_needed(mib)
             });
 
         let vm = match self.memory_mib {
-            Some(mb) => {
+            Some(mib) => {
                 if use_hugepages {
-                    kvm::KtstrKvm::new_with_hugepages(self.topology, mb, self.performance_mode)
+                    kvm::KtstrKvm::new_with_hugepages(self.topology, mib, self.performance_mode)
                         .context("create VM with hugepages")?
                 } else {
-                    kvm::KtstrKvm::new(self.topology, mb, self.performance_mode)
+                    kvm::KtstrKvm::new(self.topology, mib, self.performance_mode)
                         .context("create VM")?
                 }
             }
@@ -713,17 +713,17 @@ impl KtstrVm {
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
         };
-        let min_mb = initramfs_min_memory_mib(&budget);
-        if memory_mib < min_mb {
+        let min_mib = initramfs_min_memory_mib(&budget);
+        if memory_mib < min_mib {
             anyhow::bail!(
-                "VM memory {}MB insufficient for initramfs \
-                 (uncompressed={}MB, compressed={}MB, \
-                 init_size={}MB): need {}MB",
+                "VM memory {}MiB insufficient for initramfs \
+                 (uncompressed={}MiB, compressed={}MiB, \
+                 init_size={}MiB): need {}MiB",
                 memory_mib,
                 uncompressed_size >> 20,
                 compressed_size >> 20,
                 kernel_init_size >> 20,
-                min_mb,
+                min_mib,
             );
         }
 
@@ -785,12 +785,12 @@ impl KtstrVm {
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
         };
-        let memory_mib = initramfs_min_memory_mib(&budget).max(self.memory_min_mb);
+        let memory_mib = initramfs_min_memory_mib(&budget).max(self.memory_min_mib);
         tracing::debug!(
             uncompressed_mib = uncompressed_size >> 20,
             compressed_mib = compressed_size >> 20,
             init_size_mib = kernel_init_size >> 20,
-            memory_min_mb = self.memory_min_mb,
+            memory_min_mib = self.memory_min_mib,
             memory_mib,
             "deferred_memory_computed",
         );
@@ -809,7 +809,7 @@ impl KtstrVm {
     pub(super) fn effective_memory_mib(&self, guest_mem: &GuestMemoryMmap) -> u32 {
         use vm_memory::GuestMemoryRegion;
         match self.memory_mib {
-            Some(mb) => mb,
+            Some(mib) => mib,
             None => {
                 let total_bytes: u64 = guest_mem.iter().map(|r| r.len()).sum();
                 (total_bytes >> 20) as u32
@@ -1401,17 +1401,17 @@ impl KtstrVm {
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
         };
-        let min_mb = initramfs_min_memory_mib(&budget);
-        if memory_mib < min_mb {
+        let min_mib = initramfs_min_memory_mib(&budget);
+        if memory_mib < min_mib {
             anyhow::bail!(
-                "VM memory {}MB insufficient for initramfs \
-                 (uncompressed={}MB, compressed={}MB, \
-                 init_size={}MB): need {}MB",
+                "VM memory {}MiB insufficient for initramfs \
+                 (uncompressed={}MiB, compressed={}MiB, \
+                 init_size={}MiB): need {}MiB",
                 memory_mib,
                 uncompressed_size >> 20,
                 compressed_size >> 20,
                 kernel_init_size >> 20,
-                min_mb,
+                min_mib,
             );
         }
 
@@ -1467,12 +1467,12 @@ impl KtstrVm {
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
         };
-        let memory_mib = initramfs_min_memory_mib(&budget).max(self.memory_min_mb);
+        let memory_mib = initramfs_min_memory_mib(&budget).max(self.memory_min_mib);
         tracing::debug!(
             uncompressed_mib = uncompressed_size >> 20,
             compressed_mib = compressed_size >> 20,
             init_size_mib = kernel_init_size >> 20,
-            memory_min_mb = self.memory_min_mb,
+            memory_min_mib = self.memory_min_mib,
             memory_mib,
             "deferred_memory_computed",
         );

@@ -51,7 +51,7 @@ enum Command {
         include_files: Vec<PathBuf>,
         /// Guest memory in MiB (minimum 128). When absent, estimated
         /// from payload and include file sizes.
-        #[arg(long = "memory-mb", value_parser = clap::value_parser!(u32).range(128..))]
+        #[arg(long = "memory-mib", value_parser = clap::value_parser!(u32).range(128..))]
         memory_mib: Option<u32>,
         /// Forward kernel console (COM1/dmesg) to stderr in real-time.
         /// Sets loglevel=7 for verbose kernel output.
@@ -1909,6 +1909,25 @@ mod tests {
             }
             _ => panic!("expected Shell"),
         }
+    }
+
+    /// `ktstr shell --memory-mb 256` is rejected because the
+    /// canonical flag was renamed to `--memory-mib`. Pre-1.0
+    /// break-cleanly forbids a compat alias for the old form. A
+    /// regression that re-added `alias = "memory-mb"` to the
+    /// Shell variant's `memory_mib` field would silently accept
+    /// the old spelling — this test pins the reject. Mirrors
+    /// `parse_shell_memory_mb_rejected` in the cargo-ktstr binary
+    /// for symmetric coverage across both binaries.
+    #[test]
+    fn parse_shell_memory_mb_rejected() {
+        let rejected = Cli::try_parse_from(["ktstr", "shell", "--memory-mb", "256"]);
+        assert!(
+            rejected.is_err(),
+            "`--memory-mb` (old flag name) must be rejected — the \
+             canonical name is `--memory-mib`. A regression that \
+             re-added an alias for the old form would surface here.",
+        );
     }
 
     // -- ctprof show CLI tests

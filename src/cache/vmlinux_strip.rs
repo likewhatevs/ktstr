@@ -1,7 +1,7 @@
 //! ELF strip pipeline for the cached vmlinux sidecar.
 //!
 //! The pipeline reduces a full debug vmlinux (potentially hundreds of
-//! MB) to the minimal subset that downstream consumers actually read,
+//! MiB) to the minimal subset that downstream consumers actually read,
 //! while preserving the structural layout the kernel emits so probes
 //! that expect specific section names can still resolve them by name
 //! rather than by index.
@@ -194,11 +194,11 @@ pub(crate) fn strip_vmlinux_debug(vmlinux_path: &Path) -> anyhow::Result<Strippe
     };
 
     let stripped_size = out.len();
-    let saved_mb = (original_size - stripped_size) as f64 / (1024.0 * 1024.0);
+    let saved_mib = (original_size - stripped_size) as f64 / (1024.0 * 1024.0);
     tracing::debug!(
         original = original_size,
         stripped = stripped_size,
-        saved_mb = format!("{saved_mb:.0}"),
+        saved_mib = format!("{saved_mib:.0}"),
         "strip_vmlinux_debug",
     );
 

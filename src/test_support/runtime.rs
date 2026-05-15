@@ -687,7 +687,7 @@ mod tests {
 
     #[test]
     fn resolve_vm_topology_none_floors_memory_at_256() {
-        // Tiny topology: 1*1*1=1 cpu -> 64 MB raw, entry.memory_mib=0,
+        // Tiny topology: 1*1*1=1 cpu -> 64 MiB raw, entry.memory_mib=0,
         // floor = max(64, 256, 0) = 256.
         //
         // Override memory_mib explicitly to 0 — KtstrTestEntry::DEFAULT
@@ -701,7 +701,7 @@ mod tests {
             ..KtstrTestEntry::DEFAULT
         };
         let (_topo, mem) = resolve_vm_topology(&entry, None);
-        assert_eq!(mem, 256, "memory floor = 256 MB, got {mem}");
+        assert_eq!(mem, 256, "memory floor = 256 MiB, got {mem}");
     }
 
     #[test]

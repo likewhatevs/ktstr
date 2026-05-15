@@ -857,17 +857,17 @@ pub(crate) fn ktstr_guest_init() -> ! {
             .ok()
             .and_then(|v| v.split_whitespace().nth(2).map(|s| s.to_string()))
             .unwrap_or_else(|| "unknown".to_string());
-        let mem_mb = fs::read_to_string("/proc/meminfo").ok().and_then(|s| {
+        let mem_mib = fs::read_to_string("/proc/meminfo").ok().and_then(|s| {
             s.lines()
                 .find(|l| l.starts_with("MemTotal:"))
                 .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|kb| kb.parse::<u64>().ok())
-                .map(|kb| kb / 1024)
+                .and_then(|kib| kib.parse::<u64>().ok())
+                .map(|kib| kib / 1024)
         });
         println!("ktstr shell");
         println!("  kernel:    {kernel_version}");
-        if let Some(mb) = mem_mb {
-            println!("  memory:    {mb} MB");
+        if let Some(mib) = mem_mib {
+            println!("  memory:    {mib} MiB");
         }
         print_topology_line();
         print_includes_line();

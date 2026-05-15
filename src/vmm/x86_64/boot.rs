@@ -551,8 +551,8 @@ pub fn setup_lapic(vcpu: &VcpuFd, is_bsp: bool) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn test_mem(mb: u32) -> GuestMemoryMmap {
-        GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), (mb as usize) << 20)]).unwrap()
+    fn test_mem(mib: u32) -> GuestMemoryMmap {
+        GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), (mib as usize) << 20)]).unwrap()
     }
 
     #[test]

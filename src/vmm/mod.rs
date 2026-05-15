@@ -216,10 +216,10 @@ pub struct KtstrVm {
     /// Guest memory in MiB. `None` = deferred: computed from actual
     /// initramfs size after the initramfs build completes.
     pub(crate) memory_mib: Option<u32>,
-    /// Minimum memory in MB for deferred allocation. When non-zero,
-    /// the deferred path uses `max(computed, memory_min_mb)` so topology
+    /// Minimum memory in MiB for deferred allocation. When non-zero,
+    /// the deferred path uses `max(computed, memory_min_mib)` so topology
     /// configs that need more memory than the initramfs floor are honored.
-    pub(crate) memory_min_mb: u32,
+    pub(crate) memory_min_mib: u32,
     pub(crate) cmdline_extra: String,
     pub(crate) timeout: Duration,
     /// Thresholds for reactive SysRq-D dump. When set and the monitor

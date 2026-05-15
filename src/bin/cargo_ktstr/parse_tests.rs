@@ -3238,29 +3238,29 @@ fn parse_locks_watch_rejects_malformed_duration() {
     );
 }
 
-// -- try_get_matches_from: shell --memory-mb / --exec / --dmesg --
+// -- try_get_matches_from: shell --memory-mib / --exec / --dmesg --
 
-/// `cargo ktstr shell --memory-mb 256` round-trips the value
+/// `cargo ktstr shell --memory-mib 256` round-trips the value
 /// through clap's `value_parser!(u32).range(128..)` attribute.
 #[test]
 fn parse_shell_memory_mib_valid() {
     let Cargo {
         command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--memory-mb", "256"])
+    } = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--memory-mib", "256"])
         .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Shell { memory_mib, .. } = k.command else {
         panic!("expected Shell");
     };
-    assert_eq!(memory_mib, Some(256), "--memory-mb 256 must round-trip");
+    assert_eq!(memory_mib, Some(256), "--memory-mib 256 must round-trip");
 }
 
-/// `cargo ktstr shell --memory-mb 128` accepts the range floor —
+/// `cargo ktstr shell --memory-mib 128` accepts the range floor —
 /// the clap range is `128..` (inclusive).
 #[test]
 fn parse_shell_memory_mib_at_range_floor() {
     let Cargo {
         command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--memory-mb", "128"])
+    } = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--memory-mib", "128"])
         .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Shell { memory_mib, .. } = k.command else {
         panic!("expected Shell");
@@ -3268,33 +3268,50 @@ fn parse_shell_memory_mib_at_range_floor() {
     assert_eq!(
         memory_mib,
         Some(128),
-        "--memory-mb 128 must succeed at the inclusive range floor",
+        "--memory-mib 128 must succeed at the inclusive range floor",
     );
 }
 
-/// `cargo ktstr shell --memory-mb 64` is rejected — below the
+/// `cargo ktstr shell --memory-mib 64` is rejected — below the
 /// `value_parser!(u32).range(128..)` floor. Pins the constraint:
 /// a regression that dropped the range or relaxed the lower
 /// bound surfaces here.
 #[test]
 fn parse_shell_memory_mib_below_range_rejected() {
-    let rejected = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--memory-mb", "64"]);
+    let rejected = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--memory-mib", "64"]);
     assert!(
         rejected.is_err(),
-        "--memory-mb 64 must be rejected — value_parser range floor is 128",
+        "--memory-mib 64 must be rejected — value_parser range floor is 128",
     );
 }
 
-/// `cargo ktstr shell --memory-mb -1` is rejected at parse time —
+/// `cargo ktstr shell --memory-mib -1` is rejected at parse time —
 /// the field is `u32`, so a signed value cannot satisfy the
 /// type-level value parser. Pins the unsigned-integer
 /// constraint.
 #[test]
 fn parse_shell_memory_mib_negative_rejected() {
-    let rejected = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--memory-mb", "-1"]);
+    let rejected = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--memory-mib", "-1"]);
     assert!(
         rejected.is_err(),
-        "--memory-mb -1 must be rejected — the field is u32",
+        "--memory-mib -1 must be rejected — the field is u32",
+    );
+}
+
+/// `cargo ktstr shell --memory-mb 256` is rejected because the
+/// canonical flag was renamed to `--memory-mib`. Pre-1.0
+/// break-cleanly forbids a compat alias for the old form. A
+/// regression that re-added `alias = "memory-mb"` to the Shell
+/// variant's `memory_mib` field would silently accept the old
+/// spelling — this test pins the reject.
+#[test]
+fn parse_shell_memory_mb_rejected() {
+    let rejected = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--memory-mb", "256"]);
+    assert!(
+        rejected.is_err(),
+        "`--memory-mb` (old flag name) must be rejected — the \
+         canonical name is `--memory-mib`. A regression that \
+         re-added an alias for the old form would surface here.",
     );
 }
 

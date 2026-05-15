@@ -695,10 +695,10 @@ pub fn kernel_build_pipeline(
         .ok_or_else(|| anyhow::anyhow!("no kernel image found in {}", source_dir.display()))?;
     let vmlinux_path = source_dir.join("vmlinux");
     let vmlinux_ref = if vmlinux_path.exists() {
-        let orig_mb = std::fs::metadata(&vmlinux_path)
+        let orig_mib = std::fs::metadata(&vmlinux_path)
             .map(|m| m.len() as f64 / (1024.0 * 1024.0))
             .unwrap_or(0.0);
-        eprintln!("{cli_label}: caching vmlinux ({orig_mb:.0} MB, will be stripped)");
+        eprintln!("{cli_label}: caching vmlinux ({orig_mib:.0} MiB, will be stripped)");
         Some(vmlinux_path.as_path())
     } else {
         eprintln!("{cli_label}: warning: vmlinux not found, BTF will not be cached");

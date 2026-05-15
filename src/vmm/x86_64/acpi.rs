@@ -953,16 +953,16 @@ fn write_madt(mem: &GuestMemoryMmap, topo: &Topology, addr: u64) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn test_mem(mb: u32) -> GuestMemoryMmap {
-        GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), (mb as usize) << 20)]).unwrap()
+    fn test_mem(mib: u32) -> GuestMemoryMmap {
+        GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), (mib as usize) << 20)]).unwrap()
     }
 
-    fn test_layout(topo: &Topology, mb: u32) -> NumaMemoryLayout {
-        NumaMemoryLayout::compute(topo, mb, 0).unwrap()
+    fn test_layout(topo: &Topology, mib: u32) -> NumaMemoryLayout {
+        NumaMemoryLayout::compute(topo, mib, 0).unwrap()
     }
 
-    fn test_setup(mem: &GuestMemoryMmap, topo: &Topology, mb: u32) -> AcpiLayout {
-        let layout = test_layout(topo, mb);
+    fn test_setup(mem: &GuestMemoryMmap, topo: &Topology, mib: u32) -> AcpiLayout {
+        let layout = test_layout(topo, mib);
         setup_acpi(mem, topo, &layout).unwrap()
     }
 
@@ -1850,8 +1850,8 @@ mod tests {
 
     #[test]
     fn srat_memory_split_remainder() {
-        // 257 MB / 3 nodes: NumaMemoryLayout divides MiB first.
-        // per_node_mb = 257/3 = 85, last = 257 - 85*2 = 87.
+        // 257 MiB / 3 nodes: NumaMemoryLayout divides MiB first.
+        // per_node_mib = 257/3 = 85, last = 257 - 85*2 = 87.
         let memory_mib = 257u32;
         let mem = test_mem(memory_mib);
         let topo = Topology {
@@ -1863,9 +1863,9 @@ mod tests {
             distances: None,
         };
         let mem_bytes = (memory_mib as u64) << 20;
-        let per_node_mb = memory_mib / 3;
-        let per_node = (per_node_mb as u64) << 20;
-        let last = (memory_mib - per_node_mb * 2) as u64;
+        let per_node_mib = memory_mib / 3;
+        let per_node = (per_node_mib as u64) << 20;
+        let last = (memory_mib - per_node_mib * 2) as u64;
         let last_bytes = last << 20;
         let l = test_setup(&mem, &topo, memory_mib);
         let srat = read_table(&mem, l.srat_addr);

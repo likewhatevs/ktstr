@@ -574,8 +574,8 @@ mod tests {
         (0..count).map(|i| (1u64 << 31) | i as u64).collect()
     }
 
-    fn test_layout(topo: &Topology, mb: u32) -> NumaMemoryLayout {
-        NumaMemoryLayout::compute(topo, mb, DRAM_START).unwrap()
+    fn test_layout(topo: &Topology, mib: u32) -> NumaMemoryLayout {
+        NumaMemoryLayout::compute(topo, mib, DRAM_START).unwrap()
     }
 
     fn test_fdt(

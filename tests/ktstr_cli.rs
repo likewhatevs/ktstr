@@ -29,7 +29,7 @@ fn help_shell() {
         .success()
         .stdout(predicate::str::contains("--kernel"))
         .stdout(predicate::str::contains("--topology"))
-        .stdout(predicate::str::contains("--memory-mb"));
+        .stdout(predicate::str::contains("--memory-mib"));
 }
 
 #[test]

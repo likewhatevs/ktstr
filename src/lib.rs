@@ -1153,7 +1153,7 @@ pub fn run_shell(
     }
 
     builder = match memory_mib {
-        Some(mb) => builder.memory_mib(mb),
+        Some(mib) => builder.memory_mib(mib),
         None => builder.memory_deferred(),
     };
 

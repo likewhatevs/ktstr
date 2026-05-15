@@ -80,11 +80,11 @@ impl NumaMemoryLayout {
 
         match topo.nodes {
             Some(nodes) => {
-                let node_total_mb: u32 = nodes.iter().map(|n| n.memory_mib).sum();
+                let node_total_mib: u32 = nodes.iter().map(|n| n.memory_mib).sum();
                 anyhow::ensure!(
-                    total_memory_mib == node_total_mb,
+                    total_memory_mib == node_total_mib,
                     "total_memory_mib ({total_memory_mib}) must equal \
-                     sum of node memory_mib ({node_total_mb})"
+                     sum of node memory_mib ({node_total_mib})"
                 );
 
                 let mut regions = Vec::with_capacity(numa_nodes as usize);
@@ -124,16 +124,16 @@ impl NumaMemoryLayout {
                     });
                 }
 
-                let per_node_mb = total_memory_mib / numa_nodes;
+                let per_node_mib = total_memory_mib / numa_nodes;
                 let mut regions = Vec::with_capacity(numa_nodes as usize);
                 let mut gpa = dram_base;
                 for i in 0..numa_nodes {
-                    let mb = if i == numa_nodes - 1 {
-                        total_memory_mib - per_node_mb * (numa_nodes - 1)
+                    let mib = if i == numa_nodes - 1 {
+                        total_memory_mib - per_node_mib * (numa_nodes - 1)
                     } else {
-                        per_node_mb
+                        per_node_mib
                     };
-                    let size = (mb as u64) << 20;
+                    let size = (mib as u64) << 20;
                     regions.push(NodeRegion {
                         node_id: i,
                         gpa_start: gpa,

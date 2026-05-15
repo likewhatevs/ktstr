@@ -226,14 +226,14 @@ mod tests {
         for p in &gauntlet_presets() {
             assert!(
                 p.memory_mib >= 512,
-                "{} has too little memory: {}MB",
+                "{} has too little memory: {}MiB",
                 p.name,
                 p.memory_mib
             );
             let cpus = p.topology.total_cpus() as usize;
             assert!(
                 p.memory_mib >= cpus * 8,
-                "{} has {}MB for {} CPUs",
+                "{} has {}MiB for {} CPUs",
                 p.name,
                 p.memory_mib,
                 cpus

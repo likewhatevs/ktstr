@@ -33,7 +33,7 @@ static SHARED_CLIENT: OnceLock<Client> = OnceLock::new();
 /// No total request `.timeout()` is set: the same client serves both
 /// short requests (directory listings, releases.json) and large
 /// tarball streams ([`download_stable_tarball`],
-/// [`download_rc_tarball`]), where a 130–180 MB compressed payload
+/// [`download_rc_tarball`]), where a 130–180 MiB compressed payload
 /// over a slow uplink can take minutes of wall-clock to deliver.
 /// Capping that with a per-request timeout would abort legitimate
 /// downloads; bounding only the connect phase preserves the
@@ -467,8 +467,8 @@ fn reject_html_response(response: &reqwest::blocking::Response, url: &str) -> Re
 /// binary the user invoked (`"ktstr"` vs `"cargo ktstr"`).
 fn print_download_size(response: &reqwest::blocking::Response, url: &str, cli_label: &str) {
     if let Some(len) = response.content_length() {
-        let mb = len as f64 / (1024.0 * 1024.0);
-        eprintln!("{cli_label}: downloading {url} ({mb:.1} MB)");
+        let mib = len as f64 / (1024.0 * 1024.0);
+        eprintln!("{cli_label}: downloading {url} ({mib:.1} MiB)");
     } else {
         eprintln!("{cli_label}: downloading {url}");
     }

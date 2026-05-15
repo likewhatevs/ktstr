@@ -51,7 +51,7 @@ pub struct KtstrVmBuilder {
     sched_args: Vec<String>,
     pub(crate) topology: Topology,
     pub(crate) memory_mib: Option<u32>,
-    memory_min_mb: u32,
+    memory_min_mib: u32,
     pub(crate) cmdline_extra: String,
     pub(crate) timeout: Duration,
     pub(crate) monitor_thresholds: Option<crate::monitor::MonitorThresholds>,
@@ -150,7 +150,7 @@ impl Default for KtstrVmBuilder {
                 distances: None,
             },
             memory_mib: Some(256),
-            memory_min_mb: 0,
+            memory_min_mib: 0,
             cmdline_extra: String::new(),
             timeout: Duration::from_secs(12),
             monitor_thresholds: None,
@@ -252,12 +252,12 @@ impl KtstrVmBuilder {
         self
     }
 
-    /// Pin guest memory to an explicit MB value and clear the
+    /// Pin guest memory to an explicit MiB value and clear the
     /// deferred-sizing hint. Use `memory_deferred` when the payload
     /// size should drive the allocation.
-    pub fn memory_mib(mut self, mb: u32) -> Self {
-        self.memory_mib = Some(mb);
-        self.memory_min_mb = 0;
+    pub fn memory_mib(mut self, mib: u32) -> Self {
+        self.memory_mib = Some(mib);
+        self.memory_min_mib = 0;
         self
     }
 
@@ -267,17 +267,17 @@ impl KtstrVmBuilder {
     /// when no explicit `--memory` override is provided.
     pub fn memory_deferred(mut self) -> Self {
         self.memory_mib = None;
-        self.memory_min_mb = 0;
+        self.memory_min_mib = 0;
         self
     }
 
     /// Defer memory allocation with a minimum floor. The deferred path
     /// computes memory from actual initramfs size, then takes the max
-    /// of that and `min_mb`. Use when the topology needs more memory
-    /// than the initramfs alone requires (e.g. NUMA tests with 4096 MB).
-    pub fn memory_deferred_min(mut self, min_mb: u32) -> Self {
+    /// of that and `min_mib`. Use when the topology needs more memory
+    /// than the initramfs alone requires (e.g. NUMA tests with 4096 MiB).
+    pub fn memory_deferred_min(mut self, min_mib: u32) -> Self {
         self.memory_mib = None;
-        self.memory_min_mb = min_mb;
+        self.memory_min_mib = min_mib;
         self
     }
 
@@ -886,7 +886,7 @@ impl KtstrVmBuilder {
             sched_args: self.sched_args,
             topology: self.topology,
             memory_mib: self.memory_mib,
-            memory_min_mb: self.memory_min_mb,
+            memory_min_mib: self.memory_min_mib,
             cmdline_extra: self.cmdline_extra,
             timeout: self.timeout,
             monitor_thresholds: self.monitor_thresholds,
@@ -960,9 +960,9 @@ impl KtstrVmBuilder {
         let plan = acquire_slot_with_locks(&host_topo, t)?;
 
         // WARN: hugepages (only when memory is known upfront).
-        if let Some(mb) = self.memory_mib {
+        if let Some(mib) = self.memory_mib {
             let free = host_topology::hugepages_free();
-            let needed = host_topology::hugepages_needed(mb);
+            let needed = host_topology::hugepages_needed(mib);
             if free == 0 {
                 eprintln!(
                     "performance_mode: WARNING: no 2MB hugepages available, \
