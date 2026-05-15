@@ -458,6 +458,34 @@ static __KTSTR_ENTRY_DEMO_BPF_CRASH: KtstrTestEntry = KtstrTestEntry {
     ..KtstrTestEntry::DEFAULT
 };
 
+#[ktstr_test(
+    scheduler = KTSTR_SCHED,
+    llcs = 1,
+    cores = 4,
+    threads = 1,
+    memory_mb = 2048,
+    bpf_map_write = BPF_CRASH,
+    expect_err = true,
+    expect_scx_bpf_error_matches = r"ktstr:\s+host-triggered\s+crash",
+)]
+fn neg_expect_scx_bpf_error_matches_e2e(ctx: &Ctx) -> Result<AssertResult> {
+    ktstr::scenario::basic::custom_sched_mixed(ctx)
+}
+
+#[ktstr_test(
+    scheduler = KTSTR_SCHED,
+    llcs = 1,
+    cores = 4,
+    threads = 1,
+    memory_mb = 2048,
+    bpf_map_write = BPF_CRASH,
+    expect_err = true,
+    expect_scx_bpf_error_contains = "ktstr: host-triggered crash",
+)]
+fn neg_expect_scx_bpf_error_contains_e2e(ctx: &Ctx) -> Result<AssertResult> {
+    ktstr::scenario::basic::custom_sched_mixed(ctx)
+}
+
 #[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
