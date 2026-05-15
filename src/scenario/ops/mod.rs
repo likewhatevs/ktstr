@@ -6955,9 +6955,9 @@ mod tests {
     // Step-local vs Backdrop state invariants
     // ---------------------------------------------------------------
 
-    /// Op::RemoveCgroup dispatches `ctx.cgroups.remove_cgroup` and
-    /// then prunes the name from CgroupGroup's tracked `names` vec
-    /// via the `forget` helper. Without the prune, the stale
+    /// Op::RemoveCgroup prunes the name from CgroupGroup's tracked
+    /// `names` vec via the `forget` helper BEFORE dispatching
+    /// `ctx.cgroups.remove_cgroup`. Without the prune, the stale
     /// tracking entry would re-trigger the AddCgroup collision check
     /// for a same-name re-create, and CgroupGroup's Drop would invoke
     /// a redundant rmdir against an already-removed dir. Pin both:
