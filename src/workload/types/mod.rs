@@ -33,6 +33,29 @@ pub enum Phase {
     /// `WorkType::IoSyncWrite` (the standalone variant) is the disk-IO
     /// counterpart that opens `/dev/vda` directly.
     Io(#[serde(with = "humantime_serde_helper")] Duration),
+    /// ALU-bound multiply chain for the given duration. The width
+    /// selector picks the data path the same way as
+    /// [`WorkType::AluHot`] — see [`AluWidth`] for the resolution
+    /// rules and the AVX-512 / AMX caveats. Each visit runs
+    /// `alu_hot_chain` in 1024-step batches in a deadline-bounded
+    /// loop so shutdown latency stays bounded by one batch.
+    ///
+    /// The composable counterpart to [`WorkType::AluHot`]: use this
+    /// inside a [`Sequence`](WorkType::Sequence) to express duty-cycle
+    /// patterns ("ALU 90 % / Sleep 10 %") that the standalone
+    /// [`WorkType::AluHot`] cannot, since the standalone variant
+    /// runs ALU work for the entire scenario duration.
+    AluHot {
+        /// SIMD / scalar width selector for the multiply chain;
+        /// resolved per phase visit via `resolve_alu_width`. See
+        /// [`AluWidth`] for the per-variant data-path width and
+        /// the runtime resolution rules.
+        width: AluWidth,
+        /// Wall-clock duration of the ALU phase. Workers retire
+        /// `alu_hot_chain` batches until this deadline passes.
+        #[serde(with = "humantime_serde_helper")]
+        duration: Duration,
+    },
 }
 
 /// What each worker process does during a scenario.
@@ -1263,6 +1286,10 @@ pub enum WorkType {
     /// `worker_group_size = None` (any worker count is valid;
     /// each worker runs an independent multiply chain). No
     /// shared-memory region; no per-iteration syscall overhead.
+    ///
+    /// For duty-cycle modulation (e.g. ALU 90 % / Sleep 10 %), use
+    /// [`Phase::AluHot`] inside a [`Sequence`](Self::Sequence) — the
+    /// composable counterpart with a per-phase duration.
     AluHot {
         /// SIMD / scalar width selector for the multiply chain.
         /// See [`AluWidth`] for the per-variant data-path width

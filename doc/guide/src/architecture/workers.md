@@ -171,10 +171,10 @@ Three fields worth calling out explicitly:
     (`operations`=5 matrix multiplies per wake, one `work_units`
     tick per multiply → `gcd(5, 1024) = 1`).
   - **Phase-inherited**: Sequence inherits whichever phase is
-    currently active — Spin / Yield / Io use the same per-unit
-    accounting as the SpinWait / YieldHeavy / IoSyncWrite groups
-    above; Sleep contributes no `work_units` and so pauses migration
-    checks while it runs.
+    currently active — Spin / Yield / Io / AluHot use the same
+    per-unit accounting as the SpinWait / YieldHeavy / IoSyncWrite /
+    AluHot groups above; Sleep contributes no `work_units` and so
+    pauses migration checks while it runs.
   - **Not tracked by the framework**: Custom workers do not
     contribute to `work_units` on the framework's behalf —
     migration tracking fires only if the user's `run` function

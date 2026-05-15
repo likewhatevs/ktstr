@@ -436,13 +436,18 @@ fn worktype_serde_roundtrip_table_driven() {
 
     // Sequence is excluded from the from_name walk; cover it
     // here with an explicit construction so the roundtrip is
-    // still proven for every kind of variant.
+    // still proven for every kind of variant. AluHot is included
+    // so Phase's new variant rides the same roundtrip pin.
     let seq = WorkType::Sequence {
         first: Phase::Spin(Duration::from_millis(10)),
         rest: vec![
             Phase::Sleep(Duration::from_millis(5)),
             Phase::Yield(Duration::from_millis(2)),
             Phase::Io(Duration::from_millis(1)),
+            Phase::AluHot {
+                width: super::AluWidth::Widest,
+                duration: Duration::from_millis(3),
+            },
         ],
     };
     let json = serde_json::to_string(&seq).unwrap();
@@ -461,6 +466,73 @@ fn worktype_serde_roundtrip_table_driven() {
         "Sequence first-phase Phase::Spin must serialize \
          through humantime_serde_helper as \"10ms\"; got {json}"
     );
+    // Pin Phase::AluHot's snake_case rename and humantime
+    // formatting for the struct-variant Duration field.
+    assert!(
+        json.contains(r#""alu_hot":{"width":"widest","duration":"3ms"}"#),
+        "Phase::AluHot must serialize as snake_case `alu_hot` with \
+         humantime duration; got {json}"
+    );
+}
+
+/// `Phase::AluHot` constructs with every [`AluWidth`] variant
+/// (host capability is resolved at worker entry, not at
+/// construction). Pins the variant's constructibility surface
+/// independently of [`worktype_serde_roundtrip_table_driven`]
+/// so a regression that breaks construction surfaces here even
+/// if the table-driven roundtrip is skipped.
+#[test]
+fn phase_alu_hot_constructible_with_every_width() {
+    use super::AluWidth;
+    for width in [
+        AluWidth::Scalar,
+        AluWidth::Vec128,
+        AluWidth::Vec256,
+        AluWidth::Vec512,
+        AluWidth::Amx,
+        AluWidth::Widest,
+    ] {
+        let p = Phase::AluHot {
+            width,
+            duration: Duration::from_millis(1),
+        };
+        // Roundtrip each width so a serde regression on a
+        // specific AluWidth variant surfaces independently.
+        let json = serde_json::to_string(&p).unwrap();
+        let back: Phase = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(
+            json, json2,
+            "Phase::AluHot {width:?} roundtrip drift: {json} vs {json2}"
+        );
+    }
+}
+
+/// `Phase::AluHot` carries its Duration through
+/// `humantime_serde_helper`, matching the sibling Spin/Sleep/
+/// Yield/Io variants. A struct-form `{secs, nanos}` encoding
+/// would break the project's operator-editable JSON convention
+/// for captured `WorkSpec` configs.
+#[test]
+fn phase_alu_hot_duration_serializes_as_humantime() {
+    use super::AluWidth;
+    let p = Phase::AluHot {
+        width: AluWidth::Scalar,
+        duration: Duration::from_millis(250),
+    };
+    let json = serde_json::to_string(&p).unwrap();
+    assert_eq!(
+        json,
+        r#"{"alu_hot":{"width":"scalar","duration":"250ms"}}"#
+    );
+    let back: Phase = serde_json::from_str(&json).unwrap();
+    match back {
+        Phase::AluHot { width, duration } => {
+            assert!(matches!(width, AluWidth::Scalar));
+            assert_eq!(duration, Duration::from_millis(250));
+        }
+        _ => panic!("roundtrip lost Phase::AluHot variant"),
+    }
 }
 /// `WorkType::IpcVariance` constructor rejects every
 /// zero-value field with the typed

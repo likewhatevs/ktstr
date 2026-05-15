@@ -231,10 +231,11 @@ through explicit phases.
 phase for its specified duration and then advances to the next; when
 the last phase ends the loop restarts from `first`. Phases:
 `Phase::Spin(Duration)`, `Phase::Sleep(Duration)`,
-`Phase::Yield(Duration)`, `Phase::Io(Duration)`. Use the
+`Phase::Yield(Duration)`, `Phase::Io(Duration)`,
+`Phase::AluHot { width: AluWidth, duration: Duration }`. Use the
 `WorkType::sequence(first, rest)` constructor.
 
-`Phase`, `WorkType`, and `CpusetSpec` are all in
+`Phase`, `WorkType`, `CpusetSpec`, and `AluWidth` are all in
 `ktstr::prelude::*`; only `std::time::Duration` needs an extra
 `use` line — added on the first line of the example below:
 

@@ -286,6 +286,18 @@ pub(super) fn worker_main(
     // shot warn. The resolved width persists for the worker's
     // lifetime.
     let mut alu_hot_resolved_width: Option<AluWidth> = None;
+    // Phase::AluHot: one-shot downgrade-warn dedup. Fires the
+    // first time any Phase::AluHot visit resolves to a width
+    // different from what was requested (excluding `Widest`,
+    // which is documented as "host's widest"). A single flag
+    // suffices because the warn is about "any AluHot phase
+    // downgraded in this worker" — the per-width identity is
+    // already in the log fields. Per-visit resolution prevents
+    // sharing alu_hot_resolved_width with the standalone
+    // WorkType::AluHot arm, which would let a Phase::AluHot
+    // with width X clobber a downstream Phase::AluHot with
+    // width Y.
+    let mut phase_alu_hot_warn_emitted: bool = false;
     // IpcVariance: persistent 512KB working-set buffer reused
     // across cold phases. Allocated lazily on the first cold
     // phase and reused thereafter. Aligned u64 storage so the
@@ -942,6 +954,76 @@ pub(super) fn worker_main(
                                 );
                             }
                             last_iter_time = Instant::now();
+                        }
+                        Phase::AluHot { width, duration } => {
+                            // Resolve per visit. resolve_alu_width's
+                            // is_x86_feature_detected! probes are cached
+                            // by std after first call, so per-visit
+                            // resolution is O(1). Avoids the cache
+                            // collision risk that a single shared
+                            // Option<AluWidth> across multiple
+                            // Phase::AluHot phases with different
+                            // widths would create.
+                            let resolved = resolve_alu_width(*width);
+                            // One-shot downgrade warn — fires at most
+                            // once per worker across all Phase::AluHot
+                            // visits, matching the standalone
+                            // WorkType::AluHot arm's "warn once" shape
+                            // without sharing the resolved-width
+                            // cache. `Widest` is documented as
+                            // "host's widest" so a downgrade from it
+                            // is the contracted behaviour, not a
+                            // surprise.
+                            if !phase_alu_hot_warn_emitted
+                                && resolved != *width
+                                && !matches!(*width, AluWidth::Widest)
+                            {
+                                tracing::warn!(
+                                    requested = ?width,
+                                    resolved = ?resolved,
+                                    tid,
+                                    "Phase::AluHot width unavailable on this host; \
+                                     downgraded — see [`AluWidth`] doc for \
+                                     resolution order"
+                                );
+                                phase_alu_hot_warn_emitted = true;
+                            }
+                            // Per-chain iteration-cost sampling so
+                            // Phase::AluHot exposes the same
+                            // scheduler-preemption signal as the
+                            // standalone WorkType::AluHot arm:
+                            // AluHot never blocks, so the
+                            // resume_latencies_ns reservoir would
+                            // not capture preemption inflation
+                            // here. Variance across iteration_costs_ns
+                            // samples encodes the scheduler signal
+                            // the "AluHot at 90% with modulation"
+                            // use case wants to observe.
+                            let end = Instant::now() + *duration;
+                            while Instant::now() < end && !stop_requested(stop) {
+                                let iter_start = Instant::now();
+                                alu_hot_chain(
+                                    resolved,
+                                    ALU_HOT_CHAIN_STEPS,
+                                    &mut work_units,
+                                );
+                                reservoir_push(
+                                    &mut iteration_costs_ns,
+                                    &mut iteration_cost_sample_count,
+                                    iter_start.elapsed().as_nanos() as u64,
+                                    MAX_WAKE_SAMPLES,
+                                );
+                            }
+                            // Do NOT reset last_iter_time: AluHot is
+                            // CPU-bound (same event class as Phase::Spin),
+                            // so a reset here would artificially hide
+                            // preemption stretches crossing the phase
+                            // boundary from max_gap_ms — silently
+                            // diverging the metric vs. an equivalent
+                            // Phase::Spin Sequence. Symmetric counter
+                            // bookkeeping with Phase::Spin (which also
+                            // never resets) keeps max_gap_ms comparable
+                            // when a test swaps Spin↔AluHot.
                         }
                     }
                 }

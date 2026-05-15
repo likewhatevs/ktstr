@@ -374,6 +374,145 @@ fn pathology_alu_hot_scalar_iterates() {
         reports[0]
     );
 }
+/// `Phase::AluHot` inside a `WorkType::Sequence` must reach
+/// the worker dispatch arm and drive the multiply chain. Pins
+/// `iterations > 0` over the test window — the serde / wire-
+/// format tests in `workload::types::tests` only catch
+/// construction regressions, not "the new dispatch arm is
+/// dead code" or "the arm fell through to a no-op." Mirror of
+/// `pathology_alu_hot_iterates` for the Sequence-wrapped form.
+#[test]
+fn pathology_phase_alu_hot_in_sequence_iterates() {
+    let cfg = WorkloadConfig {
+        num_workers: 2,
+        work_type: WorkType::Sequence {
+            first: Phase::AluHot {
+                width: AluWidth::Widest,
+                duration: Duration::from_millis(50),
+            },
+            rest: vec![],
+        },
+        ..Default::default()
+    };
+    let mut h = WorkloadHandle::spawn(&cfg).expect("Phase::AluHot in Sequence must spawn");
+    h.start();
+    std::thread::sleep(Duration::from_millis(200));
+    let reports = h.stop_and_collect();
+    assert_eq!(reports.len(), 2);
+    for r in &reports {
+        assert!(
+            r.iterations > 0,
+            "Phase::AluHot in Sequence must complete >=1 outer iteration: {r:?}"
+        );
+    }
+}
+
+/// `Phase::AluHot` at `AluWidth::Scalar` exercises the
+/// architecture-independent path through the new dispatch
+/// arm. Mirror of `pathology_alu_hot_scalar_iterates` for
+/// the Sequence-wrapped form so a regression to the SIMD
+/// resolution doesn't silently break the scalar default.
+#[test]
+fn pathology_phase_alu_hot_scalar_in_sequence_iterates() {
+    let cfg = WorkloadConfig {
+        num_workers: 1,
+        work_type: WorkType::Sequence {
+            first: Phase::AluHot {
+                width: AluWidth::Scalar,
+                duration: Duration::from_millis(50),
+            },
+            rest: vec![],
+        },
+        ..Default::default()
+    };
+    let mut h =
+        WorkloadHandle::spawn(&cfg).expect("Phase::AluHot Scalar in Sequence must spawn");
+    h.start();
+    std::thread::sleep(Duration::from_millis(100));
+    let reports = h.stop_and_collect();
+    assert_eq!(reports.len(), 1);
+    assert!(
+        reports[0].iterations > 0,
+        "Phase::AluHot Scalar in Sequence must iterate: {:?}",
+        reports[0]
+    );
+}
+
+/// `Phase::AluHot { duration: Duration::ZERO }` must silently
+/// no-op and let the Sequence advance to the next phase. The
+/// deadline `Instant::now() < (Instant::now() + ZERO)` is
+/// immediately false so the inner loop body never executes —
+/// pin this contract so a future "loop at least once"
+/// optimization doesn't break it. Verified by following a
+/// ZERO-duration AluHot phase with a Spin phase and checking
+/// the worker still iterates (which requires the AluHot to
+/// have returned).
+#[test]
+fn pathology_phase_alu_hot_zero_duration_is_noop() {
+    let cfg = WorkloadConfig {
+        num_workers: 1,
+        work_type: WorkType::Sequence {
+            first: Phase::AluHot {
+                width: AluWidth::Scalar,
+                duration: Duration::ZERO,
+            },
+            rest: vec![Phase::Spin(Duration::from_millis(20))],
+        },
+        ..Default::default()
+    };
+    let mut h = WorkloadHandle::spawn(&cfg)
+        .expect("Phase::AluHot ZERO duration must spawn (no validation rejection)");
+    h.start();
+    std::thread::sleep(Duration::from_millis(80));
+    let reports = h.stop_and_collect();
+    assert_eq!(reports.len(), 1);
+    // The Spin phase that follows the ZERO AluHot must run —
+    // which requires the AluHot arm to have returned without
+    // hanging or panicking on ZERO. iterations > 0 also rules
+    // out an infinite loop in the AluHot arm.
+    assert!(
+        reports[0].iterations > 0,
+        "Phase after ZERO-duration AluHot must still iterate: {:?}",
+        reports[0]
+    );
+}
+
+/// `Phase::AluHot` populates `iteration_costs_ns` per chain
+/// batch — pins the per-batch reservoir-sampling path so the
+/// "AluHot at 90% with modulation" use case can observe
+/// scheduler-preemption signal via iteration-cost variance.
+/// AluHot never blocks so the resume_latencies_ns reservoir
+/// would not capture preemption inflation; iteration_costs_ns
+/// is the only available signal.
+#[test]
+fn pathology_phase_alu_hot_populates_iteration_costs() {
+    let cfg = WorkloadConfig {
+        num_workers: 1,
+        work_type: WorkType::Sequence {
+            first: Phase::AluHot {
+                width: AluWidth::Scalar,
+                duration: Duration::from_millis(50),
+            },
+            rest: vec![],
+        },
+        ..Default::default()
+    };
+    let mut h = WorkloadHandle::spawn(&cfg).expect("Phase::AluHot must spawn");
+    h.start();
+    std::thread::sleep(Duration::from_millis(150));
+    let reports = h.stop_and_collect();
+    assert_eq!(reports.len(), 1);
+    let r = &reports[0];
+    assert!(
+        !r.iteration_costs_ns.is_empty(),
+        "Phase::AluHot must populate iteration_costs_ns: {r:?}",
+    );
+    assert!(
+        r.iteration_cost_sample_total >= 1,
+        "Phase::AluHot must record at least one iteration-cost sample: {r:?}",
+    );
+}
+
 /// AluHot must populate `iteration_costs_ns` and bump
 /// `iteration_cost_sample_total`. Pins the per-iteration
 /// reservoir-sampling path so a regression that drops the

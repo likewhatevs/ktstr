@@ -75,7 +75,7 @@ pub enum WorkType {
     },
 
     // Compound / sequence
-    Sequence { first: Phase, rest: Vec<Phase> },        // Loop through ordered phases (Spin / Sleep / Yield / Io).
+    Sequence { first: Phase, rest: Vec<Phase> },        // Loop through ordered phases (Spin / Sleep / Yield / Io / AluHot).
 
     // Lifecycle / scheduling-class churn
     ForkExit,                                           // Rapid fork+_exit cycling; parent waitpid's then repeats.
@@ -144,9 +144,9 @@ pub enum WorkType {
 }
 ```
 
-> **Imports:** `WorkType`, `Phase`, `SchedPolicy`, `WorkSpec`, and
-> `WorkloadConfig` are in `ktstr::prelude::*`. The auxiliary enums
-> `FutexLockMode` (used by `PriorityInversion::pi_mode`),
+> **Imports:** `WorkType`, `Phase`, `SchedPolicy`, `AluWidth`,
+> `WorkSpec`, and `WorkloadConfig` are in `ktstr::prelude::*`. The
+> auxiliary enums `FutexLockMode` (used by `PriorityInversion::pi_mode`),
 > `WakeMechanism` (used by `WakeChain::wake`), and `SchedClass`
 > (used by `AsymmetricWaker`) live under `ktstr::workload`. Bring
 > them into scope with `use ktstr::workload::*;` (or import each
@@ -273,6 +273,7 @@ starts. Phases are defined via the `Phase` enum:
 - `Phase::Sleep(Duration)` -- `thread::sleep` for the given duration.
 - `Phase::Yield(Duration)` -- repeated `sched_yield` for the given duration.
 - `Phase::Io(Duration)` -- simulated I/O (write 64 KB + 100 us sleep) for the given duration.
+- `Phase::AluHot { width: AluWidth, duration: Duration }` -- ALU-bound multiply chain for the given duration. SIMD/scalar `width` resolution matches `WorkType::AluHot`.
 
 `Sequence` cannot be constructed via `WorkType::from_name()` because
 it requires explicit phase definitions. Build it directly:
