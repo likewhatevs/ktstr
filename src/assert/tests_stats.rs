@@ -15,7 +15,9 @@ use super::*;
 ///
 /// The numeric order pinned here matches the struct definition:
 /// worker checks first (not_starved → max_spread_pct), then
-/// throughput, benchmarking, monitor, and NUMA blocks.
+/// throughput, benchmarking, monitor, NUMA blocks, and the
+/// reproducer-matcher tail (`expect_scx_bpf_error_contains` /
+/// `expect_scx_bpf_error_matches`).
 #[test]
 fn assert_format_human_field_order_is_stable() {
     let a = Assert::NO_OVERRIDES
@@ -27,10 +29,17 @@ fn assert_format_human_field_order_is_stable() {
         .min_work_rate(10.0)
         .max_p99_wake_latency_ns(1000)
         .max_keep_last_rate(100.0)
-        .min_page_locality(0.5);
+        .min_page_locality(0.5)
+        .expect_scx_bpf_error_contains("foo")
+        .expect_scx_bpf_error_matches("bar");
     let out = a.format_human();
-    // Sample 6 canonical-order pairs and assert each earlier
+    // Sample canonical-order pairs and assert each earlier
     // field precedes each later field in the rendered output.
+    // The matcher fields are at the tail and must follow the
+    // prior monitor/NUMA blocks; the intermediate NUMA pairs
+    // pin the position of max_cross_node_migration_ratio +
+    // max_slow_tier_ratio so a reorder that floats one of
+    // them past the matcher tail trips here.
     let pairs = [
         ("not_starved", "isolation"),
         ("isolation", "max_gap_ms"),
@@ -38,6 +47,10 @@ fn assert_format_human_field_order_is_stable() {
         ("max_spread_pct", "max_throughput_cv"),
         ("min_work_rate", "max_p99_wake_latency_ns"),
         ("max_keep_last_rate", "min_page_locality"),
+        ("min_page_locality", "max_cross_node_migration_ratio"),
+        ("max_cross_node_migration_ratio", "max_slow_tier_ratio"),
+        ("max_slow_tier_ratio", "expect_scx_bpf_error_contains"),
+        ("expect_scx_bpf_error_contains", "expect_scx_bpf_error_matches"),
     ];
     for (earlier, later) in pairs {
         let ei = out
@@ -61,12 +74,15 @@ fn assert_format_human_field_order_is_stable() {
 #[test]
 fn assert_format_human_no_overrides_renders_all_none() {
     let out = Assert::NO_OVERRIDES.format_human();
-    // 21 threshold fields; each rendered as "none" means 21
-    // "none" occurrences in the output.
+    // 21 renderable threshold fields; each rendered as "none"
+    // means 21 "none" occurrences. `enforce_monitor_thresholds`
+    // is intentionally omitted from format_human (it's a control
+    // bit, not a threshold to inherit), so the count excludes it
+    // even though the Assert struct has 22 fields total.
     let none_count = out.matches(": none").count();
     assert_eq!(
         none_count, 21,
-        "NO_OVERRIDES must render every field as `none`, got {none_count} `none` rows:\n{out}",
+        "NO_OVERRIDES must render every renderable threshold as `none`, got {none_count} `none` rows:\n{out}",
     );
     // `format_human` is header-free — the first line carries
     // the first threshold field. A reintroduced banner header

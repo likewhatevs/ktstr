@@ -181,8 +181,9 @@ fn resolve_scheduler_for_export(entry: &KtstrTestEntry) -> Result<Option<PathBuf
 ///   - explicit relative paths (containing `/` or starting with `.`)
 ///     → relative to current dir
 ///   - bare names → search `PATH`
-///   - directories → reject with EISDIR (export packs files only;
-///     recursive packaging is a v2 enhancement)
+///   - directories → reject with an actionable "is a directory" error
+///     (export packs regular files only; recursive directory
+///     packaging is a v2 enhancement)
 ///
 /// The simpler layout (flat `include/<basename>`) keeps the
 /// extracted .run tree predictable for the operator, at the cost of
@@ -346,12 +347,28 @@ fn generate_preamble(entry: &KtstrTestEntry, has_scheduler: bool) -> String {
     let need_threads = topology.threads_per_core;
     let need_numa = topology.numa_nodes;
 
-    // Compose scheduler args from entry.extra_sched_args.
-    let mut sched_arg_tokens: Vec<String> = Vec::new();
-    for a in entry.extra_sched_args {
-        sched_arg_tokens.push(shell_quote(a));
-    }
-    let sched_args_joined = sched_arg_tokens.join(" ");
+    // Compose scheduler args via the same host-side builder the
+    // in-VM test path uses to assemble the scheduler argv
+    // (`append_base_sched_args`, invoked from both `eval.rs` and
+    // `probe.rs`): cgroup-parent auto-inject from
+    // `entry.scheduler.cgroup_parent`, then the scheduler def's own
+    // `sched_args`, then per-test `extra_sched_args`. Reusing the
+    // helper keeps the bare-metal repro aligned with a normal test
+    // run for these three sources — without it, the export would
+    // silently drop `--cell-parent-cgroup` and any sched-def
+    // baseline args, and the reproduced scheduler would land in the
+    // wrong cgroup tree. The repro does NOT yet replicate
+    // `config_file` / `config_content` scheduler args (the in-VM
+    // path pushes `--config <guest_path>` BEFORE the helper call;
+    // adding the export-side `--config` push + include_files
+    // plumbing is a v2 enhancement for config-driven schedulers).
+    let mut sched_arg_tokens_raw: Vec<String> = Vec::new();
+    crate::test_support::append_base_sched_args(entry, &mut sched_arg_tokens_raw);
+    let sched_args_joined: String = sched_arg_tokens_raw
+        .iter()
+        .map(|a| shell_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
 
     // Defensive shell-quoting on every interpolated runtime value.
     // The names come from compile-time const slots that are
@@ -808,6 +825,7 @@ fn write_runfile(path: &Path, preamble: &str, archive: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TopologyConstraints;
 
     #[test]
     fn shell_quote_preserves_safe_strings() {
@@ -1286,6 +1304,96 @@ mod tests {
         assert!(
             preamble.contains("TEST_WATCHDOG_SECS=13"),
             "preamble must set TEST_WATCHDOG_SECS from entry.watchdog_timeout",
+        );
+    }
+
+    /// `generate_preamble` auto-injects `--cell-parent-cgroup <path>`
+    /// from the scheduler's `cgroup_parent` slot. Without this, the
+    /// exported reproducer launches the scheduler with no cgroup
+    /// parent argument and the scheduler lands in the wrong cgroup
+    /// tree (or fails to find its expected parent). Pins the in-VM
+    /// runtime behavior at the export layer.
+    #[test]
+    fn generate_preamble_auto_injects_cell_parent_cgroup() {
+        use crate::test_support::{CgroupPath, Scheduler, SchedulerSpec};
+        static SCHED_WITH_PARENT: Scheduler = Scheduler {
+            name: "sched_with_parent",
+            binary: SchedulerSpec::Discover("sched_with_parent_bin"),
+            sysctls: &[],
+            kargs: &[],
+            assert: crate::assert::Assert::NO_OVERRIDES,
+            cgroup_parent: Some(CgroupPath::new("/ktstr_export_test")),
+            sched_args: &[],
+            topology: crate::vmm::topology::Topology {
+                llcs: 1,
+                cores_per_llc: 2,
+                threads_per_core: 1,
+                numa_nodes: 1,
+                nodes: None,
+                distances: None,
+            },
+            constraints: TopologyConstraints::DEFAULT,
+            config_file: None,
+            config_file_def: None,
+            kernels: &[],
+        };
+        let entry = KtstrTestEntry {
+            name: "auto_inject_smoke",
+            scheduler: &SCHED_WITH_PARENT,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let preamble = generate_preamble(&entry, true);
+        assert!(
+            preamble.contains("--cell-parent-cgroup")
+                && preamble.contains("/ktstr_export_test"),
+            "preamble must auto-inject --cell-parent-cgroup from \
+             entry.scheduler.cgroup_parent; got: {preamble}"
+        );
+    }
+
+    /// `generate_preamble` must NOT duplicate `--cell-parent-cgroup`
+    /// when the user already supplied it via `extra_sched_args`.
+    /// Duplicate clap args fail with "cannot be used multiple times"
+    /// — silent drop of the auto-inject preserves user intent.
+    #[test]
+    fn generate_preamble_skips_auto_inject_when_user_supplies_cell_parent_cgroup() {
+        use crate::test_support::{CgroupPath, Scheduler, SchedulerSpec};
+        static SCHED_WITH_PARENT: Scheduler = Scheduler {
+            name: "sched_with_parent_user_supplied",
+            binary: SchedulerSpec::Discover("sched_with_parent_user_supplied_bin"),
+            sysctls: &[],
+            kargs: &[],
+            assert: crate::assert::Assert::NO_OVERRIDES,
+            cgroup_parent: Some(CgroupPath::new("/auto_inject_path")),
+            sched_args: &[],
+            topology: crate::vmm::topology::Topology {
+                llcs: 1,
+                cores_per_llc: 2,
+                threads_per_core: 1,
+                numa_nodes: 1,
+                nodes: None,
+                distances: None,
+            },
+            constraints: TopologyConstraints::DEFAULT,
+            config_file: None,
+            config_file_def: None,
+            kernels: &[],
+        };
+        let entry = KtstrTestEntry {
+            name: "auto_inject_skip_smoke",
+            scheduler: &SCHED_WITH_PARENT,
+            extra_sched_args: &["--cell-parent-cgroup", "/user_supplied_path"],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let preamble = generate_preamble(&entry, true);
+        assert!(
+            preamble.contains("/user_supplied_path"),
+            "preamble must carry the user-supplied path; got: {preamble}"
+        );
+        assert!(
+            !preamble.contains("/auto_inject_path"),
+            "preamble must NOT auto-inject the scheduler's cgroup_parent \
+             when extra_sched_args already supplies --cell-parent-cgroup; got: {preamble}"
         );
     }
 

@@ -1668,15 +1668,31 @@ fn parse_topo_from_cmdline() -> Option<(u32, u32, u32, u32)> {
 /// count individual CPUs.
 fn count_online_cpus() -> Option<u32> {
     let content = fs::read_to_string("/sys/devices/system/cpu/online").ok()?;
+    parse_online_cpus(&content)
+}
+
+/// Parse a cpulist string (kernel `/sys/.../online` format) and
+/// return the total count of CPUs it covers. Comma-separated tokens,
+/// each either a single index or a `start-end` inclusive range.
+/// Returns `None` on any unparseable token, inverted range, or
+/// completely empty content. The `sys_rdy` budget caller at
+/// [`count_online_cpus`]'s primary use defaults to 1 vCPU on `None`
+/// (safe degradation to the floor budget); the topology-print
+/// caller skips the MOTD line instead of substituting a default.
+fn parse_online_cpus(content: &str) -> Option<u32> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
     let mut count = 0u32;
-    for range in content.trim().split(',') {
+    for range in trimmed.split(',') {
         if let Some((start, end)) = range.split_once('-') {
             let s: u32 = start.parse().ok()?;
             let e: u32 = end.parse().ok()?;
-            count += e - s + 1;
+            count = count.checked_add(e.checked_sub(s)?.checked_add(1)?)?;
         } else {
             let _: u32 = range.parse().ok()?;
-            count += 1;
+            count = count.checked_add(1)?;
         }
     }
     Some(count)
@@ -4092,6 +4108,77 @@ mod tests {
         let count = count_online_cpus();
         assert!(count.is_some());
         assert!(count.unwrap() >= 1);
+    }
+
+    #[test]
+    fn parse_online_cpus_single_index() {
+        assert_eq!(parse_online_cpus("0"), Some(1));
+        assert_eq!(parse_online_cpus("7"), Some(1));
+    }
+
+    #[test]
+    fn parse_online_cpus_simple_range() {
+        assert_eq!(parse_online_cpus("0-3"), Some(4));
+        assert_eq!(parse_online_cpus("4-7"), Some(4));
+    }
+
+    #[test]
+    fn parse_online_cpus_mixed_ranges_and_singles() {
+        assert_eq!(parse_online_cpus("0,2,4"), Some(3));
+        assert_eq!(parse_online_cpus("0-1,4-7"), Some(6));
+        assert_eq!(parse_online_cpus("0-2,4,6-7"), Some(6));
+    }
+
+    #[test]
+    fn parse_online_cpus_strips_trailing_newline() {
+        // /sys/devices/system/cpu/online emits a trailing '\n'.
+        assert_eq!(parse_online_cpus("0-3\n"), Some(4));
+    }
+
+    #[test]
+    fn parse_online_cpus_single_cpu_zero() {
+        assert_eq!(parse_online_cpus("0-0"), Some(1));
+    }
+
+    #[test]
+    fn parse_online_cpus_empty_content_is_none() {
+        assert_eq!(parse_online_cpus(""), None);
+        assert_eq!(parse_online_cpus("   "), None);
+        assert_eq!(parse_online_cpus("\n"), None);
+    }
+
+    #[test]
+    fn parse_online_cpus_non_numeric_is_none() {
+        assert_eq!(parse_online_cpus("abc"), None);
+        assert_eq!(parse_online_cpus("0-abc"), None);
+        assert_eq!(parse_online_cpus("a-3"), None);
+        assert_eq!(parse_online_cpus("0,abc,3"), None);
+        // Empty tokens from malformed list shapes — the kernel never
+        // produces these but the parser must reject loudly rather
+        // than silently skip.
+        assert_eq!(parse_online_cpus("0,"), None); // trailing comma
+        assert_eq!(parse_online_cpus(",0"), None); // leading comma
+        assert_eq!(parse_online_cpus("-3"), None); // leading dash → empty range start
+    }
+
+    #[test]
+    fn parse_online_cpus_inverted_range_is_none() {
+        // Defensive: an inverted range "10-3" would previously
+        // panic in debug (overflow) or wrap in release. checked_sub
+        // returns None instead.
+        assert_eq!(parse_online_cpus("10-3"), None);
+    }
+
+    #[test]
+    fn parse_online_cpus_extreme_range_does_not_overflow() {
+        // u32::MAX - 0 + 1 overflows u32; checked_add returns None.
+        assert_eq!(parse_online_cpus(&format!("0-{}", u32::MAX)), None);
+    }
+
+    #[test]
+    fn parse_online_cpus_large_topology() {
+        // 256 vCPUs as a single range.
+        assert_eq!(parse_online_cpus("0-255"), Some(256));
     }
 
     /// The send_sys_rdy retry loop bounds its retries by ceiling-
