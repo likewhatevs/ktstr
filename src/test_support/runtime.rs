@@ -221,6 +221,21 @@ pub(crate) fn resolve_vm_topology(
 /// so the caller decides whether to attach include files (production
 /// does, probe-only repro pipelines that already pass `include_files`
 /// can skip it).
+/// Concrete absolute-path example used by the panic messages that
+/// reject malformed `--cell-parent-cgroup` values — names the
+/// scheduler's declared default when one exists, falls back to a
+/// canonical `/ktstr` literal otherwise. The operator gets a
+/// copy-pasteable shape regardless of whether the scheduler is
+/// cell-aware. Centralised so both rejection arms (Value-invalid and
+/// MissingValue) display the same example.
+fn cgroup_parent_example(entry: &KtstrTestEntry) -> String {
+    entry
+        .scheduler
+        .cgroup_parent
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "/ktstr".to_string())
+}
+
 pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<String>) {
     // Fail-fast on a malformed user-supplied `--cell-parent-cgroup`
     // value before the auto-inject branch. The host-side consumer
@@ -253,12 +268,10 @@ pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<Stri
             .chain(entry.extra_sched_args.iter())
             .copied(),
     ) {
-        Some(path) if !path.starts_with('/') || path == "/" => {
-            let example = entry
-                .scheduler
-                .cgroup_parent
-                .map(|p| p.as_str().to_string())
-                .unwrap_or_else(|| "/ktstr".to_string());
+        super::args::CellParentCgroupArg::Value(path)
+            if !path.starts_with('/') || path == "/" =>
+        {
+            let example = cgroup_parent_example(entry);
             let mut fixes = format!(
                 "supply an absolute path under `/` (e.g. `{example}`) for the \
                  per-test cgroup root"
@@ -284,13 +297,40 @@ pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<Stri
                 entry.name, path,
             );
         }
-        Some(_) => {
+        super::args::CellParentCgroupArg::MissingValue => {
+            let example = cgroup_parent_example(entry);
+            let mut fixes = format!(
+                "either remove the bare `--cell-parent-cgroup` and let the \
+                 framework auto-inject the scheduler's default (when one is \
+                 declared), or supply a value (e.g. `--cell-parent-cgroup={example}` \
+                 in combined form, or `--cell-parent-cgroup` followed by an \
+                 absolute path in two-token form)"
+            );
+            if entry.scheduler.cgroup_parent.is_none() {
+                fixes.push_str(
+                    "; the scheduler in this test declares no default \
+                     `cgroup_parent`, so an absolute-path value is required",
+                );
+            }
+            panic!(
+                "test `{}` supplies a bare `--cell-parent-cgroup` (via \
+                 `extra_sched_args` on the test or `sched_args` in the \
+                 scheduler def) with no following value; {fixes}. The \
+                 framework intercepts this here because letting it through \
+                 would silently combine with the framework's auto-inject \
+                 (when a default exists) and trip clap's `cannot be used \
+                 multiple times` diagnostic — a confusing error that buries \
+                 the actual missing-value mistake.",
+                entry.name,
+            );
+        }
+        super::args::CellParentCgroupArg::Value(_) => {
             // User-supplied valid path — flows through the
             // `args.extend(...)` calls below. Skip the auto-inject so
             // clap doesn't reject the duplicate flag with `cannot be
             // used multiple times`.
         }
-        None => {
+        super::args::CellParentCgroupArg::Absent => {
             // No user-supplied flag — auto-inject the scheduler's
             // default `cgroup_parent` when one is declared. The same
             // parser is used guest-side by `resolve_cgroup_root` and
@@ -1039,6 +1079,124 @@ mod tests {
         let entry = KtstrTestEntry {
             name: "scheduler_def_origin_two_token_no_default",
             scheduler: &SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+    }
+
+    /// Bare `--cell-parent-cgroup` flag with no following token
+    /// (two-token form, trailing in argv) is rejected at the
+    /// framework gate via the `CellParentCgroupArg::MissingValue`
+    /// arm. Previously this shape parsed as "absent", triggered the
+    /// auto-inject, and produced two copies of the flag in the final
+    /// argv that clap then rejected with a confused "cannot be used
+    /// multiple times" diagnostic. The gate intercepts here so the
+    /// operator gets a "missing value" message anchored to their
+    /// declaration.
+    #[test]
+    #[should_panic(expected = "supplies a bare `--cell-parent-cgroup`")]
+    fn append_base_sched_args_panics_on_missing_value_via_extra() {
+        static SCHED: Scheduler = Scheduler::new("s")
+            .cgroup_parent("/sys/fs/cgroup/ktstr");
+        let entry = KtstrTestEntry {
+            name: "missing_value_extra",
+            scheduler: &SCHED,
+            extra_sched_args: &["--cell-parent-cgroup"],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+    }
+
+    /// Bare flag preceded by an unrelated trailing token still trips
+    /// the MissingValue arm — the parser walks the chain in order,
+    /// hits the bare flag, and `iter.next()` returns None at end of
+    /// stream regardless of which unrelated tokens came before it.
+    #[test]
+    #[should_panic(expected = "supplies a bare `--cell-parent-cgroup`")]
+    fn append_base_sched_args_panics_on_missing_value_after_other_flag() {
+        static SCHED: Scheduler = Scheduler::new("s")
+            .cgroup_parent("/sys/fs/cgroup/ktstr");
+        let entry = KtstrTestEntry {
+            name: "missing_value_after_other",
+            scheduler: &SCHED,
+            extra_sched_args: &["--other-flag", "--cell-parent-cgroup"],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+    }
+
+    /// Bare flag in the scheduler-def's `sched_args` also trips
+    /// MissingValue — the parser chains both sources and the
+    /// universal gate handles them identically.
+    #[test]
+    #[should_panic(expected = "supplies a bare `--cell-parent-cgroup`")]
+    fn append_base_sched_args_panics_on_missing_value_in_scheduler_sched_args() {
+        static SCHED: Scheduler = Scheduler::new("s")
+            .cgroup_parent("/sys/fs/cgroup/ktstr")
+            .sched_args(&["--cell-parent-cgroup"]);
+        let entry = KtstrTestEntry {
+            name: "missing_value_scheduler_def",
+            scheduler: &SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+    }
+
+    /// Bare flag with no scheduler default `cgroup_parent`. The
+    /// universal gate must still fire — the panic message in this
+    /// case omits the "let the framework auto-inject" suggestion
+    /// (no default to inject) and adds a hint that an absolute path
+    /// is required for cell-aware schedulers without a declared
+    /// default.
+    #[test]
+    #[should_panic(expected = "supplies a bare `--cell-parent-cgroup`")]
+    fn append_base_sched_args_panics_on_missing_value_no_scheduler_cgroup_parent() {
+        static SCHED: Scheduler = Scheduler::new("s");
+        let entry = KtstrTestEntry {
+            name: "missing_value_no_default",
+            scheduler: &SCHED,
+            extra_sched_args: &["--cell-parent-cgroup"],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+    }
+
+    /// Bare flag via scheduler-def `sched_args` with no default
+    /// `cgroup_parent`. Closes the matrix intersection: a future
+    /// refactor that gated the MissingValue check on
+    /// `cgroup_parent.is_some()` (mirroring an earlier regression
+    /// fixed for Value-invalid) would pass the other 4 MissingValue
+    /// tests but regress this cell.
+    #[test]
+    #[should_panic(expected = "supplies a bare `--cell-parent-cgroup`")]
+    fn append_base_sched_args_panics_on_missing_value_in_scheduler_sched_args_no_default() {
+        static SCHED: Scheduler = Scheduler::new("s")
+            .sched_args(&["--cell-parent-cgroup"]);
+        let entry = KtstrTestEntry {
+            name: "missing_value_scheduler_def_no_default",
+            scheduler: &SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+    }
+
+    /// Bare flag after another flag, with no scheduler default.
+    /// Completes the after-other-flag × default matrix together with
+    /// the sibling test that has a default.
+    #[test]
+    #[should_panic(expected = "supplies a bare `--cell-parent-cgroup`")]
+    fn append_base_sched_args_panics_on_missing_value_after_other_flag_no_default() {
+        static SCHED: Scheduler = Scheduler::new("s");
+        let entry = KtstrTestEntry {
+            name: "missing_value_after_other_no_default",
+            scheduler: &SCHED,
+            extra_sched_args: &["--other-flag", "--cell-parent-cgroup"],
             ..KtstrTestEntry::DEFAULT
         };
         let mut args = Vec::new();

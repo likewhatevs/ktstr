@@ -1941,13 +1941,41 @@ fn create_cgroup_parent_from_sched_args() {
         Ok(s) => s,
         Err(_) => return,
     };
-    if let Some(path) = crate::test_support::parse_cell_parent_cgroup(
+    // Defense-in-depth filter: the host-side gate in
+    // `runtime::append_base_sched_args` panics on malformed values
+    // (non-absolute, bare `/`, missing) before `/sched_args` is
+    // written. Reaching this path with a bad value means the gate
+    // was bypassed (operator hand-edited an exported `.run` script,
+    // ad-hoc argv injection); log to COM2 and skip the cgroup-tree
+    // setup rather than mkdir on the host cgroup root.
+    let path = match crate::test_support::parse_cell_parent_cgroup(
         sched_args.split_whitespace(),
     ) {
-        let cgroup_dir = format!("/sys/fs/cgroup{path}");
-        mkdir_p(&cgroup_dir);
-        enable_subtree_controllers_to(&cgroup_dir);
-    }
+        crate::test_support::CellParentCgroupArg::Value(p)
+            if p.starts_with('/') && p != "/" =>
+        {
+            p
+        }
+        crate::test_support::CellParentCgroupArg::Value(bad) => {
+            write_com2(&format!(
+                "ktstr-init: ignoring malformed `--cell-parent-cgroup` value \
+                 {bad:?} in /sched_args; skipping per-test cgroup creation \
+                 (host-side gate normally panics on this)",
+            ));
+            return;
+        }
+        crate::test_support::CellParentCgroupArg::MissingValue => {
+            write_com2(
+                "ktstr-init: ignoring bare `--cell-parent-cgroup` (no value) \
+                 in /sched_args; skipping per-test cgroup creation",
+            );
+            return;
+        }
+        crate::test_support::CellParentCgroupArg::Absent => return,
+    };
+    let cgroup_dir = format!("/sys/fs/cgroup{path}");
+    mkdir_p(&cgroup_dir);
+    enable_subtree_controllers_to(&cgroup_dir);
 }
 
 /// Enable `+cpuset +cpu` in `cgroup.subtree_control` at every ancestor

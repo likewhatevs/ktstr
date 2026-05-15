@@ -124,10 +124,37 @@ const _: () = {
     assert!(prefix[flag.len()] == b'=');
 };
 
+/// Outcome of `parse_cell_parent_cgroup`. Distinguishes "user didn't
+/// supply the flag" from "user supplied the flag but left the value
+/// empty/missing" so the auto-inject path can fire only in the
+/// genuinely-absent case. Without this distinction, a trailing bare
+/// `--cell-parent-cgroup` (no following token) would parse as
+/// `Absent` and trigger the auto-inject, producing two copies of the
+/// flag in the final argv that clap then rejects with a confused
+/// "cannot be used multiple times" diagnostic.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CellParentCgroupArg<'a> {
+    /// `--cell-parent-cgroup` not present anywhere in the argv stream.
+    Absent,
+    /// `--cell-parent-cgroup{=,SP}<value>` present; `value` is whatever
+    /// the user supplied (which may itself be invalid — callers must
+    /// run the absolute-path / non-root check before downstream use).
+    Value(&'a str),
+    /// `--cell-parent-cgroup` present as a bare flag with no
+    /// following token (two-token form, trailing-in-argv). Distinct
+    /// from `Absent` because the user clearly intended to supply the
+    /// flag, just incompletely.
+    MissingValue,
+}
+
 /// Find the value passed to `--cell-parent-cgroup` in an argv stream,
 /// accepting both the two-token form (`["--cell-parent-cgroup",
 /// "/path"]`) and the combined form (`["--cell-parent-cgroup=/path"]`).
-/// Returns `None` when the flag is absent. First match wins.
+/// First match wins. Returns [`CellParentCgroupArg::Absent`] when the
+/// flag is not present, [`CellParentCgroupArg::Value`] for a found
+/// value (whose contents callers must independently validate), or
+/// [`CellParentCgroupArg::MissingValue`] when the bare flag appears
+/// as the last token with no following value.
 ///
 /// Caveat — positional-naive: this walker treats every token equal to
 /// the canonical flag (or with the `=` prefix) as our flag without
@@ -144,7 +171,7 @@ const _: () = {
 /// branch (`--cell-parent-cgroup=...`) is unambiguous and unaffected.
 pub(crate) fn parse_cell_parent_cgroup<'a>(
     args: impl IntoIterator<Item = &'a str>,
-) -> Option<&'a str> {
+) -> CellParentCgroupArg<'a> {
     // The combined-form prefix is `CELL_PARENT_CGROUP_FLAG` plus `=`.
     // Inlined here so the strip_prefix sees a const-foldable literal;
     // keep the spellings in sync if the flag ever changes.
@@ -152,36 +179,84 @@ pub(crate) fn parse_cell_parent_cgroup<'a>(
     let mut iter = args.into_iter();
     while let Some(a) = iter.next() {
         if a == CELL_PARENT_CGROUP_FLAG {
-            return iter.next();
+            return match iter.next() {
+                Some(v) => CellParentCgroupArg::Value(v),
+                None => CellParentCgroupArg::MissingValue,
+            };
         }
         if let Some(rest) = a.strip_prefix(COMBINED_PREFIX) {
-            return Some(rest);
+            return CellParentCgroupArg::Value(rest);
         }
     }
-    None
+    CellParentCgroupArg::Absent
 }
 
 /// Derive the CgroupManager root path for guest-side dispatch.
 ///
 /// Reads `/sched_args` to find `--cell-parent-cgroup` (either form),
-/// then falls back to process argv. When found, constructs
-/// `/sys/fs/cgroup{path}`. Falls back to `/sys/fs/cgroup/ktstr` when
-/// the arg is absent.
+/// then falls back to process argv. When a valid value (starts with
+/// `/`, not bare `/`) is found, constructs `/sys/fs/cgroup{path}`.
+/// Falls back to `/sys/fs/cgroup/ktstr` when the arg is absent OR
+/// when it's malformed (missing value, empty, bare `/`, or
+/// non-absolute) — the host-side gate in `append_base_sched_args`
+/// already panics on those shapes, so reaching this fallback means
+/// the gate was bypassed (operator hand-edited an exported `.run`
+/// script, ad-hoc argv injection). Logging is limited guest-side;
+/// surface the bad value via stderr and continue with the default
+/// so the test doesn't silently land on the host cgroup root.
 pub(crate) fn resolve_cgroup_root(args: &[String]) -> String {
     // Check guest args for --cell-parent-cgroup (passed via sched_args
     // which are written to /sched_args in the initramfs).
     let sched_args = std::fs::read_to_string("/sched_args").unwrap_or_default();
-    if let Some(path) =
-        parse_cell_parent_cgroup(sched_args.split_whitespace())
-    {
+    if let Some(path) = absolute_cell_parent_value(
+        parse_cell_parent_cgroup(sched_args.split_whitespace()),
+        "/sched_args",
+    ) {
         return format!("/sys/fs/cgroup{path}");
     }
     // Also check the process args in case --cell-parent-cgroup was
     // passed directly (e.g., via extra_sched_args on the test entry).
-    if let Some(path) = parse_cell_parent_cgroup(args.iter().map(String::as_str)) {
+    if let Some(path) = absolute_cell_parent_value(
+        parse_cell_parent_cgroup(args.iter().map(String::as_str)),
+        "process argv",
+    ) {
         return format!("/sys/fs/cgroup{path}");
     }
     "/sys/fs/cgroup/ktstr".to_string()
+}
+
+/// Defense-in-depth filter for guest-side consumers of
+/// `parse_cell_parent_cgroup`. Returns `Some(path)` only for values
+/// that pass the same validation the host-side gate enforces in
+/// `runtime::append_base_sched_args` (starts with `/`, not bare `/`);
+/// returns `None` for `Absent`, `MissingValue`, or invalid `Value`
+/// shapes. Each rejection logs to stderr naming the offending source
+/// so an operator inspecting guest output can trace the bad value
+/// back to its origin even when the host-side gate was bypassed.
+fn absolute_cell_parent_value<'a>(
+    parsed: CellParentCgroupArg<'a>,
+    source: &str,
+) -> Option<&'a str> {
+    match parsed {
+        CellParentCgroupArg::Value(path) if path.starts_with('/') && path != "/" => Some(path),
+        CellParentCgroupArg::Value(path) => {
+            eprintln!(
+                "ktstr_test: ignoring malformed `--cell-parent-cgroup` value {path:?} \
+                 from {source}; falling back to default cgroup root. The host-side \
+                 gate normally panics on this; reaching this branch means the gate \
+                 was bypassed (hand-edited export script, ad-hoc argv injection).",
+            );
+            None
+        }
+        CellParentCgroupArg::MissingValue => {
+            eprintln!(
+                "ktstr_test: ignoring bare `--cell-parent-cgroup` (no following value) \
+                 from {source}; falling back to default cgroup root.",
+            );
+            None
+        }
+        CellParentCgroupArg::Absent => None,
+    }
 }
 
 #[cfg(test)]
@@ -372,7 +447,7 @@ mod tests {
         let argv = ["--cell-parent-cgroup", "/user", "--other-flag"];
         assert_eq!(
             parse_cell_parent_cgroup(argv.iter().copied()),
-            Some("/user")
+            CellParentCgroupArg::Value("/user")
         );
     }
 
@@ -381,26 +456,60 @@ mod tests {
         let argv = ["--other-flag", "--cell-parent-cgroup=/user"];
         assert_eq!(
             parse_cell_parent_cgroup(argv.iter().copied()),
-            Some("/user")
+            CellParentCgroupArg::Value("/user")
         );
     }
 
+    /// Combined-form with no characters after `=` parses as `Value("")`
+    /// — distinct from `MissingValue`. The combined-form prefix
+    /// `--cell-parent-cgroup=` always anchors on `=` and treats
+    /// everything after as the value (even if empty), so the user
+    /// SUPPLIED a value (just empty); the host gate's absolute-path
+    /// check rejects the empty string downstream. MissingValue is
+    /// reserved for the two-token form where the bare flag is the
+    /// trailing token with no following argv element at all.
     #[test]
     fn parse_cell_parent_cgroup_empty_combined_value() {
         let argv = ["--cell-parent-cgroup="];
-        assert_eq!(parse_cell_parent_cgroup(argv.iter().copied()), Some(""));
+        assert_eq!(
+            parse_cell_parent_cgroup(argv.iter().copied()),
+            CellParentCgroupArg::Value("")
+        );
     }
 
     #[test]
     fn parse_cell_parent_cgroup_absent() {
         let argv = ["--unrelated", "--other-flag=value"];
-        assert!(parse_cell_parent_cgroup(argv.iter().copied()).is_none());
+        assert_eq!(
+            parse_cell_parent_cgroup(argv.iter().copied()),
+            CellParentCgroupArg::Absent
+        );
     }
 
+    /// Bare trailing flag (two-token form, no following token) is now
+    /// distinguished from `Absent` so the auto-inject path can fire
+    /// only on genuinely-missing flags. Previously the parser returned
+    /// `None` for both shapes, which let auto-inject silently fire on
+    /// a malformed bare-flag invocation and produce a confusing clap
+    /// duplicate-rejection downstream.
     #[test]
     fn parse_cell_parent_cgroup_two_token_missing_value() {
         let argv = ["--cell-parent-cgroup"];
-        assert_eq!(parse_cell_parent_cgroup(argv.iter().copied()), None);
+        assert_eq!(
+            parse_cell_parent_cgroup(argv.iter().copied()),
+            CellParentCgroupArg::MissingValue
+        );
+    }
+
+    /// Bare flag preceded by an unrelated token still trips the
+    /// `MissingValue` case when nothing follows.
+    #[test]
+    fn parse_cell_parent_cgroup_bare_flag_at_end_after_other() {
+        let argv = ["--other-flag", "--cell-parent-cgroup"];
+        assert_eq!(
+            parse_cell_parent_cgroup(argv.iter().copied()),
+            CellParentCgroupArg::MissingValue
+        );
     }
 
     #[test]
@@ -412,7 +521,7 @@ mod tests {
         ];
         assert_eq!(
             parse_cell_parent_cgroup(argv.iter().copied()),
-            Some("/first")
+            CellParentCgroupArg::Value("/first")
         );
     }
 
@@ -425,7 +534,7 @@ mod tests {
         ];
         assert_eq!(
             parse_cell_parent_cgroup(argv.iter().copied()),
-            Some("/first")
+            CellParentCgroupArg::Value("/first")
         );
     }
 
@@ -436,6 +545,70 @@ mod tests {
     #[test]
     fn parse_cell_parent_cgroup_no_match_on_sibling_long_flag() {
         let argv = ["--cell-parent-cgroup-extra=val"];
-        assert!(parse_cell_parent_cgroup(argv.iter().copied()).is_none());
+        assert_eq!(
+            parse_cell_parent_cgroup(argv.iter().copied()),
+            CellParentCgroupArg::Absent
+        );
+    }
+
+    // -- absolute_cell_parent_value --
+    //
+    // The filter is the entire defense-in-depth for guest-side
+    // `resolve_cgroup_root` consumers — a regression here would
+    // silently corrupt downstream `format!("/sys/fs/cgroup{path}")`
+    // interpolation when the host-side gate is bypassed. Pin the
+    // full return-value contract: Some(path) iff the Value variant
+    // passes the host-side validation criterion (starts with `/`,
+    // not bare `/`); None for every other shape (Absent,
+    // MissingValue, invalid Value). The eprintln! side-effects are
+    // not asserted — return-value coverage is sufficient for the
+    // function's documented contract.
+
+    #[test]
+    fn absolute_cell_parent_value_returns_valid_path() {
+        assert_eq!(
+            absolute_cell_parent_value(CellParentCgroupArg::Value("/ktstr"), "test"),
+            Some("/ktstr")
+        );
+    }
+
+    #[test]
+    fn absolute_cell_parent_value_rejects_empty() {
+        assert_eq!(
+            absolute_cell_parent_value(CellParentCgroupArg::Value(""), "test"),
+            None
+        );
+    }
+
+    #[test]
+    fn absolute_cell_parent_value_rejects_bare_slash() {
+        assert_eq!(
+            absolute_cell_parent_value(CellParentCgroupArg::Value("/"), "test"),
+            None
+        );
+    }
+
+    #[test]
+    fn absolute_cell_parent_value_rejects_relative() {
+        assert_eq!(
+            absolute_cell_parent_value(CellParentCgroupArg::Value("my_test"), "test"),
+            None
+        );
+    }
+
+    #[test]
+    fn absolute_cell_parent_value_rejects_missing_value() {
+        assert_eq!(
+            absolute_cell_parent_value(CellParentCgroupArg::MissingValue, "test"),
+            None
+        );
+    }
+
+    #[test]
+    fn absolute_cell_parent_value_returns_none_on_absent() {
+        assert_eq!(
+            absolute_cell_parent_value(CellParentCgroupArg::Absent, "test"),
+            None
+        );
     }
 }

@@ -272,6 +272,16 @@ pass. To opt into the auto-inject path, omit the flag entirely; to
 override, supply an absolute path under `/` with at least one
 segment beyond the root like `"/ktstr"`.
 
+A bare `--cell-parent-cgroup` with no following value
+(`["--cell-parent-cgroup"]` as the trailing token) is also
+rejected at the gate. Previously, this shape parsed as "absent"
+and let the framework's auto-inject fire — producing two copies
+of the flag in the final argv that the scheduler's clap parser
+then rejected with a confused "cannot be used multiple times"
+diagnostic, burying the actual missing-value mistake. The gate
+now distinguishes "absent" from "missing value" and surfaces an
+actionable panic anchored to the declaration site instead.
+
 ## Config file
 
 `Scheduler.config_file` specifies a host-side path to an opaque
