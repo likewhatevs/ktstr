@@ -222,27 +222,85 @@ pub(crate) fn resolve_vm_topology(
 /// does, probe-only repro pipelines that already pass `include_files`
 /// can skip it).
 pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<String>) {
-    if let Some(cgroup_path) = entry.scheduler.cgroup_parent {
-        // Skip the auto-inject when the user already passes
-        // `--cell-parent-cgroup` (in either form) via the scheduler-
-        // def's `sched_args` or the per-test `extra_sched_args`.
-        // Otherwise clap rejects the duplicate with `cannot be used
-        // multiple times`. The same parser is used guest-side by
-        // `resolve_cgroup_root` and `create_cgroup_parent_from_sched_args`,
-        // so user-supplied two-token AND combined `=` forms produce
-        // identical guest cgroup-tree creation.
-        let user_supplied = super::args::parse_cell_parent_cgroup(
-            entry
+    // Fail-fast on a malformed user-supplied `--cell-parent-cgroup`
+    // value before the auto-inject branch. The host-side consumer
+    // `resolve_cgroup_root` (used by the probe/setup path at
+    // `probe.rs::run_scenario_probe`) interpolates the value into a
+    // `/sys/fs/cgroup{path}` literal and hands the result to
+    // `CgroupManager::new`, which has NO host-root guard — any path
+    // that doesn't start with `/` lands inside the host cgroup root
+    // (e.g. `""` → `/sys/fs/cgroup`, `"my_test"` →
+    // `/sys/fs/cgroupmy_test`) and corrupts unrelated cgroup state
+    // when subsequent `cgroups.setup(...)` calls run. The guest-side
+    // sibling `vmm::rust_init::create_cgroup_parent_from_sched_args`
+    // happens to be safe-by-coincidence for the empty case because
+    // `enable_subtree_controllers_to` early-returns when leaf equals
+    // the cgroup root — but probe.rs has no such gate, so the host
+    // fail-fast is what actually protects against corruption.
+    //
+    // The check is universal — independent of whether the scheduler
+    // declares a default `cgroup_parent` — because both routes
+    // (`extra_sched_args` from the test author, `sched_args` from
+    // the scheduler def) flow through the same parse + chain below,
+    // and the corruption risk is identical regardless of who
+    // supplied the bad value. Operator sees the message at test
+    // setup time, before any cgroup ops run.
+    match super::args::parse_cell_parent_cgroup(
+        entry
+            .scheduler
+            .sched_args
+            .iter()
+            .chain(entry.extra_sched_args.iter())
+            .copied(),
+    ) {
+        Some(path) if !path.starts_with('/') || path == "/" => {
+            let example = entry
                 .scheduler
-                .sched_args
-                .iter()
-                .chain(entry.extra_sched_args.iter())
-                .copied(),
-        )
-        .is_some();
-        if !user_supplied {
-            args.push(super::args::CELL_PARENT_CGROUP_FLAG.to_string());
-            args.push(cgroup_path.to_string());
+                .cgroup_parent
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_else(|| "/ktstr".to_string());
+            let mut fixes = format!(
+                "supply an absolute path under `/` (e.g. `{example}`) for the \
+                 per-test cgroup root"
+            );
+            if let Some(default) = entry.scheduler.cgroup_parent {
+                fixes.push_str(&format!(
+                    " or omit the flag entirely (the framework will auto-inject \
+                     the scheduler's default `cgroup_parent = {default}`)"
+                ));
+            }
+            panic!(
+                "test `{}` supplies `--cell-parent-cgroup` with a value `{:?}` \
+                 (via `extra_sched_args` on the test or `sched_args` in the \
+                 scheduler def) that does not start with `/` (or is `/` \
+                 alone); {fixes}. Empty, bare `/`, or relative values would \
+                 all resolve to a path equal to or inside `/sys/fs/cgroup` \
+                 (e.g. empty → `/sys/fs/cgroup`, `/` → `/sys/fs/cgroup/`, \
+                 host cgroup root) and corrupt unrelated cgroup state when \
+                 the probe-side `CgroupManager` operates on the resolved \
+                 path. This gate mirrors the const-eval check in \
+                 `CgroupPath::new` so runtime values share the validation \
+                 contract that compile-time declarations already pass.",
+                entry.name, path,
+            );
+        }
+        Some(_) => {
+            // User-supplied valid path — flows through the
+            // `args.extend(...)` calls below. Skip the auto-inject so
+            // clap doesn't reject the duplicate flag with `cannot be
+            // used multiple times`.
+        }
+        None => {
+            // No user-supplied flag — auto-inject the scheduler's
+            // default `cgroup_parent` when one is declared. The same
+            // parser is used guest-side by `resolve_cgroup_root` and
+            // `create_cgroup_parent_from_sched_args`, so the auto-
+            // injected two-token form produces identical guest
+            // cgroup-tree creation to a user-supplied value.
+            if let Some(cgroup_path) = entry.scheduler.cgroup_parent {
+                args.push(super::args::CELL_PARENT_CGROUP_FLAG.to_string());
+                args.push(cgroup_path.to_string());
+            }
         }
     }
     args.extend(entry.scheduler.sched_args.iter().map(|s| s.to_string()));
@@ -778,13 +836,17 @@ mod tests {
         );
     }
 
-    /// Empty combined value (`--cell-parent-cgroup=`) suppresses the
-    /// auto-inject — the prefix anchor on `=` catches the empty
-    /// trailing value too. The user's empty value flows through;
-    /// clap inside the scheduler binary will reject it with its own
-    /// diagnostic.
+    /// Empty combined value (`--cell-parent-cgroup=`) is rejected at
+    /// the framework gate with an actionable panic that names the
+    /// offending test and points the operator at the right fix.
+    /// Empty values would resolve to `/sys/fs/cgroup` (the host
+    /// cgroup root) downstream — guaranteed to corrupt unrelated
+    /// cgroup state — so the framework rejects rather than letting
+    /// clap surface a generic "value required" error after the
+    /// cgroup hierarchy has already been built.
     #[test]
-    fn append_base_sched_args_treats_empty_value_as_user_supplied() {
+    #[should_panic(expected = "that does not start with `/`")]
+    fn append_base_sched_args_panics_on_empty_combined_value_via_extra() {
         static SCHED: Scheduler = Scheduler::new("s")
             .cgroup_parent("/sys/fs/cgroup/ktstr");
         let entry = KtstrTestEntry {
@@ -795,12 +857,192 @@ mod tests {
         };
         let mut args = Vec::new();
         append_base_sched_args(&entry, &mut args);
-        assert_eq!(
-            args,
-            vec!["--cell-parent-cgroup=".to_string()],
-            "prefix anchors on `=`; empty trailing value still counts \
-             as user-supplied for dedup purposes"
-        );
+    }
+
+    /// Two-token form with an empty value as the second token
+    /// (`["--cell-parent-cgroup", ""]`) is rejected by the same gate.
+    /// Covers the second route into `parse_cell_parent_cgroup` so a
+    /// future refactor that switches the empty-detection logic on
+    /// only one form gets caught.
+    #[test]
+    #[should_panic(expected = "that does not start with `/`")]
+    fn append_base_sched_args_panics_on_empty_two_token_value_via_extra() {
+        static SCHED: Scheduler = Scheduler::new("s")
+            .cgroup_parent("/sys/fs/cgroup/ktstr");
+        let entry = KtstrTestEntry {
+            name: "sched_two_token",
+            scheduler: &SCHED,
+            extra_sched_args: &["--cell-parent-cgroup", ""],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+    }
+
+    /// Bad value via the scheduler-def's own `sched_args` rather than
+    /// the test's `extra_sched_args` — the chain at the parser site
+    /// covers both sources, so the gate fires regardless of origin.
+    /// Pins both the combined form and the scheduler origin.
+    #[test]
+    #[should_panic(expected = "that does not start with `/`")]
+    fn append_base_sched_args_panics_on_empty_combined_value_via_scheduler_sched_args() {
+        static SCHED: Scheduler = Scheduler::new("s")
+            .cgroup_parent("/sys/fs/cgroup/ktstr")
+            .sched_args(&["--cell-parent-cgroup="]);
+        let entry = KtstrTestEntry {
+            name: "sched_in_def",
+            scheduler: &SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+    }
+
+    /// Two-token form via the scheduler-def origin — completes the
+    /// 2-source × 2-form matrix together with the three siblings.
+    #[test]
+    #[should_panic(expected = "that does not start with `/`")]
+    fn append_base_sched_args_panics_on_empty_two_token_value_via_scheduler_sched_args() {
+        static SCHED: Scheduler = Scheduler::new("s")
+            .cgroup_parent("/sys/fs/cgroup/ktstr")
+            .sched_args(&["--cell-parent-cgroup", ""]);
+        let entry = KtstrTestEntry {
+            name: "sched_in_def_two_token",
+            scheduler: &SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+    }
+
+    /// Empty-value gate fires even when the scheduler-def has no
+    /// `cgroup_parent` default. Without the universal gate the empty
+    /// value would slip through and corrupt unrelated host cgroup
+    /// state at the downstream `resolve_cgroup_root` interpolation.
+    #[test]
+    #[should_panic(expected = "that does not start with `/`")]
+    fn append_base_sched_args_panics_on_empty_combined_value_no_scheduler_cgroup_parent() {
+        static SCHED: Scheduler = Scheduler::new("s");
+        let entry = KtstrTestEntry {
+            name: "no_default_cgroup",
+            scheduler: &SCHED,
+            extra_sched_args: &["--cell-parent-cgroup="],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+    }
+
+    /// Two-token form, no scheduler default — completes the
+    /// no-default matrix together with the combined-form sibling.
+    #[test]
+    #[should_panic(expected = "that does not start with `/`")]
+    fn append_base_sched_args_panics_on_empty_two_token_value_no_scheduler_cgroup_parent() {
+        static SCHED: Scheduler = Scheduler::new("s");
+        let entry = KtstrTestEntry {
+            name: "no_default_cgroup_two_token",
+            scheduler: &SCHED,
+            extra_sched_args: &["--cell-parent-cgroup", ""],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+    }
+
+    /// Relative path (no leading `/`) is rejected by the same gate.
+    /// Pins the broader contract (the message explicitly promises
+    /// "absolute path under `/`"); empty is just one case of
+    /// non-absolute.
+    #[test]
+    #[should_panic(expected = "that does not start with `/`")]
+    fn append_base_sched_args_panics_on_relative_path_value() {
+        static SCHED: Scheduler = Scheduler::new("s")
+            .cgroup_parent("/sys/fs/cgroup/ktstr");
+        let entry = KtstrTestEntry {
+            name: "relative_path",
+            scheduler: &SCHED,
+            extra_sched_args: &["--cell-parent-cgroup=my_test"],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+    }
+
+    /// Two-token form of the relative-path case. Closes the matrix
+    /// gap: combined-form was pinned by the sibling above but a
+    /// future refactor that split path validation between the
+    /// combined and two-token branches could regress one form
+    /// without test catching.
+    #[test]
+    #[should_panic(expected = "that does not start with `/`")]
+    fn append_base_sched_args_panics_on_relative_path_value_two_token() {
+        static SCHED: Scheduler = Scheduler::new("s")
+            .cgroup_parent("/sys/fs/cgroup/ktstr");
+        let entry = KtstrTestEntry {
+            name: "relative_path_two_token",
+            scheduler: &SCHED,
+            extra_sched_args: &["--cell-parent-cgroup", "my_test"],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+    }
+
+    /// Bare `/` slips a naive `starts_with('/')` check but resolves
+    /// downstream to `/sys/fs/cgroup/` — semantically the host cgroup
+    /// root, same corruption risk as the empty case. The gate mirrors
+    /// `CgroupPath::new`'s const-eval contract (rejects both
+    /// no-leading-slash AND `"/"` alone) so runtime values share the
+    /// same validation as compile-time declarations.
+    #[test]
+    #[should_panic(expected = "or is `/` alone")]
+    fn append_base_sched_args_panics_on_bare_slash_value() {
+        static SCHED: Scheduler = Scheduler::new("s")
+            .cgroup_parent("/sys/fs/cgroup/ktstr");
+        let entry = KtstrTestEntry {
+            name: "bare_slash",
+            scheduler: &SCHED,
+            extra_sched_args: &["--cell-parent-cgroup=/"],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+    }
+
+    /// Combined-form empty value via scheduler-def `sched_args`
+    /// when the scheduler also has NO `cgroup_parent` default. Closes
+    /// the matrix intersection: a future refactor that gates the
+    /// scheduler-def-source check on `cgroup_parent.is_some()` would
+    /// pass the other 6 empty tests but regress this cell.
+    #[test]
+    #[should_panic(expected = "that does not start with `/`")]
+    fn append_base_sched_args_panics_on_empty_combined_value_in_scheduler_sched_args_no_default() {
+        static SCHED: Scheduler = Scheduler::new("s")
+            .sched_args(&["--cell-parent-cgroup="]);
+        let entry = KtstrTestEntry {
+            name: "scheduler_def_origin_no_default",
+            scheduler: &SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+    }
+
+    /// Two-token-form sibling of the above — completes the
+    /// 2-form coverage for the scheduler-def-origin × no-default
+    /// intersection.
+    #[test]
+    #[should_panic(expected = "that does not start with `/`")]
+    fn append_base_sched_args_panics_on_empty_two_token_value_in_scheduler_sched_args_no_default() {
+        static SCHED: Scheduler = Scheduler::new("s")
+            .sched_args(&["--cell-parent-cgroup", ""]);
+        let entry = KtstrTestEntry {
+            name: "scheduler_def_origin_two_token_no_default",
+            scheduler: &SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
     }
 
     // -- build_vm_builder_base --

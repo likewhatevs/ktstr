@@ -252,6 +252,26 @@ suppressed so the scheduler binary doesn't reject a duplicate flag.
 The user's value wins, and the guest-side cgroup directory is
 created at the user-specified path.
 
+Supplying `--cell-parent-cgroup` with a value that does not name a
+valid per-test cgroup sub-path is rejected at test setup with a
+panic. The gate rejects empty (`["--cell-parent-cgroup="]` or
+`["--cell-parent-cgroup", ""]`), bare `/`
+(`["--cell-parent-cgroup=/"]`), and relative paths
+(`["--cell-parent-cgroup=my_test"]`). Such values would resolve to
+a path equal to or inside `/sys/fs/cgroup` (empty →
+`/sys/fs/cgroup`, the host cgroup root; bare `/` →
+`/sys/fs/cgroup/`, the same root; relative →
+`/sys/fs/cgroupmy_test`, a stray path next to the host root) and
+corrupt unrelated host cgroup state. The framework rejects both
+sources (the per-test `extra_sched_args` and the scheduler-def
+`sched_args`) regardless of whether the scheduler declared a
+default `cgroup_parent`. The gate mirrors the const-eval check in
+`CgroupPath::new`, so runtime values share the validation contract
+that compile-time `cgroup_parent = "..."` declarations already
+pass. To opt into the auto-inject path, omit the flag entirely; to
+override, supply an absolute path under `/` with at least one
+segment beyond the root like `"/ktstr"`.
+
 ## Config file
 
 `Scheduler.config_file` specifies a host-side path to an opaque

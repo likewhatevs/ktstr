@@ -128,6 +128,20 @@ const _: () = {
 /// accepting both the two-token form (`["--cell-parent-cgroup",
 /// "/path"]`) and the combined form (`["--cell-parent-cgroup=/path"]`).
 /// Returns `None` when the flag is absent. First match wins.
+///
+/// Caveat — positional-naive: this walker treats every token equal to
+/// the canonical flag (or with the `=` prefix) as our flag without
+/// regard for whether the preceding token was a flag-with-value
+/// expecting a positional value. If an upstream scheduler argv
+/// contains a value-taking flag followed by `--cell-parent-cgroup` as
+/// that value (e.g. `["--prev-flag", "--cell-parent-cgroup",
+/// "/user"]` where `--prev-flag` consumes the next token), this
+/// parser would still grab `/user` as if our flag had been written.
+/// A fully correct parse would need a scheduler-flag-spec table; the
+/// auto-inject and guest-side resolver intentionally stay flag-spec-
+/// agnostic, accepting the false-positive risk for arg shapes that
+/// the in-tree schedulers don't currently produce. The combined-form
+/// branch (`--cell-parent-cgroup=...`) is unambiguous and unaffected.
 pub(crate) fn parse_cell_parent_cgroup<'a>(
     args: impl IntoIterator<Item = &'a str>,
 ) -> Option<&'a str> {
