@@ -1727,10 +1727,20 @@ pub struct Assert {
     /// token anywhere in the corpus.
     ///
     /// Requires the entry's `expect_err = true` — same rationale
-    /// as [`Self::expect_scx_bpf_error_contains`]. Invalid regex
-    /// syntax fails the test at evaluation time with a diagnostic
-    /// naming the pattern; the test is not silently passed. Empty
-    /// patterns are rejected (an empty regex matches everywhere).
+    /// as [`Self::expect_scx_bpf_error_contains`]. Patterns are
+    /// validated at construction: empty literals, invalid regex
+    /// syntax, and any pattern satisfying `is_match("")` all
+    /// panic via the [`Self::expect_scx_bpf_error_matches`]
+    /// builder. The `is_match("")` predicate catches two
+    /// no-op classes with one check: patterns that match every
+    /// position (e.g. `a?`, `.*`, `(?:)`) trivially pass against
+    /// any corpus, and patterns that match only the empty string
+    /// (e.g. `^$`) trivially fail against any non-empty corpus —
+    /// real captured scheduler-output corpora are non-empty, so
+    /// both classes are equally no-op pins. Bare `\b` (word
+    /// boundary) slips the gate because the empty string
+    /// contains no word characters; see the builder docstring
+    /// for the operator-direction.
     pub expect_scx_bpf_error_matches: Option<&'static str>,
 }
 
@@ -2252,25 +2262,64 @@ impl Assert {
         self
     }
 
-    /// Const-fn builder for [`Self::expect_scx_bpf_error_matches`].
-    /// The pattern is a regex; special characters retain their regex
+    /// Builder for [`Self::expect_scx_bpf_error_matches`]. The
+    /// pattern is a regex; special characters retain their regex
     /// meaning. For literal-substring matching, prefer
     /// [`Self::expect_scx_bpf_error_contains`] to avoid escape
     /// footguns.
     ///
-    /// Empty patterns panic at construction (an empty regex matches
-    /// everywhere); pass a meaningful pattern. Regex syntax is
-    /// validated at evaluation time — an invalid pattern fails the
-    /// test with a diagnostic naming the offending pattern, not a
-    /// silent vacuous match.
+    /// Validates the pattern at construction: rejects empty
+    /// patterns, rejects invalid regex syntax, and rejects any
+    /// pattern that satisfies `is_match("")`. The empty-string
+    /// match predicate catches two related no-op classes:
+    /// patterns that match every position (e.g. `a?`, `.*`,
+    /// `(?:)`) trivially pass against any corpus, and patterns
+    /// that match only the empty string (e.g. `^$`) trivially
+    /// fail against any non-empty corpus — every real captured
+    /// scheduler-output corpus is non-empty, so the latter is
+    /// equally a no-op pin in practice. Both are useless;
+    /// `is_match("")` catches both with one check.
+    ///
+    /// Bare `\b` (word boundary) slips this gate because the
+    /// empty string contains no word characters, so `\b` finds
+    /// no transition and `is_match("")` returns false; yet `\b`
+    /// matches the first word boundary in any real corpus,
+    /// turning a bare-`\b` pin into a vacuous "any non-empty
+    /// log passes" assertion. Use a substring of the expected
+    /// error text rather than a standalone boundary assertion.
+    /// All other documented assertions (`\A`, `\z`, `^`, `$`,
+    /// `\B`) match the empty string at position 0 and ARE
+    /// caught by the gate.
+    ///
+    /// Unlike the sibling [`Self::expect_scx_bpf_error_contains`]
+    /// (which is `const fn`), this builder is non-const because
+    /// the construction-time regex compilation requires heap
+    /// allocation. Callers needing a const builder for a regex
+    /// matcher must build the `Assert` via struct literal —
+    /// the evaluator's defense-in-depth catches invalid syntax
+    /// reached via that bypass at first evaluation, but the
+    /// vacuous-pattern gate only fires on the builder path.
     ///
     /// # Panics
-    /// When `pattern` is empty.
+    /// When `pattern` is empty, is invalid regex syntax, or
+    /// matches the empty string.
     #[must_use = "builder methods consume self; bind the result"]
-    pub const fn expect_scx_bpf_error_matches(mut self, pattern: &'static str) -> Self {
+    pub fn expect_scx_bpf_error_matches(mut self, pattern: &'static str) -> Self {
         assert!(
             !pattern.is_empty(),
             "Assert::expect_scx_bpf_error_matches: pattern must be non-empty",
+        );
+        let compiled = regex::Regex::new(pattern).unwrap_or_else(|e| {
+            panic!(
+                "Assert::expect_scx_bpf_error_matches: pattern {pattern:?} is not valid regex: {e}",
+            )
+        });
+        assert!(
+            !compiled.is_match(""),
+            "Assert::expect_scx_bpf_error_matches: pattern {pattern:?} matches the empty \
+             string (e.g. `a?`, `.*`, `(?:)`, `^$`); such patterns vacuously match any \
+             corpus and turn the matcher into a no-op — use a meaningful pattern that \
+             requires at least one character",
         );
         self.expect_scx_bpf_error_matches = Some(pattern);
         self

@@ -944,24 +944,16 @@ fn evaluate_scx_bpf_error_match_regex_fails_on_mismatch() {
     assert!(msg.contains("stuck task"));
 }
 
-/// Invalid regex syntax surfaces as a matcher-failure diagnostic
-/// naming the pattern AND the compile error. The matcher MUST NOT
-/// silently vacuously match (which would let a typo in the pattern
-/// turn the assertion into a no-op).
+/// Invalid regex syntax panics at construction with a diagnostic
+/// naming the pattern AND the compile error. Construction-time
+/// rejection means a typo in the pattern surfaces immediately when
+/// the test binary loads (or the `#[ktstr_test]` macro generates
+/// the entry) instead of silently sitting in the entry until the
+/// matcher actually evaluates a corpus.
 #[test]
-fn evaluate_scx_bpf_error_match_regex_invalid_pattern_fails_loudly() {
-    let a = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches("[unclosed");
-    let details = a.evaluate_scx_bpf_error_match("corpus text", true);
-    assert_eq!(details.len(), 1);
-    let msg = &details[0].message;
-    assert!(
-        msg.contains("[unclosed"),
-        "invalid-pattern diagnostic must name the pattern: {msg}",
-    );
-    assert!(
-        msg.contains("regex compilation failed"),
-        "invalid-pattern diagnostic must say the pattern failed to compile: {msg}",
-    );
+#[should_panic(expected = "is not valid regex")]
+fn evaluate_scx_bpf_error_match_regex_invalid_pattern_panics_at_construction() {
+    let _ = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches("[unclosed");
 }
 
 /// Both matchers set + both match → empty details.
@@ -1369,54 +1361,83 @@ fn evaluate_scx_bpf_error_match_regex_dot_excludes_newline_by_default() {
     );
 }
 
-/// Vacuous regex patterns (`a?`, `(?:)`, `^$` against empty corpus,
-/// `.*`) PASS the construction gate at types.rs because the gate
-/// only rejects syntactically empty patterns; semantically the
-/// matcher returns empty details (vacuous match) regardless of corpus
-/// content. Pin this current behavior so a future improvement that
-/// adds a semantic gate (Regex compiled at construction + reject if
-/// `is_match("")` returns true) trips this test as a deliberate
-/// behavior change. The framework currently does not protect against
-/// this footgun.
+/// Each pattern that satisfies `is_match("")` gets its own
+/// `#[should_panic]` test. Per-pattern tests give each rejection a
+/// distinct backtrace target — when the rejection gate ever
+/// weakens, the test for the specific pattern that slipped through
+/// fails by name, telling the operator which case regressed. The
+/// four pinned cases cover both no-op classes the gate rejects:
+/// patterns that match every position (`a?` optional, `.*`
+/// zero-or-more, `(?:)` empty non-capturing group) trivially pass
+/// against any corpus, and the start-immediately-end anchor (`^$`)
+/// trivially fails against any non-empty corpus. All four share
+/// the `is_match("")` predicate — one check rejects both no-op
+/// classes.
 #[test]
-fn evaluate_scx_bpf_error_match_regex_vacuous_patterns_pass_current_construction_gate() {
-    // `a?` matches an empty string at every position — passes against any corpus.
-    let optional = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r"a?");
-    let optional_details = optional.evaluate_scx_bpf_error_match("xyz no a here", true);
-    assert!(
-        optional_details.is_empty(),
-        "`a?` vacuously matches; current construction gate is syntactic only: {optional_details:?}",
-    );
+#[should_panic(expected = "matches the empty string")]
+fn evaluate_scx_bpf_error_match_rejects_vacuous_optional() {
+    let _ = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r"a?");
+}
 
-    // `.*` matches the empty string — passes against empty corpus.
-    let star = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r".*");
-    let star_details = star.evaluate_scx_bpf_error_match("", true);
-    assert!(
-        star_details.is_empty(),
-        "`.*` vacuously matches empty corpus; current gate is syntactic only: {star_details:?}",
-    );
+#[test]
+#[should_panic(expected = "matches the empty string")]
+fn evaluate_scx_bpf_error_match_rejects_vacuous_star() {
+    let _ = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r".*");
+}
 
-    // `(?:)` is the canonical "syntactically non-empty, semantically
-    // empty" pattern — an empty non-capturing group that matches at
-    // every position. Distinct from `.*` (matches zero-or-more chars)
-    // and `a?` (matches zero-or-one `a`) — the empty-group syntax is
-    // the case the construction gate most plausibly should reject but
-    // currently does not.
-    let empty_group = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r"(?:)");
-    let empty_group_details = empty_group.evaluate_scx_bpf_error_match("any nonempty corpus", true);
-    assert!(
-        empty_group_details.is_empty(),
-        "`(?:)` vacuously matches every position; current gate is syntactic only: {empty_group_details:?}",
-    );
+#[test]
+#[should_panic(expected = "matches the empty string")]
+fn evaluate_scx_bpf_error_match_rejects_vacuous_empty_group() {
+    let _ = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r"(?:)");
+}
 
-    // `^$` matches only when the corpus IS empty (start-immediately-followed-by-end);
-    // for non-empty corpora it fails. Distinct from `.*` / `a?` / `(?:)`, which
-    // match every input regardless of content — `^$` is the EMPTY-ONLY vacuous case.
-    let anchored_empty = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r"^$");
-    let anchored_details = anchored_empty.evaluate_scx_bpf_error_match("", true);
+#[test]
+#[should_panic(expected = "matches the empty string")]
+fn evaluate_scx_bpf_error_match_rejects_vacuous_anchored_empty() {
+    let _ = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r"^$");
+}
+
+/// `(a|)` is the alternation form of vacuous — distinct syntactic
+/// family from the quantifier (`a?`, `.*`), empty-group (`(?:)`),
+/// and anchor-pair (`^$`) families. A real-world footgun: an
+/// operator writes `expect_matches(r"(error|)")` intending "match
+/// the word error or anything else" without realizing the empty
+/// alternation branch makes the whole pattern vacuous. Pinning
+/// this case ensures the construction gate's `is_match("")`
+/// predicate continues to catch the alternation form too.
+#[test]
+#[should_panic(expected = "matches the empty string")]
+fn evaluate_scx_bpf_error_match_rejects_vacuous_alternation_with_empty_branch() {
+    let _ = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r"(a|)");
+}
+
+/// The builder's construction-time validation is bypassed when an
+/// `Assert` is built via struct-literal syntax (the field is `pub`).
+/// In that case the evaluator's defense-in-depth catches invalid
+/// regex syntax at first use — pinning that path here ensures a
+/// hypothetical bypass route (a deserializer, a test helper that
+/// constructs `Assert` directly, or any future code that field-
+/// inits the struct) still surfaces a loud diagnostic rather than
+/// silently no-op'ing. The builder-path equivalent
+/// (`evaluate_scx_bpf_error_match_regex_invalid_pattern_panics_at_construction`)
+/// pins the construction-time panic; this pins the evaluator-side
+/// fallback for the bypass case.
+#[test]
+fn evaluate_scx_bpf_error_match_regex_invalid_pattern_via_direct_construction_fails_loudly() {
+    let a = Assert {
+        expect_scx_bpf_error_matches: Some("[unclosed"),
+        ..Assert::NO_OVERRIDES
+    };
+    let details = a.evaluate_scx_bpf_error_match("corpus text", true);
+    assert_eq!(details.len(), 1);
+    let msg = &details[0].message;
     assert!(
-        anchored_details.is_empty(),
-        "`^$` vacuously matches empty corpus; current gate is syntactic only: {anchored_details:?}",
+        msg.contains("[unclosed"),
+        "invalid-pattern diagnostic must name the pattern: {msg}",
+    );
+    assert!(
+        msg.contains("regex compilation failed"),
+        "invalid-pattern diagnostic must say the pattern failed to compile: {msg}",
     );
 }
 

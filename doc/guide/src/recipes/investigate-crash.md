@@ -113,13 +113,15 @@ corpus, opt in with the inline `(?m)` flag (e.g. `(?m)^apply_cell_config$`);
 for `.` to span line breaks, use `(?s)`. Whitespace in the pattern
 is matched byte-for-byte — no trim or normalization.
 
-Empty patterns panic at construction (an empty regex matches
-everywhere, turning the assertion into a no-op). Invalid regex
-syntax fails the test loudly at evaluation time with a diagnostic
-naming the pattern. The construction-time check is syntactic only —
-patterns that are syntactically non-empty but match every input
-(e.g. `a?`, `.*`, `(?:)`) silently pass and produce a no-op
-assertion; pin a substring of the expected error text rather than
-a wildcard. See the
+Empty patterns, invalid regex syntax, and any pattern satisfying
+`is_match("")` all panic at construction. `is_match("")` catches
+two no-op classes with one check: patterns that match every
+position (e.g. `a?`, `.*`, `(?:)`) trivially pass against any
+corpus, and patterns that match only the empty string (e.g. `^$`)
+trivially fail against any non-empty corpus — every real captured
+scheduler-output corpus is non-empty, so both are equally useless
+pins. Bare `\b` (word boundary) slips this gate because the empty
+string contains no word characters; use a substring of the
+expected error text instead of a bare boundary assertion. See the
 [`#[ktstr_test]` reference](../writing-tests/ktstr-test-macro.md#checking)
 for the full attribute list.

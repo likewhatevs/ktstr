@@ -227,9 +227,17 @@ impl BoolAttrSlots<'_> {
 ///     the evaluator ANDs them — every set matcher must hit.
 ///   - `expect_scx_bpf_error_matches = EXPR` — regex matcher with
 ///     the same accepted forms and gating as `_contains`. Maps onto
-///     `Assert::expect_scx_bpf_error_matches`. Empty patterns panic
-///     at construction; invalid regex syntax fails the test loudly
-///     at evaluation rather than silently matching nothing.
+///     `Assert::expect_scx_bpf_error_matches`. Validated at
+///     construction: empty patterns, invalid regex syntax, and any
+///     pattern satisfying `is_match("")` all panic immediately. The
+///     `is_match("")` predicate catches two no-op classes with one
+///     check: patterns that match every position (e.g. `a?`, `.*`,
+///     `(?:)`) trivially pass against any corpus, and patterns that
+///     match only the empty string (e.g. `^$`) trivially fail
+///     against any non-empty corpus — both are equally useless pins.
+///     Bare `\b` slips the gate (no word characters in `""`); see
+///     `Assert::expect_scx_bpf_error_matches` for the operator
+///     direction.
 ///   - `extra_include_files = ["PATH", "PATH", ...]` — host-side
 ///     file paths to bundle into the guest initramfs beyond what
 ///     the entry's `scheduler` / `payload` / `workloads` already
