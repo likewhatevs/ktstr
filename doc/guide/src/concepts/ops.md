@@ -13,12 +13,12 @@ stay compatible across ktstr version bumps that add new variants:
 | Op | Description |
 |---|---|
 | `AddCgroup` | Create a cgroup |
-| `RemoveCgroup` | Stop workers and remove a cgroup |
+| `RemoveCgroup` | Stop workers and remove a cgroup (see [RemoveCgroup / StopCgroup against Backdrop targets](#removecgroup--stopcgroup-against-backdrop-targets) for the permissive-removal contract) |
 | `SetCpuset` | Set a cgroup's cpuset via `CpusetSpec` |
 | `ClearCpuset` | Remove cpuset constraints |
 | `SwapCpusets` | Swap cpusets between two cgroups |
 | `Spawn` | Fork workers into a cgroup |
-| `StopCgroup` | Stop a cgroup's workers |
+| `StopCgroup` | Stop a cgroup's workers (see [RemoveCgroup / StopCgroup against Backdrop targets](#removecgroup--stopcgroup-against-backdrop-targets) for the permissive-stop contract) |
 | `SetAffinity` | Set worker affinity via `AffinityIntent` |
 | `SpawnHost` | Spawn workers in the parent cgroup |
 | `MoveAllTasks` | Move all tasks from one cgroup to another |
@@ -48,6 +48,31 @@ Op::watch_snapshot("jiffies_64")
 `SpawnHost` creates workers in the parent cgroup, not in a managed
 cgroup. Use this to simulate host-level CPU contention alongside
 managed cgroups.
+
+### RemoveCgroup / StopCgroup against Backdrop targets
+
+`Op::RemoveCgroup` and `Op::StopCgroup` are permitted against
+`Backdrop`-owned cgroups from inside a Step's ops. Removing a
+Backdrop cgroup mid-scenario drops the
+framework tracking entry so a later `Op::AddCgroup` with the same
+name re-creates the cgroup cleanly. Stopping a Backdrop cgroup's
+workers mid-scenario leaves the cgroup hierarchy alive but kills
+the workers — subsequent `Op::WaitPayload` / `Op::KillPayload` ops
+that expect those workers will fail to find them.
+
+The framework intentionally trades the early-bail for permissive
+removal. A typo'd cgroup name silently succeeds at the
+`Op::RemoveCgroup` site (rmdir on a non-existent path is a no-op)
+and surfaces later as the kernel's `No such file or directory`
+error on the next op that references the name (`Op::SetCpuset`,
+`Op::MoveAllTasks`, etc.). Debug with care: if a later Step fails
+with a missing-cgroup error, grep the test for `Op::remove_cgroup`
+calls naming a similar identifier first.
+
+`Op::MoveAllTasks` retains a separate `Backdrop`→step-local
+rejection that protects against stranding persistent workers in a
+cgroup that gets torn down at step boundary — see the variant
+docstring at `Op::MoveAllTasks` for the asymmetric-ownership table.
 
 ## OpKind
 
