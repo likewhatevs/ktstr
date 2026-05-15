@@ -3420,39 +3420,91 @@ mod tests {
         assert!(err.contains("Loop") && err.contains("busy"), "got: {err}");
     }
 
-    // -- HoldSpec variants --
+    // -- HoldSpec variants (exercise constructors + Step storage + PartialEq) --
 
     #[test]
     fn holdspec_frac() {
-        let step = Step::new(vec![], HoldSpec::Frac(0.5));
-        match step.hold {
-            HoldSpec::Frac(f) => assert!((f - 0.5).abs() < f64::EPSILON),
-            _ => panic!("expected Frac"),
-        }
+        let step = Step::new(vec![], HoldSpec::frac(0.5));
+        assert_eq!(step.hold, HoldSpec::Frac(0.5));
     }
 
     #[test]
     fn holdspec_fixed() {
-        let step = Step::new(vec![], HoldSpec::Fixed(Duration::from_secs(3)));
-        match step.hold {
-            HoldSpec::Fixed(d) => assert_eq!(d, Duration::from_secs(3)),
-            _ => panic!("expected Fixed"),
-        }
+        let step = Step::new(vec![], HoldSpec::fixed(Duration::from_secs(3)));
+        assert_eq!(step.hold, HoldSpec::Fixed(Duration::from_secs(3)));
     }
 
     #[test]
     fn holdspec_loop() {
-        let step = Step::new(
-            vec![],
+        let step = Step::new(vec![], HoldSpec::loop_at(Duration::from_millis(100)));
+        assert_eq!(
+            step.hold,
             HoldSpec::Loop {
-                interval: Duration::from_millis(100),
-            },
+                interval: Duration::from_millis(100)
+            }
         );
-        match step.hold {
-            HoldSpec::Loop { interval } => assert_eq!(interval, Duration::from_millis(100)),
-            _ => panic!("expected Loop"),
-        }
     }
+
+    // -- HoldSpec PartialEq (load-bearing semantic pins) --
+
+    /// Payload participates in equality across every variant. A
+    /// derived PartialEq guarantees this, but pinning it explicitly
+    /// catches a hypothetical hand-rolled `|_, _| true` regression
+    /// AND a partial-derive that ignores struct-variant field
+    /// contents.
+    #[test]
+    fn holdspec_partialeq_payload_participates_in_equality() {
+        assert_ne!(HoldSpec::Frac(0.5), HoldSpec::Frac(0.75));
+        assert_ne!(
+            HoldSpec::Fixed(Duration::from_secs(1)),
+            HoldSpec::Fixed(Duration::from_secs(2))
+        );
+        assert_ne!(
+            HoldSpec::Loop {
+                interval: Duration::from_millis(100)
+            },
+            HoldSpec::Loop {
+                interval: Duration::from_millis(200)
+            }
+        );
+    }
+
+    /// IEEE 754: 0.1 + 0.2 != 0.3. PartialEq on Frac inherits strict
+    /// float equality so a Frac built from arithmetic does NOT
+    /// compare equal to a Frac with the rounded literal. Pins the
+    /// documented behavior so a future "fuzzy PartialEq" rewrite
+    /// doesn't silently change the contract.
+    #[test]
+    fn holdspec_partialeq_frac_float_strict_equality() {
+        assert_ne!(HoldSpec::Frac(0.1 + 0.2), HoldSpec::Frac(0.3));
+    }
+
+    /// IEEE 754: NaN != NaN, even against itself. PartialEq on Frac
+    /// inherits the non-reflexive behavior. `HoldSpec::validate`
+    /// rejects Frac(NaN) at intake so production code paths don't
+    /// see this, but the type-level PartialEq contract must hold —
+    /// pinned against a future "treat NaN as reflexive" rewrite.
+    #[test]
+    fn holdspec_partialeq_frac_nan_self_unequal() {
+        let nan = HoldSpec::Frac(f64::NAN);
+        assert_ne!(nan, nan);
+    }
+
+    /// `FULL` is an alias for `Frac(1.0)`. The public-API const
+    /// shouldn't drift from the variant it expands to.
+    #[test]
+    fn holdspec_full_equals_frac_one() {
+        assert_eq!(HoldSpec::FULL, HoldSpec::Frac(1.0));
+    }
+
+    // Compile-time proof the constructor signatures stay `const fn`.
+    // If a future refactor demotes any of these (e.g. by introducing
+    // a non-const call internally), the module fails to compile here
+    // — surfaces the regression at the layer where const usability
+    // matters. Discarded via `_` to avoid namespace pollution.
+    const _: HoldSpec = HoldSpec::fixed(Duration::from_secs(1));
+    const _: HoldSpec = HoldSpec::frac(0.5);
+    const _: HoldSpec = HoldSpec::loop_at(Duration::from_millis(50));
 
     // -- CpusetSpec::Exact --
 

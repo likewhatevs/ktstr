@@ -1770,10 +1770,16 @@ impl Step {
 /// [`Duration`]); reuse the same `HoldSpec` value across multiple
 /// [`Step::new`] / [`Step::with_defs`] / [`Step::with_payload`]
 /// calls in a construction loop without an explicit `.clone()`.
-/// `Eq` / `Hash` remain impossible because `Frac(f64)` carries a
-/// float; `PartialEq` is not derived because no in-tree caller
-/// compares `HoldSpec` values directly.
-#[derive(Clone, Copy, Debug)]
+/// `PartialEq` is derived so tests can `assert_eq!(step.hold, ...)`
+/// and user code can pattern-compare values directly — float
+/// equality on `Frac(f64)` follows IEEE 754 semantics (so
+/// `HoldSpec::Frac(0.1 + 0.2) != HoldSpec::Frac(0.3)`, and
+/// `HoldSpec::Frac(f64::NAN) != HoldSpec::Frac(f64::NAN)` —
+/// [`Self::validate`] rejects NaN at intake so the non-reflexive
+/// case is unreachable through validated construction, but the
+/// derive inherits the IEEE 754 contract at the type level). `Eq` /
+/// `Hash` remain impossible because `Frac` carries a float.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum HoldSpec {
     /// Fraction of the total scenario duration.
     Frac(f64),
@@ -1787,6 +1793,38 @@ pub enum HoldSpec {
 impl HoldSpec {
     /// Hold for the full scenario duration (`Frac(1.0)`).
     pub const FULL: HoldSpec = HoldSpec::Frac(1.0);
+
+    /// Hold for a fixed wall-clock duration. Sugar for
+    /// `HoldSpec::Fixed(d)` that reads naturally in chain position
+    /// (`Step::new(ops, HoldSpec::fixed(Duration::from_secs(5)))`)
+    /// and surfaces in IDE autocomplete next to [`Self::frac`] and
+    /// [`Self::loop_at`].
+    pub const fn fixed(d: Duration) -> HoldSpec {
+        HoldSpec::Fixed(d)
+    }
+
+    /// Hold for a fraction of the scenario duration. Sugar for
+    /// `HoldSpec::Frac(f)`; the value is `f` (e.g. `0.5` =
+    /// half the total). `f` must be finite and `> 0.0` — see
+    /// [`Self::validate`] for the rejection rules.
+    pub const fn frac(f: f64) -> HoldSpec {
+        HoldSpec::Frac(f)
+    }
+
+    /// Repeat the step's ops at the given interval until the
+    /// remaining scenario time is exhausted. Sugar for
+    /// `HoldSpec::Loop { interval }`; the value is `interval`. Must
+    /// be non-zero — see [`Self::validate`] for the rejection rule.
+    ///
+    /// Named `loop_at` (verb-preposition) rather than `r#loop`
+    /// because the variant name `Loop` collides with the Rust
+    /// keyword `loop` — `loop_at` reads as "loop AT this interval"
+    /// and avoids the raw-identifier escape. Sibling constructors
+    /// [`Self::fixed`] / [`Self::frac`] match their variant names
+    /// directly (no keyword conflict).
+    pub const fn loop_at(interval: Duration) -> HoldSpec {
+        HoldSpec::Loop { interval }
+    }
 
     /// Reject hold values that are vacuous (no-op step) or would
     /// panic downstream.
