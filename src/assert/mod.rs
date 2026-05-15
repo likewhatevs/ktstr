@@ -1717,9 +1717,14 @@ pub struct Assert {
     /// (`. * + ? ( ) [ ] { } | ^ $ \`) carry their regex meaning.
     /// For literal-substring matching, prefer
     /// [`Self::expect_scx_bpf_error_contains`] to avoid escape
-    /// footguns. Patterns are anchored as you write them: bare
-    /// `apply_cell_config` matches as a substring, `^apply_cell_config$`
-    /// matches the full message line.
+    /// footguns. The captured corpus is the multi-line concatenation
+    /// of the scheduler log and `--- sched_ext dump ---`; the regex
+    /// crate's default flags apply: `^` and `$` anchor to the start /
+    /// end of the WHOLE corpus (not individual lines), and `.` does
+    /// NOT cross `\n`. Opt in to line-level anchoring with `(?m)`
+    /// (e.g. `(?m)^apply_cell_config$`) and to newline-spanning
+    /// `.` with `(?s)`. A bare `apply_cell_config` matches the
+    /// token anywhere in the corpus.
     ///
     /// Requires the entry's `expect_err = true` — same rationale
     /// as [`Self::expect_scx_bpf_error_contains`]. Invalid regex
@@ -2290,10 +2295,13 @@ impl Assert {
     ///    the `regex` crate. Invalid syntax surfaces as a diagnostic
     ///    naming the pattern and the compile error.
     ///
-    /// `captured_text` is the concatenation of the scheduler log
-    /// (SCHED_OUTPUT_START..SCHED_OUTPUT_END section of COM2) and the
-    /// `--- sched_ext dump ---` extract from COM1 — both surfaces
-    /// where `scx_bpf_error` printk lands.
+    /// `captured_text` is the concatenation of the raw scheduler-log
+    /// stream (the bulk-port merged `SchedLog` frames, or the test
+    /// process `output` fallback when no frames arrived) and the
+    /// `--- sched_ext dump ---` extract — both surfaces where
+    /// `scx_bpf_error` printk lands. The matcher sees the WHOLE
+    /// stream, not the marker-extracted section; lines outside the
+    /// `SCHED_OUTPUT_START..SCHED_OUTPUT_END` markers are included.
     pub fn evaluate_scx_bpf_error_match(
         &self,
         captured_text: &str,

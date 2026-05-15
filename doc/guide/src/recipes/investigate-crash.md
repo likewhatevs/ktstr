@@ -65,3 +65,61 @@ When probe data is absent, a crash reproduction status line replaces it.
 
 See [Auto-Repro](../running-tests/auto-repro.md) for details on how
 the two-VM repro cycle works.
+
+## Pin a known error as a regression test
+
+Once auto-repro identifies the crash, pin its signature as a
+regression test so the same bug fails the next CI run instead of
+silently regressing. Two `#[ktstr_test]` attributes attach matchers
+to the captured `scx_bpf_error` text (the combined scheduler log and
+`--- sched_ext dump ---` corpus):
+
+- `expect_scx_bpf_error_contains = "literal"` — substring match.
+  Use for the common case of pinning an exact error fragment
+  without escaping regex metacharacters.
+- `expect_scx_bpf_error_matches = "regex"` — full regex match
+  via the `regex` crate. Use for anchored patterns, character
+  classes, and wildcards.
+
+Both attributes require `expect_err = true` (a reproducer matcher
+narrows which failure counts as the expected bug and only applies
+to expected-error tests). Both compose via AND semantics — set both
+to require BOTH to match.
+
+```rust,ignore
+const APPLY_CELL_CONFIG_EINVAL: &str = r"apply_cell_config returned -E[A-Z]+";
+
+#[ktstr_test(
+    scheduler = MITOSIS,
+    expect_err = true,
+    expect_scx_bpf_error_contains = "apply_cell_config",
+    expect_scx_bpf_error_matches = APPLY_CELL_CONFIG_EINVAL,
+)]
+fn mitosis_apply_cell_config_einval_regression(ctx: &Ctx) -> Result<AssertResult> {
+    // Test body sets up the conditions that trigger the bug.
+    Ok(AssertResult::pass())
+}
+```
+
+The test fails if EITHER matcher misses. A passing run means the
+scheduler still hits the pinned bug; a failure means the error text
+drifted (rename the matcher to the new text) or the bug was fixed
+(delete the regression test).
+
+Regex anchors use string-boundary semantics by default: `^` matches
+the start of the WHOLE captured corpus, `$` matches the end, and `.`
+does NOT cross `\n`. For line-level anchoring inside the multi-line
+corpus, opt in with the inline `(?m)` flag (e.g. `(?m)^apply_cell_config$`);
+for `.` to span line breaks, use `(?s)`. Whitespace in the pattern
+is matched byte-for-byte — no trim or normalization.
+
+Empty patterns panic at construction (an empty regex matches
+everywhere, turning the assertion into a no-op). Invalid regex
+syntax fails the test loudly at evaluation time with a diagnostic
+naming the pattern. The construction-time check is syntactic only —
+patterns that are syntactically non-empty but match every input
+(e.g. `a?`, `.*`, `(?:)`) silently pass and produce a no-op
+assertion; pin a substring of the expected error text rather than
+a wildcard. See the
+[`#[ktstr_test]` reference](../writing-tests/ktstr-test-macro.md#checking)
+for the full attribute list.

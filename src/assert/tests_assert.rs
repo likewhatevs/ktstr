@@ -1026,3 +1026,354 @@ fn evaluate_scx_bpf_error_match_finds_pattern_in_later_event() {
         "regex matcher must scan the WHOLE concatenated corpus: {re_details:?}",
     );
 }
+
+/// Empty corpus with a configured literal matcher fails loudly. The
+/// diagnostic must name the matcher, quote the expected literal, and
+/// surface the corpus length so an operator can tell at a glance
+/// whether the scheduler produced any captured text at all. Pins that
+/// "0 bytes" appears verbatim — that token is the operator's signal
+/// that the upstream capture pipeline (bulk-port scheduler log +
+/// sched_ext dump extract) produced nothing, distinct from "matcher
+/// mismatched substantial output."
+#[test]
+fn evaluate_scx_bpf_error_match_contains_fails_on_empty_corpus() {
+    let a = Assert::NO_OVERRIDES.expect_scx_bpf_error_contains("apply_cell_config");
+    let details = a.evaluate_scx_bpf_error_match("", true);
+    assert_eq!(details.len(), 1);
+    let msg = &details[0].message;
+    assert!(
+        msg.contains("expect_scx_bpf_error_contains"),
+        "diagnostic must name the matcher: {msg}",
+    );
+    assert!(
+        msg.contains("apply_cell_config"),
+        "diagnostic must quote the expected literal: {msg}",
+    );
+    assert!(
+        msg.contains("0 bytes"),
+        "diagnostic must surface the corpus length so operators can distinguish \
+         empty-capture from matcher-mismatch: {msg}",
+    );
+    assert!(
+        msg.contains("first 400 bytes follow:"),
+        "diagnostic must include the standard excerpt suffix even when empty: {msg}",
+    );
+}
+
+/// Empty corpus with a configured regex matcher fails loudly with
+/// the same diagnostic shape as the literal-substring variant.
+#[test]
+fn evaluate_scx_bpf_error_match_regex_fails_on_empty_corpus() {
+    let pattern = r"apply_cell_config.*-EINVAL";
+    let a = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(pattern);
+    let details = a.evaluate_scx_bpf_error_match("", true);
+    assert_eq!(details.len(), 1);
+    let msg = &details[0].message;
+    assert!(
+        msg.contains("expect_scx_bpf_error_matches"),
+        "diagnostic must name the matcher: {msg}",
+    );
+    assert!(
+        msg.contains(pattern),
+        "diagnostic must quote the pattern: {msg}",
+    );
+    assert!(
+        msg.contains("0 bytes"),
+        "diagnostic must surface the corpus length: {msg}",
+    );
+    assert!(
+        msg.contains("first 400 bytes follow:"),
+        "diagnostic must include the standard excerpt suffix: {msg}",
+    );
+}
+
+/// Both matchers configured + empty corpus → each produces its own
+/// failure detail (AND-semantics: every matcher must hit, every miss
+/// surfaces independently). Pin both details land, but do not pin
+/// their order — a future refactor that swaps order would still be
+/// semantically correct.
+#[test]
+fn evaluate_scx_bpf_error_match_both_fail_on_empty_corpus() {
+    let pattern = r"apply_cell_config.*-EINVAL";
+    let a = Assert::NO_OVERRIDES
+        .expect_scx_bpf_error_contains("apply_cell_config")
+        .expect_scx_bpf_error_matches(pattern);
+    let details = a.evaluate_scx_bpf_error_match("", true);
+    assert_eq!(
+        details.len(),
+        2,
+        "both matchers must produce independent failure details on empty corpus; got {details:?}",
+    );
+    assert!(
+        details
+            .iter()
+            .any(|d| d.message.contains("expect_scx_bpf_error_contains")),
+        "one detail must name the contains matcher: {details:?}",
+    );
+    assert!(
+        details
+            .iter()
+            .any(|d| d.message.contains("expect_scx_bpf_error_matches")),
+        "the other detail must name the regex matcher: {details:?}",
+    );
+    for d in &details {
+        assert!(
+            d.message.contains("0 bytes"),
+            "every detail must include the corpus-size diagnostic: {}",
+            d.message,
+        );
+    }
+}
+
+/// Literal-substring matcher does NOT trim or normalize whitespace.
+/// A pattern with leading or trailing spaces only matches a corpus
+/// with those bytes present verbatim. Pins this so a future "helpful"
+/// trim regression (e.g. `captured_text.trim().contains(literal.trim())`)
+/// fails here — operators rely on byte-for-byte matching to pin
+/// exact kernel printk strings.
+#[test]
+fn evaluate_scx_bpf_error_match_contains_no_trim_on_literal() {
+    let leading = Assert::NO_OVERRIDES.expect_scx_bpf_error_contains("  leading spaces");
+    // Corpus has "leading spaces" but NOT with the two-space prefix.
+    let no_match = leading.evaluate_scx_bpf_error_match("the line: leading spaces here", true);
+    assert_eq!(
+        no_match.len(),
+        1,
+        "literal with two leading spaces must NOT match corpus where the only \
+         instance lacks the leading spaces; got {no_match:?}",
+    );
+    // Same matcher against corpus that DOES have the two-space prefix → empty.
+    let matches = leading
+        .evaluate_scx_bpf_error_match("prefix\n  leading spaces appear here", true);
+    assert!(
+        matches.is_empty(),
+        "literal with leading spaces must match when corpus has them byte-for-byte; got {matches:?}",
+    );
+
+    // Trailing-whitespace symmetry. The corpus must contain the BASE
+    // token "trailing" so that a hypothetical `.trim_end()` regression
+    // would make the literal match incorrectly — comparing against an
+    // unrelated corpus would pass under either implementation and
+    // wouldn't pin no-trim semantics.
+    let trailing = Assert::NO_OVERRIDES.expect_scx_bpf_error_contains("trailing  ");
+    // Negative: corpus has "trailing" with only one trailing space, not two.
+    // Under a `.trim_end()` regression both sides would collapse to "trailing"
+    // and the matcher would silently succeed.
+    let no_trail_match = trailing.evaluate_scx_bpf_error_match("some trailing text", true);
+    assert_eq!(
+        no_trail_match.len(),
+        1,
+        "literal with two trailing spaces must NOT match corpus where the base \
+         token is followed by one space (catches hypothetical trim regression): \
+         {no_trail_match:?}",
+    );
+    // Positive: corpus has the two trailing spaces byte-for-byte.
+    let trail_match = trailing.evaluate_scx_bpf_error_match("some trailing  text", true);
+    assert!(
+        trail_match.is_empty(),
+        "literal with two trailing spaces must match corpus with two spaces \
+         byte-for-byte: {trail_match:?}",
+    );
+}
+
+/// Literal-substring matcher is unaffected by embedded `\n` / `\t` in
+/// the corpus around the literal token. Pin that the contains() walk
+/// is byte-level — newlines and tabs surrounding the match are not
+/// boundaries the matcher cares about.
+#[test]
+fn evaluate_scx_bpf_error_match_contains_unaffected_by_newlines_and_tabs() {
+    let a = Assert::NO_OVERRIDES.expect_scx_bpf_error_contains("apply_cell_config");
+    let corpus = "first line\n\tindented tab here apply_cell_config more\n";
+    let details = a.evaluate_scx_bpf_error_match(corpus, true);
+    assert!(
+        details.is_empty(),
+        "literal match must succeed across embedded whitespace surroundings: {details:?}",
+    );
+
+    // A literal that itself contains a newline only matches when that
+    // exact byte sequence is present — newlines aren't elided.
+    let with_nl = Assert::NO_OVERRIDES.expect_scx_bpf_error_contains("apply_cell_conf\nig");
+    let nl_details = with_nl.evaluate_scx_bpf_error_match("apply_cell_config", true);
+    assert_eq!(
+        nl_details.len(),
+        1,
+        "literal containing a newline must NOT match a corpus without that newline: {nl_details:?}",
+    );
+}
+
+/// Regex `^` / `$` are STRING-boundary anchors by default — they
+/// match the start / end of the WHOLE corpus, not individual lines.
+/// Operators who want line-level anchoring must opt in with the
+/// inline `(?m)` flag. Pin BOTH anchors:
+///   `$` end-anchor:
+///     (1) `apply_cell_config$` fails when the token is mid-corpus,
+///     (2) `apply_cell_config$` matches when the token is at corpus-end,
+///     (3) `(?m)apply_cell_config$` matches the token at any line-end.
+///   `^` start-anchor:
+///     (4) `^apply_cell_config` fails when the token is mid-corpus,
+///     (5) `^apply_cell_config` matches when the token is at corpus-start,
+///     (6) `(?m)^apply_cell_config` matches the token at any line-start.
+#[test]
+fn evaluate_scx_bpf_error_match_regex_anchors_are_string_boundaries_by_default() {
+    // $ end-anchor — default mode: anchors to string-end.
+    let dollar = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r"apply_cell_config$");
+    let dollar_mid = "apply_cell_config\nbut more after";
+    let dollar_mid_details = dollar.evaluate_scx_bpf_error_match(dollar_mid, true);
+    assert_eq!(
+        dollar_mid_details.len(),
+        1,
+        "default-mode $ anchors to STRING-end; mid-corpus token must NOT match: {dollar_mid_details:?}",
+    );
+
+    // $ end-anchor — default mode positive: matches when token IS at string-end.
+    let dollar_end = "prefix junk\napply_cell_config";
+    let dollar_end_details = dollar.evaluate_scx_bpf_error_match(dollar_end, true);
+    assert!(
+        dollar_end_details.is_empty(),
+        "default-mode $ matches when corpus actually ends with the token: {dollar_end_details:?}",
+    );
+
+    // $ end-anchor — (?m) opt-in: now matches line-end.
+    let dollar_multiline =
+        Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r"(?m)apply_cell_config$");
+    let dollar_multi_details = dollar_multiline.evaluate_scx_bpf_error_match(dollar_mid, true);
+    assert!(
+        dollar_multi_details.is_empty(),
+        "(?m) opt-in makes $ match line-end; mid-corpus token at line-end matches: {dollar_multi_details:?}",
+    );
+
+    // ^ start-anchor — default mode: anchors to string-start.
+    let caret = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r"^apply_cell_config");
+    let caret_mid = "prefix junk\napply_cell_config more";
+    let caret_mid_details = caret.evaluate_scx_bpf_error_match(caret_mid, true);
+    assert_eq!(
+        caret_mid_details.len(),
+        1,
+        "default-mode ^ anchors to STRING-start; mid-corpus token must NOT match: {caret_mid_details:?}",
+    );
+
+    // ^ start-anchor — default mode positive: matches when token IS at string-start.
+    let caret_start = "apply_cell_config\nbut more after";
+    let caret_start_details = caret.evaluate_scx_bpf_error_match(caret_start, true);
+    assert!(
+        caret_start_details.is_empty(),
+        "default-mode ^ matches when corpus actually starts with the token: {caret_start_details:?}",
+    );
+
+    // ^ start-anchor — (?m) opt-in: now matches line-start.
+    let caret_multiline =
+        Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r"(?m)^apply_cell_config");
+    let caret_multi_details = caret_multiline.evaluate_scx_bpf_error_match(caret_mid, true);
+    assert!(
+        caret_multi_details.is_empty(),
+        "(?m) opt-in makes ^ match line-start; mid-corpus token at line-start matches: {caret_multi_details:?}",
+    );
+}
+
+/// Regex `.` does NOT match `\n` by default. Operators who want a
+/// pattern to span lines must opt in with the inline `(?s)` (DOTALL)
+/// flag. Pin all three cases:
+///   (1) `apply.*EINVAL` fails when the two tokens are on separate lines,
+///   (2) `apply.*EINVAL` matches when both are on the same line,
+///   (3) `(?s)apply.*EINVAL` matches across line boundaries.
+#[test]
+fn evaluate_scx_bpf_error_match_regex_dot_excludes_newline_by_default() {
+    let a = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r"apply.*EINVAL");
+
+    let split = "apply_cell_config triggered\n-EINVAL returned";
+    let split_details = a.evaluate_scx_bpf_error_match(split, true);
+    assert_eq!(
+        split_details.len(),
+        1,
+        "default-mode . excludes \\n; pattern spanning lines must NOT match: {split_details:?}",
+    );
+
+    let same_line = "apply_cell_config triggered -EINVAL returned";
+    let same_details = a.evaluate_scx_bpf_error_match(same_line, true);
+    assert!(
+        same_details.is_empty(),
+        "default-mode . matches non-newline bytes; same-line pattern matches: {same_details:?}",
+    );
+
+    let a_dotall = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r"(?s)apply.*EINVAL");
+    let dotall_details = a_dotall.evaluate_scx_bpf_error_match(split, true);
+    assert!(
+        dotall_details.is_empty(),
+        "(?s) DOTALL opt-in makes . cross newlines; split-line pattern matches: {dotall_details:?}",
+    );
+}
+
+/// Vacuous regex patterns (`a?`, `(?:)`, `^$` against empty corpus,
+/// `.*`) PASS the construction gate at types.rs because the gate
+/// only rejects syntactically empty patterns; semantically the
+/// matcher returns empty details (vacuous match) regardless of corpus
+/// content. Pin this current behavior so a future improvement that
+/// adds a semantic gate (Regex compiled at construction + reject if
+/// `is_match("")` returns true) trips this test as a deliberate
+/// behavior change. The framework currently does not protect against
+/// this footgun.
+#[test]
+fn evaluate_scx_bpf_error_match_regex_vacuous_patterns_pass_current_construction_gate() {
+    // `a?` matches an empty string at every position — passes against any corpus.
+    let optional = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r"a?");
+    let optional_details = optional.evaluate_scx_bpf_error_match("xyz no a here", true);
+    assert!(
+        optional_details.is_empty(),
+        "`a?` vacuously matches; current construction gate is syntactic only: {optional_details:?}",
+    );
+
+    // `.*` matches the empty string — passes against empty corpus.
+    let star = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r".*");
+    let star_details = star.evaluate_scx_bpf_error_match("", true);
+    assert!(
+        star_details.is_empty(),
+        "`.*` vacuously matches empty corpus; current gate is syntactic only: {star_details:?}",
+    );
+
+    // `(?:)` is the canonical "syntactically non-empty, semantically
+    // empty" pattern — an empty non-capturing group that matches at
+    // every position. Distinct from `.*` (matches zero-or-more chars)
+    // and `a?` (matches zero-or-one `a`) — the empty-group syntax is
+    // the case the construction gate most plausibly should reject but
+    // currently does not.
+    let empty_group = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r"(?:)");
+    let empty_group_details = empty_group.evaluate_scx_bpf_error_match("any nonempty corpus", true);
+    assert!(
+        empty_group_details.is_empty(),
+        "`(?:)` vacuously matches every position; current gate is syntactic only: {empty_group_details:?}",
+    );
+
+    // `^$` matches only when the corpus IS empty (start-immediately-followed-by-end);
+    // for non-empty corpora it fails. Distinct from `.*` / `a?` / `(?:)`, which
+    // match every input regardless of content — `^$` is the EMPTY-ONLY vacuous case.
+    let anchored_empty = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r"^$");
+    let anchored_details = anchored_empty.evaluate_scx_bpf_error_match("", true);
+    assert!(
+        anchored_details.is_empty(),
+        "`^$` vacuously matches empty corpus; current gate is syntactic only: {anchored_details:?}",
+    );
+}
+
+/// Regex literal whitespace (space, tab) in the pattern matches the
+/// same bytes in the corpus — no normalization. A pattern with a
+/// literal tab `\t` only matches a corpus with a literal tab, not a
+/// corpus with a space at that position.
+#[test]
+fn evaluate_scx_bpf_error_match_regex_literal_whitespace_matches_byte_for_byte() {
+    let a_tab = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches("apply\tcell");
+
+    let with_tab = "apply\tcell_config triggered";
+    let tab_match = a_tab.evaluate_scx_bpf_error_match(with_tab, true);
+    assert!(
+        tab_match.is_empty(),
+        "regex with literal tab must match corpus with literal tab: {tab_match:?}",
+    );
+
+    let with_space = "apply cell_config triggered";
+    let space_no_match = a_tab.evaluate_scx_bpf_error_match(with_space, true);
+    assert_eq!(
+        space_no_match.len(),
+        1,
+        "regex with literal tab must NOT match corpus with a space in that position: {space_no_match:?}",
+    );
+}
