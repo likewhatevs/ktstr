@@ -452,9 +452,10 @@ impl<'a, 'b> ScenarioState<'a, 'b> {
     }
 
     /// True iff a cgroup with the given name is tracked by backdrop
-    /// (persistent) state. Used by `Op::RemoveCgroup` to reject a
-    /// step-local op that would remove a Backdrop-owned cgroup out
-    /// from under later Steps.
+    /// (persistent) state. Used by `Op::MoveAllTasks` to decide
+    /// handle-ownership transfer direction (step→backdrop transfers
+    /// the handle into the persistent slot; backdrop→step-local is
+    /// rejected because it would orphan workers at step teardown).
     fn cgroup_name_is_backdrop(&self, name: &str) -> bool {
         self.backdrop.cgroups.names().iter().any(|n| n == name)
     }
@@ -2121,26 +2122,6 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 apply_setup(ctx, state, std::slice::from_ref(def))?;
             }
             Op::RemoveCgroup { cgroup } => {
-                // A Step's ops must not remove a Backdrop-owned
-                // cgroup — later Steps expect the Backdrop's cgroups
-                // to survive every per-step teardown. Reject
-                // explicitly so a typo in the cgroup name does not
-                // silently dismantle a persistent cgroup and let
-                // subsequent Steps fail with confusing
-                // "cgroup missing" errors. Ops running during the
-                // Backdrop's own setup pass (`target_backdrop`)
-                // are exempt: the Backdrop is allowed to structure
-                // its own state however it needs before the Step
-                // loop starts.
-                if !state.target_backdrop && state.cgroup_name_is_backdrop(cgroup) {
-                    anyhow::bail!(
-                        "Op::RemoveCgroup targets Backdrop-owned cgroup '{}' — \
-                         Backdrop cgroups live for the full scenario and must \
-                         not be removed from a Step; drop the op or move the \
-                         cgroup declaration out of the Backdrop",
-                        cgroup,
-                    );
-                }
                 // Stop workers + payload binaries in this cgroup
                 // before the cgroupfs removal. A live process in the
                 // cgroup makes `rmdir` fail with EBUSY; kill the
@@ -2148,6 +2129,13 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 state.drain_payloads_for_cgroup(cgroup);
                 state.drop_handles_for_cgroup(cgroup);
                 state.forget_cpuset(cgroup);
+                // Drop the name from step/backdrop tracking BEFORE
+                // the rmdir so a later AddCgroup with the same name
+                // doesn't collide against a stale entry, and the
+                // CgroupGroup::drop teardown path doesn't attempt
+                // to rmdir an already-removed dir.
+                state.step.cgroups.forget(cgroup);
+                state.backdrop.cgroups.forget(cgroup);
                 // ENOENT is expected here only as a TOCTOU outcome:
                 // `CgroupManager::remove_cgroup` first checks
                 // `p.exists()` and returns `Ok(())` when the dir is
@@ -2280,23 +2268,6 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 state.target_handles().push((cgroup.to_string(), h));
             }
             Op::StopCgroup { cgroup } => {
-                // Same invariant as Op::RemoveCgroup: a Step's ops
-                // must not stop a Backdrop-owned cgroup's workers.
-                // `drain_payloads_for_cgroup` and
-                // `drop_handles_for_cgroup` both touch step + backdrop
-                // state by name, so a silent step-local stop would
-                // kill persistent workers. Ops running inside the
-                // Backdrop's own setup pass (`target_backdrop`)
-                // stay exempt.
-                if !state.target_backdrop && state.cgroup_name_is_backdrop(cgroup) {
-                    anyhow::bail!(
-                        "Op::StopCgroup targets Backdrop-owned cgroup '{}' — \
-                         Backdrop workers live for the full scenario and must \
-                         not be stopped from a Step; drop the op or move the \
-                         cgroup declaration out of the Backdrop",
-                        cgroup,
-                    );
-                }
                 state.drain_payloads_for_cgroup(cgroup);
                 state.drop_handles_for_cgroup(cgroup);
             }
@@ -6276,17 +6247,17 @@ mod tests {
     // Step/Backdrop ruling invariants
     // ---------------------------------------------------------------
 
-    /// A step-local `Op::RemoveCgroup` that targets a Backdrop-owned
-    /// cgroup must bail before any cgroupfs write. Ops running inside
-    /// the Backdrop's own setup pass (i.e. `target_backdrop == true`)
-    /// stay exempt.
+    /// `Op::RemoveCgroup` and `Op::StopCgroup` reach the cgroup ops
+    /// for Backdrop-owned targets from both step-local apply and
+    /// Backdrop's own setup pass. RemoveCgroup also drops the
+    /// Backdrop tracking entry so a later AddCgroup with the same
+    /// name does not collide against a stale slot.
     #[test]
-    fn remove_cgroup_rejects_backdrop_target() {
+    fn remove_and_stop_cgroup_permit_backdrop_target_from_step() {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
 
-        // Populate a backdrop cgroup and leave the step state empty.
         let mut step_state = StepState::empty(&ctx);
         let mut backdrop_state = BackdropState::empty(&ctx);
         backdrop_state
@@ -6294,43 +6265,51 @@ mod tests {
             .add_cgroup_no_cpuset("bd_cg")
             .expect("add backdrop cgroup");
 
-        // Step-local RemoveCgroup must reject.
         {
             let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
-            let err = apply_ops(&ctx, &mut scenario, &[Op::remove_cgroup("bd_cg")]).unwrap_err();
-            let msg = format!("{err:#}");
-            assert!(
-                msg.contains("Backdrop-owned") && msg.contains("bd_cg"),
-                "error must name the backdrop cgroup and explain why, got: {msg}"
-            );
-        }
-        // The backdrop cgroup is still tracked.
-        assert_eq!(backdrop_state.cgroups.names(), &["bd_cg".to_string()]);
-        // No remove_cgroup call was issued to the mock — the bail
-        // happened before any cgroupfs write.
-        let calls = mock.calls();
-        assert!(
-            !calls
-                .iter()
-                .any(|c| matches!(c, CgroupCall::RemoveCgroup(_))),
-            "pre-bail path must not invoke remove_cgroup, got: {calls:?}"
-        );
-
-        // Backdrop-pass RemoveCgroup (target_backdrop = true) is
-        // allowed and routes through to the mock.
-        {
-            let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
-            scenario
-                .with_target_backdrop(|s| apply_ops(&ctx, s, &[Op::remove_cgroup("bd_cg")]))
-                .expect("backdrop-pass remove is permitted");
+            apply_ops(&ctx, &mut scenario, &[Op::remove_cgroup("bd_cg")])
+                .expect("step-local RemoveCgroup permitted against Backdrop target");
         }
         let calls = mock.calls();
         assert!(
             calls
                 .iter()
                 .any(|c| matches!(c, CgroupCall::RemoveCgroup(n) if n == "bd_cg")),
-            "backdrop-pass remove must reach the cgroup ops, got: {calls:?}"
+            "step-local remove must reach the cgroup ops, got: {calls:?}"
         );
+        assert!(
+            !backdrop_state.cgroups.names().iter().any(|n| n == "bd_cg"),
+            "post-RemoveCgroup must drop backdrop tracking entry, got: {:?}",
+            backdrop_state.cgroups.names()
+        );
+
+        // Slot is free — re-adding the same name must succeed.
+        {
+            let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+            apply_ops(&ctx, &mut scenario, &[Op::add_cgroup("bd_cg")])
+                .expect("AddCgroup with previously-removed name must succeed");
+        }
+
+        backdrop_state
+            .cgroups
+            .add_cgroup_no_cpuset("bd_cg_2")
+            .expect("add second backdrop cgroup");
+        {
+            let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+            apply_ops(&ctx, &mut scenario, &[Op::stop_cgroup("bd_cg_2")])
+                .expect("step-local StopCgroup permitted against Backdrop target");
+        }
+
+        backdrop_state
+            .cgroups
+            .add_cgroup_no_cpuset("bd_cg_3")
+            .expect("add third backdrop cgroup");
+        {
+            let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+            scenario
+                .with_target_backdrop(|s| apply_ops(&ctx, s, &[Op::remove_cgroup("bd_cg_3")]))
+                .expect("backdrop-pass RemoveCgroup permitted against Backdrop target");
+        }
 
         cleanup_state(&mut step_state);
     }

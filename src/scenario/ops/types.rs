@@ -55,7 +55,13 @@ pub enum Op {
     /// rejects collisions with prior Backdrop or step-local
     /// CgroupDef declarations.
     AddCgroupDef { def: CgroupDef },
-    /// Remove a cgroup (stops its workers first).
+    /// Remove a cgroup (stops its workers first). Permitted against
+    /// both step-local and Backdrop-owned cgroups; removing a
+    /// Backdrop cgroup mid-scenario drops it from the Backdrop
+    /// tracking list so a later `Op::AddCgroup` with the same name
+    /// can re-create the cgroup. A typo'd cgroup name surfaces
+    /// later as a kernel-layer "cgroup missing" error on the next
+    /// op that references the name, not at the RemoveCgroup site.
     RemoveCgroup { cgroup: Cow<'static, str> },
     /// Set a cgroup's cpuset to the resolved CPU set.
     SetCpuset {
@@ -79,6 +85,10 @@ pub enum Op {
         work: WorkSpec,
     },
     /// Stop all workers in a cgroup (does not remove the cgroup).
+    /// Permitted against both step-local and Backdrop-owned cgroups;
+    /// stopping a Backdrop cgroup's workers mid-scenario leaves the
+    /// cgroup hierarchy intact but makes subsequent ops that expect
+    /// those workers (e.g. wait/kill payload) fail to find them.
     StopCgroup { cgroup: Cow<'static, str> },
     /// Set worker affinity in a cgroup. Resolved at apply time via
     /// [`resolve_affinity_for_cgroup()`](super::resolve_affinity_for_cgroup).

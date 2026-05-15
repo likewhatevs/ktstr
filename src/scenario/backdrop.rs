@@ -32,9 +32,11 @@
 //! cgroup-addressing ops (`Op::SetCpuset`, `Op::MoveAllTasks`, etc.)
 //! — name lookups resolve step-local first, then fall through to
 //! the Backdrop. Step-local cgroups must not shadow a Backdrop
-//! cgroup name, and step-local `Op::RemoveCgroup` targeting a
-//! Backdrop cgroup is rejected so later Steps cannot find it
-//! missing.
+//! cgroup name. Step-local `Op::RemoveCgroup` / `Op::StopCgroup`
+//! targeting a Backdrop cgroup is permitted; later Steps that
+//! reference the removed cgroup by name surface a kernel-layer
+//! `cgroup missing` error rather than getting a Backdrop typo
+//! caught early.
 
 use super::ops::{CgroupDef, Op};
 use crate::test_support::Payload;

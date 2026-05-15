@@ -175,6 +175,17 @@ impl<'a> CgroupGroup<'a> {
     pub fn names(&self) -> &[String] {
         &self.names
     }
+
+    /// Forget a tracked cgroup name without touching cgroupfs. Used
+    /// by `Op::RemoveCgroup` immediately BEFORE invoking the kernel
+    /// rmdir, so a later `Op::AddCgroup` with the same name can
+    /// re-create the cgroup instead of colliding against the stale
+    /// tracking entry, and the teardown-on-drop path skips a
+    /// now-redundant rmdir of a dir that the in-progress (or
+    /// already-completed) kernel call is removing.
+    pub(crate) fn forget(&mut self, name: &str) {
+        self.names.retain(|n| n != name);
+    }
 }
 
 /// True when `err`'s root cause is an `io::Error` with kind
