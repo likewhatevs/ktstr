@@ -136,14 +136,19 @@ pub fn export_test(test_name: &str, output: Option<PathBuf>) -> Result<()> {
         std::env::current_exe().context("locate the current test binary via /proc/self/exe")?;
 
     let scheduler_path = resolve_scheduler_for_export(entry)?;
-    let include_files = resolve_include_files(entry)?;
+    let mut include_files = resolve_include_files(entry)?;
+    let config_additions = compute_config_export_additions(entry)
+        .context("resolve scheduler config file for export")?;
+    for addition in &config_additions {
+        include_files.push(addition.host_path.clone());
+    }
 
     let output_path = output.unwrap_or_else(|| PathBuf::from(format!("{test_name}.run")));
 
     let archive = build_archive(&test_binary, scheduler_path.as_deref(), &include_files)
         .context("build embedded gzip tarball")?;
 
-    let preamble = generate_preamble(entry, scheduler_path.is_some());
+    let preamble = generate_preamble(entry, scheduler_path.is_some(), &config_additions);
 
     write_runfile(&output_path, &preamble, &archive)
         .with_context(|| format!("write runfile to {}", output_path.display()))?;
@@ -169,6 +174,178 @@ fn resolve_scheduler_for_export(entry: &KtstrTestEntry) -> Result<Option<PathBuf
     let (path, _source) = resolve_scheduler(&entry.scheduler.binary)
         .with_context(|| format!("resolve scheduler binary for test '{}'", entry.name))?;
     Ok(path)
+}
+
+/// A scheduler config file or inline content contributes one
+/// host-side file plus one set of CLI arguments to the export.
+///
+/// Mirrors the in-VM path at
+/// [`crate::test_support::eval::run_ktstr_test_inner`] which calls
+/// [`crate::test_support::runtime::config_file_parts`] +
+/// [`crate::test_support::runtime::config_content_parts`] to
+/// resolve the same two slots.
+#[derive(Debug)]
+struct ConfigExportAddition {
+    /// Host-filesystem path of the config file. For
+    /// `scheduler.config_file` (on-disk file), this is the file
+    /// itself. For `entry.config_content` (inline content), this
+    /// is a temp file written under `$TMPDIR` containing the
+    /// content bytes; the export-side caller doesn't differentiate
+    /// — both go through the same `build_archive` path.
+    host_path: PathBuf,
+    /// Shell-ready CLI argument string PREPENDED to the launched
+    /// scheduler's argv at preamble-render time so the rendered
+    /// argv matches the in-VM eval.rs:1112-1125 ordering
+    /// (`--config FIRST, append_base_sched_args LAST`). Uses
+    /// `"$DIR/include/<basename>"` (with the `$DIR` shell variable
+    /// preserved for runtime expansion by the .run extractor) so
+    /// the path resolves to the operator's extracted .run tree on
+    /// the target host. No leading space — the caller manages
+    /// spacing between additions and the base args.
+    args_shell_prefix: String,
+}
+
+/// Compute the scheduler-config export additions for an entry.
+///
+/// Returns 0, 1, or 2 additions matching the in-VM path's
+/// dual-slot handling:
+///   - `entry.scheduler.config_file` (Option<host path>)
+///   - `entry.config_content` (Option<inline content>) paired
+///     with `entry.scheduler.config_file_def` (Option<(arg_template,
+///     guest_path)>)
+///
+/// Both slots are processed independently; in practice
+/// [`crate::test_support::entry::KtstrTestEntry::validate`] gates
+/// `config_content` to require a matching `config_file_def` and
+/// rejects an unpaired `config_content`, so the inline path emits
+/// at most one addition. The on-disk path is orthogonal and could
+/// in theory co-exist with the inline path — handled in lockstep
+/// with the in-VM eval.rs behavior so a single .run runs the
+/// scheduler with the same argv as a normal test invocation.
+fn compute_config_export_additions(entry: &KtstrTestEntry) -> Result<Vec<ConfigExportAddition>> {
+    let mut out = Vec::new();
+    if let Some(addition) = config_file_addition(entry)? {
+        out.push(addition);
+    }
+    if let Some(addition) = config_content_addition(entry)? {
+        out.push(addition);
+    }
+    Ok(out)
+}
+
+/// Translate `entry.scheduler.config_file` (Option<host path>)
+/// into a [`ConfigExportAddition`]. Hardcoded `--config` arg
+/// matches the in-VM behavior at
+/// [`crate::test_support::runtime::config_file_parts`] and the
+/// surrounding push at `eval.rs`.
+fn config_file_addition(entry: &KtstrTestEntry) -> Result<Option<ConfigExportAddition>> {
+    let Some(config_path) = entry.scheduler.config_file else {
+        return Ok(None);
+    };
+    let host_path = PathBuf::from(config_path);
+    if !host_path.exists() {
+        bail!(
+            "scheduler '{}' declares config_file {} but the file is not present on the host",
+            entry.scheduler.name,
+            host_path.display()
+        );
+    }
+    // Mirror resolve_include_files's directory-reject (export.rs near
+    // is_dir() rejection in that helper): export packs regular files,
+    // so a directory-shaped config_file would silently fail later in
+    // build_archive's `std::fs::read` with a less-actionable EISDIR.
+    if host_path.is_dir() {
+        bail!(
+            "scheduler '{}' declares config_file {} but the path is a directory — \
+             config_file must point at a regular file. Recursive directory packaging \
+             is a v2 enhancement; for now, list a single file or split the directory \
+             contents across `include_files` declarations.",
+            entry.scheduler.name,
+            host_path.display()
+        );
+    }
+    let basename = host_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "scheduler config_file {} has no valid basename",
+                host_path.display()
+            )
+        })?
+        .to_string();
+    reject_shell_metacharacters_in_basename(&basename, &host_path.display().to_string())?;
+    let args_shell_prefix = format!("--config \"$DIR/include/{basename}\"");
+    Ok(Some(ConfigExportAddition {
+        host_path,
+        args_shell_prefix,
+    }))
+}
+
+/// Translate `entry.config_content` (Option<inline content>) +
+/// `entry.scheduler.config_file_def` (Option<(arg_template,
+/// guest_path)>) into a [`ConfigExportAddition`] by writing the
+/// content bytes to a temp file under `$TMPDIR` and substituting
+/// `{file}` in the arg template with the export-side runtime path
+/// `"$DIR/include/<basename>"`.
+///
+/// The basename derives from the scheduler's declared guest path
+/// (e.g. `/include-files/layers.json` → `layers.json`) so a
+/// scheduler family that declares a stable guest_path naming
+/// convention sees the same basename in the .run archive that it
+/// would see in the in-VM /include-files mount.
+fn config_content_addition(entry: &KtstrTestEntry) -> Result<Option<ConfigExportAddition>> {
+    use std::hash::{Hash, Hasher};
+    let Some(content) = entry.config_content else {
+        return Ok(None);
+    };
+    let Some((arg_template, guest_path)) = entry.scheduler.config_file_def else {
+        return Ok(None);
+    };
+    let basename = std::path::Path::new(guest_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "scheduler '{}' config_file_def guest_path '{}' has no valid basename",
+                entry.scheduler.name,
+                guest_path
+            )
+        })?
+        .to_string();
+    reject_shell_metacharacters_in_basename(&basename, guest_path)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    let hash = hasher.finish();
+    let tmp = std::env::temp_dir().join(format!("ktstr-export-config-{hash:x}-{basename}"));
+    std::fs::write(&tmp, content)
+        .with_context(|| format!("write inline config_content to {}", tmp.display()))?;
+    let runtime_path = format!("\"$DIR/include/{basename}\"");
+    let expanded = arg_template.replace("{file}", &runtime_path);
+    Ok(Some(ConfigExportAddition {
+        host_path: tmp,
+        args_shell_prefix: expanded,
+    }))
+}
+
+/// Reject basenames containing shell-metacharacters that would
+/// break the double-quote-interpolation context the addition's
+/// `args_shell_prefix` ends up in (e.g.
+/// `--config "$DIR/include/<basename>"`). Test-author input is
+/// trusted (static string slots), but defense-in-depth catches
+/// any future regression that would land a basename with `"`,
+/// `\`, `$`, or `` ` `` and silently produce a broken .run script.
+fn reject_shell_metacharacters_in_basename(basename: &str, source: &str) -> Result<()> {
+    for c in basename.chars() {
+        if c == '"' || c == '\\' || c == '$' || c == '`' {
+            bail!(
+                "scheduler config file basename {basename:?} (from {source}) contains shell-metacharacter {c:?}; \
+                 this would break the double-quoted .run preamble interpolation. \
+                 Rename the file to use only ASCII letters, digits, `_`, `-`, and `.`."
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Resolve every `all_include_files()` spec to a host-side path.
@@ -340,7 +517,11 @@ fn append_file<W: Write>(
 /// `__ARCHIVE__`) before running on a system they do not control.
 /// `--quiet` suppresses the banner only — error paths still print
 /// so a failing repro is never silent.
-fn generate_preamble(entry: &KtstrTestEntry, has_scheduler: bool) -> String {
+fn generate_preamble(
+    entry: &KtstrTestEntry,
+    has_scheduler: bool,
+    config_additions: &[ConfigExportAddition],
+) -> String {
     let topology = entry.topology;
     let need_llcs = topology.llcs;
     let need_cores = topology.cores_per_llc;
@@ -357,18 +538,46 @@ fn generate_preamble(entry: &KtstrTestEntry, has_scheduler: bool) -> String {
     // run for these three sources — without it, the export would
     // silently drop `--cell-parent-cgroup` and any sched-def
     // baseline args, and the reproduced scheduler would land in the
-    // wrong cgroup tree. The repro does NOT yet replicate
-    // `config_file` / `config_content` scheduler args (the in-VM
-    // path pushes `--config <guest_path>` BEFORE the helper call;
-    // adding the export-side `--config` push + include_files
-    // plumbing is a v2 enhancement for config-driven schedulers).
+    // wrong cgroup tree.
+    //
+    // Config-driven schedulers (declared `config_file` and/or
+    // `config_content`) are handled via the `config_additions`
+    // parameter: each addition contributes a shell-ready prefix
+    // that lands BEFORE the joined base args. The ordering matches
+    // the in-VM path at `eval.rs:1112-1125` which pushes
+    // `--config <path>` (and any `config_file_def`-templated arg)
+    // first and then appends `append_base_sched_args` last.
+    // Keeping in-VM and export argv-order in lockstep means an
+    // exported reproducer's scheduler-launch line is byte-similar
+    // (modulo path expansion) to the live test's, so clap parsers
+    // with order-sensitive semantics (e.g. trailing-args,
+    // override-on-conflict) behave identically across both paths.
+    //
+    // Each prefix uses `"$DIR/include/<basename>"` so the path
+    // resolves to the operator's extracted .run tree at script-run
+    // time — the matching include-file is packed into the archive
+    // at `include/<basename>` by [`compute_config_export_additions`]
+    // and [`build_archive`].
     let mut sched_arg_tokens_raw: Vec<String> = Vec::new();
     crate::test_support::append_base_sched_args(entry, &mut sched_arg_tokens_raw);
-    let sched_args_joined: String = sched_arg_tokens_raw
+    let base_joined: String = sched_arg_tokens_raw
         .iter()
         .map(|a| shell_quote(a))
         .collect::<Vec<_>>()
         .join(" ");
+    let mut sched_args_joined = String::new();
+    for addition in config_additions {
+        if !sched_args_joined.is_empty() {
+            sched_args_joined.push(' ');
+        }
+        sched_args_joined.push_str(&addition.args_shell_prefix);
+    }
+    if !base_joined.is_empty() {
+        if !sched_args_joined.is_empty() {
+            sched_args_joined.push(' ');
+        }
+        sched_args_joined.push_str(&base_joined);
+    }
 
     // Defensive shell-quoting on every interpolated runtime value.
     // The names come from compile-time const slots that are
@@ -1247,7 +1456,7 @@ mod tests {
         };
 
         for has_scheduler in [true, false] {
-            let preamble = generate_preamble(&entry, has_scheduler);
+            let preamble = generate_preamble(&entry, has_scheduler, &[]);
             assert_bash_n_accepts(&preamble, has_scheduler);
         }
     }
@@ -1275,7 +1484,7 @@ mod tests {
             },
             ..KtstrTestEntry::DEFAULT
         };
-        let preamble = generate_preamble(&entry, true);
+        let preamble = generate_preamble(&entry, true, &[]);
 
         assert!(
             preamble.contains("KTSTR_TEST_NAME=interp_smoke"),
@@ -1342,7 +1551,7 @@ mod tests {
             scheduler: &SCHED_WITH_PARENT,
             ..KtstrTestEntry::DEFAULT
         };
-        let preamble = generate_preamble(&entry, true);
+        let preamble = generate_preamble(&entry, true, &[]);
         assert!(
             preamble.contains("--cell-parent-cgroup") && preamble.contains("/ktstr_export_test"),
             "preamble must auto-inject --cell-parent-cgroup from \
@@ -1384,7 +1593,7 @@ mod tests {
             extra_sched_args: &["--cell-parent-cgroup", "/user_supplied_path"],
             ..KtstrTestEntry::DEFAULT
         };
-        let preamble = generate_preamble(&entry, true);
+        let preamble = generate_preamble(&entry, true, &[]);
         assert!(
             preamble.contains("/user_supplied_path"),
             "preamble must carry the user-supplied path; got: {preamble}"
@@ -1393,6 +1602,504 @@ mod tests {
             !preamble.contains("/auto_inject_path"),
             "preamble must NOT auto-inject the scheduler's cgroup_parent \
              when extra_sched_args already supplies --cell-parent-cgroup; got: {preamble}"
+        );
+    }
+
+    /// `compute_config_export_additions` returns an empty vec when
+    /// neither slot is set. Baseline against false-positive: a
+    /// scheduler without `config_file` / `config_file_def` and a
+    /// test entry without `config_content` must not contribute any
+    /// additions and the export pipeline must not touch any
+    /// `--config` arg.
+    #[test]
+    fn compute_config_export_additions_returns_empty_when_no_config() {
+        let entry = KtstrTestEntry {
+            name: "no_config_smoke",
+            ..KtstrTestEntry::DEFAULT
+        };
+        let additions =
+            compute_config_export_additions(&entry).expect("compute additions must not error");
+        assert!(
+            additions.is_empty(),
+            "no config slots set must yield zero additions; got {} addition(s)",
+            additions.len()
+        );
+    }
+
+    /// `config_file_addition` mirrors the in-VM behavior at
+    /// [`crate::test_support::runtime::config_file_parts`] +
+    /// the surrounding push in `eval.rs`: a scheduler with
+    /// `config_file = Some(<host_path>)` causes a hardcoded
+    /// `--config` arg to be emitted. The export-side path uses
+    /// `"$DIR/include/<basename>"` so the .run extractor resolves
+    /// the path at script-run time on the target host. Pins the
+    /// in-VM-vs-export argv parity so a config-driven scheduler's
+    /// exported reproducer launches with the same flag as a normal
+    /// test run.
+    #[test]
+    fn config_file_addition_emits_hardcoded_config_arg_with_dir_expansion() {
+        use crate::test_support::{Scheduler, SchedulerSpec};
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let host_cfg = tmp.path().join("scheduler-config.json");
+        std::fs::write(&host_cfg, b"{\"layer_count\": 3}\n").expect("write fixture cfg");
+        let host_cfg_str: &'static str =
+            Box::leak(host_cfg.to_string_lossy().into_owned().into_boxed_str());
+        let sched: &'static Scheduler = Box::leak(Box::new(Scheduler {
+            name: "config_file_export_test",
+            binary: SchedulerSpec::Discover("config_file_export_test_bin"),
+            sysctls: &[],
+            kargs: &[],
+            assert: crate::assert::Assert::NO_OVERRIDES,
+            cgroup_parent: None,
+            sched_args: &[],
+            topology: crate::vmm::topology::Topology {
+                llcs: 1,
+                cores_per_llc: 1,
+                threads_per_core: 1,
+                numa_nodes: 1,
+                nodes: None,
+                distances: None,
+            },
+            constraints: TopologyConstraints::DEFAULT,
+            config_file: Some(host_cfg_str),
+            config_file_def: None,
+            kernels: &[],
+        }));
+        let entry = KtstrTestEntry {
+            name: "config_file_export_smoke",
+            scheduler: sched,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let addition = config_file_addition(&entry)
+            .expect("config_file_addition must not error")
+            .expect("config_file set must yield Some");
+        assert_eq!(
+            addition.host_path, host_cfg,
+            "host_path must be the configured scheduler.config_file path verbatim"
+        );
+        assert_eq!(
+            addition.args_shell_prefix, "--config \"$DIR/include/scheduler-config.json\"",
+            "args_shell_prefix must use the hardcoded --config flag with \
+             `$DIR/include/<basename>` path expansion and NO leading space \
+             (the caller manages spacing); got: {:?}",
+            addition.args_shell_prefix
+        );
+    }
+
+    /// `config_content_addition` mirrors the in-VM behavior at
+    /// [`crate::test_support::runtime::config_content_parts`]: an
+    /// entry's `config_content = Some(<bytes>)` paired with a
+    /// scheduler's `config_file_def = Some((arg_template,
+    /// guest_path))` causes the content to be written to a temp
+    /// file on the host AND the scheduler arg template to be
+    /// substituted with the `"$DIR/include/<basename>"` runtime
+    /// path. The basename derives from the scheduler's declared
+    /// guest_path so a scheduler family with a stable naming
+    /// convention sees the same basename in the .run archive and
+    /// in the live /include-files mount.
+    #[test]
+    fn config_content_addition_writes_temp_file_and_substitutes_template() {
+        use crate::test_support::{Scheduler, SchedulerSpec};
+        static SCHED_CONFIG_CONTENT: Scheduler = Scheduler {
+            name: "config_content_export_test",
+            binary: SchedulerSpec::Discover("config_content_export_test_bin"),
+            sysctls: &[],
+            kargs: &[],
+            assert: crate::assert::Assert::NO_OVERRIDES,
+            cgroup_parent: None,
+            sched_args: &[],
+            topology: crate::vmm::topology::Topology {
+                llcs: 1,
+                cores_per_llc: 1,
+                threads_per_core: 1,
+                numa_nodes: 1,
+                nodes: None,
+                distances: None,
+            },
+            constraints: TopologyConstraints::DEFAULT,
+            config_file: None,
+            config_file_def: Some(("--layered-config {file}", "/include-files/layers.json")),
+            kernels: &[],
+        };
+        const CONTENT: &str = "{\"layers\": [\"foo\", \"bar\"]}\n";
+        let entry = KtstrTestEntry {
+            name: "config_content_export_smoke",
+            scheduler: &SCHED_CONFIG_CONTENT,
+            config_content: Some(CONTENT),
+            ..KtstrTestEntry::DEFAULT
+        };
+        let addition = config_content_addition(&entry)
+            .expect("config_content_addition must not error")
+            .expect("config_content + config_file_def set must yield Some");
+        let written =
+            std::fs::read_to_string(&addition.host_path).expect("temp file must exist on disk");
+        assert_eq!(
+            written,
+            CONTENT,
+            "temp file at {} must contain the inline config_content bytes verbatim",
+            addition.host_path.display()
+        );
+        assert_eq!(
+            addition.args_shell_prefix, "--layered-config \"$DIR/include/layers.json\"",
+            "args_shell_prefix must substitute `{{file}}` with `\"$DIR/include/<basename>\"` \
+             where basename is derived from the scheduler's config_file_def guest_path, \
+             with NO leading space (the caller manages spacing); got: {:?}",
+            addition.args_shell_prefix
+        );
+    }
+
+    /// End-to-end: `generate_preamble` consumes the config
+    /// additions and prepends every `args_shell_prefix` ahead of
+    /// the base sched-args. The .run script must contain the
+    /// config flag so the scheduler launches with the expected
+    /// argv when the operator runs the exported reproducer. Pins
+    /// the wiring between [`compute_config_export_additions`] and
+    /// [`generate_preamble`].
+    #[test]
+    fn generate_preamble_prepends_config_addition_prefix() {
+        use crate::test_support::{Scheduler, SchedulerSpec};
+        static SCHED: Scheduler = Scheduler {
+            name: "preamble_config_smoke",
+            binary: SchedulerSpec::Discover("preamble_config_smoke_bin"),
+            sysctls: &[],
+            kargs: &[],
+            assert: crate::assert::Assert::NO_OVERRIDES,
+            cgroup_parent: None,
+            sched_args: &[],
+            topology: crate::vmm::topology::Topology {
+                llcs: 1,
+                cores_per_llc: 1,
+                threads_per_core: 1,
+                numa_nodes: 1,
+                nodes: None,
+                distances: None,
+            },
+            constraints: TopologyConstraints::DEFAULT,
+            config_file: None,
+            config_file_def: None,
+            kernels: &[],
+        };
+        let entry = KtstrTestEntry {
+            name: "preamble_config_smoke",
+            scheduler: &SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let additions = vec![ConfigExportAddition {
+            host_path: PathBuf::from("/tmp/ktstr-export-config-test.json"),
+            args_shell_prefix: "--config \"$DIR/include/test.json\"".to_string(),
+        }];
+        let preamble = generate_preamble(&entry, true, &additions);
+        assert!(
+            preamble.contains("--config \"$DIR/include/test.json\""),
+            "preamble must contain the verbatim args_shell_prefix from the \
+             config addition; got: {preamble}"
+        );
+    }
+
+    /// Order parity with the in-VM path at eval.rs:1112-1125:
+    /// `--config <path>` (and any `config_file_def`-templated arg)
+    /// is pushed FIRST, then `append_base_sched_args` (which
+    /// includes `--cell-parent-cgroup` auto-inject) is appended
+    /// LAST. The export must match this ordering so clap parsers
+    /// with order-sensitive semantics behave identically across
+    /// both paths. Scheduler with `cgroup_parent =
+    /// Some("/order_pin_parent")` exercises the auto-inject so
+    /// the test has a concrete base-args anchor to compare
+    /// against. Regression here means a future change reverted to
+    /// suffix-position config additions and broke argv ordering
+    /// parity (adversary F1 from #73).
+    #[test]
+    fn generate_preamble_emits_config_addition_before_base_sched_args() {
+        use crate::test_support::{CgroupPath, Scheduler, SchedulerSpec};
+        static SCHED: Scheduler = Scheduler {
+            name: "order_pin_test",
+            binary: SchedulerSpec::Discover("order_pin_test_bin"),
+            sysctls: &[],
+            kargs: &[],
+            assert: crate::assert::Assert::NO_OVERRIDES,
+            cgroup_parent: Some(CgroupPath::new("/order_pin_parent")),
+            sched_args: &[],
+            topology: crate::vmm::topology::Topology {
+                llcs: 1,
+                cores_per_llc: 1,
+                threads_per_core: 1,
+                numa_nodes: 1,
+                nodes: None,
+                distances: None,
+            },
+            constraints: TopologyConstraints::DEFAULT,
+            config_file: None,
+            config_file_def: None,
+            kernels: &[],
+        };
+        let entry = KtstrTestEntry {
+            name: "order_pin_test",
+            scheduler: &SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let additions = vec![ConfigExportAddition {
+            host_path: PathBuf::from("/tmp/order-pin-test.json"),
+            args_shell_prefix: "--config \"$DIR/include/order-pin-test.json\"".to_string(),
+        }];
+        let preamble = generate_preamble(&entry, true, &additions);
+        let config_pos = preamble
+            .find("--config \"$DIR/include/order-pin-test.json\"")
+            .expect("preamble must contain the --config arg from the addition");
+        let cgroup_pos = preamble
+            .find("--cell-parent-cgroup")
+            .expect("preamble must contain --cell-parent-cgroup from cgroup_parent auto-inject");
+        assert!(
+            config_pos < cgroup_pos,
+            "argv ordering parity with eval.rs:1112-1125: `--config` must \
+             appear BEFORE `--cell-parent-cgroup`. \
+             config_pos={config_pos}, cgroup_pos={cgroup_pos}, preamble:\n{preamble}"
+        );
+    }
+
+    /// Pin the intentional dual-fire when BOTH
+    /// `scheduler.config_file` AND `entry.config_content` (paired
+    /// with `scheduler.config_file_def`) are set. The two slots
+    /// are orthogonal — a scheduler that declares both legitimately
+    /// gets BOTH `--config` and the templated arg in its argv,
+    /// matching the in-VM eval.rs behavior at L1112-1125 which
+    /// pushes each slot independently. A regression that introduced
+    /// a mutual-exclusion check (or coalesced the two slots) would
+    /// silently drop one source.
+    #[test]
+    fn compute_config_export_additions_dual_fire_when_file_and_content_set() {
+        use crate::test_support::{Scheduler, SchedulerSpec};
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let host_cfg = tmp.path().join("static-cfg.json");
+        std::fs::write(&host_cfg, b"{\"static\": true}\n").expect("write fixture cfg");
+        let host_cfg_str: &'static str =
+            Box::leak(host_cfg.to_string_lossy().into_owned().into_boxed_str());
+        let sched: &'static Scheduler = Box::leak(Box::new(Scheduler {
+            name: "dual_fire_test",
+            binary: SchedulerSpec::Discover("dual_fire_test_bin"),
+            sysctls: &[],
+            kargs: &[],
+            assert: crate::assert::Assert::NO_OVERRIDES,
+            cgroup_parent: None,
+            sched_args: &[],
+            topology: crate::vmm::topology::Topology {
+                llcs: 1,
+                cores_per_llc: 1,
+                threads_per_core: 1,
+                numa_nodes: 1,
+                nodes: None,
+                distances: None,
+            },
+            constraints: TopologyConstraints::DEFAULT,
+            config_file: Some(host_cfg_str),
+            config_file_def: Some(("--layered-config {file}", "/include-files/layers.json")),
+            kernels: &[],
+        }));
+        let entry = KtstrTestEntry {
+            name: "dual_fire_smoke",
+            scheduler: sched,
+            config_content: Some("{\"layers\": []}\n"),
+            ..KtstrTestEntry::DEFAULT
+        };
+        let additions =
+            compute_config_export_additions(&entry).expect("compute additions must not error");
+        assert_eq!(
+            additions.len(),
+            2,
+            "both config_file and config_content slots set must yield 2 additions \
+             (orthogonal — each contributes its own scheduler arg), got {} addition(s)",
+            additions.len()
+        );
+        // Order is documented as file-first, content-second by the
+        // helper at compute_config_export_additions (push order).
+        assert_eq!(
+            additions[0].args_shell_prefix, "--config \"$DIR/include/static-cfg.json\"",
+            "first addition must be the config_file source"
+        );
+        assert_eq!(
+            additions[1].args_shell_prefix, "--layered-config \"$DIR/include/layers.json\"",
+            "second addition must be the config_content source"
+        );
+    }
+
+    /// `config_file_addition` mirrors `resolve_include_files`'s
+    /// directory-reject: a `scheduler.config_file` pointing at a
+    /// directory must fail with an actionable error at export
+    /// resolution time, not late during `build_archive`'s
+    /// `std::fs::read` (which would surface a less-actionable
+    /// EISDIR). Recursive directory packaging is a v2 enhancement;
+    /// the user-facing error names the constraint explicitly.
+    #[test]
+    fn config_file_addition_rejects_directory_with_actionable_error() {
+        use crate::test_support::{Scheduler, SchedulerSpec};
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let dir_path = tmp.path().join("config-as-dir");
+        std::fs::create_dir(&dir_path).expect("create directory fixture");
+        let dir_path_str: &'static str =
+            Box::leak(dir_path.to_string_lossy().into_owned().into_boxed_str());
+        let sched: &'static Scheduler = Box::leak(Box::new(Scheduler {
+            name: "directory_reject_test",
+            binary: SchedulerSpec::Discover("directory_reject_test_bin"),
+            sysctls: &[],
+            kargs: &[],
+            assert: crate::assert::Assert::NO_OVERRIDES,
+            cgroup_parent: None,
+            sched_args: &[],
+            topology: crate::vmm::topology::Topology {
+                llcs: 1,
+                cores_per_llc: 1,
+                threads_per_core: 1,
+                numa_nodes: 1,
+                nodes: None,
+                distances: None,
+            },
+            constraints: TopologyConstraints::DEFAULT,
+            config_file: Some(dir_path_str),
+            config_file_def: None,
+            kernels: &[],
+        }));
+        let entry = KtstrTestEntry {
+            name: "directory_reject_smoke",
+            scheduler: sched,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = config_file_addition(&entry)
+            .expect_err("config_file pointing at a directory must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("is a directory"),
+            "error must name the directory failure mode; got: {msg}"
+        );
+        assert!(
+            msg.contains("config_file must point at a regular file"),
+            "error must name the v1 constraint actionably; got: {msg}"
+        );
+    }
+
+    /// `config_file_addition` rejects basenames that contain shell
+    /// metacharacters which would break the
+    /// `"$DIR/include/<basename>"` double-quote interpolation in
+    /// the .run script (`"`, `\`, `$`, `` ` ``). Defense-in-depth
+    /// — test-author input is trusted (static string slots), but a
+    /// regression that landed a scheduler with a metacharacter-laden
+    /// basename would silently produce a broken preamble.
+    #[test]
+    fn config_file_addition_rejects_basename_with_shell_metacharacters() {
+        use crate::test_support::{Scheduler, SchedulerSpec};
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        // Use `$` which is both a shell metacharacter AND a valid
+        // POSIX filename character on most filesystems; if the host
+        // FS rejects the filename outright, the test is documented
+        // as host-dependent below.
+        let evil_path = tmp.path().join("$evil.json");
+        if std::fs::write(&evil_path, b"{}\n").is_err() {
+            crate::report::test_skip("filesystem rejected fixture with $ in basename");
+            return;
+        }
+        let evil_path_str: &'static str =
+            Box::leak(evil_path.to_string_lossy().into_owned().into_boxed_str());
+        let sched: &'static Scheduler = Box::leak(Box::new(Scheduler {
+            name: "metachar_reject_test",
+            binary: SchedulerSpec::Discover("metachar_reject_test_bin"),
+            sysctls: &[],
+            kargs: &[],
+            assert: crate::assert::Assert::NO_OVERRIDES,
+            cgroup_parent: None,
+            sched_args: &[],
+            topology: crate::vmm::topology::Topology {
+                llcs: 1,
+                cores_per_llc: 1,
+                threads_per_core: 1,
+                numa_nodes: 1,
+                nodes: None,
+                distances: None,
+            },
+            constraints: TopologyConstraints::DEFAULT,
+            config_file: Some(evil_path_str),
+            config_file_def: None,
+            kernels: &[],
+        }));
+        let entry = KtstrTestEntry {
+            name: "metachar_reject_smoke",
+            scheduler: sched,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err =
+            config_file_addition(&entry).expect_err("basename with shell metacharacter must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("shell-metacharacter"),
+            "error must name the shell-metacharacter constraint; got: {msg}"
+        );
+        assert!(
+            msg.contains('$') || msg.contains("\"$\""),
+            "error must name the offending character; got: {msg}"
+        );
+    }
+
+    /// Archive-layout-vs-args-prefix basename parity: the basename
+    /// embedded in `args_shell_prefix` MUST match the basename
+    /// `build_archive` flattens to `include/<basename>`. A
+    /// regression that derived basename differently between the
+    /// two sites would extract the file to one path but launch
+    /// the scheduler pointing at another. Roundtrips a config-bearing
+    /// entry through `compute_config_export_additions` +
+    /// `build_archive` + `read_archive_entries` to verify the two
+    /// sides agree.
+    #[test]
+    fn archive_basename_matches_args_shell_prefix_for_config_file() {
+        use crate::test_support::{Scheduler, SchedulerSpec};
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let ktstr_path = tmp.path().join("fake-ktstr");
+        std::fs::write(&ktstr_path, b"FAKE_KTSTR").expect("write ktstr stub");
+        let host_cfg = tmp.path().join("parity-config.json");
+        std::fs::write(&host_cfg, b"{\"parity\": true}\n").expect("write fixture cfg");
+        let host_cfg_str: &'static str =
+            Box::leak(host_cfg.to_string_lossy().into_owned().into_boxed_str());
+        let sched: &'static Scheduler = Box::leak(Box::new(Scheduler {
+            name: "basename_parity_test",
+            binary: SchedulerSpec::Discover("basename_parity_test_bin"),
+            sysctls: &[],
+            kargs: &[],
+            assert: crate::assert::Assert::NO_OVERRIDES,
+            cgroup_parent: None,
+            sched_args: &[],
+            topology: crate::vmm::topology::Topology {
+                llcs: 1,
+                cores_per_llc: 1,
+                threads_per_core: 1,
+                numa_nodes: 1,
+                nodes: None,
+                distances: None,
+            },
+            constraints: TopologyConstraints::DEFAULT,
+            config_file: Some(host_cfg_str),
+            config_file_def: None,
+            kernels: &[],
+        }));
+        let entry = KtstrTestEntry {
+            name: "basename_parity_smoke",
+            scheduler: sched,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let additions =
+            compute_config_export_additions(&entry).expect("compute additions must not error");
+        assert_eq!(additions.len(), 1, "expected exactly 1 addition");
+        let archive = build_archive(&ktstr_path, None, &[additions[0].host_path.clone()])
+            .expect("build archive");
+        let entries = read_archive_entries(&archive);
+        let archive_names: Vec<&str> = entries.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert!(
+            archive_names.contains(&"include/parity-config.json"),
+            "archive must contain include/parity-config.json (basename derived from \
+             host_path.file_name()); got: {archive_names:?}"
+        );
+        assert!(
+            additions[0]
+                .args_shell_prefix
+                .contains("\"$DIR/include/parity-config.json\""),
+            "args_shell_prefix must reference the same basename build_archive flattens to; \
+             got: {:?}",
+            additions[0].args_shell_prefix
         );
     }
 
@@ -1480,7 +2187,7 @@ mod tests {
         };
         let archive =
             build_archive(&ktstr_path, None, std::slice::from_ref(&inc)).expect("build archive");
-        let preamble = generate_preamble(&entry, false);
+        let preamble = generate_preamble(&entry, false, &[]);
         write_runfile(&out, &preamble, &archive).expect("write runfile");
 
         // Preamble half: split at marker, run bash -n on the

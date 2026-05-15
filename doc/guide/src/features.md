@@ -67,8 +67,12 @@ dependencies — no manual `.so` lists or `LD_LIBRARY_PATH` hacks.
 `.run` script that reproduces the scenario on bare metal without
 a VM. The runfile validates host topology and sched_ext support,
 then dispatches the test directly under whatever scheduler is
-already active. Used for testing under production schedulers and
-real topology.
+already active. Config files declared via `Scheduler::config_file`
+or `config_content` (paired with `config_file_def`) are packed into
+the archive and the scheduler launch line includes the matching
+`--config`/`{file}` arg, so a layered/lavd-class test reproduces
+with the same scheduler config the live test used. Used for testing
+under production schedulers and real topology.
 
 </details>
 
