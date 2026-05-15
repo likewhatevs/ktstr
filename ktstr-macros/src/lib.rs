@@ -1171,6 +1171,15 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     //                                 conflict is intentional)
     //   - matcher + expect_err=false: BOTH (runtime check fires on
     //                                 omitted-default expect_err too)
+    // Ordering note: the three host_only mutex checks below (the
+    // fourth check on matcher + !expect_err is a separate conflict
+    // class on different attributes, included in the same block for
+    // proximity) are ordered by likely-user-confusion descending.
+    // scheduler-first because a declared-but-never-attached
+    // scheduler is the most disorienting silent no-op. The trybuild
+    // fixture `ktstr_test_multi_mutex_first_wins` pins this
+    // precedence so a refactor that reorders the blocks doesn't
+    // silently change which diagnostic the operator sees first.
     if host_only_set && host_only && scheduler.is_some() {
         return syn::Error::new(
             proc_macro2::Span::call_site(),
