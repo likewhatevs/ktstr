@@ -268,9 +268,7 @@ pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<Stri
             .chain(entry.extra_sched_args.iter())
             .copied(),
     ) {
-        super::args::CellParentCgroupArg::Value(path)
-            if !path.starts_with('/') || path == "/" =>
-        {
+        super::args::CellParentCgroupArg::Value(path) if !path.starts_with('/') || path == "/" => {
             let example = cgroup_parent_example(entry);
             let mut fixes = format!(
                 "supply an absolute path under `/` (e.g. `{example}`) for the \
@@ -369,7 +367,11 @@ pub(crate) const fn sys_rdy_budget_ms(vcpus: u32) -> u64 {
     const PER_VCPU_MS: u64 = 150;
     let scaled = (vcpus as u64).saturating_mul(PER_VCPU_MS);
     let bounded = if scaled > CAP_MS { CAP_MS } else { scaled };
-    if bounded > FLOOR_MS { bounded } else { FLOOR_MS }
+    if bounded > FLOOR_MS {
+        bounded
+    } else {
+        FLOOR_MS
+    }
 }
 
 /// Headroom for kernel init, scheduler attach, and BPF verifier time
@@ -757,8 +759,7 @@ mod tests {
     /// doesn't reject the duplicate.
     #[test]
     fn append_base_sched_args_dedupes_extra_split_form() {
-        static SCHED: Scheduler = Scheduler::new("s")
-            .cgroup_parent("/sys/fs/cgroup/ktstr");
+        static SCHED: Scheduler = Scheduler::new("s").cgroup_parent("/sys/fs/cgroup/ktstr");
         let entry = KtstrTestEntry {
             name: "sched",
             scheduler: &SCHED,
@@ -779,8 +780,7 @@ mod tests {
     /// the auto-inject.
     #[test]
     fn append_base_sched_args_dedupes_extra_combined_form() {
-        static SCHED: Scheduler = Scheduler::new("s")
-            .cgroup_parent("/sys/fs/cgroup/ktstr");
+        static SCHED: Scheduler = Scheduler::new("s").cgroup_parent("/sys/fs/cgroup/ktstr");
         let entry = KtstrTestEntry {
             name: "sched",
             scheduler: &SCHED,
@@ -887,8 +887,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "that does not start with `/`")]
     fn append_base_sched_args_panics_on_empty_combined_value_via_extra() {
-        static SCHED: Scheduler = Scheduler::new("s")
-            .cgroup_parent("/sys/fs/cgroup/ktstr");
+        static SCHED: Scheduler = Scheduler::new("s").cgroup_parent("/sys/fs/cgroup/ktstr");
         let entry = KtstrTestEntry {
             name: "sched",
             scheduler: &SCHED,
@@ -907,8 +906,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "that does not start with `/`")]
     fn append_base_sched_args_panics_on_empty_two_token_value_via_extra() {
-        static SCHED: Scheduler = Scheduler::new("s")
-            .cgroup_parent("/sys/fs/cgroup/ktstr");
+        static SCHED: Scheduler = Scheduler::new("s").cgroup_parent("/sys/fs/cgroup/ktstr");
         let entry = KtstrTestEntry {
             name: "sched_two_token",
             scheduler: &SCHED,
@@ -996,8 +994,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "that does not start with `/`")]
     fn append_base_sched_args_panics_on_relative_path_value() {
-        static SCHED: Scheduler = Scheduler::new("s")
-            .cgroup_parent("/sys/fs/cgroup/ktstr");
+        static SCHED: Scheduler = Scheduler::new("s").cgroup_parent("/sys/fs/cgroup/ktstr");
         let entry = KtstrTestEntry {
             name: "relative_path",
             scheduler: &SCHED,
@@ -1016,8 +1013,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "that does not start with `/`")]
     fn append_base_sched_args_panics_on_relative_path_value_two_token() {
-        static SCHED: Scheduler = Scheduler::new("s")
-            .cgroup_parent("/sys/fs/cgroup/ktstr");
+        static SCHED: Scheduler = Scheduler::new("s").cgroup_parent("/sys/fs/cgroup/ktstr");
         let entry = KtstrTestEntry {
             name: "relative_path_two_token",
             scheduler: &SCHED,
@@ -1037,8 +1033,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "or is `/` alone")]
     fn append_base_sched_args_panics_on_bare_slash_value() {
-        static SCHED: Scheduler = Scheduler::new("s")
-            .cgroup_parent("/sys/fs/cgroup/ktstr");
+        static SCHED: Scheduler = Scheduler::new("s").cgroup_parent("/sys/fs/cgroup/ktstr");
         let entry = KtstrTestEntry {
             name: "bare_slash",
             scheduler: &SCHED,
@@ -1057,8 +1052,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "that does not start with `/`")]
     fn append_base_sched_args_panics_on_empty_combined_value_in_scheduler_sched_args_no_default() {
-        static SCHED: Scheduler = Scheduler::new("s")
-            .sched_args(&["--cell-parent-cgroup="]);
+        static SCHED: Scheduler = Scheduler::new("s").sched_args(&["--cell-parent-cgroup="]);
         let entry = KtstrTestEntry {
             name: "scheduler_def_origin_no_default",
             scheduler: &SCHED,
@@ -1074,8 +1068,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "that does not start with `/`")]
     fn append_base_sched_args_panics_on_empty_two_token_value_in_scheduler_sched_args_no_default() {
-        static SCHED: Scheduler = Scheduler::new("s")
-            .sched_args(&["--cell-parent-cgroup", ""]);
+        static SCHED: Scheduler = Scheduler::new("s").sched_args(&["--cell-parent-cgroup", ""]);
         let entry = KtstrTestEntry {
             name: "scheduler_def_origin_two_token_no_default",
             scheduler: &SCHED,
@@ -1097,8 +1090,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "supplies a bare `--cell-parent-cgroup`")]
     fn append_base_sched_args_panics_on_missing_value_via_extra() {
-        static SCHED: Scheduler = Scheduler::new("s")
-            .cgroup_parent("/sys/fs/cgroup/ktstr");
+        static SCHED: Scheduler = Scheduler::new("s").cgroup_parent("/sys/fs/cgroup/ktstr");
         let entry = KtstrTestEntry {
             name: "missing_value_extra",
             scheduler: &SCHED,
@@ -1116,8 +1108,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "supplies a bare `--cell-parent-cgroup`")]
     fn append_base_sched_args_panics_on_missing_value_after_other_flag() {
-        static SCHED: Scheduler = Scheduler::new("s")
-            .cgroup_parent("/sys/fs/cgroup/ktstr");
+        static SCHED: Scheduler = Scheduler::new("s").cgroup_parent("/sys/fs/cgroup/ktstr");
         let entry = KtstrTestEntry {
             name: "missing_value_after_other",
             scheduler: &SCHED,
@@ -1175,8 +1166,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "supplies a bare `--cell-parent-cgroup`")]
     fn append_base_sched_args_panics_on_missing_value_in_scheduler_sched_args_no_default() {
-        static SCHED: Scheduler = Scheduler::new("s")
-            .sched_args(&["--cell-parent-cgroup"]);
+        static SCHED: Scheduler = Scheduler::new("s").sched_args(&["--cell-parent-cgroup"]);
         let entry = KtstrTestEntry {
             name: "missing_value_scheduler_def_no_default",
             scheduler: &SCHED,

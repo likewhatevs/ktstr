@@ -400,10 +400,7 @@ mod tests {
         let b = Backdrop::new().with_payloads(inputs);
         assert_eq!(b.payloads.len(), expected.len());
         for (i, name) in expected.iter().enumerate() {
-            assert_eq!(
-                b.payloads[i].name, *name,
-                "index {i} should be {name}"
-            );
+            assert_eq!(b.payloads[i].name, *name, "index {i} should be {name}");
         }
     }
 

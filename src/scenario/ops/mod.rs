@@ -2231,7 +2231,8 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     .as_ref()
                     .map_or_else(|| ctx.topo.usable_cpuset().len(), |s| s.len());
                 let work = work.clone().resolve_workers_pct(cpuset_size, cgroup)?;
-                let n = crate::scenario::resolve_num_workers(&work, ctx.workers_per_cgroup, cgroup)?;
+                let n =
+                    crate::scenario::resolve_num_workers(&work, ctx.workers_per_cgroup, cgroup)?;
                 if let Some(ref resolved) = cgroup_cpuset {
                     validate_mempolicy_cpuset(
                         &work.mem_policy,
@@ -7054,11 +7055,7 @@ mod tests {
         )
         .expect("AddCgroupDef must succeed for a fresh name");
         assert!(
-            state
-                .cgroups
-                .names()
-                .iter()
-                .any(|n| n == "cg_midstep"),
+            state.cgroups.names().iter().any(|n| n == "cg_midstep"),
             "step-local tracking must record the AddCgroupDef name; got: {:?}",
             state.cgroups.names(),
         );
@@ -7171,9 +7168,9 @@ mod tests {
         )
         .expect("AddCgroupDef with cpuset must succeed against mock");
         let calls = mock.calls();
-        let has_set_cpuset = calls.iter().any(|c| {
-            matches!(c, CgroupCall::SetCpuset(name, _) if name == "cg_pinned")
-        });
+        let has_set_cpuset = calls
+            .iter()
+            .any(|c| matches!(c, CgroupCall::SetCpuset(name, _) if name == "cg_pinned"));
         assert!(
             has_set_cpuset,
             "AddCgroupDef must emit SetCpuset for 'cg_pinned' via apply_setup; got: {calls:?}",
@@ -9301,9 +9298,7 @@ mod tests {
         apply_setup_test(
             &ctx,
             &mut state,
-            std::slice::from_ref(
-                &CgroupDef::named("cg_narrow").with_cpuset(CpusetSpec::Llc(0)),
-            ),
+            std::slice::from_ref(&CgroupDef::named("cg_narrow").with_cpuset(CpusetSpec::Llc(0))),
         )
         .unwrap();
         // Now try to narrow it via Op::SetCpuset to an empty range.
@@ -9401,7 +9396,10 @@ mod tests {
         apply_ops_test(
             &ctx,
             &mut state,
-            &[Op::Spawn { cgroup: std::borrow::Cow::Borrowed("cg_spawn"), work }],
+            &[Op::Spawn {
+                cgroup: std::borrow::Cow::Borrowed("cg_spawn"),
+                work,
+            }],
         )
         .unwrap();
         let handle = &state
@@ -9442,7 +9440,10 @@ mod tests {
         let err = apply_ops_test(
             &ctx,
             &mut state,
-            &[Op::Spawn { cgroup: std::borrow::Cow::Borrowed("cg_x"), work }],
+            &[Op::Spawn {
+                cgroup: std::borrow::Cow::Borrowed("cg_x"),
+                work,
+            }],
         )
         .expect_err("Op::Spawn dual-set must reject");
         let msg = format!("{err}");

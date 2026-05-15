@@ -20,10 +20,7 @@ pub fn custom_cgroup_affinity_change(ctx: &Ctx) -> Result<AssertResult> {
     let backdrop = Backdrop::new()
         .with_cgroup(CgroupDef::named("cg_0"))
         .with_cgroup(CgroupDef::named("cg_1"));
-    let mut steps = vec![Step::new(
-        vec![],
-        ctx.settled_hold(0.2),
-    )];
+    let mut steps = vec![Step::new(vec![], ctx.settled_hold(0.2))];
 
     // Pool the random sample across every CPU in the topology;
     // `Op::SetAffinity` intersects with the cgroup's cpuset at apply

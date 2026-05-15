@@ -1344,8 +1344,7 @@ mod tests {
         };
         let preamble = generate_preamble(&entry, true);
         assert!(
-            preamble.contains("--cell-parent-cgroup")
-                && preamble.contains("/ktstr_export_test"),
+            preamble.contains("--cell-parent-cgroup") && preamble.contains("/ktstr_export_test"),
             "preamble must auto-inject --cell-parent-cgroup from \
              entry.scheduler.cgroup_parent; got: {preamble}"
         );

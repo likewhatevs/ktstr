@@ -521,10 +521,7 @@ fn phase_alu_hot_duration_serializes_as_humantime() {
         duration: Duration::from_millis(250),
     };
     let json = serde_json::to_string(&p).unwrap();
-    assert_eq!(
-        json,
-        r#"{"alu_hot":{"width":"scalar","duration":"250ms"}}"#
-    );
+    assert_eq!(json, r#"{"alu_hot":{"width":"scalar","duration":"250ms"}}"#);
     let back: Phase = serde_json::from_str(&json).unwrap();
     match back {
         Phase::AluHot { width, duration } => {

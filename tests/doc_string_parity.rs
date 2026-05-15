@@ -4,11 +4,9 @@
 //! out-of-date troubleshooting advice and hits a different error than
 //! the one the doc claims.
 
-const TROUBLESHOOTING_MD: &str =
-    include_str!("../doc/guide/src/troubleshooting.md");
+const TROUBLESHOOTING_MD: &str = include_str!("../doc/guide/src/troubleshooting.md");
 
-const RUST_INIT_RS: &str =
-    include_str!("../src/vmm/rust_init.rs");
+const RUST_INIT_RS: &str = include_str!("../src/vmm/rust_init.rs");
 
 /// The troubleshooting.md "send_sys_rdy timeout" section quotes the
 /// WARN emitted by src/vmm/rust_init.rs when the budget runs out. The
@@ -40,9 +38,7 @@ fn troubleshooting_send_sys_rdy_doc_matches_emit_fmt() {
     // Pin the two source-side halves separately, each as a substring
     // that appears verbatim in the raw source bytes.
     assert!(
-        RUST_INIT_RS.contains(
-            "ktstr-init: send_sys_rdy retry budget exhausted ({} ms, {} vCPUs);"
-        ),
+        RUST_INIT_RS.contains("ktstr-init: send_sys_rdy retry budget exhausted ({} ms, {} vCPUs);"),
         "src/vmm/rust_init.rs must still emit the WARN prefix \
          `ktstr-init: send_sys_rdy retry budget exhausted ({{}} ms, {{}} vCPUs);` \
          that troubleshooting.md quotes; if you rewrote the WARN, \

@@ -896,11 +896,14 @@ fn evaluate_scx_bpf_error_match_rejects_when_expect_err_unset() {
 /// captured corpus.
 #[test]
 fn evaluate_scx_bpf_error_match_contains_passes_on_substring_present() {
-    let a = Assert::NO_OVERRIDES.expect_scx_bpf_error_contains("apply_cell_config returned -EINVAL");
-    let corpus =
-        "scx_mitosis: apply_cell_config returned -EINVAL at line:42; cell_id=3\n";
+    let a =
+        Assert::NO_OVERRIDES.expect_scx_bpf_error_contains("apply_cell_config returned -EINVAL");
+    let corpus = "scx_mitosis: apply_cell_config returned -EINVAL at line:42; cell_id=3\n";
     let details = a.evaluate_scx_bpf_error_match(corpus, true);
-    assert!(details.is_empty(), "matcher must pass on substring match: {details:?}");
+    assert!(
+        details.is_empty(),
+        "matcher must pass on substring match: {details:?}"
+    );
 }
 
 /// Literal-substring matcher fails when the literal is absent, with
@@ -908,7 +911,8 @@ fn evaluate_scx_bpf_error_match_contains_passes_on_substring_present() {
 /// so the operator can compare at a glance.
 #[test]
 fn evaluate_scx_bpf_error_match_contains_fails_on_absent_substring() {
-    let a = Assert::NO_OVERRIDES.expect_scx_bpf_error_contains("apply_cell_config returned -EINVAL");
+    let a =
+        Assert::NO_OVERRIDES.expect_scx_bpf_error_contains("apply_cell_config returned -EINVAL");
     let corpus = "scx_mitosis: a DIFFERENT bug fired: stuck task X for 5000ms\n";
     let details = a.evaluate_scx_bpf_error_match(corpus, true);
     assert_eq!(details.len(), 1);
@@ -1000,8 +1004,8 @@ fn evaluate_scx_bpf_error_match_finds_pattern_in_later_event() {
                   sched_ext: BPF scheduler \"scx_mitosis\" disabled (Error)\n";
 
     // Literal-substring matcher walks the whole corpus.
-    let a_lit = Assert::NO_OVERRIDES
-        .expect_scx_bpf_error_contains("apply_cell_config returned -EINVAL");
+    let a_lit =
+        Assert::NO_OVERRIDES.expect_scx_bpf_error_contains("apply_cell_config returned -EINVAL");
     let lit_details = a_lit.evaluate_scx_bpf_error_match(corpus, true);
     assert!(
         lit_details.is_empty(),
@@ -1010,8 +1014,7 @@ fn evaluate_scx_bpf_error_match_finds_pattern_in_later_event() {
     );
 
     // Regex matcher walks the whole corpus.
-    let a_re = Assert::NO_OVERRIDES
-        .expect_scx_bpf_error_matches(r"apply_cell_config.*-E[A-Z]+");
+    let a_re = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r"apply_cell_config.*-E[A-Z]+");
     let re_details = a_re.evaluate_scx_bpf_error_match(corpus, true);
     assert!(
         re_details.is_empty(),
@@ -1201,8 +1204,8 @@ fn evaluate_scx_bpf_error_match_contains_no_trim_on_literal() {
          instance lacks the leading spaces; got {no_match:?}",
     );
     // Same matcher against corpus that DOES have the two-space prefix → empty.
-    let matches = leading
-        .evaluate_scx_bpf_error_match("prefix\n  leading spaces appear here", true);
+    let matches =
+        leading.evaluate_scx_bpf_error_match("prefix\n  leading spaces appear here", true);
     assert!(
         matches.is_empty(),
         "literal with leading spaces must match when corpus has them byte-for-byte; got {matches:?}",

@@ -2358,9 +2358,7 @@ impl CpusetSpec {
                     // malformed programmatic spec), returning an empty
                     // set is safer than the div-by-zero panic.
                     if !quiet {
-                        tracing::warn!(
-                            "CpusetSpec::Disjoint with of=0 — returning empty cpuset"
-                        );
+                        tracing::warn!("CpusetSpec::Disjoint with of=0 — returning empty cpuset");
                     }
                     return BTreeSet::new();
                 }
@@ -2378,9 +2376,7 @@ impl CpusetSpec {
             CpusetSpec::Overlap { index, of, frac } => {
                 if *of == 0 {
                     if !quiet {
-                        tracing::warn!(
-                            "CpusetSpec::Overlap with of=0 — returning empty cpuset"
-                        );
+                        tracing::warn!("CpusetSpec::Overlap with of=0 — returning empty cpuset");
                     }
                     return BTreeSet::new();
                 }

@@ -1948,14 +1948,8 @@ fn create_cgroup_parent_from_sched_args() {
     // was bypassed (operator hand-edited an exported `.run` script,
     // ad-hoc argv injection); log to COM2 and skip the cgroup-tree
     // setup rather than mkdir on the host cgroup root.
-    let path = match crate::test_support::parse_cell_parent_cgroup(
-        sched_args.split_whitespace(),
-    ) {
-        crate::test_support::CellParentCgroupArg::Value(p)
-            if p.starts_with('/') && p != "/" =>
-        {
-            p
-        }
+    let path = match crate::test_support::parse_cell_parent_cgroup(sched_args.split_whitespace()) {
+        crate::test_support::CellParentCgroupArg::Value(p) if p.starts_with('/') && p != "/" => p,
         crate::test_support::CellParentCgroupArg::Value(bad) => {
             write_com2(&format!(
                 "ktstr-init: ignoring malformed `--cell-parent-cgroup` value \

@@ -1328,10 +1328,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Emit `&'static [&'static Payload]` for workloads. Each path
     // the user supplied is a `const Payload`; we take `&` on each
     // to match the stored type.
-    let workload_refs: Vec<proc_macro2::TokenStream> = workloads_slice
-        .iter()
-        .map(|p| quote! { &#p })
-        .collect();
+    let workload_refs: Vec<proc_macro2::TokenStream> =
+        workloads_slice.iter().map(|p| quote! { &#p }).collect();
     let workloads_tokens = quote! { &[#(#workload_refs),*] };
 
     // Conditionally-emitted KtstrTestEntry fields. Each block is

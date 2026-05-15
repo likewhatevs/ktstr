@@ -229,7 +229,10 @@ fn auto_repro_false_compile(_ctx: &Ctx) -> Result<AssertResult> {
 #[test]
 fn entry_bare_auto_repro() {
     let e = ktstr::test_support::find_test("bare_auto_repro_compile").unwrap();
-    assert!(e.auto_repro, "bare `auto_repro` must set entry.auto_repro=true");
+    assert!(
+        e.auto_repro,
+        "bare `auto_repro` must set entry.auto_repro=true"
+    );
 }
 
 #[test]

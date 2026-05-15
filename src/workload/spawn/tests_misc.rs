@@ -425,8 +425,7 @@ fn pathology_phase_alu_hot_scalar_in_sequence_iterates() {
         },
         ..Default::default()
     };
-    let mut h =
-        WorkloadHandle::spawn(&cfg).expect("Phase::AluHot Scalar in Sequence must spawn");
+    let mut h = WorkloadHandle::spawn(&cfg).expect("Phase::AluHot Scalar in Sequence must spawn");
     h.start();
     std::thread::sleep(Duration::from_millis(100));
     let reports = h.stop_and_collect();

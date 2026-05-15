@@ -1002,11 +1002,7 @@ pub(super) fn worker_main(
                             let end = Instant::now() + *duration;
                             while Instant::now() < end && !stop_requested(stop) {
                                 let iter_start = Instant::now();
-                                alu_hot_chain(
-                                    resolved,
-                                    ALU_HOT_CHAIN_STEPS,
-                                    &mut work_units,
-                                );
+                                alu_hot_chain(resolved, ALU_HOT_CHAIN_STEPS, &mut work_units);
                                 reservoir_push(
                                     &mut iteration_costs_ns,
                                     &mut iteration_cost_sample_count,

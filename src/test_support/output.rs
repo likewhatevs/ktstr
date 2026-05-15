@@ -386,9 +386,7 @@ pub(crate) fn classify_init_stage(
 /// consumes this helper for its own `PayloadStarting` test, keeping
 /// the two functions on a single source of truth for "did the
 /// workload start?"
-pub(crate) fn primary_reached_workload(
-    drain: Option<&vmm::host_comms::BulkDrainResult>,
-) -> bool {
+pub(crate) fn primary_reached_workload(drain: Option<&vmm::host_comms::BulkDrainResult>) -> bool {
     use crate::vmm::wire::{LifecyclePhase, MSG_TYPE_LIFECYCLE};
     let Some(drain) = drain else {
         return false;
@@ -919,8 +917,8 @@ mod tests {
     fn extract_bug_summary_strips_ansi_from_dump_anchor() {
         let dump = "  ktstr-1234   [001]   0.500: sched_ext_dump: \x1b[1mscheduler[5678] triggered exit kind 5:\x1b[0m\n  \
                       ktstr-1234   [001]   0.501: sched_ext_dump:   \x1b[31mapply_cell_config returned -EINVAL\x1b[0m (apply_cell_config)\n";
-        let summary = extract_bug_summary("", dump)
-            .expect("ANSI-wrapped dump anchor must still match");
+        let summary =
+            extract_bug_summary("", dump).expect("ANSI-wrapped dump anchor must still match");
         assert!(
             !summary.contains('\x1b'),
             "ANSI escapes must be stripped from the dump-path returned summary: {summary:?}",

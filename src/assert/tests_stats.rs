@@ -50,7 +50,10 @@ fn assert_format_human_field_order_is_stable() {
         ("min_page_locality", "max_cross_node_migration_ratio"),
         ("max_cross_node_migration_ratio", "max_slow_tier_ratio"),
         ("max_slow_tier_ratio", "expect_scx_bpf_error_contains"),
-        ("expect_scx_bpf_error_contains", "expect_scx_bpf_error_matches"),
+        (
+            "expect_scx_bpf_error_contains",
+            "expect_scx_bpf_error_matches",
+        ),
     ];
     for (earlier, later) in pairs {
         let ei = out

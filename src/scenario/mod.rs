@@ -418,10 +418,7 @@ impl Ctx<'_> {
     /// Step::new(vec![], ctx.settled_hold(0.5));  // settle + half duration
     /// Step::new(vec![], ctx.settled_hold(1.0));  // settle + full duration
     /// ```
-    pub fn settled_hold(
-        &self,
-        fraction_of_duration: f64,
-    ) -> crate::scenario::ops::HoldSpec {
+    pub fn settled_hold(&self, fraction_of_duration: f64) -> crate::scenario::ops::HoldSpec {
         crate::scenario::ops::HoldSpec::fixed(
             self.settle + self.duration.mul_f64(fraction_of_duration),
         )
@@ -1969,7 +1966,7 @@ mod tests {
             panic!("expected Fixed variant, got {hold:?}");
         };
         let expected = Duration::from_millis(1100);
-        let diff = if d > expected { d - expected } else { expected - d };
+        let diff = d.abs_diff(expected);
         assert!(
             diff <= Duration::from_nanos(1),
             "settled_hold(1.0/3.0) drift > 1ns: {d:?} vs {expected:?}",
