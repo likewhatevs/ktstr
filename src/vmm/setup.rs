@@ -790,7 +790,7 @@ impl KtstrVm {
             uncompressed_mib = uncompressed_size >> 20,
             compressed_mib = compressed_size >> 20,
             init_size_mib = kernel_init_size >> 20,
-            memory_min_mib = self.memory_min_mb,
+            memory_min_mb = self.memory_min_mb,
             memory_mib,
             "deferred_memory_computed",
         );
@@ -1472,7 +1472,7 @@ impl KtstrVm {
             uncompressed_mib = uncompressed_size >> 20,
             compressed_mib = compressed_size >> 20,
             init_size_mib = kernel_init_size >> 20,
-            memory_min_mib = self.memory_min_mb,
+            memory_min_mb = self.memory_min_mb,
             memory_mib,
             "deferred_memory_computed",
         );

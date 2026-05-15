@@ -104,7 +104,7 @@ contain at least one LLC with a CPU in the given set.
 **`node_meminfo(node_id) -> Option<&NodeMemInfo>`** -- per-node
 memory info (total and free KiB). Returns `None` when the node ID
 is not present or meminfo is unavailable. `NodeMemInfo` has
-`total_kb`, `free_kb`, and `used_kb()` (saturating subtraction).
+`total_kib`, `free_kib`, and `used_kib()` (saturating subtraction).
 
 **`numa_distance(from, to) -> u8`** -- inter-node NUMA distance.
 Returns 255 when either node ID is not present (matches the kernel's
