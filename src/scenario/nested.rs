@@ -193,7 +193,7 @@ pub fn custom_nested_cgroup_imbalance(ctx: &Ctx) -> Result<AssertResult> {
                         Duration::from_millis(100),
                     )),
             ],
-            HoldSpec::fixed(ctx.settle + ctx.duration),
+            ctx.settled_hold(1.0),
         )
         .set_ops(vec![Op::add_cgroup("cg_0"), Op::add_cgroup("cg_1")]),
     ];
@@ -209,7 +209,7 @@ pub fn custom_nested_cgroup_no_ctrl(ctx: &Ctx) -> Result<AssertResult> {
                 CgroupDef::named("cg_0/sub_a/deep"),
                 CgroupDef::named("cg_1/sub_b"),
             ],
-            HoldSpec::fixed(ctx.settle + ctx.duration),
+            ctx.settled_hold(1.0),
         )
         .set_ops(vec![
             Op::add_cgroup("cg_0"),

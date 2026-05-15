@@ -393,6 +393,39 @@ impl Ctx<'_> {
     pub fn cpuset_cpus(&self, spec: &crate::scenario::ops::CpusetSpec) -> usize {
         spec.resolve(self).len()
     }
+
+    /// `HoldSpec::fixed(settle + duration * fraction_of_duration)` —
+    /// the dominant Step hold-time pattern across scenarios. A Step
+    /// typically holds for the settle window (so the scheduler can
+    /// reach steady state) plus some fraction of the workload
+    /// duration (often `1.0` for whole-test Steps, or `0.5`/`1.0/3.0`
+    /// for multi-Step scenarios that subdivide the duration budget).
+    ///
+    /// The multiplication routes through [`Duration::mul_f64`], so a
+    /// fraction like `1.0 / 3.0` may yield a Duration that differs
+    /// from an integer-division formulation by ≤1 nanosecond — below
+    /// Linux thread sleep granularity and so unobservable at the
+    /// hold-evaluation boundary, but worth noting if a test ever
+    /// byte-pins a Duration value.
+    ///
+    /// # Panics
+    /// When `fraction_of_duration` is NaN, infinite, or negative
+    /// (per the `Duration::mul_f64` contract).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// Step::new(vec![], ctx.settled_hold(0.5));  // settle + half duration
+    /// Step::new(vec![], ctx.settled_hold(1.0));  // settle + full duration
+    /// ```
+    pub fn settled_hold(
+        &self,
+        fraction_of_duration: f64,
+    ) -> crate::scenario::ops::HoldSpec {
+        crate::scenario::ops::HoldSpec::fixed(
+            self.settle + self.duration.mul_f64(fraction_of_duration),
+        )
+    }
 }
 
 /// Fluent builder for [`Ctx`].
@@ -1874,5 +1907,84 @@ mod tests {
             "RandomSubset with empty cpuset intersection must flatten \
              to Inherit, got {out:?}"
         );
+    }
+
+    #[test]
+    fn settled_hold_returns_settle_plus_fraction_of_duration() {
+        let cg = crate::cgroup::CgroupManager::new("/nonexistent");
+        let topo = crate::topology::TestTopology::synthetic(1, 1);
+        let ctx = Ctx::builder(&cg, &topo)
+            .settle(Duration::from_millis(200))
+            .duration(Duration::from_secs(1))
+            .build();
+        assert_eq!(
+            ctx.settled_hold(0.5),
+            crate::scenario::ops::HoldSpec::fixed(Duration::from_millis(700)),
+        );
+    }
+
+    #[test]
+    fn settled_hold_full_fraction_returns_settle_plus_full_duration() {
+        let cg = crate::cgroup::CgroupManager::new("/nonexistent");
+        let topo = crate::topology::TestTopology::synthetic(1, 1);
+        let ctx = Ctx::builder(&cg, &topo)
+            .settle(Duration::from_millis(100))
+            .duration(Duration::from_secs(2))
+            .build();
+        assert_eq!(
+            ctx.settled_hold(1.0),
+            crate::scenario::ops::HoldSpec::fixed(Duration::from_millis(2100)),
+        );
+    }
+
+    #[test]
+    fn settled_hold_zero_fraction_returns_settle_only() {
+        let cg = crate::cgroup::CgroupManager::new("/nonexistent");
+        let topo = crate::topology::TestTopology::synthetic(1, 1);
+        let ctx = Ctx::builder(&cg, &topo)
+            .settle(Duration::from_millis(500))
+            .duration(Duration::from_secs(1))
+            .build();
+        assert_eq!(
+            ctx.settled_hold(0.0),
+            crate::scenario::ops::HoldSpec::fixed(Duration::from_millis(500)),
+        );
+    }
+
+    #[test]
+    fn settled_hold_third_fraction_matches_integer_division() {
+        let cg = crate::cgroup::CgroupManager::new("/nonexistent");
+        let topo = crate::topology::TestTopology::synthetic(1, 1);
+        let ctx = Ctx::builder(&cg, &topo)
+            .settle(Duration::from_millis(100))
+            .duration(Duration::from_secs(3))
+            .build();
+        // 3s * (1/3) under mul_f64 may produce 2.999_999_999s due to
+        // f64 representation of 1/3. The hold-evaluation boundary
+        // tolerates the sub-nanosecond drift; the test pins that
+        // the result stays within 1 nanosecond of the integer-div
+        // formulation (3s / 3 = 1s exact, + 100ms settle = 1100ms).
+        let hold = ctx.settled_hold(1.0 / 3.0);
+        let crate::scenario::ops::HoldSpec::Fixed(d) = hold else {
+            panic!("expected Fixed variant, got {hold:?}");
+        };
+        let expected = Duration::from_millis(1100);
+        let diff = if d > expected { d - expected } else { expected - d };
+        assert!(
+            diff <= Duration::from_nanos(1),
+            "settled_hold(1.0/3.0) drift > 1ns: {d:?} vs {expected:?}",
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn settled_hold_panics_on_nan() {
+        let cg = crate::cgroup::CgroupManager::new("/nonexistent");
+        let topo = crate::topology::TestTopology::synthetic(1, 1);
+        let ctx = Ctx::builder(&cg, &topo)
+            .settle(Duration::from_millis(100))
+            .duration(Duration::from_secs(1))
+            .build();
+        let _ = ctx.settled_hold(f64::NAN);
     }
 }

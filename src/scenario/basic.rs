@@ -1,7 +1,7 @@
 //! Basic and mixed-workload scenario implementations.
 
 use super::Ctx;
-use super::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
+use super::ops::{CgroupDef, Op, Step, execute_steps};
 use crate::assert::AssertResult;
 use crate::workload::*;
 use anyhow::Result;
@@ -11,7 +11,7 @@ fn host_cgroup_contention_steps(ctx: &Ctx) -> Vec<Step> {
     vec![
         Step::with_defs(
             vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")],
-            HoldSpec::fixed(ctx.settle + ctx.duration),
+            ctx.settled_hold(1.0),
         )
         .set_ops(vec![Op::spawn_host(
             WorkSpec::default().workers(ctx.topo.total_cpus()),
@@ -50,7 +50,7 @@ fn sched_mixed_steps(ctx: &Ctx) -> Vec<Step> {
         }
     }
 
-    vec![Step::new(ops, HoldSpec::fixed(ctx.settle + ctx.duration))]
+    vec![Step::new(ops, ctx.settled_hold(1.0))]
 }
 
 /// Two cgroups each running Normal, Batch, Idle, and FIFO(1) workers
@@ -75,7 +75,7 @@ fn cgroup_pipe_io_steps(ctx: &Ctx) -> Vec<Step> {
         ));
     }
 
-    vec![Step::new(ops, HoldSpec::fixed(ctx.settle + ctx.duration))]
+    vec![Step::new(ops, ctx.settled_hold(1.0))]
 }
 
 /// Two cgroups each with paired PipeIo workers and SpinWait workers.

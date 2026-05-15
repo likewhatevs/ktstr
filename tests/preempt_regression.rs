@@ -2,7 +2,7 @@ use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
-use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
+use ktstr::scenario::ops::{CgroupDef, Step, execute_steps};
 use ktstr::workload::{WorkType, WorkerReport};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -237,7 +237,7 @@ fn preempt_regression_fault_under_load(ctx: &Ctx) -> Result<AssertResult> {
                 .workers(4)
                 .work_type(WorkType::SpinWait),
         ],
-        HoldSpec::fixed(ctx.settle + ctx.duration),
+        ctx.settled_hold(1.0),
     )];
 
     execute_steps(ctx, steps)

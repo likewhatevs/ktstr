@@ -28,7 +28,7 @@ pub fn custom_cgroup_add_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
         );
     let steps = vec![
         // Phase 1: settle with the two steady YieldHeavy cgroups.
-        Step::new(vec![], HoldSpec::fixed(ctx.settle + ctx.duration / 2)),
+        Step::new(vec![], ctx.settled_hold(0.5)),
         // Phase 2: add the heavy cg_2 mid-run.
         Step::with_defs(
             vec![CgroupDef::named("cg_2").workers(16)],
@@ -54,7 +54,7 @@ pub fn custom_cgroup_imbalance_mixed_workload(ctx: &Ctx) -> Result<AssertResult>
                 .workers(ctx.workers_per_cgroup)
                 .work_type(WorkType::IoSyncWrite),
         ],
-        HoldSpec::fixed(ctx.settle + ctx.duration),
+        ctx.settled_hold(1.0),
     )];
 
     execute_steps(ctx, steps)
@@ -80,7 +80,7 @@ pub fn custom_cgroup_load_oscillation(ctx: &Ctx) -> Result<AssertResult> {
 
     let mut steps = vec![Step::with_defs(
         vec![heavy_cg("cg_0"), light_cg("cg_1")],
-        HoldSpec::fixed(ctx.settle + ctx.duration / 4),
+        ctx.settled_hold(0.25),
     )];
 
     for i in 1..4 {
@@ -110,7 +110,7 @@ pub fn custom_cgroup_4way_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
             CgroupDef::named("cg_2").workers(8),
             CgroupDef::named("cg_3").workers(4),
         ],
-        HoldSpec::fixed(ctx.settle + ctx.duration),
+        ctx.settled_hold(1.0),
     )];
 
     execute_steps(ctx, steps)
@@ -133,7 +133,7 @@ pub fn custom_cgroup_cpuset_imbalance_combined(ctx: &Ctx) -> Result<AssertResult
                     Duration::from_millis(150),
                 )),
         ],
-        HoldSpec::fixed(ctx.settle + ctx.duration),
+        ctx.settled_hold(1.0),
     )];
 
     execute_steps(ctx, steps)
@@ -163,7 +163,7 @@ pub fn custom_cgroup_cpuset_overlap_imbalance_combined(ctx: &Ctx) -> Result<Asse
                 .workers(1)
                 .work_type(WorkType::YieldHeavy),
         ],
-        HoldSpec::fixed(ctx.settle + ctx.duration),
+        ctx.settled_hold(1.0),
     )];
 
     execute_steps(ctx, steps)
@@ -275,7 +275,7 @@ pub fn custom_cgroup_no_ctrl_cpuset_change(ctx: &Ctx) -> Result<AssertResult> {
 
     let steps = vec![
         // Phase 1: hold the Backdrop's initial disjoint cpusets.
-        Step::new(vec![], HoldSpec::fixed(ctx.settle + ctx.duration / 2)),
+        Step::new(vec![], ctx.settled_hold(0.5)),
         // Phase 2: clear cpusets, hold remaining half.
         Step::new(
             vec![Op::clear_cpuset("cg_0"), Op::clear_cpuset("cg_1")],
@@ -295,7 +295,7 @@ pub fn custom_cgroup_no_ctrl_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
                 .workers(1)
                 .work_type(WorkType::YieldHeavy),
         ],
-        HoldSpec::fixed(ctx.settle + ctx.duration),
+        ctx.settled_hold(1.0),
     )];
 
     execute_steps(ctx, steps)
@@ -310,7 +310,7 @@ pub fn custom_cgroup_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult> {
                 .work_type(WorkType::IoSyncWrite),
             CgroupDef::named("cg_1").workers(ctx.topo.total_cpus()),
         ],
-        HoldSpec::fixed(ctx.settle + ctx.duration),
+        ctx.settled_hold(1.0),
     )];
 
     execute_steps(ctx, steps)

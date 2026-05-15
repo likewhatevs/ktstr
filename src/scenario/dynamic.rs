@@ -32,7 +32,7 @@ pub fn custom_cgroup_add_midrun(ctx: &Ctx) -> Result<AssertResult> {
         .with_cgroup(CgroupDef::named("cg_1"));
     let steps = vec![
         // Phase 1: settle with just the two steady cgroups.
-        Step::new(vec![], HoldSpec::fixed(ctx.settle + ctx.duration / 2)),
+        Step::new(vec![], ctx.settled_hold(0.5)),
         // Phase 2: add the step-local extras.
         Step::with_defs(phase2_setup, HoldSpec::frac(0.5)),
     ];
@@ -69,7 +69,7 @@ pub fn custom_cgroup_remove_midrun(ctx: &Ctx) -> Result<AssertResult> {
         .collect();
 
     let steps = vec![
-        Step::with_defs(step0_defs, HoldSpec::fixed(ctx.settle + ctx.duration / 2)),
+        Step::with_defs(step0_defs, ctx.settled_hold(0.5)),
         Step::new(vec![], HoldSpec::frac(0.5)),
     ];
 
@@ -147,7 +147,7 @@ pub fn custom_cgroup_cpuset_add_remove(ctx: &Ctx) -> Result<AssertResult> {
     ]);
     let steps = vec![
         // Phase 1: settle the two steady cgroups.
-        Step::new(vec![], HoldSpec::fixed(ctx.settle + ctx.duration / 3)),
+        Step::new(vec![], ctx.settled_hold(1.0 / 3.0)),
         // Phase 2: add cg_2; auto teardown at step end removes it.
         Step::with_defs(
             vec![CgroupDef::named("cg_2").with_cpuset(CpusetSpec::disjoint(2, 3))],
@@ -177,7 +177,7 @@ pub fn custom_cgroup_add_during_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ]);
     let steps = vec![
         // Phase 1: settle with cg_0 and cg_1 alone.
-        Step::new(vec![], HoldSpec::fixed(ctx.settle + ctx.duration / 2)),
+        Step::new(vec![], ctx.settled_hold(0.5)),
         // Phase 2: add cg_2 as step-local.
         Step::with_defs(
             vec![CgroupDef::named("cg_2").workers(4)],

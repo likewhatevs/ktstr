@@ -1,7 +1,7 @@
 //! Performance and benchmarking scenario implementations.
 
 use super::Ctx;
-use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Step, execute_steps_with};
+use super::ops::{CgroupDef, CpusetSpec, Step, execute_steps_with};
 use crate::assert::{Assert, AssertResult};
 use crate::workload::*;
 use anyhow::Result;
@@ -21,7 +21,7 @@ pub fn custom_cache_pressure_imbalance(ctx: &Ctx) -> Result<AssertResult> {
                 .work_type(WorkType::cache_pressure(32, 64)),
             CgroupDef::named("cg_1").workers(ctx.topo.total_cpus()),
         ],
-        HoldSpec::fixed(ctx.settle + ctx.duration),
+        ctx.settled_hold(1.0),
     )];
 
     execute_steps_with(ctx, steps, Some(&checks))
@@ -53,7 +53,7 @@ pub fn custom_cache_yield_wake_affine(ctx: &Ctx) -> Result<AssertResult> {
                 .workers(ctx.workers_per_cgroup)
                 .work_type(WorkType::cache_yield(32, 64)),
         ],
-        HoldSpec::fixed(ctx.settle + ctx.duration),
+        ctx.settled_hold(1.0),
     )];
 
     execute_steps_with(ctx, steps, Some(&checks))
@@ -83,7 +83,7 @@ pub fn custom_cache_pipe_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult>
                 .work_type(WorkType::cache_pipe(32, 1024)),
             CgroupDef::named("cg_1").workers(ctx.topo.total_cpus()),
         ],
-        HoldSpec::fixed(ctx.settle + ctx.duration),
+        ctx.settled_hold(1.0),
     )];
 
     execute_steps_with(ctx, steps, Some(&checks))
@@ -113,7 +113,7 @@ pub fn custom_fan_out_wake(ctx: &Ctx) -> Result<AssertResult> {
                 .work_type(WorkType::futex_fan_out(fan_out, 1024)),
             CgroupDef::named("cg_1").workers(ctx.topo.total_cpus()),
         ],
-        HoldSpec::fixed(ctx.settle + ctx.duration),
+        ctx.settled_hold(1.0),
     )];
 
     execute_steps_with(ctx, steps, Some(&checks))
@@ -142,7 +142,7 @@ pub fn custom_fan_out_compute(ctx: &Ctx) -> Result<AssertResult> {
                 .work_type(WorkType::fan_out_compute(fan_out, 256, 5, 100)),
             CgroupDef::named("cg_1").workers(ctx.topo.total_cpus()),
         ],
-        HoldSpec::fixed(ctx.settle + ctx.duration),
+        ctx.settled_hold(1.0),
     )];
 
     execute_steps_with(ctx, steps, Some(&checks))

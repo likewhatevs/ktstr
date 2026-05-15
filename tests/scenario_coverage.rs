@@ -554,12 +554,12 @@ fn cover_op_move_all_tasks(ctx: &Ctx) -> Result<AssertResult> {
 
 #[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_op_spawn_host(ctx: &Ctx) -> Result<AssertResult> {
-    use ktstr::scenario::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
+    use ktstr::scenario::ops::{CgroupDef, Op, Step, execute_steps};
     use ktstr::workload::{WorkSpec, WorkType};
     let steps = vec![
         Step::with_defs(
             vec![CgroupDef::named("cg_0").workers(2)],
-            HoldSpec::fixed(ctx.settle + ctx.duration),
+            ctx.settled_hold(1.0),
         )
         .set_ops(vec![Op::spawn_host(
             WorkSpec::default().workers(2).work_type(WorkType::SpinWait),
@@ -572,7 +572,7 @@ fn cover_op_spawn_host(ctx: &Ctx) -> Result<AssertResult> {
 
 #[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_work_type_sequence(ctx: &Ctx) -> Result<AssertResult> {
-    use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
+    use ktstr::scenario::ops::{CgroupDef, Step, execute_steps};
     use ktstr::workload::{Phase, WorkType};
     use std::time::Duration;
     let seq = WorkType::Sequence {
@@ -584,7 +584,7 @@ fn cover_work_type_sequence(ctx: &Ctx) -> Result<AssertResult> {
     };
     let steps = vec![Step::with_defs(
         vec![CgroupDef::named("cg_seq").workers(2).work_type(seq)],
-        HoldSpec::fixed(ctx.settle + ctx.duration),
+        ctx.settled_hold(1.0),
     )];
     execute_steps(ctx, steps)
 }

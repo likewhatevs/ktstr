@@ -1838,6 +1838,10 @@ impl HoldSpec {
     /// (`Step::new(ops, HoldSpec::fixed(Duration::from_secs(5)))`)
     /// and surfaces in IDE autocomplete next to [`Self::frac`] and
     /// [`Self::loop_at`].
+    ///
+    /// For the common `settle + duration * fraction` pattern, prefer
+    /// [`Ctx::settled_hold`](crate::scenario::Ctx::settled_hold) over
+    /// `HoldSpec::fixed(ctx.settle + ctx.duration.mul_f64(frac))`.
     pub const fn fixed(d: Duration) -> HoldSpec {
         HoldSpec::Fixed(d)
     }

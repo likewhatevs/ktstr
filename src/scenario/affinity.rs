@@ -22,7 +22,7 @@ pub fn custom_cgroup_affinity_change(ctx: &Ctx) -> Result<AssertResult> {
         .with_cgroup(CgroupDef::named("cg_1"));
     let mut steps = vec![Step::new(
         vec![],
-        HoldSpec::fixed(ctx.settle + ctx.duration / 5),
+        ctx.settled_hold(0.2),
     )];
 
     // Pool the random sample across every CPU in the topology;
