@@ -35,11 +35,11 @@
 //!     let steps = vec![
 //!         Step::with_defs(
 //!             vec![CgroupDef::named("cg_0").workers(4)],
-//!             HoldSpec::Frac(0.5),
+//!             HoldSpec::frac(0.5),
 //!         ),
 //!         Step::new(
 //!             vec![Op::stop_cgroup("cg_0"), Op::remove_cgroup("cg_0")],
-//!             HoldSpec::Frac(0.5),
+//!             HoldSpec::frac(0.5),
 //!         ),
 //!     ];
 //!     execute_steps(ctx, steps)

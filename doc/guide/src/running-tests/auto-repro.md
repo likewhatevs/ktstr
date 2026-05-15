@@ -150,7 +150,7 @@ fn scenario_yield_heavy(ctx: &Ctx) -> Result<AssertResult> {
                 .work_type(WorkType::YieldHeavy)
                 .workers(4),
         ],
-        HoldSpec::Fixed(Duration::from_secs(8)),
+        HoldSpec::fixed(Duration::from_secs(8)),
     )];
     execute_steps(ctx, steps)
 }

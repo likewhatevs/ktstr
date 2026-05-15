@@ -194,7 +194,7 @@ pub enum Op {
     /// run without `--timeout`) will hang the step until the
     /// outer test watchdog fires. For time-boxed long-running
     /// payloads, prefer [`KillPayload`](Self::KillPayload) paired
-    /// with a [`HoldSpec::Fixed`] / [`HoldSpec::Frac`] step
+    /// with a [`HoldSpec::fixed`] / [`HoldSpec::frac`] step
     /// boundary that guarantees forward progress; the payload's
     /// own CLI (`--runtime`, `--timeout`) is the reliable way to
     /// cap a single invocation's runtime.

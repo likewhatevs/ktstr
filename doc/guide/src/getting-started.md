@@ -224,12 +224,12 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> {
                 CgroupDef::named("cg_0").workers(2),
                 CgroupDef::named("cg_1").workers(2),
             ],
-            HoldSpec::Frac(0.5),
+            HoldSpec::frac(0.5),
         ),
         // Phase 2: add a third cgroup for the remaining half.
         Step::with_defs(
             vec![CgroupDef::named("cg_2").workers(2)],
-            HoldSpec::Frac(0.5),
+            HoldSpec::frac(0.5),
         ),
     ];
     execute_steps(ctx, steps)

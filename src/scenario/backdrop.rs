@@ -272,6 +272,25 @@ mod tests {
         metric_bounds: None,
     };
 
+    /// Distinct-named sibling of `TEST_PAYLOAD` so payload-order
+    /// tests can discriminate position via the name field. Without
+    /// a second const, two-element tests reusing `TEST_PAYLOAD`
+    /// produce `[test_bin, test_bin]` regardless of order — a
+    /// `reverse()` regression would silently pass any name-based
+    /// assertion.
+    const TEST_PAYLOAD_2: Payload = Payload {
+        name: "test_bin_2",
+        kind: PayloadKind::Binary("/bin/false"),
+        output: OutputFormat::ExitCode,
+        default_args: &[],
+        default_checks: &[],
+        metrics: &[],
+        include_files: &[],
+        uses_parent_pgrp: false,
+        known_flags: None,
+        metric_bounds: None,
+    };
+
     #[test]
     fn empty_backdrop_has_no_entities() {
         let b = Backdrop::EMPTY;
@@ -304,7 +323,30 @@ mod tests {
         ]);
         assert_eq!(b.cgroups.len(), 3);
         assert_eq!(b.cgroups[0].name.as_ref(), "cg0");
+        // Middle index pinned so a regression that swaps middle
+        // elements via a sort or partition while leaving first/last
+        // in place gets caught.
+        assert_eq!(b.cgroups[1].name.as_ref(), "cg1");
         assert_eq!(b.cgroups[2].name.as_ref(), "cg2");
+    }
+
+    /// Declaration order is preserved across a many-entry batch.
+    /// Catches sort/partition/reverse-style regressions that the
+    /// 3-element sibling above wouldn't surface — a swap of indices
+    /// 1 and 2 there is invisible to a {0, len-1} assertion, but
+    /// here every index is checked.
+    #[test]
+    fn with_cgroups_preserves_declaration_order_for_many_entries() {
+        const NAMES: [&str; 7] = ["cg0", "cg1", "cg2", "cg3", "cg4", "cg5", "cg6"];
+        let b = Backdrop::new().with_cgroups(NAMES.map(CgroupDef::named));
+        assert_eq!(b.cgroups.len(), NAMES.len());
+        for (i, expected) in NAMES.iter().enumerate() {
+            assert_eq!(
+                b.cgroups[i].name.as_ref(),
+                *expected,
+                "index {i} should be {expected}"
+            );
+        }
     }
 
     #[test]
@@ -317,18 +359,69 @@ mod tests {
 
     #[test]
     fn with_payloads_extends_in_order() {
-        let b = Backdrop::new().with_payloads([&TEST_PAYLOAD, &TEST_PAYLOAD]);
+        // Use TEST_PAYLOAD_2 in the second slot so the assertion
+        // actually discriminates position — `[&TEST_PAYLOAD,
+        // &TEST_PAYLOAD]` would assert `[test_bin, test_bin]`
+        // regardless of order and let a `reverse()` regression pass.
+        let b = Backdrop::new().with_payloads([&TEST_PAYLOAD, &TEST_PAYLOAD_2]);
         assert_eq!(b.payloads.len(), 2);
         assert_eq!(b.payloads[0].name, "test_bin");
-        assert_eq!(b.payloads[1].name, "test_bin");
+        assert_eq!(b.payloads[1].name, "test_bin_2");
+    }
+
+    /// Declaration order is preserved across a many-entry payload
+    /// batch. Sibling of `with_cgroups_preserves_declaration_order_for_many_entries`
+    /// — catches arbitrary shuffle/sort/partition/reverse
+    /// regressions across a larger collection than the 2-entry
+    /// `with_payloads_extends_in_order` can surface.
+    #[test]
+    fn with_payloads_preserves_declaration_order_for_many_entries() {
+        // Interleave the two distinct payloads in an asymmetric (not
+        // palindromic) pattern so a single pairwise swap surfaces
+        // as a name mismatch at that index AND so a `reverse()`
+        // regression also surfaces — a perfectly alternating
+        // `[1, 2, 1, 2, 1, 2, 1]` pattern is palindromic under
+        // reverse and would silently pass that case.
+        let inputs = [
+            &TEST_PAYLOAD,
+            &TEST_PAYLOAD,
+            &TEST_PAYLOAD_2,
+            &TEST_PAYLOAD,
+            &TEST_PAYLOAD_2,
+            &TEST_PAYLOAD_2,
+            &TEST_PAYLOAD,
+        ];
+        let expected = [
+            "test_bin",
+            "test_bin",
+            "test_bin_2",
+            "test_bin",
+            "test_bin_2",
+            "test_bin_2",
+            "test_bin",
+        ];
+        let b = Backdrop::new().with_payloads(inputs);
+        assert_eq!(b.payloads.len(), expected.len());
+        for (i, name) in expected.iter().enumerate() {
+            assert_eq!(
+                b.payloads[i].name, *name,
+                "index {i} should be {name}"
+            );
+        }
     }
 
     #[test]
     fn with_payloads_appends_after_with_payload() {
+        // Use distinct payload consts so the assertion can verify
+        // that the `with_payload` entry comes BEFORE the
+        // `with_payloads` entries — a regression that prepends
+        // (instead of appends) would pass a count-only check.
         let b = Backdrop::new()
             .with_payload(&TEST_PAYLOAD)
-            .with_payloads([&TEST_PAYLOAD]);
+            .with_payloads([&TEST_PAYLOAD_2]);
         assert_eq!(b.payloads.len(), 2);
+        assert_eq!(b.payloads[0].name, "test_bin");
+        assert_eq!(b.payloads[1].name, "test_bin_2");
     }
 
     #[test]
