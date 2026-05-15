@@ -644,7 +644,9 @@ pub struct KtstrTestEntry {
     /// Host-topology constraints (CPU and LLC bounds) that gate
     /// whether this entry is eligible on the current machine.
     pub constraints: TopologyConstraints,
-    /// Guest memory in MB.
+    /// Guest memory in MiB (binary mebibytes; conversion at
+    /// VM-launch is `value << 20` bytes, not `value * 1_000_000`).
+    /// The `_mb` field suffix is historical.
     pub memory_mb: u32,
     /// Primary scheduler that drives the test. Defaults to
     /// [`Scheduler::EEVDF`] (the no-scx-scheduler placeholder; tests

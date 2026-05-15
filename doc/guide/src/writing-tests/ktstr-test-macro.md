@@ -73,7 +73,7 @@ so the bare form is the meaningful shorthand for those.
 | `numa_nodes` | inherited | Number of NUMA nodes |
 | `cores` | inherited | Cores per LLC |
 | `threads` | inherited | Threads per core |
-| `memory_mb` | 2048 | VM memory in MB (minimum; see scaling below) |
+| `memory_mb` | 2048 | VM memory in MiB (minimum; see scaling below) |
 
 Each dimension independently inherits from `Scheduler.topology` when
 a `scheduler` is specified and that dimension is not explicitly set.
@@ -85,13 +85,15 @@ so most tests do not need to set `numa_nodes`. See
 ### Memory scaling
 
 `memory_mb` is one of three floors; the framework picks
-`max(total_cpus * 64, 256, memory_mb)` MB at VM-launch time. For
+`max(total_cpus * 64, 256, memory_mb)` MiB at VM-launch time. For
 tests with more than 32 vCPUs the cpu-based floor (`total_cpus *
 64`) dominates the default `memory_mb = 2048`, so a 126-vCPU test
-allocates 8064 MB regardless. Below ~4 vCPUs the absolute 256-MB
+allocates 8064 MiB regardless. Below ~4 vCPUs the absolute 256-MiB
 floor wins if `memory_mb` is also below it. Setting `memory_mb`
 above the cpu-based floor is only meaningful when the test needs
-more headroom than the per-cpu budget.
+more headroom than the per-cpu budget. The field name carries the
+`_mb` suffix for historical reasons; the conversion at VM-launch
+is `value << 20` bytes (binary mebibytes), not `value * 1_000_000`.
 
 ### Boot timing
 

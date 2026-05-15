@@ -1076,8 +1076,10 @@ pub(crate) fn resolve_current_exe() -> anyhow::Result<std::path::PathBuf> {
 /// `numa_nodes`, `llcs`, `cores`, `threads`: guest CPU topology.
 /// `include_files`: `(archive_path, host_path)` pairs for files to
 ///   include in the guest.
-/// `memory_mb`: explicit guest memory override in MB. When `None`,
-///   memory is computed from actual initramfs size after build.
+/// `memory_mb`: explicit guest memory override in MiB (the `_mb`
+///   suffix is historical; conversion at VM-launch is `value << 20`
+///   bytes). When `None`, memory is computed from actual initramfs
+///   size after build.
 /// `disk`: optional virtio-blk device backing for `/dev/vda`. When
 ///   `Some`, the framework calls
 ///   [`vmm::KtstrVm::builder`]'s `.disk(..)` so the guest probes a

@@ -236,6 +236,52 @@ failures, not just scheduler deaths.
 See [Investigate a Crash](recipes/investigate-crash.md) for the
 complete failure output format and auto-repro walkthrough.
 
+## send_sys_rdy timeout
+
+```text
+WARN ktstr::vmm::rust_init: ktstr-init: send_sys_rdy retry budget
+exhausted (10000 ms, 1 vCPUs)
+```
+
+The placeholders `(NNNNN ms, V vCPUs)` are the rendered budget (in
+milliseconds) and the guest's online vCPU count.
+
+The guest-side `ktstr-init` writes a `sys_rdy` token to the
+host-shared mmap after the VM boots and dispatches its main thread,
+signaling the guest is ready to receive a test entry. When the host
+does not observe the token within the retry budget, the WARN above
+is logged and the VM proceeds to teardown without ever running the
+test scenario.
+
+The retry budget scales with vCPU count between a 10000 ms floor
+and a 30000 ms cap — 150 ms per vCPU once `vcpus >= 67`, capped at
+30 s once `vcpus >= 200`. A 1-vCPU test gets the floor (10000 ms);
+a 126-vCPU test gets 18900 ms; a 200+-vCPU test gets the cap. On
+lightly-loaded hosts the floor covers the boot path comfortably.
+
+**Common causes:**
+
+- Heavy host CPU contention from other workloads delaying guest
+  vCPU scheduling.
+- A KASAN / KCSAN / lockdep kernel build that adds substantial
+  boot-path overhead.
+- A guest kernel that panics before `ktstr-init` runs (look for a
+  kernel oops in the `--- diagnostics ---` console tail).
+
+**Fixes:**
+
+- Pass `--no-perf-mode` (or set `KTSTR_NO_PERF_MODE=1`) to disable
+  RT scheduling and exclusive LLC reservation, which reduces the
+  chance of host-side contention starving the guest's vCPU threads.
+  See [Performance mode](concepts/performance-mode.md) for the
+  full flag effect.
+- Reduce the topology for the test (`llcs`, `cores`, `threads`) —
+  fewer vCPUs means a shorter boot path.
+- Reserve CPUs for ktstr via host-side isolation (`isolcpus=`) on
+  the host kernel boot command line. See
+  [Resource budget](concepts/resource-budget.md) for the
+  host-side CPU isolation patterns ktstr expects.
+
 ## Insufficient hugepages
 
 ```text

@@ -69,7 +69,7 @@ on all exit paths.
 | `--kernel ID` | auto | Kernel identifier: a source directory path (e.g. `../linux`), a version (`6.14.2` or major.minor prefix `6.14`), or a cache key (see `ktstr kernel list`). Raw image files are rejected. Source directories auto-build; versions auto-download from kernel.org on cache miss. When absent, resolves via cache then filesystem and falls back to downloading the latest stable kernel. |
 | `--topology N,L,C,T` | `1,1,1,1` | Virtual CPU topology as `numa_nodes,llcs,cores,threads`. All values must be >= 1. |
 | `-i, --include-files PATH` | -- | Files or directories to include in the guest. Repeatable. Directories are walked recursively. |
-| `--memory-mb MB` | auto | Guest memory in MB (minimum 128). When absent, estimated from payload and include file sizes. |
+| `--memory-mb MB` | auto | Guest memory in MiB (minimum 128). The flag name and metavar keep the `mb` shorthand from the field name, but the value is interpreted as binary mebibytes — `--memory-mb 2048` allocates `2048 << 20` = 2 GiB. When absent, estimated from payload and include file sizes. |
 | `--dmesg` | off | Forward kernel console (COM1/dmesg) to stderr in real-time. Sets loglevel=7 for verbose kernel output. |
 | `--exec CMD` | -- | Run a command in the VM instead of an interactive shell. The VM exits after the command completes. |
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |

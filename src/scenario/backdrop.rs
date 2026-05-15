@@ -93,26 +93,38 @@ pub struct Backdrop {
     /// `with_cgroup(a).with_cgroup(b)` creates `a` first, then `b`.
     ///
     /// This matters for any scheduler whose internal IDs are
-    /// assigned in cgroup-attach order — `scx_mitosis`, for
-    /// example, allocates `cell_id`s monotonically on first attach
-    /// (and reuses freed IDs LIFO from a free-list when prior cells
-    /// were destroyed), so the cgroup declared first gets
-    /// `cell_id = 1`, the second gets `cell_id = 2`, and so on
-    /// for the initial allocation sequence. A test that wants a
+    /// assigned in cgroup-creation order — `scx_mitosis`, for
+    /// example, allocates `cell_id`s monotonically on cgroup
+    /// creation (observed via cgroup-fs inotify, not on first
+    /// task attach) and reuses freed IDs LIFO from a free-list
+    /// when prior cells were destroyed. The cgroup declared first
+    /// gets `cell_id = 1`, the second gets `cell_id = 2`, and so
+    /// on for the initial allocation sequence. A test that wants a
     /// sparse `cell_id` range (e.g. remove the middle cell to leave
     /// a gap) can rely on the framework-side declaration order:
     /// declare `cg_a`, `cg_b`, `cg_c` to get `cell_id = 1, 2, 3`,
     /// then `Op::RemoveCgroup("cg_b")` at a Step boundary leaves
-    /// cells 1 and 3 live with a `cell_id = 2` hole. Subsequent
-    /// allocations after that hole exists will reuse the freed
+    /// cells 1 and 3 live with a `cell_id = 2` hole. The next
+    /// single-cgroup allocation after that hole reuses the freed
     /// `cell_id = 2` before bumping `next_cell_id` further — LIFO
-    /// from the free-list, not lowest-free, so multi-delete reuse
-    /// order tracks insertion-into-free-list order.
+    /// from the free-list, not lowest-free.
+    ///
+    /// **Multi-delete caveat.** When several cgroups are removed
+    /// in one inotify-batched event (or two `RemoveCgroup` ops fire
+    /// before scx_mitosis services any of them), scx_mitosis
+    /// inserts the freed IDs into the free-list via
+    /// `HashSet::iter()` — hash-bucket order, NOT removal order.
+    /// Subsequent allocations still pop LIFO, but the LIFO is
+    /// against an arbitrarily-permuted insertion order, so
+    /// "remove a, b, c in this order → reuse c, b, a" does NOT
+    /// hold for multi-cell batches. Single-delete patterns
+    /// (one `RemoveCgroup` per Step) reuse the freed ID
+    /// deterministically.
     ///
     /// The cell_id assignment itself is the scheduler's
     /// responsibility, not the framework's. The Backdrop only
     /// guarantees the cgroup-creation order; the scheduler binary
-    /// observes the resulting attach order and assigns whatever
+    /// observes the resulting creation order and assigns whatever
     /// internal IDs its policy dictates.
     pub cgroups: Vec<CgroupDef>,
     /// Long-lived binary payloads spawned once before the first
