@@ -123,10 +123,16 @@ pub(crate) fn extract_sched_ext_dump(output: &str) -> Option<String> {
 ///
 /// routed through the `sched_ext_dump` tracepoint so each line in the
 /// trace_pipe stream carries a `<task>  [<cpu>]  <ts>: sched_ext_dump: `
-/// prefix. The scan locates the `triggered exit kind` anchor and
-/// returns the IMMEDIATELY-FOLLOWING line's body (everything after
-/// `sched_ext_dump:`), trimmed. That body carries the actionable
-/// BPF error text the test author needs to see.
+/// prefix. The scan locates the `triggered exit kind` anchor and walks
+/// forward for the first SAME-CPU line that isn't itself another
+/// anchor; the body (everything after `sched_ext_dump:`, trimmed) of
+/// that line is returned. Same-CPU is required because the kernel
+/// emits anchor and body via two adjacent `dump_line` calls under
+/// `scx_dump_lock` from one CPU context — but `trace_pipe` merges
+/// per-CPU ring buffers, so unrelated tracepoint events fired from
+/// OTHER CPUs can land between anchor and body in the stream. Anchors
+/// with no `[<cpu>]` prefix (synthetic test fixtures without
+/// trace_pipe framing) fall back to strict adjacency.
 ///
 /// Fallback: when no `triggered exit kind` anchor is present in the
 /// dump (truncated console, pre-attach failure, etc.), scan the
@@ -153,7 +159,7 @@ pub(crate) fn extract_bug_summary(sched_log: &str, dump: &str) -> Option<String>
     let lines: Vec<&str> = dump_clean.lines().collect();
     for (i, line) in lines.iter().enumerate() {
         if line.contains("triggered exit kind")
-            && let Some(next) = lines.get(i + 1)
+            && let Some(next) = find_same_cpu_body_after(&lines, i, parse_trace_cpu(line))
         {
             let body = next
                 .find("sched_ext_dump:")
@@ -175,6 +181,69 @@ pub(crate) fn extract_bug_summary(sched_log: &str, dump: &str) -> Option<String>
         }
     }
     None
+}
+
+/// Walk forward from `lines[after]` for the first SAME-CPU line that
+/// isn't itself another `triggered exit kind` anchor.
+///
+/// Both [`extract_bug_summary`] and [`extract_exit_from_dump_trace`]
+/// share the kernel emission contract — anchor and body emitted via
+/// two adjacent `dump_line` calls under `scx_dump_lock` from one CPU
+/// context (kernel/sched/ext.c). `trace_pipe`, however, merges per-CPU
+/// ring buffers — so unrelated tracepoint events fired from OTHER
+/// CPUs between the two `dump_line` calls land BETWEEN anchor and
+/// body in the stream. A strict `lines.get(i + 1)` pick would then
+/// return the cross-CPU interleaved event as the body. Scanning
+/// forward for the first same-CPU line skips those interleaved events.
+///
+/// Stops at the next anchor on the same CPU — the first anchor's
+/// body was lost (truncation or dump_line failure) and must not adopt
+/// the following anchor's data as its body.
+///
+/// When `anchor_cpu` is `None` (synthetic test fixtures without
+/// trace_pipe framing), the same-CPU filter is bypassed and the first
+/// non-anchor subsequent line is returned — matches strict-adjacency
+/// behavior for inputs without the tracepoint envelope.
+fn find_same_cpu_body_after<'a>(
+    lines: &[&'a str],
+    after: usize,
+    anchor_cpu: Option<&str>,
+) -> Option<&'a str> {
+    lines
+        .iter()
+        .skip(after + 1)
+        .filter(|n| anchor_cpu.is_none() || parse_trace_cpu(n) == anchor_cpu)
+        .take_while(|n| !n.contains("triggered exit kind"))
+        .next()
+        .copied()
+}
+
+/// Parse the `[<cpu>]` prefix from a trace_pipe line.
+///
+/// The trace_pipe format is `<task>-<pid> [<cpu>] <time>: <event>:
+/// <event-data>`. The CPU bracket sits between the task-pid prefix
+/// and the timestamp, well before any `scheduler[N]` mention in the
+/// event data. To avoid matching `scheduler[5678]` or other digit-
+/// bracketed tokens that appear later in the line, the parse only
+/// looks at the slice BEFORE `: sched_ext_dump:`. Within that slice
+/// the parse uses `rfind('[')` (not `find`) so a pathological task
+/// name containing `[` (kthread-style brackets, exotic comm strings)
+/// can't shadow the CPU bracket — the CPU bracket is always the
+/// LAST bracketed token before the timestamp. The inner bytes must
+/// be 1-5 ASCII digits (NR_CPUS today caps at 8192 = 4 digits; 5
+/// gives headroom). Returns `None` for lines without trace_pipe
+/// framing (e.g. raw kernel logs, or synthetic test inputs without
+/// the tracepoint envelope).
+fn parse_trace_cpu(line: &str) -> Option<&str> {
+    let event_pos = line.find(": sched_ext_dump:")?;
+    let prefix = &line[..event_pos];
+    let bracket_open = prefix.rfind('[')?;
+    let bracket_close = bracket_open + 1 + prefix[bracket_open + 1..].find(']')?;
+    let inner = &prefix[bracket_open + 1..bracket_close];
+    if inner.is_empty() || inner.len() > 5 || !inner.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(&prefix[bracket_open..=bracket_close])
 }
 
 /// Strip ANSI CSI escape sequences (`\x1b[...<letter>`) from a
@@ -222,13 +291,21 @@ fn strip_ansi_csi(s: &str) -> String {
 /// Extract exit reason from `sched_ext_dump:` trace lines when the
 /// `sched_ext: BPF scheduler "..." disabled (...)` anchor line is
 /// absent (truncated console). Looks for `triggered exit kind NNNN:`
-/// followed by the reason text on the next dump line.
+/// followed by the reason text on the same-CPU dump line.
+///
+/// Uses [`find_same_cpu_body_after`] for the same reason as
+/// [`extract_bug_summary`]: the kernel emits anchor and body via two
+/// adjacent `dump_line` calls under `scx_dump_lock`, but `trace_pipe`
+/// merges per-CPU buffers and unrelated tracepoint events fired from
+/// OTHER CPUs can land between them in the stream. Strict adjacency
+/// would surface the wrong scheduler's data; same-CPU scan skips the
+/// interleaved events.
 pub(crate) fn extract_exit_from_dump_trace(console: &str) -> Option<String> {
     let lines: Vec<&str> = console.lines().collect();
     for (i, line) in lines.iter().enumerate() {
         if line.contains("sched_ext_dump:")
             && line.contains("triggered exit kind")
-            && let Some(next) = lines.get(i + 1)
+            && let Some(next) = find_same_cpu_body_after(&lines, i, parse_trace_cpu(line))
             && let Some(pos) = next.find("sched_ext_dump:")
         {
             let body = next[pos + "sched_ext_dump:".len()..].trim();
@@ -1010,42 +1087,231 @@ mod tests {
         );
     }
 
-    /// Pin current `lines.get(i + 1)` adjacency behavior: the
-    /// dump scan takes the line immediately after the `triggered
-    /// exit kind` anchor as the body, without any context match
-    /// (e.g. without checking that the body's `scheduler[N]`
-    /// prefix matches the anchor's). In practice the kernel
-    /// emits the anchor and the body through two adjacent
-    /// `dump_line` calls (kernel/sched/ext.c:6161 + 6163) on the
-    /// same `seq_buf`, both protected by `scx_dump_lock`. Each
-    /// call produces one `trace_sched_ext_dump` tracepoint
-    /// event, so adjacency in the trace_pipe stream holds when
-    /// no other tracepoint events interleave between the two
-    /// calls — the cross-CPU interleaved-stream caveat is a
-    /// known limitation of the current implementation. A future
-    /// refactor that (a) added a
-    /// relevance check between anchor and body, or (b) replaced
-    /// the strict `i + 1` pick with a "scan downward until a
-    /// body-shaped line" search would silently change which line
-    /// gets surfaced. The intervening unrelated dump line below
-    /// — different `scheduler[N]`, different cpu, different
-    /// relative-time — is exactly the kind of line such a
-    /// refactor would skip past, so the assertion that it IS
-    /// what we return is a load-bearing pin.
+    /// Cross-CPU interleaving: a tracepoint event fired from a
+    /// DIFFERENT CPU lands between the kernel's anchor and body
+    /// `dump_line` calls in the trace_pipe stream (because
+    /// trace_pipe merges per-CPU ring buffers without preserving
+    /// the emit-order of distinct CPUs). The dump scan walks
+    /// forward from the anchor for the first SAME-CPU line that
+    /// isn't itself another anchor, skipping the interleaved
+    /// cross-CPU event. A regression that reverted to strict
+    /// `lines.get(i + 1)` adjacency would surface the wrong
+    /// scheduler's `unrelated event` here.
     #[test]
-    fn extract_bug_summary_takes_immediate_next_line() {
+    fn extract_bug_summary_skips_interleaved_other_cpu_event() {
         let dump = "\
-ktstr-1 [001] 0.5: sched_ext_dump: scheduler[1] triggered exit kind 5:
-ktstr-2 [002] 0.5: sched_ext_dump: scheduler[2] unrelated body from cpu 2
-ktstr-3 [003] 0.5: sched_ext_dump: scheduler[1] real body for kind 5
+ktstr-1234 [001] 0.500: sched_ext_dump: scheduler[1] triggered exit kind 5:
+ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
+ktstr-1234 [001] 0.501: sched_ext_dump:   apply_cell_config returned -EINVAL
 ";
-        let summary =
-            extract_bug_summary("", dump).expect("anchor + following line must yield Some");
+        let summary = extract_bug_summary("", dump)
+            .expect("interleaved cross-CPU event must not block body extraction");
+        assert!(
+            summary.contains("apply_cell_config returned -EINVAL"),
+            "must return the same-CPU body, skipping the [002] interleaved event: {summary}",
+        );
+        assert!(
+            !summary.contains("unrelated event"),
+            "must NOT surface the cross-CPU interleaved line as the body: {summary}",
+        );
+    }
+
+    /// No same-CPU body anywhere after the anchor — the dump
+    /// scan finds no candidate body and falls through to the
+    /// sched_log fallback. A regression that relaxed the
+    /// same-CPU restriction back to strict adjacency would
+    /// surface the foreign-CPU `[002]` line as the body here.
+    #[test]
+    fn extract_bug_summary_falls_through_when_no_same_cpu_body() {
+        let dump = "\
+ktstr-1 [001] 0.500: sched_ext_dump: scheduler[1] triggered exit kind 5:
+ktstr-2 [002] 0.500: sched_ext_dump: scheduler[2] unrelated from cpu 2
+ktstr-3 [003] 0.501: sched_ext_dump: scheduler[3] unrelated from cpu 3
+";
+        assert!(
+            extract_bug_summary("", dump).is_none(),
+            "no same-CPU body and empty sched_log must yield None — \
+             a regression that relaxed the same-CPU restriction back \
+             to strict adjacency would surface the [002] line instead",
+        );
+        let summary = extract_bug_summary("scx_bpf_error: late fallback\n", dump)
+            .expect("with sched_log fallback, the scx_bpf_error line must surface");
+        assert!(
+            summary.contains("scx_bpf_error"),
+            "fallback path: {summary}",
+        );
+    }
+
+    /// A second `triggered exit kind` anchor on the SAME CPU
+    /// appears before the first anchor's body — the first
+    /// anchor's body was lost (truncation, dump_line failure).
+    /// The same-CPU scan must stop at the second anchor rather
+    /// than mis-adopting its data as the first anchor's body.
+    /// The outer loop then advances to the second anchor and
+    /// extracts ITS body normally.
+    #[test]
+    fn extract_bug_summary_stops_at_next_anchor_on_same_cpu() {
+        let dump = "\
+ktstr-1 [001] 0.500: sched_ext_dump: scheduler[1] triggered exit kind 5:
+ktstr-1 [001] 0.510: sched_ext_dump: scheduler[2] triggered exit kind 7:
+ktstr-1 [001] 0.511: sched_ext_dump:   second_error returned -EBUSY
+";
+        let summary = extract_bug_summary("", dump)
+            .expect("outer loop must reach the second anchor and extract its body");
         assert_eq!(
-            summary, "scheduler[2] unrelated body from cpu 2",
-            "extract_bug_summary takes lines.get(i + 1) verbatim and \
-             does not scan for a relevance-matched body — a future \
-             refactor that adds context matching must update this pin",
+            summary, "second_error returned -EBUSY",
+            "first anchor must NOT adopt the second anchor's body; the \
+             outer loop advances to the second anchor: {summary}",
+        );
+    }
+
+    /// Anchor with NO `[<cpu>]` prefix (synthetic test input
+    /// without trace_pipe framing) falls back to strict
+    /// adjacency — `anchor_cpu` is `None`, so the same-CPU
+    /// filter is bypassed and the first non-anchor subsequent
+    /// line is taken as the body. Preserves backward
+    /// compatibility for inputs that don't carry the trace_pipe
+    /// envelope.
+    #[test]
+    fn extract_bug_summary_no_cpu_prefix_falls_back_to_adjacency() {
+        let dump = "scheduler[1] triggered exit kind 5:\n  body_without_trace_framing\n";
+        let summary = extract_bug_summary("", dump)
+            .expect("no-cpu-prefix anchor must still find an adjacent body");
+        assert_eq!(
+            summary, "body_without_trace_framing",
+            "without trace_pipe framing, the first subsequent line wins: {summary}",
+        );
+    }
+
+    /// Defensive pin against bracket-shadowing in the trace_pipe
+    /// task-name slot. `parse_trace_cpu` uses `rfind('[')` so a
+    /// pathological line whose task name (or any other prefix
+    /// token) contains `[<digits>]` can't shadow the real CPU
+    /// bracket. Without rfind, `find('[')` would land on the
+    /// task-name bracket, parse its inner as the CPU, and the
+    /// same-CPU filter would reject every subsequent line on the
+    /// real CPU.
+    #[test]
+    fn extract_bug_summary_cpu_parse_uses_last_bracket() {
+        // Anchor and body carry DIFFERENT leading bracketed tokens
+        // (`[5]` vs `[7]`) but share CPU bracket `[001]`. With a
+        // `find('[')` regression, anchor_cpu would lock onto `[5]`,
+        // body's prefix would parse to `[7]`, the same-CPU filter
+        // would reject the body, and extract_bug_summary would
+        // return None. The rfind impl correctly locks both onto
+        // `[001]` so the body is matched. Same digit-leading-
+        // bracket trick for both lines is what isolates the
+        // find/rfind divergence.
+        let dump = "\
+[5]-1234 [001] 0.500: sched_ext_dump: scheduler[1] triggered exit kind 5:
+ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
+[7]-1234 [001] 0.501: sched_ext_dump:   apply_cell_config returned -EINVAL
+";
+        let summary = extract_bug_summary("", dump).expect(
+            "rfind on the prefix must pick the CPU bracket [001], not the leading \
+             task-name token ([5] or [7]) — otherwise anchor and body lock onto \
+             different fake CPUs and the body is rejected by the same-CPU filter",
+        );
+        assert_eq!(
+            summary, "apply_cell_config returned -EINVAL",
+            "must lock onto CPU [001] for both anchor and body, skipping the [002] \
+             interleaved event, despite the divergent leading bracket tokens [5]/[7]: \
+             {summary}",
+        );
+    }
+
+    // -- extract_exit_from_dump_trace --
+
+    /// Canonical kernel emission: `triggered exit kind` anchor
+    /// plus next dump line carrying the reason on the same CPU.
+    /// Pin the basic same-CPU extraction path.
+    #[test]
+    fn extract_exit_from_dump_trace_canonical() {
+        let console = "\
+ktstr-1 [001] 0.500: sched_ext_dump: scheduler[1] triggered exit kind 5:
+ktstr-1 [001] 0.501: sched_ext_dump:   apply_cell_config returned -EINVAL
+";
+        let reason =
+            extract_exit_from_dump_trace(console).expect("anchor + same-cpu body must yield Some");
+        assert_eq!(
+            reason, "apply_cell_config returned -EINVAL",
+            "must surface the body after `sched_ext_dump:`, trimmed: {reason}",
+        );
+    }
+
+    /// Cross-CPU interleaving: tracepoint event from a DIFFERENT
+    /// CPU lands between anchor and body in the trace_pipe stream.
+    /// The same-CPU scan in [`find_same_cpu_body_after`] skips the
+    /// interleaved event and surfaces the correct body. A
+    /// regression that reverted to strict adjacency would surface
+    /// the [002] event as the exit reason — exactly the failure
+    /// mode the sibling [`extract_bug_summary`] fix addresses.
+    #[test]
+    fn extract_exit_from_dump_trace_skips_interleaved_other_cpu_event() {
+        let console = "\
+ktstr-1234 [001] 0.500: sched_ext_dump: scheduler[1] triggered exit kind 5:
+ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
+ktstr-1234 [001] 0.501: sched_ext_dump:   apply_cell_config returned -EINVAL
+";
+        let reason = extract_exit_from_dump_trace(console)
+            .expect("interleaved cross-CPU event must not block extraction");
+        assert_eq!(
+            reason, "apply_cell_config returned -EINVAL",
+            "must return the same-CPU body, skipping the [002] interleaved event: {reason}",
+        );
+    }
+
+    /// No anchor present: returns None. Pin so a regression
+    /// scanning for arbitrary `sched_ext_dump:` lines would
+    /// surface here.
+    #[test]
+    fn extract_exit_from_dump_trace_none_without_anchor() {
+        let console = "\
+ktstr-1 [001] 0.500: sched_ext_dump: routine status line
+ktstr-1 [001] 0.501: sched_ext_dump: another routine line
+";
+        assert!(extract_exit_from_dump_trace(console).is_none());
+    }
+
+    /// Next-same-CPU line is another anchor: don't adopt its data
+    /// as the first anchor's body. Outer loop advances to the
+    /// second anchor and extracts ITS body normally.
+    #[test]
+    fn extract_exit_from_dump_trace_stops_at_next_anchor_on_same_cpu() {
+        let console = "\
+ktstr-1 [001] 0.500: sched_ext_dump: scheduler[1] triggered exit kind 5:
+ktstr-1 [001] 0.510: sched_ext_dump: scheduler[2] triggered exit kind 7:
+ktstr-1 [001] 0.511: sched_ext_dump:   second_error returned -EBUSY
+";
+        let reason = extract_exit_from_dump_trace(console)
+            .expect("outer loop must reach the second anchor and extract its body");
+        assert_eq!(
+            reason, "second_error returned -EBUSY",
+            "first anchor must NOT adopt the second anchor's body: {reason}",
+        );
+    }
+
+    /// Mirror of `extract_bug_summary_cpu_parse_uses_last_bracket`
+    /// for the sibling [`extract_exit_from_dump_trace`] code path.
+    /// Anchor and body carry different leading bracketed digit
+    /// tokens (`[5]` / `[7]`) but share CPU `[001]`. With a
+    /// `find('[')` regression, anchor_cpu = `[5]`, body's prefix
+    /// parses to `[7]`, same-CPU filter rejects, function returns
+    /// None. With rfind, both lock onto `[001]` and the body is
+    /// extracted.
+    #[test]
+    fn extract_exit_from_dump_trace_cpu_parse_uses_last_bracket() {
+        let console = "\
+[5]-1234 [001] 0.500: sched_ext_dump: scheduler[1] triggered exit kind 5:
+ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
+[7]-1234 [001] 0.501: sched_ext_dump:   apply_cell_config returned -EINVAL
+";
+        let reason = extract_exit_from_dump_trace(console)
+            .expect("rfind on the prefix must pick CPU [001], not the leading task-name token");
+        assert_eq!(
+            reason, "apply_cell_config returned -EINVAL",
+            "must lock onto CPU [001] for both anchor and body despite the divergent \
+             leading bracket tokens [5]/[7]: {reason}",
         );
     }
 
