@@ -3889,6 +3889,203 @@ mod tests {
         );
     }
 
+    /// The Loop arm's sched-died-early-exit path (mod.rs:1177-1180)
+    /// fires when `sleep_or_sched_died` observes the scheduler pid
+    /// has exited mid-loop. Setting `sched_died_during_hold = true`
+    /// and returning `Ok(())` is the contract — the outer caller
+    /// (mod.rs:911-922) reads the flag and stamps a
+    /// `DetailKind::SchedulerDied` with `format_sched_died_during_workload`,
+    /// then marks the AssertResult `passed = false`.
+    ///
+    /// Implementation: use `libc::pid_t::MAX` as the dead pid. The
+    /// kernel's PID_MAX_LIMIT (include/linux/threads.h) caps real
+    /// pids well below `i32::MAX`, so `pidfd_open` on `pid_t::MAX`
+    /// always returns ESRCH, which `sleep_or_sched_died` maps to
+    /// "dead, return true." This pattern matches
+    /// [`crate::scenario::process_alive_nonexistent_pid`] (the same
+    /// trick is used to assert process-alive's no-such-pid path
+    /// without a fork+reap race window).
+    ///
+    /// Pins: (1) `sched_pid` carrying a dead pid into the Loop arm
+    /// exits the while-loop after the first apply_ops iteration;
+    /// (2) the `sched_died_during_hold = true` write at mod.rs:1178
+    /// reaches the outer caller; (3) the outer caller pushes
+    /// `DetailKind::SchedulerDied` and marks `passed = false`. A
+    /// regression that DROPPED the early-exit (loop runs all
+    /// iterations after the death is observed) would surface as
+    /// multiple SetCpuset calls; a regression that DROPPED the
+    /// `sched_died_during_hold = true` write would surface as
+    /// passed=true with no SchedulerDied detail. Note that
+    /// `return Ok(())` vs `break` produce identical observable
+    /// state here because the Loop arm is the last operation in
+    /// run_step's match block — both exit the while loop and fall
+    /// through to the same return — so the count assertion catches
+    /// loss of the early-exit BEHAVIOR, not the specific keyword
+    /// chosen to implement it.
+    #[test]
+    fn holdspec_loop_arm_exits_early_when_sched_dies_during_hold() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let mut ctx = mock_ctx(&mock, &topo);
+        // Short total duration keeps the test fast; the loop should
+        // exit on iteration 1 long before this deadline anyway.
+        ctx.duration = Duration::from_millis(150);
+        // libc::pid_t::MAX is above kernel PID_MAX_LIMIT, so
+        // pidfd_open inside sleep_or_sched_died returns ESRCH
+        // immediately. Same trick as scenario::process_alive's
+        // no-such-pid test.
+        ctx.sched_pid = Some(libc::pid_t::MAX);
+        let steps = vec![Step::new(
+            vec![Op::set_cpuset("died_test", CpusetSpec::Llc(0))],
+            HoldSpec::loop_at(Duration::from_millis(30)),
+        )];
+        let result = execute_steps(&ctx, steps).expect(
+            "Loop arm must return Ok even when sched dies — the death \
+             is surfaced via sched_died_during_hold + DetailKind::SchedulerDied, \
+             NOT as an Err out of run_step",
+        );
+        assert!(
+            !result.passed,
+            "sched-died during the Loop hold must mark passed=false; \
+             got passed=true with details: {:?}",
+            result.details,
+        );
+        let sched_died_details: Vec<_> = result
+            .details
+            .iter()
+            .filter(|d| matches!(d.kind, crate::assert::DetailKind::SchedulerDied))
+            .collect();
+        assert_eq!(
+            sched_died_details.len(),
+            1,
+            "must push exactly one DetailKind::SchedulerDied detail (from \
+             mod.rs:911-922); got {} SchedulerDied details out of {} total: {:?}",
+            sched_died_details.len(),
+            result.details.len(),
+            result.details,
+        );
+        let set_cpuset_calls = mock
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, CgroupCall::SetCpuset(name, _) if name == "died_test"))
+            .count();
+        // First iteration's apply_ops at mod.rs:1175 fires BEFORE
+        // sleep_or_sched_died at mod.rs:1177, so a sched-died-from-
+        // entry still records exactly one SetCpuset call. A
+        // regression that DROPPED the early-exit (loop runs all
+        // iterations after the death is observed) would surface as
+        // multiple calls here; a regression that skipped the first
+        // apply_ops would surface as zero.
+        assert_eq!(
+            set_cpuset_calls, 1,
+            "sched-died-on-entry must apply ops once (iter 1) then exit; \
+             got {set_cpuset_calls} SetCpuset calls. > 1 means the loop \
+             continued past the sched-died signal (early-exit dropped); \
+             0 means apply_ops was gated on liveness (would surface as \
+             a missing-apply regression).",
+        );
+    }
+
+    /// The Loop arm's apply_ops error-propagation path: an
+    /// `apply_ops` Err on iteration N at mod.rs:1175 exits the loop
+    /// via the `drain_on_err!` macro (mod.rs:1151-1161) which
+    /// propagates the Err up through `run_step`. The outer caller
+    /// at mod.rs:883-901 converts the Err to
+    /// `Ok(AssertResult { passed: false, details: [...
+    /// DetailKind::Other ...] })` so a mid-scenario failure still
+    /// returns the merged prior-step results plus the error context
+    /// rather than an opaque Err.
+    ///
+    /// Implementation: `MockCgroupOps::fail_call_at(2, "...")` fails
+    /// the third cgroup call. The cgroup call sequence is:
+    /// - Index 0: `Setup` (run_scenario at mod.rs:706-708 calls
+    ///   `cgroups.setup(&required)` before any step runs)
+    /// - Index 1: Iteration 1's SetCpuset → Ok
+    /// - Index 2: Iteration 2's SetCpuset → Err (injected)
+    ///
+    /// Expected post-state: exactly 2 SetCpuset calls (iter 1 ok +
+    /// iter 2 fail, no third iteration), result.passed=false,
+    /// DetailKind::Other detail containing the injected message.
+    /// A regression that allowed the loop to continue past the
+    /// failing iteration would surface as 3+ calls.
+    ///
+    /// SCOPE NOTE: this test does NOT verify the
+    /// `scenario.drain_all_payloads()` side effect inside
+    /// `drain_on_err!` because the fixture has no live payloads.
+    /// The drain-on-err contract at the macro level is verified by
+    /// `apply_ops_error_does_not_lose_live_payload_handles`
+    /// (sibling test in this module — grep by name) which checks
+    /// `apply_ops` itself doesn't drain (so `execute_steps`'
+    /// `drain_on_err!` is responsible). A dedicated Loop-arm drain
+    /// test with a live payload fixture is a follow-up (see queue
+    /// task for "Loop-arm drain verification with live payload
+    /// fixture") because the test infrastructure requires a custom
+    /// PayloadHandle observer to distinguish drain-side `.kill()`
+    /// from `Drop`-side SIGKILL.
+    #[test]
+    fn holdspec_loop_arm_propagates_apply_ops_error() {
+        let mock = MockCgroupOps::new();
+        // Inject an error at the THIRD cgroup call (index 2). The
+        // sequence is: Setup (index 0) + iter-1 SetCpuset (index 1,
+        // Ok) + iter-2 SetCpuset (index 2, Err injected). See
+        // run_scenario at mod.rs:706-708 for the Setup-first call.
+        mock.fail_call_at(2, "injected SetCpuset error mid-iteration");
+        let topo = mock_topo();
+        let mut ctx = mock_ctx(&mock, &topo);
+        // Long enough for >2 iterations at 30ms interval if the
+        // loop incorrectly continued past the failing iteration.
+        ctx.duration = Duration::from_millis(200);
+        let steps = vec![Step::new(
+            vec![Op::set_cpuset("err_drain_test", CpusetSpec::Llc(0))],
+            HoldSpec::loop_at(Duration::from_millis(30)),
+        )];
+        let result = execute_steps(&ctx, steps).expect(
+            "execute_steps converts step Err to Ok(passed=false) per \
+             mod.rs:883-901; the Err must NOT propagate to the caller",
+        );
+        assert!(
+            !result.passed,
+            "injected apply_ops error must mark passed=false; got \
+             passed=true with details: {:?}",
+            result.details,
+        );
+        let other_details: Vec<_> = result
+            .details
+            .iter()
+            .filter(|d| {
+                matches!(d.kind, crate::assert::DetailKind::Other)
+                    && d.message.contains("injected SetCpuset error mid-iteration")
+            })
+            .collect();
+        assert_eq!(
+            other_details.len(),
+            1,
+            "step Err must surface exactly once as DetailKind::Other \
+             carrying the injected message; got {} matching details out \
+             of {} total: {:?}",
+            other_details.len(),
+            result.details.len(),
+            result.details,
+        );
+        let set_cpuset_calls = mock
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, CgroupCall::SetCpuset(name, _) if name == "err_drain_test"))
+            .count();
+        // 1 ok + 1 fail = 2. A third call would mean the loop body
+        // ignored the Err and continued to the next interval —
+        // a regression in either drain_on_err! propagation or the
+        // run_step Loop arm's `?`-out behavior.
+        assert_eq!(
+            set_cpuset_calls, 2,
+            "loop must stop at the failed iteration (1 ok + 1 fail = 2); \
+             got {set_cpuset_calls} SetCpuset calls. Any value > 2 means \
+             the apply_ops Err was swallowed and the Loop arm continued, \
+             which would also bypass the drain_on_err! payload-kill path \
+             (silent metric loss).",
+        );
+    }
+
     // -- HoldSpec PartialEq (load-bearing semantic pins) --
 
     /// Payload participates in equality across every variant. A
