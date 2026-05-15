@@ -1006,6 +1006,91 @@ mod tests {
         );
     }
 
+    /// Real-shaped kernel scheduler crash trace fixture: a
+    /// multi-CPU trace_pipe dump representing the production
+    /// pattern when a scx scheduler triggers `scx_bpf_error` and
+    /// the kernel emits the `triggered exit kind 5` event followed
+    /// by a same-CPU body line. The fixture mirrors what an
+    /// operator captures from `cat /sys/kernel/tracing/trace_pipe`
+    /// during a real scheduler crash: pre-crash scheduler events
+    /// from multiple CPUs, the anchor + body pair, cross-CPU
+    /// interleaved events between them (per kernel/sched/ext.c the
+    /// dump_line() calls are under scx_dump_lock but trace_pipe
+    /// merges per-CPU ring buffers so unrelated tracepoint events
+    /// from other CPUs land between the pair), post-crash cleanup
+    /// records. Pins the end-to-end extraction against a fixture
+    /// that more closely resembles production input than the
+    /// hand-crafted 2-line `extract_bug_summary_*` siblings above
+    /// — guarding against a regression that handles the synthetic
+    /// shapes but breaks on real-shaped multi-CPU interleaved
+    /// input (the find_same_cpu_body_after filter at output.rs:207
+    /// is the load-bearing logic; this test exercises it through
+    /// the public entry point with input shaped like real
+    /// trace_pipe output rather than calling the helper directly).
+    #[test]
+    fn extract_bug_summary_real_shaped_scheduler_crash_trace() {
+        // Fixture mirrors the kernel's actual dump_line() emission
+        // contract at kernel/sched/ext.c:6161-6163:
+        //   "%s[%d] triggered exit kind %d:"  with current->comm,
+        //                                          current->pid,
+        //                                          ei->kind
+        //   "  %s (%s)"                       with ei->reason,
+        //                                          ei->msg
+        // Exit-kind 1025 = SCX_EXIT_ERROR_BPF (the scx_bpf_error
+        // class, per kernel/sched/ext_internal.h:39-52). Reason
+        // string "scx_bpf_error" matches ei->reason for this kind
+        // (kernel/sched/ext.c:5434-5455). The body uses paren-wrap
+        // formatting `<reason> (<msg>)` per the kernel format
+        // string, not colon-separated.
+        let dump = "\
+   scx_layered-3417  [001]   125.812043: sched_ext_dump: scx_layered[3417] triggered exit kind 1025:\n\
+        ksoftirqd/2-21    [002]   125.812055: sched_switch: prev_comm=ksoftirqd/2 prev_pid=21\n\
+        kworker/3:1-67    [003]   125.812061: sched_switch: prev_comm=kworker/3:1 prev_pid=67\n\
+   scx_layered-3417  [001]   125.812078: sched_ext_dump:   scx_bpf_error (layer_cpumask_intersect: layer=2 cpu=15 out of range (online_cpus=12))\n\
+   scx_layered-3417  [001]   125.812091: sched_ext_dump:\n\
+   scx_layered-3417  [001]   125.812094: sched_ext_dump: Backtrace:\n\
+   scx_layered-3417  [001]   125.812097: sched_ext_dump:   layer_cpumask_intersect+0x5c/0x180 [scx_layered]\n\
+   scx_layered-3417  [001]   125.812099: sched_ext_dump:   pick_idle_cpu+0x1a4/0x420 [scx_layered]\n\
+   scx_layered-3417  [001]   125.812102: sched_ext_dump:   bpf_scx_ops_select_cpu+0x90/0xc0\n\
+        kworker/0:2-89    [000]   125.812110: sched_wakeup: comm=migration/0 pid=14 prio=120\n\
+   scx_layered-3417  [001]   125.812115: sched_ext_dump: Stats:\n\
+   scx_layered-3417  [001]   125.812118: sched_ext_dump:   tasks_throttled=0 tasks_unthrottled=0\n\
+        systemd-1         [000]   125.815201: sched_process_exit: comm=scx_layered pid=3417 prio=120\n\
+";
+        let summary =
+            extract_bug_summary("", dump).expect("real-shaped multi-CPU dump must yield a summary");
+        // Exact-equality pin: extracts EXACTLY the first same-CPU
+        // body line after the anchor, with the trace_pipe envelope
+        // (`<task>-<pid> [<cpu>] <ts>: sched_ext_dump:`) stripped
+        // and the body trimmed. Pinning the whole string in one
+        // assertion subsumes every contains/!contains check the
+        // operator would otherwise sprinkle (body text present,
+        // trace_pipe prefix absent, cross-CPU events absent,
+        // Backtrace/Stats sub-sections absent, single-line). Any
+        // regression that alters one byte of the returned summary
+        // surfaces here.
+        //
+        // Regression classes this pin catches:
+        // - greedy collect of same-CPU lines past the body
+        //   (Backtrace + Stats sub-sections at [001] would
+        //   concatenate in)
+        // - filter inversion that includes cross-CPU
+        //   sched_switch / sched_wakeup events
+        // - prefix-strip drop that leaves `sched_ext_dump:` or
+        //   `[001]` in the body
+        // - anchor-line return (returning the anchor's own body
+        //   text instead of the next same-CPU line)
+        // - body trim removal (leading/trailing whitespace
+        //   smuggling)
+        assert_eq!(
+            summary,
+            "scx_bpf_error (layer_cpumask_intersect: layer=2 cpu=15 out of range (online_cpus=12))",
+            "summary must be EXACTLY the first same-CPU body line after the anchor, \
+             with the trace_pipe `<task>-<pid> [<cpu>] <ts>: sched_ext_dump:` prefix \
+             stripped and the body trimmed; got: {summary:?}",
+        );
+    }
+
     /// Whitespace-only extracted body: returns None (suppress
     /// noise). A regression that returned `Some("")` would inject
     /// empty `BUG SUMMARY:` lines into stderr — pin None here.
