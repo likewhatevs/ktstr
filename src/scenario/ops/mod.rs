@@ -8191,6 +8191,299 @@ mod tests {
         cleanup_state(&mut state);
     }
 
+    /// `CgroupDef::workers_pct(p)` stores the fraction on
+    /// `works[0].workers_pct` without pre-resolving, and leaves
+    /// `works[0].num_workers` unset. Pins the construction-time
+    /// invariant: resolution is deferred to apply-setup (which has
+    /// access to the cpuset size). A future regression that
+    /// eagerly resolved at construction would silently break the
+    /// apply-time-resolution contract; this test catches it.
+    #[test]
+    fn workers_pct_construction_stores_pct_without_resolving() {
+        let def = CgroupDef::named("cg_p").workers_pct(0.5);
+        let work = &def.works[0];
+        assert_eq!(
+            work.workers_pct,
+            Some(0.5),
+            "workers_pct must be stored verbatim at construction; got {:?}",
+            work.workers_pct,
+        );
+        assert_eq!(
+            work.num_workers, None,
+            "num_workers must be left unset at construction (apply-setup resolves); got {:?}",
+            work.num_workers,
+        );
+    }
+
+    /// `workers_pct` uses ceil() for the cpuset→worker count
+    /// resolution. Pin the rounding across four cases covering the
+    /// integer / fractional / just-above / just-below boundaries:
+    /// an exact integer product stays at that integer; any non-zero
+    /// remainder rounds UP regardless of which side of the half it
+    /// falls on. Catches a future regression to round() or floor()
+    /// rounding modes that would produce off-by-one worker counts at
+    /// boundary fractions (`round` and `floor` differ from `ceil`
+    /// in opposite directions, so these four cases pin ceil
+    /// uniquely).
+    #[test]
+    fn workers_pct_rounding_is_ceil_not_round_or_floor() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+
+        // Exact integer product: 4 * 0.5 = 2.0 (exact in IEEE 754
+        // because 0.5 = 2^-1 is exactly representable) → ceil(2.0) = 2.
+        // round and floor also give 2 here; this case doesn't
+        // distinguish ceil, it's a baseline.
+        let mut state = StepState::empty(&ctx);
+        let def_exact = CgroupDef::named("cg_exact")
+            .with_cpuset(CpusetSpec::Llc(0))
+            .workers_pct(0.5);
+        apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def_exact)).unwrap();
+        let handle = &state
+            .handles
+            .iter()
+            .find(|(n, _)| n == "cg_exact")
+            .expect("workload spawned")
+            .1;
+        assert_eq!(
+            handle.worker_pids().len(),
+            2,
+            "workers_pct(0.5) on 4 CPUs (exact 2.0) must produce 2 workers",
+        );
+        cleanup_state(&mut state);
+
+        // Mid-fractional product: 4 * 0.6 ≈ 2.3999... → ceil = 3.
+        // round (nearest) gives 2; floor gives 2. ceil gives 3.
+        // Distinguishes ceil from round.
+        let mut state = StepState::empty(&ctx);
+        let def_mid = CgroupDef::named("cg_mid")
+            .with_cpuset(CpusetSpec::Llc(0))
+            .workers_pct(0.6);
+        apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def_mid)).unwrap();
+        let handle = &state
+            .handles
+            .iter()
+            .find(|(n, _)| n == "cg_mid")
+            .expect("workload spawned")
+            .1;
+        assert_eq!(
+            handle.worker_pids().len(),
+            3,
+            "workers_pct(0.6) on 4 CPUs (≈2.4) must ceil to 3 workers; round (2) or floor (2) would be wrong",
+        );
+        cleanup_state(&mut state);
+
+        // Just above an integer: 4 * 0.51 ≈ 2.04 → ceil = 3. Pins
+        // that ANY non-zero remainder rounds up, not just near-half.
+        let mut state = StepState::empty(&ctx);
+        let def_just_over = CgroupDef::named("cg_over")
+            .with_cpuset(CpusetSpec::Llc(0))
+            .workers_pct(0.51);
+        apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def_just_over)).unwrap();
+        let handle = &state
+            .handles
+            .iter()
+            .find(|(n, _)| n == "cg_over")
+            .expect("workload spawned")
+            .1;
+        assert_eq!(
+            handle.worker_pids().len(),
+            3,
+            "workers_pct(0.51) on 4 CPUs (≈2.04) must ceil to 3 workers; round (2) or floor (2) would be wrong",
+        );
+        cleanup_state(&mut state);
+
+        // Just below an integer: 4 * 0.49 ≈ 1.96 → ceil = 2.
+        // floor gives 1; round gives 2. Distinguishes ceil/round
+        // from floor — completes the rounding-mode coverage.
+        let mut state = StepState::empty(&ctx);
+        let def_just_under = CgroupDef::named("cg_under")
+            .with_cpuset(CpusetSpec::Llc(0))
+            .workers_pct(0.49);
+        apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def_just_under)).unwrap();
+        let handle = &state
+            .handles
+            .iter()
+            .find(|(n, _)| n == "cg_under")
+            .expect("workload spawned")
+            .1;
+        assert_eq!(
+            handle.worker_pids().len(),
+            2,
+            "workers_pct(0.49) on 4 CPUs (≈1.96) must ceil to 2 workers; floor (1) would be wrong",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// Setup-spawned workers (workers from apply_setup-time
+    /// `workers_pct` resolution) keep their pid set across
+    /// subsequent `Op::SetCpuset` cpuset changes. Pins that
+    /// `Op::SetCpuset`'s apply arm at mod.rs:2063-2074 is NOT a
+    /// `resolve_workers_pct` call site — the arm validates +
+    /// resolves the CpusetSpec, calls `ctx.cgroups.set_cpuset`,
+    /// and records the new cpuset via `state.record_cpuset`, but
+    /// touches no WorkSpec / handle state.
+    ///
+    /// `resolve_workers_pct` does have TWO call sites overall
+    /// (apply_setup at mod.rs:1772 and Op::Spawn at mod.rs:2100),
+    /// so a test author who issues an `Op::Spawn` AFTER an
+    /// `Op::SetCpuset` will get fresh resolution against the
+    /// then-current cpuset — that's the Op::Spawn integration
+    /// layer's responsibility and is verified by `op_spawn_*` tests,
+    /// not here. This test catches a future regression that adds
+    /// re-resolution INTO the Op::SetCpuset apply branch
+    /// (re-counting apply-setup workers when the cpuset narrows).
+    ///
+    /// The test drives Op::SetCpuset through `apply_ops_test` (the
+    /// real Op-dispatch wrapper) instead of calling
+    /// `ctx.cgroups.set_cpuset` directly — that distinction matters
+    /// because a regression that added `resolve_workers_pct` inside
+    /// the Op match arm would NOT be caught by a direct set_cpuset
+    /// call that bypasses dispatch.
+    #[test]
+    fn workers_pct_setup_workers_survive_op_setcpuset_narrowing() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let def = CgroupDef::named("cg_stable")
+            .with_cpuset(CpusetSpec::Llc(0))
+            .workers_pct(0.5);
+        apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def)).unwrap();
+        let initial_count = state
+            .handles
+            .iter()
+            .find(|(n, _)| n == "cg_stable")
+            .expect("workload spawned")
+            .1
+            .worker_pids()
+            .len();
+        assert_eq!(
+            initial_count, 2,
+            "baseline: workers_pct(0.5) on Llc(0)=4 CPUs → ceil(4*0.5)=2 workers",
+        );
+
+        // Drive Op::SetCpuset through the real apply_ops dispatch
+        // (NOT just ctx.cgroups.set_cpuset, which would bypass the
+        // Op match arm where a regression might add re-resolution).
+        let narrower: std::collections::BTreeSet<usize> = [0usize, 1].into_iter().collect();
+        apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::SetCpuset {
+                cgroup: "cg_stable".into(),
+                cpus: CpusetSpec::Exact(narrower.clone()),
+            }],
+        )
+        .expect("Op::SetCpuset applies");
+
+        // Verify the narrowing actually took effect — without this
+        // assertion, a silently-no-op set_cpuset would make the
+        // worker-stability claim trivially true. StepState's
+        // `cpusets` HashMap is the step-local cpuset bookkeeping
+        // that Op::SetCpuset's `state.record_cpuset` call writes to.
+        assert_eq!(
+            state
+                .cpusets
+                .get("cg_stable")
+                .expect("cg_stable has recorded cpuset"),
+            &narrower,
+            "Op::SetCpuset must persist the narrower set in state.cpusets via record_cpuset",
+        );
+
+        let after_count = state
+            .handles
+            .iter()
+            .find(|(n, _)| n == "cg_stable")
+            .expect("workload still present")
+            .1
+            .worker_pids()
+            .len();
+        assert_eq!(
+            after_count, initial_count,
+            "Op::SetCpuset apply arm must NOT re-resolve workers_pct; \
+             setup-spawned worker count must remain {initial_count}; got {after_count}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// Pathological `workers_pct` values rejected at construction:
+    /// NaN, INFINITY, negative values, and zero all panic via
+    /// `CgroupDef::workers_pct`'s `assert!` at types.rs:1097-1100.
+    /// Pin all four rejection paths so a future regression that
+    /// loosens the gate (e.g. accepts NaN as "use default") fails
+    /// here loudly.
+    #[test]
+    fn workers_pct_pathological_finite_rejected_at_construction() {
+        // Non-finite NaN → CgroupDef::workers_pct panics; std::panic::catch_unwind verifies.
+        let nan_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = CgroupDef::named("cg_nan").workers_pct(f64::NAN);
+        }));
+        assert!(
+            nan_panic.is_err(),
+            "CgroupDef::workers_pct(NaN) must panic at construction",
+        );
+
+        let inf_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = CgroupDef::named("cg_inf").workers_pct(f64::INFINITY);
+        }));
+        assert!(
+            inf_panic.is_err(),
+            "CgroupDef::workers_pct(INFINITY) must panic at construction",
+        );
+
+        let neg_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = CgroupDef::named("cg_neg").workers_pct(-1.0);
+        }));
+        assert!(
+            neg_panic.is_err(),
+            "CgroupDef::workers_pct(-1.0) must panic at construction",
+        );
+
+        let zero_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = CgroupDef::named("cg_zero").workers_pct(0.0);
+        }));
+        assert!(
+            zero_panic.is_err(),
+            "CgroupDef::workers_pct(0.0) must panic at construction",
+        );
+    }
+
+    /// A very large finite `workers_pct` (e.g. `1e100`) passes the
+    /// finite + positive construction gate but produces `usize::MAX`
+    /// when `resolve_workers_pct` evaluates
+    /// `(cpuset_cpus as f64 * pct).ceil() as usize` — Rust's
+    /// saturating float-to-int cast (RFC 2484, stable since 1.45)
+    /// clamps any finite f64 exceeding the integer range to the
+    /// bound. The product `4.0 * 1e100 = 4e100` is finite (well
+    /// below `f64::MAX ≈ 1.798e308`) but far exceeds `usize::MAX`
+    /// (~`1.844e19` on 64-bit), so the cast saturates.
+    ///
+    /// Calls `resolve_workers_pct` directly on a constructed
+    /// `WorkSpec` — pins the FRAMEWORK contract (current behavior
+    /// returns `Ok(num_workers=Some(usize::MAX))`). A future
+    /// regression that added a saturation guard
+    /// (e.g. `if scaled == usize::MAX { bail!("too large") }`)
+    /// would flip this to `Err` and trip the test. The spawn path
+    /// is NOT exercised — spawning `usize::MAX` workers would hang
+    /// the host. See follow-up task for the OOM-risk doc warning
+    /// the framework currently lacks on `workers_pct`.
+    #[test]
+    fn workers_pct_pathological_finite_large_saturates_usize() {
+        let work = crate::workload::WorkSpec::default().workers_pct(1e100);
+        let resolved = work
+            .resolve_workers_pct(4, "cg_saturate")
+            .expect("current framework does not gate against usize::MAX saturation");
+        assert_eq!(
+            resolved.num_workers,
+            Some(usize::MAX),
+            "extreme pct saturates `num_workers` to `usize::MAX` per Rust's saturating \
+             float-to-int `as` cast (RFC 2484); got {:?}",
+            resolved.num_workers,
+        );
+    }
+
     /// `workers_pct` against an empty cpuset (Exact({})) resolves to
     /// 0 workers and bails with a diagnostic that names the cpuset
     /// size and the requested fraction. Pin per adversary's V1+V3
