@@ -313,8 +313,37 @@ How long to hold after a step completes:
 | `Fixed(Duration)` | Fixed time |
 | `Loop { interval }` | Repeat ops at interval until time runs out |
 
-`HoldSpec::FULL` is a constant for `Frac(1.0)` (hold for the full
-scenario duration).
+Construct via the const-fn sugar: `HoldSpec::frac(0.5)`,
+`HoldSpec::fixed(Duration::from_secs(5))`, `HoldSpec::loop_at(
+Duration::from_secs(2))`. `HoldSpec::FULL` is a constant for
+`Frac(1.0)` (hold for the full scenario duration).
+
+### Loop ops to drive periodic state changes
+
+Use `HoldSpec::loop_at(interval)` when you want a Step's ops to
+fire repeatedly until the scenario time budget is exhausted, not
+just once. This is the natural shape for "every N seconds, do X"
+patterns that drive periodic churn without writing a host-thread
+loop. Example: snapshot host state at Step entry and then every
+2 seconds thereafter, capturing periodic behavior across the
+scenario:
+
+```rust,ignore
+Step::new(
+    vec![Op::snapshot("periodic")],
+    HoldSpec::loop_at(Duration::from_secs(2)),
+)
+```
+
+The Step's setup (Step::with_defs) runs once at Step entry; only
+the ops repeat. A `Loop` Step that pairs setup with periodic ops
+runs the setup ONCE, then applies the ops vec immediately and
+again every interval until the scenario completes. The Backdrop
+persists across the loop (and across the entire scenario); prior
+Steps' step-local cgroups/handles/payloads were torn down at
+their own step boundaries before this Step started, so only
+Backdrop-owned state and this Step's own setup are live during
+each loop iteration.
 
 ## execute_defs
 
