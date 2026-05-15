@@ -615,6 +615,16 @@ fn required_controllers(
         ) {
             set.insert(Controller::Cpuset);
         }
+        // AddCgroupDef carries a full CgroupDef whose knobs may
+        // require any of the same controllers absorb_def covers. The
+        // op-applied def goes through apply_setup at op-execute time,
+        // which writes to those controller files; the parent's
+        // subtree_control must already have the controllers enabled
+        // by then, so absorb the def's needs into the pre-scenario
+        // controller setup the same way step-local CgroupDefs do.
+        if let Op::AddCgroupDef { def } = op {
+            absorb_def(set, def);
+        }
     }
     let mut set = BTreeSet::new();
     for def in &backdrop.cgroups {
@@ -2094,6 +2104,22 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 }
                 state.target_cgroups().add_cgroup_no_cpuset(name)?;
             }
+            Op::AddCgroupDef { def } => {
+                // Delegate to `apply_setup` so cpuset, cpu / memory /
+                // io / pids knobs, and worker spawning all run
+                // through the same code path that a Step's
+                // `with_defs` setup pass uses. The collision check
+                // and workers_pct / empty-cpuset diagnostics carry
+                // over via the delegation; controller-required
+                // tracking is a sibling concern wired separately at
+                // `required_controllers` (see absorb_op's
+                // Op::AddCgroupDef arm) so the parent's
+                // subtree_control has the def's controllers enabled
+                // before this dispatch runs. The only difference
+                // from Step::with_defs is the timing (apply-ops vs
+                // setup).
+                apply_setup(ctx, state, std::slice::from_ref(def))?;
+            }
             Op::RemoveCgroup { cgroup } => {
                 // A Step's ops must not remove a Backdrop-owned
                 // cgroup — later Steps expect the Backdrop's cgroups
@@ -3396,13 +3422,20 @@ mod tests {
             metric_bounds: None,
         };
         assert_eq!(Op::AddCgroup { name: "a".into() }.discriminant(), 0);
-        assert_eq!(Op::RemoveCgroup { cgroup: "a".into() }.discriminant(), 1);
+        assert_eq!(
+            Op::AddCgroupDef {
+                def: CgroupDef::named("a")
+            }
+            .discriminant(),
+            1
+        );
+        assert_eq!(Op::RemoveCgroup { cgroup: "a".into() }.discriminant(), 2);
         assert_eq!(
             Op::SpawnHost {
                 work: Default::default()
             }
             .discriminant(),
-            8
+            9
         );
         assert_eq!(
             Op::MoveAllTasks {
@@ -3410,7 +3443,7 @@ mod tests {
                 to: "b".into()
             }
             .discriminant(),
-            9
+            10
         );
         assert_eq!(
             Op::RunPayload {
@@ -3419,7 +3452,7 @@ mod tests {
                 cgroup: None,
             }
             .discriminant(),
-            10,
+            11,
         );
         assert_eq!(
             Op::WaitPayload {
@@ -3427,7 +3460,7 @@ mod tests {
                 cgroup: None,
             }
             .discriminant(),
-            11,
+            12,
         );
         assert_eq!(
             Op::KillPayload {
@@ -3435,23 +3468,23 @@ mod tests {
                 cgroup: None,
             }
             .discriminant(),
-            12,
+            13,
         );
-        assert_eq!(Op::FreezeCgroup { cgroup: "a".into() }.discriminant(), 13,);
-        assert_eq!(Op::UnfreezeCgroup { cgroup: "a".into() }.discriminant(), 14,);
+        assert_eq!(Op::FreezeCgroup { cgroup: "a".into() }.discriminant(), 14,);
+        assert_eq!(Op::UnfreezeCgroup { cgroup: "a".into() }.discriminant(), 15,);
         assert_eq!(
             Op::Snapshot {
                 name: "snap".into()
             }
             .discriminant(),
-            15,
+            16,
         );
         assert_eq!(
             Op::WatchSnapshot {
                 symbol: "kernel.x".into()
             }
             .discriminant(),
-            16,
+            17,
         );
     }
 
@@ -6734,6 +6767,281 @@ mod tests {
         );
     }
 
+    /// `Op::add_cgroup_def(def)` constructor wraps the `CgroupDef`
+    /// in the `AddCgroupDef` variant without mutation. Pins the
+    /// constructor contract so a future refactor that, e.g., merges
+    /// AddCgroup and AddCgroupDef into one variant or splits the def
+    /// into separate fields surfaces here.
+    #[test]
+    fn op_add_cgroup_def_constructor_wraps_def_unmutated() {
+        let def = CgroupDef::named("midstep").workers(3);
+        let op = Op::add_cgroup_def(def.clone());
+        match op {
+            Op::AddCgroupDef { def: out } => {
+                assert_eq!(out.name, def.name);
+                assert_eq!(out.merged_works().len(), def.merged_works().len());
+                assert_eq!(out.merged_works()[0].num_workers, Some(3));
+            }
+            other => panic!("expected AddCgroupDef, got {other:?}"),
+        }
+    }
+
+    /// `Op::AddCgroupDef` dispatches through `apply_setup` so the
+    /// cgroup is created in cgroupfs and the def's name is tracked
+    /// in step-local state — same observable result as declaring the
+    /// def in `Step::with_defs`, just at apply-ops time instead of
+    /// the step's setup pass.
+    #[test]
+    fn op_add_cgroup_def_creates_cgroup_through_apply_setup() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::add_cgroup_def(CgroupDef::named("cg_midstep"))],
+        )
+        .expect("AddCgroupDef must succeed for a fresh name");
+        assert!(
+            state
+                .cgroups
+                .names()
+                .iter()
+                .any(|n| n == "cg_midstep"),
+            "step-local tracking must record the AddCgroupDef name; got: {:?}",
+            state.cgroups.names(),
+        );
+    }
+
+    /// `Op::AddCgroupDef` reuses `apply_setup`'s dedup check, so a
+    /// name that already lives on the Backdrop is rejected with the
+    /// same collision diagnostic operators see from a step-local
+    /// `Step::with_defs` collision.
+    #[test]
+    fn op_add_cgroup_def_rejects_collision_with_backdrop() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut step_state = StepState::empty(&ctx);
+        let mut backdrop_state = BackdropState::empty(&ctx);
+        backdrop_state
+            .cgroups
+            .add_cgroup_no_cpuset("persistent")
+            .expect("add backdrop cgroup");
+        let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+        let err = apply_ops(
+            &ctx,
+            &mut scenario,
+            &[Op::add_cgroup_def(CgroupDef::named("persistent"))],
+        )
+        .expect_err("AddCgroupDef must reject a name already tracked by the Backdrop");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("'persistent'") && msg.contains("collides"),
+            "error must name the colliding cgroup and explain the collision; got: {msg}",
+        );
+    }
+
+    /// `required_controllers` picks up the controllers needed by a
+    /// `CgroupDef` embedded in `Op::AddCgroupDef`, so the parent's
+    /// `subtree_control` enables Cpuset before the op runs and the
+    /// cpuset write at apply-ops time doesn't fail with ENOENT on
+    /// the controller file. Without this absorb pass, a scenario
+    /// whose only cpuset user is an `Op::AddCgroupDef` would skip
+    /// Cpuset controller enablement entirely.
+    #[test]
+    fn required_controllers_absorbs_add_cgroup_def_cpuset() {
+        use crate::cgroup::Controller;
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let steps = vec![Step::new(
+            vec![Op::add_cgroup_def(
+                CgroupDef::named("cg_pinned").with_cpuset(CpusetSpec::disjoint(0, 2)),
+            )],
+            HoldSpec::fixed(Duration::from_millis(1)),
+        )];
+        let needed = required_controllers(&ctx, &backdrop::Backdrop::EMPTY, &steps);
+        assert!(
+            needed.contains(&Controller::Cpuset),
+            "AddCgroupDef carrying a cpuset must require Cpuset controller; got: {needed:?}",
+        );
+    }
+
+    /// `Op::AddCgroupDef` carrying `workers(N)` spawns N workers
+    /// and emits the resulting `MoveTasks(_, N)` call against the
+    /// embedded def's cgroup — proves the delegation to
+    /// `apply_setup` invokes the same worker-spawn + move-into-cgroup
+    /// path that step-local CgroupDefs use. Mirrors
+    /// `apply_setup_moves_spawned_tasks_into_cgroup` (which exercises
+    /// the setup-time entry) but enters via the apply-ops entry.
+    #[test]
+    fn op_add_cgroup_def_spawns_workers_and_moves_into_cgroup() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::add_cgroup_def(
+                CgroupDef::named("cg_workers").workers(2),
+            )],
+        )
+        .expect("AddCgroupDef with workers must succeed against mock");
+        let calls = mock.calls();
+        assert!(
+            calls.contains(&CgroupCall::MoveTasks("cg_workers".to_string(), 2)),
+            "AddCgroupDef must move 2 spawned worker pids into 'cg_workers'; got: {calls:?}",
+        );
+    }
+
+    /// `Op::AddCgroupDef` carrying a cpuset spec emits a SetCpuset
+    /// mock call against the embedded def's resolved CPU set —
+    /// proves the delegation to `apply_setup` writes the cpuset
+    /// through `CgroupOps::set_cpuset`, not just stages controller
+    /// state. Regression class: a future refactor that bypasses
+    /// apply_setup's cpuset-write loop for the AddCgroupDef path
+    /// would slip past `required_controllers_absorbs_add_cgroup_def_cpuset`
+    /// (which only verifies the controller-bitmask side) — this
+    /// test pins the actual write.
+    #[test]
+    fn op_add_cgroup_def_writes_embedded_cpuset_to_mock() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::add_cgroup_def(
+                CgroupDef::named("cg_pinned").with_cpuset(CpusetSpec::disjoint(0, 2)),
+            )],
+        )
+        .expect("AddCgroupDef with cpuset must succeed against mock");
+        let calls = mock.calls();
+        let has_set_cpuset = calls.iter().any(|c| {
+            matches!(c, CgroupCall::SetCpuset(name, _) if name == "cg_pinned")
+        });
+        assert!(
+            has_set_cpuset,
+            "AddCgroupDef must emit SetCpuset for 'cg_pinned' via apply_setup; got: {calls:?}",
+        );
+    }
+
+    /// `Op::AddCgroupDef` whose embedded def configures
+    /// `workers_pct` against a cpuset that resolves to zero CPUs
+    /// surfaces the same diagnostic apply_setup produces in the
+    /// step-setup path — the per-pct error message naming the
+    /// cgroup, the pct value, and the empty-cpuset condition.
+    /// Regression class: a refactor that short-circuits the
+    /// workers_pct empty-cpuset check for the AddCgroupDef path
+    /// would let a misconfigured def silently spawn 0 workers.
+    #[test]
+    fn op_add_cgroup_def_workers_pct_empty_cpuset_bails() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        // CpusetSpec::Exact with an empty set resolves to 0 CPUs;
+        // workers_pct on top of that hits the dedicated diagnostic.
+        let err = apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::add_cgroup_def(
+                CgroupDef::named("cg_pct")
+                    .with_cpuset(CpusetSpec::exact(std::iter::empty::<usize>()))
+                    .workers_pct(0.5),
+            )],
+        )
+        .expect_err("workers_pct + empty cpuset must bail through AddCgroupDef");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("cg_pct") && msg.contains("workers_pct"),
+            "diagnostic must name the cgroup and the workers_pct condition; got: {msg}",
+        );
+    }
+
+    /// `Op::AddCgroupDef` after a prior `Op::AddCgroup` with the
+    /// same name in one step is rejected via apply_setup's
+    /// collision check (delegation transmits the dedup contract).
+    #[test]
+    fn op_add_cgroup_def_collides_with_prior_add_cgroup_in_same_step() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let err = apply_ops_test(
+            &ctx,
+            &mut state,
+            &[
+                Op::add_cgroup("shared"),
+                Op::add_cgroup_def(CgroupDef::named("shared")),
+            ],
+        )
+        .expect_err("AddCgroupDef must reject a name already tracked by a prior AddCgroup");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("'shared'") && msg.contains("collides"),
+            "error must name the colliding cgroup and explain the collision; got: {msg}",
+        );
+    }
+
+    /// Two `Op::AddCgroupDef` ops with the same name in one step
+    /// are rejected — second op hits apply_setup's collision check
+    /// against the first op's step-local tracking entry.
+    #[test]
+    fn op_add_cgroup_def_collides_with_prior_add_cgroup_def_in_same_step() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let err = apply_ops_test(
+            &ctx,
+            &mut state,
+            &[
+                Op::add_cgroup_def(CgroupDef::named("dup")),
+                Op::add_cgroup_def(CgroupDef::named("dup")),
+            ],
+        )
+        .expect_err("second AddCgroupDef must reject the duplicated name");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("'dup'") && msg.contains("collides"),
+            "error must name the duplicated cgroup and explain the collision; got: {msg}",
+        );
+    }
+
+    /// `Op::AddCgroup` after a prior `Op::AddCgroupDef` with the
+    /// same name in one step is rejected via the AddCgroup arm's
+    /// `cgroup_name_is_tracked` check — symmetric of the
+    /// AddCgroup-then-AddCgroupDef ordering. Without symmetric
+    /// coverage, a refactor that scoped tracking differently
+    /// per-arm could let a name escape the dedup in one ordering
+    /// only.
+    #[test]
+    fn op_add_cgroup_collides_with_prior_add_cgroup_def_in_same_step() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let err = apply_ops_test(
+            &ctx,
+            &mut state,
+            &[
+                Op::add_cgroup_def(CgroupDef::named("shared")),
+                Op::add_cgroup("shared"),
+            ],
+        )
+        .expect_err("AddCgroup must reject a name already tracked by a prior AddCgroupDef");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("'shared'") && msg.contains("collides"),
+            "error must name the colliding cgroup and explain the collision; got: {msg}",
+        );
+    }
+
     /// `MoveAllTasks` must re-key EVERY workload handle whose
     /// current name matches `from`, not just the first. Multiple
     /// handles on the same cgroup arise when a scenario issues two
@@ -7013,6 +7321,7 @@ mod tests {
         let w = WorkSpec::default();
         let constructed: Vec<Op> = vec![
             Op::add_cgroup("a"),
+            Op::add_cgroup_def(CgroupDef::named("midstep")),
             Op::remove_cgroup("a"),
             Op::set_cpuset("a", CpusetSpec::Llc(0)),
             Op::clear_cpuset("a"),
@@ -7038,26 +7347,27 @@ mod tests {
         // without a constructor call above leaves one slot `false`,
         // and adding a variant without a match arm below fails to
         // compile (no `_ =>` on purpose).
-        let mut seen = [false; 17];
+        let mut seen = [false; 18];
         for op in &constructed {
             let idx = match op {
                 Op::AddCgroup { .. } => 0,
-                Op::RemoveCgroup { .. } => 1,
-                Op::SetCpuset { .. } => 2,
-                Op::ClearCpuset { .. } => 3,
-                Op::SwapCpusets { .. } => 4,
-                Op::Spawn { .. } => 5,
-                Op::StopCgroup { .. } => 6,
-                Op::SetAffinity { .. } => 7,
-                Op::SpawnHost { .. } => 8,
-                Op::MoveAllTasks { .. } => 9,
-                Op::RunPayload { .. } => 10,
-                Op::WaitPayload { .. } => 11,
-                Op::KillPayload { .. } => 12,
-                Op::FreezeCgroup { .. } => 13,
-                Op::UnfreezeCgroup { .. } => 14,
-                Op::Snapshot { .. } => 15,
-                Op::WatchSnapshot { .. } => 16,
+                Op::AddCgroupDef { .. } => 1,
+                Op::RemoveCgroup { .. } => 2,
+                Op::SetCpuset { .. } => 3,
+                Op::ClearCpuset { .. } => 4,
+                Op::SwapCpusets { .. } => 5,
+                Op::Spawn { .. } => 6,
+                Op::StopCgroup { .. } => 7,
+                Op::SetAffinity { .. } => 8,
+                Op::SpawnHost { .. } => 9,
+                Op::MoveAllTasks { .. } => 10,
+                Op::RunPayload { .. } => 11,
+                Op::WaitPayload { .. } => 12,
+                Op::KillPayload { .. } => 13,
+                Op::FreezeCgroup { .. } => 14,
+                Op::UnfreezeCgroup { .. } => 15,
+                Op::Snapshot { .. } => 16,
+                Op::WatchSnapshot { .. } => 17,
             };
             seen[idx] = true;
         }

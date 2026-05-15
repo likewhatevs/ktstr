@@ -35,8 +35,26 @@ use crate::workload::{AffinityIntent, WorkSpec, WorkType};
 #[strum_discriminants(vis(pub))]
 #[non_exhaustive]
 pub enum Op {
-    /// Create a new cgroup under the managed cgroup parent.
+    /// Create a new cgroup under the managed cgroup parent, with no
+    /// cpuset, no controller knobs, and no workers — the
+    /// operator-friendly way to declare an empty move-target cgroup
+    /// that later receives tasks via [`Op::MoveAllTasks`] or
+    /// similar. For mid-step cgroups that need cpuset / cpu /
+    /// memory / io / pids / workers, use [`Op::add_cgroup_def`]
+    /// instead; for setup-time cgroups with the same knobs, declare
+    /// via [`Step::with_defs`].
     AddCgroup { name: Cow<'static, str> },
+    /// Create a cgroup mid-step from a full [`CgroupDef`] — cpuset,
+    /// cpu/memory/io/pids knobs, and worker spawns all apply in one
+    /// op, mirroring the way `Step::with_defs` materializes a
+    /// step-local CgroupDef at setup time. Use this when the
+    /// add-cgroup-with-cpuset-and-workers sequence needs to happen
+    /// after the step's setup pass (e.g. driven by an earlier op's
+    /// observed state) instead of as part of the step's setup. The
+    /// embedded `def` is dedup-checked the same way `apply_setup`
+    /// rejects collisions with prior Backdrop or step-local
+    /// CgroupDef declarations.
+    AddCgroupDef { def: CgroupDef },
     /// Remove a cgroup (stops its workers first).
     RemoveCgroup { cgroup: Cow<'static, str> },
     /// Set a cgroup's cpuset to the resolved CPU set.
@@ -1894,22 +1912,23 @@ impl OpKind {
     pub(super) fn bit_index(self) -> u32 {
         match self {
             OpKind::AddCgroup => 0,
-            OpKind::RemoveCgroup => 1,
-            OpKind::SetCpuset => 2,
-            OpKind::ClearCpuset => 3,
-            OpKind::SwapCpusets => 4,
-            OpKind::Spawn => 5,
-            OpKind::StopCgroup => 6,
-            OpKind::SetAffinity => 7,
-            OpKind::SpawnHost => 8,
-            OpKind::MoveAllTasks => 9,
-            OpKind::RunPayload => 10,
-            OpKind::WaitPayload => 11,
-            OpKind::KillPayload => 12,
-            OpKind::FreezeCgroup => 13,
-            OpKind::UnfreezeCgroup => 14,
-            OpKind::Snapshot => 15,
-            OpKind::WatchSnapshot => 16,
+            OpKind::AddCgroupDef => 1,
+            OpKind::RemoveCgroup => 2,
+            OpKind::SetCpuset => 3,
+            OpKind::ClearCpuset => 4,
+            OpKind::SwapCpusets => 5,
+            OpKind::Spawn => 6,
+            OpKind::StopCgroup => 7,
+            OpKind::SetAffinity => 8,
+            OpKind::SpawnHost => 9,
+            OpKind::MoveAllTasks => 10,
+            OpKind::RunPayload => 11,
+            OpKind::WaitPayload => 12,
+            OpKind::KillPayload => 13,
+            OpKind::FreezeCgroup => 14,
+            OpKind::UnfreezeCgroup => 15,
+            OpKind::Snapshot => 16,
+            OpKind::WatchSnapshot => 17,
         }
     }
 }
@@ -1918,6 +1937,22 @@ impl Op {
     /// Create a new cgroup.
     pub fn add_cgroup(name: impl Into<Cow<'static, str>>) -> Self {
         Op::AddCgroup { name: name.into() }
+    }
+
+    /// Create a cgroup mid-step from a full [`CgroupDef`].
+    ///
+    /// Mirrors `Step::with_defs(vec![def], ...)` semantics — applies
+    /// the def's cpuset / cpu / memory / io / pids knobs and spawns
+    /// its workers in one op — but at apply-ops time rather than
+    /// during the step's setup pass. Use when the cgroup's
+    /// declaration needs to depend on state observed by an earlier
+    /// op in the same step (e.g. spawn a per-LLC cgroup after an
+    /// `Op::SetCpuset` narrows the parent's available CPUs). The
+    /// dedup check mirrors `apply_setup`'s rejection of name
+    /// collisions with prior Backdrop or step-local CgroupDef
+    /// declarations.
+    pub fn add_cgroup_def(def: CgroupDef) -> Self {
+        Op::AddCgroupDef { def }
     }
 
     /// Remove a cgroup (stops its workers first).
