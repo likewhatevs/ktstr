@@ -1739,7 +1739,17 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
         let mut resolved_works: Vec<crate::workload::WorkSpec> =
             Vec::with_capacity(effective_works.len());
         for work in &effective_works {
-            let n = crate::scenario::resolve_num_workers(work, ctx.workers_per_cgroup, &def.name)?;
+            // Resolve `workers_pct` against the cgroup's cpuset (or
+            // the topology-usable cpuset when the cgroup inherits)
+            // and synthesize a `num_workers` value before the rest of
+            // the dispatch. Shares the resolution helper with
+            // Op::Spawn so the two paths produce identical worker
+            // counts for the same `(pct, cpuset_size)` pair.
+            let cpuset_size = cgroup_cpuset
+                .as_ref()
+                .map_or_else(|| ctx.topo.usable_cpuset().len(), |s| s.len());
+            let work = work.clone().resolve_workers_pct(cpuset_size, &def.name)?;
+            let n = crate::scenario::resolve_num_workers(&work, ctx.workers_per_cgroup, &def.name)?;
             let effective_work_type = crate::workload::resolve_work_type(
                 &work.work_type,
                 ctx.work_type_override.as_ref(),
@@ -1764,6 +1774,7 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
                 uid: work.uid,
                 gid: work.gid,
                 numa_node: work.numa_node,
+                workers_pct: None,
             });
         }
 
@@ -2061,8 +2072,12 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 if let Err(reason) = work.mem_policy.validate() {
                     anyhow::bail!("cgroup '{}': {}", cgroup, reason);
                 }
-                let n = crate::scenario::resolve_num_workers(work, ctx.workers_per_cgroup, cgroup)?;
                 let cgroup_cpuset: Option<BTreeSet<usize>> = state.lookup_cpuset(cgroup).cloned();
+                let cpuset_size = cgroup_cpuset
+                    .as_ref()
+                    .map_or_else(|| ctx.topo.usable_cpuset().len(), |s| s.len());
+                let work = work.clone().resolve_workers_pct(cpuset_size, cgroup)?;
+                let n = crate::scenario::resolve_num_workers(&work, ctx.workers_per_cgroup, cgroup)?;
                 if let Some(ref resolved) = cgroup_cpuset {
                     validate_mempolicy_cpuset(
                         &work.mem_policy,
@@ -7970,5 +7985,321 @@ mod tests {
              into cg_zero; got: {calls:?}",
         );
         cleanup_state(&mut state);
+    }
+
+    /// `CgroupDef::workers_pct(0.5)` on a cgroup with no explicit
+    /// cpuset resolves against the topology-usable cpuset and
+    /// produces `ceil(usable_cpus * 0.5)` workers. The mock_topo's
+    /// 4-CPU topology reserves the last CPU so usable=3 → ceil(3*0.5)=2.
+    /// Pins the no-cpuset path through the apply_setup pre-resolution.
+    #[test]
+    fn workers_pct_no_cpuset_resolves_against_usable_topology() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let def = CgroupDef::named("cg_p").workers_pct(0.5);
+        apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def)).unwrap();
+        let handle = &state
+            .handles
+            .iter()
+            .find(|(n, _)| n == "cg_p")
+            .expect("workload spawned")
+            .1;
+        assert_eq!(
+            handle.worker_pids().len(),
+            2,
+            "workers_pct(0.5) on usable=3 CPUs must resolve to ceil(3*0.5)=2 \
+             workers; got {} workers",
+            handle.worker_pids().len(),
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// `CgroupDef::workers_pct(0.34)` on an LLC-restricted cpuset
+    /// (size 4 here because the mock topology is 1 LLC × 4 cores)
+    /// resolves to ceil(4 * 0.34) = 2 workers. Pins the with-cpuset
+    /// path: workers_pct denominator is the resolved cpuset size,
+    /// not the full topology.
+    #[test]
+    fn workers_pct_with_cpuset_resolves_against_cpuset_size() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let def = CgroupDef::named("cg_p")
+            .with_cpuset(CpusetSpec::Llc(0))
+            .workers_pct(0.34);
+        apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def)).unwrap();
+        let handle = &state
+            .handles
+            .iter()
+            .find(|(n, _)| n == "cg_p")
+            .expect("workload spawned")
+            .1;
+        assert_eq!(
+            handle.worker_pids().len(),
+            2,
+            "workers_pct(0.34) on Llc(0)=4 CPUs must resolve to ceil(4*0.34)=2 \
+             workers; got {} workers",
+            handle.worker_pids().len(),
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// `workers_pct(2.0)` accepts oversubscription. 4-CPU LLC * 2.0 = 8.
+    /// Pins that >1.0 fractions are NOT rejected at apply time.
+    #[test]
+    fn workers_pct_above_one_accepts_oversubscription() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let def = CgroupDef::named("cg_p")
+            .with_cpuset(CpusetSpec::Llc(0))
+            .workers_pct(2.0);
+        apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def)).unwrap();
+        let handle = &state
+            .handles
+            .iter()
+            .find(|(n, _)| n == "cg_p")
+            .expect("workload spawned")
+            .1;
+        assert_eq!(
+            handle.worker_pids().len(),
+            8,
+            "workers_pct(2.0) on Llc(0)=4 CPUs must resolve to ceil(4*2.0)=8 \
+             workers (oversubscription); got {}",
+            handle.worker_pids().len(),
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// Setting both `workers(N)` and `workers_pct(p)` is rejected at
+    /// apply-setup time regardless of the builder-call order. Pins
+    /// BOTH orderings per adversary's mutex-asymmetry concern.
+    #[test]
+    fn workers_pct_then_workers_rejected_at_apply() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let def = CgroupDef::named("cg_p")
+            .with_cpuset(CpusetSpec::Llc(0))
+            .workers_pct(0.5)
+            .workers(2);
+        let err = apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def))
+            .expect_err("workers_pct + workers must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("workers_pct") && msg.contains("workers(2)"),
+            "error must name both workers and workers_pct: {msg}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    #[test]
+    fn workers_then_workers_pct_rejected_at_apply() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let def = CgroupDef::named("cg_p")
+            .with_cpuset(CpusetSpec::Llc(0))
+            .workers(2)
+            .workers_pct(0.5);
+        let err = apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def))
+            .expect_err("workers + workers_pct must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("workers_pct") && msg.contains("workers(2)"),
+            "error must name both workers and workers_pct: {msg}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// `workers_pct` against an empty cpuset (Exact({})) resolves to
+    /// 0 workers and bails with a diagnostic that names the cpuset
+    /// size and the requested fraction. Pin per adversary's V1+V3
+    /// "loud reject with diagnostic" caveat — the message must carry
+    /// the diagnostic fields so a future refactor that drops them is
+    /// caught here, not by a confused user.
+    #[test]
+    fn workers_pct_empty_cpuset_rejects_with_diagnostic() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let def = CgroupDef::named("cg_e")
+            .with_cpuset(CpusetSpec::Exact(std::collections::BTreeSet::new()))
+            .workers_pct(0.9);
+        let err = apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def))
+            .expect_err("workers_pct on empty cpuset must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("workers_pct(0.9)") && msg.contains("cpuset of 0"),
+            "diagnostic must name the requested fraction AND cpuset size: {msg}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// `Op::Spawn` with `WorkSpec::workers_pct` resolves against the
+    /// cgroup's currently-recorded cpuset, mirroring the apply_setup
+    /// path. Pin so a future regression that drops the workers_pct
+    /// pre-resolution from Op::Spawn (silently falling back to
+    /// `ctx.workers_per_cgroup` and ignoring the user's fraction) is
+    /// caught.
+    #[test]
+    fn op_spawn_workers_pct_resolves_against_cgroup_cpuset() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        // Set up an empty cgroup with an explicit cpuset first.
+        apply_setup_test(
+            &ctx,
+            &mut state,
+            std::slice::from_ref(&CgroupDef::named("cg_spawn").with_cpuset(CpusetSpec::Llc(0))),
+        )
+        .unwrap();
+        // Drop the apply_setup default-spawned workload so the Spawn
+        // we issue below is the only handle for cg_spawn.
+        state.handles.clear();
+        // Now Spawn a WorkSpec that uses workers_pct(0.5).
+        // Llc(0) = 4 CPUs → ceil(4 * 0.5) = 2 workers.
+        let work = crate::workload::WorkSpec::default().workers_pct(0.5);
+        apply_ops_test(&ctx, &mut state, &[Op::Spawn { cgroup: "cg_spawn", work }]).unwrap();
+        let handle = &state
+            .handles
+            .iter()
+            .find(|(n, _)| n == "cg_spawn")
+            .expect("Op::Spawn workload registered")
+            .1;
+        assert_eq!(
+            handle.worker_pids().len(),
+            2,
+            "Op::Spawn workers_pct(0.5) on Llc(0)=4 must resolve to 2 workers; \
+             got {}",
+            handle.worker_pids().len(),
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// `Op::Spawn` with BOTH workers and workers_pct set is rejected
+    /// the same way apply_setup rejects it — the resolution helper
+    /// is shared so the diagnostic is identical.
+    #[test]
+    fn op_spawn_workers_pct_dual_set_rejected() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        apply_setup_test(
+            &ctx,
+            &mut state,
+            std::slice::from_ref(&CgroupDef::named("cg_x").with_cpuset(CpusetSpec::Llc(0))),
+        )
+        .unwrap();
+        state.handles.clear();
+        let work = crate::workload::WorkSpec::default()
+            .workers(2)
+            .workers_pct(0.5);
+        let err = apply_ops_test(&ctx, &mut state, &[Op::Spawn { cgroup: "cg_x", work }])
+            .expect_err("Op::Spawn dual-set must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("workers_pct") && msg.contains("workers(2)"),
+            "Op::Spawn diagnostic must name both knobs: {msg}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// `Ctx::cpuset_cpus(&spec)` returns the size of
+    /// `spec.resolve(ctx)` for every CpusetSpec variant. Pinned via a
+    /// single-pass equivalence check across all variants so a future
+    /// CpusetSpec variant added without updating cpuset_cpus stays
+    /// detectable.
+    #[test]
+    fn ctx_cpuset_cpus_matches_resolve_len() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let specs = [
+            CpusetSpec::Llc(0),
+            CpusetSpec::Numa(0),
+            CpusetSpec::Range {
+                start_frac: 0.0,
+                end_frac: 0.5,
+            },
+            CpusetSpec::Disjoint { index: 0, of: 2 },
+            CpusetSpec::Overlap {
+                index: 0,
+                of: 2,
+                frac: 0.5,
+            },
+            CpusetSpec::Exact([0usize, 1, 2].iter().copied().collect()),
+        ];
+        for spec in &specs {
+            assert_eq!(
+                ctx.cpuset_cpus(spec),
+                spec.resolve(&ctx).len(),
+                "ctx.cpuset_cpus drift on {spec:?}",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod workers_pct_construction_tests {
+    use super::types::CgroupDef;
+    use crate::workload::WorkSpec;
+
+    /// Builder rejects NaN at construction.
+    #[test]
+    #[should_panic(expected = "must be finite and > 0.0")]
+    fn cgroup_def_workers_pct_panics_on_nan() {
+        let _ = CgroupDef::named("x").workers_pct(f64::NAN);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be finite and > 0.0")]
+    fn cgroup_def_workers_pct_panics_on_inf() {
+        let _ = CgroupDef::named("x").workers_pct(f64::INFINITY);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be finite and > 0.0")]
+    fn cgroup_def_workers_pct_panics_on_zero() {
+        let _ = CgroupDef::named("x").workers_pct(0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be finite and > 0.0")]
+    fn cgroup_def_workers_pct_panics_on_negative() {
+        let _ = CgroupDef::named("x").workers_pct(-0.5);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be finite and > 0.0")]
+    fn work_spec_workers_pct_panics_on_nan() {
+        let _ = WorkSpec::default().workers_pct(f64::NAN);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be finite and > 0.0")]
+    fn work_spec_workers_pct_panics_on_inf() {
+        let _ = WorkSpec::default().workers_pct(f64::INFINITY);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be finite and > 0.0")]
+    fn work_spec_workers_pct_panics_on_zero() {
+        let _ = WorkSpec::default().workers_pct(0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be finite and > 0.0")]
+    fn work_spec_workers_pct_panics_on_negative() {
+        let _ = WorkSpec::default().workers_pct(-0.5);
     }
 }

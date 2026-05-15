@@ -1425,6 +1425,7 @@ impl GroupParams {
             gid: config.gid,
             numa_node: config.numa_node,
             pcomm: None,
+            workers_pct: None,
         };
         Ok(Self::from_work_spec(
             &spec,

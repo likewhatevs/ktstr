@@ -1253,6 +1253,28 @@ pub struct WorkSpec {
     /// scheduler matchers that check `bpf_cpumask_subset(cpus_ptr,
     /// node_cpumask)` (e.g. layered's `NumaNode`).
     pub numa_node: Option<u32>,
+    /// Optional fraction-of-cpuset worker count. When `Some(p)`, the
+    /// dispatch site computes `ceil(cpuset_cpus * p)` and writes the
+    /// result into `num_workers`. The denominator is the cgroup's
+    /// currently-recorded cpuset at dispatch time:
+    ///
+    /// - `apply_setup` dispatch: the cgroup was just created and its
+    ///   cpuset just resolved via `CpusetSpec::resolve(ctx)` (or
+    ///   inherited from `ctx.topo.usable_cpuset()` when the
+    ///   `CgroupDef` has no `.with_cpuset(...)`), so the denominator
+    ///   matches the declared `CpusetSpec`.
+    /// - `Op::Spawn` dispatch: the denominator is whatever cpuset is
+    ///   currently recorded for the cgroup. A prior `Op::SetCpuset`
+    ///   that narrowed the cgroup will narrow the denominator too.
+    ///   Workers already spawned by a prior `apply_setup` are not
+    ///   re-counted.
+    ///
+    /// Cannot coexist with `num_workers = Some(_)` — validation
+    /// rejects that combination because it's ambiguous which source
+    /// wins. Values > 1.0 are accepted as deliberate oversubscription
+    /// (e.g. `workers_pct(2.0)` on a 10-CPU cpuset produces 20
+    /// workers). NaN/Inf/negative are rejected at construction time.
+    pub workers_pct: Option<f64>,
 }
 
 impl Default for WorkSpec {
@@ -1270,6 +1292,7 @@ impl Default for WorkSpec {
             uid: None,
             gid: None,
             numa_node: None,
+            workers_pct: None,
         }
     }
 }
@@ -1280,6 +1303,83 @@ impl WorkSpec {
     pub fn workers(mut self, n: usize) -> Self {
         self.num_workers = Some(n);
         self
+    }
+
+    /// Set the worker count as a fraction of the resolved cpuset
+    /// CPU count. Apply-setup computes `ceil(cpuset_cpus * pct)` and
+    /// writes the result into `num_workers`. Use this when the worker
+    /// count should scale with the cpuset rather than hardcoding a
+    /// per-topology constant.
+    ///
+    /// Setting BOTH `workers(n)` and `workers_pct(p)` on the same
+    /// WorkSpec is rejected at apply-setup time because the two sources
+    /// would silently fight; pick one. Values > 1.0 are accepted as
+    /// deliberate oversubscription; NaN, infinite, and non-positive
+    /// values are rejected here at construction time via an assertion.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `pct` is NaN, infinite, or `<= 0.0`. The builder
+    /// returns `Self`, so the construction-time gate uses `assert!`
+    /// rather than a fallible `Result`. Negative or zero fractions
+    /// would resolve to zero workers — caught at apply-setup time by
+    /// `resolve_num_workers`'s zero-workers rejection anyway, but the
+    /// construction-time message is more actionable.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn workers_pct(mut self, pct: f64) -> Self {
+        assert!(
+            pct.is_finite() && pct > 0.0,
+            "WorkSpec::workers_pct({pct}): pct must be finite and > 0.0",
+        );
+        self.workers_pct = Some(pct);
+        self
+    }
+
+    /// Resolve `workers_pct` against a cpuset size into a concrete
+    /// `num_workers` count and clear the fractional state, leaving
+    /// `num_workers = Some(scaled)` and `workers_pct = None`. Used by
+    /// both `apply_setup` (per-CgroupDef WorkSpec) and `Op::Spawn`
+    /// (mid-step ad-hoc spawn) so the two paths produce identical
+    /// counts for the same `(pct, cpuset_size)` pair.
+    ///
+    /// Rejects the ambiguous `(num_workers = Some, workers_pct =
+    /// Some)` combination with an `anyhow::bail!` naming the cgroup.
+    /// Rejects a computed count of zero (e.g. empty cpuset, or
+    /// fraction so small it rounds down) with an actionable diagnostic
+    /// naming the cgroup, the cpuset size, and the requested fraction.
+    /// Returns the original `WorkSpec` unchanged when `workers_pct` is
+    /// `None`.
+    pub(crate) fn resolve_workers_pct(
+        mut self,
+        cpuset_cpus: usize,
+        cgroup_name: &str,
+    ) -> anyhow::Result<Self> {
+        let Some(pct) = self.workers_pct else {
+            return Ok(self);
+        };
+        if let Some(n) = self.num_workers {
+            anyhow::bail!(
+                "cgroup '{}': WorkSpec sets BOTH workers({n}) and \
+                 workers_pct({pct}); pick one — workers_pct resolves the \
+                 cpuset fraction at apply-setup time and is incompatible \
+                 with an explicit count",
+                cgroup_name,
+            );
+        }
+        let scaled = (cpuset_cpus as f64 * pct).ceil() as usize;
+        if scaled == 0 {
+            anyhow::bail!(
+                "cgroup '{cgroup_name}': workers_pct({pct}) on a cpuset of \
+                 {cpuset_cpus} CPU(s) resolved to 0 workers \
+                 (ceil({cpuset_cpus} * {pct}) = 0); the cgroup would \
+                 have no workers and downstream assertions would \
+                 vacuously pass — narrow the cpuset, raise the fraction, \
+                 or use `workers(N)` instead",
+            );
+        }
+        self.num_workers = Some(scaled);
+        self.workers_pct = None;
+        Ok(self)
     }
 
     /// Set the work type.

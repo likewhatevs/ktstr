@@ -115,6 +115,12 @@ let def = CgroupDef::named("cg_0")
 - `.with_cpuset_mems(BTreeSet<usize>)` -- explicit `cpuset.mems`
   override (default derives from the resolved cpuset's NUMA nodes).
 - `.workers(n)` -- set worker count.
+- `.workers_pct(p)` -- set worker count as a fraction of the cgroup's
+  resolved cpuset; framework computes `ceil(cpuset_cpus * p)` at
+  apply-setup time. Fractions above `1.0` are accepted as deliberate
+  oversubscription. Conflicts with `.workers(n)` — pick one. See
+  `Ctx::cpuset_cpus` for hand-computing the same denominator outside
+  the builder.
 - `.work_type(WorkType)` -- set work type (default: `SpinWait`).
 - `.sched_policy(SchedPolicy)` -- set Linux scheduling policy
   (default: `Normal`). See [WorkSpec Types](work-types.md#scheduling-policies).

@@ -115,6 +115,17 @@ explicit distances, returns 10 for local and 20 for remote.
 memory-only (has RAM but no CPUs). Typical for CXL-attached memory
 tiers.
 
+## Ctx cpuset accessors
+
+**`Ctx::cpuset_cpus(&CpusetSpec) -> usize`** -- resolve a
+`CpusetSpec` against the context's topology and return the CPU
+count. Convenience for sizing worker counts proportional to a cpuset
+without computing the topology denominator by hand. The denominator
+is the topology-level cpuset, not any cgroup's currently-effective
+cpuset; for cgroup-aware sizing use
+[`CgroupDef::workers_pct`](ops.md#builder-methods) which resolves
+against the cgroup's own cpuset at apply-setup time.
+
 ## Construction from VM topology
 
 **`from_vm_topology(topo) -> Self`** -- build a `TestTopology` from a

@@ -367,6 +367,21 @@ impl Ctx<'_> {
             None => None,
         }
     }
+
+    /// Resolve a [`CpusetSpec`] against this context's topology and
+    /// return the CPU count. Convenience accessor for tests that need
+    /// to size work counts proportional to a cpuset without computing
+    /// the topology denominator by hand. Mirrors the framework's own
+    /// resolution: the count is exactly the size of the BTreeSet
+    /// `spec.resolve(self)` returns, so any
+    /// `CpusetSpec`-aware code path (cgroup cpuset assignment,
+    /// affinity intent resolution, [`WorkSpec::workers_pct`]) sees the
+    /// same denominator. Uses the TOPOLOGY-level cpuset, not the
+    /// currently-effective cgroup cpuset — narrowing via mid-scenario
+    /// `Op::SetCpuset` does not change the value this returns.
+    pub fn cpuset_cpus(&self, spec: &crate::scenario::ops::CpusetSpec) -> usize {
+        spec.resolve(self).len()
+    }
 }
 
 /// Fluent builder for [`Ctx`].

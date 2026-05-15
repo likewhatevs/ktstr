@@ -1077,6 +1077,32 @@ impl CgroupDef {
         self
     }
 
+    /// Set [`WorkSpec::workers_pct`] on `works[0]` — auto-inserting a
+    /// default [`WorkSpec`] if `works` is empty. The fraction is
+    /// resolved against the cgroup's resolved cpuset at apply-setup
+    /// time via `ceil(cpuset_cpus * pct)`. Setting BOTH
+    /// [`Self::workers`] and [`Self::workers_pct`] on the same
+    /// `works[0]` is rejected at apply-setup time because two sources
+    /// for `num_workers` would silently fight; pick one. For
+    /// multi-WorkSpec cgroups that need per-group fractions, call
+    /// `WorkSpec::workers_pct` on each entry via [`Self::work`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when `pct` is NaN, infinite, or `<= 0.0` — same gate as
+    /// [`WorkSpec::workers_pct`]; the construction-time message is more
+    /// actionable than an apply-setup zero-workers reject.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn workers_pct(mut self, pct: f64) -> Self {
+        assert!(
+            pct.is_finite() && pct > 0.0,
+            "CgroupDef::workers_pct({pct}): pct must be finite and > 0.0",
+        );
+        self.ensure_default_work();
+        self.works[0].workers_pct = Some(pct);
+        self
+    }
+
     /// Set the work type on `works[0]` only — auto-inserting a
     /// default [`WorkSpec`] if `works` is empty. Subsequent
     /// [`Self::work`] calls add additional `WorkSpec` entries that
