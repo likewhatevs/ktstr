@@ -83,6 +83,37 @@ pub struct Backdrop {
     /// entries, or a single default WorkSpec when `works` is empty).
     /// Declare empty move-target cgroups via [`Self::ops`] /
     /// [`Self::with_op`] using [`Op::AddCgroup`] instead.
+    ///
+    /// # Ordering guarantee
+    ///
+    /// Cgroups are created in DECLARATION ORDER — the order they
+    /// appear in this `Vec`. The Backdrop setup phase iterates
+    /// `cgroups` front-to-back and runs each `CgroupDef`'s setup
+    /// (`mkdir`, cpuset/sysfs writes, worker spawn) one at a time.
+    /// `with_cgroup(a).with_cgroup(b)` creates `a` first, then `b`.
+    ///
+    /// This matters for any scheduler whose internal IDs are
+    /// assigned in cgroup-attach order — `scx_mitosis`, for
+    /// example, allocates `cell_id`s monotonically on first attach
+    /// (and reuses freed IDs LIFO from a free-list when prior cells
+    /// were destroyed), so the cgroup declared first gets
+    /// `cell_id = 1`, the second gets `cell_id = 2`, and so on
+    /// for the initial allocation sequence. A test that wants a
+    /// sparse `cell_id` range (e.g. remove the middle cell to leave
+    /// a gap) can rely on the framework-side declaration order:
+    /// declare `cg_a`, `cg_b`, `cg_c` to get `cell_id = 1, 2, 3`,
+    /// then `Op::RemoveCgroup("cg_b")` at a Step boundary leaves
+    /// cells 1 and 3 live with a `cell_id = 2` hole. Subsequent
+    /// allocations after that hole exists will reuse the freed
+    /// `cell_id = 2` before bumping `next_cell_id` further — LIFO
+    /// from the free-list, not lowest-free, so multi-delete reuse
+    /// order tracks insertion-into-free-list order.
+    ///
+    /// The cell_id assignment itself is the scheduler's
+    /// responsibility, not the framework's. The Backdrop only
+    /// guarantees the cgroup-creation order; the scheduler binary
+    /// observes the resulting attach order and assigns whatever
+    /// internal IDs its policy dictates.
     pub cgroups: Vec<CgroupDef>,
     /// Long-lived binary payloads spawned once before the first
     /// Step. The runtime holds the live handles for the duration of
@@ -127,13 +158,21 @@ impl Backdrop {
     /// created before the first Step runs and removed after the
     /// last Step tears down. Steps reference it by name via
     /// `Op::MoveAllTasks` / `Op::SetCpuset` / etc.
+    ///
+    /// Cgroups are created in the order they're added via this
+    /// builder; see [`Self::cgroups`] for the ordering guarantee
+    /// and a worked example (e.g. constructing sparse `cell_id`
+    /// ranges for scx_mitosis-style schedulers).
     #[must_use = "builder methods consume self; bind the result"]
     pub fn with_cgroup(mut self, def: CgroupDef) -> Self {
         self.cgroups.push(def);
         self
     }
 
-    /// Add several persistent cgroups at once.
+    /// Add several persistent cgroups at once. Cgroups are created
+    /// in the iteration order of `defs`, appended after any
+    /// already-declared Backdrop cgroups; see [`Self::cgroups`] for
+    /// the ordering guarantee.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn with_cgroups<I: IntoIterator<Item = CgroupDef>>(mut self, defs: I) -> Self {
         self.cgroups.extend(defs);
