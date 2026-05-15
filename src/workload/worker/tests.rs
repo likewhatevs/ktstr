@@ -828,3 +828,139 @@ fn alu_width_resolve_never_returns_widest() {
         );
     }
 }
+
+/// [`alu_hot_chain`] MUST bump `work_units` by exactly `steps` per
+/// invocation. The per-iteration body at mod.rs:3588 reads
+/// `*work_units = std::hint::black_box(work_units.wrapping_add(1))`
+/// — the bump is wrapped in `black_box` so the optimizer can't
+/// elide it as a dead-store, but a refactor that removed the
+/// `*work_units = ...` write entirely, moved it outside the loop,
+/// or changed the increment constant would silently break the
+/// work-units accounting that downstream metrics (worker progress
+/// reporting, schedstat correlation) depend on. Test counts
+/// work_units before and after a known-N call to catch:
+/// - bump removed (post == 0)
+/// - bump moved outside loop (post == 1)
+/// - wrong increment constant (post != N)
+/// - off-by-one in loop bounds (post == N-1 or N+1)
+///
+/// `AluWidth::Scalar` is the path the production code resolves to
+/// on hosts without SIMD; using it sidesteps the
+/// `resolve_alu_width(Widest)` call chain and tests the chain body
+/// directly. The 1000-step count is large enough that an off-by-one
+/// surfaces unambiguously without making the test slow (the chain
+/// is pure ALU + black_box, ~microseconds at this size).
+#[test]
+fn alu_hot_chain_bumps_work_units_by_exact_step_count() {
+    let mut work_units: u64 = 0;
+    let steps: u64 = 1000;
+    alu_hot_chain(AluWidth::Scalar, steps, &mut work_units);
+    assert_eq!(
+        work_units, steps,
+        "alu_hot_chain(Scalar, {steps}, &mut 0) MUST leave work_units \
+         == {steps}; got {work_units}. A regression that removed the \
+         per-step bump (mod.rs:3588) would surface here as 0; one \
+         that moved the bump outside the loop would surface as 1; \
+         one that changed the increment constant would surface as a \
+         multiple of {steps}; one that introduced an off-by-one in \
+         the loop bounds (e.g. `1..=steps` instead of `0..steps`) \
+         would surface as {steps}-1 or {steps}+1.",
+    );
+}
+
+/// [`alu_hot_chain`] accumulates into an externally-provided
+/// `work_units` counter, so successive calls compound the bumps.
+/// A regression that reset the counter inside the function (e.g.
+/// `*work_units = N` instead of `*work_units = work_units.wrapping_add(1)`)
+/// would surface as `work_units == steps` on the second call —
+/// matching the single-call expectation but breaking the
+/// compound-accumulation contract. Two back-to-back 500-step calls
+/// must leave `work_units == 1000`.
+#[test]
+fn alu_hot_chain_compound_calls_accumulate_work_units() {
+    let mut work_units: u64 = 0;
+    alu_hot_chain(AluWidth::Scalar, 500, &mut work_units);
+    alu_hot_chain(AluWidth::Scalar, 500, &mut work_units);
+    assert_eq!(
+        work_units, 1000,
+        "two back-to-back alu_hot_chain(Scalar, 500, ...) calls MUST \
+         leave work_units == 1000; got {work_units}. A regression that \
+         reset the counter inside the function instead of bumping would \
+         surface as 500 (the second call overwrites the first call's \
+         total).",
+    );
+}
+
+/// [`alu_hot_chain`] uses `wrapping_add(1)` at mod.rs:3588 — the
+/// per-step bump must wrap silently on `u64::MAX` overflow rather
+/// than panic or saturate. A regression that switched to
+/// `checked_add(1).unwrap()` would panic; one that switched to
+/// plain `+= 1` would panic in debug mode (integer overflow trap)
+/// and silently wrap in release. The assert catches both by
+/// starting from `u64::MAX` and verifying the wrap to 0.
+/// Long-running workloads (multi-hour scheduler tests) WILL approach
+/// `u64::MAX` given enough iterations; the wrapping contract is
+/// load-bearing for those scenarios.
+#[test]
+fn alu_hot_chain_wraps_work_units_at_u64_max() {
+    let mut work_units: u64 = u64::MAX;
+    alu_hot_chain(AluWidth::Scalar, 1, &mut work_units);
+    assert_eq!(
+        work_units, 0,
+        "alu_hot_chain bumping work_units past u64::MAX MUST wrap to 0; \
+         got {work_units}. A regression that switched `wrapping_add(1)` \
+         to `checked_add(1).unwrap()` would panic at this assertion; one \
+         that switched to plain `+= 1` would panic in debug mode \
+         (integer overflow trap) and produce a different value in release.",
+    );
+}
+
+/// [`alu_hot_chain`] with `steps=0` must be a no-op: the for-loop
+/// body (mod.rs:3583-3589) executes 0 times, work_units stays
+/// unchanged. A regression that off-by-one'd the loop bound
+/// (e.g. `for _ in 0..=steps` instead of `for _ in 0..steps`)
+/// would surface here as work_units == 43 (one bump from the
+/// initial 42).
+#[test]
+fn alu_hot_chain_zero_steps_is_noop() {
+    let mut work_units: u64 = 42;
+    alu_hot_chain(AluWidth::Scalar, 0, &mut work_units);
+    assert_eq!(
+        work_units, 42,
+        "alu_hot_chain(Scalar, 0, &mut 42) MUST leave work_units == 42; \
+         got {work_units}. A regression that off-by-one'd the loop bound \
+         (`0..=steps` instead of `0..steps`) would surface as 43.",
+    );
+}
+
+/// [`alu_hot_chain`] with `steps=1` must bump exactly once. A
+/// regression that started the loop at `for _ in 1..steps` (off-by-one
+/// in lower bound) would surface here as work_units == 0 (zero
+/// iterations from the empty `1..1` range).
+#[test]
+fn alu_hot_chain_single_step_bumps_by_one() {
+    let mut work_units: u64 = 0;
+    alu_hot_chain(AluWidth::Scalar, 1, &mut work_units);
+    assert_eq!(
+        work_units, 1,
+        "alu_hot_chain(Scalar, 1, &mut 0) MUST leave work_units == 1; \
+         got {work_units}. A regression that started the loop at \
+         `1..steps` instead of `0..steps` would surface as 0.",
+    );
+}
+
+/// [`alu_hot_chain`] has a `debug_assert!` at mod.rs:3578-3582 that
+/// rejects `AluWidth::Widest` — callers MUST resolve `Widest` via
+/// `resolve_alu_width` before reaching here. Test pins the
+/// debug-build panic contract: a regression that removed the
+/// debug_assert would surface as this test passing (no panic)
+/// instead of expected_panic. Release builds elide debug_assert so
+/// the test is gated on `cfg(debug_assertions)` to only run in
+/// debug-mode test builds.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "alu_hot_chain reached with AluWidth::Widest")]
+fn alu_hot_chain_panics_on_widest_in_debug_build() {
+    let mut work_units: u64 = 0;
+    alu_hot_chain(AluWidth::Widest, 1, &mut work_units);
+}
