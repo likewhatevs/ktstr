@@ -3033,6 +3033,34 @@ mod tests {
         );
     }
 
+    /// `OpKind::iter()` order matches `bit_index` ascending order.
+    /// strum's `EnumIter` derive follows declaration order by default
+    /// — this test pins that contract so a future strum upgrade or
+    /// an enum reorder that decouples the two orderings surfaces
+    /// here instead of silently reshuffling bitmask traversal.
+    ///
+    /// Complements `op_kind_bit_indices_are_unique_and_contiguous`
+    /// (which proves bit_index forms 0..N but not that iter() yields
+    /// them ascending) and the discriminant tests (which don't
+    /// exercise iter order at all).
+    #[test]
+    fn op_kind_iter_order_matches_bit_index_ascending() {
+        let kinds: Vec<OpKind> = OpKind::iter().collect();
+        let pairs: Vec<(usize, u32)> = kinds
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (i, k.bit_index()))
+            .collect();
+        for (i, bit) in &pairs {
+            assert_eq!(
+                *bit as usize, *i,
+                "OpKind::iter()[{i}] (variant {:?}) has bit_index {bit}; \
+                 expected iter-index to match bit_index. Pairs: {pairs:?}",
+                kinds[*i],
+            );
+        }
+    }
+
     // -- Traverse combinator (test-only) --
 
     /// Layout strategy for Traverse phases.
@@ -6252,6 +6280,16 @@ mod tests {
     /// Backdrop's own setup pass. RemoveCgroup also drops the
     /// Backdrop tracking entry so a later AddCgroup with the same
     /// name does not collide against a stale slot.
+    ///
+    /// Regression class: a future re-introduction of the Backdrop-
+    /// target rejection (e.g. as a "safety" re-add by a contributor
+    /// who didn't see the rationale) would surface here as the
+    /// `apply_ops` call returning Err. The framework intentionally
+    /// trades the early-bail for permissive removal — tests that
+    /// mistype a cgroup name will silently succeed at the
+    /// RemoveCgroup site and surface the typo later as a kernel-
+    /// layer `cgroup missing` error on the next op that references
+    /// the name.
     #[test]
     fn remove_and_stop_cgroup_permit_backdrop_target_from_step() {
         let mock = MockCgroupOps::new();
