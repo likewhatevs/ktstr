@@ -62,7 +62,7 @@ Add ktstr as a dev-dependency:
 
 ```toml
 [dev-dependencies]
-ktstr = { version = "0.4" }
+ktstr = { version = "0.5" }
 ```
 
 This is all test authors need -- run with
@@ -70,6 +70,13 @@ This is all test authors need -- run with
 [cargo-nextest](https://nexte.st/) with kernel resolution).
 The `anyhow::Result` referenced in examples below is re-exported
 through `ktstr::prelude`; no separate `anyhow` dev-dependency needed.
+
+**Version compatibility:** pin the same ktstr major.minor version
+across `[dev-dependencies] ktstr = ...` and `cargo install --locked
+--bin cargo-ktstr ktstr@X.Y.Z`. ktstr is pre-1.0 — minor-version
+bumps may break the test-facing API. Examples below assume 0.5; an
+example from a different release may not compile against the crate
+this README documents.
 
 **Optional CLI tools**:
 

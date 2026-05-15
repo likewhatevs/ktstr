@@ -55,7 +55,7 @@ Add ktstr as a dev-dependency:
 
 ```toml
 [dev-dependencies]
-ktstr = { version = "0.4" }
+ktstr = { version = "0.5" }
 ```
 
 ## Kernel discovery
