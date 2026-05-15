@@ -366,7 +366,7 @@ void BPF_STRUCT_OPS(ktstr_dispatch, s32 cpu, struct task_struct *prev)
 		if (++slow_cnt & SLOW_SKIP_MASK)
 			return;
 	}
-	scx_bpf_dsq_move_to_local(SHARED_DSQ);
+	scx_bpf_dsq_move_to_local(SHARED_DSQ, 0);
 	__sync_fetch_and_add(&nr_dispatched, 1);
 }
 
