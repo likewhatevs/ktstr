@@ -230,6 +230,25 @@ impl BoolAttrSlots<'_> {
 ///     `Assert::expect_scx_bpf_error_matches`. Empty patterns panic
 ///     at construction; invalid regex syntax fails the test loudly
 ///     at evaluation rather than silently matching nothing.
+///   - `extra_include_files = ["PATH", "PATH", ...]` — host-side
+///     file paths to bundle into the guest initramfs beyond what
+///     the entry's `scheduler` / `payload` / `workloads` already
+///     declare via their own `include_files`. Use this for
+///     test-level dependencies that don't belong on a specific
+///     Payload: auxiliary data files, per-test helper scripts,
+///     fixtures. Each element must be a string literal (no
+///     expressions). Maps onto
+///     `KtstrTestEntry::extra_include_files` and is unioned with
+///     the per-payload specs at `run_ktstr_test` time via
+///     [`KtstrTestEntry::all_include_files`]. Default: `[]`.
+///     Path resolution: bare names (no `/`) search `PATH`; paths
+///     containing `/` are absolute or relative to the test process
+///     current directory; directories are walked recursively at
+///     test-run time (rejected by `cargo ktstr export` since the
+///     `.run` packager handles regular files only — recursive
+///     directory packaging is a v2 enhancement); a missing file
+///     fails loudly at setup with an actionable error naming the
+///     missing path.
 #[proc_macro_attribute]
 pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
@@ -1027,6 +1046,21 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
              reject every successful run (any measurable cleanup \
              duration overshoots zero). Omit the attribute to \
              disable the check.",
+        )
+        .to_compile_error()
+        .into();
+    }
+    // `performance_mode = true` and `no_perf_mode = true` are
+    // mutually exclusive — the macro docstring (Mutually exclusive
+    // with `performance_mode = true`) is the only previous guard and
+    // a user setting both gets silent precedence behavior at runtime.
+    // Reject explicitly so the conflict surfaces at compile time.
+    if performance_mode_set && no_perf_mode_set && performance_mode && no_perf_mode {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "performance_mode = true and no_perf_mode = true are mutually \
+             exclusive — one disables what the other enables. Set at most \
+             one of the two; remove the other or set it to `false`.",
         )
         .to_compile_error()
         .into();

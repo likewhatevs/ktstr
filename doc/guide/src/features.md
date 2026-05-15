@@ -391,7 +391,9 @@ builds the VM with the declared `numa_nodes` / `llcs` / `cores` /
 mbind, RT scheduling, and KVM exit suppression are skipped, and
 gauntlet preset filtering relaxes host-topology checks to the
 single "host has enough total CPUs" inequality. Mutually exclusive
-with `performance_mode = true` (validated at runtime by `KtstrTestEntry::validate`). See
+with `performance_mode = true` (rejected at compile time by the
+`#[ktstr_test]` proc macro; `KtstrTestEntry::validate` provides a
+second-line gate for programmatic-entry construction). See
 [Tutorial: Step 13](tutorial.md#step-13-decouple-virtual-topology-from-host-hardware)
 and [Performance Mode](concepts/performance-mode.md#tier-2-no-perf-mode-with-cpu-cap-reservation).
 
