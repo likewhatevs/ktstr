@@ -928,16 +928,6 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .to_compile_error()
                         .into();
                     }
-                    "memory_mb" => {
-                        return syn::Error::new_spanned(
-                            path,
-                            "`memory_mb` was renamed to `memory_mib` (the value \
-                             has always been mebibytes; the name now reflects \
-                             the unit).",
-                        )
-                        .to_compile_error()
-                        .into();
-                    }
                     _ => {
                         return syn::Error::new_spanned(
                             path,
