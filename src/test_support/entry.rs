@@ -164,7 +164,26 @@ pub struct CgroupPath(&'static str);
 
 impl CgroupPath {
     /// Const constructor. Panics at compile time (or const-eval time)
-    /// if `path` does not start with `/` or is `"/"` alone.
+    /// when `path` would normalize back to (or escape) the host
+    /// cgroup root once concatenated with `/sys/fs/cgroup` and
+    /// canonicalized by the kernel. Mirrors the runtime gate in
+    /// `test_support::args::cell_parent_path_is_valid` byte-for-byte:
+    ///
+    ///   - must start with `/`
+    ///   - must not contain any `..` (ParentDir) segments
+    ///   - must contain at least one non-`.`, non-empty segment
+    ///   - empty segments (consecutive `/`) and `.` (CurDir) segments
+    ///     are auto-stripped, matching `Path::components` semantics
+    ///     used by the runtime validator
+    ///
+    /// So `cgroup_parent = "/foo/.."` panics at const-eval just as
+    /// `--cell-parent-cgroup=/foo/..` panics at test setup; the two
+    /// share validation contract, and the asymmetry that would
+    /// otherwise exist (const-fn rejecting `/foo/./bar` while the
+    /// runtime accepts it) is eliminated by the auto-strip rule.
+    /// `Path::components` and `Components` are not yet const-fn
+    /// reachable, so the walk iterates bytes directly via a stable
+    /// `while` loop.
     pub const fn new(path: &'static str) -> Self {
         assert!(
             !path.is_empty() && path.as_bytes()[0] == b'/',
@@ -173,6 +192,35 @@ impl CgroupPath {
         assert!(
             path.len() > 1,
             "CgroupPath must not be \"/\" alone (that is the cgroup root)"
+        );
+        let bytes = path.as_bytes();
+        let mut seg_start: usize = 1; // skip leading `/`
+        let mut i: usize = 1;
+        let mut has_normal = false;
+        while i <= bytes.len() {
+            let at_end = i == bytes.len();
+            if at_end || bytes[i] == b'/' {
+                let seg_len = i - seg_start;
+                let is_dotdot =
+                    seg_len == 2 && bytes[seg_start] == b'.' && bytes[seg_start + 1] == b'.';
+                assert!(
+                    !is_dotdot,
+                    "CgroupPath must not contain `..` segments \
+                     (they escape `/sys/fs/cgroup` once the kernel \
+                     canonicalizes the resolved path)"
+                );
+                let is_empty_or_dot = seg_len == 0 || (seg_len == 1 && bytes[seg_start] == b'.');
+                if !is_empty_or_dot {
+                    has_normal = true;
+                }
+                seg_start = i + 1;
+            }
+            i += 1;
+        }
+        assert!(
+            has_normal,
+            "CgroupPath must contain at least one non-`.`/non-empty segment \
+             (paths like `/`, `///`, or `/.` normalize back to `/sys/fs/cgroup`)"
         );
         Self(path)
     }
@@ -3041,5 +3089,67 @@ mod tests {
         assert!(c.max_numa_nodes.is_none());
         assert!(c.max_llcs.is_none());
         assert!(c.max_cpus.is_none());
+    }
+
+    /// Const-fn parity with the runtime `--cell-parent-cgroup` gate:
+    /// a `cgroup_parent` declaration containing `..` must compile-fail
+    /// (or panic at runtime when the const fn is evaluated
+    /// dynamically). Mirrors `runtime::append_base_sched_args`
+    /// rejecting `--cell-parent-cgroup=/foo/..` so declarative and
+    /// CLI sources share the same validation contract.
+    #[test]
+    #[should_panic(expected = "must not contain `..` segments")]
+    fn cgroup_path_new_panics_on_parent_dir_segment() {
+        let _ = CgroupPath::new("/foo/..");
+    }
+
+    /// Bare `/..` (ParentDir immediately after RootDir) — same
+    /// rejection class as `/foo/..`, distinct shape.
+    #[test]
+    #[should_panic(expected = "must not contain `..` segments")]
+    fn cgroup_path_new_panics_on_bare_parent_dir() {
+        let _ = CgroupPath::new("/..");
+    }
+
+    /// `/.` — only a CurDir segment after root, no Normal anywhere.
+    /// Hits the `has_normal=false` final assert (CurDir segments are
+    /// stripped per the auto-strip rule, matching Path::components).
+    #[test]
+    #[should_panic(expected = "at least one non-`.`/non-empty segment")]
+    fn cgroup_path_new_panics_on_only_dot_segment() {
+        let _ = CgroupPath::new("/.");
+    }
+
+    /// Multiple consecutive slashes only — `///` produces 3 empty
+    /// segments after the leading `/`. has_normal stays false →
+    /// rejected by the final assert. Mirrors Path::components which
+    /// collapses repeated separators and yields just `[RootDir]`.
+    #[test]
+    #[should_panic(expected = "at least one non-`.`/non-empty segment")]
+    fn cgroup_path_new_panics_on_only_slashes() {
+        let _ = CgroupPath::new("///");
+    }
+
+    /// `/foo/./bar` is ACCEPTED — the const-fn auto-strips the
+    /// CurDir segment, matching `Path::components` semantics that
+    /// the runtime validator uses. The two validators stay in
+    /// lockstep on this shape (the runtime test
+    /// `append_base_sched_args_accepts_embedded_dot_segment` pins
+    /// the same accept behavior on the runtime side).
+    #[test]
+    fn cgroup_path_new_accepts_embedded_dot_segment() {
+        let _ = CgroupPath::new("/foo/./bar");
+    }
+
+    /// Normal paths still pass — pin the accept path so a future
+    /// over-tightening of the segment walker (e.g. rejecting
+    /// trailing slash, or rejecting any segment of length 1) is
+    /// caught.
+    #[test]
+    fn cgroup_path_new_accepts_normal_paths() {
+        let _ = CgroupPath::new("/ktstr");
+        let _ = CgroupPath::new("/sys/fs/cgroup/ktstr");
+        let _ = CgroupPath::new("/a/b/c");
+        let _ = CgroupPath::new("/foo/"); // trailing slash OK
     }
 }

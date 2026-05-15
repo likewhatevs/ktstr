@@ -1949,7 +1949,11 @@ fn create_cgroup_parent_from_sched_args() {
     // ad-hoc argv injection); log to COM2 and skip the cgroup-tree
     // setup rather than mkdir on the host cgroup root.
     let path = match crate::test_support::parse_cell_parent_cgroup(sched_args.split_whitespace()) {
-        crate::test_support::CellParentCgroupArg::Value(p) if p.starts_with('/') && p != "/" => p,
+        crate::test_support::CellParentCgroupArg::Value(p)
+            if crate::test_support::cell_parent_path_is_valid(p) =>
+        {
+            p
+        }
         crate::test_support::CellParentCgroupArg::Value(bad) => {
             write_com2(&format!(
                 "ktstr-init: ignoring malformed `--cell-parent-cgroup` value \

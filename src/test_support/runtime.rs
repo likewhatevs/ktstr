@@ -268,11 +268,13 @@ pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<Stri
             .chain(entry.extra_sched_args.iter())
             .copied(),
     ) {
-        super::args::CellParentCgroupArg::Value(path) if !path.starts_with('/') || path == "/" => {
+        super::args::CellParentCgroupArg::Value(path)
+            if !super::args::cell_parent_path_is_valid(path) =>
+        {
             let example = cgroup_parent_example(entry);
             let mut fixes = format!(
-                "supply an absolute path under `/` (e.g. `{example}`) for the \
-                 per-test cgroup root"
+                "supply an absolute path under `/` with at least one non-`.`/`..` \
+                 segment (e.g. `{example}`) for the per-test cgroup root"
             );
             if let Some(default) = entry.scheduler.cgroup_parent {
                 fixes.push_str(&format!(
@@ -283,15 +285,18 @@ pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<Stri
             panic!(
                 "test `{}` supplies `--cell-parent-cgroup` with a value `{:?}` \
                  (via `extra_sched_args` on the test or `sched_args` in the \
-                 scheduler def) that does not start with `/` (or is `/` \
-                 alone); {fixes}. Empty, bare `/`, or relative values would \
-                 all resolve to a path equal to or inside `/sys/fs/cgroup` \
-                 (e.g. empty → `/sys/fs/cgroup`, `/` → `/sys/fs/cgroup/`, \
-                 host cgroup root) and corrupt unrelated cgroup state when \
-                 the probe-side `CgroupManager` operates on the resolved \
-                 path. This gate mirrors the const-eval check in \
-                 `CgroupPath::new` so runtime values share the validation \
-                 contract that compile-time declarations already pass.",
+                 scheduler def) that does not start with `/`, is `/` alone, or \
+                 contains `.`/`..` segments that normalize back to the host \
+                 cgroup root; {fixes}. Empty, bare `/`, relative, or paths \
+                 like `/.`, `/foo/..`, `/./bar/..` all resolve to a path \
+                 equal to or inside `/sys/fs/cgroup` (e.g. empty → \
+                 `/sys/fs/cgroup`, `/` → `/sys/fs/cgroup/`, `/.` → \
+                 `/sys/fs/cgroup` after canonicalization) and corrupt \
+                 unrelated cgroup state when the probe-side `CgroupManager` \
+                 operates on the resolved path. This gate mirrors the \
+                 const-eval check in `CgroupPath::new` so runtime values \
+                 share the validation contract that compile-time \
+                 declarations already pass.",
                 entry.name, path,
             );
         }
@@ -1024,6 +1029,130 @@ mod tests {
         append_base_sched_args(&entry, &mut args);
     }
 
+    /// `/.` is absolute and has more than one character, so a naive
+    /// `starts_with('/') && len > 1` check passes — but the kernel
+    /// canonicalizes `/sys/fs/cgroup/.` back to `/sys/fs/cgroup`
+    /// (host cgroup root), corrupting unrelated cgroup state.
+    /// `Path::components` strips the trailing `.`, yielding `[RootDir]`
+    /// — the validator rejects via the "has no Normal component"
+    /// check, not the CurDir arm (see `cell_parent_path_is_valid`).
+    #[test]
+    #[should_panic(expected = "contains `.`/`..` segments")]
+    fn append_base_sched_args_panics_on_dot_normalizing_to_root() {
+        static SCHED: Scheduler = Scheduler::new("s").cgroup_parent("/sys/fs/cgroup/ktstr");
+        let entry = KtstrTestEntry {
+            name: "dot_normalize",
+            scheduler: &SCHED,
+            extra_sched_args: &["--cell-parent-cgroup=/."],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+    }
+
+    /// `/foo/..` canonicalizes back to `/` → `/sys/fs/cgroup`. Same
+    /// host-root corruption risk as the empty/bare-slash cases. The
+    /// component-based gate rejects any `..` (ParentDir) segment.
+    #[test]
+    #[should_panic(expected = "contains `.`/`..` segments")]
+    fn append_base_sched_args_panics_on_parent_dir_normalizing_to_root() {
+        static SCHED: Scheduler = Scheduler::new("s").cgroup_parent("/sys/fs/cgroup/ktstr");
+        let entry = KtstrTestEntry {
+            name: "parent_dir_normalize",
+            scheduler: &SCHED,
+            extra_sched_args: &["--cell-parent-cgroup=/foo/.."],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+    }
+
+    /// Mixed `/./bar/..` — both kinds of normalizing segment in one
+    /// path. `Path::components` strips the leading `/.`, yielding
+    /// `[RootDir, Normal("bar"), ParentDir]`; the validator reaches
+    /// the `ParentDir` and rejects via that arm. The `/.` never
+    /// surfaces as a CurDir component.
+    #[test]
+    #[should_panic(expected = "contains `.`/`..` segments")]
+    fn append_base_sched_args_panics_on_mixed_normalize_segments() {
+        static SCHED: Scheduler = Scheduler::new("s").cgroup_parent("/sys/fs/cgroup/ktstr");
+        let entry = KtstrTestEntry {
+            name: "mixed_normalize",
+            scheduler: &SCHED,
+            extra_sched_args: &["--cell-parent-cgroup=/./bar/.."],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+    }
+
+    /// `/foo/./bar` is ACCEPTED — `Path::components` normalizes away
+    /// every `CurDir` segment (see `cell_parent_path_is_valid` for
+    /// the full per-position behavior); the canonical form
+    /// `/foo/bar` is a real non-root path. Pin the accept path so a
+    /// future refactor to a stricter `.contains("/./")` text check
+    /// is caught. Also assert the user value flows through verbatim
+    /// — a regression that canonicalized the path before forwarding
+    /// would silently rewrite `/foo/./bar` to `/foo/bar`.
+    #[test]
+    fn append_base_sched_args_accepts_embedded_dot_segment() {
+        static SCHED: Scheduler = Scheduler::new("s").cgroup_parent("/sys/fs/cgroup/ktstr");
+        let entry = KtstrTestEntry {
+            name: "embedded_dot_ok",
+            scheduler: &SCHED,
+            extra_sched_args: &["--cell-parent-cgroup=/foo/./bar"],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+        assert!(
+            args.iter().any(|a| a == "--cell-parent-cgroup=/foo/./bar"),
+            "user value must pass through verbatim (no canonicalization); args: {args:?}",
+        );
+    }
+
+    /// Bare `/..` is the most damaging path-normalize edge:
+    /// downstream interpolation `/sys/fs/cgroup/..` canonicalizes to
+    /// `/sys/fs` — escapes the cgroup hierarchy entirely. The
+    /// component walk hits `ParentDir` immediately after `RootDir`
+    /// (no Normal segment between them) and rejects via the
+    /// ParentDir arm.
+    #[test]
+    #[should_panic(expected = "contains `.`/`..` segments")]
+    fn append_base_sched_args_panics_on_bare_parent_dir() {
+        static SCHED: Scheduler = Scheduler::new("s").cgroup_parent("/sys/fs/cgroup/ktstr");
+        let entry = KtstrTestEntry {
+            name: "bare_parent_dir",
+            scheduler: &SCHED,
+            extra_sched_args: &["--cell-parent-cgroup=/.."],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+    }
+
+    /// Mid-path `/foo/../bar` — ParentDir sits BETWEEN Normal
+    /// segments. Different shape from `/foo/..` (trailing
+    /// ParentDir): a regression that bailed only on
+    /// `path.ends_with("/..")` would slip this past. Downstream
+    /// interpolation `/sys/fs/cgroup/foo/../bar` canonicalizes to
+    /// `/sys/fs/cgroup/bar` — an unintended sibling directory the
+    /// test author didn't ask for. Component walk catches ParentDir
+    /// in any position.
+    #[test]
+    #[should_panic(expected = "contains `.`/`..` segments")]
+    fn append_base_sched_args_panics_on_mid_path_parent_dir() {
+        static SCHED: Scheduler = Scheduler::new("s").cgroup_parent("/sys/fs/cgroup/ktstr");
+        let entry = KtstrTestEntry {
+            name: "mid_path_parent_dir",
+            scheduler: &SCHED,
+            extra_sched_args: &["--cell-parent-cgroup=/foo/../bar"],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+    }
+
     /// Bare `/` slips a naive `starts_with('/')` check but resolves
     /// downstream to `/sys/fs/cgroup/` — semantically the host cgroup
     /// root, same corruption risk as the empty case. The gate mirrors
@@ -1031,7 +1160,7 @@ mod tests {
     /// no-leading-slash AND `"/"` alone) so runtime values share the
     /// same validation as compile-time declarations.
     #[test]
-    #[should_panic(expected = "or is `/` alone")]
+    #[should_panic(expected = "is `/` alone")]
     fn append_base_sched_args_panics_on_bare_slash_value() {
         static SCHED: Scheduler = Scheduler::new("s").cgroup_parent("/sys/fs/cgroup/ktstr");
         let entry = KtstrTestEntry {

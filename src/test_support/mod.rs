@@ -66,9 +66,9 @@ mod topo;
 // uniformly across all CLI arg extractors.
 #[allow(unused_imports)]
 pub(crate) use args::{
-    CellParentCgroupArg, extract_export_output_arg, extract_export_test_arg,
-    extract_probe_stack_arg, extract_test_fn_arg, extract_topo_arg, extract_work_type_arg,
-    parse_cell_parent_cgroup,
+    CellParentCgroupArg, cell_parent_path_is_valid, extract_export_output_arg,
+    extract_export_test_arg, extract_probe_stack_arg, extract_test_fn_arg, extract_topo_arg,
+    extract_work_type_arg, parse_cell_parent_cgroup,
 };
 pub(crate) use runtime::{append_base_sched_args, sys_rdy_budget_ms};
 #[cfg(test)]

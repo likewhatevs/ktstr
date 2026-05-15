@@ -169,6 +169,59 @@ pub(crate) enum CellParentCgroupArg<'a> {
 /// agnostic, accepting the false-positive risk for arg shapes that
 /// the in-tree schedulers don't currently produce. The combined-form
 /// branch (`--cell-parent-cgroup=...`) is unambiguous and unaffected.
+/// True iff `path` is a valid `--cell-parent-cgroup` value: absolute,
+/// non-trivial, and contains no `..` components that would normalize
+/// back to (or escape) `/sys/fs/cgroup`.
+///
+/// The downstream consumer at `vmm/rust_init.rs::create_per_test_cgroup`
+/// concatenates the value to `/sys/fs/cgroup` and mkdirs the result.
+/// A value like `/foo/..` produces `/sys/fs/cgroup/foo/..` which the
+/// kernel canonicalizes back to `/sys/fs/cgroup` — corrupting the host
+/// cgroup root the same way an empty / bare-`/` value would. `/.`
+/// behaves identically.
+///
+/// `Path::components` strips every `CurDir` (`.`) segment from any
+/// position in the path (leading, mid, trailing) before yielding the
+/// component sequence; only `RootDir`, `Normal`, and `ParentDir`
+/// survive. So:
+///   - `/.` yields `[RootDir]` (rejected: no Normal component)
+///   - `/foo/./bar` yields `[RootDir, Normal("foo"), Normal("bar")]`
+///     (accepted; canonical form is a real non-root path)
+///   - `/foo/..` yields `[RootDir, Normal("foo"), ParentDir]`
+///     (rejected: ParentDir present)
+///   - `/./bar/..` yields `[RootDir, Normal("bar"), ParentDir]`
+///     (rejected: ParentDir present; leading `/.` stripped first)
+///
+/// The validator is therefore the conjunction of "has at least one
+/// Normal component" AND "no ParentDir component" — both classes of
+/// normalize-to-host-root are caught. The `CurDir` arm in the match
+/// below is dead under current `Path::components` semantics; it is
+/// kept as defense-in-depth in case a future stdlib change starts
+/// yielding `CurDir` for some path shape.
+///
+/// Both validation arms (host-side fail-fast in
+/// `runtime::append_base_sched_args`, guest-side defense in
+/// `vmm/rust_init.rs::create_per_test_cgroup`) share this predicate
+/// so the host gate and the guest-side defense-in-depth stay aligned.
+pub(crate) fn cell_parent_path_is_valid(path: &str) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+    let mut has_normal = false;
+    for component in std::path::Path::new(path).components() {
+        use std::path::Component;
+        match component {
+            Component::Normal(_) => has_normal = true,
+            Component::RootDir => {} // single leading `/`, expected
+            // CurDir is currently unreachable (see fn docstring) but
+            // kept as defense-in-depth.
+            Component::CurDir | Component::ParentDir => return false,
+            Component::Prefix(_) => return false, // Windows; not applicable
+        }
+    }
+    has_normal
+}
+
 pub(crate) fn parse_cell_parent_cgroup<'a>(
     args: impl IntoIterator<Item = &'a str>,
 ) -> CellParentCgroupArg<'a> {
