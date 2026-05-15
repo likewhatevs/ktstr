@@ -14,9 +14,52 @@ cargo ktstr test --kernel ../linux
 # Run a specific test
 cargo ktstr test --kernel ../linux -- -E 'test(sched_basic_proportional)'
 
+# Run all ktstr-managed tests, skipping non-ktstr tests in the same crate
+cargo ktstr test --kernel ../linux -- -E 'test(/^ktstr/)'
+
 # Run ignored gauntlet tests
 cargo ktstr test --kernel ../linux -- --run-ignored ignored-only -E 'test(gauntlet/)'
 ```
+
+## Test name shapes
+
+Tests registered through `#[ktstr_test]` show up in nextest output
+under one of four prefixes, all routed through ktstr's dispatch
+layer:
+
+- `ktstr/{name}` — single-variant form. Single-kernel mode (no
+  `KTSTR_KERNEL_LIST` or exactly one entry), or any `host_only` test
+  regardless of kernel-list size (host_only tests never boot a VM,
+  so kernel identity does not multiply them).
+- `ktstr/{name}/{kernel}` — multi-kernel single-variant form. Active
+  when `KTSTR_KERNEL_LIST` carries 2+ kernels, so each (test ×
+  kernel) pair becomes its own nextest case.
+- `gauntlet/{name}/{preset}` — single-kernel gauntlet expansion. For
+  each `#[ktstr_test]`, ktstr emits one entry per gauntlet preset so
+  topology variants run as distinct nextest cases.
+- `gauntlet/{name}/{preset}/{kernel}` — multi-kernel gauntlet
+  expansion. Active when `KTSTR_KERNEL_LIST` carries 2+ kernels, so
+  each (test × preset × kernel) triple becomes its own case.
+
+Filter by prefix with `-E 'test(/^ktstr/)'` (all ktstr-managed
+single-variant tests) or `-E 'test(/^gauntlet/)'` (all gauntlet
+expansions). Substring matches like `-E 'test(ktstr/)'` also work;
+the `^` anchor avoids accidentally matching test names like
+`verify_ktstr/bar` from a sibling crate or `something_ktstr/foo`
+from a manually-named test that happens to contain `ktstr/` as a
+substring.
+
+The `#[ktstr_test]` attribute itself isn't a nextest filter
+selector — nextest filters on test names, and the prefix routing
+above is how `#[ktstr_test]`-marked tests surface as filterable
+names.
+
+The `{kernel}` suffix is a sanitized kernel label: `kernel_`
+prefix, lowercase, every non-alphanumeric ASCII character collapsed
+to `_`, consecutive underscores collapsed, trailing underscores
+stripped. So `6.16.1` becomes `kernel_6_16_1` and `../linux`
+becomes `kernel_linux` (after the framework resolves the path to
+its sanitizable label).
 
 ## Run analysis
 
