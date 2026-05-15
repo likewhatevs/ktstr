@@ -22,7 +22,7 @@ pub fn custom_cgroup_affinity_change(ctx: &Ctx) -> Result<AssertResult> {
         .with_cgroup(CgroupDef::named("cg_1"));
     let mut steps = vec![Step::new(
         vec![],
-        HoldSpec::Fixed(ctx.settle + ctx.duration / 5),
+        HoldSpec::fixed(ctx.settle + ctx.duration / 5),
     )];
 
     // Pool the random sample across every CPU in the topology;
@@ -39,7 +39,7 @@ pub fn custom_cgroup_affinity_change(ctx: &Ctx) -> Result<AssertResult> {
                 Op::set_affinity("cg_0", intent.clone()),
                 Op::set_affinity("cg_1", intent.clone()),
             ],
-            HoldSpec::Frac(0.2),
+            HoldSpec::frac(0.2),
         ));
     }
 
@@ -62,20 +62,27 @@ pub fn custom_cgroup_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     let checks = Assert::default_checks().max_spread_pct(75.0);
 
     // Settle step uses a fixed minimum so `ctx.settle = Duration::ZERO`
-    // (the production default) does not produce a vacuous
-    // `HoldSpec::Fixed(ZERO)` that `run_scenario` rejects up front.
+    // (the production default) does not produce an instant no-op
+    // settle step. Workers spawned during Backdrop setup (cg_0 / cg_1
+    // below) need wall-clock time to migrate into their cgroup
+    // cpusets before the Op::set_affinity ops fire in the next step;
+    // without the 500ms floor a ZERO-duration settle would let the
+    // affinity-pin step race the worker dispatch path.
+    // `HoldSpec::fixed(ZERO)` itself is VALID per HoldSpec::validate
+    // (types.rs:1854) — the floor is for scheduler-warmup
+    // correctness, not validation.
     let settle = ctx.settle.max(Duration::from_millis(500));
     let backdrop = Backdrop::new()
         .with_cgroup(CgroupDef::named("cg_0"))
         .with_cgroup(CgroupDef::named("cg_1"));
     let steps = vec![
-        Step::new(vec![], HoldSpec::Fixed(settle)),
+        Step::new(vec![], HoldSpec::fixed(settle)),
         Step::new(
             vec![
                 Op::set_affinity("cg_0", AffinityIntent::Exact(pin_cpus.clone())),
                 Op::set_affinity("cg_1", AffinityIntent::Exact(pin_cpus)),
             ],
-            HoldSpec::Fixed(ctx.duration),
+            HoldSpec::fixed(ctx.duration),
         ),
     ];
 
@@ -103,13 +110,13 @@ pub fn custom_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
         CgroupDef::named("cg_1").with_cpuset(CpusetSpec::disjoint(1, 2)),
     ]);
     let steps = vec![
-        Step::new(vec![], HoldSpec::Fixed(ctx.settle)),
+        Step::new(vec![], HoldSpec::fixed(ctx.settle)),
         Step::new(
             vec![
                 Op::set_affinity("cg_0", AffinityIntent::Exact(pin_a)),
                 Op::set_affinity("cg_1", AffinityIntent::Exact(pin_b)),
             ],
-            HoldSpec::Fixed(ctx.duration),
+            HoldSpec::fixed(ctx.duration),
         ),
     ];
 

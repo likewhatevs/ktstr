@@ -28,7 +28,7 @@ fn cgroup_per_cpu_steps(ctx: &Ctx) -> Vec<Step> {
     vec![Step {
         setup: Setup::Factory(per_cpu_defs),
         ops: vec![],
-        hold: HoldSpec::Fixed(Duration::from_secs(1) + ctx.duration),
+        hold: HoldSpec::fixed(Duration::from_secs(1) + ctx.duration),
     }]
 }
 
@@ -82,14 +82,14 @@ fn cgroup_exhaust_reuse_steps(ctx: &Ctx) -> Vec<Step> {
 
     vec![
         // Phase 1: create N exhaust cgroups (no workers — they just occupy slots).
-        Step::new(exhaust_ops, HoldSpec::Fixed(Duration::from_secs(1))),
+        Step::new(exhaust_ops, HoldSpec::fixed(Duration::from_secs(1))),
         // Phase 2: remove first half.
-        Step::new(remove_ops, HoldSpec::Fixed(Duration::from_secs(1))),
+        Step::new(remove_ops, HoldSpec::fixed(Duration::from_secs(1))),
         // Phase 3: create replacement cgroups with workers.
         Step {
             setup: Setup::Factory(reuse_defs),
             ops: vec![],
-            hold: HoldSpec::Fixed(ctx.duration),
+            hold: HoldSpec::fixed(ctx.duration),
         },
     ]
 }

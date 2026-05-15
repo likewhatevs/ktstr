@@ -20,7 +20,7 @@ pub fn custom_nested_cgroup_steady(ctx: &Ctx) -> Result<AssertResult> {
                 CgroupDef::named("cg_1/sub_b"),
                 CgroupDef::named("cg_1/sub_a/deep"),
             ],
-            HoldSpec::Fixed(Duration::from_secs(2) + ctx.duration),
+            HoldSpec::fixed(Duration::from_secs(2) + ctx.duration),
         )
         .set_ops(vec![
             Op::add_cgroup("cg_0"),
@@ -57,19 +57,19 @@ pub fn custom_nested_cgroup_task_move(ctx: &Ctx) -> Result<AssertResult> {
         // budget the pre-refactor single-Step version used.
         Step::new(
             vec![],
-            HoldSpec::Fixed(Duration::from_secs(2) + ctx.duration / 4),
+            HoldSpec::fixed(Duration::from_secs(2) + ctx.duration / 4),
         ),
         Step::new(
             vec![Op::move_all_tasks("cg_0/sub", "cg_0")],
-            HoldSpec::Frac(0.25),
+            HoldSpec::frac(0.25),
         ),
         Step::new(
             vec![Op::move_all_tasks("cg_0", "cg_1/sub")],
-            HoldSpec::Frac(0.25),
+            HoldSpec::frac(0.25),
         ),
         Step::new(
             vec![Op::move_all_tasks("cg_1/sub", "cg_1")],
-            HoldSpec::Frac(0.25),
+            HoldSpec::frac(0.25),
         ),
     ];
 
@@ -193,7 +193,7 @@ pub fn custom_nested_cgroup_imbalance(ctx: &Ctx) -> Result<AssertResult> {
                         Duration::from_millis(100),
                     )),
             ],
-            HoldSpec::Fixed(ctx.settle + ctx.duration),
+            HoldSpec::fixed(ctx.settle + ctx.duration),
         )
         .set_ops(vec![Op::add_cgroup("cg_0"), Op::add_cgroup("cg_1")]),
     ];
@@ -209,7 +209,7 @@ pub fn custom_nested_cgroup_no_ctrl(ctx: &Ctx) -> Result<AssertResult> {
                 CgroupDef::named("cg_0/sub_a/deep"),
                 CgroupDef::named("cg_1/sub_b"),
             ],
-            HoldSpec::Fixed(ctx.settle + ctx.duration),
+            HoldSpec::fixed(ctx.settle + ctx.duration),
         )
         .set_ops(vec![
             Op::add_cgroup("cg_0"),

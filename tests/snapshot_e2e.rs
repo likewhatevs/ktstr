@@ -66,7 +66,7 @@ fn snapshot_op_drives_bridge_and_stores_report_under_name() {
     let steps = vec![Step {
         setup: Vec::<ktstr::scenario::ops::CgroupDef>::new().into(),
         ops: vec![Op::snapshot("after_setup"), Op::snapshot("after_workload")],
-        hold: HoldSpec::Fixed(std::time::Duration::from_millis(1)),
+        hold: HoldSpec::fixed(std::time::Duration::from_millis(1)),
     }];
     let result = execute_steps(&ctx, steps).expect("execute_steps must succeed");
     assert!(result.passed, "scenario must pass: {:?}", result.details);
@@ -105,7 +105,7 @@ fn snapshot_op_with_no_bridge_is_a_no_op() {
     let steps = vec![Step {
         setup: Vec::<ktstr::scenario::ops::CgroupDef>::new().into(),
         ops: vec![Op::snapshot("orphan")],
-        hold: HoldSpec::Fixed(std::time::Duration::from_millis(1)),
+        hold: HoldSpec::fixed(std::time::Duration::from_millis(1)),
     }];
     let result = execute_steps(&ctx, steps).expect("execute_steps with no bridge must succeed");
     assert!(
@@ -130,7 +130,7 @@ fn snapshot_op_with_failing_capture_does_not_abort_scenario() {
     let steps = vec![Step {
         setup: Vec::<ktstr::scenario::ops::CgroupDef>::new().into(),
         ops: vec![Op::snapshot("doomed")],
-        hold: HoldSpec::Fixed(std::time::Duration::from_millis(1)),
+        hold: HoldSpec::fixed(std::time::Duration::from_millis(1)),
     }];
     let result = execute_steps(&ctx, steps).expect("execute_steps must succeed");
     assert!(result.passed);
@@ -161,7 +161,7 @@ fn watch_snapshot_op_drives_register_callback() {
             Op::watch_snapshot("bss.scx_ktstr.alloc_count"),
             Op::watch_snapshot("kernel.jiffies"),
         ],
-        hold: HoldSpec::Fixed(std::time::Duration::from_millis(1)),
+        hold: HoldSpec::fixed(std::time::Duration::from_millis(1)),
     }];
     let result = execute_steps(&ctx, steps).expect("execute_steps must succeed");
     assert!(result.passed, "scenario must pass: {:?}", result.details);
@@ -192,7 +192,7 @@ fn watch_snapshot_op_max_3_per_scenario_errors_fourth() {
             Op::watch_snapshot("kernel.c"),
             Op::watch_snapshot("kernel.d"),
         ],
-        hold: HoldSpec::Fixed(std::time::Duration::from_millis(1)),
+        hold: HoldSpec::fixed(std::time::Duration::from_millis(1)),
     }];
     let result = execute_steps(&ctx, steps).expect("execute_steps returns Ok with stamped error");
     assert!(
@@ -227,7 +227,7 @@ fn watch_snapshot_op_unresolvable_symbol_bails_immediately() {
     let steps = vec![Step {
         setup: Vec::<ktstr::scenario::ops::CgroupDef>::new().into(),
         ops: vec![Op::watch_snapshot("kernel.absent_symbol")],
-        hold: HoldSpec::Fixed(std::time::Duration::from_millis(1)),
+        hold: HoldSpec::fixed(std::time::Duration::from_millis(1)),
     }];
     let result = execute_steps(&ctx, steps).expect("execute_steps returns Ok with stamped error");
     assert!(!result.passed, "unresolvable symbol must fail the step");

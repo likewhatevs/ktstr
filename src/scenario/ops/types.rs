@@ -1773,6 +1773,10 @@ impl Step {
 /// hold for a duration; `Loop` repeatedly re-applies `Step::ops` at a
 /// fixed interval instead of holding.
 ///
+/// Construct via the constructor methods ([`Self::fixed`],
+/// [`Self::frac`], [`Self::loop_at`], or the [`Self::FULL`] const) —
+/// variant syntax is reserved for pattern-matching in `match` arms.
+///
 /// `Copy` because every variant carries only `Copy` types (`f64`,
 /// [`Duration`]); reuse the same `HoldSpec` value across multiple
 /// [`Step::new`] / [`Step::with_defs`] / [`Step::with_payload`]

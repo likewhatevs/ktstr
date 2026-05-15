@@ -42,12 +42,12 @@ fn sched_dynamic_add(ctx: &Ctx) -> Result<AssertResult> {
         Step {
             setup: vec![CgroupDef::named("cg_0")].into(),
             ops: vec![],
-            hold: HoldSpec::Frac(0.5),
+            hold: HoldSpec::frac(0.5),
         },
         Step {
             setup: vec![CgroupDef::named("cg_1")].into(),
             ops: vec![],
-            hold: HoldSpec::Frac(0.5),
+            hold: HoldSpec::frac(0.5),
         },
     ];
     execute_steps(ctx, steps)
@@ -497,12 +497,12 @@ fn scenario_mid_degrade(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::Ass
             ]
             .into(),
             ops: vec![],
-            hold: HoldSpec::Fixed(std::time::Duration::from_secs(3)),
+            hold: HoldSpec::fixed(std::time::Duration::from_secs(3)),
         },
         Step {
             setup: vec![].into(),
             ops: vec![],
-            hold: HoldSpec::Fixed(std::time::Duration::from_secs(5)),
+            hold: HoldSpec::fixed(std::time::Duration::from_secs(5)),
         },
     ];
     execute_steps_with(ctx, steps, Some(&checks))

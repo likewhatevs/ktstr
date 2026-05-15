@@ -3154,9 +3154,9 @@ mod tests {
 
                 let hold = if phase == 0 {
                     // First phase includes settle time.
-                    HoldSpec::Fixed(self.settle + self.phase_duration)
+                    HoldSpec::fixed(self.settle + self.phase_duration)
                 } else {
-                    HoldSpec::Fixed(self.phase_duration)
+                    HoldSpec::fixed(self.phase_duration)
                 };
 
                 steps.push(Step {
@@ -4232,7 +4232,7 @@ mod tests {
 
     #[test]
     fn step_with_defs_empty() {
-        let step = Step::with_defs(vec![], HoldSpec::Frac(0.5));
+        let step = Step::with_defs(vec![], HoldSpec::frac(0.5));
         assert!(step.setup.is_empty());
         assert!(step.ops.is_empty());
     }
@@ -4241,7 +4241,7 @@ mod tests {
     fn step_with_defs_populated() {
         let step = Step::with_defs(
             vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")],
-            HoldSpec::Fixed(Duration::from_secs(5)),
+            HoldSpec::fixed(Duration::from_secs(5)),
         );
         assert!(!step.setup.is_empty());
         assert!(step.ops.is_empty());
@@ -4262,7 +4262,7 @@ mod tests {
     fn step_set_ops_replaces() {
         let step = Step::new(
             vec![Op::AddCgroup { name: "a".into() }],
-            HoldSpec::Frac(0.5),
+            HoldSpec::frac(0.5),
         )
         .set_ops(vec![
             Op::AddCgroup { name: "b".into() },
@@ -5563,7 +5563,7 @@ mod tests {
             known_flags: None,
             metric_bounds: None,
         };
-        let step = Step::with_payload(&FIO, HoldSpec::Fixed(Duration::from_millis(50)));
+        let step = Step::with_payload(&FIO, HoldSpec::fixed(Duration::from_millis(50)));
         assert_eq!(step.ops.len(), 1);
         match &step.ops[0] {
             Op::RunPayload {
@@ -5930,7 +5930,9 @@ mod tests {
     // -- payload_handles drain on error paths in execute_steps_with --
 
     /// An Err return from `execute_steps_with` (here: a vacuous
-    /// `HoldSpec::Fixed(ZERO)` caught by up-front validation)
+    /// `HoldSpec::Frac(0.0)` caught by up-front validation — `Frac`
+    /// rejects `f <= 0.0` per types.rs:1859, while `Fixed(ZERO)` is
+    /// deliberately valid for op-only settle steps per types.rs:1854)
     /// leaves no live payload_handles because no setup/ops ran.
     /// Pins the invariant that the pre-ops validation path does
     /// not spawn anything that could then leak.
@@ -6232,7 +6234,7 @@ mod tests {
         let err = execute_scenario_with(
             &ctx,
             backdrop,
-            vec![Step::new(vec![], HoldSpec::Fixed(Duration::from_millis(1)))],
+            vec![Step::new(vec![], HoldSpec::fixed(Duration::from_millis(1)))],
             None,
         )
         .unwrap_err();

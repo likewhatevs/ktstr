@@ -114,12 +114,12 @@ fn ctprof_pipeline_e2e_capture_write_load_compare(ctx: &Ctx) -> Result<AssertRes
 
     // First workload window: default HoldSpec::FULL occupies the
     // full step duration. `execute_steps` with one Step carrying
-    // `HoldSpec::Frac(0.5)` uses half of `ctx.duration` so the
+    // `HoldSpec::frac(0.5)` uses half of `ctx.duration` so the
     // remaining half is available for the second window below.
     let baseline_steps = vec![Step {
         setup: vec![CgroupDef::named("cg_baseline").workers(ctx.workers_per_cgroup)].into(),
         ops: vec![],
-        hold: HoldSpec::Frac(0.5),
+        hold: HoldSpec::frac(0.5),
     }];
     let baseline_workload_result = execute_steps(ctx, baseline_steps)?;
 
@@ -141,7 +141,7 @@ fn ctprof_pipeline_e2e_capture_write_load_compare(ctx: &Ctx) -> Result<AssertRes
     let candidate_steps = vec![Step {
         setup: vec![CgroupDef::named("cg_candidate").workers(ctx.workers_per_cgroup)].into(),
         ops: vec![],
-        hold: HoldSpec::Frac(0.5),
+        hold: HoldSpec::frac(0.5),
     }];
     let candidate_workload_result = execute_steps(ctx, candidate_steps)?;
 

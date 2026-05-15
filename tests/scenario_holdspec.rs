@@ -15,11 +15,9 @@ const _: () = requires_copy::<HoldSpec>();
 #[test]
 fn holdspec_is_copy_across_loop_reuse() {
     for original in [
-        HoldSpec::Fixed(Duration::from_millis(10)),
-        HoldSpec::Frac(0.5),
-        HoldSpec::Loop {
-            interval: Duration::from_millis(100),
-        },
+        HoldSpec::fixed(Duration::from_millis(10)),
+        HoldSpec::frac(0.5),
+        HoldSpec::loop_at(Duration::from_millis(100)),
         HoldSpec::FULL,
     ] {
         for _ in 0..3 {

@@ -371,7 +371,7 @@ fn scenario_yield_heavy(ctx: &Ctx) -> Result<AssertResult> {
         ]
         .into(),
         ops: vec![],
-        hold: HoldSpec::Fixed(Duration::from_secs(8)),
+        hold: HoldSpec::fixed(Duration::from_secs(8)),
     }];
     execute_steps(ctx, steps)
 }
@@ -514,11 +514,11 @@ fn cover_op_move_all_tasks(ctx: &Ctx) -> Result<AssertResult> {
                 CgroupDef::named("cg_src").workers(2),
                 CgroupDef::named("cg_dst"),
             ],
-            HoldSpec::Fixed(std::time::Duration::from_secs(2)),
+            HoldSpec::fixed(std::time::Duration::from_secs(2)),
         ),
         Step::new(
             vec![Op::move_all_tasks("cg_src", "cg_dst")],
-            HoldSpec::Fixed(std::time::Duration::from_secs(3)),
+            HoldSpec::fixed(std::time::Duration::from_secs(3)),
         ),
     ];
     execute_steps(ctx, steps)
@@ -531,7 +531,7 @@ fn cover_op_spawn_host(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
         Step::with_defs(
             vec![CgroupDef::named("cg_0").workers(2)],
-            HoldSpec::Fixed(ctx.settle + ctx.duration),
+            HoldSpec::fixed(ctx.settle + ctx.duration),
         )
         .set_ops(vec![Op::spawn_host(
             WorkSpec::default().workers(2).work_type(WorkType::SpinWait),
@@ -556,7 +556,7 @@ fn cover_work_type_sequence(ctx: &Ctx) -> Result<AssertResult> {
     };
     let steps = vec![Step::with_defs(
         vec![CgroupDef::named("cg_seq").workers(2).work_type(seq)],
-        HoldSpec::Fixed(ctx.settle + ctx.duration),
+        HoldSpec::fixed(ctx.settle + ctx.duration),
     )];
     execute_steps(ctx, steps)
 }

@@ -171,7 +171,7 @@ fn scenario_clean_exit_gate_suppresses_dump(ctx: &ktstr::scenario::Ctx) -> Resul
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
         ops: vec![],
-        hold: HoldSpec::Fixed(std::time::Duration::from_secs(2)),
+        hold: HoldSpec::fixed(std::time::Duration::from_secs(2)),
     }];
     let mut result = execute_steps(ctx, steps)?;
 
@@ -364,7 +364,7 @@ fn scenario_translate_none_with_latch_idle_suppresses_dump(
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
         ops: vec![],
-        hold: HoldSpec::Fixed(std::time::Duration::from_secs(2)),
+        hold: HoldSpec::fixed(std::time::Duration::from_secs(2)),
     }];
     let mut result = execute_steps(ctx, steps)?;
 
@@ -412,7 +412,7 @@ fn scenario_translate_none_with_latch_triggered_emits_dump(
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
         ops: vec![],
-        hold: HoldSpec::Fixed(std::time::Duration::from_secs(2)),
+        hold: HoldSpec::fixed(std::time::Duration::from_secs(2)),
     }];
     let mut result = execute_steps(ctx, steps)?;
 

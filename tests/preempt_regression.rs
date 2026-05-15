@@ -237,7 +237,7 @@ fn preempt_regression_fault_under_load(ctx: &Ctx) -> Result<AssertResult> {
                 .workers(4)
                 .work_type(WorkType::SpinWait),
         ],
-        HoldSpec::Fixed(ctx.settle + ctx.duration),
+        HoldSpec::fixed(ctx.settle + ctx.duration),
     )];
 
     execute_steps(ctx, steps)

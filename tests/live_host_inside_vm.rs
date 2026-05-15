@@ -67,7 +67,7 @@ fn live_host_pipeline_inside_guest_produces_expected_shape(ctx: &Ctx) -> Result<
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
         ops: vec![],
-        hold: HoldSpec::Fixed(std::time::Duration::from_secs(2)),
+        hold: HoldSpec::fixed(std::time::Duration::from_secs(2)),
     }];
     let _ = execute_steps(ctx, steps)?;
 
