@@ -158,12 +158,12 @@ Each LLC domain is represented by an `LlcInfo`:
 pub struct LlcInfo {
     cpus: Vec<usize>,
     numa_node: usize,
-    cache_size_kb: Option<u64>,
+    cache_size_kib: Option<u64>,
     cores: BTreeMap<usize, Vec<usize>>, // core_id -> SMT siblings
 }
 ```
 
-Accessors: `cpus()`, `numa_node()`, `cache_size_kb()`, `cores()`,
+Accessors: `cpus()`, `numa_node()`, `cache_size_kib()`, `cores()`,
 `num_cores()`.
 
 `num_cores()` returns the number of physical cores (from the core map),

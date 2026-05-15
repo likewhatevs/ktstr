@@ -17,7 +17,7 @@ use std::path::Path;
 pub struct LlcInfo {
     cpus: Vec<usize>,
     numa_node: usize,
-    cache_size_kb: Option<u64>,
+    cache_size_kib: Option<u64>,
     /// core_id -> sorted list of CPU IDs (SMT siblings).
     cores: BTreeMap<usize, Vec<usize>>,
 }
@@ -32,8 +32,8 @@ impl LlcInfo {
         self.numa_node
     }
     /// LLC cache size in KiB when sysfs reported it, else `None`.
-    pub fn cache_size_kb(&self) -> Option<u64> {
-        self.cache_size_kb
+    pub fn cache_size_kib(&self) -> Option<u64> {
+        self.cache_size_kib
     }
     /// Per-core sibling map: `core_id -> sorted list of CPU IDs that
     /// are SMT siblings of that core`.
@@ -240,7 +240,7 @@ fn read_numa_node(cpu: usize) -> Result<usize> {
     Ok(0)
 }
 
-/// Read the LLC cache size in KB for a CPU from sysfs.
+/// Read the LLC cache size in KiB for a CPU from sysfs.
 fn read_llc_cache_size(cpu: usize) -> Option<u64> {
     let llc_index = find_llc_index(cpu).ok()?;
     let size_path = format!("/sys/devices/system/cpu/cpu{cpu}/cache/index{llc_index}/size");
@@ -248,22 +248,23 @@ fn read_llc_cache_size(cpu: usize) -> Option<u64> {
     parse_cache_size(size_str.trim())
 }
 
-/// Parse a cache size string like "32768K" or "32M" into KB.
+/// Parse a cache size string like "32768K" or "32M" into KiB.
 ///
-/// Bare numeric input is interpreted as bytes and converted to KB via
-/// ceiling division — a non-zero byte count smaller than 1 KB still
-/// rounds up to 1 KB rather than silently becoming 0 KB (which a
-/// consumer would read as "no cache"). Integer division on
-/// `500 / 1024 = 0` is the failure mode being avoided. Zero bytes
-/// still maps to 0 KB.
+/// The sysfs `cache/index*/size` files use binary multiples (K=KiB,
+/// M=MiB) per Linux convention for cache sizes. Bare numeric input
+/// is interpreted as bytes and converted to KiB via ceiling division
+/// — a non-zero byte count smaller than 1 KiB still rounds up to 1
+/// KiB rather than silently becoming 0 KiB (which a consumer would
+/// read as "no cache"). Integer division on `500 / 1024 = 0` is the
+/// failure mode being avoided. Zero bytes still maps to 0 KiB.
 fn parse_cache_size(s: &str) -> Option<u64> {
     let s = s.trim();
-    if let Some(kb) = s.strip_suffix('K') {
-        kb.parse().ok()
-    } else if let Some(mb) = s.strip_suffix('M') {
-        mb.parse::<u64>().ok().map(|v| v * 1024)
+    if let Some(kib) = s.strip_suffix('K') {
+        kib.parse().ok()
+    } else if let Some(mib) = s.strip_suffix('M') {
+        mib.parse::<u64>().ok().map(|v| v * 1024)
     } else {
-        // Bare number: assume bytes, ceil-convert to KB so sub-KB
+        // Bare number: assume bytes, ceil-convert to KiB so sub-KiB
         // values don't collapse to 0.
         s.parse::<u64>().ok().map(|v| v.div_ceil(1024))
     }
@@ -351,7 +352,7 @@ fn synthesize_fallback_llc(cpus: &[usize], numa_node: usize) -> LlcInfo {
     LlcInfo {
         cpus: cpus.to_vec(),
         numa_node,
-        cache_size_kb: None,
+        cache_size_kib: None,
         cores,
     }
 }
@@ -441,7 +442,7 @@ impl TestTopology {
                     LlcInfo {
                         cpus: vec![cpu_id],
                         numa_node: node_id,
-                        cache_size_kb: llc_cache_sizes.get(&llc_id).copied().flatten(),
+                        cache_size_kib: llc_cache_sizes.get(&llc_id).copied().flatten(),
                         cores,
                     }
                 });
@@ -822,7 +823,7 @@ impl TestTopology {
                 LlcInfo {
                     cpus: (start..end).collect(),
                     numa_node: topo.numa_node_of(l as u32) as usize,
-                    cache_size_kb: None,
+                    cache_size_kib: None,
                     cores: core_map,
                 }
             })
@@ -918,7 +919,7 @@ impl TestTopology {
                 LlcInfo {
                     cpus: (start..end).collect(),
                     numa_node: i,
-                    cache_size_kb: None,
+                    cache_size_kib: None,
                     cores: BTreeMap::new(),
                 }
             })
@@ -1257,17 +1258,17 @@ mod tests {
     fn parse_cache_size_formats() {
         assert_eq!(parse_cache_size("32768K"), Some(32768));
         assert_eq!(parse_cache_size("32M"), Some(32768));
-        // 65536 bytes = 64 KB exactly.
+        // 65536 bytes = 64 KiB exactly.
         assert_eq!(parse_cache_size("65536"), Some(64));
-        // Sub-KB bare-byte values round up to 1 KB instead of 0 KB.
+        // Sub-KiB bare-byte values round up to 1 KiB instead of 0 KiB.
         // Consumers treat 0 as "no cache"; a 500-byte cache is not
         // "no cache", it's "small cache."
         assert_eq!(parse_cache_size("500"), Some(1));
         assert_eq!(parse_cache_size("1"), Some(1));
         assert_eq!(parse_cache_size("1023"), Some(1));
-        // Just over 1 KB still ceils to 2 KB.
+        // Just over 1 KiB still ceils to 2 KiB.
         assert_eq!(parse_cache_size("1025"), Some(2));
-        // Exact zero bytes maps to zero KB.
+        // Exact zero bytes maps to zero KiB.
         assert_eq!(parse_cache_size("0"), Some(0));
     }
 
@@ -1276,7 +1277,7 @@ mod tests {
         let llc = LlcInfo {
             cpus: vec![0, 1, 2, 3],
             numa_node: 0,
-            cache_size_kb: None,
+            cache_size_kib: None,
             cores: BTreeMap::from([(0, vec![0, 1]), (1, vec![2, 3])]),
         };
         assert_eq!(llc.num_cores(), 2);
@@ -1287,7 +1288,7 @@ mod tests {
         let llc = LlcInfo {
             cpus: vec![0, 1, 2, 3],
             numa_node: 0,
-            cache_size_kb: None,
+            cache_size_kib: None,
             cores: BTreeMap::new(),
         };
         assert_eq!(llc.num_cores(), 4);
@@ -1328,7 +1329,7 @@ mod tests {
 
     #[test]
     fn cache_size_bare_number() {
-        // Bare number without suffix is treated as bytes, converted to KB.
+        // Bare number without suffix is treated as bytes, converted to KiB.
         assert_eq!(parse_cache_size("1024"), Some(1));
     }
 
@@ -1648,7 +1649,7 @@ mod tests {
         assert_eq!(llc.numa_node(), 2);
 
         // Cache size unknown (we had no sysfs entries to read).
-        assert!(llc.cache_size_kb().is_none());
+        assert!(llc.cache_size_kib().is_none());
 
         // One core per CPU (no SMT sibling reconstruction possible).
         assert_eq!(llc.cores().len(), cpus.len());
