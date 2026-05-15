@@ -110,6 +110,111 @@ pub(crate) fn extract_sched_ext_dump(output: &str) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+/// Extract a one-line "BUG SUMMARY" from the scheduler log and the
+/// sched_ext dump for top-of-stderr placement on test failure.
+///
+/// Primary anchor: the kernel's scheduler-exit emission at
+/// `kernel/sched/ext.c:6161-6163` produces
+///
+/// ```text
+/// <task>[<pid>] triggered exit kind <N>:
+///   <reason> (<msg>)
+/// ```
+///
+/// routed through the `sched_ext_dump` tracepoint so each line in the
+/// trace_pipe stream carries a `<task>  [<cpu>]  <ts>: sched_ext_dump: `
+/// prefix. The scan locates the `triggered exit kind` anchor and
+/// returns the IMMEDIATELY-FOLLOWING line's body (everything after
+/// `sched_ext_dump:`), trimmed. That body carries the actionable
+/// BPF error text the test author needs to see.
+///
+/// Fallback: when no `triggered exit kind` anchor is present in the
+/// dump (truncated console, pre-attach failure, etc.), scan the
+/// scheduler log for the first line containing `scx_bpf_error` —
+/// the userspace prefix scheduler binaries emit before kernel
+/// exits. The matched line is returned trimmed.
+///
+/// First-wins: when multiple `triggered exit kind` events appear
+/// (rapid load+disable cycles per `dmesg_scx.rs:157-159`), the
+/// first is returned. Closer-event lines
+/// (`sched_ext: ... disabled (...)`) do NOT match — they describe
+/// the disable, not the trigger that caused it.
+///
+/// ANSI CSI escape sequences are stripped from BOTH inputs before
+/// the substring scan, so a scheduler binary that emits colored
+/// logs does not break extraction. The returned `String` never
+/// contains ANSI escapes.
+///
+/// Returns `None` when no actionable text is found OR when the
+/// extracted text trims to empty — suppresses a noisy top-of-stderr
+/// `BUG SUMMARY:` line when there is no bug to summarize.
+pub(crate) fn extract_bug_summary(sched_log: &str, dump: &str) -> Option<String> {
+    let dump_clean = strip_ansi_csi(dump);
+    let lines: Vec<&str> = dump_clean.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if line.contains("triggered exit kind")
+            && let Some(next) = lines.get(i + 1)
+        {
+            let body = next
+                .find("sched_ext_dump:")
+                .map(|p| &next[p + "sched_ext_dump:".len()..])
+                .unwrap_or(next)
+                .trim();
+            if !body.is_empty() {
+                return Some(body.to_string());
+            }
+        }
+    }
+    let sched_clean = strip_ansi_csi(sched_log);
+    for line in sched_clean.lines() {
+        if line.contains("scx_bpf_error") {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Strip ANSI CSI escape sequences (`\x1b[...<letter>`) from a
+/// string. Used by [`extract_bug_summary`] so a colorized
+/// scheduler-log line does not break the substring scan. Bytes
+/// outside CSI sequences pass through unchanged.
+fn strip_ansi_csi(s: &str) -> String {
+    // Common case: no ESC byte at all — return without allocating
+    // a separate Vec + roundtripping through from_utf8. Failure-
+    // path call site, but every passing test runs this on its
+    // sched_log + dump too via the eval.rs pre-compute, so the
+    // fast path matters.
+    if !s.contains('\x1b') {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
+                j += 1;
+            }
+            i = j.saturating_add(1);
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    // `out` is byte-for-byte copies from a valid &str MINUS
+    // 7-bit ASCII CSI sequences. Multi-byte UTF-8 sequences are
+    // never inside CSI (their continuation bytes 0x80-0xbf can't
+    // appear in CSI bodies which only use 0x20-0x3f params /
+    // intermediates and 0x40-0x7e terminators), so the skipped
+    // ranges never split a multi-byte codepoint. The result is
+    // guaranteed valid UTF-8.
+    String::from_utf8(out).expect("strip_ansi_csi preserves UTF-8")
+}
+
 /// Extract exit reason from `sched_ext_dump:` trace lines when the
 /// `sched_ext: BPF scheduler "..." disabled (...)` anchor line is
 /// absent (truncated console). Looks for `triggered exit kind NNNN:`
@@ -709,6 +814,137 @@ mod tests {
             !parsed.contains("unrelated noise"),
             "parser leaked a non-sched_ext_dump line: {parsed}"
         );
+    }
+
+    // -- extract_bug_summary --
+
+    /// Canonical kernel dump format: `triggered exit kind` anchor
+    /// plus next line's reason via `sched_ext_dump:` prefix.
+    /// Extract the reason body.
+    #[test]
+    fn extract_bug_summary_from_canonical_kernel_dump() {
+        let dump = "  ktstr-1234   [001]   0.500: sched_ext_dump: scheduler[5678] triggered exit kind 5:\n  \
+                      ktstr-1234   [001]   0.501: sched_ext_dump:   apply_cell_config returned -EINVAL (apply_cell_config)\n";
+        let summary = extract_bug_summary("", dump).expect("dump with anchor must yield summary");
+        assert!(
+            summary.contains("apply_cell_config returned -EINVAL"),
+            "summary must carry the BPF error text: {summary}",
+        );
+        assert!(
+            !summary.contains("sched_ext_dump:"),
+            "trace_pipe prefix must be stripped from the returned body: {summary}",
+        );
+    }
+
+    /// Multi-event dump: first event wins. A regression that
+    /// returned the LAST event or concatenated multiple would
+    /// surface here.
+    #[test]
+    fn extract_bug_summary_first_event_wins() {
+        let dump = "  ktstr-1   [001]   0.500: sched_ext_dump: scheduler[1] triggered exit kind 5:\n  \
+                      ktstr-1   [001]   0.501: sched_ext_dump:   first_error returned -EINVAL\n  \
+                      ktstr-1   [001]   1.000: sched_ext_dump: scheduler[2] triggered exit kind 5:\n  \
+                      ktstr-1   [001]   1.001: sched_ext_dump:   second_error returned -EBUSY\n";
+        let summary = extract_bug_summary("", dump).expect("multi-event dump must yield summary");
+        assert!(
+            summary.contains("first_error"),
+            "first event must win: {summary}",
+        );
+        assert!(
+            !summary.contains("second_error"),
+            "second event must NOT appear in the BUG SUMMARY: {summary}",
+        );
+    }
+
+    /// No anchor in dump, fallback to sched_log `scx_bpf_error`.
+    /// Pin the fallback path so a future regression that drops it
+    /// (e.g. inverts the conditional logic) trips here.
+    #[test]
+    fn extract_bug_summary_fallback_to_sched_log_scx_bpf_error() {
+        let sched_log = "starting up\n\
+                         scx_bpf_error: apply_cell_config: cell_id=3 returned -EINVAL\n\
+                         exiting\n";
+        let summary = extract_bug_summary(sched_log, "")
+            .expect("sched_log with scx_bpf_error must yield summary");
+        assert!(
+            summary.contains("scx_bpf_error"),
+            "fallback must surface the scx_bpf_error line: {summary}",
+        );
+        assert!(
+            summary.contains("apply_cell_config"),
+            "fallback must surface the full error line: {summary}",
+        );
+    }
+
+    /// No bug anywhere: returns None. A regression that emitted
+    /// an empty BUG SUMMARY: line for every passing test would
+    /// surface as a noise floor; pin None here.
+    #[test]
+    fn extract_bug_summary_none_when_no_error_present() {
+        assert!(extract_bug_summary("clean scheduler log\n", "boot complete\n").is_none());
+        assert!(extract_bug_summary("", "").is_none());
+    }
+
+    /// ANSI-colored input gets stripped before scan. A colored
+    /// log from a scheduler binary that wraps its error in
+    /// `\x1b[31m...\x1b[0m` (red text) must still surface the
+    /// underlying text — and the returned summary must NOT carry
+    /// the ANSI escapes.
+    #[test]
+    fn extract_bug_summary_strips_ansi_csi() {
+        let sched_log = "\x1b[31mscx_bpf_error\x1b[0m: red-wrapped error text\n";
+        let summary = extract_bug_summary(sched_log, "")
+            .expect("ANSI-wrapped error line must still match scx_bpf_error");
+        assert!(
+            !summary.contains('\x1b'),
+            "ANSI escapes must be stripped from the returned summary: {summary:?}",
+        );
+        assert!(
+            summary.contains("scx_bpf_error"),
+            "the underlying text must still be found: {summary}",
+        );
+    }
+
+    /// ANSI-colored DUMP input gets stripped before the dump-path
+    /// anchor scan. Symmetric with `extract_bug_summary_strips_ansi_csi`
+    /// which only covered the sched_log fallback path. A regression
+    /// in dump-side ANSI handling (e.g. forgetting to call
+    /// strip_ansi_csi on the dump argument) would surface here but
+    /// not in the sched_log test.
+    #[test]
+    fn extract_bug_summary_strips_ansi_from_dump_anchor() {
+        let dump = "  ktstr-1234   [001]   0.500: sched_ext_dump: \x1b[1mscheduler[5678] triggered exit kind 5:\x1b[0m\n  \
+                      ktstr-1234   [001]   0.501: sched_ext_dump:   \x1b[31mapply_cell_config returned -EINVAL\x1b[0m (apply_cell_config)\n";
+        let summary = extract_bug_summary("", dump)
+            .expect("ANSI-wrapped dump anchor must still match");
+        assert!(
+            !summary.contains('\x1b'),
+            "ANSI escapes must be stripped from the dump-path returned summary: {summary:?}",
+        );
+        assert!(
+            summary.contains("apply_cell_config returned -EINVAL"),
+            "the underlying body text must still be extracted: {summary}",
+        );
+    }
+
+    /// Whitespace-only extracted body: returns None (suppress
+    /// noise). A regression that returned `Some("")` would inject
+    /// empty `BUG SUMMARY:` lines into stderr — pin None here.
+    #[test]
+    fn extract_bug_summary_none_when_body_is_whitespace() {
+        let dump = "  ktstr-1   [001]   0.5: sched_ext_dump: foo triggered exit kind 5:\n  \
+                      ktstr-1   [001]   0.5: sched_ext_dump:   \n";
+        assert!(extract_bug_summary("", dump).is_none());
+    }
+
+    /// Closer-only dump (BPF scheduler disabled but no
+    /// `triggered exit kind` anchor) returns None. Pin so a
+    /// future scan that picked disable closers as the summary
+    /// would surface here.
+    #[test]
+    fn extract_bug_summary_none_on_closer_only_dump() {
+        let dump = "  ktstr-1   [001]   0.5: sched_ext_dump: sched_ext: BPF scheduler \"scx_mitosis\" disabled (Error)\n";
+        assert!(extract_bug_summary("", dump).is_none());
     }
 
     // -- extract_kernel_version --

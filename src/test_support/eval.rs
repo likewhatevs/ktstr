@@ -1692,9 +1692,12 @@ fn evaluate_vm_result(
 
     let sched_label = scheduler_label(&entry.scheduler.binary);
     let output = &result.output;
-    let dump_section = extract_sched_ext_dump(&result.stderr)
-        .map(|d| format!("\n\n--- sched_ext dump ---\n{d}"))
-        .unwrap_or_default();
+    let raw_dump = extract_sched_ext_dump(&result.stderr).unwrap_or_default();
+    let dump_section = if raw_dump.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n--- sched_ext dump ---\n{raw_dump}")
+    };
     // Concatenate bulk-port `MSG_TYPE_SCHED_LOG` chunks then run
     // the marker-pair extractor on the merged stream — pre-bincode
     // migration the markers travelled in `output` (COM2). Either
@@ -1733,6 +1736,27 @@ fn evaluate_vm_result(
             }
         })
         .unwrap_or_default();
+    // Hoist the first actionable `scx_bpf_error`-class line to the
+    // TOP of the failure message (above the existing noisy sections
+    // like sched_log / sched_ext dump / monitor). Without this hint
+    // the test author had to scroll past ~200 lines of trace_pipe
+    // dump output to find the line that explains why the scheduler
+    // exited; see KTSTR_API_ISSUES_FROM_SCX_MITOSIS.md B4 for the
+    // motivating user report. Extraction is suppressed when there
+    // is nothing actionable to surface so passing tests stay quiet.
+    let bug_summary_line = match crate::test_support::output::extract_bug_summary(
+        sched_log_input,
+        &raw_dump,
+    ) {
+        Some(text) => {
+            if crate::cli::stderr_color() {
+                format!("\x1b[1;31mBUG SUMMARY:\x1b[0m {text}\n")
+            } else {
+                format!("BUG SUMMARY: {text}\n")
+            }
+        }
+        None => String::new(),
+    };
 
     let tl_ctx = crate::timeline::TimelineContext {
         kernel: extract_kernel_version(&result.stderr),
@@ -1944,8 +1968,9 @@ fn evaluate_vm_result(
             let temporal_section =
                 crate::test_support::output::format_temporal_assertions_section(&check_result);
             let msg = format!(
-                "{}ktstr_test '{}'{} [topo={}] failed:\n  {}{}{}{}{}{}{}{}{}{}",
+                "{}{}ktstr_test '{}'{} [topo={}] failed:\n  {}{}{}{}{}{}{}{}{}{}",
                 fingerprint_line,
+                bug_summary_line,
                 entry.name,
                 sched_label,
                 topo,
@@ -1995,8 +2020,9 @@ fn evaluate_vm_result(
                 let timeline_section = build_timeline_section();
                 let monitor_section = format_monitor_section(monitor, merged_assert);
                 let msg = format!(
-                    "{}ktstr_test '{}'{} [topo={}] {ERR_MONITOR_FAILED_AFTER_SCENARIO}:\n  {}{}{}{}{}",
+                    "{}{}ktstr_test '{}'{} [topo={}] {ERR_MONITOR_FAILED_AFTER_SCENARIO}:\n  {}{}{}{}{}",
                     fingerprint_line,
+                    bug_summary_line,
                     entry.name,
                     sched_label,
                     topo,
@@ -2122,8 +2148,9 @@ fn evaluate_vm_result(
             }
         };
         let msg = format!(
-            "{}ktstr_test '{}'{} [topo={}] {}{}{}{}{}{}{}{}{}",
+            "{}{}ktstr_test '{}'{} [topo={}] {}{}{}{}{}{}{}{}{}",
             fingerprint_line,
+            bug_summary_line,
             entry.name,
             sched_label,
             topo,
@@ -2161,8 +2188,9 @@ fn evaluate_vm_result(
         ERR_NO_TEST_FUNCTION_OUTPUT.to_string()
     };
     let msg = format!(
-        "{}ktstr_test '{}'{} [topo={}] {}{}{}{}{}{}{}",
+        "{}{}ktstr_test '{}'{} [topo={}] {}{}{}{}{}{}{}",
         fingerprint_line,
+        bug_summary_line,
         entry.name,
         sched_label,
         topo,
