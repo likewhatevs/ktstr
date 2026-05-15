@@ -259,20 +259,8 @@ impl Backdrop {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{OutputFormat, PayloadKind};
 
-    const TEST_PAYLOAD: Payload = Payload {
-        name: "test_bin",
-        kind: PayloadKind::Binary("/bin/true"),
-        output: OutputFormat::ExitCode,
-        default_args: &[],
-        default_checks: &[],
-        metrics: &[],
-        include_files: &[],
-        uses_parent_pgrp: false,
-        known_flags: None,
-        metric_bounds: None,
-    };
+    const TEST_PAYLOAD: Payload = Payload::binary("test_bin", "/bin/true");
 
     /// Distinct-named sibling of `TEST_PAYLOAD` so payload-order
     /// tests can discriminate position via the name field. Without
@@ -280,18 +268,18 @@ mod tests {
     /// produce `[test_bin, test_bin]` regardless of order — a
     /// `reverse()` regression would silently pass any name-based
     /// assertion.
-    const TEST_PAYLOAD_2: Payload = Payload {
-        name: "test_bin_2",
-        kind: PayloadKind::Binary("/bin/false"),
-        output: OutputFormat::ExitCode,
-        default_args: &[],
-        default_checks: &[],
-        metrics: &[],
-        include_files: &[],
-        uses_parent_pgrp: false,
-        known_flags: None,
-        metric_bounds: None,
-    };
+    const TEST_PAYLOAD_2: Payload = Payload::binary("test_bin_2", "/bin/false");
+
+    /// Additional distinct-named payloads so
+    /// `with_payloads_preserves_declaration_order_for_many_entries`
+    /// can exercise a 7-distinct-payload pattern matching the
+    /// cgroups sibling test — any pairwise swap of any two indices
+    /// surfaces as a name mismatch at the swapped index.
+    const TEST_PAYLOAD_3: Payload = Payload::binary("test_bin_3", "/bin/false");
+    const TEST_PAYLOAD_4: Payload = Payload::binary("test_bin_4", "/bin/false");
+    const TEST_PAYLOAD_5: Payload = Payload::binary("test_bin_5", "/bin/false");
+    const TEST_PAYLOAD_6: Payload = Payload::binary("test_bin_6", "/bin/false");
+    const TEST_PAYLOAD_7: Payload = Payload::binary("test_bin_7", "/bin/false");
 
     #[test]
     fn empty_backdrop_has_no_entities() {
@@ -373,34 +361,31 @@ mod tests {
 
     /// Declaration order is preserved across a many-entry payload
     /// batch. Sibling of `with_cgroups_preserves_declaration_order_for_many_entries`
-    /// — catches arbitrary shuffle/sort/partition/reverse
+    /// — uses 7 fully-distinct payloads so any pairwise swap (including
+    /// non-adjacent same-name swaps that an interleaved 2-distinct-payload
+    /// pattern would miss) surfaces as a name mismatch at the swapped
+    /// index. Catches arbitrary shuffle/sort/partition/reverse
     /// regressions across a larger collection than the 2-entry
     /// `with_payloads_extends_in_order` can surface.
     #[test]
     fn with_payloads_preserves_declaration_order_for_many_entries() {
-        // Interleave the two distinct payloads in an asymmetric (not
-        // palindromic) pattern so a single pairwise swap surfaces
-        // as a name mismatch at that index AND so a `reverse()`
-        // regression also surfaces — a perfectly alternating
-        // `[1, 2, 1, 2, 1, 2, 1]` pattern is palindromic under
-        // reverse and would silently pass that case.
         let inputs = [
             &TEST_PAYLOAD,
-            &TEST_PAYLOAD,
             &TEST_PAYLOAD_2,
-            &TEST_PAYLOAD,
-            &TEST_PAYLOAD_2,
-            &TEST_PAYLOAD_2,
-            &TEST_PAYLOAD,
+            &TEST_PAYLOAD_3,
+            &TEST_PAYLOAD_4,
+            &TEST_PAYLOAD_5,
+            &TEST_PAYLOAD_6,
+            &TEST_PAYLOAD_7,
         ];
         let expected = [
             "test_bin",
-            "test_bin",
             "test_bin_2",
-            "test_bin",
-            "test_bin_2",
-            "test_bin_2",
-            "test_bin",
+            "test_bin_3",
+            "test_bin_4",
+            "test_bin_5",
+            "test_bin_6",
+            "test_bin_7",
         ];
         let b = Backdrop::new().with_payloads(inputs);
         assert_eq!(b.payloads.len(), expected.len());
