@@ -782,6 +782,131 @@ pub(crate) fn run_ktstr_test_inner(
     result
 }
 
+/// Write a placeholder `failure-dump.json` at `path` when the file
+/// does not already exist. Called from the primary VM dispatch on
+/// failure paths where the freeze coordinator did NOT produce a
+/// real BPF-state dump (pre-attach failures: send_sys_rdy timeout,
+/// VM boot failure, scheduler binary load failure, post_vm callback
+/// failure) so the spec promise ("every failed test writes
+/// `<test_name>.failure-dump.json` to the sidecar dir") survives
+/// those code paths too.
+///
+/// The placeholder's `is_placeholder: true` field lets downstream
+/// tooling (stats compare, sidecar walkers) distinguish a stub
+/// from a real BPF dump. The `reason` string carries both the
+/// lifecycle stage classification AND — when extractable — the
+/// `BUG SUMMARY` text (per `extract_bug_summary` over the captured
+/// scheduler log + sched_ext dump), so the disk artifact carries
+/// the same actionable diagnostic the operator sees in stderr
+/// rather than a less-informative on-disk stub.
+///
+/// Durability: opens the `.tmp` file, writes, `fsync()`s, drops,
+/// then `rename(2)`s atomically. Matches the freeze coordinator's
+/// own atomic-publish pattern. A concurrent reader either sees no
+/// file or sees a complete stub, never a truncated one; a host
+/// crash between write and writeback preserves the data via the
+/// fsync.
+///
+/// Errors at every step (serialize, mkdir, file create, write,
+/// fsync, rename) emit a `tracing::warn` naming the path and the
+/// io error. The test failure itself surfaces via the
+/// normal stderr path; the stub is a best-effort augment, so the
+/// helper does not propagate any io::Error.
+fn write_placeholder_failure_dump_if_missing(path: &std::path::Path, result: &vmm::VmResult) {
+    if path.exists() {
+        return;
+    }
+    let stage_label =
+        crate::test_support::output::classify_init_stage(result.guest_messages.as_ref());
+    // Fold BUG SUMMARY into the on-disk reason so the disk artifact
+    // matches the stderr summary (the design's stated goal — see
+    // src/test_support/output.rs::extract_bug_summary).
+    let sched_log_merged =
+        crate::verifier::concat_sched_log_chunks(result.guest_messages.as_ref());
+    let sched_log_input: &str = if !sched_log_merged.is_empty() {
+        &sched_log_merged
+    } else {
+        &result.output
+    };
+    let raw_dump = extract_sched_ext_dump(&result.stderr).unwrap_or_default();
+    let bug_summary =
+        crate::test_support::output::extract_bug_summary(sched_log_input, &raw_dump);
+    let reason = match bug_summary {
+        Some(s) => format!(
+            "test failed at stage `{stage_label}`; no BPF state captured \
+             (probe did not attach before failure). BUG SUMMARY: {s}"
+        ),
+        None => format!(
+            "test failed at stage `{stage_label}`; no BPF state captured \
+             (probe did not attach before failure)"
+        ),
+    };
+    let stub = crate::monitor::dump::FailureDumpReport::placeholder(reason);
+    let json = match serde_json::to_string_pretty(&stub) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "eval: failed to serialize placeholder failure-dump"
+            );
+            return;
+        }
+    };
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(
+            error = %e,
+            path = %parent.display(),
+            "eval: failed to create parent dir for placeholder failure-dump"
+        );
+        return;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let mut file = match std::fs::File::create(&tmp) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %tmp.display(),
+                "eval: failed to create placeholder failure-dump tmp file"
+            );
+            return;
+        }
+    };
+    use std::io::Write;
+    if let Err(e) = file.write_all(json.as_bytes()) {
+        tracing::warn!(
+            error = %e,
+            path = %tmp.display(),
+            "eval: failed to write placeholder failure-dump"
+        );
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    if let Err(e) = file.sync_all() {
+        tracing::warn!(
+            error = %e,
+            path = %tmp.display(),
+            "eval: failed to fsync placeholder failure-dump tmp file"
+        );
+        // Don't bail — the data is in the page cache, rename will
+        // still publish a consistent file; only crash-safety is
+        // weakened. Operators see the warn either way.
+    }
+    drop(file);
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        tracing::warn!(
+            error = %e,
+            tmp = %tmp.display(),
+            target = %path.display(),
+            "eval: failed to rename placeholder failure-dump tmp file"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 fn run_ktstr_test_inner_impl(
     entry: &KtstrTestEntry,
     topo: Option<&TopoOverride>,
@@ -943,7 +1068,7 @@ fn run_ktstr_test_inner_impl(
         &guest_args,
         no_perf_mode,
     )
-    .failure_dump_path(primary_dump_path)
+    .failure_dump_path(primary_dump_path.clone())
     .performance_mode(entry.performance_mode);
 
     // Merge order: default_checks -> scheduler.assert -> per-test assert.
@@ -1344,6 +1469,24 @@ fn run_ktstr_test_inner_impl(
             return Err(e.context("run ktstr_test VM"));
         }
     };
+    // When the primary VM failed but the freeze coordinator never
+    // wrote the real failure-dump (i.e. pre-attach failures:
+    // send_sys_rdy timeout, VM boot failure, scheduler binary load
+    // failure — anything that returns before the BPF probe attaches
+    // and the freeze-coord's err_triggered watchpoint can fire),
+    // emit a placeholder dump at the documented path so operators
+    // querying `find target/ktstr -name '*.failure-dump.json'` always
+    // see SOMETHING when a test failed. Spec-promise parity: the
+    // sidecar dir guarantees one `<test_name>.failure-dump.json`
+    // per failed run regardless of whether real BPF state could be
+    // captured. The `is_placeholder: true` field on
+    // [`crate::monitor::dump::FailureDumpReport`] lets downstream
+    // tooling (stats compare, sidecar walkers) distinguish a stub
+    // from a real BPF dump.
+    if !result.success {
+        write_placeholder_failure_dump_if_missing(&primary_dump_path, &result);
+    }
+
     // Run the test entry's optional host-side `post_vm` callback.
     // The `#[ktstr_test]` scenario function (`entry.func`) runs
     // INSIDE the guest VM and cannot read host-side state — most
@@ -1356,8 +1499,17 @@ fn run_ktstr_test_inner_impl(
     // the returned diagnostic, before sidecar write or
     // `evaluate_vm_result`. Tests that don't set `post_vm`
     // (the default) bypass this branch.
-    if let Some(post_vm) = entry.post_vm {
-        post_vm(&result)?;
+    if let Some(post_vm) = entry.post_vm
+        && let Err(e) = post_vm(&result)
+    {
+        // post_vm failure: the guest itself may have returned
+        // result.success=true, but the host-side check overrules
+        // it as a failure. Emit the placeholder dump too (if not
+        // already present from the earlier !result.success path)
+        // so spec-promise parity holds even when the failure mode
+        // is host-side rather than guest-side.
+        write_placeholder_failure_dump_if_missing(&primary_dump_path, &result);
+        return Err(e);
     }
 
     // Release VM resources (CPU/LLC flocks, guest memory) before
@@ -5821,5 +5973,166 @@ mod tests {
         assert!(!restored.stderr.contains(STDOUT_MARKER));
         assert_eq!(restored.payload_index, original.payload_index);
         assert_eq!(restored.hint.as_deref(), Some("bulk-focus"));
+    }
+
+    // -- write_placeholder_failure_dump_if_missing --
+    //
+    // Pins the spec-promise that every failed test leaves a JSON
+    // failure-dump file on disk (real for scheduler-attached
+    // failures, placeholder for pre-attach failures). Tests
+    // exercise the helper directly without booting a VM, so the
+    // coverage matrix is deterministic and runs well under a
+    // second.
+
+    /// Failure + path missing → writes placeholder; file exists and
+    /// parses as a FailureDumpReport with is_placeholder=true.
+    #[test]
+    fn placeholder_dump_writes_when_path_missing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test_writes.failure-dump.json");
+        let result = vmm::VmResult {
+            success: false,
+            ..vmm::VmResult::test_fixture()
+        };
+        write_placeholder_failure_dump_if_missing(&path, &result);
+        assert!(path.exists(), "placeholder must land at the canonical path");
+        let body = std::fs::read_to_string(&path).expect("readable");
+        let report: crate::monitor::dump::FailureDumpReport =
+            serde_json::from_str(&body).expect("valid FailureDumpReport JSON");
+        assert!(
+            report.is_placeholder,
+            "stub must carry is_placeholder=true",
+        );
+        let reason = report
+            .sdt_alloc_unavailable
+            .as_deref()
+            .expect("placeholder sets sdt_alloc_unavailable");
+        assert!(
+            reason.contains("no BPF state captured"),
+            "reason must explain why no real dump exists: {reason}",
+        );
+    }
+
+    /// Failure + path already exists → don't overwrite the real dump.
+    #[test]
+    fn placeholder_dump_skipped_when_file_exists() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test_exists.failure-dump.json");
+        let sentinel: &[u8] = br#"{"real":true,"is_placeholder":false}"#;
+        std::fs::write(&path, sentinel).unwrap();
+        let result = vmm::VmResult {
+            success: false,
+            ..vmm::VmResult::test_fixture()
+        };
+        write_placeholder_failure_dump_if_missing(&path, &result);
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            after, sentinel,
+            "real dump must not be overwritten by placeholder",
+        );
+    }
+
+    /// Atomic-publish via `.tmp` + `rename(2)` leaves no orphan.
+    /// Pin so a regression that drops the rename (and writes directly
+    /// to the canonical path) would let a half-written file leak;
+    /// the absence of any `.json.tmp` after a successful write
+    /// proves the rename completed.
+    #[test]
+    fn placeholder_dump_atomic_publish_no_tmp_orphan() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test_atomic.failure-dump.json");
+        let result = vmm::VmResult {
+            success: false,
+            ..vmm::VmResult::test_fixture()
+        };
+        write_placeholder_failure_dump_if_missing(&path, &result);
+        assert!(path.exists());
+        let tmp = path.with_extension("json.tmp");
+        assert!(
+            !tmp.exists(),
+            "atomic rename(2) must consume the .tmp file; orphan at: {}",
+            tmp.display(),
+        );
+    }
+
+    /// Reason embeds the lifecycle stage label from
+    /// `classify_init_stage`. Synthesize a drain with `InitStarted`
+    /// but no `PayloadStarting` → stage label is the
+    /// "init started but payload never ran" message, and that text
+    /// must appear in the placeholder reason. A regression that
+    /// drops the stage label propagation would surface here.
+    #[test]
+    fn placeholder_dump_reason_includes_lifecycle_stage_label() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test_stage.failure-dump.json");
+        let drain = lifecycle_drain(&[crate::vmm::wire::LifecyclePhase::InitStarted]);
+        let result = vmm::VmResult {
+            success: false,
+            guest_messages: Some(drain),
+            ..vmm::VmResult::test_fixture()
+        };
+        write_placeholder_failure_dump_if_missing(&path, &result);
+        let body = std::fs::read_to_string(&path).unwrap();
+        let report: crate::monitor::dump::FailureDumpReport =
+            serde_json::from_str(&body).unwrap();
+        let reason = report.sdt_alloc_unavailable.as_deref().unwrap();
+        assert!(
+            reason.contains(STAGE_INIT_STARTED_NO_PAYLOAD),
+            "reason must include the lifecycle stage label `{}`: {reason}",
+            STAGE_INIT_STARTED_NO_PAYLOAD,
+        );
+    }
+
+    /// Reason folds the `BUG SUMMARY` extraction (per phd Finding 3
+    /// + design intent) so the on-disk artifact matches the stderr
+    /// summary instead of being less informative. Synthesize a
+    /// `result.output` carrying a `scx_bpf_error` line; the
+    /// extract_bug_summary fallback path picks it up and the
+    /// reason includes a `BUG SUMMARY: ...` clause.
+    #[test]
+    fn placeholder_dump_reason_includes_bug_summary_from_sched_log() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test_bug.failure-dump.json");
+        let result = vmm::VmResult {
+            success: false,
+            output: "scx_bpf_error: apply_cell_config returned -EINVAL\n".to_string(),
+            ..vmm::VmResult::test_fixture()
+        };
+        write_placeholder_failure_dump_if_missing(&path, &result);
+        let body = std::fs::read_to_string(&path).unwrap();
+        let report: crate::monitor::dump::FailureDumpReport =
+            serde_json::from_str(&body).unwrap();
+        let reason = report.sdt_alloc_unavailable.as_deref().unwrap();
+        assert!(
+            reason.contains("BUG SUMMARY:"),
+            "reason must fold the BUG SUMMARY extraction: {reason}",
+        );
+        assert!(
+            reason.contains("apply_cell_config returned -EINVAL"),
+            "BUG SUMMARY text must surface the actionable scx_bpf_error: {reason}",
+        );
+    }
+
+    /// Reason omits the `BUG SUMMARY:` clause when no actionable
+    /// text could be extracted. Pin so a regression that emits
+    /// `BUG SUMMARY: ` (empty) or a `BUG SUMMARY: None` literal
+    /// would surface here.
+    #[test]
+    fn placeholder_dump_reason_omits_bug_summary_when_none() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test_no_bug.failure-dump.json");
+        let result = vmm::VmResult {
+            success: false,
+            ..vmm::VmResult::test_fixture()
+        };
+        write_placeholder_failure_dump_if_missing(&path, &result);
+        let body = std::fs::read_to_string(&path).unwrap();
+        let report: crate::monitor::dump::FailureDumpReport =
+            serde_json::from_str(&body).unwrap();
+        let reason = report.sdt_alloc_unavailable.as_deref().unwrap();
+        assert!(
+            !reason.contains("BUG SUMMARY"),
+            "reason must not mention BUG SUMMARY when no actionable text was extracted: {reason}",
+        );
     }
 }

@@ -236,3 +236,48 @@ reads all sidecar files from a run directory (recursing one level for
 gauntlet per-job subdirectories).
 
 See also: [`KTSTR_SIDECAR_DIR`](../reference/environment-variables.md).
+
+## Failure-dump artifact
+
+Every failed test writes a JSON failure-dump file alongside the
+sidecar:
+
+```text
+{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{commit}/{test_name}.failure-dump.json
+```
+
+The full dump (BPF state, per-vCPU registers, scheduler exit reason,
+map contents) is produced by the freeze coordinator when the
+scheduler attached AND its exit path triggered — the
+post-mortem snapshot path. Auto-repro runs additionally write a
+sibling `{test_name}.repro.failure-dump.json` containing the
+auto-repro VM's own post-mortem snapshot (same schema as the
+primary, with the additional `early` snapshot when the entry
+enables dual-snapshot capture).
+
+When the failure occurs BEFORE the BPF probe attaches —
+`send_sys_rdy` timeout, VM boot failures, scheduler binary load
+failures, anything that returns from `vm.run()` before the
+scheduler's BPF code runs — the framework writes a **placeholder**
+dump at the same path. The placeholder carries the lifecycle stage
+the run reached (per `classify_init_stage`) plus a "no BPF state
+captured" reason; every BPF-state field is set to `unavailable: Some(reason)`
+so stats tooling distinguishes "capture happened, no data" from
+"capture path failed for reason X". The `is_placeholder: true`
+field on the JSON makes the stub vs. real distinction explicit for
+machine consumers.
+
+The placeholder write uses an atomic `.tmp` → `rename(2)` pattern
+so a concurrent reader either sees no file or sees a complete
+stub — never a truncated one.
+
+The actionable diagnostic for pre-attach failures lives in the test
+stderr's `BUG SUMMARY:` line (extracted from the kernel's
+`triggered exit kind` emit or the scheduler log's `scx_bpf_error`
+substring) and the `--- sched_ext dump ---` section. The on-disk
+placeholder is for tooling that walks the sidecar dir; humans
+should read the stderr.
+
+The path is pre-cleared at the start of every primary VM dispatch
+so a passing rerun after a prior failed invocation does not leave
+stale dump content alongside the new sidecar.
