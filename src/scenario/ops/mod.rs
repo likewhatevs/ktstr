@@ -3352,6 +3352,9 @@ mod tests {
         };
         let ops: Vec<Op> = vec![
             Op::AddCgroup { name: "a".into() },
+            Op::AddCgroupDef {
+                def: CgroupDef::named("a"),
+            },
             Op::RemoveCgroup { cgroup: "a".into() },
             Op::SetCpuset {
                 cgroup: "a".into(),
@@ -3406,6 +3409,19 @@ mod tests {
         }
     }
 
+    /// Pins every Op variant's exact discriminant value against the
+    /// canonical `OpKind::bit_index` match in types.rs. A renumbering
+    /// or reordering surfaces here naming the specific variant that
+    /// moved — complementing `op_kind_bit_indices_are_unique_and_contiguous`
+    /// (whose contiguity arm surfaces gaps as sorted indices only,
+    /// not the offending variant; its uniqueness arm DOES name
+    /// variants via the `{:?}` of `(OpKind, bit_index)` pairs) and
+    /// `op_discriminant_unique` (which proves no collisions via the
+    /// `BTreeSet::insert` "duplicate discriminant" panic). The
+    /// variant-name label on each `assert_eq!` 3rd arg makes a
+    /// multi-variant failure operator-readable: the cargo-test output
+    /// names each variant whose discriminant drifted, no
+    /// source-cross-reference needed.
     #[test]
     fn op_discriminant_values() {
         use crate::test_support::{OutputFormat, Payload, PayloadKind};
@@ -3421,21 +3437,77 @@ mod tests {
             known_flags: None,
             metric_bounds: None,
         };
-        assert_eq!(Op::AddCgroup { name: "a".into() }.discriminant(), 0);
+        assert_eq!(
+            Op::AddCgroup { name: "a".into() }.discriminant(),
+            0,
+            "AddCgroup",
+        );
         assert_eq!(
             Op::AddCgroupDef {
                 def: CgroupDef::named("a")
             }
             .discriminant(),
-            1
+            1,
+            "AddCgroupDef",
         );
-        assert_eq!(Op::RemoveCgroup { cgroup: "a".into() }.discriminant(), 2);
+        assert_eq!(
+            Op::RemoveCgroup { cgroup: "a".into() }.discriminant(),
+            2,
+            "RemoveCgroup",
+        );
+        assert_eq!(
+            Op::SetCpuset {
+                cgroup: "a".into(),
+                cpus: CpusetSpec::Llc(0),
+            }
+            .discriminant(),
+            3,
+            "SetCpuset",
+        );
+        assert_eq!(
+            Op::ClearCpuset { cgroup: "a".into() }.discriminant(),
+            4,
+            "ClearCpuset",
+        );
+        assert_eq!(
+            Op::SwapCpusets {
+                a: "a".into(),
+                b: "b".into(),
+            }
+            .discriminant(),
+            5,
+            "SwapCpusets",
+        );
+        assert_eq!(
+            Op::Spawn {
+                cgroup: "a".into(),
+                work: WorkSpec::default(),
+            }
+            .discriminant(),
+            6,
+            "Spawn",
+        );
+        assert_eq!(
+            Op::StopCgroup { cgroup: "a".into() }.discriminant(),
+            7,
+            "StopCgroup",
+        );
+        assert_eq!(
+            Op::SetAffinity {
+                cgroup: "a".into(),
+                affinity: AffinityIntent::Inherit,
+            }
+            .discriminant(),
+            8,
+            "SetAffinity",
+        );
         assert_eq!(
             Op::SpawnHost {
                 work: Default::default()
             }
             .discriminant(),
-            9
+            9,
+            "SpawnHost",
         );
         assert_eq!(
             Op::MoveAllTasks {
@@ -3443,7 +3515,8 @@ mod tests {
                 to: "b".into()
             }
             .discriminant(),
-            10
+            10,
+            "MoveAllTasks",
         );
         assert_eq!(
             Op::RunPayload {
@@ -3453,6 +3526,7 @@ mod tests {
             }
             .discriminant(),
             11,
+            "RunPayload",
         );
         assert_eq!(
             Op::WaitPayload {
@@ -3461,6 +3535,7 @@ mod tests {
             }
             .discriminant(),
             12,
+            "WaitPayload",
         );
         assert_eq!(
             Op::KillPayload {
@@ -3469,15 +3544,25 @@ mod tests {
             }
             .discriminant(),
             13,
+            "KillPayload",
         );
-        assert_eq!(Op::FreezeCgroup { cgroup: "a".into() }.discriminant(), 14,);
-        assert_eq!(Op::UnfreezeCgroup { cgroup: "a".into() }.discriminant(), 15,);
+        assert_eq!(
+            Op::FreezeCgroup { cgroup: "a".into() }.discriminant(),
+            14,
+            "FreezeCgroup",
+        );
+        assert_eq!(
+            Op::UnfreezeCgroup { cgroup: "a".into() }.discriminant(),
+            15,
+            "UnfreezeCgroup",
+        );
         assert_eq!(
             Op::Snapshot {
                 name: "snap".into()
             }
             .discriminant(),
             16,
+            "Snapshot",
         );
         assert_eq!(
             Op::WatchSnapshot {
@@ -3485,6 +3570,7 @@ mod tests {
             }
             .discriminant(),
             17,
+            "WatchSnapshot",
         );
     }
 
