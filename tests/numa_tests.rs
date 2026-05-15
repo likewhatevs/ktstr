@@ -1,9 +1,7 @@
 use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::scenario::Ctx;
-use ktstr::scenario::ops::{
-    CgroupDef, CpusetSpec, HoldSpec, Step, execute_steps, execute_steps_with,
-};
+use ktstr::scenario::ops::{CpusetSpec, HoldSpec, Step, execute_steps, execute_steps_with};
 use ktstr::test_support::{KtstrTestEntry, NumaDistance, NumaNode, Topology, TopologyConstraints};
 use ktstr::workload::{MemPolicy, MpolFlags};
 
@@ -34,7 +32,7 @@ fn scenario_multi_numa_boot(ctx: &Ctx) -> Result<AssertResult> {
     }
 
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
@@ -85,7 +83,7 @@ fn scenario_cxl_memory_only(ctx: &Ctx) -> Result<AssertResult> {
     assert!(mi.total_kb > 0, "CXL node must have memory");
 
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
@@ -117,8 +115,7 @@ fn scenario_mempolicy_bind_locality(ctx: &Ctx) -> Result<AssertResult> {
     let checks = ktstr::assert::Assert::default_checks().min_page_locality(0.5);
     let steps = vec![Step {
         setup: vec![
-            CgroupDef::named("cg_0")
-                .workers(ctx.workers_per_cgroup)
+            ctx.cgroup_def("cg_0")
                 .with_cpuset(CpusetSpec::Numa(0))
                 .mem_policy(MemPolicy::bind([0])),
         ]
@@ -153,8 +150,7 @@ fn scenario_vmstat_migration(ctx: &Ctx) -> Result<AssertResult> {
     let checks = ktstr::assert::Assert::default_checks().max_cross_node_migration_ratio(0.5);
     let steps = vec![Step {
         setup: vec![
-            CgroupDef::named("cg_0")
-                .workers(ctx.workers_per_cgroup)
+            ctx.cgroup_def("cg_0")
                 .with_cpuset(CpusetSpec::Numa(0))
                 .mem_policy(MemPolicy::bind([0])),
         ]
@@ -198,8 +194,7 @@ fn scenario_mempolicy_interleave_cross_node(ctx: &Ctx) -> Result<AssertResult> {
     let checks = ktstr::assert::Assert::default_checks().min_page_locality(0.3);
     let steps = vec![Step {
         setup: vec![
-            CgroupDef::named("cg_0")
-                .workers(ctx.workers_per_cgroup)
+            ctx.cgroup_def("cg_0")
                 .with_cpuset(CpusetSpec::Numa(0))
                 .mem_policy(MemPolicy::interleave([0, 1]))
                 .mpol_flags(MpolFlags::STATIC_NODES),
@@ -245,8 +240,7 @@ fn scenario_mempolicy_preferred_many_locality(ctx: &Ctx) -> Result<AssertResult>
     let checks = ktstr::assert::Assert::default_checks().min_page_locality(0.5);
     let steps = vec![Step {
         setup: vec![
-            CgroupDef::named("cg_0")
-                .workers(ctx.workers_per_cgroup)
+            ctx.cgroup_def("cg_0")
                 .with_cpuset(CpusetSpec::Numa(0))
                 .mem_policy(MemPolicy::preferred_many([0, 1]))
                 .mpol_flags(MpolFlags::STATIC_NODES),

@@ -16,8 +16,7 @@ pub fn custom_cache_pressure_imbalance(ctx: &Ctx) -> Result<AssertResult> {
 
     let steps = vec![Step::with_defs(
         vec![
-            CgroupDef::named("cg_0")
-                .workers(ctx.workers_per_cgroup)
+            ctx.cgroup_def("cg_0")
                 .work_type(WorkType::cache_pressure(32, 64)),
             CgroupDef::named("cg_1").workers(ctx.topo.total_cpus()),
         ],
@@ -44,13 +43,11 @@ pub fn custom_cache_yield_wake_affine(ctx: &Ctx) -> Result<AssertResult> {
 
     let steps = vec![Step::with_defs(
         vec![
-            CgroupDef::named("cg_0")
+            ctx.cgroup_def("cg_0")
                 .with_cpuset(CpusetSpec::llc(0))
-                .workers(ctx.workers_per_cgroup)
                 .work_type(WorkType::cache_yield(32, 64)),
-            CgroupDef::named("cg_1")
+            ctx.cgroup_def("cg_1")
                 .with_cpuset(CpusetSpec::llc(1))
-                .workers(ctx.workers_per_cgroup)
                 .work_type(WorkType::cache_yield(32, 64)),
         ],
         ctx.settled_hold(1.0),

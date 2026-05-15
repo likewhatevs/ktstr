@@ -75,7 +75,7 @@
 
 use anyhow::Result;
 use ktstr::assert::AssertResult;
-use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
+use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec, sidecar_dir};
 
 const KTSTR_SCHED: Scheduler =
@@ -190,7 +190,7 @@ fn scenario_cast_analysis_chases_kernel_kptr(ctx: &ktstr::scenario::Ctx) -> Resu
     let dump_path = failure_dump_path("cast_analysis_chases_kernel_kptr");
 
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
@@ -679,7 +679,7 @@ fn scenario_cast_analysis_chases_bss_to_arena(ctx: &ktstr::scenario::Ctx) -> Res
     let dump_path = failure_dump_path("cast_analysis_chases_bss_to_arena");
 
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
@@ -1048,7 +1048,7 @@ fn scenario_cast_analysis_sdt_alloc_bridge_resolves_fwd(
     let dump_path = failure_dump_path("cast_analysis_sdt_alloc_bridge_resolves_fwd");
 
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
@@ -1361,7 +1361,7 @@ fn scenario_cast_analysis_cross_subprog_arena_chase(
     let dump_path = failure_dump_path("cast_analysis_cross_subprog_arena_chase");
 
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];

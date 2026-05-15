@@ -1,7 +1,7 @@
 use anyhow::Result;
 use ktstr::assert::{Assert, AssertResult};
 use ktstr::scenario::Ctx;
-use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps_with};
+use ktstr::scenario::ops::{HoldSpec, Step, execute_steps_with};
 use ktstr::test_support::{KtstrTestEntry, Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
@@ -9,7 +9,7 @@ const KTSTR_SCHED: Scheduler =
 
 fn scenario_with_checks(ctx: &Ctx, checks: &Assert) -> Result<AssertResult> {
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];

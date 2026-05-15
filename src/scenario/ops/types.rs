@@ -1059,6 +1059,12 @@ impl CgroupDef {
     /// with NO workers, declare it via [`Op::AddCgroup`] at step or
     /// Backdrop level instead of using a `CgroupDef`. To run more than
     /// one worker, call `.workers(N)` on the `CgroupDef` explicitly.
+    ///
+    /// **Common shortcut:** for the very-common pattern
+    /// `CgroupDef::named(name).workers(ctx.workers_per_cgroup)`, use
+    /// [`Ctx::cgroup_def`](crate::scenario::Ctx::cgroup_def) — it
+    /// pins the `ctx.workers_per_cgroup` default at the call site and
+    /// returns a `CgroupDef` ready for further chaining.
     #[must_use = "dropping a CgroupDef discards the cgroup specification"]
     pub fn named(name: impl Into<Cow<'static, str>>) -> Self {
         Self {

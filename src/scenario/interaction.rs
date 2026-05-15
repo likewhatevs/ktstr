@@ -44,15 +44,11 @@ pub fn custom_cgroup_imbalance_mixed_workload(ctx: &Ctx) -> Result<AssertResult>
     let steps = vec![Step::with_defs(
         vec![
             CgroupDef::named("cg_0").workers(8),
-            CgroupDef::named("cg_1")
-                .workers(ctx.workers_per_cgroup)
-                .work_type(WorkType::bursty(
-                    Duration::from_millis(100),
-                    Duration::from_millis(50),
-                )),
-            CgroupDef::named("cg_2")
-                .workers(ctx.workers_per_cgroup)
-                .work_type(WorkType::IoSyncWrite),
+            ctx.cgroup_def("cg_1").work_type(WorkType::bursty(
+                Duration::from_millis(100),
+                Duration::from_millis(50),
+            )),
+            ctx.cgroup_def("cg_2").work_type(WorkType::IoSyncWrite),
         ],
         ctx.settled_hold(1.0),
     )];
@@ -185,8 +181,8 @@ pub fn custom_cgroup_no_ctrl_task_migration(ctx: &Ctx) -> Result<AssertResult> {
     // cg_1: empty move target (no workers). Exactly one handle participates
     // in MoveAllTasks.
     let backdrop = Backdrop::new()
-        .with_cgroup(CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup))
-        .with_cgroup(CgroupDef::named("cg_mobile").workers(ctx.workers_per_cgroup))
+        .with_cgroup(ctx.cgroup_def("cg_0"))
+        .with_cgroup(ctx.cgroup_def("cg_mobile"))
         .with_op(Op::add_cgroup("cg_1"));
 
     // Settle: let the Backdrop-spawned workers stabilize before the
@@ -305,9 +301,7 @@ pub fn custom_cgroup_no_ctrl_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
 pub fn custom_cgroup_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
-            CgroupDef::named("cg_0")
-                .workers(ctx.workers_per_cgroup)
-                .work_type(WorkType::IoSyncWrite),
+            ctx.cgroup_def("cg_0").work_type(WorkType::IoSyncWrite),
             CgroupDef::named("cg_1").workers(ctx.topo.total_cpus()),
         ],
         ctx.settled_hold(1.0),

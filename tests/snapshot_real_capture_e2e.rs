@@ -10,7 +10,7 @@ use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::prelude::{RenderedValue, VmResult};
-use ktstr::scenario::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
+use ktstr::scenario::ops::{HoldSpec, Op, Step, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
@@ -68,7 +68,7 @@ fn assert_bridge_has_real_capture(result: &VmResult) -> Result<()> {
 )]
 fn snapshot_real_capture_op_snapshot(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![Op::snapshot("mid_run")],
         hold: HoldSpec::FULL,
     }];
@@ -89,7 +89,7 @@ fn snapshot_real_capture_op_snapshot(ctx: &ktstr::scenario::Ctx) -> Result<Asser
 )]
 fn snapshot_real_capture_op_watch_snapshot(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![Op::watch_snapshot("jiffies_64")],
         hold: HoldSpec::FULL,
     }];

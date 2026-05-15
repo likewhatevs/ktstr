@@ -423,6 +423,41 @@ impl Ctx<'_> {
             self.settle + self.duration.mul_f64(fraction_of_duration),
         )
     }
+
+    /// Construct a [`CgroupDef`] with `self.workers_per_cgroup`
+    /// workers — the most common scenario shape, dedupe of 40+
+    /// `CgroupDef::named(name).workers(ctx.workers_per_cgroup)` call
+    /// sites across `src/scenario/` and `tests/`.
+    ///
+    /// Equivalent to:
+    ///
+    /// ```ignore
+    /// CgroupDef::named(name).workers(ctx.workers_per_cgroup)
+    /// ```
+    ///
+    /// Returns a fresh [`CgroupDef`] so the test author can chain
+    /// further builders (`.with_cpuset`, `.work`, etc.) on the
+    /// result. For non-default worker counts call
+    /// `CgroupDef::named(name).workers(N)` directly — the helper
+    /// pins ONLY the `ctx.workers_per_cgroup` default path.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Before (42+ sites):
+    /// vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into()
+    /// // After:
+    /// vec![ctx.cgroup_def("cg_0")].into()
+    ///
+    /// // With additional builders:
+    /// ctx.cgroup_def("cg_0").with_cpuset(...)
+    /// ```
+    pub fn cgroup_def(
+        &self,
+        name: impl Into<std::borrow::Cow<'static, str>>,
+    ) -> crate::scenario::ops::CgroupDef {
+        crate::scenario::ops::CgroupDef::named(name).workers(self.workers_per_cgroup)
+    }
 }
 
 /// Fluent builder for [`Ctx`].
@@ -1983,5 +2018,163 @@ mod tests {
             .duration(Duration::from_secs(1))
             .build();
         let _ = ctx.settled_hold(f64::NAN);
+    }
+
+    /// `ctx.cgroup_def(name)` produces a `CgroupDef` carrying the
+    /// builder's `workers_per_cgroup` value verbatim. Pin so a
+    /// regression that pulled from a stale field or hardcoded a
+    /// literal would surface here.
+    #[test]
+    fn cgroup_def_carries_workers_per_cgroup() {
+        let cg = crate::cgroup::CgroupManager::new("/nonexistent");
+        let topo = crate::topology::TestTopology::synthetic(2, 1);
+        let ctx = Ctx::builder(&cg, &topo).workers_per_cgroup(7).build();
+        let def = ctx.cgroup_def("cg_0");
+        assert_eq!(def.name, "cg_0", "name must thread through verbatim");
+        assert_eq!(
+            def.works.len(),
+            1,
+            "the default workers(n) call seeds exactly one WorkSpec; \
+             a regression that doubled or skipped the seeding would \
+             surface here: {:?}",
+            def.works,
+        );
+        assert_eq!(
+            def.works[0].num_workers,
+            Some(7),
+            "WorkSpec must carry ctx.workers_per_cgroup as num_workers: {:?}",
+            def.works[0],
+        );
+    }
+
+    /// Default `workers_per_cgroup = 1` from `CtxBuilder` flows
+    /// through unchanged. A regression that defaulted differently
+    /// would surface here even when the test author doesn't set
+    /// `workers_per_cgroup` explicitly.
+    #[test]
+    fn cgroup_def_default_workers_per_cgroup_is_one() {
+        let cg = crate::cgroup::CgroupManager::new("/nonexistent");
+        let topo = crate::topology::TestTopology::synthetic(2, 1);
+        let ctx = Ctx::builder(&cg, &topo).build();
+        let def = ctx.cgroup_def("cg_default");
+        assert_eq!(def.works[0].num_workers, Some(1));
+    }
+
+    /// The helper accepts both `&'static str` and `String` for the
+    /// name argument (via `Into<Cow<'static, str>>`), matching
+    /// `CgroupDef::named`'s signature so the migration is
+    /// type-compatible at every call site.
+    #[test]
+    fn cgroup_def_accepts_static_str_and_string() {
+        let cg = crate::cgroup::CgroupManager::new("/nonexistent");
+        let topo = crate::topology::TestTopology::synthetic(2, 1);
+        let ctx = Ctx::builder(&cg, &topo).build();
+        let from_static = ctx.cgroup_def("static_name");
+        let from_string = ctx.cgroup_def(String::from("owned_name"));
+        assert_eq!(from_static.name, "static_name");
+        assert_eq!(from_string.name, "owned_name");
+    }
+
+    /// Helper-returned [`CgroupDef`] chains additional builders
+    /// (`.with_cpuset`, `.work_type`) — the docstring promises this
+    /// composability so the migration can collapse multi-line
+    /// chains. A regression to a newtype wrapper or `&CgroupDef`
+    /// return that broke move-based chaining would surface here.
+    #[test]
+    fn cgroup_def_chains_further_builders() {
+        use crate::scenario::ops::CpusetSpec;
+        use crate::workload::WorkType;
+        let cg = crate::cgroup::CgroupManager::new("/nonexistent");
+        let topo = crate::topology::TestTopology::synthetic(4, 1);
+        let ctx = Ctx::builder(&cg, &topo).workers_per_cgroup(3).build();
+        let def = ctx
+            .cgroup_def("cg_chained")
+            .with_cpuset(CpusetSpec::range(0.0, 1.0))
+            .work_type(WorkType::SpinWait);
+        assert_eq!(def.name, "cg_chained");
+        assert_eq!(
+            def.works[0].num_workers,
+            Some(3),
+            "ctx default propagates through subsequent chained builders",
+        );
+        assert!(
+            def.cpuset.is_some(),
+            "with_cpuset chains correctly after the helper",
+        );
+        assert!(
+            matches!(def.works[0].work_type, WorkType::SpinWait),
+            "work_type chains after the helper-seeded WorkSpec; got {:?}",
+            def.works[0].work_type,
+        );
+    }
+
+    /// `ctx.workers_per_cgroup = 0` passes through verbatim — the
+    /// helper does not reject or substitute. Matches the pre-helper
+    /// inlined `CgroupDef::named(name).workers(0)` semantics so
+    /// migration is lossless. For an empty move-target cgroup
+    /// without workers, [`CgroupDef::named`]'s docstring directs
+    /// authors to [`Op::AddCgroup`] instead — that idiomatic path is
+    /// orthogonal to this helper's dedup contract.
+    #[test]
+    fn cgroup_def_passes_through_zero_workers_per_cgroup() {
+        let cg = crate::cgroup::CgroupManager::new("/nonexistent");
+        let topo = crate::topology::TestTopology::synthetic(2, 1);
+        let ctx = Ctx::builder(&cg, &topo).workers_per_cgroup(0).build();
+        let def = ctx.cgroup_def("zero_workers");
+        assert_eq!(
+            def.works[0].num_workers,
+            Some(0),
+            "helper preserves Ctx::workers_per_cgroup=0 verbatim; \
+             for an empty move-target cgroup use Op::AddCgroup per \
+             CgroupDef::named's docstring",
+        );
+    }
+
+    /// A trailing `.workers(N)` overrides the helper's default —
+    /// produces the same `CgroupDef` as `CgroupDef::named(name).workers(N)`.
+    /// Pin so a regression that appended a SECOND WorkSpec instead
+    /// of replacing num_workers on works[0] would surface here.
+    #[test]
+    fn cgroup_def_override_workers_replaces_default() {
+        let cg = crate::cgroup::CgroupManager::new("/nonexistent");
+        let topo = crate::topology::TestTopology::synthetic(2, 1);
+        let ctx = Ctx::builder(&cg, &topo).workers_per_cgroup(3).build();
+        let def = ctx.cgroup_def("cg_override").workers(99);
+        assert_eq!(
+            def.works[0].num_workers,
+            Some(99),
+            "explicit workers(N) overrides ctx default",
+        );
+        assert_eq!(def.works.len(), 1, "no second WorkSpec is added");
+    }
+
+    /// A subsequent `.work(WorkSpec::default().workers(N))` APPENDS
+    /// a second WorkSpec rather than replacing the helper's seed.
+    /// Pin the composition shape so a regression that overwrote
+    /// works[0] (instead of pushing) would surface here.
+    #[test]
+    fn cgroup_def_with_second_workspec_preserves_helper_seed() {
+        use crate::workload::WorkSpec;
+        let cg = crate::cgroup::CgroupManager::new("/nonexistent");
+        let topo = crate::topology::TestTopology::synthetic(2, 1);
+        let ctx = Ctx::builder(&cg, &topo).workers_per_cgroup(3).build();
+        let def = ctx
+            .cgroup_def("cg_two_works")
+            .work(WorkSpec::default().workers(5));
+        assert_eq!(
+            def.works.len(),
+            2,
+            "second WorkSpec appended, not replaced; helper seed stays at works[0]",
+        );
+        assert_eq!(
+            def.works[0].num_workers,
+            Some(3),
+            "helper's ctx default preserved as works[0]",
+        );
+        assert_eq!(
+            def.works[1].num_workers,
+            Some(5),
+            "appended WorkSpec lands as works[1]",
+        );
     }
 }

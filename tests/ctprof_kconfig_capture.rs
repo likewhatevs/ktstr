@@ -117,12 +117,7 @@ fn ctprof_capture_records_wchar_under_iosync(ctx: &Ctx) -> Result<AssertResult> 
     // `task_io_account_write` unconditionally — `wchar`
     // accumulates.
     let steps = vec![Step {
-        setup: vec![
-            CgroupDef::named("cg_0")
-                .workers(ctx.workers_per_cgroup)
-                .work_type(WorkType::IoSyncWrite),
-        ]
-        .into(),
+        setup: vec![ctx.cgroup_def("cg_0").work_type(WorkType::IoSyncWrite)].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
@@ -220,12 +215,7 @@ fn ctprof_capture_records_wchar_under_iosync(ctx: &Ctx) -> Result<AssertResult> 
 )]
 fn ctprof_capture_reaches_host_psi_cpu_under_oversubscription(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
-        setup: vec![
-            CgroupDef::named("cg_0")
-                .workers(ctx.workers_per_cgroup)
-                .work_type(WorkType::SpinWait),
-        ]
-        .into(),
+        setup: vec![ctx.cgroup_def("cg_0").work_type(WorkType::SpinWait)].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];

@@ -34,7 +34,7 @@ use ktstr::ctprof::{self, CtprofSnapshot};
 use ktstr::ctprof_compare::{CompareOptions, compare};
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
-use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
+use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
 use ktstr::scenario::payload_run::PayloadHandle;
 use ktstr::test_support::{OutputFormat, Payload, PayloadKind};
 use ktstr::worker_ready_wait::wait_for_worker_ready;
@@ -117,7 +117,7 @@ fn ctprof_pipeline_e2e_capture_write_load_compare(ctx: &Ctx) -> Result<AssertRes
     // `HoldSpec::frac(0.5)` uses half of `ctx.duration` so the
     // remaining half is available for the second window below.
     let baseline_steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_baseline").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_baseline")].into(),
         ops: vec![],
         hold: HoldSpec::frac(0.5),
     }];
@@ -139,7 +139,7 @@ fn ctprof_pipeline_e2e_capture_write_load_compare(ctx: &Ctx) -> Result<AssertRes
     // GroupBy::Pcomm collapses them together and the deltas
     // compute on merged totals.
     let candidate_steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_candidate").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_candidate")].into(),
         ops: vec![],
         hold: HoldSpec::frac(0.5),
     }];

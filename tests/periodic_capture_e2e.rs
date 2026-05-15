@@ -25,7 +25,7 @@ use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::prelude::VmResult;
-use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
+use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
@@ -126,7 +126,7 @@ fn assert_periodic_captures(result: &VmResult) -> Result<()> {
 )]
 fn periodic_capture_three_boundaries(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];

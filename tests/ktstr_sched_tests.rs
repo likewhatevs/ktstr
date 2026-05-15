@@ -11,11 +11,7 @@ const KTSTR_SCHED: Scheduler =
 #[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15)]
 fn sched_basic_proportional(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
-        setup: vec![
-            CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup),
-            CgroupDef::named("cg_1").workers(ctx.workers_per_cgroup),
-        ]
-        .into(),
+        setup: vec![ctx.cgroup_def("cg_0"), ctx.cgroup_def("cg_1")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
@@ -55,7 +51,7 @@ fn sched_dynamic_add(ctx: &Ctx) -> Result<AssertResult> {
 
 fn scenario_bpf_api(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::AssertResult> {
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
@@ -157,7 +153,7 @@ fn sched_perf_positive(ctx: &Ctx) -> Result<AssertResult> {
         .min_iteration_rate(5000.0)
         .max_gap_ms(500);
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
@@ -168,7 +164,7 @@ fn scenario_perf_negative(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::A
     use ktstr::scenario::ops::execute_steps_with;
     let checks = ktstr::assert::Assert::default_checks().max_gap_ms(50);
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
@@ -196,7 +192,7 @@ fn scenario_scattershot(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::Ass
         .max_gap_ms(10000)
         .max_spread_pct(80.0);
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
@@ -232,7 +228,7 @@ fn scenario_throughput_regression(
         .min_iteration_rate(5000.0)
         .max_gap_ms(500);
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
@@ -255,7 +251,7 @@ static __KTSTR_ENTRY_SLOW: ktstr::test_support::KtstrTestEntry =
 
 fn scenario_auto_repro(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::AssertResult> {
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
@@ -307,7 +303,7 @@ fn scenario_watchdog_timing_precision(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<ktstr::assert::AssertResult> {
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
@@ -432,7 +428,7 @@ static __KTSTR_ENTRY_WATCHDOG_TIMING: ktstr::test_support::KtstrTestEntry =
 
 fn scenario_baseline(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::AssertResult> {
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
@@ -479,7 +475,7 @@ static __KTSTR_ENTRY_SCX: ktstr::test_support::KtstrTestEntry =
 #[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1, duration_s = 2, watchdog_timeout_s = 15, max_spread_pct = 80.0)]
 fn sched_verifier_stats_populated(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
@@ -491,11 +487,7 @@ fn scenario_mid_degrade(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::Ass
     let checks = ktstr::assert::Assert::default_checks().max_gap_ms(50);
     let steps = vec![
         Step {
-            setup: vec![
-                CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup),
-                CgroupDef::named("cg_1").workers(ctx.workers_per_cgroup),
-            ]
-            .into(),
+            setup: vec![ctx.cgroup_def("cg_0"), ctx.cgroup_def("cg_1")].into(),
             ops: vec![],
             hold: HoldSpec::fixed(std::time::Duration::from_secs(3)),
         },

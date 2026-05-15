@@ -34,7 +34,7 @@ use anyhow::Result;
 use ktstr::assert::{AssertResult, Verdict};
 use ktstr::ktstr_test;
 use ktstr::prelude::{SampleSeries, VmResult};
-use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
+use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
@@ -151,7 +151,7 @@ fn assert_temporal_patterns(result: &VmResult) -> Result<()> {
 )]
 fn temporal_assertions_over_periodic_samples(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];

@@ -47,7 +47,7 @@ use ktstr::assert::AssertResult;
 use ktstr::declare_scheduler;
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
-use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
+use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
 #[allow(unused_imports)]
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
@@ -138,7 +138,7 @@ fn config_file_def_e2e_pipeline(ctx: &Ctx) -> Result<AssertResult> {
     // that rejects unknown flags), which would surface here as a
     // failed `execute_steps`.
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];

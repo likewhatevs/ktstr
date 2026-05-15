@@ -72,7 +72,7 @@ use anyhow::Result;
 use common::dump_paths::failure_dump_path;
 use ktstr::assert::AssertResult;
 use ktstr::prelude::SCHEMA_SINGLE;
-use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
+use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec, sidecar_dir};
 
 const KTSTR_SCHED: Scheduler =
@@ -114,7 +114,7 @@ fn scenario_watchdog_stall_captured_emit_schema(
     let dump_path = failure_dump_path(test_name);
 
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
@@ -169,7 +169,7 @@ fn scenario_clean_exit_gate_suppresses_dump(ctx: &ktstr::scenario::Ctx) -> Resul
     let dump_path = failure_dump_path(test_name);
 
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::fixed(std::time::Duration::from_secs(2)),
     }];
@@ -205,7 +205,7 @@ fn scenario_watchdog_stall_dump_populates_vcpu_regs_and_maps(
     let dump_path = failure_dump_path(test_name);
 
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
@@ -362,7 +362,7 @@ fn scenario_translate_none_with_latch_idle_suppresses_dump(
     let dump_path = failure_dump_path(test_name);
 
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::fixed(std::time::Duration::from_secs(2)),
     }];
@@ -410,7 +410,7 @@ fn scenario_translate_none_with_latch_triggered_emits_dump(
     let dump_path = failure_dump_path(test_name);
 
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::fixed(std::time::Duration::from_secs(2)),
     }];

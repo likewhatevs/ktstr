@@ -40,7 +40,7 @@ use ktstr::prelude::{
     WatchRegisterCallback,
 };
 use ktstr::scenario::Ctx;
-use ktstr::scenario::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
+use ktstr::scenario::ops::{HoldSpec, Op, Step, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec, sidecar_dir};
 use ktstr::topology::TestTopology;
 
@@ -308,7 +308,7 @@ fn scenario_snapshot_op_captures_in_vm(
     let _bridge_guard = bridge.set_thread_local();
 
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![Op::snapshot("test_snap")],
         hold: HoldSpec::FULL,
     }];
@@ -452,7 +452,7 @@ fn scenario_watch_snapshot_op_captures_exit_state(
     let _bridge_guard = bridge.set_thread_local();
 
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![Op::watch_snapshot("exit_kind")],
         hold: HoldSpec::FULL,
     }];

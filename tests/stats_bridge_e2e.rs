@@ -29,7 +29,7 @@ use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::prelude::{SampleSeries, VmResult};
 use ktstr::scenario::Ctx;
-use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
+use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
@@ -110,7 +110,7 @@ fn assert_stats_round_trip(result: &VmResult) -> Result<()> {
 )]
 fn stats_bridge_round_trip(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];

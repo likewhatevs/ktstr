@@ -19,7 +19,7 @@ use anyhow::Result;
 use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
-use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
+use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
 
 /// Run a short CPU-spinning workload inside the guest, then call
 /// [`ktstr::ctprof::capture`] against the guest's `/proc` and
@@ -56,7 +56,7 @@ fn ctprof_capture_returns_threads_with_nonzero_counters(ctx: &Ctx) -> Result<Ass
     // framework default worker count so the test doesn't need to
     // pick a specific number.
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];

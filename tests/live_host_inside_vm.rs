@@ -39,7 +39,7 @@ use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
 use ktstr::ktstr_test;
 use ktstr::live_host::{BpfMapAccessor, BpfSyscallAccessor, KallsymsTable, LiveHostKernelEnv};
 use ktstr::scenario::Ctx;
-use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
+use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
 
 const KTSTR_SCHED: ktstr::prelude::Scheduler = ktstr::prelude::Scheduler::new("ktstr_sched")
     .binary(ktstr::prelude::SchedulerSpec::Discover("scx-ktstr"));
@@ -65,7 +65,7 @@ fn live_host_pipeline_inside_guest_produces_expected_shape(ctx: &Ctx) -> Result<
     // lazily-populated BPF maps (event counters, struct_ops state)
     // have entries before we enumerate.
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::fixed(std::time::Duration::from_secs(2)),
     }];

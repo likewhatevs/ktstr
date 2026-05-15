@@ -33,7 +33,7 @@ use anyhow::Result;
 use common::dump_paths::failure_dump_path;
 use ktstr::assert::AssertResult;
 use ktstr::prelude::SCHEMA_SINGLE;
-use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
+use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
@@ -49,7 +49,7 @@ fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Resul
     let dump_path = failure_dump_path("failure_dump_renders_bss_fields");
 
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
@@ -593,7 +593,7 @@ fn scenario_failure_dump_renders_capture_modules(
     let num_cpus = ctx.topo.total_cpus();
 
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
@@ -857,7 +857,7 @@ fn scenario_failure_dump_renders_probe_counters(
     let dump_path = failure_dump_path("failure_dump_renders_probe_counters");
 
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];

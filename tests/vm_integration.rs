@@ -40,7 +40,7 @@
 
 use anyhow::Result;
 use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
-use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
+use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec, sidecar_dir};
 
 const KTSTR_SCHED: Scheduler =
@@ -85,7 +85,7 @@ fn read_dump_or_fail(test_name: &str) -> Result<serde_json::Value> {
 /// merge per-test claims onto the same envelope.
 fn run_stalled_workload(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
