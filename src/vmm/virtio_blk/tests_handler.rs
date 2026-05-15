@@ -59,8 +59,8 @@ fn handle_write_persists_bytes_to_backing_file() {
     let f_for_verify = f.try_clone().unwrap();
     let dev = VirtioBlk::new(f, cap, DiskThrottle::default());
     // Larger guest mem so data_addr + len + status_addr all fit
-    // within the single region. 32 KB is generous; the previous
-    // 16 KB region with status_addr=0x2FFF (12287) sat within
+    // within the single region. 32 KiB is generous; the previous
+    // 16 KiB region with status_addr=0x2FFF (12287) sat within
     // bounds but write_slice rejected the write (likely a
     // single-region GuestMemoryMmap quirk under address overlap).
     let mem = make_guest_mem(32768);
@@ -360,7 +360,7 @@ fn handle_read_multi_segment_scatter() {
     // gap so test failure on cur_offset arithmetic shows up
     // as cross-contamination.
     let seg0_addr = GuestAddress(0x1000);
-    let seg1_addr = GuestAddress(0x1400); // 0x1000 + 0x400 (1 KB)
+    let seg1_addr = GuestAddress(0x1400); // 0x1000 + 0x400 (1 KiB)
     let status_addr = GuestAddress(0x1FFF);
     let segs = vec![
         ChainDescriptor {

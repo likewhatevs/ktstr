@@ -173,7 +173,7 @@ fn header_read_obj_failure_returns_ioerr() {
 }
 
 /// SIZE_MAX enforcement. A single data descriptor longer
-/// than VIRTIO_BLK_SIZE_MAX (1 MB) is malformed. Without the
+/// than VIRTIO_BLK_SIZE_MAX (1 MiB) is malformed. Without the
 /// gate, a guest can force `vec![0u8; 4 GB]` heap allocations.
 #[test]
 fn size_max_oversized_data_desc_rejected() {
@@ -186,7 +186,7 @@ fn size_max_oversized_data_desc_rejected() {
     let data_addr = GuestAddress(0x8000);
     let status_addr = GuestAddress(0x9000);
     write_blk_header(&mem, header_addr, VIRTIO_BLK_T_IN, 0);
-    // Data desc len = 1 MB + 1.
+    // Data desc len = 1 MiB + 1.
     let oversize: u32 = (1u32 << 20) + 1;
     let descs = [
         RawDescriptor::from(SplitDescriptor::new(
@@ -2155,7 +2155,7 @@ fn size_max_advertised_in_config_space() {
     assert_eq!(
         u32::from_le_bytes(buf),
         VIRTIO_BLK_SIZE_MAX,
-        "config-space size_max must equal VIRTIO_BLK_SIZE_MAX (1 MB)",
+        "config-space size_max must equal VIRTIO_BLK_SIZE_MAX (1 MiB)",
     );
 }
 

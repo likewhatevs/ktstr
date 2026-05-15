@@ -417,16 +417,14 @@ impl DiskThrottle {
 /// for `Btrfs`). See module docs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct DiskConfig {
-    /// Advertised capacity in mebibytes (MiB; the field name retains
-    /// the historical `_mb` suffix for serde compatibility, but the
-    /// unit is binary mebibytes — `capacity_bytes()` computes
-    /// `capacity_mb << 20`). 256 MiB default capacity. Sized to
-    /// accommodate common guest filesystem formatters; smaller
-    /// values are accepted but may cause `mkfs` failures inside
-    /// the template VM (see
+    /// Advertised capacity in mebibytes (MiB). `capacity_bytes()`
+    /// computes `capacity_mib << 20`. 256 MiB default capacity.
+    /// Sized to accommodate common guest filesystem formatters;
+    /// smaller values are accepted but may cause `mkfs` failures
+    /// inside the template VM (see
     /// [`crate::vmm::disk_template::build_template_via_vm`]) for
     /// `Filesystem::Btrfs`.
-    pub capacity_mb: u32,
+    pub capacity_mib: u32,
     /// Filesystem to format the per-test backing with. `Raw` leaves
     /// the device unformatted; `Btrfs` routes through the
     /// template-cache lifecycle.
@@ -474,7 +472,7 @@ impl Default for DiskConfig {
     /// accordingly or override `TMPDIR` to a disk-backed path.
     fn default() -> Self {
         DiskConfig {
-            capacity_mb: 256,
+            capacity_mib: 256,
             filesystem: Filesystem::Raw,
             throttle: DiskThrottle::default(),
             read_only: false,
@@ -487,11 +485,10 @@ impl Default for DiskConfig {
 impl DiskConfig {
     /// Set capacity in mebibytes (MiB). The argument is interpreted
     /// as binary mebibytes per [`Self::capacity_bytes`], not decimal
-    /// megabytes; the method name retains the `_mb` suffix for
-    /// historical / serde-compat reasons.
+    /// megabytes.
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn capacity_mb(mut self, mb: u32) -> Self {
-        self.capacity_mb = mb;
+    pub fn capacity_mib(mut self, mib: u32) -> Self {
+        self.capacity_mib = mib;
         self
     }
 
@@ -680,10 +677,10 @@ impl DiskConfig {
         }
     }
 
-    /// Capacity in bytes (`capacity_mb << 20`). Used by the device
+    /// Capacity in bytes (`capacity_mib << 20`). Used by the device
     /// for the config-space `capacity` field.
     pub(crate) fn capacity_bytes(&self) -> u64 {
-        (self.capacity_mb as u64) << 20
+        (self.capacity_mib as u64) << 20
     }
 
     /// Capacity in 512-byte sectors.
@@ -703,9 +700,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_256mb_raw() {
+    fn default_is_256mib_raw() {
         let d = DiskConfig::default();
-        assert_eq!(d.capacity_mb, 256);
+        assert_eq!(d.capacity_mib, 256);
         assert_eq!(d.filesystem, Filesystem::Raw);
         assert_eq!(d.throttle, DiskThrottle::default());
         assert!(!d.read_only);
@@ -718,7 +715,7 @@ mod tests {
         assert_eq!(d.capacity_bytes(), 256 * 1024 * 1024);
         assert_eq!(d.capacity_sectors(), 524_288);
 
-        let d = DiskConfig::default().capacity_mb(512);
+        let d = DiskConfig::default().capacity_mib(512);
         assert_eq!(d.capacity_bytes(), 512 * 1024 * 1024);
         assert_eq!(d.capacity_sectors(), 1_048_576);
     }
@@ -735,11 +732,11 @@ mod tests {
     #[test]
     fn builder_chain() {
         let d = DiskConfig::default()
-            .capacity_mb(128)
+            .capacity_mib(128)
             .iops(1000)
             .bytes_per_sec(10 * 1024 * 1024)
             .read_only();
-        assert_eq!(d.capacity_mb, 128);
+        assert_eq!(d.capacity_mib, 128);
         assert_eq!(d.filesystem, Filesystem::Raw);
         assert_eq!(d.throttle.iops, NonZeroU64::new(1000));
         assert_eq!(d.throttle.bytes_per_sec, NonZeroU64::new(10 * 1024 * 1024));
@@ -831,7 +828,7 @@ mod tests {
     #[test]
     fn disk_config_full_serde_roundtrip() {
         let original = DiskConfig {
-            capacity_mb: 256,
+            capacity_mib: 256,
             filesystem: Filesystem::Raw,
             throttle: DiskThrottle {
                 iops: NonZeroU64::new(2_500),
@@ -847,11 +844,40 @@ mod tests {
         let json = serde_json::to_string(&original).expect("serialize DiskConfig");
         let parsed: DiskConfig = serde_json::from_str(&json).expect("deserialize DiskConfig");
 
+        // Wire-format canonicality — the serialized key must be
+        // `capacity_mib`, not the pre-rename `capacity_mb` (legacy)
+        // form. Catches a future `#[serde(rename = "capacity_mb")]`
+        // regression that flips the emitted key.
+        assert!(
+            json.contains("\"capacity_mib\""),
+            "JSON must use the canonical `capacity_mib` key: {json}"
+        );
+        assert!(
+            !json.contains("\"capacity_mb\""),
+            "JSON must NOT contain the pre-rename `capacity_mb` key: {json}"
+        );
+
+        // Deserialize-side break: a JSON with the legacy `capacity_mb`
+        // key must FAIL to parse. Catches `#[serde(alias = "capacity_mb")]`
+        // which is deserialize-only sugar — it leaves the serialized
+        // key alone (so the contains-checks above pass) but silently
+        // accepts the old name on read. Constructed by replacing the
+        // canonical key in the just-serialized JSON, keeping every
+        // other field/value identical so the legacy_json is well-formed
+        // in every respect except the one renamed key.
+        let legacy_json = json.replace("\"capacity_mib\"", "\"capacity_mb\"");
+        assert!(
+            serde_json::from_str::<DiskConfig>(&legacy_json).is_err(),
+            "deserialization must reject the pre-rename `capacity_mb` key \
+             — a regression that added `#[serde(alias = \"capacity_mb\")]` \
+             would silently accept old sidecars on read: legacy_json={legacy_json}"
+        );
+
         // Whole-struct equality first — catches any field drift.
         assert_eq!(parsed, original);
         // Field-by-field follow-up — each line catches a distinct
         // drift mode on its own (rename, skip, type-narrowing).
-        assert_eq!(parsed.capacity_mb, original.capacity_mb);
+        assert_eq!(parsed.capacity_mib, original.capacity_mib);
         assert_eq!(parsed.filesystem, original.filesystem);
         assert_eq!(parsed.throttle.iops, original.throttle.iops);
         assert_eq!(
@@ -889,7 +915,7 @@ mod tests {
             serde_json::from_str(&json).expect("deserialize default DiskConfig");
 
         assert_eq!(parsed, original);
-        assert_eq!(parsed.capacity_mb, original.capacity_mb);
+        assert_eq!(parsed.capacity_mib, original.capacity_mib);
         assert_eq!(parsed.filesystem, original.filesystem);
         assert!(parsed.throttle.iops.is_none());
         assert!(parsed.throttle.bytes_per_sec.is_none());

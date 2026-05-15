@@ -1241,22 +1241,22 @@ fn build_template_via_vm(
     // host-PATH lookup name and the in-archive path are guaranteed
     // to stay in lockstep without a parallel match arm to drift.
     let mkfs_archive_path = format!("bin/{mkfs_name}");
-    // `capacity_mb` is u32; an `as u32` cast on `capacity_bytes /
+    // `capacity_mib` is u32; an `as u32` cast on `capacity_bytes /
     // (1024 * 1024)` would silently truncate any input above 4 TiB
     // (u32::MAX MiB). `try_from` surfaces the overflow as an
     // actionable error naming the offending value, so a caller
     // that passes an oversized capacity learns about it explicitly
     // rather than seeing a corrupted disk size in the guest.
-    let capacity_mb = u32::try_from(capacity_bytes / (1024 * 1024)).with_context(|| {
+    let capacity_mib = u32::try_from(capacity_bytes / (1024 * 1024)).with_context(|| {
         format!(
-            "capacity_mb overflow: capacity_bytes={capacity_bytes} \
-             yields {} MiB which exceeds u32::MAX. DiskConfig::capacity_mb \
+            "capacity_mib overflow: capacity_bytes={capacity_bytes} \
+             yields {} MiB which exceeds u32::MAX. DiskConfig::capacity_mib \
              is u32; use a smaller capacity.",
             capacity_bytes / (1024 * 1024),
         )
     })?;
     let disk = crate::vmm::disk_config::DiskConfig::default()
-        .capacity_mb(capacity_mb)
+        .capacity_mib(capacity_mib)
         .filesystem(Filesystem::Raw);
     // VM-level timeout for the template build. 120s = 2 minutes,
     // chosen as the inner bound that lets the outer
@@ -1596,7 +1596,7 @@ pub fn clean_orphaned_tmp_dirs(cache_root: &Path) -> Result<usize> {
 ///
 /// 1. **Disk-pressure escape hatch.** A long-running host has
 ///    accumulated dozens of cache entries across distinct
-///    `(fs, capacity, mkfs version)` triples (each capacity-mb
+///    `(fs, capacity, mkfs version)` triples (each capacity-mib
 ///    setting and each mkfs upgrade rotates the key). When disk
 ///    pressure rises, `clean_all` is the nuclear option — wipe
 ///    every published template and let the next test run rebuild
@@ -1875,7 +1875,7 @@ mod tests {
     fn cache_key_truncates_sub_mib_capacity_to_zero() {
         // Capacity less than 1 MiB rounds down to 0m. This is
         // intentional — DiskConfig's capacity is u32 mebibytes (see
-        // capacity_mb), so the only way to hit this is constructing
+        // capacity_mib), so the only way to hit this is constructing
         // capacity_bytes by hand below 2^20. Pinning the rendering
         // for that corner so a future bug that rounds up silently
         // is caught.

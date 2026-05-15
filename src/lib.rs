@@ -1082,7 +1082,7 @@ pub(crate) fn resolve_current_exe() -> anyhow::Result<std::path::PathBuf> {
 /// `disk`: optional virtio-blk device backing for `/dev/vda`. When
 ///   `Some`, the framework calls
 ///   [`vmm::KtstrVm::builder`]'s `.disk(..)` so the guest probes a
-///   raw block device sized per `disk.capacity_mb`.
+///   raw block device sized per `disk.capacity_mib`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_shell(
     kernel: std::path::PathBuf,

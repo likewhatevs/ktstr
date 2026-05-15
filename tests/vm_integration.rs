@@ -521,7 +521,7 @@ fn scenario_failure_dump_trigger_minimal_invariants(
 // `const fn` and a `static` initializer must be const-evaluable.
 
 const KTSTR_DISK_DEFAULT: ktstr::prelude::DiskConfig = ktstr::prelude::DiskConfig {
-    capacity_mb: 256,
+    capacity_mib: 256,
     filesystem: ktstr::prelude::Filesystem::Raw,
     throttle: ktstr::prelude::DiskThrottle {
         iops: None,
@@ -535,7 +535,7 @@ const KTSTR_DISK_DEFAULT: ktstr::prelude::DiskConfig = ktstr::prelude::DiskConfi
 };
 
 const KTSTR_DISK_READ_ONLY: ktstr::prelude::DiskConfig = ktstr::prelude::DiskConfig {
-    capacity_mb: 256,
+    capacity_mib: 256,
     filesystem: ktstr::prelude::Filesystem::Raw,
     throttle: ktstr::prelude::DiskThrottle {
         iops: None,
@@ -562,7 +562,7 @@ const KTSTR_DISK_READ_ONLY: ktstr::prelude::DiskConfig = ktstr::prelude::DiskCon
 /// Asserts:
 ///   - `/dev/vda` exists and is a block device (per
 ///     `std::fs::metadata().file_type().is_block_device()`).
-///   - The advertised capacity matches `KTSTR_DISK_DEFAULT.capacity_mb`
+///   - The advertised capacity matches `KTSTR_DISK_DEFAULT.capacity_mib`
 ///     when read via `ioctl(BLKGETSIZE64)` (see kernel
 ///     `block/ioctl.c` for the constant `0x80081272`).
 ///
@@ -613,13 +613,13 @@ fn scenario_disk_default_appears_at_dev_vda(_ctx: &ktstr::scenario::Ctx) -> Resu
         );
     }
 
-    let expected_bytes = (KTSTR_DISK_DEFAULT.capacity_mb as u64) << 20;
+    let expected_bytes = (KTSTR_DISK_DEFAULT.capacity_mib as u64) << 20;
     if size_bytes != expected_bytes {
         anyhow::bail!(
             "BLKGETSIZE64 on /dev/vda reported {size_bytes} bytes; \
-             expected {expected_bytes} ({} MB). The host advertised \
+             expected {expected_bytes} ({} MiB). The host advertised \
              a different capacity than the test configured.",
-            KTSTR_DISK_DEFAULT.capacity_mb,
+            KTSTR_DISK_DEFAULT.capacity_mib,
         );
     }
 
@@ -628,8 +628,8 @@ fn scenario_disk_default_appears_at_dev_vda(_ctx: &ktstr::scenario::Ctx) -> Resu
         DetailKind::Other,
         format!(
             "/dev/vda is a block device with capacity {size_bytes} bytes \
-             ({} MB), matching the configured DiskConfig",
-            KTSTR_DISK_DEFAULT.capacity_mb,
+             ({} MiB), matching the configured DiskConfig",
+            KTSTR_DISK_DEFAULT.capacity_mib,
         ),
     ));
     Ok(result)
@@ -1123,7 +1123,7 @@ static __KTSTR_ENTRY_DISK_READ_ONLY: ktstr::test_support::KtstrTestEntry =
 
 /// Disk #1 — `/dev/vda` exists with the configured capacity.
 ///
-/// Boots scx-ktstr with a 256 MB raw virtio-blk disk attached; the
+/// Boots scx-ktstr with a 256 MiB raw virtio-blk disk attached; the
 /// guest scenario stat()s `/dev/vda`, verifies it is a block device,
 /// and reads BLKGETSIZE64 to check the capacity round-trips through
 /// the kernel virtio driver.

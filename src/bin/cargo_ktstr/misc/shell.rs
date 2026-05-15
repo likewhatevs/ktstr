@@ -73,7 +73,7 @@ pub(crate) fn run_shell(
     // KVM probe so a bad string surfaces at CLI-argument time, not
     // mid-VM-setup. `parse_disk_arg` returns `Ok(None)` when the
     // attribute is absent and applies `DiskConfig::default()` for
-    // every knob except `capacity_mb` when present.
+    // every knob except `capacity_mib` when present.
     let disk_cfg = cli::parse_disk_arg(disk.as_deref()).map_err(|e| format!("{e:#}"))?;
     cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     let kernel_path = resolve_kernel_image(kernel.as_deref())?;

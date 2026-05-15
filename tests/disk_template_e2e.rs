@@ -77,7 +77,7 @@ const BTRFS_SUPER_MAGIC: i64 = 0x9123_683e;
 /// 256 MiB btrfs disk. Capacity matches the `vm_integration.rs`
 /// patterns and the disk-template-cache documentation default.
 const KTSTR_DISK_BTRFS: ktstr::prelude::DiskConfig = ktstr::prelude::DiskConfig {
-    capacity_mb: 256,
+    capacity_mib: 256,
     filesystem: ktstr::prelude::Filesystem::Btrfs,
     throttle: ktstr::prelude::DiskThrottle {
         iops: None,

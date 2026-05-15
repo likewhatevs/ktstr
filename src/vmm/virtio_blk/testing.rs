@@ -276,7 +276,7 @@ pub(super) fn used_event_addr(avail_addr: GuestAddress, queue_size: u16) -> Gues
 /// Build a guest memory map sized to host both the queue
 /// descriptor/avail/used rings (placed at GPA 0..) and the
 /// chain's data buffers (placed above the ring region).
-/// 1 MB total — generous so neither the rings nor the test
+/// 1 MiB total — generous so neither the rings nor the test
 /// payloads collide.
 pub(super) fn make_chain_test_mem() -> GuestMemoryMmap {
     GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 1 << 20)])

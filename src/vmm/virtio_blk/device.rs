@@ -86,7 +86,7 @@ pub(crate) const MMIO_MAGIC: u32 = 0x7472_6976; // "virt" in LE
 pub(crate) const MMIO_VERSION: u32 = 2; // virtio 1.x MMIO
 pub(crate) const VENDOR_ID: u32 = 0;
 
-/// MMIO region size: 4 KB (one page).
+/// MMIO region size: 4 KiB (one page).
 pub const VIRTIO_MMIO_SIZE: u64 = 0x1000;
 
 /// Single request queue. virtio-spec §5.2.2 declares one request
@@ -120,13 +120,13 @@ pub(crate) type BlkQueue = Queue;
 /// the virtio spec default.
 pub const VIRTIO_BLK_SECTOR_SIZE: u32 = 512;
 
-/// Default capacity (256 MB) used by virtio_blk tests. Mirrors the
-/// 256-MB default in [`super::disk_config::DiskConfig::default`].
+/// Default capacity (256 MiB) used by virtio_blk tests. Mirrors the
+/// 256-MiB default in [`super::disk_config::DiskConfig::default`].
 ///
 /// Sized for `mkfs.btrfs` minimum without `--mixed`: btrfs needs
-/// ~109 MB for single-profile metadata and ~256 MB if it picks DUP
+/// ~109 MiB for single-profile metadata and ~256 MiB if it picks DUP
 /// metadata (which is the default on a single-device fs). Sized
-/// below 256 MB risks `mkfs.btrfs` failing at template-build time.
+/// below 256 MiB risks `mkfs.btrfs` failing at template-build time.
 ///
 /// `dead_code` allow: only consumed by `#[cfg(test)]` modules
 /// (every virtio_blk test fixture passes this as the device's
@@ -146,10 +146,10 @@ pub(crate) const VIRTIO_BLK_SEG_MAX: u32 = 128;
 /// Maximum size in bytes of a single descriptor's data buffer.
 /// virtio-v1.2 §5.2.4 (`size_max`): caps per-descriptor length so a
 /// guest can't submit a single 4 GB descriptor and force the device
-/// to allocate a matching `Vec<u8>` for `read_at`/`write_at`. 1 MB
+/// to allocate a matching `Vec<u8>` for `read_at`/`write_at`. 1 MiB
 /// matches firecracker's default and is far above what the guest's
 /// blk-mq layer typically generates (max_sectors_kb defaults to
-/// 512 KB). Without `F_SIZE_MAX` the guest treats per-descriptor
+/// 512 KiB). Without `F_SIZE_MAX` the guest treats per-descriptor
 /// length as unbounded — host OOM hazard on a hostile guest.
 pub(crate) const VIRTIO_BLK_SIZE_MAX: u32 = 1 << 20;
 

@@ -60,7 +60,7 @@ pub fn parse_topology_string(topology: &str) -> Result<(u32, u32, u32, u32)> {
 /// into a count of mebibytes (MiB), rounded down. Returns `Err` when the
 /// suffix is unrecognized, the numeric portion fails to parse, the value
 /// is not a positive integer multiple of one MiB, or the result exceeds
-/// `u32::MAX` MiB (the [`crate::vmm::disk_config::DiskConfig::capacity_mb`]
+/// `u32::MAX` MiB (the [`crate::vmm::disk_config::DiskConfig::capacity_mib`]
 /// capacity).
 ///
 /// Accepted suffixes (case-insensitive): `b`, `kib`, `mib`, `gib`. All
@@ -75,7 +75,7 @@ pub fn parse_topology_string(topology: &str) -> Result<(u32, u32, u32, u32)> {
 /// implicit.
 ///
 /// The output unit is MiB to match
-/// [`crate::vmm::disk_config::DiskConfig::capacity_mb`] (despite the
+/// [`crate::vmm::disk_config::DiskConfig::capacity_mib`] (despite the
 /// field name, [`DiskConfig::capacity_bytes`] left-shifts by 20 — i.e.
 /// the field is MiB, not SI MB). A future rename of that field would
 /// land in this function in lockstep.
@@ -137,7 +137,7 @@ pub fn parse_disk_size_mib(s: &str) -> Result<u32> {
     if mib_count > u32::MAX as u64 {
         bail!(
             "invalid disk size '{s}': {mib_count} MiB exceeds u32::MAX \
-             (DiskConfig.capacity_mb is u32)"
+             (DiskConfig.capacity_mib is u32)"
         );
     }
     Ok(mib_count as u32)
@@ -167,7 +167,7 @@ pub fn parse_disk_arg(s: Option<&str>) -> Result<Option<crate::vmm::disk_config:
         Some(raw) => {
             let mib = parse_disk_size_mib(raw)?;
             Ok(Some(crate::vmm::disk_config::DiskConfig {
-                capacity_mb: mib,
+                capacity_mib: mib,
                 ..crate::vmm::disk_config::DiskConfig::default()
             }))
         }
@@ -368,7 +368,7 @@ mod tests {
         assert!(rendered.contains("invalid disk size '1tb'"));
     }
 
-    /// A value that overflows u32::MAX MiB is rejected (capacity_mb is u32).
+    /// A value that overflows u32::MAX MiB is rejected (capacity_mib is u32).
     #[test]
     fn parse_disk_size_mib_rejects_u32_overflow() {
         // (u32::MAX + 1) MiB
@@ -402,7 +402,7 @@ mod tests {
         );
     }
 
-    /// `--disk 256mib` → `Some(DiskConfig)` with `capacity_mb=256`
+    /// `--disk 256mib` → `Some(DiskConfig)` with `capacity_mib=256`
     /// and the remaining fields equal to `DiskConfig::default()`.
     /// Pins the size-only fast path (the only shape `parse_disk_arg`
     /// accepts today) and guards against drift in the spread of
@@ -415,13 +415,13 @@ mod tests {
             .expect("256mib must parse")
             .expect("Some(...) input must yield Some(DiskConfig)");
         let expected = crate::vmm::disk_config::DiskConfig {
-            capacity_mb: 256,
+            capacity_mib: 256,
             ..crate::vmm::disk_config::DiskConfig::default()
         };
         assert_eq!(
             got, expected,
             "parse_disk_arg(\"256mib\") must equal DiskConfig::default() \
-             with capacity_mb=256: got {got:?}, expected {expected:?}",
+             with capacity_mib=256: got {got:?}, expected {expected:?}",
         );
     }
 

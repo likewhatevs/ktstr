@@ -840,7 +840,7 @@ pub struct KtstrTestEntry {
     /// `None` (the default) boots without a disk; `Some(cfg)` calls
     /// [`crate::vmm::KtstrVmBuilder::disk`] in
     /// [`crate::test_support::runtime::build_vm_builder_base`] so the
-    /// guest sees a raw block device sized per `cfg.capacity_mb`.
+    /// guest sees a raw block device sized per `cfg.capacity_mib`.
     /// The `#[ktstr_test]` macro does not currently surface this
     /// slot — direct construction via `..KtstrTestEntry::DEFAULT`
     /// is the only path. Mutually exclusive with `host_only`:

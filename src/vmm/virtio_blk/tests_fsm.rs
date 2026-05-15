@@ -56,8 +56,8 @@ fn advertised_features_include_event_idx() {
 
 #[test]
 fn capacity_in_config_space() {
-    // 256 MB / 512 = 524_288 sectors. The default capacity is
-    // 256 MB (mkfs.btrfs minimum).
+    // 256 MiB / 512 = 524_288 sectors. The default capacity is
+    // 256 MiB (mkfs.btrfs minimum).
     let dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
     assert_eq!(dev.capacity_sectors(), 524_288);
     let mut buf = [0u8; 8];
