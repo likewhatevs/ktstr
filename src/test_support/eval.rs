@@ -1896,18 +1896,27 @@ fn evaluate_vm_result(
     // exited; see KTSTR_API_ISSUES_FROM_SCX_MITOSIS.md B4 for the
     // motivating user report. Extraction is suppressed when there
     // is nothing actionable to surface so passing tests stay quiet.
-    let bug_summary_line = match crate::test_support::output::extract_bug_summary(
-        sched_log_input,
-        &raw_dump,
-    ) {
-        Some(text) => {
-            if crate::cli::stderr_color() {
-                format!("\x1b[1;31mBUG SUMMARY:\x1b[0m {text}\n")
-            } else {
-                format!("BUG SUMMARY: {text}\n")
+    //
+    // Gated behind a closure: every failure return path below renders
+    // exactly one failure message and calls the closure exactly once,
+    // and a passing test takes the `return Ok(check_result)` at the
+    // end of the parse-success arm without invoking any failure
+    // formatter — so the `extract_bug_summary` scan over sched_log +
+    // dump never runs on the pass path. The eager `match` this
+    // replaces ran the scan unconditionally on every test, paying the
+    // ANSI strip + line walk for passing tests that would never
+    // render the result.
+    let bug_summary_line = || -> String {
+        match crate::test_support::output::extract_bug_summary(sched_log_input, &raw_dump) {
+            Some(text) => {
+                if crate::cli::stderr_color() {
+                    format!("\x1b[1;31mBUG SUMMARY:\x1b[0m {text}\n")
+                } else {
+                    format!("BUG SUMMARY: {text}\n")
+                }
             }
+            None => String::new(),
         }
-        None => String::new(),
     };
 
     let tl_ctx = crate::timeline::TimelineContext {
@@ -2122,7 +2131,7 @@ fn evaluate_vm_result(
             let msg = format!(
                 "{}{}ktstr_test '{}'{} [topo={}] failed:\n  {}{}{}{}{}{}{}{}{}{}",
                 fingerprint_line,
-                bug_summary_line,
+                bug_summary_line(),
                 entry.name,
                 sched_label,
                 topo,
@@ -2174,7 +2183,7 @@ fn evaluate_vm_result(
                 let msg = format!(
                     "{}{}ktstr_test '{}'{} [topo={}] {ERR_MONITOR_FAILED_AFTER_SCENARIO}:\n  {}{}{}{}{}",
                     fingerprint_line,
-                    bug_summary_line,
+                    bug_summary_line(),
                     entry.name,
                     sched_label,
                     topo,
@@ -2302,7 +2311,7 @@ fn evaluate_vm_result(
         let msg = format!(
             "{}{}ktstr_test '{}'{} [topo={}] {}{}{}{}{}{}{}{}{}",
             fingerprint_line,
-            bug_summary_line,
+            bug_summary_line(),
             entry.name,
             sched_label,
             topo,
@@ -2342,7 +2351,7 @@ fn evaluate_vm_result(
     let msg = format!(
         "{}{}ktstr_test '{}'{} [topo={}] {}{}{}{}{}{}{}",
         fingerprint_line,
-        bug_summary_line,
+        bug_summary_line(),
         entry.name,
         sched_label,
         topo,

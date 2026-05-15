@@ -183,10 +183,14 @@ pub(crate) fn extract_bug_summary(sched_log: &str, dump: &str) -> Option<String>
 /// outside CSI sequences pass through unchanged.
 fn strip_ansi_csi(s: &str) -> String {
     // Common case: no ESC byte at all — return without allocating
-    // a separate Vec + roundtripping through from_utf8. Failure-
-    // path call site, but every passing test runs this on its
-    // sched_log + dump too via the eval.rs pre-compute, so the
-    // fast path matters.
+    // a separate Vec + roundtripping through from_utf8. Called up
+    // to twice per test failure via `extract_bug_summary` — once
+    // on the dump arg (unconditionally), and again on the
+    // sched_log arg if the dump anchor scan doesn't return. The
+    // eval.rs pre-compute was lifted into a closure that only
+    // fires on failure paths, so passing tests no longer hit
+    // this; the fast path avoids unnecessary copy/strip work
+    // when the corpus is plain text.
     if !s.contains('\x1b') {
         return s.to_string();
     }
@@ -945,6 +949,106 @@ mod tests {
     fn extract_bug_summary_none_on_closer_only_dump() {
         let dump = "  ktstr-1   [001]   0.5: sched_ext_dump: sched_ext: BPF scheduler \"scx_mitosis\" disabled (Error)\n";
         assert!(extract_bug_summary("", dump).is_none());
+    }
+
+    /// Anchor on the dump's LAST line (no following body line):
+    /// `lines.get(i + 1)` returns `None`, the anchor loop falls
+    /// through, and the function moves on to the sched_log
+    /// fallback. Pin both arms: with an empty sched_log the
+    /// overall result is `None` (no body, no fallback), and with
+    /// a sched_log carrying an `scx_bpf_error` line the fallback
+    /// surfaces it. A future refactor that swapped `find` for
+    /// e.g. "scan all anchors and take the best body" could
+    /// silently change the no-following-line semantics — the
+    /// no-fallback assertion catches the case where the new
+    /// scan invents a body out of thin air, and the fallback
+    /// assertion catches the case where the new scan
+    /// short-circuits past the sched_log path.
+    #[test]
+    fn extract_bug_summary_anchor_on_last_line_falls_through() {
+        let dump = "  ktstr-1 [001] 0.5: sched_ext_dump: scheduler[1] triggered exit kind 5:\n";
+        assert!(
+            extract_bug_summary("", dump).is_none(),
+            "anchor on last line with empty sched_log must yield None",
+        );
+        let summary = extract_bug_summary("scx_bpf_error: late fallback\n", dump)
+            .expect("anchor on last line must fall through to sched_log fallback");
+        assert_eq!(
+            summary, "scx_bpf_error: late fallback",
+            "fallback must return the trimmed scx_bpf_error line verbatim; a \
+             regression that surfaced the whole sched_log buffer, an empty \
+             string, or a sentinel placeholder would trip here but slip past \
+             a `contains` check: {summary}",
+        );
+    }
+
+    /// Anchor in the dump takes precedence over an `scx_bpf_error`
+    /// line in the sched_log fallback. The function's early return
+    /// at the end of the dump-scan loop (output.rs:163-165) must
+    /// fire before the fallback loop ever starts. A regression that
+    /// reordered the two scans, or that concatenated their outputs,
+    /// would silently change which signal source wins on tests that
+    /// expose both. None of the prior `extract_bug_summary_*` tests
+    /// in the sibling cluster above populate the dump AND sched_log
+    /// such that each path would independently produce a `Some`
+    /// result — the canonical-dump test has no sched_log, the
+    /// fallback test has no dump anchor, the first-event-wins test
+    /// has no sched_log, and the last-line-fall-through test's
+    /// dump-arm has no following body so its dump-scan never
+    /// independently produces `Some`. This case closes that gap.
+    #[test]
+    fn extract_bug_summary_anchor_takes_precedence_over_sched_log_fallback() {
+        let dump = "  ktstr-1 [001] 0.5: sched_ext_dump: scheduler[1] triggered exit kind 5:\n  \
+                      ktstr-1 [001] 0.5: sched_ext_dump:   anchor body wins\n";
+        let sched_log = "scx_bpf_error: fallback should NOT fire when dump has anchor\n";
+        let summary = extract_bug_summary(sched_log, dump)
+            .expect("anchor + sched_log → Some via anchor scan");
+        assert_eq!(
+            summary, "anchor body wins",
+            "dump-scan anchor must early-return before the sched_log \
+             fallback loop runs; a regression that ran fallback first, or \
+             concatenated the two, would surface the scx_bpf_error line \
+             instead: {summary}",
+        );
+    }
+
+    /// Pin current `lines.get(i + 1)` adjacency behavior: the
+    /// dump scan takes the line immediately after the `triggered
+    /// exit kind` anchor as the body, without any context match
+    /// (e.g. without checking that the body's `scheduler[N]`
+    /// prefix matches the anchor's). In practice the kernel
+    /// emits the anchor and the body through two adjacent
+    /// `dump_line` calls (kernel/sched/ext.c:6161 + 6163) on the
+    /// same `seq_buf`, both protected by `scx_dump_lock`. Each
+    /// call produces one `trace_sched_ext_dump` tracepoint
+    /// event, so adjacency in the trace_pipe stream holds when
+    /// no other tracepoint events interleave between the two
+    /// calls — the cross-CPU interleaved-stream caveat is a
+    /// known limitation of the current implementation. A future
+    /// refactor that (a) added a
+    /// relevance check between anchor and body, or (b) replaced
+    /// the strict `i + 1` pick with a "scan downward until a
+    /// body-shaped line" search would silently change which line
+    /// gets surfaced. The intervening unrelated dump line below
+    /// — different `scheduler[N]`, different cpu, different
+    /// relative-time — is exactly the kind of line such a
+    /// refactor would skip past, so the assertion that it IS
+    /// what we return is a load-bearing pin.
+    #[test]
+    fn extract_bug_summary_takes_immediate_next_line() {
+        let dump = "\
+ktstr-1 [001] 0.5: sched_ext_dump: scheduler[1] triggered exit kind 5:
+ktstr-2 [002] 0.5: sched_ext_dump: scheduler[2] unrelated body from cpu 2
+ktstr-3 [003] 0.5: sched_ext_dump: scheduler[1] real body for kind 5
+";
+        let summary =
+            extract_bug_summary("", dump).expect("anchor + following line must yield Some");
+        assert_eq!(
+            summary, "scheduler[2] unrelated body from cpu 2",
+            "extract_bug_summary takes lines.get(i + 1) verbatim and \
+             does not scan for a relevance-matched body — a future \
+             refactor that adds context matching must update this pin",
+        );
     }
 
     // -- extract_kernel_version --
