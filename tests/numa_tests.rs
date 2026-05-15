@@ -28,7 +28,7 @@ fn scenario_multi_numa_boot(ctx: &Ctx) -> Result<AssertResult> {
         let mi = topo
             .node_meminfo(nid)
             .unwrap_or_else(|| panic!("node {nid} missing meminfo"));
-        assert!(mi.total_kb > 0, "node {nid} has zero memory");
+        assert!(mi.total_kib > 0, "node {nid} has zero memory");
     }
 
     let steps = vec![Step {
@@ -80,7 +80,7 @@ fn scenario_cxl_memory_only(ctx: &Ctx) -> Result<AssertResult> {
     assert_eq!(topo.numa_distance(1, 2), 25);
 
     let mi = topo.node_meminfo(2).expect("CXL node 2 must have meminfo");
-    assert!(mi.total_kb > 0, "CXL node must have memory");
+    assert!(mi.total_kib > 0, "CXL node must have memory");
 
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),

@@ -55,15 +55,15 @@ impl LlcInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeMemInfo {
     /// Total memory in KiB.
-    pub total_kb: u64,
+    pub total_kib: u64,
     /// Free memory in KiB.
-    pub free_kb: u64,
+    pub free_kib: u64,
 }
 
 impl NodeMemInfo {
-    /// Used memory in KiB (`total_kb - free_kb`).
-    pub fn used_kb(&self) -> u64 {
-        self.total_kb.saturating_sub(self.free_kb)
+    /// Used memory in KiB (`total_kib - free_kib`).
+    pub fn used_kib(&self) -> u64 {
+        self.total_kib.saturating_sub(self.free_kib)
     }
 }
 
@@ -284,24 +284,24 @@ fn read_core_id(cpu: usize) -> Option<usize> {
 fn read_node_meminfo(node: usize) -> Option<NodeMemInfo> {
     let path = format!("/sys/devices/system/node/node{node}/meminfo");
     let content = fs::read_to_string(path).ok()?;
-    let mut total_kb = None;
-    let mut free_kb = None;
+    let mut total_kib = None;
+    let mut free_kib = None;
     for line in content.lines() {
         if let Some(rest) = line.strip_suffix("kB").map(str::trim_end) {
             if rest.contains("MemTotal") {
-                total_kb = rest
+                total_kib = rest
                     .rsplit_once(char::is_whitespace)
                     .and_then(|(_, v)| v.parse().ok());
             } else if rest.contains("MemFree") {
-                free_kb = rest
+                free_kib = rest
                     .rsplit_once(char::is_whitespace)
                     .and_then(|(_, v)| v.parse().ok());
             }
         }
     }
     Some(NodeMemInfo {
-        total_kb: total_kb?,
-        free_kb: free_kb?,
+        total_kib: total_kib?,
+        free_kib: free_kib?,
     })
 }
 
@@ -847,8 +847,8 @@ impl TestTopology {
                         node_mem.insert(
                             i,
                             NodeMemInfo {
-                                total_kb: (node.memory_mib as u64) * 1024,
-                                free_kb: (node.memory_mib as u64) * 1024,
+                                total_kib: (node.memory_mib as u64) * 1024,
+                                free_kib: (node.memory_mib as u64) * 1024,
                             },
                         );
                     }
@@ -858,19 +858,19 @@ impl TestTopology {
                 }
             }
             None => {
-                if let Some(total_mb) = total_memory_mib {
-                    let per_node_mb = total_mb / numa_nodes;
+                if let Some(total_mib) = total_memory_mib {
+                    let per_node_mib = total_mib / numa_nodes;
                     for i in 0..n {
-                        let mb = if i == n - 1 {
-                            total_mb - per_node_mb * (numa_nodes - 1)
+                        let mib = if i == n - 1 {
+                            total_mib - per_node_mib * (numa_nodes - 1)
                         } else {
-                            per_node_mb
+                            per_node_mib
                         };
                         node_mem.insert(
                             i,
                             NodeMemInfo {
-                                total_kb: (mb as u64) * 1024,
-                                free_kb: (mb as u64) * 1024,
+                                total_kib: (mib as u64) * 1024,
+                                free_kib: (mib as u64) * 1024,
                             },
                         );
                     }
@@ -1509,21 +1509,21 @@ mod tests {
     // -- node_meminfo tests --
 
     #[test]
-    fn node_meminfo_used_kb() {
+    fn node_meminfo_used_kib() {
         let mi = NodeMemInfo {
-            total_kb: 1024,
-            free_kb: 256,
+            total_kib: 1024,
+            free_kib: 256,
         };
-        assert_eq!(mi.used_kb(), 768);
+        assert_eq!(mi.used_kib(), 768);
     }
 
     #[test]
-    fn node_meminfo_used_kb_saturates() {
+    fn node_meminfo_used_kib_saturates() {
         let mi = NodeMemInfo {
-            total_kb: 0,
-            free_kb: 100,
+            total_kib: 0,
+            free_kib: 100,
         };
-        assert_eq!(mi.used_kb(), 0);
+        assert_eq!(mi.used_kib(), 0);
     }
 
     #[test]

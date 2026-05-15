@@ -78,11 +78,11 @@ pub(crate) fn read_kernel_init_size(kernel_path: &Path) -> Result<u64> {
     }
 }
 
-/// Minimum guest memory (in MB) needed to boot, extract the initramfs,
+/// Minimum guest memory (in MiB) needed to boot, extract the initramfs,
 /// and run the test workload.
 ///
 /// ```text
-/// total = computed_boot_requirement + WORKLOAD_MB + shm
+/// total = computed_boot_requirement + WORKLOAD_MIB + shm
 /// ```
 ///
 /// ## Computed boot requirement
@@ -158,21 +158,21 @@ pub(crate) fn read_kernel_init_size(kernel_path: &Path) -> Result<u64> {
 ///
 /// ## Workload budget
 ///
-/// 256 MB for scheduler execution, test scenarios, and runtime
+/// 256 MiB for scheduler execution, test scenarios, and runtime
 /// allocations (cgroup memory, BPF maps, process stacks, slab caches).
 /// This is a deliberate budget for post-boot workload, not a guess at
 /// kernel overhead.
 ///
-/// Workload budget (MB): scheduler execution, test scenarios, cgroup
+/// Workload budget (MiB): scheduler execution, test scenarios, cgroup
 /// memory, BPF maps, and runtime allocations.
-const WORKLOAD_MB: u64 = 256;
+const WORKLOAD_MIB: u64 = 256;
 
 pub(crate) fn initramfs_min_memory_mib(budget: &MemoryBudget) -> u32 {
-    let ceil_mb = |bytes: u64| -> u64 { (bytes + (1 << 20) - 1) >> 20 };
+    let ceil_mib = |bytes: u64| -> u64 { (bytes + (1 << 20) - 1) >> 20 };
 
-    let init_size_mb = ceil_mb(budget.kernel_init_size);
-    let compressed_mb = ceil_mb(budget.compressed_initrd_bytes);
-    let uncompressed_mb = ceil_mb(budget.uncompressed_initramfs_bytes);
+    let init_size_mib = ceil_mib(budget.kernel_init_size);
+    let compressed_mib = ceil_mib(budget.compressed_initrd_bytes);
+    let uncompressed_mib = ceil_mib(budget.uncompressed_initramfs_bytes);
 
     // Boot requirement: initramfs_options=size=90% sets the rootfs
     // tmpfs limit to 90% of totalram_pages.
@@ -186,15 +186,15 @@ pub(crate) fn initramfs_min_memory_mib(budget: &MemoryBudget) -> u32 {
     //   (P - init_size - compressed - P/64) * 9/10 >= uncompressed
     //   P * 63/64 >= uncompressed * 10/9 + init_size + compressed
     //   P >= (ceil(uncompressed * 10/9) + init_size + compressed) * 64/63
-    let uncompressed_scaled = (uncompressed_mb * 10).div_ceil(9);
-    let content_mb = uncompressed_scaled + init_size_mb + compressed_mb;
+    let uncompressed_scaled = (uncompressed_mib * 10).div_ceil(9);
+    let content_mib = uncompressed_scaled + init_size_mib + compressed_mib;
 
     // struct page overhead: P/64 is part of reserved, creating a
     // circular dependency. Solve: P = content * 64/63.
-    let boot_mb = (content_mb * 64).div_ceil(63);
+    let boot_mib = (content_mib * 64).div_ceil(63);
 
     // total = computed boot requirement + workload budget.
-    (boot_mb + WORKLOAD_MB) as u32
+    (boot_mib + WORKLOAD_MIB) as u32
 }
 
 #[cfg(test)]
@@ -202,12 +202,12 @@ mod tests {
     use super::*;
 
     /// Pin the workload-budget constant. Bumping the value
-    /// (`WORKLOAD_MB`) changes the floor for every deferred-memory
+    /// (`WORKLOAD_MIB`) changes the floor for every deferred-memory
     /// VM boot; this test fails any change so the bump goes through
     /// review rather than slipping in unnoticed.
     #[test]
-    fn workload_mb_is_256() {
-        assert_eq!(WORKLOAD_MB, 256);
+    fn workload_mib_is_256() {
+        assert_eq!(WORKLOAD_MIB, 256);
     }
 
     /// All-zero inputs collapse to just the workload budget — no
@@ -220,19 +220,19 @@ mod tests {
             compressed_initrd_bytes: 0,
             kernel_init_size: 0,
         };
-        assert_eq!(initramfs_min_memory_mib(&budget), WORKLOAD_MB as u32);
+        assert_eq!(initramfs_min_memory_mib(&budget), WORKLOAD_MIB as u32);
     }
 
     /// `kernel_init_size` and `compressed_initrd_bytes` flow into
-    /// `content_mb` additively, then through the `*64/63` struct-page
+    /// `content_mib` additively, then through the `*64/63` struct-page
     /// circular-dependency factor. Verify the math against a
     /// hand-computed reference. Inputs:
     ///   uncompressed=10 MiB, init_size=5 MiB, compressed=2 MiB.
     /// Hand trace per `initramfs_min_memory_mib`:
     ///   uncompressed_scaled = ceil(10*10/9) = ceil(11.111) = 12
-    ///   content_mb         = 12 + 5 + 2 = 19
-    ///   boot_mb            = ceil(19*64/63) = ceil(19.301) = 20
-    ///   total              = 20 + 256 (WORKLOAD_MB) = 276
+    ///   content_mib         = 12 + 5 + 2 = 19
+    ///   boot_mib            = ceil(19*64/63) = ceil(19.301) = 20
+    ///   total              = 20 + 256 (WORKLOAD_MIB) = 276
     #[test]
     fn initramfs_min_memory_mib_known_input() {
         let budget = MemoryBudget {
@@ -249,8 +249,8 @@ mod tests {
     /// down to zero and bypass the tmpfs-90% safety factor. With
     /// uncompressed=1 byte, init=0, compressed=0:
     ///   uncompressed_scaled = ceil(1*10/9) = 2
-    ///   content_mb         = 2 + 0 + 0 = 2
-    ///   boot_mb            = ceil(2*64/63) = ceil(2.031) = 3
+    ///   content_mib         = 2 + 0 + 0 = 2
+    ///   boot_mib            = ceil(2*64/63) = ceil(2.031) = 3
     ///   total              = 3 + 256 = 259
     #[test]
     fn initramfs_min_memory_mib_subbyte_uncompressed_rounds_up() {
@@ -268,8 +268,8 @@ mod tests {
     /// production callers in vmm/mod.rs feed values of this order).
     /// Trace:
     ///   uncompressed_scaled = ceil(200*10/9) = ceil(222.222) = 223
-    ///   content_mb         = 223 + 30 + 50 = 303
-    ///   boot_mb            = ceil(303*64/63) = ceil(307.809) = 308
+    ///   content_mib         = 223 + 30 + 50 = 303
+    ///   boot_mib            = ceil(303*64/63) = ceil(307.809) = 308
     ///   total              = 308 + 256 = 564
     #[test]
     fn initramfs_min_memory_mib_larger_input() {

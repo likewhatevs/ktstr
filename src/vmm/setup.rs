@@ -787,10 +787,10 @@ impl KtstrVm {
         };
         let memory_mib = initramfs_min_memory_mib(&budget).max(self.memory_min_mb);
         tracing::debug!(
-            uncompressed_mb = uncompressed_size >> 20,
-            compressed_mb = compressed_size >> 20,
-            init_size_mb = kernel_init_size >> 20,
-            memory_min_mb = self.memory_min_mb,
+            uncompressed_mib = uncompressed_size >> 20,
+            compressed_mib = compressed_size >> 20,
+            init_size_mib = kernel_init_size >> 20,
+            memory_min_mib = self.memory_min_mb,
             memory_mib,
             "deferred_memory_computed",
         );
@@ -1469,10 +1469,10 @@ impl KtstrVm {
         };
         let memory_mib = initramfs_min_memory_mib(&budget).max(self.memory_min_mb);
         tracing::debug!(
-            uncompressed_mb = uncompressed_size >> 20,
-            compressed_mb = compressed_size >> 20,
-            init_size_mb = kernel_init_size >> 20,
-            memory_min_mb = self.memory_min_mb,
+            uncompressed_mib = uncompressed_size >> 20,
+            compressed_mib = compressed_size >> 20,
+            init_size_mib = kernel_init_size >> 20,
+            memory_min_mib = self.memory_min_mb,
             memory_mib,
             "deferred_memory_computed",
         );
