@@ -143,12 +143,13 @@ KVM enabled and the user must have read+write access to `/dev/kvm`.
 ## No kernel found
 
 ```text
-no kernel found
+no kernel found — the test harness was likely invoked outside `cargo ktstr test` (which builds and injects a kernel automatically).
+  hint: run `cargo ktstr test --kernel <path-or-version>` to drive this test, or set KTSTR_TEST_KERNEL=/path/to/{bzImage|Image} to point at a pre-built bootable image directly.
   hint: set KTSTR_KERNEL to a kernel source directory, a version (e.g. `6.14.2`), or a cache key (see `cargo ktstr kernel list`), or run `cargo ktstr kernel build` to populate the cache
-  hint: or set KTSTR_TEST_KERNEL=/path/to/bzImage to point at a pre-built bootable image directly (bypasses KTSTR_KERNEL resolution)
 ```
 
-On aarch64 the second hint says `Image` instead of `bzImage`.
+On aarch64 the first hint's image filename is `Image` instead of
+`bzImage`.
 
 `ktstr shell` and `cargo ktstr shell` auto-download the latest
 stable kernel when no `--kernel` is specified and no kernel is found
@@ -308,9 +309,16 @@ echo 2048 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
 ## Worker assertion failures
 
 ```text
-stuck 4500ms on cpu2 at +3200ms (threshold 3000ms)
+tid 2 stuck 4500ms on cpu2 at +3200ms (threshold 3000ms)
 unfair cgroup: spread=42% (8-50%) 4 workers on 4 cpus (threshold 35%)
 ```
+
+The `tid N` prefix on `stuck` names the thread the violation belongs
+to so the operator can cross-reference with `--- timeline ---` and
+`--- stats ---` sections, which key per-thread metrics by `tid`.
+`unfair cgroup` is a per-cgroup assertion and has no `tid` prefix —
+cross-reference with the per-cgroup spread / workers / cpus columns
+in `--- stats ---` instead.
 
 The Assert checks (`max_gap_ms`, `max_spread_pct`, etc.) detected a
 worker metric outside the configured thresholds.
@@ -326,20 +334,89 @@ worker metric outside the configured thresholds.
 
 ## Cgroup name typos
 
-```text
-No such file or directory: /sys/fs/cgroup/.../nonexistent/cgroup.procs
-```
+A typo'd cgroup name surfaces only when an op tries to write to a
+non-existent cgroup directory; the framework does not pre-validate
+names against the tracking registry. The exact diagnostic depends on
+which op references the typo:
 
-A cgroup name passed to `Op::SetCpuset`, `Op::Spawn`, or
-`CgroupManager::move_tasks` does not match a previously created
-cgroup. Cgroup names are case-sensitive strings.
+- **`Op::RemoveCgroup` / `Op::StopCgroup` against a typo silently
+  succeed** (rmdir / kill against a non-existent path are no-ops).
+  The failure surfaces on the next op that touches the name.
+
+- **`Op::SetCpuset` (writes `cpuset.cpus`)** falls through to the
+  kernel's `ENOENT`, wrapped with `capture_cpuset_state` — a
+  one-line snapshot of the parent's controller / subtree_control
+  state and the child's listing:
+
+  ```text
+  cgroup-state-snapshot: parent=/sys/fs/cgroup/ktstr name=nonexistent parent.cgroup.controllers="cpuset cpu memory io pids" parent.cgroup.subtree_control="cpuset cpu memory" child.cgroup.controllers="<read failed: No such file or directory (os error 2)>" child.cpuset.cpus.exists=false child.listing=<read_dir failed: No such file or directory (os error 2)>: No such file or directory (os error 2)
+  ```
+
+  The `child.listing=<read_dir failed: ...>` segment is the operator
+  tell: a typo'd name has no directory to list, distinguishing this
+  from the "cgroup exists but the cpuset.cpus write was rejected"
+  case (where the listing would enumerate the cgroupfs knobs).
+
+- **Other setters (`cpu.max`, `memory.max`, `memory.swap.max`,
+  `cpuset.mems`, etc.) against a typo** produce the wrapped
+  `+controller in parent cgroup.subtree_control` form documented
+  below in [Cgroup controller not enabled](#cgroup-controller-not-enabled).
+  The same wrap fires for both the "cgroup directory exists but the
+  parent's subtree_control lacks the controller" and the "cgroup
+  directory does not exist" cases — distinguish by checking whether
+  the directory itself is present.
+
+- **`Op::AddCgroup` against a name that's already tracked** (a typo
+  that happens to collide with an existing cgroup) bails with:
+
+  ```text
+  Op::AddCgroup 'cg_0' collides with a cgroup already tracked (by a prior Backdrop or step-local CgroupDef) — declare it in exactly one place; use a fresh name for the step-local cgroup
+  ```
 
 **Fixes:**
 
-- Verify the cgroup name matches the `name` in `Op::AddCgroup` or
-  `CgroupDef::named()`.
+- Verify the cgroup name matches the `name` in `Op::AddCgroup`,
+  `CgroupDef::named()`, or the `Backdrop.cgroups` declaration.
 - When using dynamic cgroup names (e.g. `format!("cg_{i}")`), ensure
   the same formatting is used in all ops referencing that cgroup.
+- For `Op::SetCpuset`, check the `child.listing` field of the
+  snapshot to decide whether the cgroup directory exists at all (the
+  `<read_dir failed: ENOENT>` shape rules out the controller-config
+  hypothesis).
+
+## Cgroup controller not enabled
+
+```text
+cgroup 'cg_0': set cpu.max='100000 100000' (requires +cpu in parent cgroup.subtree_control): No such file or directory (os error 2)
+cgroup 'cg_0': set memory.max='4294967296' (requires +memory in parent cgroup.subtree_control): No such file or directory (os error 2)
+cgroup 'cg_0': set memory.swap.max='1073741824' (requires +memory in parent cgroup.subtree_control; file absent on CONFIG_SWAP=n kernels): No such file or directory (os error 2)
+cgroup 'cg_0': set cpuset.mems='0-1' (requires +cpuset in parent cgroup.subtree_control): No such file or directory (os error 2)
+```
+
+The cgroup exists but the controller knob is missing from
+`/sys/fs/cgroup/<parent>/<name>/`. ktstr's `setup()` auto-enables
+the controllers it detects on the scenario's `CgroupDef` / `Op` set,
+so a missing controller means either:
+
+- the scenario declared a knob (e.g. `memory_max`) but the
+  framework's detection did not see it (file a bug — the detector
+  walks every `CgroupDef` field);
+- an outer parent (systemd `user.slice`, container runtime) stripped
+  controllers from this subtree before ktstr ran;
+- the kernel was built without `CONFIG_SWAP` (the `memory.swap.max`
+  wrapping spells this out explicitly).
+
+**Diagnostic command:**
+
+```sh
+cat /sys/fs/cgroup/<parent>/cgroup.subtree_control
+```
+
+The output enumerates the controllers the parent forwards to its
+children. A controller present in the wrapped error must appear in
+this list; if it does not, fix the parent first (`echo '+memory' >
+.../cgroup.subtree_control` from a sufficiently-privileged shell) or
+remove the knob from the scenario.
 
 ## CpusetSpec errors
 
@@ -368,12 +445,18 @@ with inputs that would panic.
 ## Worker count mismatches
 
 ```text
-PipeIo requires num_workers divisible by 2, got 3
+PipeIo (group 0) requires num_workers divisible by 2, got 3
 ```
 
 Grouped work types (`PipeIo`, `FutexPingPong`, `CachePipe`,
-`FutexFanOut`, `FanOutCompute`) require `num_workers` divisible by their
-group size. `WorkType::worker_group_size()` returns the divisor.
+`FutexFanOut`, `FanOutCompute`, plus the contention / waker
+families documented at
+[WorkloadHandle: spawning](architecture/workload-handle.md#spawning))
+require `num_workers` divisible by their group size.
+`WorkType::worker_group_size()` returns the divisor. The `(group N)`
+segment names the composed[] entry the violation belongs to —
+multi-group scenarios surface `(group 0)`, `(group 1)`, … so you
+know which composed entry to fix.
 
 **Fixes:**
 

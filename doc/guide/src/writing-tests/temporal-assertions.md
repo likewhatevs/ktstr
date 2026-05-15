@@ -7,14 +7,15 @@ warmup ends? Does a load average converge before a deadline?
 
 The shape is two-stage:
 
-1. Build a `SampleSeries`(#sampleseries) from the bridge's drained
+1. Build a [`SampleSeries`](#sampleseries) from the bridge's drained
    periodic captures.
-2. **Project** a `SeriesField<T>`(#seriesfield) — one column of
+2. **Project** a [`SeriesField<T>`](#seriesfield) — one column of
    `T`-typed values across every sample — and feed it through a
-   temporal pattern (`nondecreasing`, `rate_within`, `steady_within`,
-   `converges_to`, `always_true`, `ratio_within`).
+   temporal pattern (`nondecreasing`, `strictly_increasing`,
+   `rate_within`, `steady_within`, `converges_to`, `always_true`,
+   `ratio_within`).
 
-Each pattern records `DetailKind::Temporal`(#failure-rendering)
+Each pattern records [`DetailKind::Temporal`](#failure-rendering)
 details on the `Verdict` when a sample violates the invariant, and
 records `Note`s when projection errors leave a coverage gap.
 
@@ -27,7 +28,7 @@ projection + assertion surface only.
 `SampleSeries` is the ordered sequence of `(tag, report, stats,
 elapsed_ms)` tuples drained from the bridge after the VM exits. Build
 it from
-`SnapshotBridge::drain_ordered_with_stats`(snapshots.md#wiring-the-bridge):
+[`SnapshotBridge::drain_ordered_with_stats`](snapshots.md#wiring-the-bridge):
 
 ```rust,ignore
 use ktstr::prelude::*;
@@ -130,11 +131,15 @@ non-numeric / type-mismatched fields silently. Useful for blanket
 Nested struct members (e.g. `"ctx.weight"`) and per-CPU maps need
 the manual closure path through `SampleSeries::bpf`.
 
-## The six temporal patterns
+## The seven temporal patterns
 
 Every pattern takes `&mut Verdict` and returns the same `&mut
 Verdict` so chains of assertions stack onto one accumulator. Each
-pattern is a method on `SeriesField`:
+PATTERN is a method on `SeriesField` (distinct from `each(...)`,
+which returns the per-sample comparator builder covered in its own
+section below). `nondecreasing` and `strictly_increasing` share the
+same section heading; the seven patterns are six sections plus the
+shared one.
 
 ### `nondecreasing` / `strictly_increasing`
 

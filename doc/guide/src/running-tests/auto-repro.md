@@ -98,8 +98,8 @@ fexit captures post-mutation state, changed fields show an arrow
 (`→`) between entry and exit values:
 
 ```text
-ktstr_test 'demo_host_crash_auto_repro' [sched=scx-ktstr] failed:
-  scheduler died
+ktstr_test 'demo_host_crash_auto_repro' [sched=scx-ktstr] [topo=1n1l2c1t] failed:
+  scheduler process died unexpectedly during workload (2.0s into test)
 
 --- auto-repro ---
 === AUTO-PROBE: scx_exit fired ===
@@ -133,6 +133,37 @@ ktstr_test 'demo_host_crash_auto_repro' [sched=scx-ktstr] failed:
 After the probe data, the auto-repro section includes the repro VM
 duration and the last 40 lines of the repro VM's scheduler log,
 sched_ext dump, and dmesg (each only when non-empty).
+
+## When the primary VM never reached the workload
+
+If the primary VM fails before its scheduler ever attached and the
+workload ever started, the auto-repro VM has nothing to reproduce.
+The framework prepends a `PRIMARY DID NOT REACH WORKLOAD` label to
+the repro verdict so the operator knows the repro is non-load-bearing
+— the bug to chase is in the primary's startup path, not in the
+repro VM's output:
+
+```text
+--- auto-repro ---
+PRIMARY DID NOT REACH WORKLOAD — auto-repro is not load-bearing (the primary VM's failure prevented the bug from being exercised, so the repro's verdict below should not be read as evidence about bug reproducibility — the bug was never exercised by either run)
+{repro-verdict-line}
+```
+
+The label is one long line emitted by the framework before the repro
+VM's verdict; `{repro-verdict-line}` is the repro VM's own pass / fail
+summary (still printed after the label, but the prepended sentence
+warns the operator not to treat it as bug-reproducibility evidence).
+
+Triggers include initramfs build failures, kernel boot panics before
+guest init, scheduler-binary missing inside the guest, and any error
+that fires before `ktstr-init` writes the `sys_rdy` token. The repro
+VM still runs and may emit probe data of its own, but the framework
+suppresses the usual verdict comparison because the primary lacked
+the workload run that any repro would be compared against.
+
+Inspect `--- diagnostics ---` for the VM exit kind and the last
+~20 lines of guest console output, and `--- timeline ---` for the
+init-stage progression — the primary-side failure cause lives there.
 
 ## Demo test
 

@@ -7,7 +7,7 @@ stop/collection, and cleanup.
 ```rust,ignore
 use ktstr::prelude::*;
 
-#[must_use = "dropping a WorkloadHandle immediately kills all worker processes"]
+#[must_use = "dropping a WorkloadHandle immediately tears down all worker tasks"]
 pub struct WorkloadHandle { /* ... */ }
 ```
 
@@ -33,10 +33,19 @@ Consult the `WorkloadConfig` rustdoc for the current field list.
 SIGUSR1 handler, then blocks on a pipe waiting for the start signal.
 Workers do not begin their workload until `start()` is called.
 
-For grouped work types (`PipeIo`, `CachePipe`, `FutexPingPong`,
-`FutexFanOut`), `spawn()` validates that `num_workers` is divisible by
-the group size and sets up inter-worker communication (pipes for
-`PipeIo`/`CachePipe`, shared mmap pages for `FutexPingPong`/`FutexFanOut`).
+For grouped work types (the full set: `PipeIo`, `CachePipe`,
+`FutexPingPong`, `FutexFanOut`, `FanOutCompute`, `MutexContention`,
+`ThunderingHerd`, `PriorityInversion`, `ProducerConsumerImbalance`,
+`RtStarvation`, `AsymmetricWaker`, `WakeChain`, `SignalStorm`,
+`PreemptStorm`, `EpollStorm`, `SmtSiblingSpin`), `spawn()` validates
+that `num_workers` is divisible by the work type's group size (each
+variant exposes a `worker_group_size()` accessor) and sets up the
+inter-worker communication the variant requires: pipes for
+`PipeIo`/`CachePipe`, shared mmap pages for the futex / waker /
+contention families (`FutexPingPong`, `FutexFanOut`, `FanOutCompute`,
+`MutexContention`, `ThunderingHerd`, `PriorityInversion`,
+`ProducerConsumerImbalance`, `AsymmetricWaker`, `WakeChain`,
+`RtStarvation`, `SignalStorm`, `PreemptStorm`, `EpollStorm`).
 
 ## Methods
 

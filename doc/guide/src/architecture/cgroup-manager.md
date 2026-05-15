@@ -37,10 +37,16 @@ write stable between runs.
 
 **`parent_path() -> &Path`** -- returns the parent cgroup directory path.
 
-**`create_cgroup(name)`** -- creates a child cgroup directory. Idempotent:
-no error if the directory already exists. Supports nested paths
-(e.g. `"nested/deep"`). For nested paths, enables `+cpuset` on
-intermediate cgroups' `subtree_control`.
+**`create_cgroup(name)`** -- creates a child cgroup directory.
+Idempotent: no error if the directory already exists. Supports nested
+paths (e.g. `"nested/deep"`). For nested paths, enables ONLY
+`+cpuset` on intermediate cgroups' `subtree_control` — `+cpu`,
+`+memory`, `+memory.swap`, `+io`, and `+pids` are NOT propagated.
+Tests that drive non-cpuset controllers on a nested leaf
+(e.g. `CgroupDef::named("nested/leaf").memory_max(N)`) get `ENOENT`
+at apply-setup time when the missing controller knob is written; see
+[Cgroup controller not enabled](../troubleshooting.md#cgroup-controller-not-enabled)
+for the operator-facing diagnostic shape.
 
 **`remove_cgroup(name)`** -- drains tasks from the child cgroup to the
 cgroup filesystem root, then removes the directory. No error if the

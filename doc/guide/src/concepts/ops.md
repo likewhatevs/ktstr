@@ -1,7 +1,8 @@
 # Ops and Steps
 
 The ops system is a composable way to express dynamic cgroup topology
-changes. It replaces hand-written `Action::Custom` functions for most
+changes. It replaces hand-written `fn(&Ctx) -> Result<AssertResult>`
+custom-scenario closures that manipulated cgroups directly for most
 dynamic scenarios.
 
 ## Op
@@ -13,6 +14,7 @@ stay compatible across ktstr version bumps that add new variants:
 | Op | Description |
 |---|---|
 | `AddCgroup` | Create a cgroup |
+| `AddCgroupDef` | Create a cgroup, set cpuset, and spawn workers from a `CgroupDef` mid-step (the same three-op bundle that `Step::with_defs` runs at step entry, executable from any `ops` vec position) |
 | `RemoveCgroup` | Stop workers and remove a cgroup (see [RemoveCgroup / StopCgroup against Backdrop targets](#removecgroup--stopcgroup-against-backdrop-targets) for the permissive-removal contract) |
 | `SetCpuset` | Set a cgroup's cpuset via `CpusetSpec` |
 | `ClearCpuset` | Remove cpuset constraints |
@@ -34,10 +36,11 @@ Op constructors accept string literals directly (no `.into()` needed):
 
 ```rust,ignore
 Op::add_cgroup("cg_0")
+Op::add_cgroup_def(CgroupDef::named("cg_1").workers(4))
 Op::set_cpuset("cg_0", CpusetSpec::disjoint(0, 2))
 Op::stop_cgroup("cg_0")
 Op::spawn("cg_0", WorkSpec::default().workers(4))
-Op::set_affinity("cg_0", AffinityIntent::RandomSubset)
+Op::set_affinity("cg_0", AffinityIntent::random_subset([0, 1, 2, 3], 2))
 Op::spawn_host(WorkSpec::default().workers(4))
 Op::freeze_cgroup("cg_0")
 Op::unfreeze_cgroup("cg_0")
@@ -78,9 +81,9 @@ docstring at `Op::MoveAllTasks` for the asymmetric-ownership table.
 
 `OpKind` is a payload-free discriminant enum generated from `Op` via
 `#[strum_discriminants]`. It carries the same variant set as `Op`
-(`AddCgroup`, `RemoveCgroup`, ..., `RunPayload`, `WaitPayload`,
-`KillPayload`, `FreezeCgroup`, `UnfreezeCgroup`, `Snapshot`,
-`WatchSnapshot`) with none of the inner fields, so it is cheap to
+(`AddCgroup`, `AddCgroupDef`, `RemoveCgroup`, ..., `RunPayload`,
+`WaitPayload`, `KillPayload`, `FreezeCgroup`, `UnfreezeCgroup`,
+`Snapshot`, `WatchSnapshot`) with none of the inner fields, so it is cheap to
 copy and use as a map key. Framework code uses `OpKind` when it
 only cares WHICH operation ran (per-op statistics, stimulus-event
 tagging, verifier/monitor bookkeeping) without the payload. Test
@@ -274,9 +277,19 @@ pub struct Step {
 }
 ```
 
-`Setup` is either `Defs(Vec<CgroupDef>)` or `Factory(fn(&Ctx) -> Vec<CgroupDef>)`.
-`Vec<CgroupDef>` implements `Into<Setup>`, so you can write
-`setup: vec![...].into()` instead of `setup: Setup::Defs(vec![...])`.
+`Setup` is either `Defs(Vec<CgroupDef>)` or
+`Factory(fn(&Ctx) -> Vec<CgroupDef>)`. Construct via the named
+const-fn constructors:
+
+- `Setup::defs(defs)` -- wrap an existing `Vec<CgroupDef>`.
+- `Setup::factory(f)` -- defer construction to a `fn(&Ctx) -> Vec<CgroupDef>`
+  so the def list can depend on the resolved topology.
+- `Setup::empty()` -- zero-def setup (the ops-only path).
+
+`Setup::default()` returns `Setup::empty()`. `Vec<CgroupDef>` also
+implements `Into<Setup>` for the inline `setup: vec![...].into()`
+form when a chain-builder context already produces a Vec; new code
+should prefer the named constructors for discoverability.
 
 ### Constructors
 
@@ -288,9 +301,19 @@ to an existing topology.
 setup and a hold period. The primary constructor for steps that
 create cgroups with workers.
 
+**`Step::with_payload(payload, hold)`** -- creates a step that runs
+a single binary-kind `Payload` to completion (or for `hold`). Sets
+up a one-shot `Op::RunPayload` + `Op::WaitPayload` pair and an
+empty `Setup`. Use for inline payload-driven steps without the
+`CgroupDef` ceremony.
+
 **`Step::set_ops(self, ops)`** -- REPLACES the ops on a step
 (builder method). Chain after `with_defs` to add dynamic operations
 to a step that also creates cgroups.
+
+**`Step::set_hold(self, hold)`** -- REPLACES the hold on a step
+(builder method). Use the `set_X` prefix family to mutate the step
+in place; `with_X` is reserved for alternative constructors.
 
 > **Naming asymmetry:** `Step::set_ops` REPLACES; the sibling
 > `Backdrop::with_ops` APPENDS. The two methods deliberately use

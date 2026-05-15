@@ -64,8 +64,17 @@ for version selection and local source builds.
 
 ## 4. Run
 
+`cargo ktstr test` resolves the kernel from `KTSTR_KERNEL`, the cache,
+or an explicit `--kernel <spec>` (a version like `6.14`, a cache key
+from `cargo ktstr kernel list`, or a path to a kernel source tree or
+prebuilt `bzImage`/`Image`). Step 3 populated the cache with the
+declared kernels, so the bare form is sufficient when a single kernel
+is available:
+
 ```sh
-cargo ktstr test --kernel ../linux
+cargo ktstr test            # auto-discover from cache / KTSTR_KERNEL
+cargo ktstr test --kernel 6.14    # pin to a specific cached version
+cargo ktstr test --kernel ../linux  # pin to a local source checkout
 ```
 
 ## 5. Check BPF complexity (optional)

@@ -447,7 +447,19 @@ is per-task, not per-tgid.
 
 ## Default values
 
-`WorkType::from_name()` uses these defaults:
+`WorkType::from_name()` resolves each parameterised variant to a
+default instance via the constants in the `ktstr::workload::defaults`
+module (one `pub const` per variant — `BURSTY`, `PIPE_IO`,
+`FUTEX_PING_PONG`, `CACHE_PRESSURE`, `CACHE_YIELD`, `CACHE_PIPE`,
+`FUTEX_FAN_OUT`, `AFFINITY_CHURN`, `POLICY_CHURN`, `FAN_OUT_COMPUTE`,
+`PAGE_FAULT_CHURN`, `MUTEX_CONTENTION`, `THUNDERING_HERD`,
+`PRIORITY_INVERSION`, `PRODUCER_CONSUMER`, `RT_STARVATION`,
+`ASYMMETRIC_WAKER`, `WAKE_CHAIN`, `NUMA_WORKING_SET_SWEEP`,
+`CGROUP_CHURN`, `SIGNAL_STORM`, `PREEMPT_STORM`, `EPOLL_STORM`,
+`NUMA_MIGRATION_CHURN`, `IDLE_CHURN`, `ALU_HOT`, `IPC_VARIANCE`, …).
+A few representative defaults are shown below; see the
+`defaults` module rustdoc for the authoritative per-variant values.
+
 - `Bursty`: `burst_duration=50ms`, `sleep_duration=100ms`
 - `PipeIo`: `burst_iters=1024`
 - `FutexPingPong`: `spin_iters=1024`
@@ -535,10 +547,12 @@ pub enum SchedPolicy {
 `Fifo`, `RoundRobin`, and `Deadline` require `CAP_SYS_NICE`. The
 sched-deadline gate (`runtime <= deadline <= period`, all non-zero
 unless `period == Duration::ZERO`, which the kernel substitutes
-with `deadline`) is validated user-side in
-`SchedPolicy::deadline()` before `sched_setattr` so a malformed
+with `deadline`) is validated user-side at scheduling-policy apply
+time (in `set_sched_policy` before `sched_setattr`) so a malformed
 `Deadline` fails fast rather than tunneling `EINVAL` through the
-syscall.
+syscall. The const constructor `SchedPolicy::deadline(runtime,
+deadline, period)` itself is a struct-literal wrapper and does not
+validate at construction time.
 
 ## Overriding work types
 
@@ -552,4 +566,4 @@ Overrides to grouped work types (`PipeIo`, `FutexPingPong`,
 when `num_workers` is not divisible by the work type's group size.
 
 Ops-based scenarios have a separate override mechanism via
-`CgroupDef.swappable`. See [Ops and Steps](ops.md#work-type-overrides-and-swappable).
+`CgroupDef.swappable`. See [Ops and Steps](ops.md#workspec-type-overrides-and-swappable).

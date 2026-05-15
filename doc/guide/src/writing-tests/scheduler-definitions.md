@@ -156,19 +156,36 @@ internally, so passing the bare const yields the correct
 
 ### Accepted fields
 
-Every key=value pair after `name` and `binary` is optional. The
-key names match `Scheduler` struct fields:
+`name` plus exactly one source key (`binary`, `binary_path`, or the
+`kernel_builtin_enable`/`kernel_builtin_disable` pair) are required;
+every other key is optional. Source keys are macro-only — they map
+to the appropriate `SchedulerSpec` variant at expansion time, and
+the macro rejects `SchedulerSpec::Variant(...)` literals on these
+keys (use the dedicated key instead).
 
 - `name = "..."` — short human name (required).
-- `binary = "scx_name"` — defaults to `SchedulerSpec::Discover(name)`.
-  Accepts `SchedulerSpec::Path("/abs/path")`, `SchedulerSpec::Eevdf`,
-  or `SchedulerSpec::KernelBuiltin { enable: &[...], disable: &[...] }`.
+- `binary = "scx_name"` — string literal naming a binary the guest
+  will resolve via `which` / `PATH`. Maps to
+  `SchedulerSpec::Discover(name)`. Mutually exclusive with
+  `binary_path` and `kernel_builtin_*`.
+- `binary_path = "/abs/path/to/binary"` — string literal naming an
+  absolute path to a binary that gets injected into the guest
+  initramfs. Maps to `SchedulerSpec::Path(path)`. Mutually exclusive
+  with `binary` and `kernel_builtin_*`.
+- `kernel_builtin_enable = ["echo minlat > /sys/kernel/debug/sched/ext/root/ops"]`
+  + `kernel_builtin_disable = ["echo none > /sys/kernel/debug/sched/ext/root/ops"]`
+  — paired shell-command lists for activating / deactivating a
+  kernel-builtin scheduler (no userspace binary). Both keys must
+  appear together. Maps to
+  `SchedulerSpec::KernelBuiltin { enable, disable }`. Mutually
+  exclusive with `binary` and `binary_path`.
 - `sched_args = ["--a", "--b"]` — CLI args prepended to every
   test that uses this scheduler.
 - `kernels = ["6.14", "6.15..=7.0", "git+URL#REF", "/path", "cache-key"]`
   — verifier sweep set; see the field doc above.
 - `cgroup_parent = "/path"` — must begin with `/`, must not be
-  `"/"` alone.
+  `"/"` alone, must not contain `..` segments (rejected at compile
+  time by `CgroupPath::new()`).
 - `kargs = ["nosmt"]` — guest-kernel cmdline additions.
 - `sysctls = [Sysctl::new("kernel.foo", "1")]` — applied before
   the scheduler starts.
@@ -181,8 +198,16 @@ key names match `Scheduler` struct fields:
 - `config_file_def = ("--config={file}", "/include-files/my.json")`
   — alternative inline-config seam (see
   [The #\[ktstr_test\] Macro](ktstr-test-macro.md#inline-scheduler-config)).
-- `assert = Assert::NO_OVERRIDES.method_chain()` — scheduler-level
-  assertion overrides merged on top of `Assert::default_checks()`.
+- `assert = Assert::NO_OVERRIDES.max_imbalance_ratio(2.0)` —
+  scheduler-level assertion overrides merged on top of
+  `Assert::default_checks()`. Chain additional `Assert` setters as
+  needed.
+
+The `SchedulerSpec::Eevdf` variant is not reachable via
+`declare_scheduler!` — to test under the kernel-default EEVDF
+baseline, reference `Scheduler::EEVDF` from the `ktstr::test_support`
+module directly as the test attribute (this is also the default when
+`#[ktstr_test]` omits `scheduler = ...`).
 
 ### Visibility
 
@@ -382,8 +407,11 @@ declare_scheduler!(RELAXED, {
 ## Kernel-built scheduler example
 
 For schedulers compiled into the kernel (no userspace binary),
-use `SchedulerSpec::KernelBuiltin` with shell commands to
-activate/deactivate the scheduler:
+use the paired `kernel_builtin_enable` and `kernel_builtin_disable`
+macro keys to declare the activate / deactivate shell-command
+lists. The macro maps both keys to a single
+`SchedulerSpec::KernelBuiltin { enable, disable }` at expansion
+time:
 
 ```rust,ignore
 use ktstr::declare_scheduler;
@@ -391,10 +419,8 @@ use ktstr::prelude::*;
 
 declare_scheduler!(MINLAT, {
     name = "minlat",
-    binary = SchedulerSpec::KernelBuiltin {
-        enable: &["echo minlat > /sys/kernel/debug/sched/ext/root/ops"],
-        disable: &["echo none > /sys/kernel/debug/sched/ext/root/ops"],
-    },
+    kernel_builtin_enable = ["echo minlat > /sys/kernel/debug/sched/ext/root/ops"],
+    kernel_builtin_disable = ["echo none > /sys/kernel/debug/sched/ext/root/ops"],
 });
 ```
 

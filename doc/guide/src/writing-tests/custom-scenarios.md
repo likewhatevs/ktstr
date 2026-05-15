@@ -1,10 +1,13 @@
 # Custom Scenarios
 
 For dynamic scenarios (cgroup creation/removal, cpuset changes), prefer
-the [ops/steps system](../concepts/ops.md) over raw `Action::Custom`.
+the [ops/steps system](../concepts/ops.md) over a hand-written custom
+scenario function.
 
-Use `Action::Custom` only when you need logic that the ops system
-cannot express.
+A custom scenario is just a `fn(&Ctx) -> Result<AssertResult>` that
+runs in place of one of the canned `scenarios::*` entry points. Use
+this shape only when you need logic that the ops system cannot
+express.
 
 ## Writing a custom scenario
 
@@ -89,6 +92,34 @@ or `is_some_and(...)` before passing to `process_alive` or
 
 **`settle`** -- time to wait after cgroup creation for the scheduler
 to stabilize.
+
+**`duration`** -- total scenario wall-clock budget. Custom scenarios
+that hold workers running for a fixed period should sleep for this
+duration after `start()` and before `stop_and_collect()`. Honoring
+this value keeps custom scenarios composable with the gauntlet
+budget controller and with `#[ktstr_test(duration_s = N)]` overrides.
+
+**`workers_per_cgroup`** -- default per-cgroup worker count derived
+from the test's `workers` attribute (or the topology when unset).
+`dfl_wl(ctx)` pre-fills this. Custom scenarios that hand-build a
+`WorkloadConfig` should source `num_workers` from this field unless
+the test explicitly wants a different value.
+
+**`work_type_override`** -- gauntlet-supplied or programmatic
+`WorkType` to swap in for any `CgroupDef` whose `swappable = true`
+and for the `dfl_wl` default. `None` keeps the per-cgroup work type
+the scenario specified.
+
+**`assert`** -- the merged `Assert` (`default_checks() →
+scheduler → per-test`) the test framework expects the scenario to
+evaluate against. Pass to `collect_all(handles, &ctx.assert)` or
+the manual `assert.assert_cgroup(...)` paths.
+
+**`wait_for_map_write`** -- when `true`, the framework will not
+spawn workers until the test's `bpf_map_write` declarations have
+been applied. Custom scenarios that don't gate worker spawn on BPF
+map state can ignore this field; the framework wires it
+automatically.
 
 ## Checking in custom scenarios
 

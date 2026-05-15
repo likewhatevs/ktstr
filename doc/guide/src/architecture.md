@@ -9,7 +9,7 @@ ktstr has three execution domains:
 2. **Guest process** -- the same test binary running inside the VM
    as PID 1. Mounts filesystems, starts the scheduler, creates
    cgroups, forks [workers](architecture/workers.md), runs scenarios,
-   writes results to SHM (COM2 fallback).
+   writes results to virtio-console port 1 (COM2 + SHM fallback).
 
 3. **[Monitor](architecture/monitor.md) thread** -- runs on the host
    while the guest executes. Reads guest VM memory directly to observe
@@ -38,9 +38,9 @@ test binary
   |                             +-- poll scheduler liveness
   |                             +-- stop workers, collect reports
   |                             +-- evaluate results
-  |                             +-- write result to SHM (COM2 fallback)
+  |                             +-- write result to virtio-console port 1 (COM2 + SHM fallback)
   |                           
-  +-- read result from SHM (COM2 fallback)
+  +-- read result from virtio-console port 1 (COM2 + SHM fallback)
   +-- evaluate monitor data   
   +-- report pass/fail        
 ```
@@ -53,9 +53,14 @@ as `/init`. When running as PID 1, the Rust init code
 (`vmm::rust_init`) handles the full guest lifecycle: mounts,
 scheduler start, test dispatch, and reboot.
 
-**Forked workers, not threads.** Workers are `fork()`ed processes
-because cgroups operate on PIDs. Each worker must be a separate
-process to be placed in its own cgroup.
+**Forked workers (default), threads optional.** The default `Fork`
+clone mode spawns each worker as its own process so cgroup placement
+via `cgroup.procs` is tgid-granular. The `Thread` clone mode shares
+the harness's tgid and routes placement through `cgroup.threads`
+instead — useful when test bodies need to share address space or
+when measuring thread-only scheduler paths. See
+[WorkloadHandle](architecture/workload-handle.md) and
+[Workers](architecture/workers.md) for the per-mode dispatch table.
 
 **Host-side monitoring.** The monitor reads guest memory via KVM,
 avoiding BPF instrumentation of the scheduler under test. This

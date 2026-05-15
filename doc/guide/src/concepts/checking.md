@@ -88,8 +88,10 @@ page placement data and checks it against thresholds:
 pages residing on the expected NUMA node(s). Expected nodes are derived
 from the worker's `MemPolicy::node_set()` at evaluation time. Page
 counts come from `WorkerReport::numa_pages` (parsed from
-`/proc/self/numa_maps`). Returns 1.0 (vacuously local) when no pages
-are observed. Fails if the observed fraction falls below
+`/proc/self/numa_maps`). Returns 0.0 when no pages are observed -- a
+zero-allocation workload is treated as zero-locality (not vacuously
+local) so `min_page_locality` thresholds surface broken runs that
+produced no NUMA signal. Fails if the observed fraction falls below
 `min_page_locality`.
 
 **Cross-node migration** -- `assert_cross_node_migration()` checks
@@ -140,25 +142,43 @@ pub struct Assert {
     pub min_page_locality: Option<f64>,
     pub max_cross_node_migration_ratio: Option<f64>,
     pub max_slow_tier_ratio: Option<f64>,
+
+    // Monitor-merge policy + scx_bpf_error matchers
+    pub enforce_monitor_thresholds: bool,
+    pub expect_scx_bpf_error_contains: Option<&'static str>,
+    pub expect_scx_bpf_error_matches: Option<&'static str>,
 }
 ```
 
-Every field is `Option`. `None` means "inherit from parent layer."
+Every threshold field is `Option`; `None` means "inherit from parent
+layer." `enforce_monitor_thresholds` is the only non-`Option` field
+because it controls the sticky-`||` merge policy (any layer setting
+`true` keeps it `true`). The two `expect_scx_bpf_error_*` fields pin
+a regex / substring against the SCX exit-message stream and are
+documented per-attribute in the
+[`#[ktstr_test]` macro reference](../writing-tests/ktstr-test-macro.md).
 
 ## Merge layers
 
 Checking uses a three-layer merge:
 
-1. `Assert::default_checks()` -- baseline: `not_starved` enabled,
-   monitor thresholds from `MonitorThresholds::DEFAULT`.
+1. `Assert::default_checks()` -- currently aliases `NO_OVERRIDES`;
+   every check is `None`. The fn-name is a hook for a future
+   baseline policy; today it is a synonym. Tests opt in to
+   assertions explicitly via scheduler-level or per-test overrides,
+   or by calling `.with_monitor_defaults()` to populate the
+   monitor-threshold bundle from `MonitorThresholds::DEFAULT`.
 2. `Scheduler.assert` -- scheduler-level overrides.
 3. Per-test `assert` -- test-specific overrides via `#[ktstr_test]`
    attributes.
 
-All fields use last-`Some`-wins semantics. A `Some(false)` in a
-higher layer can disable a check that a lower layer enabled.
+All threshold fields use last-`Some`-wins semantics. A `Some(false)`
+in a higher layer can disable a check that a lower layer enabled.
+`enforce_monitor_thresholds` uses sticky-`||`: once any layer sets it
+`true` the merged result stays `true`.
 
 ```rust,ignore
+let test_assert = Assert::NO_OVERRIDES.max_gap_ms(5000);
 let final_assert = Assert::default_checks()
     .merge(&scheduler.assert)
     .merge(&test_assert);
@@ -178,7 +198,12 @@ thresholds are relaxed. Coverage-instrumented builds collect profraw
 data for code coverage analysis; all assertion and monitor threshold
 checks run normally.
 
-### Monitor checks
+### Monitor threshold values applied when `with_monitor_defaults()` is called
+
+These thresholds activate only when a test (or its scheduler) calls
+`.with_monitor_defaults()` on its `Assert`; otherwise the
+corresponding fields stay `None` and the monitor's violations land
+in `details` without flipping `passed`.
 
 | Threshold | Default | Rationale |
 |---|---|---|
@@ -210,9 +235,18 @@ Use `Assert` for both the merge chain (`#[ktstr_test]` attributes,
 - `Assert::NO_OVERRIDES` -- identity for `merge`; every field is `None`,
   so it overrides nothing. This is not "no checks" -- when used as a
   per-test or per-scheduler `assert`, the runtime chain still applies
-  defaults because it merges `default_checks() -> scheduler -> test`.
-- `Assert::default_checks()` -- `not_starved` enabled, monitor
-  thresholds populated from `MonitorThresholds::DEFAULT`.
+  the merge of `default_checks() -> scheduler -> test`.
+- `Assert::default_checks()` -- currently aliases `NO_OVERRIDES` (every
+  check is `None`). Reserved as a hook for a future baseline policy.
+- `Assert::empty()` and `Assert::defaults()` -- method-style aliases
+  for the two constants above. Pair naturally with `.verdict()` when
+  building a `Verdict` from a fresh `Assert` in claim-style code.
+- `.with_monitor_defaults()` -- populates the monitor-threshold
+  bundle (`max_imbalance_ratio`, `max_local_dsq_depth`,
+  `fail_on_stall`, `sustained_samples`, `max_fallback_rate`,
+  `max_keep_last_rate`) from `MonitorThresholds::DEFAULT`. Tests that
+  want stall + imbalance protection must opt in via this method or
+  set the fields directly.
 
 ## AssertResult
 
@@ -243,12 +277,41 @@ aggregated statistics from a scenario run.
   consumes and returns `self`. Use at the return site to chain a
   context annotation onto a fresh result without an intermediate
   `let mut`.
+- `result.note_value(key, value)` -- insert a typed measurement
+  into `measurements` under `key`. Use for any value a downstream
+  comparator should lift programmatically (latency p99, throughput
+  per worker, scheduler-specific counter). Returns `&mut Self`.
+- `result.with_note_value(key, value)` -- builder-style sibling of
+  `note_value` that consumes and returns `self`. Pairs naturally
+  with `pass()` / `fail_msg(msg)` at the return site.
 - `result.is_skipped()` -- convenience accessor returning
   `skipped`. Stats tooling uses this to subtract non-executions
   from pass counts.
 - `result.is_failed()` -- convenience accessor returning
   `!passed`. Mirrors `is_skipped` so branches reading "did this
   claim fail?" don't negate `.passed` inline.
+
+### Composing results: `any_of` and `all_of`
+
+When several sibling assertions form a logical AND or OR,
+`AssertResult::all_of([...])` and `AssertResult::any_of([...])`
+fold a slice of results into one. `all_of` passes only when every
+input passes; details are concatenated. `any_of` passes if any
+input passes (the first passing branch is chosen and its details
+returned); on a full failure the failed-branch details are
+concatenated with an `any_of[N]:` prefix per branch so the
+operator can see why every alternative was rejected.
+
+```rust,ignore
+let combined = AssertResult::any_of([
+    cpu_quota_satisfied,
+    fair_under_contention,
+]);
+```
+
+Use these to express "either this OR that" without writing the
+fold by hand. `merge` remains the right tool when results
+accumulate in a loop body.
 
 ### Fields
 

@@ -64,7 +64,7 @@ Each periodic capture is stored on the host's `SnapshotBridge` under
 
 Periodic tags coexist with on-demand `Op::snapshot` tags and
 watchpoint-fire tags on the same bridge. Use
-`SampleSeries::periodic_only`(temporal-assertions.md#sampleseries) (or
+[`SampleSeries::periodic_only`](temporal-assertions.md#sampleseries) (or
 `periodic_ref()` for the borrowed equivalent) to filter to the
 periodic timeline before assertions.
 
@@ -147,7 +147,7 @@ FIFO-evicts past `MAX_STORED_SNAPSHOTS`.
 The temporal-assertion pipeline runs on the **host**, so the drain
 happens after `vm.run()` returns — typically inside a `post_vm`
 callback. Use
-`SnapshotBridge::drain_ordered_with_stats`(snapshots.md) to take
+[`SnapshotBridge::drain_ordered_with_stats`](snapshots.md) to take
 ownership of the captured `(tag, report, stats, elapsed_ms)` tuples
 in insertion order:
 
@@ -217,14 +217,14 @@ scheduler's stats were observed; BPF state is observed up to
 (`scheduler_binary` is absent), or the per-sample stats request
 failed (relay rejected, non-zero envelope errno, scheduler not yet
 listening). A `None` slot surfaces through
-`SampleSeries::stats`(temporal-assertions.md#projecting-from-scx_stats-json) as a
+[`SampleSeries::stats`](temporal-assertions.md#projecting-from-scx_stats-json) as a
 `SnapshotError::MissingStats { tag }` per-sample error — distinct
 from in-JSON path misses so the assertion site can branch on the
 cause.
 
 A sample whose underlying `FailureDumpReport` is a placeholder
 (rendezvous timeout fallback) surfaces through
-`SampleSeries::bpf`(temporal-assertions.md#projecting-from-bpf-state) as a
+[`SampleSeries::bpf`](temporal-assertions.md#projecting-from-bpf-state) as a
 `SnapshotError::PlaceholderSample { tag, reason }` per-sample error
 rather than passing a hollow `Snapshot` to the projection closure.
 
@@ -236,12 +236,12 @@ The standard shape is two-stage:
 2. **Project + assert** — pick a column, choose a temporal pattern.
 
 For monotonic counters (BPF `.bss` advancement, scx_stats counter
-fields), `nondecreasing`(temporal-assertions.md#nondecreasing--strictly_increasing)
+fields), [`nondecreasing`](temporal-assertions.md#nondecreasing--strictly_increasing)
 is the canonical choice. For utilisation-style metrics that should
 hold steady once warmup ends,
-`steady_within`(temporal-assertions.md#steady_withinwarmup_ms-tolerance-f64-only)
+[`steady_within`](temporal-assertions.md#steady_withinwarmup_ms-tolerance-f64-only)
 captures the invariant. For "system stabilizes near `target`",
-`converges_to`(temporal-assertions.md#converges_totarget-tolerance-deadline_ms-f64-only)
+[`converges_to`](temporal-assertions.md#converges_totarget-tolerance-deadline_ms-f64-only)
 witnesses the convergence.
 
 For the full pattern surface, projection helpers, and failure

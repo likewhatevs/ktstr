@@ -123,11 +123,15 @@ Three fields worth calling out explicitly:
 - `off_cpu_ns = wall_time_ns - cpu_time_ns`
 - `exit_info` is `None` on every live-worker-authored report.
   `stop_and_collect` synthesises a sentinel `WorkerReport` with
-  `Some(_)` when the worker handed back no (or unparseable) JSON,
-  using the `WorkerExitInfo` enum
+  `Some(_)` when the worker handed back no (or unparseable) payload
+  — conventional fork workers serialise reports as bincode over the
+  report pipe; `PcommContainer` payloads use serde_json. Either
+  decoder failing or the pipe closing empty triggers the sentinel.
+  The `WorkerExitInfo` enum
   (`Exited(code)` / `Signaled(signum)` / `TimedOut` /
-  `WaitFailed(String)` — the string carries the underlying `waitpid`
-  errno rendering) to preserve the reap shape for post-mortem.
+  `WaitFailed(String)` / `Panicked` — the `WaitFailed` string carries
+  the underlying `waitpid` errno rendering) preserves the reap shape
+  for post-mortem.
 - Migrations are tracked every 1024 work units: after each outer
   iteration the worker checks `work_units.is_multiple_of(1024)`
   and runs the migration-detect body iff that is true. The check

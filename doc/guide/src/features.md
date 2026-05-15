@@ -124,9 +124,10 @@ catalog aggregator.)
 - `Op` — atomic operation (add/remove cgroup, set/swap/clear cpuset, spawn, stop, set affinity, move tasks)
 - `CpusetSpec` — topology-relative cpuset (LLC-aligned, disjoint, overlapping, range, exact)
 - `HoldSpec` — hold duration (fractional, fixed, or looped)
-- `AffinityIntent` — per-worker affinity (inherit, random subset, LLC-aligned, cross-cgroup, single CPU, exact)
-- `SchedPolicy` — Linux scheduling policy (Normal, Batch, Idle, FIFO, RoundRobin)
+- `AffinityIntent` — per-worker affinity (inherit, random subset, LLC-aligned, SMT-sibling-pair, cross-cgroup, single CPU, exact)
+- `SchedPolicy` — Linux scheduling policy (Normal, Batch, Idle, FIFO, RoundRobin, Deadline)
 - `WorkSpec` — workload definition for a group of workers
+- `Backdrop` — long-lived cgroups, payloads, and ops that span the whole scenario; the framework applies them before any Step runs and tears them down after the last Step completes
 
 </details>
 

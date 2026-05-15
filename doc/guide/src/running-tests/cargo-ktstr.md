@@ -1153,6 +1153,50 @@ Fails with an actionable message when no registered test
 matches the given name; the diagnostic includes a `Did you
 mean ...?` Levenshtein suggestion when a near match exists.
 
+## export
+
+Export a registered test as a self-extracting `.run` file that
+reproduces the scenario on bare metal without a VM. Bundles the
+running ktstr binary, the scheduler binary, and every include file
+the test declares into a gzipped tarball embedded in a bash
+preamble. The preamble validates root access, sched_ext support,
+cgroup2 mount, the no-other-scheduler-attached invariant, and
+topology compatibility before extracting and launching. The output
+is chmod-`+x`'d so the operator can execute the `.run` directly.
+
+```sh
+cargo ktstr export preempt_regression_fault_under_load             # writes ./preempt_regression_fault_under_load.run
+cargo ktstr export my_test -o /tmp/my_test.run                     # custom output path
+cargo ktstr export my_test --package my_workspace_member           # restrict workspace search
+cargo ktstr export my_test --release                               # build embedded binaries with release profile
+```
+
+| Arg / Flag | Description |
+|------|-------------|
+| `TEST` | Function-name-only test identifier as registered in `#[ktstr_test]` (e.g. `preempt_regression_fault_under_load`). Strip the `<binary>::` prefix that `cargo nextest list` prepends — the registry keys on the bare function name. |
+| `-o, --output <PATH>` | Output path for the `.run` file. Defaults to `<TEST>.run` in the current directory. |
+| `-p, --package <NAME>` | Restrict the workspace search to a specific package. When omitted, every workspace member's tests is built and scanned for a matching `#[ktstr_test]` registration. Pass-through to `cargo build --tests --package <NAME>`. |
+| `--release` | Build the test binaries with the release profile. Stricter assertion thresholds and `panic = "abort"` — match the profile the operator will run the `.run` file under, otherwise the embedded binary's behavior may drift from the dev-profile test runs the operator reproduced from. |
+
+The frozen bits — scheduler choice, scheduler args, topology — match
+the test as registered. Overridable on the target host at `.run`
+invocation time: `--duration`, `--watchdog-timeout`, `--quiet`
+(suppress banner). NOT overridable: `--cpus`, `--topology`,
+`--affinity` — re-export to change those.
+
+**Out of scope for v1** (rejected at export time with actionable
+errors): `host_only` tests (they orchestrate cargo / nested VMs
+from inside the test body), tests with `bpf_map_write` (need the
+framework's host-side runtime probe surface), and `KernelBuiltin`
+schedulers (need the `enable` / `disable` shell commands the
+preamble doesn't emit yet).
+
+**Name collisions:** if multiple workspace test binaries register a
+`#[ktstr_test]` with the same name, the router visits candidates in
+alphabetical order by absolute binary path and the FIRST binary that
+admits the test wins. Use `--package` to scope the search to a
+specific package and disambiguate deterministically.
+
 ## locks
 
 Enumerate every ktstr flock held on this host — read-only,
