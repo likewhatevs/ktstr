@@ -165,10 +165,12 @@ pub struct Payload {
 
 impl std::fmt::Debug for Payload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The inner `Scheduler` does not implement `Debug`; render
-        // the payload via its public identity fields instead so
-        // downstream Debug-requiring contexts (test panics, trace
-        // logs) can stamp a payload without a full struct dump.
+        // Manual impl renders the payload's identity + slice counts
+        // rather than the full struct (which would expand every
+        // nested Scheduler/Sysctl/CgroupPath into a multi-screen
+        // dump on every trace line). Scheduler IS Debug — the
+        // derived impl would just be too verbose for the routine
+        // tracing call sites this type appears in.
         f.debug_struct("Payload")
             .field("name", &self.name)
             .field("kind", &self.kind)
@@ -308,8 +310,11 @@ pub enum PayloadKind {
 
 impl std::fmt::Debug for PayloadKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Scheduler does not implement Debug; render variant +
-        // identity summary.
+        // Manual impl renders variant + identity summary (just the
+        // scheduler/binary name) rather than the full Scheduler
+        // struct that the derived Debug would expand. Trace lines
+        // that print a PayloadKind want one-line attribution, not a
+        // multi-screen scheduler config dump.
         match self {
             PayloadKind::Scheduler(s) => f.debug_tuple("Scheduler").field(&s.name).finish(),
             PayloadKind::Binary(name) => f.debug_tuple("Binary").field(name).finish(),
@@ -900,6 +905,15 @@ impl MetricBounds {
             value_min,
             value_max,
         }
+    }
+}
+
+impl Default for MetricBounds {
+    /// Delegates to [`Self::NONE`] (all bounds disabled). Lets
+    /// `..Default::default()` work uniformly alongside the
+    /// `..MetricBounds::NONE` spread.
+    fn default() -> Self {
+        Self::NONE
     }
 }
 

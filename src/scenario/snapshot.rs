@@ -536,6 +536,16 @@ impl Drop for WatchSlotGuard<'_> {
     }
 }
 
+/// Host-side capture pipeline that the freeze coordinator routes
+/// [`Op::Snapshot`](crate::scenario::ops::Op::Snapshot) and
+/// [`Op::WatchSnapshot`](crate::scenario::ops::Op::WatchSnapshot)
+/// requests through.
+///
+/// Construct via [`SnapshotBridge::new`] (with an explicit capture
+/// callback) and optionally [`SnapshotBridge::with_watch_register`]
+/// to attach watch support. Install for the current thread via
+/// [`SnapshotBridge::set_thread_local`] — see [`BridgeGuard`] for
+/// the RAII teardown contract.
 #[derive(Clone)]
 #[must_use = "dropping a SnapshotBridge discards the capture pipeline"]
 pub struct SnapshotBridge {

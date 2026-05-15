@@ -549,7 +549,6 @@ pub struct AssertResult {
     /// triage, `measurements` carries typed `(key, NoteValue)` pairs
     /// for programmatic consumption (sidecar parsers, `stats
     /// compare`, regression dashboards).
-    #[serde(default)]
     pub measurements: std::collections::BTreeMap<String, NoteValue>,
 }
 
@@ -648,7 +647,6 @@ pub struct CgroupStats {
     /// `numa_pages_migrated` delta divided by total allocated pages.
     pub cross_node_migration_ratio: f64,
     /// Extensible metrics for the generic comparison pipeline.
-    #[serde(default)]
     pub ext_metrics: BTreeMap<String, f64>,
 }
 
@@ -767,7 +765,6 @@ pub struct ScenarioStats {
     pub worst_iterations_per_worker: f64,
     /// Extensible metrics for the generic comparison pipeline.
     /// Populated from per-cgroup ext_metrics (worst value across cgroups).
-    #[serde(default)]
     pub ext_metrics: BTreeMap<String, f64>,
 }
 
@@ -1016,6 +1013,16 @@ impl AssertResult {
         self
     }
 
+    /// Builder-style sibling of [`Self::note_value`] returning the
+    /// owned result so a scenario can chain
+    /// `AssertResult::pass().with_note_value("max_wchar", 12345u64)`
+    /// at the return site. Equivalent to calling [`Self::note_value`]
+    /// on a mutable binding. Mirrors [`Self::with_note`].
+    pub fn with_note_value(mut self, key: impl Into<String>, value: impl Into<NoteValue>) -> Self {
+        self.note_value(key, value);
+        self
+    }
+
     /// Fold a sequence of [`AssertResult`]s with OR semantics: the
     /// returned result passes iff at least one branch passes. Use
     /// when a test author expresses "either of these two checks
@@ -1180,7 +1187,7 @@ impl AssertResult {
 ///
 /// External users should use [`Assert`] and its `assert_cgroup()` method
 /// instead.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct AssertPlan {
     pub(crate) not_starved: bool,
     pub(crate) isolation: bool,
@@ -1198,22 +1205,11 @@ pub(crate) struct AssertPlan {
 }
 
 impl AssertPlan {
+    /// Construct an empty `AssertPlan` — equivalent to `AssertPlan::default()`.
+    /// Kept as an alias for the existing test-suite call style.
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
-        Self {
-            not_starved: false,
-            isolation: false,
-            max_gap_ms: None,
-            max_spread_pct: None,
-            max_throughput_cv: None,
-            min_work_rate: None,
-            max_p99_wake_latency_ns: None,
-            max_wake_latency_cv: None,
-            min_iteration_rate: None,
-            max_migration_ratio: None,
-            min_page_locality: None,
-            max_cross_node_migration_ratio: None,
-            max_slow_tier_ratio: None,
-        }
+        Self::default()
     }
 
     /// Run all configured checks against one cgroup's reports.
@@ -1527,12 +1523,6 @@ pub fn assert_cross_node_migration(
     r
 }
 
-impl Default for AssertPlan {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 impl AssertPlan {
     fn check_not_starved(mut self) -> Self {
@@ -1554,6 +1544,19 @@ impl AssertPlan {
 /// Unified assertion configuration. Carries both worker checks and
 /// monitor thresholds as a single composable type. Each `Option` field
 /// acts as an override — `None` means "inherit from parent layer".
+///
+/// Construct via [`Assert::NO_OVERRIDES`] (preferred const baseline)
+/// or [`Assert::default_checks`] (currently aliases NO_OVERRIDES);
+/// chain builder methods on either base (all builders are `const fn`
+/// except [`Assert::expect_scx_bpf_error_matches`], which compiles a
+/// regex at construction). Use the resulting `Assert` value as the
+/// `assert` field of a [`Scheduler`](crate::test_support::Scheduler)
+/// declared via [`declare_scheduler!`](crate::declare_scheduler) — the
+/// macro accepts `assert = Assert::NO_OVERRIDES.foo()`-style chains
+/// at the scheduler level. The `#[ktstr_test]` proc macro does NOT
+/// accept an `assert = …` attribute on test entries; per-field
+/// attribute shortcuts (`max_gap_ms = N`, `not_starved = true`, …)
+/// compose into the equivalent struct literal at expansion time.
 ///
 /// Merge order: `Assert::default_checks()` -> `Scheduler.assert` -> per-test `assert`.
 /// `default_checks()` is `NO_OVERRIDES` — all assertions are opt-in.

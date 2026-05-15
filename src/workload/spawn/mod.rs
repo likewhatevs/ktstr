@@ -23,7 +23,15 @@ use super::worker::worker_main;
 pub(super) static STOP: AtomicBool = AtomicBool::new(false);
 
 /// A single CPU migration event observed by a worker.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+///
+/// No `Default` impl — a default-constructed Migration would be
+/// `{at_ns: 0, from_cpu: 0, to_cpu: 0}` (a "migration from CPU 0 to
+/// CPU 0 at time 0" is a contradiction: a migration where source ==
+/// dest is not a real migration). Downstream analysis (NUMA migration
+/// counts, scheduler-balance ratios) that assumes `from_cpu !=
+/// to_cpu` would misread default values as real migrations. Construct
+/// every Migration explicitly via [`Migration::new`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Migration {
     /// Nanoseconds since worker start.
     pub at_ns: u64,
@@ -31,6 +39,20 @@ pub struct Migration {
     pub from_cpu: usize,
     /// CPU after migration.
     pub to_cpu: usize,
+}
+
+impl Migration {
+    /// Const constructor for a Migration event. Pair-symmetric with
+    /// the struct fields; lets `Migration::new(ns, from, to)` replace
+    /// `Migration { at_ns: ns, from_cpu: from, to_cpu: to }` in
+    /// hand-built test fixtures.
+    pub const fn new(at_ns: u64, from_cpu: usize, to_cpu: usize) -> Self {
+        Self {
+            at_ns,
+            from_cpu,
+            to_cpu,
+        }
+    }
 }
 
 /// Build a nodemask bitmask and maxnode value for `set_mempolicy(2)`
@@ -478,6 +500,15 @@ pub struct WorkerReport {
 /// Invariant: every variant carries the `waitpid`-derived status for
 /// the worker PID as of the end of `stop_and_collect`. Ordered from
 /// most-informative (exit code) to least (plumbing failure).
+/// No `Default` impl — every variant carries observed-outcome state.
+/// A default-constructed value would have to pick one variant (TimedOut
+/// was the obvious candidate) but that risks silent-pass: a test
+/// fixture using `..Default::default()` on a struct containing
+/// `WorkerExitInfo` gets "worker never exited within the deadline,"
+/// which an operator triaging the failure would chase for minutes
+/// before realizing the value came from a missing field. Construct
+/// every WorkerExitInfo explicitly via the variant the test scenario
+/// expects (e.g. `WorkerExitInfo::Exited(0)` for a clean success).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum WorkerExitInfo {
     /// `WIFEXITED=true` with the given exit code. Non-zero under

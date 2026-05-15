@@ -76,7 +76,7 @@ use crate::test_support::Payload;
 ///     .with_op(Op::add_cgroup("bg_overflow"))
 ///     .with_payload(&BG_LOAD);
 /// ```
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Backdrop {
     /// Long-lived cgroups created once and removed at scenario end.
     /// Any Step can reference them by name via `Op::MoveAllTasks`,

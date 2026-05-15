@@ -190,7 +190,7 @@ impl Verdict {
     /// failure is real evidence and must surface. Distinct from
     /// [`AssertResult::skip`], which is a CONSTRUCTOR producing a
     /// fresh passing-skipped envelope from no prior state.
-    pub fn skip(&mut self, reason: &'static str) -> &mut Self {
+    pub fn skip(&mut self, reason: impl Into<String>) -> &mut Self {
         self.result.skipped = true;
         self.result
             .details
@@ -200,7 +200,7 @@ impl Verdict {
 
     /// Conditional skip: skip with `reason` when `cond` is true; no-op
     /// otherwise. Convenience over `if cond { v.skip(reason); }`.
-    pub fn skip_if(&mut self, cond: bool, reason: &'static str) -> &mut Self {
+    pub fn skip_if(&mut self, cond: bool, reason: impl Into<String>) -> &mut Self {
         if cond {
             self.skip(reason);
         }

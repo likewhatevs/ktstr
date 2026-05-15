@@ -149,10 +149,11 @@ impl AffinityIntent {
 /// same shape exists pre/post-resolution; payload presence
 /// distinguishes intent from concrete CPU id(s). See the
 /// [`AffinityIntent`] type doc for the full pre/post mapping table.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResolvedAffinity {
     /// No affinity constraint.
+    #[default]
     None,
     /// Pin to a specific set of CPUs.
     Fixed(BTreeSet<usize>),
@@ -168,6 +169,28 @@ pub enum ResolvedAffinity {
     Random { from: BTreeSet<usize>, count: usize },
     /// Pin to a single CPU.
     SingleCpu(usize),
+}
+
+impl ResolvedAffinity {
+    /// Construct a [`ResolvedAffinity::Fixed`] from any iterator over
+    /// CPU ids. Mirrors [`AffinityIntent::exact`].
+    pub fn fixed(cpus: impl IntoIterator<Item = usize>) -> Self {
+        ResolvedAffinity::Fixed(cpus.into_iter().collect())
+    }
+
+    /// Construct a [`ResolvedAffinity::Random`] from a pool iterator
+    /// and a sample count. Mirrors [`AffinityIntent::random_subset`].
+    pub fn random(from: impl IntoIterator<Item = usize>, count: usize) -> Self {
+        ResolvedAffinity::Random {
+            from: from.into_iter().collect(),
+            count,
+        }
+    }
+
+    /// Construct a [`ResolvedAffinity::SingleCpu`].
+    pub const fn single_cpu(cpu: usize) -> Self {
+        ResolvedAffinity::SingleCpu(cpu)
+    }
 }
 
 /// Resolve a [`ResolvedAffinity`] into the concrete CPU set the

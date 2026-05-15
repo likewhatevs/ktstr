@@ -1,8 +1,8 @@
 //! Wire-format tests for `CgroupStats`, `ScenarioStats`, and
 //! `AssertResult`: round-trip + strict-schema rejection of any
-//! omitted required field, with documented exceptions for the
-//! `#[serde(default)]` softness on `ext_metrics` and
-//! `measurements`.
+//! omitted required field. No `#[serde(default)]` shims — sidecar
+//! data is disposable per the project pre-1.0 stance, so every
+//! field is required on the wire.
 
 use super::*;
 
@@ -60,14 +60,6 @@ fn assert_result_serde_roundtrip() {
 /// one level deep. A regression that softened a required field
 /// on `CgroupStats` alone would slip past the sibling
 /// `ScenarioStats` test.
-///
-/// The exception is `ext_metrics`, which carries
-/// `#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]`
-/// to keep the wire minimal when unused — the sibling
-/// `scenario_stats_missing_ext_metrics_tolerated_by_deserialize`
-/// pattern applies to `CgroupStats` by construction (serde's
-/// default tolerance applies per field, not per containing
-/// type) so no dedicated CgroupStats tolerance test is needed.
 #[test]
 fn cgroup_stats_missing_required_field_rejected_by_deserialize() {
     const REQUIRED_FIELDS: &[&str] = &[
@@ -89,6 +81,7 @@ fn cgroup_stats_missing_required_field_rejected_by_deserialize() {
         "worst_run_delay_us",
         "page_locality",
         "cross_node_migration_ratio",
+        "ext_metrics",
     ];
     // `wake_latency_tail_ratio` and `iterations_per_worker` are
     // method-only on CgroupStats and DO NOT appear in the JSON
@@ -133,12 +126,6 @@ fn cgroup_stats_missing_required_field_rejected_by_deserialize() {
 /// soften a schema migration) would make the `from_str` call
 /// below succeed silently, defaulting to 0 without notifying the
 /// consumer that the producer omitted data.
-///
-/// The exception is `ext_metrics`, which intentionally carries
-/// `#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]`
-/// to keep the wire minimal when unused — a complementary test
-/// below pins THAT tolerance so dropping it by accident also
-/// trips.
 #[test]
 fn scenario_stats_missing_required_scalar_rejected_by_deserialize() {
     // Table-driven expansion covering EVERY required scalar field
@@ -150,13 +137,6 @@ fn scenario_stats_missing_required_scalar_rejected_by_deserialize() {
     // test with a field-level assertion message — the old single-
     // sentinel form would have passed silently on any field
     // other than `total_workers`.
-    //
-    // `ext_metrics` is intentionally NOT in this list: it carries
-    // `#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]`
-    // and is pinned as tolerated by the sibling
-    // `scenario_stats_missing_ext_metrics_tolerated_by_deserialize`
-    // test. A field added with `#[serde(default)]` going forward
-    // must be added to that sibling's rationale, not this list.
     const REQUIRED_FIELDS: &[&str] = &[
         "cgroups",
         "total_workers",
@@ -176,6 +156,7 @@ fn scenario_stats_missing_required_scalar_rejected_by_deserialize() {
         "worst_cross_node_migration_ratio",
         "worst_wake_latency_tail_ratio",
         "worst_iterations_per_worker",
+        "ext_metrics",
     ];
 
     let s = ScenarioStats::default();
@@ -207,33 +188,6 @@ fn scenario_stats_missing_required_scalar_rejected_by_deserialize() {
     }
 }
 
-/// Positive control for the `ext_metrics` exemption: omitting
-/// `ext_metrics` from the wire is accepted (serde defaults it to
-/// an empty `BTreeMap`). This is the ONE deliberate softness in
-/// `ScenarioStats`'s schema — pinned here so a future sweep that
-/// removes the `#[serde(default)]` attribute alongside other
-/// hardening trips this test and forces a conscious decision.
-#[test]
-fn scenario_stats_missing_ext_metrics_tolerated_by_deserialize() {
-    let s = ScenarioStats::default();
-    let mut obj = match serde_json::to_value(&s).unwrap() {
-        serde_json::Value::Object(m) => m,
-        other => panic!("expected object, got {other:?}"),
-    };
-    // `skip_serializing_if = "BTreeMap::is_empty"` keeps ext_metrics
-    // off the wire when empty — remove it if present, then assert
-    // the absence round-trips without error.
-    obj.remove("ext_metrics");
-    let without_ext_metrics = serde_json::Value::Object(obj).to_string();
-    let parsed: ScenarioStats = serde_json::from_str(&without_ext_metrics)
-        .expect("deserialize must tolerate missing ext_metrics (the sole exempt field)");
-    assert!(
-        parsed.ext_metrics.is_empty(),
-        "missing ext_metrics must default to empty, got {:?}",
-        parsed.ext_metrics,
-    );
-}
-
 /// Strict-schema rejection: an `AssertResult` JSON with a
 /// required field omitted (here: `passed`) must fail
 /// deserialization. `AssertResult` has NO `Default` derive and no
@@ -242,17 +196,17 @@ fn scenario_stats_missing_ext_metrics_tolerated_by_deserialize() {
 /// details / stats trips this test.
 #[test]
 fn assert_result_missing_required_field_rejected_by_deserialize() {
-    // All four `AssertResult` fields are wire-required (the struct
+    // All five `AssertResult` fields are wire-required (the struct
     // has no `Default` derive and no `#[serde(default)]` on any
     // field). Loop over each; each removal must fail deserialize
     // with a missing-field error naming the removed field.
-    const REQUIRED_FIELDS: &[&str] = &["passed", "skipped", "details", "stats"];
-    // `measurements` is intentionally NOT in REQUIRED_FIELDS — it
-    // carries `#[serde(default, skip_serializing_if = ...)]` so old
-    // sidecars without the key deserialize cleanly with an empty
-    // map. The companion test
-    // `assert_result_missing_measurements_tolerated_by_deserialize`
-    // pins THAT tolerance.
+    const REQUIRED_FIELDS: &[&str] = &[
+        "passed",
+        "skipped",
+        "details",
+        "stats",
+        "measurements",
+    ];
 
     let r = AssertResult {
         passed: false,
@@ -286,21 +240,3 @@ fn assert_result_missing_required_field_rejected_by_deserialize() {
     }
 }
 
-/// Old sidecars without the `measurements` key deserialize cleanly
-/// with an empty map — the field carries `#[serde(default)]`.
-#[test]
-fn assert_result_missing_measurements_tolerated_by_deserialize() {
-    let json = r#"{"passed":true,"skipped":false,"details":[],"stats":{
-        "cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,
-        "worst_spread":0,"worst_gap_ms":0,"worst_gap_cpu":0,
-        "worst_migration_ratio":0,"worst_p99_wake_latency_us":0,
-        "worst_median_wake_latency_us":0,"worst_wake_latency_cv":0,
-        "total_iterations":0,"worst_mean_run_delay_us":0,
-        "worst_run_delay_us":0,"worst_page_locality":0,
-        "worst_cross_node_migration_ratio":0,
-        "worst_wake_latency_tail_ratio":0,"worst_iterations_per_worker":0
-    }}"#;
-    let r: AssertResult =
-        serde_json::from_str(json).expect("missing-measurements must deserialize cleanly");
-    assert!(r.measurements.is_empty());
-}

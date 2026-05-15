@@ -733,7 +733,9 @@ impl CgroupManager {
     pub fn clear_cpuset(&self, name: &str) -> Result<()> {
         validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("cpuset.cpus");
-        write_with_timeout(&p, "", CGROUP_WRITE_TIMEOUT)
+        write_with_timeout(&p, "", CGROUP_WRITE_TIMEOUT).with_context(|| {
+            format!("cgroup '{name}': clear cpuset.cpus (write empty string for inherit-parent)")
+        })
     }
 
     /// Write `cpuset.mems` for a child cgroup. Constrains which NUMA
@@ -786,11 +788,12 @@ impl CgroupManager {
     pub fn set_cpuset_mems(&self, name: &str, nodes: &BTreeSet<usize>) -> Result<()> {
         validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("cpuset.mems");
-        write_with_timeout(
-            &p,
-            &TestTopology::cpuset_string(nodes),
-            CGROUP_WRITE_TIMEOUT,
-        )
+        let nodes_str = TestTopology::cpuset_string(nodes);
+        write_with_timeout(&p, &nodes_str, CGROUP_WRITE_TIMEOUT).with_context(|| {
+            format!(
+                "cgroup '{name}': set cpuset.mems='{nodes_str}' (requires +cpuset in parent cgroup.subtree_control)"
+            )
+        })
     }
 
     /// Clear `cpuset.mems` for a child cgroup (empty string = inherit parent).
@@ -800,7 +803,9 @@ impl CgroupManager {
     pub fn clear_cpuset_mems(&self, name: &str) -> Result<()> {
         validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("cpuset.mems");
-        write_with_timeout(&p, "", CGROUP_WRITE_TIMEOUT)
+        write_with_timeout(&p, "", CGROUP_WRITE_TIMEOUT).with_context(|| {
+            format!("cgroup '{name}': clear cpuset.mems (write empty string for inherit-parent)")
+        })
     }
 
     /// Write `cpu.max` for a child cgroup. `quota_us = None` writes
@@ -826,7 +831,11 @@ impl CgroupManager {
             Some(q) => format!("{q} {period_us}"),
             None => format!("max {period_us}"),
         };
-        write_with_timeout(&p, &line, CGROUP_WRITE_TIMEOUT)
+        write_with_timeout(&p, &line, CGROUP_WRITE_TIMEOUT).with_context(|| {
+            format!(
+                "cgroup '{name}': set cpu.max='{line}' (requires +cpu in parent cgroup.subtree_control)"
+            )
+        })
     }
 
     /// Write `cpu.weight` for a child cgroup (cgroup v2 weight,
@@ -841,7 +850,11 @@ impl CgroupManager {
     pub fn set_cpu_weight(&self, name: &str, weight: u32) -> Result<()> {
         validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("cpu.weight");
-        write_with_timeout(&p, &weight.to_string(), CGROUP_WRITE_TIMEOUT)
+        write_with_timeout(&p, &weight.to_string(), CGROUP_WRITE_TIMEOUT).with_context(|| {
+            format!(
+                "cgroup '{name}': set cpu.weight={weight} (requires +cpu in parent cgroup.subtree_control)"
+            )
+        })
     }
 
     /// Write `memory.max` for a child cgroup. `bytes = None` writes
@@ -856,7 +869,11 @@ impl CgroupManager {
             Some(b) => b.to_string(),
             None => "max".to_string(),
         };
-        write_with_timeout(&p, &line, CGROUP_WRITE_TIMEOUT)
+        write_with_timeout(&p, &line, CGROUP_WRITE_TIMEOUT).with_context(|| {
+            format!(
+                "cgroup '{name}': set memory.max='{line}' (requires +memory in parent cgroup.subtree_control)"
+            )
+        })
     }
 
     /// Write `memory.high` for a child cgroup. `bytes = None`
@@ -870,7 +887,11 @@ impl CgroupManager {
             Some(b) => b.to_string(),
             None => "max".to_string(),
         };
-        write_with_timeout(&p, &line, CGROUP_WRITE_TIMEOUT)
+        write_with_timeout(&p, &line, CGROUP_WRITE_TIMEOUT).with_context(|| {
+            format!(
+                "cgroup '{name}': set memory.high='{line}' (requires +memory in parent cgroup.subtree_control)"
+            )
+        })
     }
 
     /// Write `memory.low` for a child cgroup. `bytes = None` writes
@@ -884,7 +905,11 @@ impl CgroupManager {
             Some(b) => b.to_string(),
             None => "0".to_string(),
         };
-        write_with_timeout(&p, &line, CGROUP_WRITE_TIMEOUT)
+        write_with_timeout(&p, &line, CGROUP_WRITE_TIMEOUT).with_context(|| {
+            format!(
+                "cgroup '{name}': set memory.low='{line}' (requires +memory in parent cgroup.subtree_control)"
+            )
+        })
     }
 
     /// Write `io.weight` for a child cgroup (cgroup v2 weight,
@@ -901,7 +926,11 @@ impl CgroupManager {
     pub fn set_io_weight(&self, name: &str, weight: u16) -> Result<()> {
         validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("io.weight");
-        write_with_timeout(&p, &weight.to_string(), CGROUP_WRITE_TIMEOUT)
+        write_with_timeout(&p, &weight.to_string(), CGROUP_WRITE_TIMEOUT).with_context(|| {
+            format!(
+                "cgroup '{name}': set io.weight={weight} (requires +io in parent cgroup.subtree_control)"
+            )
+        })
     }
 
     /// Write `cgroup.freeze` for a child cgroup. `frozen = true` writes
@@ -920,7 +949,9 @@ impl CgroupManager {
         validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("cgroup.freeze");
         let line = if frozen { "1" } else { "0" };
-        write_with_timeout(&p, line, CGROUP_WRITE_TIMEOUT)
+        write_with_timeout(&p, line, CGROUP_WRITE_TIMEOUT).with_context(|| {
+            format!("cgroup '{name}': set cgroup.freeze='{line}' (cgroup-core file, no controller required)")
+        })
     }
 
     /// Write `pids.max` for a child cgroup. `max = None` writes `"max"`
@@ -945,7 +976,11 @@ impl CgroupManager {
             Some(n) => n.to_string(),
             None => "max".to_string(),
         };
-        write_with_timeout(&p, &line, CGROUP_WRITE_TIMEOUT)
+        write_with_timeout(&p, &line, CGROUP_WRITE_TIMEOUT).with_context(|| {
+            format!(
+                "cgroup '{name}': set pids.max='{line}' (requires +pids in parent cgroup.subtree_control)"
+            )
+        })
     }
 
     /// Write `memory.swap.max` for a child cgroup. `bytes = None` writes
@@ -969,7 +1004,11 @@ impl CgroupManager {
             Some(b) => b.to_string(),
             None => "max".to_string(),
         };
-        write_with_timeout(&p, &line, CGROUP_WRITE_TIMEOUT)
+        write_with_timeout(&p, &line, CGROUP_WRITE_TIMEOUT).with_context(|| {
+            format!(
+                "cgroup '{name}': set memory.swap.max='{line}' (requires +memory in parent cgroup.subtree_control; file absent on CONFIG_SWAP=n kernels)"
+            )
+        })
     }
 
     /// Move a single task into a child cgroup via `cgroup.procs`.

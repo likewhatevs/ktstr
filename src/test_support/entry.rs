@@ -32,6 +32,7 @@ pub use crate::vmm::topology::{MemSideCache, NumaDistance, NumaNode, Topology};
 /// name-lookup vs. explicit filesystem path respectively; and
 /// [`KernelBuiltin`](Self::KernelBuiltin) activates an in-kernel
 /// scheduling policy via shell commands rather than any binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SchedulerSpec {
     /// No userspace scheduler — run under the kernel's default
     /// scheduler. On current kernels that's EEVDF; the variant
@@ -254,6 +255,7 @@ impl std::fmt::Display for CgroupPath {
 /// The write is event-driven: the host polls for BPF map discoverability
 /// (scheduler loaded), then polls the SHM ring for scenario start, then
 /// writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BpfMapWrite {
     /// Map name suffix to match (e.g. ".bss").
     pub map_name_suffix: &'static str,
@@ -376,6 +378,12 @@ impl TopologyConstraints {
 /// its name, binary spec, sysctls, kernel args, scheduler args,
 /// cgroup parent, default topology, gauntlet topology constraints,
 /// config-file plumbing, kernel sweep set, and assertion overrides.
+///
+/// Construct via the [`declare_scheduler!`] macro (the production
+/// path) or the [`Scheduler::new`] const builder chain. Test bodies
+/// reference declared schedulers via the `scheduler = MY_SCHED`
+/// attribute on `#[ktstr_test]`.
+#[derive(Debug)]
 pub struct Scheduler {
     /// Short human name for the scheduler, used in logs and sidecar
     /// metadata.
@@ -680,6 +688,13 @@ impl Scheduler {
 }
 
 /// Registration entry for an `#[ktstr_test]`-annotated function.
+///
+/// Construct via the [`#[ktstr_test]`] macro (the production path)
+/// or struct-literal with `..KtstrTestEntry::DEFAULT` (the
+/// integration-test / gauntlet rewriter path). The macro emits the
+/// `linkme` distributed-slice registration; programmatic callers
+/// register via [`KTSTR_TESTS`].
+#[derive(Debug)]
 pub struct KtstrTestEntry {
     /// Fully qualified test name as it appears in nextest output.
     pub name: &'static str,
@@ -1290,6 +1305,17 @@ impl KtstrTestEntry {
         }
         out.extend(self.extra_include_files.iter().copied());
         out
+    }
+}
+
+impl Default for KtstrTestEntry {
+    /// Delegates to [`Self::DEFAULT`]. The const exists for
+    /// struct-update spreads in static contexts (`..KtstrTestEntry::DEFAULT`)
+    /// where const-context evaluation is required; the trait impl
+    /// lets `..Default::default()` work uniformly in non-const
+    /// callers (gauntlet rewriters, integration-test fixtures).
+    fn default() -> Self {
+        Self::DEFAULT
     }
 }
 

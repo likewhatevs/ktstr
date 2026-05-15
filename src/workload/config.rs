@@ -208,10 +208,13 @@ pub(crate) fn resolve_work_type(
 /// `Batch`, and (entering) `Idle` are unprivileged transitions for
 /// fair-policy tasks. Priority values for `Fifo`/`RoundRobin` are
 /// clamped to 1-99.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SchedPolicy {
     /// `SCHED_NORMAL` (CFS/EEVDF).
+    #[default]
     Normal,
     /// `SCHED_BATCH`.
     Batch,
@@ -281,12 +284,12 @@ pub enum SchedPolicy {
 
 impl SchedPolicy {
     /// `SCHED_FIFO` with the given priority (1-99).
-    pub fn fifo(priority: u32) -> Self {
+    pub const fn fifo(priority: u32) -> Self {
         SchedPolicy::Fifo(priority)
     }
 
     /// `SCHED_RR` with the given priority (1-99).
-    pub fn round_robin(priority: u32) -> Self {
+    pub const fn round_robin(priority: u32) -> Self {
         SchedPolicy::RoundRobin(priority)
     }
 
@@ -320,7 +323,7 @@ impl SchedPolicy {
     /// assert!(matches!(p, SchedPolicy::Deadline { .. }));
     /// assert!(matches!(q, SchedPolicy::Deadline { .. }));
     /// ```
-    pub fn deadline(runtime: Duration, deadline: Duration, period: Duration) -> Self {
+    pub const fn deadline(runtime: Duration, deadline: Duration, period: Duration) -> Self {
         SchedPolicy::Deadline {
             runtime,
             deadline,

@@ -589,7 +589,7 @@ impl CpusetSpec {
 /// Validation runs at `apply_setup` time — any violation surfaces as
 /// `anyhow::bail!` so a misconfigured CgroupDef fails before any
 /// worker spawns.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CpuLimits {
     /// `cpu.max` quota and period in microseconds. `quota = None`
@@ -1416,7 +1416,7 @@ impl CgroupDef {
     /// "two CPUs". Use [`Self::cpu_quota`] for non-default periods.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn cpu_quota_pct(mut self, pct: u32) -> Self {
-        let cpu = self.cpu.get_or_insert_with(default_cpu_limits);
+        let cpu = self.cpu.get_or_insert_with(CpuLimits::default);
         cpu.max_period_us = 100_000;
         cpu.max_quota_us = Some((pct as u64) * 1_000);
         self
@@ -1428,7 +1428,7 @@ impl CgroupDef {
     /// fractions in the supplied [`Duration`]s are truncated.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn cpu_quota(mut self, quota: Duration, period: Duration) -> Self {
-        let cpu = self.cpu.get_or_insert_with(default_cpu_limits);
+        let cpu = self.cpu.get_or_insert_with(CpuLimits::default);
         cpu.max_quota_us = Some(quota.as_micros() as u64);
         cpu.max_period_us = period.as_micros() as u64;
         self
@@ -1440,7 +1440,7 @@ impl CgroupDef {
     /// only weight-based bias.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn cpu_unlimited(mut self) -> Self {
-        let cpu = self.cpu.get_or_insert_with(default_cpu_limits);
+        let cpu = self.cpu.get_or_insert_with(CpuLimits::default);
         cpu.max_quota_us = None;
         self
     }
@@ -1450,7 +1450,7 @@ impl CgroupDef {
     /// parent cgroup is contended. Independent of `cpu.max`.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn cpu_weight(mut self, weight: u32) -> Self {
-        let cpu = self.cpu.get_or_insert_with(default_cpu_limits);
+        let cpu = self.cpu.get_or_insert_with(CpuLimits::default);
         cpu.weight = Some(weight);
         self
     }
@@ -1632,17 +1632,21 @@ impl CgroupDef {
     }
 }
 
-/// Constructor for the default [`CpuLimits`] used by the cgroup
-/// builders — `cpu.max` quota off, period 100 ms (the kernel
-/// default for `cpu.max`'s second column), `cpu.weight` unset.
-/// Extracted so the four builders that ensure_cpu_limits share
-/// one initial state and a future change to the default period
-/// (e.g. shorter for latency-sensitive tests) only edits here.
-fn default_cpu_limits() -> CpuLimits {
-    CpuLimits {
-        max_quota_us: None,
-        max_period_us: 100_000,
-        weight: None,
+impl Default for CpuLimits {
+    /// `cpu.max` quota off, period 100 ms (the kernel default for
+    /// `cpu.max`'s second column), `cpu.weight` unset. Matches the
+    /// initial state used by the four `CgroupDef::cpu_*` builders;
+    /// changing the default period only edits here.
+    ///
+    /// The derived `Default` would produce `max_period_us: 0` which
+    /// `apply_setup` rejects (kernel requires period > 0). Manual
+    /// impl avoids that footgun for `..Default::default()` callers.
+    fn default() -> Self {
+        Self {
+            max_quota_us: None,
+            max_period_us: 100_000,
+            weight: None,
+        }
     }
 }
 
@@ -1673,6 +1677,10 @@ impl Default for CgroupDef {
 // ---------------------------------------------------------------------------
 
 /// How to produce the CgroupDefs for a step's setup phase.
+///
+/// Construct via [`Setup::defs`] (static list), [`Setup::factory`]
+/// (runtime-generated from `&Ctx`), [`Setup::empty`] (no cgroups), or
+/// via [`From<Vec<CgroupDef>>`](Self::from) (`vec![def1, def2].into()`).
 pub enum Setup {
     /// Static list of cgroup definitions.
     Defs(Vec<CgroupDef>),
@@ -1702,6 +1710,28 @@ impl std::fmt::Debug for Setup {
 }
 
 impl Setup {
+    /// Construct a [`Setup::Defs`] from a vector of cgroup definitions.
+    /// Equivalent to `Setup::Defs(defs)` or `defs.into()`; the named
+    /// form is the canonical constructor for discoverability.
+    pub fn defs(defs: Vec<CgroupDef>) -> Self {
+        Setup::Defs(defs)
+    }
+
+    /// Construct a [`Setup::Factory`] from a function pointer.
+    /// Equivalent to `Setup::Factory(f)`; the named form mirrors
+    /// [`Setup::defs`] for symmetry.
+    pub const fn factory(f: fn(&Ctx) -> Vec<CgroupDef>) -> Self {
+        Setup::Factory(f)
+    }
+
+    /// Construct an empty [`Setup::Defs`] — no cgroups created in the
+    /// step. Equivalent to `Setup::Defs(vec![])`, `Setup::defs(vec![])`,
+    /// or `Setup::default()`. `const fn` so it can sit in `static` /
+    /// `const` contexts alongside [`Setup::factory`].
+    pub const fn empty() -> Self {
+        Setup::Defs(Vec::new())
+    }
+
     pub(super) fn resolve(&self, ctx: &Ctx) -> Vec<CgroupDef> {
         match self {
             Setup::Defs(defs) => defs.clone(),
@@ -1717,6 +1747,15 @@ impl Setup {
     }
 }
 
+impl Default for Setup {
+    /// Delegates to [`Setup::empty`] — no cgroups created. The
+    /// `Factory` variant cannot serve as a Default because it holds
+    /// a fn pointer with no semantic no-op.
+    fn default() -> Self {
+        Setup::empty()
+    }
+}
+
 impl From<Vec<CgroupDef>> for Setup {
     fn from(defs: Vec<CgroupDef>) -> Self {
         Setup::Defs(defs)
@@ -1727,8 +1766,13 @@ impl From<Vec<CgroupDef>> for Setup {
 ///
 /// For non-`Loop` steps, `ops` are applied first, then `setup` cgroups
 /// are created, configured, and populated. For `Loop` steps, `setup`
-/// runs once before the ops loop. Use `Step::new` to create a step
-/// with only ops (no setup).
+/// runs once before the ops loop.
+///
+/// Construct via [`Step::new`] (ops-only, no setup), [`Step::with_defs`]
+/// (cgroup setup + hold), or [`Step::with_payload`] (payload-driven step).
+/// For chained mutation of the ops list, [`Step::set_ops`] REPLACES
+/// the existing vec — Backdrop's `with_ops` semantics (APPEND) are not
+/// mirrored here because Step is single-phase.
 #[derive(Clone, Debug)]
 pub struct Step {
     /// Cgroup setup applied before (non-`Loop`) or once above (`Loop`)
@@ -1746,7 +1790,7 @@ impl Step {
     #[must_use = "dropping a Step discards its ops and hold for that scenario phase"]
     pub fn new(ops: Vec<Op>, hold: HoldSpec) -> Self {
         Self {
-            setup: Setup::Defs(vec![]),
+            setup: Setup::empty(),
             ops,
             hold,
         }
@@ -1778,6 +1822,18 @@ impl Step {
         self
     }
 
+    /// Replace the hold spec for a step, consuming and returning it.
+    /// Sibling of [`set_ops`](Self::set_ops) — both REPLACE a single
+    /// field. Bare-verb `set_` prefix matches `set_ops` for
+    /// prefix-consistency within Step; the convention reserves
+    /// `with_X` for alternative constructors (see [`with_defs`](Self::with_defs),
+    /// [`with_payload`](Self::with_payload)).
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn set_hold(mut self, hold: HoldSpec) -> Self {
+        self.hold = hold;
+        self
+    }
+
     /// Create a step that spawns a single userspace
     /// [`Payload`](crate::test_support::Payload) binary in the
     /// background and holds for the given duration before teardown.
@@ -1796,9 +1852,22 @@ impl Step {
     #[must_use = "dropping a Step discards its payload and hold for that scenario phase"]
     pub fn with_payload(payload: &'static crate::test_support::Payload, hold: HoldSpec) -> Self {
         Self {
-            setup: Setup::Defs(vec![]),
+            setup: Setup::empty(),
             ops: vec![Op::run_payload(payload, vec![])],
             hold,
+        }
+    }
+}
+
+impl Default for Step {
+    /// Empty setup, no ops, hold for the full scenario duration
+    /// ([`HoldSpec::FULL`]). Useful as a sentinel in test fixtures
+    /// that compose Steps via `..Default::default()` field overrides.
+    fn default() -> Self {
+        Self {
+            setup: Setup::empty(),
+            ops: Vec::new(),
+            hold: HoldSpec::FULL,
         }
     }
 }
