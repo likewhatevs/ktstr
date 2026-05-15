@@ -2324,7 +2324,23 @@ impl Assert {
             ));
             return details;
         }
-        let excerpt = || -> String { captured_text.chars().take(400).collect() };
+        // Truncate at a UTF-8 char boundary at or below 400 bytes so
+        // the excerpt length stays within the "up to 400 bytes follow:"
+        // budget. `chars().take(400)` would count codepoints instead,
+        // and a multi-byte corpus would exceed the byte budget — the
+        // boundary walk steps back to the nearest char start.
+        let excerpt = || -> &str {
+            let len = captured_text.len();
+            if len <= 400 {
+                captured_text
+            } else {
+                let mut end = 400;
+                while end > 0 && !captured_text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                &captured_text[..end]
+            }
+        };
         if let Some(literal) = self.expect_scx_bpf_error_contains
             && !captured_text.contains(literal)
         {
@@ -2334,7 +2350,7 @@ impl Assert {
                     "expect_scx_bpf_error_contains({literal:?}): substring not found \
                      in the scheduler log + sched_ext dump corpus (the expected bug \
                      did not fire, or its message text changed). Captured corpus \
-                     {} bytes; first 400 bytes follow:\n{}",
+                     {} bytes; up to 400 bytes follow:\n{}",
                     captured_text.len(),
                     excerpt(),
                 ),
@@ -2350,7 +2366,7 @@ impl Assert {
                                 "expect_scx_bpf_error_matches({pattern:?}): regex did \
                                  not match the scheduler log + sched_ext dump corpus \
                                  (the expected bug did not fire, or its message text \
-                                 changed). Captured corpus {} bytes; first 400 bytes \
+                                 changed). Captured corpus {} bytes; up to 400 bytes \
                                  follow:\n{}",
                                 captured_text.len(),
                                 excerpt(),

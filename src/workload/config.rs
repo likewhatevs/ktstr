@@ -1325,6 +1325,13 @@ impl WorkSpec {
     /// would resolve to zero workers — caught at apply-setup time by
     /// `resolve_num_workers`'s zero-workers rejection anyway, but the
     /// construction-time message is more actionable.
+    ///
+    /// Extreme finite values (e.g. `1e100`) pass the construction gate
+    /// and saturate to `usize::MAX` via the `as` cast in
+    /// `resolve_workers_pct` (RFC 2484 / Rust 1.45+). Attempting to
+    /// spawn that many workers would OOM the host. The framework
+    /// imposes no upper cap; as a rule of thumb keep `pct` near the
+    /// intended oversubscription factor (e.g. `1.0`, `2.0`, `4.0`).
     #[must_use = "builder methods consume self; bind the result"]
     pub fn workers_pct(mut self, pct: f64) -> Self {
         assert!(

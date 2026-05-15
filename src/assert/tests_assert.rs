@@ -1055,7 +1055,7 @@ fn evaluate_scx_bpf_error_match_contains_fails_on_empty_corpus() {
          empty-capture from matcher-mismatch: {msg}",
     );
     assert!(
-        msg.contains("first 400 bytes follow:"),
+        msg.contains("up to 400 bytes follow:"),
         "diagnostic must include the standard excerpt suffix even when empty: {msg}",
     );
 }
@@ -1082,7 +1082,7 @@ fn evaluate_scx_bpf_error_match_regex_fails_on_empty_corpus() {
         "diagnostic must surface the corpus length: {msg}",
     );
     assert!(
-        msg.contains("first 400 bytes follow:"),
+        msg.contains("up to 400 bytes follow:"),
         "diagnostic must include the standard excerpt suffix: {msg}",
     );
 }
@@ -1123,6 +1123,72 @@ fn evaluate_scx_bpf_error_match_both_fail_on_empty_corpus() {
             d.message,
         );
     }
+}
+
+/// The failure-diagnostic excerpt is byte-truncated at a UTF-8
+/// boundary so its size matches the "up to 400 bytes follow:" prose.
+/// A future regression that switched back to `chars().take(400)` would
+/// produce excerpts up to 4 × 400 bytes on multi-byte corpora; pin
+/// here so the byte-budget contract holds. The fixture uses em-dashes
+/// (3-byte UTF-8): byte 400 lands mid-codepoint, so the boundary walk
+/// steps back to 399. This is the only 1-byte/2-byte/3-byte/4-byte
+/// width that produces a non-no-op walk against a 400-byte budget;
+/// 2-byte and 4-byte codepoints land cleanly on byte 400 and would
+/// trivially pass the fast path.
+///
+/// Both matcher branches share the `excerpt` closure today, so this
+/// test pins the contract via the literal branch AND a second
+/// assertion via the regex branch — if a future refactor splits the
+/// closure (e.g. matcher path adds context lines), this test catches
+/// the regression rather than silently passing on the surviving
+/// shared path.
+#[test]
+fn evaluate_scx_bpf_error_match_excerpt_byte_truncated_at_char_boundary() {
+    // 200 em-dashes (each 3 bytes in UTF-8) = 600 bytes / 200 chars.
+    // chars().take(400) would yield all 200 chars = 600 bytes (over budget);
+    // byte-truncation stops at or below 400 bytes.
+    let mut corpus = String::new();
+    for _ in 0..200 {
+        corpus.push('\u{2014}'); // em-dash, 3 UTF-8 bytes
+    }
+    assert_eq!(corpus.len(), 600, "test fixture: 200 em-dashes = 600 bytes");
+
+    let assert_excerpt_within_budget = |msg: &str| {
+        let after_marker = msg
+            .split_once("up to 400 bytes follow:\n")
+            .unwrap_or_else(|| panic!("diagnostic missing excerpt marker: {msg}"))
+            .1;
+        // 400 / 3 = 133 full em-dashes fit (399 bytes); the 401st byte
+        // would split a codepoint, so the truncation steps back to 399.
+        // Exact-length pin catches both "no truncation" regressions
+        // (600 bytes) and forward-walk off-by-one (402 bytes) — and
+        // since the slice is valid UTF-8 by construction, the codepoint
+        // composition assertion below also pins that the excerpt is a
+        // legitimate em-dash prefix rather than a lossy decode.
+        assert_eq!(
+            after_marker.len(),
+            399,
+            "200 em-dashes at 3 bytes each: 133 fit in 399 bytes; 134 would overflow at 402",
+        );
+        assert!(
+            after_marker.chars().all(|c| c == '\u{2014}'),
+            "excerpt must contain only em-dashes (no replacement char or partial codepoint): {after_marker:?}",
+        );
+    };
+
+    // Literal matcher branch.
+    let literal = Assert::NO_OVERRIDES.expect_scx_bpf_error_contains("not present");
+    let literal_details = literal.evaluate_scx_bpf_error_match(&corpus, true);
+    assert_eq!(literal_details.len(), 1);
+    assert_excerpt_within_budget(&literal_details[0].message);
+
+    // Regex matcher branch — uses the same `excerpt` closure today,
+    // but a future refactor that splits the two branches would let
+    // a regression slip past a literal-only pin.
+    let regex = Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(r"not present anywhere");
+    let regex_details = regex.evaluate_scx_bpf_error_match(&corpus, true);
+    assert_eq!(regex_details.len(), 1);
+    assert_excerpt_within_budget(&regex_details[0].message);
 }
 
 /// Literal-substring matcher does NOT trim or normalize whitespace.
