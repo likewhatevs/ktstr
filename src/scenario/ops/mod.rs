@@ -2129,6 +2129,65 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 state.drain_payloads_for_cgroup(cgroup);
                 state.drop_handles_for_cgroup(cgroup);
                 state.forget_cpuset(cgroup);
+                // Diagnostic breadcrumbs for the typo-late-surfacing
+                // failure mode that permissive RemoveCgroup makes
+                // possible: a typo'd cgroup name now no-ops silently
+                // against the kernel, then a downstream op
+                // referencing the intended Backdrop cgroup hits
+                // kernel-level "cgroup missing" with no obvious link
+                // back to the typo. Two complementary warns:
+                //
+                // (1) RemoveCgroup against a Backdrop-tracked name
+                //     — operator can grep the log to correlate a
+                //     later "cgroup missing" error with the
+                //     intentional removal source.
+                // (2) RemoveCgroup against a name NOT in any tracked
+                //     set — could be a typo OR a second-remove of a
+                //     name already forgotten by a prior RemoveCgroup;
+                //     dump both the Backdrop and step-local cgroup
+                //     name lists so the operator can compare and
+                //     find the off-by-one. Fires unconditionally on
+                //     unknown names (no `backdrop non-empty` gate)
+                //     so typos in step-local-only scenarios are also
+                //     caught.
+                //
+                // Order matters: these membership checks must run
+                // BEFORE the `forget` calls below. Reordering them
+                // after `forget` would prune the name from both
+                // `names()` lists, making `in_backdrop` and `in_step`
+                // both observe `false` — warn (1) would never fire and
+                // warn (2) would fire spuriously on every RemoveCgroup.
+                let in_backdrop = state
+                    .backdrop
+                    .cgroups
+                    .names()
+                    .iter()
+                    .any(|n| n == &**cgroup);
+                let in_step = state.step.cgroups.names().iter().any(|n| n == &**cgroup);
+                if in_backdrop {
+                    tracing::warn!(
+                        cgroup = %cgroup,
+                        "Op::RemoveCgroup removed a Backdrop-owned cgroup mid-scenario; \
+                         unless this name is re-added by a later Op::AddCgroup, \
+                         downstream ops referencing it will see kernel-level \
+                         `cgroup missing` errors. If this removal was unintended \
+                         (e.g. typo'd cgroup name that coincidentally matched a \
+                         Backdrop entry), check the test source for the intended \
+                         Backdrop cgroup.",
+                    );
+                } else if !in_step {
+                    tracing::warn!(
+                        cgroup = %cgroup,
+                        backdrop_cgroups = ?state.backdrop.cgroups.names(),
+                        step_cgroups = ?state.step.cgroups.names(),
+                        "Op::RemoveCgroup target '{cgroup}' matches no step-local \
+                         or Backdrop-owned cgroup — could be a typo or a \
+                         second-remove of an already-forgotten name. Compare \
+                         against the listed Backdrop and step cgroups; if a \
+                         downstream op later hits kernel-level `cgroup missing` \
+                         on a similar name, the typo here is the probable source.",
+                    );
+                }
                 // Drop the name from step/backdrop tracking BEFORE
                 // the rmdir so a later AddCgroup with the same name
                 // doesn't collide against a stale entry, and the
@@ -6896,17 +6955,17 @@ mod tests {
     // Step-local vs Backdrop state invariants
     // ---------------------------------------------------------------
 
-    /// Op::RemoveCgroup dispatches `ctx.cgroups.remove_cgroup`
-    /// directly but does NOT forget the name from CgroupGroup's
-    /// tracked `names` vec. Later, CgroupGroup's Drop iterates every
-    /// tracked name and calls remove_cgroup again. The second call
-    /// is swallowed by `let _ = ` in Drop, so the desync is
-    /// observable (two remove_cgroup calls for the same name) but
-    /// harmless. Pin the behavior so a future refactor that prunes
-    /// names out from under a live Drop (or that stops swallowing
-    /// the second error) surfaces here.
+    /// Op::RemoveCgroup dispatches `ctx.cgroups.remove_cgroup` and
+    /// then prunes the name from CgroupGroup's tracked `names` vec
+    /// via the `forget` helper. Without the prune, the stale
+    /// tracking entry would re-trigger the AddCgroup collision check
+    /// for a same-name re-create, and CgroupGroup's Drop would invoke
+    /// a redundant rmdir against an already-removed dir. Pin both:
+    /// names() reflects only the surviving cgroup, and the mock
+    /// observes exactly one RemoveCgroup call for the dropped name
+    /// (from the Op — Drop does not see it).
     #[test]
-    fn remove_cgroup_does_not_forget_name_in_cgroupgroup_but_drop_is_safe() {
+    fn remove_cgroup_forgets_name_so_drop_does_not_double_rmdir() {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
@@ -6917,30 +6976,271 @@ mod tests {
             &[Op::add_cgroup("cg_keep"), Op::add_cgroup("cg_drop")],
         )
         .unwrap();
-        // Op::RemoveCgroup records on the mock but does NOT prune
-        // `cg_drop` from the tracked names — both names stay.
+        // Op::RemoveCgroup records on the mock AND prunes `cg_drop`
+        // from the tracked names — only `cg_keep` survives.
         apply_ops_test(&ctx, &mut state, &[Op::remove_cgroup("cg_drop")]).unwrap();
         assert_eq!(
             state.cgroups.names(),
-            &["cg_keep".to_string(), "cg_drop".to_string()],
-            "Op::RemoveCgroup must not mutate CgroupGroup::names (current \
-             invariant); Drop is the single rmdir dispatcher",
+            &["cg_keep".to_string()],
+            "Op::RemoveCgroup must prune the removed name from \
+             CgroupGroup::names so a later AddCgroup with the same \
+             name can re-create the cgroup without colliding against \
+             a stale tracking entry",
         );
-        // The Drop call is safe because CgroupManager::remove_cgroup
-        // is idempotent and CgroupGroup::drop swallows the second
-        // error. Proved by dropping the state and asserting the mock
-        // observed two RemoveCgroup calls for cg_drop (one from the
-        // op, one from Drop), in that order, and did not panic.
+        // After Drop, the mock observed exactly one RemoveCgroup
+        // call for cg_drop (from the Op itself). Drop iterates only
+        // surviving names so it does not re-issue rmdir against
+        // cg_drop, and it issues exactly one rmdir for the
+        // surviving cg_keep.
         drop(state);
         let calls = mock.calls();
-        let drops: Vec<&CgroupCall> = calls
+        let cg_drop_removes: Vec<&CgroupCall> = calls
             .iter()
             .filter(|c| matches!(c, CgroupCall::RemoveCgroup(n) if n == "cg_drop"))
             .collect();
         assert_eq!(
-            drops.len(),
-            2,
-            "expected Op::RemoveCgroup + Drop to both hit the mock for cg_drop: {calls:?}",
+            cg_drop_removes.len(),
+            1,
+            "Op::RemoveCgroup must be the sole rmdir dispatcher for \
+             cg_drop; Drop must not re-issue rmdir against a forgotten \
+             name: {calls:?}",
+        );
+        let cg_keep_removes: Vec<&CgroupCall> = calls
+            .iter()
+            .filter(|c| matches!(c, CgroupCall::RemoveCgroup(n) if n == "cg_keep"))
+            .collect();
+        assert_eq!(
+            cg_keep_removes.len(),
+            1,
+            "Drop must rmdir the surviving cg_keep exactly once: {calls:?}",
+        );
+    }
+
+    /// Install a minimal tracing subscriber that records every
+    /// event's (Level, concatenated-field-values) pair, run `f`,
+    /// and return the captured events. The MessageVisitor handles
+    /// both record_debug (Debug-formatted `?` fields wrapped via
+    /// `DebugValue`, Display-formatted `%` fields wrapped via
+    /// `DisplayValue`, and the format-string message itself via
+    /// `fmt::Arguments` — all three route through record_debug) and
+    /// record_str (raw string field values), so the returned message
+    /// string contains the warn body concatenated with every
+    /// structured-field value.
+    fn capture_tracing_events<F: FnOnce()>(f: F) -> Vec<(tracing::Level, String)> {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{Event, Level, Metadata, Subscriber};
+
+        #[derive(Default)]
+        struct CaptureSubscriber {
+            events: Arc<Mutex<Vec<(Level, String)>>>,
+        }
+        struct MessageVisitor<'a>(&'a mut String);
+        impl<'a> Visit for MessageVisitor<'a> {
+            fn record_debug(&mut self, _field: &Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                let _ = write!(self.0, "{value:?} ");
+            }
+            fn record_str(&mut self, _field: &Field, value: &str) {
+                use std::fmt::Write;
+                let _ = write!(self.0, "{value} ");
+            }
+        }
+        impl Subscriber for CaptureSubscriber {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut msg = String::new();
+                event.record(&mut MessageVisitor(&mut msg));
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push((*event.metadata().level(), msg));
+            }
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+        }
+        let events: Arc<Mutex<Vec<(Level, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sub = CaptureSubscriber {
+            events: events.clone(),
+        };
+        tracing::subscriber::with_default(sub, f);
+        events.lock().unwrap().clone()
+    }
+
+    /// Branch 1 of Op::RemoveCgroup's typo-late-surfacing warn
+    /// fires when the removed name was tracked in Backdrop. The
+    /// warn correlates a later kernel-level "cgroup missing" with
+    /// the intentional removal source. Pin the predicate so a
+    /// future refactor that inverts the membership check, swallows
+    /// the warn, or routes the Backdrop path to branch 2 surfaces
+    /// here.
+    #[test]
+    fn remove_cgroup_warn_branch_1_fires_on_backdrop_tracked_name() {
+        let events = capture_tracing_events(|| {
+            let mock = MockCgroupOps::new();
+            let topo = mock_topo();
+            let ctx = mock_ctx(&mock, &topo);
+            let mut step_state = StepState::empty(&ctx);
+            let mut backdrop_state = BackdropState::empty(&ctx);
+            backdrop_state
+                .cgroups
+                .add_cgroup_no_cpuset("bd_cg")
+                .expect("add backdrop cgroup");
+            let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+            apply_ops(&ctx, &mut scenario, &[Op::remove_cgroup("bd_cg")])
+                .expect("remove_cgroup of backdrop target must succeed");
+        });
+        let warns: Vec<&(tracing::Level, String)> = events
+            .iter()
+            .filter(|(lvl, _)| *lvl == tracing::Level::WARN)
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "exactly one warn expected from branch 1; got: {warns:?}",
+        );
+        assert!(
+            warns[0]
+                .1
+                .contains("removed a Backdrop-owned cgroup mid-scenario"),
+            "warn must include branch-1 text identifying Backdrop-owned removal; got: {:?}",
+            warns[0].1,
+        );
+        assert!(
+            warns[0].1.contains("bd_cg"),
+            "warn must include the cgroup name; got: {:?}",
+            warns[0].1,
+        );
+    }
+
+    /// Branch 2 of Op::RemoveCgroup's typo-late-surfacing warn
+    /// fires when the removed name matches NEITHER step-local NOR
+    /// Backdrop tracking. The warn dumps both lists so the
+    /// operator can compare against the test source and find a
+    /// typo. Pin the dump-on-typo behavior so a future refactor
+    /// that drops a list or fires on the wrong predicate surfaces
+    /// here.
+    #[test]
+    fn remove_cgroup_warn_branch_2_fires_on_unknown_typo_name() {
+        let events = capture_tracing_events(|| {
+            let mock = MockCgroupOps::new();
+            let topo = mock_topo();
+            let ctx = mock_ctx(&mock, &topo);
+            let mut step_state = StepState::empty(&ctx);
+            let mut backdrop_state = BackdropState::empty(&ctx);
+            backdrop_state
+                .cgroups
+                .add_cgroup_no_cpuset("bd_real_name")
+                .expect("add backdrop cgroup");
+            let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+            // Add a step-local cgroup so the step_cgroups field
+            // in the warn has a non-empty value to substring-match
+            // against — guards against a future refactor dropping
+            // the step_cgroups field from the warn.
+            apply_ops(&ctx, &mut scenario, &[Op::add_cgroup("step_local_real")])
+                .expect("add step-local cgroup");
+            apply_ops(&ctx, &mut scenario, &[Op::remove_cgroup("bd_typoed_name")])
+                .expect("remove_cgroup of unknown name must succeed (permissive)");
+        });
+        let warns: Vec<&(tracing::Level, String)> = events
+            .iter()
+            .filter(|(lvl, _)| *lvl == tracing::Level::WARN)
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "exactly one warn expected from branch 2; got: {warns:?}",
+        );
+        assert!(
+            warns[0].1.contains("matches no step-local"),
+            "warn must include branch-2 text identifying unknown-name typo; got: {:?}",
+            warns[0].1,
+        );
+        assert!(
+            warns[0].1.contains("bd_real_name"),
+            "warn must dump backdrop_cgroups list including the real name; got: {:?}",
+            warns[0].1,
+        );
+        assert!(
+            warns[0].1.contains("step_local_real"),
+            "warn must dump step_cgroups list including the step-local name; got: {:?}",
+            warns[0].1,
+        );
+        assert!(
+            warns[0].1.contains("bd_typoed_name"),
+            "warn must include the typo'd cgroup target name; got: {:?}",
+            warns[0].1,
+        );
+    }
+
+    /// Branch 2 also fires for a legitimate second-remove of a
+    /// name already pruned by a prior Op::RemoveCgroup. The
+    /// wording must acknowledge this as one of two possible
+    /// causes (typo or double-remove) so a test author seeing the
+    /// warn doesn't immediately assume bug. Pin both the warn
+    /// emission and the wording.
+    #[test]
+    fn remove_cgroup_warn_branch_2_fires_on_double_remove_already_forgotten() {
+        let events = capture_tracing_events(|| {
+            let mock = MockCgroupOps::new();
+            let topo = mock_topo();
+            let ctx = mock_ctx(&mock, &topo);
+            let mut state = StepState::empty(&ctx);
+            apply_ops_test(&ctx, &mut state, &[Op::add_cgroup("cg_once")]).unwrap();
+            // First remove: in_step is true → branch 2 gated off.
+            apply_ops_test(&ctx, &mut state, &[Op::remove_cgroup("cg_once")]).unwrap();
+            // Second remove: name already pruned by the prior
+            // remove's `forget` → matches neither tracking set →
+            // branch 2 fires.
+            apply_ops_test(&ctx, &mut state, &[Op::remove_cgroup("cg_once")]).unwrap();
+        });
+        let warns: Vec<&(tracing::Level, String)> = events
+            .iter()
+            .filter(|(lvl, _)| *lvl == tracing::Level::WARN)
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "exactly one warn expected — first remove gated by in_step, second remove fires branch 2 once; got: {warns:?}",
+        );
+        assert!(
+            warns[0]
+                .1
+                .contains("second-remove of an already-forgotten name"),
+            "branch-2 wording must acknowledge double-remove as legitimate cause alongside typo; got: {:?}",
+            warns[0].1,
+        );
+    }
+
+    /// Neither warn branch fires on the happy step-local
+    /// add-then-remove path. Pin the suppression so a future
+    /// refactor that flips the membership predicate (so step-local
+    /// removals would log "unknown name") surfaces here.
+    #[test]
+    fn remove_cgroup_emits_no_warn_on_happy_step_local_path() {
+        let events = capture_tracing_events(|| {
+            let mock = MockCgroupOps::new();
+            let topo = mock_topo();
+            let ctx = mock_ctx(&mock, &topo);
+            let mut state = StepState::empty(&ctx);
+            apply_ops_test(&ctx, &mut state, &[Op::add_cgroup("cg_local")]).unwrap();
+            apply_ops_test(&ctx, &mut state, &[Op::remove_cgroup("cg_local")]).unwrap();
+        });
+        let warns: Vec<&(tracing::Level, String)> = events
+            .iter()
+            .filter(|(lvl, _)| *lvl == tracing::Level::WARN)
+            .collect();
+        assert!(
+            warns.is_empty(),
+            "happy step-local add-then-remove path must emit zero warns; got: {warns:?}",
         );
     }
 
