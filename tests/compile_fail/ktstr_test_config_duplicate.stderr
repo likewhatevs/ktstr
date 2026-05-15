@@ -1,0 +1,5 @@
+error: duplicate `config = ...` — each test declares at most one inline scheduler config
+ --> tests/compile_fail/ktstr_test_config_duplicate.rs:3:50
+  |
+3 | #[ktstr_test(host_only = true, config = "first", config = "second")]
+  |                                                  ^^^^^^

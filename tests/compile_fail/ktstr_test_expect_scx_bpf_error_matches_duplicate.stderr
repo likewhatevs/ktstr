@@ -1,0 +1,5 @@
+error: duplicate `expect_scx_bpf_error_matches = ...` — each test declares at most one regex matcher
+ --> tests/compile_fail/ktstr_test_expect_scx_bpf_error_matches_duplicate.rs:3:87
+  |
+3 | #[ktstr_test(host_only = true, expect_err = true, expect_scx_bpf_error_matches = "a", expect_scx_bpf_error_matches = "b")]
+  |                                                                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^

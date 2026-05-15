@@ -213,10 +213,32 @@ fn bare_ignore_compile(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
+/// `auto_repro` defaults to `true`, so it's the one bool attr whose
+/// non-trivial setting is `false`. Pin that `auto_repro = false`
+/// flows through `BoolAttrSlots::assign` and lands on
+/// `KtstrTestEntry.auto_repro == false` — the only direct way to
+/// disable per-test auto-repro emission. (`expect_err = true` also
+/// disables auto-repro as a side effect on negative tests; see
+/// `src/test_support/entry.rs` field doc — but that path opts the
+/// test into the "expects failure" mode, not "disable auto-repro".)
+#[ktstr_test(auto_repro = false, host_only = true)]
+fn auto_repro_false_compile(_ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+
 #[test]
 fn entry_bare_auto_repro() {
     let e = ktstr::test_support::find_test("bare_auto_repro_compile").unwrap();
     assert!(e.auto_repro, "bare `auto_repro` must set entry.auto_repro=true");
+}
+
+#[test]
+fn entry_auto_repro_false() {
+    let e = ktstr::test_support::find_test("auto_repro_false_compile").unwrap();
+    assert!(
+        !e.auto_repro,
+        "explicit `auto_repro = false` must set entry.auto_repro=false"
+    );
 }
 
 #[test]

@@ -15,6 +15,65 @@ fn option_tokens<T: ToTokens>(opt: &Option<T>) -> proc_macro2::TokenStream {
     }
 }
 
+/// Render the error for a multi-segment attribute key
+/// (e.g. `#[ktstr_test(crate::host_only)]` or
+/// `#[ktstr_test(crate::host_only = true)]`). syn parses the path
+/// fine, but `#[ktstr_test]` dispatches on bare single-segment idents
+/// against the known attribute list, so multi-segment paths can never
+/// resolve. The diagnostic names both correct forms with three
+/// concrete value-attr examples (a scheduler path, a payload path, an
+/// integer) plus the full enumeration of the 10 bool attrs that
+/// accept the bare form, so the operator can identify their fix
+/// directly from the error text.
+fn multi_segment_attr_error(path: &syn::Path) -> TokenStream {
+    let path_repr = path.to_token_stream().to_string();
+    let msg = format!(
+        "unexpected multi-segment path `{path_repr}` — `#[ktstr_test]` \
+         accepts either `key = value` for value attributes (e.g. \
+         `scheduler = MITOSIS`, `payload = FIO`, `llcs = 4`) or the \
+         bare single-segment form for bool attributes ({})",
+        BOOL_ATTR_NAMES.join(", "),
+    );
+    syn::Error::new_spanned(path, msg).to_compile_error().into()
+}
+
+/// Render a duplicate-attribute error spanning `span`. Specific
+/// attributes get a tailored message; everything else falls back to a
+/// uniform "appears more than once" diagnostic. Centralised so the
+/// Meta::NameValue (`key = value`) and Meta::Path (bare) arms both
+/// emit identical messaging for the same ident, and so future per-attr
+/// wording lives in one place rather than scattered through the
+/// parse loop.
+fn duplicate_attr_error(ident: &str, span: &dyn ToTokens) -> TokenStream {
+    let msg = match ident {
+        "payload" => String::from(
+            "duplicate `payload = ...` — each test declares at most one \
+             primary payload; extras belong in `workloads = [..]`",
+        ),
+        "workloads" => String::from(
+            "duplicate `workloads = [...]` — combine all entries into a \
+             single array",
+        ),
+        "config" => String::from(
+            "duplicate `config = ...` — each test declares at most one \
+             inline scheduler config",
+        ),
+        "expect_scx_bpf_error_contains" => String::from(
+            "duplicate `expect_scx_bpf_error_contains = ...` — each test \
+             declares at most one literal matcher",
+        ),
+        "expect_scx_bpf_error_matches" => String::from(
+            "duplicate `expect_scx_bpf_error_matches = ...` — each test \
+             declares at most one regex matcher",
+        ),
+        _ => format!(
+            "duplicate attribute `{ident}` — each attribute may appear at \
+             most once on a single `#[ktstr_test]` invocation"
+        ),
+    };
+    syn::Error::new_spanned(span, msg).to_compile_error().into()
+}
+
 /// Default topology and memory for ktstr_test-annotated functions.
 const DEFAULT_LLCS: u32 = 1;
 const DEFAULT_CORES: u32 = 2;
@@ -257,6 +316,34 @@ impl BoolAttrSlots<'_> {
 ///     directory packaging is a v2 enhancement); a missing file
 ///     fails loudly at setup with an actionable error naming the
 ///     missing path.
+///
+/// Duplicate keys: each attribute KEY may appear at most once per
+/// `#[ktstr_test]` invocation; duplicate keys (whether the values
+/// match or differ) fail at expansion rather than silently letting
+/// the later value win. `#[ktstr_test(host_only = false,
+/// host_only)]` and `#[ktstr_test(llcs = 4, llcs = 8)]` both fail.
+/// The bare form (`host_only`) and explicit form (`host_only =
+/// true`) of the same attribute collide as well — they refer to
+/// the same slot. List values like `workloads = [FIO, FIO]` are
+/// NOT affected by this rule; the duplicate check is on attribute
+/// keys, not on values within an array. `payload = ...` and
+/// `workloads = [..]` keep their tailored messages directing the
+/// author to the right home for extras; `config = ...` and
+/// `expect_scx_bpf_error_{contains,matches} = ...` likewise have
+/// tailored wording; every other attribute uses a uniform
+/// "duplicate attribute" diagnostic.
+///
+/// Path / list forms: `#[ktstr_test(crate::host_only)]` (a
+/// multi-segment path, whether bare or as a key in
+/// `crate::host_only = true`) is rejected with a targeted message
+/// naming both valid forms with concrete examples — the macro only
+/// accepts bare single-segment idents because routing dispatches on
+/// the ident string against `BOOL_ATTR_NAMES` or the value-attr
+/// table. `#[ktstr_test(host_only(false))]` (parenthesised
+/// arguments) is rejected with a separate targeted message naming
+/// the attribute and the two valid forms (`= value` or bare); the
+/// same diagnostic fires for `crate::host_only(false)` so the
+/// operator sees one combined error rather than chasing two.
 #[proc_macro_attribute]
 pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
@@ -278,9 +365,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut memory_mb_set = false;
     let mut scheduler: Option<syn::Path> = None;
     let mut payload: Option<syn::Path> = None;
-    let mut payload_set = false;
-    let mut workloads: Vec<syn::Path> = Vec::new();
-    let mut workloads_set = false;
+    let mut workloads: Option<Vec<syn::Path>> = None;
     let mut auto_repro = true;
     let mut auto_repro_set = false;
     let mut not_starved: Option<bool> = None;
@@ -371,17 +456,25 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         ignore_test: &mut ignore_test,
     };
 
+    // Track every attribute key seen on this `#[ktstr_test]` invocation so
+    // accidental duplicates (`host_only = true, host_only`,
+    // `llcs = 4, llcs = 8`) are caught at expansion rather than silently
+    // letting the later value win. Checked at the top of each Meta arm
+    // once the ident has been extracted. The set is keyed by the bare
+    // identifier string so the bare-form (`host_only`) and explicit-form
+    // (`host_only = true`) of the same attribute collide as expected.
+    let mut seen_attrs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
     for meta in &parsed_attrs {
         match meta {
             Meta::NameValue(MetaNameValue { path, value, .. }) => {
                 let ident = match path.get_ident() {
                     Some(id) => id.to_string(),
-                    None => {
-                        return syn::Error::new_spanned(path, "expected identifier")
-                            .to_compile_error()
-                            .into();
-                    }
+                    None => return multi_segment_attr_error(path),
                 };
+                if !seen_attrs.insert(ident.clone()) {
+                    return duplicate_attr_error(&ident, path);
+                }
                 match ident.as_str() {
                     "scheduler" => {
                         let p = match value {
@@ -398,16 +491,6 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         scheduler = Some(p);
                     }
                     "payload" => {
-                        if payload_set {
-                            return syn::Error::new_spanned(
-                                path,
-                                "duplicate `payload = ...` — each test declares at \
-                                 most one primary payload; extras belong in \
-                                 `workloads = [..]`",
-                            )
-                            .to_compile_error()
-                            .into();
-                        }
                         let p = match value {
                             syn::Expr::Path(ep) => ep.path.clone(),
                             _ => {
@@ -420,18 +503,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             }
                         };
                         payload = Some(p);
-                        payload_set = true;
                     }
                     "workloads" => {
-                        if workloads_set {
-                            return syn::Error::new_spanned(
-                                path,
-                                "duplicate `workloads = [...]` — combine all \
-                                 entries into a single array",
-                            )
-                            .to_compile_error()
-                            .into();
-                        }
                         let arr = match value {
                             syn::Expr::Array(ea) => ea,
                             _ => {
@@ -444,9 +517,10 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 .into();
                             }
                         };
+                        let mut entries = Vec::with_capacity(arr.elems.len());
                         for elem in &arr.elems {
                             match elem {
-                                syn::Expr::Path(ep) => workloads.push(ep.path.clone()),
+                                syn::Expr::Path(ep) => entries.push(ep.path.clone()),
                                 _ => {
                                     return syn::Error::new_spanned(
                                         elem,
@@ -457,7 +531,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 }
                             }
                         }
-                        workloads_set = true;
+                        workloads = Some(entries);
                     }
                     "bpf_map_write" => {
                         let p = match value {
@@ -488,15 +562,6 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         post_vm = Some(p);
                     }
                     "config" => {
-                        if config_set {
-                            return syn::Error::new_spanned(
-                                path,
-                                "duplicate `config = ...` — each test declares at \
-                                 most one inline scheduler config",
-                            )
-                            .to_compile_error()
-                            .into();
-                        }
                         // Accept either a string literal (`config = "..."`) or a
                         // path to a `const &'static str` (`config = MY_CONFIG`).
                         // The field is `Option<&'static str>`, so any other
@@ -554,27 +619,9 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         };
                         match ident.as_str() {
                             "expect_scx_bpf_error_contains" => {
-                                if expect_scx_bpf_error_contains_tokens.is_some() {
-                                    return syn::Error::new_spanned(
-                                        path,
-                                        "duplicate `expect_scx_bpf_error_contains = ...` — \
-                                         each test declares at most one literal matcher",
-                                    )
-                                    .to_compile_error()
-                                    .into();
-                                }
                                 expect_scx_bpf_error_contains_tokens = Some(tokens);
                             }
                             "expect_scx_bpf_error_matches" => {
-                                if expect_scx_bpf_error_matches_tokens.is_some() {
-                                    return syn::Error::new_spanned(
-                                        path,
-                                        "duplicate `expect_scx_bpf_error_matches = ...` — \
-                                         each test declares at most one regex matcher",
-                                    )
-                                    .to_compile_error()
-                                    .into();
-                                }
                                 expect_scx_bpf_error_matches_tokens = Some(tokens);
                             }
                             _ => unreachable!(),
@@ -900,12 +947,11 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // diagnostic rather than the generic Meta catch-all.
                 let ident = match p.get_ident() {
                     Some(id) => id.to_string(),
-                    None => {
-                        return syn::Error::new_spanned(p, "expected identifier")
-                            .to_compile_error()
-                            .into();
-                    }
+                    None => return multi_segment_attr_error(p),
                 };
+                if !seen_attrs.insert(ident.clone()) {
+                    return duplicate_attr_error(&ident, p);
+                }
                 if !bool_slots.assign(&ident, true) {
                     return syn::Error::new_spanned(
                         p,
@@ -920,10 +966,31 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .into();
                 }
             }
-            other => {
-                return syn::Error::new_spanned(other, "expected `key` or `key = value`")
-                    .to_compile_error()
-                    .into();
+            Meta::List(ml) => {
+                // `key(args)` syntax (e.g. `#[ktstr_test(host_only(false))]`)
+                // — accepted by `syn::Meta` parsing but never valid for
+                // `#[ktstr_test]`. Emit a targeted message naming the
+                // attribute so the fix (`= value` or bare) is obvious,
+                // rather than the generic Meta dispatch above. Multi-segment
+                // paths (`crate::host_only(false)`) cannot resolve against
+                // the attribute table either way, so route those to the
+                // shared multi-segment diagnostic instead of producing a
+                // nonsense `crate :: host_only = value` suggestion.
+                let path_ident = match ml.path.get_ident() {
+                    Some(id) => id.to_string(),
+                    None => return multi_segment_attr_error(&ml.path),
+                };
+                return syn::Error::new_spanned(
+                    &ml.path,
+                    format!(
+                        "unexpected parenthesised arguments on `{path_ident}`; \
+                         use `{path_ident} = value` for value attributes or bare \
+                         `{path_ident}` for bool attributes ({})",
+                        BOOL_ATTR_NAMES.join(", "),
+                    ),
+                )
+                .to_compile_error()
+                .into();
             }
         }
     }
@@ -936,9 +1003,10 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     // to verify at macro expansion time. Runtime validation can
     // add path-deduplication after `payload`/`workloads` are read
     // back from the registered KtstrTestEntry.
+    let workloads_slice: &[syn::Path] = workloads.as_deref().unwrap_or(&[]);
     if let Some(primary) = payload.as_ref() {
         let primary_repr = primary.to_token_stream().to_string();
-        for w in &workloads {
+        for w in workloads_slice {
             if w.to_token_stream().to_string() == primary_repr {
                 return syn::Error::new_spanned(
                     w,
@@ -961,9 +1029,9 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     // as the payload/workloads cross-check: token-string equality
     // catches in-file aliases (`FIO` == `FIO`) but not resolved-path
     // identity (`FIO` vs `crate::FIO`).
-    for (i, wi_path) in workloads.iter().enumerate() {
+    for (i, wi_path) in workloads_slice.iter().enumerate() {
         let wi = wi_path.to_token_stream().to_string();
-        for wj_path in workloads.iter().skip(i + 1) {
+        for wj_path in workloads_slice.iter().skip(i + 1) {
             let wj = wj_path.to_token_stream().to_string();
             if wi == wj {
                 return syn::Error::new_spanned(
@@ -1260,8 +1328,10 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Emit `&'static [&'static Payload]` for workloads. Each path
     // the user supplied is a `const Payload`; we take `&` on each
     // to match the stored type.
-    let workload_refs: Vec<proc_macro2::TokenStream> =
-        workloads.iter().map(|p| quote! { &#p }).collect();
+    let workload_refs: Vec<proc_macro2::TokenStream> = workloads_slice
+        .iter()
+        .map(|p| quote! { &#p })
+        .collect();
     let workloads_tokens = quote! { &[#(#workload_refs),*] };
 
     // Conditionally-emitted KtstrTestEntry fields. Each block is
@@ -1275,12 +1345,12 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         quote! {}
     };
-    let payload_field = if payload_set {
+    let payload_field = if payload.is_some() {
         quote! { payload: #payload_tokens, }
     } else {
         quote! {}
     };
-    let workloads_field = if workloads_set {
+    let workloads_field = if workloads.is_some() {
         quote! { workloads: #workloads_tokens, }
     } else {
         quote! {}

@@ -195,6 +195,44 @@ example.
 See [Performance Mode](../concepts/performance-mode.md) for details on
 what `performance_mode` enables, prerequisites, and validation behavior.
 
+### Attribute syntax rules
+
+Each attribute KEY may appear at most once per `#[ktstr_test]`
+invocation; duplicate keys (whether the values match or differ) fail
+at expansion rather than silently letting the later value win.
+List values like `workloads = [FIO, FIO]` are NOT affected by this
+rule — the duplicate check is on attribute keys, not on values
+within an array.
+
+| Form | Result |
+|---|---|
+| `#[ktstr_test(host_only = false, host_only)]` | ``error: duplicate attribute `host_only` — each attribute may appear at most once on a single `#[ktstr_test]` invocation`` |
+| `#[ktstr_test(llcs = 4, llcs = 8)]` | ``error: duplicate attribute `llcs` ...`` |
+| `#[ktstr_test(payload = FIO, payload = STRESS_NG)]` | ``error: duplicate `payload = ...` — each test declares at most one primary payload; extras belong in `workloads = [..]` `` |
+| `#[ktstr_test(workloads = [FIO], workloads = [STRESS_NG])]` | ``error: duplicate `workloads = [...]` — combine all entries into a single array`` |
+| `#[ktstr_test(config = "...", config = OTHER)]` | ``error: duplicate `config = ...` — each test declares at most one inline scheduler config`` |
+| `#[ktstr_test(expect_scx_bpf_error_contains = "a", expect_scx_bpf_error_contains = "b")]` | ``error: duplicate `expect_scx_bpf_error_contains = ...` — each test declares at most one literal matcher`` |
+| `#[ktstr_test(expect_scx_bpf_error_matches = "a", expect_scx_bpf_error_matches = "b")]` | ``error: duplicate `expect_scx_bpf_error_matches = ...` — each test declares at most one regex matcher`` |
+
+The bare form (`host_only`) and explicit form (`host_only = true`) of
+the same attribute collide — they refer to the same slot, so
+`host_only = false, host_only` fails the duplicate check on the key,
+regardless of which value each form supplies.
+
+Two non-key/non-value `Meta` forms are also rejected at the attribute
+arm, before duplicate detection runs. Multi-segment paths
+(`crate::host_only`) fail whether they appear as bare attributes, as
+keys in `key = value`, or as the head of a `key(args)` form — all
+three route to the same diagnostic so the operator sees one combined
+error rather than chasing two.
+
+| Form | Result |
+|---|---|
+| `#[ktstr_test(crate::host_only)]` (multi-segment path, bare) | ``error: unexpected multi-segment path `crate :: host_only` — `#[ktstr_test]` accepts either `key = value` ... or the bare single-segment form for bool attributes (...)`` |
+| `#[ktstr_test(crate::host_only = true)]` (multi-segment path as key) | same as above |
+| `#[ktstr_test(host_only(false))]` (parenthesised arguments) | ``error: unexpected parenthesised arguments on `host_only`; use `host_only = value` for value attributes or bare `host_only` for bool attributes (...)`` |
+| `#[ktstr_test(crate::host_only(false))]` (multi-segment + parenthesised) | same as the multi-segment-path message — the single-segment requirement bails before the parenthesised-form check |
+
 ## Inline scheduler config
 
 Some schedulers (e.g. `scx_layered`, `scx_lavd`) accept a JSON config
