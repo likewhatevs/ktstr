@@ -6248,4 +6248,157 @@ mod tests {
             success_gated + 1,
         );
     }
+
+    // -- scx_bpf_error matcher dispatch wiring --
+
+    /// Pin the production wiring that surfaces
+    /// `expect_scx_bpf_error_contains` / `_matches` failures through
+    /// the test verdict. Three load-bearing source-level invariants:
+    ///
+    /// 1. `merged_assert.evaluate_scx_bpf_error_match(&matcher_corpus,
+    ///    entry.expect_err)` is dispatched from
+    ///    [`evaluate_vm_result`] (the only production caller; the
+    ///    matcher-fn itself lives on `Assert`).
+    /// 2. The dispatch is gated by `if matcher_configured` so the
+    ///    common no-matcher path does not allocate the corpus
+    ///    string for every test.
+    /// 3. When the matcher contributes a mismatch detail, the
+    ///    returned `anyhow::Error` is wrapped with
+    ///    [`ScxBpfErrorMatcherMismatch`] as `.context()`. The
+    ///    dispatch-time `expect_err` inversion checks for this
+    ///    marker via downcast and bypasses the failure-to-pass
+    ///    inversion (see [`crate::test_support::dispatch`]) — a
+    ///    reproducer with a matcher mismatch fails the test even
+    ///    when `expect_err = true`.
+    ///
+    /// A regression that:
+    ///   - removes the `evaluate_scx_bpf_error_match` dispatch →
+    ///     the matcher never runs; configured matchers produce zero
+    ///     details; `matcher_mismatch` stays false; `expect_err`
+    ///     inversion turns every Err into a pass, silently making
+    ///     positive-matcher tests vacuous.
+    ///   - hardcodes `matcher_configured = false` or removes the
+    ///     `if matcher_configured` gate → matcher_details stays
+    ///     `Vec::new()`; same vacuous outcome as above.
+    ///   - removes `err.context(ScxBpfErrorMatcherMismatch)` or
+    ///     removes the `matcher_mismatch` gate around it → the
+    ///     marker is never attached; `expect_err = true` reproducers
+    ///     would invert matcher-mismatch failures into passes.
+    ///
+    /// Interim source-pattern coverage; the proper E2E coverage
+    /// belongs in an `evaluate_vm_result` mock harness.
+    /// Fragile to source refactors: if production code wraps the
+    /// dispatch in a helper function, or spells the matcher fn /
+    /// marker type differently, this test fails even when the
+    /// wiring's semantics are preserved. Update the patterns or
+    /// migrate to the E2E mock harness in that case.
+    #[test]
+    fn matcher_dispatch_and_mismatch_marker_wiring_pinned() {
+        let src = include_str!("eval.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let test_fn_marker = "fn matcher_dispatch_and_mismatch_marker_wiring_pinned";
+        let scan_end = lines
+            .iter()
+            .position(|l| l.contains(test_fn_marker))
+            .expect("test fn must exist (it's this test)");
+        // Collect production sites of a needle, excluding both the
+        // test body (via scan_end) and the test's preceding docstring
+        // lines (which cite production identifiers verbatim).
+        let find_sites = |needle: &str| -> Vec<usize> {
+            lines
+                .iter()
+                .enumerate()
+                .take(scan_end)
+                .filter_map(|(i, l)| {
+                    // Skip all line comments (`//`, `///`, `//!`).
+                    // Production code is never a line-comment line;
+                    // excluding them avoids false-positive counts
+                    // from the test's docstring (citing production
+                    // identifiers verbatim) and from any future
+                    // `//` regular comment that mentions a needle.
+                    if l.trim_start().starts_with("//") {
+                        return None;
+                    }
+                    l.contains(needle).then_some(i)
+                })
+                .collect()
+        };
+        // Assert a production site's 8-line lookback contains the
+        // expected gate keyword. 8 lines is enough to capture
+        // surrounding `if let`-style binding plus comments.
+        let assert_gated = |site: usize, label: &str, gate: &str| {
+            let window = lines[site.saturating_sub(8)..=site].join("\n");
+            assert!(
+                window.contains(gate),
+                "{label} (line {}) must be gated by `{gate}`; \
+                 8-line lookback window:\n{window}",
+                site + 1,
+            );
+        };
+        // Assert a needle has exactly one production occurrence and
+        // return the line index. Used 4x — extract to DRY the
+        // cardinality-check + iterator-to-1-based-line diagnostic.
+        let assert_unique = |sites: &[usize], label: &str| -> usize {
+            assert_eq!(
+                sites.len(),
+                1,
+                "expected exactly 1 {label} site; found {} at lines {:?}",
+                sites.len(),
+                sites.iter().map(|i| i + 1).collect::<Vec<_>>(),
+            );
+            sites[0]
+        };
+        let dispatch_site = assert_unique(
+            &find_sites("merged_assert.evaluate_scx_bpf_error_match("),
+            "matcher dispatch",
+        );
+        assert_gated(dispatch_site, "matcher dispatch", "if matcher_configured");
+        // Pin the inversion-arg pass-through so a regression that
+        // hardcodes `true`/`false` for entry.expect_err (compile-OK,
+        // runtime regression) is caught.
+        assert!(
+            lines[dispatch_site].contains("entry.expect_err"),
+            "matcher dispatch (line {}) must forward `entry.expect_err` to drive \
+             the inversion check; line: {}",
+            dispatch_site + 1,
+            lines[dispatch_site],
+        );
+        let marker_site = assert_unique(
+            &find_sites("err.context(ScxBpfErrorMatcherMismatch)"),
+            "marker attach",
+        );
+        assert_gated(marker_site, "marker attach", "if matcher_mismatch");
+        // Catch the "hardcoded false" regression class for both
+        // gate flags: the lookback assertion only checks that the
+        // gate keyword appears in source. A regression that leaves
+        // the gate intact but hardcodes the flag to `false` (e.g.
+        // `let matcher_configured = false;`) would silently bypass
+        // the matcher dispatch / marker attach. Pin the assignment
+        // shape so the derivation from runtime state is preserved.
+        let configured_site = assert_unique(
+            &find_sites("let matcher_configured ="),
+            "`let matcher_configured =` assignment",
+        );
+        // 3-line window covers production's multi-line `X.is_some()
+        // || Y.is_some()` RHS at eval.rs:2020-2021.
+        let configured_window =
+            lines[configured_site..=configured_site.saturating_add(2).min(scan_end - 1)].join("\n");
+        assert!(
+            configured_window.contains("expect_scx_bpf_error_contains.is_some()")
+                && configured_window.contains("expect_scx_bpf_error_matches.is_some()"),
+            "matcher_configured must derive from the matcher fields' \
+             `.is_some()` checks, not a hardcoded literal; assignment window:\n\
+             {configured_window}",
+        );
+        let mismatch_site = assert_unique(
+            &find_sites("let matcher_mismatch ="),
+            "`let matcher_mismatch =` assignment",
+        );
+        let mismatch_line = lines[mismatch_site];
+        assert!(
+            mismatch_line.contains("matcher_details.is_empty()"),
+            "matcher_mismatch must derive from `matcher_details.is_empty()`, \
+             not a hardcoded literal; assignment line: {mismatch_line}",
+        );
+    }
 }
