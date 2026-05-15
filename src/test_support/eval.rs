@@ -6249,6 +6249,163 @@ mod tests {
         );
     }
 
+    /// Pin `bug_summary_line()` as positional arg 2 — immediately
+    /// after `fingerprint_line` — in every failure-message
+    /// `format!()` call. The 4 failure paths in `evaluate_vm_result`
+    /// (assert-fail, monitor-fail, timeout, no-result) each render
+    /// their stderr message via a `format!()` whose first two
+    /// positionals are `fingerprint_line` then `bug_summary_line()`,
+    /// so the operator scanning a CI log sees the BUG SUMMARY at
+    /// the top of the error block where the eye stops on the first
+    /// few lines. A regression that swaps the order, drops the
+    /// call, or moves it past `entry.name`/`topo` would push the
+    /// BUG SUMMARY below the test-name / topology line — exactly
+    /// the location the redesign moved it out of.
+    ///
+    /// Fragile to source refactors: a refactor that wraps the
+    /// failure-message format!() blocks in a helper function would
+    /// drop the per-site positional check. In that case, the
+    /// helper itself takes both args by position; update this test
+    /// to walk the helper's `format!()` instead.
+    #[test]
+    fn bug_summary_line_immediately_follows_fingerprint_line_in_all_failure_messages() {
+        let src = include_str!("eval.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        // Stop at this test's own fn so the include_str! self-
+        // reference doesn't double-count the literal pattern below.
+        let test_fn_marker =
+            "fn bug_summary_line_immediately_follows_fingerprint_line_in_all_failure_messages";
+        let scan_end = lines
+            .iter()
+            .position(|l| l.contains(test_fn_marker))
+            .expect("test fn must exist (it's this test)");
+        // Find every line that is exactly `fingerprint_line,`
+        // (trimmed). The 4 failure-message format!() sites all
+        // pass `fingerprint_line` then `bug_summary_line()` on the
+        // next non-empty line. The single binding site
+        // (`let fingerprint_line = ...`) does not trim to
+        // `fingerprint_line,`, so it's excluded naturally.
+        let fingerprint_arg_lines: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .take(scan_end)
+            .filter_map(|(i, l)| (l.trim() == "fingerprint_line,").then_some(i))
+            .collect();
+        let display_lines: Vec<usize> = fingerprint_arg_lines.iter().map(|i| i + 1).collect();
+        assert_eq!(
+            fingerprint_arg_lines.len(),
+            4,
+            "expected exactly 4 failure-message format!() sites passing \
+             `fingerprint_line,` as a positional argument (assert-fail, \
+             monitor-fail, timeout, no-result paths); found {} at lines {:?}. \
+             If a 5th failure path was added, extend this test; if a path was \
+             removed, update the expected count.",
+            fingerprint_arg_lines.len(),
+            display_lines,
+        );
+        for &i in &fingerprint_arg_lines {
+            let next = lines
+                .get(i + 1)
+                .unwrap_or_else(|| panic!("no line after fingerprint_line, at {}", i + 1));
+            assert_eq!(
+                next.trim(),
+                "bug_summary_line(),",
+                "failure-message format!() at eval.rs:{} passes `fingerprint_line,` \
+                 but the next positional argument is `{}` (trimmed), not \
+                 `bug_summary_line(),`. The BUG SUMMARY must render at the top \
+                 of every failure message so it surfaces above the test-name / \
+                 topology line in CI logs.",
+                i + 1,
+                next.trim(),
+            );
+            // Arg-list order alone is insufficient: a regression could
+            // rearrange the format-string positional indices (e.g.
+            // `"{4}{0}{1}..."`) and silently render topo at the top
+            // while leaving `fingerprint_line,` + `bug_summary_line(),`
+            // as args 0+1 in the call. Walk back from the
+            // `fingerprint_line,` arg line to the format-string
+            // literal (the previous non-empty source line) and assert
+            // it starts with `"{}{}` (default positional indices for
+            // args 0 and 1, in order). This pins rendered-output
+            // order — the load-bearing invariant — not just call
+            // order.
+            let fmt_line_idx = (0..i)
+                .rev()
+                .find(|&k| !lines[k].trim().is_empty())
+                .unwrap_or(0);
+            let trimmed = lines[fmt_line_idx].trim();
+            assert!(
+                trimmed.starts_with("\"{}{}"),
+                "failure-message format!() at eval.rs:{} passes `fingerprint_line,` \
+                 then `bug_summary_line(),` as args 0+1, but the preceding format \
+                 string literal at eval.rs:{} (`{}`) does NOT start with `\"{{}}{{}}` \
+                 (default positional indices for args 0+1 in order). A regression \
+                 that reordered the format-string indices (e.g. `\"{{2}}{{0}}{{1}}...\"`) \
+                 would render the BUG SUMMARY below the test-name / topology line \
+                 even though the args list still threads `bug_summary_line()` as \
+                 the second positional.",
+                i + 1,
+                fmt_line_idx + 1,
+                trimmed,
+            );
+        }
+    }
+
+    /// Pin the literal `BUG SUMMARY:` prefix in BOTH arms of the
+    /// `bug_summary_line` closure (ANSI-colored at eval.rs:1912
+    /// and plain at eval.rs:1914). CI log greps and downstream
+    /// parsers key on the post-ANSI-strip byte sequence
+    /// `BUG SUMMARY:`; a regression that renamed the prefix
+    /// (e.g. `BPF ERROR:`, `BUG_SUMMARY:`, dropped the colon)
+    /// would silently break those consumers while the positional
+    /// pin above passes. Scoping the source-scan to the closure
+    /// body — from the `let bug_summary_line = || -> String {`
+    /// opener to its matching `};` — isolates both arms from
+    /// (a) the test's own docstring (which contains the literal
+    /// for explanatory purposes), (b) sibling tests that assert
+    /// `reason.contains("BUG SUMMARY:")` on synthesized output,
+    /// and (c) any future code that mentions the prefix without
+    /// rendering it.
+    #[test]
+    fn bug_summary_line_renders_bug_summary_prefix_in_both_arms() {
+        let src = include_str!("eval.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let opener_idx = lines
+            .iter()
+            .position(|l| l.contains("let bug_summary_line = || -> String {"))
+            .expect(
+                "bug_summary_line closure opener `let bug_summary_line = || -> String {` \
+                 must exist in eval.rs",
+            );
+        let closer_idx = lines
+            .iter()
+            .enumerate()
+            .skip(opener_idx + 1)
+            .find(|(_, l)| l.trim() == "};")
+            .map(|(i, _)| i)
+            .expect("bug_summary_line closure must close with `};` on its own line");
+        let body = &lines[opener_idx..=closer_idx];
+        let prefix_lines: Vec<usize> = body
+            .iter()
+            .enumerate()
+            .filter_map(|(off, l)| l.contains("BUG SUMMARY:").then_some(opener_idx + off + 1))
+            .collect();
+        assert_eq!(
+            prefix_lines.len(),
+            2,
+            "expected the literal `BUG SUMMARY:` prefix to appear EXACTLY twice in \
+             the `bug_summary_line` closure body (eval.rs:{}-{}): once in the \
+             ANSI-colored arm and once in the plain arm. Found {} occurrence(s) \
+             at lines {:?}. A regression that renamed either arm's prefix (e.g. \
+             `BPF ERROR:`, `BUG_SUMMARY:`, dropped the colon) would break the \
+             post-ANSI-strip byte sequence that downstream CI log parsers grep for.",
+            opener_idx + 1,
+            closer_idx + 1,
+            prefix_lines.len(),
+            prefix_lines,
+        );
+    }
+
     // -- scx_bpf_error matcher dispatch wiring --
 
     /// Pin the production wiring that surfaces
