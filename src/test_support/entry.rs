@@ -1077,6 +1077,37 @@ impl KtstrTestEntry {
                 self.name,
             );
         }
+        // Defense-in-depth for the programmatic-construction path
+        // (struct-literal `KtstrTestEntry { .. }` in integration tests,
+        // gauntlet-rewritten entries). The macro at
+        // ktstr-macros/src/lib.rs rejects `host_only = true` paired with
+        // any `scheduler = ...` attribute at compile time, but
+        // programmatic construction bypasses that gate. Match against
+        // `SchedulerSpec::Eevdf` (the value-level marker for the
+        // no-scx-scheduler placeholder) so a struct literal that sets
+        // `scheduler: &SOME_REAL_SCHED` under host_only is caught while
+        // the default `scheduler: &Scheduler::EEVDF` (whose binary is
+        // `SchedulerSpec::Eevdf`) is accepted. The variant-based check
+        // is spec-safe — unlike a pointer-identity check against
+        // `&Scheduler::EEVDF`, which depends on rustc/LLVM's const-
+        // deduplication of `&CONST_EXPR` materializations.
+        if self.host_only
+            && !matches!(
+                self.scheduler.binary,
+                crate::test_support::SchedulerSpec::Eevdf
+            )
+        {
+            anyhow::bail!(
+                "KtstrTestEntry '{}'.host_only=true with scheduler=&{:?} — \
+                 host_only skips the VM boot that owns the scheduler \
+                 lifecycle, so the declared scheduler would never attach. \
+                 Drop one of host_only or scheduler; the host's \
+                 currently-active scheduler (default EEVDF when none is \
+                 loaded) runs the test under host_only.",
+                self.name,
+                self.scheduler.name,
+            );
+        }
         if self.performance_mode && self.no_perf_mode {
             anyhow::bail!(
                 "KtstrTestEntry '{}'.performance_mode=true with \

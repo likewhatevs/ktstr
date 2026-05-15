@@ -1,0 +1,7 @@
+error: expect_scx_bpf_error_contains/matches without expect_err = true are mutually exclusive — an scx_bpf_error matcher narrows which failure counts as the expected bug and only applies to expected-error tests. Drop the matcher (if you want any failure to count) or set expect_err = true (if you want this specific error to be the expected bug). The runtime check at entry.rs::validate enforces the same invariant for programmatic-construction paths that bypass the macro.
+ --> tests/compile_fail/ktstr_test_expect_scx_bpf_error_without_expect_err.rs:8:1
+  |
+8 | #[ktstr_test(expect_scx_bpf_error_contains = "out of range")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)

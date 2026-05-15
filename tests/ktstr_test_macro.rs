@@ -173,7 +173,11 @@ fn entry_bare_mixed_bool_attrs() {
 // regression in any arm gets caught by `cargo test --test ktstr_test_macro`.
 // ---------------------------------------------------------------------------
 
-#[ktstr_test(auto_repro, host_only = true)]
+// Cannot pair bare `auto_repro` with `host_only = true` — the macro's
+// auto_repro-vs-host_only mutex check (lib.rs) rejects the combo at
+// compile time. Omit host_only here; this fixture only registers an
+// entry that the test below looks up via find_test, never invokes.
+#[ktstr_test(auto_repro)]
 fn bare_auto_repro_compile(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
@@ -823,10 +827,14 @@ ktstr::declare_scheduler!(CFG_PAIRING_SCHED, {
 
 /// Inline-literal form: `config = "..."` lands as `Some("...")` in the
 /// emitted entry's `config_content` field, paired with a scheduler that
-/// declares `config_file_def`.
+/// declares `config_file_def`. Fixture registers an entry that
+/// `entry_config_literal_propagates` looks up via `find_test`; the
+/// fixture body itself is never invoked because there's no test runner
+/// that selects it by name in this file's #[test] set. Omitting
+/// `host_only = true` here keeps the entry compile-time-clean against
+/// the macro's host_only-scheduler mutex check.
 #[ktstr_test(
     scheduler = CFG_PAIRING_SCHED,
-    host_only = true,
     config = "{\"layers\":[]}",
 )]
 fn config_literal_compiles(ctx: &Ctx) -> Result<AssertResult> {
@@ -842,7 +850,6 @@ const PATH_CONFIG: &str = "{\"path\":true}";
 
 #[ktstr_test(
     scheduler = CFG_PAIRING_SCHED,
-    host_only = true,
     config = PATH_CONFIG,
 )]
 fn config_path_compiles(ctx: &Ctx) -> Result<AssertResult> {

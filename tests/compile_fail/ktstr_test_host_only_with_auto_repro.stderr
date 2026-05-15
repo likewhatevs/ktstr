@@ -1,0 +1,7 @@
+error: host_only = true and auto_repro = true are mutually exclusive — host_only skips the VM boot that owns the auto-repro machinery (probe re-launch under the failing scheduler in a second VM), so auto_repro would silently no-op. Drop one of host_only or auto_repro = true; host_only tests cannot trigger an automatic reproducer because there is no VM to relaunch.
+ --> tests/compile_fail/ktstr_test_host_only_with_auto_repro.rs:3:1
+  |
+3 | #[ktstr_test(host_only = true, auto_repro = true)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)

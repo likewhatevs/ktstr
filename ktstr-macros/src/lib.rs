@@ -1141,6 +1141,92 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error()
         .into();
     }
+    // `host_only = true` short-circuits the VM-boot pipeline before
+    // any of the VM-only features fire. Catch attribute combinations
+    // where the user pairs `host_only = true` with attributes that
+    // require the VM to exist — the runtime would silently no-op the
+    // VM-only side, leaving the user wondering why the scheduler/
+    // snapshot/auto-repro behavior they declared never runs. Promote
+    // to compile-time so the conflict surfaces at edit-compile time
+    // rather than at test-run time.
+    //
+    // Defense-in-depth coverage matrix (compile-time here +
+    // programmatic-construction runtime check in
+    // `src/test_support/entry.rs::validate`):
+    //   - host_only + disk         : runtime-only (macro doesn't
+    //                                 expose `disk` attribute)
+    //   - host_only + scheduler    : BOTH (runtime matches against
+    //                                 `SchedulerSpec::Eevdf` variant —
+    //                                 spec-safe value comparison vs
+    //                                 fragile pointer-identity on
+    //                                 `&CONST_EXPR`)
+    //   - host_only + num_snapshots: BOTH (runtime checks
+    //                                 `num_snapshots > 0`)
+    //   - host_only + auto_repro   : compile-time-only (auto_repro
+    //                                 defaults to `true`, and the
+    //                                 entry struct lacks provenance
+    //                                 for "user explicitly set" vs
+    //                                 "default applied"; runtime
+    //                                 cannot tell whether the
+    //                                 conflict is intentional)
+    //   - matcher + expect_err=false: BOTH (runtime check fires on
+    //                                 omitted-default expect_err too)
+    if host_only_set && host_only && scheduler.is_some() {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "host_only = true and a `scheduler = ...` attribute are mutually \
+             exclusive — host_only skips the VM boot that owns the scheduler \
+             lifecycle, so the declared scheduler would never attach. Drop \
+             one of host_only or scheduler; the host's currently-active \
+             scheduler (default EEVDF when none is loaded) runs the test \
+             under host_only.",
+        )
+        .to_compile_error()
+        .into();
+    }
+    if host_only_set && host_only && num_snapshots_set && num_snapshots > 0 {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "host_only = true and num_snapshots > 0 are mutually exclusive — \
+             host_only skips the VM boot that owns the qcow2 snapshot \
+             lifecycle, so the declared snapshots would never be taken. \
+             Drop one of host_only or num_snapshots; host_only tests run \
+             once and produce no snapshots.",
+        )
+        .to_compile_error()
+        .into();
+    }
+    if host_only_set && host_only && auto_repro_set && auto_repro {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "host_only = true and auto_repro = true are mutually exclusive — \
+             host_only skips the VM boot that owns the auto-repro \
+             machinery (probe re-launch under the failing scheduler in a \
+             second VM), so auto_repro would silently no-op. Drop one of \
+             host_only or auto_repro = true; host_only tests cannot trigger \
+             an automatic reproducer because there is no VM to relaunch.",
+        )
+        .to_compile_error()
+        .into();
+    }
+    if (expect_scx_bpf_error_contains_tokens.is_some()
+        || expect_scx_bpf_error_matches_tokens.is_some())
+        && !expect_err
+    {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "expect_scx_bpf_error_contains/matches without expect_err = true \
+             are mutually exclusive — an scx_bpf_error matcher narrows \
+             which failure counts as the expected bug and only applies to \
+             expected-error tests. Drop the matcher (if you want any failure \
+             to count) or set expect_err = true (if you want this specific \
+             error to be the expected bug). The runtime check at \
+             entry.rs::validate enforces the same invariant for \
+             programmatic-construction paths that bypass the macro.",
+        )
+        .to_compile_error()
+        .into();
+    }
     // Validate explicitly set constraint values. When a field is
     // inherited from the scheduler, the proc macro doesn't know the
     // value so cross-field validation is deferred to runtime.

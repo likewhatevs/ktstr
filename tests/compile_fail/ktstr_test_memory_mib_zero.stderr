@@ -2,6 +2,6 @@ error: memory_mib must be > 0 (a VM with zero memory cannot boot)
  --> tests/compile_fail/ktstr_test_memory_mib_zero.rs:3:1
   |
 3 | #[ktstr_test(memory_mib = 0)]
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   |
   = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)

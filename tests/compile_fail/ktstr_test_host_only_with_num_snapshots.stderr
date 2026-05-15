@@ -1,0 +1,7 @@
+error: host_only = true and num_snapshots > 0 are mutually exclusive — host_only skips the VM boot that owns the qcow2 snapshot lifecycle, so the declared snapshots would never be taken. Drop one of host_only or num_snapshots; host_only tests run once and produce no snapshots.
+ --> tests/compile_fail/ktstr_test_host_only_with_num_snapshots.rs:3:1
+  |
+3 | #[ktstr_test(host_only = true, num_snapshots = 3)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)
