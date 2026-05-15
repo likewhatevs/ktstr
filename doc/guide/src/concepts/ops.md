@@ -156,6 +156,38 @@ let def = CgroupDef::named("cg_0")
   every WorkSpec. Merged at apply-setup time.
 - `.swappable(bool)` -- opt into gauntlet work type override.
 
+#### Example: cpuset-scaled worker count
+
+Tests that span topologies need worker counts that scale with the
+cpuset. Hand-computing the count from `ctx.topo` works but couples
+the test to the topology shape:
+
+```rust,ignore
+// Before: hand-computed via Ctx::cpuset_cpus
+// (couples the test to a manual resolution step).
+let n_workers =
+    (ctx.cpuset_cpus(&CpusetSpec::Llc(0)) as f64 * 0.9).ceil() as usize;
+let def = CgroupDef::named("cg_hot")
+    .with_cpuset(CpusetSpec::Llc(0))
+    .workers(n_workers);
+```
+
+`workers_pct(p)` expresses the same intent declaratively; the
+framework resolves the count from the cgroup's cpuset at apply-setup
+time using `ceil(cpuset_cpus * p)` and the test stays independent
+of the underlying topology:
+
+```rust,ignore
+// After: framework computes the count from the resolved cpuset
+let def = CgroupDef::named("cg_hot")
+    .with_cpuset(CpusetSpec::Llc(0))
+    .workers_pct(0.9);  // ceil(N_CPUs * 0.9) workers
+```
+
+Both `workers(n)` and `workers_pct(p)` cannot coexist on the same
+`WorkSpec`; the apply-setup path rejects the dual-set with an
+actionable diagnostic.
+
 #### Cgroup controllers
 
 The cgroup-v2 cpu / memory / io / pids controllers are exposed as
