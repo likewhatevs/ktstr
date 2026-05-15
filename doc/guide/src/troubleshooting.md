@@ -239,7 +239,7 @@ complete failure output format and auto-repro walkthrough.
 ## send_sys_rdy timeout
 
 ```text
-WARN ktstr::vmm::rust_init: ktstr-init: send_sys_rdy retry budget exhausted (10000 ms, 1 vCPUs)
+WARN ktstr::vmm::rust_init: ktstr-init: send_sys_rdy retry budget exhausted (10000 ms, 1 vCPUs); see doc/guide/src/troubleshooting.md#send_sys_rdy-timeout for tuning
 ```
 
 The placeholders `(NNNNN ms, V vCPUs)` are the rendered budget (in

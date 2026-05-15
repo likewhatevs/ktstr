@@ -681,7 +681,8 @@ pub(crate) fn ktstr_guest_init() -> ! {
             // after `redirect_stdio_to_bulk_port` runs later, fd 2
             // is a pipe drained into the bulk port forwarder.
             tracing::warn!(
-                "ktstr-init: send_sys_rdy retry budget exhausted ({} ms, {} vCPUs)",
+                "ktstr-init: send_sys_rdy retry budget exhausted ({} ms, {} vCPUs); \
+                 see doc/guide/src/troubleshooting.md#send_sys_rdy-timeout for tuning",
                 budget_ms,
                 vcpus
             );
