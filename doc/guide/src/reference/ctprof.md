@@ -71,7 +71,7 @@ extension: `.ctprof.zst`).
   `thread_deallocated`) read via ptrace + `process_vm_readv` —
   populated only for processes linked against jemalloc; glibc
   arena counters are opaque and read as zero rather than failing
-  capture. `smaps_rollup_kb` (per-process map of the kernel's
+  capture. `smaps_rollup_kib` (per-process map of the kernel's
   `/proc/<tid>/smaps_rollup` keys, populated leader-only).
 - **I/O** — `rchar`, `wchar`, `syscr`, `syscw`, `read_bytes`,
   `write_bytes`, `cancelled_write_bytes` from `/proc/<tid>/io`

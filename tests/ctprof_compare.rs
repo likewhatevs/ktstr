@@ -1051,7 +1051,7 @@ fn nr_threads_leader_dedup_aggregates_via_max_on_leader_value() {
 }
 
 /// End-to-end smaps_rollup compare: stage two snapshots, each
-/// with a leader thread carrying a populated `smaps_rollup_kb`
+/// with a leader thread carrying a populated `smaps_rollup_kib`
 /// map. Run compare → write_diff and assert the rendered
 /// output carries the `## smaps_rollup` header AND the
 /// scaled-byte values for the keys that changed.
@@ -1075,14 +1075,14 @@ fn compare_smaps_rollup_renders_header_and_scaled_byte_values() {
     let mut baseline_leader = make_thread("worker", "worker");
     baseline_leader.tid = 4242;
     baseline_leader.tgid = 4242;
-    baseline_leader.smaps_rollup_kb.insert("Rss".into(), 4096);
-    baseline_leader.smaps_rollup_kb.insert("Pss".into(), 1024);
+    baseline_leader.smaps_rollup_kib.insert("Rss".into(), 4096);
+    baseline_leader.smaps_rollup_kib.insert("Pss".into(), 1024);
 
     let mut candidate_leader = make_thread("worker", "worker");
     candidate_leader.tid = 4242;
     candidate_leader.tgid = 4242;
-    candidate_leader.smaps_rollup_kb.insert("Rss".into(), 4096);
-    candidate_leader.smaps_rollup_kb.insert("Pss".into(), 2048);
+    candidate_leader.smaps_rollup_kib.insert("Rss".into(), 4096);
+    candidate_leader.smaps_rollup_kib.insert("Pss".into(), 2048);
 
     let baseline = snapshot(vec![baseline_leader], BTreeMap::new());
     let candidate = snapshot(vec![candidate_leader], BTreeMap::new());
@@ -1175,8 +1175,8 @@ fn compare_smaps_rollup_suppresses_section_when_all_unchanged() {
     let mut leader = make_thread("worker", "worker");
     leader.tid = 4242;
     leader.tgid = 4242;
-    leader.smaps_rollup_kb.insert("Rss".into(), 4096);
-    leader.smaps_rollup_kb.insert("Pss".into(), 1024);
+    leader.smaps_rollup_kib.insert("Rss".into(), 4096);
+    leader.smaps_rollup_kib.insert("Pss".into(), 1024);
 
     // Baseline AND candidate both carry IDENTICAL smaps_rollup
     // values — every (process, key) pair is unchanged.

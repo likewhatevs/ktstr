@@ -2673,8 +2673,8 @@ mod tests {
             t.tgid = tgid;
             t.pcomm = pcomm.to_string();
             t.comm = pcomm.to_string();
-            t.smaps_rollup_kb.insert("Rss".into(), rss);
-            t.smaps_rollup_kb.insert("Pss".into(), rss / 2);
+            t.smaps_rollup_kib.insert("Rss".into(), rss);
+            t.smaps_rollup_kib.insert("Pss".into(), rss / 2);
             snap.threads.push(t);
         }
 
@@ -2738,7 +2738,7 @@ mod tests {
             t.tgid = tgid;
             t.pcomm = pcomm.to_string();
             t.comm = pcomm.to_string();
-            t.smaps_rollup_kb.insert("Rss".into(), rss);
+            t.smaps_rollup_kib.insert("Rss".into(), rss);
             snap.threads.push(t);
         }
 
@@ -2792,8 +2792,8 @@ mod tests {
         bash.tgid = 1;
         bash.pcomm = "bash".to_string();
         bash.comm = "bash".to_string();
-        bash.smaps_rollup_kb.insert("Rss".into(), 100 * 1024);
-        bash.smaps_rollup_kb.insert("Pss".into(), 50 * 1024);
+        bash.smaps_rollup_kib.insert("Rss".into(), 100 * 1024);
+        bash.smaps_rollup_kib.insert("Pss".into(), 50 * 1024);
         snap.threads.push(bash);
         // zulu: 1 MiB Rss only — much smaller, but
         // alphabetically AFTER bash.
@@ -2802,8 +2802,8 @@ mod tests {
         zulu.tgid = 2;
         zulu.pcomm = "zulu".to_string();
         zulu.comm = "zulu".to_string();
-        zulu.smaps_rollup_kb.insert("Rss".into(), 1024);
-        zulu.smaps_rollup_kb.insert("Pss".into(), 512);
+        zulu.smaps_rollup_kib.insert("Rss".into(), 1024);
+        zulu.smaps_rollup_kib.insert("Pss".into(), 512);
         snap.threads.push(zulu);
 
         let mut out = String::new();

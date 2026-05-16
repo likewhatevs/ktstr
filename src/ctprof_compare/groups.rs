@@ -140,7 +140,7 @@ fn collect_smaps_rollup_inner(
 ) -> BTreeMap<String, BTreeMap<String, u64>> {
     let mut out: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
     for t in &snap.threads {
-        if t.smaps_rollup_kb.is_empty() {
+        if t.smaps_rollup_kib.is_empty() {
             continue;
         }
         let pcomm_key = if no_thread_normalize {

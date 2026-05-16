@@ -763,15 +763,15 @@ fn write_diff_smaps_literal_mode_renders_pcomm_tgid_keys() {
     let mut leader_a = make_thread("worker", "worker");
     leader_a.tid = 4242;
     leader_a.tgid = 4242;
-    leader_a.smaps_rollup_kb.insert("Rss".into(), 4096);
-    leader_a.smaps_rollup_kb.insert("Pss".into(), 1024);
+    leader_a.smaps_rollup_kib.insert("Rss".into(), 4096);
+    leader_a.smaps_rollup_kib.insert("Pss".into(), 1024);
     let snap_a = snap_with(vec![leader_a]);
 
     let mut leader_b = make_thread("worker", "worker");
     leader_b.tid = 4242;
     leader_b.tgid = 4242;
-    leader_b.smaps_rollup_kb.insert("Rss".into(), 4096);
-    leader_b.smaps_rollup_kb.insert("Pss".into(), 2048);
+    leader_b.smaps_rollup_kib.insert("Rss".into(), 4096);
+    leader_b.smaps_rollup_kib.insert("Pss".into(), 2048);
     let snap_b = snap_with(vec![leader_b]);
 
     let opts = CompareOptions {

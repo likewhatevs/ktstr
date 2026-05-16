@@ -1531,17 +1531,17 @@ fn smaps_rollup_bytes_saturating_mul_clamps_at_u64_max() {
     // u64::MAX rather than wrapping. The rendered Bytes
     // wrapper carries u64::MAX so the auto-scale ladder caps
     // at the largest representable byte count.
-    t.smaps_rollup_kb.insert("Rss".into(), u64::MAX);
+    t.smaps_rollup_kib.insert("Rss".into(), u64::MAX);
     // Below-saturation reference value: 4 KiB → 4 * 1024 =
     // 4096 bytes, no saturation.
-    t.smaps_rollup_kb.insert("Pss".into(), 4);
+    t.smaps_rollup_kib.insert("Pss".into(), 4);
     // Lower boundary: 0 kB → 0 bytes.
-    t.smaps_rollup_kb.insert("Shared_Clean".into(), 0);
+    t.smaps_rollup_kib.insert("Shared_Clean".into(), 0);
     // Just below saturation: floor((u64::MAX - 1) / 1024)
     // multiplied by 1024 must NOT saturate. Pick the largest
     // value whose * 1024 conversion fits in u64.
-    let near_max_kb = u64::MAX / 1024;
-    t.smaps_rollup_kb.insert("Anonymous".into(), near_max_kb);
+    let near_max_kib = u64::MAX / 1024;
+    t.smaps_rollup_kib.insert("Anonymous".into(), near_max_kib);
 
     let map: std::collections::BTreeMap<&String, Bytes> = t.smaps_rollup_bytes().collect();
 
@@ -1568,10 +1568,10 @@ fn smaps_rollup_bytes_saturating_mul_clamps_at_u64_max() {
         "0 kB must convert to 0 bytes; got {:?}",
         map[&shared_key],
     );
-    // near_max_kb * 1024 fits inside u64 — no saturation
+    // near_max_kib * 1024 fits inside u64 — no saturation
     // (saturating_mul returns the exact product when it
     // doesn't overflow).
-    let expected_anon = near_max_kb.saturating_mul(1024);
+    let expected_anon = near_max_kib.saturating_mul(1024);
     assert_eq!(
         map[&anon_key],
         Bytes(expected_anon),
@@ -1582,7 +1582,7 @@ fn smaps_rollup_bytes_saturating_mul_clamps_at_u64_max() {
     );
     assert!(
         expected_anon < u64::MAX,
-        "test fixture: near_max_kb * 1024 must NOT saturate \
+        "test fixture: near_max_kib * 1024 must NOT saturate \
          so the boundary distinction is meaningful; got {expected_anon}",
     );
 }

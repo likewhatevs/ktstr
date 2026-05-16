@@ -428,10 +428,10 @@ fn sidecar_variant_hash_excludes_host_context() {
     let populated = HostContext {
         cpu_model: Some("Example CPU".to_string()),
         cpu_vendor: Some("GenuineExample".to_string()),
-        total_memory_kb: Some(16_384_000),
+        total_memory_kib: Some(16_384_000),
         hugepages_total: Some(0),
         hugepages_free: Some(0),
-        hugepages_size_kb: Some(2048),
+        hugepages_size_kib: Some(2048),
         thp_enabled: Some("always [madvise] never".to_string()),
         thp_defrag: Some("[always] defer madvise never".to_string()),
         sched_tunables: None,
@@ -781,10 +781,10 @@ fn sidecar_result_roundtrip_with_populated_host_context() {
     let ctx = HostContext {
         cpu_model: Some("Example CPU".to_string()),
         cpu_vendor: Some("GenuineExample".to_string()),
-        total_memory_kb: Some(16_384_000),
+        total_memory_kib: Some(16_384_000),
         hugepages_total: Some(4),
         hugepages_free: Some(2),
-        hugepages_size_kb: Some(2048),
+        hugepages_size_kib: Some(2048),
         thp_enabled: Some("always [madvise] never".to_string()),
         thp_defrag: Some("[always] defer madvise never".to_string()),
         sched_tunables: Some(tunables),
@@ -886,12 +886,12 @@ fn sidecars_in_a_run_carry_identical_host_context() {
             "sidecar {i}: cpu_vendor drifted — STATIC_HOST_INFO cache broken?",
         );
         assert_eq!(
-            s.total_memory_kb, first.total_memory_kb,
-            "sidecar {i}: total_memory_kb drifted — STATIC_HOST_INFO cache broken?",
+            s.total_memory_kib, first.total_memory_kib,
+            "sidecar {i}: total_memory_kib drifted — STATIC_HOST_INFO cache broken?",
         );
         assert_eq!(
-            s.hugepages_size_kb, first.hugepages_size_kb,
-            "sidecar {i}: hugepages_size_kb drifted — STATIC_HOST_INFO cache broken?",
+            s.hugepages_size_kib, first.hugepages_size_kib,
+            "sidecar {i}: hugepages_size_kib drifted — STATIC_HOST_INFO cache broken?",
         );
         assert_eq!(
             s.online_cpus, first.online_cpus,

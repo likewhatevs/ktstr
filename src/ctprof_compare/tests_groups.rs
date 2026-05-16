@@ -604,12 +604,12 @@ fn collect_smaps_rollup_skips_non_leader_threads() {
         cgroup: "/".into(),
         ..ThreadState::default()
     };
-    // non_leader.smaps_rollup_kb stays empty (default) — the
+    // non_leader.smaps_rollup_kib stays empty (default) — the
     // capture-side dedup contract means non-leader threads
     // never carry a populated map.
-    assert!(non_leader.smaps_rollup_kb.is_empty());
+    assert!(non_leader.smaps_rollup_kib.is_empty());
     // Reassure: clearing is the no-op the contract assumes.
-    non_leader.smaps_rollup_kb.clear();
+    non_leader.smaps_rollup_kib.clear();
     let snap = snap_with(vec![leader, non_leader]);
     // Default normalize: one bucket from the leader keyed by
     // `pattern_key(pcomm)`; no ghost entry from the
@@ -642,10 +642,10 @@ fn collect_smaps_rollup_merge_carries_every_field_seen() {
         ..ThreadState::default()
     };
     // t1 has Rss + Pss. t2 has Rss + Private_Clean only.
-    t2.smaps_rollup_kb.insert("Rss".into(), 2048);
-    t2.smaps_rollup_kb.insert("Private_Clean".into(), 256);
+    t2.smaps_rollup_kib.insert("Rss".into(), 2048);
+    t2.smaps_rollup_kib.insert("Private_Clean".into(), 256);
     // t1 keeps its Rss + Pss from the helper, no Private_Clean.
-    assert!(!t1.smaps_rollup_kb.contains_key("Private_Clean"));
+    assert!(!t1.smaps_rollup_kib.contains_key("Private_Clean"));
 
     let snap = snap_with(vec![t1, t2]);
     let out = collect_smaps_rollup(&snap, false);

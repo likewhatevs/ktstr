@@ -274,7 +274,7 @@ pub struct CtprofDiff {
     /// ran on both sides, which is the price of literal mode.
     ///
     /// Populated from the per-thread leader rows of the
-    /// snapshot (tid == tgid; see [`crate::ctprof::ThreadState::smaps_rollup_kb`]).
+    /// snapshot (tid == tgid; see [`crate::ctprof::ThreadState::smaps_rollup_kib`]).
     pub smaps_rollup_a: BTreeMap<String, BTreeMap<String, u64>>,
     /// Candidate per-process smaps_rollup maps, same shape and
     /// normalization rules as [`Self::smaps_rollup_a`].

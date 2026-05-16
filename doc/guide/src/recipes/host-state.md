@@ -190,7 +190,7 @@ the same key out of a sidecar via `jq '.host.<field>'`.
   different OS family — `Linux` vs `FreeBSD`, say) is a harder
   stop than a same-family version bump and usually means the
   two sidecars were produced on entirely different systems.
-- `hugepages_total` / `hugepages_free` / `hugepages_size_kb`
+- `hugepages_total` / `hugepages_free` / `hugepages_size_kib`
   deltas → benchmark throughput that depends on 2 MiB pages
   (performance_mode tests) flips outcome when the pool shrinks
   or the page size changes. All three are reported by `show-host`

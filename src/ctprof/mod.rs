@@ -1280,7 +1280,7 @@ pub struct ThreadState {
     /// upstream in 4.14) or unreadable (typical
     /// permission-denied for /proc/1/smaps_rollup outside
     /// CAP_SYS_PTRACE).
-    pub smaps_rollup_kb: BTreeMap<String, u64>,
+    pub smaps_rollup_kib: BTreeMap<String, u64>,
 
     // -- I/O (/proc/<tid>/io) --
     //
@@ -1511,7 +1511,7 @@ pub struct ThreadState {
     /// taskstats `hiwater_rss` (kB), converted at parse time via
     /// `saturating_mul(1024)`. Updates from `xacct_add_tsk` in
     /// `kernel/tsacct.c::xacct_add_tsk`. Distinct from
-    /// `smaps_rollup_kb["Rss"]` which is the CURRENT RSS —
+    /// `smaps_rollup_kib["Rss"]` which is the CURRENT RSS —
     /// this field is the lifetime peak.
     ///
     /// **Kernel threads read zero**: `xacct_add_tsk` at
@@ -1608,7 +1608,7 @@ impl Default for ThreadState {
             core_forceidle_sum: Default::default(),
             fair_slice_ns: Default::default(),
             nr_threads: Default::default(),
-            smaps_rollup_kb: BTreeMap::new(),
+            smaps_rollup_kib: BTreeMap::new(),
             rchar: Default::default(),
             wchar: Default::default(),
             syscr: Default::default(),
@@ -1699,7 +1699,7 @@ impl ThreadState {
         self.hiwater_vm_bytes = PeakBytes(ds.hiwater_vm_bytes);
     }
 
-    /// Iterate over [`Self::smaps_rollup_kb`] with values
+    /// Iterate over [`Self::smaps_rollup_kib`] with values
     /// converted from kilobytes to bytes via `saturating_mul(1024)`.
     /// The kernel emits smaps_rollup values in kB; the
     /// project's display layer auto-scales bytes via the
@@ -1714,7 +1714,7 @@ impl ThreadState {
     pub fn smaps_rollup_bytes(
         &self,
     ) -> impl Iterator<Item = (&String, crate::metric_types::Bytes)> {
-        self.smaps_rollup_kb
+        self.smaps_rollup_kib
             .iter()
             .map(|(k, v)| (k, crate::metric_types::Bytes(v.saturating_mul(1024))))
     }
@@ -2140,7 +2140,7 @@ fn capture_thread_at_with_tally(
     let io = read_io_at_with_tally(proc_root, tgid, tid, tally);
     let status = read_status_at_with_tally(proc_root, tgid, tid, tally);
     let sched = read_sched_at_with_tally(proc_root, tgid, tid, tally);
-    let smaps_rollup_kb = read_smaps_rollup_at_with_tally(proc_root, tgid, tid, tally);
+    let smaps_rollup_kib = read_smaps_rollup_at_with_tally(proc_root, tgid, tid, tally);
     let cpu_affinity = if use_syscall_affinity {
         crate::cpu_util::read_affinity(tid)
             .or(status.cpus_allowed)
@@ -2255,7 +2255,7 @@ fn capture_thread_at_with_tally(
         } else {
             0
         }),
-        smaps_rollup_kb,
+        smaps_rollup_kib,
         rchar: Bytes(io.rchar.unwrap_or(0)),
         wchar: Bytes(io.wchar.unwrap_or(0)),
         syscr: MonotonicCount(io.syscr.unwrap_or(0)),

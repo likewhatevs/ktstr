@@ -25,7 +25,7 @@
 //!
 //! So on a host where CPU / NUMA / memory hotplug fires between
 //! two collect calls in the same process, `HostContext` continues
-//! to report the pre-hotplug values — `total_memory_kb` stays at
+//! to report the pre-hotplug values — `total_memory_kib` stays at
 //! the original snapshot, `numa_nodes` does not reflect an
 //! added/removed node. `arch` is the only field genuinely immune
 //! (a reboot is required to change architecture).
@@ -107,19 +107,22 @@ pub struct HostContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_vendor: Option<String>,
     /// Total physical memory in KiB — `MemTotal:` from
-    /// `/proc/meminfo`. Unit matches the file exactly so the sidecar
-    /// reader does not need to guess the scale.
+    /// `/proc/meminfo`. The kernel labels the value `kB` but the
+    /// scale is 1024 bytes (KiB); the field name uses the
+    /// unambiguous IEC binary unit so the sidecar reader does not
+    /// need to guess the scale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total_memory_kb: Option<u64>,
+    pub total_memory_kib: Option<u64>,
     /// Configured huge pages — `HugePages_Total` from `/proc/meminfo`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hugepages_total: Option<u64>,
     /// Free huge pages — `HugePages_Free` from `/proc/meminfo`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hugepages_free: Option<u64>,
-    /// Hugepage size in KiB — `Hugepagesize:` from `/proc/meminfo`.
+    /// Hugepage size in KiB — `Hugepagesize:` from `/proc/meminfo`
+    /// (labeled `kB` in the file; the scale is 1024 bytes / KiB).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hugepages_size_kb: Option<u64>,
+    pub hugepages_size_kib: Option<u64>,
     /// Active THP policy — content of
     /// `/sys/kernel/mm/transparent_hugepage/enabled` with the
     /// bracketed selection preserved verbatim (e.g.
@@ -305,10 +308,10 @@ impl HostContext {
         HostContext {
             cpu_model: Some("Intel(R) Xeon(R) Test CPU".to_string()),
             cpu_vendor: Some("GenuineIntel".to_string()),
-            total_memory_kb: Some(64 * 1024 * 1024),
+            total_memory_kib: Some(64 * 1024 * 1024),
             hugepages_total: Some(0),
             hugepages_free: Some(0),
-            hugepages_size_kb: Some(2048),
+            hugepages_size_kib: Some(2048),
             thp_enabled: Some("always [madvise] never".to_string()),
             thp_defrag: Some("always defer defer+madvise [madvise] never".to_string()),
             sched_tunables: Some(sched_tunables),
@@ -365,10 +368,10 @@ impl HostContext {
         let HostContext {
             cpu_model,
             cpu_vendor,
-            total_memory_kb,
+            total_memory_kib,
             hugepages_total,
             hugepages_free,
-            hugepages_size_kb,
+            hugepages_size_kib,
             thp_enabled,
             thp_defrag,
             sched_tunables,
@@ -397,10 +400,10 @@ impl HostContext {
         row(&mut out, "arch", arch.as_ref());
         row(&mut out, "cpu_model", cpu_model.as_ref());
         row(&mut out, "cpu_vendor", cpu_vendor.as_ref());
-        row(&mut out, "total_memory_kb", total_memory_kb.as_ref());
+        row(&mut out, "total_memory_kib", total_memory_kib.as_ref());
         row(&mut out, "hugepages_total", hugepages_total.as_ref());
         row(&mut out, "hugepages_free", hugepages_free.as_ref());
-        row(&mut out, "hugepages_size_kb", hugepages_size_kb.as_ref());
+        row(&mut out, "hugepages_size_kib", hugepages_size_kib.as_ref());
         row(&mut out, "online_cpus", online_cpus.as_ref());
         row(&mut out, "numa_nodes", numa_nodes.as_ref());
         row(&mut out, "thp_enabled", thp_enabled.as_ref());
@@ -485,10 +488,10 @@ impl HostContext {
         let HostContext {
             cpu_model: a_cpu_model,
             cpu_vendor: a_cpu_vendor,
-            total_memory_kb: a_total_memory_kb,
+            total_memory_kib: a_total_memory_kib,
             hugepages_total: a_hugepages_total,
             hugepages_free: a_hugepages_free,
-            hugepages_size_kb: a_hugepages_size_kb,
+            hugepages_size_kib: a_hugepages_size_kib,
             thp_enabled: a_thp_enabled,
             thp_defrag: a_thp_defrag,
             sched_tunables: a_sched_tunables,
@@ -504,10 +507,10 @@ impl HostContext {
         let HostContext {
             cpu_model: b_cpu_model,
             cpu_vendor: b_cpu_vendor,
-            total_memory_kb: b_total_memory_kb,
+            total_memory_kib: b_total_memory_kib,
             hugepages_total: b_hugepages_total,
             hugepages_free: b_hugepages_free,
-            hugepages_size_kb: b_hugepages_size_kb,
+            hugepages_size_kib: b_hugepages_size_kib,
             thp_enabled: b_thp_enabled,
             thp_defrag: b_thp_defrag,
             sched_tunables: b_sched_tunables,
@@ -573,9 +576,9 @@ impl HostContext {
         );
         row(
             &mut out,
-            "total_memory_kb",
-            a_total_memory_kb.as_ref(),
-            b_total_memory_kb.as_ref(),
+            "total_memory_kib",
+            a_total_memory_kib.as_ref(),
+            b_total_memory_kib.as_ref(),
         );
         row(
             &mut out,
@@ -591,9 +594,9 @@ impl HostContext {
         );
         row(
             &mut out,
-            "hugepages_size_kb",
-            a_hugepages_size_kb.as_ref(),
-            b_hugepages_size_kb.as_ref(),
+            "hugepages_size_kib",
+            a_hugepages_size_kib.as_ref(),
+            b_hugepages_size_kib.as_ref(),
         );
         row(
             &mut out,
@@ -724,8 +727,8 @@ impl HostContext {
 struct StaticHostInfo {
     cpu_model: Option<String>,
     cpu_vendor: Option<String>,
-    total_memory_kb: Option<u64>,
-    hugepages_size_kb: Option<u64>,
+    total_memory_kib: Option<u64>,
+    hugepages_size_kib: Option<u64>,
     online_cpus: Option<usize>,
     numa_nodes: Option<usize>,
     kernel_name: Option<String>,
@@ -804,8 +807,8 @@ static CPUFREQ_GOVERNORS_READ_CALLS: std::sync::atomic::AtomicUsize =
 /// [`CPUFREQ_GOVERNORS`] cache — identical across every call in
 /// the process, shift only under CPU / memory / NUMA hotplug or
 /// runtime governor change): the uname triple, CPU identity
-/// (`cpu_model` + `cpu_vendor`), `total_memory_kb`,
-/// `hugepages_size_kb`, `online_cpus`, `numa_nodes`, and
+/// (`cpu_model` + `cpu_vendor`), `total_memory_kib`,
+/// `hugepages_size_kib`, `online_cpus`, `numa_nodes`, and
 /// `cpufreq_governor`.
 ///
 /// Dynamic subset (re-read on every call): `kernel_cmdline`,
@@ -831,8 +834,8 @@ static CPUFREQ_GOVERNORS_READ_CALLS: std::sync::atomic::AtomicUsize =
 /// travel the pair via [`HostContextSnapshots`].
 pub fn collect_host_context() -> HostContext {
     // Read `/proc/meminfo` exactly once per call and share the
-    // parsed fields with `compute_static_host_info` (for `mem_total_kb`
-    // / `hugepages_size_kb` on cold init) and with the per-call
+    // parsed fields with `compute_static_host_info` (for `mem_total_kib`
+    // / `hugepages_size_kib` on cold init) and with the per-call
     // hugepage counters. The prior formulation read `/proc/meminfo`
     // twice on the cold path — once here for the dynamic counters
     // and once inside the `OnceLock` init for the static fields —
@@ -844,10 +847,10 @@ pub fn collect_host_context() -> HostContext {
     HostContext {
         cpu_model: static_info.cpu_model,
         cpu_vendor: static_info.cpu_vendor,
-        total_memory_kb: static_info.total_memory_kb,
+        total_memory_kib: static_info.total_memory_kib,
         hugepages_total: meminfo.hugepages_total,
         hugepages_free: meminfo.hugepages_free,
-        hugepages_size_kb: static_info.hugepages_size_kb,
+        hugepages_size_kib: static_info.hugepages_size_kib,
         thp_enabled: read_trimmed_sysfs("/sys/kernel/mm/transparent_hugepage/enabled"),
         thp_defrag: read_trimmed_sysfs("/sys/kernel/mm/transparent_hugepage/defrag"),
         sched_tunables: read_sched_tunables(),
@@ -1063,8 +1066,8 @@ fn compute_static_host_info(meminfo: &MeminfoFields) -> StaticHostInfo {
     StaticHostInfo {
         cpu_model,
         cpu_vendor,
-        total_memory_kb: meminfo.mem_total_kb,
-        hugepages_size_kb: meminfo.hugepages_size_kb,
+        total_memory_kib: meminfo.mem_total_kib,
+        hugepages_size_kib: meminfo.hugepages_size_kib,
         online_cpus,
         numa_nodes,
         kernel_name: u.sysname().to_str().ok().map(|s| s.to_string()),
@@ -1136,10 +1139,10 @@ fn parse_cpuinfo_identity(text: &str) -> (Option<String>, Option<String>) {
 /// makes the set of captured fields explicit at the type level.
 #[derive(Default)]
 struct MeminfoFields {
-    mem_total_kb: Option<u64>,
+    mem_total_kib: Option<u64>,
     hugepages_total: Option<u64>,
     hugepages_free: Option<u64>,
-    hugepages_size_kb: Option<u64>,
+    hugepages_size_kib: Option<u64>,
 }
 
 /// Read `/proc/meminfo` and extract the four fields the host
@@ -1173,10 +1176,10 @@ fn parse_meminfo(text: &str) -> MeminfoFields {
             continue;
         };
         match key {
-            "MemTotal" => out.mem_total_kb = Some(n),
+            "MemTotal" => out.mem_total_kib = Some(n),
             "HugePages_Total" => out.hugepages_total = Some(n),
             "HugePages_Free" => out.hugepages_free = Some(n),
-            "Hugepagesize" => out.hugepages_size_kb = Some(n),
+            "Hugepagesize" => out.hugepages_size_kib = Some(n),
             _ => {}
         }
     }
@@ -1354,7 +1357,7 @@ mod tests {
     }
 
     /// Stability regression for the STATIC subset: uname triple,
-    /// CPU identity, total_memory_kb, hugepages_size_kb,
+    /// CPU identity, total_memory_kib, hugepages_size_kib,
     /// online_cpus, numa_nodes, cpufreq_governor. These fields are
     /// memoised in [`STATIC_HOST_INFO`] (or, for `cpufreq_governor`,
     /// in [`CPUFREQ_GOVERNORS`]) and therefore return identical
@@ -1371,8 +1374,8 @@ mod tests {
         assert_eq!(a.arch, b.arch);
         assert_eq!(a.cpu_model, b.cpu_model);
         assert_eq!(a.cpu_vendor, b.cpu_vendor);
-        assert_eq!(a.total_memory_kb, b.total_memory_kb);
-        assert_eq!(a.hugepages_size_kb, b.hugepages_size_kb);
+        assert_eq!(a.total_memory_kib, b.total_memory_kib);
+        assert_eq!(a.hugepages_size_kib, b.hugepages_size_kib);
         assert_eq!(a.online_cpus, b.online_cpus);
         assert_eq!(a.numa_nodes, b.numa_nodes);
         assert_eq!(a.cpufreq_governor, b.cpufreq_governor);
@@ -1455,7 +1458,7 @@ mod tests {
         // fails loudly rather than silently weakening the cache.
         assert_eq!(first.cpu_model, second.cpu_model);
         assert_eq!(first.kernel_release, second.kernel_release);
-        assert_eq!(first.total_memory_kb, second.total_memory_kb);
+        assert_eq!(first.total_memory_kib, second.total_memory_kib);
     }
 
     /// Host context round-trips through JSON — every field uses
@@ -1488,10 +1491,10 @@ mod tests {
         let ctx = HostContext {
             cpu_model: Some("Example CPU".to_string()),
             cpu_vendor: Some("GenuineExample".to_string()),
-            total_memory_kb: Some(16_384_000),
+            total_memory_kib: Some(16_384_000),
             hugepages_total: Some(0),
             hugepages_free: Some(0),
-            hugepages_size_kb: Some(2048),
+            hugepages_size_kib: Some(2048),
             thp_enabled: Some("always [madvise] never".to_string()),
             thp_defrag: Some("[always] defer defer+madvise madvise never".to_string()),
             sched_tunables: Some(tunables),
@@ -1537,10 +1540,10 @@ mod tests {
             // path for every other Option field.
             cpu_model: None,
             cpu_vendor: None,
-            total_memory_kb: None,
+            total_memory_kib: None,
             hugepages_total: None,
             hugepages_free: None,
-            hugepages_size_kb: None,
+            hugepages_size_kib: None,
             thp_enabled: None,
             thp_defrag: None,
             online_cpus: None,
@@ -1657,19 +1660,19 @@ HugePages_Free:       40
 Hugepagesize:       2048 kB
 ";
         let out = parse_meminfo(text);
-        assert_eq!(out.mem_total_kb, Some(16_384_000));
+        assert_eq!(out.mem_total_kib, Some(16_384_000));
         assert_eq!(out.hugepages_total, Some(42));
         assert_eq!(out.hugepages_free, Some(40));
-        assert_eq!(out.hugepages_size_kb, Some(2048));
+        assert_eq!(out.hugepages_size_kib, Some(2048));
     }
 
     #[test]
     fn parse_meminfo_empty_input() {
         let out = parse_meminfo("");
-        assert!(out.mem_total_kb.is_none());
+        assert!(out.mem_total_kib.is_none());
         assert!(out.hugepages_total.is_none());
         assert!(out.hugepages_free.is_none());
-        assert!(out.hugepages_size_kb.is_none());
+        assert!(out.hugepages_size_kib.is_none());
     }
 
     #[test]
@@ -1679,10 +1682,10 @@ Hugepagesize:       2048 kB
         // "absent."
         let text = "MemTotal:       1024 kB\nMemFree:         512 kB\n";
         let out = parse_meminfo(text);
-        assert_eq!(out.mem_total_kb, Some(1024));
+        assert_eq!(out.mem_total_kib, Some(1024));
         assert!(out.hugepages_total.is_none());
         assert!(out.hugepages_free.is_none());
-        assert!(out.hugepages_size_kb.is_none());
+        assert!(out.hugepages_size_kib.is_none());
     }
 
     #[test]
@@ -1696,8 +1699,8 @@ SomeFlags:      abc def ghi
 Hugepagesize:      2048 kB
 ";
         let out = parse_meminfo(text);
-        assert_eq!(out.mem_total_kb, Some(2048));
-        assert_eq!(out.hugepages_size_kb, Some(2048));
+        assert_eq!(out.mem_total_kib, Some(2048));
+        assert_eq!(out.hugepages_size_kib, Some(2048));
     }
 
     #[test]
@@ -1712,7 +1715,7 @@ HugePages_Total:   3
 Another_Unknown: 77 kB
 ";
         let out = parse_meminfo(text);
-        assert_eq!(out.mem_total_kb, Some(100));
+        assert_eq!(out.mem_total_kib, Some(100));
         assert_eq!(out.hugepages_total, Some(3));
         assert!(out.hugepages_free.is_none());
     }
@@ -1721,9 +1724,9 @@ Another_Unknown: 77 kB
     fn parse_meminfo_crlf_line_endings() {
         let text = "MemTotal:       512 kB\r\nHugePages_Total:    2\r\nHugepagesize:   2048 kB\r\n";
         let out = parse_meminfo(text);
-        assert_eq!(out.mem_total_kb, Some(512));
+        assert_eq!(out.mem_total_kib, Some(512));
         assert_eq!(out.hugepages_total, Some(2));
-        assert_eq!(out.hugepages_size_kb, Some(2048));
+        assert_eq!(out.hugepages_size_kib, Some(2048));
     }
 
     #[test]
@@ -1777,7 +1780,7 @@ model name\t: Second Model
         // is caught by this test.
         let text = "MemTotal:       100 kB\nMemTotal:       200 kB\n";
         let out = parse_meminfo(text);
-        assert_eq!(out.mem_total_kb, Some(200));
+        assert_eq!(out.mem_total_kib, Some(200));
     }
 
     #[test]
@@ -1793,7 +1796,7 @@ another garbage line
 HugePages_Total:   3
 ";
         let out = parse_meminfo(text);
-        assert_eq!(out.mem_total_kb, Some(100));
+        assert_eq!(out.mem_total_kib, Some(100));
         assert_eq!(out.hugepages_total, Some(3));
     }
 
@@ -1807,7 +1810,7 @@ HugePages_Total:   3
         let text = "MemTotal:\nHugePages_Total:  5\n";
         let out = parse_meminfo(text);
         assert!(
-            out.mem_total_kb.is_none(),
+            out.mem_total_kib.is_none(),
             "empty value after ':' must leave the field None",
         );
         assert_eq!(
@@ -1829,7 +1832,7 @@ Hugepagesize:       2048 kB
 ";
         let out = parse_meminfo(text);
         assert!(
-            out.mem_total_kb.is_none(),
+            out.mem_total_kib.is_none(),
             "negative value must fail u64 parse and skip",
         );
         assert!(
@@ -1837,7 +1840,7 @@ Hugepagesize:       2048 kB
             "overflow value must fail u64 parse and skip",
         );
         assert_eq!(
-            out.hugepages_size_kb,
+            out.hugepages_size_kib,
             Some(2048),
             "later valid line must still parse",
         );
@@ -1911,10 +1914,10 @@ Hugepagesize:       2048 kB
         "arch",
         "cpu_model",
         "cpu_vendor",
-        "total_memory_kb",
+        "total_memory_kib",
         "hugepages_total",
         "hugepages_free",
-        "hugepages_size_kb",
+        "hugepages_size_kib",
         "online_cpus",
         "numa_nodes",
         "thp_enabled",
@@ -1964,10 +1967,10 @@ Hugepagesize:       2048 kB
         let HostContext {
             cpu_model,
             cpu_vendor,
-            total_memory_kb,
+            total_memory_kib,
             hugepages_total,
             hugepages_free,
-            hugepages_size_kb,
+            hugepages_size_kib,
             thp_enabled,
             thp_defrag,
             sched_tunables,
@@ -1983,10 +1986,10 @@ Hugepagesize:       2048 kB
         [
             drop_to_unit(cpu_model),
             drop_to_unit(cpu_vendor),
-            drop_to_unit(total_memory_kb),
+            drop_to_unit(total_memory_kib),
             drop_to_unit(hugepages_total),
             drop_to_unit(hugepages_free),
-            drop_to_unit(hugepages_size_kb),
+            drop_to_unit(hugepages_size_kib),
             drop_to_unit(thp_enabled),
             drop_to_unit(thp_defrag),
             drop_to_unit(sched_tunables),
@@ -2083,10 +2086,10 @@ Hugepagesize:       2048 kB
             arch: Some("x86_64".to_string()),
             cpu_model: Some("Example CPU".to_string()),
             cpu_vendor: Some("GenuineIntel".to_string()),
-            total_memory_kb: Some(16_384_000),
+            total_memory_kib: Some(16_384_000),
             hugepages_total: Some(0),
             hugepages_free: Some(0),
-            hugepages_size_kb: Some(2048),
+            hugepages_size_kib: Some(2048),
             online_cpus: Some(8),
             numa_nodes: Some(1),
             thp_enabled: Some("always [madvise] never".to_string()),
@@ -2144,10 +2147,10 @@ Hugepagesize:       2048 kB
                 "arch",
                 "cpu_model",
                 "cpu_vendor",
-                "total_memory_kb",
+                "total_memory_kib",
                 "hugepages_total",
                 "hugepages_free",
-                "hugepages_size_kb",
+                "hugepages_size_kib",
                 "online_cpus",
                 "numa_nodes",
                 "thp_enabled",
@@ -2179,10 +2182,10 @@ Hugepagesize:       2048 kB
             "arch",
             "cpu_model",
             "cpu_vendor",
-            "total_memory_kb",
+            "total_memory_kib",
             "hugepages_total",
             "hugepages_free",
-            "hugepages_size_kb",
+            "hugepages_size_kib",
             "online_cpus",
             "numa_nodes",
             "thp_enabled",
@@ -2224,7 +2227,7 @@ Hugepagesize:       2048 kB
             kernel_release: Some("6.11.0".to_string()),
             arch: Some("x86_64".to_string()),
             cpu_model: Some("Example CPU".to_string()),
-            total_memory_kb: Some(16_384_000),
+            total_memory_kib: Some(16_384_000),
             sched_tunables: Some(tunables),
             kernel_cmdline: Some("preempt=lazy".to_string()),
             ..HostContext::default()
@@ -2233,7 +2236,7 @@ Hugepagesize:       2048 kB
         assert!(out.contains("kernel_name: Linux"), "{out}");
         assert!(out.contains("kernel_release: 6.11.0"), "{out}");
         assert!(out.contains("cpu_model: Example CPU"), "{out}");
-        assert!(out.contains("total_memory_kb: 16384000"), "{out}");
+        assert!(out.contains("total_memory_kib: 16384000"), "{out}");
         assert!(out.contains("kernel_cmdline: preempt=lazy"), "{out}");
         assert!(out.contains("sched_tunables:\n"), "{out}");
         assert!(out.contains("  sched_migration_cost_ns = 500000"), "{out}");

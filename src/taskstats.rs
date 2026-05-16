@@ -717,8 +717,8 @@ fn parse_taskstats_payload(buf: &[u8]) -> Result<DelayStats, String> {
     let swapin_delay_total_ns = r64(56);
 
     // Extended-accounting hiwater fields (v3+).
-    let hiwater_rss_kb = r64(200);
-    let hiwater_vm_kb = r64(208);
+    let hiwater_rss_kib = r64(200);
+    let hiwater_vm_kib = r64(208);
 
     // freepages_* (v8) and thrashing_* (v9). cpu_scaled_run_real_total
     // (v8 dead) sits at 304; freepages_count starts at 312.
@@ -794,8 +794,8 @@ fn parse_taskstats_payload(buf: &[u8]) -> Result<DelayStats, String> {
         irq_delay_total_ns,
         irq_delay_max_ns,
         irq_delay_min_ns,
-        hiwater_rss_bytes: hiwater_rss_kb.saturating_mul(1024),
-        hiwater_vm_bytes: hiwater_vm_kb.saturating_mul(1024),
+        hiwater_rss_bytes: hiwater_rss_kib.saturating_mul(1024),
+        hiwater_vm_bytes: hiwater_vm_kib.saturating_mul(1024),
     })
 }
 

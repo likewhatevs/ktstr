@@ -139,7 +139,7 @@ fn wire_format_identity_raw_primitives_deserialize_into_wrapped_thread_state() {
         "core_forceidle_sum": 0,
         "fair_slice_ns": 250000,
         "nr_threads": 4,
-        "smaps_rollup_kb": {},
+        "smaps_rollup_kib": {},
         "rchar": 100,
         "wchar": 200,
         "syscr": 10,

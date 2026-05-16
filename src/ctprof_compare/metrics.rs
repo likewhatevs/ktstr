@@ -1148,7 +1148,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         sched_class: None,
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_XACCT"],
         is_dead: false,
-        description: "Lifetime high-watermark of resident-set size, bytes (taskstats hiwater_rss). Distinct from smaps_rollup_kb[\"Rss\"] which is the CURRENT RSS.",
+        description: "Lifetime high-watermark of resident-set size, bytes (taskstats hiwater_rss). Distinct from smaps_rollup_kib[\"Rss\"] which is the CURRENT RSS.",
         section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
