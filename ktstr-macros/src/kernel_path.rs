@@ -1,10 +1,18 @@
 // Shared kernel directory resolution.
 //
-// Used by both build.rs (via `include!("src/kernel_path.rs")`) and
-// lib.rs (via `pub mod kernel_path`). The `include!` is deliberate:
-// build.rs runs before the crate compiles, so it cannot `use ktstr::...`.
-// Duplicating the resolution logic would drift between build-time
-// BTF discovery (vmlinux.h generation) and run-time kernel selection.
+// This file lives in two places: `src/kernel_path.rs` (the canonical
+// source in the parent ktstr crate, included into its `build.rs` via
+// `include!("src/kernel_path.rs")` and exposed to its lib via
+// `pub mod kernel_path`) and `ktstr-macros/src/kernel_path.rs` (the
+// bundled mirror, declared `mod kernel_path` in the macros crate's
+// `src/lib.rs` and verified byte-identical to the canonical by
+// `ktstr-macros/build.rs`'s drift check). The `include!` in the
+// parent's build.rs is deliberate — build.rs runs before the crate
+// compiles, so it cannot `use ktstr::...`. Duplicating the resolution
+// logic across the three consumers (parent build.rs, parent lib,
+// macros crate) would drift between build-time BTF discovery
+// (vmlinux.h generation), run-time kernel selection, and the macros
+// crate's parse-time KernelId construction.
 //
 // Constraints that every edit to this file must satisfy — breaking
 // any of them surfaces as either a cryptic build-script error or a
