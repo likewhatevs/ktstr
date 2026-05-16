@@ -57,7 +57,7 @@ static __KTSTR_ENTRY_MULTI_NUMA_BOOT: KtstrTestEntry = KtstrTestEntry {
 
 // ---------------------------------------------------------------------------
 // CXL memory-only node: node 2 has llcs=0 (no CPUs), only memory.
-// Manual distributed_slice: #[ktstr_test] cannot express with_nodes/with_distances.
+// Manual distributed_slice: #[ktstr_test] cannot express with_nodes/distances.
 // ---------------------------------------------------------------------------
 
 static CXL_NODES: [NumaNode; 3] = [
@@ -95,7 +95,7 @@ fn scenario_cxl_memory_only(ctx: &Ctx) -> Result<AssertResult> {
 static __KTSTR_ENTRY_CXL_MEM_ONLY: KtstrTestEntry = KtstrTestEntry {
     name: "numa_cxl_memory_only_node",
     func: scenario_cxl_memory_only,
-    topology: Topology::with_nodes(2, 1, &CXL_NODES).with_distances(&CXL_DIST),
+    topology: Topology::with_nodes(2, 1, &CXL_NODES).distances(&CXL_DIST),
     constraints: TopologyConstraints {
         min_numa_nodes: 3,
         max_numa_nodes: Some(3),

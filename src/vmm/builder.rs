@@ -247,7 +247,7 @@ impl KtstrVmBuilder {
     ///
     /// For uniform topologies, build with [`Topology::new`]. For
     /// per-node configuration (asymmetric memory, CXL nodes, custom
-    /// distances), use [`Topology::with_nodes`] / [`Topology::with_distances`].
+    /// distances), use [`Topology::with_nodes`] / [`Topology::distances`].
     pub fn topology(mut self, topo: Topology) -> Self {
         self.topology = topo;
         self

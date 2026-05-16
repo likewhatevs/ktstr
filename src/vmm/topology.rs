@@ -148,7 +148,7 @@ impl NumaNode {
     }
 
     /// Attach a memory-side cache descriptor.
-    pub const fn with_cache(mut self, cache: MemSideCache) -> Self {
+    pub const fn cache(mut self, cache: MemSideCache) -> Self {
         self.mem_side_cache = Some(cache);
         self
     }
@@ -420,7 +420,7 @@ impl Topology {
     }
 
     /// Attach a distance matrix. Panics if dimension doesn't match.
-    pub const fn with_distances(mut self, distances: &'static NumaDistance) -> Self {
+    pub const fn distances(mut self, distances: &'static NumaDistance) -> Self {
         assert!(
             distances.n == self.numa_nodes,
             "invalid Topology: NumaDistance dimension must equal numa_nodes"
@@ -1217,19 +1217,19 @@ mod tests {
 
     #[test]
     fn distance_with_cxl_middle() {
-        let t = Topology::with_nodes(4, 1, &CXL_MIDDLE).with_distances(&CXL_DIST);
+        let t = Topology::with_nodes(4, 1, &CXL_MIDDLE).distances(&CXL_DIST);
         assert_eq!(t.distance(1, 2), 25);
         assert_eq!(t.distance(0, 1), 20);
         assert!(t.validate().is_ok());
     }
 
-    // -- with_distances tests --
+    // -- distances tests --
 
     static DIST_2: NumaDistance = NumaDistance::new(2, &[10, 20, 20, 10]);
 
     #[test]
-    fn with_distances() {
-        let t = Topology::new(2, 4, 2, 1).with_distances(&DIST_2);
+    fn distances() {
+        let t = Topology::new(2, 4, 2, 1).distances(&DIST_2);
         assert_eq!(t.distance(0, 0), 10);
         assert_eq!(t.distance(0, 1), 20);
         assert_eq!(t.distance(1, 0), 20);
@@ -1246,8 +1246,8 @@ mod tests {
     static DIST_3: NumaDistance = NumaDistance::new(3, &[10, 20, 30, 20, 10, 25, 30, 25, 10]);
 
     #[test]
-    fn with_nodes_and_distances() {
-        let t = Topology::with_nodes(4, 1, &CXL_NODES).with_distances(&DIST_3);
+    fn with_nodes_then_distances() {
+        let t = Topology::with_nodes(4, 1, &CXL_NODES).distances(&DIST_3);
         assert_eq!(t.distance(0, 2), 30);
         assert_eq!(t.distance(1, 2), 25);
         assert!(t.validate().is_ok());
@@ -1335,13 +1335,13 @@ mod tests {
     const _CONST_WITH_NODES: Topology = Topology::with_nodes(4, 2, &_CONST_NODES);
 
     static _CONST_DIST: NumaDistance = NumaDistance::new(2, &[10, 20, 20, 10]);
-    const _CONST_WITH_DIST: Topology = Topology::new(2, 2, 4, 2).with_distances(&_CONST_DIST);
+    const _CONST_WITH_DISTANCES: Topology = Topology::new(2, 2, 4, 2).distances(&_CONST_DIST);
 
     #[test]
     fn const_construction_valid() {
         assert!(_CONST_TOPO.validate().is_ok());
         assert!(_CONST_WITH_NODES.validate().is_ok());
-        assert!(_CONST_WITH_DIST.validate().is_ok());
+        assert!(_CONST_WITH_DISTANCES.validate().is_ok());
     }
 
     // -- single node edge case --
