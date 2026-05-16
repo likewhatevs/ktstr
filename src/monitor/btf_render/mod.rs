@@ -2301,7 +2301,7 @@ fn render_value_inner(
             reason: "unpeeled modifier (BTF cycle?)".to_string(),
         },
         _ => RenderedValue::Unsupported {
-            reason: format!("unhandled BTF type kind for type id {peeled_type_id}"),
+            reason: format!("unhandled BTF type kind {ty:?} for type id {peeled_type_id}"),
         },
     }
 }
@@ -2733,12 +2733,9 @@ fn render_member(
 
     if let Some(parent) = parent_type_id
         && let Type::Array(arr) = &member_ty
-        && let (Some(elem_tid), Some(elem_size)) = (
-            arr.get_type_id(),
-            peel_modifiers(btf, arr.get_type_id().unwrap_or(0)).and_then(|t| type_size(btf, &t)),
-        )
-        && elem_size == 8
+        && let Some(elem_tid) = arr.get_type_id()
         && let Some(elem_term) = peel_modifiers(btf, elem_tid)
+        && type_size(btf, &elem_term) == Some(8)
         && matches!(
             elem_term,
             Type::Int(ref i) if i.size() == 8 && !i.is_signed() && !i.is_bool() && !i.is_char()
