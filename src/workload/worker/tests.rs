@@ -15,6 +15,63 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+/// [`MAX_WAKE_SAMPLES`] MUST be 100_000 — the value
+/// `doc/guide/src/architecture/workers.md` cites verbatim ("clamped
+/// to at most 100_000 entries (`MAX_WAKE_SAMPLES`)"). The doc cite
+/// is operator-load-bearing (sets per-worker memory expectations for
+/// long-running scenarios); pinning the constant at the source
+/// catches a silent rot where the const changes but the doc doesn't.
+///
+/// A regression that bumped the cap to 1_000_000 — perhaps to chase
+/// a percentile-precision request — would 10x per-worker memory
+/// silently while leaving the doc claim stale. The pin trips with a
+/// clear assertion message so the developer who changed the cap
+/// updates the doc at the same time.
+#[test]
+fn max_wake_samples_pins_doc_value() {
+    assert_eq!(
+        MAX_WAKE_SAMPLES, 100_000,
+        "MAX_WAKE_SAMPLES MUST stay 100_000 to match the doc cite in \
+         doc/guide/src/architecture/workers.md (\"clamped to at most \
+         100_000 entries (`MAX_WAKE_SAMPLES`)\"). If you intentionally \
+         changed the cap, update both this assertion AND the doc \
+         cite — they are pinned together to prevent silent drift.",
+    );
+}
+
+/// [`defaults::PAGE_FAULT_CHURN_REGION_KB`] /
+/// [`defaults::PAGE_FAULT_CHURN_TOUCHES_PER_CYCLE`] /
+/// [`defaults::PAGE_FAULT_CHURN_SPIN_ITERS`] MUST stay at the values
+/// `doc/guide/src/architecture/workers.md` cites verbatim
+/// ("region_kb=4096, touches_per_cycle=256, spin_iters=64"). The doc
+/// cite gates operator expectations of per-iteration workload cost;
+/// a silent change to any of the three would leave the doc stale and
+/// mislead readers tuning page-fault-driven test scenarios.
+#[test]
+fn page_fault_churn_defaults_pin_doc_values() {
+    assert_eq!(
+        defaults::PAGE_FAULT_CHURN_REGION_KB, 4096,
+        "PAGE_FAULT_CHURN_REGION_KB MUST stay 4096 to match the doc \
+         cite in doc/guide/src/architecture/workers.md \
+         (\"region_kb=4096\"). Update both this assertion AND the doc \
+         cite if you intentionally changed the default.",
+    );
+    assert_eq!(
+        defaults::PAGE_FAULT_CHURN_TOUCHES_PER_CYCLE, 256,
+        "PAGE_FAULT_CHURN_TOUCHES_PER_CYCLE MUST stay 256 to match \
+         the doc cite in doc/guide/src/architecture/workers.md \
+         (\"touches_per_cycle=256\"). Update both this assertion AND \
+         the doc cite if you intentionally changed the default.",
+    );
+    assert_eq!(
+        defaults::PAGE_FAULT_CHURN_SPIN_ITERS, 64,
+        "PAGE_FAULT_CHURN_SPIN_ITERS MUST stay 64 to match the doc \
+         cite in doc/guide/src/architecture/workers.md \
+         (\"spin_iters=64\"). Update both this assertion AND the doc \
+         cite if you intentionally changed the default.",
+    );
+}
+
 /// `clock_gettime_ns(CLOCK_MONOTONIC)` must never observe time
 /// moving backwards between two sequential calls on the same
 /// thread. Pins the non-decreasing contract the wake-latency
@@ -889,6 +946,43 @@ fn alu_hot_chain_compound_calls_accumulate_work_units() {
          surface as 500 (the second call overwrites the first call's \
          total).",
     );
+}
+
+/// [`alu_hot_chain`] MUST bump `work_units` uniformly across every
+/// concrete [`AluWidth`] variant. Today every arm runs the same
+/// scalar multiply path per the comment at mod.rs:3567-3573 — `width`
+/// is retained on the signature so a future SIMD-intrinsic drop can
+/// pivot per-arm without changing the call shape. This test is
+/// mechanically redundant today (all arms execute the same code) but
+/// becomes load-bearing the moment per-arm SIMD dispatch lands: a
+/// regression that breaks the `work_units` bump in ONE arm
+/// (e.g. forgets the `*work_units = ...` write in the Vec256 branch
+/// of a future per-arm match) would surface here as a single-variant
+/// failure. `AluWidth::Widest` is excluded because `alu_hot_chain`
+/// `debug_assert!`s against it at mod.rs:3574-3578 (resolved away by
+/// `resolve_alu_width` before reaching the chain).
+#[test]
+fn alu_hot_chain_bumps_work_units_uniformly_across_widths() {
+    for &width in &[
+        AluWidth::Scalar,
+        AluWidth::Vec128,
+        AluWidth::Vec256,
+        AluWidth::Vec512,
+        AluWidth::Amx,
+    ] {
+        let mut work_units: u64 = 0;
+        let steps: u64 = 100;
+        alu_hot_chain(width, steps, &mut work_units);
+        assert_eq!(
+            work_units, steps,
+            "alu_hot_chain({width:?}, {steps}, &mut 0) MUST leave \
+             work_units == {steps}; got {work_units}. A regression in \
+             the per-arm dispatch (once SIMD intrinsics land) surfaces \
+             here as a single-variant divergence — the assertion \
+             message names the failing variant via `{{width:?}}`, \
+             distinguishing it from sibling-arm regressions.",
+        );
+    }
 }
 
 /// [`alu_hot_chain`] uses `wrapping_add(1)` at mod.rs:3588 — the

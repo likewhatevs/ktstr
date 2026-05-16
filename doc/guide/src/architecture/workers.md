@@ -105,7 +105,10 @@ Three fields worth calling out explicitly:
   accumulates more wakes than the cap, the vector stays at the
   cap while this counter keeps climbing. Host-side consumers
   reporting "total wakeups observed" read `wake_sample_total`;
-  percentile / CV computations read `resume_latencies_ns`.
+  percentile / CV computations read `resume_latencies_ns`. The
+  100_000 cap is pinned against this doc by the unit test
+  `max_wake_samples_pins_doc_value` in `src/workload/worker/tests.rs`,
+  so a silent change to the constant trips a build-time assertion.
 - `completed` — `true` when the worker reached its natural end
   (outer loop observed STOP and exited cleanly, or a custom-
   closure payload returned from its `run`). Sentinel reports
@@ -165,7 +168,11 @@ Three fields worth calling out explicitly:
     birthday-collision xorshift64 index may revisit a page
     already faulted this cycle, so the fault count is a ceiling,
     not a floor) + `spin_iters`=64 = 320 work units
-    (`gcd(320, 1024) = 64`).
+    (`gcd(320, 1024) = 64`). The three default values (`region_kb`,
+    `touches_per_cycle`, `spin_iters`) are pinned against this doc
+    by the unit test `page_fault_churn_defaults_pin_doc_values` in
+    `src/workload/worker/tests.rs`, so a silent change to any of
+    them trips a build-time assertion.
   - **Every 64 iterations**: IoSyncWrite (16 4-KiB writes per
     write-then-sleep pair → `gcd(16, 1024) = 16`); IoRandRead and
     IoConvoy use the same 64-iteration cadence for their per-iteration

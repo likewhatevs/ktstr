@@ -115,8 +115,24 @@ wait:
 
 ## Confirm taskstats data is actually populated
 
-If every taskstats column reads zero, the snapshot likely hit a
-gating problem rather than a real "no delay" reading. Inspect
+**Pre-flight (save a capture round-trip):** verify the host has the
+delayacct runtime toggle enabled before capturing on a fresh boot:
+
+```sh
+sysctl kernel.task_delayacct       # must report `kernel.task_delayacct = 1`
+zcat /proc/config.gz | grep -E 'CONFIG_TASKSTATS|CONFIG_TASK_DELAY_ACCT'
+                                   # both must read `=y` for delayacct to fire
+```
+
+If `task_delayacct` is `0`, set it with `sysctl -w kernel.task_delayacct=1`
+(or persist via `/etc/sysctl.d/`) before capture. If the
+`CONFIG_TASKSTATS` / `CONFIG_TASK_DELAY_ACCT` lines are absent, the
+running kernel was built without delayacct support and re-capturing
+won't help — rebuild with the kconfig or boot a different kernel.
+
+If every taskstats column reads zero AFTER the pre-flight, the
+snapshot likely hit a gating problem rather than a real "no delay"
+reading. Inspect
 `CtprofSnapshot::taskstats_summary` (the structured
 per-snapshot tally written into the snapshot itself):
 

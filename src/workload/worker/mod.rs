@@ -19,6 +19,22 @@ use super::spawn::{
 };
 use super::types::*;
 
+/// Per-worker reservoir-sample cap for the wake-latency
+/// ([`WorkerReport::resume_latencies_ns`]) and per-iteration
+/// cost ([`WorkerReport::iteration_costs_ns`]) buffers.
+///
+/// The cap bounds memory per worker on long-running scenarios:
+/// once filled the reservoir uses Vitter's Algorithm R for uniform
+/// sampling, so a 10-hour run with millions of wake events still
+/// caps at 100_000 entries (≈ 800 KiB per worker per buffer).
+///
+/// Promoted to module scope so [`tests::max_wake_samples_pins_doc_value`]
+/// can pin the value against the documentation cite in
+/// `doc/guide/src/architecture/workers.md`. Both pieces of text
+/// reference 100_000 — the pin trips when one drifts without the
+/// other.
+pub(super) const MAX_WAKE_SAMPLES: usize = 100_000;
+
 /// Wrap `FUTEX_WAKE` on `futex_ptr`, waking up to `n_waiters` tasks.
 /// Thin wrapper around `libc::syscall(SYS_futex, ...)` — callers of the
 /// wake path duplicate the 7-arg layout in every spot otherwise.
@@ -311,7 +327,6 @@ pub(super) fn worker_main(
         ipc_variance_rng = GOLDEN_RATIO_64;
     }
     // Benchmarking: per-wakeup latency samples (reservoir-sampled) and iteration counter.
-    const MAX_WAKE_SAMPLES: usize = 100_000;
     let mut resume_latencies_ns: Vec<u64> = Vec::with_capacity(MAX_WAKE_SAMPLES);
     let mut wake_sample_count: u64 = 0;
     // Per-iteration wall-clock compute duration samples

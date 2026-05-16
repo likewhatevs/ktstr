@@ -180,6 +180,15 @@ When using `SchedulerSpec::Discover`, ktstr searches for the scheduler
 binary in:
 
 1. `KTSTR_SCHEDULER` environment variable.
+   - When the OPERATOR sets `KTSTR_CARGO_TEST_MODE=1` to mark a
+     direct `cargo test` invocation that bypasses the `cargo ktstr`
+     wrapper (e.g. `KTSTR_KERNEL=… KTSTR_CARGO_TEST_MODE=1 cargo
+     test -- some_test`), `$PATH` is also consulted as part of the
+     step-1 lookup — `which`-style, first match wins — so an
+     `apt`-installed or `cargo install`-deployed scheduler binary
+     resolves without requiring an in-tree build. The variable is
+     NOT set automatically by `cargo ktstr test`; under the wrapper
+     this step is just the literal `KTSTR_SCHEDULER` env var.
 2. Sibling of the current executable (and, when the test binary
    lives under `target/{debug,release}/deps/`, the parent of
    `deps/` one level up — this covers the nextest / integration-
