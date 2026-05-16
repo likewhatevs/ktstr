@@ -1010,9 +1010,9 @@ mod tests {
             "bzImage",
             "2026-04-22T00:00:00Z",
         )
-        .with_version(version.map(String::from))
-        .with_ktstr_kconfig_hash(ktstr_kconfig_hash.map(String::from))
-        .with_extra_kconfig_hash(extra_kconfig_hash.map(String::from));
+        .with_version(version)
+        .with_ktstr_kconfig_hash(ktstr_kconfig_hash)
+        .with_extra_kconfig_hash(extra_kconfig_hash);
         crate::cache::ListedEntry::Valid(Box::new(CacheEntry {
             key: key.to_string(),
             path,
@@ -1116,9 +1116,9 @@ mod tests {
             "bzImage",
             "2026-04-12T10:00:00Z",
         )
-        .with_version(Some("6.14.2".to_string()))
-        .with_ktstr_kconfig_hash(Some(current_hash.to_string()))
-        .with_extra_kconfig_hash(Some("deadbeef".to_string()));
+        .with_version(Some("6.14.2"))
+        .with_ktstr_kconfig_hash(Some(current_hash))
+        .with_extra_kconfig_hash(Some("deadbeef"));
         let entry_with = cache
             .store("with-extras", &CacheArtifacts::new(&image), &meta_with)
             .unwrap();
@@ -1133,8 +1133,8 @@ mod tests {
             "bzImage",
             "2026-04-12T10:00:00Z",
         )
-        .with_version(Some("6.14.2".to_string()))
-        .with_ktstr_kconfig_hash(Some(current_hash.to_string()));
+        .with_version(Some("6.14.2"))
+        .with_ktstr_kconfig_hash(Some(current_hash));
         let entry_without = cache
             .store(
                 "without-extras",
@@ -1162,7 +1162,7 @@ mod tests {
             "bzImage",
             "2026-04-12T10:00:00Z",
         )
-        .with_version(Some("2.6.32".to_string()));
+        .with_version(Some("2.6.32"));
         let entry = cache
             .store("fetch-failed-fallback", &CacheArtifacts::new(&image), &meta)
             .unwrap();
@@ -1190,8 +1190,8 @@ mod tests {
             "bzImage",
             "2026-04-12T10:00:00Z",
         )
-        .with_version(Some("2.6.32".to_string()))
-        .with_ktstr_kconfig_hash(Some("deadbeef".to_string()));
+        .with_version(Some("2.6.32"))
+        .with_ktstr_kconfig_hash(Some("deadbeef"));
         let stale_entry = cache
             .store("stale-eol", &CacheArtifacts::new(&image), &stale_meta)
             .unwrap();
@@ -1210,7 +1210,7 @@ mod tests {
             "bzImage",
             "2026-04-12T10:00:00Z",
         )
-        .with_version(Some("2.6.32".to_string()))
+        .with_version(Some("2.6.32"))
         .with_ktstr_kconfig_hash(None::<String>);
         let untracked_entry = cache
             .store(
@@ -1248,7 +1248,7 @@ mod tests {
                 "bzImage",
                 "2026-04-12T10:00:00Z",
             )
-            .with_version(Some(version.to_string()));
+            .with_version(Some(version));
             cache
                 .store(key, &CacheArtifacts::new(&image), &meta)
                 .unwrap()
@@ -1300,7 +1300,7 @@ mod tests {
             "bzImage",
             "2026-04-22T00:00:00Z",
         )
-        .with_version(Some("6.14.2".to_string()));
+        .with_version(Some("6.14.2"));
         let valid_1 = cache
             .store("valid-entry-a", &CacheArtifacts::new(&image), &meta)
             .unwrap();
@@ -1368,8 +1368,8 @@ mod tests {
                 "bzImage",
                 "2026-04-12T10:00:00Z",
             )
-            .with_version(Some("6.14.2".to_string()))
-            .with_ktstr_kconfig_hash(hash.map(str::to_string))
+            .with_version(Some("6.14.2"))
+            .with_ktstr_kconfig_hash(hash)
         }
         let cases: &[(&str, Option<&str>, &str)] = &[
             ("matches", Some("same"), "same"),
@@ -1432,8 +1432,8 @@ mod tests {
                 "bzImage",
                 "2026-04-12T10:00:00Z",
             )
-            .with_version(version.map(str::to_string))
-            .with_ktstr_kconfig_hash(entry_hash.map(str::to_string));
+            .with_version(version)
+            .with_ktstr_kconfig_hash(entry_hash);
             let entry = cache
                 .store(key, &CacheArtifacts::new(&image), &meta)
                 .unwrap();

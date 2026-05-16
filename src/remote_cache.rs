@@ -425,7 +425,7 @@ mod tests {
             "bzImage",
             "2026-04-12T10:00:00Z",
         )
-        .with_version(Some("6.14.2".to_string()))
+        .with_version(Some("6.14.2"))
     }
 
     fn create_fake_image(dir: &std::path::Path) -> std::path::PathBuf {
@@ -784,10 +784,7 @@ mod tests {
         let src = tempfile::TempDir::new().unwrap();
         let image = create_fake_image(src.path());
         let meta = KernelMetadata::new(
-            KernelSource::Git {
-                git_hash: Some("a1b2c3d".to_string()),
-                git_ref: Some("v6.15-rc3".to_string()),
-            },
+            KernelSource::git("a1b2c3d", "v6.15-rc3"),
             "x86_64",
             "bzImage",
             "2026-04-12T12:00:00Z",

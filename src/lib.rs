@@ -1255,7 +1255,7 @@ mod tests {
             "bzImage",
             "2026-04-12T10:00:00Z",
         )
-        .with_version(Some("6.14.2".to_string()));
+        .with_version(Some("6.14.2"));
         // `ktstr_kconfig_hash` defaults to None in `KernelMetadata::new`,
         // which is exactly the Untracked shape this test needs.
         assert!(
@@ -1329,7 +1329,7 @@ mod tests {
             "current.bzImage",
             "2026-04-01T00:00:00Z",
         )
-        .with_version(Some("6.14.2".to_string()))
+        .with_version(Some("6.14.2"))
         .with_ktstr_kconfig_hash(Some(current_hash.clone()));
         let current_entry = cache
             .store(
@@ -1348,7 +1348,7 @@ mod tests {
             "stale.bzImage",
             "2026-04-20T00:00:00Z",
         )
-        .with_version(Some("6.14.3".to_string()))
+        .with_version(Some("6.14.3"))
         .with_ktstr_kconfig_hash(Some(stale_hash));
         cache
             .store(
@@ -2232,7 +2232,7 @@ mod tests {
             "bzImage",
             "2026-04-13T10:00:00Z",
         )
-        .with_extra_kconfig_hash(Some("deadbeef".to_string()));
+        .with_extra_kconfig_hash(Some("deadbeef"));
         let extras = cache
             .store(
                 "test-has-extras",

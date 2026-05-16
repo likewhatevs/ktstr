@@ -1160,7 +1160,7 @@ fn kconfig_status_matches_when_hash_equal() {
     let cache = CacheDir::with_root(tmp.path().join("cache"));
     let src_dir = TempDir::new().unwrap();
     let image = create_fake_image(src_dir.path());
-    let meta = test_metadata("6.14.2").with_ktstr_kconfig_hash(Some("deadbeef".to_string()));
+    let meta = test_metadata("6.14.2").with_ktstr_kconfig_hash(Some("deadbeef"));
     let entry = cache
         .store("kc-match", &CacheArtifacts::new(&image), &meta)
         .unwrap();
@@ -1189,7 +1189,7 @@ fn kconfig_status_stale_pins_cached_and_current_field_order() {
     let cache = CacheDir::with_root(tmp.path().join("cache"));
     let src_dir = TempDir::new().unwrap();
     let image = create_fake_image(src_dir.path());
-    let meta = test_metadata("6.14.2").with_ktstr_kconfig_hash(Some("old_cached".to_string()));
+    let meta = test_metadata("6.14.2").with_ktstr_kconfig_hash(Some("old_cached"));
     let entry = cache
         .store("kc-stale", &CacheArtifacts::new(&image), &meta)
         .unwrap();
@@ -2510,7 +2510,7 @@ fn kconfig_status_empty_strings_classify_as_matches() {
     let cache = CacheDir::with_root(tmp.path().join("cache"));
     let src_dir = TempDir::new().unwrap();
     let image = create_fake_image(src_dir.path());
-    let meta = test_metadata("6.14.2").with_ktstr_kconfig_hash(Some("".to_string()));
+    let meta = test_metadata("6.14.2").with_ktstr_kconfig_hash(Some(""));
     let entry = cache
         .store("empty-vs-empty", &CacheArtifacts::new(&image), &meta)
         .unwrap();
@@ -2533,7 +2533,7 @@ fn kconfig_status_empty_cached_vs_nonempty_current_is_stale() {
     let cache = CacheDir::with_root(tmp.path().join("cache"));
     let src_dir = TempDir::new().unwrap();
     let image = create_fake_image(src_dir.path());
-    let meta = test_metadata("6.14.2").with_ktstr_kconfig_hash(Some("".to_string()));
+    let meta = test_metadata("6.14.2").with_ktstr_kconfig_hash(Some(""));
     let entry = cache
         .store("empty-vs-nonempty", &CacheArtifacts::new(&image), &meta)
         .unwrap();

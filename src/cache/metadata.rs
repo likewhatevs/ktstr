@@ -532,10 +532,7 @@ mod tests {
     fn cache_metadata_serde_git_with_payload() {
         let meta = KernelMetadata {
             version: Some("6.15-rc3".to_string()),
-            source: KernelSource::Git {
-                git_hash: Some("a1b2c3d".to_string()),
-                git_ref: Some("v6.15-rc3".to_string()),
-            },
+            source: KernelSource::git("a1b2c3d", "v6.15-rc3"),
             arch: "aarch64".to_string(),
             image_name: "Image".to_string(),
             config_hash: None,
@@ -641,10 +638,10 @@ mod tests {
             "bzImage",
             "2026-04-12T10:00:00Z",
         )
-        .with_version(Some("6.14.2".to_string()))
-        .with_config_hash(Some("cfg-hash".to_string()))
-        .with_ktstr_kconfig_hash(Some("ktstr-hash".to_string()))
-        .with_extra_kconfig_hash(Some("extra-hash".to_string()))
+        .with_version(Some("6.14.2"))
+        .with_config_hash(Some("cfg-hash"))
+        .with_ktstr_kconfig_hash(Some("ktstr-hash"))
+        .with_extra_kconfig_hash(Some("extra-hash"))
         .with_source_vmlinux_stat(123_456_789, 1_700_000_000);
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
@@ -818,11 +815,7 @@ mod tests {
     fn kernel_source_serde_tagged_representation() {
         let t = serde_json::to_string(&KernelSource::Tarball).unwrap();
         assert_eq!(t, r#"{"type":"tarball"}"#);
-        let g = serde_json::to_string(&KernelSource::Git {
-            git_hash: Some("abc".to_string()),
-            git_ref: Some("main".to_string()),
-        })
-        .unwrap();
+        let g = serde_json::to_string(&KernelSource::git("abc", "main")).unwrap();
         assert!(g.contains(r#""type":"git""#));
         assert!(g.contains(r#""git_hash":"abc""#));
         assert!(g.contains(r#""ref":"main""#));
@@ -1123,10 +1116,7 @@ mod tests {
     /// `git_hash` which describes the acquire-time HEAD).
     #[test]
     fn as_local_git_hash_returns_none_for_git_even_with_hash_field() {
-        let src = KernelSource::Git {
-            git_hash: Some("a1b2c3d".to_string()),
-            git_ref: Some("main".to_string()),
-        };
+        let src = KernelSource::git("a1b2c3d", "main");
         assert_eq!(
             src.as_local_git_hash(),
             None,
@@ -1262,7 +1252,7 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
         let meta =
-            test_metadata("6.14.2").with_extra_kconfig_hash(Some("user-fragment-hash".to_string()));
+            test_metadata("6.14.2").with_extra_kconfig_hash(Some("user-fragment-hash"));
         let entry = cache
             .store("with-extra", &CacheArtifacts::new(&image), &meta)
             .unwrap();
