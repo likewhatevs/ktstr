@@ -133,6 +133,19 @@ const NO_MATCH_KEY_SAMPLE: usize = 3;
 /// failure text per sampled key.
 const NO_MATCH_KEY_CHAR_CAP: usize = 80;
 
+/// Discriminator that [`render_entry_key`]'s fallback path prepends
+/// to the raw `key_hex` bytes when an entry's BTF-rendered key was
+/// missing at capture time. [`SnapshotError::NoMatch`]'s `Display`
+/// impl uses the same prefix as the gate for its BTF-missing hint
+/// (when every sampled key starts with this string, BTF was
+/// uniformly absent for the map's key type and the hint points the
+/// operator at `CONFIG_DEBUG_INFO_BTF=y`). Naming the producer +
+/// consumer contract once here keeps a future rename of one side
+/// from silently desynchronising the other. Test sites in this
+/// module intentionally retain the literal `"hex:"` so they pin the
+/// value separately from the const that synchronises production.
+const HEX_KEY_PREFIX: &str = "hex:";
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -394,7 +407,7 @@ impl std::fmt::Display for SnapshotError {
                     // discriminator.
                     if available_keys
                         .iter()
-                        .all(|k| k.starts_with("hex:"))
+                        .all(|k| k.starts_with(HEX_KEY_PREFIX))
                     {
                         write!(
                             f,
@@ -1504,11 +1517,11 @@ fn render_entry_key(entry: &SnapshotEntry<'_>) -> Option<String> {
     let key = match entry {
         SnapshotEntry::Hash(e) => match e.key.as_ref() {
             Some(rv) => rv.to_string(),
-            None => format!("hex:{}", e.key_hex),
+            None => format!("{HEX_KEY_PREFIX}{}", e.key_hex),
         },
         SnapshotEntry::PercpuHash(e) => match e.key.as_ref() {
             Some(rv) => rv.to_string(),
-            None => format!("hex:{}", e.key_hex),
+            None => format!("{HEX_KEY_PREFIX}{}", e.key_hex),
         },
         SnapshotEntry::Percpu(e) => e.key.to_string(),
         SnapshotEntry::Value(_) | SnapshotEntry::Missing(_) => return None,
