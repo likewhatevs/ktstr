@@ -262,8 +262,8 @@ let r = assert_baseline(&reports, &SchedulerBaseline::strict());
 
 // Or build piecewise with explicit thresholds.
 let baseline = SchedulerBaseline::EMPTY
-    .with_max_p99_wake_latency_ns(5_000_000)
-    .with_min_work_units(100);
+    .max_p99_wake_latency_ns(5_000_000)
+    .min_work_units(100);
 let r = assert_baseline(&reports, &baseline);
 ```
 

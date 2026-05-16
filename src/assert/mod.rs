@@ -3105,7 +3105,7 @@ impl SchedulerBaseline {
     /// loose — a baseline tight enough to catch egregious regressions
     /// without flagging every routine scheduler perturbation. Tests
     /// that need tighter bounds should set the fields explicitly via
-    /// the `with_*` builder methods rather than tuning these constants.
+    /// the bare-verb builder methods rather than tuning these constants.
     pub const fn strict() -> Self {
         Self {
             max_p99_wake_latency_ns: Some(10_000_000),
@@ -3116,25 +3116,25 @@ impl SchedulerBaseline {
     }
 
     /// Builder setter for [`Self::max_p99_wake_latency_ns`].
-    pub const fn with_max_p99_wake_latency_ns(mut self, v: u64) -> Self {
+    pub const fn max_p99_wake_latency_ns(mut self, v: u64) -> Self {
         self.max_p99_wake_latency_ns = Some(v);
         self
     }
 
     /// Builder setter for [`Self::max_iteration_cost_p99_ns`].
-    pub const fn with_max_iteration_cost_p99_ns(mut self, v: u64) -> Self {
+    pub const fn max_iteration_cost_p99_ns(mut self, v: u64) -> Self {
         self.max_iteration_cost_p99_ns = Some(v);
         self
     }
 
     /// Builder setter for [`Self::max_migrations`].
-    pub const fn with_max_migrations(mut self, v: u64) -> Self {
+    pub const fn max_migrations(mut self, v: u64) -> Self {
         self.max_migrations = Some(v);
         self
     }
 
     /// Builder setter for [`Self::min_work_units`].
-    pub const fn with_min_work_units(mut self, v: u64) -> Self {
+    pub const fn min_work_units(mut self, v: u64) -> Self {
         self.min_work_units = Some(v);
         self
     }
