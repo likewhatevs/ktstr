@@ -1137,7 +1137,7 @@ pub fn run_shell(
     let mut builder = vmm::KtstrVm::builder()
         .kernel(&kernel)
         .init_binary(&payload)
-        .topology(numa_nodes, llcs, cores, threads)
+        .topology(vmm::Topology::new(numa_nodes, llcs, cores, threads))
         .cmdline(&cmdline)
         .include_files(owned_includes)
         .busybox(true)

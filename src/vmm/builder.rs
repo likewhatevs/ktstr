@@ -40,7 +40,7 @@ use super::{KtstrVm, disk_config};
 /// - `timeout` — 12 s (overridden by [`timeout`](Self::timeout))
 /// - `watchdog_timeout` — 5 s (overridden by [`watchdog_timeout`](Self::watchdog_timeout))
 /// - `topology` — 1 NUMA node × 1 LLC × 1 core × 1 thread (overridden
-///   by [`topology`](Self::topology) or [`with_topology`](Self::with_topology))
+///   by [`topology`](Self::topology))
 /// - `performance_mode` — `false` (operator opts in via
 ///   [`performance_mode`](Self::performance_mode))
 pub struct KtstrVmBuilder {
@@ -243,24 +243,12 @@ impl KtstrVmBuilder {
         self
     }
 
-    /// Set a uniform virtual CPU topology (big-to-little:
-    /// `numa_nodes, llcs, cores_per_llc, threads_per_core`).
+    /// Set the virtual CPU topology.
     ///
-    /// Produces a topology with uniform LLC/memory distribution and
-    /// default 10/20 NUMA distances. For per-node configuration
-    /// (asymmetric memory, CXL nodes, custom distances), use
-    /// [`with_topology`](Self::with_topology).
-    pub fn topology(mut self, numa_nodes: u32, llcs: u32, cores: u32, threads: u32) -> Self {
-        self.topology = Topology::new(numa_nodes, llcs, cores, threads);
-        self
-    }
-
-    /// Set a pre-constructed topology with full per-node configuration.
-    ///
-    /// Accepts a [`Topology`] built via [`Topology::with_nodes`] and
-    /// optionally [`Topology::with_distances`], preserving per-node
-    /// memory sizes, CXL memory-only nodes, and custom distance matrices.
-    pub fn with_topology(mut self, topo: Topology) -> Self {
+    /// For uniform topologies, build with [`Topology::new`]. For
+    /// per-node configuration (asymmetric memory, CXL nodes, custom
+    /// distances), use [`Topology::with_nodes`] / [`Topology::with_distances`].
+    pub fn topology(mut self, topo: Topology) -> Self {
         self.topology = topo;
         self
     }
@@ -301,14 +289,6 @@ impl KtstrVmBuilder {
     pub fn cmdline(mut self, extra: &str) -> Self {
         self.cmdline_extra = extra.to_string();
         self
-    }
-
-    /// Alias for [`Self::cmdline`]. The field is named
-    /// `cmdline_extra` internally; the alias matches the field name
-    /// for callers that prefer the longer form.
-    #[allow(dead_code)]
-    pub fn cmdline_extra(self, extra: &str) -> Self {
-        self.cmdline(extra)
     }
 
     /// Host-side watchdog timeout. The VM is killed if it has not
@@ -1108,7 +1088,7 @@ mod tests {
 
     #[test]
     fn builder_topology() {
-        let b = KtstrVmBuilder::default().topology(1, 2, 4, 2);
+        let b = KtstrVmBuilder::default().topology(Topology::new(1, 2, 4, 2));
         assert_eq!(b.topology.total_cpus(), 16);
         assert_eq!(b.topology.llcs, 2);
     }
@@ -1130,7 +1110,7 @@ mod tests {
     #[test]
     fn builder_chain() {
         let b = KtstrVmBuilder::default()
-            .topology(1, 2, 2, 2)
+            .topology(Topology::new(1, 2, 2, 2))
             .memory_mib(4096)
             .cmdline("root=/dev/sda")
             .timeout(Duration::from_secs(300));
@@ -1185,19 +1165,19 @@ mod tests {
     #[test]
     #[should_panic(expected = "invalid Topology")]
     fn builder_rejects_zero_llcs() {
-        KtstrVmBuilder::default().topology(1, 0, 2, 2);
+        KtstrVmBuilder::default().topology(Topology::new(1, 0, 2, 2));
     }
 
     #[test]
     #[should_panic(expected = "invalid Topology")]
     fn builder_rejects_zero_cores() {
-        KtstrVmBuilder::default().topology(1, 2, 0, 2);
+        KtstrVmBuilder::default().topology(Topology::new(1, 2, 0, 2));
     }
 
     #[test]
     #[should_panic(expected = "invalid Topology")]
     fn builder_rejects_zero_threads() {
-        KtstrVmBuilder::default().topology(1, 2, 2, 0);
+        KtstrVmBuilder::default().topology(Topology::new(1, 2, 2, 0));
     }
 
     #[test]

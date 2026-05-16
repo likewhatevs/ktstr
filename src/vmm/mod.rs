@@ -1391,7 +1391,7 @@ mod tests {
         let vm = skip_on_contention!(
             KtstrVm::builder()
                 .kernel(&kernel)
-                .topology(1, 1, 1, 1)
+                .topology(Topology::new(1, 1, 1, 1))
                 .memory_mib(256)
                 .timeout(Duration::from_secs(10))
                 .cmdline("loglevel=7")
@@ -1412,7 +1412,7 @@ mod tests {
         let vm = skip_on_contention!(
             KtstrVm::builder()
                 .kernel(&kernel)
-                .topology(1, 2, 2, 1) // 4 CPUs
+                .topology(Topology::new(1, 2, 2, 1)) // 4 CPUs
                 .memory_mib(256)
                 .timeout(Duration::from_secs(10))
                 .cmdline("loglevel=7")
@@ -1435,7 +1435,7 @@ mod tests {
             let start = Instant::now();
             let vm = match KtstrVm::builder()
                 .kernel(&kernel)
-                .topology(1, llcs, cores, threads)
+                .topology(Topology::new(1, llcs, cores, threads))
                 .memory_mib(mem)
                 .timeout(Duration::from_secs(10))
                 .build()
@@ -1510,7 +1510,7 @@ mod tests {
             KtstrVm::builder()
                 .kernel(&kernel)
                 .init_binary(&exe)
-                .topology(1, 1, 2, 1)
+                .topology(Topology::new(1, 1, 2, 1))
                 .memory_deferred()
                 .timeout(Duration::from_secs(5))
                 .watchdog_timeout(Duration::from_secs(2))
@@ -1596,7 +1596,7 @@ mod tests {
             KtstrVm::builder()
                 .kernel(&kernel)
                 .init_binary(&exe)
-                .topology(1, 1, 2, 1)
+                .topology(Topology::new(1, 1, 2, 1))
                 .memory_deferred()
                 .timeout(Duration::from_secs(5))
                 .watchdog_timeout(Duration::from_secs(2))
@@ -1677,7 +1677,7 @@ mod tests {
             KtstrVm::builder()
                 .kernel(&kernel)
                 .init_binary(&exe)
-                .topology(1, 1, 2, 1)
+                .topology(Topology::new(1, 1, 2, 1))
                 .memory_deferred()
                 .timeout(Duration::from_secs(15))
                 .build()
@@ -1742,7 +1742,7 @@ mod tests {
         let vm = skip_on_contention!(
             KtstrVm::builder()
                 .kernel(&kernel)
-                .topology(1, 1, 2, 1)
+                .topology(Topology::new(1, 1, 2, 1))
                 .memory_mib(256)
                 .timeout(Duration::from_secs(15))
                 .cmdline("init=/nonexistent panic=-1")
@@ -1805,7 +1805,7 @@ mod tests {
             KtstrVm::builder()
                 .kernel(&kernel)
                 .init_binary(&exe)
-                .topology(1, 1, 2, 1)
+                .topology(Topology::new(1, 1, 2, 1))
                 .memory_deferred()
                 .timeout(Duration::from_secs(15))
                 .watchdog_timeout(Duration::from_secs(2))
@@ -1880,7 +1880,7 @@ mod tests {
         let vm = skip_on_contention!(
             KtstrVm::builder()
                 .kernel(&kernel)
-                .topology(1, 1, 1, 1)
+                .topology(Topology::new(1, 1, 1, 1))
                 .memory_mib(256)
                 .timeout(Duration::from_secs(5))
                 .scheduler_binary(&sched_bin)
@@ -1930,7 +1930,7 @@ mod tests {
         let vm = skip_on_contention!(
             KtstrVm::builder()
                 .kernel(&kernel)
-                .topology(1, 1, 2, 1)
+                .topology(Topology::new(1, 1, 2, 1))
                 .memory_mib(256)
                 .timeout(Duration::from_secs(30))
                 .scheduler_binary(&sched_bin)
@@ -2034,7 +2034,7 @@ mod tests {
             KtstrVm::builder()
                 .kernel(&kernel)
                 .init_binary(&exe)
-                .topology(1, 1, 2, 1)
+                .topology(Topology::new(1, 1, 2, 1))
                 .memory_deferred()
                 .timeout(Duration::from_secs(5))
                 .watchdog_timeout(Duration::from_secs(2))
@@ -2117,7 +2117,7 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         let result = KtstrVmBuilder::default()
             .kernel(&exe)
-            .topology(1, 1, 1, 1)
+            .topology(Topology::new(1, 1, 1, 1))
             .performance_mode(false)
             .build();
         match result {
@@ -2139,7 +2139,7 @@ mod tests {
         let too_many = host_topo.total_cpus() as u32 + 1;
         let result = KtstrVmBuilder::default()
             .kernel(&exe)
-            .topology(1, 1, too_many, 1)
+            .topology(Topology::new(1, 1, too_many, 1))
             .performance_mode(true)
             .build();
         match result {
@@ -2163,7 +2163,7 @@ mod tests {
         if (too_many_llcs as usize + 1) <= host_topo.total_cpus() {
             let result = KtstrVmBuilder::default()
                 .kernel(&exe)
-                .topology(1, too_many_llcs, 1, 1)
+                .topology(Topology::new(1, too_many_llcs, 1, 1))
                 .performance_mode(true)
                 .build();
             assert!(
@@ -2182,7 +2182,7 @@ mod tests {
         }
         let result = KtstrVmBuilder::default()
             .kernel(&exe)
-            .topology(1, 1, 2, 1)
+            .topology(Topology::new(1, 1, 2, 1))
             .performance_mode(true)
             .build();
         match result {
@@ -2207,7 +2207,7 @@ mod tests {
         let vm = skip_on_contention!(
             KtstrVmBuilder::default()
                 .kernel(&exe)
-                .topology(1, 1, 2, 1)
+                .topology(Topology::new(1, 1, 2, 1))
                 .performance_mode(true)
                 .build()
         );
@@ -2220,7 +2220,7 @@ mod tests {
         let vm = skip_on_contention!(
             KtstrVmBuilder::default()
                 .kernel(&exe)
-                .topology(1, 1, 1, 1)
+                .topology(Topology::new(1, 1, 1, 1))
                 .performance_mode(false)
                 .build()
         );
@@ -2236,7 +2236,7 @@ mod tests {
         }
         let vm = KtstrVmBuilder::default()
             .kernel(&exe)
-            .topology(1, 1, 2, 1)
+            .topology(Topology::new(1, 1, 2, 1))
             .performance_mode(true)
             .build();
         if let Ok(vm) = vm {

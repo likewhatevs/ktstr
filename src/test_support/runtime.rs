@@ -445,7 +445,7 @@ pub(crate) fn build_vm_builder_base(
     let mut builder = crate::vmm::KtstrVm::builder()
         .kernel(kernel)
         .init_binary(ktstr_bin)
-        .with_topology(vm_topology)
+        .topology(vm_topology)
         .memory_deferred_min(memory_mib)
         .cmdline(cmdline_extra)
         .run_args(guest_args)
@@ -1365,7 +1365,7 @@ mod tests {
     }
 
     /// A zero-`llcs` topology is forwarded to the builder and surfaces
-    /// as a validation error. Proves `with_topology()` is wired through.
+    /// as a validation error. Proves `topology()` is wired through.
     #[test]
     fn build_vm_builder_base_propagates_topology_validation() {
         let entry = KtstrTestEntry {

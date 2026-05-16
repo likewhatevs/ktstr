@@ -593,20 +593,15 @@ pub fn collect_verifier_output(
     let sched_args: Vec<String> = extra_sched_args.to_vec();
 
     let no_perf_mode = std::env::var("KTSTR_NO_PERF_MODE").is_ok();
-    // Use the validated Topology's fields as the source of truth at
-    // the builder boundary. Named-field destructure here prevents the
-    // misorder a bare 4-tuple would silently accept.
+    // Pass the validated Topology directly so misorder cannot occur
+    // at the builder boundary (the TryFrom above already enforces the
+    // type-level invariants).
     let vm = crate::vmm::KtstrVm::builder()
         .kernel(kernel)
         .init_binary(ktstr_bin)
         .scheduler_binary(sched_bin)
         .sched_args(&sched_args)
-        .topology(
-            validated.numa_nodes,
-            validated.llcs,
-            validated.cores_per_llc,
-            validated.threads_per_core,
-        )
+        .topology(validated)
         .memory_mib(2048)
         .timeout(std::time::Duration::from_secs(120))
         .no_perf_mode(no_perf_mode)
