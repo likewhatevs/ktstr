@@ -246,8 +246,8 @@ use ktstr::prelude::*;
 fn cpuset_split(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
-            CgroupDef::named("cg_0").with_cpuset(CpusetSpec::disjoint(0, 2)),
-            CgroupDef::named("cg_1").with_cpuset(CpusetSpec::disjoint(1, 2)),
+            CgroupDef::named("cg_0").cpuset(CpusetSpec::disjoint(0, 2)),
+            CgroupDef::named("cg_1").cpuset(CpusetSpec::disjoint(1, 2)),
         ],
         HoldSpec::FULL,
     )];

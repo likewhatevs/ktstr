@@ -2009,7 +2009,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "cannot convert float seconds to Duration")]
     fn settled_hold_panics_on_nan() {
         let cg = crate::cgroup::CgroupManager::new("/nonexistent");
         let topo = crate::topology::TestTopology::synthetic(1, 1);

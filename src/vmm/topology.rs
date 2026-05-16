@@ -1519,7 +1519,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "index out of bounds")]
     fn topology_first_llc_in_node_panics_on_index_above_numa_nodes() {
         // Documented behavior: node_id > numa_nodes indexes past the
         // end of the node slice on the walk, panicking.
