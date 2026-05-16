@@ -28,6 +28,13 @@
 //    caching — no global state, no `std::env::set_var`, no FS
 //    writes outside the caller-provided paths. Pure is what makes
 //    the double-consumer (build + runtime) safe.
+// 5. **Bundled into ktstr-macros.** Everything before the first
+//    `#[cfg(test)]` is mirrored verbatim between
+//    `src/kernel_path.rs` (the canonical source) and
+//    `ktstr-macros/src/kernel_path.rs` (the bundled mirror);
+//    `ktstr-macros/build.rs` panics on any drift. Edits to
+//    non-test items must update both copies in lock-step. The
+//    `#[cfg(test)]` portion lives in `src/kernel_path.rs` only.
 
 /// Kernel identifier: filesystem path, version string, cache key,
 /// stable-release range, or git source.
