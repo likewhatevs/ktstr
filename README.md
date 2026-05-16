@@ -62,7 +62,7 @@ Add ktstr as a dev-dependency:
 
 ```toml
 [dev-dependencies]
-ktstr = { version = "0.5" }
+ktstr = "0.5.2"
 ```
 
 This is all test authors need -- run with
@@ -71,12 +71,13 @@ This is all test authors need -- run with
 The `anyhow::Result` referenced in examples below is re-exported
 through `ktstr::prelude`; no separate `anyhow` dev-dependency needed.
 
-**Version compatibility:** pin the same ktstr major.minor version
-across `[dev-dependencies] ktstr = ...` and `cargo install --locked
+**Version compatibility:** pin the EXACT ktstr patch version across
+`[dev-dependencies] ktstr = "X.Y.Z"` and `cargo install --locked
 --bin cargo-ktstr ktstr@X.Y.Z`. ktstr is pre-1.0 — minor-version
-bumps may break the test-facing API. Examples below assume 0.5; an
-example from a different release may not compile against the crate
-this README documents.
+bumps may break the test-facing API, and patch bumps may break
+unstable internal surfaces (the CI matrix runs against the locked
+patch). Examples below assume 0.5.2; an example from a different
+release may not compile against the crate this README documents.
 
 **Optional CLI tools**:
 
@@ -209,9 +210,13 @@ scheduler's topology. For non-uniform NUMA, see
 this scheduler. Per-test `#[ktstr_test(extra_sched_args = [...])]`
 appends additional args after these.
 
-The macro emits `pub static MY_SCHED: Scheduler` and registers a
-private linkme static in the `KTSTR_SCHEDULERS` distributed slice
-so `cargo ktstr verifier` discovers it automatically. Add
+The macro emits `pub static MY_SCHED: Scheduler` (referenceable by
+the bare ident `MY_SCHED`) and ALSO registers an internal
+`#[linkme::distributed_slice(KTSTR_SCHEDULERS)]` entry whose name
+is mangled (`__KTSTR_SCHED_REG_MY_SCHED`) so `cargo ktstr verifier`
+auto-discovers the scheduler. Test authors interact with the
+public `MY_SCHED` static only; the distributed-slice entry is a
+framework-internal hook. Add
 `scheduler = MY_SCHED` to `#[ktstr_test]` to target it:
 
 ```rust
@@ -241,8 +246,8 @@ use ktstr::prelude::*;
 fn cpuset_split(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
-            CgroupDef::named("cg_0").with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 }),
-            CgroupDef::named("cg_1").with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 }),
+            CgroupDef::named("cg_0").with_cpuset(CpusetSpec::disjoint(0, 2)),
+            CgroupDef::named("cg_1").with_cpuset(CpusetSpec::disjoint(1, 2)),
         ],
         HoldSpec::FULL,
     )];
