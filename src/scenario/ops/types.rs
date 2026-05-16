@@ -2511,8 +2511,14 @@ mod cgroup_def_default_tests {
     use super::*;
     use crate::workload::WorkSpec;
 
-    // Compile-time pin: `CgroupDef` must NOT impl `Default`. See the
-    // type-level docstring for the name="cg_0" collision rationale.
+    // Future contributor: if you hit an AmbiguousIfImpl compile error
+    // here after adding `derive(Default)` (or a manual Default impl)
+    // on CgroupDef, the rationale is at src/scenario/ops/types.rs:1666
+    // (TL;DR: the derived/zeroed default produced `name = "cg_0"`,
+    // which collides with the conventional first cgroup name in
+    // nearly every scenario — `..Default::default()` callers would
+    // silently share state with the scenario's first named entry).
+    // Use `CgroupDef::named(...)` at every construction site.
     assert_not_impl_default!(CgroupDef);
 
     #[test]

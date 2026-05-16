@@ -110,8 +110,14 @@ fn worker_report_serde_roundtrip() {
 // dropping `const` would silently break const-context use.
 const _: Migration = Migration::new(0, 1, 2);
 
-// Compile-time pin: `Migration` must NOT impl `Default`. See the
-// type doc for the self-migration rationale.
+// Future contributor: if you hit an AmbiguousIfImpl compile error
+// here after adding `derive(Default)` (or a manual Default impl) on
+// Migration, the rationale is at src/workload/spawn/mod.rs:25
+// (TL;DR: a zeroed Migration is `{at_ns: 0, from_cpu: 0, to_cpu: 0}`
+// which is a self-migration where source == dest — NOT a real
+// migration. Downstream analysis that assumes `from_cpu != to_cpu`
+// would misread default values as real migrations). Construct every
+// Migration explicitly via `Migration::new`.
 assert_not_impl_default!(Migration);
 
 #[test]
