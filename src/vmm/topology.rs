@@ -1632,4 +1632,131 @@ mod tests {
         assert_eq!(parsed.cores_per_llc, original.cores_per_llc);
         assert_eq!(parsed.threads_per_core, original.threads_per_core);
     }
+
+    // -- MemSideCache::new should_panic cluster --
+
+    #[test]
+    #[should_panic(expected = "MemSideCache: associativity must fit in 4 bits")]
+    fn mem_side_cache_new_panics_on_associativity_above_15() {
+        MemSideCache::new(4096, 16, 1, 64);
+    }
+
+    #[test]
+    #[should_panic(expected = "MemSideCache: write_policy must fit in 4 bits")]
+    fn mem_side_cache_new_panics_on_write_policy_above_15() {
+        MemSideCache::new(4096, 8, 16, 64);
+    }
+
+    // -- NumaDistance::new should_panic cluster (ACPI SLIT invariants) --
+
+    #[test]
+    #[should_panic(expected = "NumaDistance: n must be > 0")]
+    fn numa_distance_new_panics_on_zero_n() {
+        static EMPTY: [u8; 0] = [];
+        NumaDistance::new(0, &EMPTY);
+    }
+
+    #[test]
+    #[should_panic(expected = "NumaDistance: entries.len() must equal n * n")]
+    fn numa_distance_new_panics_on_size_mismatch() {
+        static THREE_ENTRIES: [u8; 3] = [10, 20, 10];
+        // n=2 expects 4 entries, but only 3 supplied.
+        NumaDistance::new(2, &THREE_ENTRIES);
+    }
+
+    #[test]
+    #[should_panic(expected = "NumaDistance: diagonal entry must be 10")]
+    fn numa_distance_new_panics_on_nonten_diagonal() {
+        // n=2 with diagonal[0][0] = 9 instead of 10.
+        static BAD_DIAG: [u8; 4] = [9, 20, 20, 10];
+        NumaDistance::new(2, &BAD_DIAG);
+    }
+
+    #[test]
+    #[should_panic(expected = "NumaDistance: off-diagonal entry must be > 10")]
+    fn numa_distance_new_panics_on_offdiagonal_at_or_below_ten() {
+        // n=2 with off-diagonal == 10 (must be > 10 per ACPI SLIT).
+        static OFF_DIAG_TEN: [u8; 4] = [10, 10, 10, 10];
+        NumaDistance::new(2, &OFF_DIAG_TEN);
+    }
+
+    #[test]
+    #[should_panic(expected = "NumaDistance: matrix must be symmetric")]
+    fn numa_distance_new_panics_on_asymmetric_matrix() {
+        // n=2 with entries[0][1] = 20 but entries[1][0] = 30.
+        static ASYMMETRIC: [u8; 4] = [10, 20, 30, 10];
+        NumaDistance::new(2, &ASYMMETRIC);
+    }
+
+    // -- Topology::with_nodes should_panic cluster --
+
+    #[test]
+    #[should_panic(expected = "invalid Topology: nodes must not be empty")]
+    fn topology_with_nodes_panics_on_empty_nodes() {
+        static EMPTY: [NumaNode; 0] = [];
+        Topology::with_nodes(2, 1, &EMPTY);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid Topology: cores_per_llc must be > 0")]
+    fn topology_with_nodes_panics_on_zero_cores() {
+        static NODES: [NumaNode; 1] = [NumaNode::new(2, 512)];
+        Topology::with_nodes(0, 1, &NODES);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid Topology: threads_per_core must be > 0")]
+    fn topology_with_nodes_panics_on_zero_threads() {
+        static NODES: [NumaNode; 1] = [NumaNode::new(2, 512)];
+        Topology::with_nodes(2, 0, &NODES);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid Topology: node LLC sum overflows u32")]
+    fn topology_with_nodes_panics_on_llc_sum_overflow() {
+        // iter 0: accumulator = 0 + u32::MAX = u32::MAX (OK; node is
+        // cpu-bearing with non-zero memory so the L491 check passes).
+        // iter 1: u32::MAX.checked_add(1) = None → panic at L489.
+        static NODES: [NumaNode; 2] = [
+            NumaNode::new(u32::MAX, 512),
+            NumaNode::new(1, 512),
+        ];
+        Topology::with_nodes(1, 1, &NODES);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid Topology: CPU-bearing node has zero memory")]
+    fn topology_with_nodes_panics_on_cpu_node_zero_memory() {
+        // llcs > 0 with memory_mib == 0 is rejected.
+        static BAD_MEM: [NumaNode; 1] = [NumaNode::new(2, 0)];
+        Topology::with_nodes(2, 1, &BAD_MEM);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid Topology: total LLCs must be > 0")]
+    fn topology_with_nodes_panics_on_no_llcs() {
+        // All memory-only nodes (llcs == 0) — total LLCs is 0.
+        static MEMORY_ONLY: [NumaNode; 1] = [NumaNode::new(0, 512)];
+        Topology::with_nodes(2, 1, &MEMORY_ONLY);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid Topology: total CPU count overflows u32")]
+    fn topology_with_nodes_panics_on_cpu_count_overflow() {
+        // cores_per_llc * threads_per_core overflows u32.
+        static NODES: [NumaNode; 1] = [NumaNode::new(1, 512)];
+        Topology::with_nodes(65_536, 65_536, &NODES);
+    }
+
+    // -- Topology::distances should_panic test --
+
+    #[test]
+    #[should_panic(expected = "invalid Topology: NumaDistance dimension must equal numa_nodes")]
+    fn topology_distances_panics_on_dimension_mismatch() {
+        // Topology has numa_nodes = 2 (uniform); attach a 3x3 distance
+        // matrix. distances.n = 3 != 2 = numa_nodes → panic.
+        static D3X3: [u8; 9] = [10, 20, 20, 20, 10, 20, 20, 20, 10];
+        static DIST: NumaDistance = NumaDistance::new(3, &D3X3);
+        Topology::new(2, 2, 1, 1).distances(&DIST);
+    }
 }
