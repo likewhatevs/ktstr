@@ -2614,24 +2614,29 @@ fn scheduler_label(spec: &SchedulerSpec) -> String {
 /// `AutoBuilt` one but can be arbitrarily old.
 ///
 /// `Eevdf` / `KernelBuiltin` / `Path` resolutions do not go through
-/// the discovery cascade; they map to [`EnvVar`](Self::EnvVar) style
-/// variants only by analogy. For those, the source is:
+/// the discovery cascade:
 /// - `Eevdf` / `KernelBuiltin` → [`NotFound`](Self::NotFound) (no
 ///   user-space binary involved; the tuple's `Option<PathBuf>` is
 ///   `None`).
-/// - `Path(p)` → [`EnvVar`](Self::EnvVar) (the caller named the path
-///   explicitly, which is the most authoritative source).
+/// - `Path(p)` → [`Path`](Self::Path) (the caller named the binary
+///   explicitly in the test entry — no env-var or filesystem search
+///   runs).
 ///
 /// The variant ordering in the enum mirrors the discovery cascade
 /// order in [`resolve_scheduler`] so a reviewer can scan both lists
 /// in lockstep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolveSource {
-    /// Resolved via an explicit environment variable or caller-
-    /// provided path (`KTSTR_SCHEDULER` for `Discover`, the literal
-    /// path for `SchedulerSpec::Path`). Trusted to the extent the
-    /// caller trusts the variable or argument; git-hash provenance
-    /// is UNKNOWN to this process.
+    /// Resolved via the literal path the caller supplied as
+    /// `SchedulerSpec::Path(p)`. No env-var or filesystem search
+    /// involved — the path arrived in the test entry directly.
+    /// Trusted to the extent the caller trusts the argument; git-
+    /// hash provenance is UNKNOWN to this process.
+    Path,
+    /// Resolved via the `KTSTR_SCHEDULER` environment variable on the
+    /// `SchedulerSpec::Discover` arm. Trusted to the extent the
+    /// caller trusts the variable; git-hash provenance is UNKNOWN
+    /// to this process.
     EnvVar,
     /// Resolved via a `$PATH` lookup. Only produced when
     /// `KTSTR_CARGO_TEST_MODE` is active and a binary by the
@@ -2707,7 +2712,7 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 /// Variant mapping:
 /// - `Eevdf` / `KernelBuiltin { .. }` → `(None, NotFound)` (no
 ///   user-space binary).
-/// - `Path(p)` → `(Some(p), EnvVar)` (explicit caller-named path;
+/// - `Path(p)` → `(Some(p), Path)` (explicit caller-named path;
 ///   validated for existence).
 /// - `Discover(name)` → cascade through `KTSTR_SCHEDULER` env
 ///   ([`EnvVar`](ResolveSource::EnvVar)), `$PATH` lookup when
@@ -2740,7 +2745,7 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, Resol
                  target/debug/scx_<name> path, or correct the path if \
                  it has shifted."
             );
-            Ok((Some(path), ResolveSource::EnvVar))
+            Ok((Some(path), ResolveSource::Path))
         }
         SchedulerSpec::Discover(name) => {
             // 1. KTSTR_SCHEDULER env var
@@ -3420,8 +3425,8 @@ mod tests {
         assert!(path.is_some());
         assert_eq!(
             source,
-            ResolveSource::EnvVar,
-            "explicit Path(_) is the most authoritative source — maps to EnvVar",
+            ResolveSource::Path,
+            "explicit SchedulerSpec::Path(_) is tagged Path",
         );
     }
 

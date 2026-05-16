@@ -903,7 +903,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "llcs_per_numa_node() requires uniform topology")]
-    fn llcs_per_numa_node_panics_on_explicit_nodes() {
+    fn topology_llcs_per_numa_node_panics_on_explicit_nodes() {
         static EXPLICIT: [NumaNode; 2] = [NumaNode::new(2, 512), NumaNode::new(2, 512)];
         let t = Topology::with_nodes(2, 1, &EXPLICIT);
         t.llcs_per_numa_node();
@@ -911,7 +911,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "numa_nodes must be > 0")]
-    fn llcs_per_numa_node_panics_on_zero_numa() {
+    fn topology_llcs_per_numa_node_panics_on_zero_numa() {
         // Direct construction bypasses Topology::new's numa_nodes>0 assert.
         let t = Topology {
             llcs: 2,
@@ -926,7 +926,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "must be divisible by numa_nodes")]
-    fn llcs_per_numa_node_panics_on_indivisible() {
+    fn topology_llcs_per_numa_node_panics_on_indivisible() {
         // 3 LLCs across 2 NUMA nodes — not evenly divisible.
         let t = Topology {
             llcs: 3,
@@ -1041,44 +1041,44 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "invalid Topology: numa_nodes must be > 0")]
-    fn new_panics_zero_numa() {
+    fn topology_new_panics_on_zero_numa() {
         Topology::new(0, 2, 1, 1);
     }
 
     #[test]
     #[should_panic(expected = "invalid Topology: llcs must be > 0")]
-    fn new_panics_zero_llcs() {
+    fn topology_new_panics_on_zero_llcs() {
         Topology::new(1, 0, 2, 1);
     }
 
     #[test]
     #[should_panic(expected = "invalid Topology: cores_per_llc must be > 0")]
-    fn new_panics_zero_cores() {
+    fn topology_new_panics_on_zero_cores() {
         Topology::new(1, 1, 0, 1);
     }
 
     #[test]
     #[should_panic(expected = "invalid Topology: threads_per_core must be > 0")]
-    fn new_panics_zero_threads() {
+    fn topology_new_panics_on_zero_threads() {
         Topology::new(1, 1, 2, 0);
     }
 
     #[test]
     #[should_panic(expected = "invalid Topology: llcs must be divisible by numa_nodes")]
-    fn new_panics_indivisible() {
+    fn topology_new_panics_on_indivisible() {
         Topology::new(2, 3, 2, 1);
     }
 
     #[test]
     #[should_panic(expected = "invalid Topology: total CPU count overflows u32")]
-    fn new_panics_llcs_times_cpus_overflow() {
+    fn topology_new_panics_on_llcs_times_cpus_overflow() {
         // llcs * cpus_per_llc overflows at L439 (cores*threads = 65536*2 succeeds at L435).
         Topology::new(1, 65536, 65536, 2);
     }
 
     #[test]
     #[should_panic(expected = "invalid Topology: total CPU count overflows u32")]
-    fn new_panics_cores_times_threads_overflow() {
+    fn topology_new_panics_on_cores_times_threads_overflow() {
         // cores_per_llc * threads_per_core = 65536 * 65536 = 2^32 overflows
         // at L435 BEFORE the llcs multiplication at L439.
         Topology::new(1, 1, 65_536, 65_536);
@@ -1520,7 +1520,7 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn first_llc_in_node_above_numa_nodes_panics() {
+    fn topology_first_llc_in_node_panics_on_index_above_numa_nodes() {
         // Documented behavior: node_id > numa_nodes indexes past the
         // end of the node slice on the walk, panicking.
         let t = Topology::with_nodes(2, 1, &TWO_NODES);
