@@ -131,16 +131,16 @@ ops-based scenarios.
 
 ```rust,ignore
 let def = CgroupDef::named("cg_0")
-    .with_cpuset(CpusetSpec::disjoint(0, 2))
+    .cpuset(CpusetSpec::disjoint(0, 2))
     .workers(4)
     .work_type(WorkType::SpinWait);
 ```
 
 ### Builder methods
 
-- `.with_cpuset(CpusetSpec)` -- set the cpuset (CPU set the cgroup is
+- `.cpuset(CpusetSpec)` -- set the cpuset (CPU set the cgroup is
   pinned to).
-- `.with_cpuset_mems(BTreeSet<usize>)` -- explicit `cpuset.mems`
+- `.cpuset_mems(BTreeSet<usize>)` -- explicit `cpuset.mems`
   override (default derives from the resolved cpuset's NUMA nodes).
 - `.workers(n)` -- set worker count.
 - `.workers_pct(p)` -- set worker count as a fraction of the cgroup's
@@ -196,7 +196,7 @@ the test to the topology shape:
 let n_workers =
     (ctx.cpuset_cpus(&CpusetSpec::Llc(0)) as f64 * 0.9).ceil() as usize;
 let def = CgroupDef::named("cg_hot")
-    .with_cpuset(CpusetSpec::Llc(0))
+    .cpuset(CpusetSpec::Llc(0))
     .workers(n_workers);
 ```
 
@@ -208,7 +208,7 @@ of the underlying topology:
 ```rust,ignore
 // After: framework computes the count from the resolved cpuset
 let def = CgroupDef::named("cg_hot")
-    .with_cpuset(CpusetSpec::Llc(0))
+    .cpuset(CpusetSpec::Llc(0))
     .workers_pct(0.9);  // ceil(N_CPUs * 0.9) workers
 ```
 

@@ -857,7 +857,7 @@ pub struct IoLimits {
 ///
 /// | Controller | One-line description | Builder methods | Underlying file(s) |
 /// |------------|----------------------|-----------------|--------------------|
-/// | cpuset | Bind to a CPU subset and NUMA-node memory affinity. | [`Self::with_cpuset`], [`Self::with_cpuset_mems`] | `cpuset.cpus`, `cpuset.mems` |
+/// | cpuset | Bind to a CPU subset and NUMA-node memory affinity. | [`Self::cpuset`], [`Self::cpuset_mems`] | `cpuset.cpus`, `cpuset.mems` |
 /// | cpu    | Bandwidth ceiling (`cpu.max` quota/period) plus relative-share weight. | [`Self::cpu_quota_pct`], [`Self::cpu_quota`], [`Self::cpu_unlimited`], [`Self::cpu_weight`] | `cpu.max`, `cpu.weight` |
 /// | memory | Hard ceiling, soft throttle threshold, soft protection floor, swap cap. | [`Self::memory_max`], [`Self::memory_high`], [`Self::memory_low`], [`Self::memory_swap_max`], [`Self::memory_swap_unlimited`], [`Self::memory_unlimited`] | `memory.max`, `memory.high`, `memory.low`, `memory.swap.max` |
 /// | io     | Relative IO share (BFQ / io.cost) when the io controller is enabled. | [`Self::io_weight`] | `io.weight` |
@@ -925,7 +925,7 @@ pub struct IoLimits {
 /// # use ktstr::workload::{WorkSpec, WorkType};
 /// // Single work group via convenience methods.
 /// let def = CgroupDef::named("workers")
-///     .with_cpuset(CpusetSpec::disjoint(0, 2))
+///     .cpuset(CpusetSpec::disjoint(0, 2))
 ///     .workers(4)
 ///     .work_type(WorkType::SpinWait);
 ///
@@ -956,7 +956,7 @@ pub struct IoLimits {
 /// #     known_flags: None,
 /// # };
 /// let def = CgroupDef::named("io_and_spin")
-///     .with_cpuset(CpusetSpec::disjoint(0, 2))
+///     .cpuset(CpusetSpec::disjoint(0, 2))
 ///     .workers(2)
 ///     .work_type(WorkType::SpinWait)
 ///     .workload(&BENCH);
@@ -1002,7 +1002,7 @@ pub struct CgroupDef {
     pub payload: Option<&'static crate::test_support::Payload>,
     /// Optional cpuset.mems NUMA node binding. `None` inherits the
     /// parent cgroup's `cpuset.mems`. Set via
-    /// [`Self::with_cpuset_mems`].
+    /// [`Self::cpuset_mems`].
     pub cpuset_mems: Option<BTreeSet<usize>>,
     /// Optional cpu controller limits (`cpu.max`, `cpu.weight`).
     /// `None` leaves both kernel defaults in place. Set via
@@ -1089,7 +1089,7 @@ impl CgroupDef {
     /// Set the cpuset for this cgroup. Use when defining cgroups in step
     /// setup (initial topology). For mid-run cpuset changes, use [`Op::SetCpuset`].
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn with_cpuset(mut self, cpus: CpusetSpec) -> Self {
+    pub fn cpuset(mut self, cpus: CpusetSpec) -> Self {
         self.cpuset = Some(cpus);
         self
     }
@@ -1406,7 +1406,7 @@ impl CgroupDef {
     }
 
     /// Bind `cpuset.mems` for this cgroup. Mirrors
-    /// [`Self::with_cpuset`] for NUMA memory placement: the cgroup's
+    /// [`Self::cpuset`] for NUMA memory placement: the cgroup's
     /// tasks may only allocate memory on the listed NUMA nodes.
     /// `None` (default) inherits the parent's `cpuset.mems`.
     ///
@@ -1418,7 +1418,7 @@ impl CgroupDef {
     /// `cpuset.cpus` so the binding is in effect before any worker
     /// is moved into the cgroup.
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn with_cpuset_mems(mut self, nodes: BTreeSet<usize>) -> Self {
+    pub fn cpuset_mems(mut self, nodes: BTreeSet<usize>) -> Self {
         self.cpuset_mems = Some(nodes);
         self
     }

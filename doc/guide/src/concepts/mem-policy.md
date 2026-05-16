@@ -91,7 +91,7 @@ let w = WorkSpec::default()
     .mpol_flags(MpolFlags::STATIC_NODES);
 
 let def = CgroupDef::named("cg_0")
-    .with_cpuset(CpusetSpec::numa(0))
+    .cpuset(CpusetSpec::numa(0))
     .workers(4)
     .mem_policy(MemPolicy::bind([0]));
 ```
@@ -135,11 +135,11 @@ use ktstr::prelude::*;
 fn numa_locality(ctx: &Ctx) -> Result<AssertResult> {
     execute_defs(ctx, vec![
         CgroupDef::named("node0")
-            .with_cpuset(CpusetSpec::numa(0))
+            .cpuset(CpusetSpec::numa(0))
             .workers(4)
             .mem_policy(MemPolicy::bind([0])),
         CgroupDef::named("node1")
-            .with_cpuset(CpusetSpec::numa(1))
+            .cpuset(CpusetSpec::numa(1))
             .workers(4)
             .mem_policy(MemPolicy::bind([1])),
     ])

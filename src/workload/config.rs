@@ -1264,7 +1264,7 @@ pub struct WorkSpec {
     /// - `apply_setup` dispatch: the cgroup was just created and its
     ///   cpuset just resolved via `CpusetSpec::resolve(ctx)` (or
     ///   inherited from `ctx.topo.usable_cpuset()` when the
-    ///   `CgroupDef` has no `.with_cpuset(...)`), so the denominator
+    ///   `CgroupDef` has no `.cpuset(...)`), so the denominator
     ///   matches the declared `CpusetSpec`.
     /// - `Op::Spawn` dispatch: the denominator is whatever cpuset is
     ///   currently recorded for the cgroup. A prior `Op::SetCpuset`

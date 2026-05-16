@@ -103,8 +103,8 @@ pub fn custom_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     let checks = Assert::default_checks().max_spread_pct(75.0);
 
     let backdrop = Backdrop::new().extend_cgroups([
-        CgroupDef::named("cg_0").with_cpuset(CpusetSpec::disjoint(0, 2)),
-        CgroupDef::named("cg_1").with_cpuset(CpusetSpec::disjoint(1, 2)),
+        CgroupDef::named("cg_0").cpuset(CpusetSpec::disjoint(0, 2)),
+        CgroupDef::named("cg_1").cpuset(CpusetSpec::disjoint(1, 2)),
     ]);
     let steps = vec![
         Step::new(vec![], HoldSpec::fixed(ctx.settle)),

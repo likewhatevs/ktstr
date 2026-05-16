@@ -44,10 +44,10 @@ pub fn custom_cache_yield_wake_affine(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
             ctx.cgroup_def("cg_0")
-                .with_cpuset(CpusetSpec::llc(0))
+                .cpuset(CpusetSpec::llc(0))
                 .work_type(WorkType::cache_yield(32, 64)),
             ctx.cgroup_def("cg_1")
-                .with_cpuset(CpusetSpec::llc(1))
+                .cpuset(CpusetSpec::llc(1))
                 .work_type(WorkType::cache_yield(32, 64)),
         ],
         ctx.settled_hold(1.0),

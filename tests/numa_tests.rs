@@ -116,7 +116,7 @@ fn scenario_mempolicy_bind_locality(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![
             ctx.cgroup_def("cg_0")
-                .with_cpuset(CpusetSpec::Numa(0))
+                .cpuset(CpusetSpec::Numa(0))
                 .mem_policy(MemPolicy::bind([0])),
         ]
         .into(),
@@ -151,7 +151,7 @@ fn scenario_vmstat_migration(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![
             ctx.cgroup_def("cg_0")
-                .with_cpuset(CpusetSpec::Numa(0))
+                .cpuset(CpusetSpec::Numa(0))
                 .mem_policy(MemPolicy::bind([0])),
         ]
         .into(),
@@ -195,7 +195,7 @@ fn scenario_mempolicy_interleave_cross_node(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![
             ctx.cgroup_def("cg_0")
-                .with_cpuset(CpusetSpec::Numa(0))
+                .cpuset(CpusetSpec::Numa(0))
                 .mem_policy(MemPolicy::interleave([0, 1]))
                 .mpol_flags(MpolFlags::STATIC_NODES),
         ]
@@ -241,7 +241,7 @@ fn scenario_mempolicy_preferred_many_locality(ctx: &Ctx) -> Result<AssertResult>
     let steps = vec![Step {
         setup: vec![
             ctx.cgroup_def("cg_0")
-                .with_cpuset(CpusetSpec::Numa(0))
+                .cpuset(CpusetSpec::Numa(0))
                 .mem_policy(MemPolicy::preferred_many([0, 1]))
                 .mpol_flags(MpolFlags::STATIC_NODES),
         ]

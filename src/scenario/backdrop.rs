@@ -95,7 +95,7 @@ use crate::test_support::Payload;
 /// // Worker-bearing cgroup + empty move target + long-running payload,
 /// // all persistent for the scenario.
 /// let backdrop = Backdrop::new()
-///     .push_cgroup(CgroupDef::named("bg_cell").with_cpuset(CpusetSpec::disjoint(0, 2)))
+///     .push_cgroup(CgroupDef::named("bg_cell").cpuset(CpusetSpec::disjoint(0, 2)))
 ///     .push_op(Op::add_cgroup("bg_overflow"))
 ///     .push_payload(&BG_LOAD);
 /// ```

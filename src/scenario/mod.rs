@@ -436,7 +436,7 @@ impl Ctx<'_> {
     /// ```
     ///
     /// Returns a fresh [`CgroupDef`] so the test author can chain
-    /// further builders (`.with_cpuset`, `.work`, etc.) on the
+    /// further builders (`.cpuset`, `.work`, etc.) on the
     /// result. For non-default worker counts call
     /// `CgroupDef::named(name).workers(N)` directly — the helper
     /// pins ONLY the `ctx.workers_per_cgroup` default path.
@@ -450,7 +450,7 @@ impl Ctx<'_> {
     /// vec![ctx.cgroup_def("cg_0")].into()
     ///
     /// // With additional builders:
-    /// ctx.cgroup_def("cg_0").with_cpuset(...)
+    /// ctx.cgroup_def("cg_0").cpuset(...)
     /// ```
     pub fn cgroup_def(
         &self,
@@ -2076,7 +2076,7 @@ mod tests {
     }
 
     /// Helper-returned [`CgroupDef`] chains additional builders
-    /// (`.with_cpuset`, `.work_type`) — the docstring promises this
+    /// (`.cpuset`, `.work_type`) — the docstring promises this
     /// composability so the migration can collapse multi-line
     /// chains. A regression to a newtype wrapper or `&CgroupDef`
     /// return that broke move-based chaining would surface here.
@@ -2089,7 +2089,7 @@ mod tests {
         let ctx = Ctx::builder(&cg, &topo).workers_per_cgroup(3).build();
         let def = ctx
             .cgroup_def("cg_chained")
-            .with_cpuset(CpusetSpec::range(0.0, 1.0))
+            .cpuset(CpusetSpec::range(0.0, 1.0))
             .work_type(WorkType::SpinWait);
         assert_eq!(def.name, "cg_chained");
         assert_eq!(
@@ -2099,7 +2099,7 @@ mod tests {
         );
         assert!(
             def.cpuset.is_some(),
-            "with_cpuset chains correctly after the helper",
+            "cpuset chains correctly after the helper",
         );
         assert!(
             matches!(def.works[0].work_type, WorkType::SpinWait),

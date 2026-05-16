@@ -18,7 +18,7 @@ fn per_cpu_defs(ctx: &super::Ctx) -> Vec<CgroupDef> {
     (0..n)
         .map(|i| {
             CgroupDef::named(format!("many_{i}"))
-                .with_cpuset(CpusetSpec::exact([all[i]]))
+                .cpuset(CpusetSpec::exact([all[i]]))
                 .workers(1)
         })
         .collect()
@@ -48,7 +48,7 @@ fn reuse_defs(ctx: &super::Ctx) -> Vec<CgroupDef> {
     (0..half)
         .map(|i| {
             CgroupDef::named(format!("reuse_{i}"))
-                .with_cpuset(CpusetSpec::exact([all[i % all.len()]]))
+                .cpuset(CpusetSpec::exact([all[i % all.len()]]))
                 .workers(1)
         })
         .collect()

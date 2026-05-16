@@ -22,8 +22,8 @@ fn sched_basic_proportional(ctx: &Ctx) -> Result<AssertResult> {
 fn sched_cpuset_split(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![
-            CgroupDef::named("cg_0").with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 }),
-            CgroupDef::named("cg_1").with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 }),
+            CgroupDef::named("cg_0").cpuset(CpusetSpec::Disjoint { index: 0, of: 2 }),
+            CgroupDef::named("cg_1").cpuset(CpusetSpec::Disjoint { index: 1, of: 2 }),
         ]
         .into(),
         ops: vec![],

@@ -119,10 +119,10 @@ pub fn custom_cgroup_cpuset_imbalance_combined(ctx: &Ctx) -> Result<AssertResult
     let steps = vec![Step::with_defs(
         vec![
             CgroupDef::named("cg_0")
-                .with_cpuset(CpusetSpec::disjoint(0, 2))
+                .cpuset(CpusetSpec::disjoint(0, 2))
                 .workers(mid * 2),
             CgroupDef::named("cg_1")
-                .with_cpuset(CpusetSpec::disjoint(1, 2))
+                .cpuset(CpusetSpec::disjoint(1, 2))
                 .workers(2)
                 .work_type(WorkType::bursty(
                     Duration::from_millis(50),
@@ -145,17 +145,17 @@ pub fn custom_cgroup_cpuset_overlap_imbalance_combined(ctx: &Ctx) -> Result<Asse
     let steps = vec![Step::with_defs(
         vec![
             CgroupDef::named("cg_0")
-                .with_cpuset(CpusetSpec::Exact(sets[0].clone()))
+                .cpuset(CpusetSpec::Exact(sets[0].clone()))
                 .workers(12),
             CgroupDef::named("cg_1")
-                .with_cpuset(CpusetSpec::Exact(sets[1].clone()))
+                .cpuset(CpusetSpec::Exact(sets[1].clone()))
                 .workers(2)
                 .work_type(WorkType::bursty(
                     Duration::from_millis(50),
                     Duration::from_millis(100),
                 )),
             CgroupDef::named("cg_2")
-                .with_cpuset(CpusetSpec::Exact(sets[2].clone()))
+                .cpuset(CpusetSpec::Exact(sets[2].clone()))
                 .workers(1)
                 .work_type(WorkType::YieldHeavy),
         ],
@@ -266,8 +266,8 @@ pub fn custom_cgroup_no_ctrl_imbalance(ctx: &Ctx) -> Result<AssertResult> {
 /// without per-step teardown removing them.
 pub fn custom_cgroup_no_ctrl_cpuset_change(ctx: &Ctx) -> Result<AssertResult> {
     let backdrop = Backdrop::new()
-        .push_cgroup(CgroupDef::named("cg_0").with_cpuset(CpusetSpec::disjoint(0, 2)))
-        .push_cgroup(CgroupDef::named("cg_1").with_cpuset(CpusetSpec::disjoint(1, 2)));
+        .push_cgroup(CgroupDef::named("cg_0").cpuset(CpusetSpec::disjoint(0, 2)))
+        .push_cgroup(CgroupDef::named("cg_1").cpuset(CpusetSpec::disjoint(1, 2)));
 
     let steps = vec![
         // Phase 1: hold the Backdrop's initial disjoint cpusets.

@@ -160,9 +160,9 @@ fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-Without `.with_cpuset(...)`, a cgroup's workers run on every CPU
+Without `.cpuset(...)`, a cgroup's workers run on every CPU
 in the test's topology — they share the VM's full CPU set
-with all other cgroups. `.with_cpuset(CpusetSpec::Llc(idx))`
+with all other cgroups. `.cpuset(CpusetSpec::Llc(idx))`
 (introduced in Step 4) restricts a cgroup to one LLC's CPUs, and
 the other `CpusetSpec` variants narrow further.
 
@@ -203,11 +203,11 @@ fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
         CgroupDef::named("background_spinner")
             .workers(2)
             .work_type(WorkType::SpinWait)
-            .with_cpuset(CpusetSpec::Llc(0)),
+            .cpuset(CpusetSpec::Llc(0)),
         CgroupDef::named("phased_worker")
             .workers(2)
             .work_type(WorkType::SpinWait)
-            .with_cpuset(CpusetSpec::Llc(1)),
+            .cpuset(CpusetSpec::Llc(1)),
     ])
 }
 ```
@@ -250,7 +250,7 @@ fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
         CgroupDef::named("background_spinner")
             .workers(2)
             .work_type(WorkType::SpinWait)
-            .with_cpuset(CpusetSpec::Llc(0)),
+            .cpuset(CpusetSpec::Llc(0)),
         // Phased worker on LLC 1: spin 100 ms, yield for 20 ms,
         // then loop. Stresses the scheduler's wake-after-yield
         // placement repeatedly while the LLC-0 spinner keeps
@@ -261,7 +261,7 @@ fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
                 Phase::Spin(Duration::from_millis(100)),
                 [Phase::Yield(Duration::from_millis(20))],
             ))
-            .with_cpuset(CpusetSpec::Llc(1)),
+            .cpuset(CpusetSpec::Llc(1)),
     ])
 }
 ```
@@ -365,14 +365,14 @@ fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
         CgroupDef::named("background_spinner")
             .workers(2)
             .work_type(WorkType::SpinWait)
-            .with_cpuset(CpusetSpec::Llc(0)),
+            .cpuset(CpusetSpec::Llc(0)),
         CgroupDef::named("phased_worker")
             .workers(2)
             .work_type(WorkType::sequence(
                 Phase::Spin(Duration::from_millis(100)),
                 [Phase::Yield(Duration::from_millis(20))],
             ))
-            .with_cpuset(CpusetSpec::Llc(1)),
+            .cpuset(CpusetSpec::Llc(1)),
     ])
 }
 ```
@@ -509,11 +509,11 @@ fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
                 CgroupDef::named("background_spinner")
                     .workers(2)
                     .work_type(WorkType::SpinWait)
-                    .with_cpuset(CpusetSpec::Llc(0)),
+                    .cpuset(CpusetSpec::Llc(0)),
                 CgroupDef::named("phased_worker")
                     .workers(2)
                     .work_type(WorkType::SpinWait)
-                    .with_cpuset(CpusetSpec::Llc(1)),
+                    .cpuset(CpusetSpec::Llc(1)),
             ]),
             ops: vec![Op::snapshot("after_workload")],
             hold: HoldSpec::FULL,
@@ -856,14 +856,14 @@ fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
         CgroupDef::named("background_spinner")
             .workers(2)
             .work_type(WorkType::SpinWait)
-            .with_cpuset(CpusetSpec::Llc(0)),
+            .cpuset(CpusetSpec::Llc(0)),
         CgroupDef::named("phased_worker")
             .workers(2)
             .work_type(WorkType::sequence(
                 Phase::Spin(Duration::from_millis(100)),
                 [Phase::Yield(Duration::from_millis(20))],
             ))
-            .with_cpuset(CpusetSpec::Llc(1)),
+            .cpuset(CpusetSpec::Llc(1)),
     ])
 }
 ```

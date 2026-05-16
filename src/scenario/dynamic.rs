@@ -142,15 +142,15 @@ pub fn custom_cgroup_cpuset_add_remove(ctx: &Ctx) -> Result<AssertResult> {
     }
 
     let backdrop = Backdrop::new().extend_cgroups([
-        CgroupDef::named("cg_0").with_cpuset(CpusetSpec::disjoint(0, 3)),
-        CgroupDef::named("cg_1").with_cpuset(CpusetSpec::disjoint(1, 3)),
+        CgroupDef::named("cg_0").cpuset(CpusetSpec::disjoint(0, 3)),
+        CgroupDef::named("cg_1").cpuset(CpusetSpec::disjoint(1, 3)),
     ]);
     let steps = vec![
         // Phase 1: settle the two steady cgroups.
         Step::new(vec![], ctx.settled_hold(1.0 / 3.0)),
         // Phase 2: add cg_2; auto teardown at step end removes it.
         Step::with_defs(
-            vec![CgroupDef::named("cg_2").with_cpuset(CpusetSpec::disjoint(2, 3))],
+            vec![CgroupDef::named("cg_2").cpuset(CpusetSpec::disjoint(2, 3))],
             HoldSpec::frac(1.0 / 3.0),
         ),
         // Phase 3: only cg_0 / cg_1 continue — cg_2 is gone.

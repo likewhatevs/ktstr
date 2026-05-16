@@ -17,8 +17,8 @@
 //!
 //! | Knob | Layer | API entry | Underlying file | When to use |
 //! |------|-------|-----------|-----------------|-------------|
-//! | CPU affinity | setup | [`CgroupDef::with_cpuset`] | `cpuset.cpus` | Bind workers to a CPU subset for the whole run. |
-//! | NUMA-mem affinity | setup | [`CgroupDef::with_cpuset_mems`] | `cpuset.mems` | Constrain allocations to specific NUMA nodes. |
+//! | CPU affinity | setup | [`CgroupDef::cpuset`] | `cpuset.cpus` | Bind workers to a CPU subset for the whole run. |
+//! | NUMA-mem affinity | setup | [`CgroupDef::cpuset_mems`] | `cpuset.mems` | Constrain allocations to specific NUMA nodes. |
 //! | CPU bandwidth | setup | [`CgroupDef::cpu_quota_pct`] / [`CgroupDef::cpu_quota`] / [`CgroupDef::cpu_unlimited`] | `cpu.max` | Cap CPU time per period (1 CPU at 50% / 2 CPU at 100% / etc). |
 //! | CPU share weight | setup | [`CgroupDef::cpu_weight`] | `cpu.weight` | Bias relative CPU share when siblings contend. |
 //! | Memory ceiling | setup | [`CgroupDef::memory_max`] / [`CgroupDef::memory_unlimited`] | `memory.max` | Hard ceiling — exceeding triggers cgroup OOM. |
@@ -4670,7 +4670,7 @@ mod tests {
     #[test]
     fn cgroup_def_builder_chain() {
         let d = CgroupDef::named("test")
-            .with_cpuset(CpusetSpec::llc(0))
+            .cpuset(CpusetSpec::llc(0))
             .workers(8)
             .work_type(WorkType::bursty(
                 Duration::from_millis(50),
@@ -5740,7 +5740,7 @@ mod tests {
         let cpus: BTreeSet<usize> = [0, 1].into_iter().collect();
         let defs = vec![
             CgroupDef::named("cg_0")
-                .with_cpuset(CpusetSpec::Exact(cpus.clone()))
+                .cpuset(CpusetSpec::Exact(cpus.clone()))
                 .workers(1),
         ];
         apply_setup_test(&ctx, &mut state, &defs).unwrap();
@@ -5833,7 +5833,7 @@ mod tests {
         let cpus: BTreeSet<usize> = [0, 1].into_iter().collect();
         let defs = vec![
             CgroupDef::named("cg_ordered")
-                .with_cpuset(CpusetSpec::Exact(cpus.clone()))
+                .cpuset(CpusetSpec::Exact(cpus.clone()))
                 .workers(2),
         ];
         apply_setup_test(&ctx, &mut state, &defs).unwrap();
@@ -5862,7 +5862,7 @@ mod tests {
         // Llc(99) on a 1-LLC topology is out of range; CpusetSpec::validate
         // bails after create_cgroup runs but before set_cpuset / move_tasks
         // fire.
-        let defs = vec![CgroupDef::named("cg_bad").with_cpuset(CpusetSpec::Llc(99))];
+        let defs = vec![CgroupDef::named("cg_bad").cpuset(CpusetSpec::Llc(99))];
         let err = apply_setup_test(&ctx, &mut state, &defs).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
@@ -5893,7 +5893,7 @@ mod tests {
         let cpus: BTreeSet<usize> = [0, 1].into_iter().collect();
         let defs = vec![
             CgroupDef::named("cg_setfail")
-                .with_cpuset(CpusetSpec::Exact(cpus))
+                .cpuset(CpusetSpec::Exact(cpus))
                 .workers(1),
         ];
         let err = apply_setup_test(&ctx, &mut state, &defs).unwrap_err();
@@ -5930,7 +5930,7 @@ mod tests {
         let bind: BTreeSet<usize> = [1].into_iter().collect();
         let defs = vec![
             CgroupDef::named("cg_memfail")
-                .with_cpuset(CpusetSpec::Exact(cpus))
+                .cpuset(CpusetSpec::Exact(cpus))
                 .mem_policy(MemPolicy::Bind(bind))
                 .workers(1),
         ];
@@ -7593,7 +7593,7 @@ mod tests {
         let ctx = mock_ctx(&mock, &topo);
         let steps = vec![Step::new(
             vec![Op::add_cgroup_def(
-                CgroupDef::named("cg_pinned").with_cpuset(CpusetSpec::disjoint(0, 2)),
+                CgroupDef::named("cg_pinned").cpuset(CpusetSpec::disjoint(0, 2)),
             )],
             HoldSpec::fixed(Duration::from_millis(1)),
         )];
@@ -7651,7 +7651,7 @@ mod tests {
             &ctx,
             &mut state,
             &[Op::add_cgroup_def(
-                CgroupDef::named("cg_pinned").with_cpuset(CpusetSpec::disjoint(0, 2)),
+                CgroupDef::named("cg_pinned").cpuset(CpusetSpec::disjoint(0, 2)),
             )],
         )
         .expect("AddCgroupDef with cpuset must succeed against mock");
@@ -7686,7 +7686,7 @@ mod tests {
             &mut state,
             &[Op::add_cgroup_def(
                 CgroupDef::named("cg_pct")
-                    .with_cpuset(CpusetSpec::exact(std::iter::empty::<usize>()))
+                    .cpuset(CpusetSpec::exact(std::iter::empty::<usize>()))
                     .workers_pct(0.5),
             )],
         )
@@ -8225,12 +8225,12 @@ mod tests {
         assert_eq!(def.io.unwrap().weight, Some(750));
     }
 
-    /// `.with_cpuset_mems(nodes)` populates the new field without
+    /// `.cpuset_mems(nodes)` populates the new field without
     /// disturbing the cpuset.cpus side.
     #[test]
-    fn cgroup_def_with_cpuset_mems_populates_independent_field() {
+    fn cgroup_def_cpuset_mems_populates_independent_field() {
         let nodes: BTreeSet<usize> = [0usize, 1].into_iter().collect();
-        let def = CgroupDef::named("cg_a").with_cpuset_mems(nodes.clone());
+        let def = CgroupDef::named("cg_a").cpuset_mems(nodes.clone());
         assert_eq!(def.cpuset_mems, Some(nodes));
         assert!(def.cpuset.is_none());
     }
@@ -8324,7 +8324,7 @@ mod tests {
         let mems: BTreeSet<usize> = [0usize].into_iter().collect();
         let defs = vec![
             CgroupDef::named("cg_full")
-                .with_cpuset_mems(mems)
+                .cpuset_mems(mems)
                 .cpu_quota_pct(40)
                 .cpu_weight(200)
                 .memory_max(2_000_000)
@@ -9267,7 +9267,7 @@ mod tests {
         let ctx = mock_ctx(&mock, &topo);
         let mut state = StepState::empty(&ctx);
         let def = CgroupDef::named("cg_p")
-            .with_cpuset(CpusetSpec::Llc(0))
+            .cpuset(CpusetSpec::Llc(0))
             .workers_pct(0.34);
         apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def)).unwrap();
         let handle = &state
@@ -9295,7 +9295,7 @@ mod tests {
         let ctx = mock_ctx(&mock, &topo);
         let mut state = StepState::empty(&ctx);
         let def = CgroupDef::named("cg_p")
-            .with_cpuset(CpusetSpec::Llc(0))
+            .cpuset(CpusetSpec::Llc(0))
             .workers_pct(2.0);
         apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def)).unwrap();
         let handle = &state
@@ -9324,7 +9324,7 @@ mod tests {
         let ctx = mock_ctx(&mock, &topo);
         let mut state = StepState::empty(&ctx);
         let def = CgroupDef::named("cg_p")
-            .with_cpuset(CpusetSpec::Llc(0))
+            .cpuset(CpusetSpec::Llc(0))
             .workers_pct(0.5)
             .workers(2);
         let err = apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def))
@@ -9344,7 +9344,7 @@ mod tests {
         let ctx = mock_ctx(&mock, &topo);
         let mut state = StepState::empty(&ctx);
         let def = CgroupDef::named("cg_p")
-            .with_cpuset(CpusetSpec::Llc(0))
+            .cpuset(CpusetSpec::Llc(0))
             .workers(2)
             .workers_pct(0.5);
         let err = apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def))
@@ -9403,7 +9403,7 @@ mod tests {
         // distinguish ceil, it's a baseline.
         let mut state = StepState::empty(&ctx);
         let def_exact = CgroupDef::named("cg_exact")
-            .with_cpuset(CpusetSpec::Llc(0))
+            .cpuset(CpusetSpec::Llc(0))
             .workers_pct(0.5);
         apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def_exact)).unwrap();
         let handle = &state
@@ -9424,7 +9424,7 @@ mod tests {
         // Distinguishes ceil from round.
         let mut state = StepState::empty(&ctx);
         let def_mid = CgroupDef::named("cg_mid")
-            .with_cpuset(CpusetSpec::Llc(0))
+            .cpuset(CpusetSpec::Llc(0))
             .workers_pct(0.6);
         apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def_mid)).unwrap();
         let handle = &state
@@ -9444,7 +9444,7 @@ mod tests {
         // that ANY non-zero remainder rounds up, not just near-half.
         let mut state = StepState::empty(&ctx);
         let def_just_over = CgroupDef::named("cg_over")
-            .with_cpuset(CpusetSpec::Llc(0))
+            .cpuset(CpusetSpec::Llc(0))
             .workers_pct(0.51);
         apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def_just_over)).unwrap();
         let handle = &state
@@ -9465,7 +9465,7 @@ mod tests {
         // from floor — completes the rounding-mode coverage.
         let mut state = StepState::empty(&ctx);
         let def_just_under = CgroupDef::named("cg_under")
-            .with_cpuset(CpusetSpec::Llc(0))
+            .cpuset(CpusetSpec::Llc(0))
             .workers_pct(0.49);
         apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def_just_under)).unwrap();
         let handle = &state
@@ -9514,7 +9514,7 @@ mod tests {
         let ctx = mock_ctx(&mock, &topo);
         let mut state = StepState::empty(&ctx);
         let def = CgroupDef::named("cg_stable")
-            .with_cpuset(CpusetSpec::Llc(0))
+            .cpuset(CpusetSpec::Llc(0))
             .workers_pct(0.5);
         apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def)).unwrap();
         let initial_count = state
@@ -9662,7 +9662,7 @@ mod tests {
         let ctx = mock_ctx(&mock, &topo);
         let mut state = StepState::empty(&ctx);
         let def = CgroupDef::named("cg_multi")
-            .with_cpuset(CpusetSpec::Exact(std::collections::BTreeSet::new()))
+            .cpuset(CpusetSpec::Exact(std::collections::BTreeSet::new()))
             .workers_pct(0.3)
             .work(crate::workload::WorkSpec::default().workers_pct(0.7))
             .work(crate::workload::WorkSpec::default().workers_pct(0.5));
@@ -9698,7 +9698,7 @@ mod tests {
         let ctx = mock_ctx(&mock, &topo);
         let mut state = StepState::empty(&ctx);
         let def = CgroupDef::named("cg_both")
-            .with_cpuset(CpusetSpec::Exact(std::collections::BTreeSet::new()))
+            .cpuset(CpusetSpec::Exact(std::collections::BTreeSet::new()))
             .workers(2)
             .workers_pct(0.5);
         let err = apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def))
@@ -9745,7 +9745,7 @@ mod tests {
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
         let mut state = StepState::empty(&ctx);
-        let def = CgroupDef::named("cg_empty_range").with_cpuset(CpusetSpec::Range {
+        let def = CgroupDef::named("cg_empty_range").cpuset(CpusetSpec::Range {
             start_frac: 0.0,
             end_frac: 0.1,
         });
@@ -9786,7 +9786,7 @@ mod tests {
         apply_setup_test(
             &ctx,
             &mut state,
-            std::slice::from_ref(&CgroupDef::named("cg_narrow").with_cpuset(CpusetSpec::Llc(0))),
+            std::slice::from_ref(&CgroupDef::named("cg_narrow").cpuset(CpusetSpec::Llc(0))),
         )
         .unwrap();
         // Now try to narrow it via Op::SetCpuset to an empty range.
@@ -9844,7 +9844,7 @@ mod tests {
         let ctx = mock_ctx(&mock, &topo);
         let mut state = StepState::empty(&ctx);
         let def = CgroupDef::named("cg_e")
-            .with_cpuset(CpusetSpec::Exact(std::collections::BTreeSet::new()))
+            .cpuset(CpusetSpec::Exact(std::collections::BTreeSet::new()))
             .workers_pct(0.9);
         let err = apply_setup_test(&ctx, &mut state, std::slice::from_ref(&def))
             .expect_err("workers_pct on empty cpuset must reject");
@@ -9872,7 +9872,7 @@ mod tests {
         apply_setup_test(
             &ctx,
             &mut state,
-            std::slice::from_ref(&CgroupDef::named("cg_spawn").with_cpuset(CpusetSpec::Llc(0))),
+            std::slice::from_ref(&CgroupDef::named("cg_spawn").cpuset(CpusetSpec::Llc(0))),
         )
         .unwrap();
         // Drop the apply_setup default-spawned workload so the Spawn
@@ -9918,7 +9918,7 @@ mod tests {
         apply_setup_test(
             &ctx,
             &mut state,
-            std::slice::from_ref(&CgroupDef::named("cg_x").with_cpuset(CpusetSpec::Llc(0))),
+            std::slice::from_ref(&CgroupDef::named("cg_x").cpuset(CpusetSpec::Llc(0))),
         )
         .unwrap();
         state.handles.clear();
