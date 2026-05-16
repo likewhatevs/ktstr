@@ -1660,7 +1660,7 @@ impl SchedulerJson {
 ///
 /// One ctor per binary, regardless of how many schedulers the binary
 /// registers — walks the slice once and emits a single JSON array.
-#[::ctor::ctor(crate_path = ::ctor)]
+#[::ctor::ctor(unsafe, crate_path = ::ctor)]
 fn __ktstr_list_schedulers() {
     if !std::env::args().any(|a| a == "--ktstr-list-schedulers") {
         return;

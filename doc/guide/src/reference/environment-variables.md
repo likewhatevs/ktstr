@@ -63,6 +63,9 @@ add `ctor` to its own dependencies — it can use the re-export
 via `ktstr::__private::ctor::ctor` and stay in sync with the
 version ktstr itself depends on, avoiding the "two ctor
 crates, two `.init_array` entries, ordering undefined" pitfall.
+The attribute requires the `unsafe` marker that ctor 1.0
+mandates for every constructor function; see
+`src/test_support/runtime.rs` for the verbatim copy-paste form.
 
 Leaving either variable unset is the normal case — the VM
 launcher skips probe wiring entirely, and no initramfs entry is

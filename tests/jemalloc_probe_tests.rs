@@ -37,7 +37,7 @@ use ktstr::worker_ready_wait::wait_for_worker_ready;
 /// under edition 2024 because it races with concurrent env reads;
 /// ctors run before any thread spawns, so the call is race-free in
 /// practice.
-#[::ktstr::__private::ctor::ctor(crate_path = ::ktstr::__private::ctor)]
+#[::ktstr::__private::ctor::ctor(unsafe, crate_path = ::ktstr::__private::ctor)]
 fn set_probe_binary_env_var() {
     unsafe {
         std::env::set_var(

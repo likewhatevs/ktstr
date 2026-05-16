@@ -470,7 +470,7 @@ pub(crate) fn build_vm_builder_base(
     // in the guest — paste verbatim, adjust the two binary names:
     //
     // ```ignore
-    // #[::ktstr::__private::ctor::ctor(crate_path = ::ktstr::__private::ctor)]
+    // #[::ktstr::__private::ctor::ctor(unsafe, crate_path = ::ktstr::__private::ctor)]
     // fn set_probe_binary_env_var() {
     //     // SAFETY: ctor runs before any `#[ktstr_test]` thread or
     //     // probe thread spawns; glibc's `__environ` mutation is
@@ -489,11 +489,13 @@ pub(crate) fn build_vm_builder_base(
     // ```
     //
     // The `crate_path = ::ktstr::__private::ctor` argument is
-    // non-negotiable: `#[ctor::ctor]` without the re-export path
-    // panics at compile time because the `ctor` crate is not
-    // listed in the test crate's direct deps. ktstr re-exports
-    // `ctor` under `__private::ctor` exactly so test authors do
-    // not need to add it themselves.
+    // non-negotiable: `#[ctor::ctor(unsafe)]` without the
+    // re-export path panics at compile time because the `ctor`
+    // crate is not listed in the test crate's direct deps. ktstr
+    // re-exports `ctor` under `__private::ctor` exactly so test
+    // authors do not need to add it themselves. ctor 1.0 also
+    // mandates the `unsafe` marker as the first attribute
+    // argument; bare `#[ctor::ctor]` no longer compiles.
     if let Ok(probe_path) = std::env::var("KTSTR_JEMALLOC_PROBE_BINARY")
         && !probe_path.is_empty()
     {

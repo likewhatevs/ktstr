@@ -55,7 +55,7 @@ fn private_serde_json_from_str_roundtrip() {
 /// initialized.
 static INIT_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-#[::ktstr::__private::ctor::ctor(crate_path = ::ktstr::__private::ctor)]
+#[::ktstr::__private::ctor::ctor(unsafe, crate_path = ::ktstr::__private::ctor)]
 fn mark_ctor_fired() {
     INIT_FIRED.store(true, std::sync::atomic::Ordering::Release);
 }

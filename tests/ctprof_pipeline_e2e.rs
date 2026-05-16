@@ -48,7 +48,7 @@ use ktstr::worker_ready_wait::wait_for_worker_ready;
 // crate compiles its own ctor list.
 // ---------------------------------------------------------------------------
 
-#[::ktstr::__private::ctor::ctor(crate_path = ::ktstr::__private::ctor)]
+#[::ktstr::__private::ctor::ctor(unsafe, crate_path = ::ktstr::__private::ctor)]
 fn set_alloc_worker_binary_env_var() {
     unsafe {
         std::env::set_var(

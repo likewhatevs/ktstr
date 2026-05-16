@@ -1,3 +1,10 @@
+// ctor 1.0's `#[ctor::ctor(...)]` macro expansion is a deep
+// TT-muncher whose recursion depth on this crate's ctor sites
+// exceeds Rust's default 128-frame macro-expansion budget. 256 is
+// what the rustc lint's own help message recommends; ctor itself
+// declares the same bump at the top of its lib.rs.
+#![recursion_limit = "256"]
+
 //! VM-based test framework for Linux kernel subsystems, with a focus on sched_ext.
 //!
 //! ktstr boots lightweight KVM virtual machines with controlled CPU topologies,

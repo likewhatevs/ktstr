@@ -400,7 +400,17 @@ fn is_coverage_instrumented_binary() -> bool {
 /// `.init_array` entries on the main thread before any user code
 /// has spawned an additional thread, so the env-block mutation is
 /// race-free.
-#[ctor::ctor(priority = 0)]
+///
+/// ctor 1.0's `priority` documentation flags the 0..100 range as
+/// platform-reserved for the C runtime's own startup, so accessing
+/// libc/std services from a constructor with such a priority "may
+/// not be safe" in portable terms. On Linux/glibc the dynamic
+/// linker finishes libc initialization before walking
+/// `.init_array.0`, so `std::env::set_var` (which lowers to glibc's
+/// `setenv`) is safe here. The priority retains the .init_array.0
+/// placement that the compiler-rt ordering above depends on; other
+/// platforms would need re-validation.
+#[ctor::ctor(unsafe, priority = 0)]
 fn redirect_default_profraw_path() {
     // Cheap precondition checks first — pid (one syscall) and env
     // (one var_os call) — so the ELF parse only runs in the
