@@ -2307,9 +2307,9 @@ fn completions_zsh_contains_subcommands() {
 fn test_metadata() -> KernelMetadata {
     KernelMetadata::new(
         ktstr::cache::KernelSource::Tarball,
-        "x86_64".to_string(),
-        "bzImage".to_string(),
-        "2026-04-12T10:00:00Z".to_string(),
+        "x86_64",
+        "bzImage",
+        "2026-04-12T10:00:00Z",
     )
     .with_version(Some("6.14.2".to_string()))
 }
@@ -2343,9 +2343,9 @@ fn format_entry_row_no_version() {
             source_tree_path: None,
             git_hash: None,
         },
-        "x86_64".to_string(),
-        "bzImage".to_string(),
-        "2026-04-12T10:00:00Z".to_string(),
+        "x86_64",
+        "bzImage",
+        "2026-04-12T10:00:00Z",
     );
     let entry = store_test_entry(&cache, "local-key", &meta);
     let row = cli::format_entry_row(&entry, "hash", &[]);

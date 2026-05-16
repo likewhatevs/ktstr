@@ -908,9 +908,9 @@ mod tests {
         let path = std::path::PathBuf::from(format!("/tmp/fixture/{key}"));
         let metadata = KernelMetadata::new(
             KernelSource::Tarball,
-            "x86_64".to_string(),
-            "bzImage".to_string(),
-            "2026-04-22T00:00:00Z".to_string(),
+            "x86_64",
+            "bzImage",
+            "2026-04-22T00:00:00Z",
         );
         crate::cache::ListedEntry::Valid(Box::new(CacheEntry {
             key: key.to_string(),
@@ -1006,9 +1006,9 @@ mod tests {
         let path = std::path::PathBuf::from(format!("/tmp/fixture/{key}"));
         let metadata = KernelMetadata::new(
             KernelSource::Tarball,
-            "x86_64".to_string(),
-            "bzImage".to_string(),
-            "2026-04-22T00:00:00Z".to_string(),
+            "x86_64",
+            "bzImage",
+            "2026-04-22T00:00:00Z",
         )
         .with_version(version.map(String::from))
         .with_ktstr_kconfig_hash(ktstr_kconfig_hash.map(String::from))
@@ -1112,9 +1112,9 @@ mod tests {
         let current_hash = "abc1234";
         let meta_with = KernelMetadata::new(
             KernelSource::Tarball,
-            "x86_64".to_string(),
-            "bzImage".to_string(),
-            "2026-04-12T10:00:00Z".to_string(),
+            "x86_64",
+            "bzImage",
+            "2026-04-12T10:00:00Z",
         )
         .with_version(Some("6.14.2".to_string()))
         .with_ktstr_kconfig_hash(Some(current_hash.to_string()))
@@ -1129,9 +1129,9 @@ mod tests {
 
         let meta_without = KernelMetadata::new(
             KernelSource::Tarball,
-            "x86_64".to_string(),
-            "bzImage".to_string(),
-            "2026-04-12T10:00:00Z".to_string(),
+            "x86_64",
+            "bzImage",
+            "2026-04-12T10:00:00Z",
         )
         .with_version(Some("6.14.2".to_string()))
         .with_ktstr_kconfig_hash(Some(current_hash.to_string()));
@@ -1158,9 +1158,9 @@ mod tests {
         std::fs::write(&image, b"fake kernel").unwrap();
         let meta = KernelMetadata::new(
             KernelSource::Tarball,
-            "x86_64".to_string(),
-            "bzImage".to_string(),
-            "2026-04-12T10:00:00Z".to_string(),
+            "x86_64",
+            "bzImage",
+            "2026-04-12T10:00:00Z",
         )
         .with_version(Some("2.6.32".to_string()));
         let entry = cache
@@ -1186,9 +1186,9 @@ mod tests {
 
         let stale_meta = KernelMetadata::new(
             KernelSource::Tarball,
-            "x86_64".to_string(),
-            "bzImage".to_string(),
-            "2026-04-12T10:00:00Z".to_string(),
+            "x86_64",
+            "bzImage",
+            "2026-04-12T10:00:00Z",
         )
         .with_version(Some("2.6.32".to_string()))
         .with_ktstr_kconfig_hash(Some("deadbeef".to_string()));
@@ -1206,9 +1206,9 @@ mod tests {
 
         let untracked_meta = KernelMetadata::new(
             KernelSource::Tarball,
-            "x86_64".to_string(),
-            "bzImage".to_string(),
-            "2026-04-12T10:00:00Z".to_string(),
+            "x86_64",
+            "bzImage",
+            "2026-04-12T10:00:00Z",
         )
         .with_version(Some("2.6.32".to_string()))
         .with_ktstr_kconfig_hash(None);
@@ -1244,9 +1244,9 @@ mod tests {
         let make_entry = |key: &str, version: &str| {
             let meta = KernelMetadata::new(
                 KernelSource::Tarball,
-                "x86_64".to_string(),
-                "bzImage".to_string(),
-                "2026-04-12T10:00:00Z".to_string(),
+                "x86_64",
+                "bzImage",
+                "2026-04-12T10:00:00Z",
             )
             .with_version(Some(version.to_string()));
             cache
@@ -1296,9 +1296,9 @@ mod tests {
 
         let meta = KernelMetadata::new(
             KernelSource::Tarball,
-            "x86_64".to_string(),
-            "bzImage".to_string(),
-            "2026-04-22T00:00:00Z".to_string(),
+            "x86_64",
+            "bzImage",
+            "2026-04-22T00:00:00Z",
         )
         .with_version(Some("6.14.2".to_string()));
         let valid_1 = cache
@@ -1364,9 +1364,9 @@ mod tests {
         fn metadata_with_hash(hash: Option<&str>) -> crate::cache::KernelMetadata {
             crate::cache::KernelMetadata::new(
                 KernelSource::Tarball,
-                "x86_64".to_string(),
-                "bzImage".to_string(),
-                "2026-04-12T10:00:00Z".to_string(),
+                "x86_64",
+                "bzImage",
+                "2026-04-12T10:00:00Z",
             )
             .with_version(Some("6.14.2".to_string()))
             .with_ktstr_kconfig_hash(hash.map(str::to_string))
@@ -1428,9 +1428,9 @@ mod tests {
         let build_row = |key: &str, version: Option<&str>, entry_hash: Option<&str>| -> String {
             let meta = KernelMetadata::new(
                 KernelSource::Tarball,
-                "x86_64".to_string(),
-                "bzImage".to_string(),
-                "2026-04-12T10:00:00Z".to_string(),
+                "x86_64",
+                "bzImage",
+                "2026-04-12T10:00:00Z",
             )
             .with_version(version.map(str::to_string))
             .with_ktstr_kconfig_hash(entry_hash.map(str::to_string));

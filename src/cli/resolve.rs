@@ -1354,9 +1354,9 @@ mod tests {
                 source_tree_path: None,
                 git_hash: None,
             },
-            arch.to_string(),
-            image_name.to_string(),
-            "2026-04-12T10:00:00Z".to_string(),
+            arch,
+            image_name,
+            "2026-04-12T10:00:00Z",
         );
         let artifacts = crate::cache::CacheArtifacts::new(&fake_image);
         let entry = cache

@@ -566,9 +566,9 @@ mod tests {
     fn kernel_metadata_option_fields_serialize_as_explicit_null() {
         let meta = KernelMetadata::new(
             KernelSource::Tarball,
-            "x86_64".to_string(),
-            "bzImage".to_string(),
-            "2026-04-12T10:00:00Z".to_string(),
+            "x86_64",
+            "bzImage",
+            "2026-04-12T10:00:00Z",
         );
         let json = serde_json::to_string(&meta).unwrap();
         for null_key in [
@@ -627,9 +627,9 @@ mod tests {
     fn kernel_metadata_all_option_fields_populated_roundtrip() {
         let meta = KernelMetadata::new(
             KernelSource::Tarball,
-            "x86_64".to_string(),
-            "bzImage".to_string(),
-            "2026-04-12T10:00:00Z".to_string(),
+            "x86_64",
+            "bzImage",
+            "2026-04-12T10:00:00Z",
         )
         .with_version(Some("6.14.2".to_string()))
         .with_config_hash(Some("cfg-hash".to_string()))

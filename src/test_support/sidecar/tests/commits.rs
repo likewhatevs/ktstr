@@ -1818,9 +1818,9 @@ fn local_metadata_with_source_tree(
             source_tree_path: Some(source_tree_path),
             git_hash: None,
         },
-        std::env::consts::ARCH.to_string(),
-        "bzImage".to_string(),
-        "2026-04-26T00:00:00Z".to_string(),
+        std::env::consts::ARCH,
+        "bzImage",
+        "2026-04-26T00:00:00Z",
     )
     .with_version(Some(version.to_string()))
     .with_config_hash(Some("abc123".to_string()))
@@ -1921,9 +1921,9 @@ fn resolve_kernel_source_dir_with_cache_version_skips_non_local_in_fallback() {
     );
     let meta = crate::cache::KernelMetadata::new(
         crate::cache::KernelSource::Tarball,
-        std::env::consts::ARCH.to_string(),
-        "bzImage".to_string(),
-        "2026-04-26T00:00:00Z".to_string(),
+        std::env::consts::ARCH,
+        "bzImage",
+        "2026-04-26T00:00:00Z",
     )
     .with_version(Some("6.14.2".to_string()))
     .with_config_hash(Some("abc123".to_string()))
@@ -2019,9 +2019,9 @@ fn resolve_kernel_source_dir_with_cache_cache_key_non_local_yields_none() {
             git_hash: Some("deadbee".to_string()),
             git_ref: Some("main".to_string()),
         },
-        std::env::consts::ARCH.to_string(),
-        "bzImage".to_string(),
-        "2026-04-26T00:00:00Z".to_string(),
+        std::env::consts::ARCH,
+        "bzImage",
+        "2026-04-26T00:00:00Z",
     )
     .with_version(Some("6.14.2".to_string()))
     .with_config_hash(Some("abc123".to_string()))
@@ -2124,9 +2124,9 @@ fn resolve_kernel_source_dir_path_metadata_non_local_falls_through() {
     let cache_entry = tempfile::TempDir::new().expect("cache entry tempdir");
     let meta = crate::cache::KernelMetadata::new(
         crate::cache::KernelSource::Tarball,
-        std::env::consts::ARCH.to_string(),
-        "bzImage".to_string(),
-        "2026-04-26T00:00:00Z".to_string(),
+        std::env::consts::ARCH,
+        "bzImage",
+        "2026-04-26T00:00:00Z",
     )
     .with_version(Some("6.14.2".to_string()));
     std::fs::write(

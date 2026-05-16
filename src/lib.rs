@@ -1251,9 +1251,9 @@ mod tests {
         std::fs::write(&image, b"fake kernel image").unwrap();
         let meta = KernelMetadata::new(
             KernelSource::Tarball,
-            "x86_64".to_string(),
-            "bzImage".to_string(),
-            "2026-04-12T10:00:00Z".to_string(),
+            "x86_64",
+            "bzImage",
+            "2026-04-12T10:00:00Z",
         )
         .with_version(Some("6.14.2".to_string()));
         // `ktstr_kconfig_hash` defaults to None in `KernelMetadata::new`,
@@ -1325,9 +1325,9 @@ mod tests {
         std::fs::write(&current_image, b"current kernel image").unwrap();
         let current_meta = KernelMetadata::new(
             KernelSource::Tarball,
-            "x86_64".to_string(),
-            "current.bzImage".to_string(),
-            "2026-04-01T00:00:00Z".to_string(),
+            "x86_64",
+            "current.bzImage",
+            "2026-04-01T00:00:00Z",
         )
         .with_version(Some("6.14.2".to_string()))
         .with_ktstr_kconfig_hash(Some(current_hash.clone()));
@@ -1344,9 +1344,9 @@ mod tests {
         std::fs::write(&stale_image, b"stale kernel image").unwrap();
         let stale_meta = KernelMetadata::new(
             KernelSource::Tarball,
-            "x86_64".to_string(),
-            "stale.bzImage".to_string(),
-            "2026-04-20T00:00:00Z".to_string(),
+            "x86_64",
+            "stale.bzImage",
+            "2026-04-20T00:00:00Z",
         )
         .with_version(Some("6.14.3".to_string()))
         .with_ktstr_kconfig_hash(Some(stale_hash));
@@ -2015,9 +2015,9 @@ mod tests {
         std::fs::write(&image, b"fake kernel image").unwrap();
         let meta = KernelMetadata::new(
             KernelSource::Tarball,
-            "x86_64".to_string(),
-            "bzImage".to_string(),
-            "2026-04-12T10:00:00Z".to_string(),
+            "x86_64",
+            "bzImage",
+            "2026-04-12T10:00:00Z",
         )
         .with_extra_kconfig_hash(Some(extra_hash.clone()));
         cache
@@ -2077,9 +2077,9 @@ mod tests {
         std::fs::write(&image, b"fake kernel image A").unwrap();
         let meta = KernelMetadata::new(
             KernelSource::Tarball,
-            "x86_64".to_string(),
-            "bzImage".to_string(),
-            "2026-04-12T10:00:00Z".to_string(),
+            "x86_64",
+            "bzImage",
+            "2026-04-12T10:00:00Z",
         )
         .with_extra_kconfig_hash(Some(extra_kconfig_hash(extra_a)));
         cache
@@ -2136,9 +2136,9 @@ mod tests {
         std::fs::write(&image, b"bare kernel").unwrap();
         let bare_meta = KernelMetadata::new(
             KernelSource::Tarball,
-            "x86_64".to_string(),
-            "bzImage".to_string(),
-            "2026-04-12T10:00:00Z".to_string(),
+            "x86_64",
+            "bzImage",
+            "2026-04-12T10:00:00Z",
         );
         // bare_meta has extra_kconfig_hash=None by default.
         assert!(
@@ -2162,9 +2162,9 @@ mod tests {
         std::fs::write(&extras_image, b"extras kernel").unwrap();
         let extras_meta = KernelMetadata::new(
             KernelSource::Tarball,
-            "x86_64".to_string(),
-            "bzImage".to_string(),
-            "2026-04-13T10:00:00Z".to_string(),
+            "x86_64",
+            "bzImage",
+            "2026-04-13T10:00:00Z",
         )
         .with_extra_kconfig_hash(Some(extra_kconfig_hash(extra)));
         cache
@@ -2213,9 +2213,9 @@ mod tests {
         // Bare entry: extra_kconfig_hash = None.
         let bare_meta = KernelMetadata::new(
             KernelSource::Tarball,
-            "x86_64".to_string(),
-            "bzImage".to_string(),
-            "2026-04-12T10:00:00Z".to_string(),
+            "x86_64",
+            "bzImage",
+            "2026-04-12T10:00:00Z",
         );
         let bare = cache
             .store("test-has-bare", &CacheArtifacts::new(&image), &bare_meta)
@@ -2228,9 +2228,9 @@ mod tests {
         // Extras entry: extra_kconfig_hash = Some(hash).
         let extras_meta = KernelMetadata::new(
             KernelSource::Tarball,
-            "x86_64".to_string(),
-            "bzImage".to_string(),
-            "2026-04-13T10:00:00Z".to_string(),
+            "x86_64",
+            "bzImage",
+            "2026-04-13T10:00:00Z",
         )
         .with_extra_kconfig_hash(Some("deadbeef".to_string()));
         let extras = cache

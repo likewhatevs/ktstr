@@ -421,9 +421,9 @@ mod tests {
     fn test_metadata() -> KernelMetadata {
         KernelMetadata::new(
             KernelSource::Tarball,
-            "x86_64".to_string(),
-            "bzImage".to_string(),
-            "2026-04-12T10:00:00Z".to_string(),
+            "x86_64",
+            "bzImage",
+            "2026-04-12T10:00:00Z",
         )
         .with_version(Some("6.14.2".to_string()))
     }
@@ -741,9 +741,9 @@ mod tests {
                 source_tree_path: Some(std::path::PathBuf::from("/tmp/linux-src")),
                 git_hash: Some("deadbee".to_string()),
             },
-            "x86_64".to_string(),
-            "bzImage".to_string(),
-            "2026-04-12T10:00:00Z".to_string(),
+            "x86_64",
+            "bzImage",
+            "2026-04-12T10:00:00Z",
         );
         assert!(matches!(
             meta.source,
@@ -788,9 +788,9 @@ mod tests {
                 git_hash: Some("a1b2c3d".to_string()),
                 git_ref: Some("v6.15-rc3".to_string()),
             },
-            "x86_64".to_string(),
-            "bzImage".to_string(),
-            "2026-04-12T12:00:00Z".to_string(),
+            "x86_64",
+            "bzImage",
+            "2026-04-12T12:00:00Z",
         );
 
         let entry = cache

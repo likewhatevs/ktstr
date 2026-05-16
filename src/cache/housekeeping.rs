@@ -810,9 +810,9 @@ mod tests {
         std::fs::create_dir_all(&entry_dir).unwrap();
         let meta = KernelMetadata::new(
             KernelSource::Tarball,
-            "x86_64".to_string(),
-            "bzImage".to_string(),
-            "2026-04-12T10:00:00Z".to_string(),
+            "x86_64",
+            "bzImage",
+            "2026-04-12T10:00:00Z",
         );
         let json = serde_json::to_string(&meta).unwrap();
         std::fs::write(entry_dir.join("metadata.json"), &json).unwrap();

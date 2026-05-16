@@ -935,9 +935,9 @@ fn cache_dir_store_falls_back_when_strip_fails() {
 fn make_warn_test_entry(has_vmlinux: bool, vmlinux_stripped: bool) -> CacheEntry {
     let mut meta = KernelMetadata::new(
         super::super::metadata::KernelSource::Tarball,
-        "x86_64".to_string(),
-        "bzImage".to_string(),
-        "2026-04-24T12:00:00Z".to_string(),
+        "x86_64",
+        "bzImage",
+        "2026-04-24T12:00:00Z",
     );
     meta.set_has_vmlinux(has_vmlinux);
     meta.set_vmlinux_stripped(vmlinux_stripped);
@@ -991,9 +991,9 @@ fn should_warn_unstripped_silent_when_no_vmlinux() {
 fn make_stale_entry_with_key(key: &str) -> CacheEntry {
     let mut meta = KernelMetadata::new(
         super::super::metadata::KernelSource::Tarball,
-        "x86_64".to_string(),
-        "bzImage".to_string(),
-        "2026-04-24T12:00:00Z".to_string(),
+        "x86_64",
+        "bzImage",
+        "2026-04-24T12:00:00Z",
     );
     meta.set_has_vmlinux(true);
     meta.set_vmlinux_stripped(false);
@@ -2702,19 +2702,19 @@ fn cache_content_matches_when_all_hashes_are_none() {
     // Option<String> hash field is None.
     let cached = KernelMetadata::new(
         super::super::metadata::KernelSource::Tarball,
-        "x86_64".to_string(),
-        "bzImage".to_string(),
-        "2026-04-12T10:00:00Z".to_string(),
+        "x86_64",
+        "bzImage",
+        "2026-04-12T10:00:00Z",
     );
     let caller = KernelMetadata::new(
         super::super::metadata::KernelSource::Tarball,
-        "x86_64".to_string(),
-        "bzImage".to_string(),
+        "x86_64",
+        "bzImage",
         // Distinct built_at — must NOT change the recheck's
         // verdict because built_at is excluded from the
         // predicate. The hashes are all None on both sides,
         // and None == None.
-        "2026-04-13T10:00:00Z".to_string(),
+        "2026-04-13T10:00:00Z",
     );
     assert!(
         cache_content_matches(&cached, &caller, false),
@@ -2737,16 +2737,16 @@ fn cache_content_matches_when_all_hashes_are_none() {
 fn cache_content_matches_all_none_with_vmlinux_on_both_sides() {
     let mut cached = KernelMetadata::new(
         super::super::metadata::KernelSource::Tarball,
-        "x86_64".to_string(),
-        "bzImage".to_string(),
-        "2026-04-12T10:00:00Z".to_string(),
+        "x86_64",
+        "bzImage",
+        "2026-04-12T10:00:00Z",
     );
     cached.set_has_vmlinux(true);
     let caller = KernelMetadata::new(
         super::super::metadata::KernelSource::Tarball,
-        "x86_64".to_string(),
-        "bzImage".to_string(),
-        "2026-04-13T10:00:00Z".to_string(),
+        "x86_64",
+        "bzImage",
+        "2026-04-13T10:00:00Z",
     );
     // caller_has_vmlinux=true (caller is publishing a vmlinux
     // sidecar); cached has has_vmlinux=true; every hash is
