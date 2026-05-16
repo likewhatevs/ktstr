@@ -481,6 +481,11 @@ impl std::fmt::Display for AssertDetail {
 /// narrower than 64-bit (`i32`, `u32`, etc.) need an explicit cast
 /// at the call site rather than a blanket impl, so the call site
 /// reads honestly about the value's resolution.
+///
+/// Derives `PartialEq` but NOT `Eq`: the `Float(f64)` variant holds
+/// IEEE-754 doubles where `NaN != NaN`, which violates the
+/// reflexivity requirement on `Eq`. Equality on `NoteValue` is
+/// partial-equivalence semantics for the same reason `f64` is.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum NoteValue {

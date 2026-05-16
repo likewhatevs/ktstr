@@ -295,7 +295,7 @@ impl ThrottleDimension {
 /// dimension (iops/bytes) tripped the rule for callers that route
 /// programmatic recovery (e.g. clear the offending
 /// `*_burst_capacity` and retry).
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum DiskThrottleValidationError {
     /// `*_burst_capacity` is set to a value strictly below the
     /// corresponding `*` refill rate. A bucket with capacity below
@@ -1449,5 +1449,19 @@ mod tests {
             parsed.throttle.bytes_burst_capacity,
             NonZeroU64::new(200 * 1024 * 1024)
         );
+    }
+
+    #[test]
+    fn disk_throttle_validation_error_hash_consistent_with_eq() {
+        use std::collections::HashSet;
+        let e1 = DiskThrottleValidationError::BurstWithoutRate {
+            dimension: ThrottleDimension::Iops,
+        };
+        let e2 = DiskThrottleValidationError::BurstWithoutRate {
+            dimension: ThrottleDimension::Iops,
+        };
+        let mut set: HashSet<DiskThrottleValidationError> = HashSet::new();
+        set.insert(e1);
+        assert!(set.contains(&e2));
     }
 }

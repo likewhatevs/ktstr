@@ -8,7 +8,7 @@
 ///
 /// Use [`new`](Self::new) for the simple uniform case, or
 /// [`with_nodes`](Self::with_nodes) for explicit per-node configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Topology {
     /// Total number of last-level caches across the whole VM; must be
     /// a multiple of `numa_nodes` when `nodes` is `None`.
@@ -35,7 +35,7 @@ pub struct Topology {
 /// `llcs = 0` models a CXL memory-only node: the node has RAM but no
 /// CPUs or LLCs. Such nodes appear in the SRAT memory affinity table
 /// and SLIT distance matrix but contribute no CPU affinity entries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NumaNode {
     /// Number of LLCs owned by this node. Zero means memory-only (CXL).
     pub llcs: u32,
@@ -65,7 +65,7 @@ pub struct NumaNode {
 ///
 /// `associativity` and `write_policy` occupy 4-bit nibbles in the
 /// HMAT cache_attributes field. Values above 15 are invalid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MemSideCache {
     /// Cache size in bytes.
     pub size: u64,
@@ -166,7 +166,7 @@ impl NumaNode {
 ///
 /// Construct via [`NumaDistance::new`] which validates all invariants
 /// at const-eval time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NumaDistance {
     /// Number of NUMA nodes (matrix is `n x n`).
     n: u32,
@@ -285,6 +285,92 @@ impl std::fmt::Display for Topology {
             "{}n{}l{}c{}t",
             self.numa_nodes, self.llcs, self.cores_per_llc, self.threads_per_core,
         )
+    }
+}
+
+/// Error returned by [`Topology::from_str`] when the input does not
+/// match the `{numa}n{llcs}l{cores}c{threads}t` format or violates a
+/// Topology invariant (each component > 0, `llcs % numa_nodes == 0`,
+/// no `u32` overflow on total CPU count).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, thiserror::Error)]
+pub enum TopologyParseError {
+    /// The input did not match `{numa}n{llcs}l{cores}c{threads}t`.
+    /// Carries the offending input for diagnostics.
+    #[error(
+        "topology string {0:?} does not match \
+         {{numa}}n{{llcs}}l{{cores}}c{{threads}}t — e.g. \"1n2l4c2t\""
+    )]
+    BadFormat(String),
+    /// A component (numa, llcs, cores, threads) was not a positive
+    /// integer (parse error, leading sign, zero).
+    #[error("topology component {0:?} must be a positive integer")]
+    BadComponent(String),
+    /// `llcs` is not a positive multiple of `numa_nodes`. Required by
+    /// [`Topology::new`] to evenly partition LLCs across NUMA nodes.
+    #[error("llcs ({llcs}) must be a positive multiple of numa_nodes ({numa_nodes})")]
+    NotMultiple { llcs: u32, numa_nodes: u32 },
+    /// The total CPU count (`llcs * cores_per_llc * threads_per_core`)
+    /// overflows `u32`. Required by [`Topology::new`] to ensure CPU
+    /// IDs fit in `u32`.
+    #[error("topology total CPU count overflows u32")]
+    Overflow,
+}
+
+/// Parse the [`Display`](#impl-Display-for-Topology) format back into a
+/// uniform `Topology` with `nodes = None` and `distances = None`.
+///
+/// # Lossy round-trip
+///
+/// Only topologies built via [`Topology::new`] (uniform layout, no
+/// per-node configuration, default 10/20 distances) round-trip cleanly
+/// through [`Display`](#impl-Display-for-Topology) → `FromStr`. A
+/// `Topology` built via [`Topology::with_nodes`] or chained with
+/// [`Topology::distances`] loses its per-node config + custom distance
+/// matrix through [`Display`] (which serializes only the 4 primitives);
+/// `FromStr` cannot reconstruct that information and produces a uniform
+/// `Topology` instead. Use the `Topology` value directly when full
+/// fidelity is required.
+impl std::str::FromStr for Topology {
+    type Err = TopologyParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bad_format = || TopologyParseError::BadFormat(s.to_string());
+        let (numa_str, rest) = s.split_once('n').ok_or_else(bad_format)?;
+        let (llcs_str, rest) = rest.split_once('l').ok_or_else(bad_format)?;
+        let (cores_str, rest) = rest.split_once('c').ok_or_else(bad_format)?;
+        let (threads_str, tail) = rest.split_once('t').ok_or_else(bad_format)?;
+        if !tail.is_empty() {
+            return Err(bad_format());
+        }
+        let parse = |c: &str| -> Result<u32, TopologyParseError> {
+            let v: u32 = c
+                .parse()
+                .map_err(|_| TopologyParseError::BadComponent(c.to_string()))?;
+            if v == 0 {
+                return Err(TopologyParseError::BadComponent(c.to_string()));
+            }
+            Ok(v)
+        };
+        let numa_nodes = parse(numa_str)?;
+        let llcs = parse(llcs_str)?;
+        let cores_per_llc = parse(cores_str)?;
+        let threads_per_core = parse(threads_str)?;
+        if !llcs.is_multiple_of(numa_nodes) {
+            return Err(TopologyParseError::NotMultiple { llcs, numa_nodes });
+        }
+        let cpus_per_llc = cores_per_llc
+            .checked_mul(threads_per_core)
+            .ok_or(TopologyParseError::Overflow)?;
+        llcs.checked_mul(cpus_per_llc)
+            .ok_or(TopologyParseError::Overflow)?;
+        Ok(Topology {
+            llcs,
+            cores_per_llc,
+            threads_per_core,
+            numa_nodes,
+            nodes: None,
+            distances: None,
+        })
     }
 }
 
@@ -1378,5 +1464,150 @@ mod tests {
         // end of the node slice on the walk, panicking.
         let t = Topology::with_nodes(2, 1, &TWO_NODES);
         let _ = t.first_llc_in_node(3);
+    }
+
+    // -- Topology FromStr / Display round-trip (uniform topologies) --
+
+    #[test]
+    fn topology_fromstr_display_roundtrip_uniform() {
+        let t = Topology::new(2, 4, 8, 2);
+        let s = t.to_string();
+        assert_eq!(s, "2n4l8c2t");
+        let parsed: Topology = s.parse().unwrap();
+        assert_eq!(parsed, t);
+    }
+
+    #[test]
+    fn topology_fromstr_minimal() {
+        let parsed: Topology = "1n1l1c1t".parse().unwrap();
+        assert_eq!(parsed, Topology::new(1, 1, 1, 1));
+    }
+
+    #[test]
+    fn topology_fromstr_default_for_payload_roundtrip() {
+        // Uniform DEFAULT_FOR_PAYLOAD round-trips cleanly.
+        let s = Topology::DEFAULT_FOR_PAYLOAD.to_string();
+        let parsed: Topology = s.parse().unwrap();
+        assert_eq!(parsed, Topology::DEFAULT_FOR_PAYLOAD);
+    }
+
+    #[test]
+    fn topology_fromstr_rejects_empty() {
+        let err = "".parse::<Topology>().unwrap_err();
+        assert!(matches!(err, TopologyParseError::BadFormat(s) if s.is_empty()));
+    }
+
+    #[test]
+    fn topology_fromstr_rejects_missing_separator() {
+        assert!(matches!(
+            "1n2l4c".parse::<Topology>(),
+            Err(TopologyParseError::BadFormat(_))
+        ));
+        assert!(matches!(
+            "1n2l4c2".parse::<Topology>(),
+            Err(TopologyParseError::BadFormat(_))
+        ));
+    }
+
+    #[test]
+    fn topology_fromstr_rejects_trailing_garbage() {
+        assert!(matches!(
+            "1n2l4c2tjunk".parse::<Topology>(),
+            Err(TopologyParseError::BadFormat(_))
+        ));
+    }
+
+    #[test]
+    fn topology_fromstr_rejects_zero_component() {
+        for s in ["0n1l1c1t", "1n0l1c1t", "1n1l0c1t", "1n1l1c0t"] {
+            assert!(
+                matches!(s.parse::<Topology>(), Err(TopologyParseError::BadComponent(_))),
+                "expected BadComponent for {s}",
+            );
+        }
+    }
+
+    #[test]
+    fn topology_fromstr_rejects_non_numeric() {
+        assert!(matches!(
+            "Xn1l1c1t".parse::<Topology>(),
+            Err(TopologyParseError::BadComponent(_))
+        ));
+        assert!(matches!(
+            "1n-1l1c1t".parse::<Topology>(),
+            Err(TopologyParseError::BadComponent(_))
+        ));
+    }
+
+    #[test]
+    fn topology_fromstr_rejects_llcs_not_multiple_of_numa_nodes() {
+        // 2 NUMA nodes but 3 LLCs is not divisible.
+        let err = "2n3l1c1t".parse::<Topology>().unwrap_err();
+        assert!(matches!(
+            err,
+            TopologyParseError::NotMultiple { llcs: 3, numa_nodes: 2 }
+        ));
+    }
+
+    #[test]
+    fn topology_fromstr_rejects_total_cpu_overflow() {
+        // 2 * 65536 = 131072 LLCs, * 65536 * 1 threads = overflow u32.
+        // Pick numbers that overflow: cores_per_llc * threads_per_core overflows u32 first.
+        let err = "1n1l65536c65537t".parse::<Topology>().unwrap_err();
+        assert!(matches!(err, TopologyParseError::Overflow));
+    }
+
+    #[test]
+    fn topology_hash_consistent_with_eq() {
+        use std::collections::HashSet;
+        let t1 = Topology::new(2, 4, 8, 2);
+        let t2 = Topology::new(2, 4, 8, 2);
+        let mut set: HashSet<Topology> = HashSet::new();
+        set.insert(t1);
+        assert!(set.contains(&t2));
+    }
+
+    #[test]
+    fn numa_node_hash_consistent_with_eq() {
+        use std::collections::HashSet;
+        let n1 = NumaNode {
+            llcs: 2,
+            memory_mib: 4096,
+            latency_ns: Some(100),
+            bandwidth_mbs: Some(51200),
+            mem_side_cache: None,
+        };
+        let n2 = NumaNode {
+            llcs: 2,
+            memory_mib: 4096,
+            latency_ns: Some(100),
+            bandwidth_mbs: Some(51200),
+            mem_side_cache: None,
+        };
+        let mut set: HashSet<NumaNode> = HashSet::new();
+        set.insert(n1);
+        assert!(set.contains(&n2));
+    }
+
+    #[test]
+    fn topology_fromstr_per_node_topology_is_lossy() {
+        // A Topology built via with_nodes carries per-node configuration
+        // that does NOT survive the Display → FromStr round-trip.
+        // Documented lossy behavior — verify the parsed result has
+        // nodes = None and distances = None even when the source had
+        // explicit per-node config.
+        let original = Topology::with_nodes(2, 1, &TWO_NODES);
+        let s = original.to_string();
+        let parsed: Topology = s.parse().unwrap();
+        assert!(parsed.nodes.is_none(), "FromStr must produce nodes = None");
+        assert!(
+            parsed.distances.is_none(),
+            "FromStr must produce distances = None"
+        );
+        // The 4 uniform primitives DO survive.
+        assert_eq!(parsed.numa_nodes, original.numa_nodes);
+        assert_eq!(parsed.llcs, original.llcs);
+        assert_eq!(parsed.cores_per_llc, original.cores_per_llc);
+        assert_eq!(parsed.threads_per_core, original.threads_per_core);
     }
 }

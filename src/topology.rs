@@ -13,7 +13,7 @@ use std::fs;
 use std::path::Path;
 
 /// Information about a last-level cache domain.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlcInfo {
     cpus: Vec<usize>,
     numa_node: usize,
@@ -76,7 +76,7 @@ impl NodeMemInfo {
 /// [`crate::vmm::topology::Topology`] built via
 /// `Topology::new(numa, llcs, cores, threads)`), or synthetic
 /// parameters ([`synthetic`](Self::synthetic), test-only).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestTopology {
     cpus: Vec<usize>,
     llcs: Vec<LlcInfo>,
@@ -1674,5 +1674,45 @@ mod tests {
         assert!(llc.cores().is_empty());
         // With empty cores map, num_cores falls back to cpus.len() == 0.
         assert_eq!(llc.num_cores(), 0);
+    }
+
+    // -- TestTopology + LlcInfo PartialEq + Eq (B1) --
+
+    #[test]
+    fn test_topology_partial_eq_equal_for_same_spec() {
+        let spec = crate::vmm::topology::Topology::new(1, 2, 4, 2);
+        let a = TestTopology::from_vm_topology(&spec);
+        let b = TestTopology::from_vm_topology(&spec);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_topology_partial_eq_differs_for_different_spec() {
+        let spec_a = crate::vmm::topology::Topology::new(1, 2, 4, 2);
+        let spec_b = crate::vmm::topology::Topology::new(2, 4, 4, 2);
+        let a = TestTopology::from_vm_topology(&spec_a);
+        let b = TestTopology::from_vm_topology(&spec_b);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn llc_info_partial_eq_equal_for_same_fields() {
+        let a = synthesize_fallback_llc(&[0, 1], 0);
+        let b = synthesize_fallback_llc(&[0, 1], 0);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn llc_info_partial_eq_differs_for_different_cpus() {
+        let a = synthesize_fallback_llc(&[0, 1], 0);
+        let b = synthesize_fallback_llc(&[2, 3], 0);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn mem_policy_partial_eq_default_equals_default() {
+        use crate::workload::MemPolicy;
+        assert_eq!(MemPolicy::default(), MemPolicy::Default);
+        assert_ne!(MemPolicy::default(), MemPolicy::Local);
     }
 }

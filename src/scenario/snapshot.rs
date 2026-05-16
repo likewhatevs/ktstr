@@ -131,7 +131,7 @@ use crate::monitor::dump::{
 /// error the test author can `?`-propagate. Each variant carries
 /// the path / alternatives needed to fix the call site without
 /// re-running the test.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SnapshotError {
     /// No map matched the requested name. `available` enumerates
@@ -3253,5 +3253,21 @@ mod tests {
         let v = serde_json::json!({"counter": "12345678901234"});
         let f = stats_path(&v, "counter");
         assert_eq!(f.as_u64().unwrap(), 12_345_678_901_234);
+    }
+
+    #[test]
+    fn snapshot_error_hash_consistent_with_eq() {
+        use std::collections::HashSet;
+        let e1 = SnapshotError::VarNotFound {
+            requested: "nr_cpus".into(),
+            available: vec!["nr_iters".into()],
+        };
+        let e2 = SnapshotError::VarNotFound {
+            requested: "nr_cpus".into(),
+            available: vec!["nr_iters".into()],
+        };
+        let mut set: HashSet<SnapshotError> = HashSet::new();
+        set.insert(e1);
+        assert!(set.contains(&e2));
     }
 }

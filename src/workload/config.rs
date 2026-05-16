@@ -603,7 +603,7 @@ impl SchedClass {
 ///
 /// Optional [`MpolFlags`] modify behavior (e.g. `STATIC_NODES` to
 /// keep the nodemask absolute across cpuset changes).
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemPolicy {
     /// Inherit the parent process's memory policy (no syscall).
