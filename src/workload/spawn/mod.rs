@@ -226,11 +226,11 @@ pub(super) fn warn_setpriority_failed_once() {
 /// - **Pro:** sentinel/test code can spread `..WorkerReport::default()`
 ///   so adding a field does not require touching every sentinel site.
 /// - **Con:** zero-valued fields are valid report outputs (e.g. a
-///   worker that never blocked has `resume_latencies_ns: vec![]`), so
+///   worker that never blocked has `wake_latencies_ns: vec![]`), so
 ///   a missing field cannot be distinguished from a real-zero field at
 ///   the reader. Consumers that need "was this field actually set"
 ///   must track presence out-of-band (e.g. whether the work type
-///   populates the field per [`resume_latencies_ns`]'s doc).
+///   populates the field per [`wake_latencies_ns`]'s doc).
 ///
 /// Decision: keep the `Default` impl. Sentinel ergonomics outweigh
 /// the distinguishability cost — every real consumer already knows
@@ -300,24 +300,24 @@ pub struct WorkerReport {
     ///
     /// Distinct from [`iteration_costs_ns`](Self::iteration_costs_ns):
     /// this field measures the OFF-CPU gap between blocks (scheduler
-    /// resume latency); `iteration_costs_ns` measures the wall-clock
+    /// wake latency); `iteration_costs_ns` measures the wall-clock
     /// duration of a single compute iteration. The three pure-compute
     /// variants that populate `iteration_costs_ns` —
     /// [`WorkType::AluHot`], [`WorkType::SmtSiblingSpin`], and
     /// [`WorkType::IpcVariance`] — never block and report
-    /// `resume_latencies_ns: vec![]`. Other compute variants
+    /// `wake_latencies_ns: vec![]`. Other compute variants
     /// (e.g. SpinWait, YieldHeavy, Mixed) populate neither
     /// reservoir.
-    pub resume_latencies_ns: Vec<u64>,
+    pub wake_latencies_ns: Vec<u64>,
     /// Total number of wake-latency observations the worker
     /// recorded, INCLUDING any that were dropped by the reservoir
-    /// sampler. `resume_latencies_ns` is reservoir-clamped to at
+    /// sampler. `wake_latencies_ns` is reservoir-clamped to at
     /// most `MAX_WAKE_SAMPLES` (100_000) entries; on a long run
     /// that accumulates more than that many wake events, the
     /// vector stays at its cap while this counter keeps climbing.
     /// Host-side consumers that want to report "total wakeups
     /// observed" (vs. "entries in the sample") read this field;
-    /// percentile / CV computations read `resume_latencies_ns`.
+    /// percentile / CV computations read `wake_latencies_ns`.
     pub wake_sample_total: u64,
     /// Per-iteration wall-clock duration of one compute iteration (ns),
     /// including any scheduler preemption. Measured via
@@ -328,7 +328,7 @@ pub struct WorkerReport {
     /// observable.
     ///
     /// Reservoir-sampled at the same cap (`MAX_WAKE_SAMPLES` =
-    /// 100_000) as [`resume_latencies_ns`](Self::resume_latencies_ns),
+    /// 100_000) as [`wake_latencies_ns`](Self::wake_latencies_ns),
     /// using the same Algorithm-R sampler.
     ///
     /// Populated for pure compute work types where the worker
@@ -337,7 +337,7 @@ pub struct WorkerReport {
     /// time from the start to the end of one outer-loop iteration's
     /// compute burst.
     ///
-    /// Distinct from [`resume_latencies_ns`](Self::resume_latencies_ns):
+    /// Distinct from [`wake_latencies_ns`](Self::wake_latencies_ns):
     /// the wake-latency reservoir captures off-CPU time (futex /
     /// pipe / nanosleep wakeups); this reservoir captures the
     /// wall-clock duration of one compute iteration (which
@@ -345,7 +345,7 @@ pub struct WorkerReport {
     /// The two are NOT comparable across variants — a
     /// scheduler-A/B test that wants iteration cost for a compute
     /// variant reads this field; a test that wants wake latency
-    /// for a blocking variant reads `resume_latencies_ns`.
+    /// for a blocking variant reads `wake_latencies_ns`.
     pub iteration_costs_ns: Vec<u64>,
     /// Total number of iteration-cost observations the worker
     /// recorded, INCLUDING any that were dropped by the reservoir
@@ -429,9 +429,9 @@ pub struct WorkerReport {
     /// [`Default`], matching its `completed: false` shape.
     ///
     /// Enables per-worker latency-participation assertions in
-    /// tests — a receiver worker produces `resume_latencies_ns`
+    /// tests — a receiver worker produces `wake_latencies_ns`
     /// entries while its messenger pair records wake-side work but
-    /// no resume latency. Without this field, tests had to
+    /// no wake latency. Without this field, tests had to
     /// cross-reference per-group indexing or guess from the empty
     /// vector — ambiguous on groups where the messenger legitimately
     /// exits before producing a report.
@@ -3974,7 +3974,7 @@ impl WorkloadHandle {
                     //    fork-child Drops that actually matter are
                     //    the parent-owned `SpawnGuard` (covered by
                     //    the `_exit` no-Drop guarantee above) and
-                    //    the child-local `resume_latencies_ns` /
+                    //    the child-local `wake_latencies_ns` /
                     //    `migrations` `Vec<T>` (per-process heap,
                     //    no cross-process impact). `STATIC_HOST_INFO`'s
                     //    inner Drop frees a handful of

@@ -39,17 +39,17 @@ pub enum WorkType {
     },
 
     // Cache pressure
-    CachePressure { size_kb: usize, stride: usize },    // Strided RMW sized to pressure L1.
-    CacheYield { size_kb: usize, stride: usize },       // Cache pressure burst then sched_yield().
+    CachePressure { size_kib: usize, stride: usize },    // Strided RMW sized to pressure L1.
+    CacheYield { size_kib: usize, stride: usize },       // Cache pressure burst then sched_yield().
 
     // Wake-placement / cross-CPU paths
     PipeIo { burst_iters: u64 },                        // CPU burst then 1-byte pipe exchange with a partner worker.
     FutexPingPong { spin_iters: u64 },                  // Paired futex wait/wake between partner workers (non-WF_SYNC).
-    CachePipe { size_kb: usize, burst_iters: u64 },     // Cache-hot working set + pipe wake.
+    CachePipe { size_kib: usize, burst_iters: u64 },     // Cache-hot working set + pipe wake.
     FutexFanOut { fan_out: usize, spin_iters: u64 },    // 1:N fan-out wake (one messenger, N receivers).
     FanOutCompute {                                     // Messenger/worker fan-out with matrix-multiply compute per receiver.
         fan_out: usize,
-        cache_footprint_kb: usize,
+        cache_footprint_kib: usize,
         operations: usize,
         sleep_usec: u64,
     },
@@ -87,12 +87,12 @@ pub enum WorkType {
 
     // Memory pressure / NUMA
     PageFaultChurn {                                    // mmap NOHUGEPAGE -> touch random pages -> MADV_DONTNEED, repeat.
-        region_kb: usize,
+        region_kib: usize,
         touches_per_cycle: usize,
         spin_iters: u64,
     },
     NumaWorkingSetSweep {                               // Rotate the working-set memory across NUMA nodes via mbind.
-        region_kb: usize,
+        region_kib: usize,
         sweep_period_ms: u64,
         target_nodes: Vec<usize>,
     },
@@ -155,8 +155,8 @@ pub enum WorkType {
 Parameterized variants have snake-case convenience constructors —
 e.g. `WorkType::bursty(burst_duration, sleep_duration)`,
 `WorkType::pipe_io(burst_iters)`,
-`WorkType::cache_pressure(size_kb, stride)`,
-`WorkType::page_fault_churn(region_kb, touches_per_cycle, spin_iters)`,
+`WorkType::cache_pressure(size_kib, stride)`,
+`WorkType::page_fault_churn(region_kib, touches_per_cycle, spin_iters)`,
 `WorkType::mutex_contention(contenders, hold_iters, work_iters)`,
 `WorkType::priority_inversion(high_count, medium_count, low_count,
 hold_iters, work_iters, pi_mode)`,
@@ -240,7 +240,7 @@ Requires even `num_workers`.
 
 **`CachePressure`** -- strided read-modify-write over a buffer sized
 to pressure the L1 cache. Each worker allocates its own buffer
-post-fork. `size_kb` controls buffer size, `stride` controls the byte
+post-fork. `size_kib` controls buffer size, `stride` controls the byte
 step between accesses.
 
 **`CacheYield`** -- cache pressure followed by `sched_yield()`. Tests
@@ -261,7 +261,7 @@ messenger per group stamps a `CLOCK_MONOTONIC` timestamp then wakes
 `fan_out` workers via `FUTEX_WAKE`. Workers measure wake-to-run latency
 (time from messenger's timestamp to worker getting the CPU), sleep for
 `sleep_usec` microseconds (simulating think time), then do `operations`
-iterations of naive matrix multiply over a `cache_footprint_kb`-sized
+iterations of naive matrix multiply over a `cache_footprint_kib`-sized
 working set (three square matrices of u64, O(n^3)). Requires
 `num_workers` divisible by `fan_out + 1`.
 
@@ -315,7 +315,7 @@ with priority 1 when `CAP_SYS_NICE` is available). Exercises
 `SCHED_OTHER` before exit. Records per-yield wake latency.
 
 **`PageFaultChurn`** -- rapid page fault cycling. Workers mmap a
-`region_kb` KB region with `MADV_NOHUGEPAGE` (forcing 4 KB pages),
+`region_kib` KiB region with `MADV_NOHUGEPAGE` (forcing 4 KiB pages),
 touch `touches_per_cycle` random pages via write faults through
 `do_anonymous_page`, then `MADV_DONTNEED` to zap PTEs and repeat.
 `spin_iters` iterations of CPU work separate cycles. Exercises
@@ -463,14 +463,14 @@ A few representative defaults are shown below; see the
 - `Bursty`: `burst_duration=50ms`, `sleep_duration=100ms`
 - `PipeIo`: `burst_iters=1024`
 - `FutexPingPong`: `spin_iters=1024`
-- `CachePressure`: `size_kb=32`, `stride=64`
-- `CacheYield`: `size_kb=32`, `stride=64`
-- `CachePipe`: `size_kb=32`, `burst_iters=1024`
+- `CachePressure`: `size_kib=32`, `stride=64`
+- `CacheYield`: `size_kib=32`, `stride=64`
+- `CachePipe`: `size_kib=32`, `burst_iters=1024`
 - `FutexFanOut`: `fan_out=4`, `spin_iters=1024`
-- `FanOutCompute`: `fan_out=4`, `cache_footprint_kb=256`, `operations=5`, `sleep_usec=100`
+- `FanOutCompute`: `fan_out=4`, `cache_footprint_kib=256`, `operations=5`, `sleep_usec=100`
 - `AffinityChurn`: `spin_iters=1024`
 - `PolicyChurn`: `spin_iters=1024`
-- `PageFaultChurn`: `region_kb=4096`, `touches_per_cycle=256`, `spin_iters=64`
+- `PageFaultChurn`: `region_kib=4096`, `touches_per_cycle=256`, `spin_iters=64`
 - `MutexContention`: `contenders=4`, `hold_iters=256`, `work_iters=1024`
 
 ## String lookup

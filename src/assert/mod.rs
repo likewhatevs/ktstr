@@ -635,7 +635,7 @@ pub struct CgroupStats {
     /// dispersion is therefore masked: a cgroup with one tight
     /// worker and one wildly variable worker can report a moderate
     /// pooled CV that looks healthier than either constituent. Use
-    /// [`WorkerReport::resume_latencies_ns`] directly if per-worker
+    /// [`WorkerReport::wake_latencies_ns`] directly if per-worker
     /// CV is needed.
     pub wake_latency_cv: f64,
     /// Sum of iteration counts across all workers.
@@ -1611,7 +1611,7 @@ pub struct Assert {
 
     // Benchmarking checks
     /// Max p99 wake latency in NANOSECONDS. Fails if the pooled
-    /// p99 across every worker's `resume_latencies_ns` exceeds this.
+    /// p99 across every worker's `wake_latencies_ns` exceeds this.
     ///
     /// # Unit-name gotcha
     ///
@@ -1626,13 +1626,13 @@ pub struct Assert {
     ///     `stats compare` / dashboard output.
     ///
     /// Both are computed from the same underlying
-    /// [`WorkerReport::resume_latencies_ns`] samples — see
+    /// [`WorkerReport::wake_latencies_ns`] samples — see
     /// [`assert_benchmarks`] for the threshold path and
     /// [`assert_not_starved`] for the reporting path. A bare
     /// comparison of `max_p99_wake_latency_ns` against
     /// `CgroupStats::p99_wake_latency_us` is a unit-mismatch bug;
     /// `assert_benchmarks` never does this — it consumes the raw
-    /// `resume_latencies_ns` directly — and
+    /// `wake_latencies_ns` directly — and
     /// `assert_p99_ns_threshold_compares_against_ns_latencies` pins
     /// that contract.
     pub max_p99_wake_latency_ns: Option<u64>,
@@ -2456,7 +2456,7 @@ pub use temporal::{EachClaim, SeriesField};
 /// #     work_units: 100, cpu_time_ns: 1_000_000, wall_time_ns: 2_000_000,
 /// #     off_cpu_ns: 1_000_000, migration_count: 0, migrations: vec![],
 /// #     max_gap_ms: 0, max_gap_cpu: 0, max_gap_at_ms: 0,
-/// #     resume_latencies_ns: vec![], wake_sample_total: 0,
+/// #     wake_latencies_ns: vec![], wake_sample_total: 0,
 /// #     iteration_costs_ns: vec![], iteration_cost_sample_total: 0,
 /// #     iterations: 0,
 /// #     schedstat_run_delay_ns: 0, schedstat_run_count: 0,
@@ -2496,7 +2496,7 @@ pub fn assert_isolation(reports: &[WorkerReport], expected: &BTreeSet<usize>) ->
 /// #     work_units: 100, cpu_time_ns: 1_000_000, wall_time_ns: 5_000_000_000,
 /// #     off_cpu_ns: 500_000_000, migration_count: 0, migrations: vec![],
 /// #     max_gap_ms: 50, max_gap_cpu: 0, max_gap_at_ms: 1000,
-/// #     resume_latencies_ns: vec![], wake_sample_total: 0,
+/// #     wake_latencies_ns: vec![], wake_sample_total: 0,
 /// #     iteration_costs_ns: vec![], iteration_cost_sample_total: 0,
 /// #     iterations: 0,
 /// #     schedstat_run_delay_ns: 0, schedstat_run_count: 0,
@@ -2590,7 +2590,7 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
     // Compute benchmarking stats from worker reports.
     let all_latencies: Vec<u64> = reports
         .iter()
-        .flat_map(|w| w.resume_latencies_ns.iter().copied())
+        .flat_map(|w| w.wake_latencies_ns.iter().copied())
         .collect();
     let (p99_us, median_us, lat_cv) = if all_latencies.is_empty() {
         (0.0, 0.0, 0.0)
@@ -2753,7 +2753,7 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
 /// #     work_units: units, cpu_time_ns: cpu_ns, wall_time_ns: cpu_ns,
 /// #     off_cpu_ns: cpu_ns, migration_count: 0, migrations: vec![],
 /// #     max_gap_ms: 0, max_gap_cpu: 0, max_gap_at_ms: 0,
-/// #     resume_latencies_ns: vec![], wake_sample_total: 0,
+/// #     wake_latencies_ns: vec![], wake_sample_total: 0,
 /// #     iteration_costs_ns: vec![], iteration_cost_sample_total: 0,
 /// #     iterations: 0,
 /// #     schedstat_run_delay_ns: 0, schedstat_run_count: 0,
@@ -2857,7 +2857,7 @@ pub fn assert_throughput_parity(
 /// #     wall_time_ns: 5_000_000_000, off_cpu_ns: 2_500_000_000,
 /// #     migration_count: 0, migrations: vec![],
 /// #     max_gap_ms: 50, max_gap_cpu: 0, max_gap_at_ms: 1000,
-/// #     resume_latencies_ns: vec![100, 200, 300, 400, 500],
+/// #     wake_latencies_ns: vec![100, 200, 300, 400, 500],
 /// #     wake_sample_total: 5,
 /// #     iteration_costs_ns: vec![], iteration_cost_sample_total: 0,
 /// #     iterations: 1000,
@@ -2892,7 +2892,7 @@ pub fn assert_benchmarks(
     // Collect all wake latencies across workers.
     let all_latencies: Vec<u64> = reports
         .iter()
-        .flat_map(|w| w.resume_latencies_ns.iter().copied())
+        .flat_map(|w| w.wake_latencies_ns.iter().copied())
         .collect();
 
     if let Some(p99_limit) = max_p99_ns
@@ -3055,7 +3055,7 @@ pub fn assert_scx_events_clean(events: &[(&str, i64)], max_count: Option<i64>) -
 pub struct SchedulerBaseline {
     /// Maximum acceptable p99 wake latency (nanoseconds). Compared
     /// against the pooled p99 across every worker's
-    /// [`WorkerReport::resume_latencies_ns`]. `None` skips the check.
+    /// [`WorkerReport::wake_latencies_ns`]. `None` skips the check.
     /// Same units / semantics as [`Assert::max_p99_wake_latency_ns`].
     pub max_p99_wake_latency_ns: Option<u64>,
     /// Maximum acceptable p99 per-iteration compute cost (nanoseconds).
@@ -3137,7 +3137,7 @@ impl SchedulerBaseline {
 ///
 /// Field-to-check mapping:
 /// - `max_p99_wake_latency_ns` -> pooled p99 across every worker's
-///   `resume_latencies_ns`; tagged [`DetailKind::Benchmark`].
+///   `wake_latencies_ns`; tagged [`DetailKind::Benchmark`].
 /// - `max_iteration_cost_p99_ns` -> pooled p99 across every worker's
 ///   `iteration_costs_ns`; tagged [`DetailKind::Benchmark`].
 /// - `max_migrations` -> sum of `migration_count` across workers;
@@ -3159,7 +3159,7 @@ impl SchedulerBaseline {
 /// #     wall_time_ns: 5_000_000_000, off_cpu_ns: 2_500_000_000,
 /// #     migration_count: 5, migrations: vec![],
 /// #     max_gap_ms: 50, max_gap_cpu: 0, max_gap_at_ms: 1000,
-/// #     resume_latencies_ns: vec![100, 200, 300, 400, 500],
+/// #     wake_latencies_ns: vec![100, 200, 300, 400, 500],
 /// #     wake_sample_total: 5,
 /// #     iteration_costs_ns: vec![1000, 2000, 3000, 4000, 5000],
 /// #     iteration_cost_sample_total: 5,

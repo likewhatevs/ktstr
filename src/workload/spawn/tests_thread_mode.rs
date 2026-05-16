@@ -562,8 +562,8 @@ fn spawn_thread_drop_cleanup() {
 /// messages via `pipe_exchange` (one `write(byte)` then a
 /// `poll(POLLIN)` + `read(byte)` round-trip per iteration);
 /// each successful round-trip pushes a sample into the
-/// reservoir-sampled `resume_latencies_ns` Vec, so a worker
-/// reporting an empty `resume_latencies_ns` after the run
+/// reservoir-sampled `wake_latencies_ns` Vec, so a worker
+/// reporting an empty `wake_latencies_ns` after the run
 /// window means its pipe ops never observed a real wake.
 ///
 /// Asserting `work_units > 0` would NOT prove pipe routing —
@@ -573,7 +573,7 @@ fn spawn_thread_drop_cleanup() {
 /// closed fds returns -1/EBADF and `pipe_exchange` short-
 /// circuits via `if ret < 0 { break; }` (skipping the latency
 /// push) but the outer iteration counter advances. Hence the
-/// invariant the test pins is `resume_latencies_ns.len() > 0`,
+/// invariant the test pins is `wake_latencies_ns.len() > 0`,
 /// not `work_units > 0`.
 ///
 /// Pin two stronger checks alongside the latency-sample
@@ -607,7 +607,7 @@ fn spawn_thread_with_pipe_io() {
             r,
         );
         assert!(
-            !r.resume_latencies_ns.is_empty(),
+            !r.wake_latencies_ns.is_empty(),
             "Thread + PipeIo worker tid={} captured zero wake-latency \
              samples — its pipe ops never observed a partner write, \
              which under shared-fd-table semantics means the pipe fds \
@@ -704,7 +704,7 @@ fn wake_chain_pipe_thread_mode_bootstrap_throughput() {
 /// [`WorkloadHandle`] and closed only at handle Drop), a
 /// Thread-mode WakeChain wake=Pipe workload must observe each
 /// stage's predecessor write — verified via
-/// `resume_latencies_ns` non-empty for at least one stage in
+/// `wake_latencies_ns` non-empty for at least one stage in
 /// the chain (the head stage publishes its first wake on the
 /// bootstrap path; subsequent stages collect samples on the
 /// post-bootstrap rounds).
@@ -736,7 +736,7 @@ fn spawn_thread_with_wake_chain_pipe() {
         2,
         "Thread + WakeChain wake=Pipe collects one report per worker"
     );
-    let total_samples: usize = reports.iter().map(|r| r.resume_latencies_ns.len()).sum();
+    let total_samples: usize = reports.iter().map(|r| r.wake_latencies_ns.len()).sum();
     assert!(
         total_samples > 0,
         "Thread + WakeChain wake=Pipe captured zero wake-latency \

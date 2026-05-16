@@ -487,8 +487,8 @@ pub enum WorkTypeHint {
     /// tracepoints + paired tids.
     FutexPingPong,
     /// Strided memory access pattern dominating CPU time. Maps to
-    /// `WorkType::CachePressure` with measured `size_kb` / `stride`.
-    CachePressure { size_kb: u32, stride: u32 },
+    /// `WorkType::CachePressure` with measured `size_kib` / `stride`.
+    CachePressure { size_kib: u32, stride: u32 },
     /// Synchronous-write workload — short bursts of `pwrite` followed
     /// by `fdatasync`, opened with `O_SYNC`. Detection signal (when
     /// capture pipeline wired): `O_SYNC` open flag plus a sequential

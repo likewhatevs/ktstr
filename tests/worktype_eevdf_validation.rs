@@ -7,7 +7,7 @@
 //! populate are actually populated. Catches assertion-string drift
 //! between production and tests — a regression that breaks the
 //! `iteration_costs_ns` reservoir-sampling for `IpcVariance`, or
-//! the `resume_latencies_ns` capture for `FutexPingPong`, would
+//! the `wake_latencies_ns` capture for `FutexPingPong`, would
 //! surface here even when the workload still produces work_units.
 //!
 //! Distinct from `eevdf_tests.rs` (which exercises EEVDF's
@@ -19,8 +19,8 @@
 //!
 //! WorkType variants covered:
 //!   - `WakeChain { wake: Pipe, ... }` — populates
-//!     `resume_latencies_ns` from the chain stage handoff.
-//!   - `FutexPingPong` — populates `resume_latencies_ns` from the
+//!     `wake_latencies_ns` from the chain stage handoff.
+//!   - `FutexPingPong` — populates `wake_latencies_ns` from the
 //!     paired wake/wait round-trips.
 //!   - `MutexContention` — populates `iterations` and `work_units`
 //!     under multi-worker contention; serialized critical sections
@@ -51,7 +51,7 @@ use ktstr::workload::{
 use std::time::Duration;
 
 /// `WakeChain { wake: WakeMechanism::Pipe }` MUST populate
-/// `resume_latencies_ns` for at least one stage in the chain.
+/// `wake_latencies_ns` for at least one stage in the chain.
 /// The head stage publishes its first wake on the bootstrap path;
 /// subsequent stages collect samples on each post-bootstrap
 /// round-trip. A regression that breaks the per-stage pipe-fd
@@ -74,7 +74,7 @@ use std::time::Duration;
     duration_s = 5,
     watchdog_timeout_s = 15
 )]
-fn validation_wake_chain_pipe_populates_resume_latencies(ctx: &Ctx) -> Result<AssertResult> {
+fn validation_wake_chain_pipe_populates_wake_latencies(ctx: &Ctx) -> Result<AssertResult> {
     let config = WorkloadConfig {
         num_workers: 4,
         affinity: AffinityIntent::Inherit,
@@ -105,13 +105,13 @@ fn validation_wake_chain_pipe_populates_resume_latencies(ctx: &Ctx) -> Result<As
         return Ok(result);
     }
 
-    let total_samples: usize = reports.iter().map(|r| r.resume_latencies_ns.len()).sum();
+    let total_samples: usize = reports.iter().map(|r| r.wake_latencies_ns.len()).sum();
     if total_samples == 0 {
         result.passed = false;
         result.details.push(AssertDetail::new(
             DetailKind::Other,
             format!(
-                "WakeChain wake=Pipe captured zero `resume_latencies_ns` \
+                "WakeChain wake=Pipe captured zero `wake_latencies_ns` \
                  samples across {} workers — the chain pipes never routed \
                  a stage handoff. Check chain_pipes ownership transfer \
                  and the per-stage pipe-fd lifetime.",
@@ -125,7 +125,7 @@ fn validation_wake_chain_pipe_populates_resume_latencies(ctx: &Ctx) -> Result<As
     result.details.push(AssertDetail::new(
         DetailKind::Other,
         format!(
-            "WakeChain wake=Pipe populated resume_latencies_ns: \
+            "WakeChain wake=Pipe populated wake_latencies_ns: \
              total_samples={total_samples}, total_iterations={total_iters} \
              across {} workers",
             reports.len(),
@@ -134,7 +134,7 @@ fn validation_wake_chain_pipe_populates_resume_latencies(ctx: &Ctx) -> Result<As
     Ok(result)
 }
 
-/// `FutexPingPong` MUST populate `resume_latencies_ns` from the
+/// `FutexPingPong` MUST populate `wake_latencies_ns` from the
 /// paired FUTEX_WAKE/FUTEX_WAIT round-trips. Each pair (i, i+1)
 /// shares a futex word; one worker's wake unblocks the partner's
 /// wait, and the timestamp from `before_block` to the wait return
@@ -150,7 +150,7 @@ fn validation_wake_chain_pipe_populates_resume_latencies(ctx: &Ctx) -> Result<As
     duration_s = 5,
     watchdog_timeout_s = 15
 )]
-fn validation_futex_ping_pong_populates_resume_latencies(ctx: &Ctx) -> Result<AssertResult> {
+fn validation_futex_ping_pong_populates_wake_latencies(ctx: &Ctx) -> Result<AssertResult> {
     let config = WorkloadConfig {
         num_workers: 2,
         affinity: AffinityIntent::Inherit,
@@ -177,12 +177,12 @@ fn validation_futex_ping_pong_populates_resume_latencies(ctx: &Ctx) -> Result<As
         return Ok(result);
     }
 
-    let total_samples: usize = reports.iter().map(|r| r.resume_latencies_ns.len()).sum();
+    let total_samples: usize = reports.iter().map(|r| r.wake_latencies_ns.len()).sum();
     if total_samples == 0 {
         result.passed = false;
         result.details.push(AssertDetail::new(
             DetailKind::Other,
-            "FutexPingPong captured zero resume_latencies_ns samples — \
+            "FutexPingPong captured zero wake_latencies_ns samples — \
              the per-pair futex word never routed a wake/wait round-trip. \
              Check the futex allocation or the wake_sample_count branch."
                 .to_string(),
@@ -208,7 +208,7 @@ fn validation_futex_ping_pong_populates_resume_latencies(ctx: &Ctx) -> Result<As
     result.details.push(AssertDetail::new(
         DetailKind::Other,
         format!(
-            "FutexPingPong populated resume_latencies_ns: \
+            "FutexPingPong populated wake_latencies_ns: \
              total_samples={total_samples} across {} workers",
             reports.len(),
         ),

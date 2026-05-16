@@ -156,7 +156,7 @@ fn thread_integration_spin_wait(ctx: &Ctx) -> Result<AssertResult> {
 /// Thread-mode `FutexPingPong` MUST exchange real wake/wait
 /// signals through the per-pair futex word. Pins the shared
 /// address-space futex semantics under the guest kernel: both
-/// workers must report `resume_latencies_ns` non-empty and
+/// workers must report `wake_latencies_ns` non-empty and
 /// `work_units > 0`. Because thread workers share the parent's
 /// mm, the futex word is automatically shared without explicit
 /// MAP_SHARED — a regression that breaks the per-pair allocation
@@ -198,7 +198,7 @@ fn thread_integration_futex_ping_pong(ctx: &Ctx) -> Result<AssertResult> {
     }
 
     for r in &reports {
-        if r.resume_latencies_ns.is_empty() {
+        if r.wake_latencies_ns.is_empty() {
             result.passed = false;
             result.details.push(AssertDetail::new(
                 DetailKind::Other,
@@ -227,11 +227,11 @@ fn thread_integration_futex_ping_pong(ctx: &Ctx) -> Result<AssertResult> {
         }
     }
 
-    let total_samples: usize = reports.iter().map(|r| r.resume_latencies_ns.len()).sum();
+    let total_samples: usize = reports.iter().map(|r| r.wake_latencies_ns.len()).sum();
     result.details.push(AssertDetail::new(
         DetailKind::Other,
         format!(
-            "Thread FutexPingPong populated resume_latencies_ns: \
+            "Thread FutexPingPong populated wake_latencies_ns: \
              total_samples={total_samples} across {} workers",
             reports.len(),
         ),

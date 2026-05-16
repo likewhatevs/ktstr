@@ -202,14 +202,14 @@ pub enum WorkType {
     FutexPingPong { spin_iters: u64 },
     /// Strided read-modify-write over a buffer, sized to pressure the L1
     /// cache. Each worker allocates its own buffer post-fork.
-    CachePressure { size_kb: usize, stride: usize },
+    CachePressure { size_kib: usize, stride: usize },
     /// Cache pressure burst followed by sched_yield(). Tests scheduler
     /// re-placement after voluntary yield with a cache-hot working set.
-    CacheYield { size_kb: usize, stride: usize },
+    CacheYield { size_kib: usize, stride: usize },
     /// Cache pressure burst then 1-byte pipe exchange with a partner
     /// worker. Combines cache-hot working set with cross-CPU wake
     /// placement. Requires even num_workers.
-    CachePipe { size_kb: usize, burst_iters: u64 },
+    CachePipe { size_kib: usize, burst_iters: u64 },
     /// 1:N fan-out wake pattern without cache pressure. One messenger per
     /// group does CPU spin work then wakes N receivers via FUTEX_WAKE.
     /// Receivers measure wake-to-run latency as the interval from
@@ -248,23 +248,23 @@ pub enum WorkType {
     /// wakes `fan_out` workers via shared futex. After recording the
     /// wake-to-run latency, each worker sleeps for `sleep_usec`
     /// microseconds (simulating think time), then does `operations`
-    /// matrix multiplications over a `cache_footprint_kb`-sized working
+    /// matrix multiplications over a `cache_footprint_kib`-sized working
     /// set. Wake-to-run latency is the interval from the messenger's
     /// timestamp to the worker observing the generation advance.
     /// Requires num_workers divisible by (fan_out + 1).
     FanOutCompute {
         fan_out: usize,
-        cache_footprint_kb: usize,
+        cache_footprint_kib: usize,
         operations: usize,
         sleep_usec: u64,
     },
-    /// Rapid page fault cycling. Workers mmap a `region_kb` KB region with
-    /// `MADV_NOHUGEPAGE` (forcing 4 KB pages), touch `touches_per_cycle`
+    /// Rapid page fault cycling. Workers mmap a `region_kib` KiB region with
+    /// `MADV_NOHUGEPAGE` (forcing 4 KiB pages), touch `touches_per_cycle`
     /// random pages via write faults, then `MADV_DONTNEED` to zap PTEs and
     /// repeat. Exercises `do_anonymous_page`, page allocator contention,
     /// and TLB pressure on migration.
     PageFaultChurn {
-        region_kb: usize,
+        region_kib: usize,
         touches_per_cycle: usize,
         spin_iters: u64,
     },
@@ -293,7 +293,7 @@ pub enum WorkType {
     /// `iter_slot` publish that host sampling reads, nor the periodic
     /// max-gap tracking. The custom closure owns its own telemetry and
     /// must populate the [`WorkerReport`] fields it wants measured
-    /// (`iterations`, `resume_latencies_ns`, `max_gap_ns`, etc.); any
+    /// (`iterations`, `wake_latencies_ns`, `max_gap_ns`, etc.); any
     /// field left at `WorkerReport::default()` is reported as zero by
     /// downstream evaluation. Assertions like
     /// [`assert_not_starved`](crate::assert::assert_not_starved) that
@@ -516,7 +516,7 @@ pub enum WorkType {
     /// or somewhere else?).
     ///
     /// `worker_group_size = 2`. Wake latency is recorded into the
-    /// wakee's `resume_latencies_ns` reservoir using the same
+    /// wakee's `wake_latencies_ns` reservoir using the same
     /// `before_block` → `cur != expected` measurement as
     /// [`FutexPingPong`](Self::FutexPingPong).
     AsymmetricWaker {
@@ -612,7 +612,7 @@ pub enum WorkType {
         #[serde(with = "humantime_serde_helper")]
         work_per_hop: Duration,
     },
-    /// Workers allocate a `region_kb` KB region with `set_mempolicy`
+    /// Workers allocate a `region_kib` KiB region with `set_mempolicy`
     /// pinned to one node, touch every page in that region, then
     /// `mbind(MPOL_BIND)` the region to the next node in
     /// `target_nodes` and re-touch — moving the working set across
@@ -631,7 +631,7 @@ pub enum WorkType {
         /// Size of the working-set region per worker (KB). Each
         /// worker allocates this much anonymous memory and re-binds
         /// it across NUMA nodes.
-        region_kb: usize,
+        region_kib: usize,
         /// Wall-clock interval between binds. After every
         /// `sweep_period_ms`, the worker rotates to the next node
         /// in `target_nodes` and `mbind`s the region.
@@ -853,7 +853,7 @@ pub enum WorkType {
     ///   `schedule()` (sched_yield-equivalent).
     /// - **NO_HZ_FULL** — workers pinned to a CPU in the
     ///   `nohz_full=` mask see LOWER median
-    ///   `resume_latencies_ns` (tick re-arm is skipped) but
+    ///   `wake_latencies_ns` (tick re-arm is skipped) but
     ///   heavier high-percentile tail (deferred jiffy-driven
     ///   work catchup). Mixing pinned-vs-unpinned workers
     ///   across the mask boundary produces a bimodal
@@ -1006,7 +1006,7 @@ pub enum WorkType {
     ///   expiry alone; the kernel skips tick re-arm on wake when
     ///   no tick-dependent subsystem demands it
     ///   (`tick_nohz_idle_enter` at `kernel/time/tick-sched.c`),
-    ///   so steady-state `resume_latencies_ns` reads LOWER on
+    ///   so steady-state `wake_latencies_ns` reads LOWER on
     ///   nohz_full CPUs than on `NO_HZ_IDLE` CPUs.
     ///   The catch: deferred jiffy-driven work (RCU callbacks,
     ///   vmstat updates, watchdog ticks) accumulates while the
@@ -1063,7 +1063,7 @@ pub enum WorkType {
     ///    `wake_up_process` → guest scheduler reruns the
     ///    IdleChurn task.
     ///
-    /// `resume_latencies_ns` (the dispatch arm subtracts
+    /// `wake_latencies_ns` (the dispatch arm subtracts
     /// `sleep_duration` to isolate scheduler-resume overhead)
     /// captures the SUM of guest scheduling cost +
     /// vmexit-vmenter round-trip + host scheduling cost. The
@@ -1125,7 +1125,7 @@ pub enum WorkType {
     ///   noisy neighbors), and budget for host-scheduler-
     ///   contributed jitter.
     /// - On a heavily-loaded host (concurrent ktstr tests, or
-    ///   noisy neighbors), `resume_latencies_ns` reflects host
+    ///   noisy neighbors), `wake_latencies_ns` reflects host
     ///   contention even under `performance_mode=true` because
     ///   the vCPU thread itself can be preempted on the host
     ///   (the guest sees this as "the worker just took longer
@@ -1139,7 +1139,7 @@ pub enum WorkType {
     ///
     /// # Wake-latency interpretation
     ///
-    /// `resume_latencies_ns` samples for IdleChurn capture the
+    /// `wake_latencies_ns` samples for IdleChurn capture the
     /// **scheduler-resume overhead** — the time the kernel spent
     /// scheduling the worker back on-CPU after the requested
     /// `sleep_duration` elapsed. The dispatch arm subtracts
@@ -1147,7 +1147,7 @@ pub enum WorkType {
     /// leaving timer slack (default 50µs) plus
     /// `try_to_wake_up` → on-CPU latency. This isolates the
     /// signal a scheduler A/B test cares about: comparing
-    /// `resume_latencies_ns` distributions across schedulers
+    /// `wake_latencies_ns` distributions across schedulers
     /// directly measures their idle-class → run-class transition
     /// behavior without the requested-sleep duration dominating
     /// the measurement.
@@ -1158,7 +1158,7 @@ pub enum WorkType {
     /// matches the "no observable resume overhead" interpretation.
     ///
     /// Samples are comparable in DIRECTION to
-    /// `resume_latencies_ns` from FutexPingPong, FutexFanOut,
+    /// `wake_latencies_ns` from FutexPingPong, FutexFanOut,
     /// and other wake-pair variants (lower = better scheduler
     /// resume), but the IdleChurn distribution carries a
     /// ~50µs floor from `current->timer_slack_ns` that
@@ -1490,15 +1490,15 @@ impl WorkType {
                 spin_iters: defaults::FUTEX_PING_PONG_SPIN_ITERS,
             }),
             "CachePressure" => Some(WorkType::CachePressure {
-                size_kb: defaults::CACHE_PRESSURE_SIZE_KB,
+                size_kib: defaults::CACHE_PRESSURE_SIZE_KIB,
                 stride: defaults::CACHE_PRESSURE_STRIDE,
             }),
             "CacheYield" => Some(WorkType::CacheYield {
-                size_kb: defaults::CACHE_YIELD_SIZE_KB,
+                size_kib: defaults::CACHE_YIELD_SIZE_KIB,
                 stride: defaults::CACHE_YIELD_STRIDE,
             }),
             "CachePipe" => Some(WorkType::CachePipe {
-                size_kb: defaults::CACHE_PIPE_SIZE_KB,
+                size_kib: defaults::CACHE_PIPE_SIZE_KIB,
                 burst_iters: defaults::CACHE_PIPE_BURST_ITERS,
             }),
             "FutexFanOut" => Some(WorkType::FutexFanOut {
@@ -1515,12 +1515,12 @@ impl WorkType {
             }),
             "FanOutCompute" => Some(WorkType::FanOutCompute {
                 fan_out: defaults::FAN_OUT_COMPUTE_FAN_OUT,
-                cache_footprint_kb: defaults::FAN_OUT_COMPUTE_CACHE_FOOTPRINT_KB,
+                cache_footprint_kib: defaults::FAN_OUT_COMPUTE_CACHE_FOOTPRINT_KIB,
                 operations: defaults::FAN_OUT_COMPUTE_OPERATIONS,
                 sleep_usec: defaults::FAN_OUT_COMPUTE_SLEEP_USEC,
             }),
             "PageFaultChurn" => Some(WorkType::PageFaultChurn {
-                region_kb: defaults::PAGE_FAULT_CHURN_REGION_KB,
+                region_kib: defaults::PAGE_FAULT_CHURN_REGION_KIB,
                 touches_per_cycle: defaults::PAGE_FAULT_CHURN_TOUCHES_PER_CYCLE,
                 spin_iters: defaults::PAGE_FAULT_CHURN_SPIN_ITERS,
             }),
@@ -1566,7 +1566,7 @@ impl WorkType {
                 work_per_hop: defaults::WAKE_CHAIN_WORK_PER_HOP,
             }),
             "NumaWorkingSetSweep" => Some(WorkType::NumaWorkingSetSweep {
-                region_kb: defaults::NUMA_WORKING_SET_SWEEP_REGION_KB,
+                region_kib: defaults::NUMA_WORKING_SET_SWEEP_REGION_KIB,
                 sweep_period_ms: defaults::NUMA_WORKING_SET_SWEEP_SWEEP_PERIOD_MS,
                 // Empty list — single-node default leaves binding
                 // disabled, matching `node_set()` defaults from
@@ -1821,29 +1821,29 @@ impl WorkType {
         WorkType::FutexPingPong { spin_iters }
     }
 
-    /// Strided read-modify-write over a `size_kb` KB buffer.
+    /// Strided read-modify-write over a `size_kib` KiB buffer.
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::CachePressure`] variant doc for preconditions.
-    pub const fn cache_pressure(size_kb: usize, stride: usize) -> Self {
-        WorkType::CachePressure { size_kb, stride }
+    pub const fn cache_pressure(size_kib: usize, stride: usize) -> Self {
+        WorkType::CachePressure { size_kib, stride }
     }
 
     /// Cache pressure burst followed by sched_yield().
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::CacheYield`] variant doc for preconditions.
-    pub const fn cache_yield(size_kb: usize, stride: usize) -> Self {
-        WorkType::CacheYield { size_kb, stride }
+    pub const fn cache_yield(size_kib: usize, stride: usize) -> Self {
+        WorkType::CacheYield { size_kib, stride }
     }
 
     /// Cache pressure burst then pipe exchange with a partner worker.
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::CachePipe`] variant doc for preconditions.
-    pub const fn cache_pipe(size_kb: usize, burst_iters: u64) -> Self {
+    pub const fn cache_pipe(size_kib: usize, burst_iters: u64) -> Self {
         WorkType::CachePipe {
-            size_kb,
+            size_kib,
             burst_iters,
         }
     }
@@ -1891,13 +1891,13 @@ impl WorkType {
     /// [`WorkType::FanOutCompute`] variant doc for preconditions.
     pub const fn fan_out_compute(
         fan_out: usize,
-        cache_footprint_kb: usize,
+        cache_footprint_kib: usize,
         operations: usize,
         sleep_usec: u64,
     ) -> Self {
         WorkType::FanOutCompute {
             fan_out,
-            cache_footprint_kb,
+            cache_footprint_kib,
             operations,
             sleep_usec,
         }
@@ -1907,9 +1907,9 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::PageFaultChurn`] variant doc for preconditions.
-    pub const fn page_fault_churn(region_kb: usize, touches_per_cycle: usize, spin_iters: u64) -> Self {
+    pub const fn page_fault_churn(region_kib: usize, touches_per_cycle: usize, spin_iters: u64) -> Self {
         WorkType::PageFaultChurn {
-            region_kb,
+            region_kib,
             touches_per_cycle,
             spin_iters,
         }
@@ -2046,12 +2046,12 @@ impl WorkType {
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::NumaWorkingSetSweep`] variant doc for preconditions.
     pub fn numa_working_set_sweep(
-        region_kb: usize,
+        region_kib: usize,
         sweep_period_ms: u64,
         target_nodes: impl IntoIterator<Item = usize>,
     ) -> Self {
         WorkType::NumaWorkingSetSweep {
-            region_kb,
+            region_kib,
             sweep_period_ms,
             target_nodes: target_nodes.into_iter().collect(),
         }

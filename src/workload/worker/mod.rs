@@ -20,7 +20,7 @@ use super::spawn::{
 use super::types::*;
 
 /// Per-worker reservoir-sample cap for the wake-latency
-/// ([`WorkerReport::resume_latencies_ns`]) and per-iteration
+/// ([`WorkerReport::wake_latencies_ns`]) and per-iteration
 /// cost ([`WorkerReport::iteration_costs_ns`]) buffers.
 ///
 /// The cap bounds memory per worker on long-running scenarios:
@@ -327,10 +327,10 @@ pub(super) fn worker_main(
         ipc_variance_rng = GOLDEN_RATIO_64;
     }
     // Benchmarking: per-wakeup latency samples (reservoir-sampled) and iteration counter.
-    let mut resume_latencies_ns: Vec<u64> = Vec::with_capacity(MAX_WAKE_SAMPLES);
+    let mut wake_latencies_ns: Vec<u64> = Vec::with_capacity(MAX_WAKE_SAMPLES);
     let mut wake_sample_count: u64 = 0;
     // Per-iteration wall-clock compute duration samples
-    // (reservoir-sampled at the same cap as resume_latencies_ns).
+    // (reservoir-sampled at the same cap as wake_latencies_ns).
     // Populated by AluHot, SmtSiblingSpin, IpcVariance; all other
     // variants leave it empty.
     let mut iteration_costs_ns: Vec<u64> = Vec::with_capacity(MAX_WAKE_SAMPLES);
@@ -380,15 +380,15 @@ pub(super) fn worker_main(
         } else {
             Vec::new()
         };
-    // FanOutCompute: pre-compute matrix dimension from cache_footprint_kb.
+    // FanOutCompute: pre-compute matrix dimension from cache_footprint_kib.
     let matrix_size: usize = if let WorkType::FanOutCompute {
-        cache_footprint_kb,
+        cache_footprint_kib,
         operations,
         ..
     } = &work_type
     {
-        if *operations > 0 && *cache_footprint_kb > 0 {
-            ((cache_footprint_kb * 1024 / 3 / std::mem::size_of::<u64>()) as f64).sqrt() as usize
+        if *operations > 0 && *cache_footprint_kib > 0 {
+            ((cache_footprint_kib * 1024 / 3 / std::mem::size_of::<u64>()) as f64).sqrt() as usize
         } else {
             0
         }
@@ -543,7 +543,7 @@ pub(super) fn worker_main(
                 // level dirty-data flush completes.
                 let _ = unsafe { libc::fdatasync(fd) };
                 reservoir_push(
-                    &mut resume_latencies_ns,
+                    &mut wake_latencies_ns,
                     &mut wake_sample_count,
                     before_fsync.elapsed().as_nanos() as u64,
                     MAX_WAKE_SAMPLES,
@@ -586,7 +586,7 @@ pub(super) fn worker_main(
                     )
                 };
                 reservoir_push(
-                    &mut resume_latencies_ns,
+                    &mut wake_latencies_ns,
                     &mut wake_sample_count,
                     before_pread.elapsed().as_nanos() as u64,
                     MAX_WAKE_SAMPLES,
@@ -675,7 +675,7 @@ pub(super) fn worker_main(
                     let _ = unsafe { libc::fdatasync(fd) };
                 }
                 reservoir_push(
-                    &mut resume_latencies_ns,
+                    &mut wake_latencies_ns,
                     &mut wake_sample_count,
                     before_io.elapsed().as_nanos() as u64,
                     MAX_WAKE_SAMPLES,
@@ -697,7 +697,7 @@ pub(super) fn worker_main(
                     let before_sleep = Instant::now();
                     std::thread::sleep(sleep_duration);
                     reservoir_push(
-                        &mut resume_latencies_ns,
+                        &mut wake_latencies_ns,
                         &mut wake_sample_count,
                         before_sleep.elapsed().as_nanos() as u64,
                         MAX_WAKE_SAMPLES,
@@ -714,7 +714,7 @@ pub(super) fn worker_main(
                 pipe_exchange(
                     read_fd,
                     write_fd,
-                    &mut resume_latencies_ns,
+                    &mut wake_latencies_ns,
                     &mut wake_sample_count,
                     MAX_WAKE_SAMPLES,
                     stop,
@@ -752,7 +752,7 @@ pub(super) fn worker_main(
                     let cur = atom.load(Ordering::Relaxed);
                     if cur == my_val {
                         reservoir_push(
-                            &mut resume_latencies_ns,
+                            &mut wake_latencies_ns,
                             &mut wake_sample_count,
                             before_block.elapsed().as_nanos() as u64,
                             MAX_WAKE_SAMPLES,
@@ -765,16 +765,16 @@ pub(super) fn worker_main(
                 last_iter_time = Instant::now();
                 iterations += 1;
             }
-            WorkType::CachePressure { size_kb, stride } => {
-                let buf = cache_pressure_buf.get_or_insert_with(|| vec![0u8; size_kb * 1024]);
+            WorkType::CachePressure { size_kib, stride } => {
+                let buf = cache_pressure_buf.get_or_insert_with(|| vec![0u8; size_kib * 1024]);
                 if buf.is_empty() || stride == 0 {
                     break;
                 }
                 cache_rmw_loop(buf, stride, 1024, &mut work_units);
                 iterations += 1;
             }
-            WorkType::CacheYield { size_kb, stride } => {
-                let buf = cache_pressure_buf.get_or_insert_with(|| vec![0u8; size_kb * 1024]);
+            WorkType::CacheYield { size_kib, stride } => {
+                let buf = cache_pressure_buf.get_or_insert_with(|| vec![0u8; size_kib * 1024]);
                 if buf.is_empty() || stride == 0 {
                     break;
                 }
@@ -782,7 +782,7 @@ pub(super) fn worker_main(
                 let before_yield = Instant::now();
                 std::thread::yield_now();
                 reservoir_push(
-                    &mut resume_latencies_ns,
+                    &mut wake_latencies_ns,
                     &mut wake_sample_count,
                     before_yield.elapsed().as_nanos() as u64,
                     MAX_WAKE_SAMPLES,
@@ -790,21 +790,21 @@ pub(super) fn worker_main(
                 iterations += 1;
             }
             WorkType::CachePipe {
-                size_kb,
+                size_kib,
                 burst_iters,
             } => {
                 let (read_fd, write_fd) = pipe_fds.unwrap_or((-1, -1));
                 if read_fd < 0 || write_fd < 0 {
                     break;
                 }
-                let buf = cache_pressure_buf.get_or_insert_with(|| vec![0u8; size_kb * 1024]);
+                let buf = cache_pressure_buf.get_or_insert_with(|| vec![0u8; size_kib * 1024]);
                 if !buf.is_empty() {
                     cache_rmw_loop(buf, 64, burst_iters, &mut work_units);
                 }
                 pipe_exchange(
                     read_fd,
                     write_fd,
-                    &mut resume_latencies_ns,
+                    &mut wake_latencies_ns,
                     &mut wake_sample_count,
                     MAX_WAKE_SAMPLES,
                     stop,
@@ -851,7 +851,7 @@ pub(super) fn worker_main(
                         let cur = atom.load(Ordering::Relaxed);
                         if cur != expected {
                             reservoir_push(
-                                &mut resume_latencies_ns,
+                                &mut wake_latencies_ns,
                                 &mut wake_sample_count,
                                 before_block.elapsed().as_nanos() as u64,
                                 MAX_WAKE_SAMPLES,
@@ -883,7 +883,7 @@ pub(super) fn worker_main(
                             let before_sleep = Instant::now();
                             std::thread::sleep(*dur);
                             reservoir_push(
-                                &mut resume_latencies_ns,
+                                &mut wake_latencies_ns,
                                 &mut wake_sample_count,
                                 before_sleep.elapsed().as_nanos() as u64,
                                 MAX_WAKE_SAMPLES,
@@ -900,7 +900,7 @@ pub(super) fn worker_main(
                             // carries. The two `Instant::now()` calls
                             // around `yield_now` (`before_yield` plus
                             // the `elapsed()` in `reservoir_push`) are
-                            // load-bearing for the resume-latency
+                            // load-bearing for the wake-latency
                             // sample — keep them per-yield. Only the
                             // top-of-loop deadline poll batches.
                             let mut yield_counter: u64 = 0;
@@ -915,7 +915,7 @@ pub(super) fn worker_main(
                                 let before_yield = Instant::now();
                                 std::thread::yield_now();
                                 reservoir_push(
-                                    &mut resume_latencies_ns,
+                                    &mut wake_latencies_ns,
                                     &mut wake_sample_count,
                                     before_yield.elapsed().as_nanos() as u64,
                                     MAX_WAKE_SAMPLES,
@@ -962,7 +962,7 @@ pub(super) fn worker_main(
                                 let before_sleep = Instant::now();
                                 std::thread::sleep(Duration::from_micros(100));
                                 reservoir_push(
-                                    &mut resume_latencies_ns,
+                                    &mut wake_latencies_ns,
                                     &mut wake_sample_count,
                                     before_sleep.elapsed().as_nanos() as u64,
                                     MAX_WAKE_SAMPLES,
@@ -1008,7 +1008,7 @@ pub(super) fn worker_main(
                             // scheduler-preemption signal as the
                             // standalone WorkType::AluHot arm:
                             // AluHot never blocks, so the
-                            // resume_latencies_ns reservoir would
+                            // wake_latencies_ns reservoir would
                             // not capture preemption inflation
                             // here. Variance across iteration_costs_ns
                             // samples encodes the scheduler signal
@@ -1055,14 +1055,14 @@ pub(super) fn worker_main(
                         // `waitpid` is a blocking primitive: the
                         // parent sleeps until the child's exit is
                         // reaped. Measuring the interval is the same
-                        // "resume latency" signal the other blocking
+                        // "wake latency" signal the other blocking
                         // work types record (pipe read, futex wait,
                         // yield_now, nanosleep), so feed it into the
                         // reservoir on the same contract.
                         let before_wait = Instant::now();
                         unsafe { libc::waitpid(child, &mut status, 0) };
                         reservoir_push(
-                            &mut resume_latencies_ns,
+                            &mut wake_latencies_ns,
                             &mut wake_sample_count,
                             before_wait.elapsed().as_nanos() as u64,
                             MAX_WAKE_SAMPLES,
@@ -1104,7 +1104,7 @@ pub(super) fn worker_main(
                 let before_yield = Instant::now();
                 std::thread::yield_now();
                 reservoir_push(
-                    &mut resume_latencies_ns,
+                    &mut wake_latencies_ns,
                     &mut wake_sample_count,
                     before_yield.elapsed().as_nanos() as u64,
                     MAX_WAKE_SAMPLES,
@@ -1131,7 +1131,7 @@ pub(super) fn worker_main(
                 let before_yield = Instant::now();
                 std::thread::yield_now();
                 reservoir_push(
-                    &mut resume_latencies_ns,
+                    &mut wake_latencies_ns,
                     &mut wake_sample_count,
                     before_yield.elapsed().as_nanos() as u64,
                     MAX_WAKE_SAMPLES,
@@ -1151,7 +1151,7 @@ pub(super) fn worker_main(
                 let before_yield = Instant::now();
                 std::thread::yield_now();
                 reservoir_push(
-                    &mut resume_latencies_ns,
+                    &mut wake_latencies_ns,
                     &mut wake_sample_count,
                     before_yield.elapsed().as_nanos() as u64,
                     MAX_WAKE_SAMPLES,
@@ -1218,7 +1218,7 @@ pub(super) fn worker_main(
                 //       speculatively issued before its generation
                 //       load and satisfied from a stale cache line.
                 // Either path yields a fresh generation paired with
-                // a stale wake_ns and contaminates the resume-latency
+                // a stale wake_ns and contaminates the wake-latency
                 // histogram.
                 let wake_ts_ptr = unsafe { (futex_ptr as *mut u8).add(8) as *mut u64 };
                 let gen_atom = unsafe { &*(futex_ptr as *const std::sync::atomic::AtomicU64) };
@@ -1288,7 +1288,7 @@ pub(super) fn worker_main(
                             // the rc was discarded and a
                             // zeroed/garbage `now_ts` was fed into
                             // `saturating_sub`, silently contaminating
-                            // the resume-latency histogram with values
+                            // the wake-latency histogram with values
                             // dominated by wake_ns itself.
                             if let Some(now_ns) = clock_gettime_ns(libc::CLOCK_MONOTONIC) {
                                 // Acquire load above synchronises-with
@@ -1298,7 +1298,7 @@ pub(super) fn worker_main(
                                 let wake_ns = wake_atom.load(Ordering::Relaxed);
                                 let latency = now_ns.saturating_sub(wake_ns);
                                 reservoir_push(
-                                    &mut resume_latencies_ns,
+                                    &mut wake_latencies_ns,
                                     &mut wake_sample_count,
                                     latency,
                                     MAX_WAKE_SAMPLES,
@@ -1328,32 +1328,32 @@ pub(super) fn worker_main(
                 iterations += 1;
             }
             WorkType::PageFaultChurn {
-                region_kb,
+                region_kib,
                 touches_per_cycle,
                 spin_iters,
             } => {
                 let (ptr, region_size) = match page_fault_region {
                     Some(p) => p,
                     None => {
-                        // `region_kb * 1024` overflows usize on 32-bit
-                        // targets for region_kb >= 4 MiB-equivalent;
+                        // `region_kib * 1024` overflows usize on 32-bit
+                        // targets for region_kib >= 4 MiB-equivalent;
                         // `checked_mul` returns None there and the
                         // workload exits this iteration rather than
                         // wrapping to a tiny region. Previously
                         // silent — a test author who typo'd a huge
-                        // `region_kb` would see a zero-iteration
+                        // `region_kib` would see a zero-iteration
                         // worker report with no diagnostic. Surface
                         // the overflow via `tracing::warn!` with the
-                        // offending `region_kb` so the configuration
+                        // offending `region_kib` so the configuration
                         // bug is visible in the test log; the early
                         // `break` still keeps the process honest.
-                        let region_size = match region_kb.checked_mul(1024) {
+                        let region_size = match region_kib.checked_mul(1024) {
                             Some(v) => v,
                             None => {
                                 tracing::warn!(
                                     tid,
-                                    region_kb,
-                                    "PageFaultChurn region_kb * 1024 overflowed usize — worker exiting outer loop without doing page-fault work"
+                                    region_kib,
+                                    "PageFaultChurn region_kib * 1024 overflowed usize — worker exiting outer loop without doing page-fault work"
                                 );
                                 break;
                             }
@@ -1381,13 +1381,13 @@ pub(super) fn worker_main(
                         (ptr, region_size)
                     }
                 };
-                // region_kb < 4 produces region_size < 4096, so
+                // region_kib < 4 produces region_size < 4096, so
                 // `region_size / 4096` truncates to zero and the
                 // `% page_count` below would panic (or UB in release
                 // with panic=abort). mmap rounds up to a whole page
                 // internally regardless of the requested length, so
                 // the kernel actually handed us at least one page
-                // of mapped memory even for a sub-page `region_kb`.
+                // of mapped memory even for a sub-page `region_kib`.
                 // Clamping `page_count` to at least 1 matches that
                 // physical reality: the single page gets touched
                 // every iteration, preserving the churn intent
@@ -1446,7 +1446,7 @@ pub(super) fn worker_main(
                         )
                     };
                     reservoir_push(
-                        &mut resume_latencies_ns,
+                        &mut wake_latencies_ns,
                         &mut wake_sample_count,
                         before_block.elapsed().as_nanos() as u64,
                         MAX_WAKE_SAMPLES,
@@ -1491,7 +1491,7 @@ pub(super) fn worker_main(
                 // thundering-herd shape.
                 //
                 // Waiter: park on the futex, observe generation
-                // advance, record resume latency. Same idiom as
+                // advance, record wake latency. Same idiom as
                 // FutexFanOut waiter; the difference is purely the
                 // group shape (single global vs per-group).
                 //
@@ -1518,7 +1518,7 @@ pub(super) fn worker_main(
                             let before_sleep = Instant::now();
                             std::thread::sleep(Duration::from_millis(inter_batch_ms));
                             reservoir_push(
-                                &mut resume_latencies_ns,
+                                &mut wake_latencies_ns,
                                 &mut wake_sample_count,
                                 before_sleep.elapsed().as_nanos() as u64,
                                 MAX_WAKE_SAMPLES,
@@ -1548,7 +1548,7 @@ pub(super) fn worker_main(
                         let cur = atom.load(Ordering::Relaxed);
                         if cur != expected {
                             reservoir_push(
-                                &mut resume_latencies_ns,
+                                &mut wake_latencies_ns,
                                 &mut wake_sample_count,
                                 before_block.elapsed().as_nanos() as u64,
                                 MAX_WAKE_SAMPLES,
@@ -1678,7 +1678,7 @@ pub(super) fn worker_main(
                                 libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, 1)
                             };
                             reservoir_push(
-                                &mut resume_latencies_ns,
+                                &mut wake_latencies_ns,
                                 &mut wake_sample_count,
                                 before_block.elapsed().as_nanos() as u64,
                                 MAX_WAKE_SAMPLES,
@@ -1762,7 +1762,7 @@ pub(super) fn worker_main(
                             // gap, matching how FutexFanOut
                             // handles its first iteration.
                             reservoir_push(
-                                &mut resume_latencies_ns,
+                                &mut wake_latencies_ns,
                                 &mut wake_sample_count,
                                 before_block.elapsed().as_nanos() as u64,
                                 MAX_WAKE_SAMPLES,
@@ -1821,7 +1821,7 @@ pub(super) fn worker_main(
                 if pos == 0 {
                     // Waker: spin to build CPU runtime, then advance
                     // the futex word and FUTEX_WAKE the wakee. The
-                    // wakee's resume_latencies_ns reservoir will
+                    // wakee's wake_latencies_ns reservoir will
                     // capture the wake-affine placement gap on its
                     // side; the waker's reservoir is empty (no
                     // blocking syscall on this side).
@@ -1844,7 +1844,7 @@ pub(super) fn worker_main(
                         let cur = atom.load(Ordering::Relaxed);
                         if cur != expected {
                             reservoir_push(
-                                &mut resume_latencies_ns,
+                                &mut wake_latencies_ns,
                                 &mut wake_sample_count,
                                 before_block.elapsed().as_nanos() as u64,
                                 MAX_WAKE_SAMPLES,
@@ -1986,7 +1986,7 @@ pub(super) fn worker_main(
                                     futex_wait(futex_ptr, 1u32, &FUTEX_WAIT_TIMEOUT);
                                 }
                                 reservoir_push(
-                                    &mut resume_latencies_ns,
+                                    &mut wake_latencies_ns,
                                     &mut wake_sample_count,
                                     before_block.elapsed().as_nanos() as u64,
                                     MAX_WAKE_SAMPLES,
@@ -2137,7 +2137,7 @@ pub(super) fn worker_main(
                                 let before_block = Instant::now();
                                 unsafe { futex_wait(prod_wake_ptr, expected, &FUTEX_WAIT_TIMEOUT) };
                                 reservoir_push(
-                                    &mut resume_latencies_ns,
+                                    &mut wake_latencies_ns,
                                     &mut wake_sample_count,
                                     before_block.elapsed().as_nanos() as u64,
                                     MAX_WAKE_SAMPLES,
@@ -2249,7 +2249,7 @@ pub(super) fn worker_main(
                             let before_block = Instant::now();
                             unsafe { futex_wait(cons_wake_ptr, expected, &FUTEX_WAIT_TIMEOUT) };
                             reservoir_push(
-                                &mut resume_latencies_ns,
+                                &mut wake_latencies_ns,
                                 &mut wake_sample_count,
                                 before_block.elapsed().as_nanos() as u64,
                                 MAX_WAKE_SAMPLES,
@@ -2323,7 +2323,7 @@ pub(super) fn worker_main(
                 iterations += 1;
             }
             WorkType::NumaWorkingSetSweep {
-                region_kb,
+                region_kib,
                 sweep_period_ms,
                 ref target_nodes,
             } => {
@@ -2354,13 +2354,13 @@ pub(super) fn worker_main(
                 // exit because they're post-fork; the worker
                 // lives until SIGUSR1 and then exits, releasing
                 // the mapping).
-                let region_size = match region_kb.checked_mul(1024) {
+                let region_size = match region_kib.checked_mul(1024) {
                     Some(v) => v,
                     None => {
                         tracing::warn!(
                             tid,
-                            region_kb,
-                            "NumaWorkingSetSweep region_kb * 1024 overflowed usize"
+                            region_kib,
+                            "NumaWorkingSetSweep region_kib * 1024 overflowed usize"
                         );
                         break;
                     }
@@ -2434,7 +2434,7 @@ pub(super) fn worker_main(
                     let before_sleep = Instant::now();
                     std::thread::sleep(Duration::from_millis(sweep_period_ms));
                     reservoir_push(
-                        &mut resume_latencies_ns,
+                        &mut wake_latencies_ns,
                         &mut wake_sample_count,
                         before_sleep.elapsed().as_nanos() as u64,
                         MAX_WAKE_SAMPLES,
@@ -2748,7 +2748,7 @@ pub(super) fn worker_main(
                                 libc::read(efd, buf.as_mut_ptr() as *mut libc::c_void, 8);
                             }
                             reservoir_push(
-                                &mut resume_latencies_ns,
+                                &mut wake_latencies_ns,
                                 &mut wake_sample_count,
                                 before_wait.elapsed().as_nanos() as u64,
                                 MAX_WAKE_SAMPLES,
@@ -3001,7 +3001,7 @@ pub(super) fn worker_main(
                 let elapsed = before_sleep.elapsed();
                 let resume_overhead = elapsed.saturating_sub(sleep_duration);
                 reservoir_push(
-                    &mut resume_latencies_ns,
+                    &mut wake_latencies_ns,
                     &mut wake_sample_count,
                     resume_overhead.as_nanos() as u64,
                     MAX_WAKE_SAMPLES,
@@ -3037,7 +3037,7 @@ pub(super) fn worker_main(
                 // Sample iteration cost (wall-clock duration of one
                 // compute iteration, including any scheduler
                 // preemption) into iteration_costs_ns: AluHot never
-                // blocks, so the resume_latencies_ns reservoir would
+                // blocks, so the wake_latencies_ns reservoir would
                 // not capture preemption inflation here. Variance
                 // across samples encodes the scheduler signal.
                 let iter_start = Instant::now();
@@ -3285,7 +3285,7 @@ pub(super) fn worker_main(
         max_gap_ms: max_gap_ns / 1_000_000,
         max_gap_cpu,
         max_gap_at_ms: max_gap_at_ns / 1_000_000,
-        resume_latencies_ns,
+        wake_latencies_ns,
         wake_sample_total: wake_sample_count,
         iteration_costs_ns,
         iteration_cost_sample_total: iteration_cost_sample_count,
@@ -3688,7 +3688,7 @@ pub(super) fn matrix_multiply(data: &mut [u64], size: usize, work_units: &mut u6
 pub(super) fn pipe_exchange(
     read_fd: i32,
     write_fd: i32,
-    resume_latencies_ns: &mut Vec<u64>,
+    wake_latencies_ns: &mut Vec<u64>,
     wake_sample_count: &mut u64,
     max_wake_samples: usize,
     stop: &AtomicBool,
@@ -3709,7 +3709,7 @@ pub(super) fn pipe_exchange(
             let mut byte = [0u8; 1];
             unsafe { libc::read(read_fd, byte.as_mut_ptr() as *mut _, 1) };
             reservoir_push(
-                resume_latencies_ns,
+                wake_latencies_ns,
                 wake_sample_count,
                 before_block.elapsed().as_nanos() as u64,
                 max_wake_samples,

@@ -43,7 +43,7 @@ Neither threshold is set by default; enable via `Assert` setters or
 
 **Benchmarking** -- `assert_benchmarks()` checks per-wakeup latency
 and iteration throughput. Three thresholds:
-- `max_p99_wake_latency_ns`: p99 of all `resume_latencies_ns` samples
+- `max_p99_wake_latency_ns`: p99 of all `wake_latencies_ns` samples
   across workers in a cgroup. Populated only for work types that
   record wake-to-run latency: `IoSyncWrite`, `IoRandRead`, `IoConvoy`,
   `Bursty`, `PipeIo`,
@@ -270,7 +270,7 @@ let r = assert_baseline(&reports, &baseline);
 Each field is independent — `None` skips that check. The four fields:
 
 - `max_p99_wake_latency_ns` -- pooled p99 across every worker's
-  `resume_latencies_ns`. Same semantics as `Assert::max_p99_wake_latency_ns`.
+  `wake_latencies_ns`. Same semantics as `Assert::max_p99_wake_latency_ns`.
 - `max_iteration_cost_p99_ns` -- pooled p99 across every worker's
   `iteration_costs_ns`. Only meaningful for compute work types
   (`AluHot`, `SmtSiblingSpin`, `IpcVariance`); blocking variants

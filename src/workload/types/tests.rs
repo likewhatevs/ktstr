@@ -30,7 +30,7 @@ fn stub_custom_fn(_stop: &AtomicBool) -> WorkerReport {
         max_gap_ms: 0,
         max_gap_cpu: 0,
         max_gap_at_ms: 0,
-        resume_latencies_ns: vec![],
+        wake_latencies_ns: vec![],
         wake_sample_total: 0,
         iteration_costs_ns: vec![],
         iteration_cost_sample_total: 0,
@@ -191,7 +191,7 @@ fn custom_group_size_is_none() {
 fn fan_out_compute_name() {
     let wt = WorkType::FanOutCompute {
         fan_out: 4,
-        cache_footprint_kb: 256,
+        cache_footprint_kib: 256,
         operations: 5,
         sleep_usec: 100,
     };
@@ -203,12 +203,12 @@ fn fan_out_compute_from_name() {
     match wt {
         WorkType::FanOutCompute {
             fan_out,
-            cache_footprint_kb,
+            cache_footprint_kib,
             operations,
             sleep_usec,
         } => {
             assert_eq!(fan_out, 4);
-            assert_eq!(cache_footprint_kb, 256);
+            assert_eq!(cache_footprint_kib, 256);
             assert_eq!(operations, 5);
             assert_eq!(sleep_usec, 100);
         }
@@ -242,11 +242,11 @@ fn page_fault_churn_from_name_defaults() {
     let wt = WorkType::from_name("PageFaultChurn").unwrap();
     match wt {
         WorkType::PageFaultChurn {
-            region_kb,
+            region_kib,
             touches_per_cycle,
             spin_iters,
         } => {
-            assert_eq!(region_kb, 4096);
+            assert_eq!(region_kib, 4096);
             assert_eq!(touches_per_cycle, 256);
             assert_eq!(spin_iters, 64);
         }

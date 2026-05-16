@@ -47,7 +47,7 @@ fn spawn_futex_fan_out_receivers_record_wake_latency() {
     std::thread::sleep(std::time::Duration::from_millis(500));
     let reports = h.stop_and_collect();
     // At least one receiver should have wake latency samples.
-    let has_latencies = reports.iter().any(|r| !r.resume_latencies_ns.is_empty());
+    let has_latencies = reports.iter().any(|r| !r.wake_latencies_ns.is_empty());
     assert!(has_latencies, "receivers should record wake latencies");
 }
 #[test]
@@ -156,7 +156,7 @@ fn resolve_work_type_fan_out_group_size() {
 /// Guards two invariants of [`WorkType::FanOutCompute`]:
 ///
 /// 1. Every spawned worker produces non-zero `work_units`, and at
-///    least one records a wake latency into `resume_latencies_ns`.
+///    least one records a wake latency into `wake_latencies_ns`.
 /// 2. The Release/Acquire ordering between the messenger's
 ///    `wake_ns` store and its generation advance prevents workers
 ///    from pairing a fresh generation with a stale or zero-init
@@ -184,7 +184,7 @@ fn spawn_fan_out_compute_produces_work() {
         affinity: AffinityIntent::Inherit,
         work_type: WorkType::FanOutCompute {
             fan_out: 4,
-            cache_footprint_kb: 256,
+            cache_footprint_kib: 256,
             operations: 5,
             sleep_usec: 100,
         },
@@ -214,12 +214,12 @@ fn spawn_fan_out_compute_produces_work() {
         reports
             .iter()
             .filter(|r| !r.is_messenger)
-            .all(|r| !r.resume_latencies_ns.is_empty()),
+            .all(|r| !r.wake_latencies_ns.is_empty()),
         "every FanOutCompute receiver must record at least one \
          wake latency sample; got {:?}",
         reports
             .iter()
-            .map(|r| (r.tid, r.is_messenger, r.resume_latencies_ns.len()))
+            .map(|r| (r.tid, r.is_messenger, r.wake_latencies_ns.len()))
             .collect::<Vec<_>>(),
     );
     // The 10 s bound catches the zero-init arm of a missing
@@ -235,7 +235,7 @@ fn spawn_fan_out_compute_produces_work() {
     // failure mode, not a full verification of the ordering.
     const MAX_PLAUSIBLE_LATENCY_NS: u64 = 10_000_000_000;
     for r in &reports {
-        for &lat in &r.resume_latencies_ns {
+        for &lat in &r.wake_latencies_ns {
             assert!(
                 lat < MAX_PLAUSIBLE_LATENCY_NS,
                 "worker {} recorded implausible wake latency {} ns \
@@ -263,7 +263,7 @@ fn spawn_fan_out_compute_bad_worker_count_fails() {
         affinity: AffinityIntent::Inherit,
         work_type: WorkType::FanOutCompute {
             fan_out: 4,
-            cache_footprint_kb: 256,
+            cache_footprint_kib: 256,
             operations: 5,
             sleep_usec: 100,
         },
@@ -289,7 +289,7 @@ fn spawn_fan_out_compute_two_groups() {
         affinity: AffinityIntent::Inherit,
         work_type: WorkType::FanOutCompute {
             fan_out: 4,
-            cache_footprint_kb: 256,
+            cache_footprint_kib: 256,
             operations: 5,
             sleep_usec: 100,
         },
@@ -319,12 +319,12 @@ fn spawn_fan_out_compute_two_groups() {
         reports
             .iter()
             .filter(|r| !r.is_messenger)
-            .all(|r| !r.resume_latencies_ns.is_empty()),
+            .all(|r| !r.wake_latencies_ns.is_empty()),
         "every FanOutCompute receiver in both groups must record \
          at least one wake latency sample; got {:?}",
         reports
             .iter()
-            .map(|r| (r.tid, r.is_messenger, r.resume_latencies_ns.len()))
+            .map(|r| (r.tid, r.is_messenger, r.wake_latencies_ns.len()))
             .collect::<Vec<_>>(),
     );
     // Mirror of the single-group test's latency sanity check —
@@ -336,7 +336,7 @@ fn spawn_fan_out_compute_two_groups() {
     // group.
     const MAX_PLAUSIBLE_LATENCY_NS: u64 = 10_000_000_000;
     for r in &reports {
-        for &lat in &r.resume_latencies_ns {
+        for &lat in &r.wake_latencies_ns {
             assert!(
                 lat < MAX_PLAUSIBLE_LATENCY_NS,
                 "worker {} recorded implausible wake latency {} ns \

@@ -116,7 +116,7 @@ fn assert_benchmarks_p99_fail() {
 }
 
 /// Unit-boundary pin: the `max_p99_wake_latency_ns` threshold
-/// MUST be compared against `WorkerReport::resume_latencies_ns`
+/// MUST be compared against `WorkerReport::wake_latencies_ns`
 /// (nanoseconds) — never against the microsecond-valued
 /// `CgroupStats::p99_wake_latency_us` field. A regression that
 /// divided either side by 1000 (or multiplied by 1000) would
@@ -124,7 +124,7 @@ fn assert_benchmarks_p99_fail() {
 /// silently corrupting every regression gate that uses this
 /// field.
 ///
-/// Construction: plant `resume_latencies_ns` values that are
+/// Construction: plant `wake_latencies_ns` values that are
 /// clearly in the NS scale (e.g. 5000 ns = 5 µs) and set a
 /// threshold of 4999 ns. The assertion must FAIL at 4999 ns and
 /// PASS at 5001 ns. If the comparison were accidentally

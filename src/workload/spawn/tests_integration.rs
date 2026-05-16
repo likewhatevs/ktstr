@@ -55,7 +55,7 @@ fn worker_report_serde_roundtrip() {
         max_gap_ms: 50,
         max_gap_cpu: 1,
         max_gap_at_ms: 500,
-        resume_latencies_ns: vec![1000, 2000],
+        wake_latencies_ns: vec![1000, 2000],
         wake_sample_total: 2,
         iteration_costs_ns: vec![3000, 4000, 5000],
         iteration_cost_sample_total: 3,
@@ -566,7 +566,7 @@ fn worker_report_serde_edge_cases() {
         max_gap_ms: 0,
         max_gap_cpu: 0,
         max_gap_at_ms: 0,
-        resume_latencies_ns: vec![],
+        wake_latencies_ns: vec![],
         wake_sample_total: 0,
         iteration_costs_ns: vec![],
         iteration_cost_sample_total: 0,
@@ -601,7 +601,7 @@ fn worker_report_serde_edge_cases() {
         max_gap_ms: u64::MAX,
         max_gap_cpu: usize::MAX,
         max_gap_at_ms: u64::MAX,
-        resume_latencies_ns: vec![],
+        wake_latencies_ns: vec![],
         wake_sample_total: u64::MAX,
         iteration_costs_ns: vec![],
         iteration_cost_sample_total: u64::MAX,
@@ -697,7 +697,7 @@ fn worker_report_debug_shows_field_values() {
         max_gap_ms: 77,
         max_gap_cpu: 5,
         max_gap_at_ms: 500,
-        resume_latencies_ns: vec![],
+        wake_latencies_ns: vec![],
         wake_sample_total: 0,
         iteration_costs_ns: vec![],
         iteration_cost_sample_total: 0,
@@ -736,7 +736,7 @@ fn worker_report_off_cpu_ns_calculation() {
         max_gap_ms: 0,
         max_gap_cpu: 0,
         max_gap_at_ms: 0,
-        resume_latencies_ns: vec![],
+        wake_latencies_ns: vec![],
         wake_sample_total: 0,
         iteration_costs_ns: vec![],
         iteration_cost_sample_total: 0,
@@ -815,7 +815,7 @@ fn snapshot_iterations_running_workers() {
 fn spawn_cache_pressure_produces_work() {
     let reports = spawn_and_collect_after(
         WorkType::CachePressure {
-            size_kb: 32,
+            size_kib: 32,
             stride: 64,
         },
         1,
@@ -828,7 +828,7 @@ fn spawn_cache_pressure_produces_work() {
 fn spawn_cache_yield_produces_work() {
     let reports = spawn_and_collect_after(
         WorkType::CacheYield {
-            size_kb: 32,
+            size_kib: 32,
             stride: 64,
         },
         1,
@@ -841,7 +841,7 @@ fn spawn_cache_yield_produces_work() {
 fn spawn_cache_pipe_produces_work() {
     let reports = spawn_and_collect_after(
         WorkType::CachePipe {
-            size_kb: 32,
+            size_kib: 32,
             burst_iters: 1024,
         },
         2,
@@ -956,7 +956,7 @@ fn spawn_page_fault_churn_produces_work() {
         num_workers,
         affinity: AffinityIntent::Inherit,
         work_type: WorkType::PageFaultChurn {
-            region_kb: 64,
+            region_kib: 64,
             touches_per_cycle: 16,
             spin_iters: 32,
         },
@@ -1193,7 +1193,7 @@ fn fully_populated_report() -> WorkerReport {
         max_gap_ms: 42,
         max_gap_cpu: 5,
         max_gap_at_ms: 999,
-        resume_latencies_ns: vec![1_000, 2_000, 3_000, 4_000],
+        wake_latencies_ns: vec![1_000, 2_000, 3_000, 4_000],
         wake_sample_total: 4,
         iteration_costs_ns: vec![10, 20, 30],
         iteration_cost_sample_total: 3,
@@ -1234,8 +1234,8 @@ fn assert_worker_report_eq(a: &WorkerReport, b: &WorkerReport) {
     assert_eq!(a.max_gap_cpu, b.max_gap_cpu, "max_gap_cpu");
     assert_eq!(a.max_gap_at_ms, b.max_gap_at_ms, "max_gap_at_ms");
     assert_eq!(
-        a.resume_latencies_ns, b.resume_latencies_ns,
-        "resume_latencies_ns"
+        a.wake_latencies_ns, b.wake_latencies_ns,
+        "wake_latencies_ns"
     );
     assert_eq!(
         a.wake_sample_total, b.wake_sample_total,

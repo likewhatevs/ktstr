@@ -69,7 +69,7 @@ fn pathology_numa_working_set_sweep_iterates() {
     let cfg = WorkloadConfig {
         num_workers: 2,
         work_type: WorkType::NumaWorkingSetSweep {
-            region_kb: 256,
+            region_kib: 256,
             sweep_period_ms: 100,
             target_nodes: vec![],
         },

@@ -48,7 +48,7 @@ fn start_idempotent() {
     assert_eq!(reports.len(), 1);
     assert!(reports[0].work_units > 0);
 }
-/// Overflow-path pin: when `region_kb * 1024` overflows `usize`
+/// Overflow-path pin: when `region_kib * 1024` overflows `usize`
 /// (the configured value is so large that the page-fault region
 /// size cannot be represented), the worker's outer loop hits
 /// the `checked_mul` None arm, emits the `tracing::warn!`, and
@@ -56,7 +56,7 @@ fn start_idempotent() {
 /// still terminates cleanly and reports 0 iterations — no
 /// mmap, no segfault, no hang.
 ///
-/// Spawns a single worker with `region_kb = usize::MAX` so the
+/// Spawns a single worker with `region_kib = usize::MAX` so the
 /// multiplication overflows on every pointer width we support
 /// (32-bit: MAX*1024 overflows immediately; 64-bit: MAX*1024
 /// also overflows). Runs briefly, asserts the worker's
@@ -69,17 +69,17 @@ fn start_idempotent() {
 /// pins the happy path — together they pin both ends of the
 /// region_size validity domain.
 #[test]
-fn page_fault_churn_region_kb_overflow_worker_exits_cleanly() {
+fn page_fault_churn_region_kib_overflow_worker_exits_cleanly() {
     let config = WorkloadConfig {
         num_workers: 1,
         affinity: AffinityIntent::Inherit,
-        // `region_kb = usize::MAX` — `usize::MAX * 1024`
+        // `region_kib = usize::MAX` — `usize::MAX * 1024`
         // overflows on both 32-bit and 64-bit usize, so
         // `checked_mul` returns None and the outer loop
         // `break`s immediately. `touches_per_cycle` and
         // `spin_iters` are ignored by that path.
         work_type: WorkType::PageFaultChurn {
-            region_kb: usize::MAX,
+            region_kib: usize::MAX,
             touches_per_cycle: 16,
             spin_iters: 32,
         },
@@ -101,7 +101,7 @@ fn page_fault_churn_region_kb_overflow_worker_exits_cleanly() {
     // completed, which is the overflow path.
     assert_eq!(
         r.iterations, 0,
-        "worker with overflowing region_kb must break out of the outer loop \
+        "worker with overflowing region_kib must break out of the outer loop \
          without completing any page-fault cycle; got iterations={}",
         r.iterations,
     );
@@ -135,7 +135,7 @@ fn mutex_contention_records_wake_latency() {
     h.start();
     std::thread::sleep(std::time::Duration::from_millis(500));
     let reports = h.stop_and_collect();
-    let has_latencies = reports.iter().any(|r| !r.resume_latencies_ns.is_empty());
+    let has_latencies = reports.iter().any(|r| !r.wake_latencies_ns.is_empty());
     assert!(has_latencies, "contenders should record wake latencies");
 }
 // -- pathology WorkType smoke tests --
@@ -156,7 +156,7 @@ fn pathology_page_fault_churn_iterates() {
     let cfg = WorkloadConfig {
         num_workers: 2,
         work_type: WorkType::PageFaultChurn {
-            region_kb: 256,
+            region_kib: 256,
             touches_per_cycle: 16,
             spin_iters: 32,
         },
@@ -480,7 +480,7 @@ fn pathology_phase_alu_hot_zero_duration_is_noop() {
 /// batch — pins the per-batch reservoir-sampling path so the
 /// "AluHot at 90% with modulation" use case can observe
 /// scheduler-preemption signal via iteration-cost variance.
-/// AluHot never blocks so the resume_latencies_ns reservoir
+/// AluHot never blocks so the wake_latencies_ns reservoir
 /// would not capture preemption inflation; iteration_costs_ns
 /// is the only available signal.
 #[test]

@@ -66,11 +66,11 @@ pub mod defaults {
     // FutexPingPong
     pub const FUTEX_PING_PONG_SPIN_ITERS: u64 = 1024;
     // CachePressure / CacheYield / CachePipe share buffer shape
-    pub const CACHE_PRESSURE_SIZE_KB: usize = 32;
+    pub const CACHE_PRESSURE_SIZE_KIB: usize = 32;
     pub const CACHE_PRESSURE_STRIDE: usize = 64;
-    pub const CACHE_YIELD_SIZE_KB: usize = 32;
+    pub const CACHE_YIELD_SIZE_KIB: usize = 32;
     pub const CACHE_YIELD_STRIDE: usize = 64;
-    pub const CACHE_PIPE_SIZE_KB: usize = 32;
+    pub const CACHE_PIPE_SIZE_KIB: usize = 32;
     pub const CACHE_PIPE_BURST_ITERS: u64 = 1024;
     // FutexFanOut
     pub const FUTEX_FAN_OUT_FAN_OUT: usize = 4;
@@ -81,11 +81,11 @@ pub mod defaults {
     pub const POLICY_CHURN_SPIN_ITERS: u64 = 1024;
     // FanOutCompute
     pub const FAN_OUT_COMPUTE_FAN_OUT: usize = 4;
-    pub const FAN_OUT_COMPUTE_CACHE_FOOTPRINT_KB: usize = 256;
+    pub const FAN_OUT_COMPUTE_CACHE_FOOTPRINT_KIB: usize = 256;
     pub const FAN_OUT_COMPUTE_OPERATIONS: usize = 5;
     pub const FAN_OUT_COMPUTE_SLEEP_USEC: u64 = 100;
     // PageFaultChurn
-    pub const PAGE_FAULT_CHURN_REGION_KB: usize = 4096;
+    pub const PAGE_FAULT_CHURN_REGION_KIB: usize = 4096;
     pub const PAGE_FAULT_CHURN_TOUCHES_PER_CYCLE: usize = 256;
     pub const PAGE_FAULT_CHURN_SPIN_ITERS: u64 = 64;
     // MutexContention
@@ -121,7 +121,7 @@ pub mod defaults {
     pub const WAKE_CHAIN_WAKE: super::WakeMechanism = super::WakeMechanism::Pipe;
     pub const WAKE_CHAIN_WORK_PER_HOP: std::time::Duration = std::time::Duration::from_micros(100);
     // NumaWorkingSetSweep
-    pub const NUMA_WORKING_SET_SWEEP_REGION_KB: usize = 4_096;
+    pub const NUMA_WORKING_SET_SWEEP_REGION_KIB: usize = 4_096;
     pub const NUMA_WORKING_SET_SWEEP_SWEEP_PERIOD_MS: u64 = 100;
     // CgroupChurn
     pub const CGROUP_CHURN_GROUPS: usize = 2;

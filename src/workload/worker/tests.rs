@@ -39,21 +39,21 @@ fn max_wake_samples_pins_doc_value() {
     );
 }
 
-/// [`defaults::PAGE_FAULT_CHURN_REGION_KB`] /
+/// [`defaults::PAGE_FAULT_CHURN_REGION_KIB`] /
 /// [`defaults::PAGE_FAULT_CHURN_TOUCHES_PER_CYCLE`] /
 /// [`defaults::PAGE_FAULT_CHURN_SPIN_ITERS`] MUST stay at the values
 /// `doc/guide/src/architecture/workers.md` cites verbatim
-/// ("region_kb=4096, touches_per_cycle=256, spin_iters=64"). The doc
+/// ("region_kib=4096, touches_per_cycle=256, spin_iters=64"). The doc
 /// cite gates operator expectations of per-iteration workload cost;
 /// a silent change to any of the three would leave the doc stale and
 /// mislead readers tuning page-fault-driven test scenarios.
 #[test]
 fn page_fault_churn_defaults_pin_doc_values() {
     assert_eq!(
-        defaults::PAGE_FAULT_CHURN_REGION_KB, 4096,
-        "PAGE_FAULT_CHURN_REGION_KB MUST stay 4096 to match the doc \
+        defaults::PAGE_FAULT_CHURN_REGION_KIB, 4096,
+        "PAGE_FAULT_CHURN_REGION_KIB MUST stay 4096 to match the doc \
          cite in doc/guide/src/architecture/workers.md \
-         (\"region_kb=4096\"). Update both this assertion AND the doc \
+         (\"region_kib=4096\"). Update both this assertion AND the doc \
          cite if you intentionally changed the default.",
     );
     assert_eq!(

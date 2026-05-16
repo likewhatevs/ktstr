@@ -516,7 +516,7 @@ fn claim_against_worker_report_via_derived_accessors() {
         max_gap_ms: 50,
         max_gap_cpu: 0,
         max_gap_at_ms: 1000,
-        resume_latencies_ns: vec![100, 200, 300, 400, 500],
+        wake_latencies_ns: vec![100, 200, 300, 400, 500],
         wake_sample_total: 5,
         iteration_costs_ns: vec![],
         iteration_cost_sample_total: 0,
@@ -539,7 +539,7 @@ fn claim_against_worker_report_via_derived_accessors() {
     report.claim_migration_count(&mut v).at_most(10);
     report.claim_completed(&mut v).eq(true);
     report.claim_cpus_used(&mut v).len_at_most(4);
-    report.claim_resume_latencies_ns(&mut v).len_eq(5);
+    report.claim_wake_latencies_ns(&mut v).len_eq(5);
     let r = v.into_result();
     assert!(r.passed, "details: {:?}", r.details);
 }

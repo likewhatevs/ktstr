@@ -56,7 +56,7 @@ pub struct WorkerReport {
     pub max_gap_ms: u64,
     pub max_gap_cpu: usize,
     pub max_gap_at_ms: u64,
-    pub resume_latencies_ns: Vec<u64>,
+    pub wake_latencies_ns: Vec<u64>,
     pub wake_sample_total: u64,
     pub iteration_costs_ns: Vec<u64>,
     pub iteration_cost_sample_total: u64,
@@ -85,7 +85,7 @@ pub enum WorkerExitInfo {
 }
 ```
 
-`iteration_costs_ns` mirrors `resume_latencies_ns` for per-iteration
+`iteration_costs_ns` mirrors `wake_latencies_ns` for per-iteration
 wall-clock cost: a reservoir-sampled vector capped at
 `MAX_WAKE_SAMPLES` entries, paired with `iteration_cost_sample_total`
 for the total observation count when the cap is exceeded.
@@ -100,12 +100,12 @@ Three fields worth calling out explicitly:
 
 - `wake_sample_total` — the TOTAL number of wake-latency
   observations the worker saw, including samples the reservoir
-  sampler dropped. `resume_latencies_ns` is clamped to at most
+  sampler dropped. `wake_latencies_ns` is clamped to at most
   100_000 entries (`MAX_WAKE_SAMPLES`); on a long run that
   accumulates more wakes than the cap, the vector stays at the
   cap while this counter keeps climbing. Host-side consumers
   reporting "total wakeups observed" read `wake_sample_total`;
-  percentile / CV computations read `resume_latencies_ns`. The
+  percentile / CV computations read `wake_latencies_ns`. The
   100_000 cap is pinned against this doc by the unit test
   `max_wake_samples_pins_doc_value` in `src/workload/worker/tests.rs`,
   so a silent change to the constant trips a build-time assertion.
@@ -120,8 +120,8 @@ Three fields worth calling out explicitly:
   `FutexFanOut` / `FanOutCompute` group (the single writer that
   advances the shared generation and issues `futex_wake`).
   Enables per-worker latency-participation assertions —
-  receivers produce `resume_latencies_ns` entries, messengers
-  record wake-side work but no resume latency.
+  receivers produce `wake_latencies_ns` entries, messengers
+  record wake-side work but no wake latency.
 
 - `off_cpu_ns = wall_time_ns - cpu_time_ns`
 - `exit_info` is `None` on every live-worker-authored report.
@@ -161,14 +161,14 @@ Three fields worth calling out explicitly:
     → same 256-unit gcd).
   - **Every 16 iterations**: PageFaultChurn — one persistent
     `MAP_PRIVATE | MAP_ANONYMOUS` region per worker (default
-    4 MiB via `region_kb`=4096), re-faulted each outer
+    4 MiB via `region_kib`=4096), re-faulted each outer
     iteration via `madvise(MADV_DONTNEED)`. Each iteration
     contributes `touches_per_cycle`=256 page writes (each first
     write after `MADV_DONTNEED` triggers a minor fault; a
     birthday-collision xorshift64 index may revisit a page
     already faulted this cycle, so the fault count is a ceiling,
     not a floor) + `spin_iters`=64 = 320 work units
-    (`gcd(320, 1024) = 64`). The three default values (`region_kb`,
+    (`gcd(320, 1024) = 64`). The three default values (`region_kib`,
     `touches_per_cycle`, `spin_iters`) are pinned against this doc
     by the unit test `page_fault_churn_defaults_pin_doc_values` in
     `src/workload/worker/tests.rs`, so a silent change to any of
@@ -205,7 +205,7 @@ Three fields worth calling out explicitly:
 
 Workers collect two categories of timing data:
 
-**Per-wakeup latency** (`resume_latencies_ns`): timestamp-based samples
+**Per-wakeup latency** (`wake_latencies_ns`): timestamp-based samples
 recorded around blocking operations. Populated for work types with a
 blocking step: Bursty (sleep), PipeIo (pipe read), FutexPingPong
 (futex wait), FutexFanOut (futex wait, receivers only), FanOutCompute

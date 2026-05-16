@@ -42,7 +42,7 @@
 //! | WorkTypeHint::Bursty{b,s}     | WorkType::Bursty { burst_duration: b, sleep_duration: s } |
 //! | WorkTypeHint::PipeIo          | WorkType::PipeIo { burst_iters: 1024 }  |
 //! | WorkTypeHint::FutexPingPong   | WorkType::FutexPingPong { spin_iters: 1024 } |
-//! | WorkTypeHint::CachePressure   | WorkType::CachePressure { size_kb, stride } |
+//! | WorkTypeHint::CachePressure   | WorkType::CachePressure { size_kib, stride } |
 //! | WorkTypeHint::IoSyncWrite     | WorkType::IoSyncWrite                   |
 //! | WorkTypeHint::IoRandRead      | WorkType::IoRandRead                    |
 //! | WorkTypeHint::IoConvoy        | WorkType::IoConvoy                      |
@@ -592,8 +592,8 @@ fn map_work_type(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
         },
         WorkTypeHint::PipeIo => WorkType::PipeIo { burst_iters: 1024 },
         WorkTypeHint::FutexPingPong => WorkType::FutexPingPong { spin_iters: 1024 },
-        WorkTypeHint::CachePressure { size_kb, stride } => WorkType::CachePressure {
-            size_kb: *size_kb as usize,
+        WorkTypeHint::CachePressure { size_kib, stride } => WorkType::CachePressure {
+            size_kib: *size_kib as usize,
             stride: *stride as usize,
         },
         WorkTypeHint::IoSyncWrite => WorkType::IoSyncWrite,
@@ -907,8 +907,8 @@ fn render_work_type(w: &WorkType) -> String {
         WorkType::FutexPingPong { spin_iters } => {
             format!("WorkType::FutexPingPong {{ spin_iters: {spin_iters} }}")
         }
-        WorkType::CachePressure { size_kb, stride } => {
-            format!("WorkType::CachePressure {{ size_kb: {size_kb}, stride: {stride} }}")
+        WorkType::CachePressure { size_kib, stride } => {
+            format!("WorkType::CachePressure {{ size_kib: {size_kib}, stride: {stride} }}")
         }
         // Variants that no fingerprint hint currently projects to.
         // Each produces an explicit TODO placeholder so the rendered
@@ -2191,7 +2191,7 @@ mod tests {
     fn is_runnable_unmapped_work_type_via_direct_config() {
         let mut spec = ReproducerSpec::default();
         spec.config.work_type = WorkType::CacheYield {
-            size_kb: 256,
+            size_kib: 256,
             stride: 64,
         };
         // No notes pushed — direct construction bypasses the
@@ -2478,7 +2478,7 @@ mod ktstr { pub mod workload {
         Bursty { burst_duration: Duration, sleep_duration: Duration },
         PipeIo { burst_iters: u64 },
         FutexPingPong { spin_iters: u64 },
-        CachePressure { size_kb: usize, stride: usize },
+        CachePressure { size_kib: usize, stride: usize },
     }
     pub enum SchedPolicy {
         Normal,
