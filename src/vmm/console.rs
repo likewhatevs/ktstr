@@ -93,6 +93,12 @@ pub struct Serial {
 }
 
 impl Default for Serial {
+    /// Constructs a `Serial` bound to `COM1_BASE` (ISA port 0x3F8 —
+    /// the standard PC/AT primary-serial address that ktstr's
+    /// guest kernel cmdline routes its console to). Delegates to
+    /// [`Self::new`] for the eventfd + buffer wiring; see that
+    /// constructor for the I/O-port semantics that drive every
+    /// kernel `console=ttyS0` write through this device.
     fn default() -> Self {
         Self::new(COM1_BASE)
     }

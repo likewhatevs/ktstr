@@ -134,6 +134,19 @@ pub struct KtstrVmBuilder {
 }
 
 impl Default for KtstrVmBuilder {
+    /// Minimal-viable VM seed — `1 LLC × 1 core × 1 thread × 1 NUMA
+    /// node = 1 vCPU`, 256 MiB guest RAM, no kernel/init/scheduler
+    /// binaries set yet (those are Required-Before-Build per
+    /// `Self::build` validation). The 1×1×1×1 topology is the
+    /// smallest legal value (`Topology::new` rejects any zero
+    /// dimension); test authors override this via `Self::topology(...)`
+    /// or attribute-built entries (`#[ktstr_test(llcs=N, cores=M,
+    /// threads=K)]`). The 256-MiB memory floor matches the
+    /// guest-init initramfs RAM cost; tests needing larger workloads
+    /// raise it via `Self::memory_mib(...)`. Every other field
+    /// (timeouts, watchdog, bpf_map_writes, ...) defaults to either
+    /// `None` (deferred) or an empty collection — no kernel-write
+    /// values, so no rejected-by-kernel risk.
     fn default() -> Self {
         KtstrVmBuilder {
             kernel: None,

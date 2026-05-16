@@ -1539,6 +1539,19 @@ pub struct ThreadState {
 }
 
 impl Default for ThreadState {
+    /// Zero-valued sentinel — tid=0/tgid=0/empty strings are the
+    /// "no thread observed yet" placeholder that ctprof inserts
+    /// into HashMap entries before the /proc walk populates them
+    /// from the live kernel state. Default-constructed ThreadState
+    /// values are NOT visible to operator-facing output: the parse
+    /// path in [`crate::ctprof::parse`] (see
+    /// `capture_thread_at_with_tally`) overwrites each field from
+    /// `/proc/<pid>/task/<tid>/{stat,status,schedstat,cgroup}` before
+    /// the entry is read for rendering. The `state` char uses the
+    /// `'~'` absent-value sentinel rather than the bare `char`
+    /// Default `'\0'` because '\0' would print as an empty cell in
+    /// the ctprof table and the absent-value glyph is operator-
+    /// readable.
     fn default() -> Self {
         Self {
             tid: 0,

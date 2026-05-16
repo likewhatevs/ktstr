@@ -222,6 +222,14 @@ pub struct SortKey {
 pub struct GroupByOrDefault(pub GroupBy);
 
 impl Default for GroupByOrDefault {
+    /// Defaults to [`GroupBy::Pcomm`] — parent-comm is the most
+    /// stable per-process identity across versions / runs (a
+    /// kernel-build version change typically does NOT rename
+    /// parent comms, whereas pid values shuffle every run and
+    /// comm values can drift if the binary is renamed). When two
+    /// ctprof runs are compared, grouping by Pcomm aligns
+    /// equivalent workloads even when their per-invocation pids
+    /// differ.
     fn default() -> Self {
         Self(GroupBy::Pcomm)
     }

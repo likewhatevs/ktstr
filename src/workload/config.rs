@@ -1281,6 +1281,20 @@ pub struct WorkSpec {
 }
 
 impl Default for WorkSpec {
+    /// Single SpinWait worker under the kernel's default scheduling
+    /// class — the framework's no-customization baseline. Every
+    /// other field is `None` / inherit so a test that needs a
+    /// specific knob (`affinity`, `mem_policy`, `nice`, etc.) sets
+    /// only that one via the corresponding `WorkSpec::with_*`
+    /// builder. `num_workers = None` defers count selection to
+    /// `CgroupDef`'s merged-works contract (the cgroup-level
+    /// default applies; see [`CgroupDef::workers`] /
+    /// [`CgroupDef::merged_works`]). The `workers_pct` mutex with
+    /// `num_workers` only fires when BOTH are `Some(_)` — at
+    /// default neither is set, so the
+    /// [`CgroupDef::resolve_workers_pct`] arm that emits the
+    /// `WorkSpec sets BOTH workers(...) and workers_pct(...)` bail
+    /// does not trigger.
     fn default() -> Self {
         Self {
             work_type: WorkType::SpinWait,

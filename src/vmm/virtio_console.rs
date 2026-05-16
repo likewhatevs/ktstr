@@ -452,6 +452,18 @@ pub struct VirtioConsole {
 }
 
 impl Default for VirtioConsole {
+    /// Constructs a virtio-console device with the framework's three
+    /// fixed ports (`PORT0_NAME` / `PORT1_NAME` / `PORT2_NAME`) and
+    /// the 8 virtqueues the multi-port protocol requires (2 RX/TX
+    /// per port + the control RX/TX pair). `device_ready` starts
+    /// `false` and flips `true` only after the guest driver's
+    /// `DEVICE_READY(value=1)` arrives on the control queue — the
+    /// host must defer PORT_ADD enqueues until then or the guest
+    /// will ignore them. Delegates to [`Self::new`] for the eventfd
+    /// + queue construction; subsequent VM-builder calls bind
+    /// per-port destinations (e.g. bulk-data port to the test
+    /// framework's output directory) without adding new ports
+    /// beyond the three.
     fn default() -> Self {
         Self::new()
     }
