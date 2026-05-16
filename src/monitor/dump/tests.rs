@@ -25,6 +25,18 @@ use crate::monitor::btf_render::MemReader;
 // `map_name_bytes` copy that duplicated the logic verbatim.
 use crate::monitor::test_util::name_from_str;
 
+// Future contributor: if you hit an AmbiguousIfImpl compile error
+// here after adding `derive(Default)` (or a manual Default impl) on
+// DualFailureDumpReport, the rationale is at
+// src/monitor/dump/mod.rs:1272 (TL;DR: the `late` field is required
+// by the doc invariant — the freeze coordinator only writes a
+// DualFailureDumpReport after the late snapshot has been captured.
+// A Default impl would produce a wrapper with an empty late report
+// whose `maps`/`vcpu_regs` vectors silently lie about a successful
+// capture). Construct via the struct literal with an explicit
+// `late: FailureDumpReport`.
+assert_not_impl_default!(DualFailureDumpReport);
+
 #[test]
 fn hex_dump_basic() {
     assert_eq!(hex_dump(&[]), "");

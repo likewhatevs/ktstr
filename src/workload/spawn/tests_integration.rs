@@ -120,6 +120,18 @@ const _: Migration = Migration::new(0, 1, 2);
 // Migration explicitly via `Migration::new`.
 assert_not_impl_default!(Migration);
 
+// Future contributor: if you hit an AmbiguousIfImpl compile error
+// here after adding `derive(Default)` (or a manual Default impl) on
+// WorkerExitInfo, the rationale is at src/workload/spawn/mod.rs:503
+// (TL;DR: every variant carries observed-outcome state; a default
+// would have to pick TimedOut, but a test using `..Default::default()`
+// would get "worker never exited within the deadline" silently,
+// which an operator triaging the failure would chase for minutes
+// before realizing the value came from a missing field). Construct
+// every WorkerExitInfo explicitly via the variant the scenario
+// expects (e.g. `WorkerExitInfo::Exited(0)` for a clean success).
+assert_not_impl_default!(WorkerExitInfo);
+
 #[test]
 fn migration_new_matches_struct_literal() {
     let from_ctor = Migration::new(1_000_000_000, 0, 1);
