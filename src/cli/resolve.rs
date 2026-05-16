@@ -1083,6 +1083,7 @@ mod tests {
         let id = crate::kernel_path::KernelId::Range {
             start: "6.16".to_string(),
             end: "6.12".to_string(),
+            syntax_inclusive: false,
         };
         let err = resolve_cached_kernel(&id, "ktstr-test").expect_err("inverted range must error");
         let msg = format!("{err:#}");

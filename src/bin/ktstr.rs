@@ -492,7 +492,7 @@ fn kernel_build(
         // "swap the endpoints" diagnostic ahead of any download.
         id.validate()
             .map_err(|e| anyhow::anyhow!("--kernel {id}: {e}"))?;
-        if let KernelId::Range { start, end } = id {
+        if let KernelId::Range { start, end, .. } = id {
             let versions = ktstr::cli::expand_kernel_range(&start, &end, "ktstr")?;
             let total = versions.len();
             let mut failures: Vec<(String, anyhow::Error)> = Vec::new();

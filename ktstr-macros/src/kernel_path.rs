@@ -59,14 +59,24 @@ pub enum KernelId {
     /// kernel.org's release index at resolve time. `start` and `end`
     /// are both [`KernelId::Version`]-shaped strings (e.g. "6.10",
     /// "6.13"); the resolver fans this out to every release in
-    /// [start, end] inclusive on both endpoints. A version present in
-    /// the range but missing from the upstream index is a hard error
-    /// before any boot — partial expansions are not silently dropped.
+    /// [start, end] inclusive on both endpoints regardless of whether
+    /// the parser saw `..` or `..=`. A version present in the range
+    /// but missing from the upstream index is a hard error before any
+    /// boot — partial expansions are not silently dropped. The
+    /// `syntax_inclusive` flag preserves the original separator for
+    /// round-trip [`std::fmt::Display`] and operator-facing error
+    /// messages; it does not change resolution semantics.
     Range {
         /// Inclusive lower bound, version-shaped.
         start: String,
         /// Inclusive upper bound, version-shaped.
         end: String,
+        /// `true` when the parser saw `..=` (or the construction site
+        /// asked for it); `false` for the `..` form. Both are
+        /// resolved as inclusive ranges; the flag exists so
+        /// [`std::fmt::Display`] and the inverted-range error
+        /// message round-trip the operator's typed form.
+        syntax_inclusive: bool,
     },
     /// Git source: clone `url`, check out `git_ref`. `git_ref` may be
     /// a branch, tag, or sha — current `KernelId::parse` stores it
@@ -121,6 +131,7 @@ impl KernelId {
             return KernelId::Range {
                 start: start.to_string(),
                 end: end.to_string(),
+                syntax_inclusive: true,
             };
         }
         if let Some((start, end)) = s.split_once("..")
@@ -130,6 +141,7 @@ impl KernelId {
             return KernelId::Range {
                 start: start.to_string(),
                 end: end.to_string(),
+                syntax_inclusive: false,
             };
         }
         if s.contains('/') || s.starts_with('.') || s.starts_with('~') {
@@ -183,7 +195,7 @@ impl KernelId {
     /// validation as a single-element range.
     pub fn validate(&self) -> Result<(), String> {
         match self {
-            KernelId::Range { start, end } => {
+            KernelId::Range { start, end, syntax_inclusive } => {
                 let start_key = decompose_version_for_compare(start).ok_or_else(|| {
                     format!(
                         "kernel range start `{start}` is not a parseable version. \
@@ -201,9 +213,10 @@ impl KernelId {
                     )
                 })?;
                 if start_key > end_key {
+                    let sep = if *syntax_inclusive { "..=" } else { ".." };
                     return Err(format!(
-                        "inverted kernel range `{start}..{end}`: start version is greater \
-                         than end version. Swap the endpoints (`{end}..{start}`) or use \
+                        "inverted kernel range `{start}{sep}{end}`: start version is greater \
+                         than end version. Swap the endpoints (`{end}{sep}{start}`) or use \
                          a single version (no range) to test just one release.",
                     ));
                 }
@@ -223,7 +236,10 @@ impl std::fmt::Display for KernelId {
             KernelId::Path(p) => write!(f, "{}", p.display()),
             KernelId::Version(v) => write!(f, "{v}"),
             KernelId::CacheKey(k) => write!(f, "{k}"),
-            KernelId::Range { start, end } => write!(f, "{start}..{end}"),
+            KernelId::Range { start, end, syntax_inclusive } => {
+                let sep = if *syntax_inclusive { "..=" } else { ".." };
+                write!(f, "{start}{sep}{end}")
+            }
             KernelId::Git { url, git_ref } => write!(f, "git+{url}#{git_ref}"),
         }
     }

@@ -59,14 +59,24 @@ pub enum KernelId {
     /// kernel.org's release index at resolve time. `start` and `end`
     /// are both [`KernelId::Version`]-shaped strings (e.g. "6.10",
     /// "6.13"); the resolver fans this out to every release in
-    /// [start, end] inclusive on both endpoints. A version present in
-    /// the range but missing from the upstream index is a hard error
-    /// before any boot — partial expansions are not silently dropped.
+    /// [start, end] inclusive on both endpoints regardless of whether
+    /// the parser saw `..` or `..=`. A version present in the range
+    /// but missing from the upstream index is a hard error before any
+    /// boot — partial expansions are not silently dropped. The
+    /// `syntax_inclusive` flag preserves the original separator for
+    /// round-trip [`std::fmt::Display`] and operator-facing error
+    /// messages; it does not change resolution semantics.
     Range {
         /// Inclusive lower bound, version-shaped.
         start: String,
         /// Inclusive upper bound, version-shaped.
         end: String,
+        /// `true` when the parser saw `..=` (or the construction site
+        /// asked for it); `false` for the `..` form. Both are
+        /// resolved as inclusive ranges; the flag exists so
+        /// [`std::fmt::Display`] and the inverted-range error
+        /// message round-trip the operator's typed form.
+        syntax_inclusive: bool,
     },
     /// Git source: clone `url`, check out `git_ref`. `git_ref` may be
     /// a branch, tag, or sha — current `KernelId::parse` stores it
@@ -121,6 +131,7 @@ impl KernelId {
             return KernelId::Range {
                 start: start.to_string(),
                 end: end.to_string(),
+                syntax_inclusive: true,
             };
         }
         if let Some((start, end)) = s.split_once("..")
@@ -130,6 +141,7 @@ impl KernelId {
             return KernelId::Range {
                 start: start.to_string(),
                 end: end.to_string(),
+                syntax_inclusive: false,
             };
         }
         if s.contains('/') || s.starts_with('.') || s.starts_with('~') {
@@ -183,7 +195,7 @@ impl KernelId {
     /// validation as a single-element range.
     pub fn validate(&self) -> Result<(), String> {
         match self {
-            KernelId::Range { start, end } => {
+            KernelId::Range { start, end, syntax_inclusive } => {
                 let start_key = decompose_version_for_compare(start).ok_or_else(|| {
                     format!(
                         "kernel range start `{start}` is not a parseable version. \
@@ -201,9 +213,10 @@ impl KernelId {
                     )
                 })?;
                 if start_key > end_key {
+                    let sep = if *syntax_inclusive { "..=" } else { ".." };
                     return Err(format!(
-                        "inverted kernel range `{start}..{end}`: start version is greater \
-                         than end version. Swap the endpoints (`{end}..{start}`) or use \
+                        "inverted kernel range `{start}{sep}{end}`: start version is greater \
+                         than end version. Swap the endpoints (`{end}{sep}{start}`) or use \
                          a single version (no range) to test just one release.",
                     ));
                 }
@@ -223,7 +236,10 @@ impl std::fmt::Display for KernelId {
             KernelId::Path(p) => write!(f, "{}", p.display()),
             KernelId::Version(v) => write!(f, "{v}"),
             KernelId::CacheKey(k) => write!(f, "{k}"),
-            KernelId::Range { start, end } => write!(f, "{start}..{end}"),
+            KernelId::Range { start, end, syntax_inclusive } => {
+                let sep = if *syntax_inclusive { "..=" } else { ".." };
+                write!(f, "{start}{sep}{end}")
+            }
             KernelId::Git { url, git_ref } => write!(f, "git+{url}#{git_ref}"),
         }
     }
@@ -1225,9 +1241,19 @@ mod tests {
             KernelId::Range {
                 start: "6.10".to_string(),
                 end: "6.13".to_string(),
+                syntax_inclusive: false,
             }
             .to_string(),
             "6.10..6.13",
+        );
+        assert_eq!(
+            KernelId::Range {
+                start: "6.10".to_string(),
+                end: "6.13".to_string(),
+                syntax_inclusive: true,
+            }
+            .to_string(),
+            "6.10..=6.13",
         );
         assert_eq!(
             KernelId::Git {
@@ -1248,18 +1274,20 @@ mod tests {
             KernelId::Range {
                 start: "6.10".to_string(),
                 end: "6.15".to_string(),
+                syntax_inclusive: false,
             },
         );
     }
 
-    /// `..=` (inclusive Rust syntax) is accepted as an alias for
-    /// `..` — both spellings produce the same Range with both
-    /// endpoints inclusive, per the parser's doc invariant
-    /// ("the endpoints are ALWAYS inclusive — both `..` and `..=`
-    /// spellings produce a closed range"). The `..=` arm is checked
-    /// first in `parse`, so even though `..=` contains `..` as a
-    /// substring the version-shaped split lands on `6.10` / `6.15`,
-    /// not on `6.10` / `=6.15`.
+    /// `..=` (inclusive Rust syntax) and `..` both produce a Range
+    /// with the SAME endpoints (and the same closed-range resolution
+    /// semantics — both endpoints inclusive); they differ only in
+    /// the `syntax_inclusive` flag, which round-trips through
+    /// [`std::fmt::Display`] and the inverted-range error message
+    /// so the operator-typed form is preserved verbatim. The `..=`
+    /// arm is checked first in `parse`, so even though `..=` contains
+    /// `..` as a substring the version-shaped split lands on `6.10`
+    /// / `6.15`, not on `6.10` / `=6.15`.
     #[test]
     fn kernel_id_parse_range_inclusive_eq_syntax() {
         assert_eq!(
@@ -1267,6 +1295,7 @@ mod tests {
             KernelId::Range {
                 start: "6.10".to_string(),
                 end: "6.15".to_string(),
+                syntax_inclusive: true,
             },
         );
     }
@@ -1278,6 +1307,7 @@ mod tests {
             KernelId::Range {
                 start: "6.10.5".to_string(),
                 end: "6.10.10".to_string(),
+                syntax_inclusive: false,
             },
         );
     }
@@ -1289,6 +1319,7 @@ mod tests {
             KernelId::Range {
                 start: "6.10".to_string(),
                 end: "6.10-rc3".to_string(),
+                syntax_inclusive: false,
             },
         );
     }
@@ -1543,6 +1574,111 @@ mod tests {
             err.contains("6.12..6.16"),
             "error must suggest the swapped form, got: {err}",
         );
+        // Load-bearing negative: the operator typed `..`, so the error
+        // must NOT silently substitute `..=`. Pins the
+        // `syntax_inclusive: false` branch of validate's separator
+        // selection — a regression that always emitted `..=`
+        // (regardless of the typed form) would still pass the
+        // positive substring checks above, but trips this assertion.
+        assert!(
+            !err.contains("..="),
+            "operator typed `..`, error must not silently switch to `..=`: {err}",
+        );
+    }
+
+    /// Mirror of `kernel_id_validate_range_inverted_minor` for the
+    /// `..=` typed form. Pins the `syntax_inclusive: true` branch of
+    /// validate's separator selection — the inverted-range error must
+    /// preserve the operator's `..=` separator in both the as-typed
+    /// citation and the swap suggestion, and must NOT silently
+    /// substitute `..` (load-bearing negative). A regression that
+    /// flipped the ternary in only one direction (Display correct,
+    /// validate wrong, or vice versa) trips one of the four
+    /// assertions.
+    #[test]
+    fn kernel_id_validate_range_inverted_minor_inclusive_eq_syntax() {
+        let id = KernelId::parse("6.16..=6.12");
+        let err = id.validate().unwrap_err();
+        assert!(
+            err.contains("inverted kernel range"),
+            "error must say 'inverted kernel range', got: {err}",
+        );
+        assert!(
+            err.contains("6.16..=6.12"),
+            "error must cite the spec verbatim (typed `..=`), got: {err}",
+        );
+        assert!(
+            err.contains("6.12..=6.16"),
+            "error must suggest the swapped form preserving `..=`, got: {err}",
+        );
+        // Load-bearing negative: operator typed `..=`, so the error
+        // must NOT contain a bare `..` separator between version-shaped
+        // tokens. The "bare `..` between digits" pattern only appears
+        // when the separator is wrong; `..=` substrings always have
+        // the trailing `=`, so checking for any `..` not followed by
+        // `=` catches the bug. Use a substring check on both renderings
+        // we expect to be inclusive.
+        assert!(
+            !err.contains("6.16..6.12"),
+            "operator typed `..=`, error must not switch the cited spec to `..`: {err}",
+        );
+        assert!(
+            !err.contains("6.12..6.16"),
+            "operator typed `..=`, error must not switch the swap suggestion to `..`: {err}",
+        );
+    }
+
+    /// Direct (non-parse) construction with `syntax_inclusive: true`
+    /// still produces a `..=`-embedded error. Catches the gap where a
+    /// caller bypasses [`KernelId::parse`] — e.g. config-file
+    /// deserialization or a future builder API — and sets the flag
+    /// directly. Validates that the flag drives the error format
+    /// regardless of construction path.
+    #[test]
+    fn kernel_id_validate_range_inverted_inclusive_direct_construction() {
+        let id = KernelId::Range {
+            start: "6.16".to_string(),
+            end: "6.12".to_string(),
+            syntax_inclusive: true,
+        };
+        let err = id.validate().unwrap_err();
+        assert!(
+            err.contains("6.16..=6.12"),
+            "direct-construction Range with syntax_inclusive=true must emit `..=` cite in error, got: {err}",
+        );
+        assert!(
+            err.contains("6.12..=6.16"),
+            "direct-construction Range with syntax_inclusive=true must emit `..=` swap in error, got: {err}",
+        );
+    }
+
+    /// End-to-end round-trip: parse → Display round-trips the typed
+    /// form verbatim, AND validate's error message embeds the typed
+    /// form in both the as-typed cite and the swap suggestion.
+    /// Parameterized over both separator spellings so a regression
+    /// that broke ONE direction trips here. Integration test for the
+    /// `syntax_inclusive` contract across parse + Display + validate.
+    #[test]
+    fn kernel_id_display_inverted_range_round_trips_syntax_through_validate() {
+        for (input, sep) in [("6.16..6.12", ".."), ("6.16..=6.12", "..=")] {
+            let id = KernelId::parse(input);
+            assert_eq!(
+                id.to_string(),
+                input,
+                "Display must round-trip input verbatim for {input:?}",
+            );
+            let err = id.validate().unwrap_err();
+            let cite = format!("6.16{sep}6.12");
+            let suggest = format!("6.12{sep}6.16");
+            assert!(
+                err.contains(&cite),
+                "validate error must cite `{cite}` for input {input:?}, got: {err}",
+            );
+            assert!(
+                err.contains(&suggest),
+                "validate error must suggest swap `{suggest}` for input {input:?}, got: {err}",
+            );
+        }
     }
 
     /// `7.0..6.99` — major decreases. Reject.
@@ -1634,6 +1770,7 @@ mod tests {
         let id = KernelId::Range {
             start: "garbage".to_string(),
             end: "6.10".to_string(),
+            syntax_inclusive: false,
         };
         let err = id.validate().unwrap_err();
         assert!(
@@ -1652,6 +1789,7 @@ mod tests {
         let id = KernelId::Range {
             start: "6.10".to_string(),
             end: "garbage".to_string(),
+            syntax_inclusive: false,
         };
         let err = id.validate().unwrap_err();
         assert!(
@@ -1735,13 +1873,16 @@ mod tests {
                 }
                 KernelId::Version(v) => prop_assert!(v == s, "Version payload drift for {s:?}"),
                 KernelId::CacheKey(k) => prop_assert!(k == s, "CacheKey payload drift for {s:?}"),
-                KernelId::Range { start, end } => {
+                KernelId::Range { start, end, syntax_inclusive } => {
                     // Range is constructed only when both endpoints
                     // are version-shaped, so the payload round-trips
-                    // through the `start..end` rendering. Display
-                    // emits the same separator the parser consumed.
+                    // through the `start..end` (or `start..=end`)
+                    // rendering. Display emits the same separator
+                    // the parser consumed, tracked via
+                    // `syntax_inclusive`.
+                    let sep = if syntax_inclusive { "..=" } else { ".." };
                     prop_assert!(
-                        format!("{start}..{end}") == s,
+                        format!("{start}{sep}{end}") == s,
                         "Range payload drift for {s:?}",
                     );
                 }

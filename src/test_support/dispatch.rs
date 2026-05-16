@@ -1264,7 +1264,7 @@ fn entry_matches_spec(entry: &KernelEntry, spec: &str) -> bool {
         KernelId::Version(spec_ver) => {
             entry.label == spec_ver || entry.sanitized.as_str() == sanitize_kernel_label(&spec_ver)
         }
-        KernelId::Range { start, end } => {
+        KernelId::Range { start, end, .. } => {
             let Some(entry_t) = decompose_version_for_compare(&entry.label) else {
                 return false;
             };

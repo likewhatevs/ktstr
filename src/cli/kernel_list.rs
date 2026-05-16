@@ -519,7 +519,7 @@ fn run_kernel_list_range(json: bool, spec: &str) -> Result<()> {
 
     let id = KernelId::parse(spec);
     let (start, end) = match &id {
-        KernelId::Range { start, end } => (start.clone(), end.clone()),
+        KernelId::Range { start, end, .. } => (start.clone(), end.clone()),
         _ => {
             bail!(
                 "kernel list --range: `{spec}` does not parse as a \

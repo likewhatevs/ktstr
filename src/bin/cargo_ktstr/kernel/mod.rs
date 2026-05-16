@@ -264,7 +264,7 @@ pub(crate) fn resolve_one(id: ktstr::kernel_path::KernelId) -> Result<(String, P
             let label = git_kernel_label(url, git_ref);
             Ok((label, dir))
         }
-        KernelId::Range { start, end } => {
+        KernelId::Range { start, end, .. } => {
             // Defensive: the caller fans Range out to per-version
             // Version ids before calling here. This arm exists
             // only so the compiler accepts the exhaustive match;
@@ -498,7 +498,7 @@ pub(crate) fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBu
                     return vec![Err(format!("--kernel {id}: {e}"))].into_iter();
                 }
                 match id {
-                    KernelId::Range { start, end } => {
+                    KernelId::Range { start, end, .. } => {
                         match ktstr::cli::expand_kernel_range(&start, &end, "cargo ktstr") {
                             Ok(versions) => versions
                                 .into_iter()
@@ -587,7 +587,7 @@ pub(crate) fn kernel_build(
         // Validate before any I/O: an inverted range surfaces the
         // "swap the endpoints" diagnostic ahead of any download.
         id.validate().map_err(|e| format!("--kernel {id}: {e}"))?;
-        if let KernelId::Range { start, end } = id {
+        if let KernelId::Range { start, end, .. } = id {
             let versions = ktstr::cli::expand_kernel_range(&start, &end, "cargo ktstr")
                 .map_err(|e| format!("{e:#}"))?;
             let total = versions.len();
