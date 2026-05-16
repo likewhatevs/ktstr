@@ -189,10 +189,11 @@ grex = { version = "1.4", default-features = false }
 # in ktstr itself — remove this entry if gix ever exposes a
 # passthrough feature.
 sha1 = { version = "0.10", features = ["asm"] }
-# SHA-256 for verifying downloaded model-cache artifacts. `asm`
-# enables `sha2-asm` — hand-tuned SHA-NI assembly on x86_64,
-# ARMv8 SHA-2 crypto extensions on aarch64.
-sha2 = { version = "0.10", features = ["asm"] }
+# SHA-256 for one-shot digest verification of downloaded artifacts
+# (fetch.rs), cache-key fingerprinting (disk_template.rs), seeded
+# key derivation (fun.rs), and model-cache integrity checks
+# (test_support/model). Not on the test hot path.
+sha2 = "0.11"
 # Lowercase hex encoding for SHA-256 digest comparisons in the
 # model-cache verify path.
 hex = "0.4"
