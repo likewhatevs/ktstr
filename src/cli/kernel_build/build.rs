@@ -833,10 +833,16 @@ pub fn kernel_build_pipeline(
         image_name,
         crate::test_support::now_iso8601(),
     )
-    .with_version(acquired.version.clone())
-    .with_config_hash(config_hash)
-    .with_ktstr_kconfig_hash(Some(kconfig_hash))
-    .with_extra_kconfig_hash(extra_kconfig_hash_value);
+    .with_ktstr_kconfig_hash(kconfig_hash);
+    if let Some(v) = acquired.version.clone() {
+        metadata = metadata.with_version(v);
+    }
+    if let Some(h) = config_hash {
+        metadata = metadata.with_config_hash(h);
+    }
+    if let Some(h) = extra_kconfig_hash_value {
+        metadata = metadata.with_extra_kconfig_hash(h);
+    }
     if is_local_source && let Some((size, mtime_secs)) = source_vmlinux_stat {
         metadata = metadata.with_source_vmlinux_stat(size, mtime_secs);
     }

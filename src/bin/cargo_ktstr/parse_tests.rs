@@ -2311,7 +2311,7 @@ fn test_metadata() -> KernelMetadata {
         "bzImage",
         "2026-04-12T10:00:00Z",
     )
-    .with_version(Some("6.14.2"))
+    .with_version("6.14.2")
 }
 
 /// Store a fake kernel image and return the CacheEntry.
@@ -2384,7 +2384,7 @@ fn format_entry_row_no_version() {
 fn kconfig_status_reports_stale_on_hash_mismatch() {
     let tmp = tempfile::TempDir::new().unwrap();
     let cache = CacheDir::with_root(tmp.path().join("cache"));
-    let meta = test_metadata().with_ktstr_kconfig_hash(Some("old"));
+    let meta = test_metadata().with_ktstr_kconfig_hash("old");
     let entry = store_test_entry(&cache, "stale", &meta);
     assert_eq!(
         entry.kconfig_status("new"),
@@ -2405,7 +2405,7 @@ fn kconfig_status_reports_stale_on_hash_mismatch() {
 fn kconfig_status_reports_matches_on_hash_equality() {
     let tmp = tempfile::TempDir::new().unwrap();
     let cache = CacheDir::with_root(tmp.path().join("cache"));
-    let meta = test_metadata().with_ktstr_kconfig_hash(Some("same"));
+    let meta = test_metadata().with_ktstr_kconfig_hash("same");
     let entry = store_test_entry(&cache, "fresh", &meta);
     assert_eq!(
         entry.kconfig_status("same"),
@@ -2452,7 +2452,7 @@ fn kconfig_status_json_string_pins_all_three_variants() {
     let tmp = tempfile::TempDir::new().unwrap();
     let cache = CacheDir::with_root(tmp.path().join("cache"));
 
-    let matches_meta = test_metadata().with_ktstr_kconfig_hash(Some("h"));
+    let matches_meta = test_metadata().with_ktstr_kconfig_hash("h");
     let matches_entry = store_test_entry(&cache, "matches-key", &matches_meta);
     let matches_status = matches_entry.kconfig_status("h");
     assert!(
@@ -2461,7 +2461,7 @@ fn kconfig_status_json_string_pins_all_three_variants() {
     );
     assert_eq!(matches_status.to_string(), "matches");
 
-    let stale_meta = test_metadata().with_ktstr_kconfig_hash(Some("old"));
+    let stale_meta = test_metadata().with_ktstr_kconfig_hash("old");
     let stale_entry = store_test_entry(&cache, "stale-key", &stale_meta);
     let stale_status = stale_entry.kconfig_status("new");
     assert!(

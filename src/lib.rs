@@ -1280,7 +1280,7 @@ mod tests {
             "bzImage",
             "2026-04-12T10:00:00Z",
         )
-        .with_version(Some("6.14.2"));
+        .with_version("6.14.2");
         // `ktstr_kconfig_hash` defaults to None in `KernelMetadata::new`,
         // which is exactly the Untracked shape this test needs.
         assert!(
@@ -1354,8 +1354,8 @@ mod tests {
             "current.bzImage",
             "2026-04-01T00:00:00Z",
         )
-        .with_version(Some("6.14.2"))
-        .with_ktstr_kconfig_hash(Some(current_hash.clone()));
+        .with_version("6.14.2")
+        .with_ktstr_kconfig_hash(current_hash.clone());
         let current_entry = cache
             .store(
                 "current-entry",
@@ -1373,8 +1373,8 @@ mod tests {
             "stale.bzImage",
             "2026-04-20T00:00:00Z",
         )
-        .with_version(Some("6.14.3"))
-        .with_ktstr_kconfig_hash(Some(stale_hash));
+        .with_version("6.14.3")
+        .with_ktstr_kconfig_hash(stale_hash);
         cache
             .store(
                 "stale-entry",
@@ -2044,7 +2044,7 @@ mod tests {
             "bzImage",
             "2026-04-12T10:00:00Z",
         )
-        .with_extra_kconfig_hash(Some(extra_hash.clone()));
+        .with_extra_kconfig_hash(extra_hash.clone());
         cache
             .store(&cache_key, &CacheArtifacts::new(&image), &meta)
             .unwrap();
@@ -2106,7 +2106,7 @@ mod tests {
             "bzImage",
             "2026-04-12T10:00:00Z",
         )
-        .with_extra_kconfig_hash(Some(extra_kconfig_hash(extra_a)));
+        .with_extra_kconfig_hash(extra_kconfig_hash(extra_a));
         cache
             .store(&key_a, &CacheArtifacts::new(&image), &meta)
             .unwrap();
@@ -2191,7 +2191,7 @@ mod tests {
             "bzImage",
             "2026-04-13T10:00:00Z",
         )
-        .with_extra_kconfig_hash(Some(extra_kconfig_hash(extra)));
+        .with_extra_kconfig_hash(extra_kconfig_hash(extra));
         cache
             .store(
                 &extras_key,
@@ -2257,7 +2257,7 @@ mod tests {
             "bzImage",
             "2026-04-13T10:00:00Z",
         )
-        .with_extra_kconfig_hash(Some("deadbeef"));
+        .with_extra_kconfig_hash("deadbeef");
         let extras = cache
             .store(
                 "test-has-extras",

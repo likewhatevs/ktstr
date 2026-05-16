@@ -1822,9 +1822,9 @@ fn local_metadata_with_source_tree(
         "bzImage",
         "2026-04-26T00:00:00Z",
     )
-    .with_version(Some(version))
-    .with_config_hash(Some("abc123"))
-    .with_ktstr_kconfig_hash(Some("def456"))
+    .with_version(version)
+    .with_config_hash("abc123")
+    .with_ktstr_kconfig_hash("def456")
 }
 
 /// Helper: build a fake kernel image file under `dir` and
@@ -1925,9 +1925,9 @@ fn resolve_kernel_source_dir_with_cache_version_skips_non_local_in_fallback() {
         "bzImage",
         "2026-04-26T00:00:00Z",
     )
-    .with_version(Some("6.14.2"))
-    .with_config_hash(Some("abc123"))
-    .with_ktstr_kconfig_hash(Some("def456"));
+    .with_version("6.14.2")
+    .with_config_hash("abc123")
+    .with_ktstr_kconfig_hash("def456");
     cache
         .store(&key, &crate::cache::CacheArtifacts::new(&image), &meta)
         .expect("store cache entry");
@@ -2020,9 +2020,9 @@ fn resolve_kernel_source_dir_with_cache_cache_key_non_local_yields_none() {
         "bzImage",
         "2026-04-26T00:00:00Z",
     )
-    .with_version(Some("6.14.2"))
-    .with_config_hash(Some("abc123"))
-    .with_ktstr_kconfig_hash(Some("def456"));
+    .with_version("6.14.2")
+    .with_config_hash("abc123")
+    .with_ktstr_kconfig_hash("def456");
     cache
         .store(&key, &crate::cache::CacheArtifacts::new(&image), &meta)
         .expect("store cache entry");
@@ -2125,7 +2125,7 @@ fn resolve_kernel_source_dir_path_metadata_non_local_falls_through() {
         "bzImage",
         "2026-04-26T00:00:00Z",
     )
-    .with_version(Some("6.14.2"));
+    .with_version("6.14.2");
     std::fs::write(
         cache_entry.path().join("metadata.json"),
         serde_json::to_string(&meta).expect("serialize metadata"),

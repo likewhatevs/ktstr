@@ -177,27 +177,59 @@ impl KernelMetadata {
         self
     }
 
+    /// Unset the source-tree vmlinux stat (both size and mtime back
+    /// to the `None` default).
+    pub fn clear_source_vmlinux_stat(mut self) -> Self {
+        self.source_vmlinux_size = None;
+        self.source_vmlinux_mtime_secs = None;
+        self
+    }
+
     /// Set the kernel version.
-    pub fn with_version(mut self, version: Option<impl Into<String>>) -> Self {
-        self.version = version.map(Into::into);
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+
+    /// Unset the kernel version (back to the `None` default).
+    pub fn clear_version(mut self) -> Self {
+        self.version = None;
         self
     }
 
     /// Set the .config CRC32 hash.
-    pub fn with_config_hash(mut self, hash: Option<impl Into<String>>) -> Self {
-        self.config_hash = hash.map(Into::into);
+    pub fn with_config_hash(mut self, hash: impl Into<String>) -> Self {
+        self.config_hash = Some(hash.into());
+        self
+    }
+
+    /// Unset the .config CRC32 hash.
+    pub fn clear_config_hash(mut self) -> Self {
+        self.config_hash = None;
         self
     }
 
     /// Set the ktstr.kconfig CRC32 hash.
-    pub fn with_ktstr_kconfig_hash(mut self, hash: Option<impl Into<String>>) -> Self {
-        self.ktstr_kconfig_hash = hash.map(Into::into);
+    pub fn with_ktstr_kconfig_hash(mut self, hash: impl Into<String>) -> Self {
+        self.ktstr_kconfig_hash = Some(hash.into());
+        self
+    }
+
+    /// Unset the ktstr.kconfig CRC32 hash.
+    pub fn clear_ktstr_kconfig_hash(mut self) -> Self {
+        self.ktstr_kconfig_hash = None;
         self
     }
 
     /// Set the `--extra-kconfig` fragment CRC32 hash.
-    pub fn with_extra_kconfig_hash(mut self, hash: Option<impl Into<String>>) -> Self {
-        self.extra_kconfig_hash = hash.map(Into::into);
+    pub fn with_extra_kconfig_hash(mut self, hash: impl Into<String>) -> Self {
+        self.extra_kconfig_hash = Some(hash.into());
+        self
+    }
+
+    /// Unset the `--extra-kconfig` fragment CRC32 hash.
+    pub fn clear_extra_kconfig_hash(mut self) -> Self {
+        self.extra_kconfig_hash = None;
         self
     }
 
@@ -638,10 +670,10 @@ mod tests {
             "bzImage",
             "2026-04-12T10:00:00Z",
         )
-        .with_version(Some("6.14.2"))
-        .with_config_hash(Some("cfg-hash"))
-        .with_ktstr_kconfig_hash(Some("ktstr-hash"))
-        .with_extra_kconfig_hash(Some("extra-hash"))
+        .with_version("6.14.2")
+        .with_config_hash("cfg-hash")
+        .with_ktstr_kconfig_hash("ktstr-hash")
+        .with_extra_kconfig_hash("extra-hash")
         .with_source_vmlinux_stat(123_456_789, 1_700_000_000);
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
@@ -1252,7 +1284,7 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
         let meta =
-            test_metadata("6.14.2").with_extra_kconfig_hash(Some("user-fragment-hash"));
+            test_metadata("6.14.2").with_extra_kconfig_hash("user-fragment-hash");
         let entry = cache
             .store("with-extra", &CacheArtifacts::new(&image), &meta)
             .unwrap();

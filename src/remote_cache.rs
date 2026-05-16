@@ -425,7 +425,7 @@ mod tests {
             "bzImage",
             "2026-04-12T10:00:00Z",
         )
-        .with_version(Some("6.14.2"))
+        .with_version("6.14.2")
     }
 
     fn create_fake_image(dir: &std::path::Path) -> std::path::PathBuf {

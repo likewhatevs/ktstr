@@ -1004,15 +1004,21 @@ mod tests {
     ) -> crate::cache::ListedEntry {
         use crate::cache::{CacheEntry, KernelMetadata, KernelSource};
         let path = std::path::PathBuf::from(format!("/tmp/fixture/{key}"));
-        let metadata = KernelMetadata::new(
+        let mut metadata = KernelMetadata::new(
             KernelSource::Tarball,
             "x86_64",
             "bzImage",
             "2026-04-22T00:00:00Z",
-        )
-        .with_version(version)
-        .with_ktstr_kconfig_hash(ktstr_kconfig_hash)
-        .with_extra_kconfig_hash(extra_kconfig_hash);
+        );
+        if let Some(v) = version {
+            metadata = metadata.with_version(v);
+        }
+        if let Some(h) = ktstr_kconfig_hash {
+            metadata = metadata.with_ktstr_kconfig_hash(h);
+        }
+        if let Some(h) = extra_kconfig_hash {
+            metadata = metadata.with_extra_kconfig_hash(h);
+        }
         crate::cache::ListedEntry::Valid(Box::new(CacheEntry {
             key: key.to_string(),
             path,
@@ -1116,9 +1122,9 @@ mod tests {
             "bzImage",
             "2026-04-12T10:00:00Z",
         )
-        .with_version(Some("6.14.2"))
-        .with_ktstr_kconfig_hash(Some(current_hash))
-        .with_extra_kconfig_hash(Some("deadbeef"));
+        .with_version("6.14.2")
+        .with_ktstr_kconfig_hash(current_hash)
+        .with_extra_kconfig_hash("deadbeef");
         let entry_with = cache
             .store("with-extras", &CacheArtifacts::new(&image), &meta_with)
             .unwrap();
@@ -1133,8 +1139,8 @@ mod tests {
             "bzImage",
             "2026-04-12T10:00:00Z",
         )
-        .with_version(Some("6.14.2"))
-        .with_ktstr_kconfig_hash(Some(current_hash));
+        .with_version("6.14.2")
+        .with_ktstr_kconfig_hash(current_hash);
         let entry_without = cache
             .store(
                 "without-extras",
@@ -1162,7 +1168,7 @@ mod tests {
             "bzImage",
             "2026-04-12T10:00:00Z",
         )
-        .with_version(Some("2.6.32"));
+        .with_version("2.6.32");
         let entry = cache
             .store("fetch-failed-fallback", &CacheArtifacts::new(&image), &meta)
             .unwrap();
@@ -1190,8 +1196,8 @@ mod tests {
             "bzImage",
             "2026-04-12T10:00:00Z",
         )
-        .with_version(Some("2.6.32"))
-        .with_ktstr_kconfig_hash(Some("deadbeef"));
+        .with_version("2.6.32")
+        .with_ktstr_kconfig_hash("deadbeef");
         let stale_entry = cache
             .store("stale-eol", &CacheArtifacts::new(&image), &stale_meta)
             .unwrap();
@@ -1210,8 +1216,8 @@ mod tests {
             "bzImage",
             "2026-04-12T10:00:00Z",
         )
-        .with_version(Some("2.6.32"))
-        .with_ktstr_kconfig_hash(None::<String>);
+        .with_version("2.6.32")
+        .clear_ktstr_kconfig_hash();
         let untracked_entry = cache
             .store(
                 "untracked-eol",
@@ -1248,7 +1254,7 @@ mod tests {
                 "bzImage",
                 "2026-04-12T10:00:00Z",
             )
-            .with_version(Some(version));
+            .with_version(version);
             cache
                 .store(key, &CacheArtifacts::new(&image), &meta)
                 .unwrap()
@@ -1300,7 +1306,7 @@ mod tests {
             "bzImage",
             "2026-04-22T00:00:00Z",
         )
-        .with_version(Some("6.14.2"));
+        .with_version("6.14.2");
         let valid_1 = cache
             .store("valid-entry-a", &CacheArtifacts::new(&image), &meta)
             .unwrap();
@@ -1362,14 +1368,18 @@ mod tests {
     fn kernel_list_stale_kconfig_json_human_parity() {
         use crate::cache::{CacheArtifacts, CacheDir, KernelSource};
         fn metadata_with_hash(hash: Option<&str>) -> crate::cache::KernelMetadata {
-            crate::cache::KernelMetadata::new(
+            let m = crate::cache::KernelMetadata::new(
                 KernelSource::Tarball,
                 "x86_64",
                 "bzImage",
                 "2026-04-12T10:00:00Z",
             )
-            .with_version(Some("6.14.2"))
-            .with_ktstr_kconfig_hash(hash)
+            .with_version("6.14.2");
+            if let Some(h) = hash {
+                m.with_ktstr_kconfig_hash(h)
+            } else {
+                m
+            }
         }
         let cases: &[(&str, Option<&str>, &str)] = &[
             ("matches", Some("same"), "same"),
@@ -1426,14 +1436,18 @@ mod tests {
         let active_prefixes = ["6.14".to_string()];
 
         let build_row = |key: &str, version: Option<&str>, entry_hash: Option<&str>| -> String {
-            let meta = KernelMetadata::new(
+            let mut meta = KernelMetadata::new(
                 KernelSource::Tarball,
                 "x86_64",
                 "bzImage",
                 "2026-04-12T10:00:00Z",
-            )
-            .with_version(version)
-            .with_ktstr_kconfig_hash(entry_hash);
+            );
+            if let Some(v) = version {
+                meta = meta.with_version(v);
+            }
+            if let Some(h) = entry_hash {
+                meta = meta.with_ktstr_kconfig_hash(h);
+            }
             let entry = cache
                 .store(key, &CacheArtifacts::new(&image), &meta)
                 .unwrap();
