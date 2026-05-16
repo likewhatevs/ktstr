@@ -485,8 +485,8 @@ fn sort_diff_rows_by_keys_categorical_only_group_does_not_panic() {
         thread_count_b: 1,
         metric_name: metric,
         metric_ladder: ScaleLadder::None,
-        baseline: Aggregated::mode_single("SCHED_OTHER".into(), 1, 1),
-        candidate: Aggregated::mode_single("SCHED_OTHER".into(), 1, 1),
+        baseline: Aggregated::mode_single("SCHED_OTHER", 1, 1),
+        candidate: Aggregated::mode_single("SCHED_OTHER", 1, 1),
         // `Mode` rows carry `delta: None` because mode
         // metrics have no scalar projection — see
         // `Aggregated::numeric()`.

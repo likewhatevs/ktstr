@@ -149,10 +149,10 @@ impl Aggregated {
     /// empty Mode renders as `~` while still carrying a
     /// well-defined `total` for the rendered "(count/total)"
     /// suffix.
-    pub fn mode_single(value: String, count: usize, total: usize) -> Aggregated {
+    pub fn mode_single(value: impl Into<String>, count: usize, total: usize) -> Aggregated {
         let mut tallies = BTreeMap::new();
         if count > 0 {
-            tallies.insert(value, count);
+            tallies.insert(value.into(), count);
         }
         Aggregated::Mode { tallies, total }
     }

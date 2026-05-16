@@ -1145,7 +1145,7 @@ pub fn run_shell(
         .no_perf_mode(no_perf_mode);
 
     if let Some(cmd) = exec {
-        builder = builder.exec_cmd(cmd.to_string());
+        builder = builder.exec_cmd(cmd);
     }
 
     if let Some(d) = disk {

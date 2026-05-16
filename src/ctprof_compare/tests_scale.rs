@@ -254,7 +254,7 @@ fn format_value_cell_renders_max_at_appropriate_scale() {
 /// counts.
 #[test]
 fn format_value_cell_passes_non_numeric_aggregates_through() {
-    let m = Aggregated::mode_single("SCHED_OTHER".into(), 4, 4);
+    let m = Aggregated::mode_single("SCHED_OTHER", 4, 4);
     assert_eq!(format_value_cell(&m, ScaleLadder::None), "SCHED_OTHER");
     let r = Aggregated::OrdinalRange { min: -5, max: 10 };
     assert_eq!(format_value_cell(&r, ScaleLadder::None), "-5..10");

@@ -75,32 +75,22 @@ use std::sync::OnceLock;
 /// for every field) instead of `Default`'s all-`None` minimum, start
 /// from [`HostContext::test_fixture`] and mutate from there.
 ///
-/// # Error-free deserialization under field drift
+/// # Partial-read round-trip
 ///
-/// The `Deserialize` impl is derived WITHOUT
-/// `#[serde(deny_unknown_fields)]`. An older binary reading a
-/// sidecar written by a newer binary therefore silently ignores
-/// any fields it does not recognize, and the downstream
-/// `SidecarResult` parse succeeds with the older struct shape.
-/// This is the intentional forward-compat contract: adding a new
-/// `Option<T>` field to `HostContext` does NOT break consumers
-/// built against a prior schema. Paired with the per-field
-/// `#[serde(default)]` on every attribute, missing fields also
-/// default cleanly — so a newer binary reading an older sidecar
-/// that lacks a newly-added field gets `None` rather than a
-/// deserialize error. Both directions of the version skew are
-/// covered by this policy.
-///
-/// "Forward-compat" here means only that deserialization does
-/// not error — it does NOT mean data is preserved across field
-/// renames. If a field is renamed (e.g. `uname_sysname` →
-/// `kernel_name`), a sidecar written under the old name
-/// deserializes cleanly but the renamed field lands as `None` on
-/// the new struct, because `#[serde(default)]` supplies the
-/// absent-field default and there is no alias mapping. This is
-/// by design: sidecar data is disposable (re-running the test
-/// regenerates it with the current schema), so rename migrations
-/// do not carry alias shims.
+/// Fields representing producer-time partial-read outcomes use
+/// `serde(default, skip_serializing_if = ...)` so the absent
+/// state round-trips through the sidecar JSON — `None` for the
+/// `Option<T>` fields paired with `Option::is_none`, empty for
+/// the `cpufreq_governor` `BTreeMap<usize, String>` paired with
+/// `BTreeMap::is_empty`. A producer-time partial read (missing
+/// `/proc` entry, permission denied, parse failure) lands at the
+/// absent state, gets omitted on serialize, and deserializes back
+/// to the same absent state. The pattern exists for that
+/// producer-side partial-population path, not for cross-binary-
+/// version compatibility. Per the pre-1.0 sidecar-disposable
+/// rule, a sidecar written by a different binary version may
+/// fail to deserialize when the schema has diverged — re-run the
+/// test to regenerate it with the current schema.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct HostContext {

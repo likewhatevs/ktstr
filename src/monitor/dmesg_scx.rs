@@ -84,8 +84,11 @@ pub enum ScxExitKind {
 pub struct ScxExitEvent {
     /// Scheduler name extracted from `sched_ext: BPF scheduler "<name>" disabled (...)`.
     pub scheduler_name: String,
-    /// Exit-kind classification.
-    #[serde(default = "default_exit_kind")]
+    /// Exit-kind classification. Defaults to
+    /// [`ScxExitKind::Unclassified`] via the `#[default]` arm on the
+    /// enum, so an absent `kind` field round-trips back to the
+    /// pre-classification placeholder.
+    #[serde(default)]
     pub kind: ScxExitKind,
     /// Operator-supplied exit message (`ei->msg`) when present —
     /// the parenthesized text in the anchor line plus any
@@ -107,10 +110,6 @@ pub struct ScxExitEvent {
     /// use the structured form or recreate the original line.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stack: Vec<StackSymbol>,
-}
-
-fn default_exit_kind() -> ScxExitKind {
-    ScxExitKind::Unclassified
 }
 
 /// One frame of a `%pS`-formatted stack trace.

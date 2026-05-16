@@ -77,10 +77,13 @@ rename render the renamed fields as `(unknown)` in `show-host`
 and in `stats compare`'s host-delta section, and re-running the
 test against the current binary regenerates the sidecar with
 the new field names populated. Mechanically: the old sidecar
-still deserializes cleanly (deserialization is forward-compatible
-in the "does-not-error" sense), but the renamed fields land as
-`None` on the new struct because the old-name data does not
-migrate to the new field names.
+deserializes only because the rename was field-additive — the
+new fields are `Option<T>` and default to `None` when the
+old-name keys are absent. Cross-version-incompatible changes
+(field deletion, type change) would fail deserialization
+loudly. Per the pre-1.0 sidecar-disposable rule, re-run the
+test to regenerate the sidecar with the current schema rather
+than relying on the additive-rename path holding.
 
 This output is human-oriented. For programmatic access, read
 the `host` field of any sidecar JSON (same schema, identical

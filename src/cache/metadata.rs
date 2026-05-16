@@ -137,14 +137,19 @@ pub struct KernelMetadata {
 
 impl KernelMetadata {
     /// Create a new KernelMetadata with required fields.
-    pub fn new(source: KernelSource, arch: String, image_name: String, built_at: String) -> Self {
+    pub fn new(
+        source: KernelSource,
+        arch: impl Into<String>,
+        image_name: impl Into<String>,
+        built_at: impl Into<String>,
+    ) -> Self {
         KernelMetadata {
             version: None,
             source,
-            arch,
-            image_name,
+            arch: arch.into(),
+            image_name: image_name.into(),
             config_hash: None,
-            built_at,
+            built_at: built_at.into(),
             ktstr_kconfig_hash: None,
             extra_kconfig_hash: None,
             has_vmlinux: false,

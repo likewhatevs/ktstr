@@ -149,9 +149,9 @@ fn ordinal_display_collapses_degenerate_range() {
 /// homogeneous groups.
 #[test]
 fn mode_display_hides_ratio_when_unanimous() {
-    let m = Aggregated::mode_single("SCHED_OTHER".into(), 4, 4);
+    let m = Aggregated::mode_single("SCHED_OTHER", 4, 4);
     assert_eq!(m.to_string(), "SCHED_OTHER");
-    let m = Aggregated::mode_single("SCHED_OTHER".into(), 3, 5);
+    let m = Aggregated::mode_single("SCHED_OTHER", 3, 5);
     assert_eq!(m.to_string(), "SCHED_OTHER (3/5)");
 }
 
@@ -191,7 +191,7 @@ fn aggregated_max_numeric_and_display() {
 /// return to `Some(0.0)` without any currently-visible symptom.
 #[test]
 fn numeric_returns_none_for_mode() {
-    let m = Aggregated::mode_single("SCHED_OTHER".into(), 4, 4);
+    let m = Aggregated::mode_single("SCHED_OTHER", 4, 4);
     assert!(m.numeric().is_none());
 }
 

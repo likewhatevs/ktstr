@@ -135,10 +135,17 @@ const MAX_NODES_PER_LIST: u32 = 4096;
 ///    [`crate::monitor::guest::GuestKernel::new_for_test`] with
 ///    known offsets + assert. See `task_enrichment.rs` tests for
 ///    the layout pattern.
-/// 3. **Serde compat.** New fields landing on
-///    [`crate::monitor::task_enrichment::TaskEnrichment`] must use
-///    `#[serde(default, skip_serializing_if = ...)]` — old JSON
-///    consumers must round-trip.
+/// 3. **Optional-field round-trip.** New fields landing on
+///    [`crate::monitor::task_enrichment::TaskEnrichment`] that
+///    represent producer-time partial-population outcomes (a
+///    capture branch could not populate the field on this build /
+///    kernel / VM shape) use the
+///    `#[serde(default, skip_serializing_if = ...)]` pattern so
+///    `None` / empty values round-trip through the JSON
+///    (omitted on serialize, absent on deserialize defaults back).
+///    The pattern is for None / empty round-trip, NOT cross-
+///    binary-version compatibility — pre-1.0 dump JSON is
+///    disposable; re-run the failing test to regenerate.
 pub(crate) fn build(
     owned_accessor: &GuestMemMapAccessorOwned,
     scx_owned: Option<&ScxWalkerOwned>,

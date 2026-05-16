@@ -674,8 +674,8 @@ impl KtstrVmBuilder {
     /// Requires `busybox(true)` and is typically paired with
     /// `KtstrVm::new_shell`.
     #[allow(dead_code)]
-    pub fn exec_cmd(mut self, cmd: String) -> Self {
-        self.exec_cmd = Some(cmd);
+    pub fn exec_cmd(mut self, cmd: impl Into<String>) -> Self {
+        self.exec_cmd = Some(cmd.into());
         self
     }
 
