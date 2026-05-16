@@ -4686,15 +4686,6 @@ mod tests {
     }
 
     #[test]
-    fn cgroup_def_default() {
-        let d = CgroupDef::default();
-        assert_eq!(d.name, "cg_0");
-        assert!(d.cpuset.is_none());
-        assert!(d.works.is_empty());
-        assert!(!d.swappable);
-    }
-
-    #[test]
     fn cgroup_def_multi_work() {
         let d = CgroupDef::named("multi")
             .work(WorkSpec::default().workers(4).work_type(WorkType::SpinWait))

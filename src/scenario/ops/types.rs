@@ -1069,7 +1069,20 @@ impl CgroupDef {
     pub fn named(name: impl Into<Cow<'static, str>>) -> Self {
         Self {
             name: name.into(),
-            ..Default::default()
+            cpuset: None,
+            works: vec![],
+            swappable: false,
+            payload: None,
+            cpuset_mems: None,
+            cpu: None,
+            memory: None,
+            io: None,
+            pids: None,
+            default_nice: None,
+            default_comm: None,
+            default_uid: None,
+            default_gid: None,
+            default_numa_node: None,
         }
     }
 
@@ -1650,27 +1663,39 @@ impl Default for CpuLimits {
     }
 }
 
-impl Default for CgroupDef {
-    fn default() -> Self {
-        Self {
-            name: Cow::Borrowed("cg_0"),
-            cpuset: None,
-            works: vec![],
-            swappable: false,
-            payload: None,
-            cpuset_mems: None,
-            cpu: None,
-            memory: None,
-            io: None,
-            pids: None,
-            default_nice: None,
-            default_comm: None,
-            default_uid: None,
-            default_gid: None,
-            default_numa_node: None,
-        }
+// `CgroupDef` deliberately has NO `Default` impl. The previous
+// derived/hand-rolled default produced `name = "cg_0"`, which
+// collides with the conventional first cgroup name in nearly every
+// scenario (a test calling `..Default::default()` would silently
+// share a cgroup with the scenario's first named entry). Forcing
+// every construction site to go through [`CgroupDef::named`] makes
+// the name explicit and eliminates the footgun. The pattern is
+// documented in the type-level docstring and operator-facing
+// guidance at `doc/guide/src/architecture/workload-handle.md` under
+// the spread-default warning.
+//
+// Compile-time pin of the absence: the `AmbiguousIfImpl<()>`
+// blanket-vs-specialized-impl trick (mirrors
+// `static_assertions::assert_not_impl_any!`) below produces a
+// compile error if a future commit adds `impl Default for
+// CgroupDef`. Two `AmbiguousIfImpl<_>` impls would match and type
+// inference for `_` becomes ambiguous, breaking compilation. The
+// in-project precedent is at `src/scenario/payload_run.rs:2122` for
+// `SigchldScope: !Send + !Sync`; the same pattern keeps the
+// assertion local without adding `static_assertions` as a direct
+// dependency.
+const _: fn() = || {
+    trait AmbiguousIfImpl<A> {
+        fn some_item() {}
     }
-}
+    impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+
+    #[allow(dead_code)]
+    struct InvalidDefault;
+    impl<T: ?Sized + Default> AmbiguousIfImpl<InvalidDefault> for T {}
+
+    let _ = <CgroupDef as AmbiguousIfImpl<_>>::some_item;
+};
 
 // ---------------------------------------------------------------------------
 // Step / HoldSpec
