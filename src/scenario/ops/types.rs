@@ -1064,6 +1064,11 @@ pub struct CgroupDef {
     /// [`WorkloadConfig::nice`](crate::workload::WorkloadConfig::nice))
     /// inherits `Some(n)` at apply-setup time. Set via [`Self::nice`];
     /// merged in [`Self::merged_works`].
+    ///
+    /// Order-independent with [`Self::work`]: `def.work(spec).nice(n)`
+    /// and `def.nice(n).work(spec)` produce identical effective
+    /// `WorkSpec` values because the merge runs at `merged_works()`
+    /// call time, not at builder-method call time.
     pub default_nice: Option<i32>,
     /// Cgroup-level default for [`WorkSpec::comm`]. Merged into any
     /// [`WorkSpec`] whose own `comm` is `None` at apply-setup time.

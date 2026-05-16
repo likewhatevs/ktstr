@@ -1186,12 +1186,26 @@ pub struct WorkSpec {
     /// Linux scheduling policy.
     pub sched_policy: SchedPolicy,
     /// Number of workers. `None` means use `Ctx::workers_per_cgroup`.
+    ///
+    /// Composition-sensitive: different work groups within the same
+    /// cgroup commonly want different worker counts (e.g. an
+    /// antagonist with 4 spinners alongside a victim with 1
+    /// SCHED_FIFO worker). For that reason `CgroupDef` does NOT
+    /// expose a cgroup-level default for `num_workers` — multi-group
+    /// cgroups set the count per-`WorkSpec` here.
     pub num_workers: Option<usize>,
     /// Per-worker affinity intent. Resolved to [`ResolvedAffinity`] at
     /// runtime via [`resolve_affinity_for_cgroup()`](crate::scenario::resolve_affinity_for_cgroup).
     pub affinity: AffinityIntent,
     /// NUMA memory placement policy. Applied via `set_mempolicy(2)`
     /// after fork, before the work loop.
+    ///
+    /// Validated against the resolved cpuset per-WorkSpec at
+    /// apply-setup time. Because validation is per-group, a
+    /// cgroup-level default would mask per-group failures with
+    /// confusing diagnostics — `CgroupDef` deliberately does not
+    /// expose a cgroup-level default for `mem_policy`; multi-group
+    /// cgroups set it per-`WorkSpec` here.
     pub mem_policy: MemPolicy,
     /// Optional mode flags for `set_mempolicy(2)`.
     pub mpol_flags: MpolFlags,
@@ -1199,6 +1213,12 @@ pub struct WorkSpec {
     /// fork, before the work loop. See [`WorkloadConfig::nice`]
     /// for range, `None`-vs-`Some(n)` semantics, and `CAP_SYS_NICE`
     /// rules.
+    ///
+    /// To inherit a cgroup-level default merged in by
+    /// [`CgroupDef::default_nice`](crate::scenario::ops::CgroupDef::default_nice),
+    /// leave this `None`. `Some(0)` opts out of the merge — see
+    /// [`WorkloadConfig::nice`] for the underlying
+    /// `setpriority(PRIO_PROCESS, 0, 0)` semantics.
     pub nice: Option<i32>,
     /// Per-worker comm set via `prctl(PR_SET_NAME)` at thread
     /// creation time (the kernel truncates to `TASK_COMM_LEN - 1 =
