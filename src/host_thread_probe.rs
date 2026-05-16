@@ -20,7 +20,7 @@
 //!   and bloat the initramfs image used by integration tests). The
 //!   compiled bytes match exactly; the bin invokes
 //!   [`attach_jemalloc`] + [`probe_thread_with_cache`] directly.
-//! - The ctprof capture pipeline at [`crate::ctprof`]
+//! - The ctprof capture pipeline at [`ktstr::ctprof`]
 //!   consumes the engine through the in-crate `pub` API, calling
 //!   [`attach_jemalloc_at`] for each probed tgid and
 //!   [`probe_thread`] for each tid behind the
@@ -1680,7 +1680,7 @@ fn find_jemalloc_via_maps_at(
 }
 
 /// Extract the on-disk ELF path from a `/proc/<pid>/maps` line, or
-/// `None` if the line is a non-file mapping (anon, [stack], …) or
+/// `None` if the line is a non-file mapping (anon, `[stack]`, …) or
 /// not executable. Returning only `r-x` mappings avoids re-opening
 /// the same ELF for each of its segments.
 fn parse_maps_elf_path(line: &str) -> Option<PathBuf> {

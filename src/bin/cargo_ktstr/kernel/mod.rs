@@ -18,7 +18,7 @@
 //! unit-testable without driving the rayon resolve pipeline (every
 //! `resolve_one` arm performs real I/O).
 
-mod wire_format;
+pub(crate) mod wire_format;
 
 use std::path::{Path, PathBuf};
 

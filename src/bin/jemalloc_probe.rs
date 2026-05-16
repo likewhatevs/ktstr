@@ -241,11 +241,11 @@ struct Cli {
     #[arg(long)]
     json: bool,
     /// Append probe output to an existing ktstr sidecar JSON file.
-    /// The probe synthesizes a [`PayloadMetrics`] entry from its
-    /// own output (walking numeric JSON leaves into `name: value`
-    /// records), appends it to `sidecar.metrics`, and writes the
-    /// result back atomically (tempfile + rename) under an
-    /// exclusive advisory lock.
+    /// The probe synthesizes a [`ktstr::test_support::PayloadMetrics`]
+    /// entry from its own output (walking numeric JSON leaves into
+    /// `name: value` records), appends it to `sidecar.metrics`, and
+    /// writes the result back atomically (tempfile + rename) under
+    /// an exclusive advisory lock.
     ///
     /// Sidecar file MUST already exist. Run the target test first
     /// so the harness writes the sidecar, then invoke the probe
@@ -1035,9 +1035,9 @@ fn print_output(cli: &Cli, out: &ProbeOutput) -> Result<()> {
 /// appends to a sidecar.
 const SIDECAR_METRIC_PREFIX: &str = "jemalloc_probe";
 
-/// Upgrade a [`Metric`]'s unit + polarity based on its flat-path
-/// name. Names ending in `.allocated_bytes` or `.deallocated_bytes`
-/// become `(Polarity::LowerBetter, "bytes")`.
+/// Upgrade a [`ktstr::test_support::Metric`]'s unit + polarity based
+/// on its flat-path name. Names ending in `.allocated_bytes` or
+/// `.deallocated_bytes` become `(Polarity::LowerBetter, "bytes")`.
 fn apply_probe_metric_hints(m: &mut ktstr::test_support::Metric) {
     use ktstr::test_support::Polarity;
     if m.name.ends_with(".allocated_bytes") || m.name.ends_with(".deallocated_bytes") {
@@ -1046,8 +1046,9 @@ fn apply_probe_metric_hints(m: &mut ktstr::test_support::Metric) {
     }
 }
 
-/// Synthesize a [`PayloadMetrics`] from a [`ProbeOutput`] so the
-/// result can land in a [`SidecarResult::metrics`] vec.
+/// Synthesize a [`ktstr::test_support::PayloadMetrics`] from a
+/// [`ProbeOutput`] so the result can land in a
+/// [`ktstr::test_support::SidecarResult::metrics`] vec.
 fn synthesize_payload_metrics(
     out: &ProbeOutput,
     exit_code: i32,
@@ -1068,8 +1069,9 @@ fn synthesize_payload_metrics(
     })
 }
 
-/// Append a synthesized [`PayloadMetrics`] to the
-/// [`SidecarResult::metrics`] vec of the sidecar file at `path`.
+/// Append a synthesized [`ktstr::test_support::PayloadMetrics`] to
+/// the [`ktstr::test_support::SidecarResult::metrics`] vec of the
+/// sidecar file at `path`.
 /// Atomic via tempfile + rename under an exclusive advisory lock.
 fn append_probe_output_to_sidecar(path: &Path, out: &ProbeOutput, exit_code: i32) -> Result<()> {
     use ktstr::test_support::SidecarResult;

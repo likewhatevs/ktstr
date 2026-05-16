@@ -78,7 +78,7 @@
 //!   language primitives, and `core` types are safe. Anything that
 //!   depends on `PayloadHandle`, scenario `Ctx`, `anyhow`, or any
 //!   other lib-only item must live in
-//!   [`crate::worker_ready_wait`] (lib-only) — not here.
+//!   [`ktstr::worker_ready_wait`] (lib-only) — not here.
 //! - **No external crate imports that only the lib or only the bin
 //!   has.** Adding a non-std dependency requires a matching `Cargo.toml`
 //!   stanza for both the lib and the bin; otherwise one build path
@@ -89,7 +89,7 @@
 //!   silently diverge the two compiled copies.
 //!
 //! The `wait_for_worker_ready` helper lives in the sibling
-//! [`crate::worker_ready_wait`] module because it needs
+//! [`ktstr::worker_ready_wait`] module because it needs
 //! `PayloadHandle` and therefore depends on the rest of the
 //! library.
 //!
