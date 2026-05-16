@@ -670,7 +670,7 @@ fn run_scenario(
     for p in &backdrop.payloads {
         if p.is_scheduler() {
             anyhow::bail!(
-                "Backdrop::with_payload received scheduler-kind Payload '{}' — \
+                "Backdrop::push_payload received scheduler-kind Payload '{}' — \
                  only PayloadKind::Binary payloads run in the Backdrop; \
                  place scheduler-kind payloads on the #[ktstr_test(scheduler = ...)] \
                  attribute instead",
@@ -678,7 +678,7 @@ fn run_scenario(
             );
         }
     }
-    // Scheduler-kind payloads smuggled via Backdrop::with_op(Op::RunPayload { ... })
+    // Scheduler-kind payloads smuggled via Backdrop::push_op(Op::RunPayload { ... })
     // would otherwise bypass the check above and only bail deep inside
     // apply_ops. Reject them here with a Backdrop-specific error so
     // the failure surface matches the declaration surface.
@@ -687,7 +687,7 @@ fn run_scenario(
             && payload.is_scheduler()
         {
             anyhow::bail!(
-                "Backdrop::with_op(Op::RunPayload) received scheduler-kind Payload '{}' — \
+                "Backdrop::push_op(Op::RunPayload) received scheduler-kind Payload '{}' — \
                  only PayloadKind::Binary payloads run in the Backdrop; \
                  place scheduler-kind payloads on the #[ktstr_test(scheduler = ...)] \
                  attribute instead",
@@ -6761,7 +6761,7 @@ mod tests {
         let topo = mock_topo();
         let ctx = crate::scenario::Ctx::builder(&cgroups, &topo).build();
         let backdrop =
-            crate::scenario::backdrop::Backdrop::new().with_payload(&Payload::KERNEL_DEFAULT);
+            crate::scenario::backdrop::Backdrop::new().push_payload(&Payload::KERNEL_DEFAULT);
         let err = execute_scenario_with(
             &ctx,
             backdrop,

@@ -1775,7 +1775,7 @@ impl From<Vec<CgroupDef>> for Setup {
 /// Construct via [`Step::new`] (ops-only, no setup), [`Step::with_defs`]
 /// (cgroup setup + hold), or [`Step::with_payload`] (payload-driven step).
 /// For chained mutation of the ops list, [`Step::set_ops`] REPLACES
-/// the existing vec — Backdrop's `with_ops` semantics (APPEND) are not
+/// the existing vec — Backdrop's `extend_ops` semantics (APPEND) are not
 /// mirrored here because Step is single-phase.
 #[derive(Clone, Debug)]
 pub struct Step {
@@ -1815,9 +1815,9 @@ impl Step {
 
     /// Replace the ops for a step, consuming and returning it.
     ///
-    /// Named `set_ops` rather than `with_ops` because the semantics
+    /// Named `set_ops` rather than `extend_ops` because the semantics
     /// are REPLACE, not EXTEND — contrast
-    /// [`Backdrop::with_ops`](crate::scenario::backdrop::Backdrop::with_ops),
+    /// [`Backdrop::extend_ops`](crate::scenario::backdrop::Backdrop::extend_ops),
     /// which appends. A chained `Step::new(ops).set_ops(more)`
     /// drops `ops` and keeps only `more`.
     #[must_use = "builder methods consume self; bind the result"]

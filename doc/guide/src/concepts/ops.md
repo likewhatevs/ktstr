@@ -315,12 +315,14 @@ to a step that also creates cgroups.
 (builder method). Use the `set_X` prefix family to mutate the step
 in place; `with_X` is reserved for alternative constructors.
 
-> **Naming asymmetry:** `Step::set_ops` REPLACES; the sibling
-> `Backdrop::with_ops` APPENDS. The two methods deliberately use
-> different verbs to signal the different semantics. A
-> `Step::new(ops).set_ops(more)` chain produces a step whose ops
-> vec is exactly `more` (the original `ops` is dropped); a
-> `Backdrop::new().with_ops(ops_a).with_ops(ops_b)` chain
+> **Naming convention:** `Step::set_ops` REPLACES; the sibling
+> `Backdrop::extend_ops` APPENDS several, `Backdrop::push_op`
+> APPENDS one. The verb prefix encodes the semantics: `set_X`
+> replaces a field, `push_X` appends one element, `extend_X`
+> appends an iterator. A `Step::new(ops).set_ops(more)` chain
+> produces a step whose ops vec is exactly `more` (the original
+> `ops` is dropped); a
+> `Backdrop::new().extend_ops(ops_a).extend_ops(ops_b)` chain
 > produces a backdrop whose ops vec is `ops_a + ops_b`. If you
 > need to extend a step's ops vec, build the combined `Vec<Op>`
 > at the call site and pass it to `set_ops`, or compose at the

@@ -22,7 +22,7 @@
 //! In the "bursty load + scheduler stress test" pattern:
 //!
 //! - The bursty payload (a persistent fio, a running stress-ng) is
-//!   a `Backdrop::with_payload(...)` entry — it runs THROUGHOUT the
+//!   a `Backdrop::push_payload(...)` entry — it runs THROUGHOUT the
 //!   test, irrespective of which Step is currently applying ops.
 //! - Each Step handles a discrete phase ("settle", "inject
 //!   contention", "measure") with its own CgroupDefs that come and
@@ -95,9 +95,9 @@ use crate::test_support::Payload;
 /// // Worker-bearing cgroup + empty move target + long-running payload,
 /// // all persistent for the scenario.
 /// let backdrop = Backdrop::new()
-///     .with_cgroup(CgroupDef::named("bg_cell").with_cpuset(CpusetSpec::disjoint(0, 2)))
-///     .with_op(Op::add_cgroup("bg_overflow"))
-///     .with_payload(&BG_LOAD);
+///     .push_cgroup(CgroupDef::named("bg_cell").with_cpuset(CpusetSpec::disjoint(0, 2)))
+///     .push_op(Op::add_cgroup("bg_overflow"))
+///     .push_payload(&BG_LOAD);
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct Backdrop {
@@ -107,7 +107,7 @@ pub struct Backdrop {
     /// least one worker (declared [`WorkSpec`](crate::workload::WorkSpec)
     /// entries, or a single default WorkSpec when `works` is empty).
     /// Declare empty move-target cgroups via [`Self::ops`] /
-    /// [`Self::with_op`] using [`Op::AddCgroup`] instead.
+    /// [`Self::push_op`] using [`Op::AddCgroup`] instead.
     ///
     /// # Ordering guarantee
     ///
@@ -115,7 +115,7 @@ pub struct Backdrop {
     /// appear in this `Vec`. The Backdrop setup phase iterates
     /// `cgroups` front-to-back and runs each `CgroupDef`'s setup
     /// (`mkdir`, cpuset/sysfs writes, worker spawn) one at a time.
-    /// `with_cgroup(a).with_cgroup(b)` creates `a` first, then `b`.
+    /// `push_cgroup(a).push_cgroup(b)` creates `a` first, then `b`.
     ///
     /// This matters for any scheduler whose internal IDs are
     /// assigned in cgroup-creation order — `scx_mitosis`, for
@@ -184,88 +184,56 @@ impl Backdrop {
         ops: Vec::new(),
     };
 
-    /// Fresh Backdrop builder. Reads naturally in chain position:
-    /// `Backdrop::new().with_cgroup(...).with_payload(...)`.
+    /// Fresh Backdrop builder.
     #[must_use = "dropping a Backdrop discards the scenario layout"]
     pub fn new() -> Self {
         Backdrop::EMPTY
     }
 
-    /// Add a persistent cgroup to the Backdrop. The cgroup is
-    /// created before the first Step runs and removed after the
-    /// last Step tears down. Steps reference it by name via
-    /// `Op::MoveAllTasks` / `Op::SetCpuset` / etc.
-    ///
-    /// Cgroups are created in the order they're added via this
-    /// builder; see [`Self::cgroups`] for the ordering guarantee
-    /// and a worked example (e.g. constructing sparse `cell_id`
-    /// ranges for scx_mitosis-style schedulers).
+    /// See [`Self::cgroups`] for the ordering guarantee and the
+    /// `cell_id` allocation example.
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn with_cgroup(mut self, def: CgroupDef) -> Self {
+    pub fn push_cgroup(mut self, def: CgroupDef) -> Self {
         self.cgroups.push(def);
         self
     }
 
-    /// Add several persistent cgroups at once. Cgroups are created
-    /// in the iteration order of `defs`, appended after any
-    /// already-declared Backdrop cgroups; see [`Self::cgroups`] for
-    /// the ordering guarantee.
+    /// See [`Self::cgroups`] for the ordering guarantee.
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn with_cgroups<I: IntoIterator<Item = CgroupDef>>(mut self, defs: I) -> Self {
+    pub fn extend_cgroups<I: IntoIterator<Item = CgroupDef>>(mut self, defs: I) -> Self {
         self.cgroups.extend(defs);
         self
     }
 
-    /// Add a persistent binary payload with no extra args. The
-    /// payload spawns before the first Step runs and is killed +
-    /// metric-drained after the last Step. Scheduler-kind payloads
-    /// are rejected at `execute_scenario` entry; this builder does
-    /// not check the kind so the check stays in one place.
-    ///
-    /// **Need custom args or a cgroup placement?** Use
-    /// [`Self::with_op`] instead:
-    /// `.with_op(Op::run_payload(&BG, vec!["--cpu".into(), "4".into()]))`
-    /// or `Op::run_payload_in_cgroup(...)` — both spawn through the
-    /// same pipeline as this shorthand but expose the full argument
-    /// and placement surface that [`Op::RunPayload`] carries.
+    /// Binary-kind payload with no extra args. See [`Self::payloads`]
+    /// for lifecycle. For custom args or cgroup placement use
+    /// [`Self::push_op`] with [`Op::run_payload`] / [`Op::run_payload_in_cgroup`].
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn with_payload(mut self, payload: &'static Payload) -> Self {
+    pub fn push_payload(mut self, payload: &'static Payload) -> Self {
         self.payloads.push(payload);
         self
     }
 
-    /// Append several persistent binary payloads at once. See
-    /// [`Self::with_payload`] for the spawn-order and argument
-    /// contract — every element follows the same no-custom-args
-    /// rule, so pass `with_op(Op::run_payload(..))` entries via
-    /// [`Self::with_ops`] when per-payload args are required.
+    /// See [`Self::push_payload`]; use [`Self::extend_ops`] with
+    /// [`Op::run_payload`] entries for per-payload args.
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn with_payloads<I: IntoIterator<Item = &'static Payload>>(mut self, payloads: I) -> Self {
+    pub fn extend_payloads<I: IntoIterator<Item = &'static Payload>>(mut self, payloads: I) -> Self {
         self.payloads.extend(payloads);
         self
     }
 
-    /// Append a raw [`Op`] to run during Backdrop setup. Typical
-    /// use: `Op::AddCgroup { .. }` to create empty move-target
-    /// cgroups that persist for the scenario but never spawn
-    /// workers (a [`CgroupDef`] always spawns at least one WorkSpec
-    /// entry, so empty cgroups are only expressible via ops).
-    ///
-    /// Setup order: CgroupDefs apply first, then ops run, then
-    /// payloads spawn last. Backdrop ops execute with the backdrop
-    /// target slot active so any cgroup / handle / payload they
-    /// create is tracked by the Backdrop and survives every Step's
-    /// teardown.
+    /// See [`Self::ops`] for run order. Typical use:
+    /// [`Op::AddCgroup`] for empty move-target cgroups (a
+    /// [`CgroupDef`] always spawns at least one worker).
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn with_op(mut self, op: Op) -> Self {
+    pub fn push_op(mut self, op: Op) -> Self {
         self.ops.push(op);
         self
     }
 
-    /// Append several raw [`Op`]s at once. See [`Self::with_op`]
-    /// for the ordering and routing contract.
+    /// See [`Self::ops`] for run order.
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn with_ops<I: IntoIterator<Item = Op>>(mut self, ops: I) -> Self {
+    pub fn extend_ops<I: IntoIterator<Item = Op>>(mut self, ops: I) -> Self {
         self.ops.extend(ops);
         self
     }
@@ -294,7 +262,7 @@ mod tests {
     const TEST_PAYLOAD_2: Payload = Payload::binary("test_bin_2", "/bin/false");
 
     /// Additional distinct-named payloads so
-    /// `with_payloads_preserves_declaration_order_for_many_entries`
+    /// `extend_payloads_preserves_declaration_order_for_many_entries`
     /// can exercise a 7-distinct-payload pattern matching the
     /// cgroups sibling test — any pairwise swap of any two indices
     /// surfaces as a name mismatch at the swapped index.
@@ -320,16 +288,16 @@ mod tests {
     }
 
     #[test]
-    fn with_cgroup_appends_and_loses_empty() {
-        let b = Backdrop::new().with_cgroup(CgroupDef::named("cg0"));
+    fn push_cgroup_populates_cgroups() {
+        let b = Backdrop::new().push_cgroup(CgroupDef::named("cg0"));
         assert_eq!(b.cgroups.len(), 1);
         assert_eq!(b.cgroups[0].name.as_ref(), "cg0");
         assert!(!b.is_empty());
     }
 
     #[test]
-    fn with_cgroups_appends_several() {
-        let b = Backdrop::new().with_cgroups([
+    fn extend_cgroups_preserves_input_order() {
+        let b = Backdrop::new().extend_cgroups([
             CgroupDef::named("cg0"),
             CgroupDef::named("cg1"),
             CgroupDef::named("cg2"),
@@ -355,9 +323,9 @@ mod tests {
     /// names were `["cg0", "cg1", ..., "cg6"]` (already sorted),
     /// a sort_by_name regression would be invisible.
     #[test]
-    fn with_cgroups_preserves_declaration_order_for_many_entries() {
+    fn extend_cgroups_preserves_declaration_order_for_many_entries() {
         const NAMES: [&str; 7] = ["cg5", "cg0", "cg3", "cg6", "cg1", "cg4", "cg2"];
-        let b = Backdrop::new().with_cgroups(NAMES.map(CgroupDef::named));
+        let b = Backdrop::new().extend_cgroups(NAMES.map(CgroupDef::named));
         assert_eq!(b.cgroups.len(), NAMES.len());
         for (i, expected) in NAMES.iter().enumerate() {
             assert_eq!(
@@ -369,39 +337,39 @@ mod tests {
     }
 
     #[test]
-    fn with_payload_appends() {
-        let b = Backdrop::new().with_payload(&TEST_PAYLOAD);
+    fn push_payload_populates_payloads() {
+        let b = Backdrop::new().push_payload(&TEST_PAYLOAD);
         assert_eq!(b.payloads.len(), 1);
         assert_eq!(b.payloads[0].name, "test_bin");
         assert!(!b.is_empty());
     }
 
     #[test]
-    fn with_payloads_extends_in_order() {
+    fn extend_payloads_preserves_order() {
         // Use TEST_PAYLOAD_2 in the second slot so the assertion
         // actually discriminates position — `[&TEST_PAYLOAD,
         // &TEST_PAYLOAD]` would assert `[test_bin, test_bin]`
         // regardless of order and let a `reverse()` regression pass.
-        let b = Backdrop::new().with_payloads([&TEST_PAYLOAD, &TEST_PAYLOAD_2]);
+        let b = Backdrop::new().extend_payloads([&TEST_PAYLOAD, &TEST_PAYLOAD_2]);
         assert_eq!(b.payloads.len(), 2);
         assert_eq!(b.payloads[0].name, "test_bin");
         assert_eq!(b.payloads[1].name, "test_bin_2");
     }
 
     /// Declaration order is preserved across a many-entry payload
-    /// batch. Sibling of `with_cgroups_preserves_declaration_order_for_many_entries`
+    /// batch. Sibling of `extend_cgroups_preserves_declaration_order_for_many_entries`
     /// — uses 7 fully-distinct payloads so any pairwise swap (including
     /// non-adjacent same-name swaps that an interleaved 2-distinct-payload
     /// pattern would miss) surfaces as a name mismatch at the swapped
     /// index. Catches arbitrary shuffle/sort/partition/reverse
     /// regressions across a larger collection than the 2-entry
-    /// `with_payloads_extends_in_order` can surface.
+    /// `extend_payloads_preserves_order` can surface.
     ///
     /// Inputs are deliberately non-monotonic in ASCII order of their
     /// `name` field so a regression that stably-sorts the input would
     /// produce a different sequence and trip the per-index assertion.
     #[test]
-    fn with_payloads_preserves_declaration_order_for_many_entries() {
+    fn extend_payloads_preserves_declaration_order_for_many_entries() {
         let inputs = [
             &TEST_PAYLOAD_5,
             &TEST_PAYLOAD,
@@ -420,7 +388,7 @@ mod tests {
             "test_bin_6",
             "test_bin_4",
         ];
-        let b = Backdrop::new().with_payloads(inputs);
+        let b = Backdrop::new().extend_payloads(inputs);
         assert_eq!(b.payloads.len(), expected.len());
         for (i, name) in expected.iter().enumerate() {
             assert_eq!(b.payloads[i].name, *name, "index {i} should be {name}");
@@ -428,14 +396,14 @@ mod tests {
     }
 
     #[test]
-    fn with_payloads_appends_after_with_payload() {
+    fn push_then_extend_preserves_order() {
         // Use distinct payload consts so the assertion can verify
-        // that the `with_payload` entry comes BEFORE the
-        // `with_payloads` entries — a regression that prepends
+        // that the `push_payload` entry comes BEFORE the
+        // `extend_payloads` entries — a regression that prepends
         // (instead of appends) would pass a count-only check.
         let b = Backdrop::new()
-            .with_payload(&TEST_PAYLOAD)
-            .with_payloads([&TEST_PAYLOAD_2]);
+            .push_payload(&TEST_PAYLOAD)
+            .extend_payloads([&TEST_PAYLOAD_2]);
         assert_eq!(b.payloads.len(), 2);
         assert_eq!(b.payloads[0].name, "test_bin");
         assert_eq!(b.payloads[1].name, "test_bin_2");
@@ -444,9 +412,9 @@ mod tests {
     #[test]
     fn chain_builds_in_order() {
         let b = Backdrop::new()
-            .with_cgroup(CgroupDef::named("cg_a"))
-            .with_payload(&TEST_PAYLOAD)
-            .with_cgroup(CgroupDef::named("cg_b"));
+            .push_cgroup(CgroupDef::named("cg_a"))
+            .push_payload(&TEST_PAYLOAD)
+            .push_cgroup(CgroupDef::named("cg_b"));
         assert_eq!(b.cgroups.len(), 2);
         assert_eq!(b.cgroups[0].name.as_ref(), "cg_a");
         assert_eq!(b.cgroups[1].name.as_ref(), "cg_b");
@@ -464,27 +432,27 @@ mod tests {
     }
 
     #[test]
-    fn with_op_appends_and_loses_empty() {
-        let b = Backdrop::new().with_op(Op::add_cgroup("empty_target"));
+    fn push_op_populates_ops() {
+        let b = Backdrop::new().push_op(Op::add_cgroup("empty_target"));
         assert_eq!(b.ops.len(), 1);
         assert!(matches!(&b.ops[0], Op::AddCgroup { name } if name.as_ref() == "empty_target"));
         assert!(!b.is_empty());
     }
 
     #[test]
-    fn with_ops_appends_several_in_order() {
-        let b = Backdrop::new().with_ops(vec![Op::add_cgroup("cg_1"), Op::add_cgroup("cg_1/sub")]);
+    fn extend_ops_preserves_order() {
+        let b = Backdrop::new().extend_ops(vec![Op::add_cgroup("cg_1"), Op::add_cgroup("cg_1/sub")]);
         assert_eq!(b.ops.len(), 2);
         assert!(matches!(&b.ops[0], Op::AddCgroup { name } if name.as_ref() == "cg_1"));
         assert!(matches!(&b.ops[1], Op::AddCgroup { name } if name.as_ref() == "cg_1/sub"));
     }
 
     #[test]
-    fn chain_with_op_interleaves_with_other_builders() {
+    fn chain_push_op_interleaves_with_other_builders() {
         let b = Backdrop::new()
-            .with_cgroup(CgroupDef::named("cg_workers"))
-            .with_op(Op::add_cgroup("cg_empty"))
-            .with_payload(&TEST_PAYLOAD);
+            .push_cgroup(CgroupDef::named("cg_workers"))
+            .push_op(Op::add_cgroup("cg_empty"))
+            .push_payload(&TEST_PAYLOAD);
         assert_eq!(b.cgroups.len(), 1);
         assert_eq!(b.ops.len(), 1);
         assert_eq!(b.payloads.len(), 1);

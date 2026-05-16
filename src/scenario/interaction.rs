@@ -16,12 +16,12 @@ use std::time::Duration;
 /// step-local CgroupDef and tears down at the step boundary.
 pub fn custom_cgroup_add_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     let backdrop = Backdrop::new()
-        .with_cgroup(
+        .push_cgroup(
             CgroupDef::named("cg_0")
                 .workers(1)
                 .work_type(WorkType::YieldHeavy),
         )
-        .with_cgroup(
+        .push_cgroup(
             CgroupDef::named("cg_1")
                 .workers(1)
                 .work_type(WorkType::YieldHeavy),
@@ -171,7 +171,7 @@ pub fn custom_cgroup_cpuset_overlap_imbalance_combined(ctx: &Ctx) -> Result<Asse
 /// All three cgroups persist for the scenario (the `MoveAllTasks`
 /// ops reference them by name across every Step), so they live in
 /// the [`Backdrop`]. `cg_1` is an empty move target declared via
-/// [`Backdrop::with_op`] so it never spawns its own workers — only
+/// [`Backdrop::push_op`] so it never spawns its own workers — only
 /// the `cg_mobile` handle ping-pongs between `cg_mobile` and
 /// `cg_1`. Workers that [`Op::MoveAllTasks`] transfers into a
 /// Backdrop cgroup retain their Backdrop ownership so the
@@ -181,9 +181,9 @@ pub fn custom_cgroup_no_ctrl_task_migration(ctx: &Ctx) -> Result<AssertResult> {
     // cg_1: empty move target (no workers). Exactly one handle participates
     // in MoveAllTasks.
     let backdrop = Backdrop::new()
-        .with_cgroup(ctx.cgroup_def("cg_0"))
-        .with_cgroup(ctx.cgroup_def("cg_mobile"))
-        .with_op(Op::add_cgroup("cg_1"));
+        .push_cgroup(ctx.cgroup_def("cg_0"))
+        .push_cgroup(ctx.cgroup_def("cg_mobile"))
+        .push_op(Op::add_cgroup("cg_1"));
 
     // Settle: let the Backdrop-spawned workers stabilize before the
     // first move.
@@ -220,13 +220,13 @@ pub fn custom_cgroup_no_ctrl_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     // cg_heavy: 6 permanent CPU-spin workers.
     // cg_light: 2 permanent bursty workers.
     // cg_mobile: 2 workers that ping-pong to cg_overflow.
-    // cg_overflow: empty move target declared via with_op so it never
+    // cg_overflow: empty move target declared via push_op so it never
     // spawns workers of its own — only the cg_mobile handle participates
     // in MoveAllTasks.
     let backdrop = Backdrop::new()
-        .with_cgroup(CgroupDef::named("cg_heavy").workers(6))
-        .with_cgroup(CgroupDef::named("cg_mobile").workers(2))
-        .with_cgroup(
+        .push_cgroup(CgroupDef::named("cg_heavy").workers(6))
+        .push_cgroup(CgroupDef::named("cg_mobile").workers(2))
+        .push_cgroup(
             CgroupDef::named("cg_light")
                 .workers(2)
                 .work_type(WorkType::bursty(
@@ -234,7 +234,7 @@ pub fn custom_cgroup_no_ctrl_imbalance(ctx: &Ctx) -> Result<AssertResult> {
                     Duration::from_millis(100),
                 )),
         )
-        .with_op(Op::add_cgroup("cg_overflow"));
+        .push_op(Op::add_cgroup("cg_overflow"));
 
     let mut steps = vec![Step::new(vec![], HoldSpec::fixed(ctx.settle))];
 
@@ -266,8 +266,8 @@ pub fn custom_cgroup_no_ctrl_imbalance(ctx: &Ctx) -> Result<AssertResult> {
 /// without per-step teardown removing them.
 pub fn custom_cgroup_no_ctrl_cpuset_change(ctx: &Ctx) -> Result<AssertResult> {
     let backdrop = Backdrop::new()
-        .with_cgroup(CgroupDef::named("cg_0").with_cpuset(CpusetSpec::disjoint(0, 2)))
-        .with_cgroup(CgroupDef::named("cg_1").with_cpuset(CpusetSpec::disjoint(1, 2)));
+        .push_cgroup(CgroupDef::named("cg_0").with_cpuset(CpusetSpec::disjoint(0, 2)))
+        .push_cgroup(CgroupDef::named("cg_1").with_cpuset(CpusetSpec::disjoint(1, 2)));
 
     let steps = vec![
         // Phase 1: hold the Backdrop's initial disjoint cpusets.

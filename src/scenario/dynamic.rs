@@ -28,8 +28,8 @@ pub fn custom_cgroup_add_midrun(ctx: &Ctx) -> Result<AssertResult> {
         .collect();
 
     let backdrop = Backdrop::new()
-        .with_cgroup(CgroupDef::named("cg_0"))
-        .with_cgroup(CgroupDef::named("cg_1"));
+        .push_cgroup(CgroupDef::named("cg_0"))
+        .push_cgroup(CgroupDef::named("cg_1"));
     let steps = vec![
         // Phase 1: settle with just the two steady cgroups.
         Step::new(vec![], ctx.settled_hold(0.5)),
@@ -60,7 +60,7 @@ pub fn custom_cgroup_remove_midrun(ctx: &Ctx) -> Result<AssertResult> {
 
     let mut backdrop = Backdrop::new();
     for &name in &cgroup_names[..half] {
-        backdrop = backdrop.with_cgroup(CgroupDef::named(name));
+        backdrop = backdrop.push_cgroup(CgroupDef::named(name));
     }
 
     let step0_defs: Vec<CgroupDef> = cgroup_names[half..n]
@@ -141,7 +141,7 @@ pub fn custom_cgroup_cpuset_add_remove(ctx: &Ctx) -> Result<AssertResult> {
         return Ok(AssertResult::skip("need >=4 CPUs"));
     }
 
-    let backdrop = Backdrop::new().with_cgroups([
+    let backdrop = Backdrop::new().extend_cgroups([
         CgroupDef::named("cg_0").with_cpuset(CpusetSpec::disjoint(0, 3)),
         CgroupDef::named("cg_1").with_cpuset(CpusetSpec::disjoint(1, 3)),
     ]);
@@ -166,7 +166,7 @@ pub fn custom_cgroup_cpuset_add_remove(ctx: &Ctx) -> Result<AssertResult> {
 /// the Backdrop. The mid-run `cg_2` appears in the second Step and
 /// tears down at the step boundary.
 pub fn custom_cgroup_add_during_imbalance(ctx: &Ctx) -> Result<AssertResult> {
-    let backdrop = Backdrop::new().with_cgroups([
+    let backdrop = Backdrop::new().extend_cgroups([
         CgroupDef::named("cg_0").workers(8),
         CgroupDef::named("cg_1")
             .workers(2)

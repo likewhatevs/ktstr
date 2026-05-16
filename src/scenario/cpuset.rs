@@ -10,8 +10,8 @@ use std::time::Duration;
 
 fn cgroup_cpuset_apply_midrun_backdrop() -> Backdrop {
     Backdrop::new()
-        .with_cgroup(CgroupDef::named("cg_0"))
-        .with_cgroup(CgroupDef::named("cg_1"))
+        .push_cgroup(CgroupDef::named("cg_0"))
+        .push_cgroup(CgroupDef::named("cg_1"))
 }
 
 fn cgroup_cpuset_apply_midrun_steps(ctx: &Ctx) -> Vec<Step> {
@@ -39,8 +39,8 @@ pub fn custom_cgroup_cpuset_apply_midrun(ctx: &Ctx) -> Result<AssertResult> {
 /// Clear disjoint cpusets from two cgroups mid-run.
 pub fn custom_cgroup_cpuset_clear_midrun(ctx: &Ctx) -> Result<AssertResult> {
     let backdrop = Backdrop::new()
-        .with_cgroup(CgroupDef::named("cg_0").with_cpuset(CpusetSpec::disjoint(0, 2)))
-        .with_cgroup(CgroupDef::named("cg_1").with_cpuset(CpusetSpec::disjoint(1, 2)));
+        .push_cgroup(CgroupDef::named("cg_0").with_cpuset(CpusetSpec::disjoint(0, 2)))
+        .push_cgroup(CgroupDef::named("cg_1").with_cpuset(CpusetSpec::disjoint(1, 2)));
 
     let steps = vec![
         Step::new(vec![], ctx.settled_hold(0.5)),
@@ -55,8 +55,8 @@ pub fn custom_cgroup_cpuset_clear_midrun(ctx: &Ctx) -> Result<AssertResult> {
 
 fn cgroup_cpuset_resize_backdrop() -> Backdrop {
     Backdrop::new()
-        .with_cgroup(CgroupDef::named("cg_0").with_cpuset(CpusetSpec::range(0.0, 0.5)))
-        .with_cgroup(CgroupDef::named("cg_1").with_cpuset(CpusetSpec::range(0.5, 1.0)))
+        .push_cgroup(CgroupDef::named("cg_0").with_cpuset(CpusetSpec::range(0.0, 0.5)))
+        .push_cgroup(CgroupDef::named("cg_1").with_cpuset(CpusetSpec::range(0.5, 1.0)))
 }
 
 fn cgroup_cpuset_resize_steps(ctx: &Ctx) -> Vec<Step> {
@@ -98,8 +98,8 @@ pub fn custom_cgroup_cpuset_swap_disjoint(ctx: &Ctx) -> Result<AssertResult> {
     }
 
     let backdrop = Backdrop::new()
-        .with_cgroup(CgroupDef::named("cg_0").with_cpuset(CpusetSpec::range(0.0, 0.5)))
-        .with_cgroup(CgroupDef::named("cg_1").with_cpuset(CpusetSpec::range(0.5, 1.0)));
+        .push_cgroup(CgroupDef::named("cg_0").with_cpuset(CpusetSpec::range(0.0, 0.5)))
+        .push_cgroup(CgroupDef::named("cg_1").with_cpuset(CpusetSpec::range(0.5, 1.0)));
 
     let steps = vec![
         Step::new(vec![], ctx.settled_hold(1.0 / 3.0)),
@@ -157,12 +157,12 @@ pub fn custom_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<AssertResult> 
     let narrow = CpusetSpec::exact([all[mid]]);
 
     let backdrop = Backdrop::new()
-        .with_cgroup(
+        .push_cgroup(
             CgroupDef::named("cg_0")
                 .with_cpuset(CpusetSpec::range(0.0, 0.5))
                 .workers(mid * 2),
         )
-        .with_cgroup(
+        .push_cgroup(
             CgroupDef::named("cg_1")
                 .with_cpuset(CpusetSpec::range(0.5, 1.0))
                 .workers(2)
@@ -198,8 +198,8 @@ pub fn custom_cgroup_cpuset_numa_swap(ctx: &Ctx) -> Result<AssertResult> {
     }
 
     let backdrop = Backdrop::new()
-        .with_cgroup(CgroupDef::named("cg_0").with_cpuset(CpusetSpec::numa(0)))
-        .with_cgroup(CgroupDef::named("cg_1").with_cpuset(CpusetSpec::numa(1)));
+        .push_cgroup(CgroupDef::named("cg_0").with_cpuset(CpusetSpec::numa(0)))
+        .push_cgroup(CgroupDef::named("cg_1").with_cpuset(CpusetSpec::numa(1)));
 
     let steps = vec![
         Step::new(vec![], ctx.settled_hold(0.5)),
@@ -218,12 +218,12 @@ pub fn custom_cgroup_cpuset_numa_swap(ctx: &Ctx) -> Result<AssertResult> {
 /// Disjoint cpusets where a light cgroup gets heavy load added mid-run.
 pub fn custom_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<AssertResult> {
     let backdrop = Backdrop::new()
-        .with_cgroup(
+        .push_cgroup(
             CgroupDef::named("cg_0")
                 .with_cpuset(CpusetSpec::disjoint(0, 2))
                 .workers(16),
         )
-        .with_cgroup(
+        .push_cgroup(
             CgroupDef::named("cg_1")
                 .with_cpuset(CpusetSpec::disjoint(1, 2))
                 .workers(1)

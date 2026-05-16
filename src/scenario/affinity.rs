@@ -18,8 +18,8 @@ use std::time::Duration;
 /// the four randomization Steps finds the same live workers.
 pub fn custom_cgroup_affinity_change(ctx: &Ctx) -> Result<AssertResult> {
     let backdrop = Backdrop::new()
-        .with_cgroup(CgroupDef::named("cg_0"))
-        .with_cgroup(CgroupDef::named("cg_1"));
+        .push_cgroup(CgroupDef::named("cg_0"))
+        .push_cgroup(CgroupDef::named("cg_1"));
     let mut steps = vec![Step::new(vec![], ctx.settled_hold(0.2))];
 
     // Pool the random sample across every CPU in the topology;
@@ -70,8 +70,8 @@ pub fn custom_cgroup_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     // correctness, not validation.
     let settle = ctx.settle.max(Duration::from_millis(500));
     let backdrop = Backdrop::new()
-        .with_cgroup(CgroupDef::named("cg_0"))
-        .with_cgroup(CgroupDef::named("cg_1"));
+        .push_cgroup(CgroupDef::named("cg_0"))
+        .push_cgroup(CgroupDef::named("cg_1"));
     let steps = vec![
         Step::new(vec![], HoldSpec::fixed(settle)),
         Step::new(
@@ -102,7 +102,7 @@ pub fn custom_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     // concentrates load and increases spread; relax the threshold.
     let checks = Assert::default_checks().max_spread_pct(75.0);
 
-    let backdrop = Backdrop::new().with_cgroups([
+    let backdrop = Backdrop::new().extend_cgroups([
         CgroupDef::named("cg_0").with_cpuset(CpusetSpec::disjoint(0, 2)),
         CgroupDef::named("cg_1").with_cpuset(CpusetSpec::disjoint(1, 2)),
     ]);

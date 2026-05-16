@@ -41,12 +41,12 @@ pub fn custom_nested_cgroup_steady(ctx: &Ctx) -> Result<AssertResult> {
 /// Step's `MoveAllTasks` resolve the target cgroup without the
 /// previous Step's teardown rmdir'ing it. Workers spawn inside
 /// `cg_0/sub` via [`CgroupDef`]; the empty peer cgroups go through
-/// [`Backdrop::with_ops`] so no implicit worker spawn happens
+/// [`Backdrop::extend_ops`] so no implicit worker spawn happens
 /// there.
 pub fn custom_nested_cgroup_task_move(ctx: &Ctx) -> Result<AssertResult> {
     let backdrop = Backdrop::new()
-        .with_cgroup(CgroupDef::named("cg_0/sub"))
-        .with_ops(vec![
+        .push_cgroup(CgroupDef::named("cg_0/sub"))
+        .extend_ops(vec![
             Op::add_cgroup("cg_0"),
             Op::add_cgroup("cg_1"),
             Op::add_cgroup("cg_1/sub"),
