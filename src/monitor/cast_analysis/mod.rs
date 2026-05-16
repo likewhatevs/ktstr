@@ -1303,11 +1303,11 @@ impl<'a> Analyzer<'a> {
         let proto = match self.btf.resolve_type_by_id(func_proto_id) {
             Ok(Type::FuncProto(fp)) => fp,
             Ok(Type::Func(f)) => match f.get_type_id() {
-                Ok(pid) => match self.btf.resolve_type_by_id(pid) {
+                Some(pid) => match self.btf.resolve_type_by_id(pid) {
                     Ok(Type::FuncProto(fp)) => fp,
                     _ => return,
                 },
-                Err(_) => return,
+                None => return,
             },
             _ => return,
         };
@@ -1327,7 +1327,7 @@ impl<'a> Analyzer<'a> {
             if param.is_variadic() {
                 break;
             }
-            let Ok(tid) = param.get_type_id() else {
+            let Some(tid) = param.get_type_id() else {
                 continue;
             };
             // Only `Ptr -> ... -> Struct/Union` parameters become
@@ -2075,7 +2075,7 @@ impl<'a> Analyzer<'a> {
                 match (size_bytes, resolved) {
                     // Ptr field directly -- BTF already typed.
                     (Some(8), Some(Type::Ptr(p))) => {
-                        if let Ok(pointee) = p.get_type_id()
+                        if let Some(pointee) = p.get_type_id()
                             && let Some(sid) =
                                 super::bpf_map::resolve_to_struct_id(self.btf, pointee)
                         {
@@ -2735,14 +2735,14 @@ impl<'a> Analyzer<'a> {
         // resolution is unified here rather than running twice.
         let (proto, func_name) = match self.btf.resolve_type_by_id(func_btf_id) {
             Ok(Type::Func(f)) => match f.get_type_id() {
-                Ok(pid) => match self.btf.resolve_type_by_id(pid) {
+                Some(pid) => match self.btf.resolve_type_by_id(pid) {
                     Ok(Type::FuncProto(fp)) => {
                         let name = self.btf.resolve_name(&f).ok();
                         (fp, name)
                     }
                     _ => return,
                 },
-                Err(_) => return,
+                None => return,
             },
             Ok(Type::FuncProto(fp)) => (fp, None),
             _ => return,
@@ -2828,7 +2828,7 @@ impl<'a> Analyzer<'a> {
                 continue;
             }
             let member_off = bit_off / 8;
-            let Ok(member_tid) = m.get_type_id() else {
+            let Some(member_tid) = m.get_type_id() else {
                 continue;
             };
             let Some(terminal) = super::btf_render::peel_modifiers(self.btf, member_tid) else {
@@ -3485,7 +3485,7 @@ fn index_aggregate_members(
         // `__aligned(64) struct { ... }` (which clang emits as a
         // typedef-or-modifier-wrapped anonymous struct) still
         // surfaces as Type::Struct here.
-        let Ok(member_tid) = m.get_type_id() else {
+        let Some(member_tid) = m.get_type_id() else {
             continue;
         };
         let Some(peeled) = super::btf_render::peel_modifiers(btf, member_tid) else {
@@ -3518,7 +3518,7 @@ fn cached_member_size(
     m: &btf_rs::Member,
     cache: &mut HashMap<u32, Option<u32>>,
 ) -> Option<u32> {
-    let tid = m.get_type_id().ok()?;
+    let tid = m.get_type_id()?;
     *cache
         .entry(tid)
         .or_insert_with(|| member_size_bytes(btf, m))
@@ -3534,7 +3534,7 @@ fn cached_member_size(
 /// `Some(16)` and the matcher simply finds no LDX access of that
 /// width to intersect against.
 fn member_size_bytes(btf: &Btf, m: &btf_rs::Member) -> Option<u32> {
-    let tid = m.get_type_id().ok()?;
+    let tid = m.get_type_id()?;
     let terminal = super::btf_render::peel_modifiers(btf, tid)?;
     super::btf_render::type_size(btf, &terminal).map(|s| s as u32)
 }
@@ -3637,7 +3637,7 @@ fn struct_member_at(btf: &Btf, parent_type_id: u32, byte_offset: u32) -> Option<
                     continue;
                 }
                 let member_off = bit_off / 8;
-                let member_type_id = m.get_type_id().ok()?;
+                let member_type_id = m.get_type_id()?;
                 if member_off == byte_offset {
                     if let Some(terminal) = super::btf_render::peel_modifiers(btf, member_type_id)
                         && matches!(terminal, Type::Struct(_) | Type::Union(_))
@@ -3655,7 +3655,7 @@ fn struct_member_at(btf: &Btf, parent_type_id: u32, byte_offset: u32) -> Option<
                 {
                     match &terminal {
                         Type::Array(arr) => {
-                            let elem_tid = arr.get_type_id().ok()?;
+                            let elem_tid = arr.get_type_id()?;
                             let elem_size = super::btf_render::type_size(btf, &{
                                 super::btf_render::peel_modifiers(btf, elem_tid)?
                             })? as u32;
@@ -3707,7 +3707,7 @@ fn struct_member_at(btf: &Btf, parent_type_id: u32, byte_offset: u32) -> Option<
                     Type::Var(v) => v,
                     _ => return None,
                 };
-                let var_underlying_type_id = var.get_type_id().ok()?;
+                let var_underlying_type_id = var.get_type_id()?;
                 let rel = byte_offset - off;
                 if let Some(terminal) =
                     super::btf_render::peel_modifiers(btf, var_underlying_type_id)
@@ -3852,7 +3852,7 @@ fn map_value_struct_id(btf: &Btf, datasec_id: u32, var_offset: u32) -> Option<u3
         Type::Var(v) => v,
         _ => return None,
     };
-    let var_type_id = var.get_type_id().ok()?;
+    let var_type_id = var.get_type_id()?;
 
     // Gate 3: the var's underlying type must peel to a
     // Struct/Union — that is the map descriptor C struct emitted
@@ -3896,13 +3896,13 @@ fn map_value_struct_id(btf: &Btf, datasec_id: u32, var_offset: u32) -> Option<u3
         // `resolve_to_struct_id` returns None, dropping the
         // resolution — the renderer's existing u64 plain-counter
         // path is the correct fallback for stat maps.
-        let mtype_id = member.get_type_id().ok()?;
+        let mtype_id = member.get_type_id()?;
         let mterminal = super::btf_render::peel_modifiers(btf, mtype_id)?;
         let ptr = match mterminal {
             Type::Ptr(p) => p,
             _ => return None,
         };
-        let pointee = ptr.get_type_id().ok()?;
+        let pointee = ptr.get_type_id()?;
         return super::bpf_map::resolve_to_struct_id(btf, pointee);
     }
     // No `value` member: map shapes that omit a value declaration

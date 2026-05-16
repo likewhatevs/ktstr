@@ -1047,7 +1047,7 @@ fn resolve_to_struct_with_id(btf: &btf_rs::Btf, type_id: u32) -> Option<(btf_rs:
             | btf_rs::Type::TypeTag(_)
             | btf_rs::Type::Restrict(_)
             | btf_rs::Type::DeclTag(_) => {
-                tid = t.as_btf_type()?.get_type_id().ok()?;
+                tid = t.as_btf_type()?.get_type_id()?;
             }
             _ => return None,
         }

@@ -705,7 +705,7 @@ fn build_fwd_index(btfs: &[Arc<Btf>]) -> HashMap<String, FwdIndexEntry> {
                         Type::Typedef(td) => {
                             if let Ok(td_name) = btf.resolve_name(td)
                                 && !td_name.is_empty()
-                                && let Ok(pid) = <dyn btf_rs::BtfType>::get_type_id(td)
+                                && let Some(pid) = <dyn btf_rs::BtfType>::get_type_id(td)
                                 && let Ok(Type::Struct(s)) = btf.resolve_type_by_id(pid)
                                 && btf.resolve_name(&s).map_or(true, |n| n.is_empty())
                             {

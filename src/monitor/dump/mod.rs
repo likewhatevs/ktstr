@@ -3536,7 +3536,7 @@ fn iter_bss_vars_with_type(btf: &Btf, section_name: &str) -> Vec<(String, usize,
             // The Var's type_id points to the variable's actual
             // type (e.g. struct scx_allocator). var_info.offset() is
             // the byte offset within the Datasec.
-            let Ok(type_id) = var.get_type_id() else {
+            let Some(type_id) = var.get_type_id() else {
                 continue;
             };
             out.push((name, var_info.offset() as usize, type_id));

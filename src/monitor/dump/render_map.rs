@@ -1373,7 +1373,7 @@ fn resolve_struct_ops_payload_type_id(btf: &Btf, wrapper_type_id: u32) -> Option
         // chains the BPF compiler emits for global variable types).
         // Peel modifiers via the chained type, then emit the type id
         // the renderer can use directly.
-        let raw_id = member.get_type_id().ok()?;
+        let raw_id = member.get_type_id()?;
         let chained = btf.resolve_type_by_id(raw_id).ok()?;
         let inner = peel_modifiers(btf, chained)?;
         // Re-derive the id of the peeled type. Peeling can hop

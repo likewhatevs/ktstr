@@ -38,15 +38,15 @@ crc32fast = "1.5"
 # baseline data is disposable; re-running tests regenerates the cache.
 bincode = { version = "2", features = ["serde"] }
 itoa = "1"
-gix = { version = "0.81", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation", "status", "revision"] }
+gix = { version = "0.83", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation", "status", "revision"] }
 reqwest = { version = "0.13", features = ["blocking"] }
 tar = "0.4"
 tempfile = "3"
 xz2 = { version = "0.1", features = ["static"] }
-opendal = { version = "0.55", default-features = false, features = ["services-ghac"] }
+opendal = { version = "0.56", default-features = false, features = ["services-ghac"] }
 tokio = { version = "1", features = ["rt"] }
 zstd = { version = "0.13", features = ["zstdmt"] }
-lz4_flex = { version = "0.12", features = ["frame"] }
+lz4_flex = { version = "0.13", features = ["frame"] }
 flate2 = "1"
 glob = "0.3"
 ctor = "0.8"
@@ -59,7 +59,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-btf-rs = "1.1.1"
+btf-rs = "2.0"
 kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
 kvm-ioctls = "0.24"
 libbpf-rs = { version = "0.26", features = ["vendored"] }
@@ -126,8 +126,8 @@ memchr = "2"
 # retain struct types that would otherwise be eliminated by inlining +
 # dead-code elimination. tree-sitter-c parses any C formatting without
 # regex fragility.
-tree-sitter = "0.24"
-tree-sitter-c = "0.23"
+tree-sitter = "0.26"
+tree-sitter-c = "0.24"
 # Human-readable duration parsing for the `--watch <interval>` flag on
 # `ktstr locks`. Accepts "100ms", "1s", "5m", "1h" forms per rev 5 §6.
 # Tiny crate (~2 modules, zero non-std deps).
@@ -141,7 +141,7 @@ rustix = { version = "1", features = ["fs", "shm", "system"] }
 # Derive macros for enum-level operations. `VariantNames` auto-generates
 # the list of variant names so `WorkType::ALL_NAMES` stays in lock-step
 # with the enum definition without a hand-maintained parallel table.
-strum = { version = "0.27", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
 # Levenshtein edit distance for the "did you mean?" suggestion in
 # `cli::show_thresholds`'s unknown-test-name error path. Already
 # present transitively via clap — promoting it to a direct dep makes
@@ -314,7 +314,7 @@ virtio-queue = { version = "0.17", features = ["test-utils"] }
 [build-dependencies]
 cc = "1"
 flate2 = "1"
-gix = { version = "0.81", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation"] }
+gix = { version = "0.83", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation"] }
 libbpf-cargo = "0.26"
 reqwest = { version = "0.13", features = ["blocking"] }
 # Stable hash for BTF content drift detection in build.rs.

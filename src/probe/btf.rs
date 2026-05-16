@@ -371,7 +371,7 @@ fn resolve_member_offset(
 fn resolve_type_size(btf: &btf_rs::Btf, member: &btf_rs::Member) -> Option<u32> {
     use btf_rs::{BtfType, Type};
 
-    let tid = member.get_type_id().ok()?;
+    let tid = member.get_type_id()?;
     let mut t = btf.resolve_type_by_id(tid).ok()?;
 
     for _ in 0..20 {
@@ -384,7 +384,7 @@ fn resolve_type_size(btf: &btf_rs::Btf, member: &btf_rs::Member) -> Option<u32> 
             Type::Union(ref u) => return Some(u.size() as u32),
             Type::Array(ref a) => {
                 // For array access like bits[0], return element size.
-                let elem_tid = a.get_type_id().ok()?;
+                let elem_tid = a.get_type_id()?;
                 let elem = btf.resolve_type_by_id(elem_tid).ok()?;
                 match elem {
                     Type::Int(ref i) => return Some(i.size() as u32),
@@ -410,7 +410,7 @@ fn resolve_type_size(btf: &btf_rs::Btf, member: &btf_rs::Member) -> Option<u32> 
 fn follow_to_struct_or_union(btf: &btf_rs::Btf, member: &btf_rs::Member) -> Option<btf_rs::Struct> {
     use btf_rs::{BtfType, Type};
 
-    let tid = member.get_type_id().ok()?;
+    let tid = member.get_type_id()?;
     let mut t = btf.resolve_type_by_id(tid).ok()?;
 
     for _ in 0..20 {
@@ -448,7 +448,7 @@ fn resolve_pointed_struct(
             .unwrap_or(false)
     })?;
 
-    let tid = member.get_type_id().ok()?;
+    let tid = member.get_type_id()?;
     crate::monitor::bpf_map::resolve_to_struct(btf, tid)
 }
 
@@ -1606,8 +1606,8 @@ fn discover_vmlinux_struct_fields(
         };
 
         let member_tid = match member.get_type_id() {
-            Ok(tid) => tid,
-            Err(_) => continue,
+            Some(tid) => tid,
+            None => continue,
         };
 
         if let Some(class) = classify_vmlinux_member(btf, member_tid) {

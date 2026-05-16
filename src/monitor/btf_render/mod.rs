@@ -1991,7 +1991,7 @@ fn render_value_inner(
                     None
                 }
                 ChaseGate::Proceed => mem.and_then(|m| {
-                    let pointee_type_id = ptr.get_type_id().ok()?;
+                    let pointee_type_id = ptr.get_type_id()?;
                     if m.is_arena_addr(val) {
                         // Arena chase factored into the shared
                         // helper so this arm and
@@ -2189,7 +2189,7 @@ fn render_value_inner(
             // element's *Type* (used for size) does need a chained
             // resolve.
             let len = arr.len();
-            let Ok(elem_type_id) = arr.get_type_id() else {
+            let Some(elem_type_id) = arr.get_type_id() else {
                 return RenderedValue::Unsupported {
                     reason: "array element type id not resolvable".to_string(),
                 };
@@ -2279,7 +2279,7 @@ fn render_value_inner(
             // its own — render its referent against the supplied
             // bytes. A failed type-id lookup falls back to
             // Unsupported rather than panicking.
-            let Ok(inner_id) = var.get_type_id() else {
+            let Some(inner_id) = var.get_type_id() else {
                 return RenderedValue::Unsupported {
                     reason: "var type id not resolvable".to_string(),
                 };
@@ -2299,6 +2299,9 @@ fn render_value_inner(
         | Type::TypeTag(_)
         | Type::DeclTag(_) => RenderedValue::Unsupported {
             reason: "unpeeled modifier (BTF cycle?)".to_string(),
+        },
+        _ => RenderedValue::Unsupported {
+            reason: format!("unhandled BTF type kind for type id {peeled_type_id}"),
         },
     }
 }
@@ -2592,8 +2595,8 @@ fn render_datasec(
         };
         let var_name = btf.resolve_name(&var).unwrap_or_default();
         let inner_id = match var.get_type_id() {
-            Ok(id) => id,
-            Err(_) => {
+            Some(id) => id,
+            None => {
                 members.push(RenderedMember {
                     name: var_name,
                     value: RenderedValue::Unsupported {
@@ -2674,7 +2677,7 @@ fn render_member(
     visited: &mut HashSet<u64>,
 ) -> RenderedValue {
     let bit_off = m.bit_offset() as usize;
-    let Ok(member_type_id) = m.get_type_id() else {
+    let Some(member_type_id) = m.get_type_id() else {
         return RenderedValue::Unsupported {
             reason: "member has no type id".to_string(),
         };
@@ -2730,7 +2733,7 @@ fn render_member(
 
     if let Some(parent) = parent_type_id
         && let Type::Array(arr) = &member_ty
-        && let (Ok(elem_tid), Some(elem_size)) = (
+        && let (Some(elem_tid), Some(elem_size)) = (
             arr.get_type_id(),
             peel_modifiers(btf, arr.get_type_id().unwrap_or(0)).and_then(|t| type_size(btf, &t)),
         )
@@ -4406,14 +4409,14 @@ pub(crate) fn peel_modifiers_with_id(btf: &Btf, mut type_id: u32) -> Option<(Typ
     for _ in 0..MAX_MODIFIER_DEPTH {
         let ty = btf.resolve_type_by_id(type_id).ok()?;
         match &ty {
-            Type::Volatile(t) => type_id = t.get_type_id().ok()?,
-            Type::Const(t) => type_id = t.get_type_id().ok()?,
-            Type::Restrict(t) => type_id = t.get_type_id().ok()?,
-            Type::Typedef(t) => type_id = t.get_type_id().ok()?,
-            Type::TypeTag(t) => type_id = t.get_type_id().ok()?,
+            Type::Volatile(t) => type_id = t.get_type_id()?,
+            Type::Const(t) => type_id = t.get_type_id()?,
+            Type::Restrict(t) => type_id = t.get_type_id()?,
+            Type::Typedef(t) => type_id = t.get_type_id()?,
+            Type::TypeTag(t) => type_id = t.get_type_id()?,
             // DeclTag doesn't change the underlying type, just adds
             // metadata; peel through it too.
-            Type::DeclTag(t) => type_id = t.get_type_id().ok()?,
+            Type::DeclTag(t) => type_id = t.get_type_id()?,
             _ => return Some((ty, type_id)),
         }
     }
@@ -4435,7 +4438,7 @@ pub(crate) fn type_size(btf: &Btf, ty: &Type) -> Option<usize> {
         Type::Ptr(_) => Some(8),
         Type::Array(arr) => {
             let len = arr.len();
-            let elem_peeled = peel_modifiers(btf, arr.get_type_id().ok()?)?;
+            let elem_peeled = peel_modifiers(btf, arr.get_type_id()?)?;
             let elem_size = type_size(btf, &elem_peeled)?;
             Some(len * elem_size)
         }
@@ -4443,7 +4446,11 @@ pub(crate) fn type_size(btf: &Btf, ty: &Type) -> Option<usize> {
             let inner = btf.resolve_chained_type(t).ok()?;
             type_size(btf, &inner)
         }
-        Type::Typedef(t) | Type::TypeTag(t) => {
+        Type::Typedef(t) => {
+            let inner = btf.resolve_chained_type(t).ok()?;
+            type_size(btf, &inner)
+        }
+        Type::TypeTag(t) => {
             let inner = btf.resolve_chained_type(t).ok()?;
             type_size(btf, &inner)
         }
