@@ -7,7 +7,10 @@
 > delay accounting per thread), see the
 > [ctprof reference](../reference/ctprof.md) and the
 > [Diagnose a Slow Scheduler with ctprof](diagnose-slow-scheduler.md)
-> recipe.
+> recipe. For **scheduler-behavior diffs between branches**
+> (per-metric scheduler measurements via `cargo ktstr stats
+> compare` on two `#[ktstr_test]` runs against different worktrees),
+> see [A/B Compare Branches](ab-compare.md).
 
 When a gauntlet run passes on one machine and fails on another —
 or passes on Monday and fails on Wednesday — the first thing to

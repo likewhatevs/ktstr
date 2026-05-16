@@ -24,10 +24,20 @@ let mut handle = WorkloadHandle::spawn(&config)?;
 
 Set only the fields that matter for the test and let
 `..Default::default()` fill in the rest. The spread-default form is the
-canonical style in the ktstr codebase — it keeps examples pinned to
+canonical style for `WorkloadConfig` — it keeps examples pinned to
 intent (`num_workers`, `work_type`) and has already absorbed additions
 to `WorkloadConfig` (the NUMA memory-policy fields) without rotting.
 Consult the `WorkloadConfig` rustdoc for the current field list.
+
+The spread-default pattern is safe for `WorkloadConfig` specifically
+because its `Default::default()` produces a known-good single-worker
+`SpinWait` baseline that runs without further setup. Do NOT extrapolate
+this guidance to every ktstr type without checking each type's
+`Default` semantics — some have known footguns (e.g. `CgroupDef::default()`
+produces `name = "cg_0"` which collides with the conventional first
+cgroup name in most scenarios). Prefer the named constructors
+(`CgroupDef::named(...)`, `Setup::defs(...)`, etc.) for types where the
+`Default` is not unambiguously useful.
 
 `spawn()` forks `num_workers` child processes. Each child installs a
 SIGUSR1 handler, then blocks on a pipe waiting for the start signal.

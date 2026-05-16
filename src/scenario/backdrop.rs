@@ -59,6 +59,29 @@ use crate::test_support::Payload;
 /// runtime skips the Backdrop setup phase entirely when every vec
 /// is empty.
 ///
+/// # `Clone` and cgroup-name collisions
+///
+/// `Backdrop` derives [`Clone`], so a test can copy a base Backdrop
+/// and attach the copies to different scenarios. **Do not pass a
+/// cloned Backdrop into a sibling scenario in the same process /
+/// VM without rewriting the cgroup names first.** Every cgroup in
+/// `cgroups` is created at the same path
+/// (`/sys/fs/cgroup/<parent>/<name>`); two scenarios both calling
+/// `setup` on a Backdrop with the same names silently share the
+/// cgroup's tasks and counters — the second `setup` finds the path
+/// already exists, skips `mkdir`, and attaches its workers alongside
+/// the first scenario's. No `EEXIST` surfaces (the kernel-level
+/// `mkdir(2)` race is absorbed by `std::fs::create_dir_all`), so
+/// diagnose by unexpected `cgroup.procs` task counts or doubled
+/// metric counters rather than a returned error. A typical safe
+/// shape is
+/// `base.clone().rename_cgroups(|n| format!("{n}_{idx}"))` (caller-
+/// provided helper) before attaching to scenario `idx`. The clone
+/// derive is provided for builder-style composition (forking a
+/// base, then conditionally appending entries) where the resulting
+/// Backdrop is attached to ONE scenario — sibling-scenario use
+/// requires the rename pass.
+///
 /// # Example
 ///
 /// ```no_run

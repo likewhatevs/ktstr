@@ -16,8 +16,9 @@ The shape is two-stage:
    `ratio_within`).
 
 Each pattern records [`DetailKind::Temporal`](#failure-rendering)
-details on the `Verdict` when a sample violates the invariant, and
-records `Note`s when projection errors leave a coverage gap.
+details on the [`Verdict`](../concepts/checking.md#verdict-the-claim-accumulator)
+when a sample violates the invariant, and records `Note`s when
+projection errors leave a coverage gap.
 
 For how to enable periodic capture and drain the bridge, see
 [Periodic Capture](periodic-capture.md). This page covers the

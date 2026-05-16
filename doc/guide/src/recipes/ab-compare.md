@@ -1,5 +1,15 @@
 # A/B Compare Branches
 
+> **Disambiguation**: this recipe covers **scheduler-behavior diffs
+> between branches** (per-metric scheduler-driven measurements via
+> `cargo ktstr stats compare` on two runs). For **host-context
+> diffs** (kernel build, CPU model, sched_\* tunables, NUMA layout
+> between machines or over time), see
+> [Capture and Compare Host State](host-state.md). Both recipes
+> invoke `cargo ktstr stats compare`; this recipe drives it via two
+> branch worktrees, the host-state recipe drives it via two
+> `show-host` snapshots.
+
 Compare scheduler behavior between two branches by running the
 same `#[ktstr_test]` suite against each, then using
 `cargo ktstr stats compare` to diff per-metric results with

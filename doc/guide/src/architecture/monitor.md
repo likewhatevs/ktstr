@@ -7,7 +7,11 @@ the scheduler under test.
 ## What it reads
 
 The monitor resolves kernel structure offsets via BTF (BPF Type Format)
-from the guest kernel. It reads per-CPU runqueue structures to extract:
+from the guest kernel. Sources break into two hierarchy levels.
+
+### Per-CPU runqueue
+
+The monitor reads per-CPU runqueue structures to extract:
 
 - `nr_running` -- number of runnable tasks on each CPU
 - `scx_nr_running` -- tasks managed by the sched_ext scheduler
@@ -24,20 +28,25 @@ When `CONFIG_SCHEDSTATS` is enabled, the monitor also reads per-CPU
 `struct rq` schedstat fields (run_delay, pcount, sched_count,
 ttwu_count, etc.).
 
+### Per sched_domain level
+
 The monitor walks the `struct sched_domain` tree whenever BTF
 contains `rq->sd` and `struct sched_domain` — no `CONFIG_SCHEDSTATS`
 required. Domain tree walking starts at `rq->sd` (lowest level) and
 follows `sd->parent` pointers up to the root. Each domain level
-provides topology metadata (level, name, flags, span_weight) and
-runtime fields (balance_interval, nr_balance_failed,
-max_newidle_lb_cost) and optional fields (newidle_call,
-newidle_success, newidle_ratio — added in 7.0, backported to
-6.18.5+ and 6.12.65+; absent on 6.16-6.18.4). When
-`CONFIG_SCHEDSTATS` is also enabled, each
-domain additionally provides load balancing stats: `lb_count`,
-`lb_failed`, `lb_balanced`, `alb_pushed`, `ttwu_wake_remote`, and
-other counters indexed by idle type (`CPU_NOT_IDLE`, `CPU_IDLE`,
-`CPU_NEWLY_IDLE`).
+provides:
+
+- Topology metadata: `level`, `name`, `flags`, `span_weight`.
+- Runtime fields: `balance_interval`, `nr_balance_failed`,
+  `max_newidle_lb_cost`.
+- Optional fields: `newidle_call`, `newidle_success`,
+  `newidle_ratio` — added in 7.0, backported to 6.18.5+ and
+  6.12.65+; absent on 6.16-6.18.4.
+
+When `CONFIG_SCHEDSTATS` is also enabled, each domain additionally
+provides load-balancing stats: `lb_count`, `lb_failed`, `lb_balanced`,
+`alb_pushed`, `ttwu_wake_remote`, and other counters indexed by idle
+type (`CPU_NOT_IDLE`, `CPU_IDLE`, `CPU_NEWLY_IDLE`).
 
 ## Sampling
 
