@@ -179,27 +179,25 @@ impl KernelId {
             KernelId::Range { start, end } => {
                 let start_key = decompose_version_for_compare(start).ok_or_else(|| {
                     format!(
-                        "kernel range start `{start}` is not a parseable version \
-                         (version components must fit u64). Direct callers that \
-                         construct `KernelId::Range` outside `KernelId::parse` are \
-                         responsible for endpoint validity; the parser admits a \
-                         strict subset.",
+                        "kernel range start `{start}` is not a parseable version. \
+                         Expected `MAJOR.MINOR[.PATCH][-rc<num>]` (e.g. \"6.10\", \
+                         \"6.14.2\", \"6.15-rc3\"). Range examples: `6.10..6.15`, \
+                         `6.10-rc1..=6.10`.",
                     )
                 })?;
                 let end_key = decompose_version_for_compare(end).ok_or_else(|| {
                     format!(
-                        "kernel range end `{end}` is not a parseable version \
-                         (version components must fit u64). Direct callers that \
-                         construct `KernelId::Range` outside `KernelId::parse` are \
-                         responsible for endpoint validity; the parser admits a \
-                         strict subset.",
+                        "kernel range end `{end}` is not a parseable version. \
+                         Expected `MAJOR.MINOR[.PATCH][-rc<num>]` (e.g. \"6.10\", \
+                         \"6.14.2\", \"6.15-rc3\"). Range examples: `6.10..6.15`, \
+                         `6.10-rc1..=6.10`.",
                     )
                 })?;
                 if start_key > end_key {
                     return Err(format!(
                         "inverted kernel range `{start}..{end}`: start version is greater \
-                         than end version. Swap the endpoints (`{end}..{start}`) or omit \
-                         the range to pass a single version.",
+                         than end version. Swap the endpoints (`{end}..{start}`) or use \
+                         a single version (no range) to test just one release.",
                     ));
                 }
                 Ok(())

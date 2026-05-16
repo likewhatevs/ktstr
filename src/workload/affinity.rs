@@ -249,18 +249,36 @@ pub(crate) fn sched_getcpu() -> usize {
 /// an unchecked `0` through.
 pub fn set_thread_affinity(pid: libc::pid_t, cpus: &BTreeSet<usize>) -> Result<()> {
     use nix::sched::{CpuSet, sched_setaffinity};
-    use nix::unistd::Pid;
+    use nix::unistd::{Pid, SysconfVar, sysconf};
     // See `set_sched_policy` for the rationale — pid <= 0 has
     // broadcast semantics at the syscall and must not be passed
     // through unchecked.
     if pid <= 0 {
         anyhow::bail!("sched_setaffinity: invalid pid {pid} (must be > 0)");
     }
+    // Snapshot the host's online-CPU count and the cpu_set bitmap
+    // width before the loop so the diagnostic on overflow carries
+    // both numbers without re-syscalling per offending CPU. Render
+    // sysconf failure as "unavailable" rather than 0 to disambiguate
+    // a degenerate sysconf result from a legitimately zero count.
+    let online_cpus_str: std::borrow::Cow<'static, str> =
+        match sysconf(SysconfVar::_NPROCESSORS_ONLN).ok().flatten() {
+            Some(n) => format!("{n}").into(),
+            None => "unavailable".into(),
+        };
+    let cpuset_bitmap_width: usize = libc::CPU_SETSIZE as usize;
     let mut cpu_set = CpuSet::new();
     for &cpu in cpus {
-        cpu_set
-            .set(cpu)
-            .with_context(|| format!("CPU {cpu} out of range"))?;
+        cpu_set.set(cpu).with_context(|| {
+            format!(
+                "CPU {cpu} out of range: cpu_set bitmap holds CPU IDs \
+                 0..{cpuset_bitmap_width} (libc CPU_SETSIZE) and host \
+                 reports {online_cpus_str} online CPUs (sysconf \
+                 _SC_NPROCESSORS_ONLN). Either the cpuset spec was \
+                 resolved against a stale topology or the bitmap cap \
+                 needs raising on this build."
+            )
+        })?;
     }
     sched_setaffinity(Pid::from_raw(pid), &cpu_set)
         .with_context(|| format!("sched_setaffinity pid={pid}"))?;

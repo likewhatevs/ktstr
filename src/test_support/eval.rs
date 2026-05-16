@@ -2731,7 +2731,15 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, Resol
         }
         SchedulerSpec::Path(p) => {
             let path = PathBuf::from(p);
-            anyhow::ensure!(path.exists(), "scheduler not found: {p}");
+            anyhow::ensure!(
+                path.exists(),
+                "scheduler binary at '{p}' does not exist on disk. \
+                 SchedulerSpec::Path treats its argument as an \
+                 already-built binary — build the scheduler first \
+                 (e.g. cargo build -p scx_<name>) and pass its \
+                 target/debug/scx_<name> path, or correct the path if \
+                 it has shifted."
+            );
             Ok((Some(path), ResolveSource::EnvVar))
         }
         SchedulerSpec::Discover(name) => {

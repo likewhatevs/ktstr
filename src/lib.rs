@@ -1039,7 +1039,16 @@ pub fn build_and_find_binary(package: &str) -> anyhow::Result<std::path::PathBuf
             return Ok(std::path::PathBuf::from(path));
         }
     }
-    anyhow::bail!("no binary artifact found for package '{package}'")
+    anyhow::bail!(
+        "no binary artifact found for package '{package}' — cargo build \
+         succeeded but no compiler-artifact JSON line declared a [[bin]] \
+         target. Two common causes: (1) the package has no [[bin]] target \
+         (library-only, or only [[example]] / [[bench]] targets); (2) the \
+         cargo --message-format=json output shape changed and the \
+         artifact walker missed the matching line. Run `cargo build -p \
+         {package} --message-format=json` and check for a `compiler-artifact` \
+         line with `\"target\":{{\"kind\":[\"bin\"],...}}` to confirm."
+    )
 }
 
 /// Resolve the current executable path, falling back to `/proc/self/exe`
