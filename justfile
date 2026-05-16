@@ -23,6 +23,19 @@ kernel-build version="":
 test kernel:
     cargo run --bin cargo-ktstr -- ktstr test --kernel {{kernel}} -- --profile ci --features integration -j $(( $(nproc) * 5 ))
 
+# Run trybuild compile_fail fixtures in serial mode.
+#
+# Trybuild's per-fixture `cargo build` calls share target/ with
+# neighbour tests under parallel exec; a concurrent build can leave
+# stale dep artifacts that let a fixture compile cleanly when it
+# should fail. Serial (-j 1) eliminates the race. Separate recipe
+# from `just test` keeps the fast lane parallel.
+#
+# Regenerate snapshots after intentional diagnostic changes:
+#   TRYBUILD=overwrite just compile-fail
+compile-fail:
+    cargo nextest run --profile ci -E 'test(compile_fail)' --run-ignored all -j 1
+
 # Run coverage
 coverage:
     cargo run --bin cargo-ktstr -- ktstr coverage -- --profile ci --lcov --output-path lcov.info --features integration --exclude-from-report scx-ktstr

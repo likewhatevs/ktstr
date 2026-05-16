@@ -29,6 +29,15 @@ jobs:
       - uses: ./.github/actions/setup
       - run: just lint
 
+  compile-fail:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup
+        with:
+          tools: cargo-nextest
+      - run: just compile-fail
+
   test-x64:
     runs-on: [ktstr-x64]
     strategy:
