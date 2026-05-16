@@ -99,6 +99,41 @@ fn explicit_empty_kernels_equals_default() {
     assert!(DECLARE_SCHEDULER_EXPLICIT_EMPTY.kernels.is_empty());
 }
 
+// -- constraints accept `..Self::new()` const-fn-constructor spread --
+//
+// Modern Rust promotes the trivially-Copy temporary returned by a
+// `const fn` constructor, so `..TopologyConstraints::new()` is a
+// valid spread base in a `pub static`. The macro's const-eligibility
+// heuristic accepts the shape; if the called fn isn't `const fn`,
+// rustc surfaces a clean E0015 at the spread site. This declaration
+// pins that the macro accepts the shape — compiling proves it.
+
+declare_scheduler!(DECLARE_SCHEDULER_CONSTRAINTS_NEW, {
+    name = "declare_scheduler_constraints_new",
+    binary = "scx-cnew",
+    constraints = TopologyConstraints {
+        max_cpus: Some(96),
+        ..TopologyConstraints::new()
+    },
+});
+
+#[test]
+fn constraints_accepts_const_fn_new_spread() {
+    assert_eq!(
+        DECLARE_SCHEDULER_CONSTRAINTS_NEW.constraints.max_cpus,
+        Some(96)
+    );
+    // Default field values flow through from ::new() spread.
+    assert_eq!(
+        DECLARE_SCHEDULER_CONSTRAINTS_NEW.constraints.min_numa_nodes,
+        TopologyConstraints::DEFAULT.min_numa_nodes
+    );
+    assert_eq!(
+        DECLARE_SCHEDULER_CONSTRAINTS_NEW.constraints.max_llcs,
+        TopologyConstraints::DEFAULT.max_llcs
+    );
+}
+
 // -- missing-docs suppression --
 //
 // With `#![deny(missing_docs)]` at the crate root above, every

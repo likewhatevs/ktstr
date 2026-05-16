@@ -300,14 +300,26 @@ impl TopologyConstraints {
     /// -nosmt variants). Test authors that want broader coverage must
     /// raise `max_numa_nodes`, `max_llcs`, or `max_cpus` explicitly.
     ///
-    /// Single source of truth — struct-literal form (not
-    /// `Self::new()`) so that `..TopologyConstraints::DEFAULT` works
-    /// in `static` / `const` initializers. Rust forbids
-    /// `..fn_call()` spreads in statics (E0493, destructor of the
-    /// temporary cannot be evaluated at compile-time); a promoted
-    /// struct literal bypasses the temporary. [`Self::new()`] and
-    /// `Default::default()` delegate to this const for the
-    /// `const fn` / trait-impl entry points.
+    /// The canonical const handle — use directly when you need an
+    /// explicit const binding (`pub const X: TopologyConstraints =
+    /// TopologyConstraints::DEFAULT;`). For struct-literal spread in
+    /// a `static` / `const` initializer, either form works (modern
+    /// Rust promotes the trivially-Copy temporary returned by the
+    /// const-fn constructor):
+    ///
+    /// ```ignore
+    /// pub static A: TopologyConstraints = TopologyConstraints {
+    ///     min_llcs: 4,
+    ///     ..TopologyConstraints::DEFAULT  // const path
+    /// };
+    /// pub static B: TopologyConstraints = TopologyConstraints {
+    ///     min_llcs: 4,
+    ///     ..TopologyConstraints::new()    // const-fn constructor
+    /// };
+    /// ```
+    ///
+    /// [`Self::new()`] and `Default::default()` delegate to this const
+    /// for the `const fn` / trait-impl entry points.
     pub const DEFAULT: Self = Self {
         min_numa_nodes: 1,
         max_numa_nodes: Some(1),
@@ -318,11 +330,12 @@ impl TopologyConstraints {
         max_cpus: Some(192),
     };
 
-    /// Build the default constraints. Equivalent to
-    /// [`Self::DEFAULT`]; use the const directly when spreading in a
-    /// `static` / `const` initializer (Rust E0493 forbids
-    /// `..Self::new()` there). `Default::default()` is also
-    /// equivalent in non-const contexts.
+    /// Build the default constraints. Equivalent to [`Self::DEFAULT`].
+    /// Either form works for struct-literal spread in `static` /
+    /// `const`: `..Self::DEFAULT` (const path) or `..Self::new()`
+    /// (const-fn constructor — modern Rust promotes the trivially-Copy
+    /// temporary). `Default::default()` is the trait-impl entry point
+    /// for non-const contexts.
     pub const fn new() -> Self {
         Self::DEFAULT
     }
@@ -990,10 +1003,15 @@ impl KtstrTestEntry {
     /// [`Self::DEFAULT`] is the source of truth (struct-literal
     /// const); [`Self::new()`] is a delegating alias for method-style
     /// use and `Default::default()` is the trait-shim — both
-    /// equivalent in non-const contexts. See the alias's docstring
-    /// for the Rust E0493 constraint that forces the const surface
-    /// for `static` / `const` initializer spread sites like
-    /// `#[distributed_slice(KTSTR_TESTS)]` macro expansions.
+    /// equivalent in non-const contexts. The const surface is
+    /// load-bearing at `static` / `const` initializer spread sites
+    /// (e.g. `#[distributed_slice(KTSTR_TESTS)]` macro expansions):
+    /// `..Self::new()` fails there with E0493 ("destructor of T
+    /// cannot be evaluated at compile-time") because KtstrTestEntry
+    /// carries non-trivially-Drop fields (notably `disk: Option<DiskConfig>`,
+    /// where `DiskConfig::name: Option<String>` brings in String's
+    /// heap deallocator). `..Self::DEFAULT` bypasses the temporary
+    /// entirely since the struct-literal const is promoted directly.
     ///
     /// ```
     /// use ktstr::prelude::*;
@@ -1048,8 +1066,15 @@ impl KtstrTestEntry {
 
     /// Build the default entry. Equivalent to [`Self::DEFAULT`]; use
     /// the const directly when spreading in a `static` / `const`
-    /// initializer (Rust E0493 forbids `..Self::new()` there).
-    /// `Default::default()` is also equivalent in non-const contexts.
+    /// initializer — `..Self::new()` fails there with E0493
+    /// ("destructor of T cannot be evaluated at compile-time")
+    /// because KtstrTestEntry carries non-trivially-Drop fields
+    /// (notably `disk: Option<DiskConfig>`, where `DiskConfig::name:
+    /// Option<String>` brings in String's heap deallocator), and
+    /// the temporary returned by `new()` would need to be dropped
+    /// at const-eval time. `..Self::DEFAULT` (a promoted struct
+    /// literal) bypasses the temporary. `Default::default()` is
+    /// equivalent to both in non-const contexts.
     pub const fn new() -> Self {
         Self::DEFAULT
     }

@@ -1,4 +1,4 @@
-error: declare_scheduler!: invalid kernel spec `6.20..6.14`: inverted kernel range `6.20..6.14`: start version is greater than end version. Swap the endpoints (`6.14..6.20`) or omit the range to pass a single version.
+error: declare_scheduler!: invalid kernel spec `6.20..6.14`: inverted kernel range `6.20..6.14`: start version is greater than end version. Swap the endpoints (`6.14..6.20`) or use a single version (no range) to test just one release.
   --> tests/compile_fail/declare_scheduler_kernels_inverted_range.rs:11:16
    |
 11 |     kernels = ["6.20..6.14"],

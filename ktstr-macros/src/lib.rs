@@ -2356,6 +2356,14 @@ fn declare_scheduler_inner(
                 //   - `TopologyConstraints { ..TopologyConstraints::DEFAULT }`
                 //     (struct literal — the canonical form, used by
                 //     every in-tree call site)
+                //   - `TopologyConstraints { ..TopologyConstraints::new() }`
+                //     or `..TopologyConstraints::default()` (struct
+                //     literal spreading a const-fn constructor — modern
+                //     Rust promotes the temporary when the return type
+                //     is trivially-Drop; if the called fn isn't `const
+                //     fn`, rustc surfaces a clean E0015 at the spread
+                //     site; if the returned type has non-trivial Drop
+                //     fields, rustc surfaces a clean E0493 instead)
                 //   - `TopologyConstraints::DEFAULT` (path expression
                 //     — bare DEFAULT or any other `const` path)
                 //   - `( … )` (parenthesized const-eligible expression
@@ -2363,8 +2371,11 @@ fn declare_scheduler_inner(
                 //     who wraps for clarity is not punished)
                 //   - reference / unary on top of any accepted form
                 //
-                // Calls and method chains are rejected with a hint
-                // describing the const-eligible alternatives.
+                // Free-helper calls (`build_helper()`) and unrecognized
+                // lowercase methods are rejected with a hint describing
+                // the const-eligible alternatives. Method chains are
+                // rejected outright in this mode (the canonical pattern
+                // is struct literal or const path, not chained setters).
                 validate_const_eligible(
                     &value,
                     "constraints",
@@ -3005,7 +3016,7 @@ fn validate_const_eligible(
         },
         syn::Expr::Call(call) => match mode {
             ConstEligibility::StructLiteralOnly => {
-                if call_func_is_pascal_constructor(&call.func) {
+                if call_func_looks_const_eligible_constructor(&call.func) {
                     for arg in &call.args {
                         recurse(arg)?;
                     }
@@ -3045,23 +3056,53 @@ fn validate_const_eligible(
     }
 }
 
-/// Heuristic: does this call expression look like a tuple-struct
-/// or enum-variant constructor (`Some(x)`, `MyVariant(x)`,
-/// `Foo::Bar(x)`)? Rust naming convention reserves PascalCase for
-/// types and variants; a function-path whose last segment starts
-/// with an uppercase ASCII letter is therefore very likely a
-/// const-eligible constructor, while a lowercase last segment
-/// (`build_value()`) is the snake_case free-fn pattern.
-fn call_func_is_pascal_constructor(func: &syn::Expr) -> bool {
+/// Heuristic: does this call expression look like a const-eligible
+/// constructor? Two shapes qualify:
+///
+/// 1. PascalCase last segment (`Some(x)`, `MyVariant(x)`, `Foo::Bar(x)`):
+///    Rust naming convention reserves PascalCase for types and variants,
+///    so a path tail starting with an uppercase ASCII letter is very
+///    likely a const-eligible tuple-struct or enum-variant constructor.
+/// 2. The conventional `new` / `default` last segments (`Type::new()`,
+///    `Type::default()`, `Default::default()`): these are the universally
+///    recognized const-fn constructor names.
+///
+/// Modern Rust accepts `..Type::new()` spreads in `static` / `const`
+/// when the called fn is `const fn` AND the returned type is
+/// trivially-Drop (no Drop impl, no fields with destructors). For
+/// trivially-Drop types like TopologyConstraints (all-primitive Copy
+/// struct), the temporary returned by the const-fn constructor is
+/// promoted to static lifetime via rustc's MIR promotion machinery
+/// (`rustc_mir_transform::promote_consts::validate_call` accepts
+/// arbitrary const-fn calls in static contexts via the
+/// `promote_all_fn = Static(_)` arm).
+///
+/// Two rustc errors surface at the spread site when those conditions
+/// don't hold; both are CLEANER than the deep const-eval diagnostic
+/// chain we'd produce by pre-rejecting at the macro layer:
+/// - E0015 ("cannot call non-const associated function in statics") —
+///   the called fn isn't `const fn`. Surfaced when a user writes
+///   `..Type::new()` and `new` is a regular fn rather than `const fn`.
+/// - E0493 ("destructor of T cannot be evaluated at compile-time") —
+///   the called fn IS `const fn` but the returned type has a
+///   non-trivial Drop (any field with a destructor: String, Vec,
+///   Box, Arc, or any of those transitively via Option, Box, etc.).
+///   Hit by types like KtstrTestEntry (which carries Option<String>
+///   via Option<DiskConfig>); their DEFAULT must remain a
+///   struct-literal const, NOT a const-fn-returning-Self.
+///
+/// Lowercase free-fn patterns (`build_helper()`) and unrecognized
+/// lowercase methods (`Type::custom()`) are not accepted — the macro
+/// has no way to tell whether those are const-eligible, and getting
+/// it wrong produces the bad deep-const-eval diagnostic at the spread
+/// site.
+fn call_func_looks_const_eligible_constructor(func: &syn::Expr) -> bool {
     let syn::Expr::Path(ep) = unwrap_parens(func) else {
         return false;
     };
     path_last_segment_ident(&ep.path).is_some_and(|ident| {
-        ident
-            .to_string()
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_uppercase())
+        let s = ident.to_string();
+        s.chars().next().is_some_and(|c| c.is_ascii_uppercase()) || s == "new" || s == "default"
     })
 }
 
@@ -3155,7 +3196,8 @@ fn field_block_not_const_error(field_name: &str, expr: &syn::Expr) -> syn::Error
 }
 
 /// Field-specific accepted-shapes sentence for `constraints`.
-const CONSTRAINTS_ACCEPTED_SHAPES: &str = "Use a struct literal `TopologyConstraints { ..TopologyConstraints::DEFAULT }` \
+const CONSTRAINTS_ACCEPTED_SHAPES: &str = "Use a struct literal `TopologyConstraints { ..TopologyConstraints::DEFAULT }`, \
+     a struct literal spreading a const-fn constructor like `TopologyConstraints { ..TopologyConstraints::new() }`, \
      or a const path like `TopologyConstraints::DEFAULT`.";
 
 /// Field-specific accepted-shapes sentence for `assert`.

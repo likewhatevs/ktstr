@@ -1,12 +1,12 @@
 error: host_only = true and a `scheduler = ...` attribute are mutually exclusive — host_only skips the VM boot that owns the scheduler lifecycle, so the declared scheduler would never attach. Drop one of host_only or scheduler; the host's currently-active scheduler (default EEVDF when none is loaded) runs the test under host_only.
-  --> tests/compile_fail/ktstr_test_multi_mutex_first_wins.rs:15:1
+  --> tests/compile_fail/ktstr_test_multi_mutex_first_wins.rs:17:1
    |
-15 | / #[ktstr_test(
-16 | |     host_only = true,
-17 | |     scheduler = MULTI_MUTEX_CONFLICT_SCHED,
-18 | |     num_snapshots = 3,
-19 | |     auto_repro = true,
-20 | | )]
+17 | / #[ktstr_test(
+18 | |     host_only = true,
+19 | |     scheduler = MULTI_MUTEX_CONFLICT_SCHED,
+20 | |     num_snapshots = 3,
+21 | |     auto_repro = true,
+22 | | )]
    | |__^
    |
    = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)
