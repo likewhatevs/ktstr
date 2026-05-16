@@ -1058,3 +1058,158 @@ fn alu_hot_chain_panics_on_widest_in_debug_build() {
     let mut work_units: u64 = 0;
     alu_hot_chain(AluWidth::Widest, 1, &mut work_units);
 }
+
+/// `Phase::AluHot` must drive observable retired-instructions counter
+/// progress via the host PMU. A regression that turned the loop into a
+/// no-op (e.g. compiler optimization stripping the work, or a refactor
+/// that defaulted to Duration::ZERO) would silently pass functional
+/// tests but produce zero ALU pressure — useless for noise-reduction
+/// or fairness benchmarking. This test opens a `perf_event_open` fd
+/// against `PERF_COUNT_HW_INSTRUCTIONS`, runs `alu_hot_chain` for a
+/// fixed iteration count, and asserts the counter delta exceeds a
+/// conservative floor.
+///
+/// **Panic-on-PMU-less host** per the user directive: if
+/// perf_event_open returns -1 (no PMU, `CONFIG_PERF_EVENTS=n`, kernel
+/// rejection, paranoid sysctl), the test FAILS LOUD instead of
+/// skipping. ktstr is a benchmarking framework; silently degrading on
+/// hosts without PMU access would undermine the entire
+/// perf-measurement subsystem.
+///
+/// **CI host expectations.** This test requires unprivileged
+/// userspace `perf_event_open` access. On hosts where
+/// `kernel.perf_event_paranoid >= 2` (default on stock Debian/Ubuntu
+/// since 2019) OR the process lacks `CAP_PERFMON`, the syscall
+/// returns `EACCES` and the test panics. Restricted-container CI
+/// (Docker without `--privileged`, GKE without
+/// `securityContext.privileged: true`) cannot run this test — the
+/// harness MUST filter it out via nextest (`--skip
+/// alu_hot_chain_drives_instructions_retired`) or by setting
+/// `kernel.perf_event_paranoid` to a value `<= 1` (kernel events) or
+/// `0` (CPU-wide) or `-1` (unrestricted) in the runner setup. The
+/// directive against silent skipping is honored: the test panics on
+/// PMU-less, and the operator deals with the filter at the harness
+/// layer.
+///
+/// Test guarantees retired-instructions semantics on both x86_64
+/// (CPUID 0x0A PMU v2 synthesized at `src/vmm/x86_64/topology.rs`)
+/// and aarch64 (KVM_ARM_VCPU_PMU_V3 wired at
+/// `src/vmm/aarch64/kvm.rs:268-271`). The test runs on the HOST
+/// (this is a #[test] in a host-test module, not a guest workload),
+/// so the relevant PMU is the host's — Linux is required.
+///
+/// Uses `perf_event_open_sys` (Cargo.toml direct dep) rather than
+/// raw libc because libc deliberately omits `perf_event_open` /
+/// `perf_event_attr` bindings. `exclude_kernel = 1` so only userspace
+/// ALU work counts (filters out interrupt-handler noise). `disabled
+/// = 1` + `IOC_ENABLE` is the standard pattern to gate counter
+/// activation until the workload starts.
+#[test]
+fn alu_hot_chain_drives_instructions_retired() {
+    use perf_event_open_sys as pe;
+    use std::io;
+    use std::mem;
+    use std::os::unix::io::RawFd;
+
+    let mut attr = pe::bindings::perf_event_attr::default();
+    attr.size = mem::size_of::<pe::bindings::perf_event_attr>() as u32;
+    attr.type_ = pe::bindings::PERF_TYPE_HARDWARE;
+    attr.config = pe::bindings::PERF_COUNT_HW_INSTRUCTIONS as u64;
+    attr.set_disabled(1);
+    attr.set_exclude_kernel(1);
+    attr.set_exclude_hv(1);
+
+    // perf_event_open: pid=0 (self process), cpu=-1 (any), group_fd=-1.
+    // SAFETY: attrs points to a properly initialised perf_event_attr;
+    // sentinel args are the standard form for "self process, any CPU,
+    // no group". fd is checked for -1 before use.
+    let fd = unsafe { pe::perf_event_open(&mut attr, 0, -1, -1, 0) };
+    if fd < 0 {
+        panic!(
+            "perf_event_open(PERF_COUNT_HW_INSTRUCTIONS) failed: {}. \
+             ktstr requires a PMU-capable host or guest. Check: \
+             (1) CPUID leaf 0x0A (x86_64) / KVM_CAP_ARM_PMU_V3 \
+             (aarch64) — host PMU presence; \
+             (2) CONFIG_PERF_EVENTS=y — kernel build config; \
+             (3) `cat /proc/sys/kernel/perf_event_paranoid` — must be \
+             <= 2 for unprivileged hardware-counter access; defaults to \
+             2 or 3 on stock Debian/Ubuntu/Fedora and BLOCKS this test. \
+             If you cannot lower the sysctl (e.g. unprivileged \
+             container), filter this test out via nextest \
+             `--skip alu_hot_chain_drives_instructions_retired`.",
+            io::Error::last_os_error(),
+        );
+    }
+    let fd: RawFd = fd;
+
+    // Reset + enable the counter. SAFETY: fd verified valid above;
+    // ioctls are standard perf-event control ops.
+    unsafe {
+        pe::ioctls::RESET(fd, 0);
+        pe::ioctls::ENABLE(fd, 0);
+    }
+
+    // Drive the AluHot work directly on the calling thread (the
+    // perf fd was opened with pid=0, so only this thread is
+    // measured). Use Scalar width to keep the test deterministic —
+    // wider variants depend on host SIMD capability.
+    let mut work_units: u64 = 0;
+    // 10_000 outer chain entry/exit cycles × 1_000 inner steps per
+    // call. Per-call retired-instruction count in debug (opt-level=0,
+    // the default for `cargo ktstr test` / `cargo nextest run`) is
+    // ~17 inst per inner step × 1_000 = ~17_000; × 10_000 outer
+    // iterations = ~170M instructions. The 10M threshold sits ~17×
+    // below this for comfortable debug-mode margin. Pre-fix tests
+    // used `steps=1` and underdelivered the threshold by ~30×
+    // (~500K actual vs 10M asserted) — a calibration defect.
+    for _ in 0..10_000 {
+        alu_hot_chain(AluWidth::Scalar, 1_000, &mut work_units);
+    }
+
+    // SAFETY: fd verified valid above; DISABLE ioctl is the
+    // counter-pair to the ENABLE above (kernel/events/core.c
+    // perf_ioctl maps both to the atomic counter-state transitions).
+    unsafe {
+        pe::ioctls::DISABLE(fd, 0);
+    }
+    let mut count: u64 = 0;
+    // SAFETY: fd is valid; reading 8 bytes from a perf_event_open
+    // fd yields the u64 counter value (default read format).
+    let n = unsafe {
+        libc::read(
+            fd,
+            &mut count as *mut u64 as *mut libc::c_void,
+            mem::size_of::<u64>(),
+        )
+    };
+    // SAFETY: fd is owned by this fn; close before any assertion
+    // panic to avoid leaks across test runs.
+    unsafe {
+        libc::close(fd);
+    }
+    assert_eq!(
+        n as usize,
+        mem::size_of::<u64>(),
+        "perf read must yield full u64 count; got {n} bytes",
+    );
+
+    // 10M instructions floor — conservative. 10_000 outer iterations
+    // × `alu_hot_chain(Scalar, 1_000, ...)` emits ~170M debug-mode
+    // instructions; threshold sits 17× below for margin. A counter at
+    // zero or near-zero indicates the loop body was optimized away or
+    // the PMU isn't counting. The diagnostic distinguishes the three
+    // failure axes via work_units cross-check.
+    assert!(
+        count > 10_000_000,
+        "alu_hot_chain must retire > 10M instructions across \
+         10_000 iterations × 1_000 inner steps; got {count}. \
+         Diagnostic axes: \
+         (a) work_units = 0 → loop never ran (build/threading bug). \
+         (b) work_units > 0 but count == 0 → PMU not counting \
+         (paranoid sysctl, container restrictions, paravirt). \
+         (c) work_units > 0 and 0 < count < 10M → threshold \
+         mis-tuned OR loop got partially optimized (e.g. compiler \
+         vectorized the scalar path). \
+         Observed work_units = {work_units}.",
+    );
+}
