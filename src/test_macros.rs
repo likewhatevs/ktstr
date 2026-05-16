@@ -87,6 +87,36 @@ macro_rules! require_capability {
     }};
 }
 
+/// Compile-time pin that a type does NOT impl [`Default`]. Mirrors
+/// `static_assertions::assert_not_impl_any!(T, Default)` without
+/// taking the dep — the `AmbiguousIfImpl<_>` blanket-vs-specialized
+/// impl trick produces a compile error when both impls match for the
+/// target type, which only happens if `T: Default`.
+///
+/// Use when a type's docs forbid `Default` because the zero / unset
+/// state is semantically invalid. Two existing call sites: `CgroupDef`
+/// (name="cg_0" footgun) and `Migration` (zeroed migration = self-
+/// migration is contradictory).
+///
+/// Expands to a `const _: fn() = ...` block; safe to invoke at module
+/// scope inside `#[cfg(test)] mod tests` or anywhere a `const` item
+/// is valid.
+#[allow(unused_macros)]
+macro_rules! assert_not_impl_default {
+    ($t:ty) => {
+        const _: fn() = || {
+            trait AmbiguousIfImpl<A> {
+                fn some_item() {}
+            }
+            impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+            #[allow(dead_code)]
+            struct InvalidDefault;
+            impl<T: ?Sized + Default> AmbiguousIfImpl<InvalidDefault> for T {}
+            let _ = <$t as AmbiguousIfImpl<_>>::some_item;
+        };
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use crate::vmm::host_topology::ResourceContention;

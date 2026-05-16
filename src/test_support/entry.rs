@@ -3208,4 +3208,169 @@ mod tests {
         let _ = CgroupPath::new("/a/b/c");
         let _ = CgroupPath::new("/foo/"); // trailing slash OK
     }
+
+    /// GAP 14: pin that `SchedulerSpec` values survive a
+    /// `HashSet` insert/lookup roundtrip — i.e. the Hash + Eq
+    /// derives are present and agree on every variant. A
+    /// regression that dropped Hash (e.g. swapping to a String
+    /// payload without re-deriving) would silently break dedup
+    /// in gauntlet expansion (which uses HashSet to collapse
+    /// duplicate scheduler variants across topology combinations).
+    #[test]
+    fn scheduler_spec_hashset_roundtrip() {
+        use std::collections::HashSet;
+        let mut set: HashSet<SchedulerSpec> = HashSet::new();
+        set.insert(SchedulerSpec::Eevdf);
+        set.insert(SchedulerSpec::Discover("scx_lavd"));
+        set.insert(SchedulerSpec::Path("./scx_rusty"));
+        set.insert(SchedulerSpec::KernelBuiltin {
+            enable: &["CONFIG_SCHED_DEBUG"],
+            disable: &["CONFIG_SCHED_AUTOGROUP"],
+        });
+        assert_eq!(set.len(), 4);
+        assert!(set.contains(&SchedulerSpec::Eevdf));
+        assert!(set.contains(&SchedulerSpec::Discover("scx_lavd")));
+        let dup_added = set.insert(SchedulerSpec::Eevdf);
+        assert!(
+            !dup_added,
+            "duplicate SchedulerSpec insert must collapse via Hash+Eq"
+        );
+        assert_eq!(set.len(), 4);
+    }
+
+    /// GAP 14 sibling: pin that `BpfMapWrite` values survive a
+    /// `HashSet` insert/lookup roundtrip — same rationale as
+    /// `scheduler_spec_hashset_roundtrip` (the field uses an
+    /// `&'static [&'static BpfMapWrite]` slice on `KtstrTestEntry`
+    /// and dedup logic relies on the derived Hash+Eq).
+    #[test]
+    fn bpf_map_write_hashset_roundtrip() {
+        use std::collections::HashSet;
+        let w1 = BpfMapWrite {
+            map_name_suffix: "data",
+            offset: 0,
+            value: 1,
+        };
+        let w2 = BpfMapWrite {
+            map_name_suffix: "data",
+            offset: 4,
+            value: 2,
+        };
+        let w3 = BpfMapWrite {
+            map_name_suffix: "other",
+            offset: 0,
+            value: 1,
+        };
+        let mut set: HashSet<BpfMapWrite> = HashSet::new();
+        set.insert(w1);
+        set.insert(w2);
+        set.insert(w3);
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(&w1));
+        let dup_added = set.insert(w1);
+        assert!(
+            !dup_added,
+            "duplicate BpfMapWrite insert must collapse via Hash+Eq"
+        );
+        assert_eq!(set.len(), 3);
+    }
+
+    /// Lock-step pin: `KtstrTestEntry::default()` must agree with
+    /// `KtstrTestEntry::DEFAULT` field-by-field. The trait impl
+    /// today delegates to the const, but a future divergence (e.g.
+    /// someone "improves" `Default` to seed a different memory
+    /// budget) would silently produce two construction paths
+    /// disagreeing on what a baseline entry looks like —
+    /// `..Default::default()` callers and `..KtstrTestEntry::DEFAULT`
+    /// callers would yield different runs from "identical" code.
+    #[test]
+    fn ktstr_test_entry_default_matches_const() {
+        let from_const = KtstrTestEntry::DEFAULT;
+        let from_trait: KtstrTestEntry = Default::default();
+        assert_eq!(from_trait.name, from_const.name);
+        assert!(std::ptr::fn_addr_eq(from_trait.func, from_const.func));
+        assert_eq!(from_trait.topology.llcs, from_const.topology.llcs);
+        assert_eq!(
+            from_trait.topology.cores_per_llc,
+            from_const.topology.cores_per_llc
+        );
+        assert_eq!(
+            from_trait.topology.threads_per_core,
+            from_const.topology.threads_per_core
+        );
+        assert_eq!(
+            from_trait.topology.numa_nodes,
+            from_const.topology.numa_nodes
+        );
+        assert_eq!(from_trait.memory_mib, from_const.memory_mib);
+        assert!(std::ptr::eq(from_trait.scheduler, from_const.scheduler));
+        assert!(from_trait.payload.is_none() && from_const.payload.is_none());
+        // Element-wise slice equality catches same-length content
+        // drift (e.g. two different `&["--baseline=X"]` slices both
+        // length 1 but with different X). Length-only compare would
+        // miss that.
+        assert_eq!(
+            from_trait.workloads.len(),
+            from_const.workloads.len(),
+            "workloads count drift"
+        );
+        for (i, (a, b)) in from_trait
+            .workloads
+            .iter()
+            .zip(from_const.workloads.iter())
+            .enumerate()
+        {
+            assert!(std::ptr::eq(*a, *b), "workloads[{i}] pointer identity drift");
+        }
+        assert_eq!(from_trait.auto_repro, from_const.auto_repro);
+        assert_eq!(
+            from_trait.extra_sched_args, from_const.extra_sched_args,
+            "extra_sched_args content drift"
+        );
+        assert_eq!(from_trait.watchdog_timeout, from_const.watchdog_timeout);
+        assert_eq!(
+            from_trait.bpf_map_write.len(),
+            from_const.bpf_map_write.len(),
+            "bpf_map_write count drift"
+        );
+        for (i, (a, b)) in from_trait
+            .bpf_map_write
+            .iter()
+            .zip(from_const.bpf_map_write.iter())
+            .enumerate()
+        {
+            assert!(
+                std::ptr::eq(*a, *b),
+                "bpf_map_write[{i}] pointer identity drift"
+            );
+        }
+        assert_eq!(from_trait.performance_mode, from_const.performance_mode);
+        assert_eq!(from_trait.no_perf_mode, from_const.no_perf_mode);
+        assert_eq!(from_trait.duration, from_const.duration);
+        assert_eq!(from_trait.expect_err, from_const.expect_err);
+        assert_eq!(from_trait.host_only, from_const.host_only);
+        assert_eq!(
+            from_trait.extra_include_files, from_const.extra_include_files,
+            "extra_include_files content drift"
+        );
+        assert_eq!(from_trait.cleanup_budget, from_const.cleanup_budget);
+        assert_eq!(from_trait.config_content, from_const.config_content);
+        assert!(from_trait.disk.is_none() && from_const.disk.is_none());
+        assert!(from_trait.post_vm.is_none() && from_const.post_vm.is_none());
+        assert_eq!(from_trait.num_snapshots, from_const.num_snapshots);
+        // `assert` field lock-step: Assert does not derive PartialEq,
+        // so compare via `format_human()` (renders every
+        // threshold field) plus the explicit bool field that
+        // format_human omits.
+        assert_eq!(
+            from_trait.assert.format_human(),
+            from_const.assert.format_human(),
+            "Assert threshold-field drift between Default::default() and DEFAULT"
+        );
+        assert_eq!(
+            from_trait.assert.enforce_monitor_thresholds,
+            from_const.assert.enforce_monitor_thresholds,
+            "Assert.enforce_monitor_thresholds drift between Default::default() and DEFAULT"
+        );
+    }
 }

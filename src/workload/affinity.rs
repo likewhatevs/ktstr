@@ -396,4 +396,71 @@ mod tests {
         let result = set_thread_affinity(pid, &cpus);
         assert!(result.is_ok(), "pinning to CPU 0 should succeed");
     }
+
+    /// GAP 7: pin that the three constructors produce the same
+    /// values a direct variant construction yields. A regression
+    /// where `fixed(iter)` started normalising the input would
+    /// silently shift downstream semantics.
+    #[test]
+    fn resolved_affinity_constructors_match_direct_variants() {
+        let from_ctor = ResolvedAffinity::fixed([0_usize, 1, 2]);
+        let from_variant =
+            ResolvedAffinity::Fixed([0_usize, 1, 2].into_iter().collect());
+        assert_eq!(from_ctor, from_variant);
+
+        let from_ctor = ResolvedAffinity::random([0_usize, 1, 2, 3], 2);
+        let from_variant = ResolvedAffinity::Random {
+            from: [0_usize, 1, 2, 3].into_iter().collect(),
+            count: 2,
+        };
+        assert_eq!(from_ctor, from_variant);
+
+        let from_ctor = ResolvedAffinity::single_cpu(5);
+        let from_variant = ResolvedAffinity::SingleCpu(5);
+        assert_eq!(from_ctor, from_variant);
+    }
+
+    // Compile-time pin: `ResolvedAffinity::single_cpu` is `pub const
+    // fn`. A regression that drops `const` (e.g. switches to a body
+    // requiring runtime allocation) would silently break the
+    // const-context use case. The `const _` binding fails to
+    // type-check if `single_cpu` is no longer const-evaluable.
+    const _: ResolvedAffinity = ResolvedAffinity::single_cpu(7);
+
+    /// GAP 8: pin that `ResolvedAffinity::default()` is `None`
+    /// and that every variant roundtrips through serde unchanged,
+    /// including empty-payload edge cases for `Fixed` and `Random`.
+    /// Serde drift on any variant breaks failure-dump replay and
+    /// captured-workload reproduction — the persisted JSON would
+    /// deserialize into a different variant or lose payload data.
+    /// A regression that landed `#[serde(skip_serializing_if =
+    /// "BTreeSet::is_empty")]` on the inner field would silently
+    /// drop the variant tag on the empty case; pinning empty
+    /// payloads catches that.
+    #[test]
+    fn resolved_affinity_default_is_none_and_serde_roundtrip_per_variant() {
+        let d: ResolvedAffinity = Default::default();
+        assert_eq!(d, ResolvedAffinity::None);
+
+        let variants = [
+            ResolvedAffinity::None,
+            ResolvedAffinity::Fixed([0_usize, 1, 5].into_iter().collect()),
+            ResolvedAffinity::Fixed(BTreeSet::new()),
+            ResolvedAffinity::Random {
+                from: [0_usize, 1, 2, 3, 4].into_iter().collect(),
+                count: 2,
+            },
+            ResolvedAffinity::Random {
+                from: BTreeSet::new(),
+                count: 0,
+            },
+            ResolvedAffinity::SingleCpu(7),
+        ];
+        for original in &variants {
+            let bytes = serde_json::to_vec(original).expect("serialize");
+            let restored: ResolvedAffinity =
+                serde_json::from_slice(&bytes).expect("deserialize");
+            assert_eq!(restored, *original, "roundtrip drift for {original:?}");
+        }
+    }
 }

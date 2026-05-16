@@ -1857,4 +1857,22 @@ mod tests {
         assert!(restored.stdout.is_empty(), "stdout must remain empty");
         assert_eq!(restored.stderr, original.stderr);
     }
+
+    /// Lock-step pin: `MetricBounds::default()` must agree with
+    /// `MetricBounds::NONE` — both routes describe the same "no
+    /// extra checks" baseline. A regression where Default seeds a
+    /// non-None bound (e.g. a defensive `value_max = Some(f64::MAX)`)
+    /// would silently start failing previously-passing metric
+    /// streams whose `..MetricBounds::NONE` callers stayed quiet.
+    #[test]
+    fn metric_bounds_default_matches_none() {
+        let from_const = MetricBounds::NONE;
+        let from_trait: MetricBounds = Default::default();
+        assert_eq!(from_trait.min_count, from_const.min_count);
+        assert_eq!(from_trait.value_min, from_const.value_min);
+        assert_eq!(from_trait.value_max, from_const.value_max);
+        assert!(from_const.min_count.is_none());
+        assert!(from_const.value_min.is_none());
+        assert!(from_const.value_max.is_none());
+    }
 }

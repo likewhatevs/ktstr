@@ -95,18 +95,49 @@ fn worker_report_serde_roundtrip() {
     assert_eq!(r.is_messenger, r2.is_messenger);
     assert_eq!(r.group_idx, r2.group_idx);
 }
+// -- Migration value-type coverage --------------------------------
+//
+// `Migration` is the wire format emitted by workers when they
+// observe a CPU migration. It is `Copy` and intentionally omits a
+// `Default` impl (a zeroed Migration is a self-migration, which is
+// semantically invalid — see the type doc on `super::Migration`).
+// The pins below cover: `::new(..)` constructor produces the same
+// field layout as the direct struct-literal form; serde roundtrip
+// across the three numeric fields; `::new` is `const fn` so it can
+// seed `static` items; the type has NO `Default` impl.
+
+// Compile-time pin: `Migration::new` is `pub const fn`. A regression
+// dropping `const` would silently break const-context use.
+const _: Migration = Migration::new(0, 1, 2);
+
+// Compile-time pin: `Migration` must NOT impl `Default`. See the
+// type doc for the self-migration rationale.
+assert_not_impl_default!(Migration);
+
 #[test]
-fn migration_serde() {
-    let m = Migration {
-        at_ns: 12345,
+fn migration_new_matches_struct_literal() {
+    let from_ctor = Migration::new(1_000_000_000, 0, 1);
+    let from_literal = Migration {
+        at_ns: 1_000_000_000,
         from_cpu: 0,
-        to_cpu: 3,
+        to_cpu: 1,
     };
-    let json = serde_json::to_string(&m).unwrap();
-    let m2: Migration = serde_json::from_str(&json).unwrap();
-    assert_eq!(m.at_ns, m2.at_ns);
-    assert_eq!(m.from_cpu, m2.from_cpu);
-    assert_eq!(m.to_cpu, m2.to_cpu);
+    assert_eq!(from_ctor, from_literal);
+    assert_eq!(from_ctor.at_ns, 1_000_000_000);
+    assert_eq!(from_ctor.from_cpu, 0);
+    assert_eq!(from_ctor.to_cpu, 1);
+}
+
+#[test]
+fn migration_serde_roundtrip() {
+    let original = Migration::new(42, 3, 7);
+    let bytes = serde_json::to_vec(&original).expect("serialize");
+    let restored: Migration =
+        serde_json::from_slice(&bytes).expect("deserialize");
+    assert_eq!(restored, original);
+    assert_eq!(restored.at_ns, 42);
+    assert_eq!(restored.from_cpu, 3);
+    assert_eq!(restored.to_cpu, 7);
 }
 #[test]
 fn spawn_start_collect_integration() {

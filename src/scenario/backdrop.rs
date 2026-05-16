@@ -490,4 +490,83 @@ mod tests {
         assert_eq!(b.payloads.len(), 1);
         assert!(!b.is_empty());
     }
+
+    /// `Backdrop::clone()` must produce an independent value: mutating
+    /// the clone leaves the original untouched. The default derived
+    /// `Clone` on a struct of `Vec<T>` fields produces deep copies,
+    /// but a future refactor that swaps any field to an `Rc`-shared
+    /// or `Cow`-shared container would silently turn the clone into
+    /// an alias — and the cgroup-name-collision footgun the type
+    /// docs warn about would expand into a "mutate one Backdrop,
+    /// corrupt the other" surprise. Pin independence per field
+    /// (cgroups, payloads, ops) against the `Backdrop::EMPTY` const,
+    /// AND verify the cloned vec received the pushed value (not just
+    /// "1 element"). A regression that cloned `original.cgroups` as
+    /// `vec![CgroupDef::named("wrong")]` and then pushed the
+    /// expected value would yield len=2, which a length-only
+    /// assertion misses.
+    #[test]
+    fn clone_is_independent_per_field() {
+        let original = Backdrop::EMPTY;
+        let mut cloned = original.clone();
+        cloned.cgroups.push(CgroupDef::named("cg_added_to_clone"));
+        cloned.payloads.push(&TEST_PAYLOAD);
+        cloned.ops.push(Op::add_cgroup("cg_op_on_clone"));
+        assert!(
+            original.cgroups.is_empty(),
+            "original.cgroups must stay empty after clone mutation"
+        );
+        assert!(
+            original.payloads.is_empty(),
+            "original.payloads must stay empty after clone mutation"
+        );
+        assert!(
+            original.ops.is_empty(),
+            "original.ops must stay empty after clone mutation"
+        );
+        // Verify clone has exactly the pushed values — catches a
+        // "started with a non-empty clone" bug that length=1 alone
+        // would miss.
+        assert_eq!(cloned.cgroups.len(), 1, "clone cgroups: unexpected count");
+        assert_eq!(
+            cloned.cgroups[0].name.as_ref(),
+            "cg_added_to_clone",
+            "clone cgroups: pushed value not present at index 0"
+        );
+        assert_eq!(cloned.payloads.len(), 1, "clone payloads: unexpected count");
+        assert!(
+            std::ptr::eq(cloned.payloads[0], &TEST_PAYLOAD),
+            "clone payloads: pushed pointer not present at index 0"
+        );
+        assert_eq!(cloned.ops.len(), 1, "clone ops: unexpected count");
+        assert!(
+            matches!(&cloned.ops[0], Op::AddCgroup { name } if name.as_ref() == "cg_op_on_clone"),
+            "clone ops: pushed Op not present at index 0"
+        );
+    }
+
+    /// Lock-step pin: `Backdrop::default()` must agree with
+    /// `Backdrop::EMPTY` field-by-field. Both produce a no-state
+    /// builder seed; a regression where Default seeds a non-empty
+    /// field would silently introduce a phantom cgroup/payload/op
+    /// into every spread-default callsite.
+    #[test]
+    fn default_matches_empty_const() {
+        let from_const = Backdrop::EMPTY;
+        let from_trait: Backdrop = Default::default();
+        assert_eq!(
+            from_trait.cgroups.len(),
+            from_const.cgroups.len(),
+            "cgroups Vec drift"
+        );
+        assert_eq!(
+            from_trait.payloads.len(),
+            from_const.payloads.len(),
+            "payloads Vec drift"
+        );
+        assert_eq!(from_trait.ops.len(), from_const.ops.len(), "ops Vec drift");
+        assert!(from_const.cgroups.is_empty());
+        assert!(from_const.payloads.is_empty());
+        assert!(from_const.ops.is_empty());
+    }
 }

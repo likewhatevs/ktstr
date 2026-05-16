@@ -1834,4 +1834,62 @@ mod tests {
         // [`WorkloadConfig::nice`].
         assert_eq!(w.nice, None);
     }
+
+    /// GAP 9: pin that `SchedPolicy::fifo` / `round_robin` /
+    /// `deadline` are usable in const context. A regression where
+    /// any of the three dropped `const` (e.g. switched from `Self {
+    /// .. }` to a builder) would silently break static
+    /// `KtstrTestEntry` declarations that bake a fixed policy.
+    #[test]
+    fn sched_policy_constructors_usable_in_const_context() {
+        const F: SchedPolicy = SchedPolicy::fifo(50);
+        const RR: SchedPolicy = SchedPolicy::round_robin(99);
+        const DL: SchedPolicy = SchedPolicy::deadline(
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+            Duration::from_millis(30),
+        );
+        assert!(matches!(F, SchedPolicy::Fifo(50)));
+        assert!(matches!(RR, SchedPolicy::RoundRobin(99)));
+        assert!(matches!(
+            DL,
+            SchedPolicy::Deadline {
+                runtime,
+                deadline,
+                period
+            } if runtime == Duration::from_millis(10)
+                && deadline == Duration::from_millis(20)
+                && period == Duration::from_millis(30)
+        ));
+    }
+
+    /// GAP 10: pin `SchedPolicy::default() == Normal` and that
+    /// every variant roundtrips through serde unchanged. Default
+    /// drift would silently re-class every WorkSpec that omits
+    /// `sched_policy`; serde drift would break captured config
+    /// replay across the 6 variants (one per scheduling class).
+    #[test]
+    fn sched_policy_default_is_normal_and_serde_roundtrip_per_variant() {
+        let d: SchedPolicy = Default::default();
+        assert!(matches!(d, SchedPolicy::Normal));
+
+        let variants = [
+            SchedPolicy::Normal,
+            SchedPolicy::Batch,
+            SchedPolicy::Idle,
+            SchedPolicy::Fifo(50),
+            SchedPolicy::RoundRobin(99),
+            SchedPolicy::Deadline {
+                runtime: Duration::from_millis(10),
+                deadline: Duration::from_millis(20),
+                period: Duration::from_millis(30),
+            },
+        ];
+        for original in &variants {
+            let bytes = serde_json::to_vec(original).expect("serialize");
+            let restored: SchedPolicy =
+                serde_json::from_slice(&bytes).expect("deserialize");
+            assert_eq!(restored, *original, "roundtrip drift for {original:?}");
+        }
+    }
 }

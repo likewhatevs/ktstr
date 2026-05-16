@@ -2346,6 +2346,164 @@ mod tests {
         );
     }
 
+    // -- setter Err-chain context wraps (#128 MEDIUM coverage) ------
+    //
+    // Each setter's `with_context` closure encodes the cgroup name,
+    // the failed value, and a controller hint pointing at the
+    // `+<controller>` line the operator needs in
+    // `cgroup.subtree_control`. A regression that dropped any of the
+    // three components from the wrap (e.g. switched to bare
+    // `?`-propagation) would silently degrade the operator
+    // diagnostic. One test per setter pins all three.
+    //
+    // Value assertions use the KNOB-PREFIXED form
+    // (e.g. `"set cpu.weight=250"`, `"set io.weight=500"`,
+    // `"set cgroup.freeze='1'"`) — bare digit substrings like `"250"`
+    // would collide with errno numbers, line refs, or other 3-digit
+    // tokens in the chain. The knob-prefixed form mirrors the
+    // exact `with_context` format string and is collision-safe.
+
+    #[test]
+    fn set_cpu_max_err_contains_cgroup_name_value_and_controller_hint() {
+        let cg = CgroupManager::new("/nonexistent/ktstr-set-cpu-max-test");
+        let err = cg
+            .set_cpu_max("cg_alpha", Some(50_000), 100_000)
+            .expect_err("missing cgroup must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cg_alpha"), "missing cgroup name: {msg}");
+        assert!(
+            msg.contains("set cpu.max='50000 100000'"),
+            "missing knob-prefixed value: {msg}"
+        );
+        assert!(msg.contains("+cpu"), "missing controller hint: {msg}");
+    }
+
+    #[test]
+    fn set_cpu_weight_err_contains_cgroup_name_value_and_controller_hint() {
+        let cg = CgroupManager::new("/nonexistent/ktstr-set-cpu-weight-test");
+        let err = cg
+            .set_cpu_weight("cg_beta", 250)
+            .expect_err("missing cgroup must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cg_beta"), "missing cgroup name: {msg}");
+        assert!(
+            msg.contains("set cpu.weight=250"),
+            "missing knob-prefixed value: {msg}"
+        );
+        assert!(msg.contains("+cpu"), "missing controller hint: {msg}");
+    }
+
+    #[test]
+    fn set_memory_max_err_contains_cgroup_name_value_and_controller_hint() {
+        let cg = CgroupManager::new("/nonexistent/ktstr-set-mem-max-test");
+        let err = cg
+            .set_memory_max("cg_gamma", Some(1_048_576))
+            .expect_err("missing cgroup must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cg_gamma"), "missing cgroup name: {msg}");
+        assert!(
+            msg.contains("set memory.max='1048576'"),
+            "missing knob-prefixed value: {msg}"
+        );
+        assert!(msg.contains("+memory"), "missing controller hint: {msg}");
+    }
+
+    #[test]
+    fn set_memory_high_err_contains_cgroup_name_value_and_controller_hint() {
+        let cg = CgroupManager::new("/nonexistent/ktstr-set-mem-high-test");
+        let err = cg
+            .set_memory_high("cg_delta", Some(524_288))
+            .expect_err("missing cgroup must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cg_delta"), "missing cgroup name: {msg}");
+        assert!(
+            msg.contains("set memory.high='524288'"),
+            "missing knob-prefixed value: {msg}"
+        );
+        assert!(msg.contains("+memory"), "missing controller hint: {msg}");
+    }
+
+    #[test]
+    fn set_memory_low_err_contains_cgroup_name_value_and_controller_hint() {
+        let cg = CgroupManager::new("/nonexistent/ktstr-set-mem-low-test");
+        let err = cg
+            .set_memory_low("cg_epsilon", Some(262_144))
+            .expect_err("missing cgroup must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cg_epsilon"), "missing cgroup name: {msg}");
+        assert!(
+            msg.contains("set memory.low='262144'"),
+            "missing knob-prefixed value: {msg}"
+        );
+        assert!(msg.contains("+memory"), "missing controller hint: {msg}");
+    }
+
+    #[test]
+    fn set_io_weight_err_contains_cgroup_name_value_and_controller_hint() {
+        let cg = CgroupManager::new("/nonexistent/ktstr-set-io-weight-test");
+        let err = cg
+            .set_io_weight("cg_zeta", 500)
+            .expect_err("missing cgroup must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cg_zeta"), "missing cgroup name: {msg}");
+        assert!(
+            msg.contains("set io.weight=500"),
+            "missing knob-prefixed value: {msg}"
+        );
+        assert!(msg.contains("+io"), "missing controller hint: {msg}");
+    }
+
+    #[test]
+    fn set_freeze_err_contains_cgroup_name_value_and_core_hint() {
+        let cg = CgroupManager::new("/nonexistent/ktstr-set-freeze-test");
+        let err = cg
+            .set_freeze("cg_eta", true)
+            .expect_err("missing cgroup must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cg_eta"), "missing cgroup name: {msg}");
+        assert!(
+            msg.contains("set cgroup.freeze='1'"),
+            "missing knob-prefixed value: {msg}"
+        );
+        // cgroup.freeze is a cgroup-core file (no `+freeze`
+        // controller exists); the wrap calls this out explicitly so
+        // operators don't go hunting subtree_control.
+        assert!(
+            msg.contains("cgroup-core"),
+            "missing cgroup-core hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn set_pids_max_err_contains_cgroup_name_value_and_controller_hint() {
+        let cg = CgroupManager::new("/nonexistent/ktstr-set-pids-max-test");
+        let err = cg
+            .set_pids_max("cg_theta", Some(4096))
+            .expect_err("missing cgroup must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cg_theta"), "missing cgroup name: {msg}");
+        assert!(
+            msg.contains("set pids.max='4096'"),
+            "missing knob-prefixed value: {msg}"
+        );
+        assert!(msg.contains("+pids"), "missing controller hint: {msg}");
+    }
+
+    #[test]
+    fn set_memory_swap_max_err_contains_cgroup_name_value_and_controller_hint() {
+        let cg = CgroupManager::new("/nonexistent/ktstr-set-swap-max-test");
+        let err = cg
+            .set_memory_swap_max("cg_iota", Some(8_388_608))
+            .expect_err("missing cgroup must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cg_iota"), "missing cgroup name: {msg}");
+        assert!(
+            msg.contains("set memory.swap.max='8388608'"),
+            "missing knob-prefixed value: {msg}"
+        );
+        assert!(msg.contains("+memory"), "missing controller hint: {msg}");
+    }
+
     // -- remove_cgroup auto-unfreeze --------------------------------
 
     /// `remove_cgroup` writes `0` to `cgroup.freeze` before draining

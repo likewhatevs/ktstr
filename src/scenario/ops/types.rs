@@ -1672,30 +1672,9 @@ impl Default for CpuLimits {
 // the name explicit and eliminates the footgun. The pattern is
 // documented in the type-level docstring and operator-facing
 // guidance at `doc/guide/src/architecture/workload-handle.md` under
-// the spread-default warning.
-//
-// Compile-time pin of the absence: the `AmbiguousIfImpl<()>`
-// blanket-vs-specialized-impl trick (mirrors
-// `static_assertions::assert_not_impl_any!`) below produces a
-// compile error if a future commit adds `impl Default for
-// CgroupDef`. Two `AmbiguousIfImpl<_>` impls would match and type
-// inference for `_` becomes ambiguous, breaking compilation. The
-// in-project precedent is at `src/scenario/payload_run.rs:2122` for
-// `SigchldScope: !Send + !Sync`; the same pattern keeps the
-// assertion local without adding `static_assertions` as a direct
-// dependency.
-const _: fn() = || {
-    trait AmbiguousIfImpl<A> {
-        fn some_item() {}
-    }
-    impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
-
-    #[allow(dead_code)]
-    struct InvalidDefault;
-    impl<T: ?Sized + Default> AmbiguousIfImpl<InvalidDefault> for T {}
-
-    let _ = <CgroupDef as AmbiguousIfImpl<_>>::some_item;
-};
+// the spread-default warning. The compile-time pin of the absence
+// lives in the `#[cfg(test)]` mod below (`assert_not_impl_default!`
+// from `src/test_macros.rs`).
 
 // ---------------------------------------------------------------------------
 // Step / HoldSpec
@@ -2532,6 +2511,10 @@ mod cgroup_def_default_tests {
     use super::*;
     use crate::workload::WorkSpec;
 
+    // Compile-time pin: `CgroupDef` must NOT impl `Default`. See the
+    // type-level docstring for the name="cg_0" collision rationale.
+    assert_not_impl_default!(CgroupDef);
+
     #[test]
     fn merged_works_nice_order_independent() {
         let pre = CgroupDef::named("cg").nice(7).work(WorkSpec::default());
@@ -2746,5 +2729,151 @@ mod cgroup_def_default_tests {
         assert_eq!(def.default_uid, Some(101));
         assert_eq!(def.default_gid, Some(202));
         assert_eq!(def.default_numa_node, Some(3));
+    }
+
+    /// [`CpuLimits::default()`] MUST return `max_period_us = 100_000`
+    /// (the kernel-rejected `0` would cause `EINVAL` on
+    /// `cpu.max` write; #95 fixed the derived `Default` bug). The
+    /// other fields (`max_quota_us`, `weight`) MUST default to
+    /// `None`. A regression that switched back to `derive(Default)`
+    /// would silently produce `max_period_us = 0` and tests would
+    /// fail at apply-setup time with a kernel ENOENT/EINVAL rather
+    /// than at construction.
+    #[test]
+    fn cpu_limits_default_period_is_100_000_microseconds() {
+        let limits = CpuLimits::default();
+        assert_eq!(
+            limits.max_period_us, 100_000,
+            "CpuLimits::default().max_period_us MUST be 100_000 \
+             (the kernel-default microsecond period). A regression \
+             back to derive(Default) would produce 0, causing \
+             EINVAL on cpu.max write.",
+        );
+        assert_eq!(limits.max_quota_us, None);
+        assert_eq!(limits.weight, None);
+    }
+
+    /// [`Step::default()`] MUST produce `setup = Setup::empty()`,
+    /// `ops = []`, `hold = HoldSpec::FULL`. This is the documented
+    /// identity-step: zero defs, zero ops, full-duration hold. A
+    /// regression that switched any field's default would change
+    /// the test-author-visible identity of `Step::default()` and
+    /// silently shift spread-default behavior across every call
+    /// site. Spread composability: a struct-update of the form
+    /// `Step { ops: my_ops, ..Default::default() }` must produce a
+    /// step with `setup = empty`, `hold = FULL`, and the explicit
+    /// `ops` — verified by constructing one and asserting the
+    /// non-spread fields match the Default contract.
+    #[test]
+    fn step_default_field_state_and_spread_composability() {
+        let s = Step::default();
+        assert!(
+            matches!(s.setup, Setup::Defs(ref v) if v.is_empty()),
+            "Step::default().setup MUST be Setup::empty() (which \
+             matches Setup::Defs(vec![])); got {:?}",
+            s.setup,
+        );
+        assert!(s.ops.is_empty(), "Step::default().ops MUST be []");
+        assert!(
+            matches!(s.hold, HoldSpec::Frac(f) if f == 1.0),
+            "Step::default().hold MUST be HoldSpec::FULL \
+             (HoldSpec::Frac(1.0)); got {:?}",
+            s.hold,
+        );
+
+        // Spread composability: explicit `ops` lands, other fields
+        // come from Default.
+        let composed = Step {
+            ops: vec![Op::add_cgroup("cg_spread")],
+            ..Default::default()
+        };
+        assert_eq!(composed.ops.len(), 1);
+        assert!(matches!(
+            composed.setup,
+            Setup::Defs(ref v) if v.is_empty()
+        ));
+        assert!(matches!(composed.hold, HoldSpec::Frac(f) if f == 1.0));
+    }
+
+    /// GAP 2: pin that `Setup::defs(v)`, `Setup::factory(f)`,
+    /// `Setup::empty()`, AND `Setup::default()` all resolve to the
+    /// same shape a direct `Setup::Defs(v)` / `Setup::Factory(f)`
+    /// construction yields. `Setup` has no `PartialEq` (it holds a
+    /// fn pointer in `Factory`), so we discriminate on variant
+    /// shape + payload.
+    #[test]
+    fn setup_constructors_match_direct_variants() {
+        // defs(vec![..]) -> Defs(vec![..])
+        let from_ctor = Setup::defs(vec![CgroupDef::named("cg_a")]);
+        match from_ctor {
+            Setup::Defs(ref v) => {
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].name.as_ref(), "cg_a");
+            }
+            Setup::Factory(_) => panic!("Setup::defs must produce Defs variant"),
+        }
+        // empty() -> Defs(vec![])
+        let from_empty = Setup::empty();
+        match from_empty {
+            Setup::Defs(ref v) => assert!(v.is_empty()),
+            Setup::Factory(_) => panic!("Setup::empty must produce Defs variant"),
+        }
+        // Default::default() -> Defs(vec![]) (delegates to empty())
+        let from_default: Setup = Default::default();
+        assert!(
+            matches!(from_default, Setup::Defs(ref v) if v.is_empty()),
+            "Setup::default() must produce Setup::empty() == Setup::Defs(vec![])"
+        );
+        // factory(fn) -> Factory(fn)
+        fn make_zero_cgroups(_: &Ctx) -> Vec<CgroupDef> {
+            Vec::new()
+        }
+        let from_factory = Setup::factory(make_zero_cgroups);
+        assert!(matches!(from_factory, Setup::Factory(_)));
+    }
+
+    /// GAP 4: pin that `Step::set_hold` replaces only the `hold`
+    /// field, leaving `setup` and `ops` untouched. A regression
+    /// where the builder accidentally reset `ops` or `setup` (e.g.
+    /// after a refactor that switched to a `Step::with(..)` style)
+    /// would silently drop test scenarios — set_ops calls would
+    /// look applied yet vanish after the subsequent set_hold.
+    ///
+    /// Builds the Step with a NON-EMPTY setup via `Step::with_defs`
+    /// so any reset of `setup` is observable. Using
+    /// `Step::default().set_ops(...)` would yield an empty setup
+    /// before AND after the set_hold call — a setup-reset bug
+    /// would silently pass the "still empty" check.
+    #[test]
+    fn step_set_hold_replaces_hold_preserves_setup_and_ops() {
+        let original =
+            Step::with_defs(vec![CgroupDef::named("cg_setup")], HoldSpec::FULL)
+                .set_ops(vec![Op::add_cgroup("cg_x")]);
+        // Pin pre-state — non-empty setup, 1 op, full hold.
+        assert!(
+            matches!(
+                &original.setup,
+                Setup::Defs(v) if v.len() == 1 && v[0].name.as_ref() == "cg_setup"
+            ),
+            "fixture must have non-empty setup"
+        );
+        assert_eq!(original.ops.len(), 1);
+        assert!(matches!(&original.hold, HoldSpec::Frac(f) if (*f - 1.0).abs() < f64::EPSILON));
+        // Apply set_hold with a non-default value.
+        let after = original.set_hold(HoldSpec::Frac(0.25));
+        // hold replaced
+        assert!(matches!(after.hold, HoldSpec::Frac(f) if (f - 0.25).abs() < f64::EPSILON));
+        // ops preserved
+        assert_eq!(after.ops.len(), 1);
+        assert!(matches!(&after.ops[0], Op::AddCgroup { name } if name.as_ref() == "cg_x"));
+        // setup preserved — non-empty cg_setup def survives
+        assert!(
+            matches!(
+                &after.setup,
+                Setup::Defs(v) if v.len() == 1 && v[0].name.as_ref() == "cg_setup"
+            ),
+            "Step::set_hold must not mutate setup; got {:?}",
+            after.setup
+        );
     }
 }
