@@ -63,13 +63,13 @@ impl<T> SeriesField<T> {
         values: Vec<SnapshotResult<T>>,
     ) -> Self {
         // Hard runtime check (not debug_assert_eq!) so the equal-
-        // length guarantee documented on iter_full() and relied on
-        // by tag(i) / elapsed_ms(i) holds in release builds. A
-        // length mismatch here would otherwise surface downstream
+        // length guarantee documented on iter_full() holds in
+        // release builds. A length mismatch would otherwise surface
         // as either a silent truncation in iter_full() (zip stops
         // at the shortest input) or an out-of-bounds panic from
-        // the indexed accessors — both harder to diagnose than a
-        // panic at the construction site.
+        // the direct `tags[i]` / `elapsed_ms[i]` field access in
+        // EachClaim failure-message rendering — both harder to
+        // diagnose than a panic at the construction site.
         assert_eq!(tags.len(), values.len());
         assert_eq!(elapsed_ms.len(), values.len());
         Self {
@@ -93,17 +93,6 @@ impl<T> SeriesField<T> {
     /// True when no samples are present.
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
-    }
-
-    /// Tag of sample `i`, panics on out-of-range. Used by the
-    /// temporal-assertion failure-message rendering.
-    pub fn tag(&self, i: usize) -> &str {
-        self.tags[i].as_str()
-    }
-
-    /// Elapsed-ms timestamp of sample `i`.
-    pub fn elapsed_ms(&self, i: usize) -> u64 {
-        self.elapsed_ms[i]
     }
 
     /// Iterate over per-sample values (each a [`SnapshotResult<T>`]).

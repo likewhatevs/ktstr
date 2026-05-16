@@ -586,6 +586,13 @@ pub fn merge_kconfig_fragments<'a>(
     }
 }
 
+// Derive macros. `Payload` here is the `#[derive(Payload)]` proc
+// macro; the same-named `Payload` struct (to which the derive
+// applies) lives at `crate::test_support::Payload`. Rust's
+// macro-vs-type namespace separation lets both coexist under the
+// identifier `Payload` in `use ktstr::prelude::*;` — the derive
+// position resolves to the macro, type position resolves to the
+// struct.
 pub use ktstr_macros::Claim;
 pub use ktstr_macros::Payload;
 pub use ktstr_macros::declare_scheduler;
@@ -653,6 +660,12 @@ pub mod prelude {
     // here so an out-of-crate caller can build synthetic
     // FailureDumpReports for unit-testing their assertions
     // against the snapshot accessor without booting a VM.
+    //
+    // Re-export of the `Payload` derive macro from the crate root.
+    // The same identifier names the `Payload` struct re-exported a
+    // few lines below from `crate::test_support`; the two live in
+    // separate Rust namespaces (macro vs type) so they coexist in
+    // `use ktstr::prelude::*;` without conflict.
     pub use crate::Payload;
     pub use crate::monitor::btf_render::{RenderedMember, RenderedValue};
     pub use crate::monitor::dump::{
@@ -671,6 +684,9 @@ pub mod prelude {
         WatchRegisterCallback, stats_path,
     };
     pub use crate::scenario::{CgroupGroup, Ctx, collect_all, spawn_diverse};
+    // `Payload` in this group is the struct on which
+    // `#[derive(Payload)]` is applied; it occupies the type
+    // namespace, distinct from the derive macro re-exported above.
     pub use crate::test_support::{
         BpfMapWrite, CgroupPath, MemSideCache, Metric, MetricBounds, MetricCheck, MetricHint,
         MetricSource, NumaDistance, NumaNode, OutputFormat, Payload, PayloadKind, PayloadMetrics,
