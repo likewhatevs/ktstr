@@ -261,7 +261,7 @@ use ktstr::assert::{SchedulerBaseline, assert_baseline};
 let r = assert_baseline(&reports, &SchedulerBaseline::strict());
 
 // Or build piecewise with explicit thresholds.
-let baseline = SchedulerBaseline::EMPTY
+let baseline = SchedulerBaseline::default()
     .max_p99_wake_latency_ns(5_000_000)
     .min_work_units(100);
 let r = assert_baseline(&reports, &baseline);

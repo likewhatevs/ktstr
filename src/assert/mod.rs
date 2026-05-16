@@ -3036,8 +3036,11 @@ pub fn assert_scx_events_clean(events: &[(&str, i64)], max_count: Option<i64>) -
 /// Each `Option` field is independent — `None` skips that check. A
 /// `SchedulerBaseline` with every field `None` is a no-op (the
 /// returned [`AssertResult`] always passes), useful as a starting
-/// point for builder-style composition. Use [`Self::strict`] for the
-/// "every check enabled with sane defaults" preset.
+/// point for builder-style composition. Construct the all-`None`
+/// baseline via `SchedulerBaseline::default()` and chain the
+/// `max_*` / `min_*` setters (e.g. `SchedulerBaseline::default().max_migrations(5)`)
+/// or spread into a struct literal (`SchedulerBaseline { max_migrations: Some(5), ..Default::default() }`).
+/// Use [`Self::strict`] for the "every check enabled with sane defaults" preset.
 ///
 /// Distinct from [`Assert`]: `Assert` is the merge-tree threshold
 /// config consumed by the worker-side `AssertPlan`; `SchedulerBaseline`
@@ -3082,28 +3085,6 @@ pub struct SchedulerBaseline {
 }
 
 impl SchedulerBaseline {
-    /// Identity baseline — every field `None`, so [`assert_baseline`]
-    /// returns a passing result with no checks performed. Serves as
-    /// both the spread-into-struct-literal source
-    /// (`SchedulerBaseline { max_migrations: Some(5), ..SchedulerBaseline::EMPTY }`)
-    /// and the builder-chain entry point
-    /// (`SchedulerBaseline::EMPTY.max_migrations(5)` — the
-    /// `max_*` / `min_*` setters take `mut self` and chain).
-    ///
-    /// Unlike [`Assert::NO_OVERRIDES`] + [`Assert::default_checks`]
-    /// (paired const + const fn for the two use cases), this type
-    /// uses a single named const that covers both. There is no
-    /// chainable verdict-style entry point on `SchedulerBaseline`
-    /// — the type is consumed by [`assert_baseline`] directly, not
-    /// composed into a [`Verdict`]. Adding a `new()` const fn would
-    /// duplicate the surface without adding capability.
-    pub const EMPTY: SchedulerBaseline = SchedulerBaseline {
-        max_p99_wake_latency_ns: None,
-        max_iteration_cost_p99_ns: None,
-        max_migrations: None,
-        min_work_units: None,
-    };
-
     /// Sane-default preset: p99 wake latency under 10ms, p99
     /// iteration cost under 1ms, total migrations under 1000, every
     /// worker completes ≥1 work unit. The defaults are deliberately
