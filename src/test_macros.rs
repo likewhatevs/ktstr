@@ -94,9 +94,14 @@ macro_rules! require_capability {
 /// target type, which only happens if `T: Default`.
 ///
 /// Use when a type's docs forbid `Default` because the zero / unset
-/// state is semantically invalid. Two existing call sites: `CgroupDef`
-/// (name="cg_0" footgun) and `Migration` (zeroed migration = self-
-/// migration is contradictory).
+/// state is semantically invalid. Existing call sites: `CgroupDef`
+/// (name="cg_0" footgun), `Migration` (zeroed migration = self-
+/// migration is contradictory), `WorkerExitInfo` (default-pick of
+/// TimedOut variant masquerades as a real outcome), and
+/// `DualFailureDumpReport` (default-empty `late` report would
+/// silently lie about a successful capture). When adding a new
+/// call site, append it here so a future debugger of an
+/// AmbiguousIfImpl compile error sees the existing pattern.
 ///
 /// Expands to a `const _: fn() = ...` block; safe to invoke at module
 /// scope inside `#[cfg(test)] mod tests` or anywhere a `const` item

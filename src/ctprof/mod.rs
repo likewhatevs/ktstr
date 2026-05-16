@@ -1543,9 +1543,10 @@ impl Default for ThreadState {
     /// "no thread observed yet" placeholder that ctprof inserts
     /// into HashMap entries before the /proc walk populates them
     /// from the live kernel state. Default-constructed ThreadState
-    /// values are NOT visible to operator-facing output: the parse
-    /// path in [`crate::ctprof::parse`] (see
-    /// `capture_thread_at_with_tally`) overwrites each field from
+    /// values are NOT visible to operator-facing output: the
+    /// capture path in [`capture_thread_at_with_tally`]
+    /// (which delegates to the per-file `/proc` read helpers in
+    /// [`parse`]) overwrites each field from
     /// `/proc/<pid>/task/<tid>/{stat,status,schedstat,cgroup}` before
     /// the entry is read for rendering. The `state` char uses the
     /// `'~'` absent-value sentinel rather than the bare `char`
