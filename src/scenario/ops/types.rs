@@ -891,6 +891,42 @@ pub struct IoLimits {
 /// per-controller numeric ranges; framework-level checks catch
 /// only the foot-cannons documented per-builder.
 ///
+/// # Builder semantics
+///
+/// The setters fall into three groups:
+///
+/// **Group I — per-WorkSpec fan to `works[0]`:**
+/// [`workers`](Self::workers), [`workers_pct`](Self::workers_pct),
+/// [`work_type`](Self::work_type), [`sched_policy`](Self::sched_policy),
+/// [`affinity`](Self::affinity), [`mem_policy`](Self::mem_policy),
+/// [`mpol_flags`](Self::mpol_flags). Each mutates `self.works[0]`,
+/// auto-inserting a default [`WorkSpec`] when `works` is empty. There
+/// is NO cgroup-level default for these knobs — per-group identity (or
+/// per-group cpuset validation) makes fan-out semantically ambiguous.
+/// Use [`work`](Self::work) + per-`WorkSpec` setters for multi-group
+/// cgroups.
+///
+/// **Group II — cgroup-level `default_*` merge:**
+/// [`nice`](Self::nice), [`comm`](Self::comm), [`uid`](Self::uid),
+/// [`gid`](Self::gid), [`numa_node`](Self::numa_node). Each stores a
+/// value in a `default_*` field on `CgroupDef`. Every [`WorkSpec`] in
+/// [`works`](Self::works) whose corresponding `Option`-typed field is
+/// `None` inherits the default at [`merged_works`](Self::merged_works)
+/// time — ORDER-INDEPENDENT with [`work`](Self::work). `Some(_)`
+/// (including `Some(0)`) opts out.
+///
+/// **Group III — [`pcomm`](Self::pcomm):** mutates `works` in-place
+/// at call time, NOT order-independent — by design. See
+/// [`pcomm`](Self::pcomm) for the coalescing rationale.
+///
+/// Other setters ([`cpuset`](Self::cpuset),
+/// [`cpuset_mems`](Self::cpuset_mems), the
+/// [`cpu_quota`](Self::cpu_quota) / [`memory_max`](Self::memory_max)
+/// / [`io_weight`](Self::io_weight) / [`pids_max`](Self::pids_max)
+/// controller families, [`workload`](Self::workload),
+/// [`swappable`](Self::swappable)) set cgroup-level state directly
+/// and do not participate in either merge pattern.
+///
 /// # See also
 ///
 /// `CgroupDef` only expresses the steady-state shape of a cgroup
@@ -1051,20 +1087,13 @@ pub struct CgroupDef {
 impl CgroupDef {
     /// Create a CgroupDef with defaults (empty works, no cpuset).
     ///
-    /// **Worker-spawning default:** `CgroupDef::named("cg_0")` alone
-    /// still spawns workers at execution time — `apply_setup` fills
-    /// an empty `works` slice with one default [`WorkSpec`] (SpinWait,
-    /// SCHED_NORMAL, `ctx.workers_per_cgroup` workers, which defaults
-    /// to 1 from `CtxBuilder`). To express an empty move-target cgroup
-    /// with NO workers, declare it via [`Op::AddCgroup`] at step or
-    /// Backdrop level instead of using a `CgroupDef`. To run more than
-    /// one worker, call `.workers(N)` on the `CgroupDef` explicitly.
-    ///
-    /// **Common shortcut:** for the very-common pattern
-    /// `CgroupDef::named(name).workers(ctx.workers_per_cgroup)`, use
-    /// [`Ctx::cgroup_def`](crate::scenario::Ctx::cgroup_def) — it
-    /// pins the `ctx.workers_per_cgroup` default at the call site and
-    /// returns a `CgroupDef` ready for further chaining.
+    /// `apply_setup` fills an empty `works` slice with one default
+    /// [`WorkSpec`] (SpinWait, SCHED_NORMAL, `ctx.workers_per_cgroup`
+    /// workers — defaults to 1 from `CtxBuilder`). For an empty
+    /// move-target cgroup with no workers, declare it via
+    /// [`Op::AddCgroup`] at step or Backdrop level. For the common
+    /// `CgroupDef::named(name).workers(ctx.workers_per_cgroup)`
+    /// pattern use [`Ctx::cgroup_def`](crate::scenario::Ctx::cgroup_def).
     #[must_use = "dropping a CgroupDef discards the cgroup specification"]
     pub fn named(name: impl Into<Cow<'static, str>>) -> Self {
         Self {
@@ -1086,16 +1115,14 @@ impl CgroupDef {
         }
     }
 
-    /// Set the cpuset for this cgroup. Use when defining cgroups in step
-    /// setup (initial topology). For mid-run cpuset changes, use [`Op::SetCpuset`].
+    /// Set [`Self::cpuset`]; see [`Op::SetCpuset`] for mid-run changes.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn cpuset(mut self, cpus: CpusetSpec) -> Self {
         self.cpuset = Some(cpus);
         self
     }
 
-    /// Add a work group. Can be called multiple times for concurrent
-    /// work groups within this cgroup.
+    /// Append a [`WorkSpec`] group (multiple calls yield concurrent groups within this cgroup).
     #[must_use = "builder methods consume self; bind the result"]
     pub fn work(mut self, w: WorkSpec) -> Self {
         self.works.push(w);
@@ -1109,14 +1136,7 @@ impl CgroupDef {
         }
     }
 
-    /// Set the number of workers on `works[0]` only — auto-inserting
-    /// a default [`WorkSpec`] if `works` is empty. Subsequent
-    /// [`Self::work`] calls add additional `WorkSpec` entries that
-    /// keep their own `num_workers`. There is no cgroup-level
-    /// default for `num_workers` because it is the most
-    /// composition-sensitive knob (different work groups commonly
-    /// want different worker counts); use `WorkSpec::workers(n)`
-    /// per group when more than one is in play.
+    /// Set [`WorkSpec::num_workers`] on `works[0]` (Group I).
     #[must_use = "builder methods consume self; bind the result"]
     pub fn workers(mut self, n: usize) -> Self {
         self.ensure_default_work();
@@ -1124,28 +1144,19 @@ impl CgroupDef {
         self
     }
 
-    /// Set [`WorkSpec::workers_pct`] on `works[0]` — auto-inserting a
-    /// default [`WorkSpec`] if `works` is empty. The fraction is
-    /// resolved against the cgroup's resolved cpuset at apply-setup
-    /// time via `ceil(cpuset_cpus * pct)`. Setting BOTH
-    /// [`Self::workers`] and [`Self::workers_pct`] on the same
-    /// `works[0]` is rejected at apply-setup time because two sources
-    /// for `num_workers` would silently fight; pick one. For
-    /// multi-WorkSpec cgroups that need per-group fractions, call
-    /// `WorkSpec::workers_pct` on each entry via [`Self::work`].
+    /// Set [`WorkSpec::workers_pct`] on `works[0]` (Group I). Resolved
+    /// against the cgroup's cpuset at apply-setup via
+    /// `ceil(cpuset_cpus * pct)`. Mutually exclusive with
+    /// [`Self::workers`] — see [`WorkSpec::workers_pct`].
     ///
     /// # Panics
     ///
-    /// Panics when `pct` is NaN, infinite, or `<= 0.0` — same gate as
-    /// [`WorkSpec::workers_pct`]; the construction-time message is more
-    /// actionable than an apply-setup zero-workers reject.
-    ///
-    /// Extreme finite values (e.g. `1e100`) pass the construction gate
-    /// and saturate to `usize::MAX` via the `as` cast in
-    /// `resolve_workers_pct` (RFC 2484 / Rust 1.45+). Attempting to
-    /// spawn that many workers would OOM the host. The framework
-    /// imposes no upper cap; as a rule of thumb keep `pct` near the
-    /// intended oversubscription factor (e.g. `1.0`, `2.0`, `4.0`).
+    /// Panics when `pct` is NaN, infinite, or `<= 0.0`. Extreme
+    /// finite values (e.g. `1e100`) pass the gate and saturate to
+    /// `usize::MAX` via the `as` cast in `resolve_workers_pct`
+    /// (RFC 2484 / Rust 1.45+) — attempting to spawn that many
+    /// workers would OOM the host. Keep `pct` near the intended
+    /// oversubscription factor (e.g. `1.0`, `2.0`, `4.0`).
     #[must_use = "builder methods consume self; bind the result"]
     pub fn workers_pct(mut self, pct: f64) -> Self {
         assert!(
@@ -1157,14 +1168,7 @@ impl CgroupDef {
         self
     }
 
-    /// Set the work type on `works[0]` only — auto-inserting a
-    /// default [`WorkSpec`] if `works` is empty. Subsequent
-    /// [`Self::work`] calls add additional `WorkSpec` entries that
-    /// keep their own `work_type`. There is no cgroup-level default
-    /// for `work_type`: it identifies what each group does, so a
-    /// shared default would make the per-group entries less
-    /// expressive without removing duplication. Multi-group cgroups
-    /// pick `work_type` per `WorkSpec`.
+    /// Set [`WorkSpec::work_type`] on `works[0]` (Group I).
     #[must_use = "builder methods consume self; bind the result"]
     pub fn work_type(mut self, wt: WorkType) -> Self {
         self.ensure_default_work();
@@ -1172,14 +1176,7 @@ impl CgroupDef {
         self
     }
 
-    /// Set the scheduling policy on `works[0]` only — auto-inserting
-    /// a default [`WorkSpec`] if `works` is empty. Subsequent
-    /// [`Self::work`] calls add additional `WorkSpec` entries that
-    /// keep their own `sched_policy`. There is no cgroup-level
-    /// default for `sched_policy`: scenarios that mix policies
-    /// across groups (e.g. a SCHED_FIFO antagonist beside a
-    /// SCHED_NORMAL victim) need each group's policy distinct, so
-    /// the cgroup-level default would obscure the intent.
+    /// Set [`WorkSpec::sched_policy`] on `works[0]` (Group I).
     #[must_use = "builder methods consume self; bind the result"]
     pub fn sched_policy(mut self, p: crate::workload::SchedPolicy) -> Self {
         self.ensure_default_work();
@@ -1187,13 +1184,7 @@ impl CgroupDef {
         self
     }
 
-    /// Set the per-worker affinity on `works[0]` only —
-    /// auto-inserting a default [`WorkSpec`] if `works` is empty.
-    /// Subsequent [`Self::work`] calls add additional `WorkSpec`
-    /// entries that keep their own `affinity`. There is no
-    /// cgroup-level default: affinity intents (Inherit, SingleCpu,
-    /// LlcAligned, etc.) carry per-group resolution semantics that
-    /// don't fan out cleanly to a "merge if unset" rule.
+    /// Set [`WorkSpec::affinity`] on `works[0]` (Group I).
     #[must_use = "builder methods consume self; bind the result"]
     pub fn affinity(mut self, a: crate::workload::AffinityIntent) -> Self {
         self.ensure_default_work();
@@ -1201,14 +1192,8 @@ impl CgroupDef {
         self
     }
 
-    /// Set the NUMA memory placement policy on `works[0]` only —
-    /// auto-inserting a default [`WorkSpec`] if `works` is empty.
-    /// Subsequent [`Self::work`] calls add additional `WorkSpec`
-    /// entries that keep their own `mem_policy`. There is no
-    /// cgroup-level default: `mem_policy` is validated against the
-    /// resolved cpuset per-group, so a fan-out default could
-    /// produce confusing per-group failures and is left out
-    /// deliberately.
+    /// Set [`WorkSpec::mem_policy`] on `works[0]` (Group I). Validated
+    /// against the resolved cpuset per-group.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn mem_policy(mut self, p: crate::workload::MemPolicy) -> Self {
         self.ensure_default_work();
@@ -1216,12 +1201,7 @@ impl CgroupDef {
         self
     }
 
-    /// Set the NUMA memory policy mode flags on `works[0]` only —
-    /// auto-inserting a default [`WorkSpec`] if `works` is empty.
-    /// Subsequent [`Self::work`] calls add additional `WorkSpec`
-    /// entries that keep their own `mpol_flags`. There is no
-    /// cgroup-level default for the same per-group-validation
-    /// reasons as [`Self::mem_policy`].
+    /// Set [`WorkSpec::mpol_flags`] on `works[0]` (Group I).
     #[must_use = "builder methods consume self; bind the result"]
     pub fn mpol_flags(mut self, f: crate::workload::MpolFlags) -> Self {
         self.ensure_default_work();
@@ -1229,54 +1209,31 @@ impl CgroupDef {
         self
     }
 
-    /// Set the cgroup-level default per-worker nice value. Merged
-    /// into every [`WorkSpec`] in [`Self::works`] whose own
-    /// [`WorkSpec::nice`] is `None` (the framework's "skip
-    /// setpriority(2)" state) at apply-setup time, regardless of
-    /// declaration order — `def.work(spec).nice(n)` and
-    /// `def.nice(n).work(spec)` are equivalent. A WorkSpec that
-    /// explicitly sets `Some(n)` (including `Some(0)`) keeps its
-    /// value. The cgroup-level default lives in
-    /// [`Self::default_nice`].
-    ///
-    /// Note: `.nice(0)` on a WorkSpec stores `Some(0)` and opts out
-    /// of the cgroup-level merge — the worker's nice is set to 0
-    /// explicitly via `setpriority(PRIO_PROCESS, 0, 0)` rather than
-    /// inheriting the cgroup default.
+    /// Set [`Self::default_nice`] (Group II). Note: `WorkSpec::nice(0)`
+    /// stores `Some(0)` and opts out of this default — the worker's
+    /// nice is explicitly set to 0 via `setpriority(2)` rather than
+    /// inheriting.
     #[must_use = "builder methods consume self; bind the result"]
     pub const fn nice(mut self, n: i32) -> Self {
         self.default_nice = Some(n);
         self
     }
 
-    /// Set the cgroup-level default worker process name. Merged
-    /// into every [`WorkSpec`] in [`Self::works`] whose own
-    /// [`WorkSpec::comm`] is `None` at apply-setup time, regardless
-    /// of declaration order. Each affected worker calls
-    /// `prctl(PR_SET_NAME)` with this name. The cgroup-level
-    /// default lives in [`Self::default_comm`].
+    /// Set [`Self::default_comm`] (Group II).
     #[must_use = "builder methods consume self; bind the result"]
     pub fn comm(mut self, name: impl Into<std::borrow::Cow<'static, str>>) -> Self {
         self.default_comm = Some(name.into());
         self
     }
 
-    /// Set the cgroup-level default worker effective UID. Merged
-    /// into every [`WorkSpec`] in [`Self::works`] whose own
-    /// [`WorkSpec::uid`] is `None` at apply-setup time, regardless
-    /// of declaration order. The cgroup-level default lives in
-    /// [`Self::default_uid`].
+    /// Set [`Self::default_uid`] (Group II).
     #[must_use = "builder methods consume self; bind the result"]
     pub const fn uid(mut self, uid: u32) -> Self {
         self.default_uid = Some(uid);
         self
     }
 
-    /// Set the cgroup-level default worker effective GID. Merged
-    /// into every [`WorkSpec`] in [`Self::works`] whose own
-    /// [`WorkSpec::gid`] is `None` at apply-setup time, regardless
-    /// of declaration order. The cgroup-level default lives in
-    /// [`Self::default_gid`].
+    /// Set [`Self::default_gid`] (Group II).
     #[must_use = "builder methods consume self; bind the result"]
     pub const fn gid(mut self, gid: u32) -> Self {
         self.default_gid = Some(gid);
@@ -1306,24 +1263,19 @@ impl CgroupDef {
     /// authoritative source per WorkSpec.
     ///
     /// **Not order-independent with [`Self::work`] — by design.**
-    /// Unlike [`Self::nice`] / [`Self::comm`] / [`Self::uid`] /
-    /// [`Self::gid`] / [`Self::numa_node`], which store a
-    /// cgroup-level default and merge into every WorkSpec at
-    /// `merged_works()` call time, `pcomm` mutates `works`
-    /// in-place when called: it stamps every WorkSpec that
-    /// EXISTS at call time and then returns. WorkSpecs added
-    /// via subsequent [`Self::work`] calls are not retroactively
-    /// touched, and a WorkSpec that already carried its own
-    /// `pcomm` is OVERWRITTEN if it was pushed before
-    /// `.pcomm(..)` ran. This is intentional — `pcomm`
+    /// Unlike Group II setters, `pcomm` mutates `works` in-place when
+    /// called: it stamps every WorkSpec that EXISTS at call time and
+    /// then returns. WorkSpecs added via subsequent [`Self::work`]
+    /// calls are not retroactively touched, and a WorkSpec that
+    /// already carried its own `pcomm` is OVERWRITTEN if it was
+    /// pushed before `.pcomm(..)` ran. This is intentional — `pcomm`
     /// determines the thread-group leader's coalescing key in
-    /// `apply_setup`, so the framework needs the value baked
-    /// onto each WorkSpec by the time `merged_works()` runs.
-    /// Storing it as a default and merging at read time would
-    /// break the coalescing contract for the empty-works case
-    /// (the synthesised `WorkSpec::default()` would have to
-    /// carry the pcomm without distinguishing "default" from
-    /// "explicit override").
+    /// `apply_setup`, so the framework needs the value baked onto
+    /// each WorkSpec by the time `merged_works()` runs. Storing it
+    /// as a default and merging at read time would break the
+    /// coalescing contract for the empty-works case (the synthesised
+    /// `WorkSpec::default()` would have to carry the pcomm without
+    /// distinguishing "default" from "explicit override").
     #[must_use = "builder methods consume self; bind the result"]
     pub fn pcomm(mut self, name: impl Into<Cow<'static, str>>) -> Self {
         let name: Cow<'static, str> = name.into();
@@ -1336,18 +1288,14 @@ impl CgroupDef {
         self
     }
 
-    /// Set the cgroup-level default NUMA-node affinity. Merged into
-    /// every [`WorkSpec`] in [`Self::works`] whose own
-    /// [`WorkSpec::numa_node`] is `None` at apply-setup time,
-    /// regardless of declaration order. The cgroup-level default
-    /// lives in [`Self::default_numa_node`].
+    /// Set [`Self::default_numa_node`] (Group II).
     #[must_use = "builder methods consume self; bind the result"]
     pub const fn numa_node(mut self, node: u32) -> Self {
         self.default_numa_node = Some(node);
         self
     }
 
-    /// When true, the gauntlet work_type override replaces each WorkSpec's work type.
+    /// Set [`Self::swappable`] (gauntlet work_type override).
     #[must_use = "builder methods consume self; bind the result"]
     pub const fn swappable(mut self, swappable: bool) -> Self {
         self.swappable = swappable;
@@ -1405,18 +1353,17 @@ impl CgroupDef {
         self
     }
 
-    /// Bind `cpuset.mems` for this cgroup. Mirrors
-    /// [`Self::cpuset`] for NUMA memory placement: the cgroup's
-    /// tasks may only allocate memory on the listed NUMA nodes.
-    /// `None` (default) inherits the parent's `cpuset.mems`.
+    /// Bind `cpuset.mems` for this cgroup. Mirrors [`Self::cpuset`]
+    /// for NUMA memory placement: the cgroup's tasks may only
+    /// allocate memory on the listed NUMA nodes. `None` (default)
+    /// inherits the parent's `cpuset.mems`.
     ///
     /// Required when the cgroup spans CPUs on a NUMA node whose
-    /// memory is NOT in the parent's `cpuset.mems` — without it,
-    /// allocations from the cgroup's tasks fail with `ENOMEM` or
-    /// migrate per the kernel's `cpuset_update_task_spread` path.
-    /// The framework writes `cpuset.mems` immediately after
-    /// `cpuset.cpus` so the binding is in effect before any worker
-    /// is moved into the cgroup.
+    /// memory is NOT in the parent's `cpuset.mems` — allocations
+    /// from the cgroup's tasks are constrained to the parent's
+    /// allowed nodes per kernel/cgroup/cpuset.c. The framework
+    /// writes `cpuset.mems` immediately after `cpuset.cpus` so the
+    /// binding is in effect before any worker is moved in.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn cpuset_mems(mut self, nodes: BTreeSet<usize>) -> Self {
         self.cpuset_mems = Some(nodes);
@@ -1458,9 +1405,10 @@ impl CgroupDef {
         self
     }
 
-    /// Set `cpu.weight` (range 1..=10000, default 100 in the
-    /// kernel). Larger values get a larger CPU share when the
-    /// parent cgroup is contended. Independent of `cpu.max`.
+    /// Set `cpu.weight` (`CGROUP_WEIGHT_MIN..=CGROUP_WEIGHT_MAX`,
+    /// 1..=10000; `CGROUP_WEIGHT_DFL` = 100; enforced by
+    /// `cpu_weight_write_u64` in kernel/sched/core.c). Larger values
+    /// get a larger share under contention. Independent of `cpu.max`.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn cpu_weight(mut self, weight: u32) -> Self {
         let cpu = self.cpu.get_or_insert_with(CpuLimits::default);
@@ -1469,7 +1417,11 @@ impl CgroupDef {
     }
 
     /// Set `memory.max` hard ceiling in bytes. Crossing this
-    /// triggers the cgroup OOM killer.
+    /// triggers reclaim first (`try_charge_memcg` in
+    /// mm/memcontrol.c); the cgroup OOM killer fires only after
+    /// `MAX_RECLAIM_RETRIES` failed retries, and is skipped when
+    /// the allocation carries `__GFP_NORETRY` or
+    /// `__GFP_RETRY_MAYFAIL`.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn memory_max(mut self, bytes: u64) -> Self {
         let m = self.memory.get_or_insert_with(MemoryLimits::default);
@@ -1477,8 +1429,11 @@ impl CgroupDef {
         self
     }
 
-    /// Set `memory.high` soft throttle threshold in bytes.
-    /// Crossing this triggers reclaim throttling but NOT OOM-kill.
+    /// Set `memory.high` soft throttle threshold in bytes. Crossing
+    /// this triggers reclaim throttling but NOT OOM-kill — per
+    /// `__mem_cgroup_handle_over_high` in mm/memcontrol.c:
+    /// "memory.high enforcement isn't as strict, and there is no
+    /// OOM killer involved".
     #[must_use = "builder methods consume self; bind the result"]
     pub fn memory_high(mut self, bytes: u64) -> Self {
         let m = self.memory.get_or_insert_with(MemoryLimits::default);
@@ -1506,10 +1461,11 @@ impl CgroupDef {
         self
     }
 
-    /// Set `io.weight` (range 1..=10000, default 100 in the
-    /// kernel). Biases relative IO share across sibling cgroups
-    /// when the io controller is enabled. `io.max` per-device caps
-    /// are not surfaced here — see [`IoLimits`] for the rationale.
+    /// Set `io.weight` (`CGROUP_WEIGHT_MIN..=CGROUP_WEIGHT_MAX`,
+    /// 1..=10000; `CGROUP_WEIGHT_DFL` = 100; enforced by
+    /// `ioc_weight_write` in block/blk-iocost.c). Biases relative
+    /// IO share when the io controller is enabled. `io.max`
+    /// per-device caps are not surfaced — see [`IoLimits`].
     #[must_use = "builder methods consume self; bind the result"]
     pub fn io_weight(mut self, weight: u16) -> Self {
         let io = self.io.get_or_insert_with(IoLimits::default);
