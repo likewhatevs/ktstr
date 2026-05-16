@@ -571,7 +571,7 @@ impl SchedClass {
     /// the kernel to read `policy == SCHED_EXT` (which
     /// requires sched_ext-aware userspace) cannot be expressed
     /// via this helper and must call the raw syscall path.
-    pub fn to_policy(self) -> SchedPolicy {
+    pub const fn to_policy(self) -> SchedPolicy {
         match self {
             SchedClass::Cfs | SchedClass::Ext => SchedPolicy::Normal,
             SchedClass::Batch => SchedPolicy::Batch,
@@ -586,7 +586,7 @@ impl SchedClass {
     /// kernel's default `sched_deadline_period_min_us` (100us).
     /// 1us runtime, 1ms deadline, 10ms period — bandwidth fraction
     /// 0.0001, well below admission-control limits.
-    pub fn default_deadline_reservation() -> SchedPolicy {
+    pub const fn default_deadline_reservation() -> SchedPolicy {
         SchedPolicy::Deadline {
             runtime: Duration::from_micros(1),
             deadline: Duration::from_millis(1),
@@ -765,7 +765,7 @@ impl MemPolicy {
     }
 
     /// Construct a `Preferred` policy for a single NUMA node.
-    pub fn preferred(node: usize) -> Self {
+    pub const fn preferred(node: usize) -> Self {
         MemPolicy::Preferred(node)
     }
 

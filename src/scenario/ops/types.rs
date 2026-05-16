@@ -542,17 +542,17 @@ impl CpusetSpec {
     }
 
     /// Partition usable CPUs into `of` equal disjoint sets; take the `index`-th.
-    pub fn disjoint(index: usize, of: usize) -> Self {
+    pub const fn disjoint(index: usize, of: usize) -> Self {
         CpusetSpec::Disjoint { index, of }
     }
 
     /// Like [`disjoint`](Self::disjoint) but each set overlaps neighbors by `frac` of its size.
-    pub fn overlap(index: usize, of: usize, frac: f64) -> Self {
+    pub const fn overlap(index: usize, of: usize, frac: f64) -> Self {
         CpusetSpec::Overlap { index, of, frac }
     }
 
     /// Fractional range of usable CPUs `[start_frac..end_frac)`.
-    pub fn range(start_frac: f64, end_frac: f64) -> Self {
+    pub const fn range(start_frac: f64, end_frac: f64) -> Self {
         CpusetSpec::Range {
             start_frac,
             end_frac,
@@ -560,12 +560,12 @@ impl CpusetSpec {
     }
 
     /// All CPUs in a given LLC index.
-    pub fn llc(index: usize) -> Self {
+    pub const fn llc(index: usize) -> Self {
         CpusetSpec::Llc(index)
     }
 
     /// All CPUs in a given NUMA node index.
-    pub fn numa(index: usize) -> Self {
+    pub const fn numa(index: usize) -> Self {
         CpusetSpec::Numa(index)
     }
 }
