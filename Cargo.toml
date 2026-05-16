@@ -183,12 +183,6 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 # `default-features = false` drops the binary CLI surface (clap,
 # colored, indoc) so only the library trait is pulled in.
 grex = { version = "1.4", default-features = false }
-# SHA-1 listed as a direct dep solely to enable `asm` (SHA-NI on
-# x86_64) via Cargo feature unification on the transitive instance
-# pulled in by gix → gix-hash → sha1-checked → sha1. No call sites
-# in ktstr itself — remove this entry if gix ever exposes a
-# passthrough feature.
-sha1 = { version = "0.10", features = ["asm"] }
 # SHA-256 for one-shot digest verification of downloaded artifacts
 # (fetch.rs), cache-key fingerprinting (disk_template.rs), seeded
 # key derivation (fun.rs), and model-cache integrity checks
