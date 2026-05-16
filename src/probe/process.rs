@@ -140,7 +140,6 @@ pub struct ProbeDiagnostics {
     /// `bpf_kprobe_fires - bpf_kprobe_returns` is the number of
     /// kprobe fires that bailed before pushing into `probe_data`
     /// (meta-map miss or scratch-slot miss).
-    #[serde(default)]
     pub bpf_kprobe_returns: u64,
     /// BPF-side trigger fire count (cross-CPU sum of the
     /// `KTSTR_PCPU_TRIGGER_COUNT` slot).
@@ -155,12 +154,10 @@ pub struct ProbeDiagnostics {
     /// Non-zero means the userspace consumer fell behind on the
     /// events ringbuf, so auto-repro will see a missing trigger
     /// event even though the scheduler did fire.
-    #[serde(default)]
     pub bpf_ringbuf_drops: u64,
     /// Nanosecond timestamp captured by the BPF trigger handler on
     /// the first error-class `sched_ext_exit` (from BSS
     /// ktstr_last_trigger_ts). 0 when no error-class exit fired.
-    #[serde(default)]
     pub bpf_first_trigger_ns: u64,
     /// `kind` argument captured by the BPF trigger handler on the
     /// first error-class `sched_ext_exit` (from BSS
@@ -169,7 +166,6 @@ pub struct ProbeDiagnostics {
     /// Used by the host renderer to disambiguate "trigger fired with
     /// kind=STALL/ERROR (no causal task; events suppressed)" from
     /// "trigger never fired" when the post-stitch event count is 0.
-    #[serde(default)]
     pub bpf_exit_kind_snap: u32,
     /// `true` when the readout phase reached the no-causal-tptr
     /// branch and emitted events grouped by frequency rather than
@@ -181,7 +177,6 @@ pub struct ProbeDiagnostics {
     /// `events: ... — trigger absent, grouped by frequency` so the
     /// operator does not misread the candidate chain as a verified
     /// stitch.
-    #[serde(default)]
     pub stitch_fallback_used: bool,
     /// Cumulative count of `tp_btf/sched_switch +
     /// sched_migrate_task + sched_wakeup` records committed into
@@ -192,7 +187,6 @@ pub struct ProbeDiagnostics {
     /// while the probe runs. Combined with `bpf_timeline_drops`
     /// it lets an operator tell whether a failure-time drain
     /// saw the full window or only the tail.
-    #[serde(default)]
     pub bpf_timeline_count: u64,
     /// `bpf_ringbuf_reserve` failures across the three timeline
     /// tracepoint handlers (sched_switch / sched_migrate_task /
@@ -201,7 +195,6 @@ pub struct ProbeDiagnostics {
     /// event lost — the ring's existing contents are NOT evicted
     /// on overflow, so the drain on failure recovers the OLDEST
     /// captured events first.
-    #[serde(default)]
     pub bpf_timeline_drops: u64,
 }
 

@@ -378,11 +378,9 @@ pub struct WorkerReport {
     /// — legitimate for pathologically short test windows) from
     /// "worker died / timed out before recording anything"
     /// (`completed: false, iterations: 0` — the sentinel shape).
-    #[serde(default)]
     pub completed: bool,
     /// Per-NUMA-node page counts from `/proc/self/numa_maps` after workload.
     /// Keyed by node ID. Empty when numa_maps is unavailable.
-    #[serde(default)]
     pub numa_pages: BTreeMap<usize, u64>,
     /// Delta of `/proc/vmstat` `numa_pages_migrated` over the work loop.
     pub vmstat_numa_pages_migrated: u64,
@@ -437,7 +435,6 @@ pub struct WorkerReport {
     /// cross-reference per-group indexing or guess from the empty
     /// vector — ambiguous on groups where the messenger legitimately
     /// exits before producing a report.
-    #[serde(default)]
     pub is_messenger: bool,
     /// Index of the worker group this report belongs to.
     ///
@@ -455,13 +452,6 @@ pub struct WorkerReport {
     /// payload / panic / timeout) carry the `group_idx` of the
     /// worker whose pid the sentinel replaces, so a "this composed
     /// group failed" assertion still works on an outright crash.
-    ///
-    /// `#[serde(default)]` so reports persisted before `group_idx`
-    /// existed (or written by a worker on a non-composed config)
-    /// deserialize cleanly with `group_idx == 0` — the primary
-    /// group, which is also the only group such reports could
-    /// possibly belong to.
-    #[serde(default)]
     pub group_idx: usize,
     /// Rendered error from the worker's `set_thread_affinity`
     /// call, or `None` when affinity setup succeeded (or the
@@ -488,7 +478,6 @@ pub struct WorkerReport {
     /// onto the next field's bytes (silent corruption). The
     /// Option<…> tag (one byte) is the only overhead on the
     /// success path.
-    #[serde(default)]
     pub affinity_error: Option<String>,
 }
 
