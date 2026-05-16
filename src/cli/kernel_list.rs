@@ -1211,7 +1211,7 @@ mod tests {
             "2026-04-12T10:00:00Z",
         )
         .with_version(Some("2.6.32".to_string()))
-        .with_ktstr_kconfig_hash(None);
+        .with_ktstr_kconfig_hash(None::<String>);
         let untracked_entry = cache
             .store(
                 "untracked-eol",

@@ -90,6 +90,16 @@ impl KernelSource {
             _ => None,
         }
     }
+
+    /// Construct [`KernelSource::Git`] with both `git_hash` and
+    /// `git_ref` populated. Use struct-literal syntax directly if
+    /// either field should be `None`.
+    pub fn git(git_hash: impl Into<String>, git_ref: impl Into<String>) -> Self {
+        KernelSource::Git {
+            git_hash: Some(git_hash.into()),
+            git_ref: Some(git_ref.into()),
+        }
+    }
 }
 
 /// Metadata stored alongside a cached kernel image.
@@ -168,26 +178,26 @@ impl KernelMetadata {
     }
 
     /// Set the kernel version.
-    pub fn with_version(mut self, version: Option<String>) -> Self {
-        self.version = version;
+    pub fn with_version(mut self, version: Option<impl Into<String>>) -> Self {
+        self.version = version.map(Into::into);
         self
     }
 
     /// Set the .config CRC32 hash.
-    pub fn with_config_hash(mut self, hash: Option<String>) -> Self {
-        self.config_hash = hash;
+    pub fn with_config_hash(mut self, hash: Option<impl Into<String>>) -> Self {
+        self.config_hash = hash.map(Into::into);
         self
     }
 
     /// Set the ktstr.kconfig CRC32 hash.
-    pub fn with_ktstr_kconfig_hash(mut self, hash: Option<String>) -> Self {
-        self.ktstr_kconfig_hash = hash;
+    pub fn with_ktstr_kconfig_hash(mut self, hash: Option<impl Into<String>>) -> Self {
+        self.ktstr_kconfig_hash = hash.map(Into::into);
         self
     }
 
     /// Set the `--extra-kconfig` fragment CRC32 hash.
-    pub fn with_extra_kconfig_hash(mut self, hash: Option<String>) -> Self {
-        self.extra_kconfig_hash = hash;
+    pub fn with_extra_kconfig_hash(mut self, hash: Option<impl Into<String>>) -> Self {
+        self.extra_kconfig_hash = hash.map(Into::into);
         self
     }
 
