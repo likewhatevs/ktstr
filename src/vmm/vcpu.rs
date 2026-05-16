@@ -290,13 +290,39 @@ pub(crate) fn register_vcpu_signal_handler() {
 pub(crate) fn pin_current_thread(cpu: usize, label: &str) {
     let mut cpuset = nix::sched::CpuSet::new();
     if let Err(e) = cpuset.set(cpu) {
-        eprintln!("performance_mode: WARNING: cpuset.set({cpu}) for {label}: {e}");
+        let (width, online) = cpu_set_diag_context();
+        eprintln!(
+            "performance_mode: WARNING: cpuset.set({cpu}) for {label}: {e}. \
+             cpu_set bitmap holds CPU IDs 0..{width} (libc CPU_SETSIZE) and \
+             host reports {online} online CPUs (sysconf _SC_NPROCESSORS_ONLN). \
+             Either the cpuset spec was resolved against a stale topology or \
+             the bitmap cap needs raising on this build."
+        );
         return;
     }
     match nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &cpuset) {
         Ok(()) => eprintln!("performance_mode: pinned {label} to host CPU {cpu}"),
         Err(e) => eprintln!("performance_mode: WARNING: pin {label} to CPU {cpu}: {e}"),
     }
+}
+
+/// Snapshot the host's CPU-set bitmap width (libc `CPU_SETSIZE`) and
+/// the online-CPU count (sysconf `_SC_NPROCESSORS_ONLN`) for use in
+/// rich `cpuset.set` failure diagnostics. Renders sysconf failure as
+/// `"unavailable"` rather than `0` so a degenerate sysconf result is
+/// disambiguated from a legitimately zero count.
+fn cpu_set_diag_context() -> (usize, std::borrow::Cow<'static, str>) {
+    let width = libc::CPU_SETSIZE as usize;
+    let online: std::borrow::Cow<'static, str> = match nix::unistd::sysconf(
+        nix::unistd::SysconfVar::_NPROCESSORS_ONLN,
+    )
+    .ok()
+    .flatten()
+    {
+        Some(n) => format!("{n}").into(),
+        None => "unavailable".into(),
+    };
+    (width, online)
 }
 
 /// Set the calling thread's CPU mask to the supplied set. Distinct
@@ -343,11 +369,22 @@ pub(crate) fn set_thread_cpumask(cpus: &[usize], label: &str) {
     let mut cpuset = nix::sched::CpuSet::new();
     let mut applied: Vec<usize> = Vec::with_capacity(cpus.len());
     let mut skipped: Vec<usize> = Vec::new();
+    // Snapshot the bitmap width + online-CPU count once before the
+    // loop so a per-CPU diagnostic on overflow carries both numbers
+    // without re-syscalling sysconf on every failing iteration.
+    let (cpuset_bitmap_width, online_cpus_str) = cpu_set_diag_context();
     for &cpu in cpus {
         match cpuset.set(cpu) {
             Ok(()) => applied.push(cpu),
             Err(e) => {
-                eprintln!("no_perf_mode: WARNING: cpuset.set({cpu}) for {label}: {e}; skipping");
+                eprintln!(
+                    "no_perf_mode: WARNING: cpuset.set({cpu}) for {label}: {e}. \
+                     cpu_set bitmap holds CPU IDs 0..{cpuset_bitmap_width} \
+                     (libc CPU_SETSIZE) and host reports {online_cpus_str} \
+                     online CPUs (sysconf _SC_NPROCESSORS_ONLN). Either the \
+                     cpuset spec was resolved against a stale topology or \
+                     the bitmap cap needs raising on this build. Skipping {cpu}."
+                );
                 skipped.push(cpu);
             }
         }

@@ -203,7 +203,7 @@ impl KernelMetadata {
         self
     }
 
-    /// Unset the .config CRC32 hash.
+    /// Unset the .config CRC32 hash (back to the `None` default).
     pub fn clear_config_hash(mut self) -> Self {
         self.config_hash = None;
         self
@@ -215,7 +215,7 @@ impl KernelMetadata {
         self
     }
 
-    /// Unset the ktstr.kconfig CRC32 hash.
+    /// Unset the ktstr.kconfig CRC32 hash (back to the `None` default).
     pub fn clear_ktstr_kconfig_hash(mut self) -> Self {
         self.ktstr_kconfig_hash = None;
         self
@@ -227,7 +227,7 @@ impl KernelMetadata {
         self
     }
 
-    /// Unset the `--extra-kconfig` fragment CRC32 hash.
+    /// Unset the `--extra-kconfig` fragment CRC32 hash (back to the `None` default).
     pub fn clear_extra_kconfig_hash(mut self) -> Self {
         self.extra_kconfig_hash = None;
         self
@@ -683,6 +683,46 @@ mod tests {
         assert_eq!(parsed.extra_kconfig_hash.as_deref(), Some("extra-hash"));
         assert_eq!(parsed.source_vmlinux_size, Some(123_456_789));
         assert_eq!(parsed.source_vmlinux_mtime_secs, Some(1_700_000_000));
+    }
+
+    /// Pins the with_X → clear_X round-trip for every Option-bearing
+    /// setter group. Each pair must be symmetric: with_X populates,
+    /// clear_X resets to None. The pair-stat method
+    /// (`with_source_vmlinux_stat` / `clear_source_vmlinux_stat`)
+    /// covers two fields together — both must be Some after with_X
+    /// and both must be None after clear_X.
+    #[test]
+    fn kernel_metadata_clear_setters_round_trip() {
+        let populated = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64",
+            "bzImage",
+            "2026-04-12T10:00:00Z",
+        )
+        .with_version("6.14.2")
+        .with_config_hash("cfg-hash")
+        .with_ktstr_kconfig_hash("ktstr-hash")
+        .with_extra_kconfig_hash("extra-hash")
+        .with_source_vmlinux_stat(123_456_789, 1_700_000_000);
+        assert!(populated.version.is_some());
+        assert!(populated.config_hash.is_some());
+        assert!(populated.ktstr_kconfig_hash.is_some());
+        assert!(populated.extra_kconfig_hash.is_some());
+        assert!(populated.source_vmlinux_size.is_some());
+        assert!(populated.source_vmlinux_mtime_secs.is_some());
+
+        let cleared = populated
+            .clear_version()
+            .clear_config_hash()
+            .clear_ktstr_kconfig_hash()
+            .clear_extra_kconfig_hash()
+            .clear_source_vmlinux_stat();
+        assert!(cleared.version.is_none());
+        assert!(cleared.config_hash.is_none());
+        assert!(cleared.ktstr_kconfig_hash.is_none());
+        assert!(cleared.extra_kconfig_hash.is_none());
+        assert!(cleared.source_vmlinux_size.is_none());
+        assert!(cleared.source_vmlinux_mtime_secs.is_none());
     }
 
     #[test]
