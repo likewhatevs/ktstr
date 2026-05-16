@@ -868,8 +868,8 @@ pub struct WorkloadConfig {
     /// inherits the parent's nice value; `Some(n)` invokes
     /// `setpriority(PRIO_PROCESS, 0, n)` unconditionally — a user
     /// who wants the worker to land on nice 0 regardless of the
-    /// parent's nice (or a cgroup-level default merged in by
-    /// [`CgroupDef::nice`](crate::scenario::ops::CgroupDef::nice))
+    /// parent's nice (or a cgroup-level default stored at
+    /// [`CgroupDef::default_nice`](crate::scenario::ops::CgroupDef::default_nice))
     /// writes `Some(0)`, distinct from `None`.
     ///
     /// Values below the calling task's current nice require
@@ -1214,10 +1214,10 @@ pub struct WorkSpec {
     /// for range, `None`-vs-`Some(n)` semantics, and `CAP_SYS_NICE`
     /// rules.
     ///
-    /// To inherit a cgroup-level default merged in by
+    /// To inherit a cgroup-level default stored at
     /// [`CgroupDef::default_nice`](crate::scenario::ops::CgroupDef::default_nice),
-    /// leave this `None`. `Some(0)` opts out of the merge — see
-    /// [`WorkloadConfig::nice`] for the underlying
+    /// leave this `None`. `Some(0)` opts out of the cgroup-level
+    /// merge — see [`WorkloadConfig::nice`] for the underlying
     /// `setpriority(PRIO_PROCESS, 0, 0)` semantics.
     pub nice: Option<i32>,
     /// Per-worker comm set via `prctl(PR_SET_NAME)` at thread
