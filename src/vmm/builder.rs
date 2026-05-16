@@ -314,7 +314,7 @@ impl KtstrVmBuilder {
     }
 
     /// Override the `MonitorThresholds` used for stall detection and
-    /// verdict rendering. Defaults to `MonitorThresholds::DEFAULT`.
+    /// verdict rendering. Defaults to `MonitorThresholds::new()`.
     #[allow(dead_code)]
     pub fn monitor_thresholds(mut self, thresholds: crate::monitor::MonitorThresholds) -> Self {
         self.monitor_thresholds = Some(thresholds);

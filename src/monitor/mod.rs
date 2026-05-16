@@ -1099,7 +1099,9 @@ pub struct MonitorThresholds {
 }
 
 impl MonitorThresholds {
-    /// Default thresholds, usable in const context.
+    /// Build the default thresholds. `const fn` so it can sit in
+    /// `static` / `const` initializers and in
+    /// `..MonitorThresholds::new()` spread expressions.
     ///
     /// - imbalance 4.0: a scheduler that can't keep CPUs within 4x
     ///   load for `sustained_samples` consecutive reads has a real
@@ -1124,20 +1126,22 @@ impl MonitorThresholds {
     /// - max_keep_last_rate 100.0: dispatch_keep_last fires when a CPU
     ///   re-dispatches the previously running task because the scheduler
     ///   provided nothing. Sustained 100/s indicates dispatch starvation.
-    pub const DEFAULT: MonitorThresholds = MonitorThresholds {
-        max_imbalance_ratio: 4.0,
-        max_local_dsq_depth: 50,
-        fail_on_stall: true,
-        sustained_samples: 5,
-        max_fallback_rate: 200.0,
-        max_keep_last_rate: 100.0,
-        enforce: false,
-    };
+    pub const fn new() -> Self {
+        Self {
+            max_imbalance_ratio: 4.0,
+            max_local_dsq_depth: 50,
+            fail_on_stall: true,
+            sustained_samples: 5,
+            max_fallback_rate: 200.0,
+            max_keep_last_rate: 100.0,
+            enforce: false,
+        }
+    }
 }
 
 impl Default for MonitorThresholds {
     fn default() -> Self {
-        Self::DEFAULT
+        Self::new()
     }
 }
 

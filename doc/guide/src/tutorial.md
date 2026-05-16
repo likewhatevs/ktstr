@@ -340,7 +340,7 @@ Default checks already run with no configuration -- `not_starved` is
 
 Host-side monitor checks (imbalance ratio, DSQ depth, stall
 detection, fallback / keep-last event rates) are also enabled by
-default with thresholds from `MonitorThresholds::DEFAULT`.
+default with thresholds from `MonitorThresholds::new()`.
 
 Cpuset isolation is **opt-in** -- enable it with `isolation = true`.
 Override the spread threshold and add throughput-parity gates:

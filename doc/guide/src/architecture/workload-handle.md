@@ -36,7 +36,7 @@ this guidance to every ktstr type without checking each type's
 `Default` semantics — some have known footguns (e.g. `CgroupDef::default()`
 produces `name = "cg_0"` which collides with the conventional first
 cgroup name in most scenarios). Prefer the named constructors
-(`CgroupDef::named(...)`, `Setup::defs(...)`, etc.) for types where the
+(`CgroupDef::named(...)`, `Setup::Defs(...)`, etc.) for types where the
 `Default` is not unambiguously useful.
 
 `spawn()` forks `num_workers` child processes. Each child installs a

@@ -299,7 +299,16 @@ impl TopologyConstraints {
     /// that exceed the CPU/LLC caps (near-max-llc, max-cpu, and their
     /// -nosmt variants). Test authors that want broader coverage must
     /// raise `max_numa_nodes`, `max_llcs`, or `max_cpus` explicitly.
-    pub const DEFAULT: TopologyConstraints = TopologyConstraints {
+    ///
+    /// Single source of truth — struct-literal form (not
+    /// `Self::new()`) so that `..TopologyConstraints::DEFAULT` works
+    /// in `static` / `const` initializers. Rust forbids
+    /// `..fn_call()` spreads in statics (E0493, destructor of the
+    /// temporary cannot be evaluated at compile-time); a promoted
+    /// struct literal bypasses the temporary. [`Self::new()`] and
+    /// `Default::default()` delegate to this const for the
+    /// `const fn` / trait-impl entry points.
+    pub const DEFAULT: Self = Self {
         min_numa_nodes: 1,
         max_numa_nodes: Some(1),
         min_llcs: 1,
@@ -308,18 +317,20 @@ impl TopologyConstraints {
         min_cpus: 1,
         max_cpus: Some(192),
     };
+
+    /// Build the default constraints. Equivalent to
+    /// [`Self::DEFAULT`]; use the const directly when spreading in a
+    /// `static` / `const` initializer (Rust E0493 forbids
+    /// `..Self::new()` there). `Default::default()` is also
+    /// equivalent in non-const contexts.
+    pub const fn new() -> Self {
+        Self::DEFAULT
+    }
 }
 
 impl Default for TopologyConstraints {
-    /// Matches [`Self::DEFAULT`]. Enables `..Default::default()` struct
-    /// update syntax in non-const contexts — runtime builders,
-    /// test-body fixtures, anywhere a trait method call is permitted.
-    /// In const contexts (`static`/`const` initializers and
-    /// `declare_scheduler!`'s `constraints` field, which expands into
-    /// a `pub static`) use the const path `..Self::DEFAULT` instead;
-    /// `Default::default()` is not const-callable in current Rust.
     fn default() -> Self {
-        Self::DEFAULT
+        Self::new()
     }
 }
 
@@ -976,6 +987,14 @@ impl KtstrTestEntry {
     /// `true` boots a second VM with BPF probes attached on failure,
     /// which roughly doubles a failing test's wall-clock time.
     ///
+    /// [`Self::DEFAULT`] is the source of truth (struct-literal
+    /// const); [`Self::new()`] is a delegating alias for method-style
+    /// use and `Default::default()` is the trait-shim — both
+    /// equivalent in non-const contexts. See the alias's docstring
+    /// for the Rust E0493 constraint that forces the const surface
+    /// for `static` / `const` initializer spread sites like
+    /// `#[distributed_slice(KTSTR_TESTS)]` macro expansions.
+    ///
     /// ```
     /// use ktstr::prelude::*;
     /// use ktstr::test_support::{KTSTR_TESTS, KtstrTestEntry, Scheduler};
@@ -993,7 +1012,7 @@ impl KtstrTestEntry {
     ///     ..KtstrTestEntry::DEFAULT
     /// };
     /// ```
-    pub const DEFAULT: KtstrTestEntry = KtstrTestEntry {
+    pub const DEFAULT: Self = Self {
         name: "",
         func: default_test_func,
         topology: Topology {
@@ -1026,6 +1045,14 @@ impl KtstrTestEntry {
         post_vm: None,
         num_snapshots: 0,
     };
+
+    /// Build the default entry. Equivalent to [`Self::DEFAULT`]; use
+    /// the const directly when spreading in a `static` / `const`
+    /// initializer (Rust E0493 forbids `..Self::new()` there).
+    /// `Default::default()` is also equivalent in non-const contexts.
+    pub const fn new() -> Self {
+        Self::DEFAULT
+    }
 
     /// Reject values that would boot a broken VM or leave assertions
     /// vacuously passing. The `#[ktstr_test]` proc macro enforces the
@@ -1313,13 +1340,8 @@ impl KtstrTestEntry {
 }
 
 impl Default for KtstrTestEntry {
-    /// Delegates to [`Self::DEFAULT`]. The const exists for
-    /// struct-update spreads in static contexts (`..KtstrTestEntry::DEFAULT`)
-    /// where const-context evaluation is required; the trait impl
-    /// lets `..Default::default()` work uniformly in non-const
-    /// callers (gauntlet rewriters, integration-test fixtures).
     fn default() -> Self {
-        Self::DEFAULT
+        Self::new()
     }
 }
 

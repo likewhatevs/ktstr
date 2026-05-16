@@ -1647,9 +1647,10 @@ impl Default for CpuLimits {
 
 /// How to produce the CgroupDefs for a step's setup phase.
 ///
-/// Construct via [`Setup::defs`] (static list), [`Setup::factory`]
-/// (runtime-generated from `&Ctx`), [`Setup::empty`] (no cgroups), or
-/// via [`From<Vec<CgroupDef>>`](Self::from) (`vec![def1, def2].into()`).
+/// Construct via `Setup::Defs(vec)` (variant constructor for a static
+/// list), [`Setup::factory`] (runtime-generated from `&Ctx`),
+/// `Setup::default()` (no cgroups — `Setup::Defs(Vec::new())`), or via
+/// [`From<Vec<CgroupDef>>`](Self::from) (`vec![def1, def2].into()`).
 pub enum Setup {
     /// Static list of cgroup definitions.
     Defs(Vec<CgroupDef>),
@@ -1679,26 +1680,13 @@ impl std::fmt::Debug for Setup {
 }
 
 impl Setup {
-    /// Construct a [`Setup::Defs`] from a vector of cgroup definitions.
-    /// Equivalent to `Setup::Defs(defs)` or `defs.into()`; the named
-    /// form is the canonical constructor for discoverability.
-    pub fn defs(defs: Vec<CgroupDef>) -> Self {
-        Setup::Defs(defs)
-    }
-
-    /// Construct a [`Setup::Factory`] from a function pointer.
-    /// Equivalent to `Setup::Factory(f)`; the named form mirrors
-    /// [`Setup::defs`] for symmetry.
+    /// Construct a [`Setup::Factory`] from a function pointer. The
+    /// `Defs` variant is constructed directly via `Setup::Defs(vec)`
+    /// (variant constructor) or `Default::default()` for the empty
+    /// case; `Factory` needs a named constructor because variant
+    /// construction with a `fn` pointer literal is awkward to read.
     pub const fn factory(f: fn(&Ctx) -> Vec<CgroupDef>) -> Self {
         Setup::Factory(f)
-    }
-
-    /// Construct an empty [`Setup::Defs`] — no cgroups created in the
-    /// step. Equivalent to `Setup::Defs(vec![])`, `Setup::defs(vec![])`,
-    /// or `Setup::default()`. `const fn` so it can sit in `static` /
-    /// `const` contexts alongside [`Setup::factory`].
-    pub const fn empty() -> Self {
-        Setup::Defs(Vec::new())
     }
 
     pub(super) fn resolve(&self, ctx: &Ctx) -> Vec<CgroupDef> {
@@ -1717,11 +1705,11 @@ impl Setup {
 }
 
 impl Default for Setup {
-    /// Delegates to [`Setup::empty`] — no cgroups created. The
-    /// `Factory` variant cannot serve as a Default because it holds
-    /// a fn pointer with no semantic no-op.
+    /// Empty `Setup::Defs` — no cgroups created. The `Factory` variant
+    /// cannot serve as a Default because it holds a fn pointer with no
+    /// semantic no-op.
     fn default() -> Self {
-        Setup::empty()
+        Setup::Defs(Vec::new())
     }
 }
 
@@ -1759,7 +1747,7 @@ impl Step {
     #[must_use = "dropping a Step discards its ops and hold for that scenario phase"]
     pub fn new(ops: Vec<Op>, hold: HoldSpec) -> Self {
         Self {
-            setup: Setup::empty(),
+            setup: Setup::Defs(Vec::new()),
             ops,
             hold,
         }
@@ -1821,7 +1809,7 @@ impl Step {
     #[must_use = "dropping a Step discards its payload and hold for that scenario phase"]
     pub fn with_payload(payload: &'static crate::test_support::Payload, hold: HoldSpec) -> Self {
         Self {
-            setup: Setup::empty(),
+            setup: Setup::Defs(Vec::new()),
             ops: vec![Op::run_payload(payload, vec![])],
             hold,
         }
@@ -1834,7 +1822,7 @@ impl Default for Step {
     /// that compose Steps via `..Default::default()` field overrides.
     fn default() -> Self {
         Self {
-            setup: Setup::empty(),
+            setup: Setup::Defs(Vec::new()),
             ops: Vec::new(),
             hold: HoldSpec::FULL,
         }
@@ -2724,7 +2712,7 @@ mod cgroup_def_default_tests {
         assert_eq!(limits.weight, None);
     }
 
-    /// [`Step::default()`] MUST produce `setup = Setup::empty()`,
+    /// [`Step::default()`] MUST produce `setup = Setup::Defs(vec![])`,
     /// `ops = []`, `hold = HoldSpec::FULL`. This is the documented
     /// identity-step: zero defs, zero ops, full-duration hold. A
     /// regression that switched any field's default would change
@@ -2740,8 +2728,7 @@ mod cgroup_def_default_tests {
         let s = Step::default();
         assert!(
             matches!(s.setup, Setup::Defs(ref v) if v.is_empty()),
-            "Step::default().setup MUST be Setup::empty() (which \
-             matches Setup::Defs(vec![])); got {:?}",
+            "Step::default().setup MUST be Setup::Defs(vec![]); got {:?}",
             s.setup,
         );
         assert!(s.ops.is_empty(), "Step::default().ops MUST be []");
@@ -2766,34 +2753,18 @@ mod cgroup_def_default_tests {
         assert!(matches!(composed.hold, HoldSpec::Frac(f) if f == 1.0));
     }
 
-    /// GAP 2: pin that `Setup::defs(v)`, `Setup::factory(f)`,
-    /// `Setup::empty()`, AND `Setup::default()` all resolve to the
-    /// same shape a direct `Setup::Defs(v)` / `Setup::Factory(f)`
+    /// Pin that `Setup::factory(f)` and `Setup::default()` resolve to
+    /// the same shape a direct `Setup::Defs(v)` / `Setup::Factory(f)`
     /// construction yields. `Setup` has no `PartialEq` (it holds a
     /// fn pointer in `Factory`), so we discriminate on variant
     /// shape + payload.
     #[test]
     fn setup_constructors_match_direct_variants() {
-        // defs(vec![..]) -> Defs(vec![..])
-        let from_ctor = Setup::defs(vec![CgroupDef::named("cg_a")]);
-        match from_ctor {
-            Setup::Defs(ref v) => {
-                assert_eq!(v.len(), 1);
-                assert_eq!(v[0].name.as_ref(), "cg_a");
-            }
-            Setup::Factory(_) => panic!("Setup::defs must produce Defs variant"),
-        }
-        // empty() -> Defs(vec![])
-        let from_empty = Setup::empty();
-        match from_empty {
-            Setup::Defs(ref v) => assert!(v.is_empty()),
-            Setup::Factory(_) => panic!("Setup::empty must produce Defs variant"),
-        }
-        // Default::default() -> Defs(vec![]) (delegates to empty())
+        // Default::default() -> Defs(vec![])
         let from_default: Setup = Default::default();
         assert!(
             matches!(from_default, Setup::Defs(ref v) if v.is_empty()),
-            "Setup::default() must produce Setup::empty() == Setup::Defs(vec![])"
+            "Setup::default() must produce Setup::Defs(Vec::new())"
         );
         // factory(fn) -> Factory(fn)
         fn make_zero_cgroups(_: &Ctx) -> Vec<CgroupDef> {

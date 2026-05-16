@@ -1669,7 +1669,7 @@ pub struct Assert {
     /// `details`, but the verdict's `passed` stays `true`. Tests that
     /// want monitor violations to fail the run call
     /// [`Self::with_monitor_defaults`], which populates each monitor
-    /// threshold from [`crate::monitor::MonitorThresholds::DEFAULT`]
+    /// threshold from [`crate::monitor::MonitorThresholds::new()`]
     /// and sets this flag to `true`.
     pub enforce_monitor_thresholds: bool,
 
@@ -2189,7 +2189,7 @@ impl Assert {
 
     pub(crate) fn monitor_thresholds(&self) -> crate::monitor::MonitorThresholds {
         use crate::monitor::MonitorThresholds;
-        let d = MonitorThresholds::DEFAULT;
+        let d = MonitorThresholds::new();
         MonitorThresholds {
             max_imbalance_ratio: self.max_imbalance_ratio.unwrap_or(d.max_imbalance_ratio),
             max_local_dsq_depth: self.max_local_dsq_depth.unwrap_or(d.max_local_dsq_depth),
@@ -2207,13 +2207,13 @@ impl Assert {
     /// threshold violation fails the test.
     ///
     /// Also populates any unset monitor-threshold field with the
-    /// canonical default from [`crate::monitor::MonitorThresholds::DEFAULT`]
+    /// canonical default from [`crate::monitor::MonitorThresholds::new()`]
     /// — so a test that only cares about `max_keep_last_rate` can chain
     /// `.max_keep_last_rate(N).with_monitor_defaults()` and get the
     /// other four enforced at their canonical defaults.
     pub const fn with_monitor_defaults(mut self) -> Self {
         use crate::monitor::MonitorThresholds;
-        let d = MonitorThresholds::DEFAULT;
+        let d = MonitorThresholds::new();
         if self.max_imbalance_ratio.is_none() {
             self.max_imbalance_ratio = Some(d.max_imbalance_ratio);
         }

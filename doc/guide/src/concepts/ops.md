@@ -278,18 +278,18 @@ pub struct Step {
 ```
 
 `Setup` is either `Defs(Vec<CgroupDef>)` or
-`Factory(fn(&Ctx) -> Vec<CgroupDef>)`. Construct via the named
-const-fn constructors:
+`Factory(fn(&Ctx) -> Vec<CgroupDef>)`. Construct via the variant
+syntax or the named const-fn for the `Factory` arm:
 
-- `Setup::defs(defs)` -- wrap an existing `Vec<CgroupDef>`.
-- `Setup::factory(f)` -- defer construction to a `fn(&Ctx) -> Vec<CgroupDef>`
-  so the def list can depend on the resolved topology.
-- `Setup::empty()` -- zero-def setup (the ops-only path).
+- `Setup::Defs(defs)` -- variant constructor for the static-list case
+  (`Setup::Defs(vec![CgroupDef::named("cg")])`).
+- `Setup::factory(f)` -- named const-fn constructor for the `Factory`
+  arm so the def list can depend on the resolved topology.
 
-`Setup::default()` returns `Setup::empty()`. `Vec<CgroupDef>` also
-implements `Into<Setup>` for the inline `setup: vec![...].into()`
-form when a chain-builder context already produces a Vec; new code
-should prefer the named constructors for discoverability.
+`Setup::default()` returns `Setup::Defs(Vec::new())` (the ops-only
+path). `Vec<CgroupDef>` also implements `Into<Setup>` for the inline
+`setup: vec![...].into()` form when a chain-builder context already
+produces a `Vec`.
 
 ### Constructors
 

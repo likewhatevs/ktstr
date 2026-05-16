@@ -5023,7 +5023,7 @@ mod tests {
     // metric set + a `MetricBounds` with a single check enabled
     // and asserts the violation list contents.
 
-    /// `MetricBounds::NONE` (every field `None`) produces zero
+    /// `MetricBounds::default()` (every field `None`) produces zero
     /// violations on any input — pins the "no bounds declared = no
     /// extra checks" contract that lets payloads opt in to the
     /// pass without paying for it.
@@ -5033,11 +5033,11 @@ mod tests {
             llm_metric("rps", -42.0),    // would trip value_min if set
             llm_metric("latency", 1e15), // would trip value_max if set
         ];
-        let bounds = crate::test_support::MetricBounds::NONE;
+        let bounds = crate::test_support::MetricBounds::default();
         let violations = super::validate_metric_bounds(&metrics, &bounds);
         assert!(
             violations.is_empty(),
-            "MetricBounds::NONE must produce zero violations regardless of input; \
+            "MetricBounds::default() must produce zero violations regardless of input; \
              got: {violations:?}",
         );
     }
@@ -5051,7 +5051,7 @@ mod tests {
         let metrics = vec![llm_metric("a", 1.0), llm_metric("b", 2.0)];
         let bounds = crate::test_support::MetricBounds {
             min_count: Some(5),
-            ..crate::test_support::MetricBounds::NONE
+            ..crate::test_support::MetricBounds::default()
         };
         let violations = super::validate_metric_bounds(&metrics, &bounds);
         assert_eq!(
@@ -5082,7 +5082,7 @@ mod tests {
         ];
         let bounds = crate::test_support::MetricBounds {
             min_count: Some(3),
-            ..crate::test_support::MetricBounds::NONE
+            ..crate::test_support::MetricBounds::default()
         };
         let violations = super::validate_metric_bounds(&metrics, &bounds);
         assert!(
@@ -5104,7 +5104,7 @@ mod tests {
         ];
         let bounds = crate::test_support::MetricBounds {
             value_min: Some(0.0),
-            ..crate::test_support::MetricBounds::NONE
+            ..crate::test_support::MetricBounds::default()
         };
         let violations = super::validate_metric_bounds(&metrics, &bounds);
         assert_eq!(
@@ -5141,7 +5141,7 @@ mod tests {
         let metrics = vec![llm_metric("zero", 0.0)];
         let bounds = crate::test_support::MetricBounds {
             value_min: Some(0.0),
-            ..crate::test_support::MetricBounds::NONE
+            ..crate::test_support::MetricBounds::default()
         };
         let violations = super::validate_metric_bounds(&metrics, &bounds);
         assert!(
@@ -5162,7 +5162,7 @@ mod tests {
         ];
         let bounds = crate::test_support::MetricBounds {
             value_max: Some(1e12),
-            ..crate::test_support::MetricBounds::NONE
+            ..crate::test_support::MetricBounds::default()
         };
         let violations = super::validate_metric_bounds(&metrics, &bounds);
         assert_eq!(
@@ -5230,7 +5230,7 @@ mod tests {
     fn validate_metric_bounds_empty_metrics_with_min_count_violates() {
         let bounds = crate::test_support::MetricBounds {
             min_count: Some(1),
-            ..crate::test_support::MetricBounds::NONE
+            ..crate::test_support::MetricBounds::default()
         };
         let violations = super::validate_metric_bounds(&[], &bounds);
         assert_eq!(
@@ -5322,7 +5322,7 @@ mod tests {
             metric_hints: Vec::new(),
             metric_bounds: Some(crate::test_support::MetricBounds {
                 min_count: Some(1),
-                ..crate::test_support::MetricBounds::NONE
+                ..crate::test_support::MetricBounds::default()
             }),
         }];
         let failures = host_side_llm_extract(&mut pm, &raws);

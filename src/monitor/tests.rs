@@ -511,7 +511,7 @@ fn balanced_sample(elapsed_ms: u64, clock_base: u64) -> MonitorSample {
 /// Without this canary, a future commit that flips the default back
 /// to `enforce: true` (or any other value) would silently re-enable
 /// enforcement for all tests using `..Default::default()` or
-/// `MonitorThresholds::DEFAULT` — masking real bugs that the
+/// `MonitorThresholds::new()` — masking real bugs that the
 /// report-only mode is designed to surface as warnings instead of
 /// failures.
 #[test]
@@ -521,13 +521,13 @@ fn enforce_defaults_to_false() {
         !t.enforce,
         "enforce must default to false (report-only mode)"
     );
-    let d = MonitorThresholds::DEFAULT;
+    let d = MonitorThresholds::new();
     assert!(!d.enforce, "DEFAULT.enforce must match default()");
 }
 
 #[test]
 fn thresholds_default_values() {
-    // Regression guard for `MonitorThresholds::DEFAULT`. Every
+    // Regression guard for `MonitorThresholds::new()`. Every
     // field is asserted: changing a default silently shifts what
     // "passes by default" across every test that inherits
     // defaults via `Assert::default_checks()` + per-scheduler
@@ -564,7 +564,7 @@ fn thresholds_default_matches_const() {
     // forwards, but the forward is a single expression that a
     // drive-by refactor could break.
     let a = MonitorThresholds::default();
-    let b = MonitorThresholds::DEFAULT;
+    let b = MonitorThresholds::new();
     assert!((a.max_imbalance_ratio - b.max_imbalance_ratio).abs() < f64::EPSILON);
     assert_eq!(a.max_local_dsq_depth, b.max_local_dsq_depth);
     assert_eq!(a.fail_on_stall, b.fail_on_stall);

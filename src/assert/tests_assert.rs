@@ -143,7 +143,7 @@ fn merge_enforce_monitor_thresholds_or_semantics_false_true() {
 }
 
 /// Behavior pin: `with_monitor_defaults()` fills ALL six unset
-/// monitor-threshold Option fields with `MonitorThresholds::DEFAULT`
+/// monitor-threshold Option fields with `MonitorThresholds::new()`
 /// values, not just `enforce_monitor_thresholds`. Documented on
 /// `Assert::with_monitor_defaults` ("Also populates any unset
 /// monitor-threshold field with the canonical default"). Without
@@ -157,7 +157,7 @@ fn merge_enforce_monitor_thresholds_or_semantics_false_true() {
 fn with_monitor_defaults_fills_all_unset_threshold_fields() {
     use crate::monitor::MonitorThresholds;
     let assert = Assert::NO_OVERRIDES.with_monitor_defaults();
-    let d = MonitorThresholds::DEFAULT;
+    let d = MonitorThresholds::new();
     assert!(
         (assert.max_imbalance_ratio.unwrap() - d.max_imbalance_ratio).abs() < f64::EPSILON,
         "max_imbalance_ratio must be auto-filled with DEFAULT"
@@ -225,7 +225,7 @@ fn merge_enforce_monitor_thresholds_or_semantics_true_true() {
 #[test]
 fn with_monitor_defaults_preserves_user_set_values() {
     use crate::monitor::MonitorThresholds;
-    let d = MonitorThresholds::DEFAULT;
+    let d = MonitorThresholds::new();
     // Pick values DIFFERENT from each DEFAULT so the test fails if
     // the auto-fill loop drops its `is_none()` guard and silently
     // overwrites. Differs from DEFAULT by ~50% on each axis where
@@ -493,7 +493,7 @@ fn assert_monitor_thresholds_extraction() {
 fn assert_monitor_thresholds_defaults_when_none() {
     let v = Assert::NO_OVERRIDES;
     let t = v.monitor_thresholds();
-    let d = crate::monitor::MonitorThresholds::DEFAULT;
+    let d = crate::monitor::MonitorThresholds::new();
     assert!((t.max_imbalance_ratio - d.max_imbalance_ratio).abs() < f64::EPSILON);
     assert_eq!(t.max_local_dsq_depth, d.max_local_dsq_depth);
 }
@@ -697,8 +697,8 @@ fn assert_worker_plan_extracts_fields() {
 fn assert_monitor_thresholds_defaults() {
     let v = Assert::NO_OVERRIDES;
     let t = v.monitor_thresholds();
-    // Should use MonitorThresholds::DEFAULT values.
-    let d = crate::monitor::MonitorThresholds::DEFAULT;
+    // Should use MonitorThresholds::new() values.
+    let d = crate::monitor::MonitorThresholds::new();
     assert_eq!(t.max_imbalance_ratio, d.max_imbalance_ratio);
     assert_eq!(t.max_local_dsq_depth, d.max_local_dsq_depth);
 }

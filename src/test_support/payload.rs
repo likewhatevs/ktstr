@@ -837,7 +837,7 @@ pub struct MetricHint {
 /// scales with workload duration. The struct is `#[non_exhaustive]`
 /// to reserve room for future bound classes; out-of-crate callers
 /// construct values through the [`MetricBounds::new`] const
-/// constructor (or [`MetricBounds::NONE`] for the all-disabled
+/// constructor (or [`MetricBounds::default()`] for the all-disabled
 /// baseline).
 ///
 /// ```
@@ -884,17 +884,6 @@ pub struct MetricBounds {
 }
 
 impl MetricBounds {
-    /// Const constructor for the all-disabled defaults — every
-    /// bound is `None`, so applying these to a metric set produces
-    /// zero violations regardless of input shape. Useful as a
-    /// const seed in tests and as the documented "no extra checks"
-    /// baseline.
-    pub const NONE: MetricBounds = MetricBounds {
-        min_count: None,
-        value_min: None,
-        value_max: None,
-    };
-
     /// Const constructor that takes all three bounds at once. The
     /// only out-of-crate construction path (the struct itself is
     /// `#[non_exhaustive]` so external callers cannot use struct-
@@ -914,11 +903,11 @@ impl MetricBounds {
 }
 
 impl Default for MetricBounds {
-    /// Delegates to [`Self::NONE`] (all bounds disabled). Lets
-    /// `..Default::default()` work uniformly alongside the
-    /// `..MetricBounds::NONE` spread.
+    /// All bounds disabled — applying these to a metric set produces
+    /// zero violations regardless of input shape. Equivalent to
+    /// `MetricBounds::new(None, None, None)`.
     fn default() -> Self {
-        Self::NONE
+        Self::new(None, None, None)
     }
 }
 
@@ -1865,21 +1854,16 @@ mod tests {
         assert_eq!(restored.stderr, original.stderr);
     }
 
-    /// Lock-step pin: `MetricBounds::default()` must agree with
-    /// `MetricBounds::NONE` — both routes describe the same "no
-    /// extra checks" baseline. A regression where Default seeds a
-    /// non-None bound (e.g. a defensive `value_max = Some(f64::MAX)`)
-    /// would silently start failing previously-passing metric
-    /// streams whose `..MetricBounds::NONE` callers stayed quiet.
+    /// `MetricBounds::default()` must produce the all-`None` baseline
+    /// (no extra checks). A regression where Default seeds a non-None
+    /// bound (e.g. a defensive `value_max = Some(f64::MAX)`) would
+    /// silently start failing previously-passing metric streams whose
+    /// `..MetricBounds::default()` spread callers stayed quiet.
     #[test]
-    fn metric_bounds_default_matches_none() {
-        let from_const = MetricBounds::NONE;
-        let from_trait: MetricBounds = Default::default();
-        assert_eq!(from_trait.min_count, from_const.min_count);
-        assert_eq!(from_trait.value_min, from_const.value_min);
-        assert_eq!(from_trait.value_max, from_const.value_max);
-        assert!(from_const.min_count.is_none());
-        assert!(from_const.value_min.is_none());
-        assert!(from_const.value_max.is_none());
+    fn metric_bounds_default_is_all_none() {
+        let bounds: MetricBounds = Default::default();
+        assert!(bounds.min_count.is_none());
+        assert!(bounds.value_min.is_none());
+        assert!(bounds.value_max.is_none());
     }
 }

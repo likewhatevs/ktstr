@@ -167,7 +167,7 @@ Checking uses a three-layer merge:
    baseline policy; today it is a synonym. Tests opt in to
    assertions explicitly via scheduler-level or per-test overrides,
    or by calling `.with_monitor_defaults()` to populate the
-   monitor-threshold bundle from `MonitorThresholds::DEFAULT`.
+   monitor-threshold bundle from `MonitorThresholds::new()`.
 2. `Scheduler.assert` -- scheduler-level overrides.
 3. Per-test `assert` -- test-specific overrides via `#[ktstr_test]`
    attributes.
@@ -402,7 +402,7 @@ combine claim outcomes with `assert_cgroup` / `assert_baseline` /
 - `.with_monitor_defaults()` -- populates the monitor-threshold
   bundle (`max_imbalance_ratio`, `max_local_dsq_depth`,
   `fail_on_stall`, `sustained_samples`, `max_fallback_rate`,
-  `max_keep_last_rate`) from `MonitorThresholds::DEFAULT`. Tests that
+  `max_keep_last_rate`) from `MonitorThresholds::new()`. Tests that
   want stall + imbalance protection must opt in via this method or
   set the fields directly.
 
