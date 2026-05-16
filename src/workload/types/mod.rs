@@ -1798,7 +1798,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::Bursty`] variant doc for preconditions.
-    pub fn bursty(burst_duration: Duration, sleep_duration: Duration) -> Self {
+    pub const fn bursty(burst_duration: Duration, sleep_duration: Duration) -> Self {
         WorkType::Bursty {
             burst_duration,
             sleep_duration,
@@ -1809,7 +1809,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::PipeIo`] variant doc for preconditions.
-    pub fn pipe_io(burst_iters: u64) -> Self {
+    pub const fn pipe_io(burst_iters: u64) -> Self {
         WorkType::PipeIo { burst_iters }
     }
 
@@ -1817,7 +1817,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::FutexPingPong`] variant doc for preconditions.
-    pub fn futex_ping_pong(spin_iters: u64) -> Self {
+    pub const fn futex_ping_pong(spin_iters: u64) -> Self {
         WorkType::FutexPingPong { spin_iters }
     }
 
@@ -1825,7 +1825,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::CachePressure`] variant doc for preconditions.
-    pub fn cache_pressure(size_kb: usize, stride: usize) -> Self {
+    pub const fn cache_pressure(size_kb: usize, stride: usize) -> Self {
         WorkType::CachePressure { size_kb, stride }
     }
 
@@ -1833,7 +1833,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::CacheYield`] variant doc for preconditions.
-    pub fn cache_yield(size_kb: usize, stride: usize) -> Self {
+    pub const fn cache_yield(size_kb: usize, stride: usize) -> Self {
         WorkType::CacheYield { size_kb, stride }
     }
 
@@ -1841,7 +1841,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::CachePipe`] variant doc for preconditions.
-    pub fn cache_pipe(size_kb: usize, burst_iters: u64) -> Self {
+    pub const fn cache_pipe(size_kb: usize, burst_iters: u64) -> Self {
         WorkType::CachePipe {
             size_kb,
             burst_iters,
@@ -1852,7 +1852,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::FutexFanOut`] variant doc for preconditions.
-    pub fn futex_fan_out(fan_out: usize, spin_iters: u64) -> Self {
+    pub const fn futex_fan_out(fan_out: usize, spin_iters: u64) -> Self {
         WorkType::FutexFanOut {
             fan_out,
             spin_iters,
@@ -1863,7 +1863,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::AffinityChurn`] variant doc for preconditions.
-    pub fn affinity_churn(spin_iters: u64) -> Self {
+    pub const fn affinity_churn(spin_iters: u64) -> Self {
         WorkType::AffinityChurn { spin_iters }
     }
 
@@ -1871,7 +1871,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::PolicyChurn`] variant doc for preconditions.
-    pub fn policy_churn(spin_iters: u64) -> Self {
+    pub const fn policy_churn(spin_iters: u64) -> Self {
         WorkType::PolicyChurn { spin_iters }
     }
 
@@ -1889,7 +1889,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::FanOutCompute`] variant doc for preconditions.
-    pub fn fan_out_compute(
+    pub const fn fan_out_compute(
         fan_out: usize,
         cache_footprint_kb: usize,
         operations: usize,
@@ -1907,7 +1907,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::PageFaultChurn`] variant doc for preconditions.
-    pub fn page_fault_churn(region_kb: usize, touches_per_cycle: usize, spin_iters: u64) -> Self {
+    pub const fn page_fault_churn(region_kb: usize, touches_per_cycle: usize, spin_iters: u64) -> Self {
         WorkType::PageFaultChurn {
             region_kb,
             touches_per_cycle,
@@ -1919,7 +1919,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::MutexContention`] variant doc for preconditions.
-    pub fn mutex_contention(contenders: usize, hold_iters: u64, work_iters: u64) -> Self {
+    pub const fn mutex_contention(contenders: usize, hold_iters: u64, work_iters: u64) -> Self {
         WorkType::MutexContention {
             contenders,
             hold_iters,
@@ -1933,7 +1933,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::ThunderingHerd`] variant doc for preconditions.
-    pub fn thundering_herd(waiters: usize, batches: u64, inter_batch_ms: u64) -> Self {
+    pub const fn thundering_herd(waiters: usize, batches: u64, inter_batch_ms: u64) -> Self {
         WorkType::ThunderingHerd {
             waiters,
             batches,
@@ -1948,7 +1948,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::PriorityInversion`] variant doc for preconditions.
-    pub fn priority_inversion(
+    pub const fn priority_inversion(
         high_count: usize,
         medium_count: usize,
         low_count: usize,
@@ -1971,7 +1971,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::ProducerConsumerImbalance`] variant doc for preconditions.
-    pub fn producer_consumer_imbalance(
+    pub const fn producer_consumer_imbalance(
         producers: usize,
         consumers: usize,
         produce_rate_hz: u64,
@@ -1993,7 +1993,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::RtStarvation`] variant doc for preconditions.
-    pub fn rt_starvation(
+    pub const fn rt_starvation(
         rt_workers: usize,
         cfs_workers: usize,
         rt_priority: i32,
@@ -2012,7 +2012,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::AsymmetricWaker`] variant doc for preconditions.
-    pub fn asymmetric_waker(
+    pub const fn asymmetric_waker(
         waker_class: SchedClass,
         wakee_class: SchedClass,
         burst_iters: u64,
@@ -2030,7 +2030,7 @@ impl WorkType {
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::WakeChain`] variant doc for preconditions
     /// (`depth >= 2`, `num_workers` divisible by `depth`, etc.).
-    pub fn wake_chain(depth: usize, wake: WakeMechanism, work_per_hop: Duration) -> Self {
+    pub const fn wake_chain(depth: usize, wake: WakeMechanism, work_per_hop: Duration) -> Self {
         WorkType::WakeChain {
             depth,
             wake,
@@ -2079,7 +2079,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::CgroupChurn`] variant doc for preconditions.
-    pub fn cgroup_churn(groups: usize, cycle_ms: u64) -> Self {
+    pub const fn cgroup_churn(groups: usize, cycle_ms: u64) -> Self {
         WorkType::CgroupChurn { groups, cycle_ms }
     }
 
@@ -2087,7 +2087,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::SignalStorm`] variant doc for preconditions.
-    pub fn signal_storm(signals_per_iter: u64, work_iters: u64) -> Self {
+    pub const fn signal_storm(signals_per_iter: u64, work_iters: u64) -> Self {
         WorkType::SignalStorm {
             signals_per_iter,
             work_iters,
@@ -2098,7 +2098,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::PreemptStorm`] variant doc for preconditions.
-    pub fn preempt_storm(cfs_workers: usize, rt_burst_iters: u64, rt_sleep_us: u64) -> Self {
+    pub const fn preempt_storm(cfs_workers: usize, rt_burst_iters: u64, rt_sleep_us: u64) -> Self {
         WorkType::PreemptStorm {
             cfs_workers,
             rt_burst_iters,
@@ -2110,7 +2110,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::EpollStorm`] variant doc for preconditions.
-    pub fn epoll_storm(producers: usize, consumers: usize, events_per_burst: u64) -> Self {
+    pub const fn epoll_storm(producers: usize, consumers: usize, events_per_burst: u64) -> Self {
         WorkType::EpollStorm {
             producers,
             consumers,
@@ -2122,7 +2122,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::NumaMigrationChurn`] variant doc for preconditions.
-    pub fn numa_migration_churn(period_ms: u64) -> Self {
+    pub const fn numa_migration_churn(period_ms: u64) -> Self {
         WorkType::NumaMigrationChurn { period_ms }
     }
 
@@ -2150,7 +2150,7 @@ impl WorkType {
     /// precise_timing: true }`. See the variant's
     /// `precise_timing` field doc for the kernel-side
     /// mechanism.
-    pub fn idle_churn(burst_duration: Duration, sleep_duration: Duration) -> Self {
+    pub const fn idle_churn(burst_duration: Duration, sleep_duration: Duration) -> Self {
         WorkType::IdleChurn {
             burst_duration,
             sleep_duration,
@@ -2168,7 +2168,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time;
     /// see [`WorkType::AluHot`] variant doc for preconditions.
-    pub fn alu_hot(width: AluWidth) -> Self {
+    pub const fn alu_hot(width: AluWidth) -> Self {
         WorkType::AluHot { width }
     }
 
@@ -2181,7 +2181,7 @@ impl WorkType {
     /// spawn-time check so callers get immediate feedback at
     /// the call site rather than discovering the rejection
     /// only at [`WorkloadHandle::spawn`] time.
-    pub fn ipc_variance(
+    pub const fn ipc_variance(
         hot_iters: u64,
         cold_iters: u64,
         period_iters: u64,

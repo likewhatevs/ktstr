@@ -1244,7 +1244,7 @@ impl CgroupDef {
     /// explicitly via `setpriority(PRIO_PROCESS, 0, 0)` rather than
     /// inheriting the cgroup default.
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn nice(mut self, n: i32) -> Self {
+    pub const fn nice(mut self, n: i32) -> Self {
         self.default_nice = Some(n);
         self
     }
@@ -1267,7 +1267,7 @@ impl CgroupDef {
     /// of declaration order. The cgroup-level default lives in
     /// [`Self::default_uid`].
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn uid(mut self, uid: u32) -> Self {
+    pub const fn uid(mut self, uid: u32) -> Self {
         self.default_uid = Some(uid);
         self
     }
@@ -1278,7 +1278,7 @@ impl CgroupDef {
     /// of declaration order. The cgroup-level default lives in
     /// [`Self::default_gid`].
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn gid(mut self, gid: u32) -> Self {
+    pub const fn gid(mut self, gid: u32) -> Self {
         self.default_gid = Some(gid);
         self
     }
@@ -1342,14 +1342,14 @@ impl CgroupDef {
     /// regardless of declaration order. The cgroup-level default
     /// lives in [`Self::default_numa_node`].
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn numa_node(mut self, node: u32) -> Self {
+    pub const fn numa_node(mut self, node: u32) -> Self {
         self.default_numa_node = Some(node);
         self
     }
 
     /// When true, the gauntlet work_type override replaces each WorkSpec's work type.
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn swappable(mut self, swappable: bool) -> Self {
+    pub const fn swappable(mut self, swappable: bool) -> Self {
         self.swappable = swappable;
         self
     }
@@ -1833,7 +1833,7 @@ impl Step {
     /// `with_X` for alternative constructors (see [`with_defs`](Self::with_defs),
     /// [`with_payload`](Self::with_payload)).
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn set_hold(mut self, hold: HoldSpec) -> Self {
+    pub const fn set_hold(mut self, hold: HoldSpec) -> Self {
         self.hold = hold;
         self
     }
@@ -2102,7 +2102,7 @@ impl Op {
     }
 
     /// Spawn workers in the parent cgroup.
-    pub fn spawn_host(work: WorkSpec) -> Self {
+    pub const fn spawn_host(work: WorkSpec) -> Self {
         Op::SpawnHost { work }
     }
 
