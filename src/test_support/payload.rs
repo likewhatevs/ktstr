@@ -757,10 +757,15 @@ impl Polarity {
         }
     }
 
-    /// Construct a [`Polarity::TargetValue`] after asserting that
-    /// `target` is finite. Non-finite `target` (`NaN`, `±inf`)
-    /// produces incorrect regression verdicts in the comparison
-    /// pipeline, so the check runs in release builds too.
+    /// Construct a [`Polarity::TargetValue`] from a finite `target`.
+    ///
+    /// # Panics
+    ///
+    /// Panics in both debug and release builds when `target` is not
+    /// finite (`NaN`, `+inf`, `-inf`). Non-finite values produce
+    /// incorrect regression verdicts in the comparison pipeline, so
+    /// the check runs unconditionally rather than via
+    /// `debug_assert!`.
     pub fn target(target: f64) -> Polarity {
         assert!(
             target.is_finite(),
@@ -954,6 +959,8 @@ impl MetricCheck {
 
     /// Fail when the named metric falls outside `[lo, hi]` (inclusive
     /// on both ends). Missing metric fails loudly.
+    ///
+    /// # Panics
     ///
     /// Panics at construction when `lo > hi` — a reversed-bounds
     /// range describes an empty interval that no finite metric can

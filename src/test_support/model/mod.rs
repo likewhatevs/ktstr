@@ -207,6 +207,18 @@ fn global_backend() -> &'static LlamaBackend {
 ///   ("seed prompt batch", "decode generated token", etc.) so the
 ///   error chain is actionable without a typed source variant per
 ///   distinct llama-cpp-2 error.
+// Derive parity with `WorkTypeValidationError` (Clone+PartialEq+Eq+
+// Hash+thiserror::Error) is intentionally not applied here: the
+// `#[source]` fields wrap external llama-cpp-2 error types
+// (`LlamaModelLoadError`, `LlamaContextLoadError`, `StringToTokenError`,
+// `DecodeError`) which collectively impl only `Debug+Eq+PartialEq+
+// thiserror::Error` (StringToTokenError lacks even PartialEq). None
+// implement `Clone` or `Hash`. Achieving the family baseline would
+// require boxing the source (loses typed match), replacing it with a
+// `String` reason field (loses Debug fidelity), or upstream changes —
+// each strictly worse than the current `#[source]`-preserved shape.
+// `InferenceError` is `pub(crate)` and its callers don't need
+// Clone/PartialEq/Eq/Hash, so the divergence is non-blocking.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum InferenceError {
     #[error(

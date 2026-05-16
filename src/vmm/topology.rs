@@ -82,6 +82,8 @@ pub struct MemSideCache {
 impl MemSideCache {
     /// Const constructor with validation.
     ///
+    /// # Panics
+    ///
     /// Panics if `associativity > 15` or `write_policy > 15`
     /// (4-bit HMAT nibble fields).
     pub const fn new(size: u64, associativity: u8, write_policy: u8, line_size: u16) -> Self {
@@ -176,6 +178,8 @@ pub struct NumaDistance {
 
 impl NumaDistance {
     /// Const constructor with full validation.
+    ///
+    /// # Panics
     ///
     /// Panics if:
     /// - `n == 0`
@@ -396,12 +400,16 @@ impl Topology {
     /// Produces a topology where LLCs and memory are distributed evenly
     /// across NUMA nodes, with default 10/20 distances.
     ///
-    /// Invariants:
-    /// - All fields must be > 0.
-    /// - `llcs` must be divisible by `numa_nodes`.
-    /// - Total CPU count must not overflow `u32`.
-    ///
     /// See [`validate`](Self::validate) for a non-panicking alternative.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any invariant is violated:
+    /// - any of `llcs`, `cores_per_llc`, `threads_per_core`,
+    ///   `numa_nodes` is zero
+    /// - `llcs` is not divisible by `numa_nodes`
+    /// - total CPU count (`llcs * cores_per_llc * threads_per_core`)
+    ///   overflows `u32`
     pub const fn new(
         numa_nodes: u32,
         llcs: u32,
@@ -444,6 +452,8 @@ impl Topology {
     ///
     /// Total LLC count is computed from the sum of `NumaNode::llcs`
     /// across all nodes. Memory-only nodes (llcs=0) are permitted.
+    ///
+    /// # Panics
     ///
     /// Panics if:
     /// - `nodes` is empty
@@ -505,7 +515,12 @@ impl Topology {
         }
     }
 
-    /// Attach a distance matrix. Panics if dimension doesn't match.
+    /// Attach a distance matrix.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `distances.n != self.numa_nodes` — the matrix
+    /// dimension must equal the topology's NUMA node count.
     pub const fn distances(mut self, distances: &'static NumaDistance) -> Self {
         assert!(
             distances.n == self.numa_nodes,
@@ -611,8 +626,12 @@ impl Topology {
 
     /// LLCs per NUMA node (uniform distribution only).
     ///
-    /// Panics if the topology uses explicit nodes (use `llcs_in_node()`
-    /// instead).
+    /// # Panics
+    ///
+    /// Panics if the topology uses explicit nodes (use
+    /// [`llcs_in_node`](Self::llcs_in_node) instead), if
+    /// `numa_nodes == 0`, or if `llcs` is not divisible by
+    /// `numa_nodes`.
     pub fn llcs_per_numa_node(&self) -> u32 {
         assert!(
             self.nodes.is_none(),
@@ -658,10 +677,13 @@ impl Topology {
 
     /// First LLC index owned by NUMA node `node_id`.
     ///
+    /// Uniform topologies do not bounds-check and return
+    /// `node_id * llcs_per_node` for any input.
+    ///
+    /// # Panics
+    ///
     /// Panics if `node_id > numa_nodes` for explicit-node topologies
-    /// (the walk would index past the end of the node slice). Uniform
-    /// topologies do not bounds-check and return `node_id *
-    /// llcs_per_node` for any input.
+    /// (the walk would index past the end of the node slice).
     pub fn first_llc_in_node(&self, node_id: u32) -> u32 {
         match &self.nodes {
             Some(nodes) => {

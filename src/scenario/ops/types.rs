@@ -1312,11 +1312,15 @@ impl CgroupDef {
     /// when the step enters `apply_setup` and is killed during
     /// step-teardown so the cgroup can be removed cleanly.
     ///
-    /// Only
+    /// # Panics
+    ///
+    /// Panics when `p.is_scheduler()` (i.e. `p` is a scheduler-kind
+    /// [`Payload`](crate::test_support::Payload) — `KERNEL_DEFAULT`
+    /// or any other `PayloadKind::Scheduler*` variant). Only
     /// [`PayloadKind::Binary`](crate::test_support::PayloadKind::Binary)
-    /// payloads are accepted; passing a scheduler-kind
-    /// [`Payload`](crate::test_support::Payload) panics with an
-    /// actionable message.
+    /// payloads are accepted; `CgroupDef.workload` is for userspace
+    /// binary payloads only, and scheduler placement uses
+    /// `#[ktstr_test(scheduler = ...)]` instead.
     ///
     /// **Why panic at declaration time, not at spawn time?** Three
     /// reasons, all of which favor failing fast:

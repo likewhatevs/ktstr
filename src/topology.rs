@@ -776,11 +776,27 @@ impl TestTopology {
     /// inside this function guard against hand-constructed `Topology`
     /// struct literals that bypass `Topology::new`; they never fire
     /// for any `Topology` obtained through the normal constructor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `topo` was constructed via struct literal
+    /// (bypassing `Topology::new`) with `llcs == 0`,
+    /// `cores_per_llc == 0`, `threads_per_core == 0`, or
+    /// `numa_nodes == 0`. Inputs obtained through `Topology::new`
+    /// satisfy the invariants and cannot trigger these asserts.
     pub fn from_vm_topology(topo: &crate::vmm::topology::Topology) -> Self {
         Self::from_vm_topology_with_memory(topo, None)
     }
 
     /// Build a [`TestTopology`] with optional total memory for uniform topologies.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `topo` was constructed via struct literal
+    /// (bypassing `Topology::new`) with `llcs == 0`,
+    /// `cores_per_llc == 0`, `threads_per_core == 0`, or
+    /// `numa_nodes == 0`. Inputs obtained through `Topology::new`
+    /// satisfy the invariants and cannot trigger these asserts.
     pub fn from_vm_topology_with_memory(
         topo: &crate::vmm::topology::Topology,
         total_memory_mib: Option<u32>,

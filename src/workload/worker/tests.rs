@@ -1111,10 +1111,12 @@ fn alu_hot_chain_drives_instructions_retired() {
     use std::mem;
     use std::os::unix::io::RawFd;
 
-    let mut attr = pe::bindings::perf_event_attr::default();
-    attr.size = mem::size_of::<pe::bindings::perf_event_attr>() as u32;
-    attr.type_ = pe::bindings::PERF_TYPE_HARDWARE;
-    attr.config = pe::bindings::PERF_COUNT_HW_INSTRUCTIONS as u64;
+    let mut attr = pe::bindings::perf_event_attr {
+        size: mem::size_of::<pe::bindings::perf_event_attr>() as u32,
+        type_: pe::bindings::PERF_TYPE_HARDWARE,
+        config: pe::bindings::PERF_COUNT_HW_INSTRUCTIONS as u64,
+        ..Default::default()
+    };
     attr.set_disabled(1);
     attr.set_exclude_kernel(1);
     attr.set_exclude_hv(1);

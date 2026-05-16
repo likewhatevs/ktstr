@@ -164,11 +164,24 @@ impl Sysctl {
 pub struct CgroupPath(&'static str);
 
 impl CgroupPath {
-    /// Const constructor. Panics at compile time (or const-eval time)
-    /// when `path` would normalize back to (or escape) the host
-    /// cgroup root once concatenated with `/sys/fs/cgroup` and
-    /// canonicalized by the kernel. Mirrors the runtime gate in
-    /// `test_support::args::cell_parent_path_is_valid` byte-for-byte:
+    /// Const constructor. Mirrors the runtime gate in
+    /// `test_support::args::cell_parent_path_is_valid` byte-for-byte.
+    /// `Path::components` and `Components` are not yet const-fn
+    /// reachable, so the walk iterates bytes directly via a stable
+    /// `while` loop.
+    ///
+    /// So `cgroup_parent = "/foo/.."` panics at const-eval just as
+    /// `--cell-parent-cgroup=/foo/..` panics at test setup; the two
+    /// share validation contract, and the asymmetry that would
+    /// otherwise exist (const-fn rejecting `/foo/./bar` while the
+    /// runtime accepts it) is eliminated by the auto-strip rule.
+    ///
+    /// # Panics
+    ///
+    /// Panics at compile time (or const-eval time) when `path` would
+    /// normalize back to (or escape) the host cgroup root once
+    /// concatenated with `/sys/fs/cgroup` and canonicalized by the
+    /// kernel:
     ///
     ///   - must start with `/`
     ///   - must not contain any `..` (ParentDir) segments
@@ -176,15 +189,6 @@ impl CgroupPath {
     ///   - empty segments (consecutive `/`) and `.` (CurDir) segments
     ///     are auto-stripped, matching `Path::components` semantics
     ///     used by the runtime validator
-    ///
-    /// So `cgroup_parent = "/foo/.."` panics at const-eval just as
-    /// `--cell-parent-cgroup=/foo/..` panics at test setup; the two
-    /// share validation contract, and the asymmetry that would
-    /// otherwise exist (const-fn rejecting `/foo/./bar` while the
-    /// runtime accepts it) is eliminated by the auto-strip rule.
-    /// `Path::components` and `Components` are not yet const-fn
-    /// reachable, so the walk iterates bytes directly via a stable
-    /// `while` loop.
     pub const fn new(path: &'static str) -> Self {
         assert!(
             !path.is_empty() && path.as_bytes()[0] == b'/',
