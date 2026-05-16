@@ -461,9 +461,9 @@ impl Default for VirtioConsole {
     /// host must defer PORT_ADD enqueues until then or the guest
     /// will ignore them. Delegates to [`Self::new`] for the eventfd
     /// + queue construction; subsequent VM-builder calls bind
-    /// per-port destinations (e.g. bulk-data port to the test
-    /// framework's output directory) without adding new ports
-    /// beyond the three.
+    ///   per-port destinations (e.g. bulk-data port to the test
+    ///   framework's output directory) without adding new ports
+    ///   beyond the three.
     fn default() -> Self {
         Self::new()
     }
