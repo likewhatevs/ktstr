@@ -161,7 +161,19 @@ that built it.
 ## Boot process
 
 1. Load kernel (bzImage on x86_64, Image on aarch64) via `linux-loader`.
-2. Set up KVM vCPUs with the specified topology.
+2. Set up KVM vCPUs with the specified topology. vCPU creation
+   takes `kvm->lock` twice in the kernel (`kvm_vm_ioctl_create_vcpu`
+   at `virt/kvm/kvm_main.c:4158`): once for the
+   `created_vcpus` counter + per-arch precreate hook, then released
+   before the per-vCPU allocations, and reacquired for vcpu-list
+   insertion. The largest cost — the per-vCPU FPU `vzalloc` on
+   x86_64 (`fpu_alloc_guest_fpstate` at
+   `arch/x86/kernel/fpu/core.c:242`) — runs between the two lock
+   acquisitions and can parallelize across vCPUs (aarch64 has its
+   own per-vCPU init path with analogous costs). High vCPU counts
+   still add measurable boot latency even with the concurrency,
+   because each vCPU pays the alloc + TSC-sync cost serially within
+   its own thread. See [Performance Mode](../concepts/performance-mode.md).
 3. Build and load initramfs.
 4. Set up serial devices (COM1 for console, COM2 for results).
 5. Boot the kernel.

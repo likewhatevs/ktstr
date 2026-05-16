@@ -33,14 +33,32 @@ TLB pressure from host-side page walks during guest execution.
 **NUMA mbind** -- guest memory is bound to the NUMA node(s) of the
 pinned vCPUs via `mbind(MPOL_BIND)`. This ensures memory allocations
 are local to the CPUs executing vCPU threads, avoiding cross-node
-memory access latency.
+memory access latency. `MPOL_BIND` is strict: the kernel allocator
+does not fall back to non-mask nodes when the bound nodes are
+exhausted, failing the allocation with `-ENOMEM` instead (see
+`do_mbind` at `mm/mempolicy.c:1480` for the policy entry point and
+`policy_nodemask` at `mm/mempolicy.c:2263` for the allocator-side
+mask restriction). Contrast `MPOL_PREFERRED`, which expresses a
+preference but falls back silently — undocumented locality drift
+would defeat the noise-reduction purpose, so `MPOL_BIND` is the
+correct primitive here.
 
 **RT scheduling** -- vCPU threads are set to `SCHED_FIFO` priority 1.
 The watchdog and monitor threads run at priority 2 on a dedicated
 host CPU not assigned to any vCPU, so they can preempt for
 timeout/sampling without competing for vCPU cores. The serial console
 mutex uses `PTHREAD_PRIO_INHERIT` to avoid priority inversion between
-RT vCPU threads and service threads.
+RT vCPU threads and service threads. Priority 2 strictly preempts
+priority 1: `wakeup_preempt_rt` at `kernel/sched/rt.c:1619` runs
+`resched_curr()` when a higher-priority RT task wakes on the
+runqueue of a lower-priority RT task — the kernel inverts userspace
+priority to internal `p->prio` via `__normal_prio` at
+`kernel/sched/syscalls.c:19` (`prio = MAX_RT_PRIO - 1 - rt_prio`),
+so userspace priority 2 maps to `p->prio = 97` and beats priority 1
+at `p->prio = 98`. The watchdog and monitor are therefore guaranteed
+to preempt a vCPU thread on the same CPU; only DL- or stop-class
+tasks can preempt them. Priority 0 is reserved for fair-class
+policies (SCHED_FIFO requires priority >= 1).
 
 **Disable PAUSE VM exits** (x86_64 only) -- `KVM_CAP_X86_DISABLE_EXITS` with
 `KVM_X86_DISABLE_EXITS_PAUSE` suppresses VM exits on PAUSE
@@ -76,7 +94,10 @@ haltpoll cpuidle driver (enabled by KVM_HINTS_REALTIME above)
 handles polling inside the guest and writes `MSR_KVM_POLL_CONTROL=0`
 to disable host-side polling via `kvm_arch_no_poll()`.
 Non-performance-mode VMs set `KVM_CAP_HALT_POLL` to 200µs (matching
-the x86 kernel default), or 0 when vCPUs exceed host CPUs.
+the x86 kernel default `KVM_HALT_POLL_NS_DEFAULT` at
+`arch/x86/include/asm/kvm_host.h:73`; aarch64's kernel default is
+500µs at `arch/arm64/include/asm/kvm_host.h:34`), or 0 when vCPUs
+exceed host CPUs.
 
 ## Prerequisites
 
@@ -84,7 +105,8 @@ the x86 kernel default), or 0 when vCPUs exceed host CPUs.
 `(llcs * cores_per_llc * threads_per_core) + 1` online CPUs. The extra
 CPU is reserved for service threads (monitor, watchdog) so they do not
 share a core with any RT vCPU. The host must also have at least as many
-LLC groups as virtual LLCs.
+LLC groups as virtual LLCs. (See [Boot process](../architecture/vmm.md#boot-process)
+for the per-vCPU init cost that scales with the chosen topology.)
 
 **2MB hugepages** (optional) -- the host must have free 2MB hugepages
 (check `/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages`).
@@ -118,7 +140,13 @@ levels of checks:
 **Warnings (non-fatal):**
 - Insufficient free hugepages -- regular page allocation is used.
 - Host load is high -- `procs_running` from `/proc/stat` exceeds
-  half the vCPU count, results may be noisy.
+  half the vCPU count, results may be noisy. `procs_running` is
+  `nr_running()` summed across online CPUs (`kernel/sched/core.c:5302`),
+  i.e. the total count of runnable tasks system-wide including
+  currently-running ones. (No-perf-mode VMs use the
+  [Resource Budget](resource-budget.md) `CpuCap` mechanism instead
+  of this warning — the cgroup-cpuset enforcement bounds concurrency
+  rather than warning about it.)
 - TSC not stable (x86_64 only, checked at VM creation time) --
   `KVM_CLOCK_TSC_STABLE` not set after `KVM_GET_CLOCK`, kvmclock
   falls back to per-vCPU timekeeping. Timing measurements may have
