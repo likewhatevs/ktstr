@@ -119,6 +119,20 @@ use crate::monitor::dump::{
     FailureDumpReport,
 };
 
+/// Maximum number of rendered keys captured into
+/// [`SnapshotError::NoMatch::available_keys`] during a failed
+/// `find` / `max_by` traversal. Three is a balance between
+/// disambiguation power (enough to suggest the keyspace shape) and
+/// failure-message readability (does not overrun a terminal line).
+const NO_MATCH_KEY_SAMPLE: usize = 3;
+
+/// Maximum number of characters each rendered key in
+/// [`SnapshotError::NoMatch::available_keys`] retains before being
+/// truncated with a trailing `…`. Wide struct keys (e.g. a
+/// 50-field `task_ctx`) would otherwise produce kilobytes of
+/// failure text per sampled key.
+const NO_MATCH_KEY_CHAR_CAP: usize = 80;
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -204,7 +218,27 @@ pub enum SnapshotError {
         unmapped: bool,
     },
     /// A predicate-based lookup (`find`, `max_by`) found no match.
-    NoMatch { map: String, op: &'static str },
+    /// `len` is the number of entries the lookup traversed before
+    /// giving up; `available_keys` is a small sample (up to
+    /// [`NO_MATCH_KEY_SAMPLE`] entries) of rendered keys seen during
+    /// the traversal so an operator can distinguish "empty map"
+    /// (`len == 0`) from "populated map with no predicate hit"
+    /// (`len > 0`) and inspect the sample to debug the predicate.
+    /// Keys are rendered via [`RenderedValue`]'s `Display` impl and
+    /// each is capped at [`NO_MATCH_KEY_CHAR_CAP`] chars with an
+    /// ellipsis to keep the failure message readable for wide struct
+    /// keys.
+    ///
+    /// `max_by` only produces this variant for empty maps (a
+    /// populated map always has a maximum), so its NoMatch always
+    /// carries `len == 0` and an empty `available_keys`. Only `find`
+    /// can produce `len > 0` here.
+    NoMatch {
+        map: String,
+        op: &'static str,
+        len: usize,
+        available_keys: Vec<String>,
+    },
     /// A path string contained an empty component (e.g. `"a..b"`).
     /// `requested` is the user-supplied lookup string.
     EmptyPathComponent { requested: String },
@@ -325,8 +359,26 @@ impl std::fmt::Display for SnapshotError {
                     )
                 }
             }
-            SnapshotError::NoMatch { map, op } => {
-                write!(f, "map '{map}': {op} matched no entries")
+            SnapshotError::NoMatch {
+                map,
+                op,
+                len,
+                available_keys,
+            } => {
+                if *len == 0 {
+                    write!(f, "map '{map}': {op} matched no entries (map is empty)")
+                } else if available_keys.is_empty() {
+                    write!(
+                        f,
+                        "map '{map}': {op} matched none of {len} entries (sample keys unavailable)"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "map '{map}': {op} matched none of {len} entries (first {sampled}: {available_keys:?})",
+                        sampled = available_keys.len(),
+                    )
+                }
             }
             SnapshotError::EmptyPathComponent { requested } => {
                 write!(
@@ -1202,16 +1254,29 @@ impl<'a> SnapshotMap<'a> {
 
     /// Find the first entry matching `predicate`. Returns
     /// [`SnapshotEntry::Missing`] with [`SnapshotError::NoMatch`]
-    /// when no entry matches.
+    /// when no entry matches. The NoMatch payload carries the
+    /// total entry count traversed and a small sample of rendered
+    /// keys so the failure message can tell `empty map` apart from
+    /// `populated map, predicate never matched`.
     pub fn find(&self, predicate: impl Fn(&SnapshotEntry<'a>) -> bool) -> SnapshotEntry<'a> {
+        let mut len = 0usize;
+        let mut available_keys: Vec<String> = Vec::with_capacity(NO_MATCH_KEY_SAMPLE);
         for entry in self.iter_entries() {
             if predicate(&entry) {
                 return entry;
             }
+            if available_keys.len() < NO_MATCH_KEY_SAMPLE {
+                if let Some(k) = render_entry_key(&entry) {
+                    available_keys.push(k);
+                }
+            }
+            len += 1;
         }
         SnapshotEntry::Missing(SnapshotError::NoMatch {
             map: self.map.name.clone(),
             op: "find",
+            len,
+            available_keys,
         })
     }
 
@@ -1222,7 +1287,8 @@ impl<'a> SnapshotMap<'a> {
 
     /// Find the entry whose `key_fn` produces the maximum u64.
     /// Returns [`SnapshotEntry::Missing`] when the map has no
-    /// entries.
+    /// entries. The NoMatch payload's `len` is 0 in that case;
+    /// `available_keys` is empty (the map has no keys to sample).
     pub fn max_by(&self, key_fn: impl Fn(&SnapshotEntry<'a>) -> u64) -> SnapshotEntry<'a> {
         let mut best: Option<(u64, SnapshotEntry<'a>)> = None;
         for entry in self.iter_entries() {
@@ -1237,6 +1303,8 @@ impl<'a> SnapshotMap<'a> {
             None => SnapshotEntry::Missing(SnapshotError::NoMatch {
                 map: self.map.name.clone(),
                 op: "max_by",
+                len: 0,
+                available_keys: Vec::new(),
             }),
         }
     }
@@ -1393,6 +1461,45 @@ fn resolve_percpu_hash_entry<'a>(
             len: entry.per_cpu.len(),
             unmapped: true,
         }),
+    }
+}
+
+/// Render a [`SnapshotEntry`]'s key into a bounded `String` suitable
+/// for the [`SnapshotError::NoMatch::available_keys`] sample.
+///
+/// Returns `None` for [`SnapshotEntry::Value`] (single-value ARRAY
+/// maps have no key surface) and [`SnapshotEntry::Missing`] (no
+/// entry was produced). Hash / per-CPU-hash entries fall back to
+/// the hex-encoded raw key bytes via the `hex:` prefix when BTF
+/// rendering was absent at capture time. The result is truncated
+/// to [`NO_MATCH_KEY_CHAR_CAP`] chars with a trailing `…` to keep
+/// wide struct keys from overrunning failure-message lines.
+fn render_entry_key(entry: &SnapshotEntry<'_>) -> Option<String> {
+    let key = match entry {
+        SnapshotEntry::Hash(e) => match e.key.as_ref() {
+            Some(rv) => rv.to_string(),
+            None => format!("hex:{}", e.key_hex),
+        },
+        SnapshotEntry::PercpuHash(e) => match e.key.as_ref() {
+            Some(rv) => rv.to_string(),
+            None => format!("hex:{}", e.key_hex),
+        },
+        SnapshotEntry::Percpu(e) => e.key.to_string(),
+        SnapshotEntry::Value(_) | SnapshotEntry::Missing(_) => return None,
+    };
+    // Bytes-per-char is >= 1 in UTF-8, so byte-length <= char-cap implies
+    // char-length <= char-cap — short-circuit the O(n) chars().count()
+    // walk on the common ASCII case.
+    if key.len() <= NO_MATCH_KEY_CHAR_CAP {
+        return Some(key);
+    }
+    if key.chars().count() > NO_MATCH_KEY_CHAR_CAP {
+        let mut truncated: String =
+            key.chars().take(NO_MATCH_KEY_CHAR_CAP.saturating_sub(1)).collect();
+        truncated.push('…');
+        Some(truncated)
+    } else {
+        Some(key)
     }
 }
 
@@ -2570,17 +2677,121 @@ mod tests {
     }
 
     #[test]
-    fn map_find_no_match_carries_op_name() {
+    fn map_find_no_match_carries_op_name_len_and_keys() {
         let r = synthetic_report();
         let snap = Snapshot::new(&r);
         let map = snap.map("scx_per_task").unwrap();
         let entry = map.find(|e| e.get("tid").as_i64().unwrap_or(-1) == 999);
         match entry {
-            SnapshotEntry::Missing(SnapshotError::NoMatch { op, .. }) => {
+            SnapshotEntry::Missing(SnapshotError::NoMatch {
+                op,
+                len,
+                available_keys,
+                ..
+            }) => {
                 assert_eq!(op, "find");
+                // synthetic_report's scx_per_task has 2 entries (tid=100 and
+                // tid=200) — every traversal that exits via NoMatch must
+                // have walked all 2.
+                assert_eq!(len, 2);
+                // 2 entries, cap is NO_MATCH_KEY_SAMPLE=3, so we keep both.
+                assert_eq!(available_keys.len(), 2);
             }
             other => panic!("expected NoMatch, got present={}", other.is_present()),
         }
+    }
+
+    #[test]
+    fn map_max_by_no_match_reports_empty_map() {
+        // Build a fixture whose scx_per_task map has zero entries so
+        // max_by's NoMatch arm fires. This is the only path through
+        // max_by that produces NoMatch — non-empty maps always have
+        // a maximum.
+        let mut r = synthetic_report();
+        for m in r.maps.iter_mut() {
+            if m.name == "scx_per_task" {
+                m.entries.clear();
+            }
+        }
+        let snap = Snapshot::new(&r);
+        let map = snap.map("scx_per_task").unwrap();
+        let entry = map.max_by(|e| e.get("runtime_ns").as_u64().unwrap_or(0));
+        match entry {
+            SnapshotEntry::Missing(SnapshotError::NoMatch {
+                op,
+                len,
+                available_keys,
+                ..
+            }) => {
+                assert_eq!(op, "max_by");
+                assert_eq!(len, 0);
+                assert!(available_keys.is_empty());
+            }
+            other => panic!("expected NoMatch, got present={}", other.is_present()),
+        }
+    }
+
+    /// Display rendering must surface `len` and `available_keys` for
+    /// each of the three cases — empty map, populated map without
+    /// sampled keys (all keys were unrenderable), and populated map
+    /// with sampled keys. Without this pin, the Display impl could
+    /// silently drop the new fields and every structural test would
+    /// still pass.
+    #[test]
+    fn no_match_display_renders_three_arms() {
+        let empty = SnapshotError::NoMatch {
+            map: "m".to_string(),
+            op: "find",
+            len: 0,
+            available_keys: Vec::new(),
+        };
+        let rendered = format!("{empty}");
+        assert!(rendered.contains("'m'"), "{rendered}");
+        assert!(rendered.contains("empty"), "{rendered}");
+
+        let unrendered = SnapshotError::NoMatch {
+            map: "m".to_string(),
+            op: "max_by",
+            len: 7,
+            available_keys: Vec::new(),
+        };
+        let rendered = format!("{unrendered}");
+        assert!(rendered.contains("'m'"), "{rendered}");
+        assert!(rendered.contains("7"), "{rendered}");
+        assert!(rendered.contains("unavailable"), "{rendered}");
+
+        let sampled = SnapshotError::NoMatch {
+            map: "m".to_string(),
+            op: "find",
+            len: 9,
+            available_keys: vec!["k0".to_string(), "k1".to_string(), "k2".to_string()],
+        };
+        let rendered = format!("{sampled}");
+        assert!(rendered.contains("'m'"), "{rendered}");
+        assert!(rendered.contains("9"), "{rendered}");
+        assert!(rendered.contains("k0"), "{rendered}");
+        assert!(rendered.contains("k2"), "{rendered}");
+    }
+
+    /// `render_entry_key` must truncate wide struct keys (e.g.
+    /// a 50-field struct) to [`NO_MATCH_KEY_CHAR_CAP`] chars with a
+    /// trailing `…`. Without the cap a single wide-struct key would
+    /// blow the failure-message size budget.
+    #[test]
+    fn render_entry_key_caps_wide_struct_keys() {
+        let oversized = "x".repeat(NO_MATCH_KEY_CHAR_CAP * 4);
+        let entry_fixture = FailureDumpEntry {
+            key: None,
+            key_hex: oversized.clone(),
+            value: None,
+            value_hex: String::new(),
+            payload: None,
+        };
+        let entry = SnapshotEntry::Hash(&entry_fixture);
+        let rendered = render_entry_key(&entry).expect("hash entry has a key");
+        assert!(rendered.chars().count() <= NO_MATCH_KEY_CHAR_CAP);
+        assert!(rendered.ends_with('…'));
+        assert!(rendered.starts_with("hex:x"));
     }
 
     #[test]

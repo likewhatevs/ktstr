@@ -251,7 +251,7 @@ impl<'a> PayloadRun<'a> {
     /// drain fails (see the timeout paragraph).
     pub fn run(self) -> Result<(AssertResult, PayloadMetrics)> {
         let binary = payload_binary(self.payload)?;
-        let cgroup_path = resolve_cgroup_path(self.ctx, self.cgroup.as_deref())?;
+        let cgroup_path = resolve_cgroup_path(self.ctx, self.cgroup.as_deref(), "PayloadRun::run")?;
         let output = spawn_and_wait(
             binary,
             &self.args,
@@ -279,7 +279,7 @@ impl<'a> PayloadRun<'a> {
     /// [`PayloadKind::Binary`] or when the spawn itself fails.
     pub fn spawn(self) -> Result<PayloadHandle> {
         let binary = payload_binary(self.payload)?;
-        let cgroup_path = resolve_cgroup_path(self.ctx, self.cgroup.as_deref())?;
+        let cgroup_path = resolve_cgroup_path(self.ctx, self.cgroup.as_deref(), "PayloadRun::spawn")?;
         let (child, sigchld) = spawn_child(
             binary,
             &self.args,
@@ -1269,6 +1269,11 @@ struct SpawnOutput {
 /// bad name produces a clear error rather than a `pre_exec` failure
 /// that surfaces as an `io::Error` after the child is already spawning.
 ///
+/// `op` is a caller-supplied label (typically `"PayloadRun::run"`
+/// or `"PayloadRun::spawn"`) that prefixes every validation-error
+/// message so an operator reading the failure can identify which
+/// Op-method bubbled the error without re-running the test.
+///
 /// Rules:
 /// - `None` → child inherits caller's cgroup (returns `Ok(None)`).
 /// - A leading `/` is tolerated and stripped so `"/workload"` and
@@ -1283,17 +1288,23 @@ struct SpawnOutput {
 ///   escaping the parent cgroup.
 /// - Empty names (or names that strip to empty) are rejected so a
 ///   typo doesn't silently target the parent cgroup itself.
-fn resolve_cgroup_path(ctx: &Ctx<'_>, name: Option<&str>) -> Result<Option<PathBuf>> {
+fn resolve_cgroup_path(
+    ctx: &Ctx<'_>,
+    name: Option<&str>,
+    op: &'static str,
+) -> Result<Option<PathBuf>> {
     let Some(name) = name else {
         return Ok(None);
     };
     if name.as_bytes().contains(&0) {
-        return Err(anyhow!("cgroup name '{name}' contains a NUL byte"));
+        return Err(anyhow!(
+            "{op}: cgroup name '{name}' contains a NUL byte"
+        ));
     }
     let trimmed = name.trim_start_matches('/');
     if trimmed.is_empty() {
         return Err(anyhow!(
-            "cgroup name '{name}' is empty or resolves to the parent cgroup"
+            "{op}: cgroup name '{name}' is empty or resolves to the parent cgroup"
         ));
     }
     let relative = std::path::Path::new(trimmed);
@@ -1302,7 +1313,7 @@ fn resolve_cgroup_path(ctx: &Ctx<'_>, name: Option<&str>) -> Result<Option<PathB
         .any(|c| matches!(c, std::path::Component::ParentDir))
     {
         return Err(anyhow!(
-            "cgroup name '{name}' contains '..'; paths must stay within the \
+            "{op}: cgroup name '{name}' contains '..'; paths must stay within the \
              test's cgroup parent"
         ));
     }
@@ -2557,7 +2568,7 @@ mod tests {
         let topo = TestTopology::synthetic(4, 1);
         let ctx = make_ctx(&cgroups, &topo);
         // Leading "/" tolerated, joined under parent.
-        let resolved = resolve_cgroup_path(&ctx, Some("/workload"))
+        let resolved = resolve_cgroup_path(&ctx, Some("/workload"), "test::strips")
             .expect("valid cgroup name")
             .expect("Some(path)");
         assert_eq!(
@@ -2565,7 +2576,7 @@ mod tests {
             std::path::PathBuf::from("/sys/fs/cgroup/test-parent/workload")
         );
         // Same name without leading slash produces the same path.
-        let plain = resolve_cgroup_path(&ctx, Some("workload"))
+        let plain = resolve_cgroup_path(&ctx, Some("workload"), "test::strips")
             .expect("valid")
             .expect("Some");
         assert_eq!(resolved, plain);
@@ -2576,8 +2587,14 @@ mod tests {
         let cgroups = CgroupManager::new("/sys/fs/cgroup/test-parent");
         let topo = TestTopology::synthetic(4, 1);
         let ctx = make_ctx(&cgroups, &topo);
-        let err = resolve_cgroup_path(&ctx, Some("../escape")).expect_err("'..' must be rejected");
-        assert!(format!("{err:#}").contains(".."), "err: {err:#}");
+        let err = resolve_cgroup_path(&ctx, Some("../escape"), "PayloadRun::run")
+            .expect_err("'..' must be rejected");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains(".."), "err: {rendered}");
+        assert!(
+            rendered.contains("PayloadRun::run"),
+            "op label must appear in error: {rendered}",
+        );
     }
 
     #[test]
@@ -2585,8 +2602,14 @@ mod tests {
         let cgroups = CgroupManager::new("/sys/fs/cgroup/test-parent");
         let topo = TestTopology::synthetic(4, 1);
         let ctx = make_ctx(&cgroups, &topo);
-        let err = resolve_cgroup_path(&ctx, Some("bad\0name")).expect_err("NUL must be rejected");
-        assert!(format!("{err:#}").contains("NUL"), "err: {err:#}");
+        let err = resolve_cgroup_path(&ctx, Some("bad\0name"), "PayloadRun::spawn")
+            .expect_err("NUL must be rejected");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("NUL"), "err: {rendered}");
+        assert!(
+            rendered.contains("PayloadRun::spawn"),
+            "op label must appear in error: {rendered}",
+        );
     }
 
     #[test]
@@ -2596,10 +2619,22 @@ mod tests {
         let ctx = make_ctx(&cgroups, &topo);
         // "/" strips to empty — reject so we don't silently target
         // the parent cgroup itself.
-        let err = resolve_cgroup_path(&ctx, Some("/")).expect_err("slash-only must be rejected");
-        assert!(format!("{err:#}").contains("empty"), "err: {err:#}");
-        let err = resolve_cgroup_path(&ctx, Some("")).expect_err("empty must be rejected");
-        assert!(format!("{err:#}").contains("empty"), "err: {err:#}");
+        let err = resolve_cgroup_path(&ctx, Some("/"), "PayloadRun::run")
+            .expect_err("slash-only must be rejected");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("empty"), "err: {rendered}");
+        assert!(
+            rendered.contains("PayloadRun::run"),
+            "op label must appear in error: {rendered}",
+        );
+        let err = resolve_cgroup_path(&ctx, Some(""), "PayloadRun::run")
+            .expect_err("empty must be rejected");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("empty"), "err: {rendered}");
+        assert!(
+            rendered.contains("PayloadRun::run"),
+            "op label must appear in error: {rendered}",
+        );
     }
 
     #[test]
@@ -2607,7 +2642,38 @@ mod tests {
         let cgroups = CgroupManager::new("/sys/fs/cgroup/test-parent");
         let topo = TestTopology::synthetic(4, 1);
         let ctx = make_ctx(&cgroups, &topo);
-        assert!(resolve_cgroup_path(&ctx, None).unwrap().is_none());
+        assert!(
+            resolve_cgroup_path(&ctx, None, "test::none")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Differential pin: the `op` label must flow through to the
+    /// rendered error verbatim, distinct per caller. Catches the
+    /// regression where the parameter is accepted but ignored
+    /// (e.g. a refactor that hardcodes one label in the
+    /// `anyhow!` message). Without this, per-caller assertions
+    /// could pass against an implementation that drops the arg.
+    #[test]
+    fn resolve_cgroup_path_op_label_differs_per_caller() {
+        let cgroups = CgroupManager::new("/sys/fs/cgroup/test-parent");
+        let topo = TestTopology::synthetic(4, 1);
+        let ctx = make_ctx(&cgroups, &topo);
+        let err_a = format!(
+            "{:#}",
+            resolve_cgroup_path(&ctx, Some("../bad"), "caller-a")
+                .expect_err("'..' must be rejected"),
+        );
+        let err_b = format!(
+            "{:#}",
+            resolve_cgroup_path(&ctx, Some("../bad"), "caller-b")
+                .expect_err("'..' must be rejected"),
+        );
+        assert!(err_a.contains("caller-a"), "err_a: {err_a}");
+        assert!(!err_a.contains("caller-b"), "err_a leaked caller-b: {err_a}");
+        assert!(err_b.contains("caller-b"), "err_b: {err_b}");
+        assert!(!err_b.contains("caller-a"), "err_b leaked caller-a: {err_b}");
     }
 
     #[test]

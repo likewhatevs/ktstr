@@ -132,10 +132,17 @@ let all_active = map.filter(|e| e.get("runtime_ns").as_u64().unwrap_or(0) > 0);
 - `at(n)` — entry at ordinal index `n`. Out of range returns
   `SnapshotEntry::Missing(SnapshotError::IndexOutOfRange)`.
 - `find(predicate)` — first matching entry. No match returns
-  `SnapshotEntry::Missing(SnapshotError::NoMatch { op: "find", ... })`.
+  `SnapshotEntry::Missing(SnapshotError::NoMatch { op: "find", len, available_keys, .. })`
+  — `len` is the number of entries the traversal inspected (`0`
+  means the map was empty; any positive value means every entry
+  was checked and rejected by the predicate), and `available_keys`
+  is a small sample (up to 3) of rendered keys for debugging the
+  predicate.
 - `filter(predicate)` — every matching entry collected into a `Vec`.
 - `max_by(key_fn)` — entry whose `key_fn` produces the maximum `u64`.
-  Empty map returns `Missing` with `op: "max_by"`.
+  Empty map returns `Missing` with `op: "max_by", len: 0`. `max_by`
+  never produces `NoMatch` with `len > 0` (a non-empty map always
+  has a maximum), so `available_keys` is always empty on this path.
 
 ### Per-CPU maps
 
@@ -289,8 +296,19 @@ needed to fix the call site without re-running the test:
 - `PerCpuSlot { map, cpu, len, unmapped }` — out-of-range or unmapped
   per-CPU slot; `unmapped: true` distinguishes a `None` slot from an
   out-of-range CPU.
-- `NoMatch { map, op }` — predicate-based lookup (`find`, `max_by`)
-  found no match. `op` names the operation.
+- `NoMatch { map, op, len, available_keys }` — predicate-based
+  lookup (`find`, `max_by`) found no match. `op` names the
+  operation. `len` is the number of entries the lookup traversed
+  before giving up — `len == 0` means the map was empty;
+  `len > 0` means every entry was inspected and the `find`
+  predicate rejected each one. `max_by` only produces `NoMatch`
+  on truly empty maps (a non-empty map always has a maximum),
+  so `len > 0` and a non-empty `available_keys` only appear on
+  the `find` path. `available_keys` is a small sample (up to
+  3 entries) of rendered keys seen during the traversal, capped
+  at 80 chars each with a trailing `…` for wide struct keys, so
+  the failure message can show the keyspace shape without
+  flooding the output.
 - `EmptyPathComponent { requested }` — a path string contained an
   empty component (e.g. `"a..b"`).
 - `PerCpuNotNarrowed { map }` — `entry.get` called on a per-CPU entry
