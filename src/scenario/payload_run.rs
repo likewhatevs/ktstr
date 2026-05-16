@@ -2676,6 +2676,47 @@ mod tests {
         assert!(!err_b.contains("caller-a"), "err_b leaked caller-a: {err_b}");
     }
 
+    /// Production-caller pin: the public `.run()` entry point must
+    /// actually pass `"PayloadRun::run"` (and not, e.g.,
+    /// `"PayloadRun::spawn"` via a copy-paste typo) when calling
+    /// resolve_cgroup_path. The helper-level differential test above
+    /// only proves the parameter isn't dropped — this test exercises
+    /// the production call site at L254 end-to-end.
+    #[test]
+    fn payload_run_run_threads_canonical_op_label() {
+        let cgroups = CgroupManager::new("/sys/fs/cgroup/test-parent");
+        let topo = TestTopology::synthetic(4, 1);
+        let ctx = make_ctx(&cgroups, &topo);
+        let run = PayloadRun::new(&ctx, &FIO_BINARY).in_cgroup("../escape");
+        let err = run.run().unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains(".."), "err: {rendered}");
+        assert!(
+            rendered.contains("PayloadRun::run"),
+            "production run() must pass PayloadRun::run as op label: {rendered}",
+        );
+    }
+
+    /// Sibling of `payload_run_run_threads_canonical_op_label` for
+    /// the `.spawn()` entry point at L282. Uses a NUL-byte cgroup
+    /// name (different validation branch from the run() test's `..`)
+    /// to guard against a hypothetical refactor that hardcodes one
+    /// op label across all anyhow! sites in resolve_cgroup_path.
+    #[test]
+    fn payload_run_spawn_threads_canonical_op_label() {
+        let cgroups = CgroupManager::new("/sys/fs/cgroup/test-parent");
+        let topo = TestTopology::synthetic(4, 1);
+        let ctx = make_ctx(&cgroups, &topo);
+        let run = PayloadRun::new(&ctx, &FIO_BINARY).in_cgroup("bad\0name");
+        let err = run.spawn().unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("NUL"), "err: {rendered}");
+        assert!(
+            rendered.contains("PayloadRun::spawn"),
+            "production spawn() must pass PayloadRun::spawn as op label: {rendered}",
+        );
+    }
+
     #[test]
     fn run_rejects_scheduler_kind() {
         let cgroups = CgroupManager::new("/nonexistent");

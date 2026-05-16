@@ -2794,6 +2794,210 @@ mod tests {
         assert!(rendered.starts_with("hex:x"));
     }
 
+    /// End-to-end pin for the `available_keys.is_empty() && len > 0`
+    /// Display arm: a single-value ARRAY map iterates as one
+    /// [`SnapshotEntry::Value`], `render_entry_key` returns None for
+    /// Value variants, so `find()` traverses one entry, never pushes
+    /// a key, and constructs NoMatch with `len = 1, available_keys
+    /// = []`. The Display impl's middle arm fires
+    /// ("sample keys unavailable"). Complements
+    /// [`no_match_display_renders_three_arms`] which exercises the
+    /// same arm via direct struct-literal construction — this test
+    /// proves the production find/iter_entries path actually reaches
+    /// it.
+    #[test]
+    fn map_find_no_match_on_single_value_array_renders_unavailable_keys() {
+        let array_map = FailureDumpMap {
+            name: "scx_singleton".into(),
+            map_type: 2,
+            value_size: 8,
+            max_entries: 1,
+            value: Some(RenderedValue::Uint {
+                bits: 64,
+                value: 42,
+            }),
+            entries: Vec::new(),
+            percpu_entries: Vec::new(),
+            percpu_hash_entries: Vec::new(),
+            arena: None,
+            ringbuf: None,
+            stack_trace: None,
+            fd_array: None,
+            error: None,
+        };
+        let r = FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            maps: vec![array_map],
+            ..Default::default()
+        };
+        let snap = Snapshot::new(&r);
+        let entry = snap.map("scx_singleton").unwrap().find(|_| false);
+        let SnapshotEntry::Missing(err) = entry else {
+            panic!("expected Missing, got present={}", entry.is_present());
+        };
+        match &err {
+            SnapshotError::NoMatch {
+                op,
+                len,
+                available_keys,
+                ..
+            } => {
+                assert_eq!(*op, "find");
+                assert_eq!(*len, 1, "single Value entry iterated");
+                assert!(
+                    available_keys.is_empty(),
+                    "Value entries are unrenderable for key sampling: {available_keys:?}",
+                );
+            }
+            other => panic!("expected NoMatch, got {other:?}"),
+        }
+        let rendered = format!("{err}");
+        assert!(rendered.contains("'scx_singleton'"), "{rendered}");
+        assert!(rendered.contains("matched none of 1"), "{rendered}");
+        assert!(rendered.contains("sample keys unavailable"), "{rendered}");
+    }
+
+    /// `find()` must clamp `available_keys` at
+    /// [`NO_MATCH_KEY_SAMPLE`] regardless of how many entries the
+    /// underlying map carries. Pins the cap-clamp inside `find()`
+    /// and the FIRST-N-preservation order (keys 0/1/2, not the
+    /// last 3). A regression that drops the cap-gate, or that
+    /// flips it from `<` to `<=`, would push a 4th key into the
+    /// sample and trip the `available_keys.len() ==
+    /// NO_MATCH_KEY_SAMPLE` assertion. A regression that reverses
+    /// iteration order or swaps to a random sample would trip the
+    /// literal-vec assertion below.
+    #[test]
+    fn map_find_no_match_caps_sampled_keys_at_no_match_key_sample() {
+        const N: u32 = 10;
+        let entries: Vec<FailureDumpEntry> = (0..N)
+            .map(|i| FailureDumpEntry {
+                key: Some(RenderedValue::Uint {
+                    bits: 32,
+                    value: u64::from(i),
+                }),
+                key_hex: format!("{i:08x}"),
+                value: Some(RenderedValue::Uint {
+                    bits: 32,
+                    value: u64::from(i * 10),
+                }),
+                value_hex: format!("{:08x}", i * 10),
+                payload: None,
+            })
+            .collect();
+        let hash_map = FailureDumpMap {
+            name: "scx_big".into(),
+            map_type: 1,
+            value_size: 4,
+            max_entries: 64,
+            value: None,
+            entries,
+            percpu_entries: Vec::new(),
+            percpu_hash_entries: Vec::new(),
+            arena: None,
+            ringbuf: None,
+            stack_trace: None,
+            fd_array: None,
+            error: None,
+        };
+        let r = FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            maps: vec![hash_map],
+            ..Default::default()
+        };
+        let snap = Snapshot::new(&r);
+        let entry = snap.map("scx_big").unwrap().find(|_| false);
+        match entry {
+            SnapshotEntry::Missing(SnapshotError::NoMatch {
+                op,
+                len,
+                available_keys,
+                ..
+            }) => {
+                assert_eq!(op, "find");
+                assert_eq!(
+                    len,
+                    usize::try_from(N).unwrap(),
+                    "all {N} entries must be traversed before NoMatch",
+                );
+                assert_eq!(
+                    available_keys.len(),
+                    NO_MATCH_KEY_SAMPLE,
+                    "cap must clamp sample at NO_MATCH_KEY_SAMPLE",
+                );
+                assert_eq!(
+                    available_keys,
+                    vec!["0".to_string(), "1".to_string(), "2".to_string()],
+                    "first-N preservation: sample must hold the FIRST 3 keys in \
+                     iteration order, not last 3 / random",
+                );
+            }
+            other => panic!("expected NoMatch, got present={}", other.is_present()),
+        }
+    }
+
+    /// Boundary case: when entry count equals [`NO_MATCH_KEY_SAMPLE`]
+    /// exactly, every entry's key fits in the sample. `len ==
+    /// available_keys.len() == NO_MATCH_KEY_SAMPLE` guards against
+    /// a regression that gates the push too tightly — e.g.
+    /// `available_keys.len() < NO_MATCH_KEY_SAMPLE - 1` would push
+    /// only 2 keys at N=3 and trip the
+    /// `available_keys.len() == NO_MATCH_KEY_SAMPLE` assertion.
+    /// Pairs with
+    /// [`map_find_no_match_caps_sampled_keys_at_no_match_key_sample`]
+    /// (which catches the OTHER direction — `<=` would push a 4th
+    /// key at N >= NO_MATCH_KEY_SAMPLE+1) so both sides of the
+    /// gate-condition are pinned.
+    #[test]
+    fn map_find_no_match_cap_exact_threshold() {
+        let entries: Vec<FailureDumpEntry> = (0..NO_MATCH_KEY_SAMPLE as u32)
+            .map(|i| FailureDumpEntry {
+                key: Some(RenderedValue::Uint {
+                    bits: 32,
+                    value: u64::from(i),
+                }),
+                key_hex: format!("{i:08x}"),
+                value: Some(RenderedValue::Uint {
+                    bits: 32,
+                    value: u64::from(i),
+                }),
+                value_hex: format!("{i:08x}"),
+                payload: None,
+            })
+            .collect();
+        let hash_map = FailureDumpMap {
+            name: "scx_threshold".into(),
+            map_type: 1,
+            value_size: 4,
+            max_entries: 16,
+            value: None,
+            entries,
+            percpu_entries: Vec::new(),
+            percpu_hash_entries: Vec::new(),
+            arena: None,
+            ringbuf: None,
+            stack_trace: None,
+            fd_array: None,
+            error: None,
+        };
+        let r = FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            maps: vec![hash_map],
+            ..Default::default()
+        };
+        let snap = Snapshot::new(&r);
+        let entry = snap.map("scx_threshold").unwrap().find(|_| false);
+        match entry {
+            SnapshotEntry::Missing(SnapshotError::NoMatch {
+                len, available_keys, ..
+            }) => {
+                assert_eq!(len, NO_MATCH_KEY_SAMPLE);
+                assert_eq!(available_keys.len(), NO_MATCH_KEY_SAMPLE);
+            }
+            other => panic!("expected NoMatch, got present={}", other.is_present()),
+        }
+    }
+
     #[test]
     fn map_filter_collects_matches() {
         let r = synthetic_report();
