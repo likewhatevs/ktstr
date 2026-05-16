@@ -23,7 +23,7 @@ fn spawn_with_composed_tags_group_idx() {
     let config = WorkloadConfig::default()
         .work_type(WorkType::SpinWait)
         .workers(2)
-        .with_composed(
+        .push_composed(
             WorkSpec::default()
                 .work_type(WorkType::pipe_io(64))
                 .workers(2),
@@ -74,7 +74,7 @@ fn spawn_with_composed_rejects_none_num_workers() {
     let config = WorkloadConfig::default()
         .work_type(WorkType::SpinWait)
         .workers(1)
-        .with_composed(WorkSpec::default().work_type(WorkType::SpinWait));
+        .push_composed(WorkSpec::default().work_type(WorkType::SpinWait));
     let result = WorkloadHandle::spawn(&config);
     let err = match result {
         Err(e) => e,
@@ -95,7 +95,7 @@ fn spawn_with_composed_rejects_topology_affinity() {
     let config = WorkloadConfig::default()
         .work_type(WorkType::SpinWait)
         .workers(1)
-        .with_composed(
+        .push_composed(
             WorkSpec::default()
                 .work_type(WorkType::SpinWait)
                 .workers(1)
@@ -125,7 +125,7 @@ fn spawn_with_composed_accepts_exact_affinity() {
     let config = WorkloadConfig::default()
         .work_type(WorkType::SpinWait)
         .workers(1)
-        .with_composed(
+        .push_composed(
             WorkSpec::default()
                 .work_type(WorkType::SpinWait)
                 .workers(1)
@@ -151,7 +151,7 @@ fn spawn_with_composed_inherits_parent_clone_mode() {
         .work_type(WorkType::SpinWait)
         .workers(1)
         .clone_mode(CloneMode::Thread)
-        .with_composed(WorkSpec::default().work_type(WorkType::SpinWait).workers(1));
+        .push_composed(WorkSpec::default().work_type(WorkType::SpinWait).workers(1));
     let mut h = WorkloadHandle::spawn(&config)
         .expect("composed entry must inherit Thread mode without diagnostic");
     h.start();
@@ -169,9 +169,9 @@ fn spawn_with_three_composed_tags_each_group_idx() {
     let config = WorkloadConfig::default()
         .work_type(WorkType::SpinWait)
         .workers(1)
-        .with_composed(WorkSpec::default().work_type(WorkType::SpinWait).workers(2))
-        .with_composed(WorkSpec::default().work_type(WorkType::SpinWait).workers(3))
-        .with_composed(WorkSpec::default().work_type(WorkType::SpinWait).workers(4));
+        .push_composed(WorkSpec::default().work_type(WorkType::SpinWait).workers(2))
+        .push_composed(WorkSpec::default().work_type(WorkType::SpinWait).workers(3))
+        .push_composed(WorkSpec::default().work_type(WorkType::SpinWait).workers(4));
     let mut h = WorkloadHandle::spawn(&config).unwrap();
     assert_eq!(
         h.worker_pids().len(),
@@ -320,7 +320,7 @@ fn idle_churn_zero_in_composed_group_rejects_with_group_idx() {
             precise_timing: false,
         })
         .workers(1)
-        .with_composed(
+        .push_composed(
             WorkSpec::default()
                 .work_type(WorkType::IdleChurn {
                     burst_duration: Duration::ZERO,
@@ -368,7 +368,7 @@ fn ipc_variance_zero_in_composed_group_rejects_with_group_idx() {
             sleep_duration: Duration::from_millis(100),
         })
         .workers(1)
-        .with_composed(
+        .push_composed(
             WorkSpec::default()
                 .work_type(WorkType::IpcVariance {
                     hot_iters: 1,

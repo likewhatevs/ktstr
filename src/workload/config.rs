@@ -925,7 +925,7 @@ pub struct WorkloadConfig {
     /// one `PipeIo(2)` composed group plus one `YieldHeavy(1)`
     /// composed group — using either the replacing
     /// [`composed`](Self::composed) setter or the appending
-    /// [`with_composed`](Self::with_composed) chain:
+    /// [`push_composed`](Self::push_composed) chain:
     ///
     /// ```
     /// use ktstr::workload::{WorkSpec, WorkType, WorkloadConfig};
@@ -934,12 +934,12 @@ pub struct WorkloadConfig {
     /// let cfg = WorkloadConfig::default()
     ///     .work_type(WorkType::SpinWait)
     ///     .workers(2)
-    ///     .with_composed(
+    ///     .push_composed(
     ///         WorkSpec::default()
     ///             .work_type(WorkType::pipe_io(64))
     ///             .workers(2),
     ///     )
-    ///     .with_composed(
+    ///     .push_composed(
     ///         WorkSpec::default()
     ///             .work_type(WorkType::YieldHeavy)
     ///             .workers(1),
@@ -1127,7 +1127,7 @@ impl WorkloadConfig {
     ///
     /// Use this when you have all groups in hand at once. To add
     /// one group at a time to an existing list, use the appending
-    /// [`with_composed`](Self::with_composed) instead.
+    /// [`push_composed`](Self::push_composed) instead.
     ///
     /// See [`Self::composed`] for the resolution rules applied to
     /// each entry's `num_workers` / `affinity` fields at spawn time.
@@ -1143,14 +1143,14 @@ impl WorkloadConfig {
     /// The supplied [`WorkSpec`] is PUSHED onto the existing
     /// `composed` vec; previously-set groups are preserved.
     /// Convenience for chained construction:
-    /// `cfg.with_composed(a).with_composed(b)` produces
+    /// `cfg.push_composed(a).push_composed(b)` produces
     /// `composed: [a, b]`.
     ///
     /// Use this when building the group list incrementally. To
     /// replace the entire list in one call, use the replacing
     /// [`composed`](Self::composed) instead.
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn with_composed(mut self, spec: WorkSpec) -> Self {
+    pub fn push_composed(mut self, spec: WorkSpec) -> Self {
         self.composed.push(spec);
         self
     }
