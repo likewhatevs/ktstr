@@ -731,3 +731,23 @@ fn worktype_custom_serialize_errors_skipped_variant() {
         "Custom variant must error on serialize (it's #[serde(skip)])"
     );
 }
+
+#[test]
+fn work_type_validation_error_hash_consistent_with_eq() {
+    use std::collections::HashSet;
+    let e1 = WorkTypeValidationError::NonDivisibleWorkerCount {
+        name: "WakeChain".to_string(),
+        group_idx: 0,
+        group_size: 2,
+        num_workers: 3,
+    };
+    let e2 = WorkTypeValidationError::NonDivisibleWorkerCount {
+        name: "WakeChain".to_string(),
+        group_idx: 0,
+        group_size: 2,
+        num_workers: 3,
+    };
+    let mut set: HashSet<WorkTypeValidationError> = HashSet::new();
+    set.insert(e1);
+    assert!(set.contains(&e2));
+}

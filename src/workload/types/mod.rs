@@ -2251,7 +2251,7 @@ impl WorkType {
 /// offending entry without re-parsing the message string. Variants
 /// with multiple constraint inputs (depth, divisor, observed count)
 /// expose those values as named fields to the same end.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum WorkTypeValidationError {
     /// [`WorkType::IdleChurn`] with `burst_duration == Duration::ZERO`.
     /// Collapses the per-iteration loop to pure nanosleep so the
