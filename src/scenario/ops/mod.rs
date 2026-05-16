@@ -557,7 +557,7 @@ pub fn execute_steps_with(
     steps: Vec<Step>,
     checks: Option<&crate::assert::Assert>,
 ) -> Result<AssertResult> {
-    execute_scenario_with(ctx, backdrop::Backdrop::EMPTY, steps, checks)
+    execute_scenario_with(ctx, backdrop::Backdrop::new(), steps, checks)
 }
 
 /// Compute the union of cgroup v2 controllers required by a
@@ -7597,7 +7597,7 @@ mod tests {
             )],
             HoldSpec::fixed(Duration::from_millis(1)),
         )];
-        let needed = required_controllers(&ctx, &backdrop::Backdrop::EMPTY, &steps);
+        let needed = required_controllers(&ctx, &backdrop::Backdrop::new(), &steps);
         assert!(
             needed.contains(&Controller::Cpuset),
             "AddCgroupDef carrying a cpuset must require Cpuset controller; got: {needed:?}",

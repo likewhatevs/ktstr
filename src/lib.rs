@@ -124,7 +124,7 @@
 //! let work_units = 10_000u64;
 //! let throughput = work_units as f64 / 5.0;
 //!
-//! let mut v = Assert::defaults().verdict();
+//! let mut v = Assert::default_checks().verdict();
 //! cg.claim_max_gap_ms(&mut v).at_most(100);          // typed CgroupStats accessor
 //! cg.claim_p99_wake_latency_us(&mut v).at_most(50.0);
 //! cg.claim_total_iterations(&mut v).at_least(1_000);

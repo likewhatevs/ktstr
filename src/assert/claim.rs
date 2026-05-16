@@ -4,7 +4,7 @@
 //! `Verdict` is the per-test claim accumulator. [`Assert`] holds threshold
 //! config and stays `Copy`; `Verdict` carries the per-test claim records
 //! (which include `Vec`/`String` allocations) and is built via
-//! [`Assert::defaults`]`().verdict()` or [`Verdict::new`].
+//! [`Assert::default_checks`]`().verdict()` or [`Verdict::new`].
 //!
 //! Test authors reach for one of two compile-mechanical labelers:
 //!
@@ -46,7 +46,7 @@ use super::{Assert, AssertDetail, AssertResult, DetailKind, NoteValue};
 /// ```
 /// # use ktstr::assert::{Assert, Verdict};
 /// // Empty verdict — no claims, passes.
-/// let v = Assert::defaults().verdict();
+/// let v = Assert::default_checks().verdict();
 /// let r = v.into_result();
 /// assert!(r.passed);
 /// ```

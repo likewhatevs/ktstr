@@ -83,12 +83,33 @@ fn verdict_default_matches_new() {
 
 #[test]
 fn verdict_assert_verdict_attaches_threshold_config() {
-    let v = Assert::defaults().verdict();
+    let v = Assert::default_checks().verdict();
     assert!(v.passed());
     assert!(v.assert().is_some());
 
     let v = Verdict::new();
     assert!(v.assert().is_none());
+}
+
+/// Pins the lockstep contract documented at `Assert::NO_OVERRIDES`
+/// (assert/mod.rs:1818-1822): the const value and the const-fn entry
+/// point return the same `Assert`. `default_checks()`'s body is
+/// `Self::NO_OVERRIDES`, so the equality is structurally guaranteed
+/// today — this test catches a future regression where someone adds a
+/// threshold default to `default_checks()` (e.g. flipping
+/// `enforce_monitor_thresholds` to true) without realising the const
+/// is the documented spread-composition source and must stay all-None.
+/// `Assert` doesn't derive `PartialEq` (f64 fields preclude `Eq`); the
+/// comparison goes via `Debug`, which prints EVERY field of the struct
+/// (including the bool `enforce_monitor_thresholds` that
+/// [`Assert::format_human`] doesn't render).
+#[test]
+fn no_overrides_matches_default_checks() {
+    assert_eq!(
+        format!("{:?}", Assert::NO_OVERRIDES),
+        format!("{:?}", Assert::default_checks()),
+        "Assert::default_checks() must remain field-by-field identical to Assert::NO_OVERRIDES",
+    );
 }
 
 #[test]

@@ -51,9 +51,9 @@ use crate::test_support::Payload;
 ///
 /// # Empty default
 ///
-/// Scenarios with no persistent state pass
-/// [`Backdrop::EMPTY`](Self::EMPTY), which is also what the
-/// shorthand [`execute_steps`](super::ops::execute_steps) /
+/// Scenarios with no persistent state pass [`Backdrop::new()`],
+/// which is also what the shorthand
+/// [`execute_steps`](super::ops::execute_steps) /
 /// [`execute_defs`](super::ops::execute_defs) wrappers forward to
 /// internally. There is no cost to using the empty default — the
 /// runtime skips the Backdrop setup phase entirely when every vec
@@ -174,20 +174,22 @@ pub struct Backdrop {
 }
 
 impl Backdrop {
-    /// Empty Backdrop — no persistent state. Used by
-    /// [`execute_steps`](super::ops::execute_steps) and
-    /// [`execute_defs`](super::ops::execute_defs) as the default
-    /// passed to [`execute_scenario`](super::ops::execute_scenario).
-    pub const EMPTY: Backdrop = Backdrop {
-        cgroups: Vec::new(),
-        payloads: Vec::new(),
-        ops: Vec::new(),
-    };
-
-    /// Fresh Backdrop builder.
+    /// Fresh empty Backdrop — no persistent state. Builder entry
+    /// point: chain [`Self::push_cgroup`] / [`Self::push_payload`] /
+    /// [`Self::push_op`] to populate.
+    ///
+    /// Equivalent to [`Default::default`](Self::default), but
+    /// `const fn` so the value is usable in `static`/`const`
+    /// contexts (`Default::default` is not yet const-stable). Prefer
+    /// `Backdrop::new()` at construction sites; `..Default::default()`
+    /// remains available inside non-const struct-update expressions.
     #[must_use = "dropping a Backdrop discards the scenario layout"]
-    pub fn new() -> Self {
-        Backdrop::EMPTY
+    pub const fn new() -> Self {
+        Backdrop {
+            cgroups: Vec::new(),
+            payloads: Vec::new(),
+            ops: Vec::new(),
+        }
     }
 
     /// See [`Self::cgroups`] for the ordering guarantee and the
@@ -274,7 +276,7 @@ mod tests {
 
     #[test]
     fn empty_backdrop_has_no_entities() {
-        let b = Backdrop::EMPTY;
+        let b = Backdrop::new();
         assert!(b.cgroups.is_empty());
         assert!(b.payloads.is_empty());
         assert!(b.ops.is_empty());
@@ -423,13 +425,21 @@ mod tests {
     }
 
     #[test]
-    fn default_impl_matches_empty() {
+    fn default_impl_matches_new() {
         let d: Backdrop = Default::default();
         assert!(d.is_empty());
-        assert_eq!(d.cgroups.len(), Backdrop::EMPTY.cgroups.len());
-        assert_eq!(d.payloads.len(), Backdrop::EMPTY.payloads.len());
-        assert_eq!(d.ops.len(), Backdrop::EMPTY.ops.len());
+        assert_eq!(d.cgroups.len(), Backdrop::new().cgroups.len());
+        assert_eq!(d.payloads.len(), Backdrop::new().payloads.len());
+        assert_eq!(d.ops.len(), Backdrop::new().ops.len());
     }
+
+    /// Compile-time pin: [`Backdrop::new`] must remain `const fn` so
+    /// downstream consumers can use it in `static`/`const` item
+    /// initializers. A regression that drops the `const` keyword (or
+    /// adds a non-const operation to the body) breaks this `const _`
+    /// item at build time rather than silently slipping past
+    /// [`default_impl_matches_new`].
+    const _BACKDROP_NEW_IS_CONST_EVALUABLE: Backdrop = Backdrop::new();
 
     #[test]
     fn push_op_populates_ops() {
@@ -467,7 +477,7 @@ mod tests {
     /// an alias — and the cgroup-name-collision footgun the type
     /// docs warn about would expand into a "mutate one Backdrop,
     /// corrupt the other" surprise. Pin independence per field
-    /// (cgroups, payloads, ops) against the `Backdrop::EMPTY` const,
+    /// (cgroups, payloads, ops) against [`Backdrop::new`],
     /// AND verify the cloned vec received the pushed value (not just
     /// "1 element"). A regression that cloned `original.cgroups` as
     /// `vec![CgroupDef::named("wrong")]` and then pushed the
@@ -475,7 +485,7 @@ mod tests {
     /// assertion misses.
     #[test]
     fn clone_is_independent_per_field() {
-        let original = Backdrop::EMPTY;
+        let original = Backdrop::new();
         let mut cloned = original.clone();
         cloned.cgroups.push(CgroupDef::named("cg_added_to_clone"));
         cloned.payloads.push(&TEST_PAYLOAD);
@@ -513,28 +523,28 @@ mod tests {
         );
     }
 
-    /// Lock-step pin: `Backdrop::default()` must agree with
-    /// `Backdrop::EMPTY` field-by-field. Both produce a no-state
+    /// Lock-step pin: [`Backdrop::default`] must agree with
+    /// [`Backdrop::new`] field-by-field. Both produce a no-state
     /// builder seed; a regression where Default seeds a non-empty
     /// field would silently introduce a phantom cgroup/payload/op
     /// into every spread-default callsite.
     #[test]
-    fn default_matches_empty_const() {
-        let from_const = Backdrop::EMPTY;
+    fn default_matches_new() {
+        let from_new = Backdrop::new();
         let from_trait: Backdrop = Default::default();
         assert_eq!(
             from_trait.cgroups.len(),
-            from_const.cgroups.len(),
+            from_new.cgroups.len(),
             "cgroups Vec drift"
         );
         assert_eq!(
             from_trait.payloads.len(),
-            from_const.payloads.len(),
+            from_new.payloads.len(),
             "payloads Vec drift"
         );
-        assert_eq!(from_trait.ops.len(), from_const.ops.len(), "ops Vec drift");
-        assert!(from_const.cgroups.is_empty());
-        assert!(from_const.payloads.is_empty());
-        assert!(from_const.ops.is_empty());
+        assert_eq!(from_trait.ops.len(), from_new.ops.len(), "ops Vec drift");
+        assert!(from_new.cgroups.is_empty());
+        assert!(from_new.payloads.is_empty());
+        assert!(from_new.ops.is_empty());
     }
 }

@@ -323,7 +323,7 @@ bound. Failures are tagged `DetailKind::SchedulerEvent`.
 `Verdict` is the per-test claim accumulator. `Assert` holds threshold
 config and stays `Copy`; `Verdict` carries the per-test claim records
 (which include `Vec`/`String` allocations) and is built via
-`Assert::defaults().verdict()` or `Verdict::new()`.
+`Assert::default_checks().verdict()` or `Verdict::new()`.
 
 Test authors reach for one of two compile-mechanical labelers:
 
@@ -333,7 +333,7 @@ Test authors reach for one of two compile-mechanical labelers:
 
    ```rust,ignore
    use ktstr::assert::{Assert, Verdict};
-   let mut v = Assert::defaults().verdict();
+   let mut v = Assert::default_checks().verdict();
    stats.claim_max_gap_ms(&mut v).at_most(100);
    stats.claim_total_iterations(&mut v).at_least(1000);
    let result = v.into_result();
@@ -390,14 +390,15 @@ combine claim outcomes with `assert_cgroup` / `assert_baseline` /
 ## Constants
 
 - `Assert::NO_OVERRIDES` -- identity for `merge`; every field is `None`,
-  so it overrides nothing. This is not "no checks" -- when used as a
-  per-test or per-scheduler `assert`, the runtime chain still applies
-  the merge of `default_checks() -> scheduler -> test`.
-- `Assert::default_checks()` -- currently aliases `NO_OVERRIDES` (every
-  check is `None`). Reserved as a hook for a future baseline policy.
-- `Assert::empty()` and `Assert::defaults()` -- method-style aliases
-  for the two constants above. Pair naturally with `.verdict()` when
-  building a `Verdict` from a fresh `Assert` in claim-style code.
+  so it overrides nothing. Use this const for spread-into-struct-literal
+  composition (e.g. `Assert { not_starved: Some(true), ..Assert::NO_OVERRIDES }`).
+  This is not "no checks" -- when used as a per-test or per-scheduler
+  `assert`, the runtime chain still applies the merge of
+  `default_checks() -> scheduler -> test`.
+- `Assert::default_checks()` -- `const fn` returning the same value as
+  `NO_OVERRIDES`. The method-style entry point that pairs with
+  `.verdict()` and builder setters (e.g.
+  `Assert::default_checks().check_not_starved().max_gap_ms(100).verdict()`).
 - `.with_monitor_defaults()` -- populates the monitor-threshold
   bundle (`max_imbalance_ratio`, `max_local_dsq_depth`,
   `fail_on_stall`, `sustained_samples`, `max_fallback_rate`,

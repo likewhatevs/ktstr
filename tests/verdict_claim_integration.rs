@@ -72,7 +72,7 @@ fn collect_real_reports() -> Vec<WorkerReport> {
 /// with `into_result`.
 ///
 /// Pins the contract that the entry point named in the user-facing
-/// docs (`use ktstr::prelude::*; let mut v = Assert::defaults().verdict();`)
+/// docs (`use ktstr::prelude::*; let mut v = Assert::default_checks().verdict();`)
 /// composes with both label sources against real `WorkerReport` data
 /// and produces a passing result with empty details.
 #[test]
@@ -80,15 +80,15 @@ fn verdict_passing_claims_against_real_worker_report() {
     let reports = collect_real_reports();
     let report = &reports[0];
 
-    // Build the Verdict via `Assert::defaults().verdict()` — the
-    // user-facing entry point referenced in the lib.rs Quick Start.
-    // `Assert::defaults()` carries the threshold layer; `.verdict()`
-    // hands it forward so any merge of an `assert_*` result later
-    // sees the same thresholds.
-    let mut v = Assert::defaults().verdict();
+    // Build the Verdict via `Assert::default_checks().verdict()` —
+    // the user-facing entry point referenced in the lib.rs Quick
+    // Start. `Assert::default_checks()` carries the threshold
+    // layer; `.verdict()` hands it forward so any merge of an
+    // `assert_*` result later sees the same thresholds.
+    let mut v = Assert::default_checks().verdict();
     assert!(
         v.assert().is_some(),
-        "Assert::defaults().verdict() must attach the threshold layer",
+        "Assert::default_checks().verdict() must attach the threshold layer",
     );
 
     // Typed scalar accessor. wall_time_ns is u64; the workload ran

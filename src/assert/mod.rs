@@ -1817,7 +1817,9 @@ impl Assert {
 
     /// Identity element for [`Assert::merge`]: every field is `None`,
     /// so neither side of a merge with `NO_OVERRIDES` is altered.
-    /// Equivalent to [`Self::default_checks`].
+    /// Identical to the value returned by [`Self::default_checks`] —
+    /// the const is for spread-into-struct-literal composition, the
+    /// const fn is the method-style entry point.
     pub const NO_OVERRIDES: Assert = Assert {
         not_starved: None,
         isolation: None,
@@ -1849,6 +1851,12 @@ impl Assert {
     /// All checks are off by default — tests opt in to the assertions
     /// they care about via scheduler-level or per-test `Assert`
     /// overrides.
+    ///
+    /// For spread-into-struct-literal composition
+    /// (`Assert { not_starved: Some(true), ..Assert::NO_OVERRIDES }`)
+    /// use the equivalent const [`Self::NO_OVERRIDES`]; this const fn
+    /// is the method-style entry point that pairs with `.verdict()`
+    /// and the builder setters.
     pub const fn default_checks() -> Assert {
         Self::NO_OVERRIDES
     }
@@ -1869,31 +1877,11 @@ impl Assert {
     ///
     /// ```
     /// # use ktstr::assert::Assert;
-    /// let r = Assert::defaults().verdict().into_result();
+    /// let r = Assert::default_checks().verdict().into_result();
     /// assert!(r.passed, "no claims means passing verdict");
     /// ```
     pub fn verdict(self) -> Verdict {
         Verdict::with_assert(self)
-    }
-
-    /// Identity-element constructor (equivalent to [`Self::NO_OVERRIDES`]).
-    ///
-    /// Replaces `NO_OVERRIDES` as the canonical name in the new
-    /// claim-API surface — the constant remains available for
-    /// merge-chain composition; `empty()` is the method-style entry
-    /// point that pairs naturally with `.verdict()` for tests that
-    /// don't want any threshold defaults to fire.
-    pub const fn empty() -> Self {
-        Self::NO_OVERRIDES
-    }
-
-    /// Default-checks constructor (equivalent to [`Self::default_checks`]).
-    ///
-    /// Method-style alias for the existing const fn; pairs with
-    /// `.verdict()` so the canonical entry point reads
-    /// `Assert::defaults().verdict()`.
-    pub const fn defaults() -> Self {
-        Self::default_checks()
     }
 
     pub const fn check_not_starved(mut self) -> Self {
@@ -3095,8 +3083,20 @@ pub struct SchedulerBaseline {
 
 impl SchedulerBaseline {
     /// Identity baseline — every field `None`, so [`assert_baseline`]
-    /// returns a passing result with no checks performed. Useful as a
-    /// starting point for builder-style composition.
+    /// returns a passing result with no checks performed. Serves as
+    /// both the spread-into-struct-literal source
+    /// (`SchedulerBaseline { max_migrations: Some(5), ..SchedulerBaseline::EMPTY }`)
+    /// and the builder-chain entry point
+    /// (`SchedulerBaseline::EMPTY.max_migrations(5)` — the
+    /// `max_*` / `min_*` setters take `mut self` and chain).
+    ///
+    /// Unlike [`Assert::NO_OVERRIDES`] + [`Assert::default_checks`]
+    /// (paired const + const fn for the two use cases), this type
+    /// uses a single named const that covers both. There is no
+    /// chainable verdict-style entry point on `SchedulerBaseline`
+    /// — the type is consumed by [`assert_baseline`] directly, not
+    /// composed into a [`Verdict`]. Adding a `new()` const fn would
+    /// duplicate the surface without adding capability.
     pub const EMPTY: SchedulerBaseline = SchedulerBaseline {
         max_p99_wake_latency_ns: None,
         max_iteration_cost_p99_ns: None,
@@ -3288,7 +3288,7 @@ pub fn assert_baseline(reports: &[WorkerReport], baseline: &SchedulerBaseline) -
 // (The legacy `Expect` / `Checks` / `CheckBuilder` types previously
 // living here were replaced by the [`Verdict`]-based claim API
 // (defined further up in this file). The new flow is
-// `Assert::defaults().verdict().claim_<field>(stats).at_most(N)` for
+// `Assert::default_checks().verdict().claim_<field>(stats).at_most(N)` for
 // stats-struct-derived accessors, or `claim!(verdict, expr)` for
 // expression-labeled claims. Both produce
 // [`ClaimBuilder`]/[`SetClaim`]/[`SeqClaim`] under the hood and
