@@ -41,7 +41,7 @@ use ktstr::live_host::{BpfMapAccessor, BpfSyscallAccessor, KallsymsTable, LiveHo
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
 
-const KTSTR_SCHED: ktstr::prelude::Scheduler = ktstr::prelude::Scheduler::new("ktstr_sched")
+const KTSTR_SCHED: ktstr::prelude::Scheduler = ktstr::prelude::Scheduler::named("ktstr_sched")
     .binary(ktstr::prelude::SchedulerSpec::Discover("scx-ktstr"));
 
 /// Discover the running kernel + every BPF map visible to it,

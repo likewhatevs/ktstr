@@ -37,7 +37,7 @@ use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
-    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
+    Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
 fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     // The freeze coordinator's file sink is wired by the test

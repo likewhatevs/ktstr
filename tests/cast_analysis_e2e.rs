@@ -79,7 +79,7 @@ use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec, sidecar_dir};
 
 const KTSTR_SCHED: Scheduler =
-    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
+    Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
 /// Mirror of `tests/failure_dump_e2e.rs::failure_dump_path` — the
 /// freeze coordinator writes per-test failure dumps under the same

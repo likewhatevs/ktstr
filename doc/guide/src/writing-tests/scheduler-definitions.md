@@ -231,7 +231,7 @@ registration:
 ```rust,ignore
 use ktstr::prelude::*;
 
-const MITOSIS: Scheduler = Scheduler::new("scx_mitosis")
+const MITOSIS: Scheduler = Scheduler::named("scx_mitosis")
     .binary(SchedulerSpec::Discover("scx_mitosis"))
     .topology(1, 2, 4, 1)
     .sched_args(&["--exit-dump-len", "1048576"])
@@ -374,7 +374,7 @@ declare_scheduler!(MITOSIS, {
 
 Arguments are `(numa_nodes, llcs, cores_per_llc, threads_per_core)`.
 Most schedulers use `numa_nodes = 1` (single NUMA node).
-`Scheduler::new()` defaults to `(1, 1, 2, 1)` — a minimal
+`Scheduler::named()` defaults to `(1, 1, 2, 1)` — a minimal
 2-CPU single-NUMA VM, sufficient for tests that don't exercise
 topology-dependent scheduling.
 

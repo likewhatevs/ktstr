@@ -2509,7 +2509,7 @@ fn scheduler_fingerprint_formats_sysctls_with_prefix() {
         Sysctl::new("kernel.bar", "yes"),
     ];
     static SCHED: super::super::entry::Scheduler =
-        super::super::entry::Scheduler::new("s").sysctls(SYSCTLS);
+        super::super::entry::Scheduler::named("s").sysctls(SYSCTLS);
     let entry = KtstrTestEntry {
         name: "s_test",
         scheduler: &SCHED,
@@ -2535,7 +2535,7 @@ fn scheduler_fingerprint_formats_sysctls_with_prefix() {
 #[test]
 fn scheduler_fingerprint_forwards_kargs_verbatim() {
     static SCHED: super::super::entry::Scheduler =
-        super::super::entry::Scheduler::new("s").kargs(&["quiet", "splash"]);
+        super::super::entry::Scheduler::named("s").kargs(&["quiet", "splash"]);
     let entry = KtstrTestEntry {
         name: "s_test",
         scheduler: &SCHED,
@@ -2555,7 +2555,7 @@ fn scheduler_fingerprint_forwards_kargs_verbatim() {
 fn scheduler_fingerprint_uses_display_name_for_discover() {
     use super::super::entry::SchedulerSpec;
     static SCHED: super::super::entry::Scheduler =
-        super::super::entry::Scheduler::new("s").binary(SchedulerSpec::Discover("scx_relaxed"));
+        super::super::entry::Scheduler::named("s").binary(SchedulerSpec::Discover("scx_relaxed"));
     let entry = KtstrTestEntry {
         name: "rel_test",
         scheduler: &SCHED,

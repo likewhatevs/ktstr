@@ -44,7 +44,7 @@ use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec, sidecar_dir};
 
 const KTSTR_SCHED: Scheduler =
-    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
+    Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
 /// Mirror `failure_dump_e2e.rs::failure_dump_path`. Both sites must
 /// agree with `test_support::eval::run_ktstr_test_inner`'s naming

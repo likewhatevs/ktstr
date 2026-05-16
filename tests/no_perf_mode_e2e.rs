@@ -38,7 +38,7 @@ use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
-    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
+    Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
 /// Host-side gate: a clean run means `acquire_llc_plan` reserved a
 /// host CPU pool, KVM oversubscribed 64 vCPUs onto it, and the

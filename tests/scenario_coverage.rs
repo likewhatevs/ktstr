@@ -5,7 +5,7 @@ use ktstr::scenario::Ctx;
 use ktstr::test_support::{BpfMapWrite, KtstrTestEntry, Scheduler, SchedulerSpec, Topology};
 
 const KTSTR_SCHED: Scheduler =
-    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
+    Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
 const TOPO_1L_4C_1T: Topology = Topology {
     llcs: 1,

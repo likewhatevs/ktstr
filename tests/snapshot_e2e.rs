@@ -249,7 +249,7 @@ fn watch_snapshot_op_unresolvable_symbol_bails_immediately() {
 // ---------------------------------------------------------------------------
 
 const KTSTR_SCHED: Scheduler =
-    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
+    Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
 /// Synthetic single-`.bss`-map `FailureDumpReport` used by the
 /// no-stall snapshot scenario. Hand-built JSON — out-of-crate code

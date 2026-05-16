@@ -1939,13 +1939,13 @@ fn camel_to_screaming_snake(s: &str) -> String {
 /// | `binary = "..."` | one source | Binary name → `SchedulerSpec::Discover(...)`. Matched against `[[bin]]` names in `target/{debug,release}/`, the test binary's directory, or `KTSTR_SCHEDULER` env var. Often equal to the cargo package name but not required to be. |
 /// | `binary_path = "/abs/path"` | one source | Absolute filesystem path → `SchedulerSpec::Path(...)`. The runtime does not auto-build this variant: the file must already exist at the path when the test runs. Use for prebuilt binaries that live outside the cargo discovery cascade. Macro-time validation rejects empty strings, relative paths, and `~`-prefixed paths (no compile-time tilde expansion); existence is the runtime's job. |
 /// | `kernel_builtin_enable = [..]` + `kernel_builtin_disable = [..]` | one source | Two string-array literals that together select `SchedulerSpec::KernelBuiltin { enable: &[..], disable: &[..] }`. The framework writes the enable commands to the guest's `/sched_enable` and the disable commands to `/sched_disable` (see `src/vmm/initramfs.rs`), and the guest interpreter runs each entry once at scenario start / teardown. Both fields must be set together — setting only one is rejected. The interpreter (`src/vmm/rust_init.rs`) accepts EXACTLY ONE shell-line shape: `echo VALUE > /path` (plus blank lines and `#` comments). Pipes, `>>`, `;`, variable expansion, and any other syntax silently no-ops at runtime, so the macro rejects entries that don't match `echo … > /…` at expand time. At least one of the two arrays must be non-empty: a pair that supplies neither enable nor disable commands is equivalent to the EEVDF baseline — reference [`Scheduler::EEVDF`] for that. Note: `cargo ktstr export` currently bails on KernelBuiltin schedulers (`src/export.rs`); declarations using this variant cannot be reproduced via the export-to-shar workflow until that limitation is lifted. |
-/// | `topology = (numa, llcs, cores, threads)` | no | Default VM topology. Default: `(1, 1, 2, 1)` (from `Scheduler::new`). Validated at compile time: each value must be non-zero, and `llcs` must be a multiple of `numa`. |
+/// | `topology = (numa, llcs, cores, threads)` | no | Default VM topology. Default: `(1, 1, 2, 1)` (from `Scheduler::named`). Validated at compile time: each value must be non-zero, and `llcs` must be a multiple of `numa`. |
 /// | `cgroup_parent = "..."` | no | Cgroup parent path (must begin with `/`). |
 /// | `sched_args = [..]` | no | Scheduler CLI args prepended before per-test `extra_sched_args`. |
 /// | `sysctls = [Sysctl::new("k", "v"), ..]` | no | Guest sysctls. |
 /// | `kargs = [..]` | no | Extra guest kernel cmdline args. |
 /// | `kernels = ["6.14", "7.0..=7.2", ..]` | no | Kernel specs the verifier sweeps. Same parser as the `--kernel` CLI flag — accepts exact versions, ranges (`..` or `..=`, both inclusive), git refs (`git+URL#REF`), paths, and cache keys. Each entry is validated at macro-expand time via the same `KernelId::parse` + `validate` the verifier uses at runtime; empty entries, inverted ranges, and `..`-containing strings whose endpoints aren't version-shaped (e.g. `"abc..def"`) are rejected. |
-/// | `constraints = TopologyConstraints { .. }` | no | Gauntlet preset constraints — maps directly onto [`Scheduler::constraints`]. Filters which gauntlet topology presets exercise this scheduler. When given as a struct literal, the macro additionally cross-checks each literal field against the effective topology (explicit `topology` field if present, otherwise the `(1, 1, 2, 1)` default from `Scheduler::new`) and rejects infeasible pairings; non-struct-literal forms (e.g. `OTHER::CONST_CONSTRAINTS`) skip that check. |
+/// | `constraints = TopologyConstraints { .. }` | no | Gauntlet preset constraints — maps directly onto [`Scheduler::constraints`]. Filters which gauntlet topology presets exercise this scheduler. When given as a struct literal, the macro additionally cross-checks each literal field against the effective topology (explicit `topology` field if present, otherwise the `(1, 1, 2, 1)` default from `Scheduler::named`) and rejects infeasible pairings; non-struct-literal forms (e.g. `OTHER::CONST_CONSTRAINTS`) skip that check. |
 /// | `assert = Assert::NO_OVERRIDES.method().chain()` | no | Scheduler-wide assertion overrides — maps directly onto [`Scheduler::assert`]. Merged with `Assert::default_checks()` and the per-test `assert` at runtime (`default ← scheduler ← per-test`). Accepts any const-evaluable expression: a const path like `Assert::NO_OVERRIDES`, a const-fn call like `Assert::default_checks()`, or a chain of const-fn setters like `Assert::NO_OVERRIDES.check_not_starved().max_gap_ms(50)`. The macro accepts MethodCall chains and Path-rooted (type/module-prefixed) Calls — only bare single-segment lowercase Calls like `helper()` are rejected as non-const free-fn patterns; non-const methods on a Path receiver slip through and surface as a deep const-eval failure at the spread site. |
 /// | `config_file = "..."` | no | Host-side config file path. |
 /// | `config_file_def = ("--config {file}", "/include-files/cfg.json")` | no | Inline-config plumbing — maps directly onto [`Scheduler::config_file_def`]. 2-tuple of string literals: arg_template (CLI arg with `{file}` placeholder substituted at run time) and guest_path (absolute path where the framework writes the JSON inside the guest). Distinct from `config_file` (which references a pre-existing host file). The macro validates: tuple-arity = 2, both elements non-empty string literals, `{file}` placeholder present in arg_template, guest_path absolute. |
@@ -2633,9 +2633,9 @@ fn declare_scheduler_inner(
     // the declared minimum (100 LLCs), and the test never runs.
     //
     // When `topology` is omitted the runtime falls back to
-    // `Scheduler::new`'s default (numa_nodes=1, llcs=1,
+    // `Scheduler::named`'s default (numa_nodes=1, llcs=1,
     // cores_per_llc=2, threads_per_core=1, total_cpus=2) — see
-    // `Scheduler::new` in `src/test_support/entry.rs`. The macro
+    // `Scheduler::named` in `src/test_support/entry.rs`. The macro
     // checks against the same default so infeasible constraints
     // are caught regardless of whether the caller pinned a
     // topology.
@@ -2657,7 +2657,7 @@ fn declare_scheduler_inner(
     // Build the Scheduler const expression via the builder chain.
     let sched_name_str = sched_name;
     let mut builder_chain = quote! {
-        ::ktstr::test_support::Scheduler::new(#sched_name_str)
+        ::ktstr::test_support::Scheduler::named(#sched_name_str)
     };
 
     let binary_spec = if let Some(name) = &sched_binary {
@@ -3185,14 +3185,14 @@ fn check_constraint_field_against_topology(
     threads_per_core: u32,
     topology_is_default: bool,
 ) -> syn::Result<()> {
-    // When `topology` was omitted, the macro inferred Scheduler::new
+    // When `topology` was omitted, the macro inferred Scheduler::named
     // defaults. Reading "effective topology llcs (1)" without
     // context makes a user wonder where the 1 came from — they
     // didn't write a topology field. Append a tail that names the
     // fallback source + the override syntax.
     let topology_origin_tail = if topology_is_default {
         " (`topology` field omitted; macro fell back to \
-         Scheduler::new's default `(numa=1, llcs=1, \
+         Scheduler::named's default `(numa=1, llcs=1, \
          cores=2, threads=1)`. Add an explicit \
          `topology = (numa, llcs, cores, threads)` to \
          override.)"

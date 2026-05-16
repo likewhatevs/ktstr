@@ -243,7 +243,7 @@ pieces wire this into a test:
    arg template and the guest path via `.config_file_def`:
 
    ```rust,ignore
-   const LAYERED_SCHED: Scheduler = Scheduler::new("layered")
+   const LAYERED_SCHED: Scheduler = Scheduler::named("layered")
        .binary(SchedulerSpec::Discover("scx_layered"))
        .config_file_def("--config {file}", "/include-files/layered.json");
    ```

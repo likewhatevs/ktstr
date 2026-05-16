@@ -380,7 +380,7 @@ impl TopologyConstraints {
 /// config-file plumbing, kernel sweep set, and assertion overrides.
 ///
 /// Construct via the [`declare_scheduler!`] macro (the production
-/// path) or the [`Scheduler::new`] const builder chain. Test bodies
+/// path) or the [`Scheduler::named`] const builder chain. Test bodies
 /// reference declared schedulers via the `scheduler = MY_SCHED`
 /// attribute on `#[ktstr_test]`.
 #[derive(Debug)]
@@ -516,7 +516,7 @@ impl Scheduler {
     };
 
     /// Const constructor for defining schedulers in static context.
-    pub const fn new(name: &'static str) -> Scheduler {
+    pub const fn named(name: &'static str) -> Scheduler {
         Scheduler {
             name,
             binary: SchedulerSpec::Eevdf,
@@ -1418,7 +1418,7 @@ where
 pub struct SchedulerJson {
     /// Scheduler name — the `name = "..."` value supplied to
     /// [`declare_scheduler!`](crate::declare_scheduler) or
-    /// [`Scheduler::new`].
+    /// [`Scheduler::named`].
     pub name: String,
     /// Binary specification: distinguishes Discover (build via cargo
     /// `[[bin]]` name), Path (use absolute path verbatim), Eevdf
@@ -2410,10 +2410,10 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_new_builder() {
+    fn scheduler_named_builder() {
         static TEST_SYSCTLS: &[Sysctl] =
             &[Sysctl::new("kernel.sched_cfs_bandwidth_slice_us", "1000")];
-        let s = Scheduler::new("test_sched")
+        let s = Scheduler::named("test_sched")
             .binary(SchedulerSpec::Discover("test_bin"))
             .sysctls(TEST_SYSCTLS)
             .kargs(&["nosmt"]);
@@ -2427,25 +2427,25 @@ mod tests {
         let v = crate::assert::Assert::NO_OVERRIDES
             .check_not_starved()
             .max_imbalance_ratio(3.0);
-        let s = Scheduler::new("sched").assert(v);
+        let s = Scheduler::named("sched").assert(v);
         assert_eq!(s.assert.not_starved, Some(true));
         assert_eq!(s.assert.max_imbalance_ratio, Some(3.0));
     }
 
     #[test]
-    fn scheduler_new_default_topology_matches_macro_hardcode() {
+    fn scheduler_named_default_topology_matches_macro_hardcode() {
         // The `declare_scheduler!` macro at
         // `ktstr-macros/src/lib.rs` hardcodes
         // `(numa=1, llcs=1, cores_per_llc=2, threads_per_core=1)`
         // as the fallback when the user omits `topology = (...)`.
-        // That hardcode mirrors `Scheduler::new`'s default Topology.
+        // That hardcode mirrors `Scheduler::named`'s default Topology.
         // The two sites are mechanically coupled by convention but
-        // not by code: a change to `Scheduler::new` here would
+        // not by code: a change to `Scheduler::named` here would
         // silently let the macro check stale values, producing
         // misleading "effective topology llcs (N)" errors and/or
         // false-positives. Pin the defaults here so a drift fails
         // this test loudly and points at both sites.
-        let s = Scheduler::new("__macro_default_topology_pin__");
+        let s = Scheduler::named("__macro_default_topology_pin__");
         assert_eq!(s.topology.numa_nodes, 1);
         assert_eq!(s.topology.llcs, 1);
         assert_eq!(s.topology.cores_per_llc, 2);
@@ -2945,8 +2945,8 @@ mod tests {
     fn build_scheduler_index_or_panic_rejects_duplicate_names() {
         // Two consts with the same name. Address-distinct so
         // `std::ptr::eq` returns false and the dedup branch fires.
-        static A: Scheduler = Scheduler::new("dup_name_test");
-        static B: Scheduler = Scheduler::new("dup_name_test");
+        static A: Scheduler = Scheduler::named("dup_name_test");
+        static B: Scheduler = Scheduler::named("dup_name_test");
         let _ = build_scheduler_index_or_panic([&A, &B]);
     }
 
@@ -2955,8 +2955,8 @@ mod tests {
     /// references for lookup parity with `find_scheduler`.
     #[test]
     fn build_scheduler_index_or_panic_accepts_distinct_names() {
-        static A: Scheduler = Scheduler::new("dup_name_a");
-        static B: Scheduler = Scheduler::new("dup_name_b");
+        static A: Scheduler = Scheduler::named("dup_name_a");
+        static B: Scheduler = Scheduler::named("dup_name_b");
         let map = build_scheduler_index_or_panic([&A, &B]);
         assert!(std::ptr::eq(*map.get("dup_name_a").unwrap(), &A));
         assert!(std::ptr::eq(*map.get("dup_name_b").unwrap(), &B));
@@ -2970,7 +2970,7 @@ mod tests {
     /// pointer-distinct duplicate is a misconfiguration.
     #[test]
     fn build_scheduler_index_or_panic_tolerates_pointer_identity_aliases() {
-        static A: Scheduler = Scheduler::new("alias_test");
+        static A: Scheduler = Scheduler::named("alias_test");
         let map = build_scheduler_index_or_panic([&A, &A]);
         assert!(std::ptr::eq(*map.get("alias_test").unwrap(), &A));
     }

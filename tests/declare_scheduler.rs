@@ -241,7 +241,7 @@ fn assert_accepts_bare_const_path() {
 
 #[test]
 fn omitted_assert_defaults_to_no_overrides() {
-    // When the macro omits `assert = ...`, Scheduler::new's
+    // When the macro omits `assert = ...`, Scheduler::named's
     // default (`Assert::NO_OVERRIDES`, all-None) flows through.
     // Verified via DECLARE_SCHEDULER_MINIMAL which omits assert.
     assert_eq!(DECLARE_SCHEDULER_MINIMAL.assert.not_starved, None);

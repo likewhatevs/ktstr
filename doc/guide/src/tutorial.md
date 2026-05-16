@@ -610,7 +610,7 @@ on a `Scheduler` const built via the manual builder, then supply the
 inline content from the test attribute:
 
 ```rust,ignore
-const LAYERED_SCHED: Scheduler = Scheduler::new("layered")
+const LAYERED_SCHED: Scheduler = Scheduler::named("layered")
     .binary(SchedulerSpec::Discover("scx_layered"))
     .topology(1, 2, 4, 1)
     .config_file_def("--config {file}", "/include-files/layered.json");

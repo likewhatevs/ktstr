@@ -5,7 +5,7 @@ use ktstr::scenario::Ctx;
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const SCX_CLEANUP_SCHED: Scheduler =
-    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
+    Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
 /// Boots a VM with the scx-ktstr scheduler attached, runs no
 /// workload, and exits cleanly. Counterpart to

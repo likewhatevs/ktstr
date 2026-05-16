@@ -36,7 +36,7 @@ use std::fs;
 /// intermediate level — each must have `+cpuset +cpu` enabled
 /// in its own `cgroup.subtree_control` before its child can
 /// inherit those controllers.
-const MULTI_LEVEL_SCHED: Scheduler = Scheduler::new("ktstr_sched")
+const MULTI_LEVEL_SCHED: Scheduler = Scheduler::named("ktstr_sched")
     .binary(SchedulerSpec::Discover("scx-ktstr"))
     .cgroup_parent("/ktstr-multi-l1/l2/l3");
 

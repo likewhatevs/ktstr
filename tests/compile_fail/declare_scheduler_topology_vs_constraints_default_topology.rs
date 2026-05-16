@@ -1,6 +1,6 @@
 // Pins that the topology-vs-constraints consistency check fires
 // even when `topology` is omitted. Without an explicit `topology`,
-// the runtime falls back to `Scheduler::new`'s default
+// the runtime falls back to `Scheduler::named`'s default
 // (numa_nodes=1, llcs=1, cores_per_llc=2, threads_per_core=1,
 // total_cpus=2). `constraints.min_llcs = 100` requires every
 // preset to provide at least 100 LLCs — every gauntlet preset

@@ -9,7 +9,7 @@ use ktstr::test_support::Scheduler;
 
 #[allow(dead_code)]
 const SCHED_REQUIRES_CONFIG: Scheduler =
-    Scheduler::new("requires_config").config_file_def("--config {file}", "/include-files/cfg.json");
+    Scheduler::named("requires_config").config_file_def("--config {file}", "/include-files/cfg.json");
 
 #[ktstr_test(scheduler = SCHED_REQUIRES_CONFIG)]
 fn def_without_config(_ctx: &ktstr::scenario::Ctx) -> anyhow::Result<ktstr::assert::AssertResult> {

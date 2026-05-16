@@ -486,7 +486,7 @@ fn entry_override_sched_constraint() {
 /// Uses EEVDF (no binary) — the test validates topology inheritance,
 /// not scheduler behavior.
 const TOPO_SCHED: ktstr::test_support::Scheduler =
-    ktstr::test_support::Scheduler::new("topo_test").topology(1, 2, 3, 1);
+    ktstr::test_support::Scheduler::named("topo_test").topology(1, 2, 3, 1);
 
 /// Full topology inheritance: all three dimensions from TOPO_SCHED.
 #[ktstr_test(scheduler = TOPO_SCHED)]

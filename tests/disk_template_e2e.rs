@@ -65,7 +65,7 @@ use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
-    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
+    Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
 /// btrfs `statfs.f_type` magic per `linux/magic.h`. Pinned here
 /// (rather than imported from `disk_template`'s private `const`)

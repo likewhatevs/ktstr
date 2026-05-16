@@ -14,7 +14,7 @@ use ktstr::scenario::ops::{HoldSpec, Op, Step, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
-    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
+    Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
 /// Host-side content assertion: verify the bridge has a capture
 /// with the scheduler's .bss containing real BTF-rendered globals.
