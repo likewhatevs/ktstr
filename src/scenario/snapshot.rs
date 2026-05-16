@@ -2820,6 +2820,68 @@ mod tests {
         assert!(rendered.starts_with("hex:x"));
     }
 
+    /// Internal-contract pin: when a HASH entry's `key` field is
+    /// `None` (BTF was missing at capture for the map's key type),
+    /// `render_entry_key` must fall back to a string that BEGINS
+    /// with `"hex:"` followed by the raw `key_hex` bytes. The
+    /// BTF-missing-hint detection on the NoMatch Display arm uses
+    /// `available_keys.iter().all(|k| k.starts_with("hex:"))` as
+    /// the discriminator — a silent change to the prefix (drop,
+    /// rename to `"0x"`, etc.) would break the hint without
+    /// surfacing in any sibling test. `key_hex` is space-separated
+    /// hex pairs per `monitor::dump::hex_dump`, so the fixture
+    /// uses that format to match what production wire data looks
+    /// like.
+    #[test]
+    fn render_entry_key_hash_fallback_uses_hex_prefix() {
+        let entry_fixture = FailureDumpEntry {
+            key: None,
+            key_hex: "de ad be ef".into(),
+            value: None,
+            value_hex: String::new(),
+            payload: None,
+        };
+        let entry = SnapshotEntry::Hash(&entry_fixture);
+        let rendered = render_entry_key(&entry).expect("hash entry has a key");
+        assert!(
+            rendered.starts_with("hex:"),
+            "Hash fallback must use 'hex:' prefix that NoMatch Display \
+             uses as the BTF-missing-hint discriminator; got {rendered:?}",
+        );
+        assert!(
+            rendered.contains("de ad be ef"),
+            "key_hex bytes must be preserved verbatim so the operator \
+             can disambiguate keys; got {rendered:?}",
+        );
+    }
+
+    /// Sibling of `render_entry_key_hash_fallback_uses_hex_prefix`
+    /// for the [`SnapshotEntry::PercpuHash`] variant. Both Hash and
+    /// PercpuHash entries hit the same `hex:{key_hex}` fallback in
+    /// `render_entry_key` when their `key` field is `None`; a
+    /// regression that altered the fallback shape for ONLY one of
+    /// the two variants would silently break the BTF-missing-hint
+    /// gate for that variant's map type. The pair pins the
+    /// internal contract for both variants explicitly.
+    #[test]
+    fn render_entry_key_percpu_hash_fallback_uses_hex_prefix() {
+        let entry_fixture = FailureDumpPercpuHashEntry {
+            key: None,
+            key_hex: "ca fe ba be".into(),
+            per_cpu: vec![None],
+        };
+        let entry = SnapshotEntry::PercpuHash(&entry_fixture);
+        let rendered = render_entry_key(&entry).expect("percpu-hash entry has a key");
+        assert!(
+            rendered.starts_with("hex:"),
+            "PercpuHash fallback must use 'hex:' prefix; got {rendered:?}",
+        );
+        assert!(
+            rendered.contains("ca fe ba be"),
+            "key_hex bytes must be preserved verbatim; got {rendered:?}",
+        );
+    }
+
     /// End-to-end pin for the `available_keys.is_empty() && len > 0`
     /// Display arm: a single-value ARRAY map iterates as one
     /// [`SnapshotEntry::Value`], `render_entry_key` returns None for
