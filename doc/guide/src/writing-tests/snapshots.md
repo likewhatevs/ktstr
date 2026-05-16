@@ -308,7 +308,12 @@ needed to fix the call site without re-running the test:
   3 entries) of rendered keys seen during the traversal, capped
   at 80 chars each with a trailing `…` for wide struct keys, so
   the failure message can show the keyspace shape without
-  flooding the output.
+  flooding the output. When every sampled key carries the
+  `hex:` prefix (because BTF type info was absent at capture
+  time for this map's key type), the rendered failure message
+  also appends a hint pointing at `CONFIG_DEBUG_INFO_BTF=y` so
+  the operator can recognize the kernel-config root cause
+  without reverse-engineering the `hex:` discriminator.
 - `EmptyPathComponent { requested }` — a path string contained an
   empty component (e.g. `"a..b"`).
 - `PerCpuNotNarrowed { map }` — `entry.get` called on a per-CPU entry

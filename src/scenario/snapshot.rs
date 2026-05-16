@@ -377,7 +377,33 @@ impl std::fmt::Display for SnapshotError {
                         f,
                         "map '{map}': {op} matched none of {len} entries (first {sampled}: {available_keys:?})",
                         sampled = available_keys.len(),
-                    )
+                    )?;
+                    // The `hex:` prefix is only ever produced by
+                    // `render_entry_key`'s fallback path when the
+                    // entry's `key` field was `None` at capture time.
+                    // Typed `RenderedValue::Display` does not emit
+                    // this prefix for any scalar variant; `Struct`
+                    // emits `TypeName{...}` inline or `TypeName:`
+                    // breadcrumb, where a `hex:` collision would
+                    // require a BTF struct literally named `hex` —
+                    // no real kernel scheduler does that. The hint
+                    // therefore fires only when BTF was uniformly
+                    // absent for this map's key type at capture time,
+                    // and names the kernel-side fix so the operator
+                    // does not have to reverse-engineer the `hex:`
+                    // discriminator.
+                    if available_keys
+                        .iter()
+                        .all(|k| k.starts_with("hex:"))
+                    {
+                        write!(
+                            f,
+                            " (BTF missing at capture — keys shown as hex bytes; \
+                             rebuild guest kernel with CONFIG_DEBUG_INFO_BTF=y for \
+                             typed keys)"
+                        )?;
+                    }
+                    Ok(())
                 }
             }
             SnapshotError::EmptyPathComponent { requested } => {
@@ -2934,6 +2960,220 @@ mod tests {
             }
             other => panic!("expected NoMatch, got present={}", other.is_present()),
         }
+    }
+
+    /// The `find()` `available_keys` sample preserves duplicates in
+    /// iteration order — there is no dedup at the snapshot layer.
+    /// `iter_entries()` walks `self.map.entries.iter()` directly for
+    /// the HASH branch (and `percpu_entries.iter()` /
+    /// `percpu_hash_entries.iter()` for the per-CPU branches); all
+    /// three are raw `Vec::iter()` calls. The wire format is a `Vec`,
+    /// not a `Map`, so duplicate keys are syntactically legal even
+    /// though real BPF maps cannot produce them — and the operator's
+    /// failure-message contract depends on `len` reflecting EVERY
+    /// entry seen and `available_keys` showing the sample as
+    /// observed. This test pins the iter-layer no-dedup invariant; a
+    /// future "optimization" that adds dedup to `iter_entries()`
+    /// would collapse the duplicate `"100"` here and fail loudly.
+    #[test]
+    fn map_find_no_match_preserves_duplicate_keys_in_sample() {
+        let hash_map = FailureDumpMap {
+            name: "scx_dup".into(),
+            map_type: 1,
+            value_size: 4,
+            max_entries: 16,
+            value: None,
+            entries: vec![
+                FailureDumpEntry {
+                    key: Some(RenderedValue::Uint {
+                        bits: 32,
+                        value: 100,
+                    }),
+                    key_hex: "64000000".into(),
+                    value: Some(RenderedValue::Uint {
+                        bits: 32,
+                        value: 1,
+                    }),
+                    value_hex: "01000000".into(),
+                    payload: None,
+                },
+                FailureDumpEntry {
+                    key: Some(RenderedValue::Uint {
+                        bits: 32,
+                        value: 100,
+                    }),
+                    key_hex: "64000000".into(),
+                    value: Some(RenderedValue::Uint {
+                        bits: 32,
+                        value: 2,
+                    }),
+                    value_hex: "02000000".into(),
+                    payload: None,
+                },
+                FailureDumpEntry {
+                    key: Some(RenderedValue::Uint {
+                        bits: 32,
+                        value: 200,
+                    }),
+                    key_hex: "c8000000".into(),
+                    value: Some(RenderedValue::Uint {
+                        bits: 32,
+                        value: 3,
+                    }),
+                    value_hex: "03000000".into(),
+                    payload: None,
+                },
+                FailureDumpEntry {
+                    key: Some(RenderedValue::Uint {
+                        bits: 32,
+                        value: 300,
+                    }),
+                    key_hex: "2c010000".into(),
+                    value: Some(RenderedValue::Uint {
+                        bits: 32,
+                        value: 4,
+                    }),
+                    value_hex: "04000000".into(),
+                    payload: None,
+                },
+            ],
+            percpu_entries: Vec::new(),
+            percpu_hash_entries: Vec::new(),
+            arena: None,
+            ringbuf: None,
+            stack_trace: None,
+            fd_array: None,
+            error: None,
+        };
+        let r = FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            maps: vec![hash_map],
+            ..Default::default()
+        };
+        let snap = Snapshot::new(&r);
+        let entry = snap.map("scx_dup").unwrap().find(|_| false);
+        match entry {
+            SnapshotEntry::Missing(SnapshotError::NoMatch {
+                op,
+                len,
+                available_keys,
+                ..
+            }) => {
+                assert_eq!(op, "find");
+                assert_eq!(
+                    len, 4,
+                    "duplicate-key entries each count toward len; iter_entries \
+                     Hash branch iterates the Vec directly with no dedup",
+                );
+                assert_eq!(available_keys.len(), NO_MATCH_KEY_SAMPLE);
+                assert_eq!(
+                    available_keys,
+                    vec!["100".to_string(), "100".to_string(), "200".to_string()],
+                    "no dedup at sample-collection: the duplicate key '100' \
+                     appears twice in iteration order before the cap fires \
+                     against the third unique key",
+                );
+                let dup_count = available_keys.iter().filter(|k| k.as_str() == "100").count();
+                assert_eq!(
+                    dup_count, 2,
+                    "position-insensitive backup pin: key '100' must appear \
+                     exactly twice in available_keys (saw {dup_count} in \
+                     {available_keys:?})",
+                );
+            }
+            other => panic!("expected NoMatch, got present={}", other.is_present()),
+        }
+    }
+
+    /// `find()`'s NoMatch Display appends a BTF-missing hint when
+    /// every sampled key carries the `hex:` prefix from
+    /// [`render_entry_key`]'s fallback path. Pins both the hint
+    /// substring AND that the prior arm's key listing is still
+    /// rendered (the hint is additive, not a replacement).
+    #[test]
+    fn no_match_display_appends_btf_hint_when_all_keys_are_hex() {
+        let err = SnapshotError::NoMatch {
+            map: "scx_per_task".to_string(),
+            op: "find",
+            len: 5,
+            available_keys: vec![
+                "hex:64000000".to_string(),
+                "hex:c8000000".to_string(),
+                "hex:2c010000".to_string(),
+            ],
+        };
+        let rendered = format!("{err}");
+        assert!(rendered.contains("'scx_per_task'"), "{rendered}");
+        assert!(rendered.contains("matched none of 5"), "{rendered}");
+        assert!(
+            rendered.contains("hex:64000000"),
+            "underlying key list still rendered: {rendered}",
+        );
+        assert!(rendered.contains("BTF missing"), "{rendered}");
+        assert!(rendered.contains("CONFIG_DEBUG_INFO_BTF"), "{rendered}");
+    }
+
+    /// The BTF-missing hint MUST NOT fire when the sample contains
+    /// any typed (non-`hex:`-prefixed) key. A mixed sample means BTF
+    /// IS present and resolving most keys; the unresolved hex ones
+    /// are a per-entry capture race, not a uniform-config problem,
+    /// so the kernel-rebuild advice would mislead the operator.
+    #[test]
+    fn no_match_display_omits_btf_hint_when_some_keys_are_typed() {
+        let err = SnapshotError::NoMatch {
+            map: "mixed".to_string(),
+            op: "find",
+            len: 5,
+            available_keys: vec![
+                "hex:64000000".to_string(),
+                "100".to_string(),
+                "hex:2c010000".to_string(),
+            ],
+        };
+        let rendered = format!("{err}");
+        assert!(rendered.contains("hex:64000000"), "{rendered}");
+        assert!(rendered.contains("100"), "{rendered}");
+        assert!(
+            !rendered.contains("BTF missing"),
+            "BTF hint must not fire on mixed-typed sample: {rendered}",
+        );
+        assert!(!rendered.contains("CONFIG_DEBUG_INFO_BTF"), "{rendered}");
+    }
+
+    /// The BTF-missing hint MUST NOT fire on the `available_keys
+    /// .is_empty()` arm even though `[].iter().all(_)` returns true
+    /// vacuously. There is no evidence of a BTF problem when no
+    /// keys were sampled; the hint here would be a false positive.
+    #[test]
+    fn no_match_display_omits_btf_hint_when_no_keys_sampled() {
+        let err = SnapshotError::NoMatch {
+            map: "m".to_string(),
+            op: "find",
+            len: 5,
+            available_keys: Vec::new(),
+        };
+        let rendered = format!("{err}");
+        assert!(rendered.contains("sample keys unavailable"), "{rendered}");
+        assert!(!rendered.contains("BTF missing"), "{rendered}");
+        assert!(!rendered.contains("CONFIG_DEBUG_INFO_BTF"), "{rendered}");
+    }
+
+    /// The BTF-missing hint MUST NOT fire on the empty-map arm
+    /// (`len == 0`). The empty-map message is its own dedicated
+    /// branch; an unconditional hint append would render the
+    /// operator-facing message contradictory.
+    #[test]
+    fn no_match_display_omits_btf_hint_when_map_is_empty() {
+        let err = SnapshotError::NoMatch {
+            map: "m".to_string(),
+            op: "find",
+            len: 0,
+            available_keys: Vec::new(),
+        };
+        let rendered = format!("{err}");
+        assert!(rendered.contains("map is empty"), "{rendered}");
+        assert!(!rendered.contains("BTF missing"), "{rendered}");
+        assert!(!rendered.contains("CONFIG_DEBUG_INFO_BTF"), "{rendered}");
     }
 
     /// Boundary case: when entry count equals [`NO_MATCH_KEY_SAMPLE`]

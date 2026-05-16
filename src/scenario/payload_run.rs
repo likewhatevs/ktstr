@@ -2681,7 +2681,7 @@ mod tests {
     /// `"PayloadRun::spawn"` via a copy-paste typo) when calling
     /// resolve_cgroup_path. The helper-level differential test above
     /// only proves the parameter isn't dropped — this test exercises
-    /// the production call site at L254 end-to-end.
+    /// the production call site inside `PayloadRun::run()` end-to-end.
     #[test]
     fn payload_run_run_threads_canonical_op_label() {
         let cgroups = CgroupManager::new("/sys/fs/cgroup/test-parent");
@@ -2698,10 +2698,11 @@ mod tests {
     }
 
     /// Sibling of `payload_run_run_threads_canonical_op_label` for
-    /// the `.spawn()` entry point at L282. Uses a NUL-byte cgroup
-    /// name (different validation branch from the run() test's `..`)
-    /// to guard against a hypothetical refactor that hardcodes one
-    /// op label across all anyhow! sites in resolve_cgroup_path.
+    /// the `PayloadRun::spawn()` entry point. Uses a NUL-byte
+    /// cgroup name (different validation branch from the run()
+    /// test's `..`) to guard against a hypothetical refactor that
+    /// hardcodes one op label across all anyhow! sites in
+    /// resolve_cgroup_path.
     #[test]
     fn payload_run_spawn_threads_canonical_op_label() {
         let cgroups = CgroupManager::new("/sys/fs/cgroup/test-parent");
