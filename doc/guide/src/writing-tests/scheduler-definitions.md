@@ -25,6 +25,23 @@ pub struct Scheduler {
 }
 ```
 
+**Pick one of `config_file` / `config_file_def` — they are
+alternatives, not complements.** A scheduler that takes a
+config file at startup picks the field that matches the
+test-author surface:
+
+- The config is the SAME file across every test that uses the
+  scheduler → `config_file = "path/to/sched.toml"` (host-side file,
+  packed once into the initramfs).
+- The config VARIES per test (different test asserts different
+  bands, knobs, or topologies) → `config_file_def` (declares the
+  arg-template + guest-path pair; each test supplies the
+  `config_content` via `#[ktstr_test(config = …)]`).
+- The scheduler takes no config → omit both fields.
+
+Setting both fields on the same scheduler is a misconfiguration
+and the framework rejects it at validation time.
+
 `config_file` packs a host-side file into the initramfs at
 `/include-files/{filename}` and prepends `--config /include-files/{filename}`
 to scheduler args automatically.
@@ -33,9 +50,7 @@ to scheduler args automatically.
 schedulers that take inline JSON content via the test attribute
 `#[ktstr_test(config = …)]`: the framework writes the test's
 `config_content` to the declared guest path and substitutes
-`{file}` in the arg template before launching the scheduler. The
-two fields are alternatives — `config_file` is the host-file path,
-`config_file_def` is the inline-content path. See
+`{file}` in the arg template before launching the scheduler. See
 [The #\[ktstr_test\] Macro](ktstr-test-macro.md#inline-scheduler-config)
 for the inline pairing gate.
 
