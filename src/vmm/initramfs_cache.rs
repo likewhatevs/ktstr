@@ -655,9 +655,11 @@ mod tests {
 
     #[test]
     fn base_key_different_content_differs() {
-        let tmp =
-            std::env::temp_dir().join(format!("ktstr-cache-content-test-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cache-content-test-")
+            .tempdir()
+            .unwrap();
+        let tmp = _tempdir_keep_alive.path();
         let bin = tmp.join("payload");
 
         std::fs::write(&bin, b"content_v1").unwrap();
@@ -670,7 +672,6 @@ mod tests {
             k1, k2,
             "different file content should produce different key"
         );
-        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
@@ -687,9 +688,11 @@ mod tests {
         // Rust toolchain versions. Golden check pins the concrete
         // algorithm — if this value changes, the cache silently
         // invalidates every prior artifact.
-        let tmp =
-            std::env::temp_dir().join(format!("ktstr-hash-golden-test-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-hash-golden-test-")
+            .tempdir()
+            .unwrap();
+        let tmp = _tempdir_keep_alive.path();
         let f = tmp.join("known");
         std::fs::write(&f, b"ktstr cache key probe").unwrap();
         let observed = hash_file(&f).unwrap();
@@ -701,15 +704,15 @@ mod tests {
             observed, expected,
             "hash_file must match ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher()"
         );
-
-        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
     fn hash_file_large_file() {
-        let tmp =
-            std::env::temp_dir().join(format!("ktstr-hash-sample-test-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-hash-sample-test-")
+            .tempdir()
+            .unwrap();
+        let tmp = _tempdir_keep_alive.path();
         let f = tmp.join("big");
         // 16KB file — spans multiple pages in the mmap.
         let data: Vec<u8> = (0..16384).map(|i| (i % 256) as u8).collect();
@@ -717,15 +720,17 @@ mod tests {
         let h = hash_file(&f).unwrap();
         // Same content should produce same hash.
         assert_eq!(h, hash_file(&f).unwrap());
-        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     /// `hash_file` must invalidate its memoisation cache when the file
     /// changes — same path, new content, must yield a new hash.
     #[test]
     fn hash_file_memoisation_invalidates_on_change() {
-        let tmp = std::env::temp_dir().join(format!("ktstr-hash-memo-test-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-hash-memo-test-")
+            .tempdir()
+            .unwrap();
+        let tmp = _tempdir_keep_alive.path();
         let f = tmp.join("rev");
 
         std::fs::write(&f, b"revision-one").unwrap();
@@ -739,7 +744,6 @@ mod tests {
         let h2 = hash_file(&f).unwrap();
 
         assert_ne!(h1, h2, "mtime change must bypass the memoisation cache");
-        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]

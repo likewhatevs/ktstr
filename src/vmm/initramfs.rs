@@ -1949,12 +1949,15 @@ mod tests {
 
     #[test]
     fn resolve_shared_libs_non_elf_returns_empty() {
-        let tmp = std::env::temp_dir().join("ktstr-test-resolve-nonelf");
-        std::fs::write(&tmp, b"not an elf").unwrap();
-        let result = resolve_shared_libs(&tmp).unwrap();
+        let _tempfile_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-test-resolve-nonelf-")
+            .tempfile()
+            .unwrap();
+        let tmp = _tempfile_keep_alive.path();
+        std::fs::write(tmp, b"not an elf").unwrap();
+        let result = resolve_shared_libs(tmp).unwrap();
         assert!(result.found.is_empty());
         assert!(result.missing.is_empty());
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
@@ -2990,18 +2993,26 @@ mod tests {
 
         let data = build_synthetic_cpio(2 << 20); // ~2MB
         let compressed = lz4_legacy_compress(&data);
-        let compressed_path = std::env::temp_dir().join("ktstr-test-lz4-compat.lz4");
-        let decompressed_path = std::env::temp_dir().join("ktstr-test-lz4-compat.bin");
-        std::fs::write(&compressed_path, &compressed).unwrap();
+        let _compressed_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-test-lz4-compat-compressed-")
+            .suffix(".lz4")
+            .tempfile()
+            .unwrap();
+        let _decompressed_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-test-lz4-compat-decompressed-")
+            .suffix(".bin")
+            .tempfile()
+            .unwrap();
+        let compressed_path = _compressed_keep_alive.path();
+        let decompressed_path = _decompressed_keep_alive.path();
+        std::fs::write(compressed_path, &compressed).unwrap();
 
         let output = std::process::Command::new("lz4")
             .args(["-d", "-f", "--no-frame-crc"])
-            .arg(&compressed_path)
-            .arg(&decompressed_path)
+            .arg(compressed_path)
+            .arg(decompressed_path)
             .output()
             .expect("lz4 -d failed to execute");
-
-        let _ = std::fs::remove_file(&compressed_path);
 
         assert!(
             output.status.success(),
@@ -3009,8 +3020,7 @@ mod tests {
             String::from_utf8_lossy(&output.stderr),
         );
 
-        let result = std::fs::read(&decompressed_path).unwrap();
-        let _ = std::fs::remove_file(&decompressed_path);
+        let result = std::fs::read(decompressed_path).unwrap();
         assert_eq!(result.len(), data.len(), "decompressed size mismatch");
         assert_eq!(&result[..], &data[..], "decompressed content mismatch");
     }
@@ -3028,17 +3038,26 @@ mod tests {
         let data = build_synthetic_cpio(2 << 20);
 
         // Compress with `lz4 -l` (reference legacy mode).
-        let input_path = std::env::temp_dir().join("ktstr-test-lz4-ref-input.bin");
-        let ref_path = std::env::temp_dir().join("ktstr-test-lz4-ref.lz4");
-        std::fs::write(&input_path, &data).unwrap();
+        let _input_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-test-lz4-ref-input-")
+            .suffix(".bin")
+            .tempfile()
+            .unwrap();
+        let _ref_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-test-lz4-ref-")
+            .suffix(".lz4")
+            .tempfile()
+            .unwrap();
+        let input_path = _input_keep_alive.path();
+        let ref_path = _ref_keep_alive.path();
+        std::fs::write(input_path, &data).unwrap();
 
         let ref_output = std::process::Command::new("lz4")
             .args(["-l", "-f"])
-            .arg(&input_path)
-            .arg(&ref_path)
+            .arg(input_path)
+            .arg(ref_path)
             .output()
             .expect("lz4 -l failed to execute");
-        let _ = std::fs::remove_file(&input_path);
 
         assert!(
             ref_output.status.success(),
@@ -3047,8 +3066,7 @@ mod tests {
         );
 
         // Decompress reference output through our kernel simulation.
-        let ref_compressed = std::fs::read(&ref_path).unwrap();
-        let _ = std::fs::remove_file(&ref_path);
+        let ref_compressed = std::fs::read(ref_path).unwrap();
 
         let ref_decompressed = simulate_kernel_unlz4(&ref_compressed)
             .expect("kernel unlz4 simulation failed on lz4 -l output");
@@ -3059,18 +3077,26 @@ mod tests {
 
         // Also compress with our encoder, decompress with lz4 -d.
         let our_compressed = lz4_legacy_compress(&data);
-        let our_lz4_path = std::env::temp_dir().join("ktstr-test-lz4-ref-ours.lz4");
-        let our_decompressed_path = std::env::temp_dir().join("ktstr-test-lz4-ref-ours.bin");
-        std::fs::write(&our_lz4_path, &our_compressed).unwrap();
+        let _our_lz4_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-test-lz4-ref-ours-")
+            .suffix(".lz4")
+            .tempfile()
+            .unwrap();
+        let _our_decompressed_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-test-lz4-ref-ours-decompressed-")
+            .suffix(".bin")
+            .tempfile()
+            .unwrap();
+        let our_lz4_path = _our_lz4_keep_alive.path();
+        let our_decompressed_path = _our_decompressed_keep_alive.path();
+        std::fs::write(our_lz4_path, &our_compressed).unwrap();
 
         let our_output = std::process::Command::new("lz4")
             .args(["-d", "-f", "--no-frame-crc"])
-            .arg(&our_lz4_path)
-            .arg(&our_decompressed_path)
+            .arg(our_lz4_path)
+            .arg(our_decompressed_path)
             .output()
             .expect("lz4 -d on our output failed to execute");
-
-        let _ = std::fs::remove_file(&our_lz4_path);
 
         assert!(
             our_output.status.success(),
@@ -3078,8 +3104,7 @@ mod tests {
             String::from_utf8_lossy(&our_output.stderr),
         );
 
-        let our_result = std::fs::read(&our_decompressed_path).unwrap();
-        let _ = std::fs::remove_file(&our_decompressed_path);
+        let our_result = std::fs::read(our_decompressed_path).unwrap();
         assert_eq!(our_result, data, "our lz4 output cross-compat mismatch");
     }
 }

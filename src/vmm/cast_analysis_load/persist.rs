@@ -195,9 +195,12 @@ mod tests {
 
     #[test]
     fn roundtrip_save_load() {
-        let dir = std::env::temp_dir().join(format!("ktstr_persist_test_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        unsafe { std::env::set_var("KTSTR_CACHE_DIR", &dir) };
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr_persist_test_")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
+        unsafe { std::env::set_var("KTSTR_CACHE_DIR", dir) };
 
         let mut cast_map = BTreeMap::new();
         cast_map.insert(
@@ -244,15 +247,16 @@ mod tests {
         assert_eq!(loaded_fwd.len(), 1);
         assert_eq!(loaded_fwd["cgx_target"].btfs_idx, 1);
         assert_eq!(loaded_fwd["cgx_target"].type_id, 4);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_wrong_btf_count_returns_none() {
-        let dir = std::env::temp_dir().join(format!("ktstr_persist_btf_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        unsafe { std::env::set_var("KTSTR_CACHE_DIR", &dir) };
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr_persist_btf_")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
+        unsafe { std::env::set_var("KTSTR_CACHE_DIR", dir) };
 
         let cast_map = BTreeMap::new();
         let fwd_index = HashMap::new();
@@ -263,8 +267,6 @@ mod tests {
             try_load(hash, 5).is_none(),
             "btf_count mismatch must return None"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

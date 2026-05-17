@@ -905,18 +905,19 @@ mod tests {
     /// an unrelated entry must not disturb it.
     #[test]
     fn sweep_orphan_sandboxes_ignores_non_ktstr_entries() {
-        let dir =
-            std::env::temp_dir().join(format!("ktstr-sandbox-sweep-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-sandbox-sweep-test-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let unrelated = dir.join("some-other-dir");
         std::fs::create_dir(&unrelated).unwrap();
-        sweep_orphan_sandboxes(&dir);
+        sweep_orphan_sandboxes(dir);
         // The unrelated entry is untouched.
         assert!(
             unrelated.exists(),
             "sweep must not remove non-ktstr entries"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `sweep_orphan_sandboxes` skips children whose trailing
@@ -925,19 +926,18 @@ mod tests {
     /// crashing the sweep.
     #[test]
     fn sweep_orphan_sandboxes_skips_malformed_pid_suffix() {
-        let dir = std::env::temp_dir().join(format!(
-            "ktstr-sandbox-malformed-test-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-sandbox-malformed-test-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let malformed = dir.join("ktstr-build-123-NOTAPID");
         std::fs::create_dir(&malformed).unwrap();
-        sweep_orphan_sandboxes(&dir);
+        sweep_orphan_sandboxes(dir);
         assert!(
             malformed.exists(),
             "sweep must skip entries with unparseable pid suffix"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `sweep_orphan_sandboxes` on an entry named exactly
@@ -949,17 +949,18 @@ mod tests {
     /// branch specifically.
     #[test]
     fn sweep_orphan_sandboxes_skips_empty_pid_suffix() {
-        let dir =
-            std::env::temp_dir().join(format!("ktstr-sandbox-empty-suffix-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-sandbox-empty-suffix-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let empty_suffix = dir.join("ktstr-build-");
         std::fs::create_dir(&empty_suffix).unwrap();
-        sweep_orphan_sandboxes(&dir);
+        sweep_orphan_sandboxes(dir);
         assert!(
             empty_suffix.exists(),
             "sweep must skip entries with empty (post-rsplit) pid tail",
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `sweep_orphan_sandboxes` on a 2-segment entry with a
@@ -969,17 +970,18 @@ mod tests {
     /// simpler parse-fails-directly-after-prefix case.
     #[test]
     fn sweep_orphan_sandboxes_skips_direct_non_numeric_pid() {
-        let dir =
-            std::env::temp_dir().join(format!("ktstr-sandbox-non-numeric-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-sandbox-non-numeric-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let non_numeric = dir.join("ktstr-build-NOTAPID");
         std::fs::create_dir(&non_numeric).unwrap();
-        sweep_orphan_sandboxes(&dir);
+        sweep_orphan_sandboxes(dir);
         assert!(
             non_numeric.exists(),
             "sweep must skip entries whose tail is directly non-numeric",
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The `ktstr-build-` filename prefix is load-bearing for
