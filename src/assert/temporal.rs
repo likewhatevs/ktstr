@@ -160,7 +160,9 @@ where
     /// hide a coverage gap, so the pattern uses `partial_cmp` and
     /// reports the offending sample distinctly.
     pub fn at_least(self, floor: T) -> &'v mut Verdict {
+        let pre_failures = temporal_failure_count(self.verdict);
         let label = self.field.label.as_str();
+        let n = self.field.values.len();
         for (i, slot) in self.field.values.iter().enumerate() {
             match slot {
                 Ok(v) => match v.partial_cmp(&floor) {
@@ -197,6 +199,9 @@ where
                 }
             }
         }
+        maybe_log_pass_temporal(self.verdict, pre_failures, || {
+            format!("{label} (each.at_least {floor}): all {n} samples passed")
+        });
         self.verdict
     }
 
@@ -204,7 +209,9 @@ where
     /// NaN samples (on `T = f64`) report an incomparable failure
     /// for the same reason documented on [`Self::at_least`].
     pub fn at_most(self, ceiling: T) -> &'v mut Verdict {
+        let pre_failures = temporal_failure_count(self.verdict);
         let label = self.field.label.as_str();
+        let n = self.field.values.len();
         for (i, slot) in self.field.values.iter().enumerate() {
             match slot {
                 Ok(v) => match v.partial_cmp(&ceiling) {
@@ -241,6 +248,9 @@ where
                 }
             }
         }
+        maybe_log_pass_temporal(self.verdict, pre_failures, || {
+            format!("{label} (each.at_most {ceiling}): all {n} samples passed")
+        });
         self.verdict
     }
 
@@ -258,6 +268,8 @@ where
             );
             return self.verdict;
         }
+        let pre_failures = temporal_failure_count(self.verdict);
+        let n = self.field.values.len();
         for (i, slot) in self.field.values.iter().enumerate() {
             match slot {
                 Ok(v) => {
@@ -300,6 +312,9 @@ where
                 }
             }
         }
+        maybe_log_pass_temporal(self.verdict, pre_failures, || {
+            format!("{label} (each.between [{lo}, {hi}]): all {n} samples passed")
+        });
         self.verdict
     }
 }
@@ -353,6 +368,7 @@ where
             ));
             return verdict;
         }
+        let pre_failures = temporal_failure_count(verdict);
         // Per-sample projection errors are NOT temporal failures —
         // they indicate the underlying field was missing on that
         // sample (e.g. placeholder report from a freeze-rendezvous
@@ -438,6 +454,13 @@ where
                 samples = skipped.join(", "),
             ));
         }
+        maybe_log_pass_temporal(verdict, pre_failures, || {
+            format!(
+                "{label} ({pat}): all {n} samples passed",
+                label = self.label,
+                n = self.values.len(),
+            )
+        });
         verdict
     }
 }
@@ -470,6 +493,7 @@ impl SeriesField<f64> {
             ));
             return verdict;
         }
+        let pre_failures = temporal_failure_count(verdict);
         // Per-sample projection errors are treated as GAPS — no
         // rate is computed across the gap. Log every gap with the
         // underlying error variant via a Note so a coverage
@@ -570,6 +594,13 @@ impl SeriesField<f64> {
                 samples = gaps.join(", "),
             ));
         }
+        maybe_log_pass_temporal(verdict, pre_failures, || {
+            format!(
+                "{label} (rate_within [{lo}, {hi}]): all {n} consecutive-pair rates within band",
+                label = self.label,
+                n = self.values.len().saturating_sub(1),
+            )
+        });
         verdict
     }
 
@@ -598,6 +629,7 @@ impl SeriesField<f64> {
             );
             return verdict;
         }
+        let pre_failures = temporal_failure_count(verdict);
         let mut active: Vec<(usize, f64)> = Vec::new();
         let mut skipped: Vec<String> = Vec::new();
         // Track whether any sample's elapsed_ms reached or exceeded
@@ -664,6 +696,7 @@ impl SeriesField<f64> {
         // For negative means (pathological), the multiplication
         // flips the band; protect by sorting.
         let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+        let active_count = active.len();
         for (i, v) in active {
             if v < lo || v > hi {
                 push_detail(
@@ -679,6 +712,14 @@ impl SeriesField<f64> {
                 );
             }
         }
+        maybe_log_pass_temporal(verdict, pre_failures, || {
+            format!(
+                "{label} (steady_within mean {mean:.4} ±{pct:.1}%): all {n} post-warmup samples in band",
+                label = self.label,
+                pct = tolerance * 100.0,
+                n = active_count,
+            )
+        });
         verdict
     }
 
@@ -705,6 +746,7 @@ impl SeriesField<f64> {
             );
             return verdict;
         }
+        let pre_failures = temporal_failure_count(verdict);
         // Pre-check: counting all successfully-projected samples
         // (within the deadline window) do we have enough evidence
         // to even attempt a 3-consecutive witness? When fewer
@@ -815,6 +857,22 @@ impl SeriesField<f64> {
                 ),
             );
         }
+        maybe_log_pass_temporal(verdict, pre_failures, || {
+            let where_at = witness_idx
+                .map(|i| {
+                    format!(
+                        "{tag} (+{elapsed_ms}ms)",
+                        tag = self.tags[i],
+                        elapsed_ms = self.elapsed_ms[i],
+                    )
+                })
+                .unwrap_or_else(|| "<unreached>".to_string());
+            format!(
+                "{label} (converges_to {target} ±{tolerance}, deadline_ms={deadline_ms}): \
+                 3-consecutive-in-band witness reached at {where_at}",
+                label = self.label,
+            )
+        });
         verdict
     }
 
@@ -858,6 +916,7 @@ impl SeriesField<f64> {
             );
             return verdict;
         }
+        let pre_failures = temporal_failure_count(verdict);
         // Per-sample projection errors on either lhs or rhs are
         // treated as gaps — no ratio is computed across the pair.
         // Surface every gap with the underlying error variant
@@ -938,6 +997,14 @@ impl SeriesField<f64> {
                 samples = gaps.join(", "),
             ));
         }
+        maybe_log_pass_temporal(verdict, pre_failures, || {
+            format!(
+                "{label} (ratio_within {other} [{lo}, {hi}]): all {n} pair ratios in band",
+                label = self.label,
+                other = other.label,
+                n = self.values.len(),
+            )
+        });
         verdict
     }
 }
@@ -948,6 +1015,7 @@ impl SeriesField<bool> {
     /// invariants — e.g. "scheduler is alive at every periodic
     /// boundary" projected as `snap.var("scheduler_alive").as_bool()`.
     pub fn always_true<'v>(&self, verdict: &'v mut Verdict) -> &'v mut Verdict {
+        let pre_failures = temporal_failure_count(verdict);
         for (i, slot) in self.values.iter().enumerate() {
             match slot {
                 Ok(v) => {
@@ -978,6 +1046,13 @@ impl SeriesField<bool> {
                 }
             }
         }
+        maybe_log_pass_temporal(verdict, pre_failures, || {
+            format!(
+                "{label} (always_true): all {n} samples true",
+                label = self.label,
+                n = self.values.len(),
+            )
+        });
         verdict
     }
 }
@@ -988,6 +1063,46 @@ fn push_detail(verdict: &mut Verdict, message: String) {
     result
         .details
         .push(AssertDetail::new(DetailKind::Temporal, message));
+}
+
+/// Count `DetailKind::Temporal` entries in `verdict`'s underlying
+/// result. Used by [`maybe_log_pass_temporal`] to gate the
+/// positive-confirmation log on "this pattern added zero Temporal
+/// failures." Notes (e.g. vacuous-pattern or projection-error
+/// skip notes) carry `DetailKind::Note` and are excluded from the
+/// count, so a pattern that emits notes but no failure details
+/// still trips the positive log.
+fn temporal_failure_count(verdict: &Verdict) -> usize {
+    verdict
+        .result()
+        .details
+        .iter()
+        .filter(|d| matches!(d.kind, DetailKind::Temporal))
+        .count()
+}
+
+/// Positive-confirmation mirror of [`push_detail`]. Emits a
+/// `tracing::info!` event naming the temporal pattern and its
+/// sample count IFF [`Verdict::log_passes`] is on AND the calling
+/// pattern added no `DetailKind::Temporal` failures over its run
+/// (compared via `pre_failures` captured at pattern entry via
+/// [`temporal_failure_count`]).
+///
+/// The pre/post gate is what makes this a positive confirmation —
+/// a pattern that emitted a [`push_detail`] mid-run stays silent
+/// here so a partial failure does not log a misleading "passed"
+/// event. The closure constructs the message only when both gates
+/// pass, so the `format!` cost is paid only on the explicit
+/// opt-in + a clean pattern run.
+fn maybe_log_pass_temporal<F: FnOnce() -> String>(
+    verdict: &Verdict,
+    pre_failures: usize,
+    message: F,
+) {
+    if verdict.log_passes() && temporal_failure_count(verdict) == pre_failures {
+        let m = message();
+        tracing::info!(target: "ktstr::assert::temporal", "{m}");
+    }
 }
 
 // Bridge into Verdict's internal AssertResult — added below as an
@@ -1672,6 +1787,43 @@ mod tests {
                 .any(|d| d.kind == DetailKind::Note && d.message.contains("periodic_001")),
             "expected skip Note naming MissingStats sample: {:?}",
             r.details
+        );
+    }
+
+    /// `always_true` emits a `tracing::info!` event under the
+    /// `ktstr::assert::temporal` target when log_passes is on AND
+    /// the pattern adds no failure details. Mirrors the scalar
+    /// claim's positive-confirmation contract at the temporal-
+    /// pattern level: a passing run names the label and the
+    /// sample count so a `--nocapture` operator sees the
+    /// confirmation rather than silent acceptance.
+    #[tracing_test::traced_test]
+    #[test]
+    fn always_true_emits_pass_log_when_log_passes_on() {
+        let f = synthetic_field("alive", vec![(100, true), (200, true), (300, true)]);
+        let mut v = Verdict::new().with_log_passes(true);
+        f.always_true(&mut v);
+        assert!(v.passed());
+        assert!(
+            logs_contain("alive (always_true): all 3 samples true"),
+            "positive-confirmation log must name the label, pattern, and sample count",
+        );
+    }
+
+    /// A failed temporal pattern stays silent on the positive
+    /// log even when log_passes is on — the pre/post
+    /// `temporal_failure_count` gate ensures a partial-failure
+    /// run does not log a misleading "all passed" event.
+    #[tracing_test::traced_test]
+    #[test]
+    fn always_true_silent_on_fail_arm_even_with_log_passes() {
+        let f = synthetic_field("alive", vec![(100, true), (200, false)]);
+        let mut v = Verdict::new().with_log_passes(true);
+        f.always_true(&mut v);
+        assert!(!v.passed());
+        assert!(
+            !logs_contain("samples true"),
+            "fail arm must NOT emit the positive-confirmation log",
         );
     }
 }

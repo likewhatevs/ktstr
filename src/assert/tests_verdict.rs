@@ -780,3 +780,106 @@ fn assert_detail_display_with_kind_uses_debug_token_for_multiword_variant() {
         "[SchedulerDied] scheduler process died",
     );
 }
+
+// -- Verdict::log_passes ---------------------------------------------
+
+/// New verdicts default to log_passes=false so the zero-cost
+/// pass path stays unallocated under normal runs. `KTSTR_LOG_PASSES`
+/// env-var seeding is tested separately in
+/// `log_passes_env_var_enables_default` via SAFETY-bracketed
+/// env mutation.
+#[test]
+fn verdict_log_passes_default_off() {
+    // Guard against test pollution: env-var-seeded tests below
+    // mutate KTSTR_LOG_PASSES, and nextest serializes tests by
+    // default within a binary, but a cross-binary parallel run
+    // could leak. Snapshot + restore.
+    let saved = std::env::var("KTSTR_LOG_PASSES").ok();
+    // SAFETY: std::env::set_var/remove_var became unsafe in Rust
+    // 2024 because the libc environ pointer can race with
+    // setenv's realloc across threads. In this binary the risk
+    // is absent: KTSTR_LOG_PASSES has exactly one reader
+    // (log_passes_default in claim.rs), and nextest's default
+    // profile runs each test binary single-threaded and
+    // serializes tests within the binary, so no concurrent
+    // reader exists during the bracketed mutation. The
+    // snapshot+restore pair brackets the mutation so
+    // log_passes_default observes the unset state inside the
+    // test and the original value is restored before the next
+    // test runs.
+    unsafe {
+        std::env::remove_var("KTSTR_LOG_PASSES");
+    }
+    let v = Verdict::new();
+    assert!(
+        !v.log_passes(),
+        "Verdict::new must default to log_passes=false when KTSTR_LOG_PASSES is unset",
+    );
+    // Restore.
+    if let Some(prior) = saved {
+        // SAFETY: same as above.
+        unsafe {
+            std::env::set_var("KTSTR_LOG_PASSES", prior);
+        }
+    }
+}
+
+/// `with_log_passes` is a chainable setter — flips the flag and
+/// returns `Self` so the result-into-claim chain stays fluent.
+#[test]
+fn verdict_with_log_passes_toggles_flag() {
+    let on = Verdict::new().with_log_passes(true);
+    assert!(on.log_passes());
+    let off = Verdict::new().with_log_passes(true).with_log_passes(false);
+    assert!(!off.log_passes(), "with_log_passes(false) must turn the flag off");
+}
+
+/// A passing scalar claim emits a `tracing::info!` event under
+/// the `ktstr::assert::claim` target when log_passes is on. The
+/// event names the claim subject and the values compared so a
+/// `--nocapture` run shows positive confirmation rather than
+/// silent acceptance.
+#[tracing_test::traced_test]
+#[test]
+fn verdict_log_passes_emits_event_on_scalar_pass() {
+    let mut v = Verdict::new().with_log_passes(true);
+    claim!(v, 42u64).at_least(40);
+    assert!(
+        logs_contain("42 >= 40"),
+        "positive-confirmation log must name the value and the comparator",
+    );
+    let r = v.into_result();
+    assert!(r.passed, "claim must still pass — log_passes only adds output");
+    assert!(r.details.is_empty(), "pass arm must add no details");
+}
+
+/// A passing scalar claim emits no `tracing::info!` event when
+/// log_passes is off (the default), preserving the
+/// allocation-free pass path documented on the flag.
+#[tracing_test::traced_test]
+#[test]
+fn verdict_log_passes_silent_when_off() {
+    let mut v = Verdict::new();
+    claim!(v, 42u64).at_least(40);
+    assert!(
+        !logs_contain("42 >= 40"),
+        "log_passes=false must suppress the positive-confirmation log",
+    );
+}
+
+/// A failing claim records a detail and never emits the pass
+/// log even when log_passes is on — the pass arm and the fail
+/// arm are mutually exclusive at the comparator level.
+#[tracing_test::traced_test]
+#[test]
+fn verdict_log_passes_silent_on_fail_arm() {
+    let mut v = Verdict::new().with_log_passes(true);
+    claim!(v, 5u64).at_least(40);
+    assert!(
+        !logs_contain("5 >= 40"),
+        "fail arm must NOT emit the positive-confirmation log",
+    );
+    let r = v.into_result();
+    assert!(!r.passed);
+    assert_eq!(r.details.len(), 1);
+}
