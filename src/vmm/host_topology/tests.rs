@@ -1033,26 +1033,36 @@ fn cleanup_lock(path: &str) {
 
 #[test]
 fn resource_lock_exclusive_acquires() {
-    let path = "/tmp/ktstr-test-flock-excl-acquires.lock";
-    cleanup_lock(path);
+    let _tempfile_keep_alive = tempfile::Builder::new()
+        .prefix("ktstr-test-flock-excl-acquires-")
+        .suffix(".lock")
+        .tempfile()
+        .unwrap();
+    let path = _tempfile_keep_alive.path().to_str().unwrap();
     let fd = try_flock(path, FlockMode::Exclusive).expect("open should succeed");
     assert!(fd.is_some(), "exclusive lock on fresh file should succeed");
-    cleanup_lock(path);
 }
 
 #[test]
 fn resource_lock_shared_acquires() {
-    let path = "/tmp/ktstr-test-flock-shared-acquires.lock";
-    cleanup_lock(path);
+    let _tempfile_keep_alive = tempfile::Builder::new()
+        .prefix("ktstr-test-flock-shared-acquires-")
+        .suffix(".lock")
+        .tempfile()
+        .unwrap();
+    let path = _tempfile_keep_alive.path().to_str().unwrap();
     let fd = try_flock(path, FlockMode::Shared).expect("open should succeed");
     assert!(fd.is_some(), "shared lock on fresh file should succeed");
-    cleanup_lock(path);
 }
 
 #[test]
 fn resource_lock_exclusive_contention() {
-    let path = "/tmp/ktstr-test-flock-excl-contention.lock";
-    cleanup_lock(path);
+    let _tempfile_keep_alive = tempfile::Builder::new()
+        .prefix("ktstr-test-flock-excl-contention-")
+        .suffix(".lock")
+        .tempfile()
+        .unwrap();
+    let path = _tempfile_keep_alive.path().to_str().unwrap();
     let holder = try_flock(path, FlockMode::Exclusive)
         .expect("open should succeed")
         .expect("first lock should succeed");
@@ -1062,13 +1072,16 @@ fn resource_lock_exclusive_contention() {
         "second exclusive lock while held should return None",
     );
     drop(holder);
-    cleanup_lock(path);
 }
 
 #[test]
 fn resource_lock_shared_coexist() {
-    let path = "/tmp/ktstr-test-flock-shared-coexist.lock";
-    cleanup_lock(path);
+    let _tempfile_keep_alive = tempfile::Builder::new()
+        .prefix("ktstr-test-flock-shared-coexist-")
+        .suffix(".lock")
+        .tempfile()
+        .unwrap();
+    let path = _tempfile_keep_alive.path().to_str().unwrap();
     let h1 = try_flock(path, FlockMode::Shared)
         .expect("open should succeed")
         .expect("first shared lock should succeed");
@@ -1078,13 +1091,16 @@ fn resource_lock_shared_coexist() {
     // Both held simultaneously.
     drop(h1);
     drop(h2);
-    cleanup_lock(path);
 }
 
 #[test]
 fn resource_lock_exclusive_blocks_shared() {
-    let path = "/tmp/ktstr-test-flock-excl-blocks-sh.lock";
-    cleanup_lock(path);
+    let _tempfile_keep_alive = tempfile::Builder::new()
+        .prefix("ktstr-test-flock-excl-blocks-sh-")
+        .suffix(".lock")
+        .tempfile()
+        .unwrap();
+    let path = _tempfile_keep_alive.path().to_str().unwrap();
     let holder = try_flock(path, FlockMode::Exclusive)
         .expect("open should succeed")
         .expect("exclusive lock should succeed");
@@ -1094,13 +1110,16 @@ fn resource_lock_exclusive_blocks_shared() {
         "shared lock should fail while exclusive is held",
     );
     drop(holder);
-    cleanup_lock(path);
 }
 
 #[test]
 fn resource_lock_shared_blocks_exclusive() {
-    let path = "/tmp/ktstr-test-flock-sh-blocks-excl.lock";
-    cleanup_lock(path);
+    let _tempfile_keep_alive = tempfile::Builder::new()
+        .prefix("ktstr-test-flock-sh-blocks-excl-")
+        .suffix(".lock")
+        .tempfile()
+        .unwrap();
+    let path = _tempfile_keep_alive.path().to_str().unwrap();
     let holder = try_flock(path, FlockMode::Shared)
         .expect("open should succeed")
         .expect("shared lock should succeed");
@@ -1110,13 +1129,16 @@ fn resource_lock_shared_blocks_exclusive() {
         "exclusive lock should fail while shared is held",
     );
     drop(holder);
-    cleanup_lock(path);
 }
 
 #[test]
 fn resource_lock_release_on_drop() {
-    let path = "/tmp/ktstr-test-flock-release-drop.lock";
-    cleanup_lock(path);
+    let _tempfile_keep_alive = tempfile::Builder::new()
+        .prefix("ktstr-test-flock-release-drop-")
+        .suffix(".lock")
+        .tempfile()
+        .unwrap();
+    let path = _tempfile_keep_alive.path().to_str().unwrap();
     {
         let _holder = try_flock(path, FlockMode::Exclusive)
             .expect("open should succeed")
@@ -1127,7 +1149,6 @@ fn resource_lock_release_on_drop() {
         .expect("open should succeed")
         .expect("lock should be available after drop");
     drop(fd);
-    cleanup_lock(path);
 }
 
 #[test]
