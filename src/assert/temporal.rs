@@ -1573,7 +1573,7 @@ mod tests {
             ("periodic_001".to_string(), placeholder, None, Some(200u64)),
             ("periodic_002".to_string(), report_b, None, Some(300u64)),
         ];
-        let series = SampleSeries::from_drained(drained);
+        let series = SampleSeries::from_drained(drained, None);
         // Project a missing var so non-placeholder samples also
         // produce errors — but the placeholder sample's Err must
         // be the dedicated PlaceholderSample variant. The skip-
@@ -1638,7 +1638,7 @@ mod tests {
                 Some(300u64),
             ),
         ];
-        let series = SampleSeries::from_drained(drained);
+        let series = SampleSeries::from_drained(drained, None);
         let field: SeriesField<u64> = series.stats("counter", |sv| sv.path("counter").as_u64());
         // Sanity-check the constructed field's middle slot is
         // exactly the MissingStats variant the spec calls out, so a

@@ -62,7 +62,7 @@ fn assert_stats_round_trip(result: &VmResult) -> Result<()> {
          periodic_fired = {}",
         result.periodic_fired,
     );
-    let series = SampleSeries::from_drained(drained).periodic_only();
+    let series = SampleSeries::from_drained(drained, result.monitor.clone()).periodic_only();
     anyhow::ensure!(
         !series.is_empty(),
         "no periodic-tagged entries on the bridge after the run"
@@ -96,6 +96,29 @@ fn assert_stats_round_trip(result: &VmResult) -> Result<()> {
         "scheduler reported nr_dispatched = 0 across every periodic \
          sample — the dispatch path never advanced under the 5 s \
          workload (was scx-ktstr loaded?)"
+    );
+
+    // series.monitor() consume-path assertion: the host-side
+    // MonitorReport must wire through SampleSeries (via
+    // `result.monitor.clone()` at the from_drained call site) and
+    // be reachable as a typed view. On a 5 s VM run with scx-ktstr
+    // loaded, the monitor loop fires repeatedly so
+    // `summary.total_samples` must be non-zero. Catches a
+    // regression where the from_drained wire-through becomes a
+    // no-op (e.g. monitor field accidentally not propagated, or
+    // VmResult.monitor never populated by the freeze coordinator).
+    let monitor_view = series.monitor().ok_or_else(|| {
+        anyhow::anyhow!(
+            "series.monitor() returned None despite VmResult.monitor \
+             being populated for this run — the monitor pipeline did \
+             not wire through SampleSeries"
+        )
+    })?;
+    anyhow::ensure!(
+        monitor_view.summary().total_samples > 0,
+        "monitor summary reported total_samples = 0 across the 5 s \
+         run — the monitor loop never sampled, or summary aggregation \
+         failed"
     );
     Ok(())
 }

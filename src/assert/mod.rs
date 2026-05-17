@@ -179,7 +179,7 @@ pub enum DetailKind {
     SchedulerDied,
     /// SCX event-counter threshold failure. An error-class
     /// `SCX_EV_*` counter (e.g. `enq_skip_exiting`,
-    /// `enq_skip_migration_disabled`, `dispatch_offline`) crossed
+    /// `enq_skip_migration_disabled`, `dispatch_local_dsq_offline`) crossed
     /// the configured bound. Distinct from
     /// [`DetailKind::SchedulerDied`] (process-liveness) and
     /// [`DetailKind::Monitor`] (imbalance / DSQ-depth /
@@ -2954,7 +2954,7 @@ pub fn assert_benchmarks(
 /// ```
 /// # use ktstr::assert::assert_scx_events_clean;
 /// // Strict default — every counter must be zero.
-/// let r = assert_scx_events_clean(&[("enq_skip_exiting", 0), ("dispatch_offline", 0)], None);
+/// let r = assert_scx_events_clean(&[("enq_skip_exiting", 0), ("dispatch_local_dsq_offline", 0)], None);
 /// assert!(r.passed);
 ///
 /// // A non-zero error-class counter fails.
