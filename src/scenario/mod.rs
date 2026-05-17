@@ -268,6 +268,33 @@ impl Drop for CgroupGroup<'_> {
 /// Provides access to cgroup management, topology information, and
 /// test configuration. Custom scenarios (`Action::Custom`) receive
 /// this as their sole parameter.
+///
+/// # Method groups
+///
+/// ## Time helpers
+///
+/// - [`Self::settled_hold`] — `HoldSpec::fixed(settle + duration * f)`
+///   sugar for the dominant Step hold-time pattern.
+///
+/// ## Cgroup construction
+///
+/// - [`Self::cgroup_def`] — `CgroupDef::named(name).workers(workers_per_cgroup)`
+///   sugar that pins the default-worker-count shape across 40+ call
+///   sites.
+///
+/// ## Topology accessors
+///
+/// - [`Self::cpuset_cpus`] — resolve a
+///   [`CpusetSpec`](crate::scenario::ops::CpusetSpec) against this
+///   context's topology and return the CPU count.
+///
+/// ## Constructors
+///
+/// - [`Self::builder`] — start a [`CtxBuilder`] with sane defaults for
+///   unit-test scenarios.
+/// - [`Self::payload`] — start a
+///   [`PayloadRun`](crate::scenario::payload_run::PayloadRun) for a
+///   given [`Payload`](crate::test_support::Payload).
 pub struct Ctx<'a> {
     /// Cgroup filesystem operations. `&dyn CgroupOps` (not `&CgroupManager`)
     /// so scenario code can be driven by an in-memory test double without

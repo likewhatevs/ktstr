@@ -16,7 +16,7 @@ use std::borrow::Cow;
 use std::time::Duration;
 
 use crate::scenario::Ctx;
-use crate::workload::{AffinityIntent, WorkSpec};
+use crate::workload::{AffinityIntent, WorkSpec, WorkType};
 
 use super::{CgroupDef, CpusetSpec, Op, OpKind};
 
@@ -419,6 +419,42 @@ impl Op {
         Op::Spawn {
             cgroup: cgroup.into(),
             work,
+        }
+    }
+
+    /// Spawn workers in a cgroup with the given [`WorkType`] and every
+    /// other [`WorkSpec`] knob defaulted. Sugar for the common
+    /// single-knob spawn case where the test only cares about
+    /// `work_type` and is happy with `Default::default()` for
+    /// scheduling policy, affinity, mempolicy, etc. Mirrors the
+    /// [`CgroupDef::named(...).work_type(...)`](super::CgroupDef::work_type)
+    /// shape at the Op layer so test authors composing mid-step
+    /// spawns get the same one-liner ergonomics as authors composing
+    /// CgroupDefs upfront.
+    ///
+    /// Equivalent to:
+    ///
+    /// ```ignore
+    /// Op::spawn(
+    ///     cgroup,
+    ///     WorkSpec { work_type, ..WorkSpec::default() },
+    /// )
+    /// ```
+    ///
+    /// For non-default knobs (worker count, affinity, …) construct
+    /// a [`WorkSpec`] explicitly and route through
+    /// [`Self::spawn`] — the sugar is intentionally minimal so a
+    /// non-default knob forces the explicit-WorkSpec call site.
+    pub fn spawn_in_cgroup(
+        cgroup: impl Into<Cow<'static, str>>,
+        work_type: WorkType,
+    ) -> Self {
+        Op::Spawn {
+            cgroup: cgroup.into(),
+            work: WorkSpec {
+                work_type,
+                ..WorkSpec::default()
+            },
         }
     }
 

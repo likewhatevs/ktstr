@@ -864,6 +864,28 @@ impl Scheduler {
         self
     }
 
+    /// Sugar for `.binary(SchedulerSpec::Discover(name))` — the
+    /// dominant Scheduler construction path. Use when the scheduler
+    /// binary is on `PATH` under the named filename (e.g.
+    /// `.binary_discover("scx_rusty")`) and the framework should
+    /// resolve it at guest-init time via `which`-style lookup.
+    /// Equivalent to:
+    ///
+    /// ```ignore
+    /// Scheduler::named("rusty").binary(SchedulerSpec::Discover("scx_rusty"))
+    /// // is equivalent to
+    /// Scheduler::named("rusty").binary_discover("scx_rusty")
+    /// ```
+    ///
+    /// For an explicit absolute path (no `PATH` lookup), call
+    /// `.binary(SchedulerSpec::Path("/absolute/path"))` directly —
+    /// the path variant has no chainable sugar because absolute
+    /// paths are the rare case (cross-compiled trees, ad-hoc
+    /// installs) and a path-typed setter would obscure the intent.
+    pub const fn binary_discover(self, name: &'static str) -> Self {
+        self.binary(SchedulerSpec::Discover(name))
+    }
+
     /// Set sysctls. Returns self for const chaining.
     pub const fn sysctls(mut self, sysctls: &'static [Sysctl]) -> Self {
         self.sysctls = sysctls;
