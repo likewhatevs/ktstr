@@ -573,3 +573,157 @@ static __KTSTR_ENTRY_WATCH_SNAPSHOT_EXIT: ktstr::test_support::KtstrTestEntry =
         expect_err: true,
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
+
+/// Multi-entry cgroup-keyed HASH map mirroring the
+/// `ktstr_cgroup_dispatch_count` shape that scx-ktstr emits
+/// (cgroup_id u64 → dispatch counter u64). Three entries with
+/// different counts so the iterator-chain assertions have
+/// non-trivial structure to walk: `.find` discriminates by key,
+/// `.filter` partitions by count threshold, `.max_by` returns
+/// the highest-count entry. Hand-built JSON because
+/// FailureDumpMap is `#[non_exhaustive]`.
+const SYNTHETIC_CGROUP_MAP_JSON: &str = r#"{
+    "schema": "single",
+    "maps": [
+        {
+            "name": "scx_obj.ktstr_cgroup_dispatch_count",
+            "map_type": 1,
+            "value_size": 8,
+            "max_entries": 256,
+            "entries": [
+                {
+                    "key": { "kind": "uint", "bits": 64, "value": 1001 },
+                    "value": { "kind": "uint", "bits": 64, "value": 50 }
+                },
+                {
+                    "key": { "kind": "uint", "bits": 64, "value": 1002 },
+                    "value": { "kind": "uint", "bits": 64, "value": 250 }
+                },
+                {
+                    "key": { "kind": "uint", "bits": 64, "value": 1003 },
+                    "value": { "kind": "uint", "bits": 64, "value": 500 }
+                }
+            ]
+        }
+    ]
+}"#;
+
+/// Test 3: exercise the
+/// [`SnapshotMap::find`](ktstr::prelude::SnapshotMap::find) /
+/// [`SnapshotMap::filter`](ktstr::prelude::SnapshotMap::filter) /
+/// [`SnapshotMap::max_by`](ktstr::prelude::SnapshotMap::max_by)
+/// iterator chain against a multi-entry HASH map shape that mirrors
+/// the `ktstr_cgroup_dispatch_count` map landed for scx-ktstr.
+///
+/// Type-fidelity to the real BPF map (cgroup_id u64 → counter u64)
+/// keeps the projection closures honest — a regression in either
+/// the iterator surface or the rendering of u64/u64 HASH entries
+/// trips the assertions. End-to-end "real BTF" coverage (boot
+/// scheduler, run multi-cgroup workload, capture freeze dump,
+/// iterate) is a heavier follow-up that needs the freeze
+/// coordinator to surface populated dumps on the non-stall path.
+fn scenario_snapshotmap_iter_against_synthetic_cgroup_map(
+    ctx: &ktstr::scenario::Ctx,
+) -> anyhow::Result<ktstr::assert::AssertResult> {
+    let cb: ktstr::prelude::CaptureCallback = std::sync::Arc::new(|_name: &str| {
+        Some(
+            serde_json::from_str::<FailureDumpReport>(SYNTHETIC_CGROUP_MAP_JSON)
+                .expect("synthetic cgroup-map JSON parses into FailureDumpReport"),
+        )
+    });
+    let bridge = SnapshotBridge::new(cb);
+    let bridge_handle = bridge.clone();
+    let _bridge_guard = bridge.set_thread_local();
+
+    let steps = vec![Step {
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
+        ops: vec![Op::snapshot("iter_target")],
+        hold: HoldSpec::FULL,
+    }];
+    let mut result = execute_steps(ctx, steps)?;
+
+    let captured = bridge_handle.drain();
+    let report = captured.get("iter_target").ok_or_else(|| {
+        anyhow::anyhow!("bridge drain missing 'iter_target' — Op::snapshot didn't fire capture")
+    })?;
+    let snap = Snapshot::new(report);
+    let map = snap
+        .map("scx_obj.ktstr_cgroup_dispatch_count")
+        .map_err(|e| anyhow::anyhow!("Snapshot::map iterator-target lookup failed: {e}"))?;
+
+    // .find — locate entry by cgroup_id key, assert presence + count.
+    // The map is u64→u64; `key("")` / `get("")` walk the root of each
+    // side, which is the unit Uint render for primitive types.
+    let cg_1002 = map.find(|e| e.key("").as_u64().ok() == Some(1002));
+    if !cg_1002.is_present() {
+        anyhow::bail!(
+            "SnapshotMap::find by cgroup_id=1002 returned a not-present entry; \
+             find must match the middle of the 3 synthetic entries"
+        );
+    }
+    let cg_1002_count = cg_1002
+        .get("")
+        .as_u64()
+        .map_err(|e| anyhow::anyhow!("find()-returned entry get('').as_u64 failed: {e}"))?;
+    if cg_1002_count != 250 {
+        anyhow::bail!(
+            "find(cg_1002).get('').as_u64() = {cg_1002_count}, expected 250 (synthetic value)"
+        );
+    }
+
+    // .filter — partition by counter threshold, assert cardinality.
+    let busy = map.filter(|e| e.get("").as_u64().unwrap_or(0) > 100);
+    if busy.len() != 2 {
+        anyhow::bail!(
+            "SnapshotMap::filter(count > 100).len() = {}, expected 2 \
+             (entries 1002@250 and 1003@500)",
+            busy.len(),
+        );
+    }
+
+    // .max_by — top-counter entry, assert key + count.
+    let top = map.max_by(|e| e.get("").as_u64().unwrap_or(0));
+    if !top.is_present() {
+        anyhow::bail!(
+            "SnapshotMap::max_by on a non-empty map returned a not-present entry"
+        );
+    }
+    let top_key = top
+        .key("")
+        .as_u64()
+        .map_err(|e| anyhow::anyhow!("max_by-returned key('').as_u64 failed: {e}"))?;
+    let top_count = top
+        .get("")
+        .as_u64()
+        .map_err(|e| anyhow::anyhow!("max_by-returned get('').as_u64 failed: {e}"))?;
+    if top_key != 1003 || top_count != 500 {
+        anyhow::bail!(
+            "max_by returned cgroup_id={top_key} count={top_count}, \
+             expected cgroup_id=1003 count=500 (highest synthetic value)"
+        );
+    }
+
+    result.details.push(ktstr::assert::AssertDetail::new(
+        ktstr::assert::DetailKind::Other,
+        format!(
+            "SnapshotMap iterator chain verified: find(cg_1002)=250, \
+             filter(>100).len()=2, max_by=cg_1003@500"
+        ),
+    ));
+    Ok(result)
+}
+
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
+static __KTSTR_ENTRY_SNAPSHOTMAP_ITER: ktstr::test_support::KtstrTestEntry =
+    ktstr::test_support::KtstrTestEntry {
+        name: "snapshotmap_iter_against_synthetic_cgroup_map",
+        func: scenario_snapshotmap_iter_against_synthetic_cgroup_map,
+        scheduler: &KTSTR_SCHED,
+        duration: std::time::Duration::from_secs(3),
+        watchdog_timeout: std::time::Duration::from_secs(15),
+        // Skip auto-repro: pure bridge-side assertion, no scheduler
+        // correctness signal worth re-running under probe.
+        auto_repro: false,
+        ..ktstr::test_support::KtstrTestEntry::DEFAULT
+    };
