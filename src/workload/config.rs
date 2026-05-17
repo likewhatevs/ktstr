@@ -1921,8 +1921,7 @@ mod tests {
         ];
         for original in &variants {
             let bytes = serde_json::to_vec(original).expect("serialize");
-            let restored: SchedPolicy =
-                serde_json::from_slice(&bytes).expect("deserialize");
+            let restored: SchedPolicy = serde_json::from_slice(&bytes).expect("deserialize");
             assert_eq!(restored, *original, "roundtrip drift for {original:?}");
         }
     }

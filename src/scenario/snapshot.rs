@@ -405,10 +405,7 @@ impl std::fmt::Display for SnapshotError {
                     // and names the kernel-side fix so the operator
                     // does not have to reverse-engineer the `hex:`
                     // discriminator.
-                    if available_keys
-                        .iter()
-                        .all(|k| k.starts_with(HEX_KEY_PREFIX))
-                    {
+                    if available_keys.iter().all(|k| k.starts_with(HEX_KEY_PREFIX)) {
                         write!(
                             f,
                             " (BTF missing at capture — keys shown as hex bytes; \
@@ -1304,10 +1301,10 @@ impl<'a> SnapshotMap<'a> {
             if predicate(&entry) {
                 return entry;
             }
-            if available_keys.len() < NO_MATCH_KEY_SAMPLE {
-                if let Some(k) = render_entry_key(&entry) {
-                    available_keys.push(k);
-                }
+            if available_keys.len() < NO_MATCH_KEY_SAMPLE
+                && let Some(k) = render_entry_key(&entry)
+            {
+                available_keys.push(k);
             }
             len += 1;
         }
@@ -1533,8 +1530,10 @@ fn render_entry_key(entry: &SnapshotEntry<'_>) -> Option<String> {
         return Some(key);
     }
     if key.chars().count() > NO_MATCH_KEY_CHAR_CAP {
-        let mut truncated: String =
-            key.chars().take(NO_MATCH_KEY_CHAR_CAP.saturating_sub(1)).collect();
+        let mut truncated: String = key
+            .chars()
+            .take(NO_MATCH_KEY_CHAR_CAP.saturating_sub(1))
+            .collect();
         truncated.push('…');
         Some(truncated)
     } else {
@@ -3067,10 +3066,7 @@ mod tests {
                         value: 100,
                     }),
                     key_hex: "64000000".into(),
-                    value: Some(RenderedValue::Uint {
-                        bits: 32,
-                        value: 1,
-                    }),
+                    value: Some(RenderedValue::Uint { bits: 32, value: 1 }),
                     value_hex: "01000000".into(),
                     payload: None,
                 },
@@ -3080,10 +3076,7 @@ mod tests {
                         value: 100,
                     }),
                     key_hex: "64000000".into(),
-                    value: Some(RenderedValue::Uint {
-                        bits: 32,
-                        value: 2,
-                    }),
+                    value: Some(RenderedValue::Uint { bits: 32, value: 2 }),
                     value_hex: "02000000".into(),
                     payload: None,
                 },
@@ -3093,10 +3086,7 @@ mod tests {
                         value: 200,
                     }),
                     key_hex: "c8000000".into(),
-                    value: Some(RenderedValue::Uint {
-                        bits: 32,
-                        value: 3,
-                    }),
+                    value: Some(RenderedValue::Uint { bits: 32, value: 3 }),
                     value_hex: "03000000".into(),
                     payload: None,
                 },
@@ -3106,10 +3096,7 @@ mod tests {
                         value: 300,
                     }),
                     key_hex: "2c010000".into(),
-                    value: Some(RenderedValue::Uint {
-                        bits: 32,
-                        value: 4,
-                    }),
+                    value: Some(RenderedValue::Uint { bits: 32, value: 4 }),
                     value_hex: "04000000".into(),
                     payload: None,
                 },
@@ -3150,7 +3137,10 @@ mod tests {
                      appears twice in iteration order before the cap fires \
                      against the third unique key",
                 );
-                let dup_count = available_keys.iter().filter(|k| k.as_str() == "100").count();
+                let dup_count = available_keys
+                    .iter()
+                    .filter(|k| k.as_str() == "100")
+                    .count();
                 assert_eq!(
                     dup_count, 2,
                     "position-insensitive backup pin: key '100' must appear \
@@ -3306,7 +3296,9 @@ mod tests {
         let entry = snap.map("scx_threshold").unwrap().find(|_| false);
         match entry {
             SnapshotEntry::Missing(SnapshotError::NoMatch {
-                len, available_keys, ..
+                len,
+                available_keys,
+                ..
             }) => {
                 assert_eq!(len, NO_MATCH_KEY_SAMPLE);
                 assert_eq!(available_keys.len(), NO_MATCH_KEY_SAMPLE);

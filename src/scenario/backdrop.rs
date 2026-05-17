@@ -219,7 +219,10 @@ impl Backdrop {
     /// See [`Self::push_payload`]; use [`Self::extend_ops`] with
     /// [`Op::run_payload`] entries for per-payload args.
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn extend_payloads<I: IntoIterator<Item = &'static Payload>>(mut self, payloads: I) -> Self {
+    pub fn extend_payloads<I: IntoIterator<Item = &'static Payload>>(
+        mut self,
+        payloads: I,
+    ) -> Self {
         self.payloads.extend(payloads);
         self
     }
@@ -451,7 +454,8 @@ mod tests {
 
     #[test]
     fn extend_ops_preserves_order() {
-        let b = Backdrop::new().extend_ops(vec![Op::add_cgroup("cg_1"), Op::add_cgroup("cg_1/sub")]);
+        let b =
+            Backdrop::new().extend_ops(vec![Op::add_cgroup("cg_1"), Op::add_cgroup("cg_1/sub")]);
         assert_eq!(b.ops.len(), 2);
         assert!(matches!(&b.ops[0], Op::AddCgroup { name } if name.as_ref() == "cg_1"));
         assert!(matches!(&b.ops[1], Op::AddCgroup { name } if name.as_ref() == "cg_1/sub"));

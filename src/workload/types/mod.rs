@@ -1907,7 +1907,11 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::PageFaultChurn`] variant doc for preconditions.
-    pub const fn page_fault_churn(region_kib: usize, touches_per_cycle: usize, spin_iters: u64) -> Self {
+    pub const fn page_fault_churn(
+        region_kib: usize,
+        touches_per_cycle: usize,
+        spin_iters: u64,
+    ) -> Self {
         WorkType::PageFaultChurn {
             region_kib,
             touches_per_cycle,

@@ -1582,7 +1582,10 @@ mod tests {
     fn topology_fromstr_rejects_zero_component() {
         for s in ["0n1l1c1t", "1n0l1c1t", "1n1l0c1t", "1n1l1c0t"] {
             assert!(
-                matches!(s.parse::<Topology>(), Err(TopologyParseError::BadComponent(_))),
+                matches!(
+                    s.parse::<Topology>(),
+                    Err(TopologyParseError::BadComponent(_))
+                ),
                 "expected BadComponent for {s}",
             );
         }
@@ -1606,7 +1609,10 @@ mod tests {
         let err = "2n3l1c1t".parse::<Topology>().unwrap_err();
         assert!(matches!(
             err,
-            TopologyParseError::NotMultiple { llcs: 3, numa_nodes: 2 }
+            TopologyParseError::NotMultiple {
+                llcs: 3,
+                numa_nodes: 2
+            }
         ));
     }
 
@@ -1756,10 +1762,7 @@ mod tests {
         // iter 0: accumulator = 0 + u32::MAX = u32::MAX (OK; node is
         // cpu-bearing with non-zero memory so the L491 check passes).
         // iter 1: u32::MAX.checked_add(1) = None → panic at L489.
-        static NODES: [NumaNode; 2] = [
-            NumaNode::new(u32::MAX, 512),
-            NumaNode::new(1, 512),
-        ];
+        static NODES: [NumaNode; 2] = [NumaNode::new(u32::MAX, 512), NumaNode::new(1, 512)];
         Topology::with_nodes(1, 1, &NODES);
     }
 

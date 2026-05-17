@@ -3377,7 +3377,10 @@ mod tests {
             .zip(from_const.workloads.iter())
             .enumerate()
         {
-            assert!(std::ptr::eq(*a, *b), "workloads[{i}] pointer identity drift");
+            assert!(
+                std::ptr::eq(*a, *b),
+                "workloads[{i}] pointer identity drift"
+            );
         }
         assert_eq!(from_trait.auto_repro, from_const.auto_repro);
         assert_eq!(

@@ -103,4 +103,4 @@ mod tests_proptest;
 // for those names only.
 #[allow(unused_imports)]
 pub(crate) use device::*;
-pub use device::{VIRTIO_MMIO_SIZE, VirtioNet, VirtioNetCounters};
+pub use device::{VIRTIO_MMIO_SIZE, VirtioNet, VirtioNetCounters, VirtioNetCountersSnapshot};

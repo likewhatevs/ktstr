@@ -99,27 +99,33 @@ mod terminal;
 mod vcpu_panic;
 mod vmlinux;
 
-// Re-export `VirtioBlkCounters` for users who hold a [`VmResult`]:
-// `VmResult::virtio_blk_counters` exposes the device-side counter
-// Arc, and the type itself must be reachable from the public path
-// for a user to spell out `Arc<VirtioBlkCounters>` in their own
-// signatures. The defining module stays `pub(crate)` because the
-// device implementation is internal — this is the single public
-// surface for the counters type.
-// Re-export `NetConfig` and `VirtioNetCounters` for the same reason
-// as `VirtioBlkCounters` below: user-facing test code holds a
-// `VmResult` whose `virtio_net_counters` field carries the device's
-// counter Arc, and `NetConfig` is the builder-side configuration
-// type, so both names must be reachable from the public path. The
-// in-tree readers go through the prelude path
-// `crate::vmm::net_config::NetConfig`, so the lib build sees no
-// direct readers of these names; allow unused-imports locally to
-// keep `cargo check` quiet while preserving the public re-export.
+// Re-export the snapshot types for users who hold a [`VmResult`]:
+// `VmResult::virtio_blk_counters` and `virtio_net_counters` expose
+// `Option<VirtioBlkCountersSnapshot>` / `Option<VirtioNetCountersSnapshot>`
+// (plain-u64 frozen views taken at result-construction time), and
+// the types themselves must be reachable from the public path for
+// a user to spell them out in their own signatures (e.g. a
+// `post_vm` helper `fn check(s: &VirtioBlkCountersSnapshot)`). The
+// defining modules stay `pub(crate)` because the device
+// implementations are internal — these snapshot re-exports are
+// the single public surface for the post-mortem counter views.
+// `NetConfig` is the builder-side configuration type, surfaced for
+// the same public-spelling reason. The in-tree readers go through
+// the prelude path so the lib build sees no direct readers of
+// these names; allow unused-imports locally to keep `cargo check`
+// quiet while preserving the public re-export.
 #[allow(unused_imports)]
 pub use net_config::NetConfig;
-pub use virtio_blk::VirtioBlkCounters;
+// `VirtioBlkCountersSnapshot` is read by the result.rs test
+// fixture (cfg(test)); the lib build still sees no direct reader
+// outside the prelude path, so the lint behaves the same as the
+// net side. Both `pub use` lines below carry their own
+// `#[allow(unused_imports)]` so a future field-name swap doesn't
+// silently re-enable the warning for only one of them.
 #[allow(unused_imports)]
-pub use virtio_net::VirtioNetCounters;
+pub use virtio_blk::VirtioBlkCountersSnapshot;
+#[allow(unused_imports)]
+pub use virtio_net::VirtioNetCountersSnapshot;
 
 // Re-export public result types from the new submodule.
 // `KVM_INTERESTING_STATS` is part of the public surface for stats

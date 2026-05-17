@@ -203,7 +203,11 @@ impl KernelId {
     /// validation as a single-element range.
     pub fn validate(&self) -> Result<(), String> {
         match self {
-            KernelId::Range { start, end, syntax_inclusive } => {
+            KernelId::Range {
+                start,
+                end,
+                syntax_inclusive,
+            } => {
                 let start_key = decompose_version_for_compare(start).ok_or_else(|| {
                     format!(
                         "kernel range start `{start}` is not a parseable version. \
@@ -244,7 +248,11 @@ impl std::fmt::Display for KernelId {
             KernelId::Path(p) => write!(f, "{}", p.display()),
             KernelId::Version(v) => write!(f, "{v}"),
             KernelId::CacheKey(k) => write!(f, "{k}"),
-            KernelId::Range { start, end, syntax_inclusive } => {
+            KernelId::Range {
+                start,
+                end,
+                syntax_inclusive,
+            } => {
                 let sep = if *syntax_inclusive { "..=" } else { ".." };
                 write!(f, "{start}{sep}{end}")
             }

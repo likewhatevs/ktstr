@@ -200,13 +200,7 @@ fn assert_result_missing_required_field_rejected_by_deserialize() {
     // has no `Default` derive and no `#[serde(default)]` on any
     // field). Loop over each; each removal must fail deserialize
     // with a missing-field error naming the removed field.
-    const REQUIRED_FIELDS: &[&str] = &[
-        "passed",
-        "skipped",
-        "details",
-        "stats",
-        "measurements",
-    ];
+    const REQUIRED_FIELDS: &[&str] = &["passed", "skipped", "details", "stats", "measurements"];
 
     let r = AssertResult {
         passed: false,
@@ -239,4 +233,3 @@ fn assert_result_missing_required_field_rejected_by_deserialize() {
         );
     }
 }
-

@@ -514,6 +514,59 @@ impl VirtioNetCounters {
     pub fn invalid_avail_idx_count(&self) -> u64 {
         self.invalid_avail_idx_count.load(Ordering::Relaxed)
     }
+
+    /// Freeze every atomic into a plain-u64 snapshot for the
+    /// host-side post-mortem path in [`crate::vmm::VmResult`].
+    /// virtio-net is single-threaded — `process_tx_loopback` runs
+    /// inline on the kicking vCPU thread, so the sole writers to
+    /// these counters are the vCPUs themselves. By the time
+    /// `collect_results` reaches the snapshot site every vCPU
+    /// thread has joined, so no writer remains and the relaxed
+    /// loads observe the final cumulative state.
+    pub fn snapshot(&self) -> VirtioNetCountersSnapshot {
+        VirtioNetCountersSnapshot {
+            tx_packets: self.tx_packets(),
+            tx_bytes: self.tx_bytes(),
+            rx_packets: self.rx_packets(),
+            rx_bytes: self.rx_bytes(),
+            tx_dropped_no_rx_buffer: self.tx_dropped_no_rx_buffer(),
+            tx_chain_invalid: self.tx_chain_invalid(),
+            rx_chain_invalid: self.rx_chain_invalid(),
+            rx_write_failed: self.rx_write_failed(),
+            tx_add_used_failures: self.tx_add_used_failures(),
+            rx_add_used_failures: self.rx_add_used_failures(),
+            invalid_avail_idx_count: self.invalid_avail_idx_count(),
+        }
+    }
+}
+
+/// Plain-u64 snapshot of [`VirtioNetCounters`] taken at VM-result
+/// construction time. Mirrors every atomic field by name.
+///
+/// Decouples [`crate::vmm::VmResult`] from the internal
+/// atomic-shared writer state — consumers see immutable owned
+/// data they can `Clone`, compare, and round-trip through serde
+/// without the `Arc<AtomicU64>` ceremony. virtio-net is
+/// single-threaded — the vCPU thread continues to bump the
+/// atomics inline from `process_tx_loopback` via the
+/// [`VirtioNetCounters`] `record_*` mutators; only the
+/// result-construction path moves to the snapshot.
+///
+/// Field semantics match the atomic source one-for-one — see
+/// [`VirtioNetCounters`] for the per-counter taxonomy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct VirtioNetCountersSnapshot {
+    pub tx_packets: u64,
+    pub tx_bytes: u64,
+    pub rx_packets: u64,
+    pub rx_bytes: u64,
+    pub tx_dropped_no_rx_buffer: u64,
+    pub tx_chain_invalid: u64,
+    pub rx_chain_invalid: u64,
+    pub rx_write_failed: u64,
+    pub tx_add_used_failures: u64,
+    pub rx_add_used_failures: u64,
+    pub invalid_avail_idx_count: u64,
 }
 
 // ---------------------------------------------------------------------------

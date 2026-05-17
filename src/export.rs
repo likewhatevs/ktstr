@@ -83,7 +83,9 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 
-use crate::test_support::{KtstrTestEntry, SchedulerSpec, content_hash, find_test, resolve_scheduler};
+use crate::test_support::{
+    KtstrTestEntry, SchedulerSpec, content_hash, find_test, resolve_scheduler,
+};
 
 /// Build a self-extracting `.run` file for the given test.
 ///

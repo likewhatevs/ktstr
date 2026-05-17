@@ -1323,8 +1323,7 @@ mod tests {
         let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
-        let meta =
-            test_metadata("6.14.2").with_extra_kconfig_hash("user-fragment-hash");
+        let meta = test_metadata("6.14.2").with_extra_kconfig_hash("user-fragment-hash");
         let entry = cache
             .store("with-extra", &CacheArtifacts::new(&image), &meta)
             .unwrap();

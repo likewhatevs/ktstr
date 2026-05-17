@@ -159,12 +159,14 @@ mod worker;
 pub(crate) use worker::*;
 
 mod counters;
-// `VirtioBlkCounters` is the only pub item in `counters.rs`; it is
-// re-exported as `pub` below for upstream consumers (vmm/mod.rs and
-// lib.rs). Internal references reach it via `super::VirtioBlkCounters`
-// from device/handlers/drain — Rust resolves through the same `pub`
-// re-export, so a separate `pub(crate) use counters::*;` glob would be
-// redundant (clippy --lib flags it as unused).
+// `VirtioBlkCounters` and `VirtioBlkCountersSnapshot` are the pub
+// items in `counters.rs`. They are re-exported as `pub` below for
+// upstream consumers (vmm/mod.rs and lib.rs). Internal references
+// reach them via `super::VirtioBlkCounters` /
+// `super::VirtioBlkCountersSnapshot` from device/handlers/drain —
+// Rust resolves through the same `pub` re-exports, so a separate
+// `pub(crate) use counters::*;` glob would be redundant (clippy
+// --lib flags it as unused).
 
 mod device;
 // The glob is `pub(crate)` so internal items (cfg-test test fixtures,
@@ -181,7 +183,7 @@ pub(crate) use device::*;
 // the same defaults the lib uses internally; the lib's current
 // callers reach the constants directly via the device module, so
 // the public re-export looks unused in clippy --lib.
-pub use counters::VirtioBlkCounters;
+pub use counters::{VirtioBlkCounters, VirtioBlkCountersSnapshot};
 #[allow(unused_imports)]
 pub use device::{
     VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, VIRTIO_BLK_SECTOR_SIZE, VIRTIO_MMIO_SIZE, VirtioBlk,

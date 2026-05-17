@@ -50,21 +50,24 @@ fn max_wake_samples_pins_doc_value() {
 #[test]
 fn page_fault_churn_defaults_pin_doc_values() {
     assert_eq!(
-        defaults::PAGE_FAULT_CHURN_REGION_KIB, 4096,
+        defaults::PAGE_FAULT_CHURN_REGION_KIB,
+        4096,
         "PAGE_FAULT_CHURN_REGION_KIB MUST stay 4096 to match the doc \
          cite in doc/guide/src/architecture/workers.md \
          (\"region_kib=4096\"). Update both this assertion AND the doc \
          cite if you intentionally changed the default.",
     );
     assert_eq!(
-        defaults::PAGE_FAULT_CHURN_TOUCHES_PER_CYCLE, 256,
+        defaults::PAGE_FAULT_CHURN_TOUCHES_PER_CYCLE,
+        256,
         "PAGE_FAULT_CHURN_TOUCHES_PER_CYCLE MUST stay 256 to match \
          the doc cite in doc/guide/src/architecture/workers.md \
          (\"touches_per_cycle=256\"). Update both this assertion AND \
          the doc cite if you intentionally changed the default.",
     );
     assert_eq!(
-        defaults::PAGE_FAULT_CHURN_SPIN_ITERS, 64,
+        defaults::PAGE_FAULT_CHURN_SPIN_ITERS,
+        64,
         "PAGE_FAULT_CHURN_SPIN_ITERS MUST stay 64 to match the doc \
          cite in doc/guide/src/architecture/workers.md \
          (\"spin_iters=64\"). Update both this assertion AND the doc \

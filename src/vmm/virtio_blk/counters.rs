@@ -408,6 +408,60 @@ impl VirtioBlkCounters {
     pub fn invalid_avail_idx_count(&self) -> u64 {
         self.invalid_avail_idx_count.load(Ordering::Relaxed)
     }
+
+    /// Freeze every atomic into a plain-u64 snapshot. Intended for
+    /// the host-side post-mortem path in
+    /// [`crate::vmm::VmResult`]: by the time `collect_results`
+    /// reaches the snapshot site the only sources of QUEUE_NOTIFY
+    /// kicks (vCPU threads) have joined, so the worker thread that
+    /// bumps these counters can receive no new work and the
+    /// post-AP-join cleanup phases (monitor join, bulk drain) give
+    /// it ample time to park. The relaxed loads therefore observe
+    /// the worker's final cumulative state.
+    pub fn snapshot(&self) -> VirtioBlkCountersSnapshot {
+        VirtioBlkCountersSnapshot {
+            reads_completed: self.reads_completed(),
+            writes_completed: self.writes_completed(),
+            flushes_completed: self.flushes_completed(),
+            bytes_read: self.bytes_read(),
+            bytes_written: self.bytes_written(),
+            throttled_count: self.throttled_count(),
+            io_errors: self.io_errors(),
+            currently_throttled_gauge: self.currently_throttled_gauge(),
+            invalid_avail_idx_count: self.invalid_avail_idx_count(),
+        }
+    }
+}
+
+/// Plain-u64 snapshot of [`VirtioBlkCounters`] taken at VM-result
+/// construction time. Mirrors every atomic field by name.
+///
+/// Decouples the public-facing [`crate::vmm::VmResult`] from the
+/// internal atomic-shared writer state — consumers see immutable
+/// owned data they can `Clone`, compare, and round-trip through
+/// serde without the `Arc<AtomicU64>` ceremony. The worker thread
+/// continues to bump the atomics via the [`VirtioBlkCounters`]
+/// `record_*` mutators; only the result-construction path moves
+/// to the snapshot.
+///
+/// Field semantics match the atomic source one-for-one — see
+/// [`VirtioBlkCounters`] for the cumulative-vs-gauge taxonomy
+/// distinguishing each field. The live-gauge field
+/// `currently_throttled_gauge` reflects the gauge state at
+/// snapshot time — typically `0` after a clean shutdown, but
+/// per the [`VirtioBlkCounters`] doc a worker-strand stall
+/// during teardown can leave a non-zero residual.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct VirtioBlkCountersSnapshot {
+    pub reads_completed: u64,
+    pub writes_completed: u64,
+    pub flushes_completed: u64,
+    pub bytes_read: u64,
+    pub bytes_written: u64,
+    pub throttled_count: u64,
+    pub io_errors: u64,
+    pub currently_throttled_gauge: u64,
+    pub invalid_avail_idx_count: u64,
 }
 
 #[cfg(test)]
@@ -1067,5 +1121,101 @@ mod tests {
             0,
             "record_invalid_avail_idx must NOT bump flushes_completed",
         );
+    }
+
+    /// Pump every counter to a DISTINCT non-zero value, then call
+    /// `snapshot()` and assert each Snapshot field equals the
+    /// matching source value. The distinct-per-field setup is
+    /// load-bearing: a copy-paste swap in `snapshot()` (e.g.
+    /// `bytes_read: self.bytes_written.load(...)`) would route the
+    /// wrong source into the post-mortem path and the only way to
+    /// detect cross-wiring is to give every field a unique value
+    /// so any swap surfaces as an assert mismatch.
+    #[test]
+    fn snapshot_captures_every_field_independently() {
+        let c = VirtioBlkCounters::default();
+        c.record_read(101);
+        c.record_write(202);
+        c.record_write(303);
+        c.record_flush();
+        c.record_flush();
+        c.record_flush();
+        c.record_throttled();
+        c.record_throttled();
+        c.record_throttled();
+        c.record_throttled();
+        c.record_io_error();
+        c.record_io_error();
+        c.record_io_error();
+        c.record_io_error();
+        c.record_io_error();
+        c.record_invalid_avail_idx();
+        c.record_invalid_avail_idx();
+        c.record_invalid_avail_idx();
+        c.record_invalid_avail_idx();
+        c.record_invalid_avail_idx();
+        c.record_invalid_avail_idx();
+        // Pump the gauge to 7 so every Snapshot field below holds a
+        // DISTINCT value (1..=7 for counts, 101 / 505 for bytes); a
+        // copy-paste source-field swap inside `snapshot()` (e.g.
+        // `currently_throttled_gauge: self.reads_completed()`) would
+        // surface as an assert mismatch because no two source fields
+        // collide. The helper docs note the 0-or-1 invariant is
+        // enforced at the dispatch site, not in the helper — the
+        // helper itself accepts N consecutive calls and bumps by N.
+        for _ in 0..7 {
+            c.record_throttle_pending_inc();
+        }
+
+        let s = c.snapshot();
+        assert_eq!(
+            s.reads_completed, 1,
+            "reads_completed source-of-truth check"
+        );
+        assert_eq!(s.bytes_read, 101, "bytes_read source-of-truth check");
+        assert_eq!(
+            s.writes_completed, 2,
+            "writes_completed source-of-truth check"
+        );
+        assert_eq!(
+            s.bytes_written, 505,
+            "bytes_written source-of-truth check (202+303)"
+        );
+        assert_eq!(
+            s.flushes_completed, 3,
+            "flushes_completed source-of-truth check"
+        );
+        assert_eq!(
+            s.throttled_count, 4,
+            "throttled_count source-of-truth check"
+        );
+        assert_eq!(s.io_errors, 5, "io_errors source-of-truth check");
+        assert_eq!(
+            s.invalid_avail_idx_count, 6,
+            "invalid_avail_idx_count source-of-truth check"
+        );
+        assert_eq!(
+            s.currently_throttled_gauge, 7,
+            "currently_throttled_gauge source-of-truth check"
+        );
+    }
+
+    /// Pin the all-zero Default snapshot: a future field added to
+    /// `VirtioBlkCountersSnapshot` that doesn't initialise to 0 would
+    /// break the "fresh device reports zero activity" contract that
+    /// VmResult readers rely on. Parity with the virtio-net side's
+    /// `default_snapshot_is_all_zero` in `src/vmm/virtio_net/tests.rs`.
+    #[test]
+    fn default_snapshot_is_all_zero() {
+        let s = VirtioBlkCountersSnapshot::default();
+        assert_eq!(s.reads_completed, 0);
+        assert_eq!(s.writes_completed, 0);
+        assert_eq!(s.flushes_completed, 0);
+        assert_eq!(s.bytes_read, 0);
+        assert_eq!(s.bytes_written, 0);
+        assert_eq!(s.throttled_count, 0);
+        assert_eq!(s.io_errors, 0);
+        assert_eq!(s.currently_throttled_gauge, 0);
+        assert_eq!(s.invalid_avail_idx_count, 0);
     }
 }

@@ -150,8 +150,7 @@ fn migration_new_matches_struct_literal() {
 fn migration_serde_roundtrip() {
     let original = Migration::new(42, 3, 7);
     let bytes = serde_json::to_vec(&original).expect("serialize");
-    let restored: Migration =
-        serde_json::from_slice(&bytes).expect("deserialize");
+    let restored: Migration = serde_json::from_slice(&bytes).expect("deserialize");
     assert_eq!(restored, original);
     assert_eq!(restored.at_ns, 42);
     assert_eq!(restored.from_cpu, 3);

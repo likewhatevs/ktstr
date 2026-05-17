@@ -1641,4 +1641,29 @@ mod tests {
         assert_eq!(vm_boot_headroom(126), Duration::from_millis(28_900));
         assert_eq!(vm_boot_headroom(512), Duration::from_secs(40));
     }
+
+    /// Two calls to `content_hash` with the same input must return
+    /// the same u64. Pins the within-process determinism invariant
+    /// against a future regression that swaps in a per-call-seeded
+    /// hasher — e.g. `std::hash::RandomState::new().build_hasher()`,
+    /// which increments its keys per call within a process, or any
+    /// time/thread-id-seeded scheme. Note: swapping to std's
+    /// `DefaultHasher::new()` would NOT regress this test —
+    /// `DefaultHasher` is itself `SipHasher13::new_with_keys(0, 0)`
+    /// and therefore deterministic; the cross-rustc-version
+    /// stability regression class is caught by the value-pin
+    /// follow-up, not this assertion.
+    #[test]
+    fn content_hash_is_deterministic_across_calls() {
+        let input = "scheduler config payload";
+        assert_eq!(content_hash(input), content_hash(input));
+    }
+
+    /// Distinct inputs must produce distinct hashes. Catches a trivial
+    /// regression (constant-returning hasher) that the determinism
+    /// test alone would silently accept.
+    #[test]
+    fn content_hash_differs_for_distinct_inputs() {
+        assert_ne!(content_hash("alpha"), content_hash("beta"));
+    }
 }

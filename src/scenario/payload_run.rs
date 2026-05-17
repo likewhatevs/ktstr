@@ -279,7 +279,8 @@ impl<'a> PayloadRun<'a> {
     /// [`PayloadKind::Binary`] or when the spawn itself fails.
     pub fn spawn(self) -> Result<PayloadHandle> {
         let binary = payload_binary(self.payload)?;
-        let cgroup_path = resolve_cgroup_path(self.ctx, self.cgroup.as_deref(), "PayloadRun::spawn")?;
+        let cgroup_path =
+            resolve_cgroup_path(self.ctx, self.cgroup.as_deref(), "PayloadRun::spawn")?;
         let (child, sigchld) = spawn_child(
             binary,
             &self.args,
@@ -1297,9 +1298,7 @@ fn resolve_cgroup_path(
         return Ok(None);
     };
     if name.as_bytes().contains(&0) {
-        return Err(anyhow!(
-            "{op}: cgroup name '{name}' contains a NUL byte"
-        ));
+        return Err(anyhow!("{op}: cgroup name '{name}' contains a NUL byte"));
     }
     let trimmed = name.trim_start_matches('/');
     if trimmed.is_empty() {
@@ -2672,9 +2671,15 @@ mod tests {
                     .expect_err("'..' must be rejected"),
             );
             assert!(err_a.contains("caller-a"), "err_a: {err_a}");
-            assert!(!err_a.contains("caller-b"), "err_a leaked caller-b: {err_a}");
+            assert!(
+                !err_a.contains("caller-b"),
+                "err_a leaked caller-b: {err_a}"
+            );
             assert!(err_b.contains("caller-b"), "err_b: {err_b}");
-            assert!(!err_b.contains("caller-a"), "err_b leaked caller-a: {err_b}");
+            assert!(
+                !err_b.contains("caller-a"),
+                "err_b leaked caller-a: {err_b}"
+            );
         });
     }
 
@@ -3449,9 +3454,7 @@ mod tests {
                 known_flags: None,
                 metric_bounds: None,
             };
-            let handle = PayloadRun::new(ctx, &SLEEPER)
-                .spawn()
-                .expect("spawn sleep");
+            let handle = PayloadRun::new(ctx, &SLEEPER).spawn().expect("spawn sleep");
             let (_result, metrics) = handle.kill().expect("kill+collect");
             // Killed process produces a non-zero exit (SIGKILL -> None
             // status code, wait_and_capture maps to -1).
@@ -3474,9 +3477,7 @@ mod tests {
                 known_flags: None,
                 metric_bounds: None,
             };
-            let mut handle = PayloadRun::new(ctx, &SLEEPER)
-                .spawn()
-                .expect("spawn sleep");
+            let mut handle = PayloadRun::new(ctx, &SLEEPER).spawn().expect("spawn sleep");
             // Not yet exited.
             assert!(handle.try_wait().expect("try_wait").is_none());
             // Cleanup — kill so Drop warning doesn't fire.

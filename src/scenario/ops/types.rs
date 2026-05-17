@@ -2788,9 +2788,8 @@ mod cgroup_def_default_tests {
     /// would silently pass the "still empty" check.
     #[test]
     fn step_set_hold_replaces_hold_preserves_setup_and_ops() {
-        let original =
-            Step::with_defs(vec![CgroupDef::named("cg_setup")], HoldSpec::FULL)
-                .set_ops(vec![Op::add_cgroup("cg_x")]);
+        let original = Step::with_defs(vec![CgroupDef::named("cg_setup")], HoldSpec::FULL)
+            .set_ops(vec![Op::add_cgroup("cg_x")]);
         // Pin pre-state — non-empty setup, 1 op, full hold.
         assert!(
             matches!(

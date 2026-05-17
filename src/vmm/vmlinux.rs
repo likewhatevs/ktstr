@@ -197,4 +197,51 @@ mod tests {
         let nonexistent = tmp.path().join("missing-xyzzy");
         assert!(cached_vmlinux_bytes(&nonexistent).is_none());
     }
+
+    /// Two distinct symlink paths pointing at the SAME real file must
+    /// dedup to one cache entry — canonicalize collapses both keys to
+    /// the same canonical PathBuf, so the second lookup hits the cache
+    /// populated by the first and returns a clone of the same `Arc`.
+    /// Verified via `Arc::ptr_eq` rather than byte equality: the bytes
+    /// would compare equal even from a re-read; only a true cache hit
+    /// returns the same allocation.
+    #[test]
+    #[cfg(unix)]
+    fn cached_vmlinux_bytes_dedups_symlinks_to_same_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("vmlinux-real");
+        std::fs::write(&real, b"SYMLINK_DEDUP_BYTES").unwrap();
+        let link_a = tmp.path().join("vmlinux-link-a");
+        let link_b = tmp.path().join("vmlinux-link-b");
+        std::os::unix::fs::symlink(&real, &link_a).unwrap();
+        std::os::unix::fs::symlink(&real, &link_b).unwrap();
+
+        let via_a = cached_vmlinux_bytes(&link_a).expect("read via symlink A");
+        let via_b = cached_vmlinux_bytes(&link_b).expect("read via symlink B");
+        assert!(
+            Arc::ptr_eq(&via_a, &via_b),
+            "two symlinks to the same target must canonicalize to the \
+             same cache key and return the same Arc; got fresh \
+             allocations, suggesting the canonicalize-then-key path \
+             regressed to keying on the raw symlink path."
+        );
+    }
+
+    /// A dangling symlink (target deleted before any read) makes
+    /// `canonicalize` fail. The function falls back to using the
+    /// symlink's own path as the cache key, then `fs::read` fails to
+    /// open the dangling target and returns `None`. The cache is not
+    /// populated for the dangling path.
+    #[test]
+    #[cfg(unix)]
+    fn cached_vmlinux_bytes_dangling_symlink_returns_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("vmlinux-gone");
+        let link = tmp.path().join("vmlinux-dangling");
+        std::fs::write(&target, b"ELF").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        std::fs::remove_file(&target).unwrap();
+
+        assert!(cached_vmlinux_bytes(&link).is_none());
+    }
 }

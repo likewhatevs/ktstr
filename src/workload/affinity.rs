@@ -422,8 +422,7 @@ mod tests {
     #[test]
     fn resolved_affinity_constructors_match_direct_variants() {
         let from_ctor = ResolvedAffinity::fixed([0_usize, 1, 2]);
-        let from_variant =
-            ResolvedAffinity::Fixed([0_usize, 1, 2].into_iter().collect());
+        let from_variant = ResolvedAffinity::Fixed([0_usize, 1, 2].into_iter().collect());
         assert_eq!(from_ctor, from_variant);
 
         let from_ctor = ResolvedAffinity::random([0_usize, 1, 2, 3], 2);
@@ -476,8 +475,7 @@ mod tests {
         ];
         for original in &variants {
             let bytes = serde_json::to_vec(original).expect("serialize");
-            let restored: ResolvedAffinity =
-                serde_json::from_slice(&bytes).expect("deserialize");
+            let restored: ResolvedAffinity = serde_json::from_slice(&bytes).expect("deserialize");
             assert_eq!(restored, *original, "roundtrip drift for {original:?}");
         }
     }

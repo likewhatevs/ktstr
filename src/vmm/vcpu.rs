@@ -313,15 +313,14 @@ pub(crate) fn pin_current_thread(cpu: usize, label: &str) {
 /// disambiguated from a legitimately zero count.
 fn cpu_set_diag_context() -> (usize, std::borrow::Cow<'static, str>) {
     let width = libc::CPU_SETSIZE as usize;
-    let online: std::borrow::Cow<'static, str> = match nix::unistd::sysconf(
-        nix::unistd::SysconfVar::_NPROCESSORS_ONLN,
-    )
-    .ok()
-    .flatten()
-    {
-        Some(n) => format!("{n}").into(),
-        None => "unavailable".into(),
-    };
+    let online: std::borrow::Cow<'static, str> =
+        match nix::unistd::sysconf(nix::unistd::SysconfVar::_NPROCESSORS_ONLN)
+            .ok()
+            .flatten()
+        {
+            Some(n) => format!("{n}").into(),
+            None => "unavailable".into(),
+        };
     (width, online)
 }
 

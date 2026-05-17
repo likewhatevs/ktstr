@@ -81,8 +81,7 @@ fn private_ctor_attribute_fires_before_tests() {
 /// (e.g. removing the `ctor::declarative` re-export) fails this
 /// binary's build before downstream test-authors who depend on the
 /// form notice.
-static DECLARATIVE_FIRED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static DECLARATIVE_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 ::ktstr::__private::ctor::declarative::ctor! {
 #[ctor(unsafe)]

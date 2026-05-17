@@ -7,13 +7,13 @@ fn compile_fail() {
 
 /// Collect stems of `.rs` and `.stderr` files in `tests/compile_fail/`.
 fn fixture_pairs() -> (Vec<String>, Vec<String>) {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR set by cargo");
+    let manifest_dir =
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo");
     let fixture_dir = std::path::Path::new(&manifest_dir).join("tests/compile_fail");
     let mut rs_stems = Vec::new();
     let mut stderr_stems = Vec::new();
-    for entry in std::fs::read_dir(&fixture_dir)
-        .unwrap_or_else(|e| panic!("read_dir({fixture_dir:?}): {e}"))
+    for entry in
+        std::fs::read_dir(&fixture_dir).unwrap_or_else(|e| panic!("read_dir({fixture_dir:?}): {e}"))
     {
         let entry = entry.expect("read_dir entry");
         let path = entry.path();
@@ -63,8 +63,7 @@ fn compile_fail_fixture_inventory() {
          silently pass with no fixtures to verify."
     );
 
-    let rs_set: std::collections::BTreeSet<&str> =
-        rs_stems.iter().map(String::as_str).collect();
+    let rs_set: std::collections::BTreeSet<&str> = rs_stems.iter().map(String::as_str).collect();
     let stderr_set: std::collections::BTreeSet<&str> =
         stderr_stems.iter().map(String::as_str).collect();
 

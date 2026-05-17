@@ -10444,8 +10444,28 @@ impl KtstrVm {
             kvm_stats: None,
             crash_message,
             cleanup_duration,
-            virtio_blk_counters: run.virtio_blk_counters,
-            virtio_net_counters: run.virtio_net_counters,
+            // Snapshot at assignment, not earlier: VmRunState owns
+            // the device's Arc<AtomicU64> counter handle until this
+            // point. The sole sources of QUEUE_NOTIFY kicks for both
+            // devices are the vCPU threads — the BSP completed its
+            // run loop earlier (joined back in `run_vm` before `bsp`
+            // dropped) and every AP joined upstream in the
+            // `run.ap_threads` join loop above. The virtio-blk
+            // worker can therefore receive no new kicks (and the
+            // intervening monitor-join + bulk-drain phases give it
+            // ample time to drain any in-flight one before settling
+            // back on its idle epoll_wait); virtio-net's
+            // `process_tx_loopback` is single-threaded on the
+            // kicking vCPU so once those joined no writer remains.
+            // The relaxed loads inside each `snapshot()` therefore
+            // observe the device's final cumulative state.
+            // Converting here (rather than at device-build time)
+            // keeps the devices incrementing through every vCPU
+            // exit path that runs before this function — failure
+            // dumps, watchdog timeouts, and the normal exit path
+            // all see fully-up-to-date counters.
+            virtio_blk_counters: run.virtio_blk_counters.as_deref().map(|c| c.snapshot()),
+            virtio_net_counters: run.virtio_net_counters.as_deref().map(|c| c.snapshot()),
             snapshot_bridge: run.snapshot_bridge,
             stats_client,
             periodic_fired: run.periodic_fired,

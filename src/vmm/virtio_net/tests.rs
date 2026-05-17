@@ -1349,3 +1349,106 @@ fn tx_kick_before_driver_ok_ignored() {
         "post-DRIVER_OK kick processes the queued chain",
     );
 }
+
+/// Pump every counter to a DISTINCT non-zero value, then call
+/// `snapshot()` and assert each Snapshot field equals the matching
+/// source value. The distinct-per-field setup is load-bearing: a
+/// copy-paste swap inside `snapshot()` (e.g. `tx_bytes:
+/// self.rx_bytes.load(...)`) would silently route the wrong source
+/// into the post-mortem path, and the only way to detect cross-
+/// wiring is to give every field a unique value so any swap surfaces
+/// as an assert mismatch.
+#[test]
+fn snapshot_captures_every_field_independently() {
+    let c = VirtioNetCounters::default();
+    c.record_tx_completed(101);
+    c.record_tx_completed(202);
+    c.record_rx_delivered(303);
+    c.record_rx_delivered(404);
+    c.record_rx_delivered(505);
+    c.record_tx_dropped_no_rx_buffer();
+    c.record_tx_dropped_no_rx_buffer();
+    c.record_tx_dropped_no_rx_buffer();
+    c.record_tx_dropped_no_rx_buffer();
+    c.record_tx_chain_invalid();
+    c.record_tx_chain_invalid();
+    c.record_tx_chain_invalid();
+    c.record_tx_chain_invalid();
+    c.record_tx_chain_invalid();
+    c.record_rx_chain_invalid();
+    c.record_rx_chain_invalid();
+    c.record_rx_chain_invalid();
+    c.record_rx_chain_invalid();
+    c.record_rx_chain_invalid();
+    c.record_rx_chain_invalid();
+    for _ in 0..7 {
+        c.record_rx_write_failed();
+    }
+    for _ in 0..8 {
+        c.record_tx_add_used_failure();
+    }
+    for _ in 0..9 {
+        c.record_rx_add_used_failure();
+    }
+    for _ in 0..10 {
+        c.record_invalid_avail_idx();
+    }
+
+    let s = c.snapshot();
+    assert_eq!(s.tx_packets, 2, "tx_packets source-of-truth check");
+    assert_eq!(s.tx_bytes, 303, "tx_bytes source-of-truth check (101+202)");
+    assert_eq!(s.rx_packets, 3, "rx_packets source-of-truth check");
+    assert_eq!(
+        s.rx_bytes, 1212,
+        "rx_bytes source-of-truth check (303+404+505)"
+    );
+    assert_eq!(
+        s.tx_dropped_no_rx_buffer, 4,
+        "tx_dropped_no_rx_buffer source-of-truth check"
+    );
+    assert_eq!(
+        s.tx_chain_invalid, 5,
+        "tx_chain_invalid source-of-truth check"
+    );
+    assert_eq!(
+        s.rx_chain_invalid, 6,
+        "rx_chain_invalid source-of-truth check"
+    );
+    assert_eq!(
+        s.rx_write_failed, 7,
+        "rx_write_failed source-of-truth check"
+    );
+    assert_eq!(
+        s.tx_add_used_failures, 8,
+        "tx_add_used_failures source-of-truth check"
+    );
+    assert_eq!(
+        s.rx_add_used_failures, 9,
+        "rx_add_used_failures source-of-truth check"
+    );
+    assert_eq!(
+        s.invalid_avail_idx_count, 10,
+        "invalid_avail_idx_count source-of-truth check"
+    );
+}
+
+/// Pin the all-zero Default snapshot: a future field added to
+/// `VirtioNetCountersSnapshot` that doesn't initialise to 0 would
+/// break the "fresh device reports zero activity" contract that
+/// VmResult readers rely on. Parity with the virtio-blk-side
+/// default-zero pin in `src/vmm/result.rs`.
+#[test]
+fn default_snapshot_is_all_zero() {
+    let s = VirtioNetCountersSnapshot::default();
+    assert_eq!(s.tx_packets, 0);
+    assert_eq!(s.tx_bytes, 0);
+    assert_eq!(s.rx_packets, 0);
+    assert_eq!(s.rx_bytes, 0);
+    assert_eq!(s.tx_dropped_no_rx_buffer, 0);
+    assert_eq!(s.tx_chain_invalid, 0);
+    assert_eq!(s.rx_chain_invalid, 0);
+    assert_eq!(s.rx_write_failed, 0);
+    assert_eq!(s.tx_add_used_failures, 0);
+    assert_eq!(s.rx_add_used_failures, 0);
+    assert_eq!(s.invalid_avail_idx_count, 0);
+}

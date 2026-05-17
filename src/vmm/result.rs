@@ -21,8 +21,8 @@ use super::host_comms::BulkDrainResult;
 use super::kvm;
 use super::pi_mutex::PiMutex;
 use super::vcpu::{VcpuThread, WatchpointArm};
-use super::virtio_blk::VirtioBlkCounters;
-use super::virtio_net::VirtioNetCounters;
+use super::virtio_blk::{VirtioBlkCounters, VirtioBlkCountersSnapshot};
+use super::virtio_net::{VirtioNetCounters, VirtioNetCountersSnapshot};
 use super::wire;
 use crate::monitor;
 
@@ -86,18 +86,19 @@ pub struct VmResult {
     /// [`SidecarResult`](crate::test_support::SidecarResult) so stats
     /// tooling can flag cleanup regressions across runs.
     pub cleanup_duration: Option<Duration>,
-    /// Host-side virtio-blk device counters, sampled after the guest
-    /// has exited. `Some(_)` when the builder attached a disk via
-    /// [`super::KtstrVmBuilder::disk`]; `None` when no disk was
+    /// Host-side virtio-blk device counters, snapshotted after the
+    /// guest has exited. `Some(_)` when the builder attached a disk
+    /// via [`super::KtstrVmBuilder::disk`]; `None` when no disk was
     /// configured and [`super::KtstrVm::init_virtio_blk`] returned
-    /// `None`. The Arc is the same handle the device increments
-    /// from `drain_bracket_impl` (production cfg: on the dedicated
-    /// `ktstr-vblk` worker thread; cfg(test): inline on the test
-    /// thread) — by the time `collect_results` constructs the
-    /// [`VmResult`] every vCPU and the worker have joined and no
-    /// further mutation occurs, so a single
-    /// `.load(Ordering::Relaxed)` per field on the consumer side
-    /// observes the final cumulative totals.
+    /// `None`. The device increments its internal `AtomicU64`
+    /// counters from `drain_bracket_impl` (production cfg: on the
+    /// dedicated `ktstr-vblk` worker thread; cfg(test): inline on
+    /// the test thread); by the time `collect_results` constructs
+    /// the [`VmResult`] every vCPU and the worker have joined and
+    /// no further mutation can occur. The snapshot is taken at that
+    /// point — readers see plain `u64` fields holding the final
+    /// cumulative totals; no atomic load is needed on the consumer
+    /// side.
     ///
     /// The counter struct exposes nine `AtomicU64` fields, each
     /// bumped from `drain_bracket_impl` (in `src/vmm/virtio_blk/device.rs`)
@@ -152,16 +153,17 @@ pub struct VmResult {
     /// Counters are cumulative for the device's lifetime. A guest
     /// driver re-bind (writing `STATUS=0` to `VIRTIO_MMIO_STATUS`
     /// triggers `VirtioBlk::reset`) does NOT zero them — the
-    /// counters Arc is shared across reset cycles and an operator
-    /// observes a monotonically non-decreasing series spanning the
-    /// entire device lifetime, not just a post-reset fragment.
+    /// device's internal `AtomicU64` storage persists across reset
+    /// cycles, and the post-exit snapshot captures the final
+    /// cumulative totals spanning the entire device lifetime, not
+    /// just a post-reset fragment.
     ///
     /// Reading example:
     ///
     /// ```ignore
     /// let r: VmResult = builder.run()?;
     /// let c = r.virtio_blk_counters.expect("disk attached");
-    /// assert!(c.reads_completed() > 0);
+    /// assert!(c.reads_completed > 0);
     /// ```
     ///
     /// `#[allow(dead_code)]` mirrors `stimulus_events` above: the
@@ -171,17 +173,19 @@ pub struct VmResult {
     /// `.virtio_blk_counters` on a `VmResult`. The in-tree readers
     /// live in unit tests.
     #[allow(dead_code)]
-    pub virtio_blk_counters: Option<Arc<VirtioBlkCounters>>,
-    /// Host-side virtio-net device counters, sampled after the guest
-    /// has exited. `Some(_)` when the builder attached a network via
-    /// [`super::KtstrVmBuilder::network`]; `None` when no network was
-    /// configured and [`super::KtstrVm::init_virtio_net`] returned
-    /// `None`. The Arc is the same handle the device increments on
-    /// the vCPU thread inside `process_tx_loopback` — by the time
+    pub virtio_blk_counters: Option<VirtioBlkCountersSnapshot>,
+    /// Host-side virtio-net device counters, snapshotted after the
+    /// guest has exited. `Some(_)` when the builder attached a
+    /// network via [`super::KtstrVmBuilder::network`]; `None` when
+    /// no network was configured and
+    /// [`super::KtstrVm::init_virtio_net`] returned `None`. The
+    /// device increments its internal `AtomicU64` counters on the
+    /// vCPU thread inside `process_tx_loopback`; by the time
     /// `collect_results` constructs the [`VmResult`] every vCPU has
-    /// joined and no further mutation occurs, so a single
-    /// `.load(Ordering::Relaxed)` per field on the consumer side
-    /// observes the final cumulative totals.
+    /// joined and no further mutation can occur. The snapshot is
+    /// taken at that point — readers see plain `u64` fields holding
+    /// the final cumulative totals; no atomic load is needed on the
+    /// consumer side.
     ///
     /// The counter struct exposes eleven `AtomicU64` fields, each
     /// bumped from `process_tx_loopback`:
@@ -228,7 +232,7 @@ pub struct VmResult {
     /// Counters are cumulative for the device's lifetime — a guest
     /// driver re-bind (writing `STATUS=0`) does NOT zero them.
     #[allow(dead_code)]
-    pub virtio_net_counters: Option<Arc<VirtioNetCounters>>,
+    pub virtio_net_counters: Option<VirtioNetCountersSnapshot>,
     /// Snapshot bridge populated by the freeze coordinator over the
     /// run's lifetime. Every `Op::Snapshot` and `Op::WatchSnapshot`
     /// fire stores a `FailureDumpReport` keyed by its tag.
@@ -464,18 +468,23 @@ pub(crate) struct VmRunState {
     pub(crate) cleanup_start: Instant,
     /// Cloned counter handle from [`super::KtstrVm::init_virtio_blk`]
     /// when a disk was attached, captured before the device-arc is
-    /// dropped so [`super::KtstrVm::collect_results`] can plumb it
-    /// onto [`VmResult::virtio_blk_counters`]. The device increments
-    /// these counters on the vCPU thread during request processing;
-    /// by the time `collect_results` reads this field every vCPU
-    /// thread has joined, so the Arc holds the final cumulative
-    /// totals.
+    /// dropped so [`super::KtstrVm::collect_results`] can snapshot
+    /// it into [`VmResult::virtio_blk_counters`]. The device worker
+    /// bumps these atomics from `drain_bracket_impl` (production cfg:
+    /// dedicated `ktstr-vblk` thread; cfg(test): inline on the test
+    /// thread); by the time `collect_results` reads this field every
+    /// vCPU thread has joined upstream, the worker can receive no
+    /// further kicks, and the conversion site
+    /// (`run.virtio_blk_counters.as_deref().map(|c| c.snapshot())`)
+    /// loads the final cumulative state into a plain-u64 snapshot
+    /// before storing on the public `VmResult`.
     pub(crate) virtio_blk_counters: Option<Arc<VirtioBlkCounters>>,
     /// Cloned counter handle from [`super::KtstrVm::init_virtio_net`]
-    /// when a network was attached, captured before the device-arc is
-    /// dropped so [`super::KtstrVm::collect_results`] can plumb it
-    /// onto [`VmResult::virtio_net_counters`]. Same Arc-handoff
-    /// pattern as `virtio_blk_counters` above.
+    /// when a network was attached, captured before the device-arc
+    /// is dropped so [`super::KtstrVm::collect_results`] can
+    /// snapshot it into [`VmResult::virtio_net_counters`]. Same
+    /// Arc-handoff + snapshot-at-assignment pattern as
+    /// `virtio_blk_counters` above.
     pub(crate) virtio_net_counters: Option<Arc<VirtioNetCounters>>,
     /// Snapshot bridge owning every report captured during the run.
     /// The freeze coordinator clones this bridge into its closure
@@ -562,7 +571,6 @@ pub(crate) struct VmRunState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::Ordering;
 
     #[test]
     fn vm_result_fields_carry_values() {
@@ -616,7 +624,7 @@ mod tests {
             kvm_stats: None,
             crash_message: None,
             cleanup_duration: None,
-            virtio_blk_counters: Some(Arc::new(VirtioBlkCounters::default())),
+            virtio_blk_counters: Some(VirtioBlkCountersSnapshot::default()),
             virtio_net_counters: None,
             snapshot_bridge: empty_snapshot_bridge_for_tests(),
             stats_client: None,
@@ -630,21 +638,22 @@ mod tests {
         assert!(r2.cleanup_duration.is_none());
         // Opposite polarity: counters present. Reads must observe
         // the default-zero values for every field — a future field
-        // added to VirtioBlkCounters that doesn't initialise to 0
-        // would break the "fresh device reports zero activity"
-        // contract that VmResult readers rely on. The Arc handle is
-        // the same one `init_virtio_blk` clones onto `VmRunState`,
-        // so test code that wants to assert on disk activity calls
-        // `.load()` on each counter through this field after the VM
-        // exits.
+        // added to VirtioBlkCountersSnapshot that doesn't initialise
+        // to 0 would break the "fresh device reports zero activity"
+        // contract that VmResult readers rely on. The snapshot was
+        // taken from the device's atomic counters at collect_results
+        // time, after every vCPU and worker thread joined; readers
+        // see plain `u64` field reads with no atomic ordering needed.
         let counters = r2.virtio_blk_counters.as_ref().unwrap();
-        assert_eq!(counters.reads_completed.load(Ordering::Relaxed), 0,);
-        assert_eq!(counters.writes_completed.load(Ordering::Relaxed), 0,);
-        assert_eq!(counters.flushes_completed.load(Ordering::Relaxed), 0,);
-        assert_eq!(counters.bytes_read.load(Ordering::Relaxed), 0,);
-        assert_eq!(counters.bytes_written.load(Ordering::Relaxed), 0,);
-        assert_eq!(counters.throttled_count.load(Ordering::Relaxed), 0,);
-        assert_eq!(counters.io_errors.load(Ordering::Relaxed), 0,);
+        assert_eq!(counters.reads_completed, 0);
+        assert_eq!(counters.writes_completed, 0);
+        assert_eq!(counters.flushes_completed, 0);
+        assert_eq!(counters.bytes_read, 0);
+        assert_eq!(counters.bytes_written, 0);
+        assert_eq!(counters.throttled_count, 0);
+        assert_eq!(counters.io_errors, 0);
+        assert_eq!(counters.currently_throttled_gauge, 0);
+        assert_eq!(counters.invalid_avail_idx_count, 0);
     }
 
     #[test]

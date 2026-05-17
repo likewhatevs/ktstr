@@ -710,8 +710,7 @@ pub mod prelude {
     // `ktstr_test_early_dispatch`, `run_ktstr_test`,
     // `resolve_scheduler`, `resolve_test_kernel`.
     pub use crate::topology::{LlcInfo, NodeMemInfo, TestTopology};
-    pub use crate::vmm::VirtioBlkCounters;
-    pub use crate::vmm::VirtioNetCounters;
+    pub use crate::vmm::{VirtioBlkCountersSnapshot, VirtioNetCountersSnapshot};
     // `VmResult` is the host-side return value from booting a VM.
     // Surfaced for `#[ktstr_test(post_vm = ...)]` callbacks: the
     // hook signature is `fn(&VmResult) -> anyhow::Result<()>`, and

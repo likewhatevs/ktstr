@@ -834,10 +834,10 @@ mod tests {
         {
             use gix::config::tree::gitoxide;
             let mut cfg = gix::config::File::new(gix::config::file::Metadata::api());
-            cfg.set_raw_value(&gitoxide::Author::NAME_FALLBACK, "ktstr-test")
+            cfg.set_raw_value(gitoxide::Author::NAME_FALLBACK, "ktstr-test")
                 .expect("set author name fallback");
             cfg.set_raw_value(
-                &gitoxide::Author::EMAIL_FALLBACK,
+                gitoxide::Author::EMAIL_FALLBACK,
                 "ktstr-test@example.invalid",
             )
             .expect("set author email fallback");
