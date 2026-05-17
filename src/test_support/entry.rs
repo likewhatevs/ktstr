@@ -1653,6 +1653,7 @@ impl SchedulerJson {
     }
 }
 
+::ctor::declarative::ctor! {
 /// Ctor that intercepts `--ktstr-list-schedulers` before `main()` runs.
 /// Walks [`KTSTR_SCHEDULERS`], serializes each entry to JSON via
 /// [`SchedulerJson::from_scheduler`], prints the resulting array on
@@ -1660,7 +1661,7 @@ impl SchedulerJson {
 ///
 /// One ctor per binary, regardless of how many schedulers the binary
 /// registers — walks the slice once and emits a single JSON array.
-#[::ctor::ctor(unsafe, crate_path = ::ctor)]
+#[ctor(unsafe)]
 fn __ktstr_list_schedulers() {
     if !std::env::args().any(|a| a == "--ktstr-list-schedulers") {
         return;
@@ -1672,6 +1673,7 @@ fn __ktstr_list_schedulers() {
     let json = ::serde_json::to_string(&entries).expect("serialize schedulers");
     println!("{json}");
     std::process::exit(0);
+}
 }
 
 #[cfg(test)]

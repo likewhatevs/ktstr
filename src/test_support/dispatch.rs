@@ -431,6 +431,7 @@ pub fn sanitize_kernel_label(raw: &str) -> String {
     out
 }
 
+ctor::declarative::ctor! {
 /// Early dispatch for `#[ktstr_test]` test execution.
 ///
 /// Runs before `main()` in any binary that links against ktstr.
@@ -447,7 +448,7 @@ pub fn sanitize_kernel_label(raw: &str) -> String {
 ///   under nextest (`NEXTEST` env var set), delegates to [`ktstr_main`].
 /// - Otherwise: no-op (falls through to the standard test harness).
 #[doc(hidden)]
-#[ctor::ctor(unsafe)]
+#[ctor(unsafe)]
 pub fn ktstr_test_early_dispatch() {
     // PID 1: the binary is /init in the VM. Perform full init lifecycle
     // (mounts, scheduler, test dispatch, reboot). Never returns.
@@ -644,6 +645,7 @@ pub fn ktstr_test_early_dispatch() {
             }
         }
     }
+}
 }
 
 /// Predicate for "this entry is a unit-test sentinel, not a real

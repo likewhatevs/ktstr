@@ -375,6 +375,7 @@ fn is_coverage_instrumented_binary() -> bool {
     matches!(vaddrs[0], Some(v) if v != 0)
 }
 
+ctor::declarative::ctor! {
 /// Set `LLVM_PROFILE_FILE` to the workspace-local target directory
 /// before the LLVM compiler-rt runtime reads it.
 ///
@@ -410,7 +411,7 @@ fn is_coverage_instrumented_binary() -> bool {
 /// `setenv`) is safe here. The priority retains the .init_array.0
 /// placement that the compiler-rt ordering above depends on; other
 /// platforms would need re-validation.
-#[ctor::ctor(unsafe, priority = 0)]
+#[ctor(unsafe, priority = 0)]
 fn redirect_default_profraw_path() {
     // Cheap precondition checks first — pid (one syscall) and env
     // (one var_os call) — so the ELF parse only runs in the
@@ -439,6 +440,7 @@ fn redirect_default_profraw_path() {
             std::env::set_var("LLVM_PROFILE_FILE", &pattern);
         }
     }
+}
 }
 
 #[cfg(test)]

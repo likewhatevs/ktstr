@@ -25,6 +25,7 @@ use ktstr::worker_ready_wait::wait_for_worker_ready;
 // Probe-binary env var setup
 // ---------------------------------------------------------------------------
 
+::ktstr::__private::ctor::declarative::ctor! {
 /// Run at static init before `#[ktstr_test]` macros register
 /// their entries. Sets `KTSTR_JEMALLOC_PROBE_BINARY` to the absolute
 /// host path of `ktstr-jemalloc-probe` so the ktstr test harness
@@ -37,7 +38,7 @@ use ktstr::worker_ready_wait::wait_for_worker_ready;
 /// under edition 2024 because it races with concurrent env reads;
 /// ctors run before any thread spawns, so the call is race-free in
 /// practice.
-#[::ktstr::__private::ctor::ctor(unsafe, crate_path = ::ktstr::__private::ctor)]
+#[ctor(unsafe)]
 fn set_probe_binary_env_var() {
     unsafe {
         std::env::set_var(
@@ -49,6 +50,7 @@ fn set_probe_binary_env_var() {
             env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker"),
         );
     }
+}
 }
 
 // ---------------------------------------------------------------------------
