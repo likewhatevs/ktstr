@@ -280,6 +280,17 @@ impl KtstrKvm {
 
             let mut vcpu_kvi = kvi;
             if cpu_id != 0 {
+                // Secondary vCPUs start POWER_OFF — the guest brings
+                // them up sequentially via PSCI CPU_ON. arm64 still
+                // boots secondaries one at a time because
+                // arch/arm64/Kconfig does not `select HOTPLUG_PARALLEL`
+                // as of Linux v7.0; the generic infra at kernel/cpu.c
+                // is arch-neutral but waits for the arch to opt in.
+                // When arm64 lands the select (re-grep
+                // `arch/arm64/Kconfig` annually for HOTPLUG_PARALLEL),
+                // ktstr can bump the arm64 CI matrix minimum kernel
+                // version to the release that ships the change and
+                // expect faster VM boots at high vCPU counts.
                 vcpu_kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_POWER_OFF;
             }
             // KVM_ARM_VCPU_INIT allocates the per-vCPU register

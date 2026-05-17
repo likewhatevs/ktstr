@@ -213,6 +213,15 @@ impl SdtAllocOffsets {
     /// `lib/sdt_task_defs.h` makes this size invariant (it's the only
     /// non-flex-array member), so the fallback is correct without BTF
     /// involvement.
+    ///
+    /// # Panics
+    ///
+    /// `Struct::size()` calls below panic if the matched
+    /// `Type::Struct(...)` record has a kind-vs-size-field skew —
+    /// structurally invalid BTF that the producer (BPF object's
+    /// program BTF) emitted. Malformed program BTF is a build-time
+    /// bug in the scheduler's BPF, not a runtime recovery case;
+    /// the panic points the operator at the BPF producer.
     pub fn from_btf(btf: &Btf) -> Result<Self> {
         let allocator = require_full_struct(btf, "scx_allocator").context(
             "btf: struct scx_allocator unavailable (scheduler doesn't link sdt_alloc, or BTF only carries a forward declaration)"
