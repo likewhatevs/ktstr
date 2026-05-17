@@ -1258,7 +1258,7 @@ impl WorkloadConfig {
 /// Workload definition for a single group of workers within a cgroup.
 ///
 /// Extracted from [`CgroupDef`](crate::scenario::ops::CgroupDef) to allow
-/// multiple concurrent work groups per cgroup. Each `WorkSpec` spawns its own
+/// multiple concurrent work groups per cgroup. Each [`WorkSpec`] spawns its own
 /// set of worker processes.
 ///
 /// ```
@@ -1291,7 +1291,7 @@ pub struct WorkSpec {
     /// antagonist with 4 spinners alongside a victim with 1
     /// SCHED_FIFO worker). For that reason `CgroupDef` does NOT
     /// expose a cgroup-level default for `num_workers` — multi-group
-    /// cgroups set the count per-`WorkSpec` here.
+    /// cgroups set the count per-[`WorkSpec`] here.
     pub num_workers: Option<usize>,
     /// Per-worker affinity intent. Resolved to `ResolvedAffinity` at
     /// runtime via [`resolve_affinity_for_cgroup()`](crate::scenario::resolve_affinity_for_cgroup).
@@ -1304,7 +1304,7 @@ pub struct WorkSpec {
     /// cgroup-level default would mask per-group failures with
     /// confusing diagnostics — `CgroupDef` deliberately does not
     /// expose a cgroup-level default for `mem_policy`; multi-group
-    /// cgroups set it per-`WorkSpec` here.
+    /// cgroups set it per-[`WorkSpec`] here.
     pub mem_policy: MemPolicy,
     /// Optional mode flags for `set_mempolicy(2)`.
     pub mpol_flags: MpolFlags,
@@ -1490,7 +1490,7 @@ impl WorkSpec {
     /// Rejects a computed count of zero (e.g. empty cpuset, or
     /// fraction so small it rounds down) with an actionable diagnostic
     /// naming the cgroup, the cpuset size, and the requested fraction.
-    /// Returns the original `WorkSpec` unchanged when `workers_pct` is
+    /// Returns the original [`WorkSpec`] unchanged when `workers_pct` is
     /// `None`.
     pub(crate) fn resolve_workers_pct(
         mut self,

@@ -732,7 +732,7 @@ fn polarity_label(p: crate::test_support::Polarity) -> String {
 
 /// Per-scenario result row for gauntlet analysis and run-to-run comparison.
 ///
-/// Populated by [`sidecar_to_row`] from on-disk `SidecarResult`s. The
+/// Populated by [`sidecar_to_row`] from on-disk [`SidecarResult`](crate::test_support::SidecarResult)s. The
 /// comparison pipeline reads metric values through [`MetricDef::read`]
 /// / [`METRICS`] rather than dereferencing fields directly so new
 /// metrics can land through the registry without touching every
@@ -807,7 +807,7 @@ pub struct GauntletRow {
     /// Sourced from `SidecarResult::project_commit`; shortened to
     /// `commit` on the row because the project commit is the
     /// most-frequently-narrowed-on of the three commit dimensions
-    /// on `SidecarResult`. The other two commit fields —
+    /// on [`SidecarResult`](crate::test_support::SidecarResult). The other two commit fields —
     /// `SidecarResult::scheduler_commit` and
     /// `SidecarResult::kernel_commit` — get fully-qualified names
     /// here (`scheduler_commit` is reserved and not yet exposed,

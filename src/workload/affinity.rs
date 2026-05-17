@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 ///
 /// Resolved to a concrete [`ResolvedAffinity`] at runtime based on the
 /// cgroup's effective cpuset and the VM's topology. When attached to
-/// a `WorkSpec`, determines per-worker `sched_setaffinity` masks.
+/// a [`WorkSpec`](crate::workload::WorkSpec), determines per-worker `sched_setaffinity` masks.
 ///
 /// Resolution uses [`resolve_affinity_for_cgroup()`](crate::scenario::resolve_affinity_for_cgroup).
 ///

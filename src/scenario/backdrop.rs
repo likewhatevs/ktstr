@@ -113,7 +113,7 @@ pub struct Backdrop {
     ///
     /// Cgroups are created in DECLARATION ORDER — the order they
     /// appear in this `Vec`. The Backdrop setup phase iterates
-    /// `cgroups` front-to-back and runs each `CgroupDef`'s setup
+    /// `cgroups` front-to-back and runs each [`CgroupDef`](crate::scenario::ops::CgroupDef)'s setup
     /// (`mkdir`, cpuset/sysfs writes, worker spawn) one at a time.
     /// `push_cgroup(a).push_cgroup(b)` creates `a` first, then `b`.
     ///

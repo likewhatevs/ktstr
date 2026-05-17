@@ -445,7 +445,7 @@ impl<'a, 'b> ScenarioState<'a, 'b> {
     /// True iff a cgroup with the given name is already tracked by
     /// either step-local or backdrop state. Used to reject duplicate
     /// names at `apply_setup` time so a user can't accidentally
-    /// shadow a Backdrop cgroup with a step-local `CgroupDef`.
+    /// shadow a Backdrop cgroup with a step-local [`CgroupDef`].
     fn cgroup_name_is_tracked(&self, name: &str) -> bool {
         self.step.cgroups.names().iter().any(|n| n == name)
             || self.backdrop.cgroups.names().iter().any(|n| n == name)
@@ -1562,7 +1562,7 @@ fn validate_mempolicy_cpuset(
 ///
 /// Cgroups created here route into step-local or backdrop state per
 /// `state.target_backdrop`. A duplicate name (already tracked by
-/// either state) bails — a `CgroupDef` must not silently shadow a
+/// either state) bails — a [`CgroupDef`] must not silently shadow a
 /// cgroup that another state slot has already created.
 fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef]) -> Result<()> {
     for def in defs {
@@ -4101,6 +4101,88 @@ mod tests {
              the apply_ops Err was swallowed and the Loop arm continued, \
              which would also bypass the drain_on_err! payload-kill path \
              (silent metric loss).",
+        );
+    }
+
+    /// Loop-arm `drain_on_err!` invokes `.kill()` on every live
+    /// payload handle when `apply_ops` returns Err mid-iteration,
+    /// rather than letting `PayloadHandle::Drop` SIGKILL them via
+    /// the process-group fallback. The two paths differ in
+    /// observable behavior at `payload_run.rs::PayloadHandle::drop`:
+    /// `.kill()` calls `self.child.take()` before reaping, so by the
+    /// time Drop runs `self.child.is_none()` and the diagnostic
+    /// `eprintln!("ktstr: PayloadHandle for 'X' dropped without
+    /// wait/kill — process group SIGKILLed, metrics not recorded.")`
+    /// does NOT fire. If `drain_on_err!` regressed to a bare `?`-out
+    /// (or any path that doesn't drain), Drop would see
+    /// `self.child.is_some()`, fire the eprintln, and the captured
+    /// stderr would contain "dropped without wait/kill".
+    ///
+    /// Pairs with `holdspec_loop_arm_propagates_apply_ops_error`:
+    /// that test verifies Err PROPAGATION via the macro (loop stops,
+    /// passed=false, exactly 2 SetCpuset calls). This test verifies
+    /// the SIDE EFFECT (kill-not-Drop) using a live `/bin/sleep`
+    /// fixture spawned by `Op::run_payload`. Both tests must pass —
+    /// drain_on_err! must both propagate Err AND drain payloads, and
+    /// covering only one half misses regressions in the other.
+    #[test]
+    fn holdspec_loop_arm_drain_on_err_kills_live_payload_via_kill_not_drop() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static SLEEP: Payload = Payload {
+            name: "drain_on_err_observer",
+            kind: PayloadKind::Binary("/bin/sleep"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
+            metric_bounds: None,
+        };
+
+        let mock = MockCgroupOps::new();
+        // Index sequence (cgroup-op counts only):
+        //   0 = run_scenario Setup (mod.rs:706-708)
+        //   1 = iter-1 SetCpuset (Ok)
+        //   2 = iter-2 SetCpuset (Err injected here)
+        // Op::run_payload without an explicit cgroup arg does NOT go
+        // through MockCgroupOps — the SLEEP child spawns directly,
+        // so it's live in state.payload_handles when the iter-2
+        // SetCpuset Err triggers drain_on_err!.
+        mock.fail_call_at(2, "injected SetCpuset error to trigger drain_on_err");
+        let topo = mock_topo();
+        let mut ctx = mock_ctx(&mock, &topo);
+        // Wide enough for iter-2 to reach the SetCpuset failure point
+        // at the 30ms interval below; the Err short-circuits the
+        // remaining iterations.
+        ctx.duration = Duration::from_millis(200);
+
+        let steps = vec![Step::new(
+            vec![
+                Op::run_payload(&SLEEP, vec!["3600".into()]),
+                Op::set_cpuset("drain_observer_cg", CpusetSpec::Llc(0)),
+            ],
+            HoldSpec::loop_at(Duration::from_millis(30)),
+        )];
+
+        let (_, captured_stderr) =
+            crate::test_support::test_helpers::capture_stderr(|| {
+                let _ = execute_steps(&ctx, steps).expect(
+                    "execute_steps converts step Err to Ok(passed=false); the \
+                     Err must NOT propagate to the caller",
+                );
+            });
+
+        let stderr_text = String::from_utf8_lossy(&captured_stderr);
+        assert!(
+            !stderr_text.contains("dropped without wait/kill"),
+            "drain_on_err! must invoke .kill() on every live payload \
+             handle, not let them fall through to PayloadHandle::Drop's \
+             process-group SIGKILL. Observed the Drop-path eprintln in \
+             captured stderr — drain_on_err! regressed (Err propagated \
+             but payloads were leaked to Drop). Full captured stderr: \
+             {stderr_text:?}",
         );
     }
 
@@ -7524,7 +7606,7 @@ mod tests {
         );
     }
 
-    /// `Op::add_cgroup_def(def)` constructor wraps the `CgroupDef`
+    /// `Op::add_cgroup_def(def)` constructor wraps the [`CgroupDef`]
     /// in the `AddCgroupDef` variant without mutation. Pins the
     /// constructor contract so a future refactor that, e.g., merges
     /// AddCgroup and AddCgroupDef into one variant or splits the def
@@ -7597,7 +7679,7 @@ mod tests {
     }
 
     /// `required_controllers` picks up the controllers needed by a
-    /// `CgroupDef` embedded in `Op::AddCgroupDef`, so the parent's
+    /// [`CgroupDef`] embedded in `Op::AddCgroupDef`, so the parent's
     /// `subtree_control` enables Cpuset before the op runs and the
     /// cpuset write at apply-ops time doesn't fail with ENOENT on
     /// the controller file. Without this absorb pass, a scenario
@@ -8874,7 +8956,7 @@ mod tests {
 
     /// Empty `works` substitution: a `CgroupDef` declared without a
     /// `.work(...)` or `.workload(...)` call falls back to a single
-    /// default `WorkSpec` (SpinWait, Normal, ctx.workers_per_cgroup
+    /// default [`WorkSpec`](crate::workload::WorkSpec) (SpinWait, Normal, ctx.workers_per_cgroup
     /// workers) at apply-setup time. Pin the substitution by
     /// asserting that workers were spawned and migrated into the
     /// cgroup — without the fallback, no MoveTasks call would fire
@@ -9197,7 +9279,7 @@ mod tests {
     /// `apply_setup` like any other 0-worker cgroup. The pcomm
     /// path receives no exception: `resolve_num_workers` runs
     /// before pcomm dispatch and rejects `num_workers=0`
-    /// because a worker-less cgroup emits no `WorkerReport`s,
+    /// because a worker-less cgroup emits no [`WorkerReport`](crate::workload::WorkerReport)s,
     /// vacuously passing every downstream assertion. The
     /// rejection error names the cgroup and the offending
     /// field so a typo'd worker count surfaces at setup
@@ -9645,7 +9727,7 @@ mod tests {
     /// (~`1.844e19` on 64-bit), so the cast saturates.
     ///
     /// Calls `resolve_workers_pct` directly on a constructed
-    /// `WorkSpec` — pins the FRAMEWORK contract (current behavior
+    /// [`WorkSpec`](crate::workload::WorkSpec) — pins the FRAMEWORK contract (current behavior
     /// returns `Ok(num_workers=Some(usize::MAX))`). A future
     /// regression that added a saturation guard
     /// (e.g. `if scaled == usize::MAX { bail!("too large") }`)
@@ -9668,7 +9750,7 @@ mod tests {
         );
     }
 
-    /// Empty cpuset + MULTIPLE `WorkSpec`s with distinct `workers_pct`
+    /// Empty cpuset + MULTIPLE [`WorkSpec`](crate::workload::WorkSpec)s with distinct `workers_pct`
     /// values: the diagnostic must enumerate ALL pct values, not just
     /// the first. An earlier diagnostic used
     /// `find_map(|w| w.workers_pct)` which dropped subsequent pcts and
@@ -9698,7 +9780,7 @@ mod tests {
         cleanup_state(&mut state);
     }
 
-    /// Empty cpuset + a single `WorkSpec` that sets BOTH `workers(N)`
+    /// Empty cpuset + a single [`WorkSpec`](crate::workload::WorkSpec) that sets BOTH `workers(N)`
     /// AND `workers_pct(p)`: the framework must emit a dual-set-specific
     /// bail (the more fundamental misconfiguration) rather than letting
     /// validate's empty-Exact mask preempt it OR the workers_pct-only

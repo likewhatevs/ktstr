@@ -59,7 +59,7 @@ use crate::test_support::{
 ///
 /// Increments once per `.run()` / `.wait()` / `.kill()` /
 /// `.try_wait()` terminal call (whichever produces the
-/// `PayloadMetrics` emission). Each guest VM is a fresh process, so
+/// [`PayloadMetrics`](crate::test_support::PayloadMetrics) emission). Each guest VM is a fresh process, so
 /// the counter starts at 0 every test boot. Stamped onto both
 /// [`PayloadMetrics::payload_index`] and
 /// [`crate::test_support::RawPayloadOutput::payload_index`] so the
@@ -313,7 +313,7 @@ fn payload_binary(payload: &Payload) -> Result<&'static str> {
 
 /// Common post-exit pipeline: extract metrics, resolve polarities,
 /// evaluate checks. Shared between foreground `.run()` and
-/// background handle `wait`/`kill` paths. The `PayloadMetrics` is
+/// background handle `wait`/`kill` paths. The [`PayloadMetrics`](crate::test_support::PayloadMetrics) is
 /// serialized to the guest-to-host SHM ring here — once per
 /// invocation — so the host can reconstruct per-call provenance in
 /// the sidecar without any Ctx-side accumulator.
@@ -469,7 +469,7 @@ fn emit_raw_payload_output(raw: &crate::test_support::RawPayloadOutput) {
 /// messages emitted by this invocation, runs
 /// [`crate::test_support::model::extract_via_llm`] stdout-primary
 /// with a stderr-fallback retry, and replaces the empty `metrics`
-/// vec on the matched `PayloadMetrics` slot with the extracted
+/// vec on the matched [`PayloadMetrics`](crate::test_support::PayloadMetrics) slot with the extracted
 /// result before the sidecar write.
 ///
 /// Both messages emitted from this invocation carry the SAME
@@ -3675,7 +3675,7 @@ mod tests {
         });
     }
 
-    /// Host-side decode of a guest-emitted `PayloadMetrics` JSON
+    /// Host-side decode of a guest-emitted [`PayloadMetrics`](crate::test_support::PayloadMetrics) JSON
     /// body must round-trip exactly — the SHM transport only carries
     /// bytes, and a schema drift between emit-side (serde_json on a
     /// `PayloadMetrics`) and drain-side (serde_json::from_slice) would
@@ -5261,7 +5261,7 @@ mod tests {
 
     /// `evaluate` on a `LlmExtract` payload must NOT run
     /// `extract_metrics` — the metrics field of the returned
-    /// `PayloadMetrics` MUST be empty regardless of the stdout
+    /// [`PayloadMetrics`](crate::test_support::PayloadMetrics) MUST be empty regardless of the stdout
     /// content. Even when stdout carries a JSON document with
     /// numeric leaves (which `extract_metrics` would happily
     /// extract for an `OutputFormat::Json` payload), the LlmExtract
@@ -5332,7 +5332,7 @@ mod tests {
     }
 
     /// `evaluate` on an LlmExtract payload propagates exit_code and
-    /// stamps it on the returned `PayloadMetrics`. Pins that the
+    /// stamps it on the returned [`PayloadMetrics`](crate::test_support::PayloadMetrics). Pins that the
     /// deferral arm doesn't accidentally zero or stub the exit_code
     /// field — host-side `MetricCheck::ExitCodeEq` evaluation reads this
     /// field, so a regression that lost the exit_code on the

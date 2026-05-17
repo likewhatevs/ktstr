@@ -424,7 +424,7 @@ impl Ctx<'_> {
         )
     }
 
-    /// Construct a `CgroupDef` with `self.workers_per_cgroup`
+    /// Construct a [`CgroupDef`](crate::scenario::ops::CgroupDef) with `self.workers_per_cgroup`
     /// workers — the most common scenario shape, dedupe of 40+
     /// `CgroupDef::named(name).workers(ctx.workers_per_cgroup)` call
     /// sites across `src/scenario/` and `tests/`.
@@ -435,7 +435,7 @@ impl Ctx<'_> {
     /// CgroupDef::named(name).workers(ctx.workers_per_cgroup)
     /// ```
     ///
-    /// Returns a fresh `CgroupDef` so the test author can chain
+    /// Returns a fresh [`CgroupDef`](crate::scenario::ops::CgroupDef) so the test author can chain
     /// further builders (`.cpuset`, `.work`, etc.) on the
     /// result. For non-default worker counts call
     /// `CgroupDef::named(name).workers(N)` directly — the helper
@@ -672,9 +672,9 @@ where
 /// Resolve a [`WorkSpec`]'s `num_workers`, falling back to `default_n` when unset,
 /// and reject `num_workers=0`.
 ///
-/// A cgroup with no workers emits no `WorkerReport`s, so every downstream
+/// A cgroup with no workers emits no [`WorkerReport`](crate::workload::WorkerReport)s, so every downstream
 /// assertion vacuously passes. Callers that want "no load" on a cgroup
-/// should either drop the `WorkSpec` entry entirely (letting the default apply)
+/// should either drop the [`WorkSpec`](crate::workload::WorkSpec) entry entirely (letting the default apply)
 /// or use a single sentinel worker so assertions have something to check.
 pub(crate) fn resolve_num_workers(work: &WorkSpec, default_n: usize, label: &str) -> Result<usize> {
     let n = work.num_workers.unwrap_or(default_n);
@@ -2607,7 +2607,7 @@ mod tests {
         let _ = ctx.settled_hold(f64::NAN);
     }
 
-    /// `ctx.cgroup_def(name)` produces a `CgroupDef` carrying the
+    /// `ctx.cgroup_def(name)` produces a [`CgroupDef`](crate::scenario::ops::CgroupDef) carrying the
     /// builder's `workers_per_cgroup` value verbatim. Pin so a
     /// regression that pulled from a stale field or hardcoded a
     /// literal would surface here.
@@ -2718,7 +2718,7 @@ mod tests {
     }
 
     /// A trailing `.workers(N)` overrides the helper's default —
-    /// produces the same `CgroupDef` as `CgroupDef::named(name).workers(N)`.
+    /// produces the same [`CgroupDef`](crate::scenario::ops::CgroupDef) as [`CgroupDef::named`](crate::scenario::ops::CgroupDef::named)`(name).workers(N)`.
     /// Pin so a regression that appended a SECOND WorkSpec instead
     /// of replacing num_workers on works[0] would surface here.
     #[test]
