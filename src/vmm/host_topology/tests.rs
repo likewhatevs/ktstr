@@ -1158,7 +1158,7 @@ fn resource_lock_exclusive_success() {
     };
     let llc_indices = &[90100usize];
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Exclusive).unwrap();
-    let (llc_offset, locks) = unwrap_acquired(outcome, "");
+    let (llc_offset, locks) = unwrap_acquired(outcome, None);
     assert_eq!(llc_offset, 90100);
     // Exclusive mode: only LLC locks, no per-CPU locks.
     assert_eq!(locks.len(), 1);
@@ -1176,7 +1176,7 @@ fn resource_lock_shared_includes_cpu_locks() {
     let llc_indices = &[90200usize];
 
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Shared).unwrap();
-    let (_, locks) = unwrap_acquired(outcome, "");
+    let (_, locks) = unwrap_acquired(outcome, None);
     // Shared mode: 1 LLC lock + 2 CPU locks = 3 total.
     assert_eq!(locks.len(), 3);
 }
@@ -1193,7 +1193,7 @@ fn resource_lock_shared_with_service_cpu() {
     let llc_indices = &[90300usize];
 
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Shared).unwrap();
-    let (_, locks) = unwrap_acquired(outcome, "");
+    let (_, locks) = unwrap_acquired(outcome, None);
     // 1 LLC lock + 1 assignment CPU lock + 1 service CPU lock = 3.
     assert_eq!(locks.len(), 3);
 }
@@ -1211,7 +1211,7 @@ fn resource_lock_exclusive_skips_cpu_locks() {
     let llc_indices = &[90400usize];
 
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Exclusive).unwrap();
-    let (_, locks) = unwrap_acquired(outcome, "");
+    let (_, locks) = unwrap_acquired(outcome, None);
     // Exclusive: only 1 LLC lock, no CPU locks.
     assert_eq!(locks.len(), 1);
 }
@@ -1234,17 +1234,11 @@ fn resource_lock_contention_returns_unavailable() {
         .unwrap();
 
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Exclusive).unwrap();
-    match outcome {
-        LockOutcome::Unavailable(reason) => {
-            assert!(
-                reason.contains("90500"),
-                "reason should identify the busy LLC: {reason}",
-            );
-        }
-        LockOutcome::Acquired { .. } => {
-            panic!("expected Unavailable while lock is held");
-        }
-    }
+    let reason = expect_unavailable(outcome, Some("while lock is held"));
+    assert!(
+        reason.contains("90500"),
+        "reason should identify the busy LLC: {reason}",
+    );
     drop(holder);
 }
 
@@ -1322,7 +1316,7 @@ fn resource_lock_empty_llc_indices() {
         locks: Vec::new(),
     };
     let outcome = acquire_resource_locks(&plan, &[], LlcLockMode::Exclusive).unwrap();
-    let (llc_offset, locks) = unwrap_acquired(outcome, "");
+    let (llc_offset, locks) = unwrap_acquired(outcome, None);
     assert_eq!(llc_offset, 0);
     assert!(locks.is_empty());
 }
@@ -1347,17 +1341,11 @@ fn resource_lock_service_cpu_contention() {
     let holder = try_flock(&cpu_901, FlockMode::Exclusive).unwrap().unwrap();
 
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Shared).unwrap();
-    match &outcome {
-        LockOutcome::Unavailable(reason) => {
-            assert!(
-                reason.contains("service CPU") && reason.contains("90901"),
-                "reason should mention service CPU 90901: {reason}",
-            );
-        }
-        LockOutcome::Acquired { .. } => {
-            panic!("expected Unavailable when service CPU is held");
-        }
-    }
+    let reason = expect_unavailable(outcome, Some("when service CPU is held"));
+    assert!(
+        reason.contains("service CPU") && reason.contains("90901"),
+        "reason should mention service CPU 90901: {reason}",
+    );
 
     // All prior locks should be released (all-or-nothing).
     let reacquire_llc = try_flock(&llc_path, FlockMode::Shared)
@@ -1775,18 +1763,43 @@ impl Drop for AllowedCpusGuard {
 }
 
 /// Destructure a `LockOutcome::Acquired { llc_offset, locks }` or
-/// panic with a stable diagnostic on `Unavailable`. `ctx` is a
-/// leading-space-prefixed clause that the panic message inlines
-/// after "expected Acquired" — pass `""` for the default site,
-/// `" in cargo-test mode"` etc. for site-specific context.
+/// panic with a stable diagnostic on `Unavailable`. `ctx` is an
+/// optional site-specific clause that the panic message inlines
+/// after "expected Acquired" with a single leading space:
+/// `None` produces `"expected Acquired, got Unavailable: ..."`,
+/// `Some("in cargo-test mode")` produces
+/// `"expected Acquired in cargo-test mode, got Unavailable: ..."`.
+/// The helper owns the space-prefix so callers cannot accidentally
+/// produce `"expected Acquiredfoo"` by forgetting it.
+///
+/// See [`expect_unavailable`] for tests that expect the
+/// `Unavailable` branch instead.
 fn unwrap_acquired(
     outcome: LockOutcome,
-    ctx: &str,
+    ctx: Option<&str>,
 ) -> (usize, Vec<std::os::fd::OwnedFd>) {
     match outcome {
         LockOutcome::Acquired { llc_offset, locks } => (llc_offset, locks),
         LockOutcome::Unavailable(reason) => {
-            panic!("expected Acquired{ctx}, got Unavailable: {reason}")
+            let suffix = ctx.map(|c| format!(" {c}")).unwrap_or_default();
+            panic!("expected Acquired{suffix}, got Unavailable: {reason}")
+        }
+    }
+}
+
+/// Destructure a `LockOutcome::Unavailable(reason)` for tests that
+/// EXPECT the unavailable branch and assert on the reason string.
+/// Panics on `Acquired`. `ctx` follows the same convention as
+/// [`unwrap_acquired`]: `None` produces
+/// `"expected Unavailable, got Acquired"`,
+/// `Some("while lock is held")` produces
+/// `"expected Unavailable while lock is held, got Acquired"`.
+fn expect_unavailable(outcome: LockOutcome, ctx: Option<&str>) -> String {
+    match outcome {
+        LockOutcome::Unavailable(reason) => reason,
+        LockOutcome::Acquired { .. } => {
+            let suffix = ctx.map(|c| format!(" {c}")).unwrap_or_default();
+            panic!("expected Unavailable{suffix}, got Acquired")
         }
     }
 }
@@ -3204,7 +3217,7 @@ fn acquire_resource_locks_cargo_test_mode_bypasses_flock() {
         locks: Vec::new(),
     };
     let outcome = acquire_resource_locks(&plan, &[95100usize], LlcLockMode::Exclusive).unwrap();
-    let (llc_offset, locks) = unwrap_acquired(outcome, " in cargo-test mode");
+    let (llc_offset, locks) = unwrap_acquired(outcome, Some("in cargo-test mode"));
     assert_eq!(llc_offset, 95100);
     assert!(
         locks.is_empty(),
@@ -3232,7 +3245,7 @@ fn acquire_resource_locks_cargo_test_mode_empty_string_inert() {
         locks: Vec::new(),
     };
     let outcome = acquire_resource_locks(&plan, &[95200usize], LlcLockMode::Exclusive).unwrap();
-    let (_, locks) = unwrap_acquired(outcome, " with empty-string bypass inert");
+    let (_, locks) = unwrap_acquired(outcome, Some("with empty-string bypass inert"));
     assert_eq!(
         locks.len(),
         1,
