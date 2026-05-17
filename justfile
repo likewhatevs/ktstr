@@ -53,6 +53,16 @@ docs:
     mdbook build doc/guide
     mdbook test doc/guide
 
+# Build the guide book and validate every internal link / anchor in the
+# rendered HTML via lychee. `--offline` skips external HTTP fetches so
+# the check is deterministic and CI-friendly (no network flakes). Run
+# locally before opening a PR that touches doc/guide/src to catch
+# broken cross-page anchors that mdbook-linkcheck2's pre-render check
+# can miss (e.g. typo'd #fragment refs against post-render heading IDs).
+link-check:
+    mdbook build doc/guide
+    lychee --offline --no-progress doc/guide/book/html
+
 # Build API reference
 api-docs:
     cargo doc --workspace --no-deps
