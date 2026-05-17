@@ -310,38 +310,15 @@ pub(crate) fn format_sched_died_during_workload(elapsed_s: f64) -> String {
 /// A single diagnostic message from an assertion, paired with a
 /// structural [`DetailKind`] so filtering is robust to wording changes.
 ///
-/// `Deref<Target = str>` and `Display` forward to `message` so existing
-/// string-based probes (`d.contains("...")`, `format!("{d}")`) keep
-/// working; new code that needs to filter by category should match on
-/// `kind`.
+/// Access the message text via `detail.message`; format-string probes
+/// (`format!("{detail}")`) work via the `Display` impl. New code that
+/// needs to filter by category should match on `kind` rather than
+/// substring-match the message text — wording can change without
+/// notice but the variant tag is the structural contract.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AssertDetail {
     pub kind: DetailKind,
     pub message: String,
-}
-
-impl PartialEq<&str> for AssertDetail {
-    fn eq(&self, other: &&str) -> bool {
-        self.message == *other
-    }
-}
-
-impl PartialEq<str> for AssertDetail {
-    fn eq(&self, other: &str) -> bool {
-        self.message == *other
-    }
-}
-
-impl PartialEq<String> for AssertDetail {
-    fn eq(&self, other: &String) -> bool {
-        self.message == *other
-    }
-}
-
-impl AsRef<str> for AssertDetail {
-    fn as_ref(&self) -> &str {
-        &self.message
-    }
 }
 
 impl AssertDetail {
@@ -422,13 +399,6 @@ impl From<&str> for AssertDetail {
             kind: DetailKind::Other,
             message: s.to_string(),
         }
-    }
-}
-
-impl std::ops::Deref for AssertDetail {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.message
     }
 }
 

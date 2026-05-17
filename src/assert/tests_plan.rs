@@ -32,7 +32,7 @@ fn plan_check_isolation_with_cpuset() {
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 4], 50)];
     let r = plan.assert_cgroup(&reports, Some(&expected), None);
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| d.contains("unexpected")));
+    assert!(r.details.iter().any(|d| d.message.contains("unexpected")));
 }
 
 #[test]
@@ -60,8 +60,8 @@ fn plan_custom_gap_threshold_fail() {
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 2000)];
     let r = plan.assert_cgroup(&reports, None, None);
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| d.contains("stuck")));
-    assert!(r.details.iter().any(|d| d.contains("threshold 1500ms")));
+    assert!(r.details.iter().any(|d| d.message.contains("stuck")));
+    assert!(r.details.iter().any(|d| d.message.contains("threshold 1500ms")));
 }
 
 #[test]
@@ -183,7 +183,7 @@ fn plan_starved_still_fails_with_custom_gap() {
         !r.passed,
         "starved worker must fail even with relaxed gap threshold"
     );
-    assert!(r.details.iter().any(|d| d.contains("starved")));
+    assert!(r.details.iter().any(|d| d.message.contains("starved")));
     // The gap (1500ms) is below the 5000ms threshold, so no "stuck" detail.
-    assert!(!r.details.iter().any(|d| d.contains("stuck")));
+    assert!(!r.details.iter().any(|d| d.message.contains("stuck")));
 }

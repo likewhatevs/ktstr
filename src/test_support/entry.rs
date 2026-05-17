@@ -3940,7 +3940,14 @@ mod tests {
             from_const.topology.numa_nodes
         );
         assert_eq!(from_trait.memory_mib, from_const.memory_mib);
-        assert!(std::ptr::eq(from_trait.scheduler, from_const.scheduler));
+        // Both default paths delegate to `Self::DEFAULT`, which sets
+        // `scheduler: &Scheduler::EEVDF`. Rust may or may not dedupe
+        // the `&CONST` materializations to the same address — pointer
+        // equality is an implementation detail, not a contract.
+        // Verify the scheduler-identity contract by NAME (the EEVDF
+        // baseline has a unique stable name).
+        assert_eq!(from_trait.scheduler.name, from_const.scheduler.name);
+        assert_eq!(from_trait.scheduler.name, "eevdf");
         assert!(from_trait.payload.is_none() && from_const.payload.is_none());
         // Element-wise slice equality catches same-length content
         // drift (e.g. two different `&["--baseline=X"]` slices both

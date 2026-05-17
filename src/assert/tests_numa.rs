@@ -149,16 +149,16 @@ fn assert_page_locality_fail() {
     let detail = r
         .details
         .iter()
-        .find(|d| d.contains("page locality"))
+        .find(|d| d.message.contains("page locality"))
         .unwrap();
     // Percentage form must accompany the fraction so an operator
     // reading the diagnostic doesn't mentally translate 0.5000 → 50%.
     assert!(
-        detail.contains("50.00%"),
+        detail.message.contains("50.00%"),
         "must include observed %: {detail}"
     );
     assert!(
-        detail.contains("80.00%"),
+        detail.message.contains("80.00%"),
         "must include threshold %: {detail}"
     );
 }
@@ -195,15 +195,15 @@ fn assert_slow_tier_ratio_fail() {
     let nodes: BTreeSet<usize> = [0].into_iter().collect();
     let r = assert_slow_tier_ratio(&pages, 0.5, 100, Some(&nodes));
     assert!(!r.passed);
-    let detail = r.details.iter().find(|d| d.contains("slow-tier")).unwrap();
+    let detail = r.details.iter().find(|d| d.message.contains("slow-tier")).unwrap();
     // 60% slow-tier (node 2 has 60 pages) vs 50% threshold; both
     // surfaces appear so the operator sees raw ratio AND human %.
     assert!(
-        detail.contains("60.00%"),
+        detail.message.contains("60.00%"),
         "must include observed %: {detail}"
     );
     assert!(
-        detail.contains("50.00%"),
+        detail.message.contains("50.00%"),
         "must include threshold %: {detail}"
     );
 }
@@ -369,16 +369,16 @@ fn assert_cross_node_migration_fail() {
     let detail = r
         .details
         .iter()
-        .find(|d| d.contains("cross-node migration"))
+        .find(|d| d.message.contains("cross-node migration"))
         .unwrap();
     // 20% migrated vs 10% threshold; pin both percentage tokens so
     // dropping either form regresses here.
     assert!(
-        detail.contains("20.00%"),
+        detail.message.contains("20.00%"),
         "must include observed %: {detail}"
     );
     assert!(
-        detail.contains("10.00%"),
+        detail.message.contains("10.00%"),
         "must include threshold %: {detail}"
     );
 }
@@ -411,14 +411,14 @@ fn assert_cross_node_migration_inconsistent_zero_total_nonzero_migrated() {
     let detail = r
         .details
         .iter()
-        .find(|d| d.contains("inconsistent"))
+        .find(|d| d.message.contains("inconsistent"))
         .unwrap_or_else(|| panic!("expected inconsistent diagnostic, got {:?}", r.details));
     assert!(
-        detail.contains("5 pages migrated"),
+        detail.message.contains("5 pages migrated"),
         "must surface migrated count: {detail}"
     );
     assert!(
-        detail.contains("0 pages observed"),
+        detail.message.contains("0 pages observed"),
         "must surface total=0: {detail}"
     );
 }

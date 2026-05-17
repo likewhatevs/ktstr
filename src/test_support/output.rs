@@ -655,7 +655,10 @@ mod tests {
         let drain = drain_with_assert(&original);
         let r = parse_assert_result_from_drain(Some(&drain)).unwrap();
         assert!(!r.passed);
-        assert_eq!(r.details, vec!["stuck 3000ms"]);
+        assert_eq!(
+            r.details.iter().map(|d| d.message.as_str()).collect::<Vec<_>>(),
+            vec!["stuck 3000ms"]
+        );
     }
 
     /// `None` drain → "no guest messages" error. Mirrors the host

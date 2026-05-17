@@ -160,7 +160,7 @@ fn assert_result_skip_is_pass_with_reason() {
     let r = AssertResult::skip("topology too small");
     assert!(r.passed);
     assert_eq!(r.details.len(), 1);
-    assert_eq!(r.details[0], "topology too small");
+    assert_eq!(r.details[0].message, "topology too small");
 }
 
 #[test]

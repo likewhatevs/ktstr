@@ -23,7 +23,7 @@ fn starved_fail() {
         rpt(2, 0, 5e9 as u64, 5e9 as u64, &[0], 50),
     ]);
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| d.contains("starved")));
+    assert!(r.details.iter().any(|d| d.message.contains("starved")));
 }
 
 #[test]
@@ -34,7 +34,7 @@ fn unfair_spread_fail() {
         rpt(3, 800, 5e9 as u64, 2e9 as u64, &[0, 1], 50),  // 40%
     ]);
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| d.contains("unfair")));
+    assert!(r.details.iter().any(|d| d.message.contains("unfair")));
 }
 
 #[test]
@@ -56,7 +56,7 @@ fn stuck_fail() {
         rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[0], threshold + 500),
     ]);
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| d.contains("stuck")));
+    assert!(r.details.iter().any(|d| d.message.contains("stuck")));
 }
 
 #[test]
@@ -80,7 +80,7 @@ fn isolation_fail() {
         &expected,
     );
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| d.contains("unexpected")));
+    assert!(r.details.iter().any(|d| d.message.contains("unexpected")));
 }
 
 #[test]
@@ -119,7 +119,7 @@ fn zero_wall_time() {
         rpt(2, 0, 0, 0, &[], 0),
     ]);
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| d.contains("starved")));
+    assert!(r.details.iter().any(|d| d.message.contains("starved")));
 }
 
 #[test]
@@ -164,7 +164,7 @@ fn gap_boundary_above_threshold_fail() {
     let threshold = gap_threshold_ms();
     let r = assert_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], threshold + 1)]);
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| d.contains("stuck")));
+    assert!(r.details.iter().any(|d| d.message.contains("stuck")));
 }
 
 #[test]
@@ -175,7 +175,7 @@ fn multiple_stuck_workers() {
         rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], threshold + 1500),
     ]);
     assert!(!r.passed);
-    let stuck_count = r.details.iter().filter(|d| d.contains("stuck")).count();
+    let stuck_count = r.details.iter().filter(|d| d.message.contains("stuck")).count();
     assert_eq!(stuck_count, 2, "both workers should be flagged stuck");
 }
 
@@ -219,7 +219,7 @@ fn isolation_empty_expected_set() {
     );
     // Worker used CPUs {0,1}, expected is empty, so all are unexpected.
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| d.contains("unexpected")));
+    assert!(r.details.iter().any(|d| d.message.contains("unexpected")));
 }
 
 #[test]
@@ -238,7 +238,7 @@ fn isolation_all_unexpected_cpus() {
         &expected,
     );
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| d.contains("unexpected")));
+    assert!(r.details.iter().any(|d| d.message.contains("unexpected")));
 }
 
 // ---------------------------------------------------------------
@@ -253,16 +253,16 @@ fn neg_starvation_zero_work_detected() {
         rpt(3, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50),
     ]);
     assert!(!r.passed, "starvation must be caught");
-    let starved = r.details.iter().filter(|d| d.contains("starved")).count();
+    let starved = r.details.iter().filter(|d| d.message.contains("starved")).count();
     assert_eq!(starved, 1, "exactly one starved worker expected");
     // Format: "tid 2 starved (0 work units)"
-    let detail = r.details.iter().find(|d| d.contains("starved")).unwrap();
+    let detail = r.details.iter().find(|d| d.message.contains("starved")).unwrap();
     assert!(
-        detail.contains("tid 2"),
+        detail.message.contains("tid 2"),
         "must name the starved tid: {detail}"
     );
     assert!(
-        detail.contains("0 work units"),
+        detail.message.contains("0 work units"),
         "must state zero work: {detail}"
     );
 }
@@ -280,14 +280,14 @@ fn neg_isolation_violation_outside_cpuset() {
     let detail = r
         .details
         .iter()
-        .find(|d| d.contains("unexpected CPUs"))
+        .find(|d| d.message.contains("unexpected CPUs"))
         .unwrap();
     assert!(
-        detail.contains("tid 2"),
+        detail.message.contains("tid 2"),
         "must name violating tid: {detail}"
     );
-    assert!(detail.contains("2"), "must list out-of-set CPU 2: {detail}");
-    assert!(detail.contains("3"), "must list out-of-set CPU 3: {detail}");
+    assert!(detail.message.contains("2"), "must list out-of-set CPU 2: {detail}");
+    assert!(detail.message.contains("3"), "must list out-of-set CPU 3: {detail}");
     // Worker 1 ran only on {0,1} which is within expected — no violation.
     assert_eq!(r.details.len(), 1, "only tid 2 should violate");
 }
@@ -300,21 +300,21 @@ fn neg_unfairness_extreme_spread_detected() {
     ]);
     assert!(!r.passed, "extreme unfairness must be caught");
     // Format: "unfair cgroup: spread=90% (5-95%) 2 workers on 2 cpus (threshold 15%)"
-    let detail = r.details.iter().find(|d| d.contains("unfair")).unwrap();
+    let detail = r.details.iter().find(|d| d.message.contains("unfair")).unwrap();
     assert!(
-        detail.contains("spread="),
+        detail.message.contains("spread="),
         "must include spread value: {detail}"
     );
     assert!(
-        detail.contains("workers"),
+        detail.message.contains("workers"),
         "must include worker count: {detail}"
     );
-    assert!(detail.contains("cpus"), "must include cpu count: {detail}");
+    assert!(detail.message.contains("cpus"), "must include cpu count: {detail}");
     // Threshold must appear so a regression dropping the bound surfaces here.
     // The literal value comes from `spread_threshold_pct()` which differs
     // between debug and release builds; pin only the textual prefix.
     assert!(
-        detail.contains("threshold "),
+        detail.message.contains("threshold "),
         "must include threshold bound: {detail}"
     );
     let c = &r.stats.cgroups[0];
@@ -347,31 +347,31 @@ fn neg_scheduling_gap_exceeds_threshold() {
     ]);
     assert!(!r.passed, "scheduling gap must be caught");
     // Format: "tid 2 stuck {gap}ms on cpu1 at +1000ms (threshold 2000ms)"
-    let detail = r.details.iter().find(|d| d.contains("stuck")).unwrap();
+    let detail = r.details.iter().find(|d| d.message.contains("stuck")).unwrap();
     assert!(
-        detail.contains(&format!("{}ms", gap)),
+        detail.message.contains(&format!("{}ms", gap)),
         "must include gap duration: {detail}"
     );
     assert!(
-        detail.contains("on cpu"),
+        detail.message.contains("on cpu"),
         "must include CPU number: {detail}"
     );
     assert!(
-        detail.contains("at +"),
+        detail.message.contains("at +"),
         "must include timing offset: {detail}"
     );
-    assert!(detail.contains("cpu1"), "gap is on cpu1: {detail}");
+    assert!(detail.message.contains("cpu1"), "gap is on cpu1: {detail}");
     // tid must be named so an operator triaging a multi-worker cgroup can
     // identify the offender without reverse-mapping CPU placement.
     assert!(
-        detail.contains("tid 2"),
+        detail.message.contains("tid 2"),
         "must name violating tid (2): {detail}"
     );
     // Threshold appears for parity with the AssertPlan custom-threshold path
     // and so a regression dropping the bound from the default-path message
     // surfaces here.
     assert!(
-        detail.contains(&format!("threshold {}ms", threshold)),
+        detail.message.contains(&format!("threshold {}ms", threshold)),
         "must include default-path threshold: {detail}"
     );
     // Stats must reflect the gap.
@@ -389,19 +389,19 @@ fn neg_plan_custom_gap_catches_lower_threshold() {
     let r = plan.assert_cgroup(&reports, None, None);
     assert!(!r.passed, "custom 500ms threshold must catch 1000ms gap");
     // Format: "tid 2 stuck 1000ms on cpu1 at +1000ms (threshold 500ms)"
-    let detail = r.details.iter().find(|d| d.contains("stuck")).unwrap();
+    let detail = r.details.iter().find(|d| d.message.contains("stuck")).unwrap();
     assert!(
-        detail.contains("1000ms"),
+        detail.message.contains("1000ms"),
         "must include gap duration: {detail}"
     );
-    assert!(detail.contains("cpu1"), "must include CPU: {detail}");
+    assert!(detail.message.contains("cpu1"), "must include CPU: {detail}");
     assert!(
-        detail.contains("threshold 500ms"),
+        detail.message.contains("threshold 500ms"),
         "must include custom threshold: {detail}"
     );
     // tid must be named; pins parity with the bare-path message.
     assert!(
-        detail.contains("tid 2"),
+        detail.message.contains("tid 2"),
         "must name violating tid (2): {detail}"
     );
 }
@@ -417,20 +417,20 @@ fn neg_isolation_plus_starvation_both_reported() {
     let r = plan.assert_cgroup(&reports, Some(&expected), None);
     assert!(!r.passed);
     // Starvation detail must name tid 1 with "0 work units".
-    let starved_detail = r.details.iter().find(|d| d.contains("starved")).unwrap();
+    let starved_detail = r.details.iter().find(|d| d.message.contains("starved")).unwrap();
     assert!(
-        starved_detail.contains("tid 1"),
+        starved_detail.message.contains("tid 1"),
         "starved tid: {starved_detail}"
     );
     assert!(
-        starved_detail.contains("0 work units"),
+        starved_detail.message.contains("0 work units"),
         "format: {starved_detail}"
     );
     // Isolation detail must name tid 2 with CPUs {4, 5}.
-    let iso_detail = r.details.iter().find(|d| d.contains("unexpected")).unwrap();
-    assert!(iso_detail.contains("tid 2"), "isolation tid: {iso_detail}");
-    assert!(iso_detail.contains("4"), "must list CPU 4: {iso_detail}");
-    assert!(iso_detail.contains("5"), "must list CPU 5: {iso_detail}");
+    let iso_detail = r.details.iter().find(|d| d.message.contains("unexpected")).unwrap();
+    assert!(iso_detail.message.contains("tid 2"), "isolation tid: {iso_detail}");
+    assert!(iso_detail.message.contains("4"), "must list CPU 4: {iso_detail}");
+    assert!(iso_detail.message.contains("5"), "must list CPU 5: {iso_detail}");
 }
 
 #[test]
@@ -443,10 +443,10 @@ fn neg_assert_cgroup_via_assert_struct() {
         !r.passed,
         "Assert.assert_cgroup must catch isolation failure"
     );
-    let detail = r.details.iter().find(|d| d.contains("unexpected")).unwrap();
-    assert!(detail.contains("tid 1"), "must name tid: {detail}");
-    assert!(detail.contains("1"), "must list CPU 1: {detail}");
-    assert!(detail.contains("2"), "must list CPU 2: {detail}");
+    let detail = r.details.iter().find(|d| d.message.contains("unexpected")).unwrap();
+    assert!(detail.message.contains("tid 1"), "must name tid: {detail}");
+    assert!(detail.message.contains("1"), "must list CPU 1: {detail}");
+    assert!(detail.message.contains("2"), "must list CPU 2: {detail}");
 }
 
 #[test]
@@ -458,6 +458,6 @@ fn neg_plan_custom_gap_passes_below_threshold() {
     ];
     let r = plan.assert_cgroup(&reports, None, None);
     // 1000ms gap < 5000ms threshold, so it passes.
-    let has_stuck = r.details.iter().any(|d| d.contains("stuck"));
+    let has_stuck = r.details.iter().any(|d| d.message.contains("stuck"));
     assert!(!has_stuck, "1000ms gap should pass 5000ms threshold");
 }

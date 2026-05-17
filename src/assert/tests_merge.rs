@@ -520,7 +520,7 @@ fn merge_pass_and_fail() {
         merged
             .details
             .iter()
-            .any(|d| d.contains("something failed"))
+            .any(|d| d.message.contains("something failed"))
     );
 }
 
@@ -572,7 +572,10 @@ fn assert_result_merge_combines_stats() {
     };
     a.merge(b);
     assert!(!a.passed);
-    assert_eq!(a.details, vec!["a", "b"]);
+    assert_eq!(
+        a.details.iter().map(|d| d.message.as_str()).collect::<Vec<_>>(),
+        vec!["a", "b"]
+    );
     assert_eq!(a.stats.total_workers, 5);
     assert_eq!(a.stats.total_cpus, 10);
     assert_eq!(a.stats.total_migrations, 30);
