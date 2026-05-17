@@ -51,6 +51,15 @@ fn smt_steady(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
+While iterating on a single test, mark the others with
+`#[ktstr_test(scheduler = MY_SCHED, ignore = true)]` so the
+distributed-slice walker still discovers them but
+`cargo ktstr test` skips them in the sweep. This is the
+ktstr-native attribute and is distinct from std's `#[ignore]`
+(which is invisible to the macro). Clear the attribute when the
+test is ready to land — leaving it on permanently silently
+drops coverage from the verifier sweep.
+
 ## 3. Build a kernel
 
 Build a kernel with sched_ext support:
@@ -124,6 +133,42 @@ Inside the guest, run `/include-files/scx_my_sched` manually to
 inspect behavior. See
 [cargo-ktstr shell](../running-tests/cargo-ktstr.md#shell) for
 all flags.
+
+## 8. Write a crash test
+
+Schedulers ship with their own failure-handling paths. A
+negative test pins those paths: tell ktstr to force a BPF-map
+write into the scheduler that produces a known `scx_bpf_error`,
+declare the test as expected-error, and assert on the rendered
+error message. The test passes when the scheduler emits the
+expected error and fails when it doesn't (or emits the wrong
+one — silent regressions become visible).
+
+```rust,ignore
+use ktstr::prelude::*;
+
+#[ktstr_test(
+    scheduler = MY_SCHED,
+    bpf_map_write = BPF_CRASH,
+    expect_err = true,
+    expect_scx_bpf_error_contains = "ktstr: host-triggered crash",
+)]
+fn crash_path_emits_expected_error(ctx: &Ctx) -> Result<AssertResult> {
+    ktstr::scenario::basic::custom_sched_mixed(ctx)
+}
+```
+
+`BPF_CRASH` is the framework-provided crash-trigger map handle;
+the host writes the trigger value, the kernel's `bpf_map_update`
+fires the scheduler's error path, the scheduler emits
+`scx_bpf_error_str("ktstr: host-triggered crash …")`, and the
+test asserts the substring.
+
+Use `expect_scx_bpf_error_matches = r"…"` (regex) for richer
+matching against escape-sequence-rich messages. Both attributes
+gate against the same expected-error-on-pass contract — the
+test fails if the scheduler exits without emitting the matching
+error.
 
 See [The #\[ktstr_test\] Macro](../writing-tests/ktstr-test-macro.md)
 for all available attributes and
