@@ -153,6 +153,7 @@ fn merge_three_cgroups_worst_wins_and_iterations_sum() {
             passed: true,
             skipped: false,
             details: vec![],
+            passes: vec![],
             stats: ScenarioStats {
                 total_iterations: total_iters,
                 worst_spread,
@@ -542,6 +543,7 @@ fn assert_result_merge_combines_stats() {
         passed: true,
         skipped: false,
         details: vec!["a".into()],
+        passes: vec![],
         stats: ScenarioStats {
             cgroups: vec![],
             total_workers: 2,
@@ -558,6 +560,7 @@ fn assert_result_merge_combines_stats() {
         passed: false,
         skipped: false,
         details: vec!["b".into()],
+        passes: vec![],
         stats: ScenarioStats {
             cgroups: vec![],
             total_workers: 3,

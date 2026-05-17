@@ -379,6 +379,99 @@ impl AssertDetail {
     }
 }
 
+/// Structured record of a single passing claim — the positive
+/// counterpart to [`AssertDetail`]. Populated by
+/// [`Verdict::record_pass`] at every comparator's pass arm so the
+/// auto-repro renderer (and any other consumer that wants per-claim
+/// fidelity) can iterate passes alongside fails.
+///
+/// Carries the same shape primitives every comparator naturally has
+/// at the pass site: the claim's `name`, a short `comparator`
+/// token (`"=="`, `">="`, `"is_finite"`, …), the `value` that was
+/// compared (formatted via the comparator's `Display`), and an
+/// optional `expected` for binary comparators. Unary comparators
+/// (e.g. `is_finite`, `is_empty`) leave `expected = None`.
+///
+/// Distinct from a one-line tracing log — the structured form is
+/// the data path the auto-repro renderer reads to compose the
+/// bracketed phase output that surfaces passing context alongside
+/// failing assertions. The tracing log path remains the
+/// operator-facing surface for `--nocapture` runs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PassDetail {
+    pub name: String,
+    pub comparator: String,
+    pub value: String,
+    pub expected: Option<String>,
+    /// Scenario phase the claim was made under. `None` outside any
+    /// [`PhaseGuard`] scope; `Some(label)` when the active-phase
+    /// thread-local has been installed at the scenario-driver step
+    /// loop entry. The auto-repro renderer groups passes by this
+    /// field to compose the bracketed `==== PHASE N: <label> ====`
+    /// output.
+    pub phase: Option<String>,
+}
+
+impl PassDetail {
+    /// Construct a binary-comparator pass record (e.g. `==`, `>=`,
+    /// `∈`). Both `value` and `expected` are stringified via
+    /// [`std::fmt::Display`] at the call site so the struct is
+    /// `T`-agnostic on the wire.
+    pub fn binary(
+        name: impl Into<String>,
+        comparator: impl Into<String>,
+        value: impl Into<String>,
+        expected: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            comparator: comparator.into(),
+            value: value.into(),
+            expected: Some(expected.into()),
+            phase: None,
+        }
+    }
+
+    /// Construct a unary-comparator pass record (e.g. `is_finite`,
+    /// `is_empty`). `expected` is left None — the comparator name
+    /// alone carries the meaning.
+    pub fn unary(
+        name: impl Into<String>,
+        comparator: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            comparator: comparator.into(),
+            value: value.into(),
+            expected: None,
+            phase: None,
+        }
+    }
+}
+
+/// Cap on `AssertResult.passes` (and the matching truncation sentinel)
+/// so a pathological test that fires millions of claims doesn't
+/// balloon the wire-formatted result. Mirrors SnapshotBridge's
+/// `MAX_STORED_EVENTS` truncation pattern: when the cap is hit,
+/// the cap-th record is replaced with a synthetic
+/// `PassDetail { name: PASSES_TRUNCATION_SENTINEL_NAME, … }` carrying
+/// the dropped-count, and further pushes are no-ops.
+///
+/// 10_000 is comfortably above the steady-state claim count of every
+/// existing test (typical test fires <100 claims; pathological hot-
+/// loop tests in the tree fire under 5_000) while bounding the
+/// worst-case wire size to ~3 MB — well under the 16 MiB
+/// `MAX_BULK_FRAME_PAYLOAD` per vmm/bulk.rs:53.
+pub const MAX_RECORDED_PASSES: usize = 10_000;
+
+/// Sentinel `PassDetail.name` value used by the truncation record
+/// that replaces the `MAX_RECORDED_PASSES`-th slot when a test
+/// over-runs the cap. Consumers (the auto-repro renderer in #140)
+/// match on this string to render `[N passes truncated]` instead
+/// of treating it as a real claim.
+pub const PASSES_TRUNCATION_SENTINEL_NAME: &str = "__ktstr_passes_truncated__";
+
 /// `Display` adapter returned by [`AssertDetail::display_with_kind`].
 /// Renders the detail as `[<kind>] <message>`. Held by reference so
 /// the helper allocates nothing on the formatting path; the lifetime
@@ -538,6 +631,16 @@ pub struct AssertResult {
     /// Human-readable diagnostic messages (failures, warnings), each
     /// tagged with a [`DetailKind`] for structural filtering.
     pub details: Vec<AssertDetail>,
+    /// Structured records of every passing claim. Counterpart to
+    /// [`Self::details`]: where `details` carries failing/warning
+    /// signals, `passes` carries the positive confirmations every
+    /// comparator's pass arm emits via [`Verdict::record_pass`].
+    /// Empty in tests that don't exercise the structured-pass path
+    /// (the no-claim base case), populated whenever a [`Verdict`]
+    /// records claims. The auto-repro renderer iterates both vecs
+    /// to compose the bracketed phase-grouped output that surfaces
+    /// passing context alongside failing assertions.
+    pub passes: Vec<PassDetail>,
     /// Aggregated stats from all workers in this scenario.
     pub stats: ScenarioStats,
     /// Structured measurements attached via [`Self::note_value`] /
@@ -774,6 +877,7 @@ impl AssertResult {
             passed: true,
             skipped: false,
             details: vec![],
+            passes: vec![],
             stats: Default::default(),
             measurements: std::collections::BTreeMap::new(),
         }
@@ -785,6 +889,7 @@ impl AssertResult {
             passed: true,
             skipped: true,
             details: vec![AssertDetail::new(DetailKind::Skip, reason)],
+            passes: vec![],
             stats: Default::default(),
             measurements: std::collections::BTreeMap::new(),
         }
@@ -799,6 +904,7 @@ impl AssertResult {
             passed: false,
             skipped: false,
             details: vec![detail],
+            passes: vec![],
             stats: Default::default(),
             measurements: std::collections::BTreeMap::new(),
         }
@@ -883,6 +989,7 @@ impl AssertResult {
         // the two `skipped` flags.
         self.skipped = self.skipped && other.skipped;
         self.details.extend(other.details);
+        self.passes.extend(other.passes);
         let s = &mut self.stats;
         let o = &other.stats;
         s.total_workers += o.total_workers;
@@ -1111,6 +1218,7 @@ impl AssertResult {
                 passed: false,
                 skipped: false,
                 details: Vec::new(),
+                passes: first.passes,
                 stats: first.stats,
                 measurements: first.measurements,
             };

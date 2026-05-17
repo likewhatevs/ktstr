@@ -26,6 +26,7 @@ fn basic_topology_check(ctx: &Ctx) -> Result<AssertResult> {
             passed: false,
             skipped: false,
             details: vec!["no CPUs detected".into()],
+            passes: vec![],
             stats: Default::default(),
             measurements: std::collections::BTreeMap::new(),
         });
@@ -708,6 +709,7 @@ fn topology_matches_vm_spec(ctx: &Ctx) -> Result<AssertResult> {
             passed: false,
             skipped: false,
             details,
+            passes: vec![],
             stats: Default::default(),
             measurements: std::collections::BTreeMap::new(),
         })

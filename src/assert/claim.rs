@@ -324,17 +324,61 @@ impl Verdict {
         }
     }
 
-    /// Internal: emit a `tracing::info!` event naming the just-passed
-    /// claim and the values it compared, gated on
-    /// [`Self::log_passes`]. The closure constructs the message only
-    /// when the flag is on so the format cost stays unpaid on the
-    /// default `log_passes = false` path. Shared by every comparator's
-    /// pass arm on every builder type.
-    fn maybe_log_pass<F: FnOnce() -> String>(&self, msg: F) {
+    /// Record a passing claim as both a structured
+    /// [`PassDetail`](super::PassDetail) on `result.passes` AND a
+    /// `tracing::info!` event (gated on [`Self::log_passes`]).
+    ///
+    /// The structured push is unconditional: every comparator's pass
+    /// arm contributes one [`PassDetail`] to the result so the
+    /// auto-repro renderer (and any other consumer that wants per-
+    /// claim fidelity) can iterate passing assertions alongside
+    /// failing ones without re-running the comparators.
+    ///
+    /// The tracing event remains gated on `log_passes` so the
+    /// `--nocapture` operator surface stays clean by default; only
+    /// the structured push is universal.
+    fn record_pass(
+        &mut self,
+        name: &str,
+        comparator: &str,
+        value: String,
+        expected: Option<String>,
+    ) {
         if self.log_passes {
-            let m = msg();
-            tracing::info!(target: "ktstr::assert::claim", "{m}");
+            match expected.as_ref() {
+                Some(exp) => tracing::info!(
+                    target: "ktstr::assert::claim",
+                    "{name}: {value} {comparator} {exp}"
+                ),
+                None => tracing::info!(
+                    target: "ktstr::assert::claim",
+                    "{name}: {value} {comparator}"
+                ),
+            }
         }
+        // Cap + truncation sentinel: once `MAX_RECORDED_PASSES` is
+        // exceeded, replace the cap-th slot with a sentinel record
+        // that names the dropped-count; further pushes become
+        // no-ops. The cap bounds the wire-formatted AssertResult so
+        // a pathological test firing millions of claims can't blow
+        // past `MAX_BULK_FRAME_PAYLOAD`. Sentinel pattern mirrors
+        // `SnapshotBridge::EventLogTruncated`.
+        let len = self.result.passes.len();
+        if len < super::MAX_RECORDED_PASSES {
+            let detail = match expected {
+                Some(exp) => super::PassDetail::binary(name, comparator, value, exp),
+                None => super::PassDetail::unary(name, comparator, value),
+            };
+            self.result.passes.push(detail);
+        } else if len == super::MAX_RECORDED_PASSES {
+            self.result.passes.push(super::PassDetail::unary(
+                super::PASSES_TRUNCATION_SENTINEL_NAME,
+                "truncated",
+                format!("cap={}", super::MAX_RECORDED_PASSES),
+            ));
+        }
+        // len > MAX_RECORDED_PASSES: drop on the floor — sentinel is
+        // already published.
     }
 }
 
@@ -408,7 +452,7 @@ where
             reason,
         } = self;
         let outcome = if value == expected {
-            verdict.maybe_log_pass(|| format!("{name}: {value} == {expected}"));
+            verdict.record_pass(name, "==", value.to_string(), Some(expected.to_string()));
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(format!("{name}: expected {expected}, was {value}"), reason);
@@ -429,7 +473,7 @@ where
             reason,
         } = self;
         let outcome = if value != forbidden {
-            verdict.maybe_log_pass(|| format!("{name}: {value} != {forbidden}"));
+            verdict.record_pass(name, "!=", value.to_string(), Some(forbidden.to_string()));
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(
@@ -458,7 +502,7 @@ where
             reason,
         } = self;
         let outcome = if value >= floor {
-            verdict.maybe_log_pass(|| format!("{name}: {value} >= {floor}"));
+            verdict.record_pass(name, ">=", value.to_string(), Some(floor.to_string()));
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(
@@ -482,7 +526,7 @@ where
             reason,
         } = self;
         let outcome = if value <= ceiling {
-            verdict.maybe_log_pass(|| format!("{name}: {value} <= {ceiling}"));
+            verdict.record_pass(name, "<=", value.to_string(), Some(ceiling.to_string()));
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(
@@ -505,7 +549,7 @@ where
             reason,
         } = self;
         let outcome = if value < ceiling {
-            verdict.maybe_log_pass(|| format!("{name}: {value} < {ceiling}"));
+            verdict.record_pass(name, "<", value.to_string(), Some(ceiling.to_string()));
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(
@@ -528,7 +572,7 @@ where
             reason,
         } = self;
         let outcome = if value > floor {
-            verdict.maybe_log_pass(|| format!("{name}: {value} > {floor}"));
+            verdict.record_pass(name, ">", value.to_string(), Some(floor.to_string()));
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(
@@ -558,7 +602,12 @@ where
             );
             ClaimOutcome::Fail { kind, message: msg }
         } else if value >= lo && value <= hi {
-            verdict.maybe_log_pass(|| format!("{name}: {value} ∈ [{lo}, {hi}]"));
+            verdict.record_pass(
+                name,
+                "∈",
+                value.to_string(),
+                Some(format!("[{lo}, {hi}]")),
+            );
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(
@@ -583,7 +632,7 @@ impl<'a> ClaimBuilder<'a, f64> {
             reason,
         } = self;
         let outcome = if value.is_finite() {
-            verdict.maybe_log_pass(|| format!("{name}: {value} is finite"));
+            verdict.record_pass(name, "is_finite", value.to_string(), None);
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(format!("{name}: expected finite, was {value}"), reason);
@@ -612,9 +661,12 @@ impl<'a> ClaimBuilder<'a, f64> {
             );
             ClaimOutcome::Fail { kind, message: msg }
         } else if value == target || (value - target).abs() <= tolerance {
-            verdict.maybe_log_pass(|| {
-                format!("{name}: {value} near {target} (±{tolerance})")
-            });
+            verdict.record_pass(
+                name,
+                "near",
+                value.to_string(),
+                Some(format!("{target} (±{tolerance})")),
+            );
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(
@@ -659,7 +711,7 @@ impl<'a, T: Ord + std::fmt::Debug> SetClaim<'a, T> {
             reason,
         } = self;
         let outcome = if value.is_empty() {
-            verdict.maybe_log_pass(|| format!("{name}: set is empty"));
+            verdict.record_pass(name, "set_is_empty", String::new(), None);
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(format!("{name}: expected empty, was {value:?}"), reason);
@@ -680,7 +732,7 @@ impl<'a, T: Ord + std::fmt::Debug> SetClaim<'a, T> {
         } = self;
         let outcome = if !value.is_empty() {
             let len = value.len();
-            verdict.maybe_log_pass(|| format!("{name}: set is non-empty (len={len})"));
+            verdict.record_pass(name, "set_is_non_empty", format!("len={len}"), None);
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(format!("{name}: expected non-empty, was empty"), reason);
@@ -700,7 +752,12 @@ impl<'a, T: Ord + std::fmt::Debug> SetClaim<'a, T> {
             reason,
         } = self;
         let outcome = if value.contains(needle) {
-            verdict.maybe_log_pass(|| format!("{name}: set contains {needle:?}"));
+            verdict.record_pass(
+                name,
+                "set_contains",
+                String::new(),
+                Some(format!("{needle:?}")),
+            );
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(
@@ -724,7 +781,7 @@ impl<'a, T: Ord + std::fmt::Debug> SetClaim<'a, T> {
         } = self;
         let actual = value.len();
         let outcome = if actual == n {
-            verdict.maybe_log_pass(|| format!("{name}: set len == {n}"));
+            verdict.record_pass(name, "set_len ==", n.to_string(), None);
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(format!("{name}: expected len == {n}, was {actual}"), reason);
@@ -745,7 +802,12 @@ impl<'a, T: Ord + std::fmt::Debug> SetClaim<'a, T> {
         } = self;
         let actual = value.len();
         let outcome = if actual <= n {
-            verdict.maybe_log_pass(|| format!("{name}: set len {actual} <= {n}"));
+            verdict.record_pass(
+                name,
+                "set_len <=",
+                actual.to_string(),
+                Some(n.to_string()),
+            );
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(format!("{name}: expected len <= {n}, was {actual}"), reason);
@@ -766,7 +828,12 @@ impl<'a, T: Ord + std::fmt::Debug> SetClaim<'a, T> {
         } = self;
         let actual = value.len();
         let outcome = if actual >= n {
-            verdict.maybe_log_pass(|| format!("{name}: set len {actual} >= {n}"));
+            verdict.record_pass(
+                name,
+                "set_len >=",
+                actual.to_string(),
+                Some(n.to_string()),
+            );
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(format!("{name}: expected len >= {n}, was {actual}"), reason);
@@ -788,7 +855,12 @@ impl<'a, T: Ord + std::fmt::Debug> SetClaim<'a, T> {
         } = self;
         let bad: Vec<&T> = value.iter().filter(|x| !whitelist.contains(x)).collect();
         let outcome = if bad.is_empty() {
-            verdict.maybe_log_pass(|| format!("{name}: {value:?} ⊆ {whitelist:?}"));
+            verdict.record_pass(
+                name,
+                "⊆",
+                format!("{value:?}"),
+                Some(format!("{whitelist:?}")),
+            );
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(
@@ -813,7 +885,12 @@ impl<'a, T: Ord + std::fmt::Debug> SetClaim<'a, T> {
         } = self;
         let bad: Vec<&T> = value.iter().filter(|x| forbidden.contains(x)).collect();
         let outcome = if bad.is_empty() {
-            verdict.maybe_log_pass(|| format!("{name}: {value:?} ∩ {forbidden:?} = ∅"));
+            verdict.record_pass(
+                name,
+                "∩=∅",
+                format!("{value:?}"),
+                Some(format!("{forbidden:?}")),
+            );
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(
@@ -860,7 +937,7 @@ impl<'a, T: std::fmt::Debug> SeqClaim<'a, T> {
             reason,
         } = self;
         let outcome = if value.is_empty() {
-            verdict.maybe_log_pass(|| format!("{name}: sequence is empty"));
+            verdict.record_pass(name, "sequence_is_empty", String::new(), None);
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(format!("{name}: expected empty, was {value:?}"), reason);
@@ -881,7 +958,7 @@ impl<'a, T: std::fmt::Debug> SeqClaim<'a, T> {
         } = self;
         let outcome = if !value.is_empty() {
             let len = value.len();
-            verdict.maybe_log_pass(|| format!("{name}: sequence is non-empty (len={len})"));
+            verdict.record_pass(name, "sequence_is_non_empty", format!("len={len}"), None);
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(format!("{name}: expected non-empty, was empty"), reason);
@@ -904,7 +981,12 @@ impl<'a, T: std::fmt::Debug> SeqClaim<'a, T> {
             reason,
         } = self;
         let outcome = if value.iter().any(|x| x == needle) {
-            verdict.maybe_log_pass(|| format!("{name}: sequence contains {needle:?}"));
+            verdict.record_pass(
+                name,
+                "sequence_contains",
+                String::new(),
+                Some(format!("{needle:?}")),
+            );
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(
@@ -928,7 +1010,7 @@ impl<'a, T: std::fmt::Debug> SeqClaim<'a, T> {
         } = self;
         let actual = value.len();
         let outcome = if actual == n {
-            verdict.maybe_log_pass(|| format!("{name}: sequence len == {n}"));
+            verdict.record_pass(name, "sequence_len ==", n.to_string(), None);
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(format!("{name}: expected len == {n}, was {actual}"), reason);
@@ -949,7 +1031,12 @@ impl<'a, T: std::fmt::Debug> SeqClaim<'a, T> {
         } = self;
         let actual = value.len();
         let outcome = if actual <= n {
-            verdict.maybe_log_pass(|| format!("{name}: sequence len {actual} <= {n}"));
+            verdict.record_pass(
+                name,
+                "sequence_len <=",
+                actual.to_string(),
+                Some(n.to_string()),
+            );
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(format!("{name}: expected len <= {n}, was {actual}"), reason);
@@ -970,7 +1057,12 @@ impl<'a, T: std::fmt::Debug> SeqClaim<'a, T> {
         } = self;
         let actual = value.len();
         let outcome = if actual >= n {
-            verdict.maybe_log_pass(|| format!("{name}: sequence len {actual} >= {n}"));
+            verdict.record_pass(
+                name,
+                "sequence_len >=",
+                actual.to_string(),
+                Some(n.to_string()),
+            );
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(format!("{name}: expected len >= {n}, was {actual}"), reason);
