@@ -2745,6 +2745,29 @@ impl WorkloadHandle {
             );
         }
 
+        // Structural mem_policy validation per-spec — same gate as
+        // [`WorkloadHandle::spawn`]'s [`WorkloadConfig::validate`],
+        // applied at the second public spawn entry point. Closes the
+        // bypass that would otherwise allow invalid mem_policy via
+        // this entry to reach `apply_mempolicy_with_flags`'s silent-
+        // skip arm. The `exit_group(2)` thread-mode unsoundness
+        // documented on [`WorkloadConfig::validate`] does not apply
+        // here (pcomm-container workers run inside a forked container
+        // with a new tgid distinct from the test runner's — the
+        // container forks once via `libc::fork`, then workers are
+        // spawned as threads sharing the container's tgid; a
+        // hypothetical inner `_exit(1)` would only tear down the
+        // container, not the test runner), but the validation
+        // symmetry between the two pub entries prevents future
+        // refactors from inadvertently re-opening the bypass.
+        for (i, spec) in works.iter().enumerate() {
+            spec.mem_policy.validate().map_err(|e| {
+                anyhow::anyhow!(
+                    "WorkloadHandle::spawn_pcomm_cgroup: works[{i}].mem_policy: {e}",
+                )
+            })?;
+        }
+
         // Build a `GroupParams` per `WorkSpec` using the same
         // resolver `WorkloadHandle::spawn` uses for composed
         // entries. group_idx is the entry's position in `works` (0-
@@ -2987,6 +3010,11 @@ impl WorkloadHandle {
     /// primitive (`fork` or `std::thread::spawn`) is selected by
     /// [`WorkloadConfig::clone_mode`].
     pub fn spawn(config: &WorkloadConfig) -> Result<Self> {
+        // Reject invalid mem_policy before any worker context exists;
+        // see [`WorkloadConfig::validate`] for the silent-skip
+        // rationale and why a worker-side `_exit(1)` fix is unsound.
+        config.validate()?;
+
         let dispatch = match &config.clone_mode {
             CloneMode::Fork => Dispatch::Fork,
             CloneMode::Thread => Dispatch::Thread,

@@ -87,3 +87,75 @@ fn pathology_numa_working_set_sweep_iterates() {
         );
     }
 }
+
+/// Pins that [`WorkloadHandle::spawn`] invokes
+/// [`WorkloadConfig::validate`] before any worker setup. A regression
+/// that drops the `config.validate()?` call at the top of
+/// [`WorkloadHandle::spawn`] would silently restore the pre-validate
+/// behavior: unit tests on [`WorkloadConfig::validate`] still pass
+/// (they call the validator directly), but production `spawn(&bad)`
+/// would silently coast through to `apply_mempolicy_with_flags`'s
+/// permissive silent-skip arm. Anchor on the validate-wrap prefix
+/// ("WorkloadConfig.mem_policy") to prove `spawn` called the
+/// structural gate, not some other reject site downstream.
+///
+/// `WorkloadHandle` does not derive `Debug` (intentional — wrapping
+/// raw fds + mmaps + child reapers in a printable type would invite
+/// accidental fmt-on-failure paths), so the let-else shape is used
+/// instead of `expect_err` (which has a `T: Debug` bound).
+#[test]
+fn spawn_rejects_invalid_mempolicy_config() {
+    let bad = WorkloadConfig::default().mem_policy(MemPolicy::Bind(BTreeSet::new()));
+    let Err(err) = WorkloadHandle::spawn(&bad) else {
+        panic!(
+            "WorkloadHandle::spawn must reject invalid mem_policy via WorkloadConfig::validate",
+        );
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("WorkloadConfig.mem_policy"),
+        "spawn must surface the WorkloadConfig::validate() wrap prefix \
+         (proves the validator was actually called): got {msg}",
+    );
+    assert!(
+        msg.contains("primary"),
+        "diagnostic must name the slot (primary group): got {msg}",
+    );
+    assert!(
+        msg.contains("Bind"),
+        "diagnostic must name the offending variant (Bind): got {msg}",
+    );
+}
+
+/// Pins that [`WorkloadHandle::spawn_pcomm_cgroup`] — the second
+/// public spawn entry point — also validates mem_policy. Same
+/// reasoning as [`spawn_rejects_invalid_mempolicy_config`]: a
+/// regression that drops the validate loop at the top of
+/// `spawn_pcomm_cgroup` would silently bypass the structural gate
+/// for the pcomm entry, allowing invalid mem_policy through to
+/// `apply_mempolicy_with_flags`'s silent-skip arm. The let-else
+/// shape mirrors the sibling test (`WorkloadHandle` is not
+/// `Debug`, so `expect_err` cannot apply).
+#[test]
+fn spawn_pcomm_cgroup_rejects_invalid_mempolicy() {
+    let bad = WorkSpec::default()
+        .workers(1)
+        .work_type(WorkType::SpinWait)
+        .mem_policy(MemPolicy::Bind(BTreeSet::new()));
+    let Err(err) = WorkloadHandle::spawn_pcomm_cgroup("ktstr-test", None, None, &[bad]) else {
+        panic!("spawn_pcomm_cgroup must reject invalid mem_policy on works[0]");
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("spawn_pcomm_cgroup"),
+        "diagnostic must name the entry point: got {msg}",
+    );
+    assert!(
+        msg.contains("works[0].mem_policy"),
+        "diagnostic must name the offending slot: got {msg}",
+    );
+    assert!(
+        msg.contains("Bind"),
+        "diagnostic must name the offending variant: got {msg}",
+    );
+}

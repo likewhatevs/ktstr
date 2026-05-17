@@ -805,23 +805,41 @@ impl MemPolicy {
     /// Validate that this policy's node set is non-empty where required.
     ///
     /// Returns `Err` with a description when a node-set-bearing policy
-    /// has an empty set.
+    /// has an empty set. Each diagnostic names the offending variant,
+    /// the constraint ("at least one NUMA node"), and the actionable
+    /// fix — both the matching constructor and the recommended
+    /// fallbacks for "I don't want node-restricted placement" — so the
+    /// operator sees the next mouse-click inline rather than having to
+    /// `cargo doc --open` to discover the constructor menu. Mirrors the
+    /// workers_pct rejection trailer at [`WorkSpec::resolve_workers_pct`].
     pub fn validate(&self) -> std::result::Result<(), String> {
         match self {
             MemPolicy::Default | MemPolicy::Local => Ok(()),
             MemPolicy::Preferred(_) => Ok(()),
-            MemPolicy::Bind(nodes) if nodes.is_empty() => {
-                Err("Bind policy requires at least one NUMA node".into())
-            }
-            MemPolicy::Interleave(nodes) if nodes.is_empty() => {
-                Err("Interleave policy requires at least one NUMA node".into())
-            }
-            MemPolicy::PreferredMany(nodes) if nodes.is_empty() => {
-                Err("PreferredMany policy requires at least one NUMA node".into())
-            }
-            MemPolicy::WeightedInterleave(nodes) if nodes.is_empty() => {
-                Err("WeightedInterleave policy requires at least one NUMA node".into())
-            }
+            MemPolicy::Bind(nodes) if nodes.is_empty() => Err(
+                "Bind policy requires at least one NUMA node — \
+                 use `MemPolicy::bind([node, ...])` with one or more node IDs, \
+                 or `MemPolicy::Default` / `MemPolicy::Local` for non-bound placement"
+                    .into(),
+            ),
+            MemPolicy::Interleave(nodes) if nodes.is_empty() => Err(
+                "Interleave policy requires at least one NUMA node — \
+                 use `MemPolicy::interleave([node, ...])` with one or more node IDs, \
+                 or `MemPolicy::Default` for unrestricted placement"
+                    .into(),
+            ),
+            MemPolicy::PreferredMany(nodes) if nodes.is_empty() => Err(
+                "PreferredMany policy requires at least one NUMA node — \
+                 use `MemPolicy::preferred_many([node, ...])` with one or more node IDs, \
+                 or `MemPolicy::Preferred(node)` / `MemPolicy::Default` / `MemPolicy::Local`"
+                    .into(),
+            ),
+            MemPolicy::WeightedInterleave(nodes) if nodes.is_empty() => Err(
+                "WeightedInterleave policy requires at least one NUMA node — \
+                 use `MemPolicy::weighted_interleave([node, ...])` with one or more node IDs, \
+                 or `MemPolicy::interleave([node, ...])` / `MemPolicy::Default` for unweighted placement"
+                    .into(),
+            ),
             _ => Ok(()),
         }
     }
@@ -1010,6 +1028,87 @@ impl Default for WorkloadConfig {
 }
 
 impl WorkloadConfig {
+    /// Validate the config before spawn. Fails loud on invariants
+    /// that the worker-spawn path otherwise handles by silent
+    /// degradation — in particular `mem_policy` variants that
+    /// require a non-empty nodemask (Bind / Interleave / PreferredMany /
+    /// WeightedInterleave with an empty BTreeSet).
+    ///
+    /// # Why a config-layer gate
+    ///
+    /// `apply_mempolicy_with_flags` (called from the worker's hot
+    /// path in BOTH forked-child and thread-mode contexts) currently
+    /// handles an empty node-set by logging to `stderr` and
+    /// returning — the worker silently proceeds with default kernel
+    /// placement instead of the requested NUMA binding. That
+    /// silent-skip violates the project-wide no-silent-drops
+    /// invariant (the test reports success while the actual workload
+    /// ran with the wrong placement).
+    ///
+    /// A hypothetical fix-it-in-the-worker design — `libc::_exit(1)`
+    /// on an empty node-set inside the worker — was rejected because
+    /// it is unsound for thread-mode workers: `_exit` invokes
+    /// `exit_group(2)` (verified at kernel/exit.c::do_group_exit →
+    /// `zap_other_threads`) which terminates EVERY thread in the
+    /// caller's tgid. A thread-mode worker shares its tgid with the
+    /// test runner, so an inner `_exit(1)` would kill the runner.
+    /// Rejecting at the config layer keeps the failure visible as a
+    /// returnable `Result` BEFORE any worker context exists,
+    /// regardless of clone-mode dispatch, and avoids the exit_group
+    /// hazard entirely.
+    ///
+    /// # What is validated
+    ///
+    /// The primary group's `mem_policy` plus every composed
+    /// [`WorkSpec`]'s `mem_policy`. Per-entry errors name the
+    /// offending slot ("primary" or "composed[N] (group_idx M)") so
+    /// the test author can locate the misconfigured group.
+    ///
+    /// # Scope
+    ///
+    /// Currently validates only `mem_policy` on the primary group +
+    /// each composed [`WorkSpec`]. Other field invariants are
+    /// validated at their own use sites: `num_workers` via
+    /// [`WorkSpec::resolve_workers_pct`] (and the spawn-time
+    /// [`WorkloadHandle::spawn`] derivation cascade); [`WorkType`]
+    /// payloads via per-variant constructors and
+    /// `validate_workload_admission`; [`AffinityIntent`] topology
+    /// rules at the scenario-engine
+    /// `resolve_affinity_for_cgroup` resolver. This method is the
+    /// home for invariants that must hold BEFORE any worker context
+    /// (threads, forks, cgroups) exists — `mem_policy` qualifies
+    /// because of the silent-skip + `exit_group` hazard noted
+    /// above; future fields with the same "must-fail-before-spawn"
+    /// shape belong here too.
+    ///
+    /// # Return type
+    ///
+    /// Returns [`anyhow::Result`] (composite-layer convention used
+    /// by sibling composite validators
+    /// [`crate::test_support::entry::KtstrTestEntry::validate`] and
+    /// [`crate::test_support::entry::TopologyConstraints::validate`]
+    /// — they wrap leaf validators that return
+    /// `Result<(), String>` with slot-context). The leaf validator
+    /// [`MemPolicy::validate`] returns `Result<(), String>` to match
+    /// the leaf convention used by every per-spec validator in the
+    /// project.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.mem_policy.validate().map_err(|e| {
+            anyhow::anyhow!(
+                "WorkloadConfig.mem_policy (primary group): {e}",
+            )
+        })?;
+        for (idx, spec) in self.composed.iter().enumerate() {
+            spec.mem_policy.validate().map_err(|e| {
+                anyhow::anyhow!(
+                    "WorkloadConfig.composed[{idx}].mem_policy (group_idx {}): {e}",
+                    idx + 1,
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     /// Set the number of worker processes.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn workers(mut self, n: usize) -> Self {
@@ -1642,6 +1741,15 @@ mod tests {
             err.contains("Bind") && err.contains("NUMA node"),
             "diagnostic must name the variant and required content: {err}",
         );
+        // Actionable-trailer pin (#41 tester gap): the trailer points
+        // at the constructor a copy-paste fix would use. A future
+        // simplification that strips the trailer back to the terse
+        // form would silently regress the documented inline-fix UX
+        // (see MemPolicy::validate doc).
+        assert!(
+            err.contains("MemPolicy::bind("),
+            "diagnostic must name the recommended constructor: {err}",
+        );
     }
     #[test]
     fn mempolicy_validate_interleave_empty() {
@@ -1652,21 +1760,48 @@ mod tests {
             err.contains("Interleave") && err.contains("NUMA node"),
             "diagnostic must name the variant and required content: {err}",
         );
+        assert!(
+            err.contains("MemPolicy::interleave("),
+            "diagnostic must name the recommended constructor: {err}",
+        );
     }
     #[test]
     fn mempolicy_validate_preferred_many_empty() {
+        let err = MemPolicy::PreferredMany(BTreeSet::new())
+            .validate()
+            .unwrap_err();
         assert!(
-            MemPolicy::PreferredMany(BTreeSet::new())
-                .validate()
-                .is_err()
+            err.contains("PreferredMany") && err.contains("NUMA node"),
+            "diagnostic must name the variant and required content: {err}",
+        );
+        assert!(
+            err.contains("MemPolicy::preferred_many("),
+            "diagnostic must name the recommended constructor: {err}",
         );
     }
     #[test]
     fn mempolicy_validate_weighted_interleave_empty() {
+        let err = MemPolicy::WeightedInterleave(BTreeSet::new())
+            .validate()
+            .unwrap_err();
         assert!(
-            MemPolicy::WeightedInterleave(BTreeSet::new())
-                .validate()
-                .is_err()
+            err.contains("WeightedInterleave") && err.contains("NUMA node"),
+            "diagnostic must name the variant and required content: {err}",
+        );
+        assert!(
+            err.contains("MemPolicy::weighted_interleave("),
+            "diagnostic must name the recommended constructor: {err}",
+        );
+        // Phd D1 regression guard: the WeightedInterleave trailer
+        // previously suggested `MemPolicy::Interleave([...])` (capital
+        // I — the tuple variant) which won't compile because
+        // `Interleave(BTreeSet<usize>)` cannot be constructed from
+        // a literal array. The correct suggestion is the lowercase
+        // `interleave(...)` function constructor. This assertion
+        // pins the fix.
+        assert!(
+            !err.contains("MemPolicy::Interleave(["),
+            "diagnostic must not suggest the non-compiling capital-I Interleave variant with a literal array: {err}",
         );
     }
     #[test]
@@ -1676,6 +1811,103 @@ mod tests {
     #[test]
     fn mempolicy_validate_weighted_interleave_ok() {
         assert!(MemPolicy::weighted_interleave([0, 1]).validate().is_ok());
+    }
+
+    #[test]
+    fn workload_config_validate_accepts_default() {
+        WorkloadConfig::default()
+            .validate()
+            .expect("WorkloadConfig::default must self-validate (mem_policy=Default)");
+    }
+
+    #[test]
+    fn workload_config_validate_rejects_invalid_primary_mempolicy() {
+        let cfg = WorkloadConfig::default().mem_policy(MemPolicy::Bind(BTreeSet::new()));
+        let err = cfg
+            .validate()
+            .expect_err("empty Bind nodemask on primary must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("primary") && msg.contains("Bind") && msg.contains("NUMA node"),
+            "diagnostic must name the slot (primary), the variant (Bind), and the constraint (NUMA node): got {msg}",
+        );
+    }
+
+    #[test]
+    fn workload_config_validate_rejects_invalid_composed_mempolicy() {
+        let bad = WorkSpec::default()
+            .work_type(WorkType::SpinWait)
+            .mem_policy(MemPolicy::Interleave(BTreeSet::new()));
+        let cfg = WorkloadConfig::default().composed(vec![bad]);
+        let err = cfg
+            .validate()
+            .expect_err("empty Interleave nodemask on composed[0] must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("composed[0]") && msg.contains("group_idx 1") && msg.contains("Interleave"),
+            "diagnostic must name composed[0] + group_idx 1 + Interleave: got {msg}",
+        );
+    }
+
+    #[test]
+    fn workload_config_validate_accepts_valid_composed_mempolicy() {
+        let ok = WorkSpec::default()
+            .work_type(WorkType::SpinWait)
+            .mem_policy(MemPolicy::Bind([0].into_iter().collect()));
+        let cfg = WorkloadConfig::default().composed(vec![ok]);
+        cfg.validate()
+            .expect("non-empty Bind on composed[0] must validate");
+    }
+
+    /// Pins `?` short-circuit semantics in the composed-validation
+    /// loop. composed[0] is valid; composed[1] is invalid Bind;
+    /// composed[2] is invalid Interleave. The first invalid entry
+    /// (composed[1]) must surface; subsequent invalid entries
+    /// (composed[2]) must NOT appear in the diagnostic. A regression
+    /// that switched to an error-accumulator pattern (try_fold into a
+    /// Vec, partition, etc.) would change which composed[N] appears,
+    /// silently inverting the test-author's debugging order. Editor
+    /// note: `.collect::<Result<_, _>>()` also short-circuits on the
+    /// first Err, so swapping the for-loop for collect wouldn't break
+    /// this assertion — only a true accumulator would.
+    #[test]
+    fn workload_config_validate_short_circuits_first_invalid_composed() {
+        let valid_spec = WorkSpec::default()
+            .work_type(WorkType::SpinWait)
+            .mem_policy(MemPolicy::Bind([0].into_iter().collect()));
+        let invalid_bind = WorkSpec::default()
+            .work_type(WorkType::SpinWait)
+            .mem_policy(MemPolicy::Bind(BTreeSet::new()));
+        let invalid_interleave = WorkSpec::default()
+            .work_type(WorkType::SpinWait)
+            .mem_policy(MemPolicy::Interleave(BTreeSet::new()));
+        let cfg = WorkloadConfig::default()
+            .composed(vec![valid_spec, invalid_bind, invalid_interleave]);
+        let err = cfg
+            .validate()
+            .expect_err("multi-composed with invalid entries must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("composed[1]"),
+            "diagnostic must name the FIRST invalid composed entry (composed[1]): got {msg}",
+        );
+        assert!(
+            msg.contains("Bind"),
+            "diagnostic must name the first failing variant (Bind): got {msg}",
+        );
+        // The negative assertion is LOAD-BEARING on the short-circuit
+        // semantics (`?` in the validate loop returns on first Err),
+        // not on the wrap content. A future "errors-trailing-
+        // suggestions" rewrite that mentions composed.len() or
+        // re-formats the wrap to include sibling indices would
+        // silently break this guard — at which point the right fix
+        // is to assert on the structural property (e.g. count of
+        // anyhow::Error frames) rather than to relax the substring
+        // check.
+        assert!(
+            !msg.contains("composed[2]"),
+            "short-circuit must not surface the second invalid entry (composed[2]): got {msg}",
+        );
     }
     #[test]
     fn mpol_flags_union() {
