@@ -1970,65 +1970,72 @@ mod tests {
     // these on directory creation; tmpfs needs them touched), invoke
     // the method, and assert on the resulting file contents.
 
-    fn make_test_cgroup(label: &str) -> (PathBuf, CgroupManager) {
-        let dir = std::env::temp_dir().join(format!("ktstr-cg-{label}-{}", std::process::id()));
+    /// Spin up an isolated tempdir + pre-populated `cg_x` subdir +
+    /// `CgroupManager` for a single `#[test]` body. The returned
+    /// `TempDir` is the RAII teardown handle; binding it as `_tmp`
+    /// (underscore prefix) keeps it alive for the duration of the
+    /// test and lets `Drop` recursively remove the dir on test exit
+    /// (success OR panic). `dir` is the same path as a `PathBuf`
+    /// for test bodies that use `dir.join(...)` to build target
+    /// file paths.
+    fn make_test_cgroup(label: &str) -> (tempfile::TempDir, PathBuf, CgroupManager) {
+        let tmp = tempfile::Builder::new()
+            .prefix(&format!("ktstr-cg-{label}-"))
+            .tempdir()
+            .unwrap();
+        let dir = tmp.path().to_path_buf();
         fs::create_dir_all(dir.join("cg_x")).unwrap();
         let cg = CgroupManager::new(dir.to_str().unwrap());
-        (dir, cg)
+        (tmp, dir, cg)
     }
 
     #[test]
     fn set_cpu_max_writes_quota_and_period_when_some() {
-        let (dir, cg) = make_test_cgroup("cpu-max-some");
+        let (_tmp, dir, cg) = make_test_cgroup("cpu-max-some");
         let target = dir.join("cg_x").join("cpu.max");
         fs::write(&target, "").unwrap();
         cg.set_cpu_max("cg_x", Some(50_000), 100_000).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "50000 100000");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn set_cpu_max_writes_max_keyword_when_none() {
-        let (dir, cg) = make_test_cgroup("cpu-max-none");
+        let (_tmp, dir, cg) = make_test_cgroup("cpu-max-none");
         let target = dir.join("cg_x").join("cpu.max");
         fs::write(&target, "").unwrap();
         cg.set_cpu_max("cg_x", None, 100_000).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "max 100000");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn set_cpu_weight_writes_decimal_value() {
-        let (dir, cg) = make_test_cgroup("cpu-weight");
+        let (_tmp, dir, cg) = make_test_cgroup("cpu-weight");
         let target = dir.join("cg_x").join("cpu.weight");
         fs::write(&target, "").unwrap();
         cg.set_cpu_weight("cg_x", 250).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "250");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn set_memory_max_writes_bytes_or_max_keyword() {
-        let (dir, cg) = make_test_cgroup("mem-max");
+        let (_tmp, dir, cg) = make_test_cgroup("mem-max");
         let target = dir.join("cg_x").join("memory.max");
         fs::write(&target, "").unwrap();
         cg.set_memory_max("cg_x", Some(1_048_576)).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "1048576");
         cg.set_memory_max("cg_x", None).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "max");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn set_memory_high_writes_bytes_or_max_keyword() {
-        let (dir, cg) = make_test_cgroup("mem-high");
+        let (_tmp, dir, cg) = make_test_cgroup("mem-high");
         let target = dir.join("cg_x").join("memory.high");
         fs::write(&target, "").unwrap();
         cg.set_memory_high("cg_x", Some(524_288)).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "524288");
         cg.set_memory_high("cg_x", None).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "max");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// `memory.low`'s "no protection" wire value is `"0"`, NOT
@@ -2036,24 +2043,22 @@ mod tests {
     /// `memory.low`. Pin both the bytes-set and the cleared paths.
     #[test]
     fn set_memory_low_writes_bytes_or_zero() {
-        let (dir, cg) = make_test_cgroup("mem-low");
+        let (_tmp, dir, cg) = make_test_cgroup("mem-low");
         let target = dir.join("cg_x").join("memory.low");
         fs::write(&target, "").unwrap();
         cg.set_memory_low("cg_x", Some(2_048)).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "2048");
         cg.set_memory_low("cg_x", None).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "0");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn set_io_weight_writes_decimal_value() {
-        let (dir, cg) = make_test_cgroup("io-weight");
+        let (_tmp, dir, cg) = make_test_cgroup("io-weight");
         let target = dir.join("cg_x").join("io.weight");
         fs::write(&target, "").unwrap();
         cg.set_io_weight("cg_x", 500).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "500");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// `set_freeze(true)` writes the literal `"1"`; `false` writes
@@ -2062,14 +2067,13 @@ mod tests {
     /// or "frozen" would surface as a syscall failure on real cgroupfs.
     #[test]
     fn set_freeze_writes_zero_or_one() {
-        let (dir, cg) = make_test_cgroup("freeze");
+        let (_tmp, dir, cg) = make_test_cgroup("freeze");
         let target = dir.join("cg_x").join("cgroup.freeze");
         fs::write(&target, "").unwrap();
         cg.set_freeze("cg_x", true).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "1");
         cg.set_freeze("cg_x", false).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "0");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// `set_pids_max(Some(n))` writes the decimal `n`;
@@ -2078,14 +2082,13 @@ mod tests {
     /// `pids_max_write`.
     #[test]
     fn set_pids_max_writes_decimal_or_max_keyword() {
-        let (dir, cg) = make_test_cgroup("pids-max");
+        let (_tmp, dir, cg) = make_test_cgroup("pids-max");
         let target = dir.join("cg_x").join("pids.max");
         fs::write(&target, "").unwrap();
         cg.set_pids_max("cg_x", Some(1024)).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "1024");
         cg.set_pids_max("cg_x", None).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "max");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// `set_memory_swap_max(Some(b))` writes the decimal byte count;
@@ -2093,7 +2096,7 @@ mod tests {
     /// `page_counter_memparse` recognises in `swap_max_write`.
     #[test]
     fn set_memory_swap_max_writes_bytes_or_max_keyword() {
-        let (dir, cg) = make_test_cgroup("mem-swap-max");
+        let (_tmp, dir, cg) = make_test_cgroup("mem-swap-max");
         let target = dir.join("cg_x").join("memory.swap.max");
         fs::write(&target, "").unwrap();
         cg.set_memory_swap_max("cg_x", Some(2 * 1024 * 1024))
@@ -2101,7 +2104,6 @@ mod tests {
         assert_eq!(fs::read_to_string(&target).unwrap(), "2097152");
         cg.set_memory_swap_max("cg_x", None).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "max");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     // -- validate_cgroup_name ----------------------------------------
@@ -2232,7 +2234,7 @@ mod tests {
     /// case is checked here.
     #[test]
     fn set_freeze_is_idempotent_when_already_in_target_state() {
-        let (dir, cg) = make_test_cgroup("freeze-idem");
+        let (_tmp, dir, cg) = make_test_cgroup("freeze-idem");
         let target = dir.join("cg_x").join("cgroup.freeze");
         fs::write(&target, "").unwrap();
         cg.set_freeze("cg_x", true).unwrap();
@@ -2245,7 +2247,6 @@ mod tests {
         assert_eq!(fs::read_to_string(&target).unwrap(), "0");
         cg.set_freeze("cg_x", false).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "0");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     // -- pids.max / memory.swap.max overflow boundary ---------------
@@ -2258,7 +2259,7 @@ mod tests {
     /// u32 (which would silently saturate).
     #[test]
     fn set_pids_max_writes_u64_max_verbatim() {
-        let (dir, cg) = make_test_cgroup("pids-overflow");
+        let (_tmp, dir, cg) = make_test_cgroup("pids-overflow");
         let target = dir.join("cg_x").join("pids.max");
         fs::write(&target, "").unwrap();
         cg.set_pids_max("cg_x", Some(u64::MAX)).unwrap();
@@ -2267,14 +2268,13 @@ mod tests {
             u64::MAX.to_string(),
             "u64::MAX must round-trip without narrowing or sign change"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// `set_memory_swap_max(Some(u64::MAX))` mirrors the pids.max
     /// boundary check. Catches the same narrowing-regression class.
     #[test]
     fn set_memory_swap_max_writes_u64_max_verbatim() {
-        let (dir, cg) = make_test_cgroup("swap-overflow");
+        let (_tmp, dir, cg) = make_test_cgroup("swap-overflow");
         let target = dir.join("cg_x").join("memory.swap.max");
         fs::write(&target, "").unwrap();
         cg.set_memory_swap_max("cg_x", Some(u64::MAX)).unwrap();
@@ -2283,7 +2283,6 @@ mod tests {
             u64::MAX.to_string(),
             "u64::MAX must round-trip without narrowing or sign change"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     // -- write_with_timeout failure paths for new methods ------------
