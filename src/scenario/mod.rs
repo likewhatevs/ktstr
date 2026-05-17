@@ -714,6 +714,10 @@ pub(crate) fn resolve_num_workers(work: &WorkSpec, default_n: usize, label: &str
 ///   (intersection empty).
 /// - [`AffinityIntent::SmtSiblingPair`]: no physical core with
 ///   ≥2 SMT siblings inside the cpuset.
+/// - [`AffinityIntent::CrossCgroup`]: topology exposes zero CPUs.
+///   The public [`crate::topology::TestTopology`] constructors all
+///   reject this at construction; reaching this case requires a
+///   private-field construction or a future API addition.
 ///
 /// Every error diagnostic names the offending intent and a
 /// remediation hint. Diagnostics for cpuset-narrowed pools
@@ -810,7 +814,33 @@ pub fn resolve_affinity_for_cgroup(
             // When a cpuset is active, crossing cgroup boundaries is the intent,
             // but the kernel will intersect. Use all CPUs -- the kernel enforces
             // the cpuset constraint.
-            Ok(ResolvedAffinity::Fixed(topo.all_cpuset()))
+            let all = topo.all_cpuset();
+            if all.is_empty() {
+                // Defense-in-depth against zero-CPU topologies. The two
+                // public TestTopology constructors (`synthetic` +
+                // `from_vm_topology`) both reject `num_cpus == 0` at
+                // construction, so reaching this branch requires a
+                // private-field construction or a future API addition
+                // that produces a zero-CPU topology. Without this bail
+                // an empty `Fixed` would either trip the
+                // `flatten_for_spawn` unreachable!() OR (if reached via
+                // a path that bypassed flatten) silently produce an
+                // empty `sched_setaffinity` mask the kernel rejects
+                // with EINVAL after the cgroup intersection.
+                anyhow::bail!(
+                    "AffinityIntent::CrossCgroup cannot satisfy any worker — \
+                     the topology exposes zero CPUs. The public \
+                     TestTopology constructors (`synthetic` + \
+                     `from_vm_topology`) reject this at construction; \
+                     reaching this bail means a direct private-field \
+                     construction or a future API addition produced a \
+                     zero-CPU topology. Build the test against a \
+                     topology with at least one CPU, or switch to \
+                     `AffinityIntent::Inherit` to defer to the cgroup \
+                     cpuset.",
+                );
+            }
+            Ok(ResolvedAffinity::Fixed(all))
         }
         AffinityIntent::SingleCpu => {
             let pool = cpuset.cloned().unwrap_or_else(|| topo.all_cpuset());
@@ -976,9 +1006,10 @@ fn resolve_smt_sibling_pair(
 /// — see that function's `# Errors` section for the full list of
 /// unsatisfiable cases (RandomSubset empty pool / count=0,
 /// LlcAligned no-overlap, SingleCpu empty cpuset, Exact empty or
-/// disjoint, SmtSiblingPair no-pair-in-cpuset). The empty-pool
-/// "silent degrade to Inherit" policy that previously lived here
-/// was removed — empty pools are operator bugs, not "soft" fallbacks.
+/// disjoint, SmtSiblingPair no-pair-in-cpuset, CrossCgroup on
+/// zero-CPU topology). The empty-pool "silent degrade to Inherit"
+/// policy that previously lived here was removed — empty pools are
+/// operator bugs, not "soft" fallbacks.
 pub(crate) fn intent_for_spawn(
     kind: &AffinityIntent,
     cpuset: Option<&BTreeSet<usize>>,
@@ -997,11 +1028,12 @@ fn flatten_for_spawn(resolved: ResolvedAffinity) -> AffinityIntent {
                 // Invariant: resolve_affinity_for_cgroup bails before
                 // constructing an empty Fixed (LlcAligned
                 // empty-effective bail, Exact empty-input bail, Exact
-                // disjoint-intersection bail). Reaching here means a
-                // future constructor of ResolvedAffinity::Fixed
-                // bypassed those checks — panic loudly so the
-                // regression surfaces at the construction site, not
-                // as a silent inheritance downstream.
+                // disjoint-intersection bail, CrossCgroup zero-CPU
+                // topology bail). Reaching here means a future
+                // constructor of ResolvedAffinity::Fixed bypassed
+                // those checks — panic loudly so the regression
+                // surfaces at the construction site, not as a silent
+                // inheritance downstream.
                 unreachable!(
                     "ResolvedAffinity::Fixed(empty) reached flatten_for_spawn — \
                      resolve_affinity_for_cgroup is supposed to bail on every \
