@@ -340,10 +340,11 @@ impl Verdict {
     fn record_pass(
         &mut self,
         name: &str,
-        comparator: &str,
+        comparator: impl Into<std::borrow::Cow<'static, str>>,
         value: String,
         expected: Option<String>,
     ) {
+        let comparator = comparator.into();
         if self.log_passes {
             match expected.as_ref() {
                 Some(exp) => tracing::info!(

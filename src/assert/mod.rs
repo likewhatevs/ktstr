@@ -392,6 +392,23 @@ impl AssertDetail {
 /// optional `expected` for binary comparators. Unary comparators
 /// (e.g. `is_finite`, `is_empty`) leave `expected = None`.
 ///
+/// `comparator` is a [`Cow<'static, str>`] so call sites passing a
+/// `&'static str` literal — the universal case for built-in
+/// comparators — pay zero allocation; runtime-built comparator
+/// labels store as `Cow::Owned`. The same `Cow` shape applies to
+/// `phase` (set by the per-step RAII guard's static label in the
+/// common case).
+///
+/// **Structurally distinct from [`AssertDetail`]**: PassDetail
+/// carries a uniform per-claim shape (every comparator emits
+/// `name + comparator + value + expected`), while AssertDetail
+/// uses a `kind: DetailKind` category enum because failure /
+/// note / warning shapes diverge. Forcing them to one mold would
+/// either lose comparator-typed slots (collapse to kind+message)
+/// or invent a Pass variant of DetailKind that doesn't carry the
+/// typed slots cleanly. Keeping them separate is a deliberate
+/// design choice, not an inconsistency.
+///
 /// Distinct from a one-line tracing log — the structured form is
 /// the data path the auto-repro renderer reads to compose the
 /// bracketed phase output that surfaces passing context alongside
@@ -400,7 +417,7 @@ impl AssertDetail {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PassDetail {
     pub name: String,
-    pub comparator: String,
+    pub comparator: std::borrow::Cow<'static, str>,
     pub value: String,
     pub expected: Option<String>,
     /// Scenario phase the claim was made under. `None` outside any
@@ -408,8 +425,9 @@ pub struct PassDetail {
     /// thread-local has been installed at the scenario-driver step
     /// loop entry. The auto-repro renderer groups passes by this
     /// field to compose the bracketed `==== PHASE N: <label> ====`
-    /// output.
-    pub phase: Option<String>,
+    /// output. [`Cow<'static, str>`] so the common case (the RAII
+    /// guard's static `&'static str` label) pays zero allocation.
+    pub phase: Option<std::borrow::Cow<'static, str>>,
 }
 
 impl PassDetail {
@@ -419,7 +437,7 @@ impl PassDetail {
     /// `T`-agnostic on the wire.
     pub fn binary(
         name: impl Into<String>,
-        comparator: impl Into<String>,
+        comparator: impl Into<std::borrow::Cow<'static, str>>,
         value: impl Into<String>,
         expected: impl Into<String>,
     ) -> Self {
@@ -437,7 +455,7 @@ impl PassDetail {
     /// alone carries the meaning.
     pub fn unary(
         name: impl Into<String>,
-        comparator: impl Into<String>,
+        comparator: impl Into<std::borrow::Cow<'static, str>>,
         value: impl Into<String>,
     ) -> Self {
         Self {
@@ -447,6 +465,17 @@ impl PassDetail {
             expected: None,
             phase: None,
         }
+    }
+
+    /// Builder-style setter for [`Self::phase`]. Consumes self,
+    /// stamps the phase label, returns the updated value so
+    /// per-phase test fixtures and the [`PhaseGuard`] RAII helper can chain
+    /// `PassDetail::binary(...).with_phase("step_0")`.
+    /// `&'static str` literals stay `Cow::Borrowed` (zero alloc);
+    /// runtime-built `String` becomes `Cow::Owned`.
+    pub fn with_phase(mut self, phase: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        self.phase = Some(phase.into());
+        self
     }
 }
 
@@ -467,9 +496,16 @@ pub const MAX_RECORDED_PASSES: usize = 10_000;
 
 /// Sentinel `PassDetail.name` value used by the truncation record
 /// that replaces the `MAX_RECORDED_PASSES`-th slot when a test
-/// over-runs the cap. Consumers (the auto-repro renderer in #140)
-/// match on this string to render `[N passes truncated]` instead
-/// of treating it as a real claim.
+/// over-runs the cap. Consumers (the auto-repro renderer) match on
+/// this string to render `[N passes truncated]` instead of treating
+/// it as a real claim.
+///
+/// **Truncation-check idiom**: a caller checking
+/// `result.passes.len() == MAX_RECORDED_PASSES` MISSES the truncated
+/// state because the truncation sentinel pushes the vec to
+/// `MAX_RECORDED_PASSES + 1`. The correct check is
+/// `result.passes.last().map(|p| p.name == PASSES_TRUNCATION_SENTINEL_NAME)
+/// .unwrap_or(false)` — i.e. inspect the tail entry's name.
 pub const PASSES_TRUNCATION_SENTINEL_NAME: &str = "__ktstr_passes_truncated__";
 
 /// `Display` adapter returned by [`AssertDetail::display_with_kind`].
@@ -617,6 +653,17 @@ impl From<&str> for NoteValue {
     }
 }
 
+/// Verdict for a single test scenario.
+///
+/// **Wire-format stability**: this struct is postcard-serialized as
+/// part of the in-VM `MSG_TYPE_TEST_RESULT` payload and as
+/// sidecar artifacts under `~/.cache/ktstr`. The wire format is
+/// **not stable across crate versions** — pre-1.0, fields can be
+/// added, removed, or reshaped at any time, and old sidecars must
+/// be regenerated after upgrades (re-running the affected tests
+/// produces a fresh sidecar). Per the project's pre-1.0 no-compat
+/// stance ([`crate::scenario`] module-level doc), no
+/// `#[serde(default)]` shims are added for old payloads.
 #[must_use = "test verdict is lost if not checked"]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AssertResult {
@@ -640,6 +687,22 @@ pub struct AssertResult {
     /// records claims. The auto-repro renderer iterates both vecs
     /// to compose the bracketed phase-grouped output that surfaces
     /// passing context alongside failing assertions.
+    ///
+    /// **Bounded by [`MAX_RECORDED_PASSES`]** — past that count,
+    /// further pushes drop on the floor and a single sentinel
+    /// record named [`PASSES_TRUNCATION_SENTINEL_NAME`] appears at
+    /// the tail. Use the sentinel-name check (not `len()`
+    /// arithmetic) to detect truncation.
+    ///
+    /// **Test-author convention**: do NOT pin `result.passes` shape
+    /// or contents in test assertions unless the test exists
+    /// specifically to verify the structured-pass surface (e.g.
+    /// the auto-repro renderer's own coverage tests). The field
+    /// exists for the renderer's consumption; pinning it
+    /// elsewhere makes the test surface viral — every new
+    /// comparator that fires under the test starts churning the
+    /// pin. Pin `passed`, `details`, and `measurements` for
+    /// scenario verification.
     pub passes: Vec<PassDetail>,
     /// Aggregated stats from all workers in this scenario.
     pub stats: ScenarioStats,
