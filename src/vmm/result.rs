@@ -575,25 +575,11 @@ mod tests {
     #[test]
     fn vm_result_fields_carry_values() {
         let r = VmResult {
-            success: true,
-            exit_code: 0,
             duration: Duration::from_secs(5),
-            timed_out: false,
             output: "hello world".into(),
             stderr: "boot log".into(),
-            monitor: None,
-            guest_messages: None,
-            stimulus_events: Vec::new(),
-            verifier_stats: Vec::new(),
-            kvm_stats: None,
-            crash_message: None,
             cleanup_duration: Some(Duration::from_millis(50)),
-            virtio_blk_counters: None,
-            virtio_net_counters: None,
-            snapshot_bridge: empty_snapshot_bridge_for_tests(),
-            stats_client: None,
-            periodic_fired: 0,
-            periodic_target: 0,
+            ..VmResult::test_fixture()
         };
         assert!(r.success);
         assert_eq!(r.exit_code, 0);
@@ -615,27 +601,18 @@ mod tests {
             exit_code: 1,
             duration: Duration::from_millis(500),
             timed_out: true,
-            output: String::new(),
-            stderr: String::new(),
-            monitor: None,
-            guest_messages: None,
-            stimulus_events: Vec::new(),
-            verifier_stats: Vec::new(),
-            kvm_stats: None,
-            crash_message: None,
-            cleanup_duration: None,
             virtio_blk_counters: Some(VirtioBlkCountersSnapshot::default()),
-            virtio_net_counters: None,
-            snapshot_bridge: empty_snapshot_bridge_for_tests(),
-            stats_client: None,
-            periodic_fired: 0,
-            periodic_target: 0,
+            periodic_fired: 3,
+            periodic_target: 7,
+            ..VmResult::test_fixture()
         };
         assert!(!r2.success);
         assert_eq!(r2.exit_code, 1);
         assert!(r2.timed_out);
         assert_eq!(r2.duration, Duration::from_millis(500));
         assert!(r2.cleanup_duration.is_none());
+        assert_eq!(r2.periodic_fired, 3);
+        assert_eq!(r2.periodic_target, 7);
         // Opposite polarity: counters present. Reads must observe
         // the default-zero values for every field — a future field
         // added to VirtioBlkCountersSnapshot that doesn't initialise
@@ -659,25 +636,8 @@ mod tests {
     #[test]
     fn vm_result_without_monitor_has_no_samples() {
         let r = VmResult {
-            success: true,
-            exit_code: 0,
-            duration: Duration::from_secs(1),
-            timed_out: false,
             output: "test output".into(),
-            stderr: String::new(),
-            monitor: None,
-            guest_messages: None,
-            stimulus_events: Vec::new(),
-            verifier_stats: Vec::new(),
-            kvm_stats: None,
-            crash_message: None,
-            cleanup_duration: None,
-            virtio_blk_counters: None,
-            virtio_net_counters: None,
-            snapshot_bridge: empty_snapshot_bridge_for_tests(),
-            stats_client: None,
-            periodic_fired: 0,
-            periodic_target: 0,
+            ..VmResult::test_fixture()
         };
         assert!(r.monitor.is_none());
         // Output and exit_code must still be accessible.
@@ -707,21 +667,9 @@ mod tests {
             exit_code: 1,
             duration: Duration::from_millis(500),
             timed_out: true,
-            output: String::new(),
             stderr: "kernel panic".into(),
             monitor: Some(report),
-            guest_messages: None,
-            stimulus_events: Vec::new(),
-            verifier_stats: Vec::new(),
-            kvm_stats: None,
-            crash_message: None,
-            cleanup_duration: None,
-            virtio_blk_counters: None,
-            virtio_net_counters: None,
-            snapshot_bridge: empty_snapshot_bridge_for_tests(),
-            stats_client: None,
-            periodic_fired: 0,
-            periodic_target: 0,
+            ..VmResult::test_fixture()
         };
         let mon = r.monitor.as_ref().unwrap();
         assert_eq!(mon.summary.total_samples, 5);
