@@ -192,15 +192,12 @@ pub(super) fn try_save(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_helpers::{isolated_cache_dir, lock_env};
 
     #[test]
     fn roundtrip_save_load() {
-        let _tempdir_keep_alive = tempfile::Builder::new()
-            .prefix("ktstr_persist_test_")
-            .tempdir()
-            .unwrap();
-        let dir = _tempdir_keep_alive.path();
-        unsafe { std::env::set_var("KTSTR_CACHE_DIR", dir) };
+        let _env_lock = lock_env();
+        let _cache = isolated_cache_dir();
 
         let mut cast_map = BTreeMap::new();
         cast_map.insert(
@@ -251,12 +248,8 @@ mod tests {
 
     #[test]
     fn load_wrong_btf_count_returns_none() {
-        let _tempdir_keep_alive = tempfile::Builder::new()
-            .prefix("ktstr_persist_btf_")
-            .tempdir()
-            .unwrap();
-        let dir = _tempdir_keep_alive.path();
-        unsafe { std::env::set_var("KTSTR_CACHE_DIR", dir) };
+        let _env_lock = lock_env();
+        let _cache = isolated_cache_dir();
 
         let cast_map = BTreeMap::new();
         let fwd_index = HashMap::new();
@@ -271,6 +264,7 @@ mod tests {
 
     #[test]
     fn load_nonexistent_returns_none() {
+        let _env_lock = lock_env();
         assert!(try_load(0xFFFF_FFFF_FFFF_FFFFu64, 1).is_none());
     }
 }
