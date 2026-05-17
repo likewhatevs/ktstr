@@ -624,6 +624,53 @@ pub mod __private {
 #[cfg(feature = "integration")]
 pub use crate::probe::process::resolve_func_ip;
 
+/// The `linkme` crate, re-exported as part of ktstr's public surface
+/// so downstream code can reference it via [`ktstr::linkme`](crate::linkme)
+/// in the `#[linkme(crate = ...)]` annotation that
+/// [`distributed_slice`](crate::distributed_slice) registrations
+/// require — without having to add `linkme` as a direct Cargo
+/// dependency. See [`distributed_slice`](crate::distributed_slice)
+/// for the usage pattern.
+pub use ::linkme;
+
+/// `linkme::distributed_slice` re-exported as part of ktstr's public
+/// surface. Combined with [`crate::linkme`] for the
+/// `#[linkme(crate = ...)]` annotation, this lets a downstream crate
+/// register entries into
+/// [`KTSTR_TESTS`](crate::test_support::KTSTR_TESTS) or
+/// [`KTSTR_SCHEDULERS`](crate::test_support::KTSTR_SCHEDULERS)
+/// without adding `linkme` as a direct Cargo dependency:
+///
+/// ```ignore
+/// use ktstr::prelude::*;
+///
+/// fn my_test_fn(_ctx: &Ctx) -> Result<AssertResult> {
+///     Ok(AssertResult::pass())
+/// }
+///
+/// #[distributed_slice(KTSTR_TESTS)]
+/// #[linkme(crate = ktstr::linkme)]
+/// static MY_ENTRY: KtstrTestEntry = KtstrTestEntry {
+///     name: "my_test",
+///     func: my_test_fn,
+///     ..KtstrTestEntry::DEFAULT
+/// };
+/// ```
+///
+/// The `#[linkme(crate = ...)]` annotation is REQUIRED because the
+/// `linkme` proc-macro expansion hardcodes `::linkme::DistributedSlice`
+/// — without the annotation, downstream crates without `linkme` in
+/// their `Cargo.toml` get an unresolved-import error.
+/// The annotation tells the macro to resolve type references through
+/// `ktstr::linkme` instead, which IS reachable from downstream by
+/// transitive dependency.
+///
+/// Downstream crates that already depend on `linkme = "0.3"` directly
+/// can omit the annotation. The `#[ktstr_test]` proc macro emits both
+/// attributes internally so test authors using the standard macro
+/// surface never have to spell either out.
+pub use linkme::distributed_slice;
+
 /// Re-exports for writing `#[ktstr_test]` functions.
 ///
 /// ```rust
@@ -650,6 +697,7 @@ pub mod prelude {
     pub use crate::cgroup::CgroupManager;
     pub use crate::claim;
     pub use crate::declare_scheduler;
+    pub use crate::distributed_slice;
     pub use crate::host_context::HostContext;
     pub use crate::host_heap::HostHeapState;
     pub use crate::ktstr_test;

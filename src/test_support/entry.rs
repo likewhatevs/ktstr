@@ -1307,8 +1307,8 @@ impl KtstrTestEntry {
     ///     Ok(AssertResult::pass())
     /// }
     ///
-    /// #[ktstr::__private::linkme::distributed_slice(KTSTR_TESTS)]
-    /// #[linkme(crate = ktstr::__private::linkme)]
+    /// #[distributed_slice(KTSTR_TESTS)]
+    /// #[linkme(crate = ktstr::linkme)]
     /// static ENTRY: KtstrTestEntry = KtstrTestEntry {
     ///     name: "my_test",
     ///     func: my_test_fn,
@@ -1316,6 +1316,10 @@ impl KtstrTestEntry {
     ///     ..KtstrTestEntry::DEFAULT
     /// };
     /// ```
+    ///
+    /// The `#[linkme(crate = ktstr::linkme)]` annotation is required
+    /// when the downstream crate does not depend on `linkme` directly
+    /// — see [`crate::distributed_slice`] for the full rationale.
     pub const DEFAULT: Self = Self {
         name: "",
         func: default_test_func,
