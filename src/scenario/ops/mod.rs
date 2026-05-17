@@ -75,7 +75,7 @@ use crate::scenario::backdrop;
 use crate::scenario::{CgroupGroup, Ctx, process_alive};
 use crate::vmm::guest_comms;
 use crate::vmm::wire::StimulusPayload;
-use crate::workload::{MemPolicy, WorkloadConfig, WorkloadHandle};
+use crate::workload::{MemPolicy, ResolvedAffinity, WorkloadConfig, WorkloadHandle};
 
 /// Latched once `Op::Snapshot` / `Op::WatchSnapshot` observes a
 /// [`crate::vmm::wire::SnapshotRequestResult::TransportError`].
@@ -2347,19 +2347,31 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 // when a `CgroupDef::works` vec or repeated `Op::Spawn`
                 // populates more than one). The pool is invariant
                 // across handles for a given resolved affinity.
-                let random_pool: Vec<usize> = match &resolved {
-                    crate::workload::ResolvedAffinity::Random { from, count }
-                        if !from.is_empty() && *count > 0 =>
-                    {
-                        from.iter().copied().collect()
-                    }
-                    _ => Vec::new(),
+                //
+                // Invariant: `resolve_affinity_for_cgroup` bails on
+                // `RandomSubset` with an empty pool or `count == 0`
+                // before this match, so the Random arm here always
+                // sees a non-empty pool and count > 0. The match
+                // guard is gone; the former defensive no-op arm is
+                // replaced with an `unreachable!()` inside the Random
+                // arm — a regression that reintroduced the empty case
+                // would trip the panic at this site (both debug and
+                // release) instead of silently no-op'ing a
+                // SetAffinity. Mirrors the same enforcement in
+                // `flatten_for_spawn` at
+                // `crate::scenario::flatten_for_spawn`, so both
+                // consumer sites of ResolvedAffinity::Random share
+                // identical regression surfaces.
+                let random_pool: Vec<usize> = if let ResolvedAffinity::Random { from, .. } = &resolved {
+                    from.iter().copied().collect()
+                } else {
+                    Vec::new()
                 };
                 for (name, handle) in state.all_handles() {
                     if name.as_str() == *cgroup {
                         match &resolved {
-                            crate::workload::ResolvedAffinity::None => {}
-                            crate::workload::ResolvedAffinity::Fixed(cpus) => {
+                            ResolvedAffinity::None => {}
+                            ResolvedAffinity::Fixed(cpus) => {
                                 for idx in 0..handle.worker_pids().len() {
                                     if let Err(e) = handle.set_affinity(idx, cpus) {
                                         tracing::warn!(
@@ -2372,9 +2384,28 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                                     }
                                 }
                             }
-                            crate::workload::ResolvedAffinity::Random { from: _, count }
-                                if !random_pool.is_empty() && *count > 0 =>
-                            {
+                            ResolvedAffinity::Random { from, count } => {
+                                if from.is_empty() || *count == 0 {
+                                    // Invariant: resolve_affinity_for_cgroup
+                                    // bails on empty pool / count=0 before
+                                    // this match. Reaching here means a
+                                    // future caller constructed
+                                    // ResolvedAffinity::Random directly
+                                    // (bypassing the resolver). Panic loudly
+                                    // so the regression surfaces at the
+                                    // construction site instead of producing
+                                    // an empty sched_setaffinity mask that
+                                    // the kernel rejects with EINVAL —
+                                    // matches the unreachable!() pattern in
+                                    // flatten_for_spawn (scenario/mod.rs).
+                                    unreachable!(
+                                        "ResolvedAffinity::Random {{ from={from:?}, count={count} }} \
+                                         reached Op::SetAffinity with empty pool or count==0 — \
+                                         resolve_affinity_for_cgroup is supposed to bail on those \
+                                         cases (no-silent-drops invariant). Audit the new caller \
+                                         that constructed it.",
+                                    );
+                                }
                                 use rand::seq::IndexedRandom;
                                 for idx in 0..handle.worker_pids().len() {
                                     let chosen: BTreeSet<usize> = random_pool
@@ -2392,20 +2423,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                                     }
                                 }
                             }
-                            // Empty pool OR count == 0: divergence from
-                            // `workload::resolve_affinity`, which BAILS
-                            // on count == 0 because it runs during
-                            // workload setup where a zero-sample is a
-                            // caller-config bug. Here at the
-                            // step-execution layer the affinity was
-                            // already applied at spawn and this op is
-                            // re-applying; a zero-sample is a harmless
-                            // skip, not a caller error. No-op rather
-                            // than bail so a mid-run SetAffinity with
-                            // a degenerate Random spec doesn't abort
-                            // the whole scenario.
-                            crate::workload::ResolvedAffinity::Random { .. } => {}
-                            crate::workload::ResolvedAffinity::SingleCpu(cpu) => {
+                            ResolvedAffinity::SingleCpu(cpu) => {
                                 let cpus: BTreeSet<usize> = [*cpu].into_iter().collect();
                                 for idx in 0..handle.worker_pids().len() {
                                     if let Err(e) = handle.set_affinity(idx, &cpus) {

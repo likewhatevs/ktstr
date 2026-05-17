@@ -925,16 +925,25 @@ fn resolve_smt_sibling_pair(
             }
         }
     }
+    // Render the search scope: when a cpuset narrowed the pool, name
+    // it (operator can widen / pick siblings inside it); when no
+    // cpuset is active, the scope IS the full topology (operator must
+    // adjust topology or switch intents — naming "<no cpuset>" would
+    // mislead by implying cpuset config is relevant).
+    let scope = if cpuset.is_some() {
+        format!("the effective cpuset ({})", format_cpuset_for_diag(cpuset))
+    } else {
+        "the full topology (no cgroup cpuset is active)".to_string()
+    };
     anyhow::bail!(
         "AffinityIntent::SmtSiblingPair requires a physical core with at \
-         least two SMT siblings present in the effective cpuset. The \
-         current topology and cpuset expose no such pair — \
-         threads_per_core may be 1 (SMT disabled or non-SMT host), the \
-         cpuset may have isolated each sibling onto a different cgroup, \
-         or the topology was built without per-core sibling data. \
-         Switch to a different AffinityIntent for non-SMT scheduling \
-         tests, or run on a host whose VM topology has \
-         threads_per_core >= 2.",
+         least two SMT siblings present in {scope}. The current topology \
+         and cpuset expose no such pair — threads_per_core may be 1 (SMT \
+         disabled or non-SMT host), the cpuset may have isolated each \
+         sibling onto a different cgroup, or the topology was built \
+         without per-core sibling data. Switch to a different \
+         AffinityIntent for non-SMT scheduling tests, or run on a host \
+         whose VM topology has threads_per_core >= 2.",
     );
 }
 
@@ -1526,6 +1535,14 @@ mod tests {
             msg.contains("two SMT siblings"),
             "diagnostic must explain the missing precondition, got: {msg}"
         );
+        // With cpuset=None, the scope must read as "full topology" —
+        // NOT "<no cpuset>" — so the operator looks at topology config
+        // (threads_per_core), not cgroup cpuset config.
+        assert!(
+            msg.contains("full topology"),
+            "diagnostic with no cpuset must name the topology as the \
+             search scope (not '<no cpuset>'), got: {msg}",
+        );
     }
 
     /// When the cpuset isolates each sibling onto a different
@@ -1544,6 +1561,49 @@ mod tests {
             msg.contains("SmtSiblingPair"),
             "diagnostic must name the variant, got: {msg}"
         );
+        // The cpuset must be echoed via format_cpuset_for_diag so an
+        // operator sees which sibling-isolating cpuset they passed.
+        // Pin the exact rendered shape (not just a digit) so a future
+        // format change can't slip past on a coincidental substring.
+        assert!(
+            msg.contains("effective cpuset (cpuset {0, 2})"),
+            "diagnostic with cpuset=Some must echo the cpuset value \
+             verbatim via format_cpuset_for_diag, got: {msg}",
+        );
+    }
+
+    /// SmtSiblingPair bail with `cpuset=Some(empty)` should still take
+    /// the cpuset-branch of the scope conditional (since `is_some()`
+    /// is true) and render "the effective cpuset (empty cpuset {})".
+    /// Pin the wording so a refactor that collapses Some(empty) into
+    /// the None branch (e.g. via `cpuset.map_or(false, |cs|
+    /// !cs.is_empty())`) doesn't silently change the operator-facing
+    /// scope from "the effective cpuset (empty cpuset {})" to "the
+    /// full topology (no cgroup cpuset is active)".
+    #[test]
+    fn resolve_affinity_smt_sibling_pair_errors_with_empty_cpuset() {
+        let vmt = crate::vmm::topology::Topology::new(1, 1, 2, 2);
+        let t = crate::topology::TestTopology::from_vm_topology(&vmt);
+        let empty_cpuset: BTreeSet<usize> = BTreeSet::new();
+        let err = resolve_affinity_for_cgroup(
+            &AffinityIntent::SmtSiblingPair,
+            Some(&empty_cpuset),
+            &t,
+        )
+        .expect_err("SmtSiblingPair with empty cpuset must bail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SmtSiblingPair"),
+            "diagnostic must name the variant, got: {msg}"
+        );
+        // Some(empty) → cpuset-branch ("the effective cpuset (empty cpuset {})"),
+        // NOT the None branch ("the full topology"). Inversion would be silent.
+        assert!(
+            msg.contains("effective cpuset (empty cpuset")
+                && !msg.contains("full topology"),
+            "diagnostic with cpuset=Some(empty) must take the cpuset \
+             branch (not the topology branch), got: {msg}",
+        );
     }
 
     /// `TestTopology::synthetic` builds an empty per-core sibling
@@ -1559,6 +1619,12 @@ mod tests {
         assert!(
             msg.contains("SmtSiblingPair"),
             "diagnostic must name the variant, got: {msg}"
+        );
+        // No cpuset → scope reads as "full topology", not "<no cpuset>".
+        assert!(
+            msg.contains("full topology"),
+            "diagnostic with no cpuset must name the topology as the \
+             search scope, got: {msg}",
         );
     }
 
@@ -2315,6 +2381,118 @@ mod tests {
             msg.contains("AffinityIntent::SingleCpu")
                 && msg.contains("empty"),
             "bail diag should name the intent and the empty cpuset, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn intent_for_spawn_propagates_llc_aligned_no_overlap_bail() {
+        let vmt = crate::vmm::topology::Topology::new(1, 2, 2, 2);
+        let t = crate::topology::TestTopology::from_vm_topology(&vmt);
+        let empty_cpuset: BTreeSet<usize> = BTreeSet::new();
+        let err = intent_for_spawn(&AffinityIntent::LlcAligned, Some(&empty_cpuset), &t)
+            .expect_err("LlcAligned with empty cpuset must bail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("AffinityIntent::LlcAligned")
+                && msg.contains("No LLC has any CPU"),
+            "bail diag should name the intent and the no-overlap failure mode, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn intent_for_spawn_propagates_exact_disjoint_bail() {
+        let vmt = crate::vmm::topology::Topology::new(1, 2, 2, 2);
+        let t = crate::topology::TestTopology::from_vm_topology(&vmt);
+        // Cpuset = {0, 1}; Exact = {6, 7}. Both subsets of all_cpuset
+        // (so the empty-Exact bail doesn't fire) but their intersection
+        // with cpuset is empty.
+        let cpuset: BTreeSet<usize> = [0, 1].into_iter().collect();
+        let exact: BTreeSet<usize> = [6, 7].into_iter().collect();
+        let err = intent_for_spawn(
+            &AffinityIntent::Exact(exact),
+            Some(&cpuset),
+            &t,
+        )
+        .expect_err("Exact disjoint from cpuset must bail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("AffinityIntent::Exact")
+                && msg.contains("disjoint"),
+            "bail diag should name the intent and the disjoint failure mode, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn intent_for_spawn_propagates_smt_sibling_pair_bail() {
+        // synthetic() leaves LlcInfo::cores empty so SmtSiblingPair's
+        // walker finds no core with two siblings in the pool and bails.
+        let t = crate::topology::TestTopology::synthetic(8, 2);
+        let err = intent_for_spawn(&AffinityIntent::SmtSiblingPair, None, &t)
+            .expect_err("SmtSiblingPair on a topology without per-core sibling data must bail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("AffinityIntent::SmtSiblingPair")
+                && msg.contains("two SMT siblings"),
+            "bail diag should name the intent and the no-SMT-pair failure mode, got: {msg}"
+        );
+    }
+
+    /// Exact non-empty against cpuset=Some(empty) must fall through to
+    /// the disjoint bail (since cpus ∩ empty = empty), NOT to the
+    /// empty-Exact bail (the Exact set itself is non-empty). Pin the
+    /// path so a refactor that swaps the bail order doesn't silently
+    /// change the operator-facing message.
+    #[test]
+    fn resolve_affinity_exact_nonempty_disjoint_from_empty_cpuset_bails() {
+        let t = crate::topology::TestTopology::synthetic(4, 1);
+        let empty_cpuset: BTreeSet<usize> = BTreeSet::new();
+        let exact: BTreeSet<usize> = [0usize, 1].into_iter().collect();
+        let err = resolve_affinity_for_cgroup(
+            &AffinityIntent::Exact(exact.clone()),
+            Some(&empty_cpuset),
+            &t,
+        )
+        .expect_err("Exact non-empty against empty cpuset must bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("disjoint"),
+            "bail diag should name the disjoint failure mode (NOT the empty-Exact form, since the Exact set itself is non-empty): got {msg}",
+        );
+        assert!(
+            msg.contains("empty cpuset"),
+            "bail diag should render the empty cpuset via format_cpuset_for_diag: got {msg}",
+        );
+    }
+
+    /// LlcAligned with a non-empty cpuset that doesn't overlap ANY LLC
+    /// must bail. The existing `_disjoint_cpuset_bails` test uses
+    /// cpuset=empty; this one uses a non-empty cpuset referencing CPUs
+    /// outside topo.all_cpuset() so the bail fires on the
+    /// non-empty-but-still-disjoint path.
+    #[test]
+    fn resolve_affinity_llc_aligned_nonempty_disjoint_cpuset_bails() {
+        // LLC 0 = {0,1,2,3}, LLC 1 = {4,5,6,7}. Cpuset = {99} (a CPU
+        // ID outside any LLC's range). Every LLC's intersection with
+        // the pool is empty → bail.
+        let t = crate::topology::TestTopology::synthetic(8, 2);
+        let cpuset: BTreeSet<usize> = [99usize].into_iter().collect();
+        let err = resolve_affinity_for_cgroup(&AffinityIntent::LlcAligned, Some(&cpuset), &t)
+            .expect_err("LlcAligned with non-empty disjoint cpuset must bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("AffinityIntent::LlcAligned"),
+            "diagnostic must name the intent variant: got {msg}",
+        );
+        assert!(
+            msg.contains("No LLC has any CPU"),
+            "diagnostic must name the failure mode: got {msg}",
+        );
+        // Pin that the cpuset is rendered with its CPU IDs (not the
+        // "<no cpuset>" sentinel) so format_cpuset_for_diag picked
+        // the Some(non_empty) branch.
+        assert!(
+            msg.contains("99"),
+            "bail diag should render the non-empty cpuset's CPU IDs via format_cpuset_for_diag: got {msg}",
         );
     }
 
