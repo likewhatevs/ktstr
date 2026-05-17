@@ -2469,6 +2469,20 @@ mod tests {
         crate::scenario::Ctx::builder(cgroups, topo).build()
     }
 
+    /// Closure-form helper that owns the CgroupManager + TestTopology
+    /// pair under the closure's stack frame so a Ctx borrowed from
+    /// them stays valid for the closure body. Collapses the 3-line
+    /// `cgroups + topo + make_ctx` setup that every payload_run test
+    /// repeats. Tests pick the `parent` cgroup path: tests that never
+    /// resolve against a real FS pass `"/nonexistent"`; tests that
+    /// assert `resolve_cgroup_path` output pass `"/sys/fs/cgroup/test-parent"`.
+    fn with_ctx<R>(parent: &str, f: impl FnOnce(&crate::scenario::Ctx<'_>) -> R) -> R {
+        let cgroups = CgroupManager::new(parent);
+        let topo = TestTopology::synthetic(4, 1);
+        let ctx = make_ctx(&cgroups, &topo);
+        f(&ctx)
+    }
+
     const FIO_BINARY: Payload = Payload {
         name: "fio",
         kind: PayloadKind::Binary("fio"),
@@ -2497,156 +2511,145 @@ mod tests {
 
     #[test]
     fn builder_inherits_default_args() {
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let run = PayloadRun::new(&ctx, &FIO_BINARY);
-        assert_eq!(run.args, vec!["--output-format=json"]);
+        with_ctx("/nonexistent", |ctx| {
+            let run = PayloadRun::new(ctx, &FIO_BINARY);
+            assert_eq!(run.args, vec!["--output-format=json"]);
+        });
     }
 
     #[test]
     fn arg_appends() {
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let run = PayloadRun::new(&ctx, &FIO_BINARY)
-            .arg("--runtime=30")
-            .arg("job.fio");
-        assert_eq!(
-            run.args,
-            vec!["--output-format=json", "--runtime=30", "job.fio"]
-        );
+        with_ctx("/nonexistent", |ctx| {
+            let run = PayloadRun::new(ctx, &FIO_BINARY)
+                .arg("--runtime=30")
+                .arg("job.fio");
+            assert_eq!(
+                run.args,
+                vec!["--output-format=json", "--runtime=30", "job.fio"]
+            );
+        });
     }
 
     #[test]
     fn clear_args_wipes_defaults() {
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let run = PayloadRun::new(&ctx, &FIO_BINARY)
-            .clear_args()
-            .arg("--custom");
-        assert_eq!(run.args, vec!["--custom"]);
+        with_ctx("/nonexistent", |ctx| {
+            let run = PayloadRun::new(ctx, &FIO_BINARY)
+                .clear_args()
+                .arg("--custom");
+            assert_eq!(run.args, vec!["--custom"]);
+        });
     }
 
     #[test]
     fn args_method_bulk_appends() {
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let run = PayloadRun::new(&ctx, &FIO_BINARY).args(["--a", "--b", "--c"]);
-        assert_eq!(run.args, vec!["--output-format=json", "--a", "--b", "--c"]);
+        with_ctx("/nonexistent", |ctx| {
+            let run = PayloadRun::new(ctx, &FIO_BINARY).args(["--a", "--b", "--c"]);
+            assert_eq!(run.args, vec!["--output-format=json", "--a", "--b", "--c"]);
+        });
     }
 
     #[test]
     fn check_and_clear_checks() {
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let run = PayloadRun::new(&ctx, &FIO_BINARY)
-            .check(MetricCheck::min("iops", 1000.0))
-            .check(MetricCheck::max("latency", 500.0));
-        assert_eq!(run.checks.len(), 2);
-        let cleared = PayloadRun::new(&ctx, &FIO_BINARY)
-            .clear_checks()
-            .check(MetricCheck::exit_code_eq(0));
-        assert_eq!(cleared.checks.len(), 1);
+        with_ctx("/nonexistent", |ctx| {
+            let run = PayloadRun::new(ctx, &FIO_BINARY)
+                .check(MetricCheck::min("iops", 1000.0))
+                .check(MetricCheck::max("latency", 500.0));
+            assert_eq!(run.checks.len(), 2);
+            let cleared = PayloadRun::new(ctx, &FIO_BINARY)
+                .clear_checks()
+                .check(MetricCheck::exit_code_eq(0));
+            assert_eq!(cleared.checks.len(), 1);
+        });
     }
 
     #[test]
     fn in_cgroup_stores_name() {
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let run = PayloadRun::new(&ctx, &FIO_BINARY).in_cgroup("fio_cg");
-        assert_eq!(run.cgroup.as_deref(), Some("fio_cg"));
+        with_ctx("/nonexistent", |ctx| {
+            let run = PayloadRun::new(ctx, &FIO_BINARY).in_cgroup("fio_cg");
+            assert_eq!(run.cgroup.as_deref(), Some("fio_cg"));
+        });
     }
 
     #[test]
     fn resolve_cgroup_path_strips_leading_slash_and_joins() {
-        let cgroups = CgroupManager::new("/sys/fs/cgroup/test-parent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        // Leading "/" tolerated, joined under parent.
-        let resolved = resolve_cgroup_path(&ctx, Some("/workload"), "test::strips")
-            .expect("valid cgroup name")
-            .expect("Some(path)");
-        assert_eq!(
-            resolved,
-            std::path::PathBuf::from("/sys/fs/cgroup/test-parent/workload")
-        );
-        // Same name without leading slash produces the same path.
-        let plain = resolve_cgroup_path(&ctx, Some("workload"), "test::strips")
-            .expect("valid")
-            .expect("Some");
-        assert_eq!(resolved, plain);
+        with_ctx("/sys/fs/cgroup/test-parent", |ctx| {
+            // Leading "/" tolerated, joined under parent.
+            let resolved = resolve_cgroup_path(ctx, Some("/workload"), "test::strips")
+                .expect("valid cgroup name")
+                .expect("Some(path)");
+            assert_eq!(
+                resolved,
+                std::path::PathBuf::from("/sys/fs/cgroup/test-parent/workload")
+            );
+            // Same name without leading slash produces the same path.
+            let plain = resolve_cgroup_path(ctx, Some("workload"), "test::strips")
+                .expect("valid")
+                .expect("Some");
+            assert_eq!(resolved, plain);
+        });
     }
 
     #[test]
     fn resolve_cgroup_path_rejects_parent_dir() {
-        let cgroups = CgroupManager::new("/sys/fs/cgroup/test-parent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let err = resolve_cgroup_path(&ctx, Some("../escape"), "PayloadRun::run")
-            .expect_err("'..' must be rejected");
-        let rendered = format!("{err:#}");
-        assert!(rendered.contains(".."), "err: {rendered}");
-        assert!(
-            rendered.contains("PayloadRun::run"),
-            "op label must appear in error: {rendered}",
-        );
+        with_ctx("/sys/fs/cgroup/test-parent", |ctx| {
+            let err = resolve_cgroup_path(ctx, Some("../escape"), "PayloadRun::run")
+                .expect_err("'..' must be rejected");
+            let rendered = format!("{err:#}");
+            assert!(rendered.contains(".."), "err: {rendered}");
+            assert!(
+                rendered.contains("PayloadRun::run"),
+                "op label must appear in error: {rendered}",
+            );
+        });
     }
 
     #[test]
     fn resolve_cgroup_path_rejects_nul_byte() {
-        let cgroups = CgroupManager::new("/sys/fs/cgroup/test-parent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let err = resolve_cgroup_path(&ctx, Some("bad\0name"), "PayloadRun::spawn")
-            .expect_err("NUL must be rejected");
-        let rendered = format!("{err:#}");
-        assert!(rendered.contains("NUL"), "err: {rendered}");
-        assert!(
-            rendered.contains("PayloadRun::spawn"),
-            "op label must appear in error: {rendered}",
-        );
+        with_ctx("/sys/fs/cgroup/test-parent", |ctx| {
+            let err = resolve_cgroup_path(ctx, Some("bad\0name"), "PayloadRun::spawn")
+                .expect_err("NUL must be rejected");
+            let rendered = format!("{err:#}");
+            assert!(rendered.contains("NUL"), "err: {rendered}");
+            assert!(
+                rendered.contains("PayloadRun::spawn"),
+                "op label must appear in error: {rendered}",
+            );
+        });
     }
 
     #[test]
     fn resolve_cgroup_path_rejects_empty_after_strip() {
-        let cgroups = CgroupManager::new("/sys/fs/cgroup/test-parent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        // "/" strips to empty — reject so we don't silently target
-        // the parent cgroup itself.
-        let err = resolve_cgroup_path(&ctx, Some("/"), "PayloadRun::run")
-            .expect_err("slash-only must be rejected");
-        let rendered = format!("{err:#}");
-        assert!(rendered.contains("empty"), "err: {rendered}");
-        assert!(
-            rendered.contains("PayloadRun::run"),
-            "op label must appear in error: {rendered}",
-        );
-        let err = resolve_cgroup_path(&ctx, Some(""), "PayloadRun::run")
-            .expect_err("empty must be rejected");
-        let rendered = format!("{err:#}");
-        assert!(rendered.contains("empty"), "err: {rendered}");
-        assert!(
-            rendered.contains("PayloadRun::run"),
-            "op label must appear in error: {rendered}",
-        );
+        with_ctx("/sys/fs/cgroup/test-parent", |ctx| {
+            // "/" strips to empty — reject so we don't silently target
+            // the parent cgroup itself.
+            let err = resolve_cgroup_path(ctx, Some("/"), "PayloadRun::run")
+                .expect_err("slash-only must be rejected");
+            let rendered = format!("{err:#}");
+            assert!(rendered.contains("empty"), "err: {rendered}");
+            assert!(
+                rendered.contains("PayloadRun::run"),
+                "op label must appear in error: {rendered}",
+            );
+            let err = resolve_cgroup_path(ctx, Some(""), "PayloadRun::run")
+                .expect_err("empty must be rejected");
+            let rendered = format!("{err:#}");
+            assert!(rendered.contains("empty"), "err: {rendered}");
+            assert!(
+                rendered.contains("PayloadRun::run"),
+                "op label must appear in error: {rendered}",
+            );
+        });
     }
 
     #[test]
     fn resolve_cgroup_path_none_passes_through() {
-        let cgroups = CgroupManager::new("/sys/fs/cgroup/test-parent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        assert!(
-            resolve_cgroup_path(&ctx, None, "test::none")
-                .unwrap()
-                .is_none()
-        );
+        with_ctx("/sys/fs/cgroup/test-parent", |ctx| {
+            assert!(
+                resolve_cgroup_path(ctx, None, "test::none")
+                    .unwrap()
+                    .is_none()
+            );
+        });
     }
 
     /// Differential pin: the `op` label must flow through to the
@@ -2657,23 +2660,22 @@ mod tests {
     /// could pass against an implementation that drops the arg.
     #[test]
     fn resolve_cgroup_path_op_label_differs_per_caller() {
-        let cgroups = CgroupManager::new("/sys/fs/cgroup/test-parent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let err_a = format!(
-            "{:#}",
-            resolve_cgroup_path(&ctx, Some("../bad"), "caller-a")
-                .expect_err("'..' must be rejected"),
-        );
-        let err_b = format!(
-            "{:#}",
-            resolve_cgroup_path(&ctx, Some("../bad"), "caller-b")
-                .expect_err("'..' must be rejected"),
-        );
-        assert!(err_a.contains("caller-a"), "err_a: {err_a}");
-        assert!(!err_a.contains("caller-b"), "err_a leaked caller-b: {err_a}");
-        assert!(err_b.contains("caller-b"), "err_b: {err_b}");
-        assert!(!err_b.contains("caller-a"), "err_b leaked caller-a: {err_b}");
+        with_ctx("/sys/fs/cgroup/test-parent", |ctx| {
+            let err_a = format!(
+                "{:#}",
+                resolve_cgroup_path(ctx, Some("../bad"), "caller-a")
+                    .expect_err("'..' must be rejected"),
+            );
+            let err_b = format!(
+                "{:#}",
+                resolve_cgroup_path(ctx, Some("../bad"), "caller-b")
+                    .expect_err("'..' must be rejected"),
+            );
+            assert!(err_a.contains("caller-a"), "err_a: {err_a}");
+            assert!(!err_a.contains("caller-b"), "err_a leaked caller-b: {err_a}");
+            assert!(err_b.contains("caller-b"), "err_b: {err_b}");
+            assert!(!err_b.contains("caller-a"), "err_b leaked caller-a: {err_b}");
+        });
     }
 
     /// Production-caller pin: the public `.run()` entry point must
@@ -2684,17 +2686,16 @@ mod tests {
     /// the production call site inside `PayloadRun::run()` end-to-end.
     #[test]
     fn payload_run_run_threads_canonical_op_label() {
-        let cgroups = CgroupManager::new("/sys/fs/cgroup/test-parent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let run = PayloadRun::new(&ctx, &FIO_BINARY).in_cgroup("../escape");
-        let err = run.run().unwrap_err();
-        let rendered = format!("{err:#}");
-        assert!(rendered.contains(".."), "err: {rendered}");
-        assert!(
-            rendered.contains("PayloadRun::run"),
-            "production run() must pass PayloadRun::run as op label: {rendered}",
-        );
+        with_ctx("/sys/fs/cgroup/test-parent", |ctx| {
+            let run = PayloadRun::new(ctx, &FIO_BINARY).in_cgroup("../escape");
+            let err = run.run().unwrap_err();
+            let rendered = format!("{err:#}");
+            assert!(rendered.contains(".."), "err: {rendered}");
+            assert!(
+                rendered.contains("PayloadRun::run"),
+                "production run() must pass PayloadRun::run as op label: {rendered}",
+            );
+        });
     }
 
     /// Sibling of `payload_run_run_threads_canonical_op_label` for
@@ -2705,30 +2706,28 @@ mod tests {
     /// resolve_cgroup_path.
     #[test]
     fn payload_run_spawn_threads_canonical_op_label() {
-        let cgroups = CgroupManager::new("/sys/fs/cgroup/test-parent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let run = PayloadRun::new(&ctx, &FIO_BINARY).in_cgroup("bad\0name");
-        let err = run.spawn().unwrap_err();
-        let rendered = format!("{err:#}");
-        assert!(rendered.contains("NUL"), "err: {rendered}");
-        assert!(
-            rendered.contains("PayloadRun::spawn"),
-            "production spawn() must pass PayloadRun::spawn as op label: {rendered}",
-        );
+        with_ctx("/sys/fs/cgroup/test-parent", |ctx| {
+            let run = PayloadRun::new(ctx, &FIO_BINARY).in_cgroup("bad\0name");
+            let err = run.spawn().unwrap_err();
+            let rendered = format!("{err:#}");
+            assert!(rendered.contains("NUL"), "err: {rendered}");
+            assert!(
+                rendered.contains("PayloadRun::spawn"),
+                "production spawn() must pass PayloadRun::spawn as op label: {rendered}",
+            );
+        });
     }
 
     #[test]
     fn run_rejects_scheduler_kind() {
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let run = PayloadRun::new(&ctx, &EEVDF_SCHED_PAYLOAD);
-        let err = run.run().unwrap_err();
-        assert!(
-            format!("{err:#}").contains("scheduler-kind"),
-            "err: {err:#}"
-        );
+        with_ctx("/nonexistent", |ctx| {
+            let run = PayloadRun::new(ctx, &EEVDF_SCHED_PAYLOAD);
+            let err = run.run().unwrap_err();
+            assert!(
+                format!("{err:#}").contains("scheduler-kind"),
+                "err: {err:#}"
+            );
+        });
     }
 
     #[test]
@@ -3334,46 +3333,44 @@ mod tests {
     /// field that debug-printing consumers rely on.
     #[test]
     fn payload_run_debug_renders_identity_fields() {
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let run = PayloadRun::new(&ctx, &TRUE_BIN)
-            .arg("--foo")
-            .arg("--bar")
-            .check(MetricCheck::exit_code_eq(0))
-            .in_cgroup("workers");
-        let s = format!("{run:?}");
-        assert!(s.contains("PayloadRun"), "prefix: {s}");
-        assert!(s.contains("payload:"), "payload field: {s}");
-        assert!(s.contains("true_bin"), "payload name: {s}");
-        assert!(s.contains("args_len"), "args_len field: {s}");
-        assert!(s.contains("checks_len"), "checks_len field: {s}");
-        assert!(s.contains("cgroup:"), "cgroup field: {s}");
-        // Values: 2 args added (on top of 0 default) + 1 check.
-        assert!(s.contains("args_len: 2"), "computed args_len: {s}");
-        assert!(s.contains("checks_len: 1"), "computed checks_len: {s}");
-        // cgroup is Some("workers"); the debug form of Cow<str>
-        // renders as "workers" inside Some(..).
-        assert!(s.contains("workers"), "cgroup value: {s}");
-        // Must NOT leak the Ctx pointer (no raw-address tokens).
-        assert!(
-            !s.contains("Ctx {"),
-            "Ctx should not appear in PayloadRun Debug: {s}"
-        );
+        with_ctx("/nonexistent", |ctx| {
+            let run = PayloadRun::new(ctx, &TRUE_BIN)
+                .arg("--foo")
+                .arg("--bar")
+                .check(MetricCheck::exit_code_eq(0))
+                .in_cgroup("workers");
+            let s = format!("{run:?}");
+            assert!(s.contains("PayloadRun"), "prefix: {s}");
+            assert!(s.contains("payload:"), "payload field: {s}");
+            assert!(s.contains("true_bin"), "payload name: {s}");
+            assert!(s.contains("args_len"), "args_len field: {s}");
+            assert!(s.contains("checks_len"), "checks_len field: {s}");
+            assert!(s.contains("cgroup:"), "cgroup field: {s}");
+            // Values: 2 args added (on top of 0 default) + 1 check.
+            assert!(s.contains("args_len: 2"), "computed args_len: {s}");
+            assert!(s.contains("checks_len: 1"), "computed checks_len: {s}");
+            // cgroup is Some("workers"); the debug form of Cow<str>
+            // renders as "workers" inside Some(..).
+            assert!(s.contains("workers"), "cgroup value: {s}");
+            // Must NOT leak the Ctx pointer (no raw-address tokens).
+            assert!(
+                !s.contains("Ctx {"),
+                "Ctx should not appear in PayloadRun Debug: {s}"
+            );
+        });
     }
 
     /// Default `PayloadRun` (no args, no checks, no cgroup)
     /// renders sensible zeroes.
     #[test]
     fn payload_run_debug_renders_defaults() {
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let run = PayloadRun::new(&ctx, &TRUE_BIN);
-        let s = format!("{run:?}");
-        assert!(s.contains("args_len: 0"), "default args_len: {s}");
-        assert!(s.contains("checks_len: 0"), "default checks_len: {s}");
-        assert!(s.contains("cgroup: None"), "default cgroup: {s}");
+        with_ctx("/nonexistent", |ctx| {
+            let run = PayloadRun::new(ctx, &TRUE_BIN);
+            let s = format!("{run:?}");
+            assert!(s.contains("args_len: 0"), "default args_len: {s}");
+            assert!(s.contains("checks_len: 0"), "default checks_len: {s}");
+            assert!(s.contains("cgroup: None"), "default cgroup: {s}");
+        });
     }
 
     #[test]
@@ -3414,115 +3411,109 @@ mod tests {
 
     #[test]
     fn spawn_rejects_scheduler_kind() {
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let run = PayloadRun::new(&ctx, &EEVDF_SCHED_PAYLOAD);
-        let err = run.spawn().unwrap_err();
-        assert!(
-            format!("{err:#}").contains("scheduler-kind"),
-            "err: {err:#}"
-        );
+        with_ctx("/nonexistent", |ctx| {
+            let run = PayloadRun::new(ctx, &EEVDF_SCHED_PAYLOAD);
+            let err = run.spawn().unwrap_err();
+            assert!(
+                format!("{err:#}").contains("scheduler-kind"),
+                "err: {err:#}"
+            );
+        });
     }
 
     #[test]
     fn spawn_then_wait_returns_result_and_metrics() {
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let handle = PayloadRun::new(&ctx, &TRUE_BIN)
-            .spawn()
-            .expect("spawn /bin/true");
-        let (result, metrics) = handle.wait().expect("wait");
-        assert!(result.passed);
-        assert_eq!(metrics.exit_code, 0);
+        with_ctx("/nonexistent", |ctx| {
+            let handle = PayloadRun::new(ctx, &TRUE_BIN)
+                .spawn()
+                .expect("spawn /bin/true");
+            let (result, metrics) = handle.wait().expect("wait");
+            assert!(result.passed);
+            assert_eq!(metrics.exit_code, 0);
+        });
     }
 
     #[test]
     fn spawn_then_kill_returns_collected_output() {
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        // /bin/sleep runs for a while; .kill() terminates it.
-        const SLEEPER: Payload = Payload {
-            name: "sleeper",
-            kind: PayloadKind::Binary("/bin/sleep"),
-            output: crate::test_support::OutputFormat::ExitCode,
-            default_args: &["60"],
-            default_checks: &[],
-            metrics: &[],
-            include_files: &[],
-            uses_parent_pgrp: false,
-            known_flags: None,
-            metric_bounds: None,
-        };
-        let handle = PayloadRun::new(&ctx, &SLEEPER)
-            .spawn()
-            .expect("spawn sleep");
-        let (_result, metrics) = handle.kill().expect("kill+collect");
-        // Killed process produces a non-zero exit (SIGKILL -> None
-        // status code, wait_and_capture maps to -1).
-        assert_ne!(metrics.exit_code, 0);
+        with_ctx("/nonexistent", |ctx| {
+            // /bin/sleep runs for a while; .kill() terminates it.
+            const SLEEPER: Payload = Payload {
+                name: "sleeper",
+                kind: PayloadKind::Binary("/bin/sleep"),
+                output: crate::test_support::OutputFormat::ExitCode,
+                default_args: &["60"],
+                default_checks: &[],
+                metrics: &[],
+                include_files: &[],
+                uses_parent_pgrp: false,
+                known_flags: None,
+                metric_bounds: None,
+            };
+            let handle = PayloadRun::new(ctx, &SLEEPER)
+                .spawn()
+                .expect("spawn sleep");
+            let (_result, metrics) = handle.kill().expect("kill+collect");
+            // Killed process produces a non-zero exit (SIGKILL -> None
+            // status code, wait_and_capture maps to -1).
+            assert_ne!(metrics.exit_code, 0);
+        });
     }
 
     #[test]
     fn spawn_try_wait_returns_none_while_running() {
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        const SLEEPER: Payload = Payload {
-            name: "sleeper3",
-            kind: PayloadKind::Binary("/bin/sleep"),
-            output: crate::test_support::OutputFormat::ExitCode,
-            default_args: &["60"],
-            default_checks: &[],
-            metrics: &[],
-            include_files: &[],
-            uses_parent_pgrp: false,
-            known_flags: None,
-            metric_bounds: None,
-        };
-        let mut handle = PayloadRun::new(&ctx, &SLEEPER)
-            .spawn()
-            .expect("spawn sleep");
-        // Not yet exited.
-        assert!(handle.try_wait().expect("try_wait").is_none());
-        // Cleanup — kill so Drop warning doesn't fire.
-        let _ = handle.kill();
+        with_ctx("/nonexistent", |ctx| {
+            const SLEEPER: Payload = Payload {
+                name: "sleeper3",
+                kind: PayloadKind::Binary("/bin/sleep"),
+                output: crate::test_support::OutputFormat::ExitCode,
+                default_args: &["60"],
+                default_checks: &[],
+                metrics: &[],
+                include_files: &[],
+                uses_parent_pgrp: false,
+                known_flags: None,
+                metric_bounds: None,
+            };
+            let mut handle = PayloadRun::new(ctx, &SLEEPER)
+                .spawn()
+                .expect("spawn sleep");
+            // Not yet exited.
+            assert!(handle.try_wait().expect("try_wait").is_none());
+            // Cleanup — kill so Drop warning doesn't fire.
+            let _ = handle.kill();
+        });
     }
 
     #[test]
     fn spawn_try_wait_returns_some_after_exit() {
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let mut handle = PayloadRun::new(&ctx, &TRUE_BIN)
-            .spawn()
-            .expect("spawn /bin/true");
-        // /bin/true exits quickly. Poll a few times.
-        let mut result = None;
-        for _ in 0..100 {
-            if let Some(r) = handle.try_wait().expect("try_wait") {
-                result = Some(r);
-                break;
+        with_ctx("/nonexistent", |ctx| {
+            let mut handle = PayloadRun::new(ctx, &TRUE_BIN)
+                .spawn()
+                .expect("spawn /bin/true");
+            // /bin/true exits quickly. Poll a few times.
+            let mut result = None;
+            for _ in 0..100 {
+                if let Some(r) = handle.try_wait().expect("try_wait") {
+                    result = Some(r);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let (r, metrics) = result.expect("try_wait eventually returns Some");
-        assert!(r.passed);
-        assert_eq!(metrics.exit_code, 0);
+            let (r, metrics) = result.expect("try_wait eventually returns Some");
+            assert!(r.passed);
+            assert_eq!(metrics.exit_code, 0);
+        });
     }
 
     #[test]
     fn spawn_false_binary_produces_failing_exit_code() {
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let handle = PayloadRun::new(&ctx, &FALSE_BIN)
-            .spawn()
-            .expect("spawn /bin/false");
-        let (_result, metrics) = handle.wait().expect("wait");
-        assert_ne!(metrics.exit_code, 0);
+        with_ctx("/nonexistent", |ctx| {
+            let handle = PayloadRun::new(ctx, &FALSE_BIN)
+                .spawn()
+                .expect("spawn /bin/false");
+            let (_result, metrics) = handle.wait().expect("wait");
+            assert_ne!(metrics.exit_code, 0);
+        });
     }
 
     #[test]
@@ -3605,14 +3596,13 @@ mod tests {
         // previously-appended .arg(...) — and subsequent .arg(...)
         // calls start from empty. Regression guard for the
         // "clear_args truncates, arg appends" contract.
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let run = PayloadRun::new(&ctx, &FIO_BINARY)
-            .arg("--x")
-            .clear_args()
-            .arg("--y");
-        assert_eq!(run.args, vec!["--y"]);
+        with_ctx("/nonexistent", |ctx| {
+            let run = PayloadRun::new(ctx, &FIO_BINARY)
+                .arg("--x")
+                .clear_args()
+                .arg("--y");
+            assert_eq!(run.args, vec!["--y"]);
+        });
     }
 
     #[test]
@@ -3636,26 +3626,24 @@ mod tests {
             known_flags: None,
             metric_bounds: None,
         };
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
+        with_ctx("/nonexistent", |ctx| {
+            // Fresh builder inherits both default checks in order.
+            let fresh = PayloadRun::new(ctx, &CHECKED);
+            assert_eq!(fresh.checks.len(), 2);
+            assert!(matches!(fresh.checks[0], MetricCheck::ExitCodeEq(0)));
+            assert!(matches!(
+                fresh.checks[1],
+                MetricCheck::Min { value, .. } if value == 500.0,
+            ));
 
-        // Fresh builder inherits both default checks in order.
-        let fresh = PayloadRun::new(&ctx, &CHECKED);
-        assert_eq!(fresh.checks.len(), 2);
-        assert!(matches!(fresh.checks[0], MetricCheck::ExitCodeEq(0)));
-        assert!(matches!(
-            fresh.checks[1],
-            MetricCheck::Min { value, .. } if value == 500.0,
-        ));
+            // Appending preserves defaults and adds on top.
+            let appended = PayloadRun::new(ctx, &CHECKED).check(MetricCheck::exists("latency"));
+            assert_eq!(appended.checks.len(), 3);
 
-        // Appending preserves defaults and adds on top.
-        let appended = PayloadRun::new(&ctx, &CHECKED).check(MetricCheck::exists("latency"));
-        assert_eq!(appended.checks.len(), 3);
-
-        // Clearing wipes defaults too.
-        let cleared = PayloadRun::new(&ctx, &CHECKED).clear_checks();
-        assert!(cleared.checks.is_empty());
+            // Clearing wipes defaults too.
+            let cleared = PayloadRun::new(ctx, &CHECKED).clear_checks();
+            assert!(cleared.checks.is_empty());
+        });
     }
 
     #[test]
@@ -3663,29 +3651,27 @@ mod tests {
         // Static &'static str goes in as Cow::Borrowed; no heap
         // allocation happens for the common case of a const cgroup
         // name. Regression guard for the Cow<'static, str> API shape.
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let run = PayloadRun::new(&ctx, &FIO_BINARY).in_cgroup("workload");
-        match &run.cgroup {
-            Some(Cow::Borrowed(s)) => assert_eq!(*s, "workload"),
-            other => panic!("expected Cow::Borrowed for &'static str input, got {other:?}"),
-        }
+        with_ctx("/nonexistent", |ctx| {
+            let run = PayloadRun::new(ctx, &FIO_BINARY).in_cgroup("workload");
+            match &run.cgroup {
+                Some(Cow::Borrowed(s)) => assert_eq!(*s, "workload"),
+                other => panic!("expected Cow::Borrowed for &'static str input, got {other:?}"),
+            }
+        });
     }
 
     #[test]
     fn in_cgroup_accepts_owned_string() {
         // Owned String goes in as Cow::Owned; the builder must not
         // require the caller to convert themselves.
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let name = String::from("dynamic");
-        let run = PayloadRun::new(&ctx, &FIO_BINARY).in_cgroup(name);
-        match &run.cgroup {
-            Some(Cow::Owned(s)) => assert_eq!(s, "dynamic"),
-            other => panic!("expected Cow::Owned for String input, got {other:?}"),
-        }
+        with_ctx("/nonexistent", |ctx| {
+            let name = String::from("dynamic");
+            let run = PayloadRun::new(ctx, &FIO_BINARY).in_cgroup(name);
+            match &run.cgroup {
+                Some(Cow::Owned(s)) => assert_eq!(s, "dynamic"),
+                other => panic!("expected Cow::Owned for String input, got {other:?}"),
+            }
+        });
     }
 
     /// Host-side decode of a guest-emitted `PayloadMetrics` JSON
@@ -4165,30 +4151,29 @@ mod tests {
     /// panicking `.expect(...)`.
     #[test]
     fn try_wait_after_terminal_returns_err() {
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let mut handle = PayloadRun::new(&ctx, &TRUE_BIN)
-            .spawn()
-            .expect("spawn /bin/true");
-        // First terminal: /bin/true exits immediately; spin until
-        // try_wait returns Some.
-        for _ in 0..100 {
-            if handle.try_wait().expect("try_wait").is_some() {
-                break;
+        with_ctx("/nonexistent", |ctx| {
+            let mut handle = PayloadRun::new(ctx, &TRUE_BIN)
+                .spawn()
+                .expect("spawn /bin/true");
+            // First terminal: /bin/true exits immediately; spin until
+            // try_wait returns Some.
+            for _ in 0..100 {
+                if handle.try_wait().expect("try_wait").is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        // Second call must not panic — expect Err describing the
-        // consumed state.
-        let err = handle
-            .try_wait()
-            .expect_err("second try_wait on consumed handle must be Err");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("already consumed") && msg.contains("true_bin"),
-            "error must name the handle + misuse, got: {msg}"
-        );
+            // Second call must not panic — expect Err describing the
+            // consumed state.
+            let err = handle
+                .try_wait()
+                .expect_err("second try_wait on consumed handle must be Err");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("already consumed") && msg.contains("true_bin"),
+                "error must name the handle + misuse, got: {msg}"
+            );
+        });
     }
 
     /// Calling `wait()` after `try_wait()` has consumed the child
@@ -4197,53 +4182,51 @@ mod tests {
     /// terminal method.
     #[test]
     fn wait_after_try_wait_consumed_returns_err() {
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let mut handle = PayloadRun::new(&ctx, &TRUE_BIN)
-            .spawn()
-            .expect("spawn /bin/true");
-        for _ in 0..100 {
-            if handle.try_wait().expect("try_wait").is_some() {
-                break;
+        with_ctx("/nonexistent", |ctx| {
+            let mut handle = PayloadRun::new(ctx, &TRUE_BIN)
+                .spawn()
+                .expect("spawn /bin/true");
+            for _ in 0..100 {
+                if handle.try_wait().expect("try_wait").is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        // Child is now taken; wait() must return Err, not panic.
-        let err = handle
-            .wait()
-            .expect_err("wait() on consumed handle must return Err");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("already consumed") && msg.contains("true_bin"),
-            "error must name the handle + misuse, got: {msg}"
-        );
+            // Child is now taken; wait() must return Err, not panic.
+            let err = handle
+                .wait()
+                .expect_err("wait() on consumed handle must return Err");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("already consumed") && msg.contains("true_bin"),
+                "error must name the handle + misuse, got: {msg}"
+            );
+        });
     }
 
     /// Calling `kill()` after `try_wait()` has consumed the child
     /// must Err rather than panic.
     #[test]
     fn kill_after_try_wait_consumed_returns_err() {
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        let mut handle = PayloadRun::new(&ctx, &TRUE_BIN)
-            .spawn()
-            .expect("spawn /bin/true");
-        for _ in 0..100 {
-            if handle.try_wait().expect("try_wait").is_some() {
-                break;
+        with_ctx("/nonexistent", |ctx| {
+            let mut handle = PayloadRun::new(ctx, &TRUE_BIN)
+                .spawn()
+                .expect("spawn /bin/true");
+            for _ in 0..100 {
+                if handle.try_wait().expect("try_wait").is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let err = handle
-            .kill()
-            .expect_err("kill() on consumed handle must return Err");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("already consumed") && msg.contains("true_bin"),
-            "error must name the handle + misuse, got: {msg}"
-        );
+            let err = handle
+                .kill()
+                .expect_err("kill() on consumed handle must return Err");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("already consumed") && msg.contains("true_bin"),
+                "error must name the handle + misuse, got: {msg}"
+            );
+        });
     }
 
     // -- stdout-primary / stderr-fallback evaluation --
@@ -4553,52 +4536,51 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn kill_reaps_fork_descendants_via_process_group() {
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        const MULTI_SLEEPER: Payload = Payload {
-            name: "multi_sleeper",
-            kind: PayloadKind::Binary("/bin/sh"),
-            output: crate::test_support::OutputFormat::ExitCode,
-            default_args: &["-c", "sleep 60 & exec sleep 60"],
-            default_checks: &[],
-            metrics: &[],
-            include_files: &[],
-            uses_parent_pgrp: false,
-            known_flags: None,
-            metric_bounds: None,
-        };
-        let handle = PayloadRun::new(&ctx, &MULTI_SLEEPER)
-            .spawn()
-            .expect("spawn multi-sleeper");
-        // The pgid equals the head child's pid. Capture it via the
-        // public `pid()` accessor so the test does not reach into the
-        // private `child` field.
-        let pgid = libc::pid_t::try_from(handle.pid().expect("child still present"))
-            .expect("child pid fits in pid_t");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let (_, _) = handle.kill().expect("kill+reap");
-        // After kill+reap the whole process group must be gone.
-        // Poll `killpg(pgid, 0)` (existence probe) until ESRCH;
-        // SIGKILL delivery + reap can lag the caller.
-        loop {
-            // SAFETY: killpg with signal 0 is a pure existence query
-            // with no side effects beyond errno.
-            let rc = unsafe { libc::killpg(pgid, 0) };
-            if rc != 0 {
-                let err = std::io::Error::last_os_error();
-                assert_eq!(
-                    err.raw_os_error(),
-                    Some(libc::ESRCH),
-                    "unexpected errno from killpg probe: {err}",
-                );
-                break;
+        with_ctx("/nonexistent", |ctx| {
+            const MULTI_SLEEPER: Payload = Payload {
+                name: "multi_sleeper",
+                kind: PayloadKind::Binary("/bin/sh"),
+                output: crate::test_support::OutputFormat::ExitCode,
+                default_args: &["-c", "sleep 60 & exec sleep 60"],
+                default_checks: &[],
+                metrics: &[],
+                include_files: &[],
+                uses_parent_pgrp: false,
+                known_flags: None,
+                metric_bounds: None,
+            };
+            let handle = PayloadRun::new(ctx, &MULTI_SLEEPER)
+                .spawn()
+                .expect("spawn multi-sleeper");
+            // The pgid equals the head child's pid. Capture it via the
+            // public `pid()` accessor so the test does not reach into the
+            // private `child` field.
+            let pgid = libc::pid_t::try_from(handle.pid().expect("child still present"))
+                .expect("child pid fits in pid_t");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let (_, _) = handle.kill().expect("kill+reap");
+            // After kill+reap the whole process group must be gone.
+            // Poll `killpg(pgid, 0)` (existence probe) until ESRCH;
+            // SIGKILL delivery + reap can lag the caller.
+            loop {
+                // SAFETY: killpg with signal 0 is a pure existence query
+                // with no side effects beyond errno.
+                let rc = unsafe { libc::killpg(pgid, 0) };
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    assert_eq!(
+                        err.raw_os_error(),
+                        Some(libc::ESRCH),
+                        "unexpected errno from killpg probe: {err}",
+                    );
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("process group {pgid} still alive after kill+reap");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            if std::time::Instant::now() >= deadline {
-                panic!("process group {pgid} still alive after kill+reap");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        });
     }
 
     /// Drop path of [`PayloadHandle`]: a handle that falls out of
@@ -4617,56 +4599,55 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn drop_kills_fork_descendants_via_process_group() {
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        const MULTI_SLEEPER: Payload = Payload {
-            name: "multi_sleeper_drop",
-            kind: PayloadKind::Binary("/bin/sh"),
-            output: crate::test_support::OutputFormat::ExitCode,
-            default_args: &["-c", "sleep 60 & exec sleep 60"],
-            default_checks: &[],
-            metrics: &[],
-            include_files: &[],
-            uses_parent_pgrp: false,
-            known_flags: None,
-            metric_bounds: None,
-        };
-        let handle = PayloadRun::new(&ctx, &MULTI_SLEEPER)
-            .spawn()
-            .expect("spawn multi-sleeper");
-        // Capture the pgid via the public `pid()` accessor before
-        // dropping, so we can probe the group after the handle
-        // goes out of scope.
-        let pgid = libc::pid_t::try_from(handle.pid().expect("child still present"))
-            .expect("child pid fits in pid_t");
-        // Drop (no wait/kill/try_wait). The Drop impl at
-        // src/scenario/payload_run.rs routes through
-        // `kill_payload_process_group` + `child.wait()`.
-        drop(handle);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            // SAFETY: killpg with signal 0 is a pure existence
-            // query with no side effects beyond errno.
-            let rc = unsafe { libc::killpg(pgid, 0) };
-            if rc != 0 {
-                let err = std::io::Error::last_os_error();
-                assert_eq!(
-                    err.raw_os_error(),
-                    Some(libc::ESRCH),
-                    "unexpected errno from killpg probe after drop: {err}",
-                );
-                break;
+        with_ctx("/nonexistent", |ctx| {
+            const MULTI_SLEEPER: Payload = Payload {
+                name: "multi_sleeper_drop",
+                kind: PayloadKind::Binary("/bin/sh"),
+                output: crate::test_support::OutputFormat::ExitCode,
+                default_args: &["-c", "sleep 60 & exec sleep 60"],
+                default_checks: &[],
+                metrics: &[],
+                include_files: &[],
+                uses_parent_pgrp: false,
+                known_flags: None,
+                metric_bounds: None,
+            };
+            let handle = PayloadRun::new(ctx, &MULTI_SLEEPER)
+                .spawn()
+                .expect("spawn multi-sleeper");
+            // Capture the pgid via the public `pid()` accessor before
+            // dropping, so we can probe the group after the handle
+            // goes out of scope.
+            let pgid = libc::pid_t::try_from(handle.pid().expect("child still present"))
+                .expect("child pid fits in pid_t");
+            // Drop (no wait/kill/try_wait). The Drop impl at
+            // src/scenario/payload_run.rs routes through
+            // `kill_payload_process_group` + `child.wait()`.
+            drop(handle);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                // SAFETY: killpg with signal 0 is a pure existence
+                // query with no side effects beyond errno.
+                let rc = unsafe { libc::killpg(pgid, 0) };
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    assert_eq!(
+                        err.raw_os_error(),
+                        Some(libc::ESRCH),
+                        "unexpected errno from killpg probe after drop: {err}",
+                    );
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!(
+                        "process group {pgid} still alive 30 s after \
+                         PayloadHandle drop — Drop-path killpg sweep \
+                         failed to reach every member",
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            if std::time::Instant::now() >= deadline {
-                panic!(
-                    "process group {pgid} still alive 30 s after \
-                     PayloadHandle drop — Drop-path killpg sweep \
-                     failed to reach every member",
-                );
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        });
     }
 
     /// `uses_parent_pgrp = true` SKIPS the `process_group(0)` call
@@ -4679,49 +4660,48 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn payload_uses_parent_pgrp_opts_out_of_process_group() {
-        let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::synthetic(4, 1);
-        let ctx = make_ctx(&cgroups, &topo);
-        const PARENT_PGRP_SLEEPER: Payload = Payload {
-            name: "parent_pgrp_sleeper",
-            kind: PayloadKind::Binary("/bin/sleep"),
-            output: crate::test_support::OutputFormat::ExitCode,
-            default_args: &["60"],
-            default_checks: &[],
-            metrics: &[],
-            include_files: &[],
-            uses_parent_pgrp: true,
-            known_flags: None,
-            metric_bounds: None,
-        };
-        let handle = PayloadRun::new(&ctx, &PARENT_PGRP_SLEEPER)
-            .spawn()
-            .expect("spawn opt-out sleeper");
-        let child_pid = libc::pid_t::try_from(handle.pid().expect("child alive"))
-            .expect("child pid fits in pid_t");
-        // SAFETY: getpgid(pid) is a pure lookup with no side
-        // effects beyond returning the queried pid's pgid (or -1
-        // + errno on failure).
-        let child_pgid = unsafe { libc::getpgid(child_pid) };
-        // SAFETY: getpgid(0) returns the CURRENT process's pgid
-        // and cannot fail.
-        let parent_pgid = unsafe { libc::getpgid(0) };
-        assert!(child_pgid > 0, "getpgid(child) failed: {child_pgid}");
-        assert_eq!(
-            child_pgid, parent_pgid,
-            "uses_parent_pgrp=true payload must inherit the \
-             parent's pgid (child_pgid={child_pgid}, \
-             parent_pgid={parent_pgid}); a mismatch means \
-             `build_command` still called `process_group(0)` \
-             despite the opt-out",
-        );
-        // kill() on a handle whose child is not a pgrp leader
-        // still reaps normally — kill_payload_process_group
-        // falls back to single-pid SIGKILL. Consume the handle
-        // so the sleeper doesn't outlive the test; a silent
-        // failure here would mask the test's own regression
-        // (e.g. a broken kill path that leaks sleepers).
-        let _ = handle.kill().expect("kill opt-out sleeper");
+        with_ctx("/nonexistent", |ctx| {
+            const PARENT_PGRP_SLEEPER: Payload = Payload {
+                name: "parent_pgrp_sleeper",
+                kind: PayloadKind::Binary("/bin/sleep"),
+                output: crate::test_support::OutputFormat::ExitCode,
+                default_args: &["60"],
+                default_checks: &[],
+                metrics: &[],
+                include_files: &[],
+                uses_parent_pgrp: true,
+                known_flags: None,
+                metric_bounds: None,
+            };
+            let handle = PayloadRun::new(ctx, &PARENT_PGRP_SLEEPER)
+                .spawn()
+                .expect("spawn opt-out sleeper");
+            let child_pid = libc::pid_t::try_from(handle.pid().expect("child alive"))
+                .expect("child pid fits in pid_t");
+            // SAFETY: getpgid(pid) is a pure lookup with no side
+            // effects beyond returning the queried pid's pgid (or -1
+            // + errno on failure).
+            let child_pgid = unsafe { libc::getpgid(child_pid) };
+            // SAFETY: getpgid(0) returns the CURRENT process's pgid
+            // and cannot fail.
+            let parent_pgid = unsafe { libc::getpgid(0) };
+            assert!(child_pgid > 0, "getpgid(child) failed: {child_pgid}");
+            assert_eq!(
+                child_pgid, parent_pgid,
+                "uses_parent_pgrp=true payload must inherit the \
+                 parent's pgid (child_pgid={child_pgid}, \
+                 parent_pgid={parent_pgid}); a mismatch means \
+                 `build_command` still called `process_group(0)` \
+                 despite the opt-out",
+            );
+            // kill() on a handle whose child is not a pgrp leader
+            // still reaps normally — kill_payload_process_group
+            // falls back to single-pid SIGKILL. Consume the handle
+            // so the sleeper doesn't outlive the test; a silent
+            // failure here would mask the test's own regression
+            // (e.g. a broken kill path that leaks sleepers).
+            let _ = handle.kill().expect("kill opt-out sleeper");
+        });
     }
 
     /// `wait_with_deadline` timeout kills the whole process group
