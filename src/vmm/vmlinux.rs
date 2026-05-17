@@ -118,34 +118,29 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn find_vmlinux_from_bzimage_path() {
         // Create a temp dir simulating <root>/arch/x86/boot/bzImage with vmlinux at <root>.
-        let tmp = std::env::temp_dir().join("ktstr-find-vmlinux-test");
-        let boot_dir = tmp.join("arch/x86/boot");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let boot_dir = tmp.path().join("arch/x86/boot");
         std::fs::create_dir_all(&boot_dir).unwrap();
-        let vmlinux = tmp.join("vmlinux");
+        let vmlinux = tmp.path().join("vmlinux");
         std::fs::write(&vmlinux, b"ELF").unwrap();
         let bzimage = boot_dir.join("bzImage");
         std::fs::write(&bzimage, b"kernel").unwrap();
 
         let found = find_vmlinux(&bzimage);
         assert_eq!(found, Some(vmlinux));
-
-        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
     fn find_vmlinux_sibling() {
         // vmlinux in the same directory as the kernel image.
-        let tmp = std::env::temp_dir().join("ktstr-find-vmlinux-sibling");
-        std::fs::create_dir_all(&tmp).unwrap();
-        let vmlinux = tmp.join("vmlinux");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vmlinux = tmp.path().join("vmlinux");
         std::fs::write(&vmlinux, b"ELF").unwrap();
-        let kernel = tmp.join("bzImage");
+        let kernel = tmp.path().join("bzImage");
         std::fs::write(&kernel, b"kernel").unwrap();
 
         let found = find_vmlinux(&kernel);
         assert_eq!(found, Some(vmlinux));
-
-        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
@@ -167,14 +162,11 @@ mod tests {
 
     #[test]
     fn find_vmlinux_missing_returns_none() {
-        let tmp = std::env::temp_dir().join("ktstr-find-vmlinux-none");
-        std::fs::create_dir_all(&tmp).unwrap();
-        let kernel = tmp.join("bzImage");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let kernel = tmp.path().join("bzImage");
         std::fs::write(&kernel, b"kernel").unwrap();
 
         assert_eq!(find_vmlinux(&kernel), None);
-
-        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     /// First call reads from disk; second call returns a clone of the
@@ -184,9 +176,8 @@ mod tests {
     /// hit returns the same allocation.
     #[test]
     fn cached_vmlinux_bytes_hits_on_second_call() {
-        let tmp = std::env::temp_dir().join("ktstr-cached-vmlinux-bytes");
-        std::fs::create_dir_all(&tmp).unwrap();
-        let vmlinux = tmp.join("vmlinux-test-cache");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vmlinux = tmp.path().join("vmlinux-test-cache");
         std::fs::write(&vmlinux, b"FAKE_VMLINUX_BYTES").unwrap();
 
         let first = cached_vmlinux_bytes(&vmlinux).expect("first read populates cache");
@@ -196,18 +187,14 @@ mod tests {
             Arc::ptr_eq(&first, &second),
             "cache hit must return the same Arc; got fresh allocations on each call"
         );
-
-        std::fs::remove_file(&vmlinux).ok();
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// Unreadable path returns `None` without populating the cache;
     /// a subsequent successful path is unaffected.
     #[test]
     fn cached_vmlinux_bytes_missing_returns_none() {
-        let nonexistent = std::env::temp_dir().join("ktstr-cached-vmlinux-bytes-missing-xyzzy");
-        // Defensive: ensure the file does not exist from a prior run.
-        std::fs::remove_file(&nonexistent).ok();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nonexistent = tmp.path().join("missing-xyzzy");
         assert!(cached_vmlinux_bytes(&nonexistent).is_none());
     }
 }
