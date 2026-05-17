@@ -105,9 +105,14 @@ pub use config::*;
 // re-exported here. `WorkerReportClaim` is the proc-macro-
 // generated companion to `WorkerReport` (see the `crate::Claim`
 // derive on the `WorkerReport` struct).
-pub use spawn::{
-    Migration, WorkerExitInfo, WorkerReport, WorkerReportClaim, WorkloadHandle, build_nodemask,
-};
+pub use spawn::{Migration, WorkerExitInfo, WorkerReport, WorkerReportClaim, WorkloadHandle};
+// `build_nodemask` is the low-level `set_mempolicy(2)` / `mbind(2)`
+// nodemask builder. It's deliberately NOT in the public surface —
+// test authors express NUMA placement through the [`MemPolicy`]
+// enum — but `crate::vmm::host_topology` invokes the syscall
+// directly when warming the per-VM topology cache and needs an
+// in-crate path to the helper.
+pub(crate) use spawn::build_nodemask;
 pub use types::*;
 
 // `FanOutCompute` stores its u64 generation counter at offset 0 of

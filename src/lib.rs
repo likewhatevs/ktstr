@@ -765,6 +765,14 @@ pub mod prelude {
     // `newest_run_dir`, `runs_root`, `analyze_sidecars`, `ktstr_main`,
     // `ktstr_test_early_dispatch`, `run_ktstr_test`,
     // `resolve_scheduler`, `resolve_test_kernel`.
+    //
+    // `build_nodemask` (the low-level `set_mempolicy(2)` / `mbind(2)`
+    // bitmask builder) is also excluded: test authors express NUMA
+    // placement through the `MemPolicy` enum, not raw nodemask
+    // construction. The helper itself lives in the crate-private
+    // `workload::spawn` submodule with a `pub(crate)` re-export at
+    // `crate::workload::build_nodemask` for `vmm::host_topology`
+    // internal use.
     pub use crate::topology::{LlcInfo, NodeMemInfo, TestTopology};
     pub use crate::vmm::{VirtioBlkCountersSnapshot, VirtioNetCountersSnapshot};
     // `VmResult` is the host-side return value from booting a VM.
@@ -780,7 +788,7 @@ pub mod prelude {
     pub use crate::workload::{
         AffinityIntent, AluWidth, CloneMode, MemPolicy, Migration, MpolFlags, Phase,
         ResolvedAffinity, SchedPolicy, WorkSpec, WorkType, WorkTypeValidationError, WorkerReport,
-        WorkloadConfig, WorkloadHandle, build_nodemask,
+        WorkloadConfig, WorkloadHandle,
     };
 }
 
