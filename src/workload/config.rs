@@ -1636,6 +1636,24 @@ mod tests {
         assert_eq!(p.node_set(), [1, 3].into_iter().collect());
     }
     #[test]
+    fn mempolicy_validate_bind_empty() {
+        let err = MemPolicy::Bind(BTreeSet::new()).validate().unwrap_err();
+        assert!(
+            err.contains("Bind") && err.contains("NUMA node"),
+            "diagnostic must name the variant and required content: {err}",
+        );
+    }
+    #[test]
+    fn mempolicy_validate_interleave_empty() {
+        let err = MemPolicy::Interleave(BTreeSet::new())
+            .validate()
+            .unwrap_err();
+        assert!(
+            err.contains("Interleave") && err.contains("NUMA node"),
+            "diagnostic must name the variant and required content: {err}",
+        );
+    }
+    #[test]
     fn mempolicy_validate_preferred_many_empty() {
         assert!(
             MemPolicy::PreferredMany(BTreeSet::new())

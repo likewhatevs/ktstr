@@ -164,8 +164,15 @@ pub enum ResolvedAffinity {
     /// - `count > from.len()` is clamped to `from.len()` — asking for
     ///   more CPUs than the pool contains is a topology fact, not a
     ///   caller error.
-    /// - `from` empty with `count > 0` resolves to no affinity (no
-    ///   pool to sample from); downstream treats this as `None`.
+    /// - `from` empty with `count > 0` is a caller bug: [`resolve_affinity`]
+    ///   bails (an unsatisfiable sample request would otherwise produce an
+    ///   empty `sched_setaffinity` mask that the kernel rejects with
+    ///   `EINVAL`). The resolution step that produces this variant — see
+    ///   [`crate::scenario::resolve_affinity_for_cgroup`] — already
+    ///   short-circuits empty pools to [`ResolvedAffinity::None`] before
+    ///   construction. Direct constructor callers (e.g. test fixtures)
+    ///   must do the same: use [`ResolvedAffinity::None`] for "no affinity
+    ///   constraint", never `Random { from: empty, count: > 0 }`.
     Random { from: BTreeSet<usize>, count: usize },
     /// Pin to a single CPU.
     SingleCpu(usize),
@@ -197,9 +204,15 @@ impl ResolvedAffinity {
 /// spawn pipeline writes into the worker's `sched_setaffinity` mask.
 ///
 /// `Random` samples `count` CPUs from `from` per call (each worker
-/// gets an independent draw at spawn time). Empty `from` with
-/// `count > 0` returns `Ok(None)` (no affinity applied) and logs a
-/// debug-level note; `count == 0` is a caller bug and bails.
+/// gets an independent draw at spawn time). Empty `from` is a caller
+/// bug and bails — the upstream resolver
+/// [`crate::scenario::resolve_affinity_for_cgroup`] already
+/// short-circuits empty pools (after cpuset intersection) to
+/// [`ResolvedAffinity::None`], so reaching this fn with an empty
+/// `Random.from` indicates a caller bypassing the resolver. Aligned
+/// with the project-wide no-silent-drops invariant: invalid input
+/// must fail loudly, never silently degrade to "no affinity applied".
+/// `count == 0` likewise bails.
 pub(crate) fn resolve_affinity(mode: &ResolvedAffinity) -> Result<Option<BTreeSet<usize>>> {
     match mode {
         ResolvedAffinity::None => Ok(None),
@@ -214,11 +227,15 @@ pub(crate) fn resolve_affinity(mode: &ResolvedAffinity) -> Result<Option<BTreeSe
                 );
             }
             if from.is_empty() {
-                tracing::debug!(
+                anyhow::bail!(
+                    "ResolvedAffinity::Random.from is empty with count={count}; \
+                     a worker cannot be pinned to an empty CPU pool. The \
+                     resolution step that produced this Random must either \
+                     reject the empty set up-front or fall back to \
+                     ResolvedAffinity::None deliberately rather than \
+                     forwarding an unsatisfiable sample request",
                     count = count,
-                    "resolve_affinity: empty Random pool, leaving affinity unset"
                 );
-                return Ok(None);
             }
             let pool: Vec<usize> = from.iter().copied().collect();
             // Clamp count down to the pool size (user asked for more
@@ -389,13 +406,27 @@ mod tests {
         );
     }
     #[test]
-    fn resolve_affinity_random_empty_pool_is_none() {
-        // Regression: ResolvedAffinity::Random { from: empty, count } previously
-        // produced an empty affinity mask rejected by sched_setaffinity
-        // with EINVAL. Empty pool must short-circuit to Ok(None).
+    fn resolve_affinity_random_empty_pool_bails() {
+        // Empty Random.from with count > 0 is unsatisfiable: a worker
+        // cannot be pinned to an empty CPU pool, and the prior
+        // silent-degrade-to-Ok(None) violated the project-wide
+        // no-silent-drops invariant. Resolution-step callers must
+        // either reject empty up-front or deliberately fall back to
+        // ResolvedAffinity::None — bail forces the bug to surface.
         let from: BTreeSet<usize> = BTreeSet::new();
-        let r = resolve_affinity(&ResolvedAffinity::Random { from, count: 1 }).unwrap();
-        assert!(r.is_none(), "empty Random pool must resolve to no affinity");
+        let err = resolve_affinity(&ResolvedAffinity::Random { from, count: 1 }).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("empty") && msg.contains("count=1"),
+            "diagnostic must name the empty pool and the count: got {msg}",
+        );
+        // Also pin the actionable suggestion — names the recommended
+        // fallback type so a caller hitting this error learns how to
+        // express "no affinity constraint" via the type system.
+        assert!(
+            msg.contains("ResolvedAffinity::None"),
+            "diagnostic must name the recommended fallback type so callers learn the fix: got {msg}",
+        );
     }
 
     #[test]

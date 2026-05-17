@@ -2209,15 +2209,47 @@ pub(super) fn spawn_pcomm_container(
                     // each call produces an independent BTreeSet.
                     // Fixed affinity returns the same BTreeSet for
                     // every thread.
+                    //
+                    // resolve_affinity bails on caller bugs (count==0,
+                    // empty pool). In the pcomm container's forked-
+                    // child context we cannot propagate Err up; the
+                    // surrounding convention (grep `libc::_exit` for
+                    // the sibling forked-child failure sites in this
+                    // file — the start-byte poll-timeout bail, the
+                    // EventFd::new bail, the thread::Builder::spawn
+                    // bail) is eprintln + _exit so the parent collects
+                    // a missing-report rather than silently spawning
+                    // workers without the affinity the test author
+                    // requested. Aligns with the project-wide
+                    // no-silent-drops invariant; the prior
+                    // degrade-to-None behaviour was a violation we
+                    // close here.
                     let affinity = match resolve_affinity(&group.affinity) {
                         Ok(a) => a,
                         Err(e) => {
                             eprintln!(
                                 "ktstr: pcomm container (group {}): resolve_affinity \
-                                 for thread {i}/{num_workers} failed: {e:#}",
+                                 for thread {i}/{num_workers} failed: {e:#}. \
+                                 Aborting container — refusing to spawn workers \
+                                 without the requested affinity (no silent drops).",
                                 group.group_idx,
                             );
-                            None
+                            // SAFETY: `_exit` is the standard async-
+                            // signal-safe exit primitive used at every
+                            // other forked-child failure site in this
+                            // file (grep `libc::_exit` for siblings).
+                            // Argument is a plain `c_int`; no resources
+                            // need unwind. Kernel-side `_exit` invokes
+                            // `exit_group(2)`, terminating every thread
+                            // in this child process atomically —
+                            // sibling worker threads spawned in earlier
+                            // loop iterations are killed along with
+                            // this one, the intended fail-stop
+                            // behaviour (the parent observes a missing
+                            // report and surfaces a sentinel).
+                            unsafe {
+                                libc::_exit(1);
+                            }
                         }
                     };
 
