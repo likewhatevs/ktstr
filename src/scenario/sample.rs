@@ -127,6 +127,29 @@ struct SampleRow {
     elapsed_ms: u64,
 }
 
+/// Common scaffolding shared by every projector axis (bpf / stats /
+/// host per-CPU). Iterates `rows` once, threads each row's
+/// `tag` and `elapsed_ms` into the resulting [`SeriesField`], and
+/// invokes `row_to_slot` to compute the per-sample value or per-
+/// sample [`SnapshotError`]. Keeps the `tags`/`elapsed`/`values`
+/// vec lengths in lock-step so the [`SeriesField::from_parts`]
+/// length-parity invariant never triggers.
+fn build_series_field<T>(
+    rows: &[SampleRow],
+    label: impl Into<String>,
+    mut row_to_slot: impl FnMut(&SampleRow) -> SnapshotResult<T>,
+) -> SeriesField<T> {
+    let mut values: Vec<SnapshotResult<T>> = Vec::with_capacity(rows.len());
+    let mut tags: Vec<String> = Vec::with_capacity(rows.len());
+    let mut elapsed: Vec<u64> = Vec::with_capacity(rows.len());
+    for row in rows {
+        tags.push(row.tag.clone());
+        elapsed.push(row.elapsed_ms);
+        values.push(row_to_slot(row));
+    }
+    SeriesField::from_parts(label, tags, elapsed, values)
+}
+
 impl SampleSeries {
     /// Build a series from the bridge's drained tuple. Every entry
     /// is preserved in the order the bridge surfaced, including
@@ -239,12 +262,7 @@ impl SampleSeries {
     where
         F: Fn(&Snapshot<'_>) -> SnapshotResult<T>,
     {
-        let mut values: Vec<SnapshotResult<T>> = Vec::with_capacity(self.rows.len());
-        let mut tags: Vec<String> = Vec::with_capacity(self.rows.len());
-        let mut elapsed: Vec<u64> = Vec::with_capacity(self.rows.len());
-        for row in &self.rows {
-            tags.push(row.tag.clone());
-            elapsed.push(row.elapsed_ms);
+        build_series_field(&self.rows, label, |row| {
             // Placeholder reports carry no real BPF state — the
             // freeze rendezvous timed out (or the capture pipeline
             // otherwise failed). Surface a dedicated PlaceholderSample
@@ -253,22 +271,18 @@ impl SampleSeries {
             // "placeholder, skip" distinctly from "field missing,
             // skip" when rendering the verdict's skip-Note.
             if row.report.is_placeholder {
-                values.push(Err(
-                    crate::scenario::snapshot::SnapshotError::PlaceholderSample {
-                        tag: row.tag.clone(),
-                        reason: row
-                            .report
-                            .scx_walker_unavailable
-                            .clone()
-                            .unwrap_or_else(|| "placeholder report".to_string()),
-                    },
-                ));
-                continue;
+                return Err(crate::scenario::snapshot::SnapshotError::PlaceholderSample {
+                    tag: row.tag.clone(),
+                    reason: row
+                        .report
+                        .scx_walker_unavailable
+                        .clone()
+                        .unwrap_or_else(|| "placeholder report".to_string()),
+                });
             }
             let snap = Snapshot::new(&row.report);
-            values.push(project(&snap));
-        }
-        SeriesField::from_parts(label, tags, elapsed, values)
+            project(&snap)
+        })
     }
 
     /// Project the series along the stats axis. The closure
@@ -286,21 +300,12 @@ impl SampleSeries {
     where
         F: Fn(StatsValue<'_>) -> SnapshotResult<T>,
     {
-        let mut values: Vec<SnapshotResult<T>> = Vec::with_capacity(self.rows.len());
-        let mut tags: Vec<String> = Vec::with_capacity(self.rows.len());
-        let mut elapsed: Vec<u64> = Vec::with_capacity(self.rows.len());
-        for row in &self.rows {
-            tags.push(row.tag.clone());
-            elapsed.push(row.elapsed_ms);
-            let outcome = match row.stats.as_ref() {
-                Some(v) => project(StatsValue { value: v }),
-                None => Err(crate::scenario::snapshot::SnapshotError::MissingStats {
-                    tag: row.tag.clone(),
-                }),
-            };
-            values.push(outcome);
-        }
-        SeriesField::from_parts(label, tags, elapsed, values)
+        build_series_field(&self.rows, label, |row| match row.stats.as_ref() {
+            Some(v) => project(StatsValue { value: v }),
+            None => Err(crate::scenario::snapshot::SnapshotError::MissingStats {
+                tag: row.tag.clone(),
+            }),
+        })
     }
 
     /// Auto-project a top-level BPF map's struct members. The
@@ -579,6 +584,13 @@ impl<'a> HostView<'a> {
     /// [`SampleSeries::iter_samples`] and consult
     /// [`crate::scenario::snapshot::Snapshot::per_cpu_time_at`] per
     /// sample.
+    ///
+    /// Inherits the first-match-wins contract for duplicate-cpu
+    /// entries from
+    /// [`crate::scenario::snapshot::Snapshot::per_cpu_time_at`]:
+    /// production walker (`collect_per_cpu_time`) enforces one
+    /// entry per cpu per sample, but the lookup leaves the contract
+    /// first-match for graceful degradation on a malformed report.
     pub fn per_cpu_time_timeline(&self, cpu: u32) -> Vec<(u64, &'a PerCpuTimeStats)> {
         let mut entries: Vec<(u64, &'a PerCpuTimeStats)> = Vec::new();
         for row in self.rows {
@@ -610,12 +622,7 @@ impl<'a> HostView<'a> {
         label: impl Into<String>,
         project: impl Fn(&PerCpuTimeStats) -> u64,
     ) -> SeriesField<u64> {
-        let mut values: Vec<SnapshotResult<u64>> = Vec::with_capacity(self.rows.len());
-        let mut tags: Vec<String> = Vec::with_capacity(self.rows.len());
-        let mut elapsed: Vec<u64> = Vec::with_capacity(self.rows.len());
-        for row in self.rows {
-            tags.push(row.tag.clone());
-            elapsed.push(row.elapsed_ms);
+        build_series_field(&self.rows, label, |row| {
             // Placeholder reports surface as the dedicated
             // PlaceholderSample variant — matching the series.bpf
             // pattern so temporal-assertion sites route placeholder
@@ -625,19 +632,22 @@ impl<'a> HostView<'a> {
             // FAIL on placeholders instead of skipping; gap-tolerant
             // patterns render the right diagnostic Note.
             if row.report.is_placeholder {
-                values.push(Err(
-                    crate::scenario::snapshot::SnapshotError::PlaceholderSample {
-                        tag: row.tag.clone(),
-                        reason: row
-                            .report
-                            .scx_walker_unavailable
-                            .clone()
-                            .unwrap_or_else(|| "placeholder report".to_string()),
-                    },
-                ));
-                continue;
+                return Err(crate::scenario::snapshot::SnapshotError::PlaceholderSample {
+                    tag: row.tag.clone(),
+                    reason: row
+                        .report
+                        .scx_walker_unavailable
+                        .clone()
+                        .unwrap_or_else(|| "placeholder report".to_string()),
+                });
             }
-            let slot = match row.report.per_cpu_time.iter().find(|c| c.cpu == cpu) {
+            // Inherits the first-match-wins contract from
+            // [`crate::scenario::snapshot::Snapshot::per_cpu_time_at`]:
+            // production walker (`collect_per_cpu_time` at
+            // `crate::monitor::dump`) enforces one entry per cpu,
+            // but the closure leaves the contract first-match for
+            // graceful degradation on a malformed report.
+            match row.report.per_cpu_time.iter().find(|c| c.cpu == cpu) {
                 Some(stats) => Ok(project(stats)),
                 None => Err(
                     crate::scenario::snapshot::SnapshotError::HostFieldUnavailable {
@@ -645,10 +655,8 @@ impl<'a> HostView<'a> {
                         cpu,
                     },
                 ),
-            };
-            values.push(slot);
-        }
-        SeriesField::from_parts(label, tags, elapsed, values)
+            }
+        })
     }
 }
 
@@ -2043,5 +2051,121 @@ mod tests {
             vec![1, 3, 5],
             "cpus() MUST return ascending-sorted distinct CPU ids regardless of per_cpu_time insertion order"
         );
+    }
+
+    /// Duplicate-cpu first-match-wins contract. The production
+    /// walker (`collect_per_cpu_time`) enforces one entry per cpu
+    /// per sample, but `HostView::per_cpu_time_timeline` and
+    /// `HostView::per_cpu_field_u64` both use `iter().find(|c|
+    /// c.cpu == cpu)` which returns the FIRST match — silently
+    /// dropping subsequent entries for the same cpu. Pins the
+    /// first-match-wins contract so a regression to `last_match`,
+    /// panic-on-dup, or any other handling surfaces here. #125.
+    #[test]
+    fn series_host_per_cpu_time_timeline_first_match_wins_on_duplicate_cpu() {
+        let mut report = FailureDumpReport::default();
+        report.per_cpu_time = vec![
+            PerCpuTimeStats {
+                cpu: 0,
+                cpustat_user_ns: 100,
+                ..Default::default()
+            },
+            PerCpuTimeStats {
+                cpu: 0,
+                cpustat_user_ns: 200,
+                ..Default::default()
+            },
+        ];
+        let series =
+            SampleSeries::from_drained(vec![("s".to_string(), report, None, Some(0u64))], None);
+        let host = series.host().expect("non-empty");
+        let timeline = host.per_cpu_time_timeline(0);
+        assert_eq!(timeline.len(), 1, "first-match-wins: timeline pushes once");
+        assert_eq!(
+            timeline[0].1.cpustat_user_ns, 100,
+            "first-match-wins: timeline returns FIRST entry (100), not second (200)"
+        );
+        let field = host.per_cpu_field_u64(0, "user_ns", |s| s.cpustat_user_ns);
+        let slots: Vec<_> = field.values_iter().collect();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(
+            *slots[0].as_ref().expect("Ok(first match value)"),
+            100,
+            "first-match-wins: per_cpu_field_u64 also returns FIRST entry"
+        );
+    }
+
+    /// elapsed_ms plumbing through `per_cpu_field_u64` is verified
+    /// via `iter_full()` — pins both the elapsed_ms VALUE per slot
+    /// AND the tag string per slot against value-corruption
+    /// regressions (e.g. `elapsed.push(0)` instead of
+    /// `elapsed.push(row.elapsed_ms)`, or tag/elapsed vec swap).
+    /// #126.
+    #[test]
+    fn series_host_per_cpu_field_u64_iter_full_threads_tag_and_elapsed_correctly() {
+        let mk = |val: u64| {
+            let mut r = FailureDumpReport::default();
+            r.per_cpu_time = vec![PerCpuTimeStats {
+                cpu: 0,
+                cpustat_user_ns: val,
+                ..Default::default()
+            }];
+            r
+        };
+        let series = SampleSeries::from_drained(
+            vec![
+                ("alpha".to_string(), mk(10), None, Some(100u64)),
+                ("beta".to_string(), mk(20), None, Some(200u64)),
+                ("gamma".to_string(), mk(30), None, Some(300u64)),
+            ],
+            None,
+        );
+        let host = series.host().expect("non-empty");
+        let field = host.per_cpu_field_u64(0, "user_ns", |s| s.cpustat_user_ns);
+        let full: Vec<_> = field.iter_full().collect();
+        assert_eq!(full.len(), 3);
+        assert_eq!(full[0].0, "alpha");
+        assert_eq!(full[0].1, 100);
+        assert_eq!(*full[0].2.as_ref().unwrap(), 10);
+        assert_eq!(full[1].0, "beta");
+        assert_eq!(full[1].1, 200);
+        assert_eq!(*full[1].2.as_ref().unwrap(), 20);
+        assert_eq!(full[2].0, "gamma");
+        assert_eq!(full[2].1, 300);
+        assert_eq!(*full[2].2.as_ref().unwrap(), 30);
+    }
+
+    /// Non-placeholder sample with EMPTY per_cpu_time (real capture
+    /// succeeded, BPF axis populated, but CpuTimeCapture didn't
+    /// run or returned an empty Vec) MUST surface as
+    /// `HostFieldUnavailable`, NOT `PlaceholderSample`. Pins the
+    /// `is_placeholder` gate predicate against drift to
+    /// `per_cpu_time.is_empty() || is_placeholder` (which would
+    /// mis-classify "real but no data" as a placeholder). #127.
+    #[test]
+    fn series_host_per_cpu_field_u64_non_placeholder_empty_per_cpu_time_surfaces_host_field_unavailable() {
+        // FailureDumpReport::default() has is_placeholder=false +
+        // empty per_cpu_time.
+        let report = FailureDumpReport::default();
+        let series = SampleSeries::from_drained(
+            vec![("real_no_cpu_data".to_string(), report, None, Some(10u64))],
+            None,
+        );
+        let host = series.host().expect("non-empty");
+        let field = host.per_cpu_field_u64(0, "user_ns", |s| s.cpustat_user_ns);
+        let slots: Vec<_> = field.values_iter().collect();
+        assert_eq!(slots.len(), 1);
+        match slots[0] {
+            Err(crate::scenario::snapshot::SnapshotError::HostFieldUnavailable { tag, cpu }) => {
+                assert_eq!(tag, "real_no_cpu_data");
+                assert_eq!(*cpu, 0);
+            }
+            Err(crate::scenario::snapshot::SnapshotError::PlaceholderSample { .. }) => {
+                panic!(
+                    "non-placeholder sample with empty per_cpu_time MUST surface as HostFieldUnavailable, NOT PlaceholderSample (regression: empty-per_cpu_time gating as placeholder)"
+                )
+            }
+            other => panic!("expected HostFieldUnavailable, got {other:?}"),
+        }
     }
 }
