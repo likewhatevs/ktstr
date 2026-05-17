@@ -1218,4 +1218,59 @@ mod tests {
         assert_eq!(s.currently_throttled_gauge, 0);
         assert_eq!(s.invalid_avail_idx_count, 0);
     }
+
+    /// Pin the derived `PartialEq` semantic: two snapshots compare
+    /// equal iff every field matches, and a single differing field
+    /// is sufficient to make them compare unequal. Cheap insurance
+    /// against a maintainer adding a non-`PartialEq` field (e.g. a
+    /// `Mutex<T>`, `Box<dyn Any>`, or any type that fails the
+    /// `derive(PartialEq)` requirement) without weighing the cost —
+    /// that change would force a custom impl and silently drop the
+    /// field from the equality check.
+    #[test]
+    fn snapshot_partial_eq_pins_field_equivalence() {
+        let a = VirtioBlkCountersSnapshot {
+            reads_completed: 5,
+            ..Default::default()
+        };
+        let b = VirtioBlkCountersSnapshot {
+            reads_completed: 5,
+            ..Default::default()
+        };
+        assert_eq!(a, b);
+        let c = VirtioBlkCountersSnapshot {
+            reads_completed: 6,
+            ..Default::default()
+        };
+        assert_ne!(a, c);
+        let d = VirtioBlkCountersSnapshot {
+            currently_throttled_gauge: 1,
+            ..a.clone()
+        };
+        assert_ne!(a, d, "single differing field must break equality");
+    }
+
+    /// Serde JSON round-trip preserves every field. Snapshot types
+    /// land in sidecar JSON / failure-dump artifacts (the
+    /// `#[allow(dead_code)]` doc on `VmResult` anticipates external
+    /// readers). A field-rename or `#[serde(rename = ...)]` slip-up
+    /// here would produce JSON the next ktstr revision can't
+    /// deserialize, silently breaking baseline replay.
+    #[test]
+    fn snapshot_roundtrips_through_json() {
+        let original = VirtioBlkCountersSnapshot {
+            reads_completed: 11,
+            writes_completed: 22,
+            flushes_completed: 33,
+            bytes_read: 4400,
+            bytes_written: 5500,
+            throttled_count: 66,
+            io_errors: 77,
+            currently_throttled_gauge: 88,
+            invalid_avail_idx_count: 99,
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let parsed: VirtioBlkCountersSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, original);
+    }
 }

@@ -1666,4 +1666,34 @@ mod tests {
     fn content_hash_differs_for_distinct_inputs() {
         assert_ne!(content_hash("alpha"), content_hash("beta"));
     }
+
+    /// Cross-toolchain stability pin: every `content_hash` output must
+    /// equal the SipHasher13(keys=0,0) value emitted at commit time.
+    /// Pins the algorithm choice — a future swap to a different
+    /// stable hasher (e.g. xxhash, fxhash) would silently regenerate
+    /// every content-addressed cache filename on disk, breaking cache
+    /// hit rates without surfacing as a failed test. The companion
+    /// `content_hash_is_deterministic_across_calls` pin guards
+    /// within-process determinism; this pin guards cross-process /
+    /// cross-toolchain / cross-machine stability.
+    #[test]
+    fn content_hash_value_pin() {
+        // SipHasher13(keys=0,0) over the four corpora below. If any
+        // assertion fails, the algorithm or its seeding changed —
+        // STOP. `content_hash` names the inline-config tempfile in
+        // `config_content_parts` at src/test_support/runtime.rs and
+        // the export-config tempfile in `export.rs`; flipping the
+        // hashes silently regenerates those filenames on every
+        // process, breaking any future scheme that tries to dedup
+        // across runs and breaking intra-run reproducibility if a
+        // caller comes to depend on stable byte equality across
+        // identical inputs. Update only after intentional algorithm
+        // migration. The four corpora — empty + two short ASCII +
+        // one realistic config payload — span the cases the
+        // algorithm needs to handle correctly.
+        assert_eq!(content_hash(""), 0x30406ea523c53def);
+        assert_eq!(content_hash("alpha"), 0x3c87f3c3317bd39a);
+        assert_eq!(content_hash("beta"), 0xbb8fd2aa1487d7ac);
+        assert_eq!(content_hash("scheduler config payload"), 0xc678971ba48d5f80);
+    }
 }

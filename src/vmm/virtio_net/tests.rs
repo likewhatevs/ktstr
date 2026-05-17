@@ -1452,3 +1452,60 @@ fn default_snapshot_is_all_zero() {
     assert_eq!(s.rx_add_used_failures, 0);
     assert_eq!(s.invalid_avail_idx_count, 0);
 }
+
+/// Pin the derived `PartialEq` semantic: two snapshots compare
+/// equal iff every field matches, and a single differing field is
+/// sufficient to make them compare unequal. Cheap insurance against
+/// a maintainer adding a non-`PartialEq` field (e.g. a `Mutex<T>`,
+/// `Box<dyn Any>`, or any type that fails the `derive(PartialEq)`
+/// requirement) without weighing the cost — that change would force
+/// a custom impl and silently drop the field from the equality
+/// check.
+#[test]
+fn snapshot_partial_eq_pins_field_equivalence() {
+    let a = VirtioNetCountersSnapshot {
+        tx_packets: 5,
+        ..Default::default()
+    };
+    let b = VirtioNetCountersSnapshot {
+        tx_packets: 5,
+        ..Default::default()
+    };
+    assert_eq!(a, b);
+    let c = VirtioNetCountersSnapshot {
+        tx_packets: 6,
+        ..Default::default()
+    };
+    assert_ne!(a, c);
+    let d = VirtioNetCountersSnapshot {
+        rx_write_failed: 1,
+        ..a.clone()
+    };
+    assert_ne!(a, d, "single differing field must break equality");
+}
+
+/// Serde JSON round-trip preserves every field. Snapshot types land
+/// in sidecar JSON / failure-dump artifacts (the `#[allow(dead_code)]`
+/// doc on `VmResult` anticipates external readers). A field-rename
+/// or `#[serde(rename = ...)]` slip-up here would produce JSON the
+/// next ktstr revision can't deserialize, silently breaking baseline
+/// replay.
+#[test]
+fn snapshot_roundtrips_through_json() {
+    let original = VirtioNetCountersSnapshot {
+        tx_packets: 11,
+        tx_bytes: 22,
+        rx_packets: 33,
+        rx_bytes: 44,
+        tx_dropped_no_rx_buffer: 55,
+        tx_chain_invalid: 66,
+        rx_chain_invalid: 77,
+        rx_write_failed: 88,
+        tx_add_used_failures: 99,
+        rx_add_used_failures: 110,
+        invalid_avail_idx_count: 121,
+    };
+    let json = serde_json::to_string(&original).expect("serialize");
+    let parsed: VirtioNetCountersSnapshot = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(parsed, original);
+}
