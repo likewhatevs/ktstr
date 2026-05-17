@@ -368,15 +368,15 @@ ktstr::declare_scheduler!(SYS_KARGS_TEST, {
 fn declare_scheduler_sysctls_kargs() {
     assert_eq!(SYS_KARGS_TEST.sysctls.len(), 2);
     assert_eq!(
-        SYS_KARGS_TEST.sysctls[0].key,
+        SYS_KARGS_TEST.sysctls[0].key(),
         "kernel.sched_cfs_bandwidth_slice_us"
     );
-    assert_eq!(SYS_KARGS_TEST.sysctls[0].value, "1000");
+    assert_eq!(SYS_KARGS_TEST.sysctls[0].value(), "1000");
     assert_eq!(
-        SYS_KARGS_TEST.sysctls[1].key,
+        SYS_KARGS_TEST.sysctls[1].key(),
         "kernel.sched_rr_timeslice_ms"
     );
-    assert_eq!(SYS_KARGS_TEST.sysctls[1].value, "25");
+    assert_eq!(SYS_KARGS_TEST.sysctls[1].value(), "25");
     assert_eq!(SYS_KARGS_TEST.kargs, &["nosmt", "iomem=relaxed"]);
 }
 

@@ -54,7 +54,7 @@ declare_scheduler!(DECLARE_SCHEDULER_FULL, {
     kernels = ["6.14", "7.0..7.2"],
     cgroup_parent = "/declare_scheduler_full",
     kargs = ["nosmt"],
-    sysctls = [Sysctl::new("k", "v")],
+    sysctls = [Sysctl::new("kernel.k", "v")],
     topology = (1, 2, 4, 1),
     config_file = "cfg.toml",
     constraints = TopologyConstraints {
@@ -72,8 +72,8 @@ fn full_field_set_roundtrips() {
     assert_eq!(DECLARE_SCHEDULER_FULL.kernels, &["6.14", "7.0..7.2"]);
     assert_eq!(DECLARE_SCHEDULER_FULL.kargs, &["nosmt"]);
     assert_eq!(DECLARE_SCHEDULER_FULL.sysctls.len(), 1);
-    assert_eq!(DECLARE_SCHEDULER_FULL.sysctls[0].key, "k");
-    assert_eq!(DECLARE_SCHEDULER_FULL.sysctls[0].value, "v");
+    assert_eq!(DECLARE_SCHEDULER_FULL.sysctls[0].key(), "kernel.k");
+    assert_eq!(DECLARE_SCHEDULER_FULL.sysctls[0].value(), "v");
     assert_eq!(DECLARE_SCHEDULER_FULL.topology.numa_nodes, 1);
     assert_eq!(DECLARE_SCHEDULER_FULL.topology.llcs, 2);
     assert_eq!(DECLARE_SCHEDULER_FULL.topology.cores_per_llc, 4);

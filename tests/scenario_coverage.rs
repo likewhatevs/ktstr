@@ -376,11 +376,7 @@ fn scenario_yield_heavy(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
-static BPF_CRASH: BpfMapWrite = BpfMapWrite {
-    map_name_suffix: ".bss",
-    offset: 4,
-    value: 1,
-};
+static BPF_CRASH: BpfMapWrite = BpfMapWrite::new(".bss", 4, 1);
 
 #[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::__private::linkme)]

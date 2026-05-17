@@ -1955,7 +1955,7 @@ fn scheduler_fingerprint(entry: &KtstrTestEntry) -> SchedulerFingerprint {
         .scheduler
         .sysctls
         .iter()
-        .map(|s| format!("sysctl.{}={}", s.key, s.value))
+        .map(|s| format!("sysctl.{}={}", s.key(), s.value()))
         .collect();
     let kargs: Vec<String> = entry
         .scheduler

@@ -286,7 +286,7 @@ pub(crate) fn config_content_parts(
 pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
     let mut parts: Vec<String> = Vec::new();
     for s in entry.scheduler.sysctls {
-        parts.push(format!("sysctl.{}={}", s.key, s.value));
+        parts.push(format!("sysctl.{}={}", s.key(), s.value()));
     }
     for &karg in entry.scheduler.kargs {
         parts.push(karg.to_string());
@@ -691,8 +691,11 @@ pub(crate) fn build_vm_builder_base(
     }
 
     for bpf_write in entry.bpf_map_write {
-        builder =
-            builder.bpf_map_write(bpf_write.map_name_suffix, bpf_write.offset, bpf_write.value);
+        builder = builder.bpf_map_write(
+            bpf_write.map_name_suffix(),
+            bpf_write.offset(),
+            bpf_write.value(),
+        );
     }
 
     if let Some(disk_cfg) = entry.disk.clone() {

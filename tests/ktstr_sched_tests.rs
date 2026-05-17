@@ -61,11 +61,7 @@ fn scenario_bpf_api(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::AssertR
 /// Write stall=0 to the .bss map after scenario starts.
 /// stall is at offset 0, already 0 — this is a no-op write
 /// that exercises the full BPF map API pipeline.
-static BPF_NOOP: BpfMapWrite = BpfMapWrite {
-    map_name_suffix: ".bss",
-    offset: 0,
-    value: 0,
-};
+static BPF_NOOP: BpfMapWrite = BpfMapWrite::new(".bss", 0, 0);
 
 #[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::__private::linkme)]
@@ -113,11 +109,8 @@ static __KTSTR_ENTRY_BPF_API: ktstr::test_support::KtstrTestEntry =
 // fires quickly; `duration` is longer so the watchdog has room
 // to fire inside the scenario window rather than racing the
 // natural scenario end.
-static BPF_STALL_HOST_WRITE: BpfMapWrite = BpfMapWrite {
-    map_name_suffix: ".bss",
-    offset: 0, // stall flag in main.bpf.c .bss
-    value: 1,
-};
+// offset 0 = stall flag in main.bpf.c .bss
+static BPF_STALL_HOST_WRITE: BpfMapWrite = BpfMapWrite::new(".bss", 0, 1);
 
 #[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::__private::linkme)]

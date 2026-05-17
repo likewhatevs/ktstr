@@ -139,19 +139,108 @@ impl SchedulerSpec {
 /// `"kernel/foo"`). Duplicate keys in a scheduler's sysctls slice are
 /// applied in order; the last write wins.
 ///
-/// Use [`Sysctl::new`] to construct in `const` context.
+/// Construct with [`Sysctl::new`], which const-asserts the key format
+/// at compile time. Direct struct-literal construction is rejected
+/// (fields are crate-private) to ensure every constructed `Sysctl`
+/// passed through the format gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sysctl {
-    /// Dotted sysctl name (e.g. `"kernel.sched_cfs_bandwidth_slice_us"`).
-    pub key: &'static str,
-    /// Value written to the sysctl file as a string.
-    pub value: &'static str,
+    key: &'static str,
+    value: &'static str,
 }
 
 impl Sysctl {
     /// Const constructor for use in `static`/`const` context.
+    ///
+    /// # Panics
+    ///
+    /// Panics at compile time (or const-eval time) when:
+    /// - `key` is empty
+    /// - `key` contains `/` (common typo from sysctl conf-file paths —
+    ///   sysctl-write uses the dotted form, not the slash form)
+    /// - `key` contains whitespace, `=`, or any control byte
+    ///   (would corrupt the `sysctl.<key>=<value>` cmdline form)
+    /// - `key` does not contain at least one `.` (sysctls are
+    ///   namespaced like `kernel.foo` / `net.core.bar`; a bare
+    ///   single-segment name is almost certainly a typo)
+    /// - `key` starts or ends with `.`
+    /// - `key` contains an empty segment (`..` — kernel sysctl
+    ///   parser rejects)
+    /// - `value` is empty
+    /// - `value` contains a newline / carriage return / `=`
+    ///   (would corrupt the `sysctl.<key>=<value>` cmdline form)
     pub const fn new(key: &'static str, value: &'static str) -> Self {
+        let key_bytes = key.as_bytes();
+        assert!(!key_bytes.is_empty(), "Sysctl key must not be empty");
+        assert!(
+            key_bytes[0] != b'.' && key_bytes[key_bytes.len() - 1] != b'.',
+            "Sysctl key must not start or end with `.`",
+        );
+        let mut i = 0;
+        let mut has_dot = false;
+        let mut prev = 0u8;
+        while i < key_bytes.len() {
+            let b = key_bytes[i];
+            assert!(
+                b != b'/',
+                "Sysctl key must use the dotted form (e.g. `kernel.foo`), not the slash form (`kernel/foo`)",
+            );
+            assert!(
+                b != b' ' && b != b'\t' && b != b'\n' && b != b'\r',
+                "Sysctl key must not contain whitespace (would corrupt cmdline form)",
+            );
+            assert!(
+                b != b'=',
+                "Sysctl key must not contain `=` (would corrupt `sysctl.<key>=<value>` cmdline split)",
+            );
+            assert!(
+                b >= 0x20 && b < 0x7f,
+                "Sysctl key must be printable ASCII only (no control bytes / high-bit chars)",
+            );
+            if b == b'.' {
+                has_dot = true;
+                assert!(
+                    i == 0 || prev != b'.',
+                    "Sysctl key must not contain `..` (empty segment — kernel sysctl parser rejects)",
+                );
+            }
+            prev = b;
+            i += 1;
+        }
+        assert!(
+            has_dot,
+            "Sysctl key must be namespaced (contain at least one `.`, e.g. `kernel.foo`)",
+        );
+        let value_bytes = value.as_bytes();
+        assert!(!value_bytes.is_empty(), "Sysctl value must not be empty");
+        let mut j = 0;
+        while j < value_bytes.len() {
+            let b = value_bytes[j];
+            assert!(
+                b != b'\n',
+                "Sysctl value must not contain a newline (would corrupt cmdline form)",
+            );
+            assert!(
+                b != b'\r',
+                "Sysctl value must not contain a carriage return (would corrupt cmdline form)",
+            );
+            assert!(
+                b != b'=',
+                "Sysctl value must not contain `=` (would corrupt `sysctl.<key>=<value>` cmdline form)",
+            );
+            j += 1;
+        }
         Self { key, value }
+    }
+
+    /// The validated dotted sysctl key (e.g. `"kernel.sched_cfs_bandwidth_slice_us"`).
+    pub const fn key(&self) -> &'static str {
+        self.key
+    }
+
+    /// The validated sysctl value, written as a string.
+    pub const fn value(&self) -> &'static str {
+        self.value
     }
 }
 
@@ -259,14 +348,89 @@ impl std::fmt::Display for CgroupPath {
 /// The write is event-driven: the host polls for BPF map discoverability
 /// (scheduler loaded), then polls the SHM ring for scenario start, then
 /// writes.
+///
+/// Construct with [`BpfMapWrite::new`], which const-asserts the
+/// `map_name_suffix` format at compile time. Direct struct-literal
+/// construction is rejected (fields are crate-private) so every
+/// constructed `BpfMapWrite` passes through the format gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BpfMapWrite {
-    /// Map name suffix to match (e.g. ".bss").
-    pub map_name_suffix: &'static str,
+    map_name_suffix: &'static str,
+    offset: usize,
+    value: u32,
+}
+
+impl BpfMapWrite {
+    /// Const constructor for use in `static`/`const` context.
+    ///
+    /// # Panics
+    ///
+    /// Panics at compile time (or const-eval time) when:
+    /// - `map_name_suffix` is empty
+    /// - `map_name_suffix` does not start with `.` (BPF map names
+    ///   are derived from ELF section names like `.bss`, `.data`,
+    ///   `.rodata`; a suffix without the leading `.` would never
+    ///   match any loaded map and is almost certainly a typo)
+    /// - `map_name_suffix` is a bare `.` or starts with `..`
+    ///   (no real BPF section name has that shape)
+    /// - `map_name_suffix` contains whitespace, `/`, `\`, or any
+    ///   non-printable / control byte (no real BPF map name carries
+    ///   those characters; NULL would truncate libbpf C-string
+    ///   comparison)
+    pub const fn new(map_name_suffix: &'static str, offset: usize, value: u32) -> Self {
+        let bytes = map_name_suffix.as_bytes();
+        assert!(!bytes.is_empty(), "BpfMapWrite map_name_suffix must not be empty");
+        assert!(
+            bytes[0] == b'.',
+            "BpfMapWrite map_name_suffix must start with `.` (BPF map suffixes match ELF section names like `.bss`, `.data`, `.rodata`)",
+        );
+        assert!(
+            bytes.len() >= 2,
+            "BpfMapWrite map_name_suffix must be longer than a bare `.` (no real BPF section name is just `.`)",
+        );
+        assert!(
+            bytes[1] != b'.',
+            "BpfMapWrite map_name_suffix must not start with `..` (no real BPF section name has that shape)",
+        );
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            assert!(
+                b != b' ' && b != b'\t' && b != b'\n' && b != b'\r',
+                "BpfMapWrite map_name_suffix must not contain whitespace",
+            );
+            assert!(
+                b != b'/' && b != b'\\',
+                "BpfMapWrite map_name_suffix must not contain path separators",
+            );
+            assert!(
+                b >= 0x20 && b < 0x7f,
+                "BpfMapWrite map_name_suffix must be printable ASCII only (no control bytes / NULL / high-bit chars)",
+            );
+            i += 1;
+        }
+        Self {
+            map_name_suffix,
+            offset,
+            value,
+        }
+    }
+
+    /// The validated map-name suffix to match against loaded BPF maps
+    /// (e.g. `".bss"`).
+    pub const fn map_name_suffix(&self) -> &'static str {
+        self.map_name_suffix
+    }
+
     /// Byte offset within the map's value region.
-    pub offset: usize,
-    /// u32 value to write.
-    pub value: u32,
+    pub const fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// u32 value to write at `offset` inside the matched map.
+    pub const fn value(&self) -> u32 {
+        self.value
+    }
 }
 
 /// Gauntlet topology filtering constraints.
@@ -3552,21 +3716,9 @@ mod tests {
     #[test]
     fn bpf_map_write_hashset_roundtrip() {
         use std::collections::HashSet;
-        let w1 = BpfMapWrite {
-            map_name_suffix: "data",
-            offset: 0,
-            value: 1,
-        };
-        let w2 = BpfMapWrite {
-            map_name_suffix: "data",
-            offset: 4,
-            value: 2,
-        };
-        let w3 = BpfMapWrite {
-            map_name_suffix: "other",
-            offset: 0,
-            value: 1,
-        };
+        let w1 = BpfMapWrite::new(".data", 0, 1);
+        let w2 = BpfMapWrite::new(".data", 4, 2);
+        let w3 = BpfMapWrite::new(".other", 0, 1);
         let mut set: HashSet<BpfMapWrite> = HashSet::new();
         set.insert(w1);
         set.insert(w2);
@@ -3579,6 +3731,185 @@ mod tests {
             "duplicate BpfMapWrite insert must collapse via Hash+Eq"
         );
         assert_eq!(set.len(), 3);
+    }
+
+    // -- BpfMapWrite::new + Sysctl::new format-validation pins --
+    //
+    // Each `#[should_panic]` pins one branch of the const-assert
+    // chain. A future relaxation of the format rules (e.g. dropping
+    // the leading-`.` requirement on map_name_suffix) would have to
+    // explicitly delete the corresponding test, surfacing the
+    // semantic change rather than letting it pass silently.
+
+    /// Empty `map_name_suffix` is intent-only invalid (matches no
+    /// loaded BPF map). const-assert catches it at construction.
+    #[test]
+    #[should_panic(expected = "map_name_suffix must not be empty")]
+    fn bpf_map_write_new_rejects_empty_suffix() {
+        let _ = BpfMapWrite::new("", 0, 0);
+    }
+
+    /// BPF section names start with `.` (`.bss`, `.data`, `.rodata`);
+    /// a suffix without the leading `.` matches no real map.
+    #[test]
+    #[should_panic(expected = "must start with `.`")]
+    fn bpf_map_write_new_rejects_missing_dot_prefix() {
+        let _ = BpfMapWrite::new("bss", 0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "must not contain whitespace")]
+    fn bpf_map_write_new_rejects_whitespace_in_suffix() {
+        let _ = BpfMapWrite::new(".b s", 0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "must not contain path separators")]
+    fn bpf_map_write_new_rejects_path_separator_in_suffix() {
+        let _ = BpfMapWrite::new(".bss/data", 0, 0);
+    }
+
+    /// Valid construction round-trips through the getters. Pinned to
+    /// catch a getter-vs-field divergence (e.g. if a future refactor
+    /// caches a transformed value but forgets to update the getter).
+    #[test]
+    fn bpf_map_write_new_valid_round_trips() {
+        let w = BpfMapWrite::new(".bss", 16, 42);
+        assert_eq!(w.map_name_suffix(), ".bss");
+        assert_eq!(w.offset(), 16);
+        assert_eq!(w.value(), 42);
+    }
+
+    #[test]
+    #[should_panic(expected = "Sysctl key must not be empty")]
+    fn sysctl_new_rejects_empty_key() {
+        let _ = Sysctl::new("", "1");
+    }
+
+    /// Common operator typo: writing the sysctl path in slash-form
+    /// (`kernel/foo`) instead of dotted form (`kernel.foo`).
+    #[test]
+    #[should_panic(expected = "must use the dotted form")]
+    fn sysctl_new_rejects_slash_in_key() {
+        let _ = Sysctl::new("kernel/foo", "1");
+    }
+
+    /// A bare single-segment key (`foo` instead of `kernel.foo`) is
+    /// almost certainly a typo — the sysctl tree is always at least
+    /// 2 segments deep.
+    #[test]
+    #[should_panic(expected = "must be namespaced")]
+    fn sysctl_new_rejects_undotted_key() {
+        let _ = Sysctl::new("foo", "1");
+    }
+
+    #[test]
+    #[should_panic(expected = "must not start or end with `.`")]
+    fn sysctl_new_rejects_leading_dot_key() {
+        let _ = Sysctl::new(".foo", "1");
+    }
+
+    #[test]
+    #[should_panic(expected = "must not start or end with `.`")]
+    fn sysctl_new_rejects_trailing_dot_key() {
+        let _ = Sysctl::new("foo.", "1");
+    }
+
+    #[test]
+    #[should_panic(expected = "value must not be empty")]
+    fn sysctl_new_rejects_empty_value() {
+        let _ = Sysctl::new("kernel.foo", "");
+    }
+
+    #[test]
+    #[should_panic(expected = "must not contain a newline")]
+    fn sysctl_new_rejects_newline_in_value() {
+        let _ = Sysctl::new("kernel.foo", "1\n2");
+    }
+
+    /// `=` in the value would corrupt the `sysctl.<key>=<value>`
+    /// cmdline form (parser would split on the wrong `=`).
+    #[test]
+    #[should_panic(expected = "must not contain `=`")]
+    fn sysctl_new_rejects_equals_in_value() {
+        let _ = Sysctl::new("kernel.foo", "1=2");
+    }
+
+    #[test]
+    fn sysctl_new_valid_round_trips() {
+        let s = Sysctl::new("kernel.sched_cfs_bandwidth_slice_us", "1000");
+        assert_eq!(s.key(), "kernel.sched_cfs_bandwidth_slice_us");
+        assert_eq!(s.value(), "1000");
+    }
+
+    // -- additional Sysctl key/value rejection cases --
+
+    #[test]
+    #[should_panic(expected = "must not contain whitespace")]
+    fn sysctl_new_rejects_space_in_key() {
+        let _ = Sysctl::new(" kernel.foo", "1");
+    }
+
+    #[test]
+    #[should_panic(expected = "must not contain whitespace")]
+    fn sysctl_new_rejects_tab_in_key() {
+        let _ = Sysctl::new("kernel\t.foo", "1");
+    }
+
+    #[test]
+    #[should_panic(expected = "must not contain whitespace")]
+    fn sysctl_new_rejects_newline_in_key() {
+        let _ = Sysctl::new("kernel\n.foo", "1");
+    }
+
+    #[test]
+    #[should_panic(expected = "must not contain `=`")]
+    fn sysctl_new_rejects_equals_in_key() {
+        let _ = Sysctl::new("kernel=foo.bar", "1");
+    }
+
+    #[test]
+    #[should_panic(expected = "must be printable ASCII")]
+    fn sysctl_new_rejects_control_byte_in_key() {
+        let _ = Sysctl::new("kernel.\x01foo", "1");
+    }
+
+    #[test]
+    #[should_panic(expected = "must not contain `..`")]
+    fn sysctl_new_rejects_double_dot_in_key() {
+        let _ = Sysctl::new("kernel..foo", "1");
+    }
+
+    #[test]
+    #[should_panic(expected = "must not contain a carriage return")]
+    fn sysctl_new_rejects_carriage_return_in_value() {
+        let _ = Sysctl::new("kernel.foo", "1\r2");
+    }
+
+    // -- additional BpfMapWrite suffix rejection cases --
+
+    #[test]
+    #[should_panic(expected = "must be longer than a bare `.`")]
+    fn bpf_map_write_new_rejects_bare_dot() {
+        let _ = BpfMapWrite::new(".", 0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "must not start with `..`")]
+    fn bpf_map_write_new_rejects_leading_double_dot() {
+        let _ = BpfMapWrite::new("..bss", 0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be printable ASCII")]
+    fn bpf_map_write_new_rejects_null_byte_in_suffix() {
+        let _ = BpfMapWrite::new(".bss\0", 0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be printable ASCII")]
+    fn bpf_map_write_new_rejects_control_byte_in_suffix() {
+        let _ = BpfMapWrite::new(".b\x01ss", 0, 0);
     }
 
     /// Lock-step pin: `KtstrTestEntry::default()` must agree with
