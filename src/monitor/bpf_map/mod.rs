@@ -678,17 +678,6 @@ pub(crate) fn find_bpf_map(
     None
 }
 
-/// Smallest page granule that `translate_kva` always resolves contiguously.
-///
-/// x86-64 and aarch64 both partition KVA into 4 KiB pages at the lowest
-/// level; larger entries (2 MiB PMD block, 1 GiB PUD block, aarch64 64 KiB
-/// base) are strictly coarser, so chunking at 4 KiB means a single
-/// `translate_kva` call covers the rest of the page regardless of the
-/// entry granule. Bumping this to a larger value would break 4 KiB
-/// huge-page-absent paths because a single translate result would no
-/// longer be guaranteed to span the chunk.
-const BPF_MAP_PAGE_CHUNK: u64 = 4096;
-
 /// Hostile-guest cap on a single value-region read. Bounds the
 /// `vec![0u8; len]` allocation before it reaches the heap so a
 /// corrupted (uninitialized) `bpf_map.value_size` read can't
@@ -699,44 +688,27 @@ const BPF_MAP_PAGE_CHUNK: u64 = 4096;
 /// well below this for ordinary map types.
 const MAX_VALUE_SIZE: usize = 16 * 1024 * 1024;
 
-/// Copy a contiguous byte range to or from a map's value region,
-/// chunking at page boundaries so each chunk takes one `translate_kva`
-/// call plus one bulk DRAM copy.
+/// BPF-map I/O wrapper around [`super::kva_io::chunked_kva_io`] that
+/// supplies the `(cr3_pa, l5, tcr_el1, mem)` translator the BPF map
+/// path needs.
 ///
-/// This replaces the former byte-by-byte loop that issued one
-/// translate per byte — a 4 KiB value read translated 4096 times and
-/// paid 4096 copy_nonoverlapping-of-one-byte calls. A full page now
-/// takes one translate + one bulk copy (up to BPF_MAP_PAGE_CHUNK
-/// bytes); a range that crosses a page boundary splits into N
-/// translate+copy pairs where N is the number of pages touched.
-///
-/// `ctx` supplies the CR3 / L5 flag and the DRAM accessor. `target_kva`
-/// is the starting guest virtual address; `len` is the total length.
-/// `chunk_fn` receives the resolved guest PA and the chunk buffer
-/// (mutable for reads, immutable for writes) and performs the actual
-/// memcpy. Returns `false` when any chunk fails to translate.
-fn chunked_kva_io<F>(ctx: &AccessorCtx<'_>, target_kva: u64, len: usize, mut chunk_fn: F) -> bool
+/// The shared helper covers the page-boundary chunking; this thin
+/// wrapper plumbs the per-accessor translation context through. See
+/// the shared helper's docs for the chunking semantics and the
+/// caller-side bytes-tracking contract.
+fn chunked_kva_io<F>(ctx: &AccessorCtx<'_>, target_kva: u64, len: usize, chunk_fn: F) -> bool
 where
     F: FnMut(u64, u64, usize),
 {
-    let mut consumed: u64 = 0;
-    let total = len as u64;
-    while consumed < total {
-        let kva = target_kva + consumed;
-        let Some(pa) = ctx
-            .mem
-            .translate_kva(ctx.cr3_pa.0, Kva(kva), ctx.l5, ctx.tcr_el1)
-        else {
-            return false;
-        };
-        // Advance at most to the next page boundary so the next
-        // translate_kva lands on a fresh resolved page.
-        let page_end = (kva & !(BPF_MAP_PAGE_CHUNK - 1)) + BPF_MAP_PAGE_CHUNK;
-        let chunk_len = (page_end - kva).min(total - consumed) as usize;
-        chunk_fn(pa, consumed, chunk_len);
-        consumed += chunk_len as u64;
-    }
-    true
+    super::kva_io::chunked_kva_io(
+        |kva| {
+            ctx.mem
+                .translate_kva(ctx.cr3_pa.0, Kva(kva), ctx.l5, ctx.tcr_el1)
+        },
+        target_kva,
+        len,
+        chunk_fn,
+    )
 }
 
 /// Write bytes to a BPF map's value region at `offset`.

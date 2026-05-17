@@ -26,6 +26,7 @@ pub mod dmesg_scx;
 pub mod dump;
 pub mod guest;
 pub mod idr;
+pub(crate) mod kva_io;
 pub mod live_host_kernel;
 pub mod perf_counters;
 pub mod reader;
