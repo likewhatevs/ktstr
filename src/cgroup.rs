@@ -1972,12 +1972,24 @@ mod tests {
 
     /// Spin up an isolated tempdir + pre-populated `cg_x` subdir +
     /// `CgroupManager` for a single `#[test]` body. The returned
-    /// `TempDir` is the RAII teardown handle; binding it as `_tmp`
-    /// (underscore prefix) keeps it alive for the duration of the
-    /// test and lets `Drop` recursively remove the dir on test exit
-    /// (success OR panic). `dir` is the same path as a `PathBuf`
-    /// for test bodies that use `dir.join(...)` to build target
-    /// file paths.
+    /// `TempDir` is the RAII teardown handle; bind it as
+    /// `_tempdir_keep_alive` (or any underscore-prefix identifier
+    /// other than bare `_`) to keep the tempdir alive for the
+    /// duration of the test and let `Drop` recursively remove it
+    /// on test exit (success OR panic).
+    ///
+    /// DO NOT rename the binding to bare `_` — bare `_` discards
+    /// the value immediately, so `Drop` would fire BEFORE the test
+    /// body runs and every subsequent `fs::write(&target, ...)`
+    /// would fail with `ENOENT`. The failure mode is loud (the
+    /// test panics on the missing path), but the trap is real: any
+    /// IDE rename or clippy fix that mistakes the underscore-prefix
+    /// identifier for a true discard binding will introduce the
+    /// regression. The `_tempdir_keep_alive` name is deliberately
+    /// verbose to discourage that rewrite.
+    ///
+    /// `dir` is the same path as a `PathBuf` for test bodies that
+    /// use `dir.join(...)` to build target file paths.
     fn make_test_cgroup(label: &str) -> (tempfile::TempDir, PathBuf, CgroupManager) {
         let tmp = tempfile::Builder::new()
             .prefix(&format!("ktstr-cg-{label}-"))
@@ -1991,7 +2003,7 @@ mod tests {
 
     #[test]
     fn set_cpu_max_writes_quota_and_period_when_some() {
-        let (_tmp, dir, cg) = make_test_cgroup("cpu-max-some");
+        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("cpu-max-some");
         let target = dir.join("cg_x").join("cpu.max");
         fs::write(&target, "").unwrap();
         cg.set_cpu_max("cg_x", Some(50_000), 100_000).unwrap();
@@ -2000,7 +2012,7 @@ mod tests {
 
     #[test]
     fn set_cpu_max_writes_max_keyword_when_none() {
-        let (_tmp, dir, cg) = make_test_cgroup("cpu-max-none");
+        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("cpu-max-none");
         let target = dir.join("cg_x").join("cpu.max");
         fs::write(&target, "").unwrap();
         cg.set_cpu_max("cg_x", None, 100_000).unwrap();
@@ -2009,7 +2021,7 @@ mod tests {
 
     #[test]
     fn set_cpu_weight_writes_decimal_value() {
-        let (_tmp, dir, cg) = make_test_cgroup("cpu-weight");
+        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("cpu-weight");
         let target = dir.join("cg_x").join("cpu.weight");
         fs::write(&target, "").unwrap();
         cg.set_cpu_weight("cg_x", 250).unwrap();
@@ -2018,7 +2030,7 @@ mod tests {
 
     #[test]
     fn set_memory_max_writes_bytes_or_max_keyword() {
-        let (_tmp, dir, cg) = make_test_cgroup("mem-max");
+        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("mem-max");
         let target = dir.join("cg_x").join("memory.max");
         fs::write(&target, "").unwrap();
         cg.set_memory_max("cg_x", Some(1_048_576)).unwrap();
@@ -2029,7 +2041,7 @@ mod tests {
 
     #[test]
     fn set_memory_high_writes_bytes_or_max_keyword() {
-        let (_tmp, dir, cg) = make_test_cgroup("mem-high");
+        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("mem-high");
         let target = dir.join("cg_x").join("memory.high");
         fs::write(&target, "").unwrap();
         cg.set_memory_high("cg_x", Some(524_288)).unwrap();
@@ -2043,7 +2055,7 @@ mod tests {
     /// `memory.low`. Pin both the bytes-set and the cleared paths.
     #[test]
     fn set_memory_low_writes_bytes_or_zero() {
-        let (_tmp, dir, cg) = make_test_cgroup("mem-low");
+        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("mem-low");
         let target = dir.join("cg_x").join("memory.low");
         fs::write(&target, "").unwrap();
         cg.set_memory_low("cg_x", Some(2_048)).unwrap();
@@ -2054,7 +2066,7 @@ mod tests {
 
     #[test]
     fn set_io_weight_writes_decimal_value() {
-        let (_tmp, dir, cg) = make_test_cgroup("io-weight");
+        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("io-weight");
         let target = dir.join("cg_x").join("io.weight");
         fs::write(&target, "").unwrap();
         cg.set_io_weight("cg_x", 500).unwrap();
@@ -2067,7 +2079,7 @@ mod tests {
     /// or "frozen" would surface as a syscall failure on real cgroupfs.
     #[test]
     fn set_freeze_writes_zero_or_one() {
-        let (_tmp, dir, cg) = make_test_cgroup("freeze");
+        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("freeze");
         let target = dir.join("cg_x").join("cgroup.freeze");
         fs::write(&target, "").unwrap();
         cg.set_freeze("cg_x", true).unwrap();
@@ -2082,7 +2094,7 @@ mod tests {
     /// `pids_max_write`.
     #[test]
     fn set_pids_max_writes_decimal_or_max_keyword() {
-        let (_tmp, dir, cg) = make_test_cgroup("pids-max");
+        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("pids-max");
         let target = dir.join("cg_x").join("pids.max");
         fs::write(&target, "").unwrap();
         cg.set_pids_max("cg_x", Some(1024)).unwrap();
@@ -2096,7 +2108,7 @@ mod tests {
     /// `page_counter_memparse` recognises in `swap_max_write`.
     #[test]
     fn set_memory_swap_max_writes_bytes_or_max_keyword() {
-        let (_tmp, dir, cg) = make_test_cgroup("mem-swap-max");
+        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("mem-swap-max");
         let target = dir.join("cg_x").join("memory.swap.max");
         fs::write(&target, "").unwrap();
         cg.set_memory_swap_max("cg_x", Some(2 * 1024 * 1024))
@@ -2234,7 +2246,7 @@ mod tests {
     /// case is checked here.
     #[test]
     fn set_freeze_is_idempotent_when_already_in_target_state() {
-        let (_tmp, dir, cg) = make_test_cgroup("freeze-idem");
+        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("freeze-idem");
         let target = dir.join("cg_x").join("cgroup.freeze");
         fs::write(&target, "").unwrap();
         cg.set_freeze("cg_x", true).unwrap();
@@ -2259,7 +2271,7 @@ mod tests {
     /// u32 (which would silently saturate).
     #[test]
     fn set_pids_max_writes_u64_max_verbatim() {
-        let (_tmp, dir, cg) = make_test_cgroup("pids-overflow");
+        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("pids-overflow");
         let target = dir.join("cg_x").join("pids.max");
         fs::write(&target, "").unwrap();
         cg.set_pids_max("cg_x", Some(u64::MAX)).unwrap();
@@ -2274,7 +2286,7 @@ mod tests {
     /// boundary check. Catches the same narrowing-regression class.
     #[test]
     fn set_memory_swap_max_writes_u64_max_verbatim() {
-        let (_tmp, dir, cg) = make_test_cgroup("swap-overflow");
+        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("swap-overflow");
         let target = dir.join("cg_x").join("memory.swap.max");
         fs::write(&target, "").unwrap();
         cg.set_memory_swap_max("cg_x", Some(u64::MAX)).unwrap();
