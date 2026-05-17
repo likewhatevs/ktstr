@@ -21,11 +21,22 @@ pub(crate) trait MutexExt<T> {
     /// "possibly stale" if a previous thread panicked while
     /// holding the lock.
     fn lock_unpoisoned(&self) -> MutexGuard<'_, T>;
+    /// Consume the mutex, returning the protected value regardless
+    /// of poison state. Equivalent to
+    /// `self.into_inner().unwrap_or_else(|e| e.into_inner())` —
+    /// keeps the recover-on-poison policy in one place for the
+    /// consuming variant alongside [`Self::lock_unpoisoned`].
+    fn into_inner_unpoisoned(self) -> T
+    where
+        Self: Sized;
 }
 
 impl<T> MutexExt<T> for Mutex<T> {
     fn lock_unpoisoned(&self) -> MutexGuard<'_, T> {
         self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn into_inner_unpoisoned(self) -> T {
+        self.into_inner().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -204,6 +215,32 @@ mod tests {
         .join();
         assert!(m.is_poisoned());
         assert_eq!(*m.lock_unpoisoned(), 99);
+    }
+
+    /// `into_inner_unpoisoned` on an unpoisoned mutex matches plain
+    /// `.into_inner().unwrap()`.
+    #[test]
+    fn into_inner_unpoisoned_unpoisoned() {
+        let m = Mutex::new(42);
+        assert_eq!(m.into_inner_unpoisoned(), 42);
+    }
+
+    /// Pins the recover-on-poison policy for the consuming variant:
+    /// after another thread panics while holding the mutex,
+    /// `into_inner_unpoisoned()` still returns the inner value with
+    /// the protected state intact.
+    #[test]
+    fn into_inner_unpoisoned_recovers_from_poison() {
+        let m = Arc::new(Mutex::new(99));
+        let m_inner = Arc::clone(&m);
+        let _ = std::thread::spawn(move || {
+            let _g = m_inner.lock().unwrap();
+            panic!("poison the mutex");
+        })
+        .join();
+        assert!(m.is_poisoned());
+        let mutex = Arc::try_unwrap(m).expect("only one Arc remains");
+        assert_eq!(mutex.into_inner_unpoisoned(), 99);
     }
 
     /// `read_unpoisoned` / `write_unpoisoned` on an unpoisoned

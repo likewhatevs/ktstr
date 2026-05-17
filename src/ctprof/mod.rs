@@ -3151,9 +3151,7 @@ fn capture_with(
 
     // `mut` is required because phase 2 below threads `&mut
     // summary` into `probe_thread_recording`.
-    let mut summary = summary_mutex
-        .into_inner()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut summary = summary_mutex.into_inner_unpoisoned();
     // Tally for procfs read-level failures, surfaced as
     // `parse_summary` when the production path runs. Tests that
     // pass `use_syscall_affinity=false` skip the assignment so
