@@ -618,6 +618,78 @@ impl TopologyConstraints {
     }
 }
 
+impl TopologyConstraints {
+    /// Override `min_numa_nodes`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub const fn with_min_numa_nodes(mut self, min_numa_nodes: u32) -> Self {
+        self.min_numa_nodes = min_numa_nodes;
+        self
+    }
+
+    /// Override `max_numa_nodes`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub const fn with_max_numa_nodes(mut self, max_numa_nodes: u32) -> Self {
+        self.max_numa_nodes = Some(max_numa_nodes);
+        self
+    }
+
+    /// Clear `max_numa_nodes` (lift the upper bound).
+    #[must_use = "builder methods consume self; bind the result"]
+    pub const fn without_max_numa_nodes(mut self) -> Self {
+        self.max_numa_nodes = None;
+        self
+    }
+
+    /// Override `min_llcs`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub const fn with_min_llcs(mut self, min_llcs: u32) -> Self {
+        self.min_llcs = min_llcs;
+        self
+    }
+
+    /// Override `max_llcs`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub const fn with_max_llcs(mut self, max_llcs: u32) -> Self {
+        self.max_llcs = Some(max_llcs);
+        self
+    }
+
+    /// Clear `max_llcs` (lift the upper bound).
+    #[must_use = "builder methods consume self; bind the result"]
+    pub const fn without_max_llcs(mut self) -> Self {
+        self.max_llcs = None;
+        self
+    }
+
+    /// Override `requires_smt`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub const fn with_requires_smt(mut self, requires_smt: bool) -> Self {
+        self.requires_smt = requires_smt;
+        self
+    }
+
+    /// Override `min_cpus`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub const fn with_min_cpus(mut self, min_cpus: u32) -> Self {
+        self.min_cpus = min_cpus;
+        self
+    }
+
+    /// Override `max_cpus`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub const fn with_max_cpus(mut self, max_cpus: u32) -> Self {
+        self.max_cpus = Some(max_cpus);
+        self
+    }
+
+    /// Clear `max_cpus` (lift the upper bound).
+    #[must_use = "builder methods consume self; bind the result"]
+    pub const fn without_max_cpus(mut self) -> Self {
+        self.max_cpus = None;
+        self
+    }
+}
+
 /// Definition of a scheduler for the test framework.
 ///
 /// Captures everything the framework needs to know about a scheduler:
@@ -1221,15 +1293,11 @@ impl KtstrTestEntry {
     /// [`Self::DEFAULT`] is the source of truth (struct-literal
     /// const); [`Self::new()`] is a delegating alias for method-style
     /// use and `Default::default()` is the trait-shim — both
-    /// equivalent in non-const contexts. The const surface is
-    /// load-bearing at `static` / `const` initializer spread sites
-    /// (e.g. `#[distributed_slice(KTSTR_TESTS)]` macro expansions):
-    /// `..Self::new()` fails there with E0493 ("destructor of T
-    /// cannot be evaluated at compile-time") because KtstrTestEntry
-    /// carries non-trivially-Drop fields (notably `disk: Option<DiskConfig>`,
-    /// where `DiskConfig::name: Option<String>` brings in String's
-    /// heap deallocator). `..Self::DEFAULT` bypasses the temporary
-    /// entirely since the struct-literal const is promoted directly.
+    /// equivalent in non-const contexts. For `static` / `const`
+    /// initializer spread sites (e.g. `#[distributed_slice(KTSTR_TESTS)]`
+    /// macro expansions), `..Self::DEFAULT` is the canonical shape —
+    /// it spreads the struct-literal const directly without taking a
+    /// detour through a const-fn return.
     ///
     /// ```
     /// use ktstr::prelude::*;
@@ -1282,17 +1350,12 @@ impl KtstrTestEntry {
         num_snapshots: 0,
     };
 
-    /// Build the default entry. Equivalent to [`Self::DEFAULT`]; use
-    /// the const directly when spreading in a `static` / `const`
-    /// initializer — `..Self::new()` fails there with E0493
-    /// ("destructor of T cannot be evaluated at compile-time")
-    /// because KtstrTestEntry carries non-trivially-Drop fields
-    /// (notably `disk: Option<DiskConfig>`, where `DiskConfig::name:
-    /// Option<String>` brings in String's heap deallocator), and
-    /// the temporary returned by `new()` would need to be dropped
-    /// at const-eval time. `..Self::DEFAULT` (a promoted struct
-    /// literal) bypasses the temporary. `Default::default()` is
-    /// equivalent to both in non-const contexts.
+    /// Build the default entry. Equivalent to [`Self::DEFAULT`].
+    /// Either `..Self::DEFAULT` or `..Self::new()` works in
+    /// `static` / `const` initializer spread sites since `new()`
+    /// is `const fn` and KtstrTestEntry has no Drop-bearing
+    /// fields. `Default::default()` is the trait-shim equivalent
+    /// for non-const contexts.
     pub const fn new() -> Self {
         Self::DEFAULT
     }
@@ -1595,6 +1658,240 @@ impl KtstrTestEntry {
         }
         out.extend(self.extra_include_files.iter().copied());
         out
+    }
+}
+
+/// Programmatic builder methods. Use at runtime (let bindings, fn
+/// returns). For `static` / `const` initializers and
+/// `#[distributed_slice(KTSTR_TESTS)]` registration, prefer the
+/// struct-literal `..KtstrTestEntry::DEFAULT` spread — chained
+/// `with_X` calls fail in `const` context with E0015 ("cannot call
+/// non-const fn in constants") because these setters are declared
+/// `pub fn`, not `pub const fn`. See [`Self::DEFAULT`] for the
+/// worked struct-literal example.
+impl KtstrTestEntry {
+    /// Override `name`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_name(mut self, name: &'static str) -> Self {
+        self.name = name;
+        self
+    }
+
+    /// Override `func`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_func(mut self, func: fn(&Ctx) -> Result<AssertResult>) -> Self {
+        self.func = func;
+        self
+    }
+
+    /// Override `topology`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_topology(mut self, topology: Topology) -> Self {
+        self.topology = topology;
+        self
+    }
+
+    /// Override `constraints`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_constraints(mut self, constraints: TopologyConstraints) -> Self {
+        self.constraints = constraints;
+        self
+    }
+
+    /// Override `memory_mib`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_memory_mib(mut self, memory_mib: u32) -> Self {
+        self.memory_mib = memory_mib;
+        self
+    }
+
+    /// Override `scheduler`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_scheduler(mut self, scheduler: &'static crate::test_support::Scheduler) -> Self {
+        self.scheduler = scheduler;
+        self
+    }
+
+    /// Override `payload`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_payload(mut self, payload: &'static crate::test_support::Payload) -> Self {
+        self.payload = Some(payload);
+        self
+    }
+
+    /// Clear `payload` (run a scheduler-only scenario with no primary
+    /// binary).
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn without_payload(mut self) -> Self {
+        self.payload = None;
+        self
+    }
+
+    /// Override `workloads`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_workloads(
+        mut self,
+        workloads: &'static [&'static crate::test_support::Payload],
+    ) -> Self {
+        self.workloads = workloads;
+        self
+    }
+
+    /// Override `auto_repro`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_auto_repro(mut self, auto_repro: bool) -> Self {
+        self.auto_repro = auto_repro;
+        self
+    }
+
+    /// Override `assert`.
+    ///
+    /// Replaces the entry's per-test overrides wholesale; the assertion
+    /// resolution at run time still layers `Assert::default_checks()`
+    /// and the scheduler-level `assert` underneath.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_assert(mut self, assert: crate::assert::Assert) -> Self {
+        self.assert = assert;
+        self
+    }
+
+    /// Override `extra_sched_args`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_extra_sched_args(mut self, extra_sched_args: &'static [&'static str]) -> Self {
+        self.extra_sched_args = extra_sched_args;
+        self
+    }
+
+    /// Override `watchdog_timeout`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_watchdog_timeout(mut self, watchdog_timeout: Duration) -> Self {
+        self.watchdog_timeout = watchdog_timeout;
+        self
+    }
+
+    /// Override `bpf_map_write`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_bpf_map_write(mut self, bpf_map_write: &'static [&'static BpfMapWrite]) -> Self {
+        self.bpf_map_write = bpf_map_write;
+        self
+    }
+
+    /// Override `performance_mode`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_performance_mode(mut self, performance_mode: bool) -> Self {
+        self.performance_mode = performance_mode;
+        self
+    }
+
+    /// Override `no_perf_mode`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_no_perf_mode(mut self, no_perf_mode: bool) -> Self {
+        self.no_perf_mode = no_perf_mode;
+        self
+    }
+
+    /// Override `duration`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_duration(mut self, duration: Duration) -> Self {
+        self.duration = duration;
+        self
+    }
+
+    /// Override `expect_err`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_expect_err(mut self, expect_err: bool) -> Self {
+        self.expect_err = expect_err;
+        self
+    }
+
+    /// Override `host_only`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_host_only(mut self, host_only: bool) -> Self {
+        self.host_only = host_only;
+        self
+    }
+
+    /// Override `extra_include_files`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_extra_include_files(
+        mut self,
+        extra_include_files: &'static [&'static str],
+    ) -> Self {
+        self.extra_include_files = extra_include_files;
+        self
+    }
+
+    /// Override `cleanup_budget`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_cleanup_budget(mut self, cleanup_budget: Duration) -> Self {
+        self.cleanup_budget = Some(cleanup_budget);
+        self
+    }
+
+    /// Clear `cleanup_budget` (leave the host watchdog as the only
+    /// guard).
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn without_cleanup_budget(mut self) -> Self {
+        self.cleanup_budget = None;
+        self
+    }
+
+    /// Override `config_content`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_config_content(mut self, config_content: &'static str) -> Self {
+        self.config_content = Some(config_content);
+        self
+    }
+
+    /// Clear `config_content`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn without_config_content(mut self) -> Self {
+        self.config_content = None;
+        self
+    }
+
+    /// Override `disk`.
+    ///
+    /// Pairs with the `host_only = false` requirement enforced by
+    /// [`Self::validate`] — `host_only = true` with a `Some(..)` disk
+    /// is rejected because host-only skips the VM boot that owns the
+    /// virtio-blk lifecycle.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_disk(mut self, disk: crate::vmm::disk_config::DiskConfig) -> Self {
+        self.disk = Some(disk);
+        self
+    }
+
+    /// Clear `disk` (boot without a virtio-blk device).
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn without_disk(mut self) -> Self {
+        self.disk = None;
+        self
+    }
+
+    /// Override `post_vm`.
+    ///
+    /// The closure runs on the host after `vm.run()` returns with
+    /// access to the full `VmResult`; an `Err` from the closure fails
+    /// the test with the returned message.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_post_vm(mut self, post_vm: fn(&crate::vmm::VmResult) -> Result<()>) -> Self {
+        self.post_vm = Some(post_vm);
+        self
+    }
+
+    /// Clear `post_vm` (skip the host-side callback).
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn without_post_vm(mut self) -> Self {
+        self.post_vm = None;
+        self
+    }
+
+    /// Override `num_snapshots`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_num_snapshots(mut self, num_snapshots: u32) -> Self {
+        self.num_snapshots = num_snapshots;
+        self
     }
 }
 
@@ -1968,6 +2265,83 @@ mod tests {
         // so struct-update spreaders also get the right values.
         assert!(d.payload.is_none());
         assert!(d.workloads.is_empty());
+    }
+
+    /// Empirical pin: `..Self::new()` works in a `static` spread.
+    /// KtstrTestEntry has no Drop-bearing transitive fields (every
+    /// type in the struct is Copy or holds only `&'static`/`Option`/
+    /// primitives), so `Self::new()` returning a const Self literal
+    /// is const-evaluable AND the temporary it produces needs no
+    /// destructor. Both DEFAULT and new() are valid in const-spread.
+    #[allow(dead_code)]
+    static ENTRY_VIA_NEW: KtstrTestEntry = KtstrTestEntry {
+        name: "via_new",
+        ..KtstrTestEntry::new()
+    };
+
+    #[allow(dead_code)]
+    static ENTRY_VIA_DEFAULT: KtstrTestEntry = KtstrTestEntry {
+        name: "via_default",
+        ..KtstrTestEntry::DEFAULT
+    };
+
+    #[test]
+    fn ktstr_test_entry_const_spread_works_via_both_new_and_default() {
+        assert_eq!(ENTRY_VIA_NEW.name, "via_new");
+        assert_eq!(ENTRY_VIA_DEFAULT.name, "via_default");
+        // Both spread forms produce identical non-name fields.
+        assert_eq!(ENTRY_VIA_NEW.memory_mib, ENTRY_VIA_DEFAULT.memory_mib);
+        assert_eq!(ENTRY_VIA_NEW.duration, ENTRY_VIA_DEFAULT.duration);
+    }
+
+    #[test]
+    fn ktstr_test_entry_with_chain_overrides_target_fields() {
+        let entry = KtstrTestEntry::DEFAULT
+            .with_name("chain_test")
+            .with_memory_mib(4096)
+            .with_duration(Duration::from_secs(30))
+            .with_auto_repro(false)
+            .with_performance_mode(true)
+            .with_num_snapshots(2);
+        assert_eq!(entry.name, "chain_test");
+        assert_eq!(entry.memory_mib, 4096);
+        assert_eq!(entry.duration, Duration::from_secs(30));
+        assert!(!entry.auto_repro);
+        assert!(entry.performance_mode);
+        assert_eq!(entry.num_snapshots, 2);
+        // Untouched defaults survive.
+        assert_eq!(entry.scheduler.name, "eevdf");
+        assert!(!entry.host_only);
+        // Validate succeeds — the chain produced a usable entry.
+        entry.validate().expect("chained entry must validate");
+    }
+
+    /// `without_<field>` returns the original Option<T> field to
+    /// `None`. The chain symmetry pin: `with_X(v).without_X() ==
+    /// DEFAULT-state for that field`.
+    #[test]
+    fn ktstr_test_entry_without_chain_clears_option_fields() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        const FIO: Payload = Payload {
+            name: "fio",
+            kind: PayloadKind::Binary("fio"),
+            output: OutputFormat::Json,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
+            metric_bounds: None,
+        };
+        let entry = KtstrTestEntry::DEFAULT
+            .with_name("clear_test")
+            .with_payload(&FIO)
+            .with_cleanup_budget(Duration::from_secs(10))
+            .without_payload()
+            .without_cleanup_budget();
+        assert!(entry.payload.is_none());
+        assert!(entry.cleanup_budget.is_none());
     }
 
     #[test]
@@ -2808,6 +3182,49 @@ mod tests {
         assert_eq!(c.min_numa_nodes, 1);
         assert_eq!(c.min_llcs, 1);
         assert_eq!(c.min_cpus, 1);
+    }
+
+    #[test]
+    fn topology_constraints_with_chain_overrides_target_fields_only() {
+        let c = TopologyConstraints::DEFAULT
+            .with_min_numa_nodes(2)
+            .with_max_numa_nodes(8)
+            .with_min_llcs(3)
+            .with_max_llcs(16)
+            .with_requires_smt(true)
+            .with_min_cpus(4)
+            .with_max_cpus(64);
+        assert_eq!(c.min_numa_nodes, 2);
+        assert_eq!(c.max_numa_nodes, Some(8));
+        assert_eq!(c.min_llcs, 3);
+        assert_eq!(c.max_llcs, Some(16));
+        assert!(c.requires_smt);
+        assert_eq!(c.min_cpus, 4);
+        assert_eq!(c.max_cpus, Some(64));
+    }
+
+    #[test]
+    fn topology_constraints_without_chain_clears_option_fields() {
+        let c = TopologyConstraints::DEFAULT
+            .without_max_numa_nodes()
+            .without_max_llcs()
+            .without_max_cpus();
+        assert!(c.max_numa_nodes.is_none());
+        assert!(c.max_llcs.is_none());
+        assert!(c.max_cpus.is_none());
+        // min fields untouched.
+        assert_eq!(c.min_numa_nodes, 1);
+        assert_eq!(c.min_llcs, 1);
+        assert_eq!(c.min_cpus, 1);
+    }
+
+    #[test]
+    fn topology_constraints_with_chain_const_evaluable() {
+        const C: TopologyConstraints = TopologyConstraints::DEFAULT
+            .with_min_llcs(2)
+            .with_max_llcs(4);
+        assert_eq!(C.min_llcs, 2);
+        assert_eq!(C.max_llcs, Some(4));
     }
 
     #[test]
