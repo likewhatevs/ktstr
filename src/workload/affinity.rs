@@ -168,11 +168,11 @@ pub enum ResolvedAffinity {
     ///   bails (an unsatisfiable sample request would otherwise produce an
     ///   empty `sched_setaffinity` mask that the kernel rejects with
     ///   `EINVAL`). The resolution step that produces this variant — see
-    ///   [`crate::scenario::resolve_affinity_for_cgroup`] — already
-    ///   short-circuits empty pools to [`ResolvedAffinity::None`] before
-    ///   construction. Direct constructor callers (e.g. test fixtures)
-    ///   must do the same: use [`ResolvedAffinity::None`] for "no affinity
-    ///   constraint", never `Random { from: empty, count: > 0 }`.
+    ///   [`crate::scenario::resolve_affinity_for_cgroup`] — bails on
+    ///   empty pools before construction; no silent fallback. Direct
+    ///   constructor callers (e.g. test fixtures) must do the same: use
+    ///   [`ResolvedAffinity::None`] for "no affinity constraint", never
+    ///   `Random { from: empty, count: > 0 }`.
     Random { from: BTreeSet<usize>, count: usize },
     /// Pin to a single CPU.
     SingleCpu(usize),
@@ -206,13 +206,14 @@ impl ResolvedAffinity {
 /// `Random` samples `count` CPUs from `from` per call (each worker
 /// gets an independent draw at spawn time). Empty `from` is a caller
 /// bug and bails — the upstream resolver
-/// [`crate::scenario::resolve_affinity_for_cgroup`] already
-/// short-circuits empty pools (after cpuset intersection) to
-/// [`ResolvedAffinity::None`], so reaching this fn with an empty
-/// `Random.from` indicates a caller bypassing the resolver. Aligned
-/// with the project-wide no-silent-drops invariant: invalid input
-/// must fail loudly, never silently degrade to "no affinity applied".
-/// `count == 0` likewise bails.
+/// [`crate::scenario::resolve_affinity_for_cgroup`] itself bails
+/// (rather than degrading to [`ResolvedAffinity::None`]) on every
+/// path that would produce an empty pool — empty cpuset intersection
+/// against `RandomSubset.from`, `count == 0`, or any other
+/// unsatisfiable shape. Reaching this fn with an empty `Random.from`
+/// therefore indicates a caller that bypassed the resolver. Invalid
+/// input must fail loudly, never silently degrade to "no affinity
+/// applied". `count == 0` likewise bails.
 pub(crate) fn resolve_affinity(mode: &ResolvedAffinity) -> Result<Option<BTreeSet<usize>>> {
     match mode {
         ResolvedAffinity::None => Ok(None),
@@ -230,10 +231,11 @@ pub(crate) fn resolve_affinity(mode: &ResolvedAffinity) -> Result<Option<BTreeSe
                 anyhow::bail!(
                     "ResolvedAffinity::Random.from is empty with count={count}; \
                      a worker cannot be pinned to an empty CPU pool. The \
-                     resolution step that produced this Random must either \
-                     reject the empty set up-front or fall back to \
-                     ResolvedAffinity::None deliberately rather than \
-                     forwarding an unsatisfiable sample request",
+                     resolution step that produced this Random must reject \
+                     the empty set up-front (e.g. via the bail paths in \
+                     `crate::scenario::resolve_affinity_for_cgroup`) — \
+                     forwarding an unsatisfiable sample request would \
+                     silently drop the affinity constraint",
                     count = count,
                 );
             }
@@ -409,10 +411,10 @@ mod tests {
     fn resolve_affinity_random_empty_pool_bails() {
         // Empty Random.from with count > 0 is unsatisfiable: a worker
         // cannot be pinned to an empty CPU pool, and the prior
-        // silent-degrade-to-Ok(None) violated the project-wide
-        // no-silent-drops invariant. Resolution-step callers must
-        // either reject empty up-front or deliberately fall back to
-        // ResolvedAffinity::None — bail forces the bug to surface.
+        // silent-degrade-to-Ok(None) was a silent-drop bug. The bail
+        // forces the bug to surface and points the caller at the
+        // upstream resolver as the place where empty pools should be
+        // rejected up-front.
         let from: BTreeSet<usize> = BTreeSet::new();
         let err = resolve_affinity(&ResolvedAffinity::Random { from, count: 1 }).unwrap_err();
         let msg = format!("{err}");
@@ -420,12 +422,13 @@ mod tests {
             msg.contains("empty") && msg.contains("count=1"),
             "diagnostic must name the empty pool and the count: got {msg}",
         );
-        // Also pin the actionable suggestion — names the recommended
-        // fallback type so a caller hitting this error learns how to
-        // express "no affinity constraint" via the type system.
+        // Also pin the actionable suggestion — names the upstream
+        // resolver as the place callers should reject the empty set
+        // so a caller hitting this error learns where to plug the hole.
         assert!(
-            msg.contains("ResolvedAffinity::None"),
-            "diagnostic must name the recommended fallback type so callers learn the fix: got {msg}",
+            msg.contains("resolve_affinity_for_cgroup"),
+            "diagnostic must point to the upstream resolver so callers \
+             learn where the empty pool should have been rejected: got {msg}",
         );
     }
 

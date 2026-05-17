@@ -692,12 +692,40 @@ pub(crate) fn resolve_num_workers(work: &WorkSpec, default_n: usize, label: &str
 /// Resolve an [`AffinityIntent`] to a concrete [`ResolvedAffinity`]
 /// for workers in a cgroup with the given effective cpuset.
 ///
-/// Returns `Err` for [`AffinityIntent::SmtSiblingPair`] when the
-/// topology exposes no SMT-sibling pair within the effective cpuset
-/// — there is no silent fallback because running an SMT-pair
-/// workload on a non-SMT host would produce a misleading result.
-/// Every other variant succeeds (degrading to
-/// [`ResolvedAffinity::None`] when the resolved pool is empty).
+/// # Errors
+///
+/// Returns `Err` when the test author's affinity intent cannot be
+/// satisfied against the cgroup's effective cpuset. Per the
+/// project-wide no-silent-drops invariant, an unsatisfiable
+/// intent must surface as a returnable error rather than silently
+/// degrading to "no affinity applied" — silent degradation lets
+/// the workload run with the wrong placement while the test
+/// reports success (vacuously-passing assertions).
+///
+/// The unsatisfiable cases by variant:
+/// - [`AffinityIntent::RandomSubset`]: `from` pool empty after
+///   cpuset intersection, or `count == 0`.
+/// - [`AffinityIntent::LlcAligned`]: every LLC's CPUs disjoint
+///   from the cpuset (no LLC has any CPU inside the cpuset).
+/// - [`AffinityIntent::SingleCpu`]: cpuset is empty.
+/// - [`AffinityIntent::Exact`]: requested CPU set is empty
+///   (`Exact(BTreeSet::new())` is intent-only unsatisfiable),
+///   or requested CPU set disjoint from the cpuset
+///   (intersection empty).
+/// - [`AffinityIntent::SmtSiblingPair`]: no physical core with
+///   ≥2 SMT siblings inside the cpuset.
+///
+/// Every error diagnostic names the offending intent and a
+/// remediation hint. Diagnostics for cpuset-narrowed pools
+/// (`RandomSubset` empty intersection, `LlcAligned`, `SingleCpu`,
+/// `Exact` disjoint-intersection, `SmtSiblingPair`) also render the
+/// cpuset that narrowed the pool. The intent-only errors —
+/// `RandomSubset { count: 0 }` and `Exact(BTreeSet::new())` — omit
+/// the cpuset because the cpuset is irrelevant to the failure (the
+/// intent itself names zero CPUs). Remediation hints include
+/// switching to [`AffinityIntent::Inherit`] to deliberately inherit
+/// the cpuset, widening the cgroup's cpuset, or picking CPUs inside
+/// the cpuset.
 pub fn resolve_affinity_for_cgroup(
     kind: &AffinityIntent,
     cpuset: Option<&BTreeSet<usize>>,
@@ -706,6 +734,16 @@ pub fn resolve_affinity_for_cgroup(
     match kind {
         AffinityIntent::Inherit => Ok(ResolvedAffinity::None),
         AffinityIntent::RandomSubset { from, count } => {
+            // Validate the intent itself (count > 0) before doing any
+            // resource work — an intent-only bug (count==0) doesn't
+            // need an allocation to diagnose.
+            if *count == 0 {
+                anyhow::bail!(
+                    "AffinityIntent::RandomSubset count=0 cannot satisfy any sample. \
+                     Switch to `AffinityIntent::Inherit` to deliberately inherit the \
+                     cgroup cpuset, or pass `count >= 1`.",
+                );
+            }
             // The pool is already resolved by the caller (typed
             // `from`). Intersect with the cgroup's cpuset if one is
             // active so the resolved pool stays within the
@@ -716,21 +754,29 @@ pub fn resolve_affinity_for_cgroup(
             } else {
                 from.clone()
             };
-            if pool.is_empty() || *count == 0 {
-                tracing::debug!(
-                    pool_len = pool.len(),
-                    count = *count,
-                    "RandomSubset: empty pool or zero count after \
-                     cpuset intersection, falling back to \
-                     ResolvedAffinity::None"
-                );
-                Ok(ResolvedAffinity::None)
-            } else {
-                Ok(ResolvedAffinity::Random {
-                    from: pool,
-                    count: *count,
-                })
+            if pool.is_empty() {
+                if cpuset.is_some() {
+                    let cpuset_repr = format_cpuset_for_diag(cpuset);
+                    anyhow::bail!(
+                        "AffinityIntent::RandomSubset has no CPUs after intersecting \
+                         `from={from:?}` with the cgroup cpuset ({cpuset_repr}). \
+                         Switch to `AffinityIntent::Inherit` to deliberately inherit \
+                         the cgroup cpuset, widen the cgroup's cpuset, or pick a \
+                         `from` set that overlaps the cpuset.",
+                    );
+                } else {
+                    anyhow::bail!(
+                        "AffinityIntent::RandomSubset has an empty `from` pool with \
+                         no cgroup cpuset to narrow it — there is no CPU to sample. \
+                         Switch to `AffinityIntent::Inherit` to deliberately inherit \
+                         the scenario's CPU budget, or pass a non-empty `from` set.",
+                    );
+                }
             }
+            Ok(ResolvedAffinity::Random {
+                from: pool,
+                count: *count,
+            })
         }
         AffinityIntent::LlcAligned => {
             let pool = cpuset.cloned().unwrap_or_else(|| topo.all_cpuset());
@@ -748,11 +794,17 @@ pub fn resolve_affinity_for_cgroup(
             // Intersect with cpuset so effective affinity matches kernel behavior.
             let effective: BTreeSet<usize> = best_llc.intersection(&pool).copied().collect();
             if effective.is_empty() {
-                // All LLC CPUs outside cpuset -- fall back to inheriting cpuset.
-                Ok(ResolvedAffinity::None)
-            } else {
-                Ok(ResolvedAffinity::Fixed(effective))
+                let cpuset_repr = format_cpuset_for_diag(cpuset);
+                anyhow::bail!(
+                    "AffinityIntent::LlcAligned has no CPUs after intersecting every \
+                     LLC with the cgroup cpuset ({cpuset_repr}). No LLC has any CPU \
+                     inside the cpuset. Switch to `AffinityIntent::Inherit` to \
+                     deliberately inherit the cpuset, widen the cgroup's cpuset to \
+                     include CPUs from at least one LLC, or pick a different \
+                     affinity intent that doesn't require LLC alignment.",
+                );
             }
+            Ok(ResolvedAffinity::Fixed(effective))
         }
         AffinityIntent::CrossCgroup => {
             // When a cpuset is active, crossing cgroup boundaries is the intent,
@@ -765,22 +817,61 @@ pub fn resolve_affinity_for_cgroup(
             if let Some(&cpu) = pool.iter().next() {
                 Ok(ResolvedAffinity::SingleCpu(cpu))
             } else {
-                Ok(ResolvedAffinity::None)
+                // Pool is empty only when cpuset is Some(empty) — `all_cpuset()`
+                // returns at least the boot CPU for any non-degenerate topology.
+                anyhow::bail!(
+                    "AffinityIntent::SingleCpu cannot pick a CPU from an empty \
+                     cgroup cpuset. Switch to `AffinityIntent::Inherit` to \
+                     deliberately inherit (the empty cpuset is itself the \
+                     problem), or assign a non-empty cpuset to the cgroup.",
+                );
             }
         }
         AffinityIntent::Exact(cpus) => {
+            if cpus.is_empty() {
+                // Empty Exact is the most-explicit way a user can say
+                // "I made a mistake" — silently degrading it to
+                // Inherit is the same no-silent-drop violation as the
+                // disjoint-intersection case below.
+                anyhow::bail!(
+                    "AffinityIntent::Exact(BTreeSet::new()) is unsatisfiable — an \
+                     empty CPU set pins workers to nothing. Switch to \
+                     `AffinityIntent::Inherit` to deliberately inherit the cgroup \
+                     cpuset (or the full topology when no cpuset is active), or \
+                     pass at least one CPU ID.",
+                );
+            }
             if let Some(cs) = cpuset {
                 let effective: BTreeSet<usize> = cpus.intersection(cs).copied().collect();
                 if effective.is_empty() {
-                    Ok(ResolvedAffinity::None)
-                } else {
-                    Ok(ResolvedAffinity::Fixed(effective))
+                    let cpuset_repr = format_cpuset_for_diag(cpuset);
+                    anyhow::bail!(
+                        "AffinityIntent::Exact({cpus:?}) is disjoint from the cgroup \
+                         cpuset ({cpuset_repr}); intersection is empty. Switch to \
+                         `AffinityIntent::Inherit` to deliberately inherit the cpuset, \
+                         widen the cgroup's cpuset to include the requested CPUs, or \
+                         narrow the `Exact` set to CPUs inside the cpuset.",
+                    );
                 }
+                Ok(ResolvedAffinity::Fixed(effective))
             } else {
                 Ok(ResolvedAffinity::Fixed(cpus.clone()))
             }
         }
         AffinityIntent::SmtSiblingPair => resolve_smt_sibling_pair(cpuset, topo),
+    }
+}
+
+/// Render a cgroup cpuset for the bail diagnostics on
+/// [`resolve_affinity_for_cgroup`]'s unsatisfiable arms. `None`
+/// renders as `<no cpuset>` so the operator can distinguish
+/// "cpuset is empty" from "no cpuset is active" — both can produce
+/// an empty intersection on different intents.
+fn format_cpuset_for_diag(cpuset: Option<&BTreeSet<usize>>) -> String {
+    match cpuset {
+        Some(cs) if cs.is_empty() => "empty cpuset {}".to_string(),
+        Some(cs) => format!("cpuset {cs:?}"),
+        None => "<no cpuset>".to_string(),
     }
 }
 
@@ -870,15 +961,15 @@ fn resolve_smt_sibling_pair(
 ///   sampling stays deferred to spawn time (each worker gets an
 ///   independent draw from `from`).
 ///
-/// Empty pools (`Random` with `count == 0` or empty `from`, or `Fixed`
-/// emptied by cpuset intersection) degrade to
-/// [`AffinityIntent::Inherit`] so the spawn-time gate does not see a
-/// pre-resolved empty mask. This matches the spawn-side
-/// `resolve_affinity` policy that emits no affinity for an empty pool.
+/// # Errors
 ///
-/// Returns `Err` when the inner [`resolve_affinity_for_cgroup`] does —
-/// today only [`AffinityIntent::SmtSiblingPair`] errors, when the
-/// effective cpuset exposes no SMT-sibling pair.
+/// Forwards every `Err` from the inner [`resolve_affinity_for_cgroup`]
+/// — see that function's `# Errors` section for the full list of
+/// unsatisfiable cases (RandomSubset empty pool / count=0,
+/// LlcAligned no-overlap, SingleCpu empty cpuset, Exact empty or
+/// disjoint, SmtSiblingPair no-pair-in-cpuset). The empty-pool
+/// "silent degrade to Inherit" policy that previously lived here
+/// was removed — empty pools are operator bugs, not "soft" fallbacks.
 pub(crate) fn intent_for_spawn(
     kind: &AffinityIntent,
     cpuset: Option<&BTreeSet<usize>>,
@@ -894,7 +985,20 @@ fn flatten_for_spawn(resolved: ResolvedAffinity) -> AffinityIntent {
         ResolvedAffinity::None => AffinityIntent::Inherit,
         ResolvedAffinity::Fixed(set) => {
             if set.is_empty() {
-                AffinityIntent::Inherit
+                // Invariant: resolve_affinity_for_cgroup bails before
+                // constructing an empty Fixed (LlcAligned
+                // empty-effective bail, Exact empty-input bail, Exact
+                // disjoint-intersection bail). Reaching here means a
+                // future constructor of ResolvedAffinity::Fixed
+                // bypassed those checks — panic loudly so the
+                // regression surfaces at the construction site, not
+                // as a silent inheritance downstream.
+                unreachable!(
+                    "ResolvedAffinity::Fixed(empty) reached flatten_for_spawn — \
+                     resolve_affinity_for_cgroup is supposed to bail on every \
+                     path that produces an empty Fixed (no-silent-drops \
+                     invariant). Audit the new caller that constructed it.",
+                )
             } else {
                 AffinityIntent::Exact(set)
             }
@@ -905,12 +1009,19 @@ fn flatten_for_spawn(resolved: ResolvedAffinity) -> AffinityIntent {
             // [`AffinityIntent::RandomSubset`] so per-worker
             // sampling stays deferred to spawn time
             // (`workload::resolve_affinity` samples each worker
-            // independently). Empty pool / zero count degrade to
-            // [`AffinityIntent::Inherit`] — same policy as
-            // `resolve_affinity_for_cgroup` for the same
-            // degenerate cases.
+            // independently).
             if count == 0 || from.is_empty() {
-                AffinityIntent::Inherit
+                // Invariant: resolve_affinity_for_cgroup bails on
+                // RandomSubset { count: 0 } and on empty intersected
+                // pools. Same regression-surface contract as the
+                // Fixed arm above.
+                unreachable!(
+                    "ResolvedAffinity::Random {{ count={count}, from={from:?} }} \
+                     reached flatten_for_spawn with count==0 or empty pool — \
+                     resolve_affinity_for_cgroup is supposed to bail on those \
+                     cases (no-silent-drops invariant). Audit the new caller \
+                     that constructed it.",
+                )
             } else {
                 AffinityIntent::RandomSubset { from, count }
             }
@@ -1138,20 +1249,191 @@ mod tests {
     }
 
     #[test]
-    fn resolve_affinity_random_subset_empty_pool_is_none() {
-        // Regression: empty cpuset produced ResolvedAffinity::Random { from: empty,
-        // count: 1 }, which previously produced an empty affinity mask
-        // rejected by sched_setaffinity with EINVAL. Must short-circuit
-        // to ResolvedAffinity::None here. The caller-supplied pool is
-        // intersected with the cgroup cpuset; an empty cpuset empties
-        // the intersection and the resolver short-circuits.
+    fn resolve_affinity_random_subset_empty_pool_bails() {
+        // Empty cpuset intersection on RandomSubset must surface as
+        // a returnable Err — per the project no-silent-drops
+        // invariant, an unsatisfiable affinity intent is the
+        // operator's bug to fix (widen the cpuset, change the
+        // intent), not a silent "default placement" the test
+        // happily accepts. (Earlier code paths produced
+        // ResolvedAffinity::None or even an empty Random.from that
+        // sched_setaffinity rejected with EINVAL; both forms
+        // masked the configuration error.)
         let t = crate::topology::TestTopology::synthetic(4, 1);
         let empty: BTreeSet<usize> = BTreeSet::new();
         let intent = AffinityIntent::random_subset(t.all_cpus().iter().copied(), 1);
-        match resolve_affinity_for_cgroup(&intent, Some(&empty), &t).unwrap() {
-            ResolvedAffinity::None => {}
-            other => panic!("expected None for empty cpuset, got {:?}", other),
-        }
+        let err = resolve_affinity_for_cgroup(&intent, Some(&empty), &t)
+            .expect_err("empty cpuset intersection must bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("AffinityIntent::RandomSubset"),
+            "diagnostic must name the intent variant: got {msg}",
+        );
+        assert!(
+            msg.contains("empty cpuset"),
+            "diagnostic must name what narrowed the pool (empty cpuset): got {msg}",
+        );
+        assert!(
+            msg.contains("AffinityIntent::Inherit"),
+            "diagnostic must name the recommended fix (Inherit fallback): got {msg}",
+        );
+    }
+
+    #[test]
+    fn resolve_affinity_random_subset_empty_from_no_cpuset_bails() {
+        // Companion to `_empty_pool_bails` above — that one pins the
+        // `cpuset=Some(non_empty)` + `from=non_empty` → empty intersection
+        // path. This test pins the OTHER way pool can be empty: caller
+        // passes RandomSubset { from: empty } directly and no cpuset is
+        // active. The bail diag must distinguish "intersected to empty"
+        // (cpuset present) from "from-pool was empty with no cpuset to
+        // narrow it" (no cpuset) so operators see actionable wording.
+        let t = crate::topology::TestTopology::synthetic(4, 1);
+        let intent = AffinityIntent::random_subset(std::iter::empty(), 1);
+        let err = resolve_affinity_for_cgroup(&intent, None, &t)
+            .expect_err("empty from-pool with no cpuset must bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("AffinityIntent::RandomSubset"),
+            "diagnostic must name the intent variant: got {msg}",
+        );
+        assert!(
+            msg.contains("empty `from` pool with no cgroup cpuset"),
+            "diagnostic must distinguish this case from the cpuset-intersection \
+             case so the operator sees the right remediation: got {msg}",
+        );
+        assert!(
+            msg.contains("AffinityIntent::Inherit"),
+            "diagnostic must name the recommended fix (Inherit fallback): got {msg}",
+        );
+    }
+
+    #[test]
+    fn resolve_affinity_random_subset_zero_count_bails() {
+        let t = crate::topology::TestTopology::synthetic(4, 1);
+        let intent = AffinityIntent::random_subset(t.all_cpus().iter().copied(), 0);
+        let err = resolve_affinity_for_cgroup(&intent, None, &t)
+            .expect_err("count=0 must bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("RandomSubset count=0"),
+            "diagnostic must name count=0: got {msg}",
+        );
+    }
+
+    #[test]
+    fn resolve_affinity_llc_aligned_disjoint_cpuset_bails() {
+        // LLC 0 = {0,1,2,3}, LLC 1 = {4,5,6,7}. Cpuset = {} (empty)
+        // → every LLC's intersection is empty → bail.
+        let t = crate::topology::TestTopology::synthetic(8, 2);
+        let empty: BTreeSet<usize> = BTreeSet::new();
+        let err = resolve_affinity_for_cgroup(&AffinityIntent::LlcAligned, Some(&empty), &t)
+            .expect_err("empty cpuset on LlcAligned must bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("AffinityIntent::LlcAligned"),
+            "diagnostic must name the intent variant: got {msg}",
+        );
+        assert!(
+            msg.contains("No LLC has any CPU"),
+            "diagnostic must name the failure mode: got {msg}",
+        );
+        assert!(
+            msg.contains("AffinityIntent::Inherit"),
+            "diagnostic must name the recommended fix: got {msg}",
+        );
+    }
+
+    #[test]
+    fn resolve_affinity_single_cpu_empty_cpuset_bails() {
+        let t = crate::topology::TestTopology::synthetic(4, 1);
+        let empty: BTreeSet<usize> = BTreeSet::new();
+        let err = resolve_affinity_for_cgroup(&AffinityIntent::SingleCpu, Some(&empty), &t)
+            .expect_err("empty cpuset on SingleCpu must bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("AffinityIntent::SingleCpu"),
+            "diagnostic must name the intent variant: got {msg}",
+        );
+        assert!(
+            msg.contains("empty cgroup cpuset"),
+            "diagnostic must name the failure mode (empty cpuset): got {msg}",
+        );
+        assert!(
+            msg.contains("AffinityIntent::Inherit"),
+            "diagnostic must name the recommended fix: got {msg}",
+        );
+    }
+
+    #[test]
+    fn resolve_affinity_exact_disjoint_from_cpuset_bails() {
+        let t = crate::topology::TestTopology::synthetic(4, 1);
+        // Cpuset = {0, 1}; Exact = {2, 3}. Intersection is empty.
+        let cpuset: BTreeSet<usize> = [0, 1].into_iter().collect();
+        let exact: BTreeSet<usize> = [2, 3].into_iter().collect();
+        let err = resolve_affinity_for_cgroup(
+            &AffinityIntent::Exact(exact),
+            Some(&cpuset),
+            &t,
+        )
+        .expect_err("disjoint Exact must bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("AffinityIntent::Exact"),
+            "diagnostic must name the intent variant: got {msg}",
+        );
+        assert!(
+            msg.contains("disjoint"),
+            "diagnostic must name the failure mode (disjoint): got {msg}",
+        );
+        assert!(
+            msg.contains("AffinityIntent::Inherit"),
+            "diagnostic must name the recommended fix: got {msg}",
+        );
+    }
+
+    #[test]
+    fn resolve_affinity_exact_empty_bails_regardless_of_cpuset() {
+        // Empty Exact is the most-explicit way a user can say "I made
+        // a mistake" — must bail whether or not a cpuset is active,
+        // otherwise the no-cpuset branch silently produces
+        // ResolvedAffinity::Fixed({}) which flatten_for_spawn used to
+        // coerce to Inherit.
+        let t = crate::topology::TestTopology::synthetic(4, 1);
+        let empty: BTreeSet<usize> = BTreeSet::new();
+        // (a) no cpuset
+        let err_no_cs = resolve_affinity_for_cgroup(
+            &AffinityIntent::Exact(empty.clone()),
+            None,
+            &t,
+        )
+        .expect_err("empty Exact must bail even without cpuset");
+        let msg_no_cs = format!("{err_no_cs:#}");
+        assert!(
+            msg_no_cs.contains("AffinityIntent::Exact(BTreeSet::new())"),
+            "diagnostic must name the empty-Exact form: got {msg_no_cs}",
+        );
+        assert!(
+            msg_no_cs.contains("unsatisfiable"),
+            "diagnostic must name the failure mode: got {msg_no_cs}",
+        );
+        assert!(
+            msg_no_cs.contains("AffinityIntent::Inherit"),
+            "diagnostic must name the recommended fix: got {msg_no_cs}",
+        );
+        // (b) with cpuset — same bail, doesn't reach the intersection arm
+        let cpuset: BTreeSet<usize> = [0, 1].into_iter().collect();
+        let err_with_cs = resolve_affinity_for_cgroup(
+            &AffinityIntent::Exact(empty),
+            Some(&cpuset),
+            &t,
+        )
+        .expect_err("empty Exact must bail with cpuset too");
+        let msg_with_cs = format!("{err_with_cs:#}");
+        assert!(
+            msg_with_cs.contains("AffinityIntent::Exact(BTreeSet::new())"),
+            "diagnostic must name the empty-Exact form (not the disjoint message): got {msg_with_cs}",
+        );
     }
 
     #[test]
@@ -1766,11 +2048,16 @@ mod tests {
     // Every arm of `flatten_for_spawn` must round-trip a known
     // [`ResolvedAffinity`] into the matching [`AffinityIntent`]
     // shape. The flatten step gates the scenario engine's output
-    // against the spawn-time gate in `workload::resolve_spawn_affinity`
-    // — empty pools (`Random` with `from.is_empty()` or `count == 0`,
-    // and `Fixed` with an empty set) MUST degrade to
-    // [`AffinityIntent::Inherit`] so the gate never sees a
-    // pre-resolved empty mask. These tests pin every arm.
+    // against the spawn-time gate in `workload::resolve_spawn_affinity`.
+    //
+    // Post-#48 contract: `resolve_affinity_for_cgroup` bails on every
+    // path that would produce an empty pool — empty `Fixed`,
+    // `Random { from: empty }`, `Random { count: 0 }` — so
+    // `flatten_for_spawn` upholds that contract with `unreachable!()`
+    // on those arms. The `_panics` tests pin the invariant: a future
+    // caller that bypasses the resolver and constructs an empty pool
+    // directly trips the panic at the construction site, never
+    // silently degrades to `Inherit`.
 
     #[test]
     fn flatten_for_spawn_none_to_inherit() {
@@ -1793,14 +2080,19 @@ mod tests {
         }
     }
 
+    /// Post-#48 invariant: `resolve_affinity_for_cgroup` bails on
+    /// every path that would produce an empty `Fixed`, so
+    /// `flatten_for_spawn` upholds that contract with `unreachable!()`.
+    /// This test pins that contract — if a future caller bypasses the
+    /// resolver and constructs `ResolvedAffinity::Fixed(BTreeSet::new())`
+    /// directly, the panic surfaces the bug at the call site instead of
+    /// silently degrading to `Inherit`.
     #[test]
-    fn flatten_for_spawn_fixed_empty_to_inherit() {
-        let out = flatten_for_spawn(ResolvedAffinity::Fixed(BTreeSet::new()));
-        assert!(
-            matches!(out, AffinityIntent::Inherit),
-            "Fixed(empty) must degrade to Inherit (an empty mask would \
-             EINVAL at sched_setaffinity), got {out:?}"
-        );
+    #[should_panic(
+        expected = "ResolvedAffinity::Fixed(empty) reached flatten_for_spawn"
+    )]
+    fn flatten_for_spawn_fixed_empty_panics() {
+        let _ = flatten_for_spawn(ResolvedAffinity::Fixed(BTreeSet::new()));
     }
 
     #[test]
@@ -1834,36 +2126,42 @@ mod tests {
         }
     }
 
+    /// Post-#48 invariant: `resolve_affinity_for_cgroup` bails on
+    /// `RandomSubset` empty pools (after cpuset intersection), so
+    /// `flatten_for_spawn` upholds that contract with `unreachable!()`.
+    /// Pins the contract — see `flatten_for_spawn_fixed_empty_panics`.
     #[test]
-    fn flatten_for_spawn_random_empty_pool_to_inherit() {
-        let out = flatten_for_spawn(ResolvedAffinity::Random {
+    #[should_panic(
+        expected = "reached flatten_for_spawn with count==0 or empty pool"
+    )]
+    fn flatten_for_spawn_random_empty_pool_panics() {
+        let _ = flatten_for_spawn(ResolvedAffinity::Random {
             from: BTreeSet::new(),
             count: 4,
         });
-        assert!(
-            matches!(out, AffinityIntent::Inherit),
-            "Random with empty pool must degrade to Inherit (the \
-             spawn-time gate rejects empty-pool RandomSubset), got {out:?}"
-        );
     }
 
+    /// Post-#48 invariant: `resolve_affinity_for_cgroup` bails on
+    /// `RandomSubset { count: 0 }`. Pins the contract — see
+    /// `flatten_for_spawn_fixed_empty_panics`.
     #[test]
-    fn flatten_for_spawn_random_zero_count_to_inherit() {
+    #[should_panic(
+        expected = "reached flatten_for_spawn with count==0 or empty pool"
+    )]
+    fn flatten_for_spawn_random_zero_count_panics() {
         let from: BTreeSet<usize> = [0usize, 1, 2, 3].into_iter().collect();
-        let out = flatten_for_spawn(ResolvedAffinity::Random { from, count: 0 });
-        assert!(
-            matches!(out, AffinityIntent::Inherit),
-            "Random with count=0 must degrade to Inherit (the \
-             spawn-time gate rejects count=0 RandomSubset), got {out:?}"
-        );
+        let _ = flatten_for_spawn(ResolvedAffinity::Random { from, count: 0 });
     }
 
     /// End-to-end: `intent_for_spawn` chains
     /// `resolve_affinity_for_cgroup` into `flatten_for_spawn`. Verify
     /// the full pipeline produces a spawn-gate-acceptable intent for
-    /// each top-level [`AffinityIntent`] variant. Topology-aware
-    /// variants flatten to `Exact`; `Inherit` round-trips; empty-pool
-    /// `RandomSubset` degrades to `Inherit`.
+    /// each top-level [`AffinityIntent`] variant on the happy path.
+    /// Topology-aware variants (`SingleCpu`, `CrossCgroup`,
+    /// `SmtSiblingPair`, `LlcAligned`) flatten to `Exact`; `Inherit`
+    /// and `RandomSubset` (with a valid pool) round-trip. The bail
+    /// propagation for unsatisfiable inputs is covered by the
+    /// dedicated `intent_for_spawn_propagates_*_bail` sibling tests.
     #[test]
     fn intent_for_spawn_full_pipeline() {
         // Use a real VM topology so the per-LLC sibling map is
@@ -1916,6 +2214,33 @@ mod tests {
             other => panic!("expected Exact, got {other:?}"),
         }
 
+        // LlcAligned → Exact(<LLC's CPUs>) — picks the LLC with most
+        // overlap against the cpuset (or `all_cpuset` when no cpuset
+        // is active). On the 1-NUMA / 2-LLC / 2-core / 2-thread
+        // topology, each LLC owns 4 CPUs.
+        let out = intent_for_spawn(&AffinityIntent::LlcAligned, None, &t).unwrap();
+        match out {
+            AffinityIntent::Exact(set) => {
+                assert_eq!(set.len(), 4, "LlcAligned flattens to one LLC's worth of CPUs");
+            }
+            other => panic!("expected Exact, got {other:?}"),
+        }
+
+        // Exact(non-empty) → Exact(round-trip when within cpuset)
+        let exact_cpus: BTreeSet<usize> = [0usize, 2, 4].into_iter().collect();
+        let out = intent_for_spawn(
+            &AffinityIntent::Exact(exact_cpus.clone()),
+            None,
+            &t,
+        )
+        .unwrap();
+        match out {
+            AffinityIntent::Exact(set) => {
+                assert_eq!(set, exact_cpus, "Exact round-trip must preserve the CPU set");
+            }
+            other => panic!("expected Exact, got {other:?}"),
+        }
+
         // RandomSubset with valid pool → RandomSubset round-trip
         let pool: BTreeSet<usize> = [0usize, 1, 2, 3].into_iter().collect();
         let intent = AffinityIntent::random_subset(pool.iter().copied(), 2);
@@ -1927,17 +2252,69 @@ mod tests {
             }
             other => panic!("expected RandomSubset, got {other:?}"),
         }
+    }
 
-        // RandomSubset with empty cpuset → Inherit (pool intersects to
-        // empty, resolver short-circuits to None, flatten degrades to
-        // Inherit).
+    /// Post-#48 invariant: `intent_for_spawn` must propagate every
+    /// `Err` from the inner `resolve_affinity_for_cgroup` rather than
+    /// swallowing it. These tests pin the `?`-propagation path for
+    /// each unsatisfiable bail.
+    #[test]
+    fn intent_for_spawn_propagates_random_empty_intersection_bail() {
+        let vmt = crate::vmm::topology::Topology::new(1, 2, 2, 2);
+        let t = crate::topology::TestTopology::from_vm_topology(&vmt);
         let empty_cpuset: BTreeSet<usize> = BTreeSet::new();
         let intent = AffinityIntent::random_subset(t.all_cpus().iter().copied(), 1);
-        let out = intent_for_spawn(&intent, Some(&empty_cpuset), &t).unwrap();
+        let err = intent_for_spawn(&intent, Some(&empty_cpuset), &t)
+            .expect_err("RandomSubset with empty cpuset intersection must bail");
+        let msg = err.to_string();
         assert!(
-            matches!(out, AffinityIntent::Inherit),
-            "RandomSubset with empty cpuset intersection must flatten \
-             to Inherit, got {out:?}"
+            msg.contains("AffinityIntent::RandomSubset")
+                && msg.contains("after intersecting"),
+            "bail diag should name the intent and the intersection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn intent_for_spawn_propagates_random_zero_count_bail() {
+        let vmt = crate::vmm::topology::Topology::new(1, 2, 2, 2);
+        let t = crate::topology::TestTopology::from_vm_topology(&vmt);
+        let pool: BTreeSet<usize> = [0usize, 1].into_iter().collect();
+        let intent = AffinityIntent::random_subset(pool.iter().copied(), 0);
+        let err = intent_for_spawn(&intent, None, &t)
+            .expect_err("RandomSubset { count: 0 } must bail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("count=0"),
+            "bail diag should name the count=0 condition, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn intent_for_spawn_propagates_exact_empty_bail() {
+        let vmt = crate::vmm::topology::Topology::new(1, 2, 2, 2);
+        let t = crate::topology::TestTopology::from_vm_topology(&vmt);
+        let intent = AffinityIntent::Exact(BTreeSet::new());
+        let err = intent_for_spawn(&intent, None, &t)
+            .expect_err("Exact(empty) must bail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("AffinityIntent::Exact(BTreeSet::new())"),
+            "bail diag should name the empty Exact, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn intent_for_spawn_propagates_single_cpu_empty_cpuset_bail() {
+        let vmt = crate::vmm::topology::Topology::new(1, 2, 2, 2);
+        let t = crate::topology::TestTopology::from_vm_topology(&vmt);
+        let empty_cpuset: BTreeSet<usize> = BTreeSet::new();
+        let err = intent_for_spawn(&AffinityIntent::SingleCpu, Some(&empty_cpuset), &t)
+            .expect_err("SingleCpu with empty cpuset must bail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("AffinityIntent::SingleCpu")
+                && msg.contains("empty"),
+            "bail diag should name the intent and the empty cpuset, got: {msg}"
         );
     }
 
