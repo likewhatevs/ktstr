@@ -1,0 +1,762 @@
+//! [`Snapshot`] is the entry point for a captured
+//! [`FailureDumpReport`], plus [`SnapshotMap`] for typed traversal of
+//! one map and the per-CPU resolver helpers it uses to project
+//! per-CPU array / hash entries down to a single slot.
+//!
+//! [`render_entry_key`] formats a [`SnapshotEntry`] key for the
+//! `NoMatch` diagnostic; lives here because it walks the same
+//! `SnapshotMap` entry shapes the type uses internally.
+
+use crate::monitor::arena::ArenaSnapshot;
+use crate::monitor::bpf_prog::ProgRuntimeStats;
+use crate::monitor::btf_render::RenderedValue;
+use crate::monitor::dump::{
+    EventCounterSample, FailureDumpFdArray, FailureDumpMap, FailureDumpPercpuEntry,
+    FailureDumpPercpuHashEntry, FailureDumpReport, FailureDumpRingbuf, FailureDumpStackTrace,
+    PerCpuTimeStats, PerNodeNumaStats, ProbeBssCounters,
+};
+use crate::monitor::scx_walker::{DsqState, RqScxState, ScxSchedState};
+use crate::monitor::task_enrichment::TaskEnrichment;
+
+use super::{
+    HEX_KEY_PREFIX, NO_MATCH_KEY_CHAR_CAP, NO_MATCH_KEY_SAMPLE, SnapshotEntry, SnapshotError,
+    SnapshotField, SnapshotResult,
+};
+use super::field::lookup_member;
+
+/// Borrowed view over a captured [`FailureDumpReport`] for typed
+/// traversal of BTF-rendered map values, per-CPU entries, and
+/// scalar variables.
+///
+/// Constructed from a [`FailureDumpReport`] reference (typically
+/// obtained via [`SnapshotBridge::drain`]); the view is cheap to
+/// build — it does not copy the underlying report. Accessor
+/// methods all return further borrowed views that walk the report
+/// in place.
+#[derive(Debug)]
+#[must_use = "Snapshot is a borrowed view; bind or chain accessors"]
+#[non_exhaustive]
+pub struct Snapshot<'a> {
+    report: &'a FailureDumpReport,
+}
+
+impl<'a> Snapshot<'a> {
+    /// Build a borrowed view over `report`.
+    pub fn new(report: &'a FailureDumpReport) -> Self {
+        Self { report }
+    }
+
+    /// Underlying [`FailureDumpReport`] borrowed back to the caller.
+    ///
+    /// **Escape hatch.** Most consumers should reach for the typed
+    /// accessors on [`Snapshot`] / [`SnapshotMap`] / [`SnapshotEntry`]
+    /// / [`SnapshotField`], which route through [`SnapshotError`] and
+    /// compose with the [`crate::assert::temporal`] patterns via
+    /// [`SeriesField`](crate::assert::temporal::SeriesField). Use
+    /// `report()` only when a [`FailureDumpReport`] field has no
+    /// typed accessor yet:
+    ///
+    /// - `vcpu_regs` — per-vCPU register snapshot captured at the
+    ///   freeze instant.
+    /// - `vcpu_perf_at_freeze` — per-vCPU hardware perf counter
+    ///   snapshot captured at the freeze instant.
+    /// - `dump_truncated_at_us` — microseconds-into-the-dump at
+    ///   which the soft deadline tripped.
+    /// - `sdt_allocations`, `scx_static_ranges` — SDT allocator and
+    ///   scx static memory layout snapshots used by the arena /
+    ///   pointer-renderer pipelines.
+    /// - `schema` — wire-format metadata
+    ///   ([`Self::is_placeholder`] already wraps the boolean form).
+    ///
+    /// All other fields documented as escape-only on
+    /// [`FailureDumpReport`] above now have first-class accessors on
+    /// [`Snapshot`] (`event_counter_timeline`, `rq_scx_states`,
+    /// `dsq_states`, `scx_sched_state`, `per_cpu_time`,
+    /// `per_node_numa`, `task_enrichments`, `prog_runtime_stats`,
+    /// `probe_counters`) and on [`SnapshotMap`] (`ringbuf`,
+    /// `arena`, `fd_array`, `stack_trace`, `map_error`).
+    ///
+    /// Five `*_unavailable` diagnostic accessors cover the subset of
+    /// walker-backed fields the dump pipeline writes a reason string
+    /// for: [`Self::scx_walker_unavailable`] (shared by
+    /// rq_scx_states / dsq_states / scx_sched_state — the scx
+    /// walker writes one reason for the whole group),
+    /// [`Self::task_enrichments_unavailable`],
+    /// [`Self::prog_runtime_stats_unavailable`],
+    /// [`Self::per_node_numa_unavailable`], and
+    /// [`Self::sdt_alloc_unavailable`] (for the still-escape-only
+    /// `sdt_allocations` field above). The remaining accessors
+    /// (`event_counter_timeline`, `per_cpu_time`, `probe_counters`)
+    /// have no companion diagnostic — empty / None is their only
+    /// "no capture" signal.
+    ///
+    /// **Caveats of the bypass:**
+    /// - No [`SnapshotError`] routing — call-site is on its own to
+    ///   handle missing fields / type mismatches / per-CPU
+    ///   narrowing.
+    /// - No [`SeriesField`](crate::assert::temporal::SeriesField)
+    ///   integration — temporal patterns
+    ///   ([`nondecreasing`](crate::assert::temporal::SeriesField::nondecreasing),
+    ///   [`rate_within`](crate::assert::temporal::SeriesField::rate_within),
+    ///   etc.) cannot consume raw `FailureDumpReport` field values.
+    /// - No placeholder-sample short-circuit
+    ///   ([`Self::is_placeholder`] check is the caller's
+    ///   responsibility).
+    pub fn report(&self) -> &'a FailureDumpReport {
+        self.report
+    }
+
+    /// Look up a BPF map by exact name. Returns
+    /// [`SnapshotError::MapNotFound`] (with the captured map names
+    /// in `available`) when no match is found.
+    pub fn map(&self, name: &str) -> SnapshotResult<SnapshotMap<'a>> {
+        for m in &self.report.maps {
+            if m.name == name {
+                return Ok(SnapshotMap { map: m, cpu: None });
+            }
+        }
+        Err(SnapshotError::MapNotFound {
+            requested: name.to_string(),
+            available: self.report.maps.iter().map(|m| m.name.clone()).collect(),
+        })
+    }
+
+    /// Walk the BTF-rendered fields of every `*.bss` / `*.data` /
+    /// `*.rodata` global-section map for a top-level variable
+    /// named `name`. Convenience for `.var("nr_cpus_onln")` style
+    /// scalar reads without naming the section explicitly.
+    ///
+    /// Returns [`SnapshotField::Value`] on a unique match;
+    /// [`SnapshotField::Missing`] with
+    /// [`SnapshotError::VarNotFound`] (and the union of every
+    /// global-section map's top-level member names in `available`)
+    /// when no map exposes the name; or
+    /// [`SnapshotError::AmbiguousVar`] when more than one
+    /// global-section map exposes a top-level member with the same
+    /// name. Two BPF objects sharing a global symbol — common when
+    /// a scenario loads multiple progs into one report — would
+    /// otherwise fall through to an arbitrary first match keyed off
+    /// `report.maps` ordering, which depends on kernel IDR
+    /// allocation order. Callers disambiguate via
+    /// [`Self::map`] and walk the named map directly.
+    pub fn var(&self, name: &str) -> SnapshotField<'a> {
+        let mut hits: Vec<(&'a str, &'a RenderedValue)> = Vec::new();
+        for m in &self.report.maps {
+            if !is_global_section_map(&m.name) {
+                continue;
+            }
+            if let Some(v) = m.value.as_ref()
+                && let Some(found) = lookup_member(v, name)
+            {
+                hits.push((m.name.as_str(), found));
+            }
+        }
+        match hits.len() {
+            1 => SnapshotField::Value(hits[0].1),
+            n if n > 1 => SnapshotField::Missing(SnapshotError::AmbiguousVar {
+                requested: name.to_string(),
+                found_in: hits.iter().map(|(name, _)| (*name).to_string()).collect(),
+            }),
+            _ => {
+                let mut available: Vec<String> = Vec::new();
+                for m in &self.report.maps {
+                    if !is_global_section_map(&m.name) {
+                        continue;
+                    }
+                    if let Some(RenderedValue::Struct { members, .. }) = m.value.as_ref() {
+                        for member in members {
+                            available.push(member.name.clone());
+                        }
+                    }
+                }
+                available.sort();
+                available.dedup();
+                SnapshotField::Missing(SnapshotError::VarNotFound {
+                    requested: name.to_string(),
+                    available,
+                })
+            }
+        }
+    }
+
+    /// Number of maps captured in the report.
+    pub fn map_count(&self) -> usize {
+        self.report.maps.len()
+    }
+
+    /// True when the underlying [`FailureDumpReport`] is a
+    /// placeholder produced by [`FailureDumpReport::placeholder`]
+    /// — i.e. the freeze-rendezvous capture pipeline could not
+    /// produce real data. Periodic-sample temporal patterns use
+    /// this to skip the BPF axis on a placeholder sample (the
+    /// stats axis, when present, may still be valid). Bypassing
+    /// the projection-error path keeps the sample's diagnostic
+    /// distinct from "field missing on a real capture".
+    pub fn is_placeholder(&self) -> bool {
+        self.report.is_placeholder
+    }
+
+    // -----------------------------------------------------------------
+    // First-class accessors for fields the freeze-coordinator pipeline
+    // populates on `FailureDumpReport` outside the BPF-map axis. Each
+    // accessor returns either a borrowed slice (whole-vec views) or an
+    // `Option<&T>` keyed by the natural identifier. Empty vec is the
+    // normal state when the corresponding walker did not run — callers
+    // check the companion `*_unavailable` field on the raw report for
+    // the diagnostic reason. None on a keyed lookup means "the dump
+    // did not capture an entry for that key"; it is not an error.
+    //
+    // **Keyed-lookup naming convention.** `<base>_at(<key>)` is used
+    // when the key is a topology position (CPU index, NUMA node id)
+    // that the kernel allocates densely from 0; the `_at` mirrors
+    // `Vec::get(idx)` and reads naturally as "the row at this
+    // position". `<base>_by_<field>(<value>)` is used when the key is
+    // a sparse identifier (pid, program name) — the `_by_<field>`
+    // names which field the lookup compares against and reads
+    // naturally as "the entry whose <field> matches". The `<base>` is
+    // normally the singular form of the plural-vec accessor (e.g.
+    // `task_enrichments` → `task_enrichment_by_pid`), but stays
+    // plural when the singular reads unnaturally (e.g.
+    // `prog_runtime_stats` → `prog_runtime_stats_by_name` — the
+    // singular `prog_runtime_stat` would be awkward English; the
+    // `Stats` suffix is part of the canonical noun). Each keyed
+    // accessor returns the first match in walker enumeration order;
+    // production captures do not duplicate keys (kernel walker
+    // invariants), but the contract is left first-match-wins so a
+    // future duplicate-key scenario surfaces only one row without
+    // panicking.
+    // -----------------------------------------------------------------
+
+    /// Per-monitor-tick SCX_EV_* event counter samples. Each entry is
+    /// the cross-CPU sum of the 13 SCX event counters at one monitor
+    /// tick. Empty when no `EventCounterCapture` ran, or every sample
+    /// was suppressed (event-stat offsets unresolved, scx_root unset).
+    ///
+    /// Unlike the walker-backed accessors below, this field carries
+    /// no `*_unavailable` companion: an empty timeline is the only
+    /// signal for "no capture / no events".
+    pub fn event_counter_timeline(&self) -> &'a [EventCounterSample] {
+        &self.report.event_counter_timeline
+    }
+
+    /// Per-CPU `rq->scx` snapshots — one per CPU walked by
+    /// [`crate::monitor::scx_walker`]. Empty when the
+    /// `ScxWalkerCapture` was absent or every CPU's translate
+    /// failed (see `FailureDumpReport::scx_walker_unavailable`).
+    pub fn rq_scx_states(&self) -> &'a [RqScxState] {
+        &self.report.rq_scx_states
+    }
+
+    /// Per-DSQ snapshots — local, bypass, global, and user DSQs
+    /// reachable from `*scx_root`. Each entry carries `nr` (depth),
+    /// `seq` (BPF-iter counter), and the queued task KVAs. Empty
+    /// when the `ScxWalkerCapture` was absent (see
+    /// `FailureDumpReport::scx_walker_unavailable`).
+    pub fn dsq_states(&self) -> &'a [DsqState] {
+        &self.report.dsq_states
+    }
+
+    /// Top-level `scx_sched` state captured from `*scx_root`:
+    /// aborting flag, bypass_depth, exit_kind. `None` when no
+    /// scheduler is attached or `*scx_root` was unreadable (see
+    /// `FailureDumpReport::scx_walker_unavailable`).
+    pub fn scx_sched_state(&self) -> Option<&'a ScxSchedState> {
+        self.report.scx_sched_state.as_ref()
+    }
+
+    /// Per-CPU CPU-time / softirq / IRQ counter rows. One row per
+    /// CPU enumerated by [`crate::monitor::dump::CpuTimeCapture`].
+    /// Empty when the capture was not wired or symbol/BTF
+    /// resolution failed.
+    pub fn per_cpu_time(&self) -> &'a [PerCpuTimeStats] {
+        &self.report.per_cpu_time
+    }
+
+    /// Per-CPU CPU-time row for CPU `cpu`, looked up by the `cpu`
+    /// field on each [`PerCpuTimeStats`] (not by vec position).
+    /// Returns `None` when no row matches — typical when the
+    /// walker skipped that CPU, the capture didn't run, or `cpu`
+    /// exceeded the topology. Returns the first match in walker
+    /// enumeration order if `cpu` appears more than once.
+    pub fn per_cpu_time_at(&self, cpu: u32) -> Option<&'a PerCpuTimeStats> {
+        self.report.per_cpu_time.iter().find(|c| c.cpu == cpu)
+    }
+
+    /// Per-NUMA-node event counter rows captured from
+    /// `pglist_data->node_zones[]->vm_numa_event[]`. Empty until
+    /// the host-side NUMA walker lands (see
+    /// `FailureDumpReport::per_node_numa_unavailable`).
+    pub fn per_node_numa(&self) -> &'a [PerNodeNumaStats] {
+        &self.report.per_node_numa
+    }
+
+    /// Per-NUMA-node event-counter row for `node`, looked up by
+    /// the `node` field on each [`PerNodeNumaStats`]. Returns
+    /// `None` when no row matches. Returns the first match in
+    /// walker enumeration order if `node` appears more than once.
+    pub fn per_node_numa_at(&self, node: u32) -> Option<&'a PerNodeNumaStats> {
+        self.report.per_node_numa.iter().find(|n| n.node == node)
+    }
+
+    /// Per-task failure-dump enrichments — identity (pid, tgid,
+    /// comm), process tree, scheduling priority, sched_class name,
+    /// context-switch counters, watchdog disambiguation, lock
+    /// slowpath stack matches. Empty when no task walker ran (see
+    /// `FailureDumpReport::task_enrichments_unavailable`).
+    pub fn task_enrichments(&self) -> &'a [TaskEnrichment] {
+        &self.report.task_enrichments
+    }
+
+    /// Look up the enrichment for `pid`. The returned reference
+    /// matches the first task whose `task_struct.pid` equals `pid`
+    /// in walker enumeration order. Returns `None` when no task with
+    /// that pid was captured. Production captures dedupe by task_kva
+    /// before push, so duplicate-pid rows do not occur in real
+    /// dumps.
+    pub fn task_enrichment_by_pid(&self, pid: i32) -> Option<&'a TaskEnrichment> {
+        self.report.task_enrichments.iter().find(|t| t.pid == pid)
+    }
+
+    /// Per-program BPF runtime stats — invocation count, total ns,
+    /// recursion misses. One entry per struct_ops program reached
+    /// by the prog walker. Empty when no struct_ops programs are
+    /// loaded or the prog accessor was unavailable (see
+    /// `FailureDumpReport::prog_runtime_stats_unavailable`).
+    pub fn prog_runtime_stats(&self) -> &'a [ProgRuntimeStats] {
+        &self.report.prog_runtime_stats
+    }
+
+    /// Look up the runtime stats for the program registered with
+    /// `name` (kernel-side `bpf_prog->aux->name`). Returns `None`
+    /// when no program with that name was captured. Returns the
+    /// first match in walker enumeration order if `name` appears
+    /// more than once — struct_ops programs in real captures use
+    /// distinct callback names (`select_cpu`, `enqueue`, etc.) so
+    /// duplicates do not occur in production.
+    pub fn prog_runtime_stats_by_name(&self, name: &str) -> Option<&'a ProgRuntimeStats> {
+        self.report.prog_runtime_stats.iter().find(|p| p.name == name)
+    }
+
+    /// Probe BPF program's per-CPU diagnostic counter snapshot.
+    /// `None` when the probe's `.bss` map isn't enumerated (probe
+    /// not loaded), the program BTF can't be parsed, or the
+    /// array's offset doesn't resolve. A populated
+    /// `trigger_count > 0` is the structural signal that the
+    /// `tp_btf/sched_ext_exit` handler fired during the run.
+    pub fn probe_counters(&self) -> Option<&'a ProbeBssCounters> {
+        self.report.probe_counters.as_ref()
+    }
+
+    // -----------------------------------------------------------------
+    // Companion `*_unavailable` diagnostic accessors. Each accessor
+    // pairs with the walker-backed slice/option accessor above:
+    // when the slice is empty (or the option is None), the matching
+    // `*_unavailable()` returns `Some(reason)` if the walker
+    // recorded one. `None` from the unavailable accessor means
+    // either the walker ran normally (slice populated) or the field
+    // is simply absent from the wire format (no reason recorded).
+    // -----------------------------------------------------------------
+
+    /// Diagnostic reason recorded when [`Self::rq_scx_states`] /
+    /// [`Self::dsq_states`] / [`Self::scx_sched_state`] could not
+    /// be populated. `None` when the walker fully succeeded;
+    /// otherwise `Some(reason)` (e.g. `"scx_root null"`,
+    /// `"no scx walker"`, or a partial-degradation string from the
+    /// dump pipeline).
+    pub fn scx_walker_unavailable(&self) -> Option<&'a str> {
+        self.report.scx_walker_unavailable.as_deref()
+    }
+
+    /// Diagnostic reason recorded when [`Self::task_enrichments`]
+    /// could not be populated. `None` when the walker yielded at
+    /// least one enrichment; otherwise `Some(reason)`
+    /// (e.g. `"no task walker available"`,
+    /// `"task walker yielded zero tasks"`).
+    pub fn task_enrichments_unavailable(&self) -> Option<&'a str> {
+        self.report.task_enrichments_unavailable.as_deref()
+    }
+
+    /// Diagnostic reason recorded when [`Self::prog_runtime_stats`]
+    /// could not be populated. `None` when the walker yielded at
+    /// least one program; otherwise `Some(reason)`
+    /// (e.g. `"prog accessor unavailable"`,
+    /// `"no struct_ops programs loaded"`).
+    pub fn prog_runtime_stats_unavailable(&self) -> Option<&'a str> {
+        self.report.prog_runtime_stats_unavailable.as_deref()
+    }
+
+    /// Diagnostic reason recorded when [`Self::per_node_numa`]
+    /// could not be populated — typically `"no NUMA walker"` until
+    /// the host-side walker lands.
+    pub fn per_node_numa_unavailable(&self) -> Option<&'a str> {
+        self.report.per_node_numa_unavailable.as_deref()
+    }
+
+    /// Diagnostic reason recorded when the SDT allocator snapshot
+    /// (still escape-only via [`Self::report`]) could not be
+    /// populated.
+    pub fn sdt_alloc_unavailable(&self) -> Option<&'a str> {
+        self.report.sdt_alloc_unavailable.as_deref()
+    }
+}
+
+/// True when a map name matches the libbpf-composed
+/// `<obj>.<section>` naming for a global-section map.
+fn is_global_section_map(name: &str) -> bool {
+    name.ends_with(".bss") || name.ends_with(".data") || name.ends_with(".rodata")
+}
+
+// ---------------------------------------------------------------------------
+// SnapshotMap
+// ---------------------------------------------------------------------------
+
+/// One map's view, possibly narrowed to a specific per-CPU slot via
+/// [`Self::cpu`]. Returned by [`Snapshot::map`].
+#[derive(Debug)]
+#[must_use = "SnapshotMap is a borrowed view; chain accessors"]
+#[non_exhaustive]
+pub struct SnapshotMap<'a> {
+    map: &'a FailureDumpMap,
+    /// When `Some(cpu)`, subsequent [`Self::at`] /
+    /// [`Self::find`] calls walk only the per-CPU slot for that
+    /// CPU; `None` walks the natural (non-per-CPU) entry list.
+    cpu: Option<usize>,
+}
+
+impl<'a> SnapshotMap<'a> {
+    /// Map name as captured.
+    pub fn name(&self) -> &'a str {
+        &self.map.name
+    }
+
+    /// Underlying [`FailureDumpMap`].
+    pub fn raw(&self) -> &'a FailureDumpMap {
+        self.map
+    }
+
+    /// Ringbuf occupancy snapshot for `BPF_MAP_TYPE_RINGBUF` /
+    /// `BPF_MAP_TYPE_USER_RINGBUF` maps — capacity, consumer /
+    /// producer / pending positions, and the cumulative
+    /// `pending_bytes` gap. `None` for non-ringbuf maps or when
+    /// the BTF offsets for `bpf_ringbuf_map` / `bpf_ringbuf`
+    /// weren't resolvable at capture time.
+    pub fn ringbuf(&self) -> Option<&'a FailureDumpRingbuf> {
+        self.map.ringbuf.as_ref()
+    }
+
+    /// Mapped-page snapshot for `BPF_MAP_TYPE_ARENA` maps. Borrows
+    /// the per-page `(user_addr, bytes)` records plus the declared
+    /// span / truncation flags. `None` for non-arena maps or when
+    /// the arena walker failed to translate the user_vm window.
+    pub fn arena(&self) -> Option<&'a ArenaSnapshot> {
+        self.map.arena.as_ref()
+    }
+
+    /// Populated-slot summary for FD-array families (`PROG_ARRAY`,
+    /// `PERF_EVENT_ARRAY`, `ARRAY_OF_MAPS`, `SOCKMAP*`, etc.).
+    /// `None` for non-FD-array maps. Surfaces the populated count,
+    /// scanned slot count, populated-index list, and the two
+    /// truncation flags ([`FailureDumpFdArray::truncated`] for the
+    /// scan limit, [`FailureDumpFdArray::indices_truncated`] for the
+    /// index list limit).
+    pub fn fd_array(&self) -> Option<&'a FailureDumpFdArray> {
+        self.map.fd_array.as_ref()
+    }
+
+    /// Per-bucket summary for `BPF_MAP_TYPE_STACK_TRACE` maps.
+    /// `None` for non-STACK_TRACE maps or when the BTF offsets for
+    /// `bpf_stack_map` / `stack_map_bucket` weren't resolvable.
+    pub fn stack_trace(&self) -> Option<&'a FailureDumpStackTrace> {
+        self.map.stack_trace.as_ref()
+    }
+
+    /// Per-map decode-error string set by the freeze coordinator
+    /// when this map's contents are missing or partial. `None` on a
+    /// successful render. Distinct from [`SnapshotError`] (which
+    /// flows through the accessor API) — `map_error` surfaces the
+    /// capture-side diagnostic the kernel-walker recorded before
+    /// the snapshot was handed to test code.
+    pub fn map_error(&self) -> Option<&'a str> {
+        self.map.error.as_deref()
+    }
+
+    /// Narrow this map view to a specific per-CPU slot. On a
+    /// non-per-CPU map this is recorded but ignored when the
+    /// underlying entries are not per-CPU. Use on
+    /// `BPF_MAP_TYPE_PERCPU_ARRAY` / `BPF_MAP_TYPE_PERCPU_HASH` /
+    /// `BPF_MAP_TYPE_LRU_PERCPU_HASH`.
+    pub fn cpu(self, n: usize) -> SnapshotMap<'a> {
+        SnapshotMap {
+            map: self.map,
+            cpu: Some(n),
+        }
+    }
+
+    /// Get an entry by ordinal index.
+    ///
+    /// For HASH-style entry lists, returns the `n`-th
+    /// [`FailureDumpEntry`] in the captured order. For per-CPU
+    /// array maps narrowed via [`Self::cpu`], returns the entry
+    /// at key `n` with its per-CPU slot pre-resolved. For ARRAY
+    /// maps with a single value, `n == 0` returns the value.
+    pub fn at(&self, n: usize) -> SnapshotEntry<'a> {
+        let resolved = self.entry_at(n);
+        match resolved {
+            Ok(e) => e,
+            Err(err) => SnapshotEntry::Missing(err),
+        }
+    }
+
+    /// Find the first entry matching `predicate`. Returns
+    /// [`SnapshotEntry::Missing`] with [`SnapshotError::NoMatch`]
+    /// when no entry matches. The NoMatch payload carries the
+    /// total entry count traversed and a small sample of rendered
+    /// keys so the failure message can tell `empty map` apart from
+    /// `populated map, predicate never matched`.
+    pub fn find(&self, predicate: impl Fn(&SnapshotEntry<'a>) -> bool) -> SnapshotEntry<'a> {
+        let mut len = 0usize;
+        let mut available_keys: Vec<String> = Vec::with_capacity(NO_MATCH_KEY_SAMPLE);
+        for entry in self.iter_entries() {
+            if predicate(&entry) {
+                return entry;
+            }
+            if available_keys.len() < NO_MATCH_KEY_SAMPLE
+                && let Some(k) = render_entry_key(&entry)
+            {
+                available_keys.push(k);
+            }
+            len += 1;
+        }
+        SnapshotEntry::Missing(SnapshotError::NoMatch {
+            map: self.map.name.clone(),
+            op: "find".to_string(),
+            len,
+            available_keys,
+        })
+    }
+
+    /// Collect every entry matching `predicate` into a Vec.
+    pub fn filter(&self, predicate: impl Fn(&SnapshotEntry<'a>) -> bool) -> Vec<SnapshotEntry<'a>> {
+        self.iter_entries().filter(|e| predicate(e)).collect()
+    }
+
+    /// Find the entry whose `key_fn` produces the maximum u64.
+    /// Returns [`SnapshotEntry::Missing`] when the map has no
+    /// entries. The NoMatch payload's `len` is 0 in that case;
+    /// `available_keys` is empty (the map has no keys to sample).
+    pub fn max_by(&self, key_fn: impl Fn(&SnapshotEntry<'a>) -> u64) -> SnapshotEntry<'a> {
+        let mut best: Option<(u64, SnapshotEntry<'a>)> = None;
+        for entry in self.iter_entries() {
+            let k = key_fn(&entry);
+            let beats = best.as_ref().is_none_or(|(prev, _)| k > *prev);
+            if beats {
+                best = Some((k, entry));
+            }
+        }
+        match best {
+            Some((_, e)) => e,
+            None => SnapshotEntry::Missing(SnapshotError::NoMatch {
+                map: self.map.name.clone(),
+                op: "max_by".to_string(),
+                len: 0,
+                available_keys: Vec::new(),
+            }),
+        }
+    }
+
+    /// Iterator over every entry under this view. Used by
+    /// [`Self::find`] / [`Self::filter`] / [`Self::max_by`].
+    fn iter_entries(&self) -> Box<dyn Iterator<Item = SnapshotEntry<'a>> + 'a> {
+        if !self.map.percpu_entries.is_empty() {
+            let cpu = self.cpu;
+            let map = self.map;
+            return Box::new(
+                map.percpu_entries
+                    .iter()
+                    .map(move |e| resolve_percpu_entry(map, e, cpu)),
+            );
+        }
+        if !self.map.percpu_hash_entries.is_empty() {
+            let cpu = self.cpu;
+            let map = self.map;
+            return Box::new(
+                map.percpu_hash_entries
+                    .iter()
+                    .map(move |e| resolve_percpu_hash_entry(map, e, cpu)),
+            );
+        }
+        if !self.map.entries.is_empty() {
+            return Box::new(self.map.entries.iter().map(SnapshotEntry::Hash));
+        }
+        if let Some(v) = self.map.value.as_ref() {
+            return Box::new(std::iter::once(SnapshotEntry::Value(v)));
+        }
+        Box::new(std::iter::empty())
+    }
+
+    /// Internal entry-by-index resolver returning a structured
+    /// error for the surrounding [`Self::at`] arm.
+    fn entry_at(&self, n: usize) -> SnapshotResult<SnapshotEntry<'a>> {
+        if !self.map.percpu_entries.is_empty() {
+            return resolve_percpu_entry_at(self.map, n, self.cpu);
+        }
+        if !self.map.percpu_hash_entries.is_empty() {
+            return resolve_percpu_hash_entry_at(self.map, n, self.cpu);
+        }
+        if !self.map.entries.is_empty() {
+            if n < self.map.entries.len() {
+                return Ok(SnapshotEntry::Hash(&self.map.entries[n]));
+            }
+            return Err(SnapshotError::IndexOutOfRange {
+                map: self.map.name.clone(),
+                index: n,
+                len: self.map.entries.len(),
+            });
+        }
+        if let Some(v) = self.map.value.as_ref() {
+            if n == 0 {
+                return Ok(SnapshotEntry::Value(v));
+            }
+            return Err(SnapshotError::IndexOutOfRange {
+                map: self.map.name.clone(),
+                index: n,
+                len: 1,
+            });
+        }
+        Err(SnapshotError::IndexOutOfRange {
+            map: self.map.name.clone(),
+            index: n,
+            len: 0,
+        })
+    }
+}
+
+fn resolve_percpu_entry_at<'a>(
+    map: &'a FailureDumpMap,
+    n: usize,
+    cpu: Option<usize>,
+) -> SnapshotResult<SnapshotEntry<'a>> {
+    if n >= map.percpu_entries.len() {
+        return Err(SnapshotError::IndexOutOfRange {
+            map: map.name.clone(),
+            index: n,
+            len: map.percpu_entries.len(),
+        });
+    }
+    Ok(resolve_percpu_entry(map, &map.percpu_entries[n], cpu))
+}
+
+fn resolve_percpu_entry<'a>(
+    map: &'a FailureDumpMap,
+    entry: &'a FailureDumpPercpuEntry,
+    cpu: Option<usize>,
+) -> SnapshotEntry<'a> {
+    let Some(c) = cpu else {
+        return SnapshotEntry::Percpu(entry);
+    };
+    if c >= entry.per_cpu.len() {
+        return SnapshotEntry::Missing(SnapshotError::PerCpuSlot {
+            map: map.name.clone(),
+            cpu: c,
+            len: entry.per_cpu.len(),
+            unmapped: false,
+        });
+    }
+    match entry.per_cpu[c].as_ref() {
+        Some(v) => SnapshotEntry::Value(v),
+        None => SnapshotEntry::Missing(SnapshotError::PerCpuSlot {
+            map: map.name.clone(),
+            cpu: c,
+            len: entry.per_cpu.len(),
+            unmapped: true,
+        }),
+    }
+}
+
+fn resolve_percpu_hash_entry_at<'a>(
+    map: &'a FailureDumpMap,
+    n: usize,
+    cpu: Option<usize>,
+) -> SnapshotResult<SnapshotEntry<'a>> {
+    if n >= map.percpu_hash_entries.len() {
+        return Err(SnapshotError::IndexOutOfRange {
+            map: map.name.clone(),
+            index: n,
+            len: map.percpu_hash_entries.len(),
+        });
+    }
+    Ok(resolve_percpu_hash_entry(
+        map,
+        &map.percpu_hash_entries[n],
+        cpu,
+    ))
+}
+
+fn resolve_percpu_hash_entry<'a>(
+    map: &'a FailureDumpMap,
+    entry: &'a FailureDumpPercpuHashEntry,
+    cpu: Option<usize>,
+) -> SnapshotEntry<'a> {
+    let Some(c) = cpu else {
+        return SnapshotEntry::PercpuHash(entry);
+    };
+    if c >= entry.per_cpu.len() {
+        return SnapshotEntry::Missing(SnapshotError::PerCpuSlot {
+            map: map.name.clone(),
+            cpu: c,
+            len: entry.per_cpu.len(),
+            unmapped: false,
+        });
+    }
+    match entry.per_cpu[c].as_ref() {
+        Some(v) => SnapshotEntry::Value(v),
+        None => SnapshotEntry::Missing(SnapshotError::PerCpuSlot {
+            map: map.name.clone(),
+            cpu: c,
+            len: entry.per_cpu.len(),
+            unmapped: true,
+        }),
+    }
+}
+
+/// Render a [`SnapshotEntry`]'s key into a bounded `String` suitable
+/// for the [`SnapshotError::NoMatch::available_keys`] sample.
+///
+/// Returns `None` for [`SnapshotEntry::Value`] (single-value ARRAY
+/// maps have no key surface) and [`SnapshotEntry::Missing`] (no
+/// entry was produced). Hash / per-CPU-hash entries fall back to
+/// the hex-encoded raw key bytes via the `hex:` prefix when BTF
+/// rendering was absent at capture time. The result is truncated
+/// to [`NO_MATCH_KEY_CHAR_CAP`] chars with a trailing `…` to keep
+/// wide struct keys from overrunning failure-message lines.
+pub(super) fn render_entry_key(entry: &SnapshotEntry<'_>) -> Option<String> {
+    let key = match entry {
+        SnapshotEntry::Hash(e) => match e.key.as_ref() {
+            Some(rv) => rv.to_string(),
+            None => format!("{HEX_KEY_PREFIX}{}", e.key_hex),
+        },
+        SnapshotEntry::PercpuHash(e) => match e.key.as_ref() {
+            Some(rv) => rv.to_string(),
+            None => format!("{HEX_KEY_PREFIX}{}", e.key_hex),
+        },
+        SnapshotEntry::Percpu(e) => e.key.to_string(),
+        SnapshotEntry::Value(_) | SnapshotEntry::Missing(_) => return None,
+    };
+    // Bytes-per-char is >= 1 in UTF-8, so byte-length <= char-cap implies
+    // char-length <= char-cap — short-circuit the O(n) chars().count()
+    // walk on the common ASCII case.
+    if key.len() <= NO_MATCH_KEY_CHAR_CAP {
+        return Some(key);
+    }
+    if key.chars().count() > NO_MATCH_KEY_CHAR_CAP {
+        let mut truncated: String = key
+            .chars()
+            .take(NO_MATCH_KEY_CHAR_CAP.saturating_sub(1))
+            .collect();
+        truncated.push('…');
+        Some(truncated)
+    } else {
+        Some(key)
+    }
+}
+
