@@ -120,6 +120,54 @@ fn assert_stats_round_trip(result: &VmResult) -> Result<()> {
          run — the monitor loop never sampled, or summary aggregation \
          failed"
     );
+
+    // series.host() consume-path assertion: the per-sample
+    // per-CPU host snapshot data (FailureDumpReport.per_cpu_time)
+    // must wire through SampleSeries and surface via the
+    // HostView projector. With num_snapshots = 1 the bridge
+    // captures at least one periodic boundary that includes the
+    // per-CPU time stats; HostView.cpus() must therefore report
+    // at least one captured CPU. Catches the regression where
+    // the per_cpu_time slice is unpopulated or the host accessor
+    // dropped the rows.
+    let host_view = series.host().ok_or_else(|| {
+        anyhow::anyhow!(
+            "series.host() returned None despite a periodic capture \
+             having fired — the per-sample per_cpu_time rows did \
+             not wire through SampleSeries"
+        )
+    })?;
+    let captured_cpus = host_view.cpus();
+    anyhow::ensure!(
+        !captured_cpus.is_empty(),
+        "host view reported zero captured CPUs across the 5 s run \
+         — the per_cpu_time pipeline never populated rows, or the \
+         HostView::cpus discovery dropped them"
+    );
+
+    // Closure projector consume-path: exercise
+    // per_cpu_field_u64 against the first captured CPU. With a 5 s
+    // workload holding a cgroup full of busy workers, cpustat_user_ns
+    // must have advanced — at least one sample's Ok-slot value must
+    // be > 0. Catches regressions in the closure-projector loop
+    // body (wrong cpu match, wrong tag/elapsed thread-through,
+    // wrong slot type) that the construction-only assertion above
+    // would miss.
+    let first_cpu = captured_cpus[0];
+    let user_ns_field = host_view.per_cpu_field_u64(first_cpu, "user_ns", |stats| {
+        stats.cpustat_user_ns
+    });
+    let advanced = user_ns_field
+        .values_iter()
+        .filter_map(|slot| slot.as_ref().ok())
+        .any(|v| *v > 0);
+    anyhow::ensure!(
+        advanced,
+        "per_cpu_field_u64 for cpu {first_cpu} cpustat_user_ns \
+         reported 0 on every periodic sample — the workload never \
+         ran in user mode, or the projector dropped the per-sample \
+         field"
+    );
     Ok(())
 }
 

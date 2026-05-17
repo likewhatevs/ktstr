@@ -292,6 +292,17 @@ pub enum SnapshotError {
     /// `FieldNotFound`) so the temporal-assertion site can
     /// branch on the cause without re-walking the source.
     MissingStats { tag: String },
+    /// A [`SampleSeries::host`](crate::scenario::sample::SampleSeries::host)
+    /// projection ran on a sample whose `per_cpu_time` slice did
+    /// not include `cpu` — placeholder report (freeze rendezvous
+    /// timed out), or a kernel that didn't surface per-CPU
+    /// `kernel_stat`/`tick_cpu_sched`/`kernel_cpustat` resolution
+    /// for the requested CPU. Distinguishes a per-sample host-data
+    /// coverage gap from a kernel-walker failure (`Unavailable` on
+    /// the broader Snapshot accessor) so the temporal-assertion
+    /// site can decide whether to fail strict or skip with a
+    /// rendered Note.
+    HostFieldUnavailable { tag: String, cpu: u32 },
 }
 
 impl std::fmt::Display for SnapshotError {
@@ -452,6 +463,13 @@ impl std::fmt::Display for SnapshotError {
                 write!(
                     f,
                     "sample '{tag}': stats absent (relay error or no scheduler)"
+                )
+            }
+            SnapshotError::HostFieldUnavailable { tag, cpu } => {
+                write!(
+                    f,
+                    "sample '{tag}': per_cpu_time has no entry for cpu {cpu} \
+                     (placeholder report or kernel-walker resolution failure)"
                 )
             }
         }
