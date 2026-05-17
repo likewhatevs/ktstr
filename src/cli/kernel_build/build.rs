@@ -1800,7 +1800,7 @@ mod tests {
             .path()
             .join(crate::flock::LOCK_DIR_NAME)
             .join(format!("source-{path_hash}.lock"));
-        let needle = crate::flock::needle_from_path(&lock_path)
+        let needle = crate::flock::mountinfo::needle_from_path(&lock_path)
             .expect("needle_from_path must resolve the lockfile inode");
 
         // Spawn a worker that issues the second acquire. The worker's
