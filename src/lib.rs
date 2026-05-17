@@ -707,8 +707,8 @@ pub mod prelude {
     pub use crate::ktstr_test;
     pub use crate::scenario::backdrop::Backdrop;
     pub use crate::scenario::ops::{
-        CgroupDef, CpusetSpec, HoldSpec, Op, Setup, Step, execute_defs, execute_scenario,
-        execute_scenario_with, execute_steps, execute_steps_with,
+        CgroupDef, CpusetSpec, HoldSpec, KernelTarget, KernelValue, Op, Setup, Step, execute_defs,
+        execute_scenario, execute_scenario_with, execute_steps, execute_steps_with,
     };
     pub use crate::scenario::payload_run::{PayloadHandle, PayloadRun};
     pub use crate::scenario::scenarios;

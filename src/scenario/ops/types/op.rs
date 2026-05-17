@@ -569,3 +569,160 @@ impl CpusetSpec {
         CpusetSpec::Numa(index)
     }
 }
+
+/// Host-side write/read target for the upcoming kernel-memory ops
+/// (the `Op::WriteKernel*` / `Op::ReadKernel*` variants land in a
+/// follow-up sub-batch and consume this type).
+///
+/// Each variant names a kernel address by the resolution path the
+/// host coordinator will take when the op fires; the actual
+/// `GuestKernel` write helpers consume the resolved KVA. The variant
+/// chosen here picks WHICH translation path (KASLR-aware kernel-image
+/// base for [`Self::Symbol`], `PAGE_OFFSET` for [`Self::Direct`],
+/// page-table walk for [`Self::Kva`], or per-CPU dereference for
+/// [`Self::PerCpuField`]).
+///
+/// # `#[non_exhaustive]`
+///
+/// `KernelTarget` is `#[non_exhaustive]` — see
+/// [`crate::non_exhaustive`] for the cross-crate pattern-match rule.
+/// Prefer the per-variant constructors ([`Self::symbol`],
+/// [`Self::direct`], [`Self::kva`], [`Self::per_cpu_field`]) over
+/// naming variant literals.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KernelTarget {
+    /// Kernel text/data/bss symbol. The host resolves
+    /// `name → KVA → PA` via the runtime kernel image base + KASLR
+    /// `phys_base`, exactly as
+    /// [`crate::monitor::guest::GuestKernel::write_symbol_u64`]
+    /// already does for the existing write-symbol helper.
+    Symbol(Cow<'static, str>),
+    /// Direct-mapped kernel virtual address — translated via
+    /// `kva - PAGE_OFFSET`. Use this when the caller has already
+    /// resolved a SLAB / per-CPU / physmem KVA and just wants the
+    /// host to write at that address.
+    Direct(u64),
+    /// Vmalloc'd / vmap'd kernel virtual address — translated via
+    /// page-table walk through the guest's `CR3`. Use this for BPF
+    /// maps, vmalloc'd memory, and any other address that does NOT
+    /// live in the direct map.
+    Kva(u64),
+    /// Per-CPU field of a kernel struct, resolved lazily at op
+    /// dispatch time. The variant carries the symbolic intent only
+    /// (`symbol`, `field`, `cpu`); the resolver — landing with the
+    /// upcoming op handler — will look up `symbol` in the vmlinux
+    /// symbol table, add `__per_cpu_offset[cpu]`, and add the
+    /// BTF-resolved byte offset of `field` within `symbol`'s struct
+    /// type to yield the per-CPU field's runtime KVA.
+    ///
+    /// Lazy resolution keeps the construction surface pure-data
+    /// (the test author needs no `GuestKernel`/BTF/symbol-table
+    /// handle to construct the variant); resolution failures will
+    /// surface as op-execution errors at the same layer as
+    /// missing-symbol failures in other snapshot ops.
+    PerCpuField {
+        /// Kernel symbol naming the per-CPU template
+        /// (e.g. `"runqueues"`).
+        symbol: Cow<'static, str>,
+        /// Field name within the symbol's struct
+        /// (e.g. `"clock"` for `struct rq.clock`).
+        field: Cow<'static, str>,
+        /// CPU index whose per-CPU instance to address.
+        cpu: u32,
+    },
+}
+
+impl KernelTarget {
+    /// Kernel text/data/bss symbol target. Resolves at op-dispatch
+    /// time via the runtime kernel image base + KASLR `phys_base`.
+    pub fn symbol(name: impl Into<Cow<'static, str>>) -> Self {
+        KernelTarget::Symbol(name.into())
+    }
+
+    /// Direct-mapped KVA target. Translates via `kva - PAGE_OFFSET`.
+    /// For per-CPU bases the caller must add
+    /// `__per_cpu_offset[cpu]` to the base symbol KVA before
+    /// constructing the variant; use [`Self::per_cpu_field`]
+    /// instead for the framework-resolved per-CPU shape.
+    pub const fn direct(kva: u64) -> Self {
+        KernelTarget::Direct(kva)
+    }
+
+    /// Vmalloc'd / vmap'd KVA target. Translates via page-table
+    /// walk through the guest's `CR3`.
+    pub const fn kva(kva: u64) -> Self {
+        KernelTarget::Kva(kva)
+    }
+
+    /// Per-CPU field of a kernel struct. Resolves at op-dispatch
+    /// time via `symbol_kva + __per_cpu_offset[cpu] + BTF byte
+    /// offset of field`.
+    pub fn per_cpu_field(
+        symbol: impl Into<Cow<'static, str>>,
+        field: impl Into<Cow<'static, str>>,
+        cpu: u32,
+    ) -> Self {
+        KernelTarget::PerCpuField {
+            symbol: symbol.into(),
+            field: field.into(),
+            cpu,
+        }
+    }
+}
+
+/// Value payload for the kernel-memory write ops, and the result
+/// shape for the read ops.
+///
+/// The variant tag picks both the width (`u32` vs `u64` vs a byte
+/// slice) and the underlying [`crate::monitor::guest::GuestKernel`]
+/// write helper the host coordinator will invoke (`write_*_u32`,
+/// `write_*_u64`, `write_*_bytes` per the [`KernelTarget`] class).
+///
+/// # `#[non_exhaustive]`
+///
+/// `KernelValue` is `#[non_exhaustive]` so new value widths can be
+/// added without breaking external pattern-matchers. Prefer the
+/// per-variant constructors over naming variant literals.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KernelValue {
+    /// 32-bit unsigned little-endian write. Atomic when the
+    /// resolved host PA is 4-byte aligned. Misaligned PAs fall
+    /// through to a per-byte volatile loop in
+    /// [`super::super::super::monitor::reader::GuestMem`]
+    /// `write_volatile_bytes` (the 4-byte fast path branches on
+    /// `ptr.align_offset(align_of::<u32>()) == 0` and only emits
+    /// a single `write_volatile` when alignment holds); torn
+    /// intermediate state is observable to concurrent guest readers
+    /// in the fallback case.
+    U32(u32),
+    /// 64-bit unsigned little-endian write. Atomic when the
+    /// resolved host PA is 8-byte aligned. See the alignment note
+    /// on [`Self::U32`] for the misaligned fall-through behaviour.
+    U64(u64),
+    /// Variable-length byte payload. Written non-atomically; the
+    /// `GuestKernel::write_*_bytes` helpers emit a Release fence
+    /// after the copy so a weakly-ordered guest's
+    /// `smp_load_acquire` observes the bytes in write order — the
+    /// fence orders the stores but does NOT atomicize the
+    /// multi-byte write versus a concurrent guest reader.
+    Bytes(Vec<u8>),
+}
+
+impl KernelValue {
+    /// 32-bit unsigned value.
+    pub const fn u32(val: u32) -> Self {
+        KernelValue::U32(val)
+    }
+
+    /// 64-bit unsigned value.
+    pub const fn u64(val: u64) -> Self {
+        KernelValue::U64(val)
+    }
+
+    /// Variable-length byte payload.
+    pub fn bytes(data: impl Into<Vec<u8>>) -> Self {
+        KernelValue::Bytes(data.into())
+    }
+}
