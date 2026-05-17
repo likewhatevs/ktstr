@@ -1132,6 +1132,50 @@ impl<'a> Snapshot<'a> {
     }
 
     /// Underlying [`FailureDumpReport`] borrowed back to the caller.
+    ///
+    /// **Escape hatch.** Most consumers should reach for the typed
+    /// accessors on [`Snapshot`] / [`SnapshotMap`] / [`SnapshotEntry`]
+    /// / [`SnapshotField`], which route through [`SnapshotError`] and
+    /// compose with the [`crate::assert::temporal`] patterns via
+    /// [`SeriesField`](crate::assert::temporal::SeriesField). Use
+    /// `report()` only when a [`FailureDumpReport`] field has no
+    /// typed accessor yet:
+    ///
+    /// - `dsq_states`, `rq_scx_states`, `scx_sched_state` —
+    ///   per-DSQ depth, per-CPU rq->scx state, scheduler global
+    ///   state.
+    /// - `event_counter_timeline` — periodic SCX event counter
+    ///   samples ([`EventCounterSample`](crate::monitor::dump::EventCounterSample)).
+    /// - `per_cpu_time`, `per_node_numa` — per-CPU
+    ///   cpustat/schedstat and per-node NUMA event counters
+    ///   ([`PerCpuTimeStats`](crate::monitor::dump::PerCpuTimeStats),
+    ///   [`PerNodeNumaStats`](crate::monitor::dump::PerNodeNumaStats)).
+    /// - `task_enrichments`, `prog_runtime_stats`, `probe_counters`
+    ///   — task-level enrichment, BPF prog runtime stats,
+    ///   per-probe counters.
+    /// - On [`FailureDumpMap`]: `ringbuf`, `arena`, `fd_array`,
+    ///   `stack_trace`, `error` — non-key/value map shapes whose
+    ///   typed [`SnapshotMap`] accessors are not yet implemented.
+    ///
+    /// **Caveats of the bypass:**
+    /// - No [`SnapshotError`] routing — call-site is on its own to
+    ///   handle missing fields / type mismatches / per-CPU
+    ///   narrowing.
+    /// - No [`SeriesField`](crate::assert::temporal::SeriesField)
+    ///   integration — temporal patterns
+    ///   ([`nondecreasing`](crate::assert::temporal::SeriesField::nondecreasing),
+    ///   [`rate_within`](crate::assert::temporal::SeriesField::rate_within),
+    ///   etc.) cannot consume raw `FailureDumpReport` field values.
+    /// - No placeholder-sample short-circuit
+    ///   ([`Self::is_placeholder`] check is the caller's
+    ///   responsibility).
+    ///
+    /// First-class typed accessors for the listed fields are tracked
+    /// as a separate work item ("extend Snapshot / SampleSeries
+    /// projection API for full first-class coverage"); when those
+    /// land this method's docstring should narrow to whatever
+    /// remains unwrapped — and ideally `report()` becomes redundant
+    /// for production tests.
     pub fn report(&self) -> &'a FailureDumpReport {
         self.report
     }
@@ -4072,5 +4116,31 @@ mod tests {
             let back: SnapshotError = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(case, back, "round-trip mismatch for {case:?}");
         }
+    }
+
+    /// Contract pin for the documented escape-hatch role of
+    /// `Snapshot::report()`. The docstring blesses
+    /// `snap.report().<field>` as the official bypass for
+    /// FailureDumpReport fields without typed accessors. A
+    /// regression that removed `pub fn report()` would silently
+    /// break the documented promise without breaking any other
+    /// test in the tree (per-field bypass consumers are not yet
+    /// landed at the doc time). This test makes the contract
+    /// compile-and-test enforced: the method must remain pub, must
+    /// pass through the underlying `FailureDumpReport` unchanged.
+    #[test]
+    fn snapshot_report_escape_hatch_passes_through_underlying_report() {
+        let report = FailureDumpReport {
+            schema: "escape-hatch-contract-pin".to_string(),
+            ..Default::default()
+        };
+        let snap = Snapshot::new(&report);
+        assert_eq!(
+            snap.report().schema,
+            "escape-hatch-contract-pin",
+            "Snapshot::report() must hand back the underlying \
+             FailureDumpReport unchanged — this is the documented \
+             escape-hatch contract",
+        );
     }
 }
