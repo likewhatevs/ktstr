@@ -436,8 +436,8 @@ fn evaluate(
 /// (virtio-console port 1) under
 /// [`MSG_TYPE_PAYLOAD_METRICS`](crate::vmm::wire::MSG_TYPE_PAYLOAD_METRICS).
 ///
-/// The encoding (bincode v2 with `bincode::config::standard()`) and
-/// the bulk-port fire-and-forget semantics live inside
+/// The encoding (postcard v1) and the bulk-port fire-and-forget
+/// semantics live inside
 /// [`crate::vmm::guest_comms::send_payload_metrics`]; this thin
 /// wrapper exists only so the call site reads as the post-extraction
 /// emit step rather than reaching across modules. Backpressure is
@@ -451,7 +451,7 @@ fn emit_payload_metrics(pm: &PayloadMetrics) {
 /// channel (virtio-console port 1) under
 /// [`MSG_TYPE_RAW_PAYLOAD_OUTPUT`](crate::vmm::wire::MSG_TYPE_RAW_PAYLOAD_OUTPUT).
 ///
-/// Mirrors [`emit_payload_metrics`]'s shape — bincode encoding and
+/// Mirrors [`emit_payload_metrics`]'s shape — postcard encoding and
 /// backpressure live inside the typed sender.
 fn emit_raw_payload_output(raw: &crate::test_support::RawPayloadOutput) {
     crate::vmm::guest_comms::send_raw_payload_output(raw);

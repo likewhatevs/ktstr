@@ -433,7 +433,7 @@ pub struct WorkerReport {
     pub vmstat_numa_pages_migrated: u64,
     /// Diagnostic attached only to sentinel reports — populated when
     /// `stop_and_collect` synthesized the entry because no (or
-    /// unparseable) bincode payload came back on the report pipe.
+    /// unparseable) postcard payload came back on the report pipe.
     /// `None` on every real worker-produced report. Lets operators
     /// distinguish the four failure shapes that all collapse to
     /// "empty pipe + no report":
@@ -455,7 +455,7 @@ pub struct WorkerReport {
     ///   was reaped by an external signal handler, a double-reap
     ///   regression, or the pid was recycled.
     ///
-    /// No `skip_serializing_if`: bincode is a positional, schemaless
+    /// No `skip_serializing_if`: postcard is a positional, schemaless
     /// format — every Serialize call must emit every field in the
     /// same order or the decoder reads the next field's bytes off
     /// the wire (silent data corruption). The Option<…> tag itself
@@ -519,7 +519,7 @@ pub struct WorkerReport {
     /// its default `None` — a worker that died before
     /// `worker_main` ran has no affinity-error observation.
     ///
-    /// No `skip_serializing_if`: bincode is positional and
+    /// No `skip_serializing_if`: postcard is positional and
     /// schemaless, so every Serialize call must emit every field
     /// in the same order — skipping a field shifts the decoder
     /// onto the next field's bytes (silent corruption). The
@@ -530,7 +530,7 @@ pub struct WorkerReport {
 
 /// Reason a sentinel [`WorkerReport`] was synthesized — attached to
 /// the report's `exit_info` field so operators can triage a missing
-/// or undecodable bincode payload without cross-referencing
+/// or undecodable postcard payload without cross-referencing
 /// parent-side logs.
 ///
 /// Invariant: every variant carries the `waitpid`-derived status for
@@ -552,7 +552,7 @@ pub enum WorkerExitInfo {
     /// worker-child closure and `_exit(1)` fired, or the 30s
     /// parent-ready poll timed out. Zero means the worker ran to
     /// completion but failed to write / serialize the report — a
-    /// bincode encode or pipe-write failure that didn't panic.
+    /// postcard encode or pipe-write failure that didn't panic.
     Exited(i32),
     /// `WIFSIGNALED=true` with the given signal number. Under
     /// `panic = "abort"` a worker panic raises SIGABRT (signal 6);
@@ -826,7 +826,7 @@ impl Drop for ThreadWorker {
 /// Two variants:
 ///
 /// - [`ForkedChildKind::Worker`]: the conventional fork-mode worker
-///   (one process per worker, single bincode `WorkerReport`).
+///   (one process per worker, single postcard `WorkerReport`).
 ///   Carries the worker's `group_idx` so a sentinel report on a
 ///   missing payload can be tagged correctly.
 /// - [`ForkedChildKind::PcommContainer`]: a single thread-group
@@ -839,14 +839,14 @@ impl Drop for ThreadWorker {
 ///   `Vec<WorkerReport>` (one entry per worker thread; per-thread
 ///   `group_idx` lives inside each `WorkerReport`).
 ///
-/// Note the per-variant wire-format split: `Worker` uses bincode and
+/// Note the per-variant wire-format split: `Worker` uses postcard and
 /// `PcommContainer` uses serde_json. The encodings are dispatched by
 /// `ForkedChildKind` at decode time on the parent.
 #[derive(Clone, Debug)]
 pub(super) enum ForkedChildKind {
     /// Conventional fork-mode worker (one process per worker).
     /// Report wire format: bare `b'r'` ready byte followed by a
-    /// `bincode::serde::encode_to_vec(&WorkerReport, …)` document.
+    /// `postcard::to_stdvec(&WorkerReport)` document.
     Worker { group_idx: usize },
     /// pcomm thread-group leader hosting worker threads across one
     /// or more logical groups. `groups` records the per-group
@@ -878,7 +878,7 @@ pub(super) struct ForkedChild {
     /// the container is the thread-group leader of its inner threads).
     pub pid: libc::pid_t,
     /// Parent-side read end of the report pipe. The child writes one
-    /// `b'r'` ready byte followed by either a bincode-encoded single
+    /// `b'r'` ready byte followed by either a postcard-encoded single
     /// `WorkerReport` (Worker) or a `serde_json` `Vec<WorkerReport>`
     /// (PcommContainer) per the [`ForkedChildKind`] tag.
     pub report_fd: std::os::unix::io::RawFd,
@@ -913,7 +913,7 @@ pub struct WorkloadHandle {
     /// Forked-child processes owned by this handle. Each entry is a
     /// [`ForkedChild`] carrying pid, parent-side pipe fds, and a
     /// [`ForkedChildKind`] tag that drives report decoding (single
-    /// bincode `WorkerReport` for `Worker`; `serde_json`
+    /// postcard `WorkerReport` for `Worker`; `serde_json`
     /// `Vec<WorkerReport>` for `PcommContainer`). Empty when every
     /// group used [`CloneMode::Thread`] without `pcomm`.
     children: Vec<ForkedChild>,
@@ -2611,7 +2611,7 @@ pub(super) fn spawn_pcomm_container(
             // Encode and write the report stream as a single
             // `Vec<WorkerReport>` JSON document via `serde_json`.
             // serde_json for pcomm Vec<WorkerReport>
-            // design ruling; fork-mode workers use bincode for
+            // design ruling; fork-mode workers use postcard for
             // single WorkerReport. The pcomm container is a
             // fork-mode child and its payload sits on the same
             // per-child pipe used by every other forked worker.
@@ -3544,7 +3544,7 @@ impl WorkloadHandle {
             // smaller fields) finishes `write_all` without blocking
             // for the parent to drain. The default pipe capacity on
             // Linux is 16 pages (64 KiB on 4 KiB pages, 256 KiB on
-            // 16 KiB pages); a bincode-encoded `WorkerReport` with
+            // 16 KiB pages); a postcard-encoded `WorkerReport` with
             // both reservoirs full is at most ~1.8 MiB (u64 varint
             // is up to 9 bytes per entry, 200_000 entries total).
             // Without this grow, the worker blocks inside
@@ -4010,7 +4010,7 @@ impl WorkloadHandle {
                     //    against (a) additional Drops on this
                     //    frame's stack (e.g. future refactors that
                     //    add more RAII) and (b) alloc/OOM panics
-                    //    during worker_main / bincode encode.
+                    //    during worker_main / postcard encode.
                     //
                     //    Caveat: catch_unwind is a no-op under
                     //    `panic = "abort"`, which ktstr's Cargo.toml
@@ -4134,7 +4134,7 @@ impl WorkloadHandle {
                             //
                             // The byte is `b'r'`. The parent's collect path
                             // strips a leading `b'r'` before
-                            // `bincode::serde::decode_from_slice` so the
+                            // `postcard::from_bytes` so the
                             // explicit-start call site (which skips the
                             // barrier) still parses correctly. A zero return or short write
                             // is treated as best-effort: if the kernel
@@ -4175,9 +4175,7 @@ impl WorkloadHandle {
                                 &STOP,
                                 group.group_idx,
                             );
-                            let bytes =
-                                bincode::serde::encode_to_vec(&report, bincode::config::standard())
-                                    .unwrap_or_default();
+                            let bytes = postcard::to_stdvec(&report).unwrap_or_default();
                             let mut f = unsafe { std::fs::File::from_raw_fd(report_fds[1]) };
                             if let Err(e) = f.write_all(&bytes) {
                                 // tracing is unsafe in a post-fork child
@@ -4536,7 +4534,7 @@ impl WorkloadHandle {
     /// # Exit-shape invariance
     ///
     /// Collection discriminates purely on the presence and validity of
-    /// the worker's pipe-delivered bincode payload — **not** on
+    /// the worker's pipe-delivered postcard payload — **not** on
     /// `waitpid` exit status. Under `panic = "unwind"` (dev/test
     /// profile) the worker's
     /// `catch_unwind` arm calls `_exit(1)` so the parent sees
@@ -4545,7 +4543,7 @@ impl WorkloadHandle {
     /// sees `WIFEXITED=false`, `WTERMSIG=6`. Either way, a panicking
     /// worker never finishes `f.write_all(&bytes)` on the report pipe,
     /// so `poll` + `read_to_end` hands back an empty (or truncated)
-    /// buffer, `bincode::serde::decode_from_slice` fails, and the
+    /// buffer, `postcard::from_bytes` fails, and the
     /// sentinel path fires. Partial writes from a panic between successful
     /// `write_all` and `_exit(0)` are not reachable — the write is the
     /// last non-trivial statement inside the catch_unwind closure.
@@ -4676,7 +4674,7 @@ impl WorkloadHandle {
                             // ownership of the fd — the collect
                             // path below still owns it via the
                             // `children` Vec and will read the
-                            // bincode tail on its own deadline.
+                            // postcard tail on its own deadline.
                             let mut byte: u8 = 0;
                             // SAFETY: `&mut byte` is a valid
                             // 1-byte buffer; `fd` is the report
@@ -4839,12 +4837,11 @@ impl WorkloadHandle {
                 &buf[..]
             };
 
-            // Per-kind decoding. `Worker` carries a single bincode
-            // `WorkerReport` (`bincode::config::standard()`,
-            // little-endian, variable int). `PcommContainer` carries
+            // Per-kind decoding. `Worker` carries a single postcard
+            // `WorkerReport`. `PcommContainer` carries
             // a `serde_json` `Vec<WorkerReport>` — serde_json for
             // pcomm per task #6 design ruling; fork-mode workers
-            // use bincode for single WorkerReport. Both
+            // use postcard for single WorkerReport. Both
             // payloads ride the EOF-terminated pipe with no length
             // prefix; the parent's `read_to_end` provides framing.
             // On a decode failure, emit one sentinel per expected
@@ -4852,12 +4849,9 @@ impl WorkloadHandle {
             // assert_not_starved) see the correct cardinality.
             match child.kind {
                 ForkedChildKind::Worker { group_idx } => {
-                    let decoded: Result<(WorkerReport, usize), _> =
-                        bincode::serde::decode_from_slice(
-                            report_slice,
-                            bincode::config::standard(),
-                        );
-                    if let Ok((report, _)) = decoded {
+                    let decoded: Result<WorkerReport, _> =
+                        postcard::from_bytes(report_slice);
+                    if let Ok(report) = decoded {
                         reports.push(report);
                     } else {
                         let exit_info = classify_wait_outcome(exit_info_source);

@@ -81,7 +81,7 @@ pub enum MsgType {
     ScenarioResume,
     /// Guest exit code (payload: 4-byte LE i32).
     Exit,
-    /// Test result (payload: bincode-encoded `AssertResult`).
+    /// Test result (payload: postcard-encoded `AssertResult`).
     TestResult,
     /// Scheduler process exit (payload: 4-byte LE i32 exit code).
     SchedExit,
@@ -92,11 +92,11 @@ pub enum MsgType {
     /// and blocking inside a fault handler would deadlock the
     /// guest before the diagnostic reached the host.
     Crash,
-    /// Per-payload-invocation metrics (payload: bincode-encoded
+    /// Per-payload-invocation metrics (payload: postcard-encoded
     /// `PayloadMetrics`).
     PayloadMetrics,
     /// Raw stdout/stderr captured from an LlmExtract payload (payload:
-    /// bincode-encoded `RawPayloadOutput`).
+    /// postcard-encoded `RawPayloadOutput`).
     RawPayloadOutput,
     /// Coverage profraw blob.
     Profraw,
@@ -339,7 +339,7 @@ pub const MSG_TYPE_SCENARIO_END: u32 = 0x5343_454E; // "SCEN"
 /// Guest exit code (payload: 4-byte i32).
 pub const MSG_TYPE_EXIT: u32 = 0x4558_4954; // "EXIT"
 
-/// Test result (payload: bincode-encoded AssertResult).
+/// Test result (payload: postcard-encoded AssertResult).
 pub const MSG_TYPE_TEST_RESULT: u32 = 0x5445_5354; // "TEST"
 
 /// Scheduler process exit (payload: 4-byte i32 exit code).
@@ -349,11 +349,11 @@ pub const MSG_TYPE_SCHED_EXIT: u32 = 0x5343_4458; // "SCDX"
 pub const MSG_TYPE_CRASH: u32 = 0x4352_5348; // "CRSH"
 
 /// Per-payload-invocation metrics
-/// (payload: bincode-encoded `crate::test_support::PayloadMetrics`).
+/// (payload: postcard-encoded `crate::test_support::PayloadMetrics`).
 pub const MSG_TYPE_PAYLOAD_METRICS: u32 = 0x504d_4554; // "PMET"
 
 /// Raw stdout/stderr captured from an LlmExtract payload
-/// (payload: bincode-encoded `crate::test_support::RawPayloadOutput`).
+/// (payload: postcard-encoded `crate::test_support::RawPayloadOutput`).
 pub const MSG_TYPE_RAW_PAYLOAD_OUTPUT: u32 = 0x5241_574f; // "RAWO"
 
 /// Coverage profraw blob (payload: raw `.profraw` bytes from

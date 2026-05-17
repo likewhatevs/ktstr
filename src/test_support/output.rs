@@ -4,10 +4,10 @@
 //! streams that the host must parse before it can judge pass/fail or
 //! surface useful diagnostics:
 //!
-//! - **AssertResult bincode** on the bulk data channel under
+//! - **AssertResult postcard** on the bulk data channel under
 //!   `MSG_TYPE_TEST_RESULT`. See [`print_assert_result`] (guest
 //!   emit) and [`parse_assert_result_from_drain`] (host parse).
-//!   The wire format is bincode v2 with `bincode::config::standard()`
+//!   The wire format is postcard v1
 //!   so guest and host stay in lock-step on the encoding choice.
 //! - **Scheduler log** in `MSG_TYPE_SCHED_LOG` chunks on the bulk
 //!   data channel. The chunks carry the
@@ -44,10 +44,10 @@ use crate::verifier::parse_sched_output;
 use crate::vmm;
 
 /// Emit AssertResult to the host over the bulk data channel
-/// (`MSG_TYPE_TEST_RESULT`) using bincode v2 with
-/// `bincode::config::standard()`. The encoding choice is paired
-/// with the host's [`parse_assert_result_from_drain`] decoder so
-/// layout never diverges.
+/// (`MSG_TYPE_TEST_RESULT`) using postcard v1. The encoding
+/// choice is paired with the host's
+/// [`parse_assert_result_from_drain`] decoder so layout never
+/// diverges.
 ///
 /// Pre-1.0: the legacy COM2 `RESULT_START` / `RESULT_END` JSON
 /// fallback is gone — bulk port is the only transport.
@@ -70,11 +70,8 @@ pub(crate) fn parse_assert_result_from_drain(
         .rev()
         .find(|e| e.msg_type == vmm::wire::MSG_TYPE_TEST_RESULT && e.crc_ok)
         .ok_or_else(|| anyhow::anyhow!("no test result in guest messages"))?;
-    let (result, _) = bincode::serde::decode_from_slice::<AssertResult, _>(
-        &entry.payload,
-        bincode::config::standard(),
-    )
-    .context("decode AssertResult bincode payload from drain")?;
+    let result = postcard::from_bytes::<AssertResult>(&entry.payload)
+        .context("decode AssertResult postcard payload from drain")?;
     Ok(result)
 }
 
@@ -351,7 +348,7 @@ pub(crate) fn extract_panic_message(output: &str) -> Option<&str> {
         .find_map(|l| l.strip_prefix("PANIC:").map(str::trim_start))
 }
 
-// Pre-bincode-migration the guest emitted COM2 sentinel strings
+// Pre-bulk-port-migration the guest emitted COM2 sentinel strings
 // (`KTSTR_INIT_STARTED`, `KTSTR_PAYLOAD_STARTING`,
 // `KTSTR_EXIT=<code>`, `KTSTR_EXEC_EXIT=<code>`, `SCHEDULER_DIED`,
 // `SCHEDULER_NOT_ATTACHED: <reason>`) that the host scraped to
@@ -397,7 +394,7 @@ pub(crate) const STAGE_PAYLOAD_STARTED_NO_RESULT: &str =
 /// Classify the failure stage based on which `MSG_TYPE_LIFECYCLE`
 /// phase events appear in the bulk-port drain.
 ///
-/// Pre-bincode-migration: read `KTSTR_INIT_STARTED` /
+/// Pre-bulk-port-migration: read `KTSTR_INIT_STARTED` /
 /// `KTSTR_PAYLOAD_STARTING` substrings from COM2 output. Now the
 /// guest emits each phase as a typed
 /// [`crate::vmm::wire::LifecyclePhase`] frame; the classifier walks
@@ -633,10 +630,9 @@ mod tests {
 
     // -- parse_assert_result_from_drain --
 
-    /// A bincode-encoded `MSG_TYPE_TEST_RESULT` entry decodes back to
+    /// A postcard-encoded `MSG_TYPE_TEST_RESULT` entry decodes back to
     /// the same `AssertResult`. Pin the round-trip so a future
-    /// encoding tweak (e.g. config swap to legacy()) trips this test
-    /// before reaching the real wire.
+    /// encoding tweak trips this test before reaching the real wire.
     #[test]
     fn parse_assert_result_from_drain_round_trips() {
         let original = build_assert_result(true, vec![]);
@@ -681,7 +677,7 @@ mod tests {
 
     /// CRC-bad MSG_TYPE_TEST_RESULT entry is ignored; the helper
     /// returns "no test result" rather than feeding a corrupt
-    /// payload into the bincode decoder.
+    /// payload into the postcard decoder.
     #[test]
     fn parse_assert_result_from_drain_skips_crc_bad_entries() {
         let drain = BulkDrainResult {
@@ -710,8 +706,8 @@ mod tests {
         assert!(r.passed, "latest entry must win");
     }
 
-    /// Malformed bincode payload (right msg_type, right CRC, wrong
-    /// bytes) surfaces the bincode decode error rather than silently
+    /// Malformed postcard payload (right msg_type, right CRC, wrong
+    /// bytes) surfaces the postcard decode error rather than silently
     /// returning a default `AssertResult`.
     #[test]
     fn parse_assert_result_from_drain_rejects_garbage_payload() {
@@ -1692,7 +1688,7 @@ ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
 
     // -- Verdict API integration coverage -------------------------------
     //
-    // The host-side runner decodes the guest's bincode-encoded
+    // The host-side runner decodes the guest's postcard-encoded
     // AssertResult via `parse_assert_result_from_drain`, then a
     // scenario's verifier folds that result into a Verdict via
     // `Verdict::merge`. This integration shape is the single most
@@ -1700,7 +1696,7 @@ ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
     // pin it here so a regression that broke either the decode OR the
     // merge surface trips at the seam.
 
-    /// Round-trip: failing AssertResult through bincode TLV →
+    /// Round-trip: failing AssertResult through postcard TLV →
     /// `parse_assert_result_from_drain`, then merge into a Verdict
     /// that records a pointwise claim from the host side. The
     /// combined result must fail (the parsed AssertResult was

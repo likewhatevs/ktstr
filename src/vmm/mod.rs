@@ -1334,7 +1334,7 @@ impl KtstrVm {
             if !app_output.is_empty() {
                 use std::io::Write;
                 let mut stdout = std::io::stdout().lock();
-                // Pre-bincode-migration the guest emitted a
+                // Pre-bulk-port-migration the guest emitted a
                 // `KTSTR_EXEC_EXIT=N` sentinel line on COM2 that
                 // needed filtering out of this stdout copy. The
                 // exec exit is now a typed `MSG_TYPE_EXEC_EXIT`
@@ -1963,7 +1963,7 @@ mod tests {
         // SchedulerDied / SchedulerNotAttached lifecycle frames are
         // written by start_scheduler in rust_init on attach failure
         // or scheduler exit (now via `send_lifecycle` on the bulk
-        // data port — pre-bincode-migration these were COM2
+        // data port — pre-bulk-port-migration these were COM2
         // sentinel strings). "sched_ext: disabled" is the kernel's
         // own disable message when scx tears down a scheduler (e.g.
         // on watchdog stall). Any of these appearing proves the

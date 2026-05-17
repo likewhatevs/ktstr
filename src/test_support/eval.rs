@@ -1627,13 +1627,10 @@ fn run_ktstr_test_inner_impl(
                 }
                 Some(crate::vmm::wire::MsgType::PayloadMetrics) => {
                     if bulk_entry.crc_ok {
-                        match bincode::serde::decode_from_slice::<
-                            crate::test_support::PayloadMetrics,
-                            _,
-                        >(
-                            &bulk_entry.payload, bincode::config::standard()
+                        match postcard::from_bytes::<crate::test_support::PayloadMetrics>(
+                            &bulk_entry.payload,
                         ) {
-                            Ok((pm, _)) => payload_metrics.push(pm),
+                            Ok(pm) => payload_metrics.push(pm),
                             Err(e) => {
                                 eprintln!("ktstr_test: decode payload metrics from bulk port: {e}")
                             }
@@ -1642,13 +1639,10 @@ fn run_ktstr_test_inner_impl(
                 }
                 Some(crate::vmm::wire::MsgType::RawPayloadOutput) => {
                     if bulk_entry.crc_ok {
-                        match bincode::serde::decode_from_slice::<
-                            crate::test_support::RawPayloadOutput,
-                            _,
-                        >(
-                            &bulk_entry.payload, bincode::config::standard()
+                        match postcard::from_bytes::<crate::test_support::RawPayloadOutput>(
+                            &bulk_entry.payload,
                         ) {
-                            Ok((raw, _)) => raw_outputs.push(raw),
+                            Ok(raw) => raw_outputs.push(raw),
                             Err(e) => eprintln!(
                                 "ktstr_test: decode raw payload output from bulk port: {e}"
                             ),
@@ -1849,7 +1843,7 @@ fn evaluate_vm_result(
         format!("\n\n--- sched_ext dump ---\n{raw_dump}")
     };
     // Concatenate bulk-port `MSG_TYPE_SCHED_LOG` chunks then run
-    // the marker-pair extractor on the merged stream — pre-bincode
+    // the marker-pair extractor on the merged stream — pre-bulk-port
     // migration the markers travelled in `output` (COM2). Either
     // source feeds `parse_sched_output` byte-for-byte; falling back
     // to `output` when the bulk-port drain has no SchedLog frames
@@ -2229,7 +2223,7 @@ fn evaluate_vm_result(
     // carries is the only signal of where the boot got stuck (BPF
     // verifier reject vs. scheduler attach vs. test-fn launch), and
     // dropping it leaves the operator without that locator.
-    // Pre-bincode-migration: scheduler logs travelled in COM2
+    // Pre-bulk-port-migration: scheduler logs travelled in COM2
     // bracketed by `SCHED_OUTPUT_START`. The marker now lives
     // inside `MSG_TYPE_SCHED_LOG` chunk bytes, so check both the
     // bulk-port drain and the legacy COM2 fallback (still useful
@@ -4008,7 +4002,7 @@ mod tests {
         // — it's the host's `parse_sched_output` that the assert
         // failure renderer reads, and the bulk-port migration of
         // SCHED_OUTPUT happens in a sibling task. The assert verdict
-        // is the part that moved to bincode-over-bulk-port.
+        // is the part that moved to postcard-over-bulk-port.
         let output = format!("{SCHED_OUTPUT_START}\nscheduler noise line\n{SCHED_OUTPUT_END}",);
         let entry = sched_entry("__eval_fail_sched_log__");
         let result = make_vm_result_with_assert(&output, "", 0, false, &assert);
@@ -5957,8 +5951,7 @@ mod tests {
             metric_hints: Vec::new(),
             metric_bounds: None,
         };
-        let payload = bincode::serde::encode_to_vec(&original, bincode::config::standard())
-            .expect("bincode-encode RawPayloadOutput");
+        let payload = postcard::to_stdvec(&original).expect("postcard-encode RawPayloadOutput");
 
         // Build a single TLV frame in the same format the guest
         // writer emits to /dev/vport0p1: 16-byte ShmMessage header
@@ -5985,9 +5978,8 @@ mod tests {
         assert_eq!(entry.msg_type, wire::MSG_TYPE_RAW_PAYLOAD_OUTPUT,);
         assert!(entry.crc_ok, "bulk CRC must match");
 
-        let (restored, _consumed): (crate::test_support::RawPayloadOutput, _) =
-            bincode::serde::decode_from_slice(&entry.payload, bincode::config::standard())
-                .expect("decode RawPayloadOutput from bulk");
+        let restored: crate::test_support::RawPayloadOutput =
+            postcard::from_bytes(&entry.payload).expect("decode RawPayloadOutput from bulk");
         assert_eq!(restored.stdout, STDOUT_MARKER);
         assert_eq!(restored.stderr, STDERR_MARKER);
         assert!(!restored.stdout.contains(STDERR_MARKER));

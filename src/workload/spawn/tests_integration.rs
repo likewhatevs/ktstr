@@ -1183,7 +1183,7 @@ fn ipc_variance_spawn_rejects_zero_period_iters() {
 /// Build a fully populated `WorkerReport` with non-default values
 /// in every field. Anchoring tests on this shape proves the wire
 /// format carries every byte the worker writes — a missing field on
-/// either side would shift the positional bincode decoder onto the
+/// either side would shift the positional postcard decoder onto the
 /// next field's bytes (silent corruption per the doc on
 /// `exit_info` / `affinity_error`).
 fn fully_populated_report() -> WorkerReport {
@@ -1232,7 +1232,7 @@ fn fully_populated_report() -> WorkerReport {
 /// not derive `PartialEq`, so the roundtrip tests must check every
 /// field explicitly. A missing assertion would silently let a
 /// mismatched field through — the same hazard the production
-/// bincode pipe avoids by emitting every field on every call.
+/// postcard pipe avoids by emitting every field on every call.
 fn assert_worker_report_eq(a: &WorkerReport, b: &WorkerReport) {
     assert_eq!(a.tid, b.tid, "tid");
     assert_eq!(a.work_units, b.work_units, "work_units");
@@ -1310,22 +1310,17 @@ fn assert_worker_report_eq(a: &WorkerReport, b: &WorkerReport) {
 }
 
 /// Roundtrip a fully populated `WorkerReport` (`exit_info=None`)
-/// through `bincode::serde::encode_to_vec` →
-/// `bincode::serde::decode_from_slice` with
-/// `bincode::config::standard()` — the exact codec the
-/// worker→parent report pipe uses (mod.rs: `encode_to_vec` at the
-/// worker child, `decode_from_slice` at `stop_and_collect`). Every
-/// field is asserted equal post-decode; a missing field on either
-/// side would corrupt subsequent fields silently per the
-/// `exit_info` / `affinity_error` doc warnings.
+/// through `postcard::to_stdvec` → `postcard::from_bytes` —
+/// the exact codec the worker→parent report pipe uses (mod.rs:
+/// `to_stdvec` at the worker child, `from_bytes` at
+/// `stop_and_collect`). Every field is asserted equal post-decode;
+/// a missing field on either side would corrupt subsequent fields
+/// silently per the `exit_info` / `affinity_error` doc warnings.
 #[test]
-fn worker_report_bincode_roundtrip() {
+fn worker_report_postcard_roundtrip() {
     let report = fully_populated_report();
-    let bytes =
-        bincode::serde::encode_to_vec(&report, bincode::config::standard()).expect("encode");
-    let (decoded, consumed): (WorkerReport, usize) =
-        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
-    assert_eq!(consumed, bytes.len(), "decoder must consume entire frame");
+    let bytes = postcard::to_stdvec(&report).expect("encode");
+    let decoded: WorkerReport = postcard::from_bytes(&bytes).expect("decode");
     assert_worker_report_eq(&report, &decoded);
 }
 
@@ -1334,20 +1329,17 @@ fn worker_report_bincode_roundtrip() {
 /// stop_and_collect's sentinel doc) and `affinity_error =
 /// Some("EINVAL")` (the EINVAL-from-cpuset shape per the
 /// `affinity_error` doc). Confirms the `Option<…>` tag bytes
-/// round-trip through bincode without losing the inner payload —
-/// the bincode positional encoding emits the tag whether or not
+/// round-trip through postcard without losing the inner payload —
+/// the postcard positional encoding emits the tag whether or not
 /// the option is populated, so a sentinel and a live-worker frame
 /// must each decode with their original shape.
 #[test]
-fn worker_report_bincode_sentinel_roundtrip() {
+fn worker_report_postcard_sentinel_roundtrip() {
     let mut report = fully_populated_report();
     report.exit_info = Some(WorkerExitInfo::Exited(1));
     report.affinity_error = Some("EINVAL".to_string());
-    let bytes =
-        bincode::serde::encode_to_vec(&report, bincode::config::standard()).expect("encode");
-    let (decoded, consumed): (WorkerReport, usize) =
-        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
-    assert_eq!(consumed, bytes.len(), "decoder must consume entire frame");
+    let bytes = postcard::to_stdvec(&report).expect("encode");
+    let decoded: WorkerReport = postcard::from_bytes(&bytes).expect("decode");
     assert!(
         matches!(decoded.exit_info, Some(WorkerExitInfo::Exited(1))),
         "exit_info must roundtrip as Exited(1); got {:?}",
@@ -1357,13 +1349,13 @@ fn worker_report_bincode_sentinel_roundtrip() {
     assert_worker_report_eq(&report, &decoded);
 }
 
-/// Roundtrip-verify that `Vec<WorkerReport>` survives bincode
+/// Roundtrip-verify that `Vec<WorkerReport>` survives postcard
 /// encode/decode, guarding the wire format for the fork-mode
-/// report path which already uses bincode. Pins per-element field
-/// fidelity through the bincode codec across a multi-report
+/// report path which uses postcard. Pins per-element field
+/// fidelity through the postcard codec across a multi-report
 /// container.
 #[test]
-fn vec_worker_report_bincode_roundtrip() {
+fn vec_worker_report_postcard_roundtrip() {
     let mut second = fully_populated_report();
     second.tid = 67890;
     second.group_idx = 5;
@@ -1371,10 +1363,8 @@ fn vec_worker_report_bincode_roundtrip() {
     second.exit_info = Some(WorkerExitInfo::Signaled(9));
     let reports: Vec<WorkerReport> = vec![fully_populated_report(), second];
     let bytes =
-        bincode::serde::encode_to_vec(&reports, bincode::config::standard()).expect("encode");
-    let (decoded, consumed): (Vec<WorkerReport>, usize) =
-        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
-    assert_eq!(consumed, bytes.len(), "decoder must consume entire frame");
+        postcard::to_stdvec(&reports).expect("encode");
+    let decoded: Vec<WorkerReport> = postcard::from_bytes(&bytes).expect("decode");
     assert_eq!(decoded.len(), reports.len(), "vec length must roundtrip");
     for (i, (a, b)) in reports.iter().zip(decoded.iter()).enumerate() {
         assert_worker_report_eq(a, b);
@@ -1384,13 +1374,13 @@ fn vec_worker_report_bincode_roundtrip() {
 
 /// Roundtrip every `WorkerExitInfo` variant — Exited, Signaled,
 /// TimedOut, WaitFailed(String), Panicked(String) — through the
-/// bincode codec. Each variant carries a distinct payload shape
+/// postcard codec. Each variant carries a distinct payload shape
 /// (i32 / unit / String) and a serde-tagged enum encoding emits a
 /// discriminant byte plus the inner payload; a missing variant on
 /// either side would shift every downstream field per the
 /// positional decoder, so the roundtrip must cover all five.
 #[test]
-fn worker_report_bincode_all_exit_info_variants_roundtrip() {
+fn worker_report_postcard_all_exit_info_variants_roundtrip() {
     let variants = [
         WorkerExitInfo::Exited(1),
         WorkerExitInfo::Signaled(9),
@@ -1401,16 +1391,13 @@ fn worker_report_bincode_all_exit_info_variants_roundtrip() {
     for variant in variants {
         let mut report = fully_populated_report();
         report.exit_info = Some(variant);
-        let bytes =
-            bincode::serde::encode_to_vec(&report, bincode::config::standard()).expect("encode");
-        let (decoded, consumed): (WorkerReport, usize) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
-        assert_eq!(consumed, bytes.len(), "decoder must consume entire frame");
+        let bytes = postcard::to_stdvec(&report).expect("encode");
+        let decoded: WorkerReport = postcard::from_bytes(&bytes).expect("decode");
         assert_worker_report_eq(&report, &decoded);
     }
 }
 
-/// Roundtrip a `WorkerReport::default()` shape through bincode.
+/// Roundtrip a `WorkerReport::default()` shape through postcard.
 /// Production sentinels are constructed via
 /// `WorkerReport { ..WorkerReport::default() }` with select fields
 /// overridden (mod.rs uses this shape at the catch_unwind arm,
@@ -1419,34 +1406,30 @@ fn worker_report_bincode_all_exit_info_variants_roundtrip() {
 /// every sentinel without surfacing in tests that only encode
 /// fully-populated reports.
 #[test]
-fn worker_report_bincode_default_roundtrip() {
+fn worker_report_postcard_default_roundtrip() {
     let sentinel = WorkerReport::default();
-    let bytes =
-        bincode::serde::encode_to_vec(&sentinel, bincode::config::standard()).expect("encode");
-    let (decoded, consumed): (WorkerReport, usize) =
-        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
-    assert_eq!(consumed, bytes.len(), "decoder must consume entire frame");
+    let bytes = postcard::to_stdvec(&sentinel).expect("encode");
+    let decoded: WorkerReport = postcard::from_bytes(&bytes).expect("decode");
     assert_worker_report_eq(&sentinel, &decoded);
 }
 
-/// `decode_from_slice` rejects a truncated bincode frame
-/// (first half of a fully-populated `WorkerReport` encoding) with
-/// `Err`. Pins the codec-level rejection only — does not exercise
-/// the parent's sentinel-synthesis path, which is covered by
-/// dedicated `stop_and_collect` tests.
+/// `postcard::from_bytes` rejects a truncated frame (first half of
+/// a fully-populated `WorkerReport` encoding) with `Err`. Pins the
+/// codec-level rejection only — does not exercise the parent's
+/// sentinel-synthesis path, which is covered by dedicated
+/// `stop_and_collect` tests.
 #[test]
 fn truncated_frame_decodes_to_err() {
     let report = fully_populated_report();
     let bytes =
-        bincode::serde::encode_to_vec(&report, bincode::config::standard()).expect("encode");
+        postcard::to_stdvec(&report).expect("encode");
     assert!(
         bytes.len() >= 2,
         "encoded report must be at least 2 bytes; got {}",
         bytes.len()
     );
     let truncated = &bytes[..bytes.len() / 2];
-    let result: Result<(WorkerReport, usize), _> =
-        bincode::serde::decode_from_slice(truncated, bincode::config::standard());
+    let result: Result<WorkerReport, _> = postcard::from_bytes(truncated);
     assert!(
         result.is_err(),
         "truncated frame must decode to Err; got Ok({:?})",
@@ -1454,14 +1437,13 @@ fn truncated_frame_decodes_to_err() {
     );
 }
 
-/// `decode_from_slice` rejects an empty input slice with `Err`.
+/// `postcard::from_bytes` rejects an empty input slice with `Err`.
 /// Pins the codec-level rejection only — does not exercise the
 /// parent's sentinel-synthesis path, which is covered by dedicated
 /// `stop_and_collect` tests.
 #[test]
 fn empty_payload_decodes_to_err() {
-    let result: Result<(WorkerReport, usize), _> =
-        bincode::serde::decode_from_slice(&[], bincode::config::standard());
+    let result: Result<WorkerReport, _> = postcard::from_bytes(&[]);
     assert!(
         result.is_err(),
         "empty payload must decode to Err; got Ok({:?})",

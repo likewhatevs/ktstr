@@ -428,7 +428,7 @@ mod tests {
         );
     }
 
-    /// Every new bincode-migration MsgType variant round-trips
+    /// Every new postcard-migration MsgType variant round-trips
     /// through frame-bytes → `parse_tlv_stream` → `MsgType::from_wire`
     /// without dropping the payload. A regression that diverged the
     /// guest writer's tag from the host parser's recogniser would

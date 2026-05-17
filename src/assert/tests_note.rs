@@ -109,7 +109,7 @@ fn note_value_survives_serde_roundtrip() {
 
 /// Empty `measurements` is present in the wire format as `{}`.
 /// `skip_serializing_if` was removed because AssertResult is
-/// serialized with bincode (positional) — skipping a field on
+/// serialized with postcard (positional) — skipping a field on
 /// serialize misaligns the deserializer. `#[serde(default)]`
 /// handles old sidecars that lack the key.
 #[test]
@@ -118,7 +118,7 @@ fn empty_measurements_present_in_wire_format() {
     let json = serde_json::to_string(&r).unwrap();
     assert!(
         json.contains("\"measurements\":{}"),
-        "empty measurements must be present in JSON for bincode compat: {json}",
+        "empty measurements must be present in JSON for postcard compat: {json}",
     );
 }
 

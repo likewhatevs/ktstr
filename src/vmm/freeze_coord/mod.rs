@@ -10343,7 +10343,7 @@ impl KtstrVm {
                 .find(|e| e.msg_type == wire::MSG_TYPE_EXIT && e.crc_ok && e.payload.len() == 4)
                 .map(|e| i32::from_ne_bytes(e.payload[..4].try_into().unwrap()))
         });
-        // Pre-bincode-migration: a COM2 `KTSTR_EXIT=N` sentinel line
+        // Pre-bulk-port-migration: a COM2 `KTSTR_EXIT=N` sentinel line
         // served as the fallback when no binary `MSG_TYPE_EXIT`
         // frame arrived. The fallback is gone — bulk-port
         // backpressure guarantees delivery, and the guest no longer

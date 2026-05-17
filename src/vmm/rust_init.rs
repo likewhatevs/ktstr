@@ -1115,7 +1115,7 @@ const STDIO_CHUNK_BYTES: usize = 4 * 1024;
 
 /// Redirect stdout and stderr through bulk-port forwarder threads.
 ///
-/// Pre-bincode-migration: dup2'd `/dev/ttyS1` over fd 1 and fd 2 so
+/// Pre-bulk-port-migration: dup2'd `/dev/ttyS1` over fd 1 and fd 2 so
 /// every `println!` / `eprintln!` reached the host as a stream of
 /// COM2 bytes.  The bulk-port migration replaces COM2 with one
 /// [`MsgType::Stdout`] / [`MsgType::Stderr`] TLV frame per chunk:

@@ -303,22 +303,21 @@ pub fn send_exit(code: i32) {
     write_msg(MsgType::Exit.wire_value(), &code.to_le_bytes());
 }
 
-/// Send a test result to the host. Payload: bincode-encoded
-/// [`crate::assert::AssertResult`] using the standard config
-/// (little-endian, variable-int).
+/// Send a test result to the host. Payload: postcard-encoded
+/// [`crate::assert::AssertResult`].
 ///
-/// Frames with [`MsgType::TestResult`]. Bincode encoding is
-/// guest-host paired through `bincode::config::standard()`; the
-/// host's [`crate::test_support::output::parse_assert_result_from_drain`]
-/// uses the same config so layout never diverges.
+/// Frames with [`MsgType::TestResult`]. Guest and host both use
+/// `postcard` so layout never diverges; the host's
+/// [`crate::test_support::output::parse_assert_result_from_drain`]
+/// decodes with the same library.
 ///
-/// Required: `result` MUST round-trip through bincode without
+/// Required: `result` MUST round-trip through postcard without
 /// erroring — every field is owned `String` / `bool` / nested
 /// `serde::Serialize` derives, so the only failure path is OOM
 /// during the `Vec<u8>` allocation, which the surrounding eprintln
 /// guards against silent loss.
 pub fn send_test_result(result: &crate::assert::AssertResult) {
-    match bincode::serde::encode_to_vec(result, bincode::config::standard()) {
+    match postcard::to_stdvec(result) {
         Ok(bytes) => {
             if bytes.len() > crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD as usize {
                 tracing::error!(
@@ -330,14 +329,14 @@ pub fn send_test_result(result: &crate::assert::AssertResult) {
                     crate::assert::AssertResult::fail(crate::assert::AssertDetail::new(
                         crate::assert::DetailKind::Other,
                         format!(
-                            "AssertResult bincode size {} exceeded bulk port limit {}; \
+                            "AssertResult postcard size {} exceeded bulk port limit {}; \
                              original details dropped",
                             bytes.len(),
                             crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD,
                         ),
                     ));
                 if let Ok(small) =
-                    bincode::serde::encode_to_vec(&truncated, bincode::config::standard())
+                    postcard::to_stdvec(&truncated)
                 {
                     write_msg(MsgType::TestResult.wire_value(), &small);
                 }
@@ -346,23 +345,22 @@ pub fn send_test_result(result: &crate::assert::AssertResult) {
             }
         }
         Err(e) => {
-            eprintln!("ktstr: bincode-encode AssertResult for bulk-port emit: {e}");
+            eprintln!("ktstr: postcard-encode AssertResult for bulk-port emit: {e}");
         }
     }
 }
 
 /// Send per-payload-invocation metrics to the host. Payload:
-/// bincode-encoded [`crate::test_support::PayloadMetrics`] using
-/// `bincode::config::standard()`.
+/// postcard-encoded [`crate::test_support::PayloadMetrics`].
 ///
 /// Frames with [`MsgType::PayloadMetrics`].
 pub fn send_payload_metrics(metrics: &crate::test_support::PayloadMetrics) {
-    match bincode::serde::encode_to_vec(metrics, bincode::config::standard()) {
+    match postcard::to_stdvec(metrics) {
         Ok(bytes) => {
             write_msg(MsgType::PayloadMetrics.wire_value(), &bytes);
         }
         Err(e) => {
-            eprintln!("ktstr: bincode-encode PayloadMetrics for bulk-port emit: {e}");
+            eprintln!("ktstr: postcard-encode PayloadMetrics for bulk-port emit: {e}");
         }
     }
 }
@@ -385,17 +383,16 @@ pub fn send_stimulus(payload: &[u8]) {
 }
 
 /// Send raw stdout/stderr from an LlmExtract payload. Payload:
-/// bincode-encoded [`crate::test_support::RawPayloadOutput`] using
-/// `bincode::config::standard()`.
+/// postcard-encoded [`crate::test_support::RawPayloadOutput`].
 ///
 /// Frames with [`MsgType::RawPayloadOutput`].
 pub(crate) fn send_raw_payload_output(raw: &crate::test_support::RawPayloadOutput) {
-    match bincode::serde::encode_to_vec(raw, bincode::config::standard()) {
+    match postcard::to_stdvec(raw) {
         Ok(bytes) => {
             write_msg(MsgType::RawPayloadOutput.wire_value(), &bytes);
         }
         Err(e) => {
-            eprintln!("ktstr: bincode-encode RawPayloadOutput for bulk-port emit: {e}");
+            eprintln!("ktstr: postcard-encode RawPayloadOutput for bulk-port emit: {e}");
         }
     }
 }

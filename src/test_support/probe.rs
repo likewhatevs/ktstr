@@ -407,7 +407,7 @@ fn classify_repro_vm_status(
 /// `SchedulerNotAttached` lifecycle frame is present (or the frame
 /// carries an empty reason).
 ///
-/// Pre-bincode-migration: the emission lived as a
+/// Pre-bulk-port-migration: the emission lived as a
 /// `"SCHEDULER_NOT_ATTACHED: <reason>"` COM2 line and the parser
 /// split at the first colon. The reason now travels in the
 /// `MSG_TYPE_LIFECYCLE` payload bytes after the 1-byte phase

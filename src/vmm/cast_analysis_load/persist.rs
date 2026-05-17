@@ -105,8 +105,7 @@ pub(super) fn try_load(
 ) -> Option<(CastMap, HashMap<String, FwdIndexEntry>, Vec<(u64, String)>)> {
     let path = cache_path(hash)?;
     let bytes = std::fs::read(&path).ok()?;
-    let (persisted, _): (PersistedCastAnalysis, _) =
-        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).ok()?;
+    let persisted: PersistedCastAnalysis = postcard::from_bytes(&bytes).ok()?;
 
     if persisted.schema_version != SCHEMA_VERSION {
         return None;
@@ -163,7 +162,7 @@ pub(super) fn try_save(
         alloc_size_types: alloc_size_types.to_vec(),
     };
 
-    let encoded = match bincode::serde::encode_to_vec(&persisted, bincode::config::standard()) {
+    let encoded = match postcard::to_stdvec(&persisted) {
         Ok(v) => v,
         Err(e) => {
             tracing::debug!(error = %e, "cast_analysis: failed to encode for disk cache");

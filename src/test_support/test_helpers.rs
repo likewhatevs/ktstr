@@ -269,7 +269,7 @@ pub(crate) fn make_vm_result(
 /// skeleton that previously had to be hand-typed at every
 /// `evaluate_vm_result` call site.
 ///
-/// Pre-bincode migration: every call site used to wrap this
+/// Pre-bulk-port migration: every call site used to wrap this
 /// in `serde_json::to_string` and embed the JSON between
 /// `RESULT_START` / `RESULT_END` delimiters in `output`. The
 /// fallback decoder is gone — call sites now build the full
@@ -286,7 +286,7 @@ pub(crate) fn build_assert_result(passed: bool, details: Vec<AssertDetail>) -> A
     }
 }
 
-/// Frame an [`AssertResult`] as a bincode-encoded
+/// Frame an [`AssertResult`] as a postcard-encoded
 /// `MSG_TYPE_TEST_RESULT` TLV entry, ready to drop into
 /// [`crate::vmm::host_comms::BulkDrainResult::entries`].
 ///
@@ -295,11 +295,11 @@ pub(crate) fn build_assert_result(passed: bool, details: Vec<AssertDetail>) -> A
 /// wire (modulo the framing header — `BulkDrainResult` carries
 /// already-parsed entries, not raw bytes), so a test fixture's
 /// entry round-trips through `parse_assert_result_from_drain`'s
-/// `bincode::serde::decode_from_slice` exactly as a real guest
+/// `postcard::from_bytes` exactly as a real guest
 /// emission would.
 pub(crate) fn assert_result_tlv_entry(result: &AssertResult) -> crate::vmm::wire::ShmEntry {
-    let payload = bincode::serde::encode_to_vec(result, bincode::config::standard())
-        .expect("AssertResult bincode encode must not fail");
+    let payload = postcard::to_stdvec(result)
+        .expect("AssertResult postcard encode must not fail");
     crate::vmm::wire::ShmEntry {
         msg_type: crate::vmm::wire::MSG_TYPE_TEST_RESULT,
         payload,
@@ -308,7 +308,7 @@ pub(crate) fn assert_result_tlv_entry(result: &AssertResult) -> crate::vmm::wire
 }
 
 /// Construct a [`crate::vmm::VmResult`] whose `guest_messages`
-/// carries a single bincode-encoded `MSG_TYPE_TEST_RESULT` TLV
+/// carries a single postcard-encoded `MSG_TYPE_TEST_RESULT` TLV
 /// entry produced from `assert`. Otherwise identical to
 /// [`make_vm_result`]; the explicit `output` / `stderr` / `exit_code`
 /// / `timed_out` arguments still drive the COM2-style fields the

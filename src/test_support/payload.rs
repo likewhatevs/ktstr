@@ -1743,11 +1743,10 @@ mod tests {
             ],
             metric_bounds: None,
         };
-        let bytes = bincode::serde::encode_to_vec(&original, bincode::config::standard())
-            .expect("RawPayloadOutput must always bincode-serialize");
-        let (restored, _consumed): (RawPayloadOutput, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("wire format must round-trip");
+        let bytes = postcard::to_stdvec(&original)
+            .expect("RawPayloadOutput must always postcard-serialize");
+        let restored: RawPayloadOutput =
+            postcard::from_bytes(&bytes).expect("wire format must round-trip");
 
         assert_eq!(restored.payload_index, original.payload_index);
         assert_eq!(
