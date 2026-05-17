@@ -1153,6 +1153,7 @@ fn resource_lock_release_on_drop() {
 
 #[test]
 fn resource_lock_exclusive_success() {
+    let _prefixes = LockPrefixesGuard::new();
     // Use high LLC indices to avoid collision with real locks.
     let plan = PinningPlan {
         assignments: vec![(0, 90100), (1, 90101)],
@@ -1161,7 +1162,6 @@ fn resource_lock_exclusive_success() {
         locks: Vec::new(),
     };
     let llc_indices = &[90100usize];
-    cleanup_lock(&llc_lock_path(90100));
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Exclusive).unwrap();
     match outcome {
         LockOutcome::Acquired { llc_offset, locks } => {
@@ -1173,11 +1173,11 @@ fn resource_lock_exclusive_success() {
             panic!("expected Acquired, got Unavailable: {reason}");
         }
     }
-    cleanup_lock(&llc_lock_path(90100));
 }
 
 #[test]
 fn resource_lock_shared_includes_cpu_locks() {
+    let _prefixes = LockPrefixesGuard::new();
     let plan = PinningPlan {
         assignments: vec![(0, 90200), (1, 90201)],
         service_cpu: None,
@@ -1185,9 +1185,6 @@ fn resource_lock_shared_includes_cpu_locks() {
         locks: Vec::new(),
     };
     let llc_indices = &[90200usize];
-    cleanup_lock(&llc_lock_path(90200));
-    cleanup_lock(&cpu_lock_path(90200));
-    cleanup_lock(&cpu_lock_path(90201));
 
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Shared).unwrap();
     match outcome {
@@ -1199,13 +1196,11 @@ fn resource_lock_shared_includes_cpu_locks() {
             panic!("expected Acquired, got Unavailable: {reason}");
         }
     }
-    cleanup_lock(&llc_lock_path(90200));
-    cleanup_lock(&cpu_lock_path(90200));
-    cleanup_lock(&cpu_lock_path(90201));
 }
 
 #[test]
 fn resource_lock_shared_with_service_cpu() {
+    let _prefixes = LockPrefixesGuard::new();
     let plan = PinningPlan {
         assignments: vec![(0, 90300)],
         service_cpu: Some(90301),
@@ -1213,9 +1208,6 @@ fn resource_lock_shared_with_service_cpu() {
         locks: Vec::new(),
     };
     let llc_indices = &[90300usize];
-    cleanup_lock(&llc_lock_path(90300));
-    cleanup_lock(&cpu_lock_path(90300));
-    cleanup_lock(&cpu_lock_path(90301));
 
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Shared).unwrap();
     match outcome {
@@ -1227,13 +1219,11 @@ fn resource_lock_shared_with_service_cpu() {
             panic!("expected Acquired, got Unavailable: {reason}");
         }
     }
-    cleanup_lock(&llc_lock_path(90300));
-    cleanup_lock(&cpu_lock_path(90300));
-    cleanup_lock(&cpu_lock_path(90301));
 }
 
 #[test]
 fn resource_lock_exclusive_skips_cpu_locks() {
+    let _prefixes = LockPrefixesGuard::new();
     // Exclusive LLC mode should NOT acquire per-CPU locks.
     let plan = PinningPlan {
         assignments: vec![(0, 90400), (1, 90401)],
@@ -1242,7 +1232,6 @@ fn resource_lock_exclusive_skips_cpu_locks() {
         locks: Vec::new(),
     };
     let llc_indices = &[90400usize];
-    cleanup_lock(&llc_lock_path(90400));
 
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Exclusive).unwrap();
     match outcome {
@@ -1254,11 +1243,11 @@ fn resource_lock_exclusive_skips_cpu_locks() {
             panic!("expected Acquired, got Unavailable: {reason}");
         }
     }
-    cleanup_lock(&llc_lock_path(90400));
 }
 
 #[test]
 fn resource_lock_contention_returns_unavailable() {
+    let _prefixes = LockPrefixesGuard::new();
     // Hold an exclusive lock, then try to acquire the same LLC.
     let plan = PinningPlan {
         assignments: vec![(0, 90500)],
@@ -1268,7 +1257,6 @@ fn resource_lock_contention_returns_unavailable() {
     };
     let llc_indices = &[90500usize];
     let lock_path = llc_lock_path(90500);
-    cleanup_lock(&lock_path);
 
     let holder = try_flock(&lock_path, FlockMode::Exclusive)
         .unwrap()
@@ -1287,11 +1275,11 @@ fn resource_lock_contention_returns_unavailable() {
         }
     }
     drop(holder);
-    cleanup_lock(&lock_path);
 }
 
 #[test]
 fn resource_lock_all_or_nothing() {
+    let _prefixes = LockPrefixesGuard::new();
     // Two LLC indices: hold the second one, verify the first is
     // released when the second fails (all-or-nothing semantics).
     let plan = PinningPlan {
@@ -1303,8 +1291,6 @@ fn resource_lock_all_or_nothing() {
     let llc_indices = &[90600usize, 90601];
     let llc_600 = llc_lock_path(90600);
     let llc_601 = llc_lock_path(90601);
-    cleanup_lock(&llc_600);
-    cleanup_lock(&llc_601);
 
     let holder = try_flock(&llc_601, FlockMode::Exclusive).unwrap().unwrap();
 
@@ -1321,12 +1307,11 @@ fn resource_lock_all_or_nothing() {
         .expect("LLC 90600 should be released after all-or-nothing failure");
     drop(reacquire);
     drop(holder);
-    cleanup_lock(&llc_600);
-    cleanup_lock(&llc_601);
 }
 
 #[test]
 fn resource_lock_shared_cpu_contention() {
+    let _prefixes = LockPrefixesGuard::new();
     // Shared LLC mode: hold a CPU lock, verify acquire fails.
     let plan = PinningPlan {
         assignments: vec![(0, 90700)],
@@ -1337,8 +1322,6 @@ fn resource_lock_shared_cpu_contention() {
     let llc_indices = &[90700usize];
     let llc_path = llc_lock_path(90700);
     let cpu_path = cpu_lock_path(90700);
-    cleanup_lock(&llc_path);
-    cleanup_lock(&cpu_path);
 
     let holder = try_flock(&cpu_path, FlockMode::Exclusive).unwrap().unwrap();
 
@@ -1354,8 +1337,6 @@ fn resource_lock_shared_cpu_contention() {
         .expect("LLC 90700 should be released after CPU contention");
     drop(reacquire);
     drop(holder);
-    cleanup_lock(&llc_path);
-    cleanup_lock(&cpu_path);
 }
 
 #[test]
@@ -1383,6 +1364,7 @@ fn resource_lock_empty_llc_indices() {
 
 #[test]
 fn resource_lock_service_cpu_contention() {
+    let _prefixes = LockPrefixesGuard::new();
     // Shared mode: LLC and assignment CPU locks succeed, but
     // service CPU is held → Unavailable. All prior locks released.
     let plan = PinningPlan {
@@ -1395,9 +1377,6 @@ fn resource_lock_service_cpu_contention() {
     let llc_path = llc_lock_path(90850);
     let cpu_900 = cpu_lock_path(90900);
     let cpu_901 = cpu_lock_path(90901);
-    cleanup_lock(&llc_path);
-    cleanup_lock(&cpu_900);
-    cleanup_lock(&cpu_901);
 
     // Hold the service CPU lock.
     let holder = try_flock(&cpu_901, FlockMode::Exclusive).unwrap().unwrap();
@@ -1425,29 +1404,20 @@ fn resource_lock_service_cpu_contention() {
     drop(reacquire_llc);
     drop(reacquire_cpu);
     drop(holder);
-    cleanup_lock(&llc_path);
-    cleanup_lock(&cpu_900);
-    cleanup_lock(&cpu_901);
 }
 
 #[test]
 fn cpu_lock_window_success() {
-    for c in 91300..91303 {
-        cleanup_lock(&cpu_lock_path(c));
-    }
+    let _prefixes = LockPrefixesGuard::new();
     let locks = try_acquire_cpu_window(91300, 3).unwrap();
     assert_eq!(locks.len(), 3);
-    for c in 91300..91303 {
-        cleanup_lock(&cpu_lock_path(c));
-    }
 }
 
 #[test]
 fn cpu_lock_window_contention_all_or_nothing() {
+    let _prefixes = LockPrefixesGuard::new();
     let cpu_400 = cpu_lock_path(91400);
     let cpu_401 = cpu_lock_path(91401);
-    cleanup_lock(&cpu_400);
-    cleanup_lock(&cpu_401);
 
     let holder = try_flock(&cpu_400, FlockMode::Exclusive).unwrap().unwrap();
 
@@ -1468,8 +1438,6 @@ fn cpu_lock_window_contention_all_or_nothing() {
         .expect("CPU 91400 should be released after all-or-nothing");
     drop(reacquire);
     drop(holder2);
-    cleanup_lock(&cpu_400);
-    cleanup_lock(&cpu_401);
 }
 
 #[test]
@@ -1481,12 +1449,9 @@ fn cpu_lock_zero_count() {
 
 #[test]
 fn cpu_lock_contention_slides_window() {
+    let _prefixes = LockPrefixesGuard::new();
     // Hold CPU at offset 91500, verify next window succeeds
     // via try_acquire_cpu_window (unit-level sliding test).
-    for c in 91500..91503 {
-        cleanup_lock(&cpu_lock_path(c));
-    }
-
     let holder = try_flock(cpu_lock_path(91500), FlockMode::Exclusive)
         .unwrap()
         .unwrap();
@@ -1499,9 +1464,6 @@ fn cpu_lock_contention_slides_window() {
 
     drop(locks);
     drop(holder);
-    for c in 91500..91503 {
-        cleanup_lock(&cpu_lock_path(c));
-    }
 }
 
 #[test]
@@ -1687,22 +1649,12 @@ fn cpu_lock_acquire_no_windows_fit() {
 
 #[test]
 fn cpu_lock_acquire_with_llc_shared() {
-    // Uses a per-test lockfile prefix so the LLC group can sit
+    // Uses per-test lockfile prefixes so the LLC group can sit
     // at index 0 instead of padding to 92000. The production
-    // `acquire_cpu_locks` path threads through `llc_lock_path`,
-    // which honors the test-only prefix override.
-    let _prefix = LlcLockPrefixGuard::new();
-    let cpu_prefix_dir = tempfile::TempDir::new().expect("tempdir");
-    let cpu_prefix = format!("{}/cpu-", cpu_prefix_dir.path().display());
-    CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = Some(cpu_prefix));
-
-    struct CpuPrefixGuard;
-    impl Drop for CpuPrefixGuard {
-        fn drop(&mut self) {
-            CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = None);
-        }
-    }
-    let _cpu_prefix = CpuPrefixGuard;
+    // `acquire_cpu_locks` path threads through `llc_lock_path`
+    // and `cpu_lock_path`, both of which honor the test-only
+    // prefix overrides.
+    let _prefixes = LockPrefixesGuard::new();
 
     let topo = HostTopology::new_for_tests(&[((0..100).collect(), 0)]);
 
@@ -1730,7 +1682,6 @@ fn cpu_lock_acquire_with_llc_shared() {
 
     drop(shared2);
     drop(result);
-    drop(cpu_prefix_dir);
 }
 
 #[test]
@@ -1787,6 +1738,52 @@ impl LlcLockPrefixGuard {
 impl Drop for LlcLockPrefixGuard {
     fn drop(&mut self) {
         LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = None);
+    }
+}
+
+/// RAII guard for a per-test CPU lockfile path prefix. Mirrors
+/// [`LlcLockPrefixGuard`] for the CPU-lock side of the
+/// `acquire_resource_locks` path. See that struct's doc for the
+/// per-test-tempdir + panic-safe-cleanup rationale.
+struct CpuLockPrefixGuard {
+    _dir: tempfile::TempDir,
+}
+
+impl CpuLockPrefixGuard {
+    fn new() -> Self {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let prefix = format!("{}/cpu-", dir.path().display());
+        CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = Some(prefix));
+        CpuLockPrefixGuard { _dir: dir }
+    }
+}
+
+impl Drop for CpuLockPrefixGuard {
+    fn drop(&mut self) {
+        CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = None);
+    }
+}
+
+/// RAII bundle that installs BOTH [`LlcLockPrefixGuard`] AND
+/// [`CpuLockPrefixGuard`] in one call. Used by any test that hits
+/// both LLC and CPU lockfile families — `acquire_resource_locks`
+/// (LLC + per-CPU), `acquire_cpu_locks` (CPU + the LLC shared lock
+/// from `acquire_llc_shared_locks`), or any future helper that
+/// composes the two. Each test gets its own per-tempdir prefix for
+/// both lockfile families, so cross-run / cross-process
+/// collisions on `/tmp/ktstr-llc-*.lock` and `/tmp/ktstr-cpu-*.lock`
+/// cannot occur.
+struct LockPrefixesGuard {
+    _cpu: CpuLockPrefixGuard,
+    _llc: LlcLockPrefixGuard,
+}
+
+impl LockPrefixesGuard {
+    fn new() -> Self {
+        LockPrefixesGuard {
+            _cpu: CpuLockPrefixGuard::new(),
+            _llc: LlcLockPrefixGuard::new(),
+        }
     }
 }
 
