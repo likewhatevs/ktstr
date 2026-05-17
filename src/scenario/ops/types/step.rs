@@ -623,9 +623,11 @@ impl Op {
     /// **Two consecutive singleton calls produce two separate Ops**
     /// — not auto-merged at construction time. For dispatching
     /// multiple hot writes as a single op, use
-    /// [`Self::write_kernel_hot_batch`]. The executor's adjacent-op
-    /// auto-merge is a follow-up sub-batch feature; until it lands,
-    /// each `write_kernel_hot` call is its own dispatch.
+    /// [`Self::write_kernel_hot_batch`]. The executor's
+    /// adjacent-op auto-merge (which would collapse N adjacent
+    /// singleton hot writes into one dispatch) is queued as a
+    /// dedicated follow-up task; until it lands, each
+    /// `write_kernel_hot` call is its own dispatch.
     pub fn write_kernel_hot(target: KernelTarget, value: KernelValue) -> Self {
         Op::WriteKernelHot {
             writes: vec![(target, value)],
@@ -654,8 +656,8 @@ impl Op {
     /// between them. For correct multi-CPU seeding always use
     /// [`Self::write_kernel_cold_batch`]. The executor's
     /// adjacent-op auto-merge (which would collapse N adjacent
-    /// singleton cold writes into one rendezvous) is a follow-up
-    /// sub-batch feature; until then, callers needing
+    /// singleton cold writes into one rendezvous) is queued as a
+    /// dedicated follow-up task; until it lands, callers needing
     /// inter-CPU-coherent writes MUST batch explicitly.
     pub fn write_kernel_cold(target: KernelTarget, value: KernelValue) -> Self {
         Op::WriteKernelCold {
@@ -698,11 +700,12 @@ impl Op {
     /// rendezvous-coherent-read contract and
     /// [`Self::read_kernel_hot`] for the singleton-only rationale.
     ///
-    /// Until the adjacent-cold-op auto-merge lands, each
-    /// `read_kernel_cold` triggers its own freeze rendezvous. Where
-    /// multiple cold reads are needed within the same coherent
-    /// snapshot, prefer [`Op::CaptureSnapshot`] (which already
-    /// orchestrates a single rendezvous for all snapshot reads).
+    /// Until the adjacent-cold-op auto-merge (queued as a dedicated
+    /// follow-up task) lands, each `read_kernel_cold` triggers its
+    /// own freeze rendezvous. Where multiple cold reads are needed
+    /// within the same coherent snapshot, prefer
+    /// [`Op::CaptureSnapshot`] (which already orchestrates a single
+    /// rendezvous for all snapshot reads).
     pub fn read_kernel_cold(tag: impl Into<Cow<'static, str>>, target: KernelTarget) -> Self {
         Op::ReadKernelCold {
             tag: tag.into(),

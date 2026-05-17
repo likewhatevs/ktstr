@@ -505,12 +505,13 @@ pub enum Op {
     /// CPU at the same instant) must land in ONE freeze window —
     /// N separate cold-write ops would mean N rendezvous cycles
     /// and observable inter-CPU skew. The variant payload is a
-    /// `Vec` precisely to make batched writes the natural shape;
-    /// the executor will additionally auto-merge adjacent
-    /// cold-write ops in the same Step into one rendezvous as a
-    /// safety net (auto-merge + the handler itself land in a
-    /// follow-up sub-batch — the dispatch stub currently returns
-    /// an explicit "not yet implemented" error).
+    /// `Vec` precisely to make batched writes the natural shape.
+    /// The executor's adjacent-op auto-merge (which would collapse
+    /// N adjacent singleton cold-write ops into one rendezvous as
+    /// a safety net) is queued as a dedicated follow-up task; the
+    /// dispatch handler itself lands in the next sub-batch and the
+    /// stub currently returns an explicit "not yet implemented"
+    /// error.
     ///
     /// Use this for: multi-field atomic writes, all-CPUs-at-once
     /// seeding, one-shot setup that must complete before the guest
