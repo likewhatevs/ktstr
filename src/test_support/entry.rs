@@ -398,6 +398,60 @@ impl TopologyConstraints {
             && self.max_cpus.is_none_or(|max| topo.total_cpus() <= max)
             && topo.total_cpus() <= host_cpus
     }
+
+    /// Reject inverted ranges (any `max_*` strictly less than the
+    /// matching `min_*`). An inverted range cannot match ANY topology
+    /// — [`Self::accepts`] / [`Self::accepts_no_perf_mode`] would
+    /// silently return `false` for every preset and the test would
+    /// be skipped without diagnostic.
+    ///
+    /// Wired into [`KtstrTestEntry::validate`], which fires at the
+    /// start of `run_ktstr_test` (before any VM boot or preset
+    /// enumeration). A struct-literal like `TopologyConstraints {
+    /// min_numa_nodes: 5, max_numa_nodes: Some(2), ..DEFAULT }`
+    /// surfaces a loud error within seconds of test dispatch instead
+    /// of as a silently-empty gauntlet sweep at runtime. NOTE: this
+    /// only covers the BASE test invocation path — nextest's
+    /// `--list` output for gauntlet variant lines still elides
+    /// presets that don't satisfy `accepts()`, so an inverted entry
+    /// produces zero gauntlet variant lines in `--list` output
+    /// without a per-variant diagnostic. The base-test invocation
+    /// surfaces the error definitively; the listing-time silent
+    /// elision of gauntlet variants is a separate concern.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(max) = self.max_numa_nodes
+            && max < self.min_numa_nodes
+        {
+            anyhow::bail!(
+                "TopologyConstraints inverted: max_numa_nodes={} < \
+                 min_numa_nodes={}. No topology can satisfy both bounds, \
+                 so every gauntlet preset would silently skip.",
+                max,
+                self.min_numa_nodes,
+            );
+        }
+        if let Some(max) = self.max_llcs
+            && max < self.min_llcs
+        {
+            anyhow::bail!(
+                "TopologyConstraints inverted: max_llcs={} < min_llcs={}. \
+                 No topology can satisfy both bounds.",
+                max,
+                self.min_llcs,
+            );
+        }
+        if let Some(max) = self.max_cpus
+            && max < self.min_cpus
+        {
+            anyhow::bail!(
+                "TopologyConstraints inverted: max_cpus={} < min_cpus={}. \
+                 No topology can satisfy both bounds.",
+                max,
+                self.min_cpus,
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Definition of a scheduler for the test framework.
@@ -1329,6 +1383,22 @@ impl KtstrTestEntry {
                 );
             }
         }
+        // Reject inverted topology ranges before they silently filter
+        // every gauntlet preset to zero matches. The per-entry
+        // constraints gate which gauntlet presets the test author wants
+        // to exercise; an inverted bound (e.g. min_numa_nodes=5 with
+        // max_numa_nodes=Some(2)) would yield false on every preset.
+        self.constraints
+            .validate()
+            .map_err(|e| anyhow::anyhow!("KtstrTestEntry '{}'.constraints: {e}", self.name))?;
+        // Same for the scheduler-level constraints, which apply on top
+        // of the per-entry ones. A scheduler whose declared topology
+        // requirements are themselves inverted has the same silent-
+        // filter pathology regardless of what test entries declare.
+        self.scheduler
+            .constraints
+            .validate()
+            .map_err(|e| anyhow::anyhow!("KtstrTestEntry '{}'.scheduler '{}'.constraints: {e}", self.name, self.scheduler.name))?;
         Ok(())
     }
 
@@ -2771,6 +2841,185 @@ mod tests {
         // cores_per_llc=8, threads_per_core=2 → 16 CPUs/LLC
         let t = Topology::new(1, 2, 8, 2);
         assert!(!c.accepts(&t, 128, 16, 8));
+    }
+
+    // -- TopologyConstraints::validate --
+
+    #[test]
+    fn validate_accepts_default_constraints() {
+        // DEFAULT has min_numa_nodes=1, max_numa_nodes=Some(1);
+        // min_llcs=1, max_llcs=Some(12); min_cpus=1, max_cpus=Some(192).
+        // All min<=max — must pass.
+        TopologyConstraints::DEFAULT
+            .validate()
+            .expect("DEFAULT constraints must be self-consistent");
+    }
+
+    #[test]
+    fn validate_rejects_inverted_numa_nodes() {
+        let c = TopologyConstraints {
+            min_numa_nodes: 5,
+            max_numa_nodes: Some(2),
+            ..TopologyConstraints::DEFAULT
+        };
+        let err = c
+            .validate()
+            .expect_err("inverted min/max_numa_nodes must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_numa_nodes=2") && msg.contains("min_numa_nodes=5"),
+            "diagnostic must name both bounds: got {msg}",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_inverted_llcs() {
+        let c = TopologyConstraints {
+            min_llcs: 8,
+            max_llcs: Some(2),
+            ..TopologyConstraints::DEFAULT
+        };
+        let err = c
+            .validate()
+            .expect_err("inverted min/max_llcs must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_llcs=2") && msg.contains("min_llcs=8"),
+            "diagnostic must name both bounds: got {msg}",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_inverted_cpus() {
+        let c = TopologyConstraints {
+            min_cpus: 64,
+            max_cpus: Some(16),
+            ..TopologyConstraints::DEFAULT
+        };
+        let err = c
+            .validate()
+            .expect_err("inverted min/max_cpus must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_cpus=16") && msg.contains("min_cpus=64"),
+            "diagnostic must name both bounds: got {msg}",
+        );
+    }
+
+    #[test]
+    fn validate_accepts_max_equal_min() {
+        // max == min is satisfiable (any topology with that exact
+        // value matches), so the validator must allow it.
+        let c = TopologyConstraints {
+            min_numa_nodes: 3,
+            max_numa_nodes: Some(3),
+            min_llcs: 4,
+            max_llcs: Some(4),
+            min_cpus: 16,
+            max_cpus: Some(16),
+            ..TopologyConstraints::DEFAULT
+        };
+        c.validate()
+            .expect("max==min is satisfiable and must be accepted");
+    }
+
+    #[test]
+    fn validate_accepts_open_upper_bound() {
+        // None for max_* means "no upper bound" — never inverted.
+        let c = TopologyConstraints {
+            min_numa_nodes: 16,
+            max_numa_nodes: None,
+            min_llcs: 32,
+            max_llcs: None,
+            min_cpus: 1024,
+            max_cpus: None,
+            ..TopologyConstraints::DEFAULT
+        };
+        c.validate()
+            .expect("None upper bounds must always validate");
+    }
+
+    // -- KtstrTestEntry::validate wire-in for TopologyConstraints --
+
+    /// Pin that an inverted per-entry `constraints` field surfaces
+    /// through `KtstrTestEntry::validate` with the documented
+    /// `KtstrTestEntry '<name>'.constraints:` prefix wrap. Catches a
+    /// regression that drops the per-entry `.validate()?` call at the
+    /// wire-in site in `KtstrTestEntry::validate`.
+    #[test]
+    fn entry_validate_propagates_per_entry_constraints_error() {
+        let entry = KtstrTestEntry {
+            name: "test_inverted_entry",
+            constraints: TopologyConstraints {
+                min_numa_nodes: 5,
+                max_numa_nodes: Some(2),
+                ..TopologyConstraints::DEFAULT
+            },
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("inverted per-entry constraints must surface");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("KtstrTestEntry 'test_inverted_entry'.constraints:"),
+            "wrap prefix must name the entry + constraints field: got {msg}",
+        );
+        assert!(
+            msg.contains("max_numa_nodes=2") && msg.contains("min_numa_nodes=5"),
+            "underlying validator diagnostic must be preserved through map_err: got {msg}",
+        );
+    }
+
+    /// Pin that an inverted scheduler-level `constraints` field
+    /// surfaces through `KtstrTestEntry::validate` with the
+    /// `KtstrTestEntry '<name>'.scheduler '<sched>'.constraints:`
+    /// prefix wrap. Catches a regression that drops the
+    /// `.scheduler.constraints.validate()?` call at the wire-in site.
+    #[test]
+    fn entry_validate_propagates_scheduler_constraints_error() {
+        static BAD_SCHED: Scheduler = Scheduler {
+            name: "bad_sched",
+            binary: SchedulerSpec::Eevdf,
+            sysctls: &[],
+            kargs: &[],
+            assert: crate::assert::Assert::NO_OVERRIDES,
+            cgroup_parent: None,
+            sched_args: &[],
+            topology: Topology {
+                llcs: 1,
+                cores_per_llc: 1,
+                threads_per_core: 1,
+                numa_nodes: 1,
+                nodes: None,
+                distances: None,
+            },
+            constraints: TopologyConstraints {
+                min_llcs: 8,
+                max_llcs: Some(2),
+                ..TopologyConstraints::DEFAULT
+            },
+            config_file: None,
+            config_file_def: None,
+            kernels: &[],
+        };
+        let entry = KtstrTestEntry {
+            name: "test_inverted_scheduler",
+            scheduler: &BAD_SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("inverted scheduler-level constraints must surface");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("KtstrTestEntry 'test_inverted_scheduler'.scheduler 'bad_sched'.constraints:"),
+            "wrap prefix must name the entry + scheduler + constraints: got {msg}",
+        );
+        assert!(
+            msg.contains("max_llcs=2") && msg.contains("min_llcs=8"),
+            "underlying validator diagnostic must be preserved: got {msg}",
+        );
     }
 
     // -- SchedulerSpec::display_name --
