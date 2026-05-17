@@ -22,7 +22,10 @@ use super::entry::KtstrTestEntry;
 /// [`scratch_dir`]).
 static SCRATCH_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-/// Process-owned scratch directory for inline-config tempfile writes.
+/// Process-owned scratch directory for all inline-config tempfile
+/// writes — both [`config_content_parts`] (in-VM eval path) and
+/// [`crate::export::export_test`]'s `config_content_addition`
+/// (host-side .run packaging path).
 ///
 /// Created lazily on first access via `tempfile::Builder` with
 /// explicit `0o700` mode (overrides the crate default of umask-
@@ -31,6 +34,16 @@ static SCRATCH_PATH: OnceLock<PathBuf> = OnceLock::new();
 /// listings + filename predictability to other uids). The
 /// directory is a random-suffixed subdirectory of
 /// `std::env::temp_dir()`, owned by the current uid.
+///
+/// Both call sites share this single directory because the
+/// security and leak-bound properties are identical for both
+/// purposes, and a single `OnceLock` + single `atexit` handler is
+/// simpler than maintaining parallel scratch dirs that diverge
+/// silently. Filenames are independently prefixed at each call
+/// site (`ktstr-config-{hash:016x}.json` for the eval path,
+/// `ktstr-export-config-{hash:016x}-{basename}` for the export
+/// path) so the two purposes can be visually distinguished inside
+/// the same directory.
 ///
 /// Two properties matter:
 ///
@@ -55,7 +68,7 @@ static SCRATCH_PATH: OnceLock<PathBuf> = OnceLock::new();
 ///    text-sized config files. The tempdir's random suffix
 ///    prevents collisions across runs, so accumulated leak dirs
 ///    don't interfere with future runs.
-fn scratch_dir() -> &'static Path {
+pub(crate) fn scratch_dir() -> &'static Path {
     SCRATCH_PATH
         .get_or_init(|| {
             let td = tempfile::Builder::new()
@@ -1813,8 +1826,7 @@ mod tests {
 
     /// Per-content-hash inline-config files MUST land inside the
     /// per-process `scratch_dir()` subtree, NOT bare
-    /// `std::env::temp_dir()`. This is the load-bearing security
-    /// property of #247 — the 0o700 process-owned subdirectory
+    /// `std::env::temp_dir()`. The 0o700 process-owned subdirectory
     /// blocks the cross-uid symlink-replacement attack on
     /// predictable content-addressed filenames in shared `/tmp`. A
     /// future "simplification" that reverts the path to bare

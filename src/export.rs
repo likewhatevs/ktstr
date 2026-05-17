@@ -76,7 +76,6 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -85,7 +84,7 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 
 use crate::test_support::{
-    KtstrTestEntry, SchedulerSpec, content_hash, find_test, resolve_scheduler,
+    KtstrTestEntry, SchedulerSpec, content_hash, find_test, resolve_scheduler, scratch_dir,
 };
 
 /// Build a self-extracting `.run` file for the given test.
@@ -317,12 +316,14 @@ fn config_content_addition(entry: &KtstrTestEntry) -> Result<Option<ConfigExport
         .to_string();
     reject_shell_metacharacters_in_basename(&basename, guest_path)?;
     let hash = content_hash(content);
-    // Write to a uniquely-named scratch file inside the process-
-    // owned 0o700 scratch directory, then atomic-rename to the
-    // canonical content-addressed path. See [`scratch_dir`] for
-    // the symlink-defense + leak-bound rationale; the parallel
-    // pattern in `src/test_support/runtime.rs::config_content_parts`
-    // hardens the same attack surface for the in-process test path.
+    // Write to a uniquely-named scratch file inside the shared
+    // process-owned 0o700 scratch directory, then atomic-rename to
+    // the canonical content-addressed path. See
+    // [`crate::test_support::runtime::scratch_dir`] for the
+    // symlink-defense + leak-bound rationale — that helper is
+    // shared with the in-VM `config_content_parts` path so both
+    // sites get the same atexit cleanup + per-process 0o700
+    // directory without divergent maintenance.
     let dir = scratch_dir();
     let canonical = dir.join(format!("ktstr-export-config-{hash:016x}-{basename}"));
     let mut scratch = tempfile::NamedTempFile::new_in(dir)
@@ -343,88 +344,6 @@ fn config_content_addition(entry: &KtstrTestEntry) -> Result<Option<ConfigExport
         host_path: canonical,
         args_shell_prefix: expanded,
     }))
-}
-
-/// Stable PathBuf for the process-owned export-config scratch
-/// directory. Populated once by [`scratch_dir`] on first access.
-/// See the parallel `SCRATCH_PATH` in
-/// `src/test_support/runtime.rs` for the same rationale —
-/// separate static here because the export tool lives in a
-/// different crate-module boundary and shares no init path with
-/// the test-support runtime.
-static SCRATCH_PATH: OnceLock<PathBuf> = OnceLock::new();
-
-/// Process-owned scratch directory for export-time inline-config
-/// tempfile writes. Sibling of
-/// `src/test_support/runtime.rs::scratch_dir` (#247) — same
-/// security and leak-bound model applied to the export path's
-/// content-addressed tempfile naming.
-///
-/// Created lazily on first access via `tempfile::Builder` with
-/// explicit `0o700` mode. The directory is a random-suffixed
-/// subdirectory of `std::env::temp_dir()`, owned by the current
-/// uid. Two properties matter:
-///
-/// 1. **Symlink defense.** /tmp is sticky-bit world-writable, so
-///    an attacker can pre-plant a symlink at the predictable
-///    `ktstr-export-config-{hash:016x}-{basename}` path and have
-///    us write to wherever it points. A per-process 0o700
-///    subdirectory blocks every cross-uid access mode (read, list,
-///    write, traverse); only our process can create or replace
-///    files inside it, which eliminates the symlink-attack surface
-///    for the export-tempfile-write path.
-/// 2. **Leak bound.** Rust does NOT run `Drop` impls on values
-///    stored in `static` slots at process exit. Instead, the path
-///    is registered with `libc::atexit` so a clean exit triggers
-///    [`std::fs::remove_dir_all`] on the directory. Crash, abort,
-///    SIGKILL, or panic-`abort` skip the atexit handler and leak
-///    the directory; the residual is bounded by the number of
-///    such ungraceful exits and the directory contents are
-///    text-sized config files. The tempdir's random suffix
-///    prevents collisions across runs.
-fn scratch_dir() -> &'static Path {
-    SCRATCH_PATH
-        .get_or_init(|| {
-            let td = tempfile::Builder::new()
-                .prefix("ktstr-export-config-")
-                .permissions(std::fs::Permissions::from_mode(0o700))
-                .tempdir()
-                .expect("create ktstr export-config scratch directory");
-            // `keep()` consumes the TempDir without running its
-            // Drop's cleanup (flips the cleanup flag, returns the
-            // bare PathBuf we own). The atexit registration below
-            // takes over cleanup responsibility.
-            let path = td.keep();
-            // SAFETY: `cleanup_scratch_dir` has the required
-            // `extern "C" fn()` signature that `libc::atexit`
-            // accepts. The `unsafe` block here is required because
-            // `libc::atexit` itself is an `unsafe extern "C"` FFI
-            // call (the callback signature itself is plain
-            // `extern "C" fn()`, not `unsafe`). Registering more
-            // than once is the caller's responsibility;
-            // `OnceLock::get_or_init` guarantees this runs exactly
-            // once per process.
-            let rc = unsafe { libc::atexit(cleanup_scratch_dir) };
-            assert_eq!(
-                rc, 0,
-                "libc::atexit registration for ktstr export-config scratch dir failed"
-            );
-            path
-        })
-        .as_path()
-}
-
-/// Process-exit handler registered via `libc::atexit` by
-/// [`scratch_dir`] on first init. Removes the scratch directory
-/// and every export-config file inside it. Errors are ignored —
-/// by the time this runs the process is exiting and there is
-/// nowhere to surface a failure (no `eprintln!` ordering
-/// guarantees from inside an atexit handler, and panicking would
-/// be unsound across the C ABI boundary).
-extern "C" fn cleanup_scratch_dir() {
-    if let Some(path) = SCRATCH_PATH.get() {
-        let _ = std::fs::remove_dir_all(path);
-    }
 }
 
 /// Reject basenames containing shell-metacharacters that would
@@ -1851,12 +1770,11 @@ mod tests {
     /// [`scratch_dir`]-based atomic-rename pattern: the host_path
     /// produced by `config_content_addition` lives INSIDE the
     /// process-owned 0o700 scratch directory, never bare
-    /// `std::env::temp_dir()`. A regression that reverts to the
-    /// pre-#258 `std::env::temp_dir().join(...)` would silently
-    /// restore the symlink-attack surface this batch closed —
-    /// every other functional assertion in this file's tests
-    /// would still pass. This test is the dedicated guard against
-    /// that revert path.
+    /// `std::env::temp_dir()`. A regression that reverts to a bare
+    /// `std::env::temp_dir().join(...)` path would silently restore
+    /// the symlink-attack surface — every other functional
+    /// assertion in this file's tests would still pass. This test
+    /// is the dedicated guard against that revert path.
     #[test]
     fn config_content_addition_writes_inside_process_scratch_dir() {
         use crate::test_support::{Scheduler, SchedulerSpec};
@@ -1958,8 +1876,8 @@ mod tests {
         );
     }
 
-    /// Pin the L318 `reject_shell_metacharacters_in_basename`
-    /// gate on the inline-content path. Parallel to the existing
+    /// Pin the `reject_shell_metacharacters_in_basename` gate on the
+    /// inline-content path. Parallel to the existing
     /// `config_file_addition_rejects_basename_with_shell_metacharacters`
     /// test for the config_file path — the metacharacter rejection
     /// must fire BEFORE any scratch-file write touches the disk.
