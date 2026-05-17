@@ -83,7 +83,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 
-use crate::test_support::{KtstrTestEntry, SchedulerSpec, find_test, resolve_scheduler};
+use crate::test_support::{KtstrTestEntry, SchedulerSpec, content_hash, find_test, resolve_scheduler};
 
 /// Build a self-extracting `.run` file for the given test.
 ///
@@ -295,7 +295,6 @@ fn config_file_addition(entry: &KtstrTestEntry) -> Result<Option<ConfigExportAdd
 /// convention sees the same basename in the .run archive that it
 /// would see in the in-VM /include-files mount.
 fn config_content_addition(entry: &KtstrTestEntry) -> Result<Option<ConfigExportAddition>> {
-    use std::hash::{Hash, Hasher};
     let Some(content) = entry.config_content else {
         return Ok(None);
     };
@@ -314,10 +313,8 @@ fn config_content_addition(entry: &KtstrTestEntry) -> Result<Option<ConfigExport
         })?
         .to_string();
     reject_shell_metacharacters_in_basename(&basename, guest_path)?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    content.hash(&mut hasher);
-    let hash = hasher.finish();
-    let tmp = std::env::temp_dir().join(format!("ktstr-export-config-{hash:x}-{basename}"));
+    let hash = content_hash(content);
+    let tmp = std::env::temp_dir().join(format!("ktstr-export-config-{hash:016x}-{basename}"));
     std::fs::write(&tmp, content)
         .with_context(|| format!("write inline config_content to {}", tmp.display()))?;
     let runtime_path = format!("\"$DIR/include/{basename}\"");

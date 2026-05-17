@@ -102,6 +102,29 @@ pub(crate) fn config_file_parts(entry: &KtstrTestEntry) -> Option<(String, PathB
     Some((archive_path, PathBuf::from(config_path), guest_path))
 }
 
+/// Stable u64 hash of arbitrary string content.
+///
+/// Used by the config-content tempfile path code, but suitable for
+/// any content-addressed naming site that needs determinism across
+/// rustc bumps.
+///
+/// Uses `siphasher::sip::SipHasher13::new_with_keys(0, 0)` rather
+/// than `std::collections::hash_map::DefaultHasher` because the std
+/// algorithm is explicitly unspecified across rustc versions (see
+/// workspace `Cargo.toml` for the dep-line rationale). The explicit
+/// `new_with_keys(0, 0)` form matches the project's other
+/// stable-hash sites (`src/test_support/sidecar/mod.rs`, `build.rs`)
+/// so a future audit of zero-keyed SipHasher13 callers finds every
+/// instance via one grep. Same content always produces the same u64
+/// across toolchain upgrades, so cached artifacts stay reproducible
+/// across machines and rustc bumps.
+pub(crate) fn content_hash(content: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = siphasher::sip::SipHasher13::new_with_keys(0, 0);
+    content.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Resolve inline config content into a temp file on disk, returning
 /// `(archive_path, host_path, guest_path, sched_args)` where
 /// `sched_args` are the CLI args derived from the scheduler's
@@ -110,14 +133,11 @@ pub(crate) fn config_file_parts(entry: &KtstrTestEntry) -> Option<(String, PathB
 pub(crate) fn config_content_parts(
     entry: &KtstrTestEntry,
 ) -> Option<(String, PathBuf, String, Vec<String>)> {
-    use std::hash::{Hash, Hasher};
     let content = entry.config_content?;
     let (arg_template, guest_path) = entry.scheduler.config_file_def?;
     let archive_path = guest_path.trim_start_matches('/').to_string();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    content.hash(&mut hasher);
-    let hash = hasher.finish();
-    let tmp = std::env::temp_dir().join(format!("ktstr-config-{hash:x}.json"));
+    let hash = content_hash(content);
+    let tmp = std::env::temp_dir().join(format!("ktstr-config-{hash:016x}.json"));
     std::fs::write(&tmp, content).expect("failed to write inline config to temp file");
     let expanded = arg_template.replace("{file}", guest_path);
     let sched_args: Vec<String> = expanded.split_whitespace().map(|s| s.to_string()).collect();
