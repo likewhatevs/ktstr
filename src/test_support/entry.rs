@@ -723,6 +723,14 @@ pub struct Scheduler {
     pub kargs: &'static [&'static str],
     /// Scheduler-wide assertion overrides merged on top of
     /// `Assert::default_checks()` and below each per-entry `assert`.
+    ///
+    /// Construct via [`crate::assert::Assert::NO_OVERRIDES`] (the
+    /// zero-overrides baseline) chained through the `Assert` builder
+    /// methods. The `Assert` builder surface (every overridable
+    /// threshold + scheduler-tunable knob) is documented at the
+    /// [Checking](https://likewhatevs.github.io/ktstr/guide/concepts/checking.html)
+    /// guide chapter; see [`crate::assert::Assert`] for the full
+    /// per-method threshold list.
     pub assert: crate::assert::Assert,
     /// Cgroup parent path. Must begin with `/` and must not be `"/"`
     /// alone (that is the cgroup root). Example: `"/ktstr"`.

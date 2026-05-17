@@ -45,6 +45,29 @@ dot-separated form for the key (e.g. `"kernel.foo"`, not
 `"kernel/foo"`); duplicate keys are applied in order and the
 last write wins.
 
+For a scheduler that needs several sysctls in lockstep, declare
+them as a `const` slice — every `Sysctl::new(...)` is `const fn`,
+so the array literal stays in `static`/`const` context and the
+scheduler `const` can reference it directly:
+
+```rust,ignore
+const RT_TUNING: &[Sysctl] = &[
+    Sysctl::new("kernel.sched_rt_runtime_us", "950000"),
+    Sysctl::new("kernel.sched_rt_period_us", "1000000"),
+    Sysctl::new("kernel.numa_balancing", "0"),
+];
+
+declare_scheduler!(RT_TUNED, {
+    name = "rt_tuned_scx",
+    binary = "scx_rt_tuned",
+    sysctls = RT_TUNING,
+});
+```
+
+The framework applies each `Sysctl` in declaration order at
+scenario start and reverts to the pre-test value at scenario
+teardown.
+
 `kargs` is the extra GUEST KERNEL command-line (not the scheduler
 binary's CLI — use `sched_args` for that). Do not override the
 kargs ktstr injects itself (`console=`, `loglevel=`, `init=`):
@@ -132,6 +155,12 @@ declare_scheduler!(MY_SCHED, {
     topology = (1, 2, 4, 1),
     kernels = ["6.14", "6.15..=7.0"],
 });
+// `MY_SCHED` is the generated Rust handle test functions reference
+// via `#[ktstr_test(scheduler = MY_SCHED)]`. `name = "my_sched"` is
+// the user-visible label that appears in nextest output, sidecars,
+// and the `cargo ktstr` CLI. The two names are independent —
+// rename the Rust handle freely without touching anything else;
+// renaming the `name` string updates every downstream artifact.
 
 #[ktstr_test(scheduler = MY_SCHED)]
 fn basic(ctx: &Ctx) -> Result<AssertResult> {
