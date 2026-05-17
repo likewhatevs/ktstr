@@ -135,12 +135,16 @@ pub(crate) const VMLINUX_KEEP_SECTIONS: &[&[u8]] = &[
 /// - `.data`: `st_value` is a kernel VA. `kva_to_pa` (direct mapping)
 ///   or `text_kva_to_pa_with_base` (text mapping) translates it to a PA
 ///   that [`super::reader::GuestMem`] reads directly.
-/// - `.data..percpu`: `sh_addr = 0` on this section, so `st_value` is
-///   a section-relative offset, NOT a KVA. The per-CPU KVA for CPU
-///   `n` is `st_value + __per_cpu_offset[n]`; [`compute_rq_pas`]
-///   performs that add and then calls `kva_to_pa` for each CPU.
-///   Calling `kva_to_pa` on the raw `st_value` would translate the
-///   wrong address.
+/// - `.data..percpu`: `st_value` is the link-time KVA of the per-CPU
+///   template (readelf on a real vmlinux: `runqueues.st_value =
+///   0xffffffff83bcb280` against `.data..percpu sh_addr =
+///   0xffffffff83ba0000` — both non-zero KVAs). The per-CPU KVA
+///   for CPU `n` is `st_value + __per_cpu_offset[n]` (plus
+///   `virt_kaslr_offset` under KASLR);
+///   [`compute_rq_pas`] performs that add and then calls
+///   `kva_to_pa` for each CPU. Calling `kva_to_pa` on the raw
+///   `st_value` would translate the template address rather than
+///   any specific CPU's instance.
 pub(crate) const VMLINUX_ZERO_DATA_SECTIONS: &[&[u8]] = &[
     b".data",         // init_top_pgt, map_idr, prog_idr, scx_watchdog_timeout
     b".data..percpu", // runqueues (per-CPU runqueue template)
@@ -149,12 +153,14 @@ pub(crate) const VMLINUX_ZERO_DATA_SECTIONS: &[&[u8]] = &[
 /// Kernel symbol addresses extracted from vmlinux ELF.
 #[derive(Debug, Clone)]
 pub(crate) struct KernelSymbols {
-    /// `.data..percpu` section-relative offset of the `runqueues`
-    /// per-CPU variable. Per-CPU symbols carry section offsets (not
-    /// kernel virtual addresses) in the vmlinux symtab because the
-    /// `.data..percpu` section has `sh_addr=0`. The kernel virtual
-    /// address for CPU `n` is `runqueues + per_cpu_offset[n]`; see
-    /// [`compute_rq_pas`].
+    /// Link-time kernel virtual address of the `runqueues` per-CPU
+    /// template. Despite living in `.data..percpu`, x86_64 vmlinux
+    /// emits the symbol with a real KVA — readelf shows
+    /// `runqueues.st_value = 0xffffffff83bcb280` against
+    /// `.data..percpu sh_addr = 0xffffffff83ba0000` (both
+    /// non-zero). The kernel virtual address for CPU `n` is
+    /// `runqueues + per_cpu_offset[n]` (plus `virt_kaslr_offset`
+    /// under KASLR); see [`compute_rq_pas`].
     pub runqueues: u64,
     /// Kernel virtual address of the `__per_cpu_offset` array.
     pub per_cpu_offset: u64,
@@ -254,21 +260,24 @@ pub(crate) struct KernelSymbols {
     /// `.data..percpu` section. Subtracted from per-CPU symbol KVAs
     /// to recover section-relative offsets for `compute_rq_pas`.
     pub per_cpu_start: u64,
-    /// `.data..percpu` section-relative offset of the
-    /// `kernel_cpustat` per-CPU variable. The per-CPU KVA for CPU
-    /// `n` is `kernel_cpustat + __per_cpu_offset[n]`; same percpu-
-    /// addressing rule as [`Self::runqueues`]. Used by the failure
-    /// dump to read each CPU's `cpustat[CPUTIME_*]` counters.
-    /// `None` when the symbol is absent from a stripped vmlinux —
-    /// per-CPU CPU-time capture is then skipped.
+    /// Link-time kernel virtual address of the `kernel_cpustat`
+    /// per-CPU template. The per-CPU KVA for CPU `n` is
+    /// `kernel_cpustat + __per_cpu_offset[n]` (plus
+    /// `virt_kaslr_offset` under KASLR); same
+    /// per-CPU addressing rule as [`Self::runqueues`]. Used by the
+    /// failure dump to read each CPU's `cpustat[CPUTIME_*]`
+    /// counters. `None` when the symbol is absent from a stripped
+    /// vmlinux — per-CPU CPU-time capture is then skipped.
     pub kernel_cpustat: Option<u64>,
-    /// `.data..percpu` section-relative offset of the `kstat`
-    /// per-CPU variable (`struct kernel_stat`). Used by the failure
-    /// dump to read each CPU's `irqs_sum` and `softirqs[]`. `None`
-    /// when absent.
+    /// Link-time kernel virtual address of the `kstat` per-CPU
+    /// template (`struct kernel_stat`). Same per-CPU addressing
+    /// rule as [`Self::runqueues`]. Used by the failure dump to
+    /// read each CPU's `irqs_sum` and `softirqs[]`. `None` when
+    /// absent.
     pub kstat: Option<u64>,
-    /// `.data..percpu` section-relative offset of the `tick_cpu_sched`
-    /// per-CPU variable (`struct tick_sched`). Used by the failure
+    /// Link-time kernel virtual address of the `tick_cpu_sched`
+    /// per-CPU template (`struct tick_sched`). Same per-CPU
+    /// addressing rule as [`Self::runqueues`]. Used by the failure
     /// dump to read each CPU's `iowait_sleeptime`. `None` when
     /// absent — kernels without `CONFIG_NO_HZ_COMMON` omit this
     /// symbol; the dump path then skips that field per
@@ -322,10 +331,15 @@ impl KernelSymbols {
         // placeholders) carry st_shndx == 0 and must be skipped
         // here. We DO NOT filter `st_value != 0` because the cached-
         // vmlinux strip pipeline rewrites `.data..percpu` sh_addr to
-        // 0, leaving percpu st_value as a section-relative offset.
-        // A percpu symbol legitimately at offset 0 (e.g. the first
-        // entry in `.data..percpu`) would be silently dropped by an
-        // st_value filter, masquerading as an absent symbol.
+        // 0; some per-CPU symbols can plausibly land at low st_value
+        // after that rewrite, and a percpu symbol legitimately at
+        // st_value == 0 (e.g. the first entry in `.data..percpu`)
+        // would be silently dropped by an st_value filter,
+        // masquerading as an absent symbol. The arithmetic
+        // `template_st_value + __per_cpu_offset[cpu]` produces the
+        // per-CPU instance's KVA regardless of how `st_value` is
+        // encoded — the kernel calibrates `__per_cpu_offset` at boot
+        // to make the sum land at the runtime per-CPU area.
         const SHN_UNDEF: u16 = 0;
         let sym_addr = |name: &str| -> Option<u64> {
             elf.syms
@@ -374,9 +388,13 @@ impl KernelSymbols {
         let per_cpu_start = sym_addr("__per_cpu_start").unwrap_or(0);
 
         // Per-CPU CPU-time / softirq / IRQ / iowait_sleeptime
-        // symbols. All three are `.data..percpu` (section-relative
-        // offsets, NOT KVAs); resolution per CPU adds
-        // `__per_cpu_offset[cpu]` like every other percpu read.
+        // symbols. All three are `.data..percpu` per-CPU templates;
+        // resolution per CPU adds `__per_cpu_offset[cpu]` to the
+        // template's `st_value` (whether `st_value` itself is the
+        // raw link-time KVA or a post-strip relative form — the
+        // arithmetic lands at the per-CPU instance KVA either way
+        // because the kernel calibrates `__per_cpu_offset` to match
+        // the storage form).
         // Each is optional: a stripped vmlinux without
         // `kernel_cpustat`/`kstat` skips the corresponding capture
         // leg without failing the dump (CPU-time is best-effort
@@ -813,10 +831,11 @@ mod tests {
         let syms = KernelSymbols::from_vmlinux(&path).unwrap();
         assert_ne!(syms.runqueues, 0);
         assert_ne!(syms.per_cpu_offset, 0);
-        // runqueues is a per-cpu symbol — its st_value is a section-
-        // relative offset within .data..percpu (sh_addr=0), not a
-        // kernel VA. per_cpu_offset is a kernel-VA data symbol
-        // and is what should land in the upper half.
+        // runqueues is a per-cpu symbol — st_value IS a real KVA
+        // (the link-time KVA of the per-CPU template — see the
+        // VMLINUX_ZERO_DATA_SECTIONS doc + KernelSymbols.runqueues
+        // doc for readelf evidence). per_cpu_offset is a kernel-VA
+        // data symbol and is what should land in the upper half.
         assert!(syms.per_cpu_offset > 0xffff_0000_0000_0000);
     }
 

@@ -65,7 +65,7 @@ pub(crate) struct ScxWalkerOwned {
 ///   `dump_scx_walker_offsets`); without it `dump_state` cannot
 ///   construct a [`crate::monitor::dump::ScxWalkerCapture`].
 /// - `symbols`: no [`KernelSymbols`] (vmlinux ELF parse failed); the
-///   `runqueues` percpu section offset and `scx_root`/`scx_tasks`
+///   `runqueues` per-CPU template KVA and `scx_root`/`scx_tasks`
 ///   symbol KVAs are unavailable.
 ///
 /// `per_cpu_offsets` is NOT a hard prereq. When `None` (secondary
@@ -105,7 +105,7 @@ pub(crate) struct ScxWalkerOwned {
 /// `owned_accessor` carries the [`crate::monitor::guest::GuestKernel`]
 /// the walker reads through (used here only for `page_offset`);
 /// `offsets` carries the BTF sub-group offsets the walker needs;
-/// `symbols` carries the `runqueues` section offset and `scx_root`
+/// `symbols` carries the `runqueues` per-CPU template KVA and `scx_root`
 /// symbol KVA; `per_cpu_offsets` is the `__per_cpu_offset[]` array
 /// the walker uses to address each CPU's `scx_sched_pcpu.bypass_dsq`.
 #[allow(dead_code)]
@@ -171,14 +171,17 @@ pub(crate) fn build(
 /// without a real owned accessor (the type has no `new_for_test`
 /// constructor).
 ///
-/// `runqueues_off` is the `.data..percpu` section-relative offset of
-/// the per-CPU `runqueues` symbol (NOT a KVA — see
-/// [`crate::monitor::symbols::KernelSymbols::runqueues`]); the per-CPU
-/// rq KVA for CPU `n` is `runqueues_off + per_cpu_offsets[n]` and the
-/// PA is the same KVA minus `page_offset` (direct mapping).
+/// `runqueues_kva` is the link-time KVA of the per-CPU `runqueues`
+/// template — readelf on a real vmlinux shows
+/// `runqueues.st_value = 0xffffffff83bcb280` against `.data..percpu`
+/// `sh_addr = 0xffffffff83ba0000` (NON-zero), so `st_value` IS a
+/// KVA. The per-CPU rq KVA for CPU `n` is
+/// `runqueues_kva + per_cpu_offsets[n]` (plus `virt_kaslr_offset`
+/// under KASLR); the PA is the same KVA minus
+/// `page_offset` (direct mapping).
 fn compute_owned(
     page_offset: u64,
-    runqueues_off: u64,
+    runqueues_kva: u64,
     scx_root_kva: u64,
     scx_tasks_kva: u64,
     per_cpu_offsets: &[u64],
@@ -193,7 +196,7 @@ fn compute_owned(
     let mut rq_pas: Vec<u64> = Vec::with_capacity(n);
     let mut rq_kvas: Vec<u64> = Vec::with_capacity(n);
     for &offset in per_cpu_offsets {
-        let kva = runqueues_off.wrapping_add(offset);
+        let kva = runqueues_kva.wrapping_add(offset);
         let pa = crate::monitor::symbols::kva_to_pa(kva, page_offset);
         rq_pas.push(pa);
         rq_kvas.push(pa.wrapping_add(page_offset));
@@ -213,20 +216,20 @@ mod tests {
 
     /// Happy path: every prereq resolves. The pure builder produces
     /// per-CPU rq KVA/PA pairs that match
-    /// `runqueues_off + per_cpu_offset[cpu]` and pass `scx_root_kva`
+    /// `runqueues_kva + per_cpu_offset[cpu]` and pass `scx_root_kva`
     /// through unchanged. Mirrors the runnable scanner's address
     /// derivation in `freeze_coord.rs` so both code paths agree on
     /// the per-CPU rq base.
     #[test]
     fn compute_owned_happy_path() {
         let page_offset = DEFAULT_PAGE_OFFSET;
-        let runqueues_off: u64 = 0x20_0000;
+        let runqueues_kva: u64 = 0x20_0000;
         let per_cpu = [0x10_0000u64, 0x14_0000u64, 0x18_0000u64];
         let scx_root_kva = 0xffff_ffff_8230_0000;
         let scx_tasks_kva = 0xffff_ffff_8240_0000;
         let owned = compute_owned(
             page_offset,
-            runqueues_off,
+            runqueues_kva,
             scx_root_kva,
             scx_tasks_kva,
             &per_cpu,
@@ -240,7 +243,7 @@ mod tests {
         // scanner uses — any drift between the two would surface
         // here as different per-CPU PAs.
         let expected_pas =
-            crate::monitor::symbols::compute_rq_pas(runqueues_off, &per_cpu, page_offset, 0, 0);
+            crate::monitor::symbols::compute_rq_pas(runqueues_kva, &per_cpu, page_offset, 0, 0);
         assert_eq!(owned.rq_pas, expected_pas);
         // Every rq_kva is the recovered KVA for the same CPU's PA.
         for (cpu, expected_pa) in expected_pas.iter().enumerate() {
@@ -255,16 +258,16 @@ mod tests {
     #[test]
     fn compute_owned_partial_scx_root_zero() {
         let page_offset = DEFAULT_PAGE_OFFSET;
-        let runqueues_off: u64 = 0x20_0000;
+        let runqueues_kva: u64 = 0x20_0000;
         let per_cpu = [0x10_0000u64, 0x14_0000u64];
-        let owned = compute_owned(page_offset, runqueues_off, 0, 0, &per_cpu);
+        let owned = compute_owned(page_offset, runqueues_kva, 0, 0, &per_cpu);
 
         assert_eq!(owned.scx_root_kva, 0);
         assert_eq!(owned.scx_tasks_kva, 0);
         assert_eq!(owned.rq_kvas.len(), 2);
         assert_eq!(owned.rq_pas.len(), 2);
         let expected_pas =
-            crate::monitor::symbols::compute_rq_pas(runqueues_off, &per_cpu, page_offset, 0, 0);
+            crate::monitor::symbols::compute_rq_pas(runqueues_kva, &per_cpu, page_offset, 0, 0);
         assert_eq!(owned.rq_pas, expected_pas);
     }
 
@@ -275,10 +278,10 @@ mod tests {
     #[test]
     fn compute_owned_partial_scx_tasks_zero() {
         let page_offset = DEFAULT_PAGE_OFFSET;
-        let runqueues_off: u64 = 0x20_0000;
+        let runqueues_kva: u64 = 0x20_0000;
         let per_cpu = [0x10_0000u64];
         let scx_root_kva = 0xffff_ffff_8230_0000;
-        let owned = compute_owned(page_offset, runqueues_off, scx_root_kva, 0, &per_cpu);
+        let owned = compute_owned(page_offset, runqueues_kva, scx_root_kva, 0, &per_cpu);
 
         assert_eq!(owned.scx_root_kva, scx_root_kva);
         assert_eq!(owned.scx_tasks_kva, 0);
@@ -349,10 +352,10 @@ mod tests {
     #[test]
     fn compute_owned_empty_per_cpu_offsets() {
         let page_offset = DEFAULT_PAGE_OFFSET;
-        let runqueues_off: u64 = 0x20_0000;
+        let runqueues_kva: u64 = 0x20_0000;
         let scx_root_kva = 0xffff_ffff_8230_0000;
         let scx_tasks_kva = 0xffff_ffff_8240_0000;
-        let owned = compute_owned(page_offset, runqueues_off, scx_root_kva, scx_tasks_kva, &[]);
+        let owned = compute_owned(page_offset, runqueues_kva, scx_root_kva, scx_tasks_kva, &[]);
 
         assert!(owned.rq_kvas.is_empty());
         assert!(owned.rq_pas.is_empty());
@@ -369,11 +372,11 @@ mod tests {
     fn compute_owned_wrapping_arithmetic() {
         let page_offset = DEFAULT_PAGE_OFFSET;
         // Pick a per_cpu offset that, combined with the section-
-        // relative runqueues_off, lands at exactly page_offset — the
+        // relative runqueues_kva, lands at exactly page_offset — the
         // resulting rq_pa is 0 and the recovered rq_kva is page_offset.
-        let runqueues_off: u64 = 0x1000;
-        let per_cpu = [page_offset.wrapping_sub(runqueues_off)];
-        let owned = compute_owned(page_offset, runqueues_off, 0, 0, &per_cpu);
+        let runqueues_kva: u64 = 0x1000;
+        let per_cpu = [page_offset.wrapping_sub(runqueues_kva)];
+        let owned = compute_owned(page_offset, runqueues_kva, 0, 0, &per_cpu);
 
         assert_eq!(owned.rq_pas, vec![0u64]);
         assert_eq!(owned.rq_kvas, vec![page_offset]);
@@ -386,7 +389,7 @@ mod tests {
     #[test]
     fn compute_owned_kva_pa_pairwise_consistent() {
         let page_offset = DEFAULT_PAGE_OFFSET;
-        let runqueues_off: u64 = 0x4_0000;
+        let runqueues_kva: u64 = 0x4_0000;
         let per_cpu = [
             0x10_0000u64,
             0x14_0000u64,
@@ -396,7 +399,7 @@ mod tests {
         ];
         let owned = compute_owned(
             page_offset,
-            runqueues_off,
+            runqueues_kva,
             0xffff_ffff_8000_0000,
             0xffff_ffff_8001_0000,
             &per_cpu,
