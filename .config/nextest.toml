@@ -81,6 +81,11 @@ filter = "test(acquire_llc_plan_) | test(resource_lock_exclusive_) | test(resour
 test-group = "llc-lock"
 threads-required = 1
 
+[[profile.ci.overrides]]
+filter = "binary(compile_fail) & test(=compile_fail)"
+test-group = "compile-fail"
+threads-required = 1
+
 # vmm::sched_stats tests share a binary whose first-attempt load is
 # slow under cold page cache + concurrent test-runner contention.
 # Observed: try 1 hit profile.default's 60s x 2 = 120s slow-timeout;
@@ -157,10 +162,11 @@ slow-timeout = { period = "120s", terminate-after = 2 }
 # should fail ("Expected test case to fail to compile, but it
 # succeeded"). Inherits retries = 5 from profile.default which
 # typically resolves the contention on try 2-3 after the concurrent
-# build settles. The `compile-fail` justfile recipe + matching CI job
-# run this filter serially (`-j 1`) to sidestep the contention
-# entirely; per-fixture trybuild cache isolation would be the
-# definitive in-tree fix (would require patching the test wrapper).
+# build settles. The `compile-fail` test-group below holds the
+# driver to a single slot so cross-test cargo invocations cannot
+# interleave with trybuild's fixture builds; per-fixture trybuild
+# cache isolation would be the definitive in-tree fix (would require
+# patching the test wrapper).
 [[profile.default.overrides]]
 filter = "test(compile_fail)"
 slow-timeout = { period = "180s", terminate-after = 2 }
@@ -283,6 +289,27 @@ max-threads = 1
 [[profile.default.overrides]]
 filter = "test(acquire_llc_plan_) | test(resource_lock_exclusive_) | test(resource_lock_shared_) | test(resource_lock_contention_returns_unavailable) | test(resource_lock_all_or_nothing) | test(resource_lock_service_cpu_contention) | test(resource_lock_empty_llc_indices) | test(resource_lock_release_on_drop) | test(cpu_lock_window_) | test(cpu_lock_acquire_) | test(cpu_lock_llc_shared_protection) | test(cpu_lock_contention_slides_window) | test(cpu_lock_zero_count)"
 test-group = "llc-lock"
+threads-required = 1
+
+# ── compile-fail ─────────────────────────────────────────────────────
+# The compile_fail test driver invokes trybuild, which spawns one
+# `cargo build` per fixture. Each cargo invocation grabs target/'s
+# build lock; trybuild itself walks its fixtures sequentially. The
+# stale-target race appears when compile_fail runs CONCURRENTLY with
+# other tests that also spawn cargo invocations (or otherwise mutate
+# target/) — a neighbour test's intermediate `.rmeta` /`.rlib` can
+# satisfy a fixture build that should have failed. max-threads = 1
+# + threads-required = 1 holds the compile_fail driver to a single
+# slot, so the test-group reserves the entire pool against cross-test
+# contention. Other tests outside this group keep their global
+# parallelism. Within compile_fail, trybuild's fixture loop is
+# already serial — the test-group does NOT change that.
+[test-groups.compile-fail]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = "binary(compile_fail) & test(=compile_fail)"
+test-group = "compile-fail"
 threads-required = 1
 
 # Quick profile: short-circuit long-running tests.

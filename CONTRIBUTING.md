@@ -37,13 +37,18 @@ message that a test author would otherwise see at compile time.
 The fixtures live in their own `[[test]] name = "compile_fail"`
 target. The test driver function in `tests/compile_fail.rs` carries
 `#[ignore]` so `cargo nextest run` skips it by default; `just
-compile-fail` runs it via `--run-ignored all` in serial (`-j 1`).
-The serial mode is deliberate — trybuild's per-fixture `cargo build`
-calls share `target/` with neighbour tests, and a concurrent build
-can leave stale dep artifacts that let a fixture compile cleanly
-when it should fail. CI runs `just compile-fail` as a dedicated job
-on every push and pull-request, so a new fixture is picked up
-automatically.
+compile-fail` runs it via `--run-ignored all`. Each fixture is its
+own `cargo build` invocation; trybuild iterates them sequentially
+inside the driver. The `compile-fail` nextest test-group in
+`.config/nextest.toml` pins `max-threads = 1` for the matched
+filter so the driver doesn't share a runner slot with neighbour
+tests that also spawn cargo invocations (or otherwise mutate
+`target/`) — concurrent cargo runs across tests can leave stale
+intermediate artifacts that let a fixture compile cleanly when it
+should fail. The test-group addresses that cross-test contention;
+within the driver, trybuild's fixture loop is already serial. CI
+runs `just compile-fail` as a dedicated job on every push and
+pull-request, so a new fixture is picked up automatically.
 
 When you change a diagnostic intentionally, regenerate every
 fixture's `.stderr` snapshot with:
