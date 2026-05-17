@@ -20,6 +20,9 @@ use super::config::{CloneMode, MemPolicy, MpolFlags, SchedPolicy, WorkSpec, Work
 use super::types::*;
 use super::worker::worker_main;
 
+mod cleanup;
+use cleanup::{close_fds_silently, kill_and_killpg};
+
 pub(super) static STOP: AtomicBool = AtomicBool::new(false);
 
 /// A single CPU migration event observed by a worker.
@@ -1137,11 +1140,7 @@ impl Drop for SpawnGuard {
         }
         // Close each child's parent-side report/start fds.
         for child in &self.children {
-            for fd in [child.report_fd, child.start_fd] {
-                if fd >= 0 {
-                    let _ = nix::unistd::close(fd);
-                }
-            }
+            close_fds_silently(&[child.report_fd, child.start_fd]);
         }
         // Stop and join any partially-spawned threads. Threads
         // share our address space, so `kill` does not reach them
@@ -1181,14 +1180,11 @@ impl Drop for SpawnGuard {
         // copies it held, and Thread-mode early-bail joined any
         // partially-spawned threads above before this loop runs.
         for (ab, ba) in &self.pipe_pairs {
-            for fd in [ab[0], ab[1], ba[0], ba[1]] {
-                let _ = nix::unistd::close(fd);
-            }
+            close_fds_silently(&[ab[0], ab[1], ba[0], ba[1]]);
         }
         for chain in &self.chain_pipes {
             for pipe in chain {
-                let _ = nix::unistd::close(pipe[0]);
-                let _ = nix::unistd::close(pipe[1]);
+                close_fds_silently(&[pipe[0], pipe[1]]);
             }
         }
         // Munmap shared regions. `futex_ptrs[i]` and
@@ -4808,16 +4804,14 @@ impl WorkloadHandle {
                 // Kill first so read_to_end doesn't block on the
                 // pipe's write end (the child may have written
                 // only the 'r' ready byte but no payload).
-                let _ = nix::sys::signal::kill(npid, nix::sys::signal::Signal::SIGKILL);
-                let _ = nix::sys::signal::killpg(npid, nix::sys::signal::Signal::SIGKILL);
+                kill_and_killpg(npid, nix::sys::signal::Signal::SIGKILL);
                 let _ = nix::unistd::close(child.report_fd);
             } else {
                 // Child responded — read the report, then kill.
                 let mut f = unsafe { std::fs::File::from_raw_fd(child.report_fd) };
                 let _ = f.read_to_end(&mut buf);
                 drop(f);
-                let _ = nix::sys::signal::kill(npid, nix::sys::signal::Signal::SIGKILL);
-                let _ = nix::sys::signal::killpg(npid, nix::sys::signal::Signal::SIGKILL);
+                kill_and_killpg(npid, nix::sys::signal::Signal::SIGKILL);
             }
             let waited = nix::sys::wait::waitpid(npid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
             let still_running = matches!(waited, Ok(nix::sys::wait::WaitStatus::StillAlive));
