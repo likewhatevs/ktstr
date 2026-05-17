@@ -265,6 +265,16 @@ impl BoolAttrSlots<'_> {
 ///     must have signature
 ///     `fn(&ktstr::vmm::VmResult) -> anyhow::Result<()>`.
 ///     Default: `None` (no callback).
+///   - `disk = PATH` — path to a `const DiskConfig` attached to the
+///     VM as a virtio-blk device at `/dev/vda`. Construct via
+///     `DiskConfig::DEFAULT.with_name("data")` or similar const-fn
+///     chain (the `with_name` builder takes `&'static str` so the
+///     full expression is const-evaluable). Maps onto
+///     `KtstrTestEntry::disk`. Default: `None` (no disk).
+///     Mutually exclusive with `host_only = true` —
+///     `host_only` skips the VM boot that owns the device lifecycle,
+///     so a `disk` attached under `host_only` would never bind;
+///     `KtstrTestEntry::validate` rejects the pairing at runtime.
 ///   - `config = EXPR` — inline scheduler config content, written
 ///     into the guest at the path declared by the scheduler's
 ///     `config_file_def`. `EXPR` is either a string literal or a
@@ -425,6 +435,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut post_vm: Option<syn::Path> = None;
     let mut config_expr: Option<proc_macro2::TokenStream> = None;
     let mut config_set = false;
+    let mut disk: Option<syn::Path> = None;
 
     let attr_parser = syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated;
     let parsed_attrs = match attr_parser.parse(attr) {
@@ -560,6 +571,23 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             }
                         };
                         post_vm = Some(p);
+                    }
+                    "disk" => {
+                        let p = match value {
+                            syn::Expr::Path(ep) => ep.path.clone(),
+                            _ => {
+                                return syn::Error::new_spanned(
+                                    value,
+                                    "expected path for disk (e.g. MY_DISK \
+                                     where MY_DISK is a `const DiskConfig`); \
+                                     construct via `DiskConfig::DEFAULT.with_name(...)` \
+                                     or similar const-fn chain",
+                                )
+                                .to_compile_error()
+                                .into();
+                            }
+                        };
+                        disk = Some(p);
                     }
                     "config" => {
                         // Accept either a string literal (`config = "..."`) or a
@@ -931,7 +959,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mib, scheduler, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, expect_scx_bpf_error_contains, expect_scx_bpf_error_matches, extra_sched_args, extra_include_files, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, bpf_map_write, expect_err, host_only, ignore, cleanup_budget_ms, post_vm, config, num_snapshots"),
+                            format!("unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mib, scheduler, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, expect_scx_bpf_error_contains, expect_scx_bpf_error_matches, extra_sched_args, extra_include_files, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, bpf_map_write, expect_err, host_only, ignore, cleanup_budget_ms, post_vm, config, disk, num_snapshots"),
                         )
                         .to_compile_error()
                         .into();
@@ -1593,6 +1621,16 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         quote! {}
     };
+    // `disk = PATH` resolves to a `const DiskConfig`. The entry's
+    // `disk` field is `Option<DiskConfig>` (owned, but const-
+    // constructible — see DiskConfig::DEFAULT). Wrap in `Some(...)`
+    // at emission. The struct is `Clone` so spreading a const ref
+    // into a `static` initializer works.
+    let disk_field = if let Some(ref p) = disk {
+        quote! { disk: ::core::option::Option::Some(#p), }
+    } else {
+        quote! {}
+    };
 
     // Compile-time assert: `config = ...` must be paired with a
     // scheduler that declares `config_file_def`, and vice versa. The
@@ -1831,6 +1869,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             #cleanup_budget_field
             #post_vm_field
             #config_content_field
+            #disk_field
             ..::ktstr::test_support::KtstrTestEntry::DEFAULT
         };
 

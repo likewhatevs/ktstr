@@ -2,6 +2,15 @@ use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
+use ktstr::prelude::DiskConfig;
+
+/// Const-evaluable DiskConfig declared at module scope so the
+/// `#[ktstr_test(disk = MACRO_TEST_DISK)]` arm below can reference
+/// it as a path. Pins the const-construction property the macro's
+/// `disk = PATH` codegen depends on — if `DiskConfig::DEFAULT` or
+/// `with_name` ever loses const-fn-ness, this const declaration
+/// fails at `cargo check` and the test that follows can't compile.
+const MACRO_TEST_DISK: DiskConfig = DiskConfig::DEFAULT.with_name("macro-test");
 
 /// Minimal ktstr_test that checks the macro compiles and the generated
 /// linkme registration + test wrapper resolve correctly from an
@@ -66,6 +75,20 @@ fn bare_mixed_bool_attrs_compile(ctx: &Ctx) -> Result<AssertResult> {
 /// not drag the test through a VM boot.
 #[ktstr_test(host_only = true, workloads = [])]
 fn empty_workloads_compiles(_ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+
+/// Pin the `#[ktstr_test(disk = PATH)]` macro arm — verifies the
+/// `disk = MACRO_TEST_DISK` syntax expands to a valid entry that
+/// links into the test registry. The test body just confirms the
+/// disk made it through to the runtime entry; it does not boot the
+/// VM (disk requires VM boot which is heavy + needs disk infra).
+///
+/// `#[ignore]` so the test isn't gated on the disk-template-cache
+/// infrastructure; the value is the COMPILE pass, not the runtime
+/// behavior.
+#[ktstr_test(llcs = 1, cores = 1, threads = 1, disk = MACRO_TEST_DISK, ignore)]
+fn disk_macro_arm_compiles(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 

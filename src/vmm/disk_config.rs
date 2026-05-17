@@ -440,7 +440,20 @@ pub struct DiskConfig {
     /// name lets WorkType variants reference the disk symbolically
     /// (e.g. `"data"`, `"log"`) instead of by index, which keeps
     /// tests stable across topology rearrangements.
-    pub name: Option<String>,
+    ///
+    /// Stored as `Option<&'static str>` so `DiskConfig` is
+    /// const-constructible — `DiskConfig::DEFAULT.with_name("data")`
+    /// works in a `static` or `const` initializer, which the
+    /// `#[ktstr_test(disk = ...)]` macro relies on. The field is
+    /// `#[serde(skip)]` because `&'static str` can't be deserialized
+    /// from arbitrary input without leaking; the name is operator
+    /// metadata that the framework computes on-the-fly from the
+    /// declaration, not state that needs to round-trip through
+    /// sidecar JSON. Sidecar consumers that need to associate a
+    /// disk identity with serialized data should use the disk's
+    /// index instead.
+    #[serde(skip)]
+    pub name: Option<&'static str>,
     /// Opt out of guest-side auto-mount. Default `false` means a
     /// non-`Raw` disk is auto-mounted at `/mnt/disk0` by the guest
     /// init (see
@@ -471,15 +484,39 @@ impl Default for DiskConfig {
     /// — operators running large topologies should size host memory
     /// accordingly or override `TMPDIR` to a disk-backed path.
     fn default() -> Self {
-        DiskConfig {
-            capacity_mib: 256,
-            filesystem: Filesystem::Raw,
-            throttle: DiskThrottle::default(),
-            read_only: false,
-            name: None,
-            no_auto_mount: false,
-        }
+        Self::DEFAULT
     }
+}
+
+impl DiskConfig {
+    /// Const-evaluable default — same values as [`Default::default`]
+    /// but usable in `static` / `const` initializers. Required for
+    /// the `#[ktstr_test(disk = ...)]` macro surface: the macro
+    /// emits a `static` containing a `DiskConfig`, which must be
+    /// const-constructible.
+    ///
+    /// Spread via `..DiskConfig::DEFAULT` in struct-update syntax,
+    /// or chain const setters (`DiskConfig::DEFAULT.with_name("data")`).
+    pub const DEFAULT: Self = Self {
+        capacity_mib: 256,
+        filesystem: Filesystem::Raw,
+        throttle: DiskThrottle::DEFAULT,
+        read_only: false,
+        name: None,
+        no_auto_mount: false,
+    };
+}
+
+impl DiskThrottle {
+    /// Const-evaluable default — all `None` (unthrottled), matching
+    /// [`Default::default`]. Required so `DiskConfig::DEFAULT` can be
+    /// `const`.
+    pub const DEFAULT: Self = Self {
+        iops: None,
+        bytes_per_sec: None,
+        iops_burst_capacity: None,
+        bytes_burst_capacity: None,
+    };
 }
 
 impl DiskConfig {
@@ -631,15 +668,21 @@ impl DiskConfig {
     /// that need to address a specific disk (e.g. one of several
     /// attached) can resolve the name instead of relying on
     /// attachment order. Default is anonymous (`None`); calling
-    /// `.name(...)` sets it.
+    /// `.with_name(...)` sets it.
     ///
     /// The name also drives the guest auto-mount path: a disk
     /// named `"data"` auto-mounts at `/mnt/data` instead of the
     /// default `/mnt/disk0`. See [`Self::no_auto_mount`] to opt
     /// out of auto-mount entirely.
+    ///
+    /// Takes `&'static str` so the builder is `const fn` —
+    /// `DiskConfig::DEFAULT.with_name("data")` can spread into a
+    /// `static` initializer. String literals are `&'static`; tests
+    /// needing a dynamic name should build the disk programmatically
+    /// rather than going through this builder.
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn name(mut self, name: impl Into<String>) -> Self {
-        self.name = Some(name.into());
+    pub const fn with_name(mut self, name: &'static str) -> Self {
+        self.name = Some(name);
         self
     }
 
@@ -671,7 +714,7 @@ impl DiskConfig {
     /// [`crate::vmm::rust_init::auto_mount_data_disks`].
     #[allow(dead_code)]
     pub(crate) fn auto_mount_path(&self) -> String {
-        match self.name.as_deref() {
+        match self.name {
             Some(n) => format!("/mnt/{n}"),
             None => "/mnt/disk0".to_string(),
         }
@@ -837,7 +880,7 @@ mod tests {
                 bytes_burst_capacity: NonZeroU64::new(200 * 1024 * 1024),
             },
             read_only: true,
-            name: Some("data-disk".to_string()),
+            name: Some("data-disk"),
             no_auto_mount: false,
         };
 
@@ -893,8 +936,17 @@ mod tests {
             original.throttle.bytes_burst_capacity
         );
         assert_eq!(parsed.read_only, original.read_only);
-        assert_eq!(parsed.name, original.name);
-        assert_eq!(parsed.name.as_deref(), Some("data-disk"));
+        // `name` is `#[serde(skip)]` since `&'static str` can't be
+        // deserialized from arbitrary input — the field round-trips
+        // to `None` regardless of original. Test authors that need
+        // disk identity in serialized output should use the disk's
+        // index instead. Pin this contract here so a future serde
+        // tweak (e.g. dropping the skip) surfaces in this assertion.
+        assert!(
+            parsed.name.is_none(),
+            "DiskConfig.name uses #[serde(skip)]; round-trip must produce None regardless of original (was {:?})",
+            original.name,
+        );
     }
 
     /// Roundtrip the unthrottled default (both throttle fields
@@ -926,19 +978,24 @@ mod tests {
     }
 
     #[test]
-    fn name_builder_sets_label() {
-        let d = DiskConfig::default().name("data-disk");
+    fn with_name_builder_sets_label() {
+        let d = DiskConfig::default().with_name("data-disk");
         assert_eq!(d.name.as_deref(), Some("data-disk"));
 
-        // Accepts both &str (Into<String>) and String — pin the
-        // generic-bound coverage so a future tightening to &str-only
-        // surfaces here.
-        let d = DiskConfig::default().name(String::from("log-disk"));
-        assert_eq!(d.name.as_deref(), Some("log-disk"));
-
         // Last call wins — the builder overwrites.
-        let d = DiskConfig::default().name("first").name("second");
+        let d = DiskConfig::default().with_name("first").with_name("second");
         assert_eq!(d.name.as_deref(), Some("second"));
+    }
+
+    /// The `with_name` builder is `const fn`, so a `static DiskConfig`
+    /// can be constructed by chaining setters off the const DEFAULT.
+    /// This pins the const-construction property the #[ktstr_test]
+    /// macro's `disk = ...` arm depends on.
+    #[test]
+    fn with_name_works_in_const_context() {
+        const NAMED: DiskConfig = DiskConfig::DEFAULT.with_name("static-disk");
+        assert_eq!(NAMED.name.as_deref(), Some("static-disk"));
+        assert_eq!(NAMED.capacity_mib, 256);
     }
 
     #[test]

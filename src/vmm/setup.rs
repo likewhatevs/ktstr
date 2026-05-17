@@ -1653,7 +1653,7 @@ mod tests {
     fn disk_auto_mount_cmdline_tokens_btrfs_named() {
         let disk = disk_config::DiskConfig::default()
             .filesystem(disk_config::Filesystem::Btrfs)
-            .name("data");
+            .with_name("data");
         assert_eq!(
             disk_auto_mount_cmdline_tokens(&disk),
             " KTSTR_DISK0_FS=btrfs KTSTR_DISK0_MOUNT=/mnt/data",
@@ -1691,7 +1691,7 @@ mod tests {
         // dominates every other config dimension.
         let disk = disk_config::DiskConfig::default()
             .filesystem(disk_config::Filesystem::Btrfs)
-            .name("data")
+            .with_name("data")
             .read_only()
             .no_auto_mount();
         assert_eq!(disk_auto_mount_cmdline_tokens(&disk), "");
