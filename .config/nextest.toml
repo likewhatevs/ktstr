@@ -43,7 +43,7 @@ filter = "test(gauntlet/)"
 slow-timeout = { period = "120s", terminate-after = 3 }
 
 [[profile.ci.overrides]]
-filter = "test(compile_fail)"
+filter = "binary(compile_fail) & test(=compile_fail)"
 slow-timeout = { period = "180s", terminate-after = 3 }
 
 [[profile.ci.overrides]]
@@ -168,7 +168,7 @@ slow-timeout = { period = "120s", terminate-after = 2 }
 # cache isolation would be the definitive in-tree fix (would require
 # patching the test wrapper).
 [[profile.default.overrides]]
-filter = "test(compile_fail)"
+filter = "binary(compile_fail) & test(=compile_fail)"
 slow-timeout = { period = "180s", terminate-after = 2 }
 
 # cached_releases bypass test: drives a localhost mock through the

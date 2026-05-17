@@ -64,8 +64,12 @@ docs:
 # locally before opening a PR that touches doc/guide/src to catch
 # broken cross-page anchors that mdbook-linkcheck2's pre-render check
 # can miss (e.g. typo'd #fragment refs against post-render heading IDs).
+# `mdbook test` also runs every doctest inside the guide so a code
+# block that drifts away from the live API surfaces at PR time
+# rather than after a release goes out.
 link-check:
     mdbook build doc/guide
+    mdbook test doc/guide
     lychee --offline --no-progress doc/guide/book/html
 
 # Build API reference
