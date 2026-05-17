@@ -36,7 +36,7 @@
 //!    full instrumentation in place.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use super::btf::{BtfFunc, RenderHint, STRUCT_FIELDS};
@@ -44,6 +44,68 @@ use super::stack::StackFunction;
 
 use crate::bpf_skel::types;
 use crate::sync::{Latch, RwLockExt};
+
+/// Cross-thread mirror of the BPF probe's `ktstr_err_exit_detected`
+/// BSS latch. The probe-poll thread reads the BSS slot via volatile
+/// load each iteration and `store`s the observed value here; scenario
+/// code calls [`sched_exit_kind`] from any thread to read the current
+/// classification synchronously without owning the skeleton.
+///
+/// Encoded as `u32` for `AtomicU32`-friendliness:
+/// - `0` (initial / probe-not-yet-armed / scheduler still alive):
+///   [`SchedExitKind::Unknown`].
+/// - `1` ([`SchedExitKind::Clean`]) — probe armed, BSS latch read as
+///   `0` after at least one poll iteration. Means the scheduler is
+///   either still alive (latch never set) or exited via the clean
+///   `SCX_EXIT_NONE` path.
+/// - `2` ([`SchedExitKind::Crashed`]) — probe armed, BSS latch
+///   observed at `!= 0`. Set by the BPF trace_sched_ext_exit handler
+///   under any non-clean kernel exit (`SCX_EXIT_ERROR`,
+///   `SCX_EXIT_ERROR_STALL`, watchdog kick, BPF-side error).
+///
+/// 0 → 1/2 transitions are monotonic for a single test run; once the
+/// kernel emits the exit trace, the latch never clears. Cross-thread
+/// observation uses Release / Acquire so the scenario-side load sees
+/// every prior probe-side store.
+pub(crate) static PROBE_SCHED_EXIT_STATE: AtomicU32 = AtomicU32::new(0);
+
+const PROBE_EXIT_STATE_CLEAN: u32 = 1;
+const PROBE_EXIT_STATE_CRASHED: u32 = 2;
+
+/// Classification of the scheduler's exit observed by the probe
+/// poll thread. Mirrors the BSS latch in
+/// [`PROBE_SCHED_EXIT_STATE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedExitKind {
+    /// Probe has not observed the scheduler's exit yet — either the
+    /// scheduler is still alive, the probe never armed for this run,
+    /// or the poll thread has not completed a single iteration since
+    /// the prior reset. Callers gating clean-vs-crash classification
+    /// on a known-dead scheduler treat `Unknown` as a probe-coverage
+    /// gap, not as evidence of either outcome.
+    Unknown,
+    /// Probe armed AND completed at least one observation with the
+    /// BSS latch unset. Scheduler is either still alive or exited
+    /// cleanly via the `SCX_EXIT_NONE` path that does not latch the
+    /// error flag.
+    Clean,
+    /// Probe armed AND observed the BSS latch set. Kernel emitted a
+    /// non-clean `trace_sched_ext_exit` event (error, stall,
+    /// watchdog kick, BPF-side error) before this read.
+    Crashed,
+}
+
+/// Read the current probe-observed scheduler exit classification.
+/// Synchronous, cross-thread-safe (Acquire load mirrors the probe's
+/// Release stores). Returns [`SchedExitKind::Unknown`] when the
+/// probe has not yet completed its first poll iteration.
+pub fn sched_exit_kind() -> SchedExitKind {
+    match PROBE_SCHED_EXIT_STATE.load(Ordering::Acquire) {
+        PROBE_EXIT_STATE_CLEAN => SchedExitKind::Clean,
+        PROBE_EXIT_STATE_CRASHED => SchedExitKind::Crashed,
+        _ => SchedExitKind::Unknown,
+    }
+}
 
 /// Input for Phase B probe attachment (BPF fentry/fexit).
 ///
@@ -1693,6 +1755,21 @@ pub fn run_probe_skeleton(
         let bss_triggered = skel.maps.bss_data.as_ref().is_some_and(|bss| unsafe {
             std::ptr::read_volatile(&bss.ktstr_err_exit_detected as *const u32) != 0
         });
+        // Mirror the latch into the cross-thread atomic so scenario
+        // code can synchronously classify SchedulerDied as Clean vs
+        // Crashed without owning the skeleton. Monotonic 0→1→2 —
+        // once a poll iteration completes we know the probe armed,
+        // and the BSS latch only ever transitions 0→1 within a
+        // single test run. Release pairs with the Acquire load in
+        // `sched_exit_kind()`.
+        PROBE_SCHED_EXIT_STATE.store(
+            if bss_triggered {
+                PROBE_EXIT_STATE_CRASHED
+            } else {
+                PROBE_EXIT_STATE_CLEAN
+            },
+            Ordering::Release,
+        );
         // Snapshot `triggered` once: a second `triggered.load` for the
         // diag assignment would observe an unrelated state if a racing
         // trigger fires between the two reads, so the gate decision

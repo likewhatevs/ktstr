@@ -168,15 +168,37 @@ pub enum DetailKind {
     /// Use `DetailKind::SchedulerDied` for scheduler-liveness failures.
     Monitor,
     /// Scheduler process observed to have died (via `sched_pid`
-    /// probe returning ESRCH or wait on the leader). Covers
-    /// post-ops liveness probes and inter-step liveness checks;
-    /// the vocabulary was unified from "exited" / "no longer
-    /// running" onto "died" so every scheduler-liveness failure
-    /// lands under a single structural tag. Consumers filter on
-    /// this variant directly — `test_support::eval`'s console-dump
-    /// gate matches on `kind == SchedulerDied` rather than
-    /// scanning message text.
-    SchedulerDied,
+    /// probe returning ESRCH or wait on the leader) AND the BPF
+    /// probe observed a non-clean `trace_sched_ext_exit` event
+    /// before the liveness check fired. The crash classification
+    /// covers SCX_EXIT_ERROR, SCX_EXIT_ERROR_STALL, watchdog kick,
+    /// and BPF-side error paths — every kernel exit that latches
+    /// `ktstr_err_exit_detected` in the probe BSS.
+    ///
+    /// Distinguished from [`DetailKind::SchedulerExitedCleanly`]
+    /// (`SCX_EXIT_NONE` clean teardown) so the console-dump gate
+    /// and downstream triage can tell a real crash from a benign
+    /// completion. Consumers wanting to gate on "any scheduler
+    /// exit" should match both variants via
+    /// `matches!(d.kind, SchedulerCrashed | SchedulerExitedCleanly)`.
+    SchedulerCrashed,
+    /// Scheduler process observed to have died with the probe BSS
+    /// `ktstr_err_exit_detected` latch unset — the kernel ran the
+    /// `SCX_EXIT_NONE` clean-teardown path (sysrq, explicit
+    /// unregister) without latching an error. Surfaces alongside
+    /// `SchedulerCrashed` because both are "scheduler exited"
+    /// signals; splitting them lets the operator distinguish a
+    /// benign shutdown from a real fault without re-parsing
+    /// console output.
+    SchedulerExitedCleanly,
+    /// Scheduler process observed to have died but the BPF probe
+    /// has no classification yet — either the probe never armed
+    /// for this run (no scheduler attached, host-only test) or
+    /// the poll thread has not completed a first iteration since
+    /// the prior reset. Operators triaging this variant should
+    /// check whether the probe pipeline was wired before
+    /// concluding "scheduler-exit classification is broken".
+    SchedulerDiedUnknownReason,
     /// SCX event-counter threshold failure. An error-class
     /// `SCX_EV_*` counter (e.g. `enq_skip_exiting`,
     /// `enq_skip_migration_disabled`, `dispatch_local_dsq_offline`) crossed

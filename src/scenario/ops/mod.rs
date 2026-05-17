@@ -498,6 +498,32 @@ struct PayloadEntry {
     handle: crate::scenario::payload_run::PayloadHandle,
 }
 
+/// Map the BPF probe's current scheduler-exit classification onto
+/// the [`crate::assert::DetailKind`] variant the three liveness
+/// emission sites push. Reads [`crate::probe::process::sched_exit_kind`]
+/// which mirrors the probe's `ktstr_err_exit_detected` BSS latch
+/// across threads.
+///
+/// Returns:
+/// - `SchedulerCrashed` when the probe observed a non-clean kernel
+///   exit (any path that latched `ktstr_err_exit_detected`).
+/// - `SchedulerExitedCleanly` when the probe ran but never observed
+///   the latch (clean `SCX_EXIT_NONE` teardown, or the scheduler
+///   exited for a benign reason).
+/// - `SchedulerDiedUnknownReason` when the probe has not classified
+///   yet — typically the probe pipeline never wired for this run
+///   (host-only test, no scheduler attached) or the poll thread has
+///   not completed a first iteration since the prior reset.
+fn sched_died_detail_kind() -> crate::assert::DetailKind {
+    use crate::assert::DetailKind;
+    use crate::probe::process::{SchedExitKind, sched_exit_kind};
+    match sched_exit_kind() {
+        SchedExitKind::Crashed => DetailKind::SchedulerCrashed,
+        SchedExitKind::Clean => DetailKind::SchedulerExitedCleanly,
+        SchedExitKind::Unknown => DetailKind::SchedulerDiedUnknownReason,
+    }
+}
+
 /// Execute a single step with CgroupDefs that hold for the full duration.
 ///
 /// Convenience wrapper around [`execute_steps`] for the common pattern
@@ -844,7 +870,7 @@ fn run_scenario(
             r.merge(result);
             r.passed = false;
             r.details.push(crate::assert::AssertDetail::new(
-                crate::assert::DetailKind::SchedulerDied,
+                sched_died_detail_kind(),
                 crate::assert::format_sched_died_after_step(
                     step_idx,
                     steps.len(),
@@ -914,7 +940,7 @@ fn run_scenario(
             r.merge(result);
             r.passed = false;
             r.details.push(crate::assert::AssertDetail::new(
-                crate::assert::DetailKind::SchedulerDied,
+                sched_died_detail_kind(),
                 crate::assert::format_sched_died_during_workload(
                     scenario_start.elapsed().as_secs_f64(),
                 ),
@@ -942,7 +968,7 @@ fn run_scenario(
     if sched_dead {
         result.passed = false;
         result.details.push(crate::assert::AssertDetail::new(
-            crate::assert::DetailKind::SchedulerDied,
+            sched_died_detail_kind(),
             crate::assert::format_sched_died_after_all_steps(
                 steps.len(),
                 scenario_start.elapsed().as_secs_f64(),
@@ -3911,8 +3937,12 @@ mod tests {
     /// fires when `sleep_or_sched_died` observes the scheduler pid
     /// has exited mid-loop. Setting `sched_died_during_hold = true`
     /// and returning `Ok(())` is the contract — the outer caller
-    /// (mod.rs:911-922) reads the flag and stamps a
-    /// `DetailKind::SchedulerDied` with `format_sched_died_during_workload`,
+    /// (mod.rs:911-922) reads the flag and stamps one of
+    /// `DetailKind::SchedulerCrashed` /
+    /// `DetailKind::SchedulerExitedCleanly` /
+    /// `DetailKind::SchedulerDiedUnknownReason` (chosen by
+    /// `sched_died_detail_kind` reading the probe BSS latch) with
+    /// `format_sched_died_during_workload`,
     /// then marks the AssertResult `passed = false`.
     ///
     /// Implementation: use `libc::pid_t::MAX` as the dead pid. The
@@ -3928,12 +3958,12 @@ mod tests {
     /// exits the while-loop after the first apply_ops iteration;
     /// (2) the `sched_died_during_hold = true` write at mod.rs:1178
     /// reaches the outer caller; (3) the outer caller pushes
-    /// `DetailKind::SchedulerDied` and marks `passed = false`. A
-    /// regression that DROPPED the early-exit (loop runs all
-    /// iterations after the death is observed) would surface as
-    /// multiple SetCpuset calls; a regression that DROPPED the
-    /// `sched_died_during_hold = true` write would surface as
-    /// passed=true with no SchedulerDied detail. Note that
+    /// one of the three sched-died `DetailKind` variants and marks
+    /// `passed = false`. A regression that DROPPED the early-exit
+    /// (loop runs all iterations after the death is observed) would
+    /// surface as multiple SetCpuset calls; a regression that
+    /// DROPPED the `sched_died_during_hold = true` write would
+    /// surface as passed=true with no sched-died detail. Note that
     /// `return Ok(())` vs `break` produce identical observable
     /// state here because the Loop arm is the last operation in
     /// run_step's match block — both exit the while loop and fall
@@ -3959,7 +3989,7 @@ mod tests {
         )];
         let result = execute_steps(&ctx, steps).expect(
             "Loop arm must return Ok even when sched dies — the death \
-             is surfaced via sched_died_during_hold + DetailKind::SchedulerDied, \
+             is surfaced via sched_died_during_hold + one of the three sched-died DetailKind variants, \
              NOT as an Err out of run_step",
         );
         assert!(
@@ -3971,13 +4001,18 @@ mod tests {
         let sched_died_details: Vec<_> = result
             .details
             .iter()
-            .filter(|d| matches!(d.kind, crate::assert::DetailKind::SchedulerDied))
+            .filter(|d| matches!(
+                d.kind,
+                crate::assert::DetailKind::SchedulerCrashed
+                    | crate::assert::DetailKind::SchedulerExitedCleanly
+                    | crate::assert::DetailKind::SchedulerDiedUnknownReason
+            ))
             .collect();
         assert_eq!(
             sched_died_details.len(),
             1,
-            "must push exactly one DetailKind::SchedulerDied detail (from \
-             mod.rs:911-922); got {} SchedulerDied details out of {} total: {:?}",
+            "must push exactly one sched-died DetailKind detail (from \
+             mod.rs:911-922); got {} sched-died details out of {} total: {:?}",
             sched_died_details.len(),
             result.details.len(),
             result.details,

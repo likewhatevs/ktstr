@@ -774,10 +774,10 @@ fn assert_detail_display_with_kind_prefixes_variant_token() {
 /// renderer (which could rename the token).
 #[test]
 fn assert_detail_display_with_kind_uses_debug_token_for_multiword_variant() {
-    let d = AssertDetail::new(DetailKind::SchedulerDied, "scheduler process died");
+    let d = AssertDetail::new(DetailKind::SchedulerCrashed, "scheduler process died");
     assert_eq!(
         d.display_with_kind().to_string(),
-        "[SchedulerDied] scheduler process died",
+        "[SchedulerCrashed] scheduler process died",
     );
 }
 

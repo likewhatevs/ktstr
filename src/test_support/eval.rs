@@ -2096,7 +2096,12 @@ fn evaluate_vm_result(
             let console_section = if check_result
                 .details
                 .iter()
-                .any(|d| d.kind == crate::assert::DetailKind::SchedulerDied)
+                .any(|d| matches!(
+                    d.kind,
+                    crate::assert::DetailKind::SchedulerCrashed
+                        | crate::assert::DetailKind::SchedulerExitedCleanly
+                        | crate::assert::DetailKind::SchedulerDiedUnknownReason
+                ))
                 || verbose()
             {
                 let init_stage = classify_init_stage(result.guest_messages.as_ref());
@@ -4484,7 +4489,7 @@ mod tests {
         let assert = build_assert_result(
             false,
             vec![AssertDetail::new(
-                DetailKind::SchedulerDied,
+                DetailKind::SchedulerCrashed,
                 "scheduler process died unexpectedly after completing step 1 of 2 (0.5s into test)",
             )],
         );
@@ -4515,7 +4520,7 @@ mod tests {
         let assert = build_assert_result(
             false,
             vec![AssertDetail::new(
-                DetailKind::SchedulerDied,
+                DetailKind::SchedulerCrashed,
                 "scheduler process died unexpectedly during workload (2.0s into test)",
             )],
         );
