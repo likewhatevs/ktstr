@@ -2723,6 +2723,16 @@ impl<'a> Analyzer<'a> {
     ///    return is NOT Ptr->Void (BTF mismatch — drift between
     ///    kernel source and analyzer's allowlist) drops to no
     ///    typing rather than misclassifying R0.
+    ///
+    /// # Panics
+    ///
+    /// `proto.return_type_id()` calls into btf-rs's `FuncProto::return_type_id`,
+    /// which `expect()`s a type slot in the underlying btf-type record.
+    /// A malformed BTF blob whose `Type::FuncProto(...)` discriminant
+    /// matches but whose return-type field decoded as the size
+    /// alternative panics here. Malformed program BTF is a build-time
+    /// bug in the scheduler's BPF (the producer-bug framing of the
+    /// btf_render module-level `# Panics` section applies here too).
     fn handle_kfunc_call(&mut self, imm: i32) {
         if imm <= 0 {
             return;

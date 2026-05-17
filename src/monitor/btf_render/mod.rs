@@ -39,16 +39,18 @@
 //!
 //! # Panics on malformed BTF
 //!
-//! [`btf_rs::Int::size`], [`btf_rs::Struct::size`], [`btf_rs::Enum::size`],
-//! [`btf_rs::Enum64::size`], [`btf_rs::Float::size`], and
-//! [`btf_rs::Datasec::size`] each panic when the underlying BTF type
-//! record has a kind discriminant claiming "Int/Struct/Enum/etc." but
-//! a size field that the kernel's btf-type union decoded as the
-//! type-id alternative — a structural-validity violation that is not
-//! a recoverable parse error in `btf_rs` 2.0. This renderer calls
-//! those `size()` accessors after `Type::X(...)` discriminant match,
-//! which guards against wrong-kind dispatch but does NOT guard against
-//! the kind-vs-size-field skew inside a single record.
+//! [`btf_rs::Int::size`], [`btf_rs::Struct::size`] (and
+//! [`btf_rs::Union::size`] via `pub type Union = Struct;`),
+//! [`btf_rs::Enum::size`], [`btf_rs::Enum64::size`],
+//! [`btf_rs::Float::size`], and [`btf_rs::Datasec::size`] each panic
+//! when the underlying BTF type record has a kind discriminant
+//! claiming "Int/Struct/Union/Enum/etc." but a size field that the
+//! kernel's btf-type union decoded as the type-id alternative — a
+//! structural-validity violation that is not a recoverable parse
+//! error in `btf_rs` 2.0. This renderer calls those `size()`
+//! accessors after `Type::X(...)` discriminant match, which guards
+//! against wrong-kind dispatch but does NOT guard against the
+//! kind-vs-size-field skew inside a single record.
 //!
 //! Malformed BTF is treated as a producer bug (kernel BTF blob, BPF
 //! object's program BTF, or operator-supplied `--vmlinux` override).
