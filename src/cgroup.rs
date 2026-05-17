@@ -1585,7 +1585,7 @@ mod tests {
 
     #[test]
     fn create_cgroup_in_tmpdir() {
-        let _tempdir_keep_alive = make_inline_tempdir("cg-test");
+        let _tempdir_keep_alive = make_inline_tempdir("create-in-tmpdir");
         let dir = _tempdir_keep_alive.path();
         let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.create_cgroup("test_cg").unwrap();
@@ -1596,7 +1596,7 @@ mod tests {
 
     #[test]
     fn create_cgroup_idempotent() {
-        let _tempdir_keep_alive = make_inline_tempdir("cg-idem");
+        let _tempdir_keep_alive = make_inline_tempdir("idem");
         let dir = _tempdir_keep_alive.path();
         let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.create_cgroup("cg_0").unwrap();
@@ -1618,7 +1618,7 @@ mod tests {
 
     #[test]
     fn cleanup_removes_child_dirs() {
-        let _tempdir_keep_alive = make_inline_tempdir("cg-clean");
+        let _tempdir_keep_alive = make_inline_tempdir("clean");
         let dir = _tempdir_keep_alive.path();
         let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.create_cgroup("a").unwrap();
@@ -1648,7 +1648,7 @@ mod tests {
     /// deleting arbitrary files under the cgroup parent.
     #[test]
     fn cleanup_all_skips_non_dir_entries() {
-        let _tempdir_keep_alive = make_inline_tempdir("cg-nondir");
+        let _tempdir_keep_alive = make_inline_tempdir("nondir");
         let dir = _tempdir_keep_alive.path();
         let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.create_cgroup("cg_child").unwrap();
@@ -1677,7 +1677,7 @@ mod tests {
     /// function-pointer arg drives.
     #[test]
     fn cleanup_recursive_removes_nested_dirs_depth_first() {
-        let _tempdir_keep_alive = make_inline_tempdir("cg-nested");
+        let _tempdir_keep_alive = make_inline_tempdir("nested");
         let base = _tempdir_keep_alive.path();
         let root = base.join("root");
         fs::create_dir_all(root.join("mid").join("leaf")).unwrap();
@@ -1816,7 +1816,7 @@ mod tests {
 
     #[test]
     fn set_cpuset_empty() {
-        let _tempdir_keep_alive = make_inline_tempdir("cg-cpuset");
+        let _tempdir_keep_alive = make_inline_tempdir("cpuset");
         let dir = _tempdir_keep_alive.path();
         let dir_a = dir.join("cg_a");
         fs::create_dir_all(&dir_a).unwrap();
@@ -1838,7 +1838,7 @@ mod tests {
 
     #[test]
     fn drain_tasks_empty_cgroup() {
-        let _tempdir_keep_alive = make_inline_tempdir("cg-drain");
+        let _tempdir_keep_alive = make_inline_tempdir("drain");
         let dir = _tempdir_keep_alive.path();
         let dir_d = dir.join("cg_d");
         fs::create_dir_all(&dir_d).unwrap();
@@ -1888,7 +1888,7 @@ mod tests {
 
     #[test]
     fn clear_subtree_control_empty() {
-        let _tempdir_keep_alive = make_inline_tempdir("cg-sc");
+        let _tempdir_keep_alive = make_inline_tempdir("subtree-control");
         let dir = _tempdir_keep_alive.path();
         let dir_a = dir.join("cg_a");
         fs::create_dir_all(&dir_a).unwrap();
@@ -1901,7 +1901,7 @@ mod tests {
     #[test]
     fn write_with_timeout_blocks_on_fifo() {
         use std::ffi::CString;
-        let _tempdir_keep_alive = make_inline_tempdir("cg-fifo");
+        let _tempdir_keep_alive = make_inline_tempdir("fifo");
         let dir = _tempdir_keep_alive.path();
         let fifo_path = dir.join("blocked_write");
         let c_path = CString::new(fifo_path.to_str().unwrap()).unwrap();
@@ -1941,7 +1941,7 @@ mod tests {
 
     #[test]
     fn add_parent_subtree_controller_writes_plus_prefixed_token() {
-        let _tempdir_keep_alive = make_inline_tempdir("cg-addparent");
+        let _tempdir_keep_alive = make_inline_tempdir("addparent");
         let dir = _tempdir_keep_alive.path();
         // The subtree_control file in a real cgroup v2 tree echoes the
         // currently-enabled controllers (no `+` prefix) when read back;
@@ -1966,6 +1966,16 @@ mod tests {
     /// callers own the RAII handle; bind it as
     /// `_tempdir_keep_alive` (or `_<role>_keep_alive`) per the
     /// convention spelled out on [`make_test_cgroup`].
+    ///
+    /// `label` should describe what the test exercises (e.g.,
+    /// `nested`, `cpuset`, `subtree-control`) — not the file the
+    /// test lives in. The `ktstr-` prefix already namespaces
+    /// against other on-host tempdirs; an additional `cg-` prefix
+    /// is automatically injected by [`make_test_cgroup`] for tests
+    /// built around the `CgroupManager` fixture, so direct callers
+    /// of `make_inline_tempdir` should NOT add `cg-` themselves.
+    /// Use hyphens (not underscores) for multi-word labels to
+    /// keep tempdir names readable.
     fn make_inline_tempdir(label: &str) -> tempfile::TempDir {
         tempfile::Builder::new()
             .prefix(&format!("ktstr-{label}-"))
@@ -2206,7 +2216,7 @@ mod tests {
     /// `Path::join`. Pin one representative method per knob type.
     #[test]
     fn cgroup_methods_reject_bad_names_before_fs_writes() {
-        let _tempdir_keep_alive = make_inline_tempdir("cg-badname");
+        let _tempdir_keep_alive = make_inline_tempdir("badname");
         let dir = _tempdir_keep_alive.path();
         let cg = CgroupManager::new(dir.to_str().unwrap());
         let bad = "../escape";
@@ -2267,7 +2277,7 @@ mod tests {
     #[test]
     fn setup_under_root_outside_root_creates_dir_and_skips_walk() {
         let outside = std::env::temp_dir().join(format!("ktstr-out-{}", std::process::id()));
-        let _unrelated_root_keep_alive = make_inline_tempdir("other");
+        let _unrelated_root_keep_alive = make_inline_tempdir("unrelated-root");
         let unrelated_root = _unrelated_root_keep_alive.path();
         // `unrelated_root` is created by `tempfile::TempDir` itself;
         // `outside` must NOT exist pre-call — `setup_under_root`
@@ -2689,7 +2699,7 @@ mod tests {
     /// non-zero state.
     #[test]
     fn remove_cgroup_decrements_outstanding_on_success() {
-        let _tempdir_keep_alive = make_inline_tempdir("cg-decrement");
+        let _tempdir_keep_alive = make_inline_tempdir("decrement");
         let dir = _tempdir_keep_alive.path();
         let cg = CgroupManager::new(dir.to_str().unwrap());
         // Seed the counter to simulate a prior failure.
@@ -2713,7 +2723,7 @@ mod tests {
     /// here.
     #[test]
     fn remove_cgroup_bails_when_cap_exceeded() {
-        let _tempdir_keep_alive = make_inline_tempdir("cg-cap");
+        let _tempdir_keep_alive = make_inline_tempdir("cap");
         let dir = _tempdir_keep_alive.path();
         let inner = dir.join("cg_x");
         fs::create_dir_all(&inner).unwrap();
@@ -2768,7 +2778,7 @@ mod tests {
     /// readback surfaces here.
     #[test]
     fn move_task_refuses_when_cpuset_cpus_set_but_effective_mems_empty() {
-        let _tempdir_keep_alive = make_inline_tempdir("cg-cpuset-gate");
+        let _tempdir_keep_alive = make_inline_tempdir("cpuset-gate");
         let dir = _tempdir_keep_alive.path();
         let inner = dir.join("cg_x");
         fs::create_dir_all(&inner).unwrap();
