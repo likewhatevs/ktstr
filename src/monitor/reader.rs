@@ -3055,6 +3055,7 @@ mod tests {
 
     fn test_offsets() -> KernelOffsets {
         KernelOffsets {
+            rq_cpu: 4,
             rq_nr_running: 8,
             rq_clock: 16,
             rq_scx: 100,

@@ -7,6 +7,14 @@
 # an inherited defconfig flip would silently invalidate ktstr's KASLR fix.
 # CONFIG_X86_FRED is not set
 
+# CONFIG_RANDOMIZE_BASE=y forces virt-KASLR on for every ktstr boot. The
+# kaslr_compute_rq_pas_e2e regression test depends on a non-zero KASLR offset
+# to exercise the freeze_coord → compute_rq_pas wire-in; an inherited
+# defconfig that flipped this off would silently degrade the test into a
+# tautology (kaslr=0 makes the buggy and fixed paths agree on the same PA).
+# Pinning here keeps the assertion meaningful.
+CONFIG_RANDOMIZE_BASE=y
+
 # -- sched_ext + BPF (required) --
 # sched_ext scheduling class. Depends on BPF_SYSCALL + BPF_JIT + DEBUG_INFO_BTF.
 CONFIG_BPF=y

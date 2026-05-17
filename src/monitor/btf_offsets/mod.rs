@@ -414,6 +414,16 @@ fn write_btf_sidecar(sidecar: &Path, bytes: &[u8]) -> Result<()> {
 /// All offsets are relative to the start of their containing struct.
 #[derive(Debug, Clone)]
 pub struct KernelOffsets {
+    /// Offset of `cpu` within `struct rq`. The kernel sets each
+    /// runqueue's `cpu` field to its own CPU index at boot via
+    /// `sched_init`'s per-cpu init loop in `kernel/sched/core.c`
+    /// (write at the loop body's `rq->cpu = i;` line); the value
+    /// is invariant for the run. Resolved and cached so consumers
+    /// can ground-truth that a derived per-CPU runqueue PA actually
+    /// points at the runqueue the kernel believes belongs to that
+    /// CPU.
+    #[allow(dead_code)]
+    pub rq_cpu: usize,
     /// Offset of `nr_running` within `struct rq`.
     pub rq_nr_running: usize,
     /// Offset of `clock` within `struct rq`.
@@ -526,6 +536,7 @@ impl KernelOffsets {
     /// the path-based wrapper that does the BTF load itself.
     pub fn from_btf(btf: &Btf) -> Result<Self> {
         let (rq_struct, _) = find_struct(btf, "rq")?;
+        let rq_cpu = member_byte_offset(btf, &rq_struct, "cpu")?;
         let rq_nr_running = member_byte_offset(btf, &rq_struct, "nr_running")?;
         let rq_clock = member_byte_offset(btf, &rq_struct, "clock")?;
         let (rq_scx, scx_member) = member_byte_offset_with_member(btf, &rq_struct, "scx")?;
@@ -549,6 +560,7 @@ impl KernelOffsets {
         let watchdog_offsets = resolve_watchdog_offsets(btf).ok();
 
         Ok(Self {
+            rq_cpu,
             rq_nr_running,
             rq_clock,
             rq_scx,
