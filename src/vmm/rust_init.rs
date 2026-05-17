@@ -4032,20 +4032,38 @@ mod tests {
 
     #[test]
     fn mkdir_p_creates_nested() {
-        let base = std::env::temp_dir().join("ktstr-rust-init-test-mkdir");
-        let _ = fs::remove_dir_all(&base);
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-rust-init-test-mkdir-")
+            .tempdir()
+            .unwrap();
+        let base = _tempdir_keep_alive.path();
         let nested = base.join("a/b/c");
         mkdir_p(nested.to_str().unwrap());
         assert!(nested.exists());
-        let _ = fs::remove_dir_all(&base);
     }
 
+    /// Uses raw `std::env::temp_dir()` (not `tempfile::TempDir`)
+    /// because the test's premise is "mkdir_p is a no-op when the
+    /// dir already exists" — pointing at an existing dir is the
+    /// whole point. `tempfile::TempDir` would also work, but raw
+    /// `temp_dir()` is closer to the production input: `mkdir_p`
+    /// is called against arbitrary already-existing system paths.
     #[test]
     fn mkdir_p_existing_is_noop() {
         let tmp = std::env::temp_dir();
         mkdir_p(tmp.to_str().unwrap());
     }
 
+    /// Tests a single FILE write+read rather than a directory
+    /// tree, so `tempfile::TempDir` doesn't fit (it's a
+    /// directory primitive). `tempfile::NamedTempFile` would
+    /// fit and would add RAII cleanup + a random suffix to
+    /// avoid concurrent-test collisions on the bare
+    /// `"ktstr-rust-init-echo-test"` filename used below.
+    /// Migration to `NamedTempFile` is tracked as a follow-up
+    /// task; the current raw `temp_dir().join(...)` +
+    /// `let _ = fs::remove_file(...)` keeps the diff scoped
+    /// to directory-cleanup migrations.
     #[test]
     fn exec_shell_line_echo_redirect() {
         let tmp = std::env::temp_dir().join("ktstr-rust-init-echo-test");

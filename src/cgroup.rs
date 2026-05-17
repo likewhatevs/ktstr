@@ -1585,25 +1585,29 @@ mod tests {
 
     #[test]
     fn create_cgroup_in_tmpdir() {
-        let dir = std::env::temp_dir().join(format!("ktstr-cg-test-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-test-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.create_cgroup("test_cg").unwrap();
         assert!(dir.join("test_cg").exists());
         cg.create_cgroup("nested/deep").unwrap();
         assert!(dir.join("nested/deep").exists());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn create_cgroup_idempotent() {
-        let dir = std::env::temp_dir().join(format!("ktstr-cg-idem-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-idem-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.create_cgroup("cg_0").unwrap();
         cg.create_cgroup("cg_0").unwrap(); // should not error
         assert!(dir.join("cg_0").exists());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1620,8 +1624,11 @@ mod tests {
 
     #[test]
     fn cleanup_removes_child_dirs() {
-        let dir = std::env::temp_dir().join(format!("ktstr-cg-clean-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-clean-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.create_cgroup("a").unwrap();
         cg.create_cgroup("b").unwrap();
@@ -1633,7 +1640,6 @@ mod tests {
         assert!(!dir.join("a").exists());
         assert!(!dir.join("b").exists());
         assert!(!dir.join("c").exists());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1651,8 +1657,11 @@ mod tests {
     /// deleting arbitrary files under the cgroup parent.
     #[test]
     fn cleanup_all_skips_non_dir_entries() {
-        let dir = std::env::temp_dir().join(format!("ktstr-cg-nondir-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-nondir-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.create_cgroup("cg_child").unwrap();
         let stray_file = dir.join("stray.txt");
@@ -1669,7 +1678,6 @@ mod tests {
             "cleanup_all must not descend into or remove regular files",
         );
         assert_eq!(fs::read_to_string(&stray_file).unwrap(), "do not descend");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// `cleanup_recursive` on a 2-level nested directory structure must
@@ -1681,7 +1689,11 @@ mod tests {
     /// function-pointer arg drives.
     #[test]
     fn cleanup_recursive_removes_nested_dirs_depth_first() {
-        let base = std::env::temp_dir().join(format!("ktstr-cg-nested-{}", std::process::id()));
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-nested-")
+            .tempdir()
+            .unwrap();
+        let base = _tempdir_keep_alive.path();
         let root = base.join("root");
         fs::create_dir_all(root.join("mid").join("leaf")).unwrap();
         fs::create_dir_all(root.join("sibling")).unwrap();
@@ -1692,18 +1704,20 @@ mod tests {
             !root.exists(),
             "cleanup_recursive should remove root and every descendant",
         );
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
     fn setup_non_cgroup_path() {
         // setup() on a non-cgroup path should still create the dir.
         // Empty controller set skips the subtree_control walk entirely.
-        let dir = std::env::temp_dir().join(format!("ktstr-setup-{}", std::process::id()));
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-setup-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.setup(&BTreeSet::new()).unwrap();
         assert!(dir.exists());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// `setup` writes only the controllers the caller requested to
@@ -1719,8 +1733,11 @@ mod tests {
     /// non-requested controllers do not.
     #[test]
     fn setup_writes_requested_controllers_only() {
-        let root =
-            std::env::temp_dir().join(format!("ktstr-setup-controllers-{}", std::process::id()));
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-setup-controllers-")
+            .tempdir()
+            .unwrap();
+        let root = _tempdir_keep_alive.path();
         let parent = root.join("ktstr");
         fs::create_dir_all(&parent).unwrap();
         // Pre-create cgroup.controllers at root so the availability
@@ -1768,8 +1785,6 @@ mod tests {
                  got '{suffix}' at pos {pos} in {written:?}",
             );
         }
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// `setup` rejects an unavailable controller with a clear error
@@ -1779,7 +1794,11 @@ mod tests {
     /// harder to diagnose than "controller X not available".
     #[test]
     fn setup_rejects_unavailable_controller() {
-        let root = std::env::temp_dir().join(format!("ktstr-setup-unavail-{}", std::process::id()));
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-setup-unavail-")
+            .tempdir()
+            .unwrap();
+        let root = _tempdir_keep_alive.path();
         let parent = root.join("ktstr");
         fs::create_dir_all(&parent).unwrap();
         // Advertise only memory; request cpuset.
@@ -1796,17 +1815,18 @@ mod tests {
             msg.contains("cpuset") && msg.contains("not available"),
             "error must cite missing 'cpuset' and 'not available'; got {msg:?}",
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn write_with_timeout_success() {
-        let dir = std::env::temp_dir().join(format!("ktstr-wt-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-wt-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let f = dir.join("test_write");
         write_with_timeout(&f, "hello", Duration::from_secs(5)).unwrap();
         assert_eq!(fs::read_to_string(&f).unwrap(), "hello");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1823,14 +1843,17 @@ mod tests {
 
     #[test]
     fn set_cpuset_empty() {
-        let dir = std::env::temp_dir().join(format!("ktstr-cg-cpuset-{}", std::process::id()));
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-cpuset-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let dir_a = dir.join("cg_a");
         fs::create_dir_all(&dir_a).unwrap();
         let cg = CgroupManager::new(dir.to_str().unwrap());
         // Empty BTreeSet → writes empty string via cpuset_string
         cg.set_cpuset("cg_a", &BTreeSet::new()).unwrap();
         assert_eq!(fs::read_to_string(dir_a.join("cpuset.cpus")).unwrap(), "");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1845,7 +1868,11 @@ mod tests {
 
     #[test]
     fn drain_tasks_empty_cgroup() {
-        let dir = std::env::temp_dir().join(format!("ktstr-cg-drain-{}", std::process::id()));
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-drain-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let dir_d = dir.join("cg_d");
         fs::create_dir_all(&dir_d).unwrap();
         // Create an empty cgroup.procs file
@@ -1855,7 +1882,6 @@ mod tests {
         let cg = CgroupManager::new(dir.to_str().unwrap());
         // drain_tasks on a cgroup with empty procs file should succeed
         assert!(cg.drain_tasks("cg_d").is_ok());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1895,21 +1921,27 @@ mod tests {
 
     #[test]
     fn clear_subtree_control_empty() {
-        let dir = std::env::temp_dir().join(format!("ktstr-cg-sc-{}", std::process::id()));
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-sc-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let dir_a = dir.join("cg_a");
         fs::create_dir_all(&dir_a).unwrap();
         fs::write(dir_a.join("cgroup.subtree_control"), "").unwrap();
         let cg = CgroupManager::new(dir.to_str().unwrap());
         // Empty subtree_control → no-op success.
         assert!(cg.clear_subtree_control("cg_a").is_ok());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn write_with_timeout_blocks_on_fifo() {
         use std::ffi::CString;
-        let dir = std::env::temp_dir().join(format!("ktstr-cg-fifo-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-fifo-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let fifo_path = dir.join("blocked_write");
         let c_path = CString::new(fifo_path.to_str().unwrap()).unwrap();
         let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o700) };
@@ -1918,7 +1950,6 @@ mod tests {
         let err = write_with_timeout(&fifo_path, "data", Duration::from_millis(50)).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("timed out"), "unexpected error: {msg}");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1949,8 +1980,11 @@ mod tests {
 
     #[test]
     fn add_parent_subtree_controller_writes_plus_prefixed_token() {
-        let dir = std::env::temp_dir().join(format!("ktstr-cg-addparent-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-addparent-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         // The subtree_control file in a real cgroup v2 tree echoes the
         // currently-enabled controllers (no `+` prefix) when read back;
         // here we just observe that our write landed verbatim.
@@ -1959,7 +1993,6 @@ mod tests {
         let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.add_parent_subtree_controller("cpuset").unwrap();
         assert_eq!(fs::read_to_string(&sc).unwrap(), "+cpuset");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     // -- Cgroup v2 resource control writes ----------------------------
@@ -2173,8 +2206,11 @@ mod tests {
     /// `Path::join`. Pin one representative method per knob type.
     #[test]
     fn cgroup_methods_reject_bad_names_before_fs_writes() {
-        let dir = std::env::temp_dir().join(format!("ktstr-cg-badname-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-badname-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let cg = CgroupManager::new(dir.to_str().unwrap());
         let bad = "../escape";
         // Each call must fail at validation, not at the fs write.
@@ -2204,7 +2240,6 @@ mod tests {
             !escape_marker.exists(),
             "validator must bail before fs writes; saw {escape_marker:?}"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     // -- setup_under_root strip-prefix-fail branch -------------------
@@ -2216,25 +2251,45 @@ mod tests {
     /// matches the production "non-cgroup-mount" path described on
     /// [`Self::setup_under_root`]. Pin both: the parent dir exists,
     /// no subtree_control was written.
+    ///
+    /// `outside` uses a raw `std::env::temp_dir().join(...)` path
+    /// (not `tempfile::TempDir`) because the production code under
+    /// test must create the directory itself via `mkdir` — the
+    /// `assert!(outside.exists(), ...)` below verifies that
+    /// production behavior. `tempfile::TempDir` would create
+    /// `outside` eagerly on construction, making the assertion
+    /// vacuously true and defeating the test's intent. `outside`
+    /// is cleaned up manually at the end of the test (best-effort;
+    /// a panic between construction and cleanup leaks the dir, but
+    /// the path is process-id-suffixed so collisions only matter
+    /// for the same in-process test re-run).
+    ///
+    /// `unrelated_root` does NOT have that constraint — the test
+    /// pre-creates it manually before the call — so it uses
+    /// `tempfile::TempDir` RAII for panic-safe cleanup.
     #[test]
     fn setup_under_root_outside_root_creates_dir_and_skips_walk() {
         let outside = std::env::temp_dir().join(format!("ktstr-out-{}", std::process::id()));
-        let unrelated_root =
-            std::env::temp_dir().join(format!("ktstr-other-{}", std::process::id()));
-        // Pre-create both so neither needs `mkdir`. The point is that
-        // `outside.strip_prefix(unrelated_root)` returns Err.
-        fs::create_dir_all(&unrelated_root).unwrap();
+        let _unrelated_root_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-other-")
+            .tempdir()
+            .unwrap();
+        let unrelated_root = _unrelated_root_keep_alive.path();
+        // `unrelated_root` is created by `tempfile::TempDir` itself;
+        // `outside` must NOT exist pre-call — `setup_under_root`
+        // creates it as part of its parent-directory step, after
+        // which `outside.strip_prefix(unrelated_root)` returns Err
+        // and the subtree-control walk is skipped.
         let cg = CgroupManager::new(outside.to_str().unwrap());
         let mut requested = BTreeSet::new();
         requested.insert(Controller::Cpuset);
-        cg.setup_under_root(&requested, &unrelated_root).unwrap();
+        cg.setup_under_root(&requested, unrelated_root).unwrap();
         assert!(outside.exists(), "setup must create the parent directory");
         assert!(
             !outside.join("cgroup.subtree_control").exists(),
             "no subtree_control walk should fire when the parent is not under root"
         );
         let _ = fs::remove_dir_all(&outside);
-        let _ = fs::remove_dir_all(&unrelated_root);
     }
 
     // -- set_freeze idempotency --------------------------------------
@@ -2527,7 +2582,11 @@ mod tests {
     /// under test, not the rmdir success.
     #[test]
     fn remove_cgroup_auto_unfreezes_before_drain() {
-        let dir = std::env::temp_dir().join(format!("ktstr-cg-autounf-{}", std::process::id()));
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-autounf-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let inner = dir.join("cg_x");
         fs::create_dir_all(&inner).unwrap();
         // Pre-create the freeze + procs files. Seed `cgroup.freeze`
@@ -2547,7 +2606,6 @@ mod tests {
             "0",
             "remove_cgroup must write '0' to cgroup.freeze before draining"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// `remove_cgroup` swallows ENOENT on the unfreeze write so a
@@ -2557,7 +2615,11 @@ mod tests {
     /// missing freeze file.
     #[test]
     fn remove_cgroup_tolerates_missing_freeze_file() {
-        let dir = std::env::temp_dir().join(format!("ktstr-cg-nofrz-{}", std::process::id()));
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-nofrz-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let inner = dir.join("cg_x");
         fs::create_dir_all(&inner).unwrap();
         // Deliberately omit cgroup.freeze. Provide cgroup.procs so
@@ -2573,7 +2635,6 @@ mod tests {
         // No assertion on the freeze file — it never existed. The
         // test passes when the call body runs to completion without
         // panicking on the tolerated ENOENT branch.
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// `cleanup_recursive` writes `0` to `cgroup.freeze` before
@@ -2590,9 +2651,11 @@ mod tests {
     /// the freeze-file content is what the assertion targets.
     #[test]
     fn cleanup_recursive_auto_unfreezes_before_drain() {
-        let dir =
-            std::env::temp_dir().join(format!("ktstr-cleanup-rec-autounf-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cleanup-rec-autounf-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         // Seed cgroup.freeze="1" + empty cgroup.procs so the test
         // observes the unfreeze write the same way
         // remove_cgroup_auto_unfreezes_before_drain does.
@@ -2601,7 +2664,7 @@ mod tests {
         fs::write(dir.join("cgroup.procs"), "").unwrap();
         // `cleanup_recursive` is the free fn the cleanup_all walk
         // dispatches per directory; call it directly.
-        cleanup_recursive(&dir);
+        cleanup_recursive(dir);
         // The auto-unfreeze must have written "0" to cgroup.freeze
         // before the drain — pinned identically to the
         // remove_cgroup test so a regression on either path
@@ -2612,7 +2675,6 @@ mod tests {
             "cleanup_recursive must write '0' to cgroup.freeze before draining \
              (mirrors remove_cgroup auto-unfreeze for state hygiene)",
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     // -- outstanding-removes cap ------------------------------------
@@ -2626,7 +2688,11 @@ mod tests {
     /// rises monotonically as failures accumulate.
     #[test]
     fn remove_cgroup_increments_outstanding_on_failure() {
-        let dir = std::env::temp_dir().join(format!("ktstr-cg-outstanding-{}", std::process::id()));
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-outstanding-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let inner = dir.join("cg_x");
         fs::create_dir_all(&inner).unwrap();
         // Seed cgroup.procs so drain_tasks succeeds; rmdir will then
@@ -2653,7 +2719,6 @@ mod tests {
             2,
             "outstanding_removes must increment monotonically on repeat failures"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// `remove_cgroup` decrements `outstanding_removes` on success
@@ -2664,8 +2729,11 @@ mod tests {
     /// non-zero state.
     #[test]
     fn remove_cgroup_decrements_outstanding_on_success() {
-        let dir = std::env::temp_dir().join(format!("ktstr-cg-decrement-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-decrement-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let cg = CgroupManager::new(dir.to_str().unwrap());
         // Seed the counter to simulate a prior failure.
         cg.outstanding_removes.store(3, Ordering::Relaxed);
@@ -2679,7 +2747,6 @@ mod tests {
             2,
             "successful remove must decrement outstanding_removes by 1"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Once `outstanding_removes` exceeds [`MAX_OUTSTANDING_REMOVES`],
@@ -2689,7 +2756,11 @@ mod tests {
     /// here.
     #[test]
     fn remove_cgroup_bails_when_cap_exceeded() {
-        let dir = std::env::temp_dir().join(format!("ktstr-cg-cap-{}", std::process::id()));
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-cap-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let inner = dir.join("cg_x");
         fs::create_dir_all(&inner).unwrap();
         let cg = CgroupManager::new(dir.to_str().unwrap());
@@ -2709,7 +2780,6 @@ mod tests {
             inner.exists(),
             "cap-exceeded bail must not touch the filesystem"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// `remove_cgroup` on a missing directory returns Ok and does
@@ -2744,7 +2814,11 @@ mod tests {
     /// readback surfaces here.
     #[test]
     fn move_task_refuses_when_cpuset_cpus_set_but_effective_mems_empty() {
-        let dir = std::env::temp_dir().join(format!("ktstr-cg-cpuset-gate-{}", std::process::id()));
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-cpuset-gate-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let inner = dir.join("cg_x");
         fs::create_dir_all(&inner).unwrap();
         // Configured: cpuset.cpus has bits; cpuset.mems.effective
@@ -2766,7 +2840,6 @@ mod tests {
             !procs_path.exists(),
             "gate must bail before any cgroup.procs write; cgroup.procs exists at {procs_path:?}"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// [`CgroupManager::move_task`] admits migrations when
@@ -2777,7 +2850,11 @@ mod tests {
     /// `cgroup.procs` without bailing.
     #[test]
     fn move_task_admits_when_cpus_set_and_effective_mems_non_empty() {
-        let dir = std::env::temp_dir().join(format!("ktstr-cg-cpuset-ok-{}", std::process::id()));
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-cpuset-ok-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let inner = dir.join("cg_x");
         fs::create_dir_all(&inner).unwrap();
         fs::write(inner.join("cpuset.cpus"), "0-1").unwrap();
@@ -2790,7 +2867,6 @@ mod tests {
         fs::write(inner.join("cgroup.procs"), "").unwrap();
         cg.move_task("cg_x", 1)
             .expect("non-empty effective mems must admit move_task");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// [`CgroupManager::move_task`] admits migrations when the local
@@ -2802,10 +2878,11 @@ mod tests {
     /// to reading the local file fails this test.
     #[test]
     fn move_task_admits_when_local_mems_empty_but_effective_inherited() {
-        let dir = std::env::temp_dir().join(format!(
-            "ktstr-cg-cpuset-inherit-mems-{}",
-            std::process::id()
-        ));
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-cpuset-inherit-mems-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let inner = dir.join("cg_x");
         fs::create_dir_all(&inner).unwrap();
         fs::write(inner.join("cpuset.cpus"), "0-1").unwrap();
@@ -2818,7 +2895,6 @@ mod tests {
         let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.move_task("cg_x", 1)
             .expect("inherited effective mems must admit move_task");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// [`CgroupManager::move_task`] admits migrations when
@@ -2828,8 +2904,11 @@ mod tests {
     /// such a cgroup without a local cpus mask.
     #[test]
     fn move_task_admits_when_cpuset_cpus_empty() {
-        let dir =
-            std::env::temp_dir().join(format!("ktstr-cg-cpuset-inherit-{}", std::process::id()));
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-cpuset-inherit-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let inner = dir.join("cg_x");
         fs::create_dir_all(&inner).unwrap();
         fs::write(inner.join("cpuset.cpus"), "").unwrap();
@@ -2841,7 +2920,6 @@ mod tests {
         let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.move_task("cg_x", 1)
             .expect("inherit-cpuset cgroup must admit move_task");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// [`CgroupManager::move_task`] admits migrations when
@@ -2850,7 +2928,11 @@ mod tests {
     /// cgroup tree without `+cpuset` in `subtree_control`.
     #[test]
     fn move_task_admits_when_cpuset_files_absent() {
-        let dir = std::env::temp_dir().join(format!("ktstr-cg-no-cpuset-{}", std::process::id()));
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-no-cpuset-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let inner = dir.join("cg_x");
         fs::create_dir_all(&inner).unwrap();
         // Deliberately omit cpuset.cpus / cpuset.mems.effective.
@@ -2858,7 +2940,6 @@ mod tests {
         let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.move_task("cg_x", 1)
             .expect("no-cpuset cgroup must admit move_task");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// [`CgroupManager::move_task`] admits migrations when
@@ -2870,8 +2951,11 @@ mod tests {
     /// [`CgroupManager::move_task`].
     #[test]
     fn move_task_admits_when_effective_mems_file_absent() {
-        let dir =
-            std::env::temp_dir().join(format!("ktstr-cg-no-effective-mems-{}", std::process::id()));
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-cg-no-effective-mems-")
+            .tempdir()
+            .unwrap();
+        let dir = _tempdir_keep_alive.path();
         let inner = dir.join("cg_x");
         fs::create_dir_all(&inner).unwrap();
         fs::write(inner.join("cpuset.cpus"), "0-1").unwrap();
@@ -2881,6 +2965,5 @@ mod tests {
         let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.move_task("cg_x", 1)
             .expect("missing cpuset.mems.effective must admit move_task (read-failure absorb)");
-        let _ = fs::remove_dir_all(&dir);
     }
 }
