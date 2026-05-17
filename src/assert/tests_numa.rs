@@ -149,7 +149,7 @@ fn assert_page_locality_fail() {
     let detail = r
         .details
         .iter()
-        .find(|d| d.message.contains("page locality"))
+        .find(|d| matches!(d.kind, DetailKind::PageLocality))
         .unwrap();
     // Percentage form must accompany the fraction so an operator
     // reading the diagnostic doesn't mentally translate 0.5000 → 50%.
@@ -195,7 +195,11 @@ fn assert_slow_tier_ratio_fail() {
     let nodes: BTreeSet<usize> = [0].into_iter().collect();
     let r = assert_slow_tier_ratio(&pages, 0.5, 100, Some(&nodes));
     assert!(!r.passed);
-    let detail = r.details.iter().find(|d| d.message.contains("slow-tier")).unwrap();
+    let detail = r
+        .details
+        .iter()
+        .find(|d| matches!(d.kind, DetailKind::SlowTier))
+        .unwrap();
     // 60% slow-tier (node 2 has 60 pages) vs 50% threshold; both
     // surfaces appear so the operator sees raw ratio AND human %.
     assert!(
@@ -369,7 +373,7 @@ fn assert_cross_node_migration_fail() {
     let detail = r
         .details
         .iter()
-        .find(|d| d.message.contains("cross-node migration"))
+        .find(|d| matches!(d.kind, DetailKind::CrossNodeMigration))
         .unwrap();
     // 20% migrated vs 10% threshold; pin both percentage tokens so
     // dropping either form regresses here.
