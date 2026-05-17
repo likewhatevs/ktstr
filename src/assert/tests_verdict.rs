@@ -845,8 +845,8 @@ fn verdict_log_passes_emits_event_on_scalar_pass() {
     let mut v = Verdict::new().with_log_passes(true);
     claim!(v, 42u64).at_least(40);
     assert!(
-        logs_contain("42 >= 40"),
-        "positive-confirmation log must name the value and the comparator",
+        logs_contain("42 ge 40"),
+        "positive-confirmation log must name the value and the comparator token (snake_case per the COMPARATOR_VOCABULARY contract — `ge`, not `>=`)",
     );
     let r = v.into_result();
     assert!(r.passed, "claim must still pass — log_passes only adds output");
@@ -862,7 +862,7 @@ fn verdict_log_passes_silent_when_off() {
     let mut v = Verdict::new();
     claim!(v, 42u64).at_least(40);
     assert!(
-        !logs_contain("42 >= 40"),
+        !logs_contain("42 ge 40"),
         "log_passes=false must suppress the positive-confirmation log",
     );
 }
@@ -876,7 +876,7 @@ fn verdict_log_passes_silent_on_fail_arm() {
     let mut v = Verdict::new().with_log_passes(true);
     claim!(v, 5u64).at_least(40);
     assert!(
-        !logs_contain("5 >= 40"),
+        !logs_contain("5 ge 40"),
         "fail arm must NOT emit the positive-confirmation log",
     );
     let r = v.into_result();

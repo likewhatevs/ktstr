@@ -387,10 +387,24 @@ impl AssertDetail {
 ///
 /// Carries the same shape primitives every comparator naturally has
 /// at the pass site: the claim's `name`, a short `comparator`
-/// token (`"=="`, `">="`, `"is_finite"`, …), the `value` that was
+/// token (`"eq"`, `"ge"`, `"is_finite"`, …), the `value` that was
 /// compared (formatted via the comparator's `Display`), and an
 /// optional `expected` for binary comparators. Unary comparators
-/// (e.g. `is_finite`, `is_empty`) leave `expected = None`.
+/// (e.g. `is_finite`, `set_is_empty`) leave `expected = None`.
+///
+/// `comparator` is a **wire-canonical token** from
+/// [`COMPARATOR_VOCABULARY`], NOT a string derived from the builder
+/// method name. Operator-named comparators map to operator-canonical
+/// tokens (`eq`/`ne`/`ge`/`le`/`lt`/`gt`) regardless of whether the
+/// invoking builder method is `eq` or `at_least` — tokens are the
+/// stable wire vocabulary, methods are the ergonomic surface. A
+/// renderer that wants pretty operators can map `ge → >=` on output.
+///
+/// Container-bound comparators prefix their tokens with the
+/// container type name (`set_*`, `sequence_*`) to disambiguate same-
+/// named operations across surfaces (`contains` is ambiguous between
+/// sets and sequences, so prefix; `is_finite` is scalar-only, so
+/// bare). The prefix policy is part of the vocabulary contract.
 ///
 /// `comparator` is a [`Cow<'static, str>`] so call sites passing a
 /// `&'static str` literal — the universal case for built-in
@@ -431,10 +445,11 @@ pub struct PassDetail {
 }
 
 impl PassDetail {
-    /// Construct a binary-comparator pass record (e.g. `==`, `>=`,
-    /// `∈`). Both `value` and `expected` are stringified via
+    /// Construct a binary-comparator pass record (e.g. `eq`, `ge`,
+    /// `in_range`). Both `value` and `expected` are stringified via
     /// [`std::fmt::Display`] at the call site so the struct is
-    /// `T`-agnostic on the wire.
+    /// `T`-agnostic on the wire. See [`COMPARATOR_VOCABULARY`] for
+    /// the full set of canonical tokens.
     pub fn binary(
         name: impl Into<String>,
         comparator: impl Into<std::borrow::Cow<'static, str>>,
@@ -451,8 +466,9 @@ impl PassDetail {
     }
 
     /// Construct a unary-comparator pass record (e.g. `is_finite`,
-    /// `is_empty`). `expected` is left None — the comparator name
-    /// alone carries the meaning.
+    /// `set_is_empty`). `expected` is left None — the comparator
+    /// name alone carries the meaning. See [`COMPARATOR_VOCABULARY`]
+    /// for the full set of canonical tokens.
     pub fn unary(
         name: impl Into<String>,
         comparator: impl Into<std::borrow::Cow<'static, str>>,
@@ -478,6 +494,64 @@ impl PassDetail {
         self
     }
 }
+
+/// Wire-canonical vocabulary of `PassDetail.comparator` tokens.
+///
+/// Every comparator implementation in [`crate::assert::claim`] emits
+/// one of these tokens when it records a passing claim. The vocabulary
+/// is the **stable wire contract** — renderers, sidecar consumers,
+/// and the auto-repro pipeline match against these exact
+/// strings. A token rename in `claim.rs` without a parallel update
+/// here breaks every downstream consumer; the regression test in
+/// `tests/claim_comparator_tokens_canonical.rs` pins this.
+///
+/// One synthetic token is NOT in this vocabulary: the cap-overflow
+/// sentinel record (see [`PASSES_TRUNCATION_SENTINEL_NAME`]) carries
+/// `comparator = "truncated"` to indicate the slot is metadata, not
+/// a real claim. Renderers that filter passes by vocabulary should
+/// also handle the sentinel as a distinct category.
+///
+/// Tokens follow three style rules:
+///
+/// 1. **Operator-canonical**: comparison operators map to short
+///    operator names (`eq`, `ne`, `ge`, `le`, `lt`, `gt`) regardless
+///    of whether the builder method is `eq` or `at_least`. The
+///    vocabulary is independent of method naming.
+/// 2. **Container-prefixed**: comparators bound to a specific
+///    container type prefix their token with the container name
+///    (`set_*`, `sequence_*`) to disambiguate same-named operations
+///    across surfaces. Scalar tokens are unprefixed.
+/// 3. **Snake-case ASCII**: every token is lower-snake-case, no
+///    Unicode, no spaces — survives shell escapes, IDE regex search,
+///    and log-mining pipelines without transformation.
+///
+/// Asymmetries are intentional: `sequence_*` does not carry
+/// `subset_of` / `disjoint_from` because sequences have order and
+/// duplicates that set semantics don't model.
+///
+/// Categorization below groups by SEMANTIC AXIS (comparison /
+/// predicate / cardinality / membership / relation), not by call-
+/// site arity — some `len_eq` tokens record via the unary helper
+/// (only the value is reported; the expected `n` is implicit in the
+/// comparator name) while others record via the binary helper.
+pub const COMPARATOR_VOCABULARY: &[&str] = &[
+    // Scalar comparisons
+    "eq", "ne", "ge", "le", "lt", "gt", "in_range", "near_within",
+    // Scalar predicates
+    "is_finite",
+    // Set predicates (emptiness)
+    "set_is_empty", "set_is_non_empty",
+    // Set cardinality
+    "set_len_eq", "set_len_le", "set_len_ge",
+    // Set membership / relations
+    "set_contains", "subset_of", "disjoint_from",
+    // Sequence predicates (emptiness)
+    "sequence_is_empty", "sequence_is_non_empty",
+    // Sequence cardinality
+    "sequence_len_eq", "sequence_len_le", "sequence_len_ge",
+    // Sequence membership
+    "sequence_contains",
+];
 
 /// Cap on `AssertResult.passes` (and the matching truncation sentinel)
 /// so a pathological test that fires millions of claims doesn't
