@@ -18,7 +18,7 @@ use std::time::Duration;
 use crate::scenario::Ctx;
 use crate::workload::{AffinityIntent, WorkSpec, WorkType};
 
-use super::{CgroupDef, CpusetSpec, Op, OpKind};
+use super::{CgroupDef, CpusetSpec, KernelTarget, KernelValue, Op, OpKind};
 
 // ---------------------------------------------------------------------------
 // Step / HoldSpec
@@ -361,6 +361,10 @@ impl OpKind {
             OpKind::UnfreezeCgroup => 15,
             OpKind::CaptureSnapshot => 16,
             OpKind::WatchSnapshot => 17,
+            OpKind::WriteKernelHot => 18,
+            OpKind::WriteKernelCold => 19,
+            OpKind::ReadKernelHot => 20,
+            OpKind::ReadKernelCold => 21,
         }
     }
 }
@@ -607,6 +611,102 @@ impl Op {
     pub fn watch_snapshot(symbol: impl Into<Cow<'static, str>>) -> Self {
         Op::WatchSnapshot {
             symbol: symbol.into(),
+        }
+    }
+
+    /// Live-vCPU write of a single (target, value) pair. Singleton
+    /// convenience that wraps the pair into the
+    /// [`Op::WriteKernelHot`] batch shape. See the variant doc for
+    /// the live-vCPU orchestration contract and the
+    /// caller-side-synchronisation requirement.
+    ///
+    /// **Two consecutive singleton calls produce two separate Ops**
+    /// — not auto-merged at construction time. For dispatching
+    /// multiple hot writes as a single op, use
+    /// [`Self::write_kernel_hot_batch`]. The executor's adjacent-op
+    /// auto-merge is a follow-up sub-batch feature; until it lands,
+    /// each `write_kernel_hot` call is its own dispatch.
+    pub fn write_kernel_hot(target: KernelTarget, value: KernelValue) -> Self {
+        Op::WriteKernelHot {
+            writes: vec![(target, value)],
+        }
+    }
+
+    /// Live-vCPU batched write. See [`Op::WriteKernelHot`] for the
+    /// live-vCPU orchestration contract. The batch is issued in
+    /// iteration order.
+    pub fn write_kernel_hot_batch(
+        writes: impl IntoIterator<Item = (KernelTarget, KernelValue)>,
+    ) -> Self {
+        Op::WriteKernelHot {
+            writes: writes.into_iter().collect(),
+        }
+    }
+
+    /// Auto-freezing write of a single (target, value) pair.
+    /// Singleton convenience that wraps the pair into the
+    /// [`Op::WriteKernelCold`] batch shape. See the variant doc for
+    /// the rendezvous-and-batched-writes contract and the
+    /// no-inter-CPU-skew guarantee.
+    ///
+    /// **Two consecutive singleton calls produce two separate Ops**
+    /// — two freeze rendezvous cycles + observable inter-CPU skew
+    /// between them. For correct multi-CPU seeding always use
+    /// [`Self::write_kernel_cold_batch`]. The executor's
+    /// adjacent-op auto-merge (which would collapse N adjacent
+    /// singleton cold writes into one rendezvous) is a follow-up
+    /// sub-batch feature; until then, callers needing
+    /// inter-CPU-coherent writes MUST batch explicitly.
+    pub fn write_kernel_cold(target: KernelTarget, value: KernelValue) -> Self {
+        Op::WriteKernelCold {
+            writes: vec![(target, value)],
+        }
+    }
+
+    /// Auto-freezing batched write. See [`Op::WriteKernelCold`] for
+    /// the freeze-rendezvous-and-batched-writes contract. All
+    /// writes in the batch land within a single freeze rendezvous —
+    /// no inter-CPU skew from N separate freeze cycles.
+    pub fn write_kernel_cold_batch(
+        writes: impl IntoIterator<Item = (KernelTarget, KernelValue)>,
+    ) -> Self {
+        Op::WriteKernelCold {
+            writes: writes.into_iter().collect(),
+        }
+    }
+
+    /// Live-vCPU read of `target` into the snapshot bridge keyed by
+    /// `tag`. See [`Op::ReadKernelHot`] for the live-vCPU
+    /// orchestration contract and the read-vs-guest-write race
+    /// caveat.
+    ///
+    /// Reads are singleton-only: each read produces one bridge
+    /// entry keyed by `tag`. A batched read (multi-target single op)
+    /// is a future surface — it would need either Vec<(tag, target)>
+    /// with parallel result slots or a HashMap result, both
+    /// distinct contracts from the write batch's "do N writes".
+    /// For now, dispatch N reads as N separate ops.
+    pub fn read_kernel_hot(tag: impl Into<Cow<'static, str>>, target: KernelTarget) -> Self {
+        Op::ReadKernelHot {
+            tag: tag.into(),
+            target,
+        }
+    }
+
+    /// Auto-freezing read of `target` into the snapshot bridge keyed
+    /// by `tag`. See [`Op::ReadKernelCold`] for the
+    /// rendezvous-coherent-read contract and
+    /// [`Self::read_kernel_hot`] for the singleton-only rationale.
+    ///
+    /// Until the adjacent-cold-op auto-merge lands, each
+    /// `read_kernel_cold` triggers its own freeze rendezvous. Where
+    /// multiple cold reads are needed within the same coherent
+    /// snapshot, prefer [`Op::CaptureSnapshot`] (which already
+    /// orchestrates a single rendezvous for all snapshot reads).
+    pub fn read_kernel_cold(tag: impl Into<Cow<'static, str>>, target: KernelTarget) -> Self {
+        Op::ReadKernelCold {
+            tag: tag.into(),
+            target,
         }
     }
 }

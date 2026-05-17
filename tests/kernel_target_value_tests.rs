@@ -60,3 +60,62 @@ fn kernel_value_bytes_clone_preserves_payload() {
     let different = KernelValue::bytes(vec![1u8, 2, 4]);
     assert_ne!(v, different);
 }
+
+#[test]
+fn op_write_kernel_hot_singleton_constructor_wraps_to_vec() {
+    let target = KernelTarget::symbol("test_symbol");
+    let value = KernelValue::u64(0xDEAD_BEEF);
+    let op = Op::write_kernel_hot(target.clone(), value.clone());
+    match op {
+        Op::WriteKernelHot { writes } => {
+            assert_eq!(writes.len(), 1);
+            assert_eq!(writes[0].0, target);
+            assert_eq!(writes[0].1, value);
+        }
+        _ => panic!("expected Op::WriteKernelHot"),
+    }
+}
+
+#[test]
+fn op_write_kernel_cold_batch_preserves_order() {
+    let batch = vec![
+        (KernelTarget::direct(0x1000), KernelValue::u32(1)),
+        (KernelTarget::direct(0x2000), KernelValue::u32(2)),
+        (KernelTarget::direct(0x3000), KernelValue::u32(3)),
+    ];
+    let op = Op::write_kernel_cold_batch(batch.clone());
+    match op {
+        Op::WriteKernelCold { writes } => {
+            assert_eq!(writes.len(), 3);
+            for (i, (target, value)) in batch.iter().enumerate() {
+                assert_eq!(&writes[i].0, target, "batch order broken at index {i}");
+                assert_eq!(&writes[i].1, value, "batch order broken at index {i}");
+            }
+        }
+        _ => panic!("expected Op::WriteKernelCold"),
+    }
+}
+
+#[test]
+fn op_read_kernel_hot_tag_carried() {
+    let op = Op::read_kernel_hot("my-tag", KernelTarget::symbol("x"));
+    match op {
+        Op::ReadKernelHot { tag, target } => {
+            assert_eq!(tag, "my-tag");
+            assert_eq!(target, KernelTarget::symbol("x"));
+        }
+        _ => panic!("expected Op::ReadKernelHot"),
+    }
+}
+
+#[test]
+fn op_read_kernel_cold_tag_carried() {
+    let op = Op::read_kernel_cold("cold-tag", KernelTarget::kva(0xffff_c900_0000_0000));
+    match op {
+        Op::ReadKernelCold { tag, target } => {
+            assert_eq!(tag, "cold-tag");
+            assert_eq!(target, KernelTarget::kva(0xffff_c900_0000_0000));
+        }
+        _ => panic!("expected Op::ReadKernelCold"),
+    }
+}

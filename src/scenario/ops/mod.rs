@@ -2823,6 +2823,34 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     }
                 }
             }
+            Op::WriteKernelHot { writes: _ } => {
+                anyhow::bail!(
+                    "Op::WriteKernelHot: dispatcher not yet implemented (handler lands in \
+                     a follow-up sub-batch — variant declaration + constructors are \
+                     in place, executor wiring is queued)"
+                );
+            }
+            Op::WriteKernelCold { writes: _ } => {
+                anyhow::bail!(
+                    "Op::WriteKernelCold: dispatcher not yet implemented (handler lands in \
+                     a follow-up sub-batch — variant declaration + constructors are \
+                     in place, executor wiring is queued)"
+                );
+            }
+            Op::ReadKernelHot { tag: _, target: _ } => {
+                anyhow::bail!(
+                    "Op::ReadKernelHot: dispatcher not yet implemented (handler lands in \
+                     a follow-up sub-batch — variant declaration + constructors are \
+                     in place, executor wiring is queued)"
+                );
+            }
+            Op::ReadKernelCold { tag: _, target: _ } => {
+                anyhow::bail!(
+                    "Op::ReadKernelCold: dispatcher not yet implemented (handler lands in \
+                     a follow-up sub-batch — variant declaration + constructors are \
+                     in place, executor wiring is queued)"
+                );
+            }
         }
     }
     Ok(())
@@ -3505,6 +3533,20 @@ mod tests {
             Op::WatchSnapshot {
                 symbol: "kernel.x".into(),
             },
+            Op::WriteKernelHot {
+                writes: vec![(KernelTarget::symbol("x"), KernelValue::u64(0))],
+            },
+            Op::WriteKernelCold {
+                writes: vec![(KernelTarget::symbol("x"), KernelValue::u64(0))],
+            },
+            Op::ReadKernelHot {
+                tag: "t".into(),
+                target: KernelTarget::symbol("x"),
+            },
+            Op::ReadKernelCold {
+                tag: "t".into(),
+                target: KernelTarget::symbol("x"),
+            },
         ];
         let mut seen = std::collections::BTreeSet::new();
         for op in &ops {
@@ -3674,6 +3716,40 @@ mod tests {
             .discriminant(),
             17,
             "WatchSnapshot",
+        );
+        assert_eq!(
+            Op::WriteKernelHot {
+                writes: vec![(KernelTarget::symbol("x"), KernelValue::u64(0))]
+            }
+            .discriminant(),
+            18,
+            "WriteKernelHot",
+        );
+        assert_eq!(
+            Op::WriteKernelCold {
+                writes: vec![(KernelTarget::symbol("x"), KernelValue::u64(0))]
+            }
+            .discriminant(),
+            19,
+            "WriteKernelCold",
+        );
+        assert_eq!(
+            Op::ReadKernelHot {
+                tag: "t".into(),
+                target: KernelTarget::symbol("x")
+            }
+            .discriminant(),
+            20,
+            "ReadKernelHot",
+        );
+        assert_eq!(
+            Op::ReadKernelCold {
+                tag: "t".into(),
+                target: KernelTarget::symbol("x")
+            }
+            .discriminant(),
+            21,
+            "ReadKernelCold",
         );
     }
 
@@ -8211,13 +8287,32 @@ mod tests {
             Op::unfreeze_cgroup("a"),
             Op::capture_snapshot("constructor-test"),
             Op::watch_snapshot("kernel.constructor_test"),
+            Op::write_kernel_hot(
+                KernelTarget::symbol("constructor_test_symbol"),
+                KernelValue::u64(0),
+            ),
+            Op::write_kernel_cold(
+                KernelTarget::symbol("constructor_test_symbol"),
+                KernelValue::u64(0),
+            ),
+            Op::read_kernel_hot(
+                "constructor-test-hot",
+                KernelTarget::symbol("constructor_test_symbol"),
+            ),
+            Op::read_kernel_cold(
+                "constructor-test-cold",
+                KernelTarget::symbol("constructor_test_symbol"),
+            ),
         ];
 
         // Track which variants we observed. Adding a variant to `Op`
         // without a constructor call above leaves one slot `false`,
         // and adding a variant without a match arm below fails to
-        // compile (no `_ =>` on purpose).
-        let mut seen = [false; 18];
+        // compile (no `_ =>` on purpose). **Bump the array size when
+        // the bit_index high-water-mark in `OpKind::bit_index`
+        // changes** — the runtime index check at `seen[idx] = true`
+        // will panic if the new variant's index >= the array length.
+        let mut seen = [false; 22];
         for op in &constructed {
             let idx = match op {
                 Op::AddCgroup { .. } => 0,
@@ -8238,6 +8333,10 @@ mod tests {
                 Op::UnfreezeCgroup { .. } => 15,
                 Op::CaptureSnapshot { .. } => 16,
                 Op::WatchSnapshot { .. } => 17,
+                Op::WriteKernelHot { .. } => 18,
+                Op::WriteKernelCold { .. } => 19,
+                Op::ReadKernelHot { .. } => 20,
+                Op::ReadKernelCold { .. } => 21,
             };
             seen[idx] = true;
         }

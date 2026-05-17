@@ -467,6 +467,96 @@ pub enum Op {
     /// Use [`Op::CaptureSnapshot`] for time-driven captures when
     /// frequency is the concern.
     WatchSnapshot { symbol: Cow<'static, str> },
+    /// Live-vCPU write of one or more [`KernelTarget`] / [`KernelValue`]
+    /// pairs into running guest memory. The host coordinator routes
+    /// each pair to the appropriate `GuestKernel::write_*` helper
+    /// (no freeze rendezvous, vCPUs keep executing). A Release fence
+    /// is issued after the last write so a weakly-ordered guest's
+    /// `smp_load_acquire` observes the bytes in write order — but
+    /// concurrent guest readers can still race against in-flight
+    /// stores, and the caller owns any guest-side synchronisation
+    /// the test requires (`READ_ONCE` / `smp_load_acquire` on the
+    /// target field).
+    ///
+    /// Same orchestration pattern as the existing
+    /// `BpfMapAccessor::write_value` path: synchronous host-side
+    /// memory mutation on a worker thread, no vCPU pause. Use this
+    /// for scratch fields, debug flags, scx-ktstr-private state,
+    /// and anything the guest reads with proper barriers.
+    ///
+    /// **Batch shape.** `writes` carries 1+ pairs; the executor
+    /// will issue them in order. For a single write the
+    /// [`Op::write_kernel_hot`](#method.write_kernel_hot) singleton
+    /// constructor wraps a 1-element vec. The executor handler
+    /// itself lands in a follow-up sub-batch; the dispatch stub
+    /// currently returns an explicit "not yet implemented" error.
+    WriteKernelHot {
+        /// Ordered list of `(target, value)` pairs to write.
+        writes: Vec<(KernelTarget, KernelValue)>,
+    },
+    /// Auto-freezing batched write of one or more
+    /// [`KernelTarget`] / [`KernelValue`] pairs while every vCPU is
+    /// parked at the freeze rendezvous. Reuses the same coordinator
+    /// path that [`Op::CaptureSnapshot`] triggers: one rendezvous,
+    /// every write in the batch lands while paused, then resume.
+    ///
+    /// **Batching is a hard correctness requirement.** Multi-CPU
+    /// seeds (e.g. `with_uptime` writing per-CPU `rq.clock` on every
+    /// CPU at the same instant) must land in ONE freeze window —
+    /// N separate cold-write ops would mean N rendezvous cycles
+    /// and observable inter-CPU skew. The variant payload is a
+    /// `Vec` precisely to make batched writes the natural shape;
+    /// the executor will additionally auto-merge adjacent
+    /// cold-write ops in the same Step into one rendezvous as a
+    /// safety net (auto-merge + the handler itself land in a
+    /// follow-up sub-batch — the dispatch stub currently returns
+    /// an explicit "not yet implemented" error).
+    ///
+    /// Use this for: multi-field atomic writes, all-CPUs-at-once
+    /// seeding, one-shot setup that must complete before the guest
+    /// observes any partial state. Use [`Op::WriteKernelHot`] when
+    /// the guest is OK with live-write semantics + caller-side
+    /// synchronisation.
+    WriteKernelCold {
+        /// Ordered list of `(target, value)` pairs to write inside
+        /// a single freeze rendezvous.
+        writes: Vec<(KernelTarget, KernelValue)>,
+    },
+    /// Live-vCPU read of a [`KernelTarget`] into the
+    /// [`SnapshotBridge`](crate::scenario::snapshot::SnapshotBridge)
+    /// keyed by `tag`. Mirrors [`Op::WriteKernelHot`]: no freeze
+    /// rendezvous, host-side worker thread issues the read while
+    /// the guest keeps executing. The caller assumes the read may
+    /// race against guest writes; for read-write coherency pair the
+    /// op with a guest-side `smp_store_release` on the target.
+    ///
+    /// Use this for: read-back of values previously written via
+    /// [`Op::WriteKernelHot`], lightweight polling of single fields
+    /// the test wants to observe without pausing the guest.
+    ReadKernelHot {
+        /// Bridge-keyed tag under which the read result lands.
+        tag: Cow<'static, str>,
+        /// Address to read.
+        target: KernelTarget,
+    },
+    /// Auto-freezing read of a [`KernelTarget`] into the
+    /// [`SnapshotBridge`](crate::scenario::snapshot::SnapshotBridge)
+    /// keyed by `tag`, taken while every vCPU is parked at the
+    /// freeze rendezvous. Reuses the same coordinator path that
+    /// [`Op::CaptureSnapshot`] triggers. Coherent with respect to
+    /// guest state — no concurrent guest write can race against the
+    /// read.
+    ///
+    /// Use this for: ground-truth reads that must reflect a stable
+    /// guest state, snapshot-style point-in-time reads paired with
+    /// other [`Op::CaptureSnapshot`] / [`Op::WriteKernelCold`] ops
+    /// the executor auto-merges into the same rendezvous.
+    ReadKernelCold {
+        /// Bridge-keyed tag under which the read result lands.
+        tag: Cow<'static, str>,
+        /// Address to read.
+        target: KernelTarget,
+    },
 }
 
 /// How to compute a cpuset from topology.
