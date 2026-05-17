@@ -701,10 +701,11 @@ pub mod prelude {
     // `#[derive(Payload)]` is applied; it occupies the type
     // namespace, distinct from the derive macro re-exported above.
     pub use crate::test_support::{
-        BpfMapWrite, CgroupPath, MemSideCache, Metric, MetricBounds, MetricCheck, MetricHint,
-        MetricSource, NumaDistance, NumaNode, OutputFormat, Payload, PayloadKind, PayloadMetrics,
-        Polarity, Scheduler, SchedulerSpec, SidecarResult, Sysctl, Topology, TopologyConstraints,
-        extract_metrics,
+        BpfMapWrite, CgroupPath, KTSTR_SCHEDULERS, KTSTR_TESTS, KtstrTestEntry, MemSideCache,
+        Metric, MetricBounds, MetricCheck, MetricHint, MetricSource, MetricStream, NumaDistance,
+        NumaNode, OutputFormat, Payload, PayloadKind, PayloadMetrics, Polarity, Scheduler,
+        SchedulerSpec, SidecarResult, Sysctl, Topology, TopologyConstraints, extract_metrics,
+        find_scheduler, find_test, sidecar_dir,
     };
     // The following items are intentionally NOT in the prelude. They
     // are binary-entry helpers (the `ktstr` / `cargo-ktstr` bins) or
