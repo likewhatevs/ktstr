@@ -1132,10 +1132,10 @@ fn evaluate_checks(checks: &[MetricCheck], pm: &PayloadMetrics, stderr: &str) ->
                     if actual.is_nan() {
                         Some(nan_metric(metric))
                     } else if actual < *value {
-                        Some(AssertDetail {
-                            kind: DetailKind::Other,
-                            message: format!("metric '{metric}' = {actual} below minimum {value}"),
-                        })
+                        Some(AssertDetail::new(
+                            DetailKind::Other,
+                            format!("metric '{metric}' = {actual} below minimum {value}"),
+                        ))
                     } else {
                         None
                     }
@@ -1147,12 +1147,10 @@ fn evaluate_checks(checks: &[MetricCheck], pm: &PayloadMetrics, stderr: &str) ->
                     if actual.is_nan() {
                         Some(nan_metric(metric))
                     } else if actual > *value {
-                        Some(AssertDetail {
-                            kind: DetailKind::Other,
-                            message: format!(
-                                "metric '{metric}' = {actual} exceeds maximum {value}"
-                            ),
-                        })
+                        Some(AssertDetail::new(
+                            DetailKind::Other,
+                            format!("metric '{metric}' = {actual} exceeds maximum {value}"),
+                        ))
                     } else {
                         None
                     }
@@ -1164,10 +1162,10 @@ fn evaluate_checks(checks: &[MetricCheck], pm: &PayloadMetrics, stderr: &str) ->
                     if actual.is_nan() {
                         Some(nan_metric(metric))
                     } else if actual < *lo || actual > *hi {
-                        Some(AssertDetail {
-                            kind: DetailKind::Other,
-                            message: format!("metric '{metric}' = {actual} outside [{lo}, {hi}]"),
-                        })
+                        Some(AssertDetail::new(
+                            DetailKind::Other,
+                            format!("metric '{metric}' = {actual} outside [{lo}, {hi}]"),
+                        ))
                     } else {
                         None
                     }
@@ -1190,17 +1188,17 @@ fn evaluate_checks(checks: &[MetricCheck], pm: &PayloadMetrics, stderr: &str) ->
 /// renamer-resistant single source of truth that pairs naturally
 /// with [`missing_metric`] for the absent-metric counterpart.
 fn nan_metric(metric: &str) -> AssertDetail {
-    AssertDetail {
-        kind: DetailKind::Other,
-        message: format!("metric '{metric}' value is NaN"),
-    }
+    AssertDetail::new(
+        DetailKind::Other,
+        format!("metric '{metric}' value is NaN"),
+    )
 }
 
 fn missing_metric(metric: &str) -> AssertDetail {
-    AssertDetail {
-        kind: DetailKind::Other,
-        message: format!("metric '{metric}' not found in payload output"),
-    }
+    AssertDetail::new(
+        DetailKind::Other,
+        format!("metric '{metric}' not found in payload output"),
+    )
 }
 
 /// Scan `checks` for the first `MetricCheck::ExitCodeEq` whose expected
@@ -1220,10 +1218,12 @@ fn exit_code_mismatch_detail(
     stderr: &str,
 ) -> Option<AssertDetail> {
     checks.iter().find_map(|c| match c {
-        MetricCheck::ExitCodeEq(expected) if actual_exit_code != *expected => Some(AssertDetail {
-            kind: DetailKind::Other,
-            message: format_exit_mismatch(actual_exit_code, *expected, stderr),
-        }),
+        MetricCheck::ExitCodeEq(expected) if actual_exit_code != *expected => Some(
+            AssertDetail::new(
+                DetailKind::Other,
+                format_exit_mismatch(actual_exit_code, *expected, stderr),
+            ),
+        ),
         _ => None,
     })
 }

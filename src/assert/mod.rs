@@ -341,6 +341,21 @@ pub(crate) fn format_sched_died_during_workload(elapsed_s: f64) -> String {
 pub struct AssertDetail {
     pub kind: DetailKind,
     pub message: String,
+    /// Scenario phase the detail was emitted under. Mirrors
+    /// [`PassDetail::phase`]: `None` outside any [`PhaseGuard`] scope
+    /// (boot, BASELINE settle, non-scenario test fixtures), `Some`
+    /// when an active guard has installed a label. Carried on every
+    /// detail so consumers (auto-repro renderer, sidecar parsers)
+    /// see a uniform phase field across pass + fail records.
+    /// Producers that already know the active phase can stamp via
+    /// [`Self::with_phase`].
+    ///
+    /// [`Cow<'static, str>`] mirrors [`PassDetail::phase`] for the
+    /// same zero-allocation reason: the common case is the per-step
+    /// RAII guard's static `&'static str` label staying as
+    /// `Cow::Borrowed` (zero alloc); runtime-built `String`s become
+    /// `Cow::Owned`.
+    pub phase: Option<std::borrow::Cow<'static, str>>,
 }
 
 impl AssertDetail {
@@ -348,7 +363,19 @@ impl AssertDetail {
         Self {
             kind,
             message: message.into(),
+            phase: None,
         }
+    }
+
+    /// Builder-style setter for [`Self::phase`]. Consumes self,
+    /// stamps the phase label, returns the updated value. Matches
+    /// the [`PassDetail::with_phase`] shape so producers can chain
+    /// `AssertDetail::new(...).with_phase(...)` uniformly across
+    /// pass and fail records.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_phase(mut self, phase: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        self.phase = Some(phase.into());
+        self
     }
 
     /// Borrow this detail as a kind-prefixed [`std::fmt::Display`]
@@ -582,6 +609,12 @@ pub const MAX_RECORDED_PASSES: usize = 10_000;
 /// .unwrap_or(false)` — i.e. inspect the tail entry's name.
 pub const PASSES_TRUNCATION_SENTINEL_NAME: &str = "__ktstr_passes_truncated__";
 
+/// Comparator-string value used by the truncation sentinel record
+/// alone. Out-of-vocabulary by design — not in [`COMPARATOR_VOCABULARY`]
+/// — so the runtime debug_assert in `record_pass_inner` allows it
+/// explicitly without polluting the wire-canonical token set.
+pub const PASSES_TRUNCATION_SENTINEL_COMPARATOR: &str = "truncated";
+
 /// `Display` adapter returned by [`AssertDetail::display_with_kind`].
 /// Renders the detail as `[<kind>] <message>`. Held by reference so
 /// the helper allocates nothing on the formatting path; the lifetime
@@ -605,10 +638,7 @@ impl From<String> for AssertDetail {
     /// failures, so losing the category bucket makes post-run
     /// categorization rely on free-text regex against `message`.
     fn from(message: String) -> Self {
-        Self {
-            kind: DetailKind::Other,
-            message,
-        }
+        Self::new(DetailKind::Other, message)
     }
 }
 
@@ -620,10 +650,7 @@ impl From<&str> for AssertDetail {
     /// failures, so losing the category bucket makes post-run
     /// categorization rely on free-text regex against `message`.
     fn from(s: &str) -> Self {
-        Self {
-            kind: DetailKind::Other,
-            message: s.to_string(),
-        }
+        Self::new(DetailKind::Other, s)
     }
 }
 

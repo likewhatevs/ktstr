@@ -245,3 +245,189 @@ fn every_expected_token_is_in_vocabulary() {
         "expected_tokens and COMPARATOR_VOCABULARY differ in size"
     );
 }
+
+// =====================================================================
+// Coverage-class tests: merge-survival, chain-emits-N,
+// sentinel-truncation. Guard against regressions in cross-cutting
+// PassDetail handling that the per-comparator tests above don't catch.
+// =====================================================================
+
+/// Merging two Verdicts must preserve every PassDetail's comparator
+/// — neither side gets dropped or has its comparator rewritten.
+/// Catches a refactor that accidentally normalizes comparators
+/// during Verdict::merge or filters by some category.
+#[test]
+fn merge_preserves_comparators_from_both_verdicts() {
+    let mut a = Verdict::new();
+    a.claim("x", 42u64).eq(42);
+
+    let mut b = Verdict::new();
+    b.claim("y", 1.5f64).is_finite();
+
+    let result_b = b.into_result();
+    a.merge(result_b);
+    let result = a.into_result();
+
+    assert_eq!(result.passes.len(), 2, "both passes must survive merge");
+    let comparators: std::collections::HashSet<&str> = result
+        .passes
+        .iter()
+        .map(|p| p.comparator.as_ref())
+        .collect();
+    assert!(comparators.contains("eq"), "eq from verdict A lost in merge");
+    assert!(
+        comparators.contains("is_finite"),
+        "is_finite from verdict B lost in merge"
+    );
+}
+
+/// A single Verdict with N chained claims of DIFFERENT comparators
+/// emits N PassDetails — one per claim, each with its own
+/// comparator. Catches accidental dedup or last-claim-wins logic
+/// in the record-pass path.
+#[test]
+fn chain_emits_one_pass_per_comparator() {
+    let mut v = Verdict::new();
+    v.claim("a", 42u64).eq(42);
+    v.claim("b", 1.5f64).is_finite();
+    v.claim("c", 5u64).at_least(1);
+
+    let r = v.into_result();
+    assert_eq!(r.passes.len(), 3, "3 chained claims must emit 3 passes");
+    assert_eq!(r.passes[0].comparator, "eq");
+    assert_eq!(r.passes[1].comparator, "is_finite");
+    assert_eq!(r.passes[2].comparator, "ge"); // at_least → "ge"
+}
+
+/// Merging two Verdicts whose passes carry the SAME comparator token
+/// must NOT dedupe by token-equivalence — both passes survive as
+/// distinct records. Pins that merge() is content-blind concat, not
+/// dedup-by-comparator.
+#[test]
+fn merge_preserves_duplicate_comparators() {
+    let mut a = Verdict::new();
+    a.claim("x", 42u64).eq(42);
+
+    let mut b = Verdict::new();
+    b.claim("y", 7u64).eq(7);
+
+    let result_b = b.into_result();
+    a.merge(result_b);
+    let result = a.into_result();
+
+    assert_eq!(
+        result.passes.len(),
+        2,
+        "merge must preserve both eq passes, not dedupe by token"
+    );
+    assert_eq!(result.passes[0].comparator, "eq");
+    assert_eq!(result.passes[1].comparator, "eq");
+    // Names distinguish the two records when comparator can't.
+    assert_eq!(result.passes[0].name, "x");
+    assert_eq!(result.passes[1].name, "y");
+}
+
+/// Empty-side merge (both directions) must be a no-op on the
+/// passes vector. Pins the zero-length transit degenerate case.
+#[test]
+fn merge_with_empty_verdict_is_noop() {
+    // non-empty.merge(empty)
+    let mut a = Verdict::new();
+    a.claim("x", 42u64).eq(42);
+    let empty = Verdict::new().into_result();
+    a.merge(empty);
+    let result = a.into_result();
+    assert_eq!(result.passes.len(), 1, "merging empty must not drop the existing pass");
+    assert_eq!(result.passes[0].comparator, "eq");
+
+    // empty.merge(non-empty)
+    let mut a = Verdict::new();
+    let mut b = Verdict::new();
+    b.claim("x", 42u64).eq(42);
+    a.merge(b.into_result());
+    let result = a.into_result();
+    assert_eq!(result.passes.len(), 1, "merging into empty must adopt the incoming pass");
+    assert_eq!(result.passes[0].comparator, "eq");
+}
+
+/// Subsequent pushes BEYOND the cap-th sentinel must be no-ops —
+/// the passes vec must stay at MAX_RECORDED_PASSES + 1 entries
+/// regardless of how many over-cap claims fire. Catches a
+/// regression that re-pushes the sentinel on every over-cap claim
+/// (vec would balloon to MAX + over_cap_count).
+#[test]
+fn truncation_sentinel_idempotent_under_repeated_overflow() {
+    let mut v = Verdict::new();
+    // Fire MAX_RECORDED_PASSES + 100 claims so the over-cap branch
+    // hits 100 times after the sentinel is published.
+    for _ in 0..(MAX_RECORDED_PASSES + 100) {
+        v.claim("loop", 42u64).eq(42);
+    }
+    let r = v.into_result();
+    assert_eq!(
+        r.passes.len(),
+        MAX_RECORDED_PASSES + 1,
+        "passes vec must stay at cap+1 — additional over-cap pushes must be no-ops, not re-push the sentinel"
+    );
+    let last = r.passes.last().expect("non-empty after cap-hit");
+    assert_eq!(last.name, PASSES_TRUNCATION_SENTINEL_NAME);
+    assert_eq!(last.comparator, PASSES_TRUNCATION_SENTINEL_COMPARATOR);
+}
+
+/// Sentinel record's `value` field must encode the cap (not be
+/// empty and not leak a real claim's value). Pins the
+/// `format!("cap={MAX_RECORDED_PASSES}")` convention from
+/// record_pass_inner so an auto-repro renderer can grep for
+/// the cap-encoded value to detect truncation.
+#[test]
+fn truncation_sentinel_value_encodes_cap() {
+    let mut v = Verdict::new();
+    for _ in 0..(MAX_RECORDED_PASSES + 1) {
+        v.claim("loop", 42u64).eq(42);
+    }
+    let r = v.into_result();
+    let last = r.passes.last().expect("non-empty after cap-hit");
+    assert_eq!(last.name, PASSES_TRUNCATION_SENTINEL_NAME);
+    let expected_value = format!("cap={MAX_RECORDED_PASSES}");
+    assert_eq!(
+        last.value, expected_value,
+        "sentinel value must encode the cap so renderers can detect truncation"
+    );
+    assert!(
+        last.expected.is_none(),
+        "sentinel uses unary shape — no expected field"
+    );
+}
+
+/// Exceeding MAX_RECORDED_PASSES must produce a truncation sentinel
+/// as the cap-th entry: `name == PASSES_TRUNCATION_SENTINEL_NAME`
+/// and `comparator == PASSES_TRUNCATION_SENTINEL_COMPARATOR`
+/// ("truncated"). Pins the sentinel record's wire shape against
+/// silent refactors that change the cap-hit behavior.
+#[test]
+fn truncation_sentinel_caps_at_max_recorded_passes() {
+    let mut v = Verdict::new();
+    // Fire MAX_RECORDED_PASSES+1 claims so the cap-th slot becomes
+    // the sentinel + further pushes are no-ops.
+    for _ in 0..(MAX_RECORDED_PASSES + 1) {
+        v.claim("loop", 42u64).eq(42);
+    }
+    let r = v.into_result();
+    assert_eq!(
+        r.passes.len(),
+        MAX_RECORDED_PASSES + 1,
+        "passes vec grows to cap + 1 sentinel"
+    );
+    let last = r.passes.last().expect("non-empty after cap-hit");
+    assert_eq!(
+        last.name, PASSES_TRUNCATION_SENTINEL_NAME,
+        "sentinel name pins the wire contract"
+    );
+    assert_eq!(
+        last.comparator, PASSES_TRUNCATION_SENTINEL_COMPARATOR,
+        "sentinel comparator is the out-of-vocabulary 'truncated' token"
+    );
+    // The first MAX_RECORDED_PASSES entries are real claim records.
+    assert_eq!(r.passes[0].comparator, "eq");
+    assert_eq!(r.passes[MAX_RECORDED_PASSES - 1].comparator, "eq");
+}

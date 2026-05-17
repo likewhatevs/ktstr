@@ -363,6 +363,18 @@ impl Verdict {
         value: String,
         expected: Option<String>,
     ) {
+        // Catch unregistered comparator tokens at debug-build runtime.
+        // Vocabulary count + membership guards in
+        // tests/claim_comparator_tokens_canonical.rs catch the
+        // forgot-to-update-the-vocab case at test-collection time;
+        // this debug_assert catches it inside any test that exercises
+        // the new comparator path (zero release-build cost).
+        debug_assert!(
+            super::COMPARATOR_VOCABULARY.contains(&comparator.as_ref())
+                || comparator == super::PASSES_TRUNCATION_SENTINEL_COMPARATOR,
+            "comparator token {comparator:?} not in COMPARATOR_VOCABULARY \
+             — add it to the const slice + regression test before shipping"
+        );
         if self.log_passes {
             match expected.as_ref() {
                 Some(exp) => tracing::info!(
@@ -392,7 +404,7 @@ impl Verdict {
         } else if len == super::MAX_RECORDED_PASSES {
             self.result.passes.push(super::PassDetail::unary(
                 super::PASSES_TRUNCATION_SENTINEL_NAME,
-                "truncated",
+                super::PASSES_TRUNCATION_SENTINEL_COMPARATOR,
                 format!("cap={}", super::MAX_RECORDED_PASSES),
             ));
         }
