@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use vmm_sys_util::eventfd::EventFd;
+use crate::sync::MutexExt;
 
 /// Snapshot of a vCPU's architectural state, captured by the vCPU
 /// thread itself at freeze time (just before it parks). Surfaced in
@@ -1135,7 +1136,7 @@ pub(crate) fn handle_freeze(
     // correct. A failed capture stores `None`; the dump shows
     // "registers unavailable" rather than panicking the freeze.
     let snapshot = capture_vcpu_regs(vcpu);
-    *regs_slot.lock().unwrap_or_else(|e| e.into_inner()) = snapshot;
+    *regs_slot.lock_unpoisoned() = snapshot;
 
     // Acknowledge frozen state. The Release store synchronizes-with
     // the coordinator's Acquire load on `parked`, providing the

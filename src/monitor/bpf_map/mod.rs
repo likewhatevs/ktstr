@@ -15,6 +15,7 @@
 //!   use `kva_to_pa` with `__per_cpu_offset[cpu]`.
 
 use anyhow::Context;
+use crate::sync::MutexExt;
 
 use super::btf_offsets::BpfMapOffsets;
 use super::idr::{translate_any_kva, xa_load};
@@ -1331,7 +1332,7 @@ impl PerCpuOffsetsCache {
     where
         F: FnOnce() -> Vec<u64>,
     {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.inner.lock_unpoisoned();
         if let Some((cached_n, cached)) = guard.as_ref()
             && *cached_n == num_cpus
         {
@@ -1438,7 +1439,7 @@ impl<'a> GuestMemMapAccessor<'a> {
     /// Goes through the per-accessor maps cache so repeat
     /// `find_map` calls within one dump amortize the IDR walk.
     pub fn find_map(&self, name_suffix: &str) -> Option<BpfMapInfo> {
-        let mut guard = self.maps_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.maps_cache.lock_unpoisoned();
         if guard.is_none() {
             *guard = Some(std::sync::Arc::new(find_all_bpf_maps(
                 &self.ctx(),
@@ -1509,7 +1510,7 @@ impl BpfMapAccessor for GuestMemMapAccessor<'_> {
     /// cannot return stale entries for maps the guest kernel
     /// created / destroyed between dumps.
     fn maps(&self) -> Vec<BpfMapInfo> {
-        let mut guard = self.maps_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.maps_cache.lock_unpoisoned();
         if let Some(cached) = guard.as_ref() {
             return (**cached).clone();
         }
@@ -1527,7 +1528,7 @@ impl BpfMapAccessor for GuestMemMapAccessor<'_> {
     /// returned a clone-and-drop of the full `Vec<BpfMapInfo>`
     /// from the cache only to scan it linearly.
     fn find_map(&self, name_suffix: &str) -> Option<BpfMapInfo> {
-        let mut guard = self.maps_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.maps_cache.lock_unpoisoned();
         if guard.is_none() {
             *guard = Some(std::sync::Arc::new(find_all_bpf_maps(
                 &self.ctx(),

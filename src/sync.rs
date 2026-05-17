@@ -5,7 +5,51 @@
 //! semantics like "probe readiness" or "phase-B attach" in their
 //! type or method names.
 
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+/// Adds [`Self::lock_unpoisoned`] to [`Mutex`] for the recover-on-
+/// poison policy every in-tree mutex caller follows. Equivalent to
+/// `self.lock().unwrap_or_else(|e| e.into_inner())`, consolidated
+/// in one named method so the policy ("we tolerate poison;
+/// recovery is structurally safe because the protected state is
+/// observation-only or already tombstoned") lives in one place
+/// instead of ~70 hand-rolled call sites.
+pub(crate) trait MutexExt<T> {
+    /// Acquire the mutex, returning the inner guard regardless of
+    /// poison state. A poisoned mutex still yields its protected
+    /// data — the caller is responsible for treating the value as
+    /// "possibly stale" if a previous thread panicked while
+    /// holding the lock.
+    fn lock_unpoisoned(&self) -> MutexGuard<'_, T>;
+}
+
+impl<T> MutexExt<T> for Mutex<T> {
+    fn lock_unpoisoned(&self) -> MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Adds [`Self::read_unpoisoned`] and [`Self::write_unpoisoned`] to
+/// [`RwLock`] for the recover-on-poison policy. Mirrors
+/// [`MutexExt::lock_unpoisoned`] — each method returns the inner
+/// guard regardless of poison state.
+pub(crate) trait RwLockExt<T> {
+    /// Acquire a shared read guard, returning the inner guard
+    /// regardless of poison state.
+    fn read_unpoisoned(&self) -> RwLockReadGuard<'_, T>;
+    /// Acquire an exclusive write guard, returning the inner guard
+    /// regardless of poison state.
+    fn write_unpoisoned(&self) -> RwLockWriteGuard<'_, T>;
+}
+
+impl<T> RwLockExt<T> for RwLock<T> {
+    fn read_unpoisoned(&self) -> RwLockReadGuard<'_, T> {
+        self.read().unwrap_or_else(|e| e.into_inner())
+    }
+    fn write_unpoisoned(&self) -> RwLockWriteGuard<'_, T> {
+        self.write().unwrap_or_else(|e| e.into_inner())
+    }
+}
 
 /// One-shot signal from a producer thread to one or more waiters.
 ///
@@ -136,5 +180,57 @@ mod tests {
         latch.set();
         latch.set();
         latch.wait();
+    }
+
+    /// `lock_unpoisoned` on an unpoisoned mutex matches plain
+    /// `.lock().unwrap()`.
+    #[test]
+    fn lock_unpoisoned_unpoisoned() {
+        let m = Mutex::new(42);
+        assert_eq!(*m.lock_unpoisoned(), 42);
+    }
+
+    /// Pins the recover-on-poison policy: after another thread
+    /// panics while holding the mutex, `lock_unpoisoned()` still
+    /// returns the inner guard with the protected state intact.
+    #[test]
+    fn lock_unpoisoned_recovers_from_poison() {
+        let m = Arc::new(Mutex::new(99));
+        let m_inner = Arc::clone(&m);
+        let _ = std::thread::spawn(move || {
+            let _g = m_inner.lock().unwrap();
+            panic!("poison the mutex");
+        })
+        .join();
+        assert!(m.is_poisoned());
+        assert_eq!(*m.lock_unpoisoned(), 99);
+    }
+
+    /// `read_unpoisoned` / `write_unpoisoned` on an unpoisoned
+    /// RwLock match plain `.read()` / `.write()`.
+    #[test]
+    fn rwlock_unpoisoned_unpoisoned() {
+        let l = RwLock::new(7);
+        assert_eq!(*l.read_unpoisoned(), 7);
+        *l.write_unpoisoned() = 8;
+        assert_eq!(*l.read_unpoisoned(), 8);
+    }
+
+    /// Pins recover-on-poison for both read and write paths on
+    /// RwLock — mirrors `lock_unpoisoned_recovers_from_poison` for
+    /// the rwlock case.
+    #[test]
+    fn rwlock_unpoisoned_recovers_from_poison() {
+        let l = Arc::new(RwLock::new(123));
+        let l_inner = Arc::clone(&l);
+        let _ = std::thread::spawn(move || {
+            let mut _w = l_inner.write().unwrap();
+            panic!("poison the rwlock");
+        })
+        .join();
+        assert!(l.is_poisoned());
+        assert_eq!(*l.read_unpoisoned(), 123);
+        *l.write_unpoisoned() = 456;
+        assert_eq!(*l.read_unpoisoned(), 456);
     }
 }

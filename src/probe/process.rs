@@ -44,6 +44,7 @@ use super::stack::StackFunction;
 
 use crate::bpf_skel::types;
 use crate::sync::Latch;
+use crate::sync::RwLockExt;
 
 /// Input for Phase B probe attachment (BPF fentry/fexit).
 ///
@@ -332,7 +333,7 @@ pub fn resolve_func_ip(name: &str) -> Option<u64> {
     // Post-load the lookup is read-only and batches resolving many
     // symbols contend only on the shared read lock.
     {
-        let read = slot.read().unwrap_or_else(|e| e.into_inner());
+        let read = slot.read_unpoisoned();
         if let Some(map) = read.as_ref() {
             return map.get(name).copied();
         }
@@ -344,7 +345,7 @@ pub fn resolve_func_ip(name: &str) -> Option<u64> {
     // that slips past this gate still gets serialized.
     let last_slot = LAST_LOAD_ATTEMPT.get_or_init(|| RwLock::new(None));
     {
-        let last = last_slot.read().unwrap_or_else(|e| e.into_inner());
+        let last = last_slot.read_unpoisoned();
         if let Some(t) = *last
             && t.elapsed() < RETRY_MIN_INTERVAL
         {
@@ -356,9 +357,9 @@ pub fn resolve_func_ip(name: &str) -> Option<u64> {
     // concurrent first-callers don't stampede into N serialized
     // loads: only the winner gets past the timestamp gate, everyone
     // else observes `*last = Some(now)` and bails.
-    let mut write = slot.write().unwrap_or_else(|e| e.into_inner());
+    let mut write = slot.write_unpoisoned();
     if write.is_none() {
-        let mut last = last_slot.write().unwrap_or_else(|e| e.into_inner());
+        let mut last = last_slot.write_unpoisoned();
         if last.is_none_or(|t| t.elapsed() >= RETRY_MIN_INTERVAL) {
             *write = load_kallsyms();
             *last = Some(Instant::now());

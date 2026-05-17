@@ -95,6 +95,7 @@ use crate::monitor::MonitorSummary;
 use crate::test_support::PayloadMetrics;
 use crate::timeline::StimulusEvent;
 use crate::vmm;
+use crate::sync::MutexExt;
 
 use super::entry::KtstrTestEntry;
 use super::timefmt::{generate_run_id, now_iso8601};
@@ -1546,9 +1547,10 @@ pub(crate) fn detect_kernel_commit(kernel_dir: &std::path::Path) -> Option<Strin
     // the answer is still unknown for that path.
     //
     // Mutex poisoning recovery: a panic mid-probe could poison
-    // the lock; the `unwrap_or_else(|e| e.into_inner())` pattern
-    // recovers the guard so a future caller doesn't fail
-    // catastrophically. The cached map is just a HashMap of
+    // the lock; acquiring via
+    // [`crate::sync::MutexExt::lock_unpoisoned`] returns the
+    // guard regardless of poison state so a future caller doesn't
+    // fail catastrophically. The cached map is just a HashMap of
     // owned strings; no invariant beyond "key→value mapping" can
     // be broken by an interrupted probe.
     use std::collections::HashMap;
@@ -1571,7 +1573,7 @@ pub(crate) fn detect_kernel_commit(kernel_dir: &std::path::Path) -> Option<Strin
         .unwrap_or_else(|_| kernel_dir.to_path_buf());
     let cache = KERNEL_COMMIT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     {
-        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = cache.lock_unpoisoned();
         if let Some(cached) = guard.get(&cache_key) {
             return Some(cached.clone());
         }
@@ -1595,7 +1597,7 @@ pub(crate) fn detect_kernel_commit(kernel_dir: &std::path::Path) -> Option<Strin
         .ok()
         .and_then(|repo| commit_with_dirty_suffix(&repo));
     if let Some(ref hash) = result {
-        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = cache.lock_unpoisoned();
         // First successful caller wins; a concurrent caller's
         // identical hash would overwrite harmlessly because
         // success is deterministic for a given (canonicalized
@@ -2334,7 +2336,7 @@ fn pre_clear_run_dir_once(dir: &std::path::Path) {
     // same way and share the entry).
     let cache_key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let cache = PRE_CLEARED.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = cache.lock_unpoisoned();
     if guard.contains(&cache_key) {
         return;
     }

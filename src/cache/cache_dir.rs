@@ -55,6 +55,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::Context;
+use crate::sync::MutexExt;
 
 use super::housekeeping::{
     TmpDirGuard, atomic_swap_dirs, clean_orphaned_tmp_dirs, read_metadata, validate_cache_key,
@@ -170,7 +171,7 @@ fn should_emit_unstripped_warn(entry: &CacheEntry, set: &Mutex<HashSet<String>>)
     if !should_warn_unstripped(entry) {
         return false;
     }
-    let mut guard = set.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = set.lock_unpoisoned();
     guard.insert(entry.key.clone())
 }
 

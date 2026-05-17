@@ -142,6 +142,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use crate::sync::MutexExt;
 
 /// Top-level serialized artifact produced by `ktstr ctprof`.
 ///
@@ -2983,13 +2984,12 @@ fn capture_with(
                                 // re-panicking out of `pool.install` and
                                 // collapsing the snapshot.
                                 let cached = probe_cache
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
+                                    .lock_unpoisoned()
                                     .get(&key)
                                     .cloned();
                                 if let Some(cached_result) = cached {
                                     let mut s =
-                                        summary_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                                        summary_mutex.lock_unpoisoned();
                                     s.tgids_walked += 1;
                                     match &cached_result.failed_tag {
                                         None => {
@@ -3064,13 +3064,12 @@ fn capture_with(
                                     // bounded by the rayon pool size.
                                     let outcome = attach_probe_for_tgid_at(proc_root, tgid);
                                     let mut s =
-                                        summary_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                                        summary_mutex.lock_unpoisoned();
                                     let res = record_attach_outcome(tgid, outcome, &mut s);
                                     drop(s);
                                     let probe = res.probe.clone();
                                     probe_cache
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
+                                        .lock_unpoisoned()
                                         .insert(key, res);
                                     probe
                                 }
@@ -3080,7 +3079,7 @@ fn capture_with(
                                 // branch above; result is not cached because
                                 // there's no key to file it under.
                                 let outcome = attach_probe_for_tgid_at(proc_root, tgid);
-                                let mut s = summary_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut s = summary_mutex.lock_unpoisoned();
                                 record_attach_outcome(tgid, outcome, &mut s).probe
                             }
                         }));
@@ -3119,7 +3118,7 @@ fn capture_with(
                                 // strictly less bad than re-panicking out
                                 // of the worker and tearing down
                                 // `pool.install`.
-                                let mut s = summary_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut s = summary_mutex.lock_unpoisoned();
                                 s.tgids_walked += 1;
                                 *s.attach_tag_counts.entry("worker-panic").or_insert(0) += 1;
                                 s.failed += 1;

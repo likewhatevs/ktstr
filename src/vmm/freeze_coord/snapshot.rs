@@ -24,6 +24,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use vmm_sys_util::eventfd::EventFd;
+use crate::sync::MutexExt;
 
 use super::super::vcpu::{ImmediateExitHandle, WatchpointArm, vcpu_signal};
 use super::state::SnapshotRequest;
@@ -265,8 +266,7 @@ pub(super) fn arm_user_watchpoint(
     {
         let mut tag_guard = watchpoint.user[idx]
             .tag
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .lock_unpoisoned();
         *tag_guard = symbol.to_string();
     }
     watchpoint.user[idx]

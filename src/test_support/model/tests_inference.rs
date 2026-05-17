@@ -4,6 +4,7 @@
 
 use super::super::test_helpers::{EnvVarGuard, isolated_cache_dir, lock_env};
 use super::*;
+use crate::sync::MutexExt;
 
 // ---- inference_thread_count ----------------------------------
 //
@@ -861,7 +862,7 @@ fn reset_clears_model_cache() {
     // First call — populates MODEL_CACHE with Err(<offline gate>).
     let _ = extract_via_llm("seed call", None, crate::test_support::MetricStream::Stdout);
     {
-        let guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = MODEL_CACHE.lock_unpoisoned();
         assert!(
             guard.is_some(),
             "first extract_via_llm should populate MODEL_CACHE"
@@ -870,7 +871,7 @@ fn reset_clears_model_cache() {
     // Reset: cache must be cleared.
     reset();
     {
-        let guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = MODEL_CACHE.lock_unpoisoned();
         assert!(guard.is_none(), "reset must clear MODEL_CACHE to None");
     }
     // Subsequent extract_via_llm under the same offline gate must
@@ -880,7 +881,7 @@ fn reset_clears_model_cache() {
         None,
         crate::test_support::MetricStream::Stdout,
     );
-    let guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = MODEL_CACHE.lock_unpoisoned();
     let cached = guard
         .as_ref()
         .expect("post-reset call should populate MODEL_CACHE");

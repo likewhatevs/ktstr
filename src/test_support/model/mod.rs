@@ -88,6 +88,7 @@
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+use crate::sync::MutexExt;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -2516,7 +2517,7 @@ fn strip_think_block(s: &str) -> String {
 /// on the outer mutex is the lock + (slot read or load + store) +
 /// unlock.
 fn memoized_inference() -> Arc<CachedInference> {
-    let mut guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = MODEL_CACHE.lock_unpoisoned();
     if let Some(arc) = guard.as_ref() {
         return Arc::clone(arc);
     }
@@ -2567,7 +2568,7 @@ fn memoized_inference() -> Arc<CachedInference> {
 #[cfg(test)]
 pub(crate) fn reset() {
     MODEL_CACHE_LOAD_COUNT.store(0, Ordering::Relaxed);
-    let mut guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = MODEL_CACHE.lock_unpoisoned();
     *guard = None;
 }
 

@@ -2112,6 +2112,7 @@ pub fn ktstr_main() -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::MutexExt;
 
     // ---------------------------------------------------------------
     // is_test_sentinel — convention-based sentinel-name predicate
@@ -3129,8 +3130,7 @@ mod tests {
     fn capture_stdout<R>(f: impl FnOnce() -> R) -> (R, Vec<u8>) {
         use std::io::{Read, Seek, SeekFrom, Write};
         let _lock = STDOUT_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .lock_unpoisoned();
         let mut sink = tempfile::tempfile().expect("create stdout-capture tempfile");
         // Flush before redirect: println! is line-buffered behind
         // the Stdout lock; pre-call bytes need to reach the

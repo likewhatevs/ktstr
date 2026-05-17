@@ -64,6 +64,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
+use crate::sync::MutexExt;
 
 use super::PiMutex;
 use super::virtio_console::VirtioConsole;
@@ -468,8 +469,7 @@ impl SchedStatsClient {
         let _request_guard = self
             .shared
             .request_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .lock_unpoisoned();
 
         // Drain any stale guest→host bytes from port2_tx_buf BEFORE
         // flipping in_flight=true. This NARROWS the stale-bytes race

@@ -20,6 +20,7 @@
 //! guest on host backpressure. The panic hook in
 //! [`super::rust_init`] follows this discipline.
 
+use crate::sync::MutexExt;
 use crate::vmm::wire::{
     LifecyclePhase, MSG_TYPE_SNAPSHOT_REPLY, MsgType, SNAPSHOT_REASON_MAX, SNAPSHOT_STATUS_ERR,
     SNAPSHOT_STATUS_OK, SNAPSHOT_TAG_MAX, ShmMessage, SnapshotReplyPayload, SnapshotRequestPayload,
@@ -186,7 +187,7 @@ fn write_msg(msg_type: u32, payload: &[u8]) -> bool {
     if !assert_guest_context("write_msg", msg_type) {
         return false;
     }
-    let _guard = GUEST_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = GUEST_WRITE_LOCK.lock_unpoisoned();
     write_to_bulk_port(msg_type, payload)
 }
 
@@ -207,7 +208,7 @@ fn write_msg(msg_type: u32, payload: &[u8]) -> bool {
 /// submissions reassemble correctly.
 fn write_to_bulk_port(msg_type: u32, payload: &[u8]) -> bool {
     let slot = BULK_PORT_FD.get_or_init(|| std::sync::Mutex::new(None));
-    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = slot.lock_unpoisoned();
     if guard.is_none() {
         match try_open_bulk_port() {
             Some(f) => *guard = Some(f),
@@ -859,8 +860,7 @@ pub fn request_snapshot(
         };
     }
     let _guard = SNAPSHOT_REQUEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+        .lock_unpoisoned();
     // Allocate a request id. Skip 0 so the wait loop's `reply.request_id
     // == request_id` check cannot accidentally match a zero-initialised
     // reply payload from an earlier protocol version.
@@ -889,7 +889,7 @@ pub fn request_snapshot(
     // open would fail. The write fd is opened O_RDWR by
     // try_open_bulk_port.
     let read_slot = BULK_PORT_FD.get_or_init(|| std::sync::Mutex::new(None));
-    let mut read_guard = read_slot.lock().unwrap_or_else(|e| e.into_inner());
+    let mut read_guard = read_slot.lock_unpoisoned();
     if read_guard.is_none() {
         match try_open_bulk_port() {
             Some(f) => *read_guard = Some(f),

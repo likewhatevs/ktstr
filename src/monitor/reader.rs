@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::timerfd::TimerFd;
+use crate::sync::MutexExt;
 
 /// Per-NUMA-node host memory region within a GuestMem.
 #[derive(Debug, Clone, Copy)]
@@ -886,7 +887,7 @@ impl GuestMem {
         // corrupt the entry's bytes, and bypass-on-poison would
         // silently drop every subsequent hit.
         {
-            let guard = self.page_tlb.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = self.page_tlb.lock_unpoisoned();
             if let Some(entry) = guard.as_ref()
                 && entry.cr3_pa == cr3_pa
                 && entry.l5 == l5
@@ -914,7 +915,7 @@ impl GuestMem {
         }
 
         if let Some(pa) = walk_result {
-            let mut guard = self.page_tlb.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = self.page_tlb.lock_unpoisoned();
             *guard = Some(TlbEntry {
                 cr3_pa,
                 l5,
@@ -959,7 +960,7 @@ impl GuestMem {
         // Recover from poison rather than silently bypass — see
         // [`Self::translate_kva`] for the rationale.
         {
-            let guard = self.page_tlb.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = self.page_tlb.lock_unpoisoned();
             if let Some(entry) = guard.as_ref()
                 && entry.cr3_pa == cr3_pa
                 && entry.l5 == l5
@@ -990,7 +991,7 @@ impl GuestMem {
         }
 
         if let Some(pa) = walk_result {
-            let mut guard = self.page_tlb.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = self.page_tlb.lock_unpoisoned();
             *guard = Some(TlbEntry {
                 cr3_pa,
                 l5,

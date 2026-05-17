@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
+use crate::sync::RwLockExt;
 
 /// Process-global cache of vmlinux ELF bytes keyed by canonical path.
 ///
@@ -60,7 +61,7 @@ pub(crate) fn cached_vmlinux_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
     let mtime = std::fs::metadata(&canon).and_then(|m| m.modified()).ok()?;
     let slot = VMLINUX_BYTES_CACHE.get_or_init(|| RwLock::new(std::collections::HashMap::new()));
     {
-        let read = slot.read().unwrap_or_else(|e| e.into_inner());
+        let read = slot.read_unpoisoned();
         if let Some(entry) = read.get(&canon)
             && entry.mtime == mtime
         {
@@ -73,7 +74,7 @@ pub(crate) fn cached_vmlinux_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
     // produce the same bytes.
     let bytes = std::fs::read(&canon).ok()?;
     let arc = Arc::new(bytes);
-    let mut write = slot.write().unwrap_or_else(|e| e.into_inner());
+    let mut write = slot.write_unpoisoned();
     // Always overwrite: if no entry, insert; if entry exists with
     // matching mtime (racing reader won the insert race), our overwrite
     // is identical; if entry exists with stale mtime (file rewrote
@@ -97,7 +98,7 @@ pub(crate) fn cached_vmlinux_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
 #[cfg(test)]
 pub(crate) fn clear_vmlinux_cache_for_tests() {
     if let Some(slot) = VMLINUX_BYTES_CACHE.get() {
-        slot.write().unwrap_or_else(|e| e.into_inner()).clear();
+        slot.write_unpoisoned().clear();
     }
 }
 

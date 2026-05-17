@@ -337,6 +337,7 @@ mod tests {
     //! every case. That isolates state between tests even under the
     //! parallel test runner (nextest).
     use super::*;
+    use crate::sync::MutexExt;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     /// Ten `install_once` calls must neither panic nor deadlock;
@@ -473,7 +474,7 @@ mod tests {
     /// the preserved prev chain.
     #[test]
     fn panic_inside_ctx_still_runs_prev_hook() {
-        let _guard = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = HOOK_TEST_LOCK.lock_unpoisoned();
         let saved = std::panic::take_hook();
 
         let prev_ran = Arc::new(AtomicBool::new(false));
@@ -554,7 +555,7 @@ mod tests {
     /// itself.
     #[test]
     fn panic_inside_ctx_flips_alive_before_prev() {
-        let _guard = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = HOOK_TEST_LOCK.lock_unpoisoned();
         let saved = std::panic::take_hook();
 
         let alive = Arc::new(AtomicBool::new(true));

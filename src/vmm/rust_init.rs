@@ -4028,6 +4028,7 @@ fn exec_shell_line(line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::MutexExt;
 
     #[test]
     fn mkdir_p_creates_nested() {
@@ -4298,9 +4299,8 @@ mod tests {
     /// regression tests must serialize. Without this lock, two
     /// concurrent `libc::signal(SIGCHLD, ...)` calls from different
     /// test threads could leave SIGCHLD in an unexpected state when
-    /// either test inspects or restores it. Poison-recovery via
-    /// `unwrap_or_else(|e| e.into_inner())` matches the pattern at
-    /// `src/vmm/vcpu_panic.rs::HOOK_TEST_LOCK` so a panic in one
+    /// either test inspects or restores it. Acquired via
+    /// [`crate::sync::MutexExt::lock_unpoisoned`] so a panic in one
     /// signal-aware test does not poison every other one.
     static SIGCHLD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -4347,7 +4347,7 @@ mod tests {
     /// restored.
     #[test]
     fn with_sigchld_default_captures_real_exit_status() {
-        let _guard = SIGCHLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
         let _restore = SigchldGuard::install(libc::SIG_IGN);
 
         // Sanity: under SIG_IGN, plain Command::status() returns
@@ -4387,7 +4387,7 @@ mod tests {
     /// every status under SIG_IGN.
     #[test]
     fn with_sigchld_default_captures_nonzero_exit_status() {
-        let _guard = SIGCHLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
         let _restore = SigchldGuard::install(libc::SIG_IGN);
 
         let wrapped = with_sigchld_default(|| Command::new("/bin/false").status());
@@ -4411,7 +4411,7 @@ mod tests {
     /// which are signal-disposition independent.
     #[test]
     fn poll_startup_detects_death_under_sigchld_ignore() {
-        let _guard = SIGCHLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
         let _restore = SigchldGuard::install(libc::SIG_IGN);
 
         let mut child = std::process::Command::new("/bin/true")
@@ -4437,7 +4437,7 @@ mod tests {
     /// anyway, but the new path must not regress that branch).
     #[test]
     fn poll_startup_reports_alive_under_sigchld_ignore() {
-        let _guard = SIGCHLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
         let _restore = SigchldGuard::install(libc::SIG_IGN);
 
         let mut child = std::process::Command::new("/bin/sleep")
@@ -4487,7 +4487,7 @@ mod tests {
         // is already the chokepoint for "tests that touch
         // process-wide state" and serializing through it is
         // cheaper than introducing a second mutex for one test.
-        let _guard = SIGCHLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
 
         let snapshot = SCHED_PID.load(Ordering::Acquire);
 
@@ -4516,7 +4516,7 @@ mod tests {
     /// `set_var` back, this test fails immediately.
     #[test]
     fn sched_pid_does_not_publish_via_env_var() {
-        let _guard = SIGCHLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
 
         // Clear any ambient env var — some test harnesses inherit
         // `SCHED_PID` from a parent shell. SAFETY: holding the

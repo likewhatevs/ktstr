@@ -121,6 +121,7 @@ use crate::monitor::dump::{
     FailureDumpPercpuEntry, FailureDumpPercpuHashEntry, FailureDumpReport, FailureDumpRingbuf,
     FailureDumpStackTrace, PerCpuTimeStats, PerNodeNumaStats, ProbeBssCounters,
 };
+use crate::sync::MutexExt;
 use crate::monitor::scx_walker::{DsqState, RqScxState, ScxSchedState};
 use crate::monitor::task_enrichment::TaskEnrichment;
 
@@ -830,7 +831,7 @@ impl SnapshotBridge {
         stats: Option<serde_json::Value>,
         elapsed_ms: Option<u64>,
     ) {
-        let mut store = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
+        let mut store = self.snapshots.lock_unpoisoned();
         if let Some(existing) = store.reports.insert(name.to_string(), report) {
             tracing::warn!(
                 name,
@@ -903,8 +904,7 @@ impl SnapshotBridge {
     /// Snapshot count for diagnostic logging.
     pub fn len(&self) -> usize {
         self.snapshots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_unpoisoned()
             .reports
             .len()
     }
@@ -912,8 +912,7 @@ impl SnapshotBridge {
     /// True when no snapshots have been captured.
     pub fn is_empty(&self) -> bool {
         self.snapshots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_unpoisoned()
             .reports
             .is_empty()
     }
@@ -929,8 +928,7 @@ impl SnapshotBridge {
     /// the real one.
     pub fn has(&self, name: &str) -> bool {
         self.snapshots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_unpoisoned()
             .reports
             .contains_key(name)
     }
@@ -941,7 +939,7 @@ impl SnapshotBridge {
     /// or per-sample timestamp must use
     /// [`Self::drain_ordered_with_stats`] instead.
     pub fn drain(&self) -> HashMap<String, FailureDumpReport> {
-        let mut store = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
+        let mut store = self.snapshots.lock_unpoisoned();
         store.order.clear();
         store.stats.clear();
         store.elapsed_ms.clear();
@@ -969,7 +967,7 @@ impl SnapshotBridge {
     /// captures are gone and [`Self::store`] already logged the
     /// eviction.
     pub fn drain_ordered(&self) -> Vec<(String, FailureDumpReport)> {
-        let mut store = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
+        let mut store = self.snapshots.lock_unpoisoned();
         let order = std::mem::take(&mut store.order);
         let mut reports = std::mem::take(&mut store.reports);
         // Stats / elapsed are dropped with the bridge — callers
@@ -1026,7 +1024,7 @@ impl SnapshotBridge {
         Option<serde_json::Value>,
         Option<u64>,
     )> {
-        let mut store = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
+        let mut store = self.snapshots.lock_unpoisoned();
         let order = std::mem::take(&mut store.order);
         let mut reports = std::mem::take(&mut store.reports);
         let mut stats = std::mem::take(&mut store.stats);

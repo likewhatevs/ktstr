@@ -18,6 +18,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use anyhow::{Context, Result, bail};
 use btf_rs::{Btf, Type};
+use crate::sync::RwLockExt;
 
 mod local_storage;
 pub use local_storage::TaskStorageOffsets;
@@ -138,7 +139,7 @@ static VMLINUX_BTF_CACHE: OnceLock<RwLock<Option<Arc<Btf>>>> = OnceLock::new();
 pub(crate) fn cached_vmlinux_btf() -> Option<Arc<Btf>> {
     let slot = VMLINUX_BTF_CACHE.get_or_init(|| RwLock::new(None));
     {
-        let read = slot.read().unwrap_or_else(|e| e.into_inner());
+        let read = slot.read_unpoisoned();
         if let Some(btf) = read.as_ref() {
             return Some(Arc::clone(btf));
         }
@@ -160,7 +161,7 @@ pub(crate) fn cached_vmlinux_btf() -> Option<Arc<Btf>> {
             return None;
         }
     };
-    let mut write = slot.write().unwrap_or_else(|e| e.into_inner());
+    let mut write = slot.write_unpoisoned();
     if write.is_none() {
         *write = Some(Arc::clone(&btf));
     }

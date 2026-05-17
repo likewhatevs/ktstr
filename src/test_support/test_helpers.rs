@@ -23,6 +23,7 @@ use crate::scenario::Ctx;
 
 use super::entry::{KtstrTestEntry, Scheduler, SchedulerSpec, TopologyConstraints};
 use crate::vmm::topology::Topology;
+use crate::sync::MutexExt;
 
 /// Serializes tests that mutate env vars. Shared across every
 /// `#[cfg(test)]` module in the crate: nextest runs tests in
@@ -37,7 +38,7 @@ pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// no shared invariant beyond their own save/restore pair, so the
 /// poisoned inner guard is safe to take.
 pub(crate) fn lock_env() -> MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    ENV_LOCK.lock_unpoisoned()
 }
 
 /// Tempdir bound as the process-wide `KTSTR_CACHE_DIR`. While the
@@ -626,8 +627,7 @@ impl Drop for StderrRestoreGuard {
 pub(crate) fn capture_stderr<R>(f: impl FnOnce() -> R) -> (R, Vec<u8>) {
     use std::io::{Read, Seek, SeekFrom, Write};
     let _lock = STDERR_CAPTURE_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+        .lock_unpoisoned();
     let mut sink = tempfile::tempfile().expect("create stderr-capture tempfile");
     // Flush before redirect: eprintln! is line-buffered behind the
     // Stderr lock; pre-call bytes need to reach the ORIGINAL fd 2

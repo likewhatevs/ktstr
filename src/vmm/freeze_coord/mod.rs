@@ -22,6 +22,7 @@ use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 use vmm_sys_util::timerfd::TimerFd;
 
 use crate::monitor;
+use crate::sync::MutexExt;
 
 use super::exit_dispatch::{self, ExitAction, classify_exit, vcpu_run_loop_unified};
 use super::host_comms::BulkDrainResult;
@@ -2951,8 +2952,7 @@ impl KtstrVm {
                                     // the verdict.
                                     if !bucket.is_empty() {
                                         let mut buf = freeze_coord_bulk_messages_for_closure
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner());
+                                            .lock_unpoisoned();
                                         buf.extend(bucket);
                                     }
                                 }
@@ -3984,10 +3984,9 @@ impl KtstrVm {
                             // freeze kicks below, so this clear
                             // races nothing.
                             *freeze_coord_bsp_regs
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner()) = None;
+                                .lock_unpoisoned() = None;
                             for ap in &freeze_coord_ap_regs {
-                                *ap.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                                *ap.lock_unpoisoned() = None;
                             }
                             // Snapshot virtio-blk worker liveness
                             // BEFORE pause(). When the device exists
@@ -4646,12 +4645,11 @@ impl KtstrVm {
                                     Vec::with_capacity(1 + freeze_coord_ap_regs.len());
                                 regs.push(
                                     *freeze_coord_bsp_regs
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner()),
+                                        .lock_unpoisoned(),
                                 );
                                 for ap in &freeze_coord_ap_regs {
                                     regs.push(
-                                        *ap.lock().unwrap_or_else(|e| e.into_inner()),
+                                        *ap.lock_unpoisoned(),
                                     );
                                 }
                                 regs
@@ -6633,8 +6631,7 @@ impl KtstrVm {
                         }
                         let tag = freeze_coord_watchpoint.user[slot_idx]
                             .tag
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
+                            .lock_unpoisoned()
                             .clone();
                         if freeze_coord_on_demand_in_flight
                             .swap(true, Ordering::AcqRel)
@@ -6817,8 +6814,7 @@ impl KtstrVm {
                             let mut tag_guard = freeze_coord_watchpoint
                                 .user[slot_idx]
                                 .tag
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner());
+                                .lock_unpoisoned();
                             tag_guard.clear();
                         }
                         freeze_coord_watchpoint.user[slot_idx]
@@ -7737,8 +7733,7 @@ impl KtstrVm {
                     }
                     let tag = freeze_coord_watchpoint.user[slot_idx]
                         .tag
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
+                        .lock_unpoisoned()
                         .clone();
                     // Skip the placeholder entirely when the bridge
                     // already has a real report under this tag. The
@@ -7969,7 +7964,7 @@ impl KtstrVm {
                         .ok()
                         .and_then(|lock| lock.into_inner())
                         .and_then(|(_map, prog)| prog);
-                    *slot.lock().unwrap_or_else(|e| e.into_inner()) = extracted;
+                    *slot.lock_unpoisoned() = extracted;
                 }
                 eprintln!("CLEANUP: coord closure done {:?}", coord_exit_t.elapsed());
             })
@@ -8455,8 +8450,7 @@ impl KtstrVm {
             cr3: cr3_cache,
             vmlinux_data: vmlinux_data_for_result,
             prog_accessor: prog_accessor_slot
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_unpoisoned()
                 .take(),
             kern_phys_base: kern_phys_base_for_result.load(Ordering::Acquire),
             // Virtio-console handle threaded into `collect_results`
