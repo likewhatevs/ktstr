@@ -209,6 +209,21 @@ struct {
 	__uint(max_entries, 1);
 } ktstr_cross_btf_map SEC(".maps");
 
+/* Per-cgroup dispatch counter — bumps on every `ktstr_dispatch`
+ * invocation under the running task's v2 cgroup. Exists so the
+ * host-side SnapshotMap.find/.filter/.max_by integration test
+ * (tests/snapshot_e2e.rs) has a multi-entry HASH map to iterate
+ * against; nothing inside scx-ktstr reads this back. 256-entry cap
+ * comfortably covers per-test cgroup fan-out without leaning on
+ * runtime resize. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, __u64);
+	__type(value, __u64);
+	__uint(max_entries, 256);
+} ktstr_cgroup_dispatch_count SEC(".maps");
+
 /* Single sentinel key for `ktstr_cross_btf_map`. The fixture only
  * uses one entry — distinct keys would diverge the publish and
  * chase helpers' lookups, producing a useless empty entry. */
@@ -368,6 +383,21 @@ void BPF_STRUCT_OPS(ktstr_dispatch, s32 cpu, struct task_struct *prev)
 	}
 	scx_bpf_dsq_move_to_local(SHARED_DSQ, 0);
 	__sync_fetch_and_add(&nr_dispatched, 1);
+
+	/* Per-cgroup dispatch tally — see `ktstr_cgroup_dispatch_count`
+	 * decl for purpose. NULL lookup is the cold-key path; insert
+	 * with initial 1 then let later dispatches hit the hot
+	 * lookup-and-bump branch. */
+	{
+		__u64 cgid = bpf_get_current_cgroup_id();
+		__u64 *cnt = bpf_map_lookup_elem(&ktstr_cgroup_dispatch_count, &cgid);
+		if (cnt) {
+			__sync_fetch_and_add(cnt, 1);
+		} else {
+			__u64 initial = 1;
+			bpf_map_update_elem(&ktstr_cgroup_dispatch_count, &cgid, &initial, BPF_ANY);
+		}
+	}
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(ktstr_init)
