@@ -2285,6 +2285,28 @@ fn declare_scheduler_inner(
                     for (i, e) in t.elems.iter().enumerate() {
                         parts[i] = expect_u32_lit(e, &key, "topology")?;
                     }
+                    const DIM_NAMES: [&str; 4] = ["numa_nodes", "llcs", "cores", "threads"];
+                    for (i, &v) in parts.iter().enumerate() {
+                        if v == 0 {
+                            return Err(syn::Error::new_spanned(
+                                t,
+                                format!(
+                                    "topology ({}, {}, {}, {}): {} must be > 0",
+                                    parts[0], parts[1], parts[2], parts[3], DIM_NAMES[i],
+                                ),
+                            ));
+                        }
+                    }
+                    if parts[1] % parts[0] != 0 {
+                        return Err(syn::Error::new_spanned(
+                            t,
+                            format!(
+                                "topology (numa_nodes={}, llcs={}, cores={}, threads={}): \
+                                 llcs must be a multiple of numa_nodes — likely a numa/llcs swap",
+                                parts[0], parts[1], parts[2], parts[3],
+                            ),
+                        ));
+                    }
                     sched_topology = Some((parts[0], parts[1], parts[2], parts[3]));
                 } else {
                     return Err(syn::Error::new_spanned(
@@ -2295,6 +2317,27 @@ fn declare_scheduler_inner(
             }
             "cgroup_parent" => {
                 let lit = expect_str_lit(&value, &key, "cgroup_parent")?;
+                if !lit.starts_with('/') {
+                    return Err(syn::Error::new_spanned(
+                        &value,
+                        format!(
+                            "cgroup_parent must begin with `/` (e.g. \"/ktstr\"); \
+                             got {lit:?} — relative paths const-panic at CgroupPath::new \
+                             during macro expansion",
+                        ),
+                    ));
+                }
+                if lit.split('/').any(|seg| seg == "..") {
+                    return Err(syn::Error::new_spanned(
+                        &value,
+                        format!(
+                            "cgroup_parent must not contain `..` segments; \
+                             got {lit:?} — path traversal would escape the cgroup hierarchy \
+                             and the const-panic at CgroupPath::new would point at macro \
+                             expansion instead of the literal",
+                        ),
+                    ));
+                }
                 sched_cgroup_parent = Some(lit);
             }
             "sched_args" => {
@@ -2330,12 +2373,11 @@ fn declare_scheduler_inner(
                     if s.is_empty() {
                         return Err(syn::Error::new_spanned(
                             elem,
-                            "declare_scheduler!: `kernels` entry must \
-                             be a non-empty string. Accepted forms: \
-                             exact version (`6.14`), inclusive range \
-                             (`6.14..7.0` or `6.14..=7.0`), git source \
-                             (`git+URL#REF`), absolute or `~`-prefixed \
-                             path, or cache key.",
+                            format!(
+                                "declare_scheduler!: `kernels` entry must \
+                                 be a non-empty string. Accepted forms: {}.",
+                                kernel_path::KERNEL_ID_GRAMMAR,
+                            ),
                         ));
                     }
                     // Run the same `KernelId::parse` + `validate` the

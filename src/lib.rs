@@ -893,9 +893,16 @@ pub const KTSTR_VERIFIER_RAW_ENV: &str = "KTSTR_VERIFIER_RAW";
 /// remediation tail. Keeping the prefix per-caller lets each site
 /// name the specific artifact it needs while the `KTSTR_KERNEL`
 /// wording stays consistent.
-pub const KTSTR_KERNEL_HINT: &str = "set KTSTR_KERNEL to a kernel source directory, \
-    a version (e.g. `6.14.2`), or a cache key (see `cargo ktstr kernel list`), or run \
-    `cargo ktstr kernel build` to populate the cache";
+// NOTE: the "accepted forms" enumeration here mirrors
+// [`kernel_path::KERNEL_ID_GRAMMAR`] verbatim — keep in sync when
+// either changes. (Composition at const time needs `concat!`-of-
+// literals, and `KERNEL_ID_GRAMMAR` is a `const &str` not a literal.)
+pub const KTSTR_KERNEL_HINT: &str = "set KTSTR_KERNEL to one of: \
+    exact version (`6.14`), inclusive range (`6.14..7.0` or \
+    `6.14..=7.0`), git source (`git+URL#REF`), absolute or \
+    `~`-prefixed path, or cache key. List cached keys with \
+    `cargo ktstr kernel list`; build new ones with \
+    `cargo ktstr kernel build`";
 
 /// Read [`KTSTR_KERNEL_ENV`] once, normalizing the raw value:
 /// missing / empty / whitespace-only reads collapse to `None`, and

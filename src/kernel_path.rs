@@ -44,6 +44,16 @@
 //    non-test items must update both copies in lock-step. The
 //    `#[cfg(test)]` portion lives in `src/kernel_path.rs` only.
 
+/// Human-readable enumeration of every form `KernelId::parse` accepts.
+/// Single source of truth — the macro-time rejection in
+/// `declare_scheduler!(kernels = […])` and the runtime cache-lookup
+/// bails in `ktstr` / `cargo-ktstr` all cite this string verbatim so
+/// the operator sees one grammar regardless of where their typo trips.
+pub const KERNEL_ID_GRAMMAR: &str =
+    "exact version (`6.14`), inclusive range (`6.14..7.0` or \
+     `6.14..=7.0`), git source (`git+URL#REF`), absolute or \
+     `~`-prefixed path, or cache key";
+
 /// Kernel identifier: filesystem path, version string, cache key,
 /// stable-release range, or git source.
 ///
