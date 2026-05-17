@@ -44,7 +44,7 @@ const SHARED_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Return the process-wide shared [`reqwest::blocking::Client`]. First
 /// call constructs it via `Client::builder()` with
-/// [`SHARED_CLIENT_CONNECT_TIMEOUT`] applied; every subsequent call
+/// `SHARED_CLIENT_CONNECT_TIMEOUT` applied; every subsequent call
 /// returns a reference to the same instance. This helper is for
 /// top-level CLI entries that want the default client.
 ///
@@ -52,20 +52,20 @@ const SHARED_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// cache hit) must NOT pass `shared_client()` to a cache-routed
 /// helper (`cached_releases`, `cached_releases_with`,
 /// [`fetch_latest_stable_version`], [`fetch_version_for_prefix`]) —
-/// [`RELEASES_CACHE`] may already be populated by a peer test, in
+/// `RELEASES_CACHE` may already be populated by a peer test, in
 /// which case the helper returns cached data and the network is
 /// never touched. Construct a local `Client` and pass it to the
 /// cache-routed helper to skip the cache; the pointer-equality gate
-/// in [`cached_releases_with`] routes a non-singleton client to a
-/// direct [`fetch_releases`] call against [`RELEASES_URL`] (the
+/// in `cached_releases_with` routes a non-singleton client to a
+/// direct `fetch_releases` call against `RELEASES_URL` (the
 /// production URL — the bypass skips the cache, NOT the URL). For
 /// full URL injection (e.g. localhost mock server testing), call
-/// either [`fetch_releases`] directly with the mock URL — see
+/// either `fetch_releases` directly with the mock URL — see
 /// `fetch_releases_against_localhost_mock_returns_parsed` — or use
-/// the cache-aware seam [`cached_releases_with_url`], which routes
+/// the cache-aware seam `cached_releases_with_url`, which routes
 /// the non-singleton bypass branch through the supplied URL while
 /// preserving the singleton/cache routing identical to
-/// [`cached_releases_with`].
+/// `cached_releases_with`.
 ///
 /// # Panics
 ///
@@ -1012,7 +1012,7 @@ fn download_rc_tarball(
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
 ///
-/// `skip_sha256` propagates to [`download_stable_tarball`] only —
+/// `skip_sha256` propagates to `download_stable_tarball` only —
 /// stable tarballs publish a `sha256sums.asc` manifest the flag
 /// bypasses. RC tarballs (`download_rc_tarball`) have no published
 /// manifest so verification is impossible regardless of the flag;
@@ -1135,9 +1135,9 @@ fn parse_releases_body(body: &str) -> Result<Vec<Release>> {
 /// that may have build issues on CI runners.
 ///
 /// When `client` is the process-wide [`shared_client`] singleton,
-/// routes through [`RELEASES_CACHE`]; other clients bypass the
-/// cache via pointer-equality and exercise [`fetch_releases`]
-/// directly — see [`cached_releases_with`] for details.
+/// routes through `RELEASES_CACHE`; other clients bypass the
+/// cache via pointer-equality and exercise `fetch_releases`
+/// directly — see `cached_releases_with` for details.
 ///
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
@@ -1207,11 +1207,11 @@ pub fn is_major_minor_prefix(s: &str) -> bool {
 /// listing to find the highest patch version with a tarball.
 ///
 /// When `client` is the process-wide [`shared_client`] singleton,
-/// routes through [`RELEASES_CACHE`]; other clients bypass the
-/// cache via pointer-equality and exercise [`fetch_releases`]
-/// directly — see [`cached_releases_with`] for details. Cache
+/// routes through `RELEASES_CACHE`; other clients bypass the
+/// cache via pointer-equality and exercise `fetch_releases`
+/// directly — see `cached_releases_with` for details. Cache
 /// scope is releases.json only; the EOL-series directory-listing
-/// fallback in [`probe_latest_patch`] always hits the network.
+/// fallback in `probe_latest_patch` always hits the network.
 ///
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).

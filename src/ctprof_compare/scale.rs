@@ -33,8 +33,8 @@ use super::{Aggregated, DerivedValue};
 /// format dispatch.
 ///
 /// Picks the unit family up the type system rather than a free-form
-/// `&'static str` tag. Each [`AggRule`] variant maps to exactly one
-/// ladder via [`AggRule::ladder`]; each [`super::DerivedMetricDef`] entry
+/// `&'static str` tag. Each `AggRule` variant maps to exactly one
+/// ladder via `AggRule::ladder`; each [`super::DerivedMetricDef`] entry
 /// carries a ladder via [`super::DerivedMetricDef::ladder`]; the cgroup-
 /// level render path passes a ladder directly. A registry typo or
 /// drift between accessor newtype and ladder choice fails to compile
@@ -44,9 +44,9 @@ use super::{Aggregated, DerivedValue};
 /// The six ladder variants and their step-up rules:
 /// - [`Ns`](Self::Ns): ns → µs (×1e3) → ms (×1e6) → s (×1e9).
 ///   Decimal prefixes — SI time, not binary. Used for
-///   [`AggRule::SumNs`] (cumulative ns counters),
-///   [`AggRule::MaxPeak`] (lifetime ns high-water marks),
-///   [`AggRule::MaxGaugeNs`] (instantaneous ns gauges), and
+///   `AggRule::SumNs` (cumulative ns counters),
+///   `AggRule::MaxPeak` (lifetime ns high-water marks),
+///   `AggRule::MaxGaugeNs` (instantaneous ns gauges), and
 ///   the `"ns"` derived-metric ladder.
 /// - [`Us`](Self::Us): µs → ms (×1e3) → s (×1e6). Decimal SI
 ///   prefixes. The cgroup `cpu_usage_usec` and `throttled_usec`
@@ -55,7 +55,7 @@ use super::{Aggregated, DerivedValue};
 ///   nanoseconds.
 /// - [`Bytes`](Self::Bytes): B → KiB → MiB → GiB → TiB. IEC binary
 ///   prefixes (×1024) for byte counts. Used for
-///   [`AggRule::SumBytes`] and any byte-typed derived metric.
+///   `AggRule::SumBytes` and any byte-typed derived metric.
 /// - [`Ticks`](Self::Ticks): ticks → Kticks (×1e3) → Mticks (×1e6).
 ///   Decimal prefixes for clock-tick counts
 ///   (`utime_clock_ticks`, `stime_clock_ticks`); the unit
@@ -64,14 +64,14 @@ use super::{Aggregated, DerivedValue};
 ///   promise.
 /// - [`Unitless`](Self::Unitless): "" → K → M → G. Decimal
 ///   prefixes for non-dimensional counters (wakeups, migrations,
-///   csw, syscall counts). Used for [`AggRule::SumCount`] and
-///   [`AggRule::MaxGaugeCount`].
+///   csw, syscall counts). Used for `AggRule::SumCount` and
+///   `AggRule::MaxGaugeCount`.
 /// - [`None`](Self::None): no ladder — values render as the bare
 ///   integer with no unit suffix and no scaling. Used for
-///   [`AggRule::Mode`] / [`AggRule::ModeChar`] /
-///   [`AggRule::ModeBool`] (categorical strings),
-///   [`AggRule::RangeI32`] / [`AggRule::RangeU32`] (bounded
-///   ordinals), and [`AggRule::Affinity`] (cpuset summaries) —
+///   `AggRule::Mode` / `AggRule::ModeChar` /
+///   `AggRule::ModeBool` (categorical strings),
+///   `AggRule::RangeI32` / `AggRule::RangeU32` (bounded
+///   ordinals), and `AggRule::Affinity` (cpuset summaries) —
 ///   the [`Aggregated`] [`std::fmt::Display`] impl handles render for
 ///   these directly.
 ///
@@ -89,7 +89,7 @@ pub enum ScaleLadder {
 }
 
 impl ScaleLadder {
-    /// Base unit string for this ladder — what [`auto_scale`]
+    /// Base unit string for this ladder — what `auto_scale`
     /// returns for a value at the bottom of the ladder. Used by
     /// the format helpers to detect whether a value stepped up
     /// (`auto_scale(v).1 != ladder.base_unit()` ⇒ stepped up,
@@ -186,7 +186,7 @@ pub(super) fn auto_scale(value: f64, ladder: ScaleLadder) -> (f64, &'static str)
 
 /// Format a per-row baseline / candidate cell for [`super::write_diff`].
 /// Numeric aggregates ([`Aggregated::Sum`] / [`Aggregated::Max`])
-/// run through [`auto_scale`] so large values render in a
+/// run through `auto_scale` so large values render in a
 /// readable magnitude (`1.235ms` instead of `1234567ns`). When
 /// the scaled unit equals the ladder's base unit (no step-up was
 /// triggered), the original integer value is rendered verbatim

@@ -521,7 +521,7 @@ static MODEL_CACHE_LOAD_COUNT: AtomicUsize = AtomicUsize::new(0);
 ///
 /// The fields are `&'static` so a `ModelSpec` can live in a
 /// top-level `const` — the default model used by
-/// [`OutputFormat::LlmExtract`] sits in [`DEFAULT_MODEL`] and the
+/// `OutputFormat::LlmExtract` sits in [`DEFAULT_MODEL`] and the
 /// tests below cover the invariants (size sanity, URL+SHA shape)
 /// without any heap allocation.
 #[derive(Debug, Clone, Copy)]
@@ -560,7 +560,7 @@ pub struct ModelSpec {
 }
 
 /// Default model served when a payload declares
-/// [`OutputFormat::LlmExtract`] without pointing at a custom pin.
+/// `OutputFormat::LlmExtract` without pointing at a custom pin.
 ///
 /// Qwen3-4B Q4_K_M GGUF (~2.55 GiB).
 /// The 4B-parameter tier gives usable structured-JSON extraction
@@ -711,7 +711,7 @@ pub const OFFLINE_ENV: &str = "KTSTR_MODEL_OFFLINE";
 
 /// Environment variable that opts into raw-response tracing for
 /// LlmExtract. When set to any non-empty value,
-/// [`extract_via_llm`] emits the full model output on every call as
+/// `extract_via_llm` emits the full model output on every call as
 /// a `tracing::debug!` event (field `response`) alongside the
 /// existing parse-outcome warn. Off by default: a single debug
 /// emission can run to multiple KiB of chat-formatted text with
@@ -827,10 +827,10 @@ pub enum ShaVerdict {
     /// metadata probe produces this.
     NotCached,
     /// SHA-256 digest of the cached file equals the declared pin.
-    /// Ok(true) from [`check_sha256`].
+    /// Ok(true) from `check_sha256`.
     Matches,
     /// SHA-256 digest was computed successfully but did not equal
-    /// the declared pin. Ok(false) from [`check_sha256`].
+    /// the declared pin. Ok(false) from `check_sha256`.
     /// Remediation: re-fetch, or re-pin if the cached bytes are
     /// known-correct.
     Mismatches,
@@ -1007,7 +1007,7 @@ fn compute_sha_verdict(
 /// Return the on-disk path the spec would occupy and the outcome
 /// of the SHA-256 integrity check as a [`ShaVerdict`]. Used by the
 /// CLI's `model status` subcommand. Uses the warm-cache sidecar
-/// short-circuit for responsiveness; see [`compute_sha_verdict`] for
+/// short-circuit for responsiveness; see `compute_sha_verdict` for
 /// the strict-integrity alternative consumed by [`ensure`].
 pub fn status(spec: &ModelSpec) -> Result<ModelStatus> {
     let root = resolve_cache_root()?;
@@ -1093,7 +1093,7 @@ impl CleanReport {
 /// another process.
 ///
 /// Errors:
-///  - [`resolve_cache_root`] failure (HOME unset, KTSTR_CACHE_DIR
+///  - `resolve_cache_root` failure (HOME unset, KTSTR_CACHE_DIR
 ///    non-UTF-8, etc.) propagates up — the operator needs the
 ///    cache root before any deletion can happen.
 ///  - `metadata` errors other than `NotFound` propagate up so a

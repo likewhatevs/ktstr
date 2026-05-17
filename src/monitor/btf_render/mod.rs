@@ -122,7 +122,7 @@ pub enum RenderedValue {
         type_name: Option<String>,
         members: Vec<RenderedMember>,
     },
-    /// Array. `elements` is truncated to [`MAX_ARRAY_ELEMS`].
+    /// Array. `elements` is truncated to `MAX_ARRAY_ELEMS`.
     Array {
         len: usize,
         elements: Vec<RenderedValue>,
@@ -145,7 +145,7 @@ pub enum RenderedValue {
     /// struct is rendered inline. `deref_skipped_reason` carries the
     /// cause when the chase was attempted but did not produce a
     /// deref — `None` means no chase was attempted (e.g. null
-    /// pointer or no [`MemReader`] supplied), and a non-`None`
+    /// pointer or no `MemReader` supplied), and a non-`None`
     /// reason with `deref: None` means the chase was attempted but
     /// could not complete (cross-page boundary, BTF-size truncated
     /// against the read cap, kernel kptr that failed plausibility
@@ -154,7 +154,7 @@ pub enum RenderedValue {
     /// reason X" without a separate flag.
     ///
     /// `cast_annotation` distinguishes cast-recovered pointers
-    /// (set by [`render_cast_pointer`] to `"cast→arena"` /
+    /// (set by `render_cast_pointer` to `"cast→arena"` /
     /// `"cast→kernel"`) from BTF-typed pointers (the
     /// [`Type::Ptr`] arm normally leaves it `None`). Display
     /// surfaces it as a parenthesised tag so operators can tell
@@ -163,7 +163,7 @@ pub enum RenderedValue {
     ///
     /// One [`Type::Ptr`] exception: when the renderer recovers a
     /// `BTF_KIND_FWD` pointee's real struct id via the sdt_alloc
-    /// bridge ([`MemReader::resolve_arena_type`]), the arena
+    /// bridge (`MemReader::resolve_arena_type`), the arena
     /// branch sets this field to `"sdt_alloc"` so the rendered
     /// subtree is flagged as a recovered chase rather than a
     /// native BTF resolve. Cast-recovered pointers that cleared
@@ -197,7 +197,7 @@ pub enum RenderedValue {
     /// is the required byte count; `had` is what was supplied.
     /// `partial` carries whatever decoded successfully before the
     /// truncation: a `Struct` with the members that fit (further
-    /// truncated members nest as their own [`Truncated`]), an
+    /// truncated members nest as their own `Truncated`), an
     /// `Array` with the elements that fit, or a `Bytes` hex dump of
     /// the raw bytes that were available when no structured partial
     /// applied (e.g. a 2-byte slice for a 4-byte int).

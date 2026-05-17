@@ -72,7 +72,7 @@ pub enum GroupBy {
     /// land in their own bucket and the per-pool aggregate gets
     /// scattered across N rows. Token-based pattern
     /// normalization handles this: pcomms that produce the same
-    /// skeleton under [`pattern_key`]'s normalizer cluster into
+    /// skeleton under `pattern_key`'s normalizer cluster into
     /// one bucket whose internal join key is the skeleton. The
     /// normalizer splits each pcomm on a separator class
     /// (`[.\-_/:@+\[\]\s]+`) and classifies each token as
@@ -95,7 +95,7 @@ pub enum GroupBy {
     Cgroup,
     /// Group by thread name pattern across every process. Threads
     /// whose names produce the same skeleton under
-    /// [`pattern_key`]'s token-based normalizer cluster into one
+    /// `pattern_key`'s token-based normalizer cluster into one
     /// bucket whose internal join key is the skeleton. The
     /// normalizer splits each comm on a separator class
     /// (`[.\-_/:@+\[\]\s]+`) and classifies each token as pure-digit
@@ -119,7 +119,7 @@ pub enum GroupBy {
     /// Distinct from `--group-by comm --no-thread-normalize`:
     /// this variant ONLY disables thread-axis normalization,
     /// leaving the smaps_rollup pcomm keying still normalized
-    /// (per [`collect_smaps_rollup`]). The
+    /// (per `collect_smaps_rollup`). The
     /// `--no-thread-normalize` flag, by contrast, disables
     /// normalization across every name-family axis (Comm, Pcomm,
     /// AND smaps_rollup). Pick `CommExact` when you want literal
@@ -135,7 +135,7 @@ pub enum GroupBy {
     All,
 }
 
-/// Options controlling [`compare`].
+/// Options controlling `compare`.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct CompareOptions {
@@ -144,7 +144,7 @@ pub struct CompareOptions {
     /// to a canonical form before grouping. Applied in listed
     /// order; each pattern that matches a thread's cgroup path
     /// rewrites the matched segments with the literal portions
-    /// of the pattern. See [`flatten_cgroup_path`] for the
+    /// of the pattern. See `flatten_cgroup_path` for the
     /// rewrite rule and examples.
     ///
     /// Independent of [`Self::no_cg_normalize`] — explicit
@@ -154,7 +154,7 @@ pub struct CompareOptions {
     /// When true, disable token-based pattern normalization
     /// across every name-family axis: [`GroupBy::Comm`],
     /// [`GroupBy::Pcomm`], AND the smaps_rollup keying in
-    /// [`collect_smaps_rollup`] (which keys by
+    /// `collect_smaps_rollup` (which keys by
     /// `pattern_key(&t.pcomm)` under default normalization, but
     /// reverts to literal `pcomm[tgid]` when this flag is set so
     /// each PID stays attributable).
@@ -176,7 +176,7 @@ pub struct CompareOptions {
     /// Multi-key sort spec for the diff rows. When non-empty,
     /// overrides the default `delta_pct desc` sort. Each
     /// [`SortKey`] names one metric from
-    /// [`CTPROF_METRICS`] or [`CTPROF_DERIVED_METRICS`]
+    /// `CTPROF_METRICS` or `CTPROF_DERIVED_METRICS`
     /// and a direction; groups rank by the tuple
     /// (`metric_1_delta`, `metric_2_delta`, ...) under
     /// lexicographic order with per-key direction. Within a
@@ -185,21 +185,21 @@ pub struct CompareOptions {
     /// the chosen axis (pcomm / cgroup / comm / comm-exact) and
     /// then ranked by their aggregated metric values, so the
     /// same `sort_by` spec works under every grouping. See
-    /// [`parse_sort_by`] for the CLI string parser.
+    /// `parse_sort_by` for the CLI string parser.
     pub sort_by: Vec<SortKey>,
 }
 
 /// One key in a multi-key `--sort-by` spec. Names a metric from
-/// [`CTPROF_METRICS`] or [`CTPROF_DERIVED_METRICS`] and
+/// `CTPROF_METRICS` or `CTPROF_DERIVED_METRICS` and
 /// the sort direction for that key. Direction defaults to
 /// descending (largest delta first) so the common operator
 /// request — "show me the biggest regressions first" — is the
 /// unmarked form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SortKey {
-    /// Metric name. Holds one of the [`CTPROF_METRICS`] or
-    /// [`CTPROF_DERIVED_METRICS`] entries' `name` fields
-    /// verbatim — [`parse_sort_by`] looks up the input string in
+    /// Metric name. Holds one of the `CTPROF_METRICS` or
+    /// `CTPROF_DERIVED_METRICS` entries' `name` fields
+    /// verbatim — `parse_sort_by` looks up the input string in
     /// either registry and stores the matched `&'static str`, so
     /// this never carries an allocation. Equality against a
     /// registry `name` is by content (`str::eq`); both sides
@@ -244,7 +244,7 @@ impl From<GroupBy> for GroupByOrDefault {
 /// Aggregation rule for a single metric.
 ///
 /// Encoded as an enum rather than a trait object so the registry
-/// table ([`CTPROF_METRICS`]) can live in static memory. Each
+/// table (`CTPROF_METRICS`) can live in static memory. Each
 /// variant's accessor returns the typed
 /// [`crate::metric_types`] newtype that matches the reduction
 /// — the reader and rule are paired by construction so a new
@@ -317,7 +317,7 @@ pub enum AggRule {
     /// [`PeakNs`]: crate::metric_types::PeakNs
     MaxPeak(fn(&ThreadState) -> crate::metric_types::PeakNs),
     /// Maximum across the group of a [`PeakBytes`] field — the
-    /// byte-typed twin of [`MaxPeak`]. Used for taskstats-sourced
+    /// byte-typed twin of `MaxPeak`. Used for taskstats-sourced
     /// lifetime memory watermarks (`hiwater_rss`, `hiwater_vm`).
     /// `xacct_add_tsk` (`kernel/tsacct.c::xacct_add_tsk`, lines
     /// 99-104) reads the watermark out of the SHARED `mm_struct`
@@ -328,7 +328,7 @@ pub enum AggRule {
     /// bucket spans multiple parent processes) is the meaningful
     /// reduction: it picks the largest watermark any tgid in the
     /// bucket reported. Routes through the IEC binary auto-scale
-    /// ladder ([`crate::metric_types::ScaleLadder::Bytes`]) so a
+    /// ladder (`crate::metric_types::ScaleLadder::Bytes`) so a
     /// 7.5 GiB watermark renders as `7.500GiB` instead of
     /// dominating the table with raw byte counts. Summing
     /// watermarks would over-count shared address-space mappings
@@ -374,7 +374,7 @@ pub enum AggRule {
     /// as the scalar; output prints both the range and the
     /// delta. The dispatch routes through
     /// [`crate::metric_types::Rangeable::range_across`] and
-    /// widens to `i64` for [`Aggregated::OrdinalRange`].
+    /// widens to `i64` for `Aggregated::OrdinalRange`.
     ///
     /// [`OrdinalI32`]: crate::metric_types::OrdinalI32
     RangeI32(fn(&ThreadState) -> crate::metric_types::OrdinalI32),
@@ -384,7 +384,7 @@ pub enum AggRule {
     /// [`AggRule::RangeI32`] but the inner width matches the
     /// kernel-side `unsigned int` declaration; the dispatch
     /// widens the resulting `u32` to `i64` for
-    /// [`Aggregated::OrdinalRange`].
+    /// `Aggregated::OrdinalRange`.
     ///
     /// [`OrdinalU32`]: crate::metric_types::OrdinalU32
     RangeU32(fn(&ThreadState) -> crate::metric_types::OrdinalU32),
@@ -437,14 +437,14 @@ pub enum AggRule {
     /// thread shared the same allowed set. Used for
     /// `cpu_affinity`. The accessor returns
     /// [`crate::metric_types::CpuSet`]; the dispatch unwraps to
-    /// `Vec<u32>` for the [`AffinitySummary`] reduction.
+    /// `Vec<u32>` for the `AffinitySummary` reduction.
     ///
     /// Unlike the `Sum*` / `Max*` / `Range*` / `Mode*` rules,
     /// `Affinity` does NOT route through a
     /// [`crate::metric_types`] trait method — its reduction
-    /// produces an [`AffinitySummary`] (num_cpus range +
+    /// produces an `AffinitySummary` (num_cpus range +
     /// uniform-cpuset flag), not a homogeneous `CpuSet`, so the
-    /// inline aggregator in [`aggregate`] walks the per-thread
+    /// inline aggregator in `aggregate` walks the per-thread
     /// `Vec<u32>` directly. A future `Affinable` trait could
     /// fold the body into [`crate::metric_types`] but the
     /// summary type is single-use today.

@@ -216,7 +216,7 @@ impl CtprofSnapshot {
     /// handles it by emitting an empty diff.
     ///
     /// The decompression step is bounded by
-    /// [`MAX_DECOMPRESSED_SNAPSHOT_BYTES`] — a payload that
+    /// `MAX_DECOMPRESSED_SNAPSHOT_BYTES` — a payload that
     /// decompresses past that ceiling surfaces an error rather
     /// than allocating unbounded memory, guarding against a
     /// hostile zstd payload (zstd compresses pathologically well

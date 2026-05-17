@@ -147,7 +147,7 @@ const ANCHOR_PREFIX: &str = "sched_ext: BPF scheduler \"";
 /// Parse a window of `/dev/kmsg` (or `dmesg` text) and return every
 /// scx exit event found in it.
 ///
-/// Looks for [`ANCHOR_PREFIX`] anchor lines, then collects
+/// Looks for `ANCHOR_PREFIX` anchor lines, then collects
 /// follow-on lines (typically `<N>` or `[ts]` prefixed kernel print
 /// continuation) until the next non-stack-looking line or the next
 /// anchor. Stack-trace `%pS` tokens are extracted from the

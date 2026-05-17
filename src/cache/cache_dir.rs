@@ -297,12 +297,12 @@ impl CacheDir {
     /// Look up a cached kernel by cache key.
     ///
     /// On hit, emits a `tracing::warn!` via
-    /// [`warn_if_unstripped_vmlinux`] when the cached entry took the
-    /// strip-failure fallback (see [`should_warn_unstripped`] for the
+    /// `warn_if_unstripped_vmlinux` when the cached entry took the
+    /// strip-failure fallback (see `should_warn_unstripped` for the
     /// exact predicate). Caller-facing call sites want the warning;
     /// internal call sites that look the entry up only to compare
     /// against caller intent (notably [`Self::store`]'s in-lock
-    /// recheck) use [`Self::lookup_silent`] to avoid double-emitting
+    /// recheck) use `Self::lookup_silent` to avoid double-emitting
     /// the same warning the caller will see on its next `lookup`.
     pub fn lookup(&self, cache_key: &str) -> Option<CacheEntry> {
         let entry = self.lookup_silent(cache_key)?;
@@ -412,16 +412,16 @@ impl CacheDir {
     ///
     /// # Steps (in order)
     ///
-    /// 1. **Validate inputs.** [`validate_cache_key`] rejects
+    /// 1. **Validate inputs.** `validate_cache_key` rejects
     ///    `..`, slashes, NUL, leading-dot keys (the `TMP_DIR_PREFIX`
     ///    reservation plus any other dotfile-shaped key, since
     ///    `list()` skips every dotfile child);
-    ///    [`validate_filename`] rejects path-separator characters in
+    ///    `validate_filename` rejects path-separator characters in
     ///    the image basename. Invalid input fails before any I/O.
     /// 2. **Acquire the per-key store lock.** `LOCK_EX` on
     ///    `<root>/.locks/<cache_key>.lock`. Timeout defaults to
-    ///    [`STORE_EXCLUSIVE_LOCK_DEFAULT_TIMEOUT`] (5 minutes) and
-    ///    can be overridden via [`STORE_EXCLUSIVE_LOCK_TIMEOUT_ENV`]
+    ///    `STORE_EXCLUSIVE_LOCK_DEFAULT_TIMEOUT` (5 minutes) and
+    ///    can be overridden via `STORE_EXCLUSIVE_LOCK_TIMEOUT_ENV`
     ///    for environments where a slow vmlinux strip stacks many
     ///    contending peers behind the head writer. The lock
     ///    excludes other writers for the same key while letting
@@ -429,7 +429,7 @@ impl CacheDir {
     ///    produces an error rather than blocking forever — a hung
     ///    writer cannot indefinitely block a fresh rebuild attempt.
     /// 3. **Double-checked re-lookup inside the lock.** After
-    ///    acquiring `LOCK_EX`, re-run [`Self::lookup_silent`] for
+    ///    acquiring `LOCK_EX`, re-run `Self::lookup_silent` for
     ///    `cache_key`. When N peers race to publish the same key
     ///    they all miss the pre-lock cache check, queue on
     ///    `LOCK_EX`, and serialise behind the head writer. Without
@@ -437,7 +437,7 @@ impl CacheDir {
     ///    publish steps in series even though the head writer's
     ///    output already satisfies them. The recheck early-returns
     ///    when the existing cached entry's content-defining metadata
-    ///    fields ([`cache_content_matches`] — config_hash,
+    ///    fields (`cache_content_matches` — config_hash,
     ///    ktstr_kconfig_hash, extra_kconfig_hash, has_vmlinux) match
     ///    the caller's intent for this publish, so only the head
     ///    writer pays the strip/copy/rename cost. Cache-relevant
@@ -450,15 +450,15 @@ impl CacheDir {
     ///    already cached, so the publish is redundant.
     /// 4. **Stage into a temp directory.** `<root>/.tmp-<key>-<pid>`
     ///    is created (or pruned and recreated if a previous attempt
-    ///    by the same PID exists), with [`TmpDirGuard`] enrolling the
+    ///    by the same PID exists), with `TmpDirGuard` enrolling the
     ///    path for cleanup on any subsequent error. A best-effort
-    ///    [`clean_orphaned_tmp_dirs`] pass also runs here so dead
+    ///    `clean_orphaned_tmp_dirs` pass also runs here so dead
     ///    sibling temp directories from crashed PIDs are GC'd before
     ///    we add another one.
     /// 5. **Copy the boot image.** `metadata.image_name` lands at
     ///    `tmp/<image_name>` via `fs::copy`.
     /// 6. **Strip and copy vmlinux (if supplied).** When
-    ///    `artifacts.vmlinux` is `Some`, [`strip_vmlinux_debug`]
+    ///    `artifacts.vmlinux` is `Some`, `strip_vmlinux_debug`
     ///    runs the 3-stage strip pipeline and the result is written
     ///    to `tmp/vmlinux`. **Strip-fallback rationale:** if the
     ///    strip pipeline returns an error (e.g. an unrecognised ELF
@@ -478,7 +478,7 @@ impl CacheDir {
     ///    intentional — operators inspect this file directly when
     ///    debugging cache state.
     /// 8. **Atomic publish.** `fs::rename(tmp → final)` if `final`
-    ///    does not exist; otherwise [`atomic_swap_dirs`] uses
+    ///    does not exist; otherwise `atomic_swap_dirs` uses
     ///    `renameat2(RENAME_EXCHANGE)` to swap the two directories
     ///    in a single atomic syscall. Either way, no reader observes
     ///    a partial entry; the swap path also cleans up the
@@ -659,7 +659,7 @@ impl CacheDir {
 
     /// Acquire `LOCK_EX` on the cache-entry lockfile, blocking up
     /// to `timeout`. On timeout, the error message surfaces the
-    /// [`STORE_EXCLUSIVE_LOCK_TIMEOUT_ENV`] override so an operator
+    /// `STORE_EXCLUSIVE_LOCK_TIMEOUT_ENV` override so an operator
     /// hitting a contended `store()` discovers the env-var
     /// remediation without reading the docs.
     pub fn acquire_exclusive_lock_blocking(

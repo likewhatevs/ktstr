@@ -1,5 +1,5 @@
 //! Group, aggregate, and render the comparison between two
-//! [`CtprofSnapshot`]s.
+//! `CtprofSnapshot`s.
 //!
 //! Design summary: the per-thread profiler emits
 //! one snapshot per run. Comparison groups threads within each

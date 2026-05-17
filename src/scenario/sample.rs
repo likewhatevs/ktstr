@@ -6,12 +6,12 @@
 //! [`Sample`] is the borrowed-view tuple over that pair plus the
 //! per-sample tag and elapsed-millisecond timestamp;
 //! [`SampleSeries`] is the ordered sequence of samples drained
-//! from a [`SnapshotBridge`] after VM exit.
+//! from a `SnapshotBridge` after VM exit.
 //!
 //! Test authors do not construct samples manually — they call
 //! [`SampleSeries::from_drained`] on the periodic bundle the
 //! bridge surfaces via
-//! [`SnapshotBridge::drain_ordered_with_stats`], then project the
+//! `SnapshotBridge::drain_ordered_with_stats`, then project the
 //! series along either the BPF or the stats axis through
 //! [`SampleSeries::bpf`] / [`SampleSeries::stats`] / the typed
 //! [`SampleSeries::bpf_map`] / [`SampleSeries::stats_path`]
@@ -51,7 +51,7 @@ pub struct Sample<'a> {
     /// Periodic tag the freeze coordinator stamped onto this
     /// sample. Always begins with `"periodic_"` followed by a
     /// zero-padded ordinal — see
-    /// [`crate::vmm::freeze_coord::periodic_tag`].
+    /// `crate::vmm::freeze_coord::periodic_tag`.
     pub tag: &'a str,
     /// Wall-clock elapsed milliseconds (pause-adjusted: the
     /// coordinator subtracts cumulative ScenarioPause/Resume
@@ -351,7 +351,7 @@ impl<'a> StatsValue<'a> {
 
 /// Auto-projector handle returned by [`SampleSeries::bpf_map`].
 /// Lazily resolves the named map's value at the requested entry
-/// index when [`Self::field`] is invoked.
+/// index when `Self::field` is invoked.
 pub struct BpfMapProjector<'a> {
     series: &'a SampleSeries,
     map_name: &'a str,

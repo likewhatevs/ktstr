@@ -63,8 +63,8 @@ use super::runner::DisplayOptions;
 /// infallible sink (`String`) can unwrap or ignore.
 ///
 /// `display` controls per-row column layout, terminal-width
-/// wrapping, and per-section filtering: see [`DisplayFormat`] /
-/// [`Column`] / [`Section`] / [`DisplayOptions`] for the
+/// wrapping, and per-section filtering: see `DisplayFormat` /
+/// [`Column`] / `Section` / [`DisplayOptions`] for the
 /// resolution rules. Each sub-emitter is gated on
 /// [`DisplayOptions::is_section_enabled`] before its
 /// data-availability check, so `--sections` always wins over

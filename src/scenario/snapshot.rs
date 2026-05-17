@@ -233,12 +233,12 @@ pub enum SnapshotError {
     /// A predicate-based lookup (`find`, `max_by`) found no match.
     /// `len` is the number of entries the lookup traversed before
     /// giving up; `available_keys` is a small sample (up to
-    /// [`NO_MATCH_KEY_SAMPLE`] entries) of rendered keys seen during
+    /// `NO_MATCH_KEY_SAMPLE` entries) of rendered keys seen during
     /// the traversal so an operator can distinguish "empty map"
     /// (`len == 0`) from "populated map with no predicate hit"
     /// (`len > 0`) and inspect the sample to debug the predicate.
     /// Keys are rendered via [`RenderedValue`]'s `Display` impl and
-    /// each is capped at [`NO_MATCH_KEY_CHAR_CAP`] chars with an
+    /// each is capped at `NO_MATCH_KEY_CHAR_CAP` chars with an
     /// ellipsis to keep the failure message readable for wide struct
     /// keys.
     ///
@@ -525,10 +525,10 @@ pub type WatchRegisterCallback =
 /// map.
 ///
 /// Cloneable via the wrapped `Arc`s. The host installs an instance
-/// in the executor's thread-local via [`Self::set_thread_local`]
+/// in the executor's thread-local via `Self::set_thread_local`
 /// before [`execute_steps`](crate::scenario::ops::execute_steps)
 /// runs; the executor's `Op::Snapshot` arm calls
-/// [`Self::capture`] with the op's name.
+/// `Self::capture` with the op's name.
 /// Maximum number of [`Op::WatchSnapshot`](crate::scenario::ops::Op::WatchSnapshot)
 /// ops a single scenario may register.
 ///
@@ -538,12 +538,12 @@ pub type WatchRegisterCallback =
 /// always reserved internally for the `*scx_root->exit_kind`
 /// watchpoint that drives the error-class freeze trigger, so a host
 /// must expose at least 4 hardware watchpoint slots through
-/// `KVM_SET_GUEST_DEBUG` for every user [`Op::WatchSnapshot`] to arm.
+/// `KVM_SET_GUEST_DEBUG` for every user `Op::WatchSnapshot` to arm.
 /// Common x86_64 and aarch64 hosts meet that bar.
 ///
 /// The actual host slot count is probed once during VM bring-up via
 /// `KVM_CHECK_EXTENSION(KVM_CAP_GUEST_DEBUG_HW_WPS)` in
-/// [`crate::vmm::freeze_coord`] (search for `Cap::DebugHwWps`); a
+/// `crate::vmm::freeze_coord` (search for `Cap::DebugHwWps`); a
 /// host returning `<= 0` or fewer than 4 slots logs a `tracing::warn!`
 /// at coordinator setup. Per-arm failures surface as `tracing::warn!`
 /// from `self_arm_watchpoint` with per-vCPU retry capping at
@@ -944,7 +944,7 @@ impl SnapshotBridge {
 
     /// Take ownership of the captured snapshots in insertion order,
     /// leaving the bridge empty. The returned `Vec` walks
-    /// [`SnapshotStore::order`] (the FIFO key list maintained by
+    /// `SnapshotStore::order` (the FIFO key list maintained by
     /// [`Self::store`]) so periodic captures — whose ordering IS the
     /// signal — are returned `periodic_000` first, `periodic_NNN`
     /// last. [`Self::drain`] returns a `HashMap` and loses ordering;
@@ -1145,11 +1145,11 @@ impl<'a> Snapshot<'a> {
     ///   per-DSQ depth, per-CPU rq->scx state, scheduler global
     ///   state.
     /// - `event_counter_timeline` — periodic SCX event counter
-    ///   samples ([`EventCounterSample`](crate::monitor::dump::EventCounterSample)).
+    ///   samples (`EventCounterSample`).
     /// - `per_cpu_time`, `per_node_numa` — per-CPU
     ///   cpustat/schedstat and per-node NUMA event counters
-    ///   ([`PerCpuTimeStats`](crate::monitor::dump::PerCpuTimeStats),
-    ///   [`PerNodeNumaStats`](crate::monitor::dump::PerNodeNumaStats)).
+    ///   (`PerCpuTimeStats`,
+    ///   `PerNodeNumaStats`).
     /// - `task_enrichments`, `prog_runtime_stats`, `probe_counters`
     ///   — task-level enrichment, BPF prog runtime stats,
     ///   per-probe counters.
@@ -1840,7 +1840,7 @@ impl<'a> SnapshotField<'a> {
 // ---------------------------------------------------------------------------
 
 /// One value's view at the leaf of a dotted-path walk over a
-/// [`serde_json::Value`]. Returned by [`stats_path`] / [`StatsValue::path`].
+/// [`serde_json::Value`]. Returned by [`stats_path`] / `StatsValue::path`.
 ///
 /// Mirrors the [`SnapshotField`] shape so test authors who already
 /// know the BPF-snapshot accessor surface get the same `as_u64` /

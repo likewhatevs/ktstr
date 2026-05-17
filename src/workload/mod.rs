@@ -19,24 +19,24 @@
 //!
 //! # Module layout
 //!
-//! - [`affinity`] — [`AffinityIntent`] / [`ResolvedAffinity`] +
+//! - `affinity` — [`AffinityIntent`] / [`ResolvedAffinity`] +
 //!   the resolver and `sched_setaffinity` wrapper.
-//! - [`config`] — declarative test-author input
+//! - `config` — declarative test-author input
 //!   ([`WorkloadConfig`], [`WorkSpec`], [`SchedPolicy`],
 //!   [`MemPolicy`], [`MpolFlags`], [`CloneMode`],
 //!   [`FutexLockMode`], [`WakeMechanism`], [`AluWidth`]) and
 //!   the `humantime_serde_helper` shared by every `Duration`
 //!   field.
-//! - [`types`] — [`WorkType`] / [`Phase`] /
+//! - `types` — [`WorkType`] / [`Phase`] /
 //!   [`WorkTypeValidationError`] and the WorkType naming
 //!   surface (`from_name`, `suggest`, `ALL_NAMES`).
-//! - [`spawn`] — runtime spawn pipeline: [`WorkloadHandle`],
+//! - `spawn` — runtime spawn pipeline: [`WorkloadHandle`],
 //!   `SpawnGuard`, [`Migration`], [`WorkerReport`],
 //!   [`WorkerExitInfo`], `build_nodemask`,
 //!   `apply_mempolicy_with_flags`, `apply_nice`. Tests are
 //!   co-located in `spawn/tests_*.rs` siblings with shared
 //!   fixtures in `spawn/testing.rs`.
-//! - [`worker`] — `worker_main` and the per-WorkType bodies.
+//! - `worker` — `worker_main` and the per-WorkType bodies.
 //!   `worker/io.rs` holds the IO-backing RAII wrappers and
 //!   `worker/sched.rs` holds the scheduler/clock/metric
 //!   helpers (incl. `set_sched_policy`).

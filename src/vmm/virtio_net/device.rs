@@ -540,7 +540,7 @@ impl VirtioNetCounters {
     }
 }
 
-/// Plain-u64 snapshot of [`VirtioNetCounters`] taken at VM-result
+/// Plain-u64 snapshot of `VirtioNetCounters` taken at VM-result
 /// construction time. Mirrors every atomic field by name.
 ///
 /// Decouples [`crate::vmm::VmResult`] from the internal
@@ -549,11 +549,11 @@ impl VirtioNetCounters {
 /// without the `Arc<AtomicU64>` ceremony. virtio-net is
 /// single-threaded — the vCPU thread continues to bump the
 /// atomics inline from `process_tx_loopback` via the
-/// [`VirtioNetCounters`] `record_*` mutators; only the
+/// `VirtioNetCounters` `record_*` mutators; only the
 /// result-construction path moves to the snapshot.
 ///
 /// Field semantics match the atomic source one-for-one — see
-/// [`VirtioNetCounters`] for the per-counter taxonomy.
+/// `VirtioNetCounters` for the per-counter taxonomy.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct VirtioNetCountersSnapshot {
     pub tx_packets: u64,

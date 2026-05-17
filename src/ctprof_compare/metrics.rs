@@ -143,7 +143,7 @@ pub struct CtprofMetricDef {
     /// [`Section::TaskstatsDelay`] so an operator can scope
     /// the rendered table down to (or away from) the taskstats
     /// rows. The primary-table emitter checks
-    /// [`DisplayOptions::is_section_enabled`] per row before
+    /// `DisplayOptions::is_section_enabled` per row before
     /// rendering — `--sections taskstats-delay` keeps only
     /// taskstats rows, `--sections primary` excludes them, and
     /// either alone keeps the primary table open. The default
@@ -165,9 +165,9 @@ pub struct CtprofMetricDef {
 /// Pressure Stall Information is per-snapshot (host-level) and
 /// per-cgroup. PSI surfaces in dedicated secondary tables
 /// under "## Host pressure / ..." and "## Pressure / ..."
-/// headers, rendered by [`write_diff`] / `write_show` directly
-/// rather than via [`AggRule`]. See [`Psi`] / [`PsiResource`] /
-/// [`PsiHalf`] for the data model.
+/// headers, rendered by `write_diff` / `write_show` directly
+/// rather than via [`AggRule`]. See `Psi` / `PsiResource` /
+/// `PsiHalf` for the data model.
 pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
     // structural: group population count
     CtprofMetricDef {
@@ -1194,12 +1194,12 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
 /// path (e.g. `1.500ms`, `7.500GiB`) and the raw three-decimal
 /// path (`0.873` for ratios).
 ///
-/// Sign preservation: the [`auto_scale`] step uses `abs()` for
+/// Sign preservation: the `auto_scale` step uses `abs()` for
 /// the threshold check but propagates the original signed value
-/// through the scaled output, and [`format_derived_value_cell`]
-/// / [`format_derived_delta_cell`] both render with `{value:.2}`
+/// through the scaled output, and `format_derived_value_cell`
+/// / `format_derived_delta_cell` both render with `{value:.2}`
 /// or `{value:.3}` formatters that preserve the explicit `-` for
-/// negatives. The [`auto_scale_preserves_sign_on_negative_input`]
+/// negatives. The `auto_scale_preserves_sign_on_negative_input`
 /// regression test pins this for the Bytes and ns ladders.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
@@ -1216,7 +1216,7 @@ pub enum DerivedValue {
 
 impl DerivedValue {
     /// Return the underlying `f64`. Helper for delta math
-    /// downstream of [`DerivedRow`] consumers.
+    /// downstream of `DerivedRow` consumers.
     pub fn as_f64(&self) -> f64 {
         match self {
             DerivedValue::Scalar(v) => *v,
@@ -1294,7 +1294,7 @@ pub struct DerivedMetricDef {
     /// — the 34 raw rows AND the 9 derivations that depend on
     /// them — without dragging in unrelated derived metrics.
     /// The `## Derived metrics` table emitter checks
-    /// [`DisplayOptions::is_section_enabled`] per row before
+    /// `DisplayOptions::is_section_enabled` per row before
     /// rendering, and the outer-table gate opens whenever EITHER
     /// section in the rendered set is enabled.
     pub section: Section,
@@ -1561,7 +1561,7 @@ pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
 /// [`CtprofMetricDef::name`]'s static-string storage —
 /// callers may borrow the static name without allocation;
 /// render sites that need owned `String`s allocate at the
-/// table-cell boundary (see [`super::render`] at the
+/// table-cell boundary (see `super::render` at the
 /// `metric_display_name(metric_def).to_string()` call site
 /// and [`super::runner::write_metric_list`]).
 ///

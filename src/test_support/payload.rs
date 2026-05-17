@@ -150,7 +150,7 @@ pub struct Payload {
     /// `None` (the default), only the framework's universal
     /// invariants apply. When `Some(&MetricBounds { … })`, each
     /// declared bound is enforced after extraction in
-    /// [`crate::test_support::eval::host_side_llm_extract`] and
+    /// `crate::test_support::eval::host_side_llm_extract` and
     /// any violation surfaces as an [`crate::assert::AssertDetail`].
     /// See [`MetricBounds`] for the per-bound contract and the
     /// rationale for declaring this per-payload rather than
@@ -633,7 +633,7 @@ impl Payload {
 
     /// Gauntlet topology constraints. Scheduler-kind payloads forward
     /// to the inner `Scheduler::constraints`; binary-kind payloads
-    /// return [`TopologyConstraints::DEFAULT`].
+    /// return `TopologyConstraints::DEFAULT`.
     pub const fn constraints(&self) -> crate::test_support::TopologyConstraints {
         match self.kind {
             PayloadKind::Scheduler(s) => s.constraints,
@@ -744,7 +744,7 @@ pub enum Polarity {
 
 impl Polarity {
     /// Map the legacy `higher_is_worse: bool` used by
-    /// [`MetricDef`](crate::stats::MetricDef) to a `Polarity`.
+    /// `MetricDef` to a `Polarity`.
     ///
     /// The sense is INVERSE: `true` (bigger values are regressions)
     /// maps to [`Polarity::LowerBetter`] (we want the metric to go
@@ -789,7 +789,7 @@ pub struct MetricHint {
     pub polarity: Polarity,
     /// Human-readable unit for display (e.g. `iops`, `ns`). Empty
     /// string means "no unit"; matches the sentinel used by
-    /// [`MetricDef`](crate::stats::MetricDef).
+    /// `MetricDef`.
     pub unit: &'static str,
 }
 
@@ -797,7 +797,7 @@ pub struct MetricHint {
 /// metrics from `OutputFormat::LlmExtract` payloads.
 ///
 /// The framework's universal invariants in
-/// [`crate::test_support::eval::validate_llm_extraction`] (unique
+/// `crate::test_support::eval::validate_llm_extraction` (unique
 /// names, finite values, `MetricSource::LlmExtract`) are workload-
 /// agnostic and apply to every LlmExtract payload. Workload-
 /// specific bounds — minimum metric count, sign, magnitude — vary
@@ -808,7 +808,7 @@ pub struct MetricHint {
 /// `MetricBounds` lets the payload author declare these bounds
 /// declaratively on the `Payload` struct via the `metric_bounds`
 /// field. The host applies them after extraction in
-/// [`crate::test_support::eval::host_side_llm_extract`]; each
+/// `crate::test_support::eval::host_side_llm_extract`; each
 /// violation surfaces as its own [`crate::assert::AssertDetail`]
 /// with `DetailKind::Other`.
 ///
@@ -1116,7 +1116,7 @@ pub struct Metric {
 /// counter — assigned at emit time inside the guest VM. Hosts use
 /// the index to pair an [`OutputFormat::LlmExtract`] payload's
 /// empty-metrics `PayloadMetrics` slot with its companion
-/// [`crate::test_support::RawPayloadOutput`] without relying on
+/// `crate::test_support::RawPayloadOutput` without relying on
 /// emission order, which would conflate a `Json` payload that
 /// legitimately produced zero metrics (no numeric leaves) with an
 /// `LlmExtract` placeholder.
@@ -1124,7 +1124,7 @@ pub struct Metric {
 pub struct PayloadMetrics {
     /// Per-invocation index assigned at emit time. Monotonically
     /// increasing within a single guest VM process, starting at 0.
-    /// Pairs with [`crate::test_support::RawPayloadOutput::payload_index`]
+    /// Pairs with `crate::test_support::RawPayloadOutput::payload_index`
     /// for `OutputFormat::LlmExtract` payloads — the host matches
     /// raw output to its empty-metrics slot by equal index.
     pub payload_index: usize,

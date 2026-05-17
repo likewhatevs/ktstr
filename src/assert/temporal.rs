@@ -2,7 +2,7 @@
 //! [`SampleSeries`](crate::scenario::sample::SampleSeries).
 //!
 //! `SeriesField<T>` is a per-sample column extracted from the
-//! series via [`SampleSeries::bpf`] or [`SampleSeries::stats`] (or
+//! series via `SampleSeries::bpf` or `SampleSeries::stats` (or
 //! the typed `bpf_map` / `stats_path` projectors). It carries a
 //! parallel `(tag, elapsed_ms, SnapshotResult<T>)` triple per
 //! sample so any failure-path message can name the offending tag

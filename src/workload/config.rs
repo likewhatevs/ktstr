@@ -142,30 +142,30 @@ pub mod defaults {
     // IdleChurn
     pub const IDLE_CHURN_BURST_DURATION: std::time::Duration = std::time::Duration::from_millis(1);
     pub const IDLE_CHURN_SLEEP_DURATION: std::time::Duration = std::time::Duration::from_millis(5);
-    /// Default for [`WorkType::IdleChurn`]'s `precise_timing` field.
+    /// Default for `WorkType::IdleChurn`'s `precise_timing` field.
     /// `false` keeps the inherited 50µs `current->timer_slack_ns`
     /// the variant doc describes; opt-in callers set the field to
     /// `true` directly to call `prctl(PR_SET_TIMERSLACK, 1)`.
     pub const IDLE_CHURN_PRECISE_TIMING: bool = false;
     // AluHot
-    /// Default for [`WorkType::AluHot`]'s `width` field. `Widest`
+    /// Default for `WorkType::AluHot`'s `width` field. `Widest`
     /// resolves to the widest data-path the host supports at
     /// worker entry — see [`super::AluWidth`] for the resolution
     /// order.
     pub const ALU_HOT_WIDTH: super::AluWidth = super::AluWidth::Widest;
     // IpcVariance
-    /// Multiply-chain steps per hot phase in [`WorkType::IpcVariance`].
+    /// Multiply-chain steps per hot phase in `WorkType::IpcVariance`.
     /// At IPC 2.0 / 2 GHz this spans ~50µs — long enough that the
     /// scheduler's IPC-window observer sees a steady high-IPC
     /// signal before the cold phase flips it.
     pub const IPC_VARIANCE_HOT_ITERS: u64 = 100_000;
     /// Random cache-line touches per cold phase in
-    /// [`WorkType::IpcVariance`]. 1024 touches across a 512KB
+    /// `WorkType::IpcVariance`. 1024 touches across a 512KB
     /// working set on a typical x86 core takes ~100µs (LLC) to
     /// ~1ms (DRAM-spill).
     pub const IPC_VARIANCE_COLD_ITERS: u64 = 1024;
     /// Hot+cold pair iterations per outer loop in
-    /// [`WorkType::IpcVariance`]. 64 keeps per-stop-check
+    /// `WorkType::IpcVariance`. 64 keeps per-stop-check
     /// overhead at <2% while bounding shutdown latency to one
     /// outer iteration (~10ms with the defaults above).
     pub const IPC_VARIANCE_PERIOD_ITERS: u64 = 64;
@@ -414,7 +414,7 @@ pub enum WakeMechanism {
 /// compat for older capture data). `Widest` is the
 /// workload-level default the
 /// [`defaults::ALU_HOT_WIDTH`] constant resolves at runtime
-/// via [`resolve_alu_width`]: tests that take
+/// via `resolve_alu_width`: tests that take
 /// `WorkType::from_name("AluHot")` get the host's widest
 /// available data-path, not the type-level scalar fallback.
 /// The asymmetry is deliberate — type-level Default favours
@@ -513,7 +513,7 @@ pub enum AluWidth {
 /// [`WorkType::AsymmetricWaker`] consumes when it wants to
 /// describe a waker / wakee pair without specifying priority
 /// values. When a per-worker class is applied,
-/// [`apply_sched_class`] maps the variant to the equivalent
+/// `apply_sched_class` maps the variant to the equivalent
 /// [`SchedPolicy`] (using a default priority where applicable)
 /// and routes through `set_sched_policy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -563,7 +563,7 @@ const RT_DEFAULT_PRIO: u32 = 50;
 
 impl SchedClass {
     /// Resolve to an equivalent [`SchedPolicy`]. `Rt` uses
-    /// [`RT_DEFAULT_PRIO`]; `Deadline` uses the minimum-bandwidth
+    /// `RT_DEFAULT_PRIO`; `Deadline` uses the minimum-bandwidth
     /// reservation (1us runtime over 1ms period — passes
     /// `__checkparam_dl` and the default sysctl bounds).
     /// `Ext` maps to `SchedPolicy::Normal` because there is no
@@ -699,9 +699,9 @@ impl std::ops::BitOr for MpolFlags {
     }
 }
 
-/// How [`WorkloadHandle::spawn`] creates worker tasks.
+/// How `WorkloadHandle::spawn` creates worker tasks.
 ///
-/// `Fork` is the default — the existing [`fork(2)`] path with
+/// `Fork` is the default — the existing `fork(2)` path with
 /// separate address space, separate thread group, and `waitpid`
 /// reaping. `Thread` switches to [`std::thread::spawn`] for workers
 /// that share the test runner's tgid.
@@ -710,7 +710,7 @@ impl std::ops::BitOr for MpolFlags {
 ///
 /// Most [`WorkType`] variants compose with both clone modes. The
 /// only exception is surfaced at spawn time by
-/// [`WorkloadHandle::spawn`]:
+/// `WorkloadHandle::spawn`:
 ///
 /// | WorkType                | Fork | Thread |
 /// |-------------------------|------|--------|
@@ -743,7 +743,7 @@ impl std::ops::BitOr for MpolFlags {
 pub enum CloneMode {
     /// Plain `fork(2)`: separate address space, separate thread
     /// group (`p->tgid = p->pid`), reaped via `waitpid`. The default
-    /// — preserves existing [`WorkloadHandle::spawn`] behavior.
+    /// — preserves existing `WorkloadHandle::spawn` behavior.
     #[default]
     Fork,
     /// Same thread group as the spawning process. Implementation
@@ -811,7 +811,7 @@ impl MemPolicy {
     /// fallbacks for "I don't want node-restricted placement" — so the
     /// operator sees the next mouse-click inline rather than having to
     /// `cargo doc --open` to discover the constructor menu. Mirrors the
-    /// workers_pct rejection trailer at [`WorkSpec::resolve_workers_pct`].
+    /// workers_pct rejection trailer at `WorkSpec::resolve_workers_pct`.
     pub fn validate(&self) -> std::result::Result<(), String> {
         match self {
             MemPolicy::Default | MemPolicy::Local => Ok(()),
@@ -857,12 +857,12 @@ pub struct WorkloadConfig {
     /// Per-worker affinity intent. Resolved at spawn time via the
     /// same gate as composed entries (see [`Self::composed`]):
     /// [`AffinityIntent::Inherit`] (resolved to
-    /// [`ResolvedAffinity::None`]),
+    /// `ResolvedAffinity::None`),
     /// [`AffinityIntent::Exact`] (resolved to
-    /// [`ResolvedAffinity::Fixed`]), and
+    /// `ResolvedAffinity::Fixed`), and
     /// [`AffinityIntent::RandomSubset`] (resolved to
-    /// [`ResolvedAffinity::Random`] — sampling deferred per-worker
-    /// at spawn time) are accepted at [`WorkloadHandle::spawn`].
+    /// `ResolvedAffinity::Random` — sampling deferred per-worker
+    /// at spawn time) are accepted at `WorkloadHandle::spawn`.
     /// Topology-aware variants (`SingleCpu`, `LlcAligned`,
     /// `CrossCgroup`, `SmtSiblingPair`) require scenario context
     /// and are rejected with an actionable diagnostic.
@@ -925,16 +925,16 @@ pub struct WorkloadConfig {
     /// `sched_policy`, `affinity`, etc. Composed groups are spawned
     /// in declaration order after the primary group; their workers
     /// run concurrently with the primary's for the lifetime of the
-    /// [`WorkloadHandle`]. The default (an empty vec) skips the
+    /// `WorkloadHandle`. The default (an empty vec) skips the
     /// composed pass and behaves exactly as the pre-composition
     /// spawn.
     ///
     /// All groups share the same stop signal —
-    /// [`WorkloadHandle::stop_and_collect`] terminates primary plus
+    /// `WorkloadHandle::stop_and_collect` terminates primary plus
     /// every composed group atomically. Per-group stop is not
     /// supported.
     ///
-    /// Reports carry [`WorkerReport::group_idx`] = 0 for the primary
+    /// Reports carry `WorkerReport::group_idx` = 0 for the primary
     /// group and 1..=N for composed entries in declaration order.
     ///
     /// # Worked example
@@ -981,15 +981,15 @@ pub struct WorkloadConfig {
     /// [`WorkSpec::num_workers`] (`Some(n)`); the `None` default
     /// resolved by the scenario engine via
     /// `Ctx::workers_per_cgroup` is unreachable from
-    /// [`WorkloadHandle::spawn`] and is rejected with an actionable
+    /// `WorkloadHandle::spawn` and is rejected with an actionable
     /// diagnostic.
     ///
     /// Composed [`WorkSpec::affinity`] accepts the no-context
     /// variants [`AffinityIntent::Inherit`] (resolved to
-    /// [`ResolvedAffinity::None`]), [`AffinityIntent::Exact`]
-    /// (resolved to [`ResolvedAffinity::Fixed`]), and
+    /// `ResolvedAffinity::None`), [`AffinityIntent::Exact`]
+    /// (resolved to `ResolvedAffinity::Fixed`), and
     /// [`AffinityIntent::RandomSubset`] (resolved to
-    /// [`ResolvedAffinity::Random`] — sampling deferred per-worker
+    /// `ResolvedAffinity::Random` — sampling deferred per-worker
     /// at spawn time). The topology-aware variants (`SingleCpu`,
     /// `LlcAligned`, `CrossCgroup`, `SmtSiblingPair`) are rejected
     /// because spawn() has no access to the
@@ -1061,7 +1061,7 @@ impl WorkloadConfig {
     ///
     /// The primary group's `mem_policy` plus every composed
     /// [`WorkSpec`]'s `mem_policy`. Per-entry errors name the
-    /// offending slot ("primary" or "composed[N] (group_idx M)") so
+    /// offending slot (`"primary"` or `"composed[N] (group_idx M)"`) so
     /// the test author can locate the misconfigured group.
     ///
     /// # Scope
@@ -1069,8 +1069,8 @@ impl WorkloadConfig {
     /// Currently validates only `mem_policy` on the primary group +
     /// each composed [`WorkSpec`]. Other field invariants are
     /// validated at their own use sites: `num_workers` via
-    /// [`WorkSpec::resolve_workers_pct`] (and the spawn-time
-    /// [`WorkloadHandle::spawn`] derivation cascade); [`WorkType`]
+    /// `WorkSpec::resolve_workers_pct` (and the spawn-time
+    /// `WorkloadHandle::spawn` derivation cascade); [`WorkType`]
     /// payloads via per-variant constructors and
     /// `validate_workload_admission`; [`AffinityIntent`] topology
     /// rules at the scenario-engine
@@ -1085,8 +1085,8 @@ impl WorkloadConfig {
     ///
     /// Returns [`anyhow::Result`] (composite-layer convention used
     /// by sibling composite validators
-    /// [`crate::test_support::entry::KtstrTestEntry::validate`] and
-    /// [`crate::test_support::entry::TopologyConstraints::validate`]
+    /// `crate::test_support::entry::KtstrTestEntry::validate` and
+    /// `crate::test_support::entry::TopologyConstraints::validate`
     /// — they wrap leaf validators that return
     /// `Result<(), String>` with slot-context). The leaf validator
     /// [`MemPolicy::validate`] returns `Result<(), String>` to match
@@ -1118,7 +1118,7 @@ impl WorkloadConfig {
 
     /// Set the per-worker affinity intent.
     ///
-    /// At [`WorkloadHandle::spawn`], [`AffinityIntent::Inherit`],
+    /// At `WorkloadHandle::spawn`, [`AffinityIntent::Inherit`],
     /// [`AffinityIntent::Exact`], and [`AffinityIntent::RandomSubset`]
     /// are accepted; topology-aware variants (`SingleCpu`,
     /// `LlcAligned`, `CrossCgroup`, `SmtSiblingPair`) require
@@ -1293,7 +1293,7 @@ pub struct WorkSpec {
     /// expose a cgroup-level default for `num_workers` — multi-group
     /// cgroups set the count per-`WorkSpec` here.
     pub num_workers: Option<usize>,
-    /// Per-worker affinity intent. Resolved to [`ResolvedAffinity`] at
+    /// Per-worker affinity intent. Resolved to `ResolvedAffinity` at
     /// runtime via [`resolve_affinity_for_cgroup()`](crate::scenario::resolve_affinity_for_cgroup).
     pub affinity: AffinityIntent,
     /// NUMA memory placement policy. Applied via `set_mempolicy(2)`
@@ -1350,7 +1350,7 @@ pub struct WorkSpec {
     ///
     /// This is the AUTHORITATIVE source for the pcomm dispatch:
     /// `apply_setup` reads it directly from each WorkSpec.
-    /// [`crate::scenario::ops::types::CgroupDef::pcomm`] is a
+    /// `crate::scenario::ops::types::CgroupDef::pcomm` is a
     /// convenience method that writes the same value into every
     /// WorkSpec at builder time; there is no separate cgroup-level
     /// pcomm field.
@@ -1407,11 +1407,11 @@ impl Default for WorkSpec {
     /// only that one via the corresponding `WorkSpec::with_*`
     /// builder. `num_workers = None` defers count selection to
     /// `CgroupDef`'s merged-works contract (the cgroup-level
-    /// default applies; see [`CgroupDef::workers`] /
-    /// [`CgroupDef::merged_works`]). The `workers_pct` mutex with
+    /// default applies; see `CgroupDef::workers` /
+    /// `CgroupDef::merged_works`). The `workers_pct` mutex with
     /// `num_workers` only fires when BOTH are `Some(_)` — at
     /// default neither is set, so the
-    /// [`CgroupDef::resolve_workers_pct`] arm that emits the
+    /// `CgroupDef::resolve_workers_pct` arm that emits the
     /// `WorkSpec sets BOTH workers(...) and workers_pct(...)` bail
     /// does not trigger.
     fn default() -> Self {

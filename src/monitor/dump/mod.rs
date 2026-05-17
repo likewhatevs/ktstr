@@ -625,13 +625,13 @@ pub const REASON_DEGRADED_KILL_DURING_RENDEZVOUS: &str =
 /// `freeze_and_capture(false)` returns `Degraded` (early-half
 /// rendezvous timeout). The freeze coordinator writes the degraded
 /// JSON to a sibling path named via
-/// [`super::super::vmm::freeze_coord::snapshot_tagged_path`] using
+/// `super::super::vmm::freeze_coord::snapshot_tagged_path` using
 /// this tag — main `{stem}.failure-dump.json` is preserved for the
 /// subsequent late-trigger emission. Operator-readable wire-format
 /// constant: kebab-case, stable across releases.
 ///
 /// MAINTENANCE: adding a new `SNAPSHOT_TAG_*` const requires updating
-/// BOTH (a) the [`ALL_SNAPSHOT_TAGS`] slice below AND (b) the
+/// BOTH (a) the `ALL_SNAPSHOT_TAGS` slice below AND (b) the
 /// `expected` hand-list in
 /// `all_snapshot_tags_enumerates_every_pub_const_in_module` in
 /// `src/monitor/dump/tests.rs`. The pinning test catches slice-vs-
@@ -918,13 +918,13 @@ pub struct FailureDumpReport {
     /// Structured per-allocation views from sdt_alloc-backed
     /// allocators. One entry per discovered allocator; each carries
     /// every live leaf slot (capped at
-    /// [`super::sdt_alloc::MAX_SDT_ALLOC_ENTRIES`]) BTF-rendered to
+    /// `super::sdt_alloc::MAX_SDT_ALLOC_ENTRIES`) BTF-rendered to
     /// named field views. Empty when no scheduler-side allocator
     /// could be located, when arena offsets / sdt_alloc offsets are
     /// absent, or when the program BTF lacks the `scx_allocator`
     /// type (scheduler doesn't link `lib/sdt_alloc.bpf.c`).
     ///
-    /// Populated alongside the page-granular [`ArenaSnapshot`] in
+    /// Populated alongside the page-granular `ArenaSnapshot` in
     /// each map: a consumer can read either representation depending
     /// on whether they want raw bytes or named-field allocations.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -975,17 +975,17 @@ pub struct FailureDumpReport {
     /// time (cnt, nsecs, misses). One entry per discovered
     /// struct_ops BPF program. Empty when no struct_ops programs are
     /// loaded OR when the prog accessor was unavailable to
-    /// [`dump_state`] — see [`Self::prog_runtime_stats_unavailable`]
+    /// `dump_state` — see [`Self::prog_runtime_stats_unavailable`]
     /// for the reason.
     ///
     /// Per-CPU offset resolution failure does NOT empty the vec —
     /// each program still contributes one entry, but with
     /// `cnt`/`nsecs`/`misses` summed only over CPUs whose per-CPU
     /// `bpf_prog_stats` slot translated successfully (out-of-range
-    /// CPUs return None per [`super::bpf_map::read_percpu_array_value`]
+    /// CPUs return None per `super::bpf_map::read_percpu_array_value`
     /// semantics).
     ///
-    /// See [`super::bpf_prog::ProgRuntimeStats`] for field semantics
+    /// See `super::bpf_prog::ProgRuntimeStats` for field semantics
     /// and the kernel-source-grounded provenance of each counter.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prog_runtime_stats: Vec<super::bpf_prog::ProgRuntimeStats>,
@@ -1003,7 +1003,7 @@ pub struct FailureDumpReport {
     ///   `__per_cpu_offset` resolution didn't yield non-zero offsets
     ///   yet (still-booting guest).
     ///
-    /// Set by [`dump_state`] only when prog_runtime_stats ends up
+    /// Set by `dump_state` only when prog_runtime_stats ends up
     /// empty AND a definite cause is identifiable; left None
     /// otherwise so the field stays absent in the JSON for
     /// already-populated dumps.
@@ -1012,10 +1012,10 @@ pub struct FailureDumpReport {
     /// Per-CPU CPU-time / softirq / IRQ counters captured from
     /// `kernel_cpustat`, `kernel_stat`, and (under NO_HZ)
     /// `tick_sched`. One entry per CPU enumerated by the walker.
-    /// Empty when the dump caller passed no [`CpuTimeCapture`] or
+    /// Empty when the dump caller passed no `CpuTimeCapture` or
     /// when symbol/BTF resolution failed.
     ///
-    /// See [`PerCpuTimeStats`] for field semantics. Surfaces the
+    /// See `PerCpuTimeStats` for field semantics. Surfaces the
     /// per-CPU interrupt and idle-time data the failure dump
     /// otherwise leaves implicit (the existing scx walker reads
     /// `rq->nr_iowait` but not the cumulative time accounting).
@@ -1027,7 +1027,7 @@ pub struct FailureDumpReport {
     /// walker has not landed yet (the BTF offsets and wire shape
     /// are wired; the reader is a follow-up).
     ///
-    /// See [`PerNodeNumaStats`] for field semantics; see
+    /// See `PerNodeNumaStats` for field semantics; see
     /// [`Self::per_node_numa_unavailable`] for the "why empty"
     /// diagnostic.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1048,10 +1048,10 @@ pub struct FailureDumpReport {
     /// today's task walkers are the rq->scx walker and the DSQ
     /// walker; both produce task KVAs that get enriched here.
     /// Empty when no task walker ran (typical until walker
-    /// dispatch lands) or when the [`TaskEnrichmentCapture`] was
+    /// dispatch lands) or when the `TaskEnrichmentCapture` was
     /// absent.
     ///
-    /// See [`super::task_enrichment::TaskEnrichment`] for field
+    /// See `super::task_enrichment::TaskEnrichment` for field
     /// semantics; see [`Self::task_enrichments_unavailable`] for the
     /// "why empty" diagnostic.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1061,8 +1061,8 @@ pub struct FailureDumpReport {
     /// - `None` → vec was populated normally (or the dump path
     ///   didn't run).
     /// - `Some("no task walker available")` → the
-    ///   [`TaskEnrichmentCapture`] was missing from
-    ///   [`DumpContext`]. Until DSQ + rq->scx walker dispatch
+    ///   `TaskEnrichmentCapture` was missing from
+    ///   `DumpContext`. Until DSQ + rq->scx walker dispatch
     ///   lands, this is the expected steady state for the dump
     ///   pipeline; the offsets + walker library is wired and
     ///   ready to populate as soon as a task-list producer hooks
@@ -1076,23 +1076,23 @@ pub struct FailureDumpReport {
     /// Per-monitor-tick SCX_EV_* event counter timeline. Each entry
     /// is the cross-CPU sum of the 13 SCX_EV_* counters at one
     /// monitor sample. Empty when the dump caller passed no
-    /// [`EventCounterCapture`] or no sample reported event counters
+    /// `EventCounterCapture` or no sample reported event counters
     /// (event-stat offsets unresolved, scx_root unset). Renderers
     /// build sparklines / per-counter delta plots from this vec.
     ///
-    /// See [`EventCounterSample`] for field semantics; the kernel-
+    /// See `EventCounterSample` for field semantics; the kernel-
     /// source provenance lives on
-    /// [`super::ScxEventCounters`] field doc.
+    /// `super::ScxEventCounters` field doc.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_counter_timeline: Vec<EventCounterSample>,
     /// Per-CPU `rq->scx` snapshots — scalar fields the kernel's
     /// own `scx_dump_state` reads plus the runnable_list per-task
     /// KVAs that fed into the per-task enrichment capture.
     /// One entry per CPU walked. Empty when the
-    /// [`ScxWalkerCapture`] was absent or every CPU's translate
+    /// `ScxWalkerCapture` was absent or every CPU's translate
     /// failed.
     ///
-    /// See [`super::scx_walker::RqScxState`] for field semantics.
+    /// See `super::scx_walker::RqScxState` for field semantics.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rq_scx_states: Vec<super::scx_walker::RqScxState>,
     /// Per-DSQ snapshots — local, bypass, global, and user DSQs
@@ -1102,7 +1102,7 @@ pub struct FailureDumpReport {
     /// emit (per-DSQ depth enumeration), so this vec adds value
     /// even on a kernel that prints its own dump.
     ///
-    /// Empty when the [`ScxWalkerCapture`] was absent.
+    /// Empty when the `ScxWalkerCapture` was absent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dsq_states: Vec<super::scx_walker::DsqState>,
     /// Top-level `scx_sched` state captured from `*scx_root`:
@@ -1120,20 +1120,20 @@ pub struct FailureDumpReport {
     /// instant the failure dump fired. One entry per vCPU; index
     /// matches vCPU id (0 = BSP, 1..N = APs). `None` per-entry when
     /// the freeze-time `read(2)` failed for that vCPU. Empty vec
-    /// when [`DumpContext::perf_capture`] was None (perf
+    /// when `DumpContext::perf_capture` was None (perf
     /// unavailable on this host) or the read errored wholesale.
     ///
     /// `exclude_host=1` means each counter ticks only during guest
     /// execution; the values here record the cumulative count from
     /// the start of the run. Diff against any
-    /// [`super::CpuSnapshot::vcpu_perf`] in the monitor timeline to
+    /// `super::CpuSnapshot::vcpu_perf` in the monitor timeline to
     /// recover the count over a freeze-aligned window. See
-    /// [`super::perf_counters::VcpuPerfSample`] for field semantics
+    /// `super::perf_counters::VcpuPerfSample` for field semantics
     /// and the multiplexing math.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vcpu_perf_at_freeze: Vec<Option<super::perf_counters::VcpuPerfSample>>,
     /// Microseconds from dump_state entry to the phase that exceeded
-    /// the soft deadline supplied via [`DumpContext::deadline`]. `None`
+    /// the soft deadline supplied via `DumpContext::deadline`. `None`
     /// when no deadline was supplied, when every phase finished within
     /// the deadline, or when the deadline check happened before the
     /// dump started any heavy phase. A `Some(us)` value means the dump
@@ -1147,8 +1147,8 @@ pub struct FailureDumpReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dump_truncated_at_us: Option<u64>,
     /// Probe BPF program's per-CPU diagnostic counter snapshot
-    /// (see [`ProbeBssCounters`]). Populated by the host-side
-    /// reader in [`decode_probe_counters_snapshot`] which sums
+    /// (see `ProbeBssCounters`). Populated by the host-side
+    /// reader in `decode_probe_counters_snapshot` which sums
     /// each `KTSTR_PCPU_*` slot across CPUs. `None` when the
     /// probe `.bss` map isn't enumerated (probe not loaded), the
     /// program BTF can't be parsed, or the array's offset doesn't
@@ -1157,7 +1157,7 @@ pub struct FailureDumpReport {
     /// A populated `trigger_count > 0` is the structural signal
     /// that the BPF tp_btf/sched_ext_exit handler fired during
     /// the run — distinct from the boolean `trigger_fired` flag
-    /// in [`super::probe::process::ProbeDiagnostics`] (which
+    /// in `super::probe::process::ProbeDiagnostics` (which
     /// also records host-side observations like a watchdog
     /// teardown). The cross-product is the failure-dump E2E
     /// test's structural assertion: a stall scenario must show
@@ -1262,7 +1262,7 @@ impl FailureDumpReport {
 ///
 /// **No user toggle — auto-repro engages this automatically.** Only
 /// the auto-repro VM emits this shape;
-/// [`crate::test_support::probe::attempt_auto_repro`] is the
+/// `crate::test_support::probe::attempt_auto_repro` is the
 /// single call site flipping the builder's `dual_snapshot` flag,
 /// and there is no public ktstr surface for asking for it from a
 /// primary VM. Test authors don't need to know about it — when an
@@ -1339,7 +1339,7 @@ pub struct DualFailureDumpReport {
     ///   scx_tick kernel side without any task on
     ///   `rq->scx.runnable_list`).
     ///
-    /// Display rendering at [`super::display`] surfaces this string
+    /// Display rendering at `super::display` surfaces this string
     /// directly; the previous "stall fired before half-way threshold,
     /// or runnable_at scan setup failed" generic text is replaced
     /// with the structured reason whenever this field is `Some`.
@@ -1402,7 +1402,7 @@ pub struct DegradedFailureDumpReport {
     /// (latch readable, value still 0), `"out_of_bounds"` (cached
     /// `.bss` PA no longer 4-byte-readable — probe map freed
     /// mid-run), or `"not_resolved"` (cached `.bss` PA was never
-    /// populated). Mirror of [`crate::vmm::freeze_coord`]'s
+    /// populated). Mirror of `crate::vmm::freeze_coord`'s
     /// internal `BssReadState` enum, serialised as the snake-case
     /// of each variant. String-typed for wire-format stability with
     /// the rest of the `REASON_*` / state-name surface — see
@@ -1512,7 +1512,7 @@ impl FailureDumpReportAny {
 pub struct FailureDumpMap {
     /// Map name as registered with the kernel. Truncated to
     /// `BPF_OBJ_NAME_LEN` (16) by the kernel; libbpf composes
-    /// "<obj_name>.<section>" for global-section maps.
+    /// `"<obj_name>.<section>"` for global-section maps.
     pub name: String,
     /// Raw `map_type` from `struct bpf_map` (e.g. `BPF_MAP_TYPE_ARRAY`).
     /// Kept as `u32` rather than an enum to avoid bumping a serde
@@ -1525,8 +1525,8 @@ pub struct FailureDumpMap {
     /// Surfaces alongside the rendered slice so a consumer can spot
     /// when the dump shows fewer entries than the map declares
     /// (e.g. multi-entry ARRAY rendering only key 0; HASH map
-    /// truncated at [`MAX_HASH_ENTRIES`]; PERCPU_ARRAY truncated at
-    /// [`MAX_PERCPU_KEYS`]).
+    /// truncated at `MAX_HASH_ENTRIES`; PERCPU_ARRAY truncated at
+    /// `MAX_PERCPU_KEYS`).
     pub max_entries: u32,
     /// Single-value render (set for ARRAY-style maps).
     #[serde(default, skip_serializing_if = "Option::is_none")]

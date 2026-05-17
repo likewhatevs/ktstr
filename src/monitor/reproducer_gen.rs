@@ -153,7 +153,7 @@ pub struct ReproducerSpec {
 /// that block [`ReproducerSpec::is_runnable`]; `Informational` and
 /// `Resolved` are zero-cost surface for the generated source's
 /// comment block. Replaced an earlier substring-marker scheme that
-/// probed the rendered text — see [`Self::is_unresolved`] for the
+/// probed the rendered text — see `Self::is_unresolved` for the
 /// runnability filter.
 ///
 /// Each variant carries the rendered text the generator emits — the
@@ -183,8 +183,8 @@ pub enum ReproducerNote {
     /// `AffinityIntent::Inherit`). Counted by
     /// [`ReproducerSpec::unresolved_count`].
     UnresolvedAffinity(String),
-    /// The projected [`WorkType`] is one [`render_work_type`]
-    /// dispatches to [`render_work_type_todo`] (renders as
+    /// The projected [`WorkType`] is one `render_work_type`
+    /// dispatches to `render_work_type_todo` (renders as
     /// `WorkType::SpinWait /* TODO: ... */`). Spec is NOT runnable
     /// until the user replaces the placeholder with a real builder
     /// call. Counted by [`ReproducerSpec::unresolved_count`].
@@ -241,10 +241,10 @@ impl ReproducerSpec {
     ///    [`ReproducerNote::UnmappedWorkType`] entry by enum kind
     ///    (no substring matching).
     /// 2. Direct check on [`Self::config`]'s `work_type` —
-    ///    [`is_unmapped_work_type`] returns `true` for variants that
-    ///    [`render_work_type`] dispatches to [`render_work_type_todo`].
+    ///    `is_unmapped_work_type` returns `true` for variants that
+    ///    `render_work_type` dispatches to `render_work_type_todo`.
     ///    This catches specs constructed without going through
-    ///    [`generate_spec`] / [`map_work_type`] (e.g. callers that set
+    ///    [`generate_spec`] / `map_work_type` (e.g. callers that set
     ///    `config.work_type` directly), so a manually-built spec with
     ///    `WorkType::CacheYield { .. }` is correctly classified as
     ///    NOT runnable even though no unresolved note was pushed.

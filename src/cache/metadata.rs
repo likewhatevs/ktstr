@@ -257,7 +257,7 @@ impl KernelMetadata {
 /// Bundle of cache artifacts for [`crate::cache::CacheDir::store`].
 ///
 /// The vmlinux path points at the raw (unstripped) ELF. `store()`
-/// strips it internally via [`crate::cache::strip_vmlinux_debug`]
+/// strips it internally via `crate::cache::strip_vmlinux_debug`
 /// and writes the result.
 #[derive(Debug, Clone)]
 #[non_exhaustive]

@@ -109,7 +109,7 @@
 //!
 //! For pointwise assertions against captured stats — the most direct
 //! way to express "this counter is at least N", "this rate is between
-//! A and B", "this metric is finite" — use [`Verdict`] +
+//! A and B", "this metric is finite" — use `Verdict` +
 //! `#[derive(Claim)]` accessors and the [`claim!`] macro:
 //!
 //! ```rust
@@ -749,7 +749,7 @@ pub const KTSTR_KERNEL_ENV: &str = "KTSTR_KERNEL";
 /// expands to multiple stable releases via
 /// [`crate::kernel_path::KernelId::Range`]) before the `exec` into
 /// `cargo nextest`. Read by the test binary's `--list` /
-/// `--exact` handlers in [`crate::test_support::dispatch`] to fan
+/// `--exact` handlers in `crate::test_support::dispatch` to fan
 /// the gauntlet across kernels: each (test × scenario × topology ×
 /// kernel) tuple becomes a distinct nextest test case so
 /// nextest's parallelism, retries, and `-E` filtering work
@@ -807,7 +807,7 @@ pub const KTSTR_KERNEL_PARALLELISM_ENV: &str = "KTSTR_KERNEL_PARALLELISM";
 /// presence of the variable is what matters; the value is ignored)
 /// by the dispatcher in `src/bin/cargo_ktstr/verifier.rs` when the
 /// operator passes `--raw`, and read by
-/// [`crate::test_support::dispatch::run_verifier_cell`] before
+/// `crate::test_support::dispatch::run_verifier_cell` before
 /// formatting via [`crate::verifier::format_verifier_output`].
 ///
 /// Single source of truth so the name is not spelled by hand at
@@ -1112,7 +1112,7 @@ pub(crate) fn resolve_current_exe() -> anyhow::Result<std::path::PathBuf> {
 ///   computed from actual initramfs size after build.
 /// `disk`: optional virtio-blk device backing for `/dev/vda`. When
 ///   `Some`, the framework calls
-///   [`vmm::KtstrVm::builder`]'s `.disk(..)` so the guest probes a
+///   `vmm::KtstrVm::builder`'s `.disk(..)` so the guest probes a
 ///   raw block device sized per `disk.capacity_mib`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_shell(

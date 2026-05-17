@@ -50,7 +50,7 @@ pub fn list_runs() -> Result<()> {
 
 /// Render the metric registry for `cargo ktstr stats list-metrics`.
 ///
-/// Thin wrapper over [`crate::stats::list_metrics`] — exposed through
+/// Thin wrapper over `crate::stats::list_metrics` — exposed through
 /// `cli::` to match the `list_runs` / `compare_partitions` / `show_host`
 /// convention where every stats-subcommand dispatch arm lands on a
 /// `cli::*` helper before reaching the private `stats` module. The
@@ -62,7 +62,7 @@ pub fn list_metrics(json: bool) -> Result<String> {
 /// Render the distinct-value catalogue for the sidecar pool, for
 /// `cargo ktstr stats list-values`.
 ///
-/// Thin wrapper over [`crate::stats::list_values`] — exposed
+/// Thin wrapper over `crate::stats::list_values` — exposed
 /// through `cli::` for the same surface-stability reason as
 /// [`list_metrics`]. The returned `String` is printed verbatim by
 /// the dispatch site.
@@ -72,7 +72,7 @@ pub fn list_values(json: bool, dir: Option<&Path>) -> Result<String> {
 
 /// Compare two filter-defined partitions of the sidecar pool and
 /// report regressions across slicing dimensions. See
-/// [`crate::stats::compare_partitions`] for the full contract.
+/// `crate::stats::compare_partitions` for the full contract.
 pub fn compare_partitions(
     filter_a: &RowFilter,
     filter_b: &RowFilter,

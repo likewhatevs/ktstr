@@ -237,7 +237,7 @@ fn install_spinner_termios_panic_hook() {
 /// restores echo and clears the bar so a panic or early `?`
 /// propagation leaves the terminal in a usable state. Under
 /// `panic = "abort"`, Drop does NOT run on a panic — the panic hook
-/// installed by [`install_spinner_termios_panic_hook`] restores
+/// installed by `install_spinner_termios_panic_hook` restores
 /// termios instead, so the panic message renders cleanly before
 /// SIGABRT kills the process. Note: Drop also does NOT run on
 /// SIGINT/SIGTERM kill; if the spinner is interrupted mid-operation,
@@ -247,7 +247,7 @@ pub struct Spinner {
     pb: Option<indicatif::ProgressBar>,
     /// Saved termios for echo restore. None when stdin is not a tty
     /// or when the spinner is inactive (non-TTY stderr). Owned directly
-    /// (not Arc<Mutex>) because Spinner is not Clone.
+    /// (not `Arc<Mutex>`) because Spinner is not Clone.
     saved_termios: Option<libc::termios>,
 }
 
@@ -437,11 +437,11 @@ impl Spinner {
 impl Drop for Spinner {
     /// Restore terminal echo and clear any live progress bar on drop.
     ///
-    /// [`finish`](Self::finish) calls [`Self::teardown`] and takes
+    /// [`finish`](Self::finish) calls `Self::teardown` and takes
     /// `self.pb` via [`Option::take`], so this impl is a no-op after
     /// an explicit end. When the spinner is dropped implicitly
     /// (panic, `?` propagation, `drop(sp)`, or scope exit), this
-    /// restores the termios saved in [`Self::disable_echo`] and
+    /// restores the termios saved in `Self::disable_echo` and
     /// clears the live bar so stdin is usable afterwards.
     fn drop(&mut self) {
         self.teardown();

@@ -128,7 +128,7 @@ pub struct SidecarResult {
     /// nullable on this struct.
     pub scheduler_commit: Option<String>,
     /// Best-effort git HEAD of the ktstr project tree at sidecar-
-    /// write time. Captured by [`detect_project_commit`] via
+    /// write time. Captured by `detect_project_commit` via
     /// `gix::discover` from the test process's current working
     /// directory; walks up to find the enclosing repo and reads
     /// HEAD short-hex, suffixing `-dirty` when index-vs-HEAD or
@@ -149,7 +149,7 @@ pub struct SidecarResult {
     /// Reader-side: serde's native `Option<T>` deserialize tolerates
     /// absence (a missing key parses as `None`) — see the module-
     /// level doc for the full asymmetric contract. Excluded from
-    /// [`sidecar_variant_hash`] for the same cross-host grouping
+    /// `sidecar_variant_hash` for the same cross-host grouping
     /// reason `scheduler_commit` is excluded: two runs of the same
     /// semantic variant on different ktstr commits must still bucket
     /// together so `stats compare` can diff them; the commit-drift
@@ -239,7 +239,7 @@ pub struct SidecarResult {
     /// observed. Probes via `gix::open` against the kernel
     /// directory resolved from `KTSTR_KERNEL` (not `gix::discover`
     /// — the kernel dir is explicit, not walked-up). Captured by
-    /// [`detect_kernel_commit`] at sidecar-write time.
+    /// `detect_kernel_commit` at sidecar-write time.
     ///
     /// Distinct from sibling fields:
     /// - [`SidecarResult::kernel_version`] — release string read
@@ -268,7 +268,7 @@ pub struct SidecarResult {
     /// Writer always emits (`"kernel_commit": null` on absence);
     /// reader-side, serde's native `Option<T>` deserialize tolerates
     /// absence — see the module-level doc for the full asymmetric
-    /// contract. Excluded from [`sidecar_variant_hash`] for the same
+    /// contract. Excluded from `sidecar_variant_hash` for the same
     /// cross-host grouping reason `scheduler_commit` and
     /// `project_commit` are excluded: two runs of the same semantic
     /// variant on different kernel-source HEADs must still bucket
@@ -318,7 +318,7 @@ pub struct SidecarResult {
     /// long-term migration story.
     pub host: Option<crate::host_context::HostContext>,
     /// Wall-clock milliseconds spent in
-    /// [`KtstrVm::collect_results`](crate::vmm::KtstrVm) — the host-side
+    /// `KtstrVm::collect_results` — the host-side
     /// teardown window from BSP exit through SHM drain (mirrors
     /// [`VmResult::cleanup_duration`](crate::vmm::VmResult::cleanup_duration);
     /// `Duration` is converted to `u64` ms here because every other
@@ -336,8 +336,8 @@ pub struct SidecarResult {
     /// `stats compare` can narrow on (or contrast across) the run
     /// environment without inferring it from `host`.
     ///
-    /// Recorded by [`detect_run_source`] at sidecar-write time:
-    /// - `Some("ci")` when [`KTSTR_CI_ENV`] is set non-empty (CI runner
+    /// Recorded by `detect_run_source` at sidecar-write time:
+    /// - `Some("ci")` when `KTSTR_CI_ENV` is set non-empty (CI runner
     ///   scripts export it before invoking the test binary; local
     ///   runs never set it).
     /// - `Some("local")` otherwise — the default for any sidecar
@@ -346,7 +346,7 @@ pub struct SidecarResult {
     ///   here: a sidecar cannot know it will later be archived. The
     ///   stats CLI applies the `"archive"` tag at LOAD time when its
     ///   `--dir` flag points at a non-default pool root, overriding
-    ///   whatever was on disk via [`apply_archive_source_override`].
+    ///   whatever was on disk via `apply_archive_source_override`.
     ///
     /// `Option<String>` (rather than an enum) keeps the schema
     /// extensible without a serde-version bump if a future producer
@@ -356,7 +356,7 @@ pub struct SidecarResult {
     /// Writer always emits (`"run_source": null` on absence);
     /// reader-side, serde's native `Option<T>` deserialize tolerates
     /// absence — see the module-level doc for the full asymmetric
-    /// contract. Excluded from [`sidecar_variant_hash`] for the same
+    /// contract. Excluded from `sidecar_variant_hash` for the same
     /// cross-host grouping reason `host` is excluded — two runs of
     /// the same semantic variant from different environments must
     /// still bucket together so `stats compare` can diff them;
@@ -753,7 +753,7 @@ pub(crate) fn collect_sidecars_with_errors(
 /// `{project_commit}` is the project tree's HEAD short hex with
 /// `-dirty` suffix when the worktree differs from HEAD) and
 /// concatenates the sidecars each
-/// one yields via [`collect_sidecars`]. The result is a flat
+/// one yields via `collect_sidecars`. The result is a flat
 /// `Vec<SidecarResult>` covering every recorded run on disk —
 /// `cargo ktstr stats compare`'s pool-driven sourcing reads it
 /// once, applies the typed `--a-*` / `--b-*` filters in memory,
@@ -766,7 +766,7 @@ pub(crate) fn collect_sidecars_with_errors(
 /// Returns an empty Vec when `root` does not exist or contains no
 /// run directories. Per-run failure (a corrupt sidecar, a partial
 /// directory) prints a per-file `eprintln!` from
-/// [`collect_sidecars`] and continues — pool-collection never
+/// `collect_sidecars` and continues — pool-collection never
 /// aborts on a single bad file.
 ///
 /// Performance: this is a full filesystem walk over `root`. On a
@@ -1004,13 +1004,13 @@ pub(crate) fn format_kvm_stats(sidecars: &[SidecarResult]) -> String {
 /// the override is set, `serialize_and_write_sidecar` ALSO skips
 /// the per-directory pre-clear so any pre-existing sidecars in
 /// the operator-chosen directory are preserved verbatim — see
-/// [`sidecar_dir_override`].
+/// `sidecar_dir_override`.
 ///
 /// Default: `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{project_commit}/`,
 /// where `{kernel}` is the version detected from `KTSTR_KERNEL`'s
 /// metadata (or `"unknown"` when no kernel is set / detection fails)
 /// and `{project_commit}` is the project-tree HEAD short hex from
-/// [`detect_project_commit`] (with `-dirty` suffix when the worktree
+/// `detect_project_commit` (with `-dirty` suffix when the worktree
 /// differs from HEAD), or `"unknown"` when the test process is not
 /// running inside a git repository or the probe fails. Every sidecar
 /// written from the same `cargo ktstr test` invocation lands in the
@@ -1018,7 +1018,7 @@ pub(crate) fn format_kvm_stats(sidecars: &[SidecarResult]) -> String {
 /// (e.g. re-running the same suite without committing changes) reuse
 /// the same directory, with the second run pre-clearing any
 /// `*.ktstr.json` files left by the first via
-/// [`pre_clear_run_dir_once`] — the directory is a last-writer-wins
+/// `pre_clear_run_dir_once` — the directory is a last-writer-wins
 /// snapshot keyed on (kernel, project commit), not an append-only
 /// archive of every invocation.
 pub fn sidecar_dir() -> PathBuf {
@@ -1131,7 +1131,7 @@ pub(crate) fn is_run_directory(entry: &std::fs::DirEntry) -> bool {
 /// report from my last test run."
 ///
 /// Dotfile-prefixed entries (notably the flock sentinel
-/// subdirectory `.locks/`) are excluded via [`is_run_directory`]
+/// subdirectory `.locks/`) are excluded via `is_run_directory`
 /// so the lock infrastructure cannot claim the "most recent
 /// run" bucket — `.locks/`'s mtime tracks per-write flock
 /// activity and would otherwise eclipse the actual newest run

@@ -214,7 +214,7 @@ pub const BPF_MAP_TYPE_CGRP_STORAGE: u32 = 32;
 
 /// `BPF_MAP_TYPE_ARENA` — sparse, page-granular memory region
 /// shared between BPF programs and userspace. The host-side
-/// walker for arena pages lives in [`super::arena`].
+/// walker for arena pages lives in `super::arena`.
 pub const BPF_MAP_TYPE_ARENA: u32 = 33;
 
 /// `BPF_MAP_TYPE_INSN_ARRAY` — array of bpf instructions used by
@@ -250,7 +250,7 @@ pub struct BpfMapInfo {
     /// source bytes fill the field without a NUL — see the
     /// `if (src == end) return -EINVAL;` guard. So `name_len` is
     /// strictly less than `BPF_OBJ_NAME_LEN` in practice; the
-    /// `unwrap_or(BPF_OBJ_NAME_LEN)` fallback in [`find_all_bpf_maps`]
+    /// `unwrap_or(BPF_OBJ_NAME_LEN)` fallback in `find_all_bpf_maps`
     /// is defense-in-depth against a corrupted guest read, not a
     /// shape the kernel itself produces.
     pub name_len: u8,
@@ -1066,20 +1066,20 @@ fn resolve_to_struct_with_id(btf: &btf_rs::Btf, type_id: u32) -> Option<(btf_rs:
 /// the live-host introspection task in the project queue) and will
 /// plug into the same trait surface.
 ///
-/// - [`GuestMemMapAccessor`] — reads from a frozen guest VM's physical
+/// - `GuestMemMapAccessor` — reads from a frozen guest VM's physical
 ///   memory via PTE walks against the frozen `init_mm`. Used by the
-///   freeze-coordinator path ([`super::dump::dump_state`]) on the
+///   freeze-coordinator path (`super::dump::dump_state`) on the
 ///   in-VM scheduler test runs. Hash map iteration walks
 ///   `bpf_htab.buckets` directly without RCU; the freeze rendezvous
 ///   IS the ordering primitive (every CPU is parked at a known KVM
 ///   exit before the host begins reading memory). Per-CPU value
 ///   reads use the cached `__per_cpu_offset[cpu]` array; out-of-range
 ///   CPUs surface as `None` rather than aliasing CPU 0 (see
-///   [`read_percpu_array_value`]).
+///   `read_percpu_array_value`).
 ///
 /// The planned live-host backend will produce identical
 /// [`BpfMapInfo`] / byte buffers, so the rendering pipeline
-/// ([`super::btf_render::render_value`]) stays data-source-agnostic
+/// (`super::btf_render::render_value`) stays data-source-agnostic
 /// and will consume either accessor through this trait. The
 /// live-host backend's failure modes are different (e.g. hash reads
 /// will rely on the kernel's RCU read-side critical section,
@@ -1087,8 +1087,8 @@ fn resolve_to_struct_with_id(btf: &btf_rs::Btf, type_id: u32) -> Option<(btf_rs:
 /// individual method docs spell those out where they matter.
 ///
 /// `dump_state` currently takes a concrete
-/// [`GuestMemMapAccessor`] because its sdt_alloc post-pass walks
-/// the underlying [`super::guest::GuestKernel`] — that handle is
+/// `GuestMemMapAccessor` because its sdt_alloc post-pass walks
+/// the underlying `super::guest::GuestKernel` — that handle is
 /// not part of the trait surface. When the live-host backend lands
 /// (and sdt_alloc walking moves into a backend-specific path),
 /// `dump_state` will switch to `&dyn BpfMapAccessor`. Other call
@@ -1167,7 +1167,7 @@ pub trait BpfMapAccessor {
     /// Iterate every entry in a `BPF_MAP_TYPE_TASK_STORAGE` map (and
     /// the shape-identical `INODE_STORAGE` / `SK_STORAGE` /
     /// `CGRP_STORAGE` variants — they all use
-    /// [`super::btf_offsets::TaskStorageOffsets`]).
+    /// `super::btf_offsets::TaskStorageOffsets`).
     ///
     /// Returned tuples are `(owner_kva_le_bytes, value_bytes)`:
     /// - `owner_kva_le_bytes` is the 8-byte little-endian encoding of

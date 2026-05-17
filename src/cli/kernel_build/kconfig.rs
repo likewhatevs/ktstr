@@ -357,7 +357,7 @@ pub(super) fn warn_dropped_extra_kconfig_lines(kernel_dir: &Path, extra: &str, c
 }
 
 /// Checks each non-empty line of the fragment against the current
-/// `.config` via [`all_fragment_lines_present`]. If every fragment
+/// `.config` via `all_fragment_lines_present`. If every fragment
 /// line already appears in `.config`, the file is not touched
 /// (preserving mtime for make's dependency tracking). If any are
 /// missing, appends the full fragment and runs `make olddefconfig`

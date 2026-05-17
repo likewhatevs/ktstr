@@ -330,7 +330,7 @@ pub enum TopologyParseError {
 /// through [`Display`](#impl-Display-for-Topology) → `FromStr`. A
 /// `Topology` built via [`Topology::with_nodes`] or chained with
 /// [`Topology::distances`] loses its per-node config + custom distance
-/// matrix through [`Display`] (which serializes only the 4 primitives);
+/// matrix through `Display` (which serializes only the 4 primitives);
 /// `FromStr` cannot reconstruct that information and produces a uniform
 /// `Topology` instead. Use the `Topology` value directly when full
 /// fidelity is required.

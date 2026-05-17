@@ -50,7 +50,7 @@ use super::{
 /// Each parsed [`SortKey`] stores the matched registry name as
 /// `&'static str` (not a copy of the user's input), so downstream
 /// equality with [`CtprofMetricDef::name`] or
-/// [`DerivedMetricDef::name`] is a content-equality check
+/// `DerivedMetricDef::name` is a content-equality check
 /// (`str::eq`) over the same registry-owned bytes — no per-key
 /// allocation outlives this call. The two registries are
 /// disjoint, so a name resolves unambiguously to one or the
@@ -787,7 +787,7 @@ fn flush_section(result: &mut String, header: Option<&str>, lines: &[&str], limi
 
 impl DisplayOptions {
     /// Resolved compare-side column set: `columns` if
-    /// non-empty, otherwise [`compare_columns_for`] over
+    /// non-empty, otherwise `compare_columns_for` over
     /// `format`. `--columns` always wins over the format
     /// shorthand (explicit > shorthand) per the design call.
     pub fn resolved_compare_columns(&self) -> Vec<Column> {
@@ -799,7 +799,7 @@ impl DisplayOptions {
     }
 
     /// Resolved show-side column set: `columns` if non-empty,
-    /// otherwise [`show_columns_default`].
+    /// otherwise `show_columns_default`.
     pub fn resolved_show_columns(&self) -> Vec<Column> {
         if self.columns.is_empty() {
             show_columns_default()

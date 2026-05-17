@@ -9,9 +9,9 @@
 //! - [`normalize_verifier_line`] — strip variable register state annotations
 //! - [`detect_cycle`] / [`collapse_cycles`] — loop iteration compression
 //! - [`build_b_map`] / [`build_diff_rows`] — A/B comparison helpers
-//! - [`SCHED_OUTPUT_START`] / [`SCHED_OUTPUT_END`] — COM2 delimiters
+//! - `SCHED_OUTPUT_START` / `SCHED_OUTPUT_END` — COM2 delimiters
 //!   written by the guest's rust_init around the scheduler log region;
-//!   [`parse_sched_output`] extracts the enclosed block
+//!   `parse_sched_output` extracts the enclosed block
 
 use std::collections::HashMap;
 
@@ -111,7 +111,7 @@ pub struct VerifierStats {
     /// Total verification wall time in microseconds, when
     /// BPF_LOG_STATS emitted a "verification time" line.
     pub time_usec: Option<u64>,
-    /// Stack depth in the format "<prog>+<subprog>+<main>" (e.g.
+    /// Stack depth in the format `"<prog>+<subprog>+<main>"` (e.g.
     /// `"32+16+8"`) when BPF_LOG_STATS emitted a "stack depth" line.
     pub stack_depth: Option<String>,
 }
@@ -573,7 +573,7 @@ pub struct VerifierVmResult {
 /// at the call site, preventing position-swap misorders. Callers
 /// from the sweep dispatch pass per-cell topologies derived from
 /// declared constraints. Single-CPU baseline callers pass
-/// [`TopologyJson::SINGLE_CPU`].
+/// `TopologyJson::SINGLE_CPU`.
 pub fn collect_verifier_output(
     sched_bin: &std::path::Path,
     ktstr_bin: &std::path::Path,

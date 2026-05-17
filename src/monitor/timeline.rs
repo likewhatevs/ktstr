@@ -251,7 +251,7 @@ fn decode_raw(raw: &TimelineEventRaw) -> TimelineEvent {
 /// raw bytes (concatenated 40-byte records, in ringbuf order) plus
 /// the BSS-side drop count. The dump consumer parses the buffer
 /// into [`TimelineEvent`] values and surfaces both alongside
-/// [`super::dump::FailureDumpReport::timeline_events`] /
+/// `super::dump::FailureDumpReport::timeline_events` /
 /// `timeline_drops`.
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
@@ -300,7 +300,7 @@ pub struct IncrementalSnapshot {
     pub monotonic_ns: u64,
     /// Raw captured bytes. Shape is producer-defined: typically
     /// the `.bss` value buffer of the scheduler's BPF object,
-    /// concatenated with a serialized [`super::scx_walker`]
+    /// concatenated with a serialized `super::scx_walker`
     /// snapshot. The renderer treats it as opaque until
     /// trigger time.
     pub bytes: Vec<u8>,

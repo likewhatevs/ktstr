@@ -127,7 +127,7 @@ impl Funifier {
     /// binary build) produce identical fun names for the same
     /// inputs. Different seeds give independent mappings.
     ///
-    /// Uses SHA-256 over the fixed [`FUN_PEPPER`] || seed bytes,
+    /// Uses SHA-256 over the fixed `FUN_PEPPER` || seed bytes,
     /// truncated to 128 bits for SipHash. Not cryptographic but
     /// sufficient for the deterministic-mapping contract.
     pub fn with_seed(seed: &str) -> Self {

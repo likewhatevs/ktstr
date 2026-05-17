@@ -160,7 +160,7 @@
 //!   [`GaugeNs`] / [`GaugeCount`] / [`OrdinalI32`] /
 //!   [`OrdinalU32`] / [`OrdinalU64`] / [`CategoricalString`] /
 //!   [`CpuSet`]. The trait is sealed via
-//!   [`sealed::SummableSealed`] so a downstream crate cannot add
+//!   `sealed::SummableSealed` so a downstream crate cannot add
 //!   `impl Summable for PeakNs` to bypass the category invariant.
 //! - [`Maxable`] — reduce by max. Implemented by [`PeakNs`]
 //!   (max-of-peak is "worst peak any contributor saw across its
@@ -177,7 +177,7 @@
 //!   [`CategoricalString`] (string max has no useful semantic),
 //!   nor by [`CpuSet`] (the affinity reduction is a custom
 //!   summary, not a bare max). Sealed via
-//!   [`sealed::MaxableSealed`].
+//!   `sealed::MaxableSealed`.
 //!
 //!   `max_across` returns `Option<Self>`: `None` for an empty
 //!   iterator (so callers can distinguish "no contributors" from
@@ -189,10 +189,10 @@
 //!   this is an empty-iterator check, not an arithmetic check.
 //! - [`Modeable`] — reduce by mode (most-frequent value).
 //!   Implemented by [`CategoricalString`] only. Sealed via
-//!   [`sealed::ModeableSealed`].
+//!   `sealed::ModeableSealed`.
 //! - [`Rangeable`] — reduce by `[min, max]`. Implemented by
 //!   [`OrdinalI32`], [`OrdinalU32`], and [`OrdinalU64`]. Sealed
-//!   via [`sealed::RangeableSealed`]. `range_across` returns
+//!   via `sealed::RangeableSealed`. `range_across` returns
 //!   `Option<Range<Self>>` — the [`Range`] newtype enforces
 //!   `min ≤ max` at construction so a downstream consumer cannot
 //!   observe a swapped pair.
@@ -453,7 +453,7 @@ pub struct PeakNs(pub u64);
 ///
 /// The kernel's taskstats interface (`/proc/<tid>/stat` does NOT
 /// expose these — they require the genetlink TASKSTATS_CMD_GET
-/// path; see [`crate::taskstats::TaskstatsClient`]) carries
+/// path; see `crate::taskstats::TaskstatsClient`) carries
 /// `hiwater_rss` and `hiwater_vm` as KB-truncated lifetime
 /// watermarks. The capture pipeline multiplies by 1024 at the
 /// boundary so the wire-format value is in bytes, matching the
@@ -804,7 +804,7 @@ mod sealed {
 /// reductions are category errors and a generic site bound on
 /// `T: Summable` will reject them at compile time.
 ///
-/// Sealed via [`sealed::SummableSealed`]: a downstream crate
+/// Sealed via `sealed::SummableSealed`: a downstream crate
 /// cannot write `impl Summable for PeakNs` because the sealed
 /// supertrait is private to this module.
 ///
@@ -903,7 +903,7 @@ pub trait Summable: sealed::SummableSealed + Sized + Copy {
 /// nor by [`CpuSet`] (the affinity reduction is a custom
 /// summary, not a bare max).
 ///
-/// Sealed via [`sealed::MaxableSealed`]: a downstream crate
+/// Sealed via `sealed::MaxableSealed`: a downstream crate
 /// cannot write `impl Maxable for CategoricalString` because the
 /// sealed supertrait is private to this module.
 ///
@@ -941,7 +941,7 @@ pub trait Maxable: sealed::MaxableSealed + Sized + Copy + Ord {
 /// [`crate::ctprof_compare::AggRule::Mode`] contract:
 /// "lexicographically smaller wins" for equal-frequency strings.
 ///
-/// Sealed via [`sealed::ModeableSealed`]: a downstream crate
+/// Sealed via `sealed::ModeableSealed`: a downstream crate
 /// cannot write `impl Modeable for u64` because the sealed
 /// supertrait is private to this module.
 #[diagnostic::on_unimplemented(
@@ -1080,7 +1080,7 @@ impl<T: PartialOrd> Range<T> {
 /// separately while walking the input, so the constructor
 /// invariant is satisfied by construction.
 ///
-/// Sealed via [`sealed::RangeableSealed`]: a downstream crate
+/// Sealed via `sealed::RangeableSealed`: a downstream crate
 /// cannot write `impl Rangeable for u64` because the sealed
 /// supertrait is private to this module.
 #[diagnostic::on_unimplemented(

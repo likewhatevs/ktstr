@@ -957,13 +957,13 @@ fn default_cpu_budget(allowed_cpus: usize) -> usize {
 /// Bounded to `1..=usize::MAX` at the constructor — a cap of 0 is
 /// nonsensical (reserving zero CPUs is just "don't run") and
 /// rejected upstream by the CLI layer, but we enforce the bound in
-/// the type system via [`NonZeroUsize`] so callers can
+/// the type system via `NonZeroUsize` so callers can
 /// `CpuCap::new(...)?` without a follow-up bounds check.
 ///
 /// The runtime upper bound — "don't exceed the process's allowed
 /// CPU count" — is enforced at acquire time via
 /// [`CpuCap::effective_count`] because the allowed set is not known
-/// until [`host_allowed_cpus`] reads `sched_getaffinity`.
+/// until `host_allowed_cpus` reads `sched_getaffinity`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuCap {
     n: std::num::NonZeroUsize,
@@ -972,7 +972,7 @@ pub struct CpuCap {
 impl CpuCap {
     /// Construct from a raw `usize` CPU count. Returns `Err` on `0`;
     /// `usize::MAX` is accepted here and clamped later by
-    /// [`effective_count`].
+    /// `effective_count`.
     pub fn new(n: usize) -> Result<Self> {
         std::num::NonZeroUsize::new(n)
             .map(|n| CpuCap { n })
@@ -982,7 +982,7 @@ impl CpuCap {
     /// Three-tier resolution: explicit CLI flag wins over env var,
     /// which wins over "not set". Returns `None` when neither is
     /// present, meaning "use the 30% default of the allowed CPU set"
-    /// (see [`default_cpu_budget`]).
+    /// (see `default_cpu_budget`).
     ///
     /// Env var is `KTSTR_CPU_CAP` (integer ≥ 1, CPU count). An empty
     /// or unset env var is treated as absent; a non-numeric value
@@ -1017,10 +1017,10 @@ impl CpuCap {
 
     /// Runtime-bounded cap: returns the inner count unless it exceeds
     /// `allowed_cpus` (the calling process's sched_getaffinity cpuset
-    /// count), in which case a [`ResourceContention`] error steers
+    /// count), in which case a `ResourceContention` error steers
     /// the caller toward an actionable message. This check lives at
     /// acquire time — not at construction — because the allowed set
-    /// is not known until [`host_allowed_cpus`] reads the syscall.
+    /// is not known until `host_allowed_cpus` reads the syscall.
     pub fn effective_count(&self, allowed_cpus: usize) -> Result<usize> {
         let n = self.n.get();
         if n > allowed_cpus {

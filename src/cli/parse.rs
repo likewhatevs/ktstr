@@ -76,7 +76,7 @@ pub fn parse_topology_string(topology: &str) -> Result<(u32, u32, u32, u32)> {
 ///
 /// The output unit is MiB to match
 /// [`crate::vmm::disk_config::DiskConfig::capacity_mib`] (despite the
-/// field name, [`DiskConfig::capacity_bytes`] left-shifts by 20 — i.e.
+/// field name, `DiskConfig::capacity_bytes` left-shifts by 20 — i.e.
 /// the field is MiB, not SI MB). A future rename of that field would
 /// land in this function in lockstep.
 pub fn parse_disk_size_mib(s: &str) -> Result<u32> {

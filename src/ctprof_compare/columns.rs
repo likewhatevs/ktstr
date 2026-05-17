@@ -39,7 +39,7 @@
 
 use super::{CTPROF_DERIVED_METRICS, CTPROF_METRICS, GroupBy};
 
-/// Per-row display layout for [`write_diff`].
+/// Per-row display layout for `write_diff`.
 ///
 /// `Full` (default) emits the seven-column form
 /// `(group | threads | metric | baseline | candidate | delta | %)`.
@@ -54,7 +54,7 @@ use super::{CTPROF_DERIVED_METRICS, CTPROF_METRICS, GroupBy};
 /// dedicated Delta + Pct + Uptime columns (not fused into the
 /// arrow cell itself), so the renderer keeps the deltas
 /// readable on either side of the arrow form. The arrow cell
-/// shape mirrors [`cgroup_cell`]'s so primary and cgroup tables
+/// shape mirrors `cgroup_cell`'s so primary and cgroup tables
 /// stay visually consistent.
 ///
 /// [`Arrow`]: DisplayFormat::Arrow
@@ -308,14 +308,14 @@ pub fn parse_columns(spec: &str, compare_side: bool) -> anyhow::Result<Vec<Colum
     Ok(out)
 }
 
-/// One sub-table emitted by [`write_diff`] / `write_show`.
+/// One sub-table emitted by `write_diff` / `write_show`.
 /// `--sections` filters which sub-tables render — every section
 /// not in the filter is suppressed before its emission gate
 /// (zero-suppression, group-by-cgroup gating, etc.) runs, so a
 /// section that would otherwise emit when its data is present
 /// stays silent when omitted from the filter.
 ///
-/// Variant order tracks the rendering order in [`write_diff`]
+/// Variant order tracks the rendering order in `write_diff`
 /// and `write_show` so iteration over [`Section::ALL`] walks
 /// the table in the order the operator sees it. The
 /// [`Self::cli_name`] tokens are the spelling accepted by
@@ -359,7 +359,7 @@ pub enum Section {
     /// rows are keyed per pcomm pattern under default
     /// normalization (matching the [`GroupBy::Pcomm`] join key)
     /// or per literal `pcomm[tgid]` PID under
-    /// [`CompareOptions::no_thread_normalize`]; show-side rows
+    /// `CompareOptions::no_thread_normalize`; show-side rows
     /// are emitted per-PID directly off each captured leader
     /// thread.
     Smaps,
@@ -375,21 +375,21 @@ pub enum Section {
     /// `irq_delay_*`) plus the two memory watermarks
     /// (`hiwater_rss_bytes`, `hiwater_vm_bytes`). Renders inside
     /// the primary table alongside [`Section::Primary`] rows;
-    /// each [`CtprofMetricDef`] carries a [`Self`] tag in its
-    /// [`CtprofMetricDef::section`] field, and the primary
+    /// each `CtprofMetricDef` carries a [`Self`] tag in its
+    /// `CtprofMetricDef::section` field, and the primary
     /// table emitter checks
-    /// [`DisplayOptions::is_section_enabled`] per row so
+    /// `DisplayOptions::is_section_enabled` per row so
     /// `--sections taskstats-delay` shows only the taskstats
     /// rows, `--sections primary` excludes them, and either
     /// alone keeps the primary table open. Captured via the
-    /// kernel's TASKSTATS family in [`crate::taskstats`].
+    /// kernel's TASKSTATS family in `crate::taskstats`.
     TaskstatsDelay,
 }
 
 impl Section {
     /// Every variant in rendering order. Single source of
     /// truth — `parse_sections` walks this slice to validate
-    /// names and the [`DisplayOptions::is_section_enabled`]
+    /// names and the `DisplayOptions::is_section_enabled`
     /// default-empty case treats it as "all on."
     pub const ALL: &'static [Section] = &[
         Section::Primary,
@@ -463,7 +463,7 @@ impl Section {
 /// Diagnostic shape per cgroup-only entry: one line of the
 /// form `section 'X' requires --group-by cgroup; omitted under
 /// --group-by Y`. The text is pinned by
-/// [`format_cgroup_only_section_warning`] so a wording drift
+/// `format_cgroup_only_section_warning` so a wording drift
 /// surfaces in unit tests rather than at the operator's
 /// terminal.
 pub fn warn_cgroup_only_sections_under_non_cgroup(sections: &[Section], group_by: GroupBy) {
@@ -510,7 +510,7 @@ fn group_by_cli_name(group_by: GroupBy) -> &'static str {
 /// Format: comma-separated names matching [`Section::cli_name`].
 /// Whitespace around each name is trimmed. Empty input parses
 /// to an empty `Vec` — caller treats that as "every section
-/// renders" via [`DisplayOptions::is_section_enabled`].
+/// renders" via `DisplayOptions::is_section_enabled`.
 ///
 /// Errors (mirrored from [`parse_columns`] so the two CLI
 /// surfaces report drift identically):
@@ -565,7 +565,7 @@ pub fn parse_sections(spec: &str) -> anyhow::Result<Vec<Section>> {
 /// [`CTPROF_DERIVED_METRICS`]. Whitespace around each name
 /// is trimmed. Empty input parses to an empty `Vec` — caller
 /// treats that as "every metric renders" via
-/// [`DisplayOptions::is_metric_enabled`], mirroring
+/// `DisplayOptions::is_metric_enabled`, mirroring
 /// [`parse_sections`]'s empty-input semantic.
 ///
 /// The returned `&'static str`s point into the registry's own

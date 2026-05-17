@@ -4,7 +4,7 @@
 //!
 //!  - LLC reservation locks at `{lock_dir}/ktstr-llc-{N}.lock` and
 //!    per-CPU locks at `{lock_dir}/ktstr-cpu-{C}.lock` where
-//!    `lock_dir` is resolved by [`crate::cache::resolve_lock_dir`]
+//!    `lock_dir` is resolved by `crate::cache::resolve_lock_dir`
 //!    (`KTSTR_LOCK_DIR` env var, fallback `/tmp`). See
 //!    `crate::vmm::host_topology::acquire_resource_locks` and
 //!    friends.
@@ -17,7 +17,7 @@
 //!    `make` invocations against the same kernel source checkout.
 //!  - Observational enumeration from `ktstr locks --json` — a
 //!    read-only scan that does NOT acquire flocks; reads
-//!    /proc/locks through [`read_holders`] to attribute holders
+//!    /proc/locks through `read_holders` to attribute holders
 //!    without contending with active acquirers.
 //!
 //! All four share:
@@ -50,20 +50,20 @@
 //!
 //! Needle production:
 //!
-//! [`needle_from_path`] resolves `path` to the mount-point covering
+//! `needle_from_path` resolves `path` to the mount-point covering
 //! it via `/proc/self/mountinfo` (longest-prefix match on the
 //! `mount_point` field), then reads the `{major:minor}` field of
 //! that mount entry. Combines with `stat().st_ino` for the full
 //! triple. The mountinfo `{major:minor}` is the kernel's
 //! `i_sb->s_dev` verbatim, so the resulting needle matches
 //! /proc/locks by construction. The needle feeds
-//! [`read_holders_for_needle`], which scans `/proc/locks` exactly
+//! `read_holders_for_needle`, which scans `/proc/locks` exactly
 //! once and byte-compares.
 //!
 //! # Remote-filesystem rejection
 //!
 //! [`try_flock`] refuses to operate on NFS / CIFS / SMB2 / CEPH /
-//! AFS / FUSE (see [`reject_remote_fs`]). `flock(2)` on those
+//! AFS / FUSE (see `reject_remote_fs`). `flock(2)` on those
 //! filesystems is either advisory-only under some server
 //! configurations (NFSv3 without NLM coordination) or silently
 //! returns success without serializing peers (FUSE when the
@@ -112,7 +112,7 @@ pub enum FlockMode {
 ///
 /// Cmdline is read from `/proc/{pid}/cmdline`, NUL-separated by the
 /// kernel, lossy-UTF-8 decoded, `\0 → space`, and truncated to
-/// [`CMDLINE_MAX_CHARS`] chars with a `…` marker so a log line remains
+/// `CMDLINE_MAX_CHARS` chars with a `…` marker so a log line remains
 /// single-line. A missing / racing / permission-denied
 /// `/proc/{pid}/cmdline` produces `"<cmdline unavailable>"` so the pid
 /// still surfaces with diagnostic value.
@@ -284,7 +284,7 @@ pub(crate) fn materialize<P: AsRef<Path>>(path: P) -> Result<()> {
 /// `OwnedFd::drop` runs, producing phantom holders the next acquirer
 /// would blame on the wrong pid.
 ///
-/// Calls [`reject_remote_fs`] before the open to fail-fast on NFS /
+/// Calls `reject_remote_fs` before the open to fail-fast on NFS /
 /// CIFS / SMB2 / CEPH / AFS / FUSE — see the module-level rationale.
 ///
 /// Accepts any `AsRef<Path>` so `&str`, `&Path`, `&PathBuf`, and
@@ -780,7 +780,7 @@ fn holder_info_for_pid(pid: u32) -> HolderInfo {
 }
 
 /// Format a [`HolderInfo`] slice for inclusion in user-facing error
-/// strings. Empty slice yields [`NO_HOLDERS_RECORDED`] so the
+/// strings. Empty slice yields `NO_HOLDERS_RECORDED` so the
 /// diagnostic is unambiguous — a stale lockfile whose holder has
 /// exited presents as empty, and the error should say so rather than
 /// print a misleading blank. Non-empty renders one

@@ -207,7 +207,7 @@ pub struct CtprofSnapshot {
     /// the kernel was built without `CONFIG_TASKSTATS`" (the
     /// netlink open failed up-front so every counter is zero)
     /// from "no taskstats data because `CAP_NET_ADMIN` is missing"
-    /// (high `eperm_count`). See [`crate::taskstats::TaskstatsSummary`]
+    /// (high `eperm_count`). See `crate::taskstats::TaskstatsSummary`
     /// for the per-counter semantics and remediation guidance.
     pub taskstats_summary: Option<crate::taskstats::TaskstatsSummary>,
 
@@ -655,7 +655,7 @@ pub struct ThreadState {
     /// namespace visibility that varies per caller.
     ///
     /// Kept as `cgroup` (not renamed to `cgroup_ns_relative`)
-    /// for consistency with [`GroupBy::Cgroup`],
+    /// for consistency with `GroupBy::Cgroup`,
     /// `cgroup_flatten`, `cgroup_stats`, and every CLI flag
     /// that threads the same concept through the comparison
     /// layer; a rename would cascade through every pinned
@@ -701,7 +701,7 @@ pub struct ThreadState {
     pub policy: crate::metric_types::CategoricalString,
     /// Nice value in the standard [-20, 19] range. Signed i32
     /// because the range includes negative values and
-    /// [`parse_stat`] extracts the field via `get_i32` on
+    /// `parse_stat` extracts the field via `get_i32` on
     /// procfs's decimal text — the inner type matches the
     /// extraction path and the kernel-visible range without
     /// coercion. Wrapped in [`crate::metric_types::OrdinalI32`]
@@ -1544,9 +1544,9 @@ impl Default for ThreadState {
     /// into HashMap entries before the /proc walk populates them
     /// from the live kernel state. Default-constructed ThreadState
     /// values are NOT visible to operator-facing output: the
-    /// capture path in [`capture_thread_at_with_tally`]
+    /// capture path in `capture_thread_at_with_tally`
     /// (which delegates to the per-file `/proc` read helpers in
-    /// [`parse`]) overwrites each field from
+    /// `parse`) overwrites each field from
     /// `/proc/<pid>/task/<tid>/{stat,status,schedstat,cgroup}` before
     /// the entry is read for rendering. The `state` char uses the
     /// `'~'` absent-value sentinel rather than the bare `char`

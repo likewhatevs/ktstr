@@ -33,7 +33,7 @@ use std::num::NonZeroU64;
 /// to live on a reflink-capable filesystem (btrfs or xfs) — the
 /// per-test fan-out uses `FICLONE` to clone the cached template
 /// image and would fail on tmpfs/ext4. The host must also have the
-/// formatter named by [`Self::mkfs_binary_name`] on `PATH` at
+/// formatter named by `Self::mkfs_binary_name` on `PATH` at
 /// template-build time so the template-VM initramfs can pack it.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
@@ -47,15 +47,15 @@ pub enum Filesystem {
     /// btrfs filesystem. Per-test backing is a reflink clone of a
     /// host-cached, guest-formatted btrfs image at the configured
     /// capacity. On cache miss
-    /// [`crate::vmm::disk_template::ensure_template`] boots a one-shot
+    /// `crate::vmm::disk_template::ensure_template` boots a one-shot
     /// template VM that runs `mkfs.btrfs /dev/vda` inside the guest,
     /// caches the formatted image under the ktstr cache root, and
     /// returns the cached path. On cache hit
-    /// [`crate::vmm::disk_template::clone_to_per_test`] FICLONE-clones
+    /// `crate::vmm::disk_template::clone_to_per_test` FICLONE-clones
     /// the cached template into a per-test tempfile under the same
     /// cache filesystem. The cache directory must live on a btrfs/xfs
     /// mount, and `mkfs.btrfs` must be on the host `PATH` at
-    /// template-build time. See [`crate::vmm::disk_template`].
+    /// template-build time. See `crate::vmm::disk_template`.
     Btrfs,
 }
 
@@ -184,7 +184,7 @@ impl Filesystem {
 /// # Constraint summary
 ///
 /// Both rules are enforced by [`DiskThrottle::validate`] (run by
-/// [`crate::vmm::KtstrVmBuilder::build`] before the backing file is
+/// `crate::vmm::KtstrVmBuilder::build` before the backing file is
 /// allocated):
 ///
 /// - `*_burst_capacity` must be `>= *_refill_rate` when both are
@@ -422,7 +422,7 @@ pub struct DiskConfig {
     /// Sized to accommodate common guest filesystem formatters;
     /// smaller values are accepted but may cause `mkfs` failures
     /// inside the template VM (see
-    /// [`crate::vmm::disk_template::build_template_via_vm`]) for
+    /// `crate::vmm::disk_template::build_template_via_vm`) for
     /// `Filesystem::Btrfs`.
     pub capacity_mib: u32,
     /// Filesystem to format the per-test backing with. `Raw` leaves
@@ -444,7 +444,7 @@ pub struct DiskConfig {
     /// Opt out of guest-side auto-mount. Default `false` means a
     /// non-`Raw` disk is auto-mounted at `/mnt/disk0` by the guest
     /// init (see
-    /// [`crate::vmm::rust_init::auto_mount_data_disks`]); setting
+    /// `crate::vmm::rust_init::auto_mount_data_disks`); setting
     /// `true` suppresses the auto-mount cmdline tokens and leaves
     /// `/dev/vda` raw to the test author. Has no effect for
     /// `Filesystem::Raw` disks (there is nothing to mount). The
@@ -459,7 +459,7 @@ impl Default for DiskConfig {
     /// keeps the on-host cost minimal — no template-VM build, no
     /// cache directory required — and the per-test backing is a
     /// fresh sparse `tempfile()` per VM (see
-    /// [`crate::vmm::KtstrVm::init_virtio_blk`]).
+    /// `crate::vmm::KtstrVm::init_virtio_blk`).
     ///
     /// # Memory footprint
     ///
@@ -484,7 +484,7 @@ impl Default for DiskConfig {
 
 impl DiskConfig {
     /// Set capacity in mebibytes (MiB). The argument is interpreted
-    /// as binary mebibytes per [`Self::capacity_bytes`], not decimal
+    /// as binary mebibytes per `Self::capacity_bytes`, not decimal
     /// megabytes.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn capacity_mib(mut self, mib: u32) -> Self {
@@ -496,13 +496,13 @@ impl DiskConfig {
     ///
     /// `Filesystem::Raw` (the default) leaves the device unformatted.
     /// `Filesystem::Btrfs` routes through
-    /// [`crate::vmm::disk_template::ensure_template`]: on cache miss
+    /// `crate::vmm::disk_template::ensure_template`: on cache miss
     /// the framework boots a one-shot template VM that runs
     /// `mkfs.btrfs` inside the guest, caches the formatted image,
     /// and per-test boots reflink-clone it. The lifecycle requires
     /// a reflink-capable cache directory (btrfs or xfs) and a host
     /// `mkfs.btrfs` binary on `PATH` at template-build time. See
-    /// the module-level docs and [`crate::vmm::disk_template`].
+    /// the module-level docs and `crate::vmm::disk_template`.
     ///
     /// # Disk-template lifecycle
     ///
@@ -511,22 +511,22 @@ impl DiskConfig {
     /// explicitly:
     ///
     /// 1. **Cache lookup** —
-    ///    [`disk_template::ensure_template`](crate::vmm::disk_template::ensure_template)
+    ///    `disk_template::ensure_template`
     ///    keys off `(filesystem, capacity)` and returns the cached
     ///    image path on hit. See the module docs at
-    ///    [`crate::vmm::disk_template`] for the cache-key encoding
+    ///    `crate::vmm::disk_template` for the cache-key encoding
     ///    and on-disk layout.
     /// 2. **Template build (cache miss)** —
-    ///    [`disk_template::build_template_via_vm`](crate::vmm::disk_template::build_template_via_vm)
+    ///    `disk_template::build_template_via_vm`
     ///    boots a one-shot guest with the host's `mkfs.btrfs` packed
     ///    into the initramfs; the guest formats `/dev/vda` against
     ///    a sparse staging image, and the framework atomically moves
     ///    the formatted image into the cache via
-    ///    [`disk_template::store_atomic`](crate::vmm::disk_template::store_atomic).
+    ///    `disk_template::store_atomic`.
     ///    The host never execs `mkfs.btrfs` against a real backing
     ///    file — the guest kernel is the on-disk-format authority.
     /// 3. **Per-test fan-out** —
-    ///    [`disk_template::clone_to_per_test`](crate::vmm::disk_template::clone_to_per_test)
+    ///    `disk_template::clone_to_per_test`
     ///    `FICLONE`-clones the cached image into a tempfile under
     ///    the cache root. The clone is O(metadata) and copy-on-write
     ///    at the extent level, so per-test writes never touch the
@@ -534,9 +534,9 @@ impl DiskConfig {
     ///
     /// Stage 3 requires the cache directory to live on a reflink-
     /// capable filesystem (btrfs or xfs); see
-    /// [`disk_template::verify_cache_dir_supports_reflink`](crate::vmm::disk_template::verify_cache_dir_supports_reflink)
+    /// `disk_template::verify_cache_dir_supports_reflink`
     /// for the gate and
-    /// [`crate::vmm::KtstrVmBuilder::disk`] for the full
+    /// `crate::vmm::KtstrVmBuilder::disk` for the full
     /// builder-side wiring.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn filesystem(mut self, fs: Filesystem) -> Self {
@@ -645,7 +645,7 @@ impl DiskConfig {
 
     /// Suppress the guest-side auto-mount of this disk. Default
     /// behavior auto-mounts a non-`Raw` disk at the path returned
-    /// by [`Self::auto_mount_path`]; calling this method flips
+    /// by `Self::auto_mount_path`; calling this method flips
     /// the flag on. Useful for tests that want raw access to
     /// `/dev/vda` after a host-driven mkfs (e.g. mount-option
     /// fuzzing, deliberate mount-failure injection, manual
@@ -653,10 +653,10 @@ impl DiskConfig {
     ///
     /// No-op for `Filesystem::Raw` disks (there is nothing to
     /// mount). The flag is honored at cmdline-emission time in
-    /// [`crate::vmm::KtstrVmBuilder::build`]: when set, the
+    /// `crate::vmm::KtstrVmBuilder::build`: when set, the
     /// `KTSTR_DISK0_FS` / `KTSTR_DISK0_MOUNT` / `KTSTR_DISK0_RO`
     /// tokens are not emitted, and the guest's
-    /// [`crate::vmm::rust_init::auto_mount_data_disks`] short-
+    /// `crate::vmm::rust_init::auto_mount_data_disks` short-
     /// circuits at the missing-token check.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn no_auto_mount(mut self) -> Self {

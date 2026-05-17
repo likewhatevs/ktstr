@@ -3,10 +3,10 @@
 //!
 //! [`export_test`] is the entry point invoked from the test binary's
 //! `#[ctor]` dispatch (see
-//! [`crate::test_support::dispatch::maybe_dispatch_export`]) when
+//! `crate::test_support::dispatch::maybe_dispatch_export`) when
 //! `cargo ktstr export` exec's the binary with
 //! `--ktstr-export-test=NAME`. The export pipeline locates the named
-//! test in the [`KTSTR_TESTS`] distributed slice, gathers the
+//! test in the `KTSTR_TESTS` distributed slice, gathers the
 //! binaries it needs (the running test binary itself via
 //! `current_exe()`, the scheduler binary, and per-test include
 //! files), tarballs them with gzip, and emits a single shell script:

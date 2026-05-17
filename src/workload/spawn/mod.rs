@@ -274,7 +274,7 @@ pub(super) fn warn_setpriority_failed_once() {
 ///   a missing field cannot be distinguished from a real-zero field at
 ///   the reader. Consumers that need "was this field actually set"
 ///   must track presence out-of-band (e.g. whether the work type
-///   populates the field per [`wake_latencies_ns`]'s doc).
+///   populates the field per `wake_latencies_ns`'s doc).
 ///
 /// Decision: keep the `Default` impl. Sentinel ergonomics outweigh
 /// the distinguishability cost — every real consumer already knows
@@ -405,7 +405,7 @@ pub struct WorkerReport {
     pub schedstat_run_delay_ns: u64,
     /// Delta of /proc/self/schedstat field 3 (pcount — number of
     /// times the task was scheduled in over the work loop). This is
-    /// NOT a context-switch count; /proc/<pid>/status's
+    /// NOT a context-switch count; `/proc/<pid>/status`'s
     /// `voluntary_ctxt_switches` / `nonvoluntary_ctxt_switches` are
     /// the true context-switch counters and are not read here.
     pub schedstat_run_count: u64,
@@ -4401,7 +4401,7 @@ impl WorkloadHandle {
     /// [`start()`](Self::start) first so the worker reaches its
     /// `gettid()` publish before reading.
     ///
-    /// Bails for [`ForkedChildKind::PcommContainer`] entries: the
+    /// Bails for `ForkedChildKind::PcommContainer` entries: the
     /// container's tgid leader pid is the only kernel handle the
     /// parent holds for that group, but `sched_setaffinity` against
     /// that pid pins only the leader thread (a placeholder thread
@@ -4511,14 +4511,14 @@ impl WorkloadHandle {
     /// # Shutdown latency
     ///
     /// Workers spend their steady-state time blocked inside a
-    /// `futex_wait` with timeout [`WORKER_STOP_POLL_NS`] (~100 ms).
+    /// `futex_wait` with timeout `WORKER_STOP_POLL_NS` (~100 ms).
     /// The "stop signal" is a per-mode flag the worker checks on
     /// every futex-wait wake; the wake interval bounds shutdown
     /// latency.
     ///
     /// _Fork mode_ — `stop_and_collect` sends SIGUSR1 to each
     /// worker pid; the per-process `sigusr1_handler` flips the
-    /// global [`STOP`] in that worker's CoW address space, and the
+    /// global `STOP` in that worker's CoW address space, and the
     /// worker observes it on the NEXT futex wake (partner-writes
     /// or the 100 ms timeout, whichever comes first). The signal
     /// handler is process-wide and reaches one worker per kill().
@@ -4531,7 +4531,7 @@ impl WorkloadHandle {
     /// wake at the same 100 ms cadence.
     ///
     /// Callers that budget a graceful-shutdown window should
-    /// allow at least one [`WORKER_STOP_POLL_NS`] tick (~100 ms)
+    /// allow at least one `WORKER_STOP_POLL_NS` tick (~100 ms)
     /// between flag flip and final collect, over and above any
     /// report-flush / IO latency. Tighter windows can race the
     /// worker's pre-stop iteration and surface as a missing

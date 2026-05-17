@@ -174,7 +174,7 @@ fn collect_smaps_rollup_inner(
 /// of paths from both snapshots' threads and `cgroup_stats` so
 /// that Layer 3 (tighten) sees every contributor to a given
 /// Layer-2 skeleton group. Returns the map keyed by post-flatten
-/// path; consumers ([`build_groups`], [`flatten_cgroup_stats`])
+/// path; consumers ([`build_groups`], `flatten_cgroup_stats`)
 /// look up the final key for any path they see.
 pub fn build_cgroup_key_map(
     baseline: &CtprofSnapshot,

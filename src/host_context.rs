@@ -19,7 +19,7 @@
 //! `/sys/devices/system/node/*`, and the `uname()` return all
 //! update live when memory or NUMA hotplug fires, and a freshly-
 //! started process would pick up the new values on its next
-//! collect call. It is [`STATIC_HOST_INFO`]'s `OnceLock` that
+//! collect call. It is `STATIC_HOST_INFO`'s `OnceLock` that
 //! binds a single read for the process lifetime — not any
 //! kernel-side caching.
 //!
@@ -286,7 +286,7 @@ impl HostContext {
     /// CPU identity, 64 GiB memory, 2 NUMA nodes, default THP
     /// policies, a minimal `sched_*` tunable map, and a populated
     /// uname triple. Parity with
-    /// [`SidecarResult::test_fixture`](crate::test_support::SidecarResult::test_fixture)
+    /// `SidecarResult::test_fixture`
     /// — both fixtures exist so tests don't re-derive an
     /// "everything populated" baseline in every call site.
     ///
@@ -802,9 +802,9 @@ static CPUFREQ_GOVERNORS_READ_CALLS: std::sync::atomic::AtomicUsize =
 ///
 /// Fields fall into two groups by how they are read:
 ///
-/// Static subset (memoised in [`STATIC_HOST_INFO`] —
+/// Static subset (memoised in `STATIC_HOST_INFO` —
 /// or, for `cpufreq_governor`, the parallel
-/// [`CPUFREQ_GOVERNORS`] cache — identical across every call in
+/// `CPUFREQ_GOVERNORS` cache — identical across every call in
 /// the process, shift only under CPU / memory / NUMA hotplug or
 /// runtime governor change): the uname triple, CPU identity
 /// (`cpu_model` + `cpu_vendor`), `total_memory_kib`,
@@ -909,7 +909,7 @@ pub fn collect_host_context() -> HostContext {
 /// Static fields (uname triple, CPU identity, total memory,
 /// hugepage size, online CPU count, NUMA node count) are
 /// memoised across every call in the process via
-/// [`STATIC_HOST_INFO`], so `collect_host_context_pre_run` and
+/// `STATIC_HOST_INFO`, so `collect_host_context_pre_run` and
 /// `collect_host_context` observing different values for a static
 /// field implies CPU/memory/NUMA hotplug between the two calls —
 /// see the module-level "Static-cache staleness under hotplug"

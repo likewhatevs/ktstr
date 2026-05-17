@@ -2645,7 +2645,7 @@ pub enum ResolveSource {
     /// UNKNOWN — the binary on PATH may be a system-wide install,
     /// a prior build, or a custom one the user staged for this run.
     PathLookup,
-    /// Resolved via a sibling of [`crate::resolve_current_exe`]
+    /// Resolved via a sibling of `crate::resolve_current_exe`
     /// (same directory, or the sibling of a `deps/` directory for
     /// integration tests / nextest). Git-hash provenance UNKNOWN
     /// — the binary may be from any previous build.

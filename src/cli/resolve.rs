@@ -517,7 +517,7 @@ pub fn download_and_cache_version(
 /// releases that fall inside `[start, end]` inclusive.
 ///
 /// Fetches kernel.org's `releases.json` once via
-/// [`crate::fetch::cached_releases`], filters to rows whose `moniker`
+/// `crate::fetch::cached_releases`, filters to rows whose `moniker`
 /// is `stable` or `longterm` (matching the policy
 /// [`crate::fetch::fetch_latest_stable_version`] uses for "is this a
 /// production release we want to test against"), drops any version

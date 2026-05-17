@@ -1008,17 +1008,17 @@ pub struct GauntletRow {
     pub ext_metrics: BTreeMap<String, f64>,
 }
 
-/// Typed-field filter set for narrowing [`GauntletRow`] sets in the
+/// Typed-field filter set for narrowing `GauntletRow` sets in the
 /// `cargo ktstr stats compare` pipeline. Every field is `None` /
 /// empty by default; populated fields are AND-combined ACROSS
 /// fields, with field-internal OR/AND semantics described per-field
-/// below. Applied via [`apply_row_filters`] in `compare_partitions`
+/// below. Applied via `apply_row_filters` in `compare_partitions`
 /// before the rows reach `compare_rows`.
 ///
 /// Match semantics:
 /// - `scheduler` / `topology` / `work_type` — STRICT EQUALITY against
 ///   the row's corresponding field. The sibling substring filter on
-///   [`compare_rows`] (`-E`) stays as the only fuzzy-match knob;
+///   `compare_rows` (`-E`) stays as the only fuzzy-match knob;
 ///   typed fields are exact so a `--scheduler scx_rusty` filter does
 ///   NOT spuriously match `scx_rusty_alt`.
 /// - `kernels` — repeatable, OR-combined: a row matches iff its
@@ -1036,7 +1036,7 @@ pub struct GauntletRow {
 ///   iff its `kernel_commit` equals ANY entry in `kernel_commits`.
 ///   Same multi-value semantic as `project_commits`, applied to
 ///   the kernel source-tree commit recorded by
-///   [`crate::test_support::sidecar::detect_kernel_commit`] at
+///   `crate::test_support::sidecar::detect_kernel_commit` at
 ///   sidecar-write time. Filters on the kernel HEAD, NOT on the
 ///   kernel release version (`kernels` is the version filter).
 /// - `run_sources` — repeatable, OR-combined: a row matches iff
@@ -1044,7 +1044,7 @@ pub struct GauntletRow {
 ///   multi-value semantic as `kernels` / `project_commits` /
 ///   `kernel_commits`, applied to the run-environment provenance
 ///   tag (`"local"`, `"ci"`, `"archive"`) recorded by
-///   [`crate::test_support::sidecar::detect_run_source`] at
+///   `crate::test_support::sidecar::detect_run_source` at
 ///   sidecar-write time, or rewritten to `"archive"` at load
 ///   time when the consumer pulled the pool from a non-default
 ///   `--dir`. Surfaced as the `--run-source` CLI flag.
@@ -1333,12 +1333,12 @@ fn is_major_minor_prefix(s: &str) -> bool {
             .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// One of the seven dimensions that compose a [`GauntletRow`]'s
+/// One of the seven dimensions that compose a `GauntletRow`'s
 /// identity in the comparison pipeline: `kernel`, `scheduler`,
 /// `topology`, `work-type`, `project-commit`, `kernel-commit`,
 /// `run-source`. Each maps to the corresponding
 /// `RowFilter` field and `GauntletRow` field; the dimension
-/// model lets [`compare_partitions`] derive its slicing dims and
+/// model lets `compare_partitions` derive its slicing dims and
 /// dynamic pairing key without hardcoding the dimension list at
 /// every call site. Variant names match the CLI flag suffix
 /// (e.g. `Dimension::ProjectCommit` ↔ `--project-commit`,
@@ -1370,7 +1370,7 @@ pub enum Dimension {
 impl Dimension {
     /// Every dimension in CLI-flag order. Used by
     /// [`derive_slicing_dims`] to walk the dimension space and by
-    /// [`compare_partitions`] to compute the pairing-dim
+    /// `compare_partitions` to compute the pairing-dim
     /// complement set (all dims minus slicing dims).
     pub const ALL: &'static [Dimension] = &[
         Dimension::Kernel,
@@ -1431,7 +1431,7 @@ pub(crate) const LEGACY_PAIRING_DIMS: &[Dimension] = &[Dimension::Topology, Dime
 /// dimensions on which the two sides select disjoint cohorts and
 /// therefore form the A/B contrast. The complement (every other
 /// dimension) is the PAIRING-key dimension set used by
-/// [`compare_rows`] to join A-side rows against B-side rows.
+/// `compare_rows` to join A-side rows against B-side rows.
 ///
 /// Comparison shape per dimension: every dim uses the same
 /// SORTED-DEDUPED `Vec<&str>` comparison — order and multiplicity
@@ -1610,7 +1610,7 @@ fn commit_pairing_key_part(value: &Option<String>) -> String {
     s.strip_suffix("-dirty").unwrap_or(s).to_string()
 }
 
-/// One aggregated [`GauntletRow`] produced by [`group_and_average_by`],
+/// One aggregated `GauntletRow` produced by `group_and_average_by`,
 /// plus the pass-bookkeeping needed to render `N/M` in the per-group
 /// summary block.
 ///
@@ -1628,7 +1628,7 @@ fn commit_pairing_key_part(value: &Option<String>) -> String {
 /// `passed` on `row` is the AND across every contributor: a single
 /// failing contributor in the group flips the aggregated row to
 /// `passed = false`, which routes the pair through
-/// [`compare_rows`]' `skipped_failed` gate. `skipped` follows an
+/// `compare_rows`' `skipped_failed` gate. `skipped` follows an
 /// OR rule — any skipped contributor flips the aggregate to
 /// skipped.
 ///
@@ -1648,7 +1648,7 @@ pub struct AveragedGroup {
     /// Aggregated row carrying arithmetic-mean metric values plus
     /// the AND-of-contributors `passed` / OR-of-contributors
     /// `skipped` flags. Fed
-    /// directly into [`compare_rows`] when `--average` is active.
+    /// directly into `compare_rows` when `--average` is active.
     pub row: GauntletRow,
     /// Number of contributors where both `passed && !skipped`.
     /// Renders as the numerator of the per-group `N/M` summary.
@@ -3009,8 +3009,8 @@ pub(crate) struct CompareReport {
     pub findings: Vec<Finding>,
 }
 
-/// Per-metric threshold policy driving [`compare_rows`] /
-/// [`compare_partitions`].
+/// Per-metric threshold policy driving `compare_rows` /
+/// `compare_partitions`.
 ///
 /// Resolution priority for a given metric's relative significance
 /// threshold, highest first:
@@ -3020,7 +3020,7 @@ pub(crate) struct CompareReport {
 /// 2. `default_percent` — uniform override across every metric
 ///    not listed in the map (equivalent to the old `--threshold N`
 ///    CLI flag).
-/// 3. The metric's built-in `default_rel` from the [`METRICS`]
+/// 3. The metric's built-in `default_rel` from the `METRICS`
 ///    registry — the "no policy" fallback.
 ///
 /// Values in the struct are stored as PERCENT (e.g. `10.0` meaning
@@ -3061,7 +3061,7 @@ pub struct ComparisonPolicy {
 }
 
 impl ComparisonPolicy {
-    /// Empty policy — every metric uses its [`METRICS`] registry
+    /// Empty policy — every metric uses its `METRICS` registry
     /// default. Equivalent to the old `--threshold None` CLI path.
     pub fn new() -> Self {
         Self::default()
@@ -3088,7 +3088,7 @@ impl ComparisonPolicy {
     /// negative thresholds (a misconfigured 10 vs -10 would
     /// invert the dual-gate logic at the `.abs() >= rel_thresh`
     /// check and silently classify every metric as significant)
-    /// and rejects per-metric keys not registered in [`METRICS`]
+    /// and rejects per-metric keys not registered in `METRICS`
     /// (a typo like `"wrost_spread"` would otherwise be silently
     /// ignored — the key simply never matches during resolution
     /// and the metric falls through to `default_percent`).
@@ -3118,7 +3118,7 @@ impl ComparisonPolicy {
     /// - Negative `default_percent` (nonsensical — thresholds are
     ///   absolute-value comparisons).
     /// - Negative entries in `per_metric_percent`.
-    /// - Per-metric keys not in the [`METRICS`] registry (silent
+    /// - Per-metric keys not in the `METRICS` registry (silent
     ///   typos would otherwise fall through to `default_percent`
     ///   unnoticed).
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -3155,7 +3155,7 @@ impl ComparisonPolicy {
     /// Resolve the relative threshold (as a fraction, e.g. `0.10`
     /// for 10%) for `metric_name` with `default_rel` as the
     /// registry-level fallback. Handles the percent→fraction
-    /// conversion so [`compare_rows_by`] does not need to re-derive
+    /// conversion so `compare_rows_by` does not need to re-derive
     /// `p / 100.0` at every call site.
     pub fn rel_threshold(&self, metric_name: &str, default_rel: f64) -> f64 {
         if let Some(p) = self.per_metric_percent.get(metric_name) {

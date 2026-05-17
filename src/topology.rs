@@ -75,7 +75,7 @@ impl NodeMemInfo {
 /// ([`from_vm_topology`](Self::from_vm_topology) — takes a
 /// [`crate::vmm::topology::Topology`] built via
 /// `Topology::new(numa, llcs, cores, threads)`), or synthetic
-/// parameters ([`synthetic`](Self::synthetic), test-only).
+/// parameters (`synthetic`, test-only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestTopology {
     cpus: Vec<usize>,

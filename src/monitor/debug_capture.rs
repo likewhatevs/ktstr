@@ -139,7 +139,7 @@ pub struct DebugCapture {
 /// sample inline would bloat capture records past practical
 /// transport sizes. Real captures store the snapshot blobs as
 /// sibling `.ctprof.zst` files (the existing
-/// [`crate::ctprof::SNAPSHOT_EXTENSION`] format) and keep refs
+/// `crate::ctprof::SNAPSHOT_EXTENSION` format) and keep refs
 /// here.
 ///
 /// The reproducer generator dereferences refs lazily — most

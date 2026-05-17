@@ -91,7 +91,7 @@ pub enum Op {
     /// those workers (e.g. wait/kill payload) fail to find them.
     StopCgroup { cgroup: Cow<'static, str> },
     /// Set worker affinity in a cgroup. Resolved at apply time via
-    /// [`resolve_affinity_for_cgroup()`](super::resolve_affinity_for_cgroup).
+    /// `resolve_affinity_for_cgroup()`.
     SetAffinity {
         cgroup: Cow<'static, str>,
         affinity: AffinityIntent,
@@ -126,7 +126,7 @@ pub enum Op {
     /// allowed because both endpoints share a lifetime; the
     /// step→Backdrop case is allowed because the kernel moves
     /// reference-count once and the framework's
-    /// [`ScenarioState::rename_handles`](super::ScenarioState::rename_handles)
+    /// `ScenarioState::rename_handles`
     /// transfers the handle into the persistent slot in the same
     /// step. The Backdrop→step case is the only one that produces
     /// a guaranteed orphan, hence the asymmetric reject.

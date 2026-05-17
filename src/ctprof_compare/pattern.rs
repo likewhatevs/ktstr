@@ -174,7 +174,7 @@ pub(super) fn split_into_segments(s: &str) -> Vec<Segment<'_>> {
 /// returns.
 ///
 /// Splits the input on a separator class (`[.\-_/:@+\[\]\s]+`),
-/// classifies each non-separator token by [`classify_token`], and
+/// classifies each non-separator token by `classify_token`, and
 /// rejoins with the original separator runs preserved verbatim.
 /// The first matching rule wins per token:
 ///

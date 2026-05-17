@@ -22,7 +22,7 @@
 //!
 //! # Stdout-primary, stderr-fallback metric extraction
 //!
-//! The extraction pipeline runs [`extract_metrics`](crate::test_support::extract_metrics)
+//! The extraction pipeline runs `extract_metrics`
 //! against **stdout first**. When that returns an empty metric set
 //! AND stderr is non-empty, the extractor retries against stderr.
 //! This preserves the stdout-primary contract for well-behaved
@@ -227,12 +227,12 @@ impl<'a> PayloadRun<'a> {
     ///
     /// Runtime is bounded by the value set via
     /// [`timeout`](Self::timeout). When the deadline expires,
-    /// [`kill_payload_process_group`] fires and the returned
+    /// `kill_payload_process_group` fires and the returned
     /// `(AssertResult, PayloadMetrics)` reflects the captured
     /// output plus the killed-child exit code; `status.code()`
     /// returns `None` for a SIGKILL'd child, which
-    /// [`spawn_and_wait`] surfaces as `exit_code = -1` in
-    /// [`SpawnOutput`]. The timeout case is not an error — the
+    /// `spawn_and_wait` surfaces as `exit_code = -1` in
+    /// `SpawnOutput`. The timeout case is not an error — the
     /// caller can still inspect metrics collected before the kill.
     /// A post-kill drain failure is reported as `Err` (wraps the
     /// original I/O error with "drain after timeout of N"); the
@@ -592,7 +592,7 @@ fn evaluate_llm_extract_deferred(
 /// author sees the implicit drop. The process-group kill reaches
 /// every descendant of multi-process payloads (stress-ng, schbench
 /// worker mode, fio `--numjobs`); without it the orphans keep
-/// stdout/stderr open, block [`wait_and_capture`], and lose metrics.
+/// stdout/stderr open, block `wait_and_capture`, and lose metrics.
 ///
 /// When multiple handles are active, sidecar entries appear in
 /// finalization order (the order `.wait()`, `.kill()`, or
@@ -729,7 +729,7 @@ impl PayloadHandle {
     /// payloads (stress-ng, schbench worker mode, fio --numjobs) fork
     /// descendants that keep stdout/stderr open; killing only the
     /// head would orphan those writers and block
-    /// [`wait_and_capture`] forever, losing every metric.
+    /// `wait_and_capture` forever, losing every metric.
     ///
     /// Metrics are also recorded to the per-test sidecar via the
     /// SHM ring; the returned tuple is a convenience view of the

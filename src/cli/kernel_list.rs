@@ -296,7 +296,7 @@ pub fn kernel_list(json: bool) -> Result<()> {
 
 /// Range-preview variant of [`kernel_list`].
 ///
-/// Routes through [`kernel_list_inner`] with `range = Some(spec)`,
+/// Routes through `kernel_list_inner` with `range = Some(spec)`,
 /// switching the subcommand from "walk the cache and list local
 /// entries" to "fetch releases.json once and print the versions
 /// `spec` expands to." See the `range` arg's doc on

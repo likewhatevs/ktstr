@@ -194,7 +194,7 @@ pub(super) fn drain_lines_lossy(
 /// (`.lines()` + `Result::ok`) dropped every error-tagged item —
 /// a mid-stream read failure just looked like EOF and the child's
 /// tail output disappeared without a diagnostic. The byte-oriented
-/// [`drain_lines_lossy`] now surfaces such failures with `anyhow`
+/// `drain_lines_lossy` now surfaces such failures with `anyhow`
 /// context naming the merged-stream read, so a broken-pipe or EIO
 /// during make's output is caught at the call site.
 ///

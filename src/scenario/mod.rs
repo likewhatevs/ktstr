@@ -379,7 +379,7 @@ impl Ctx<'_> {
         }
     }
 
-    /// Resolve a [`CpusetSpec`] against this context's topology and
+    /// Resolve a `CpusetSpec` against this context's topology and
     /// return the CPU count. Convenience accessor for tests that need
     /// to size work counts proportional to a cpuset without computing
     /// the topology denominator by hand. Mirrors the framework's own
@@ -424,7 +424,7 @@ impl Ctx<'_> {
         )
     }
 
-    /// Construct a [`CgroupDef`] with `self.workers_per_cgroup`
+    /// Construct a `CgroupDef` with `self.workers_per_cgroup`
     /// workers — the most common scenario shape, dedupe of 40+
     /// `CgroupDef::named(name).workers(ctx.workers_per_cgroup)` call
     /// sites across `src/scenario/` and `tests/`.
@@ -435,7 +435,7 @@ impl Ctx<'_> {
     /// CgroupDef::named(name).workers(ctx.workers_per_cgroup)
     /// ```
     ///
-    /// Returns a fresh [`CgroupDef`] so the test author can chain
+    /// Returns a fresh `CgroupDef` so the test author can chain
     /// further builders (`.cpuset`, `.work`, etc.) on the
     /// result. For non-default worker counts call
     /// `CgroupDef::named(name).workers(N)` directly — the helper
@@ -473,7 +473,7 @@ impl Ctx<'_> {
 /// - `duration`: 1 s — matches the `scenario::basic` test helper
 ///   (`scenario::stress` uses 2 s and sets it explicitly)
 /// - `workers_per_cgroup`: 1
-/// - `sched_pid`: `None` — [`run_scenario`] short-circuits the
+/// - `sched_pid`: `None` — `run_scenario` short-circuits the
 ///   liveness checks when `sched_pid.is_none()`.
 /// - `settle`: 0 ms — tests do not need to wait for scheduler stabilisation
 /// - `work_type_override`: `None`
@@ -521,7 +521,7 @@ impl<'a> CtxBuilder<'a> {
     }
 
     /// PID of the scheduler process; `None` disables the liveness
-    /// checks in [`run_scenario`].
+    /// checks in `run_scenario`.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn sched_pid(mut self, pid: Option<libc::pid_t>) -> Self {
         self.sched_pid = pid;

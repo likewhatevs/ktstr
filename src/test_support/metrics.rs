@@ -237,7 +237,7 @@ pub fn walk_json_leaves(
     out
 }
 
-/// Hard cap on recursion depth in [`walk`]. Object and array
+/// Hard cap on recursion depth in `walk`. Object and array
 /// children past this depth are skipped and a single
 /// [`tracing::warn!`] fires. Serde_json's default parser recursion
 /// limit is 128, so this caps us well below that; a hand-built
@@ -249,7 +249,7 @@ pub fn walk_json_leaves(
 /// value may change across ktstr pre-1.0 versions.
 pub const MAX_WALK_DEPTH: usize = 64;
 
-/// Sentinel metric name emitted when [`walk`] hits
+/// Sentinel metric name emitted when `walk` hits
 /// [`MAX_WALK_DEPTH`] and skips a subtree. Callers of
 /// [`walk_json_leaves`] / [`extract_metrics`] that want to
 /// distinguish "no deep metrics present" from "deep metrics

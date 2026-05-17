@@ -2079,7 +2079,7 @@ fn ktstr_list_only() {
 ///
 /// - `--list --format terse`: output `ktstr/{name}: test\n` for base
 ///   tests and `gauntlet/{name}/{preset}: test\n` for gauntlet
-///   variants. (Discovery uses [`ktstr_list_only`] instead to allow
+///   variants. (Discovery uses `ktstr_list_only` instead to allow
 ///   libtest to print its own list afterward; this branch is
 ///   preserved for direct callers of `ktstr_main`.)
 /// - `--exact NAME --nocapture`: run the named test, exit 0/1.

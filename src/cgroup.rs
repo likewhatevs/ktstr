@@ -7,7 +7,7 @@
 //! # Controller surface
 //!
 //! [`CgroupManager`] enables a fixed controller set in
-//! `cgroup.subtree_control` at [`Self::setup`] time so every method
+//! `cgroup.subtree_control` at `Self::setup` time so every method
 //! that writes a controller knob succeeds without per-call lazy
 //! enablement (which would race against concurrent sibling cgroup
 //! creation). The enabled controllers and the knobs each one exposes
@@ -15,12 +15,12 @@
 //!
 //! | Controller | `setup` writes | Methods that touch the controller's files |
 //! |------------|----------------|-------------------------------------------|
-//! | `cpuset`   | always         | [`Self::set_cpuset`], [`Self::set_cpuset_mems`], [`Self::clear_cpuset`], [`Self::clear_cpuset_mems`] |
-//! | `cpu`      | when `enable_cpu_controller=true` | [`Self::set_cpu_max`], [`Self::set_cpu_weight`] |
-//! | `memory`   | always         | [`Self::set_memory_max`], [`Self::set_memory_high`], [`Self::set_memory_low`], [`Self::set_memory_swap_max`] |
-//! | `pids`     | always         | [`Self::set_pids_max`] |
-//! | `io`       | always         | [`Self::set_io_weight`] |
-//! | (cgroup-core) | not gated   | [`Self::set_freeze`], [`Self::move_task`], [`Self::move_tasks`] |
+//! | `cpuset`   | always         | `Self::set_cpuset`, `Self::set_cpuset_mems`, `Self::clear_cpuset`, `Self::clear_cpuset_mems` |
+//! | `cpu`      | when `enable_cpu_controller=true` | `Self::set_cpu_max`, `Self::set_cpu_weight` |
+//! | `memory`   | always         | `Self::set_memory_max`, `Self::set_memory_high`, `Self::set_memory_low`, `Self::set_memory_swap_max` |
+//! | `pids`     | always         | `Self::set_pids_max` |
+//! | `io`       | always         | `Self::set_io_weight` |
+//! | (cgroup-core) | not gated   | `Self::set_freeze`, `Self::move_task`, `Self::move_tasks` |
 //!
 //! `cgroup.freeze` and `cgroup.procs` are cgroup-core files exposed on
 //! every non-root cgroup automatically; they do not require a
@@ -32,7 +32,7 @@
 //! # Untrusted-name validation
 //!
 //! Cgroup names flow into [`Path::join`] under `parent` to address
-//! files inside cgroupfs. [`validate_cgroup_name`] rejects shapes that
+//! files inside cgroupfs. `validate_cgroup_name` rejects shapes that
 //! would escape that parent (`..`, absolute leading `/`, `NUL`) or
 //! that produce invisible cgroupfs entries (leading `.`); other ASCII
 //! is passed through to the kernel which is the final authority on
@@ -83,7 +83,7 @@ pub enum Controller {
 
 impl Controller {
     /// Kernel token written to `cgroup.subtree_control` (the bare name
-    /// without the `+`/`-` prefix; see [`Self::as_subtree_control_add`]
+    /// without the `+`/`-` prefix; see `Self::as_subtree_control_add`
     /// for the full token).
     pub fn name(self) -> &'static str {
         match self {
@@ -358,7 +358,7 @@ const MAX_OUTSTANDING_REMOVES: usize = 10;
 /// [`Self::remove_cgroup`] call failed (the directory still exists
 /// in the cgroupfs tree). It increments on every removal failure,
 /// decrements on every removal success, and gates further calls:
-/// once the count exceeds [`MAX_OUTSTANDING_REMOVES`],
+/// once the count exceeds `MAX_OUTSTANDING_REMOVES`,
 /// [`Self::remove_cgroup`] returns Err without attempting the
 /// underlying writes. The counter is `AtomicUsize` because
 /// scenario code holds the manager behind `&dyn CgroupOps` and
@@ -499,7 +499,7 @@ impl CgroupManager {
     /// # Limitation: only `+cpuset` is propagated through nested
     /// intermediates
     ///
-    /// [`Self::enable_subtree_cpuset`] writes ONLY `+cpuset` to each
+    /// `Self::enable_subtree_cpuset` writes ONLY `+cpuset` to each
     /// intermediate's `cgroup.subtree_control`; the `+cpu` /
     /// `+memory` / `+pids` / `+io` controllers enabled by
     /// [`Self::setup`] cover only the manager's parent cgroup, not
@@ -514,7 +514,7 @@ impl CgroupManager {
     /// Today's in-tree consumers (host topology cpuset locks,
     /// `BuildSandbox`, scenario ops) only nest cgroups for cpuset
     /// scoping, so this matches the actual surface the framework
-    /// exercises. Extending [`Self::enable_subtree_cpuset`] to
+    /// exercises. Extending `Self::enable_subtree_cpuset` to
     /// propagate the remaining controllers across intermediates is
     /// straightforward (write the same controller list as
     /// [`Self::setup`] uses) but is deferred until a use case
@@ -540,13 +540,13 @@ impl CgroupManager {
     /// callers treat that as "parent is not a cgroup v2 node" and
     /// degrade elsewhere.
     ///
-    /// Unlike [`Self::setup`] and [`Self::enable_subtree_cpuset`],
+    /// Unlike [`Self::setup`] and `Self::enable_subtree_cpuset`,
     /// which swallow write failures via `tracing::warn!`, this method
     /// propagates the underlying [`std::io::Error`] so callers can
     /// classify errnos (EACCES/EPERM for permission, EBUSY for a
-    /// peer holding the subtree) via [`anyhow_first_io_errno`] and
+    /// peer holding the subtree) via `anyhow_first_io_errno` and
     /// map them to operator-facing degrade variants. Used by
-    /// [`crate::vmm::cgroup_sandbox::BuildSandbox::try_create`] under
+    /// `crate::vmm::cgroup_sandbox::BuildSandbox::try_create` under
     /// the `--cpu-cap` hard-error contract.
     pub fn add_parent_subtree_controller(&self, controller: &str) -> Result<()> {
         let p = self.parent.join("cgroup.subtree_control");
@@ -598,7 +598,7 @@ impl CgroupManager {
     /// race freeze/drain and see EBUSY/ENOENT on individual remove
     /// calls. Each failed remove increments
     /// [`Self::outstanding_removes`]; once the counter exceeds
-    /// [`MAX_OUTSTANDING_REMOVES`], the next call returns Err
+    /// `MAX_OUTSTANDING_REMOVES`, the next call returns Err
     /// without attempting any filesystem writes — bounding the peak
     /// resident cgroup leak to that cap regardless of how long the
     /// scenario runs. Successful removes decrement the counter, so a
@@ -741,8 +741,8 @@ impl CgroupManager {
     /// Write `cpuset.mems` for a child cgroup. Constrains which NUMA
     /// nodes the cgroup's tasks can allocate memory on.
     ///
-    /// Shape mirrors [`set_cpuset`] exactly — [`TestTopology::cpuset_string`]
-    /// range-compact-formats the node set, [`write_with_timeout`] bounds
+    /// Shape mirrors `set_cpuset` exactly — [`TestTopology::cpuset_string`]
+    /// range-compact-formats the node set, `write_with_timeout` bounds
     /// the filesystem-write at 2s. Used by `BuildSandbox` under the
     /// `--cpu-cap` flow to bind build memory to the NUMA nodes hosting
     /// the locked LLCs, avoiding cross-socket DRAM latency for gcc's
@@ -797,7 +797,7 @@ impl CgroupManager {
     }
 
     /// Clear `cpuset.mems` for a child cgroup (empty string = inherit parent).
-    /// Parallels [`clear_cpuset`]; callers use it only when tearing
+    /// Parallels `clear_cpuset`; callers use it only when tearing
     /// down a cpuset-restricted cgroup that needs to accept a
     /// fresh task binding with a different NUMA budget.
     pub fn clear_cpuset_mems(&self, name: &str) -> Result<()> {
@@ -822,7 +822,7 @@ impl CgroupManager {
     ///
     /// Requires `+cpu` in the parent's `cgroup.subtree_control`;
     /// missing controller surfaces as ENOENT on the file (handled
-    /// generically by [`write_with_timeout`]'s error path with the
+    /// generically by `write_with_timeout`'s error path with the
     /// errno suffix).
     pub fn set_cpu_max(&self, name: &str, quota_us: Option<u64>, period_us: u64) -> Result<()> {
         validate_cgroup_name(name)?;
@@ -1015,7 +1015,7 @@ impl CgroupManager {
     ///
     /// `move_task` is host-side scenario orchestration, never
     /// invoked from a vCPU thread, so the bare `fs::read_to_string`
-    /// reads in [`Self::check_cpuset_ordering`] are not bounded by
+    /// reads in `Self::check_cpuset_ordering` are not bounded by
     /// the freeze-rendezvous timeout. A wedged cgroupfs read here
     /// would stall the orchestrator thread, not a vCPU.
     ///

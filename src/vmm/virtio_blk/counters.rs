@@ -433,23 +433,23 @@ impl VirtioBlkCounters {
     }
 }
 
-/// Plain-u64 snapshot of [`VirtioBlkCounters`] taken at VM-result
+/// Plain-u64 snapshot of `VirtioBlkCounters` taken at VM-result
 /// construction time. Mirrors every atomic field by name.
 ///
 /// Decouples the public-facing [`crate::vmm::VmResult`] from the
 /// internal atomic-shared writer state — consumers see immutable
 /// owned data they can `Clone`, compare, and round-trip through
 /// serde without the `Arc<AtomicU64>` ceremony. The worker thread
-/// continues to bump the atomics via the [`VirtioBlkCounters`]
+/// continues to bump the atomics via the `VirtioBlkCounters`
 /// `record_*` mutators; only the result-construction path moves
 /// to the snapshot.
 ///
 /// Field semantics match the atomic source one-for-one — see
-/// [`VirtioBlkCounters`] for the cumulative-vs-gauge taxonomy
+/// `VirtioBlkCounters` for the cumulative-vs-gauge taxonomy
 /// distinguishing each field. The live-gauge field
 /// `currently_throttled_gauge` reflects the gauge state at
 /// snapshot time — typically `0` after a clean shutdown, but
-/// per the [`VirtioBlkCounters`] doc a worker-strand stall
+/// per the `VirtioBlkCounters` doc a worker-strand stall
 /// during teardown can leave a non-zero residual.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct VirtioBlkCountersSnapshot {

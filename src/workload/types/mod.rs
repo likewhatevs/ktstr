@@ -99,7 +99,7 @@ pub enum Phase {
 /// assert!(WorkType::from_name("nonexistent").is_none());
 /// ```
 ///
-/// IO variants share the [`IoBacking`] open path but differ in the
+/// IO variants share the `IoBacking` open path but differ in the
 /// open flag + IO shape used to detect them:
 ///
 /// - [`IoSyncWrite`](Self::IoSyncWrite): `O_SYNC` + sequential
@@ -300,7 +300,7 @@ pub enum WorkType {
     /// compute wake-latency percentiles will produce zero/degenerate
     /// numbers against a `Custom` report that did not record them.
     ///
-    /// **Process-group lifecycle (per [`CloneMode`]):**
+    /// **Process-group lifecycle (per `CloneMode`):**
     ///
     /// _Fork mode_ — every worker calls `setpgid(0, 0)` immediately
     /// after fork, giving the worker its own process group
@@ -310,7 +310,7 @@ pub enum WorkType {
     /// change it. On teardown, `stop_and_collect` issues
     /// `killpg(worker_pid, SIGKILL)` unconditionally (on both the
     /// graceful-exit and StillAlive-escalation paths) and
-    /// [`WorkloadHandle::drop`] issues another `killpg` on handle
+    /// `WorkloadHandle::drop` issues another `killpg` on handle
     /// teardown, so **every descendant a `Custom` closure spawns
     /// will be SIGKILLed at worker teardown** — there is no opt-out.
     /// Closures that need children to outlive the worker must
@@ -349,11 +349,11 @@ pub enum WorkType {
     /// flips. This is a runtime contract, not a static check —
     /// `Custom` closures are arbitrary user code and the framework
     /// cannot detect violations at spawn time. If your workload
-    /// genuinely needs `_exit`/`fork`/etc., use [`CloneMode::Fork`]
+    /// genuinely needs `_exit`/`fork`/etc., use `CloneMode::Fork`
     /// where each worker IS its own process. The
-    /// [`WorkType::ForkExit`] + [`CloneMode::Thread`] combination
+    /// [`WorkType::ForkExit`] + `CloneMode::Thread` combination
     /// is rejected at spawn time precisely because of this — see
-    /// [`WorkloadHandle::spawn`].
+    /// `WorkloadHandle::spawn`.
     ///
     /// **Serde:** the `Custom` variant is `#[serde(skip)]` because
     /// the `run` field is a `fn` pointer that has no portable wire
@@ -412,7 +412,7 @@ pub enum WorkType {
     /// Tests both halves of the rt_mutex PI chain under the same
     /// workload shape.
     ///
-    /// Requires same-CPU pinning (e.g. [`AffinityIntent::SingleCpu`])
+    /// Requires same-CPU pinning (e.g. `AffinityIntent::SingleCpu`)
     /// for `medium` to actually preempt `low`. Without pinning, the
     /// scheduler distributes the priorities across CPUs and the
     /// inversion never materialises.
@@ -480,7 +480,7 @@ pub enum WorkType {
     /// scx_ext docs), the SCHED_NORMAL workers starve.
     ///
     /// Reproducer setup: pin both groups to the same CPU set
-    /// (e.g. via [`AffinityIntent::SingleCpu`]), and on the host set
+    /// (e.g. via `AffinityIntent::SingleCpu`), and on the host set
     /// `sysctl_sched_rt_runtime_us=-1` for unlimited RT bandwidth
     /// (otherwise the kernel rt_period throttle unstuck things
     /// after 0.95s).
@@ -557,12 +557,12 @@ pub enum WorkType {
     /// additionally allocates `depth` pipes per chain — see
     /// [`chain_pipe_depth`](Self::chain_pipe_depth) and the
     /// `chain_pipes` field on `SpawnGuard` (early-bail path) and
-    /// [`WorkloadHandle`] (success path).
+    /// `WorkloadHandle` (success path).
     ///
-    /// Both [`CloneMode::Fork`] and [`CloneMode::Thread`] are
+    /// Both `CloneMode::Fork` and `CloneMode::Thread` are
     /// supported for `WakeMechanism::Pipe`. On a successful spawn
     /// the chain-pipe fds transfer from the guard into
-    /// [`WorkloadHandle`], and `WorkloadHandle::drop` closes them
+    /// `WorkloadHandle`, and `WorkloadHandle::drop` closes them
     /// only after every worker is reaped (Fork) or joined (Thread).
     /// Under Thread mode each worker thread shares the parent's fd
     /// table, so the post-shutdown close is what guarantees workers
@@ -608,7 +608,7 @@ pub enum WorkType {
         /// Wall-clock CPU work each worker performs per stage
         /// before signalling the next. Use [`Duration`] to keep
         /// the unit visible at the call site (consistent with
-        /// [`SchedPolicy::Deadline`]'s switch to `Duration`).
+        /// `SchedPolicy::Deadline`'s switch to `Duration`).
         #[serde(with = "humantime_serde_helper")]
         work_per_hop: Duration,
     },
@@ -919,7 +919,7 @@ pub enum WorkType {
     /// exclusive CPU affinity AND no co-scheduled kernel threads.
     /// Concrete recipe:
     ///
-    /// - Use [`AffinityIntent::SingleCpu`] or a one-CPU `Exact`
+    /// - Use `AffinityIntent::SingleCpu` or a one-CPU `Exact`
     ///   mask so only this worker is pinned to the CPU.
     /// - Run under `performance_mode=true` so the CPU lock budget
     ///   reserves the CPU for this test.
@@ -954,7 +954,7 @@ pub enum WorkType {
     /// - Sub-50µs `sleep_duration` values do not produce sub-50µs
     ///   idle periods — the slack floor dominates.
     /// - **RT workers bypass slack.** Under
-    ///   [`SchedPolicy::Fifo`] or [`SchedPolicy::RoundRobin`] the
+    ///   `SchedPolicy::Fifo` or `SchedPolicy::RoundRobin` the
     ///   kernel forces `timer_slack_ns` to 0
     ///   (`kernel/sched/syscalls.c:258`), so RT IdleChurn workers
     ///   get exact wake timing. CFS / SCHED_NORMAL workers
@@ -1307,17 +1307,17 @@ pub enum WorkType {
     /// workers to the two siblings of one physical core.
     ///
     /// The framework provides
-    /// [`AffinityIntent::SmtSiblingPair`] for this purpose: the
+    /// `AffinityIntent::SmtSiblingPair` for this purpose: the
     /// scenario engine resolves it against the host topology
     /// (using sysfs's
     /// `/sys/devices/system/cpu/cpu_a/topology/thread_siblings_list`
     /// when the topology was built from sysfs) and produces a
-    /// 2-CPU [`AffinityIntent::Exact`] for the spawn pipeline.
+    /// 2-CPU `AffinityIntent::Exact` for the spawn pipeline.
     /// Resolving on a non-SMT host (`threads_per_core == 1`)
     /// returns an explicit error rather than silently degrading.
     /// Test authors who want exact CPU IDs (e.g. comparing
     /// same-core vs. cross-core behaviour on a known topology)
-    /// can still hand-pick via [`AffinityIntent::Exact`].
+    /// can still hand-pick via `AffinityIntent::Exact`.
     ///
     /// Without one of those affinity intents the variant
     /// degenerates to two independent [`SpinWait`](Self::SpinWait)
@@ -1363,7 +1363,7 @@ pub enum WorkType {
     ///
     /// All three must be `> 0`; both the
     /// [`ipc_variance`](Self::ipc_variance) constructor and
-    /// [`WorkloadHandle::spawn`] reject zeros with
+    /// `WorkloadHandle::spawn` reject zeros with
     /// [`WorkTypeValidationError::ZeroIpcVarianceParam`].
     ///
     /// **Stop responsiveness.** The hot and cold inner loops do
@@ -1640,7 +1640,7 @@ impl WorkType {
     /// (`" SpinWait"`, `"SpinWait\n"`) suppresses a match. Callers
     /// that accept user input with possible surrounding whitespace
     /// must `s.trim()` before calling — the same convention
-    /// [`from_name`] follows. Keeping the predicate strict here
+    /// `from_name` follows. Keeping the predicate strict here
     /// avoids confusing "suggested canonical spelling" reports for
     /// inputs that were already nearly correct save for stray
     /// whitespace the caller should have already normalized.
@@ -1881,7 +1881,7 @@ impl WorkType {
     /// the number of waiters to wake. Realistic values are tens of
     /// workers; sched-test topologies that need more than `i32::MAX`
     /// (~2.1B) receivers per messenger are not expressible.
-    /// [`WorkloadHandle::spawn`] clamps the cast to `i32::MAX` so a
+    /// `WorkloadHandle::spawn` clamps the cast to `i32::MAX` so a
     /// pathological `usize` input wakes all-available instead of
     /// wrapping to a negative (FUTEX_WAKE broadcasts when passed a
     /// negative N on some kernels, which would wake every waiter on
@@ -2138,7 +2138,7 @@ impl WorkType {
     /// `burst_duration` and `sleep_duration` must both be
     /// strictly greater than `Duration::ZERO`. The constructor
     /// itself accepts any value (no early validation); the
-    /// rejection fires at [`WorkloadHandle::spawn`] time with an
+    /// rejection fires at `WorkloadHandle::spawn` time with an
     /// actionable bail message naming the offending field. See
     /// [`WorkType::IdleChurn`] variant doc for the rationale and
     /// the kernel-source citation.
@@ -2184,7 +2184,7 @@ impl WorkType {
     /// is `0`. Construction-time validation matches the
     /// spawn-time check so callers get immediate feedback at
     /// the call site rather than discovering the rejection
-    /// only at [`WorkloadHandle::spawn`] time.
+    /// only at `WorkloadHandle::spawn` time.
     pub const fn ipc_variance(
         hot_iters: u64,
         cold_iters: u64,
@@ -2218,8 +2218,8 @@ impl WorkType {
     /// User-supplied work function with a display name.
     ///
     /// `run` receives a reference to the stop flag (flipped per-mode:
-    /// the SIGUSR1 handler for [`CloneMode::Fork`], a per-worker
-    /// `AtomicBool` for [`CloneMode::Thread`]) and must return a
+    /// the SIGUSR1 handler for `CloneMode::Fork`, a per-worker
+    /// `AtomicBool` for `CloneMode::Thread`) and must return a
     /// [`WorkerReport`] when the flag becomes `true`. The framework
     /// handles fork / thread spawn, cgroup placement, affinity,
     /// scheduling policy, and signal setup (Fork mode only); `run`
@@ -2241,7 +2241,7 @@ impl WorkType {
 /// Spawn-time validation failures for [`WorkType`] preconditions.
 ///
 /// Returned (boxed inside [`anyhow::Error`]) by
-/// [`WorkloadHandle::spawn`] when a per-group [`WorkSpec`] violates a
+/// `WorkloadHandle::spawn` when a per-group `WorkSpec` violates a
 /// runtime invariant the variant doc declares as a precondition.
 /// Tests that need to assert on a specific variant downcast via
 /// `err.downcast_ref::<WorkTypeValidationError>()`; the
@@ -2250,7 +2250,7 @@ impl WorkType {
 /// rendered message keep working.
 ///
 /// Each variant carries `group_idx` (the position of the offending
-/// [`WorkSpec`] inside [`WorkloadConfig::composed`]; the primary
+/// `WorkSpec` inside `WorkloadConfig::composed`; the primary
 /// group is index 0) so multi-group scenarios can locate the
 /// offending entry without re-parsing the message string. Variants
 /// with multiple constraint inputs (depth, divisor, observed count)
@@ -2269,7 +2269,7 @@ pub enum WorkTypeValidationError {
     )]
     ZeroBurstDuration {
         /// Index of the offending group in
-        /// [`WorkloadConfig::composed`] (primary group = 0).
+        /// `WorkloadConfig::composed` (primary group = 0).
         group_idx: usize,
     },
     /// [`WorkType::IdleChurn`] with `sleep_duration == Duration::ZERO`.
@@ -2288,7 +2288,7 @@ pub enum WorkTypeValidationError {
     )]
     ZeroSleepDuration {
         /// Index of the offending group in
-        /// [`WorkloadConfig::composed`] (primary group = 0).
+        /// `WorkloadConfig::composed` (primary group = 0).
         group_idx: usize,
     },
     /// [`WorkType::WakeChain`] with `depth < 2`. A 1-stage chain has
@@ -2304,7 +2304,7 @@ pub enum WorkTypeValidationError {
         /// The offending `depth` value the caller supplied.
         depth: usize,
         /// Index of the offending group in
-        /// [`WorkloadConfig::composed`] (primary group = 0).
+        /// `WorkloadConfig::composed` (primary group = 0).
         group_idx: usize,
     },
     /// `num_workers` is not a positive multiple of the variant's
@@ -2318,7 +2318,7 @@ pub enum WorkTypeValidationError {
         /// PascalCase variant name from [`WorkType::name`].
         name: String,
         /// Index of the offending group in
-        /// [`WorkloadConfig::composed`] (primary group = 0).
+        /// `WorkloadConfig::composed` (primary group = 0).
         group_idx: usize,
         /// Required group size (the variant's
         /// [`worker_group_size`](WorkType::worker_group_size)).
@@ -2345,7 +2345,7 @@ pub enum WorkTypeValidationError {
         /// `"hot_iters"`, `"cold_iters"`, or `"period_iters"`.
         field: &'static str,
         /// Index of the offending group in
-        /// [`WorkloadConfig::composed`] (primary group = 0).
+        /// `WorkloadConfig::composed` (primary group = 0).
         group_idx: usize,
     },
 }

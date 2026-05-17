@@ -114,7 +114,7 @@ fn create_operator() -> Result<opendal::Operator, String> {
 /// Zstd magic number (first 4 bytes of any zstd frame).
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
-/// Decompressed-size ceiling for [`decompress_payload`] zstd payloads.
+/// Decompressed-size ceiling for `decompress_payload` zstd payloads.
 /// Bounds the allocation a malicious or corrupted zstd payload from
 /// the GHA cache service can force, since zstd compresses
 /// pathologically well on repeated bytes (a few-KiB compressed blob

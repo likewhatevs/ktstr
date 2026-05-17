@@ -20,7 +20,7 @@
 //!
 //! # Statistical conventions
 //!
-//! - **Percentiles / medians**: nearest-rank (see [`percentile`]),
+//! - **Percentiles / medians**: nearest-rank (see `percentile`),
 //!   value at index `ceil(n * p) - 1`. Unlike interpolated
 //!   percentiles, every reported p99 is an actual observed sample,
 //!   not a synthetic midpoint. Consistent across every
@@ -142,7 +142,7 @@ fn spread_threshold_pct() -> f64 {
 }
 
 /// Category tag for an [`AssertDetail`]. Enables structural filtering
-/// (e.g. by [`AssertPlan`]) without matching on substrings of
+/// (e.g. by `AssertPlan`) without matching on substrings of
 /// human-readable messages, which is fragile if wording changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum DetailKind {
@@ -562,7 +562,7 @@ pub struct AssertResult {
 /// # Percentile convention
 ///
 /// `p99_wake_latency_us` and `median_wake_latency_us` are computed
-/// by [`percentile`] using the NEAREST-RANK (Type 1) definition:
+/// by `percentile` using the NEAREST-RANK (Type 1) definition:
 /// the value at `ceil(n * p) - 1` in sorted order. No interpolation
 /// between samples. This matches the percentile convention used
 /// throughout schbench and the BPF latency histograms the project
@@ -1669,7 +1669,7 @@ pub struct Assert {
     /// `details`, but the verdict's `passed` stays `true`. Tests that
     /// want monitor violations to fail the run call
     /// [`Self::with_monitor_defaults`], which populates each monitor
-    /// threshold from [`crate::monitor::MonitorThresholds::new()`]
+    /// threshold from `MonitorThresholds::new()`
     /// and sets this flag to `true`.
     pub enforce_monitor_thresholds: bool,
 
@@ -2207,7 +2207,7 @@ impl Assert {
     /// threshold violation fails the test.
     ///
     /// Also populates any unset monitor-threshold field with the
-    /// canonical default from [`crate::monitor::MonitorThresholds::new()`]
+    /// canonical default from `MonitorThresholds::new()`
     /// — so a test that only cares about `max_keep_last_rate` can chain
     /// `.max_keep_last_rate(N).with_monitor_defaults()` and get the
     /// other four enforced at their canonical defaults.

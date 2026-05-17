@@ -45,19 +45,19 @@
 //!
 //! Every knob ends in [`crate::cgroup::CgroupOps`] (production:
 //! [`crate::cgroup::CgroupManager`]; tests: a recording `MockCgroupOps`
-//! double). [`apply_setup`] runs the [`CgroupDef`] passes; [`apply_ops`]
+//! double). `apply_setup` runs the [`CgroupDef`] passes; `apply_ops`
 //! dispatches the [`Op`] variants. Both share `ctx.cgroups` so a test
 //! that uses both layers writes through the same RAII teardown
-//! ([`crate::scenario::CgroupGroup::Drop`]).
+//! (`crate::scenario::CgroupGroup::Drop`).
 //!
 //! # File layout
 //!
-//! [`types`] holds the data model: [`Op`], [`CgroupDef`], [`Step`],
+//! `types` holds the data model: [`Op`], [`CgroupDef`], [`Step`],
 //! [`HoldSpec`], [`Setup`], [`CpusetSpec`], the per-controller limits
 //! structs, and every builder constructor. Re-exported from this module
 //! so external paths remain `crate::scenario::ops::Op` etc. The executor
 //! in this file drives that model against [`crate::cgroup::CgroupOps`]
-//! via [`apply_setup`] / [`apply_ops`] and exposes the [`execute_steps`] /
+//! via `apply_setup` / `apply_ops` and exposes the [`execute_steps`] /
 //! [`execute_scenario`] family of public entry points.
 
 mod types;

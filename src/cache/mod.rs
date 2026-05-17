@@ -18,28 +18,28 @@
 //!
 //! # Submodule layout
 //!
-//! - [`metadata`] — public types: [`KernelSource`], [`KernelMetadata`],
+//! - `metadata` — public types: [`KernelSource`], [`KernelMetadata`],
 //!   [`CacheArtifacts`], [`KconfigStatus`], [`CacheEntry`],
 //!   [`ListedEntry`], plus the internal `classify_corrupt_reason`
 //!   dispatcher.
-//! - [`cache_dir`] — [`CacheDir`] handle, lock guards
+//! - `cache_dir` — [`CacheDir`] handle, lock guards
 //!   ([`SharedLockGuard`], [`ExclusiveLockGuard`]), store/lookup/list/
 //!   clean lifecycle, and reader/writer-asymmetric lock policy.
-//! - [`housekeeping`] — atomic-rename install primitives, cache-key
+//! - `housekeeping` — atomic-rename install primitives, cache-key
 //!   and image-name validators, `read_metadata` decoder, and the
 //!   `clean_orphaned_tmp_dirs` cross-PID sweep.
-//! - [`vmlinux_strip`] — ELF strip pipeline ([`strip_vmlinux_debug`],
+//! - `vmlinux_strip` — ELF strip pipeline (`strip_vmlinux_debug`,
 //!   `neutralize_relocs`, `strip_keep_list`, `strip_debug_prefix`)
 //!   plus the keep-list / zero-data section-name unions.
-//! - [`resolve`] — env-cascade root resolution
+//! - `resolve` — env-cascade root resolution
 //!   (`resolve_cache_root_with_suffix`, `validate_home_for_cache`,
-//!   [`path_inside_cache_root`]) and source-tree path helpers
+//!   `path_inside_cache_root`) and source-tree path helpers
 //!   ([`prefer_source_tree_for_dwarf`], [`recover_local_source_tree`]).
 //!
 //! Each submodule owns its tests (collocated under the same file in
 //! a `#[cfg(test)] mod tests` block); shared test fixtures used by
 //! more than one submodule's tests live in
-//! [`shared_test_helpers`].
+//! `shared_test_helpers`.
 
 use crate::flock::LOCK_DIR_NAME;
 

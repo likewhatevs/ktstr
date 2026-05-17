@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 ///
 /// Resolved to a concrete [`ResolvedAffinity`] at runtime based on the
 /// cgroup's effective cpuset and the VM's topology. When attached to
-/// a [`WorkSpec`], determines per-worker `sched_setaffinity` masks.
+/// a `WorkSpec`, determines per-worker `sched_setaffinity` masks.
 ///
 /// Resolution uses [`resolve_affinity_for_cgroup()`](crate::scenario::resolve_affinity_for_cgroup).
 ///
@@ -86,10 +86,10 @@ pub enum AffinityIntent {
     /// resources, exposing scheduler decisions about co-running
     /// vs. spreading compute load across cores.
     ///
-    /// Designed for [`WorkType::SmtSiblingSpin`] and other
+    /// Designed for `WorkType::SmtSiblingSpin` and other
     /// `worker_group_size = 2` variants
-    /// ([`WorkType::FutexPingPong`], [`WorkType::AsymmetricWaker`],
-    /// [`WorkType::SignalStorm`], etc.) where both workers in a
+    /// (`WorkType::FutexPingPong`, `WorkType::AsymmetricWaker`,
+    /// `WorkType::SignalStorm`, etc.) where both workers in a
     /// group are intended to run on a sibling pair. The variant
     /// has no payload — the resolver picks an SMT-sibling pair
     /// from the cgroup's effective cpuset (or the full topology
@@ -97,7 +97,7 @@ pub enum AffinityIntent {
     ///
     /// Resolution is performed by the scenario engine's
     /// `resolve_affinity_for_cgroup` (topology-aware, not
-    /// available at the bare [`WorkloadHandle::spawn`] gate). The
+    /// available at the bare `WorkloadHandle::spawn` gate). The
     /// resolver searches the cpuset for a physical core with at
     /// least two thread siblings present and resolves to
     /// [`ResolvedAffinity::Fixed`] containing those two CPU IDs.
@@ -110,7 +110,7 @@ pub enum AffinityIntent {
     /// fallback — when no SMT-sibling pair is available
     /// (`threads_per_core == 1`, or the cpuset isolates each
     /// sibling onto a different CPU set). Callers must handle
-    /// the error; running [`WorkType::SmtSiblingSpin`] without
+    /// the error; running `WorkType::SmtSiblingSpin` without
     /// SMT siblings would produce a misleading result.
     SmtSiblingPair,
 }
@@ -164,7 +164,7 @@ pub enum ResolvedAffinity {
     /// - `count > from.len()` is clamped to `from.len()` — asking for
     ///   more CPUs than the pool contains is a topology fact, not a
     ///   caller error.
-    /// - `from` empty with `count > 0` is a caller bug: [`resolve_affinity`]
+    /// - `from` empty with `count > 0` is a caller bug: `resolve_affinity`
     ///   bails (an unsatisfiable sample request would otherwise produce an
     ///   empty `sched_setaffinity` mask that the kernel rejects with
     ///   `EINVAL`). The resolution step that produces this variant — see

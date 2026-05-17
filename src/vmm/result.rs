@@ -61,20 +61,20 @@ pub struct VmResult {
     /// KVM per-vCPU cumulative stats (requires Linux >= 5.14).
     pub kvm_stats: Option<KvmStatsTotals>,
     /// Crash message extracted from COM2 output via
-    /// [`crate::test_support::extract_panic_message`]. The guest
+    /// `crate::test_support::extract_panic_message`. The guest
     /// panic hook in `rust_init.rs` writes `PANIC: <info>\n<bt>\n`
     /// to `/dev/ttyS1` synchronously inside `KVM_RUN`, so the host
     /// captures the full backtrace in `output` even when the guest
     /// is wedged. `None` when no `PANIC:`-prefixed line was seen.
     pub crash_message: Option<String>,
     /// Wall-clock time from BSP exit to the moment
-    /// [`super::KtstrVm::collect_results`] finishes assembling
+    /// `super::KtstrVm::collect_results` finishes assembling
     /// [`VmResult`].
     /// Records the host-side cost of every teardown step that runs
     /// after the guest has stopped advancing: watchdog join, AP joins,
     /// monitor join, BPF-writer join, SHM drain, exit/crash-message
     /// extraction, and BPF verifier-stat read. Always `Some(_)` for
-    /// VMs whose [`super::KtstrVm::run_vm`] returns normally —
+    /// VMs whose `super::KtstrVm::run_vm` returns normally —
     /// including the host-watchdog timeout path, because
     /// `run_bsp_loop` exits cleanly with `timed_out = true` and
     /// `collect_results` still executes, populating the field.
@@ -88,8 +88,8 @@ pub struct VmResult {
     pub cleanup_duration: Option<Duration>,
     /// Host-side virtio-blk device counters, snapshotted after the
     /// guest has exited. `Some(_)` when the builder attached a disk
-    /// via [`super::KtstrVmBuilder::disk`]; `None` when no disk was
-    /// configured and [`super::KtstrVm::init_virtio_blk`] returned
+    /// via `super::KtstrVmBuilder::disk`; `None` when no disk was
+    /// configured and `super::KtstrVm::init_virtio_blk` returned
     /// `None`. The device increments its internal `AtomicU64`
     /// counters from `drain_bracket_impl` (production cfg: on the
     /// dedicated `ktstr-vblk` worker thread; cfg(test): inline on
@@ -109,7 +109,7 @@ pub struct VmResult {
     ///
     ///   - `reads_completed` — count of `VIRTIO_BLK_T_IN` requests
     ///     that returned `S_OK` to the guest. Bumped together with
-    ///     `bytes_read` per [`VirtioBlkCounters::record_read`].
+    ///     `bytes_read` per `VirtioBlkCounters::record_read`.
     ///   - `writes_completed` — count of `VIRTIO_BLK_T_OUT` requests
     ///     that returned `S_OK`. Bumped together with `bytes_written`.
     ///   - `flushes_completed` — count of `VIRTIO_BLK_T_FLUSH`
@@ -176,9 +176,9 @@ pub struct VmResult {
     pub virtio_blk_counters: Option<VirtioBlkCountersSnapshot>,
     /// Host-side virtio-net device counters, snapshotted after the
     /// guest has exited. `Some(_)` when the builder attached a
-    /// network via [`super::KtstrVmBuilder::network`]; `None` when
+    /// network via `super::KtstrVmBuilder::network`; `None` when
     /// no network was configured and
-    /// [`super::KtstrVm::init_virtio_net`] returned `None`. The
+    /// `super::KtstrVm::init_virtio_net` returned `None`. The
     /// device increments its internal `AtomicU64` counters on the
     /// vCPU thread inside `process_tx_loopback`; by the time
     /// `collect_results` constructs the [`VmResult`] every vCPU has
@@ -257,10 +257,10 @@ pub struct VmResult {
     /// Live scheduler-stats client. `Some(_)` when the run wired the
     /// virtio-console port-2 stats bridge (the in-tree path always
     /// does so, but tests that construct a [`VmResult`] manually via
-    /// [`Self::test_fixture`] leave this `None`). Test code that
+    /// `Self::test_fixture` leave this `None`). Test code that
     /// asserts on scheduler-reported metrics calls
-    /// [`super::SchedStatsClient::stats`] /
-    /// [`super::SchedStatsClient::stats_meta`] on this handle WHILE
+    /// `super::SchedStatsClient::stats` /
+    /// `super::SchedStatsClient::stats_meta` on this handle WHILE
     /// the guest is alive — calling after VM exit will time out
     /// because the relay thread has already exited. Cloneable;
     /// multiple test threads may share the same client.

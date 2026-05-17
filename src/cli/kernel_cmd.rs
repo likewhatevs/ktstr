@@ -498,7 +498,7 @@ pub(crate) fn eol_legend_if_any(any_eol: bool) -> Option<&'static str> {
 ///
 /// The `(corrupt)` tag is deliberately not in this legend family —
 /// its remediation is operational, not informational. See
-/// [`format_corrupt_footer`] for the full rationale.
+/// `format_corrupt_footer` for the full rationale.
 pub const UNTRACKED_KCONFIG_EXPLANATION: &str = "(untracked kconfig) marks entries with no recorded ktstr.kconfig hash \
      (pre-dates kconfig hash tracking). Rebuild with: kernel build --force VERSION \
      (add --extra-kconfig PATH if the original entry was built with a user fragment).";

@@ -461,7 +461,7 @@ impl TopologyConstraints {
 /// cgroup parent, default topology, gauntlet topology constraints,
 /// config-file plumbing, kernel sweep set, and assertion overrides.
 ///
-/// Construct via the [`declare_scheduler!`] macro (the production
+/// Construct via the `declare_scheduler!` macro (the production
 /// path) or the [`Scheduler::named`] const builder chain. Test bodies
 /// reference declared schedulers via the `scheduler = MY_SCHED`
 /// attribute on `#[ktstr_test]`.
@@ -935,8 +935,8 @@ pub struct KtstrTestEntry {
     pub config_content: Option<&'static str>,
     /// Optional virtio-blk disk attached to the VM at `/dev/vda`.
     /// `None` (the default) boots without a disk; `Some(cfg)` calls
-    /// [`crate::vmm::KtstrVmBuilder::disk`] in
-    /// [`crate::test_support::runtime::build_vm_builder_base`] so the
+    /// `crate::vmm::KtstrVmBuilder::disk` in
+    /// `crate::test_support::runtime::build_vm_builder_base` so the
     /// guest sees a raw block device sized per `cfg.capacity_mib`.
     /// The `#[ktstr_test]` macro does not currently surface this
     /// slot — direct construction via `..KtstrTestEntry::DEFAULT`
@@ -1571,7 +1571,7 @@ pub struct SchedulerJson {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum BinaryKindJson {
-    /// Cargo [[bin]] name. Verifier resolves via `build_and_find_binary`.
+    /// Cargo `[[bin]]` name. Verifier resolves via `build_and_find_binary`.
     Discover(String),
     /// Absolute filesystem path. Verifier checks `path.exists()` and uses verbatim.
     Path(String),
