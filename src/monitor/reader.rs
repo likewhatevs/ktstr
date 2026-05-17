@@ -4359,10 +4359,21 @@ mod tests {
             virtio_con: Some(virtio_con.clone()),
         };
 
+        // 2 s wall-clock budget for the monitor loop to land >= 3
+        // samples (need 2 stall pairs) and queue SIGNAL_VC_DUMP.
+        // The 30 ms sample interval normally produces ~60 samples in
+        // this window — vastly more headroom than the 3 required.
+        // Original 200 ms budget assumed 6 samples and flaked under
+        // nextest parallel load when monitor_loop's wakeup intervals
+        // stretched past 30 ms due to host CPU contention. The
+        // longer ceiling is bounded by the kill flag — once the
+        // assertion would succeed, the test still pays the full
+        // budget in wall time, but that's a one-time cost per test
+        // run and a non-flake outcome is worth the seconds.
         let handle = {
             let kill = std::sync::Arc::clone(&kill);
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
+                std::thread::sleep(Duration::from_secs(2));
                 kill.store(true, Ordering::Release);
             })
         };

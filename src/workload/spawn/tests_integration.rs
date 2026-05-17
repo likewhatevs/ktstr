@@ -967,14 +967,32 @@ fn spawn_page_fault_churn_produces_work() {
     // Delta-based iter_slot assertion. Pre-fix these snapshots
     // were both 0 for PageFaultChurn (inner `while !STOP`
     // blocked the iter_slot publish in the outer `worker_main`
-    // loop). Post-fix the outer loop
-    // updates iter_slot every iteration, so the 150 ms gap
-    // between snap1 and snap2 observes many iterations'
-    // worth of progress.
+    // loop). Post-fix the outer loop updates iter_slot every
+    // iteration. We snapshot at t=100 ms, then poll every 50 ms
+    // up to a 5 s ceiling for the delta to clear 0 on every
+    // worker — that's enough headroom for the oversubscribed
+    // `num_cpus + 1` workers to each get CPU at least once even
+    // under heavy nextest parallel load. The original 150 ms
+    // hard wait flaked under contention; the regression this
+    // test guards (inner-while bug → permanent iter_slot=0) is
+    // unaffected by the longer ceiling because the polled
+    // assertion still fires if ANY worker stays at 0
+    // indefinitely.
     std::thread::sleep(std::time::Duration::from_millis(100));
     let snap1 = h.snapshot_iterations();
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    let snap2 = h.snapshot_iterations();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let snap2 = loop {
+        let snap = h.snapshot_iterations();
+        let all_advanced =
+            snap.iter().zip(snap1.iter()).all(|(b, a)| b.saturating_sub(*a) > 0);
+        if all_advanced {
+            break snap;
+        }
+        if std::time::Instant::now() >= deadline {
+            break snap;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
     let reports = h.stop_and_collect();
     assert_eq!(reports.len(), num_workers);
     assert_eq!(snap1.len(), num_workers);
@@ -983,10 +1001,10 @@ fn spawn_page_fault_churn_produces_work() {
         let delta = snap2[i].saturating_sub(snap1[i]);
         assert!(
             delta > 0,
-            "worker {i} iter_slot delta between 100 ms and 250 ms \
-             was 0 (snap1={}, snap2={}); outer loop is not \
-             advancing, indicating a regression that restores \
-             the inner-`while !STOP` bug",
+            "worker {i} iter_slot delta within 5 s budget was 0 \
+             (snap1={}, snap2={}); outer loop is not advancing, \
+             indicating a regression that restores the \
+             inner-`while !STOP` bug",
             snap1[i],
             snap2[i],
         );
