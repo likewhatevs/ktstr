@@ -20,10 +20,10 @@ use tempfile::TempDir;
 
 use crate::assert::{AssertDetail, AssertResult, ScenarioStats};
 use crate::scenario::Ctx;
+use crate::sync::MutexExt;
+use crate::vmm::topology::Topology;
 
 use super::entry::{KtstrTestEntry, Scheduler, SchedulerSpec, TopologyConstraints};
-use crate::vmm::topology::Topology;
-use crate::sync::MutexExt;
 
 /// Serializes tests that mutate env vars. Shared across every
 /// `#[cfg(test)]` module in the crate: nextest runs tests in

@@ -92,10 +92,10 @@ use anyhow::Context;
 
 use crate::assert::{AssertResult, ScenarioStats};
 use crate::monitor::MonitorSummary;
+use crate::sync::MutexExt;
 use crate::test_support::PayloadMetrics;
 use crate::timeline::StimulusEvent;
 use crate::vmm;
-use crate::sync::MutexExt;
 
 use super::entry::KtstrTestEntry;
 use super::timefmt::{generate_run_id, now_iso8601};

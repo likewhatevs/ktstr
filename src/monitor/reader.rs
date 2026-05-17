@@ -20,13 +20,14 @@ use super::{
     CpuSnapshot, Kva, MonitorSample, RqSchedstat, SchedDomainSnapshot, SchedDomainStats,
     ScxEventCounters,
 };
+use crate::sync::MutexExt;
+
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::timerfd::TimerFd;
-use crate::sync::MutexExt;
 
 /// Per-NUMA-node host memory region within a GuestMem.
 #[derive(Debug, Clone, Copy)]

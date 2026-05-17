@@ -121,9 +121,9 @@ use crate::monitor::dump::{
     FailureDumpPercpuEntry, FailureDumpPercpuHashEntry, FailureDumpReport, FailureDumpRingbuf,
     FailureDumpStackTrace, PerCpuTimeStats, PerNodeNumaStats, ProbeBssCounters,
 };
-use crate::sync::MutexExt;
 use crate::monitor::scx_walker::{DsqState, RqScxState, ScxSchedState};
 use crate::monitor::task_enrichment::TaskEnrichment;
+use crate::sync::MutexExt;
 
 /// Maximum number of rendered keys captured into
 /// [`SnapshotError::NoMatch::available_keys`] during a failed

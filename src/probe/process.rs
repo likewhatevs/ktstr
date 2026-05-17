@@ -43,8 +43,7 @@ use super::btf::{BtfFunc, RenderHint, STRUCT_FIELDS};
 use super::stack::StackFunction;
 
 use crate::bpf_skel::types;
-use crate::sync::Latch;
-use crate::sync::RwLockExt;
+use crate::sync::{Latch, RwLockExt};
 
 /// Input for Phase B probe attachment (BPF fentry/fexit).
 ///
