@@ -257,7 +257,8 @@ pub(super) struct SnapshotStore {
     /// absent. Sample::stats reads `stats.get(tag)` — `None` is the
     /// expected shape for non-periodic tags or when the scheduler
     /// stats request failed.
-    pub(super) stats: HashMap<String, serde_json::Value>,
+    pub(super) stats:
+        HashMap<String, Result<serde_json::Value, super::error::MissingStatsReason>>,
     /// Elapsed milliseconds since `run_start` at the moment the
     /// periodic capture fired. Same key set as `reports` for
     /// periodic tags; absent for non-periodic captures. Read by
@@ -537,7 +538,7 @@ impl SnapshotBridge {
         &self,
         name: &str,
         report: FailureDumpReport,
-        stats: Option<serde_json::Value>,
+        stats: Option<Result<serde_json::Value, super::error::MissingStatsReason>>,
         elapsed_ms: Option<u64>,
     ) {
         self.store_internal(name, report, stats, elapsed_ms);
@@ -547,7 +548,7 @@ impl SnapshotBridge {
         &self,
         name: &str,
         report: FailureDumpReport,
-        stats: Option<serde_json::Value>,
+        stats: Option<Result<serde_json::Value, super::error::MissingStatsReason>>,
         elapsed_ms: Option<u64>,
     ) {
         let mut store = self.snapshots.lock_unpoisoned();
@@ -763,7 +764,7 @@ impl SnapshotBridge {
     ) -> Vec<(
         String,
         FailureDumpReport,
-        Option<serde_json::Value>,
+        Result<serde_json::Value, super::error::MissingStatsReason>,
         Option<u64>,
     )> {
         let mut store = self.snapshots.lock_unpoisoned();
@@ -774,12 +775,21 @@ impl SnapshotBridge {
         let mut out: Vec<(
             String,
             FailureDumpReport,
-            Option<serde_json::Value>,
+            Result<serde_json::Value, super::error::MissingStatsReason>,
             Option<u64>,
         )> = Vec::with_capacity(order.len());
+        // Bridge-absent stats slot collapses to the typed
+        // `NoSchedulerBinary` reason: the capture path that produced
+        // this tag never bundled a stats Result (non-periodic Op
+        // capture, or periodic without a stats client wired). The
+        // periodic path always bundles a Some(Result), so a `None`
+        // here is always the "no scheduler binary" case.
+        let stats_fallback = || {
+            Err(super::error::MissingStatsReason::NoSchedulerBinary)
+        };
         for tag in order {
             if let Some(report) = reports.remove(&tag) {
-                let s = stats.remove(&tag);
+                let s = stats.remove(&tag).unwrap_or_else(stats_fallback);
                 let e = elapsed.remove(&tag);
                 out.push((tag, report, s, e));
             }
@@ -801,7 +811,7 @@ impl SnapshotBridge {
                 tag: tag.clone(),
                 drain_variant: "drain_ordered_with_stats",
             });
-            let s = stats.remove(&tag);
+            let s = stats.remove(&tag).unwrap_or_else(stats_fallback);
             let e = elapsed.remove(&tag);
             out.push((tag, report, s, e));
         }

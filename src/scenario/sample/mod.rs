@@ -95,11 +95,13 @@ pub struct Sample<'a> {
     /// [`FailureDumpReport`] in place.
     pub snapshot: Snapshot<'a>,
     /// scx_stats JSON observed by a stats request issued just
-    /// BEFORE the freeze rendezvous. `None` when the stats client
-    /// was not wired (`scheduler_binary` is absent) or the request
-    /// failed (relay rejected, non-zero envelope errno, scheduler
-    /// not yet listening). [`SampleSeries::stats`] surfaces this
-    /// `None` as a per-sample
+    /// BEFORE the freeze rendezvous. `Err(reason)` when the stats
+    /// client was not wired (`scheduler_binary` is absent) or the
+    /// request failed — the carried
+    /// [`MissingStatsReason`](crate::scenario::snapshot::MissingStatsReason)
+    /// identifies the specific failure mode (no scheduler, relay
+    /// rejected, watchdog cancelled, scheduler errno, etc.).
+    /// [`SampleSeries::stats`] surfaces this `Err` as a per-sample
     /// [`SnapshotError::MissingStats`](crate::scenario::snapshot::SnapshotError::MissingStats)
     /// slot in the resulting [`SeriesField`] rather than vacuously
     /// skipping; temporal patterns handle that error per their own
@@ -109,7 +111,10 @@ pub struct Sample<'a> {
     /// strict patterns like `always_true` and `each` fail the
     /// assertion so a stats-coverage gap can never silently slip
     /// past the call site).
-    pub stats: Option<&'a serde_json::Value>,
+    pub stats: Result<
+        &'a serde_json::Value,
+        &'a crate::scenario::snapshot::MissingStatsReason,
+    >,
 }
 
 /// Ordered collection of [`Sample`]s drained from a
@@ -145,7 +150,7 @@ pub struct SampleSeries {
 struct SampleRow {
     tag: String,
     report: FailureDumpReport,
-    stats: Option<serde_json::Value>,
+    stats: Result<serde_json::Value, crate::scenario::snapshot::MissingStatsReason>,
     elapsed_ms: u64,
 }
 
@@ -188,6 +193,45 @@ impl SampleSeries {
             String,
             FailureDumpReport,
             Option<serde_json::Value>,
+            Option<u64>,
+        )>,
+        monitor: Option<MonitorReport>,
+    ) -> Self {
+        let rows = drained
+            .into_iter()
+            .map(|(tag, report, stats, elapsed_ms)| SampleRow {
+                tag,
+                report,
+                // Test/synthetic caller convention: `None` collapses to
+                // the `NoSchedulerBinary` reason because that's the
+                // shape every fixture has historically modelled — no
+                // scheduler client wired, no stats. Production callers
+                // that have a typed [`SchedStatsError`] use
+                // [`Self::from_drained_typed`] instead, which preserves
+                // the specific failure mode.
+                stats: stats.map(Ok).unwrap_or(Err(
+                    crate::scenario::snapshot::MissingStatsReason::NoSchedulerBinary,
+                )),
+                elapsed_ms: elapsed_ms.unwrap_or(0),
+            })
+            .collect();
+        Self { rows, monitor }
+    }
+
+    /// Production-path constructor: takes the typed
+    /// [`Result<serde_json::Value, MissingStatsReason>`](crate::scenario::snapshot::MissingStatsReason)
+    /// shape returned by
+    /// [`SnapshotBridge::drain_ordered_with_stats`](crate::scenario::snapshot::SnapshotBridge::drain_ordered_with_stats),
+    /// preserving the specific failure mode (relay error, scheduler
+    /// errno, watchdog cancellation, etc.). Use this when the caller
+    /// has access to the bridge drain output; tests prefer
+    /// [`Self::from_drained`] which accepts the simpler `Option`
+    /// shape and collapses absent → `NoSchedulerBinary`.
+    pub fn from_drained_typed(
+        drained: Vec<(
+            String,
+            FailureDumpReport,
+            Result<serde_json::Value, crate::scenario::snapshot::MissingStatsReason>,
             Option<u64>,
         )>,
         monitor: Option<MonitorReport>,
@@ -265,6 +309,7 @@ impl SampleSeries {
             stats: r.stats.as_ref(),
         })
     }
+
 
 }
 

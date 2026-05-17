@@ -22,10 +22,12 @@ impl SampleSeries {
     /// Project the series along the stats axis. The closure
     /// receives each sample's stats JSON (when present) and
     /// returns a [`SnapshotResult<T>`]. Samples whose `stats` is
-    /// `None` get a `Err(MissingStats)` slot — temporal assertions
-    /// surface that as a per-sample missing-stats failure rather
-    /// than vacuously skipping it, so a coverage gap is never
-    /// silent.
+    /// `Err(reason)` get a `Err(MissingStats { reason })` slot —
+    /// temporal assertions surface that as a per-sample
+    /// missing-stats failure rather than vacuously skipping it,
+    /// so a coverage gap is never silent and the operator sees
+    /// the *why* (no scheduler binary configured, relay timed
+    /// out, scheduler returned errno, etc.).
     ///
     /// `label` is owned (`impl Into<String>`) and matches the
     /// shape of [`Self::bpf`] — pass a literal or a runtime-built
@@ -35,9 +37,10 @@ impl SampleSeries {
         F: Fn(StatsValue<'_>) -> SnapshotResult<T>,
     {
         build_series_field(&self.rows, label, |row| match row.stats.as_ref() {
-            Some(v) => project(StatsValue { value: v }),
-            None => Err(crate::scenario::snapshot::SnapshotError::MissingStats {
+            Ok(v) => project(StatsValue { value: v }),
+            Err(reason) => Err(crate::scenario::snapshot::SnapshotError::MissingStats {
                 tag: row.tag.clone(),
+                reason: reason.clone(),
             }),
         })
     }
@@ -132,8 +135,8 @@ impl<'a> StatsPathProjector<'a> {
             None => return Vec::new(),
         };
         let stats = match row.stats.as_ref() {
-            Some(s) => s,
-            None => return Vec::new(),
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
         };
         let resolved = stats_path(stats, &self.path);
         let raw = match resolved.raw() {
@@ -266,21 +269,22 @@ mod tests {
 
     #[test]
     fn stats_projection_handles_missing_stats_as_error() {
+        use crate::scenario::snapshot::MissingStatsReason;
         let drained = vec![
             (
                 "periodic_000".to_string(),
                 synthetic_report(10),
-                Some(synthetic_stats(50.0)),
+                Ok(synthetic_stats(50.0)),
                 Some(100),
             ),
             (
                 "periodic_001".to_string(),
                 synthetic_report(20),
-                None,
+                Err(MissingStatsReason::NoSchedulerBinary),
                 Some(200),
             ),
         ];
-        let series = SampleSeries::from_drained(drained, None);
+        let series = SampleSeries::from_drained_typed(drained, None);
         let field: SeriesField<f64> = series.stats("busy", |s| s.path("busy").as_f64());
         let outcomes: Vec<SnapshotResult<f64>> = field.values_iter().cloned().collect();
         assert_eq!(outcomes.len(), 2);
@@ -290,14 +294,19 @@ mod tests {
             "sample with stats present must project the `busy` field verbatim"
         );
         match &outcomes[1] {
-            Err(crate::scenario::snapshot::SnapshotError::MissingStats { tag }) => {
+            Err(crate::scenario::snapshot::SnapshotError::MissingStats { tag, reason }) => {
                 assert_eq!(
                     tag, "periodic_001",
-                    "MissingStats tag must identify the sample whose stats slot was None"
+                    "MissingStats tag must identify the sample whose stats slot was Err"
+                );
+                assert_eq!(
+                    reason,
+                    &MissingStatsReason::NoSchedulerBinary,
+                    "MissingStats reason must propagate the carried MissingStatsReason verbatim"
                 );
             }
             other => panic!(
-                "sample with stats=None must surface SnapshotError::MissingStats, got {other:?}"
+                "sample with stats=Err must surface SnapshotError::MissingStats, got {other:?}"
             ),
         }
     }

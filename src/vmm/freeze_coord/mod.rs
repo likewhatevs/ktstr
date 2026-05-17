@@ -6358,24 +6358,26 @@ impl KtstrVm {
                                 // temporal-stats projection surfaces
                                 // a per-sample missing-stats failure
                                 // the test author can opt to ignore.
-                                let stats_value: Option<serde_json::Value> =
-                                    if let Some(ref client) = freeze_coord_stats_client {
-                                        match client.stats(&[]) {
-                                            Ok(v) => Some(v),
-                                            Err(e) => {
-                                                tracing::debug!(
-                                                    target: "ktstr::failure_dump",
-                                                    %tag,
-                                                    error = %e,
-                                                    "freeze-coord: periodic stats request \
-                                                     failed; bundling None into Sample"
-                                                );
-                                                None
-                                            }
+                                let stats_value: Option<Result<
+                                    serde_json::Value,
+                                    crate::scenario::snapshot::MissingStatsReason,
+                                >> = Some(if let Some(ref client) = freeze_coord_stats_client {
+                                    match client.stats(&[]) {
+                                        Ok(v) => Ok(v),
+                                        Err(e) => {
+                                            tracing::debug!(
+                                                target: "ktstr::failure_dump",
+                                                %tag,
+                                                error = %e,
+                                                "freeze-coord: periodic stats request \
+                                                 failed; bundling typed reason into Sample"
+                                            );
+                                            Err((&e).into())
                                         }
-                                    } else {
-                                        None
-                                    };
+                                    }
+                                } else {
+                                    Err(crate::scenario::snapshot::MissingStatsReason::NoSchedulerBinary)
+                                });
                                 // Sample timestamp anchor = the moment
                                 // the stats request COMPLETED (or
                                 // failed). Captured AFTER the stats
@@ -6470,7 +6472,7 @@ impl KtstrVm {
                                         vcpu_regs_count,
                                         tasks_enriched,
                                         elapsed_ms,
-                                        stats_present = stats_value.is_some(),
+                                        stats_present = matches!(stats_value, Some(Ok(_))),
                                         sample_elapsed_ms = sample_elapsed_ms_anchor,
                                         "freeze-coord: periodic snapshot captured"
                                     );

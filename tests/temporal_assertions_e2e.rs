@@ -57,7 +57,7 @@ fn assert_temporal_patterns(result: &VmResult) -> Result<()> {
     // bridge happened to also store under the same drain
     // (e.g. an Op::Snapshot fire from inside the scenario body) so
     // the temporal patterns walk a clean, contiguous timeline.
-    let series = SampleSeries::from_drained(
+    let series = SampleSeries::from_drained_typed(
         result.snapshot_bridge.drain_ordered_with_stats(),
         result.monitor.clone(),
     )

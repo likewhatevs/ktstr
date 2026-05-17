@@ -1764,7 +1764,7 @@ mod tests {
         assert!(
             matches!(
                 middle,
-                Err(SnapshotError::MissingStats { tag }) if tag == "periodic_001"
+                Err(SnapshotError::MissingStats { tag, .. }) if tag == "periodic_001"
             ),
             "middle slot must be MissingStats('periodic_001'), got {middle:?}"
         );

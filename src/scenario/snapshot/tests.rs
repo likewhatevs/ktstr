@@ -1785,17 +1785,21 @@
         bridge.store_with_stats(
             "periodic_000",
             FailureDumpReport::default(),
-            Some(stats.clone()),
+            Some(Ok(stats.clone())),
             Some(123),
         );
         bridge.store("periodic_001", FailureDumpReport::default());
         let drained = bridge.drain_ordered_with_stats();
         assert_eq!(drained.len(), 2);
         assert_eq!(drained[0].0, "periodic_000");
-        assert_eq!(drained[0].2, Some(stats));
+        assert_eq!(drained[0].2, Ok(stats));
         assert_eq!(drained[0].3, Some(123));
         assert_eq!(drained[1].0, "periodic_001");
-        assert!(drained[1].2.is_none());
+        assert_eq!(
+            drained[1].2,
+            Err(crate::scenario::snapshot::MissingStatsReason::NoSchedulerBinary),
+            "non-stats store collapses to NoSchedulerBinary",
+        );
         assert!(drained[1].3.is_none());
     }
 
@@ -1810,7 +1814,7 @@
             bridge.store_with_stats(
                 &format!("tag_{i:04}"),
                 FailureDumpReport::default(),
-                Some(serde_json::json!({"i": i})),
+                Some(Ok(serde_json::json!({"i": i}))),
                 Some(i as u64),
             );
         }
@@ -1818,7 +1822,7 @@
         bridge.store_with_stats(
             &overflow_tag,
             FailureDumpReport::default(),
-            Some(serde_json::json!({"overflow": true})),
+            Some(Ok(serde_json::json!({"overflow": true}))),
             Some(9_999),
         );
         let drained = bridge.drain_ordered_with_stats();
@@ -1830,7 +1834,7 @@
             .iter()
             .find(|(n, _, _, _)| n == &overflow_tag)
             .expect("overflow tag resident after evict");
-        assert_eq!(last.2, Some(serde_json::json!({"overflow": true})));
+        assert_eq!(last.2, Ok(serde_json::json!({"overflow": true})));
         assert_eq!(last.3, Some(9_999));
     }
 
@@ -1845,7 +1849,7 @@
         bridge.store_with_stats(
             "periodic_000",
             FailureDumpReport::default(),
-            Some(serde_json::json!({"first": true})),
+            Some(Ok(serde_json::json!({"first": true}))),
             Some(100),
         );
         // Overwrite via plain `store(...)` — should clear the
@@ -1853,7 +1857,11 @@
         bridge.store("periodic_000", FailureDumpReport::default());
         let drained = bridge.drain_ordered_with_stats();
         assert_eq!(drained.len(), 1);
-        assert!(drained[0].2.is_none());
+        assert_eq!(
+            drained[0].2,
+            Err(crate::scenario::snapshot::MissingStatsReason::NoSchedulerBinary),
+            "cleared stats slot collapses to NoSchedulerBinary",
+        );
         assert!(drained[0].3.is_none());
     }
 
@@ -2017,6 +2025,7 @@
             },
             SnapshotError::MissingStats {
                 tag: "scheduler".into(),
+                reason: crate::scenario::snapshot::MissingStatsReason::NoSchedulerBinary,
             },
         ];
         for case in cases {

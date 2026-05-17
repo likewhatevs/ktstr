@@ -62,7 +62,7 @@ fn assert_stats_round_trip(result: &VmResult) -> Result<()> {
          periodic_fired = {}",
         result.periodic_fired,
     );
-    let series = SampleSeries::from_drained(drained, result.monitor.clone()).periodic_only();
+    let series = SampleSeries::from_drained_typed(drained, result.monitor.clone()).periodic_only();
     anyhow::ensure!(
         !series.is_empty(),
         "no periodic-tagged entries on the bridge after the run"

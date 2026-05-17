@@ -7,6 +7,148 @@
 use super::HEX_KEY_PREFIX;
 
 // ---------------------------------------------------------------------------
+// Missing-stats reason
+// ---------------------------------------------------------------------------
+
+/// Why a sample's `stats` slot is unavailable — carried on
+/// [`SnapshotError::MissingStats`] so operator diagnostics name
+/// the specific failure mode rather than the generic "stats
+/// absent". Built by [`From<&crate::vmm::sched_stats::SchedStatsError>`]
+/// for the relay-failure path, plus dedicated variants for the
+/// pre-client gates that the [`SchedStatsError`] enum doesn't
+/// cover (no scheduler binary configured).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub enum MissingStatsReason {
+    /// No `scheduler_binary` was configured on the run, so the
+    /// freeze coordinator never wired a [`SchedStatsClient`].
+    /// Every periodic sample bypasses the stats request entirely
+    /// and lands here.
+    NoSchedulerBinary,
+    /// The guest relay never connected to the scheduler's Unix
+    /// socket (no scheduler running, or the scheduler refused the
+    /// connection).
+    NoScheduler { reason: String },
+    /// The host-side coordinator marked the run as freezing while
+    /// this stats request was in flight (or about to start);
+    /// scx_stats responses are undefined while the scheduler's
+    /// userspace thread is paused.
+    DuringFreeze,
+    /// The run-wide cancel flag was set (watchdog fired or the
+    /// run is shutting down) while this stats request was in
+    /// flight or about to start.
+    Cancelled,
+    /// The scheduler returned a non-zero `errno` in the typed
+    /// [`StatsResponse`] envelope. The `args` payload is preserved
+    /// so operators can render the scheduler-side message.
+    SchedulerError {
+        errno: i32,
+        args: serde_json::Value,
+    },
+    /// The typed envelope was decoded but the inner `args` map
+    /// did not contain the expected `"resp"` key — protocol
+    /// mismatch with the scheduler.
+    MissingResp { args: serde_json::Value },
+    /// The caller passed a stats request larger than the client's
+    /// [`MAX_REQUEST_BYTES`] cap.
+    RequestTooLarge { size: usize, max: usize },
+    /// The scheduler's response grew past
+    /// [`MAX_RESPONSE_BYTES`] without ever emitting a newline.
+    ResponseTooLarge { size: usize, max: usize },
+    /// The shared response mutex was poisoned by a previous
+    /// panic; the stats client cannot recover for this sample.
+    MutexPoisoned,
+}
+
+impl std::fmt::Display for MissingStatsReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSchedulerBinary => {
+                write!(f, "no scheduler_binary configured for this run")
+            }
+            Self::NoScheduler { reason } => {
+                write!(f, "guest relay reports no scheduler: {reason}")
+            }
+            Self::DuringFreeze => {
+                write!(
+                    f,
+                    "stats request cancelled — freeze coordinator paused the scheduler"
+                )
+            }
+            Self::Cancelled => {
+                write!(
+                    f,
+                    "stats request cancelled — run-wide cancel flag was set (watchdog or shutdown)"
+                )
+            }
+            Self::SchedulerError { errno, args } => {
+                write!(f, "scheduler returned errno={errno} (args={args})")
+            }
+            Self::MissingResp { args } => {
+                write!(f, "scheduler envelope missing 'resp' key (args={args})")
+            }
+            Self::RequestTooLarge { size, max } => {
+                write!(f, "stats request {size} bytes exceeds {max}-byte cap")
+            }
+            Self::ResponseTooLarge { size, max } => {
+                write!(f, "stats response {size} bytes exceeds {max}-byte cap")
+            }
+            Self::MutexPoisoned => {
+                write!(f, "stats client response mutex was poisoned")
+            }
+        }
+    }
+}
+
+impl From<&anyhow::Error> for MissingStatsReason {
+    /// Downcast the anyhow chain to a typed
+    /// [`SchedStatsError`](crate::vmm::sched_stats::SchedStatsError)
+    /// when one is present (every `SchedStatsClient` failure path
+    /// boxes a typed variant via `anyhow::anyhow!(SchedStatsError::…)`,
+    /// so the downcast succeeds on every well-formed sched_stats
+    /// error). Falls back to [`MissingStatsReason::NoScheduler`]
+    /// carrying the rendered display when the downcast fails — that
+    /// covers serde / IO / other errors that didn't originate inside
+    /// [`SchedStatsClient`] but still surface through the same
+    /// `Result<_, anyhow::Error>` return.
+    fn from(e: &anyhow::Error) -> Self {
+        if let Some(typed) = e.downcast_ref::<crate::vmm::sched_stats::SchedStatsError>() {
+            return Self::from(typed);
+        }
+        Self::NoScheduler {
+            reason: e.to_string(),
+        }
+    }
+}
+
+impl From<&crate::vmm::sched_stats::SchedStatsError> for MissingStatsReason {
+    fn from(e: &crate::vmm::sched_stats::SchedStatsError) -> Self {
+        use crate::vmm::sched_stats::SchedStatsError as S;
+        match e {
+            S::Poisoned => Self::MutexPoisoned,
+            S::RequestTooLarge { size, max } => Self::RequestTooLarge {
+                size: *size,
+                max: *max,
+            },
+            S::ResponseTooLarge { size, max } => Self::ResponseTooLarge {
+                size: *size,
+                max: *max,
+            },
+            S::DuringFreeze => Self::DuringFreeze,
+            S::Cancelled => Self::Cancelled,
+            S::NoScheduler { reason } => Self::NoScheduler {
+                reason: reason.clone(),
+            },
+            S::SchedulerError { errno, args } => Self::SchedulerError {
+                errno: *errno,
+                args: args.clone(),
+            },
+            S::MissingResp { args } => Self::MissingResp { args: args.clone() },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
 
@@ -137,15 +279,21 @@ pub enum SnapshotError {
     /// the report.
     PlaceholderSample { tag: String, reason: String },
     /// A [`SampleSeries::stats`](crate::scenario::sample::SampleSeries::stats)
-    /// projection ran on a sample whose `stats` field is `None`
-    /// — the stats client was not wired (no `scheduler_binary`)
-    /// or the per-sample stats request failed (relay rejected,
-    /// non-zero envelope errno, scheduler not yet listening).
+    /// projection ran on a sample whose `stats` field carries an
+    /// `Err` — the stats client was not wired (no
+    /// `scheduler_binary`) or the per-sample stats request failed.
+    /// The carried [`MissingStatsReason`] identifies the *why* so
+    /// operator diagnostics distinguish "no scheduler configured"
+    /// from "scheduler refused the request" from "watchdog
+    /// cancelled the request" without re-walking the source error.
     /// Distinguishes a per-sample stats coverage gap from an
     /// in-stats-JSON path miss (`TypeMismatch` /
     /// `FieldNotFound`) so the temporal-assertion site can
     /// branch on the cause without re-walking the source.
-    MissingStats { tag: String },
+    MissingStats {
+        tag: String,
+        reason: MissingStatsReason,
+    },
     /// A [`SampleSeries::host`](crate::scenario::sample::SampleSeries::host)
     /// projection ran on a sample whose `per_cpu_time` slice did
     /// not include `cpu` — placeholder report (freeze rendezvous
@@ -313,11 +461,8 @@ impl std::fmt::Display for SnapshotError {
                      {reason}"
                 )
             }
-            SnapshotError::MissingStats { tag } => {
-                write!(
-                    f,
-                    "sample '{tag}': stats absent (relay error or no scheduler)"
-                )
+            SnapshotError::MissingStats { tag, reason } => {
+                write!(f, "sample '{tag}': stats absent ({reason})")
             }
             SnapshotError::HostFieldUnavailable { tag, cpu } => {
                 write!(

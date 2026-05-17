@@ -139,7 +139,7 @@ pub(super) const HEX_KEY_PREFIX: &str = "hex:";
 
 mod error;
 
-pub use error::{SnapshotError, SnapshotResult};
+pub use error::{MissingStatsReason, SnapshotError, SnapshotResult};
 
 mod bridge;
 
