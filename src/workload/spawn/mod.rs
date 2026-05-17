@@ -165,6 +165,50 @@ pub(super) fn apply_mempolicy_with_flags(policy: &MemPolicy, flags: MpolFlags) {
     }
 }
 
+/// Terminate the calling forked-child worker with success status (code 0).
+///
+/// Uses the `_exit(2)` syscall via `libc::_exit` directly rather than [`std::process::exit`] or
+/// returning from `main` so that:
+/// 1. Rust drop glue does NOT run on inherited parent state (open file
+///    descriptors, mmaps, atexit handlers, thread-local destructors).
+///    Forked children share address space with the parent at fork
+///    time; running destructors on the child side would also tear down
+///    parent-owned resources via the shared FD table / OS handles.
+/// 2. `exit_group(2)` semantics (which `_exit` invokes) tear down only
+///    the calling tgid. Forked children have their own tgid distinct
+///    from the test-runner's, so the parent test runner survives.
+///
+/// Code 0 signals to the parent's collect_results path that the worker
+/// completed the work-loop normally — the WorkerReport (if any was
+/// written) is valid and should be merged into the test verdict.
+#[inline]
+fn exit_child_success() -> ! {
+    // SAFETY: `libc::_exit` is `unsafe` because it bypasses Rust drop
+    // execution + C stdlib atexit. That bypass IS the contract here
+    // for forked children: running destructors on shared inherited
+    // state corrupts parent-owned resources. exit_group(2) tear-down
+    // of the child's tgid is sound — the parent is in a different
+    // tgid.
+    unsafe { libc::_exit(0) }
+}
+
+/// Terminate the calling forked-child worker with error status (code 1).
+///
+/// Same `_exit`-vs-Rust-exit rationale as [`exit_child_success`]. Code 1
+/// signals to the parent's collect_results path that the worker failed
+/// before completing the work-loop normally — the parent treats the
+/// WorkerReport as missing or invalid and surfaces the failure to the
+/// test verdict.
+///
+/// Use this on any error path inside the forked-child closure: poll
+/// timeout, syscall failure, panic via `catch_unwind`, write-report
+/// failure, orphan detection.
+#[inline]
+fn exit_child_error() -> ! {
+    // SAFETY: see [`exit_child_success`] — identical contract.
+    unsafe { libc::_exit(1) }
+}
+
 /// Apply `nice` to the calling worker via `setpriority(2)`.
 ///
 /// Always invokes `setpriority(PRIO_PROCESS, 0, nice)` — including
@@ -1988,9 +2032,7 @@ pub(super) fn spawn_pcomm_container(
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
             }
             if std::env::var_os("KTSTR_GUEST_INIT").is_none() && unsafe { libc::getppid() } == 1 {
-                unsafe {
-                    libc::_exit(0);
-                }
+                exit_child_success();
             }
             unsafe {
                 libc::setpgid(0, 0);
@@ -2140,8 +2182,9 @@ pub(super) fn spawn_pcomm_container(
             // Wait for the parent's start byte (poll with 30s
             // timeout — same budget as the conventional fork
             // worker). Match the conventional worker's behaviour:
-            // on `poll <= 0` _exit(1) so the parent's collect path
-            // observes a missing report and emits sentinels.
+            // on `poll <= 0` call exit_child_error so the parent's
+            // collect path observes a missing report and emits
+            // sentinels.
             let mut pfd = libc::pollfd {
                 fd: start_fds[0],
                 events: libc::POLLIN,
@@ -2149,9 +2192,7 @@ pub(super) fn spawn_pcomm_container(
             };
             let ret = unsafe { libc::poll(&mut pfd, 1, 30_000) };
             if ret <= 0 {
-                unsafe {
-                    libc::_exit(1);
-                }
+                exit_child_error();
             }
             let mut buf = [0u8; 1];
             {
@@ -2213,17 +2254,15 @@ pub(super) fn spawn_pcomm_container(
                     // resolve_affinity bails on caller bugs (count==0,
                     // empty pool). In the pcomm container's forked-
                     // child context we cannot propagate Err up; the
-                    // surrounding convention (grep `libc::_exit` for
-                    // the sibling forked-child failure sites in this
-                    // file — the start-byte poll-timeout bail, the
-                    // EventFd::new bail, the thread::Builder::spawn
-                    // bail) is eprintln + _exit so the parent collects
-                    // a missing-report rather than silently spawning
-                    // workers without the affinity the test author
-                    // requested. Aligns with the project-wide
-                    // no-silent-drops invariant; the prior
-                    // degrade-to-None behaviour was a violation we
-                    // close here.
+                    // convention is eprintln + [`exit_child_error`]
+                    // (the named helper used by every forked-child
+                    // failure site in this file — start-byte
+                    // poll-timeout bail, EventFd::new bail,
+                    // thread::Builder::spawn bail) so the parent
+                    // collects a missing-report rather than silently
+                    // spawning workers without the affinity the test
+                    // author requested. The prior degrade-to-None
+                    // behaviour was a silent-drop bug we close here.
                     let affinity = match resolve_affinity(&group.affinity) {
                         Ok(a) => a,
                         Err(e) => {
@@ -2234,22 +2273,13 @@ pub(super) fn spawn_pcomm_container(
                                  without the requested affinity (no silent drops).",
                                 group.group_idx,
                             );
-                            // SAFETY: `_exit` is the standard async-
-                            // signal-safe exit primitive used at every
-                            // other forked-child failure site in this
-                            // file (grep `libc::_exit` for siblings).
-                            // Argument is a plain `c_int`; no resources
-                            // need unwind. Kernel-side `_exit` invokes
-                            // `exit_group(2)`, terminating every thread
-                            // in this child process atomically —
-                            // sibling worker threads spawned in earlier
-                            // loop iterations are killed along with
-                            // this one, the intended fail-stop
-                            // behaviour (the parent observes a missing
-                            // report and surfaces a sentinel).
-                            unsafe {
-                                libc::_exit(1);
-                            }
+                            // exit_group(2) tears down every sibling
+                            // worker thread spawned in earlier loop
+                            // iterations along with this one — the
+                            // intended fail-stop behaviour (parent
+                            // observes a missing report and surfaces
+                            // a sentinel).
+                            exit_child_error();
                         }
                     };
 
@@ -2320,8 +2350,8 @@ pub(super) fn spawn_pcomm_container(
                             // Hard fail: continuing with fewer
                             // threads silently breaks the
                             // workload's worker count and the
-                            // parent's report count. _exit(1) so
-                            // the parent's sentinel path observes
+                            // parent's report count. exit_child_error
+                            // so the parent's sentinel path observes
                             // a missing payload and emits one
                             // sentinel per expected report. Reuses
                             // the same fail-stop contract as the
@@ -2333,9 +2363,7 @@ pub(super) fn spawn_pcomm_container(
                                 group.group_idx,
                                 i + 1,
                             );
-                            unsafe {
-                                libc::_exit(1);
-                            }
+                            exit_child_error();
                         }
                     };
                     let exit_evt_thread = std::sync::Arc::clone(&exit_evt);
@@ -2387,19 +2415,17 @@ pub(super) fn spawn_pcomm_container(
                             // Hard fail: see EventFd path above.
                             // A partially-spawned container leaves
                             // the parent guessing about which
-                            // reports are real vs missing; an
-                            // _exit(1) collapses to the parent's
-                            // sentinel path with deterministic
-                            // cardinality.
+                            // reports are real vs missing;
+                            // exit_child_error collapses to the
+                            // parent's sentinel path with
+                            // deterministic cardinality.
                             eprintln!(
                                 "ktstr: pcomm container (group {}): thread::spawn for \
                                  worker {}/{num_workers} failed: {e}; aborting container",
                                 group.group_idx,
                                 i + 1,
                             );
-                            unsafe {
-                                libc::_exit(1);
-                            }
+                            exit_child_error();
                         }
                     }
                 }
@@ -2595,8 +2621,9 @@ pub(super) fn spawn_pcomm_container(
             // per-child pipe used by every other forked worker.
             // The parent decodes via
             // `serde_json::from_slice::<Vec<WorkerReport>>`. Encode
-            // failures fall through to `_exit(0)` — the parent's
-            // sentinel path handles missing / truncated payloads.
+            // failures fall through to exit_child_success — the
+            // parent's sentinel path handles missing / truncated
+            // payloads.
             // tracing is unsafe in a forked child (the parent's
             // subscriber may hold a lock); use eprintln + raw fd.
             let bytes = match serde_json::to_vec(&reports) {
@@ -2621,9 +2648,7 @@ pub(super) fn spawn_pcomm_container(
                 }
                 drop(f);
             }
-            unsafe {
-                libc::_exit(0);
-            }
+            exit_child_success();
         }
         child_pid => {
             // Parent. Restore signal mask, close the wrong ends,
@@ -3741,9 +3766,7 @@ impl WorkloadHandle {
                     if std::env::var_os("KTSTR_GUEST_INIT").is_none()
                         && unsafe { libc::getppid() } == 1
                     {
-                        unsafe {
-                            libc::_exit(0);
-                        }
+                        exit_child_success();
                     }
                     // Make this worker its own process-group leader so
                     // any descendants it spawns inherit `pgid == worker_pid`.
@@ -4069,9 +4092,7 @@ impl WorkloadHandle {
                             };
                             let ret = unsafe { libc::poll(&mut pfd, 1, 30_000) };
                             if ret <= 0 {
-                                unsafe {
-                                    libc::_exit(1);
-                                }
+                                exit_child_error();
                             }
                             let mut buf = [0u8; 1];
                             let mut f = unsafe { std::fs::File::from_raw_fd(start_fds[0]) };
@@ -4181,9 +4202,10 @@ impl WorkloadHandle {
                             }
                             drop(f);
                         }));
-                    let code = if child_result.is_ok() { 0 } else { 1 };
-                    unsafe {
-                        libc::_exit(code);
+                    if child_result.is_ok() {
+                        exit_child_success();
+                    } else {
+                        exit_child_error();
                     }
                 }
                 child_pid => {
