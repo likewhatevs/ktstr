@@ -680,9 +680,9 @@ pub enum SnapshotBridgeEvent {
     /// `events_dropped > 0` (resets to 0 after drain), so the
     /// operator never silently loses events — they see a count of
     /// how many were dropped between drains. Test authors who care
-    /// about exhaustive coverage should `assert!(matches!(events
-    /// .last(), Some(SnapshotBridgeEvent::EventLogTruncated { .. }))
-    /// .not())` to fail when the bridge truncated.
+    /// about exhaustive coverage should `assert!(!matches!(events
+    /// .last(), Some(SnapshotBridgeEvent::EventLogTruncated { .. })))`
+    /// to fail when the bridge truncated.
     EventLogTruncated {
         /// Number of events evicted from the front of the log since
         /// the last [`SnapshotBridge::drain_events`] call. Resets to
