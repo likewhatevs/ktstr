@@ -658,9 +658,17 @@ fn scenario_disk_default_appears_at_dev_vda(_ctx: &ktstr::scenario::Ctx) -> Resu
 fn scenario_disk_write_read_roundtrip(_ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::fs::OpenOptionsExt;
 
     const SECTOR_SIZE: usize = 512;
     const PATTERN_BYTE: u8 = 0xA5;
+
+    // O_DIRECT-aligned sector buffer. Without 512-byte alignment, the
+    // kernel rejects the O_DIRECT readback with EINVAL. `#[repr(align(512))]`
+    // forces the struct's first byte (and thus `.0` array's first byte)
+    // onto a 512-byte boundary regardless of stack layout.
+    #[repr(align(512))]
+    struct AlignedSector([u8; SECTOR_SIZE]);
 
     let path = std::path::Path::new("/dev/vda");
     let mut file = OpenOptions::new()
@@ -684,29 +692,39 @@ fn scenario_disk_write_read_roundtrip(_ctx: &ktstr::scenario::Ctx) -> Result<Ass
     // Sync to push the data through the kernel block layer to the
     // virtio device — without this, the write could sit in the page
     // cache and a subsequent read would short-circuit there instead
-    // of round-tripping through the device.
+    // of round-tripping through the device. Also makes the WRITE
+    // observable on the host's virtio-blk counters (record_write
+    // fires per-request; record_flush fires on VIRTIO_BLK_T_FLUSH).
     file.sync_all()
         .map_err(|e| anyhow::anyhow!("fsync /dev/vda after write: {e}"))?;
 
-    // Re-open for read so the read goes through the block device
-    // path again rather than reusing the same file's seek state in
-    // a way that could mask aliasing bugs.
+    // Re-open for read with O_DIRECT so the readback bypasses the
+    // bdev buffer cache and unconditionally reaches the device.
+    // Without O_DIRECT the pwrite+fsync above leaves the sector in
+    // the buffer cache; a subsequent pread typically short-circuits
+    // there and never bumps the host's record_read counter. O_DIRECT
+    // forces the kernel to issue a virtio-blk READ for every page
+    // touched, which is exactly what the upstream host-side
+    // counter-assertion test needs to observe (see post_vm callback
+    // `assert_virtio_blk_counters_nonzero_after_roundtrip`).
     let mut readback = OpenOptions::new()
         .read(true)
+        .custom_flags(libc::O_DIRECT)
         .open(path)
-        .map_err(|e| anyhow::anyhow!("re-open /dev/vda for readback: {e}"))?;
-    let mut buf = [0u8; SECTOR_SIZE];
+        .map_err(|e| anyhow::anyhow!("re-open /dev/vda for O_DIRECT readback: {e}"))?;
+    let mut buf = AlignedSector([0u8; SECTOR_SIZE]);
     readback
         .seek(SeekFrom::Start(0))
         .map_err(|e| anyhow::anyhow!("seek to sector 0 for read: {e}"))?;
     readback
-        .read_exact(&mut buf)
-        .map_err(|e| anyhow::anyhow!("read sector 0: {e}"))?;
+        .read_exact(&mut buf.0)
+        .map_err(|e| anyhow::anyhow!("O_DIRECT read sector 0: {e}"))?;
 
-    if buf != pattern {
+    if buf.0 != pattern {
         // Find the first byte that differs to give a diagnostic
         // pointer into the corruption.
         let first_bad = buf
+            .0
             .iter()
             .zip(pattern.iter())
             .position(|(a, b)| a != b)
@@ -715,9 +733,9 @@ fn scenario_disk_write_read_roundtrip(_ctx: &ktstr::scenario::Ctx) -> Result<Ass
             "/dev/vda sector 0 readback mismatch: byte {first_bad} \
              read=0x{:02X} expected=0x{:02X}. The first 16 bytes \
              read back as {:02X?}, expected {:02X?}.",
-            buf[first_bad],
+            buf.0[first_bad],
             pattern[first_bad],
-            &buf[..16.min(buf.len())],
+            &buf.0[..16.min(buf.0.len())],
             &pattern[..16.min(pattern.len())],
         );
     }
@@ -799,10 +817,137 @@ fn scenario_disk_read_only_rejects_write(_ctx: &ktstr::scenario::Ctx) -> Result<
     Ok(result)
 }
 
-// Counter-introspection scenario is a follow-up — once `VmResult`
-// exposes `virtio_blk_counters`, a separate test will assert
-// host-side counter values directly. The three scenarios above
-// cover guest-visible behavior end-to-end.
+/// Host-side `post_vm` callback for the
+/// `vm_integration_disk_virtio_blk_counters_handoff` entry below.
+/// Asserts that the freeze-coordinator's snapshot-at-assignment seam
+/// (`run.virtio_blk_counters.as_deref().map(|c| c.snapshot())` →
+/// [`crate::vmm::VmResult::virtio_blk_counters`]) actually delivers
+/// the device's live atomic counters into the host's plain-u64
+/// snapshot after the guest exits.
+///
+/// The entry reuses [`scenario_disk_write_read_roundtrip`] as the
+/// guest workload — that scenario writes a 512-byte pattern to
+/// sector 0 of `/dev/vda`, fsyncs, and reads it back via
+/// O_DIRECT (bypassing the bdev buffer cache so the read
+/// unconditionally reaches the device). After the VM exits, this
+/// callback verifies that the host-side counters observed both
+/// the write, the read, and the flush end-to-end through the
+/// virtio-blk request-processing path (named in framework as
+/// `VirtioBlk::process_requests` → `VirtioBlkCounters::record_read`
+/// / `record_write` / `record_flush`; these symbols are
+/// `pub(crate)` so intra-doc links don't resolve from integration
+/// tests — see `src/vmm/virtio_blk/` for the implementation).
+///
+/// Lower bounds, not exact equality: the guest kernel may issue
+/// additional reads (e.g. partition-table scan, superblock probe)
+/// before or after the roundtrip, so `reads_completed` and
+/// `bytes_read` floor at the single roundtrip read. `bytes_written`
+/// floors at 512 because the test write is the sole writer in a
+/// fresh VM with no filesystem mounted on `/dev/vda`.
+///
+/// Regression coverage: without this callback, a future change that
+/// snapshots `VirtioBlkCounters` BEFORE the worker has drained
+/// in-flight notifications (or that wires the snapshot to the wrong
+/// `Arc<VirtioBlkCounters>`) would silently report all zeros — every
+/// existing guest-visible disk test would still pass because the
+/// readback bytes are correct, but the host's introspection surface
+/// would be broken.
+fn assert_virtio_blk_counters_nonzero_after_roundtrip(
+    result: &ktstr::prelude::VmResult,
+) -> Result<()> {
+    let counters = result.virtio_blk_counters.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "result.virtio_blk_counters is None despite the entry attaching \
+             a DiskConfig — the snapshot-at-assignment seam in \
+             freeze_coord did not populate VmResult.virtio_blk_counters, \
+             or the device was never wired into the run state at all"
+        )
+    })?;
+    anyhow::ensure!(
+        counters.reads_completed >= 1,
+        "reads_completed = {} (expected >= 1 after the readback in \
+         scenario_disk_write_read_roundtrip): the guest performed a 512-byte \
+         pread of /dev/vda sector 0 but no read landed on the host counter — \
+         the device never observed the request OR the counter was snapshotted \
+         before record_read fired",
+        counters.reads_completed,
+    );
+    anyhow::ensure!(
+        counters.writes_completed >= 1,
+        "writes_completed = {} (expected >= 1 after the pattern write): the \
+         guest performed a 512-byte pwrite + fsync but no write landed on the \
+         host counter",
+        counters.writes_completed,
+    );
+    anyhow::ensure!(
+        counters.bytes_read >= 512,
+        "bytes_read = {} (expected >= 512 = one full sector readback): the \
+         guest issued the readback but the byte total never reached the \
+         counter (record_read parameter wrong, or the read never reached the \
+         backing-file `pread`)",
+        counters.bytes_read,
+    );
+    anyhow::ensure!(
+        counters.bytes_written >= 512,
+        "bytes_written = {} (expected >= 512 = one full sector pattern \
+         write): the guest issued the pwrite + fsync but the byte total never \
+         reached the counter (record_write parameter wrong, or the write never \
+         reached the backing-file `pwrite`)",
+        counters.bytes_written,
+    );
+    anyhow::ensure!(
+        counters.flushes_completed >= 1,
+        "flushes_completed = {} (expected >= 1 after fsync): the guest \
+         issued sync_all on /dev/vda which translates to VIRTIO_BLK_T_FLUSH \
+         per the virtio-spec + drivers/block/virtio_blk.c REQ_OP_FLUSH path, \
+         but no flush landed on the host counter — the handle_flush / \
+         record_flush wiring may be broken or the snapshot fired before \
+         the flush completion",
+        counters.flushes_completed,
+    );
+    // Upper-bound sanity caps: a regression that multiplies counters by
+    // a wrong factor (e.g. unit confusion bytes-as-bits, or a counter-
+    // bump loop double-counting) would pass the `>= 1` / `>= 512` floors
+    // above. The caps below are generous slack — the test issues 1
+    // operator write + 1 operator read of 512 bytes each, plus
+    // discovery-time partition-probe reads. Real-world counter values
+    // settle in the single-digit-requests / single-digit-KiB range.
+    // Cap thresholds catch ×1000+ regressions while tolerating any
+    // plausible kernel/probe-read variance.
+    const SANE_REQ_CAP: u64 = 1000;
+    const SANE_BYTES_CAP: u64 = 64 * 1024 * 1024;
+    anyhow::ensure!(
+        counters.writes_completed < SANE_REQ_CAP,
+        "writes_completed = {} exceeds sanity cap {SANE_REQ_CAP}: the \
+         operator issued 1 write; counter-bump regression suspected \
+         (multiplication / loop / unit confusion)",
+        counters.writes_completed,
+    );
+    anyhow::ensure!(
+        counters.bytes_written < SANE_BYTES_CAP,
+        "bytes_written = {} exceeds sanity cap {SANE_BYTES_CAP} (64 MiB) \
+         on a single 512-byte operator write: counter-bump regression \
+         suspected (bytes-as-bits, multi-counting, or byte-count parameter \
+         mismatch with record_write)",
+        counters.bytes_written,
+    );
+    anyhow::ensure!(
+        counters.reads_completed < SANE_REQ_CAP,
+        "reads_completed = {} exceeds sanity cap {SANE_REQ_CAP}: the \
+         operator issued 1 O_DIRECT read; kernel partition probes plausibly \
+         add a handful more. Above {SANE_REQ_CAP} indicates a \
+         counter-bump regression",
+        counters.reads_completed,
+    );
+    anyhow::ensure!(
+        counters.bytes_read < SANE_BYTES_CAP,
+        "bytes_read = {} exceeds sanity cap {SANE_BYTES_CAP} (64 MiB) \
+         on a single 512-byte O_DIRECT read + a handful of partition \
+         probes: counter-bump regression suspected",
+        counters.bytes_read,
+    );
+    Ok(())
+}
 
 // ----------------------------------------------------------------------------
 // Entry registrations
@@ -887,38 +1032,8 @@ static __KTSTR_ENTRY_DUMP_TRIGGER: ktstr::test_support::KtstrTestEntry =
     };
 
 // ----------------------------------------------------------------------------
-// `#[test] #[ignore]` shims — cargo nextest entry points
+// `#[test] #[ignore]` shims — nextest entry points for `cargo ktstr test`
 // ----------------------------------------------------------------------------
-//
-// The five scenarios above are registered with the `KTSTR_TESTS`
-// distributed_slice and run via `cargo ktstr test --filter <name>`,
-// which is the canonical pattern for tests that need a real KVM VM
-// (see `failure_dump_e2e.rs`, `eevdf_tests.rs`, `scenario_coverage.rs`).
-//
-// The shims below let the same scenarios surface under
-// `cargo nextest run --run-ignored all` by shelling out to
-// `cargo ktstr test --filter <scenario_name>`. Each shim is gated
-// `#[ignore]` because:
-//   - VM boot requires a built kernel image cache (~10-100MB),
-//     a built scx-ktstr scheduler binary, /dev/kvm access,
-//     `kernel.perf_event_paranoid <= 2` for the perf-counter test,
-//     and CONFIG_SCHED_DEADLINE in the guest kernel for the Deadline test.
-//   - Each test takes ~10-30 seconds (boot + run + freeze + teardown).
-//   - Default `cargo nextest run` would hang or fail on hosts
-//     without these prerequisites.
-//
-// Run all five via:
-//
-// ```bash
-// cargo nextest run --test vm_integration --run-ignored all
-// # OR (canonical):
-// cargo ktstr test --kernel ../linux \
-//     --filter "vm_integration_dsq_and_rq_walker|\
-// vm_integration_perf_counters_capture|\
-// vm_integration_event_counter_timeline|\
-// vm_integration_sched_deadline|\
-// vm_integration_failure_dump_trigger"
-// ```
 
 /// Locate the `cargo-ktstr` binary built for this test pass.
 /// `CARGO_BIN_EXE_<name>` is set at compile time for every `[[bin]]`
@@ -989,11 +1104,7 @@ fn drive_ktstr_test(scenario_name: &str) {
 /// - `/dev/kvm` accessible
 /// - guest kernel with CONFIG_SCHED_CLASS_EXT + CONFIG_DEBUG_INFO_BTF
 #[test]
-#[ignore = "long-running VM integration test (~30s); requires KVM, \
-            ../linux, scx-ktstr binary, kernel BTF. Run via \
-            `cargo nextest run --run-ignored all` or \
-            `cargo ktstr test --kernel ../linux \
-            --filter vm_integration_dsq_and_rq_walker`."]
+#[ignore = "requires KVM, ../linux, scx-ktstr, kernel BTF"]
 fn vm_integration_dsq_and_rq_walker() {
     drive_ktstr_test("vm_integration_dsq_and_rq_walker");
 }
@@ -1007,12 +1118,7 @@ fn vm_integration_dsq_and_rq_walker() {
 /// - `kernel.perf_event_paranoid <= 2` on the host
 /// - `CAP_PERFMON` (or root) in the test runner
 #[test]
-#[ignore = "long-running VM integration test (~30s); requires KVM, \
-            ../linux, scx-ktstr binary, AND kernel.perf_event_paranoid \
-            <= 2 on the host (CAP_PERFMON or root). Run via \
-            `cargo nextest run --run-ignored all` or \
-            `cargo ktstr test --kernel ../linux \
-            --filter vm_integration_perf_counters_capture`."]
+#[ignore = "requires KVM, ../linux, scx-ktstr, kernel.perf_event_paranoid <= 2 (CAP_PERFMON or root)"]
 fn vm_integration_perf_counters_capture() {
     drive_ktstr_test("vm_integration_perf_counters_capture");
 }
@@ -1023,11 +1129,7 @@ fn vm_integration_perf_counters_capture() {
 /// window. Pins the per-monitor-tick capture loop + SCX_EV_*
 /// offset resolution + `EventCounterCapture` attach path.
 #[test]
-#[ignore = "long-running VM integration test (~45s, longer duration \
-            for timeline samples); requires KVM, ../linux, \
-            scx-ktstr. Run via `cargo nextest run --run-ignored all` \
-            or `cargo ktstr test --kernel ../linux \
-            --filter vm_integration_event_counter_timeline`."]
+#[ignore = "requires KVM, ../linux, scx-ktstr"]
 fn vm_integration_event_counter_timeline() {
     drive_ktstr_test("vm_integration_event_counter_timeline");
 }
@@ -1043,11 +1145,7 @@ fn vm_integration_event_counter_timeline() {
 /// `sched_setattr` path. `expect_err: false` because the success
 /// path is what's under test.
 #[test]
-#[ignore = "VM integration test (~10s); requires KVM, ../linux, \
-            scx-ktstr, AND guest kernel with CONFIG_SCHED_DEADLINE. \
-            Run via `cargo nextest run --run-ignored all` or \
-            `cargo ktstr test --kernel ../linux \
-            --filter vm_integration_sched_deadline`."]
+#[ignore = "requires KVM, ../linux, scx-ktstr, CONFIG_SCHED_DEADLINE in guest"]
 fn vm_integration_sched_deadline() {
     drive_ktstr_test("vm_integration_sched_deadline");
 }
@@ -1059,11 +1157,7 @@ fn vm_integration_sched_deadline() {
 /// cross-pipeline invariants independent of which BPF struct
 /// happens to be inspected.
 #[test]
-#[ignore = "long-running VM integration test (~30s); requires KVM, \
-            ../linux, scx-ktstr. Run via \
-            `cargo nextest run --run-ignored all` or \
-            `cargo ktstr test --kernel ../linux \
-            --filter vm_integration_failure_dump_trigger`."]
+#[ignore = "requires KVM, ../linux, scx-ktstr"]
 fn vm_integration_failure_dump_trigger() {
     drive_ktstr_test("vm_integration_failure_dump_trigger");
 }
@@ -1121,6 +1215,22 @@ static __KTSTR_ENTRY_DISK_READ_ONLY: ktstr::test_support::KtstrTestEntry =
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
+static __KTSTR_ENTRY_DISK_COUNTERS_HANDOFF: ktstr::test_support::KtstrTestEntry =
+    ktstr::test_support::KtstrTestEntry {
+        name: "vm_integration_disk_virtio_blk_counters_handoff",
+        func: scenario_disk_write_read_roundtrip,
+        scheduler: &KTSTR_SCHED,
+        extra_sched_args: &[],
+        watchdog_timeout: std::time::Duration::from_secs(3),
+        duration: std::time::Duration::from_millis(500),
+        expect_err: false,
+        disk: Some(KTSTR_DISK_DEFAULT),
+        post_vm: Some(assert_virtio_blk_counters_nonzero_after_roundtrip),
+        ..ktstr::test_support::KtstrTestEntry::DEFAULT
+    };
+
 /// Disk #1 — `/dev/vda` exists with the configured capacity.
 ///
 /// Boots scx-ktstr with a 256 MiB raw virtio-blk disk attached; the
@@ -1133,11 +1243,7 @@ static __KTSTR_ENTRY_DISK_READ_ONLY: ktstr::test_support::KtstrTestEntry =
 /// - `/dev/kvm` accessible
 /// - guest kernel with CONFIG_VIRTIO_BLK + CONFIG_BLK_DEV
 #[test]
-#[ignore = "VM integration test (~10s); requires KVM, ../linux, \
-            CONFIG_VIRTIO_BLK in guest kernel. Run via \
-            `cargo nextest run --run-ignored all` or \
-            `cargo ktstr test --kernel ../linux \
-            --filter vm_integration_disk_default_appears`."]
+#[ignore = "requires KVM, ../linux, CONFIG_VIRTIO_BLK in guest"]
 fn vm_integration_disk_default_appears() {
     drive_ktstr_test("vm_integration_disk_default_appears");
 }
@@ -1150,11 +1256,7 @@ fn vm_integration_disk_default_appears() {
 /// `process_requests`, sparse tempfile pwrite/pread, and irqfd
 /// completion.
 #[test]
-#[ignore = "VM integration test (~10s); requires KVM, ../linux, \
-            CONFIG_VIRTIO_BLK in guest kernel. Run via \
-            `cargo nextest run --run-ignored all` or \
-            `cargo ktstr test --kernel ../linux \
-            --filter vm_integration_disk_write_read_roundtrip`."]
+#[ignore = "requires KVM, ../linux, CONFIG_VIRTIO_BLK in guest"]
 fn vm_integration_disk_write_read_roundtrip() {
     drive_ktstr_test("vm_integration_disk_write_read_roundtrip");
 }
@@ -1166,11 +1268,24 @@ fn vm_integration_disk_write_read_roundtrip() {
 /// Pins the VIRTIO_BLK_F_RO advertisement and the guest kernel's
 /// `disk->part0.policy = 1` gate at `open(2)` time.
 #[test]
-#[ignore = "VM integration test (~10s); requires KVM, ../linux, \
-            CONFIG_VIRTIO_BLK in guest kernel. Run via \
-            `cargo nextest run --run-ignored all` or \
-            `cargo ktstr test --kernel ../linux \
-            --filter vm_integration_disk_read_only_rejects_write`."]
+#[ignore = "requires KVM, ../linux, CONFIG_VIRTIO_BLK in guest"]
 fn vm_integration_disk_read_only_rejects_write() {
     drive_ktstr_test("vm_integration_disk_read_only_rejects_write");
+}
+
+/// Disk #4 — virtio-blk counter handoff from device to `VmResult`.
+///
+/// Reuses the write+read roundtrip workload as the in-guest scenario
+/// but adds a `post_vm` callback
+/// ([`assert_virtio_blk_counters_nonzero_after_roundtrip`]) that asserts
+/// the host-side `VmResult.virtio_blk_counters` snapshot reflects
+/// the IO the guest performed. Pins the freeze-coordinator's
+/// snapshot-at-assignment seam (`run.virtio_blk_counters` → `VmResult`)
+/// — without this test, a regression that snapshots the counters
+/// before `record_read` / `record_write` fires would silently report
+/// zeros while every guest-visible disk test still passed.
+#[test]
+#[ignore = "requires KVM, ../linux, CONFIG_VIRTIO_BLK in guest"]
+fn vm_integration_disk_virtio_blk_counters_handoff() {
+    drive_ktstr_test("vm_integration_disk_virtio_blk_counters_handoff");
 }

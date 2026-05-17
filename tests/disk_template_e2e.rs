@@ -40,18 +40,7 @@
 //! - guest kernel with `CONFIG_VIRTIO_BLK + CONFIG_BTRFS_FS`
 //!
 //! The tests are gated `#[ignore]` because each requires a real
-//! VM boot (~30-90s including the template-build VM on first run)
-//! and the prerequisite host configuration; default
-//! `cargo nextest run` would hang or fail on hosts without these.
-//! Run via:
-//!
-//! ```bash
-//! cargo nextest run --test disk_template_e2e --run-ignored all
-//! # OR the canonical entry:
-//! cargo ktstr test --kernel ../linux \
-//!     --filter "disk_template_e2e_btrfs_template_build|\
-//! disk_template_e2e_ficlone_clone_isolated"
-//! ```
+//! VM boot and the prerequisite host configuration.
 //!
 //! User-facing test bar: a `ktstr_test` declaring
 //! `Filesystem::Btrfs` on its `DiskConfig` MUST surface a
@@ -415,12 +404,7 @@ fn drive_ktstr_test(scenario_name: &str) {
 ///   btrfs/xfs
 /// - guest kernel with CONFIG_VIRTIO_BLK + CONFIG_BTRFS_FS
 #[test]
-#[ignore = "VM integration test (~30-90s with cold cache template \
-            build); requires KVM, ../linux, mkfs.btrfs on PATH, \
-            btrfs/xfs cache dir, CONFIG_BTRFS_FS in guest. Run via \
-            `cargo nextest run --run-ignored all` or \
-            `cargo ktstr test --kernel ../linux \
-            --filter disk_template_e2e_btrfs_template_build`."]
+#[ignore = "requires KVM, ../linux, mkfs.btrfs on PATH, btrfs/xfs cache dir, CONFIG_BTRFS_FS in guest"]
 fn disk_template_e2e_btrfs_template_build() {
     drive_ktstr_test("disk_template_e2e_btrfs_template_build");
 }
@@ -433,11 +417,7 @@ fn disk_template_e2e_btrfs_template_build() {
 /// (sentinel content matches). Pins the per-test fan-out path
 /// through `ktstr::vmm::disk_template::clone_to_per_test`.
 #[test]
-#[ignore = "VM integration test (~10-90s); requires KVM, ../linux, \
-            mkfs.btrfs on PATH, btrfs/xfs cache dir, CONFIG_BTRFS_FS \
-            in guest. Run via `cargo nextest run --run-ignored all` \
-            or `cargo ktstr test --kernel ../linux \
-            --filter disk_template_e2e_ficlone_clone_isolated`."]
+#[ignore = "requires KVM, ../linux, mkfs.btrfs on PATH, btrfs/xfs cache dir, CONFIG_BTRFS_FS in guest"]
 fn disk_template_e2e_ficlone_clone_isolated() {
     drive_ktstr_test("disk_template_e2e_ficlone_clone_isolated");
 }
