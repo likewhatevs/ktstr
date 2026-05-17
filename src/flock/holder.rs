@@ -17,7 +17,7 @@ use super::HolderInfo;
 
 /// Cmdline truncation limit. Matches the 100-char cap shared with the
 /// rest of the crate's user-facing diagnostic output.
-pub(crate) const CMDLINE_MAX_CHARS: usize = 100;
+const CMDLINE_MAX_CHARS: usize = 100;
 
 /// Diagnostic text for lock-holder error messages when /proc/locks
 /// lists no PID against the lockfile inode. Centralized so every
@@ -31,7 +31,7 @@ pub(crate) const NO_HOLDERS_RECORDED: &str = "<none recorded>";
 /// `…` suffix on overflow. Missing / racing / permission-denied on
 /// `/proc/{pid}/cmdline` produces `"<cmdline unavailable>"` — the
 /// pid still carries diagnostic value even without the command.
-pub(crate) fn holder_info_for_pid(pid: u32) -> HolderInfo {
+pub(super) fn holder_info_for_pid(pid: u32) -> HolderInfo {
     let raw = match std::fs::read(format!("/proc/{pid}/cmdline")) {
         Ok(bytes) => bytes,
         Err(_) => {

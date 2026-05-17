@@ -52,7 +52,7 @@ use super::mountinfo::{needle_from_path, needle_from_path_with_mountinfo};
 /// [`super::holder::CMDLINE_MAX_CHARS`] with a `…` suffix on
 /// overflow. A cmdline read failure is non-fatal — the entry
 /// carries `"<cmdline unavailable>"` so the pid still surfaces.
-pub(crate) fn read_holders_for_needle(needle: &str) -> Result<Vec<HolderInfo>> {
+pub(super) fn read_holders_for_needle(needle: &str) -> Result<Vec<HolderInfo>> {
     use anyhow::Context;
     use std::fs;
 
@@ -78,7 +78,7 @@ pub(crate) fn read_holders_for_needle(needle: &str) -> Result<Vec<HolderInfo>> {
 /// [`read_holders_for_needle`] caller expects. Extracted so batched
 /// callers and the per-needle wrapper both key against the same seam
 /// rather than duplicating the `.into_iter().map()` plumbing.
-pub(crate) fn read_holders_from_contents(contents: &str, needle: &str) -> Vec<HolderInfo> {
+pub(super) fn read_holders_from_contents(contents: &str, needle: &str) -> Vec<HolderInfo> {
     let pids = parse_flock_pids_for_needle(contents, needle);
     pids.into_iter().map(holder_info_for_pid).collect()
 }

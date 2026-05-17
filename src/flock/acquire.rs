@@ -265,34 +265,40 @@ mod tests {
     fn acquire_flock_remediation_appended_when_some() {
         use tempfile::TempDir;
         let tmp = TempDir::new().expect("tempdir");
-        let lockfile = tmp.path().join(".locks").join("remediation.lock");
-        std::fs::create_dir_all(lockfile.parent().unwrap()).unwrap();
-        let _peer = try_flock(&lockfile, FlockMode::Exclusive)
-            .expect("peer flock attempt")
-            .expect("peer must acquire on a fresh lockfile");
+        let locks_dir = tmp.path().join(".locks");
+        std::fs::create_dir_all(&locks_dir).unwrap();
         let hint = "Wait for peer or kill it, then retry.";
+
+        // Some(hint) and None each run against their own lockfile +
+        // peer fd. Two lockfiles instead of one + drop-and-recreate
+        // removes the implicit dependency on Drop ordering: the
+        // None case was previously gated on the LOCK_EX peer from
+        // the Some case being dropped first, which made the test
+        // order-sensitive and easy to break by reordering the arms.
+        let lockfile_with = locks_dir.join("remediation_some.lock");
+        let _peer_with = try_flock(&lockfile_with, FlockMode::Exclusive)
+            .expect("peer (Some case) flock attempt")
+            .expect("peer (Some case) must acquire on a fresh lockfile");
         let err_with = acquire_flock_with_timeout(
-            &lockfile,
+            &lockfile_with,
             FlockMode::Exclusive,
             std::time::Duration::from_millis(120),
             "rem-test",
             Some(hint),
         )
-        .expect_err("acquire must fail under LOCK_EX peer");
+        .expect_err("acquire must fail under LOCK_EX peer (Some case)");
         let msg_with = format!("{err_with:#}");
         assert!(
             msg_with.contains(hint),
             "Some(hint) must append the remediation; got: {msg_with}",
         );
 
-        // Drop and recreate the peer so the fresh acquire below
-        // also contends.
-        drop(_peer);
-        let _peer2 = try_flock(&lockfile, FlockMode::Exclusive)
-            .expect("peer2 attempt")
-            .expect("peer2 must acquire");
+        let lockfile_without = locks_dir.join("remediation_none.lock");
+        let _peer_without = try_flock(&lockfile_without, FlockMode::Exclusive)
+            .expect("peer (None case) flock attempt")
+            .expect("peer (None case) must acquire on a fresh lockfile");
         let err_without = acquire_flock_with_timeout(
-            &lockfile,
+            &lockfile_without,
             FlockMode::Exclusive,
             std::time::Duration::from_millis(120),
             "rem-test",

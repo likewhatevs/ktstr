@@ -22,29 +22,29 @@ use std::path::Path;
 /// `<linux/magic.h>`. Kept as a deny-list (reject known-bad) rather
 /// than an allow-list — exotic local filesystems (zfs, erofs, …)
 /// are safer to accept with unreliable flock than to reject.
-pub(crate) mod fs_magic {
+pub(super) mod fs_magic {
     /// `nfs_super_magic` — NFSv2/3/4 mounts. `flock(2)` on NFS is
     /// advisory-only under some server configurations; rejecting
     /// at lockfile open prevents silent false-success.
-    pub(crate) const NFS: i64 = 0x6969;
+    pub(super) const NFS: i64 = 0x6969;
     /// `cifs_magic_number` — CIFS / SMB1.
-    pub(crate) const CIFS: i64 = 0xFF53_4D42;
+    pub(super) const CIFS: i64 = 0xFF53_4D42;
     /// `smb2_magic_number` — SMB2+. Distinct from the CIFS constant.
-    pub(crate) const SMB2: i64 = 0xFE53_4D42;
+    pub(super) const SMB2: i64 = 0xFE53_4D42;
     /// `ceph_super_magic` — CephFS.
-    pub(crate) const CEPH: i64 = 0x00c3_6400;
+    pub(super) const CEPH: i64 = 0x00c3_6400;
     /// `AFS_FS_MAGIC` — the in-tree kAFS client's superblock magic
     /// (`fs/afs/super.c:460`, linux/magic.h defines the constant as
     /// `0x6B414653`). Distinct from the legacy `AFS_SUPER_MAGIC =
     /// 0x5346414F` that lingers in `<linux/magic.h>` but is not
     /// emitted by any in-tree AFS driver today — we only reject
     /// what the running kernel actually reports.
-    pub(crate) const AFS: i64 = 0x6B41_4653;
+    pub(super) const AFS: i64 = 0x6B41_4653;
     /// `FUSE_SUPER_MAGIC` — any FUSE mount (linux/magic.h line 39:
     /// `#define FUSE_SUPER_MAGIC 0x65735546`). FUSE flock
     /// reliability depends on whether the userspace server
     /// implements the flock op; the safe default is to reject.
-    pub(crate) const FUSE: i64 = 0x6573_5546;
+    pub(super) const FUSE: i64 = 0x6573_5546;
 }
 
 /// Refuse to operate on filesystems where `flock(2)` is unreliable.
@@ -58,7 +58,7 @@ pub(crate) mod fs_magic {
 /// below will create it on the parent filesystem's type). Only
 /// filesystems whose magic appears in [`fs_magic`]'s deny-list
 /// produce an error.
-pub(crate) fn reject_remote_fs(path: &Path) -> Result<()> {
+pub(super) fn reject_remote_fs(path: &Path) -> Result<()> {
     // statfs on the path's PARENT when the path itself does not yet
     // exist — we want to classify the filesystem the lockfile will
     // live on, not error on "path doesn't exist" which is normal for
@@ -95,7 +95,7 @@ pub(crate) fn reject_remote_fs(path: &Path) -> Result<()> {
 /// magic values without a real mount. The caller decorates the
 /// error with the lockfile path and the "Move to tmpfs, …" hint;
 /// this function produces only the fs-specific middle clause.
-pub(crate) fn classify_fs_magic(magic: i64) -> Result<()> {
+pub(super) fn classify_fs_magic(magic: i64) -> Result<()> {
     let (name, reason) = match magic {
         fs_magic::NFS => (
             "NFS",

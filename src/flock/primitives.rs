@@ -36,6 +36,34 @@ use std::path::Path;
 use super::FlockMode;
 use super::fs_filter::reject_remote_fs;
 
+/// Open a lockfile with the crate-wide flock contract: refuses
+/// remote filesystems via [`reject_remote_fs`], then opens with
+/// `O_CREAT | O_RDWR | O_CLOEXEC | 0o666`. The three module entry
+/// points ([`materialize`], [`try_flock`], [`block_flock`]) share
+/// this open shape; centralizing it here means a future flag change
+/// (or an addition to the remote-fs deny-list) lands in one place
+/// instead of drifting across three call sites.
+///
+/// `O_CLOEXEC` is mandatory: a leaked fd across `exec(2)` (cargo
+/// subcommand, build-pipeline subprocess, initramfs compressor)
+/// would keep the lock alive in the child after the parent's
+/// `OwnedFd::drop`, producing phantom holders the next acquirer
+/// would blame on the wrong pid.
+///
+/// 0o666 mode matches a peer first-acquire so the file's owner and
+/// permissions don't depend on creation order.
+fn open_lockfile(path: &Path) -> Result<OwnedFd> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    reject_remote_fs(path)?;
+    open(
+        path,
+        OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o666),
+    )
+    .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))
+}
+
 /// Ensure the lockfile exists on disk without acquiring a lock.
 /// Used by the DISCOVER phase of `acquire_llc_plan` (see
 /// `discover_llc_snapshots` in `crate::vmm::host_topology`): the
@@ -43,26 +71,13 @@ use super::fs_filter::reject_remote_fs;
 /// subsequent `/proc/locks` match has a target, but DISCOVER itself
 /// must not contend with peer acquires.
 ///
-/// Opens with the same `O_CREAT | O_RDWR | O_CLOEXEC | 0o666` mode
-/// as [`try_flock`] so the resulting inode and fd mode match what a
-/// first-time acquirer would create. Immediately closes the fd —
-/// `OwnedFd::drop` releases the open-file description and (since
-/// no flock was ever taken on this fd) cannot release a lock held
-/// by a peer fd.
-///
-/// Runs [`reject_remote_fs`] first so the caller never materializes
-/// a lockfile on NFS / CIFS / etc.
+/// Opens through [`open_lockfile`] so the resulting inode and fd
+/// mode match what a first-time acquirer would create. Immediately
+/// closes the fd — `OwnedFd::drop` releases the open-file
+/// description and (since no flock was ever taken on this fd)
+/// cannot release a lock held by a peer fd.
 pub(crate) fn materialize<P: AsRef<Path>>(path: P) -> Result<()> {
-    use rustix::fs::{Mode, OFlags, open};
-
-    let path = path.as_ref();
-    reject_remote_fs(path)?;
-    let fd = open(
-        path,
-        OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC,
-        Mode::from_raw_mode(0o666),
-    )
-    .map_err(|e| anyhow::anyhow!("materialize lockfile {}: {e}", path.display()))?;
+    let fd = open_lockfile(path.as_ref())?;
     drop(fd);
     Ok(())
 }
@@ -94,16 +109,10 @@ pub(crate) fn materialize<P: AsRef<Path>>(path: P) -> Result<()> {
 /// lockfile paths are built as `PathBuf` via `Path::join` — both
 /// pass straight through.
 pub fn try_flock<P: AsRef<Path>>(path: P, mode: FlockMode) -> Result<Option<OwnedFd>> {
-    use rustix::fs::{FlockOperation, Mode, OFlags, flock, open};
+    use rustix::fs::{FlockOperation, flock};
 
     let path = path.as_ref();
-    reject_remote_fs(path)?;
-    let fd = open(
-        path,
-        OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC,
-        Mode::from_raw_mode(0o666),
-    )
-    .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
+    let fd = open_lockfile(path)?;
     let op = match mode {
         FlockMode::Exclusive => FlockOperation::NonBlockingLockExclusive,
         FlockMode::Shared => FlockOperation::NonBlockingLockShared,
@@ -120,16 +129,10 @@ pub fn try_flock<P: AsRef<Path>>(path: P, mode: FlockMode) -> Result<Option<Owne
 /// caller in the kernel until the lock is available. Use after
 /// [`try_flock`] returns `None` to wait for a live peer to finish.
 pub fn block_flock<P: AsRef<Path>>(path: P, mode: FlockMode) -> Result<OwnedFd> {
-    use rustix::fs::{FlockOperation, Mode, OFlags, flock, open};
+    use rustix::fs::{FlockOperation, flock};
 
     let path = path.as_ref();
-    reject_remote_fs(path)?;
-    let fd = open(
-        path,
-        OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC,
-        Mode::from_raw_mode(0o666),
-    )
-    .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
+    let fd = open_lockfile(path)?;
     let op = match mode {
         FlockMode::Exclusive => FlockOperation::LockExclusive,
         FlockMode::Shared => FlockOperation::LockShared,
