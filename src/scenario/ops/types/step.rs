@@ -241,7 +241,9 @@ pub enum HoldSpec {
 }
 
 impl HoldSpec {
-    /// Hold for the full scenario duration (`Frac(1.0)`).
+    /// Hold for the full scenario duration. Equivalent to
+    /// [`HoldSpec::frac(1.0)`](Self::frac) and resolves to
+    /// `ctx.duration` at scenario-run time.
     pub const FULL: HoldSpec = HoldSpec::Frac(1.0);
 
     /// Hold for a fixed wall-clock duration. Sugar for
@@ -257,9 +259,11 @@ impl HoldSpec {
         HoldSpec::Fixed(d)
     }
 
-    /// Hold for a fraction of the scenario duration. Sugar for
-    /// `HoldSpec::Frac(f)`; the value is `f` (e.g. `0.5` =
-    /// half the total). `f` must be finite and `> 0.0` — see
+    /// Hold for a fraction of `ctx.duration` (the scenario duration
+    /// configured on [`Ctx`](crate::scenario::Ctx)). Sugar for
+    /// `HoldSpec::Frac(f)`; the resolved wall-clock hold is
+    /// `ctx.duration * f` (e.g. `0.5` = half the scenario
+    /// duration). `f` must be finite and `> 0.0` — see
     /// [`Self::validate`] for the rejection rules.
     pub const fn frac(f: f64) -> HoldSpec {
         HoldSpec::Frac(f)

@@ -63,6 +63,15 @@ pub struct CpuLimits {
 /// Memory controller limits (`memory.max` / `memory.high` /
 /// `memory.low` / `memory.swap.max`). Each field is `None` by
 /// default (inherit from parent / no limit).
+///
+/// Set via [`CgroupDef::memory_max`], [`CgroupDef::memory_high`],
+/// [`CgroupDef::memory_low`], [`CgroupDef::memory_unlimited`],
+/// [`CgroupDef::memory_swap_max`], or
+/// [`CgroupDef::memory_swap_unlimited`]. Construct directly only
+/// when copying a [`MemoryLimits`] across [`CgroupDef`]s — the
+/// builder methods are the preferred entry point because they
+/// keep test code in chain position and route the per-knob value
+/// through the framework's validation seam at `apply_setup`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct MemoryLimits {
@@ -240,6 +249,13 @@ pub struct MemoryLimits {
 /// ripple into every test fixture. The runtime bail keeps the
 /// surface ergonomic while still surfacing the foot-cannon at
 /// construction time (before any worker spawns).
+///
+/// Set via [`CgroupDef::pids_max`] or
+/// [`CgroupDef::pids_unlimited`]. Construct directly only when
+/// copying a [`PidsLimits`] across [`CgroupDef`]s — the builder
+/// methods are the preferred entry point because they route the
+/// per-knob value through the framework's validation seam at
+/// `apply_setup`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PidsLimits {
@@ -260,6 +276,12 @@ pub struct PidsLimits {
 /// interface needs major:minor device-id lookup which has no
 /// in-tree consumer; surface it as a follow-up task when a
 /// concrete use case lands.
+///
+/// Set via [`CgroupDef::io_weight`]. Construct directly only when
+/// copying an [`IoLimits`] across [`CgroupDef`]s — the builder
+/// method is the preferred entry point because it routes the
+/// per-knob value through the framework's validation seam at
+/// `apply_setup`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct IoLimits {
