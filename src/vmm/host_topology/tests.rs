@@ -1026,11 +1026,6 @@ fn compute_pinning_offset_numa_combined_rotation() {
 
 // -- resource lock tests --
 
-/// Clean up a lock file. Best-effort; ignores errors.
-fn cleanup_lock(path: &str) {
-    let _ = std::fs::remove_file(path);
-}
-
 #[test]
 fn resource_lock_exclusive_acquires() {
     let _tempfile_keep_alive = tempfile::Builder::new()
@@ -1163,16 +1158,10 @@ fn resource_lock_exclusive_success() {
     };
     let llc_indices = &[90100usize];
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Exclusive).unwrap();
-    match outcome {
-        LockOutcome::Acquired { llc_offset, locks } => {
-            assert_eq!(llc_offset, 90100);
-            // Exclusive mode: only LLC locks, no per-CPU locks.
-            assert_eq!(locks.len(), 1);
-        }
-        LockOutcome::Unavailable(reason) => {
-            panic!("expected Acquired, got Unavailable: {reason}");
-        }
-    }
+    let (llc_offset, locks) = unwrap_acquired(outcome, "");
+    assert_eq!(llc_offset, 90100);
+    // Exclusive mode: only LLC locks, no per-CPU locks.
+    assert_eq!(locks.len(), 1);
 }
 
 #[test]
@@ -1187,15 +1176,9 @@ fn resource_lock_shared_includes_cpu_locks() {
     let llc_indices = &[90200usize];
 
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Shared).unwrap();
-    match outcome {
-        LockOutcome::Acquired { locks, .. } => {
-            // Shared mode: 1 LLC lock + 2 CPU locks = 3 total.
-            assert_eq!(locks.len(), 3);
-        }
-        LockOutcome::Unavailable(reason) => {
-            panic!("expected Acquired, got Unavailable: {reason}");
-        }
-    }
+    let (_, locks) = unwrap_acquired(outcome, "");
+    // Shared mode: 1 LLC lock + 2 CPU locks = 3 total.
+    assert_eq!(locks.len(), 3);
 }
 
 #[test]
@@ -1210,15 +1193,9 @@ fn resource_lock_shared_with_service_cpu() {
     let llc_indices = &[90300usize];
 
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Shared).unwrap();
-    match outcome {
-        LockOutcome::Acquired { locks, .. } => {
-            // 1 LLC lock + 1 assignment CPU lock + 1 service CPU lock = 3.
-            assert_eq!(locks.len(), 3);
-        }
-        LockOutcome::Unavailable(reason) => {
-            panic!("expected Acquired, got Unavailable: {reason}");
-        }
-    }
+    let (_, locks) = unwrap_acquired(outcome, "");
+    // 1 LLC lock + 1 assignment CPU lock + 1 service CPU lock = 3.
+    assert_eq!(locks.len(), 3);
 }
 
 #[test]
@@ -1234,15 +1211,9 @@ fn resource_lock_exclusive_skips_cpu_locks() {
     let llc_indices = &[90400usize];
 
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Exclusive).unwrap();
-    match outcome {
-        LockOutcome::Acquired { locks, .. } => {
-            // Exclusive: only 1 LLC lock, no CPU locks.
-            assert_eq!(locks.len(), 1);
-        }
-        LockOutcome::Unavailable(reason) => {
-            panic!("expected Acquired, got Unavailable: {reason}");
-        }
-    }
+    let (_, locks) = unwrap_acquired(outcome, "");
+    // Exclusive: only 1 LLC lock, no CPU locks.
+    assert_eq!(locks.len(), 1);
 }
 
 #[test]
@@ -1351,15 +1322,9 @@ fn resource_lock_empty_llc_indices() {
         locks: Vec::new(),
     };
     let outcome = acquire_resource_locks(&plan, &[], LlcLockMode::Exclusive).unwrap();
-    match outcome {
-        LockOutcome::Acquired { llc_offset, locks } => {
-            assert_eq!(llc_offset, 0);
-            assert!(locks.is_empty());
-        }
-        LockOutcome::Unavailable(reason) => {
-            panic!("expected Acquired, got Unavailable: {reason}");
-        }
-    }
+    let (llc_offset, locks) = unwrap_acquired(outcome, "");
+    assert_eq!(llc_offset, 0);
+    assert!(locks.is_empty());
 }
 
 #[test]
@@ -1408,14 +1373,14 @@ fn resource_lock_service_cpu_contention() {
 
 #[test]
 fn cpu_lock_window_success() {
-    let _prefixes = LockPrefixesGuard::new();
+    let _cpu_prefix = CpuLockPrefixGuard::new();
     let locks = try_acquire_cpu_window(91300, 3).unwrap();
     assert_eq!(locks.len(), 3);
 }
 
 #[test]
 fn cpu_lock_window_contention_all_or_nothing() {
-    let _prefixes = LockPrefixesGuard::new();
+    let _cpu_prefix = CpuLockPrefixGuard::new();
     let cpu_400 = cpu_lock_path(91400);
     let cpu_401 = cpu_lock_path(91401);
 
@@ -1449,7 +1414,7 @@ fn cpu_lock_zero_count() {
 
 #[test]
 fn cpu_lock_contention_slides_window() {
-    let _prefixes = LockPrefixesGuard::new();
+    let _cpu_prefix = CpuLockPrefixGuard::new();
     // Hold CPU at offset 91500, verify next window succeeds
     // via try_acquire_cpu_window (unit-level sliding test).
     let holder = try_flock(cpu_lock_path(91500), FlockMode::Exclusive)
@@ -1615,15 +1580,14 @@ fn pid_window_offset_max_start_one() {
 
 #[test]
 fn cpu_lock_acquire_slides_past_held() {
+    let _cpu_prefix = CpuLockPrefixGuard::new();
     let cpu0 = cpu_lock_path(0);
-    cleanup_lock(&cpu0);
     let holder = try_flock(&cpu0, FlockMode::Exclusive).unwrap().unwrap();
 
     let result = match acquire_cpu_locks(2, 100, None) {
         Ok(r) => r,
         Err(e) if e.downcast_ref::<ResourceContention>().is_some() => {
             drop(holder);
-            cleanup_lock(&cpu0);
             panic!("{e}");
         }
         Err(e) => panic!("{e:#}"),
@@ -1633,7 +1597,6 @@ fn cpu_lock_acquire_slides_past_held() {
 
     drop(result);
     drop(holder);
-    cleanup_lock(&cpu0);
 }
 
 #[test]
@@ -1690,7 +1653,7 @@ fn cpu_lock_llc_shared_protection() {
     // acquired, shared coexistence, and exclusive blocking.
     // Uses a per-test lockfile prefix so the LLC group can sit
     // at index 0 with real CPU ids (no 92100-entry padding).
-    let _prefix = LlcLockPrefixGuard::new();
+    let _llc_prefix = LlcLockPrefixGuard::new();
     let topo = HostTopology::new_for_tests(&[(vec![91200, 91201], 0)]);
 
     let cpus = vec![91200usize, 91201];
@@ -1772,7 +1735,10 @@ impl Drop for CpuLockPrefixGuard {
 /// composes the two. Each test gets its own per-tempdir prefix for
 /// both lockfile families, so cross-run / cross-process
 /// collisions on `/tmp/ktstr-llc-*.lock` and `/tmp/ktstr-cpu-*.lock`
-/// cannot occur.
+/// cannot occur. When in doubt about which guard to pick, default
+/// to this bundle — over-provisioning a tempdir is cheap and is
+/// always safe; under-provisioning leaks production-path test
+/// collisions.
 struct LockPrefixesGuard {
     _cpu: CpuLockPrefixGuard,
     _llc: LlcLockPrefixGuard,
@@ -1808,6 +1774,23 @@ impl Drop for AllowedCpusGuard {
     }
 }
 
+/// Destructure a `LockOutcome::Acquired { llc_offset, locks }` or
+/// panic with a stable diagnostic on `Unavailable`. `ctx` is a
+/// leading-space-prefixed clause that the panic message inlines
+/// after "expected Acquired" — pass `""` for the default site,
+/// `" in cargo-test mode"` etc. for site-specific context.
+fn unwrap_acquired(
+    outcome: LockOutcome,
+    ctx: &str,
+) -> (usize, Vec<std::os::fd::OwnedFd>) {
+    match outcome {
+        LockOutcome::Acquired { llc_offset, locks } => (llc_offset, locks),
+        LockOutcome::Unavailable(reason) => {
+            panic!("expected Acquired{ctx}, got Unavailable: {reason}")
+        }
+    }
+}
+
 /// `acquire_llc_plan` with `cpu_cap: None` reserves exactly 30%
 /// of the allowed-CPU set (ceiling), walking whole LLCs and
 /// partial-taking the last LLC's CPUs when the budget falls
@@ -1825,7 +1808,7 @@ impl Drop for AllowedCpusGuard {
 /// runner's real sched_getaffinity.
 #[test]
 fn acquire_llc_plan_none_cap_reserves_thirty_percent_cpus() {
-    let _prefix = LlcLockPrefixGuard::new();
+    let _llc_prefix = LlcLockPrefixGuard::new();
     let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
     let topo = HostTopology::new_for_tests(&[
         (vec![0, 1], 0),
@@ -1876,7 +1859,7 @@ fn acquire_llc_plan_none_cap_reserves_thirty_percent_cpus() {
 /// actionable error that names the LLC.
 #[test]
 fn acquire_llc_plan_bails_on_exclusive_peer() {
-    let _prefix = LlcLockPrefixGuard::new();
+    let _llc_prefix = LlcLockPrefixGuard::new();
     let _allowed = AllowedCpusGuard::new(vec![0]);
     let topo = HostTopology::new_for_tests(&[(vec![0], 0)]);
 
@@ -1914,7 +1897,7 @@ fn acquire_llc_plan_bails_on_exclusive_peer() {
 /// above.
 #[test]
 fn acquire_llc_plan_coexists_with_shared_peer() {
-    let _prefix = LlcLockPrefixGuard::new();
+    let _llc_prefix = LlcLockPrefixGuard::new();
     let _allowed = AllowedCpusGuard::new(vec![0]);
     let topo = HostTopology::new_for_tests(&[(vec![0], 0)]);
     let shared_path = llc_lock_path(0);
@@ -2718,7 +2701,7 @@ fn cpu_cap_effective_count_on_zero_llc_host() {
 /// depends on a userspace utility.
 #[test]
 fn acquire_llc_plan_consolidates_on_peer_held_llc() {
-    let _prefix = LlcLockPrefixGuard::new();
+    let _llc_prefix = LlcLockPrefixGuard::new();
     // 2 LLCs on the same node so NUMA-locality doesn't bias
     // against consolidation.
     let topo = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
@@ -2814,12 +2797,9 @@ fn acquire_max_toctou_retries_pinned() {
 /// SYNTHETIC-TOPOLOGY OFFSET CONVENTION.
 #[test]
 fn acquire_llc_plan_retry_succeeds_on_attempt_one() {
+    let _llc_prefix = LlcLockPrefixGuard::new();
     let _allowed = AllowedCpusGuard::new(vec![93500, 93501]);
     let topo = synth_host_topo(&[(vec![93500], 0), (vec![93501], 0)]);
-    // Clean the lockfile paths DISCOVER materializes so the
-    // test is idempotent across re-runs.
-    cleanup_lock(&llc_lock_path(0));
-    cleanup_lock(&llc_lock_path(1));
 
     let test_topo = crate::topology::TestTopology::synthetic(2, 1);
     let counter = std::cell::Cell::new(0u32);
@@ -2846,9 +2826,6 @@ fn acquire_llc_plan_retry_succeeds_on_attempt_one() {
     // (seed-node first: LLC 0). `selected` holds only LLC 0;
     // the second LLC stays unlocked.
     assert_eq!(plan.locked_llcs, vec![0]);
-
-    cleanup_lock(&llc_lock_path(0));
-    cleanup_lock(&llc_lock_path(1));
 }
 
 /// TOCTOU retry EXHAUSTED path via the acquire-fn seam: every
@@ -2864,9 +2841,9 @@ fn acquire_llc_plan_retry_succeeds_on_attempt_one() {
 /// holder diagnostic block runs (the final DISCOVER read).
 #[test]
 fn acquire_llc_plan_retry_exhausted_bails_with_resource_contention() {
+    let _llc_prefix = LlcLockPrefixGuard::new();
     let _allowed = AllowedCpusGuard::new(vec![93600]);
     let topo = synth_host_topo(&[(vec![93600], 0)]);
-    cleanup_lock(&llc_lock_path(0));
     let test_topo = crate::topology::TestTopology::synthetic(1, 1);
 
     let counter = std::cell::Cell::new(0u32);
@@ -2895,8 +2872,6 @@ fn acquire_llc_plan_retry_exhausted_bails_with_resource_contention() {
         msg.contains("attempts"),
         "message must name the attempt count: {msg}",
     );
-
-    cleanup_lock(&llc_lock_path(0));
 }
 
 /// `plan_from_snapshots` MUST-CONSOLIDATE invariant: on a
@@ -3027,7 +3002,7 @@ fn default_cpu_budget_30_percent_rounded_up_min_one() {
 /// test failure rather than an "no-op" VM boot.
 #[test]
 fn acquire_llc_plan_bails_when_no_llc_overlaps_allowed() {
-    let _prefix = LlcLockPrefixGuard::new();
+    let _llc_prefix = LlcLockPrefixGuard::new();
     // Allowed CPUs {100, 101} don't overlap ANY of the host's
     // LLCs (CPUs 0, 1). plan_from_snapshots returns empty →
     // acquire_llc_plan bails with the no-overlap diagnostic.
@@ -3099,7 +3074,7 @@ fn plan_from_snapshots_filters_llcs_outside_allowed_set() {
 /// over-reserving).
 #[test]
 fn acquire_llc_plan_partial_take_last_llc_matches_exact_budget() {
-    let _prefix = LlcLockPrefixGuard::new();
+    let _llc_prefix = LlcLockPrefixGuard::new();
     let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3, 4, 5, 6, 7]);
     let topo = HostTopology::new_for_tests(&[(vec![0, 1, 2, 3], 0), (vec![4, 5, 6, 7], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
@@ -3169,7 +3144,7 @@ fn plan_from_snapshots_partial_llc_overlap_counted_correctly() {
 /// lockfile paths.
 #[test]
 fn acquire_llc_plan_cross_node_spill_mems_union() {
-    let _prefix = LlcLockPrefixGuard::new();
+    let _llc_prefix = LlcLockPrefixGuard::new();
     let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3]);
     // LLC 0,1 on node 0 (CPUs 0,1); LLC 2,3 on node 1 (CPUs 2,3).
     let topo =
@@ -3229,20 +3204,14 @@ fn acquire_resource_locks_cargo_test_mode_bypasses_flock() {
         locks: Vec::new(),
     };
     let outcome = acquire_resource_locks(&plan, &[95100usize], LlcLockMode::Exclusive).unwrap();
-    match outcome {
-        LockOutcome::Acquired { llc_offset, locks } => {
-            assert_eq!(llc_offset, 95100);
-            assert!(
-                locks.is_empty(),
-                "cargo-test-mode bypass must NOT take any flocks; \
-                 got {} held fds",
-                locks.len(),
-            );
-        }
-        LockOutcome::Unavailable(reason) => {
-            panic!("expected Acquired in cargo-test mode, got Unavailable: {reason}");
-        }
-    }
+    let (llc_offset, locks) = unwrap_acquired(outcome, " in cargo-test mode");
+    assert_eq!(llc_offset, 95100);
+    assert!(
+        locks.is_empty(),
+        "cargo-test-mode bypass must NOT take any flocks; \
+         got {} held fds",
+        locks.len(),
+    );
 }
 
 /// Empty `KTSTR_CARGO_TEST_MODE` does NOT activate the bypass.
@@ -3255,28 +3224,21 @@ fn acquire_resource_locks_cargo_test_mode_empty_string_inert() {
     use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
     let _lock = lock_env();
     let _env = EnvVarGuard::set("KTSTR_CARGO_TEST_MODE", "");
+    let _llc_prefix = LlcLockPrefixGuard::new();
     let plan = PinningPlan {
         assignments: vec![(0, 95200)],
         service_cpu: None,
         llc_indices: vec![95200],
         locks: Vec::new(),
     };
-    cleanup_lock(&llc_lock_path(95200));
     let outcome = acquire_resource_locks(&plan, &[95200usize], LlcLockMode::Exclusive).unwrap();
-    match outcome {
-        LockOutcome::Acquired { locks, .. } => {
-            assert_eq!(
-                locks.len(),
-                1,
-                "empty-string cargo-test-mode is inert — expected the \
-                 standard `Exclusive` path to take exactly one LLC fd, \
-                 got {}",
-                locks.len(),
-            );
-        }
-        LockOutcome::Unavailable(reason) => {
-            panic!("expected Acquired with empty-string bypass inert, got Unavailable: {reason}");
-        }
-    }
-    cleanup_lock(&llc_lock_path(95200));
+    let (_, locks) = unwrap_acquired(outcome, " with empty-string bypass inert");
+    assert_eq!(
+        locks.len(),
+        1,
+        "empty-string cargo-test-mode is inert — expected the \
+         standard `Exclusive` path to take exactly one LLC fd, \
+         got {}",
+        locks.len(),
+    );
 }
