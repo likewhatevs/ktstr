@@ -49,6 +49,9 @@ zstd = { version = "0.13", features = ["zstdmt"] }
 lz4_flex = { version = "0.13", features = ["frame"] }
 flate2 = "1"
 glob = "0.3"
+# `proc_macro` default feature kept on: tests/private_module_paths.rs
+# pins the `::ktstr::__private::ctor::ctor(...)` re-export so the
+# proc-macro form stays compilable for downstream consumers.
 ctor = "1"
 libc = "0.2"
 nix = { version = "0.31", features = ["event", "feature", "fs", "inotify", "mount", "poll", "process", "ptrace", "reboot", "sched", "signal", "term", "uio"] }

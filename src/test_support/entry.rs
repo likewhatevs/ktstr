@@ -1661,6 +1661,10 @@ impl SchedulerJson {
 ///
 /// One ctor per binary, regardless of how many schedulers the binary
 /// registers — walks the slice once and emits a single JSON array.
+///
+/// Uses ctor's declarative `ctor::declarative::ctor! { ... }` form;
+/// the proc-macro `#[ctor::ctor(...)]` form is re-exported at
+/// `crate::__private::ctor::ctor` for downstream consumers.
 #[ctor(unsafe)]
 fn __ktstr_list_schedulers() {
     if !std::env::args().any(|a| a == "--ktstr-list-schedulers") {

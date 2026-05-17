@@ -467,7 +467,12 @@ pub(crate) fn build_vm_builder_base(
     // behavior (no probe).
     //
     // Required ctor shape in a new test file that needs the probe
-    // in the guest — paste verbatim, adjust the two binary names:
+    // in the guest — paste verbatim, adjust the two binary names.
+    // Either ctor form works (ktstr re-exports both): the proc-macro
+    // attribute shown below, or the declarative
+    // `::ktstr::__private::ctor::declarative::ctor! { ... }` block
+    // form (ktstr's own in-tree sites use the declarative form per
+    // src/test_support/dispatch.rs).
     //
     // ```ignore
     // #[::ktstr::__private::ctor::ctor(unsafe, crate_path = ::ktstr::__private::ctor)]
@@ -485,6 +490,28 @@ pub(crate) fn build_vm_builder_base(
     //             env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker"),
     //         );
     //     }
+    // }
+    // ```
+    //
+    // Declarative-form equivalent (no `crate_path = ` plumbing required
+    // because the macro_rules! expansion resolves paths via `$crate`):
+    //
+    // ```ignore
+    // ::ktstr::__private::ctor::declarative::ctor! {
+    // #[ctor(unsafe)]
+    // fn set_probe_binary_env_var() {
+    //     // SAFETY: same as proc-macro form above.
+    //     unsafe {
+    //         std::env::set_var(
+    //             "KTSTR_JEMALLOC_PROBE_BINARY",
+    //             env!("CARGO_BIN_EXE_ktstr-jemalloc-probe"),
+    //         );
+    //         std::env::set_var(
+    //             "KTSTR_JEMALLOC_ALLOC_WORKER_BINARY",
+    //             env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker"),
+    //         );
+    //     }
+    // }
     // }
     // ```
     //

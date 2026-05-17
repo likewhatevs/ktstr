@@ -411,6 +411,13 @@ ctor::declarative::ctor! {
 /// `setenv`) is safe here. The priority retains the .init_array.0
 /// placement that the compiler-rt ordering above depends on; other
 /// platforms would need re-validation.
+///
+/// This site uses ctor's declarative `ctor::declarative::ctor! { ... }`
+/// form; ctor 1.0 also ships `#[ctor::ctor(...)]` (proc-macro attribute)
+/// re-exported under `crate::__private::ctor::ctor` for downstream
+/// consumers. The declarative form is the in-tree convention because
+/// it avoids the TT-muncher recursion-limit cost on the ktstr_test
+/// expansion path.
 #[ctor(unsafe, priority = 0)]
 fn redirect_default_profraw_path() {
     // Cheap precondition checks first — pid (one syscall) and env

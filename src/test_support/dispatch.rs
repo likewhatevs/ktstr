@@ -447,6 +447,15 @@ ctor::declarative::ctor! {
 /// - nextest protocol (`--list`/`--exact`): intercepted when running
 ///   under nextest (`NEXTEST` env var set), delegates to [`ktstr_main`].
 /// - Otherwise: no-op (falls through to the standard test harness).
+///
+/// ctor 1.0 ships both `#[ctor::ctor(...)]` (proc-macro attribute) and
+/// `ctor::declarative::ctor! { ... }` (declarative block). This site
+/// uses the declarative form because it sidesteps the TT-muncher
+/// recursion-limit cost the proc-macro form would impose on the
+/// ktstr_test expansion. The proc-macro form stays reachable via
+/// `crate::__private::ctor::ctor` for downstream consumers that prefer
+/// the attribute-on-fn shape; see `tests/private_module_paths.rs` for
+/// the re-export contract.
 #[doc(hidden)]
 #[ctor(unsafe)]
 pub fn ktstr_test_early_dispatch() {
