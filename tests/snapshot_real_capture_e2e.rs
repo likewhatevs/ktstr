@@ -69,13 +69,13 @@ fn assert_bridge_has_real_capture(result: &VmResult) -> Result<()> {
 fn snapshot_real_capture_op_snapshot(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
-        ops: vec![Op::snapshot("mid_run")],
+        ops: vec![Op::capture_snapshot("mid_run")],
         hold: HoldSpec::FULL,
     }];
     let mut result = execute_steps(ctx, steps)?;
     result.details.push(ktstr::assert::AssertDetail::new(
         ktstr::assert::DetailKind::Other,
-        "Op::snapshot('mid_run') SHM request succeeded".to_string(),
+        "Op::capture_snapshot('mid_run') SHM request succeeded".to_string(),
     ));
     Ok(result)
 }

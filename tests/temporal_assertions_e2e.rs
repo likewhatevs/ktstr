@@ -55,7 +55,7 @@ fn assert_temporal_patterns(result: &VmResult) -> Result<()> {
     // metadata so the resulting series carries both projection axes.
     // `periodic_only` strips any non-periodic capture entries the
     // bridge happened to also store under the same drain
-    // (e.g. an Op::Snapshot fire from inside the scenario body) so
+    // (e.g. an Op::CaptureSnapshot fire from inside the scenario body) so
     // the temporal patterns walk a clean, contiguous timeline.
     let series = SampleSeries::from_drained_typed(
         result.snapshot_bridge.drain_ordered_with_stats(),

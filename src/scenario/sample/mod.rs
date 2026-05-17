@@ -124,7 +124,7 @@ pub struct Sample<'a> {
 ///
 /// Test authors construct a `SampleSeries` from
 /// [`super::snapshot::SnapshotBridge::drain_ordered_with_stats`]
-/// via [`Self::from_drained`]; non-periodic tags (e.g. `Op::Snapshot`
+/// via [`Self::from_drained`]; non-periodic tags (e.g. `Op::CaptureSnapshot`
 /// captures) coexist in the drain output and are tolerated by the
 /// projection helpers — the typical pattern is to pre-filter to
 /// periodic tags via [`Self::periodic_only`] before asserting.
@@ -270,7 +270,7 @@ impl SampleSeries {
     /// Filter the series to entries whose tag begins with
     /// `"periodic_"`. Periodic captures are the only entries the
     /// temporal-assertion patterns are designed for; on-demand
-    /// `Op::Snapshot` and watchpoint-fire captures share the
+    /// `Op::CaptureSnapshot` and watchpoint-fire captures share the
     /// bridge's tag namespace and would otherwise mix into the
     /// timeline as off-cadence outliers. Consumes `self` because
     /// the filter rebuilds the owning row vec — when a borrowed

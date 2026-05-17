@@ -1489,7 +1489,7 @@ fn run_ktstr_test_inner_impl(
     // The `#[ktstr_test]` scenario function (`entry.func`) runs
     // INSIDE the guest VM and cannot read host-side state — most
     // notably `VmResult.snapshot_bridge`, which the freeze
-    // coordinator populates on every `Op::Snapshot` /
+    // coordinator populates on every `Op::CaptureSnapshot` /
     // `Op::WatchSnapshot` fire. The `post_vm` hook closes that
     // gap: it runs on the HOST after `vm.run()` returns, with
     // direct access to the full `VmResult`. An `Err` from the

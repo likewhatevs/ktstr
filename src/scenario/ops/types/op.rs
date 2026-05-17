@@ -80,7 +80,7 @@ pub enum Op {
     /// The work type is used as-is; gauntlet `work_type_override` does
     /// not apply. Use [`CgroupDef`] with `swappable(true)` when the
     /// work type should be overridable.
-    Spawn {
+    SpawnWorkers {
         cgroup: Cow<'static, str>,
         work: WorkSpec,
     },
@@ -99,7 +99,7 @@ pub enum Op {
     /// Spawn workers in the parent cgroup (not in a managed cgroup).
     ///
     /// `WorkSpec` is resolved to a `WorkloadConfig` at apply time, matching
-    /// the resolution pattern used by `Op::Spawn`.
+    /// the resolution pattern used by `Op::SpawnWorkers`.
     SpawnHost { work: WorkSpec },
     /// Move all tasks from one cgroup to another.
     ///
@@ -390,7 +390,7 @@ pub enum Op {
     ///
     /// let steps = vec![Step {
     ///     setup: vec![CgroupDef::named("workers").workers(2)].into(),
-    ///     ops: vec![Op::snapshot("after_spawn")],
+    ///     ops: vec![Op::capture_snapshot("after_spawn")],
     ///     hold: HoldSpec::FULL,
     /// }];
     /// execute_steps(ctx, steps)?;
@@ -402,7 +402,7 @@ pub enum Op {
     /// let nr_cpus = snap.var("nr_cpus_onln").as_u64()?;
     /// assert!(nr_cpus > 0, "snapshot captured live nr_cpus_onln");
     /// ```
-    Snapshot { name: Cow<'static, str> },
+    CaptureSnapshot { name: Cow<'static, str> },
     /// Capture a snapshot whenever the guest writes to the named
     /// kernel symbol. The snapshot is tagged with the symbol
     /// itself; one fire = one capture.
@@ -449,7 +449,7 @@ pub enum Op {
     ///   the resolved KVA in the error.
     ///
     /// **Guest → host wire.** The registration request rides the
-    /// same ioeventfd doorbell as [`Op::Snapshot`] (separate tag
+    /// same ioeventfd doorbell as [`Op::CaptureSnapshot`] (separate tag
     /// namespace), so symbol resolution + user watchpoint slot
     /// allocation + `KVM_SET_GUEST_DEBUG` arming happen on the host
     /// without a vCPU userspace exit. Once armed, the
@@ -464,7 +464,7 @@ pub enum Op {
     /// thousands of times (each overwriting the prior capture
     /// under the same tag); the framework does not rate-limit
     /// captures, so the test author owns the frequency choice.
-    /// Use [`Op::Snapshot`] for time-driven captures when
+    /// Use [`Op::CaptureSnapshot`] for time-driven captures when
     /// frequency is the concern.
     WatchSnapshot { symbol: Cow<'static, str> },
 }

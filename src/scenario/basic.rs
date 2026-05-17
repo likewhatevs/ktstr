@@ -40,7 +40,7 @@ fn sched_mixed_steps(ctx: &Ctx) -> Vec<Step> {
     let mut ops = vec![Op::add_cgroup("cg_0"), Op::add_cgroup("cg_1")];
     for name in ["cg_0", "cg_1"] {
         for &(policy, ref wtype) in &configs {
-            ops.push(Op::spawn(
+            ops.push(Op::spawn_workers(
                 name,
                 WorkSpec::default()
                     .workers(2)
@@ -63,13 +63,13 @@ pub fn custom_sched_mixed(ctx: &Ctx) -> Result<AssertResult> {
 fn cgroup_pipe_io_steps(ctx: &Ctx) -> Vec<Step> {
     let mut ops = vec![Op::add_cgroup("cg_0"), Op::add_cgroup("cg_1")];
     for name in ["cg_0", "cg_1"] {
-        ops.push(Op::spawn(
+        ops.push(Op::spawn_workers(
             name,
             WorkSpec::default()
                 .workers(2)
                 .work_type(WorkType::pipe_io(1024)),
         ));
-        ops.push(Op::spawn(
+        ops.push(Op::spawn_workers(
             name,
             WorkSpec::default().workers(ctx.workers_per_cgroup),
         ));
@@ -144,11 +144,11 @@ mod tests {
             .iter()
             .filter(|o| matches!(o, Op::AddCgroup { .. }))
             .count();
-        let spawns = ops.iter().filter(|o| matches!(o, Op::Spawn { .. })).count();
+        let spawns = ops.iter().filter(|o| matches!(o, Op::SpawnWorkers { .. })).count();
         assert_eq!(adds, 2, "two cgroups added");
         assert_eq!(spawns, 8, "4 policies × 2 cgroups = 8 spawns");
         for op in ops {
-            if let Op::Spawn { work, .. } = op {
+            if let Op::SpawnWorkers { work, .. } = op {
                 assert_eq!(work.num_workers, Some(2));
             }
         }
@@ -166,7 +166,7 @@ mod tests {
         let spawns: Vec<_> = ops
             .iter()
             .filter_map(|o| match o {
-                Op::Spawn { cgroup, work } => Some((cgroup.to_string(), work.num_workers)),
+                Op::SpawnWorkers { cgroup, work } => Some((cgroup.to_string(), work.num_workers)),
                 _ => None,
             })
             .collect();

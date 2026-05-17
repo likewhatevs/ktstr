@@ -1,6 +1,6 @@
 //! Diagnostic snapshot capture and traversal.
 //!
-//! Test scenarios use [`Op::Snapshot`](crate::scenario::ops::Op::Snapshot)
+//! Test scenarios use [`Op::CaptureSnapshot`](crate::scenario::ops::Op::CaptureSnapshot)
 //! to request a host-side diagnostic capture mid-run. The capture
 //! result — a [`FailureDumpReport`] — is keyed by the `name` argument
 //! and stored on the scenario's [`SnapshotBridge`], where downstream
@@ -15,7 +15,7 @@
 //!    bridge owns the storage map and a callable that performs the
 //!    capture.
 //!
-//! 2. **Capture.** When the executor reaches `Op::Snapshot { name }`,
+//! 2. **Capture.** When the executor reaches `Op::CaptureSnapshot { name }`,
 //!    it invokes [`SnapshotBridge::capture`] with the name. The
 //!    closure performs the freeze rendezvous (request/reply with
 //!    the freeze coordinator), builds a [`FailureDumpReport`], and
@@ -30,7 +30,7 @@
 //!
 //! # On-demand vs error-trigger captures
 //!
-//! `Op::Snapshot` requests are orthogonal to the error-class freeze
+//! `Op::CaptureSnapshot` requests are orthogonal to the error-class freeze
 //! path. The freeze coordinator's existing state machine for
 //! `SCX_EXIT_ERROR` triggers (Idle → TookEarly → Done) governs the
 //! *unsolicited* capture pipeline; on-demand captures funnel
@@ -53,11 +53,10 @@
 //!    the existing MMIO gap (e.g. `MMIO_GAP_START + 0x3000`) via
 //!    `KVM_IOEVENTFD`. The exact GPA is arch-dependent —
 //!    `MMIO_GAP_START + 0x3000` on x86_64,
-//!    `VIRTIO_NET_MMIO_BASE + VIRTIO_MMIO_SIZE` on aarch64 — and
-//!    the canonical value is exposed as `an internal MMIO doorbell GPA (deleted)`.
-//!    The fd is owned by the freeze coordinator and polled
-//!    alongside its existing wake sources.
-//! 2. Guest [`Op::Snapshot`](crate::scenario::ops::Op::Snapshot)
+//!    `VIRTIO_NET_MMIO_BASE + VIRTIO_MMIO_SIZE` on aarch64. The
+//!    fd is owned by the freeze coordinator and polled alongside
+//!    its existing wake sources.
+//! 2. Guest [`Op::CaptureSnapshot`](crate::scenario::ops::Op::CaptureSnapshot)
 //!    handler `mmap`s `/dev/mem` to reach the doorbell GPA (same
 //!    pattern the SHM ring already uses) and writes the tag value
 //!    plus a serial counter into a small per-call slot, then
@@ -86,7 +85,7 @@
 //!
 //! # No-bridge fallback
 //!
-//! When `Op::Snapshot` runs in a context with no installed bridge
+//! When `Op::CaptureSnapshot` runs in a context with no installed bridge
 //! (e.g. unit tests that exercise the executor without spinning up
 //! a VM), the op is a no-op with a `tracing::warn!`. Existing
 //! scenarios that do not declare snapshot ops keep working

@@ -312,7 +312,7 @@ fn step_default_field_state_and_spread_composability() {
     assert!(matches!(composed.hold, HoldSpec::Frac(f) if f == 1.0));
 }
 
-/// Pin that `Setup::factory(f)` and `Setup::default()` resolve to
+/// Pin that `Setup::with_factory(f)` and `Setup::default()` resolve to
 /// the same shape a direct `Setup::Defs(v)` / `Setup::Factory(f)`
 /// construction yields. `Setup` has no `PartialEq` (it holds a
 /// fn pointer in `Factory`), so we discriminate on variant
@@ -325,11 +325,11 @@ fn setup_constructors_match_direct_variants() {
         matches!(from_default, Setup::Defs(ref v) if v.is_empty()),
         "Setup::default() must produce Setup::Defs(Vec::new())"
     );
-    // factory(fn) -> Factory(fn)
+    // with_factory(fn) -> Factory(fn)
     fn make_zero_cgroups(_: &Ctx) -> Vec<CgroupDef> {
         Vec::new()
     }
-    let from_factory = Setup::factory(make_zero_cgroups);
+    let from_factory = Setup::with_factory(make_zero_cgroups);
     assert!(matches!(from_factory, Setup::Factory(_)));
 }
 

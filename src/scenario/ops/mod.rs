@@ -77,13 +77,13 @@ use crate::vmm::guest_comms;
 use crate::vmm::wire::StimulusPayload;
 use crate::workload::{MemPolicy, ResolvedAffinity, WorkloadConfig, WorkloadHandle};
 
-/// Latched once `Op::Snapshot` / `Op::WatchSnapshot` observes a
+/// Latched once `Op::CaptureSnapshot` / `Op::WatchSnapshot` observes a
 /// [`crate::vmm::wire::SnapshotRequestResult::TransportError`].
 /// Process-scoped because the underlying transport (virtio-console
 /// bulk port + SHM ring) is process-shared: once the host's freeze
 /// coordinator stops draining, every subsequent guest-side request
 /// will time out the same 30-second window. A `Loop` step that
-/// fires `Op::Snapshot` every iteration would otherwise burn 30 s
+/// fires `Op::CaptureSnapshot` every iteration would otherwise burn 30 s
 /// per iteration on a permanently dead transport. After the first
 /// timeout the flag short-circuits later attempts back to a
 /// `tracing::warn!` no-op so the loop continues exercising the
@@ -601,7 +601,7 @@ pub fn execute_steps_with(
 /// - [`Op::SetCpuset`] / [`Op::ClearCpuset`] / [`Op::SwapCpusets`] /
 ///   [`Op::SetAffinity`] → [`Controller::Cpuset`]
 /// - Every other [`Op`] variant ([`Op::FreezeCgroup`],
-///   [`Op::AddCgroup`], [`Op::Spawn`], [`Op::MoveAllTasks`], etc.)
+///   [`Op::AddCgroup`], [`Op::SpawnWorkers`], [`Op::MoveAllTasks`], etc.)
 ///   touches cgroup-core knobs (`cgroup.freeze`, `cgroup.procs`,
 ///   `mkdir`/`rmdir`) which are ungated by any controller and
 ///   contribute nothing to this set.
@@ -1889,7 +1889,7 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
             // the topology-usable cpuset when the cgroup inherits)
             // and synthesize a `num_workers` value before the rest of
             // the dispatch. Shares the resolution helper with
-            // Op::Spawn so the two paths produce identical worker
+            // Op::SpawnWorkers so the two paths produce identical worker
             // counts for the same `(pct, cpuset_size)` pair.
             let cpuset_size = cgroup_cpuset
                 .as_ref()
@@ -2307,7 +2307,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     state.record_cpuset(a, cb);
                 }
             }
-            Op::Spawn { cgroup, work } => {
+            Op::SpawnWorkers { cgroup, work } => {
                 if let Err(reason) = work.mem_policy.validate() {
                     anyhow::bail!("cgroup '{}': {}", cgroup, reason);
                 }
@@ -2370,7 +2370,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 // without this hoist the per-handle inner arm would
                 // re-collect the same pool on every matching handle
                 // (and a single cgroup name can carry multiple handles
-                // when a `CgroupDef::works` vec or repeated `Op::Spawn`
+                // when a `CgroupDef::works` vec or repeated `Op::SpawnWorkers`
                 // populates more than one). The pool is invariant
                 // across handles for a given resolved affinity.
                 //
@@ -2663,7 +2663,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     .set_freeze(cgroup, false)
                     .with_context(|| format!("Op::UnfreezeCgroup: cgroup '{cgroup}'"))?;
             }
-            Op::Snapshot { name } => {
+            Op::CaptureSnapshot { name } => {
                 // Two execution contexts:
                 //   1. Test fixture: a thread-local SnapshotBridge is
                 //      installed (e.g. by the `snapshot_e2e.rs`
@@ -2685,7 +2685,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                         tracing::info!(
                             name = %name,
                             stored = b.len(),
-                            "Op::Snapshot: captured diagnostic snapshot"
+                            "Op::CaptureSnapshot: captured diagnostic snapshot"
                         );
                     }
                     captured
@@ -2701,7 +2701,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                             // process restarts.
                             tracing::warn!(
                                 name = %name,
-                                "Op::Snapshot: snapshot transport latched dead; skipping host \
+                                "Op::CaptureSnapshot: snapshot transport latched dead; skipping host \
                                  request to avoid the 30 s timeout per attempt"
                             );
                         } else {
@@ -2714,12 +2714,12 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                                 crate::vmm::wire::SnapshotRequestResult::Ok => {
                                     tracing::info!(
                                         name = %name,
-                                        "Op::Snapshot: host captured diagnostic snapshot via TLV stream"
+                                        "Op::CaptureSnapshot: host captured diagnostic snapshot via TLV stream"
                                     );
                                 }
                                 crate::vmm::wire::SnapshotRequestResult::HostError { reason } => {
                                     anyhow::bail!(
-                                        "Op::Snapshot('{name}'): host rejected capture: {reason}"
+                                        "Op::CaptureSnapshot('{name}'): host rejected capture: {reason}"
                                     );
                                 }
                                 crate::vmm::wire::SnapshotRequestResult::TransportError {
@@ -2727,7 +2727,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                                 } => {
                                     SNAPSHOT_TRANSPORT_DEAD.store(true, Ordering::Relaxed);
                                     anyhow::bail!(
-                                        "Op::Snapshot('{name}'): port-1 transport failure: {reason}"
+                                        "Op::CaptureSnapshot('{name}'): port-1 transport failure: {reason}"
                                     );
                                 }
                             }
@@ -2735,14 +2735,14 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     } else {
                         tracing::warn!(
                             name = %name,
-                            "Op::Snapshot: no SnapshotBridge installed on the executor's \
+                            "Op::CaptureSnapshot: no SnapshotBridge installed on the executor's \
                              thread and not running in a guest VM — skipping capture"
                         );
                     }
                 }
             }
             Op::WatchSnapshot { symbol } => {
-                // Two execution contexts mirroring `Op::Snapshot`:
+                // Two execution contexts mirroring `Op::CaptureSnapshot`:
                 //   1. Test fixture: thread-local SnapshotBridge
                 //      drives the register callback directly.
                 //   2. Production: in-guest scenario sends a
@@ -3239,7 +3239,7 @@ mod tests {
                         .cloned()
                         .unwrap_or_default();
                     ops.push(Op::AddCgroup { name: name.clone() });
-                    ops.push(Op::Spawn {
+                    ops.push(Op::SpawnWorkers {
                         cgroup: name.clone(),
                         work: w,
                     });
@@ -3468,7 +3468,7 @@ mod tests {
                 a: "a".into(),
                 b: "b".into(),
             },
-            Op::Spawn {
+            Op::SpawnWorkers {
                 cgroup: "a".into(),
                 work: Default::default(),
             },
@@ -3499,7 +3499,7 @@ mod tests {
             },
             Op::FreezeCgroup { cgroup: "a".into() },
             Op::UnfreezeCgroup { cgroup: "a".into() },
-            Op::Snapshot {
+            Op::CaptureSnapshot {
                 name: "snap".into(),
             },
             Op::WatchSnapshot {
@@ -3582,7 +3582,7 @@ mod tests {
             "SwapCpusets",
         );
         assert_eq!(
-            Op::Spawn {
+            Op::SpawnWorkers {
                 cgroup: "a".into(),
                 work: WorkSpec::default(),
             }
@@ -3660,7 +3660,7 @@ mod tests {
             "UnfreezeCgroup",
         );
         assert_eq!(
-            Op::Snapshot {
+            Op::CaptureSnapshot {
                 name: "snap".into()
             }
             .discriminant(),
@@ -7915,7 +7915,7 @@ mod tests {
     /// `MoveAllTasks` must re-key EVERY workload handle whose
     /// current name matches `from`, not just the first. Multiple
     /// handles on the same cgroup arise when a scenario issues two
-    /// `Op::Spawn` ops on the same cgroup name.
+    /// `Op::SpawnWorkers` ops on the same cgroup name.
     #[test]
     fn move_all_tasks_renames_every_handle_keyed_under_from() {
         use crate::workload::{AffinityIntent, WorkType, WorkloadConfig, WorkloadHandle};
@@ -7929,7 +7929,7 @@ mod tests {
         step_state.cgroups.add_cgroup_no_cpuset("dst").unwrap();
 
         // Push THREE handles all keyed under "src" — simulates two
-        // Op::Spawn ops in the same cgroup + one from CgroupDef.
+        // Op::SpawnWorkers ops in the same cgroup + one from CgroupDef.
         for _ in 0..3 {
             let wl = WorkloadConfig {
                 num_workers: 1,
@@ -8196,7 +8196,7 @@ mod tests {
             Op::set_cpuset("a", CpusetSpec::Llc(0)),
             Op::clear_cpuset("a"),
             Op::swap_cpusets("a", "b"),
-            Op::spawn("a", w.clone()),
+            Op::spawn_workers("a", w.clone()),
             Op::stop_cgroup("a"),
             Op::set_affinity("a", AffinityIntent::Inherit),
             Op::spawn_host(w.clone()),
@@ -8209,7 +8209,7 @@ mod tests {
             Op::kill_payload_in_cgroup("constructor-test", "a"),
             Op::freeze_cgroup("a"),
             Op::unfreeze_cgroup("a"),
-            Op::snapshot("constructor-test"),
+            Op::capture_snapshot("constructor-test"),
             Op::watch_snapshot("kernel.constructor_test"),
         ];
 
@@ -8226,7 +8226,7 @@ mod tests {
                 Op::SetCpuset { .. } => 3,
                 Op::ClearCpuset { .. } => 4,
                 Op::SwapCpusets { .. } => 5,
-                Op::Spawn { .. } => 6,
+                Op::SpawnWorkers { .. } => 6,
                 Op::StopCgroup { .. } => 7,
                 Op::SetAffinity { .. } => 8,
                 Op::SpawnHost { .. } => 9,
@@ -8236,7 +8236,7 @@ mod tests {
                 Op::KillPayload { .. } => 13,
                 Op::FreezeCgroup { .. } => 14,
                 Op::UnfreezeCgroup { .. } => 15,
-                Op::Snapshot { .. } => 16,
+                Op::CaptureSnapshot { .. } => 16,
                 Op::WatchSnapshot { .. } => 17,
             };
             seen[idx] = true;
@@ -9627,10 +9627,10 @@ mod tests {
     /// touches no WorkSpec / handle state.
     ///
     /// `resolve_workers_pct` does have TWO call sites overall
-    /// (apply_setup at mod.rs:1772 and Op::Spawn at mod.rs:2100),
-    /// so a test author who issues an `Op::Spawn` AFTER an
+    /// (apply_setup at mod.rs:1772 and Op::SpawnWorkers at mod.rs:2100),
+    /// so a test author who issues an `Op::SpawnWorkers` AFTER an
     /// `Op::SetCpuset` will get fresh resolution against the
-    /// then-current cpuset — that's the Op::Spawn integration
+    /// then-current cpuset — that's the Op::SpawnWorkers integration
     /// layer's responsibility and is verified by `op_spawn_*` tests,
     /// not here. This test catches a future regression that adds
     /// re-resolution INTO the Op::SetCpuset apply branch
@@ -9991,10 +9991,10 @@ mod tests {
         cleanup_state(&mut state);
     }
 
-    /// `Op::Spawn` with `WorkSpec::workers_pct` resolves against the
+    /// `Op::SpawnWorkers` with `WorkSpec::workers_pct` resolves against the
     /// cgroup's currently-recorded cpuset, mirroring the apply_setup
     /// path. Pin so a future regression that drops the workers_pct
-    /// pre-resolution from Op::Spawn (silently falling back to
+    /// pre-resolution from Op::SpawnWorkers (silently falling back to
     /// `ctx.workers_per_cgroup` and ignoring the user's fraction) is
     /// caught.
     #[test]
@@ -10019,7 +10019,7 @@ mod tests {
         apply_ops_test(
             &ctx,
             &mut state,
-            &[Op::Spawn {
+            &[Op::SpawnWorkers {
                 cgroup: std::borrow::Cow::Borrowed("cg_spawn"),
                 work,
             }],
@@ -10029,19 +10029,19 @@ mod tests {
             .handles
             .iter()
             .find(|(n, _)| n == "cg_spawn")
-            .expect("Op::Spawn workload registered")
+            .expect("Op::SpawnWorkers workload registered")
             .1;
         assert_eq!(
             handle.worker_pids().len(),
             2,
-            "Op::Spawn workers_pct(0.5) on Llc(0)=4 must resolve to 2 workers; \
+            "Op::SpawnWorkers workers_pct(0.5) on Llc(0)=4 must resolve to 2 workers; \
              got {}",
             handle.worker_pids().len(),
         );
         cleanup_state(&mut state);
     }
 
-    /// `Op::Spawn` with BOTH workers and workers_pct set is rejected
+    /// `Op::SpawnWorkers` with BOTH workers and workers_pct set is rejected
     /// the same way apply_setup rejects it — the resolution helper
     /// is shared so the diagnostic is identical.
     #[test]
@@ -10063,16 +10063,16 @@ mod tests {
         let err = apply_ops_test(
             &ctx,
             &mut state,
-            &[Op::Spawn {
+            &[Op::SpawnWorkers {
                 cgroup: std::borrow::Cow::Borrowed("cg_x"),
                 work,
             }],
         )
-        .expect_err("Op::Spawn dual-set must reject");
+        .expect_err("Op::SpawnWorkers dual-set must reject");
         let msg = format!("{err}");
         assert!(
             msg.contains("workers_pct") && msg.contains("workers(2)"),
-            "Op::Spawn diagnostic must name both knobs: {msg}",
+            "Op::SpawnWorkers diagnostic must name both knobs: {msg}",
         );
         cleanup_state(&mut state);
     }

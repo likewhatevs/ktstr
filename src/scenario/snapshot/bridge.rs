@@ -83,7 +83,7 @@ pub type WatchRegisterCallback =
 /// Cloneable via the wrapped `Arc`s. The host installs an instance
 /// in the executor's thread-local via `Self::set_thread_local`
 /// before [`execute_steps`](crate::scenario::ops::execute_steps)
-/// runs; the executor's `Op::Snapshot` arm calls
+/// runs; the executor's `Op::CaptureSnapshot` arm calls
 /// `Self::capture` with the op's name.
 /// Maximum number of [`Op::WatchSnapshot`](crate::scenario::ops::Op::WatchSnapshot)
 /// ops a single scenario may register.
@@ -155,7 +155,7 @@ pub const MAX_STORED_EVENTS: usize = 1024;
 #[non_exhaustive]
 pub enum SnapshotBridgeEvent {
     /// Capture callback returned `None` for `tag` — the corresponding
-    /// `Op::Snapshot` was a no-op. Fires from
+    /// `Op::CaptureSnapshot` was a no-op. Fires from
     /// [`SnapshotBridge::capture`] when the host couldn't freeze /
     /// build the report (scheduler died before the freeze, scan
     /// accessor unavailable, etc.).
@@ -347,7 +347,7 @@ impl Drop for WatchSlotGuard<'_> {
 }
 
 /// Host-side capture pipeline that the freeze coordinator routes
-/// [`Op::Snapshot`](crate::scenario::ops::Op::Snapshot) and
+/// [`Op::CaptureSnapshot`](crate::scenario::ops::Op::CaptureSnapshot) and
 /// [`Op::WatchSnapshot`](crate::scenario::ops::Op::WatchSnapshot)
 /// requests through.
 ///
@@ -436,7 +436,7 @@ impl SnapshotBridge {
                     "Op::WatchSnapshot cap exceeded: scenario already registered \
                      {MAX_WATCH_SNAPSHOTS} watchpoints ({MAX_WATCH_SNAPSHOTS} user \
                      watchpoint slots occupied; slot 0 reserved for the error-class \
-                     exit_kind trigger). Drop a watch or use Op::Snapshot for a \
+                     exit_kind trigger). Drop a watch or use Op::CaptureSnapshot for a \
                      time-driven capture instead."
                 ));
             }
@@ -512,7 +512,7 @@ impl SnapshotBridge {
     ///
     /// Storage is capped at [`MAX_STORED_SNAPSHOTS`] entries to bound
     /// host memory under runaway capture cadence (e.g. a Loop step
-    /// firing `Op::Snapshot` with a unique tag every iteration).
+    /// firing `Op::CaptureSnapshot` with a unique tag every iteration).
     /// When the cap is reached, the oldest stored entry is evicted
     /// with a `tracing::warn!` naming the dropped tag. An overwrite
     /// of an existing tag also warns and replaces the prior report
@@ -870,7 +870,7 @@ impl SnapshotBridge {
     /// `None`) is restored.
     ///
     /// Thread-local because [`execute_steps`](crate::scenario::ops::execute_steps)
-    /// runs on the calling thread and `Op::Snapshot` only makes
+    /// runs on the calling thread and `Op::CaptureSnapshot` only makes
     /// sense in that exact thread's call stack — installing a
     /// bridge process-wide would race against parallel test
     /// threads.

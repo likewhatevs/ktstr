@@ -17,6 +17,34 @@
 //!
 //! The [`scenarios`] submodule provides curated canned scenarios.
 //!
+//! ## Builder method conventions
+//!
+//! Every builder type in the scenario API (Setup, Step, Backdrop,
+//! WorkloadConfig, …) names its methods by what they do, not by
+//! what they return. The three-prefix vocabulary is uniform across
+//! the scenario surface so a reader can predict semantics from
+//! the prefix alone:
+//!
+//! - **`with_X(arg) -> Self`** — alternate constructor that returns
+//!   a fresh value with `X` already set (e.g.
+//!   [`ops::Step::with_defs`], [`ops::Step::with_payload`],
+//!   [`ops::Setup::with_factory`]). Distinct from `Self::new(...)`
+//!   which is the base ctor; `with_X` constructors compose without
+//!   reaching for `Default::default()` then chaining setters.
+//! - **`set_X(self, value) -> Self`** — field REPLACE on an
+//!   existing builder. Consumes `self`, writes `X`, returns the
+//!   updated value (e.g. [`ops::Step::set_ops`],
+//!   [`ops::Step::set_hold`]). Previous contents of `X` are
+//!   discarded.
+//! - **`push_X(self, value) -> Self`** / **`extend_X<I>(self, iter)
+//!   -> Self`** — field APPEND. `push_X` adds one element,
+//!   `extend_X` adds many from any `IntoIterator` (e.g.
+//!   [`backdrop::Backdrop::push_cgroup`] /
+//!   [`backdrop::Backdrop::extend_cgroups`]).
+//!
+//! Naming an APPEND method `set_X` (or a REPLACE method `push_X`)
+//! mis-encodes the semantics and is a defect — flag at review.
+//!
 //! See the [Scenarios](https://likewhatevs.github.io/ktstr/guide/concepts/scenarios.html)
 //! and [Writing Tests](https://likewhatevs.github.io/ktstr/guide/writing-tests.html)
 //! chapters of the guide.

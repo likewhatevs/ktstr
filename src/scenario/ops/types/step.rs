@@ -27,7 +27,7 @@ use super::{CgroupDef, CpusetSpec, Op, OpKind};
 /// How to produce the CgroupDefs for a step's setup phase.
 ///
 /// Construct via `Setup::Defs(vec)` (variant constructor for a static
-/// list), [`Setup::factory`] (runtime-generated from `&Ctx`),
+/// list), [`Setup::with_factory`] (runtime-generated from `&Ctx`),
 /// `Setup::default()` (no cgroups — `Setup::Defs(Vec::new())`), or via
 /// [`From<Vec<CgroupDef>>`](Self::from) (`vec![def1, def2].into()`).
 pub enum Setup {
@@ -59,12 +59,15 @@ impl std::fmt::Debug for Setup {
 }
 
 impl Setup {
-    /// Construct a [`Setup::Factory`] from a function pointer. The
-    /// `Defs` variant is constructed directly via `Setup::Defs(vec)`
-    /// (variant constructor) or `Default::default()` for the empty
-    /// case; `Factory` needs a named constructor because variant
-    /// construction with a `fn` pointer literal is awkward to read.
-    pub const fn factory(f: fn(&Ctx) -> Vec<CgroupDef>) -> Self {
+    /// Construct a [`Setup::Factory`] from a function pointer.
+    /// `with_factory` per the scenario-module builder convention
+    /// (`with_X` = constructor variant; see the module-level docs
+    /// on [`crate::scenario`]). The `Defs` variant is constructed
+    /// directly via `Setup::Defs(vec)` (variant constructor) or
+    /// `Default::default()` for the empty case; `Factory` needs a
+    /// named constructor because variant construction with a `fn`
+    /// pointer literal is awkward to read.
+    pub const fn with_factory(f: fn(&Ctx) -> Vec<CgroupDef>) -> Self {
         Setup::Factory(f)
     }
 
@@ -346,7 +349,7 @@ impl OpKind {
             OpKind::SetCpuset => 3,
             OpKind::ClearCpuset => 4,
             OpKind::SwapCpusets => 5,
-            OpKind::Spawn => 6,
+            OpKind::SpawnWorkers => 6,
             OpKind::StopCgroup => 7,
             OpKind::SetAffinity => 8,
             OpKind::SpawnHost => 9,
@@ -356,7 +359,7 @@ impl OpKind {
             OpKind::KillPayload => 13,
             OpKind::FreezeCgroup => 14,
             OpKind::UnfreezeCgroup => 15,
-            OpKind::Snapshot => 16,
+            OpKind::CaptureSnapshot => 16,
             OpKind::WatchSnapshot => 17,
         }
     }
@@ -415,8 +418,8 @@ impl Op {
     }
 
     /// Spawn workers in a cgroup.
-    pub fn spawn(cgroup: impl Into<Cow<'static, str>>, work: WorkSpec) -> Self {
-        Op::Spawn {
+    pub fn spawn_workers(cgroup: impl Into<Cow<'static, str>>, work: WorkSpec) -> Self {
+        Op::SpawnWorkers {
             cgroup: cgroup.into(),
             work,
         }
@@ -435,7 +438,7 @@ impl Op {
     /// Equivalent to:
     ///
     /// ```ignore
-    /// Op::spawn(
+    /// Op::spawn_workers(
     ///     cgroup,
     ///     WorkSpec { work_type, ..WorkSpec::default() },
     /// )
@@ -449,7 +452,7 @@ impl Op {
         cgroup: impl Into<Cow<'static, str>>,
         work_type: WorkType,
     ) -> Self {
-        Op::Spawn {
+        Op::SpawnWorkers {
             cgroup: cgroup.into(),
             work: WorkSpec {
                 work_type,
@@ -591,10 +594,10 @@ impl Op {
     }
 
     /// Capture a host-side diagnostic snapshot under `name`. See
-    /// [`Op::Snapshot`] for the full request/reply protocol and
+    /// [`Op::CaptureSnapshot`] for the full request/reply protocol and
     /// no-bridge fallback semantics.
-    pub fn snapshot(name: impl Into<Cow<'static, str>>) -> Self {
-        Op::Snapshot { name: name.into() }
+    pub fn capture_snapshot(name: impl Into<Cow<'static, str>>) -> Self {
+        Op::CaptureSnapshot { name: name.into() }
     }
 
     /// Register a write-driven snapshot watch on `symbol`. See

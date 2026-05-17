@@ -388,7 +388,7 @@ impl KtstrVmBuilder {
     /// the window at the first `MSG_TYPE_SCENARIO_START` it sees,
     /// so boot + verifier time do not eat the budget. Each fire
     /// runs the same `freeze_and_capture(false)` path the
-    /// on-demand `Op::Snapshot` handler uses and stores under
+    /// on-demand `Op::CaptureSnapshot` handler uses and stores under
     /// `"periodic_NNN"` on the host's
     /// [`crate::scenario::snapshot::SnapshotBridge`]. Bounded above
     /// by [`crate::scenario::snapshot::MAX_STORED_SNAPSHOTS`] —

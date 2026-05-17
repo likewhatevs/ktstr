@@ -236,7 +236,7 @@ pub fn custom_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<AssertResult> {
         // die at step teardown — which is what the prior
         // execute_steps behavior eventually did at scenario end too.
         Step::new(
-            vec![Op::spawn("cg_1", WorkSpec::default().workers(16))],
+            vec![Op::spawn_workers("cg_1", WorkSpec::default().workers(16))],
             HoldSpec::frac(0.5),
         ),
     ];

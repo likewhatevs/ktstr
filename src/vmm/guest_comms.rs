@@ -644,7 +644,7 @@ static SNAPSHOT_REQUEST_COUNTER: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(1);
 
 /// Mutex serialising guest-side snapshot requests. Without this two
-/// guest threads issuing `Op::Snapshot` concurrently could interleave
+/// guest threads issuing `Op::CaptureSnapshot` concurrently could interleave
 /// their TX writes and read each other's replies. The freeze
 /// coordinator's `on_demand_in_flight` latch already collapses
 /// doorbell floods to one capture per thaw on the host side; this

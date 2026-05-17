@@ -1,9 +1,9 @@
 //! End-to-end test for the on-demand diagnostic snapshot pipeline.
 //!
-//! Covers the wiring between [`Op::Snapshot`] / [`Op::WatchSnapshot`]
+//! Covers the wiring between [`Op::CaptureSnapshot`] / [`Op::WatchSnapshot`]
 //! and the host-side [`SnapshotBridge`]:
 //!   1. Install a [`SnapshotBridge`] in the executor's thread.
-//!   2. Run a step sequence whose ops include `Op::snapshot(name)`
+//!   2. Run a step sequence whose ops include `Op::capture_snapshot(name)`
 //!      and `Op::watch_snapshot(symbol)` — the executor invokes
 //!      the bridge's capture / register callbacks.
 //!   3. After the scenario finishes, drain the bridge and verify
@@ -25,7 +25,7 @@
 //! - **In-VM integration** (the `#[ktstr_test]`-registered scenarios
 //!   at the bottom of this file): boot scx-ktstr, install a
 //!   [`SnapshotBridge`] inside the scenario function, run
-//!   `Op::snapshot` / `Op::watch_snapshot`, and verify the bridge's
+//!   `Op::capture_snapshot` / `Op::watch_snapshot`, and verify the bridge's
 //!   captured / registered state. The watch-fire test deserializes
 //!   the host-written failure dump JSON (sidecar dir) into a real
 //!   [`FailureDumpReport`] so the [`Snapshot`] accessor walks
@@ -65,7 +65,7 @@ fn snapshot_op_drives_bridge_and_stores_report_under_name() {
 
     let steps = vec![Step {
         setup: Vec::<ktstr::scenario::ops::CgroupDef>::new().into(),
-        ops: vec![Op::snapshot("after_setup"), Op::snapshot("after_workload")],
+        ops: vec![Op::capture_snapshot("after_setup"), Op::capture_snapshot("after_workload")],
         hold: HoldSpec::fixed(std::time::Duration::from_millis(1)),
     }];
     let result = execute_steps(&ctx, steps).expect("execute_steps must succeed");
@@ -74,7 +74,7 @@ fn snapshot_op_drives_bridge_and_stores_report_under_name() {
     assert_eq!(
         calls.load(Ordering::Relaxed),
         2,
-        "bridge.capture must have fired exactly once per Op::Snapshot"
+        "bridge.capture must have fired exactly once per Op::CaptureSnapshot"
     );
 
     let captured = bridge_handle.drain();
@@ -104,7 +104,7 @@ fn snapshot_op_with_no_bridge_is_a_no_op() {
 
     let steps = vec![Step {
         setup: Vec::<ktstr::scenario::ops::CgroupDef>::new().into(),
-        ops: vec![Op::snapshot("orphan")],
+        ops: vec![Op::capture_snapshot("orphan")],
         hold: HoldSpec::fixed(std::time::Duration::from_millis(1)),
     }];
     let result = execute_steps(&ctx, steps).expect("execute_steps with no bridge must succeed");
@@ -129,7 +129,7 @@ fn snapshot_op_with_failing_capture_does_not_abort_scenario() {
 
     let steps = vec![Step {
         setup: Vec::<ktstr::scenario::ops::CgroupDef>::new().into(),
-        ops: vec![Op::snapshot("doomed")],
+        ops: vec![Op::capture_snapshot("doomed")],
         hold: HoldSpec::fixed(std::time::Duration::from_millis(1)),
     }];
     let result = execute_steps(&ctx, steps).expect("execute_steps must succeed");
@@ -241,7 +241,7 @@ fn watch_snapshot_op_unresolvable_symbol_bails_immediately() {
 
 // ---------------------------------------------------------------------------
 // In-VM integration: scx-ktstr boots, scenario function installs a
-// SnapshotBridge inside the guest, exercises Op::snapshot /
+// SnapshotBridge inside the guest, exercises Op::capture_snapshot /
 // Op::watch_snapshot end-to-end. The host-side automatic bridge wiring
 // is a follow-up; these tests install the bridge in the scenario thread
 // before `execute_steps`, the same shape the executor's `with_active_bridge`
@@ -285,7 +285,7 @@ const SYNTHETIC_BSS_REPORT_JSON: &str = r#"{
     ]
 }"#;
 
-/// Test 1: `Op::snapshot` runs inside scx-ktstr's guest VM and drives
+/// Test 1: `Op::capture_snapshot` runs inside scx-ktstr's guest VM and drives
 /// the host-installed `SnapshotBridge`'s capture callback. The
 /// callback returns a hand-crafted `FailureDumpReport`; the scenario
 /// drains the bridge after `execute_steps` and walks the rendered
@@ -309,17 +309,17 @@ fn scenario_snapshot_op_captures_in_vm(
 
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
-        ops: vec![Op::snapshot("test_snap")],
+        ops: vec![Op::capture_snapshot("test_snap")],
         hold: HoldSpec::FULL,
     }];
     let mut result = execute_steps(ctx, steps)?;
 
-    // Drain the bridge — `Op::snapshot` must have driven `capture`,
+    // Drain the bridge — `Op::capture_snapshot` must have driven `capture`,
     // and the synthetic report must be stored under the op's `name`.
     let captured = bridge_handle.drain();
     if !captured.contains_key("test_snap") {
         anyhow::bail!(
-            "Op::snapshot('test_snap') did not store a report on the bridge; \
+            "Op::capture_snapshot('test_snap') did not store a report on the bridge; \
              captured keys: {:?}",
             captured.keys().collect::<Vec<_>>()
         );
@@ -330,7 +330,7 @@ fn scenario_snapshot_op_captures_in_vm(
     let snap = Snapshot::new(report);
     if snap.map_count() == 0 {
         anyhow::bail!(
-            "Op::snapshot captured a report but the report has no maps — \
+            "Op::capture_snapshot captured a report but the report has no maps — \
              SnapshotBridge::capture lost the synthetic FailureDumpReport's \
              `maps` vec on store"
         );
@@ -373,7 +373,7 @@ fn scenario_snapshot_op_captures_in_vm(
     result.details.push(ktstr::assert::AssertDetail::new(
         ktstr::assert::DetailKind::Other,
         format!(
-            "Op::snapshot('test_snap') captured {} map(s); bpf.bss has \
+            "Op::capture_snapshot('test_snap') captured {} map(s); bpf.bss has \
              nr_cpus_onln={via_var} via var() and {via_path} via dotted-path",
             snap.map_count()
         ),
@@ -637,14 +637,14 @@ fn scenario_snapshotmap_iter_against_synthetic_cgroup_map(
 
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
-        ops: vec![Op::snapshot("iter_target")],
+        ops: vec![Op::capture_snapshot("iter_target")],
         hold: HoldSpec::FULL,
     }];
     let mut result = execute_steps(ctx, steps)?;
 
     let captured = bridge_handle.drain();
     let report = captured.get("iter_target").ok_or_else(|| {
-        anyhow::anyhow!("bridge drain missing 'iter_target' — Op::snapshot didn't fire capture")
+        anyhow::anyhow!("bridge drain missing 'iter_target' — Op::capture_snapshot didn't fire capture")
     })?;
     let snap = Snapshot::new(report);
     let map = snap

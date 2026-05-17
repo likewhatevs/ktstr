@@ -2690,7 +2690,7 @@
 
     /// `capture` whose callback returns `None` records exactly one
     /// `CaptureUnavailable` event under the requested tag and returns
-    /// `false` (the Op::Snapshot no-op contract).
+    /// `false` (the Op::CaptureSnapshot no-op contract).
     #[test]
     fn snapshot_bridge_event_capture_unavailable_recorded() {
         let bridge = SnapshotBridge::new(std::sync::Arc::new(|_name| None));

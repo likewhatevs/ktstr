@@ -1291,7 +1291,7 @@ pub struct KtstrTestEntry {
     ///
     /// **Capture cost.** Each periodic boundary fires the same
     /// host-side `freeze_and_capture(false)` path that
-    /// [`crate::scenario::ops::Op::Snapshot`] dispatches: every
+    /// [`crate::scenario::ops::Op::CaptureSnapshot`] dispatches: every
     /// vCPU is parked under `FREEZE_RENDEZVOUS_TIMEOUT` (30 s
     /// hard ceiling), BPF maps are walked, the dump is serialised
     /// to JSON, and the report is stored on the
@@ -1308,7 +1308,7 @@ pub struct KtstrTestEntry {
     /// deadline) can cut the periodic sequence short, and the
     /// run-loop stops servicing periodic boundaries the moment the
     /// kill flag fires. Tests should assert `>= some_lower_bound`
-    /// rather than `== num_snapshots`. `Op::Snapshot` captures
+    /// rather than `== num_snapshots`. `Op::CaptureSnapshot` captures
     /// composed by the test author land on the same bridge
     /// alongside the `periodic_NNN` tags; total bridge occupancy
     /// is `num_snapshots + user_captures` and the bridge

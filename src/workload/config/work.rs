@@ -89,7 +89,7 @@ pub struct WorkSpec {
     ///
     /// **Dispatch is `apply_setup`-only.** Direct calls to
     /// [`crate::workload::WorkloadHandle::spawn`] and
-    /// [`crate::scenario::ops::Op::Spawn`] do NOT honor `pcomm` —
+    /// [`crate::scenario::ops::Op::SpawnWorkers`] do NOT honor `pcomm` —
     /// they always spawn one process per worker (fork mode). To
     /// drive the pcomm container path without going through
     /// `CgroupDef`, callers may invoke
@@ -133,7 +133,7 @@ pub struct WorkSpec {
     ///   inherited from `ctx.topo.usable_cpuset()` when the
     ///   `CgroupDef` has no `.cpuset(...)`), so the denominator
     ///   matches the declared `CpusetSpec`.
-    /// - `Op::Spawn` dispatch: the denominator is whatever cpuset is
+    /// - `Op::SpawnWorkers` dispatch: the denominator is whatever cpuset is
     ///   currently recorded for the cgroup. A prior `Op::SetCpuset`
     ///   that narrowed the cgroup will narrow the denominator too.
     ///   Workers already spawned by a prior `apply_setup` are not
@@ -229,7 +229,7 @@ impl WorkSpec {
     /// Resolve `workers_pct` against a cpuset size into a concrete
     /// `num_workers` count and clear the fractional state, leaving
     /// `num_workers = Some(scaled)` and `workers_pct = None`. Used by
-    /// both `apply_setup` (per-CgroupDef WorkSpec) and `Op::Spawn`
+    /// both `apply_setup` (per-CgroupDef WorkSpec) and `Op::SpawnWorkers`
     /// (mid-step ad-hoc spawn) so the two paths produce identical
     /// counts for the same `(pct, cpuset_size)` pair.
     ///

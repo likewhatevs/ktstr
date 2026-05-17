@@ -41,7 +41,7 @@ use super::Op;
 ///
 /// Use `CgroupDef` in `Step::with_defs` for scenarios where cgroups are
 /// created once and run for the step duration. Use `Op::AddCgroup` +
-/// `Op::Spawn` directly when you need mid-step cgroup creation, removal,
+/// `Op::SpawnWorkers` directly when you need mid-step cgroup creation, removal,
 /// or other dynamic operations between spawn and collect.
 ///
 /// # Resource controllers overview

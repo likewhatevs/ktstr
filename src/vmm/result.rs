@@ -234,7 +234,7 @@ pub struct VmResult {
     #[allow(dead_code)]
     pub virtio_net_counters: Option<VirtioNetCountersSnapshot>,
     /// Snapshot bridge populated by the freeze coordinator over the
-    /// run's lifetime. Every `Op::Snapshot` and `Op::WatchSnapshot`
+    /// run's lifetime. Every `Op::CaptureSnapshot` and `Op::WatchSnapshot`
     /// fire stores a `FailureDumpReport` keyed by its tag.
     ///
     /// `#[ktstr_test]` test bodies whose scenario fires snapshot

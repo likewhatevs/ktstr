@@ -824,7 +824,7 @@ impl KtstrVm {
         // pending TLV requests drain). Independent of `freeze_state`,
         // which governs only the error-class trigger machine —
         // on-demand captures must service even when
-        // `freeze_state == Done` so post-failure `Op::Snapshot` calls
+        // `freeze_state == Done` so post-failure `Op::CaptureSnapshot` calls
         // still work.
         let on_demand_in_flight = Arc::new(AtomicBool::new(false));
 
@@ -2635,7 +2635,7 @@ impl KtstrVm {
                 // partial-dump report (0 maps, vcpu_regs only — see
                 // the `// Partial dump:` branch in
                 // `freeze_and_capture`) which is useless to the test
-                // author who asked for `Op::snapshot("...")`.
+                // author who asked for `Op::capture_snapshot("...")`.
                 //
                 // The queue is drained at the accessor-adoption site
                 // by appending its contents back onto
@@ -6240,7 +6240,7 @@ impl KtstrVm {
                     }
                     // Periodic-capture cadence runs BEFORE the
                     // user-watchpoint dispatch below so periodic
-                    // boundaries get priority over Op::Snapshot /
+                    // boundaries get priority over Op::CaptureSnapshot /
                     // Op::WatchSnapshot fires when both contend for
                     // the same `freeze_coord_on_demand_in_flight`
                     // gate. Iteration ordering within the body:
