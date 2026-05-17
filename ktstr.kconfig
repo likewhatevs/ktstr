@@ -1,3 +1,12 @@
+# -- Architecture defensives (x86_64) --
+# CONFIG_X86_FRED=y kernels skip idt_syscall_init (arch/x86/kernel/cpu/common.c:2303-2304)
+# and never write MSR_LSTAR. ktstr's virt-KASLR derivation reads MSR_LSTAR to
+# recover the runtime KVA of entry_SYSCALL_64 — FRED would silently break that
+# path and corrupt every per-CPU read on KASLR-enabled boots. Locked off here
+# as a belt-and-suspenders measure since FRED is gaining adoption upstream and
+# an inherited defconfig flip would silently invalidate ktstr's KASLR fix.
+# CONFIG_X86_FRED is not set
+
 # -- sched_ext + BPF (required) --
 # sched_ext scheduling class. Depends on BPF_SYSCALL + BPF_JIT + DEBUG_INFO_BTF.
 CONFIG_BPF=y

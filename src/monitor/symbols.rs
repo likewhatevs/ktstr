@@ -253,9 +253,41 @@ pub(crate) struct KernelSymbols {
     /// (CONFIG_64BIT=n on a host that emits only the legacy `jiffies`
     /// alias, or a stripped vmlinux that lost the symbol).
     pub jiffies_64: Option<u64>,
-    /// Link-time KVA of `entry_SYSCALL_64`. Used with MSR_LSTAR
-    /// to compute the virtual KASLR offset on x86_64:
-    /// `kaslr_offset = LSTAR_runtime - entry_SYSCALL_64_link`.
+    /// Link-time KVA of `entry_SYSCALL_64` — the SYSCALL entry handler
+    /// symbol (defined `SYM_CODE_START` in `arch/x86/entry/entry_64.S`).
+    /// Used with MSR_LSTAR to derive the runtime virtual KASLR offset:
+    /// `virt_kaslr_offset = LSTAR_runtime - entry_SYSCALL_64_link`.
+    ///
+    /// On non-FRED x86_64 kernels, `idt_syscall_init` at
+    /// `arch/x86/kernel/cpu/common.c:2257` writes `wrmsrq(MSR_LSTAR,
+    /// (unsigned long)entry_SYSCALL_64)` — the cast resolves to the
+    /// post-relocation runtime KVA (relocation is applied by
+    /// `handle_relocations` in `arch/x86/boot/compressed/misc.c`).
+    /// Reading LSTAR back via `KVM_GET_MSRS` after the guest has run
+    /// `cpu_init → syscall_init` yields the runtime KVA; subtracting
+    /// this link-time KVA gives the virt-KASLR delta.
+    ///
+    /// `None` when the symbol is absent (stripped vmlinux, aarch64,
+    /// or any non-x86_64 build) — the virt-KASLR derivation skips
+    /// rather than failing, and the existing phys_base-derived path
+    /// at `freeze_coord::mod` continues to handle physical KASLR.
+    ///
+    /// **FRED caveat**: on CONFIG_X86_FRED=y kernels, `syscall_init`
+    /// at common.c:2303-2304 SKIPS `idt_syscall_init` entirely — the
+    /// FRED entry-points live in MSR_IA32_FRED_CONFIG, not MSR_LSTAR.
+    /// On such kernels MSR_LSTAR reads back as 0 (the value KVM
+    /// seeded at vCPU init); the LSTAR-derivation path must gate on
+    /// `lstar != 0` to avoid computing `0 - entry_SYSCALL_64_link`
+    /// (a huge u64 wraparound). ktstr.kconfig defensively asserts
+    /// `# CONFIG_X86_FRED is not set` to make this gate dormant.
+    // #117 lands the field + virt-KASLR derivation primitive; #31
+    // wires the consumer at freeze_coord/mod.rs:3593 (replaces the
+    // hardcoded-0 kaslr_offset). Until that lands the field looks
+    // dead to dead_code; the read is real, just in another commit.
+    // The `_kva` suffix matches sibling fields phys_base_kva +
+    // page_offset_base_kva — link-time KVA values from vmlinux.
+    #[allow(dead_code)]
+    pub entry_syscall_64_kva: Option<u64>,
     /// Link-time KVA of `__per_cpu_start` — the base of the
     /// `.data..percpu` section. Subtracted from per-CPU symbol KVAs
     /// to recover section-relative offsets for `compute_rq_pas`.
@@ -385,6 +417,13 @@ impl KernelSymbols {
         let scx_watchdog_interval = sym_addr("scx_watchdog_interval");
 
         let jiffies_64 = sym_addr("jiffies_64");
+        // entry_SYSCALL_64 — the canonical SYSCALL entry symbol; the
+        // `_safe_stack` follow-on is NOT what MSR_LSTAR holds (the
+        // kernel writes the unsafe-stack landing pad). The PhD-recon
+        // verification on kernel-source rev 9636d2ea confirms
+        // `wrmsrq(MSR_LSTAR, (unsigned long)entry_SYSCALL_64)` in
+        // arch/x86/kernel/cpu/common.c:2257 — name match guaranteed.
+        let entry_syscall_64_kva = sym_addr("entry_SYSCALL_64");
         let per_cpu_start = sym_addr("__per_cpu_start").unwrap_or(0);
 
         // Per-CPU CPU-time / softirq / IRQ / iowait_sleeptime
@@ -423,6 +462,7 @@ impl KernelSymbols {
             scx_watchdog_timestamp,
             scx_watchdog_interval,
             jiffies_64,
+            entry_syscall_64_kva,
             per_cpu_start,
             kernel_cpustat,
             kstat,
@@ -1147,6 +1187,7 @@ mod tests {
             kstat: None,
             tick_cpu_sched: None,
             node_data: None,
+            entry_syscall_64_kva: None,
             per_cpu_start: 0,
         };
 
@@ -1182,6 +1223,7 @@ mod tests {
             kstat: None,
             tick_cpu_sched: None,
             node_data: None,
+            entry_syscall_64_kva: None,
             per_cpu_start: 0,
         };
 
@@ -1219,6 +1261,7 @@ mod tests {
             kstat: None,
             tick_cpu_sched: None,
             node_data: None,
+            entry_syscall_64_kva: None,
             per_cpu_start: 0,
         };
 
@@ -1259,6 +1302,7 @@ mod tests {
             kstat: None,
             tick_cpu_sched: None,
             node_data: None,
+            entry_syscall_64_kva: None,
             per_cpu_start: 0,
         };
 
@@ -1302,6 +1346,7 @@ mod tests {
             kstat: None,
             tick_cpu_sched: None,
             node_data: None,
+            entry_syscall_64_kva: None,
             per_cpu_start: 0,
         };
 
@@ -1341,6 +1386,7 @@ mod tests {
             kstat: None,
             tick_cpu_sched: None,
             node_data: None,
+            entry_syscall_64_kva: None,
             per_cpu_start: 0,
         };
 
@@ -1377,6 +1423,7 @@ mod tests {
             kstat: None,
             tick_cpu_sched: None,
             node_data: None,
+            entry_syscall_64_kva: None,
             per_cpu_start: 0,
         };
 
@@ -1409,6 +1456,7 @@ mod tests {
             kstat: None,
             tick_cpu_sched: None,
             node_data: None,
+            entry_syscall_64_kva: None,
             per_cpu_start: 0,
         };
 

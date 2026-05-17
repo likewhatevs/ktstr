@@ -33,7 +33,12 @@ const MSR_IA32_SYSENTER_CS: u32 = 0x174;
 const MSR_IA32_SYSENTER_ESP: u32 = 0x175;
 const MSR_IA32_SYSENTER_EIP: u32 = 0x176;
 const MSR_STAR: u32 = 0xc000_0081;
-const MSR_LSTAR: u32 = 0xc000_0082;
+// MSR_LSTAR is the canonical source in src/vmm/x86_64/msr_kaslr.rs
+// (where its KASLR-derivation semantic role is documented). Re-export
+// here so the boot MSR-set seed code stays self-contained for the
+// 10+ MSR write batch while keeping a single source of truth for the
+// numeric value. #149 will consolidate the full MSR-const block.
+pub(super) use super::msr_kaslr::MSR_LSTAR;
 const MSR_CSTAR: u32 = 0xc000_0083;
 const MSR_SYSCALL_MASK: u32 = 0xc000_0084;
 const MSR_KERNEL_GS_BASE: u32 = 0xc000_0102;
