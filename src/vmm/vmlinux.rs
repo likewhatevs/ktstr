@@ -15,45 +15,90 @@ use std::sync::{Arc, OnceLock, RwLock};
 /// path. Caching the bytes once per canonical path collapses every
 /// subsequent VM's read to a hash lookup + `Arc::clone`.
 ///
-/// Same-process invariant: vmlinux content is immutable per process.
-/// A user that rebuilds vmlinux must restart the test process for the
-/// new bytes to take effect — same as every other on-disk artifact
-/// the host pre-loads at boot. The cache key is the canonicalized path
-/// so symlinks across cache / source-tree layouts collapse to one
-/// entry. A `canonicalize` failure (EACCES, missing target) skips the
-/// cache and falls through to the direct read.
-static VMLINUX_BYTES_CACHE: OnceLock<RwLock<std::collections::HashMap<PathBuf, Arc<Vec<u8>>>>> =
+/// The cached entry pairs the bytes with the file's mtime at read
+/// time. On every lookup we re-stat the file: if the stat'd mtime
+/// matches the cached mtime, the cached bytes are reused; otherwise
+/// the entry is replaced with a fresh read. This catches the case
+/// where a developer rebuilds vmlinux mid-process — the user gets
+/// the new bytes instead of stale cached bytes that would mismatch
+/// against the running guest kernel. Stat-cost is microseconds vs
+/// ~100ms for the cached read it gates, so the invalidation check
+/// is effectively free on the hot path.
+///
+/// The cache key is the canonicalized path so symlinks across cache
+/// / source-tree layouts collapse to one entry. A `canonicalize` or
+/// `metadata` failure (EACCES, missing target) skips the cache and
+/// falls through to the direct read. The error case is not cached:
+/// a transient EACCES (e.g. a half-written cache entry whose
+/// permissions arrive on the next ms) should not poison the cache
+/// for the rest of the process.
+static VMLINUX_BYTES_CACHE: OnceLock<RwLock<std::collections::HashMap<PathBuf, CachedEntry>>> =
     OnceLock::new();
 
+/// One slot in [`VMLINUX_BYTES_CACHE`]. The mtime gates the bytes —
+/// a mismatch on lookup invalidates and triggers a re-read.
+struct CachedEntry {
+    mtime: std::time::SystemTime,
+    bytes: Arc<Vec<u8>>,
+}
+
 /// Return the cached vmlinux ELF bytes for `path`, populating the cache
-/// on first read.
+/// on first read and invalidating on file modification.
 ///
-/// Returns `None` when `path` is unreadable. The error case is not
-/// cached: a transient EACCES (e.g. a half-written cache entry whose
-/// permissions arrive on the next ms) should not poison the cache for
-/// the rest of the process.
+/// Returns `None` when `path` is unreadable (stat or read failure).
+/// The error case is not cached: a transient EACCES (e.g. a
+/// half-written cache entry whose permissions arrive on the next
+/// ms) should not poison the cache for the rest of the process.
 pub(crate) fn cached_vmlinux_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
     let canon = std::fs::canonicalize(path)
         .ok()
         .unwrap_or_else(|| path.to_path_buf());
+    // mtime captured before the read so a concurrent write that
+    // finishes mid-read produces a mtime-bumped entry on the NEXT
+    // lookup (this insert may carry the M1 mtime with mid-stream
+    // bytes; the next lookup sees M2 ≠ M1 and re-reads cleanly).
+    let mtime = std::fs::metadata(&canon).and_then(|m| m.modified()).ok()?;
     let slot = VMLINUX_BYTES_CACHE.get_or_init(|| RwLock::new(std::collections::HashMap::new()));
     {
         let read = slot.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(bytes) = read.get(&canon) {
-            return Some(Arc::clone(bytes));
+        if let Some(entry) = read.get(&canon)
+            && entry.mtime == mtime
+        {
+            return Some(Arc::clone(&entry.bytes));
         }
     }
     // Read outside the write lock so a slow read doesn't block other
     // canonical paths' lookups. A racing second reader will pay the
-    // same read once each — acceptable: the bytes are immutable so
-    // both inserts produce the same value.
+    // same read once each — acceptable: if mtime matches both reads
+    // produce the same bytes.
     let bytes = std::fs::read(&canon).ok()?;
     let arc = Arc::new(bytes);
     let mut write = slot.write().unwrap_or_else(|e| e.into_inner());
-    // `or_insert` consumes `arc` only on the miss path; on the racing-
-    // win-then-lose path the existing entry's `Arc` is returned and
-    // our `arc` is dropped (one wasted file read; the bytes match).
-    Some(Arc::clone(write.entry(canon).or_insert(arc)))
+    // Always overwrite: if no entry, insert; if entry exists with
+    // matching mtime (racing reader won the insert race), our overwrite
+    // is identical; if entry exists with stale mtime (file rewrote
+    // between our read-lock release and our write-lock acquire), the
+    // stale entry is replaced.
+    write.insert(
+        canon,
+        CachedEntry {
+            mtime,
+            bytes: Arc::clone(&arc),
+        },
+    );
+    Some(arc)
+}
+
+/// Clear every cached entry. Used by `#[cfg(test)]` tests that need
+/// to assert against a clean cache state without inheriting entries
+/// from prior tests in the same process — a regular use case for
+/// invalidation-coverage tests where we want to compare cache-miss
+/// vs cache-hit behaviour deterministically.
+#[cfg(test)]
+pub(crate) fn clear_vmlinux_cache_for_tests() {
+    if let Some(slot) = VMLINUX_BYTES_CACHE.get() {
+        slot.write().unwrap_or_else(|e| e.into_inner()).clear();
+    }
 }
 
 /// Find the vmlinux ELF next to a kernel image path.
@@ -243,5 +288,62 @@ mod tests {
         std::fs::remove_file(&target).unwrap();
 
         assert!(cached_vmlinux_bytes(&link).is_none());
+    }
+
+    /// Rewriting the file with new bytes between two lookups must
+    /// invalidate the cache and surface the new bytes on the
+    /// second lookup. Catches the "stale cached bytes after a
+    /// rebuild" regression that the pre-mtime version had: a
+    /// developer who rebuilds vmlinux while a long-lived test
+    /// process is running would get the stale bytes forever
+    /// without this invalidation. Verifies via NON-`Arc::ptr_eq`
+    /// (the new bytes must be in a fresh allocation) plus a byte-
+    /// content comparison (the new content actually reached the
+    /// reader). Bumps mtime explicitly via `libc::utimes` (rather
+    /// than sleeping for FS-granularity) so the test runs in
+    /// microseconds and survives FS variants with 1-second mtime
+    /// resolution.
+    #[test]
+    #[cfg(unix)]
+    fn cached_vmlinux_bytes_invalidates_on_mtime_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vmlinux = tmp.path().join("vmlinux-mtime-test");
+        std::fs::write(&vmlinux, b"FIRST_BYTES").unwrap();
+        clear_vmlinux_cache_for_tests();
+
+        let first = cached_vmlinux_bytes(&vmlinux).expect("first read");
+        assert_eq!(first.as_slice(), b"FIRST_BYTES");
+
+        // Rewrite with new content, then bump mtime to a sentinel
+        // value far in the past via libc::utimes so the captured
+        // mtime is guaranteed != the cached one regardless of FS
+        // mtime resolution. Setting both atime and mtime to
+        // 1970-01-02T00:00:00 (86400 sec since epoch) makes the
+        // pre-write mtime (now-ish) vs post-utimes mtime
+        // (1970-01-02) trivially distinct.
+        std::fs::write(&vmlinux, b"SECOND_BYTES_DIFFERENT").unwrap();
+        let path_c = std::ffi::CString::new(vmlinux.as_os_str().as_encoded_bytes()).unwrap();
+        let sentinel = libc::timeval {
+            tv_sec: 86_400,
+            tv_usec: 0,
+        };
+        let times = [sentinel, sentinel];
+        // SAFETY: path_c is a valid NUL-terminated path; times is a
+        // 2-element timeval array (atime, mtime) as utimes(2) requires.
+        let rc = unsafe { libc::utimes(path_c.as_ptr(), times.as_ptr()) };
+        assert_eq!(rc, 0, "libc::utimes must succeed on the temp file");
+
+        let second = cached_vmlinux_bytes(&vmlinux).expect("second read");
+        assert_eq!(
+            second.as_slice(),
+            b"SECOND_BYTES_DIFFERENT",
+            "mtime change must invalidate cache and surface the rewritten bytes"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "post-rewrite second lookup must return a fresh Arc, \
+             not the stale cached one — Arc::ptr_eq returning true \
+             means the invalidation path didn't fire."
+        );
     }
 }
