@@ -1273,4 +1273,53 @@ mod tests {
         let parsed: VirtioBlkCountersSnapshot = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, original);
     }
+
+    /// Round-trip `u64::MAX` and other 64-bit edge values through
+    /// JSON to guard against a future serde-json mode swap that
+    /// silently coerces u64 to f64 (IEEE 754 double, 53-bit
+    /// mantissa). Today serde-json stores integers as a
+    /// discriminated `Number` (i64/u64/f64) and preserves u64::MAX
+    /// exactly; if a future revision opts into JSON-spec-strict
+    /// Number-as-f64 semantics, values above 2^53-1 would lose
+    /// precision on round-trip and this test would fail before any
+    /// downstream consumer silently sees a truncated bytes_read /
+    /// bytes_written counter (each can legitimately reach u64::MAX
+    /// for a long-lived high-IO device).
+    #[test]
+    fn snapshot_roundtrips_u64_max_precision() {
+        let original = VirtioBlkCountersSnapshot {
+            reads_completed: u64::MAX,
+            writes_completed: u64::MAX - 1,
+            flushes_completed: (1u64 << 53),
+            bytes_read: (1u64 << 53) + 1,
+            bytes_written: (1u64 << 60),
+            throttled_count: u64::MAX / 2,
+            io_errors: u64::MAX / 3,
+            currently_throttled_gauge: u64::MAX / 5,
+            invalid_avail_idx_count: u64::MAX / 7,
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let parsed: VirtioBlkCountersSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, original);
+        // Spot-check the most-fragile fields directly so a precision
+        // loss surfaces with a clear u64::MAX-specific failure message
+        // rather than a generic struct-comparison mismatch.
+        // Every spot-check below is on a value that is NOT exactly
+        // representable in f64 — a hypothetical regression that swaps
+        // serde_json's Number backing to f64 would fail at least one
+        // spot-check with a specific value mismatch. (Note: not every
+        // bulk-struct field meets this bar — e.g. `bytes_written =
+        // 1<<60` is exactly representable in f64 — but the bulk
+        // struct equality at `assert_eq!(parsed, original)` above
+        // still catches it via the precision-fragile siblings.)
+        assert_eq!(parsed.reads_completed, u64::MAX);
+        // The 2^53 boundary is where f64 mantissa precision runs out;
+        // 2^53 + 1 is the smallest integer NOT exactly representable
+        // in f64 (it rounds to 2^53), so this is the canonical canary.
+        assert_eq!(parsed.bytes_read, (1u64 << 53) + 1);
+        // u64::MAX / 2 = 0x7FFF_FFFF_FFFF_FFFF — far above the 2^53
+        // mantissa boundary and not a power-of-2, so f64 backing
+        // would round it to a different value on round-trip.
+        assert_eq!(parsed.throttled_count, u64::MAX / 2);
+    }
 }
