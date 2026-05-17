@@ -54,6 +54,21 @@ pub enum Phase {
         duration: Duration,
     },
 }
+
+impl Phase {
+    /// Construct a [`Phase::AluHot`] variant. Sugar for the
+    /// struct-literal form that brings the struct variant in line
+    /// with the tuple-variant constructors — every other [`Phase`]
+    /// variant takes a single `Duration` and reads as
+    /// `Phase::Spin(d)` etc.; the struct variant needs an explicit
+    /// `Phase::AluHot { width: ..., duration: ... }` block at every
+    /// call site, breaking the visual symmetry. `Phase::alu_hot(w, d)`
+    /// restores it so `vec![Phase::Spin(d1), Phase::alu_hot(w, d2),
+    /// Phase::Sleep(d3)]` reads consistently.
+    pub const fn alu_hot(width: AluWidth, duration: Duration) -> Self {
+        Phase::AluHot { width, duration }
+    }
+}
 mod methods;
 mod work_type;
 
