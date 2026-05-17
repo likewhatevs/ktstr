@@ -43,7 +43,7 @@ mod stats;
 
 pub use bpf::BpfMapProjector;
 pub use host::HostView;
-pub use monitor::{MonitorView, ScxEventsView};
+pub use monitor::{ERROR_CLASS_NAMES, MonitorView, ScxEventsView};
 pub use stats::{StatsPathProjector, StatsValue};
 
 /// One captured periodic sample: a frozen BPF snapshot paired with

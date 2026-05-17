@@ -62,6 +62,30 @@ impl<'a> MonitorView<'a> {
 /// [`MonitorView::scx_events`]; exposes the 14 i64 counter totals
 /// via [`Self::total_pairs`] and the 2 f64 derived rates via
 /// [`Self::rates_pairs`].
+/// Default curated subset of [`ScxEventsView::total_pairs`] counter
+/// names that signal genuine scheduler-class errors when non-zero.
+/// Used to filter the full 14-entry total slice down to the entries
+/// that callers conventionally bound at zero with
+/// [`crate::assert::assert_scx_events_clean`].
+///
+/// Membership is the documented intersection of the kernel-side
+/// `SCX_EV_*` counters whose non-zero firing is exclusively
+/// pathological (skipped enqueue paths, repeated re-enqueue cycles,
+/// owner-mismatched inserts) — the `bypass_*`,
+/// `dispatch_keep_last`, `refill_slice_dfl` counters that
+/// legitimately fire on healthy schedulers are deliberately
+/// excluded. Different test scenarios may consider different
+/// counters error-class; the projector exposes the full slice via
+/// [`ScxEventsView::total_pairs`] so callers can override this
+/// default by filtering on their own set.
+pub const ERROR_CLASS_NAMES: &[&str] = &[
+    "enq_skip_exiting",
+    "enq_skip_migration_disabled",
+    "reenq_immed",
+    "reenq_local_repeat",
+    "insert_not_owned",
+];
+
 #[derive(Debug, Clone, Copy)]
 #[must_use = "ScxEventsView is a borrowed view; call .total_pairs() or .rates_pairs() to project"]
 #[non_exhaustive]
@@ -96,6 +120,7 @@ impl<'a> ScxEventsView<'a> {
     ///
     /// ```no_run
     /// # use ktstr::scenario::sample::SampleSeries;
+    /// # use ktstr::scenario::sample::ERROR_CLASS_NAMES;
     /// # use ktstr::assert::assert_scx_events_clean;
     /// # fn example(series: &SampleSeries) {
     /// if let Some(view) = series.monitor()
@@ -104,16 +129,7 @@ impl<'a> ScxEventsView<'a> {
     ///     let pairs = events.total_pairs();
     ///     let error_only: Vec<(&str, i64)> = pairs
     ///         .into_iter()
-    ///         .filter(|(name, _)| {
-    ///             matches!(
-    ///                 *name,
-    ///                 "enq_skip_exiting"
-    ///                     | "enq_skip_migration_disabled"
-    ///                     | "reenq_immed"
-    ///                     | "reenq_local_repeat"
-    ///                     | "insert_not_owned"
-    ///             )
-    ///         })
+    ///         .filter(|(name, _)| ERROR_CLASS_NAMES.contains(name))
     ///         .collect();
     ///     assert!(assert_scx_events_clean(&error_only, None).passed);
     /// }
@@ -322,16 +338,7 @@ mod tests {
         // and dispatch_keep_last, neither of which is error class).
         let error_only: Vec<(&str, i64)> = pairs
             .into_iter()
-            .filter(|(name, _)| {
-                matches!(
-                    *name,
-                    "enq_skip_exiting"
-                        | "enq_skip_migration_disabled"
-                        | "reenq_immed"
-                        | "reenq_local_repeat"
-                        | "insert_not_owned"
-                )
-            })
+            .filter(|(name, _)| ERROR_CLASS_NAMES.contains(name))
             .collect();
         let r_curated = assert_scx_events_clean(&error_only, None);
         assert!(
