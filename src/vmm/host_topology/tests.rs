@@ -1,4 +1,5 @@
 use super::*;
+use crate::sync::MutexExt;
 use crate::vmm::topology::Topology;
 
 // ─── SYNTHETIC-TOPOLOGY OFFSET CONVENTION ────────────────────
@@ -1931,10 +1932,7 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     // panicking test, cascading failures. Recover by taking the
     // inner guard — the test that panicked already failed; the
     // current test's env cleanup still runs.
-    ENV_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    ENV_LOCK.get_or_init(|| Mutex::new(())).lock_unpoisoned()
 }
 
 /// RAII guard for scoped `std::env::set_var` mutation inside a

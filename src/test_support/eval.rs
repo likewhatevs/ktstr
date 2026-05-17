@@ -3042,6 +3042,7 @@ mod tests {
     };
     use super::*;
     use crate::assert::{AssertDetail, DetailKind};
+    use crate::sync::MutexExt;
     use crate::verifier::SCHED_OUTPUT_END;
     use tempfile::TempDir;
 
@@ -3298,7 +3299,7 @@ mod tests {
     /// stop-vcpu handler in place after VM teardown.
     #[test]
     fn sigrtmin_save_install_restore_roundtrip() {
-        let _serial = SIGRTMIN_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SIGRTMIN_TEST_LOCK.lock_unpoisoned();
 
         // Step 1: save current SIGRTMIN sigaction.
         let mut saved: libc::sigaction = unsafe { std::mem::zeroed() };

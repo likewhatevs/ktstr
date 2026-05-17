@@ -3112,7 +3112,8 @@ fn capture_with(
                                 // worker-panic tag++, failed++. The lock
                                 // may be poisoned if the inner panic
                                 // happened mid-update of the summary, so
-                                // recover via `PoisonError::into_inner`
+                                // recover via
+                                // [`crate::sync::MutexExt::lock_unpoisoned`]
                                 // rather than `.unwrap()` — bumping a
                                 // counter on partially-mutated state is
                                 // strictly less bad than re-panicking out

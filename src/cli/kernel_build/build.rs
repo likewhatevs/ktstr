@@ -877,6 +877,7 @@ pub fn kernel_build_pipeline(
 mod tests {
     use super::super::super::kernel_cmd::KernelCommand;
     use super::*;
+    use crate::sync::MutexExt;
 
     /// Returns `false` when `git` is not on `PATH`. Tests that drive
     /// a real git repo in a tempdir call this first and `return` early
@@ -1514,10 +1515,7 @@ mod tests {
     fn bypass_env_lock() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::{Mutex, OnceLock};
         static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        ENV_LOCK.get_or_init(|| Mutex::new(())).lock_unpoisoned()
     }
 
     /// RAII guard for scoped `KTSTR_BYPASS_LLC_LOCKS` mutation.
