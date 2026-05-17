@@ -85,7 +85,7 @@ fn cover_cgroup_cpuset_clear_midrun(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::cpuset::custom_cgroup_cpuset_clear_midrun(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
+#[ktstr_test(llcs = 1, cores = 8, threads = 1, memory_mib = 2048)]
 fn cover_cgroup_cpuset_resize(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::cpuset::custom_cgroup_cpuset_resize(ctx)
 }
