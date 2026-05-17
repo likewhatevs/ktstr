@@ -696,15 +696,8 @@ mod tests {
 
     #[test]
     fn immediate_exit_cap_detected() {
-        let topo = Topology {
-            llcs: 1,
-            cores_per_llc: 1,
-            threads_per_core: 1,
-            numa_nodes: 1,
-            nodes: None,
-            distances: None,
-        };
-        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        use crate::vmm::x86_64::test_helpers::single_vcpu_kvm;
+        let vm = single_vcpu_kvm();
         // KVM_CAP_IMMEDIATE_EXIT is available since Linux 4.12.
         assert!(vm.has_immediate_exit);
     }

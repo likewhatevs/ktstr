@@ -66,28 +66,15 @@ pub(crate) fn read_one_msr_required(vcpu: &VcpuFd, msr_index: u32, label: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vmm::kvm::KtstrKvm;
-    use crate::vmm::topology::Topology;
     use crate::vmm::x86_64::msr_indices::MSR_IA32_MISC_ENABLE;
-
-    fn one_vcpu_kvm() -> KtstrKvm {
-        let topo = Topology {
-            llcs: 1,
-            cores_per_llc: 1,
-            threads_per_core: 1,
-            numa_nodes: 1,
-            nodes: None,
-            distances: None,
-        };
-        KtstrKvm::new(topo, 64, false).unwrap()
-    }
+    use crate::vmm::x86_64::test_helpers::single_vcpu_kvm;
 
     #[test]
     fn read_one_msr_returns_some_on_supported_msr() {
         // MSR_IA32_MISC_ENABLE is architectural on every x86_64 host
         // KVM build; KVM_GET_MSRS must return 1 entry with the seeded
         // value (KVM hands out a default at vCPU init).
-        let vm = one_vcpu_kvm();
+        let vm = single_vcpu_kvm();
         let value = read_one_msr(&vm.vcpus[0], MSR_IA32_MISC_ENABLE).unwrap();
         assert!(
             value.is_some(),
@@ -102,7 +89,7 @@ mod tests {
         // Per the helper's contract that collapses to `Ok(None)`.
         // Firecracker uses the same probe index in its
         // test_get_msrs_with_invalid_msr_index test.
-        let vm = one_vcpu_kvm();
+        let vm = single_vcpu_kvm();
         let value = read_one_msr(&vm.vcpus[0], 0x2).unwrap();
         assert!(value.is_none(), "MSR 0x2 must not be exposed by KVM");
     }
@@ -113,7 +100,7 @@ mod tests {
         // KVM_GET_MSRS through the same kvm_msr_entry path. Guards
         // against an accidental transform inside read_one_msr after
         // future refactors.
-        let vm = one_vcpu_kvm();
+        let vm = single_vcpu_kvm();
         let via_helper = read_one_msr(&vm.vcpus[0], MSR_IA32_MISC_ENABLE).unwrap();
         let mut raw_msrs = Msrs::from_entries(&[kvm_msr_entry {
             index: MSR_IA32_MISC_ENABLE,

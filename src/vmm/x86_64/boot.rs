@@ -701,17 +701,8 @@ mod tests {
 
     #[test]
     fn setup_sregs_with_kvm() {
-        use crate::vmm::kvm::KtstrKvm;
-        use crate::vmm::topology::Topology;
-        let topo = Topology {
-            llcs: 1,
-            cores_per_llc: 1,
-            threads_per_core: 1,
-            numa_nodes: 1,
-            nodes: None,
-            distances: None,
-        };
-        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        use crate::vmm::x86_64::test_helpers::single_vcpu_kvm;
+        let vm = single_vcpu_kvm();
         setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();
         let sregs = vm.vcpus[0].get_sregs().unwrap();
         assert_eq!(sregs.cr3, PML4_START);
@@ -722,17 +713,8 @@ mod tests {
 
     #[test]
     fn setup_regs_with_kvm() {
-        use crate::vmm::kvm::KtstrKvm;
-        use crate::vmm::topology::Topology;
-        let topo = Topology {
-            llcs: 1,
-            cores_per_llc: 1,
-            threads_per_core: 1,
-            numa_nodes: 1,
-            nodes: None,
-            distances: None,
-        };
-        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        use crate::vmm::x86_64::test_helpers::single_vcpu_kvm;
+        let vm = single_vcpu_kvm();
         setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();
         setup_regs(&vm.vcpus[0], KERNEL_LOAD_ADDR).unwrap();
         let regs = vm.vcpus[0].get_regs().unwrap();
@@ -743,17 +725,8 @@ mod tests {
 
     #[test]
     fn setup_fpu_with_kvm() {
-        use crate::vmm::kvm::KtstrKvm;
-        use crate::vmm::topology::Topology;
-        let topo = Topology {
-            llcs: 1,
-            cores_per_llc: 1,
-            threads_per_core: 1,
-            numa_nodes: 1,
-            nodes: None,
-            distances: None,
-        };
-        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        use crate::vmm::x86_64::test_helpers::single_vcpu_kvm;
+        let vm = single_vcpu_kvm();
         setup_fpu(&vm.vcpus[0]).unwrap();
         let fpu = vm.vcpus[0].get_fpu().unwrap();
         assert_eq!(fpu.fcw, 0x37f);
@@ -761,18 +734,9 @@ mod tests {
 
     #[test]
     fn setup_msrs_with_kvm() {
-        use crate::vmm::kvm::KtstrKvm;
-        use crate::vmm::topology::Topology;
         use crate::vmm::x86_64::msr_io::read_one_msr_required;
-        let topo = Topology {
-            llcs: 1,
-            cores_per_llc: 1,
-            threads_per_core: 1,
-            numa_nodes: 1,
-            nodes: None,
-            distances: None,
-        };
-        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        use crate::vmm::x86_64::test_helpers::single_vcpu_kvm;
+        let vm = single_vcpu_kvm();
         setup_msrs(&vm.vcpus[0], None).unwrap();
         let data = read_one_msr_required(
             &vm.vcpus[0],
@@ -788,18 +752,9 @@ mod tests {
 
     #[test]
     fn setup_msrs_with_extra_override() {
-        use crate::vmm::kvm::KtstrKvm;
-        use crate::vmm::topology::Topology;
         use crate::vmm::x86_64::msr_io::read_one_msr_required;
-        let topo = Topology {
-            llcs: 1,
-            cores_per_llc: 1,
-            threads_per_core: 1,
-            numa_nodes: 1,
-            nodes: None,
-            distances: None,
-        };
-        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        use crate::vmm::x86_64::test_helpers::single_vcpu_kvm;
+        let vm = single_vcpu_kvm();
         // Override MISC_ENABLE to disable FAST_STRING
         let extra = [kvm_bindings::kvm_msr_entry {
             index: MSR_IA32_MISC_ENABLE,
@@ -817,17 +772,8 @@ mod tests {
 
     #[test]
     fn setup_msrs_with_extra_append() {
-        use crate::vmm::kvm::KtstrKvm;
-        use crate::vmm::topology::Topology;
-        let topo = Topology {
-            llcs: 1,
-            cores_per_llc: 1,
-            threads_per_core: 1,
-            numa_nodes: 1,
-            nodes: None,
-            distances: None,
-        };
-        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        use crate::vmm::x86_64::test_helpers::single_vcpu_kvm;
+        let vm = single_vcpu_kvm();
         // Append a new MSR (IA32_EFER = 0xC0000080)
         let extra = [kvm_bindings::kvm_msr_entry {
             index: 0xC000_0080,
@@ -958,17 +904,8 @@ mod tests {
 
     #[test]
     fn cr0_no_host_bits() {
-        use crate::vmm::kvm::KtstrKvm;
-        use crate::vmm::topology::Topology;
-        let topo = Topology {
-            llcs: 1,
-            cores_per_llc: 1,
-            threads_per_core: 1,
-            numa_nodes: 1,
-            nodes: None,
-            distances: None,
-        };
-        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        use crate::vmm::x86_64::test_helpers::single_vcpu_kvm;
+        let vm = single_vcpu_kvm();
         setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();
         let sregs = vm.vcpus[0].get_sregs().unwrap();
         // CR0 should be exactly PE|PG — no NW/CD bits from host
@@ -990,17 +927,8 @@ mod tests {
 
     #[test]
     fn setup_sregs_x2apic_disabled() {
-        use crate::vmm::kvm::KtstrKvm;
-        use crate::vmm::topology::Topology;
-        let topo = Topology {
-            llcs: 1,
-            cores_per_llc: 1,
-            threads_per_core: 1,
-            numa_nodes: 1,
-            nodes: None,
-            distances: None,
-        };
-        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        use crate::vmm::x86_64::test_helpers::single_vcpu_kvm;
+        let vm = single_vcpu_kvm();
         setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();
         let sregs = vm.vcpus[0].get_sregs().unwrap();
         assert_eq!(
@@ -1012,17 +940,8 @@ mod tests {
 
     #[test]
     fn setup_sregs_x2apic_enabled() {
-        use crate::vmm::kvm::KtstrKvm;
-        use crate::vmm::topology::Topology;
-        let topo = Topology {
-            llcs: 1,
-            cores_per_llc: 1,
-            threads_per_core: 1,
-            numa_nodes: 1,
-            nodes: None,
-            distances: None,
-        };
-        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        use crate::vmm::x86_64::test_helpers::single_vcpu_kvm;
+        let vm = single_vcpu_kvm();
         setup_sregs(&vm.guest_mem, &vm.vcpus[0], true).unwrap();
         let sregs = vm.vcpus[0].get_sregs().unwrap();
         // x2APIC mode requires BOTH EN (bit 11) and EXTD (bit 10).
