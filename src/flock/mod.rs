@@ -17,7 +17,7 @@
 //!    `make` invocations against the same kernel source checkout.
 //!  - Observational enumeration from `ktstr locks --json` — a
 //!    read-only scan that does NOT acquire flocks; reads
-//!    /proc/locks through [`read_holders`] to attribute holders
+//!    /proc/locks through `read_holders` to attribute holders
 //!    without contending with active acquirers.
 //!
 //! All four share:

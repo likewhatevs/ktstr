@@ -17,7 +17,7 @@ use crate::monitor::{MonitorReport, MonitorSummary, ScxEventDeltas};
 
 use super::SampleSeries;
 
-/// Borrowed view over a per-VM-run [`MonitorReport`]. Returned by
+/// Borrowed view over a per-VM-run `MonitorReport`. Returned by
 /// [`SampleSeries::monitor`]; provides typed access to the report's
 /// summary statistics + the SCX event-counter deltas.
 ///
@@ -36,7 +36,7 @@ impl<'a> MonitorView<'a> {
     /// Aggregate summary statistics: imbalance ratio, nr_running
     /// averages, local DSQ depth, stuck-CPU detection, and
     /// optional schedstat / prog-stats deltas. See
-    /// [`MonitorSummary`] for the full field set.
+    /// `MonitorSummary` for the full field set.
     pub fn summary(&self) -> &'a MonitorSummary {
         &self.report.summary
     }
@@ -57,7 +57,7 @@ impl<'a> MonitorView<'a> {
     }
 }
 
-/// Borrowed view over the [`ScxEventDeltas`] aggregated across the
+/// Borrowed view over the `ScxEventDeltas` aggregated across the
 /// monitor's first/last sample window. Returned by
 /// [`MonitorView::scx_events`]; exposes the 14 i64 counter totals
 /// via [`Self::total_pairs`] and the 2 f64 derived rates via

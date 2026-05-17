@@ -12,10 +12,22 @@
 //! [`SampleSeries::from_drained`] on the periodic bundle the
 //! bridge surfaces via
 //! `SnapshotBridge::drain_ordered_with_stats`, then project the
-//! series along either the BPF or the stats axis through
-//! [`SampleSeries::bpf`] / [`SampleSeries::stats`] / the typed
-//! [`SampleSeries::bpf_map`] / [`SampleSeries::stats_path`]
-//! auto-projection helpers. Each projection yields a
+//! series along one of four orthogonal axes:
+//!
+//!  - **bpf** — kernel BPF state through
+//!    [`SampleSeries::bpf`] / the typed
+//!    [`SampleSeries::bpf_map`] helper.
+//!  - **stats** — userspace scx_stats JSON through
+//!    [`SampleSeries::stats`] / the typed
+//!    [`SampleSeries::stats_path`] helper.
+//!  - **host** — per-sample per-CPU host timeline through
+//!    [`SampleSeries::host`] (sourced from
+//!    `FailureDumpReport::per_cpu_time`).
+//!  - **monitor** — per-VM-run cross-CPU host monitor aggregate
+//!    through [`SampleSeries::monitor`] (sourced from
+//!    `MonitorReport::summary`).
+//!
+//! Each projection yields a
 //! [`crate::assert::temporal::SeriesField`] that
 //! flows into the temporal-assertion patterns
 //! (`nondecreasing`, `rate_within`, `steady_within`,
@@ -141,7 +153,7 @@ struct SampleRow {
 /// host per-CPU). Iterates `rows` once, threads each row's
 /// `tag` and `elapsed_ms` into the resulting [`SeriesField`], and
 /// invokes `row_to_slot` to compute the per-sample value or per-
-/// sample [`SnapshotError`]. Keeps the `tags`/`elapsed`/`values`
+/// sample `SnapshotError`. Keeps the `tags`/`elapsed`/`values`
 /// vec lengths in lock-step so the [`SeriesField::from_parts`]
 /// length-parity invariant never triggers.
 fn build_series_field<T>(
@@ -166,7 +178,7 @@ impl SampleSeries {
     /// non-periodic tags — callers that want the periodic-only
     /// view chain `.periodic_only()`.
     ///
-    /// `monitor` is the per-VM-run [`MonitorReport`] (typically
+    /// `monitor` is the per-VM-run `MonitorReport` (typically
     /// `result.monitor.clone()` from a `VmResult`). Pass `None`
     /// when the monitor did not run (host-only tests, early VM
     /// failure). Surfaced via [`Self::monitor`] for typed projection
