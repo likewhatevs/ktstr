@@ -158,7 +158,7 @@ const HEX_KEY_PREFIX: &str = "hex:";
 /// error the test author can `?`-propagate. Each variant carries
 /// the path / alternatives needed to fix the call site without
 /// re-running the test.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum SnapshotError {
     /// No map matched the requested name. `available` enumerates
@@ -204,7 +204,7 @@ pub enum SnapshotError {
         requested: String,
         walked: String,
         component: String,
-        kind: &'static str,
+        kind: String,
     },
     /// A typed accessor (`as_u64` etc.) was called on a rendered
     /// shape it cannot decode (e.g. `as_str` on a `Struct`).
@@ -213,8 +213,8 @@ pub enum SnapshotError {
     /// user-supplied lookup string (empty when the accessor was
     /// invoked on a leaf without a path walk).
     TypeMismatch {
-        expected: &'static str,
-        actual: &'static str,
+        expected: String,
+        actual: String,
         requested: String,
     },
     /// A map index was out of range for the underlying entry list.
@@ -248,7 +248,7 @@ pub enum SnapshotError {
     /// can produce `len > 0` here.
     NoMatch {
         map: String,
-        op: &'static str,
+        op: String,
         len: usize,
         available_keys: Vec<String>,
     },
@@ -260,7 +260,7 @@ pub enum SnapshotError {
     PerCpuNotNarrowed { map: String },
     /// Hash entry has no rendered key/value side (BTF type id was
     /// missing at capture time, leaving the hex bytes only).
-    NoRendered { map: String, side: &'static str },
+    NoRendered { map: String, side: String },
     /// The sample's underlying [`crate::monitor::dump::FailureDumpReport`]
     /// is a placeholder produced by
     /// [`crate::monitor::dump::FailureDumpReport::placeholder`] —
@@ -1313,7 +1313,7 @@ impl<'a> SnapshotMap<'a> {
         }
         SnapshotEntry::Missing(SnapshotError::NoMatch {
             map: self.map.name.clone(),
-            op: "find",
+            op: "find".to_string(),
             len,
             available_keys,
         })
@@ -1341,7 +1341,7 @@ impl<'a> SnapshotMap<'a> {
             Some((_, e)) => e,
             None => SnapshotEntry::Missing(SnapshotError::NoMatch {
                 map: self.map.name.clone(),
-                op: "max_by",
+                op: "max_by".to_string(),
                 len: 0,
                 available_keys: Vec::new(),
             }),
@@ -1596,7 +1596,7 @@ impl<'a> SnapshotEntry<'a> {
         let Some(v) = value else {
             return SnapshotField::Missing(SnapshotError::NoRendered {
                 map: "<entry>".to_string(),
-                side: "value",
+                side: "value".to_string(),
             });
         };
         walk_dotted_path(v, path)
@@ -1611,14 +1611,14 @@ impl<'a> SnapshotEntry<'a> {
                 Some(v) => walk_dotted_path(v, path),
                 None => SnapshotField::Missing(SnapshotError::NoRendered {
                     map: "<entry>".to_string(),
-                    side: "key",
+                    side: "key".to_string(),
                 }),
             },
             SnapshotEntry::PercpuHash(e) => match e.key.as_ref() {
                 Some(v) => walk_dotted_path(v, path),
                 None => SnapshotField::Missing(SnapshotError::NoRendered {
                     map: "<entry>".to_string(),
-                    side: "key",
+                    side: "key".to_string(),
                 }),
             },
             SnapshotEntry::Percpu(e) => {
@@ -1626,15 +1626,15 @@ impl<'a> SnapshotEntry<'a> {
                     SnapshotField::PercpuKey { key: e.key }
                 } else {
                     SnapshotField::Missing(SnapshotError::TypeMismatch {
-                        expected: "Struct",
-                        actual: "Uint(percpu key)",
+                        expected: "Struct".to_string(),
+                        actual: "Uint(percpu key)".to_string(),
                         requested: path.to_string(),
                     })
                 }
             }
             SnapshotEntry::Value(_) => SnapshotField::Missing(SnapshotError::TypeMismatch {
-                expected: "key",
-                actual: "single Value (no key)",
+                expected: "key".to_string(),
+                actual: "single Value (no key)".to_string(),
                 requested: path.to_string(),
             }),
             SnapshotEntry::Missing(err) => SnapshotField::Missing(err.clone()),
@@ -1672,8 +1672,8 @@ impl<'a> SnapshotField<'a> {
             SnapshotField::Value(v) => walk_dotted_path(v, path),
             SnapshotField::PercpuKey { .. } => {
                 SnapshotField::Missing(SnapshotError::TypeMismatch {
-                    expected: "Struct",
-                    actual: "Uint(percpu key)",
+                    expected: "Struct".to_string(),
+                    actual: "Uint(percpu key)".to_string(),
                     requested: path.to_string(),
                 })
             }
@@ -1721,7 +1721,7 @@ impl<'a> SnapshotField<'a> {
                 RenderedValue::Enum { value, .. } => Ok(*value != 0),
                 RenderedValue::Ptr { value, .. } => Ok(*value != 0),
                 other => Err(SnapshotError::TypeMismatch {
-                    expected: "bool",
+                    expected: "bool".to_string(),
                     actual: describe_kind(other),
                     requested: String::new(),
                 }),
@@ -1740,7 +1740,7 @@ impl<'a> SnapshotField<'a> {
                 RenderedValue::Uint { value, .. } => Ok(*value as f64),
                 RenderedValue::Enum { value, .. } => Ok(*value as f64),
                 other => Err(SnapshotError::TypeMismatch {
-                    expected: "f64",
+                    expected: "f64".to_string(),
                     actual: describe_kind(other),
                     requested: String::new(),
                 }),
@@ -1760,14 +1760,14 @@ impl<'a> SnapshotField<'a> {
                     ..
                 } => Ok(name.as_str()),
                 other => Err(SnapshotError::TypeMismatch {
-                    expected: "str (enum variant name)",
+                    expected: "str (enum variant name)".to_string(),
                     actual: describe_kind(other),
                     requested: String::new(),
                 }),
             },
             SnapshotField::PercpuKey { .. } => Err(SnapshotError::TypeMismatch {
-                expected: "str",
-                actual: "Uint(percpu key)",
+                expected: "str".to_string(),
+                actual: "Uint(percpu key)".to_string(),
                 requested: String::new(),
             }),
             SnapshotField::Missing(err) => Err(err.clone()),
@@ -1892,7 +1892,7 @@ impl<'a> JsonField<'a> {
         match self {
             JsonField::Value(serde_json::Value::Bool(b)) => Ok(*b),
             JsonField::Value(other) => Err(SnapshotError::TypeMismatch {
-                expected: "bool",
+                expected: "bool".to_string(),
                 actual: describe_json_kind(other),
                 requested: String::new(),
             }),
@@ -1905,7 +1905,7 @@ impl<'a> JsonField<'a> {
         match self {
             JsonField::Value(serde_json::Value::String(s)) => Ok(s.as_str()),
             JsonField::Value(other) => Err(SnapshotError::TypeMismatch {
-                expected: "str",
+                expected: "str".to_string(),
                 actual: describe_json_kind(other),
                 requested: String::new(),
             }),
@@ -1975,7 +1975,7 @@ fn walk_json_path<'a>(root: &'a serde_json::Value, path: &str) -> JsonField<'a> 
     JsonField::Value(cursor)
 }
 
-fn describe_json_kind(v: &serde_json::Value) -> &'static str {
+fn describe_json_kind(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::Null => "Null",
         serde_json::Value::Bool(_) => "Bool",
@@ -1984,6 +1984,7 @@ fn describe_json_kind(v: &serde_json::Value) -> &'static str {
         serde_json::Value::Array(_) => "Array",
         serde_json::Value::Object(_) => "Object",
     }
+    .to_string()
 }
 
 fn json_to_u64(v: &serde_json::Value) -> SnapshotResult<u64> {
@@ -1994,8 +1995,8 @@ fn json_to_u64(v: &serde_json::Value) -> SnapshotResult<u64> {
             } else if let Some(i) = n.as_i64() {
                 if i < 0 {
                     Err(SnapshotError::TypeMismatch {
-                        expected: "u64",
-                        actual: "Int(negative)",
+                        expected: "u64".to_string(),
+                        actual: "Int(negative)".to_string(),
                         requested: String::new(),
                     })
                 } else {
@@ -2004,14 +2005,14 @@ fn json_to_u64(v: &serde_json::Value) -> SnapshotResult<u64> {
             } else if let Some(f) = n.as_f64() {
                 if !f.is_finite() || f < 0.0 {
                     Err(SnapshotError::TypeMismatch {
-                        expected: "u64",
-                        actual: "Float(non-coercible)",
+                        expected: "u64".to_string(),
+                        actual: "Float(non-coercible)".to_string(),
                         requested: String::new(),
                     })
                 } else if f.fract() != 0.0 {
                     Err(SnapshotError::TypeMismatch {
-                        expected: "integer",
-                        actual: "non-integer float",
+                        expected: "integer".to_string(),
+                        actual: "non-integer float".to_string(),
                         requested: String::new(),
                     })
                 } else {
@@ -2019,20 +2020,20 @@ fn json_to_u64(v: &serde_json::Value) -> SnapshotResult<u64> {
                 }
             } else {
                 Err(SnapshotError::TypeMismatch {
-                    expected: "u64",
-                    actual: "Number(unrepresentable)",
+                    expected: "u64".to_string(),
+                    actual: "Number(unrepresentable)".to_string(),
                     requested: String::new(),
                 })
             }
         }
         serde_json::Value::Bool(b) => Ok(u64::from(*b)),
         serde_json::Value::String(s) => s.parse::<u64>().map_err(|_| SnapshotError::TypeMismatch {
-            expected: "u64",
-            actual: "String(non-numeric)",
+            expected: "u64".to_string(),
+            actual: "String(non-numeric)".to_string(),
             requested: String::new(),
         }),
         other => Err(SnapshotError::TypeMismatch {
-            expected: "u64",
+            expected: "u64".to_string(),
             actual: describe_json_kind(other),
             requested: String::new(),
         }),
@@ -2047,8 +2048,8 @@ fn json_to_i64(v: &serde_json::Value) -> SnapshotResult<i64> {
             } else if let Some(u) = n.as_u64() {
                 if u > i64::MAX as u64 {
                     Err(SnapshotError::TypeMismatch {
-                        expected: "i64",
-                        actual: "Uint(>i64::MAX)",
+                        expected: "i64".to_string(),
+                        actual: "Uint(>i64::MAX)".to_string(),
                         requested: String::new(),
                     })
                 } else {
@@ -2057,14 +2058,14 @@ fn json_to_i64(v: &serde_json::Value) -> SnapshotResult<i64> {
             } else if let Some(f) = n.as_f64() {
                 if !f.is_finite() {
                     Err(SnapshotError::TypeMismatch {
-                        expected: "i64",
-                        actual: "Float(non-finite)",
+                        expected: "i64".to_string(),
+                        actual: "Float(non-finite)".to_string(),
                         requested: String::new(),
                     })
                 } else if f.fract() != 0.0 {
                     Err(SnapshotError::TypeMismatch {
-                        expected: "integer",
-                        actual: "non-integer float",
+                        expected: "integer".to_string(),
+                        actual: "non-integer float".to_string(),
                         requested: String::new(),
                     })
                 } else {
@@ -2072,20 +2073,20 @@ fn json_to_i64(v: &serde_json::Value) -> SnapshotResult<i64> {
                 }
             } else {
                 Err(SnapshotError::TypeMismatch {
-                    expected: "i64",
-                    actual: "Number(unrepresentable)",
+                    expected: "i64".to_string(),
+                    actual: "Number(unrepresentable)".to_string(),
                     requested: String::new(),
                 })
             }
         }
         serde_json::Value::Bool(b) => Ok(i64::from(*b)),
         serde_json::Value::String(s) => s.parse::<i64>().map_err(|_| SnapshotError::TypeMismatch {
-            expected: "i64",
-            actual: "String(non-numeric)",
+            expected: "i64".to_string(),
+            actual: "String(non-numeric)".to_string(),
             requested: String::new(),
         }),
         other => Err(SnapshotError::TypeMismatch {
-            expected: "i64",
+            expected: "i64".to_string(),
             actual: describe_json_kind(other),
             requested: String::new(),
         }),
@@ -2095,17 +2096,17 @@ fn json_to_i64(v: &serde_json::Value) -> SnapshotResult<i64> {
 fn json_to_f64(v: &serde_json::Value) -> SnapshotResult<f64> {
     match v {
         serde_json::Value::Number(n) => n.as_f64().ok_or(SnapshotError::TypeMismatch {
-            expected: "f64",
-            actual: "Number(unrepresentable)",
+            expected: "f64".to_string(),
+            actual: "Number(unrepresentable)".to_string(),
             requested: String::new(),
         }),
         serde_json::Value::String(s) => s.parse::<f64>().map_err(|_| SnapshotError::TypeMismatch {
-            expected: "f64",
-            actual: "String(non-numeric)",
+            expected: "f64".to_string(),
+            actual: "String(non-numeric)".to_string(),
             requested: String::new(),
         }),
         other => Err(SnapshotError::TypeMismatch {
-            expected: "f64",
+            expected: "f64".to_string(),
             actual: describe_json_kind(other),
             requested: String::new(),
         }),
@@ -2192,7 +2193,7 @@ fn peel_pointer(mut v: &RenderedValue) -> &RenderedValue {
 }
 
 /// Human-readable variant name used in error messages.
-fn describe_kind(v: &RenderedValue) -> &'static str {
+fn describe_kind(v: &RenderedValue) -> String {
     match v {
         RenderedValue::Int { .. } => "Int",
         RenderedValue::Uint { .. } => "Uint",
@@ -2208,6 +2209,7 @@ fn describe_kind(v: &RenderedValue) -> &'static str {
         RenderedValue::Truncated { .. } => "Truncated",
         RenderedValue::Unsupported { .. } => "Unsupported",
     }
+    .to_string()
 }
 
 /// Shared u64 coercion used by [`SnapshotField::as_u64`].
@@ -2217,8 +2219,8 @@ fn render_to_u64(v: &RenderedValue) -> SnapshotResult<u64> {
         RenderedValue::Int { value, .. } => {
             if *value < 0 {
                 Err(SnapshotError::TypeMismatch {
-                    expected: "u64",
-                    actual: "Int(negative)",
+                    expected: "u64".to_string(),
+                    actual: "Int(negative)".to_string(),
                     requested: String::new(),
                 })
             } else {
@@ -2230,8 +2232,8 @@ fn render_to_u64(v: &RenderedValue) -> SnapshotResult<u64> {
         RenderedValue::Enum { value, .. } => {
             if *value < 0 {
                 Err(SnapshotError::TypeMismatch {
-                    expected: "u64",
-                    actual: "Enum(negative)",
+                    expected: "u64".to_string(),
+                    actual: "Enum(negative)".to_string(),
                     requested: String::new(),
                 })
             } else {
@@ -2240,7 +2242,7 @@ fn render_to_u64(v: &RenderedValue) -> SnapshotResult<u64> {
         }
         RenderedValue::Ptr { value, .. } => Ok(*value),
         other => Err(SnapshotError::TypeMismatch {
-            expected: "u64",
+            expected: "u64".to_string(),
             actual: describe_kind(other),
             requested: String::new(),
         }),
@@ -2254,8 +2256,8 @@ fn render_to_i64(v: &RenderedValue) -> SnapshotResult<i64> {
         RenderedValue::Uint { value, .. } => {
             if *value > i64::MAX as u64 {
                 Err(SnapshotError::TypeMismatch {
-                    expected: "i64",
-                    actual: "Uint(>i64::MAX)",
+                    expected: "i64".to_string(),
+                    actual: "Uint(>i64::MAX)".to_string(),
                     requested: String::new(),
                 })
             } else {
@@ -2266,7 +2268,7 @@ fn render_to_i64(v: &RenderedValue) -> SnapshotResult<i64> {
         RenderedValue::Char { value } => Ok(i64::from(*value)),
         RenderedValue::Enum { value, .. } => Ok(*value),
         other => Err(SnapshotError::TypeMismatch {
-            expected: "i64",
+            expected: "i64".to_string(),
             actual: describe_kind(other),
             requested: String::new(),
         }),
@@ -2780,7 +2782,7 @@ mod tests {
     fn no_match_display_renders_three_arms() {
         let empty = SnapshotError::NoMatch {
             map: "m".to_string(),
-            op: "find",
+            op: "find".to_string(),
             len: 0,
             available_keys: Vec::new(),
         };
@@ -2790,7 +2792,7 @@ mod tests {
 
         let unrendered = SnapshotError::NoMatch {
             map: "m".to_string(),
-            op: "max_by",
+            op: "max_by".to_string(),
             len: 7,
             available_keys: Vec::new(),
         };
@@ -2801,7 +2803,7 @@ mod tests {
 
         let sampled = SnapshotError::NoMatch {
             map: "m".to_string(),
-            op: "find",
+            op: "find".to_string(),
             len: 9,
             available_keys: vec!["k0".to_string(), "k1".to_string(), "k2".to_string()],
         };
@@ -3169,7 +3171,7 @@ mod tests {
     fn no_match_display_appends_btf_hint_when_all_keys_are_hex() {
         let err = SnapshotError::NoMatch {
             map: "scx_per_task".to_string(),
-            op: "find",
+            op: "find".to_string(),
             len: 5,
             available_keys: vec![
                 "hex:64000000".to_string(),
@@ -3197,7 +3199,7 @@ mod tests {
     fn no_match_display_omits_btf_hint_when_some_keys_are_typed() {
         let err = SnapshotError::NoMatch {
             map: "mixed".to_string(),
-            op: "find",
+            op: "find".to_string(),
             len: 5,
             available_keys: vec![
                 "hex:64000000".to_string(),
@@ -3223,7 +3225,7 @@ mod tests {
     fn no_match_display_omits_btf_hint_when_no_keys_sampled() {
         let err = SnapshotError::NoMatch {
             map: "m".to_string(),
-            op: "find",
+            op: "find".to_string(),
             len: 5,
             available_keys: Vec::new(),
         };
@@ -3241,7 +3243,7 @@ mod tests {
     fn no_match_display_omits_btf_hint_when_map_is_empty() {
         let err = SnapshotError::NoMatch {
             map: "m".to_string(),
-            op: "find",
+            op: "find".to_string(),
             len: 0,
             available_keys: Vec::new(),
         };
@@ -3999,5 +4001,84 @@ mod tests {
         let mut set: HashSet<SnapshotError> = HashSet::new();
         set.insert(e1);
         assert!(set.contains(&e2));
+    }
+
+    /// Round-trip every SnapshotError variant through serde_json to
+    /// pin that the Serialize+Deserialize derives stay byte-stable
+    /// across every field shape. Catches a future regression that
+    /// reverts a String field to `&'static str` (which would silently
+    /// drop the variant from the Deserialize impl).
+    #[test]
+    fn snapshot_error_serde_round_trip() {
+        let cases = vec![
+            SnapshotError::MapNotFound {
+                requested: "nr_cpus".into(),
+                available: vec!["scx_bss".into(), "scx_data".into()],
+            },
+            SnapshotError::VarNotFound {
+                requested: "stall".into(),
+                available: vec!["nr_cpus_onln".into()],
+            },
+            SnapshotError::AmbiguousVar {
+                requested: "ctx".into(),
+                found_in: vec!["scx_bss".into(), "scx_data".into()],
+            },
+            SnapshotError::FieldNotFound {
+                requested: "scx_bss.ctx.missing".into(),
+                walked: "scx_bss.ctx".into(),
+                component: "missing".into(),
+                available: vec!["nr_cpus".into(), "stall".into()],
+            },
+            SnapshotError::NotAStruct {
+                requested: "scx_bss.stall.x".into(),
+                walked: "scx_bss.stall".into(),
+                component: "x".into(),
+                kind: "Uint".to_string(),
+            },
+            SnapshotError::TypeMismatch {
+                expected: "u64".to_string(),
+                actual: "Struct".to_string(),
+                requested: "scx_bss.ctx".into(),
+            },
+            SnapshotError::IndexOutOfRange {
+                map: "scx_data".into(),
+                index: 5,
+                len: 2,
+            },
+            SnapshotError::PerCpuSlot {
+                map: "scx_percpu".into(),
+                cpu: 7,
+                len: 4,
+                unmapped: false,
+            },
+            SnapshotError::NoMatch {
+                map: "scx_data".into(),
+                op: "find".to_string(),
+                len: 3,
+                available_keys: vec!["k0".into(), "k1".into()],
+            },
+            SnapshotError::EmptyPathComponent {
+                requested: "a..b".into(),
+            },
+            SnapshotError::PerCpuNotNarrowed {
+                map: "scx_percpu".into(),
+            },
+            SnapshotError::NoRendered {
+                map: "scx_percpu".into(),
+                side: "value".to_string(),
+            },
+            SnapshotError::PlaceholderSample {
+                tag: "primary".into(),
+                reason: "vCPU rendezvous timed out".into(),
+            },
+            SnapshotError::MissingStats {
+                tag: "scheduler".into(),
+            },
+        ];
+        for case in cases {
+            let json = serde_json::to_string(&case).expect("serialize");
+            let back: SnapshotError = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(case, back, "round-trip mismatch for {case:?}");
+        }
     }
 }
