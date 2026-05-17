@@ -290,9 +290,7 @@ pub(crate) fn get_or_build_base(
     busybox: bool,
     key: &BaseKey,
 ) -> Result<BaseRef> {
-    let cargo_test_mode = std::env::var("KTSTR_CARGO_TEST_MODE")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
+    let cargo_test_mode = crate::cargo_test_mode::cargo_test_mode_active();
 
     // 1. Process-local cache. Always tried first — this is the only
     //    layer that survives in cargo-test mode.

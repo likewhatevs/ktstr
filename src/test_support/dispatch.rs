@@ -606,7 +606,7 @@ pub fn ktstr_test_early_dispatch() {
         // won't run. The warning is still emitted under bare
         // `cargo test` without the env var set so unaware users
         // see the coverage gap.
-        if !super::runtime::cargo_test_mode_active() {
+        if !crate::cargo_test_mode::cargo_test_mode_active() {
             let total = KTSTR_TESTS.len();
             let real = KTSTR_TESTS
                 .iter()
@@ -1155,7 +1155,7 @@ fn for_each_gauntlet_variant<F>(
 /// even if it were enabled — pin both behaviors explicitly so
 /// the listing matches what the dispatch path will actually run.
 fn list_tests_all(ignored_only: bool) {
-    let cargo_test_mode = super::runtime::cargo_test_mode_active();
+    let cargo_test_mode = crate::cargo_test_mode::cargo_test_mode_active();
     let presets = crate::vm::gauntlet_presets();
     let has_vmlinux = resolve_test_kernel()
         .ok()
@@ -1626,7 +1626,7 @@ fn run_verifier_cell(full_name: &str) -> i32 {
 fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
     use crate::budget::{TestCandidate, estimate_duration, extract_features, select};
 
-    let cargo_test_mode = super::runtime::cargo_test_mode_active();
+    let cargo_test_mode = crate::cargo_test_mode::cargo_test_mode_active();
     let presets = crate::vm::gauntlet_presets();
     let has_vmlinux = resolve_test_kernel()
         .ok()

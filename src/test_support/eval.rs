@@ -2764,7 +2764,7 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, Resol
             // that mode the sibling-dir / target-dir cascade below
             // remains authoritative so gauntlet runs land on the
             // workspace-built scheduler revision.
-            if super::runtime::cargo_test_mode_active()
+            if crate::cargo_test_mode::cargo_test_mode_active()
                 && let Some(found) = find_on_path(name)
             {
                 return Ok((Some(found), ResolveSource::PathLookup));

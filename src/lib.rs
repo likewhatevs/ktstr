@@ -379,6 +379,7 @@ pub fn read_kmsg() -> String {
 
 pub mod assert;
 pub(crate) mod budget;
+pub(crate) mod cargo_test_mode;
 pub mod cli;
 pub mod cpu_util;
 pub mod ctprof;

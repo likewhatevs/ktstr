@@ -13,21 +13,6 @@ use anyhow::{Context, Result};
 // (production + `super::*` tests) compiling unchanged.
 use crate::flock::{FlockMode, try_flock};
 
-/// True when `KTSTR_CARGO_TEST_MODE` is set to a non-empty value.
-///
-/// Mirrored from `super::test_support::runtime::cargo_test_mode_active`
-/// (which is `pub(crate)` inside `test_support`) without the
-/// cross-module dependency: this module is on the VM-host side of
-/// the library and shouldn't pull in `test_support` symbols just for
-/// an env-var read. Empty-string rejection matches the test_support
-/// helper so a stray `KTSTR_CARGO_TEST_MODE=` doesn't accidentally
-/// flip the harness into degraded coordination mode.
-fn cargo_test_mode_active() -> bool {
-    std::env::var("KTSTR_CARGO_TEST_MODE")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
-}
-
 /// Resource contention error — LLC slots or CPUs unavailable.
 /// Downcast via `anyhow::Error::downcast_ref::<ResourceContention>()`
 /// to distinguish from fatal errors.
@@ -616,7 +601,7 @@ pub fn acquire_resource_locks(
     llc_indices: &[usize],
     llc_mode: LlcLockMode,
 ) -> Result<LockOutcome> {
-    if cargo_test_mode_active() {
+    if crate::cargo_test_mode::cargo_test_mode_active() {
         return Ok(LockOutcome::Acquired {
             llc_offset: llc_indices.first().copied().unwrap_or(0),
             locks: Vec::new(),
@@ -1395,7 +1380,7 @@ pub fn acquire_llc_plan(
     test_topo: &crate::topology::TestTopology,
     cpu_cap: Option<CpuCap>,
 ) -> Result<LlcPlan> {
-    if cargo_test_mode_active() {
+    if crate::cargo_test_mode::cargo_test_mode_active() {
         // Bare `cargo test` mode: no peer-coordination contract.
         // Synthesise a degenerate plan that names every LLC and
         // every allowed CPU but holds no flocks. The vmm caller
