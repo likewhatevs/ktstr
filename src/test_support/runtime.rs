@@ -5,10 +5,100 @@
 //! circular import chain. All items are `pub(crate)` and remain
 //! internal to `test_support`.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use super::entry::KtstrTestEntry;
+
+/// Stable PathBuf for the process-owned config scratch directory.
+///
+/// Populated once by [`scratch_dir`] on first access. Kept in a
+/// separate `OnceLock` from the `TempDir` itself so the `atexit`
+/// cleanup handler can read the path through `extern "C"` without
+/// involving the `tempfile::TempDir` value (whose `Drop` would
+/// otherwise never run — see the "leak bound" note on
+/// [`scratch_dir`]).
+static SCRATCH_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Process-owned scratch directory for inline-config tempfile writes.
+///
+/// Created lazily on first access via `tempfile::Builder` with
+/// explicit `0o700` mode (overrides the crate default of umask-
+/// restricted `0o777`-via-`mkdir(2)`, which on a standard
+/// `umask=0o022` host yields `0o755` and would expose directory
+/// listings + filename predictability to other uids). The
+/// directory is a random-suffixed subdirectory of
+/// `std::env::temp_dir()`, owned by the current uid.
+///
+/// Two properties matter:
+///
+/// 1. **Symlink defense.** /tmp is sticky-bit world-writable, so an
+///    attacker can pre-plant a symlink at the predictable content-
+///    addressed path and have us write to wherever it points. A
+///    per-process 0o700 subdirectory blocks every cross-uid access
+///    mode (read, list, write, traverse); only our process can
+///    create or replace files inside it, which eliminates the
+///    symlink-attack surface for the tempfile-write path.
+///
+/// 2. **Leak bound.** Rust does NOT run `Drop` impls on values
+///    stored in `static` slots at process exit — so the
+///    `tempfile::TempDir`'s built-in cleanup would never fire here.
+///    Instead, the path is registered with `libc::atexit`
+///    (POSIX-spec process-exit handler) so a clean exit
+///    (`exit(3)`, fall-off-`main`) triggers
+///    [`std::fs::remove_dir_all`] on the directory. Crash, abort,
+///    SIGKILL, or panic-`abort` skip the atexit handler and leak
+///    the directory; the residual is bounded by the number of
+///    such ungraceful exits and the directory contents are
+///    text-sized config files. The tempdir's random suffix
+///    prevents collisions across runs, so accumulated leak dirs
+///    don't interfere with future runs.
+fn scratch_dir() -> &'static Path {
+    SCRATCH_PATH
+        .get_or_init(|| {
+            let td = tempfile::Builder::new()
+                .prefix("ktstr-config-")
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .expect("create ktstr config scratch directory");
+            // `keep()` consumes the TempDir without running its
+            // Drop's cleanup (it flips the cleanup flag and returns
+            // the bare PathBuf we own). The atexit registration
+            // below takes over cleanup responsibility.
+            let path = td.keep();
+            // SAFETY: `cleanup_scratch_dir` has the required
+            // `extern "C" fn()` signature that `libc::atexit`
+            // accepts. The `unsafe` block here is required because
+            // `libc::atexit` itself is an `unsafe extern "C"` FFI
+            // call (the callback signature itself is plain
+            // `extern "C" fn()`, not `unsafe`). Registering more
+            // than once is the caller's responsibility;
+            // `OnceLock::get_or_init` guarantees this runs exactly
+            // once per process.
+            let rc = unsafe { libc::atexit(cleanup_scratch_dir) };
+            assert_eq!(
+                rc, 0,
+                "libc::atexit registration for ktstr config scratch dir failed"
+            );
+            path
+        })
+        .as_path()
+}
+
+/// Process-exit handler registered via `libc::atexit` by
+/// [`scratch_dir`] on first init. Removes the scratch directory and
+/// every config file inside it. Errors are ignored — by the time
+/// this runs the process is exiting and there is nowhere to surface
+/// a failure (no `eprintln!` ordering guarantees from inside an
+/// atexit handler, and panicking would be unsound across the C ABI
+/// boundary).
+extern "C" fn cleanup_scratch_dir() {
+    if let Some(path) = SCRATCH_PATH.get() {
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
 
 /// True when `RUST_BACKTRACE` is set to `"1"` or `"full"`.
 ///
@@ -133,15 +223,39 @@ pub(crate) fn content_hash(content: &str) -> u64 {
 pub(crate) fn config_content_parts(
     entry: &KtstrTestEntry,
 ) -> Option<(String, PathBuf, String, Vec<String>)> {
+    use std::io::Write as _;
     let content = entry.config_content?;
     let (arg_template, guest_path) = entry.scheduler.config_file_def?;
     let archive_path = guest_path.trim_start_matches('/').to_string();
     let hash = content_hash(content);
-    let tmp = std::env::temp_dir().join(format!("ktstr-config-{hash:016x}.json"));
-    std::fs::write(&tmp, content).expect("failed to write inline config to temp file");
+    let dir = scratch_dir();
+    // Write to a uniquely-named scratch file, then atomic-rename to the
+    // canonical content-addressed path:
+    //   - Scratch acquisition via `NamedTempFile::new_in` uses
+    //     `mkstemp(3)` semantics: random suffix, opened O_EXCL so no
+    //     pre-existing file can be subverted as the write target.
+    //   - The atomic `persist` rename is the cross-thread / cross-process
+    //     race fix. Two writers of the same content race their renames
+    //     to the canonical path; the last writer wins, but since `hash`
+    //     is content-addressed both wrote byte-identical content, so the
+    //     winner's bytes match the loser's. No torn writes are possible
+    //     because `rename(2)` is atomic at the inode level — readers
+    //     either see the old inode or the new one, never a partial blend.
+    //   - On panic between `new_in` and `persist`, NamedTempFile's `Drop`
+    //     unlinks the scratch file. No `/tmp` leak from in-process aborts.
+    let canonical = dir.join(format!("ktstr-config-{hash:016x}.json"));
+    let mut scratch =
+        tempfile::NamedTempFile::new_in(dir).expect("create ktstr config scratch file");
+    scratch
+        .as_file_mut()
+        .write_all(content.as_bytes())
+        .expect("write ktstr config content to scratch");
+    scratch
+        .persist(&canonical)
+        .expect("atomic-rename ktstr config scratch to canonical path");
     let expanded = arg_template.replace("{file}", guest_path);
     let sched_args: Vec<String> = expanded.split_whitespace().map(|s| s.to_string()).collect();
-    Some((archive_path, tmp, guest_path.to_string(), sched_args))
+    Some((archive_path, canonical, guest_path.to_string(), sched_args))
 }
 
 /// Build the shared `cmdline=` string appended to every ktstr_test
@@ -1695,5 +1809,128 @@ mod tests {
         assert_eq!(content_hash("alpha"), 0x3c87f3c3317bd39a);
         assert_eq!(content_hash("beta"), 0xbb8fd2aa1487d7ac);
         assert_eq!(content_hash("scheduler config payload"), 0xc678971ba48d5f80);
+    }
+
+    /// Per-content-hash inline-config files MUST land inside the
+    /// per-process `scratch_dir()` subtree, NOT bare
+    /// `std::env::temp_dir()`. This is the load-bearing security
+    /// property of #247 — the 0o700 process-owned subdirectory
+    /// blocks the cross-uid symlink-replacement attack on
+    /// predictable content-addressed filenames in shared `/tmp`. A
+    /// future "simplification" that reverts the path to bare
+    /// `std::env::temp_dir().join(...)` silently restores the
+    /// attack surface; this test fails loudly first.
+    #[test]
+    fn config_content_parts_writes_inside_process_scratch_dir() {
+        use crate::assert::Assert;
+        use crate::scenario::Ctx;
+        use crate::test_support::entry::{
+            KtstrTestEntry, Scheduler, SchedulerSpec, TopologyConstraints,
+        };
+        use crate::vmm::topology::Topology;
+
+        static SCHED: Scheduler = Scheduler {
+            name: "config_parts_test_sched",
+            binary: SchedulerSpec::Discover("nope"),
+            sysctls: &[],
+            kargs: &[],
+            assert: Assert::NO_OVERRIDES,
+            cgroup_parent: None,
+            sched_args: &[],
+            topology: Topology {
+                llcs: 1,
+                cores_per_llc: 1,
+                threads_per_core: 1,
+                numa_nodes: 1,
+                nodes: None,
+                distances: None,
+            },
+            constraints: TopologyConstraints::DEFAULT,
+            config_file: None,
+            config_file_def: Some(("--config={file}", "/include-files/p.json")),
+            kernels: &[],
+        };
+        fn func(_: &Ctx) -> anyhow::Result<crate::assert::AssertResult> {
+            Ok(crate::assert::AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "scratch_dir_path_test",
+            func,
+            scheduler: &SCHED,
+            config_content: Some("{\"sentinel\":42}"),
+            ..KtstrTestEntry::DEFAULT
+        };
+        let (_, host_path, _, _) =
+            config_content_parts(&entry).expect("config_content_parts returns Some");
+        assert!(
+            host_path.starts_with(scratch_dir()),
+            "config tempfile must live inside the process-owned scratch dir, \
+             not bare std::env::temp_dir(): got host_path={host_path:?}, \
+             scratch_dir={:?}",
+            scratch_dir()
+        );
+    }
+
+    /// Two same-content calls produce the SAME canonical path
+    /// (content-addressed naming idempotence). Callers using the
+    /// returned PathBuf for downstream dedup decisions rely on this
+    /// — a regression that breaks the content-hash → path mapping
+    /// would silently spam the scratch dir with per-call distinct
+    /// names instead of reusing the canonical entry.
+    #[test]
+    fn config_content_parts_same_content_same_canonical_path() {
+        use crate::assert::Assert;
+        use crate::scenario::Ctx;
+        use crate::test_support::entry::{
+            KtstrTestEntry, Scheduler, SchedulerSpec, TopologyConstraints,
+        };
+        use crate::vmm::topology::Topology;
+
+        static SCHED: Scheduler = Scheduler {
+            name: "config_parts_idempotent_sched",
+            binary: SchedulerSpec::Discover("nope"),
+            sysctls: &[],
+            kargs: &[],
+            assert: Assert::NO_OVERRIDES,
+            cgroup_parent: None,
+            sched_args: &[],
+            topology: Topology {
+                llcs: 1,
+                cores_per_llc: 1,
+                threads_per_core: 1,
+                numa_nodes: 1,
+                nodes: None,
+                distances: None,
+            },
+            constraints: TopologyConstraints::DEFAULT,
+            config_file: None,
+            config_file_def: Some(("--config={file}", "/include-files/p.json")),
+            kernels: &[],
+        };
+        fn func(_: &Ctx) -> anyhow::Result<crate::assert::AssertResult> {
+            Ok(crate::assert::AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "idempotent_path_test",
+            func,
+            scheduler: &SCHED,
+            config_content: Some("{\"idempotent\":true}"),
+            ..KtstrTestEntry::DEFAULT
+        };
+        let (_, p1, _, _) = config_content_parts(&entry).expect("first call returns Some");
+        let (_, p2, _, _) = config_content_parts(&entry).expect("second call returns Some");
+        assert_eq!(
+            p1, p2,
+            "same content_content -> same canonical path; content-addressed naming \
+             must be idempotent across calls"
+        );
+        // The filename component encodes the content hash via the
+        // `ktstr-config-{hash:016x}.json` template; verify the prefix
+        // so a future filename-template change is caught.
+        let name = p1.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        assert!(
+            name.starts_with("ktstr-config-") && name.ends_with(".json"),
+            "canonical filename must follow `ktstr-config-{{hash}}.json` template, got: {name}"
+        );
     }
 }
