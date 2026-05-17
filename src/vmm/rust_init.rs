@@ -4054,24 +4054,16 @@ mod tests {
         mkdir_p(tmp.to_str().unwrap());
     }
 
-    /// Tests a single FILE write+read rather than a directory
-    /// tree, so `tempfile::TempDir` doesn't fit (it's a
-    /// directory primitive). `tempfile::NamedTempFile` would
-    /// fit and would add RAII cleanup + a random suffix to
-    /// avoid concurrent-test collisions on the bare
-    /// `"ktstr-rust-init-echo-test"` filename used below.
-    /// Migration to `NamedTempFile` is tracked as a follow-up
-    /// task; the current raw `temp_dir().join(...)` +
-    /// `let _ = fs::remove_file(...)` keeps the diff scoped
-    /// to directory-cleanup migrations.
     #[test]
     fn exec_shell_line_echo_redirect() {
-        let tmp = std::env::temp_dir().join("ktstr-rust-init-echo-test");
-        let path = tmp.to_str().unwrap();
+        let _tempfile_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-rust-init-echo-test-")
+            .tempfile()
+            .unwrap();
+        let path = _tempfile_keep_alive.path().to_str().unwrap();
         exec_shell_line(&format!("echo 42 > {path}"));
-        let content = fs::read_to_string(&tmp).unwrap();
+        let content = fs::read_to_string(_tempfile_keep_alive.path()).unwrap();
         assert_eq!(content, "42\n");
-        let _ = fs::remove_file(&tmp);
     }
 
     #[test]
