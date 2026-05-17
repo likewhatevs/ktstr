@@ -567,6 +567,130 @@ pub const MAX_WATCH_SNAPSHOTS: usize = 3;
 /// naming the dropped tag so the operator sees the truncation.
 pub const MAX_STORED_SNAPSHOTS: usize = 64;
 
+/// Maximum number of [`SnapshotBridgeEvent`] entries the bridge
+/// retains between [`SnapshotBridge::drain_events`] calls. A scenario
+/// that triggers many cap-eviction events (a Loop step that captures
+/// a unique tag every 30ms for 10 minutes produces ~20 000 events,
+/// each ~100 bytes) would otherwise grow the events log without
+/// bound. The bridge enforces FIFO eviction at this cap — when push
+/// would exceed it, the oldest event is dropped, the dropped count
+/// is tracked on `SnapshotStore::events_dropped`, and the next
+/// [`SnapshotBridge::drain_events`] call appends a synthetic
+/// [`SnapshotBridgeEvent::EventLogTruncated`] entry at the tail so
+/// the operator never silently loses events. The cap is loose enough
+/// (1024 events × ~100 bytes ≈ 100 KiB) that legitimate scenarios
+/// never hit it; only runaway capture frequency does.
+pub const MAX_STORED_EVENTS: usize = 1024;
+
+/// A structured event surfaced by the [`SnapshotBridge`] during its
+/// own operation (capture, storage, drain). Promotes the previous
+/// `tracing::warn!`-only diagnostic channel into an operator-
+/// drainable structured row so tests can assert on bridge-side
+/// conditions (eviction, missing capture, invariant violations)
+/// instead of grepping stderr.
+///
+/// Distinct from [`crate::assert::AssertDetail`]: an `AssertDetail`
+/// is a per-assertion outcome (Starved / Stuck / etc.); a
+/// `SnapshotBridgeEvent` is a per-bridge meta-event about the
+/// storage pipeline itself. Mixing them at the assertion level
+/// would conflate "scheduler behavior failed" with "bridge dropped
+/// an entry due to cap" — two orthogonal concerns. Test authors
+/// who want to fail their scenario on a bridge event compose the
+/// two streams themselves (drain events, convert to `AssertDetail`
+/// if needed) — see [`SnapshotBridge::drain_events`].
+///
+/// Every bridge site that previously emitted only `tracing::warn!`
+/// still emits the warn (preserved for stderr visibility) AND
+/// appends the structured variant here. "Promote, don't replace."
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub enum SnapshotBridgeEvent {
+    /// Capture callback returned `None` for `tag` — the corresponding
+    /// `Op::Snapshot` was a no-op. Fires from
+    /// [`SnapshotBridge::capture`] when the host couldn't freeze /
+    /// build the report (scheduler died before the freeze, scan
+    /// accessor unavailable, etc.).
+    CaptureUnavailable {
+        /// Tag the failed capture was attempted under.
+        tag: String,
+    },
+    /// Storage of `tag` overwrote a prior entry. Fires from
+    /// [`SnapshotBridge::store`] / [`SnapshotBridge::store_with_stats`]
+    /// when `bridge.store(tag, ...)` is called with a tag that
+    /// already has a stored report. FIFO order is refreshed to back,
+    /// prior `(stats, elapsed_ms)` parallel slots are replaced.
+    Overwrite {
+        /// Tag whose prior entry was overwritten.
+        tag: String,
+        /// `schema` of the prior entry — included for diagnostic
+        /// context (a schema bump alongside an unintended overwrite
+        /// is the textbook double-tag bug).
+        prior_schema: String,
+    },
+    /// FIFO eviction of `evicted_tag` triggered by storing
+    /// `new_tag`. Fires from the cap-enforcement loop in
+    /// `store_internal` when `reports.len()` exceeds
+    /// [`MAX_STORED_SNAPSHOTS`] after insertion. `cap` is the limit
+    /// at the time of eviction.
+    Eviction {
+        /// Tag that was popped from the FIFO to make room.
+        evicted_tag: String,
+        /// Tag whose storage triggered the cap-overflow.
+        new_tag: String,
+        /// Cap value at the time — folded in so the operator
+        /// doesn't have to cross-reference [`MAX_STORED_SNAPSHOTS`].
+        cap: usize,
+    },
+    /// A drain found `tag` in `reports` but missing from `order` —
+    /// internal invariant violation. The report was surfaced at the
+    /// tail of the drain output rather than dropped silently; this
+    /// event flags the bug so test authors who care can fail their
+    /// scenario.
+    DrainOrderingInvariantViolation {
+        /// Tag whose desynchronised entry was surfaced at the tail.
+        tag: String,
+        /// Which drain variant fired the warning —
+        /// `"drain_ordered"` or `"drain_ordered_with_stats"`. Lets
+        /// post-mortem analysis disambiguate the two code paths.
+        drain_variant: &'static str,
+    },
+    /// The cap-enforcement loop in `store_internal` found
+    /// `reports.len() > cap` while `order` was empty — a worse
+    /// invariant violation than [`Self::DrainOrderingInvariantViolation`]
+    /// because the bulk-clear branch nukes ALL reports / stats /
+    /// elapsed_ms to restore the invariant. Unreachable through the
+    /// current public API (every insert site appends to `order`
+    /// alongside `reports`), but recorded for the same future-proofing
+    /// reason as the drain variant: a refactor that desynchronised
+    /// the two collections must not be allowed to silently drop the
+    /// entire bridge state.
+    CapInvariantViolation {
+        /// `reports.len()` at the moment the bulk-clear was triggered.
+        /// Folded in so the operator can see how much state was
+        /// nuked.
+        reports_len: usize,
+        /// Cap value at the time — same definition as
+        /// [`Self::Eviction::cap`].
+        cap: usize,
+    },
+    /// The events log itself hit [`MAX_STORED_EVENTS`] and dropped
+    /// `dropped_count` oldest events to keep memory bounded. The
+    /// bridge appends this variant at the tail of every
+    /// [`SnapshotBridge::drain_events`] result whenever
+    /// `events_dropped > 0` (resets to 0 after drain), so the
+    /// operator never silently loses events — they see a count of
+    /// how many were dropped between drains. Test authors who care
+    /// about exhaustive coverage should `assert!(matches!(events
+    /// .last(), Some(SnapshotBridgeEvent::EventLogTruncated { .. }))
+    /// .not())` to fail when the bridge truncated.
+    EventLogTruncated {
+        /// Number of events evicted from the front of the log since
+        /// the last [`SnapshotBridge::drain_events`] call. Resets to
+        /// 0 after drain.
+        dropped_count: u64,
+    },
+}
+
 /// Inner storage for [`SnapshotBridge::snapshots`]. Pairs the
 /// HashMap-keyed reports with a [`VecDeque`] tracking insertion
 /// order so the FIFO eviction in [`SnapshotBridge::store`] can pop
@@ -596,6 +720,27 @@ struct SnapshotStore {
     /// before pushing the fresh occurrence so the `reports.len()`
     /// and `order.len()` invariants stay in lock-step.
     order: VecDeque<String>,
+    /// Structured bridge-side meta-events appended in insertion
+    /// order. Every site that previously emitted only a
+    /// `tracing::warn!` also pushes the corresponding
+    /// [`SnapshotBridgeEvent`] variant here. Drained by
+    /// [`SnapshotBridge::drain_events`] so test authors can assert
+    /// on bridge meta-conditions (eviction, overwrite, missing
+    /// capture, invariant violation) without grepping stderr.
+    /// Capped at [`MAX_STORED_EVENTS`] via FIFO eviction in
+    /// [`push_event`]; dropped count is tracked in `events_dropped`
+    /// and surfaced as a synthetic
+    /// [`SnapshotBridgeEvent::EventLogTruncated`] appended at the
+    /// tail of the next `drain_events` result so no event loss is
+    /// silent.
+    events: Vec<SnapshotBridgeEvent>,
+    /// Number of events evicted from the front of `events` since
+    /// the last `drain_events` call. Reset to 0 on drain.
+    /// Drain appends [`SnapshotBridgeEvent::EventLogTruncated`] at
+    /// the tail when this is non-zero so the operator never silently
+    /// loses events — they always see a marker carrying the dropped
+    /// count.
+    events_dropped: u64,
 }
 
 impl SnapshotStore {
@@ -605,7 +750,27 @@ impl SnapshotStore {
             stats: HashMap::new(),
             elapsed_ms: HashMap::new(),
             order: VecDeque::new(),
+            events: Vec::new(),
+            events_dropped: 0,
         }
+    }
+
+    /// Append `event` to `events`, enforcing [`MAX_STORED_EVENTS`]
+    /// via FIFO eviction. When push would exceed the cap, the
+    /// oldest entry is removed and `events_dropped` is incremented
+    /// so a subsequent [`SnapshotBridge::drain_events`] call can
+    /// surface a [`SnapshotBridgeEvent::EventLogTruncated`] marker
+    /// — the operator never silently loses events. The fast path
+    /// (cap not reached) is a single push with no extra allocation.
+    fn push_event(&mut self, event: SnapshotBridgeEvent) {
+        if self.events.len() >= MAX_STORED_EVENTS {
+            // Drop the oldest. Vec::remove(0) is O(n) but the cap
+            // is bounded and this branch only fires in pathological
+            // runaway-capture scenarios.
+            self.events.remove(0);
+            self.events_dropped = self.events_dropped.saturating_add(1);
+        }
+        self.events.push(event);
     }
 }
 
@@ -778,6 +943,11 @@ impl SnapshotBridge {
                 name,
                 "SnapshotBridge::capture: capture callback returned None — snapshot unavailable"
             );
+            self.snapshots
+                .lock_unpoisoned()
+                .push_event(SnapshotBridgeEvent::CaptureUnavailable {
+                    tag: name.to_string(),
+                });
             return false;
         };
         self.store(name, report);
@@ -838,6 +1008,10 @@ impl SnapshotBridge {
                 schema = %existing.schema,
                 "SnapshotBridge::store: name already had a stored report; overwriting prior capture"
             );
+            store.push_event(SnapshotBridgeEvent::Overwrite {
+                tag: name.to_string(),
+                prior_schema: existing.schema.clone(),
+            });
             // Move this tag to the back of the FIFO order so the
             // overwrite refreshes its position (newest insertion =
             // farthest from eviction). Without this, a hot-rewritten
@@ -882,6 +1056,16 @@ impl SnapshotBridge {
                 // Defensive: if order is empty while reports is over
                 // cap something is desynchronised — clear reports to
                 // restore the invariant rather than loop forever.
+                let nuked = store.reports.len();
+                tracing::warn!(
+                    reports_len = nuked,
+                    cap = MAX_STORED_SNAPSHOTS,
+                    "SnapshotBridge::store: order empty while reports over cap — bulk-clearing to restore invariant"
+                );
+                store.push_event(SnapshotBridgeEvent::CapInvariantViolation {
+                    reports_len: nuked,
+                    cap: MAX_STORED_SNAPSHOTS,
+                });
                 store.reports.clear();
                 store.stats.clear();
                 store.elapsed_ms.clear();
@@ -893,6 +1077,11 @@ impl SnapshotBridge {
                     cap = MAX_STORED_SNAPSHOTS,
                     "SnapshotBridge::store: cap reached, evicting oldest captured snapshot"
                 );
+                store.push_event(SnapshotBridgeEvent::Eviction {
+                    evicted_tag: evicted.clone(),
+                    new_tag: name.to_string(),
+                    cap: MAX_STORED_SNAPSHOTS,
+                });
             }
             // Sweep the parallel maps in lock-step so a stranded
             // stats / elapsed entry cannot outlive its report.
@@ -994,6 +1183,10 @@ impl SnapshotBridge {
                  but missing from `order` — surfacing at tail (FIFO \
                  invariant violation; please file)"
             );
+            store.push_event(SnapshotBridgeEvent::DrainOrderingInvariantViolation {
+                tag: tag.clone(),
+                drain_variant: "drain_ordered",
+            });
             out.push((tag, report));
         }
         out
@@ -1055,11 +1248,61 @@ impl SnapshotBridge {
                  but missing from `order` — surfacing at tail (FIFO \
                  invariant violation; please file)"
             );
+            store.push_event(SnapshotBridgeEvent::DrainOrderingInvariantViolation {
+                tag: tag.clone(),
+                drain_variant: "drain_ordered_with_stats",
+            });
             let s = stats.remove(&tag);
             let e = elapsed.remove(&tag);
             out.push((tag, report, s, e));
         }
         out
+    }
+
+    /// Take ownership of all queued [`SnapshotBridgeEvent`]s in
+    /// insertion order. Empties the internal log; a follow-up call
+    /// returns an empty vec. Test authors call this after
+    /// [`Self::drain_ordered`] / [`Self::drain_ordered_with_stats`]
+    /// to inspect bridge-side conditions that fired during the
+    /// scenario (eviction, overwrite, missing capture, invariant
+    /// violation).
+    ///
+    /// Independent of the report drain — events accumulate even on
+    /// scenarios that never call `drain_ordered*`, and reports
+    /// remain reachable even on scenarios that never call
+    /// `drain_events`. Tests that want to fail on a bridge event
+    /// compose the streams: drain events, inspect, fail with
+    /// `AssertResult::fail(AssertDetail::new(Other, ...))` if any
+    /// variant is unexpected.
+    ///
+    /// When the events log hit [`MAX_STORED_EVENTS`] and FIFO-evicted
+    /// older entries since the previous drain, a synthetic
+    /// [`SnapshotBridgeEvent::EventLogTruncated`] is appended at the
+    /// tail of the returned vec carrying the dropped count — the
+    /// operator never silently loses events. The internal dropped
+    /// counter resets to 0 after every drain.
+    pub fn drain_events(&self) -> Vec<SnapshotBridgeEvent> {
+        let mut store = self.snapshots.lock_unpoisoned();
+        let mut events = std::mem::take(&mut store.events);
+        if store.events_dropped > 0 {
+            events.push(SnapshotBridgeEvent::EventLogTruncated {
+                dropped_count: store.events_dropped,
+            });
+            store.events_dropped = 0;
+        }
+        events
+    }
+
+    /// Non-draining count of queued [`SnapshotBridgeEvent`]s. Useful
+    /// for "no bridge events fired" assertions without consuming
+    /// the log — `assert_eq!(bridge.event_count(), 0)`. Does NOT
+    /// include the synthetic
+    /// [`SnapshotBridgeEvent::EventLogTruncated`] marker that
+    /// [`Self::drain_events`] would append; that marker is
+    /// drain-time-only and `events_dropped > 0` is observable via
+    /// the next drain rather than via this counter.
+    pub fn event_count(&self) -> usize {
+        self.snapshots.lock_unpoisoned().events.len()
     }
 
     /// Install this bridge as the active bridge for the calling
@@ -5420,5 +5663,503 @@ mod tests {
         assert_eq!(st.n_buckets, 16);
         assert!(st.truncated);
         assert_eq!(map.map_error(), Some("decode failed"));
+    }
+
+    // -- SnapshotBridgeEvent + drain_events -------------------------------
+
+    /// Construct a bridge whose capture callback always returns the
+    /// caller-supplied report. Tests that need to trigger
+    /// `CaptureUnavailable` build their own bridge with a None-returning
+    /// callback inline.
+    fn bridge_with_capture_returning(report: FailureDumpReport) -> SnapshotBridge {
+        SnapshotBridge::new(std::sync::Arc::new(move |_name| Some(report.clone())))
+    }
+
+    /// `capture` whose callback returns `None` records exactly one
+    /// `CaptureUnavailable` event under the requested tag and returns
+    /// `false` (the Op::Snapshot no-op contract).
+    #[test]
+    fn snapshot_bridge_event_capture_unavailable_recorded() {
+        let bridge = SnapshotBridge::new(std::sync::Arc::new(|_name| None));
+        assert!(!bridge.capture("tag_x"));
+        let events = bridge.drain_events();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            SnapshotBridgeEvent::CaptureUnavailable { tag } => {
+                assert_eq!(tag, "tag_x");
+            }
+            other => panic!("expected CaptureUnavailable, got {other:?}"),
+        }
+    }
+
+    /// `store` of a tag that already has a stored report records
+    /// exactly one `Overwrite` event with the prior report's `schema`.
+    #[test]
+    fn snapshot_bridge_event_overwrite_recorded() {
+        let bridge = bridge_with_capture_returning(synthetic_report());
+        bridge.store("dup_tag", synthetic_report());
+        bridge.store("dup_tag", synthetic_report());
+        let events = bridge.drain_events();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            SnapshotBridgeEvent::Overwrite { tag, prior_schema } => {
+                assert_eq!(tag, "dup_tag");
+                assert_eq!(prior_schema, SCHEMA_SINGLE);
+            }
+            other => panic!("expected Overwrite, got {other:?}"),
+        }
+    }
+
+    /// `store` that triggers FIFO cap-eviction records one `Eviction`
+    /// event per evicted tag, with `cap` reflecting
+    /// [`MAX_STORED_SNAPSHOTS`] and `new_tag` naming the storing
+    /// operation that pushed the bridge over the cap.
+    #[test]
+    fn snapshot_bridge_event_eviction_recorded() {
+        let bridge = bridge_with_capture_returning(synthetic_report());
+        for i in 0..MAX_STORED_SNAPSHOTS {
+            bridge.store(&format!("tag_{i}"), synthetic_report());
+        }
+        // The first MAX_STORED_SNAPSHOTS stores fit; none should
+        // have evicted anything.
+        assert_eq!(bridge.event_count(), 0);
+        // One more store crosses the cap — exactly one Eviction.
+        bridge.store("overflow_tag", synthetic_report());
+        let events = bridge.drain_events();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            SnapshotBridgeEvent::Eviction {
+                evicted_tag,
+                new_tag,
+                cap,
+            } => {
+                assert_eq!(evicted_tag, "tag_0");
+                assert_eq!(new_tag, "overflow_tag");
+                assert_eq!(*cap, MAX_STORED_SNAPSHOTS);
+            }
+            other => panic!("expected Eviction, got {other:?}"),
+        }
+    }
+
+    /// `drain_events` empties the log — a follow-up call returns an
+    /// empty vec without re-yielding the previously-drained events.
+    #[test]
+    fn snapshot_bridge_drain_events_consumes_log() {
+        let bridge = SnapshotBridge::new(std::sync::Arc::new(|_name| None));
+        bridge.capture("a");
+        bridge.capture("b");
+        let first = bridge.drain_events();
+        assert_eq!(first.len(), 2);
+        let second = bridge.drain_events();
+        assert!(second.is_empty(), "second drain must return empty vec");
+        assert_eq!(bridge.event_count(), 0);
+    }
+
+    /// `event_count` reports queued events without consuming them —
+    /// a follow-up `drain_events` still yields the same events.
+    #[test]
+    fn snapshot_bridge_event_count_is_non_draining() {
+        let bridge = SnapshotBridge::new(std::sync::Arc::new(|_name| None));
+        bridge.capture("only");
+        assert_eq!(bridge.event_count(), 1);
+        // Re-checking does not drain.
+        assert_eq!(bridge.event_count(), 1);
+        let events = bridge.drain_events();
+        assert_eq!(events.len(), 1);
+    }
+
+    /// A bridge whose storage and drain paths run cleanly produces
+    /// zero events — the structured log is silent on the happy path.
+    #[test]
+    fn snapshot_bridge_no_events_on_clean_capture_and_drain() {
+        let bridge = bridge_with_capture_returning(synthetic_report());
+        assert!(bridge.capture("clean_a"));
+        assert!(bridge.capture("clean_b"));
+        let _ = bridge.drain_ordered_with_stats();
+        assert_eq!(
+            bridge.event_count(),
+            0,
+            "clean capture-then-drain must not record any bridge events",
+        );
+    }
+
+    /// `tracing::warn!` is preserved alongside the event push — the
+    /// "promote, don't replace" contract. Cannot directly observe the
+    /// warn without a subscriber install; this test pins that the
+    /// event is still recorded even after a clean drain (the warn
+    /// path is exercised the same way regardless of subscriber state,
+    /// so observing the structured event covers both axes).
+    #[test]
+    fn snapshot_bridge_event_recorded_even_after_drain() {
+        let bridge = SnapshotBridge::new(std::sync::Arc::new(|_name| None));
+        bridge.capture("post_drain_tag");
+        let _ = bridge.drain_ordered_with_stats();
+        // Events are independent of report drain — they remain
+        // queued for inspection until drain_events is called.
+        assert_eq!(bridge.event_count(), 1);
+        let events = bridge.drain_events();
+        assert!(
+            matches!(
+                events[0],
+                SnapshotBridgeEvent::CaptureUnavailable { ref tag } if tag == "post_drain_tag",
+            ),
+            "post-drain event must remain in the log",
+        );
+    }
+
+    /// `DrainOrderingInvariantViolation` fires from
+    /// [`SnapshotBridge::drain_ordered`] when a report exists in
+    /// `reports` without a matching entry in `order`. The
+    /// public API keeps the two collections in lock-step, so the
+    /// only way to exercise this path is to poke `snapshots`
+    /// directly from inside the test module — simulating an internal
+    /// refactor bug that desynchronised the two. Pins both the
+    /// tag field and the `drain_variant` literal so a regression
+    /// that drops the event push (leaving only the warn) surfaces
+    /// here.
+    #[test]
+    fn snapshot_bridge_event_drain_ordering_invariant_violation_drain_ordered() {
+        let bridge = bridge_with_capture_returning(synthetic_report());
+        {
+            let mut store = bridge.snapshots.lock_unpoisoned();
+            store
+                .reports
+                .insert("orphan_tag".to_string(), synthetic_report());
+        }
+        let drained = bridge.drain_ordered();
+        assert_eq!(drained.len(), 1, "orphan must surface at the tail");
+        assert_eq!(drained[0].0, "orphan_tag");
+        let events = bridge.drain_events();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            SnapshotBridgeEvent::DrainOrderingInvariantViolation {
+                tag,
+                drain_variant,
+            } => {
+                assert_eq!(tag, "orphan_tag");
+                assert_eq!(*drain_variant, "drain_ordered");
+            }
+            other => panic!("expected DrainOrderingInvariantViolation, got {other:?}"),
+        }
+    }
+
+    /// Parallel test for `drain_ordered_with_stats` — the second
+    /// production site for `DrainOrderingInvariantViolation`. The
+    /// `drain_variant` discriminator is the only difference; a single
+    /// test cannot pin both sites simultaneously because each drain
+    /// method consumes the desync.
+    #[test]
+    fn snapshot_bridge_event_drain_ordering_invariant_violation_drain_ordered_with_stats() {
+        let bridge = bridge_with_capture_returning(synthetic_report());
+        {
+            let mut store = bridge.snapshots.lock_unpoisoned();
+            store
+                .reports
+                .insert("orphan_tag".to_string(), synthetic_report());
+        }
+        let drained = bridge.drain_ordered_with_stats();
+        assert_eq!(drained.len(), 1, "orphan must surface at the tail");
+        assert_eq!(drained[0].0, "orphan_tag");
+        let events = bridge.drain_events();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            SnapshotBridgeEvent::DrainOrderingInvariantViolation {
+                tag,
+                drain_variant,
+            } => {
+                assert_eq!(tag, "orphan_tag");
+                assert_eq!(*drain_variant, "drain_ordered_with_stats");
+            }
+            other => panic!("expected DrainOrderingInvariantViolation, got {other:?}"),
+        }
+    }
+
+    /// The cap-enforcement loop supports multi-iteration eviction
+    /// (e.g. if `reports.len()` ever exceeds `cap + 1`). The public
+    /// API never produces this state because `store_internal`
+    /// inserts one entry and pops one per loop iteration, but a
+    /// future refactor that pushed N entries in one shot would
+    /// rely on the loop running N - cap times. Pre-seed
+    /// `reports + order` in lock-step with `cap + 1` entries, then
+    /// trigger one store to drive the loop past the cap by 2, and
+    /// pin that exactly 2 Eviction events fire — one per iteration,
+    /// in FIFO order. A regression that moved the `events.push`
+    /// outside the while-loop body (single push after the loop with
+    /// the last evicted tag) would only fire 1 event and fail here.
+    #[test]
+    fn snapshot_bridge_event_eviction_loop_fires_once_per_iteration() {
+        let bridge = bridge_with_capture_returning(synthetic_report());
+        {
+            let mut store = bridge.snapshots.lock_unpoisoned();
+            for i in 0..=MAX_STORED_SNAPSHOTS {
+                let tag = format!("seed_{i:03}");
+                store.reports.insert(tag.clone(), synthetic_report());
+                store.order.push_back(tag);
+            }
+        }
+        bridge.store("trigger_tag", synthetic_report());
+        let events = bridge.drain_events();
+        assert_eq!(
+            events.len(),
+            2,
+            "loop must fire exactly one Eviction per popped entry, not one batched event for the last pop"
+        );
+        match &events[0] {
+            SnapshotBridgeEvent::Eviction {
+                evicted_tag,
+                new_tag,
+                cap,
+            } => {
+                assert_eq!(evicted_tag, "seed_000", "first pop is FIFO-oldest");
+                assert_eq!(new_tag, "trigger_tag");
+                assert_eq!(*cap, MAX_STORED_SNAPSHOTS);
+            }
+            other => panic!("expected Eviction at events[0], got {other:?}"),
+        }
+        match &events[1] {
+            SnapshotBridgeEvent::Eviction {
+                evicted_tag,
+                new_tag,
+                cap,
+            } => {
+                assert_eq!(evicted_tag, "seed_001", "second pop is FIFO-next-oldest");
+                assert_eq!(new_tag, "trigger_tag");
+                assert_eq!(*cap, MAX_STORED_SNAPSHOTS);
+            }
+            other => panic!("expected Eviction at events[1], got {other:?}"),
+        }
+    }
+
+    /// `CapInvariantViolation` fires when the cap-enforcement loop
+    /// in `store_internal` finds `reports.len() > cap` while `order`
+    /// is empty — the bulk-clear branch nukes everything to restore
+    /// the invariant. Unreachable through the public API (which
+    /// always keeps the two collections in lock-step), so this test
+    /// pre-seeds the desync directly: `cap + 2` orphan entries in
+    /// `reports` with empty `order`, then `bridge.store("trigger_tag",
+    /// ...)` to enter `store_internal`. `store_internal` pushes
+    /// trigger_tag onto `order` BEFORE the loop, so the first loop
+    /// iteration pops trigger_tag (Eviction event with self-eviction
+    /// shape — both evicted_tag and new_tag = trigger_tag); the
+    /// second iteration finds `order` empty while `reports.len()`
+    /// still over cap and fires CapInvariantViolation, bulk-clears,
+    /// then breaks. Test asserts both events fire in this order so a
+    /// regression in either site surfaces.
+    #[test]
+    fn snapshot_bridge_event_cap_invariant_violation_recorded() {
+        let bridge = bridge_with_capture_returning(synthetic_report());
+        {
+            let mut store = bridge.snapshots.lock_unpoisoned();
+            for i in 0..(MAX_STORED_SNAPSHOTS + 2) {
+                store
+                    .reports
+                    .insert(format!("orphan_{i:03}"), synthetic_report());
+            }
+        }
+        bridge.store("trigger_tag", synthetic_report());
+        let events = bridge.drain_events();
+        assert_eq!(
+            events.len(),
+            2,
+            "expected one Eviction (self-evicting trigger_tag from order) + one CapInvariantViolation (bulk-clearing the remaining orphans)"
+        );
+        match &events[0] {
+            SnapshotBridgeEvent::Eviction {
+                evicted_tag,
+                new_tag,
+                cap,
+            } => {
+                assert_eq!(
+                    evicted_tag, "trigger_tag",
+                    "self-eviction: trigger_tag is the only entry in order"
+                );
+                assert_eq!(new_tag, "trigger_tag");
+                assert_eq!(*cap, MAX_STORED_SNAPSHOTS);
+            }
+            other => panic!("expected Eviction at events[0], got {other:?}"),
+        }
+        match &events[1] {
+            SnapshotBridgeEvent::CapInvariantViolation { reports_len, cap } => {
+                assert_eq!(
+                    *reports_len,
+                    MAX_STORED_SNAPSHOTS + 2,
+                    "reports_len at bulk-clear: 66 orphans remain after trigger_tag was evicted in iteration 1"
+                );
+                assert_eq!(*cap, MAX_STORED_SNAPSHOTS);
+            }
+            other => panic!("expected CapInvariantViolation at events[1], got {other:?}"),
+        }
+        let store = bridge.snapshots.lock_unpoisoned();
+        assert_eq!(
+            store.reports.len(),
+            0,
+            "bulk-clear must nuke reports to restore the invariant"
+        );
+        assert_eq!(store.stats.len(), 0);
+        assert_eq!(store.elapsed_ms.len(), 0);
+    }
+
+    /// `events` Vec is capped at [`MAX_STORED_EVENTS`] via FIFO
+    /// eviction. A scenario that triggers many events without
+    /// draining (e.g. a runaway capture loop) must NOT grow the
+    /// log unboundedly. Push `cap + 5` events, verify `event_count`
+    /// is exactly `cap`, then drain and verify the drained vec is
+    /// `cap + 1` long (cap real events + 1 synthetic
+    /// [`SnapshotBridgeEvent::EventLogTruncated`] at the tail) with
+    /// `dropped_count = 5`. Also pins FIFO eviction order: the
+    /// oldest events are dropped, the newest are retained.
+    #[test]
+    fn snapshot_bridge_events_capped_at_max_stored_events() {
+        let bridge = SnapshotBridge::new(std::sync::Arc::new(|_name| None));
+        let total = MAX_STORED_EVENTS + 5;
+        for i in 0..total {
+            bridge.capture(&format!("runaway_{i:05}"));
+        }
+        assert_eq!(
+            bridge.event_count(),
+            MAX_STORED_EVENTS,
+            "events Vec must be capped at MAX_STORED_EVENTS (event_count excludes the synthetic truncation marker)"
+        );
+        let drained = bridge.drain_events();
+        assert_eq!(
+            drained.len(),
+            MAX_STORED_EVENTS + 1,
+            "drain must yield cap real events + 1 synthetic EventLogTruncated tail marker"
+        );
+        // The first event surviving FIFO eviction is the 6th push
+        // (indices 0-4 = 5 events were dropped to make room).
+        match &drained[0] {
+            SnapshotBridgeEvent::CaptureUnavailable { tag } => {
+                assert_eq!(
+                    tag, "runaway_00005",
+                    "oldest surviving event must be index 5 (indices 0-4 dropped by FIFO eviction)"
+                );
+            }
+            other => panic!("expected CaptureUnavailable at events[0], got {other:?}"),
+        }
+        // The tail marker carries the dropped count.
+        match drained.last().expect("non-empty drain") {
+            SnapshotBridgeEvent::EventLogTruncated { dropped_count } => {
+                assert_eq!(
+                    *dropped_count, 5,
+                    "5 events were dropped from the front before the cap held"
+                );
+            }
+            other => panic!("expected EventLogTruncated at events[last], got {other:?}"),
+        }
+    }
+
+    /// Pushing EXACTLY [`MAX_STORED_EVENTS`] events must NOT trigger
+    /// any eviction — the cap-enforcement predicate at L766 is
+    /// `>=`, so the cap-th push fits without dropping. Drain then
+    /// yields exactly `cap` events with NO `EventLogTruncated` tail
+    /// marker. Pins the boundary: a regression that changed `>=`
+    /// to `>` would silently shift the cap by one and only be
+    /// catchable via tests that exercise the exact-cap case (the
+    /// existing over-cap tests would still pass with a one-off
+    /// dropped_count). Tester recommended this test in #77 pass 3
+    /// coverage-gap analysis.
+    #[test]
+    fn snapshot_bridge_events_exactly_at_cap_no_truncation_marker() {
+        let bridge = SnapshotBridge::new(std::sync::Arc::new(|_name| None));
+        for i in 0..MAX_STORED_EVENTS {
+            bridge.capture(&format!("at_cap_{i:05}"));
+        }
+        assert_eq!(
+            bridge.event_count(),
+            MAX_STORED_EVENTS,
+            "exact-cap push must NOT trigger eviction — len == cap, dropped == 0"
+        );
+        let drained = bridge.drain_events();
+        assert_eq!(
+            drained.len(),
+            MAX_STORED_EVENTS,
+            "drain must yield exactly cap events with NO synthetic tail marker"
+        );
+        assert!(
+            drained.iter().all(|e| !matches!(
+                e,
+                SnapshotBridgeEvent::EventLogTruncated { .. }
+            )),
+            "no EventLogTruncated marker at exact-cap — events_dropped must remain 0"
+        );
+    }
+
+    /// A second overflow batch after a clean drain must produce a
+    /// FRESH truncation marker with its own dropped_count — NOT 0
+    /// (missed reset), NOT carried-forward from the prior batch,
+    /// NOT accumulated. Pins the events_dropped reset path against
+    /// regressions where the counter persists across drains (e.g.
+    /// `events_dropped = events_dropped.saturating_sub(...)`
+    /// instead of `= 0`, or a reset path that forgets to fire on
+    /// the empty-events case). Tester recommended this test in #77
+    /// pass 3 coverage-gap analysis.
+    #[test]
+    fn snapshot_bridge_events_truncation_marker_fresh_after_reset() {
+        let bridge = SnapshotBridge::new(std::sync::Arc::new(|_name| None));
+        // First overflow: cap+5 push → marker with dropped_count=5.
+        for i in 0..(MAX_STORED_EVENTS + 5) {
+            bridge.capture(&format!("first_{i:05}"));
+        }
+        let first = bridge.drain_events();
+        match first.last().expect("non-empty first drain") {
+            SnapshotBridgeEvent::EventLogTruncated { dropped_count } => {
+                assert_eq!(*dropped_count, 5, "first batch dropped 5");
+            }
+            other => panic!("expected EventLogTruncated tail in first drain, got {other:?}"),
+        }
+        // Second overflow: cap+7 push → marker with dropped_count=7
+        // (fresh count, NOT 5+7=12 stale-accumulated, NOT 0
+        // missed-reset).
+        for i in 0..(MAX_STORED_EVENTS + 7) {
+            bridge.capture(&format!("second_{i:05}"));
+        }
+        let second = bridge.drain_events();
+        match second.last().expect("non-empty second drain") {
+            SnapshotBridgeEvent::EventLogTruncated { dropped_count } => {
+                assert_eq!(
+                    *dropped_count, 7,
+                    "second batch dropped 7 from a clean post-reset counter"
+                );
+            }
+            other => panic!("expected EventLogTruncated tail in second drain, got {other:?}"),
+        }
+    }
+
+    /// `events_dropped` resets to 0 after every `drain_events` call —
+    /// a subsequent drain with no over-cap pushes in between must NOT
+    /// re-emit a stale truncation marker. Push to overflow, drain
+    /// (consuming the marker), push within-cap, drain again — the
+    /// second drain must NOT include EventLogTruncated.
+    #[test]
+    fn snapshot_bridge_events_dropped_resets_after_drain() {
+        let bridge = SnapshotBridge::new(std::sync::Arc::new(|_name| None));
+        for i in 0..(MAX_STORED_EVENTS + 3) {
+            bridge.capture(&format!("over_{i:05}"));
+        }
+        let first = bridge.drain_events();
+        assert!(matches!(
+            first.last(),
+            Some(SnapshotBridgeEvent::EventLogTruncated { dropped_count: 3 })
+        ));
+        // Second drain immediately — events log is empty, dropped
+        // counter reset. Must be empty, NOT carry a stale truncation
+        // marker.
+        let second = bridge.drain_events();
+        assert!(
+            second.is_empty(),
+            "second drain must NOT re-emit EventLogTruncated — dropped counter reset to 0 after first drain"
+        );
+        // Push 3 events that fit under the cap. Drain — no
+        // truncation marker because nothing was dropped this batch.
+        for i in 0..3 {
+            bridge.capture(&format!("clean_{i:05}"));
+        }
+        let third = bridge.drain_events();
+        assert_eq!(third.len(), 3, "3 captures, no truncation marker");
+        assert!(third.iter().all(|e| !matches!(
+            e,
+            SnapshotBridgeEvent::EventLogTruncated { .. }
+        )));
     }
 }
