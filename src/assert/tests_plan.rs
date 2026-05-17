@@ -74,7 +74,7 @@ fn plan_custom_gap_threshold_produces_stuck_kind() {
     let r = plan.assert_cgroup(&reports, None, None);
     assert!(!r.passed);
     assert!(
-        r.details.iter().any(|d| d.kind == DetailKind::Stuck),
+        r.details.iter().any(|d| matches!(d.kind, DetailKind::Stuck)),
         "custom gap override must produce a Stuck-kind detail: {:?}",
         r.details
     );
@@ -105,17 +105,17 @@ fn plan_permissive_overrides_clear_unfair_and_stuck_preserve_starved() {
     plan.max_gap_ms = Some(5000);
     let r = plan.assert_cgroup(&reports, None, None);
     assert!(
-        r.details.iter().any(|d| d.kind == DetailKind::Starved),
+        r.details.iter().any(|d| matches!(d.kind, DetailKind::Starved)),
         "starved detail must survive permissive overrides: {:?}",
         r.details
     );
     assert!(
-        !r.details.iter().any(|d| d.kind == DetailKind::Unfair),
+        !r.details.iter().any(|d| matches!(d.kind, DetailKind::Unfair)),
         "unfair detail must be cleared by permissive spread: {:?}",
         r.details
     );
     assert!(
-        !r.details.iter().any(|d| d.kind == DetailKind::Stuck),
+        !r.details.iter().any(|d| matches!(d.kind, DetailKind::Stuck)),
         "stuck detail must be cleared by permissive gap: {:?}",
         r.details
     );

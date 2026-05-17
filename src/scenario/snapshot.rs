@@ -4418,29 +4418,20 @@ mod tests {
     // -------------------------------------------------------------
 
     fn task_enrichment_fixture(pid: i32, comm: &str) -> TaskEnrichment {
+        // TaskEnrichment derives Default with all zero/empty fields;
+        // override only the identity fields the lookup tests pin
+        // (and weight/prio/static/normal_prio for the round-trip
+        // pin further below — defaults are 0, lookup tests assert
+        // non-default values).
         TaskEnrichment {
             pid,
             tgid: pid,
             comm: comm.to_string(),
-            group_leader_pid: None,
-            real_parent_pid: None,
-            real_parent_comm: None,
-            pgid: None,
-            sid: None,
-            nr_threads: None,
             weight: 100,
             prio: 120,
             static_prio: 120,
             normal_prio: 120,
-            rt_priority: 0,
-            sched_class: None,
-            core_cookie: None,
-            pi_boosted_out_of_scx: false,
-            nvcsw: 0,
-            nivcsw: 0,
-            signal_nvcsw: None,
-            signal_nivcsw: None,
-            lock_slowpath_match: None,
+            ..Default::default()
         }
     }
 
@@ -4686,18 +4677,12 @@ mod tests {
     ) -> FailureDumpMap {
         FailureDumpMap {
             name: name.into(),
-            map_type: 0,
-            value_size: 0,
-            max_entries: 0,
-            value: None,
-            entries: Vec::new(),
-            percpu_entries: Vec::new(),
-            percpu_hash_entries: Vec::new(),
             arena,
             ringbuf,
             stack_trace,
             fd_array,
             error,
+            ..Default::default()
         }
     }
 

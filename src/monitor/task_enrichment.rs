@@ -197,7 +197,7 @@ impl LockSlowpathRegistry {
 /// CONFIG_SCHED_CORE) and "unreadable at this freeze instant" (e.g.
 /// `real_parent_pid` when the parent task_struct's slab page didn't
 /// translate).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct TaskEnrichment {
     /// `task_struct.pid`. The kernel's per-task identifier.

@@ -151,7 +151,7 @@ fn any_of_chooses_passing_branch() {
     assert!(
         r.details
             .iter()
-            .any(|d| d.kind == DetailKind::Note
+            .any(|d| matches!(d.kind, DetailKind::Note)
                 && d.message.contains("any_of: branch 1 satisfied")),
         "chosen-branch annotation missing: {:?}",
         r.details,

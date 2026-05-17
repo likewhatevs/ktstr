@@ -204,7 +204,7 @@ impl BpfArenaOffsets {
 }
 
 /// One mapped arena page captured from guest memory.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ArenaPage {
     /// User-side virtual address (32-bit window starting at

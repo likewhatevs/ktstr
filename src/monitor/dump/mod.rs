@@ -1507,7 +1507,7 @@ impl FailureDumpReportAny {
 /// maps (HASH) populate `entries`; per-CPU maps populate
 /// `percpu_entries`. Exactly one of these is non-empty for a
 /// successful render; on failure `error` is set and the rest empty.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct FailureDumpMap {
     /// Map name as registered with the kernel. Truncated to
@@ -1589,7 +1589,7 @@ pub struct FailureDumpMap {
 ///
 /// Read via [`crate::monitor::btf_offsets::BpfRingbufOffsets`]; rendered
 /// in [`render_ringbuf_state`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct FailureDumpRingbuf {
     /// Ring data area capacity in bytes (= `mask + 1`). Always a
@@ -1624,7 +1624,7 @@ pub struct FailureDumpRingbuf {
 /// (build-id stacks render the raw bytes hex since the per-entry
 /// shape is `struct bpf_stack_build_id`, not a u64). The dump caps
 /// per-bucket entries at [`MAX_STACK_TRACE_PCS`] to bound memory.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct FailureDumpStackTrace {
     /// `bpf_stack_map.n_buckets` — the rounded-up power-of-two slot
@@ -1640,7 +1640,7 @@ pub struct FailureDumpStackTrace {
 }
 
 /// One populated stack trace from a STACK_TRACE map.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct FailureDumpStackTraceEntry {
     /// Bucket id (= stack ID returned by `bpf_get_stackid`).
@@ -1666,7 +1666,7 @@ pub struct FailureDumpStackTraceEntry {
 /// struct file *, etc.). The dump path reads up to
 /// [`MAX_FD_ARRAY_SLOTS`] slots, counts non-zero, and lists the
 /// populated indices.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct FailureDumpFdArray {
     /// Number of populated (non-zero) slots seen.
@@ -1690,7 +1690,7 @@ pub struct FailureDumpFdArray {
 /// One (key, value) pair from a hash map. Both sides are rendered via
 /// BTF when key/value type ids are available; a `None` rendering
 /// preserves the raw bytes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct FailureDumpEntry {
     /// Rendered key. `None` when no BTF type is available for the key.
@@ -1725,7 +1725,7 @@ pub struct FailureDumpEntry {
 
 /// One key from a per-CPU array, with one rendered value per CPU
 /// (None for CPUs whose per-CPU page was unmapped or out-of-range).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct FailureDumpPercpuEntry {
     pub key: u32,
@@ -1736,7 +1736,7 @@ pub struct FailureDumpPercpuEntry {
 /// rendered value per CPU. Mirrors [`FailureDumpEntry`] for the key
 /// side (rendered + hex) and [`FailureDumpPercpuEntry`] for the
 /// per-CPU value vector.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct FailureDumpPercpuHashEntry {
     /// Rendered key. `None` when no BTF type is available for the key.

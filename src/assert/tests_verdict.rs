@@ -417,13 +417,13 @@ fn verdict_per_claim_kind_override_routes_to_detail() {
     let bench = r
         .details
         .iter()
-        .find(|d| d.kind == DetailKind::Benchmark)
+        .find(|d| matches!(d.kind, DetailKind::Benchmark))
         .expect("Benchmark kind must propagate");
     assert!(bench.message.contains("p99"));
     let loc = r
         .details
         .iter()
-        .find(|d| d.kind == DetailKind::PageLocality)
+        .find(|d| matches!(d.kind, DetailKind::PageLocality))
         .expect("PageLocality kind must propagate");
     assert!(loc.message.contains("locality"));
 }
@@ -447,8 +447,8 @@ fn verdict_merge_folds_in_external_assert_result() {
     let r = v.into_result();
     assert!(!r.passed);
     assert_eq!(r.details.len(), 2);
-    assert!(r.details.iter().any(|d| d.kind == DetailKind::Starved));
-    assert!(r.details.iter().any(|d| d.kind == DetailKind::Other));
+    assert!(r.details.iter().any(|d| matches!(d.kind, DetailKind::Starved)));
+    assert!(r.details.iter().any(|d| matches!(d.kind, DetailKind::Other)));
 }
 
 #[test]
@@ -592,7 +592,7 @@ fn verdict_skip_marks_skipped_without_failing() {
     assert!(
         r.details
             .iter()
-            .any(|d| { d.kind == DetailKind::Skip && d.message.contains("topology missing") })
+            .any(|d| matches!(d.kind, DetailKind::Skip) && d.message.contains("topology missing"))
     );
 }
 
@@ -625,7 +625,7 @@ fn verdict_skip_preserves_prior_failure() {
     assert!(
         r.details
             .iter()
-            .any(|d| d.kind == DetailKind::Skip && d.message.contains("precondition missing")),
+            .any(|d| matches!(d.kind, DetailKind::Skip) && d.message.contains("precondition missing")),
         "skip reason must be recorded: {:?}",
         r.details,
     );
