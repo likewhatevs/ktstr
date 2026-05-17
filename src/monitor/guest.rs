@@ -531,11 +531,83 @@ impl GuestKernel {
         Ok(buf)
     }
 
+    /// Write a u32 to a kernel text/data/bss symbol.
+    ///
+    /// Translates via the runtime kernel image base
+    /// ([`Self::start_kernel_map`]) + KASLR `phys_base`, identical to
+    /// [`Self::read_symbol_u32`]'s translation path. Returns `Err`
+    /// when `name` does not resolve in the vmlinux symbol table.
+    ///
+    /// **Atomicity**: single 4-byte store, atomic when the resolved
+    /// host PA is 4-byte aligned. Kernel symbols are ABI-aligned by
+    /// the compiler (`u32` lands on a 4-byte boundary), so this
+    /// always holds for valid symbol writes. Misaligned PAs fall
+    /// through to a per-byte volatile loop in
+    /// [`super::reader::GuestMem::write_u32`] — torn intermediate
+    /// state is observable to concurrent guest readers in that case.
+    pub fn write_symbol_u32(&self, name: &str, val: u32) -> Result<()> {
+        let kva = self.require_symbol(name)?;
+        let pa = self.text_kva_to_pa(kva);
+        self.mem.write_u32(pa, 0, val);
+        Ok(())
+    }
+
     /// Write a u64 to a kernel text/data/bss symbol.
+    ///
+    /// Translates via the runtime kernel image base
+    /// ([`Self::start_kernel_map`]) + KASLR `phys_base`, identical to
+    /// [`Self::read_symbol_u64`]'s translation path. Returns `Err`
+    /// when `name` does not resolve in the vmlinux symbol table.
+    ///
+    /// **Atomicity**: single 8-byte store, atomic when the resolved
+    /// host PA is 8-byte aligned. Kernel `u64` symbols are
+    /// ABI-aligned. See [`Self::write_symbol_u32`] for the
+    /// misalignment fall-through note.
     pub fn write_symbol_u64(&self, name: &str, val: u64) -> Result<()> {
         let kva = self.require_symbol(name)?;
         let pa = self.text_kva_to_pa(kva);
         self.mem.write_u64(pa, 0, val);
+        Ok(())
+    }
+
+    /// Write bytes to a kernel text/data/bss symbol.
+    ///
+    /// Mirrors [`Self::read_symbol_bytes`]. Bytes are written
+    /// non-atomically via [`super::reader::GuestMem::write_bytes_at`].
+    /// Returns `Err` when `name` does not resolve, OR when the
+    /// underlying byte copy returns short (the symbol's PA crosses
+    /// a `MemRegion` boundary or end-of-DRAM) — the latter signals
+    /// a stripped or malformed vmlinux symbol; valid kernel symbols
+    /// land in contiguous DRAM-resident regions and never trigger
+    /// the short-write path.
+    ///
+    /// **Ordering**: emits [`std::sync::atomic::Ordering::Release`]
+    /// after a successful write. On x86 (TSO) this compiles to no
+    /// barrier instruction; on aarch64 it lowers to `DMB ISHST`,
+    /// pushing the stores into the inner-shareable coherency
+    /// domain so a guest `smp_load_acquire` after this returns
+    /// observes the bytes in write order. This does NOT make the
+    /// multi-byte write atomic with respect to a concurrent guest
+    /// reader: for single-word atomicity use
+    /// [`Self::write_symbol_u32`] / [`Self::write_symbol_u64`].
+    ///
+    /// **Partial-state on `Err`**: if the short-write path fires,
+    /// bytes from the prefix have already landed in guest memory
+    /// and the Release fence is NOT issued. This call cannot
+    /// roll back; callers that need atomicity must hold the freeze
+    /// rendezvous (paused vCPUs) before issuing the write.
+    pub fn write_symbol_bytes(&self, name: &str, data: &[u8]) -> Result<()> {
+        let kva = self.require_symbol(name)?;
+        let pa = self.text_kva_to_pa(kva);
+        let n = self.mem.write_bytes_at(pa, 0, data);
+        if n != data.len() {
+            anyhow::bail!(
+                "write_symbol_bytes('{name}'): short write {n}/{} bytes — \
+                 symbol PA crosses MemRegion boundary or end-of-DRAM",
+                data.len()
+            );
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -563,6 +635,60 @@ impl GuestKernel {
         let mut buf = vec![0u8; len];
         self.mem.read_bytes(pa, &mut buf);
         buf
+    }
+
+    /// Write a u32 to a direct-mapped kernel virtual address.
+    ///
+    /// Mirrors [`Self::read_direct_u32`]: translates via
+    /// `kva - PAGE_OFFSET`. Infallible. For per-CPU bases the caller
+    /// must add `__per_cpu_offset[cpu]` to the base symbol KVA before
+    /// calling — this method is the low-level write primitive, not a
+    /// per-CPU resolver.
+    ///
+    /// **Atomicity**: see [`Self::write_symbol_u32`] for the
+    /// alignment-conditional atomicity contract. Per-CPU runqueue
+    /// fields are ABI-aligned; raw-KVA writes are caller-responsible
+    /// for alignment.
+    pub fn write_direct_u32(&self, kva: u64, val: u32) {
+        let pa = kva_to_pa(kva, self.page_offset);
+        self.mem.write_u32(pa, 0, val);
+    }
+
+    /// Write a u64 to a direct-mapped kernel virtual address. See
+    /// [`Self::write_direct_u32`] for the per-CPU resolution caveat
+    /// and [`Self::write_symbol_u32`] for the alignment-conditional
+    /// atomicity contract.
+    pub fn write_direct_u64(&self, kva: u64, val: u64) {
+        let pa = kva_to_pa(kva, self.page_offset);
+        self.mem.write_u64(pa, 0, val);
+    }
+
+    /// Write bytes to a direct-mapped kernel virtual address.
+    ///
+    /// Mirrors [`Self::read_direct_bytes`]: infallible. The
+    /// underlying [`super::reader::GuestMem::write_bytes_at`] clamps
+    /// to the `MemRegion` containing the resolved PA; if the range
+    /// crosses a region boundary the tail is silently dropped. This
+    /// matches the read counterpart, which silently zero-tails the
+    /// equivalent short-read case. Direct-map kernel writes (per-CPU
+    /// fields, SLAB slots) live in a single region by construction;
+    /// cross-region writes only occur on pathological inputs.
+    ///
+    /// **Ordering**: emits [`std::sync::atomic::Ordering::Release`]
+    /// after the copy. See [`Self::write_symbol_bytes`] for the
+    /// ordering-vs-atomicity rationale.
+    ///
+    /// **Partial-state**: even when the full range writes, the
+    /// stores happen non-atomically; concurrent guest readers can
+    /// observe torn intermediate state. The Release fence orders
+    /// the stores but does NOT atomicize the write. For
+    /// observable-atomicity callers must either pause vCPUs at the
+    /// freeze rendezvous or use [`Self::write_direct_u32`] /
+    /// [`Self::write_direct_u64`] for single-word writes.
+    pub fn write_direct_bytes(&self, kva: u64, data: &[u8]) {
+        let pa = kva_to_pa(kva, self.page_offset);
+        self.mem.write_bytes_at(pa, 0, data);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
     }
 
     // ---------------------------------------------------------------
@@ -724,6 +850,92 @@ impl GuestKernel {
             consumed += chunk_len;
         }
         Some(buf)
+    }
+
+    /// Write a u32 to a vmalloc'd kernel virtual address.
+    ///
+    /// Mirrors [`Self::read_kva_u32`]: translates via page table
+    /// walk. Returns `None` if the page is unmapped.
+    ///
+    /// **Atomicity**: see [`Self::write_symbol_u32`] — atomic only
+    /// when the resolved host PA is 4-byte aligned; misaligned PAs
+    /// degrade to a per-byte volatile loop.
+    pub fn write_kva_u32(&self, kva: u64, val: u32) -> Option<()> {
+        let pa = self.translate_kva_cached(kva)?;
+        self.mem.write_u32(pa, 0, val);
+        Some(())
+    }
+
+    /// Write a u64 to a vmalloc'd kernel virtual address.
+    ///
+    /// Mirrors [`Self::read_kva_u64`]: translates via page table
+    /// walk. Returns `None` if the page is unmapped.
+    ///
+    /// **Atomicity**: see [`Self::write_symbol_u32`] — atomic only
+    /// when the resolved host PA is 8-byte aligned.
+    pub fn write_kva_u64(&self, kva: u64, val: u64) -> Option<()> {
+        let pa = self.translate_kva_cached(kva)?;
+        self.mem.write_u64(pa, 0, val);
+        Some(())
+    }
+
+    /// Write bytes to a vmalloc'd kernel virtual address range,
+    /// chunking at page boundaries via the shared
+    /// [`super::kva_io::chunked_kva_io`] helper.
+    ///
+    /// Pays one [`super::reader::GuestMem::translate_kva`] call plus
+    /// one bulk [`super::reader::GuestMem::write_bytes_at`] per 4 KiB
+    /// page rather than per byte. Mirrors
+    /// [`Self::read_kva_bytes_chunked`]'s page-walking shape with the
+    /// write side of the same primitives.
+    ///
+    /// Returns `None` when any page in the requested range fails to
+    /// translate **or** when a chunk's bulk write returns fewer bytes
+    /// than the chunk's expected length (DRAM end before the chunk
+    /// completes); the all-or-nothing contract lets callers treat any
+    /// `Some(())` return as a fully-applied write.
+    ///
+    /// **Partial-state on `None`**: chunks that translated and wrote
+    /// successfully BEFORE the failure ARE applied to guest memory;
+    /// only the failing chunk and subsequent chunks are skipped. The
+    /// Release fence is NOT issued on the failure path, so on weakly-
+    /// ordered guests the partial prefix may be observed out-of-order
+    /// relative to surrounding stores. For atomicity callers must
+    /// hold the freeze rendezvous (paused vCPUs); the method itself
+    /// cannot roll back partial writes.
+    ///
+    /// **Ordering**: emits [`std::sync::atomic::Ordering::Release`]
+    /// after a fully-successful write — see
+    /// [`Self::write_symbol_bytes`] for the ordering-vs-atomicity
+    /// rationale (the fence orders the stores, but does NOT make the
+    /// multi-byte write atomic with respect to a concurrent guest
+    /// reader).
+    ///
+    /// **u64-wrap invariant**: inherits the
+    /// [`super::kva_io::chunked_kva_io`] caller invariant —
+    /// `kva.checked_add(data.len() as u64).is_some()`. Safe-by-
+    /// construction for any KernelSymbols-derived KVA (kernel KVAs
+    /// live well below u64::MAX); raw-KVA callers must check if they
+    /// target addresses near the top of the address space.
+    pub fn write_kva_bytes_chunked(&self, kva: u64, data: &[u8]) -> Option<()> {
+        let mut bytes_written: usize = 0;
+        let ok = super::kva_io::chunked_kva_io(
+            |kva| self.translate_kva_cached(kva),
+            kva,
+            data.len(),
+            |pa, src_off, chunk_len| {
+                let src_off = src_off as usize;
+                let n = self
+                    .mem
+                    .write_bytes_at(pa, 0, &data[src_off..src_off + chunk_len]);
+                bytes_written = bytes_written.saturating_add(n);
+            },
+        );
+        if !ok || bytes_written != data.len() {
+            return None;
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        Some(())
     }
 
     // ---------------------------------------------------------------

@@ -820,11 +820,9 @@ impl GuestMem {
     }
 
     /// Write a u32 at DRAM offset `pa + offset`. Production callers
-    /// retired with the snapshot-doorbell TLV migration; preserved for
-    /// the `write_scalar::<4>` boundary tests below and external test
-    /// fixtures (`bpf_map`, `dump`) that splice u32 fields into mock
-    /// guest memory.
-    #[allow(dead_code)]
+    /// today: `GuestKernel::write_symbol_u32` / `write_direct_u32` /
+    /// `write_kva_u32` in `super::guest`, plus the bpf_map / dump
+    /// test fixtures that splice u32 fields into mock guest memory.
     pub fn write_u32(&self, pa: u64, offset: usize, val: u32) {
         self.write_scalar::<4>(pa, offset, val.to_ne_bytes());
     }
