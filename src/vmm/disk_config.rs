@@ -917,7 +917,14 @@ mod tests {
         );
 
         // Whole-struct equality first — catches any field drift.
-        assert_eq!(parsed, original);
+        // `name` is stripped because it's `#[serde(skip)]` (see the
+        // dedicated assert at the bottom of this fn) and always
+        // round-trips to `None` regardless of original.
+        let original_for_eq = DiskConfig {
+            name: None,
+            ..original.clone()
+        };
+        assert_eq!(parsed, original_for_eq);
         // Field-by-field follow-up — each line catches a distinct
         // drift mode on its own (rename, skip, type-narrowing).
         assert_eq!(parsed.capacity_mib, original.capacity_mib);
