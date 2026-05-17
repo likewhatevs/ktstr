@@ -1155,16 +1155,8 @@ impl<'a> Snapshot<'a> {
     /// - `sdt_allocations`, `scx_static_ranges` — SDT allocator and
     ///   scx static memory layout snapshots used by the arena /
     ///   pointer-renderer pipelines.
-    /// - `*_unavailable` diagnostic reason strings
-    ///   ([`FailureDumpReport::scx_walker_unavailable`],
-    ///   [`FailureDumpReport::task_enrichments_unavailable`],
-    ///   [`FailureDumpReport::prog_runtime_stats_unavailable`],
-    ///   [`FailureDumpReport::per_node_numa_unavailable`],
-    ///   [`FailureDumpReport::sdt_alloc_unavailable`]) —
-    ///   companion fields to the typed accessors above.
-    /// - `schema`, `is_placeholder` — wire-format / capture-status
-    ///   metadata ([`Self::is_placeholder`] already wraps the
-    ///   boolean).
+    /// - `schema` — wire-format metadata
+    ///   ([`Self::is_placeholder`] already wraps the boolean form).
     ///
     /// All other fields documented as escape-only on
     /// [`FailureDumpReport`] above now have first-class accessors on
@@ -1173,6 +1165,20 @@ impl<'a> Snapshot<'a> {
     /// `per_node_numa`, `task_enrichments`, `prog_runtime_stats`,
     /// `probe_counters`) and on [`SnapshotMap`] (`ringbuf`,
     /// `arena`, `fd_array`, `stack_trace`, `map_error`).
+    ///
+    /// Five `*_unavailable` diagnostic accessors cover the subset of
+    /// walker-backed fields the dump pipeline writes a reason string
+    /// for: [`Self::scx_walker_unavailable`] (shared by
+    /// rq_scx_states / dsq_states / scx_sched_state — the scx
+    /// walker writes one reason for the whole group),
+    /// [`Self::task_enrichments_unavailable`],
+    /// [`Self::prog_runtime_stats_unavailable`],
+    /// [`Self::per_node_numa_unavailable`], and
+    /// [`Self::sdt_alloc_unavailable`] (for the still-escape-only
+    /// `sdt_allocations` field above). The remaining accessors
+    /// (`event_counter_timeline`, `per_cpu_time`, `probe_counters`)
+    /// have no companion diagnostic — empty / None is their only
+    /// "no capture" signal.
     ///
     /// **Caveats of the bypass:**
     /// - No [`SnapshotError`] routing — call-site is on its own to
@@ -1429,6 +1435,58 @@ impl<'a> Snapshot<'a> {
     /// `tp_btf/sched_ext_exit` handler fired during the run.
     pub fn probe_counters(&self) -> Option<&'a ProbeBssCounters> {
         self.report.probe_counters.as_ref()
+    }
+
+    // -----------------------------------------------------------------
+    // Companion `*_unavailable` diagnostic accessors. Each accessor
+    // pairs with the walker-backed slice/option accessor above:
+    // when the slice is empty (or the option is None), the matching
+    // `*_unavailable()` returns `Some(reason)` if the walker
+    // recorded one. `None` from the unavailable accessor means
+    // either the walker ran normally (slice populated) or the field
+    // is simply absent from the wire format (no reason recorded).
+    // -----------------------------------------------------------------
+
+    /// Diagnostic reason recorded when [`Self::rq_scx_states`] /
+    /// [`Self::dsq_states`] / [`Self::scx_sched_state`] could not
+    /// be populated. `None` when the walker fully succeeded;
+    /// otherwise `Some(reason)` (e.g. `"scx_root null"`,
+    /// `"no scx walker"`, or a partial-degradation string from the
+    /// dump pipeline).
+    pub fn scx_walker_unavailable(&self) -> Option<&'a str> {
+        self.report.scx_walker_unavailable.as_deref()
+    }
+
+    /// Diagnostic reason recorded when [`Self::task_enrichments`]
+    /// could not be populated. `None` when the walker yielded at
+    /// least one enrichment; otherwise `Some(reason)`
+    /// (e.g. `"no task walker available"`,
+    /// `"task walker yielded zero tasks"`).
+    pub fn task_enrichments_unavailable(&self) -> Option<&'a str> {
+        self.report.task_enrichments_unavailable.as_deref()
+    }
+
+    /// Diagnostic reason recorded when [`Self::prog_runtime_stats`]
+    /// could not be populated. `None` when the walker yielded at
+    /// least one program; otherwise `Some(reason)`
+    /// (e.g. `"prog accessor unavailable"`,
+    /// `"no struct_ops programs loaded"`).
+    pub fn prog_runtime_stats_unavailable(&self) -> Option<&'a str> {
+        self.report.prog_runtime_stats_unavailable.as_deref()
+    }
+
+    /// Diagnostic reason recorded when [`Self::per_node_numa`]
+    /// could not be populated — typically `"no NUMA walker"` until
+    /// the host-side walker lands.
+    pub fn per_node_numa_unavailable(&self) -> Option<&'a str> {
+        self.report.per_node_numa_unavailable.as_deref()
+    }
+
+    /// Diagnostic reason recorded when the SDT allocator snapshot
+    /// (still escape-only via [`Self::report`]) could not be
+    /// populated.
+    pub fn sdt_alloc_unavailable(&self) -> Option<&'a str> {
+        self.report.sdt_alloc_unavailable.as_deref()
     }
 }
 
@@ -4797,5 +4855,189 @@ mod tests {
             snap.map("err_m").unwrap().map_error(),
             Some("BTF offset unresolved")
         );
+    }
+
+    // -------------------------------------------------------------
+    // `*_unavailable` companion accessors — pin against the
+    // matching `Option<String>` field on FailureDumpReport. Each
+    // accessor returns `None` for the default report and
+    // `Some(&str)` after the walker writes a reason.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn snapshot_unavailable_accessors_thread_option() {
+        let r_absent = FailureDumpReport::default();
+        let s = Snapshot::new(&r_absent);
+        assert!(s.scx_walker_unavailable().is_none());
+        assert!(s.task_enrichments_unavailable().is_none());
+        assert!(s.prog_runtime_stats_unavailable().is_none());
+        assert!(s.per_node_numa_unavailable().is_none());
+        assert!(s.sdt_alloc_unavailable().is_none());
+
+        let r_present = FailureDumpReport {
+            scx_walker_unavailable: Some("scx_root unset".into()),
+            task_enrichments_unavailable: Some("no task walker available".into()),
+            prog_runtime_stats_unavailable: Some("prog accessor unavailable".into()),
+            per_node_numa_unavailable: Some("no NUMA walker".into()),
+            sdt_alloc_unavailable: Some("sdt symbol absent".into()),
+            ..Default::default()
+        };
+        let s = Snapshot::new(&r_present);
+        assert_eq!(s.scx_walker_unavailable(), Some("scx_root unset"));
+        assert_eq!(
+            s.task_enrichments_unavailable(),
+            Some("no task walker available")
+        );
+        assert_eq!(
+            s.prog_runtime_stats_unavailable(),
+            Some("prog accessor unavailable")
+        );
+        assert_eq!(s.per_node_numa_unavailable(), Some("no NUMA walker"));
+        assert_eq!(s.sdt_alloc_unavailable(), Some("sdt symbol absent"));
+    }
+
+    // -------------------------------------------------------------
+    // Serde round-trip pin for the 13 new accessor target types.
+    // Populates a FailureDumpReport with one entry per accessor,
+    // serializes to JSON, deserializes back, and hits every new
+    // accessor to assert field-level values match. Pins the wire
+    // format against silent `#[serde(skip)]` regressions on any
+    // of the underlying structs.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn snapshot_accessor_targets_round_trip_through_serde_json() {
+        let original = FailureDumpReport {
+            event_counter_timeline: vec![EventCounterSample {
+                elapsed_ms: 42,
+                select_cpu_fallback: 7,
+                ..Default::default()
+            }],
+            rq_scx_states: vec![crate::monitor::scx_walker::RqScxState {
+                cpu: 5,
+                ..Default::default()
+            }],
+            dsq_states: vec![crate::monitor::scx_walker::DsqState {
+                nr: 9,
+                ..Default::default()
+            }],
+            scx_sched_state: Some(crate::monitor::scx_walker::ScxSchedState {
+                exit_kind: 3,
+                ..Default::default()
+            }),
+            per_cpu_time: vec![PerCpuTimeStats {
+                cpu: 3,
+                cpustat_user_ns: 9_999,
+                ..Default::default()
+            }],
+            per_node_numa: vec![PerNodeNumaStats {
+                node: 1,
+                numa_hit: 12_345,
+                ..Default::default()
+            }],
+            task_enrichments: vec![task_enrichment_fixture(101, "rt-test")],
+            prog_runtime_stats: vec![ProgRuntimeStats {
+                name: "dispatch".into(),
+                cnt: 50,
+                nsecs: 12_500,
+                misses: 2,
+            }],
+            probe_counters: Some(ProbeBssCounters {
+                trigger_count: 17,
+                ..Default::default()
+            }),
+            maps: vec![FailureDumpMap {
+                name: "shape_map".into(),
+                map_type: 0,
+                value_size: 0,
+                max_entries: 0,
+                value: None,
+                entries: Vec::new(),
+                percpu_entries: Vec::new(),
+                percpu_hash_entries: Vec::new(),
+                arena: Some(ArenaSnapshot {
+                    declared_pages: 256,
+                    ..Default::default()
+                }),
+                ringbuf: Some(FailureDumpRingbuf {
+                    capacity: 8192,
+                    consumer_pos: 50,
+                    producer_pos: 700,
+                    pending_pos: 100,
+                    pending_bytes: 650,
+                }),
+                stack_trace: Some(FailureDumpStackTrace {
+                    n_buckets: 16,
+                    entries: Vec::new(),
+                    truncated: true,
+                }),
+                fd_array: Some(FailureDumpFdArray {
+                    populated: 2,
+                    scanned: 4,
+                    indices: vec![1, 3],
+                    truncated: false,
+                    indices_truncated: false,
+                }),
+                error: Some("decode failed".to_string()),
+            }],
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&original).expect("serialize");
+        let round_tripped: FailureDumpReport =
+            serde_json::from_str(&json).expect("deserialize");
+        let snap = Snapshot::new(&round_tripped);
+
+        assert_eq!(snap.event_counter_timeline().len(), 1);
+        assert_eq!(snap.event_counter_timeline()[0].elapsed_ms, 42);
+        assert_eq!(snap.event_counter_timeline()[0].select_cpu_fallback, 7);
+
+        assert_eq!(snap.rq_scx_states().len(), 1);
+        assert_eq!(snap.rq_scx_states()[0].cpu, 5);
+        assert_eq!(snap.dsq_states().len(), 1);
+        assert_eq!(snap.dsq_states()[0].nr, 9);
+        let sched = snap.scx_sched_state().expect("scx_sched_state");
+        assert_eq!(sched.exit_kind, 3);
+
+        assert_eq!(snap.per_cpu_time().len(), 1);
+        let cpu_row = snap.per_cpu_time_at(3).expect("cpu 3 row");
+        assert_eq!(cpu_row.cpustat_user_ns, 9_999);
+
+        assert_eq!(snap.per_node_numa().len(), 1);
+        let numa_row = snap.per_node_numa_at(1).expect("node 1 row");
+        assert_eq!(numa_row.numa_hit, 12_345);
+
+        assert_eq!(snap.task_enrichments().len(), 1);
+        let task = snap.task_enrichment_by_pid(101).expect("pid 101");
+        assert_eq!(task.comm, "rt-test");
+        // Fixture defaults pin non-pid/comm fields too — verifies
+        // they survive serde without #[serde(skip)] regressions.
+        assert_eq!(task.weight, 100);
+        assert_eq!(task.prio, 120);
+
+        assert_eq!(snap.prog_runtime_stats().len(), 1);
+        let prog = snap
+            .prog_runtime_stats_by_name("dispatch")
+            .expect("dispatch prog");
+        assert_eq!(prog.cnt, 50);
+        assert_eq!(prog.nsecs, 12_500);
+        assert_eq!(prog.misses, 2);
+
+        let probe = snap.probe_counters().expect("probe_counters");
+        assert_eq!(probe.trigger_count, 17);
+
+        let map = snap.map("shape_map").expect("map present");
+        let rb = map.ringbuf().expect("ringbuf");
+        assert_eq!(rb.capacity, 8192);
+        assert_eq!(rb.pending_bytes, 650);
+        let arena = map.arena().expect("arena");
+        assert_eq!(arena.declared_pages, 256);
+        let fda = map.fd_array().expect("fd_array");
+        assert_eq!(fda.populated, 2);
+        assert_eq!(fda.indices, vec![1, 3]);
+        let st = map.stack_trace().expect("stack_trace");
+        assert_eq!(st.n_buckets, 16);
+        assert!(st.truncated);
+        assert_eq!(map.map_error(), Some("decode failed"));
     }
 }
