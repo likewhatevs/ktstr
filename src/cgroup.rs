@@ -1994,8 +1994,20 @@ mod tests {
     /// verbose to discourage that rewrite. The same convention
     /// applies to direct [`make_inline_tempdir`] callers.
     ///
-    /// `dir` is the same path as a `PathBuf` for test bodies that
-    /// use `dir.join(...)` to build target file paths.
+    /// The second tuple element is the tempdir root path (a
+    /// `PathBuf`) for test bodies that use `dir.join("cg_x").join(...)`
+    /// to build target file paths.
+    ///
+    /// See [`make_test_cgroup_with_procs`] for tests that need an
+    /// empty `cgroup.procs` pre-seeded, or
+    /// [`make_test_cgroup_with_seeded_file`] for tests that need a
+    /// specific knob file (e.g. `cpu.max`) pre-seeded. Note that
+    /// those helpers return the same `(TempDir, PathBuf, CgroupManager)`
+    /// shape but the second element's SEMANTIC differs: this helper
+    /// returns the tempdir root, `_with_procs` returns the `cg_x`
+    /// subdir, `_with_seeded_file` returns the seeded file path.
+    /// Rename the binding (`dir` / `inner` / `target`) to match
+    /// when migrating between helpers.
     fn make_test_cgroup(label: &str) -> (tempfile::TempDir, PathBuf, CgroupManager) {
         let tmp = make_inline_tempdir(&format!("cg-{label}"));
         let dir = tmp.path().to_path_buf();
@@ -2004,38 +2016,68 @@ mod tests {
         (tmp, dir, cg)
     }
 
+    /// Like [`make_test_cgroup`] but additionally pre-creates an
+    /// empty `cgroup.procs` file inside the `cg_x` subdir. The
+    /// second tuple element is the `cg_x` subdir path (NOT the
+    /// tempdir root and NOT a file path — distinct from the second
+    /// tuple element returned by [`make_test_cgroup`] and
+    /// [`make_test_cgroup_with_seeded_file`]) so callers can
+    /// `inner.join("FILE.name")` against it directly without
+    /// re-deriving the path from the tempdir.
+    ///
+    /// See [`make_test_cgroup_with_seeded_file`] when the test needs
+    /// a specific knob file pre-seeded instead of `cgroup.procs`.
+    fn make_test_cgroup_with_procs(label: &str) -> (tempfile::TempDir, PathBuf, CgroupManager) {
+        let (tmp, dir, cg) = make_test_cgroup(label);
+        let inner = dir.join("cg_x");
+        fs::write(inner.join("cgroup.procs"), "").unwrap();
+        (tmp, inner, cg)
+    }
+
+    /// Like [`make_test_cgroup`] but additionally pre-creates an
+    /// empty file named `filename` inside the `cg_x` subdir. The
+    /// second tuple element is the seeded file path (NOT the
+    /// tempdir root and NOT the `cg_x` subdir — distinct from the
+    /// second tuple element returned by [`make_test_cgroup`] and
+    /// [`make_test_cgroup_with_procs`]) so callers can
+    /// `fs::read_to_string(&target)` it directly without re-joining.
+    ///
+    /// See [`make_test_cgroup_with_procs`] when the test needs
+    /// `cgroup.procs` pre-seeded instead of a specific knob file.
+    fn make_test_cgroup_with_seeded_file(
+        label: &str,
+        filename: &str,
+    ) -> (tempfile::TempDir, PathBuf, CgroupManager) {
+        let (tmp, dir, cg) = make_test_cgroup(label);
+        let target = dir.join("cg_x").join(filename);
+        fs::write(&target, "").unwrap();
+        (tmp, target, cg)
+    }
+
     #[test]
     fn set_cpu_max_writes_quota_and_period_when_some() {
-        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("cpu-max-some");
-        let target = dir.join("cg_x").join("cpu.max");
-        fs::write(&target, "").unwrap();
+        let (_tempdir_keep_alive, target, cg) = make_test_cgroup_with_seeded_file("cpu-max-some", "cpu.max");
         cg.set_cpu_max("cg_x", Some(50_000), 100_000).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "50000 100000");
     }
 
     #[test]
     fn set_cpu_max_writes_max_keyword_when_none() {
-        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("cpu-max-none");
-        let target = dir.join("cg_x").join("cpu.max");
-        fs::write(&target, "").unwrap();
+        let (_tempdir_keep_alive, target, cg) = make_test_cgroup_with_seeded_file("cpu-max-none", "cpu.max");
         cg.set_cpu_max("cg_x", None, 100_000).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "max 100000");
     }
 
     #[test]
     fn set_cpu_weight_writes_decimal_value() {
-        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("cpu-weight");
-        let target = dir.join("cg_x").join("cpu.weight");
-        fs::write(&target, "").unwrap();
+        let (_tempdir_keep_alive, target, cg) = make_test_cgroup_with_seeded_file("cpu-weight", "cpu.weight");
         cg.set_cpu_weight("cg_x", 250).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "250");
     }
 
     #[test]
     fn set_memory_max_writes_bytes_or_max_keyword() {
-        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("mem-max");
-        let target = dir.join("cg_x").join("memory.max");
-        fs::write(&target, "").unwrap();
+        let (_tempdir_keep_alive, target, cg) = make_test_cgroup_with_seeded_file("mem-max", "memory.max");
         cg.set_memory_max("cg_x", Some(1_048_576)).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "1048576");
         cg.set_memory_max("cg_x", None).unwrap();
@@ -2044,9 +2086,7 @@ mod tests {
 
     #[test]
     fn set_memory_high_writes_bytes_or_max_keyword() {
-        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("mem-high");
-        let target = dir.join("cg_x").join("memory.high");
-        fs::write(&target, "").unwrap();
+        let (_tempdir_keep_alive, target, cg) = make_test_cgroup_with_seeded_file("mem-high", "memory.high");
         cg.set_memory_high("cg_x", Some(524_288)).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "524288");
         cg.set_memory_high("cg_x", None).unwrap();
@@ -2058,9 +2098,7 @@ mod tests {
     /// `memory.low`. Pin both the bytes-set and the cleared paths.
     #[test]
     fn set_memory_low_writes_bytes_or_zero() {
-        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("mem-low");
-        let target = dir.join("cg_x").join("memory.low");
-        fs::write(&target, "").unwrap();
+        let (_tempdir_keep_alive, target, cg) = make_test_cgroup_with_seeded_file("mem-low", "memory.low");
         cg.set_memory_low("cg_x", Some(2_048)).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "2048");
         cg.set_memory_low("cg_x", None).unwrap();
@@ -2069,9 +2107,7 @@ mod tests {
 
     #[test]
     fn set_io_weight_writes_decimal_value() {
-        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("io-weight");
-        let target = dir.join("cg_x").join("io.weight");
-        fs::write(&target, "").unwrap();
+        let (_tempdir_keep_alive, target, cg) = make_test_cgroup_with_seeded_file("io-weight", "io.weight");
         cg.set_io_weight("cg_x", 500).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "500");
     }
@@ -2082,9 +2118,7 @@ mod tests {
     /// or "frozen" would surface as a syscall failure on real cgroupfs.
     #[test]
     fn set_freeze_writes_zero_or_one() {
-        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("freeze");
-        let target = dir.join("cg_x").join("cgroup.freeze");
-        fs::write(&target, "").unwrap();
+        let (_tempdir_keep_alive, target, cg) = make_test_cgroup_with_seeded_file("freeze", "cgroup.freeze");
         cg.set_freeze("cg_x", true).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "1");
         cg.set_freeze("cg_x", false).unwrap();
@@ -2097,9 +2131,7 @@ mod tests {
     /// `pids_max_write`.
     #[test]
     fn set_pids_max_writes_decimal_or_max_keyword() {
-        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("pids-max");
-        let target = dir.join("cg_x").join("pids.max");
-        fs::write(&target, "").unwrap();
+        let (_tempdir_keep_alive, target, cg) = make_test_cgroup_with_seeded_file("pids-max", "pids.max");
         cg.set_pids_max("cg_x", Some(1024)).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "1024");
         cg.set_pids_max("cg_x", None).unwrap();
@@ -2111,9 +2143,7 @@ mod tests {
     /// `page_counter_memparse` recognises in `swap_max_write`.
     #[test]
     fn set_memory_swap_max_writes_bytes_or_max_keyword() {
-        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("mem-swap-max");
-        let target = dir.join("cg_x").join("memory.swap.max");
-        fs::write(&target, "").unwrap();
+        let (_tempdir_keep_alive, target, cg) = make_test_cgroup_with_seeded_file("mem-swap-max", "memory.swap.max");
         cg.set_memory_swap_max("cg_x", Some(2 * 1024 * 1024))
             .unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "2097152");
@@ -2265,9 +2295,7 @@ mod tests {
     /// case is checked here.
     #[test]
     fn set_freeze_is_idempotent_when_already_in_target_state() {
-        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("freeze-idem");
-        let target = dir.join("cg_x").join("cgroup.freeze");
-        fs::write(&target, "").unwrap();
+        let (_tempdir_keep_alive, target, cg) = make_test_cgroup_with_seeded_file("freeze-idem", "cgroup.freeze");
         cg.set_freeze("cg_x", true).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "1");
         // Second freeze: no error, file content unchanged.
@@ -2290,9 +2318,7 @@ mod tests {
     /// u32 (which would silently saturate).
     #[test]
     fn set_pids_max_writes_u64_max_verbatim() {
-        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("pids-overflow");
-        let target = dir.join("cg_x").join("pids.max");
-        fs::write(&target, "").unwrap();
+        let (_tempdir_keep_alive, target, cg) = make_test_cgroup_with_seeded_file("pids-overflow", "pids.max");
         cg.set_pids_max("cg_x", Some(u64::MAX)).unwrap();
         assert_eq!(
             fs::read_to_string(&target).unwrap(),
@@ -2305,9 +2331,7 @@ mod tests {
     /// boundary check. Catches the same narrowing-regression class.
     #[test]
     fn set_memory_swap_max_writes_u64_max_verbatim() {
-        let (_tempdir_keep_alive, dir, cg) = make_test_cgroup("swap-overflow");
-        let target = dir.join("cg_x").join("memory.swap.max");
-        fs::write(&target, "").unwrap();
+        let (_tempdir_keep_alive, target, cg) = make_test_cgroup_with_seeded_file("swap-overflow", "memory.swap.max");
         cg.set_memory_swap_max("cg_x", Some(u64::MAX)).unwrap();
         assert_eq!(
             fs::read_to_string(&target).unwrap(),
@@ -2546,16 +2570,11 @@ mod tests {
     /// under test, not the rmdir success.
     #[test]
     fn remove_cgroup_auto_unfreezes_before_drain() {
-        let _tempdir_keep_alive = make_inline_tempdir("cg-autounf");
-        let dir = _tempdir_keep_alive.path();
-        let inner = dir.join("cg_x");
-        fs::create_dir_all(&inner).unwrap();
-        // Pre-create the freeze + procs files. Seed `cgroup.freeze`
-        // with "1" so the test can observe the unfreeze write.
+        let (_tempdir_keep_alive, inner, cg) = make_test_cgroup_with_procs("autounf");
+        // Seed `cgroup.freeze` with "1" so the test can observe
+        // the unfreeze write.
         let freeze_path = inner.join("cgroup.freeze");
         fs::write(&freeze_path, "1").unwrap();
-        fs::write(inner.join("cgroup.procs"), "").unwrap();
-        let cg = CgroupManager::new(dir.to_str().unwrap());
         // The rmdir at the end fails on tmpfs because cgroup.freeze
         // / cgroup.procs are leftover non-cgroupfs files; we don't
         // care — the assertion is on the freeze-file content.
@@ -2576,14 +2595,9 @@ mod tests {
     /// missing freeze file.
     #[test]
     fn remove_cgroup_tolerates_missing_freeze_file() {
-        let _tempdir_keep_alive = make_inline_tempdir("cg-nofrz");
-        let dir = _tempdir_keep_alive.path();
-        let inner = dir.join("cg_x");
-        fs::create_dir_all(&inner).unwrap();
-        // Deliberately omit cgroup.freeze. Provide cgroup.procs so
-        // drain_tasks finds something to read.
-        fs::write(inner.join("cgroup.procs"), "").unwrap();
-        let cg = CgroupManager::new(dir.to_str().unwrap());
+        // Helper pre-creates cgroup.procs (drain_tasks needs it).
+        // Deliberately omit cgroup.freeze.
+        let (_tempdir_keep_alive, _inner, cg) = make_test_cgroup_with_procs("nofrz");
         // The rmdir at the end fails on tmpfs (cgroup.procs left
         // over) — we only care that no error propagates from the
         // pre-drain unfreeze branch. The test would catch a
@@ -2643,16 +2657,10 @@ mod tests {
     /// rises monotonically as failures accumulate.
     #[test]
     fn remove_cgroup_increments_outstanding_on_failure() {
-        let _tempdir_keep_alive = make_inline_tempdir("cg-outstanding");
-        let dir = _tempdir_keep_alive.path();
-        let inner = dir.join("cg_x");
-        fs::create_dir_all(&inner).unwrap();
-        // Seed cgroup.procs so drain_tasks succeeds; rmdir will then
-        // fail on tmpfs because cgroup.procs (a regular file the
-        // test created) is still inside the directory and tmpfs
-        // does not auto-unlink children.
-        fs::write(inner.join("cgroup.procs"), "").unwrap();
-        let cg = CgroupManager::new(dir.to_str().unwrap());
+        // Helper pre-creates cgroup.procs (drain_tasks needs it;
+        // rmdir then fails on tmpfs because cgroup.procs is a
+        // regular file tmpfs won't auto-unlink).
+        let (_tempdir_keep_alive, inner, cg) = make_test_cgroup_with_procs("outstanding");
         assert_eq!(cg.outstanding_removes(), 0);
         // First call: rmdir fails with ENOTEMPTY → counter goes to 1.
         let _ = cg.remove_cgroup("cg_x");
@@ -2793,18 +2801,13 @@ mod tests {
     /// `cgroup.procs` without bailing.
     #[test]
     fn move_task_admits_when_cpus_set_and_effective_mems_non_empty() {
-        let _tempdir_keep_alive = make_inline_tempdir("cg-cpuset-ok");
-        let dir = _tempdir_keep_alive.path();
-        let inner = dir.join("cg_x");
-        fs::create_dir_all(&inner).unwrap();
+        // Helper pre-creates cgroup.procs so the underlying
+        // tmpfs write succeeds (not a real cgroupfs, so the write
+        // just appends to a regular file — the assertion is that
+        // the gate did NOT bail).
+        let (_tempdir_keep_alive, inner, cg) = make_test_cgroup_with_procs("cpuset-ok");
         fs::write(inner.join("cpuset.cpus"), "0-1").unwrap();
         fs::write(inner.join("cpuset.mems.effective"), "0").unwrap();
-        let cg = CgroupManager::new(dir.to_str().unwrap());
-        // Pre-create cgroup.procs so the underlying write succeeds
-        // on tmpfs (not a real cgroupfs, so the write just appends
-        // to a regular file, but that's fine — the assertion is
-        // that the gate did NOT bail).
-        fs::write(inner.join("cgroup.procs"), "").unwrap();
         cg.move_task("cg_x", 1)
             .expect("non-empty effective mems must admit move_task");
     }
@@ -2818,18 +2821,14 @@ mod tests {
     /// to reading the local file fails this test.
     #[test]
     fn move_task_admits_when_local_mems_empty_but_effective_inherited() {
-        let _tempdir_keep_alive = make_inline_tempdir("cg-cpuset-inherit-mems");
-        let dir = _tempdir_keep_alive.path();
-        let inner = dir.join("cg_x");
-        fs::create_dir_all(&inner).unwrap();
+        // Helper pre-creates cgroup.procs.
+        let (_tempdir_keep_alive, inner, cg) = make_test_cgroup_with_procs("cpuset-inherit-mems");
         fs::write(inner.join("cpuset.cpus"), "0-1").unwrap();
         // Local cpuset.mems empty: the v2 default for an inheriting
         // child. The kernel's effective view shows the inherited
         // nodemask "0" — the gate must use the effective view.
         fs::write(inner.join("cpuset.mems"), "").unwrap();
         fs::write(inner.join("cpuset.mems.effective"), "0").unwrap();
-        fs::write(inner.join("cgroup.procs"), "").unwrap();
-        let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.move_task("cg_x", 1)
             .expect("inherited effective mems must admit move_task");
     }
@@ -2841,17 +2840,13 @@ mod tests {
     /// such a cgroup without a local cpus mask.
     #[test]
     fn move_task_admits_when_cpuset_cpus_empty() {
-        let _tempdir_keep_alive = make_inline_tempdir("cg-cpuset-inherit");
-        let dir = _tempdir_keep_alive.path();
-        let inner = dir.join("cg_x");
-        fs::create_dir_all(&inner).unwrap();
+        // Helper pre-creates cgroup.procs.
+        let (_tempdir_keep_alive, inner, cg) = make_test_cgroup_with_procs("cpuset-inherit");
         fs::write(inner.join("cpuset.cpus"), "").unwrap();
         // Whether cpuset.mems.effective is set or not is irrelevant
         // when local cpus is empty — the gate short-circuits before
         // reading the effective file.
         fs::write(inner.join("cpuset.mems.effective"), "").unwrap();
-        fs::write(inner.join("cgroup.procs"), "").unwrap();
-        let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.move_task("cg_x", 1)
             .expect("inherit-cpuset cgroup must admit move_task");
     }
@@ -2862,13 +2857,9 @@ mod tests {
     /// cgroup tree without `+cpuset` in `subtree_control`.
     #[test]
     fn move_task_admits_when_cpuset_files_absent() {
-        let _tempdir_keep_alive = make_inline_tempdir("cg-no-cpuset");
-        let dir = _tempdir_keep_alive.path();
-        let inner = dir.join("cg_x");
-        fs::create_dir_all(&inner).unwrap();
         // Deliberately omit cpuset.cpus / cpuset.mems.effective.
-        fs::write(inner.join("cgroup.procs"), "").unwrap();
-        let cg = CgroupManager::new(dir.to_str().unwrap());
+        // Helper pre-creates cgroup.procs.
+        let (_tempdir_keep_alive, _inner, cg) = make_test_cgroup_with_procs("no-cpuset");
         cg.move_task("cg_x", 1)
             .expect("no-cpuset cgroup must admit move_task");
     }
@@ -2882,15 +2873,11 @@ mod tests {
     /// [`CgroupManager::move_task`].
     #[test]
     fn move_task_admits_when_effective_mems_file_absent() {
-        let _tempdir_keep_alive = make_inline_tempdir("cg-no-effective-mems");
-        let dir = _tempdir_keep_alive.path();
-        let inner = dir.join("cg_x");
-        fs::create_dir_all(&inner).unwrap();
+        // Helper pre-creates cgroup.procs.
+        let (_tempdir_keep_alive, inner, cg) = make_test_cgroup_with_procs("no-effective-mems");
         fs::write(inner.join("cpuset.cpus"), "0-1").unwrap();
         // Deliberately omit cpuset.mems.effective: read fails,
         // gate degrades to accept.
-        fs::write(inner.join("cgroup.procs"), "").unwrap();
-        let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.move_task("cg_x", 1)
             .expect("missing cpuset.mems.effective must admit move_task (read-failure absorb)");
     }
