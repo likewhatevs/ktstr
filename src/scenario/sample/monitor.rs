@@ -57,11 +57,6 @@ impl<'a> MonitorView<'a> {
     }
 }
 
-/// Borrowed view over the `ScxEventDeltas` aggregated across the
-/// monitor's first/last sample window. Returned by
-/// [`MonitorView::scx_events`]; exposes the 14 i64 counter totals
-/// via [`Self::total_pairs`] and the 2 f64 derived rates via
-/// [`Self::rates_pairs`].
 /// Default curated subset of [`ScxEventsView::total_pairs`] counter
 /// names that signal genuine scheduler-class errors when non-zero.
 /// Used to filter the full 14-entry total slice down to the entries
@@ -86,6 +81,11 @@ pub const ERROR_CLASS_NAMES: &[&str] = &[
     "insert_not_owned",
 ];
 
+/// Borrowed view over the `ScxEventDeltas` aggregated across the
+/// monitor's first/last sample window. Returned by
+/// [`MonitorView::scx_events`]; exposes the 14 i64 counter totals
+/// via [`Self::total_pairs`] and the 2 f64 derived rates via
+/// [`Self::rates_pairs`].
 #[derive(Debug, Clone, Copy)]
 #[must_use = "ScxEventsView is a borrowed view; call .total_pairs() or .rates_pairs() to project"]
 #[non_exhaustive]
