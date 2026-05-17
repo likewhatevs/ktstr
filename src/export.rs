@@ -76,6 +76,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -316,15 +317,114 @@ fn config_content_addition(entry: &KtstrTestEntry) -> Result<Option<ConfigExport
         .to_string();
     reject_shell_metacharacters_in_basename(&basename, guest_path)?;
     let hash = content_hash(content);
-    let tmp = std::env::temp_dir().join(format!("ktstr-export-config-{hash:016x}-{basename}"));
-    std::fs::write(&tmp, content)
-        .with_context(|| format!("write inline config_content to {}", tmp.display()))?;
+    // Write to a uniquely-named scratch file inside the process-
+    // owned 0o700 scratch directory, then atomic-rename to the
+    // canonical content-addressed path. See [`scratch_dir`] for
+    // the symlink-defense + leak-bound rationale; the parallel
+    // pattern in `src/test_support/runtime.rs::config_content_parts`
+    // hardens the same attack surface for the in-process test path.
+    let dir = scratch_dir();
+    let canonical = dir.join(format!("ktstr-export-config-{hash:016x}-{basename}"));
+    let mut scratch = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| "create ktstr export-config scratch file")?;
+    scratch
+        .as_file_mut()
+        .write_all(content.as_bytes())
+        .with_context(|| "write inline config_content to scratch")?;
+    scratch.persist(&canonical).with_context(|| {
+        format!(
+            "atomic-rename export-config scratch to {}",
+            canonical.display()
+        )
+    })?;
     let runtime_path = format!("\"$DIR/include/{basename}\"");
     let expanded = arg_template.replace("{file}", &runtime_path);
     Ok(Some(ConfigExportAddition {
-        host_path: tmp,
+        host_path: canonical,
         args_shell_prefix: expanded,
     }))
+}
+
+/// Stable PathBuf for the process-owned export-config scratch
+/// directory. Populated once by [`scratch_dir`] on first access.
+/// See the parallel `SCRATCH_PATH` in
+/// `src/test_support/runtime.rs` for the same rationale —
+/// separate static here because the export tool lives in a
+/// different crate-module boundary and shares no init path with
+/// the test-support runtime.
+static SCRATCH_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Process-owned scratch directory for export-time inline-config
+/// tempfile writes. Sibling of
+/// `src/test_support/runtime.rs::scratch_dir` (#247) — same
+/// security and leak-bound model applied to the export path's
+/// content-addressed tempfile naming.
+///
+/// Created lazily on first access via `tempfile::Builder` with
+/// explicit `0o700` mode. The directory is a random-suffixed
+/// subdirectory of `std::env::temp_dir()`, owned by the current
+/// uid. Two properties matter:
+///
+/// 1. **Symlink defense.** /tmp is sticky-bit world-writable, so
+///    an attacker can pre-plant a symlink at the predictable
+///    `ktstr-export-config-{hash:016x}-{basename}` path and have
+///    us write to wherever it points. A per-process 0o700
+///    subdirectory blocks every cross-uid access mode (read, list,
+///    write, traverse); only our process can create or replace
+///    files inside it, which eliminates the symlink-attack surface
+///    for the export-tempfile-write path.
+/// 2. **Leak bound.** Rust does NOT run `Drop` impls on values
+///    stored in `static` slots at process exit. Instead, the path
+///    is registered with `libc::atexit` so a clean exit triggers
+///    [`std::fs::remove_dir_all`] on the directory. Crash, abort,
+///    SIGKILL, or panic-`abort` skip the atexit handler and leak
+///    the directory; the residual is bounded by the number of
+///    such ungraceful exits and the directory contents are
+///    text-sized config files. The tempdir's random suffix
+///    prevents collisions across runs.
+fn scratch_dir() -> &'static Path {
+    SCRATCH_PATH
+        .get_or_init(|| {
+            let td = tempfile::Builder::new()
+                .prefix("ktstr-export-config-")
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .expect("create ktstr export-config scratch directory");
+            // `keep()` consumes the TempDir without running its
+            // Drop's cleanup (flips the cleanup flag, returns the
+            // bare PathBuf we own). The atexit registration below
+            // takes over cleanup responsibility.
+            let path = td.keep();
+            // SAFETY: `cleanup_scratch_dir` has the required
+            // `extern "C" fn()` signature that `libc::atexit`
+            // accepts. The `unsafe` block here is required because
+            // `libc::atexit` itself is an `unsafe extern "C"` FFI
+            // call (the callback signature itself is plain
+            // `extern "C" fn()`, not `unsafe`). Registering more
+            // than once is the caller's responsibility;
+            // `OnceLock::get_or_init` guarantees this runs exactly
+            // once per process.
+            let rc = unsafe { libc::atexit(cleanup_scratch_dir) };
+            assert_eq!(
+                rc, 0,
+                "libc::atexit registration for ktstr export-config scratch dir failed"
+            );
+            path
+        })
+        .as_path()
+}
+
+/// Process-exit handler registered via `libc::atexit` by
+/// [`scratch_dir`] on first init. Removes the scratch directory
+/// and every export-config file inside it. Errors are ignored —
+/// by the time this runs the process is exiting and there is
+/// nowhere to surface a failure (no `eprintln!` ordering
+/// guarantees from inside an atexit handler, and panicking would
+/// be unsound across the C ABI boundary).
+extern "C" fn cleanup_scratch_dir() {
+    if let Some(path) = SCRATCH_PATH.get() {
+        let _ = std::fs::remove_dir_all(path);
+    }
 }
 
 /// Reject basenames containing shell-metacharacters that would
@@ -1744,6 +1844,168 @@ mod tests {
              where basename is derived from the scheduler's config_file_def guest_path, \
              with NO leading space (the caller manages spacing); got: {:?}",
             addition.args_shell_prefix
+        );
+    }
+
+    /// Pin the load-bearing security property of the
+    /// [`scratch_dir`]-based atomic-rename pattern: the host_path
+    /// produced by `config_content_addition` lives INSIDE the
+    /// process-owned 0o700 scratch directory, never bare
+    /// `std::env::temp_dir()`. A regression that reverts to the
+    /// pre-#258 `std::env::temp_dir().join(...)` would silently
+    /// restore the symlink-attack surface this batch closed —
+    /// every other functional assertion in this file's tests
+    /// would still pass. This test is the dedicated guard against
+    /// that revert path.
+    #[test]
+    fn config_content_addition_writes_inside_process_scratch_dir() {
+        use crate::test_support::{Scheduler, SchedulerSpec};
+        static SCHED_SCRATCH_DIR_PIN: Scheduler = Scheduler {
+            name: "scratch_dir_pin",
+            binary: SchedulerSpec::Discover("scratch_dir_pin_bin"),
+            sysctls: &[],
+            kargs: &[],
+            assert: crate::assert::Assert::NO_OVERRIDES,
+            cgroup_parent: None,
+            sched_args: &[],
+            topology: crate::vmm::topology::Topology {
+                llcs: 1,
+                cores_per_llc: 1,
+                threads_per_core: 1,
+                numa_nodes: 1,
+                nodes: None,
+                distances: None,
+            },
+            constraints: TopologyConstraints::DEFAULT,
+            config_file: None,
+            config_file_def: Some(("--config={file}", "/include-files/dirpin.json")),
+            kernels: &[],
+        };
+        let entry = KtstrTestEntry {
+            name: "scratch_dir_pin_smoke",
+            scheduler: &SCHED_SCRATCH_DIR_PIN,
+            config_content: Some("{\"pin\": true}\n"),
+            ..KtstrTestEntry::DEFAULT
+        };
+        let addition = config_content_addition(&entry)
+            .expect("config_content_addition must not error")
+            .expect("config_content + config_file_def set must yield Some");
+        let dir = scratch_dir();
+        assert!(
+            addition.host_path.starts_with(dir),
+            "host_path {} must live inside the process scratch_dir {} — a regression \
+             to bare std::env::temp_dir() would silently restore the symlink-attack \
+             surface this test guards against",
+            addition.host_path.display(),
+            dir.display(),
+        );
+    }
+
+    /// Pin the content-addressed naming idempotence: calling
+    /// `config_content_addition` twice with the same
+    /// `config_content` produces the same canonical host_path.
+    /// Verifies the atomic-rename collision-handling described in
+    /// the production-code comment plus the content-hash filename
+    /// template `ktstr-export-config-{hash:016x}-{basename}`.
+    #[test]
+    fn config_content_addition_same_content_same_canonical_path() {
+        use crate::test_support::{Scheduler, SchedulerSpec};
+        static SCHED_IDEMPOTENT: Scheduler = Scheduler {
+            name: "idempotent_pin",
+            binary: SchedulerSpec::Discover("idempotent_pin_bin"),
+            sysctls: &[],
+            kargs: &[],
+            assert: crate::assert::Assert::NO_OVERRIDES,
+            cgroup_parent: None,
+            sched_args: &[],
+            topology: crate::vmm::topology::Topology {
+                llcs: 1,
+                cores_per_llc: 1,
+                threads_per_core: 1,
+                numa_nodes: 1,
+                nodes: None,
+                distances: None,
+            },
+            constraints: TopologyConstraints::DEFAULT,
+            config_file: None,
+            config_file_def: Some(("--config={file}", "/include-files/idem.json")),
+            kernels: &[],
+        };
+        const CONTENT: &str = "{\"idem\": 42}\n";
+        let entry = KtstrTestEntry {
+            name: "idempotent_pin_smoke",
+            scheduler: &SCHED_IDEMPOTENT,
+            config_content: Some(CONTENT),
+            ..KtstrTestEntry::DEFAULT
+        };
+        let a = config_content_addition(&entry).unwrap().unwrap();
+        let b = config_content_addition(&entry).unwrap().unwrap();
+        assert_eq!(
+            a.host_path, b.host_path,
+            "same content must produce same canonical host_path; got {} vs {}",
+            a.host_path.display(),
+            b.host_path.display(),
+        );
+        let basename = a
+            .host_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("host_path must have a UTF-8 basename");
+        assert!(
+            basename.starts_with("ktstr-export-config-") && basename.ends_with("idem.json"),
+            "basename must match the `ktstr-export-config-{{hash:016x}}-<basename>` \
+             template (with the scheduler's config_file_def basename suffix); got {basename}",
+        );
+    }
+
+    /// Pin the L318 `reject_shell_metacharacters_in_basename`
+    /// gate on the inline-content path. Parallel to the existing
+    /// `config_file_addition_rejects_basename_with_shell_metacharacters`
+    /// test for the config_file path — the metacharacter rejection
+    /// must fire BEFORE any scratch-file write touches the disk.
+    #[test]
+    fn config_content_addition_rejects_basename_with_shell_metacharacters() {
+        use crate::test_support::{Scheduler, SchedulerSpec};
+        static SCHED_METACHAR: Scheduler = Scheduler {
+            name: "metachar_pin",
+            binary: SchedulerSpec::Discover("metachar_pin_bin"),
+            sysctls: &[],
+            kargs: &[],
+            assert: crate::assert::Assert::NO_OVERRIDES,
+            cgroup_parent: None,
+            sched_args: &[],
+            topology: crate::vmm::topology::Topology {
+                llcs: 1,
+                cores_per_llc: 1,
+                threads_per_core: 1,
+                numa_nodes: 1,
+                nodes: None,
+                distances: None,
+            },
+            constraints: TopologyConstraints::DEFAULT,
+            config_file: None,
+            // Basename "$evil.json" derives from this guest_path —
+            // `$` is a shell-metacharacter that would expand
+            // unpredictably in the args_shell_prefix's double-quoted
+            // context. The metacharacter check at the top of
+            // config_content_addition must reject it before any
+            // scratch write fires.
+            config_file_def: Some(("--config={file}", "/include-files/$evil.json")),
+            kernels: &[],
+        };
+        let entry = KtstrTestEntry {
+            name: "metachar_pin_smoke",
+            scheduler: &SCHED_METACHAR,
+            config_content: Some("ignored\n"),
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = config_content_addition(&entry)
+            .expect_err("basename with shell metacharacter must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("shell-metacharacter") && msg.contains('$'),
+            "rejection diagnostic must name the failure mode and the offending \
+             character; got {msg}",
         );
     }
 
