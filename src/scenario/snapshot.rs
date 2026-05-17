@@ -247,10 +247,11 @@ pub enum SnapshotError {
     /// ellipsis to keep the failure message readable for wide struct
     /// keys.
     ///
-    /// `max_by` only produces this variant for empty maps (a
-    /// populated map always has a maximum), so its NoMatch always
-    /// carries `len == 0` and an empty `available_keys`. Only `find`
-    /// can produce `len > 0` here.
+    /// Aggregation methods (`max_by`, `cpu_max_u64` / `cpu_min_u64`
+    /// / `cpu_max_f64` / `cpu_min_f64`) produce this variant for
+    /// empty / all-None inputs; their NoMatch always carries
+    /// `len == 0` and empty `available_keys`. Only `find` can
+    /// produce `len > 0` here.
     NoMatch {
         map: String,
         op: String,
@@ -1946,6 +1947,188 @@ impl<'a> SnapshotEntry<'a> {
                 requested: path.to_string(),
             }),
             SnapshotEntry::Missing(err) => SnapshotField::Missing(err.clone()),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Per-CPU aggregators. Apply only to `Percpu` / `PercpuHash`
+    // entries; other variants return `Err(TypeMismatch)`. Inside the
+    // per_cpu vec, slots whose value is `None` (CPU unmapped / out of
+    // range — see `read_percpu_array_value` semantics) skip the
+    // aggregation; slots whose rendered value can't decode to the
+    // requested scalar return `Err(TypeMismatch)` immediately.
+    //
+    // `cpu_sum_*` returns `0` when no slot contributes (empty sum
+    // identity). `cpu_max_*` / `cpu_min_*` return `Err(NoMatch)`
+    // when no slot contributes (max / min of empty set has no
+    // meaningful answer).
+    // -----------------------------------------------------------------
+
+    /// Sum the per-CPU values at `path` as `u64`. Returns `0` when
+    /// every slot is `None` (no slot contributed). A slot whose
+    /// rendered value cannot decode to `u64` propagates an Err
+    /// immediately and stops the aggregation.
+    pub fn cpu_sum_u64(&self, path: &str) -> SnapshotResult<u64> {
+        let mut acc: u64 = 0;
+        self.try_for_each_cpu_value(path, |v| {
+            acc = acc.saturating_add(SnapshotField::Value(v).as_u64()?);
+            Ok(())
+        })?;
+        Ok(acc)
+    }
+
+    /// Maximum of per-CPU values at `path` as `u64`. Returns
+    /// `Err(NoMatch)` when every slot is `None` (no slot contributed).
+    /// A slot whose rendered value cannot decode to `u64` propagates
+    /// an Err immediately.
+    pub fn cpu_max_u64(&self, path: &str) -> SnapshotResult<u64> {
+        let mut best: Option<u64> = None;
+        self.try_for_each_cpu_value(path, |v| {
+            let n = SnapshotField::Value(v).as_u64()?;
+            best = Some(best.map_or(n, |b| b.max(n)));
+            Ok(())
+        })?;
+        best.ok_or_else(|| self.empty_aggregate_error("cpu_max_u64"))
+    }
+
+    /// Minimum of per-CPU values at `path` as `u64`. Returns
+    /// `Err(NoMatch)` when every slot is `None`. A slot whose
+    /// rendered value cannot decode to `u64` propagates an Err
+    /// immediately.
+    pub fn cpu_min_u64(&self, path: &str) -> SnapshotResult<u64> {
+        let mut best: Option<u64> = None;
+        self.try_for_each_cpu_value(path, |v| {
+            let n = SnapshotField::Value(v).as_u64()?;
+            best = Some(best.map_or(n, |b| b.min(n)));
+            Ok(())
+        })?;
+        best.ok_or_else(|| self.empty_aggregate_error("cpu_min_u64"))
+    }
+
+    /// Sum the per-CPU values at `path` as `f64`. Returns `0.0`
+    /// when every slot is `None`. A slot whose rendered value
+    /// cannot decode to `f64` propagates an Err immediately. NaN
+    /// slot values propagate through `+=` per IEEE-754 — a single
+    /// NaN slot makes the result NaN.
+    pub fn cpu_sum_f64(&self, path: &str) -> SnapshotResult<f64> {
+        let mut acc: f64 = 0.0;
+        self.try_for_each_cpu_value(path, |v| {
+            acc += SnapshotField::Value(v).as_f64()?;
+            Ok(())
+        })?;
+        Ok(acc)
+    }
+
+    /// Maximum of per-CPU values at `path` as `f64`. Returns
+    /// `Err(NoMatch)` when every slot is `None`. A slot whose
+    /// rendered value cannot decode to `f64` propagates an Err
+    /// immediately. NaN slot values are filtered out per
+    /// `f64::max` semantics — `f64::max(NaN, x)` returns `x`, so a
+    /// NaN slot never wins against a non-NaN slot. An all-NaN run
+    /// is an edge case: the first NaN slot sets `best=NaN`, then
+    /// subsequent `NaN.max(NaN)` returns NaN, so the final result
+    /// is `Ok(NaN)` rather than NoMatch.
+    pub fn cpu_max_f64(&self, path: &str) -> SnapshotResult<f64> {
+        let mut best: Option<f64> = None;
+        self.try_for_each_cpu_value(path, |v| {
+            let n = SnapshotField::Value(v).as_f64()?;
+            best = Some(best.map_or(n, |b| b.max(n)));
+            Ok(())
+        })?;
+        best.ok_or_else(|| self.empty_aggregate_error("cpu_max_f64"))
+    }
+
+    /// Minimum of per-CPU values at `path` as `f64`. Returns
+    /// `Err(NoMatch)` when every slot is `None`. A slot whose
+    /// rendered value cannot decode to `f64` propagates an Err
+    /// immediately. NaN slot values are filtered out per
+    /// `f64::min` semantics — `f64::min(NaN, x)` returns `x`, so a
+    /// NaN slot never wins against a non-NaN slot. An all-NaN run
+    /// yields `Ok(NaN)` rather than NoMatch — same edge case as
+    /// `cpu_max_f64`.
+    pub fn cpu_min_f64(&self, path: &str) -> SnapshotResult<f64> {
+        let mut best: Option<f64> = None;
+        self.try_for_each_cpu_value(path, |v| {
+            let n = SnapshotField::Value(v).as_f64()?;
+            best = Some(best.map_or(n, |b| b.min(n)));
+            Ok(())
+        })?;
+        best.ok_or_else(|| self.empty_aggregate_error("cpu_min_f64"))
+    }
+
+    /// Iterate non-None per-CPU rendered values at `path`. For each
+    /// successful slot, invokes `f(cpu_idx, &RenderedValue)`. Slots
+    /// whose value is `None` are skipped silently; the iteration
+    /// stops at the first slot whose value cannot be reached via
+    /// `path` (returning the path-walk error). Returns `Err` for
+    /// non-percpu variants.
+    pub fn cpu_each<F>(&self, path: &str, mut f: F) -> SnapshotResult<()>
+    where
+        F: FnMut(usize, &'a RenderedValue) -> SnapshotResult<()>,
+    {
+        let per_cpu: &[Option<RenderedValue>] = match self {
+            SnapshotEntry::Percpu(e) => &e.per_cpu,
+            SnapshotEntry::PercpuHash(e) => &e.per_cpu,
+            SnapshotEntry::Hash(_) | SnapshotEntry::Value(_) => {
+                return Err(SnapshotError::TypeMismatch {
+                    expected: "Percpu / PercpuHash".to_string(),
+                    actual: self.variant_name().to_string(),
+                    requested: path.to_string(),
+                });
+            }
+            SnapshotEntry::Missing(err) => return Err(err.clone()),
+        };
+        for (cpu_idx, slot) in per_cpu.iter().enumerate() {
+            let Some(rendered) = slot.as_ref() else {
+                continue;
+            };
+            let walked = walk_dotted_path(rendered, path);
+            let value = match walked {
+                SnapshotField::Value(v) => v,
+                SnapshotField::PercpuKey { .. } => {
+                    return Err(SnapshotError::TypeMismatch {
+                        expected: "rendered value".to_string(),
+                        actual: "PercpuKey".to_string(),
+                        requested: path.to_string(),
+                    });
+                }
+                SnapshotField::Missing(err) => return Err(err),
+            };
+            f(cpu_idx, value)?;
+        }
+        Ok(())
+    }
+
+    /// Shared walk helper for `cpu_sum_*` / `cpu_max_*` / `cpu_min_*`
+    /// — invokes `f` on every non-None slot's rendered value.
+    fn try_for_each_cpu_value<F>(&self, path: &str, mut f: F) -> SnapshotResult<()>
+    where
+        F: FnMut(&'a RenderedValue) -> SnapshotResult<()>,
+    {
+        self.cpu_each(path, |_, v| f(v))
+    }
+
+    /// Name for diagnostic messages. Used by the per-CPU aggregator
+    /// `TypeMismatch` paths so the error names the actual variant.
+    fn variant_name(&self) -> &'static str {
+        match self {
+            SnapshotEntry::Hash(_) => "Hash",
+            SnapshotEntry::Percpu(_) => "Percpu",
+            SnapshotEntry::PercpuHash(_) => "PercpuHash",
+            SnapshotEntry::Value(_) => "Value",
+            SnapshotEntry::Missing(_) => "Missing",
+        }
+    }
+
+    /// Build the `NoMatch` error for an empty per-CPU aggregate
+    /// (max / min of all-None or all-decode-fail). `op` names the
+    /// caller so the error message points at the right method.
+    fn empty_aggregate_error(&self, op: &str) -> SnapshotError {
+        SnapshotError::NoMatch {
+            map: format!("<{}>", self.variant_name()),
+            op: op.to_string(),
+            len: 0,
+            available_keys: Vec::new(),
         }
     }
 }
@@ -3684,6 +3867,221 @@ mod tests {
         match f.error().expect("missing") {
             SnapshotError::PerCpuNotNarrowed { .. } => {}
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// The scx_pcpu fixture has per_cpu = [Some(11), Some(22), None,
+    /// Some(44)] (snapshot.rs synthetic_report). Per-CPU aggregators
+    /// skip the None slot at index 2 and sum / max / min the others.
+    #[test]
+    fn snapshot_entry_cpu_sum_u64_skips_none_slots() {
+        let r = synthetic_report();
+        let snap = Snapshot::new(&r);
+        let entry = snap.map("scx_pcpu").unwrap().at(0);
+        assert_eq!(entry.cpu_sum_u64("").unwrap(), 11 + 22 + 44);
+    }
+
+    #[test]
+    fn snapshot_entry_cpu_max_u64_returns_largest_present() {
+        let r = synthetic_report();
+        let snap = Snapshot::new(&r);
+        let entry = snap.map("scx_pcpu").unwrap().at(0);
+        assert_eq!(entry.cpu_max_u64("").unwrap(), 44);
+    }
+
+    #[test]
+    fn snapshot_entry_cpu_min_u64_returns_smallest_present() {
+        let r = synthetic_report();
+        let snap = Snapshot::new(&r);
+        let entry = snap.map("scx_pcpu").unwrap().at(0);
+        assert_eq!(entry.cpu_min_u64("").unwrap(), 11);
+    }
+
+    /// `cpu_max_u64` / `cpu_min_u64` on an all-None per_cpu vec
+    /// return NoMatch — no slot contributes a value, so neither max
+    /// nor min has a meaningful answer.
+    #[test]
+    fn snapshot_entry_cpu_max_min_no_slots_returns_no_match() {
+        let entry_struct = FailureDumpPercpuEntry {
+            key: 0,
+            per_cpu: vec![None, None, None],
+        };
+        let entry = SnapshotEntry::Percpu(&entry_struct);
+        match entry.cpu_max_u64("").expect_err("empty must err") {
+            SnapshotError::NoMatch { op, len, .. } => {
+                assert_eq!(op, "cpu_max_u64");
+                assert_eq!(len, 0);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // cpu_sum_u64 returns 0 for all-None (sum identity); this
+        // pins the asymmetry between sum (always-defined) and
+        // max/min (require >= 1 slot).
+        assert_eq!(entry.cpu_sum_u64("").unwrap(), 0);
+    }
+
+    #[test]
+    fn snapshot_entry_cpu_each_visits_only_present_slots() {
+        let r = synthetic_report();
+        let snap = Snapshot::new(&r);
+        let entry = snap.map("scx_pcpu").unwrap().at(0);
+        let mut visited: Vec<(usize, u64)> = Vec::new();
+        entry
+            .cpu_each("", |cpu, v| {
+                visited.push((cpu, SnapshotField::Value(v).as_u64()?));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(visited, vec![(0, 11), (1, 22), (3, 44)]);
+    }
+
+    /// Non-percpu variants — Hash, Value — produce TypeMismatch.
+    #[test]
+    fn snapshot_entry_cpu_sum_on_non_percpu_variant_errors() {
+        let r = synthetic_report();
+        let snap = Snapshot::new(&r);
+        let bss_entry = snap.map("bpf.bss").unwrap().at(0);
+        // .bss is a Value entry, not Percpu.
+        match bss_entry.cpu_sum_u64("").expect_err("non-percpu must err") {
+            SnapshotError::TypeMismatch {
+                expected, actual, ..
+            } => {
+                assert!(expected.contains("Percpu"));
+                assert_eq!(actual, "Value");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// cpu_min_u64 on all-None must also return NoMatch (sibling
+    /// of the cpu_max_u64 empty case already pinned).
+    #[test]
+    fn snapshot_entry_cpu_min_u64_no_slots_returns_no_match() {
+        let entry_struct = FailureDumpPercpuEntry {
+            key: 0,
+            per_cpu: vec![None, None],
+        };
+        let entry = SnapshotEntry::Percpu(&entry_struct);
+        match entry.cpu_min_u64("").expect_err("empty must err") {
+            SnapshotError::NoMatch { op, len, .. } => {
+                assert_eq!(op, "cpu_min_u64");
+                assert_eq!(len, 0);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    fn percpu_entry_with_floats(per_cpu: Vec<Option<f64>>) -> FailureDumpPercpuEntry {
+        FailureDumpPercpuEntry {
+            key: 0,
+            per_cpu: per_cpu
+                .into_iter()
+                .map(|opt| opt.map(|v| RenderedValue::Float { bits: 64, value: v }))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn snapshot_entry_cpu_sum_f64_skips_none_and_sums() {
+        let e = percpu_entry_with_floats(vec![Some(1.5), Some(2.5), None, Some(3.0)]);
+        let entry = SnapshotEntry::Percpu(&e);
+        let sum = entry.cpu_sum_f64("").unwrap();
+        assert!((sum - 7.0).abs() < f64::EPSILON, "sum was {sum}");
+    }
+
+    #[test]
+    fn snapshot_entry_cpu_max_f64_returns_largest() {
+        let e = percpu_entry_with_floats(vec![Some(1.5), Some(9.25), Some(3.0)]);
+        let entry = SnapshotEntry::Percpu(&e);
+        assert!((entry.cpu_max_f64("").unwrap() - 9.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn snapshot_entry_cpu_min_f64_returns_smallest() {
+        let e = percpu_entry_with_floats(vec![Some(1.5), Some(9.25), Some(3.0)]);
+        let entry = SnapshotEntry::Percpu(&e);
+        assert!((entry.cpu_min_f64("").unwrap() - 1.5).abs() < f64::EPSILON);
+    }
+
+    /// NaN propagates through f64 sum (per IEEE-754 +=) but is
+    /// filtered out by f64::max / f64::min (per Rust stdlib
+    /// `maximumNumber` / `minimumNumber` semantics).
+    #[test]
+    fn snapshot_entry_cpu_f64_aggregators_handle_nan_per_docs() {
+        let e = percpu_entry_with_floats(vec![Some(1.0), Some(f64::NAN), Some(3.0)]);
+        let entry = SnapshotEntry::Percpu(&e);
+        assert!(entry.cpu_sum_f64("").unwrap().is_nan());
+        // f64::max filters NaN — the result is the max of 1.0/3.0.
+        assert!((entry.cpu_max_f64("").unwrap() - 3.0).abs() < f64::EPSILON);
+        // f64::min filters NaN — the result is the min of 1.0/3.0.
+        assert!((entry.cpu_min_f64("").unwrap() - 1.0).abs() < f64::EPSILON);
+    }
+
+    /// Nested path lookup descends into a Struct rendered value.
+    /// Each slot's value is `{count: Uint(N)}` and cpu_sum_u64
+    /// walks "count" to get N.
+    #[test]
+    fn snapshot_entry_cpu_sum_u64_walks_nested_path() {
+        let struct_for = |n: u64| RenderedValue::Struct {
+            type_name: Some("slot".into()),
+            members: vec![RenderedMember {
+                name: "count".into(),
+                value: RenderedValue::Uint { bits: 64, value: n },
+            }],
+        };
+        let e = FailureDumpPercpuEntry {
+            key: 0,
+            per_cpu: vec![Some(struct_for(10)), Some(struct_for(20)), None, Some(struct_for(30))],
+        };
+        let entry = SnapshotEntry::Percpu(&e);
+        assert_eq!(entry.cpu_sum_u64("count").unwrap(), 60);
+    }
+
+    /// The PercpuHash variant takes the same per_cpu walk as
+    /// Percpu (both dispatch through cpu_each's `&e.per_cpu`
+    /// arm). Pin both variant dispatch paths so a refactor that
+    /// drops the PercpuHash arm surfaces as a TypeMismatch error
+    /// the test catches.
+    #[test]
+    fn snapshot_entry_cpu_aggregators_apply_to_percpu_hash_variant() {
+        let e = FailureDumpPercpuHashEntry {
+            key: Some(RenderedValue::Uint { bits: 32, value: 0 }),
+            key_hex: "00000000".into(),
+            per_cpu: vec![
+                Some(RenderedValue::Uint { bits: 64, value: 5 }),
+                Some(RenderedValue::Uint { bits: 64, value: 7 }),
+                None,
+            ],
+        };
+        let entry = SnapshotEntry::PercpuHash(&e);
+        assert_eq!(entry.cpu_sum_u64("").unwrap(), 12);
+        assert_eq!(entry.cpu_max_u64("").unwrap(), 7);
+        assert_eq!(entry.cpu_min_u64("").unwrap(), 5);
+    }
+
+    /// A slot whose rendered value is a Struct (not directly an
+    /// integer) makes the empty-path cpu_sum_u64 fail with
+    /// TypeMismatch — the SnapshotField::Value(v).as_u64() chain
+    /// rejects Struct.
+    #[test]
+    fn snapshot_entry_cpu_sum_u64_struct_slot_errors_with_type_mismatch() {
+        let s = RenderedValue::Struct {
+            type_name: Some("slot".into()),
+            members: vec![RenderedMember {
+                name: "count".into(),
+                value: RenderedValue::Uint { bits: 64, value: 7 },
+            }],
+        };
+        let e = FailureDumpPercpuEntry {
+            key: 0,
+            per_cpu: vec![Some(s)],
+        };
+        let entry = SnapshotEntry::Percpu(&e);
+        match entry.cpu_sum_u64("").expect_err("struct cannot as_u64") {
+            SnapshotError::TypeMismatch { actual, .. } => {
+                assert!(actual.contains("Struct"), "actual was {actual}");
+            }
+            other => panic!("unexpected: {other:?}"),
         }
     }
 
