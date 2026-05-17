@@ -301,8 +301,8 @@ fn scenario_ficlone_clone_writable_and_fresh(_ctx: &ktstr::scenario::Ctx) -> Res
 // Entry registrations
 // ----------------------------------------------------------------------------
 
-#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__private::linkme)]
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_BTRFS_TEMPLATE_BUILD: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "disk_template_e2e_btrfs_template_build",
@@ -317,8 +317,8 @@ static __KTSTR_ENTRY_BTRFS_TEMPLATE_BUILD: ktstr::test_support::KtstrTestEntry =
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
-#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__private::linkme)]
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_FICLONE_CLONE_ISOLATED: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "disk_template_e2e_ficlone_clone_isolated",

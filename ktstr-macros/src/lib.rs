@@ -1824,8 +1824,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         #(#attrs)*
         #vis #inner_sig #block
 
-        #[::ktstr::__private::linkme::distributed_slice(::ktstr::test_support::KTSTR_TESTS)]
-        #[linkme(crate = ::ktstr::__private::linkme)]
+        #[::ktstr::distributed_slice(::ktstr::test_support::KTSTR_TESTS)]
+        #[linkme(crate = ::ktstr::linkme)]
         static #entry_name: ::ktstr::test_support::KtstrTestEntry = ::ktstr::test_support::KtstrTestEntry {
             // Always-emit fields. `name`/`func` are macro-generated;
             // `topology`/`constraints` inherit from the scheduler
@@ -2793,8 +2793,8 @@ fn declare_scheduler_inner(
         // visibility is irrelevant to the slice mechanism. Keeping it
         // private keeps the registry symbol opaque even when the
         // user-facing const is `pub`.
-        #[::ktstr::__private::linkme::distributed_slice(::ktstr::test_support::KTSTR_SCHEDULERS)]
-        #[linkme(crate = ::ktstr::__private::linkme)]
+        #[::ktstr::distributed_slice(::ktstr::test_support::KTSTR_SCHEDULERS)]
+        #[linkme(crate = ::ktstr::linkme)]
         static #registry_ident: &'static ::ktstr::test_support::Scheduler = &#const_name;
     };
 

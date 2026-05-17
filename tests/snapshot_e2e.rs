@@ -381,8 +381,8 @@ fn scenario_snapshot_op_captures_in_vm(
     Ok(result)
 }
 
-#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__private::linkme)]
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_SNAPSHOT_OP_IN_VM: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "snapshot_op_captures_in_vm",
@@ -550,8 +550,8 @@ fn scenario_watch_snapshot_op_captures_exit_state(
     Ok(result)
 }
 
-#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__private::linkme)]
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_WATCH_SNAPSHOT_EXIT: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "watch_snapshot_op_captures_exit_state",

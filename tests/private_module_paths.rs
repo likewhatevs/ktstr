@@ -1,7 +1,7 @@
 //! External-context check for `ktstr::__private::{ctor, serde_json}`.
 //!
 //! The `#[ktstr_test]` proc macro emits a
-//! `#[::ktstr::__private::linkme::distributed_slice(::ktstr::test_support::KTSTR_TESTS)]`
+//! `#[::ktstr::distributed_slice(::ktstr::test_support::KTSTR_TESTS)]`
 //! static of type `KtstrTestEntry` that registers the test in the
 //! `KTSTR_TESTS` distributed slice at link time. The `__private::ctor`
 //! and `__private::serde_json` re-exports are part of the surface

@@ -545,8 +545,8 @@ fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Resul
     Ok(result)
 }
 
-#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__private::linkme)]
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_FAILURE_DUMP_BSS: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "failure_dump_renders_bss_fields",
@@ -804,8 +804,8 @@ fn scenario_failure_dump_renders_capture_modules(
     Ok(result)
 }
 
-#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__private::linkme)]
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_FAILURE_DUMP_CAPTURES: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "failure_dump_renders_capture_modules",
@@ -975,8 +975,8 @@ fn scenario_failure_dump_renders_probe_counters(
     Ok(result)
 }
 
-#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__private::linkme)]
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_FAILURE_DUMP_PROBE_COUNTERS: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "failure_dump_renders_probe_counters",

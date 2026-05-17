@@ -609,15 +609,16 @@ pub use ktstr_macros::ktstr_test;
 /// Internal re-exports for proc-macro-generated code. Not public API.
 ///
 /// Grouped into a single hidden module so that `use ktstr::*;` pulls
-/// in one module name instead of three leading-underscore items.
+/// in one module name instead of two leading-underscore items.
 /// Consumers of `#[ktstr_test]` should not reference anything under
 /// this path — the macro expansion names these crates via
-/// `::ktstr::__private::ctor` / `linkme` / `serde_json` and the set
-/// may change without notice.
+/// `::ktstr::__private::ctor` / `serde_json` and the set may change
+/// without notice. (`linkme` lives at the public crate root —
+/// [`ktstr::linkme`](crate::linkme) — since the macro now emits the
+/// public path.)
 #[doc(hidden)]
 pub mod __private {
     pub use ctor;
-    pub use linkme;
     pub use serde_json;
 }
 

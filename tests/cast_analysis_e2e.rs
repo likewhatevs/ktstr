@@ -579,8 +579,8 @@ fn scenario_cast_analysis_chases_kernel_kptr(ctx: &ktstr::scenario::Ctx) -> Resu
     Ok(result)
 }
 
-#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__private::linkme)]
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_CAST_ANALYSIS_KERNEL_KPTR: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "cast_analysis_chases_kernel_kptr",
@@ -988,8 +988,8 @@ fn scenario_cast_analysis_chases_bss_to_arena(ctx: &ktstr::scenario::Ctx) -> Res
     Ok(result)
 }
 
-#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__private::linkme)]
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_CAST_ANALYSIS_BSS_TO_ARENA: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "cast_analysis_chases_bss_to_arena",
@@ -1490,8 +1490,8 @@ fn scenario_cast_analysis_cross_subprog_arena_chase(
     Ok(result)
 }
 
-#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__private::linkme)]
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_CAST_ANALYSIS_CROSS_SUBPROG: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "cast_analysis_cross_subprog_arena_chase",
@@ -1504,8 +1504,8 @@ static __KTSTR_ENTRY_CAST_ANALYSIS_CROSS_SUBPROG: ktstr::test_support::KtstrTest
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
-#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__private::linkme)]
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_CAST_ANALYSIS_SDT_ALLOC_BRIDGE: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "cast_analysis_sdt_alloc_bridge_resolves_fwd",

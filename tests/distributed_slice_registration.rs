@@ -9,13 +9,15 @@
 //! programmatically populate entries without going through the
 //! macro.
 //!
-//! Manual registration depends on `ktstr::__private::linkme` being
-//! re-exported at the crate root so consumers can spell the
-//! `distributed_slice` attribute. If that re-export disappears or
-//! the path changes, this file fails to compile. At runtime, the
-//! framework's `--list` protocol must surface the manually-registered
-//! entry under its declared name; nextest discovery proves that by
-//! listing the entry below as a runnable test.
+//! Manual registration depends on `ktstr::distributed_slice` and
+//! `ktstr::linkme` being re-exported at the crate root so consumers
+//! can spell the `#[distributed_slice]` attribute and the companion
+//! `#[linkme(crate = ktstr::linkme)]` annotation. If either re-export
+//! disappears or the path changes, this file fails to compile. At
+//! runtime, the framework's `--list` protocol must surface the
+//! manually-registered entry under its declared name; nextest
+//! discovery proves that by listing the entry below as a runnable
+//! test.
 //!
 //! No standalone `#[test]` assertions live here: once a binary holds
 //! any real `#[ktstr_test]` entry, `test_support::ktstr_main`
@@ -33,13 +35,13 @@ fn external_context_test_fn(_ctx: &Ctx) -> Result<AssertResult> {
 }
 
 /// Manual `#[distributed_slice]` registration reachable through
-/// `ktstr::__private::linkme`. If nextest `--list` for this binary
-/// does not emit `ktstr::distributed_slice_registration
-/// ktstr/external_context_marker`, the manual-registration surface
-/// regressed — the macro expansion still works but programmatic
-/// test generation has silently broken.
-#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__private::linkme)]
+/// `ktstr::distributed_slice` and `ktstr::linkme`. If nextest
+/// `--list` for this binary does not emit
+/// `ktstr::distributed_slice_registration ktstr/external_context_marker`,
+/// the manual-registration surface regressed — the macro expansion
+/// still works but programmatic test generation has silently broken.
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
 static EXTERNAL_CONTEXT_MARKER: KtstrTestEntry = KtstrTestEntry {
     name: "external_context_marker",
     func: external_context_test_fn,

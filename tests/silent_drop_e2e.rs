@@ -267,8 +267,8 @@ fn scenario_watchdog_stall_dump_populates_vcpu_regs_and_maps(
     Ok(result)
 }
 
-#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__private::linkme)]
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_SILENT_DROP_WATCHDOG_STALL_CAPTURED_SCHEMA:
     ktstr::test_support::KtstrTestEntry = ktstr::test_support::KtstrTestEntry {
     name: "silent_drop_watchdog_stall_captured_schema",
@@ -281,8 +281,8 @@ static __KTSTR_ENTRY_SILENT_DROP_WATCHDOG_STALL_CAPTURED_SCHEMA:
     ..ktstr::test_support::KtstrTestEntry::DEFAULT
 };
 
-#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__private::linkme)]
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_SILENT_DROP_CLEAN_EXIT_GATE_SUPPRESSION: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "silent_drop_clean_exit_gate_suppression",
@@ -295,8 +295,8 @@ static __KTSTR_ENTRY_SILENT_DROP_CLEAN_EXIT_GATE_SUPPRESSION: ktstr::test_suppor
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
-#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__private::linkme)]
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_SILENT_DROP_WATCHDOG_STALL_CAPTURED_CONTENT:
     ktstr::test_support::KtstrTestEntry = ktstr::test_support::KtstrTestEntry {
     name: "silent_drop_watchdog_stall_captured_content",
@@ -461,8 +461,8 @@ fn scenario_translate_none_with_latch_triggered_emits_dump(
     Ok(result)
 }
 
-#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__private::linkme)]
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_SILENT_DROP_TRANSLATE_NONE_LATCH_IDLE: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "silent_drop_translate_none_with_latch_idle",
@@ -475,8 +475,8 @@ static __KTSTR_ENTRY_SILENT_DROP_TRANSLATE_NONE_LATCH_IDLE: ktstr::test_support:
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
-#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__private::linkme)]
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_SILENT_DROP_TRANSLATE_NONE_LATCH_TRIGGERED:
     ktstr::test_support::KtstrTestEntry = ktstr::test_support::KtstrTestEntry {
     name: "silent_drop_translate_none_with_latch_triggered",

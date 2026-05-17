@@ -1301,7 +1301,6 @@ impl KtstrTestEntry {
     ///
     /// ```
     /// use ktstr::prelude::*;
-    /// use ktstr::test_support::{KTSTR_TESTS, KtstrTestEntry, Scheduler};
     ///
     /// fn my_test_fn(_ctx: &Ctx) -> Result<AssertResult> {
     ///     Ok(AssertResult::pass())
