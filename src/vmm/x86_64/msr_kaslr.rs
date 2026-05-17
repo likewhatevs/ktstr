@@ -79,20 +79,18 @@
 //! rendezvous (an AP that hasn't completed `cpu_init` yet still
 //! holds the KVM-seeded 0). Reading from BSP avoids the race.
 
-// #117 lands this module as the virt-KASLR primitive. Consumers
-// (#31 wire-in, #133, KASLR cluster #108-115) call these helpers
-// from freeze_coord and dump paths. Until those land the items
-// look unused in non-test builds, so suppress dead-code warnings
-// at module scope — the unit tests below DO exercise every fn.
+// Consumers of these helpers (KASLR wire-in into freeze_coord and
+// dump paths) land in follow-up commits. Until those land the
+// virt-KASLR primitive items look unused in non-test builds, so
+// suppress dead-code warnings at module scope — the unit tests
+// below DO exercise every fn.
 #![allow(dead_code)]
 
-use anyhow::{Context, Result, ensure};
-use kvm_bindings::{Msrs, kvm_msr_entry};
+use anyhow::Result;
 use kvm_ioctls::VcpuFd;
 
-/// `MSR_LSTAR` — the long-mode SYSCALL target MSR. Holds the runtime
-/// KVA of `entry_SYSCALL_64` on non-FRED kernels.
-pub(crate) const MSR_LSTAR: u32 = 0xc000_0082;
+use super::msr_indices::MSR_LSTAR;
+use super::msr_io::read_one_msr;
 
 /// KASLR randomization alignment, per `CONFIG_PHYSICAL_ALIGN` default
 /// in `arch/x86/Kconfig`. `find_random_virt_addr` in
@@ -100,18 +98,28 @@ pub(crate) const MSR_LSTAR: u32 = 0xc000_0082;
 /// multiples of this alignment.
 const PHYSICAL_ALIGN: u64 = 2 * 1024 * 1024;
 
-/// Kernel-half canonical address threshold on x86_64. 4-level paging
-/// requires bits 63..47 set; 5-level paging requires bits 63..56 set
-/// (a strict subset that also satisfies the 4-level threshold). The
-/// constant uses the 4-level form because it's conservatively safe
-/// for BOTH paging modes (no 5-level kernel KVA is below it). A
-/// non-zero `MSR_LSTAR` value below this threshold is either a
+/// Kernel-half canonical address threshold for `entry_SYSCALL_64`
+/// KVAs on x86_64. `__START_KERNEL_map = 0xffff_ffff_8000_0000` is
+/// declared unconditionally in `arch/x86/include/asm/page_64_types.h`
+/// — kernel-text anchors at the same base on both 4-level and
+/// 5-level paging. Virt-KASLR picks a slot within `KERNEL_IMAGE_SIZE`
+/// (1 GiB with `CONFIG_RANDOMIZE_BASE`) above that base, so every
+/// valid runtime `entry_SYSCALL_64` KVA falls in
+/// `[0xffff_ffff_8000_0000, 0xffff_ffff_c000_0000)` — well above
+/// this threshold on both paging modes.
+///
+/// A non-zero `MSR_LSTAR` value below this threshold is either a
 /// non-canonical/garbage read or the boot firmware's pre-init value
 /// — not a valid `entry_SYSCALL_64` KVA.
 ///
-/// Future dynamic-threshold work could read `pgtable_l5_enabled`
-/// (already in KernelSymbols) and pick the tighter 5-level form,
-/// but the current conservative form is sound for both paging modes.
+/// **Scope:** this threshold is correct for `entry_SYSCALL_64`-class
+/// KVAs only. Generic kernel-half detection for arbitrary KVAs
+/// (direct-map base `__PAGE_OFFSET_BASE_L5 = 0xff11_0000_0000_0000`
+/// or vmalloc base `__VMALLOC_BASE_L5 = 0xffa0_0000_0000_0000` both
+/// FAIL this threshold and would be wrongly rejected as
+/// non-canonical) needs a paging-aware variant driven by
+/// `KernelSymbols::pgtable_l5_enabled` — that's the canonical-KVA
+/// validity guard's scope, not this module's.
 const KERNEL_HALF_THRESHOLD: u64 = 0xFFFF_8000_0000_0000;
 
 /// Reasons the LSTAR-based virt-KASLR derivation can decline a
@@ -225,45 +233,6 @@ impl LstarDeriveError {
     }
 }
 
-/// Read `MSR_LSTAR` from a single vCPU via `KVM_GET_MSRS`.
-///
-/// Builds a single-entry `Msrs` wrapper, issues the ioctl, and
-/// returns the `data` field of the populated entry. Returns
-/// `Ok(None)` when KVM_GET_MSRS returns 0 entries (host KVM doesn't
-/// expose MSR_LSTAR — should never happen on x86_64 hosts since
-/// LSTAR is mandatory for long-mode SYSCALL, but defensive against
-/// future KVM-build oddities). Returns `Err` on ioctl failure.
-///
-/// Kernel contract: `__msr_io` at `arch/x86/kvm/x86.c:4663` returns
-/// count of successfully-read entries and stops on first per-MSR
-/// failure. For a 1-MSR batch this collapses to "either 1 or 0";
-/// any other value would violate the KVM ABI and the `ensure!` would
-/// fire.
-///
-/// The positional `msrs.as_slice()[0].data` access is safe because
-/// N=1 is enforced at the call site — if N grew, the caller would
-/// need match-on-`.index` dispatch (since KVM's per-MSR partial-read
-/// contract retains the request-position `.index` but does not
-/// guarantee positional response ordering past the first failure).
-pub(crate) fn read_lstar(vcpu: &VcpuFd) -> Result<Option<u64>> {
-    let mut msrs = Msrs::from_entries(&[kvm_msr_entry {
-        index: MSR_LSTAR,
-        ..Default::default()
-    }])
-    .context("Msrs::from_entries for MSR_LSTAR")?;
-    let n = vcpu
-        .get_msrs(&mut msrs)
-        .context("KVM_GET_MSRS for MSR_LSTAR")?;
-    if n == 0 {
-        return Ok(None);
-    }
-    ensure!(
-        n == 1,
-        "KVM_GET_MSRS returned {n} entries for 1-MSR batch — KVM ABI violation"
-    );
-    Ok(Some(msrs.as_slice()[0].data))
-}
-
 /// Derive the virtual KASLR offset from a runtime `MSR_LSTAR` value
 /// and the link-time `entry_SYSCALL_64` KVA from vmlinux.
 ///
@@ -293,30 +262,32 @@ pub fn derive_virt_kaslr(lstar: u64, entry_syscall_64_link: u64) -> Result<u64, 
     Ok(offset)
 }
 
-/// Convenience helper: read LSTAR from `vcpu` and derive the
+/// Convenience helper: read `MSR_LSTAR` from `vcpu` and derive the
 /// virt-KASLR offset from the supplied link-time KVA. Used by the
 /// freeze-coordinator at the `kern_phys_base` handshake site —
 /// guarantees the guest has reached `idt_syscall_init` before the
 /// read (otherwise LSTAR is the KVM-seeded 0).
 ///
 /// Errors fall into two classes:
-/// - Read failures (ioctl error, partial KVM_GET_MSRS) bubble as
+/// - Read failures (ioctl error, KVM ABI violation) bubble as
 ///   `anyhow::Error` and indicate a KVM-layer problem.
 /// - Derivation failures (any [`LstarDeriveError`] variant —
-///   LstarUnsupported, LstarZero, LinkUnknown, NonCanonical,
-///   LinkAboveLstar, Misaligned) bubble as `LstarDeriveError`
+///   `LstarUnsupported`, `LstarZero`, `LinkUnknown`, `NonCanonical`,
+///   `LinkAboveLstar`, `Misaligned`) bubble as `LstarDeriveError`
 ///   wrapped in `anyhow::Error` and indicate the kernel's LSTAR
-///   isn't usable for KASLR derivation on this guest (FRED, early-
+///   isn't usable for KASLR derivation on this guest (FRED, early
 ///   boot, wrong vmlinux, missing symbol, ...). Callers that want
-///   to dispatch per-variant should call [`read_lstar`] +
+///   to dispatch per-variant should call
+///   [`super::msr_io::read_one_msr`] with [`MSR_LSTAR`] and
 ///   [`derive_virt_kaslr`] directly to get the typed error.
 ///
 /// Callers typically fall back to the `phys_base`-derived KASLR
 /// path on any error here — that path is independent and works
 /// whether or not LSTAR is meaningful.
 pub(crate) fn read_and_derive(vcpu: &VcpuFd, entry_syscall_64_link: u64) -> Result<u64> {
-    let lstar = read_lstar(vcpu)?
-        .ok_or_else(|| anyhow::anyhow!("derive virt_kaslr_offset: {}", LstarDeriveError::LstarUnsupported))?;
+    let lstar = read_one_msr(vcpu, MSR_LSTAR)?.ok_or_else(|| {
+        anyhow::anyhow!("derive virt_kaslr_offset: {}", LstarDeriveError::LstarUnsupported)
+    })?;
     derive_virt_kaslr(lstar, entry_syscall_64_link)
         .map_err(|e| anyhow::anyhow!("derive virt_kaslr_offset: {e}"))
 }

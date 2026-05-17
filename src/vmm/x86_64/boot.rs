@@ -7,6 +7,11 @@ use crate::vmm::kvm::{
     BOOT_PARAMS_ADDR, CMDLINE_ADDR, CMDLINE_MAX, E820_RAM, EBDA_START, HIMEM_START,
     KERNEL_LOAD_ADDR, MMIO_GAP_END, MMIO_GAP_START, STARTUP64_OFFSET,
 };
+use crate::vmm::x86_64::msr_indices::{
+    MSR_CSTAR, MSR_IA32_MISC_ENABLE, MSR_IA32_SYSENTER_CS, MSR_IA32_SYSENTER_EIP,
+    MSR_IA32_SYSENTER_ESP, MSR_IA32_TSC, MSR_KERNEL_GS_BASE, MSR_LSTAR, MSR_MTRR_DEF_TYPE,
+    MSR_STAR, MSR_SYSCALL_MASK,
+};
 
 // Page table addresses (identity-mapped, 2MB pages)
 // Firecracker/libkrun/CH all use these same addresses.
@@ -28,24 +33,10 @@ const CR4_PAE: u64 = 0x20;
 const EFER_LME: u64 = 0x100;
 const EFER_LMA: u64 = 0x400;
 
-// MSR indices — Firecracker/libkrun boot MSR set
-const MSR_IA32_SYSENTER_CS: u32 = 0x174;
-const MSR_IA32_SYSENTER_ESP: u32 = 0x175;
-const MSR_IA32_SYSENTER_EIP: u32 = 0x176;
-const MSR_STAR: u32 = 0xc000_0081;
-// MSR_LSTAR is the canonical source in src/vmm/x86_64/msr_kaslr.rs
-// (where its KASLR-derivation semantic role is documented). Re-export
-// here so the boot MSR-set seed code stays self-contained for the
-// 10+ MSR write batch while keeping a single source of truth for the
-// numeric value. #149 will consolidate the full MSR-const block.
-pub(super) use super::msr_kaslr::MSR_LSTAR;
-const MSR_CSTAR: u32 = 0xc000_0083;
-const MSR_SYSCALL_MASK: u32 = 0xc000_0084;
-const MSR_KERNEL_GS_BASE: u32 = 0xc000_0102;
-const MSR_IA32_TSC: u32 = 0x10;
-const MSR_IA32_MISC_ENABLE: u32 = 0x1a0;
+// MSR value-bit constants for the boot-time MSR seed. Index
+// constants live in `super::msr_indices`; only value bits stay local
+// to the consumer that interprets them.
 const MSR_IA32_MISC_ENABLE_FAST_STRING: u64 = 0x1;
-const MSR_MTRR_DEF_TYPE: u32 = 0x2ff;
 const MTRR_ENABLE: u64 = 1 << 11;
 const MTRR_MEM_TYPE_WB: u64 = 0x6;
 
@@ -772,6 +763,7 @@ mod tests {
     fn setup_msrs_with_kvm() {
         use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
+        use crate::vmm::x86_64::msr_io::read_one_msr_required;
         let topo = Topology {
             llcs: 1,
             cores_per_llc: 1,
@@ -782,15 +774,11 @@ mod tests {
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_msrs(&vm.vcpus[0], None).unwrap();
-        // Verify MISC_ENABLE was set
-        let mut msrs = kvm_bindings::Msrs::from_entries(&[kvm_bindings::kvm_msr_entry {
-            index: MSR_IA32_MISC_ENABLE,
-            ..Default::default()
-        }])
-        .unwrap();
-        let read = vm.vcpus[0].get_msrs(&mut msrs).unwrap();
-        assert_eq!(read, 1);
-        let data = msrs.as_slice()[0].data;
+        let data = read_one_msr_required(
+            &vm.vcpus[0],
+            MSR_IA32_MISC_ENABLE,
+            "post-default-seed",
+        );
         assert_ne!(
             data & MSR_IA32_MISC_ENABLE_FAST_STRING,
             0,
@@ -802,6 +790,7 @@ mod tests {
     fn setup_msrs_with_extra_override() {
         use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
+        use crate::vmm::x86_64::msr_io::read_one_msr_required;
         let topo = Topology {
             llcs: 1,
             cores_per_llc: 1,
@@ -818,18 +807,12 @@ mod tests {
             ..Default::default()
         }];
         setup_msrs(&vm.vcpus[0], Some(&extra)).unwrap();
-        let mut msrs = kvm_bindings::Msrs::from_entries(&[kvm_bindings::kvm_msr_entry {
-            index: MSR_IA32_MISC_ENABLE,
-            ..Default::default()
-        }])
-        .unwrap();
-        let read = vm.vcpus[0].get_msrs(&mut msrs).unwrap();
-        assert_eq!(read, 1);
-        assert_eq!(
-            msrs.as_slice()[0].data,
-            0,
-            "MISC_ENABLE should be overridden to 0"
+        let data = read_one_msr_required(
+            &vm.vcpus[0],
+            MSR_IA32_MISC_ENABLE,
+            "post-extra-override",
         );
+        assert_eq!(data, 0, "MISC_ENABLE should be overridden to 0");
     }
 
     #[test]
