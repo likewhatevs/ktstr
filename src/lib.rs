@@ -674,14 +674,20 @@ pub mod prelude {
     // separate Rust namespaces (macro vs type) so they coexist in
     // `use ktstr::prelude::*;` without conflict.
     pub use crate::Payload;
+    pub use crate::monitor::arena::{ArenaPage, ArenaSnapshot};
+    pub use crate::monitor::bpf_prog::ProgRuntimeStats;
     pub use crate::monitor::btf_render::{RenderedMember, RenderedValue};
     pub use crate::monitor::dump::{
-        DegradedFailureDumpReport, DualFailureDumpReport, FailureDumpEntry, FailureDumpMap,
-        FailureDumpPercpuEntry, FailureDumpPercpuHashEntry, FailureDumpReport,
-        FailureDumpReportAny, REASON_DEGRADED_RENDEZVOUS_TIMEOUT, SCHEMA_DEGRADED, SCHEMA_DUAL,
-        SCHEMA_SINGLE, SNAPSHOT_TAG_EARLY_DEGRADED, SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED,
+        DegradedFailureDumpReport, DualFailureDumpReport, EventCounterSample, FailureDumpEntry,
+        FailureDumpFdArray, FailureDumpMap, FailureDumpPercpuEntry, FailureDumpPercpuHashEntry,
+        FailureDumpReport, FailureDumpReportAny, FailureDumpRingbuf, FailureDumpStackTrace,
+        FailureDumpStackTraceEntry, PerCpuTimeStats, PerNodeNumaStats, ProbeBssCounters,
+        REASON_DEGRADED_RENDEZVOUS_TIMEOUT, SCHEMA_DEGRADED, SCHEMA_DUAL, SCHEMA_SINGLE,
+        SNAPSHOT_TAG_EARLY_DEGRADED, SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED,
         SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED, SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED,
     };
+    pub use crate::monitor::scx_walker::{DsqState, RqScxState, ScxSchedState};
+    pub use crate::monitor::task_enrichment::TaskEnrichment;
     pub use crate::scenario::sample::{
         BpfMapProjector, Sample, SampleSeries, StatsPathProjector, StatsValue,
     };

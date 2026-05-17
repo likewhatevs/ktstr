@@ -113,11 +113,16 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use crate::monitor::arena::ArenaSnapshot;
+use crate::monitor::bpf_prog::ProgRuntimeStats;
 use crate::monitor::btf_render::{RenderedMember, RenderedValue};
 use crate::monitor::dump::{
-    FailureDumpEntry, FailureDumpMap, FailureDumpPercpuEntry, FailureDumpPercpuHashEntry,
-    FailureDumpReport,
+    EventCounterSample, FailureDumpEntry, FailureDumpFdArray, FailureDumpMap,
+    FailureDumpPercpuEntry, FailureDumpPercpuHashEntry, FailureDumpReport, FailureDumpRingbuf,
+    FailureDumpStackTrace, PerCpuTimeStats, PerNodeNumaStats, ProbeBssCounters,
 };
+use crate::monitor::scx_walker::{DsqState, RqScxState, ScxSchedState};
+use crate::monitor::task_enrichment::TaskEnrichment;
 
 /// Maximum number of rendered keys captured into
 /// [`SnapshotError::NoMatch::available_keys`] during a failed
@@ -1141,21 +1146,33 @@ impl<'a> Snapshot<'a> {
     /// `report()` only when a [`FailureDumpReport`] field has no
     /// typed accessor yet:
     ///
-    /// - `dsq_states`, `rq_scx_states`, `scx_sched_state` —
-    ///   per-DSQ depth, per-CPU rq->scx state, scheduler global
-    ///   state.
-    /// - `event_counter_timeline` — periodic SCX event counter
-    ///   samples (`EventCounterSample`).
-    /// - `per_cpu_time`, `per_node_numa` — per-CPU
-    ///   cpustat/schedstat and per-node NUMA event counters
-    ///   (`PerCpuTimeStats`,
-    ///   `PerNodeNumaStats`).
-    /// - `task_enrichments`, `prog_runtime_stats`, `probe_counters`
-    ///   — task-level enrichment, BPF prog runtime stats,
-    ///   per-probe counters.
-    /// - On [`FailureDumpMap`]: `ringbuf`, `arena`, `fd_array`,
-    ///   `stack_trace`, `error` — non-key/value map shapes whose
-    ///   typed [`SnapshotMap`] accessors are not yet implemented.
+    /// - `vcpu_regs` — per-vCPU register snapshot captured at the
+    ///   freeze instant.
+    /// - `vcpu_perf_at_freeze` — per-vCPU hardware perf counter
+    ///   snapshot captured at the freeze instant.
+    /// - `dump_truncated_at_us` — microseconds-into-the-dump at
+    ///   which the soft deadline tripped.
+    /// - `sdt_allocations`, `scx_static_ranges` — SDT allocator and
+    ///   scx static memory layout snapshots used by the arena /
+    ///   pointer-renderer pipelines.
+    /// - `*_unavailable` diagnostic reason strings
+    ///   ([`FailureDumpReport::scx_walker_unavailable`],
+    ///   [`FailureDumpReport::task_enrichments_unavailable`],
+    ///   [`FailureDumpReport::prog_runtime_stats_unavailable`],
+    ///   [`FailureDumpReport::per_node_numa_unavailable`],
+    ///   [`FailureDumpReport::sdt_alloc_unavailable`]) —
+    ///   companion fields to the typed accessors above.
+    /// - `schema`, `is_placeholder` — wire-format / capture-status
+    ///   metadata ([`Self::is_placeholder`] already wraps the
+    ///   boolean).
+    ///
+    /// All other fields documented as escape-only on
+    /// [`FailureDumpReport`] above now have first-class accessors on
+    /// [`Snapshot`] (`event_counter_timeline`, `rq_scx_states`,
+    /// `dsq_states`, `scx_sched_state`, `per_cpu_time`,
+    /// `per_node_numa`, `task_enrichments`, `prog_runtime_stats`,
+    /// `probe_counters`) and on [`SnapshotMap`] (`ringbuf`,
+    /// `arena`, `fd_array`, `stack_trace`, `map_error`).
     ///
     /// **Caveats of the bypass:**
     /// - No [`SnapshotError`] routing — call-site is on its own to
@@ -1169,13 +1186,6 @@ impl<'a> Snapshot<'a> {
     /// - No placeholder-sample short-circuit
     ///   ([`Self::is_placeholder`] check is the caller's
     ///   responsibility).
-    ///
-    /// First-class typed accessors for the listed fields are tracked
-    /// as a separate work item ("extend Snapshot / SampleSeries
-    /// projection API for full first-class coverage"); when those
-    /// land this method's docstring should narrow to whatever
-    /// remains unwrapped — and ideally `report()` becomes redundant
-    /// for production tests.
     pub fn report(&self) -> &'a FailureDumpReport {
         self.report
     }
@@ -1269,6 +1279,157 @@ impl<'a> Snapshot<'a> {
     pub fn is_placeholder(&self) -> bool {
         self.report.is_placeholder
     }
+
+    // -----------------------------------------------------------------
+    // First-class accessors for fields the freeze-coordinator pipeline
+    // populates on `FailureDumpReport` outside the BPF-map axis. Each
+    // accessor returns either a borrowed slice (whole-vec views) or an
+    // `Option<&T>` keyed by the natural identifier. Empty vec is the
+    // normal state when the corresponding walker did not run — callers
+    // check the companion `*_unavailable` field on the raw report for
+    // the diagnostic reason. None on a keyed lookup means "the dump
+    // did not capture an entry for that key"; it is not an error.
+    //
+    // **Keyed-lookup naming convention.** `<base>_at(<key>)` is used
+    // when the key is a topology position (CPU index, NUMA node id)
+    // that the kernel allocates densely from 0; the `_at` mirrors
+    // `Vec::get(idx)` and reads naturally as "the row at this
+    // position". `<base>_by_<field>(<value>)` is used when the key is
+    // a sparse identifier (pid, program name) — the `_by_<field>`
+    // names which field the lookup compares against and reads
+    // naturally as "the entry whose <field> matches". The `<base>` is
+    // normally the singular form of the plural-vec accessor (e.g.
+    // `task_enrichments` → `task_enrichment_by_pid`), but stays
+    // plural when the singular reads unnaturally (e.g.
+    // `prog_runtime_stats` → `prog_runtime_stats_by_name` — the
+    // singular `prog_runtime_stat` would be awkward English; the
+    // `Stats` suffix is part of the canonical noun). Each keyed
+    // accessor returns the first match in walker enumeration order;
+    // production captures do not duplicate keys (kernel walker
+    // invariants), but the contract is left first-match-wins so a
+    // future duplicate-key scenario surfaces only one row without
+    // panicking.
+    // -----------------------------------------------------------------
+
+    /// Per-monitor-tick SCX_EV_* event counter samples. Each entry is
+    /// the cross-CPU sum of the 13 SCX event counters at one monitor
+    /// tick. Empty when no `EventCounterCapture` ran, or every sample
+    /// was suppressed (event-stat offsets unresolved, scx_root unset).
+    ///
+    /// Unlike the walker-backed accessors below, this field carries
+    /// no `*_unavailable` companion: an empty timeline is the only
+    /// signal for "no capture / no events".
+    pub fn event_counter_timeline(&self) -> &'a [EventCounterSample] {
+        &self.report.event_counter_timeline
+    }
+
+    /// Per-CPU `rq->scx` snapshots — one per CPU walked by
+    /// [`crate::monitor::scx_walker`]. Empty when the
+    /// `ScxWalkerCapture` was absent or every CPU's translate
+    /// failed (see `FailureDumpReport::scx_walker_unavailable`).
+    pub fn rq_scx_states(&self) -> &'a [RqScxState] {
+        &self.report.rq_scx_states
+    }
+
+    /// Per-DSQ snapshots — local, bypass, global, and user DSQs
+    /// reachable from `*scx_root`. Each entry carries `nr` (depth),
+    /// `seq` (BPF-iter counter), and the queued task KVAs. Empty
+    /// when the `ScxWalkerCapture` was absent (see
+    /// `FailureDumpReport::scx_walker_unavailable`).
+    pub fn dsq_states(&self) -> &'a [DsqState] {
+        &self.report.dsq_states
+    }
+
+    /// Top-level `scx_sched` state captured from `*scx_root`:
+    /// aborting flag, bypass_depth, exit_kind. `None` when no
+    /// scheduler is attached or `*scx_root` was unreadable (see
+    /// `FailureDumpReport::scx_walker_unavailable`).
+    pub fn scx_sched_state(&self) -> Option<&'a ScxSchedState> {
+        self.report.scx_sched_state.as_ref()
+    }
+
+    /// Per-CPU CPU-time / softirq / IRQ counter rows. One row per
+    /// CPU enumerated by [`crate::monitor::dump::CpuTimeCapture`].
+    /// Empty when the capture was not wired or symbol/BTF
+    /// resolution failed.
+    pub fn per_cpu_time(&self) -> &'a [PerCpuTimeStats] {
+        &self.report.per_cpu_time
+    }
+
+    /// Per-CPU CPU-time row for CPU `cpu`, looked up by the `cpu`
+    /// field on each [`PerCpuTimeStats`] (not by vec position).
+    /// Returns `None` when no row matches — typical when the
+    /// walker skipped that CPU, the capture didn't run, or `cpu`
+    /// exceeded the topology. Returns the first match in walker
+    /// enumeration order if `cpu` appears more than once.
+    pub fn per_cpu_time_at(&self, cpu: u32) -> Option<&'a PerCpuTimeStats> {
+        self.report.per_cpu_time.iter().find(|c| c.cpu == cpu)
+    }
+
+    /// Per-NUMA-node event counter rows captured from
+    /// `pglist_data->node_zones[]->vm_numa_event[]`. Empty until
+    /// the host-side NUMA walker lands (see
+    /// `FailureDumpReport::per_node_numa_unavailable`).
+    pub fn per_node_numa(&self) -> &'a [PerNodeNumaStats] {
+        &self.report.per_node_numa
+    }
+
+    /// Per-NUMA-node event-counter row for `node`, looked up by
+    /// the `node` field on each [`PerNodeNumaStats`]. Returns
+    /// `None` when no row matches. Returns the first match in
+    /// walker enumeration order if `node` appears more than once.
+    pub fn per_node_numa_at(&self, node: u32) -> Option<&'a PerNodeNumaStats> {
+        self.report.per_node_numa.iter().find(|n| n.node == node)
+    }
+
+    /// Per-task failure-dump enrichments — identity (pid, tgid,
+    /// comm), process tree, scheduling priority, sched_class name,
+    /// context-switch counters, watchdog disambiguation, lock
+    /// slowpath stack matches. Empty when no task walker ran (see
+    /// `FailureDumpReport::task_enrichments_unavailable`).
+    pub fn task_enrichments(&self) -> &'a [TaskEnrichment] {
+        &self.report.task_enrichments
+    }
+
+    /// Look up the enrichment for `pid`. The returned reference
+    /// matches the first task whose `task_struct.pid` equals `pid`
+    /// in walker enumeration order. Returns `None` when no task with
+    /// that pid was captured. Production captures dedupe by task_kva
+    /// before push, so duplicate-pid rows do not occur in real
+    /// dumps.
+    pub fn task_enrichment_by_pid(&self, pid: i32) -> Option<&'a TaskEnrichment> {
+        self.report.task_enrichments.iter().find(|t| t.pid == pid)
+    }
+
+    /// Per-program BPF runtime stats — invocation count, total ns,
+    /// recursion misses. One entry per struct_ops program reached
+    /// by the prog walker. Empty when no struct_ops programs are
+    /// loaded or the prog accessor was unavailable (see
+    /// `FailureDumpReport::prog_runtime_stats_unavailable`).
+    pub fn prog_runtime_stats(&self) -> &'a [ProgRuntimeStats] {
+        &self.report.prog_runtime_stats
+    }
+
+    /// Look up the runtime stats for the program registered with
+    /// `name` (kernel-side `bpf_prog->aux->name`). Returns `None`
+    /// when no program with that name was captured. Returns the
+    /// first match in walker enumeration order if `name` appears
+    /// more than once — struct_ops programs in real captures use
+    /// distinct callback names (`select_cpu`, `enqueue`, etc.) so
+    /// duplicates do not occur in production.
+    pub fn prog_runtime_stats_by_name(&self, name: &str) -> Option<&'a ProgRuntimeStats> {
+        self.report.prog_runtime_stats.iter().find(|p| p.name == name)
+    }
+
+    /// Probe BPF program's per-CPU diagnostic counter snapshot.
+    /// `None` when the probe's `.bss` map isn't enumerated (probe
+    /// not loaded), the program BTF can't be parsed, or the
+    /// array's offset doesn't resolve. A populated
+    /// `trigger_count > 0` is the structural signal that the
+    /// `tp_btf/sched_ext_exit` handler fired during the run.
+    pub fn probe_counters(&self) -> Option<&'a ProbeBssCounters> {
+        self.report.probe_counters.as_ref()
+    }
 }
 
 /// True when a map name matches the libbpf-composed
@@ -1303,6 +1464,52 @@ impl<'a> SnapshotMap<'a> {
     /// Underlying [`FailureDumpMap`].
     pub fn raw(&self) -> &'a FailureDumpMap {
         self.map
+    }
+
+    /// Ringbuf occupancy snapshot for `BPF_MAP_TYPE_RINGBUF` /
+    /// `BPF_MAP_TYPE_USER_RINGBUF` maps — capacity, consumer /
+    /// producer / pending positions, and the cumulative
+    /// `pending_bytes` gap. `None` for non-ringbuf maps or when
+    /// the BTF offsets for `bpf_ringbuf_map` / `bpf_ringbuf`
+    /// weren't resolvable at capture time.
+    pub fn ringbuf(&self) -> Option<&'a FailureDumpRingbuf> {
+        self.map.ringbuf.as_ref()
+    }
+
+    /// Mapped-page snapshot for `BPF_MAP_TYPE_ARENA` maps. Borrows
+    /// the per-page `(user_addr, bytes)` records plus the declared
+    /// span / truncation flags. `None` for non-arena maps or when
+    /// the arena walker failed to translate the user_vm window.
+    pub fn arena(&self) -> Option<&'a ArenaSnapshot> {
+        self.map.arena.as_ref()
+    }
+
+    /// Populated-slot summary for FD-array families (`PROG_ARRAY`,
+    /// `PERF_EVENT_ARRAY`, `ARRAY_OF_MAPS`, `SOCKMAP*`, etc.).
+    /// `None` for non-FD-array maps. Surfaces the populated count,
+    /// scanned slot count, populated-index list, and the two
+    /// truncation flags ([`FailureDumpFdArray::truncated`] for the
+    /// scan limit, [`FailureDumpFdArray::indices_truncated`] for the
+    /// index list limit).
+    pub fn fd_array(&self) -> Option<&'a FailureDumpFdArray> {
+        self.map.fd_array.as_ref()
+    }
+
+    /// Per-bucket summary for `BPF_MAP_TYPE_STACK_TRACE` maps.
+    /// `None` for non-STACK_TRACE maps or when the BTF offsets for
+    /// `bpf_stack_map` / `stack_map_bucket` weren't resolvable.
+    pub fn stack_trace(&self) -> Option<&'a FailureDumpStackTrace> {
+        self.map.stack_trace.as_ref()
+    }
+
+    /// Per-map decode-error string set by the freeze coordinator
+    /// when this map's contents are missing or partial. `None` on a
+    /// successful render. Distinct from [`SnapshotError`] (which
+    /// flows through the accessor API) — `map_error` surfaces the
+    /// capture-side diagnostic the kernel-walker recorded before
+    /// the snapshot was handed to test code.
+    pub fn map_error(&self) -> Option<&'a str> {
+        self.map.error.as_deref()
     }
 
     /// Narrow this map view to a specific per-CPU slot. On a
@@ -4141,6 +4348,454 @@ mod tests {
             "Snapshot::report() must hand back the underlying \
              FailureDumpReport unchanged — this is the documented \
              escape-hatch contract",
+        );
+    }
+
+    // -------------------------------------------------------------
+    // First-class accessor tests — pin every Snapshot / SnapshotMap
+    // accessor against the underlying FailureDumpReport / FailureDumpMap
+    // field so a rename or removal lights up as a compile error AND
+    // the empty-by-default contract holds for callers checking
+    // "did the walker run?" via the slice length.
+    // -------------------------------------------------------------
+
+    fn task_enrichment_fixture(pid: i32, comm: &str) -> TaskEnrichment {
+        TaskEnrichment {
+            pid,
+            tgid: pid,
+            comm: comm.to_string(),
+            group_leader_pid: None,
+            real_parent_pid: None,
+            real_parent_comm: None,
+            pgid: None,
+            sid: None,
+            nr_threads: None,
+            weight: 100,
+            prio: 120,
+            static_prio: 120,
+            normal_prio: 120,
+            rt_priority: 0,
+            sched_class: None,
+            core_cookie: None,
+            pi_boosted_out_of_scx: false,
+            nvcsw: 0,
+            nivcsw: 0,
+            signal_nvcsw: None,
+            signal_nivcsw: None,
+            lock_slowpath_match: None,
+        }
+    }
+
+    #[test]
+    fn snapshot_event_counter_timeline_is_empty_by_default() {
+        let r = FailureDumpReport::default();
+        let snap = Snapshot::new(&r);
+        assert!(snap.event_counter_timeline().is_empty());
+    }
+
+    #[test]
+    fn snapshot_event_counter_timeline_borrows_populated_vec() {
+        let r = FailureDumpReport {
+            event_counter_timeline: vec![
+                EventCounterSample {
+                    elapsed_ms: 10,
+                    select_cpu_fallback: 7,
+                    ..Default::default()
+                },
+                EventCounterSample {
+                    elapsed_ms: 20,
+                    select_cpu_fallback: 11,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let snap = Snapshot::new(&r);
+        let timeline = snap.event_counter_timeline();
+        assert_eq!(timeline.len(), 2);
+        assert_eq!(timeline[0].elapsed_ms, 10);
+        assert_eq!(timeline[1].select_cpu_fallback, 11);
+    }
+
+    #[test]
+    fn snapshot_rq_scx_states_borrows_populated_vec() {
+        let r = FailureDumpReport {
+            rq_scx_states: vec![
+                crate::monitor::scx_walker::RqScxState::default(),
+                crate::monitor::scx_walker::RqScxState::default(),
+            ],
+            ..Default::default()
+        };
+        let snap = Snapshot::new(&r);
+        assert_eq!(snap.rq_scx_states().len(), 2);
+    }
+
+    #[test]
+    fn snapshot_dsq_states_borrows_populated_vec() {
+        let r = FailureDumpReport {
+            dsq_states: vec![crate::monitor::scx_walker::DsqState::default()],
+            ..Default::default()
+        };
+        let snap = Snapshot::new(&r);
+        assert_eq!(snap.dsq_states().len(), 1);
+    }
+
+    #[test]
+    fn snapshot_scx_sched_state_threads_option() {
+        let r_absent = FailureDumpReport::default();
+        assert!(Snapshot::new(&r_absent).scx_sched_state().is_none());
+
+        let r_present = FailureDumpReport {
+            scx_sched_state: Some(crate::monitor::scx_walker::ScxSchedState::default()),
+            ..Default::default()
+        };
+        assert!(Snapshot::new(&r_present).scx_sched_state().is_some());
+    }
+
+    #[test]
+    fn snapshot_per_cpu_time_at_finds_by_cpu_field_not_position() {
+        let r = FailureDumpReport {
+            per_cpu_time: vec![
+                PerCpuTimeStats {
+                    cpu: 2,
+                    cpustat_user_ns: 200,
+                    ..Default::default()
+                },
+                PerCpuTimeStats {
+                    cpu: 0,
+                    cpustat_user_ns: 0,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let snap = Snapshot::new(&r);
+        assert_eq!(snap.per_cpu_time().len(), 2);
+        // Lookup by the `cpu` field, not vec position — first entry
+        // has cpu=2 even though it's at index 0.
+        let row = snap.per_cpu_time_at(2).expect("cpu 2 present");
+        assert_eq!(row.cpustat_user_ns, 200);
+        let zero = snap.per_cpu_time_at(0).expect("cpu 0 present");
+        assert_eq!(zero.cpustat_user_ns, 0);
+        assert!(snap.per_cpu_time_at(99).is_none());
+    }
+
+    #[test]
+    fn snapshot_per_node_numa_at_finds_by_node_field() {
+        let r = FailureDumpReport {
+            per_node_numa: vec![
+                PerNodeNumaStats {
+                    node: 1,
+                    numa_hit: 500,
+                    ..Default::default()
+                },
+                PerNodeNumaStats {
+                    node: 0,
+                    numa_hit: 100,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let snap = Snapshot::new(&r);
+        assert_eq!(snap.per_node_numa().len(), 2);
+        assert_eq!(snap.per_node_numa_at(0).unwrap().numa_hit, 100);
+        assert_eq!(snap.per_node_numa_at(1).unwrap().numa_hit, 500);
+        assert!(snap.per_node_numa_at(99).is_none());
+    }
+
+    #[test]
+    fn snapshot_task_enrichment_by_pid_finds_first_match() {
+        let r = FailureDumpReport {
+            task_enrichments: vec![
+                task_enrichment_fixture(42, "alpha"),
+                task_enrichment_fixture(7, "beta"),
+            ],
+            ..Default::default()
+        };
+        let snap = Snapshot::new(&r);
+        assert_eq!(snap.task_enrichments().len(), 2);
+        assert_eq!(snap.task_enrichment_by_pid(7).unwrap().comm, "beta");
+        assert_eq!(snap.task_enrichment_by_pid(42).unwrap().comm, "alpha");
+        assert!(snap.task_enrichment_by_pid(1).is_none());
+    }
+
+    #[test]
+    fn snapshot_prog_runtime_stats_by_name_finds_match() {
+        let r = FailureDumpReport {
+            prog_runtime_stats: vec![
+                ProgRuntimeStats {
+                    name: "dispatch".into(),
+                    cnt: 100,
+                    nsecs: 5000,
+                    misses: 1,
+                },
+                ProgRuntimeStats {
+                    name: "select_cpu".into(),
+                    cnt: 50,
+                    nsecs: 2000,
+                    misses: 0,
+                },
+            ],
+            ..Default::default()
+        };
+        let snap = Snapshot::new(&r);
+        assert_eq!(snap.prog_runtime_stats().len(), 2);
+        assert_eq!(snap.prog_runtime_stats_by_name("dispatch").unwrap().cnt, 100);
+        assert_eq!(snap.prog_runtime_stats_by_name("select_cpu").unwrap().nsecs, 2000);
+        assert!(snap.prog_runtime_stats_by_name("nope").is_none());
+    }
+
+    /// Pin the first-match-on-duplicate contract on all 4 keyed
+    /// lookups. Production captures dedupe before push so this case
+    /// shouldn't occur, but the contract is documented as
+    /// first-match-wins and a future "return all matches" refactor
+    /// without explicit migration would silently surface a
+    /// different row.
+    #[test]
+    fn snapshot_keyed_lookups_return_first_match_on_duplicate() {
+        let r = FailureDumpReport {
+            per_cpu_time: vec![
+                PerCpuTimeStats {
+                    cpu: 0,
+                    cpustat_user_ns: 11,
+                    ..Default::default()
+                },
+                PerCpuTimeStats {
+                    cpu: 0,
+                    cpustat_user_ns: 22,
+                    ..Default::default()
+                },
+            ],
+            per_node_numa: vec![
+                PerNodeNumaStats {
+                    node: 0,
+                    numa_hit: 100,
+                    ..Default::default()
+                },
+                PerNodeNumaStats {
+                    node: 0,
+                    numa_hit: 200,
+                    ..Default::default()
+                },
+            ],
+            task_enrichments: vec![
+                task_enrichment_fixture(7, "first"),
+                task_enrichment_fixture(7, "second"),
+            ],
+            prog_runtime_stats: vec![
+                ProgRuntimeStats {
+                    name: "p".into(),
+                    cnt: 1,
+                    nsecs: 10,
+                    misses: 0,
+                },
+                ProgRuntimeStats {
+                    name: "p".into(),
+                    cnt: 2,
+                    nsecs: 20,
+                    misses: 0,
+                },
+            ],
+            ..Default::default()
+        };
+        let snap = Snapshot::new(&r);
+        assert_eq!(snap.per_cpu_time_at(0).unwrap().cpustat_user_ns, 11);
+        assert_eq!(snap.per_node_numa_at(0).unwrap().numa_hit, 100);
+        assert_eq!(snap.task_enrichment_by_pid(7).unwrap().comm, "first");
+        assert_eq!(snap.prog_runtime_stats_by_name("p").unwrap().cnt, 1);
+    }
+
+    #[test]
+    fn snapshot_probe_counters_threads_option() {
+        let r_absent = FailureDumpReport::default();
+        assert!(Snapshot::new(&r_absent).probe_counters().is_none());
+
+        let r_present = FailureDumpReport {
+            probe_counters: Some(ProbeBssCounters::default()),
+            ..Default::default()
+        };
+        assert!(Snapshot::new(&r_present).probe_counters().is_some());
+    }
+
+    fn map_with_shape(
+        name: &str,
+        ringbuf: Option<FailureDumpRingbuf>,
+        arena: Option<ArenaSnapshot>,
+        fd_array: Option<FailureDumpFdArray>,
+        stack_trace: Option<FailureDumpStackTrace>,
+        error: Option<String>,
+    ) -> FailureDumpMap {
+        FailureDumpMap {
+            name: name.into(),
+            map_type: 0,
+            value_size: 0,
+            max_entries: 0,
+            value: None,
+            entries: Vec::new(),
+            percpu_entries: Vec::new(),
+            percpu_hash_entries: Vec::new(),
+            arena,
+            ringbuf,
+            stack_trace,
+            fd_array,
+            error,
+        }
+    }
+
+    #[test]
+    fn snapshot_map_ringbuf_threads_option() {
+        let m_absent = map_with_shape("ring", None, None, None, None, None);
+        let r1 = FailureDumpReport {
+            maps: vec![m_absent],
+            ..Default::default()
+        };
+        let snap1 = Snapshot::new(&r1);
+        assert!(snap1.map("ring").unwrap().ringbuf().is_none());
+
+        let m_present = map_with_shape(
+            "ring2",
+            Some(FailureDumpRingbuf {
+                capacity: 4096,
+                consumer_pos: 100,
+                producer_pos: 500,
+                pending_pos: 200,
+                pending_bytes: 400,
+            }),
+            None,
+            None,
+            None,
+            None,
+        );
+        let r2 = FailureDumpReport {
+            maps: vec![m_present],
+            ..Default::default()
+        };
+        let snap2 = Snapshot::new(&r2);
+        let rb = snap2.map("ring2").unwrap().ringbuf().expect("present");
+        assert_eq!(rb.capacity, 4096);
+        assert_eq!(rb.pending_bytes, 400);
+    }
+
+    #[test]
+    fn snapshot_map_arena_threads_option() {
+        let m_absent = map_with_shape("arena_a", None, None, None, None, None);
+        let r_a = FailureDumpReport {
+            maps: vec![m_absent],
+            ..Default::default()
+        };
+        assert!(Snapshot::new(&r_a).map("arena_a").unwrap().arena().is_none());
+
+        let m_present = map_with_shape(
+            "arena_m",
+            None,
+            Some(ArenaSnapshot::default()),
+            None,
+            None,
+            None,
+        );
+        let r = FailureDumpReport {
+            maps: vec![m_present],
+            ..Default::default()
+        };
+        let snap = Snapshot::new(&r);
+        assert!(snap.map("arena_m").unwrap().arena().is_some());
+    }
+
+    #[test]
+    fn snapshot_map_fd_array_threads_option() {
+        let m_absent = map_with_shape("fda_a", None, None, None, None, None);
+        let r_a = FailureDumpReport {
+            maps: vec![m_absent],
+            ..Default::default()
+        };
+        assert!(Snapshot::new(&r_a).map("fda_a").unwrap().fd_array().is_none());
+
+        let m_present = map_with_shape(
+            "fda",
+            None,
+            None,
+            Some(FailureDumpFdArray {
+                populated: 3,
+                scanned: 5,
+                indices: vec![0, 2, 4],
+                truncated: false,
+                indices_truncated: false,
+            }),
+            None,
+            None,
+        );
+        let r = FailureDumpReport {
+            maps: vec![m_present],
+            ..Default::default()
+        };
+        let snap = Snapshot::new(&r);
+        let fda = snap.map("fda").unwrap().fd_array().expect("present");
+        assert_eq!(fda.populated, 3);
+        assert_eq!(fda.indices, vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn snapshot_map_stack_trace_threads_option() {
+        let m_absent = map_with_shape("stack_a", None, None, None, None, None);
+        let r_a = FailureDumpReport {
+            maps: vec![m_absent],
+            ..Default::default()
+        };
+        assert!(
+            Snapshot::new(&r_a)
+                .map("stack_a")
+                .unwrap()
+                .stack_trace()
+                .is_none()
+        );
+
+        let m_present = map_with_shape(
+            "stack",
+            None,
+            None,
+            None,
+            Some(FailureDumpStackTrace {
+                n_buckets: 32,
+                entries: Vec::new(),
+                truncated: false,
+            }),
+            None,
+        );
+        let r = FailureDumpReport {
+            maps: vec![m_present],
+            ..Default::default()
+        };
+        let snap = Snapshot::new(&r);
+        let st = snap.map("stack").unwrap().stack_trace().expect("present");
+        assert_eq!(st.n_buckets, 32);
+    }
+
+    #[test]
+    fn snapshot_map_error_threads_option() {
+        let m_absent = map_with_shape("err_a", None, None, None, None, None);
+        let r_a = FailureDumpReport {
+            maps: vec![m_absent],
+            ..Default::default()
+        };
+        assert!(Snapshot::new(&r_a).map("err_a").unwrap().map_error().is_none());
+
+        let m_present = map_with_shape(
+            "err_m",
+            None,
+            None,
+            None,
+            None,
+            Some("BTF offset unresolved".to_string()),
+        );
+        let r = FailureDumpReport {
+            maps: vec![m_present],
+            ..Default::default()
+        };
+        let snap = Snapshot::new(&r);
+        assert_eq!(
+            snap.map("err_m").unwrap().map_error(),
+            Some("BTF offset unresolved")
         );
     }
 }
