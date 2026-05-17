@@ -708,6 +708,20 @@ pub struct Scheduler {
     pub name: &'static str,
     /// Source of the scheduler: a built-in spec variant (`Eevdf`,
     /// `Discover`, `Path`, or `KernelBuiltin`).
+    ///
+    /// The `declare_scheduler!` macro exposes three pseudo-keys that
+    /// each map to one [`SchedulerSpec`] variant — the macro never
+    /// accepts an enum literal, so authors must pick the matching
+    /// key:
+    /// - `binary = "scx_name"` → [`SchedulerSpec::Discover("scx_name")`](SchedulerSpec::Discover) (PATH lookup in the guest).
+    /// - `binary_path = "/abs/path"` → [`SchedulerSpec::Path("/abs/path")`](SchedulerSpec::Path) (explicit absolute path).
+    /// - `kernel_builtin_enable = "…", kernel_builtin_disable = "…"` (paired) → [`SchedulerSpec::KernelBuiltin`].
+    ///
+    /// Code that constructs a [`Scheduler`] outside the macro
+    /// (manual `..Scheduler::EEVDF` spread, programmatic builders)
+    /// uses the typed [`SchedulerSpec`] enum directly — see the
+    /// chainable [`Scheduler::binary_discover`] sugar for the
+    /// `Discover` common case.
     pub binary: SchedulerSpec,
     /// Guest sysctls applied before the scheduler starts (injected
     /// into the guest kernel cmdline as `sysctl.<key>=<value>`).
@@ -842,6 +856,37 @@ impl Scheduler {
     };
 
     /// Const constructor for defining schedulers in static context.
+    /// Caller chains [`Self::binary`] (or
+    /// [`Self::binary_discover`]) plus any of the other const-fn
+    /// builders to override the per-field defaults; the unset
+    /// fields stay at the values below.
+    ///
+    /// **Defaults** (intentional — these compose with the
+    /// per-test `#[ktstr_test]` attributes via merge, so every
+    /// field has a no-op identity that lets per-test overrides
+    /// take precedence):
+    /// - `binary`: [`SchedulerSpec::Eevdf`] — kernel default
+    ///   scheduling class, no scheduler binary launched.
+    ///   Override via [`Self::binary`] / [`Self::binary_discover`].
+    /// - `sysctls` / `kargs` / `sched_args`: empty slices — no
+    ///   guest sysctls applied, no extra kernel cmdline args, no
+    ///   extra scheduler CLI args.
+    /// - `assert`: [`crate::assert::Assert::NO_OVERRIDES`] — no
+    ///   threshold overrides on top of
+    ///   [`crate::assert::Assert::default_checks`].
+    /// - `cgroup_parent`: `None` — no `--cell-parent-cgroup`
+    ///   injection.
+    /// - `topology`: `1 numa × 1 llc × 2 cores × 1 thread` —
+    ///   smallest meaningful topology for a quick smoke
+    ///   scheduler. Override via [`Self::topology`].
+    /// - `constraints`: [`TopologyConstraints::DEFAULT`] — no
+    ///   gauntlet limits.
+    /// - `config_file` / `config_file_def`: `None` — no config
+    ///   file plumbing. Setting both at construction is rejected
+    ///   at validation time.
+    /// - `kernels`: empty slice — verifies against every kernel
+    ///   in the operator's `--kernel` set (no per-scheduler
+    ///   filter).
     pub const fn named(name: &'static str) -> Scheduler {
         Scheduler {
             name,
