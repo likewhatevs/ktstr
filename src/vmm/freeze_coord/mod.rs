@@ -6385,17 +6385,17 @@ impl KtstrVm {
                     // the error in CI can find the live work.
                     //
                     // Drain ordering: this block runs AFTER the
-                    // snapshot drain above (per adversary
-                    // attack-surface #5: a slow cold-op batch
-                    // bounded by KERNEL_OP_MAX_ENTRIES_PER_BATCH
-                    // still consumes a freeze-rendezvous budget
-                    // once the handler internals at #48 are live;
-                    // running the snapshot drain first prevents
-                    // hostile-batch starvation of
-                    // `Op::CaptureSnapshot` / `Op::WatchSnapshot`
-                    // whose own 30 s per-op deadlines would
-                    // otherwise be pushed past the watchdog by a
-                    // pathological cold-op batch).
+                    // snapshot drain above. Snapshot ops carry a
+                    // 30 s guest-side per-op deadline; running the
+                    // snapshot drain first preserves that headroom
+                    // when a cold-op batch later consumes
+                    // freeze-rendezvous budget from the same
+                    // iteration. Snapshot-priority is a behavior
+                    // choice — Op::CaptureSnapshot / Op::WatchSnapshot
+                    // call sites assume the captured state reflects
+                    // the moment the op was issued, not the moment
+                    // after an arbitrary-duration kernel-op batch
+                    // finished modifying that same kernel state.
                     let pending_kernel_ops = std::mem::take(&mut kernel_op_requests_pending);
                     for req in pending_kernel_ops {
                         // Bound the reason field at

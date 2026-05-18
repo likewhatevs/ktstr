@@ -440,17 +440,17 @@ pub(super) fn dispatch_bulk_message(
             // `None` via `postcard::from_bytes` and drop the same
             // way for the same reason.
             //
-            // Hostile-guest tag-length defense: `req.tag` is a
-            // `String` bounded only by the bulk-frame cap (16 MiB)
-            // until decoded here — a hostile guest could publish a
-            // multi-megabyte tag and force the coordinator to
-            // format it into the reply's `reason` field, blow
-            // `KERNEL_OP_REPLY_MAX` when the reply is framed, and
-            // silently drop the reply on the guest's RX cap (op
-            // times out at the 30 s deadline). Truncate the tag at
-            // decode time to `KERNEL_OP_TAG_MAX` — bounded surface
-            // for every downstream consumer (format!, tracing,
-            // reply payload). The host-side cold handler (see
+            // Tag bound: `req.tag` is a `String` and downstream
+            // formatters (the reply `reason` field, tracing) embed
+            // it inline. A framework bug or test-author misuse
+            // (e.g. a tag accidentally concatenated with a debug
+            // dump) producing a multi-megabyte tag would inflate
+            // the postcard-encoded reply past `KERNEL_OP_REPLY_MAX`
+            // and the reply would silently drop at the guest's RX
+            // cap, surfacing only as a 30 s transport timeout.
+            // Bounding the tag length at decode time keeps reply
+            // sizes predictable for any input the framework
+            // produces. The host-side cold handler (see
             // `freeze_coord/mod.rs` pending-request processing)
             // validates the resolved PA against the kernel-half +
             // guest-memory-size + width-alignment invariants before
@@ -461,31 +461,15 @@ pub(super) fn dispatch_bulk_message(
                         &msg.payload[..],
                     )
             {
-                // Reject hostile-batch requests at decode time.
-                // A guest publishing entries.len() > the per-batch
-                // cap would force the cold-path freeze-rendezvous
-                // to span thousands of writes, starving the
-                // snapshot drain that runs alongside the kernel-op
-                // drain in the coord loop. Silent drop — the
-                // matching reply path needs a freeze rendezvous to
-                // dispatch through and the per-iteration drain
-                // budget is exactly what the cap is protecting.
-                // Operator-trusted guests stay under the cap by
-                // construction (`with_uptime` 64-CPU = 64 entries);
-                // a buggy or hostile guest publishing 1024+
-                // entries gets dropped at the gate, which the
-                // guest's 30 s per-op deadline surfaces.
-                if req.entries.len() > crate::vmm::wire::KERNEL_OP_MAX_ENTRIES_PER_BATCH {
-                    return None;
-                }
                 // String::truncate panics if the cut lands inside
-                // a multi-byte UTF-8 sequence. A hostile guest
-                // publishing a tag whose 256th byte falls mid-codepoint
-                // would crash the coordinator thread — that's
-                // host-side DoS through the wire path. Walk down
-                // from KERNEL_OP_TAG_MAX until is_char_boundary
-                // returns true; index 0 is guaranteed-valid so the
-                // loop terminates without panic.
+                // a multi-byte UTF-8 sequence. Any input string
+                // (operator-typed test name, framework-generated
+                // phase label) could happen to land its 256th byte
+                // mid-codepoint, and the bare truncate would crash
+                // the coordinator thread. Walk down from
+                // KERNEL_OP_TAG_MAX until is_char_boundary returns
+                // true; index 0 is guaranteed-valid so the loop
+                // terminates without panic.
                 if req.tag.len() > crate::vmm::wire::KERNEL_OP_TAG_MAX {
                     let mut idx = crate::vmm::wire::KERNEL_OP_TAG_MAX;
                     while !req.tag.is_char_boundary(idx) {

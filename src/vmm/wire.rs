@@ -1053,46 +1053,31 @@ pub struct KernelOpReplyPayload {
 /// buggy host cannot OOM the guest's PID 1 init.
 pub const KERNEL_OP_REPLY_MAX: usize = 1024 * 1024;
 
-/// Upper bound on the bytes of [`KernelOpRequestPayload::tag`] +
-/// [`KernelOpReplyPayload::reason`] strings. Bounds the
-/// hostile-guest attack surface against the wire layer's 16 MiB
-/// bulk-frame cap — without this cap a guest could publish a
-/// multi-megabyte tag, force the coordinator to format it into
-/// the reply's `reason` field, blow [`KERNEL_OP_REPLY_MAX`] when
-/// the reply is framed, and silently drop the reply on the
-/// guest's RX cap — turning a hostile request into a
-/// 30-second-per-op transport timeout. Tags longer than this cap
-/// are truncated at decode time in
-/// `src/vmm/freeze_coord/dispatch.rs`'s `MsgType::KernelOpRequest`
-/// arm; reason strings produced by the coordinator are
-/// `truncate()`-bounded at format time. 256 bytes is generous for
-/// operator-readable tags (test names, scenario phase labels)
-/// while keeping the bounded-surface invariant intact.
+/// Upper bound on [`KernelOpRequestPayload::tag`] bytes.
+/// `req.tag` is a `String` and downstream formatters (the reply
+/// `reason` field, tracing emits) embed it inline. Without a
+/// bound, a framework bug or test-author misuse producing a
+/// multi-megabyte tag would inflate the postcard-encoded reply
+/// past [`KERNEL_OP_REPLY_MAX`] and the reply would silently
+/// drop at the guest's RX cap, surfacing only as a 30-second
+/// transport timeout. Tags longer than this cap are truncated at
+/// decode time in `src/vmm/freeze_coord/dispatch.rs`'s
+/// `MsgType::KernelOpRequest` arm with a UTF-8 char-boundary
+/// walk-down to avoid the `String::truncate` mid-codepoint panic.
+/// 256 bytes fits operator-readable test-name and scenario-phase
+/// labels with headroom; framework code that benignly produces
+/// longer tags loses suffix bytes from the diagnostic but the op
+/// itself continues normally.
 pub const KERNEL_OP_TAG_MAX: usize = 256;
-/// Upper bound on [`KernelOpReplyPayload::reason`] bytes. See
-/// [`KERNEL_OP_TAG_MAX`] for the hostile-guest-attack rationale —
-/// the reason cap covers the reply path the way the tag cap
-/// covers the request path. 256 bytes fits diagnostic messages
-/// like "PA validation rejected: pa=0x... reason=wrong-half" plus
-/// the request_id + truncated tag.
+/// Upper bound on [`KernelOpReplyPayload::reason`] bytes. Pairs
+/// with [`KERNEL_OP_TAG_MAX`] for the reply-side bound:
+/// coordinator-generated reasons embed the request tag inline and
+/// otherwise format diagnostic text from typed-error payloads.
+/// 256 bytes fits diagnostic messages like
+/// "PA validation rejected: pa=0x... reason=wrong-half" plus the
+/// request_id and the truncated tag.
 pub const KERNEL_OP_REASON_MAX: usize = 256;
 
-/// Upper bound on entries per [`KernelOpRequestPayload`] batch.
-/// Without a cap, a hostile or buggy guest could submit a single
-/// request with thousands of entries — each entry would consume a
-/// freeze-rendezvous deadline budget once the cold-path handler
-/// internals land, starving the per-iteration snapshot drain that
-/// runs alongside the kernel-op drain in the coord loop. The
-/// snapshot drain has its own deadlines (Op::CaptureSnapshot has
-/// a 30 s guest-side per-op deadline); a kernel-op batch whose
-/// freeze duration approaches that bound could push the snapshot
-/// past its deadline and silently drop. 64 entries covers every
-/// realistic batch shape (`with_uptime` writing per-CPU `rq.clock`
-/// on 64 CPUs is the canonical use case; larger CPU counts split
-/// across multiple ops with the existing adjacent-fold pre-pass)
-/// while bounding per-call freeze duration well under the
-/// snapshot drain's deadline budget.
-pub const KERNEL_OP_MAX_ENTRIES_PER_BATCH: usize = 64;
 
 /// Outcome of a guest-driven kernel-memory op request: the host
 /// returned a reply (caller inspects [`KernelOpReplyPayload::success`])
