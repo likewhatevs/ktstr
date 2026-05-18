@@ -112,6 +112,21 @@ pub struct Sample<'a> {
     /// assertion so a stats-coverage gap can never silently slip
     /// past the call site).
     pub stats: Result<&'a serde_json::Value, &'a crate::scenario::snapshot::MissingStatsReason>,
+    /// Scenario phase index the freeze coordinator stamped onto
+    /// this sample at capture time. Encoded per the framework's
+    /// 1-indexed phase convention — `0` is the BASELINE settle
+    /// window, `1..=N` align with scenario Step ordinals. `None`
+    /// for fixture-injected samples that took the unstamped legacy
+    /// bridge paths
+    /// ([`super::snapshot::SnapshotBridge::capture`] /
+    /// [`super::snapshot::SnapshotBridge::store`] /
+    /// [`super::snapshot::SnapshotBridge::store_with_stats`]);
+    /// production captures via the periodic-fire path and the
+    /// on-demand `Op::CaptureSnapshot` / `Op::WatchSnapshot` apply
+    /// arms always carry `Some(idx)`. Read by
+    /// [`SampleSeries::by_phase`] to bucket samples per scenario
+    /// phase for the phase-aware aggregator.
+    pub step_index: Option<u16>,
 }
 
 /// Ordered collection of [`Sample`]s drained from a
@@ -149,6 +164,12 @@ struct SampleRow {
     report: FailureDumpReport,
     stats: Result<serde_json::Value, crate::scenario::snapshot::MissingStatsReason>,
     elapsed_ms: u64,
+    /// Scenario phase index stamped at capture time by the
+    /// step-aware bridge entry points, mirrored from
+    /// [`super::snapshot::DrainedSnapshotEntry::step_index`].
+    /// `None` for unstamped legacy / fixture captures (see
+    /// [`Sample::step_index`] for the surfaced semantic).
+    step_index: Option<u16>,
 }
 
 /// Common scaffolding shared by every projector axis (bpf / stats /
@@ -210,6 +231,11 @@ impl SampleSeries {
                     crate::scenario::snapshot::MissingStatsReason::NoSchedulerBinary,
                 )),
                 elapsed_ms: elapsed_ms.unwrap_or(0),
+                // Unstamped fixture path: samples surface with
+                // `step_index = None` and fall under the by_phase
+                // fallback bucket. Production callers thread the
+                // bridge-stamped index via from_drained_typed.
+                step_index: None,
             })
             .collect();
         Self { rows, monitor }
@@ -236,6 +262,7 @@ impl SampleSeries {
                     report,
                     stats,
                     elapsed_ms,
+                    step_index,
                     ..
                 } = entry;
                 SampleRow {
@@ -243,6 +270,7 @@ impl SampleSeries {
                     report,
                     stats,
                     elapsed_ms: elapsed_ms.unwrap_or(0),
+                    step_index,
                 }
             })
             .collect();
@@ -301,14 +329,48 @@ impl SampleSeries {
 
     /// Iterate over [`Sample`] views borrowing into this series.
     /// Each yielded `Sample<'_>` carries the tag, elapsed-ms,
-    /// borrowed [`Snapshot`], and borrowed `Option<&Value>` stats.
+    /// borrowed [`Snapshot`], borrowed `Option<&Value>` stats,
+    /// and the per-sample phase step index.
     pub fn iter_samples(&self) -> impl Iterator<Item = Sample<'_>> {
         self.rows.iter().map(|r| Sample {
             tag: r.tag.as_str(),
             elapsed_ms: r.elapsed_ms,
             snapshot: Snapshot::new(&r.report),
             stats: r.stats.as_ref(),
+            step_index: r.step_index,
         })
+    }
+
+    /// Group samples by their stamped scenario phase. The returned
+    /// map is keyed by `step_index` (1-indexed phase encoding —
+    /// `0` is BASELINE, `1..=N` align with scenario Step ordinals);
+    /// each entry is the ordered run of samples that fell in that
+    /// phase, preserving the iteration order produced by
+    /// [`Self::iter_samples`].
+    ///
+    /// Samples that lack a stamped step index (the unstamped
+    /// fixture path via
+    /// [`super::snapshot::SnapshotBridge::capture`] /
+    /// [`super::snapshot::SnapshotBridge::store`] /
+    /// [`super::snapshot::SnapshotBridge::store_with_stats`]) fall
+    /// under key `0` per the "no stamped index" fallback — the same
+    /// bucket BASELINE samples land in. The fixture / BASELINE
+    /// collision is acceptable because both flavours represent
+    /// pre-first-Step (or unstamped) state from the bucketer's
+    /// perspective; production callers that need to distinguish
+    /// can inspect `Sample::step_index` directly.
+    ///
+    /// The phase-aware aggregator consumes this map to compute
+    /// per-phase metric reductions (Counter `last - first` delta,
+    /// Gauge / Peak / Timestamp via [`crate::stats::aggregate_samples`]).
+    pub fn by_phase(&self) -> std::collections::BTreeMap<u16, Vec<Sample<'_>>> {
+        let mut by_phase: std::collections::BTreeMap<u16, Vec<Sample<'_>>> =
+            std::collections::BTreeMap::new();
+        for sample in self.iter_samples() {
+            let key = sample.step_index.unwrap_or(0);
+            by_phase.entry(key).or_default().push(sample);
+        }
+        by_phase
     }
 }
 
