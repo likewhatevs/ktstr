@@ -147,12 +147,98 @@ fn any_of_chooses_passing_branch() {
         "failed-branch details must be dropped: {:?}",
         r.details,
     );
-    // The chosen-branch annotation MUST appear with branch index 1.
+    // The chosen-branch annotation MUST appear in info_notes with
+    // branch index 1 — any_of moves its "branch N satisfied"
+    // annotation to the structural info-notes stream, never the
+    // failure stream.
     assert!(
-        r.details.iter().any(|d| matches!(d.kind, DetailKind::Note)
-            && d.message.contains("any_of: branch 1 satisfied")),
+        r.info_notes
+            .iter()
+            .any(|n| n.message.contains("any_of: branch 1 satisfied")),
         "chosen-branch annotation missing: {:?}",
-        r.details,
+        r.info_notes,
+    );
+}
+
+/// `any_of` with all branches failing must prefix EVERY branch's
+/// `info_notes` with the same `any_of[<idx>]:` stamp as `details`.
+/// Symmetric structural treatment — the auto-repro renderer attributes
+/// notes to the branch that emitted them. A regression that dropped
+/// the info_notes prefix loop would silently strip attribution.
+#[test]
+fn any_of_all_fail_prefixes_info_notes_with_branch_index() {
+    let r = AssertResult::any_of([
+        {
+            let mut a = AssertResult::fail(AssertDetail::new(DetailKind::Other, "boom_0"));
+            a.note("context_from_branch_0");
+            a
+        },
+        {
+            let mut b = AssertResult::fail(AssertDetail::new(DetailKind::Other, "boom_1"));
+            b.note("context_from_branch_1");
+            b
+        },
+    ]);
+    assert!(!r.passed);
+    let messages: Vec<&str> = r.info_notes.iter().map(|n| n.message.as_str()).collect();
+    assert!(
+        messages.contains(&"any_of[0]: context_from_branch_0"),
+        "branch 0 note must carry index prefix: {:?}",
+        r.info_notes,
+    );
+    assert!(
+        messages.contains(&"any_of[1]: context_from_branch_1"),
+        "branch 1 note must carry index prefix: {:?}",
+        r.info_notes,
+    );
+}
+
+/// `any_of` with at least one passing branch unions info_notes from
+/// every passing branch (each prefix-stamped with `any_of[<idx>]:`)
+/// plus the bare arbiter "branch N satisfied" annotation. Failed-
+/// branch info_notes are dropped (matching failed-branch details
+/// policy). Pinned so a regression that drops the pass-path union
+/// loop or the prefix stamping silently loses operator-visible
+/// provenance.
+#[test]
+fn any_of_pass_path_unions_passing_branch_info_notes_with_prefix() {
+    let r = AssertResult::any_of([
+        {
+            let mut a = AssertResult::pass();
+            a.note("context_from_branch_0");
+            a
+        },
+        {
+            let mut b = AssertResult::pass();
+            b.note("context_from_branch_1");
+            b
+        },
+        {
+            let mut c = AssertResult::fail(AssertDetail::new(DetailKind::Other, "boom"));
+            c.note("context_from_branch_2_failed");
+            c
+        },
+    ]);
+    assert!(r.passed);
+    let messages: Vec<&str> = r.info_notes.iter().map(|n| n.message.as_str()).collect();
+    // Branch 0 + branch 1 notes survive, both prefix-stamped.
+    assert!(
+        messages.contains(&"any_of[0]: context_from_branch_0"),
+        "branch 0 passing note must survive with prefix: {messages:?}"
+    );
+    assert!(
+        messages.contains(&"any_of[1]: context_from_branch_1"),
+        "branch 1 passing note must survive with prefix: {messages:?}"
+    );
+    // Failed-branch note is dropped (matches details policy).
+    assert!(
+        !messages.iter().any(|m| m.contains("branch_2_failed")),
+        "failed-branch note must be dropped: {messages:?}"
+    );
+    // Bare arbiter annotation appended last (no prefix).
+    assert!(
+        messages.contains(&"any_of: branch 0 satisfied the disjunction"),
+        "bare arbiter annotation missing: {messages:?}"
     );
 }
 

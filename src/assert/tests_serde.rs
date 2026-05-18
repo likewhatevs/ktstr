@@ -46,12 +46,15 @@ fn assert_result_serde_roundtrip() {
         passes: vec![],
         stats: Default::default(),
         measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![InfoNote::new("ctx=42")],
     };
     let json = serde_json::to_string(&r).unwrap();
     let r2: AssertResult = serde_json::from_str(&json).unwrap();
     assert_eq!(r.passed, r2.passed);
     assert_eq!(r.details, r2.details);
     assert_eq!(r.passes, r2.passes);
+    assert_eq!(r.info_notes.len(), r2.info_notes.len());
+    assert_eq!(r.info_notes[0].message, r2.info_notes[0].message);
 }
 
 /// Strict-schema rejection sibling for `CgroupStats`. The
@@ -198,7 +201,7 @@ fn scenario_stats_missing_required_scalar_rejected_by_deserialize() {
 /// details / stats trips this test.
 #[test]
 fn assert_result_missing_required_field_rejected_by_deserialize() {
-    // All six `AssertResult` fields are wire-required (the struct
+    // All seven `AssertResult` fields are wire-required (the struct
     // has no `Default` derive and no `#[serde(default)]` on any
     // field). Loop over each; each removal must fail deserialize
     // with a missing-field error naming the removed field.
@@ -209,6 +212,7 @@ fn assert_result_missing_required_field_rejected_by_deserialize() {
         "passes",
         "stats",
         "measurements",
+        "info_notes",
     ];
 
     let r = AssertResult {
@@ -218,6 +222,7 @@ fn assert_result_missing_required_field_rejected_by_deserialize() {
         passes: vec![],
         stats: ScenarioStats::default(),
         measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
     };
     let full = match serde_json::to_value(&r).unwrap() {
         serde_json::Value::Object(m) => m,

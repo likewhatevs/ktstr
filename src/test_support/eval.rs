@@ -2050,6 +2050,25 @@ fn evaluate_vm_result(
                 .map(|d| d.message.as_str())
                 .collect::<Vec<_>>()
                 .join("\n  ");
+            // Render info_notes in their own delineated section
+            // (mirrors --- stats --- / --- auto-repro --- pattern)
+            // so the structural details-vs-info separation that
+            // sidecar consumers rely on is also visible at the
+            // operator-facing failure-dump boundary. An undelineated
+            // append into the failures block would interleave
+            // failure messages with context lines and undo the
+            // split's "details = failures" invariant at the human
+            // surface.
+            let info_section = if check_result.info_notes.is_empty() {
+                String::new()
+            } else {
+                let lines: Vec<String> = check_result
+                    .info_notes
+                    .iter()
+                    .map(|n| format!("  {}", n.message))
+                    .collect();
+                format!("\n\n--- info ---\n{}", lines.join("\n"))
+            };
             let repro = if entry.scheduler.has_active_scheduling() {
                 repro_fn(output)
             } else {
@@ -2126,13 +2145,14 @@ fn evaluate_vm_result(
             let temporal_section =
                 crate::test_support::output::format_temporal_assertions_section(&check_result);
             let msg = format!(
-                "{}{}ktstr_test '{}'{} [topo={}] failed:\n  {}{}{}{}{}{}{}{}{}{}",
+                "{}{}ktstr_test '{}'{} [topo={}] failed:\n  {}{}{}{}{}{}{}{}{}{}{}",
                 fingerprint_line,
                 bug_summary_line(),
                 entry.name,
                 sched_label,
                 topo,
                 details,
+                info_section,
                 stats_section,
                 console_section,
                 timeline_section,

@@ -3459,11 +3459,8 @@ fn collect_per_cpu_time(cap: &CpuTimeCapture<'_>) -> Vec<PerCpuTimeStats> {
 
         // kernel_cpustat::cpustat[N]: each slot is a u64 in nsec.
         // Read CPUTIME_USER through CPUTIME_STEAL (indices 0..=7).
-        let cpustat_kva = super::symbols::per_cpu_kva(
-            cap.kernel_cpustat_kva,
-            cap.kaslr_offset,
-            per_cpu_off,
-        );
+        let cpustat_kva =
+            super::symbols::per_cpu_kva(cap.kernel_cpustat_kva, cap.kaslr_offset, per_cpu_off);
         let cpustat_pa = super::symbols::kva_to_pa(cpustat_kva, cap.page_offset);
         let cpustat_base = cap.offsets.kernel_cpustat_cpustat;
         let read_cpustat = |idx: usize| -> u64 {
@@ -3481,11 +3478,7 @@ fn collect_per_cpu_time(cap: &CpuTimeCapture<'_>) -> Vec<PerCpuTimeStats> {
 
         // kernel_stat::softirqs[N]: each slot is a u32 (count).
         // Widen to u64 for reporting consistency with cpustat.
-        let kstat_kva = super::symbols::per_cpu_kva(
-            cap.kstat_kva,
-            cap.kaslr_offset,
-            per_cpu_off,
-        );
+        let kstat_kva = super::symbols::per_cpu_kva(cap.kstat_kva, cap.kaslr_offset, per_cpu_off);
         let kstat_pa = super::symbols::kva_to_pa(kstat_kva, cap.page_offset);
         let mut softirqs = [0u64; NR_SOFTIRQS];
         for (i, slot) in softirqs.iter_mut().enumerate() {
@@ -3507,11 +3500,7 @@ fn collect_per_cpu_time(cap: &CpuTimeCapture<'_>) -> Vec<PerCpuTimeStats> {
             .tick_cpu_sched_kva
             .zip(cap.offsets.tick_sched_iowait_sleeptime)
             .map(|(tick_sym_kva, off)| {
-                let kva = super::symbols::per_cpu_kva(
-                    tick_sym_kva,
-                    cap.kaslr_offset,
-                    per_cpu_off,
-                );
+                let kva = super::symbols::per_cpu_kva(tick_sym_kva, cap.kaslr_offset, per_cpu_off);
                 let pa = super::symbols::kva_to_pa(kva, cap.page_offset);
                 cap.mem.read_u64(pa, off)
             });

@@ -210,8 +210,7 @@ fn compute_owned(
     let mut rq_pas: Vec<u64> = Vec::with_capacity(n);
     let mut rq_kvas: Vec<u64> = Vec::with_capacity(n);
     for &offset in per_cpu_offsets {
-        let kva =
-            crate::monitor::symbols::per_cpu_kva(runqueues_kva, kaslr_offset, offset);
+        let kva = crate::monitor::symbols::per_cpu_kva(runqueues_kva, kaslr_offset, offset);
         let pa = crate::monitor::symbols::kva_to_pa(kva, page_offset);
         rq_pas.push(pa);
         rq_kvas.push(pa.wrapping_add(page_offset));
@@ -371,7 +370,14 @@ mod tests {
         let runqueues_kva: u64 = 0x20_0000;
         let scx_root_kva = 0xffff_ffff_8230_0000;
         let scx_tasks_kva = 0xffff_ffff_8240_0000;
-        let owned = compute_owned(page_offset, runqueues_kva, scx_root_kva, scx_tasks_kva, &[], 0);
+        let owned = compute_owned(
+            page_offset,
+            runqueues_kva,
+            scx_root_kva,
+            scx_tasks_kva,
+            &[],
+            0,
+        );
 
         assert!(owned.rq_kvas.is_empty());
         assert!(owned.rq_pas.is_empty());
@@ -457,12 +463,8 @@ mod tests {
             &per_cpu,
             kaslr,
         );
-        let expected_pas = crate::monitor::symbols::compute_rq_pas(
-            runqueues_kva,
-            &per_cpu,
-            page_offset,
-            kaslr,
-        );
+        let expected_pas =
+            crate::monitor::symbols::compute_rq_pas(runqueues_kva, &per_cpu, page_offset, kaslr);
         assert_eq!(
             owned.rq_pas, expected_pas,
             "compute_owned and compute_rq_pas must agree on non-zero \

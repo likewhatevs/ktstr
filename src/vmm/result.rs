@@ -735,8 +735,10 @@ mod tests {
         assert_eq!(r.snapshot_bridge.len(), 0);
         assert_eq!(c.snapshot_bridge.len(), 0);
         // Store a synthetic report through ONE clone's bridge.
-        r.snapshot_bridge
-            .store("regression_pin", crate::monitor::dump::FailureDumpReport::default());
+        r.snapshot_bridge.store(
+            "regression_pin",
+            crate::monitor::dump::FailureDumpReport::default(),
+        );
         // The OTHER clone observes the store — proves the Arc<Mutex<…>>
         // is shared, not deep-copied. If this assertion ever fires,
         // SnapshotBridge's Clone has changed shape and VmResult's

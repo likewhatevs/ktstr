@@ -284,8 +284,10 @@ impl KtstrKvm {
                 // them up sequentially via PSCI CPU_ON. arm64 still
                 // boots secondaries one at a time because
                 // arch/arm64/Kconfig does not `select HOTPLUG_PARALLEL`
-                // as of Linux v7.0; the generic infra at kernel/cpu.c
-                // is arch-neutral but waits for the arch to opt in.
+                // (re-verified at Linux v7.0-rc2; x86/mips/riscv DO
+                // select it under HOTPLUG_CPU at arch/{x86,mips,riscv}
+                // /Kconfig). The generic infra at kernel/cpu.c is
+                // arch-neutral but waits for the arch to opt in.
                 // When arm64 lands the select (re-grep
                 // `arch/arm64/Kconfig` annually for HOTPLUG_PARALLEL),
                 // ktstr can bump the arm64 CI matrix minimum kernel

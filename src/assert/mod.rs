@@ -144,6 +144,15 @@ fn spread_threshold_pct() -> f64 {
 /// Category tag for an [`AssertDetail`]. Enables structural filtering
 /// (e.g. by `AssertPlan`) without matching on substrings of
 /// human-readable messages, which is fragile if wording changes.
+///
+/// Notes previously lived as a `DetailKind::Note` variant on
+/// [`AssertDetail`]; they now live on [`AssertResult::info_notes`] as
+/// [`InfoNote`] values. See [`AssertResult::note`] /
+/// [`AssertResult::with_note`] for the producer-side migration and
+/// [`InfoNote`] for the rationale (structurally-separate context
+/// stream so sidecar consumers iterating `details` count only real
+/// failures without a "forgot to filter `kind == Note`" miscount
+/// class of bug).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum DetailKind {
     /// A worker made zero progress.
@@ -228,27 +237,6 @@ pub enum DetailKind {
     Temporal,
     /// Skip notification (scenario could not run under this topology/flags).
     Skip,
-    /// Informational annotation that does NOT contribute to the
-    /// failure verdict. Use when a scenario wants to surface
-    /// observed values, environment context, or measured numbers
-    /// alongside the verdict — e.g. "max_wchar=12345" attached to
-    /// a passing IO_ACCOUNTING reachability check, or "psi.cpu.some
-    /// total_usec=0 (kernel did not accumulate)" surfaced from a
-    /// pass that intentionally allows the zero case.
-    ///
-    /// Producers should keep `AssertResult::passed = true` when
-    /// adding a `Note` detail; the kind is purely structural so
-    /// downstream consumers (sidecar parsers, stats tooling, the
-    /// `evaluate_vm_result` failure path) can filter informational
-    /// rows from genuine failures without scanning message text.
-    /// `AssertResult::note` and `AssertResult::with_note` are the
-    /// note-emitting helpers — neither enforces the invariant via
-    /// debug_assert or otherwise; they just append the detail and
-    /// leave `passed` untouched. Hand-constructed results that
-    /// flip `passed = false` while pushing a `Note` detail still
-    /// produce a valid (failing) result, but the kind is meant
-    /// to read as "context", not "what failed".
-    Note,
     /// Uncategorized — falls through when a detail has no specific kind.
     Other,
 }
@@ -668,6 +656,66 @@ impl From<String> for AssertDetail {
     }
 }
 
+/// Informational annotation that does NOT contribute to the failure
+/// verdict — the structural counterpart to [`AssertDetail`] for
+/// "context surfaced alongside a result" emissions. Lives in its own
+/// type (not as a `DetailKind` variant of `AssertDetail`) so the
+/// "details = failures" mental model holds at the type level:
+/// `AssertResult::details` is the failure stream, `AssertResult::info_notes`
+/// is the context stream. Producers can no longer accidentally tag a
+/// note as a failure (the prior `DetailKind::Note` variant on
+/// `AssertDetail` made misclassification a one-character bug — every
+/// sidecar consumer that read `details` needed to remember to filter
+/// `kind == Note` to count real failures, and forgetting silently
+/// misreported failure counts).
+///
+/// Carries the same `phase` field as [`AssertDetail`] so the auto-repro
+/// renderer can attribute notes to the scenario phase they were emitted
+/// under, mirroring the per-step grouping already used for failures
+/// and passes.
+///
+/// `PartialEq + Eq` mirror the derive set on [`AssertDetail`] and
+/// [`PassDetail`] so test authors can compose `AssertResult` fixtures
+/// across the three record types with uniform structural-equality
+/// affordances. Test authors should still prefer
+/// `result.info_notes.iter().any(|n| n.message.contains(...))` over
+/// `assert_eq!(result.info_notes, expected)` so pins survive note
+/// wording adjustments without churn.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InfoNote {
+    pub message: String,
+    /// Scenario phase the note was emitted under. Mirrors
+    /// [`AssertDetail::phase`] and [`PassDetail::phase`] so the
+    /// renderer threads pass / fail / note records through one
+    /// per-phase grouping.
+    pub phase: Option<std::borrow::Cow<'static, str>>,
+}
+
+impl InfoNote {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            phase: None,
+        }
+    }
+
+    /// Builder-style setter for [`Self::phase`]. Matches the
+    /// [`AssertDetail::with_phase`] shape so producers can chain
+    /// `InfoNote::new(...).with_phase(...)` uniformly with the
+    /// failure-detail builder.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_phase(mut self, phase: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        self.phase = Some(phase.into());
+        self
+    }
+}
+
+impl std::fmt::Display for InfoNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 impl From<&str> for AssertDetail {
     /// Conversion for uncategorized messages; defaults `kind` to
     /// [`DetailKind::Other`]. Prefer [`AssertDetail::new`] when the
@@ -716,12 +764,14 @@ impl std::fmt::Display for AssertDetail {
 /// tooling reads `result.measurements["max_wchar"]` as
 /// `NoteValue::Int(12345)`.
 ///
-/// Distinct from [`AssertDetail`]'s free-form `Note` message: the
-/// `Display` impl on `AssertDetail` is for human readers; the
-/// structured map is for programmatic consumption (sidecar parsers,
-/// `stats compare`, regression dashboards). Producers can call BOTH
-/// `note(msg)` and `note_value(key, val)` on the same result — they
-/// occupy independent buffers.
+/// Distinct from [`AssertResult::info_notes`]'s free-form
+/// [`InfoNote`] messages: an `InfoNote` carries a single human-
+/// readable string (formatted via its `Display` impl), the
+/// structured map carries typed `(key, NoteValue)` pairs for
+/// programmatic consumption (sidecar parsers, `stats compare`,
+/// regression dashboards). Producers can call BOTH `note(msg)`
+/// and `note_value(key, val)` on the same result — they occupy
+/// independent buffers (`info_notes` vs `measurements`).
 ///
 /// Conversion via the `From` impls below: any
 /// `i64`/`u64`/`f64`/`bool`/`String`/`&str` literal flows into
@@ -840,6 +890,16 @@ pub struct AssertResult {
     /// for programmatic consumption (sidecar parsers, `stats
     /// compare`, regression dashboards).
     pub measurements: std::collections::BTreeMap<String, NoteValue>,
+    /// Informational annotations attached via [`Self::note`] /
+    /// [`Verdict::note`]. Structurally separated from [`Self::details`]
+    /// so the failure stream stays purely failure-shaped: sidecar
+    /// consumers iterating `details` count real failures without
+    /// the "forgot to filter notes" silent-miscount class of bug
+    /// that the prior `DetailKind::Note` variant on [`AssertDetail`]
+    /// invited. The auto-repro renderer surfaces these alongside the
+    /// failure summary so the operator still sees them on a failing
+    /// run.
+    pub info_notes: Vec<InfoNote>,
 }
 
 /// Per-cgroup statistics from worker telemetry.
@@ -1070,6 +1130,7 @@ impl AssertResult {
             passes: vec![],
             stats: Default::default(),
             measurements: std::collections::BTreeMap::new(),
+            info_notes: vec![],
         }
     }
     /// Pass result with a skip reason. Used when a scenario cannot run
@@ -1082,6 +1143,7 @@ impl AssertResult {
             passes: vec![],
             stats: Default::default(),
             measurements: std::collections::BTreeMap::new(),
+            info_notes: vec![],
         }
     }
     /// Failing result carrying a single [`AssertDetail`]. Mirrors
@@ -1097,6 +1159,7 @@ impl AssertResult {
             passes: vec![],
             stats: Default::default(),
             measurements: std::collections::BTreeMap::new(),
+            info_notes: vec![],
         }
     }
     /// Failing result carrying a single diagnostic message with
@@ -1112,17 +1175,18 @@ impl AssertResult {
     pub fn fail_msg(msg: impl Into<String>) -> Self {
         Self::fail(AssertDetail::new(DetailKind::Other, msg))
     }
-    /// Append an informational annotation tagged
-    /// [`DetailKind::Note`]. Does NOT alter [`Self::passed`] or
-    /// [`Self::skipped`] — a note is context, not a verdict.
-    /// Use to surface observed values alongside a passing or
-    /// failing result so the sidecar carries the diagnostic
-    /// context an operator needs without forcing every test to
-    /// hand-format a `format!` and push it onto `details`
-    /// directly. The kind tag lets sidecar consumers filter
-    /// informational rows from genuine failures structurally.
+    /// Append an informational annotation to [`Self::info_notes`].
+    /// Does NOT alter [`Self::passed`] or [`Self::skipped`] — a note
+    /// is context, not a verdict. Use to surface observed values
+    /// alongside a passing or failing result so the sidecar carries
+    /// the diagnostic context an operator needs without forcing every
+    /// test to hand-format a `format!` and push onto `details`
+    /// directly. Notes live on the structurally-separate
+    /// [`Self::info_notes`] field — sidecar consumers iterating
+    /// `details` see only failures, eliminating the prior
+    /// "forgot to filter `kind == Note`" silent-miscount class of bug.
     pub fn note(&mut self, msg: impl Into<String>) -> &mut Self {
-        self.details.push(AssertDetail::new(DetailKind::Note, msg));
+        self.info_notes.push(InfoNote::new(msg));
         self
     }
     /// Builder-style sibling of [`Self::note`] returning the
@@ -1147,9 +1211,22 @@ impl AssertResult {
         !self.passed
     }
     /// Fold `other` into `self`. `passed` is conjoined (any failure
-    /// wins), `details` concatenate, and aggregate stats adopt the
-    /// worst-case value per dimension so the merged result represents
-    /// the union of all checks applied.
+    /// wins), `skipped` is conjoined (both must skip for the merged
+    /// result to be skipped), the four record vecs/maps —
+    /// [`Self::details`], [`Self::passes`], [`Self::info_notes`],
+    /// [`Self::measurements`] — all extend with `other`'s contents
+    /// (the three vecs concatenate; `measurements` is a `BTreeMap`
+    /// merged with plain last-write-wins on key collision, i.e.
+    /// `other`'s value overwrites `self`'s for shared keys).
+    /// Aggregate `stats` adopt the worst-case value per dimension
+    /// so the merged result represents the union of all checks
+    /// applied. The polarity-aware per-key min/max selection for
+    /// extensible scheduler metrics is a separate mechanism that
+    /// applies inside `stats.ext_metrics` only — see the loop at
+    /// the bottom of this body for the polarity registry path; the
+    /// result-level `measurements` map deliberately does not consult
+    /// the registry (it is a producer-attached typed annotation map,
+    /// not a roll-up aggregation surface).
     pub fn merge(&mut self, other: AssertResult) {
         /// Lowest-non-zero fold: `*self_field` becomes `other_field`
         /// when `other_field` is strictly positive AND either
@@ -1180,6 +1257,7 @@ impl AssertResult {
         self.skipped = self.skipped && other.skipped;
         self.details.extend(other.details);
         self.passes.extend(other.passes);
+        self.info_notes.extend(other.info_notes);
         let s = &mut self.stats;
         let o = &other.stats;
         s.total_workers += o.total_workers;
@@ -1326,11 +1404,15 @@ impl AssertResult {
     ///
     /// Outcomes:
     /// - **At least one branch passes**: returned result is passing.
-    ///   `details` carries the [`DetailKind::Note`]-tagged "branch N
-    ///   chosen" annotation pointing at the first passing branch.
-    ///   Failed-branch details are dropped (they would only confuse
-    ///   the operator with messages from the not-taken paths).
-    ///   `stats` adopts the first passing branch's `stats`.
+    ///   `info_notes` carries the union of every passing branch's
+    ///   info_notes, each prefix-stamped with `any_of[<branch-idx>]:`
+    ///   so an operator can attribute every note to the emitting
+    ///   branch. The synthesized "any_of: branch N satisfied the
+    ///   disjunction" arbiter annotation is appended last, bare
+    ///   (it's not from any branch — it IS the disposition).
+    ///   Failed-branch details and info_notes are dropped (they would
+    ///   only confuse the operator with messages from the not-taken
+    ///   paths). `stats` adopts the first passing branch's `stats`.
     ///   `measurements` union all passing branches' measurements
     ///   (last write wins on key collision, matching `merge`).
     ///   `skipped` follows the first passing branch.
@@ -1366,7 +1448,7 @@ impl AssertResult {
     /// assert!(r.passed);
     /// ```
     pub fn any_of(branches: impl IntoIterator<Item = AssertResult>) -> AssertResult {
-        let mut branches: Vec<AssertResult> = branches.into_iter().collect();
+        let branches: Vec<AssertResult> = branches.into_iter().collect();
         if branches.is_empty() {
             return AssertResult::fail(AssertDetail::new(
                 DetailKind::Other,
@@ -1377,25 +1459,61 @@ impl AssertResult {
         let first_pass_idx = branches.iter().position(|b| b.passed && !b.skipped);
         if let Some(idx) = first_pass_idx {
             // At least one branch passes. Take the first passing
-            // branch's stats / skipped, union measurements across
-            // every passing branch, and drop failed-branch details.
-            let mut chosen = branches.swap_remove(idx);
-            // After swap_remove(idx) we no longer iterate the
-            // original branches in their original order. Use the
-            // remaining `branches` to scoop up `measurements` from
-            // any other passing branches before discarding their
-            // `details`.
-            for b in branches {
-                if b.passed && !b.skipped {
+            // branch as the "chosen" narrative: keep its stats /
+            // skipped, union measurements AND info_notes across
+            // every passing branch (failed branches' content is
+            // dropped — they would only confuse the operator with
+            // messages from not-taken paths), and prefix every
+            // surviving info_note with `any_of[<branch-idx>]:` for
+            // operator-visible provenance.
+            //
+            // Iterate by enumerate() with `drain(..)` so the
+            // original branch indices are preserved as the prefix
+            // values. The chosen branch keeps its stats / skipped /
+            // passes (set up below); all branches contribute
+            // measurements + info_notes via the union loop.
+            let mut chosen: Option<AssertResult> = None;
+            let mut union_measurements: std::collections::BTreeMap<String, NoteValue> =
+                std::collections::BTreeMap::new();
+            let mut union_info_notes: Vec<InfoNote> = Vec::new();
+            for (orig_idx, b) in branches.into_iter().enumerate() {
+                if orig_idx == idx {
+                    // Pre-take the chosen branch's notes/measurements
+                    // so they enter the union loop on equal footing
+                    // with other passing branches.
+                    let mut b = b;
+                    let pre_notes = std::mem::take(&mut b.info_notes);
+                    let pre_meas = std::mem::take(&mut b.measurements);
+                    chosen = Some(b);
+                    for n in pre_notes {
+                        union_info_notes
+                            .push(InfoNote::new(format!("any_of[{orig_idx}]: {}", n.message)));
+                    }
+                    for (k, v) in pre_meas {
+                        union_measurements.insert(k, v);
+                    }
+                } else if b.passed && !b.skipped {
+                    for n in b.info_notes {
+                        union_info_notes
+                            .push(InfoNote::new(format!("any_of[{orig_idx}]: {}", n.message)));
+                    }
                     for (k, v) in b.measurements {
-                        chosen.measurements.insert(k, v);
+                        union_measurements.insert(k, v);
                     }
                 }
+                // Failed/skipped non-chosen branches: contents are
+                // dropped (would confuse the operator with not-taken
+                // path messages).
             }
-            chosen.details.push(AssertDetail::new(
-                DetailKind::Note,
-                format!("any_of: branch {idx} satisfied the disjunction"),
-            ));
+            let mut chosen = chosen.expect("first_pass_idx matched a branch");
+            chosen.measurements = union_measurements;
+            chosen.info_notes = union_info_notes;
+            // The synthesized arbiter annotation stays bare (not
+            // from any branch); appended last so it reads as the
+            // final disposition.
+            chosen.info_notes.push(InfoNote::new(format!(
+                "any_of: branch {idx} satisfied the disjunction"
+            )));
             chosen
         } else {
             // All branches failed. Concatenate details with branch-
@@ -1411,13 +1529,21 @@ impl AssertResult {
                 passes: first.passes,
                 stats: first.stats,
                 measurements: first.measurements,
+                info_notes: Vec::new(),
             };
-            // Re-prefix the first branch's details and feed in.
+            // Re-prefix the first branch's details and notes and feed
+            // in. info_notes get the same branch-index prefix as
+            // details so the operator can attribute every record to
+            // the branch that emitted it.
             for d in first.details {
                 acc.details.push(AssertDetail::new(
                     d.kind,
                     format!("any_of[0]: {}", d.message),
                 ));
+            }
+            for n in first.info_notes {
+                acc.info_notes
+                    .push(InfoNote::new(format!("any_of[0]: {}", n.message)));
             }
             for (idx, b) in iter {
                 for d in b.details {
@@ -1425,6 +1551,10 @@ impl AssertResult {
                         d.kind,
                         format!("any_of[{idx}]: {}", d.message),
                     ));
+                }
+                for n in b.info_notes {
+                    acc.info_notes
+                        .push(InfoNote::new(format!("any_of[{idx}]: {}", n.message)));
                 }
             }
             acc.details.push(AssertDetail::new(

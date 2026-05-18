@@ -165,6 +165,7 @@ fn merge_three_cgroups_worst_wins_and_iterations_sum() {
                 ..ScenarioStats::default()
             },
             measurements: std::collections::BTreeMap::new(),
+            info_notes: vec![],
         }
     }
 
@@ -555,6 +556,7 @@ fn assert_result_merge_combines_stats() {
             ..Default::default()
         },
         measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
     };
     let b = AssertResult {
         passed: false,
@@ -572,6 +574,7 @@ fn assert_result_merge_combines_stats() {
             ..Default::default()
         },
         measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
     };
     a.merge(b);
     assert!(!a.passed);

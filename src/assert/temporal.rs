@@ -1068,10 +1068,11 @@ fn push_detail(verdict: &mut Verdict, message: String) {
 /// Count `DetailKind::Temporal` entries in `verdict`'s underlying
 /// result. Used by [`maybe_log_pass_temporal`] to gate the
 /// positive-confirmation log on "this pattern added zero Temporal
-/// failures." Notes (e.g. vacuous-pattern or projection-error
-/// skip notes) carry `DetailKind::Note` and are excluded from the
-/// count, so a pattern that emits notes but no failure details
-/// still trips the positive log.
+/// failures." Vacuous-pattern and projection-error skip notes live on
+/// `AssertResult::info_notes` (a structurally-separate field from
+/// `details`) and are therefore naturally excluded from this count,
+/// so a pattern that emits notes but no failure details still trips
+/// the positive log.
 fn temporal_failure_count(verdict: &Verdict) -> usize {
     verdict
         .result()
@@ -1371,7 +1372,7 @@ mod tests {
         f.nondecreasing(&mut v);
         let r = v.into_result();
         assert!(r.passed);
-        assert!(r.details.iter().any(|d| d.kind == DetailKind::Note));
+        assert!(!r.info_notes.is_empty());
     }
 
     /// End-to-end sample: sanity-check that a series projection
@@ -1420,11 +1421,12 @@ mod tests {
             r.details
         );
         assert!(
-            r.details.iter().any(|d| d.kind == DetailKind::Note
-                && d.message.contains("skipped 1 sample")
-                && d.message.contains("periodic_001")),
-            "expected skip Note: {:?}",
-            r.details
+            r.info_notes
+                .iter()
+                .any(|n| n.message.contains("skipped 1 sample")
+                    && n.message.contains("periodic_001")),
+            "expected skip note: {:?}",
+            r.info_notes
         );
     }
 
@@ -1456,11 +1458,9 @@ mod tests {
             r.details
         );
         assert!(
-            r.details
-                .iter()
-                .any(|d| d.kind == DetailKind::Note && d.message.contains("gap")),
-            "expected gap Note: {:?}",
-            r.details
+            r.info_notes.iter().any(|n| n.message.contains("gap")),
+            "expected gap note: {:?}",
+            r.info_notes
         );
     }
 
@@ -1488,11 +1488,11 @@ mod tests {
         let r = v.into_result();
         assert!(r.passed, "{:?}", r.details);
         assert!(
-            r.details.iter().any(|d| d.kind == DetailKind::Note
-                && d.message.contains("skipped")
-                && d.message.contains("periodic_001")),
-            "expected skip Note: {:?}",
-            r.details
+            r.info_notes
+                .iter()
+                .any(|n| n.message.contains("skipped") && n.message.contains("periodic_001")),
+            "expected skip note: {:?}",
+            r.info_notes
         );
     }
 
@@ -1522,11 +1522,9 @@ mod tests {
         let r = v.into_result();
         assert!(r.passed, "{:?}", r.details);
         assert!(
-            r.details
-                .iter()
-                .any(|d| d.kind == DetailKind::Note && d.message.contains("1 pair")),
-            "expected gap Note: {:?}",
-            r.details
+            r.info_notes.iter().any(|n| n.message.contains("1 pair")),
+            "expected gap note: {:?}",
+            r.info_notes
         );
     }
 
@@ -1549,11 +1547,12 @@ mod tests {
             r.details
         );
         assert!(
-            r.details.iter().any(|d| d.kind == DetailKind::Note
-                && d.message.contains("insufficient samples")
-                && d.message.contains("need ≥3, have 2")),
-            "expected insufficient-samples Note with count: {:?}",
-            r.details
+            r.info_notes
+                .iter()
+                .any(|n| n.message.contains("insufficient samples")
+                    && n.message.contains("need ≥3, have 2")),
+            "expected insufficient-samples note with count: {:?}",
+            r.info_notes
         );
     }
 
@@ -1700,13 +1699,13 @@ mod tests {
         let r = v.into_result();
         // Verdict passes (nondecreasing skips errored samples).
         assert!(r.passed, "{:?}", r.details);
-        // The Note message names the placeholder sample.
+        // The note message names the placeholder sample.
         assert!(
-            r.details
+            r.info_notes
                 .iter()
-                .any(|d| d.kind == DetailKind::Note && d.message.contains("periodic_001")),
-            "expected skip Note naming placeholder sample: {:?}",
-            r.details
+                .any(|n| n.message.contains("periodic_001")),
+            "expected skip note naming placeholder sample: {:?}",
+            r.info_notes
         );
     }
 
@@ -1778,15 +1777,15 @@ mod tests {
             "nondecreasing must NOT flip on MissingStats: {:?}",
             r.details
         );
-        // The Note message names the MissingStats sample so the
+        // The note message names the MissingStats sample so the
         // operator sees the stats-coverage gap without re-walking
         // the source.
         assert!(
-            r.details
+            r.info_notes
                 .iter()
-                .any(|d| d.kind == DetailKind::Note && d.message.contains("periodic_001")),
-            "expected skip Note naming MissingStats sample: {:?}",
-            r.details
+                .any(|n| n.message.contains("periodic_001")),
+            "expected skip note naming MissingStats sample: {:?}",
+            r.info_notes
         );
     }
 

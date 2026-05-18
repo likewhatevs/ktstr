@@ -284,6 +284,7 @@ pub(crate) fn build_assert_result(passed: bool, details: Vec<AssertDetail>) -> A
         passes: vec![],
         stats: ScenarioStats::default(),
         measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
     }
 }
 

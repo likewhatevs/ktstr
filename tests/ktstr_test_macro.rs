@@ -29,6 +29,7 @@ fn basic_topology_check(ctx: &Ctx) -> Result<AssertResult> {
             passes: vec![],
             stats: Default::default(),
             measurements: std::collections::BTreeMap::new(),
+            info_notes: vec![],
         });
     }
     Ok(AssertResult::pass())
@@ -712,6 +713,7 @@ fn topology_matches_vm_spec(ctx: &Ctx) -> Result<AssertResult> {
             passes: vec![],
             stats: Default::default(),
             measurements: std::collections::BTreeMap::new(),
+            info_notes: vec![],
         })
     }
 }

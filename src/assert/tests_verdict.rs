@@ -8,59 +8,104 @@ use super::*;
 use crate::claim;
 use crate::workload::{WorkerReport, WorkerReportClaim};
 
-/// `AssertResult::note` records a `DetailKind::Note` detail
-/// without flipping `passed` or `skipped`. Tests downstream of
-/// note() rely on this — a sidecar consumer that filters notes
-/// from genuine failures depends on the verdict bits being
-/// untouched while the detail is appended.
+/// `AssertResult::note` records an [`InfoNote`] on `info_notes`
+/// without flipping `passed` or `skipped`, and without touching
+/// the `details` failure stream. The structural separation
+/// (notes != failures) is the invariant sidecar consumers rely on
+/// — iterating `details` counts real failures, iterating
+/// `info_notes` surfaces diagnostic context.
 #[test]
 fn assert_result_note_does_not_flip_passed_or_skipped() {
     let mut r = AssertResult::pass();
     let was_passed = r.passed;
     let was_skipped = r.skipped;
+    let was_details = r.details.len();
     r.note("observed worker.iterations=12345");
     assert_eq!(r.passed, was_passed);
     assert_eq!(r.skipped, was_skipped);
-    assert_eq!(r.details.len(), 1);
-    assert_eq!(r.details[0].kind, DetailKind::Note);
-    assert!(r.details[0].message.contains("worker.iterations"));
+    assert_eq!(
+        r.details.len(),
+        was_details,
+        "note must not pollute details"
+    );
+    assert_eq!(r.info_notes.len(), 1);
+    assert!(r.info_notes[0].message.contains("worker.iterations"));
 
     // Same on a skip-only result.
     let mut r = AssertResult::skip("topo missing");
     r.note("topo had 2 LLCs, test wants 4");
     assert!(r.passed);
     assert!(r.skipped);
-    // skip pushed a Skip detail; note pushed a Note detail.
-    // Two details, one each kind.
-    assert_eq!(r.details.len(), 2);
+    // skip pushed a Skip detail; note pushed to info_notes.
+    // details has only the Skip; info_notes has the note.
+    assert_eq!(r.details.len(), 1);
     assert_eq!(r.details[0].kind, DetailKind::Skip);
-    assert_eq!(r.details[1].kind, DetailKind::Note);
+    assert_eq!(r.info_notes.len(), 1);
+    assert!(r.info_notes[0].message.contains("LLCs"));
 }
 
 /// `AssertResult::with_note` is the builder-style sibling of
-/// `note`. Same invariant: never flips verdict, appends Note
-/// detail, returns the same owned shape.
+/// `note`. Same invariant: never flips verdict, appends to
+/// `info_notes` (not `details`), returns the same owned shape.
 #[test]
 fn assert_result_with_note_preserves_verdict() {
     let r = AssertResult::pass().with_note("max_wchar=6543");
     assert!(r.passed);
     assert!(!r.skipped);
-    assert_eq!(r.details.len(), 1);
-    assert_eq!(r.details[0].kind, DetailKind::Note);
-    assert!(r.details[0].message.contains("max_wchar=6543"));
+    assert!(r.details.is_empty(), "with_note must not pollute details");
+    assert_eq!(r.info_notes.len(), 1);
+    assert!(r.info_notes[0].message.contains("max_wchar=6543"));
 }
 
-/// Note kind survives serde round-trip — sidecar consumers
-/// match on DetailKind::Note structurally, so the wire format
-/// must preserve the variant.
+/// `info_notes` survive serde round-trip — sidecar consumers
+/// match on the structural `info_notes` field, so the wire format
+/// must preserve it across pass/fail/skip variants.
 #[test]
-fn note_kind_survives_serde_roundtrip() {
+fn info_note_survives_serde_roundtrip() {
     let r = AssertResult::pass().with_note("snapshot=disabled");
     let json = serde_json::to_string(&r).unwrap();
     let r2: AssertResult = serde_json::from_str(&json).unwrap();
-    assert_eq!(r2.details.len(), 1);
-    assert_eq!(r2.details[0].kind, DetailKind::Note);
-    assert!(r2.details[0].message.contains("snapshot=disabled"));
+    assert!(r2.details.is_empty());
+    assert_eq!(r2.info_notes.len(), 1);
+    assert!(r2.info_notes[0].message.contains("snapshot=disabled"));
+}
+
+/// `AssertResult::merge` must extend `info_notes` from BOTH sides.
+/// A regression that dropped the extend line (or biased to one side)
+/// would silently lose diagnostic context from the merged-in result
+/// — sidecar consumers would see only one of the two info-streams
+/// that fed the merge.
+#[test]
+fn merge_extends_info_notes_from_both_sides() {
+    let mut a = AssertResult::pass().with_note("note_from_a");
+    let b = AssertResult::pass().with_note("note_from_b");
+    a.merge(b);
+    assert_eq!(
+        a.info_notes.len(),
+        2,
+        "merge must concatenate both sides' notes"
+    );
+    let messages: Vec<&str> = a.info_notes.iter().map(|n| n.message.as_str()).collect();
+    assert!(
+        messages.contains(&"note_from_a"),
+        "a's note dropped during merge"
+    );
+    assert!(
+        messages.contains(&"note_from_b"),
+        "b's note dropped during merge"
+    );
+}
+
+/// `merge` preserves order: self's notes precede other's notes.
+/// `extend(iter)` is the natural ordering — pinning it so a future
+/// "sort by phase" refactor doesn't silently reorder.
+#[test]
+fn merge_preserves_info_notes_order_self_then_other() {
+    let mut a = AssertResult::pass().with_note("first");
+    let b = AssertResult::pass().with_note("second");
+    a.merge(b);
+    assert_eq!(a.info_notes[0].message, "first");
+    assert_eq!(a.info_notes[1].message, "second");
 }
 
 // -- Verdict pointwise-claim API -------------------------------------
@@ -663,8 +708,12 @@ fn verdict_note_does_not_affect_verdict() {
     let r = v.into_result();
     assert!(r.passed);
     assert!(!r.skipped);
-    assert_eq!(r.details.len(), 1);
-    assert_eq!(r.details[0].kind, DetailKind::Note);
+    assert!(
+        r.details.is_empty(),
+        "verdict.note must not pollute details"
+    );
+    assert_eq!(r.info_notes.len(), 1);
+    assert!(r.info_notes[0].message.contains("counter=12345"));
 }
 
 #[test]

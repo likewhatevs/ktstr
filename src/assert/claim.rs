@@ -783,7 +783,22 @@ impl<'a, T: Ord + std::fmt::Debug> SetClaim<'a, T> {
             reason,
         } = self;
         let outcome = if value.contains(needle) {
-            verdict.record_pass_binary(name, "set_contains", "", format_args!("{needle:?}"));
+            // Pass-actual is the set's length — naming the haystack
+            // size at pass time without dumping the full set into
+            // PassDetail::value (pass records are bounded by
+            // MAX_RECORDED_PASSES so we keep the payload compact, and
+            // the analogous `set_len_eq` comparator already publishes
+            // len-as-actual so consumers see a uniform shape across
+            // the set_* family). Prior emission used the empty string
+            // — that left consumers with no haystack signal at all,
+            // forcing them to re-derive the set context from the
+            // surrounding test setup.
+            verdict.record_pass_binary(
+                name,
+                "set_contains",
+                value.len(),
+                format_args!("{needle:?}"),
+            );
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(
@@ -997,7 +1012,16 @@ impl<'a, T: std::fmt::Debug> SeqClaim<'a, T> {
             reason,
         } = self;
         let outcome = if value.iter().any(|x| x == needle) {
-            verdict.record_pass_binary(name, "sequence_contains", "", format_args!("{needle:?}"));
+            // Pass-actual is the sequence length — mirrors the
+            // `sequence_len_eq` comparator's len-as-actual emission
+            // and the parallel `set_contains` rationale above
+            // (compact, uniform, gives consumers a haystack signal).
+            verdict.record_pass_binary(
+                name,
+                "sequence_contains",
+                value.len(),
+                format_args!("{needle:?}"),
+            );
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(

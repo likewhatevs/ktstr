@@ -427,10 +427,11 @@ aggregated statistics from a scenario run.
 
 ### Mutation and inspection
 
-- `result.note(msg)` -- append an informational annotation tagged
-  `DetailKind::Note`. Does NOT flip `passed` or `skipped` — a
-  note is context, not a verdict. Returns `&mut Self` so calls
-  chain.
+- `result.note(msg)` -- append an informational annotation to
+  `AssertResult::info_notes` (the structurally-separate context
+  stream, distinct from failure-carrying `details`). Does NOT
+  flip `passed` or `skipped` — a note is context, not a verdict.
+  Returns `&mut Self` so calls chain.
 - `result.with_note(msg)` -- builder-style sibling of `note` that
   consumes and returns `self`. Use at the return site to chain a
   context annotation onto a fresh result without an intermediate
