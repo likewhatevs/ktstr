@@ -521,21 +521,15 @@ mod tests {
     /// false-rejection. A regression that flipped either value would
     /// silently break dispatch.rs's kernel-text canonical check OR
     /// make kernel_op_dispatch.rs over-permissive.
-    #[test]
-    fn kernel_half_consts_5level_below_4level() {
-        assert!(
-            KERNEL_HALF_CONSERVATIVE_5LEVEL < KERNEL_HALF_CANONICAL_4LEVEL,
-            "5-level threshold must be permissively lower than 4-level \
-             canonical (5L={KERNEL_HALF_CONSERVATIVE_5LEVEL:#x}, \
-             4L={KERNEL_HALF_CANONICAL_4LEVEL:#x})",
-        );
-        assert_ne!(
-            KERNEL_HALF_CONSERVATIVE_5LEVEL,
-            KERNEL_HALF_CANONICAL_4LEVEL,
-            "constants must be distinct values (collapsing to one would \
-             defeat the purpose of the split rename)",
-        );
-    }
+    ///
+    /// `const _: () = assert!(...)` is a const-eval'd assertion that
+    /// fails at COMPILE time — strictly stronger than `#[test]` (no
+    /// dependency on running cargo test to bite). The collapse-rejection
+    /// (`!=`) is implicit in the strict `<`.
+    const _: () = assert!(
+        KERNEL_HALF_CONSERVATIVE_5LEVEL < KERNEL_HALF_CANONICAL_4LEVEL,
+        "5-level threshold must be permissively lower than 4-level canonical",
+    );
 
     /// Under-cap reasons pass through unchanged.
     #[test]

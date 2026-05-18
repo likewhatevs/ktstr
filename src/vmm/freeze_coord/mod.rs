@@ -11872,9 +11872,11 @@ mod kvm_clock_save_semantics_tests {
     fn take_yields_value_once_then_none() {
         let save: std::cell::RefCell<Option<kvm_clock_data>> =
             std::cell::RefCell::new(None);
-        let mut captured = kvm_clock_data::default();
-        captured.clock = 12345;
-        captured.flags = kvm_bindings::KVM_CLOCK_REALTIME;
+        let captured = kvm_clock_data {
+            clock: 12345,
+            flags: kvm_bindings::KVM_CLOCK_REALTIME,
+            ..Default::default()
+        };
         *save.borrow_mut() = Some(captured);
 
         let taken = save.borrow_mut().take();

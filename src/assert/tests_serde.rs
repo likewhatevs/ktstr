@@ -80,7 +80,7 @@ fn assert_result_postcard_roundtrip() {
     let mut measurements = std::collections::BTreeMap::new();
     measurements.insert("pid".to_string(), NoteValue::Int(-1));
     measurements.insert("bytes".to_string(), NoteValue::Uint(4096));
-    measurements.insert("rate".to_string(), NoteValue::Float(3.14));
+    measurements.insert("rate".to_string(), NoteValue::Float(3.15));
     measurements.insert("ok".to_string(), NoteValue::Bool(true));
     measurements.insert("label".to_string(), NoteValue::Text("benchmark".to_string()));
     let r = AssertResult {
@@ -116,7 +116,7 @@ fn assert_result_postcard_roundtrip() {
     assert_eq!(r2.measurements.get("pid"), Some(&NoteValue::Int(-1)));
     assert_eq!(r2.measurements.get("bytes"), Some(&NoteValue::Uint(4096)));
     if let Some(NoteValue::Float(f)) = r2.measurements.get("rate") {
-        assert!((f - 3.14).abs() < 1e-9);
+        assert!((f - 3.15).abs() < 1e-9);
     } else {
         panic!("rate must decode to NoteValue::Float, got {:?}", r2.measurements.get("rate"));
     }
@@ -142,7 +142,7 @@ fn assert_result_postcard_roundtrip() {
 /// silently-defaulted value.
 #[test]
 fn assert_strict_type_rejection_names_offending_field() {
-    let base = serde_json::to_value(&Assert::NO_OVERRIDES).expect("baseline serializes");
+    let base = serde_json::to_value(Assert::NO_OVERRIDES).expect("baseline serializes");
     let serde_json::Value::Object(base_obj) = base else {
         panic!("Assert must serialize as a JSON object");
     };

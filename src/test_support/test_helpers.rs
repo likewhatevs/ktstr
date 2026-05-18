@@ -284,13 +284,13 @@ pub(crate) fn build_assert_result(passed: bool, details: Vec<AssertDetail>) -> A
         // info_notes shape via Skip variants (rare; tests use this).
         details
             .into_iter()
-            .map(|d| crate::assert::Outcome::Skip(d))
+            .map(crate::assert::Outcome::Skip)
             .collect()
     } else {
         // Failing result — wrap each detail in a Fail outcome.
         details
             .into_iter()
-            .map(|d| crate::assert::Outcome::Fail(d))
+            .map(crate::assert::Outcome::Fail)
             .collect()
     };
     AssertResult {
