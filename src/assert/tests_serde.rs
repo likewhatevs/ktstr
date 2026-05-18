@@ -124,6 +124,58 @@ fn assert_result_postcard_roundtrip() {
     assert_eq!(r2.measurements.get("label"), Some(&NoteValue::Text("benchmark".to_string())));
 }
 
+/// Strict-type rejection on `Assert` deserialize. The serde
+/// derive emits typed `invalid type ...: expected $T` errors when
+/// the wire payload supplies the wrong type — a regression that
+/// softened any field to `#[serde(deserialize_with = lenient_*)]`
+/// or `#[serde(default)]` on a typed-wrong input would silently
+/// accept garbage and downgrade test thresholds. Pins three
+/// representative fields across distinct shapes:
+/// `enforce_monitor_thresholds` (bool) + `min_page_locality` +
+/// `max_slow_tier_ratio` (Option<f64>). Each case verifies both
+/// shape and locality: the error must be a typed-mismatch (not a
+/// "missing field" or generic parse error — the typed-mismatch
+/// shape is what discriminates strict from softened) AND the
+/// `serde_path_to_error` wrapper must surface the offending
+/// field name so an operator pasting a malformed config can
+/// diagnose at the source, not at the call site that consumed a
+/// silently-defaulted value.
+#[test]
+fn assert_strict_type_rejection_names_offending_field() {
+    let base = serde_json::to_value(&Assert::NO_OVERRIDES).expect("baseline serializes");
+    let serde_json::Value::Object(base_obj) = base else {
+        panic!("Assert must serialize as a JSON object");
+    };
+
+    let cases: &[(&str, serde_json::Value)] = &[
+        ("enforce_monitor_thresholds", serde_json::json!(0)),
+        ("enforce_monitor_thresholds", serde_json::json!("true")),
+        ("enforce_monitor_thresholds", serde_json::Value::Null),
+        ("min_page_locality", serde_json::json!("0.95")),
+        ("max_slow_tier_ratio", serde_json::json!(true)),
+    ];
+
+    for (field, wrong_val) in cases {
+        let mut obj = base_obj.clone();
+        obj.insert((*field).to_string(), wrong_val.clone());
+        let value = serde_json::Value::Object(obj);
+        let err = serde_path_to_error::deserialize::<_, Assert>(value)
+            .expect_err(&format!("deserialize must reject {field} = {wrong_val}"));
+        let path = err.path().to_string();
+        let inner = err.inner().to_string();
+        assert!(
+            inner.contains("invalid type"),
+            "deserialize error for `{field} = {wrong_val}` must be a typed-mismatch \
+             (`invalid type ...`), not a softened-default acceptance; got inner: {inner}"
+        );
+        assert_eq!(
+            path, *field,
+            "serde_path_to_error must surface the offending field path for \
+             `{field} = {wrong_val}`; got path `{path}` with inner `{inner}`"
+        );
+    }
+}
+
 /// Strict-schema rejection sibling for `CgroupStats`. The
 /// sidecar wire format persists one
 /// [`CgroupStats`](crate::assert::CgroupStats) per entry inside

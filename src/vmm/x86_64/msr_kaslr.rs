@@ -284,6 +284,44 @@ pub fn derive_virt_kaslr(lstar: u64, entry_syscall_64_link: u64) -> Result<u64, 
 /// Callers typically fall back to the `phys_base`-derived KASLR
 /// path on any error here — that path is independent and works
 /// whether or not LSTAR is meaningful.
+///
+/// # Confidential-compute caveat (SEV-ES / SEV-SNP / TDX)
+///
+/// `KVM_GET_MSRS` for MSR_LSTAR FAILS on confidential-compute
+/// guests — fail-loud rather than silent-garbage. ktstr does NOT
+/// target SEV-ES / SEV-SNP / TDX guests today; the gates below
+/// catch it correctly via the existing `is_retryable()` /
+/// `LstarUnsupported` / `LstarZero` path at L209-225, fall
+/// through to the wait-loop, and let the guest-channel
+/// `KERN_ADDRS` `_text` publisher
+/// (`src/vmm/freeze_coord/dispatch.rs`) or the `nokaslr` cmdline
+/// (`src/vmm/setup.rs`) become the authoritative source.
+///
+/// Kernel-source paths the gates rely on:
+///
+/// - SEV-ES / SEV-SNP: `svm_get_msr` (arch/x86/kvm/svm/svm.c:2733-2738)
+///   calls `sev_es_prevent_msr_access` FIRST
+///   (arch/x86/kvm/svm/svm.c:2725-2731). When
+///   `sev_es_guest(kvm) && vcpu->arch.guest_state_protected &&
+///    msr_index != MSR_IA32_XSS && !msr_write_intercepted`, data
+///   is zeroed AND returns `-EINVAL` if `has_protected_state`,
+///   else `0` (success with data=0). ioctl FAILS or returns
+///   zero — never garbage.
+///
+/// - TDX: `vt_get_msr` (arch/x86/kvm/vmx/main.c:183-189) dispatches
+///   to `tdx_get_msr` (arch/x86/kvm/vmx/tdx.c:2157-2180) for TD
+///   vCPUs. `tdx_get_msr` falls through to `kvm_get_msr_common`
+///   ONLY if `tdx_has_emulated_msr(index)` returns true
+///   (arch/x86/kvm/vmx/tdx.c:2104-2149) — an explicit allow-list
+///   (UCODE_REV, ARCH_CAPABILITIES, MTRR*, EFER, FEAT_CTL, etc.).
+///   MSR_LSTAR is NOT in the list, so `tdx_get_msr` returns 1,
+///   ioctl FAILS — never garbage.
+///
+/// Future cc support remains a fallback-engagement question, not a
+/// data-correctness one. If a confidential-compute backend is
+/// added, the existing fail-loud → KERN_ADDRS / nokaslr fallback
+/// chain Just Works; document the assumption explicitly at the
+/// backend's BSP-init site.
 pub(crate) fn read_and_derive(vcpu: &VcpuFd, entry_syscall_64_link: u64) -> Result<u64> {
     let lstar = read_one_msr(vcpu, MSR_LSTAR)?.ok_or_else(|| {
         anyhow::anyhow!(

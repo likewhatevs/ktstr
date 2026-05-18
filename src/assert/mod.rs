@@ -942,6 +942,58 @@ impl Outcome {
             (Skip(d), Skip(_)) => Skip(d),
         }
     }
+
+    /// Borrow this outcome's payload as an [`OutcomeRef`]. Zero-
+    /// allocation projection — `Pass` carries no payload, `Skip`
+    /// and `Fail` borrow their [`AssertDetail`] in place. Used by
+    /// the verdict-read fast path
+    /// ([`AssertResult::outcome_ref`]) and any caller that wants
+    /// to inspect the terminal verdict without cloning the
+    /// detail (e.g. error-message formatting where the detail
+    /// outlives the formatter, or sidecar emission that already
+    /// owns the source `Outcome`).
+    pub fn as_ref(&self) -> OutcomeRef<'_> {
+        match self {
+            Outcome::Pass => OutcomeRef::Pass,
+            Outcome::Skip(d) => OutcomeRef::Skip(d),
+            Outcome::Fail(d) => OutcomeRef::Fail(d),
+        }
+    }
+}
+
+/// Borrowed view of an [`Outcome`]: same three discriminants but
+/// the `Skip` and `Fail` payloads borrow their [`AssertDetail`]
+/// in place. Returned by [`Outcome::as_ref`] and the zero-clone
+/// verdict-read fast path [`AssertResult::outcome_ref`].
+///
+/// Use when the caller wants the terminal verdict shape (or its
+/// payload) WITHOUT taking ownership — typical sites are
+/// formatter and sidecar paths that already hold the source
+/// `AssertResult` and want to avoid the per-call
+/// `AssertDetail::clone` the owned [`Outcome`] accessor performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutcomeRef<'a> {
+    Pass,
+    Skip(&'a AssertDetail),
+    Fail(&'a AssertDetail),
+}
+
+impl OutcomeRef<'_> {
+    /// True iff `self == OutcomeRef::Pass`. Matches the boolean
+    /// shape of [`Outcome::is_pass`] for naming parity.
+    pub fn is_pass(&self) -> bool {
+        matches!(self, OutcomeRef::Pass)
+    }
+    /// True iff `self == OutcomeRef::Skip(_)`. Matches the
+    /// boolean shape of [`Outcome::is_skip`].
+    pub fn is_skip(&self) -> bool {
+        matches!(self, OutcomeRef::Skip(_))
+    }
+    /// True iff `self == OutcomeRef::Fail(_)`. Matches the
+    /// boolean shape of [`Outcome::is_fail`].
+    pub fn is_fail(&self) -> bool {
+        matches!(self, OutcomeRef::Fail(_))
+    }
 }
 
 /// Verdict for a single test scenario.
@@ -1471,6 +1523,11 @@ impl AssertResult {
     /// "empty Pass identity" / "real Pass beats Skip" /
     /// "all-Skip is Skip terminal" distinctions the boolean
     /// accessors enforce.
+    ///
+    /// Use [`Self::outcome_ref`] when the caller only needs to
+    /// inspect the verdict shape/payload without taking ownership —
+    /// avoids the per-call `AssertDetail::clone` this accessor
+    /// performs on the `Skip` / `Fail` arms.
     pub fn outcome(&self) -> Outcome {
         if let Some(d) = self.failure_details().next() {
             Outcome::Fail(d.clone())
@@ -1482,6 +1539,35 @@ impl AssertResult {
             }
         } else {
             Outcome::Pass
+        }
+    }
+
+    /// Borrow the terminal verdict as an [`OutcomeRef`]. Same
+    /// fold semantics as [`Self::outcome`] — `Fail > Pass > Skip`
+    /// precedence, empty-vec / non-empty-all-Skip / mixed-Pass-
+    /// plus-Skip branches all match — but the `Skip(_)` /
+    /// `Fail(_)` arms borrow the source [`AssertDetail`] from
+    /// `self.outcomes` instead of cloning. Use when the caller
+    /// holds the source `AssertResult` and wants the verdict
+    /// payload without the per-call clone (formatter / sidecar
+    /// emit / debug-render paths).
+    ///
+    /// Drift guard: `assert_result_outcome_ref_matches_owned_outcome_shape`
+    /// in `tests_assert.rs` pins the lockstep with [`Self::outcome`];
+    /// any divergence (e.g. a future refactor that adds a new
+    /// terminal arm here but forgets the owned accessor, or vice
+    /// versa) trips the test.
+    pub fn outcome_ref(&self) -> OutcomeRef<'_> {
+        if let Some(d) = self.failure_details().next() {
+            OutcomeRef::Fail(d)
+        } else if let Some(d) = self.skip_reasons().next() {
+            if self.outcomes.iter().all(|o| matches!(o, Outcome::Skip(_))) {
+                OutcomeRef::Skip(d)
+            } else {
+                OutcomeRef::Pass
+            }
+        } else {
+            OutcomeRef::Pass
         }
     }
     /// Fold `other` into `self`. The four parallel vecs/maps —

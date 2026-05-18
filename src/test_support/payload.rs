@@ -1865,4 +1865,93 @@ mod tests {
         assert!(bounds.value_min.is_none());
         assert!(bounds.value_max.is_none());
     }
+
+    /// `PayloadMetrics` postcard wire-format roundtrip. The type ships
+    /// guest→host inside `MSG_TYPE_PAYLOAD_METRICS` and the
+    /// postcard codec rejects any nested type carrying
+    /// `#[serde(untagged)]` or `#[serde(tag, content)]` at encode
+    /// time (`WontImplement`) — a regression introduced by a
+    /// contributor adding adjacent tagging to `Metric` or any
+    /// downstream field would surface as
+    /// `ERR_NO_TEST_FUNCTION_OUTPUT` on the host without this pin.
+    /// Sister inventory: see comment block at src/vmm/wire.rs.
+    #[test]
+    fn payload_metrics_postcard_roundtrip() {
+        let original = PayloadMetrics {
+            payload_index: 7,
+            metrics: vec![
+                Metric {
+                    name: "tput".to_string(),
+                    value: 12345.6,
+                    polarity: Polarity::HigherBetter,
+                    unit: "ops/s".to_string(),
+                    source: MetricSource::Json,
+                    stream: MetricStream::Stdout,
+                },
+                Metric {
+                    name: "lat_p99".to_string(),
+                    value: 0.025,
+                    polarity: Polarity::LowerBetter,
+                    unit: "s".to_string(),
+                    source: MetricSource::LlmExtract,
+                    stream: MetricStream::Stderr,
+                },
+            ],
+            exit_code: 0,
+        };
+        let bytes = postcard::to_allocvec(&original).expect("encode");
+        let back: PayloadMetrics = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(back.payload_index, original.payload_index);
+        assert_eq!(back.exit_code, original.exit_code);
+        assert_eq!(back.metrics.len(), original.metrics.len());
+        for (a, b) in original.metrics.iter().zip(back.metrics.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.value, b.value);
+        }
+    }
+
+    /// `RawPayloadOutput` postcard wire-format roundtrip. Same
+    /// silent-truncation class as the `PayloadMetrics` pin above —
+    /// ships guest→host via the LlmExtract path. Nested
+    /// `WireMetricHint` + `Polarity` must stay externally-tagged on
+    /// the postcard channel. Pin populates every field including the
+    /// `Option<String>` arm (Some + None) so a regression that
+    /// flipped `hint`'s encoding tags trips here.
+    #[test]
+    fn raw_payload_output_postcard_roundtrip() {
+        let original = RawPayloadOutput {
+            payload_index: 3,
+            stdout: "tput=987\n".to_string(),
+            stderr: "warn: clock drift\n".to_string(),
+            hint: Some("extract tput".to_string()),
+            metric_hints: vec![WireMetricHint {
+                name: "tput".to_string(),
+                polarity: Polarity::HigherBetter,
+                unit: "ops/s".to_string(),
+            }],
+            metric_bounds: None,
+        };
+        let bytes = postcard::to_allocvec(&original).expect("encode");
+        let back: RawPayloadOutput = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(back.payload_index, original.payload_index);
+        assert_eq!(back.stdout, original.stdout);
+        assert_eq!(back.stderr, original.stderr);
+        assert_eq!(back.hint, original.hint);
+        assert_eq!(back.metric_hints.len(), original.metric_hints.len());
+        // None branch on `hint` — covers the other arm of the Option
+        // encoding so a future externally-tagged-vs-untagged Option
+        // breakage on either arm trips here.
+        let none_hint = RawPayloadOutput {
+            payload_index: 4,
+            stdout: String::new(),
+            stderr: String::new(),
+            hint: None,
+            metric_hints: Vec::new(),
+            metric_bounds: None,
+        };
+        let bytes = postcard::to_allocvec(&none_hint).expect("encode None-hint");
+        let back: RawPayloadOutput =
+            postcard::from_bytes(&bytes).expect("decode None-hint");
+        assert_eq!(back.hint, None);
+    }
 }

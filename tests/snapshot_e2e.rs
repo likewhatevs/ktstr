@@ -367,13 +367,10 @@ fn scenario_snapshot_op_captures_in_vm(
         anyhow::bail!("entry.get(\"nr_cpus_onln\") returned {via_path}, expected 4");
     }
 
-    result.record_fail(ktstr::assert::AssertDetail::new(
-        ktstr::assert::DetailKind::Other,
-        format!(
-            "Op::capture_snapshot('test_snap') captured {} map(s); bpf.bss has \
-             nr_cpus_onln={via_var} via var() and {via_path} via dotted-path",
-            snap.map_count()
-        ),
+    result.note(format!(
+        "Op::capture_snapshot('test_snap') captured {} map(s); bpf.bss has \
+         nr_cpus_onln={via_var} via var() and {via_path} via dotted-path",
+        snap.map_count()
     ));
     Ok(result)
 }
@@ -534,15 +531,12 @@ fn scenario_watch_snapshot_op_captures_exit_state(
         );
     }
 
-    result.record_fail(ktstr::assert::AssertDetail::new(
-        ktstr::assert::DetailKind::Other,
-        format!(
-            "Op::watch_snapshot('exit_kind') drove register_watch \
-             ({attempts:?}); manually-fired capture loaded \
-             {} map(s) from {} with stall={stall}",
-            snap.map_count(),
-            dump_path.display(),
-        ),
+    result.note(format!(
+        "Op::watch_snapshot('exit_kind') drove register_watch \
+         ({attempts:?}); manually-fired capture loaded \
+         {} map(s) from {} with stall={stall}",
+        snap.map_count(),
+        dump_path.display(),
     ));
     Ok(result)
 }
@@ -700,12 +694,10 @@ fn scenario_snapshotmap_iter_against_synthetic_cgroup_map(
         );
     }
 
-    result.record_fail(ktstr::assert::AssertDetail::new(
-        ktstr::assert::DetailKind::Other,
+    result.note(
         "SnapshotMap iterator chain verified: find(cg_1002)=250, \
-         filter(>100).len()=2, max_by=cg_1003@500"
-            .to_string(),
-    ));
+         filter(>100).len()=2, max_by=cg_1003@500",
+    );
     Ok(result)
 }
 

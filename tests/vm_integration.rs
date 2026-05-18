@@ -158,14 +158,11 @@ fn scenario_dsq_and_rq_walker_populates_failure_dump(
         );
     }
 
-    result.record_fail(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "scx walker captured {} DSQ entries and {} rq->scx entries from \
-             frozen-VM walk",
-            dsq_states.len(),
-            rq_scx_states.len(),
-        ),
+    result.note(format!(
+        "scx walker captured {} DSQ entries and {} rq->scx entries from \
+         frozen-VM walk",
+        dsq_states.len(),
+        rq_scx_states.len(),
     ));
     Ok(result)
 }
@@ -233,14 +230,11 @@ fn scenario_perf_counters_capture_populates_dump(
         );
     }
 
-    result.record_fail(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "vcpu_perf_at_freeze: {}/{} vCPUs reported a non-null \
-             perf_event_open(exclude_host=1) sample at freeze",
-            populated.len(),
-            vcpu_perf.len(),
-        ),
+    result.note(format!(
+        "vcpu_perf_at_freeze: {}/{} vCPUs reported a non-null \
+         perf_event_open(exclude_host=1) sample at freeze",
+        populated.len(),
+        vcpu_perf.len(),
     ));
     Ok(result)
 }
@@ -308,13 +302,10 @@ fn scenario_event_counter_timeline_populates_dump(
         );
     }
 
-    result.record_fail(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "event_counter_timeline captured {} per-tick samples across \
-             the run window",
-            timeline.len(),
-        ),
+    result.note(format!(
+        "event_counter_timeline captured {} per-tick samples across \
+         the run window",
+        timeline.len(),
     ));
     Ok(result)
 }
@@ -407,14 +398,11 @@ fn scenario_sched_deadline_real_setattr(ctx: &ktstr::scenario::Ctx) -> Result<As
         return Ok(result);
     }
 
-    result.record_fail(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "SCHED_DEADLINE worker completed cleanly: tid={}, work_units={}, \
-             wall_time_ns={}, cpu_time_ns={} — sched_setattr(2) syscall \
-             path verified end-to-end on real kernel",
-            r.tid, r.work_units, r.wall_time_ns, r.cpu_time_ns,
-        ),
+    result.note(format!(
+        "SCHED_DEADLINE worker completed cleanly: tid={}, work_units={}, \
+         wall_time_ns={}, cpu_time_ns={} — sched_setattr(2) syscall \
+         path verified end-to-end on real kernel",
+        r.tid, r.work_units, r.wall_time_ns, r.cpu_time_ns,
     ));
     Ok(result)
 }
@@ -484,15 +472,12 @@ fn scenario_failure_dump_trigger_minimal_invariants(
         );
     }
 
-    result.record_fail(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "failure-dump trigger pipeline produced schema={schema:?}, \
-             {} maps, {} vcpu_regs entries — full-stack capture path \
-             verified end-to-end",
-            maps.len(),
-            vcpu_regs.len(),
-        ),
+    result.note(format!(
+        "failure-dump trigger pipeline produced schema={schema:?}, \
+         {} maps, {} vcpu_regs entries — full-stack capture path \
+         verified end-to-end",
+        maps.len(),
+        vcpu_regs.len(),
     ));
     Ok(result)
 }
@@ -624,13 +609,10 @@ fn scenario_disk_default_appears_at_dev_vda(_ctx: &ktstr::scenario::Ctx) -> Resu
     }
 
     let mut result = AssertResult::pass();
-    result.record_fail(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "/dev/vda is a block device with capacity {size_bytes} bytes \
-             ({} MiB), matching the configured DiskConfig",
-            KTSTR_DISK_DEFAULT.capacity_mib,
-        ),
+    result.note(format!(
+        "/dev/vda is a block device with capacity {size_bytes} bytes \
+         ({} MiB), matching the configured DiskConfig",
+        KTSTR_DISK_DEFAULT.capacity_mib,
     ));
     Ok(result)
 }
@@ -741,12 +723,9 @@ fn scenario_disk_write_read_roundtrip(_ctx: &ktstr::scenario::Ctx) -> Result<Ass
     }
 
     let mut result = AssertResult::pass();
-    result.record_fail(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "{SECTOR_SIZE}-byte pattern written to sector 0 round-tripped \
-             cleanly through virtio-blk write+fsync+read"
-        ),
+    result.note(format!(
+        "{SECTOR_SIZE}-byte pattern written to sector 0 round-tripped \
+         cleanly through virtio-blk write+fsync+read"
     ));
     Ok(result)
 }
@@ -808,12 +787,10 @@ fn scenario_disk_read_only_rejects_write(_ctx: &ktstr::scenario::Ctx) -> Result<
     }
 
     let mut result = AssertResult::pass();
-    result.record_fail(AssertDetail::new(
-        DetailKind::Other,
+    result.note(
         "open(/dev/vda, O_WRONLY) returned EROFS as expected — \
-         VIRTIO_BLK_F_RO is honored end-to-end"
-            .to_string(),
-    ));
+         VIRTIO_BLK_F_RO is honored end-to-end",
+    );
     Ok(result)
 }
 

@@ -258,13 +258,11 @@ fn classify_perf_open_errno(raw: i32) -> PerfOpenResult {
 fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
     if !cfg!(target_arch = "x86_64") {
         let mut result = AssertResult::pass();
-        result.record_fail(AssertDetail::new(
-            DetailKind::Other,
+        result.note(
             "CPUID leaf 0xA is x86-only; skipping on non-x86_64 \
              target. PMUv3 surface coverage on aarch64 lives in \
-             src/vmm/aarch64/{kvm,fdt}.rs unit tests."
-                .to_string(),
-        ));
+             src/vmm/aarch64/{kvm,fdt}.rs unit tests.",
+        );
         return Ok(result);
     }
     let leaf = read_cpuid_leaf_a();
@@ -305,14 +303,13 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
         // design — the synthesizer skips it on a zero-version
         // base. This is the expected behavior on a no-PMU host
         // (AMD, ancient Intel without DS, or PMU-less hardware);
-        // report it without failing the test.
-        result.record_fail(AssertDetail::new(
-            DetailKind::Other,
+        // record an informational note so the operator sees the
+        // path that was taken without failing the test.
+        result.note(
             "CPUID leaf 0xA reports version=0 and the host probe \
              (vendor + DS bit) does not indicate a PMU; \
-             synthesizer correctly preserved the zeroed leaf"
-                .to_string(),
-        ));
+             synthesizer correctly preserved the zeroed leaf",
+        );
         return Ok(result);
     }
 
@@ -393,19 +390,16 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
         return Ok(result);
     }
 
-    result.record_fail(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "CPUID leaf 0xA synthesized PMU-v2 visible: version={}, \
-             num_gp={}, gp_width={}, mask_length={}, num_fixed={}, \
-             fixed_width={}",
-            leaf.version,
-            leaf.num_gp,
-            leaf.gp_width,
-            leaf.mask_length,
-            leaf.num_fixed,
-            leaf.fixed_width,
-        ),
+    result.note(format!(
+        "CPUID leaf 0xA synthesized PMU-v2 visible: version={}, \
+         num_gp={}, gp_width={}, mask_length={}, num_fixed={}, \
+         fixed_width={}",
+        leaf.version,
+        leaf.num_gp,
+        leaf.gp_width,
+        leaf.mask_length,
+        leaf.num_fixed,
+        leaf.fixed_width,
     ));
     Ok(result)
 }
@@ -479,13 +473,10 @@ fn guest_pmu_perf_event_open_counts_instructions(_ctx: &Ctx) -> Result<AssertRes
         match classify_perf_open_errno(raw) {
             PerfOpenResult::Skip(reason) => {
                 let mut result = AssertResult::pass();
-                result.record_fail(AssertDetail::new(
-                    DetailKind::Other,
-                    format!(
-                        "perf_event_open failed with host-config errno \
-                         ({errno}, raw={raw}); skipping counter assertion. \
-                         {reason}.",
-                    ),
+                result.note(format!(
+                    "perf_event_open failed with host-config errno \
+                     ({errno}, raw={raw}); skipping counter assertion. \
+                     {reason}.",
                 ));
                 return Ok(result);
             }

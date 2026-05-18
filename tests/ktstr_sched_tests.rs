@@ -337,16 +337,14 @@ fn scenario_watchdog_timing_precision(
                  duration {observed:.3}s > {OVERRIDE_BUDGET_SECS:.1}s budget"
             );
         }
-        // Override effective — observed ≤ budget. Push a confirming
-        // detail so the test log shows the measured number; the
-        // AssertResult keeps its existing scheduler-died detail
-        // (which expect_err inverts to PASS).
-        result.record_fail(ktstr::assert::AssertDetail::new(
-            ktstr::assert::DetailKind::Other,
-            format!(
-                "watchdog override effective: kernel-measured stall \
-                 duration {observed:.3}s ≤ {OVERRIDE_BUDGET_SECS:.1}s budget"
-            ),
+        // Override effective — observed ≤ budget. Attach an
+        // informational note so the test log shows the measured
+        // number; the AssertResult keeps its existing
+        // scheduler-died Fail detail (which expect_err inverts to
+        // PASS).
+        result.note(format!(
+            "watchdog override effective: kernel-measured stall \
+             duration {observed:.3}s ≤ {OVERRIDE_BUDGET_SECS:.1}s budget"
         ));
     } else {
         // No stall line in kmsg. Could be a pre-6.16 kernel that

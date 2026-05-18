@@ -10080,6 +10080,25 @@ impl KtstrVm {
             // the next iteration until the read succeeds or kill
             // fires. Steady-state cost is one `.load()` per
             // iteration (one atomic read) once published.
+            //
+            // Confidential-compute caveat (SEV-ES / SEV-SNP / TDX):
+            // `KVM_GET_MSRS` for MSR_LSTAR FAILS on cc guests —
+            // SEV-ES via `sev_es_prevent_msr_access` returns
+            // -EINVAL when `has_protected_state` (arch/x86/kvm/
+            // svm/svm.c:2725-2738); TDX via `tdx_get_msr` returns
+            // 1 (ioctl-fail) because `tdx_has_emulated_msr`
+            // (arch/x86/kvm/vmx/tdx.c:2104-2149) excludes
+            // MSR_LSTAR from the TD-emulated allow-list.
+            // Fail-loud, not silent-garbage. The
+            // `is_retryable()` / `LstarUnsupported` gate at
+            // msr_kaslr.rs:209-225 surfaces this as
+            // `LstarDeriveError`; the wait-loop falls through to
+            // the guest-channel KERN_ADDRS `_text` publisher
+            // (`dispatch.rs`) or the `nokaslr` cmdline arg
+            // (`setup.rs`). ktstr does not target cc today; if a
+            // backend ever adds cc support, this chain Just Works
+            // — document the assumption at the backend's BSP-init
+            // site.
             #[cfg(target_arch = "x86_64")]
             if entry_syscall_64_link_kva != 0
                 && kern_virt_kaslr_shared.load(Ordering::Acquire) == 0

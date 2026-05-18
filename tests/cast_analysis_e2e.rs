@@ -559,21 +559,18 @@ fn scenario_cast_analysis_chases_kernel_kptr(ctx: &ktstr::scenario::Ctx) -> Resu
         );
     }
 
-    result.record_fail(ktstr::assert::AssertDetail::new(
-        ktstr::assert::DetailKind::Other,
-        format!(
-            "cast analysis pipeline E2E: dump at {} carries scx_task_map \
-             with {} entries, {} non-null payloads. Located ktstr_arena_ctx \
-             render with cast-chased task_kptr=0x{task_kptr_value:x} → \
-             {}{deref_type_name}{{pid={pid_int:?}, comm.kind={comm_kind:?}, \
-             member count={}}}; magic=0x{magic_value:016x} (Uint, not chased), \
-             counter={counter_value} (Uint, not chased)",
-            dump_path.display(),
-            entries.len(),
-            payloads.len(),
-            if was_truncated { "truncated " } else { "" },
-            members.len(),
-        ),
+    result.note(format!(
+        "cast analysis pipeline E2E: dump at {} carries scx_task_map \
+         with {} entries, {} non-null payloads. Located ktstr_arena_ctx \
+         render with cast-chased task_kptr=0x{task_kptr_value:x} → \
+         {}{deref_type_name}{{pid={pid_int:?}, comm.kind={comm_kind:?}, \
+         member count={}}}; magic=0x{magic_value:016x} (Uint, not chased), \
+         counter={counter_value} (Uint, not chased)",
+        dump_path.display(),
+        entries.len(),
+        payloads.len(),
+        if was_truncated { "truncated " } else { "" },
+        members.len(),
     ));
 
     Ok(result)
@@ -973,16 +970,13 @@ fn scenario_cast_analysis_chases_bss_to_arena(ctx: &ktstr::scenario::Ctx) -> Res
         );
     }
 
-    result.record_fail(ktstr::assert::AssertDetail::new(
-        ktstr::assert::DetailKind::Other,
-        format!(
-            "BSS->arena cast pipeline E2E: dump at {} carries `.bss` map with \
-             ktstr_bss_arena_holder render where arena_target=0x{arena_value:x} -> \
-             {}{deref_type_name}{{magic=0x{magic_value:016x}, counter={counter_value}}}; \
-             bss_plain_counter={plain_value} (Uint, not chased -- negative control)",
-            dump_path.display(),
-            if was_truncated { "truncated " } else { "" },
-        ),
+    result.note(format!(
+        "BSS->arena cast pipeline E2E: dump at {} carries `.bss` map with \
+         ktstr_bss_arena_holder render where arena_target=0x{arena_value:x} -> \
+         {}{deref_type_name}{{magic=0x{magic_value:016x}, counter={counter_value}}}; \
+         bss_plain_counter={plain_value} (Uint, not chased -- negative control)",
+        dump_path.display(),
+        if was_truncated { "truncated " } else { "" },
     ));
 
     Ok(result)
@@ -1316,18 +1310,15 @@ fn scenario_cast_analysis_sdt_alloc_bridge_resolves_fwd(
         );
     }
 
-    result.record_fail(ktstr::assert::AssertDetail::new(
-        ktstr::assert::DetailKind::Other,
-        format!(
-            "sdt_alloc bridge E2E: dump at {} carries scx_task_map with \
-             {} entries; data_members_seen={data_members_seen}, \
-             any_bridge_fired={any_bridge_fired}, payloads_inspected={payloads_inspected}. \
-             No entry's `data` showed a 'forward declaration' skip reason; \
-             every chased ktstr_arena_ctx payload carries the alloc-time \
-             sentinel and counter.",
-            dump_path.display(),
-            entries.len(),
-        ),
+    result.note(format!(
+        "sdt_alloc bridge E2E: dump at {} carries scx_task_map with \
+         {} entries; data_members_seen={data_members_seen}, \
+         any_bridge_fired={any_bridge_fired}, payloads_inspected={payloads_inspected}. \
+         No entry's `data` showed a 'forward declaration' skip reason; \
+         every chased ktstr_arena_ctx payload carries the alloc-time \
+         sentinel and counter.",
+        dump_path.display(),
+        entries.len(),
     ));
 
     Ok(result)
@@ -1473,18 +1464,15 @@ fn scenario_cast_analysis_cross_subprog_arena_chase(
         );
     }
 
-    result.record_fail(ktstr::assert::AssertDetail::new(
-        ktstr::assert::DetailKind::Other,
-        format!(
-            "cross-subprog arena chase E2E: dump at {} carries scx_task_map \
-             with {} entries, {} ktstr_arena_ctx payloads. Located \
-             stashed_arena_ptr rendered as Ptr with arena annotation -- \
-             fixpoint propagation across publish→map→chase subprog boundary \
-             is working.",
-            dump_path.display(),
-            entries.len(),
-            payloads.len(),
-        ),
+    result.note(format!(
+        "cross-subprog arena chase E2E: dump at {} carries scx_task_map \
+         with {} entries, {} ktstr_arena_ctx payloads. Located \
+         stashed_arena_ptr rendered as Ptr with arena annotation -- \
+         fixpoint propagation across publish→map→chase subprog boundary \
+         is working.",
+        dump_path.display(),
+        entries.len(),
+        payloads.len(),
     ));
 
     Ok(result)

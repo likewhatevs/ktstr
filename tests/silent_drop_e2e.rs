@@ -154,12 +154,9 @@ fn scenario_watchdog_stall_captured_emit_schema(
         siblings,
     );
 
-    result.record_fail(ktstr::assert::AssertDetail::new(
-        ktstr::assert::DetailKind::Other,
-        format!(
-            "Captured emit produced schema={SCHEMA_SINGLE} dump at {}",
-            dump_path.display()
-        ),
+    result.note(format!(
+        "Captured emit produced schema={SCHEMA_SINGLE} dump at {}",
+        dump_path.display()
     ));
     Ok(result)
 }
@@ -191,10 +188,7 @@ fn scenario_clean_exit_gate_suppresses_dump(ctx: &ktstr::scenario::Ctx) -> Resul
         siblings,
     );
 
-    result.record_fail(ktstr::assert::AssertDetail::new(
-        ktstr::assert::DetailKind::Other,
-        "clean exit produced no dump artifacts (primary path absent, no tagged siblings)",
-    ));
+    result.note("clean exit produced no dump artifacts (primary path absent, no tagged siblings)");
     Ok(result)
 }
 
@@ -255,14 +249,11 @@ fn scenario_watchdog_stall_dump_populates_vcpu_regs_and_maps(
         siblings,
     );
 
-    result.record_fail(ktstr::assert::AssertDetail::new(
-        ktstr::assert::DetailKind::Other,
-        format!(
-            "Captured dump populated vcpu_regs ({} entries) and maps ({} entries) at {}",
-            vcpu_regs.len(),
-            maps.len(),
-            dump_path.display()
-        ),
+    result.note(format!(
+        "Captured dump populated vcpu_regs ({} entries) and maps ({} entries) at {}",
+        vcpu_regs.len(),
+        maps.len(),
+        dump_path.display()
     ));
     Ok(result)
 }
@@ -385,11 +376,10 @@ fn scenario_translate_none_with_latch_idle_suppresses_dump(
         siblings,
     );
 
-    result.record_fail(ktstr::assert::AssertDetail::new(
-        ktstr::assert::DetailKind::Other,
+    result.note(
         "FORCE_TRANSLATE_NONE + idle BPF latch correctly suppressed dump \
          (translate-fail branch entered, no rescue fired)",
-    ));
+    );
     Ok(result)
 }
 
@@ -450,13 +440,10 @@ fn scenario_translate_none_with_latch_triggered_emits_dump(
         siblings,
     );
 
-    result.record_fail(ktstr::assert::AssertDetail::new(
-        ktstr::assert::DetailKind::Other,
-        format!(
-            "FORCE_TRANSLATE_NONE + FORCE_BSS_TRIGGERED drove BSS-latch rescue → \
-             dump emitted at {}",
-            dump_path.display()
-        ),
+    result.note(format!(
+        "FORCE_TRANSLATE_NONE + FORCE_BSS_TRIGGERED drove BSS-latch rescue → \
+         dump emitted at {}",
+        dump_path.display()
     ));
     Ok(result)
 }

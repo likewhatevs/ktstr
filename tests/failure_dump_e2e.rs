@@ -524,21 +524,18 @@ fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Resul
     }
 
     // Confirming detail so the test log shows the captured value.
-    result.record_fail(ktstr::assert::AssertDetail::new(
-        ktstr::assert::DetailKind::Other,
-        format!(
-            "failure-dump file at {} contains scheduler .bss render with \
-             stall={stall_int}, ktstr_alloc_count={alloc_count_int}, \
-             member count={}, vcpu_regs entries={} ({} populated with \
-             non-zero IP), arena pages={} ({total_bytes} bytes, \
-             {magic_hits} pages with KTSTR_ARENA_MAGIC sentinel, \
-             declared_pages={declared_pages})",
-            dump_path.display(),
-            members.len(),
-            vcpu_regs.len(),
-            populated_with_ip.len(),
-            arena_pages.len(),
-        ),
+    result.note(format!(
+        "failure-dump file at {} contains scheduler .bss render with \
+         stall={stall_int}, ktstr_alloc_count={alloc_count_int}, \
+         member count={}, vcpu_regs entries={} ({} populated with \
+         non-zero IP), arena pages={} ({total_bytes} bytes, \
+         {magic_hits} pages with KTSTR_ARENA_MAGIC sentinel, \
+         declared_pages={declared_pages})",
+        dump_path.display(),
+        members.len(),
+        vcpu_regs.len(),
+        populated_with_ip.len(),
+        arena_pages.len(),
     ));
 
     Ok(result)
@@ -783,21 +780,18 @@ fn scenario_failure_dump_renders_capture_modules(
         );
     }
 
-    result.record_fail(ktstr::assert::AssertDetail::new(
-        ktstr::assert::DetailKind::Other,
-        format!(
-            "failure-dump file at {} contains capture-module data: \
-             rq_scx_states.len()={} (num_cpus={num_cpus}), \
-             dsq_states.len()={}, scx_sched_state present, \
-             task_enrichments.len()={}, per_node_numa.len()={} \
-             (unavailable={:?})",
-            dump_path.display(),
-            rq_scx_states.len(),
-            dsq_states.len(),
-            task_enrichments.len(),
-            per_node_numa.len(),
-            per_node_numa_unavailable,
-        ),
+    result.note(format!(
+        "failure-dump file at {} contains capture-module data: \
+         rq_scx_states.len()={} (num_cpus={num_cpus}), \
+         dsq_states.len()={}, scx_sched_state present, \
+         task_enrichments.len()={}, per_node_numa.len()={} \
+         (unavailable={:?})",
+        dump_path.display(),
+        rq_scx_states.len(),
+        dsq_states.len(),
+        task_enrichments.len(),
+        per_node_numa.len(),
+        per_node_numa_unavailable,
     ));
 
     Ok(result)
@@ -960,15 +954,12 @@ fn scenario_failure_dump_renders_probe_counters(
         );
     }
 
-    result.record_fail(ktstr::assert::AssertDetail::new(
-        ktstr::assert::DetailKind::Other,
-        format!(
-            "failure-dump file at {} contains probe_counters with \
-             trigger_count={trigger_count}, probe_count={probe_count} \
-             (per-CPU sum walked across CPUs in `.bss` \
-             `ktstr_pcpu_counters` array)",
-            dump_path.display(),
-        ),
+    result.note(format!(
+        "failure-dump file at {} contains probe_counters with \
+         trigger_count={trigger_count}, probe_count={probe_count} \
+         (per-CPU sum walked across CPUs in `.bss` \
+         `ktstr_pcpu_counters` array)",
+        dump_path.display(),
     ));
 
     Ok(result)

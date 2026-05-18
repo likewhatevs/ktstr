@@ -1665,9 +1665,66 @@ fn assert_result_outcome_multi_skip_returns_first_payload() {
     assert!(d.message.contains("first"), "first-Skip-wins; got: {}", d.message);
 }
 
-/// Phase 2b mutator semantics: repeated `record_fail` calls append
-/// distinct Fail outcomes onto the vec; `outcome()` folds them and
-/// the result is Fail with the LEFT operand's payload winning per
+/// `Outcome::as_ref` projection preserves the discriminant +
+/// borrows the payload in place. Pins the no-clone contract that
+/// the verdict-read fast path ([`AssertResult::outcome_ref`])
+/// relies on. (Borrow-in-place is enforced by the type system —
+/// `OutcomeRef::Fail(&'a AssertDetail)` cannot construct without
+/// borrowing from the source.)
+#[test]
+fn outcome_as_ref_preserves_discriminant_and_payload() {
+    assert!(matches!(Outcome::Pass.as_ref(), OutcomeRef::Pass));
+    let fail = Outcome::Fail(AssertDetail::new(DetailKind::Starved, "boom"));
+    let OutcomeRef::Fail(d) = fail.as_ref() else {
+        panic!("Fail as_ref should be Fail variant");
+    };
+    assert_eq!(d.kind, DetailKind::Starved);
+    assert!(d.message.contains("boom"));
+    let skip = Outcome::Skip(AssertDetail::new(DetailKind::Skip, "missing"));
+    let OutcomeRef::Skip(d) = skip.as_ref() else {
+        panic!("Skip as_ref should be Skip variant");
+    };
+    assert_eq!(d.kind, DetailKind::Skip);
+    assert!(d.message.contains("missing"));
+}
+
+/// `AssertResult::outcome_ref` matches `outcome()` shape across
+/// every branch (Pass identity / non-empty all-Skip / mixed-Pass-
+/// plus-Skip / Fail wins) while borrowing the payload instead of
+/// cloning. Pins the borrowed-fast-path semantic against the
+/// owned accessor so a regression that drifted one but not the
+/// other trips here.
+#[test]
+fn assert_result_outcome_ref_matches_owned_outcome_shape() {
+    // Pass identity: empty stream.
+    assert!(matches!(AssertResult::pass().outcome_ref(), OutcomeRef::Pass));
+    // Non-empty all-Skip → Skip with first payload.
+    let mut all_skip = AssertResult::pass();
+    all_skip.record_skip("only-skip");
+    let OutcomeRef::Skip(d) = all_skip.outcome_ref() else {
+        panic!("all-Skip stream should yield Skip");
+    };
+    assert!(d.message.contains("only-skip"));
+    // Mixed Pass + Skip → Pass (Pass demotes Skip per outcome()
+    // inner-else branch).
+    let mut mixed = AssertResult::pass();
+    mixed.record_pass();
+    mixed.record_skip("demoted");
+    assert!(matches!(mixed.outcome_ref(), OutcomeRef::Pass));
+    // Any Fail → Fail with first Fail's payload.
+    let mut fail = AssertResult::pass();
+    fail.record_fail(AssertDetail::new(DetailKind::Stuck, "first-fail"));
+    fail.record_fail(AssertDetail::new(DetailKind::Starved, "second-fail"));
+    let OutcomeRef::Fail(d) = fail.outcome_ref() else {
+        panic!("any-Fail stream should yield Fail");
+    };
+    assert_eq!(d.kind, DetailKind::Stuck);
+    assert!(d.message.contains("first-fail"));
+}
+
+/// Mutator semantics: repeated `record_fail` calls append distinct
+/// Fail outcomes onto the vec; `outcome()` folds them and the
+/// result is Fail with the LEFT operand's payload winning per
 /// `Outcome::merge`'s payload-tie semantics.
 #[test]
 fn assert_result_record_fail_appends_and_folds_fail() {

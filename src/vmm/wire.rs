@@ -7,6 +7,38 @@
 //! frame layout authoritative — a producer change here lands in both
 //! the guest writer and the host parser without a hand-sync step.
 //!
+//! # Postcard wire-format pin inventory (contributor guide)
+//!
+//! Every type that crosses the in-VM postcard TLV channel MUST be
+//! externally-tagged (postcard cannot decode `#[serde(untagged)]`
+//! or `#[serde(tag, content)]` enums — encode raises `WontImplement`
+//! at runtime and the host surfaces it as
+//! `ERR_NO_TEST_FUNCTION_OUTPUT`). The compile-time
+//! `#[derive(serde::Serialize, serde::Deserialize)]` itself does
+//! NOT catch the shape mismatch; the contract is verified by the
+//! per-type roundtrip pin tests listed below. A contributor adding
+//! a new postcard payload MUST add a roundtrip pin in the
+//! corresponding location and update this inventory.
+//!
+//! Inventory (type → test name → file):
+//!   - `AssertResult` → `assert_result_postcard_roundtrip`
+//!     → `src/assert/tests_serde.rs`
+//!   - `KernAddrs` → `kern_addrs_roundtrip_all_present` (+ 4 sibling
+//!     boundary pins) → `src/vmm/wire.rs` (this file)
+//!   - `KernelOpRequestPayload` / `KernelOpReplyPayload`
+//!     → 4 tests → `src/vmm/wire.rs` (this file)
+//!   - `PayloadMetrics` / `RawPayloadOutput`
+//!     → `payload_metrics_postcard_roundtrip` /
+//!       `raw_payload_output_postcard_roundtrip`
+//!     → `src/test_support/payload.rs`
+//!   - `WorkloadConfig` → `payload_roundtrip`
+//!     → `src/test_support/payload.rs`
+//!   - `WorkerReport` → `worker_report_postcard_roundtrip` (+ 3 sibling
+//!     pins covering Vec<WorkerReport> + all `ExitInfo` variants)
+//!     → `src/workload/spawn/tests_integration.rs`
+//!   - `PersistedCastAnalysis` → see `src/vmm/cast_analysis_load`
+//!     module's tests
+//!
 //! # Frame layout
 //!
 //! Each guest→host bulk message is a 16-byte [`ShmMessage`] header
@@ -1765,6 +1797,38 @@ mod tests {
         assert_eq!(
             u64::from_le_bytes(p[16..24].try_into().unwrap()),
             0x5555_6666_7777_8889u64
+        );
+    }
+
+    #[test]
+    fn kern_addrs_u64_max_runtime_collapses_to_absent_roundtrip() {
+        // Documents the bias-encoding boundary collision: a
+        // `kernel_text_runtime_kva` of `u64::MAX` wraps to biased 0
+        // on encode, which the decoder reads as the "guest could
+        // not derive" sentinel (None). u64::MAX is non-canonical
+        // and impossible as a real `_text` KVA, AND the
+        // downstream KERN_ADDRS dispatch arm in dispatch.rs
+        // triple-gates derived offsets (kernel-half threshold +
+        // non-negative slide + ≤1GiB max-slide-bound + link
+        // canonical) which catch any synthesized variant of this
+        // collision before it reaches the shared Arc. Test pins
+        // the symmetric collapse so a future encoder refactor
+        // that broke the "absent sentinel = biased 0" contract
+        // (e.g. switched to a different sentinel value) trips
+        // here loudly.
+        let max_runtime = KernAddrs::new(0u64, 0u64, Some(u64::MAX));
+        let payload = max_runtime.to_payload();
+        // Biased slot reads 0 — collides with the absent encoding.
+        assert_eq!(
+            u64::from_le_bytes(payload[16..24].try_into().unwrap()),
+            0,
+            "Some(u64::MAX) biased-add wraps to 0; collides with absent sentinel"
+        );
+        // Roundtrip surfaces it as None, not Some(u64::MAX).
+        let decoded = KernAddrs::from_payload(&payload).expect("decode");
+        assert_eq!(
+            decoded.kernel_text_runtime_kva, None,
+            "u64::MAX runtime decodes to None via the bias collision"
         );
     }
 }
