@@ -72,10 +72,42 @@
 //! `cargo ktstr replay | cargo nextest run -E -` parses cleanly
 //! and runs zero tests instead of erroring on empty stdin. A
 //! stderr line explains the no-op.
+//!
+//! ## Host-context attachment
+//!
+//! Every render path also surfaces a host-context section so the
+//! operator knows what host the failures were captured on and
+//! how that compares to the host running the replay. The section
+//! has three shapes:
+//!
+//! - `(no host context captured)` — the pool predates host
+//!   capture, or every collection failed. Operator gets the hint
+//!   that the comparison is not available.
+//! - `(host context unchanged since capture)` — captured host
+//!   matches the current host field-for-field. Reassures the
+//!   operator that the replay environment matches the capture
+//!   environment; reproduction failure cannot be blamed on host
+//!   drift.
+//! - `host context drift since capture:` followed by the per-field
+//!   diff body (`key: before → after` lines). The load-bearing case
+//!   — environment changes between capture and replay are exactly
+//!   what would silently cause a "persistent" failure to become
+//!   "fixed" or vice versa.
+//!
+//! The host extraction policy is "first sidecar with `host =
+//! Some(_)`". Pool iteration order is deterministic (collect_pool
+//! walks dirs in `read_dir` order, which the kernel returns in
+//! arbitrary-but-fixed order per inode layout). When sidecars
+//! disagree on captured host (mixed-host pool from archived
+//! cross-machine runs), the diff is against the first encountered
+//! capture — sufficient for the single-host common case and
+//! deterministic for the archived case.
 
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+use ktstr::host_context::{HostContext, collect_host_context};
 
 /// Sentinel filter expression emitted when the pool has no
 /// failures to replay. nextest parses it cleanly and matches
@@ -96,11 +128,7 @@ const EMPTY_POOL_FILTER: &str = "test(/^__ktstr_no_failures_to_replay__$/)";
 /// Returns `Ok(N)` with nextest's exit code when `exec` is set
 /// and nextest exits non-zero. Returns `Err` only for genuine
 /// errors (unreadable sidecar root, nextest spawn failure).
-pub(crate) fn run_replay(
-    dir: Option<&Path>,
-    filter: Option<&str>,
-    exec: bool,
-) -> Result<i32> {
+pub(crate) fn run_replay(dir: Option<&Path>, filter: Option<&str>, exec: bool) -> Result<i32> {
     let root: PathBuf = dir
         .map(Path::to_path_buf)
         .unwrap_or_else(ktstr::test_support::runs_root);
@@ -136,6 +164,16 @@ pub(crate) fn run_replay(
 
     let filter_expr = build_nextest_filter(&failed_names);
 
+    // Host-context comparison is identical between the dry-run and
+    // --exec paths (same `pool` source for the captured host, same
+    // `collect_host_context()` for current). Hoisting once avoids a
+    // duplicate `/proc` + `/sys` probe (`collect_host_context`
+    // touches ~10 pseudo-files) and a duplicate
+    // `extract_captured_host` walk. Render still fires at the END
+    // of each path so the section order matches the rest of the
+    // path's narrative.
+    let host_section = compute_host_diff(extract_captured_host(&pool), &collect_host_context());
+
     if !exec {
         // Dry-run: print the computed filter expression so the
         // operator can paste it into their own nextest invocation
@@ -149,6 +187,7 @@ pub(crate) fn run_replay(
              or re-run with --exec to invoke nextest directly.",
             failed_names.len(),
         );
+        render_host_diff_section(&host_section);
         return Ok(0);
     }
 
@@ -173,6 +212,16 @@ pub(crate) fn run_replay(
     let queued_refs: BTreeSet<&str> = queued.iter().map(String::as_str).collect();
     let outcomes = classify_replay(&queued_refs, &post_pool);
     render_outcome_diff(&outcomes);
+
+    // Host-context diff was computed ABOVE (hoisted across both
+    // paths) against the PRE-exec `pool` — that snapshot is the
+    // source of truth for "what host did the original failures
+    // happen on", whereas `post_pool` reflects post-replay
+    // sidecars which (if successful) also carry a host capture
+    // but from the replay host, not the original failure host.
+    // Rendering here keeps the host section in the operator's
+    // attention path right after the outcome diff.
+    render_host_diff_section(&host_section);
 
     Ok(exit)
 }
@@ -228,7 +277,6 @@ pub(crate) enum ReplayOutcome {
         persistent_count: usize,
     },
 }
-
 
 /// Classify the replay outcome for each test_name in `queued`
 /// against the post-replay sidecar pool. Returns a BTreeMap so
@@ -347,6 +395,179 @@ fn render_outcome_diff(outcomes: &BTreeMap<&str, ReplayOutcome>) {
     }
 }
 
+/// Host-context section attached to every replay render path.
+///
+/// `Clone` deliberately omitted: HostDiffSection is constructed
+/// once per `run_replay` invocation and consumed once by the
+/// renderer; no production or test site needs to duplicate the
+/// value, so the derive stays minimal.
+/// Three shapes for the three possible relationships between the
+/// captured-failure host and the current replay host:
+///
+/// - `NoCapture` — no sidecar in the input pool carried a
+///   populated `host` field (older sidecar, host-context
+///   collection failure, or test that ran without
+///   `collect_host_context` in its path). The operator sees a
+///   "(no host context captured)" hint so they know the
+///   comparison is unavailable rather than silently absent.
+///
+/// - `Unchanged` — captured host and current host compare equal
+///   field-for-field via `HostContext` `PartialEq`. The operator
+///   sees a "(host context unchanged)" reassurance: replay env
+///   matches capture env, so reproduction failures cannot be
+///   blamed on host drift.
+///
+/// - `Changed(diff)` — the load-bearing case. `diff` carries the
+///   `HostContext::diff` output (`key: before → after` lines, one
+///   per differing field). The operator sees the per-field drift
+///   inline and can correlate it with persistent/mixed outcomes
+///   above.
+///
+/// Non-exhaustive matching is intentional inside the renderer —
+/// every variant has a distinct user-visible string and a future
+/// fourth variant would need explicit handling.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HostDiffSection {
+    /// No sidecar in the input pool carried `host = Some(_)`.
+    NoCapture,
+    /// Captured host equals current host field-for-field.
+    Unchanged,
+    /// Captured host differs from current host. Body is the
+    /// already-rendered `HostContext::diff` output — one
+    /// `  key: before → after` line per differing field. Empty
+    /// body is impossible by construction (the only way to land
+    /// here is `captured != current`, which by `HostContext`
+    /// `Eq` semantics means at least one field differs and
+    /// `diff` will emit at least one line). The renderer trusts
+    /// that invariant — it does not re-check the body length.
+    Changed(String),
+}
+
+/// Pick the captured host from the first sidecar in `pool` that
+/// carries `host = Some(_)`. Returns `None` when no sidecar has
+/// a populated host capture — older sidecars from before
+/// `host_context` was wired, or runs where every
+/// `collect_host_context` invocation failed.
+///
+/// Borrows from the pool rather than cloning: a `HostContext`
+/// carries non-trivial heap data (sched_tunables `BTreeMap`,
+/// cpufreq_governor `BTreeMap`, several `String` fields) — the
+/// downstream consumer `compute_host_diff` only needs read access,
+/// so a borrowed return avoids one full deep-clone per
+/// `run_replay` invocation.
+///
+/// First-match-wins is acceptable because (a) the single-host
+/// common case has every sidecar reporting the same host, and
+/// (b) for the archived cross-machine case the pool order is
+/// deterministic (collect_pool walks dirs in the order
+/// `std::fs::read_dir` returns them). A future variant that wants
+/// per-test host capture would attach the host to each `Mixed` /
+/// `Persistent` entry directly rather than reaching for the
+/// pool-level capture.
+pub(crate) fn extract_captured_host(
+    pool: &[ktstr::test_support::SidecarResult],
+) -> Option<&HostContext> {
+    pool.iter().find_map(|sc| sc.host.as_ref())
+}
+
+/// Classify the relationship between a captured host (from a
+/// pre-replay sidecar) and the current host (collected at replay
+/// time). Returns a [`HostDiffSection`] for the renderer to
+/// translate into operator-facing output.
+///
+/// Pure function — takes `current` as a parameter rather than
+/// calling [`collect_host_context`] internally so unit tests can
+/// drive the classification with synthetic [`HostContext`]
+/// fixtures (host_context.rs:[`HostContext::test_fixture`])
+/// instead of standing up a real `/proc` + `/sys` probe in the
+/// test process.
+///
+/// Implementation: defers all field-level comparison to
+/// [`HostContext::diff`] at host_context.rs:480. That function
+/// already handles every dimension of the struct (CPU identity,
+/// memory, NUMA, kernel uname triple, cmdline, sched tunables,
+/// THP, cpufreq governors) plus the `Option` / `BTreeMap` edge
+/// cases (`None → Some`, `(absent)` map entries, per-CPU governor
+/// drift). Re-implementing the comparison here would duplicate
+/// that logic without adding anything new.
+///
+/// `heap_state` is stripped from BOTH sides before comparison —
+/// it captures the *running process's* jemalloc footprint, not a
+/// host attribute. The captured snapshot comes from the test
+/// runner process; the current snapshot comes from the `cargo
+/// ktstr replay` binary process. These are always different
+/// processes, so `heap_state` will essentially always differ even
+/// when the host is unchanged. Leaving it in would make
+/// [`HostDiffSection::Unchanged`] unreachable and pollute every
+/// [`HostDiffSection::Changed`] body with a noise line that has
+/// nothing to do with host environment drift.
+pub(crate) fn compute_host_diff(
+    captured: Option<&HostContext>,
+    current: &HostContext,
+) -> HostDiffSection {
+    let Some(captured) = captured else {
+        return HostDiffSection::NoCapture;
+    };
+    let captured = without_heap_state(captured);
+    let current = without_heap_state(current);
+    if captured == current {
+        HostDiffSection::Unchanged
+    } else {
+        HostDiffSection::Changed(captured.diff(&current))
+    }
+}
+
+/// Return a clone of `host` with `heap_state` cleared to `None`.
+/// Companion to [`compute_host_diff`] — see that function's docs
+/// for the rationale (process-local jemalloc state is not a host
+/// attribute, so the host comparison must skip it).
+///
+/// Owned-clone is acceptable here: a replay invocation runs at
+/// most one host diff, so the two clones (captured + current) are
+/// O(1) per process lifetime and the alternative (a "view" type
+/// that excludes heap_state) would be over-engineered for a
+/// once-per-CLI cost.
+fn without_heap_state(host: &HostContext) -> HostContext {
+    let mut stripped = host.clone();
+    stripped.heap_state = None;
+    stripped
+}
+
+/// Render the host-context section to stderr (the narrative
+/// stream — stdout stays clean for the dry-run filter expression
+/// pipe target).
+///
+/// Output shape per variant:
+/// - `NoCapture` → one line: `ktstr replay: (no host context captured)`
+/// - `Unchanged` → one line: `ktstr replay: (host context unchanged since capture)`
+/// - `Changed(body)` → header line + indented diff body:
+///   `ktstr replay: host context drift since capture:` followed
+///   by the body verbatim (already two-space-indented per the
+///   `HostContext::diff` line format).
+///
+/// The header line carries the `ktstr replay:` prefix on every
+/// variant so an operator scanning stderr can grep for `ktstr
+/// replay:` and pick up every replay-emitted line, matching the
+/// prefix convention `render_outcome_diff` uses.
+fn render_host_diff_section(section: &HostDiffSection) {
+    match section {
+        HostDiffSection::NoCapture => {
+            eprintln!("ktstr replay: (no host context captured)");
+        }
+        HostDiffSection::Unchanged => {
+            eprintln!("ktstr replay: (host context unchanged since capture)");
+        }
+        HostDiffSection::Changed(body) => {
+            eprintln!("ktstr replay: host context drift since capture:");
+            // `HostContext::diff` already terminates each line with
+            // a newline AND uses two-space indentation, so a single
+            // `eprint!` (NOT `eprintln!`) emits the body verbatim
+            // without a trailing blank line.
+            eprint!("{body}");
+        }
+    }
+}
+
 /// Select the set of test_names from `pool` whose sidecars
 /// represent real failures (`!passed && !skipped`), optionally
 /// narrowed by a substring filter on test_name. Returns a
@@ -399,8 +620,7 @@ fn regex_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
-            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|'
-            | '\\' => {
+            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\' => {
                 out.push('\\');
                 out.push(ch);
             }
@@ -476,8 +696,7 @@ mod tests {
         names.insert("scheduler_smoke_test");
         let expr = build_nextest_filter(&names);
         assert_eq!(
-            expr,
-            "test(/^(.*::)?scheduler_smoke_test$/)",
+            expr, "test(/^(.*::)?scheduler_smoke_test$/)",
             "single-name filter wraps in regex with optional path prefix + end anchor"
         );
     }
@@ -552,15 +771,14 @@ mod tests {
     #[test]
     fn select_failed_skips_passed_and_skipped_keeps_only_real_failures() {
         let pool = synth_pool(&[
-            ("test_pass", true, false),     // not selected (passed)
-            ("test_skip", true, true),      // not selected (passed+skipped)
-            ("test_fail1", false, false),   // SELECTED
-            ("test_fail2", false, false),   // SELECTED
-            ("test_corner", false, true),   // not selected — !passed but skipped
+            ("test_pass", true, false),   // not selected (passed)
+            ("test_skip", true, true),    // not selected (passed+skipped)
+            ("test_fail1", false, false), // SELECTED
+            ("test_fail2", false, false), // SELECTED
+            ("test_corner", false, true), // not selected — !passed but skipped
         ]);
         let result = select_failed_names(&pool, None);
-        let expected: BTreeSet<&str> =
-            ["test_fail1", "test_fail2"].iter().copied().collect();
+        let expected: BTreeSet<&str> = ["test_fail1", "test_fail2"].iter().copied().collect();
         assert_eq!(result, expected);
     }
 
@@ -588,10 +806,7 @@ mod tests {
     /// doesn't synthesize.
     #[test]
     fn select_failed_with_filter_no_match_returns_empty_set() {
-        let pool = synth_pool(&[
-            ("test_pass", true, false),
-            ("test_fail", false, false),
-        ]);
+        let pool = synth_pool(&[("test_pass", true, false), ("test_fail", false, false)]);
         let result = select_failed_names(&pool, Some("nonexistent"));
         assert!(result.is_empty());
     }
@@ -673,7 +888,11 @@ mod tests {
             .copied()
             .collect();
         let outcomes = classify_replay(&queued, &post_pool);
-        assert_eq!(outcomes.len(), 3, "every queued name gets exactly one outcome");
+        assert_eq!(
+            outcomes.len(),
+            3,
+            "every queued name gets exactly one outcome"
+        );
         assert_eq!(outcomes.get("test_a_fixed"), Some(&ReplayOutcome::Fixed));
         assert_eq!(
             outcomes.get("test_b_persistent"),
@@ -753,16 +972,326 @@ mod tests {
     /// every variant should not silently become Mixed.
     #[test]
     fn classify_replay_all_variants_fail_classifies_as_persistent() {
-        let post_pool = synth_pool(&[
-            ("test_broken", false, false),
-            ("test_broken", false, false),
-        ]);
+        let post_pool = synth_pool(&[("test_broken", false, false), ("test_broken", false, false)]);
         let queued: BTreeSet<&str> = ["test_broken"].iter().copied().collect();
         let outcomes = classify_replay(&queued, &post_pool);
         assert_eq!(
             outcomes.get("test_broken"),
             Some(&ReplayOutcome::Persistent),
             "2-of-2 variants failed → Persistent, not Mixed"
+        );
+    }
+
+    // -- phase 4: host-context diff (extract / compute / render) --
+
+    /// Override one sidecar in a synth pool to carry a populated
+    /// host capture so the extract+compute path can be exercised
+    /// against fixture data without standing up a real `/proc` +
+    /// `/sys` probe.
+    fn synth_sidecar_with_host(
+        test_name: &str,
+        passed: bool,
+        skipped: bool,
+        host: HostContext,
+    ) -> SidecarResult {
+        let mut sc = synth_sidecar(test_name, passed, skipped);
+        sc.host = Some(host);
+        sc
+    }
+
+    /// G-P3.4 vacuity: empty pool → NoCapture. Pins that the
+    /// extract path returns `None` for an empty pool and the
+    /// compute path translates that to the NoCapture section
+    /// — the operator gets the hint that host comparison is
+    /// unavailable rather than silently dropping the section.
+    #[test]
+    fn compute_host_diff_empty_pool_yields_no_capture() {
+        let pool: Vec<SidecarResult> = Vec::new();
+        let captured = extract_captured_host(&pool);
+        assert!(
+            captured.is_none(),
+            "empty pool must yield None — no sidecar means no captured host"
+        );
+        let current = HostContext::test_fixture();
+        let section = compute_host_diff(captured, &current);
+        assert_eq!(section, HostDiffSection::NoCapture);
+    }
+
+    /// G-P3.3 partial: pool with only host=None sidecars → also
+    /// NoCapture. The extractor short-circuits as soon as it sees
+    /// the first `Some(host)`; a pool where every sidecar has
+    /// `host = None` (older sidecars from before host-context was
+    /// wired, or runs where every collect failed) lands here.
+    #[test]
+    fn compute_host_diff_pool_without_host_yields_no_capture() {
+        let pool = synth_pool(&[("test_a", false, false), ("test_b", false, false)]);
+        // synth_pool sets host=None on every sidecar; pin the
+        // assumption here so a future refactor that adds default
+        // host to synth_pool surfaces this test.
+        assert!(pool.iter().all(|sc| sc.host.is_none()));
+        let captured = extract_captured_host(&pool);
+        assert!(captured.is_none());
+        let section = compute_host_diff(captured, &HostContext::test_fixture());
+        assert_eq!(section, HostDiffSection::NoCapture);
+    }
+
+    /// G-P3.1 matched: captured host equals current host →
+    /// Unchanged. Pins the "replay env matches capture env"
+    /// reassurance signal — the operator gets confirmation that
+    /// host drift cannot explain reproduction outcomes.
+    #[test]
+    fn compute_host_diff_captured_equals_current_yields_unchanged() {
+        let host = HostContext::test_fixture();
+        let pool = vec![synth_sidecar_with_host(
+            "test_a",
+            false,
+            false,
+            host.clone(),
+        )];
+        let captured = extract_captured_host(&pool);
+        assert_eq!(
+            captured,
+            Some(&host),
+            "extracted host must equal the one we attached to the sidecar"
+        );
+        let section = compute_host_diff(captured, &host);
+        assert_eq!(section, HostDiffSection::Unchanged);
+    }
+
+    /// Captured host differs from current host in a load-bearing
+    /// field (kernel_release) → Changed with a non-empty diff
+    /// body that names the differing field. The operator MUST
+    /// see the drift — if the host changed underneath, the
+    /// renderer must surface that.
+    #[test]
+    fn compute_host_diff_differing_kernel_release_yields_changed_with_diff_body() {
+        let mut captured = HostContext::test_fixture();
+        captured.kernel_release = Some("6.16.0-test".to_string());
+        let mut current = HostContext::test_fixture();
+        current.kernel_release = Some("6.17.0-test".to_string());
+        let pool = vec![synth_sidecar_with_host(
+            "test_a",
+            false,
+            false,
+            captured.clone(),
+        )];
+        let extracted = extract_captured_host(&pool);
+        let section = compute_host_diff(extracted, &current);
+        let HostDiffSection::Changed(body) = section else {
+            panic!("kernel_release mismatch must yield Changed, got non-Changed variant");
+        };
+        assert!(
+            body.contains("kernel_release"),
+            "diff body must name the differing field; got: {body:?}"
+        );
+        assert!(
+            body.contains("6.16.0-test") && body.contains("6.17.0-test"),
+            "diff body must carry both before and after values; got: {body:?}"
+        );
+    }
+
+    /// First-match-wins on the extractor: pool with multiple
+    /// sidecars carrying different host captures returns the
+    /// FIRST `Some(host)` encountered. Pins the deterministic
+    /// pick policy documented at `extract_captured_host` so a
+    /// future change to "last wins" or "most-common wins" must
+    /// either preserve the semantic in tests or surface here.
+    #[test]
+    fn extract_captured_host_first_some_wins_over_later_sidecars() {
+        let mut host_first = HostContext::test_fixture();
+        host_first.kernel_release = Some("FIRST-release".to_string());
+        let mut host_second = HostContext::test_fixture();
+        host_second.kernel_release = Some("SECOND-release".to_string());
+        let pool = vec![
+            synth_sidecar_with_host("test_a", false, false, host_first.clone()),
+            synth_sidecar_with_host("test_b", false, false, host_second.clone()),
+        ];
+        let extracted = extract_captured_host(&pool);
+        assert_eq!(
+            extracted.and_then(|h| h.kernel_release.as_deref()),
+            Some("FIRST-release"),
+            "first-match-wins: earlier sidecar's host capture must win"
+        );
+    }
+
+    /// Table-driven coverage of the [`HostDiffSection::Changed`]
+    /// diff body across every shape class HostContext exposes.
+    /// kernel_release-only (covered by the focused test above) was
+    /// insufficient — different field shapes flow through different
+    /// branches of `HostContext::diff` (scalar `Option<T>`,
+    /// `BTreeMap` field-with-default-empty, `Option<BTreeMap>`),
+    /// and a regression in (say) the per-CPU `cpufreq_governor`
+    /// diff branch would silently produce malformed diff lines.
+    ///
+    /// Each entry: short label + mutator that drifts one dimension
+    /// + substring that must appear in the diff body. Catches a
+    /// regression where a particular shape class stops emitting
+    /// rows OR emits rows under a wrong field-name key.
+    #[test]
+    fn compute_host_diff_changed_body_covers_each_dimension_class() {
+        fn drift_body(mutate: impl FnOnce(&mut HostContext, &mut HostContext)) -> String {
+            let mut captured = HostContext::test_fixture();
+            let mut current = HostContext::test_fixture();
+            mutate(&mut captured, &mut current);
+            let pool = vec![synth_sidecar_with_host("test", false, false, captured)];
+            let extracted = extract_captured_host(&pool);
+            match compute_host_diff(extracted, &current) {
+                HostDiffSection::Changed(body) => body,
+                other => panic!("expected Changed, got {other:?}"),
+            }
+        }
+
+        type Mutator = fn(&mut HostContext, &mut HostContext);
+
+        // (label, mutator, substring-that-must-appear-in-body)
+        let cases: &[(&str, Mutator, &str)] = &[
+            (
+                "scalar Option<String> drift (kernel_release)",
+                |c, n| {
+                    c.kernel_release = Some("6.16.0-a".to_string());
+                    n.kernel_release = Some("6.16.0-b".to_string());
+                },
+                "kernel_release",
+            ),
+            (
+                "scalar Option<u64> drift (total_memory_kib)",
+                |c, n| {
+                    c.total_memory_kib = Some(32 * 1024 * 1024);
+                    n.total_memory_kib = Some(64 * 1024 * 1024);
+                },
+                "total_memory_kib",
+            ),
+            (
+                "scalar Option<usize> drift (online_cpus)",
+                |c, n| {
+                    c.online_cpus = Some(8);
+                    n.online_cpus = Some(16);
+                },
+                "online_cpus",
+            ),
+            (
+                "scalar Option<usize> drift (numa_nodes)",
+                |c, n| {
+                    c.numa_nodes = Some(1);
+                    n.numa_nodes = Some(2);
+                },
+                "numa_nodes",
+            ),
+            (
+                "scalar Option<String> drift (arch)",
+                |c, n| {
+                    c.arch = Some("x86_64".to_string());
+                    n.arch = Some("aarch64".to_string());
+                },
+                "arch",
+            ),
+            (
+                "scalar Option<String> drift (kernel_cmdline)",
+                |c, n| {
+                    c.kernel_cmdline = Some("root=/dev/sda1".to_string());
+                    n.kernel_cmdline = Some("root=/dev/sda2".to_string());
+                },
+                "kernel_cmdline",
+            ),
+            (
+                "BTreeMap<usize,String> per-CPU drift (cpufreq_governor)",
+                |c, n| {
+                    c.cpufreq_governor.insert(0, "performance".to_string());
+                    n.cpufreq_governor.insert(0, "powersave".to_string());
+                },
+                "cpufreq_governor.cpu0",
+            ),
+            (
+                "Option<BTreeMap<String,String>> entry drift (sched_tunables)",
+                |_c, n| {
+                    // test_fixture pre-populates sched_tunables; mutate
+                    // a known key on the current side only.
+                    if let Some(m) = n.sched_tunables.as_mut() {
+                        m.insert("sched_migration_cost_ns".to_string(), "999999".to_string());
+                    }
+                },
+                "sched_tunables.sched_migration_cost_ns",
+            ),
+            (
+                "Option None vs Some transition (cpu_vendor)",
+                |c, n| {
+                    c.cpu_vendor = None;
+                    n.cpu_vendor = Some("GenuineIntel".to_string());
+                },
+                "cpu_vendor",
+            ),
+        ];
+
+        for (label, mutate, expected_substr) in cases {
+            let body = drift_body(*mutate);
+            assert!(
+                body.contains(expected_substr),
+                "{label}: diff body missing expected substring \
+                 {expected_substr:?}; got body: {body:?}"
+            );
+        }
+    }
+
+    /// `heap_state` drift between captured (different sidecar
+    /// writer process) and current (replay binary process)
+    /// MUST NOT cause a [`HostDiffSection::Changed`] verdict —
+    /// jemalloc allocations are process-local, not host attributes.
+    /// Pins the [`compute_host_diff`] heap_state strip + the
+    /// matching documentation against a regression that drops
+    /// the strip and re-introduces noise-line emission for
+    /// every replay invocation.
+    ///
+    /// Without the strip, Unchanged is unreachable:
+    /// captured.heap_state is the original-process jemalloc
+    /// snapshot, current.heap_state is the replay-process
+    /// snapshot — always different.
+    #[test]
+    fn compute_host_diff_strips_heap_state_so_process_local_drift_is_unchanged() {
+        use ktstr::host_heap::HostHeapState;
+        let mut captured = HostContext::test_fixture();
+        let mut current = HostContext::test_fixture();
+        // Two clearly-distinct heap states (different bytes-allocated
+        // values) so a regression that DOESN'T strip would emit a
+        // Changed body.
+        let mut h1 = HostHeapState::test_fixture();
+        h1.allocated_bytes = Some(1_000_000);
+        captured.heap_state = Some(h1);
+        let mut h2 = HostHeapState::test_fixture();
+        h2.allocated_bytes = Some(2_000_000);
+        current.heap_state = Some(h2);
+        // Every other field matches (both came from test_fixture).
+        let pool = vec![synth_sidecar_with_host("test", false, false, captured)];
+        let extracted = extract_captured_host(&pool);
+        let section = compute_host_diff(extracted, &current);
+        assert_eq!(
+            section,
+            HostDiffSection::Unchanged,
+            "heap_state drift must NOT yield Changed; if it does, \
+             the strip in compute_host_diff regressed and every \
+             replay will spam process-local jemalloc deltas as \
+             host drift"
+        );
+    }
+
+    /// Pool where the first sidecar has host=None and a LATER
+    /// sidecar has host=Some(_) → extractor returns the LATER
+    /// host. Pins the `find_map`-based first-Some-wins semantic
+    /// against a regression to "first sidecar wins regardless of
+    /// host=None": a None capture must not shadow a real
+    /// downstream capture.
+    #[test]
+    fn extract_captured_host_skips_none_to_first_some() {
+        let mut host = HostContext::test_fixture();
+        host.kernel_release = Some("LATE-CAPTURE".to_string());
+        let pool = vec![
+            synth_sidecar("test_a_no_host", false, false), // host=None
+            synth_sidecar_with_host("test_b_with_host", false, false, host.clone()),
+        ];
+        let extracted = extract_captured_host(&pool);
+        assert_eq!(
+            extracted.and_then(|h| h.kernel_release.as_deref()),
+            Some("LATE-CAPTURE"),
+            "extractor must skip host=None and land on first host=Some entry"
         );
     }
 }
