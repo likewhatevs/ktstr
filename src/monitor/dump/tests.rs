@@ -6676,3 +6676,281 @@ fn resolve_cross_btf_fwd_in_index_rejects_kind_mismatch() {
          this confirms the rejection above is the kind gate firing",
     );
 }
+
+// -- collect_per_cpu_time KASLR coverage ------------------------------
+//
+// End-to-end coverage that `collect_per_cpu_time` threads
+// [`CpuTimeCapture::kaslr_offset`] through the per-CPU KVA helper
+// (see [`crate::monitor::symbols::per_cpu_kva`]) for cpustat,
+// kstat, AND the optional tick_sched read. The helper has its own
+// algebra tests at `monitor/symbols.rs::per_cpu_kva_*`; the tests
+// below pin the wiring through `collect_per_cpu_time` end-to-end
+// so a regression that drops the `kaslr_offset` arg from any of
+// the three call sites in `collect_per_cpu_time` lands here as a
+// "wrong per-CPU read" failure instead of silently picking the
+// link-time slot when `CONFIG_RANDOMIZE_BASE=y`.
+
+/// Backing fixture for the per_cpu_time tests. Owns the Vec<u8>
+/// guest-memory buffer so the [`GuestMem`] view stays valid for
+/// the test body's lifetime; the cpu-time template KVAs +
+/// CpuTimeOffsets + per-CPU layout are picked to land each CPU's
+/// reads at known PAs inside the buffer.
+///
+/// Memory layout (page_offset = 0 — PA = KVA):
+///   - cpustat template KVA: 0x1000
+///   - kstat   template KVA: 0x2000
+///   - tick    template KVA: 0x3000
+///   - per-CPU stride: 0x4000 (CPU 0 at +0x0, CPU 1 at +0x4000)
+///
+/// CpuTimeOffsets in-struct layout:
+///   - kernel_cpustat.cpustat[]   at struct offset 0  (8 u64 = 64B)
+///   - kernel_stat.irqs_sum       at struct offset 0  (1 u64 = 8B)
+///   - kernel_stat.softirqs[]     at struct offset 8  (NR_SOFTIRQS u32)
+///   - tick_sched.iowait_sleeptime at struct offset 0 (1 u64 = 8B)
+struct PerCpuTimeScene {
+    buf: Vec<u8>,
+    cpustat_template_kva: u64,
+    kstat_template_kva: u64,
+    tick_template_kva: u64,
+    per_cpu_offsets: Vec<u64>,
+    offsets: super::super::btf_offsets::CpuTimeOffsets,
+}
+
+impl PerCpuTimeScene {
+    fn build(num_cpus: usize, per_cpu_stride: u64) -> Self {
+        let cpustat_template_kva = 0x1000u64;
+        let kstat_template_kva = 0x2000u64;
+        let tick_template_kva = 0x3000u64;
+        let per_cpu_offsets: Vec<u64> = (0..num_cpus as u64).map(|i| i * per_cpu_stride).collect();
+        // Buffer must span every CPU's largest read offset. The
+        // max PA we touch is tick_template_kva + max_per_cpu_off +
+        // sizeof(u64). Round up to 0x1000 alignment + 0x1000 pad.
+        let max_off = per_cpu_offsets.last().copied().unwrap_or(0);
+        let span = tick_template_kva + max_off + 0x1000;
+        let buf = vec![0u8; span as usize];
+        let offsets = super::super::btf_offsets::CpuTimeOffsets {
+            kernel_cpustat_cpustat: 0,
+            kstat_irqs_sum: 0,
+            kstat_softirqs: 8,
+            tick_sched_iowait_sleeptime: Some(0),
+        };
+        Self {
+            buf,
+            cpustat_template_kva,
+            kstat_template_kva,
+            tick_template_kva,
+            per_cpu_offsets,
+            offsets,
+        }
+    }
+
+    /// Compute the PA that `collect_per_cpu_time` will read for
+    /// `template_kva` on `cpu`, applying the per-cpu offset + the
+    /// supplied KASLR offset. Mirrors the production formula
+    /// `kva_to_pa(per_cpu_kva(template, kaslr, off), page_offset)`
+    /// at [`crate::monitor::symbols::per_cpu_kva`] +
+    /// [`crate::monitor::symbols::kva_to_pa`] explicitly so a
+    /// future refactor that changes either helper's algebra
+    /// surfaces here at the fixture rather than as opaque test
+    /// breakage.
+    fn pa_for(&self, template_kva: u64, cpu: usize, kaslr_offset: u64) -> u64 {
+        super::super::symbols::kva_to_pa(
+            super::super::symbols::per_cpu_kva(
+                template_kva,
+                kaslr_offset,
+                self.per_cpu_offsets[cpu],
+            ),
+            0,
+        )
+    }
+
+    /// Write `value` as 8 LE bytes at `pa` in the backing buffer.
+    fn write_u64_at(&mut self, pa: u64, value: u64) {
+        let pa_usize = pa as usize;
+        self.buf[pa_usize..pa_usize + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// Write `value` as 4 LE bytes at `pa` in the backing buffer.
+    fn write_u32_at(&mut self, pa: u64, value: u32) {
+        let pa_usize = pa as usize;
+        self.buf[pa_usize..pa_usize + 4].copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+/// Smoke baseline: `kaslr_offset = 0` reads each CPU's slot
+/// straight from the per-cpu offset (no KASLR shift). Sanity
+/// check that the test fixture is constructed correctly before
+/// the non-zero-KASLR test exercises the bug-fix path.
+#[test]
+fn collect_per_cpu_time_zero_kaslr_reads_per_cpu_slot() {
+    let mut scene = PerCpuTimeScene::build(2, 0x4000);
+    let kaslr = 0u64;
+
+    // CPU 0: write a recognizable cpustat[USER] value, a softirqs[3]
+    // value, an irqs_sum, an iowait_sleeptime.
+    let cpu0_cpustat_pa = scene.pa_for(scene.cpustat_template_kva, 0, kaslr);
+    let cpu0_kstat_pa = scene.pa_for(scene.kstat_template_kva, 0, kaslr);
+    let cpu0_tick_pa = scene.pa_for(scene.tick_template_kva, 0, kaslr);
+    scene.write_u64_at(cpu0_cpustat_pa, 1_111u64); // CPUTIME_USER (slot 0)
+    scene.write_u64_at(cpu0_cpustat_pa + 5 * 8, 5_555u64); // CPUTIME_IDLE (slot 5)
+    scene.write_u64_at(cpu0_kstat_pa, 9_001u64); // irqs_sum at offset 0
+    scene.write_u32_at(cpu0_kstat_pa + 8 + 3 * 4, 333u32); // softirqs[3] at +8 then *4
+    scene.write_u64_at(cpu0_tick_pa, 42_000u64); // iowait_sleeptime at offset 0
+
+    // CPU 1: distinct values so a regression that aliases CPUs
+    // (e.g. drops per_cpu_off from the formula) trips here.
+    let cpu1_cpustat_pa = scene.pa_for(scene.cpustat_template_kva, 1, kaslr);
+    let cpu1_kstat_pa = scene.pa_for(scene.kstat_template_kva, 1, kaslr);
+    let cpu1_tick_pa = scene.pa_for(scene.tick_template_kva, 1, kaslr);
+    scene.write_u64_at(cpu1_cpustat_pa, 2_222u64);
+    scene.write_u64_at(cpu1_cpustat_pa + 5 * 8, 6_666u64);
+    scene.write_u64_at(cpu1_kstat_pa, 9_002u64);
+    scene.write_u32_at(cpu1_kstat_pa + 8 + 3 * 4, 444u32);
+    scene.write_u64_at(cpu1_tick_pa, 43_000u64);
+
+    // SAFETY: scene.buf is a live local Vec<u8>; the GuestMem
+    // view does not outlive this test body.
+    let mem = unsafe {
+        super::super::reader::GuestMem::new(scene.buf.as_mut_ptr(), scene.buf.len() as u64)
+    };
+    let capture = super::CpuTimeCapture {
+        mem: &mem,
+        offsets: &scene.offsets,
+        kernel_cpustat_kva: scene.cpustat_template_kva,
+        kstat_kva: scene.kstat_template_kva,
+        tick_cpu_sched_kva: Some(scene.tick_template_kva),
+        per_cpu_offsets: &scene.per_cpu_offsets,
+        page_offset: 0,
+        kaslr_offset: kaslr,
+    };
+    let out = super::collect_per_cpu_time(&capture);
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0].cpu, 0);
+    assert_eq!(out[0].cpustat_user_ns, 1_111);
+    assert_eq!(out[0].cpustat_idle_ns, 5_555);
+    assert_eq!(out[0].irqs_sum, 9_001);
+    assert_eq!(out[0].softirqs[3], 333);
+    assert_eq!(out[0].iowait_sleeptime_ns, Some(42_000));
+    assert_eq!(out[1].cpu, 1);
+    assert_eq!(out[1].cpustat_user_ns, 2_222);
+    assert_eq!(out[1].cpustat_idle_ns, 6_666);
+    assert_eq!(out[1].irqs_sum, 9_002);
+    assert_eq!(out[1].softirqs[3], 444);
+    assert_eq!(out[1].iowait_sleeptime_ns, Some(43_000));
+}
+
+/// `collect_per_cpu_time` adds `kaslr_offset` to every per-cpu
+/// KVA — cpustat, kstat, and tick_cpu_sched. A regression that
+/// drops the `kaslr_offset` arg from any of the three
+/// `per_cpu_kva` call sites in `collect_per_cpu_time` reads from
+/// the link-time slot instead of the runtime slot, silently
+/// returning zeros (or stale neighbour bytes). Pins the wiring
+/// end-to-end: write known values at the KASLR-shifted PAs,
+/// verify each field reads the right value.
+#[test]
+fn collect_per_cpu_time_non_zero_kaslr_shifts_per_cpu_reads() {
+    let mut scene = PerCpuTimeScene::build(2, 0x4000);
+    // Non-zero, page-aligned kaslr slide. Small enough that
+    // template + kaslr + per_cpu_off fits in the buffer span.
+    let kaslr = 0x100u64;
+
+    // CPU 0 at KASLR-shifted PAs (template + kaslr + 0):
+    let cpu0_cpustat_pa = scene.pa_for(scene.cpustat_template_kva, 0, kaslr);
+    let cpu0_kstat_pa = scene.pa_for(scene.kstat_template_kva, 0, kaslr);
+    let cpu0_tick_pa = scene.pa_for(scene.tick_template_kva, 0, kaslr);
+    scene.write_u64_at(cpu0_cpustat_pa + 2 * 8, 22_22u64); // CPUTIME_SYSTEM (slot 2)
+    scene.write_u64_at(cpu0_kstat_pa, 7_007u64);
+    scene.write_u32_at(cpu0_kstat_pa + 8, 70u32); // softirqs[0] = +8
+    scene.write_u64_at(cpu0_tick_pa, 70_000u64);
+
+    // CPU 1 at KASLR-shifted PAs (template + kaslr + 0x4000):
+    let cpu1_cpustat_pa = scene.pa_for(scene.cpustat_template_kva, 1, kaslr);
+    let cpu1_kstat_pa = scene.pa_for(scene.kstat_template_kva, 1, kaslr);
+    let cpu1_tick_pa = scene.pa_for(scene.tick_template_kva, 1, kaslr);
+    scene.write_u64_at(cpu1_cpustat_pa + 2 * 8, 33_33u64);
+    scene.write_u64_at(cpu1_kstat_pa, 8_008u64);
+    scene.write_u32_at(cpu1_kstat_pa + 8, 80u32);
+    scene.write_u64_at(cpu1_tick_pa, 80_000u64);
+
+    // CRITICAL: ALSO write distinct sentinel values at ALL three
+    // link-time (kaslr=0) per-cpu slots — cpustat, kstat, AND
+    // tick. A regression that drops kaslr_offset from ANY of the
+    // three `per_cpu_kva` call sites in collect_per_cpu_time
+    // would read the sentinel instead of the kaslr-shifted real
+    // value. Without sentinels at all three sites, a regression
+    // on kstat or tick alone would only surface as a zero-vs-real
+    // mismatch (informative but less unambiguous than reading
+    // back 0xDEAD_BEEF / 0xCAFE_BABE / 0xFEED_FACE explicitly).
+    for cpu in 0..2 {
+        let cpustat_link_pa = scene.pa_for(scene.cpustat_template_kva, cpu, 0);
+        scene.write_u64_at(cpustat_link_pa + 2 * 8, 0xDEAD_BEEFu64);
+        let kstat_link_pa = scene.pa_for(scene.kstat_template_kva, cpu, 0);
+        scene.write_u64_at(kstat_link_pa, 0xCAFE_BABEu64);
+        scene.write_u32_at(kstat_link_pa + 8, 0xFEEDu32); // softirqs[0]
+        let tick_link_pa = scene.pa_for(scene.tick_template_kva, cpu, 0);
+        scene.write_u64_at(tick_link_pa, 0xFEED_FACEu64);
+    }
+
+    let mem = unsafe {
+        super::super::reader::GuestMem::new(scene.buf.as_mut_ptr(), scene.buf.len() as u64)
+    };
+    let capture = super::CpuTimeCapture {
+        mem: &mem,
+        offsets: &scene.offsets,
+        kernel_cpustat_kva: scene.cpustat_template_kva,
+        kstat_kva: scene.kstat_template_kva,
+        tick_cpu_sched_kva: Some(scene.tick_template_kva),
+        per_cpu_offsets: &scene.per_cpu_offsets,
+        page_offset: 0,
+        kaslr_offset: kaslr,
+    };
+    let out = super::collect_per_cpu_time(&capture);
+    assert_eq!(out.len(), 2);
+    // The values read MUST be the KASLR-shifted-PA writes, NOT
+    // the 0xDEAD_BEEF link-time-PA sentinel. A regression that
+    // drops kaslr_offset would surface here.
+    assert_eq!(out[0].cpustat_system_ns, 22_22);
+    assert_eq!(out[0].irqs_sum, 7_007);
+    assert_eq!(out[0].softirqs[0], 70);
+    assert_eq!(out[0].iowait_sleeptime_ns, Some(70_000));
+    assert_eq!(out[1].cpustat_system_ns, 33_33);
+    assert_eq!(out[1].irqs_sum, 8_008);
+    assert_eq!(out[1].softirqs[0], 80);
+    assert_eq!(out[1].iowait_sleeptime_ns, Some(80_000));
+}
+
+/// `collect_per_cpu_time` skips the iowait_sleeptime read when
+/// `tick_cpu_sched_kva` is None (CONFIG_NO_HZ_COMMON absent)
+/// OR when `offsets.tick_sched_iowait_sleeptime` is None
+/// (BTF lacks the field). Pins the skip path so a regression
+/// that unconditionally reads the tick KVA would either panic
+/// (None unwrap) or read garbage from a stale region.
+#[test]
+fn collect_per_cpu_time_no_tick_sched_skips_iowait() {
+    let mut scene = PerCpuTimeScene::build(1, 0x4000);
+    let kaslr = 0u64;
+    let cpu0_cpustat_pa = scene.pa_for(scene.cpustat_template_kva, 0, kaslr);
+    scene.write_u64_at(cpu0_cpustat_pa, 100u64);
+    let mem = unsafe {
+        super::super::reader::GuestMem::new(scene.buf.as_mut_ptr(), scene.buf.len() as u64)
+    };
+    let capture = super::CpuTimeCapture {
+        mem: &mem,
+        offsets: &scene.offsets,
+        kernel_cpustat_kva: scene.cpustat_template_kva,
+        kstat_kva: scene.kstat_template_kva,
+        // tick_cpu_sched_kva = None covers the CONFIG_NO_HZ_COMMON-off
+        // path.
+        tick_cpu_sched_kva: None,
+        per_cpu_offsets: &scene.per_cpu_offsets,
+        page_offset: 0,
+        kaslr_offset: kaslr,
+    };
+    let out = super::collect_per_cpu_time(&capture);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].cpustat_user_ns, 100);
+    assert_eq!(
+        out[0].iowait_sleeptime_ns, None,
+        "missing tick_cpu_sched_kva must surface as None, not zero",
+    );
+}

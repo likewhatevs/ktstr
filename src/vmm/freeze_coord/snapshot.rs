@@ -237,6 +237,76 @@ pub(super) fn arm_user_watchpoint(
         .lookup(symbol)
         .ok_or_else(|| format!("symbol '{symbol}' not found in vmlinux symtab"))?;
     let kva = link_kva.wrapping_add(kaslr_offset);
+    // Silent-misfire detection: when `kaslr_offset == 0` AND the
+    // resolved `link_kva` is in the x86_64 kernel high-half
+    // (canonical-space addresses start at `0xffff_8000_0000_0000`
+    // per Documentation/arch/x86/x86_64/mm.rst, where the guard
+    // hole / hypervisor mapping ends and kernel mappings begin),
+    // the watchpoint arms at the link-time address. Under
+    // `CONFIG_RANDOMIZE_BASE=y` (the default in `ktstr.kconfig`)
+    // the guest kernel's runtime symbol lives at `link_kva +
+    // runtime_kaslr_slide`, so the DR programmed against
+    // `link_kva` never matches a guest write — the operator sees a
+    // valid-looking arm with zero hits and no diagnostic.
+    //
+    // The arm still completes — refusing it would regress every
+    // `Op::WatchSnapshot` user when the host coordinator has not
+    // yet derived the runtime KASLR slide (e.g. before the BSP
+    // `MSR_LSTAR`-based virt_kaslr plumbing lands). The warn is a
+    // defense-in-depth signal that survives that future fix:
+    // `kaslr_offset == 0` is a VALID runtime state even after the
+    // derivation lands (a guest booted with the `nokaslr` cmdline
+    // legitimately has zero slide, and a derivation that falls
+    // back on lookup failure also yields zero). The warn
+    // distinguishes "zero because nokaslr" (low-address synthetic
+    // fixtures stay silent) from "zero against a kernel-text-
+    // looking symbol" (operator-visible signal).
+    //
+    // Arch caveats: the `0xffff_8000_0000_0000` threshold is the
+    // x86_64 canonical-space lower bound (Documentation/arch/
+    // x86/x86_64/mm.rst). arm64 layouts differ — VA_BITS=48 puts
+    // PAGE_OFFSET at `0xffff_0000_0000_0000` (memory.rst L52), so
+    // some arm64 kernel-text addresses fall below the x86_64
+    // threshold and won't trip the warn. That conservative miss
+    // is acceptable today (arm64 watchpoint paths are gated
+    // separately and the host coordinator's KASLR-derive plumbing
+    // is x86_64-first); revisit when arm64 grows full watchpoint
+    // support.
+    //
+    // Log cadence: once per unique `(symbol, link_kva)` per
+    // process. The first arm fires the warn, every subsequent
+    // arm against the same symbol/KVA stays silent — operators
+    // get the signal without log spam dominating a CI run.
+    if kaslr_offset == 0 && link_kva >= 0xffff_8000_0000_0000 {
+        // Process-wide one-shot tracker keyed on `(symbol,
+        // link_kva)`. Insertion returns `true` only the first
+        // time the pair appears; subsequent arms are silent.
+        // `Mutex<HashSet>` is fine — arm rate is low (handful
+        // per VM run) and contention is bounded.
+        static WARN_ONCE: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashSet<(String, u64)>>,
+        > = std::sync::OnceLock::new();
+        let seen =
+            WARN_ONCE.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        let key = (symbol.to_string(), link_kva);
+        let first_fire = {
+            let mut guard = seen.lock().unwrap_or_else(|e| e.into_inner());
+            guard.insert(key)
+        };
+        if first_fire {
+            tracing::warn!(
+                symbol = symbol,
+                link_kva = format_args!("{link_kva:#x}"),
+                "arm_user_watchpoint: kaslr_offset = 0 but link_kva is in \
+                 x86_64 kernel high-half — under CONFIG_RANDOMIZE_BASE=y the \
+                 runtime symbol lives at link_kva + runtime_kaslr_slide, so \
+                 this arm will not match guest writes. Boot the guest with \
+                 the `nokaslr` cmdline argument to use Op::WatchSnapshot, OR \
+                 omit Op::WatchSnapshot from KASLR-on test runs. (Logged \
+                 once per unique symbol/KVA pair per process.)"
+            );
+        }
+    }
     // `request_kva == 0` is the slot's "free" sentinel — the per-vCPU
     // `self_arm_watchpoint` short-circuits on a zero request_kva, and
     // the free-slot scan above treats kva == 0 as available. Arming
@@ -1127,6 +1197,162 @@ mod arm_user_watchpoint_tests {
         assert_eq!(
             wp.user[2].request_kva.load(Ordering::Acquire),
             0xffff_8000_0000_6000u64
+        );
+    }
+
+    /// arm_user_watchpoint logs a `tracing::warn!` when
+    /// `kaslr_offset == 0` AND `link_kva` is in the kernel
+    /// high-half (`>= 0xffff_8000_0000_0000`) — the silent-
+    /// misfire detection path. Without the warn,
+    /// `Op::WatchSnapshot` against a kernel-text symbol under
+    /// `CONFIG_RANDOMIZE_BASE=y` would arm at the link-time KVA
+    /// (wrong under runtime KASLR slide) and never fire, with no
+    /// operator-visible signal that anything was wrong. Pin the
+    /// warn so a refactor that drops the check (or the warn
+    /// itself) trips here.
+    ///
+    /// Each test uses a UNIQUE symbol name + link_kva so the
+    /// process-wide warn-once tracker fires per test, regardless
+    /// of test execution order.
+    #[tracing_test::traced_test]
+    #[test]
+    fn warns_when_kaslr_zero_against_kernel_high_half() {
+        let wp = Arc::new(WatchpointArm::new().unwrap());
+        let cache = cache_with("test_sym_warn_high_half", 0xffff_8000_0000_4040u64);
+        let bsp_alive = dead_bsp();
+        let idx = arm_user_watchpoint(
+            &wp,
+            &cache,
+            "test_sym_warn_high_half",
+            0, // kaslr_offset == 0 — triggers the warn
+            &[],
+            &[],
+            &[],
+            0 as libc::pthread_t,
+            None,
+            &bsp_alive,
+        )
+        .unwrap();
+        // Arm still succeeds — refusing it would regress every
+        // caller that hasn't yet plumbed the runtime KASLR slide.
+        assert_eq!(idx, 0);
+        assert_eq!(
+            wp.user[0].request_kva.load(Ordering::Acquire),
+            0xffff_8000_0000_4040u64,
+            "arm completes at the link-time KVA even though the warn fires",
+        );
+        // The warn names the symbol AND points at the `nokaslr`
+        // operator workaround so a user scanning logs sees an
+        // actionable next step rather than an internal task ID.
+        assert!(
+            logs_contain("arm_user_watchpoint"),
+            "expected arm_user_watchpoint warn marker in log output",
+        );
+        assert!(
+            logs_contain("test_sym_warn_high_half"),
+            "warn must name the symbol",
+        );
+        assert!(
+            logs_contain("nokaslr"),
+            "warn must cite the nokaslr operator workaround so users have an action",
+        );
+    }
+
+    /// arm_user_watchpoint logs the warn at the EXACT high-half
+    /// boundary (`link_kva == 0xffff_8000_0000_0000`) — the check
+    /// uses `>=` (inclusive). A regression that flipped to `>`
+    /// (exclusive) would silently disable the warn for any
+    /// symbol resolving exactly to the boundary. Pin the
+    /// inclusive-bound semantic.
+    #[tracing_test::traced_test]
+    #[test]
+    fn warns_when_link_kva_exactly_at_kernel_high_half_boundary() {
+        let wp = Arc::new(WatchpointArm::new().unwrap());
+        // Boundary KVA must still be 4-byte aligned (the
+        // alignment check at the function tail enforces this);
+        // 0xffff_8000_0000_0000 is 16-byte aligned.
+        let cache = cache_with("test_sym_boundary", 0xffff_8000_0000_0000u64);
+        let bsp_alive = dead_bsp();
+        // Arm at exactly the boundary. The kva==0 reject only
+        // fires when link_kva + kaslr_offset == 0 — that's not
+        // the case here (link_kva != 0).
+        let _idx = arm_user_watchpoint(
+            &wp,
+            &cache,
+            "test_sym_boundary",
+            0,
+            &[],
+            &[],
+            &[],
+            0 as libc::pthread_t,
+            None,
+            &bsp_alive,
+        )
+        .unwrap();
+        assert!(
+            logs_contain("arm_user_watchpoint"),
+            "link_kva exactly at high-half boundary (>= check is inclusive) must warn",
+        );
+    }
+
+    /// Inverse: arm_user_watchpoint does NOT log the warn when
+    /// `kaslr_offset != 0` (a runtime KASLR slide IS plumbed —
+    /// the warn path is for the structural-zero / nokaslr
+    /// scenarios). Pinned so a future regression that drops the
+    /// conditional (and warns on every arm) trips here.
+    #[tracing_test::traced_test]
+    #[test]
+    fn no_warn_when_kaslr_nonzero() {
+        let wp = Arc::new(WatchpointArm::new().unwrap());
+        let cache = cache_with("test_sym_warn_nonzero", 0xffff_8000_0000_5040u64);
+        let bsp_alive = dead_bsp();
+        let _idx = arm_user_watchpoint(
+            &wp,
+            &cache,
+            "test_sym_warn_nonzero",
+            0x1000, // kaslr_offset != 0 — warn must NOT fire
+            &[],
+            &[],
+            &[],
+            0 as libc::pthread_t,
+            None,
+            &bsp_alive,
+        )
+        .unwrap();
+        assert!(
+            !logs_contain("arm_user_watchpoint"),
+            "non-zero kaslr_offset must NOT log the silent-misfire warn",
+        );
+    }
+
+    /// Inverse: arm_user_watchpoint does NOT log the warn when
+    /// `kaslr_offset == 0` BUT `link_kva` falls below the kernel
+    /// high-half (e.g. a test fixture using low addresses). The
+    /// silent-misfire concern only applies to kernel-text symbols
+    /// (high-half KVA under `CONFIG_RANDOMIZE_BASE`); low-address
+    /// arms are tests / synthetic and not subject to KASLR slide.
+    #[tracing_test::traced_test]
+    #[test]
+    fn no_warn_when_link_kva_below_kernel_high_half() {
+        let wp = Arc::new(WatchpointArm::new().unwrap());
+        let cache = cache_with("test_sym_warn_low", 0x4000u64); // low address
+        let bsp_alive = dead_bsp();
+        let _idx = arm_user_watchpoint(
+            &wp,
+            &cache,
+            "test_sym_warn_low",
+            0,
+            &[],
+            &[],
+            &[],
+            0 as libc::pthread_t,
+            None,
+            &bsp_alive,
+        )
+        .unwrap();
+        assert!(
+            !logs_contain("arm_user_watchpoint"),
+            "low-address link_kva must NOT trigger the kernel-text silent-misfire warn",
         );
     }
 }

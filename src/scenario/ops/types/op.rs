@@ -447,6 +447,19 @@ pub enum Op {
     ///   which require `addr & 0x3 == 0` on every supported
     ///   architecture. Mis-aligned addresses bail at setup with
     ///   the resolved KVA in the error.
+    /// - **Silent-misfire detection (KASLR-on guests).** When the
+    ///   host coordinator's `kaslr_offset` is zero AND the
+    ///   resolved kernel symbol lives in the x86_64 high-half
+    ///   address range, `arm_user_watchpoint` emits a
+    ///   `tracing::warn!` (once per unique `(symbol, link_kva)`
+    ///   per process) noting the arm targets the link-time KVA
+    ///   while the runtime symbol lives at `link_kva +
+    ///   runtime_kaslr_slide`. The arm STILL completes (rejecting
+    ///   it would regress every caller running before the host
+    ///   coordinator's runtime-KASLR-slide derivation lands);
+    ///   operators who hit the warn can boot the guest with the
+    ///   `nokaslr` cmdline to use `Op::WatchSnapshot`, or omit
+    ///   the op from KASLR-on test runs entirely.
     ///
     /// **Guest → host wire.** The registration request rides the
     /// same ioeventfd doorbell as [`Op::CaptureSnapshot`] (separate tag
