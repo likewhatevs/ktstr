@@ -114,6 +114,7 @@ pub(crate) fn build(
     offsets: Option<&ScxWalkerOffsets>,
     symbols: Option<&KernelSymbols>,
     per_cpu_offsets: Option<&[u64]>,
+    kaslr_offset: u64,
 ) -> Option<ScxWalkerOwned> {
     // Hard prereqs. Each `?` short-circuits to a `None` capture which
     // surfaces as `REASON_NO_SCX_WALKER` in the dump.
@@ -161,6 +162,7 @@ pub(crate) fn build(
         scx_root_kva,
         scx_tasks_kva,
         pco,
+        kaslr_offset,
     ))
 }
 
@@ -185,6 +187,7 @@ fn compute_owned(
     scx_root_kva: u64,
     scx_tasks_kva: u64,
     per_cpu_offsets: &[u64],
+    kaslr_offset: u64,
 ) -> ScxWalkerOwned {
     // Build rq_pas and rq_kvas in a single pass over per_cpu_offsets
     // rather than calling compute_rq_pas (one walk) then mapping
@@ -192,11 +195,23 @@ fn compute_owned(
     // allocation and one full iteration on every freeze — matters
     // when nr_cpus is large because this runs while every vCPU is
     // paused.
+    //
+    // Pre-batch this site dropped the `kaslr_offset` term
+    // outright; the helper now accepts it as scaffolding, but
+    // production callers in `crate::vmm::freeze_coord` pass `0`
+    // until the LSTAR-derived virtual KASLR slide is plumbed
+    // cross-thread to the monitor (#31 real-fix). Under
+    // `CONFIG_RANDOMIZE_BASE=y` the read still surfaces
+    // phantom-empty rq->scx state; the helper extraction is the
+    // prerequisite for the single-line caller fix when the value
+    // flows in. See [`crate::monitor::symbols::per_cpu_kva`] for
+    // the canonical formula every per-CPU walker now shares.
     let n = per_cpu_offsets.len();
     let mut rq_pas: Vec<u64> = Vec::with_capacity(n);
     let mut rq_kvas: Vec<u64> = Vec::with_capacity(n);
     for &offset in per_cpu_offsets {
-        let kva = runqueues_kva.wrapping_add(offset);
+        let kva =
+            crate::monitor::symbols::per_cpu_kva(runqueues_kva, kaslr_offset, offset);
         let pa = crate::monitor::symbols::kva_to_pa(kva, page_offset);
         rq_pas.push(pa);
         rq_kvas.push(pa.wrapping_add(page_offset));
@@ -233,6 +248,7 @@ mod tests {
             scx_root_kva,
             scx_tasks_kva,
             &per_cpu,
+            0,
         );
 
         assert_eq!(owned.scx_root_kva, scx_root_kva);
@@ -243,7 +259,7 @@ mod tests {
         // scanner uses — any drift between the two would surface
         // here as different per-CPU PAs.
         let expected_pas =
-            crate::monitor::symbols::compute_rq_pas(runqueues_kva, &per_cpu, page_offset, 0, 0);
+            crate::monitor::symbols::compute_rq_pas(runqueues_kva, &per_cpu, page_offset, 0);
         assert_eq!(owned.rq_pas, expected_pas);
         // Every rq_kva is the recovered KVA for the same CPU's PA.
         for (cpu, expected_pa) in expected_pas.iter().enumerate() {
@@ -260,14 +276,14 @@ mod tests {
         let page_offset = DEFAULT_PAGE_OFFSET;
         let runqueues_kva: u64 = 0x20_0000;
         let per_cpu = [0x10_0000u64, 0x14_0000u64];
-        let owned = compute_owned(page_offset, runqueues_kva, 0, 0, &per_cpu);
+        let owned = compute_owned(page_offset, runqueues_kva, 0, 0, &per_cpu, 0);
 
         assert_eq!(owned.scx_root_kva, 0);
         assert_eq!(owned.scx_tasks_kva, 0);
         assert_eq!(owned.rq_kvas.len(), 2);
         assert_eq!(owned.rq_pas.len(), 2);
         let expected_pas =
-            crate::monitor::symbols::compute_rq_pas(runqueues_kva, &per_cpu, page_offset, 0, 0);
+            crate::monitor::symbols::compute_rq_pas(runqueues_kva, &per_cpu, page_offset, 0);
         assert_eq!(owned.rq_pas, expected_pas);
     }
 
@@ -281,7 +297,7 @@ mod tests {
         let runqueues_kva: u64 = 0x20_0000;
         let per_cpu = [0x10_0000u64];
         let scx_root_kva = 0xffff_ffff_8230_0000;
-        let owned = compute_owned(page_offset, runqueues_kva, scx_root_kva, 0, &per_cpu);
+        let owned = compute_owned(page_offset, runqueues_kva, scx_root_kva, 0, &per_cpu, 0);
 
         assert_eq!(owned.scx_root_kva, scx_root_kva);
         assert_eq!(owned.scx_tasks_kva, 0);
@@ -355,7 +371,7 @@ mod tests {
         let runqueues_kva: u64 = 0x20_0000;
         let scx_root_kva = 0xffff_ffff_8230_0000;
         let scx_tasks_kva = 0xffff_ffff_8240_0000;
-        let owned = compute_owned(page_offset, runqueues_kva, scx_root_kva, scx_tasks_kva, &[]);
+        let owned = compute_owned(page_offset, runqueues_kva, scx_root_kva, scx_tasks_kva, &[], 0);
 
         assert!(owned.rq_kvas.is_empty());
         assert!(owned.rq_pas.is_empty());
@@ -376,7 +392,7 @@ mod tests {
         // resulting rq_pa is 0 and the recovered rq_kva is page_offset.
         let runqueues_kva: u64 = 0x1000;
         let per_cpu = [page_offset.wrapping_sub(runqueues_kva)];
-        let owned = compute_owned(page_offset, runqueues_kva, 0, 0, &per_cpu);
+        let owned = compute_owned(page_offset, runqueues_kva, 0, 0, &per_cpu, 0);
 
         assert_eq!(owned.rq_pas, vec![0u64]);
         assert_eq!(owned.rq_kvas, vec![page_offset]);
@@ -403,6 +419,7 @@ mod tests {
             0xffff_ffff_8000_0000,
             0xffff_ffff_8001_0000,
             &per_cpu,
+            0,
         );
 
         assert_eq!(owned.rq_kvas.len(), per_cpu.len());
@@ -414,5 +431,42 @@ mod tests {
                 "kva/pa pair mismatch on cpu {cpu}",
             );
         }
+    }
+
+    /// Cross-check that `compute_owned` and `compute_rq_pas` agree
+    /// under a non-zero `kaslr_offset`. Before the KASLR slide was
+    /// threaded into both helpers, they silently omitted it and
+    /// produced identical (wrong) PAs — the prior cross-checks at
+    /// L257 / L281 pass `kaslr_offset = 0` to both sides, so they
+    /// would not detect an asymmetry where one side picks up the new
+    /// arg and the other doesn't. The shared helper + this test
+    /// together pin the contract: a future change that drops the
+    /// slide on one path but not the other surfaces here as
+    /// divergent PAs.
+    #[test]
+    fn compute_owned_matches_compute_rq_pas_under_kaslr() {
+        let page_offset = DEFAULT_PAGE_OFFSET;
+        let runqueues_kva: u64 = 0x20_0000;
+        let per_cpu = [0x10_0000u64, 0x14_0000u64, 0x18_0000u64];
+        let kaslr = 0x1_0000_0000u64; // 4 GiB virt slide
+        let owned = compute_owned(
+            page_offset,
+            runqueues_kva,
+            0xffff_ffff_8230_0000,
+            0xffff_ffff_8240_0000,
+            &per_cpu,
+            kaslr,
+        );
+        let expected_pas = crate::monitor::symbols::compute_rq_pas(
+            runqueues_kva,
+            &per_cpu,
+            page_offset,
+            kaslr,
+        );
+        assert_eq!(
+            owned.rq_pas, expected_pas,
+            "compute_owned and compute_rq_pas must agree on non-zero \
+             kaslr — asymmetric kaslr threading would surface here",
+        );
     }
 }

@@ -288,10 +288,6 @@ pub(crate) struct KernelSymbols {
     // page_offset_base_kva — link-time KVA values from vmlinux.
     #[allow(dead_code)]
     pub entry_syscall_64_kva: Option<u64>,
-    /// Link-time KVA of `__per_cpu_start` — the base of the
-    /// `.data..percpu` section. Subtracted from per-CPU symbol KVAs
-    /// to recover section-relative offsets for `compute_rq_pas`.
-    pub per_cpu_start: u64,
     /// Link-time kernel virtual address of the `kernel_cpustat`
     /// per-CPU template. The per-CPU KVA for CPU `n` is
     /// `kernel_cpustat + __per_cpu_offset[n]` (plus
@@ -424,7 +420,6 @@ impl KernelSymbols {
         // `wrmsrq(MSR_LSTAR, (unsigned long)entry_SYSCALL_64)` in
         // arch/x86/kernel/cpu/common.c:2257 — name match guaranteed.
         let entry_syscall_64_kva = sym_addr("entry_SYSCALL_64");
-        let per_cpu_start = sym_addr("__per_cpu_start").unwrap_or(0);
 
         // Per-CPU CPU-time / softirq / IRQ / iowait_sleeptime
         // symbols. All three are `.data..percpu` per-CPU templates;
@@ -463,7 +458,6 @@ impl KernelSymbols {
             scx_watchdog_interval,
             jiffies_64,
             entry_syscall_64_kva,
-            per_cpu_start,
             kernel_cpustat,
             kstat,
             tick_cpu_sched,
@@ -812,42 +806,92 @@ pub(crate) fn read_per_cpu_offsets(
         .collect()
 }
 
+/// Resolve a per-CPU symbol's runtime KVA for one CPU.
+///
+/// Every callsite that walks a per-CPU symbol (`runqueues`,
+/// `kernel_cpustat`, `kstat`, `tick_cpu_sched`, scheduler-event
+/// pcpu fields) computes the same formula — given the link-time
+/// KVA the linker assigned to the per-CPU template
+/// (`template_kva`), the active KASLR slide for the kernel's
+/// virtual mapping (`kaslr_offset` — derived once at coordinator
+/// handshake from BSP MSR_LSTAR per
+/// [`crate::vmm::x86_64::msr_kaslr::read_and_derive`] once the
+/// cross-thread plumbing for that derive lands; production
+/// callers currently pass `0` as scaffolding while that
+/// follow-up is in flight), and the runtime per-CPU base
+/// offset for the target CPU (`per_cpu_off`, the value read
+/// out of `__per_cpu_offset[cpu]`), the runtime KVA is the
+/// simple sum `template_kva + kaslr_offset + per_cpu_off`. The
+/// kernel's own `per_cpu_ptr()` macro performs the same
+/// arithmetic (`linux:include/linux/percpu-defs.h`); the host
+/// monitor duplicates it because we read guest memory directly
+/// rather than calling into the kernel.
+///
+/// Extracted into a single helper so the formula has one audit
+/// point. Pre-#31 the math was open-coded at five sites; three
+/// of them silently omitted `kaslr_offset` (compute_owned in
+/// capture_scx, plus the three collect_per_cpu_time sites in
+/// dump::mod) and quietly returned zero from
+/// [`super::reader::GuestMem::read_u64`] under KASLR-on. The
+/// scaffolding consolidation is complete (one audit point;
+/// helper accepts `kaslr_offset`; all five sites route through
+/// it), but every production caller still passes
+/// `kaslr_offset = 0`. The silent-zero mode persists until the
+/// LSTAR-derive plumbing lands — see the `compute_rq_pas` doc
+/// below and `crate::vmm::x86_64::msr_kaslr::read_and_derive`.
+/// Anyone adding a sixth per-CPU walker should call this helper
+/// (passing `0` to match the existing callers) rather than
+/// re-deriving the formula.
+#[inline]
+pub(crate) fn per_cpu_kva(template_kva: u64, kaslr_offset: u64, per_cpu_off: u64) -> u64 {
+    template_kva
+        .wrapping_add(kaslr_offset)
+        .wrapping_add(per_cpu_off)
+}
+
 /// Compute the physical address of each CPU's `struct rq`.
 ///
-/// Each CPU's rq is at `runqueues_kva + per_cpu_offset[cpu]` in kernel
-/// virtual space; subtracting PAGE_OFFSET yields the guest physical address.
+/// Each CPU's rq is at `runqueues_kva + kaslr_offset +
+/// per_cpu_offset[cpu]` in kernel virtual space (the
+/// [`per_cpu_kva`] formula); subtracting PAGE_OFFSET yields the
+/// guest physical address.
+///
+/// `kaslr_offset` is the VIRTUAL kernel-image KASLR slide — the
+/// delta between the link-time `__per_cpu_start` and the
+/// runtime per-CPU base, equivalent to (LSTAR_RUNTIME -
+/// entry_SYSCALL_64_link_KVA) per `crate::vmm::x86_64::msr_kaslr`.
+/// Production callers in `crate::vmm::freeze_coord` currently
+/// pass `0` (the LSTAR-derive needs cross-thread BSP-vcpu
+/// plumbing that has not yet landed); under `CONFIG_RANDOMIZE_BASE=y`
+/// (the default ktstr.kconfig setting) this produces wrong
+/// per-CPU KVAs and `kva_to_pa` bounds-rejects to zero (the
+/// silent-data-corruption mode #31 will fix once the LSTAR-derive
+/// plumbing lands). The helper algebra itself is correct: when
+/// the right value flows in, the formula
+/// `template + kaslr + per_cpu_off` matches the kernel's
+/// `per_cpu_ptr()` macro exactly (include/linux/percpu-defs.h).
 ///
 /// `per_cpu_offsets` slots that are zero produce a PA at
-/// `kva_to_pa(runqueues_kva, page_offset)`, which on a typical
-/// `runqueues` percpu offset (small, far below `page_offset`)
-/// wraps via `wrapping_sub` into the upper-half KVA region — far
-/// outside any guest DRAM region. [`super::reader::GuestMem::read_u64`]
-/// silently bounds-rejects such reads to zero, so callers get
-/// zero-filled `CpuSnapshot`s when this function is fed a stale
-/// (BSS-zero) per-CPU offset table. Callers that need to dodge
-/// the host-monitor / guest-BSP boot race should refresh the
-/// offset table per sample (see
+/// `kva_to_pa(runqueues_kva + kaslr_offset, page_offset)`, which
+/// on a typical `runqueues` percpu offset (small, far below
+/// `page_offset`) wraps via `wrapping_sub` into the upper-half
+/// KVA region — far outside any guest DRAM region.
+/// [`super::reader::GuestMem::read_u64`] silently bounds-rejects
+/// such reads to zero, so callers get zero-filled `CpuSnapshot`s
+/// when this function is fed a stale (BSS-zero) per-CPU offset
+/// table. Callers that need to dodge the host-monitor / guest-BSP
+/// boot race should refresh the offset table per sample (see
 /// [`super::reader::RqRefresh`]).
 pub(crate) fn compute_rq_pas(
     runqueues_kva: u64,
     per_cpu_offsets: &[u64],
     page_offset: u64,
-    per_cpu_start: u64,
     kaslr_offset: u64,
 ) -> Vec<u64> {
-    // __per_cpu_offset[cpu] = pcpu_base_addr - __per_cpu_start_RUNTIME.
-    // runqueues section_offset = runqueues_kva - __per_cpu_start_LINK.
-    // __per_cpu_start_RUNTIME = __per_cpu_start_LINK + kaslr_offset.
-    // KVA = section_offset + __per_cpu_offset[cpu] + __per_cpu_start_RUNTIME
-    //     = pcpu_base_addr + section_offset  (KASLR cancels).
-    let section_offset = runqueues_kva.wrapping_sub(per_cpu_start);
-    let runtime_start = per_cpu_start.wrapping_add(kaslr_offset);
     per_cpu_offsets
         .iter()
         .map(|&offset| {
-            let kva = runtime_start
-                .wrapping_add(section_offset)
-                .wrapping_add(offset);
+            let kva = per_cpu_kva(runqueues_kva, kaslr_offset, offset);
             kva_to_pa(kva, page_offset)
         })
         .collect()
@@ -895,7 +939,7 @@ mod tests {
         let page_offset = DEFAULT_PAGE_OFFSET;
         let runqueues = page_offset.wrapping_add(0x20_0000);
         let offsets = vec![0, 0x4_0000]; // CPU 0 at base, CPU 1 at +256KB
-        let pas = compute_rq_pas(runqueues, &offsets, page_offset, 0, 0);
+        let pas = compute_rq_pas(runqueues, &offsets, page_offset, 0);
         assert_eq!(pas[0], 0x20_0000);
         assert_eq!(pas[1], 0x24_0000);
     }
@@ -1140,7 +1184,7 @@ mod tests {
     fn compute_rq_pas_empty_offsets() {
         let page_offset = DEFAULT_PAGE_OFFSET;
         let runqueues = page_offset.wrapping_add(0x20_0000);
-        let pas = compute_rq_pas(runqueues, &[], page_offset, 0, 0);
+        let pas = compute_rq_pas(runqueues, &[], page_offset, 0);
         assert!(pas.is_empty());
     }
 
@@ -1148,9 +1192,75 @@ mod tests {
     fn compute_rq_pas_single_cpu() {
         let page_offset = DEFAULT_PAGE_OFFSET;
         let runqueues = page_offset.wrapping_add(0x20_0000);
-        let pas = compute_rq_pas(runqueues, &[0], page_offset, 0, 0);
+        let pas = compute_rq_pas(runqueues, &[0], page_offset, 0);
         assert_eq!(pas.len(), 1);
         assert_eq!(pas[0], 0x20_0000);
+    }
+
+    /// Sanity-pin the new `per_cpu_kva` helper at the no-KASLR
+    /// baseline: with `kaslr_offset = 0` the formula collapses to
+    /// `template + per_cpu_off`.
+    #[test]
+    fn per_cpu_kva_zero_kaslr_is_simple_sum() {
+        let template = 0xffff_ffff_8200_0000_u64;
+        let off = 0x4_0000_u64;
+        assert_eq!(per_cpu_kva(template, 0, off), template.wrapping_add(off));
+    }
+
+    /// KASLR-on path: every per-CPU KVA slides by the same delta.
+    /// Without an explicit non-zero `kaslr_offset` test, a
+    /// regression that subtracted instead of added (mirroring the
+    /// phys-vs-virt confusion class) would compile and pass every
+    /// `kaslr_offset = 0` test. Pin the slide direction explicitly
+    /// so a future refactor that drops or inverts the add tripping
+    /// `kva_to_pa` surfaces here instead of silently in production.
+    #[test]
+    fn per_cpu_kva_non_zero_kaslr_shifts_template() {
+        let template = 0xffff_ffff_8200_0000_u64;
+        let kaslr = 0x1_0000_0000_u64; // 4 GiB virt slide
+        let off = 0x4_0000_u64;
+        let expected = template.wrapping_add(kaslr).wrapping_add(off);
+        assert_eq!(per_cpu_kva(template, kaslr, off), expected);
+        // Cross-check by associativity: pre-add the slide into
+        // template and the no-slide form lands on the same value.
+        assert_eq!(
+            per_cpu_kva(template, kaslr, off),
+            per_cpu_kva(template.wrapping_add(kaslr), 0, off),
+        );
+    }
+
+    /// All three operands near u64::MAX must wrap cleanly; the
+    /// `wrapping_add` chain is intentional (KVA arithmetic is
+    /// modular). A future refactor that swapped to `checked_add`
+    /// would panic here.
+    #[test]
+    fn per_cpu_kva_wraps_at_u64_boundary() {
+        let template = u64::MAX - 0x100;
+        let kaslr = 0x80_u64;
+        // (MAX - 0x100) + 0x80 + 0x81 = (MAX + 1) = 0 under
+        // wrapping arithmetic; no panic.
+        assert_eq!(per_cpu_kva(template, kaslr, 0x81_u64), 0u64);
+    }
+
+    /// Non-zero KASLR slides every per-CPU PA by the same delta
+    /// as the no-slide baseline. An older helper had
+    /// `(per_cpu_start + kaslr) + (template - per_cpu_start) +
+    /// offset` which simplifies to `template + kaslr + offset` —
+    /// pin the simplified form against a non-zero `kaslr_offset`
+    /// so a regression that drops the slide arm of the formula
+    /// trips on every CPU rather than just on the non-existent
+    /// `per_cpu_start != 0` test path.
+    #[test]
+    fn compute_rq_pas_non_zero_kaslr_shifts_every_cpu() {
+        let page_offset = DEFAULT_PAGE_OFFSET;
+        let runqueues = page_offset.wrapping_add(0x20_0000);
+        let offsets = [0u64, 0x10_0000, 0x20_0000];
+        let kaslr = 0x1_0000_0000_u64;
+        let baseline = compute_rq_pas(runqueues, &offsets, page_offset, 0);
+        let shifted = compute_rq_pas(runqueues, &offsets, page_offset, kaslr);
+        for (b, s) in baseline.iter().zip(shifted.iter()) {
+            assert_eq!(*s, b.wrapping_add(kaslr));
+        }
     }
 
     #[test]
@@ -1188,7 +1298,6 @@ mod tests {
             tick_cpu_sched: None,
             node_data: None,
             entry_syscall_64_kva: None,
-            per_cpu_start: 0,
         };
 
         assert_eq!(
@@ -1224,7 +1333,6 @@ mod tests {
             tick_cpu_sched: None,
             node_data: None,
             entry_syscall_64_kva: None,
-            per_cpu_start: 0,
         };
 
         assert_eq!(
@@ -1262,7 +1370,6 @@ mod tests {
             tick_cpu_sched: None,
             node_data: None,
             entry_syscall_64_kva: None,
-            per_cpu_start: 0,
         };
 
         assert_eq!(
@@ -1303,7 +1410,6 @@ mod tests {
             tick_cpu_sched: None,
             node_data: None,
             entry_syscall_64_kva: None,
-            per_cpu_start: 0,
         };
 
         assert_eq!(
@@ -1347,7 +1453,6 @@ mod tests {
             tick_cpu_sched: None,
             node_data: None,
             entry_syscall_64_kva: None,
-            per_cpu_start: 0,
         };
 
         assert_eq!(
@@ -1387,7 +1492,6 @@ mod tests {
             tick_cpu_sched: None,
             node_data: None,
             entry_syscall_64_kva: None,
-            per_cpu_start: 0,
         };
 
         assert!(resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP, 0));
@@ -1424,7 +1528,6 @@ mod tests {
             tick_cpu_sched: None,
             node_data: None,
             entry_syscall_64_kva: None,
-            per_cpu_start: 0,
         };
 
         assert!(!resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP, 0));
@@ -1457,7 +1560,6 @@ mod tests {
             tick_cpu_sched: None,
             node_data: None,
             entry_syscall_64_kva: None,
-            per_cpu_start: 0,
         };
 
         assert!(!resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP, 0));

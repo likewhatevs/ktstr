@@ -3581,15 +3581,34 @@ impl KtstrVm {
                                      (some CPUs still booting)",
                                 );
                             }
-                            // The coordinator's scan_ctx path uses
-                            // the accessor's own phys_base (from
-                            // page-table walk). TODO: derive
-                            // kaslr_offset for the coordinator too.
+                            // Passes `0` until the LSTAR-derived
+                            // virtual KASLR slide is plumbed
+                            // through. The `coord_kaslr_offset`
+                            // derivation at L2999
+                            // (`pb.wrapping_sub(real_pb)`) reduces
+                            // to 0 in steady state — both reads
+                            // resolve the kernel's `phys_base`
+                            // global from the same address — so
+                            // passing it here would be no functional
+                            // difference from `0`. The correct
+                            // virtual slide must come from
+                            // `crate::vmm::x86_64::msr_kaslr::read_and_derive`
+                            // (BSP MSR_LSTAR - syms.entry_syscall_64_kva),
+                            // which needs cross-thread plumbing of
+                            // the BSP `VcpuFd` to this monitor
+                            // thread — tracked separately as the
+                            // #31 real-fix follow-up. Until that
+                            // lands, per-CPU PA derivation under
+                            // KASLR-on remains silent-zero (the
+                            // pre-batch behavior); the helper
+                            // extraction + plumbing + tests in
+                            // this batch are scaffolding for the
+                            // follow-up commit that flips this
+                            // literal.
                             let rq_pas = crate::monitor::symbols::compute_rq_pas(
                                 syms.runqueues,
                                 &pco_offsets,
                                 walk.page_offset,
-                                syms.per_cpu_start,
                                 0,
                             );
                             // scx_watchdog_timestamp is a `.data`
@@ -5072,11 +5091,22 @@ impl KtstrVm {
                                 // duration line so operators can
                                 // budget against the watchdog timeout.
                                 let scx_build_t0 = std::time::Instant::now();
+                                // TODO(#31 real-fix): plumb the
+                                // LSTAR-derived virtual KASLR slide
+                                // here (see the freeze_coord scan_ctx
+                                // call comment above; `coord_kaslr_offset`
+                                // is structurally zero, so passing it
+                                // here would also be a no-op). The
+                                // scaffolding (`build` accepts the
+                                // arg; `per_cpu_kva` helper applies
+                                // it) is in place — only the value
+                                // remains.
                                 let scx_owned = crate::vmm::capture_scx::build(
                                     owned,
                                     dump_scx_walker_offsets.as_ref(),
                                     dump_cpu_time_symbols.as_ref(),
                                     prog_per_cpu_offsets.as_deref(),
+                                    0,
                                 );
                                 tracing::debug!(
                                     elapsed_us = scx_build_t0.elapsed().as_micros() as u64,
@@ -5154,6 +5184,13 @@ impl KtstrVm {
                                         match (syms.kernel_cpustat, syms.kstat) {
                                             (Some(kcpustat_kva), Some(kstat_kva)) => {
                                                 let page_offset = dump_kernel.page_offset();
+                                                // TODO(#31 real-fix): same as
+                                                // the capture_scx::build call —
+                                                // pass the LSTAR-derived
+                                                // virtual KASLR slide here.
+                                                // Helper + struct field are
+                                                // wired; only the value is
+                                                // missing.
                                                 Some(crate::monitor::dump::CpuTimeCapture {
                                                     mem,
                                                     offsets,
@@ -5162,6 +5199,7 @@ impl KtstrVm {
                                                     tick_cpu_sched_kva: syms.tick_cpu_sched,
                                                     per_cpu_offsets: pcpu,
                                                     page_offset,
+                                                    kaslr_offset: 0,
                                                 })
                                             }
                                             _ => None,
@@ -9073,28 +9111,23 @@ impl KtstrVm {
                     let _ = kern_phys_base_evt.write(1);
                 }
 
-                // Derive kaslr_offset by reading the kernel's real
-                // phys_base variable from guest memory. The guest
-                // reported `output - LOAD_PHYSICAL_ADDR` which equals
-                // `real_phys_base + kaslr_offset`. Reading the kernel's
-                // own phys_base and subtracting recovers kaslr_offset.
-                let kaslr_offset = if phys_base != 0
-                    && let Some(pb_kva) = symbols.phys_base_kva
-                {
-                    let pb_pa = crate::monitor::symbols::text_kva_to_pa_with_base(
-                        pb_kva,
-                        start_kernel_map_for_thread,
-                        phys_base,
-                    );
-                    let real_phys_base = mem.read_u64(pb_pa, 0);
-                    if real_phys_base != 0 || phys_base == 0 {
-                        phys_base.wrapping_sub(real_phys_base)
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                };
+                // TODO(#31 real-fix): the pre-batch derivation here
+                // computed `phys_base - real_phys_base`, but both
+                // reads target the kernel's `phys_base` global at
+                // the same address — `phys_base` is the cached
+                // GuestKernel::phys_base() (set during construction
+                // by resolve_phys_base reading that global), and
+                // `real_phys_base` re-reads the same byte. The
+                // subtraction reduces to a structural zero. Replaced
+                // with a literal `0` to match the other 3 production
+                // sites at L3601/L5104/L5197 + the RqRefresh init
+                // below. The real source of truth is
+                // `crate::vmm::x86_64::msr_kaslr::read_and_derive`
+                // (BSP MSR_LSTAR minus link-time entry_SYSCALL_64),
+                // which needs cross-thread plumbing of the BSP
+                // VcpuFd to this monitor thread — tracked as task
+                // #24 ([#31 real-fix]).
+                let kaslr_offset: u64 = 0;
 
                 // Kill check between sys_rdy wait and the long-tail
                 // setup work below (page-table walks, watchdog override
@@ -9278,7 +9311,6 @@ impl KtstrVm {
                 let rq_refresh = monitor::reader::RqRefresh {
                     pco_pa,
                     runqueues_kva: symbols.runqueues,
-                    per_cpu_start: symbols.per_cpu_start,
                     kaslr_offset,
                     num_cpus,
                     page_offset_base_pa,

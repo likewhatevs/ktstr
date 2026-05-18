@@ -8,12 +8,21 @@
 # CONFIG_X86_FRED is not set
 
 # CONFIG_RANDOMIZE_BASE=y forces virt-KASLR on for every ktstr boot. The
-# kaslr_compute_rq_pas_e2e regression test depends on a non-zero KASLR offset
-# to exercise the freeze_coord → compute_rq_pas wire-in; an inherited
-# defconfig that flipped this off would silently degrade the test into a
-# tautology (kaslr=0 makes the buggy and fixed paths agree on the same PA).
-# Pinning here keeps the assertion meaningful.
+# `kaslr_offset_nonzero_post_boot` e2e test (tests/kaslr_axis_e2e.rs) depends
+# on a non-zero KASLR offset to exercise the freeze_coord → compute_rq_pas
+# wire-in; an inherited defconfig that flipped this off would silently
+# degrade the test into a tautology (kaslr=0 makes the buggy and fixed
+# paths agree on the same PA). Pinning here keeps the assertion meaningful.
 CONFIG_RANDOMIZE_BASE=y
+
+# CONFIG_RANDOMIZE_MEMORY=n keeps `page_offset_base` at its compile-time
+# default so the host monitor's `kva_to_pa` (which assumes
+# `super::symbols::DEFAULT_PAGE_OFFSET` when the runtime symbol resolve has
+# not landed) is correct during the boot-race window. Independent of the
+# kernel-image text/data KASLR slide: text KASLR comes from
+# CONFIG_RANDOMIZE_BASE=y above and the virtual slide is recovered via
+# MSR_LSTAR (see `crate::vmm::x86_64::msr_kaslr::read_and_derive`).
+# CONFIG_RANDOMIZE_MEMORY is not set
 
 # -- sched_ext + BPF (required) --
 # sched_ext scheduling class. Depends on BPF_SYSCALL + BPF_JIT + DEBUG_INFO_BTF.

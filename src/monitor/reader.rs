@@ -1817,11 +1817,20 @@ pub(crate) struct RqRefresh {
     /// CPU's offset to compute the per-CPU rq KVA, then reduced
     /// to a PA via [`super::symbols::kva_to_pa`].
     pub runqueues_kva: u64,
-    /// Link-time KVA of `__per_cpu_start`. Subtracted from
-    /// `runqueues_kva` to get the section-relative offset.
-    pub per_cpu_start: u64,
-    /// Virtual KASLR offset. Per-CPU offset computation needs this
-    /// to bridge the link-time and runtime `__per_cpu_start`.
+    /// KASLR offset for the per-CPU walker. The virtual slide is
+    /// supposed to flow in from the monitor-thread handshake
+    /// (`super::symbols::per_cpu_kva` needs it to bridge
+    /// link-time and runtime per-CPU bases). In the current
+    /// scaffolding the producer at the freeze-coord handshake
+    /// derives `phys_base - real_phys_base`, which reduces to a
+    /// structural zero because both reads target the kernel's
+    /// `phys_base` global at the same address. The per-CPU walker
+    /// at `super::reader::monitor_loop` therefore reads zero PAs
+    /// under KASLR-on — same pre-batch behavior — until the
+    /// LSTAR-derive plumbing in `crate::vmm::x86_64::msr_kaslr::read_and_derive`
+    /// reaches this monitor thread (the #31 real-fix follow-up).
+    /// Field exists so the single-line caller flip is the only
+    /// remaining work once that value flows.
     pub kaslr_offset: u64,
     /// Number of CPUs (entries to read from `__per_cpu_offset[]`).
     pub num_cpus: u32,
@@ -2627,7 +2636,6 @@ pub(crate) fn monitor_loop(
                 refresh.runqueues_kva,
                 &fresh,
                 page_offset,
-                refresh.per_cpu_start,
                 refresh.kaslr_offset,
             );
             // `event_pcpu_pas` requires both fresh `__per_cpu_offset[]`
@@ -3696,7 +3704,6 @@ mod tests {
             num_cpus: 2,
             page_offset_base_pa: None,
             event: None,
-            per_cpu_start: 0,
             kaslr_offset: 0,
         };
 
@@ -3767,7 +3774,6 @@ mod tests {
             num_cpus: 2,
             page_offset_base_pa: None,
             event: None,
-            per_cpu_start: 0,
             kaslr_offset: 0,
         };
 

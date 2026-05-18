@@ -134,15 +134,18 @@ pub struct CpuTimeCapture<'a> {
     /// `kernel_stat::softirqs[]`, `kernel_stat::irqs_sum`, and
     /// optionally `tick_sched::iowait_sleeptime`.
     pub offsets: &'a super::btf_offsets::CpuTimeOffsets,
-    /// Section-relative `.data..percpu` offset of the
-    /// `kernel_cpustat` per-CPU symbol. Each CPU's KVA is
-    /// `kernel_cpustat + per_cpu_offsets[cpu]`.
+    /// Link-time KVA of the `kernel_cpustat` per-CPU symbol (the
+    /// value `st_value` carries in the vmlinux symbol table — the
+    /// template address the linker assigned). The runtime KVA on
+    /// CPU `cpu` is
+    /// [`super::symbols::per_cpu_kva`]`(kernel_cpustat_kva,
+    /// kaslr_offset, per_cpu_offsets[cpu])`.
     pub kernel_cpustat_kva: u64,
-    /// Section-relative `.data..percpu` offset of the `kstat`
-    /// per-CPU symbol.
+    /// Link-time KVA of the `kstat` per-CPU symbol. See
+    /// `kernel_cpustat_kva` for the runtime KVA formula.
     pub kstat_kva: u64,
-    /// Section-relative `.data..percpu` offset of the `tick_cpu_sched`
-    /// per-CPU symbol. `None` when the kernel was built without
+    /// Link-time KVA of the `tick_cpu_sched` per-CPU symbol.
+    /// `None` when the kernel was built without
     /// `CONFIG_NO_HZ_COMMON`; iowait_sleeptime capture is skipped.
     pub tick_cpu_sched_kva: Option<u64>,
     /// Per-CPU offset array (`__per_cpu_offset[cpu]`) — same array
@@ -155,6 +158,20 @@ pub struct CpuTimeCapture<'a> {
     /// each CPU's per-CPU KVA to a guest physical address for the
     /// memory read.
     pub page_offset: u64,
+    /// Virtual KASLR offset that per-CPU KVA derivation needs to
+    /// bridge the link-time (`__per_cpu_start_LINK`) and runtime
+    /// (`__per_cpu_start_RUNTIME`) bases. Source-of-truth is
+    /// `crate::vmm::x86_64::msr_kaslr::read_and_derive` (BSP
+    /// MSR_LSTAR minus link-time `entry_SYSCALL_64`). Production
+    /// callers in `crate::vmm::freeze_coord` currently pass `0`
+    /// pending the cross-thread BSP-vcpu plumbing for that
+    /// derive — see the TODO at the construction site and the
+    /// #31 real-fix follow-up. Under `CONFIG_RANDOMIZE_BASE=y`
+    /// (the default ktstr.kconfig setting) per-CPU lookups
+    /// bounds-reject to zero today, the silent-data-corruption
+    /// mode #31 will fix when the value flows in. aarch64 keeps
+    /// `0` until #108 lands the `kimage_voffset` derivation.
+    pub kaslr_offset: u64,
 }
 
 /// Borrow-only capture context for per-task enrichment.
@@ -3442,7 +3459,11 @@ fn collect_per_cpu_time(cap: &CpuTimeCapture<'_>) -> Vec<PerCpuTimeStats> {
 
         // kernel_cpustat::cpustat[N]: each slot is a u64 in nsec.
         // Read CPUTIME_USER through CPUTIME_STEAL (indices 0..=7).
-        let cpustat_kva = cap.kernel_cpustat_kva.wrapping_add(per_cpu_off);
+        let cpustat_kva = super::symbols::per_cpu_kva(
+            cap.kernel_cpustat_kva,
+            cap.kaslr_offset,
+            per_cpu_off,
+        );
         let cpustat_pa = super::symbols::kva_to_pa(cpustat_kva, cap.page_offset);
         let cpustat_base = cap.offsets.kernel_cpustat_cpustat;
         let read_cpustat = |idx: usize| -> u64 {
@@ -3460,7 +3481,11 @@ fn collect_per_cpu_time(cap: &CpuTimeCapture<'_>) -> Vec<PerCpuTimeStats> {
 
         // kernel_stat::softirqs[N]: each slot is a u32 (count).
         // Widen to u64 for reporting consistency with cpustat.
-        let kstat_kva = cap.kstat_kva.wrapping_add(per_cpu_off);
+        let kstat_kva = super::symbols::per_cpu_kva(
+            cap.kstat_kva,
+            cap.kaslr_offset,
+            per_cpu_off,
+        );
         let kstat_pa = super::symbols::kva_to_pa(kstat_kva, cap.page_offset);
         let mut softirqs = [0u64; NR_SOFTIRQS];
         for (i, slot) in softirqs.iter_mut().enumerate() {
@@ -3482,7 +3507,11 @@ fn collect_per_cpu_time(cap: &CpuTimeCapture<'_>) -> Vec<PerCpuTimeStats> {
             .tick_cpu_sched_kva
             .zip(cap.offsets.tick_sched_iowait_sleeptime)
             .map(|(tick_sym_kva, off)| {
-                let kva = tick_sym_kva.wrapping_add(per_cpu_off);
+                let kva = super::symbols::per_cpu_kva(
+                    tick_sym_kva,
+                    cap.kaslr_offset,
+                    per_cpu_off,
+                );
                 let pa = super::symbols::kva_to_pa(kva, cap.page_offset);
                 cap.mem.read_u64(pa, off)
             });
