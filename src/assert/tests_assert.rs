@@ -1631,6 +1631,40 @@ fn assert_result_outcome_folds_outcomes_vec() {
     assert!(d.message.contains("boom"));
 }
 
+/// Mixed `Pass + Skip` stream: `outcome()` must return
+/// `Outcome::Pass`, NOT Skip. Pins the inner-else branch in the
+/// outcome() folder — a real Pass marker alongside any Skip beats
+/// the Skip per the "Pass demotes Skip" semantic that
+/// `merge_skip_plus_explicit_pass_demotes_skip` already pins on
+/// `is_pass()`. A regression that returned `Outcome::Skip` here
+/// would silently downgrade a passing scenario's terminal verdict.
+#[test]
+fn assert_result_outcome_pass_plus_skip_is_pass_not_skip() {
+    let mut r = AssertResult::pass();
+    r.record_pass();
+    r.record_skip("optional probe");
+    assert!(matches!(r.outcome(), Outcome::Pass));
+    assert!(r.is_pass());
+    assert!(!r.is_skip());
+}
+
+/// Multi-Skip stream: `outcome()` returns the FIRST Skip's payload
+/// (mirrors `Outcome::merge`'s left-wins payload-tie semantic). Pins
+/// the .next() iterator in the all-Skip branch — a regression to
+/// .last() would silently change which reason surfaces in the
+/// terminal verdict.
+#[test]
+fn assert_result_outcome_multi_skip_returns_first_payload() {
+    let mut r = AssertResult::pass();
+    r.record_skip("first");
+    r.record_skip("second");
+    r.record_skip("third");
+    let Outcome::Skip(d) = r.outcome() else {
+        panic!("expected Skip, got {:?}", r.outcome());
+    };
+    assert!(d.message.contains("first"), "first-Skip-wins; got: {}", d.message);
+}
+
 /// Phase 2b mutator semantics: repeated `record_fail` calls append
 /// distinct Fail outcomes onto the vec; `outcome()` folds them and
 /// the result is Fail with the LEFT operand's payload winning per

@@ -551,6 +551,32 @@ fn merge_fail_and_pass() {
     assert!(merged.is_fail(), "merging fail+pass must produce fail");
 }
 
+/// `merge` must preserve TWO independent invariants in lock-step:
+/// (1) outcomes vec extends (both sides' outcomes concatenate);
+/// (2) ScenarioStats fields SUM. A
+/// regression that conflated the two (e.g. clamped totals to
+/// outcomes.len()) would trip here. Pins the dual invariant
+/// cleanly: one Fail + one Skip on distinct sides, distinct
+/// stats, observe both extension AND sum.
+#[test]
+fn merge_outcomes_extend_and_stats_sum_coexist() {
+    let mut a = AssertResult::pass();
+    a.record_fail(AssertDetail::new(DetailKind::Other, "fail_a"));
+    a.stats.total_iterations = 100;
+    a.stats.total_workers = 2;
+    let mut b = AssertResult::pass();
+    b.record_skip("skip_b");
+    b.stats.total_iterations = 50;
+    b.stats.total_workers = 3;
+    a.merge(b);
+    assert_eq!(a.outcomes.len(), 2, "Fail + Skip both extend");
+    assert!(a.is_fail(), "Fail dominates the verdict");
+    assert_eq!(a.stats.total_iterations, 150, "stats SUM (not max)");
+    assert_eq!(a.stats.total_workers, 5);
+    assert_eq!(a.failure_details().count(), 1);
+    assert_eq!(a.skip_reasons().count(), 1);
+}
+
 #[test]
 fn assert_result_merge_combines_stats() {
     let mut a = AssertResult {
