@@ -489,9 +489,102 @@ impl KtstrKvm {
     }
 }
 
+/// Call `KVM_GET_CLOCK` via a raw VM fd (libc::ioctl direct).
+/// Companion to the safe-wrapper boot-time probe above — used by
+/// the freeze coordinator (see [`crate::vmm::freeze_coord`]) for
+/// the freeze rendezvous save/restore where the coordinator's
+/// `freeze_and_capture` + `thaw_and_barrier` sibling closures
+/// can't borrow `&vm.vm_fd` (vm is consumed by a downstream closure
+/// in the same scope) and therefore use the raw fd (Copy) cached
+/// at coord-thread spawn time.
+///
+/// Mirrors `kvm_ioctls::VmFd::get_clock` — same ioctl number
+/// (`KVM_GET_CLOCK = KVMIO | 0x7c`), same `kvm_clock_data` payload,
+/// same error mapping. The underlying ioctl path
+/// (`arch/x86/kvm/x86.c kvm_vm_ioctl_get_clock` → `get_kvmclock`)
+/// is a pure seqcount read on the host side with no lock
+/// acquisition. The save/restore pairing keeps the guest's
+/// post-resume kvm_clock view at the parked-state value rather
+/// than the freeze-advanced host monotonic; the planned per-vCPU
+/// `KVM_KVMCLOCK_CTRL` emit at freeze entry is complementary —
+/// it sets `PVCLOCK_GUEST_STOPPED` so the guest's soft-lockup
+/// watchdog (`pvclock_touch_watchdogs` in
+/// `arch/x86/kernel/pvclock.c`) skips the freeze interval and
+/// does not fire on long freezes.
+pub(crate) fn kvm_get_clock_via_raw_fd(vm_fd: i32) -> std::io::Result<kvm_bindings::kvm_clock_data> {
+    // KVMIO | 0x7c, ioctl_ior_nr! per kvm-ioctls 0.24.0
+    // kvm_ioctls.rs:109. `kvm_clock_data` size is 8 (clock) +
+    // 4 (flags) + 4 (pad0) + 8 (realtime) + 8 (host_tsc) + 4*4
+    // (pad) = 48 bytes; `_IOC_SIZE` (0x30 = 48) is encoded into
+    // the ioctl number. If kvm-bindings ever bumps the struct
+    // past 48 bytes, the encoded size in our ioctl constant
+    // diverges from the kernel's expectation and the syscall
+    // returns EINVAL silently — guard the size at compile time.
+    const _: () = assert!(std::mem::size_of::<kvm_bindings::kvm_clock_data>() == 48);
+    const KVM_GET_CLOCK_IOCTL: libc::c_ulong = 0x8030_ae7c;
+    let mut clock = kvm_bindings::kvm_clock_data::default();
+    // SAFETY: `vm_fd` is a valid kvm_vmfd (caller is the freeze
+    // coordinator, which got the fd from vm.vm_fd.as_raw_fd() at
+    // closure-definition time and the fd is alive for the
+    // duration of `run_vm`). `kvm_clock_data` is `#[repr(C)]`
+    // POD; the kernel writes <= sizeof::<kvm_clock_data>() bytes.
+    let rc = unsafe {
+        libc::ioctl(
+            vm_fd,
+            KVM_GET_CLOCK_IOCTL,
+            &mut clock as *mut kvm_bindings::kvm_clock_data,
+        )
+    };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(clock)
+    }
+}
+
+/// Call `KVM_SET_CLOCK` via a raw VM fd (libc::ioctl direct).
+/// Sibling of [`kvm_get_clock_via_raw_fd`] for the restore-side of
+/// the freeze rendezvous kvm_clock save/restore. Mirrors
+/// `kvm_ioctls::VmFd::set_clock`. The underlying ioctl path
+/// (`arch/x86/kvm/x86.c kvm_vm_ioctl_set_clock`) takes the
+/// `pvclock_sc` seqcount write side, recomputes
+/// `master_kernel_ns`, sets `ka->kvmclock_offset = data.clock -
+/// now_raw_ns`, then queues `KVM_REQ_CLOCK_UPDATE` on every vCPU
+/// (processed at the next KVM_RUN entry per-vCPU).
+///
+/// Caller MUST clear `flags` to 0 before calling (per the
+/// boot-time precedent above) — leaving `KVM_CLOCK_REALTIME` in
+/// flags causes the kernel to apply a realtime adjustment that
+/// double-counts elapsed time.
+pub(crate) fn kvm_set_clock_via_raw_fd(
+    vm_fd: i32,
+    clock: &kvm_bindings::kvm_clock_data,
+) -> std::io::Result<()> {
+    // KVMIO | 0x7b, ioctl_iow_nr! per kvm-ioctls 0.24.0
+    // kvm_ioctls.rs:106.
+    const KVM_SET_CLOCK_IOCTL: libc::c_ulong = 0x4030_ae7b;
+    // SAFETY: `vm_fd` is a valid kvm_vmfd (see SAFETY note on
+    // [`kvm_get_clock_via_raw_fd`]). The kernel reads exactly
+    // sizeof::<kvm_clock_data>() bytes from the pointer; the
+    // payload is `#[repr(C)]` POD.
+    let rc = unsafe {
+        libc::ioctl(
+            vm_fd,
+            KVM_SET_CLOCK_IOCTL,
+            clock as *const kvm_bindings::kvm_clock_data,
+        )
+    };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd;
     use vm_memory::GuestMemory;
 
     #[test]
@@ -800,6 +893,88 @@ mod tests {
         // pvclock_update_vm_gtod_copy. In nested virt it may not be.
         // Either way, the roundtrip must not fail.
         let _ = clock2.flags & KVM_CLOCK_TSC_STABLE;
+    }
+
+    #[test]
+    fn kvm_clock_data_default_is_zeroed() {
+        let clock = kvm_bindings::kvm_clock_data::default();
+        assert_eq!(clock.clock, 0);
+        assert_eq!(clock.flags, 0);
+        assert_eq!(clock.pad0, 0);
+        assert_eq!(clock.realtime, 0);
+        assert_eq!(clock.host_tsc, 0);
+        assert_eq!(clock.pad, [0u32; 4]);
+    }
+
+    #[test]
+    fn kvm_clock_data_size_matches_ioctl_encoding() {
+        // The hand-encoded `_IOC_SIZE = 0x30 = 48` in the
+        // KVM_GET_CLOCK / KVM_SET_CLOCK ioctl-number constants in
+        // this file presumes this exact size. A compile-time
+        // `const _: () = assert!(...)` next to the first constant
+        // guards builds; this runtime check is a belt-and-
+        // suspenders guard against a future split of kvm-bindings
+        // that drops the compile-time assert.
+        assert_eq!(std::mem::size_of::<kvm_bindings::kvm_clock_data>(), 48);
+    }
+
+    #[test]
+    fn raw_fd_get_clock_matches_safe_wrapper() {
+        // Cross-check: the hand-encoded ioctl number 0x8030_ae7c
+        // hits the same kernel path as kvm_ioctls::VmFd::get_clock.
+        // If the number were wrong, libc::ioctl would return ENOTTY
+        // (-22), which surfaces as Err and the assertion below would
+        // observe it. If the number aimed at a different ioctl, the
+        // returned clock value would not advance monotonically and
+        // the safe-vs-raw comparison would diverge dramatically.
+        let topo = Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        let raw_fd = vm.vm_fd.as_raw_fd();
+        let via_safe = vm.vm_fd.get_clock().expect("safe GET_CLOCK");
+        let via_raw = super::kvm_get_clock_via_raw_fd(raw_fd).expect("raw GET_CLOCK");
+        // Both reads hit the same in-kernel pvclock via separate
+        // seqcount reads; the later one must be >= the earlier
+        // (kvm_clock is monotonic non-decreasing).
+        assert!(
+            via_raw.clock >= via_safe.clock,
+            "raw-fd GET regressed below safe GET (raw={}, safe={}) — ioctl number drift",
+            via_raw.clock,
+            via_safe.clock,
+        );
+        // < 1 second drift means we are reading the same ioctl,
+        // not some unrelated kernel time source.
+        assert!(
+            via_raw.clock - via_safe.clock < 1_000_000_000,
+            "raw-fd vs safe GET differ by >1s (raw={}, safe={}) — likely different kernel state",
+            via_raw.clock,
+            via_safe.clock,
+        );
+    }
+
+    #[test]
+    fn raw_fd_set_clock_roundtrip_with_flags_zero() {
+        let topo = Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        let raw_fd = vm.vm_fd.as_raw_fd();
+        let mut clock = super::kvm_get_clock_via_raw_fd(raw_fd).expect("raw GET_CLOCK");
+        clock.flags = 0;
+        super::kvm_set_clock_via_raw_fd(raw_fd, &clock).expect("raw SET_CLOCK");
+        let after = super::kvm_get_clock_via_raw_fd(raw_fd).expect("raw GET_CLOCK after");
+        assert!(after.clock >= clock.clock);
     }
 
     #[test]

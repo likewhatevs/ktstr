@@ -110,6 +110,35 @@ pub static FREEZE_COORD_TEST_FORCE_TRANSLATE_NONE: AtomicBool = AtomicBool::new(
 #[doc(hidden)]
 pub static FREEZE_COORD_TEST_FORCE_BSS_TRIGGERED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(target_arch = "x86_64")]
+fn warn_kvm_clock_failure(ioctl_phase: &'static str, e: &std::io::Error) {
+    // KVM_GET_CLOCK / KVM_SET_CLOCK do not gate on SEV-ES / SEV-SNP /
+    // TDX in arch/x86/kvm/x86.c (kvm_vm_ioctl_get_clock /
+    // kvm_vm_ioctl_set_clock take no confidential-compute side
+    // path). Realistic failures are EFAULT (bad userspace pointer)
+    // and EINVAL (invalid flags on SET); EBADF would indicate the
+    // VM fd was closed underneath us (real bug). On any of these,
+    // log + fall through — the dump completes without the
+    // save/restore and the guest sees freeze duration as elapsed
+    // kvm_clock until the next pvclock update. If this fires
+    // repeatedly in practice, it is a real bug worth filing.
+    let when = if ioctl_phase == "GET_CLOCK" {
+        "entry"
+    } else {
+        "exit"
+    };
+    tracing::warn!(
+        error = %e,
+        ioctl = ioctl_phase,
+        when = when,
+        "freeze-coord: KVM_{ioctl_phase} failed at freeze {when}; guest \
+         will see freeze duration as elapsed kvm_clock until the next \
+         pvclock update. Likely causes: EFAULT (bad pointer), EINVAL \
+         (invalid flags on SET), or EBADF (fd closed). File an issue \
+         with the error + kernel version if this fires repeatedly."
+    );
+}
+
 /// Three-way result of polling the BPF probe's `.bss` latch via the
 /// cached guest-physical-address path used by [`bss_read_state`].
 ///
@@ -1865,6 +1894,18 @@ impl KtstrVm {
         // (`Copy`) by value rather than borrowing `self`, which the
         // `'static` thread::spawn bound forbids.
         let rendezvous_timeout = self.rendezvous_timeout.unwrap_or(FREEZE_RENDEZVOUS_TIMEOUT);
+        // Cache vm.vm_fd's raw fd (Copy = i32) before the
+        // freeze-coord spawn. The spawned closure is `move ||` —
+        // capturing vm directly would consume it and break L8888
+        // construction of VmRunState. The raw fd is owned by
+        // `vm.vm_fd` (in the outer scope) and stays valid for the
+        // entire `run_vm` lifetime; coord-thread joins via
+        // `freeze_coord_handle.join()` at L8825 before vm drops.
+        // Used by the kvm_clock save/restore path inside
+        // freeze_and_capture + thaw_and_barrier closures via
+        // [`kvm_get_clock_via_raw_fd`] +
+        // [`kvm_set_clock_via_raw_fd`].
+        let vm_fd_raw_for_coord: i32 = vm.vm_fd.as_raw_fd();
         let freeze_coord_handle = std::thread::Builder::new()
             .name("vmm-freeze-coord".into())
             .spawn(move || {
@@ -3902,11 +3943,120 @@ impl KtstrVm {
                     // (half-way age threshold; tp_btf handler latch
                     // on error-class kinds), so an extra exit_kind
                     // read would be redundant overhead.
+                    // kvm_clock save/restore around the freeze
+                    // rendezvous. Captured AFTER all vCPUs ack
+                    // park (inside the polling loop, gated on
+                    // `parked_count >= expected_parks`) + restored
+                    // BEFORE the thaw gate flip so the guest's
+                    // first post-resume kvm_clock read returns the
+                    // parked-state value rather than the current
+                    // (advanced-by-freeze-duration) host monotonic.
+                    // Without this, every snapshot dump (~100ms)
+                    // leaves the guest seeing the freeze window
+                    // as elapsed time, which accumulates phantom
+                    // run_delay in schedstat for the currently-
+                    // running task and can trip ktstr's own
+                    // monitor assertions on run_delay thresholds.
+                    //
+                    // Post-park-ack capture avoids a backward-jump
+                    // race on stable-TSC guests: those bypass the
+                    // `__pvclock_clocksource_read` cmpxchg ratchet
+                    // (arch/x86/kernel/pvclock.c), so if any vCPU
+                    // reads pvclock between a pre-freeze GET and
+                    // park-ack, the post-thaw restored read would
+                    // appear lower than the last pre-park read.
+                    //
+                    // Kernel ground truth: KVM_GET_CLOCK is a pure
+                    // seqcount read (arch/x86/kvm/x86.c
+                    // get_kvmclock — no lock, no SEV-ES gating);
+                    // KVM_SET_CLOCK queues a per-vCPU
+                    // KVM_REQ_CLOCK_UPDATE that the vCPU processes
+                    // on its next entry into guest mode (the
+                    // ioctl syscall itself provides the
+                    // memory-ordering barrier — no explicit fence
+                    // needed between the kvm_set_clock call and
+                    // the subsequent freeze.store(false, Release)
+                    // because the syscall return happens-before
+                    // any subsequent atomic write). SET MUST
+                    // therefore complete before the thaw signal
+                    // flips freeze=false (otherwise a vCPU that
+                    // wakes and re-enters KVM_RUN before the
+                    // request is queued reads the OLD pvclock
+                    // page on its first guest instruction).
+                    // `flags = 0` on SET is mandatory — leaving
+                    // `KVM_CLOCK_REALTIME` in flags causes
+                    // set_clock to apply a realtime adjustment
+                    // that double-counts elapsed time (matches the
+                    // existing boot-time precedent in this crate).
+                    //
+                    // Differs from firecracker
+                    // (`arch/x86_64/vm.rs` set_clock) which only
+                    // strips `KVM_CLOCK_TSC_STABLE` and leaves the
+                    // `KVM_CLOCK_REALTIME` bit set — fc accepts
+                    // the realtime re-base because its
+                    // snapshot/restore lifecycle crosses host
+                    // boundaries where the realtime base may
+                    // legitimately have shifted; ktstr's
+                    // same-host freeze mask wants ZERO
+                    // adjustment so the guest sees the freeze
+                    // duration as instant. See the project
+                    // CLAUDE.md "reference impl divergences"
+                    // rule for the documentation convention this
+                    // follows.
+                    //
+                    // Skip-freeze fast path (BSP exited before
+                    // gate flip): no clock save needed — no vCPU
+                    // will read kvm_clock again before VM
+                    // teardown. None sentinel signals to
+                    // thaw_and_barrier that there's nothing to
+                    // restore.
+                    //
+                    // RefCell because freeze_and_capture (writer)
+                    // and thaw_and_barrier (reader+consumer) are
+                    // sibling closures sharing the state. Both
+                    // run on the coordinator thread; never
+                    // concurrent. The borrow_mut() pattern
+                    // matches the snapshot-bridge state
+                    // management at L831-842.
+                    let kvm_clock_save_for_freeze: std::cell::RefCell<
+                        Option<kvm_bindings::kvm_clock_data>,
+                    > = std::cell::RefCell::new(None);
+                    // Use the raw fd (Copy) rather than a borrow of
+                    // vm.vm_fd — `vm` is moved into a downstream
+                    // closure later in this scope, so a borrow of
+                    // vm.vm_fd here would extend the borrow past
+                    // that move via the freeze_and_capture +
+                    // thaw_and_barrier closures and the compiler
+                    // rejects. The raw fd is closed when vm.vm_fd
+                    // drops at run_vm scope exit; freeze_and_capture
+                    // + thaw_and_barrier always run before that
+                    // drop so the fd is live for every ioctl call.
+                    let vm_fd_raw_for_freeze: i32 = vm_fd_raw_for_coord;
                     let freeze_and_capture =
                         |gate_on_exit_kind: bool|
                             -> LateCaptureOutcome {
                             let skip_freeze =
                                 freeze_coord_bsp_done.load(Ordering::Acquire);
+                            // The kvm_clock GET capture is
+                            // deferred until after all vCPUs are
+                            // confirmed parked (see the
+                            // `all_parked = true; break;` site in
+                            // the polling loop below). Capturing
+                            // before the SIGRTMIN kick + park-ack
+                            // rendezvous would race with vCPU
+                            // pvclock reads in the window between
+                            // GET and the last park-ack; stable-
+                            // TSC guests bypass the
+                            // `__pvclock_clocksource_read` cmpxchg
+                            // ratchet (arch/x86/kernel/pvclock.c)
+                            // and would observe a backward jump
+                            // on resume (last pre-park read at
+                            // pvclock(t_kick + ε) → post-thaw
+                            // restored read at pvclock(t_get) <
+                            // t_kick). Post-park-ack capture
+                            // closes the window: no vCPU reads
+                            // pvclock between the captured
+                            // moment and the restore + thaw.
                             if skip_freeze {
                                 tracing::info!(
                                     gate_on_exit_kind,
@@ -4531,6 +4681,37 @@ impl KtstrVm {
                                 // when they did.
                                 if parked_count >= expected_parks {
                                     all_parked = true;
+                                    // All vCPUs parked → no vCPU
+                                    // is reading pvclock. Capture
+                                    // kvm_clock NOW so the
+                                    // restored value in
+                                    // thaw_and_barrier reflects
+                                    // the parked-state moment;
+                                    // post-thaw guest reads
+                                    // resume from this exact
+                                    // value with no backward
+                                    // jump (see the "deferred"
+                                    // comment at freeze_and_capture
+                                    // entry for the timing
+                                    // rationale).
+                                    // Skip the GET on the skip-freeze
+                                    // fast path: no freeze gate was
+                                    // flipped, no SIGRTMIN kick was
+                                    // issued, no vCPUs are actually
+                                    // parked at a save-relevant
+                                    // boundary — and thaw_and_barrier
+                                    // will not SET because the
+                                    // RefCell stays None.
+                                    if !skip_freeze {
+                                        let captured = kvm::kvm_get_clock_via_raw_fd(
+                                            vm_fd_raw_for_freeze,
+                                        );
+                                        if let Err(ref e) = captured {
+                                            warn_kvm_clock_failure("GET_CLOCK", e);
+                                        }
+                                        *kvm_clock_save_for_freeze.borrow_mut() =
+                                            captured.ok();
+                                    }
                                     break;
                                 }
                                 // Kill check follows parked-count by
@@ -5519,6 +5700,36 @@ impl KtstrVm {
                         if let Some(ref blk) = freeze_coord_virtio_blk {
                             blk.lock().resume();
                         }
+                        // Restore the pre-freeze kvm_clock BEFORE
+                        // flipping freeze=false. Kernel ground
+                        // truth: KVM_SET_CLOCK queues per-vCPU
+                        // KVM_REQ_CLOCK_UPDATE; if the thaw
+                        // signal fires first, a parked vCPU may
+                        // re-enter guest mode before the request
+                        // is queued and read the OLD pvclock page
+                        // on its first guest instruction. The
+                        // take() + flags=0 pattern matches the
+                        // cloud-hypervisor precedent
+                        // (`src/vmm/src/vm.rs` reset_flags) —
+                        // leaving KVM_CLOCK_REALTIME in flags
+                        // causes a realtime adjustment that
+                        // double-counts elapsed time per the
+                        // existing boot-time pattern in this
+                        // crate. SET_CLOCK failure is observable
+                        // as a single warn log; guest sees
+                        // freeze duration as elapsed kvm_clock
+                        // if the restore fails.
+                        if let Some(mut clock) =
+                            kvm_clock_save_for_freeze.borrow_mut().take()
+                        {
+                            clock.flags = 0;
+                            if let Err(e) = kvm::kvm_set_clock_via_raw_fd(
+                                vm_fd_raw_for_freeze,
+                                &clock,
+                            ) {
+                                warn_kvm_clock_failure("SET_CLOCK", &e);
+                            }
+                        }
                         freeze_coord_freeze.store(false, Ordering::Release);
                         let _ = freeze_coord_thaw_evt.write(1);
                         if freeze_coord_bsp_done.load(Ordering::Acquire) {
@@ -6411,7 +6622,7 @@ impl KtstrVm {
                             "cold-path Op handler not yet implemented: \
                              wire-up is in place but the freeze-rendezvous + \
                              host-side gmem.write_obj/read_obj dispatch is a \
-                             follow-up task (#48 B7-handler-internals). \
+                             planned follow-up. \
                              Request was: tag={} mode={:?} direction={:?} entries={}",
                             req.tag,
                             req.mode,
@@ -6453,8 +6664,8 @@ impl KtstrVm {
                                     mode = ?req.mode,
                                     direction = ?req.direction,
                                     entries = req.entries.len(),
-                                    "freeze-coord: KernelOpRequest stub-replied (#19 handler \
-                                     internals pending)"
+                                    "freeze-coord: KernelOpRequest stub-replied \
+                                     (handler internals pending)"
                                 );
                             }
                             Err(e) => {
@@ -11446,5 +11657,54 @@ mod write_to_tagged_path_tests {
         // a panic from the payload-head eprintln! rather than a
         // clean Err return.
         assert!(result.is_err(), "expected Err on write failure path");
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[cfg(test)]
+mod kvm_clock_save_semantics_tests {
+    //! Codifies the take()-once + flags=0-on-restore invariant for
+    //! the kvm_clock save/restore bridge between freeze_and_capture
+    //! (writer) and thaw_and_barrier (reader). The contract: a
+    //! freeze captures a kvm_clock_data into the shared RefCell at
+    //! freeze entry; the matching thaw take()s the value, zeros
+    //! flags, and SET_CLOCKs once. A second take() yields None
+    //! (the skip-freeze sentinel — no save → no restore).
+    //!
+    //! A regression that lost the flags=0 reassignment would still
+    //! type-check at the call site (kvm_clock_data is Copy); this
+    //! test catches it.
+    use kvm_bindings::kvm_clock_data;
+
+    #[test]
+    fn take_yields_value_once_then_none() {
+        let save: std::cell::RefCell<Option<kvm_clock_data>> =
+            std::cell::RefCell::new(None);
+        let mut captured = kvm_clock_data::default();
+        captured.clock = 12345;
+        captured.flags = kvm_bindings::KVM_CLOCK_REALTIME;
+        *save.borrow_mut() = Some(captured);
+
+        let taken = save.borrow_mut().take();
+        assert!(taken.is_some(), "first take must yield captured value");
+        let mut clock = taken.unwrap();
+        clock.flags = 0;
+        assert_eq!(clock.flags, 0, "flags MUST be zeroed before SET_CLOCK");
+        assert_eq!(clock.clock, 12345);
+
+        assert!(
+            save.borrow_mut().take().is_none(),
+            "second take must yield None — freeze cycle is one-shot per pair"
+        );
+    }
+
+    #[test]
+    fn skip_freeze_path_yields_none_without_write() {
+        let save: std::cell::RefCell<Option<kvm_clock_data>> =
+            std::cell::RefCell::new(None);
+        assert!(
+            save.borrow_mut().take().is_none(),
+            "skip-freeze path means no capture → take() must yield None"
+        );
     }
 }
