@@ -1522,6 +1522,111 @@ impl ScenarioStats {
     }
 }
 
+/// Build per-phase metric buckets from a sample series.
+///
+/// Walks [`crate::scenario::sample::SampleSeries::by_phase`] to
+/// group every stamped sample under its bridge-stamped
+/// `step_index` (NOT re-derived from elapsed-ms windows; the
+/// bridge stamp is authoritative because the capture path knows
+/// the phase it fired from while the time window cannot recover
+/// the phase when stimulus events arrive late or out of order).
+///
+/// For each phase observed (BASELINE under `step_index = 0`,
+/// scenario Steps under `step_index = 1..=N` per the 1-indexed
+/// phase convention) emits one [`PhaseBucket`] with:
+///
+/// * `step_index` -> the bucket's key
+/// * `label` -> `"BASELINE"` for `step_index = 0`,
+///   `"Step[k-1]"` for `step_index = k`
+/// * `start_ms` / `end_ms` -> the first / last sample's
+///   `elapsed_ms`; an open-ended trailing window (no closing
+///   stimulus event) keeps `end_ms = u64::MAX` as a sentinel
+///   distinguishable from any plausible real timestamp
+/// * `sample_count` -> the count of samples that fell into the
+///   bucket
+/// * `metrics` -> per-metric reduction via
+///   [`crate::stats::aggregate_samples_for_phase`] reading each
+///   sample through [`crate::stats::MetricDef::read_sample`].
+///   Metrics whose per-sample reading returns `None` for every
+///   sample in the bucket are omitted entirely (absent ->
+///   "no data") rather than collapsed to `Some(0.0)` (real
+///   zero), preserving the sentinel-free contract on the
+///   resulting [`PhaseBucket::metrics`] map.
+///
+/// Returns an empty `Vec` when the input series is empty (no
+/// samples captured), distinct from a returning a single empty
+/// BASELINE bucket — the former means the periodic-capture path
+/// never fired, the latter means it fired but no metric reading
+/// came back. The phase aggregator wire-in keeps the two cases
+/// observably distinct so the downstream renderer can paint
+/// "test produced no per-phase data" differently from "test
+/// produced phase data but no readable metrics".
+///
+/// `dead_code` allow: pinned via in-file unit tests. The live
+/// production caller lands when the host-side stats-population
+/// path in `evaluate_vm_result` is rewired to consume the
+/// drained snapshot bridge into a `SampleSeries` and stamp the
+/// resulting buckets onto `AssertResult.stats.phases`.
+#[allow(dead_code)]
+pub fn build_phase_buckets(
+    samples: &crate::scenario::sample::SampleSeries,
+) -> Vec<PhaseBucket> {
+    let by_phase = samples.by_phase();
+    let mut out: Vec<PhaseBucket> = Vec::with_capacity(by_phase.len());
+    for (step_index, samples_in_phase) in by_phase {
+        let label = if step_index == 0 {
+            "BASELINE".to_string()
+        } else {
+            // Scenario-Step ordinal lives at `step_index - 1`
+            // because phase 0 is BASELINE under the 1-indexed
+            // encoding; saturate at 0 if the underflow guard
+            // ever fires (unreachable for the current encoding
+            // — step_index here came from the bucket key so the
+            // `> 0` branch is satisfied — but keep the guard so
+            // a future caller that hands in a synthetic
+            // `step_index = 0` does not panic).
+            format!("Step[{}]", step_index.saturating_sub(1))
+        };
+        let sample_count = samples_in_phase.len();
+        let (start_ms, end_ms) = match samples_in_phase.as_slice() {
+            [] => (0, u64::MAX),
+            [only] => (only.elapsed_ms, only.elapsed_ms),
+            [first, .., last] => (first.elapsed_ms, last.elapsed_ms),
+        };
+        let mut metrics: std::collections::BTreeMap<String, f64> =
+            std::collections::BTreeMap::new();
+        for metric_def in crate::stats::METRICS {
+            let per_sample_readings: Vec<f64> = samples_in_phase
+                .iter()
+                .filter_map(|s| metric_def.read_sample(s))
+                .collect();
+            if per_sample_readings.is_empty() {
+                // No per-sample reading for any sample in this
+                // bucket -- the metric is host-side-only
+                // (cross-cgroup fold) or its dispatch arm has
+                // not landed yet. Omit the key rather than
+                // collapsing to `Some(0.0)` so the renderer
+                // paints "absent" vs "real zero" distinctly.
+                continue;
+            }
+            if let Some(reduced) =
+                crate::stats::aggregate_samples_for_phase(metric_def, &per_sample_readings)
+            {
+                metrics.insert(metric_def.name.to_string(), reduced);
+            }
+        }
+        out.push(PhaseBucket {
+            step_index,
+            label,
+            start_ms,
+            end_ms,
+            sample_count,
+            metrics,
+        });
+    }
+    out
+}
+
 impl AssertResult {
     /// Empty passing result with no outcomes and default stats. Use
     /// when a scenario completed successfully with nothing interesting

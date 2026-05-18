@@ -278,6 +278,53 @@ impl MetricDef {
         (self.accessor)(row).or_else(|| row.ext_metrics.get(self.name).copied())
     }
 
+    /// Read this metric's value from a single
+    /// [`crate::scenario::sample::Sample`] — the per-sample
+    /// analogue of [`Self::read`] used by the per-phase
+    /// aggregator to fold a window of samples into one
+    /// [`crate::assert::PhaseBucket`] value per metric.
+    ///
+    /// Returns `None` for metrics that cannot be derived from a
+    /// single-sample shape: most ktstr metrics are computed
+    /// host-side from cross-CPU or cross-cgroup folds
+    /// (`worst_spread`, `worst_gap_ms`, `worst_migration_ratio`,
+    /// `max_imbalance_ratio`, all `worst_*_wake_latency_*`,
+    /// `worst_iterations_per_worker`, `worst_page_locality`,
+    /// `worst_cross_node_migration_ratio`,
+    /// `worst_mean_run_delay_us`, `worst_run_delay_us`,
+    /// `worst_wake_latency_tail_ratio`) and have no single-sample
+    /// reading.
+    ///
+    /// Metrics that DO have a per-sample shape (`max_dsq_depth`
+    /// from `sample.snapshot`'s BPF .bss / per_cpu, `stuck_count`
+    /// from `sample.snapshot`'s stall counter, `total_fallback`
+    /// / `total_keep_last` / `total_migrations` /
+    /// `total_iterations` from `sample.stats`' scx_stats JSON
+    /// or `sample.snapshot`'s SCX events region) get their
+    /// dispatch arms added incrementally as the per-metric
+    /// adapters land. Until then this returns `None` for every
+    /// metric and [`crate::stats::aggregate_samples_for_phase`]
+    /// surfaces the all-None reduction as a `None` bucket entry
+    /// — distinct from `Some(0.0)` (a real zero), so the
+    /// bucket renderer can paint "no data" vs "real zero"
+    /// distinctly without losing information.
+    ///
+    /// `dead_code` allow: pinned via in-file unit tests; the
+    /// live production caller lands when the host-side
+    /// stats-population path is rewired to feed per-phase
+    /// `SampleSeries::by_phase` slices through
+    /// [`crate::assert::build_phase_buckets`].
+    #[allow(dead_code)]
+    pub fn read_sample(&self, _sample: &crate::scenario::sample::Sample<'_>) -> Option<f64> {
+        // Per-metric dispatch is staged: every registered metric
+        // currently returns None (no per-sample reading available).
+        // The phase aggregator surfaces all-None reductions as
+        // absent bucket entries, distinct from real zeros — see
+        // the function's doc comment for the metric inventory and
+        // their pending sources.
+        None
+    }
+
     /// Returns `true` for [`Polarity::LowerBetter`], `false` for
     /// [`Polarity::HigherBetter`]. [`Polarity::TargetValue`] and
     /// [`Polarity::Unknown`] branches keep the match total; they
