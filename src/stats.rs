@@ -1077,6 +1077,29 @@ pub struct GauntletRow {
     /// [`metric_def`] when a matching entry exists in [`METRICS`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ext_metrics: BTreeMap<String, f64>,
+    /// Per-phase metric buckets carried verbatim from the source
+    /// sidecar's [`crate::assert::ScenarioStats::phases`]. Each
+    /// [`crate::assert::PhaseBucket`] surfaces the metric values
+    /// reduced over one scenario phase (BASELINE at
+    /// `step_index = 0`, Step ordinals at `step_index = 1..=N`
+    /// per the 1-indexed phase convention) so the per-phase
+    /// comparison renderer at [`compare_partitions`] can pair
+    /// matched phases across two sidecars by `step_index` and
+    /// emit per-phase delta rows without re-deriving phase
+    /// boundaries.
+    ///
+    /// Empty when the source sidecar had no phase data — single-
+    /// phase scenarios that didn't drive an explicit Step vec,
+    /// or legacy sidecars from before the phase-aware pipeline
+    /// shipped. Per the pre-1.0 disposability contract, the
+    /// expected response to a legacy sidecar is to re-run the
+    /// test and regenerate, NOT to back-fill the field on read.
+    /// `serde(default, skip_serializing_if = "Vec::is_empty")`
+    /// keeps the serialized shape compact: a row with no phase
+    /// data omits the field entirely on the wire rather than
+    /// carrying an empty array.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phases: Vec<crate::assert::PhaseBucket>,
 }
 
 impl GauntletRow {
@@ -2129,6 +2152,18 @@ pub fn group_and_average_by(
                 .into_iter()
                 .map(|(k, (sum, count))| (k, sum / f64::from(count)))
                 .collect(),
+            // Phase buckets do not aggregate cleanly across an
+            // averaged group: two contributors might run different
+            // scenarios with different phase counts, and per-phase
+            // averaging across mismatched step_index sets would
+            // invent rows neither side carried. Surface the empty
+            // slice so downstream consumers fall back to the flat
+            // bucket. A future MergeKind::Phase aware merge will
+            // revisit this once compare_partitions' cross-cardinality
+            // (per-step_index intersection + unpaired surfacing)
+            // lands and gives us a tested intersection semantic to
+            // reuse here.
+            phases: Vec::new(),
         };
         out.push(AveragedGroup {
             row: aggregated,
@@ -2302,6 +2337,15 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
                 }
             })
             .collect(),
+        // Carry per-phase buckets verbatim from the source
+        // ScenarioStats. The bucket structure has already been
+        // reduced by the host-side phase aggregator (Counter via
+        // `phase_counter_delta`, Gauge/Peak/Timestamp via
+        // `aggregate_samples`), so the sidecar -> row step just
+        // forwards the prebuilt slice. An empty `phases` slot on
+        // the source sidecar (single-phase scenario or legacy
+        // file) flows through as an empty slice.
+        phases: sc.stats.phases.clone(),
     }
 }
 
@@ -4459,6 +4503,7 @@ mod tests {
             page_locality: 0.0,
             cross_node_migration_ratio: 0.0,
             ext_metrics: BTreeMap::new(),
+            phases: Vec::new(),
         }
     }
 
@@ -7318,6 +7363,7 @@ mod tests {
             page_locality: 0.0,
             cross_node_migration_ratio: 0.0,
             ext_metrics: BTreeMap::new(),
+            phases: Vec::new(),
         }
     }
 
