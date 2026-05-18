@@ -27,7 +27,31 @@ use super::wire;
 use crate::monitor;
 
 /// Result of a VM execution.
-#[derive(Debug)]
+///
+/// `Clone` is supported, but two field categories have different
+/// Clone semantics that callers must understand:
+///
+/// 1. **Pure-data fields** (the bulk of the struct): primitives,
+///    `String`, `Vec`, `Option<_>`, plus `MonitorReport` /
+///    `BulkDrainResult` / `ProgVerifierStats` / `StimulusEvent` /
+///    `KvmStatsTotals` / `VirtioBlkCountersSnapshot` /
+///    `VirtioNetCountersSnapshot`. Every clone produces an
+///    independent value — mutations to one do not affect the
+///    other. The `virtio_blk_counters` / `virtio_net_counters`
+///    fields are materialized `*CountersSnapshot` types (atomic
+///    loads done at construction time inside
+///    `super::KtstrVm::collect_results`), so clones cannot alias
+///    live device state.
+///
+/// 2. **Arc-shared handles** (`snapshot_bridge`, `stats_client`):
+///    these wrap `Arc<Mutex<…>>` / `Arc<AtomicUsize>` and clone via
+///    shallow refcount bump. Two `VmResult` clones SHARE the
+///    underlying store — calling `snapshot_bridge.drain()` on one
+///    clone empties the data visible to the other. See each
+///    field's own doc for the precise drain / iteration contract.
+///    If you need an independent snapshot view, drain into a local
+///    `Vec` before cloning the `VmResult`.
+#[derive(Debug, Clone)]
 pub struct VmResult {
     /// Overall success flag: `true` when the test reported a pass AND
     /// the VM exited cleanly without crash, timeout, or watchdog.
@@ -679,5 +703,50 @@ mod tests {
         assert!(r.timed_out);
         assert_eq!(r.exit_code, 1);
         assert_eq!(r.stderr, "kernel panic");
+    }
+
+    /// Compile-time pin that `VmResult: Clone`. A future field
+    /// added with a non-Clone type would break the derive at compile
+    /// time and break this test's `let _: Self = self_clone(r)` call.
+    /// Cheap insurance that nobody silently strips the Clone derive
+    /// or adds a non-Clone field.
+    #[test]
+    fn vm_result_is_clone() {
+        fn self_clone<T: Clone>(t: &T) -> T {
+            t.clone()
+        }
+        let r = VmResult::test_fixture();
+        let _: VmResult = self_clone(&r);
+    }
+
+    /// Pin the documented aliasing semantic on the Arc-shared
+    /// `snapshot_bridge` field: clones of `VmResult` share the
+    /// underlying snapshot store. A future refactor that turned
+    /// `SnapshotBridge` into a deep-copy struct would break this
+    /// test — at which point the doc paragraph at the head of
+    /// `VmResult` must be updated to drop the Arc-shared-handle
+    /// category. Loud failure on contract drift, not a silent
+    /// behavior change.
+    #[test]
+    fn vm_result_clone_snapshot_bridge_aliases_via_arc() {
+        let r = VmResult::test_fixture();
+        let c = r.clone();
+        // Pre-condition: both bridges start empty.
+        assert_eq!(r.snapshot_bridge.len(), 0);
+        assert_eq!(c.snapshot_bridge.len(), 0);
+        // Store a synthetic report through ONE clone's bridge.
+        r.snapshot_bridge
+            .store("regression_pin", crate::monitor::dump::FailureDumpReport::default());
+        // The OTHER clone observes the store — proves the Arc<Mutex<…>>
+        // is shared, not deep-copied. If this assertion ever fires,
+        // SnapshotBridge's Clone has changed shape and VmResult's
+        // doc paragraph must be revisited.
+        assert_eq!(
+            r.snapshot_bridge.len(),
+            c.snapshot_bridge.len(),
+            "snapshot_bridge clones must observe the same store \
+             per the VmResult Clone contract (Arc-shared handle)"
+        );
+        assert_eq!(c.snapshot_bridge.len(), 1);
     }
 }
