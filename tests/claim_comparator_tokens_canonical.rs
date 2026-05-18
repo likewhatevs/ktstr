@@ -122,7 +122,20 @@ fn set_len_eq_emits_set_len_eq() {
     let mut v = Verdict::new();
     let s: BTreeSet<u64> = [1u64, 2, 3].into_iter().collect();
     v.claim_set("x", &s).len_eq(3);
-    assert_eq!(single_pass(v).comparator, "set_len_eq");
+    let p = single_pass(v);
+    assert_eq!(p.comparator, "set_len_eq");
+    // Pin the binary-recording wire shape: a silent revert to
+    // record_pass_unary would leave expected=None and break the
+    // auto-repro renderer (#140) cardinality-token contract.
+    assert_eq!(
+        p.value, "3",
+        "set_len_eq must record the observed length"
+    );
+    assert_eq!(
+        p.expected.as_deref(),
+        Some("3"),
+        "set_len_eq must record the expected bound via record_pass_binary"
+    );
 }
 
 #[test]
@@ -188,7 +201,20 @@ fn sequence_len_eq_emits_sequence_len_eq() {
     let mut v = Verdict::new();
     let s = vec![1u64, 2, 3];
     v.claim_seq("x", &s).len_eq(3);
-    assert_eq!(single_pass(v).comparator, "sequence_len_eq");
+    let p = single_pass(v);
+    assert_eq!(p.comparator, "sequence_len_eq");
+    // Pin the binary-recording wire shape: a silent revert to
+    // record_pass_unary would leave expected=None and break the
+    // auto-repro renderer cardinality-token contract.
+    assert_eq!(
+        p.value, "3",
+        "sequence_len_eq must record the observed length"
+    );
+    assert_eq!(
+        p.expected.as_deref(),
+        Some("3"),
+        "sequence_len_eq must record the expected bound via record_pass_binary"
+    );
 }
 
 #[test]

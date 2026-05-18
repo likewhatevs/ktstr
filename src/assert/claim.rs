@@ -807,7 +807,7 @@ impl<'a, T: Ord + std::fmt::Debug> SetClaim<'a, T> {
         } = self;
         let actual = value.len();
         let outcome = if actual == n {
-            verdict.record_pass_unary(name, "set_len_eq", n);
+            verdict.record_pass_binary(name, "set_len_eq", actual, n);
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(format!("{name}: expected len == {n}, was {actual}"), reason);
@@ -1021,7 +1021,7 @@ impl<'a, T: std::fmt::Debug> SeqClaim<'a, T> {
         } = self;
         let actual = value.len();
         let outcome = if actual == n {
-            verdict.record_pass_unary(name, "sequence_len_eq", n);
+            verdict.record_pass_binary(name, "sequence_len_eq", actual, n);
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(format!("{name}: expected len == {n}, was {actual}"), reason);

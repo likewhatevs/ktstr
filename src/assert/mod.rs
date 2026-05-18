@@ -558,9 +558,20 @@ impl PassDetail {
 ///
 /// Categorization below groups by SEMANTIC AXIS (comparison /
 /// predicate / cardinality / membership / relation), not by call-
-/// site arity — some `len_eq` tokens record via the unary helper
-/// (only the value is reported; the expected `n` is implicit in the
-/// comparator name) while others record via the binary helper.
+/// site arity. Every `len_*` cardinality token (`set_len_eq` /
+/// `set_len_le` / `set_len_ge` and the sequence peers) records
+/// via the binary helper so renderer-side handling is uniform:
+/// each pass surfaces both the actual length and the expected
+/// bound. The previous unary-on-eq + binary-on-le/ge asymmetry
+/// was a micro-optimization (eq's `actual == expected` makes the
+/// actual redundant on the pass arm) that traded uniform output
+/// for one elided field. The `*_is_non_empty` and `*_is_empty`
+/// predicates remain unary by design — the comparator token IS
+/// the predicate, and there is no separate expected bound to
+/// surface. `*_is_non_empty` records the observed length
+/// (evidence the container was non-empty); `*_is_empty` records
+/// no value (the predicate token alone carries the meaning —
+/// emptiness is self-evident from the comparator).
 pub const COMPARATOR_VOCABULARY: &[&str] = &[
     // Scalar comparisons
     "eq",
