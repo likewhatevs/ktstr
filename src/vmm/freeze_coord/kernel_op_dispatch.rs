@@ -2329,4 +2329,134 @@ mod tests {
         );
         assert!(!err.contains("TASK_DEAD"));
     }
+
+    /// `KernelValue::OrU32` RMW: sets the supplied bits without
+    /// clobbering bits already set in the target word. Pre-populates
+    /// a synthetic symbol with an alternating bit pattern and ORs a
+    /// single unset bit; the read-back must show the union, not just
+    /// the OR mask alone.
+    ///
+    /// Migrated from `tests/oru64_rmw_e2e.rs` (gated skeleton); the
+    /// dispatcher narrowed OrU64 to OrU32 because the canonical
+    /// scheduler-flags use case (`struct scx_rq.flags`) is u32 per
+    /// `kernel/sched/sched.h:802`. Test runs as a host-side unit
+    /// test against `build_test_kernel`'s synthetic guest memory —
+    /// no VM boot — because the RMW correctness is pure dispatcher
+    /// arithmetic.
+    #[test]
+    fn oru32_sets_target_bits_preserves_others() {
+        // KVA = start_kernel_map (0xFFFF_FFFF_8000_0000) + PA; the
+        // Symbol path's `text_kva_to_pa` translates via
+        // start_kernel_map, NOT page_offset.
+        const SYMBOL_PA: u64 = 0x40;
+        const SYMBOL_KVA: u64 = 0xFFFF_FFFF_8000_0040;
+        const INITIAL_FLAGS: u32 = 0xAAAA_AAAA;
+        const OR_MASK: u32 = 0x0000_0001;
+        let mut buf = vec![0u8; 4096];
+        buf[SYMBOL_PA as usize..SYMBOL_PA as usize + 4]
+            .copy_from_slice(&INITIAL_FLAGS.to_le_bytes());
+        let mut symbols = std::collections::HashMap::new();
+        symbols.insert("test_flags".to_string(), SYMBOL_KVA);
+        let kernel = build_test_kernel(&mut buf, symbols);
+        dispatch_one_write(
+            &kernel,
+            None,
+            &KernelOpTarget::Symbol("test_flags".into()),
+            &KernelOpValue::OrU32(OR_MASK),
+        )
+        .expect("OrU32 RMW dispatch must succeed against painted symbol");
+        let observed = kernel
+            .read_symbol_u32("test_flags")
+            .expect("read-back must succeed");
+        assert_eq!(
+            observed,
+            INITIAL_FLAGS | OR_MASK,
+            "OrU32 must set 0x{OR_MASK:08x} without clobbering 0x{INITIAL_FLAGS:08x}"
+        );
+    }
+
+    /// `KernelValue::OrU32` is idempotent on already-set bits: OR'ing
+    /// a bit that is already 1 leaves the word unchanged. Pins that
+    /// the RMW path never accidentally toggles or clears a bit it
+    /// was asked to OR — a regression that flipped `|=` to `^=`
+    /// would slip past the [`oru32_sets_target_bits_preserves_others`]
+    /// test (which uses a NEW bit) and surface only here.
+    ///
+    /// Migrated from `tests/oru64_rmw_e2e.rs` (T33.2 in the original
+    /// skeleton).
+    #[test]
+    fn oru32_idempotent_on_already_set_bit() {
+        // KVA = start_kernel_map (0xFFFF_FFFF_8000_0000) + PA; the
+        // Symbol path's `text_kva_to_pa` translates via
+        // start_kernel_map, NOT page_offset.
+        const SYMBOL_PA: u64 = 0x40;
+        const SYMBOL_KVA: u64 = 0xFFFF_FFFF_8000_0040;
+        const INITIAL_FLAGS: u32 = 0xAAAA_AAAA;
+        // Bit 1 is set in 0xA = 1010 — picking 0x2 means OR-ing an
+        // already-set bit.
+        const ALREADY_SET: u32 = 0x0000_0002;
+        let mut buf = vec![0u8; 4096];
+        buf[SYMBOL_PA as usize..SYMBOL_PA as usize + 4]
+            .copy_from_slice(&INITIAL_FLAGS.to_le_bytes());
+        let mut symbols = std::collections::HashMap::new();
+        symbols.insert("test_flags".to_string(), SYMBOL_KVA);
+        let kernel = build_test_kernel(&mut buf, symbols);
+        // Sanity: the chosen bit IS set in the initial value (test
+        // construction guard).
+        assert_eq!(
+            INITIAL_FLAGS & ALREADY_SET,
+            ALREADY_SET,
+            "test setup bug: chose a bit that is not pre-set"
+        );
+        dispatch_one_write(
+            &kernel,
+            None,
+            &KernelOpTarget::Symbol("test_flags".into()),
+            &KernelOpValue::OrU32(ALREADY_SET),
+        )
+        .expect("OrU32 with already-set bit must succeed");
+        let observed = kernel
+            .read_symbol_u32("test_flags")
+            .expect("read-back must succeed");
+        assert_eq!(
+            observed, INITIAL_FLAGS,
+            "OrU32 of already-set bit must leave value unchanged \
+             (regression: bit was toggled or cleared instead of OR'd)"
+        );
+    }
+
+    /// `KernelOpValue::OrU32` survives a postcard round-trip embedded
+    /// inside a full `KernelOpRequestPayload`. Pins the wire-format
+    /// shape against a `#[serde(untagged)]` regression (untagged enums
+    /// break postcard's externally-tagged constraint — the wire-path
+    /// reader at the host would silently drop the variant tag).
+    ///
+    /// Migrated from `tests/oru64_rmw_e2e.rs` T33.3. The existing
+    /// `kernel_op_request_payload_postcard_round_trip` test in
+    /// `src/vmm/wire.rs` covers U32/U64/Bytes/PerCpuField/TaskField
+    /// but does not include an OrU32 entry — this fills that gap.
+    #[test]
+    fn oru32_postcard_round_trip_through_payload() {
+        const MASK: u32 = 0xDEAD_BEEF;
+        let payload = crate::vmm::wire::KernelOpRequestPayload {
+            request_id: 0xABCD,
+            mode: crate::vmm::wire::KernelOpMode::Cold,
+            direction: crate::vmm::wire::KernelOpDirection::Write,
+            tag: "oru32_roundtrip_pin".into(),
+            entries: vec![crate::vmm::wire::KernelOpEntry {
+                target: KernelOpTarget::Symbol("any_symbol".into()),
+                value: KernelOpValue::OrU32(MASK),
+            }],
+        };
+        let bytes = postcard::to_allocvec(&payload).expect("encode");
+        let back: crate::vmm::wire::KernelOpRequestPayload =
+            postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(back.entries.len(), 1);
+        match &back.entries[0].value {
+            KernelOpValue::OrU32(observed_mask) => {
+                assert_eq!(*observed_mask, MASK, "OrU32 mask must survive round-trip");
+            }
+            other => panic!("expected OrU32 variant after round-trip, got {other:?}"),
+        }
+    }
 }
