@@ -3391,6 +3391,136 @@ pub struct ComparisonPolicy {
     pub per_metric_percent: BTreeMap<String, f64>,
 }
 
+/// CLI-controlled rendering of the per-phase delta block in
+/// `cargo ktstr stats compare`. Bundled as a struct so the
+/// 5-flag clap surface threads through `compare_partitions` as
+/// a single positional rather than five. Default value renders
+/// every phase / every metric / every paired row — equivalent
+/// to passing no phase flags.
+///
+/// The flags compose via AND on independent axes (block-level
+/// suppression × phase-id × row-significance), with three
+/// mutex constraints enforced at CLI parse time:
+///
+/// - `--no-phases` excludes every other phase flag (the whole
+///   block is suppressed; refining what to render is a
+///   contradiction).
+/// - `--phases-only` excludes `--no-phases` (same reason).
+/// - `--steps-only` excludes `--phase` (one of them collapses
+///   to a single bucket; the other suppresses BASELINE — both
+///   together are confused phrasing).
+///
+/// The 5 flags trigger renderer behaviour ONLY — the data
+/// layer in [`compare_rows_by`] always emits the full set of
+/// matched [`PhaseDeltaRow`]s and [`UnpairedPhaseRow`]s so
+/// programmatic consumers of [`CompareReport`] see the
+/// unfiltered surface. Filtering is render-time projection.
+#[derive(Debug, Default, Clone)]
+pub struct PhaseDisplayOptions {
+    /// `--no-phases`: suppress the per-phase delta + unpaired
+    /// tables entirely. The scalar findings table and footer
+    /// render unchanged; the only effect is hiding the phase
+    /// block (and the phase footer hint). Mutually exclusive
+    /// with every other phase flag at CLI parse time.
+    pub no_phases: bool,
+    /// `--phases-only`: suppress the scalar findings table and
+    /// the host-context delta; render ONLY the per-phase block.
+    /// Useful for narrowing investigation to a phase regression
+    /// when the scalar rollup is noise. Composes with
+    /// `--steps-only`, `--phase`, and `--phase-threshold`.
+    pub phases_only: bool,
+    /// `--steps-only`: within the per-phase block, suppress
+    /// the BASELINE bucket (`step_index == 0`); render only
+    /// scenario Step buckets. Useful when the BASELINE settle
+    /// window is dominated by scheduler startup transients.
+    /// Mutually exclusive with `--phase`.
+    pub steps_only: bool,
+    /// `--phase <N>`: within the per-phase block, render only
+    /// rows whose `step_index == N`. `0` selects BASELINE;
+    /// `1..=N` selects scenario Step ordinals (1 → Step[0],
+    /// 2 → Step[1], ...). Integer chosen over label so a label
+    /// rename (`"Step[0]"` → `"Step:0"`) doesn't break operator
+    /// CI invocations. Mutually exclusive with `--steps-only`.
+    pub phase: Option<u16>,
+    /// `--phase-threshold <PCT>`: render-side relative-delta
+    /// gate for the per-phase pass. Suppresses paired rows
+    /// where `|delta| / max(|a|, 1.0) < PCT / 100.0`. `0.0`
+    /// shows every paired row; absence falls through to the
+    /// registry's per-metric `default_rel`. Independent from
+    /// the scalar `--threshold` — the two passes have separate
+    /// filters so an operator can widen the phase view without
+    /// widening the scalar view (the diagnostic "show me every
+    /// per-phase delta but only load-bearing scalar findings"
+    /// use case).
+    pub phase_threshold: Option<f64>,
+}
+
+impl PhaseDisplayOptions {
+    /// Resolve the per-phase relative threshold for a given
+    /// metric. Returns the override fraction when
+    /// `phase_threshold` is set, else falls through to the
+    /// `ComparisonPolicy` resolution the scalar pass uses. The
+    /// `metric_name` + `default_rel` shape mirrors
+    /// [`ComparisonPolicy::rel_threshold`] so the two surfaces
+    /// stay symmetric.
+    pub fn rel_threshold(
+        &self,
+        policy: &ComparisonPolicy,
+        metric_name: &str,
+        default_rel: f64,
+    ) -> f64 {
+        match self.phase_threshold {
+            Some(pct) => pct / 100.0,
+            None => policy.rel_threshold(metric_name, default_rel),
+        }
+    }
+
+    /// True when a phase row at the given `step_index` should
+    /// render under the current display flags. Combines the two
+    /// step-axis predicates (`--phase <N>` filter and
+    /// `--steps-only` BASELINE-suppressor) into a single
+    /// row-level decision the renderer can apply uniformly
+    /// across [`PhaseDeltaRow`] and [`UnpairedPhaseRow`] vecs.
+    /// Returns `true` when no relevant flag is set (default
+    /// path: every step renders).
+    pub fn matches_phase(&self, step_index: u16) -> bool {
+        if let Some(want) = self.phase {
+            if step_index != want {
+                return false;
+            }
+        }
+        if self.steps_only && step_index == 0 {
+            return false;
+        }
+        true
+    }
+
+    /// True when a [`PhaseDeltaRow`] passes the
+    /// `--phase-threshold` relative-significance gate. Computes
+    /// `|delta| / max(|a|, 1.0) >= phase_threshold / 100.0` —
+    /// the `max(|a|, 1.0)` denominator floor prevents NaN from
+    /// `a == 0.0` (the row that pairs a zero against any
+    /// non-zero produces a delta of finite magnitude that
+    /// should not divide by zero). Returns `true` when no
+    /// flag is set (default path: every row passes; per the
+    /// `--phase-threshold` clap doc — absence keeps every
+    /// paired row in the rendered output).
+    ///
+    /// `pub(crate)` rather than `pub` because [`PhaseDeltaRow`]
+    /// is `pub(crate)` — the row type is an internal renderer
+    /// detail, not a public surface. External consumers reach
+    /// per-row decisions through the rendered output, not by
+    /// instantiating a `PhaseDeltaRow` themselves.
+    pub(crate) fn passes_delta_threshold(&self, delta: &PhaseDeltaRow) -> bool {
+        let Some(pct) = self.phase_threshold else {
+            return true;
+        };
+        let denom = delta.a.abs().max(1.0);
+        let rel = delta.delta.abs() / denom;
+        rel >= pct / 100.0
+    }
+}
+
 impl ComparisonPolicy {
     /// Empty policy — every metric uses its `METRICS` registry
     /// default. Equivalent to the old `--threshold None` CLI path.
@@ -3674,6 +3804,25 @@ pub(crate) fn compare_rows_by(
                         // sentinel-free `PhaseBucket::get` contract;
                         // the renderer does not invent a synthetic
                         // delta for it.
+                        //
+                        // `is_regression` honors the same dual-gate
+                        // the scalar pass applies inside its
+                        // per-metric loop (search for `default_abs <`
+                        // in `compare_rows_by` above): a row whose
+                        // `|delta| < default_abs` OR whose
+                        // `rel_delta < policy.rel_threshold` is
+                        // classified `is_regression = false` even
+                        // when the direction matches `polarity`.
+                        // This mirrors the scalar `unchanged`
+                        // semantic so a sub-threshold per-phase
+                        // delta (e.g. `+0.1 ms` on a 10-ms-default
+                        // gate) does not produce a false-positive
+                        // REGRESSION verdict in the rendered table.
+                        // The row is still emitted into
+                        // `phase_deltas` so programmatic consumers
+                        // of `CompareReport.phase_deltas` see every
+                        // paired comparison; the filter is on the
+                        // classification only.
                         for (metric_name, &val_a) in &pa.metrics {
                             let Some(&val_b) = pb.metrics.get(metric_name) else {
                                 continue;
@@ -3682,7 +3831,18 @@ pub(crate) fn compare_rows_by(
                                 continue;
                             };
                             let delta = val_b - val_a;
-                            let is_regression = if metric_def.higher_is_worse() {
+                            let rel_thresh = policy
+                                .rel_threshold(metric_def.name, metric_def.default_rel);
+                            let rel_delta = if val_a.abs() > f64::EPSILON {
+                                (delta / val_a).abs()
+                            } else {
+                                0.0
+                            };
+                            let below_dual_gate = delta.abs() < metric_def.default_abs
+                                || rel_delta < rel_thresh;
+                            let is_regression = if below_dual_gate {
+                                false
+                            } else if metric_def.higher_is_worse() {
                                 delta > 0.0
                             } else {
                                 delta < 0.0
@@ -4055,6 +4215,7 @@ pub fn compare_partitions(
     policy: &ComparisonPolicy,
     dir: Option<&std::path::Path>,
     no_average: bool,
+    phase_opts: &PhaseDisplayOptions,
 ) -> anyhow::Result<i32> {
     // Validation gate 1: there must be at least one dimension
     // on which filter_a differs from filter_b — otherwise the
@@ -4208,173 +4369,234 @@ pub fn compare_partitions(
     }
 
     use comfy_table::{Cell, Color};
-    let mut table = crate::cli::new_table();
-    table.set_header(vec![
-        "TEST", "METRIC", &label_a, &label_b, "DELTA", "VERDICT",
-    ]);
-    for f in &report.findings {
-        let (verdict_text, verdict_color) = if f.is_regression {
-            ("REGRESSION", Color::Red)
-        } else {
-            ("improvement", Color::Green)
-        };
-        // PairingKey's first slot is scenario; subsequent slots
-        // are the pairing-dim values in canonical order. Joining
-        // with `/` produces a label whose shape mirrors the
-        // pairing-dim count — so a comparison that pairs on
-        // (topology, work_type) renders a `scenario/topology/work_type`
-        // label, while a comparison that slices on most dims
-        // renders a shorter identifier. The operator can always
-        // cross-reference the "pairing on:" header line above to
-        // see what each segment means.
-        let label = f.pairing_key.0.join("/");
-        table.add_row(vec![
-            Cell::new(label),
-            Cell::new(f.metric.name),
-            Cell::new(format!("{:.2}", f.val_a)),
-            Cell::new(format!("{:.2}", f.val_b)),
-            Cell::new(format!("{:+.2}{}", f.delta, f.metric.display_unit)),
-            Cell::new(verdict_text).fg(verdict_color),
+    // Scalar findings table — suppressed when the operator
+    // passed `--phases-only` (they want the per-phase block
+    // only). The scalar pre-aggregation already ran; this just
+    // hides its render.
+    if !phase_opts.phases_only {
+        let mut table = crate::cli::new_table();
+        table.set_header(vec![
+            "TEST", "METRIC", &label_a, &label_b, "DELTA", "VERDICT",
         ]);
+        for f in &report.findings {
+            let (verdict_text, verdict_color) = if f.is_regression {
+                ("REGRESSION", Color::Red)
+            } else {
+                ("improvement", Color::Green)
+            };
+            // PairingKey's first slot is scenario; subsequent slots
+            // are the pairing-dim values in canonical order. Joining
+            // with `/` produces a label whose shape mirrors the
+            // pairing-dim count — so a comparison that pairs on
+            // (topology, work_type) renders a `scenario/topology/work_type`
+            // label, while a comparison that slices on most dims
+            // renders a shorter identifier. The operator can always
+            // cross-reference the "pairing on:" header line above to
+            // see what each segment means.
+            let label = f.pairing_key.0.join("/");
+            table.add_row(vec![
+                Cell::new(label),
+                Cell::new(f.metric.name),
+                Cell::new(format!("{:.2}", f.val_a)),
+                Cell::new(format!("{:.2}", f.val_b)),
+                Cell::new(format!("{:+.2}{}", f.delta, f.metric.display_unit)),
+                Cell::new(verdict_text).fg(verdict_color),
+            ]);
+        }
+        println!("{table}");
     }
-    println!("{table}");
 
     // Per-phase delta render. Activated when the parallel pass
     // populated either phase_deltas or unpaired_phases for the
-    // current row-pair set. Single-phase scenarios (no periodic
-    // captures) leave both vecs empty and the phase block is
-    // suppressed entirely — the operator sees only the scalar
-    // table above, as before. This is the data-only render; CLI
-    // flag gating (--phases-only / --steps-only / --no-phases
-    // / --phase <N> / --phase-delta-threshold) lands in a
-    // follow-up commit.
-    if !report.phase_deltas.is_empty() || !report.unpaired_phases.is_empty() {
-        println!();
-        println!("phase coverage:");
-        if !report.phase_deltas.is_empty() {
-            let mut phase_table = crate::cli::new_table();
-            phase_table.set_header(vec![
-                "PHASE", "TEST", "METRIC", &label_a, &label_b, "DELTA", "VERDICT",
-            ]);
-            // Sort by step_index ascending, then pairing key,
-            // then metric name. step_index-first ordering matches
-            // the operator-facing time order from BASELINE
-            // through Step[N] so the reader scans top-down by
-            // phase boundary; ties within a phase sort by row
-            // pair then metric so the table is stable across
-            // runs with identical input.
-            let mut sorted_deltas: Vec<&PhaseDeltaRow> = report.phase_deltas.iter().collect();
-            sorted_deltas.sort_by(|a, b| {
-                a.step_index
-                    .cmp(&b.step_index)
-                    .then_with(|| a.pairing_key.0.cmp(&b.pairing_key.0))
-                    .then_with(|| a.metric.name.cmp(b.metric.name))
-            });
-            for d in sorted_deltas {
-                let (verdict_text, verdict_color) = if d.is_regression {
-                    ("REGRESSION", Color::Red)
-                } else {
-                    ("improvement", Color::Green)
-                };
-                let test_label = d.pairing_key.0.join("/");
-                let phase_cell = format!("{}: {}", d.step_index, d.label);
-                phase_table.add_row(vec![
-                    Cell::new(phase_cell),
-                    Cell::new(test_label),
-                    Cell::new(d.metric.name),
-                    Cell::new(format!("{:.2}", d.a)),
-                    Cell::new(format!("{:.2}", d.b)),
-                    Cell::new(format!("{:+.2}{}", d.delta, d.metric.display_unit)),
-                    Cell::new(verdict_text).fg(verdict_color),
-                ]);
-            }
-            println!("{phase_table}");
-        }
-        if !report.unpaired_phases.is_empty() {
+    // current row-pair set AND `--no-phases` was not passed.
+    // Single-phase scenarios (no periodic captures) leave both
+    // vecs empty and the phase block is suppressed entirely.
+    //
+    // CLI filters compose by AND on independent axes:
+    // - `--phase <N>` keeps only the named step_index
+    // - `--steps-only` suppresses BASELINE (step_index == 0)
+    // - `--phase-threshold <PCT>` filters paired rows whose
+    //   `|delta| / max(|a|, 1.0)` is below `PCT / 100.0`
+    //
+    // Filtering is render-time projection — the underlying
+    // CompareReport.phase_deltas / unpaired_phases vecs hold
+    // the unfiltered data so programmatic consumers see every
+    // paired row regardless of CLI flags.
+    let render_phase_block = !phase_opts.no_phases
+        && (!report.phase_deltas.is_empty() || !report.unpaired_phases.is_empty());
+    if render_phase_block {
+        let filtered_deltas: Vec<&PhaseDeltaRow> = report
+            .phase_deltas
+            .iter()
+            .filter(|d| phase_opts.matches_phase(d.step_index))
+            .filter(|d| phase_opts.passes_delta_threshold(d))
+            .collect();
+        let filtered_unpaired: Vec<&UnpairedPhaseRow> = report
+            .unpaired_phases
+            .iter()
+            .filter(|u| phase_opts.matches_phase(u.step_index))
+            .collect();
+        // Capture filtered counts BEFORE moving `filtered_deltas`
+        // into `sorted_deltas` below — the footer hint reads them
+        // after the table rendering consumes the Vec.
+        let filtered_delta_total = filtered_deltas.len();
+        let filtered_delta_regressions =
+            filtered_deltas.iter().filter(|d| d.is_regression).count();
+        if !filtered_deltas.is_empty() || !filtered_unpaired.is_empty() {
             println!();
-            println!("phase coverage asymmetry (one-sided phases):");
-            let mut unpaired_table = crate::cli::new_table();
-            unpaired_table.set_header(vec![
-                "SIDE", "TEST", "PHASE", "METRIC", "VALUE",
-            ]);
-            // Sort by step_index then side then pairing key then
-            // metric name. Time-order (step_index first) reads
-            // most naturally — the reader sees missing data in
-            // the order it would have appeared during the
-            // scenario, not grouped by which side is missing
-            // (side grouping would force a mental flip-flop
-            // across the paired rows above).
-            let mut sorted_unpaired: Vec<&UnpairedPhaseRow> =
-                report.unpaired_phases.iter().collect();
-            sorted_unpaired.sort_by(|a, b| {
-                a.step_index
-                    .cmp(&b.step_index)
-                    .then_with(|| a.side.as_str().cmp(b.side.as_str()))
-                    .then_with(|| a.pairing_key.0.cmp(&b.pairing_key.0))
-            });
-            for u in sorted_unpaired {
-                let test_label = u.pairing_key.0.join("/");
-                let phase_cell = format!("{}: {}", u.step_index, u.label);
-                if u.metrics.is_empty() {
-                    // Bucket present but no metrics — surface
-                    // the empty shape rather than hiding it. The
-                    // operator sees that the phase fired but
-                    // produced no readable metric data on the
-                    // single side it ran on, which is itself a
-                    // signal (capture path landed but
-                    // MetricDef::read_sample returned None for
-                    // every registered metric on these samples).
-                    unpaired_table.add_row(vec![
-                        Cell::new(u.side.as_str()),
-                        Cell::new(test_label),
+            println!("phase coverage:");
+            if !filtered_deltas.is_empty() {
+                let mut phase_table = crate::cli::new_table();
+                phase_table.set_header(vec![
+                    "PHASE", "TEST", "METRIC", &label_a, &label_b, "DELTA", "VERDICT",
+                ]);
+                // Sort by step_index ascending, then pairing key,
+                // then metric name. step_index-first ordering matches
+                // the operator-facing time order from BASELINE
+                // through Step[N] so the reader scans top-down by
+                // phase boundary; ties within a phase sort by row
+                // pair then metric so the table is stable across
+                // runs with identical input.
+                let mut sorted_deltas = filtered_deltas;
+                sorted_deltas.sort_by(|a, b| {
+                    a.step_index
+                        .cmp(&b.step_index)
+                        .then_with(|| a.pairing_key.0.cmp(&b.pairing_key.0))
+                        .then_with(|| a.metric.name.cmp(b.metric.name))
+                });
+                for d in sorted_deltas {
+                    let (verdict_text, verdict_color) = if d.is_regression {
+                        ("REGRESSION", Color::Red)
+                    } else {
+                        ("improvement", Color::Green)
+                    };
+                    let test_label = d.pairing_key.0.join("/");
+                    let phase_cell = format!("{}: {}", d.step_index, d.label);
+                    phase_table.add_row(vec![
                         Cell::new(phase_cell),
-                        Cell::new("—"),
-                        Cell::new("—"),
+                        Cell::new(test_label),
+                        Cell::new(d.metric.name),
+                        Cell::new(format!("{:.2}", d.a)),
+                        Cell::new(format!("{:.2}", d.b)),
+                        Cell::new(format!("{:+.2}{}", d.delta, d.metric.display_unit)),
+                        Cell::new(verdict_text).fg(verdict_color),
                     ]);
-                } else {
-                    for (metric_name, &value) in &u.metrics {
+                }
+                println!("{phase_table}");
+            }
+            if !filtered_unpaired.is_empty() {
+                println!();
+                println!("phase coverage asymmetry (one-sided phases):");
+                let mut unpaired_table = crate::cli::new_table();
+                unpaired_table.set_header(vec![
+                    "SIDE", "TEST", "PHASE", "METRIC", "VALUE",
+                ]);
+                // Sort by step_index then side then pairing key then
+                // metric name. Time-order (step_index first) reads
+                // most naturally — the reader sees missing data in
+                // the order it would have appeared during the
+                // scenario, not grouped by which side is missing
+                // (side grouping would force a mental flip-flop
+                // across the paired rows above).
+                let mut sorted_unpaired = filtered_unpaired;
+                sorted_unpaired.sort_by(|a, b| {
+                    a.step_index
+                        .cmp(&b.step_index)
+                        .then_with(|| a.side.as_str().cmp(b.side.as_str()))
+                        .then_with(|| a.pairing_key.0.cmp(&b.pairing_key.0))
+                });
+                for u in sorted_unpaired {
+                    let test_label = u.pairing_key.0.join("/");
+                    let phase_cell = format!("{}: {}", u.step_index, u.label);
+                    if u.metrics.is_empty() {
+                        // Bucket present but no metrics — surface
+                        // the empty shape rather than hiding it. The
+                        // operator sees that the phase fired but
+                        // produced no readable metric data on the
+                        // single side it ran on, which is itself a
+                        // signal (capture path landed but
+                        // MetricDef::read_sample returned None for
+                        // every registered metric on these samples).
                         unpaired_table.add_row(vec![
                             Cell::new(u.side.as_str()),
-                            Cell::new(&test_label),
-                            Cell::new(&phase_cell),
-                            Cell::new(metric_name),
-                            Cell::new(format!("{value:.2}")),
+                            Cell::new(test_label),
+                            Cell::new(phase_cell),
+                            Cell::new("—"),
+                            Cell::new("—"),
                         ]);
+                    } else {
+                        for (metric_name, &value) in &u.metrics {
+                            unpaired_table.add_row(vec![
+                                Cell::new(u.side.as_str()),
+                                Cell::new(&test_label),
+                                Cell::new(&phase_cell),
+                                Cell::new(metric_name),
+                                Cell::new(format!("{value:.2}")),
+                            ]);
+                        }
                     }
                 }
+                println!("{unpaired_table}");
             }
-            println!("{unpaired_table}");
+            // Operator hint surfaces only when the default-on
+            // path is producing rows AND no filter flag was set —
+            // a user who already passed `--phase`, `--steps-only`,
+            // `--phase-threshold`, or `--phases-only` doesn't need
+            // the discovery hint. `--no-phases` already
+            // short-circuited the entire block above so it can't
+            // reach here.
+            let any_flag_set = phase_opts.phases_only
+                || phase_opts.steps_only
+                || phase_opts.phase.is_some()
+                || phase_opts.phase_threshold.is_some();
+            if !any_flag_set {
+                println!(
+                    "  phases: {filtered_delta_total} delta row(s) shown \
+                     ({filtered_delta_regressions} regression{plural}). \
+                     Filter with --phase N / --phases-only / --steps-only / \
+                     --phase-threshold P / --no-phases.",
+                    plural = if filtered_delta_regressions == 1 { "" } else { "s" },
+                );
+            }
         }
     }
 
-    println!();
-    println!(
-        "summary: {} regressions, {} improvements, {} unchanged",
-        report.regressions, report.improvements, report.unchanged,
-    );
-    if report.skipped_failed > 0 {
+    // Scalar summary block — regressions / improvements /
+    // unchanged + skipped-failed + per-group pass counts +
+    // new_in_b / removed_from_a. All four lines describe the
+    // scalar findings table; suppress them under `--phases-only`
+    // so the operator's "phase-block only" projection stays
+    // pure (the phase block has its own footer hint above).
+    if !phase_opts.phases_only {
+        println!();
         println!(
-            "  {} pairing-key row pair(s) skipped because one or both sides failed",
-            report.skipped_failed,
+            "summary: {} regressions, {} improvements, {} unchanged",
+            report.regressions, report.improvements, report.unchanged,
         );
-    }
-    if let (Some(avg_a), Some(avg_b)) = (&avg_a, &avg_b) {
-        let block = format_per_group_pass_counts(avg_a, avg_b, &label_a, &label_b);
-        if !block.is_empty() {
-            print!("{block}");
+        if report.skipped_failed > 0 {
+            println!(
+                "  {} pairing-key row pair(s) skipped because one or both sides failed",
+                report.skipped_failed,
+            );
         }
-    }
-    if report.new_in_b > 0 {
-        println!(
-            "  {} row(s) new in '{}' (no matching key in '{}')",
-            report.new_in_b, label_b, label_a,
-        );
-    }
-    if report.removed_from_a > 0 {
-        println!(
-            "  {} row(s) removed from '{}' (no matching key in '{}')",
-            report.removed_from_a, label_a, label_b,
-        );
+        if let (Some(avg_a), Some(avg_b)) = (&avg_a, &avg_b) {
+            let block = format_per_group_pass_counts(avg_a, avg_b, &label_a, &label_b);
+            if !block.is_empty() {
+                print!("{block}");
+            }
+        }
+        if report.new_in_b > 0 {
+            println!(
+                "  {} row(s) new in '{}' (no matching key in '{}')",
+                report.new_in_b, label_b, label_a,
+            );
+        }
+        if report.removed_from_a > 0 {
+            println!(
+                "  {} row(s) removed from '{}' (no matching key in '{}')",
+                report.removed_from_a, label_a, label_b,
+            );
+        }
     }
 
     // Host-context delta. Same first-Some(host) baseline
@@ -7534,6 +7756,7 @@ mod tests {
             &ComparisonPolicy::default(),
             Some(alt_root.path()),
             false,
+            &PhaseDisplayOptions::default(),
         )
         .expect("compare_partitions must pool sidecars under --dir override");
         assert_eq!(
@@ -8902,6 +9125,7 @@ mod tests {
             &ComparisonPolicy::default(),
             Some(alt_root.path()),
             false, // no_average=false → averaging is ON
+            &PhaseDisplayOptions::default(),
         )
         .expect("compare_partitions must succeed against valid fixtures");
         assert_eq!(
@@ -9075,21 +9299,31 @@ mod tests {
     /// regression=false (improvement). Pins the polarity wiring
     /// that the existing scalar-finding path uses, applied to
     /// the per-phase pass.
+    ///
+    /// Values chosen to clear the per-phase dual-gate (the same
+    /// `|delta| < default_abs || rel_delta < default_rel` gate
+    /// the scalar pass uses inside its per-metric loop in
+    /// `compare_rows_by`). max_dsq_depth has
+    /// default_abs=10.0 / default_rel=0.50; total_iterations has
+    /// default_abs=100.0 / default_rel=0.10. The 10→25 (delta=15)
+    /// and 200→400 (delta=200) deltas both clear both gates, so
+    /// polarity dispatches as documented. Sub-threshold deltas
+    /// are explicitly exercised by the dual-gate test below.
     #[test]
     fn compare_rows_by_phase_deltas_respect_metric_polarity() {
         let mut row_a = make_row("test_z", "tiny-1llc", true, 0.0);
         let mut row_b = make_row("test_z", "tiny-1llc", true, 0.0);
-        // max_dsq_depth is Peak/LowerBetter — bigger = regression
-        // total_iterations is Counter/HigherBetter — bigger = improvement
+        // max_dsq_depth Peak/LowerBetter: delta=15 > abs=10, rel=1.5 > rel=0.5
+        // total_iterations Counter/HigherBetter: delta=200 > abs=100, rel=1.0 > rel=0.10
         row_a.phases = vec![make_phase_bucket(
             0,
             "BASELINE",
-            &[("max_dsq_depth", 5.0), ("total_iterations", 100.0)],
+            &[("max_dsq_depth", 10.0), ("total_iterations", 200.0)],
         )];
         row_b.phases = vec![make_phase_bucket(
             0,
             "BASELINE",
-            &[("max_dsq_depth", 9.0), ("total_iterations", 200.0)],
+            &[("max_dsq_depth", 25.0), ("total_iterations", 400.0)],
         )];
         let report = compare_rows_by(
             &[row_a],
@@ -9116,6 +9350,349 @@ mod tests {
         assert!(
             !iters.is_regression,
             "total_iterations bigger on B -> improvement (HigherBetter polarity)"
+        );
+    }
+
+    /// per-phase pass honors the dual-gate semantic the
+    /// scalar pass uses inside its per-metric loop in
+    /// `compare_rows_by` (`|delta| < default_abs ||
+    /// rel_delta < default_rel`). Sub-threshold deltas are still
+    /// emitted into `phase_deltas` (programmatic consumers see
+    /// every paired comparison) but their `is_regression` flag
+    /// is `false` — the renderer paints them as "improvement"
+    /// or unstyled rather than the red REGRESSION verdict.
+    ///
+    /// Two cases pinned in one test:
+    /// - sub-abs-gate: `max_dsq_depth` `default_abs=10.0` —
+    ///   delta=5 (5→10) is direction-matching for LowerBetter
+    ///   polarity but `5 < 10` → is_regression=false.
+    /// - above-both-gates: `max_dsq_depth` delta=15 (10→25)
+    ///   passes both abs and rel gates → is_regression=true.
+    #[test]
+    fn compare_rows_by_phase_deltas_dual_gate_suppresses_subthreshold_regressions() {
+        let mut row_a = make_row("test_dg", "tiny-1llc", true, 0.0);
+        let mut row_b = make_row("test_dg", "tiny-1llc", true, 0.0);
+        // BASELINE: delta=5 (under abs=10), Step[0]: delta=15 (over abs=10 + rel=0.5)
+        row_a.phases = vec![
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)]),
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 10.0)]),
+        ];
+        row_b.phases = vec![
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 10.0)]),
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 25.0)]),
+        ];
+        let report = compare_rows_by(
+            &[row_a],
+            &[row_b],
+            &[],
+            None,
+            &ComparisonPolicy::default(),
+        );
+        assert_eq!(
+            report.phase_deltas.len(),
+            2,
+            "both phases emit a delta row regardless of dual-gate"
+        );
+        let baseline = report
+            .phase_deltas
+            .iter()
+            .find(|r| r.step_index == 0)
+            .expect("BASELINE delta present");
+        assert_eq!(baseline.delta, 5.0);
+        assert!(
+            !baseline.is_regression,
+            "delta=5 < default_abs=10 → sub-abs-gate; \
+             is_regression must clear despite LowerBetter polarity direction"
+        );
+        let step0 = report
+            .phase_deltas
+            .iter()
+            .find(|r| r.step_index == 1)
+            .expect("Step[0] delta present");
+        assert_eq!(step0.delta, 15.0);
+        assert!(
+            step0.is_regression,
+            "delta=15 ≥ default_abs=10 AND rel_delta=1.5 ≥ default_rel=0.5 → \
+             above both gates; LowerBetter polarity sets is_regression=true"
+        );
+    }
+
+    // -- PhaseDisplayOptions::rel_threshold (plan_17 step 11c) --
+
+    /// `PhaseDisplayOptions::rel_threshold` returns the
+    /// `phase_threshold` percent divided by 100 (the override
+    /// branch) when the flag is set, regardless of what
+    /// `ComparisonPolicy` says. Confirms `--phase-threshold X`
+    /// is the sole determinant of per-phase relative-gate
+    /// resolution at the override branch.
+    #[test]
+    fn phase_display_options_rel_threshold_override_branch_takes_precedence() {
+        let opts = PhaseDisplayOptions {
+            phase_threshold: Some(25.0), // 25%
+            ..PhaseDisplayOptions::default()
+        };
+        let mut policy = ComparisonPolicy::default();
+        policy.per_metric_percent.insert("max_dsq_depth".into(), 99.0);
+        let resolved = opts.rel_threshold(&policy, "max_dsq_depth", 0.50);
+        assert_eq!(
+            resolved, 0.25,
+            "--phase-threshold 25 → 0.25 fraction regardless of policy override"
+        );
+    }
+
+    /// `PhaseDisplayOptions::rel_threshold` falls through to
+    /// `ComparisonPolicy::rel_threshold` when `phase_threshold`
+    /// is absent. The policy's per-metric or default-percent
+    /// override applies (the operator's CLI surface). Pins the
+    /// fallback chain so a `--policy file.json` invocation with
+    /// no `--phase-threshold` continues to feed the per-metric
+    /// thresholds into the per-phase pass.
+    #[test]
+    fn phase_display_options_rel_threshold_falls_through_to_policy_when_unset() {
+        let opts = PhaseDisplayOptions::default(); // phase_threshold = None
+        let mut policy = ComparisonPolicy::default();
+        policy.per_metric_percent.insert("max_dsq_depth".into(), 30.0); // 30%
+        let resolved = opts.rel_threshold(&policy, "max_dsq_depth", 0.50);
+        assert_eq!(
+            resolved, 0.30,
+            "absent --phase-threshold → policy.rel_threshold = 30% / 100 = 0.30"
+        );
+    }
+
+    /// When neither `PhaseDisplayOptions::phase_threshold` nor
+    /// any `ComparisonPolicy` override applies, fall through to
+    /// the registry default (e.g. `MetricDef.default_rel = 0.50`
+    /// for `max_dsq_depth`). Pins the "no flag at all" path so
+    /// the dual-gate semantic at the data layer continues to
+    /// use the metric registry as the source of truth.
+    #[test]
+    fn phase_display_options_rel_threshold_falls_through_to_registry_default() {
+        let opts = PhaseDisplayOptions::default();
+        let policy = ComparisonPolicy::default(); // no overrides
+        let resolved = opts.rel_threshold(&policy, "max_dsq_depth", 0.50);
+        assert_eq!(
+            resolved, 0.50,
+            "no flag, no policy → registry default_rel = 0.50"
+        );
+    }
+
+    // -- PhaseDisplayOptions::matches_phase (step-axis filter) --
+
+    /// Default-shape opts (`--phase` None, `--steps-only` false)
+    /// match every step_index. Pins the "no flag, every step
+    /// renders" default path that the earlier per-phase pass tests
+    /// implicitly assume but never assert directly on the
+    /// extracted helper.
+    #[test]
+    fn matches_phase_default_opts_pass_all_steps() {
+        let opts = PhaseDisplayOptions::default();
+        for step in [0u16, 1, 2, 7, 65535] {
+            assert!(
+                opts.matches_phase(step),
+                "default opts must match step_index = {step}"
+            );
+        }
+    }
+
+    /// `--steps-only` suppresses BASELINE (step_index = 0) and
+    /// admits every other step. Pins the single-step exclusion
+    /// behavior and confirms that no other steps are
+    /// accidentally caught by the gate.
+    #[test]
+    fn matches_phase_steps_only_suppresses_only_baseline() {
+        let opts = PhaseDisplayOptions {
+            steps_only: true,
+            ..PhaseDisplayOptions::default()
+        };
+        assert!(
+            !opts.matches_phase(0),
+            "--steps-only: step_index = 0 (BASELINE) must be suppressed"
+        );
+        for step in [1u16, 2, 3, 7, 65535] {
+            assert!(
+                opts.matches_phase(step),
+                "--steps-only: step_index = {step} must NOT be suppressed"
+            );
+        }
+    }
+
+    /// `--phase N` keeps only step_index == N and rejects every
+    /// other step (including BASELINE when N != 0). Pins the
+    /// single-phase filter.
+    #[test]
+    fn matches_phase_phase_filter_keeps_only_target_step() {
+        let opts = PhaseDisplayOptions {
+            phase: Some(2),
+            ..PhaseDisplayOptions::default()
+        };
+        assert!(opts.matches_phase(2), "--phase 2 must keep step_index = 2");
+        for step in [0u16, 1, 3, 7, 65535] {
+            assert!(
+                !opts.matches_phase(step),
+                "--phase 2: step_index = {step} must be suppressed"
+            );
+        }
+    }
+
+    /// `--phase 0` keeps BASELINE only — the
+    /// `--phase`-via-step-zero arm. Confirms an operator can
+    /// explicitly request BASELINE through the `--phase` flag
+    /// rather than only through "no flag at all" default.
+    /// (Mutually exclusive with `--steps-only` at the CLI parse
+    /// layer; here we test the method in isolation.)
+    #[test]
+    fn matches_phase_phase_zero_keeps_only_baseline() {
+        let opts = PhaseDisplayOptions {
+            phase: Some(0),
+            ..PhaseDisplayOptions::default()
+        };
+        assert!(opts.matches_phase(0), "--phase 0 must keep step_index = 0");
+        for step in [1u16, 2, 7, 65535] {
+            assert!(
+                !opts.matches_phase(step),
+                "--phase 0: step_index = {step} must be suppressed"
+            );
+        }
+    }
+
+    // -- PhaseDisplayOptions::passes_delta_threshold --
+
+    /// `--phase-threshold` unset (default opts) passes every
+    /// row regardless of delta magnitude — matches the clap
+    /// doc contract ("absence shows every paired row"). Pins
+    /// the default render-everything behavior.
+    #[test]
+    fn passes_delta_threshold_unset_admits_all_deltas() {
+        let opts = PhaseDisplayOptions::default();
+        let metric = METRICS
+            .iter()
+            .find(|m| m.name == "max_dsq_depth")
+            .expect("max_dsq_depth in METRICS");
+        // delta = 0.0 (no change) and delta = 999.0 (massive change) both pass.
+        let zero_delta = PhaseDeltaRow {
+            pairing_key: PairingKey(vec!["t".into()]),
+            step_index: 0,
+            label: "BASELINE".into(),
+            metric,
+            a: 100.0,
+            b: 100.0,
+            delta: 0.0,
+            is_regression: false,
+        };
+        let big_delta = PhaseDeltaRow {
+            pairing_key: PairingKey(vec!["t".into()]),
+            step_index: 0,
+            label: "BASELINE".into(),
+            metric,
+            a: 100.0,
+            b: 1099.0,
+            delta: 999.0,
+            is_regression: true,
+        };
+        assert!(opts.passes_delta_threshold(&zero_delta));
+        assert!(opts.passes_delta_threshold(&big_delta));
+    }
+
+    /// `--phase-threshold 10` (10% gate) suppresses rows whose
+    /// relative delta is below 10% AND admits rows at or above.
+    /// Pins the inclusive-at-boundary semantic (`>=`) so a
+    /// future refactor to `>` silently flips it.
+    #[test]
+    fn passes_delta_threshold_inclusive_at_boundary() {
+        let opts = PhaseDisplayOptions {
+            phase_threshold: Some(10.0),
+            ..PhaseDisplayOptions::default()
+        };
+        let metric = METRICS
+            .iter()
+            .find(|m| m.name == "max_dsq_depth")
+            .expect("max_dsq_depth in METRICS");
+        // delta=10, a=100 → rel = 10/100 = 0.10. Exactly at the boundary.
+        let at_gate = PhaseDeltaRow {
+            pairing_key: PairingKey(vec!["t".into()]),
+            step_index: 0,
+            label: "BASELINE".into(),
+            metric,
+            a: 100.0,
+            b: 110.0,
+            delta: 10.0,
+            is_regression: true,
+        };
+        assert!(
+            opts.passes_delta_threshold(&at_gate),
+            "at-boundary delta (rel=0.10, gate=0.10) must pass via >= comparison"
+        );
+        // delta=5, a=100 → rel = 0.05 < 0.10. Below the gate.
+        let below_gate = PhaseDeltaRow { delta: 5.0, b: 105.0, ..at_gate };
+        assert!(
+            !opts.passes_delta_threshold(&below_gate),
+            "below-boundary delta (rel=0.05, gate=0.10) must be suppressed"
+        );
+    }
+
+    /// `--phase-threshold 50` against `a = 0.0` divides by the
+    /// `max(|a|, 1.0)` floor (NOT zero), so a delta of 10 yields
+    /// rel = 10/1 = 10.0 (1000%) which passes the 0.5 gate. Pins
+    /// the NaN-defense in the denominator: a future refactor that
+    /// drops the `.max(1.0)` would divide by zero and either
+    /// admit all rows (NaN >= X → false) or panic.
+    #[test]
+    fn passes_delta_threshold_zero_a_divides_by_unit_floor() {
+        let opts = PhaseDisplayOptions {
+            phase_threshold: Some(50.0),
+            ..PhaseDisplayOptions::default()
+        };
+        let metric = METRICS
+            .iter()
+            .find(|m| m.name == "max_dsq_depth")
+            .expect("max_dsq_depth in METRICS");
+        let zero_a = PhaseDeltaRow {
+            pairing_key: PairingKey(vec!["t".into()]),
+            step_index: 0,
+            label: "BASELINE".into(),
+            metric,
+            a: 0.0,
+            b: 10.0,
+            delta: 10.0,
+            is_regression: true,
+        };
+        assert!(
+            opts.passes_delta_threshold(&zero_a),
+            "zero-a divisor floor (|a|.max(1.0)) must keep rel finite \
+             (rel = |10|/max(0,1) = 10.0); 10.0 ≥ 0.5 → row passes"
+        );
+    }
+
+    /// `--phase-threshold 0` (PCT = 0) admits every row because
+    /// `rel >= 0.0` is always true. Pins the documented sentinel
+    /// "PCT = 0 shows every paired row" — a future refactor that
+    /// special-cased 0 to mean "no filter" via different code
+    /// path would still produce the same result, but the
+    /// straight numeric comparison is the simplest implementation
+    /// and this test pins it.
+    #[test]
+    fn passes_delta_threshold_zero_pct_admits_all_rows() {
+        let opts = PhaseDisplayOptions {
+            phase_threshold: Some(0.0),
+            ..PhaseDisplayOptions::default()
+        };
+        let metric = METRICS
+            .iter()
+            .find(|m| m.name == "max_dsq_depth")
+            .expect("max_dsq_depth in METRICS");
+        let zero_delta = PhaseDeltaRow {
+            pairing_key: PairingKey(vec!["t".into()]),
+            step_index: 0,
+            label: "BASELINE".into(),
+            metric,
+            a: 100.0,
+            b: 100.0,
+            delta: 0.0,
+            is_regression: false,
+        };
+        assert!(
+            opts.passes_delta_threshold(&zero_delta),
+            "--phase-threshold 0 must admit even zero-delta rows (rel = 0 >= 0)"
         );
     }
 

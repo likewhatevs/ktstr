@@ -80,8 +80,11 @@ pub fn compare_partitions(
     policy: &ComparisonPolicy,
     dir: Option<&Path>,
     no_average: bool,
+    phase_opts: &crate::stats::PhaseDisplayOptions,
 ) -> Result<i32> {
-    crate::stats::compare_partitions(filter_a, filter_b, filter, policy, dir, no_average)
+    crate::stats::compare_partitions(
+        filter_a, filter_b, filter, policy, dir, no_average, phase_opts,
+    )
 }
 
 /// Collect the current host context via

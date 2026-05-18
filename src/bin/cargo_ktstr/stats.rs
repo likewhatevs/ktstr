@@ -83,6 +83,11 @@ pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             b_topology,
             b_work_type,
             no_average,
+            no_phases,
+            phases_only,
+            steps_only,
+            phase,
+            phase_threshold,
         }) => {
             // Resolve `--threshold N` / `--policy PATH` / neither
             // into a single `ComparisonPolicy`. Clap's
@@ -204,6 +209,19 @@ pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
                 b_work_type: b_work_type.clone(),
             };
             let (filter_a, filter_b) = build.build();
+            // Bundle the 5 phase-display flags into a single
+            // `PhaseDisplayOptions` value the renderer reads.
+            // Clap's `conflicts_with_all` already enforces the
+            // mutex constraints at parse time, so the struct
+            // construction here can dereference each flag
+            // independently.
+            let phase_opts = ktstr::cli::PhaseDisplayOptions {
+                no_phases: *no_phases,
+                phases_only: *phases_only,
+                steps_only: *steps_only,
+                phase: *phase,
+                phase_threshold: *phase_threshold,
+            };
             let exit = cli::compare_partitions(
                 &filter_a,
                 &filter_b,
@@ -211,6 +229,7 @@ pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
                 &resolved_policy,
                 dir.as_deref(),
                 *no_average,
+                &phase_opts,
             )
             .map_err(|e| format!("{e:#}"))?;
             if exit != 0 {

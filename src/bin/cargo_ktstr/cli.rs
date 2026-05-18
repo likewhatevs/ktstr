@@ -1012,5 +1012,238 @@ pub(crate) enum StatsCommand {
         /// `skipped_failed` gate).
         #[arg(long = "no-average")]
         no_average: bool,
+
+        /// Suppress the per-phase delta tables entirely.
+        ///
+        /// The scalar findings table and footer render
+        /// unchanged, for operators who don't want the
+        /// per-phase surface. Mutually exclusive with every
+        /// other phase flag (`--phases-only`, `--steps-only`,
+        /// `--phase`, `--phase-threshold`).
+        #[arg(
+            long = "no-phases",
+            help_heading = "Phase rendering",
+            conflicts_with_all = ["phases_only", "steps_only", "phase", "phase_threshold"],
+        )]
+        no_phases: bool,
+
+        /// Show ONLY the per-phase tables; suppress the scalar
+        /// findings table and the scalar summary footer (host
+        /// context delta still renders).
+        ///
+        /// Useful for narrowing investigation to a phase
+        /// regression when the scalar rollup is noise. Composes
+        /// with `--steps-only`, `--phase`, and
+        /// `--phase-threshold`.
+        #[arg(
+            long = "phases-only",
+            help_heading = "Phase rendering",
+            conflicts_with = "no_phases",
+        )]
+        phases_only: bool,
+
+        /// Within the per-phase tables, suppress the BASELINE
+        /// bucket (`step_index == 0`) — show only scenario
+        /// Step buckets.
+        ///
+        /// Useful when the BASELINE settle window is dominated
+        /// by scheduler startup transients. Mutually exclusive
+        /// with `--phase` (the single-phase filter).
+        #[arg(
+            long = "steps-only",
+            help_heading = "Phase rendering",
+            conflicts_with_all = ["no_phases", "phase"],
+        )]
+        steps_only: bool,
+
+        /// Within the per-phase tables, show only the named
+        /// phase index. `0` selects BASELINE; `1..=N` selects
+        /// scenario Step ordinals (`1` → Step[0], `2` → Step[1],
+        /// ...).
+        ///
+        /// Integer rather than label so a future label rename
+        /// (`"Step[0]"` → `"Step:0"`) doesn't break operator CI
+        /// invocations. Mutually exclusive with `--steps-only`.
+        #[arg(
+            long = "phase",
+            help_heading = "Phase rendering",
+            conflicts_with_all = ["no_phases", "steps_only"],
+        )]
+        phase: Option<u16>,
+
+        /// Per-row relative-delta gate for the per-phase tables.
+        /// Suppresses paired rows whose
+        /// `|delta| / max(|a|, 1.0) < PCT / 100.0`.
+        ///
+        /// `0` shows every paired row; positive values widen
+        /// the gate to suppress small deltas. ABSENCE shows
+        /// every paired row — the registry's per-metric
+        /// `default_rel` already governs the `is_regression`
+        /// flag at the data layer (sub-threshold rows render
+        /// without the red REGRESSION verdict), so the renderer
+        /// defaults to "show everything; the verdict column
+        /// surfaces what matters." Pass an explicit
+        /// `--phase-threshold` to additionally hide noise rows.
+        /// Independent from `--threshold` — the per-phase and
+        /// scalar passes have separate filters so the operator
+        /// can widen one without widening the other. Mutually
+        /// exclusive with `--no-phases`.
+        #[arg(
+            long = "phase-threshold",
+            help_heading = "Phase rendering",
+            conflicts_with = "no_phases",
+        )]
+        phase_threshold: Option<f64>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- StatsCommand::Compare phase-rendering flag mutex constraints --
+    //
+    // Clap's `conflicts_with` / `conflicts_with_all` annotations on
+    // the 5 phase flags (`--no-phases` / `--phases-only` /
+    // `--steps-only` / `--phase` / `--phase-threshold`) are
+    // load-bearing — they prevent the operator from passing
+    // contradictory flag combinations (e.g. `--no-phases` AND
+    // `--phase 1` which simultaneously requests "no phase render"
+    // and "render only phase 1"). A future refactor that drops
+    // one of those annotations silently re-admits the contradiction
+    // and the renderer reaches an undefined state. The tests below
+    // exercise each documented conflict pair and one negative-case
+    // composition that should parse without error.
+    //
+    // Tests construct argv via `Cargo::try_parse_from(...)` rather
+    // than `StatsCommand::try_parse_from(...)` because Compare is
+    // a Subcommand variant nested under `KtstrCommand::Stats` —
+    // the parser entry point is the top-level Cli.
+
+    fn argv_compare<'a>(extra: &[&'a str]) -> Vec<&'a str> {
+        // Minimum-viable Compare argv: needs at least one per-side
+        // filter so the slicing-dims validation downstream is happy
+        // (the parse step doesn't validate dims, but the canonical
+        // argv shape includes one slicing pair so the tests pin
+        // intended use).
+        let mut v: Vec<&'a str> = vec![
+            "cargo-ktstr",
+            "ktstr",
+            "stats",
+            "compare",
+            "--a-kernel",
+            "6.14",
+            "--b-kernel",
+            "6.15",
+        ];
+        v.extend_from_slice(extra);
+        v
+    }
+
+    /// `--no-phases` paired with `--phases-only` is the cleanest
+    /// contradiction: suppress the entire phase block AND show
+    /// only the phase block. Clap must reject at parse.
+    #[test]
+    fn compare_phase_flags_no_phases_conflicts_with_phases_only() {
+        let argv = argv_compare(&["--no-phases", "--phases-only"]);
+        let result = Cargo::try_parse_from(&argv);
+        let err = match result {
+            Ok(_) => panic!("--no-phases + --phases-only must be rejected"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--no-phases") && msg.contains("--phases-only"),
+            "clap error must name both conflicting flags; got: {msg}",
+        );
+    }
+
+    /// `--no-phases` paired with `--steps-only` contradicts: the
+    /// phase block is suppressed entirely, so "show only steps
+    /// within the phase block" is nonsensical. Clap must reject.
+    #[test]
+    fn compare_phase_flags_no_phases_conflicts_with_steps_only() {
+        let argv = argv_compare(&["--no-phases", "--steps-only"]);
+        assert!(
+            Cargo::try_parse_from(&argv).is_err(),
+            "--no-phases + --steps-only must be rejected",
+        );
+    }
+
+    /// `--no-phases` paired with `--phase 1` contradicts: suppressed
+    /// block can't show a specific phase. Clap must reject.
+    #[test]
+    fn compare_phase_flags_no_phases_conflicts_with_phase_filter() {
+        let argv = argv_compare(&["--no-phases", "--phase", "1"]);
+        assert!(
+            Cargo::try_parse_from(&argv).is_err(),
+            "--no-phases + --phase must be rejected",
+        );
+    }
+
+    /// `--no-phases` paired with `--phase-threshold` contradicts:
+    /// suppressed block can't apply a row-significance filter.
+    /// Clap must reject.
+    #[test]
+    fn compare_phase_flags_no_phases_conflicts_with_phase_threshold() {
+        let argv = argv_compare(&["--no-phases", "--phase-threshold", "5"]);
+        assert!(
+            Cargo::try_parse_from(&argv).is_err(),
+            "--no-phases + --phase-threshold must be rejected",
+        );
+    }
+
+    /// `--steps-only` paired with `--phase 1` contradicts: one
+    /// collapses to a single bucket, the other suppresses
+    /// BASELINE — both together are confused phrasing (if N=0,
+    /// `--steps-only` suppresses it; if N>=1, `--steps-only` is
+    /// redundant). Clap must reject.
+    #[test]
+    fn compare_phase_flags_steps_only_conflicts_with_phase_filter() {
+        let argv = argv_compare(&["--steps-only", "--phase", "1"]);
+        assert!(
+            Cargo::try_parse_from(&argv).is_err(),
+            "--steps-only + --phase must be rejected",
+        );
+    }
+
+    /// `--phases-only` + `--steps-only` + `--phase-threshold`
+    /// composes — no conflict annotations gate any of the three
+    /// against each other. Pins the composability contract:
+    /// a refactor that adds a stricter conflict annotation
+    /// would break this test, surfacing the over-restriction
+    /// before it ships.
+    #[test]
+    fn compare_phase_flags_phases_only_composes_with_steps_only_and_threshold() {
+        let argv = argv_compare(&[
+            "--phases-only",
+            "--steps-only",
+            "--phase-threshold",
+            "5",
+        ]);
+        assert!(
+            Cargo::try_parse_from(&argv).is_ok(),
+            "--phases-only + --steps-only + --phase-threshold must parse cleanly",
+        );
+    }
+
+    /// `--phases-only` + `--phase 1` + `--phase-threshold 5`
+    /// composes because all three are non-conflicting (they
+    /// project on different axes: section suppression × specific
+    /// phase × per-row significance gate). Sibling negative-case
+    /// sentinel to the steps-only composition above.
+    #[test]
+    fn compare_phase_flags_phases_only_composes_with_phase_filter_and_threshold() {
+        let argv = argv_compare(&[
+            "--phases-only",
+            "--phase",
+            "1",
+            "--phase-threshold",
+            "5",
+        ]);
+        assert!(
+            Cargo::try_parse_from(&argv).is_ok(),
+            "--phases-only + --phase + --phase-threshold must parse cleanly",
+        );
+    }
 }
