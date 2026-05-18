@@ -1909,16 +1909,16 @@ fn snapshot_bridge_store_with_stats_round_trips() {
     bridge.store("periodic_001", FailureDumpReport::default());
     let drained = bridge.drain_ordered_with_stats();
     assert_eq!(drained.len(), 2);
-    assert_eq!(drained[0].0, "periodic_000");
-    assert_eq!(drained[0].2, Ok(stats));
-    assert_eq!(drained[0].3, Some(123));
-    assert_eq!(drained[1].0, "periodic_001");
+    assert_eq!(drained[0].tag, "periodic_000");
+    assert_eq!(drained[0].stats, Ok(stats));
+    assert_eq!(drained[0].elapsed_ms, Some(123));
+    assert_eq!(drained[1].tag, "periodic_001");
     assert_eq!(
-        drained[1].2,
+        drained[1].stats,
         Err(crate::scenario::snapshot::MissingStatsReason::NoSchedulerBinary),
         "non-stats store collapses to NoSchedulerBinary",
     );
-    assert!(drained[1].3.is_none());
+    assert!(drained[1].elapsed_ms.is_none());
 }
 
 /// FIFO eviction at `MAX_STORED_SNAPSHOTS` sweeps the parallel
@@ -1945,15 +1945,15 @@ fn snapshot_bridge_store_with_stats_evicts_in_lockstep() {
     );
     let drained = bridge.drain_ordered_with_stats();
     // tag_0000 must be evicted.
-    let names: Vec<&str> = drained.iter().map(|(n, _, _, _)| n.as_str()).collect();
+    let names: Vec<&str> = drained.iter().map(|e| e.tag.as_str()).collect();
     assert!(!names.contains(&"tag_0000"));
     // Newest must be present with its parallel data.
     let last = drained
         .iter()
-        .find(|(n, _, _, _)| n == &overflow_tag)
+        .find(|e| e.tag == overflow_tag)
         .expect("overflow tag resident after evict");
-    assert_eq!(last.2, Ok(serde_json::json!({"overflow": true})));
-    assert_eq!(last.3, Some(9_999));
+    assert_eq!(last.stats, Ok(serde_json::json!({"overflow": true})));
+    assert_eq!(last.elapsed_ms, Some(9_999));
 }
 
 /// Overwriting a tag with a `None` stats slot clears the prior
@@ -1976,11 +1976,11 @@ fn snapshot_bridge_store_with_stats_overwrite_clears_stale_values() {
     let drained = bridge.drain_ordered_with_stats();
     assert_eq!(drained.len(), 1);
     assert_eq!(
-        drained[0].2,
+        drained[0].stats,
         Err(crate::scenario::snapshot::MissingStatsReason::NoSchedulerBinary),
         "cleared stats slot collapses to NoSchedulerBinary",
     );
-    assert!(drained[0].3.is_none());
+    assert!(drained[0].elapsed_ms.is_none());
 }
 
 // ---------- stats_path JSON accessor ----------
@@ -3010,7 +3010,7 @@ fn snapshot_bridge_event_drain_ordering_invariant_violation_drain_ordered_with_s
     }
     let drained = bridge.drain_ordered_with_stats();
     assert_eq!(drained.len(), 1, "orphan must surface at the tail");
-    assert_eq!(drained[0].0, "orphan_tag");
+    assert_eq!(drained[0].tag, "orphan_tag");
     let events = bridge.drain_events();
     assert_eq!(events.len(), 1);
     match &events[0] {

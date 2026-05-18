@@ -230,11 +230,20 @@ impl SampleSeries {
     ) -> Self {
         let rows = drained
             .into_iter()
-            .map(|(tag, report, stats, elapsed_ms)| SampleRow {
-                tag,
-                report,
-                stats,
-                elapsed_ms: elapsed_ms.unwrap_or(0),
+            .map(|entry| {
+                let crate::scenario::snapshot::DrainedSnapshotEntry {
+                    tag,
+                    report,
+                    stats,
+                    elapsed_ms,
+                    ..
+                } = entry;
+                SampleRow {
+                    tag,
+                    report,
+                    stats,
+                    elapsed_ms: elapsed_ms.unwrap_or(0),
+                }
             })
             .collect();
         Self { rows, monitor }

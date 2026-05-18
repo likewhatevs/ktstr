@@ -478,8 +478,7 @@ impl std::error::Error for SnapshotError {}
 pub type SnapshotResult<T> = std::result::Result<T, SnapshotError>;
 
 /// Typed shape of one entry drained from the snapshot bridge's
-/// ordered per-tag store. Each tuple is `(tag, report, stats,
-/// elapsed_ms)`:
+/// ordered per-tag store. Fields:
 /// * `tag`: snapshot name the report was stored under.
 /// * `report`: [`crate::monitor::dump::FailureDumpReport`] of the
 ///   captured guest state.
@@ -487,14 +486,26 @@ pub type SnapshotResult<T> = std::result::Result<T, SnapshotError>;
 ///   [`MissingStatsReason`] when capture happened without a
 ///   wired stats client.
 /// * `elapsed_ms`: optional wall-clock anchor (ms since run-start).
+/// * `step_index`: scenario phase index stamped at capture time.
+///   `Some(idx)` for captures stored via the step-aware entry
+///   points ([`crate::scenario::snapshot::SnapshotBridge::capture_with_step`]
+///   or [`crate::scenario::snapshot::SnapshotBridge::store_with_stats_and_step`]);
+///   `None` for fixture-injected captures via the unstamped legacy
+///   paths ([`crate::scenario::snapshot::SnapshotBridge::capture`]
+///   / [`crate::scenario::snapshot::SnapshotBridge::store`]
+///   / [`crate::scenario::snapshot::SnapshotBridge::store_with_stats`]).
 ///
 /// Used by [`crate::scenario::snapshot::SnapshotBridge::drain_ordered_with_stats`]
-/// and [`crate::scenario::sample::SampleSeries::from_drained_typed`]
-/// to avoid restating the 4-tuple shape at every consumer (which
-/// trips clippy's `type_complexity` lint).
-pub type DrainedSnapshotEntry = (
-    String,
-    crate::monitor::dump::FailureDumpReport,
-    std::result::Result<serde_json::Value, MissingStatsReason>,
-    Option<u64>,
-);
+/// and [`crate::scenario::sample::SampleSeries::from_drained_typed`].
+/// `#[non_exhaustive]` so future additive fields stay
+/// pattern-match-compatible via rest-pattern destructure
+/// (`DrainedSnapshotEntry { tag, report, .. }`).
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct DrainedSnapshotEntry {
+    pub tag: String,
+    pub report: crate::monitor::dump::FailureDumpReport,
+    pub stats: std::result::Result<serde_json::Value, MissingStatsReason>,
+    pub elapsed_ms: Option<u64>,
+    pub step_index: Option<u16>,
+}

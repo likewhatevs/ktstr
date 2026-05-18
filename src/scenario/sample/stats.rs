@@ -269,20 +269,22 @@ mod tests {
 
     #[test]
     fn stats_projection_handles_missing_stats_as_error() {
-        use crate::scenario::snapshot::MissingStatsReason;
+        use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
         let drained = vec![
-            (
-                "periodic_000".to_string(),
-                synthetic_report(10),
-                Ok(synthetic_stats(50.0)),
-                Some(100),
-            ),
-            (
-                "periodic_001".to_string(),
-                synthetic_report(20),
-                Err(MissingStatsReason::NoSchedulerBinary),
-                Some(200),
-            ),
+            DrainedSnapshotEntry {
+                tag: "periodic_000".to_string(),
+                report: synthetic_report(10),
+                stats: Ok(synthetic_stats(50.0)),
+                elapsed_ms: Some(100),
+                step_index: None,
+            },
+            DrainedSnapshotEntry {
+                tag: "periodic_001".to_string(),
+                report: synthetic_report(20),
+                stats: Err(MissingStatsReason::NoSchedulerBinary),
+                elapsed_ms: Some(200),
+                step_index: None,
+            },
         ];
         let series = SampleSeries::from_drained_typed(drained, None);
         let field: SeriesField<f64> = series.stats("busy", |s| s.path("busy").as_f64());

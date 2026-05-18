@@ -291,6 +291,19 @@ pub(super) struct SnapshotStore {
     /// [`SnapshotBridge::drain_ordered_with_stats`] to populate
     /// `Sample::elapsed_ms` without recomputing.
     pub(super) elapsed_ms: HashMap<String, u64>,
+    /// Per-VM scenario step index stamped on the capture by the
+    /// step-aware entry points
+    /// ([`SnapshotBridge::capture_with_step`] /
+    /// [`SnapshotBridge::store_with_stats_and_step`]). Absent for
+    /// fixture-injected captures stored via the unstamped legacy
+    /// paths ([`SnapshotBridge::capture`] / [`SnapshotBridge::store`]
+    /// / [`SnapshotBridge::store_with_stats`]). Encoded per the
+    /// 1-indexed phase convention (`0` = BASELINE, `1..=N` = Step
+    /// ordinals); drained in lock-step with `reports` / `stats` /
+    /// `elapsed_ms` and surfaced as the
+    /// [`super::error::DrainedSnapshotEntry::step_index`] field so
+    /// the phase-aware aggregator can bucket each sample directly.
+    pub(super) step_index: HashMap<String, u16>,
     /// Insertion order of currently-resident keys. An overwrite of
     /// an existing key MUST remove the prior entry from this deque
     /// before pushing the fresh occurrence so the `reports.len()`
@@ -325,6 +338,7 @@ impl SnapshotStore {
             reports: HashMap::new(),
             stats: HashMap::new(),
             elapsed_ms: HashMap::new(),
+            step_index: HashMap::new(),
             order: VecDeque::new(),
             events: Vec::new(),
             events_dropped: 0,
@@ -632,6 +646,41 @@ impl SnapshotBridge {
         true
     }
 
+    /// Step-aware variant of [`Self::capture`]: drives the capture
+    /// closure and stores the result under `name`, stamping it with
+    /// `step_index` so the drained entry's
+    /// [`super::error::DrainedSnapshotEntry::step_index`] surfaces
+    /// the scenario phase the capture belongs to.
+    ///
+    /// `step_index` is encoded per the 1-indexed phase convention:
+    /// `0` is the BASELINE settle window, `1..=N` align with
+    /// scenario Step ordinals. The host-side on-demand-capture
+    /// dispatch reads
+    /// [`crate::scenario::Ctx::current_step`] just before the
+    /// freeze rendezvous and passes the loaded value through this
+    /// entry point so the downstream phase aggregator can bucket
+    /// the sample directly.
+    ///
+    /// Returns `true` when a report was captured and stored;
+    /// `false` when the closure returned `None`.
+    pub fn capture_with_step(&self, name: &str, step_index: u16) -> bool {
+        let Some(report) = (self.capture)(name) else {
+            tracing::warn!(
+                name,
+                step_index,
+                "SnapshotBridge::capture_with_step: capture callback returned None — snapshot unavailable"
+            );
+            self.snapshots
+                .lock_unpoisoned()
+                .push_event(SnapshotBridgeEvent::CaptureUnavailable {
+                    tag: name.to_string(),
+                });
+            return false;
+        };
+        self.store_internal(name, report, None, None, Some(step_index));
+        true
+    }
+
     /// Store a pre-built [`FailureDumpReport`] under `name`,
     /// bypassing the capture callback. Used by the host-side freeze
     /// coordinator after it runs `freeze_and_capture(false)` and
@@ -646,7 +695,7 @@ impl SnapshotBridge {
     /// of an existing tag also warns and replaces the prior report
     /// in place without disturbing FIFO ordering of other entries.
     pub fn store(&self, name: &str, report: FailureDumpReport) {
-        self.store_internal(name, report, None, None);
+        self.store_internal(name, report, None, None, None);
     }
 
     /// Bundle a [`FailureDumpReport`] with the scx_stats JSON and
@@ -669,7 +718,33 @@ impl SnapshotBridge {
         stats: Option<Result<serde_json::Value, super::error::MissingStatsReason>>,
         elapsed_ms: Option<u64>,
     ) {
-        self.store_internal(name, report, stats, elapsed_ms);
+        self.store_internal(name, report, stats, elapsed_ms, None);
+    }
+
+    /// Step-aware variant of [`Self::store_with_stats`]: bundles the
+    /// scenario phase index alongside the report / stats / elapsed
+    /// tuple so the drained entry's
+    /// [`super::error::DrainedSnapshotEntry::step_index`] carries
+    /// the phase the capture belongs to. The freeze coordinator's
+    /// periodic-fire path reads
+    /// [`crate::scenario::Ctx::current_step`] just before the
+    /// rendezvous and routes the value through this method so each
+    /// periodic sample is bucketable per phase without a second
+    /// lookup.
+    ///
+    /// `step_index` is encoded per the 1-indexed phase convention
+    /// — `0` is the BASELINE settle window, `1..=N` align with
+    /// scenario Step ordinals. All other arguments match
+    /// [`Self::store_with_stats`] verbatim.
+    pub fn store_with_stats_and_step(
+        &self,
+        name: &str,
+        report: FailureDumpReport,
+        stats: Option<Result<serde_json::Value, super::error::MissingStatsReason>>,
+        elapsed_ms: Option<u64>,
+        step_index: u16,
+    ) {
+        self.store_internal(name, report, stats, elapsed_ms, Some(step_index));
     }
 
     fn store_internal(
@@ -678,6 +753,7 @@ impl SnapshotBridge {
         report: FailureDumpReport,
         stats: Option<Result<serde_json::Value, super::error::MissingStatsReason>>,
         elapsed_ms: Option<u64>,
+        step_index: Option<u16>,
     ) {
         let mut store = self.snapshots.lock_unpoisoned();
         if let Some(existing) = store.reports.insert(name.to_string(), report) {
@@ -720,6 +796,14 @@ impl SnapshotBridge {
                     store.elapsed_ms.remove(name);
                 }
             }
+            match step_index {
+                Some(v) => {
+                    store.step_index.insert(name.to_string(), v);
+                }
+                None => {
+                    store.step_index.remove(name);
+                }
+            }
             return;
         }
         store.order.push_back(name.to_string());
@@ -728,6 +812,9 @@ impl SnapshotBridge {
         }
         if let Some(v) = elapsed_ms {
             store.elapsed_ms.insert(name.to_string(), v);
+        }
+        if let Some(v) = step_index {
+            store.step_index.insert(name.to_string(), v);
         }
         while store.reports.len() > MAX_STORED_SNAPSHOTS {
             let Some(evicted) = store.order.pop_front() else {
@@ -747,6 +834,7 @@ impl SnapshotBridge {
                 store.reports.clear();
                 store.stats.clear();
                 store.elapsed_ms.clear();
+                store.step_index.clear();
                 break;
             };
             if store.reports.remove(&evicted).is_some() {
@@ -762,9 +850,11 @@ impl SnapshotBridge {
                 });
             }
             // Sweep the parallel maps in lock-step so a stranded
-            // stats / elapsed entry cannot outlive its report.
+            // stats / elapsed / step_index entry cannot outlive its
+            // report.
             store.stats.remove(&evicted);
             store.elapsed_ms.remove(&evicted);
+            store.step_index.remove(&evicted);
         }
     }
 
@@ -801,6 +891,7 @@ impl SnapshotBridge {
         store.order.clear();
         store.stats.clear();
         store.elapsed_ms.clear();
+        store.step_index.clear();
         std::mem::take(&mut store.reports)
     }
 
@@ -828,11 +919,12 @@ impl SnapshotBridge {
         let mut store = self.snapshots.lock_unpoisoned();
         let order = std::mem::take(&mut store.order);
         let mut reports = std::mem::take(&mut store.reports);
-        // Stats / elapsed are dropped with the bridge — callers
-        // that need the parallel data must use
+        // Stats / elapsed / step_index are dropped with the bridge —
+        // callers that need the parallel data must use
         // `drain_ordered_with_stats` instead.
         store.stats.clear();
         store.elapsed_ms.clear();
+        store.step_index.clear();
         let mut out: Vec<(String, FailureDumpReport)> = Vec::with_capacity(order.len());
         for tag in order {
             if let Some(report) = reports.remove(&tag) {
@@ -884,6 +976,7 @@ impl SnapshotBridge {
         let mut reports = std::mem::take(&mut store.reports);
         let mut stats = std::mem::take(&mut store.stats);
         let mut elapsed = std::mem::take(&mut store.elapsed_ms);
+        let mut step_index = std::mem::take(&mut store.step_index);
         let mut out: Vec<super::error::DrainedSnapshotEntry> = Vec::with_capacity(order.len());
         // Bridge-absent stats slot collapses to the typed
         // `NoSchedulerBinary` reason: the capture path that produced
@@ -896,15 +989,22 @@ impl SnapshotBridge {
             if let Some(report) = reports.remove(&tag) {
                 let s = stats.remove(&tag).unwrap_or_else(stats_fallback);
                 let e = elapsed.remove(&tag);
-                out.push((tag, report, s, e));
+                let phase = step_index.remove(&tag);
+                out.push(super::error::DrainedSnapshotEntry {
+                    tag,
+                    report,
+                    stats: s,
+                    elapsed_ms: e,
+                    step_index: phase,
+                });
             }
         }
         // Defensive tail for desynchronised maps (matches
-        // `drain_ordered`'s tail behaviour). Any stats / elapsed
-        // entries that were not paired with a tag in `order` are
-        // dropped because they have no anchoring report — surfacing
-        // them as orphaned tuples would invent a structure no
-        // consumer expects.
+        // `drain_ordered`'s tail behaviour). Any stats / elapsed /
+        // step_index entries that were not paired with a tag in
+        // `order` are dropped because they have no anchoring report
+        // — surfacing them as orphaned tuples would invent a structure
+        // no consumer expects.
         for (tag, report) in reports {
             tracing::warn!(
                 tag,
@@ -918,7 +1018,14 @@ impl SnapshotBridge {
             });
             let s = stats.remove(&tag).unwrap_or_else(stats_fallback);
             let e = elapsed.remove(&tag);
-            out.push((tag, report, s, e));
+            let phase = step_index.remove(&tag);
+            out.push(super::error::DrainedSnapshotEntry {
+                tag,
+                report,
+                stats: s,
+                elapsed_ms: e,
+                step_index: phase,
+            });
         }
         out
     }
