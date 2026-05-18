@@ -74,7 +74,7 @@
 //! stderr line explains the no-op.
 
 use anyhow::{Context, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Sentinel filter expression emitted when the pool has no
@@ -152,9 +152,199 @@ pub(crate) fn run_replay(
         return Ok(0);
     }
 
-    invoke_nextest(&filter_expr).with_context(|| {
+    // Snapshot the failed names BEFORE invoking nextest so we
+    // can re-look them up in the post-exec pool. `failed_names`
+    // is a `BTreeSet<&str>` borrowing from the pre-exec pool;
+    // own the strings so the references survive the
+    // post-exec re-scan that builds a fresh pool Vec.
+    let queued: BTreeSet<String> = failed_names.iter().map(|s| s.to_string()).collect();
+
+    let exit = invoke_nextest(&filter_expr).with_context(|| {
         format!("ktstr replay: cargo nextest run -E {filter_expr:?} failed to spawn")
-    })
+    })?;
+
+    // Post-exec outcome diff. Re-scan the sidecar pool so the
+    // newly-written sidecars from the replay run reach the
+    // classification. nextest's sidecar writes hit deterministic
+    // paths per (test_name, topology, scheduler), so the new
+    // contents overwrite the old contents in-place; the pool
+    // re-collection reads the post-replay state.
+    let post_pool = ktstr::test_support::collect_pool(&root);
+    let queued_refs: BTreeSet<&str> = queued.iter().map(String::as_str).collect();
+    let outcomes = classify_replay(&queued_refs, &post_pool);
+    render_outcome_diff(&outcomes);
+
+    Ok(exit)
+}
+
+/// Per-test outcome classification after a replay invocation.
+/// Each test_name in the pre-exec failed set lands in exactly
+/// one variant based on the post-exec sidecar pool — with one
+/// crucial wrinkle: a test_name with multiple sidecars (one
+/// per topology × scheduler variant) may have variants that
+/// disagree. The classifier surfaces that disagreement as
+/// [`Self::Mixed`] rather than silently collapsing to "any
+/// variant passed = fixed" — silent collapse would let a
+/// half-broken parameterized test report green, which is
+/// the silent-drop failure mode this surface exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReplayOutcome {
+    /// EVERY post-replay sidecar for the test_name reports
+    /// `passed=true && !skipped`. Either the fix landed
+    /// between the original run and this replay, or the test
+    /// was passing intermittently (flake) and now passes.
+    /// Operator sees a green signal here.
+    Fixed,
+    /// EVERY post-replay sidecar for the test_name reports
+    /// `!passed || skipped`. The load-bearing case the replay
+    /// command exists to surface: a regression that survived
+    /// the operator's change.
+    Persistent,
+    /// Test_name has no post-replay sidecar. Three plausible
+    /// causes the operator should triage in order:
+    /// - The test was removed from the suite between runs.
+    /// - The `--filter` narrowed past it.
+    /// - nextest crashed before reaching the test.
+    /// The classifier itself doesn't distinguish — the inline
+    /// triage hint in [`render_outcome_diff`] surfaces all
+    /// three causes for the operator.
+    Dropped,
+    /// Test_name has multiple post-replay sidecars and they
+    /// DISAGREE — at least one passed and at least one failed.
+    /// Common when a parameterized test runs across topology
+    /// variants and only some variants reproduce the
+    /// regression. The operator MUST drill in to see which
+    /// variant is still red; surfacing this as `Fixed` would
+    /// silently hide the failing variant.
+    ///
+    /// Never collapse variant disagreement — that would silently
+    /// hide a failing variant behind a passing one.
+    Mixed {
+        /// Count of post-replay sidecars for this test_name
+        /// that passed.
+        fixed_count: usize,
+        /// Count of post-replay sidecars for this test_name
+        /// that failed or skipped.
+        persistent_count: usize,
+    },
+}
+
+
+/// Classify the replay outcome for each test_name in `queued`
+/// against the post-replay sidecar pool. Returns a BTreeMap so
+/// the renderer iterates in deterministic ascending order.
+///
+/// Lookup strategy: group `post_pool` by test_name into a
+/// `BTreeMap<&str, Vec<&SidecarResult>>` so EVERY topology ×
+/// scheduler variant for a name is visible. Then for each
+/// queued name:
+/// - Empty group → [`ReplayOutcome::Dropped`]
+/// - All variants passed && !skipped → [`ReplayOutcome::Fixed`]
+/// - All variants failed/skipped → [`ReplayOutcome::Persistent`]
+/// - Variants disagree → [`ReplayOutcome::Mixed`] carrying
+///   per-side counts so the operator sees the disagreement
+///   instead of an erroneously-green verdict.
+///
+/// The Mixed case is the load-bearing addition over a naive
+/// "any-variant-fixed" semantic: collapsing variant
+/// disagreement to Fixed is a silent drop — a parameterized
+/// test where variant A is fixed and variant B is still red
+/// would silently report green.
+pub(crate) fn classify_replay<'a>(
+    queued: &'a BTreeSet<&'a str>,
+    post_pool: &'a [ktstr::test_support::SidecarResult],
+) -> BTreeMap<&'a str, ReplayOutcome> {
+    let mut by_name: BTreeMap<&str, Vec<&ktstr::test_support::SidecarResult>> = BTreeMap::new();
+    for sc in post_pool {
+        by_name.entry(sc.test_name.as_str()).or_default().push(sc);
+    }
+    queued
+        .iter()
+        .map(|name| {
+            let outcome = match by_name.get(name) {
+                None => ReplayOutcome::Dropped,
+                Some(variants) => {
+                    let fixed_count = variants
+                        .iter()
+                        .filter(|sc| sc.passed && !sc.skipped)
+                        .count();
+                    let persistent_count = variants.len() - fixed_count;
+                    match (fixed_count, persistent_count) {
+                        (n, 0) if n > 0 => ReplayOutcome::Fixed,
+                        (0, n) if n > 0 => ReplayOutcome::Persistent,
+                        _ => ReplayOutcome::Mixed {
+                            fixed_count,
+                            persistent_count,
+                        },
+                    }
+                }
+            };
+            (*name, outcome)
+        })
+        .collect()
+}
+
+/// Render the outcome-diff summary to stderr (the narrative
+/// stream — stdout stays clean for the dry-run filter path,
+/// which is the primary pipeable surface). Header line carries
+/// the counts; per-test lines name each PERSISTENT/DROPPED
+/// entry so the operator can drill in without parsing nextest
+/// output. FIXED entries are aggregated to a count only to
+/// keep the diff short on healthy days; the operator who wants
+/// per-test FIXED detail can grep the live nextest output above.
+fn render_outcome_diff(outcomes: &BTreeMap<&str, ReplayOutcome>) {
+    let (mut fixed, mut persistent, mut dropped, mut mixed) = (0usize, 0usize, 0usize, 0usize);
+    for o in outcomes.values() {
+        match o {
+            ReplayOutcome::Fixed => fixed += 1,
+            ReplayOutcome::Persistent => persistent += 1,
+            ReplayOutcome::Dropped => dropped += 1,
+            ReplayOutcome::Mixed { .. } => mixed += 1,
+        }
+    }
+    eprintln!();
+    eprintln!(
+        "ktstr replay: {fixed} FIXED, {persistent} PERSISTENT, {mixed} MIXED, {dropped} DROPPED",
+    );
+    if persistent > 0 || dropped > 0 || mixed > 0 {
+        for (name, outcome) in outcomes {
+            match outcome {
+                ReplayOutcome::Persistent => {
+                    eprintln!("  PERSISTENT {name}");
+                }
+                ReplayOutcome::Dropped => {
+                    // Triage hint: the operator sees DROPPED
+                    // with zero context without this. Listing
+                    // the 3 plausible causes inline turns an
+                    // opaque verdict into actionable diagnosis
+                    // (test removed is the most common cause,
+                    // --filter narrowed second-most-common,
+                    // nextest crash a distant third).
+                    eprintln!(
+                        "  DROPPED {name} \
+                         (not run — test removed, --filter narrowed past, \
+                         or nextest skipped/crashed before reaching it)",
+                    );
+                }
+                ReplayOutcome::Mixed {
+                    fixed_count,
+                    persistent_count,
+                } => {
+                    // Surface variant disagreement explicitly:
+                    // a parameterized test with some variants
+                    // fixed and some still red must NOT collapse
+                    // to a green Fixed verdict.
+                    eprintln!(
+                        "  MIXED {name} \
+                         ({fixed_count} variant(s) fixed, \
+                         {persistent_count} variant(s) still failing — \
+                         drill into the per-variant sidecars to triage)",
+                    );
+                }
+                ReplayOutcome::Fixed => {}
+            }
+        }
+    }
 }
 
 /// Select the set of test_names from `pool` whose sidecars
@@ -418,6 +608,161 @@ mod tests {
         assert!(
             result.is_empty(),
             "failed+skipped must be excluded; the && !skipped guard is load-bearing"
+        );
+    }
+
+    // -- classify_replay (phase 3 outcome diff) --
+
+    /// Test was failing in pre-replay; post-replay sidecar
+    /// reports passed=true → FIXED. Pins the primary "happy
+    /// path" outcome — the operator fixed the bug between runs.
+    #[test]
+    fn classify_replay_failing_then_passing_classifies_as_fixed() {
+        let post_pool = synth_pool(&[("test_fix_me", true, false)]);
+        let queued: BTreeSet<&str> = ["test_fix_me"].iter().copied().collect();
+        let outcomes = classify_replay(&queued, &post_pool);
+        assert_eq!(outcomes.get("test_fix_me"), Some(&ReplayOutcome::Fixed));
+    }
+
+    /// Test was failing in pre-replay; post-replay sidecar
+    /// still reports passed=false → PERSISTENT. The
+    /// load-bearing case the replay command exists to surface:
+    /// the operator's fix didn't take.
+    #[test]
+    fn classify_replay_still_failing_classifies_as_persistent() {
+        let post_pool = synth_pool(&[("test_still_broken", false, false)]);
+        let queued: BTreeSet<&str> = ["test_still_broken"].iter().copied().collect();
+        let outcomes = classify_replay(&queued, &post_pool);
+        assert_eq!(
+            outcomes.get("test_still_broken"),
+            Some(&ReplayOutcome::Persistent)
+        );
+    }
+
+    /// Test was failing in pre-replay but missing from
+    /// post-pool → DROPPED. Triage candidates: test removed,
+    /// --filter narrowed past, nextest crashed before
+    /// reaching it. The classifier doesn't distinguish; the
+    /// operator triages from context.
+    #[test]
+    fn classify_replay_missing_from_post_pool_classifies_as_dropped() {
+        let post_pool = synth_pool(&[("unrelated_test", true, false)]);
+        let queued: BTreeSet<&str> = ["test_was_removed"].iter().copied().collect();
+        let outcomes = classify_replay(&queued, &post_pool);
+        assert_eq!(
+            outcomes.get("test_was_removed"),
+            Some(&ReplayOutcome::Dropped)
+        );
+    }
+
+    /// Mixed pool exercises all three branches in one call:
+    /// FIXED + PERSISTENT + DROPPED in deterministic
+    /// ascending order via the BTreeMap iteration. Pins both
+    /// the per-test classification AND the multi-test
+    /// orchestration through `classify_replay`.
+    #[test]
+    fn classify_replay_mixed_outcomes_classifies_each_correctly() {
+        let post_pool = synth_pool(&[
+            ("test_a_fixed", true, false),
+            ("test_b_persistent", false, false),
+            // test_c_dropped absent from post_pool by design
+            ("unrelated_pass", true, false),
+        ]);
+        let queued: BTreeSet<&str> = ["test_a_fixed", "test_b_persistent", "test_c_dropped"]
+            .iter()
+            .copied()
+            .collect();
+        let outcomes = classify_replay(&queued, &post_pool);
+        assert_eq!(outcomes.len(), 3, "every queued name gets exactly one outcome");
+        assert_eq!(outcomes.get("test_a_fixed"), Some(&ReplayOutcome::Fixed));
+        assert_eq!(
+            outcomes.get("test_b_persistent"),
+            Some(&ReplayOutcome::Persistent)
+        );
+        assert_eq!(
+            outcomes.get("test_c_dropped"),
+            Some(&ReplayOutcome::Dropped)
+        );
+    }
+
+    /// Post-replay sidecar that reports `passed=true skipped=true`
+    /// (the SidecarResult "skipped" convention) classifies as
+    /// PERSISTENT, NOT Fixed. A skipped re-run is not a pass —
+    /// the test didn't actually run, so the original failure
+    /// isn't validated as fixed. Pin the `&& !sc.skipped` guard
+    /// in classify_replay against a future regression that
+    /// treats skipped as passed.
+    #[test]
+    fn classify_replay_post_skipped_is_persistent_not_fixed() {
+        let post_pool = synth_pool(&[("test_skipped", true, true)]);
+        let queued: BTreeSet<&str> = ["test_skipped"].iter().copied().collect();
+        let outcomes = classify_replay(&queued, &post_pool);
+        assert_eq!(
+            outcomes.get("test_skipped"),
+            Some(&ReplayOutcome::Persistent),
+            "post-replay skipped means the original failure is unvalidated; \
+             classifier must NOT treat skip as Fixed"
+        );
+    }
+
+    /// Test_name with 2 post-replay sidecars (variants) where
+    /// one passed and one failed → Mixed. The classifier must
+    /// NOT silently collapse variant disagreement to Fixed.
+    /// Surfacing as Mixed lets the operator drill in instead
+    /// of mistakenly closing the bug.
+    #[test]
+    fn classify_replay_mixed_variants_classifies_as_mixed() {
+        let post_pool = synth_pool(&[
+            ("test_param", true, false),  // variant A: fixed
+            ("test_param", false, false), // variant B: still failing
+        ]);
+        let queued: BTreeSet<&str> = ["test_param"].iter().copied().collect();
+        let outcomes = classify_replay(&queued, &post_pool);
+        assert_eq!(
+            outcomes.get("test_param"),
+            Some(&ReplayOutcome::Mixed {
+                fixed_count: 1,
+                persistent_count: 1,
+            }),
+            "variant disagreement must surface as Mixed; \
+             silent collapse to Fixed would hide the failing variant"
+        );
+    }
+
+    /// All variants pass → Fixed (not Mixed). Pins the
+    /// "every sidecar passed" branch of the new variant-aware
+    /// classifier against the all-pass case.
+    #[test]
+    fn classify_replay_all_variants_pass_classifies_as_fixed() {
+        let post_pool = synth_pool(&[
+            ("test_consistent", true, false),
+            ("test_consistent", true, false),
+            ("test_consistent", true, false),
+        ]);
+        let queued: BTreeSet<&str> = ["test_consistent"].iter().copied().collect();
+        let outcomes = classify_replay(&queued, &post_pool);
+        assert_eq!(
+            outcomes.get("test_consistent"),
+            Some(&ReplayOutcome::Fixed),
+            "3-of-3 variants passed → Fixed, not Mixed"
+        );
+    }
+
+    /// All variants fail → Persistent. Pins the "every sidecar
+    /// failed" branch — a parameterized test that's broken on
+    /// every variant should not silently become Mixed.
+    #[test]
+    fn classify_replay_all_variants_fail_classifies_as_persistent() {
+        let post_pool = synth_pool(&[
+            ("test_broken", false, false),
+            ("test_broken", false, false),
+        ]);
+        let queued: BTreeSet<&str> = ["test_broken"].iter().copied().collect();
+        let outcomes = classify_replay(&queued, &post_pool);
+        assert_eq!(
+            outcomes.get("test_broken"),
+            Some(&ReplayOutcome::Persistent),
+            "2-of-2 variants failed → Persistent, not Mixed"
         );
     }
 }
