@@ -1260,6 +1260,79 @@ impl CgroupStats {
     }
 }
 
+/// Per-phase metric bucket — one entry per scenario phase in
+/// [`ScenarioStats::phases`].
+///
+/// A scenario with N Steps yields `N + 1` phases: phase 0 is the
+/// BASELINE (pre-first-Step settle window), and phases 1..=N
+/// correspond to Step 0..Step N-1 in scenario order. The
+/// 1-indexed Step encoding (instead of 0-indexed) lets BASELINE
+/// own `step_index = 0` unambiguously — a `step_index = 0` sample
+/// is always settle, not first-Step.
+///
+/// Each bucket carries the metric values reduced over the phase's
+/// sample window. For [`crate::stats::MetricKind::Counter`]
+/// metrics the reduction is `last - first` across the phase's
+/// periodic samples (cumulative-counter delta); for `Gauge` /
+/// `Peak` / `Timestamp` it dispatches per the kind via
+/// [`crate::stats::aggregate_samples`]. Missing metric keys mean
+/// the phase had no finite samples for that metric.
+///
+/// Metric keys match [`crate::stats::MetricDef::name`] — see
+/// [`crate::stats::METRICS`] for the canonical list of registered
+/// metric names a `get` / `phase_metric` lookup expects.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize, crate::Claim)]
+pub struct PhaseBucket {
+    /// Phase index. `0` = BASELINE (pre-first-Step settle window).
+    /// `1..=N` align with Step ordinals (1-indexed): Step 0 of the
+    /// scenario lives at `step_index = 1`, Step 1 at
+    /// `step_index = 2`, etc. The encoding avoids the collision
+    /// where a 0-indexed Step would share `step_index = 0` with
+    /// the BASELINE settle window.
+    pub step_index: u16,
+    /// Human-readable label. `"BASELINE"` for `step_index = 0`,
+    /// `"Step[0]"` / `"Step[1]"` / ... for `step_index = 1..=N`.
+    /// Mirrors the formatting used by
+    /// [`crate::timeline::Timeline`]'s phase rendering so operator
+    /// inspection of the formatted diagnostic and the structured
+    /// sidecar yield the same phase identifiers.
+    pub label: String,
+    /// Phase window start, milliseconds since `run_start`
+    /// (pause-adjusted to match [`crate::scenario::sample::Sample`]
+    /// elapsed timestamps).
+    pub start_ms: u64,
+    /// Phase window end, milliseconds since `run_start`
+    /// (exclusive). `u64::MAX` sentinel when the phase is the
+    /// trailing window and the scenario ended without a closing
+    /// stimulus event — distinguishes "open-ended trailing phase"
+    /// from any plausible real timestamp.
+    pub end_ms: u64,
+    /// Number of periodic samples bucketed into this phase. Zero
+    /// when the phase fired no captures (e.g. BASELINE when the
+    /// settle window was shorter than the periodic interval).
+    pub sample_count: usize,
+    /// Per-metric phase-aggregated values keyed by
+    /// [`crate::stats::MetricDef::name`]. Reduction dispatches on
+    /// [`crate::stats::MetricKind`] — Counter uses last-first
+    /// delta over the phase's samples (cumulative-counter
+    /// semantic), other kinds use [`crate::stats::aggregate_samples`]
+    /// directly. Missing keys mean the phase carried no finite
+    /// samples for that metric (sentinel-free: `None` from the
+    /// reducer surfaces as "key absent" rather than "value 0.0").
+    pub metrics: std::collections::BTreeMap<String, f64>,
+}
+
+impl PhaseBucket {
+    /// Look up the phase-aggregated value for `metric_name` (a
+    /// [`crate::stats::MetricDef::name`]). Returns `None` when the
+    /// phase carried no finite samples for that metric — distinct
+    /// from `Some(0.0)` which means the reducer produced a real
+    /// zero from finite samples.
+    pub fn get(&self, metric_name: &str) -> Option<f64> {
+        self.metrics.get(metric_name).copied()
+    }
+}
+
 /// Aggregated statistics across all cgroups in a scenario.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, crate::Claim)]
 pub struct ScenarioStats {
@@ -1332,6 +1405,121 @@ pub struct ScenarioStats {
     /// Extensible metrics for the generic comparison pipeline.
     /// Populated from per-cgroup ext_metrics (worst value across cgroups).
     pub ext_metrics: BTreeMap<String, f64>,
+    /// Per-phase metric buckets in step-index order. A scenario
+    /// with N Steps populates `N + 1` entries: phase 0 is the
+    /// BASELINE settle window before Step 0 fires, phases
+    /// 1..=N align with Step 0..Step N-1 in scenario order
+    /// (1-indexed Steps so the BASELINE encoding doesn't collide
+    /// with first-Step's index).
+    ///
+    /// Empty when the scenario produced no periodic captures
+    /// (Default::default() yields `vec![]`). The existing
+    /// flat-bucket scalars on this struct are independent of the
+    /// per-phase view — they remain the "all phases merged"
+    /// reading, unchanged in semantics by the introduction of
+    /// `phases`.
+    ///
+    /// See [`PhaseBucket`] for the per-phase shape.
+    pub phases: Vec<PhaseBucket>,
+}
+
+impl ScenarioStats {
+    /// Look up the phase bucket for a phase index.
+    ///
+    /// **Heads up:** `step_index = 0` returns the pre-Step BASELINE
+    /// settle window, NOT the first Step. The first Step the
+    /// scenario author wrote lives at `step_index = 1` per the
+    /// 1-indexed Step encoding. To look up the test author's "Step
+    /// N", pass `N + 1` — or use [`Self::step`] for an accessor
+    /// that takes the 0-indexed scenario Step number directly.
+    ///
+    /// Returns `None` when no bucket with that index exists
+    /// (single-phase scenario, scenario didn't reach the step, or
+    /// `step_index` past the last phase).
+    pub fn phase(&self, step_index: u16) -> Option<&PhaseBucket> {
+        self.phases.iter().find(|p| p.step_index == step_index)
+    }
+
+    /// Look up the phase bucket for a 0-indexed scenario Step
+    /// number — the natural index the test author used when
+    /// constructing `vec![step_a, step_b, step_c]` (Step A is
+    /// `scenario_step_idx = 0`, Step B is `1`, etc.).
+    ///
+    /// Internally translates to `step_index = scenario_step_idx + 1`
+    /// per the 1-indexed phase encoding (phase 0 is reserved for
+    /// BASELINE). Use this for the common "I want metrics for the
+    /// N-th Step I wrote" case; use [`Self::phase`] when you need
+    /// to address BASELINE explicitly or work in phase-index space.
+    ///
+    /// Returns `None` when the scenario didn't reach that Step or
+    /// `phases` is empty.
+    pub fn step(&self, scenario_step_idx: u16) -> Option<&PhaseBucket> {
+        scenario_step_idx
+            .checked_add(1)
+            .and_then(|phase_idx| self.phase(phase_idx))
+    }
+
+    /// Shortcut: look up a single metric value in a specific
+    /// phase by phase-index. Returns `None` when:
+    /// (a) the phase is absent (no bucket with `step_index` in
+    ///     [`Self::phases`]),
+    /// (b) the phase exists but had no finite samples for that
+    ///     metric, OR
+    /// (c) `metric` is not a registered [`crate::stats::MetricDef::name`]
+    ///     (typo case — `is_known_metric` surfaces it).
+    ///
+    /// Sentinel-free: `Some(0.0)` means the reducer produced a
+    /// real zero from finite samples, NOT "missing data".
+    ///
+    /// `metric` matches [`crate::stats::MetricDef::name`] — see
+    /// [`crate::stats::METRICS`] for the registered list. When
+    /// debugging an unexpected `None`, gate the lookup on
+    /// [`Self::is_known_metric`] to distinguish typos from absent
+    /// data.
+    ///
+    /// **Heads up:** same 1-indexed Step encoding as
+    /// [`Self::phase`] — `step_index = 0` is BASELINE, not the
+    /// first Step. Use [`Self::step_metric`] for the 0-indexed
+    /// scenario-Step lookup.
+    pub fn phase_metric(&self, step_index: u16, metric: &str) -> Option<f64> {
+        self.phase(step_index).and_then(|p| p.get(metric))
+    }
+
+    /// Shortcut: look up a single metric value in a 0-indexed
+    /// scenario Step. Sibling of [`Self::step`]. See [`Self::phase_metric`]
+    /// for the None-cause taxonomy and
+    /// [`Self::is_known_metric`] for typo-debugging.
+    pub fn step_metric(&self, scenario_step_idx: u16, metric: &str) -> Option<f64> {
+        self.step(scenario_step_idx).and_then(|p| p.get(metric))
+    }
+
+    /// True when `name` matches a registered
+    /// [`crate::stats::MetricDef::name`] in
+    /// [`crate::stats::METRICS`]. Use to disambiguate the typo
+    /// None-cause from [`Self::phase_metric`] / [`Self::step_metric`]:
+    /// if the lookup returns `None` and `is_known_metric(name) ==
+    /// false`, the metric name is a typo (caller mistake), not
+    /// missing data (legitimately-absent samples).
+    pub fn is_known_metric(name: &str) -> bool {
+        crate::stats::METRICS.iter().any(|m| m.name == name)
+    }
+
+    /// Iterate the canonical metric names a test author may pass
+    /// to [`Self::phase_metric`] / [`Self::step_metric`]. Sourced
+    /// from [`crate::stats::METRICS`].
+    ///
+    /// Sample usage for an A/B scheduler-swap assertion that
+    /// compares every registered metric across two scenario Steps:
+    /// ```ignore
+    /// for metric in ScenarioStats::known_metrics() {
+    ///     let baseline = r.stats.step_metric(0, metric);
+    ///     let after_swap = r.stats.step_metric(2, metric);
+    ///     // ... compare per metric ...
+    /// }
+    /// ```
+    pub fn known_metrics() -> impl Iterator<Item = &'static str> {
+        crate::stats::METRICS.iter().map(|m| m.name)
+    }
 }
 
 impl AssertResult {
@@ -3535,6 +3723,7 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
         worst_iterations_per_worker: cg.iterations_per_worker(),
         ext_metrics: cg.ext_metrics.clone(),
         cgroups: vec![cg],
+        phases: Vec::new(),
     };
 
     r
@@ -4084,6 +4273,8 @@ mod tests_note;
 mod tests_numa;
 #[cfg(test)]
 mod tests_percentile;
+#[cfg(test)]
+mod tests_phase_bucket;
 #[cfg(test)]
 mod tests_plan;
 #[cfg(test)]
