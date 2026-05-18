@@ -164,6 +164,22 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// `workload_duration` at the run-loop level, not at the
     /// dispatch level.
     pub run_start: std::time::Instant,
+    /// Host-side mirror of the guest's scenario phase index.
+    /// Updated on every CRC-valid `MSG_TYPE_STIMULUS` frame in
+    /// the dispatch loop from
+    /// [`crate::vmm::wire::StimulusEvent::step_index`]; consumed
+    /// by the freeze-coordinator's periodic-capture path so
+    /// each periodic sample carries the phase it fired in.
+    /// Encoded per the framework's 1-indexed phase convention
+    /// (`0` = BASELINE settle window, `1..=N` = Step ordinals)
+    /// to match the encoding the guest publishes (see
+    /// [`crate::scenario::Ctx::current_step`] and
+    /// [`crate::assert::PhaseBucket::step_index`]).
+    /// `Release` on the writer here pairs with `Acquire` on the
+    /// periodic-fire reader so the published step is visible
+    /// once the dispatch loop returns from the frame that
+    /// promoted it.
+    pub current_step: &'a std::sync::Arc<std::sync::atomic::AtomicU16>,
 }
 
 /// Classify and dispatch a single [`BulkMessage`] from the port-1
@@ -593,15 +609,58 @@ pub(super) fn dispatch_bulk_message(
                 crc_ok: msg.crc_ok,
             })
         }
+        Some(crate::vmm::wire::MsgType::Stimulus) => {
+            // Decode the published step_index into the host-side
+            // mirror so the freeze-coordinator periodic-capture
+            // path can stamp samples with the scenario phase the
+            // guest was in when the periodic boundary fired.
+            //
+            // CRC-bad frames do NOT promote — a torn frame would
+            // otherwise let a hostile guest forge a phase that
+            // mislabels a periodic sample. The decoder also gates
+            // on the payload size match in
+            // [`crate::vmm::wire::StimulusEvent::from_payload`];
+            // an oversized / undersized payload returns None and
+            // the publish is skipped. The frame still buckets
+            // verbatim below so the post-run drain at
+            // `freeze_coord/mod.rs:11130` recovers the full
+            // stimulus log unchanged.
+            //
+            // Release pairs with the periodic-fire reader's
+            // `Acquire` load on the same atomic so the published
+            // step is visible immediately on the next iteration's
+            // wake. The encoded 1-indexed convention (`0` =
+            // BASELINE, `1..=N` = Step ordinals) matches the
+            // encoding the guest publishes via
+            // [`crate::scenario::ops::build_stimulus`].
+            if msg.crc_ok
+                && let Some(event) = crate::vmm::wire::StimulusEvent::from_payload(&msg.payload)
+            {
+                sinks
+                    .current_step
+                    .store(event.step_index, std::sync::atomic::Ordering::Release);
+            }
+            // Stimulus is verdict-bearing — bucket verbatim so the
+            // post-run drain at `freeze_coord/mod.rs:11130`
+            // recovers the full log for `VmResult::stimulus_events`
+            // population.
+            Some(crate::vmm::wire::ShmEntry {
+                msg_type: msg.msg_type,
+                payload: msg.payload.to_vec(),
+                crc_ok: msg.crc_ok,
+            })
+        }
         Some(other) if !other.is_coordinator_internal() => {
-            // Every other typed verdict-bearing variant (Stimulus,
-            // ScenarioEnd, Exit, TestResult, Crash,
-            // PayloadMetrics, RawPayloadOutput, Profraw, Stdout,
-            // Stderr, SchedLog, Lifecycle, ExecExit, Dmesg,
-            // ProbeOutput) accumulates into the bucket verbatim.
-            // SnapshotReply is host→guest only and is filtered out
-            // by the `is_coordinator_internal` guard above; a guest
-            // TX frame stamped with that tag falls through to the
+            // Every other typed verdict-bearing variant
+            // (ScenarioEnd, Exit, TestResult, Crash, PayloadMetrics,
+            // RawPayloadOutput, Profraw, Stdout, Stderr, SchedLog,
+            // Lifecycle, ExecExit, Dmesg, ProbeOutput) accumulates
+            // into the bucket verbatim. Stimulus has its own typed
+            // arm above (decodes step_index into the host-side
+            // mirror, then buckets). SnapshotReply is host→guest
+            // only and is filtered out by the
+            // `is_coordinator_internal` guard above; a guest TX
+            // frame stamped with that tag falls through to the
             // `Some(_)` arm below and is dropped silently. CRC-bad
             // entries still land here — the host-side consumers
             // filter on `crc_ok` per their own per-type contract.

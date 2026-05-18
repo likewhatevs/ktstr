@@ -16,7 +16,7 @@ use kvm_ioctls::VcpuExit;
 use std::os::fd::AsRawFd;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use vm_memory::{GuestAddress, GuestMemory};
@@ -1540,6 +1540,21 @@ impl KtstrVm {
         // be added to the pause sequence.
         let freeze_coord_freeze = freeze.clone();
         let freeze_coord_kill = kill.clone();
+        // Per-VM scenario phase index, host-side mirror of the
+        // guest's `Ctx::current_step` publisher. Updated whenever
+        // the freeze-coord dispatch loop decodes a CRC-valid
+        // `MSG_TYPE_STIMULUS` frame on the bulk port (see the
+        // `MsgType::Stimulus` arm in `dispatch.rs`); consumed by
+        // the periodic-fire path below to stamp each captured
+        // sample with the scenario phase the guest was in when
+        // the periodic boundary fired. Encoded per the framework's
+        // 1-indexed phase convention (`0` = BASELINE settle
+        // window, `1..=N` = Step ordinals) to match every other
+        // step_index slot in the pipeline. Per-VM (not
+        // process-global) so parallel in-process gauntlet
+        // variants get independent atomics.
+        let host_current_step: Arc<AtomicU16> = Arc::new(AtomicU16::new(0));
+        let freeze_coord_current_step = Arc::clone(&host_current_step);
         // Optional virtio-blk handle for the failure-dump
         // worker-pause rendezvous. None when no disk is attached.
         // Cloned into the closure so the dump path can call
@@ -3154,6 +3169,7 @@ impl KtstrVm {
                                         scenario_pause_cumulative_ns:
                                             scenario_pause_cumulative_for_coord.as_ref(),
                                         run_start,
+                                        current_step: &freeze_coord_current_step,
                                     };
                                     for msg in &drained.messages {
                                         if let Some(entry) =
@@ -7184,11 +7200,29 @@ impl KtstrVm {
                                         sample_elapsed_ms = sample_elapsed_ms_anchor,
                                         "freeze-coord: periodic snapshot captured"
                                     );
-                                    freeze_coord_snapshot_bridge.store_with_stats(
+                                    // Stamp the periodic capture with the
+                                    // current scenario phase (1-indexed:
+                                    // 0 = BASELINE, 1..=N = Step ordinals)
+                                    // read from the host-side mirror the
+                                    // dispatch loop populates on every
+                                    // CRC-valid MSG_TYPE_STIMULUS frame.
+                                    // `Acquire` pairs with the dispatch
+                                    // loop's `Release` store so the
+                                    // most-recently-published step is
+                                    // visible here. A periodic boundary
+                                    // that fires before any stimulus
+                                    // event reads `0` (BASELINE) -- the
+                                    // settle-window initial value --
+                                    // which is the correct bucket for a
+                                    // pre-first-Step sample.
+                                    let phase_step_index = freeze_coord_current_step
+                                        .load(Ordering::Acquire);
+                                    freeze_coord_snapshot_bridge.store_with_stats_and_step(
                                         &tag,
                                         report,
                                         stats_value,
                                         Some(sample_elapsed_ms_anchor),
+                                        phase_step_index,
                                     );
                                     // Successful capture resets the
                                     // consecutive-timeout counter so
@@ -7244,11 +7278,27 @@ impl KtstrVm {
                                                 degraded.reason.clone(),
                                             )
                                         };
-                                        freeze_coord_snapshot_bridge.store_with_stats(
+                                        // Stamp the degraded placeholder
+                                        // with the current scenario phase
+                                        // for the same reason the Captured
+                                        // path does: a degraded sample
+                                        // belongs to the phase the
+                                        // periodic boundary fired in, NOT
+                                        // BASELINE (which is what the
+                                        // bucket renderer's "no stamped
+                                        // index" fallback would land it
+                                        // in). Without this stamp,
+                                        // rendezvous timeouts would
+                                        // silently shift their placeholders
+                                        // into the wrong phase bucket.
+                                        let degraded_phase_step_index =
+                                            freeze_coord_current_step.load(Ordering::Acquire);
+                                        freeze_coord_snapshot_bridge.store_with_stats_and_step(
                                             &tag,
                                             placeholder,
                                             stats_value,
                                             Some(sample_elapsed_ms_anchor),
+                                            degraded_phase_step_index,
                                         );
                                         periodic_consecutive_timeouts =
                                             periodic_consecutive_timeouts.saturating_add(1);
@@ -7266,11 +7316,24 @@ impl KtstrVm {
                                             crate::monitor::dump::FailureDumpReport::placeholder(
                                                 "periodic capture suppressed (gate decision)",
                                             );
-                                        freeze_coord_snapshot_bridge.store_with_stats(
+                                        // Stamp the suppressed placeholder
+                                        // with the current scenario phase
+                                        // for the same reason as the
+                                        // Degraded path above. Even on the
+                                        // unreachable arm, a placeholder
+                                        // that ever lands in the bridge
+                                        // must carry the phase so the
+                                        // bucket renderer's fallback does
+                                        // not silently mislabel it as
+                                        // BASELINE.
+                                        let suppressed_phase_step_index =
+                                            freeze_coord_current_step.load(Ordering::Acquire);
+                                        freeze_coord_snapshot_bridge.store_with_stats_and_step(
                                             &tag,
                                             placeholder,
                                             stats_value,
                                             Some(sample_elapsed_ms_anchor),
+                                            suppressed_phase_step_index,
                                         );
                                     }
                                     FreezeOutcome::KernelOp(_) => capture_only_unreachable!(),
