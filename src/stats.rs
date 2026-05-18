@@ -4239,6 +4239,114 @@ pub fn compare_partitions(
     }
     println!("{table}");
 
+    // Per-phase delta render. Activated when the parallel pass
+    // populated either phase_deltas or unpaired_phases for the
+    // current row-pair set. Single-phase scenarios (no periodic
+    // captures) leave both vecs empty and the phase block is
+    // suppressed entirely — the operator sees only the scalar
+    // table above, as before. This is the data-only render; CLI
+    // flag gating (--phases-only / --steps-only / --no-phases
+    // / --phase <N> / --phase-delta-threshold) lands in a
+    // follow-up commit.
+    if !report.phase_deltas.is_empty() || !report.unpaired_phases.is_empty() {
+        println!();
+        println!("phase coverage:");
+        if !report.phase_deltas.is_empty() {
+            let mut phase_table = crate::cli::new_table();
+            phase_table.set_header(vec![
+                "PHASE", "TEST", "METRIC", &label_a, &label_b, "DELTA", "VERDICT",
+            ]);
+            // Sort by step_index ascending, then pairing key,
+            // then metric name. step_index-first ordering matches
+            // the operator-facing time order from BASELINE
+            // through Step[N] so the reader scans top-down by
+            // phase boundary; ties within a phase sort by row
+            // pair then metric so the table is stable across
+            // runs with identical input.
+            let mut sorted_deltas: Vec<&PhaseDeltaRow> = report.phase_deltas.iter().collect();
+            sorted_deltas.sort_by(|a, b| {
+                a.step_index
+                    .cmp(&b.step_index)
+                    .then_with(|| a.pairing_key.0.cmp(&b.pairing_key.0))
+                    .then_with(|| a.metric.name.cmp(b.metric.name))
+            });
+            for d in sorted_deltas {
+                let (verdict_text, verdict_color) = if d.is_regression {
+                    ("REGRESSION", Color::Red)
+                } else {
+                    ("improvement", Color::Green)
+                };
+                let test_label = d.pairing_key.0.join("/");
+                let phase_cell = format!("{}: {}", d.step_index, d.label);
+                phase_table.add_row(vec![
+                    Cell::new(phase_cell),
+                    Cell::new(test_label),
+                    Cell::new(d.metric.name),
+                    Cell::new(format!("{:.2}", d.a)),
+                    Cell::new(format!("{:.2}", d.b)),
+                    Cell::new(format!("{:+.2}{}", d.delta, d.metric.display_unit)),
+                    Cell::new(verdict_text).fg(verdict_color),
+                ]);
+            }
+            println!("{phase_table}");
+        }
+        if !report.unpaired_phases.is_empty() {
+            println!();
+            println!("phase coverage asymmetry (one-sided phases):");
+            let mut unpaired_table = crate::cli::new_table();
+            unpaired_table.set_header(vec![
+                "SIDE", "TEST", "PHASE", "METRIC", "VALUE",
+            ]);
+            // Sort by step_index then side then pairing key then
+            // metric name. Time-order (step_index first) reads
+            // most naturally — the reader sees missing data in
+            // the order it would have appeared during the
+            // scenario, not grouped by which side is missing
+            // (side grouping would force a mental flip-flop
+            // across the paired rows above).
+            let mut sorted_unpaired: Vec<&UnpairedPhaseRow> =
+                report.unpaired_phases.iter().collect();
+            sorted_unpaired.sort_by(|a, b| {
+                a.step_index
+                    .cmp(&b.step_index)
+                    .then_with(|| a.side.as_str().cmp(b.side.as_str()))
+                    .then_with(|| a.pairing_key.0.cmp(&b.pairing_key.0))
+            });
+            for u in sorted_unpaired {
+                let test_label = u.pairing_key.0.join("/");
+                let phase_cell = format!("{}: {}", u.step_index, u.label);
+                if u.metrics.is_empty() {
+                    // Bucket present but no metrics — surface
+                    // the empty shape rather than hiding it. The
+                    // operator sees that the phase fired but
+                    // produced no readable metric data on the
+                    // single side it ran on, which is itself a
+                    // signal (capture path landed but
+                    // MetricDef::read_sample returned None for
+                    // every registered metric on these samples).
+                    unpaired_table.add_row(vec![
+                        Cell::new(u.side.as_str()),
+                        Cell::new(test_label),
+                        Cell::new(phase_cell),
+                        Cell::new("—"),
+                        Cell::new("—"),
+                    ]);
+                } else {
+                    for (metric_name, &value) in &u.metrics {
+                        unpaired_table.add_row(vec![
+                            Cell::new(u.side.as_str()),
+                            Cell::new(&test_label),
+                            Cell::new(&phase_cell),
+                            Cell::new(metric_name),
+                            Cell::new(format!("{value:.2}")),
+                        ]);
+                    }
+                }
+            }
+            println!("{unpaired_table}");
+        }
+    }
+
     println!();
     println!(
         "summary: {} regressions, {} improvements, {} unchanged",
