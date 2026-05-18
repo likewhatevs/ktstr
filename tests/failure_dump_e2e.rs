@@ -83,8 +83,7 @@ fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Resul
     let json = match std::fs::read_to_string(&dump_path) {
         Ok(s) => s,
         Err(e) => {
-            result.passed = false;
-            result.details.push(ktstr::assert::AssertDetail::new(
+            result.record_fail(ktstr::assert::AssertDetail::new(
                 ktstr::assert::DetailKind::Other,
                 format!(
                     "failure dump file missing at {}: {e} (freeze coordinator did \
@@ -525,7 +524,7 @@ fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Resul
     }
 
     // Confirming detail so the test log shows the captured value.
-    result.details.push(ktstr::assert::AssertDetail::new(
+    result.record_fail(ktstr::assert::AssertDetail::new(
         ktstr::assert::DetailKind::Other,
         format!(
             "failure-dump file at {} contains scheduler .bss render with \
@@ -602,8 +601,8 @@ fn scenario_failure_dump_renders_capture_modules(
     let json = match std::fs::read_to_string(&dump_path) {
         Ok(s) => s,
         Err(e) => {
-            result.passed = false;
-            result.details.push(ktstr::assert::AssertDetail::new(
+            
+            result.record_fail(ktstr::assert::AssertDetail::new(
                 ktstr::assert::DetailKind::Other,
                 format!(
                     "failure dump file missing at {}: {e} (freeze coordinator did \
@@ -784,7 +783,7 @@ fn scenario_failure_dump_renders_capture_modules(
         );
     }
 
-    result.details.push(ktstr::assert::AssertDetail::new(
+    result.record_fail(ktstr::assert::AssertDetail::new(
         ktstr::assert::DetailKind::Other,
         format!(
             "failure-dump file at {} contains capture-module data: \
@@ -866,8 +865,8 @@ fn scenario_failure_dump_renders_probe_counters(
     let json = match std::fs::read_to_string(&dump_path) {
         Ok(s) => s,
         Err(e) => {
-            result.passed = false;
-            result.details.push(ktstr::assert::AssertDetail::new(
+            
+            result.record_fail(ktstr::assert::AssertDetail::new(
                 ktstr::assert::DetailKind::Other,
                 format!(
                     "failure dump file missing at {}: {e} (freeze coordinator did \
@@ -961,7 +960,7 @@ fn scenario_failure_dump_renders_probe_counters(
         );
     }
 
-    result.details.push(ktstr::assert::AssertDetail::new(
+    result.record_fail(ktstr::assert::AssertDetail::new(
         ktstr::assert::DetailKind::Other,
         format!(
             "failure-dump file at {} contains probe_counters with \

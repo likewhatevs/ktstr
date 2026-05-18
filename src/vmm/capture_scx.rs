@@ -196,15 +196,13 @@ fn compute_owned(
     // when nr_cpus is large because this runs while every vCPU is
     // paused.
     //
-    // Pre-batch this site dropped the `kaslr_offset` term
-    // outright; the helper now accepts it as scaffolding, but
-    // production callers in `crate::vmm::freeze_coord` pass `0`
-    // until the LSTAR-derived virtual KASLR slide is plumbed
-    // cross-thread to the monitor (#31 real-fix). Under
-    // `CONFIG_RANDOMIZE_BASE=y` the read still surfaces
-    // phantom-empty rq->scx state; the helper extraction is the
-    // prerequisite for the single-line caller fix when the value
-    // flows in. See [`crate::monitor::symbols::per_cpu_kva`] for
+    // Production callers in `crate::vmm::freeze_coord` thread the
+    // virt-KASLR slide through here via the shared
+    // `kern_virt_kaslr` Arc (populated by either the BSP MSR_LSTAR
+    // derive on x86_64 or the guest-channel KERN_ADDRS `_text`
+    // subtraction on both arches). 0 fallback collapses to the
+    // no-slide formula and matches KASLR-off / nokaslr-karg
+    // semantics. See [`crate::monitor::symbols::per_cpu_kva`] for
     // the canonical formula every per-CPU walker now shares.
     let n = per_cpu_offsets.len();
     let mut rq_pas: Vec<u64> = Vec::with_capacity(n);

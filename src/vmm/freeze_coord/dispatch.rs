@@ -72,6 +72,39 @@ pub(super) struct BulkDispatchSinks<'a> {
     pub kern_phys_base: &'a Arc<std::sync::atomic::AtomicU64>,
     /// Fires when `kern_phys_base` transitions from 0 to non-zero.
     pub kern_phys_base_evt: &'a EventFd,
+    /// Derived virt-KASLR offset (biased `+1` so 0 = "not yet
+    /// derived"). The KERN_ADDRS arm extracts the guest-reported
+    /// runtime `_text` KVA from the third payload slot and stores
+    /// `(runtime - link) + 1` here when the link KVA from
+    /// [`Self::kernel_text_link_kva`] is non-zero AND the runtime
+    /// KVA is above the kernel-half threshold (rejects torn
+    /// payloads from a hostile guest). Idempotent CAS: the
+    /// BSP-side MSR_LSTAR path
+    /// (`src/vmm/x86_64/msr_kaslr::read_and_derive`) publishes the
+    /// same derived value to this slot from the BSP thread, so the
+    /// first writer wins and the second observes the existing
+    /// non-zero value via the CAS-fail branch (KASLR shifts both
+    /// `_text` and `entry_SYSCALL_64` by the same `kaslr_offset`,
+    /// so the two paths produce identical offsets even though
+    /// they read different runtime symbols). Consumers (monitor +
+    /// dump) `.load()` and subtract 1 to recover the offset; 0
+    /// means "no path has succeeded yet — use literal 0 for
+    /// KASLR-off semantics".
+    pub kern_virt_kaslr: &'a Arc<std::sync::atomic::AtomicU64>,
+    /// Fires when `kern_virt_kaslr` transitions from 0 to non-zero.
+    /// Mirrors [`Self::kern_phys_base_evt`].
+    pub kern_virt_kaslr_evt: &'a EventFd,
+    /// Link-time KVA of `_text` (the kernel image start symbol)
+    /// from the host's vmlinux parse
+    /// (`KernelSymbols::kernel_text_kva`). The KERN_ADDRS arm
+    /// subtracts this from the guest-reported runtime KVA to
+    /// derive the virt-KASLR offset. `0` when the symbol is
+    /// absent (extremely stripped vmlinux) — the arm
+    /// short-circuits and leaves [`Self::kern_virt_kaslr`] at 0
+    /// in that case (matches KASLR-off semantics). `_text` is
+    /// defined in `vmlinux.lds.S` on every architecture so the
+    /// host-side extraction is cross-arch.
+    pub kernel_text_link_kva: u64,
     /// Watchdog reset atomic + workload duration. SCENARIO_START
     /// stores `(now - run_start + duration).as_nanos()` so the
     /// watchdog starts the workload clock from scenario start, not
@@ -229,15 +262,125 @@ pub(super) fn dispatch_bulk_message(
             None
         }
         _ if msg.msg_type == crate::vmm::wire::MSG_TYPE_KERN_ADDRS => {
-            // Payload carries phys_base + 1 (biased to avoid
-            // the 0 sentinel). Subtract 1 to recover.
-            if msg.crc_ok && msg.payload.len() >= 8 {
-                let biased = u64::from_le_bytes(msg.payload[..8].try_into().unwrap_or([0; 8]));
-                if biased != 0 {
+            // Payload carries (via [`crate::vmm::wire::KernAddrs`]):
+            //   [0..8]   phys_base + 1                (biased)
+            //   [8..16]  page_offset_base             (unused by host
+            //                                          today — guest
+            //                                          sends 0)
+            //   [16..24] kernel_text_runtime_kva + 1  (biased; `_text`
+            //                                          symbol from
+            //                                          guest's
+            //                                          /proc/kallsyms)
+            //
+            // All three slots are u64 LE. The biased slots use the
+            // +1 trick so the 0 sentinel distinguishes "not yet
+            // received / could not derive" from a legitimately-zero
+            // value (phys_base = 0 with KASLR off; kernel_text = 0
+            // means symbol masked or absent).
+            //
+            // CRC failures DO NOT promote — a torn frame would
+            // otherwise let a hostile guest forge a wrong KVA and
+            // poison the monitor's per-CPU resolution. The decoder
+            // gates on `payload.len() == KernAddrs::WIRE_LEN`
+            // (exact 24 bytes); shorter or longer payloads never
+            // publish either slot. Exact-length match (vs `>=`)
+            // makes a future protocol extension that appends bytes
+            // trip loudly at this arm rather than silently dropping
+            // the new bytes.
+            if msg.crc_ok
+                && let Some(addrs) = crate::vmm::wire::KernAddrs::from_payload(&msg.payload)
+            {
+                if addrs.has_phys_present_bit() {
+                    let biased_phys = addrs.phys_base.wrapping_add(1);
                     sinks
                         .kern_phys_base
-                        .store(biased, std::sync::atomic::Ordering::Release);
+                        .store(biased_phys, std::sync::atomic::Ordering::Release);
                     let _ = sinks.kern_phys_base_evt.write(1);
+                }
+                // Derive virt-KASLR from the guest-reported runtime
+                // `_text` KVA + the host's link-time KVA. Skip if
+                // either input is unavailable:
+                //   * link KVA == 0    — vmlinux missing the symbol
+                //                         (extremely stripped build)
+                //   * runtime_kva == 0 — guest could not read
+                //                         /proc/kallsyms
+                // In either case the BSP MSR_LSTAR path may still
+                // publish a non-zero value on x86_64; leaving the
+                // slot at 0 matches that fallback's "not yet
+                // derived" sentinel. `_text` is the kernel image
+                // start symbol — defined on every Linux build, so
+                // this derivation works on both x86_64 and aarch64.
+                // Hostile-input gate stack (defense in depth against
+                // a torn / compromised guest payload AND a corrupted
+                // host vmlinux ELF):
+                //
+                //   (l) `link >= KERNEL_HALF_THRESHOLD` —
+                //       host-side: if the vmlinux ELF parse
+                //       returned a low / garbage `_text` symbol
+                //       (e.g. 0x1000 from a corrupted symbol
+                //       table), refuse to derive against it.
+                //       Catches the broken-ELF case before gates
+                //       (a)/(b)/(c) below have to.
+                //
+                //   (a) `runtime >= KERNEL_HALF_THRESHOLD` —
+                //       runtime KVA must be in the kernel-half
+                //       canonical range (bits 63..47 all set).
+                //       Rejects non-canonical and userspace
+                //       addresses.
+                //
+                //   (b) `runtime >= link` — KASLR shifts text
+                //       symbols by a non-negative slot per
+                //       `find_random_virt_addr` in
+                //       arch/x86/boot/compressed/kaslr.c. A
+                //       runtime KVA below the link KVA would
+                //       wrap into a huge u64 offset.
+                //
+                //   (c) `offset <= RANDOMIZE_BASE_MAX_OFFSET` —
+                //       x86_64 KASLR picks slots in
+                //       `[0, KERNEL_IMAGE_SIZE - KERNEL_BASE)`
+                //       where `KERNEL_IMAGE_SIZE = 1 GiB` per
+                //       arch/x86/include/asm/page_64_types.h.
+                //       An offset above 1 GiB cannot be a real
+                //       KASLR slot and indicates a forged or
+                //       torn payload. aarch64 KASLR slot range
+                //       is `0..KIMAGE_VADDR_SIZE` which is at
+                //       most 4 GiB depending on VA_BITS, so
+                //       the 1 GiB bound is conservative on x86
+                //       and may admit a small range of
+                //       legitimate aarch64 slots above it; the
+                //       worst case is rejecting valid aarch64
+                //       payloads on >47-bit VA, which surfaces
+                //       as fallback to BSP MSR (x86) or
+                //       literal-0 (aarch64-only path) rather
+                //       than incorrect data.
+                const KERNEL_HALF_THRESHOLD: u64 = 0xFFFF_8000_0000_0000;
+                const RANDOMIZE_BASE_MAX_OFFSET: u64 = 1 << 30; // 1 GiB
+                if let Some(runtime) = addrs.kernel_text_runtime_kva
+                    && sinks.kernel_text_link_kva >= KERNEL_HALF_THRESHOLD
+                {
+                    let link = sinks.kernel_text_link_kva;
+                    if runtime >= KERNEL_HALF_THRESHOLD
+                        && runtime >= link
+                        && (runtime - link) <= RANDOMIZE_BASE_MAX_OFFSET
+                    {
+                        let offset = runtime - link;
+                        let biased_offset = offset.wrapping_add(1);
+                        // CAS-once: idempotent vs the BSP-side
+                        // MSR_LSTAR publisher. Both paths derive
+                        // the SAME virt-KASLR (KASLR is a single
+                        // boot-time slot pick stored in
+                        // `kaslr_offset`), so the CAS-fail branch
+                        // (some other writer already published) is
+                        // a no-op. Release pairs with the consumer
+                        // `.load(Acquire)` at L9130 / L5202.
+                        let _ = sinks.kern_virt_kaslr.compare_exchange(
+                            0,
+                            biased_offset,
+                            std::sync::atomic::Ordering::Release,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        let _ = sinks.kern_virt_kaslr_evt.write(1);
+                    }
                 }
             }
             None

@@ -23,9 +23,9 @@ fn single_pass(v: Verdict) -> PassDetail {
     assert_eq!(
         r.passes.len(),
         1,
-        "expected exactly one PassDetail; got {} passes and {} details",
+        "expected exactly one PassDetail; got {} passes and {} outcomes",
         r.passes.len(),
-        r.details.len()
+        r.outcomes.len()
     );
     r.passes.into_iter().next().unwrap()
 }

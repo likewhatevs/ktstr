@@ -1157,6 +1157,29 @@ pub struct MonitorVerdict {
     pub summary: String,
 }
 
+impl MonitorVerdict {
+    /// Convenience accessor mirroring [`AssertResult::is_pass`] so the
+    /// is_pass / is_fail vocabulary applies uniformly across both
+    /// verdict surfaces.
+    pub fn is_pass(&self) -> bool {
+        self.passed
+    }
+    /// Convenience accessor mirroring [`AssertResult::is_fail`].
+    pub fn is_fail(&self) -> bool {
+        !self.passed
+    }
+    /// Iterate the violation-detail messages. Naming mirrors
+    /// [`AssertResult::failure_details`] so consumers can swap
+    /// between the two verdict types with the same vocabulary;
+    /// MonitorVerdict's details are `String` rather than
+    /// `AssertDetail` because the monitor-thread surface doesn't
+    /// carry kind tags.
+    #[allow(dead_code)]
+    pub fn failure_details(&self) -> impl Iterator<Item = &String> {
+        self.details.iter()
+    }
+}
+
 impl MonitorThresholds {
     /// Evaluate a MonitorReport against these thresholds.
     ///

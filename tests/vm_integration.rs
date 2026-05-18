@@ -158,7 +158,7 @@ fn scenario_dsq_and_rq_walker_populates_failure_dump(
         );
     }
 
-    result.details.push(AssertDetail::new(
+    result.record_fail(AssertDetail::new(
         DetailKind::Other,
         format!(
             "scx walker captured {} DSQ entries and {} rq->scx entries from \
@@ -233,7 +233,7 @@ fn scenario_perf_counters_capture_populates_dump(
         );
     }
 
-    result.details.push(AssertDetail::new(
+    result.record_fail(AssertDetail::new(
         DetailKind::Other,
         format!(
             "vcpu_perf_at_freeze: {}/{} vCPUs reported a non-null \
@@ -308,7 +308,7 @@ fn scenario_event_counter_timeline_populates_dump(
         );
     }
 
-    result.details.push(AssertDetail::new(
+    result.record_fail(AssertDetail::new(
         DetailKind::Other,
         format!(
             "event_counter_timeline captured {} per-tick samples across \
@@ -370,8 +370,8 @@ fn scenario_sched_deadline_real_setattr(ctx: &ktstr::scenario::Ctx) -> Result<As
 
     let mut result = AssertResult::pass();
     if reports.is_empty() {
-        result.passed = false;
-        result.details.push(AssertDetail::new(
+        
+        result.record_fail(AssertDetail::new(
             DetailKind::Other,
             "SCHED_DEADLINE worker produced no report — sched_setattr likely \
              rejected the params"
@@ -381,8 +381,8 @@ fn scenario_sched_deadline_real_setattr(ctx: &ktstr::scenario::Ctx) -> Result<As
     }
     let r = &reports[0];
     if !r.completed {
-        result.passed = false;
-        result.details.push(AssertDetail::new(
+        
+        result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
                 "SCHED_DEADLINE worker reported completed=false (sentinel) — \
@@ -394,8 +394,8 @@ fn scenario_sched_deadline_real_setattr(ctx: &ktstr::scenario::Ctx) -> Result<As
         return Ok(result);
     }
     if r.work_units == 0 {
-        result.passed = false;
-        result.details.push(AssertDetail::new(
+        
+        result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
                 "SCHED_DEADLINE worker reported work_units=0 — the SCHED_DL \
@@ -407,7 +407,7 @@ fn scenario_sched_deadline_real_setattr(ctx: &ktstr::scenario::Ctx) -> Result<As
         return Ok(result);
     }
 
-    result.details.push(AssertDetail::new(
+    result.record_fail(AssertDetail::new(
         DetailKind::Other,
         format!(
             "SCHED_DEADLINE worker completed cleanly: tid={}, work_units={}, \
@@ -484,7 +484,7 @@ fn scenario_failure_dump_trigger_minimal_invariants(
         );
     }
 
-    result.details.push(AssertDetail::new(
+    result.record_fail(AssertDetail::new(
         DetailKind::Other,
         format!(
             "failure-dump trigger pipeline produced schema={schema:?}, \
@@ -624,7 +624,7 @@ fn scenario_disk_default_appears_at_dev_vda(_ctx: &ktstr::scenario::Ctx) -> Resu
     }
 
     let mut result = AssertResult::pass();
-    result.details.push(AssertDetail::new(
+    result.record_fail(AssertDetail::new(
         DetailKind::Other,
         format!(
             "/dev/vda is a block device with capacity {size_bytes} bytes \
@@ -741,7 +741,7 @@ fn scenario_disk_write_read_roundtrip(_ctx: &ktstr::scenario::Ctx) -> Result<Ass
     }
 
     let mut result = AssertResult::pass();
-    result.details.push(AssertDetail::new(
+    result.record_fail(AssertDetail::new(
         DetailKind::Other,
         format!(
             "{SECTOR_SIZE}-byte pattern written to sector 0 round-tripped \
@@ -808,7 +808,7 @@ fn scenario_disk_read_only_rejects_write(_ctx: &ktstr::scenario::Ctx) -> Result<
     }
 
     let mut result = AssertResult::pass();
-    result.details.push(AssertDetail::new(
+    result.record_fail(AssertDetail::new(
         DetailKind::Other,
         "open(/dev/vda, O_WRONLY) returned EROFS as expected — \
          VIRTIO_BLK_F_RO is honored end-to-end"

@@ -445,9 +445,9 @@ mod tests {
         crate::claim!(v, off_b).eq(32usize);
         let r = v.into_result();
         assert!(
-            r.passed,
+            r.is_pass(),
             "timeline_event layout drift detected: {:?}",
-            r.details,
+            r.outcomes,
         );
     }
 
@@ -497,7 +497,7 @@ mod tests {
                 crate::claim!(v, prev_state).eq(0x402u64);
                 crate::claim!(v, preempt).eq(true);
                 let r = v.into_result();
-                assert!(r.passed, "Switch record decode drift: {:?}", r.details,);
+                assert!(r.is_pass(), "Switch record decode drift: {:?}", r.outcomes,);
             }
             other => panic!("expected Switch, got {other:?}"),
         }

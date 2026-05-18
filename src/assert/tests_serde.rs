@@ -40,9 +40,7 @@ fn scenario_stats_serde_roundtrip() {
 #[test]
 fn assert_result_serde_roundtrip() {
     let r = AssertResult {
-        passed: false,
-        skipped: false,
-        details: vec!["test".into()],
+        outcomes: vec![Outcome::Fail(AssertDetail::new(DetailKind::Other, "test"))],
         passes: vec![],
         stats: Default::default(),
         measurements: std::collections::BTreeMap::new(),
@@ -50,11 +48,80 @@ fn assert_result_serde_roundtrip() {
     };
     let json = serde_json::to_string(&r).unwrap();
     let r2: AssertResult = serde_json::from_str(&json).unwrap();
-    assert_eq!(r.passed, r2.passed);
-    assert_eq!(r.details, r2.details);
+    assert_eq!(r.is_pass(), r2.is_pass());
+    assert_eq!(r.is_fail(), r2.is_fail());
+    let r_details: Vec<&AssertDetail> = r.failure_details().collect();
+    let r2_details: Vec<&AssertDetail> = r2.failure_details().collect();
+    assert_eq!(r_details.len(), r2_details.len());
+    assert_eq!(r_details[0].message, r2_details[0].message);
     assert_eq!(r.passes, r2.passes);
     assert_eq!(r.info_notes.len(), r2.info_notes.len());
     assert_eq!(r.info_notes[0].message, r2.info_notes[0].message);
+}
+
+/// Postcard roundtrip pins the wire format the freeze-coord drain
+/// reads via
+/// [`crate::test_support::output::parse_assert_result_from_drain`]
+/// (MSG_TYPE_TEST_RESULT TLV). A regression that re-adds
+/// `#[serde(tag = "kind", content = "data")]` to `Outcome` (or any
+/// nested type inside `AssertResult`) breaks postcard's
+/// externally-tagged enum decoder silently — caught here at test
+/// time, not at runtime by a failing TLV drain that surfaces as
+/// `ERR_NO_TEST_FUNCTION_OUTPUT`.
+#[test]
+fn assert_result_postcard_roundtrip() {
+    // Populate every NoteValue variant in measurements — guards
+    // against a future regression that re-adds `#[serde(untagged)]`
+    // to NoteValue (postcard cannot decode untagged enums under the
+    // same self-describing-format constraint that drove the Outcome
+    // tagging choice). If the attr slips back in, postcard decode
+    // here fails with `WontImplement` at test time rather than
+    // silently dropping measurement data on the wire.
+    let mut measurements = std::collections::BTreeMap::new();
+    measurements.insert("pid".to_string(), NoteValue::Int(-1));
+    measurements.insert("bytes".to_string(), NoteValue::Uint(4096));
+    measurements.insert("rate".to_string(), NoteValue::Float(3.14));
+    measurements.insert("ok".to_string(), NoteValue::Bool(true));
+    measurements.insert("label".to_string(), NoteValue::Text("benchmark".to_string()));
+    let r = AssertResult {
+        outcomes: vec![
+            Outcome::Fail(AssertDetail::new(DetailKind::Other, "fail msg")),
+            Outcome::Skip(AssertDetail::new(DetailKind::Skip, "skip msg")),
+            Outcome::Pass,
+        ],
+        passes: vec![],
+        stats: Default::default(),
+        measurements,
+        info_notes: vec![InfoNote::new("ctx=42")],
+    };
+    let bytes = postcard::to_allocvec(&r).expect("postcard encode");
+    let r2: AssertResult = postcard::from_bytes(&bytes).expect("postcard decode");
+    assert_eq!(r.is_fail(), r2.is_fail());
+    assert_eq!(r.is_skip(), r2.is_skip());
+    assert_eq!(r.outcomes.len(), r2.outcomes.len());
+    let r_fails: Vec<_> = r.failure_details().collect();
+    let r2_fails: Vec<_> = r2.failure_details().collect();
+    assert_eq!(r_fails.len(), r2_fails.len());
+    assert_eq!(r_fails[0].message, r2_fails[0].message);
+    let r_skips: Vec<_> = r.skip_reasons().collect();
+    let r2_skips: Vec<_> = r2.skip_reasons().collect();
+    assert_eq!(r_skips.len(), r2_skips.len());
+    assert_eq!(r_skips[0].message, r2_skips[0].message);
+    assert_eq!(r.info_notes.len(), r2.info_notes.len());
+    assert_eq!(r.info_notes[0].message, r2.info_notes[0].message);
+    // Verify every NoteValue variant roundtripped — guards against
+    // a future `#[serde(untagged)]` regression on NoteValue (or any
+    // nested measurement type) that postcard can't decode.
+    assert_eq!(r.measurements.len(), r2.measurements.len());
+    assert_eq!(r2.measurements.get("pid"), Some(&NoteValue::Int(-1)));
+    assert_eq!(r2.measurements.get("bytes"), Some(&NoteValue::Uint(4096)));
+    if let Some(NoteValue::Float(f)) = r2.measurements.get("rate") {
+        assert!((f - 3.14).abs() < 1e-9);
+    } else {
+        panic!("rate must decode to NoteValue::Float, got {:?}", r2.measurements.get("rate"));
+    }
+    assert_eq!(r2.measurements.get("ok"), Some(&NoteValue::Bool(true)));
+    assert_eq!(r2.measurements.get("label"), Some(&NoteValue::Text("benchmark".to_string())));
 }
 
 /// Strict-schema rejection sibling for `CgroupStats`. The
@@ -201,14 +268,12 @@ fn scenario_stats_missing_required_scalar_rejected_by_deserialize() {
 /// details / stats trips this test.
 #[test]
 fn assert_result_missing_required_field_rejected_by_deserialize() {
-    // All seven `AssertResult` fields are wire-required (the struct
+    // All five `AssertResult` fields are wire-required (the struct
     // has no `Default` derive and no `#[serde(default)]` on any
     // field). Loop over each; each removal must fail deserialize
     // with a missing-field error naming the removed field.
     const REQUIRED_FIELDS: &[&str] = &[
-        "passed",
-        "skipped",
-        "details",
+        "outcomes",
         "passes",
         "stats",
         "measurements",
@@ -216,9 +281,7 @@ fn assert_result_missing_required_field_rejected_by_deserialize() {
     ];
 
     let r = AssertResult {
-        passed: false,
-        skipped: false,
-        details: vec!["detail".into()],
+        outcomes: vec![Outcome::Fail(AssertDetail::new(DetailKind::Other, "detail"))],
         passes: vec![],
         stats: ScenarioStats::default(),
         measurements: std::collections::BTreeMap::new(),

@@ -13,7 +13,7 @@ fn healthy_pass() {
         rpt(2, 1000, 5_000_000_000, 600_000_000, &[0, 1], 60),
         rpt(3, 1000, 5_000_000_000, 550_000_000, &[0, 1], 45),
     ]);
-    assert!(r.passed, "{:?}", r.details);
+    assert!(r.is_pass(), "{:?}", r.outcomes);
 }
 
 #[test]
@@ -22,10 +22,9 @@ fn starved_fail() {
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
         rpt(2, 0, 5e9 as u64, 5e9 as u64, &[0], 50),
     ]);
-    assert!(!r.passed);
+    assert!(r.is_fail());
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Starved))
     );
 }
@@ -37,10 +36,9 @@ fn unfair_spread_fail() {
         rpt(2, 500, 5e9 as u64, 4e9 as u64, &[0, 1], 50),  // 80%
         rpt(3, 800, 5e9 as u64, 2e9 as u64, &[0, 1], 50),  // 40%
     ]);
-    assert!(!r.passed);
+    assert!(r.is_fail());
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Unfair))
     );
 }
@@ -53,7 +51,7 @@ fn fair_oversubscribed_pass() {
         rpt(3, 100, 5e9 as u64, (3.80e9) as u64, &[0], 50),
         rpt(4, 100, 5e9 as u64, (3.75e9) as u64, &[0], 50),
     ]);
-    assert!(r.passed, "{:?}", r.details);
+    assert!(r.is_pass(), "{:?}", r.outcomes);
 }
 
 #[test]
@@ -63,10 +61,9 @@ fn stuck_fail() {
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
         rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[0], threshold + 500),
     ]);
-    assert!(!r.passed);
+    assert!(r.is_fail());
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Stuck))
     );
 }
@@ -81,7 +78,7 @@ fn isolation_pass() {
         ],
         &expected,
     );
-    assert!(r.passed);
+    assert!(r.is_pass());
 }
 
 #[test]
@@ -91,10 +88,9 @@ fn isolation_fail() {
         &[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 4], 50)],
         &expected,
     );
-    assert!(!r.passed);
+    assert!(r.is_fail());
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Isolation))
     );
 }
@@ -110,9 +106,9 @@ fn spread_boundary() {
         rpt(2, 1000, 5e9 as u64, at_threshold_ns, &[0], 50), // 10% + threshold
     ]);
     assert!(
-        r.passed,
+        r.is_pass(),
         "{threshold}% spread at threshold: {:?}",
-        r.details
+        r.outcomes
     );
     // Above threshold - fail
     let above_ns = ((15.0 + threshold) / 100.0 * 5e9) as u64;
@@ -120,12 +116,12 @@ fn spread_boundary() {
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50), // 10%
         rpt(2, 1000, 5e9 as u64, above_ns, &[0], 50),   // 10% + threshold + 5%
     ]);
-    assert!(!r.passed, "spread above {threshold}% should fail");
+    assert!(!r.is_pass(), "spread above {threshold}% should fail");
 }
 
 #[test]
 fn empty_pass() {
-    assert!(assert_not_starved(&[]).passed);
+    assert!(assert_not_starved(&[]).is_pass());
 }
 
 #[test]
@@ -134,10 +130,9 @@ fn zero_wall_time() {
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
         rpt(2, 0, 0, 0, &[], 0),
     ]);
-    assert!(!r.passed);
+    assert!(r.is_fail());
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Starved))
     );
 }
@@ -145,7 +140,7 @@ fn zero_wall_time() {
 #[test]
 fn single_worker_always_pass() {
     let r = assert_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50)]);
-    assert!(r.passed);
+    assert!(r.is_pass());
     assert_eq!(r.stats.total_workers, 1);
     assert_eq!(r.stats.cgroups.len(), 1);
 }
@@ -156,7 +151,7 @@ fn stats_accuracy() {
         rpt(1, 1000, 5e9 as u64, 1e9 as u64, &[0], 50),  // 20%
         rpt(2, 1000, 5e9 as u64, 15e8 as u64, &[1], 60), // 30%
     ]);
-    assert!(r.passed); // spread = 10% < 15%
+    assert!(r.is_pass()); // spread = 10% < 15%
     let c = &r.stats.cgroups[0];
     assert_eq!(c.num_workers, 2);
     assert_eq!(c.num_cpus, 2);
@@ -169,24 +164,23 @@ fn stats_accuracy() {
 #[test]
 fn isolation_empty_reports() {
     let expected: BTreeSet<usize> = [0, 1].into_iter().collect();
-    assert!(assert_isolation(&[], &expected).passed);
+    assert!(assert_isolation(&[], &expected).is_pass());
 }
 
 #[test]
 fn gap_boundary_at_threshold_pass() {
     let threshold = gap_threshold_ms();
     let r = assert_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], threshold)]);
-    assert!(r.passed, "gap at threshold should pass: {:?}", r.details);
+    assert!(r.is_pass(), "gap at threshold should pass: {:?}", r.outcomes);
 }
 
 #[test]
 fn gap_boundary_above_threshold_fail() {
     let threshold = gap_threshold_ms();
     let r = assert_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], threshold + 1)]);
-    assert!(!r.passed);
+    assert!(r.is_fail());
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Stuck))
     );
 }
@@ -198,11 +192,8 @@ fn multiple_stuck_workers() {
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], threshold + 500),
         rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], threshold + 1500),
     ]);
-    assert!(!r.passed);
-    let stuck_count = r
-        .details
-        .iter()
-        .filter(|d| matches!(d.kind, DetailKind::Stuck))
+    assert!(r.is_fail());
+    let stuck_count = r.failure_details().filter(|d| matches!(d.kind, DetailKind::Stuck))
         .count();
     assert_eq!(stuck_count, 2, "both workers should be flagged stuck");
 }
@@ -218,7 +209,7 @@ fn migration_tracking() {
 #[test]
 fn single_worker_spread_zero() {
     let r = assert_not_starved(&[rpt(1, 500, 5e9 as u64, 25e8 as u64, &[0, 1], 50)]);
-    assert!(r.passed);
+    assert!(r.is_pass());
     let c = &r.stats.cgroups[0];
     assert!((c.spread - 0.0).abs() < f64::EPSILON);
 }
@@ -230,9 +221,9 @@ fn zero_wall_time_nonzero_work() {
     // The off_cpu_pct computation skips this worker (no pcts entry).
     let r = assert_not_starved(&[rpt(1, 100, 0, 0, &[0], 0)]);
     assert!(
-        r.passed,
+        r.is_pass(),
         "nonzero work with zero wall_time: {:?}",
-        r.details
+        r.outcomes
     );
 }
 
@@ -246,10 +237,9 @@ fn isolation_empty_expected_set() {
         &expected,
     );
     // Worker used CPUs {0,1}, expected is empty, so all are unexpected.
-    assert!(!r.passed);
+    assert!(r.is_fail());
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Isolation))
     );
 }
@@ -259,7 +249,7 @@ fn isolation_worker_used_no_cpus() {
     // Worker used no CPUs -- difference with expected is empty, so passes.
     let expected: BTreeSet<usize> = [0, 1].into_iter().collect();
     let r = assert_isolation(&[rpt(1, 0, 0, 0, &[], 0)], &expected);
-    assert!(r.passed);
+    assert!(r.is_pass());
 }
 
 #[test]
@@ -269,10 +259,9 @@ fn isolation_all_unexpected_cpus() {
         &[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[4, 5, 6], 50)],
         &expected,
     );
-    assert!(!r.passed);
+    assert!(r.is_fail());
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Isolation))
     );
 }
@@ -288,18 +277,12 @@ fn neg_starvation_zero_work_detected() {
         rpt(2, 0, 5e9 as u64, 0, &[0], 0), // starved
         rpt(3, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50),
     ]);
-    assert!(!r.passed, "starvation must be caught");
-    let starved = r
-        .details
-        .iter()
-        .filter(|d| matches!(d.kind, DetailKind::Starved))
+    assert!(!r.is_pass(), "starvation must be caught");
+    let starved = r.failure_details().filter(|d| matches!(d.kind, DetailKind::Starved))
         .count();
     assert_eq!(starved, 1, "exactly one starved worker expected");
     // Format: "tid 2 starved (0 work units)"
-    let detail = r
-        .details
-        .iter()
-        .find(|d| matches!(d.kind, DetailKind::Starved))
+    let detail = r.failure_details().find(|d| matches!(d.kind, DetailKind::Starved))
         .unwrap();
     assert!(
         detail.message.contains("tid 2"),
@@ -319,12 +302,9 @@ fn neg_isolation_violation_outside_cpuset() {
         rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 2, 3], 50),
     ];
     let r = assert_isolation(&reports, &expected);
-    assert!(!r.passed, "isolation violation must be caught");
+    assert!(!r.is_pass(), "isolation violation must be caught");
     // Format: "tid 2 ran on unexpected CPUs {2, 3}"
-    let detail = r
-        .details
-        .iter()
-        .find(|d| matches!(d.kind, DetailKind::Isolation))
+    let detail = r.failure_details().find(|d| matches!(d.kind, DetailKind::Isolation))
         .unwrap();
     assert!(
         detail.message.contains("tid 2"),
@@ -339,7 +319,7 @@ fn neg_isolation_violation_outside_cpuset() {
         "must list out-of-set CPU 3: {detail}"
     );
     // Worker 1 ran only on {0,1} which is within expected — no violation.
-    assert_eq!(r.details.len(), 1, "only tid 2 should violate");
+    assert_eq!(r.outcomes.len(), 1, "only tid 2 should violate");
 }
 
 #[test]
@@ -348,12 +328,9 @@ fn neg_unfairness_extreme_spread_detected() {
         rpt(1, 100, 5e9 as u64, 25e7 as u64, &[0, 1], 50), // 5%
         rpt(2, 5000, 5e9 as u64, 475e7 as u64, &[0, 1], 50), // 95%
     ]);
-    assert!(!r.passed, "extreme unfairness must be caught");
+    assert!(!r.is_pass(), "extreme unfairness must be caught");
     // Format: "unfair cgroup: spread=90% (5-95%) 2 workers on 2 cpus (threshold 15%)"
-    let detail = r
-        .details
-        .iter()
-        .find(|d| matches!(d.kind, DetailKind::Unfair))
+    let detail = r.failure_details().find(|d| matches!(d.kind, DetailKind::Unfair))
         .unwrap();
     assert!(
         detail.message.contains("spread="),
@@ -402,12 +379,9 @@ fn neg_scheduling_gap_exceeds_threshold() {
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
         rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], gap),
     ]);
-    assert!(!r.passed, "scheduling gap must be caught");
+    assert!(!r.is_pass(), "scheduling gap must be caught");
     // Format: "tid 2 stuck {gap}ms on cpu1 at +1000ms (threshold 2000ms)"
-    let detail = r
-        .details
-        .iter()
-        .find(|d| matches!(d.kind, DetailKind::Stuck))
+    let detail = r.failure_details().find(|d| matches!(d.kind, DetailKind::Stuck))
         .unwrap();
     assert!(
         detail.message.contains(&format!("{}ms", gap)),
@@ -450,12 +424,9 @@ fn neg_plan_custom_gap_catches_lower_threshold() {
         rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 1000),
     ];
     let r = plan.assert_cgroup(&reports, None, None);
-    assert!(!r.passed, "custom 500ms threshold must catch 1000ms gap");
+    assert!(!r.is_pass(), "custom 500ms threshold must catch 1000ms gap");
     // Format: "tid 2 stuck 1000ms on cpu1 at +1000ms (threshold 500ms)"
-    let detail = r
-        .details
-        .iter()
-        .find(|d| matches!(d.kind, DetailKind::Stuck))
+    let detail = r.failure_details().find(|d| matches!(d.kind, DetailKind::Stuck))
         .unwrap();
     assert!(
         detail.message.contains("1000ms"),
@@ -485,12 +456,9 @@ fn neg_isolation_plus_starvation_both_reported() {
         rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[4, 5], 50),
     ];
     let r = plan.assert_cgroup(&reports, Some(&expected), None);
-    assert!(!r.passed);
+    assert!(r.is_fail());
     // Starvation detail must name tid 1 with "0 work units".
-    let starved_detail = r
-        .details
-        .iter()
-        .find(|d| matches!(d.kind, DetailKind::Starved))
+    let starved_detail = r.failure_details().find(|d| matches!(d.kind, DetailKind::Starved))
         .unwrap();
     assert!(
         starved_detail.message.contains("tid 1"),
@@ -501,10 +469,7 @@ fn neg_isolation_plus_starvation_both_reported() {
         "format: {starved_detail}"
     );
     // Isolation detail must name tid 2 with CPUs {4, 5}.
-    let iso_detail = r
-        .details
-        .iter()
-        .find(|d| matches!(d.kind, DetailKind::Isolation))
+    let iso_detail = r.failure_details().find(|d| matches!(d.kind, DetailKind::Isolation))
         .unwrap();
     assert!(
         iso_detail.message.contains("tid 2"),
@@ -527,13 +492,10 @@ fn neg_assert_cgroup_via_assert_struct() {
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 2], 50)];
     let r = v.assert_cgroup(&reports, Some(&expected));
     assert!(
-        !r.passed,
+        !r.is_pass(),
         "Assert.assert_cgroup must catch isolation failure"
     );
-    let detail = r
-        .details
-        .iter()
-        .find(|d| matches!(d.kind, DetailKind::Isolation))
+    let detail = r.failure_details().find(|d| matches!(d.kind, DetailKind::Isolation))
         .unwrap();
     assert!(detail.message.contains("tid 1"), "must name tid: {detail}");
     assert!(detail.message.contains("1"), "must list CPU 1: {detail}");
@@ -549,9 +511,6 @@ fn neg_plan_custom_gap_passes_below_threshold() {
     ];
     let r = plan.assert_cgroup(&reports, None, None);
     // 1000ms gap < 5000ms threshold, so it passes.
-    let has_stuck = r
-        .details
-        .iter()
-        .any(|d| matches!(d.kind, DetailKind::Stuck));
+    let has_stuck = r.failure_details().any(|d| matches!(d.kind, DetailKind::Stuck));
     assert!(!has_stuck, "1000ms gap should pass 5000ms threshold");
 }

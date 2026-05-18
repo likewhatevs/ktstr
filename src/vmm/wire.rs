@@ -432,12 +432,149 @@ pub const MSG_TYPE_LIFECYCLE: u32 = 0x4c49_4645; // "LIFE"
 ///
 /// Sent BEFORE `MSG_TYPE_SYS_RDY` so the monitor has `phys_base`
 /// and `page_offset_base` before its first sample iteration.
-/// Payload layout: `[phys_base: u64 LE, page_offset_base: u64 LE]`.
-/// The guest reads these from `/proc/kallsyms` after
-/// `mount_filesystems` — by that point `__startup_64` and
-/// `kernel_randomize_memory` have both run, so the values are
-/// final regardless of KASLR configuration.
+/// Payload layout: 24 bytes encoded by [`KernAddrs::to_payload`]:
+///   `[phys_base + 1 : u64 LE, page_offset_base : u64 LE, kernel_text_runtime_kva + 1 : u64 LE]`
+/// The guest reads these from `/proc/iomem` and `/proc/kallsyms`
+/// after `mount_filesystems` — by that point `__startup_64`,
+/// `kernel_randomize_memory`, `cpu_init → syscall_init`, and the
+/// post-relocation kallsyms table population have all run, so the
+/// values are final regardless of KASLR configuration.
 pub const MSG_TYPE_KERN_ADDRS: u32 = 0x4b41_4452; // "KADR"
+
+/// Typed payload for [`MSG_TYPE_KERN_ADDRS`].
+///
+/// Three u64 fields published by the guest at boot so the host can
+/// translate kernel virtual addresses without walking guest page
+/// tables and recover the virt-KASLR slide without a separate
+/// in-VMM derivation. The wire layout uses bias-by-1 on the
+/// `phys_base` and `kernel_text_runtime_kva` slots so 0 stays the
+/// "not yet received / could not derive" sentinel; `page_offset_base`
+/// is unbiased (today the guest always sends 0 and the host
+/// re-derives via page-table walk — left in the layout for a future
+/// extension that bypasses the walk).
+///
+/// Constructors:
+///   - [`Self::new`]: bare fields, no sentinel logic. Used by
+///     [`crate::vmm::guest_comms::send_kern_addrs`] on the guest
+///     side.
+///   - [`Self::from_payload`]: decodes a 24-byte payload, strips
+///     the +1 bias on the biased slots, validates the length. Used
+///     by the host dispatch arm in
+///     [`crate::vmm::freeze_coord::dispatch::dispatch_bulk_message`].
+///
+/// Field semantics:
+///   - `phys_base = 0` is a legitimate KASLR-off value (the
+///     payload encodes it biased as `1`, decoder strips back to
+///     `0`). [`Self::has_phys_present_bit`] reports whether the
+///     guest sent a non-zero biased phys_base (i.e. the payload
+///     carries phys_base data at all).
+///   - `kernel_text_runtime_kva` is wrapped in `Option<u64>` so
+///     the decoder distinguishes "guest could not read kallsyms"
+///     (`None`) from "guest read kallsyms and KASLR is off"
+///     (`Some(link_kva)`). The bias-by-1 encoding handles the
+///     former (biased 0 → `None`); a non-zero biased value
+///     decodes to `Some(raw)`.
+#[derive(Debug, Clone, Copy)]
+pub struct KernAddrs {
+    /// Guest-derived `phys_base` (the KASLR-physical slide), or 0
+    /// when KASLR-physical is off (`__startup_64` left
+    /// `phys_base = 0`). Compare with the host's expected
+    /// load-address to recover the physical KASLR offset.
+    pub phys_base: u64,
+    /// Guest-derived `page_offset_base` (the KASLR-direct-map
+    /// slide on x86_64) if the guest derived it; the host today
+    /// always sees 0 here and falls back to a page-table walk via
+    /// `monitor::symbols::resolve_page_offset_with_tcr`. Left in
+    /// the wire format for a future extension.
+    pub page_offset_base: u64,
+    /// Runtime KVA of `_text` (the kernel image start symbol)
+    /// from the guest's `/proc/kallsyms`, when readable. The
+    /// host derives `virt_kaslr = runtime - link_text_kva` using
+    /// the link-time KVA extracted from vmlinux at coordinator
+    /// init. `None` when the guest could not read kallsyms
+    /// (kptr_restrict masked, /proc not mountable, symbol absent).
+    pub kernel_text_runtime_kva: Option<u64>,
+}
+
+impl KernAddrs {
+    /// Wire-format byte length. Exact-match check on the receive
+    /// side so a future payload extension trips a decoder
+    /// rejection rather than silently dropping the new bytes.
+    pub const WIRE_LEN: usize = 24;
+
+    /// Construct from bare field values. Caller owns the
+    /// "did I read kallsyms?" decision via the `Option` on
+    /// `kernel_text_runtime_kva`.
+    pub fn new(
+        phys_base: u64,
+        page_offset_base: u64,
+        kernel_text_runtime_kva: Option<u64>,
+    ) -> Self {
+        Self {
+            phys_base,
+            page_offset_base,
+            kernel_text_runtime_kva,
+        }
+    }
+
+    /// Encode to a 24-byte LE payload with `+1` bias on the
+    /// biased slots. Caller transmits this on the wire. Takes
+    /// `self` by value since [`Self`] is `Copy` and the encoder
+    /// reads each field at most once.
+    pub fn to_payload(self) -> [u8; Self::WIRE_LEN] {
+        let mut buf = [0u8; Self::WIRE_LEN];
+        buf[..8].copy_from_slice(&(self.phys_base.wrapping_add(1)).to_le_bytes());
+        buf[8..16].copy_from_slice(&self.page_offset_base.to_le_bytes());
+        // bias 0 → encodes as 0 (sentinel: guest could not derive)
+        let runtime_biased = match self.kernel_text_runtime_kva {
+            Some(kva) => kva.wrapping_add(1),
+            None => 0,
+        };
+        buf[16..24].copy_from_slice(&runtime_biased.to_le_bytes());
+        buf
+    }
+
+    /// Decode from a wire payload. Returns `None` on length
+    /// mismatch (exact match required — short payloads never
+    /// publish either slot to avoid a partial-init race; longer
+    /// payloads indicate a protocol extension the decoder
+    /// doesn't understand).
+    pub fn from_payload(payload: &[u8]) -> Option<Self> {
+        if payload.len() != Self::WIRE_LEN {
+            return None;
+        }
+        let phys_biased = u64::from_le_bytes(payload[..8].try_into().ok()?);
+        let page_offset_base = u64::from_le_bytes(payload[8..16].try_into().ok()?);
+        let runtime_biased = u64::from_le_bytes(payload[16..24].try_into().ok()?);
+        Some(Self {
+            // biased 0 means "guest didn't send" — but the
+            // unbiased phys_base = 0 is legitimate (KASLR off).
+            // `has_phys_present_bit` distinguishes the two on the
+            // host side.
+            phys_base: phys_biased.wrapping_sub(1),
+            page_offset_base,
+            kernel_text_runtime_kva: if runtime_biased == 0 {
+                None
+            } else {
+                Some(runtime_biased.wrapping_sub(1))
+            },
+        })
+    }
+
+    /// True iff the encoded payload had a non-zero biased
+    /// `phys_base` slot (i.e. the guest sent phys_base data).
+    /// Distinguishes "guest sent phys_base = 0" (KASLR off, valid)
+    /// from "guest didn't send phys_base at all" (truncated wire
+    /// path, treat as absent). Computed from the post-decode
+    /// `phys_base` field: encoded `phys_biased = phys_base + 1`
+    /// is non-zero iff `phys_base != u64::MAX`. Wrap-around case
+    /// (`phys_base = u64::MAX` encodes to biased 0) is impossible
+    /// in practice — kernel `phys_base` is a low physical address,
+    /// never the all-ones sentinel.
+    pub fn has_phys_present_bit(&self) -> bool {
+        self.phys_base != u64::MAX
+    }
+}
 
 /// Guest→host shell-exec exit code (payload: 4-byte LE i32).
 ///
@@ -1527,5 +1664,107 @@ mod tests {
         // Bytes reads on 1024 CPUs, small enough to keep OOM
         // exposure bounded for a forged frame.
         assert_eq!(KERNEL_OP_REPLY_MAX, 1024 * 1024);
+    }
+
+    // ----- KernAddrs wire-format pins -----
+    //
+    // Pin both the typed encode/decode contract AND the on-wire
+    // byte layout. The byte-layout pin (last test) catches slot-
+    // swap regressions that a roundtrip-equality test alone would
+    // miss when encoder and decoder both flip the same way.
+
+    #[test]
+    fn kern_addrs_roundtrip_all_present() {
+        let a = KernAddrs::new(
+            0x12345678u64,
+            0xffff_8880_0000_0000u64,
+            Some(0xffff_ffff_8200_0000u64),
+        );
+        let payload = a.to_payload();
+        assert_eq!(payload.len(), KernAddrs::WIRE_LEN);
+        let b = KernAddrs::from_payload(&payload).expect("decode");
+        assert_eq!(b.phys_base, a.phys_base);
+        assert_eq!(b.page_offset_base, a.page_offset_base);
+        assert_eq!(b.kernel_text_runtime_kva, a.kernel_text_runtime_kva);
+        assert!(b.has_phys_present_bit());
+    }
+
+    #[test]
+    fn kern_addrs_roundtrip_kallsyms_absent() {
+        // The None branch on kernel_text_runtime_kva must decode
+        // back to None (NOT Some(u64::MAX) via wrapping_sub(1) on
+        // a raw-0 biased slot). The biased-0 sentinel is the
+        // wire-format "guest could not derive" marker.
+        let a = KernAddrs::new(0u64, 0u64, None);
+        let payload = a.to_payload();
+        let b = KernAddrs::from_payload(&payload).expect("decode");
+        assert_eq!(
+            b.kernel_text_runtime_kva, None,
+            "biased-0 runtime slot must decode to None"
+        );
+        // phys_base = 0 IS a valid KASLR-off value; the biased
+        // encoder writes 1 (non-zero) so has_phys_present_bit
+        // surfaces present.
+        assert!(b.has_phys_present_bit());
+    }
+
+    #[test]
+    fn kern_addrs_from_payload_rejects_length_mismatch() {
+        // Exact-length match required so a protocol-extension
+        // partial write or truncated wire surfaces as None,
+        // never as a zero-padded silent decode.
+        assert!(KernAddrs::from_payload(&[]).is_none());
+        assert!(KernAddrs::from_payload(&[0u8; KernAddrs::WIRE_LEN - 1]).is_none());
+        assert!(KernAddrs::from_payload(&[0u8; KernAddrs::WIRE_LEN + 1]).is_none());
+    }
+
+    #[test]
+    fn kern_addrs_has_phys_present_bit_distinguishes_zero_vs_absent() {
+        // Pins the bias-sentinel contract on the present-bit
+        // accessor. A struct constructed via KernAddrs::new with
+        // phys_base=0 surfaces as present (encoded biased = 1).
+        // A hand-decoded all-zero payload (the "guest never
+        // sent" wire state) surfaces as absent (raw biased 0 →
+        // wrapping_sub(1) = u64::MAX → has_phys_present_bit
+        // returns false).
+        let present = KernAddrs::new(0u64, 0u64, None);
+        assert!(present.has_phys_present_bit());
+        let absent = KernAddrs::from_payload(&[0u8; KernAddrs::WIRE_LEN])
+            .expect("zero-length payload decodes; shape is valid");
+        assert!(
+            !absent.has_phys_present_bit(),
+            "zero-bias slot decodes to u64::MAX; has_phys_present_bit must surface absent"
+        );
+    }
+
+    #[test]
+    fn kern_addrs_to_payload_byte_layout_is_le_phys_first() {
+        // Pin the on-wire byte layout directly via slot offsets.
+        // A reordering refactor that swapped slots would silently
+        // pass the roundtrip-equality tests above (encoder and
+        // decoder would flip together) — this test catches the
+        // slot-swap class by asserting against fixed byte
+        // positions.
+        let a = KernAddrs::new(
+            0x1111_2222_3333_4444u64,
+            0xaaaa_bbbb_cccc_ddddu64,
+            Some(0x5555_6666_7777_8888u64),
+        );
+        let p = a.to_payload();
+        // phys_base biased: ...4444 + 1 = ...4445; LE first byte = 0x45.
+        assert_eq!(p[0], 0x45, "phys_base slot is [0..8] LE biased");
+        assert_eq!(
+            u64::from_le_bytes(p[..8].try_into().unwrap()),
+            0x1111_2222_3333_4445
+        );
+        assert_eq!(
+            u64::from_le_bytes(p[8..16].try_into().unwrap()),
+            0xaaaa_bbbb_cccc_ddddu64
+        );
+        // kernel_text_runtime_kva biased: ...8888 + 1 = ...8889.
+        assert_eq!(
+            u64::from_le_bytes(p[16..24].try_into().unwrap()),
+            0x5555_6666_7777_8889u64
+        );
     }
 }

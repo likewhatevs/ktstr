@@ -162,7 +162,7 @@ fn scenario_btrfs_filesystem_visible_at_dev_vda(
     }
 
     let mut result = AssertResult::pass();
-    result.details.push(AssertDetail::new(
+    result.record_fail(AssertDetail::new(
         DetailKind::Other,
         format!(
             "/mnt/disk0 statfs.f_type=0x{fs_type:x} matches \
@@ -286,7 +286,7 @@ fn scenario_ficlone_clone_writable_and_fresh(_ctx: &ktstr::scenario::Ctx) -> Res
     }
 
     let mut result = AssertResult::pass();
-    result.details.push(AssertDetail::new(
+    result.record_fail(AssertDetail::new(
         DetailKind::Other,
         format!(
             "FICLONE clone produced a fresh writable btrfs filesystem \

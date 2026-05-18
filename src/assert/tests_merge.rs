@@ -20,7 +20,7 @@ fn merge_cgroups() {
     m.merge(r2);
     assert_eq!(m.stats.cgroups.len(), 2);
     assert_eq!(m.stats.total_workers, 4);
-    assert!(m.passed, "diff cgroups diff off_cpu should pass");
+    assert!(m.is_pass(), "diff cgroups diff off_cpu should pass");
 }
 
 #[test]
@@ -82,22 +82,40 @@ fn merge_takes_worst_spread() {
 }
 
 #[test]
-fn merge_skip_plus_pass_demotes_skip() {
+fn merge_skip_plus_explicit_pass_demotes_skip() {
+    // A bare `AssertResult::pass()` has empty outcomes (the
+    // zero-allocation Pass identity). Merging it onto a skip leaves
+    // the stream all-Skip, so it does NOT demote. To demote a skip,
+    // the passing side must carry an explicit `Outcome::Pass` marker
+    // via `record_pass()` — that's the "real Pass beats Skip" semantic.
+    let mut a = AssertResult::skip("optional");
+    let mut b = AssertResult::pass();
+    b.record_pass();
+    a.merge(b);
+    assert!(!a.is_skip(), "explicit Pass in the merged stream means not all-Skip");
+    assert!(a.is_pass(), "explicit Pass + no Fail → is_pass=true");
+}
+
+#[test]
+fn merge_skip_plus_empty_pass_stays_skip() {
+    // Companion to merge_skip_plus_explicit_pass_demotes_skip: bare
+    // `pass()` (empty outcomes) cannot demote a skip; the merged
+    // stream is still all-Skip.
     let mut a = AssertResult::skip("optional");
     let b = AssertResult::pass();
     a.merge(b);
-    assert!(!a.skipped);
-    assert!(a.passed);
+    assert!(a.is_skip(), "empty pass() merges to a no-op; stream stays all-Skip");
+    assert!(!a.is_pass(), "Phase 2b: all-Skip is not pass");
 }
 
 #[test]
 fn merge_skip_plus_fail_is_fail_not_skip() {
     let mut a = AssertResult::skip("topo missing");
     let mut b = AssertResult::pass();
-    b.passed = false;
+    b.record_fail(AssertDetail::new(DetailKind::Other, "synthetic fail"));
     a.merge(b);
-    assert!(!a.passed);
-    assert!(!a.skipped);
+    assert!(a.is_fail());
+    assert!(!a.is_skip());
 }
 
 #[test]
@@ -150,9 +168,7 @@ fn merge_three_cgroups_worst_wins_and_iterations_sum() {
         // is now method-only and recomputed on read from
         // `total_iterations / num_workers`.
         AssertResult {
-            passed: true,
-            skipped: false,
-            details: vec![],
+            outcomes: vec![],
             passes: vec![],
             stats: ScenarioStats {
                 total_iterations: total_iters,
@@ -512,16 +528,14 @@ fn merge_ext_metrics_first_insert_uses_other_value() {
 fn merge_pass_and_fail() {
     let pass = AssertResult::pass();
     let mut fail = AssertResult::pass();
-    fail.passed = false;
-    fail.details.push("something failed".into());
+    fail.record_fail(AssertDetail::new(DetailKind::Other, "something failed"));
 
     let mut merged = pass;
     merged.merge(fail);
-    assert!(!merged.passed, "merging pass+fail must produce fail");
+    assert!(merged.is_fail(), "merging pass+fail must produce fail");
     assert!(
         merged
-            .details
-            .iter()
+            .failure_details()
             .any(|d| d.message.contains("something failed"))
     );
 }
@@ -529,21 +543,18 @@ fn merge_pass_and_fail() {
 #[test]
 fn merge_fail_and_pass() {
     let mut fail = AssertResult::pass();
-    fail.passed = false;
-    fail.details.push("first failed".into());
+    fail.record_fail(AssertDetail::new(DetailKind::Other, "first failed"));
     let pass = AssertResult::pass();
 
     let mut merged = fail;
     merged.merge(pass);
-    assert!(!merged.passed, "merging fail+pass must produce fail");
+    assert!(merged.is_fail(), "merging fail+pass must produce fail");
 }
 
 #[test]
 fn assert_result_merge_combines_stats() {
     let mut a = AssertResult {
-        passed: true,
-        skipped: false,
-        details: vec!["a".into()],
+        outcomes: vec![Outcome::Fail(AssertDetail::new(DetailKind::Other, "a"))],
         passes: vec![],
         stats: ScenarioStats {
             cgroups: vec![],
@@ -559,9 +570,7 @@ fn assert_result_merge_combines_stats() {
         info_notes: vec![],
     };
     let b = AssertResult {
-        passed: false,
-        skipped: false,
-        details: vec!["b".into()],
+        outcomes: vec![Outcome::Fail(AssertDetail::new(DetailKind::Other, "b"))],
         passes: vec![],
         stats: ScenarioStats {
             cgroups: vec![],
@@ -577,10 +586,9 @@ fn assert_result_merge_combines_stats() {
         info_notes: vec![],
     };
     a.merge(b);
-    assert!(!a.passed);
+    assert!(a.is_fail());
     assert_eq!(
-        a.details
-            .iter()
+        a.failure_details()
             .map(|d| d.message.as_str())
             .collect::<Vec<_>>(),
         vec!["a", "b"]

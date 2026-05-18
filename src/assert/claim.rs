@@ -34,7 +34,7 @@
 
 use std::collections::BTreeSet;
 
-use super::{Assert, AssertDetail, AssertResult, DetailKind, NoteValue};
+use super::{Assert, AssertDetail, AssertResult, DetailKind, NoteValue, Outcome};
 
 /// Read the `KTSTR_LOG_PASSES` env var to seed
 /// [`Verdict::log_passes`]. Any value other than `""` or `"0"` enables
@@ -52,7 +52,7 @@ fn log_passes_default() -> bool {
 /// Pointwise-claim accumulator.
 ///
 /// Carries an [`AssertResult`] under the hood and exposes the same
-/// `passed` / `details` / `stats` shape on completion. Build via
+/// `outcome()` / `outcomes` / `stats` shape on completion. Build via
 /// [`Verdict::new`] or [`Assert::verdict`]; finish with
 /// [`Verdict::into_result`].
 ///
@@ -61,7 +61,7 @@ fn log_passes_default() -> bool {
 /// // Empty verdict — no claims, passes.
 /// let v = Assert::default_checks().verdict();
 /// let r = v.into_result();
-/// assert!(r.passed);
+/// assert!(r.is_pass());
 /// ```
 #[must_use = "Verdict accumulates claims; call into_result() to consume"]
 #[derive(Debug, Clone)]
@@ -239,10 +239,7 @@ impl Verdict {
     /// [`AssertResult::skip`], which is a CONSTRUCTOR producing a
     /// fresh passing-skipped envelope from no prior state.
     pub fn skip(&mut self, reason: impl Into<String>) -> &mut Self {
-        self.result.skipped = true;
-        self.result
-            .details
-            .push(AssertDetail::new(DetailKind::Skip, reason));
+        self.result.record_skip(reason);
         self
     }
 
@@ -269,12 +266,17 @@ impl Verdict {
     /// True iff every claim recorded so far passed and no merged
     /// upstream result reported a failure. Read-only.
     pub fn passed(&self) -> bool {
-        self.result.passed
+        self.result.is_pass()
     }
 
-    /// Number of details (failures, notes, skips) recorded so far.
+    /// Number of recorded outcomes carrying a payload (Fail + Skip)
+    /// — i.e. recorded diagnostics so far. Pass markers don't count.
     pub fn detail_count(&self) -> usize {
-        self.result.details.len()
+        self.result
+            .outcomes
+            .iter()
+            .filter(|o| !matches!(o, Outcome::Pass))
+            .count()
     }
 
     /// Read the [`Assert`] threshold config attached at construction
@@ -319,8 +321,7 @@ impl Verdict {
     /// comparator on every builder type.
     fn record(&mut self, outcome: ClaimOutcome) {
         if let ClaimOutcome::Fail { kind, message } = outcome {
-            self.result.passed = false;
-            self.result.details.push(AssertDetail::new(kind, message));
+            self.result.record_fail(AssertDetail::new(kind, message));
         }
     }
 
@@ -1121,7 +1122,7 @@ impl<'a, T: std::fmt::Debug> SeqClaim<'a, T> {
 /// claim!(v, answer).at_least(40);
 /// claim!(v, answer * 2).at_most(100);
 /// let r = v.into_result();
-/// assert!(r.passed);
+/// assert!(r.is_pass());
 /// ```
 #[macro_export]
 macro_rules! claim {

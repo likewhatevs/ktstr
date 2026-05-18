@@ -108,9 +108,9 @@ mod tests {
         crate::claim!(v, got_hex).eq(want_hex);
         let r = v.into_result();
         assert!(
-            r.passed,
+            r.is_pass(),
             "tar roundtrip claims must all pass: {:?}",
-            r.details,
+            r.outcomes,
         );
 
         // Confirm only one entry was packed.
@@ -150,9 +150,9 @@ mod tests {
         crate::claim!(v, a_mode).ne(b_mode);
         let r = v.into_result();
         assert!(
-            r.passed,
+            r.is_pass(),
             "per-call mode must be preserved distinctly: {:?}",
-            r.details,
+            r.outcomes,
         );
     }
 }

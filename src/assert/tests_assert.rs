@@ -467,7 +467,7 @@ fn assert_cgroup_delegates_to_plan() {
     let v = Assert::NO_OVERRIDES.check_not_starved();
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)];
     let r = v.assert_cgroup(&reports, None);
-    assert!(r.passed);
+    assert!(r.is_pass());
     assert_eq!(r.stats.total_workers, 1);
 }
 
@@ -1604,12 +1604,13 @@ fn outcome_accessor_truth_table() {
     assert!(Outcome::Fail(d.clone()).is_fail());
 }
 
-/// `AssertResult::outcome()` Phase-2a derived view over the tri-state
-/// `(passed, skipped, details)` representation. Pins the synthesis
-/// rules so Phase-2b's eventual replacement of the underlying fields
-/// produces the same terminal verdict consumers see today.
+/// `AssertResult::outcome()` folds the `outcomes: Vec<Outcome>` slot
+/// into a single terminal verdict per `Outcome::merge`'s precedence
+/// (Fail > Pass > Skip; identity Pass). Pins the synthesis rules so
+/// consumers that read `outcome()` see Pass / Skip / Fail without
+/// depending on the inner vec structure.
 #[test]
-fn assert_result_outcome_derives_from_tri_state() {
+fn assert_result_outcome_folds_outcomes_vec() {
     // Pass result with no notable details → Outcome::Pass.
     assert!(AssertResult::pass().outcome().is_pass());
 
@@ -1630,85 +1631,128 @@ fn assert_result_outcome_derives_from_tri_state() {
     assert!(d.message.contains("boom"));
 }
 
-/// Producer-side defect detector: `outcome()` debug-asserts when a
-/// caller sets `passed=false` without pushing a non-Skip detail.
-/// Pins the panic message so a regression that renames the
-/// producer-defect signal (or removes the assert) trips loudly.
-/// Release builds fall back to the `"unspecified failure"`
-/// placeholder; this test guards the debug-build safety net that
-/// catches the bug at the test site instead of the operator dump.
+/// Phase 2b mutator semantics: repeated `record_fail` calls append
+/// distinct Fail outcomes onto the vec; `outcome()` folds them and
+/// the result is Fail with the LEFT operand's payload winning per
+/// `Outcome::merge`'s payload-tie semantics.
 #[test]
-#[should_panic(expected = "producer-side defect")]
-fn assert_result_outcome_debug_asserts_on_failure_without_detail() {
+fn assert_result_record_fail_appends_and_folds_fail() {
     let mut r = AssertResult::pass();
-    r.passed = false; // simulate a hand-constructed failure without a detail
-    let _ = r.outcome();
-}
-
-/// Same producer-defect detector for the skip axis: `outcome()`
-/// debug-asserts when `skipped=true` is set without pushing a
-/// Skip-kind detail. Mirror of the !passed assert above.
-#[test]
-#[should_panic(expected = "producer-side defect")]
-fn assert_result_outcome_debug_asserts_on_skip_without_detail() {
-    let mut r = AssertResult::pass();
-    r.skipped = true; // skipped flag set, but no Skip-kind detail pushed
-    let _ = r.outcome();
-}
-
-/// Inconsistent-flag fixture: `passed=false, skipped=true`. The
-/// accessor's `!self.passed` branch fires first, returning Fail even
-/// though skipped=true is also set. Pins "Fail dominates inconsistent
-/// state" so a future refactor that flips accessor priority (skip
-/// before fail) trips this test.
-///
-/// Uses a fixture with BOTH a Skip-kind detail and a non-Skip detail
-/// so the debug_assert path in `outcome()` doesn't fire (a non-Skip
-/// detail exists for the Fail branch to consume).
-#[test]
-fn assert_result_outcome_fail_dominates_inconsistent_flags() {
-    let mut r = AssertResult::pass();
-    r.passed = false;
-    r.skipped = true;
-    r.details.push(AssertDetail::new(DetailKind::Skip, "skip reason"));
-    r.details.push(AssertDetail::new(DetailKind::Starved, "real failure"));
+    assert!(r.is_pass(), "fresh AssertResult::pass is_pass");
+    r.record_fail(AssertDetail::new(DetailKind::Starved, "first"));
+    r.record_fail(AssertDetail::new(DetailKind::Stuck, "second"));
+    assert_eq!(r.outcomes.len(), 2);
+    assert!(r.is_fail());
     let Outcome::Fail(d) = r.outcome() else {
-        panic!("expected Outcome::Fail on inconsistent flags, got {:?}", r.outcome());
+        panic!("expected Outcome::Fail, got {:?}", r.outcome());
     };
-    // Fail branch picks the first non-Skip detail, so the Starved
-    // entry surfaces (not the Skip one) — confirms the priority of
-    // "Fail with real diagnostic" over "Skip with reason" on
-    // contradictory state.
+    // LEFT-wins on Fail+Fail ties: first record_fail's detail wins.
     assert_eq!(d.kind, DetailKind::Starved);
-    assert!(d.message.contains("real failure"));
+    assert!(d.message.contains("first"));
+    // Iteration helper surfaces both fails.
+    let collected: Vec<&AssertDetail> = r.failure_details().collect();
+    assert_eq!(collected.len(), 2);
 }
 
-/// `Outcome` serde uses the explicit-tag style `#[serde(tag =
-/// "kind", content = "data")]`. Pin the JSON shape so a refactor
-/// that flips to `untagged` or `tag = "type"` trips loudly. Sidecar
-/// consumers will hard-code on the `"kind"` key once Phase-2b
-/// migrates AssertResult to carry Outcomes on the wire.
+/// `record_skip` appends a Skip outcome carrying the reason; mixed
+/// Skip + Pass = Pass (Pass dominates Skip in the merge fold).
 #[test]
-fn outcome_serde_uses_tag_kind_content_data() {
+fn assert_result_record_skip_then_pass_marker_yields_pass() {
+    let mut r = AssertResult::pass();
+    r.record_skip("topology mismatch");
+    assert!(r.is_skip(), "skip-only stream is is_skip");
+    r.record_pass();
+    // Skip + Pass = Pass (the Pass entry beats the Skip per merge precedence).
+    assert!(r.is_pass(), "Skip + Pass folds to Pass");
+    assert!(!r.is_skip(), "is_skip requires all-Skip + non-empty");
+}
+
+/// `is_skip()` returns FALSE on empty outcomes (Pass identity, not
+/// vacuous skip). Pins the "empty = Pass" convention so a future
+/// refactor flipping is_skip to vacuous-all-skip semantics trips
+/// loudly.
+#[test]
+fn assert_result_empty_outcomes_is_pass_not_skip() {
+    let r = AssertResult::pass();
+    assert!(r.outcomes.is_empty());
+    assert!(r.is_pass());
+    assert!(!r.is_skip());
+    assert!(!r.is_fail());
+}
+
+/// `record_outcome` escape hatch pushes a pre-folded [`Outcome`]
+/// onto the stream. Pins the surface so the dead-code lint doesn't
+/// strip it, and verifies it composes with the variant-specific
+/// mutators (record_outcome of a Fail is observable via is_fail()
+/// and failure_details() identically to a record_fail call).
+#[test]
+fn assert_result_record_outcome_pushes_and_observable() {
+    let mut r = AssertResult::pass();
+    let d = AssertDetail::new(DetailKind::Other, "external verdict");
+    r.record_outcome(Outcome::Fail(d.clone()));
+    assert_eq!(r.outcomes.len(), 1);
+    assert!(r.is_fail());
+    let collected: Vec<&AssertDetail> = r.failure_details().collect();
+    assert_eq!(collected.len(), 1);
+    assert!(collected[0].message.contains("external verdict"));
+    // Composes with record_outcome of a Skip: Fail still dominates.
+    r.record_outcome(Outcome::Skip(AssertDetail::new(DetailKind::Skip, "stop")));
+    assert_eq!(r.outcomes.len(), 2);
+    assert!(r.is_fail(), "Fail dominates the merged outcome");
+    assert_eq!(r.skip_reasons().count(), 1);
+}
+
+/// `Outcome` serde uses the externally-tagged default (no
+/// `#[serde(tag, content)]`). The adjacently-tagged style was
+/// dropped because postcard — the wire format for the AssertResult
+/// TLV in [`crate::test_support::output::parse_assert_result_from_drain`]
+/// and [`crate::test_support::test_helpers::assert_result_tlv_entry`]
+/// — is not self-describing and cannot decode adjacently-tagged
+/// enums. Pin both the JSON shape and the postcard roundtrip so a
+/// refactor that re-adds `#[serde(tag, content)]` trips loudly on
+/// the wire format that consumers actually depend on.
+#[test]
+fn outcome_serde_externally_tagged_roundtrips_via_json_and_postcard() {
     let d = AssertDetail::new(DetailKind::Other, "msg");
+
+    // JSON shape: unit variant serializes as the bare variant
+    // name; data variants serialize as `{"<Variant>": {...}}`.
     let pass_json = serde_json::to_string(&Outcome::Pass).unwrap();
-    assert!(
-        pass_json.contains("\"kind\":\"Pass\""),
-        "Pass must serialize with kind tag: {pass_json}"
-    );
+    assert_eq!(pass_json, "\"Pass\"", "Pass must serialize as bare variant name");
     let fail_json = serde_json::to_string(&Outcome::Fail(d.clone())).unwrap();
     assert!(
-        fail_json.contains("\"kind\":\"Fail\""),
-        "Fail must serialize with kind tag: {fail_json}"
+        fail_json.starts_with("{\"Fail\":"),
+        "Fail must serialize as externally-tagged object: {fail_json}"
+    );
+    // Absence-check for the dropped adjacently-tagged shape: the
+    // outer object's first key must be the variant name, not the
+    // prior `"kind"` discriminator, and there must be no outer
+    // `"data"` field wrapping the payload. (The inner
+    // `AssertDetail` still has a `kind: DetailKind` field — that's
+    // unrelated to Outcome's tagging.)
+    assert!(
+        !fail_json.starts_with("{\"kind\":"),
+        "Fail outer key must be the variant name, not the dropped \"kind\" tag: {fail_json}"
     );
     assert!(
-        fail_json.contains("\"data\""),
-        "Fail must serialize with content data: {fail_json}"
+        !fail_json.contains("\"data\":"),
+        "Fail must not carry the dropped \"data\" wrapper: {fail_json}"
     );
 
-    // Roundtrip.
+    // JSON roundtrip.
     let recovered: Outcome = serde_json::from_str(&fail_json).unwrap();
     assert!(recovered.is_fail());
+
+    // Postcard roundtrip — the wire format that the TLV path uses.
+    // A regression that re-adds `#[serde(tag, content)]` would
+    // silently break this and surface only at runtime as
+    // ERR_NO_TEST_FUNCTION_OUTPUT.
+    let pc_pass = postcard::to_stdvec(&Outcome::Pass).unwrap();
+    let pc_pass_recovered: Outcome = postcard::from_bytes(&pc_pass).unwrap();
+    assert!(pc_pass_recovered.is_pass());
+    let pc_fail = postcard::to_stdvec(&Outcome::Fail(d)).unwrap();
+    let pc_fail_recovered: Outcome = postcard::from_bytes(&pc_fail).unwrap();
+    assert!(pc_fail_recovered.is_fail());
 }
 
 /// `expect_scx_bpf_error_contains` and `expect_scx_bpf_error_matches`

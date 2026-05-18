@@ -139,17 +139,14 @@ fn page_locality_empty_expected_set() {
 #[test]
 fn assert_page_locality_pass() {
     let r = assert_page_locality(0.9, Some(0.8), 100, 90);
-    assert!(r.passed, "{:?}", r.details);
+    assert!(r.is_pass(), "{:?}", r.outcomes);
 }
 
 #[test]
 fn assert_page_locality_fail() {
     let r = assert_page_locality(0.5, Some(0.8), 100, 50);
-    assert!(!r.passed);
-    let detail = r
-        .details
-        .iter()
-        .find(|d| matches!(d.kind, DetailKind::PageLocality))
+    assert!(r.is_fail());
+    let detail = r.failure_details().find(|d| matches!(d.kind, DetailKind::PageLocality))
         .unwrap();
     // Percentage form must accompany the fraction so an operator
     // reading the diagnostic doesn't mentally translate 0.5000 → 50%.
@@ -166,13 +163,13 @@ fn assert_page_locality_fail() {
 #[test]
 fn assert_page_locality_no_threshold() {
     let r = assert_page_locality(0.1, None, 100, 10);
-    assert!(r.passed);
+    assert!(r.is_pass());
 }
 
 #[test]
 fn assert_page_locality_exact_threshold() {
     let r = assert_page_locality(0.8, Some(0.8), 100, 80);
-    assert!(r.passed, "{:?}", r.details);
+    assert!(r.is_pass(), "{:?}", r.outcomes);
 }
 
 // -- assert_slow_tier_ratio tests --
@@ -184,7 +181,7 @@ fn assert_slow_tier_ratio_pass() {
     pages.insert(1, 10);
     let nodes: BTreeSet<usize> = [0, 1].into_iter().collect();
     let r = assert_slow_tier_ratio(&pages, 0.5, 100, Some(&nodes));
-    assert!(r.passed, "{:?}", r.details);
+    assert!(r.is_pass(), "{:?}", r.outcomes);
 }
 
 #[test]
@@ -194,11 +191,8 @@ fn assert_slow_tier_ratio_fail() {
     pages.insert(2, 60);
     let nodes: BTreeSet<usize> = [0].into_iter().collect();
     let r = assert_slow_tier_ratio(&pages, 0.5, 100, Some(&nodes));
-    assert!(!r.passed);
-    let detail = r
-        .details
-        .iter()
-        .find(|d| matches!(d.kind, DetailKind::SlowTier))
+    assert!(r.is_fail());
+    let detail = r.failure_details().find(|d| matches!(d.kind, DetailKind::SlowTier))
         .unwrap();
     // 60% slow-tier (node 2 has 60 pages) vs 50% threshold; both
     // surfaces appear so the operator sees raw ratio AND human %.
@@ -217,7 +211,7 @@ fn assert_slow_tier_ratio_none_numa_nodes() {
     let mut pages = BTreeMap::new();
     pages.insert(0, 100);
     let r = assert_slow_tier_ratio(&pages, 0.1, 100, None);
-    assert!(r.passed);
+    assert!(r.is_pass());
 }
 
 #[test]
@@ -225,7 +219,7 @@ fn assert_slow_tier_ratio_zero_pages() {
     let pages = BTreeMap::new();
     let nodes: BTreeSet<usize> = [0].into_iter().collect();
     let r = assert_slow_tier_ratio(&pages, 0.5, 0, Some(&nodes));
-    assert!(r.passed);
+    assert!(r.is_pass());
 }
 
 #[test]
@@ -234,7 +228,7 @@ fn assert_slow_tier_ratio_all_local() {
     pages.insert(0, 100);
     let nodes: BTreeSet<usize> = [0].into_iter().collect();
     let r = assert_slow_tier_ratio(&pages, 0.0, 100, Some(&nodes));
-    assert!(r.passed, "{:?}", r.details);
+    assert!(r.is_pass(), "{:?}", r.outcomes);
 }
 
 // -- Assert NUMA builder and merge tests --
@@ -272,14 +266,14 @@ fn assert_numa_has_worker_checks() {
 fn assert_page_locality_method_pass() {
     let a = Assert::NO_OVERRIDES.min_page_locality(0.8);
     let r = a.assert_page_locality(0.9, 100, 90);
-    assert!(r.passed, "{:?}", r.details);
+    assert!(r.is_pass(), "{:?}", r.outcomes);
 }
 
 #[test]
 fn assert_page_locality_method_fail() {
     let a = Assert::NO_OVERRIDES.min_page_locality(0.95);
     let r = a.assert_page_locality(0.8, 100, 80);
-    assert!(!r.passed);
+    assert!(r.is_fail());
 }
 
 // -- ScenarioStats NUMA merge tests --
@@ -363,17 +357,14 @@ fn parse_vmstat_malformed_value() {
 #[test]
 fn assert_cross_node_migration_pass() {
     let r = assert_cross_node_migration(5, 100, Some(0.1));
-    assert!(r.passed, "{:?}", r.details);
+    assert!(r.is_pass(), "{:?}", r.outcomes);
 }
 
 #[test]
 fn assert_cross_node_migration_fail() {
     let r = assert_cross_node_migration(20, 100, Some(0.1));
-    assert!(!r.passed);
-    let detail = r
-        .details
-        .iter()
-        .find(|d| matches!(d.kind, DetailKind::CrossNodeMigration))
+    assert!(r.is_fail());
+    let detail = r.failure_details().find(|d| matches!(d.kind, DetailKind::CrossNodeMigration))
         .unwrap();
     // 20% migrated vs 10% threshold; pin both percentage tokens so
     // dropping either form regresses here.
@@ -390,19 +381,19 @@ fn assert_cross_node_migration_fail() {
 #[test]
 fn assert_cross_node_migration_no_threshold() {
     let r = assert_cross_node_migration(50, 100, None);
-    assert!(r.passed);
+    assert!(r.is_pass());
 }
 
 #[test]
 fn assert_cross_node_migration_exact_threshold() {
     let r = assert_cross_node_migration(10, 100, Some(0.1));
-    assert!(r.passed, "{:?}", r.details);
+    assert!(r.is_pass(), "{:?}", r.outcomes);
 }
 
 #[test]
 fn assert_cross_node_migration_zero_pages() {
     let r = assert_cross_node_migration(0, 0, Some(0.1));
-    assert!(r.passed, "zero total pages should pass");
+    assert!(r.is_pass(), "zero total pages should pass");
 }
 
 #[test]
@@ -411,12 +402,9 @@ fn assert_cross_node_migration_inconsistent_zero_total_nonzero_migrated() {
     // inconsistent measurement that must surface as a failure
     // rather than silently coercing to ratio=0.0.
     let r = assert_cross_node_migration(5, 0, Some(0.1));
-    assert!(!r.passed, "inconsistent input must fail loudly");
-    let detail = r
-        .details
-        .iter()
-        .find(|d| d.message.contains("inconsistent"))
-        .unwrap_or_else(|| panic!("expected inconsistent diagnostic, got {:?}", r.details));
+    assert!(!r.is_pass(), "inconsistent input must fail loudly");
+    let detail = r.failure_details().find(|d| d.message.contains("inconsistent"))
+        .unwrap_or_else(|| panic!("expected inconsistent diagnostic, got {:?}", r.outcomes));
     assert!(
         detail.message.contains("5 pages migrated"),
         "must surface migrated count: {detail}"
@@ -468,14 +456,14 @@ fn assert_cross_node_migration_has_worker_checks() {
 fn assert_cross_node_migration_method_pass() {
     let a = Assert::NO_OVERRIDES.max_cross_node_migration_ratio(0.1);
     let r = a.assert_cross_node_migration(5, 100);
-    assert!(r.passed, "{:?}", r.details);
+    assert!(r.is_pass(), "{:?}", r.outcomes);
 }
 
 #[test]
 fn assert_cross_node_migration_method_fail() {
     let a = Assert::NO_OVERRIDES.max_cross_node_migration_ratio(0.05);
     let r = a.assert_cross_node_migration(20, 100);
-    assert!(!r.passed);
+    assert!(r.is_fail());
 }
 
 // -- ScenarioStats cross-node migration merge --
@@ -528,9 +516,9 @@ fn plan_cross_node_migration_aggregates_cgroup_total() {
     };
     let r = plan.assert_cgroup(&[a, b], None, None);
     assert!(
-        r.passed,
+        r.is_pass(),
         "0.025 < 0.03 must pass under aggregated calc; per-worker would have failed at 0.05: {:?}",
-        r.details
+        r.outcomes
     );
 }
 
@@ -561,16 +549,13 @@ fn plan_cross_node_migration_emits_one_failure_not_per_worker() {
         max_slow_tier_ratio: None,
     };
     let r = plan.assert_cgroup(&[a, b], None, None);
-    assert!(!r.passed);
-    let cross_node_failures = r
-        .details
-        .iter()
-        .filter(|d| matches!(d.kind, DetailKind::CrossNodeMigration))
+    assert!(r.is_fail());
+    let cross_node_failures = r.failure_details().filter(|d| matches!(d.kind, DetailKind::CrossNodeMigration))
         .count();
     assert_eq!(
         cross_node_failures, 1,
         "exactly one cross-node migration failure for the cgroup (not per-worker): {:?}",
-        r.details
+        r.outcomes
     );
 }
 
@@ -603,16 +588,15 @@ fn plan_min_page_locality_fails_on_zero_allocation_cgroup() {
     let nodes: BTreeSet<usize> = [0].into_iter().collect();
     let r = plan.assert_cgroup(&[a, b], None, Some(&nodes));
     assert!(
-        !r.passed,
+        !r.is_pass(),
         "zero-allocation cgroup must fail min_page_locality, not silently pass: {:?}",
-        r.details
+        r.outcomes
     );
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::PageLocality)),
         "must surface a PageLocality detail: {:?}",
-        r.details
+        r.outcomes
     );
 }
 
@@ -643,5 +627,5 @@ fn plan_min_page_locality_aggregates_across_cgroup() {
     };
     let nodes: BTreeSet<usize> = [0].into_iter().collect();
     let r = plan.assert_cgroup(&[a, b], None, Some(&nodes));
-    assert!(!r.passed, "cgroup-aggregate locality 0.5 < 0.8 must fail");
+    assert!(!r.is_pass(), "cgroup-aggregate locality 0.5 < 0.8 must fail");
 }

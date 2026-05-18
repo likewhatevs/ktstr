@@ -690,18 +690,37 @@ fn resolve_watchdog_offsets(btf: &Btf) -> Result<ScxWatchdogOffsets> {
 }
 
 /// Find a named struct in BTF. Returns the Struct and its BTF type name.
+///
+/// When multiple structs share `name` (the Linux kernel has several —
+/// `struct rq` exists as both the scheduler runqueue in
+/// `kernel/sched/sched.h` AND as a driver-local type in unrelated
+/// subsystems), prefer the LARGEST one. The scheduler runqueue is
+/// thousands of bytes wide; driver-local types are typically a few
+/// dozen bytes. Picking the first match (the previous behavior) would
+/// silently bind callers to whichever struct BTF happened to emit
+/// first and surface as garbage offsets — e.g. `member_byte_offset`
+/// returning 0 for `nr_running` when the matched struct genuinely
+/// starts with a `u32` field, causing the monitor to read junk values
+/// from the wrong type's layout.
 pub(crate) fn find_struct(btf: &Btf, name: &str) -> Result<(btf_rs::Struct, String)> {
     let types = btf
         .resolve_types_by_name(name)
         .with_context(|| format!("btf: type '{name}' not found"))?;
 
+    let mut best: Option<(btf_rs::Struct, String, usize)> = None;
     for t in &types {
         if let Type::Struct(s) = t {
-            let resolved_name = btf.resolve_name(s).unwrap_or_default();
-            return Ok((s.clone(), resolved_name));
+            let size = s.size();
+            if best.as_ref().is_none_or(|(_, _, b)| size > *b) {
+                let resolved_name = btf.resolve_name(s).unwrap_or_default();
+                best = Some((s.clone(), resolved_name, size));
+            }
         }
     }
-    bail!("btf: '{name}' exists but is not a struct");
+    match best {
+        Some((s, n, _)) => Ok((s, n)),
+        None => bail!("btf: '{name}' exists but is not a struct"),
+    }
 }
 
 /// Outcome of [`find_struct_or_fwd`]: either a full struct definition

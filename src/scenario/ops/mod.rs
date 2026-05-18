@@ -836,8 +836,7 @@ fn run_scenario(
             // step_staging's CgroupGroup RAII still drops here,
             // removing any cgroups the failed Backdrop setup routed
             // into step-local state.
-            r.passed = false;
-            r.details.push(crate::assert::AssertDetail::new(
+            r.record_fail(crate::assert::AssertDetail::new(
                 crate::assert::DetailKind::Other,
                 format!("Backdrop setup failed: {err:#}"),
             ));
@@ -868,8 +867,7 @@ fn run_scenario(
             let mut r =
                 collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
             r.merge(result);
-            r.passed = false;
-            r.details.push(crate::assert::AssertDetail::new(
+            r.record_fail(crate::assert::AssertDetail::new(
                 sched_died_detail_kind(),
                 crate::assert::format_sched_died_after_step(
                     step_idx,
@@ -918,8 +916,7 @@ fn run_scenario(
             let mut r =
                 collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
             r.merge(result);
-            r.passed = false;
-            r.details.push(crate::assert::AssertDetail::new(
+            r.record_fail(crate::assert::AssertDetail::new(
                 crate::assert::DetailKind::Other,
                 format!("step {step_idx} failed: {err:#}"),
             ));
@@ -938,8 +935,7 @@ fn run_scenario(
             let mut r =
                 collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
             r.merge(result);
-            r.passed = false;
-            r.details.push(crate::assert::AssertDetail::new(
+            r.record_fail(crate::assert::AssertDetail::new(
                 sched_died_detail_kind(),
                 crate::assert::format_sched_died_during_workload(
                     scenario_start.elapsed().as_secs_f64(),
@@ -966,8 +962,7 @@ fn run_scenario(
     result.merge(backdrop_result);
 
     if sched_dead {
-        result.passed = false;
-        result.details.push(crate::assert::AssertDetail::new(
+        result.record_fail(crate::assert::AssertDetail::new(
             sched_died_detail_kind(),
             crate::assert::format_sched_died_after_all_steps(
                 steps.len(),
@@ -4117,9 +4112,9 @@ mod tests {
         let result = execute_steps(&ctx, steps)
             .expect("HoldSpec::Loop apply path must succeed against mock cgroups");
         assert!(
-            result.passed,
+            result.is_pass(),
             "scenario must pass with no failing assertions; got: {:?}",
-            result.details,
+            result.outcomes,
         );
         let set_cpuset_calls = mock
             .calls()
@@ -4161,9 +4156,9 @@ mod tests {
         let result = execute_steps(&ctx, steps)
             .expect("HoldSpec::Loop with setup must succeed against mock cgroups");
         assert!(
-            result.passed,
+            result.is_pass(),
             "scenario must pass with no failing assertions; got: {:?}",
-            result.details,
+            result.outcomes,
         );
         let create_calls = mock
             .calls()
@@ -4215,9 +4210,9 @@ mod tests {
         let result = execute_steps(&ctx, steps)
             .expect("HoldSpec::Loop with interval > duration must succeed against mock");
         assert!(
-            result.passed,
+            result.is_pass(),
             "scenario must pass with no failing assertions; got: {:?}",
-            result.details,
+            result.outcomes,
         );
         let set_cpuset_calls = mock
             .calls()
@@ -4296,31 +4291,29 @@ mod tests {
              NOT as an Err out of run_step",
         );
         assert!(
-            !result.passed,
+            !result.is_pass(),
             "sched-died during the Loop hold must mark passed=false; \
              got passed=true with details: {:?}",
-            result.details,
+            result.outcomes,
         );
-        let sched_died_details: Vec<_> = result
-            .details
-            .iter()
-            .filter(|d| {
-                matches!(
-                    d.kind,
-                    crate::assert::DetailKind::SchedulerCrashed
-                        | crate::assert::DetailKind::SchedulerExitedCleanly
-                        | crate::assert::DetailKind::SchedulerDiedUnknownReason
-                )
-            })
+        let sched_died_details: Vec<_> = result.failure_details().filter(|d| {
+            matches!(
+                d.kind,
+                crate::assert::DetailKind::SchedulerCrashed
+                    | crate::assert::DetailKind::SchedulerExitedCleanly
+                    | crate::assert::DetailKind::SchedulerDiedUnknownReason
+            )
+        })
             .collect();
         assert_eq!(
             sched_died_details.len(),
             1,
             "must push exactly one sched-died DetailKind detail (from \
-             mod.rs:911-922); got {} sched-died details out of {} total: {:?}",
+             mod.rs:911-922); got {} sched-died failures out of {} total \
+             failures: {:?}",
             sched_died_details.len(),
-            result.details.len(),
-            result.details,
+            result.failure_details().count(),
+            result.outcomes,
         );
         let set_cpuset_calls = mock
             .calls()
@@ -4402,18 +4395,15 @@ mod tests {
              mod.rs:883-901; the Err must NOT propagate to the caller",
         );
         assert!(
-            !result.passed,
+            !result.is_pass(),
             "injected apply_ops error must mark passed=false; got \
              passed=true with details: {:?}",
-            result.details,
+            result.outcomes,
         );
-        let other_details: Vec<_> = result
-            .details
-            .iter()
-            .filter(|d| {
-                matches!(d.kind, crate::assert::DetailKind::Other)
-                    && d.message.contains("injected SetCpuset error mid-iteration")
-            })
+        let other_details: Vec<_> = result.failure_details().filter(|d| {
+            matches!(d.kind, crate::assert::DetailKind::Other)
+                && d.message.contains("injected SetCpuset error mid-iteration")
+        })
             .collect();
         assert_eq!(
             other_details.len(),
@@ -4422,8 +4412,8 @@ mod tests {
              carrying the injected message; got {} matching details out \
              of {} total: {:?}",
             other_details.len(),
-            result.details.len(),
-            result.details,
+            result.outcomes.len(),
+            result.outcomes,
         );
         let set_cpuset_calls = mock
             .calls()

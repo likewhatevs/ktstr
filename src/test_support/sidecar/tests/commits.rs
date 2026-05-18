@@ -409,7 +409,7 @@ fn write_skip_sidecar_records_entry_payload_name() {
     let data = std::fs::read_to_string(&path).unwrap();
     let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
     assert_eq!(loaded.payload.as_deref(), Some("stress-ng"));
-    assert!(loaded.skipped);
+    assert!(loaded.is_skip());
     assert!(
         loaded.metrics.is_empty(),
         "skip path never accumulates metrics"

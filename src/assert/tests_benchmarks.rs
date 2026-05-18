@@ -9,19 +9,22 @@ use super::*;
 
 #[test]
 fn assert_benchmarks_empty_reports() {
-    // Empty reports → skip (passed stays true for gate-compat, but
-    // `skipped` is set and a detail with DetailKind::Skip carries
-    // the reason). The thresholds supplied here cannot be evaluated
-    // against zero signal, so a silent pass would mask a broken run.
+    // Empty reports → skip terminal verdict. Skip is
+    // is_skip()=true, is_fail()=false, is_pass()=false (a skipped
+    // scenario didn't run, so it's not a pass). The thresholds
+    // supplied here cannot be evaluated against zero signal — a
+    // silent pass would mask a broken run.
     let r = assert_benchmarks(&[], Some(1000), Some(0.5), Some(100.0));
-    assert!(r.passed, "skip keeps passed=true for gate-compat");
-    assert!(r.skipped, "no reports must surface as skipped");
+    assert!(!r.is_fail(), "empty-reports skip must not surface as failure");
+    assert!(r.is_skip(), "no reports must surface as skipped");
+    assert!(!r.is_pass(), "skip is not pass");
+    let skip_reasons: Vec<&AssertDetail> = r.skip_reasons().collect();
     assert!(
-        r.details
+        skip_reasons
             .iter()
             .any(|d| matches!(d.kind, DetailKind::Skip) && d.message.contains("no worker reports")),
         "skip detail must carry the 'no worker reports' reason: {:?}",
-        r.details,
+        skip_reasons,
     );
 }
 
@@ -34,7 +37,7 @@ fn assert_benchmarks_no_thresholds() {
         5_000_000_000,
     )];
     let r = assert_benchmarks(&reports, None, None, None);
-    assert!(r.passed);
+    assert!(r.is_pass());
 }
 
 #[test]
@@ -46,7 +49,7 @@ fn assert_benchmarks_p99_pass() {
         5_000_000_000,
     )];
     let r = assert_benchmarks(&reports, Some(1000), None, None);
-    assert!(r.passed, "p99 500ns < 1000ns limit: {:?}", r.details);
+    assert!(r.is_pass(), "p99 500ns < 1000ns limit: {:?}", r.outcomes);
 }
 
 #[test]
@@ -61,9 +64,9 @@ fn assert_benchmarks_p99_n100_at_limit_passes() {
     let reports = [rpt_with_latencies(1, latencies, 100, 5_000_000_000)];
     let r = assert_benchmarks(&reports, Some(99), None, None);
     assert!(
-        r.passed,
+        r.is_pass(),
         "p99 should be 98, under limit 99: {:?}",
-        r.details
+        r.outcomes
     );
 }
 
@@ -78,9 +81,9 @@ fn assert_benchmarks_p99_n100_below_old_p100_passes() {
     let reports = [rpt_with_latencies(1, latencies, 100, 5_000_000_000)];
     let r = assert_benchmarks(&reports, Some(98), None, None);
     assert!(
-        r.passed,
+        r.is_pass(),
         "corrected p99 (98) must equal limit 98 and pass: {:?}",
-        r.details
+        r.outcomes
     );
 }
 
@@ -111,10 +114,9 @@ fn assert_benchmarks_p99_fail() {
         5_000_000_000,
     )];
     let r = assert_benchmarks(&reports, Some(1000), None, None);
-    assert!(!r.passed);
+    assert!(r.is_fail());
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Benchmark)
                 && d.message.contains("p99 wake latency"))
     );
@@ -147,7 +149,7 @@ fn assert_p99_ns_threshold_compares_against_ns_latencies() {
     // Threshold just below the 5000 ns sample -> FAIL.
     let fail = assert_benchmarks(&reports, Some(4999), None, None);
     assert!(
-        !fail.passed,
+        fail.is_fail(),
         "threshold 4999 ns against 5000 ns p99 must fail — if this \
          passes, the comparison may be converting to µs and eating \
          3 digits of resolution",
@@ -156,7 +158,7 @@ fn assert_p99_ns_threshold_compares_against_ns_latencies() {
     // Threshold just above the 5000 ns sample -> PASS.
     let pass = assert_benchmarks(&reports, Some(5001), None, None);
     assert!(
-        pass.passed,
+        pass.is_pass(),
         "threshold 5001 ns against 5000 ns p99 must pass — if this \
          fails, the comparison may be multiplying the threshold by \
          1000 (treating it as µs)",
@@ -186,7 +188,7 @@ fn assert_benchmarks_cv_pass() {
         5_000_000_000,
     )];
     let r = assert_benchmarks(&reports, None, Some(0.5), None);
-    assert!(r.passed, "uniform latencies CV=0: {:?}", r.details);
+    assert!(r.is_pass(), "uniform latencies CV=0: {:?}", r.outcomes);
 }
 
 #[test]
@@ -199,10 +201,9 @@ fn assert_benchmarks_cv_fail() {
         5_000_000_000,
     )];
     let r = assert_benchmarks(&reports, None, Some(0.5), None);
-    assert!(!r.passed);
+    assert!(r.is_fail());
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Benchmark)
                 && d.message.contains("wake latency CV"))
     );
@@ -213,7 +214,7 @@ fn assert_benchmarks_iteration_rate_pass() {
     // 1000 iterations in 5 seconds = 200/s, above 100/s floor.
     let reports = [rpt_with_latencies(1, vec![], 1000, 5_000_000_000)];
     let r = assert_benchmarks(&reports, None, None, Some(100.0));
-    assert!(r.passed, "200/s > 100/s floor: {:?}", r.details);
+    assert!(r.is_pass(), "200/s > 100/s floor: {:?}", r.outcomes);
 }
 
 #[test]
@@ -221,9 +222,9 @@ fn assert_benchmarks_iteration_rate_fail() {
     // 10 iterations in 5 seconds = 2/s, below 100/s floor.
     let reports = [rpt_with_latencies(1, vec![], 10, 5_000_000_000)];
     let r = assert_benchmarks(&reports, None, None, Some(100.0));
-    assert!(!r.passed);
+    assert!(r.is_fail());
     assert!(
-        r.details.iter().any(
+        r.failure_details().any(
             |d| matches!(d.kind, DetailKind::Benchmark) && d.message.contains("iteration rate")
         )
     );
@@ -233,14 +234,14 @@ fn assert_benchmarks_iteration_rate_fail() {
 fn assert_benchmarks_zero_wall_time_skips_rate() {
     let reports = [rpt_with_latencies(1, vec![], 10, 0)];
     let r = assert_benchmarks(&reports, None, None, Some(100.0));
-    assert!(r.passed, "zero wall_time should skip rate check");
+    assert!(r.is_pass(), "zero wall_time should skip rate check");
 }
 
 #[test]
 fn assert_benchmarks_no_latencies_skips_p99() {
     let reports = [rpt_with_latencies(1, vec![], 10, 5_000_000_000)];
     let r = assert_benchmarks(&reports, Some(1000), None, None);
-    assert!(r.passed, "empty latencies should skip p99 check");
+    assert!(r.is_pass(), "empty latencies should skip p99 check");
 }
 
 #[test]
@@ -248,7 +249,7 @@ fn assert_benchmarks_single_latency_cv_skipped() {
     // Single sample -> len < 2, CV check skipped.
     let reports = [rpt_with_latencies(1, vec![1000], 10, 5_000_000_000)];
     let r = assert_benchmarks(&reports, None, Some(0.1), None);
-    assert!(r.passed, "single sample should skip CV check");
+    assert!(r.is_pass(), "single sample should skip CV check");
 }
 
 // -- wake latency stats in assert_not_starved --
@@ -260,7 +261,7 @@ fn not_starved_wake_latency_stats() {
         rpt_with_latencies(2, vec![6000, 7000, 8000, 9000, 10000], 200, 5_000_000_000),
     ];
     let r = assert_not_starved(&reports);
-    assert!(r.passed, "{:?}", r.details);
+    assert!(r.is_pass(), "{:?}", r.outcomes);
     let s = &r.stats;
     // p99 of [1000,2000,3000,4000,5000,6000,7000,8000,9000,10000] in us:
     // sorted, percentile index = ceil(10*0.99) - 1 = 9 -> sorted[9] = 10000ns = 10.0us
@@ -291,7 +292,7 @@ fn not_starved_wake_latency_stats() {
 fn not_starved_empty_latencies_zero_stats() {
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)];
     let r = assert_not_starved(&reports);
-    assert!(r.passed);
+    assert!(r.is_pass());
     assert_eq!(r.stats.worst_p99_wake_latency_us, 0.0);
     assert_eq!(r.stats.worst_median_wake_latency_us, 0.0);
     assert_eq!(r.stats.worst_wake_latency_cv, 0.0);
@@ -304,7 +305,7 @@ fn not_starved_run_delay_stats() {
     let mut w2 = rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 50);
     w2.schedstat_run_delay_ns = 300_000; // 300us
     let r = assert_not_starved(&[w1, w2]);
-    assert!(r.passed, "{:?}", r.details);
+    assert!(r.is_pass(), "{:?}", r.outcomes);
     // mean_run_delay = (100 + 300) / 2 = 200us
     assert!(
         (r.stats.worst_mean_run_delay_us - 200.0).abs() < 0.1,
@@ -345,10 +346,9 @@ fn plan_benchmarks_p99_via_assert_cgroup() {
         5_000_000_000,
     )];
     let r = plan.assert_cgroup(&reports, None, None);
-    assert!(!r.passed, "p99 1000ns > 500ns limit");
+    assert!(!r.is_pass(), "p99 1000ns > 500ns limit");
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Benchmark)
                 && d.message.contains("p99 wake latency"))
     );
@@ -376,10 +376,9 @@ fn plan_migration_ratio_gate() {
         max_slow_tier_ratio: None,
     };
     let r = plan.assert_cgroup(&[w], None, None);
-    assert!(!r.passed);
+    assert!(r.is_fail());
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Migration)
                 && d.message.contains("migration ratio"))
     );
@@ -407,7 +406,7 @@ fn plan_migration_ratio_gate_pass() {
         max_slow_tier_ratio: None,
     };
     let r = plan.assert_cgroup(&[w], None, None);
-    assert!(r.passed, "{:?}", r.details);
+    assert!(r.is_pass(), "{:?}", r.outcomes);
 }
 
 #[test]
@@ -429,9 +428,9 @@ fn plan_benchmarks_iteration_rate_via_assert_cgroup() {
     };
     let reports = [rpt_with_latencies(1, vec![], 10, 5_000_000_000)];
     let r = plan.assert_cgroup(&reports, None, None);
-    assert!(!r.passed, "2/s < 1000/s floor");
+    assert!(!r.is_pass(), "2/s < 1000/s floor");
     assert!(
-        r.details.iter().any(
+        r.failure_details().any(
             |d| matches!(d.kind, DetailKind::Benchmark) && d.message.contains("iteration rate")
         )
     );
@@ -450,13 +449,12 @@ fn assert_throughput_parity_all_zero_cpu_time_fails_when_cv_set() {
     a.cpu_time_ns = 0;
     b.cpu_time_ns = 0;
     let r = assert_throughput_parity(&[a, b], Some(0.5), None);
-    assert!(!r.passed, "all-zero cpu_time must fail when max_cv set");
+    assert!(!r.is_pass(), "all-zero cpu_time must fail when max_cv set");
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Benchmark) && d.message.contains("CV undefined")),
         "diagnostic must surface the undefined-CV root cause: {:?}",
-        r.details
+        r.outcomes
     );
 }
 
@@ -471,5 +469,5 @@ fn assert_throughput_parity_all_zero_cpu_time_passes_without_cv() {
     a.cpu_time_ns = 0;
     b.cpu_time_ns = 0;
     let r = assert_throughput_parity(&[a, b], None, None);
-    assert!(r.passed, "no CV configured → no failure: {:?}", r.details);
+    assert!(r.is_pass(), "no CV configured → no failure: {:?}", r.outcomes);
 }

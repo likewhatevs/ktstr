@@ -582,7 +582,7 @@ fn thresholds_empty_report_passes() {
         ..Default::default()
     };
     let v = t.evaluate(&report);
-    assert!(v.passed);
+    assert!(v.is_pass());
     assert!(v.details.is_empty());
 }
 
@@ -639,7 +639,7 @@ fn thresholds_imbalance_below_sustained_passes() {
     };
     let v = t.evaluate(&report);
     assert!(
-        v.passed,
+        v.is_pass(),
         "4 imbalanced < sustained_samples=5: {:?}",
         v.details
     );
@@ -680,7 +680,7 @@ fn thresholds_imbalance_at_sustained_fails() {
         ..Default::default()
     };
     let v = t.evaluate(&report);
-    assert!(!v.passed);
+    assert!(v.is_fail());
     assert!(v.details.iter().any(|d| d.contains("imbalance")));
 }
 
@@ -721,7 +721,7 @@ fn thresholds_dsq_depth_sustained_fails() {
         ..Default::default()
     };
     let v = t.evaluate(&report);
-    assert!(!v.passed);
+    assert!(v.is_fail());
     assert!(v.details.iter().any(|d| d.contains("DSQ depth")));
 }
 
@@ -818,7 +818,7 @@ fn thresholds_stuck_detected_fails() {
         ..Default::default()
     };
     let v = t.evaluate(&report);
-    assert!(!v.passed);
+    assert!(v.is_fail());
     assert!(v.details.iter().any(|d| d.contains("rq_clock stall")));
 }
 
@@ -916,7 +916,7 @@ fn thresholds_imbalance_interrupted_by_balanced_resets() {
     };
     let v = t.evaluate(&report);
     assert!(
-        v.passed,
+        v.is_pass(),
         "interrupted imbalance should pass: {:?}",
         v.details
     );
@@ -992,7 +992,7 @@ fn thresholds_multiple_violations() {
         ..Default::default()
     };
     let v = t.evaluate(&report);
-    assert!(!v.passed);
+    assert!(v.is_fail());
     assert!(v.details.iter().any(|d| d.contains("imbalance")));
     assert!(v.details.iter().any(|d| d.contains("rq_clock stall")));
 }
@@ -1019,7 +1019,7 @@ fn thresholds_empty_cpus_samples_pass() {
         ..Default::default()
     };
     let v = t.evaluate(&report);
-    assert!(v.passed);
+    assert!(v.is_pass());
 }
 
 #[test]
@@ -1056,7 +1056,7 @@ fn thresholds_uninitialized_memory_passes() {
     };
     let v = t.evaluate(&report);
     assert!(
-        v.passed,
+        v.is_pass(),
         "uninitialized guest memory should be skipped: {:?}",
         v.details
     );
@@ -1111,7 +1111,7 @@ fn thresholds_all_same_clocks_passes() {
     };
     let v = t.evaluate(&report);
     assert!(
-        v.passed,
+        v.is_pass(),
         "all-same clocks should be treated as uninitialized: {:?}",
         v.details
     );
@@ -1146,7 +1146,7 @@ fn thresholds_dsq_over_plausibility_ceiling_passes() {
     };
     let v = t.evaluate(&report);
     assert!(
-        v.passed,
+        v.is_pass(),
         "implausible DSQ depth should skip evaluation: {:?}",
         v.details
     );
@@ -1241,7 +1241,7 @@ fn thresholds_fallback_rate_sustained_fails() {
         ..Default::default()
     };
     let v = t.evaluate(&report);
-    assert!(!v.passed);
+    assert!(v.is_fail());
     assert!(v.details.iter().any(|d| d.contains("fallback rate")));
 }
 
@@ -1288,7 +1288,7 @@ fn thresholds_keep_last_rate_sustained_fails() {
         ..Default::default()
     };
     let v = t.evaluate(&report);
-    assert!(!v.passed);
+    assert!(v.is_fail());
     assert!(v.details.iter().any(|d| d.contains("keep_last rate")));
 }
 
@@ -1356,7 +1356,7 @@ fn thresholds_event_rate_interrupted_resets() {
     };
     let v = t.evaluate(&report);
     assert!(
-        v.passed,
+        v.is_pass(),
         "interrupted rate violations should pass: {:?}",
         v.details
     );
@@ -1383,7 +1383,7 @@ fn thresholds_no_event_counters_skips_rate_check() {
     };
     let v = t.evaluate(&report);
     assert!(
-        v.passed,
+        v.is_pass(),
         "no event counters should skip rate check: {:?}",
         v.details
     );
@@ -1974,7 +1974,7 @@ fn neg_tight_imbalance_threshold_catches_mild_imbalance() {
     let v = t.evaluate(&report);
     assert!(!v.passed, "imbalance=1.5 must fail threshold=1.0");
     // Format: "imbalance ratio 1.5 exceeded threshold 1.0 for 2 consecutive samples (ending at sample 2)"
-    let detail = v.details.iter().find(|d| d.contains("imbalance")).unwrap();
+    let detail = v.failure_details().find(|d| d.contains("imbalance")).unwrap();
     assert!(detail.contains("ratio"), "must include 'ratio': {detail}");
     assert!(
         detail.contains("exceeded threshold"),
@@ -2045,7 +2045,7 @@ fn neg_tight_dsq_threshold_catches_small_depth() {
     let v = t.evaluate(&report);
     assert!(!v.passed, "dsq_depth=3 must fail threshold=1");
     // Format: "local DSQ depth 3 on cpu0 exceeded threshold 1 for 2 consecutive samples (ending at sample 2)"
-    let detail = v.details.iter().find(|d| d.contains("DSQ depth")).unwrap();
+    let detail = v.failure_details().find(|d| d.contains("DSQ depth")).unwrap();
     assert!(detail.contains("3"), "must show depth value: {detail}");
     assert!(detail.contains("cpu0"), "must show CPU number: {detail}");
     assert!(
@@ -2114,10 +2114,7 @@ fn neg_stuck_detection_catches_frozen_rq_clock() {
     };
     let v = t.evaluate(&report);
     assert!(!v.passed, "frozen rq_clock must be detected");
-    let detail = v
-        .details
-        .iter()
-        .find(|d| d.contains("rq_clock stall"))
+    let detail = v.failure_details().find(|d| d.contains("rq_clock stall"))
         .unwrap();
     assert!(detail.contains("cpu0"), "must name frozen CPU: {detail}");
     assert!(
@@ -2182,16 +2179,13 @@ fn neg_combined_imbalance_and_stuck_both_reported() {
         ..Default::default()
     };
     let v = t.evaluate(&report);
-    assert!(!v.passed);
-    let imb = v.details.iter().find(|d| d.contains("imbalance")).unwrap();
+    assert!(v.is_fail());
+    let imb = v.failure_details().find(|d| d.contains("imbalance")).unwrap();
     assert!(
         imb.contains("exceeded threshold 2.0"),
         "imbalance format: {imb}"
     );
-    let stall = v
-        .details
-        .iter()
-        .find(|d| d.contains("rq_clock stall"))
+    let stall = v.failure_details().find(|d| d.contains("rq_clock stall"))
         .unwrap();
     assert!(stall.contains("cpu0"), "stall format: {stall}");
     assert!(
@@ -2258,7 +2252,7 @@ fn stuck_idle_cpu_exempt() {
     };
     let v = t.evaluate(&report);
     assert!(
-        v.passed,
+        v.is_pass(),
         "idle CPU should not trigger stall: {:?}",
         v.details
     );
@@ -2322,7 +2316,7 @@ fn stuck_idle_to_busy_not_exempt() {
     };
     let v = t.evaluate(&report);
     assert!(
-        !v.passed,
+        !v.is_pass(),
         "busy CPU with frozen clock must fail: {:?}",
         v.details
     );
@@ -2473,7 +2467,7 @@ fn enforce_true_with_violation_yields_passed_false() {
     };
     let v = t.evaluate(&report);
     assert!(
-        !v.passed,
+        !v.is_pass(),
         "enforce=true + violation must yield passed=false: {:?}",
         v.details
     );
@@ -2535,7 +2529,7 @@ fn enforce_false_with_violation_yields_passed_true_and_records_details() {
     };
     let v = t.evaluate(&report);
     assert!(
-        v.passed,
+        v.is_pass(),
         "enforce=false + violation must yield passed=true (report-only mode)"
     );
     assert!(
@@ -2689,10 +2683,7 @@ fn neg_fallback_rate_threshold_fires() {
     let v = t.evaluate(&report);
     assert!(!v.passed, "fallback rate must be caught");
     // Format: "fallback rate 200.0/s exceeded threshold 5.0/s for 2 consecutive intervals (ending at sample 2)"
-    let detail = v
-        .details
-        .iter()
-        .find(|d| d.contains("fallback rate"))
+    let detail = v.failure_details().find(|d| d.contains("fallback rate"))
         .unwrap();
     assert!(detail.contains("/s"), "must include rate unit: {detail}");
     assert!(
@@ -2731,10 +2722,7 @@ fn neg_keep_last_rate_threshold_fires() {
     let v = t.evaluate(&report);
     assert!(!v.passed, "keep_last rate must be caught");
     // Format: "keep_last rate .../s exceeded threshold 5.0/s for 2 consecutive intervals ..."
-    let detail = v
-        .details
-        .iter()
-        .find(|d| d.contains("keep_last rate"))
+    let detail = v.failure_details().find(|d| d.contains("keep_last rate"))
         .unwrap();
     assert!(detail.contains("/s"), "must include rate unit: {detail}");
     assert!(
@@ -2812,7 +2800,7 @@ fn evaluate_suppresses_stuck_when_vcpu_preempted() {
     };
     let v = t.evaluate(&report);
     assert!(
-        v.passed,
+        v.is_pass(),
         "preempted vCPU should suppress stall: {:?}",
         v.details
     );
@@ -2940,7 +2928,7 @@ fn evaluate_stuck_none_vcpu_time_falls_back_to_current_behavior() {
     };
     let v = t.evaluate(&report);
     assert!(
-        !v.passed,
+        !v.is_pass(),
         "None vcpu time should detect stall: {:?}",
         v.details
     );

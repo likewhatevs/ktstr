@@ -73,10 +73,7 @@ fn snapshot_real_capture_op_snapshot(ctx: &ktstr::scenario::Ctx) -> Result<Asser
         hold: HoldSpec::FULL,
     }];
     let mut result = execute_steps(ctx, steps)?;
-    result.details.push(ktstr::assert::AssertDetail::new(
-        ktstr::assert::DetailKind::Other,
-        "Op::capture_snapshot('mid_run') SHM request succeeded".to_string(),
-    ));
+    result.note("Op::capture_snapshot('mid_run') SHM request succeeded");
     Ok(result)
 }
 
@@ -94,9 +91,6 @@ fn snapshot_real_capture_op_watch_snapshot(ctx: &ktstr::scenario::Ctx) -> Result
         hold: HoldSpec::FULL,
     }];
     let mut result = execute_steps(ctx, steps)?;
-    result.details.push(ktstr::assert::AssertDetail::new(
-        ktstr::assert::DetailKind::Other,
-        "Op::watch_snapshot('jiffies_64') SHM request succeeded".to_string(),
-    ));
+    result.note("Op::watch_snapshot('jiffies_64') SHM request succeeded");
     Ok(result)
 }

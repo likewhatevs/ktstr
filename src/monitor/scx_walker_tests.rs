@@ -106,9 +106,9 @@ fn rq_scx_state_serde_roundtrip_populated() {
     crate::claim!(v, parsed_runnable_truncated).eq(true);
     let r = v.into_result();
     assert!(
-        r.passed,
+        r.is_pass(),
         "rq_scx_state roundtrip claims must all pass: {:?}",
-        r.details,
+        r.outcomes,
     );
 }
 
@@ -177,9 +177,9 @@ fn scx_sched_state_serde_roundtrip() {
     crate::claim!(v, parsed_exit_kind).eq(1027u32);
     let r = v.into_result();
     assert!(
-        r.passed,
+        r.is_pass(),
         "scx_sched_state roundtrip claims must all pass: {:?}",
-        r.details,
+        r.outcomes,
     );
 }
 
@@ -411,9 +411,9 @@ fn rq_scx_state_authorial_verdict_claims_compose() {
 
     let r = v.into_result();
     assert!(
-        r.passed,
+        r.is_pass(),
         "authorial claim sequence on populated RqScxState must pass: {:?}",
-        r.details,
+        r.outcomes,
     );
 }
 
@@ -446,14 +446,14 @@ fn rq_scx_state_failing_at_most_records_labeled_detail() {
     crate::claim!(v, s.nr_running).at_most(10);
     let r = v.into_result();
 
-    assert!(!r.passed, "at_most(10) on nr_running=100 must fail");
+    assert!(!r.is_pass(), "at_most(10) on nr_running=100 must fail");
     assert_eq!(
-        r.details.len(),
+        r.outcomes.len(),
         1,
         "exactly one failing detail must record: {:?}",
-        r.details,
+        r.outcomes,
     );
-    let msg = &r.details[0].message;
+    let msg = &*r.failure_details().next().unwrap().message;
     assert!(
         msg.contains("s.nr_running"),
         "detail must carry the macro-stringify label: {msg}",
@@ -495,9 +495,9 @@ fn dsq_state_authorial_verdict_claims_compose() {
 
     let r = v.into_result();
     assert!(
-        r.passed,
+        r.is_pass(),
         "authorial claim sequence on populated DsqState must pass: {:?}",
-        r.details,
+        r.outcomes,
     );
 }
 
@@ -521,7 +521,7 @@ fn scx_sched_state_healthy_exit_kind_claim() {
     crate::claim!(v, healthy.bypass_depth).eq(0);
     crate::claim!(v, healthy.exit_kind).eq(0u32);
     let r = v.into_result();
-    assert!(r.passed, "healthy-state claims must pass: {:?}", r.details);
+    assert!(r.is_pass(), "healthy-state claims must pass: {:?}", r.outcomes);
 
     // Inverse: an aborting scheduler with non-zero exit_kind
     // must fail the same claim sequence.
@@ -535,7 +535,7 @@ fn scx_sched_state_healthy_exit_kind_claim() {
     let mut v = Verdict::new();
     crate::claim!(v, aborted.exit_kind).eq(0u32);
     let r = v.into_result();
-    assert!(!r.passed, "exit_kind=1027 must fail eq(0)");
+    assert!(!r.is_pass(), "exit_kind=1027 must fail eq(0)");
 }
 
 /// `walk_scx_tasks_global` returns an empty vec when the

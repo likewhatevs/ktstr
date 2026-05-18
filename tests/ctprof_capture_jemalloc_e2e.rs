@@ -236,7 +236,7 @@ fn ctprof_capture_records_allocated_bytes_for_jemalloc_alloc_worker(
     // distinguishing slop variations across kernel versions
     // without breaking the assertion contract.
     let mut result = AssertResult::pass();
-    result.details.push(AssertDetail::new(
+    result.record_fail(AssertDetail::new(
         DetailKind::Other,
         format!(
             "ctprof_capture_records_allocated_bytes: tgid={worker_pid}, \
@@ -329,7 +329,7 @@ fn ctprof_capture_completes_against_bare_guest(_ctx: &Ctx) -> Result<AssertResul
     }
 
     let mut result = AssertResult::pass();
-    result.details.push(AssertDetail::new(
+    result.record_fail(AssertDetail::new(
         DetailKind::Other,
         format!(
             "ctprof_capture_completes_against_bare_guest: \
@@ -445,7 +445,7 @@ fn ctprof_capture_against_churn_worker_does_not_panic(ctx: &Ctx) -> Result<Asser
         .find(|t| t.tgid == worker_pid && t.tid == worker_pid)
         .map(|t| t.allocated_bytes.0)
         .unwrap_or(0);
-    result.details.push(AssertDetail::new(
+    result.record_fail(AssertDetail::new(
         DetailKind::Other,
         format!(
             "ctprof_capture_against_churn_worker: tgid={worker_pid}, \

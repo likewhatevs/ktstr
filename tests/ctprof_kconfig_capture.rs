@@ -157,9 +157,8 @@ fn ctprof_capture_records_wchar_under_iosync(ctx: &Ctx) -> Result<AssertResult> 
     }
 
     let mut result = workload_result;
-    result.details.push(AssertDetail::new(
-        DetailKind::Other,
-        format!("ctprof_capture_records_wchar: max_wchar={max_wchar}"),
+    result.note(format!(
+        "ctprof_capture_records_wchar: max_wchar={max_wchar}"
     ));
     Ok(result)
 }
@@ -246,17 +245,14 @@ fn ctprof_capture_reaches_host_psi_cpu_under_oversubscription(ctx: &Ctx) -> Resu
     let irq_full_total = snap.psi.irq.full.total_usec;
 
     let mut result = workload_result;
-    result.details.push(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "ctprof_capture_reaches_host_psi_cpu: threads={}, \
-             cpu.some.total_usec={cpu_some_total}, \
-             cpu.some.avg10={cpu_some_avg10}, \
-             memory.some.total_usec={mem_some_total}, \
-             io.some.total_usec={io_some_total}, \
-             irq.full.total_usec={irq_full_total}",
-            snap.threads.len(),
-        ),
+    result.note(format!(
+        "ctprof_capture_reaches_host_psi_cpu: threads={}, \
+         cpu.some.total_usec={cpu_some_total}, \
+         cpu.some.avg10={cpu_some_avg10}, \
+         memory.some.total_usec={mem_some_total}, \
+         io.some.total_usec={io_some_total}, \
+         irq.full.total_usec={irq_full_total}",
+        snap.threads.len(),
     ));
     Ok(result)
 }
@@ -432,14 +428,11 @@ fn ctprof_capture_records_taskstats_cpu_delay_and_hiwater_under_oversubscription
 
     let total = snap.threads.len();
     let mut result = workload_result;
-    result.details.push(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "ctprof_capture_records_taskstats: threads={total}, \
-             max_cpu_delay_count={max_cpu_delay_count}, \
-             max_cpu_delay_total_ns={max_cpu_delay_total_ns}, \
-             max_hiwater_rss_bytes={max_hiwater_rss_bytes}"
-        ),
+    result.note(format!(
+        "ctprof_capture_records_taskstats: threads={total}, \
+         max_cpu_delay_count={max_cpu_delay_count}, \
+         max_cpu_delay_total_ns={max_cpu_delay_total_ns}, \
+         max_hiwater_rss_bytes={max_hiwater_rss_bytes}"
     ));
     Ok(result)
 }

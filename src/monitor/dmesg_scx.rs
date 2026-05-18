@@ -514,9 +514,9 @@ mod tests {
         crate::claim!(v, first_frame_name).eq("scx_disable_workfn".to_string());
         let r = v.into_result();
         assert!(
-            r.passed,
+            r.is_pass(),
             "kmsg parse drift on canonical error event: {:?}",
-            r.details,
+            r.outcomes,
         );
     }
 

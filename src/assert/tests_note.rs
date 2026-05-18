@@ -34,14 +34,14 @@ fn note_value_from_impls_route_to_correct_variant() {
 #[test]
 fn note_value_records_without_altering_verdict() {
     let mut r = AssertResult::pass();
-    let was_passed = r.passed;
-    let was_skipped = r.skipped;
-    let was_details = r.details.len();
+    let was_pass = r.is_pass();
+    let was_skip = r.is_skip();
+    let was_outcomes = r.outcomes.len();
     r.note_value("max_wchar", 12345i64);
     r.note_value("psi_available", true);
-    assert_eq!(r.passed, was_passed);
-    assert_eq!(r.skipped, was_skipped);
-    assert_eq!(r.details.len(), was_details);
+    assert_eq!(r.is_pass(), was_pass);
+    assert_eq!(r.is_skip(), was_skip);
+    assert_eq!(r.outcomes.len(), was_outcomes);
     assert_eq!(r.measurements.len(), 2);
     assert_eq!(r.measurements["max_wchar"], NoteValue::Int(12345));
     assert_eq!(r.measurements["psi_available"], NoteValue::Bool(true));
@@ -85,11 +85,14 @@ fn merge_unions_measurements_last_write_wins() {
     );
 }
 
-/// `measurements` survives serde round-trip with the `untagged`
-/// representation flowing into the right variant on deserialize.
-/// Pins the wire-format invariant so a regression that switched
-/// to a tagged enum representation (and broke existing parsers)
-/// trips here.
+/// `measurements` survives serde round-trip with the
+/// externally-tagged default representation flowing into the right
+/// variant on deserialize. Pins the wire-format invariant so a
+/// regression that re-adds `#[serde(untagged)]` — which postcard
+/// cannot decode (returns `WontImplement`) — trips here at test
+/// time rather than as a silent data drop at runtime. See
+/// `assert_result_postcard_roundtrip` in `tests_serde.rs` for the
+/// postcard-side pin.
 #[test]
 fn note_value_survives_serde_roundtrip() {
     let mut r = AssertResult::pass();
@@ -133,19 +136,18 @@ fn any_of_chooses_passing_branch() {
     let r = AssertResult::any_of([
         {
             let mut a = AssertResult::pass();
-            a.passed = false;
-            a.details.push(AssertDetail::new(DetailKind::Other, "boom"));
+            a.record_fail(AssertDetail::new(DetailKind::Other, "boom"));
             a
         },
         AssertResult::pass(),
     ]);
-    assert!(r.passed);
+    assert!(r.is_pass());
     // The "boom" detail from the failed branch must NOT appear —
-    // the chosen branch's details prevail.
+    // the chosen branch's outcomes prevail.
     assert!(
-        !r.details.iter().any(|d| d.message.contains("boom")),
+        !r.failure_details().any(|d| d.message.contains("boom")),
         "failed-branch details must be dropped: {:?}",
-        r.details,
+        r.outcomes,
     );
     // The chosen-branch annotation MUST appear in info_notes with
     // branch index 1 — any_of moves its "branch N satisfied"
@@ -179,7 +181,7 @@ fn any_of_all_fail_prefixes_info_notes_with_branch_index() {
             b
         },
     ]);
-    assert!(!r.passed);
+    assert!(r.is_fail());
     let messages: Vec<&str> = r.info_notes.iter().map(|n| n.message.as_str()).collect();
     assert!(
         messages.contains(&"any_of[0]: context_from_branch_0"),
@@ -219,7 +221,7 @@ fn any_of_pass_path_unions_passing_branch_info_notes_with_prefix() {
             c
         },
     ]);
-    assert!(r.passed);
+    assert!(r.is_pass());
     let messages: Vec<&str> = r.info_notes.iter().map(|n| n.message.as_str()).collect();
     // Branch 0 + branch 1 notes survive, both prefix-stamped.
     assert!(
@@ -252,28 +254,25 @@ fn any_of_concatenates_branch_failures_with_index_prefixes() {
         AssertResult::fail(AssertDetail::new(DetailKind::Other, "first boom")),
         AssertResult::fail(AssertDetail::new(DetailKind::Other, "second boom")),
     ]);
-    assert!(!r.passed);
+    assert!(r.is_fail());
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| d.message == "any_of[0]: first boom"),
         "branch 0 detail must carry index prefix: {:?}",
-        r.details,
+        r.outcomes,
     );
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| d.message == "any_of[1]: second boom"),
         "branch 1 detail must carry index prefix: {:?}",
-        r.details,
+        r.outcomes,
     );
     // A summary line names how many branches failed.
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| d.message.contains("all 2 branches failed")),
         "summary line missing: {:?}",
-        r.details,
+        r.outcomes,
     );
 }
 
@@ -283,13 +282,12 @@ fn any_of_concatenates_branch_failures_with_index_prefixes() {
 #[test]
 fn any_of_empty_input_fails() {
     let r = AssertResult::any_of(std::iter::empty());
-    assert!(!r.passed);
+    assert!(r.is_fail());
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| d.message.contains("empty branch list")),
         "empty disjunction must surface as named failure: {:?}",
-        r.details,
+        r.outcomes,
     );
 }
 
@@ -299,19 +297,19 @@ fn any_of_empty_input_fails() {
 #[test]
 fn all_of_passes_when_every_branch_passes() {
     let r = AssertResult::all_of([AssertResult::pass(), AssertResult::pass()]);
-    assert!(r.passed);
+    assert!(r.is_pass());
 
     // One failing branch flips the verdict.
     let r = AssertResult::all_of([
         AssertResult::pass(),
         AssertResult::fail(AssertDetail::new(DetailKind::Other, "boom")),
     ]);
-    assert!(!r.passed);
+    assert!(r.is_fail());
 
     // Empty input is the passing identity.
     let r = AssertResult::all_of(std::iter::empty());
-    assert!(r.passed);
-    assert!(r.details.is_empty());
+    assert!(r.is_pass());
+    assert!(r.outcomes.is_empty());
 }
 
 /// `Verdict::note_value` mirrors [`AssertResult::note_value`] —
@@ -322,7 +320,7 @@ fn verdict_note_value_records_into_underlying_result() {
     v.note_value("max_wchar", 12345i64);
     v.note_value("psi_available", false);
     let r = v.into_result();
-    assert!(r.passed);
+    assert!(r.is_pass());
     assert_eq!(r.measurements.len(), 2);
     assert_eq!(r.measurements["max_wchar"], NoteValue::Int(12345));
     assert_eq!(r.measurements["psi_available"], NoteValue::Bool(false));

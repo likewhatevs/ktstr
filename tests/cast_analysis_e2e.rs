@@ -199,8 +199,8 @@ fn scenario_cast_analysis_chases_kernel_kptr(ctx: &ktstr::scenario::Ctx) -> Resu
     let json = match std::fs::read_to_string(&dump_path) {
         Ok(s) => s,
         Err(e) => {
-            result.passed = false;
-            result.details.push(ktstr::assert::AssertDetail::new(
+            
+            result.record_fail(ktstr::assert::AssertDetail::new(
                 ktstr::assert::DetailKind::Other,
                 format!(
                     "failure dump file missing at {}: {e} (freeze coordinator did \
@@ -559,7 +559,7 @@ fn scenario_cast_analysis_chases_kernel_kptr(ctx: &ktstr::scenario::Ctx) -> Resu
         );
     }
 
-    result.details.push(ktstr::assert::AssertDetail::new(
+    result.record_fail(ktstr::assert::AssertDetail::new(
         ktstr::assert::DetailKind::Other,
         format!(
             "cast analysis pipeline E2E: dump at {} carries scx_task_map \
@@ -688,8 +688,8 @@ fn scenario_cast_analysis_chases_bss_to_arena(ctx: &ktstr::scenario::Ctx) -> Res
     let json = match std::fs::read_to_string(&dump_path) {
         Ok(s) => s,
         Err(e) => {
-            result.passed = false;
-            result.details.push(ktstr::assert::AssertDetail::new(
+            
+            result.record_fail(ktstr::assert::AssertDetail::new(
                 ktstr::assert::DetailKind::Other,
                 format!(
                     "failure dump file missing at {}: {e} (freeze coordinator did \
@@ -973,7 +973,7 @@ fn scenario_cast_analysis_chases_bss_to_arena(ctx: &ktstr::scenario::Ctx) -> Res
         );
     }
 
-    result.details.push(ktstr::assert::AssertDetail::new(
+    result.record_fail(ktstr::assert::AssertDetail::new(
         ktstr::assert::DetailKind::Other,
         format!(
             "BSS->arena cast pipeline E2E: dump at {} carries `.bss` map with \
@@ -1057,8 +1057,8 @@ fn scenario_cast_analysis_sdt_alloc_bridge_resolves_fwd(
     let json = match std::fs::read_to_string(&dump_path) {
         Ok(s) => s,
         Err(e) => {
-            result.passed = false;
-            result.details.push(ktstr::assert::AssertDetail::new(
+            
+            result.record_fail(ktstr::assert::AssertDetail::new(
                 ktstr::assert::DetailKind::Other,
                 format!(
                     "failure dump file missing at {}: {e} (freeze coordinator did \
@@ -1316,7 +1316,7 @@ fn scenario_cast_analysis_sdt_alloc_bridge_resolves_fwd(
         );
     }
 
-    result.details.push(ktstr::assert::AssertDetail::new(
+    result.record_fail(ktstr::assert::AssertDetail::new(
         ktstr::assert::DetailKind::Other,
         format!(
             "sdt_alloc bridge E2E: dump at {} carries scx_task_map with \
@@ -1370,8 +1370,8 @@ fn scenario_cast_analysis_cross_subprog_arena_chase(
     let json = match std::fs::read_to_string(&dump_path) {
         Ok(s) => s,
         Err(e) => {
-            result.passed = false;
-            result.details.push(ktstr::assert::AssertDetail::new(
+            
+            result.record_fail(ktstr::assert::AssertDetail::new(
                 ktstr::assert::DetailKind::Other,
                 format!(
                     "failure dump file missing at {}: {e} (freeze coordinator did \
@@ -1473,7 +1473,7 @@ fn scenario_cast_analysis_cross_subprog_arena_chase(
         );
     }
 
-    result.details.push(ktstr::assert::AssertDetail::new(
+    result.record_fail(ktstr::assert::AssertDetail::new(
         ktstr::assert::DetailKind::Other,
         format!(
             "cross-subprog arena chase E2E: dump at {} carries scx_task_map \

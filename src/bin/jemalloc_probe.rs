@@ -348,11 +348,14 @@ struct Snapshot {
 
 /// Per-thread probe outcome.
 ///
-/// Wire format: `#[serde(untagged)]` by deliberate choice. The two
-/// variants have disjoint field sets so consumers can discriminate
-/// via field presence without a tag.
+/// Wire format: serde's externally-tagged default (no
+/// `#[serde(untagged)]`). The variants discriminate cleanly via the
+/// outer key (`{"Ok": {...}}` / `{"Err": {...}}`) rather than
+/// field-presence. Defensive consistency with other ktstr enums that
+/// cross any binary wire — untagged enums silently fail to decode
+/// under postcard (`WontImplement`), so the codebase pattern is to
+/// never use them.
 #[derive(Debug, Serialize)]
-#[serde(untagged)]
 enum ThreadResult {
     Ok {
         tid: i32,
@@ -2262,8 +2265,8 @@ mod tests {
         assert_eq!(sc.test_name, "t");
         assert_eq!(sc.topology, "1n1l1c1t");
         assert_eq!(sc.scheduler, "eevdf");
-        assert!(sc.passed);
-        assert!(!sc.skipped);
+        assert!(sc.is_pass());
+        assert!(!sc.is_skip());
         assert_eq!(sc.metrics.len(), 1, "one appended PayloadMetrics");
         let pm = &sc.metrics[0];
         assert_eq!(pm.exit_code, 0);

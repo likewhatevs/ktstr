@@ -124,10 +124,8 @@ fn assert_temporal_patterns(result: &VmResult) -> Result<()> {
         .at_most(DISPATCHED_CEILING);
 
     let r = verdict.into_result();
-    if !r.passed {
-        let detail_lines: Vec<String> = r
-            .details
-            .iter()
+    if r.is_fail() {
+        let detail_lines: Vec<String> = r.failure_details()
             .map(|d| format!("  [{:?}] {}", d.kind, d.message))
             .collect();
         anyhow::bail!(

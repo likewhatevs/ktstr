@@ -22,15 +22,7 @@ const MACRO_TEST_DISK: DiskConfig = DiskConfig::DEFAULT.with_name("macro-test");
 fn basic_topology_check(ctx: &Ctx) -> Result<AssertResult> {
     let total = ctx.topo.total_cpus();
     if total == 0 {
-        return Ok(AssertResult {
-            passed: false,
-            skipped: false,
-            details: vec!["no CPUs detected".into()],
-            passes: vec![],
-            stats: Default::default(),
-            measurements: std::collections::BTreeMap::new(),
-            info_notes: vec![],
-        });
+        return Ok(AssertResult::fail_msg("no CPUs detected"));
     }
     Ok(AssertResult::pass())
 }
@@ -106,13 +98,9 @@ fn resolve_func_ip_known_symbol(ctx: &Ctx) -> Result<AssertResult> {
     {
         return Ok(AssertResult::pass());
     }
-    Ok(AssertResult {
-        passed: false,
-        skipped: false,
-        details: vec![format!("schedule address: {ip:?}").into()],
-        stats: Default::default(),
-        measurements: Default::default(),
-    })
+    Ok(AssertResult::fail_msg(format!(
+        "schedule address: {ip:?}"
+    )))
 }
 
 /// Check that find_test can locate registered entries.
@@ -706,10 +694,12 @@ fn topology_matches_vm_spec(ctx: &Ctx) -> Result<AssertResult> {
     if passed {
         Ok(AssertResult::pass())
     } else {
+        let outcomes: Vec<ktstr::assert::Outcome> = details
+            .into_iter()
+            .map(ktstr::assert::Outcome::Fail)
+            .collect();
         Ok(AssertResult {
-            passed: false,
-            skipped: false,
-            details,
+            outcomes,
             passes: vec![],
             stats: Default::default(),
             measurements: std::collections::BTreeMap::new(),

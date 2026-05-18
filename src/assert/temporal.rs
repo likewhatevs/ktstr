@@ -1058,26 +1058,23 @@ impl SeriesField<bool> {
 }
 
 fn push_detail(verdict: &mut Verdict, message: String) {
-    let result = verdict.result_mut();
-    result.passed = false;
-    result
-        .details
-        .push(AssertDetail::new(DetailKind::Temporal, message));
+    verdict
+        .result_mut()
+        .record_fail(AssertDetail::new(DetailKind::Temporal, message));
 }
 
-/// Count `DetailKind::Temporal` entries in `verdict`'s underlying
-/// result. Used by [`maybe_log_pass_temporal`] to gate the
-/// positive-confirmation log on "this pattern added zero Temporal
-/// failures." Vacuous-pattern and projection-error skip notes live on
-/// `AssertResult::info_notes` (a structurally-separate field from
-/// `details`) and are therefore naturally excluded from this count,
-/// so a pattern that emits notes but no failure details still trips
-/// the positive log.
+/// Count `DetailKind::Temporal` Fail outcomes in `verdict`'s
+/// underlying result. Used by [`maybe_log_pass_temporal`] to gate
+/// the positive-confirmation log on "this pattern added zero
+/// Temporal failures." Vacuous-pattern and projection-error skip
+/// notes live on `AssertResult::info_notes` (a structurally-separate
+/// field from outcomes) and are therefore naturally excluded from
+/// this count, so a pattern that emits notes but no failure
+/// outcomes still trips the positive log.
 fn temporal_failure_count(verdict: &Verdict) -> usize {
     verdict
         .result()
-        .details
-        .iter()
+        .failure_details()
         .filter(|d| matches!(d.kind, DetailKind::Temporal))
         .count()
 }
@@ -1142,9 +1139,9 @@ mod tests {
         let mut v = Verdict::new();
         f.nondecreasing(&mut v);
         let r = v.into_result();
-        assert!(!r.passed);
-        assert!(r.details.iter().any(|d| d.kind == DetailKind::Temporal));
-        assert!(r.details.iter().any(|d| d.message.contains("counter")));
+        assert!(r.is_fail());
+        assert!(r.failure_details().any(|d| d.kind == DetailKind::Temporal));
+        assert!(r.failure_details().any(|d| d.message.contains("counter")));
     }
 
     #[test]
@@ -1153,7 +1150,7 @@ mod tests {
         let mut v = Verdict::new();
         f.strictly_increasing(&mut v);
         let r = v.into_result();
-        assert!(!r.passed);
+        assert!(r.is_fail());
     }
 
     #[test]
@@ -1188,7 +1185,7 @@ mod tests {
         );
         let mut v = Verdict::new();
         f.steady_within(&mut v, 250, 0.01);
-        assert!(v.passed(), "{:?}", v.into_result().details);
+        assert!(v.passed(), "{:?}", v.into_result().outcomes);
     }
 
     #[test]
@@ -1289,10 +1286,9 @@ mod tests {
         let mut v = Verdict::new();
         f.each(&mut v).at_least(1u64);
         let r = v.into_result();
-        assert!(!r.passed);
+        assert!(r.is_fail());
         assert!(
-            r.details
-                .iter()
+            r.failure_details()
                 .any(|d| d.message.contains("projection error"))
         );
     }
@@ -1371,7 +1367,7 @@ mod tests {
         let mut v = Verdict::new();
         f.nondecreasing(&mut v);
         let r = v.into_result();
-        assert!(r.passed);
+        assert!(r.is_pass());
         assert!(!r.info_notes.is_empty());
     }
 
@@ -1388,7 +1384,7 @@ mod tests {
         let mut v = Verdict::new();
         field.nondecreasing(&mut v);
         let r = v.into_result();
-        assert!(r.passed);
+        assert!(r.is_pass());
     }
 
     // ---- Skip-on-projection-error semantics ----
@@ -1416,9 +1412,9 @@ mod tests {
         f.nondecreasing(&mut v);
         let r = v.into_result();
         assert!(
-            r.passed,
+            r.is_pass(),
             "nondecreasing must NOT flip on projection error: {:?}",
-            r.details
+            r.outcomes
         );
         assert!(
             r.info_notes
@@ -1453,9 +1449,9 @@ mod tests {
         f.rate_within(&mut v, 0.0, 1.0);
         let r = v.into_result();
         assert!(
-            r.passed,
+            r.is_pass(),
             "rate_within must NOT flip on gap: {:?}",
-            r.details
+            r.outcomes
         );
         assert!(
             r.info_notes.iter().any(|n| n.message.contains("gap")),
@@ -1486,7 +1482,7 @@ mod tests {
         let mut v = Verdict::new();
         f.steady_within(&mut v, 0, 0.10);
         let r = v.into_result();
-        assert!(r.passed, "{:?}", r.details);
+        assert!(r.is_pass(), "{:?}", r.outcomes);
         assert!(
             r.info_notes
                 .iter()
@@ -1520,7 +1516,7 @@ mod tests {
         let mut v = Verdict::new();
         lhs.ratio_within(&mut v, &rhs, 1.5, 2.5);
         let r = v.into_result();
-        assert!(r.passed, "{:?}", r.details);
+        assert!(r.is_pass(), "{:?}", r.outcomes);
         assert!(
             r.info_notes.iter().any(|n| n.message.contains("1 pair")),
             "expected gap note: {:?}",
@@ -1542,9 +1538,9 @@ mod tests {
         f.converges_to(&mut v, 1.0, 0.5, 1000);
         let r = v.into_result();
         assert!(
-            r.passed,
+            r.is_pass(),
             "insufficient-samples must NOT flip the verdict: {:?}",
-            r.details
+            r.outcomes
         );
         assert!(
             r.info_notes
@@ -1574,20 +1570,18 @@ mod tests {
         let mut v = Verdict::new();
         f.converges_to(&mut v, 1.0, 0.5, 1000);
         let r = v.into_result();
-        assert!(!r.passed);
+        assert!(r.is_fail());
         assert!(
-            r.details
-                .iter()
+            r.failure_details()
                 .any(|d| d.message.contains("no 3-consecutive-in-band witness")),
             "expected no-witness message: {:?}",
-            r.details
+            r.outcomes
         );
         assert!(
-            !r.details
-                .iter()
+            !r.failure_details()
                 .any(|d| d.message.contains("insufficient samples")),
             "must NOT report insufficient-samples when there ARE enough samples: {:?}",
-            r.details
+            r.outcomes
         );
     }
 
@@ -1604,13 +1598,12 @@ mod tests {
         let mut v = Verdict::new();
         f.each(&mut v).at_least(0.0f64);
         let r = v.into_result();
-        assert!(!r.passed);
+        assert!(r.is_fail());
         assert!(
-            r.details
-                .iter()
+            r.failure_details()
                 .any(|d| d.message.contains("NaN") && d.message.contains("periodic_001")),
             "expected NaN failure naming the sample: {:?}",
-            r.details
+            r.outcomes
         );
     }
 
@@ -1621,13 +1614,12 @@ mod tests {
         let mut v = Verdict::new();
         f.each(&mut v).at_most(100.0f64);
         let r = v.into_result();
-        assert!(!r.passed);
+        assert!(r.is_fail());
         assert!(
-            r.details
-                .iter()
+            r.failure_details()
                 .any(|d| d.message.contains("NaN") && d.message.contains("periodic_001")),
             "expected NaN failure naming the sample: {:?}",
-            r.details
+            r.outcomes
         );
     }
 
@@ -1638,13 +1630,12 @@ mod tests {
         let mut v = Verdict::new();
         f.each(&mut v).between(0.0f64, 100.0f64);
         let r = v.into_result();
-        assert!(!r.passed);
+        assert!(r.is_fail());
         assert!(
-            r.details
-                .iter()
+            r.failure_details()
                 .any(|d| d.message.contains("NaN") && d.message.contains("periodic_001")),
             "expected NaN failure naming the sample: {:?}",
-            r.details
+            r.outcomes
         );
     }
 
@@ -1661,13 +1652,12 @@ mod tests {
         let mut v = Verdict::new();
         f.rate_within(&mut v, 0.0, 1.0);
         let r = v.into_result();
-        assert!(!r.passed);
+        assert!(r.is_fail());
         assert!(
-            r.details
-                .iter()
+            r.failure_details()
                 .any(|d| d.kind == DetailKind::Temporal && d.message.contains("non-finite rate")),
             "expected non-finite-rate failure: {:?}",
-            r.details
+            r.outcomes
         );
     }
 
@@ -1698,7 +1688,7 @@ mod tests {
         field.nondecreasing(&mut v);
         let r = v.into_result();
         // Verdict passes (nondecreasing skips errored samples).
-        assert!(r.passed, "{:?}", r.details);
+        assert!(r.is_pass(), "{:?}", r.outcomes);
         // The note message names the placeholder sample.
         assert!(
             r.info_notes
@@ -1773,9 +1763,9 @@ mod tests {
         // Verdict passes — MissingStats is structurally missing
         // data, not a monotonicity regression.
         assert!(
-            r.passed,
+            r.is_pass(),
             "nondecreasing must NOT flip on MissingStats: {:?}",
-            r.details
+            r.outcomes
         );
         // The note message names the MissingStats sample so the
         // operator sees the stats-coverage gap without re-walking

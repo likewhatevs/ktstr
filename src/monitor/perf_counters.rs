@@ -369,9 +369,9 @@ mod tests {
         crate::claim!(v, ipc).is_finite();
         let r = v.into_result();
         assert!(
-            r.passed,
+            r.is_pass(),
             "productive IPC=1.5 must satisfy at_least(1.0): {:?}",
-            r.details,
+            r.outcomes,
         );
     }
 
@@ -386,8 +386,8 @@ mod tests {
         let mut v = Verdict::new();
         crate::claim!(v, ipc).at_least(1.0);
         let r = v.into_result();
-        assert!(!r.passed, "idle vCPU's ipc=0 must fail at_least(1.0)");
-        let msg = &r.details[0].message;
+        assert!(!r.is_pass(), "idle vCPU's ipc=0 must fail at_least(1.0)");
+        let msg = &*r.failure_details().next().unwrap().message;
         assert!(msg.contains("at least 1"), "msg must name threshold: {msg}");
         assert!(msg.contains("ipc"), "msg must include the label: {msg}");
     }
@@ -412,8 +412,8 @@ mod tests {
         let mut v = Verdict::new();
         crate::claim!(v, s.time_running_ns).eq(s.time_enabled_ns);
         let r = v.into_result();
-        assert!(!r.passed, "multiplexed sample must fail eq claim");
-        let msg = &r.details[0].message;
+        assert!(!r.is_pass(), "multiplexed sample must fail eq claim");
+        let msg = &*r.failure_details().next().unwrap().message;
         assert!(
             msg.contains("expected 1000000"),
             "msg must reflect expected value: {msg}",

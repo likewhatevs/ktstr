@@ -102,8 +102,7 @@ fn thread_integration_spin_wait(ctx: &Ctx) -> Result<AssertResult> {
 
     let mut result = AssertResult::pass();
     if reports.len() != 2 {
-        result.passed = false;
-        result.details.push(AssertDetail::new(
+        result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
                 "Thread SpinWait expected 2 reports, got {}; collection \
@@ -115,8 +114,7 @@ fn thread_integration_spin_wait(ctx: &Ctx) -> Result<AssertResult> {
     }
     for r in &reports {
         if !r.completed {
-            result.passed = false;
-            result.details.push(AssertDetail::new(
+            result.record_fail(AssertDetail::new(
                 DetailKind::Other,
                 format!(
                     "Thread SpinWait worker tid={} did not complete; \
@@ -127,8 +125,7 @@ fn thread_integration_spin_wait(ctx: &Ctx) -> Result<AssertResult> {
             return Ok(result);
         }
         if r.work_units == 0 {
-            result.passed = false;
-            result.details.push(AssertDetail::new(
+            result.record_fail(AssertDetail::new(
                 DetailKind::Other,
                 format!(
                     "Thread SpinWait worker tid={} did no work; the \
@@ -141,14 +138,11 @@ fn thread_integration_spin_wait(ctx: &Ctx) -> Result<AssertResult> {
         }
     }
 
-    result.details.push(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "Thread SpinWait completed cleanly across {} workers; \
-             total work_units={}",
-            reports.len(),
-            reports.iter().map(|r| r.work_units).sum::<u64>(),
-        ),
+    result.note(format!(
+        "Thread SpinWait completed cleanly across {} workers; \
+         total work_units={}",
+        reports.len(),
+        reports.iter().map(|r| r.work_units).sum::<u64>(),
     ));
     Ok(result)
 }
@@ -185,8 +179,7 @@ fn thread_integration_futex_ping_pong(ctx: &Ctx) -> Result<AssertResult> {
 
     let mut result = AssertResult::pass();
     if reports.len() != 2 {
-        result.passed = false;
-        result.details.push(AssertDetail::new(
+        result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
                 "Thread FutexPingPong expected 2 reports, got {}; \
@@ -199,8 +192,7 @@ fn thread_integration_futex_ping_pong(ctx: &Ctx) -> Result<AssertResult> {
 
     for r in &reports {
         if r.wake_latencies_ns.is_empty() {
-            result.passed = false;
-            result.details.push(AssertDetail::new(
+            result.record_fail(AssertDetail::new(
                 DetailKind::Other,
                 format!(
                     "Thread FutexPingPong worker tid={} captured zero \
@@ -214,8 +206,7 @@ fn thread_integration_futex_ping_pong(ctx: &Ctx) -> Result<AssertResult> {
             return Ok(result);
         }
         if r.work_units == 0 {
-            result.passed = false;
-            result.details.push(AssertDetail::new(
+            result.record_fail(AssertDetail::new(
                 DetailKind::Other,
                 format!(
                     "Thread FutexPingPong worker tid={} did no work; \
@@ -228,13 +219,10 @@ fn thread_integration_futex_ping_pong(ctx: &Ctx) -> Result<AssertResult> {
     }
 
     let total_samples: usize = reports.iter().map(|r| r.wake_latencies_ns.len()).sum();
-    result.details.push(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "Thread FutexPingPong populated wake_latencies_ns: \
-             total_samples={total_samples} across {} workers",
-            reports.len(),
-        ),
+    result.note(format!(
+        "Thread FutexPingPong populated wake_latencies_ns: \
+         total_samples={total_samples} across {} workers",
+        reports.len(),
     ));
     Ok(result)
 }
@@ -271,8 +259,7 @@ fn thread_integration_page_fault_churn(ctx: &Ctx) -> Result<AssertResult> {
 
     let mut result = AssertResult::pass();
     if reports.len() != 2 {
-        result.passed = false;
-        result.details.push(AssertDetail::new(
+        result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
                 "Thread PageFaultChurn expected 2 reports, got {}; \
@@ -285,8 +272,7 @@ fn thread_integration_page_fault_churn(ctx: &Ctx) -> Result<AssertResult> {
 
     let total_iters: u64 = reports.iter().map(|r| r.iterations).sum();
     if total_iters == 0 {
-        result.passed = false;
-        result.details.push(AssertDetail::new(
+        result.record_fail(AssertDetail::new(
             DetailKind::Other,
             "Thread PageFaultChurn reported zero total iterations — \
              the madvise(DONTNEED) → fault loop never advanced. \
@@ -300,8 +286,7 @@ fn thread_integration_page_fault_churn(ctx: &Ctx) -> Result<AssertResult> {
 
     for r in &reports {
         if r.work_units == 0 {
-            result.passed = false;
-            result.details.push(AssertDetail::new(
+            result.record_fail(AssertDetail::new(
                 DetailKind::Other,
                 format!(
                     "Thread PageFaultChurn worker tid={} did no \
@@ -313,13 +298,10 @@ fn thread_integration_page_fault_churn(ctx: &Ctx) -> Result<AssertResult> {
         }
     }
 
-    result.details.push(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "Thread PageFaultChurn populated iterations: \
-             total_iterations={total_iters} across {} workers",
-            reports.len(),
-        ),
+    result.note(format!(
+        "Thread PageFaultChurn populated iterations: \
+         total_iterations={total_iters} across {} workers",
+        reports.len(),
     ));
     Ok(result)
 }
@@ -358,8 +340,7 @@ fn thread_integration_mutex_contention(ctx: &Ctx) -> Result<AssertResult> {
 
     let mut result = AssertResult::pass();
     if reports.len() != 4 {
-        result.passed = false;
-        result.details.push(AssertDetail::new(
+        result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
                 "Thread MutexContention expected 4 reports, got {}; \
@@ -372,8 +353,7 @@ fn thread_integration_mutex_contention(ctx: &Ctx) -> Result<AssertResult> {
 
     let total_iters: u64 = reports.iter().map(|r| r.iterations).sum();
     if total_iters == 0 {
-        result.passed = false;
-        result.details.push(AssertDetail::new(
+        result.record_fail(AssertDetail::new(
             DetailKind::Other,
             "Thread MutexContention reported zero total iterations — \
              every worker failed to acquire the shared mutex. The \
@@ -386,8 +366,7 @@ fn thread_integration_mutex_contention(ctx: &Ctx) -> Result<AssertResult> {
 
     for r in &reports {
         if r.work_units == 0 {
-            result.passed = false;
-            result.details.push(AssertDetail::new(
+            result.record_fail(AssertDetail::new(
                 DetailKind::Other,
                 format!(
                     "Thread MutexContention worker tid={} did no \
@@ -399,23 +378,17 @@ fn thread_integration_mutex_contention(ctx: &Ctx) -> Result<AssertResult> {
         }
     }
 
-    result.details.push(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "Thread MutexContention populated iterations: \
-             total_iterations={total_iters} across {} workers",
-            reports.len(),
-        ),
+    result.note(format!(
+        "Thread MutexContention populated iterations: \
+         total_iterations={total_iters} across {} workers",
+        reports.len(),
     ));
     Ok(result)
 }
 
-/// Builds an [`AssertResult`] with `passed = false` and a single
-/// [`AssertDetail`] containing `msg`. Helper to reduce repetition
-/// across the early-bail branches in the tests above.
+/// Builds a failing [`AssertResult`] carrying `msg` as the Fail
+/// outcome detail. Helper to reduce repetition across the
+/// early-bail branches in the tests above.
 fn failing_result(msg: String) -> AssertResult {
-    let mut r = AssertResult::pass();
-    r.passed = false;
-    r.details.push(AssertDetail::new(DetailKind::Other, msg));
-    r
+    AssertResult::fail_msg(msg)
 }

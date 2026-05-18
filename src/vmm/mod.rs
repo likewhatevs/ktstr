@@ -1286,6 +1286,13 @@ impl KtstrVm {
             // is effectively disabled), so this flag never flips
             // and the BSP returns `timed_out=false` cleanly.
             &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // Interactive shell does not run the monitor/dump
+            // pipeline that consumes the virt-KASLR offset, so the
+            // BSP loop's MSR_LSTAR derive has no consumer. Pass a
+            // throwaway Arc (never read by any thread) and a 0
+            // link KVA to short-circuit the derive attempt.
+            &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            0,
         );
 
         // Shutdown.
@@ -1506,6 +1513,7 @@ mod tests {
     /// must be None. Watchdog observation may be Some on kernels
     /// with a static watchdog_timeout symbol (pre-7.1); if present,
     /// the write/read roundtrip must match.
+    ///
     #[test]
     fn boot_kernel_with_monitor() {
         let kernel = crate::test_support::require_kernel();
@@ -1801,6 +1809,7 @@ mod tests {
     /// indicate the monitor started sampling before the guest had
     /// the rq fields written, defeating the whole point of the
     /// SYS_RDY gate.
+    ///
     #[test]
     fn first_sample_has_valid_rq_clock_thanks_to_sys_rdy() {
         let kernel = crate::test_support::require_kernel();
@@ -2020,6 +2029,7 @@ mod tests {
     ///
     /// Gates on sched_domain_offsets BTF availability. Uses a 2-CPU
     /// topology so the domain tree spans multiple CPUs.
+    ///
     #[test]
     fn sched_domain_data_populated() {
         let kernel = crate::test_support::require_kernel();

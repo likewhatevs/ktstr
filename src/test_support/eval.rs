@@ -2043,10 +2043,10 @@ fn evaluate_vm_result(
             eprintln!("ktstr_test: {e:#}");
         }
 
-        if !check_result.passed {
+        if !check_result.is_pass() {
             let details = check_result
-                .details
-                .iter()
+                .failure_details()
+                .chain(check_result.skip_reasons())
                 .map(|d| d.message.as_str())
                 .collect::<Vec<_>>()
                 .join("\n  ");
@@ -2114,7 +2114,7 @@ fn evaluate_vm_result(
             // removed once every production emitter was audited as
             // kind-tagging its details. `verbose()` forces the
             // section on for operator debugging runs.
-            let console_section = if check_result.details.iter().any(|d| {
+            let console_section = if check_result.failure_details().any(|d| {
                 matches!(
                     d.kind,
                     crate::assert::DetailKind::SchedulerCrashed
@@ -2193,7 +2193,7 @@ fn evaluate_vm_result(
             let eval_report = trim_settle_samples(monitor);
             let thresholds = merged_assert.monitor_thresholds();
             let verdict = thresholds.evaluate(&eval_report);
-            if !verdict.passed {
+            if verdict.is_fail() {
                 let details = verdict.details.join("\n  ");
                 let timeline_section = build_timeline_section();
                 let monitor_section = format_monitor_section(monitor, merged_assert);
@@ -2396,7 +2396,7 @@ pub(crate) fn format_monitor_section(
     let s = &eval_report.summary;
     let thresholds = merged_assert.monitor_thresholds();
     let verdict = thresholds.evaluate(&eval_report);
-    let verdict_line = if verdict.passed {
+    let verdict_line = if verdict.is_pass() {
         verdict.summary.clone()
     } else {
         format!("{}: {}", verdict.summary, verdict.details.join("; "))

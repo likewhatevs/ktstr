@@ -743,15 +743,14 @@ impl std::fmt::Display for AssertDetail {
 /// ```
 /// # use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
 /// let mut a = AssertResult::pass();
-/// assert!(a.passed);
+/// assert!(a.is_pass());
 ///
 /// let mut b = AssertResult::pass();
-/// b.passed = false;
-/// b.details.push(AssertDetail::new(DetailKind::Starved, "worker starved"));
+/// b.record_fail(AssertDetail::new(DetailKind::Starved, "worker starved"));
 ///
 /// a.merge(b);
-/// assert!(!a.passed);
-/// assert!(a.details.iter().any(|d| d.kind == DetailKind::Starved));
+/// assert!(a.is_fail());
+/// assert!(a.failure_details().any(|d| d.kind == DetailKind::Starved));
 /// ```
 /// Structured measurement value attached via
 /// [`AssertResult::note_value`] / [`Verdict::note_value`].
@@ -784,8 +783,20 @@ impl std::fmt::Display for AssertDetail {
 /// IEEE-754 doubles where `NaN != NaN`, which violates the
 /// reflexivity requirement on `Eq`. Equality on `NoteValue` is
 /// partial-equivalence semantics for the same reason `f64` is.
+///
+/// Uses serde's externally-tagged default (no `#[serde(untagged)]`).
+/// Like [`Outcome`], NoteValue is wire-encoded as part of
+/// [`AssertResult::measurements`] via postcard's TLV transport from
+/// guest to host. Postcard is not a self-describing format and cannot
+/// decode `#[serde(untagged)]` enums (returns `WontImplement`) — pre-fix
+/// the decode silently failed when any test populated measurements
+/// before its result crossed the wire. The externally-tagged default
+/// (JSON form `{"Int": 42}` / `{"Text": "x"}`) is what postcard's
+/// externally-tagged enum decoder expects. The
+/// `assert_result_postcard_roundtrip` test pins this contract so a
+/// regression that re-adds `#[serde(untagged)]` trips at test time
+/// rather than as a silent data drop at runtime.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
 pub enum NoteValue {
     /// 64-bit signed integer — pid_t, exit codes, signed counters.
     Int(i64),
@@ -856,14 +867,37 @@ impl From<&str> for NoteValue {
 /// `details`. `Pass` carries no payload — there is no failure to
 /// describe.
 ///
-/// Phase 2a (this landing) introduces the enum + the
-/// [`AssertResult::outcome`] accessor that folds the existing
-/// `(passed, skipped, details)` representation into the new
-/// `Outcome`. Phase 2b will replace the tri-state fields with an
-/// `outcomes: Vec<Outcome>` field and migrate the ~150 consumer
-/// sites; until then, `Outcome` is a read-only derived view.
+/// Outcomes are stored as [`AssertResult::outcomes`] and the
+/// [`AssertResult::outcome`] accessor folds the vec via this enum's
+/// [`Self::merge`] (identity = `Outcome::Pass`). Callers query via
+/// [`AssertResult::is_pass`] / [`AssertResult::is_fail`] /
+/// [`AssertResult::is_skip`] (bool checks),
+/// [`AssertResult::record_fail`] / [`AssertResult::record_skip`] /
+/// [`AssertResult::record_pass`] (atomic mutators), or
+/// [`AssertResult::failure_details`] / [`AssertResult::skip_reasons`]
+/// (per-variant payload iterators).
+///
+/// **Skip is not Pass**: `is_pass()` returns `false` on skip — a
+/// skipped scenario is "couldn't run", not "passed". Stats tooling
+/// and gate callers that want to count "not a failure" must test
+/// `r.is_pass() || r.is_skip()` rather than bare `r.is_pass()`.
+/// Uses serde's externally-tagged default (no `#[serde(tag,
+/// content)]`). Most ktstr enums adopt the adjacently-tagged
+/// `#[serde(tag = "kind", content = "data")]` style for JSON
+/// readability, but `Outcome` is uniquely wire-encoded via
+/// postcard as part of [`AssertResult`]'s TLV transport from
+/// guest to host (see
+/// [`crate::test_support::output::parse_assert_result_from_drain`]
+/// and [`crate::test_support::test_helpers::assert_result_tlv_entry`]).
+/// Postcard is not a self-describing format and cannot decode
+/// adjacently-tagged enums — pre-fix the decode silently failed and
+/// surfaced as `ERR_NO_TEST_FUNCTION_OUTPUT`. The externally-tagged
+/// default is what postcard's externally-tagged enum decoder
+/// expects. `tests_assert.rs::outcome_serde_externally_tagged_*`
+/// pins both the JSON shape and the postcard roundtrip so a
+/// refactor that re-adds adjacent tagging trips loudly at test
+/// time rather than at runtime.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", content = "data")]
 pub enum Outcome {
     Pass,
     Skip(AssertDetail),
@@ -912,6 +946,28 @@ impl Outcome {
 
 /// Verdict for a single test scenario.
 ///
+/// # Reading the verdict
+///
+/// Inspect the terminal verdict via [`Self::outcome`] (returns the
+/// folded [`Outcome`] enum) or the convenience accessors
+/// [`Self::is_pass`] / [`Self::is_fail`] / [`Self::is_skip`]. Iterate
+/// the per-variant payloads via [`Self::failure_details`] (all
+/// [`Outcome::Fail`] payloads) and [`Self::skip_reasons`] (all
+/// [`Outcome::Skip`] payloads). The legacy [`Self::is_skipped`] /
+/// [`Self::is_failed`] aliases remain for the migration window — new
+/// code prefers the un-suffixed `is_skip` / `is_fail` for naming
+/// parity with [`Outcome::is_skip`] / [`Outcome::is_fail`].
+///
+/// # Recording outcomes
+///
+/// Producers use the atomic mutators [`Self::record_fail`] /
+/// [`Self::record_skip`] / [`Self::record_pass`] (each pushes a single
+/// [`Outcome`] variant onto [`Self::outcomes`]) and the escape hatch
+/// [`Self::record_outcome`] for pre-folded values. Constructors
+/// [`Self::pass`] / [`Self::skip`] / [`Self::fail`] seed the
+/// outcomes vec with the corresponding variant; [`Self::pass`] is
+/// zero-allocation (empty vec; the Pass identity element).
+///
 /// **Wire-format stability**: this struct is postcard-serialized as
 /// part of the in-VM `MSG_TYPE_TEST_RESULT` payload and as
 /// sidecar artifacts under `~/.cache/ktstr`. The wire format is
@@ -924,31 +980,34 @@ impl Outcome {
 #[must_use = "test verdict is lost if not checked"]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AssertResult {
-    /// Whether all checks passed.
+    /// Recorded terminal verdicts in emission order, one entry per
+    /// check that explicitly called [`Self::record_pass`],
+    /// [`Self::record_skip`], or [`Self::record_fail`] (plus the
+    /// single entry seeded by [`Self::skip`] / [`Self::fail`]
+    /// constructors).
     ///
-    /// **Prefer [`Self::outcome`].** Phase 2b replaces this bool +
-    /// [`Self::skipped`] + [`Self::details`] tri-state with an
-    /// `outcomes: Vec<Outcome>` field; new readers should match on
-    /// `Outcome` so the eventual field removal is a single migration
-    /// instead of cascading bool-pair updates across hundreds of
-    /// sites.
-    pub passed: bool,
-    /// True when the scenario was skipped (e.g. topology mismatch,
-    /// missing resource). `passed` stays `true` so gate callers that
-    /// treat skip as "not a failure" continue to work; stats tooling
-    /// must subtract skipped runs from pass counts so they don't
-    /// count as successful executions.
+    /// **Empty `outcomes` is the Pass identity** — [`Self::pass`]
+    /// constructs with `outcomes: vec![]`, [`Self::outcome`] folds
+    /// the vec via [`Outcome::merge`] starting from
+    /// [`Outcome::Pass`], so a never-touched accumulator naturally
+    /// resolves to Pass without any allocation. `record_pass()` is
+    /// for the rare case where a test explicitly records a passing
+    /// check (e.g. per-check helpers that document what passed);
+    /// `pass()` is the zero-state "nothing failed so far"
+    /// constructor.
     ///
-    /// **Prefer [`Self::outcome`].** Phase 2b removes this field
-    /// (see [`Self::passed`] for the rationale).
-    pub skipped: bool,
-    /// Human-readable diagnostic messages (failures, warnings), each
-    /// tagged with a [`DetailKind`] for structural filtering.
-    pub details: Vec<AssertDetail>,
+    /// The folded terminal verdict is computed by [`Self::outcome`]
+    /// per the precedence `Fail > Pass > Skip`. Use
+    /// [`Self::is_pass`] / [`Self::is_fail`] / [`Self::is_skip`] for
+    /// bool checks; use [`Self::failure_details`] /
+    /// [`Self::skip_reasons`] to iterate the per-variant
+    /// [`AssertDetail`] payloads.
+    pub outcomes: Vec<Outcome>,
     /// Structured records of every passing claim. Counterpart to
-    /// [`Self::details`]: where `details` carries failing/warning
-    /// signals, `passes` carries the positive confirmations every
-    /// comparator's pass arm emits via [`Verdict::record_pass`].
+    /// [`Self::outcomes`]: where `outcomes` carries terminal-verdict
+    /// records (Fail/Skip/Pass per-check), `passes` carries the
+    /// positive confirmations every comparator's pass arm emits via
+    /// [`Verdict::record_pass`].
     /// Empty in tests that don't exercise the structured-pass path
     /// (the no-claim base case), populated whenever a [`Verdict`]
     /// records claims. The auto-repro renderer iterates both vecs
@@ -968,20 +1027,20 @@ pub struct AssertResult {
     /// exists for the renderer's consumption; pinning it
     /// elsewhere makes the test surface viral — every new
     /// comparator that fires under the test starts churning the
-    /// pin. Pin `passed`, `details`, and `measurements` for
+    /// pin. Pin `outcome()`, `failure_details()`, and `measurements` for
     /// scenario verification.
     pub passes: Vec<PassDetail>,
     /// Aggregated stats from all workers in this scenario.
     pub stats: ScenarioStats,
     /// Structured measurements attached via [`Self::note_value`] /
-    /// [`Verdict::note_value`]. Distinct from [`Self::details`] —
-    /// `details` carries human-readable `String`s for operator
-    /// triage, `measurements` carries typed `(key, NoteValue)` pairs
-    /// for programmatic consumption (sidecar parsers, `stats
-    /// compare`, regression dashboards).
+    /// [`Verdict::note_value`]. Distinct from [`Self::outcomes`] —
+    /// outcomes carry typed verdict variants with `AssertDetail`
+    /// payloads for operator triage, `measurements` carries typed
+    /// `(key, NoteValue)` pairs for programmatic consumption (sidecar
+    /// parsers, `stats compare`, regression dashboards).
     pub measurements: std::collections::BTreeMap<String, NoteValue>,
     /// Informational annotations attached via [`Self::note`] /
-    /// [`Verdict::note`]. Structurally separated from [`Self::details`]
+    /// [`Verdict::note`]. Structurally separated from [`Self::outcomes`]
     /// so the failure stream stays purely failure-shaped: sidecar
     /// consumers iterating `details` count real failures without
     /// the "forgot to filter notes" silent-miscount class of bug
@@ -1209,14 +1268,14 @@ pub struct ScenarioStats {
 }
 
 impl AssertResult {
-    /// Empty passing result with no details and default stats. Use
+    /// Empty passing result with no outcomes and default stats. Use
     /// when a scenario completed successfully with nothing interesting
-    /// to report.
+    /// to report. Zero-allocation: `outcomes` is an empty `Vec` and
+    /// [`Self::outcome`] folds it to [`Outcome::Pass`] via the
+    /// merge identity.
     pub fn pass() -> Self {
         Self {
-            passed: true,
-            skipped: false,
-            details: vec![],
+            outcomes: vec![],
             passes: vec![],
             stats: Default::default(),
             measurements: std::collections::BTreeMap::new(),
@@ -1225,48 +1284,134 @@ impl AssertResult {
     }
     /// Pass result with a skip reason. Used when a scenario cannot run
     /// under the current topology or flag combination but is not a failure.
+    /// Seeds [`Self::outcomes`] with a single [`Outcome::Skip`] carrying
+    /// the reason.
+    ///
+    /// **Skip is not Pass**: a skipped result reports `is_pass() == false`
+    /// (the outcomes vec contains a non-Pass entry). Callers that want
+    /// "not a failure" gate semantics must test
+    /// `r.is_pass() || r.is_skip()` rather than bare `r.is_pass()` —
+    /// otherwise skipped runs count as failures.
     pub fn skip(reason: impl Into<String>) -> Self {
         Self {
-            passed: true,
-            skipped: true,
-            details: vec![AssertDetail::new(DetailKind::Skip, reason)],
-            passes: vec![],
-            stats: Default::default(),
-            measurements: std::collections::BTreeMap::new(),
-            info_notes: vec![],
+            outcomes: vec![Outcome::Skip(AssertDetail::new(DetailKind::Skip, reason))],
+            ..Self::pass()
         }
     }
     /// Failing result carrying a single [`AssertDetail`]. Mirrors
     /// [`Self::pass`] / [`Self::skip`] for the failure axis so callers
-    /// don't hand-roll the struct-literal shape (`passed: false,
-    /// skipped: false, details: vec![d], stats: Default::default()`)
-    /// at every diagnostic-only failure site.
+    /// don't hand-roll the struct-literal shape at every diagnostic-only
+    /// failure site. Seeds [`Self::outcomes`] with a single
+    /// [`Outcome::Fail`] carrying the detail.
     pub fn fail(detail: AssertDetail) -> Self {
         Self {
-            passed: false,
-            skipped: false,
-            details: vec![detail],
-            passes: vec![],
-            stats: Default::default(),
-            measurements: std::collections::BTreeMap::new(),
-            info_notes: vec![],
+            outcomes: vec![Outcome::Fail(detail)],
+            ..Self::pass()
         }
     }
     /// Failing result carrying a single diagnostic message with
-    /// [`DetailKind::Other`]. Shortcut for the common three-deep
-    /// nesting `AssertResult::fail(AssertDetail::new(DetailKind::Other,
-    /// msg))` at call sites where the failure is a diagnostic
-    /// message and the kind is always `Other`. Named `fail_msg`
-    /// rather than `fail_other` so the call site reads "failing
-    /// result with a message" without leaking the `DetailKind`
-    /// variant name into the API surface; external callers that do
-    /// want a specific `kind` still reach for `AssertResult::fail`
-    /// + `AssertDetail::new(kind, msg)`.
+    /// [`DetailKind::Other`]. Shortcut for the common nesting
+    /// `AssertResult::fail(AssertDetail::new(DetailKind::Other, msg))`
+    /// at call sites where the failure is a diagnostic message and
+    /// the kind is always `Other`. Named `fail_msg` rather than
+    /// `fail_other` so the call site reads "failing result with a
+    /// message" without leaking the [`DetailKind`] variant name into
+    /// the API surface; external callers that do want a specific
+    /// `kind` still reach for `AssertResult::fail` +
+    /// `AssertDetail::new(kind, msg)`.
     pub fn fail_msg(msg: impl Into<String>) -> Self {
         Self::fail(AssertDetail::new(DetailKind::Other, msg))
     }
+
+    /// Atomically record a Fail outcome carrying `detail`. Replaces
+    /// the legacy two-step pattern `r.passed = false; r.details.push(d);`
+    /// — collapses the producer-defect window where the discriminant
+    /// flipped without a corresponding diagnostic. Returns `&mut Self`
+    /// for chaining.
+    pub fn record_fail(&mut self, detail: AssertDetail) -> &mut Self {
+        self.outcomes.push(Outcome::Fail(detail));
+        self
+    }
+
+    /// Atomically record a Skip outcome carrying `reason`. Replaces
+    /// the legacy two-step pattern `r.skipped = true;
+    /// r.details.push(AssertDetail::new(DetailKind::Skip, reason));`.
+    /// Returns `&mut Self` for chaining.
+    pub fn record_skip(&mut self, reason: impl Into<String>) -> &mut Self {
+        self.outcomes
+            .push(Outcome::Skip(AssertDetail::new(DetailKind::Skip, reason)));
+        self
+    }
+
+    /// Explicitly record a Pass marker. Rare — the zero-state
+    /// `AssertResult::pass()` already folds to [`Outcome::Pass`] via
+    /// the merge identity over an empty vec. Use when a test helper
+    /// wants the outcome stream to carry an explicit pass record for
+    /// per-check accounting (e.g. "this specific check ran and
+    /// passed" vs "no check ran"). Returns `&mut Self` for chaining.
+    pub fn record_pass(&mut self) -> &mut Self {
+        self.outcomes.push(Outcome::Pass);
+        self
+    }
+
+    /// Escape hatch: push a pre-folded [`Outcome`] onto the stream.
+    /// Used by helpers that compute a verdict externally (e.g.
+    /// "this branch returned `Outcome::Fail(d)`") and want to fold
+    /// it into the running [`Self::outcomes`] without re-deriving
+    /// the variant. Returns `&mut Self` for chaining.
+    pub fn record_outcome(&mut self, outcome: Outcome) -> &mut Self {
+        self.outcomes.push(outcome);
+        self
+    }
+
+    /// True iff the scenario completed without failure and actually
+    /// ran (i.e. wasn't all-Skip). An empty outcomes stream (the
+    /// [`Self::pass`] zero-state, which is the merge identity
+    /// element) satisfies this; any stream containing at least one
+    /// real Pass marker alongside no Fail also satisfies it; an
+    /// all-Skip stream returns false (a skipped scenario didn't
+    /// pass, it didn't run).
+    ///
+    /// Mechanically: `!self.is_fail() && !self.is_skip()`. The two
+    /// conjuncts capture "no failure recorded" AND "not vacuously
+    /// satisfied by all-skip".
+    pub fn is_pass(&self) -> bool {
+        !self.is_fail() && !self.is_skip()
+    }
+
+    /// True iff any recorded outcome is [`Outcome::Fail`]. Any fail
+    /// in the stream dominates per `Fail > Pass > Skip` precedence.
+    pub fn is_fail(&self) -> bool {
+        self.outcomes.iter().any(|o| matches!(o, Outcome::Fail(_)))
+    }
+
+    /// True iff `outcomes` is non-empty AND every entry is
+    /// [`Outcome::Skip`]. Empty `outcomes` is the Pass identity,
+    /// NOT a vacuous Skip — `is_skip()` returns false on empty.
+    pub fn is_skip(&self) -> bool {
+        !self.outcomes.is_empty()
+            && self.outcomes.iter().all(|o| matches!(o, Outcome::Skip(_)))
+    }
+
+    /// Iterate every [`Outcome::Fail`]'s payload. Use to extract
+    /// failure diagnostics for rendering or stats roll-up.
+    pub fn failure_details(&self) -> impl Iterator<Item = &AssertDetail> {
+        self.outcomes.iter().filter_map(|o| match o {
+            Outcome::Fail(d) => Some(d),
+            _ => None,
+        })
+    }
+
+    /// Iterate every [`Outcome::Skip`]'s payload. Use to extract
+    /// skip reasons when triaging "scenario didn't run" outcomes.
+    pub fn skip_reasons(&self) -> impl Iterator<Item = &AssertDetail> {
+        self.outcomes.iter().filter_map(|o| match o {
+            Outcome::Skip(d) => Some(d),
+            _ => None,
+        })
+    }
     /// Append an informational annotation to [`Self::info_notes`].
-    /// Does NOT alter [`Self::passed`] or [`Self::skipped`] — a note
+    /// Does NOT alter the terminal verdict ([`Self::outcome`] is unaffected) — a note
     /// is context, not a verdict. Use to surface observed values
     /// alongside a passing or failing result so the sidecar carries
     /// the diagnostic context an operator needs without forcing every
@@ -1288,86 +1433,59 @@ impl AssertResult {
         self.note(msg);
         self
     }
-    /// Convenience accessor returning [`Self::skipped`]. Stats tooling
-    /// uses this to subtract non-executions from pass counts so
-    /// "topology mismatch" runs don't inflate the pass rate.
-    ///
-    /// **Prefer [`Self::outcome`] + [`Outcome::is_skip`].** Phase 2b
-    /// removes the underlying [`Self::skipped`] field; see [`Self::passed`].
+    /// Alias for [`Self::is_skip`] so stats tooling reading
+    /// "this scenario was skipped" via `is_skipped()` continues to
+    /// compile; new code should prefer [`Self::is_skip`] for naming
+    /// parity with [`Outcome::is_skip`].
     pub fn is_skipped(&self) -> bool {
-        self.skipped
+        self.is_skip()
     }
-    /// Convenience accessor returning the negation of [`Self::passed`].
-    /// Mirrors [`Self::is_skipped`] so short-circuit branches reading
-    /// "did this claim fail?" don't have to negate `.passed` inline.
-    ///
-    /// **Prefer [`Self::outcome`] + [`Outcome::is_fail`].** Phase 2b
-    /// removes the underlying [`Self::passed`] field; see [`Self::passed`].
+    /// Legacy alias for [`Self::is_fail`]. Kept so short-circuit
+    /// branches reading "did this claim fail?" via `is_failed()`
+    /// continue to compile; new code should prefer [`Self::is_fail`]
+    /// for naming parity with [`Outcome::is_fail`].
     pub fn is_failed(&self) -> bool {
-        !self.passed
+        self.is_fail()
     }
 
-    /// Terminal verdict folded into a single [`Outcome`] value.
+    /// Terminal verdict as a single [`Outcome`] value, aligned with
+    /// [`Self::is_pass`] / [`Self::is_fail`] / [`Self::is_skip`]:
     ///
-    /// Phase-2a read-only derived view over the existing
-    /// `(passed, skipped, details)` tri-state representation. Maps:
-    /// - `!self.passed` → `Outcome::Fail(first non-Skip detail or
-    ///   a synthesized "unspecified failure" placeholder when
-    ///   `details` is empty)` so consumers always have a payload to
-    ///   render.
-    /// - `self.skipped` → `Outcome::Skip(first Skip detail, or a
-    ///   synthesized "unspecified skip" placeholder)`.
-    /// - Otherwise → `Outcome::Pass`.
+    /// - any [`Outcome::Fail`] in the stream → [`Outcome::Fail`]
+    ///   carrying the first Fail's payload (the LEFT operand wins
+    ///   per [`Outcome::merge`]'s payload-tie semantics).
+    /// - else non-empty all-[`Outcome::Skip`] → [`Outcome::Skip`]
+    ///   carrying the first Skip's payload (a scenario whose only
+    ///   recorded gates were skips didn't run — the terminal
+    ///   verdict is Skip, not Pass).
+    /// - else (empty stream OR at least one explicit
+    ///   [`Outcome::Pass`] marker alongside no Fail) →
+    ///   [`Outcome::Pass`] (the zero-allocation pass identity also
+    ///   lands here).
     ///
-    /// Phase-2b will replace the underlying fields with
-    /// `outcomes: Vec<Outcome>` and this accessor becomes a fold
-    /// over that vec via [`Outcome::merge`] instead of a synthesis
-    /// from bools. Test authors using this accessor today get the
-    /// same terminal verdict regardless of which side of the
-    /// migration they're on.
+    /// Diverges from the naive `Outcome::merge` fold over the
+    /// identity element [`Outcome::Pass`]: that fold would treat
+    /// `[Skip(d)]` as `Pass.merge(Skip(d)) = Pass` per the
+    /// `Fail > Pass > Skip` precedence, contradicting the all-Skip
+    /// branch of [`Self::is_skip`]. This accessor encodes the
+    /// "empty Pass identity" / "real Pass beats Skip" /
+    /// "all-Skip is Skip terminal" distinctions the boolean
+    /// accessors enforce.
     pub fn outcome(&self) -> Outcome {
-        if !self.passed {
-            let candidate = self
-                .details
-                .iter()
-                .find(|d| d.kind != DetailKind::Skip)
-                .cloned();
-            debug_assert!(
-                candidate.is_some(),
-                "AssertResult.passed=false but details has no non-Skip entry — \
-                 producer-side defect: a failure was recorded without an \
-                 accompanying diagnostic. Every site that sets passed=false \
-                 must also push an AssertDetail describing the failure."
-            );
-            let detail = candidate.unwrap_or_else(|| {
-                AssertDetail::new(DetailKind::Other, "unspecified failure")
-            });
-            Outcome::Fail(detail)
-        } else if self.skipped {
-            let candidate = self
-                .details
-                .iter()
-                .find(|d| d.kind == DetailKind::Skip)
-                .cloned();
-            debug_assert!(
-                candidate.is_some(),
-                "AssertResult.skipped=true but details has no Skip-kind entry — \
-                 producer-side defect: a skip was recorded without a reason. \
-                 Every site that sets skipped=true must also push an \
-                 AssertDetail with DetailKind::Skip describing the skip reason."
-            );
-            let detail = candidate.unwrap_or_else(|| {
-                AssertDetail::new(DetailKind::Skip, "unspecified skip")
-            });
-            Outcome::Skip(detail)
+        if let Some(d) = self.failure_details().next() {
+            Outcome::Fail(d.clone())
+        } else if let Some(d) = self.skip_reasons().next() {
+            if self.outcomes.iter().all(|o| matches!(o, Outcome::Skip(_))) {
+                Outcome::Skip(d.clone())
+            } else {
+                Outcome::Pass
+            }
         } else {
             Outcome::Pass
         }
     }
-    /// Fold `other` into `self`. `passed` is conjoined (any failure
-    /// wins), `skipped` is conjoined (both must skip for the merged
-    /// result to be skipped), the four record vecs/maps —
-    /// [`Self::details`], [`Self::passes`], [`Self::info_notes`],
+    /// Fold `other` into `self`. The four parallel vecs/maps —
+    /// [`Self::outcomes`], [`Self::passes`], [`Self::info_notes`],
     /// [`Self::measurements`] — all extend with `other`'s contents
     /// (the three vecs concatenate; `measurements` is a `BTreeMap`
     /// merged with plain last-write-wins on key collision, i.e.
@@ -1381,6 +1499,12 @@ impl AssertResult {
     /// result-level `measurements` map deliberately does not consult
     /// the registry (it is a producer-attached typed annotation map,
     /// not a roll-up aggregation surface).
+    ///
+    /// Terminal-verdict semantics (any-Fail-dominates, both-must-Skip)
+    /// fall out automatically: appending `other.outcomes` keeps every
+    /// Fail in the stream so [`Self::outcome`]'s fold surfaces them,
+    /// and Skip survives only when both inputs were Skip-only because
+    /// a Pass entry in either side beats Skip per the merge precedence.
     pub fn merge(&mut self, other: AssertResult) {
         /// Lowest-non-zero fold: `*self_field` becomes `other_field`
         /// when `other_field` is strictly positive AND either
@@ -1402,14 +1526,7 @@ impl AssertResult {
             }
         }
 
-        if !other.passed {
-            self.passed = false;
-        }
-        // skip + skip = skipped (nothing executed); skip + pass/fail =
-        // NOT skipped (real work ran). Equivalent to logical AND of
-        // the two `skipped` flags.
-        self.skipped = self.skipped && other.skipped;
-        self.details.extend(other.details);
+        self.outcomes.extend(other.outcomes);
         self.passes.extend(other.passes);
         self.info_notes.extend(other.info_notes);
         let s = &mut self.stats;
@@ -1508,7 +1625,7 @@ impl AssertResult {
 
     /// Attach a structured `(key, value)` measurement to the result.
     /// Writes into [`Self::measurements`] without altering
-    /// [`Self::passed`] / [`Self::skipped`] / [`Self::details`] —
+    /// the terminal verdict ([`Self::outcome`]) —
     /// pure context for stats tooling.
     ///
     /// Distinct from [`Self::note`]: `note` carries a free-form
@@ -1569,20 +1686,18 @@ impl AssertResult {
     ///   paths). `stats` adopts the first passing branch's `stats`.
     ///   `measurements` union all passing branches' measurements
     ///   (last write wins on key collision, matching `merge`).
-    ///   `skipped` follows the first passing branch.
+    ///   `outcomes` follows the first passing branch (typically
+    ///   empty per the Pass identity).
     /// - **All branches fail**: returned result is failing. Every
-    ///   branch's `details` are concatenated, with each detail's
-    ///   message prefixed by `"any_of[<branch-idx>]: "` so an
-    ///   operator can identify which branch produced which failure.
-    ///   `stats` and `measurements` adopt the FIRST branch's values
-    ///   (an arbitrary choice but deterministic; a smarter
-    ///   "best-failing-branch" pick would require comparing
-    ///   `details.len()`, which is policy not mechanism).
-    ///   `skipped` is `false`.
+    ///   branch's recorded outcomes are re-emitted with each
+    ///   payload's message prefixed by `"any_of[<branch-idx>]: "`
+    ///   so an operator can identify which branch produced which
+    ///   failure. `stats` and `measurements` adopt the FIRST
+    ///   branch's values (an arbitrary choice but deterministic).
     /// - **Empty input**: returned result is failing with a single
-    ///   detail explaining the empty `any_of`. An empty disjunction
-    ///   is logically false; this surfaces a producer bug as a
-    ///   nameable failure rather than a vacuous pass.
+    ///   Fail outcome explaining the empty `any_of`. An empty
+    ///   disjunction is logically false; this surfaces a producer
+    ///   bug as a nameable failure rather than a vacuous pass.
     ///
     /// Doc: a trivial two-branch test with the second branch passing
     /// and the first branch failing — pinning that the verdict
@@ -1593,13 +1708,12 @@ impl AssertResult {
     /// let r = AssertResult::any_of([
     ///     {
     ///         let mut a = AssertResult::pass();
-    ///         a.passed = false;
-    ///         a.details.push(AssertDetail::new(DetailKind::Other, "branch 0 boom"));
+    ///         a.record_fail(AssertDetail::new(DetailKind::Other, "branch 0 boom"));
     ///         a
     ///     },
     ///     AssertResult::pass(),
     /// ]);
-    /// assert!(r.passed);
+    /// assert!(r.is_pass());
     /// ```
     pub fn any_of(branches: impl IntoIterator<Item = AssertResult>) -> AssertResult {
         let branches: Vec<AssertResult> = branches.into_iter().collect();
@@ -1610,31 +1724,22 @@ impl AssertResult {
             ));
         }
 
-        let first_pass_idx = branches.iter().position(|b| b.passed && !b.skipped);
+        let first_pass_idx = branches.iter().position(|b| b.is_pass());
         if let Some(idx) = first_pass_idx {
             // At least one branch passes. Take the first passing
             // branch as the "chosen" narrative: keep its stats /
-            // skipped, union measurements AND info_notes across
+            // outcomes, union measurements AND info_notes across
             // every passing branch (failed branches' content is
             // dropped — they would only confuse the operator with
             // messages from not-taken paths), and prefix every
             // surviving info_note with `any_of[<branch-idx>]:` for
             // operator-visible provenance.
-            //
-            // Iterate by enumerate() with `drain(..)` so the
-            // original branch indices are preserved as the prefix
-            // values. The chosen branch keeps its stats / skipped /
-            // passes (set up below); all branches contribute
-            // measurements + info_notes via the union loop.
             let mut chosen: Option<AssertResult> = None;
             let mut union_measurements: std::collections::BTreeMap<String, NoteValue> =
                 std::collections::BTreeMap::new();
             let mut union_info_notes: Vec<InfoNote> = Vec::new();
             for (orig_idx, b) in branches.into_iter().enumerate() {
                 if orig_idx == idx {
-                    // Pre-take the chosen branch's notes/measurements
-                    // so they enter the union loop on equal footing
-                    // with other passing branches.
                     let mut b = b;
                     let pre_notes = std::mem::take(&mut b.info_notes);
                     let pre_meas = std::mem::take(&mut b.measurements);
@@ -1646,7 +1751,7 @@ impl AssertResult {
                     for (k, v) in pre_meas {
                         union_measurements.insert(k, v);
                     }
-                } else if b.passed && !b.skipped {
+                } else if b.is_pass() {
                     for n in b.info_notes {
                         union_info_notes
                             .push(InfoNote::new(format!("any_of[{orig_idx}]: {}", n.message)));
@@ -1662,59 +1767,59 @@ impl AssertResult {
             let mut chosen = chosen.expect("first_pass_idx matched a branch");
             chosen.measurements = union_measurements;
             chosen.info_notes = union_info_notes;
-            // The synthesized arbiter annotation stays bare (not
-            // from any branch); appended last so it reads as the
-            // final disposition.
             chosen.info_notes.push(InfoNote::new(format!(
                 "any_of: branch {idx} satisfied the disjunction"
             )));
             chosen
         } else {
-            // All branches failed. Concatenate details with branch-
-            // index prefixes; adopt the first branch's stats /
-            // measurements / skipped (deterministic but arbitrary).
+            // All branches failed. Re-emit every branch's outcome
+            // stream with branch-index prefixes; adopt the first
+            // branch's stats / measurements / passes (deterministic
+            // but arbitrary). Fail/Skip variants keep their kind
+            // discriminant so the operator narrative differentiates
+            // "this branch failed" from "this branch skipped" — the
+            // disjunction still resolves to Fail via the synthesized
+            // summary record appended last.
             let total_branches = branches.len();
             let mut iter = branches.into_iter().enumerate();
             let (_, first) = iter.next().expect("non-empty checked above");
             let mut acc = AssertResult {
-                passed: false,
-                skipped: false,
-                details: Vec::new(),
+                outcomes: Vec::new(),
                 passes: first.passes,
                 stats: first.stats,
                 measurements: first.measurements,
                 info_notes: Vec::new(),
             };
-            // Re-prefix the first branch's details and notes and feed
-            // in. info_notes get the same branch-index prefix as
-            // details so the operator can attribute every record to
-            // the branch that emitted it.
-            for d in first.details {
-                acc.details.push(AssertDetail::new(
-                    d.kind,
-                    format!("any_of[0]: {}", d.message),
-                ));
-            }
-            for n in first.info_notes {
-                acc.info_notes
-                    .push(InfoNote::new(format!("any_of[0]: {}", n.message)));
-            }
-            for (idx, b) in iter {
-                for d in b.details {
-                    acc.details.push(AssertDetail::new(
-                        d.kind,
-                        format!("any_of[{idx}]: {}", d.message),
-                    ));
+            fn reemit_with_prefix(
+                acc: &mut AssertResult,
+                idx: usize,
+                outcomes: Vec<Outcome>,
+                info_notes: Vec<InfoNote>,
+            ) {
+                for o in outcomes {
+                    match o {
+                        Outcome::Pass => acc.outcomes.push(Outcome::Pass),
+                        Outcome::Fail(d) => acc.outcomes.push(Outcome::Fail(
+                            AssertDetail::new(d.kind, format!("any_of[{idx}]: {}", d.message)),
+                        )),
+                        Outcome::Skip(d) => acc.outcomes.push(Outcome::Skip(
+                            AssertDetail::new(d.kind, format!("any_of[{idx}]: {}", d.message)),
+                        )),
+                    }
                 }
-                for n in b.info_notes {
+                for n in info_notes {
                     acc.info_notes
                         .push(InfoNote::new(format!("any_of[{idx}]: {}", n.message)));
                 }
             }
-            acc.details.push(AssertDetail::new(
+            reemit_with_prefix(&mut acc, 0, first.outcomes, first.info_notes);
+            for (idx, b) in iter {
+                reemit_with_prefix(&mut acc, idx, b.outcomes, b.info_notes);
+            }
+            acc.outcomes.push(Outcome::Fail(AssertDetail::new(
                 DetailKind::Other,
                 format!("any_of: all {total_branches} branches failed"),
-            ));
+            )));
             acc
         }
     }
@@ -1727,11 +1832,12 @@ impl AssertResult {
     /// Distinct from [`Self::merge`] in API shape only: `merge`
     /// folds one external result into an existing accumulator;
     /// `all_of` folds an iterator of branches into a fresh result.
-    /// Same semantics for `passed` (conjoined), `details`
-    /// (concatenated), `stats` (worst-per-dimension), `measurements`
-    /// (union with last-write-wins). An empty input yields the
-    /// passing identity (`AssertResult::pass()`) — the AND of an
-    /// empty set is logically true, mirroring `Iterator::all`.
+    /// Same semantics for `outcomes` (concatenated; Fail dominates
+    /// per `Outcome::merge` precedence), `stats` (worst-per-dimension),
+    /// `measurements` (union with last-write-wins). An empty input
+    /// yields the passing identity (`AssertResult::pass()`) — the
+    /// AND of an empty set is logically true, mirroring
+    /// `Iterator::all`.
     ///
     /// Use when the test reads more naturally as "every check
     /// must hold" than as a merge chain — e.g. when the checks
@@ -1744,13 +1850,13 @@ impl AssertResult {
     ///     AssertResult::pass(),
     ///     AssertResult::pass(),
     /// ]);
-    /// assert!(r.passed);
+    /// assert!(r.is_pass());
     ///
     /// let r = AssertResult::all_of([
     ///     AssertResult::pass(),
     ///     AssertResult::fail(AssertDetail::new(DetailKind::Other, "boom")),
     /// ]);
-    /// assert!(!r.passed);
+    /// assert!(r.is_fail());
     /// ```
     pub fn all_of(branches: impl IntoIterator<Item = AssertResult>) -> AssertResult {
         let mut acc = AssertResult::pass();
@@ -1814,58 +1920,48 @@ impl AssertPlan {
                 // Re-check spread against custom threshold. The default
                 // assert_not_starved uses spread_threshold_pct(); clear
                 // those failures and re-evaluate.
+                // Strip the default-threshold Unfair Fail outcomes
+                // before re-evaluating against the caller's limit.
                 cgroup_result
-                    .details
-                    .retain(|d| d.kind != DetailKind::Unfair);
-                if let Some(cg) = cgroup_result.stats.cgroups.first() {
-                    if cg.spread > spread_limit && cg.num_workers >= 2 {
-                        cgroup_result.passed = false;
-                        cgroup_result.details.push(AssertDetail::new(
-                            DetailKind::Unfair,
-                            format!(
-                                "unfair cgroup: spread={:.0}% ({:.0}-{:.0}%) {} workers on {} cpus (threshold {:.0}%)",
-                                cg.spread, cg.min_off_cpu_pct, cg.max_off_cpu_pct,
-                                cg.num_workers, cg.num_cpus, spread_limit
-                            ),
-                        ));
-                    } else {
-                        // Re-derive passed: only non-spread failures matter.
-                        cgroup_result.passed = !cgroup_result
-                            .details
-                            .iter()
-                            .any(|d| matches!(d.kind, DetailKind::Starved | DetailKind::Stuck));
-                    }
+                    .outcomes
+                    .retain(|o| !matches!(o, Outcome::Fail(d) if d.kind == DetailKind::Unfair));
+                if let Some(cg) = cgroup_result.stats.cgroups.first()
+                    && cg.spread > spread_limit
+                    && cg.num_workers >= 2
+                {
+                    cgroup_result.record_fail(AssertDetail::new(
+                        DetailKind::Unfair,
+                        format!(
+                            "unfair cgroup: spread={:.0}% ({:.0}-{:.0}%) {} workers on {} cpus (threshold {:.0}%)",
+                            cg.spread, cg.min_off_cpu_pct, cg.max_off_cpu_pct,
+                            cg.num_workers, cg.num_cpus, spread_limit
+                        ),
+                    ));
                 }
+                // Else: no new Unfair failure; remaining Starved/Stuck
+                // Fail outcomes (if any) already encode the verdict
+                // via `outcomes`. No re-derive needed — outcomes are
+                // the single source of truth, so there is no `passed`
+                // flag to keep in sync with `details`.
             }
             // Apply custom gap threshold if set.
             if let Some(threshold) = self.max_gap_ms {
-                // Re-check gaps against custom threshold. The default
-                // assert_not_starved uses gap_threshold_ms() (2000ms
-                // release, 3000ms debug); clear those failures and
-                // re-evaluate.
+                // Re-check gaps against custom threshold. Strip the
+                // default-threshold Stuck Fail outcomes before
+                // re-evaluating against the caller's limit.
                 cgroup_result
-                    .details
-                    .retain(|d| d.kind != DetailKind::Stuck);
-                let had_gap_failure = reports.iter().any(|w| w.max_gap_ms > threshold);
-                if had_gap_failure {
-                    cgroup_result.passed = false;
-                    for w in reports {
-                        if w.max_gap_ms > threshold {
-                            cgroup_result.details.push(AssertDetail::new(
-                                DetailKind::Stuck,
-                                format!(
-                                    "tid {} stuck {}ms on cpu{} at +{}ms (threshold {}ms)",
-                                    w.tid, w.max_gap_ms, w.max_gap_cpu, w.max_gap_at_ms, threshold,
-                                ),
-                            ));
-                        }
+                    .outcomes
+                    .retain(|o| !matches!(o, Outcome::Fail(d) if d.kind == DetailKind::Stuck));
+                for w in reports {
+                    if w.max_gap_ms > threshold {
+                        cgroup_result.record_fail(AssertDetail::new(
+                            DetailKind::Stuck,
+                            format!(
+                                "tid {} stuck {}ms on cpu{} at +{}ms (threshold {}ms)",
+                                w.tid, w.max_gap_ms, w.max_gap_cpu, w.max_gap_at_ms, threshold,
+                            ),
+                        ));
                     }
-                } else {
-                    // Re-derive passed: only non-gap failures matter.
-                    cgroup_result.passed = !cgroup_result
-                        .details
-                        .iter()
-                        .any(|d| matches!(d.kind, DetailKind::Starved | DetailKind::Unfair));
                 }
             }
             r.merge(cgroup_result);
@@ -1902,8 +1998,7 @@ impl AssertPlan {
                 0.0
             };
             if ratio > max_ratio {
-                r.passed = false;
-                r.details.push(AssertDetail::new(
+                r.record_fail(AssertDetail::new(
                     DetailKind::Migration,
                     format!(
                         "migration ratio {:.4} exceeds threshold {:.4} ({} migrations / {} iterations)",
@@ -2015,8 +2110,7 @@ fn assert_slow_tier_ratio(
         .sum();
     let ratio = slow_pages as f64 / total_pages as f64;
     if ratio > max_ratio {
-        r.passed = false;
-        r.details.push(AssertDetail::new(
+        r.record_fail(AssertDetail::new(
             DetailKind::SlowTier,
             format!(
                 "slow-tier page ratio {ratio:.4} ({pct:.2}%) exceeds threshold {max_ratio:.4} ({thr_pct:.2}%) \
@@ -2043,8 +2137,7 @@ pub fn assert_page_locality(
     if let Some(threshold) = min_locality
         && observed < threshold
     {
-        r.passed = false;
-        r.details.push(AssertDetail::new(
+        r.record_fail(AssertDetail::new(
             DetailKind::PageLocality,
             format!(
                 "page locality {observed:.4} ({pct:.2}%) below threshold {threshold:.4} ({thr_pct:.2}%) ({local_pages}/{total_pages} pages local)",
@@ -2076,8 +2169,7 @@ pub fn assert_cross_node_migration(
     if let Some(threshold) = max_ratio {
         if total_pages == 0 {
             if migrated_pages > 0 {
-                r.passed = false;
-                r.details.push(AssertDetail::new(
+                r.record_fail(AssertDetail::new(
                     DetailKind::CrossNodeMigration,
                     format!(
                         "cross-node migration inconsistent: {migrated_pages} pages migrated but 0 pages observed in numa_maps (threshold {threshold:.4})",
@@ -2088,8 +2180,7 @@ pub fn assert_cross_node_migration(
         }
         let ratio = migrated_pages as f64 / total_pages as f64;
         if ratio > threshold {
-            r.passed = false;
-            r.details.push(AssertDetail::new(
+            r.record_fail(AssertDetail::new(
                 DetailKind::CrossNodeMigration,
                 format!(
                     "cross-node migration ratio {ratio:.4} ({pct:.2}%) exceeds threshold {threshold:.4} ({thr_pct:.2}%) ({migrated_pages}/{total_pages} pages migrated)",
@@ -2491,7 +2582,7 @@ impl Assert {
     /// ```
     /// # use ktstr::assert::Assert;
     /// let r = Assert::default_checks().verdict().into_result();
-    /// assert!(r.passed, "no claims means passing verdict");
+    /// assert!(r.is_pass(), "no claims means passing verdict");
     /// ```
     pub fn verdict(self) -> Verdict {
         Verdict::with_assert(self)
@@ -3082,15 +3173,14 @@ pub use temporal::{EachClaim, SeriesField};
 /// #     ..Default::default()
 /// # };
 /// let expected: BTreeSet<usize> = [0, 1, 2].into_iter().collect();
-/// assert!(assert_isolation(&[report], &expected).passed);
+/// assert!(assert_isolation(&[report], &expected).is_pass());
 /// ```
 pub fn assert_isolation(reports: &[WorkerReport], expected: &BTreeSet<usize>) -> AssertResult {
     let mut r = AssertResult::pass();
     for w in reports {
         let bad: BTreeSet<usize> = w.cpus_used.difference(expected).copied().collect();
         if !bad.is_empty() {
-            r.passed = false;
-            r.details.push(AssertDetail::new(
+            r.record_fail(AssertDetail::new(
                 DetailKind::Isolation,
                 format!("tid {} ran on unexpected CPUs {:?}", w.tid, bad),
             ));
@@ -3122,7 +3212,7 @@ pub fn assert_isolation(reports: &[WorkerReport], expected: &BTreeSet<usize>) ->
 /// #     ..Default::default()
 /// # };
 /// let r = assert_not_starved(&[report]);
-/// assert!(r.passed);
+/// assert!(r.is_pass());
 /// assert_eq!(r.stats.total_workers, 1);
 /// ```
 /// Nearest-rank percentile of a sorted slice (`p` in `[0.0, 1.0]`).
@@ -3175,8 +3265,7 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
 
     for w in reports {
         if w.work_units == 0 {
-            r.passed = false;
-            r.details.push(AssertDetail::new(
+            r.record_fail(AssertDetail::new(
                 DetailKind::Starved,
                 format!("tid {} starved (0 work units)", w.tid),
             ));
@@ -3283,8 +3372,7 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
     // and giving the operator the gate value without re-grepping `show-thresholds`.
     let spread_limit = spread_threshold_pct();
     if spread > spread_limit && pcts.len() >= 2 {
-        r.passed = false;
-        r.details.push(AssertDetail::new(
+        r.record_fail(AssertDetail::new(
             DetailKind::Unfair,
             format!(
                 "unfair cgroup: spread={:.0}% ({:.0}-{:.0}%) {} workers on {} cpus (threshold {:.0}%)",
@@ -3306,8 +3394,7 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
     let gap_limit = gap_threshold_ms();
     for w in reports {
         if w.max_gap_ms > gap_limit {
-            r.passed = false;
-            r.details.push(AssertDetail::new(
+            r.record_fail(AssertDetail::new(
                 DetailKind::Stuck,
                 format!(
                     "tid {} stuck {}ms on cpu{} at +{}ms (threshold {}ms)",
@@ -3380,7 +3467,7 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
 /// # };
 /// // Equal throughput -> low CV -> passes.
 /// let reports = [mk(1000, 1_000_000_000), mk(1000, 1_000_000_000)];
-/// assert!(assert_throughput_parity(&reports, Some(0.5), None).passed);
+/// assert!(assert_throughput_parity(&reports, Some(0.5), None).is_pass());
 /// ```
 pub fn assert_throughput_parity(
     reports: &[WorkerReport],
@@ -3416,8 +3503,7 @@ pub fn assert_throughput_parity(
         // instead of letting `max_throughput_cv` look green.
         let all_zero_cpu = reports.iter().all(|w| w.cpu_time_ns == 0);
         if all_zero_cpu {
-            r.passed = false;
-            r.details.push(AssertDetail::new(
+            r.record_fail(AssertDetail::new(
                 DetailKind::Benchmark,
                 format!(
                     "throughput CV undefined: all {} workers recorded zero cpu_time_ns (limit {cv_limit:.3})",
@@ -3429,8 +3515,7 @@ pub fn assert_throughput_parity(
             let stddev = variance.sqrt();
             let cv = stddev / mean;
             if cv > cv_limit {
-                r.passed = false;
-                r.details.push(AssertDetail::new(
+                r.record_fail(AssertDetail::new(
                     DetailKind::Benchmark,
                     format!(
                         "throughput CV {cv:.3} exceeds limit {cv_limit:.3} (mean={mean:.0} work/cpu_s)"
@@ -3443,8 +3528,7 @@ pub fn assert_throughput_parity(
     if let Some(floor) = min_rate {
         for (i, &rate) in rates.iter().enumerate() {
             if rate < floor {
-                r.passed = false;
-                r.details.push(AssertDetail::new(
+                r.record_fail(AssertDetail::new(
                     DetailKind::Benchmark,
                     format!(
                         "worker {} throughput {rate:.0} work/cpu_s below floor {floor:.0}",
@@ -3484,7 +3568,7 @@ pub fn assert_throughput_parity(
 /// #     ..Default::default()
 /// # };
 /// // p99 = 500ns, well under 10000ns limit.
-/// assert!(assert_benchmarks(&[report], Some(10000), None, None).passed);
+/// assert!(assert_benchmarks(&[report], Some(10000), None, None).is_pass());
 /// ```
 pub fn assert_benchmarks(
     reports: &[WorkerReport],
@@ -3515,8 +3599,7 @@ pub fn assert_benchmarks(
         sorted.sort_unstable();
         let p99 = percentile(&sorted, 0.99);
         if p99 > p99_limit {
-            r.passed = false;
-            r.details.push(AssertDetail::new(
+            r.record_fail(AssertDetail::new(
                 DetailKind::Benchmark,
                 format!(
                     "p99 wake latency {p99}ns exceeds limit {p99_limit}ns ({} samples)",
@@ -3539,8 +3622,7 @@ pub fn assert_benchmarks(
                 / n;
             let cv = variance.sqrt() / mean;
             if cv > cv_limit {
-                r.passed = false;
-                r.details.push(AssertDetail::new(
+                r.record_fail(AssertDetail::new(
                     DetailKind::Benchmark,
                     format!(
                         "wake latency CV {cv:.3} exceeds limit {cv_limit:.3} (mean={mean:.0}ns)"
@@ -3557,8 +3639,7 @@ pub fn assert_benchmarks(
             }
             let rate = w.iterations as f64 / (w.wall_time_ns as f64 / 1e9);
             if rate < rate_floor {
-                r.passed = false;
-                r.details.push(AssertDetail::new(
+                r.record_fail(AssertDetail::new(
                     DetailKind::Benchmark,
                     format!(
                         "worker {} iteration rate {rate:.1}/s below floor {rate_floor:.1}/s",
@@ -3598,15 +3679,15 @@ pub fn assert_benchmarks(
 /// # use ktstr::assert::assert_scx_events_clean;
 /// // Strict default — every counter must be zero.
 /// let r = assert_scx_events_clean(&[("enq_skip_exiting", 0), ("dispatch_local_dsq_offline", 0)], None);
-/// assert!(r.passed);
+/// assert!(r.is_pass());
 ///
 /// // A non-zero error-class counter fails.
 /// let r = assert_scx_events_clean(&[("enq_skip_exiting", 7)], None);
-/// assert!(!r.passed);
+/// assert!(r.is_fail());
 ///
 /// // Caller-supplied bound tolerates small counts.
 /// let r = assert_scx_events_clean(&[("dispatch_keep_last", 3)], Some(10));
-/// assert!(r.passed);
+/// assert!(r.is_pass());
 /// ```
 pub fn assert_scx_events_clean(events: &[(&str, i64)], max_count: Option<i64>) -> AssertResult {
     let mut r = AssertResult::pass();
@@ -3626,12 +3707,11 @@ pub fn assert_scx_events_clean(events: &[(&str, i64)], max_count: Option<i64>) -
             Some(bound) => *count < 0 || *count > bound,
         };
         if failed {
-            r.passed = false;
             let bound_desc = match max_count {
                 None => "0".to_string(),
                 Some(b) => b.to_string(),
             };
-            r.details.push(AssertDetail::new(
+            r.record_fail(AssertDetail::new(
                 DetailKind::SchedulerEvent,
                 format!("scx event `{name}` count {count} exceeds bound {bound_desc}",),
             ));
@@ -3788,7 +3868,7 @@ impl SchedulerBaseline {
 /// # };
 /// // Strict preset on a healthy run — passes.
 /// let r = assert_baseline(&[report], &SchedulerBaseline::strict());
-/// assert!(r.passed);
+/// assert!(r.is_pass());
 /// ```
 pub fn assert_baseline(reports: &[WorkerReport], baseline: &SchedulerBaseline) -> AssertResult {
     // Empty `reports` means nothing was measured. Returning a fresh
@@ -3831,8 +3911,7 @@ pub fn assert_baseline(reports: &[WorkerReport], baseline: &SchedulerBaseline) -
             sorted.sort_unstable();
             let p99 = percentile(&sorted, 0.99);
             if p99 > cost_limit {
-                r.passed = false;
-                r.details.push(AssertDetail::new(
+                r.record_fail(AssertDetail::new(
                     DetailKind::Benchmark,
                     format!(
                         "p99 iteration cost {p99}ns exceeds limit {cost_limit}ns ({} samples)",
@@ -3848,8 +3927,7 @@ pub fn assert_baseline(reports: &[WorkerReport], baseline: &SchedulerBaseline) -
     if let Some(max_mig) = baseline.max_migrations {
         let total_mig: u64 = reports.iter().map(|w| w.migration_count).sum();
         if total_mig > max_mig {
-            r.passed = false;
-            r.details.push(AssertDetail::new(
+            r.record_fail(AssertDetail::new(
                 DetailKind::Migration,
                 format!(
                     "total migrations {total_mig} exceeds limit {max_mig} ({} workers)",
@@ -3864,8 +3942,7 @@ pub fn assert_baseline(reports: &[WorkerReport], baseline: &SchedulerBaseline) -
     if let Some(min_units) = baseline.min_work_units {
         for w in reports {
             if w.work_units < min_units {
-                r.passed = false;
-                r.details.push(AssertDetail::new(
+                r.record_fail(AssertDetail::new(
                     DetailKind::Starved,
                     format!(
                         "tid {} work_units {} below floor {min_units}",

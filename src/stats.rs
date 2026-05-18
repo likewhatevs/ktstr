@@ -1008,6 +1008,27 @@ pub struct GauntletRow {
     pub ext_metrics: BTreeMap<String, f64>,
 }
 
+impl GauntletRow {
+    /// Convenience accessor mirroring [`crate::assert::AssertResult::is_pass`]
+    /// so the is_pass / is_fail vocabulary applies uniformly across both
+    /// verdict surfaces. GauntletRow is the sidecar-wire shape; its
+    /// `passed` bool is populated from `AssertResult::is_pass()` at
+    /// sidecar emission time.
+    pub fn is_pass(&self) -> bool {
+        self.passed
+    }
+    /// Convenience accessor mirroring
+    /// [`crate::assert::AssertResult::is_fail`].
+    pub fn is_fail(&self) -> bool {
+        !self.passed
+    }
+    /// Convenience accessor mirroring
+    /// [`crate::assert::AssertResult::is_skip`].
+    pub fn is_skip(&self) -> bool {
+        self.skipped
+    }
+}
+
 /// Typed-field filter set for narrowing `GauntletRow` sets in the
 /// `cargo ktstr stats compare` pipeline. Every field is `None` /
 /// empty by default; populated fields are AND-combined ACROSS
@@ -1917,11 +1938,11 @@ pub fn group_and_average_by(
             &mut acc.any_kernel_dirty,
             &mut acc.first_kernel_base,
         );
-        if row.skipped {
+        if row.is_skip() {
             acc.any_skipped = true;
             continue;
         }
-        if !row.passed {
+        if row.is_fail() {
             acc.any_failed = true;
             continue;
         }
@@ -2112,8 +2133,8 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         commit: sc.project_commit.clone(),
         kernel_commit: sc.kernel_commit.clone(),
         run_source: sc.run_source.clone(),
-        passed: sc.passed,
-        skipped: sc.skipped,
+        passed: sc.is_pass(),
+        skipped: sc.is_skip(),
         spread: finite_or_zero("spread", sc.stats.worst_spread),
         gap_ms: sc.stats.worst_gap_ms,
         migrations: sc.stats.total_migrations,
@@ -2218,8 +2239,8 @@ fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
     let scenario: Vec<&str> = rows.iter().map(|r| r.scenario.as_str()).collect();
     let topology: Vec<&str> = rows.iter().map(|r| r.topology.as_str()).collect();
     let work_type: Vec<&str> = rows.iter().map(|r| r.work_type.as_str()).collect();
-    let passed: Vec<bool> = rows.iter().map(|r| r.passed).collect();
-    let skipped: Vec<bool> = rows.iter().map(|r| r.skipped).collect();
+    let passed: Vec<bool> = rows.iter().map(|r| r.is_pass()).collect();
+    let skipped: Vec<bool> = rows.iter().map(|r| r.is_skip()).collect();
     let spread: Vec<f64> = rows.iter().map(|r| r.spread).collect();
     let gap_ms: Vec<f64> = rows.iter().map(|r| r.gap_ms as f64).collect();
     let migrations: Vec<f64> = rows.iter().map(|r| r.migrations as f64).collect();
@@ -3263,7 +3284,7 @@ pub(crate) fn compare_rows_by(
         // mode (short run, stalled workload), not the scheduler's
         // behavior — comparing either against a real run produces
         // meaningless deltas.
-        if !row_a.passed || !row_b.passed || row_a.skipped || row_b.skipped {
+        if row_a.is_fail() || row_b.is_fail() || row_a.is_skip() || row_b.is_skip() {
             report.skipped_failed += 1;
             continue;
         }
@@ -4344,7 +4365,7 @@ mod tests {
         let row = sidecar_to_row(&sc);
         assert_eq!(row.scenario, "my_test");
         assert_eq!(row.topology, "1n2l4c2t");
-        assert!(row.passed);
+        assert!(row.is_pass());
         assert_eq!(row.spread, 15.0);
         assert_eq!(row.gap_ms, 200);
         assert_eq!(row.migrations, 12);
@@ -4366,7 +4387,7 @@ mod tests {
         };
         let row = sidecar_to_row(&sc);
         assert_eq!(row.scenario, "eevdf_test");
-        assert!(!row.passed);
+        assert!(row.is_fail());
         assert_eq!(row.imbalance_ratio, 0.0);
         assert_eq!(row.max_dsq_depth, 0);
         assert_eq!(row.stuck_count, 0);
@@ -5676,10 +5697,9 @@ mod tests {
     fn compare_rows_skipped_side_drops_pair_into_skipped_failed() {
         // A skipped row on either side of the comparison must not
         // contribute to regressions/improvements — a skipped run
-        // carries no executed metrics. `row.passed == true` for skips
-        // would otherwise let the pair through the regression math,
-        // producing meaningless deltas against default-zero metric
-        // values.
+        // carries no executed metrics, so the pair must short-circuit
+        // via the is_skip() gate before regression math touches the
+        // default-zero metric values.
         let mut row_a = cmp_row("t", "tiny-1llc", true, 10.0, 100);
         let mut row_b = cmp_row("t", "tiny-1llc", true, 10.0, 100);
         row_a.skipped = true; // A side was skipped

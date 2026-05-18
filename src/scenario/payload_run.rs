@@ -2740,7 +2740,7 @@ mod tests {
             exit_code: 0,
         };
         let r = evaluate_checks(&[], &pm, "");
-        assert!(r.passed);
+        assert!(r.is_pass());
     }
 
     #[test]
@@ -2755,14 +2755,14 @@ mod tests {
             MetricCheck::min("iops", 100.0),
         ];
         let r = evaluate_checks(&checks, &pm, "");
-        assert!(!r.passed);
+        assert!(r.is_fail());
         // exit-code failure short-circuits — only one detail, not
         // a "missing metric" detail from the min check.
-        assert_eq!(r.details.len(), 1);
+        assert_eq!(r.outcomes.len(), 1);
         assert!(
-            r.details[0].message.contains("exited with code 42"),
+            r.failure_details().next().unwrap().message.contains("exited with code 42"),
             "details: {:?}",
-            r.details
+            r.outcomes
         );
     }
 
@@ -2778,16 +2778,16 @@ mod tests {
             &pm,
             "fatal: config missing\n",
         );
-        assert!(!r.passed);
+        assert!(r.is_fail());
         assert!(
-            r.details[0].message.contains("fatal: config missing"),
+            r.failure_details().next().unwrap().message.contains("fatal: config missing"),
             "stderr tail must appear in detail: {:?}",
-            r.details,
+            r.outcomes,
         );
         assert!(
-            r.details[0].message.contains("stderr:"),
+            r.failure_details().next().unwrap().message.contains("stderr:"),
             "detail must label the stderr block: {:?}",
-            r.details,
+            r.outcomes,
         );
     }
 
@@ -2799,12 +2799,12 @@ mod tests {
             exit_code: 1,
         };
         let r = evaluate_checks(&[MetricCheck::exit_code_eq(0)], &pm, "");
-        assert!(!r.passed);
+        assert!(r.is_fail());
         // Empty stderr → no "stderr:" prefix in the detail.
         assert!(
-            !r.details[0].message.contains("stderr:"),
+            !r.failure_details().next().unwrap().message.contains("stderr:"),
             "empty stderr must not produce a stderr: block: {:?}",
-            r.details,
+            r.outcomes,
         );
     }
 
@@ -2823,9 +2823,9 @@ mod tests {
         };
         let r = evaluate_checks(&[MetricCheck::exit_code_eq(-1)], &pm, "");
         assert!(
-            r.passed,
+            r.is_pass(),
             "exit_code_eq(-1) must pass when exit_code == -1: {:?}",
-            r.details,
+            r.outcomes,
         );
     }
 
@@ -2841,8 +2841,8 @@ mod tests {
             exit_code: 0,
         };
         let r = evaluate_checks(&[MetricCheck::exit_code_eq(-1)], &pm, "");
-        assert!(!r.passed);
-        let msg = &r.details[0].message;
+        assert!(r.is_fail());
+        let msg = &*r.failure_details().next().unwrap().message;
         assert!(
             msg.contains("exited with code 0"),
             "mismatch detail must cite the actual exit code, got: {msg}"
@@ -3013,11 +3013,11 @@ mod tests {
         };
         let checks = [MetricCheck::min("iops", 100.0)];
         let r = evaluate_checks(&checks, &pm, "");
-        assert!(!r.passed);
+        assert!(r.is_fail());
         assert!(
-            r.details[0].message.contains("not found"),
+            r.failure_details().next().unwrap().message.contains("not found"),
             "details: {:?}",
-            r.details
+            r.outcomes
         );
     }
 
@@ -3036,8 +3036,8 @@ mod tests {
             exit_code: 0,
         };
         let r = evaluate_checks(&[MetricCheck::min("iops", 100.0)], &pm, "");
-        assert!(!r.passed);
-        assert!(r.details[0].message.contains("below minimum"));
+        assert!(r.is_fail());
+        assert!(r.failure_details().next().unwrap().message.contains("below minimum"));
     }
 
     #[test]
@@ -3055,8 +3055,8 @@ mod tests {
             exit_code: 0,
         };
         let r = evaluate_checks(&[MetricCheck::max("lat", 500.0)], &pm, "");
-        assert!(!r.passed);
-        assert!(r.details[0].message.contains("exceeds maximum"));
+        assert!(r.is_fail());
+        assert!(r.failure_details().next().unwrap().message.contains("exceeds maximum"));
     }
 
     #[test]
@@ -3074,8 +3074,8 @@ mod tests {
             exit_code: 0,
         };
         let r = evaluate_checks(&[MetricCheck::range("cpu", 0.0, 100.0)], &pm, "");
-        assert!(!r.passed);
-        assert!(r.details[0].message.contains("outside"));
+        assert!(r.is_fail());
+        assert!(r.failure_details().next().unwrap().message.contains("outside"));
     }
 
     /// IEEE 754 makes every comparison against NaN evaluate to
@@ -3102,11 +3102,11 @@ mod tests {
             exit_code: 0,
         };
         let r = evaluate_checks(&[MetricCheck::min("iops", 100.0)], &pm, "");
-        assert!(!r.passed, "NaN value must fail Min check");
+        assert!(!r.is_pass(), "NaN value must fail Min check");
         assert!(
-            r.details[0].message.contains("value is NaN"),
+            r.failure_details().next().unwrap().message.contains("value is NaN"),
             "NaN failure must surface the dedicated message: {:?}",
-            r.details
+            r.outcomes
         );
     }
 
@@ -3128,11 +3128,11 @@ mod tests {
             exit_code: 0,
         };
         let r = evaluate_checks(&[MetricCheck::max("lat", 500.0)], &pm, "");
-        assert!(!r.passed, "NaN value must fail Max check");
+        assert!(!r.is_pass(), "NaN value must fail Max check");
         assert!(
-            r.details[0].message.contains("value is NaN"),
+            r.failure_details().next().unwrap().message.contains("value is NaN"),
             "NaN failure must surface the dedicated message: {:?}",
-            r.details
+            r.outcomes
         );
     }
 
@@ -3155,11 +3155,11 @@ mod tests {
             exit_code: 0,
         };
         let r = evaluate_checks(&[MetricCheck::range("cpu", 0.0, 100.0)], &pm, "");
-        assert!(!r.passed, "NaN value must fail Range check");
+        assert!(!r.is_pass(), "NaN value must fail Range check");
         assert!(
-            r.details[0].message.contains("value is NaN"),
+            r.failure_details().next().unwrap().message.contains("value is NaN"),
             "NaN failure must surface the dedicated message: {:?}",
-            r.details
+            r.outcomes
         );
     }
 
@@ -3171,7 +3171,7 @@ mod tests {
             exit_code: 0,
         };
         let r = evaluate_checks(&[MetricCheck::exists("thing")], &pm, "");
-        assert!(!r.passed);
+        assert!(r.is_fail());
     }
 
     #[test]
@@ -3197,7 +3197,7 @@ mod tests {
             &pm,
             "",
         );
-        assert!(r.passed);
+        assert!(r.is_pass());
     }
 
     /// Multiple checks on the same metric all fire — the evaluator
@@ -3231,14 +3231,14 @@ mod tests {
             &pm,
             "",
         );
-        assert!(!r.passed, "second min must fail");
-        assert_eq!(r.details.len(), 1, "only the failing check emits a detail");
+        assert!(!r.is_pass(), "second min must fail");
+        assert_eq!(r.outcomes.len(), 1, "only the failing check emits a detail");
         // The passing check produces no detail; only the failing one
         // shows up. The message must reference the 200 threshold.
         assert!(
-            r.details[0].message.contains("below minimum 200"),
+            r.failure_details().next().unwrap().message.contains("below minimum 200"),
             "failing check must cite its threshold: {:?}",
-            r.details,
+            r.outcomes,
         );
     }
 
@@ -3269,12 +3269,12 @@ mod tests {
             &pm,
             "",
         );
-        assert!(!r.passed);
+        assert!(r.is_fail());
         assert_eq!(
-            r.details.len(),
+            r.outcomes.len(),
             2,
             "both conflicting checks must each emit a detail: {:?}",
-            r.details,
+            r.outcomes,
         );
     }
 
@@ -3300,9 +3300,9 @@ mod tests {
         };
         let r = evaluate_checks(&[MetricCheck::exists("errors")], &pm, "");
         assert!(
-            r.passed,
+            r.is_pass(),
             "exists('errors') must pass when metric is 0.0: {:?}",
-            r.details,
+            r.outcomes,
         );
     }
 
@@ -3325,7 +3325,7 @@ mod tests {
             exit_code: 0,
         };
         let r = evaluate_checks(&[MetricCheck::exists("drift")], &pm, "");
-        assert!(r.passed);
+        assert!(r.is_pass());
     }
 
     /// `PayloadRun`'s custom `Debug` impl renders the stable
@@ -3430,7 +3430,7 @@ mod tests {
                 .spawn()
                 .expect("spawn /bin/true");
             let (result, metrics) = handle.wait().expect("wait");
-            assert!(result.passed);
+            assert!(result.is_pass());
             assert_eq!(metrics.exit_code, 0);
         });
     }
@@ -3498,7 +3498,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             let (r, metrics) = result.expect("try_wait eventually returns Some");
-            assert!(r.passed);
+            assert!(r.is_pass());
             assert_eq!(metrics.exit_code, 0);
         });
     }
@@ -3574,18 +3574,18 @@ mod tests {
             MetricCheck::range("cpu", 0.0, 100.0),
         ];
         let r = evaluate_checks(&checks, &pm, "");
-        assert!(!r.passed);
+        assert!(r.is_fail());
         assert_eq!(
-            r.details.len(),
+            r.outcomes.len(),
             3,
             "expected one detail per failed metric check, got: {:?}",
-            r.details,
+            r.outcomes,
         );
         // Each check's message must surface — not an aggregate or
         // a deduped first-only line.
-        assert!(r.details.iter().any(|d| d.message.contains("iops")));
-        assert!(r.details.iter().any(|d| d.message.contains("lat")));
-        assert!(r.details.iter().any(|d| d.message.contains("cpu")));
+        assert!(r.failure_details().any(|d| d.message.contains("iops")));
+        assert!(r.failure_details().any(|d| d.message.contains("lat")));
+        assert!(r.failure_details().any(|d| d.message.contains("cpu")));
     }
 
     #[test]
@@ -5293,7 +5293,7 @@ mod tests {
             "exit_code must still propagate through the deferral arm",
         );
         assert!(
-            assert_result.passed,
+            assert_result.is_pass(),
             "no checks declared and no exit-code mismatch — verdict must pass; \
              got {assert_result:?}",
         );
@@ -5406,7 +5406,7 @@ mod tests {
             output,
         );
         assert!(
-            assert_result.passed,
+            assert_result.is_pass(),
             "matching ExitCodeEq must pass on LlmExtract deferral arm; got {assert_result:?}",
         );
         assert!(pm.metrics.is_empty());
@@ -5423,11 +5423,11 @@ mod tests {
             output,
         );
         assert!(
-            !assert_result.passed,
+            !assert_result.is_pass(),
             "mismatching ExitCodeEq must produce a failing AssertResult on the deferral arm",
         );
         assert!(
-            !assert_result.details.is_empty(),
+            !assert_result.outcomes.is_empty(),
             "exit-code mismatch must surface at least one AssertDetail; got: {assert_result:?}",
         );
     }

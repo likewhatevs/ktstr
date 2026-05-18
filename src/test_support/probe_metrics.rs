@@ -141,29 +141,36 @@ where
 /// `worker_tid` from snapshot 0 in the flat metric list produced by
 /// `walk_json_leaves` over the probe's JSON output.
 ///
-/// The probe emits
-/// `{"pid":P,"snapshots":[{"timestamp_unix_sec":T,"threads":[{"tid":T,"allocated_bytes":A,"deallocated_bytes":D,...}, ...]}, ...]}`
+/// `ThreadResult` is externally-tagged so the probe emits
+/// `{"pid":P,"snapshots":[{"timestamp_unix_sec":T,"threads":[{"Ok":{"tid":T,"allocated_bytes":A,"deallocated_bytes":D,...}}, {"Err":{"tid":T,"error":...,"error_kind":...}}, ...]}, ...]}`
 /// which `walk_json_leaves` flattens per array index into contiguous
-/// keys `snapshots.0.threads.0.tid`, `snapshots.0.threads.1.tid`, …
-/// with no gaps. The scan below stops at the first
-/// `snapshots.0.threads.N.tid` miss, which is the natural array
-/// terminator, and returns [`ThreadLookup::TidAbsent`] in that case.
-/// If the scan instead runs the full [`MAX_SCAN_INDEX`]
-/// iterations without hitting the terminator AND without matching
-/// `worker_tid`, it returns [`ThreadLookup::ExceedsCap`] to make the
-/// inconclusive outcome visible to the caller (the tid may exist
-/// past the cap).
+/// keys `snapshots.0.threads.0.Ok.tid`, `snapshots.0.threads.1.Err.tid`,
+/// … with no gaps. Each index carries exactly one variant wrapper.
+/// The scan stops at the first index where neither `.Ok.tid` nor
+/// `.Err.tid` exists (the natural array terminator) and returns
+/// [`ThreadLookup::TidAbsent`]. If the cap is reached without hitting
+/// the terminator AND without matching `worker_tid`, returns
+/// [`ThreadLookup::ExceedsCap`]. If the matching tid is on the `Err`
+/// arm (no `allocated_bytes` sibling), returns
+/// [`ThreadLookup::MissingAllocatedBytes`].
 pub fn lookup_thread(metrics: &PayloadMetrics, worker_tid: i32) -> ThreadLookup {
     let worker_tid_f64 = worker_tid as f64;
     for i in 0..MAX_SCAN_INDEX {
-        let tid_key = format!("snapshots.0.threads.{i}.tid");
-        let tid_m = match find_metric(metrics, &tid_key) {
-            Some(m) => m,
-            None => return ThreadLookup::TidAbsent,
+        let ok_tid_key = format!("snapshots.0.threads.{i}.Ok.tid");
+        let err_tid_key = format!("snapshots.0.threads.{i}.Err.tid");
+        let (tid_m, is_ok) = match find_metric(metrics, &ok_tid_key) {
+            Some(m) => (m, true),
+            None => match find_metric(metrics, &err_tid_key) {
+                Some(m) => (m, false),
+                None => return ThreadLookup::TidAbsent,
+            },
         };
         if tid_m.value == worker_tid_f64 {
-            let alloc_key = format!("snapshots.0.threads.{i}.allocated_bytes");
-            let dealloc_key = format!("snapshots.0.threads.{i}.deallocated_bytes");
+            if !is_ok {
+                return ThreadLookup::MissingAllocatedBytes;
+            }
+            let alloc_key = format!("snapshots.0.threads.{i}.Ok.allocated_bytes");
+            let dealloc_key = format!("snapshots.0.threads.{i}.Ok.deallocated_bytes");
             let allocated_bytes = match find_metric(metrics, &alloc_key).map(|m| m.value as u64) {
                 Some(v) => v,
                 None => return ThreadLookup::MissingAllocatedBytes,
@@ -175,8 +182,8 @@ pub fn lookup_thread(metrics: &PayloadMetrics, worker_tid: i32) -> ThreadLookup 
             };
         }
     }
-    // Loop ran to completion — every one of 0..MAX_SCAN_INDEX
-    // had a tid entry, and none matched. A contiguous-array
+    // Loop ran to completion — every index 0..MAX_SCAN_INDEX had a
+    // tid entry (Ok or Err), and none matched. A contiguous-array
     // terminator would have early-returned `TidAbsent`, so the cap
     // was hit with data remaining. Surface the inconclusive outcome
     // distinctly from genuine absence.
@@ -195,14 +202,21 @@ pub fn snapshot_worker_allocated(
 ) -> ThreadLookup {
     let worker_tid_f64 = worker_tid as f64;
     for j in 0..MAX_SCAN_INDEX {
-        let tid_key = format!("snapshots.{snap_idx}.threads.{j}.tid");
-        let tid_m = match find_metric(metrics, &tid_key) {
-            Some(m) => m,
-            None => return ThreadLookup::TidAbsent,
+        let ok_tid_key = format!("snapshots.{snap_idx}.threads.{j}.Ok.tid");
+        let err_tid_key = format!("snapshots.{snap_idx}.threads.{j}.Err.tid");
+        let (tid_m, is_ok) = match find_metric(metrics, &ok_tid_key) {
+            Some(m) => (m, true),
+            None => match find_metric(metrics, &err_tid_key) {
+                Some(m) => (m, false),
+                None => return ThreadLookup::TidAbsent,
+            },
         };
         if tid_m.value == worker_tid_f64 {
-            let alloc_key = format!("snapshots.{snap_idx}.threads.{j}.allocated_bytes");
-            let dealloc_key = format!("snapshots.{snap_idx}.threads.{j}.deallocated_bytes");
+            if !is_ok {
+                return ThreadLookup::MissingAllocatedBytes;
+            }
+            let alloc_key = format!("snapshots.{snap_idx}.threads.{j}.Ok.allocated_bytes");
+            let dealloc_key = format!("snapshots.{snap_idx}.threads.{j}.Ok.deallocated_bytes");
             let allocated_bytes = match find_metric(metrics, &alloc_key).map(|m| m.value as u64) {
                 Some(v) => v,
                 None => return ThreadLookup::MissingAllocatedBytes,
@@ -217,12 +231,22 @@ pub fn snapshot_worker_allocated(
     ThreadLookup::ExceedsCap
 }
 
-/// Count the number of `snapshots.0.threads.N.tid` entries in the
-/// flat metric list, capped at [`MAX_SCAN_INDEX`].
+/// Count the number of `snapshots.0.threads.N.{Ok,Err}.tid` entries
+/// in the flat metric list, capped at [`MAX_SCAN_INDEX`]. Each index
+/// carries exactly one variant wrapper (`Ok` or `Err`); the count
+/// terminates at the first index where neither exists.
 pub fn thread_count(metrics: &PayloadMetrics) -> usize {
-    count_indexed_metrics(metrics, MAX_SCAN_INDEX, |i| {
-        format!("snapshots.0.threads.{i}.tid")
-    })
+    let mut n = 0;
+    for i in 0..MAX_SCAN_INDEX {
+        let ok_key = format!("snapshots.0.threads.{i}.Ok.tid");
+        let err_key = format!("snapshots.0.threads.{i}.Err.tid");
+        if find_metric(metrics, &ok_key).is_some() || find_metric(metrics, &err_key).is_some() {
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    n
 }
 
 /// Count the number of `snapshots.N.timestamp_unix_sec` entries in
@@ -275,15 +299,21 @@ mod tests {
         }
     }
 
-    fn push_tid(metrics: &mut PayloadMetrics, idx: usize, tid: f64) {
+    fn push_ok_tid(metrics: &mut PayloadMetrics, idx: usize, tid: f64) {
         metrics
             .metrics
-            .push(metric(&format!("snapshots.0.threads.{idx}.tid"), tid));
+            .push(metric(&format!("snapshots.0.threads.{idx}.Ok.tid"), tid));
+    }
+
+    fn push_err_tid(metrics: &mut PayloadMetrics, idx: usize, tid: f64) {
+        metrics
+            .metrics
+            .push(metric(&format!("snapshots.0.threads.{idx}.Err.tid"), tid));
     }
 
     fn push_alloc(metrics: &mut PayloadMetrics, idx: usize, alloc: f64) {
         metrics.metrics.push(metric(
-            &format!("snapshots.0.threads.{idx}.allocated_bytes"),
+            &format!("snapshots.0.threads.{idx}.Ok.allocated_bytes"),
             alloc,
         ));
     }
@@ -301,7 +331,7 @@ mod tests {
     #[test]
     fn lookup_thread_matching_tid_returns_found() {
         let mut m = empty_payload();
-        push_tid(&mut m, 0, 42.0);
+        push_ok_tid(&mut m, 0, 42.0);
         push_alloc(&mut m, 0, 1_048_576.0);
         match lookup_thread(&m, 42) {
             ThreadLookup::Found {
@@ -320,8 +350,23 @@ mod tests {
     #[test]
     fn lookup_thread_missing_allocated_bytes_returns_missing_variant() {
         let mut m = empty_payload();
-        push_tid(&mut m, 0, 42.0);
+        push_ok_tid(&mut m, 0, 42.0);
         // no matching `.allocated_bytes`
+        assert!(matches!(
+            lookup_thread(&m, 42),
+            ThreadLookup::MissingAllocatedBytes
+        ));
+    }
+
+    /// Matching tid on the Err arm — `ThreadResult::Err` carries the
+    /// tid but no `allocated_bytes` sibling by design. Direct
+    /// detection via the `.Err.tid` path discriminator returns
+    /// `MissingAllocatedBytes` so callers route the Err arm through
+    /// the same diagnostic path as a malformed Ok entry.
+    #[test]
+    fn lookup_thread_err_arm_returns_missing_allocated_bytes() {
+        let mut m = empty_payload();
+        push_err_tid(&mut m, 0, 42.0);
         assert!(matches!(
             lookup_thread(&m, 42),
             ThreadLookup::MissingAllocatedBytes
@@ -335,7 +380,7 @@ mod tests {
     fn lookup_thread_contiguous_prefix_without_match_returns_tid_absent() {
         let mut m = empty_payload();
         for i in 0..10 {
-            push_tid(&mut m, i, (1000 + i) as f64);
+            push_ok_tid(&mut m, i, (1000 + i) as f64);
         }
         assert!(matches!(lookup_thread(&m, 42), ThreadLookup::TidAbsent));
     }
@@ -350,7 +395,7 @@ mod tests {
         let mut m = empty_payload();
         for i in 0..MAX_SCAN_INDEX {
             // tids chosen so none is equal to the probe tid below.
-            push_tid(&mut m, i, (1_000_000 + i) as f64);
+            push_ok_tid(&mut m, i, (1_000_000 + i) as f64);
         }
         let target_tid: i32 = 42;
         let outcome = lookup_thread(&m, target_tid);
@@ -367,7 +412,7 @@ mod tests {
     fn snapshot_worker_allocated_saturated_scan_returns_exceeds_cap() {
         let mut m = empty_payload();
         for i in 0..MAX_SCAN_INDEX {
-            push_tid(&mut m, i, (1_000_000 + i) as f64);
+            push_ok_tid(&mut m, i, (1_000_000 + i) as f64);
         }
         let outcome = snapshot_worker_allocated(&m, 0, 42);
         assert!(

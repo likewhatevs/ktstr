@@ -317,7 +317,7 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
     // regression to "worker is no longer strictly single-threaded"
     // visible for human review without a silent capability loss.
     let mut result = AssertResult::pass();
-    result.details.push(AssertDetail::new(
+    result.record_fail(AssertDetail::new(
         DetailKind::Other,
         format!(
             "jemalloc_probe_external_target: n_threads={n_threads} for \
@@ -514,19 +514,20 @@ fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
         if thread_count(&metrics) > 1 {
             any_multi_thread_seen = true;
         }
-        // Scan for an error entry on this invocation: the probe's Err
-        // arm emits `snapshots.0.threads.N.tid` without an
-        // `allocated_bytes` sibling (the `error` string is flattened-
-        // away by walk_json_leaves). Any such pair is evidence the
+        // Scan for an error entry on this invocation. `ThreadResult`
+        // is externally-tagged, so the probe's Err arm emits
+        // `snapshots.0.threads.N.Err.tid` (and `.Err.error_kind`,
+        // etc.) while the Ok arm emits `.Ok.tid` (and `.Ok.allocated_bytes`,
+        // etc.). Each index carries exactly one variant wrapper.
+        // Direct presence of `.Err.tid` at any index is evidence the
         // ESRCH race actually fired on this invocation.
         for j in 0..MAX_SCAN_INDEX {
-            if !has_metric(&metrics, &format!("snapshots.0.threads.{j}.tid")) {
+            let ok = has_metric(&metrics, &format!("snapshots.0.threads.{j}.Ok.tid"));
+            let err = has_metric(&metrics, &format!("snapshots.0.threads.{j}.Err.tid"));
+            if !ok && !err {
                 break;
             }
-            if !has_metric(
-                &metrics,
-                &format!("snapshots.0.threads.{j}.allocated_bytes"),
-            ) {
+            if err {
                 error_invocations += 1;
                 break;
             }
@@ -563,9 +564,7 @@ fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
              visible, but no tid died mid-probe)"
         )
     };
-    result
-        .details
-        .push(AssertDetail::new(DetailKind::Other, message));
+    result.record_fail(AssertDetail::new(DetailKind::Other, message));
     Ok(result)
 }
 

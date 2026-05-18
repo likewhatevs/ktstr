@@ -118,27 +118,28 @@ fn assert_format_human_default_checks_shows_all_none() {
 
 #[test]
 fn is_skipped_true_for_skip_result() {
-    // Skip results must be distinguishable from pass results so
-    // stats tooling can subtract them from pass counts — a
-    // skipped test is not a successful execution.
+    // Skip results must be distinguishable from pass and fail
+    // results so stats tooling can subtract them from pass counts
+    // — a skipped test is not a successful execution. A skip has
+    // is_skip()=true, is_fail()=false, is_pass()=false.
     let r = AssertResult::skip("no LLC available");
-    assert!(r.passed, "skip keeps passed=true for simple gate");
+    assert!(!r.is_fail(), "skip is not a failure");
+    assert!(!r.is_pass(), "skip is not a pass");
     assert!(r.is_skipped(), "skip must report is_skipped");
 }
 
 #[test]
 fn is_skipped_false_for_pass_result() {
     let r = AssertResult::pass();
-    assert!(r.passed);
+    assert!(r.is_pass());
     assert!(!r.is_skipped(), "pass is not a skip");
 }
 
 #[test]
 fn is_skipped_false_for_fail_result() {
     let mut r = AssertResult::pass();
-    r.passed = false;
-    r.details
-        .push(AssertDetail::new(DetailKind::Starved, "worker starved"));
+    
+    r.record_fail(AssertDetail::new(DetailKind::Starved, "worker starved"));
     assert!(
         !r.is_skipped(),
         "fail is not a skip even with non-skip details"
@@ -148,19 +149,23 @@ fn is_skipped_false_for_fail_result() {
 #[test]
 fn assert_result_pass_defaults() {
     let r = AssertResult::pass();
-    assert!(r.passed);
-    assert!(r.details.is_empty());
+    assert!(r.is_pass());
+    assert!(r.outcomes.is_empty());
     assert_eq!(r.stats.total_workers, 0);
 }
 
 // -- AssertResult::skip --
 
 #[test]
-fn assert_result_skip_is_pass_with_reason() {
+fn assert_result_skip_carries_reason() {
+    // A skip terminal verdict is is_skip()=true, with the reason
+    // recorded as an Outcome::Skip entry observable via
+    // skip_reasons(). It is NOT a pass (is_pass() returns false).
     let r = AssertResult::skip("topology too small");
-    assert!(r.passed);
-    assert_eq!(r.details.len(), 1);
-    assert_eq!(r.details[0].message, "topology too small");
+    assert!(r.is_skip());
+    assert!(!r.is_pass(), "skip is not a pass");
+    assert_eq!(r.outcomes.len(), 1);
+    assert_eq!(r.skip_reasons().next().unwrap().message, "topology too small");
 }
 
 #[test]

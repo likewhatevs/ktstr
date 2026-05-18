@@ -354,8 +354,8 @@ fn scenario_sched_mixed(ctx: &Ctx) -> Result<AssertResult> {
 
 fn scenario_forced_failure(ctx: &Ctx) -> Result<AssertResult> {
     let mut r = ktstr::scenario::basic::custom_sched_mixed(ctx)?;
-    r.passed = false;
-    r.details.push("forced failure for auto-repro test".into());
+    
+    r.record_fail("forced failure for auto-repro test".into());
     Ok(r)
 }
 

@@ -339,7 +339,7 @@ mod tests {
         // counters fired with legitimate non-zero values.
         let r_full = assert_scx_events_clean(&pairs, None);
         assert!(
-            !r_full.passed,
+            !r_full.is_pass(),
             "strict-zero against full 14-entry slice MUST fail when non-error-class counters legitimately fire — pins the STRICTNESS WARNING design contract"
         );
         // Curated error-class subset: MUST pass because every
@@ -351,7 +351,7 @@ mod tests {
             .collect();
         let r_curated = assert_scx_events_clean(&error_only, None);
         assert!(
-            r_curated.passed,
+            r_curated.is_pass(),
             "curated error-class subset MUST pass when every error counter is zero — pins the curate-then-assert documented workaround"
         );
     }

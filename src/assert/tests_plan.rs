@@ -21,7 +21,7 @@ fn plan_check_not_starved() {
     let plan = AssertPlan::new().check_not_starved();
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)];
     let r = plan.assert_cgroup(&reports, None, None);
-    assert!(r.passed);
+    assert!(r.is_pass());
     assert_eq!(r.stats.total_workers, 1);
 }
 
@@ -31,10 +31,9 @@ fn plan_check_isolation_with_cpuset() {
     let expected: BTreeSet<usize> = [0, 1].into_iter().collect();
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 4], 50)];
     let r = plan.assert_cgroup(&reports, Some(&expected), None);
-    assert!(!r.passed);
+    assert!(r.is_fail());
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Isolation))
     );
 }
@@ -45,7 +44,7 @@ fn plan_isolation_skipped_without_cpuset() {
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 4], 50)];
     // No cpuset provided -- isolation check is skipped.
     let r = plan.assert_cgroup(&reports, None, None);
-    assert!(r.passed);
+    assert!(r.is_pass());
 }
 
 #[test]
@@ -54,7 +53,7 @@ fn plan_custom_gap_threshold_pass() {
     // 2500ms gap: passes with 3000ms threshold.
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 2500)];
     let r = plan.assert_cgroup(&reports, None, None);
-    assert!(r.passed, "2500ms < 3000ms threshold: {:?}", r.details);
+    assert!(r.is_pass(), "2500ms < 3000ms threshold: {:?}", r.outcomes);
 }
 
 #[test]
@@ -63,15 +62,13 @@ fn plan_custom_gap_threshold_fail() {
     // 2000ms gap: fails with 1500ms threshold.
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 2000)];
     let r = plan.assert_cgroup(&reports, None, None);
-    assert!(!r.passed);
+    assert!(r.is_fail());
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Stuck))
     );
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| d.message.contains("threshold 1500ms"))
     );
 }
@@ -84,13 +81,12 @@ fn plan_custom_gap_threshold_produces_stuck_kind() {
     let plan = AssertPlan::new().check_not_starved().max_gap_ms(1500);
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 2000)];
     let r = plan.assert_cgroup(&reports, None, None);
-    assert!(!r.passed);
+    assert!(r.is_fail());
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Stuck)),
         "custom gap override must produce a Stuck-kind detail: {:?}",
-        r.details
+        r.outcomes
     );
 }
 
@@ -119,27 +115,24 @@ fn plan_permissive_overrides_clear_unfair_and_stuck_preserve_starved() {
     plan.max_gap_ms = Some(5000);
     let r = plan.assert_cgroup(&reports, None, None);
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Starved)),
         "starved detail must survive permissive overrides: {:?}",
-        r.details
+        r.outcomes
     );
     assert!(
-        !r.details
-            .iter()
+        !r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Unfair)),
         "unfair detail must be cleared by permissive spread: {:?}",
-        r.details
+        r.outcomes
     );
     assert!(
-        !r.details
-            .iter()
+        !r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Stuck)),
         "stuck detail must be cleared by permissive gap: {:?}",
-        r.details
+        r.outcomes
     );
-    assert!(!r.passed, "starved alone is still a failure");
+    assert!(!r.is_pass(), "starved alone is still a failure");
 }
 
 #[test]
@@ -147,7 +140,7 @@ fn plan_no_checks_always_passes() {
     let plan = AssertPlan::new();
     let reports = [rpt(1, 0, 0, 0, &[], 5000)]; // starved + stuck
     let r = plan.assert_cgroup(&reports, None, None);
-    assert!(r.passed, "no checks enabled should pass");
+    assert!(r.is_pass(), "no checks enabled should pass");
 }
 
 #[test]
@@ -168,7 +161,7 @@ fn plan_default_all_checks_disabled() {
     // A plan with all checks disabled must pass even pathological input.
     let reports = [rpt(1, 0, 0, 0, &[], 99999)];
     let r = plan.assert_cgroup(&reports, None, None);
-    assert!(r.passed, "all-disabled plan must pass any input");
+    assert!(r.is_pass(), "all-disabled plan must pass any input");
 }
 
 #[test]
@@ -185,7 +178,7 @@ fn assert_plan_default_equals_new() {
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)];
     let rd = d.assert_cgroup(&reports, None, None);
     let rn = n.assert_cgroup(&reports, None, None);
-    assert_eq!(rd.passed, rn.passed);
+    assert_eq!(rd.is_pass(), rn.is_pass());
 }
 
 #[test]
@@ -200,18 +193,16 @@ fn plan_starved_still_fails_with_custom_gap() {
     ];
     let r = plan.assert_cgroup(&reports, None, None);
     assert!(
-        !r.passed,
+        !r.is_pass(),
         "starved worker must fail even with relaxed gap threshold"
     );
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Starved))
     );
     // The gap (1500ms) is below the 5000ms threshold, so no Stuck detail.
     assert!(
-        !r.details
-            .iter()
+        !r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Stuck))
     );
 }

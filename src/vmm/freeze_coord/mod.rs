@@ -1210,6 +1210,54 @@ impl KtstrVm {
         let kern_phys_base: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
         let kern_phys_base_evt = Arc::new(EventFd::new(0).expect("eventfd for kern_phys_base"));
+        // Derived virt-KASLR offset (biased `+1`). Populated by
+        // either the BSP-side MSR_LSTAR readback
+        // (`src/vmm/x86_64/msr_kaslr::read_and_derive` invoked from
+        // `run_bsp_loop`) or the guest-channel KERN_ADDRS
+        // dispatcher (`src/vmm/freeze_coord/dispatch.rs`'s
+        // KERN_ADDRS arm). Both paths CAS-publish the same offset
+        // so first-writer wins; the dual sourcing is defense in
+        // depth — `nokaslr` cmdline addition above further keeps
+        // the offset at 0 for kernels we don't control the build
+        // of. Consumers `.load(Acquire)` and subtract 1; the 0
+        // sentinel means "no path has published yet" and the
+        // consumer should use a literal 0 for KASLR-off semantics.
+        let kern_virt_kaslr: Arc<std::sync::atomic::AtomicU64> =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let kern_virt_kaslr_evt =
+            Arc::new(EventFd::new(0).expect("eventfd for kern_virt_kaslr"));
+        // Link-time KVAs from vmlinux for the two virt-KASLR
+        // derivation paths. Resolved once here so both the dispatch
+        // sinks (the KERN_ADDRS arm subtracts `_text` to derive)
+        // and `run_bsp_loop` (the BSP MSR_LSTAR path subtracts
+        // `entry_SYSCALL_64`) share a single source of truth.
+        // `find_vmlinux` is cheap path discovery; the
+        // `cached_vmlinux_bytes` hit is shared with the monitor's
+        // later parse so the host pays the ELF read at most once
+        // per process. Both fields land 0 when the symbol is
+        // absent — `_text` only on extremely stripped vmlinux,
+        // `entry_SYSCALL_64` on aarch64 and non-x86_64 builds.
+        // Both paths short-circuit on a 0 link KVA, leaving the
+        // shared Arc at 0 (matches the KASLR-off semantics the
+        // nokaslr karg also produces). KASLR shifts every text
+        // symbol by the same `kaslr_offset`, so the two link
+        // KVAs back distinct derivations that produce identical
+        // offsets — guaranteeing the two writers don't race on
+        // different values.
+        let host_kernel_symbols: Option<crate::monitor::symbols::KernelSymbols> =
+            find_vmlinux(&self.kernel)
+                .and_then(|p| cached_vmlinux_bytes(&p))
+                .and_then(|data| {
+                    crate::monitor::symbols::KernelSymbols::from_vmlinux_bytes(&data).ok()
+                });
+        let kernel_text_link_kva: u64 = host_kernel_symbols
+            .as_ref()
+            .and_then(|s| s.kernel_text_kva)
+            .unwrap_or(0);
+        let entry_syscall_64_link_kva: u64 = host_kernel_symbols
+            .as_ref()
+            .and_then(|s| s.entry_syscall_64_kva)
+            .unwrap_or(0);
         let accessor_ready_evt = Arc::new(EventFd::new(0).expect("eventfd for accessor_ready"));
 
         let monitor_handle = self.start_monitor(
@@ -1227,6 +1275,7 @@ impl KtstrVm {
             watchdog_reset_ns.clone(),
             kern_phys_base.clone(),
             kern_phys_base_evt.clone(),
+            kern_virt_kaslr.clone(),
         )?;
         let watchdog_reset_for_coord = watchdog_reset_ns.clone();
         let watchdog_pause_ns: Arc<std::sync::atomic::AtomicU64> =
@@ -1795,6 +1844,17 @@ impl KtstrVm {
         }
 
         let kern_phys_base_for_result = kern_phys_base.clone();
+        // Sibling clone for the BSP loop: the freeze-coord closure
+        // below captures `kern_virt_kaslr` by move (the dispatch
+        // sink uses it for the guest-channel KERN_ADDRS derive), so
+        // the BSP MSR_LSTAR path (which runs on this thread AFTER
+        // the coord spawn at `run_bsp_loop`) needs its own clone to
+        // CAS-publish into the same Arc. KASLR offset is a single
+        // boot-time slot pick so both writers always derive the
+        // same value — the CAS-fail branch is benign (first writer
+        // wins; second observes its own derivation match the
+        // existing slot value).
+        let kern_virt_kaslr_for_bsp = kern_virt_kaslr.clone();
         // Effective rendezvous-wait deadline shared by the worker-park
         // and post-thaw barriers downstream. Downstream comments
         // reference `FREEZE_RENDEZVOUS_TIMEOUT` (the 30 s const) as
@@ -1946,7 +2006,21 @@ impl KtstrVm {
                     Option<&crate::monitor::bpf_map::GuestMemMapAccessorOwned> = None;
                 let mut owned_prog_accessor:
                     Option<&crate::monitor::bpf_prog::GuestMemProgAccessorOwned> = None;
-                let mut coord_kaslr_offset: u64 = 0;
+                // Virt-KASLR offset accessor — re-reads the shared
+                // `kern_virt_kaslr` Arc on every call so consumers
+                // observe the freshest value the BSP MSR_LSTAR path
+                // or the guest-channel KERN_ADDRS path has published.
+                // `saturating_sub(1)` folds the `+1` bias (0 sentinel
+                // → 0, 1 → 0, N>1 → N-1). The closure capture keeps
+                // call sites read like a plain value (`coord_kaslr_offset()`)
+                // and avoids a stale local snapshot that could
+                // produce different results in different iterations
+                // when the publisher fires mid-loop.
+                let coord_kaslr_offset = || -> u64 {
+                    kern_virt_kaslr
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        .saturating_sub(1)
+                };
                 // Spawn the accessor-init worker before entering the
                 // coordinator's epoll loop. The worker:
                 //   1. Loops `try_init_owned_accessor` +
@@ -2915,6 +2989,9 @@ impl KtstrVm {
                                             &mut snapshot_requests_pending,
                                         kern_phys_base: &kern_phys_base,
                                         kern_phys_base_evt: &kern_phys_base_evt,
+                                        kern_virt_kaslr: &kern_virt_kaslr,
+                                        kern_virt_kaslr_evt: &kern_virt_kaslr_evt,
+                                        kernel_text_link_kva,
                                         watchdog_reset: workload_duration_for_coord.map(|d| {
                                             (watchdog_reset_for_coord.as_ref(), d, run_start)
                                         }),
@@ -2985,21 +3062,15 @@ impl KtstrVm {
                         if let Some(prog) = prog.as_ref() {
                             owned_prog_accessor = Some(prog);
                         }
-                        {
-                            let kernel = map.guest_kernel();
-                            let pb = kernel.phys_base();
-                            if pb != 0
-                                && let Some(pb_kva) = dump_cpu_time_symbols
-                                    .as_ref()
-                                    .and_then(|s| s.phys_base_kva)
-                                {
-                                    let pb_pa = kernel.text_kva_to_pa(pb_kva);
-                                    if let Some(ref mem) = freeze_coord_mem {
-                                        let real_pb = mem.read_u64(pb_pa, 0);
-                                        coord_kaslr_offset = pb.wrapping_sub(real_pb);
-                                    }
-                                }
-                        }
+                        // (virt-KASLR derivation lives in
+                        // `coord_kaslr_offset` above — sourced from
+                        // the shared `kern_virt_kaslr` Arc, populated
+                        // by BSP MSR_LSTAR + guest-channel KERN_ADDRS.
+                        // The prior in-line derivation here computed
+                        // `phys_base - real_phys_base` where both
+                        // reads target the same kernel global, which
+                        // reduced to a structural zero. Deleted in
+                        // favour of the cross-thread Arc-based path.)
                         // Drain CAPTURE requests deferred during the
                         // pre-adoption window. Append onto
                         // `snapshot_requests_pending` so the existing
@@ -3581,35 +3652,20 @@ impl KtstrVm {
                                      (some CPUs still booting)",
                                 );
                             }
-                            // Passes `0` until the LSTAR-derived
-                            // virtual KASLR slide is plumbed
-                            // through. The `coord_kaslr_offset`
-                            // derivation at L2999
-                            // (`pb.wrapping_sub(real_pb)`) reduces
-                            // to 0 in steady state — both reads
-                            // resolve the kernel's `phys_base`
-                            // global from the same address — so
-                            // passing it here would be no functional
-                            // difference from `0`. The correct
-                            // virtual slide must come from
-                            // `crate::vmm::x86_64::msr_kaslr::read_and_derive`
-                            // (BSP MSR_LSTAR - syms.entry_syscall_64_kva),
-                            // which needs cross-thread plumbing of
-                            // the BSP `VcpuFd` to this monitor
-                            // thread — tracked separately as the
-                            // #31 real-fix follow-up. Until that
-                            // lands, per-CPU PA derivation under
-                            // KASLR-on remains silent-zero (the
-                            // pre-batch behavior); the helper
-                            // extraction + plumbing + tests in
-                            // this batch are scaffolding for the
-                            // follow-up commit that flips this
-                            // literal.
+                            // Virt-KASLR slide from the shared
+                            // `kern_virt_kaslr` Arc (populated by
+                            // BSP MSR_LSTAR derive on x86_64 +
+                            // guest-channel KERN_ADDRS `_text`
+                            // subtraction on both arches). 0 fallback
+                            // matches KASLR-off semantics (compute_rq_pas
+                            // collapses to the no-slide formula); the
+                            // `coord_kaslr_offset` closure handles the
+                            // `+1` bias strip + 0-sentinel folding.
                             let rq_pas = crate::monitor::symbols::compute_rq_pas(
                                 syms.runqueues,
                                 &pco_offsets,
                                 walk.page_offset,
-                                0,
+                                coord_kaslr_offset(),
                             );
                             // scx_watchdog_timestamp is a `.data`
                             // file-scope static — same text-mapping
@@ -5091,22 +5147,22 @@ impl KtstrVm {
                                 // duration line so operators can
                                 // budget against the watchdog timeout.
                                 let scx_build_t0 = std::time::Instant::now();
-                                // TODO(#31 real-fix): plumb the
-                                // LSTAR-derived virtual KASLR slide
-                                // here (see the freeze_coord scan_ctx
-                                // call comment above; `coord_kaslr_offset`
-                                // is structurally zero, so passing it
-                                // here would also be a no-op). The
-                                // scaffolding (`build` accepts the
-                                // arg; `per_cpu_kva` helper applies
-                                // it) is in place — only the value
-                                // remains.
+                                // Pass the virt-KASLR offset from
+                                // the shared Arc (populated by BSP
+                                // MSR_LSTAR + guest-channel KERN_ADDRS
+                                // publishers). 0 sentinel means
+                                // KASLR-off-or-not-yet-published; the
+                                // `per_cpu_kva` helper inside
+                                // `build` handles both as a no-op
+                                // slide. See `coord_kaslr_offset`
+                                // closure above for the load + bias
+                                // unwrap.
                                 let scx_owned = crate::vmm::capture_scx::build(
                                     owned,
                                     dump_scx_walker_offsets.as_ref(),
                                     dump_cpu_time_symbols.as_ref(),
                                     prog_per_cpu_offsets.as_deref(),
-                                    0,
+                                    coord_kaslr_offset(),
                                 );
                                 tracing::debug!(
                                     elapsed_us = scx_build_t0.elapsed().as_micros() as u64,
@@ -5184,13 +5240,27 @@ impl KtstrVm {
                                         match (syms.kernel_cpustat, syms.kstat) {
                                             (Some(kcpustat_kva), Some(kstat_kva)) => {
                                                 let page_offset = dump_kernel.page_offset();
-                                                // TODO(#31 real-fix): same as
-                                                // the capture_scx::build call —
-                                                // pass the LSTAR-derived
-                                                // virtual KASLR slide here.
-                                                // Helper + struct field are
-                                                // wired; only the value is
-                                                // missing.
+                                                // Virt-KASLR offset published
+                                                // by the BSP MSR_LSTAR path
+                                                // (`run_bsp_loop` →
+                                                // `msr_kaslr::read_and_derive`,
+                                                // x86_64) or the guest-channel
+                                                // KERN_ADDRS path
+                                                // (`dispatch.rs`, both arches).
+                                                // `+1` bias on the shared Arc;
+                                                // `saturating_sub(1)` folds the
+                                                // "no publisher yet" sentinel
+                                                // and the "KASLR off, real
+                                                // offset = 0" case to the same
+                                                // observable 0 — both produce
+                                                // correct per-CPU template
+                                                // arithmetic in
+                                                // `monitor::symbols::per_cpu_kva`.
+                                                let kaslr_offset = kern_virt_kaslr
+                                                    .load(
+                                                        std::sync::atomic::Ordering::Acquire,
+                                                    )
+                                                    .saturating_sub(1);
                                                 Some(crate::monitor::dump::CpuTimeCapture {
                                                     mem,
                                                     offsets,
@@ -5199,7 +5269,7 @@ impl KtstrVm {
                                                     tick_cpu_sched_kva: syms.tick_cpu_sched,
                                                     per_cpu_offsets: pcpu,
                                                     page_offset,
-                                                    kaslr_offset: 0,
+                                                    kaslr_offset,
                                                 })
                                             }
                                             _ => None,
@@ -6145,7 +6215,7 @@ impl KtstrVm {
                                     .queue_input_port1(&reply);
                             }
                             crate::vmm::wire::SNAPSHOT_KIND_WATCH => {
-                                if coord_kaslr_offset == 0
+                                if coord_kaslr_offset() == 0
                                     && owned_accessor.is_none()
                                 {
                                     tracing::info!(
@@ -6212,7 +6282,7 @@ impl KtstrVm {
                                             &freeze_coord_watchpoint,
                                             symbol_cache,
                                             &tag,
-                                            coord_kaslr_offset,
+                                            coord_kaslr_offset(),
                                             &freeze_coord_ap_pthreads,
                                             &freeze_coord_ap_ies,
                                             &freeze_coord_ap_alive,
@@ -8350,6 +8420,8 @@ impl KtstrVm {
                     tcr_el1_cache.as_ref(),
                     &cr3_cache,
                     &timed_out_flag,
+                    &kern_virt_kaslr_for_bsp,
+                    entry_syscall_64_link_kva,
                 )
             },
         );
@@ -8770,6 +8842,7 @@ impl KtstrVm {
         watchdog_reset_ns: Arc<std::sync::atomic::AtomicU64>,
         kern_phys_base_shared: Arc<std::sync::atomic::AtomicU64>,
         kern_phys_base_evt: Arc<EventFd>,
+        kern_virt_kaslr_shared: Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<Option<JoinHandle<monitor::reader::MonitorLoopResult>>> {
         let Some(vmlinux) = find_vmlinux(&self.kernel) else {
             return Ok(None);
@@ -9111,23 +9184,45 @@ impl KtstrVm {
                     let _ = kern_phys_base_evt.write(1);
                 }
 
-                // TODO(#31 real-fix): the pre-batch derivation here
-                // computed `phys_base - real_phys_base`, but both
-                // reads target the kernel's `phys_base` global at
-                // the same address — `phys_base` is the cached
-                // GuestKernel::phys_base() (set during construction
-                // by resolve_phys_base reading that global), and
-                // `real_phys_base` re-reads the same byte. The
-                // subtraction reduces to a structural zero. Replaced
-                // with a literal `0` to match the other 3 production
-                // sites at L3601/L5104/L5197 + the RqRefresh init
-                // below. The real source of truth is
-                // `crate::vmm::x86_64::msr_kaslr::read_and_derive`
-                // (BSP MSR_LSTAR minus link-time entry_SYSCALL_64),
-                // which needs cross-thread plumbing of the BSP
-                // VcpuFd to this monitor thread — tracked as task
-                // #24 ([#31 real-fix]).
-                let kaslr_offset: u64 = 0;
+                // Virt-KASLR offset published by either the BSP
+                // MSR_LSTAR readback
+                // (`src/vmm/x86_64/msr_kaslr::read_and_derive`
+                // invoked from `run_bsp_loop`) or the guest-channel
+                // KERN_ADDRS handler
+                // (`src/vmm/freeze_coord/dispatch.rs`'s KERN_ADDRS
+                // arm). Both writers CAS-publish the SAME offset
+                // (KASLR is a single boot-time slot pick) into
+                // `kern_virt_kaslr_shared` with `+1` bias; first
+                // writer wins, second observes the existing value
+                // via CAS-fail and is a no-op. By the time this
+                // line executes the sys_rdy wait above has already
+                // returned, so the guest has run far past
+                // `setup_per_cpu_areas` + `idt_syscall_init` and at
+                // least one of the two publishers has typically
+                // observed a non-zero value. The 0 sentinel below
+                // matches the `nokaslr` cmdline state (added in
+                // `src/vmm/setup.rs`) where neither publisher
+                // produces a non-zero offset because KASLR was
+                // disabled at boot — the consumer uses a literal 0
+                // and the per-CPU template arithmetic in
+                // `monitor::symbols::per_cpu_kva` lands on the
+                // compile-time base.
+                let kaslr_offset: u64 = kern_virt_kaslr_shared
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    .saturating_sub(1);
+                // `saturating_sub(1)` folds the `+1` bias:
+                //   stored == 0 (no publisher fired)    → 0
+                //   stored == 1 (KASLR off, offset=0)   → 0
+                //   stored == N (offset N-1)            → N-1
+                // The two 0 cases collapse to the same observable
+                // behaviour: the per-CPU template arithmetic in
+                // `monitor::symbols::per_cpu_kva` lands on the
+                // compile-time base, which is correct for both
+                // "KASLR off" and "no publisher yet" — the latter
+                // is rare (sys_rdy already fired) and the worst
+                // outcome is a single early sample reading a
+                // pre-KASLR PA that fails the BSS-zero gate in
+                // `monitor::reader`.
 
                 // Kill check between sys_rdy wait and the long-tail
                 // setup work below (page-table walks, watchdog override
@@ -9852,6 +9947,30 @@ impl KtstrVm {
         tcr_el1_cache: Option<&Arc<std::sync::atomic::AtomicU64>>,
         cr3_cache: &Arc<std::sync::atomic::AtomicU64>,
         timed_out_flag: &Arc<AtomicBool>,
+        // Shared virt-KASLR offset slot (biased `+1`). The BSP
+        // loop attempts a one-shot `KVM_GET_MSRS(MSR_LSTAR)` derive
+        // via `msr_kaslr::read_and_derive` on x86_64 between vCPU
+        // run iterations; on success it CAS-publishes the
+        // `(offset + 1)` here so the monitor + dump pipelines
+        // (`freeze_coord/mod.rs:9130` and `freeze_coord/mod.rs:5202`)
+        // can resolve per-CPU `rq` / `kernel_cpustat` / `kstat`
+        // KVAs under `CONFIG_RANDOMIZE_BASE=y`. The guest-channel
+        // KERN_ADDRS path also CAS-publishes here (from the coord
+        // thread's dispatch); both writers produce the same value
+        // because KASLR shifts every text symbol by the same
+        // `kaslr_offset`. The CAS-fail branch is a benign no-op.
+        // On aarch64 the BSP MSR read is unavailable (no MSR_LSTAR
+        // equivalent) so this Arc is read but not written from
+        // this path — the guest-channel publisher is the sole
+        // source on aarch64.
+        kern_virt_kaslr_shared: &Arc<std::sync::atomic::AtomicU64>,
+        // Link-time KVA of `entry_SYSCALL_64` from vmlinux. Passed
+        // through to `msr_kaslr::read_and_derive` so the BSP
+        // MSR_LSTAR readback can compute the offset. `0` on
+        // aarch64 builds (no `entry_SYSCALL_64` symbol) — the
+        // BSP-side derive short-circuits in that case and the
+        // shared Arc stays at 0 until the guest channel publishes.
+        entry_syscall_64_link_kva: u64,
     ) -> (i32, bool) {
         let mut exit_code: i32 = -1;
         // Track which path drove the BSP out of the loop so the
@@ -9932,6 +10051,59 @@ impl KtstrVm {
                 && val != 0
             {
                 cr3_cache.store(val, Ordering::Release);
+            }
+            // One-shot virt-KASLR derivation from BSP MSR_LSTAR.
+            // On x86_64, the kernel writes the post-relocation
+            // `entry_SYSCALL_64` KVA into MSR_LSTAR during
+            // `cpu_init → syscall_init → idt_syscall_init` (kernel
+            // rev 9636d2ea, arch/x86/kernel/cpu/common.c:2257).
+            // Reading the MSR back via KVM_GET_MSRS and subtracting
+            // the link-time KVA yields the virt-KASLR slide
+            // (`msr_kaslr::read_and_derive`). Cross-thread
+            // publish target is `kern_virt_kaslr_shared`
+            // (Acquire/Release CAS, idempotent vs the guest-channel
+            // KERN_ADDRS writer); both paths derive the same offset
+            // so the CAS-fail branch is benign.
+            //
+            // Gates:
+            //   * x86_64 only — no MSR_LSTAR on aarch64
+            //   * entry_syscall_64_link_kva != 0 — vmlinux must have
+            //     the symbol (stripped builds short-circuit)
+            //   * `kern_virt_kaslr_shared.load() == 0` — only attempt
+            //     until someone publishes (avoids re-running the
+            //     ioctl every iteration once the slot is filled)
+            //
+            // Failure modes (`LstarUnsupported`, `LstarZero`,
+            // `NonCanonical`, ...) are retryable per
+            // `LstarDeriveError::is_retryable`. We don't track
+            // retries explicitly; the loop simply tries again on
+            // the next iteration until the read succeeds or kill
+            // fires. Steady-state cost is one `.load()` per
+            // iteration (one atomic read) once published.
+            #[cfg(target_arch = "x86_64")]
+            if entry_syscall_64_link_kva != 0
+                && kern_virt_kaslr_shared.load(Ordering::Acquire) == 0
+                && let Ok(offset) = crate::vmm::x86_64::msr_kaslr::read_and_derive(
+                    bsp,
+                    entry_syscall_64_link_kva,
+                )
+            {
+                let _ = kern_virt_kaslr_shared.compare_exchange(
+                    0,
+                    offset.wrapping_add(1),
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                );
+            }
+            // On aarch64 MSR_LSTAR has no equivalent so the BSP
+            // path is unavailable; the guest-channel KERN_ADDRS
+            // publisher is the sole source on that architecture.
+            // Reference the two args once so the compiler's
+            // dead-code analysis doesn't fire on aarch64 builds.
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let _ = entry_syscall_64_link_kva;
+                let _ = kern_virt_kaslr_shared;
             }
             // Honour a pending freeze before re-entering KVM_RUN.
             // Same drain-dance + park pattern as the AP run loop —

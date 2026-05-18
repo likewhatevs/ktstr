@@ -641,7 +641,7 @@ fn sidecar_result_roundtrip_no_monitor() {
     let json = serde_json::to_string(&sc).unwrap();
     let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
     assert_eq!(loaded.test_name, "eevdf_test");
-    assert!(!loaded.passed);
+    assert!(loaded.is_fail());
     assert!(loaded.monitor.is_none());
     assert!(loaded.stimulus_events.is_empty());
     // `monitor` is emitted as `"monitor":null` when absent — the
@@ -2071,7 +2071,7 @@ fn write_sidecar_writes_file() {
     let data = std::fs::read_to_string(&path).unwrap();
     let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
     assert_eq!(loaded.test_name, "__sidecar_write_test__");
-    assert!(loaded.passed);
+    assert!(loaded.is_pass());
     assert!(!loaded.skipped, "pass result is not a skip");
     // write_sidecar must populate the host-context snapshot so
     // downstream `stats compare --runs a b` can diff hosts.

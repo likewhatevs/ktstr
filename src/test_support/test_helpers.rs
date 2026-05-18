@@ -277,10 +277,24 @@ pub(crate) fn make_vm_result(
 /// [`make_vm_result_with_assert`] (or hand-roll a `BulkDrainResult`
 /// when they need extra entries beyond the test result).
 pub(crate) fn build_assert_result(passed: bool, details: Vec<AssertDetail>) -> AssertResult {
+    let outcomes = if passed && details.is_empty() {
+        vec![]
+    } else if passed {
+        // Passing result with details — treat the details as
+        // info_notes shape via Skip variants (rare; tests use this).
+        details
+            .into_iter()
+            .map(|d| crate::assert::Outcome::Skip(d))
+            .collect()
+    } else {
+        // Failing result — wrap each detail in a Fail outcome.
+        details
+            .into_iter()
+            .map(|d| crate::assert::Outcome::Fail(d))
+            .collect()
+    };
     AssertResult {
-        passed,
-        skipped: false,
-        details,
+        outcomes,
         passes: vec![],
         stats: ScenarioStats::default(),
         measurements: std::collections::BTreeMap::new(),

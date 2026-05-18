@@ -131,7 +131,7 @@ fn periodic_capture_three_boundaries(ctx: &ktstr::scenario::Ctx) -> Result<Asser
         hold: HoldSpec::FULL,
     }];
     let mut result = execute_steps(ctx, steps)?;
-    result.details.push(ktstr::assert::AssertDetail::new(
+    result.record_fail(ktstr::assert::AssertDetail::new(
         ktstr::assert::DetailKind::Other,
         "10s workload with num_snapshots=3 finished".to_string(),
     ));

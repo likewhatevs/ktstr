@@ -588,15 +588,14 @@ pub(crate) fn format_periodic_samples_section(result: &vmm::VmResult) -> String 
 }
 
 /// Format the `--- temporal assertions ---` summary section for
-/// failure output. Walks the [`AssertResult::details`] vector,
-/// filters to entries tagged [`crate::assert::DetailKind::Temporal`],
-/// and renders each as a single line. The section is suppressed
-/// when no temporal-tagged details are present so non-temporal
-/// failure paths do not pick up an empty section header.
+/// failure output. Walks the failure-detail stream, filters to
+/// entries tagged [`crate::assert::DetailKind::Temporal`], and
+/// renders each as a single line. The section is suppressed when
+/// no temporal-tagged failures are present so non-temporal failure
+/// paths do not pick up an empty section header.
 pub(crate) fn format_temporal_assertions_section(result: &crate::assert::AssertResult) -> String {
     let temporal: Vec<&crate::assert::AssertDetail> = result
-        .details
-        .iter()
+        .failure_details()
         .filter(|d| d.kind == crate::assert::DetailKind::Temporal)
         .collect();
     if temporal.is_empty() {
@@ -638,7 +637,7 @@ mod tests {
         let original = build_assert_result(true, vec![]);
         let drain = drain_with_assert(&original);
         let r = parse_assert_result_from_drain(Some(&drain)).unwrap();
-        assert!(r.passed);
+        assert!(r.is_pass());
     }
 
     /// A failing `AssertResult` round-trips its details verbatim.
@@ -650,10 +649,9 @@ mod tests {
         );
         let drain = drain_with_assert(&original);
         let r = parse_assert_result_from_drain(Some(&drain)).unwrap();
-        assert!(!r.passed);
+        assert!(r.is_fail());
         assert_eq!(
-            r.details
-                .iter()
+            r.failure_details()
                 .map(|d| d.message.as_str())
                 .collect::<Vec<_>>(),
             vec!["stuck 3000ms"]
@@ -706,7 +704,7 @@ mod tests {
             ],
         };
         let r = parse_assert_result_from_drain(Some(&drain)).unwrap();
-        assert!(r.passed, "latest entry must win");
+        assert!(r.is_pass(), "latest entry must win");
     }
 
     /// Malformed postcard payload (right msg_type, right CRC, wrong
@@ -1718,7 +1716,7 @@ ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
         );
         let drain = drain_with_assert(&original);
         let parsed = parse_assert_result_from_drain(Some(&drain)).unwrap();
-        assert!(!parsed.passed, "guest result must be failing");
+        assert!(!parsed.is_pass(), "guest result must be failing");
 
         // Host-side scenario adds its own claim — say, a deadline
         // budget the host can verify post-VM (a pseudo-value here
@@ -1730,20 +1728,20 @@ ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
 
         let r = v.into_result();
         assert!(
-            !r.passed,
+            !r.is_pass(),
             "merge of failing parsed result + failing host claim must fail",
         );
         // Both failures must be visible in the merged details: the
         // host-side at_most claim AND the guest-side Stuck.
         assert!(
-            r.details.iter().any(|d| d.message.contains("at most 5000")),
+            r.failure_details().any(|d| d.message.contains("at most 5000")),
             "host claim failure missing: {:?}",
-            r.details,
+            r.outcomes,
         );
         assert!(
-            r.details.iter().any(|d| d.kind == DetailKind::Stuck),
+            r.failure_details().any(|d| d.kind == DetailKind::Stuck),
             "guest Stuck detail missing: {:?}",
-            r.details,
+            r.outcomes,
         );
     }
 
@@ -1767,9 +1765,9 @@ ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
 
         let r = v.into_result();
         assert!(
-            r.passed,
+            r.is_pass(),
             "passing merge must keep verdict passing: {:?}",
-            r.details
+            r.outcomes
         );
     }
 
@@ -1819,9 +1817,8 @@ ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
     #[test]
     fn format_temporal_assertions_section_empty_without_temporal_details() {
         let mut r = crate::assert::AssertResult::pass();
-        r.passed = false;
-        r.details
-            .push(AssertDetail::new(DetailKind::Stuck, "tid 7 stuck 2000ms"));
+        
+        r.record_fail(AssertDetail::new(DetailKind::Stuck, "tid 7 stuck 2000ms"));
         let s = format_temporal_assertions_section(&r);
         assert!(s.is_empty());
     }
@@ -1830,14 +1827,13 @@ ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
     #[test]
     fn format_temporal_assertions_section_renders_temporal_details() {
         let mut r = crate::assert::AssertResult::pass();
-        r.passed = false;
-        r.details.push(AssertDetail::new(
+        
+        r.record_fail(AssertDetail::new(
             DetailKind::Temporal,
             "counter (nondecreasing): regression at sample periodic_001",
         ));
-        r.details
-            .push(AssertDetail::new(DetailKind::Stuck, "unrelated failure"));
-        r.details.push(AssertDetail::new(
+        r.record_fail(AssertDetail::new(DetailKind::Stuck, "unrelated failure"));
+        r.record_fail(AssertDetail::new(
             DetailKind::Temporal,
             "load (steady_within ...): outlier at sample periodic_005",
         ));

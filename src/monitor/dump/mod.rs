@@ -160,17 +160,17 @@ pub struct CpuTimeCapture<'a> {
     pub page_offset: u64,
     /// Virtual KASLR offset that per-CPU KVA derivation needs to
     /// bridge the link-time (`__per_cpu_start_LINK`) and runtime
-    /// (`__per_cpu_start_RUNTIME`) bases. Source-of-truth is
-    /// `crate::vmm::x86_64::msr_kaslr::read_and_derive` (BSP
-    /// MSR_LSTAR minus link-time `entry_SYSCALL_64`). Production
-    /// callers in `crate::vmm::freeze_coord` currently pass `0`
-    /// pending the cross-thread BSP-vcpu plumbing for that
-    /// derive — see the TODO at the construction site and the
-    /// #31 real-fix follow-up. Under `CONFIG_RANDOMIZE_BASE=y`
-    /// (the default ktstr.kconfig setting) per-CPU lookups
-    /// bounds-reject to zero today, the silent-data-corruption
-    /// mode #31 will fix when the value flows in. aarch64 keeps
-    /// `0` until #108 lands the `kimage_voffset` derivation.
+    /// (`__per_cpu_start_RUNTIME`) bases. Sourced from the shared
+    /// `kern_virt_kaslr` Arc populated by either the BSP MSR_LSTAR
+    /// derive (`crate::vmm::x86_64::msr_kaslr::read_and_derive`,
+    /// x86_64-only) or the guest-channel KERN_ADDRS `_text`
+    /// subtraction (`crate::vmm::freeze_coord::dispatch`, both
+    /// arches). 0 fallback matches KASLR-off / nokaslr-karg
+    /// semantics and collapses [`super::symbols::per_cpu_kva`] to
+    /// the no-slide formula. On aarch64 without `_text` in
+    /// /proc/kallsyms (kptr_restrict masked) the value stays 0
+    /// and per-CPU resolution relies on the `nokaslr` karg
+    /// (`src/vmm/setup.rs`) instead.
     pub kaslr_offset: u64,
 }
 

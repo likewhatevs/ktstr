@@ -317,8 +317,8 @@ fn scenario_watchdog_timing_precision(
             // dominated instead of the 2s host write. Surface as a
             // fatal failure detail; expect_err cannot mask this
             // because we replace the AssertResult.
-            result.passed = false;
-            result.details.push(ktstr::assert::AssertDetail::new(
+            
+            result.record_fail(ktstr::assert::AssertDetail::new(
                 ktstr::assert::DetailKind::Other,
                 format!(
                     "watchdog override ineffective: kernel measured \
@@ -341,7 +341,7 @@ fn scenario_watchdog_timing_precision(
         // detail so the test log shows the measured number; the
         // AssertResult keeps its existing scheduler-died detail
         // (which expect_err inverts to PASS).
-        result.details.push(ktstr::assert::AssertDetail::new(
+        result.record_fail(ktstr::assert::AssertDetail::new(
             ktstr::assert::DetailKind::Other,
             format!(
                 "watchdog override effective: kernel-measured stall \

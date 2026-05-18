@@ -452,19 +452,84 @@ pub fn send_sys_rdy() -> bool {
     write_msg(MsgType::SysRdy.wire_value(), &[])
 }
 
-/// Send `phys_base` and `page_offset_base` to the host so the
-/// monitor can translate kernel virtual addresses without walking
-/// guest page tables. Called from `ktstr_guest_init` after
-/// `mount_filesystems` and before `send_sys_rdy`.
-/// Payload: `[phys_base + 1 : u64 LE, page_offset_base: u64 LE]`.
-/// The +1 bias avoids the 0 sentinel — the host subtracts 1 to
-/// recover the actual value. This lets `phys_base=0` (no KASLR
-/// physical randomization) be distinguished from "not yet received."
-pub fn send_kern_addrs(phys_base: u64, page_offset_base: u64) -> bool {
-    let mut payload = [0u8; 16];
-    payload[..8].copy_from_slice(&(phys_base.wrapping_add(1)).to_le_bytes());
-    payload[8..].copy_from_slice(&page_offset_base.to_le_bytes());
+/// Send the typed [`crate::vmm::wire::KernAddrs`] payload to the
+/// host so the monitor can translate kernel virtual addresses
+/// without walking guest page tables. Called from
+/// `ktstr_guest_init` after `mount_filesystems` and before
+/// `send_sys_rdy`.
+///
+/// The wire layout, the per-field encoding (including the +1
+/// bias on present-bit slots), and the host-side decode contract
+/// all live on the typed struct — see
+/// [`crate::vmm::wire::KernAddrs`] for the full reference. This
+/// helper is a thin transport wrapper that delegates to
+/// [`crate::vmm::wire::KernAddrs::to_payload`] and ships the
+/// bytes through the host_comms TLV channel.
+///
+/// The runtime `_text` KVA in the payload powers the
+/// cross-architecture virt-KASLR derive at
+/// `src/vmm/freeze_coord/dispatch.rs`'s KERN_ADDRS arm:
+/// `virt_kaslr = _text_runtime - _text_link`, where the link-time
+/// KVA comes from the host's vmlinux parse
+/// (`KernelSymbols::kernel_text_kva` at `src/monitor/symbols.rs`).
+/// `_text` is defined in `vmlinux.lds.S` on every Linux build so
+/// the derivation works on both x86_64 and aarch64.
+///
+/// Two independent paths feed the same
+/// `Arc<AtomicU64> kern_virt_kaslr` on the host: this guest-side
+/// derivation (cross-arch), and the BSP-side
+/// `KVM_GET_MSRS(MSR_LSTAR)` readback
+/// (`src/vmm/x86_64/msr_kaslr::read_and_derive`, x86_64-only).
+/// Either is sufficient on x86_64; on aarch64 only the guest
+/// channel and the `nokaslr` cmdline gate participate.
+pub fn send_kern_addrs(addrs: &super::wire::KernAddrs) -> bool {
+    let payload = addrs.to_payload();
     write_msg(super::wire::MSG_TYPE_KERN_ADDRS, &payload)
+}
+
+/// Read the runtime virtual address of `_text` (the kernel image
+/// start symbol) from `/proc/kallsyms`.
+///
+/// Returns `Some(kva)` when the symbol is present AND the address
+/// is non-zero (kallsyms masks addresses to `0000000000000000`
+/// when `kernel.kptr_restrict >= 1` and the reader lacks
+/// `CAP_SYSLOG`). `rust_init` runs as PID 1 with all caps including
+/// `CAP_SYSLOG`, so the read sees real addresses regardless of the
+/// `kptr_restrict` sysctl default.
+///
+/// The kernel writes the post-relocation KVA into the symbol table
+/// via `handle_relocations` in `arch/x86/boot/compressed/misc.c`
+/// (x86_64) and via the kallsyms relocation pass in
+/// `init/main.c::__init` (aarch64) before userspace boots, so by
+/// the time guest userland can read `/proc/kallsyms` the entry
+/// already reflects the runtime virt-KASLR slide. `_text` is
+/// defined in `vmlinux.lds.S` on every Linux build, so this
+/// returns a meaningful value on both x86_64 and aarch64 — and on
+/// any other architecture ktstr might target in future.
+pub fn read_kernel_text_from_kallsyms() -> Option<u64> {
+    let kallsyms = std::fs::read_to_string("/proc/kallsyms").ok()?;
+    for line in kallsyms.lines() {
+        let mut parts = line.split_ascii_whitespace();
+        let addr = parts.next()?;
+        let typ = parts.next()?;
+        let name = parts.next()?;
+        // `_text` lives at the kernel image start so its type
+        // letter is `T` (global text) or `t` (local text) in the
+        // kallsyms output. Match both to tolerate kernel build
+        // variants. The kallsyms format is documented at
+        // kernel/kallsyms.c::s_show.
+        if name == "_text" && (typ == "T" || typ == "t") {
+            let kva = u64::from_str_radix(addr, 16).ok()?;
+            // 0 addresses indicate kptr_restrict masking — treat
+            // as "not readable" so the caller skips the
+            // virt-KASLR contribution rather than racing with the
+            // kallsyms read.
+            if kva != 0 {
+                return Some(kva);
+            }
+        }
+    }
+    None
 }
 
 /// Derive the KASLR physical displacement from `/proc/iomem`.

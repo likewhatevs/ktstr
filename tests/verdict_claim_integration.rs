@@ -119,14 +119,14 @@ fn verdict_passing_claims_against_real_worker_report() {
 
     let r = v.into_result();
     assert!(
-        r.passed,
+        r.is_pass(),
         "every claim should pass against a real Thread-mode WorkerReport: {:?}",
-        r.details,
+        r.outcomes,
     );
     assert!(
-        r.details.is_empty(),
+        r.outcomes.is_empty(),
         "passing claims must not push details: {:?}",
-        r.details,
+        r.outcomes,
     );
 }
 
@@ -163,20 +163,20 @@ fn verdict_failing_claims_label_with_stringify_tokens() {
 
     let r = v.into_result();
     assert!(
-        !r.passed,
+        !r.is_pass(),
         "deliberately-failing claims must produce a failed verdict",
     );
     assert_eq!(
-        r.details.len(),
+        r.outcomes.len(),
         3,
         "one detail per failed claim; got: {:?}",
-        r.details,
+        r.outcomes,
     );
 
     // Every detail records DetailKind::Other (the ClaimBuilder default
     // when no `.kind(...)` was set) and surfaces the comparator's
     // formatted message.
-    for d in &r.details {
+    for d in r.failure_details() {
         assert_eq!(d.kind, DetailKind::Other);
     }
 
@@ -185,42 +185,42 @@ fn verdict_failing_claims_label_with_stringify_tokens() {
     // `verdict.claim(stringify!(wall_time_ns), ...)`, so the label
     // is the field name verbatim.
     assert!(
-        r.details[0].message.contains("wall_time_ns"),
+        r.failure_details().next().unwrap().message.contains("wall_time_ns"),
         "typed accessor failure must label with the field name from \
          stringify!(field) in the derive expansion: {}",
-        r.details[0].message,
+        r.failure_details().next().unwrap().message,
     );
     assert!(
-        r.details[0].message.contains("at most 0"),
+        r.failure_details().next().unwrap().message.contains("at most 0"),
         "at_most failure must render the bound: {}",
-        r.details[0].message,
+        r.failure_details().next().unwrap().message,
     );
 
     // Detail 1: macro on local binding. Label is the binding ident
     // verbatim -- proves the macro reads the expression token, not
     // the variable's underlying source.
     assert!(
-        r.details[1].message.contains("iter_count"),
+        r.failure_details().nth(1).unwrap().message.contains("iter_count"),
         "claim! macro failure on a local binding must label with the \
          binding name from stringify!($value): {}",
-        r.details[1].message,
+        r.failure_details().nth(1).unwrap().message,
     );
     // Negative: the field name `iterations` (which the binding was
     // initialized from) MUST NOT appear -- the label tracks the
     // expression token, not the value's provenance.
     assert!(
-        !r.details[1].message.contains("iterations"),
+        !r.failure_details().nth(1).unwrap().message.contains("iterations"),
         "claim! must NOT leak the underlying field name when the \
          caller bound it to a different ident: {}",
-        r.details[1].message,
+        r.failure_details().nth(1).unwrap().message,
     );
 
     // Detail 2: macro on a multi-token expression. Label preserves
     // every token from the input, including method-call parens.
     assert!(
-        r.details[2].message.contains("report.cpus_used.len()"),
+        r.failure_details().nth(2).unwrap().message.contains("report.cpus_used.len()"),
         "claim! on an expression must stringify the full token tree: {}",
-        r.details[2].message,
+        r.failure_details().nth(2).unwrap().message,
     );
 }
 
@@ -242,8 +242,8 @@ fn verdict_merges_external_assert_result_into_pointwise_claims() {
     // Synthesize a failing upstream AssertResult (simulating an
     // `assert_*` returning a failure).
     let mut upstream = AssertResult::pass();
-    upstream.passed = false;
-    upstream.details.push(ktstr::assert::AssertDetail::new(
+    
+    upstream.record_fail(ktstr::assert::AssertDetail::new(
         DetailKind::Other,
         "synthetic upstream failure".to_string(),
     ));
@@ -252,10 +252,10 @@ fn verdict_merges_external_assert_result_into_pointwise_claims() {
 
     let r = v.into_result();
     assert!(
-        !r.passed,
+        !r.is_pass(),
         "merging a failing upstream must conjoin into the verdict",
     );
-    let messages: Vec<&str> = r.details.iter().map(|d| d.message.as_str()).collect();
+    let messages: Vec<&str> = r.failure_details().map(|d| d.message.as_str()).collect();
     assert!(
         messages
             .iter()
@@ -281,16 +281,16 @@ fn verdict_skip_records_skip_kind_with_reason() {
     v.skip("integration test demonstrates skip path");
 
     let r = v.into_result();
+    // skip is not a failure (is_fail() = false) but also not a pass
+    // (is_pass() = false on an all-Skip stream — skipped means "didn't
+    // run"). is_skip() carries the skip terminal verdict.
     assert!(
-        r.passed,
+        !r.is_fail(),
         "skip must NOT mark the verdict failed: {:?}",
-        r.details,
+        r.outcomes,
     );
-    assert!(r.skipped, "skip flag must be set on the result");
-    let skip_detail = r
-        .details
-        .iter()
-        .find(|d| d.kind == DetailKind::Skip)
+    assert!(r.is_skip(), "skip flag must be set on the result");
+    let skip_detail = r.skip_reasons().find(|d| d.kind == DetailKind::Skip)
         .expect("at least one Skip-kind detail must be present");
     assert!(
         skip_detail

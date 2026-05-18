@@ -17,16 +17,16 @@ use crate::workload::{WorkerReport, WorkerReportClaim};
 #[test]
 fn assert_result_note_does_not_flip_passed_or_skipped() {
     let mut r = AssertResult::pass();
-    let was_passed = r.passed;
-    let was_skipped = r.skipped;
-    let was_details = r.details.len();
+    let was_pass = r.is_pass();
+    let was_skip = r.is_skip();
+    let was_outcomes = r.outcomes.len();
     r.note("observed worker.iterations=12345");
-    assert_eq!(r.passed, was_passed);
-    assert_eq!(r.skipped, was_skipped);
+    assert_eq!(r.is_pass(), was_pass);
+    assert_eq!(r.is_skip(), was_skip);
     assert_eq!(
-        r.details.len(),
-        was_details,
-        "note must not pollute details"
+        r.outcomes.len(),
+        was_outcomes,
+        "note must not pollute outcomes"
     );
     assert_eq!(r.info_notes.len(), 1);
     assert!(r.info_notes[0].message.contains("worker.iterations"));
@@ -34,12 +34,13 @@ fn assert_result_note_does_not_flip_passed_or_skipped() {
     // Same on a skip-only result.
     let mut r = AssertResult::skip("topo missing");
     r.note("topo had 2 LLCs, test wants 4");
-    assert!(r.passed);
-    assert!(r.skipped);
-    // skip pushed a Skip detail; note pushed to info_notes.
-    // details has only the Skip; info_notes has the note.
-    assert_eq!(r.details.len(), 1);
-    assert_eq!(r.details[0].kind, DetailKind::Skip);
+    // Skip is the "could not run" verdict — is_pass is FALSE for skip.
+    assert!(!r.is_pass());
+    assert!(r.is_skip());
+    // skip pushed one Outcome::Skip; note pushed to info_notes.
+    assert_eq!(r.outcomes.len(), 1);
+    let d = r.skip_reasons().next().unwrap();
+    assert_eq!(d.kind, DetailKind::Skip);
     assert_eq!(r.info_notes.len(), 1);
     assert!(r.info_notes[0].message.contains("LLCs"));
 }
@@ -50,9 +51,9 @@ fn assert_result_note_does_not_flip_passed_or_skipped() {
 #[test]
 fn assert_result_with_note_preserves_verdict() {
     let r = AssertResult::pass().with_note("max_wchar=6543");
-    assert!(r.passed);
-    assert!(!r.skipped);
-    assert!(r.details.is_empty(), "with_note must not pollute details");
+    assert!(r.is_pass());
+    assert!(!r.is_skip());
+    assert!(r.outcomes.is_empty(), "with_note must not pollute outcomes");
     assert_eq!(r.info_notes.len(), 1);
     assert!(r.info_notes[0].message.contains("max_wchar=6543"));
 }
@@ -65,7 +66,7 @@ fn info_note_survives_serde_roundtrip() {
     let r = AssertResult::pass().with_note("snapshot=disabled");
     let json = serde_json::to_string(&r).unwrap();
     let r2: AssertResult = serde_json::from_str(&json).unwrap();
-    assert!(r2.details.is_empty());
+    assert!(r2.outcomes.is_empty());
     assert_eq!(r2.info_notes.len(), 1);
     assert!(r2.info_notes[0].message.contains("snapshot=disabled"));
 }
@@ -113,8 +114,8 @@ fn merge_preserves_info_notes_order_self_then_other() {
 #[test]
 fn verdict_empty_is_passing() {
     let r = Verdict::new().into_result();
-    assert!(r.passed);
-    assert!(r.details.is_empty());
+    assert!(r.is_pass());
+    assert!(r.outcomes.is_empty());
     assert_eq!(r.stats.total_workers, 0);
 }
 
@@ -161,9 +162,9 @@ fn no_overrides_matches_default_checks() {
 fn verdict_passing_into_result_matches_assert_result_pass() {
     let r1 = Verdict::new().into_result();
     let r2 = AssertResult::pass();
-    assert_eq!(r1.passed, r2.passed);
-    assert_eq!(r1.skipped, r2.skipped);
-    assert_eq!(r1.details, r2.details);
+    assert_eq!(r1.is_pass(), r2.is_pass());
+    assert_eq!(r1.is_skip(), r2.is_skip());
+    assert_eq!(r1.outcomes, r2.outcomes);
 }
 
 #[test]
@@ -172,9 +173,9 @@ fn claim_eq_pass_returns_passing_verdict() {
     let answer = 42u64;
     claim!(v, answer).eq(42);
     let r = v.into_result();
-    assert!(r.passed);
+    assert!(r.is_pass());
     assert!(
-        r.details.is_empty(),
+        r.outcomes.is_empty(),
         "passing comparator must not push a detail",
     );
 }
@@ -185,9 +186,9 @@ fn claim_eq_fail_names_subject_and_values() {
     let answer = 42u64;
     claim!(v, answer).eq(7);
     let r = v.into_result();
-    assert!(!r.passed);
-    assert_eq!(r.details.len(), 1);
-    let d = &r.details[0];
+    assert!(r.is_fail());
+    assert_eq!(r.outcomes.len(), 1);
+    let d = r.failure_details().next().unwrap();
     assert_eq!(d.kind, DetailKind::Other);
     assert!(d.message.contains("answer"), "msg: {}", d.message);
     assert!(d.message.contains("expected"), "msg: {}", d.message);
@@ -207,9 +208,9 @@ fn claim_ne_pass_and_fail() {
     let flag_fail = 1u64;
     claim!(v, flag_fail).ne(1);
     let r = v.into_result();
-    assert!(!r.passed);
-    assert!(r.details[0].message.contains("flag_fail"));
-    assert!(r.details[0].message.contains("!="));
+    assert!(r.is_fail());
+    assert!(r.failure_details().next().unwrap().message.contains("flag_fail"));
+    assert!(r.failure_details().next().unwrap().message.contains("!="));
 }
 
 #[test]
@@ -223,9 +224,9 @@ fn claim_at_least_boundary_is_inclusive() {
     let counter = 99u64;
     claim!(v, counter).at_least(100);
     let r = v.into_result();
-    assert!(!r.passed);
-    assert!(r.details[0].message.contains("at least 100"));
-    assert!(r.details[0].message.contains("counter"));
+    assert!(r.is_fail());
+    assert!(r.failure_details().next().unwrap().message.contains("at least 100"));
+    assert!(r.failure_details().next().unwrap().message.contains("counter"));
 }
 
 #[test]
@@ -239,8 +240,8 @@ fn claim_at_most_boundary_is_inclusive() {
     let counter = 101u64;
     claim!(v, counter).at_most(100);
     let r = v.into_result();
-    assert!(!r.passed);
-    assert!(r.details[0].message.contains("at most 100"));
+    assert!(r.is_fail());
+    assert!(r.failure_details().next().unwrap().message.contains("at most 100"));
 }
 
 #[test]
@@ -254,8 +255,8 @@ fn claim_lt_strict_upper_bound() {
     let x = 100u64;
     claim!(v, x).lt(100);
     let r = v.into_result();
-    assert!(!r.passed);
-    assert!(r.details[0].message.contains("less than 100"));
+    assert!(r.is_fail());
+    assert!(r.failure_details().next().unwrap().message.contains("less than 100"));
 }
 
 #[test]
@@ -269,8 +270,8 @@ fn claim_gt_strict_lower_bound() {
     let x = 100u64;
     claim!(v, x).gt(100);
     let r = v.into_result();
-    assert!(!r.passed);
-    assert!(r.details[0].message.contains("greater than 100"));
+    assert!(r.is_fail());
+    assert!(r.failure_details().next().unwrap().message.contains("greater than 100"));
 }
 
 #[test]
@@ -288,8 +289,8 @@ fn claim_between_inclusive_on_both_ends() {
     let below = 9u64;
     claim!(v, below).between(10, 20);
     let r = v.into_result();
-    assert!(!r.passed);
-    assert!(r.details[0].message.contains("[10, 20]"));
+    assert!(r.is_fail());
+    assert!(r.failure_details().next().unwrap().message.contains("[10, 20]"));
 }
 
 #[test]
@@ -298,8 +299,8 @@ fn claim_between_inverted_interval_fails_with_visible_typo() {
     let x = 15u64;
     claim!(v, x).between(20, 10);
     let r = v.into_result();
-    assert!(!r.passed);
-    let msg = &r.details[0].message;
+    assert!(r.is_fail());
+    let msg = &*r.failure_details().next().unwrap().message;
     assert!(msg.contains("caller error"), "msg: {msg}");
     assert!(msg.contains("interval inverted"), "msg: {msg}");
     assert!(msg.contains("lo=20"), "msg: {msg}");
@@ -312,8 +313,8 @@ fn claim_kind_override_is_persisted_to_detail() {
     let p99 = 5000u64;
     claim!(v, p99).kind(DetailKind::Benchmark).at_most(1000);
     let r = v.into_result();
-    assert!(!r.passed);
-    assert_eq!(r.details[0].kind, DetailKind::Benchmark);
+    assert!(r.is_fail());
+    assert_eq!(r.failure_details().next().unwrap().kind, DetailKind::Benchmark);
 }
 
 #[test]
@@ -322,8 +323,8 @@ fn claim_default_kind_is_other() {
     let anything = 1u64;
     claim!(v, anything).eq(2);
     let r = v.into_result();
-    assert!(!r.passed);
-    assert_eq!(r.details[0].kind, DetailKind::Other);
+    assert!(r.is_fail());
+    assert_eq!(r.failure_details().next().unwrap().kind, DetailKind::Other);
 }
 
 #[test]
@@ -355,8 +356,8 @@ fn claim_is_finite_fails_for_nan_and_infinities() {
         let x = v_val;
         claim!(v, x).is_finite();
         let r = v.into_result();
-        assert!(!r.passed, "{v_val} must fail is_finite");
-        assert!(r.details[0].message.contains("expected finite"));
+        assert!(!r.is_pass(), "{v_val} must fail is_finite");
+        assert!(r.failure_details().next().unwrap().message.contains("expected finite"));
     }
 }
 
@@ -373,8 +374,8 @@ fn claim_near_inclusive_at_tolerance_boundary() {
     let outside = 1.002_f64;
     claim!(v, outside).near(1.0, 0.001);
     let r = v.into_result();
-    assert!(!r.passed);
-    assert!(r.details[0].message.contains("near 1"));
+    assert!(r.is_fail());
+    assert!(r.failure_details().next().unwrap().message.contains("near 1"));
 }
 
 #[test]
@@ -392,10 +393,10 @@ fn claim_near_negative_tolerance_is_caller_error() {
     claim!(v, exact).near(1.0, -0.001);
     let r = v.into_result();
     assert!(
-        !r.passed,
+        !r.is_pass(),
         "negative tolerance must surface as a caller-error fail",
     );
-    let msg = &r.details[0].message;
+    let msg = &*r.failure_details().next().unwrap().message;
     assert!(msg.contains("caller error"), "msg: {msg}");
     assert!(msg.contains("tolerance negative"), "msg: {msg}");
     assert!(msg.contains("-0.001"), "msg: {msg}");
@@ -431,20 +432,20 @@ fn verdict_continues_past_failure_and_accumulates_all_details() {
     claim!(v, c).eq(42); // pass
     claim!(v, d).between(10, 20); // fail
     let r = v.into_result();
-    assert!(!r.passed);
+    assert!(r.is_fail());
     assert_eq!(
-        r.details.len(),
+        r.outcomes.len(),
         3,
         "exactly the 3 failing claims must record details: {:?}",
-        r.details,
+        r.outcomes,
     );
-    assert!(r.details.iter().any(|d| d.message.contains("a:")));
-    assert!(r.details.iter().any(|d| d.message.contains("b:")));
-    assert!(r.details.iter().any(|d| d.message.contains("d:")));
+    assert!(r.failure_details().any(|d| d.message.contains("a:")));
+    assert!(r.failure_details().any(|d| d.message.contains("b:")));
+    assert!(r.failure_details().any(|d| d.message.contains("d:")));
     assert!(
-        !r.details.iter().any(|d| d.message.contains("c:")),
+        !r.failure_details().any(|d| d.message.contains("c:")),
         "passing claim must not push a detail: {:?}",
-        r.details,
+        r.outcomes,
     );
 }
 
@@ -458,17 +459,11 @@ fn verdict_per_claim_kind_override_routes_to_detail() {
         .kind(DetailKind::PageLocality)
         .at_least(0.9);
     let r = v.into_result();
-    assert!(!r.passed);
-    let bench = r
-        .details
-        .iter()
-        .find(|d| matches!(d.kind, DetailKind::Benchmark))
+    assert!(r.is_fail());
+    let bench = r.failure_details().find(|d| matches!(d.kind, DetailKind::Benchmark))
         .expect("Benchmark kind must propagate");
     assert!(bench.message.contains("p99"));
-    let loc = r
-        .details
-        .iter()
-        .find(|d| matches!(d.kind, DetailKind::PageLocality))
+    let loc = r.failure_details().find(|d| matches!(d.kind, DetailKind::PageLocality))
         .expect("PageLocality kind must propagate");
     assert!(loc.message.contains("locality"));
 }
@@ -480,26 +475,22 @@ fn verdict_merge_folds_in_external_assert_result() {
     claim!(v, a).at_least(50); // pass
 
     let mut external = AssertResult::pass();
-    external.passed = false;
-    external
-        .details
-        .push(AssertDetail::new(DetailKind::Starved, "tid 7 starved"));
+    
+    external.record_fail(AssertDetail::new(DetailKind::Starved, "tid 7 starved"));
     v.merge(external);
 
     let b = 5u64;
     claim!(v, b).at_least(50); // fail
 
     let r = v.into_result();
-    assert!(!r.passed);
-    assert_eq!(r.details.len(), 2);
+    assert!(r.is_fail());
+    assert_eq!(r.outcomes.len(), 2);
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Starved))
     );
     assert!(
-        r.details
-            .iter()
+        r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Other))
     );
 }
@@ -544,15 +535,15 @@ fn claim_against_cgroup_stats_via_derived_accessors() {
     cg.claim_num_workers(&mut v).between(1, 10);
     cg.claim_total_iterations(&mut v).at_least(100);
     let r = v.into_result();
-    assert!(r.passed, "details: {:?}", r.details);
+    assert!(r.is_pass(), "details: {:?}", r.outcomes);
 
     // Failing claim still names the field.
     let mut v = Verdict::new();
     cg.claim_max_gap_ms(&mut v).at_most(10); // 50 > 10 → fail
     let r = v.into_result();
-    assert!(!r.passed);
-    assert!(r.details[0].message.contains("max_gap_ms"));
-    assert!(r.details[0].message.contains("at most 10"));
+    assert!(r.is_fail());
+    assert!(r.failure_details().next().unwrap().message.contains("max_gap_ms"));
+    assert!(r.failure_details().next().unwrap().message.contains("at most 10"));
 }
 
 #[test]
@@ -594,7 +585,7 @@ fn claim_against_worker_report_via_derived_accessors() {
     report.claim_cpus_used(&mut v).len_at_most(4);
     report.claim_wake_latencies_ns(&mut v).len_eq(5);
     let r = v.into_result();
-    assert!(r.passed, "details: {:?}", r.details);
+    assert!(r.is_pass(), "details: {:?}", r.outcomes);
 }
 
 #[test]
@@ -640,11 +631,15 @@ fn verdict_skip_marks_skipped_without_failing() {
     let mut v = Verdict::new();
     v.skip("topology missing");
     let r = v.into_result();
-    assert!(r.passed);
-    assert!(r.skipped);
+    // A pure skip terminal verdict is is_skip()=true,
+    // is_fail()=false, is_pass()=false: empty `outcomes` is the Pass
+    // identity, but a Skip variant in the vec makes the all-Skip
+    // stream report as Skip, not Pass.
+    assert!(!r.is_fail(), "pure skip must not be a failure");
+    assert!(r.is_skip());
+    assert!(!r.is_pass(), "skip is not pass");
     assert!(
-        r.details
-            .iter()
+        r.skip_reasons()
             .any(|d| matches!(d.kind, DetailKind::Skip) && d.message.contains("topology missing"))
     );
 }
@@ -665,28 +660,30 @@ fn verdict_skip_preserves_prior_failure() {
     assert!(!v.passed(), "prior claim should fail (5 > 3)");
     v.skip("precondition missing");
     let r = v.into_result();
+    // Skip-after-fail produces a Fail terminal verdict
+    // (any-Fail-dominates), with the skip reason recorded as a
+    // separate Outcome::Skip entry. The result is is_fail() = true
+    // (failure not masked) AND skip_reasons() carries the skip
+    // detail. is_skip() is false because the outcomes stream contains
+    // both a Fail and a Skip (not all-Skip).
     assert!(
-        !r.passed,
-        "prior failure must NOT be masked by a later skip — got passed={}",
-        r.passed,
+        r.is_fail(),
+        "prior failure must NOT be masked by a later skip — got is_fail={}",
+        r.is_fail(),
     );
+    // The skip reason and the prior failure must both appear in the
+    // appropriate per-variant streams.
     assert!(
-        r.skipped,
-        "skip must still mark `skipped=true` so callers see the skip reason",
-    );
-    // The skip reason and the prior failure must both appear in details.
-    assert!(
-        r.details
-            .iter()
+        r.skip_reasons()
             .any(|d| matches!(d.kind, DetailKind::Skip)
                 && d.message.contains("precondition missing")),
         "skip reason must be recorded: {:?}",
-        r.details,
+        r.outcomes,
     );
     assert!(
-        r.details.iter().any(|d| d.message.contains("at most 3")),
+        r.failure_details().any(|d| d.message.contains("at most 3")),
         "prior claim failure must be retained: {:?}",
-        r.details,
+        r.outcomes,
     );
 }
 
@@ -694,11 +691,11 @@ fn verdict_skip_preserves_prior_failure() {
 fn verdict_skip_if_is_conditional() {
     let mut v = Verdict::new();
     v.skip_if(false, "nope");
-    assert!(!v.into_result().skipped);
+    assert!(!v.into_result().is_skip());
 
     let mut v = Verdict::new();
     v.skip_if(true, "yep");
-    assert!(v.into_result().skipped);
+    assert!(v.into_result().is_skip());
 }
 
 #[test]
@@ -706,10 +703,10 @@ fn verdict_note_does_not_affect_verdict() {
     let mut v = Verdict::new();
     v.note("observed counter=12345");
     let r = v.into_result();
-    assert!(r.passed);
-    assert!(!r.skipped);
+    assert!(r.is_pass());
+    assert!(!r.is_skip());
     assert!(
-        r.details.is_empty(),
+        r.outcomes.is_empty(),
         "verdict.note must not pollute details"
     );
     assert_eq!(r.info_notes.len(), 1);
@@ -750,8 +747,8 @@ fn claim_because_reason_appears_in_failure_message() {
         .because("scheduler should have produced more events")
         .at_least(50);
     let r = v.into_result();
-    assert!(!r.passed);
-    let msg = &r.details[0].message;
+    assert!(r.is_fail());
+    let msg = &*r.failure_details().next().unwrap().message;
     assert!(
         msg.contains("scheduler should have produced more events"),
         "msg: {msg}"
@@ -786,20 +783,21 @@ fn verdict_clone_carries_state() {
 fn verdict_merge_skipped_does_not_fail_accumulator() {
     let mut v = Verdict::new();
     let counter = 100u64;
-    claim!(v, counter).at_least(50); // pass
-    v.merge(AssertResult::skip("optional probe"));
-    assert!(
-        v.passed(),
-        "merging a skip must not flip the accumulator to failing",
-    );
+    claim!(v, counter).at_least(50); // pass — adds PassDetail to passes, outcomes stays empty
+    v.merge(AssertResult::skip("optional probe")); // outcomes: [Skip(detail)]
     let r = v.into_result();
-    assert!(r.passed);
+    // Merging a skip onto an accumulator with no failures yields an
+    // all-Skip terminal verdict. The "does not fail" intent is
+    // preserved: is_fail() stays false — no failure was introduced.
+    // A skip is not a pass, it's a skip.
+    assert!(!r.is_fail(), "merging a skip must not introduce a failure");
+    assert!(r.is_skip(), "post-merge stream is all-Skip");
+    assert!(!r.is_pass(), "all-Skip is not pass");
     assert!(
-        r.details
-            .iter()
+        r.skip_reasons()
             .any(|d| d.message.contains("optional probe")),
-        "skip rationale must reach merged details: {:?}",
-        r.details
+        "skip rationale must reach merged outcomes: {:?}",
+        r.outcomes
     );
 }
 
@@ -911,10 +909,10 @@ fn verdict_log_passes_emits_event_on_scalar_pass() {
     );
     let r = v.into_result();
     assert!(
-        r.passed,
+        r.is_pass(),
         "claim must still pass — log_passes only adds output"
     );
-    assert!(r.details.is_empty(), "pass arm must add no details");
+    assert!(r.outcomes.is_empty(), "pass arm must add no details");
 }
 
 /// A passing scalar claim emits no `tracing::info!` event when
@@ -944,6 +942,6 @@ fn verdict_log_passes_silent_on_fail_arm() {
         "fail arm must NOT emit the positive-confirmation log",
     );
     let r = v.into_result();
-    assert!(!r.passed);
-    assert_eq!(r.details.len(), 1);
+    assert!(r.is_fail());
+    assert_eq!(r.outcomes.len(), 1);
 }

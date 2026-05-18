@@ -258,7 +258,7 @@ fn classify_perf_open_errno(raw: i32) -> PerfOpenResult {
 fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
     if !cfg!(target_arch = "x86_64") {
         let mut result = AssertResult::pass();
-        result.details.push(AssertDetail::new(
+        result.record_fail(AssertDetail::new(
             DetailKind::Other,
             "CPUID leaf 0xA is x86-only; skipping on non-x86_64 \
              target. PMUv3 surface coverage on aarch64 lives in \
@@ -286,8 +286,8 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
         // version=0 in the guest is a synthesizer regression —
         // fail the test instead of silently passing.
         if host_likely_has_pmu() {
-            result.passed = false;
-            result.details.push(AssertDetail::new(
+            
+            result.record_fail(AssertDetail::new(
                 DetailKind::Other,
                 "CPUID leaf 0xA reports version=0 but the host \
                  appears PMU-capable (vendor=GenuineIntel and \
@@ -306,7 +306,7 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
         // base. This is the expected behavior on a no-PMU host
         // (AMD, ancient Intel without DS, or PMU-less hardware);
         // report it without failing the test.
-        result.details.push(AssertDetail::new(
+        result.record_fail(AssertDetail::new(
             DetailKind::Other,
             "CPUID leaf 0xA reports version=0 and the host probe \
              (vendor + DS bit) does not indicate a PMU; \
@@ -318,8 +318,8 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
 
     // PMU present — assert the synthesized v2 shape.
     if leaf.version != 2 {
-        result.passed = false;
-        result.details.push(AssertDetail::new(
+        
+        result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
                 "CPUID leaf 0xA reports version={}, expected 2 \
@@ -331,8 +331,8 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
         return Ok(result);
     }
     if leaf.num_gp != 4 {
-        result.passed = false;
-        result.details.push(AssertDetail::new(
+        
+        result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
                 "CPUID leaf 0xA reports num_gp={}, expected 4 \
@@ -343,8 +343,8 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
         return Ok(result);
     }
     if leaf.gp_width != 48 {
-        result.passed = false;
-        result.details.push(AssertDetail::new(
+        
+        result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
                 "CPUID leaf 0xA reports gp_width={}, expected 48 \
@@ -355,8 +355,8 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
         return Ok(result);
     }
     if leaf.mask_length != 7 {
-        result.passed = false;
-        result.details.push(AssertDetail::new(
+        
+        result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
                 "CPUID leaf 0xA reports mask_length={}, expected 7 \
@@ -369,8 +369,8 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
         return Ok(result);
     }
     if leaf.num_fixed != 3 {
-        result.passed = false;
-        result.details.push(AssertDetail::new(
+        
+        result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
                 "CPUID leaf 0xA reports num_fixed={}, expected 3 \
@@ -381,8 +381,8 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
         return Ok(result);
     }
     if leaf.fixed_width != 48 {
-        result.passed = false;
-        result.details.push(AssertDetail::new(
+        
+        result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
                 "CPUID leaf 0xA reports fixed_width={}, expected 48 \
@@ -393,7 +393,7 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
         return Ok(result);
     }
 
-    result.details.push(AssertDetail::new(
+    result.record_fail(AssertDetail::new(
         DetailKind::Other,
         format!(
             "CPUID leaf 0xA synthesized PMU-v2 visible: version={}, \
@@ -479,7 +479,7 @@ fn guest_pmu_perf_event_open_counts_instructions(_ctx: &Ctx) -> Result<AssertRes
         match classify_perf_open_errno(raw) {
             PerfOpenResult::Skip(reason) => {
                 let mut result = AssertResult::pass();
-                result.details.push(AssertDetail::new(
+                result.record_fail(AssertDetail::new(
                     DetailKind::Other,
                     format!(
                         "perf_event_open failed with host-config errno \
@@ -491,8 +491,8 @@ fn guest_pmu_perf_event_open_counts_instructions(_ctx: &Ctx) -> Result<AssertRes
             }
             PerfOpenResult::Fail(reason) => {
                 let mut result = AssertResult::pass();
-                result.passed = false;
-                result.details.push(AssertDetail::new(
+                
+                result.record_fail(AssertDetail::new(
                     DetailKind::Other,
                     format!(
                         "perf_event_open(PERF_TYPE_HARDWARE, \
@@ -571,8 +571,8 @@ fn guest_pmu_perf_event_open_counts_instructions(_ctx: &Ctx) -> Result<AssertRes
 
     let mut result = AssertResult::pass();
     if count == 0 {
-        result.passed = false;
-        result.details.push(AssertDetail::new(
+        
+        result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
                 "perf_event_open(PERF_COUNT_HW_INSTRUCTIONS) reported \
@@ -587,13 +587,10 @@ fn guest_pmu_perf_event_open_counts_instructions(_ctx: &Ctx) -> Result<AssertRes
         return Ok(result);
     }
 
-    result.details.push(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "perf_event_open(PERF_COUNT_HW_INSTRUCTIONS) advanced: \
-             count={count} after 10M black_box iterations (acc={acc}); \
-             guest PMU pipeline is live end-to-end",
-        ),
+    result.note(format!(
+        "perf_event_open(PERF_COUNT_HW_INSTRUCTIONS) advanced: \
+         count={count} after 10M black_box iterations (acc={acc}); \
+         guest PMU pipeline is live end-to-end",
     ));
     Ok(result)
 }

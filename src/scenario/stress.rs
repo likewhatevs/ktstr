@@ -155,8 +155,7 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
         let reports = h.stop_and_collect();
         for w in &reports {
             if w.max_gap_ms > 1500 {
-                r.passed = false;
-                r.details.push(crate::assert::AssertDetail::new(
+                r.record_fail(crate::assert::AssertDetail::new(
                     crate::assert::DetailKind::Stuck,
                     format!(
                         "pinned worker {} on CPU {} had {}ms gap (dispatch contention stall)",

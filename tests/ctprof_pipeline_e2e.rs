@@ -258,7 +258,7 @@ fn ctprof_pipeline_e2e_capture_write_load_compare(ctx: &Ctx) -> Result<AssertRes
     // scenario's own verdict so any scheduler-side failure
     // surfaces alongside — the two signals are orthogonal.
     // Merge the two workload verdicts: fail if either failed.
-    if !baseline_workload_result.passed {
+    if baseline_workload_result.is_fail() {
         return Ok(baseline_workload_result);
     }
     Ok(candidate_workload_result)
@@ -548,13 +548,10 @@ fn ctprof_pipeline_e2e_allocated_bytes_delta_survives_round_trip(
             (r.group_key.clone(), b, c, r.delta)
         })
         .collect();
-    result.details.push(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "ctprof_pipeline_e2e_allocated_bytes_delta: \
-             baseline_alloc={baseline_alloc}, candidate_alloc={candidate_alloc}, \
-             alloc_worker_rows={summary:?}",
-        ),
+    result.note(format!(
+        "ctprof_pipeline_e2e_allocated_bytes_delta: \
+         baseline_alloc={baseline_alloc}, candidate_alloc={candidate_alloc}, \
+         alloc_worker_rows={summary:?}",
     ));
     Ok(result)
 }

@@ -658,6 +658,31 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // [`super::super::monitor::reader`]'s sample loop tolerates
     // pre-boot zeros for as long as needed.
     let kern_phys_base = crate::vmm::guest_comms::read_phys_base_from_iomem().unwrap_or(0);
+    // Runtime KVA of `_text`, the kernel image start symbol.
+    // Powers the host-side virt-KASLR derive at
+    // `src/vmm/freeze_coord/dispatch.rs::dispatch_bulk_message`'s
+    // KERN_ADDRS arm: subtracting the link-time KVA (from the
+    // host's vmlinux parse) yields the virt-KASLR slide so the
+    // monitor and dump pipelines can resolve per-CPU `rq` /
+    // `kernel_cpustat` / `kstat` KVAs under
+    // `CONFIG_RANDOMIZE_BASE=y`. `_text` is defined in
+    // `vmlinux.lds.S` on every Linux build, so this works on
+    // both x86_64 and aarch64. `None` only when the symbol is
+    // masked (kptr_restrict + non-CAP_SYSLOG, which we are not —
+    // PID 1 has all caps) or `/proc/kallsyms` is unreadable; the
+    // host's KERN_ADDRS handler treats `None` as "guest could
+    // not derive" and leaves the slot at its prior value (the
+    // BSP MSR_LSTAR path may still publish on x86_64).
+    let kern_text_kva = crate::vmm::guest_comms::read_kernel_text_from_kallsyms();
+    let kern_addrs = crate::vmm::wire::KernAddrs::new(
+        kern_phys_base,
+        // `page_offset_base` slot — guest does not derive it
+        // today; host falls back to a page-table walk via
+        // `monitor::symbols::resolve_page_offset_with_tcr` when
+        // it needs the direct-map base.
+        0,
+        kern_text_kva,
+    );
     // `count_online_cpus()` reads `/sys/devices/system/cpu/online`
     // which `mount_filesystems()` mounted earlier in setup();
     // fallback to 1 yields the floor budget if the read fails.
@@ -669,7 +694,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // truncating-floor 100 retries / 10_000 ms wall).
     let retries = budget_ms.div_ceil(100) as u32;
     for attempt in 0..retries {
-        crate::vmm::guest_comms::send_kern_addrs(kern_phys_base, 0);
+        crate::vmm::guest_comms::send_kern_addrs(&kern_addrs);
         if crate::vmm::guest_comms::send_sys_rdy() {
             break;
         }

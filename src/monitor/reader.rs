@@ -1817,20 +1817,18 @@ pub(crate) struct RqRefresh {
     /// CPU's offset to compute the per-CPU rq KVA, then reduced
     /// to a PA via [`super::symbols::kva_to_pa`].
     pub runqueues_kva: u64,
-    /// KASLR offset for the per-CPU walker. The virtual slide is
-    /// supposed to flow in from the monitor-thread handshake
-    /// (`super::symbols::per_cpu_kva` needs it to bridge
-    /// link-time and runtime per-CPU bases). In the current
-    /// scaffolding the producer at the freeze-coord handshake
-    /// derives `phys_base - real_phys_base`, which reduces to a
-    /// structural zero because both reads target the kernel's
-    /// `phys_base` global at the same address. The per-CPU walker
-    /// at `super::reader::monitor_loop` therefore reads zero PAs
-    /// under KASLR-on — same pre-batch behavior — until the
-    /// LSTAR-derive plumbing in `crate::vmm::x86_64::msr_kaslr::read_and_derive`
-    /// reaches this monitor thread (the #31 real-fix follow-up).
-    /// Field exists so the single-line caller flip is the only
-    /// remaining work once that value flows.
+    /// Virtual KASLR slide for the per-CPU walker. Sourced from
+    /// the shared `kern_virt_kaslr` Arc populated by either the
+    /// BSP MSR_LSTAR derive
+    /// (`crate::vmm::x86_64::msr_kaslr::read_and_derive`,
+    /// x86_64-only) or the guest-channel KERN_ADDRS `_text`
+    /// subtraction
+    /// (`crate::vmm::freeze_coord::dispatch::dispatch_bulk_message`,
+    /// both arches). The monitor thread loads the Arc once per
+    /// `RqRefresh` construction (after sys_rdy fires, so both
+    /// publishers have had time to populate); 0 fallback matches
+    /// KASLR-off / nokaslr-karg semantics and collapses
+    /// [`super::symbols::per_cpu_kva`] to the no-slide formula.
     pub kaslr_offset: u64,
     /// Number of CPUs (entries to read from `__per_cpu_offset[]`).
     pub num_cpus: u32,
@@ -4501,7 +4499,7 @@ mod tests {
         // Both paths should agree: stall detected on cpu0.
         assert!(reactive_stall, "reactive path should detect stall");
         assert!(
-            !verdict.passed,
+            !verdict.is_pass(),
             "evaluate should detect stall: {:?}",
             verdict.details
         );
@@ -4595,7 +4593,7 @@ mod tests {
         };
         let verdict = thresholds.evaluate(&report);
         assert!(
-            verdict.passed,
+            verdict.is_pass(),
             "evaluate: idle CPU should pass: {:?}",
             verdict.details
         );

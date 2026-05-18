@@ -393,6 +393,27 @@ pub struct SidecarResult {
     pub run_source: Option<String>,
 }
 
+impl SidecarResult {
+    /// Convenience accessor mirroring
+    /// [`crate::assert::AssertResult::is_pass`]. SidecarResult is the
+    /// wire-format mirror of an AssertResult; this method exposes the
+    /// same is_pass / is_fail / is_skip vocabulary so consumers can swap
+    /// between the two without re-learning field names.
+    pub fn is_pass(&self) -> bool {
+        self.passed
+    }
+    /// Convenience accessor mirroring
+    /// [`crate::assert::AssertResult::is_fail`].
+    pub fn is_fail(&self) -> bool {
+        !self.passed
+    }
+    /// Convenience accessor mirroring
+    /// [`crate::assert::AssertResult::is_skip`].
+    pub fn is_skip(&self) -> bool {
+        self.skipped
+    }
+}
+
 #[cfg(test)]
 impl SidecarResult {
     /// Populated [`SidecarResult`] for unit tests. Every field has a
@@ -2655,8 +2676,8 @@ pub(crate) fn write_sidecar(
         project_commit: detect_project_commit(),
         payload: entry.payload.map(|p| p.name.to_string()),
         metrics: payload_metrics.to_vec(),
-        passed: check_result.passed,
-        skipped: check_result.is_skipped(),
+        passed: check_result.is_pass(),
+        skipped: check_result.is_skip(),
         stats: check_result.stats.clone(),
         monitor: vm_result.monitor.as_ref().map(|m| m.summary.clone()),
         stimulus_events: stimulus_events.to_vec(),

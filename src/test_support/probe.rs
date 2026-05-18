@@ -1613,21 +1613,13 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
     let result = match (entry.func)(&ctx) {
         Ok(r) => r,
         Err(e) => {
-            let r = AssertResult {
-                passed: false,
-                skipped: false,
-                details: vec![format!("{e:#}").into()],
-                passes: vec![],
-                stats: Default::default(),
-                measurements: std::collections::BTreeMap::new(),
-                info_notes: vec![],
-            };
+            let r = AssertResult::fail_msg(format!("{e:#}"));
             publish_result_and_collect(&r, probe_stop, probe_handle);
             return Some(1);
         }
     };
 
-    let exit_code = if result.passed { 0 } else { 1 };
+    let exit_code = if result.is_pass() { 0 } else { 1 };
     publish_result_and_collect(&result, probe_stop, probe_handle);
     Some(exit_code)
 }
@@ -2074,21 +2066,13 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
     let result = match (entry.func)(&ctx) {
         Ok(r) => r,
         Err(e) => {
-            let r = AssertResult {
-                passed: false,
-                skipped: false,
-                details: vec![format!("{e:#}").into()],
-                passes: vec![],
-                stats: Default::default(),
-                measurements: std::collections::BTreeMap::new(),
-                info_notes: vec![],
-            };
+            let r = AssertResult::fail_msg(format!("{e:#}"));
             publish_result_and_collect(&r, stop, Some(handle));
             return Some(1);
         }
     };
 
-    let exit_code = if result.passed { 0 } else { 1 };
+    let exit_code = if result.is_pass() { 0 } else { 1 };
     publish_result_and_collect(&result, stop, Some(handle));
     Some(exit_code)
 }

@@ -280,14 +280,27 @@ pub(crate) struct KernelSymbols {
     /// `lstar != 0` to avoid computing `0 - entry_SYSCALL_64_link`
     /// (a huge u64 wraparound). ktstr.kconfig defensively asserts
     /// `# CONFIG_X86_FRED is not set` to make this gate dormant.
-    // #117 lands the field + virt-KASLR derivation primitive; #31
-    // wires the consumer at freeze_coord/mod.rs:3593 (replaces the
-    // hardcoded-0 kaslr_offset). Until that lands the field looks
-    // dead to dead_code; the read is real, just in another commit.
-    // The `_kva` suffix matches sibling fields phys_base_kva +
-    // page_offset_base_kva — link-time KVA values from vmlinux.
-    #[allow(dead_code)]
+    // Consumed by the BSP-side virt-KASLR derivation
+    // (`src/vmm/x86_64/msr_kaslr::read_and_derive`) — subtracts
+    // this link-time KVA from `KVM_GET_MSRS(MSR_LSTAR)` runtime
+    // value to recover the kaslr_offset. x86_64-only by definition
+    // of MSR_LSTAR (no aarch64 equivalent). The `_kva` suffix
+    // matches sibling fields phys_base_kva + page_offset_base_kva —
+    // link-time KVA values from vmlinux.
     pub entry_syscall_64_kva: Option<u64>,
+    /// Link-time kernel virtual address of `_text` (the kernel
+    /// image start symbol from `vmlinux.lds.S`). Defined on every
+    /// Linux build (x86_64: `__START_KERNEL_map + LOAD_PHYSICAL_ADDR`,
+    /// aarch64: `KIMAGE_VADDR`).
+    ///
+    /// Used by the guest-channel virt-KASLR derivation in
+    /// `src/vmm/freeze_coord/dispatch.rs`'s KERN_ADDRS arm:
+    /// `virt_kaslr_offset = _text_runtime - _text_link`, where
+    /// the runtime KVA comes from the guest's `/proc/kallsyms`
+    /// read (see `src/vmm/guest_comms.rs`). `None` only on
+    /// extremely stripped vmlinux builds that omit even the
+    /// kernel image's start anchor.
+    pub kernel_text_kva: Option<u64>,
     /// Link-time kernel virtual address of the `kernel_cpustat`
     /// per-CPU template. The per-CPU KVA for CPU `n` is
     /// `kernel_cpustat + __per_cpu_offset[n]` (plus
@@ -420,6 +433,20 @@ impl KernelSymbols {
         // `wrmsrq(MSR_LSTAR, (unsigned long)entry_SYSCALL_64)` in
         // arch/x86/kernel/cpu/common.c:2257 — name match guaranteed.
         let entry_syscall_64_kva = sym_addr("entry_SYSCALL_64");
+        // `_text` — the kernel image start symbol. Defined in
+        // `vmlinux.lds.S` on every Linux build (both x86_64 and
+        // aarch64); placed at `__START_KERNEL_map + LOAD_PHYSICAL_ADDR`
+        // on x86_64 and at `KIMAGE_VADDR` on aarch64. Used by the
+        // guest-channel virt-KASLR derivation
+        // (`src/vmm/freeze_coord/dispatch.rs::dispatch_bulk_message`'s
+        // KERN_ADDRS arm): the guest reads runtime `_text` from
+        // `/proc/kallsyms` and the host subtracts this link-time KVA
+        // to recover the virt-KASLR slide. KASLR shifts every
+        // text-segment symbol by the same `kaslr_offset` so `_text`
+        // is interchangeable with `entry_SYSCALL_64` for the
+        // derivation purpose; the difference is `_text` exists on
+        // both architectures while `entry_SYSCALL_64` is x86_64-only.
+        let kernel_text_kva = sym_addr("_text");
 
         // Per-CPU CPU-time / softirq / IRQ / iowait_sleeptime
         // symbols. All three are `.data..percpu` per-CPU templates;
@@ -458,6 +485,7 @@ impl KernelSymbols {
             scx_watchdog_interval,
             jiffies_64,
             entry_syscall_64_kva,
+            kernel_text_kva,
             kernel_cpustat,
             kstat,
             tick_cpu_sched,
@@ -813,35 +841,27 @@ pub(crate) fn read_per_cpu_offsets(
 /// pcpu fields) computes the same formula — given the link-time
 /// KVA the linker assigned to the per-CPU template
 /// (`template_kva`), the active KASLR slide for the kernel's
-/// virtual mapping (`kaslr_offset` — derived once at coordinator
-/// handshake from BSP MSR_LSTAR per
-/// [`crate::vmm::x86_64::msr_kaslr::read_and_derive`] once the
-/// cross-thread plumbing for that derive lands; production
-/// callers currently pass `0` as scaffolding while that
-/// follow-up is in flight), and the runtime per-CPU base
-/// offset for the target CPU (`per_cpu_off`, the value read
-/// out of `__per_cpu_offset[cpu]`), the runtime KVA is the
-/// simple sum `template_kva + kaslr_offset + per_cpu_off`. The
-/// kernel's own `per_cpu_ptr()` macro performs the same
-/// arithmetic (`linux:include/linux/percpu-defs.h`); the host
-/// monitor duplicates it because we read guest memory directly
-/// rather than calling into the kernel.
+/// virtual mapping (`kaslr_offset`, sourced from the shared
+/// `kern_virt_kaslr` Arc populated by the BSP MSR_LSTAR derive
+/// at [`crate::vmm::x86_64::msr_kaslr::read_and_derive`] on
+/// x86_64 OR the guest-channel KERN_ADDRS `_text` subtraction
+/// at `crate::vmm::freeze_coord::dispatch` on both arches), and
+/// the runtime per-CPU base offset for the target CPU
+/// (`per_cpu_off`, the value read out of `__per_cpu_offset[cpu]`),
+/// the runtime KVA is the simple sum
+/// `template_kva + kaslr_offset + per_cpu_off`. The kernel's
+/// own `per_cpu_ptr()` macro performs the same arithmetic
+/// (`linux:include/linux/percpu-defs.h`); the host monitor
+/// duplicates it because we read guest memory directly rather
+/// than calling into the kernel.
 ///
 /// Extracted into a single helper so the formula has one audit
-/// point. Pre-#31 the math was open-coded at five sites; three
-/// of them silently omitted `kaslr_offset` (compute_owned in
-/// capture_scx, plus the three collect_per_cpu_time sites in
-/// dump::mod) and quietly returned zero from
-/// [`super::reader::GuestMem::read_u64`] under KASLR-on. The
-/// scaffolding consolidation is complete (one audit point;
-/// helper accepts `kaslr_offset`; all five sites route through
-/// it), but every production caller still passes
-/// `kaslr_offset = 0`. The silent-zero mode persists until the
-/// LSTAR-derive plumbing lands — see the `compute_rq_pas` doc
-/// below and `crate::vmm::x86_64::msr_kaslr::read_and_derive`.
-/// Anyone adding a sixth per-CPU walker should call this helper
-/// (passing `0` to match the existing callers) rather than
-/// re-deriving the formula.
+/// point. Production callers route the `kaslr_offset` argument
+/// from the shared Arc snapshot; 0 is the KASLR-off /
+/// nokaslr-karg / not-yet-published fallback (the addition is a
+/// no-op slide and the formula collapses to the unsigned-add
+/// link-time path). Anyone adding a sixth per-CPU walker should
+/// call this helper rather than re-deriving the formula.
 #[inline]
 pub(crate) fn per_cpu_kva(template_kva: u64, kaslr_offset: u64, per_cpu_off: u64) -> u64 {
     template_kva
@@ -1298,6 +1318,7 @@ mod tests {
             tick_cpu_sched: None,
             node_data: None,
             entry_syscall_64_kva: None,
+            kernel_text_kva: None,
         };
 
         assert_eq!(
@@ -1333,6 +1354,7 @@ mod tests {
             tick_cpu_sched: None,
             node_data: None,
             entry_syscall_64_kva: None,
+            kernel_text_kva: None,
         };
 
         assert_eq!(
@@ -1370,6 +1392,7 @@ mod tests {
             tick_cpu_sched: None,
             node_data: None,
             entry_syscall_64_kva: None,
+            kernel_text_kva: None,
         };
 
         assert_eq!(
@@ -1410,6 +1433,7 @@ mod tests {
             tick_cpu_sched: None,
             node_data: None,
             entry_syscall_64_kva: None,
+            kernel_text_kva: None,
         };
 
         assert_eq!(
@@ -1453,6 +1477,7 @@ mod tests {
             tick_cpu_sched: None,
             node_data: None,
             entry_syscall_64_kva: None,
+            kernel_text_kva: None,
         };
 
         assert_eq!(
@@ -1492,6 +1517,7 @@ mod tests {
             tick_cpu_sched: None,
             node_data: None,
             entry_syscall_64_kva: None,
+            kernel_text_kva: None,
         };
 
         assert!(resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP, 0));
@@ -1528,6 +1554,7 @@ mod tests {
             tick_cpu_sched: None,
             node_data: None,
             entry_syscall_64_kva: None,
+            kernel_text_kva: None,
         };
 
         assert!(!resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP, 0));
@@ -1560,6 +1587,7 @@ mod tests {
             tick_cpu_sched: None,
             node_data: None,
             entry_syscall_64_kva: None,
+            kernel_text_kva: None,
         };
 
         assert!(!resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP, 0));

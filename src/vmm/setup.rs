@@ -1126,6 +1126,23 @@ impl KtstrVm {
             "sysctl.kernel.sched_schedstats=1 ",
             "delayacct ",
             "sysctl.kernel.task_delayacct=1 ",
+            // KASLR defense-in-depth. The KERN_ADDRS guest channel
+            // (src/vmm/guest_comms.rs::send_kern_addrs) and the BSP
+            // MSR_LSTAR readback (src/vmm/x86_64/msr_kaslr.rs) each
+            // produce a virt-KASLR offset that flows into the
+            // monitor + dump consumers; nokaslr keeps both paths at
+            // a literal 0 offset for kernels we don't control the
+            // build of (distro/production kernels with
+            // CONFIG_RANDOMIZE_BASE=y + CONFIG_RANDOMIZE_MEMORY=y).
+            // Disables both forms at boot — page_offset_base,
+            // vmalloc_base, vmemmap_base, and the kernel image base
+            // all stay at compile-time defaults so the monitor's
+            // template + per_cpu_offset arithmetic in
+            // `monitor::symbols::per_cpu_kva` lands on the right
+            // PA without runtime derivation. Belt + suspenders: the
+            // virt-KASLR derivation paths still run and produce 0,
+            // which matches the disabled state.
+            "nokaslr ",
             "KTSTR_GUEST=1",
         )
         .to_string();
@@ -1515,6 +1532,13 @@ impl KtstrVm {
             "sysctl.kernel.sched_schedstats=1 ",
             "delayacct sysctl.kernel.task_delayacct=1 ",
             "kfence.sample_interval=0 ",
+            // KASLR defense-in-depth — see x86_64 cmdline above for
+            // rationale. On aarch64 nokaslr disables the
+            // CONFIG_RANDOMIZE_BASE kernel-image slide (the only
+            // KASLR form on this arch; arm64 has no
+            // CONFIG_RANDOMIZE_MEMORY equivalent — the kernel
+            // direct-map base is fixed by VA_BITS).
+            "nokaslr ",
             "KTSTR_GUEST=1",
         )
         .to_string();

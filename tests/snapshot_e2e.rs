@@ -72,7 +72,7 @@ fn snapshot_op_drives_bridge_and_stores_report_under_name() {
         hold: HoldSpec::fixed(std::time::Duration::from_millis(1)),
     }];
     let result = execute_steps(&ctx, steps).expect("execute_steps must succeed");
-    assert!(result.passed, "scenario must pass: {:?}", result.details);
+    assert!(result.is_pass(), "scenario must pass: {:?}", result.outcomes);
 
     assert_eq!(
         calls.load(Ordering::Relaxed),
@@ -112,9 +112,9 @@ fn snapshot_op_with_no_bridge_is_a_no_op() {
     }];
     let result = execute_steps(&ctx, steps).expect("execute_steps with no bridge must succeed");
     assert!(
-        result.passed,
+        result.is_pass(),
         "scenario without a bridge must still pass: {:?}",
-        result.details
+        result.outcomes
     );
 }
 
@@ -136,7 +136,7 @@ fn snapshot_op_with_failing_capture_does_not_abort_scenario() {
         hold: HoldSpec::fixed(std::time::Duration::from_millis(1)),
     }];
     let result = execute_steps(&ctx, steps).expect("execute_steps must succeed");
-    assert!(result.passed);
+    assert!(result.is_pass());
     assert!(bridge_handle.is_empty());
 }
 
@@ -167,7 +167,7 @@ fn watch_snapshot_op_drives_register_callback() {
         hold: HoldSpec::fixed(std::time::Duration::from_millis(1)),
     }];
     let result = execute_steps(&ctx, steps).expect("execute_steps must succeed");
-    assert!(result.passed, "scenario must pass: {:?}", result.details);
+    assert!(result.is_pass(), "scenario must pass: {:?}", result.outcomes);
     let recorded = attempts.lock().unwrap().clone();
     assert_eq!(recorded.len(), 2);
     assert_eq!(recorded[0], "bss.scx_ktstr.alloc_count");
@@ -199,13 +199,10 @@ fn watch_snapshot_op_max_3_per_scenario_errors_fourth() {
     }];
     let result = execute_steps(&ctx, steps).expect("execute_steps returns Ok with stamped error");
     assert!(
-        !result.passed,
+        !result.is_pass(),
         "scenario must fail when 4th watchpoint is registered (cap exceeded)"
     );
-    let detail = result
-        .details
-        .iter()
-        .find(|d| d.message.contains("cap exceeded"))
+    let detail = result.failure_details().find(|d| d.message.contains("cap exceeded"))
         .expect("AssertResult must carry the cap-exceeded message");
     assert!(detail.message.contains("WatchSnapshot"));
     assert_eq!(MAX_WATCH_SNAPSHOTS, 3);
@@ -233,11 +230,8 @@ fn watch_snapshot_op_unresolvable_symbol_bails_immediately() {
         hold: HoldSpec::fixed(std::time::Duration::from_millis(1)),
     }];
     let result = execute_steps(&ctx, steps).expect("execute_steps returns Ok with stamped error");
-    assert!(!result.passed, "unresolvable symbol must fail the step");
-    let detail = result
-        .details
-        .iter()
-        .find(|d| d.message.contains("did not resolve"))
+    assert!(result.is_fail(), "unresolvable symbol must fail the step");
+    let detail = result.failure_details().find(|d| d.message.contains("did not resolve"))
         .expect("AssertResult must surface the resolution error");
     assert!(detail.message.contains("absent_symbol"));
 }
@@ -373,7 +367,7 @@ fn scenario_snapshot_op_captures_in_vm(
         anyhow::bail!("entry.get(\"nr_cpus_onln\") returned {via_path}, expected 4");
     }
 
-    result.details.push(ktstr::assert::AssertDetail::new(
+    result.record_fail(ktstr::assert::AssertDetail::new(
         ktstr::assert::DetailKind::Other,
         format!(
             "Op::capture_snapshot('test_snap') captured {} map(s); bpf.bss has \
@@ -540,7 +534,7 @@ fn scenario_watch_snapshot_op_captures_exit_state(
         );
     }
 
-    result.details.push(ktstr::assert::AssertDetail::new(
+    result.record_fail(ktstr::assert::AssertDetail::new(
         ktstr::assert::DetailKind::Other,
         format!(
             "Op::watch_snapshot('exit_kind') drove register_watch \
@@ -706,7 +700,7 @@ fn scenario_snapshotmap_iter_against_synthetic_cgroup_map(
         );
     }
 
-    result.details.push(ktstr::assert::AssertDetail::new(
+    result.record_fail(ktstr::assert::AssertDetail::new(
         ktstr::assert::DetailKind::Other,
         "SnapshotMap iterator chain verified: find(cg_1002)=250, \
          filter(>100).len()=2, max_by=cg_1003@500"

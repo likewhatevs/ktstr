@@ -1063,7 +1063,7 @@ mod tests {
         // equal total struct size.
         crate::claim!(v, map_extra_tail).eq(total_size);
         let r = v.into_result();
-        assert!(r.passed, "bpf_map_info uapi layout drift: {:?}", r.details,);
+        assert!(r.is_pass(), "bpf_map_info uapi layout drift: {:?}", r.outcomes,);
     }
 
     /// Round-up arithmetic for percpu stride matches the kernel's
