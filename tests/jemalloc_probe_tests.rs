@@ -14,7 +14,7 @@
 //! [`set_probe_binary_env_var`] at static init time.
 
 use anyhow::{Result, anyhow};
-use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
+use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
 use ktstr::scenario::payload_run::PayloadHandle;
@@ -310,22 +310,19 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
         }
         _ => {}
     }
-    // Attach the observed n_threads to the passing result so CI
-    // output surfaces the count. If a future jemalloc version grows
-    // a lazily-spawned background thread the test still passes (via
-    // tid-identity), but `n_threads=2` in the detail makes the
-    // regression to "worker is no longer strictly single-threaded"
+    // Attach the observed n_threads as an info note on the passing
+    // result so CI output surfaces the count. If a future jemalloc
+    // version grows a lazily-spawned background thread the test still
+    // passes (via tid-identity), but `n_threads=2` in the note makes
+    // the regression to "worker is no longer strictly single-threaded"
     // visible for human review without a silent capability loss.
-    let mut result = AssertResult::pass();
-    result.record_fail(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "jemalloc_probe_external_target: n_threads={n_threads} for \
-             worker pid={worker_pid} (expected 1 for single-threaded worker; \
-             >1 indicates jemalloc or a future dep spawned a helper thread)"
-        ),
-    ));
-    Ok(result)
+    // `with_note` keeps the verdict at Pass; `record_fail` would
+    // flip it to Fail.
+    Ok(AssertResult::pass().with_note(format!(
+        "jemalloc_probe_external_target: n_threads={n_threads} for \
+         worker pid={worker_pid} (expected 1 for single-threaded worker; \
+         >1 indicates jemalloc or a future dep spawned a helper thread)"
+    )))
 }
 
 /// Error path — probe a pid that does not exist. The probe must
@@ -542,16 +539,13 @@ fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
                  or readdir(/proc/<pid>/task) is not observing the churn"
         )));
     }
-    // Both pass paths attach a DetailKind::Other diagnostic so
-    // `error_invocations` is observable in the test report (JSON /
-    // stdout). No dedicated `Info` variant exists in DetailKind — the
-    // kind is advisory here since the result passes either way; the
-    // message is the payload. Hard pass = saw the race at least once;
-    // soft pass = race window present (multi-thread view) but never
-    // lost. Whether a given invocation wins or loses every race is
-    // inherently timing-dependent, so this test does not pin a
-    // specific error count.
-    let mut result = AssertResult::pass();
+    // Both pass paths attach an info note so `error_invocations` is
+    // observable in the test report (JSON / stdout). Hard pass = saw
+    // the race at least once; soft pass = race window present
+    // (multi-thread view) but never lost. Whether a given invocation
+    // wins or loses every race is inherently timing-dependent, so
+    // this test does not pin a specific error count. `with_note`
+    // keeps the verdict at Pass; `record_fail` would flip it to Fail.
     let message = if error_invocations > 0 {
         format!(
             "{error_invocations} of {INVOCATIONS} probe invocations observed \
@@ -564,8 +558,7 @@ fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
              visible, but no tid died mid-probe)"
         )
     };
-    result.record_fail(AssertDetail::new(DetailKind::Other, message));
-    Ok(result)
+    Ok(AssertResult::pass().with_note(message))
 }
 
 /// Extract `snapshots.{snap_idx}.timestamp_unix_sec` for the given
