@@ -229,7 +229,7 @@ pub(super) fn compute_err_triggered(watchpoint_hit: bool, bss_state: BssReadStat
 /// "watchpoint sees a write to `*scx_root->exit_kind`, probe hasn't
 /// latched the error class (yet)".
 ///
-/// Used at the `freeze_and_capture` call site (a closure inside
+/// Used at the `freeze_and_dispatch` call site (a closure inside
 /// the run-loop, not a free fn) to compute the `gate_on_exit_kind`
 /// argument: a watchpoint-only trigger sets
 /// the gate because the watchpoint catches every write (including the
@@ -613,13 +613,27 @@ pub(super) fn write_to_tagged_path(
 // site, the on-demand sites at three sites) which destructures and
 // drops the box right away. Stack-passing the unboxed
 // FailureDumpReport reuses the closure's already-allocated frame.
+// Macro for the 5 Capture-mode call sites' defensive
+// `FreezeOutcome::KernelOp(_)` arms (dedups 5 identical 3-line
+// blocks). The macro body is `unreachable!`
+// (returns `!`) so each match arm stays exhaustive without
+// extra return-type plumbing. Search for `capture_only_unreachable!`
+// to find all five sites.
+macro_rules! capture_only_unreachable {
+    () => {
+        unreachable!("FreezeMode::Capture dispatch cannot return KernelOp")
+    };
+}
+
 #[allow(clippy::large_enum_variant)]
-pub(super) enum LateCaptureOutcome {
+pub(super) enum FreezeOutcome {
     /// Successfully captured a full failure dump.
+    /// Produced ONLY by [`FreezeMode::Capture`] dispatch paths.
     Captured(crate::monitor::dump::FailureDumpReport, Instant),
     /// Aborted in a way that warrants surfacing a degraded JSON.
     /// Boxed to keep the enum's discriminant size bounded — the
     /// degraded report carries per-vCPU register data inline.
+    /// Produced ONLY by [`FreezeMode::Capture`] dispatch paths.
     Degraded(Box<crate::monitor::dump::DegradedFailureDumpReport>),
     /// Legit suppression: gate decided clean exit. The watchpoint
     /// hit is reset and the coordinator transitions to
@@ -630,7 +644,50 @@ pub(super) enum LateCaptureOutcome {
     /// tagged sibling path so the operator can read the early
     /// observation; see the late-trigger `Suppressed` arm in
     /// `run_bsp_loop` for the emit detail.
+    /// Produced ONLY by [`FreezeMode::Capture`] dispatch paths.
     Suppressed,
+    /// Cold-path kernel-memory operation reply.
+    /// Produced ONLY by [`FreezeMode::ColdOp`] dispatch paths.
+    /// The five Capture-mode call sites in this file each carry a
+    /// defensive `FreezeOutcome::KernelOp(_) => unreachable!(…)` arm
+    /// (search the file for `freeze_and_dispatch(FreezeMode::Capture`
+    /// to find them); the ColdOp call site at the pending-cold-op
+    /// drain cannot observe the Capture variants symmetrically.
+    KernelOp(crate::vmm::wire::KernelOpReplyPayload),
+}
+
+/// Dispatch mode for the freeze rendezvous closure
+/// (`freeze_and_dispatch`). The closure body branches on this enum
+/// post-park-ack to select between snapshot capture (`Capture`) and
+/// cold-path kernel-memory op dispatch (`ColdOp`).
+///
+/// # Variants
+///
+/// - [`FreezeMode::Capture`] runs the snapshot CAPTURE pipeline
+///   (`dump_state` + numa-stats + serialise + JSON file emit) and
+///   returns [`FreezeOutcome::Captured`] / [`FreezeOutcome::Degraded`]
+///   / [`FreezeOutcome::Suppressed`].
+/// - [`FreezeMode::ColdOp`] invokes
+///   [`crate::vmm::freeze_coord::kernel_op_dispatch::dispatch_kernel_op_batch`]
+///   against the borrowed request payload and returns
+///   [`FreezeOutcome::KernelOp`] wrapping the reply.
+///
+/// # Lifetime
+///
+/// The lifetime parameter `'a` binds the [`FreezeMode::ColdOp`]
+/// variant's `&'a KernelOpRequestPayload` borrow; the
+/// [`FreezeMode::Capture`] variant ignores it. Use elided syntax
+/// `FreezeMode<'_>` at function signatures unless the call site
+/// needs to name the lifetime.
+pub(super) enum FreezeMode<'a> {
+    /// Snapshot capture. `gate_on_exit_kind` is the existing
+    /// dual-snapshot gate: when true, the closure suppresses
+    /// non-late-trigger captures so the watchpoint hit is the
+    /// snapshot's only signal.
+    Capture { gate_on_exit_kind: bool },
+    /// Cold-path kernel-memory op dispatch. Borrows the request
+    /// payload from the coordinator's pending-cold-op Vec.
+    ColdOp(&'a crate::vmm::wire::KernelOpRequestPayload),
 }
 
 /// Owns the dual-snapshot early-trigger `FailureDumpReport` plus the
@@ -864,7 +921,7 @@ impl KtstrVm {
         // drain captured reports after the VM exits. The bridge's
         // capture callback returns `None` — the coordinator never
         // calls `bridge.capture()`; instead it runs
-        // `freeze_and_capture(false)` directly and stores the
+        // `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` directly and stores the
         // resulting report via `bridge.store(name, report)` so the
         // host owns the entire capture pipeline.
         let snapshot_bridge = {
@@ -1473,7 +1530,7 @@ impl KtstrVm {
         //
         // DMA quiescence: virtio-blk's independent worker thread
         // is paused before the vCPU SIGRTMIN kick (see
-        // `blk.lock().pause()` in freeze_and_capture below); the
+        // `blk.lock().pause()` in freeze_and_dispatch below); the
         // rendezvous waits for the worker's paused ack alongside
         // the vCPU parked acks. virtio-net (v0) and virtio-console
         // run synchronously on the vCPU thread, so they freeze
@@ -1688,7 +1745,7 @@ impl KtstrVm {
         let freeze_coord_ap_ies: Vec<Option<ImmediateExitHandle>> =
             ap_threads.iter().map(|vt| vt.immediate_exit).collect();
         // Per-AP `alive` flags paired with the IE handles above. The
-        // coordinator's pass-1 kick (in `freeze_and_capture`) and
+        // coordinator's pass-1 kick (in `freeze_and_dispatch`) and
         // `arm_user_watchpoint` gate each `ie.set` on a fresh
         // Acquire load of the corresponding entry, mirroring the
         // BSP-side `bsp_alive` TOCTOU-tightened gate. Without this,
@@ -1746,7 +1803,7 @@ impl KtstrVm {
         let freeze_coord_snapshot_bridge = snapshot_bridge.clone();
         // Stats-client clone for the periodic-capture path. The
         // periodic-fire branch issues a `stats(&[])` request BEFORE
-        // calling `freeze_and_capture(false)` so the JSON it returns
+        // calling `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` so the JSON it returns
         // reflects the running scheduler — once the freeze rendezvous
         // begins the scheduler's userspace thread is paused and the
         // request would either time out or wedge until thaw. The
@@ -1904,7 +1961,7 @@ impl KtstrVm {
         // entire `run_vm` lifetime; coord-thread joins via
         // `freeze_coord_handle.join()` at L8825 before vm drops.
         // Used by the kvm_clock save/restore path inside
-        // freeze_and_capture + thaw_and_barrier closures via
+        // freeze_and_dispatch + thaw_and_barrier closures via
         // [`kvm_get_clock_via_raw_fd`] +
         // [`kvm_set_clock_via_raw_fd`].
         let vm_fd_raw_for_coord: i32 = vm.vm_fd.as_raw_fd();
@@ -2737,7 +2794,7 @@ impl KtstrVm {
                 // Per-iteration accumulator for guest-side
                 // [`crate::vmm::wire::MSG_TYPE_SNAPSHOT_REQUEST`]
                 // frames the TOKEN_TX handler decoded. Drained later
-                // in the iteration body where `freeze_and_capture` /
+                // in the iteration body where `freeze_and_dispatch` /
                 // `thaw_and_barrier` / `arm_user_watchpoint` are in
                 // scope; the dispatch frames a
                 // `MSG_TYPE_SNAPSHOT_REPLY` TLV and pushes it back
@@ -2754,7 +2811,7 @@ impl KtstrVm {
                 // pushes them here; the coord-loop pending-request
                 // processing block (mirrors the
                 // `snapshot_requests_pending` drain shape) takes the
-                // vec, triggers `freeze_and_capture(false)`, runs
+                // vec, triggers `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })`, runs
                 // `gmem.write_obj` / `gmem.read_obj` per entry while
                 // all vCPUs are parked, and ships a
                 // [`crate::vmm::wire::KernelOpReplyPayload`] back to
@@ -2770,14 +2827,14 @@ impl KtstrVm {
                 // immediately. Servicing pre-adoption produces a
                 // partial-dump report (0 maps, vcpu_regs only — see
                 // the `// Partial dump:` branch in
-                // `freeze_and_capture`) which is useless to the test
+                // `freeze_and_dispatch`) which is useless to the test
                 // author who asked for `Op::capture_snapshot("...")`.
                 //
                 // The queue is drained at the accessor-adoption site
                 // by appending its contents back onto
                 // `snapshot_requests_pending`, so the same iteration's
                 // CAPTURE drain dispatches them through the normal
-                // `freeze_and_capture(false)` flow with the accessor
+                // `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` flow with the accessor
                 // present.
                 //
                 // If the accessor never adopts (worker permanently
@@ -2792,7 +2849,7 @@ impl KtstrVm {
                 // Periodic-capture state. `periodic_boundaries_ns`
                 // is the precomputed list of `Instant` deadlines
                 // (encoded as nanos-since-`run_start`) at which the
-                // run-loop fires `freeze_and_capture(false)`. Lazily
+                // run-loop fires `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })`. Lazily
                 // built on the first iteration AFTER BOTH:
                 //   1. `KtstrVm::num_snapshots > 0` (periodic capture
                 //      is requested), AND
@@ -2822,7 +2879,7 @@ impl KtstrVm {
                 let mut next_periodic_idx: u32 = 0;
                 // Consecutive parked-vCPU rendezvous failures during
                 // periodic capture. Reset to 0 on every successful
-                // `freeze_and_capture(..)`. After 2 consecutive
+                // `freeze_and_dispatch(..)`. After 2 consecutive
                 // timeouts the run-loop abandons the remaining
                 // periodic boundaries and logs once — repeated
                 // 30 s rendezvous waits on a wedged guest would
@@ -3103,7 +3160,7 @@ impl KtstrVm {
                         // No break on kill/bsp_done here — the
                         // iteration body must run so the
                         // late-trigger err_triggered check and
-                        // freeze_and_capture can fire. The while
+                        // freeze_and_dispatch can fire. The while
                         // condition + inner bsp_done check handle
                         // loop exit after the body completes.
                     }
@@ -3140,7 +3197,7 @@ impl KtstrVm {
                         // `snapshot_requests_pending` so the existing
                         // CAPTURE drain (further down this iteration
                         // body) dispatches them through the normal
-                        // `freeze_and_capture(false)` flow with the
+                        // `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` flow with the
                         // accessor present — no flow duplication.
                         if !capture_requests_deferred.is_empty() {
                             let n = capture_requests_deferred.len();
@@ -4013,7 +4070,7 @@ impl KtstrVm {
                     // thaw_and_barrier that there's nothing to
                     // restore.
                     //
-                    // RefCell because freeze_and_capture (writer)
+                    // RefCell because freeze_and_dispatch (writer)
                     // and thaw_and_barrier (reader+consumer) are
                     // sibling closures sharing the state. Both
                     // run on the coordinator thread; never
@@ -4027,16 +4084,27 @@ impl KtstrVm {
                     // vm.vm_fd — `vm` is moved into a downstream
                     // closure later in this scope, so a borrow of
                     // vm.vm_fd here would extend the borrow past
-                    // that move via the freeze_and_capture +
+                    // that move via the freeze_and_dispatch +
                     // thaw_and_barrier closures and the compiler
                     // rejects. The raw fd is closed when vm.vm_fd
-                    // drops at run_vm scope exit; freeze_and_capture
+                    // drops at run_vm scope exit; freeze_and_dispatch
                     // + thaw_and_barrier always run before that
                     // drop so the fd is live for every ioctl call.
                     let vm_fd_raw_for_freeze: i32 = vm_fd_raw_for_coord;
-                    let freeze_and_capture =
-                        |gate_on_exit_kind: bool|
-                            -> LateCaptureOutcome {
+                    let freeze_and_dispatch =
+                        |mode: FreezeMode<'_>|
+                            -> FreezeOutcome {
+                            // Destructure mode into the per-mode locals used
+                            // by the rest of the closure body. The Capture
+                            // arm's gate_on_exit_kind threads through the
+                            // existing snapshot pipeline unchanged; the
+                            // ColdOp branch fires at the V4 split (post
+                            // park-ack rendezvous) and returns
+                            // FreezeOutcome::KernelOp(reply) directly.
+                            let gate_on_exit_kind = match &mode {
+                                FreezeMode::Capture { gate_on_exit_kind } => *gate_on_exit_kind,
+                                FreezeMode::ColdOp(_) => false,
+                            };
                             let skip_freeze =
                                 freeze_coord_bsp_done.load(Ordering::Acquire);
                             // The kvm_clock GET capture is
@@ -4383,7 +4451,7 @@ impl KtstrVm {
                             freeze_coord_freeze.store(true, Ordering::Release);
                             // No force-clear of `parked` flags here.
                             // The post-thaw barrier at the END of
-                            // every prior freeze_and_capture cycle
+                            // every prior freeze_and_dispatch cycle
                             // (see `// Post-thaw barrier` below)
                             // is the primary guarantee that every
                             // vCPU has run its trailing
@@ -4693,7 +4761,7 @@ impl KtstrVm {
                                     // resume from this exact
                                     // value with no backward
                                     // jump (see the "deferred"
-                                    // comment at freeze_and_capture
+                                    // comment at freeze_and_dispatch
                                     // entry for the timing
                                     // rationale).
                                     // Skip the GET on the skip-freeze
@@ -4934,6 +5002,34 @@ impl KtstrVm {
                                 regs
                             };
                             if !all_parked {
+                                // V5 ColdOp early-bail: rendezvous-timeout
+                                // under ColdOp mode returns
+                                // FreezeOutcome::KernelOp(error_reply)
+                                // rather than Degraded — Capture-mode's
+                                // Degraded carries vcpu_regs +
+                                // DegradedFailureDumpReport which the
+                                // L6614 ColdOp caller cannot consume
+                                // (it expects KernelOp). Build a typed
+                                // error reply naming the rendezvous
+                                // failure so the wire reply correlates
+                                // back to the request via request_id.
+                                // Capture mode falls through to the
+                                // existing Degraded construction below.
+                                if let FreezeMode::ColdOp(req) = &mode {
+                                    let reply = crate::vmm::wire::KernelOpReplyPayload {
+                                        request_id: req.request_id,
+                                        success: false,
+                                        reason: format!(
+                                            "freeze-coord: rendezvous-timeout under ColdOp mode \
+                                             (parked_count={parked_count} expected_parks={expected_parks} \
+                                             killed={killed_during_rendezvous} \
+                                             elapsed_ms={})",
+                                            capture_start.elapsed().as_millis() as u64,
+                                        ),
+                                        read_values: Vec::new(),
+                                    };
+                                    break 'capture FreezeOutcome::KernelOp(reply);
+                                }
                                 // Re-check bsp_done AFTER the rendezvous
                                 // loop exits. The loop has a
                                 // `if freeze_coord_bsp_done.load(...) { break; }`
@@ -5067,10 +5163,44 @@ impl KtstrVm {
                                         exit_kind,
                                         elapsed_ms,
                                     };
-                                    break 'capture LateCaptureOutcome::Degraded(
+                                    break 'capture FreezeOutcome::Degraded(
                                         Box::new(degraded),
                                     );
                                 }
+                            }
+                            // V4 split: ColdOp dispatch fires here, after
+                            // the park-ack rendezvous + kvm_clock save +
+                            // V5 !all_parked Degraded handling, and BEFORE
+                            // the Capture-mode exit-kind gate + dump
+                            // pipeline below. Returns
+                            // FreezeOutcome::KernelOp(reply) directly so
+                            // the L6614 stub-replacement call site can
+                            // frame the wire reply without traversing the
+                            // dump path. Capture mode falls through.
+                            if let FreezeMode::ColdOp(req) = &mode {
+                                let reply = if let Some(owned) = owned_accessor {
+                                    kernel_op_dispatch::dispatch_kernel_op_batch(
+                                        owned.guest_kernel(),
+                                        req,
+                                    )
+                                } else {
+                                    // Caller at L6614 should gate on
+                                    // owned_accessor.is_some() before
+                                    // invoking; defensive error frame if
+                                    // it slipped through unset. No panic
+                                    // — the request_id round-trip lets
+                                    // the caller correlate the failure.
+                                    crate::vmm::wire::KernelOpReplyPayload {
+                                        request_id: req.request_id,
+                                        success: false,
+                                        reason:
+                                            "freeze-coord: owned_accessor not yet initialised; \
+                                             ColdOp dispatch dropped"
+                                                .to_string(),
+                                        read_values: Vec::new(),
+                                    }
+                                };
+                                break 'capture FreezeOutcome::KernelOp(reply);
                             }
                             // Exit-kind gate. The hardware watchpoint
                             // catches every write to
@@ -5294,7 +5424,7 @@ impl KtstrVm {
                                              (latch is historical authority)"
                                         );
                                     } else {
-                                        break 'capture LateCaptureOutcome::Suppressed;
+                                        break 'capture FreezeOutcome::Suppressed;
                                     }
                                 }
                             }
@@ -5601,7 +5731,7 @@ impl KtstrVm {
                                     report.per_node_numa = stats;
                                     report.per_node_numa_unavailable = None;
                                 }
-                                LateCaptureOutcome::Captured(report, capture_start)
+                                FreezeOutcome::Captured(report, capture_start)
                             } else {
                                 // Partial dump: vcpu_regs only.
                                 let report = crate::monitor::dump::FailureDumpReport {
@@ -5644,7 +5774,7 @@ impl KtstrVm {
                                     "freeze-coord: dump prerequisites unavailable; \
                                      emitting partial report with vcpu_regs only"
                                 );
-                                LateCaptureOutcome::Captured(report, capture_start)
+                                FreezeOutcome::Captured(report, capture_start)
                             }
                         } // end 'capture labeled block (the closure
                           // returns this block's value; the caller
@@ -5657,7 +5787,7 @@ impl KtstrVm {
                           // the closure).
                         };
                     // Unified thaw + post-thaw barrier. Called by
-                    // every site after `freeze_and_capture` returns
+                    // every site after `freeze_and_dispatch` returns
                     // (and after any while-frozen work the site
                     // needs). Replaces the per-site thaw block that
                     // previously diverged on which ordering rules
@@ -5818,7 +5948,7 @@ impl KtstrVm {
                     };
                     // Helper: extend the watchdog deadline by the
                     // wall-clock duration of a single
-                    // `freeze_and_capture(..)` cycle. Captures eat
+                    // `freeze_and_dispatch(..)` cycle. Captures eat
                     // host wall-clock that would otherwise count
                     // against the workload's `workload_duration`
                     // budget; without this push, a 5 s test that
@@ -6207,7 +6337,7 @@ impl KtstrVm {
                     // its `hit` flag for the next iteration instead
                     // of opening a second concurrent capture window.
                     //
-                    // CAPTURE runs `freeze_and_capture(false)` and
+                    // CAPTURE runs `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` and
                     // stores the report on the bridge under the
                     // tag, then frames a `MSG_TYPE_SNAPSHOT_REPLY`
                     // TLV (header + 72-byte payload) and pushes it
@@ -6293,14 +6423,14 @@ impl KtstrVm {
                                 // `extend_watchdog_for_freeze` for
                                 // the full rationale).
                                 let freeze_start = Instant::now();
-                                let on_demand = freeze_and_capture(false);
+                                let on_demand = freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false });
                                 thaw_and_barrier();
                                 extend_watchdog_for_freeze(freeze_start);
                                 let mut reply_status =
                                     crate::vmm::wire::SNAPSHOT_STATUS_OK;
                                 let mut reply_reason = String::new();
                                 match on_demand {
-                                    LateCaptureOutcome::Captured(report, capture_start) => {
+                                    FreezeOutcome::Captured(report, capture_start) => {
                                     let map_count = report.maps.len();
                                     let vcpu_regs_count =
                                         report.vcpu_regs.len();
@@ -6368,7 +6498,7 @@ impl KtstrVm {
                                     // accessor.
                                     freeze_coord_snapshot_bridge.store(&tag, report);
                                     }
-                                    LateCaptureOutcome::Degraded(degraded) => {
+                                    FreezeOutcome::Degraded(degraded) => {
                                         // Rendezvous timed out building
                                         // the on-demand capture. Write
                                         // the degraded JSON to the same
@@ -6420,7 +6550,7 @@ impl KtstrVm {
                                             "freeze-coord: on-demand capture degraded (rendezvous timeout)"
                                         );
                                     }
-                                    LateCaptureOutcome::Suppressed => {
+                                    FreezeOutcome::Suppressed => {
                                         // Unreachable in practice: the gate
                                         // only runs when gate_on_exit_kind=true
                                         // and the on-demand path always
@@ -6438,6 +6568,7 @@ impl KtstrVm {
                                             "freeze-coord: on-demand capture unexpectedly suppressed by gate"
                                         );
                                     }
+                                    FreezeOutcome::KernelOp(_) => capture_only_unreachable!(),
                                 }
                                 let reply = frame_snapshot_reply(
                                     request_id,
@@ -6611,49 +6742,86 @@ impl KtstrVm {
                     // finished modifying that same kernel state.
                     let pending_kernel_ops = std::mem::take(&mut kernel_op_requests_pending);
                     for req in pending_kernel_ops {
-                        // Bound the reason field at
-                        // KERNEL_OP_REASON_MAX so a hostile guest's
-                        // unbounded `req.tag` (truncated at decode
-                        // to KERNEL_OP_TAG_MAX but still up to 256
-                        // bytes) cannot inflate the reply past
-                        // KERNEL_OP_REPLY_MAX and trip the guest's
-                        // RX cap. Mirrors the SNAPSHOT_REASON_MAX
-                        // truncation pattern at snapshot.rs's
-                        // `frame_snapshot_reply` reason buffer.
-                        let mut reason = format!(
-                            "cold-path Op handler not yet implemented: \
-                             wire-up is in place but the freeze-rendezvous + \
-                             host-side gmem.write_obj/read_obj dispatch is a \
-                             planned follow-up. \
-                             Request was: tag={} mode={:?} direction={:?} entries={}",
-                            req.tag,
-                            req.mode,
-                            req.direction,
-                            req.entries.len(),
-                        );
-                        // String::truncate panics if the cut lands
-                        // inside a multi-byte UTF-8 sequence. The
-                        // formatted reason embeds `req.tag` which
-                        // is bounded but may contain multi-byte
-                        // codepoints — the cap could land mid-
-                        // codepoint and crash the coordinator
-                        // thread (host-side DoS via the wire
-                        // path). Walk down from KERNEL_OP_REASON_MAX
-                        // until is_char_boundary returns true; index
-                        // 0 is guaranteed-valid so the loop
-                        // terminates without panic.
-                        if reason.len() > crate::vmm::wire::KERNEL_OP_REASON_MAX {
-                            let mut idx = crate::vmm::wire::KERNEL_OP_REASON_MAX;
-                            while !reason.is_char_boundary(idx) {
-                                idx -= 1;
+                        // Per-iteration `on_demand_in_flight` gate
+                        // acquire (phd F3): ColdOp dispatch must NOT
+                        // race a concurrent CAPTURE / periodic /
+                        // user-watchpoint rendezvous. Same pattern as
+                        // the snapshot capture sites at the TLV
+                        // CAPTURE (L6363+drift) and periodic (L6946+
+                        // drift) call sites. If the gate is already
+                        // held, reply ERR rather than block — caller
+                        // can re-queue via the host TLV layer.
+                        if freeze_coord_on_demand_in_flight
+                            .swap(true, Ordering::AcqRel)
+                        {
+                            let reply = crate::vmm::wire::KernelOpReplyPayload {
+                                request_id: req.request_id,
+                                success: false,
+                                reason:
+                                    "freeze-coord: on_demand_in_flight gate held; ColdOp deferred; retry"
+                                        .to_string(),
+                                read_values: Vec::new(),
+                            };
+                            match frame_kernel_op_reply(&reply) {
+                                Ok(frame) => {
+                                    freeze_coord_virtio_con
+                                        .lock()
+                                        .queue_input_port1(&frame);
+                                    tracing::warn!(
+                                        request_id = req.request_id,
+                                        tag = %req.tag,
+                                        "freeze-coord: KernelOpRequest rejected \
+                                         (in-flight gate held)"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        request_id = req.request_id,
+                                        tag = %req.tag,
+                                        error = %e,
+                                        "freeze-coord: KernelOpReply postcard serialize failed \
+                                         (gate-held branch); guest will see transport timeout"
+                                    );
+                                }
                             }
-                            reason.truncate(idx);
+                            continue;
                         }
-                        let reply = crate::vmm::wire::KernelOpReplyPayload {
-                            request_id: req.request_id,
-                            success: false,
-                            reason,
-                            read_values: Vec::new(),
+                        // Gate acquired. Invoke the freeze rendezvous +
+                        // dispatcher; thaw after; clear gate AFTER
+                        // thaw per phd F3 + adversary F18 panic-safety
+                        // ordering. The closure body's V4 split returns
+                        // FreezeOutcome::KernelOp(reply) for ColdOp
+                        // mode; V5 !all_parked ColdOp arm builds an
+                        // error reply with rendezvous-timeout context.
+                        // Non-KernelOp outcomes are unreachable per the
+                        // closure body's structure but defensively
+                        // typed to surface a coordinator-side bug if
+                        // future closure surgery breaks the invariant.
+                        let outcome = freeze_and_dispatch(
+                            FreezeMode::ColdOp(&req),
+                        );
+                        thaw_and_barrier();
+                        freeze_coord_on_demand_in_flight
+                            .store(false, Ordering::Release);
+                        let reply = match outcome {
+                            FreezeOutcome::KernelOp(reply) => reply,
+                            FreezeOutcome::Captured(_, _)
+                            | FreezeOutcome::Degraded(_)
+                            | FreezeOutcome::Suppressed => {
+                                tracing::error!(
+                                    request_id = req.request_id,
+                                    tag = %req.tag,
+                                    "freeze-coord: invariant violated — FreezeMode::ColdOp dispatch returned non-KernelOp variant; framing synthetic error reply"
+                                );
+                                crate::vmm::wire::KernelOpReplyPayload {
+                                    request_id: req.request_id,
+                                    success: false,
+                                    reason:
+                                        "freeze-coord: ColdOp dispatch returned wrong FreezeOutcome variant (coordinator bug)"
+                                            .to_string(),
+                                    read_values: Vec::new(),
+                                }
+                            }
                         };
                         match frame_kernel_op_reply(&reply) {
                             Ok(frame) => {
@@ -6666,8 +6834,8 @@ impl KtstrVm {
                                     mode = ?req.mode,
                                     direction = ?req.direction,
                                     entries = req.entries.len(),
-                                    "freeze-coord: KernelOpRequest stub-replied \
-                                     (handler internals pending)"
+                                    success = reply.success,
+                                    "freeze-coord: KernelOpRequest dispatched + replied"
                                 );
                             }
                             Err(e) => {
@@ -6696,7 +6864,7 @@ impl KtstrVm {
                     // stamped — then on every iteration check
                     // whether `now` has crossed the next un-fired
                     // boundary, and fire a host-side
-                    // `freeze_and_capture(false)` for each crossed
+                    // `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` for each crossed
                     // boundary. Reuses the same gate
                     // (`freeze_coord_on_demand_in_flight`) the
                     // TLV CAPTURE / user-watchpoint paths use —
@@ -6871,11 +7039,11 @@ impl KtstrVm {
                                     .saturating_sub(anchor_in_flight_pause)
                                     / 1_000_000;
                                 let freeze_start = Instant::now();
-                                let on_demand = freeze_and_capture(false);
+                                let on_demand = freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false });
                                 thaw_and_barrier();
                                 extend_watchdog_for_freeze(freeze_start);
                                 match on_demand {
-                                    LateCaptureOutcome::Captured(report, capture_start) => {
+                                    FreezeOutcome::Captured(report, capture_start) => {
                                     let map_count = report.maps.len();
                                     let vcpu_regs_count = report.vcpu_regs.len();
                                     let tasks_enriched = report.task_enrichments.len();
@@ -6933,7 +7101,7 @@ impl KtstrVm {
                                     // boundaries.
                                     periodic_consecutive_timeouts = 0;
                                     }
-                                    LateCaptureOutcome::Degraded(degraded) => {
+                                    FreezeOutcome::Degraded(degraded) => {
                                         // Periodic rendezvous timed out.
                                         // Preserve the structured trigger
                                         // state by writing the degraded JSON
@@ -6988,7 +7156,7 @@ impl KtstrVm {
                                         periodic_consecutive_timeouts =
                                             periodic_consecutive_timeouts.saturating_add(1);
                                     }
-                                    LateCaptureOutcome::Suppressed => {
+                                    FreezeOutcome::Suppressed => {
                                         // Unreachable: gate only runs with
                                         // gate_on_exit_kind=true and the
                                         // periodic path always passes false.
@@ -7008,6 +7176,7 @@ impl KtstrVm {
                                             Some(sample_elapsed_ms_anchor),
                                         );
                                     }
+                                    FreezeOutcome::KernelOp(_) => capture_only_unreachable!(),
                                 }
                                 freeze_coord_on_demand_in_flight
                                     .store(false, Ordering::Release);
@@ -7123,10 +7292,10 @@ impl KtstrVm {
                         );
                         // User watchpoint has no while-frozen work,
                         // so thaw immediately.
-                        let on_demand = freeze_and_capture(false);
+                        let on_demand = freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false });
                         thaw_and_barrier();
                         match on_demand {
-                            LateCaptureOutcome::Captured(report, capture_start) => {
+                            FreezeOutcome::Captured(report, capture_start) => {
                             let map_count = report.maps.len();
                             // File mirror via `&report` (no clone),
                             // then move the report into the bridge.
@@ -7172,7 +7341,7 @@ impl KtstrVm {
                             );
                             freeze_coord_snapshot_bridge.store(&tag, report);
                             }
-                            LateCaptureOutcome::Degraded(degraded) => {
+                            FreezeOutcome::Degraded(degraded) => {
                                 // User-watchpoint rendezvous timeout.
                                 // Preserve the trigger state by writing
                                 // the degraded JSON to the tagged path
@@ -7219,7 +7388,7 @@ impl KtstrVm {
                                 };
                                 freeze_coord_snapshot_bridge.store(&tag, placeholder);
                             }
-                            LateCaptureOutcome::Suppressed => {
+                            FreezeOutcome::Suppressed => {
                                 // Unreachable: user-watchpoint passes
                                 // gate_on_exit_kind=false. Defensive:
                                 // publish a placeholder so the test
@@ -7236,6 +7405,7 @@ impl KtstrVm {
                                     );
                                 freeze_coord_snapshot_bridge.store(&tag, placeholder);
                             }
+                            FreezeOutcome::KernelOp(_) => capture_only_unreachable!(),
                         }
                         // Release the slot for future arm requests.
                         // `arm_user_watchpoint` finds a free slot by
@@ -7255,6 +7425,18 @@ impl KtstrVm {
                         // `Acquire` in `arm_user_watchpoint`'s free-slot
                         // search and the per-vCPU `self_arm_watchpoint`
                         // load.
+                        // F18 panic-safety reorder: gate clear MUST
+                        // precede per-slot cleanup. If `tag_guard.clear()`
+                        // or `lock_unpoisoned()` panics, the
+                        // `freeze_coord_on_demand_in_flight=true` state
+                        // would otherwise be stuck for the rest of the
+                        // run — every future TLV CAPTURE / periodic /
+                        // user-watchpoint / ColdOp dispatch would
+                        // reject on the gate-held check, permanently
+                        // deadlocking the coordinator. Comprehensive
+                        // RAII guard pattern in #66.
+                        freeze_coord_on_demand_in_flight
+                            .store(false, Ordering::Release);
                         {
                             let mut tag_guard = freeze_coord_watchpoint
                                 .user[slot_idx]
@@ -7265,8 +7447,6 @@ impl KtstrVm {
                         freeze_coord_watchpoint.user[slot_idx]
                             .request_kva
                             .store(0, Ordering::Release);
-                        freeze_coord_on_demand_in_flight
-                            .store(false, Ordering::Release);
                     }
                     // Once the late snapshot has been emitted, the
                     // coordinator's only remaining job is to keep
@@ -7372,13 +7552,13 @@ impl KtstrVm {
                             // arm; here we write a tagged degraded
                             // JSON so the early-half trigger evidence
                             // survives to disk.
-                            match freeze_and_capture(false) {
-                                LateCaptureOutcome::Captured(report, _capture_start) => {
+                            match freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false }) {
+                                FreezeOutcome::Captured(report, _capture_start) => {
                                     early_max_age_jiffies = max_age;
                                     early_threshold_jiffies = half_threshold_jiffies;
                                     early_guard.snapshot = Some(report);
                                 }
-                                LateCaptureOutcome::Degraded(degraded) => {
+                                FreezeOutcome::Degraded(degraded) => {
                                     // Stash the degraded reason so the
                                     // late-arm's early_skipped_reason
                                     // calculator can surface it via the
@@ -7417,17 +7597,17 @@ impl KtstrVm {
                                         "freeze-coord: early-snapshot degraded (rendezvous timeout); late path will retry"
                                     );
                                 }
-                                LateCaptureOutcome::Suppressed => {
+                                FreezeOutcome::Suppressed => {
                                     // Symmetric with the other three
-                                    // `LateCaptureOutcome::Suppressed`
+                                    // `FreezeOutcome::Suppressed`
                                     // arms in this file (TLV CAPTURE
                                     // / periodic / user-watchpoint
                                     // dispatch sites — grep
-                                    // `LateCaptureOutcome::Suppressed`
+                                    // `FreezeOutcome::Suppressed`
                                     // to find them), which all log +
                                     // continue rather than panic.
                                     // Suppressed is only producible by
-                                    // `freeze_and_capture(true)` (the
+                                    // `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: true })` (the
                                     // exit_kind gate path); the early
                                     // path passes false so this arm is
                                     // unreachable under the current
@@ -7444,9 +7624,10 @@ impl KtstrVm {
                                     // so a monitoring rule catches all
                                     // four uniformly.
                                     tracing::warn!(
-                                        "freeze-coord: invariant violated — early-snapshot freeze_and_capture(false) returned Suppressed (expected only when gate_on_exit_kind=true). Continuing without early snapshot."
+                                        "freeze-coord: invariant violated — early-snapshot freeze_and_dispatch(FreezeMode::Capture {{ gate_on_exit_kind: false }}) returned Suppressed (expected only when gate_on_exit_kind=true). Continuing without early snapshot."
                                     );
                                 }
+                                FreezeOutcome::KernelOp(_) => capture_only_unreachable!(),
                             }
                             thaw_and_barrier();
                             freeze_state = FreezeState::TookEarly;
@@ -7515,7 +7696,9 @@ impl KtstrVm {
                                 watchpoint_hit, bss_state,
                             );
                         let late_capture =
-                            freeze_and_capture(watchpoint_only_trigger);
+                            freeze_and_dispatch(FreezeMode::Capture {
+                                gate_on_exit_kind: watchpoint_only_trigger,
+                            });
                         // Late-trigger backstop: while guest memory
                         // is still quiesced (vCPUs parked, virtio-blk
                         // worker paused, freeze flag still set), do a
@@ -7551,7 +7734,7 @@ impl KtstrVm {
                         if freeze_coord_dual_snapshot
                             && early_guard.snapshot.is_none()
                             && half_threshold_jiffies > 0
-                            && let LateCaptureOutcome::Captured(ref late, _) = late_capture
+                            && let FreezeOutcome::Captured(ref late, _) = late_capture
                             && let Some(ref ctx) = scan_ctx
                             && let Some(ref mem) = freeze_coord_mem
                         {
@@ -7603,7 +7786,7 @@ impl KtstrVm {
                             {
                                 // Early-trigger DID fire (max_age
                                 // crossed the half threshold) but
-                                // freeze_and_capture(false) returned
+                                // freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false }) returned
                                 // Degraded. The early dump landed on
                                 // disk at the
                                 // SNAPSHOT_TAG_EARLY_DEGRADED sibling
@@ -7655,7 +7838,7 @@ impl KtstrVm {
                         // is safe because every site that depends
                         // on quiesced state has completed.
                         thaw_and_barrier();
-                        // Branch on three outcomes of `freeze_and_capture`:
+                        // Branch on three outcomes of `freeze_and_dispatch`:
                         //   Captured(report, _) → emit the full dump,
                         //                         mark Done, kick kill
                         //                         so the run tears down
@@ -7693,7 +7876,7 @@ impl KtstrVm {
                         //                         Captured/Degraded
                         //                         upstream).
                         match late_capture {
-                            LateCaptureOutcome::Captured(late, capture_start) => {
+                            FreezeOutcome::Captured(late, capture_start) => {
                                 // capture_start anchors the freeze→emit
                                 // timing summary; emit_json reads
                                 // Instant::now() - capture_start at log
@@ -7840,7 +8023,7 @@ impl KtstrVm {
                                 // to be"; no recovery is meaningful.
                                 let _ = freeze_coord_kill_evt.write(1);
                             }
-                            LateCaptureOutcome::Degraded(degraded) => {
+                            FreezeOutcome::Degraded(degraded) => {
                                 // Rendezvous timeout: emit the
                                 // pre-built degraded JSON via the same
                                 // atomic-publish helper used for full
@@ -7877,7 +8060,7 @@ impl KtstrVm {
                                 // `write_to_tagged_path` helper (atomic
                                 // publish + parent-dir fsync + stderr
                                 // fallback) — same as the
-                                // `LateCaptureOutcome::Degraded` arm of
+                                // `FreezeOutcome::Degraded` arm of
                                 // the early-snapshot dispatch above.
                                 // The tag and signal differ: early-
                                 // Degraded means the early itself was
@@ -7999,7 +8182,7 @@ impl KtstrVm {
                                 // recovery is meaningful.
                                 let _ = freeze_coord_kill_evt.write(1);
                             }
-                            LateCaptureOutcome::Suppressed => {
+                            FreezeOutcome::Suppressed => {
                                 // Gate cross-reference decided no dump
                                 // is warranted: the live
                                 // `*scx_root->exit_kind` read is below
@@ -8014,7 +8197,7 @@ impl KtstrVm {
                                 // override on potentially-recycled
                                 // vmalloc bytes — see the `bss_state =
                                 // bss_read_state(...)` block inside
-                                // `freeze_and_capture` above for the
+                                // `freeze_and_dispatch` above for the
                                 // gate decision). Either way the
                                 // scheduler shut down cleanly; no late
                                 // failure dump is warranted. Reset the
@@ -8029,9 +8212,9 @@ impl KtstrVm {
                                 // hand (runnable_at exceeded half-
                                 // threshold during the stall, the
                                 // early-trigger
-                                // `freeze_and_capture(false)` returned
+                                // `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` returned
                                 // Captured — see the
-                                // `LateCaptureOutcome::Captured` arm
+                                // `FreezeOutcome::Captured` arm
                                 // of the early-snapshot dispatch
                                 // above). The late gate-Suppressed
                                 // decision does NOT invalidate the
@@ -8121,6 +8304,7 @@ impl KtstrVm {
                                     .store(false, Ordering::Release);
                                 freeze_state = FreezeState::Done;
                             }
+                            FreezeOutcome::KernelOp(_) => capture_only_unreachable!(),
                         }
                         continue;
                     }
@@ -8265,7 +8449,7 @@ impl KtstrVm {
                     );
                 }
                 // Drain any held early_snapshot at coord exit. The
-                // late-trigger arms (the three `LateCaptureOutcome`
+                // late-trigger arms (the three `FreezeOutcome`
                 // match arms inside the `if err_triggered &&
                 // (freeze_state == Idle || freeze_state ==
                 // TookEarly)` block above) each take() the early when
@@ -8275,7 +8459,7 @@ impl KtstrVm {
                 // when the coord exits. A Captured early IS a real
                 // failure-dump observation worth surfacing.
                 //
-                // Symmetric with the `LateCaptureOutcome::Suppressed`
+                // Symmetric with the `FreezeOutcome::Suppressed`
                 // late-trigger arm above in WRITE PATTERN ONLY (both
                 // route through the shared `write_to_tagged_path`
                 // helper for atomic publish + parent-dir fsync +
@@ -8805,7 +8989,7 @@ impl KtstrVm {
         // Join the freeze coordinator BEFORE `bsp` falls out of scope at
         // the end of this function. The coordinator's captured BSP
         // `ImmediateExitHandle` addresses bsp's kvm_run mmap; reachable
-        // from multiple paths inside `freeze_and_capture` (TLV-driven
+        // from multiple paths inside `freeze_and_dispatch` (TLV-driven
         // CAPTURE, user watchpoint, late-trigger, even after `bsp_done`
         // flips). Without this join, any of those paths can write
         // through a freed kvm_run mapping after bsp drops — a
@@ -11666,7 +11850,7 @@ mod write_to_tagged_path_tests {
 #[cfg(test)]
 mod kvm_clock_save_semantics_tests {
     //! Codifies the take()-once + flags=0-on-restore invariant for
-    //! the kvm_clock save/restore bridge between freeze_and_capture
+    //! the kvm_clock save/restore bridge between freeze_and_dispatch
     //! (writer) and thaw_and_barrier (reader). The contract: a
     //! freeze captures a kvm_clock_data into the shared RefCell at
     //! freeze entry; the matching thaw take()s the value, zeros

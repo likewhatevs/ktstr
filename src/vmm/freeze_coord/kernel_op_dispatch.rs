@@ -59,20 +59,140 @@
 //! Hot-path RMW (when implemented as a sibling op type) cannot reuse
 //! this pattern; it must use `core::sync::atomic::AtomicU32::from_ptr`
 //! and a `compare_exchange` loop against the live guest writer.
-
-// Functions are wired in by a follow-up edit that branches the
-// freeze_and_capture closure on a new FreezeMode parameter (see
-// the synthesis memo at memory/cold_path_implementation_synthesis.md
-// for the structural plan). Until that branch lands, the helpers
-// live here so the closure surgery can be a pure call-site change
-// without doubling the diff size with the dispatch body.
-#![allow(dead_code)]
+//!
+//! # Same-rendezvous-epoch invariant
+//!
+//! For `OrU32` to be race-free, the read and the write MUST occur
+//! inside the SAME freeze rendezvous epoch — i.e. within a single
+//! invocation of [`dispatch_one_write`], between the `Release` store
+//! on `freeze_coord_freeze` (rendezvous entry) and its matching clear
+//! (rendezvous exit). Splitting the read + OR + write across freeze
+//! boundaries would let the next guest writer interleave between our
+//! load and our store, producing torn state silent to the dispatcher
+//! and detectable only by KASAN or scheduler-state inconsistency
+//! dumps. The structural guarantee is the dispatcher's per-entry
+//! sequential walk: `dispatch_one_write` runs the read + OR + write
+//! triple in one function body, never yielding between them. A
+//! future refactor that extracts the RMW into a helper invoked
+//! across multiple rendezvous would silently break this invariant —
+//! the `// rmw-invariant-anchor` markers at the OrU32 arms and the
+//! [`tests::or_u32_rmw_anchors_inside_dispatch_one_write`] doc-grep
+//! regression test together enforce the pattern at the source level.
 
 use crate::monitor::guest::GuestKernel;
 use crate::vmm::wire::{
     KERNEL_OP_REASON_MAX, KernelOpDirection, KernelOpEntry, KernelOpReplyPayload,
     KernelOpRequestPayload, KernelOpTarget, KernelOpValue,
 };
+
+/// Lower bound for any KVA accepted as a [`KernelOpTarget::Kva`]
+/// target (page-walked, `read_kva_*`/`write_kva_*`).
+///
+/// `0xFF00_0000_0000_0000` is the conservative 5-level x86_64
+/// kernel-half boundary (top 8 bits set; sign-extension from bit 56
+/// per `__VIRTUAL_MASK_SHIFT` in `arch/x86/include/asm/page_64_types.h`
+/// when `CONFIG_X86_5LEVEL=y`). It accepts every legitimate 4-level
+/// kernel-half KVA (≥ `0xFFFF_8000_0000_0000`) AND every 5-level
+/// kernel-half KVA (≥ `0xFF00_0000_0000_0000`). The Kva path can
+/// safely use a loose threshold here because the downstream
+/// `read_kva_*`/`write_kva_*` page-walk returns `Option::None` on
+/// unmapped or non-canonical addresses (page-walk safety net).
+///
+/// INTENTIONALLY DIFFERS from
+/// [`crate::vmm::x86_64::msr_kaslr::KERNEL_HALF_THRESHOLD`] +
+/// [`crate::vmm::freeze_coord::dispatch`]'s constant of the same
+/// name (value `0xFFFF_8000_0000_0000`). Those check the LSTAR MSR's
+/// canonical-bits invariant on 4-level x86_64 — a strict per-hw
+/// invariant on a known register. This dispatcher accepts arbitrary
+/// caller-supplied KVAs and must use the looser 5-level superset so
+/// 5-level kernel direct-map/vmalloc/vmemmap addresses are not
+/// false-rejected. See `#68` for a rename cleanup that disambiguates
+/// the two.
+///
+/// [`KernelOpTarget::Direct`] does NOT use this threshold — it uses
+/// runtime `page_offset + dram_size` range validation via
+/// [`validate_direct_target`], because `kva_to_pa` (the Direct
+/// path's PA derivation) does `kva.wrapping_sub(page_offset)` with
+/// no safety net — a wrap to an in-bounds-but-wrong PA would silently
+/// no-op at `write_scalar`/`read_scalar`.
+const KERNEL_HALF_THRESHOLD: u64 = 0xFF00_0000_0000_0000;
+
+/// Validate that a [`KernelOpTarget::Direct`] target's KVA range is
+/// inside the direct-map region `[page_offset, page_offset + dram_size)`.
+///
+/// Direct targets compute their PA via
+/// `kva_to_pa = kva.wrapping_sub(page_offset)` (no page-walk, no
+/// Option-failure). A KVA below `page_offset` underflows and wraps
+/// to a huge PA that the downstream `write_scalar`/`read_scalar`
+/// silently no-ops on (per `src/monitor/reader.rs:639-687`). A KVA
+/// past `page_offset + dram_size` similarly wraps the bounds check.
+/// Either case is a silent-data-loss path the [`KERNEL_HALF_THRESHOLD`]
+/// alone cannot catch.
+///
+/// Caller derives `len` from the value width (U32=4, U64=8,
+/// Bytes=`bytes.len()`, OrU32=4). `page_offset` from
+/// [`GuestKernel::page_offset`]; `dram_size` from
+/// [`GuestKernel::mem`]`.size()`.
+fn validate_direct_target(
+    kva: u64,
+    len: u64,
+    page_offset: u64,
+    dram_size: u64,
+) -> Result<(), String> {
+    if kva < page_offset {
+        return Err(format!(
+            "Direct kva={kva:#x} below page_offset={page_offset:#x} \
+             (kva_to_pa would wrap; use Kva target for vmalloc/vmemmap)"
+        ));
+    }
+    let direct_map_end = page_offset.checked_add(dram_size).ok_or_else(|| {
+        format!(
+            "internal: page_offset+dram_size overflow ({page_offset:#x} + {dram_size:#x})"
+        )
+    })?;
+    let kva_end = kva.checked_add(len).ok_or_else(|| {
+        format!("Direct kva+len overflow ({kva:#x} + {len:#x})")
+    })?;
+    if kva_end > direct_map_end {
+        return Err(format!(
+            "Direct kva={kva:#x} len={len} overruns direct-map end {direct_map_end:#x}"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate that a [`KernelOpTarget::Kva`] target's KVA range is in
+/// the kernel-half address space.
+///
+/// The page-walk safety net (`read_kva_*`/`write_kva_*` return
+/// `Option::None` on unmapped or non-canonical addresses) catches
+/// most invalid KVAs downstream — this helper just rejects the
+/// obvious user-half case early so the operator-visible error names
+/// the right band ("below kernel-half threshold") rather than
+/// "page unmapped".
+fn validate_kva_target(kva: u64, len: u64) -> Result<(), String> {
+    if kva < KERNEL_HALF_THRESHOLD {
+        return Err(user_half_kva_rejection_reason(kva));
+    }
+    let _ = kva.checked_add(len).ok_or_else(|| {
+        format!("Kva kva+len overflow ({kva:#x} + {len:#x})")
+    })?;
+    Ok(())
+}
+
+/// Build the typed-error reason for [`validate_kva_target`]'s
+/// user-half rejection. Extracted as a standalone `pub(super) fn`
+/// for the same reason as [`percpufield_v1_deferred_reason`] /
+/// [`oru32_read_rejection_reason`]: the tests that pin the format
+/// invoke the SAME helper the dispatcher uses, avoiding the
+/// tautology where the test re-synthesises the expected string.
+pub(super) fn user_half_kva_rejection_reason(kva: u64) -> String {
+    format!(
+        "Kva={kva:#x} below kernel-half 5-level conservative threshold \
+         {KERNEL_HALF_THRESHOLD:#x}; use Symbol target or a KVA in the \
+         kernel address space"
+    )
+}
 
 /// Walk the request's batch and produce a reply.
 ///
@@ -135,8 +255,13 @@ fn dispatch_one_write(
     target: &KernelOpTarget,
     value: &KernelOpValue,
 ) -> Result<(), String> {
+    let page_offset = kernel.page_offset();
+    let dram_size = kernel.mem().size();
     match (target, value) {
-        // Symbol writes
+        // Symbol writes — kernel-half guaranteed by vmlinux linker
+        // convention (KernelSymbols::from_elf reads only the vmlinux
+        // .symtab; built-in sections + module_alloc both land in
+        // kernel-half by construction). No KVA validation needed.
         (KernelOpTarget::Symbol(name), KernelOpValue::U32(v)) => kernel
             .write_symbol_u32(name, *v)
             .map_err(|e| format!("write_symbol_u32('{name}'): {e:#}")),
@@ -147,6 +272,17 @@ fn dispatch_one_write(
             .write_symbol_bytes(name, b)
             .map_err(|e| format!("write_symbol_bytes('{name}'): {e:#}")),
         (KernelOpTarget::Symbol(name), KernelOpValue::OrU32(mask)) => {
+            // rmw-invariant-anchor: OrU32 RMW must run inside a
+            // single dispatch_one_write invocation; the caller
+            // (freeze_and_dispatch closure in mod.rs) holds the
+            // freeze rendezvous open for the duration. Extracting
+            // this triple into a helper invokable outside
+            // dispatch_one_write would lose the rendezvous-epoch
+            // coupling — the same-epoch invariant rests on the
+            // dispatcher's per-entry sequential walk, not on a
+            // local property of dispatch_one_write itself. See
+            // KernelValue::OrU32 doc + module doc above for the
+            // kernel-writer race model.
             let cur = kernel
                 .read_symbol_u32(name)
                 .map_err(|e| format!("read_symbol_u32('{name}') for OrU32: {e:#}"))?;
@@ -155,36 +291,60 @@ fn dispatch_one_write(
                 .map_err(|e| format!("write_symbol_u32('{name}') for OrU32: {e:#}"))
         }
 
-        // Direct-mapped writes (infallible at the GuestKernel layer)
+        // Direct-mapped writes — validate against runtime
+        // [page_offset, page_offset+dram_size) BEFORE invoking the
+        // underlying write (which uses kva.wrapping_sub(page_offset)
+        // with NO page-walk safety net; an out-of-range KVA wraps to
+        // a huge PA that write_scalar silently no-ops on per
+        // reader.rs:639-687).
         (KernelOpTarget::Direct(kva), KernelOpValue::U32(v)) => {
+            validate_direct_target(*kva, 4, page_offset, dram_size)?;
             kernel.write_direct_u32(*kva, *v);
             Ok(())
         }
         (KernelOpTarget::Direct(kva), KernelOpValue::U64(v)) => {
+            validate_direct_target(*kva, 8, page_offset, dram_size)?;
             kernel.write_direct_u64(*kva, *v);
             Ok(())
         }
         (KernelOpTarget::Direct(kva), KernelOpValue::Bytes(b)) => {
+            validate_direct_target(*kva, b.len() as u64, page_offset, dram_size)?;
             kernel.write_direct_bytes(*kva, b);
             Ok(())
         }
         (KernelOpTarget::Direct(kva), KernelOpValue::OrU32(mask)) => {
+            // rmw-invariant-anchor: see OrU32 module doc.
+            validate_direct_target(*kva, 4, page_offset, dram_size)?;
             let cur = kernel.read_direct_u32(*kva);
             kernel.write_direct_u32(*kva, cur | mask);
             Ok(())
         }
 
         // Vmalloc/vmap writes (page-table walked; Option on unmapped)
-        (KernelOpTarget::Kva(kva), KernelOpValue::U32(v)) => kernel
-            .write_kva_u32(*kva, *v)
-            .ok_or_else(|| format!("write_kva_u32({kva:#x}): page unmapped")),
-        (KernelOpTarget::Kva(kva), KernelOpValue::U64(v)) => kernel
-            .write_kva_u64(*kva, *v)
-            .ok_or_else(|| format!("write_kva_u64({kva:#x}): page unmapped")),
-        (KernelOpTarget::Kva(kva), KernelOpValue::Bytes(b)) => kernel
-            .write_kva_bytes_chunked(*kva, b)
-            .ok_or_else(|| format!("write_kva_bytes_chunked({kva:#x}): page unmapped or short")),
+        // — validate against KERNEL_HALF_THRESHOLD (loose 5-level
+        // conservative bound; page-walk catches non-canonical-hole
+        // + unmapped via Option::None safety net).
+        (KernelOpTarget::Kva(kva), KernelOpValue::U32(v)) => {
+            validate_kva_target(*kva, 4)?;
+            kernel
+                .write_kva_u32(*kva, *v)
+                .ok_or_else(|| format!("write_kva_u32({kva:#x}): page unmapped"))
+        }
+        (KernelOpTarget::Kva(kva), KernelOpValue::U64(v)) => {
+            validate_kva_target(*kva, 8)?;
+            kernel
+                .write_kva_u64(*kva, *v)
+                .ok_or_else(|| format!("write_kva_u64({kva:#x}): page unmapped"))
+        }
+        (KernelOpTarget::Kva(kva), KernelOpValue::Bytes(b)) => {
+            validate_kva_target(*kva, b.len() as u64)?;
+            kernel
+                .write_kva_bytes_chunked(*kva, b)
+                .ok_or_else(|| format!("write_kva_bytes_chunked({kva:#x}): page unmapped or short"))
+        }
         (KernelOpTarget::Kva(kva), KernelOpValue::OrU32(mask)) => {
+            // rmw-invariant-anchor: see OrU32 module doc.
+            validate_kva_target(*kva, 4)?;
             let cur = kernel
                 .read_kva_u32(*kva)
                 .ok_or_else(|| format!("read_kva_u32({kva:#x}) for OrU32: page unmapped"))?;
@@ -193,7 +353,10 @@ fn dispatch_one_write(
                 .ok_or_else(|| format!("write_kva_u32({kva:#x}) for OrU32: page unmapped"))
         }
 
-        // Per-CPU field — deferred until the BTF resolution surface lands
+        // Per-CPU field — deferred until the BTF resolution surface lands.
+        // TODO(#62-followup): apply validate_direct_target /
+        // validate_kva_target (per resolved address class) when the
+        // BTF stub becomes a real implementation.
         (KernelOpTarget::PerCpuField { symbol, field, cpu }, _) => {
             Err(percpufield_v1_deferred_reason(symbol, field, *cpu))
         }
@@ -205,8 +368,11 @@ fn dispatch_one_read(
     target: &KernelOpTarget,
     width_hint: &KernelOpValue,
 ) -> Result<KernelOpValue, String> {
+    let page_offset = kernel.page_offset();
+    let dram_size = kernel.mem().size();
     match (target, width_hint) {
-        // Symbol reads
+        // Symbol reads — kernel-half guaranteed by vmlinux .symtab
+        // linker convention (see write-side note for full rationale).
         (KernelOpTarget::Symbol(name), KernelOpValue::U32(_)) => kernel
             .read_symbol_u32(name)
             .map(KernelOpValue::U32)
@@ -220,37 +386,57 @@ fn dispatch_one_read(
             .map(KernelOpValue::Bytes)
             .map_err(|e| format!("read_symbol_bytes('{name}', {}): {e:#}", placeholder.len())),
 
-        // Direct-mapped reads (infallible at the GuestKernel layer)
+        // Direct-mapped reads — validate against runtime
+        // [page_offset, page_offset+dram_size); read_direct_*
+        // shares the same wrapping-sub PA derivation as the write
+        // path and would silently return [0; N] on out-of-range.
         (KernelOpTarget::Direct(kva), KernelOpValue::U32(_)) => {
+            validate_direct_target(*kva, 4, page_offset, dram_size)?;
             Ok(KernelOpValue::U32(kernel.read_direct_u32(*kva)))
         }
         (KernelOpTarget::Direct(kva), KernelOpValue::U64(_)) => {
+            validate_direct_target(*kva, 8, page_offset, dram_size)?;
             Ok(KernelOpValue::U64(kernel.read_direct_u64(*kva)))
         }
-        (KernelOpTarget::Direct(kva), KernelOpValue::Bytes(placeholder)) => Ok(
-            KernelOpValue::Bytes(kernel.read_direct_bytes(*kva, placeholder.len())),
-        ),
+        (KernelOpTarget::Direct(kva), KernelOpValue::Bytes(placeholder)) => {
+            validate_direct_target(*kva, placeholder.len() as u64, page_offset, dram_size)?;
+            Ok(KernelOpValue::Bytes(
+                kernel.read_direct_bytes(*kva, placeholder.len()),
+            ))
+        }
 
-        // Vmalloc/vmap reads (page-table walked; Option on unmapped)
-        (KernelOpTarget::Kva(kva), KernelOpValue::U32(_)) => kernel
-            .read_kva_u32(*kva)
-            .map(KernelOpValue::U32)
-            .ok_or_else(|| format!("read_kva_u32({kva:#x}): page unmapped")),
-        (KernelOpTarget::Kva(kva), KernelOpValue::U64(_)) => kernel
-            .read_kva_u64(*kva)
-            .map(KernelOpValue::U64)
-            .ok_or_else(|| format!("read_kva_u64({kva:#x}): page unmapped")),
-        (KernelOpTarget::Kva(kva), KernelOpValue::Bytes(placeholder)) => kernel
-            .read_kva_bytes_chunked(*kva, placeholder.len())
-            .map(KernelOpValue::Bytes)
-            .ok_or_else(|| {
-                format!(
-                    "read_kva_bytes_chunked({kva:#x}, {}): page unmapped or short",
-                    placeholder.len()
-                )
-            }),
+        // Vmalloc/vmap reads — validate against KERNEL_HALF_THRESHOLD
+        // (page-walk safety net handles non-canonical-hole + unmapped).
+        (KernelOpTarget::Kva(kva), KernelOpValue::U32(_)) => {
+            validate_kva_target(*kva, 4)?;
+            kernel
+                .read_kva_u32(*kva)
+                .map(KernelOpValue::U32)
+                .ok_or_else(|| format!("read_kva_u32({kva:#x}): page unmapped"))
+        }
+        (KernelOpTarget::Kva(kva), KernelOpValue::U64(_)) => {
+            validate_kva_target(*kva, 8)?;
+            kernel
+                .read_kva_u64(*kva)
+                .map(KernelOpValue::U64)
+                .ok_or_else(|| format!("read_kva_u64({kva:#x}): page unmapped"))
+        }
+        (KernelOpTarget::Kva(kva), KernelOpValue::Bytes(placeholder)) => {
+            validate_kva_target(*kva, placeholder.len() as u64)?;
+            kernel
+                .read_kva_bytes_chunked(*kva, placeholder.len())
+                .map(KernelOpValue::Bytes)
+                .ok_or_else(|| {
+                    format!(
+                        "read_kva_bytes_chunked({kva:#x}, {}): page unmapped or short",
+                        placeholder.len()
+                    )
+                })
+        }
 
-        // Per-CPU field — same v1 deferral as the write side
+        // Per-CPU field — same v1 deferral as the write side.
+        // TODO(#62-followup): apply target-aware validation when
+        // BTF stub becomes a real implementation.
         (KernelOpTarget::PerCpuField { symbol, field, cpu }, _) => {
             Err(percpufield_v1_deferred_reason(symbol, field, *cpu))
         }
@@ -323,33 +509,6 @@ fn error_reply(request_id: u32, reason: String) -> KernelOpReplyPayload {
 mod tests {
     use super::*;
 
-    /// `error_reply` truncates an over-cap reason at a UTF-8
-    /// boundary. A naive `String::truncate` panics when the cap
-    /// lands mid-codepoint; this regression test pins the
-    /// is_char_boundary walk-back behaviour by constructing a
-    /// reason whose `KERNEL_OP_REASON_MAX`'th byte index lands
-    /// inside a multi-byte sequence.
-    #[test]
-    fn error_reply_truncates_at_utf8_boundary() {
-        // A 4-byte UTF-8 codepoint repeated enough times to pass
-        // `KERNEL_OP_REASON_MAX`. The cap may land at byte 1, 2,
-        // or 3 of a codepoint; in all three cases the walk-back
-        // must reach a boundary without panicking.
-        let cp = "🦀"; // U+1F980, 4 bytes UTF-8
-        let mut s = String::new();
-        while s.len() < KERNEL_OP_REASON_MAX + 8 {
-            s.push_str(cp);
-        }
-        let reply = error_reply(42, s);
-        assert!(!reply.success, "error reply success bit");
-        assert_eq!(reply.request_id, 42);
-        assert!(reply.reason.len() <= KERNEL_OP_REASON_MAX);
-        assert!(reply.reason.is_char_boundary(reply.reason.len()));
-        // The reason must still be valid UTF-8 (String::truncate
-        // upholds this when the cut lands on a boundary).
-        let _ = reply.reason.as_str();
-    }
-
     /// Under-cap reasons pass through unchanged.
     #[test]
     fn error_reply_passes_short_reason_unchanged() {
@@ -397,6 +556,16 @@ mod tests {
     /// invokes the SAME helper the production dispatcher calls,
     /// asserts the dispatcher's error_reply propagates the
     /// helper's output verbatim (with batch prefix).
+    ///
+    /// Tester T2 (PerCpuField precedence negative pin): also pins
+    /// that the deferred reason does NOT contain validate-KVA
+    /// rejection substrings. A future refactor that wires
+    /// validate_kva_target into the PerCpuField arm (e.g. when the
+    /// BTF stub is replaced) MUST keep the deferred-error
+    /// precedence: PerCpuField has no KVA yet at the dispatch
+    /// boundary, so synthesizing a user-half rejection on it
+    /// produces garbage. Negative-substring pin catches the
+    /// reorder regression.
     #[test]
     fn percpufield_target_v1_deferred_reason_format() {
         let helper_reason = percpufield_v1_deferred_reason("runqueues", "clock", 3);
@@ -404,13 +573,451 @@ mod tests {
         let reply = error_reply(1, batch_reason.clone());
         assert!(!reply.success);
         assert_eq!(reply.reason, batch_reason);
-        // Helper output names the resolution surface that lands in
-        // a follow-up and the (symbol, field, cpu) tuple the caller
-        // passed, so a regression to either wording or arg
-        // formatting trips here.
+        // Positive: helper output names the resolution surface +
+        // (symbol, field, cpu) tuple.
         assert!(helper_reason.contains("per-CPU field resolution"));
         assert!(helper_reason.contains("runqueues.clock"));
         assert!(helper_reason.contains("cpu=3"));
         assert!(helper_reason.contains("BTF struct-field offset surface"));
+        // Negative (tester T2): deferred reason MUST NOT contain
+        // validate-KVA rejection substrings — proves the deferred
+        // error wins over (a hypothetical future) KVA validation
+        // call on the PerCpuField arm.
+        assert!(
+            !helper_reason.contains("kernel-half"),
+            "PerCpuField deferred reason must not contain 'kernel-half' \
+             (validate_kva_target output); reorder regression"
+        );
+        assert!(
+            !helper_reason.contains("below kernel-half"),
+            "PerCpuField deferred reason must not contain 'below kernel-half'; \
+             reorder regression"
+        );
+        assert!(
+            !helper_reason.contains("5-level conservative"),
+            "PerCpuField deferred reason must not contain '5-level conservative' \
+             (validate_kva_target threshold cite); reorder regression"
+        );
+    }
+
+    /// 4-call-site product matrix via source-grep: each of the 4
+    /// dispatch arms — Direct/Write, Direct/Read, Kva/Write, Kva/Read
+    /// — MUST call validate_direct_target (Direct) or
+    /// validate_kva_target (Kva) BEFORE invoking the underlying
+    /// kernel.{read,write}_{direct,kva}_* function. A regression that
+    /// wires validate into 3/4 sites and drops one silently re-opens
+    /// the silent-data-loss class for the missing arm.
+    ///
+    /// Source-grep approach mirrors the marker-anchor test below:
+    /// pin the structural invariant at the source level without
+    /// requiring MockGuestKernel infrastructure (which doesn't exist
+    /// in-tree yet).
+    ///
+    /// Self-match exclusion: the searched arm shape appears in this
+    /// test's own docstring above + in error-message format strings
+    /// below. Restrict the search to source BEFORE `#[cfg(test)]`
+    /// (production code only) to avoid counting test-body matches.
+    #[test]
+    fn dispatch_arms_call_validate_target_helpers() {
+        let full_src = include_str!("kernel_op_dispatch.rs");
+        let test_mod_start = full_src
+            .find("#[cfg(test)]")
+            .expect("test module must exist");
+        let src = &full_src[..test_mod_start];
+        // Each Direct arm shape `KernelOpTarget::Direct(kva), KernelOpValue::*`
+        // MUST be followed within ~10 lines by `validate_direct_target(`.
+        // Each Kva arm shape `KernelOpTarget::Kva(kva), KernelOpValue::*`
+        // MUST be followed within ~10 lines by `validate_kva_target(`.
+        // Symbol arms are exempt (vmlinux .symtab kernel-half guarantee);
+        // PerCpuField arms are exempt (v1-deferred error wins).
+
+        // Count Direct arms.
+        let direct_arms: Vec<_> = src
+            .match_indices("KernelOpTarget::Direct(kva), KernelOpValue::")
+            .collect();
+        // Expect 7: 4 in dispatch_one_write (U32/U64/Bytes/OrU32) +
+        // 3 in dispatch_one_read (U32/U64/Bytes). OrU32 read is
+        // rejected via the catch-all and doesn't have a per-target arm.
+        assert_eq!(
+            direct_arms.len(),
+            7,
+            "expected exactly 7 Direct arms (4 write + 3 read); found {}",
+            direct_arms.len()
+        );
+        for (idx, _) in &direct_arms {
+            let window_end = (idx + 400).min(src.len());
+            let window = &src[*idx..window_end];
+            assert!(
+                window.contains("validate_direct_target("),
+                "Direct arm at byte offset {idx} is missing validate_direct_target() call; \
+                 window: {window:?}"
+            );
+        }
+
+        // Count Kva arms.
+        let kva_arms: Vec<_> = src
+            .match_indices("KernelOpTarget::Kva(kva), KernelOpValue::")
+            .collect();
+        assert_eq!(
+            kva_arms.len(),
+            7,
+            "expected exactly 7 Kva arms (4 write + 3 read); found {}",
+            kva_arms.len()
+        );
+        for (idx, _) in &kva_arms {
+            let window_end = (idx + 400).min(src.len());
+            let window = &src[*idx..window_end];
+            assert!(
+                window.contains("validate_kva_target("),
+                "Kva arm at byte offset {idx} is missing validate_kva_target() call; \
+                 window: {window:?}"
+            );
+        }
+    }
+
+    // ---- UTF-8 boundary tests ----
+
+    /// Table-driven UTF-8 boundary classes: 2-byte, 3-byte, 4-byte,
+    /// BOM. Each exercises the is_char_boundary walk-back loop with a
+    /// different multi-byte codepoint width.
+    /// Mixed-width + pure-ASCII + empty paths are distinct from this
+    /// table — they're separate tests below because their assertion
+    /// shape differs (mixed-width tests walk-back regardless of width;
+    /// pure-ASCII tests cap-exact length; empty tests passthrough).
+    #[test]
+    fn error_reply_truncates_at_utf8_boundary_classes() {
+        for (cp, label, padding) in [
+            // (codepoint, label for failure context, padding bytes
+            // past KERNEL_OP_REASON_MAX to ensure overflow)
+            ("é", "2byte_U+00E9", 4),     // U+00E9, 2 bytes (C3 A9)
+            ("☃", "3byte_U+2603", 6),     // U+2603, 3 bytes (E2 98 83)
+            ("🦀", "4byte_U+1F980", 8),   // U+1F980, 4 bytes
+            ("\u{FEFF}", "BOM_U+FEFF", 6), // U+FEFF, 3 bytes (EF BB BF)
+        ] {
+            let mut s = String::new();
+            while s.len() < KERNEL_OP_REASON_MAX + padding {
+                s.push_str(cp);
+            }
+            let reply = error_reply(42, s);
+            assert!(
+                reply.reason.len() <= KERNEL_OP_REASON_MAX,
+                "{label}: reason.len()={} > cap={KERNEL_OP_REASON_MAX}",
+                reply.reason.len()
+            );
+            assert!(
+                reply.reason.is_char_boundary(reply.reason.len()),
+                "{label}: truncation landed mid-codepoint"
+            );
+            let _ = reply.reason.as_str();
+        }
+    }
+
+    /// Mixed-width input: the cap position is data-dependent —
+    /// exercise the is_char_boundary walk-back under all four
+    /// widths (1B + 2B + 3B + 4B intermixed) in one pass.
+    #[test]
+    fn error_reply_truncates_mixed_width_input_at_boundary() {
+        let pattern = "Aé☃🦀";
+        let mut s = String::new();
+        while s.len() < KERNEL_OP_REASON_MAX + 10 {
+            s.push_str(pattern);
+        }
+        let reply = error_reply(99, s);
+        assert!(reply.reason.len() <= KERNEL_OP_REASON_MAX);
+        assert!(reply.reason.is_char_boundary(reply.reason.len()));
+        let _ = reply.reason.as_str();
+    }
+
+    /// Pure-ASCII over-cap input: cap lands on a clean boundary
+    /// (every byte is a codepoint boundary in ASCII). Tests the
+    /// degenerate "walk-back of 0 bytes" path that a regression in
+    /// the lower-bound condition could break.
+    #[test]
+    fn error_reply_truncates_pure_ascii_no_walkback() {
+        let s = "A".repeat(KERNEL_OP_REASON_MAX + 16);
+        let reply = error_reply(1, s);
+        assert_eq!(reply.reason.len(), KERNEL_OP_REASON_MAX);
+        assert!(reply.reason.is_char_boundary(reply.reason.len()));
+    }
+
+    /// Empty-string passthrough — error_reply must not crash on
+    /// `is_char_boundary(0)` of an empty string. Trivial today but
+    /// pins the gate's behavior so a refactor that swapped the
+    /// `>` for `>=` (forcing walk-back on empty) trips here.
+    #[test]
+    fn error_reply_zero_length_reason_passes() {
+        let reply = error_reply(2, String::new());
+        assert!(!reply.success);
+        assert_eq!(reply.reason, "");
+    }
+
+    // ---- KVA validation tests ----
+
+    /// T62.1 — boundary inclusive: KVA at exactly KERNEL_HALF_THRESHOLD
+    /// is accepted. Regression guard against off-by-one flipping
+    /// the `<` to `<=` (which would reject the canonical bound).
+    #[test]
+    fn validate_kva_target_accepts_exact_threshold() {
+        assert!(validate_kva_target(KERNEL_HALF_THRESHOLD, 4).is_ok());
+    }
+
+    /// T62.2 — boundary exclusive: KVA one below threshold rejects.
+    /// Pins the rejection-side off-by-one symmetric with T62.1.
+    #[test]
+    fn validate_kva_target_rejects_one_below_threshold() {
+        let kva = KERNEL_HALF_THRESHOLD - 1;
+        let err = validate_kva_target(kva, 4).expect_err("must reject");
+        assert!(
+            err.contains(&format!("{kva:#x}")),
+            "error must echo rejected KVA for operator triage; got {err}"
+        );
+    }
+
+    /// T62.3 — user-half edge (kva=0). Per CLAUDE.md "no silent drops",
+    /// 0 must fail loud rather than be treated as a sentinel.
+    #[test]
+    fn validate_kva_target_rejects_zero() {
+        let err = validate_kva_target(0, 4).expect_err("kva=0 must reject");
+        assert!(err.contains("0x0"));
+    }
+
+    /// T62.4 — user-half max (canonical 4-level user-half top).
+    /// Pins that a bit-63 only check is insufficient; the
+    /// threshold-based check catches this case.
+    #[test]
+    fn validate_kva_target_rejects_user_half_max() {
+        let kva = 0x0000_7FFF_FFFF_FFFF;
+        assert!(
+            validate_kva_target(kva, 4).is_err(),
+            "canonical user-half max must reject"
+        );
+    }
+
+    /// T62.5 — kernel-half typical KASLR-off + KASLR-on land.
+    /// Pins that real-world kernel KVAs don't false-reject.
+    #[test]
+    fn validate_kva_target_accepts_kernel_typical() {
+        // x86_64 _text on KASLR-off (4-level).
+        assert!(validate_kva_target(0xFFFF_FFFF_8100_0000, 4).is_ok());
+        // Typical vmalloc address (high canonical addr).
+        assert!(validate_kva_target(0xFFFF_C900_0000_0000, 4).is_ok());
+        // 5-level direct-map base sample (would fail under 4-level-strict).
+        assert!(validate_kva_target(0xFF11_0000_0000_0000, 4).is_ok());
+    }
+
+    /// T62 — user_half_kva_rejection_reason format pin via Path B
+    /// helper-extraction integration: the test invokes the SAME
+    /// helper the production dispatcher calls and pins error_reply's
+    /// propagation through the batch-prefix machinery. A regression
+    /// that drops the rejection, changes the format, or stops
+    /// calling the helper trips here. NOT a tautology — the test
+    /// does not synthesize its own copy of the format string.
+    #[test]
+    fn user_half_kva_rejection_reason_format_pin() {
+        let kva = 0x4000_0000_0000;
+        let helper_reason = user_half_kva_rejection_reason(kva);
+        let batch_reason = format!("entry[0]: {helper_reason}");
+        let reply = error_reply(11, batch_reason.clone());
+        assert!(!reply.success);
+        assert_eq!(reply.reason, batch_reason);
+        // Helper output names the rejected KVA + the threshold + the
+        // operator-actionable suggestion. A regression to the wrong
+        // bound or dropped rejection surfaces.
+        assert!(helper_reason.contains(&format!("{kva:#x}")));
+        assert!(helper_reason.contains(&format!("{KERNEL_HALF_THRESHOLD:#x}")));
+        assert!(helper_reason.contains("kernel-half"));
+        assert!(helper_reason.contains("5-level conservative"));
+        assert!(helper_reason.contains("Symbol target"));
+    }
+
+    /// T62 — validate_direct_target accepts an in-range KVA.
+    /// Page_offset is a typical 4-level KASLR-off direct-map base.
+    #[test]
+    fn validate_direct_target_accepts_in_range() {
+        let page_offset = 0xFFFF_8880_0000_0000u64;
+        let dram_size = 256 * 1024 * 1024; // 256 MB typical ktstr test VM
+        // First byte of direct map.
+        assert!(validate_direct_target(page_offset, 4, page_offset, dram_size).is_ok());
+        // Mid-range.
+        assert!(validate_direct_target(page_offset + 0x1000, 8, page_offset, dram_size).is_ok());
+        // Last U32 inside.
+        assert!(
+            validate_direct_target(page_offset + dram_size - 4, 4, page_offset, dram_size).is_ok()
+        );
+    }
+
+    /// T62 — validate_direct_target rejects a KVA below page_offset.
+    /// The user-half / canonical-hole class — kva_to_pa would
+    /// underflow and wrap.
+    #[test]
+    fn validate_direct_target_rejects_below_page_offset() {
+        let page_offset = 0xFFFF_8880_0000_0000u64;
+        let dram_size = 256 * 1024 * 1024;
+        let kva = page_offset - 1;
+        let err = validate_direct_target(kva, 4, page_offset, dram_size)
+            .expect_err("kva below page_offset must reject");
+        assert!(err.contains(&format!("{kva:#x}")));
+        assert!(err.contains(&format!("{page_offset:#x}")));
+        assert!(err.contains("would wrap"));
+    }
+
+    /// T62 — validate_direct_target rejects a KVA range past the
+    /// direct-map end. The "out the upper end" class.
+    #[test]
+    fn validate_direct_target_rejects_past_end() {
+        let page_offset = 0xFFFF_8880_0000_0000u64;
+        let dram_size = 256 * 1024 * 1024;
+        // One byte past the last valid KVA, 4-byte len.
+        let kva = page_offset + dram_size - 3;
+        let err = validate_direct_target(kva, 4, page_offset, dram_size)
+            .expect_err("kva+len past direct-map end must reject");
+        assert!(err.contains("overruns direct-map end"));
+    }
+
+    /// T62 — validate_direct_target rejects overflow on kva+len.
+    /// Pins the checked_add guard.
+    #[test]
+    fn validate_direct_target_rejects_kva_len_overflow() {
+        let page_offset = 0xFFFF_8880_0000_0000u64;
+        let dram_size = 256 * 1024 * 1024;
+        let kva = u64::MAX - 2;
+        let err = validate_direct_target(kva, 4, page_offset, dram_size)
+            .expect_err("kva+len overflow must reject");
+        assert!(err.contains("overflow"));
+    }
+
+    /// T62 — validate_kva_target rejects overflow on kva+len.
+    #[test]
+    fn validate_kva_target_rejects_kva_len_overflow() {
+        let kva = u64::MAX - 2;
+        let err = validate_kva_target(kva, 4).expect_err("kva+len overflow must reject");
+        assert!(err.contains("overflow"));
+    }
+
+    // ---- same-rendezvous-epoch marker-anchor test ----
+
+    /// T63.1 — Doc-grep / marker-anchor regression test. Every
+    /// OrU32 RMW site in the dispatcher MUST carry a
+    /// `// rmw-invariant-anchor` comment. The same-rendezvous-epoch
+    /// invariant is structural (per-entry sequential walk in
+    /// dispatch_one_write), not type-enforced. A future refactor
+    /// that extracts the RMW into a helper or relocates the
+    /// read+OR+write triple outside dispatch_one_write breaks the
+    /// invariant — this test guards against that by:
+    ///   1. Asserting every OrU32 RMW pattern in the source carries
+    ///      the marker.
+    ///   2. Asserting the count of markers matches the count of
+    ///      `KernelOpValue::OrU32` match arms in dispatch_one_write
+    ///      (currently 3: Symbol, Direct, Kva).
+    ///
+    /// A refactor that adds a new RMW site without the marker, or
+    /// moves an existing site outside dispatch_one_write, trips here.
+    #[test]
+    fn or_u32_rmw_anchors_inside_dispatch_one_write() {
+        let full_src = include_str!("kernel_op_dispatch.rs");
+        // Self-match exclusion (same approach as
+        // dispatch_arms_call_validate_target_helpers): the searched
+        // arm shape + `| mask)` pattern appear in this test's body.
+        // Restrict to production source (before `#[cfg(test)]`).
+        let test_mod_start = full_src
+            .find("#[cfg(test)]")
+            .expect("test module must exist");
+        let src = &full_src[..test_mod_start];
+        // Strict-count pin: exactly 3 production OrU32 arms.
+        // Match-arm-shape `KernelOpValue::OrU32(mask)) => {` is
+        // unique to the dispatch_one_write body. Catches a new 4th
+        // arm AND catches removal of an existing arm.
+        let arm_sites: Vec<_> = src
+            .match_indices("KernelOpValue::OrU32(mask)) => {")
+            .collect();
+        assert_eq!(
+            arm_sites.len(),
+            3,
+            "expected exactly 3 OrU32 write arms (Symbol/Direct/Kva); \
+             found {} — if a 4th was added, add the rmw-invariant-anchor \
+             comment to it AND update this expected count",
+            arm_sites.len()
+        );
+        // Per-arm pattern pin (see also the extracted-helper pin
+        // below): for every OrU32 match arm shape, the next ~400
+        // bytes MUST contain a `rmw-invariant-anchor` marker.
+        // Catches the refactor that adds a new OrU32 arm without
+        // the marker comment.
+        for (idx, _) in &arm_sites {
+            let window_end = (idx + 400).min(src.len());
+            let window = &src[*idx..window_end];
+            assert!(
+                window.contains("rmw-invariant-anchor"),
+                "OrU32 arm at byte offset {idx} is missing the \
+                 // rmw-invariant-anchor comment; window: {window:?}"
+            );
+        }
+        // Extracted-helper pin: a refactor that extracts the
+        // read+OR+write triple into a helper would LOSE the
+        // match-arm shape but the read+OR+write pattern would still
+        // exist somewhere. Search for that pattern via its signature
+        // `| mask` (the OR operation distinctive to OrU32 RMW) —
+        // every occurrence in the source MUST be inside
+        // `dispatch_one_write` (between the `fn dispatch_one_write`
+        // declaration and the next top-level `fn` after it).
+        //
+        // Find dispatch_one_write's body extent.
+        let dow_start = src
+            .find("fn dispatch_one_write(")
+            .expect("dispatch_one_write must exist");
+        // The body extends until the next top-level `fn` declaration
+        // at the same indentation level (search for "\nfn " after
+        // dow_start — module-private fns sit at column 0).
+        let dow_end = src[dow_start..]
+            .find("\nfn ")
+            .map(|rel| dow_start + rel)
+            .unwrap_or(src.len());
+        // Count `| mask` occurrences globally vs inside dispatch_one_write.
+        // The 3 OrU32 RMW arms each have `cur | mask` (or `cur | *mask`)
+        // inside the write call.
+        let global_or_mask: Vec<_> = src.match_indices("| mask").collect();
+        let inside_dow: Vec<_> = global_or_mask
+            .iter()
+            .filter(|(idx, _)| *idx >= dow_start && *idx < dow_end)
+            .collect();
+        // Allow `| mask` matches in:
+        //  - the 3 OrU32 RMW arms (inside dispatch_one_write)
+        //  - the docstring/comment text describing the pattern (anywhere)
+        // Production OR-with-mask sites OUTSIDE dispatch_one_write are
+        // the refactor regression class — none should exist. Practical
+        // detection: assert that every `| mask` occurrence followed
+        // shortly by `)` (function-call close — the write call) is
+        // inside dispatch_one_write.
+        for (idx, _) in &global_or_mask {
+            // Look ahead 4 bytes for `)` — if present, this is a
+            // function-call argument (the production RMW write call).
+            // If absent (e.g. `| mask)` appears in a doc comment with
+            // surrounding prose), skip.
+            let lookahead_end = (idx + 6).min(src.len());
+            let lookahead = &src[*idx..lookahead_end];
+            if lookahead.contains("| mask)") {
+                assert!(
+                    *idx >= dow_start && *idx < dow_end,
+                    "Production `| mask)` OR-with-mask call at byte offset \
+                     {idx} is OUTSIDE dispatch_one_write \
+                     [start={dow_start}, end={dow_end}). \
+                     A refactor extracted the OrU32 RMW into a helper, \
+                     breaking the same-rendezvous-epoch invariant. \
+                     Move it back inside dispatch_one_write OR (if \
+                     intentional) update this test."
+                );
+            }
+        }
+        // Sanity: inside_dow should have exactly 3 entries (the 3 RMW
+        // arms each contribute one `| mask`). Doc-comment refs add
+        // more globally, but the inside-dow filter should be stable.
+        assert_eq!(
+            inside_dow.len(),
+            3,
+            "expected exactly 3 `| mask` production sites inside \
+             dispatch_one_write (one per Symbol/Direct/Kva OrU32 arm); \
+             found {}",
+            inside_dow.len()
+        );
     }
 }
