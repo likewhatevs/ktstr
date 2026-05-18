@@ -234,17 +234,13 @@ fn ctprof_capture_records_allocated_bytes_for_jemalloc_alloc_worker(
     // Pass — annotate the result with the observed allocation so
     // CI output surfaces the actual reading. Useful for
     // distinguishing slop variations across kernel versions
-    // without breaking the assertion contract.
-    let mut result = AssertResult::pass();
-    result.record_fail(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "ctprof_capture_records_allocated_bytes: tgid={worker_pid}, \
-             threads_in_tgid={}, allocated={allocated}, deallocated={deallocated}",
-            worker_threads.len(),
-        ),
-    ));
-    Ok(result)
+    // without breaking the assertion contract. `with_note` keeps
+    // the verdict at Pass; `record_fail` would flip it to Fail.
+    Ok(AssertResult::pass().with_note(format!(
+        "ctprof_capture_records_allocated_bytes: tgid={worker_pid}, \
+         threads_in_tgid={}, allocated={allocated}, deallocated={deallocated}",
+        worker_threads.len(),
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -328,17 +324,12 @@ fn ctprof_capture_completes_against_bare_guest(_ctx: &Ctx) -> Result<AssertResul
         }
     }
 
-    let mut result = AssertResult::pass();
-    result.record_fail(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "ctprof_capture_completes_against_bare_guest: \
-             kthreadd_threads={}, total_threads={}",
-            kthreadd_threads.len(),
-            snap.threads.len(),
-        ),
-    ));
-    Ok(result)
+    Ok(AssertResult::pass().with_note(format!(
+        "ctprof_capture_completes_against_bare_guest: \
+         kthreadd_threads={}, total_threads={}",
+        kthreadd_threads.len(),
+        snap.threads.len(),
+    )))
 }
 
 /// Helper that builds a small diagnostic of the observed tgids in
@@ -438,20 +429,15 @@ fn ctprof_capture_against_churn_worker_does_not_panic(ctx: &Ctx) -> Result<Asser
         ));
     }
 
-    let mut result = AssertResult::pass();
     let main_alloc: u64 = snap
         .threads
         .iter()
         .find(|t| t.tgid == worker_pid && t.tid == worker_pid)
         .map(|t| t.allocated_bytes.0)
         .unwrap_or(0);
-    result.record_fail(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "ctprof_capture_against_churn_worker: tgid={worker_pid}, \
-             total_threads={}, main_allocated_bytes={main_alloc}",
-            snap.threads.len(),
-        ),
-    ));
-    Ok(result)
+    Ok(AssertResult::pass().with_note(format!(
+        "ctprof_capture_against_churn_worker: tgid={worker_pid}, \
+         total_threads={}, main_allocated_bytes={main_alloc}",
+        snap.threads.len(),
+    )))
 }
