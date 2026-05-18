@@ -141,8 +141,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
 use crate::sync::MutexExt;
+use anyhow::{Context, Result};
 
 /// Top-level serialized artifact produced by `ktstr ctprof`.
 ///
@@ -2983,13 +2983,9 @@ fn capture_with(
                                 // partially-mutated state rather than
                                 // re-panicking out of `pool.install` and
                                 // collapsing the snapshot.
-                                let cached = probe_cache
-                                    .lock_unpoisoned()
-                                    .get(&key)
-                                    .cloned();
+                                let cached = probe_cache.lock_unpoisoned().get(&key).cloned();
                                 if let Some(cached_result) = cached {
-                                    let mut s =
-                                        summary_mutex.lock_unpoisoned();
+                                    let mut s = summary_mutex.lock_unpoisoned();
                                     s.tgids_walked += 1;
                                     match &cached_result.failed_tag {
                                         None => {
@@ -3063,14 +3059,11 @@ fn capture_with(
                                     // subsequent lookups; the duplicate work is
                                     // bounded by the rayon pool size.
                                     let outcome = attach_probe_for_tgid_at(proc_root, tgid);
-                                    let mut s =
-                                        summary_mutex.lock_unpoisoned();
+                                    let mut s = summary_mutex.lock_unpoisoned();
                                     let res = record_attach_outcome(tgid, outcome, &mut s);
                                     drop(s);
                                     let probe = res.probe.clone();
-                                    probe_cache
-                                        .lock_unpoisoned()
-                                        .insert(key, res);
+                                    probe_cache.lock_unpoisoned().insert(key, res);
                                     probe
                                 }
                             } else {

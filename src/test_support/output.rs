@@ -652,7 +652,10 @@ mod tests {
         let r = parse_assert_result_from_drain(Some(&drain)).unwrap();
         assert!(!r.passed);
         assert_eq!(
-            r.details.iter().map(|d| d.message.as_str()).collect::<Vec<_>>(),
+            r.details
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>(),
             vec!["stuck 3000ms"]
         );
     }

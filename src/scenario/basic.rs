@@ -144,7 +144,10 @@ mod tests {
             .iter()
             .filter(|o| matches!(o, Op::AddCgroup { .. }))
             .count();
-        let spawns = ops.iter().filter(|o| matches!(o, Op::SpawnWorkers { .. })).count();
+        let spawns = ops
+            .iter()
+            .filter(|o| matches!(o, Op::SpawnWorkers { .. }))
+            .count();
         assert_eq!(adds, 2, "two cgroups added");
         assert_eq!(spawns, 8, "4 policies × 2 cgroups = 8 spawns");
         for op in ops {

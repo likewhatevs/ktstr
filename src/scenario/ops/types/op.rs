@@ -485,11 +485,19 @@ pub enum Op {
     /// and anything the guest reads with proper barriers.
     ///
     /// **Batch shape.** `writes` carries 1+ pairs; the executor
-    /// will issue them in order. For a single write the
+    /// issues them in order. For a single write the
     /// [`Op::write_kernel_hot`](#method.write_kernel_hot) singleton
-    /// constructor wraps a 1-element vec. The executor handler
-    /// itself lands in a follow-up sub-batch; the dispatch stub
-    /// currently returns an explicit "not yet implemented" error.
+    /// constructor wraps a 1-element vec.
+    ///
+    /// **Dispatch.** The executor's arm dispatches via the
+    /// in-process `SnapshotBridge` callback when one is installed
+    /// (the test-fixture seam) and falls back to the
+    /// virtio-console port-1 wire path
+    /// (`MsgType::KernelOpRequest`) in-guest. The host-side
+    /// hot-path worker that consumes the wire request lands in a
+    /// dedicated follow-up sub-batch; until that worker exists the
+    /// in-guest wire fallback surfaces a transport timeout. The
+    /// bridge path works today for executor unit tests.
     WriteKernelHot {
         /// Ordered list of `(target, value)` pairs to write.
         writes: Vec<(KernelTarget, KernelValue)>,
@@ -508,10 +516,18 @@ pub enum Op {
     /// `Vec` precisely to make batched writes the natural shape.
     /// The executor's adjacent-op auto-merge (which would collapse
     /// N adjacent singleton cold-write ops into one rendezvous as
-    /// a safety net) is queued as a dedicated follow-up task; the
-    /// dispatch handler itself lands in the next sub-batch and the
-    /// stub currently returns an explicit "not yet implemented"
-    /// error.
+    /// a safety net) is queued as a dedicated follow-up task.
+    ///
+    /// **Dispatch.** The executor's arm dispatches via the
+    /// in-process `SnapshotBridge` callback when one is installed
+    /// (the test-fixture seam) and falls back to the
+    /// virtio-console port-1 wire path
+    /// (`MsgType::KernelOpRequest`) in-guest. The host-side
+    /// freeze-coord cold-path handler that consumes the wire
+    /// request lands in a dedicated follow-up sub-batch; until
+    /// that handler exists the in-guest wire fallback surfaces a
+    /// transport timeout. The bridge path works today for
+    /// executor unit tests.
     ///
     /// Use this for: multi-field atomic writes, all-CPUs-at-once
     /// seeding, one-shot setup that must complete before the guest
@@ -525,38 +541,68 @@ pub enum Op {
     },
     /// Live-vCPU read of a [`KernelTarget`] into the
     /// [`SnapshotBridge`](crate::scenario::snapshot::SnapshotBridge)
-    /// keyed by `tag`. Mirrors [`Op::WriteKernelHot`]: no freeze
-    /// rendezvous, host-side worker thread issues the read while
-    /// the guest keeps executing. The caller assumes the read may
-    /// race against guest writes; for read-write coherency pair the
-    /// op with a guest-side `smp_store_release` on the target.
+    /// drain log keyed by `tag`. Mirrors [`Op::WriteKernelHot`]:
+    /// no freeze rendezvous, host-side worker thread issues the
+    /// read while the guest keeps executing. The caller assumes
+    /// the read may race against guest writes; for read-write
+    /// coherency pair the op with a guest-side `smp_store_release`
+    /// on the target.
     ///
     /// Use this for: read-back of values previously written via
     /// [`Op::WriteKernelHot`], lightweight polling of single fields
     /// the test wants to observe without pausing the guest.
+    ///
+    /// **Width.** The `width` field picks which
+    /// [`crate::monitor::guest::GuestKernel`] `read_*` family the
+    /// host dispatcher invokes — `u32` / `u64` / `Bytes(len)`.
+    /// The reply lands as a [`crate::vmm::wire::KernelOpValue`] of
+    /// the matching shape in the bridge's drain log; a u32 field
+    /// must be read with `KernelValueWidth::u32()` (a u64 read of
+    /// a u32 field returns the field's bytes plus 4 adjacent
+    /// bytes).
+    ///
+    /// **Dispatch.** Same bridge-first / wire-fallback model as
+    /// [`Op::WriteKernelHot`]; the host-side hot-path worker that
+    /// consumes the wire request is queued as a follow-up
+    /// sub-batch.
     ReadKernelHot {
         /// Bridge-keyed tag under which the read result lands.
         tag: Cow<'static, str>,
         /// Address to read.
         target: KernelTarget,
+        /// Width specifier: picks the read family + the reply
+        /// value shape.
+        width: KernelValueWidth,
     },
     /// Auto-freezing read of a [`KernelTarget`] into the
     /// [`SnapshotBridge`](crate::scenario::snapshot::SnapshotBridge)
-    /// keyed by `tag`, taken while every vCPU is parked at the
-    /// freeze rendezvous. Reuses the same coordinator path that
-    /// [`Op::CaptureSnapshot`] triggers. Coherent with respect to
-    /// guest state — no concurrent guest write can race against the
-    /// read.
+    /// drain log keyed by `tag`, taken while every vCPU is parked
+    /// at the freeze rendezvous. Reuses the same coordinator path
+    /// that [`Op::CaptureSnapshot`] triggers. Coherent with
+    /// respect to guest state — no concurrent guest write can race
+    /// against the read.
     ///
     /// Use this for: ground-truth reads that must reflect a stable
     /// guest state, snapshot-style point-in-time reads paired with
     /// other [`Op::CaptureSnapshot`] / [`Op::WriteKernelCold`] ops
-    /// the executor auto-merges into the same rendezvous.
+    /// the executor's adjacent-op auto-merge collapses into the
+    /// same rendezvous.
+    ///
+    /// **Width.** Same `width` semantics as [`Op::ReadKernelHot`]:
+    /// pick the read family explicitly so the dispatcher invokes
+    /// the matching `GuestKernel::read_*` helper.
+    ///
+    /// **Dispatch.** Bridge-first / wire-fallback like the other
+    /// `*Kernel*` variants; the host-side freeze-coord cold-path
+    /// handler is queued as a follow-up sub-batch.
     ReadKernelCold {
         /// Bridge-keyed tag under which the read result lands.
         tag: Cow<'static, str>,
         /// Address to read.
         target: KernelTarget,
+        /// Width specifier: picks the read family + the reply
+        /// value shape.
+        width: KernelValueWidth,
     },
 }
 
@@ -661,9 +707,9 @@ impl CpusetSpec {
     }
 }
 
-/// Host-side write/read target for the upcoming kernel-memory ops
-/// (the `Op::WriteKernel*` / `Op::ReadKernel*` variants land in a
-/// follow-up sub-batch and consume this type).
+/// Host-side write/read target for the kernel-memory ops
+/// ([`Op::WriteKernelHot`] / [`Op::WriteKernelCold`] /
+/// [`Op::ReadKernelHot`] / [`Op::ReadKernelCold`]).
 ///
 /// Each variant names a kernel address by the resolution path the
 /// host coordinator will take when the op fires; the actual
@@ -815,5 +861,109 @@ impl KernelValue {
     /// Variable-length byte payload.
     pub fn bytes(data: impl Into<Vec<u8>>) -> Self {
         KernelValue::Bytes(data.into())
+    }
+}
+
+impl From<&KernelTarget> for crate::vmm::wire::KernelOpTarget {
+    /// 1:1 mapping of every Op-side [`KernelTarget`] variant to its
+    /// wire-side peer. `Cow → String` coercion for the symbolic
+    /// forms; copy for the integer/`u32` forms. Used by the
+    /// executor's `Op::WriteKernel*` / `Op::ReadKernel*` dispatch
+    /// arms when building [`crate::vmm::wire::KernelOpRequestPayload`].
+    fn from(target: &KernelTarget) -> Self {
+        match target {
+            KernelTarget::Symbol(name) => Self::Symbol(name.to_string()),
+            KernelTarget::Direct(kva) => Self::Direct(*kva),
+            KernelTarget::Kva(kva) => Self::Kva(*kva),
+            KernelTarget::PerCpuField { symbol, field, cpu } => Self::PerCpuField {
+                symbol: symbol.to_string(),
+                field: field.to_string(),
+                cpu: *cpu,
+            },
+        }
+    }
+}
+
+impl From<&KernelValue> for crate::vmm::wire::KernelOpValue {
+    /// 1:1 mapping of every Op-side [`KernelValue`] variant to its
+    /// wire-side peer. The `Bytes` arm clones the inner `Vec<u8>`
+    /// so the source variant remains usable after dispatch (large
+    /// payloads pay the clone cost — see
+    /// [`crate::vmm::wire::KernelOpValue::Bytes`] for the wire
+    /// representation).
+    fn from(value: &KernelValue) -> Self {
+        match value {
+            KernelValue::U32(v) => Self::U32(*v),
+            KernelValue::U64(v) => Self::U64(*v),
+            KernelValue::Bytes(b) => Self::Bytes(b.clone()),
+        }
+    }
+}
+
+/// Width specifier for the [`Op::ReadKernelHot`] /
+/// [`Op::ReadKernelCold`] ops — picks which
+/// [`crate::monitor::guest::GuestKernel`]
+/// `read_*_u32` / `read_*_u64` / `read_*_bytes` family the host
+/// dispatcher invokes for the read. Mirrors [`KernelValue`]'s
+/// variant tags but without payload data (reads do not carry an
+/// outgoing value — only a width hint that the dispatcher uses to
+/// size the resulting [`crate::vmm::wire::KernelOpValue`] in the
+/// reply).
+///
+/// # `#[non_exhaustive]`
+///
+/// `KernelValueWidth` is `#[non_exhaustive]` so new widths can be
+/// added without breaking external pattern-matchers. Prefer the
+/// per-variant constructors ([`Self::u32`], [`Self::u64`],
+/// [`Self::bytes`]) over naming variant literals.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KernelValueWidth {
+    /// Read a `u32` little-endian. Atomic when the resolved host
+    /// PA is 4-byte aligned (see [`KernelValue::U32`]'s alignment
+    /// note for the misaligned fall-through behaviour).
+    U32,
+    /// Read a `u64` little-endian. Atomic at 8-byte alignment;
+    /// otherwise a per-byte loop is used (same fall-through as
+    /// [`KernelValue::U64`]).
+    U64,
+    /// Read exactly `len` raw bytes. Non-atomic; reads through the
+    /// [`crate::monitor::guest::GuestKernel`] `read_*_bytes`
+    /// helpers' chunked-page primitive.
+    Bytes(usize),
+}
+
+impl KernelValueWidth {
+    /// `u32` read width.
+    pub const fn u32() -> Self {
+        KernelValueWidth::U32
+    }
+
+    /// `u64` read width.
+    pub const fn u64() -> Self {
+        KernelValueWidth::U64
+    }
+
+    /// `len`-byte read width. Produces a
+    /// [`crate::vmm::wire::KernelOpValue::Bytes`] of exactly `len`
+    /// bytes in the reply.
+    pub const fn bytes(len: usize) -> Self {
+        KernelValueWidth::Bytes(len)
+    }
+}
+
+impl From<&KernelValueWidth> for crate::vmm::wire::KernelOpValue {
+    /// Map a [`KernelValueWidth`] to a zero-filled
+    /// [`crate::vmm::wire::KernelOpValue`] of the requested width
+    /// for the read-entry's value-hint slot. The wire payload's
+    /// `value` discriminant tells the host dispatcher which read
+    /// family to invoke; the byte contents are written by the
+    /// host before replying.
+    fn from(width: &KernelValueWidth) -> Self {
+        match width {
+            KernelValueWidth::U32 => Self::U32(0),
+            KernelValueWidth::U64 => Self::U64(0),
+            KernelValueWidth::Bytes(len) => Self::Bytes(vec![0u8; *len]),
+        }
     }
 }

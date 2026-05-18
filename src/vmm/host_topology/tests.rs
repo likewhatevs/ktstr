@@ -1774,10 +1774,7 @@ impl Drop for AllowedCpusGuard {
 ///
 /// See [`expect_unavailable`] for tests that expect the
 /// `Unavailable` branch instead.
-fn unwrap_acquired(
-    outcome: LockOutcome,
-    ctx: Option<&str>,
-) -> (usize, Vec<std::os::fd::OwnedFd>) {
+fn unwrap_acquired(outcome: LockOutcome, ctx: Option<&str>) -> (usize, Vec<std::os::fd::OwnedFd>) {
     match outcome {
         LockOutcome::Acquired { llc_offset, locks } => (llc_offset, locks),
         LockOutcome::Unavailable(reason) => {

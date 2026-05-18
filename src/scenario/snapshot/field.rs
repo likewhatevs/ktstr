@@ -159,8 +159,6 @@ impl<'a> SnapshotField<'a> {
 // JSON dotted-path accessor (mirrors SnapshotField for stats values)
 // ---------------------------------------------------------------------------
 
-/// One value's view at the leaf of a dotted-path walk over a
-
 /// Walk a [`RenderedValue`] tree along a dotted path. Each
 /// component matches a [`RenderedMember::name`] inside a
 /// [`RenderedValue::Struct`]; [`RenderedValue::Ptr`] dereferences
@@ -318,4 +316,3 @@ fn render_to_i64(v: &RenderedValue) -> SnapshotResult<i64> {
         }),
     }
 }
-

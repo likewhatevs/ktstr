@@ -3129,8 +3129,7 @@ mod tests {
     /// `test_support::test_helpers`.
     fn capture_stdout<R>(f: impl FnOnce() -> R) -> (R, Vec<u8>) {
         use std::io::{Read, Seek, SeekFrom, Write};
-        let _lock = STDOUT_CAPTURE_LOCK
-            .lock_unpoisoned();
+        let _lock = STDOUT_CAPTURE_LOCK.lock_unpoisoned();
         let mut sink = tempfile::tempfile().expect("create stdout-capture tempfile");
         // Flush before redirect: println! is line-buffered behind
         // the Stdout lock; pre-call bytes need to reach the

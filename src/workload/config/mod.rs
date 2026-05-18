@@ -265,8 +265,8 @@ pub enum CloneMode {
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::WorkType;
     use super::super::AffinityIntent;
+    use super::super::types::WorkType;
     use super::*;
     use std::collections::BTreeSet;
     use std::time::Duration;
@@ -457,7 +457,9 @@ mod tests {
             .expect_err("empty Interleave nodemask on composed[0] must reject");
         let msg = err.to_string();
         assert!(
-            msg.contains("composed[0]") && msg.contains("group_idx 1") && msg.contains("Interleave"),
+            msg.contains("composed[0]")
+                && msg.contains("group_idx 1")
+                && msg.contains("Interleave"),
             "diagnostic must name composed[0] + group_idx 1 + Interleave: got {msg}",
         );
     }
@@ -494,8 +496,8 @@ mod tests {
         let invalid_interleave = WorkSpec::default()
             .work_type(WorkType::SpinWait)
             .mem_policy(MemPolicy::Interleave(BTreeSet::new()));
-        let cfg = WorkloadConfig::default()
-            .composed(vec![valid_spec, invalid_bind, invalid_interleave]);
+        let cfg =
+            WorkloadConfig::default().composed(vec![valid_spec, invalid_bind, invalid_interleave]);
         let err = cfg
             .validate()
             .expect_err("multi-composed with invalid entries must reject");

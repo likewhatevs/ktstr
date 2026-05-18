@@ -8,8 +8,8 @@
 use super::tests_helpers::stage_synthetic_proc;
 use super::*;
 use crate::metric_types::MonotonicCount;
-use std::path::Path;
 use crate::sync::MutexExt;
+use std::path::Path;
 
 // ------------------------------------------------------------
 // T28 — CtprofParseSummary: per-file read-failure tally
@@ -886,8 +886,7 @@ fn capture_with_rayon_worker_panic_is_caught_and_surfaced() {
     // is not clobbered. `Mutex<()>` is enough — the lock is
     // only held for the duration of the capture call.
     static PANIC_INJECT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = PANIC_INJECT_TEST_LOCK
-        .lock_unpoisoned();
+    let _guard = PANIC_INJECT_TEST_LOCK.lock_unpoisoned();
 
     let proc_tmp = tempfile::TempDir::new().unwrap();
     let cgroup_tmp = tempfile::TempDir::new().unwrap();
@@ -998,8 +997,7 @@ fn capture_with_rayon_worker_panic_is_caught_and_surfaced() {
 fn capture_with_rayon_worker_panic_non_string_payload_falls_back() {
     // Serialize against any other panic-hook test in the crate.
     static PANIC_INJECT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = PANIC_INJECT_TEST_LOCK
-        .lock_unpoisoned();
+    let _guard = PANIC_INJECT_TEST_LOCK.lock_unpoisoned();
 
     let proc_tmp = tempfile::TempDir::new().unwrap();
     let cgroup_tmp = tempfile::TempDir::new().unwrap();

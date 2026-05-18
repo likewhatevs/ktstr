@@ -228,10 +228,29 @@ fn vocabulary_count_matches_test_coverage() {
 #[test]
 fn every_expected_token_is_in_vocabulary() {
     let expected_tokens = [
-        "eq", "ne", "ge", "le", "lt", "gt", "in_range", "is_finite", "near_within",
-        "set_is_empty", "set_is_non_empty", "set_contains", "set_len_eq", "set_len_le",
-        "set_len_ge", "subset_of", "disjoint_from", "sequence_is_empty", "sequence_is_non_empty",
-        "sequence_contains", "sequence_len_eq", "sequence_len_le", "sequence_len_ge",
+        "eq",
+        "ne",
+        "ge",
+        "le",
+        "lt",
+        "gt",
+        "in_range",
+        "is_finite",
+        "near_within",
+        "set_is_empty",
+        "set_is_non_empty",
+        "set_contains",
+        "set_len_eq",
+        "set_len_le",
+        "set_len_ge",
+        "subset_of",
+        "disjoint_from",
+        "sequence_is_empty",
+        "sequence_is_non_empty",
+        "sequence_contains",
+        "sequence_len_eq",
+        "sequence_len_le",
+        "sequence_len_ge",
     ];
     for tok in expected_tokens {
         assert!(
@@ -274,7 +293,10 @@ fn merge_preserves_comparators_from_both_verdicts() {
         .iter()
         .map(|p| p.comparator.as_ref())
         .collect();
-    assert!(comparators.contains("eq"), "eq from verdict A lost in merge");
+    assert!(
+        comparators.contains("eq"),
+        "eq from verdict A lost in merge"
+    );
     assert!(
         comparators.contains("is_finite"),
         "is_finite from verdict B lost in merge"
@@ -337,7 +359,11 @@ fn merge_with_empty_verdict_is_noop() {
     let empty = Verdict::new().into_result();
     a.merge(empty);
     let result = a.into_result();
-    assert_eq!(result.passes.len(), 1, "merging empty must not drop the existing pass");
+    assert_eq!(
+        result.passes.len(),
+        1,
+        "merging empty must not drop the existing pass"
+    );
     assert_eq!(result.passes[0].comparator, "eq");
 
     // empty.merge(non-empty)
@@ -346,7 +372,11 @@ fn merge_with_empty_verdict_is_noop() {
     b.claim("x", 42u64).eq(42);
     a.merge(b.into_result());
     let result = a.into_result();
-    assert_eq!(result.passes.len(), 1, "merging into empty must adopt the incoming pass");
+    assert_eq!(
+        result.passes.len(),
+        1,
+        "merging into empty must adopt the incoming pass"
+    );
     assert_eq!(result.passes[0].comparator, "eq");
 }
 

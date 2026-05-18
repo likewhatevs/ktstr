@@ -33,7 +33,7 @@ mod step;
 
 pub use cgroup_def::CgroupDef;
 pub use limits::{CpuLimits, IoLimits, MemoryLimits, PidsLimits};
-pub use op::{CpusetSpec, KernelTarget, KernelValue, Op, OpKind};
+pub use op::{CpusetSpec, KernelTarget, KernelValue, KernelValueWidth, Op, OpKind};
 pub use step::{HoldSpec, Setup, Step};
 
 #[cfg(test)]

@@ -149,10 +149,8 @@ fn any_of_chooses_passing_branch() {
     );
     // The chosen-branch annotation MUST appear with branch index 1.
     assert!(
-        r.details
-            .iter()
-            .any(|d| matches!(d.kind, DetailKind::Note)
-                && d.message.contains("any_of: branch 1 satisfied")),
+        r.details.iter().any(|d| matches!(d.kind, DetailKind::Note)
+            && d.message.contains("any_of: branch 1 satisfied")),
         "chosen-branch annotation missing: {:?}",
         r.details,
     );

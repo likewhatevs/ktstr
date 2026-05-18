@@ -576,7 +576,10 @@ fn assert_result_merge_combines_stats() {
     a.merge(b);
     assert!(!a.passed);
     assert_eq!(
-        a.details.iter().map(|d| d.message.as_str()).collect::<Vec<_>>(),
+        a.details
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect::<Vec<_>>(),
         vec!["a", "b"]
     );
     assert_eq!(a.stats.total_workers, 5);

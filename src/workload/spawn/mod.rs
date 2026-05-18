@@ -2783,9 +2783,7 @@ impl WorkloadHandle {
         // refactors from inadvertently re-opening the bypass.
         for (i, spec) in works.iter().enumerate() {
             spec.mem_policy.validate().map_err(|e| {
-                anyhow::anyhow!(
-                    "WorkloadHandle::spawn_pcomm_cgroup: works[{i}].mem_policy: {e}",
-                )
+                anyhow::anyhow!("WorkloadHandle::spawn_pcomm_cgroup: works[{i}].mem_policy: {e}",)
             })?;
         }
 
@@ -4849,8 +4847,7 @@ impl WorkloadHandle {
             // assert_not_starved) see the correct cardinality.
             match child.kind {
                 ForkedChildKind::Worker { group_idx } => {
-                    let decoded: Result<WorkerReport, _> =
-                        postcard::from_bytes(report_slice);
+                    let decoded: Result<WorkerReport, _> = postcard::from_bytes(report_slice);
                     if let Ok(report) = decoded {
                         reports.push(report);
                     } else {

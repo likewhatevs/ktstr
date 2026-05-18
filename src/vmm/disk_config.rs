@@ -987,11 +987,11 @@ mod tests {
     #[test]
     fn with_name_builder_sets_label() {
         let d = DiskConfig::default().with_name("data-disk");
-        assert_eq!(d.name.as_deref(), Some("data-disk"));
+        assert_eq!(d.name, Some("data-disk"));
 
         // Last call wins — the builder overwrites.
         let d = DiskConfig::default().with_name("first").with_name("second");
-        assert_eq!(d.name.as_deref(), Some("second"));
+        assert_eq!(d.name, Some("second"));
     }
 
     /// The `with_name` builder is `const fn`, so a `static DiskConfig`
@@ -1001,7 +1001,7 @@ mod tests {
     #[test]
     fn with_name_works_in_const_context() {
         const NAMED: DiskConfig = DiskConfig::DEFAULT.with_name("static-disk");
-        assert_eq!(NAMED.name.as_deref(), Some("static-disk"));
+        assert_eq!(NAMED.name, Some("static-disk"));
         assert_eq!(NAMED.capacity_mib, 256);
     }
 

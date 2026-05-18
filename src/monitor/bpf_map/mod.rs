@@ -14,8 +14,8 @@
 //! - Per-CPU values (`BPF_MAP_TYPE_PERCPU_ARRAY`) are in the direct mapping:
 //!   use `kva_to_pa` with `__per_cpu_offset[cpu]`.
 
-use anyhow::Context;
 use crate::sync::MutexExt;
+use anyhow::Context;
 
 use super::btf_offsets::BpfMapOffsets;
 use super::idr::{translate_any_kva, xa_load};

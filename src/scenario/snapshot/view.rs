@@ -18,11 +18,11 @@ use crate::monitor::dump::{
 use crate::monitor::scx_walker::{DsqState, RqScxState, ScxSchedState};
 use crate::monitor::task_enrichment::TaskEnrichment;
 
+use super::field::lookup_member;
 use super::{
     HEX_KEY_PREFIX, NO_MATCH_KEY_CHAR_CAP, NO_MATCH_KEY_SAMPLE, SnapshotEntry, SnapshotError,
     SnapshotField, SnapshotResult,
 };
-use super::field::lookup_member;
 
 /// Borrowed view over a captured [`FailureDumpReport`] for typed
 /// traversal of BTF-rendered map values, per-CPU entries, and
@@ -334,7 +334,10 @@ impl<'a> Snapshot<'a> {
     /// distinct callback names (`select_cpu`, `enqueue`, etc.) so
     /// duplicates do not occur in production.
     pub fn prog_runtime_stats_by_name(&self, name: &str) -> Option<&'a ProgRuntimeStats> {
-        self.report.prog_runtime_stats.iter().find(|p| p.name == name)
+        self.report
+            .prog_runtime_stats
+            .iter()
+            .find(|p| p.name == name)
     }
 
     /// Probe BPF program's per-CPU diagnostic counter snapshot.
@@ -657,7 +660,7 @@ fn resolve_percpu_entry<'a>(
     if c >= entry.per_cpu.len() {
         return SnapshotEntry::Missing(SnapshotError::PerCpuSlot {
             map: map.name.clone(),
-            cpu: c,
+            cpu: u32::try_from(c).unwrap_or(u32::MAX),
             len: entry.per_cpu.len(),
             unmapped: false,
         });
@@ -666,7 +669,7 @@ fn resolve_percpu_entry<'a>(
         Some(v) => SnapshotEntry::Value(v),
         None => SnapshotEntry::Missing(SnapshotError::PerCpuSlot {
             map: map.name.clone(),
-            cpu: c,
+            cpu: u32::try_from(c).unwrap_or(u32::MAX),
             len: entry.per_cpu.len(),
             unmapped: true,
         }),
@@ -703,7 +706,7 @@ fn resolve_percpu_hash_entry<'a>(
     if c >= entry.per_cpu.len() {
         return SnapshotEntry::Missing(SnapshotError::PerCpuSlot {
             map: map.name.clone(),
-            cpu: c,
+            cpu: u32::try_from(c).unwrap_or(u32::MAX),
             len: entry.per_cpu.len(),
             unmapped: false,
         });
@@ -712,7 +715,7 @@ fn resolve_percpu_hash_entry<'a>(
         Some(v) => SnapshotEntry::Value(v),
         None => SnapshotEntry::Missing(SnapshotError::PerCpuSlot {
             map: map.name.clone(),
-            cpu: c,
+            cpu: u32::try_from(c).unwrap_or(u32::MAX),
             len: entry.per_cpu.len(),
             unmapped: true,
         }),
@@ -759,4 +762,3 @@ pub(super) fn render_entry_key(entry: &SnapshotEntry<'_>) -> Option<String> {
         Some(key)
     }
 }
-

@@ -21,10 +21,10 @@
 //! [`VmlinuxSymbolCache`] which is built once per coordinator at
 //! `run_vm` scope.
 
+use crate::sync::MutexExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use vmm_sys_util::eventfd::EventFd;
-use crate::sync::MutexExt;
 
 use super::super::vcpu::{ImmediateExitHandle, WatchpointArm, vcpu_signal};
 use super::state::SnapshotRequest;
@@ -264,9 +264,7 @@ pub(super) fn arm_user_watchpoint(
     // request_kva synchronises-with this Release; the tag must be
     // visible by the time the vCPU latches a hit on this slot).
     {
-        let mut tag_guard = watchpoint.user[idx]
-            .tag
-            .lock_unpoisoned();
+        let mut tag_guard = watchpoint.user[idx].tag.lock_unpoisoned();
         *tag_guard = symbol.to_string();
     }
     watchpoint.user[idx]

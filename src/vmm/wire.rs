@@ -148,6 +148,16 @@ pub enum MsgType {
     /// carries the matching request_id, the status, and a UTF-8
     /// reason buffer for the failure path.
     SnapshotReply,
+    /// Guest→host kernel-memory write/read op request (payload:
+    /// postcard-encoded [`KernelOpRequestPayload`]). Carries the
+    /// `Op::WriteKernel{Hot,Cold}` / `Op::ReadKernel{Hot,Cold}`
+    /// invocation from the guest's step executor; variable-length
+    /// payload rides this distinct MSG_TYPE rather than extending
+    /// the fixed-72-byte [`SnapshotRequestPayload`].
+    KernelOpRequest,
+    /// Host→guest reply to [`MsgType::KernelOpRequest`] (payload:
+    /// postcard-encoded [`KernelOpReplyPayload`]).
+    KernelOpReply,
     /// Guest→host system-ready signal (payload: empty).
     ///
     /// Emitted by the guest's `ktstr_guest_init` after
@@ -184,6 +194,8 @@ impl MsgType {
             MsgType::Profraw => MSG_TYPE_PROFRAW,
             MsgType::SnapshotRequest => MSG_TYPE_SNAPSHOT_REQUEST,
             MsgType::SnapshotReply => MSG_TYPE_SNAPSHOT_REPLY,
+            MsgType::KernelOpRequest => MSG_TYPE_KERNEL_OP_REQUEST,
+            MsgType::KernelOpReply => MSG_TYPE_KERNEL_OP_REPLY,
             MsgType::SysRdy => MSG_TYPE_SYS_RDY,
             MsgType::Stdout => MSG_TYPE_STDOUT,
             MsgType::Stderr => MSG_TYPE_STDERR,
@@ -214,6 +226,8 @@ impl MsgType {
             MSG_TYPE_PROFRAW => Some(MsgType::Profraw),
             MSG_TYPE_SNAPSHOT_REQUEST => Some(MsgType::SnapshotRequest),
             MSG_TYPE_SNAPSHOT_REPLY => Some(MsgType::SnapshotReply),
+            MSG_TYPE_KERNEL_OP_REQUEST => Some(MsgType::KernelOpRequest),
+            MSG_TYPE_KERNEL_OP_REPLY => Some(MsgType::KernelOpReply),
             MSG_TYPE_SYS_RDY => Some(MsgType::SysRdy),
             MSG_TYPE_STDOUT => Some(MsgType::Stdout),
             MSG_TYPE_STDERR => Some(MsgType::Stderr),
@@ -251,7 +265,11 @@ impl MsgType {
     pub const fn is_coordinator_internal(self) -> bool {
         matches!(
             self,
-            MsgType::SnapshotRequest | MsgType::SnapshotReply | MsgType::SysRdy
+            MsgType::SnapshotRequest
+                | MsgType::SnapshotReply
+                | MsgType::KernelOpRequest
+                | MsgType::KernelOpReply
+                | MsgType::SysRdy
         )
     }
 }
@@ -439,6 +457,26 @@ pub const MSG_TYPE_DMESG: u32 = 0x444d_5347; // "DMSG"
 /// Replaces the prior COM2 ProbeDrain path so probe output and
 /// scheduler-log dumps stop interleaving on the same serial port.
 pub const MSG_TYPE_PROBE_OUTPUT: u32 = 0x5052_4f42; // "PROB"
+
+/// Guest→host kernel-memory write/read op request (payload:
+/// postcard-encoded [`KernelOpRequestPayload`]).
+///
+/// Carries an [`Op::WriteKernelHot`](crate::scenario::ops::Op::WriteKernelHot)
+/// / [`Op::WriteKernelCold`](crate::scenario::ops::Op::WriteKernelCold)
+/// / [`Op::ReadKernelHot`](crate::scenario::ops::Op::ReadKernelHot)
+/// / [`Op::ReadKernelCold`](crate::scenario::ops::Op::ReadKernelCold)
+/// request from the guest's step executor to the host coordinator.
+/// Variable-length payload (target + value bytes do not fit in the
+/// 72-byte [`SnapshotRequestPayload`]), so this rides a distinct
+/// MSG_TYPE_* with a postcard-encoded body rather than extending the
+/// fixed-size snapshot envelope.
+pub const MSG_TYPE_KERNEL_OP_REQUEST: u32 = 0x4b4f_5251; // "KORQ"
+
+/// Host→guest reply to a [`MSG_TYPE_KERNEL_OP_REQUEST`] (payload:
+/// postcard-encoded [`KernelOpReplyPayload`]). Echoes the request id
+/// the guest stamped, carries the status + reason + (for reads) the
+/// value bytes the host coordinator read.
+pub const MSG_TYPE_KERNEL_OP_REPLY: u32 = 0x4b4f_5250; // "KORP"
 
 // ---------------------------------------------------------------------------
 // ShmMessage — TLV header
@@ -686,6 +724,182 @@ const _SNAPSHOT_REPLY_PAYLOAD_SIZE: () =
     assert!(std::mem::size_of::<SnapshotReplyPayload>() == 8 + SNAPSHOT_REASON_MAX);
 
 // ---------------------------------------------------------------------------
+// KernelOp request/reply payloads (postcard-encoded, variable-length)
+// ---------------------------------------------------------------------------
+
+/// Hot/cold orchestration discriminant for kernel-memory ops on the
+/// wire. Encoded inside [`KernelOpRequestPayload`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum KernelOpMode {
+    /// Hot: dispatched on a host worker thread without freeze
+    /// rendezvous. Mirrors `Op::WriteKernelHot` / `Op::ReadKernelHot`
+    /// orchestration. Caller is responsible for guest-side sync.
+    Hot,
+    /// Cold: dispatched inside a freeze rendezvous with every vCPU
+    /// parked. Mirrors `Op::WriteKernelCold` / `Op::ReadKernelCold`
+    /// orchestration. Coherent with respect to guest state.
+    Cold,
+}
+
+/// Direction discriminant: write vs read. Inside
+/// [`KernelOpRequestPayload`] the kind picks WHICH `GuestKernel::*`
+/// method family the host dispatcher invokes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum KernelOpDirection {
+    /// Write: `values` contains the bytes to write; reply carries
+    /// success/error and the per-write byte count.
+    Write,
+    /// Read: `values` is empty; reply carries the bytes read into
+    /// [`KernelOpReplyPayload::read_value`].
+    Read,
+}
+
+/// Wire-encoded [`crate::scenario::ops::KernelTarget`] variant tag.
+/// Mirrors the four `KernelTarget` enum variants 1:1; postcard
+/// encodes the tag + the variant payload that follows in
+/// [`KernelOpTarget`].
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum KernelOpTarget {
+    /// Kernel symbol (text/data/bss), resolved at dispatch via
+    /// runtime kernel image base + KASLR.
+    Symbol(String),
+    /// Direct-mapped KVA; translated via `kva - PAGE_OFFSET`.
+    Direct(u64),
+    /// Vmalloc'd KVA; translated via page-table walk through CR3.
+    Kva(u64),
+    /// Per-CPU field of a kernel struct. Resolved at dispatch via
+    /// `symbol_kva + __per_cpu_offset[cpu] + BTF byte offset of field`.
+    PerCpuField {
+        /// Symbol naming the per-CPU template (e.g. `"runqueues"`).
+        symbol: String,
+        /// Field within the symbol's struct (e.g. `"clock"`).
+        field: String,
+        /// CPU index whose per-CPU instance to address.
+        cpu: u32,
+    },
+}
+
+/// Wire-encoded [`crate::scenario::ops::KernelValue`] variant tag.
+/// Mirrors the three `KernelValue` enum variants 1:1.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum KernelOpValue {
+    /// 32-bit unsigned, little-endian on the wire and at the
+    /// resolved PA. Atomic when the resolved host PA is 4-byte
+    /// aligned (see `GuestKernel::write_*_u32` doc).
+    U32(u32),
+    /// 64-bit unsigned, little-endian. Atomic at 8-byte alignment.
+    U64(u64),
+    /// Variable-length byte payload. Written non-atomically; the
+    /// dispatcher emits a Release fence after the copy.
+    Bytes(Vec<u8>),
+}
+
+/// One write/read pair inside a [`KernelOpRequestPayload`] batch.
+/// `value` is the bytes to write for a [`KernelOpDirection::Write`]
+/// request and a placeholder ignored by the dispatcher for a
+/// [`KernelOpDirection::Read`] request (the value-width discriminant
+/// IS still load-bearing for reads — it picks the read method
+/// family).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KernelOpEntry {
+    /// Address to write or read.
+    pub target: KernelOpTarget,
+    /// Value to write (or value-width hint for a read).
+    pub value: KernelOpValue,
+}
+
+/// Postcard-encoded payload for [`MsgType::KernelOpRequest`].
+///
+/// Carries an entire `Op::WriteKernel{Hot,Cold}` /
+/// `Op::ReadKernel{Hot,Cold}` invocation including the full
+/// `Vec<(KernelTarget, KernelValue)>` batch — variable-length, hence
+/// the postcard encoding rather than a zerocopy fixed-size struct.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KernelOpRequestPayload {
+    /// Monotonic request id; the host echoes it into the matching
+    /// [`KernelOpReplyPayload::request_id`].
+    pub request_id: u32,
+    /// Hot vs cold orchestration.
+    pub mode: KernelOpMode,
+    /// Write vs read direction.
+    pub direction: KernelOpDirection,
+    /// Bridge-keyed tag for the response. For reads the tag becomes
+    /// the bridge entry key; for writes the tag is informational
+    /// only (the executor surfaces it in the success record).
+    pub tag: String,
+    /// Ordered batch entries. For [`KernelOpDirection::Write`] all
+    /// entries' `value` carries the bytes to write; for
+    /// [`KernelOpDirection::Read`] only `target` + the value-width
+    /// discriminant are load-bearing.
+    pub entries: Vec<KernelOpEntry>,
+}
+
+/// Postcard-encoded payload for [`MsgType::KernelOpReply`].
+///
+/// Mirrors the request id so the guest's blocking reader can pair
+/// against the original request. Status carries success/failure; on
+/// failure `reason` describes the host-side error. For
+/// [`KernelOpDirection::Read`] requests `read_values` carries the
+/// per-entry bytes the host coordinator read; empty for writes.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KernelOpReplyPayload {
+    /// Echo of the request's `request_id`.
+    pub request_id: u32,
+    /// `true` when the host completed every entry in the batch;
+    /// `false` when any entry failed (reason describes the first
+    /// failure).
+    pub success: bool,
+    /// Human-readable diagnostic on the failure path; empty on
+    /// success.
+    pub reason: String,
+    /// For a [`KernelOpDirection::Read`] request: one
+    /// [`KernelOpValue`] per request entry in iteration order. Empty
+    /// for writes.
+    pub read_values: Vec<KernelOpValue>,
+}
+
+/// Upper bound on the on-wire size of a postcard-encoded
+/// [`KernelOpReplyPayload`] frame the guest accepts on port-1 RX.
+///
+/// 1 MiB covers every realistic batch shape:
+/// * `with_uptime` writing per-CPU `rq.clock` on 1024 CPUs:
+///   ~9 KiB (well under cap).
+/// * Bulk `read_*_bytes` of a struct page (4 KiB) per CPU on a
+///   128-CPU host: ~520 KiB (within cap).
+/// * Per-CPU 1 KiB `Bytes` read on 1024 CPUs: ~1 MiB (right at cap).
+///
+/// **Per-op entry budget**: callers that need replies larger than
+/// 1 MiB must split the request across multiple ops; the cap
+/// rejects forged or accidentally-huge lengths BEFORE the
+/// `vec![0u8; length]` allocation in
+/// [`crate::vmm::guest_comms`]'s frame reader, so a hostile or
+/// buggy host cannot OOM the guest's PID 1 init.
+pub const KERNEL_OP_REPLY_MAX: usize = 1024 * 1024;
+
+/// Outcome of a guest-driven kernel-memory op request: the host
+/// returned a reply (caller inspects [`KernelOpReplyPayload::success`])
+/// or the transport failed (port not open, timeout, malformed frame).
+///
+/// Distinct from a `host_error` variant the way [`SnapshotRequestResult`]
+/// distinguishes — kernel-op replies are postcard-encoded with
+/// arbitrary structure, so the "host completed but op failed" carrier
+/// is the reply payload's `success: false` + `reason`. The
+/// `TransportError` arm covers cases where the guest never receives a
+/// usable reply at all.
+#[derive(Debug)]
+pub enum KernelOpRequestResult {
+    /// Host returned a postcard-decoded reply. The caller inspects
+    /// `reply.success` to distinguish op success from host-side op
+    /// failure; `reply.reason` carries the failure diagnostic when
+    /// `success == false`.
+    Ok(KernelOpReplyPayload),
+    /// Transport failed (called from host context, port not yet open,
+    /// host did not reply within `timeout`, malformed reply frame).
+    /// The supplied diagnostic names the underlying cause.
+    TransportError { reason: String },
+}
+
+// ---------------------------------------------------------------------------
 // ControlEvent — multiport control protocol discriminants
 // ---------------------------------------------------------------------------
 
@@ -850,6 +1064,8 @@ mod tests {
             MSG_TYPE_PROFRAW,
             MSG_TYPE_SNAPSHOT_REQUEST,
             MSG_TYPE_SNAPSHOT_REPLY,
+            MSG_TYPE_KERNEL_OP_REQUEST,
+            MSG_TYPE_KERNEL_OP_REPLY,
             MSG_TYPE_SYS_RDY,
             MSG_TYPE_STDOUT,
             MSG_TYPE_STDERR,
@@ -917,6 +1133,8 @@ mod tests {
             MsgType::Profraw,
             MsgType::SnapshotRequest,
             MsgType::SnapshotReply,
+            MsgType::KernelOpRequest,
+            MsgType::KernelOpReply,
             MsgType::SysRdy,
             MsgType::Stdout,
             MsgType::Stderr,
@@ -978,22 +1196,25 @@ mod tests {
     }
 
     /// `is_coordinator_internal` flips on for SnapshotRequest,
-    /// SnapshotReply, and SysRdy and stays off for every
-    /// test-verdict-bearing variant. SnapshotReply is host→guest
-    /// only on port-1 RX; a guest TX frame stamped with this tag
-    /// is illegitimate and must be dropped rather than bucketed
-    /// as a phantom verdict entry. Pinning this matrix here means
-    /// a future contributor adding a new control frame must
-    /// explicitly opt into the gate (or explicitly opt out by
-    /// adding a "verdict-bearing" entry to the test) — the freeze
-    /// coord's mid-run filter and `collect_results`'s post-run
-    /// drain both key on this single classifier (search for
-    /// `is_coordinator_internal` in `freeze_coord.rs`).
+    /// SnapshotReply, KernelOpRequest, KernelOpReply, and SysRdy
+    /// and stays off for every test-verdict-bearing variant. The
+    /// Reply variants are host→guest only on port-1 RX; a guest TX
+    /// frame stamped with one of those tags is illegitimate and
+    /// must be dropped rather than bucketed as a phantom verdict
+    /// entry. Pinning this matrix here means a future contributor
+    /// adding a new control frame must explicitly opt into the
+    /// gate (or explicitly opt out by adding a "verdict-bearing"
+    /// entry to the test) — the freeze coord's mid-run filter and
+    /// `collect_results`'s post-run drain both key on this single
+    /// classifier (search for `is_coordinator_internal` in
+    /// `freeze_coord.rs`).
     #[test]
     fn is_coordinator_internal_matches_filter_set() {
         let internal = [
             MsgType::SnapshotRequest,
             MsgType::SnapshotReply,
+            MsgType::KernelOpRequest,
+            MsgType::KernelOpReply,
             MsgType::SysRdy,
         ];
         let verdict = [
@@ -1193,5 +1414,110 @@ mod tests {
         assert_eq!(id, 1);
         assert_eq!(event, ControlEvent::PortOpen.wire_value());
         assert_eq!(value, 1);
+    }
+
+    /// `KernelOpRequestPayload` round-trips through postcard with
+    /// every `KernelOpTarget` + `KernelOpValue` variant present —
+    /// pins encode/decode against an accidental serde derive
+    /// breakage on either side. The wire format the freeze coord
+    /// (host) decodes is exactly what the guest's
+    /// [`crate::vmm::guest_comms::request_kernel_op`] encodes, so a
+    /// round-trip mismatch surfaces as a silent host-side parse
+    /// failure rather than a typed error.
+    #[test]
+    fn kernel_op_request_payload_postcard_round_trip() {
+        let payload = KernelOpRequestPayload {
+            request_id: 0xCAFEBABE,
+            mode: KernelOpMode::Cold,
+            direction: KernelOpDirection::Write,
+            tag: "with_uptime".into(),
+            entries: vec![
+                KernelOpEntry {
+                    target: KernelOpTarget::Symbol("jiffies".into()),
+                    value: KernelOpValue::U64(42),
+                },
+                KernelOpEntry {
+                    target: KernelOpTarget::Direct(0xffff_8000_0000_1000),
+                    value: KernelOpValue::U32(7),
+                },
+                KernelOpEntry {
+                    target: KernelOpTarget::Kva(0xffff_c000_dead_beef),
+                    value: KernelOpValue::Bytes(vec![1, 2, 3, 4, 5]),
+                },
+                KernelOpEntry {
+                    target: KernelOpTarget::PerCpuField {
+                        symbol: "runqueues".into(),
+                        field: "clock".into(),
+                        cpu: 3,
+                    },
+                    value: KernelOpValue::U64(0xDEAD_BEEF_CAFE_F00D),
+                },
+            ],
+        };
+        let bytes = postcard::to_allocvec(&payload).expect("encode");
+        let back: KernelOpRequestPayload = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(back, payload);
+    }
+
+    /// `KernelOpReplyPayload` round-trips through postcard. The
+    /// reply carries success/failure + (for reads) the per-entry
+    /// values the host coordinator read — both code paths must
+    /// survive encode/decode unchanged.
+    #[test]
+    fn kernel_op_reply_payload_postcard_round_trip() {
+        let success = KernelOpReplyPayload {
+            request_id: 0x1234_5678,
+            success: true,
+            reason: String::new(),
+            read_values: vec![
+                KernelOpValue::U64(100),
+                KernelOpValue::U32(200),
+                KernelOpValue::Bytes(vec![0xAB, 0xCD, 0xEF]),
+            ],
+        };
+        let bytes = postcard::to_allocvec(&success).expect("encode success");
+        let back: KernelOpReplyPayload = postcard::from_bytes(&bytes).expect("decode success");
+        assert_eq!(back, success);
+
+        let failure = KernelOpReplyPayload {
+            request_id: 0xFEED_FACE,
+            success: false,
+            reason: "host: symbol 'jiffies' not found in vmlinux".into(),
+            read_values: vec![],
+        };
+        let bytes = postcard::to_allocvec(&failure).expect("encode failure");
+        let back: KernelOpReplyPayload = postcard::from_bytes(&bytes).expect("decode failure");
+        assert_eq!(back, failure);
+    }
+
+    /// `KERNEL_OP_REPLY_MAX` envelope check: a representative
+    /// large reply (1024-CPU per-CPU u64) fits comfortably; the
+    /// cap is 1 MiB which bounds OOM exposure while accommodating
+    /// realistic batch shapes. A regression that shrunk the cap
+    /// below ~10 KiB would silently truncate large kernel-op
+    /// replies; one that grew it beyond 1 MiB would widen the
+    /// OOM-attack surface.
+    #[test]
+    fn kernel_op_reply_max_envelope_check() {
+        // 1024 CPUs * KernelOpValue::U64 (~9 bytes each + bookkeeping)
+        // is well under 1 MiB. Build a representative reply and
+        // verify its encoded size sits inside the cap.
+        let big = KernelOpReplyPayload {
+            request_id: 1,
+            success: true,
+            reason: String::new(),
+            read_values: (0..1024u64).map(KernelOpValue::U64).collect(),
+        };
+        let bytes = postcard::to_allocvec(&big).expect("encode 1024-CPU reply");
+        assert!(
+            bytes.len() < KERNEL_OP_REPLY_MAX,
+            "1024-CPU kernel-op reply ({} bytes) must fit under \
+             KERNEL_OP_REPLY_MAX ({KERNEL_OP_REPLY_MAX} bytes)",
+            bytes.len(),
+        );
+        // The cap is exactly 1 MiB — large enough for per-CPU 1 KiB
+        // Bytes reads on 1024 CPUs, small enough to keep OOM
+        // exposure bounded for a forged frame.
+        assert_eq!(KERNEL_OP_REPLY_MAX, 1024 * 1024);
     }
 }

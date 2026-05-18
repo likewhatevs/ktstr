@@ -299,8 +299,7 @@ pub(crate) fn build_assert_result(passed: bool, details: Vec<AssertDetail>) -> A
 /// `postcard::from_bytes` exactly as a real guest
 /// emission would.
 pub(crate) fn assert_result_tlv_entry(result: &AssertResult) -> crate::vmm::wire::ShmEntry {
-    let payload = postcard::to_stdvec(result)
-        .expect("AssertResult postcard encode must not fail");
+    let payload = postcard::to_stdvec(result).expect("AssertResult postcard encode must not fail");
     crate::vmm::wire::ShmEntry {
         msg_type: crate::vmm::wire::MSG_TYPE_TEST_RESULT,
         payload,
@@ -627,8 +626,7 @@ impl Drop for StderrRestoreGuard {
 /// even if `f` panics under `panic = "unwind"`.
 pub(crate) fn capture_stderr<R>(f: impl FnOnce() -> R) -> (R, Vec<u8>) {
     use std::io::{Read, Seek, SeekFrom, Write};
-    let _lock = STDERR_CAPTURE_LOCK
-        .lock_unpoisoned();
+    let _lock = STDERR_CAPTURE_LOCK.lock_unpoisoned();
     let mut sink = tempfile::tempfile().expect("create stderr-capture tempfile");
     // Flush before redirect: eprintln! is line-buffered behind the
     // Stderr lock; pre-call bytes need to reach the ORIGINAL fd 2

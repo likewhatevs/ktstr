@@ -123,14 +123,16 @@ impl<'a> HostView<'a> {
             // FAIL on placeholders instead of skipping; gap-tolerant
             // patterns render the right diagnostic Note.
             if row.report.is_placeholder {
-                return Err(crate::scenario::snapshot::SnapshotError::PlaceholderSample {
-                    tag: row.tag.clone(),
-                    reason: row
-                        .report
-                        .scx_walker_unavailable
-                        .clone()
-                        .unwrap_or_else(|| "placeholder report".to_string()),
-                });
+                return Err(
+                    crate::scenario::snapshot::SnapshotError::PlaceholderSample {
+                        tag: row.tag.clone(),
+                        reason: row
+                            .report
+                            .scx_walker_unavailable
+                            .clone()
+                            .unwrap_or_else(|| "placeholder report".to_string()),
+                    },
+                );
             }
             // Inherits the first-match-wins contract from
             // [`crate::scenario::snapshot::Snapshot::per_cpu_time_at`]:
@@ -195,19 +197,21 @@ mod tests {
     /// counter-style assertions.
     #[test]
     fn series_host_per_cpu_time_timeline_single_sample() {
-        let mut report = FailureDumpReport::default();
-        report.per_cpu_time = vec![
-            PerCpuTimeStats {
-                cpu: 0,
-                cpustat_user_ns: 100,
-                ..Default::default()
-            },
-            PerCpuTimeStats {
-                cpu: 3,
-                cpustat_user_ns: 300,
-                ..Default::default()
-            },
-        ];
+        let report = FailureDumpReport {
+            per_cpu_time: vec![
+                PerCpuTimeStats {
+                    cpu: 0,
+                    cpustat_user_ns: 100,
+                    ..Default::default()
+                },
+                PerCpuTimeStats {
+                    cpu: 3,
+                    cpustat_user_ns: 300,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
         let series = SampleSeries::from_drained(
             vec![("periodic_000".to_string(), report, None, Some(50u64))],
             None,
@@ -235,14 +239,13 @@ mod tests {
     /// reverse order.
     #[test]
     fn series_host_per_cpu_time_timeline_sorts_by_elapsed_ms_stable() {
-        let mk = |val: u64| {
-            let mut r = FailureDumpReport::default();
-            r.per_cpu_time = vec![PerCpuTimeStats {
+        let mk = |val: u64| FailureDumpReport {
+            per_cpu_time: vec![PerCpuTimeStats {
                 cpu: 0,
                 cpustat_user_ns: val,
                 ..Default::default()
-            }];
-            r
+            }],
+            ..Default::default()
         };
         let series = SampleSeries::from_drained(
             vec![
@@ -279,20 +282,24 @@ mod tests {
     /// row that would silently advance counter-style assertions.
     #[test]
     fn series_host_placeholder_naturally_drops_without_explicit_filter() {
-        let mk_real = |val: u64| {
-            let mut r = FailureDumpReport::default();
-            r.per_cpu_time = vec![PerCpuTimeStats {
+        let mk_real = |val: u64| FailureDumpReport {
+            per_cpu_time: vec![PerCpuTimeStats {
                 cpu: 0,
                 cpustat_user_ns: val,
                 ..Default::default()
-            }];
-            r
+            }],
+            ..Default::default()
         };
         let placeholder = FailureDumpReport::placeholder("freeze rendezvous timed out");
         let series = SampleSeries::from_drained(
             vec![
                 ("real_pre".to_string(), mk_real(10), None, Some(10u64)),
-                ("placeholder_mid".to_string(), placeholder, None, Some(20u64)),
+                (
+                    "placeholder_mid".to_string(),
+                    placeholder,
+                    None,
+                    Some(20u64),
+                ),
                 ("real_post".to_string(), mk_real(30), None, Some(30u64)),
             ],
             None,
@@ -317,23 +324,21 @@ mod tests {
     /// temporal-assertion layer.
     #[test]
     fn series_host_per_cpu_field_u64_closure_projection() {
-        let mk = |val: u64| {
-            let mut r = FailureDumpReport::default();
-            r.per_cpu_time = vec![PerCpuTimeStats {
+        let mk = |val: u64| FailureDumpReport {
+            per_cpu_time: vec![PerCpuTimeStats {
                 cpu: 1,
                 cpustat_system_ns: val,
                 ..Default::default()
-            }];
-            r
+            }],
+            ..Default::default()
         };
-        let mk_missing = || {
-            let mut r = FailureDumpReport::default();
-            r.per_cpu_time = vec![PerCpuTimeStats {
+        let mk_missing = || FailureDumpReport {
+            per_cpu_time: vec![PerCpuTimeStats {
                 cpu: 0,
                 cpustat_system_ns: 999,
                 ..Default::default()
-            }];
-            r
+            }],
+            ..Default::default()
         };
         let series = SampleSeries::from_drained(
             vec![
@@ -368,14 +373,13 @@ mod tests {
     /// F2 fold-in 2026-05-17).
     #[test]
     fn series_host_per_cpu_field_u64_placeholder_surfaces_placeholder_sample_variant() {
-        let mk = |val: u64| {
-            let mut r = FailureDumpReport::default();
-            r.per_cpu_time = vec![PerCpuTimeStats {
+        let mk = |val: u64| FailureDumpReport {
+            per_cpu_time: vec![PerCpuTimeStats {
                 cpu: 0,
                 cpustat_user_ns: val,
                 ..Default::default()
-            }];
-            r
+            }],
+            ..Default::default()
         };
         let placeholder = FailureDumpReport::placeholder("freeze rendezvous timed out");
         let series = SampleSeries::from_drained(
@@ -444,22 +448,26 @@ mod tests {
     /// fold-in 2026-05-17.
     #[test]
     fn series_host_interleaved_multi_cpu_multi_sample_coverage() {
-        let mk = |cpus: &[(u32, u64)]| {
-            let mut r = FailureDumpReport::default();
-            r.per_cpu_time = cpus
+        let mk = |cpus: &[(u32, u64)]| FailureDumpReport {
+            per_cpu_time: cpus
                 .iter()
                 .map(|(c, v)| PerCpuTimeStats {
                     cpu: *c,
                     cpustat_user_ns: *v,
                     ..Default::default()
                 })
-                .collect();
-            r
+                .collect(),
+            ..Default::default()
         };
         let series = SampleSeries::from_drained(
             vec![
                 ("A".to_string(), mk(&[(0, 10), (1, 100)]), None, Some(10u64)),
-                ("B".to_string(), mk(&[(1, 200), (2, 300)]), None, Some(20u64)),
+                (
+                    "B".to_string(),
+                    mk(&[(1, 200), (2, 300)]),
+                    None,
+                    Some(20u64),
+                ),
                 ("C".to_string(), mk(&[(0, 50), (2, 600)]), None, Some(30u64)),
             ],
             None,
@@ -505,25 +513,25 @@ mod tests {
     /// sort step. Tester T8 fold-in 2026-05-17.
     #[test]
     fn series_host_cpus_sorted_ascending_independent_of_insertion_order() {
-        let mut report = FailureDumpReport::default();
-        report.per_cpu_time = vec![
-            PerCpuTimeStats {
-                cpu: 5,
-                ..Default::default()
-            },
-            PerCpuTimeStats {
-                cpu: 1,
-                ..Default::default()
-            },
-            PerCpuTimeStats {
-                cpu: 3,
-                ..Default::default()
-            },
-        ];
-        let series = SampleSeries::from_drained(
-            vec![("s".to_string(), report, None, Some(0u64))],
-            None,
-        );
+        let report = FailureDumpReport {
+            per_cpu_time: vec![
+                PerCpuTimeStats {
+                    cpu: 5,
+                    ..Default::default()
+                },
+                PerCpuTimeStats {
+                    cpu: 1,
+                    ..Default::default()
+                },
+                PerCpuTimeStats {
+                    cpu: 3,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let series =
+            SampleSeries::from_drained(vec![("s".to_string(), report, None, Some(0u64))], None);
         let host = series.host().expect("non-empty");
         assert_eq!(
             host.cpus(),
@@ -542,19 +550,21 @@ mod tests {
     /// panic-on-dup, or any other handling surfaces here.
     #[test]
     fn series_host_per_cpu_time_timeline_first_match_wins_on_duplicate_cpu() {
-        let mut report = FailureDumpReport::default();
-        report.per_cpu_time = vec![
-            PerCpuTimeStats {
-                cpu: 0,
-                cpustat_user_ns: 100,
-                ..Default::default()
-            },
-            PerCpuTimeStats {
-                cpu: 0,
-                cpustat_user_ns: 200,
-                ..Default::default()
-            },
-        ];
+        let report = FailureDumpReport {
+            per_cpu_time: vec![
+                PerCpuTimeStats {
+                    cpu: 0,
+                    cpustat_user_ns: 100,
+                    ..Default::default()
+                },
+                PerCpuTimeStats {
+                    cpu: 0,
+                    cpustat_user_ns: 200,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
         let series =
             SampleSeries::from_drained(vec![("s".to_string(), report, None, Some(0u64))], None);
         let host = series.host().expect("non-empty");
@@ -581,14 +591,13 @@ mod tests {
     /// `elapsed.push(row.elapsed_ms)`, or tag/elapsed vec swap).
     #[test]
     fn series_host_per_cpu_field_u64_iter_full_threads_tag_and_elapsed_correctly() {
-        let mk = |val: u64| {
-            let mut r = FailureDumpReport::default();
-            r.per_cpu_time = vec![PerCpuTimeStats {
+        let mk = |val: u64| FailureDumpReport {
+            per_cpu_time: vec![PerCpuTimeStats {
                 cpu: 0,
                 cpustat_user_ns: val,
                 ..Default::default()
-            }];
-            r
+            }],
+            ..Default::default()
         };
         let series = SampleSeries::from_drained(
             vec![
@@ -621,7 +630,8 @@ mod tests {
     /// `per_cpu_time.is_empty() || is_placeholder` (which would
     /// mis-classify "real but no data" as a placeholder).
     #[test]
-    fn series_host_per_cpu_field_u64_non_placeholder_empty_per_cpu_time_surfaces_host_field_unavailable() {
+    fn series_host_per_cpu_field_u64_non_placeholder_empty_per_cpu_time_surfaces_host_field_unavailable()
+     {
         // FailureDumpReport::default() has is_placeholder=false +
         // empty per_cpu_time.
         let report = FailureDumpReport::default();

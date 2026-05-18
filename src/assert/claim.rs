@@ -344,7 +344,12 @@ impl Verdict {
         value: impl std::fmt::Display,
         expected: impl std::fmt::Display,
     ) {
-        self.record_pass_inner(name, comparator.into(), value.to_string(), Some(expected.to_string()));
+        self.record_pass_inner(
+            name,
+            comparator.into(),
+            value.to_string(),
+            Some(expected.to_string()),
+        );
     }
 
     fn record_pass_unary(
@@ -687,7 +692,12 @@ impl<'a> ClaimBuilder<'a, f64> {
             );
             ClaimOutcome::Fail { kind, message: msg }
         } else if value == target || (value - target).abs() <= tolerance {
-            verdict.record_pass_binary(name, "near_within", value, format_args!("{target} (±{tolerance})"));
+            verdict.record_pass_binary(
+                name,
+                "near_within",
+                value,
+                format_args!("{target} (±{tolerance})"),
+            );
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(
@@ -861,7 +871,12 @@ impl<'a, T: Ord + std::fmt::Debug> SetClaim<'a, T> {
         } = self;
         let bad: Vec<&T> = value.iter().filter(|x| !whitelist.contains(x)).collect();
         let outcome = if bad.is_empty() {
-            verdict.record_pass_binary(name, "subset_of", format_args!("{value:?}"), format_args!("{whitelist:?}"));
+            verdict.record_pass_binary(
+                name,
+                "subset_of",
+                format_args!("{value:?}"),
+                format_args!("{whitelist:?}"),
+            );
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(
@@ -886,7 +901,12 @@ impl<'a, T: Ord + std::fmt::Debug> SetClaim<'a, T> {
         } = self;
         let bad: Vec<&T> = value.iter().filter(|x| forbidden.contains(x)).collect();
         let outcome = if bad.is_empty() {
-            verdict.record_pass_binary(name, "disjoint_from", format_args!("{value:?}"), format_args!("{forbidden:?}"));
+            verdict.record_pass_binary(
+                name,
+                "disjoint_from",
+                format_args!("{value:?}"),
+                format_args!("{forbidden:?}"),
+            );
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(

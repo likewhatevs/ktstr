@@ -107,9 +107,7 @@ fn pathology_numa_working_set_sweep_iterates() {
 fn spawn_rejects_invalid_mempolicy_config() {
     let bad = WorkloadConfig::default().mem_policy(MemPolicy::Bind(BTreeSet::new()));
     let Err(err) = WorkloadHandle::spawn(&bad) else {
-        panic!(
-            "WorkloadHandle::spawn must reject invalid mem_policy via WorkloadConfig::validate",
-        );
+        panic!("WorkloadHandle::spawn must reject invalid mem_policy via WorkloadConfig::validate",);
     };
     let msg = err.to_string();
     assert!(

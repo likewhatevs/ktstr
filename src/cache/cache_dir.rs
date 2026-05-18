@@ -54,8 +54,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use anyhow::Context;
 use crate::sync::MutexExt;
+use anyhow::Context;
 
 use super::housekeeping::{
     TmpDirGuard, atomic_swap_dirs, clean_orphaned_tmp_dirs, read_metadata, validate_cache_key,

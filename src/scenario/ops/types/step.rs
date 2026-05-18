@@ -18,7 +18,7 @@ use std::time::Duration;
 use crate::scenario::Ctx;
 use crate::workload::{AffinityIntent, WorkSpec, WorkType};
 
-use super::{CgroupDef, CpusetSpec, KernelTarget, KernelValue, Op, OpKind};
+use super::{CgroupDef, CpusetSpec, KernelTarget, KernelValue, KernelValueWidth, Op, OpKind};
 
 // ---------------------------------------------------------------------------
 // Step / HoldSpec
@@ -452,10 +452,7 @@ impl Op {
     /// a [`WorkSpec`] explicitly and route through
     /// [`Self::spawn`] — the sugar is intentionally minimal so a
     /// non-default knob forces the explicit-WorkSpec call site.
-    pub fn spawn_in_cgroup(
-        cgroup: impl Into<Cow<'static, str>>,
-        work_type: WorkType,
-    ) -> Self {
+    pub fn spawn_in_cgroup(cgroup: impl Into<Cow<'static, str>>, work_type: WorkType) -> Self {
         Op::SpawnWorkers {
             cgroup: cgroup.into(),
             work: WorkSpec {
@@ -678,9 +675,11 @@ impl Op {
     }
 
     /// Live-vCPU read of `target` into the snapshot bridge keyed by
-    /// `tag`. See [`Op::ReadKernelHot`] for the live-vCPU
-    /// orchestration contract and the read-vs-guest-write race
-    /// caveat.
+    /// `tag`, with explicit `width` picking the read family
+    /// ([`KernelValueWidth::u32`] / [`KernelValueWidth::u64`] /
+    /// [`KernelValueWidth::bytes`]). See [`Op::ReadKernelHot`] for
+    /// the live-vCPU orchestration contract and the
+    /// read-vs-guest-write race caveat.
     ///
     /// Reads are singleton-only: each read produces one bridge
     /// entry keyed by `tag`. A batched read (multi-target single op)
@@ -688,17 +687,23 @@ impl Op {
     /// with parallel result slots or a HashMap result, both
     /// distinct contracts from the write batch's "do N writes".
     /// For now, dispatch N reads as N separate ops.
-    pub fn read_kernel_hot(tag: impl Into<Cow<'static, str>>, target: KernelTarget) -> Self {
+    pub fn read_kernel_hot(
+        tag: impl Into<Cow<'static, str>>,
+        target: KernelTarget,
+        width: KernelValueWidth,
+    ) -> Self {
         Op::ReadKernelHot {
             tag: tag.into(),
             target,
+            width,
         }
     }
 
     /// Auto-freezing read of `target` into the snapshot bridge keyed
-    /// by `tag`. See [`Op::ReadKernelCold`] for the
-    /// rendezvous-coherent-read contract and
-    /// [`Self::read_kernel_hot`] for the singleton-only rationale.
+    /// by `tag`, with explicit `width` picking the read family.
+    /// See [`Op::ReadKernelCold`] for the rendezvous-coherent-read
+    /// contract and [`Self::read_kernel_hot`] for the
+    /// singleton-only rationale.
     ///
     /// Until the adjacent-cold-op auto-merge (queued as a dedicated
     /// follow-up task) lands, each `read_kernel_cold` triggers its
@@ -706,10 +711,15 @@ impl Op {
     /// within the same coherent snapshot, prefer
     /// [`Op::CaptureSnapshot`] (which already orchestrates a single
     /// rendezvous for all snapshot reads).
-    pub fn read_kernel_cold(tag: impl Into<Cow<'static, str>>, target: KernelTarget) -> Self {
+    pub fn read_kernel_cold(
+        tag: impl Into<Cow<'static, str>>,
+        target: KernelTarget,
+        width: KernelValueWidth,
+    ) -> Self {
         Op::ReadKernelCold {
             tag: tag.into(),
             target,
+            width,
         }
     }
 }

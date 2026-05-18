@@ -379,7 +379,10 @@ impl BpfMapWrite {
     ///   comparison)
     pub const fn new(map_name_suffix: &'static str, offset: usize, value: u32) -> Self {
         let bytes = map_name_suffix.as_bytes();
-        assert!(!bytes.is_empty(), "BpfMapWrite map_name_suffix must not be empty");
+        assert!(
+            !bytes.is_empty(),
+            "BpfMapWrite map_name_suffix must not be empty"
+        );
         assert!(
             bytes[0] == b'.',
             "BpfMapWrite map_name_suffix must start with `.` (BPF map suffixes match ELF section names like `.bss`, `.data`, `.rodata`)",
@@ -1700,10 +1703,13 @@ impl KtstrTestEntry {
         // of the per-entry ones. A scheduler whose declared topology
         // requirements are themselves inverted has the same silent-
         // filter pathology regardless of what test entries declare.
-        self.scheduler
-            .constraints
-            .validate()
-            .map_err(|e| anyhow::anyhow!("KtstrTestEntry '{}'.scheduler '{}'.constraints: {e}", self.name, self.scheduler.name))?;
+        self.scheduler.constraints.validate().map_err(|e| {
+            anyhow::anyhow!(
+                "KtstrTestEntry '{}'.scheduler '{}'.constraints: {e}",
+                self.name,
+                self.scheduler.name
+            )
+        })?;
         Ok(())
     }
 
@@ -3672,7 +3678,9 @@ mod tests {
             .expect_err("inverted scheduler-level constraints must surface");
         let msg = err.to_string();
         assert!(
-            msg.contains("KtstrTestEntry 'test_inverted_scheduler'.scheduler 'bad_sched'.constraints:"),
+            msg.contains(
+                "KtstrTestEntry 'test_inverted_scheduler'.scheduler 'bad_sched'.constraints:"
+            ),
             "wrap prefix must name the entry + scheduler + constraints: got {msg}",
         );
         assert!(

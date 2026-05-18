@@ -41,10 +41,7 @@ pub enum MissingStatsReason {
     /// The scheduler returned a non-zero `errno` in the typed
     /// [`StatsResponse`] envelope. The `args` payload is preserved
     /// so operators can render the scheduler-side message.
-    SchedulerError {
-        errno: i32,
-        args: serde_json::Value,
-    },
+    SchedulerError { errno: i32, args: serde_json::Value },
     /// The typed envelope was decoded but the inner `args` map
     /// did not contain the expected `"resp"` key — protocol
     /// mismatch with the scheduler.
@@ -228,7 +225,7 @@ pub enum SnapshotError {
     /// A per-CPU slot was out of range or unmapped.
     PerCpuSlot {
         map: String,
-        cpu: usize,
+        cpu: u32,
         len: usize,
         unmapped: bool,
     },
@@ -479,3 +476,25 @@ impl std::error::Error for SnapshotError {}
 
 /// Result alias for snapshot accessors.
 pub type SnapshotResult<T> = std::result::Result<T, SnapshotError>;
+
+/// Typed shape of one entry drained from the snapshot bridge's
+/// ordered per-tag store. Each tuple is `(tag, report, stats,
+/// elapsed_ms)`:
+/// * `tag`: snapshot name the report was stored under.
+/// * `report`: [`crate::monitor::dump::FailureDumpReport`] of the
+///   captured guest state.
+/// * `stats`: scheduler-side stats JSON or a typed
+///   [`MissingStatsReason`] when capture happened without a
+///   wired stats client.
+/// * `elapsed_ms`: optional wall-clock anchor (ms since run-start).
+///
+/// Used by [`crate::scenario::snapshot::SnapshotBridge::drain_ordered_with_stats`]
+/// and [`crate::scenario::sample::SampleSeries::from_drained_typed`]
+/// to avoid restating the 4-tuple shape at every consumer (which
+/// trips clippy's `type_complexity` lint).
+pub type DrainedSnapshotEntry = (
+    String,
+    crate::monitor::dump::FailureDumpReport,
+    std::result::Result<serde_json::Value, MissingStatsReason>,
+    Option<u64>,
+);

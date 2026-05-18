@@ -983,8 +983,10 @@ fn spawn_page_fault_churn_produces_work() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let snap2 = loop {
         let snap = h.snapshot_iterations();
-        let all_advanced =
-            snap.iter().zip(snap1.iter()).all(|(b, a)| b.saturating_sub(*a) > 0);
+        let all_advanced = snap
+            .iter()
+            .zip(snap1.iter())
+            .all(|(b, a)| b.saturating_sub(*a) > 0);
         if all_advanced {
             break snap;
         }
@@ -1362,8 +1364,7 @@ fn vec_worker_report_postcard_roundtrip() {
     second.is_messenger = false;
     second.exit_info = Some(WorkerExitInfo::Signaled(9));
     let reports: Vec<WorkerReport> = vec![fully_populated_report(), second];
-    let bytes =
-        postcard::to_stdvec(&reports).expect("encode");
+    let bytes = postcard::to_stdvec(&reports).expect("encode");
     let decoded: Vec<WorkerReport> = postcard::from_bytes(&bytes).expect("decode");
     assert_eq!(decoded.len(), reports.len(), "vec length must roundtrip");
     for (i, (a, b)) in reports.iter().zip(decoded.iter()).enumerate() {
@@ -1421,8 +1422,7 @@ fn worker_report_postcard_default_roundtrip() {
 #[test]
 fn truncated_frame_decodes_to_err() {
     let report = fully_populated_report();
-    let bytes =
-        postcard::to_stdvec(&report).expect("encode");
+    let bytes = postcard::to_stdvec(&report).expect("encode");
     assert!(
         bytes.len() >= 2,
         "encoded report must be at least 2 bytes; got {}",

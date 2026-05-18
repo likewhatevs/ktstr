@@ -3,9 +3,9 @@
 //! Used by the host monitor and BPF reader to resolve symbols and
 //! BTF offsets against the running guest kernel.
 
+use crate::sync::RwLockExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
-use crate::sync::RwLockExt;
 
 /// Process-global cache of vmlinux ELF bytes keyed by canonical path.
 ///

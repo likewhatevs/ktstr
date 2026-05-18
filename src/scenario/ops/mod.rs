@@ -2388,11 +2388,12 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 // `crate::scenario::flatten_for_spawn`, so both
                 // consumer sites of ResolvedAffinity::Random share
                 // identical regression surfaces.
-                let random_pool: Vec<usize> = if let ResolvedAffinity::Random { from, .. } = &resolved {
-                    from.iter().copied().collect()
-                } else {
-                    Vec::new()
-                };
+                let random_pool: Vec<usize> =
+                    if let ResolvedAffinity::Random { from, .. } = &resolved {
+                        from.iter().copied().collect()
+                    } else {
+                        Vec::new()
+                    };
                 for (name, handle) in state.all_handles() {
                     if name.as_str() == *cgroup {
                         match &resolved {
@@ -2823,36 +2824,193 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     }
                 }
             }
-            Op::WriteKernelHot { writes: _ } => {
-                anyhow::bail!(
-                    "Op::WriteKernelHot: dispatcher not yet implemented (handler lands in \
-                     a follow-up sub-batch — variant declaration + constructors are \
-                     in place, executor wiring is queued)"
+            Op::WriteKernelHot { writes } => {
+                let payload = build_kernel_op_request(
+                    crate::vmm::wire::KernelOpMode::Hot,
+                    crate::vmm::wire::KernelOpDirection::Write,
+                    String::new(),
+                    write_entries_from_writes(writes),
                 );
+                dispatch_kernel_op_request("Op::WriteKernelHot", payload)?;
             }
-            Op::WriteKernelCold { writes: _ } => {
-                anyhow::bail!(
-                    "Op::WriteKernelCold: dispatcher not yet implemented (handler lands in \
-                     a follow-up sub-batch — variant declaration + constructors are \
-                     in place, executor wiring is queued)"
+            Op::WriteKernelCold { writes } => {
+                let payload = build_kernel_op_request(
+                    crate::vmm::wire::KernelOpMode::Cold,
+                    crate::vmm::wire::KernelOpDirection::Write,
+                    String::new(),
+                    write_entries_from_writes(writes),
                 );
+                dispatch_kernel_op_request("Op::WriteKernelCold", payload)?;
             }
-            Op::ReadKernelHot { tag: _, target: _ } => {
-                anyhow::bail!(
-                    "Op::ReadKernelHot: dispatcher not yet implemented (handler lands in \
-                     a follow-up sub-batch — variant declaration + constructors are \
-                     in place, executor wiring is queued)"
+            Op::ReadKernelHot { tag, target, width } => {
+                let payload = build_kernel_op_request(
+                    crate::vmm::wire::KernelOpMode::Hot,
+                    crate::vmm::wire::KernelOpDirection::Read,
+                    tag.to_string(),
+                    vec![crate::vmm::wire::KernelOpEntry {
+                        target: target.into(),
+                        value: width.into(),
+                    }],
                 );
+                dispatch_kernel_op_request("Op::ReadKernelHot", payload)?;
             }
-            Op::ReadKernelCold { tag: _, target: _ } => {
-                anyhow::bail!(
-                    "Op::ReadKernelCold: dispatcher not yet implemented (handler lands in \
-                     a follow-up sub-batch — variant declaration + constructors are \
-                     in place, executor wiring is queued)"
+            Op::ReadKernelCold { tag, target, width } => {
+                let payload = build_kernel_op_request(
+                    crate::vmm::wire::KernelOpMode::Cold,
+                    crate::vmm::wire::KernelOpDirection::Read,
+                    tag.to_string(),
+                    vec![crate::vmm::wire::KernelOpEntry {
+                        target: target.into(),
+                        value: width.into(),
+                    }],
                 );
+                dispatch_kernel_op_request("Op::ReadKernelCold", payload)?;
             }
         }
     }
+    Ok(())
+}
+
+/// Build a [`crate::vmm::wire::KernelOpRequestPayload`] from the
+/// per-arm bits — mode, direction, tag, entries. The `request_id` is
+/// stamped 0 here and overwritten by the wire transport
+/// ([`crate::vmm::guest_comms::request_kernel_op`]) before publishing;
+/// the bridge path ignores it (the in-process callback round-trips
+/// whatever id the caller supplied).
+fn build_kernel_op_request(
+    mode: crate::vmm::wire::KernelOpMode,
+    direction: crate::vmm::wire::KernelOpDirection,
+    tag: String,
+    entries: Vec<crate::vmm::wire::KernelOpEntry>,
+) -> crate::vmm::wire::KernelOpRequestPayload {
+    crate::vmm::wire::KernelOpRequestPayload {
+        request_id: 0,
+        mode,
+        direction,
+        tag,
+        entries,
+    }
+}
+
+/// Convert an Op-side `(KernelTarget, KernelValue)` write batch into
+/// the wire-side [`crate::vmm::wire::KernelOpEntry`] list, using the
+/// `From<&KernelTarget>` / `From<&KernelValue>` impls in
+/// [`super::types::op`] for the 1:1 enum mapping.
+fn write_entries_from_writes(
+    writes: &[(KernelTarget, KernelValue)],
+) -> Vec<crate::vmm::wire::KernelOpEntry> {
+    writes
+        .iter()
+        .map(|(target, value)| crate::vmm::wire::KernelOpEntry {
+            target: target.into(),
+            value: value.into(),
+        })
+        .collect()
+}
+
+/// Dispatch a built [`crate::vmm::wire::KernelOpRequestPayload`] via
+/// the bridge-first / wire-fallback / hard-fail pattern:
+///
+/// 1. **Test fixture path**: if a thread-local
+///    [`crate::scenario::snapshot::SnapshotBridge`] is installed
+///    with a kernel-op callback, route the request through it. The
+///    callback can record the request, synthesise a reply, and
+///    return without touching real guest memory — the host-side
+///    coordinator / freeze-coord paths are not invoked.
+/// 2. **Production path**: if the executor is running inside a
+///    guest VM (no in-process bridge callback), forward the
+///    request via the port-1 TLV stream through
+///    [`crate::vmm::guest_comms::request_kernel_op`]. The host-side
+///    handler that consumes the request (freeze-coord cold-path
+///    for `Cold` mode, host-worker for `Hot` mode) lands in
+///    dedicated follow-up sub-batches; until those handlers exist
+///    the wire fallback will surface a `TransportError` after the
+///    deadline elapses.
+/// 3. **Neither**: a hard `anyhow::bail!` with an actionable hint.
+///    Per the project "no silent drops" rule the dispatcher
+///    refuses to no-op; a no-bridge-no-guest call is always a
+///    misconfigured test fixture. The bail names both recovery
+///    paths so the test author can install a callback via
+///    `SnapshotBridge::new(...).with_kernel_op(...).set_thread_local()`
+///    or run the scenario inside a guest VM.
+///
+/// On any success-path reply the function checks
+/// [`crate::vmm::wire::KernelOpReplyPayload::success`] and converts
+/// `false` to an `anyhow::Error` so the caller's `?` propagation
+/// surfaces the host-side failure.
+///
+/// **Timeout choice.** The 30 s wire-fallback timeout is sized for
+/// the cold path's freeze-rendezvous round-trip (matches the
+/// `FREEZE_RENDEZVOUS_TIMEOUT` budget in CLAUDE.md). The hot path
+/// completes sub-microsecond and treats the timeout strictly as an
+/// upper bound; a regression that stalls the host-worker would
+/// surface as a deferred 30 s wait, not a missed bug.
+fn dispatch_kernel_op_request(
+    op_label: &str,
+    payload: crate::vmm::wire::KernelOpRequestPayload,
+) -> Result<()> {
+    // `with_active_bridge` returns `Option<Option<reply>>` — outer
+    // `None` means no bridge active on the thread; inner `None`
+    // means bridge active but no kernel-op callback installed.
+    // Both collapse to "no bridge-routed reply" via `.flatten()`.
+    let bridge_reply =
+        crate::scenario::snapshot::with_active_bridge(|b| b.dispatch_kernel_op(&payload)).flatten();
+    if let Some(reply) = bridge_reply {
+        return check_kernel_op_reply(op_label, &payload, &reply);
+    }
+    if !crate::vmm::guest_comms::is_guest() {
+        // No bridge callback AND not in a guest VM — refuse to
+        // no-op. The actionable hint names both recovery paths so
+        // the test author can pick the one matching their context
+        // (per the project "no silent drops" rule).
+        anyhow::bail!(
+            "{op_label}('{}'): no SnapshotBridge kernel-op callback is installed on this \
+             thread and not running in a guest VM. Install a callback via \
+             SnapshotBridge::new(...).with_kernel_op(...).set_thread_local() for host-side \
+             tests, or run the scenario inside a ktstr guest VM where the port-1 wire path \
+             provides dispatch.",
+            payload.tag,
+        );
+    }
+    let timeout = std::time::Duration::from_secs(30);
+    match crate::vmm::guest_comms::request_kernel_op(payload.clone(), timeout) {
+        crate::vmm::wire::KernelOpRequestResult::Ok(reply) => {
+            check_kernel_op_reply(op_label, &payload, &reply)
+        }
+        crate::vmm::wire::KernelOpRequestResult::TransportError { reason } => {
+            anyhow::bail!(
+                "{op_label}('{}'): port-1 transport failure: {reason}",
+                payload.tag,
+            );
+        }
+    }
+}
+
+/// Inspect a [`crate::vmm::wire::KernelOpReplyPayload`]. Logs success
+/// at info level (with entry count + tag for diagnostics), converts
+/// `success = false` into an `anyhow::Error` so the executor's `?`
+/// propagation bails the step.
+fn check_kernel_op_reply(
+    op_label: &str,
+    request: &crate::vmm::wire::KernelOpRequestPayload,
+    reply: &crate::vmm::wire::KernelOpReplyPayload,
+) -> Result<()> {
+    if !reply.success {
+        anyhow::bail!(
+            "{op_label}('{}'): host reported failure: {}",
+            request.tag,
+            reply.reason,
+        );
+    }
+    tracing::info!(
+        op = op_label,
+        tag = %request.tag,
+        mode = ?request.mode,
+        direction = ?request.direction,
+        entries = request.entries.len(),
+        read_values = reply.read_values.len(),
+        "{op_label}: host completed kernel-op batch",
+    );
     Ok(())
 }
 
@@ -3542,10 +3700,12 @@ mod tests {
             Op::ReadKernelHot {
                 tag: "t".into(),
                 target: KernelTarget::symbol("x"),
+                width: KernelValueWidth::u64(),
             },
             Op::ReadKernelCold {
                 tag: "t".into(),
                 target: KernelTarget::symbol("x"),
+                width: KernelValueWidth::u64(),
             },
         ];
         let mut seen = std::collections::BTreeSet::new();
@@ -3736,7 +3896,8 @@ mod tests {
         assert_eq!(
             Op::ReadKernelHot {
                 tag: "t".into(),
-                target: KernelTarget::symbol("x")
+                target: KernelTarget::symbol("x"),
+                width: KernelValueWidth::u64(),
             }
             .discriminant(),
             20,
@@ -3745,7 +3906,8 @@ mod tests {
         assert_eq!(
             Op::ReadKernelCold {
                 tag: "t".into(),
-                target: KernelTarget::symbol("x")
+                target: KernelTarget::symbol("x"),
+                width: KernelValueWidth::u64(),
             }
             .discriminant(),
             21,
@@ -4077,12 +4239,14 @@ mod tests {
         let sched_died_details: Vec<_> = result
             .details
             .iter()
-            .filter(|d| matches!(
-                d.kind,
-                crate::assert::DetailKind::SchedulerCrashed
-                    | crate::assert::DetailKind::SchedulerExitedCleanly
-                    | crate::assert::DetailKind::SchedulerDiedUnknownReason
-            ))
+            .filter(|d| {
+                matches!(
+                    d.kind,
+                    crate::assert::DetailKind::SchedulerCrashed
+                        | crate::assert::DetailKind::SchedulerExitedCleanly
+                        | crate::assert::DetailKind::SchedulerDiedUnknownReason
+                )
+            })
             .collect();
         assert_eq!(
             sched_died_details.len(),
@@ -4277,13 +4441,12 @@ mod tests {
             HoldSpec::loop_at(Duration::from_millis(30)),
         )];
 
-        let (_, captured_stderr) =
-            crate::test_support::test_helpers::capture_stderr(|| {
-                let _ = execute_steps(&ctx, steps).expect(
-                    "execute_steps converts step Err to Ok(passed=false); the \
+        let (_, captured_stderr) = crate::test_support::test_helpers::capture_stderr(|| {
+            let _ = execute_steps(&ctx, steps).expect(
+                "execute_steps converts step Err to Ok(passed=false); the \
                      Err must NOT propagate to the caller",
-                );
-            });
+            );
+        });
 
         let stderr_text = String::from_utf8_lossy(&captured_stderr);
         assert!(
@@ -8298,10 +8461,12 @@ mod tests {
             Op::read_kernel_hot(
                 "constructor-test-hot",
                 KernelTarget::symbol("constructor_test_symbol"),
+                KernelValueWidth::u64(),
             ),
             Op::read_kernel_cold(
                 "constructor-test-cold",
                 KernelTarget::symbol("constructor_test_symbol"),
+                KernelValueWidth::u32(),
             ),
         ];
 
@@ -10209,6 +10374,201 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------
+    // Kernel-op integration: 4 Op::*Kernel* arms dispatch through
+    // apply_ops + a thread-local SnapshotBridge kernel-op callback.
+    // -----------------------------------------------------------------
+
+    /// `Op::WriteKernelHot` dispatched via `apply_ops` invokes the
+    /// installed bridge kernel-op callback with the correct mode +
+    /// direction + entries, and the bridge's drain log records the
+    /// reply. Pins the executor arm's mapping from variant fields
+    /// to wire payload — a regression that flipped Hot↔Cold or
+    /// Write↔Read or dropped a write entry surfaces here.
+    #[test]
+    fn apply_ops_write_kernel_hot_dispatches_via_bridge() {
+        use std::sync::Arc;
+        let captured = Arc::new(std::sync::Mutex::new(
+            None::<crate::vmm::wire::KernelOpRequestPayload>,
+        ));
+        let captured_clone = captured.clone();
+        let kernel_op_cb: crate::scenario::snapshot::KernelOpCallback = Arc::new(move |req| {
+            *captured_clone.lock().unwrap() = Some(req.clone());
+            crate::vmm::wire::KernelOpReplyPayload {
+                request_id: req.request_id,
+                success: true,
+                reason: String::new(),
+                read_values: vec![],
+            }
+        });
+        let bridge = crate::scenario::snapshot::SnapshotBridge::new(Arc::new(|_| None))
+            .with_kernel_op(kernel_op_cb);
+        let bridge_clone = bridge.clone();
+        let _bg = bridge.set_thread_local();
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let ops = vec![Op::write_kernel_hot(
+            KernelTarget::symbol("test_field"),
+            KernelValue::u64(42),
+        )];
+        apply_ops_test(&ctx, &mut state, &ops).expect("WriteKernelHot must dispatch");
+        let req = captured.lock().unwrap().take().expect("callback must fire");
+        assert_eq!(req.mode, crate::vmm::wire::KernelOpMode::Hot);
+        assert_eq!(req.direction, crate::vmm::wire::KernelOpDirection::Write);
+        assert_eq!(req.entries.len(), 1);
+        match &req.entries[0].target {
+            crate::vmm::wire::KernelOpTarget::Symbol(s) => assert_eq!(s, "test_field"),
+            other => panic!("unexpected target shape: {other:?}"),
+        }
+        match req.entries[0].value {
+            crate::vmm::wire::KernelOpValue::U64(42) => {}
+            ref other => panic!("unexpected value shape: {other:?}"),
+        }
+        assert_eq!(bridge_clone.drain_kernel_ops().len(), 1);
+        cleanup_state(&mut state);
+    }
+
+    /// `Op::WriteKernelCold` dispatches with `KernelOpMode::Cold`
+    /// (vs Hot) — pins the per-arm mode mapping. A regression that
+    /// reused Hot's payload-build path for Cold would surface here.
+    #[test]
+    fn apply_ops_write_kernel_cold_dispatches_with_cold_mode() {
+        use std::sync::Arc;
+        let captured = Arc::new(std::sync::Mutex::new(
+            None::<crate::vmm::wire::KernelOpRequestPayload>,
+        ));
+        let captured_clone = captured.clone();
+        let kernel_op_cb: crate::scenario::snapshot::KernelOpCallback = Arc::new(move |req| {
+            *captured_clone.lock().unwrap() = Some(req.clone());
+            crate::vmm::wire::KernelOpReplyPayload {
+                request_id: req.request_id,
+                success: true,
+                reason: String::new(),
+                read_values: vec![],
+            }
+        });
+        let bridge = crate::scenario::snapshot::SnapshotBridge::new(Arc::new(|_| None))
+            .with_kernel_op(kernel_op_cb);
+        let _bg = bridge.set_thread_local();
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let ops = vec![Op::write_kernel_cold_batch(vec![
+            (
+                KernelTarget::per_cpu_field("runqueues", "clock", 0),
+                KernelValue::u64(100),
+            ),
+            (
+                KernelTarget::per_cpu_field("runqueues", "clock", 1),
+                KernelValue::u64(200),
+            ),
+        ])];
+        apply_ops_test(&ctx, &mut state, &ops).expect("WriteKernelCold must dispatch");
+        let req = captured.lock().unwrap().take().expect("callback must fire");
+        assert_eq!(req.mode, crate::vmm::wire::KernelOpMode::Cold);
+        assert_eq!(req.direction, crate::vmm::wire::KernelOpDirection::Write);
+        assert_eq!(req.entries.len(), 2, "batch must carry both entries");
+        cleanup_state(&mut state);
+    }
+
+    /// `Op::ReadKernelHot` dispatches with the right tag + width
+    /// hint. The wire payload's value-slot mirrors the
+    /// `KernelValueWidth` chosen at the variant level: U32 picks
+    /// the u32 read family, U64 picks u64, Bytes(N) picks the
+    /// N-byte read.
+    #[test]
+    fn apply_ops_read_kernel_hot_dispatches_with_width_u32() {
+        use std::sync::Arc;
+        let captured = Arc::new(std::sync::Mutex::new(
+            None::<crate::vmm::wire::KernelOpRequestPayload>,
+        ));
+        let captured_clone = captured.clone();
+        let kernel_op_cb: crate::scenario::snapshot::KernelOpCallback = Arc::new(move |req| {
+            *captured_clone.lock().unwrap() = Some(req.clone());
+            crate::vmm::wire::KernelOpReplyPayload {
+                request_id: req.request_id,
+                success: true,
+                reason: String::new(),
+                read_values: vec![crate::vmm::wire::KernelOpValue::U32(7)],
+            }
+        });
+        let bridge = crate::scenario::snapshot::SnapshotBridge::new(Arc::new(|_| None))
+            .with_kernel_op(kernel_op_cb);
+        let bridge_clone = bridge.clone();
+        let _bg = bridge.set_thread_local();
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let ops = vec![Op::read_kernel_hot(
+            "scratch_u32",
+            KernelTarget::symbol("some_u32"),
+            KernelValueWidth::u32(),
+        )];
+        apply_ops_test(&ctx, &mut state, &ops).expect("ReadKernelHot must dispatch");
+        let req = captured.lock().unwrap().take().expect("callback must fire");
+        assert_eq!(req.mode, crate::vmm::wire::KernelOpMode::Hot);
+        assert_eq!(req.direction, crate::vmm::wire::KernelOpDirection::Read);
+        assert_eq!(req.tag, "scratch_u32");
+        match req.entries[0].value {
+            crate::vmm::wire::KernelOpValue::U32(_) => {}
+            ref other => panic!("u32 width hint must emit U32 slot, got {other:?}"),
+        }
+        // Single-tag convenience accessor returns the U32 read-back.
+        match bridge_clone.kernel_op_value("scratch_u32") {
+            Some(crate::vmm::wire::KernelOpValue::U32(7)) => {}
+            other => panic!("kernel_op_value lookup mismatch: {other:?}"),
+        }
+        cleanup_state(&mut state);
+    }
+
+    /// `Op::ReadKernelCold` mirrors `Op::ReadKernelHot` with cold
+    /// mode + Bytes width. Pins the Bytes width hint passing
+    /// through to the wire payload's value slot.
+    #[test]
+    fn apply_ops_read_kernel_cold_dispatches_with_width_bytes() {
+        use std::sync::Arc;
+        let captured = Arc::new(std::sync::Mutex::new(
+            None::<crate::vmm::wire::KernelOpRequestPayload>,
+        ));
+        let captured_clone = captured.clone();
+        let kernel_op_cb: crate::scenario::snapshot::KernelOpCallback = Arc::new(move |req| {
+            *captured_clone.lock().unwrap() = Some(req.clone());
+            crate::vmm::wire::KernelOpReplyPayload {
+                request_id: req.request_id,
+                success: true,
+                reason: String::new(),
+                read_values: vec![crate::vmm::wire::KernelOpValue::Bytes(vec![0xAA; 16])],
+            }
+        });
+        let bridge = crate::scenario::snapshot::SnapshotBridge::new(Arc::new(|_| None))
+            .with_kernel_op(kernel_op_cb);
+        let _bg = bridge.set_thread_local();
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let ops = vec![Op::read_kernel_cold(
+            "scratch_bytes",
+            KernelTarget::kva(0xffff_c900_0000_1000),
+            KernelValueWidth::bytes(16),
+        )];
+        apply_ops_test(&ctx, &mut state, &ops).expect("ReadKernelCold must dispatch");
+        let req = captured.lock().unwrap().take().expect("callback must fire");
+        assert_eq!(req.mode, crate::vmm::wire::KernelOpMode::Cold);
+        assert_eq!(req.direction, crate::vmm::wire::KernelOpDirection::Read);
+        match &req.entries[0].value {
+            crate::vmm::wire::KernelOpValue::Bytes(b) => {
+                assert_eq!(b.len(), 16, "Bytes(16) width hint must emit a 16-byte slot");
+            }
+            other => panic!("Bytes width hint must emit Bytes slot, got {other:?}"),
+        }
+        cleanup_state(&mut state);
+    }
 }
 
 #[cfg(test)]
@@ -10263,5 +10623,236 @@ mod workers_pct_construction_tests {
     #[should_panic(expected = "must be finite and > 0.0")]
     fn work_spec_workers_pct_panics_on_negative() {
         let _ = WorkSpec::default().workers_pct(-0.5);
+    }
+}
+
+#[cfg(test)]
+mod kernel_op_dispatch_tests {
+    //! Coverage for the kernel-op dispatch surface: the four
+    //! `KernelTarget`/`KernelValue` conversion helpers plus
+    //! `dispatch_kernel_op_request`'s bridge-first /
+    //! wire-fallback / hard-bail routing.
+    //!
+    //! These exercise the host-side dispatch surface only. The
+    //! in-guest wire path (`request_kernel_op` end-to-end) is
+    //! covered separately in `src/vmm/guest_comms.rs::tests` and
+    //! the future end-to-end integration suite.
+
+    use std::sync::Arc;
+
+    use super::{
+        KernelTarget, KernelValue, build_kernel_op_request, dispatch_kernel_op_request,
+        write_entries_from_writes,
+    };
+    use crate::scenario::snapshot::{CaptureCallback, KernelOpCallback, SnapshotBridge};
+
+    /// 1:1 mapping of every `KernelTarget` variant via the
+    /// `From<&KernelTarget> for KernelOpTarget` impl — pins the
+    /// Cow-to-String coercion + per-CPU field decomposition. A
+    /// regression that flipped a variant tag, dropped a Cow→String
+    /// conversion, or swapped per-cpu-field fields surfaces here.
+    #[test]
+    fn kernel_target_into_wire_maps_every_variant() {
+        let cases: &[(KernelTarget, crate::vmm::wire::KernelOpTarget)] = &[
+            (
+                KernelTarget::symbol("jiffies"),
+                crate::vmm::wire::KernelOpTarget::Symbol("jiffies".into()),
+            ),
+            (
+                KernelTarget::direct(0xffff_8000_0000_2000),
+                crate::vmm::wire::KernelOpTarget::Direct(0xffff_8000_0000_2000),
+            ),
+            (
+                KernelTarget::kva(0xffff_c000_dead_beef),
+                crate::vmm::wire::KernelOpTarget::Kva(0xffff_c000_dead_beef),
+            ),
+            (
+                KernelTarget::per_cpu_field("runqueues", "clock", 5),
+                crate::vmm::wire::KernelOpTarget::PerCpuField {
+                    symbol: "runqueues".into(),
+                    field: "clock".into(),
+                    cpu: 5,
+                },
+            ),
+        ];
+        for (src, want) in cases {
+            let got: crate::vmm::wire::KernelOpTarget = src.into();
+            assert_eq!(&got, want, "wire mapping mismatch for {src:?}");
+        }
+    }
+
+    /// 1:1 mapping of every `KernelValue` variant via the
+    /// `From<&KernelValue> for KernelOpValue` impl — pins the
+    /// Bytes-clone semantic and the numeric-width identity. A
+    /// regression that swapped U32/U64 width or skipped the Bytes
+    /// clone surfaces here.
+    #[test]
+    fn kernel_value_into_wire_maps_every_variant() {
+        let u32_val: crate::vmm::wire::KernelOpValue = (&KernelValue::u32(42)).into();
+        assert_eq!(u32_val, crate::vmm::wire::KernelOpValue::U32(42));
+        let u64_val: crate::vmm::wire::KernelOpValue =
+            (&KernelValue::u64(0xDEAD_BEEF_CAFE_F00D)).into();
+        assert_eq!(
+            u64_val,
+            crate::vmm::wire::KernelOpValue::U64(0xDEAD_BEEF_CAFE_F00D)
+        );
+        let bytes = vec![1u8, 2, 3, 4, 5];
+        let bytes_val: crate::vmm::wire::KernelOpValue =
+            (&KernelValue::bytes(bytes.clone())).into();
+        assert_eq!(bytes_val, crate::vmm::wire::KernelOpValue::Bytes(bytes));
+    }
+
+    /// `write_entries_from_writes` preserves order and produces one
+    /// wire entry per source pair — the cold-batch contract relies
+    /// on every entry surviving the conversion in the supplied
+    /// sequence (a reorder would change which CPU's `rq.clock`
+    /// landed in which freeze-rendezvous slot).
+    #[test]
+    fn write_entries_from_writes_preserves_order_and_count() {
+        let writes = vec![
+            (
+                KernelTarget::per_cpu_field("runqueues", "clock", 0),
+                KernelValue::u64(100),
+            ),
+            (
+                KernelTarget::per_cpu_field("runqueues", "clock", 1),
+                KernelValue::u64(200),
+            ),
+            (KernelTarget::symbol("jiffies"), KernelValue::u32(0xDEAD)),
+        ];
+        let entries = write_entries_from_writes(&writes);
+        assert_eq!(entries.len(), 3);
+        match (&entries[0].target, &entries[0].value) {
+            (
+                crate::vmm::wire::KernelOpTarget::PerCpuField { cpu: 0, .. },
+                crate::vmm::wire::KernelOpValue::U64(100),
+            ) => {}
+            other => panic!("entry[0] mismatch: {other:?}"),
+        }
+        match (&entries[1].target, &entries[1].value) {
+            (
+                crate::vmm::wire::KernelOpTarget::PerCpuField { cpu: 1, .. },
+                crate::vmm::wire::KernelOpValue::U64(200),
+            ) => {}
+            other => panic!("entry[1] mismatch: {other:?}"),
+        }
+        match (&entries[2].target, &entries[2].value) {
+            (
+                crate::vmm::wire::KernelOpTarget::Symbol(s),
+                crate::vmm::wire::KernelOpValue::U32(0xDEAD),
+            ) if s == "jiffies" => {}
+            other => panic!("entry[2] mismatch: {other:?}"),
+        }
+    }
+
+    /// `dispatch_kernel_op_request` hard-bails when no bridge is
+    /// installed AND we're not in a guest VM — per the project
+    /// "no silent drops" rule. The bail message must name both
+    /// recovery paths (install bridge callback / run in guest VM)
+    /// so the misconfigured-test signal is actionable. A regression
+    /// that reverted to silent warn-skip would re-introduce the
+    /// vacuous-test footgun.
+    #[test]
+    fn dispatch_kernel_op_request_no_bridge_no_guest_hard_bails() {
+        let payload = build_kernel_op_request(
+            crate::vmm::wire::KernelOpMode::Hot,
+            crate::vmm::wire::KernelOpDirection::Write,
+            "missing_setup".into(),
+            vec![],
+        );
+        let r = dispatch_kernel_op_request("Op::TestNoBridge", payload);
+        let err = r.expect_err("no-bridge/non-guest must bail loudly, not warn-skip");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Op::TestNoBridge"),
+            "error must name the op label: {msg}"
+        );
+        assert!(
+            msg.contains("missing_setup"),
+            "error must name the request tag: {msg}"
+        );
+        assert!(
+            msg.contains("with_kernel_op"),
+            "error must point at SnapshotBridge::with_kernel_op recovery path: {msg}"
+        );
+        assert!(
+            msg.contains("guest VM"),
+            "error must mention the guest-VM recovery path: {msg}"
+        );
+    }
+
+    /// `dispatch_kernel_op_request` invokes the bridge callback on
+    /// success, propagates `reply.success == true` as `Ok(())`, and
+    /// the bridge's drain log captures the (tag, reply) pair.
+    #[test]
+    fn dispatch_kernel_op_request_bridge_success_path() {
+        let cb: CaptureCallback = Arc::new(|_| None);
+        let kernel_op_cb: KernelOpCallback =
+            Arc::new(|req| crate::vmm::wire::KernelOpReplyPayload {
+                request_id: req.request_id,
+                success: true,
+                reason: String::new(),
+                read_values: vec![],
+            });
+        let bridge = SnapshotBridge::new(cb).with_kernel_op(kernel_op_cb);
+        let bridge_clone = bridge.clone();
+        let _g = bridge.set_thread_local();
+        let payload = build_kernel_op_request(
+            crate::vmm::wire::KernelOpMode::Cold,
+            crate::vmm::wire::KernelOpDirection::Write,
+            "test_tag".into(),
+            vec![crate::vmm::wire::KernelOpEntry {
+                target: crate::vmm::wire::KernelOpTarget::Symbol("jiffies".into()),
+                value: crate::vmm::wire::KernelOpValue::U64(42),
+            }],
+        );
+        let r = dispatch_kernel_op_request("Op::TestSuccess", payload);
+        assert!(r.is_ok(), "bridge success path must Ok, got {r:?}");
+        let log = bridge_clone.drain_kernel_ops();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].0, "test_tag");
+        assert!(log[0].1.success);
+    }
+
+    /// `dispatch_kernel_op_request` propagates `reply.success ==
+    /// false` as an `anyhow::Error` carrying the reason — the
+    /// executor's `?` propagation thus surfaces host-side op
+    /// failures (e.g. "symbol not found") to the caller.
+    #[test]
+    fn dispatch_kernel_op_request_bridge_failure_path_bails() {
+        let cb: CaptureCallback = Arc::new(|_| None);
+        let kernel_op_cb: KernelOpCallback =
+            Arc::new(|req| crate::vmm::wire::KernelOpReplyPayload {
+                request_id: req.request_id,
+                success: false,
+                reason: "host: symbol 'bogus' not found".into(),
+                read_values: vec![],
+            });
+        let bridge = SnapshotBridge::new(cb).with_kernel_op(kernel_op_cb);
+        let _g = bridge.set_thread_local();
+        let payload = build_kernel_op_request(
+            crate::vmm::wire::KernelOpMode::Hot,
+            crate::vmm::wire::KernelOpDirection::Read,
+            "failing_tag".into(),
+            vec![crate::vmm::wire::KernelOpEntry {
+                target: crate::vmm::wire::KernelOpTarget::Symbol("bogus".into()),
+                value: crate::vmm::wire::KernelOpValue::U64(0),
+            }],
+        );
+        let r = dispatch_kernel_op_request("Op::TestFailure", payload);
+        let err = r.expect_err("reply.success=false must bail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Op::TestFailure"),
+            "error must name the op label: {msg}"
+        );
+        assert!(
+            msg.contains("failing_tag"),
+            "error must name the request tag: {msg}"
+        );
+        assert!(
+            msg.contains("symbol 'bogus' not found"),
+            "error must surface the host reason: {msg}"
+        );
     }
 }

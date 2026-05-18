@@ -9,6 +9,7 @@
 //! - aarch64: serial + virtio-console both via MMIO ([`dispatch_mmio_write`]
 //!   / [`dispatch_mmio_read`]).
 
+use crate::sync::MutexExt;
 use crate::vmm::PiMutex;
 use crate::vmm::vcpu::{SCX_EXIT_ERROR_THRESHOLD, WatchpointArm, self_arm_watchpoint};
 use crate::vmm::{console, kvm, virtio_blk, virtio_console, virtio_net};
@@ -17,7 +18,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use vmm_sys_util::eventfd::EventFd;
-use crate::sync::MutexExt;
 
 /// Snapshot of a vCPU's architectural state, captured by the vCPU
 /// thread itself at freeze time (just before it parks). Surfaced in

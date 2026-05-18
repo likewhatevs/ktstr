@@ -23,7 +23,11 @@ fn starved_fail() {
         rpt(2, 0, 5e9 as u64, 5e9 as u64, &[0], 50),
     ]);
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| matches!(d.kind, DetailKind::Starved)));
+    assert!(
+        r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Starved))
+    );
 }
 
 #[test]
@@ -34,7 +38,11 @@ fn unfair_spread_fail() {
         rpt(3, 800, 5e9 as u64, 2e9 as u64, &[0, 1], 50),  // 40%
     ]);
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| matches!(d.kind, DetailKind::Unfair)));
+    assert!(
+        r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Unfair))
+    );
 }
 
 #[test]
@@ -56,7 +64,11 @@ fn stuck_fail() {
         rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[0], threshold + 500),
     ]);
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| matches!(d.kind, DetailKind::Stuck)));
+    assert!(
+        r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Stuck))
+    );
 }
 
 #[test]
@@ -80,7 +92,11 @@ fn isolation_fail() {
         &expected,
     );
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| matches!(d.kind, DetailKind::Isolation)));
+    assert!(
+        r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Isolation))
+    );
 }
 
 #[test]
@@ -119,7 +135,11 @@ fn zero_wall_time() {
         rpt(2, 0, 0, 0, &[], 0),
     ]);
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| matches!(d.kind, DetailKind::Starved)));
+    assert!(
+        r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Starved))
+    );
 }
 
 #[test]
@@ -164,7 +184,11 @@ fn gap_boundary_above_threshold_fail() {
     let threshold = gap_threshold_ms();
     let r = assert_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], threshold + 1)]);
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| matches!(d.kind, DetailKind::Stuck)));
+    assert!(
+        r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Stuck))
+    );
 }
 
 #[test]
@@ -223,7 +247,11 @@ fn isolation_empty_expected_set() {
     );
     // Worker used CPUs {0,1}, expected is empty, so all are unexpected.
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| matches!(d.kind, DetailKind::Isolation)));
+    assert!(
+        r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Isolation))
+    );
 }
 
 #[test]
@@ -242,7 +270,11 @@ fn isolation_all_unexpected_cpus() {
         &expected,
     );
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| matches!(d.kind, DetailKind::Isolation)));
+    assert!(
+        r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Isolation))
+    );
 }
 
 // ---------------------------------------------------------------
@@ -298,8 +330,14 @@ fn neg_isolation_violation_outside_cpuset() {
         detail.message.contains("tid 2"),
         "must name violating tid: {detail}"
     );
-    assert!(detail.message.contains("2"), "must list out-of-set CPU 2: {detail}");
-    assert!(detail.message.contains("3"), "must list out-of-set CPU 3: {detail}");
+    assert!(
+        detail.message.contains("2"),
+        "must list out-of-set CPU 2: {detail}"
+    );
+    assert!(
+        detail.message.contains("3"),
+        "must list out-of-set CPU 3: {detail}"
+    );
     // Worker 1 ran only on {0,1} which is within expected — no violation.
     assert_eq!(r.details.len(), 1, "only tid 2 should violate");
 }
@@ -325,7 +363,10 @@ fn neg_unfairness_extreme_spread_detected() {
         detail.message.contains("workers"),
         "must include worker count: {detail}"
     );
-    assert!(detail.message.contains("cpus"), "must include cpu count: {detail}");
+    assert!(
+        detail.message.contains("cpus"),
+        "must include cpu count: {detail}"
+    );
     // Threshold must appear so a regression dropping the bound surfaces here.
     // The literal value comes from `spread_threshold_pct()` which differs
     // between debug and release builds; pin only the textual prefix.
@@ -391,7 +432,9 @@ fn neg_scheduling_gap_exceeds_threshold() {
     // and so a regression dropping the bound from the default-path message
     // surfaces here.
     assert!(
-        detail.message.contains(&format!("threshold {}ms", threshold)),
+        detail
+            .message
+            .contains(&format!("threshold {}ms", threshold)),
         "must include default-path threshold: {detail}"
     );
     // Stats must reflect the gap.
@@ -418,7 +461,10 @@ fn neg_plan_custom_gap_catches_lower_threshold() {
         detail.message.contains("1000ms"),
         "must include gap duration: {detail}"
     );
-    assert!(detail.message.contains("cpu1"), "must include CPU: {detail}");
+    assert!(
+        detail.message.contains("cpu1"),
+        "must include CPU: {detail}"
+    );
     assert!(
         detail.message.contains("threshold 500ms"),
         "must include custom threshold: {detail}"
@@ -460,9 +506,18 @@ fn neg_isolation_plus_starvation_both_reported() {
         .iter()
         .find(|d| matches!(d.kind, DetailKind::Isolation))
         .unwrap();
-    assert!(iso_detail.message.contains("tid 2"), "isolation tid: {iso_detail}");
-    assert!(iso_detail.message.contains("4"), "must list CPU 4: {iso_detail}");
-    assert!(iso_detail.message.contains("5"), "must list CPU 5: {iso_detail}");
+    assert!(
+        iso_detail.message.contains("tid 2"),
+        "isolation tid: {iso_detail}"
+    );
+    assert!(
+        iso_detail.message.contains("4"),
+        "must list CPU 4: {iso_detail}"
+    );
+    assert!(
+        iso_detail.message.contains("5"),
+        "must list CPU 5: {iso_detail}"
+    );
 }
 
 #[test]
@@ -494,6 +549,9 @@ fn neg_plan_custom_gap_passes_below_threshold() {
     ];
     let r = plan.assert_cgroup(&reports, None, None);
     // 1000ms gap < 5000ms threshold, so it passes.
-    let has_stuck = r.details.iter().any(|d| matches!(d.kind, DetailKind::Stuck));
+    let has_stuck = r
+        .details
+        .iter()
+        .any(|d| matches!(d.kind, DetailKind::Stuck));
     assert!(!has_stuck, "1000ms gap should pass 5000ms threshold");
 }

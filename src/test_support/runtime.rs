@@ -1590,7 +1590,6 @@ mod tests {
         );
     }
 
-
     // -- vm_timeout_from_entry tests --
 
     #[test]

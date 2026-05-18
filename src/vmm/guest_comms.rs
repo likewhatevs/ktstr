@@ -22,9 +22,10 @@
 
 use crate::sync::MutexExt;
 use crate::vmm::wire::{
-    LifecyclePhase, MSG_TYPE_SNAPSHOT_REPLY, MsgType, SNAPSHOT_REASON_MAX, SNAPSHOT_STATUS_ERR,
-    SNAPSHOT_STATUS_OK, SNAPSHOT_TAG_MAX, ShmMessage, SnapshotReplyPayload, SnapshotRequestPayload,
-    SnapshotRequestResult,
+    KERNEL_OP_REPLY_MAX, KernelOpReplyPayload, KernelOpRequestPayload, KernelOpRequestResult,
+    LifecyclePhase, MSG_TYPE_KERNEL_OP_REPLY, MSG_TYPE_SNAPSHOT_REPLY, MsgType,
+    SNAPSHOT_REASON_MAX, SNAPSHOT_STATUS_ERR, SNAPSHOT_STATUS_OK, SNAPSHOT_TAG_MAX, ShmMessage,
+    SnapshotReplyPayload, SnapshotRequestPayload, SnapshotRequestResult,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -335,9 +336,7 @@ pub fn send_test_result(result: &crate::assert::AssertResult) {
                             crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD,
                         ),
                     ));
-                if let Ok(small) =
-                    postcard::to_stdvec(&truncated)
-                {
+                if let Ok(small) = postcard::to_stdvec(&truncated) {
                     write_msg(MsgType::TestResult.wire_value(), &small);
                 }
             } else {
@@ -643,13 +642,27 @@ pub fn send_probe_output(buf: &[u8]) {
 static SNAPSHOT_REQUEST_COUNTER: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(1);
 
-/// Mutex serialising guest-side snapshot requests. Without this two
-/// guest threads issuing `Op::CaptureSnapshot` concurrently could interleave
-/// their TX writes and read each other's replies. The freeze
-/// coordinator's `on_demand_in_flight` latch already collapses
+/// Mutex serialising guest-side request/reply RPCs over the
+/// port-1 transport — both [`request_snapshot`] and
+/// [`request_kernel_op`] take it before publishing. Without it two
+/// guest threads issuing concurrent requests would interleave their
+/// TX writes and race for each other's replies on the shared read fd
+/// (only one open is permitted per port, so the snapshot reader and
+/// the kernel-op reader share the same `BULK_PORT_FD` handle). The
+/// freeze coordinator's `on_demand_in_flight` latch already collapses
 /// doorbell floods to one capture per thaw on the host side; this
-/// lock keeps the guest-side request/reply pairing well-defined too.
+/// lock keeps the guest-side request/reply pairing well-defined for
+/// every RPC kind too.
 static SNAPSHOT_REQUEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Monotonic guest-side request id counter for
+/// [`request_kernel_op`]. Kept separate from
+/// [`SNAPSHOT_REQUEST_COUNTER`] so the two RPC kinds have independent
+/// id sequences — the reply's [`MsgType`] distinguishes which counter
+/// the id pairs against, but separate counters keep on-the-wire ids
+/// monotonic per request kind which simplifies host-side logs.
+static KERNEL_OP_REQUEST_COUNTER: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(1);
 
 /// Cached read-side handle on `/dev/vport0p1`. Reused across snapshot
 /// requests so the kernel's port-1 read queue refills only once per
@@ -780,8 +793,18 @@ fn bounded_read_exact(
 /// reads the payload with `bounded_read_exact`. On any I/O failure
 /// (premature EOF, EINTR, etc.) the cached handle is dropped so a
 /// subsequent call retries the open.
+///
+/// `max_payload_size` caps the payload allocation against a hostile
+/// or corrupted host that frames an oversized length. Callers pass
+/// the upper bound of any payload they expect to read on this
+/// transport (e.g. `size_of::<SnapshotReplyPayload>()` for snapshot
+/// replies, [`KERNEL_OP_REPLY_MAX`] for postcard-encoded kernel-op
+/// replies); a length above the cap is rejected with `InvalidData`
+/// BEFORE the `vec![0u8; length]` allocation so a forged
+/// `length = u32::MAX` cannot OOM the guest's PID 1 init.
 fn read_bulk_port_frame(
     f: &mut std::fs::File,
+    max_payload_size: usize,
     deadline: std::time::Instant,
 ) -> std::io::Result<(u32, Vec<u8>)> {
     let mut header = [0u8; std::mem::size_of::<ShmMessage>()];
@@ -792,22 +815,13 @@ fn read_bulk_port_frame(
             "ShmMessage::read_from_bytes failed (header underflow)",
         )
     })?;
-    // Cap payload allocation at the largest frame this transport can
-    // legitimately deliver. The only producer on port-1 RX is the
-    // host's snapshot-reply path which writes exactly
-    // `size_of::<SnapshotReplyPayload>()` bytes. A host that frames
-    // an oversized length (corruption or hostile) would otherwise
-    // cause `vec![0u8; u32::MAX]` to OOM the guest before the
-    // post-read length check at the caller has a chance to reject
-    // the frame.
     let length = msg.length as usize;
-    if length > std::mem::size_of::<SnapshotReplyPayload>() {
+    if length > max_payload_size {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
-                "TLV length {length} exceeds max payload {} for port-1 RX; \
-                 rejecting before allocation to avoid guest OOM",
-                std::mem::size_of::<SnapshotReplyPayload>()
+                "TLV length {length} exceeds max payload {max_payload_size} for port-1 RX; \
+                 rejecting before allocation to avoid guest OOM"
             ),
         ));
     }
@@ -856,8 +870,7 @@ pub fn request_snapshot(
                 .into(),
         };
     }
-    let _guard = SNAPSHOT_REQUEST_LOCK
-        .lock_unpoisoned();
+    let _guard = SNAPSHOT_REQUEST_LOCK.lock_unpoisoned();
     // Allocate a request id. Skip 0 so the wait loop's `reply.request_id
     // == request_id` check cannot accidentally match a zero-initialised
     // reply payload from an earlier protocol version.
@@ -918,26 +931,29 @@ pub fn request_snapshot(
                 ),
             };
         }
-        let frame = match read_bulk_port_frame(f, deadline) {
-            Ok(frame) => frame,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                return SnapshotRequestResult::TransportError {
-                    reason: format!(
-                        "snapshot reply deadline elapsed before frame complete \
+        let frame =
+            match read_bulk_port_frame(f, std::mem::size_of::<SnapshotReplyPayload>(), deadline) {
+                Ok(frame) => frame,
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    return SnapshotRequestResult::TransportError {
+                        reason: format!(
+                            "snapshot reply deadline elapsed before frame complete \
                          (request_id={request_id}, kind={kind}): {e}"
-                    ),
-                };
-            }
-            Err(e) => {
-                // I/O error on the read fd — drop the cached
-                // handle so the next call retries the open and
-                // surface the failure to the caller.
-                *read_guard = None;
-                return SnapshotRequestResult::TransportError {
-                    reason: format!("snapshot reply read failed (request_id={request_id}): {e}"),
-                };
-            }
-        };
+                        ),
+                    };
+                }
+                Err(e) => {
+                    // I/O error on the read fd — drop the cached
+                    // handle so the next call retries the open and
+                    // surface the failure to the caller.
+                    *read_guard = None;
+                    return SnapshotRequestResult::TransportError {
+                        reason: format!(
+                            "snapshot reply read failed (request_id={request_id}): {e}"
+                        ),
+                    };
+                }
+            };
         let (msg_type, frame_payload) = frame;
         if msg_type != MSG_TYPE_SNAPSHOT_REPLY {
             tracing::warn!(
@@ -995,6 +1011,167 @@ pub fn request_snapshot(
                 ),
             },
         };
+    }
+}
+
+/// Request a host-driven kernel-memory op (`Op::WriteKernel{Hot,Cold}`
+/// / `Op::ReadKernel{Hot,Cold}`). Publishes a postcard-encoded
+/// [`KernelOpRequestPayload`] via the virtio-console port-1 TLV
+/// stream and blocks reading port 1 RX until a matching
+/// [`MsgType::KernelOpReply`] arrives (or `timeout` elapses).
+///
+/// The supplied `request` carries the full op intent — mode
+/// (hot/cold), direction (write/read), tag (for read replies and
+/// diagnostics), and the ordered batch of `(target, value)` entries.
+/// The function stamps a fresh `request_id` into the payload before
+/// publishing (overriding whatever the caller put there) so the
+/// reply pairing stays well-defined; the returned reply mirrors that
+/// id back in [`KernelOpReplyPayload::request_id`].
+///
+/// Returns one of [`KernelOpRequestResult`] variants. Distinct from
+/// [`SnapshotRequestResult`]: the "host completed but op failed"
+/// carrier is [`KernelOpReplyPayload::success`] = false +
+/// [`KernelOpReplyPayload::reason`], not a separate enum arm,
+/// because postcard-encoded replies can carry per-entry result data
+/// (e.g. read values) that an enum arm would erase.
+///
+/// Shares [`SNAPSHOT_REQUEST_LOCK`] with [`request_snapshot`]: only
+/// one in-flight guest→host RPC per process, regardless of kind —
+/// the shared `BULK_PORT_FD` read handle cannot safely demux two
+/// concurrent reply streams.
+///
+/// **Throughput note.** This helper holds the `BULK_PORT_FD` slot
+/// lock for the entire reply-wait loop (up to `timeout`, default
+/// 30 s for the cold-path freeze-rendezvous round-trip). Concurrent
+/// guest writers (`write_msg` callers — stimulus producers, scenario
+/// lifecycle events) on the same port-1 transport BLOCK on the
+/// shared slot lock until the reply lands. Deadlock potential is
+/// zero (the `GUEST_WRITE_LOCK` and `SNAPSHOT_REQUEST_LOCK` are
+/// acquired in independent orders by independent paths, and no
+/// path holds both simultaneously), but a long-running cold-op
+/// rendezvous serializes against unrelated TX traffic during its
+/// reply wait.
+pub fn request_kernel_op(
+    request: KernelOpRequestPayload,
+    timeout: std::time::Duration,
+) -> KernelOpRequestResult {
+    if !is_guest() {
+        return KernelOpRequestResult::TransportError {
+            reason: "request_kernel_op called from host context (virtio-console port 1 \
+                     is reachable only from inside the guest)"
+                .into(),
+        };
+    }
+    let _guard = SNAPSHOT_REQUEST_LOCK.lock_unpoisoned();
+    // Allocate a request id. Skip 0 so the wait loop's `reply.request_id
+    // == request_id` check cannot accidentally match a zero-initialised
+    // reply payload from an earlier protocol version.
+    let mut request_id =
+        KERNEL_OP_REQUEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    if request_id == 0 {
+        request_id = KERNEL_OP_REQUEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+    // Stamp the freshly-allocated id into a clone of the request
+    // payload (the caller's `request_id` field is overwritten — the
+    // function owns id allocation per the doc contract).
+    let stamped = KernelOpRequestPayload {
+        request_id,
+        ..request
+    };
+    let payload_bytes = match postcard::to_allocvec(&stamped) {
+        Ok(b) => b,
+        Err(e) => {
+            return KernelOpRequestResult::TransportError {
+                reason: format!(
+                    "request_kernel_op: postcard encode failed (request_id={request_id}): {e}"
+                ),
+            };
+        }
+    };
+    // Send via the existing port-1 TX writer. `write_msg` already
+    // takes `GUEST_WRITE_LOCK` internally, so this serialises with
+    // every other guest TLV producer.
+    write_msg(MsgType::KernelOpRequest.wire_value(), &payload_bytes);
+    // Read replies from the same O_RDWR fd used for writes. See
+    // `request_snapshot` for the bulk-port handle lifecycle notes;
+    // both helpers share `BULK_PORT_FD`.
+    let read_slot = BULK_PORT_FD.get_or_init(|| std::sync::Mutex::new(None));
+    let mut read_guard = read_slot.lock_unpoisoned();
+    if read_guard.is_none() {
+        match try_open_bulk_port() {
+            Some(f) => *read_guard = Some(f),
+            None => {
+                return KernelOpRequestResult::TransportError {
+                    reason: "/dev/vport0p1 not yet open \
+                             (multiport handshake still in flight)"
+                        .into(),
+                };
+            }
+        }
+    }
+    let f = read_guard
+        .as_mut()
+        .expect("bulk port handle just installed");
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return KernelOpRequestResult::TransportError {
+                reason: format!(
+                    "host did not deliver matching kernel-op reply within {timeout:?} \
+                     (request_id={request_id})"
+                ),
+            };
+        }
+        let frame = match read_bulk_port_frame(f, KERNEL_OP_REPLY_MAX, deadline) {
+            Ok(frame) => frame,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                return KernelOpRequestResult::TransportError {
+                    reason: format!(
+                        "kernel-op reply deadline elapsed before frame complete \
+                         (request_id={request_id}): {e}"
+                    ),
+                };
+            }
+            Err(e) => {
+                *read_guard = None;
+                return KernelOpRequestResult::TransportError {
+                    reason: format!("kernel-op reply read failed (request_id={request_id}): {e}"),
+                };
+            }
+        };
+        let (msg_type, frame_payload) = frame;
+        if msg_type != MSG_TYPE_KERNEL_OP_REPLY {
+            tracing::warn!(
+                msg_type,
+                len = frame_payload.len(),
+                request_id,
+                "request_kernel_op: ignoring non-KernelOpReply TLV on port 1 RX (likely a \
+                 stale snapshot reply from a prior request that timed out on the guest side)"
+            );
+            continue;
+        }
+        let reply: KernelOpReplyPayload = match postcard::from_bytes(&frame_payload) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    request_id,
+                    error = %e,
+                    "request_kernel_op: postcard decode failed; ignoring"
+                );
+                continue;
+            }
+        };
+        if reply.request_id != request_id {
+            tracing::warn!(
+                expected = request_id,
+                got = reply.request_id,
+                "request_kernel_op: stale reply id (likely a leftover from a prior \
+                 request that timed out on the guest side); ignoring"
+            );
+            continue;
+        }
+        return KernelOpRequestResult::Ok(reply);
     }
 }
 
@@ -1171,6 +1348,73 @@ mod tests {
         }
     }
 
+    /// `request_kernel_op` from host context returns
+    /// `TransportError` (mirrors `request_snapshot`'s host-context
+    /// gate). The virtio-console port-1 transport is reachable only
+    /// from inside the guest; a host-context call must not silently
+    /// no-op or panic.
+    #[test]
+    fn request_kernel_op_from_host_context_returns_transport_error() {
+        let _g = IsGuestOverrideGuard::new(false);
+        let request = crate::vmm::wire::KernelOpRequestPayload {
+            request_id: 0,
+            mode: crate::vmm::wire::KernelOpMode::Hot,
+            direction: crate::vmm::wire::KernelOpDirection::Write,
+            tag: String::new(),
+            entries: vec![],
+        };
+        let r = request_kernel_op(request, std::time::Duration::from_millis(0));
+        match r {
+            crate::vmm::wire::KernelOpRequestResult::TransportError { .. } => {}
+            other => panic!("expected TransportError from host context, got {other:?}"),
+        }
+    }
+
+    /// `read_bulk_port_frame` rejects a payload whose `length`
+    /// exceeds the caller-supplied `max_payload_size` cap. Pins
+    /// the parameterized cap introduced for the kernel-op reply
+    /// path — a callers passes its own limit and the function
+    /// must honour it, NOT the old hardcoded
+    /// `size_of::<SnapshotReplyPayload>()` value.
+    #[test]
+    fn read_bulk_port_frame_respects_caller_supplied_cap() {
+        use std::os::unix::io::FromRawFd;
+        let mut fds = [0i32; 2];
+        // SAFETY: standard pipe(2) call; fds is a valid &mut to a
+        // 2-element i32 array. Returning <0 indicates failure.
+        let r = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(r, 0, "pipe(2) failed: {}", std::io::Error::last_os_error());
+        // SAFETY: pipe(2) just returned the fds; both are open and
+        // owned by this scope. From_raw_fd takes ownership so the
+        // File closes them on drop.
+        let mut read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let mut write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+
+        // Frame a header with length = 200 but cap at 100. The
+        // function must reject WITHOUT reading the (forged) payload.
+        let header = ShmMessage {
+            msg_type: MSG_TYPE_KERNEL_OP_REPLY,
+            length: 200,
+            crc32: 0,
+            _pad: 0,
+        };
+        use std::io::Write;
+        write_end
+            .write_all(header.as_bytes())
+            .expect("write forged header");
+        drop(write_end);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let err = read_bulk_port_frame(&mut read_end, 100, deadline)
+            .expect_err("cap=100 must reject length=200");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds max payload 100"),
+            "error must cite the caller-supplied cap, got: {msg}"
+        );
+    }
+
     /// `read_bulk_port_frame` must reject a header whose `length`
     /// exceeds `size_of::<SnapshotReplyPayload>()` BEFORE allocating
     /// the payload buffer. A hostile or corrupted host could otherwise
@@ -1209,8 +1453,12 @@ mod tests {
         drop(write_end);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let err = read_bulk_port_frame(&mut read_end, deadline)
-            .expect_err("oversized length must be rejected");
+        let err = read_bulk_port_frame(
+            &mut read_end,
+            std::mem::size_of::<SnapshotReplyPayload>(),
+            deadline,
+        )
+        .expect_err("oversized length must be rejected");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         let msg = err.to_string();
         assert!(
@@ -1250,8 +1498,12 @@ mod tests {
         drop(write_end);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let (msg_type, body) =
-            read_bulk_port_frame(&mut read_end, deadline).expect("exact-size payload must succeed");
+        let (msg_type, body) = read_bulk_port_frame(
+            &mut read_end,
+            std::mem::size_of::<SnapshotReplyPayload>(),
+            deadline,
+        )
+        .expect("exact-size payload must succeed");
         assert_eq!(msg_type, MSG_TYPE_SNAPSHOT_REPLY);
         assert_eq!(body.len(), std::mem::size_of::<SnapshotReplyPayload>());
     }

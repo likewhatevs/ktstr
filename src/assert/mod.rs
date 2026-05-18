@@ -563,19 +563,34 @@ impl PassDetail {
 /// comparator name) while others record via the binary helper.
 pub const COMPARATOR_VOCABULARY: &[&str] = &[
     // Scalar comparisons
-    "eq", "ne", "ge", "le", "lt", "gt", "in_range", "near_within",
+    "eq",
+    "ne",
+    "ge",
+    "le",
+    "lt",
+    "gt",
+    "in_range",
+    "near_within",
     // Scalar predicates
     "is_finite",
     // Set predicates (emptiness)
-    "set_is_empty", "set_is_non_empty",
+    "set_is_empty",
+    "set_is_non_empty",
     // Set cardinality
-    "set_len_eq", "set_len_le", "set_len_ge",
+    "set_len_eq",
+    "set_len_le",
+    "set_len_ge",
     // Set membership / relations
-    "set_contains", "subset_of", "disjoint_from",
+    "set_contains",
+    "subset_of",
+    "disjoint_from",
     // Sequence predicates (emptiness)
-    "sequence_is_empty", "sequence_is_non_empty",
+    "sequence_is_empty",
+    "sequence_is_non_empty",
     // Sequence cardinality
-    "sequence_len_eq", "sequence_len_le", "sequence_len_ge",
+    "sequence_len_eq",
+    "sequence_len_le",
+    "sequence_len_ge",
     // Sequence membership
     "sequence_contains",
 ];

@@ -1,8 +1,8 @@
 use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
-use ktstr::scenario::Ctx;
 use ktstr::prelude::DiskConfig;
+use ktstr::scenario::Ctx;
 
 /// Const-evaluable DiskConfig declared at module scope so the
 /// `#[ktstr_test(disk = MACRO_TEST_DISK)]` arm below can reference

@@ -86,9 +86,9 @@
 //!    deterministic ArgMax sampling a second call on the same
 //!    prompt produces byte-identical output.
 
+use crate::sync::MutexExt;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
-use crate::sync::MutexExt;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};

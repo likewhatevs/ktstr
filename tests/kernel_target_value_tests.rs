@@ -98,11 +98,12 @@ fn op_write_kernel_cold_batch_preserves_order() {
 
 #[test]
 fn op_read_kernel_hot_tag_carried() {
-    let op = Op::read_kernel_hot("my-tag", KernelTarget::symbol("x"));
+    let op = Op::read_kernel_hot("my-tag", KernelTarget::symbol("x"), KernelValueWidth::u64());
     match op {
-        Op::ReadKernelHot { tag, target } => {
+        Op::ReadKernelHot { tag, target, width } => {
             assert_eq!(tag, "my-tag");
             assert_eq!(target, KernelTarget::symbol("x"));
+            assert_eq!(width, KernelValueWidth::u64());
         }
         _ => panic!("expected Op::ReadKernelHot"),
     }
@@ -110,12 +111,27 @@ fn op_read_kernel_hot_tag_carried() {
 
 #[test]
 fn op_read_kernel_cold_tag_carried() {
-    let op = Op::read_kernel_cold("cold-tag", KernelTarget::kva(0xffff_c900_0000_0000));
+    let op = Op::read_kernel_cold(
+        "cold-tag",
+        KernelTarget::kva(0xffff_c900_0000_0000),
+        KernelValueWidth::bytes(32),
+    );
     match op {
-        Op::ReadKernelCold { tag, target } => {
+        Op::ReadKernelCold { tag, target, width } => {
             assert_eq!(tag, "cold-tag");
             assert_eq!(target, KernelTarget::kva(0xffff_c900_0000_0000));
+            assert_eq!(width, KernelValueWidth::bytes(32));
         }
         _ => panic!("expected Op::ReadKernelCold"),
     }
+}
+
+/// `KernelValueWidth::u32()`, `u64()`, `bytes(len)` constructors
+/// each produce the matching enum variant — pins the
+/// non_exhaustive surface so a future variant rename surfaces here.
+#[test]
+fn kernel_value_width_constructors() {
+    assert_eq!(KernelValueWidth::u32(), KernelValueWidth::U32);
+    assert_eq!(KernelValueWidth::u64(), KernelValueWidth::U64);
+    assert_eq!(KernelValueWidth::bytes(42), KernelValueWidth::Bytes(42));
 }

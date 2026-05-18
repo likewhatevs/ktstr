@@ -146,26 +146,29 @@ fn assert_stats_round_trip(result: &VmResult) -> Result<()> {
     );
 
     // Closure projector consume-path: exercise
-    // per_cpu_field_u64 against the first captured CPU. With a 5 s
-    // workload holding a cgroup full of busy workers, cpustat_user_ns
-    // must have advanced — at least one sample's Ok-slot value must
-    // be > 0. Catches regressions in the closure-projector loop
-    // body (wrong cpu match, wrong tag/elapsed thread-through,
-    // wrong slot type) that the construction-only assertion above
-    // would miss.
-    let first_cpu = captured_cpus[0];
-    let user_ns_field = host_view.per_cpu_field_u64(first_cpu, "user_ns", |stats| {
-        stats.cpustat_user_ns
+    // per_cpu_field_u64 against EVERY captured CPU. With a 5 s
+    // workload holding a cgroup full of busy workers, at least one
+    // CPU's cpustat_user_ns must have advanced — at least one
+    // sample's Ok-slot value across any captured CPU must be > 0.
+    // Catches regressions in the closure-projector loop body
+    // (wrong cpu match, wrong tag/elapsed thread-through, wrong
+    // slot type) that the construction-only assertion above would
+    // miss. Iterating every CPU avoids the brittle-on-1-worker-2-vCPU
+    // shape where the worker happens to land entirely on cpu N != 0:
+    // any captured CPU advancing proves the pipeline works.
+    let advanced_on_any_cpu = captured_cpus.iter().any(|&cpu| {
+        host_view
+            .per_cpu_field_u64(cpu, "user_ns", |stats| stats.cpustat_user_ns)
+            .values_iter()
+            .filter_map(|slot| slot.as_ref().ok())
+            .any(|v| *v > 0)
     });
-    let advanced = user_ns_field
-        .values_iter()
-        .filter_map(|slot| slot.as_ref().ok())
-        .any(|v| *v > 0);
     anyhow::ensure!(
-        advanced,
-        "per_cpu_field_u64 for cpu {first_cpu} cpustat_user_ns \
-         reported 0 on every periodic sample — the workload never \
-         ran in user mode, or the projector dropped the per-sample \
+        advanced_on_any_cpu,
+        "per_cpu_field_u64 cpustat_user_ns reported 0 on every \
+         periodic sample across every captured CPU \
+         ({captured_cpus:?}) — the workload never ran in user mode \
+         on any captured CPU, or the projector dropped the per-sample \
          field"
     );
     Ok(())

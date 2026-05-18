@@ -65,7 +65,10 @@ fn snapshot_op_drives_bridge_and_stores_report_under_name() {
 
     let steps = vec![Step {
         setup: Vec::<ktstr::scenario::ops::CgroupDef>::new().into(),
-        ops: vec![Op::capture_snapshot("after_setup"), Op::capture_snapshot("after_workload")],
+        ops: vec![
+            Op::capture_snapshot("after_setup"),
+            Op::capture_snapshot("after_workload"),
+        ],
         hold: HoldSpec::fixed(std::time::Duration::from_millis(1)),
     }];
     let result = execute_steps(&ctx, steps).expect("execute_steps must succeed");
@@ -644,7 +647,9 @@ fn scenario_snapshotmap_iter_against_synthetic_cgroup_map(
 
     let captured = bridge_handle.drain();
     let report = captured.get("iter_target").ok_or_else(|| {
-        anyhow::anyhow!("bridge drain missing 'iter_target' — Op::capture_snapshot didn't fire capture")
+        anyhow::anyhow!(
+            "bridge drain missing 'iter_target' — Op::capture_snapshot didn't fire capture"
+        )
     })?;
     let snap = Snapshot::new(report);
     let map = snap
@@ -684,9 +689,7 @@ fn scenario_snapshotmap_iter_against_synthetic_cgroup_map(
     // .max_by — top-counter entry, assert key + count.
     let top = map.max_by(|e| e.get("").as_u64().unwrap_or(0));
     if !top.is_present() {
-        anyhow::bail!(
-            "SnapshotMap::max_by on a non-empty map returned a not-present entry"
-        );
+        anyhow::bail!("SnapshotMap::max_by on a non-empty map returned a not-present entry");
     }
     let top_key = top
         .key("")
@@ -705,10 +708,9 @@ fn scenario_snapshotmap_iter_against_synthetic_cgroup_map(
 
     result.details.push(ktstr::assert::AssertDetail::new(
         ktstr::assert::DetailKind::Other,
-        format!(
-            "SnapshotMap iterator chain verified: find(cg_1002)=250, \
-             filter(>100).len()=2, max_by=cg_1003@500"
-        ),
+        "SnapshotMap iterator chain verified: find(cg_1002)=250, \
+         filter(>100).len()=2, max_by=cg_1003@500"
+            .to_string(),
     ));
     Ok(result)
 }

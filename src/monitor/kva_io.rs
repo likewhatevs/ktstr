@@ -144,7 +144,7 @@ mod tests {
                 *translate_calls.borrow_mut() += 1;
                 Some(kva.wrapping_sub(0x1_0000)) // any deterministic mapping
             },
-            0x1000,                                // page-aligned start
+            0x1000,                                              // page-aligned start
             (PAGE_CHUNK as usize) * 2 + PAGE_CHUNK as usize / 2, // 2.5 pages
         );
         assert!(ok);

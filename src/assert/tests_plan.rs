@@ -32,7 +32,11 @@ fn plan_check_isolation_with_cpuset() {
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 4], 50)];
     let r = plan.assert_cgroup(&reports, Some(&expected), None);
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| matches!(d.kind, DetailKind::Isolation)));
+    assert!(
+        r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Isolation))
+    );
 }
 
 #[test]
@@ -60,8 +64,16 @@ fn plan_custom_gap_threshold_fail() {
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 2000)];
     let r = plan.assert_cgroup(&reports, None, None);
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| matches!(d.kind, DetailKind::Stuck)));
-    assert!(r.details.iter().any(|d| d.message.contains("threshold 1500ms")));
+    assert!(
+        r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Stuck))
+    );
+    assert!(
+        r.details
+            .iter()
+            .any(|d| d.message.contains("threshold 1500ms"))
+    );
 }
 
 #[test]
@@ -74,7 +86,9 @@ fn plan_custom_gap_threshold_produces_stuck_kind() {
     let r = plan.assert_cgroup(&reports, None, None);
     assert!(!r.passed);
     assert!(
-        r.details.iter().any(|d| matches!(d.kind, DetailKind::Stuck)),
+        r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Stuck)),
         "custom gap override must produce a Stuck-kind detail: {:?}",
         r.details
     );
@@ -105,17 +119,23 @@ fn plan_permissive_overrides_clear_unfair_and_stuck_preserve_starved() {
     plan.max_gap_ms = Some(5000);
     let r = plan.assert_cgroup(&reports, None, None);
     assert!(
-        r.details.iter().any(|d| matches!(d.kind, DetailKind::Starved)),
+        r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Starved)),
         "starved detail must survive permissive overrides: {:?}",
         r.details
     );
     assert!(
-        !r.details.iter().any(|d| matches!(d.kind, DetailKind::Unfair)),
+        !r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Unfair)),
         "unfair detail must be cleared by permissive spread: {:?}",
         r.details
     );
     assert!(
-        !r.details.iter().any(|d| matches!(d.kind, DetailKind::Stuck)),
+        !r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Stuck)),
         "stuck detail must be cleared by permissive gap: {:?}",
         r.details
     );
@@ -183,7 +203,15 @@ fn plan_starved_still_fails_with_custom_gap() {
         !r.passed,
         "starved worker must fail even with relaxed gap threshold"
     );
-    assert!(r.details.iter().any(|d| matches!(d.kind, DetailKind::Starved)));
+    assert!(
+        r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Starved))
+    );
     // The gap (1500ms) is below the 5000ms threshold, so no Stuck detail.
-    assert!(!r.details.iter().any(|d| matches!(d.kind, DetailKind::Stuck)));
+    assert!(
+        !r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Stuck))
+    );
 }

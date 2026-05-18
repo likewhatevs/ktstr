@@ -447,8 +447,16 @@ fn verdict_merge_folds_in_external_assert_result() {
     let r = v.into_result();
     assert!(!r.passed);
     assert_eq!(r.details.len(), 2);
-    assert!(r.details.iter().any(|d| matches!(d.kind, DetailKind::Starved)));
-    assert!(r.details.iter().any(|d| matches!(d.kind, DetailKind::Other)));
+    assert!(
+        r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Starved))
+    );
+    assert!(
+        r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Other))
+    );
 }
 
 #[test]
@@ -625,7 +633,8 @@ fn verdict_skip_preserves_prior_failure() {
     assert!(
         r.details
             .iter()
-            .any(|d| matches!(d.kind, DetailKind::Skip) && d.message.contains("precondition missing")),
+            .any(|d| matches!(d.kind, DetailKind::Skip)
+                && d.message.contains("precondition missing")),
         "skip reason must be recorded: {:?}",
         r.details,
     );
@@ -831,7 +840,10 @@ fn verdict_with_log_passes_toggles_flag() {
     let on = Verdict::new().with_log_passes(true);
     assert!(on.log_passes());
     let off = Verdict::new().with_log_passes(true).with_log_passes(false);
-    assert!(!off.log_passes(), "with_log_passes(false) must turn the flag off");
+    assert!(
+        !off.log_passes(),
+        "with_log_passes(false) must turn the flag off"
+    );
 }
 
 /// A passing scalar claim emits a `tracing::info!` event under
@@ -849,7 +861,10 @@ fn verdict_log_passes_emits_event_on_scalar_pass() {
         "positive-confirmation log must name the value and the comparator token (snake_case per the COMPARATOR_VOCABULARY contract — `ge`, not `>=`)",
     );
     let r = v.into_result();
-    assert!(r.passed, "claim must still pass — log_passes only adds output");
+    assert!(
+        r.passed,
+        "claim must still pass — log_passes only adds output"
+    );
     assert!(r.details.is_empty(), "pass arm must add no details");
 }
 

@@ -61,10 +61,10 @@ use std::sync::{Arc, Condvar, Mutex};
 // regression that re-introduces a timeout does not silently
 // compile.
 
+use crate::sync::MutexExt;
 use serde::{Deserialize, Serialize};
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
-use crate::sync::MutexExt;
 
 use super::PiMutex;
 use super::virtio_console::VirtioConsole;
@@ -466,10 +466,7 @@ impl SchedStatsClient {
         // poisoning recovers via `into_inner` — we only ever access
         // the unit `()` payload, which has no invariant a panicked
         // thread could leave broken.
-        let _request_guard = self
-            .shared
-            .request_lock
-            .lock_unpoisoned();
+        let _request_guard = self.shared.request_lock.lock_unpoisoned();
 
         // Drain any stale guest→host bytes from port2_tx_buf BEFORE
         // flipping in_flight=true. This NARROWS the stale-bytes race

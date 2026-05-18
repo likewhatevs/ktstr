@@ -16,9 +16,9 @@ use std::time::Duration;
 
 use crate::workload::{WorkSpec, WorkType};
 
-use super::{CpuLimits, CpusetSpec, IoLimits, MemoryLimits, PidsLimits};
 #[allow(unused_imports)] // referenced by intra-doc links
 use super::Op;
+use super::{CpuLimits, CpusetSpec, IoLimits, MemoryLimits, PidsLimits};
 
 // ---------------------------------------------------------------------------
 // CgroupDef

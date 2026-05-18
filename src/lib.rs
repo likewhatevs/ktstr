@@ -694,9 +694,8 @@ pub mod prelude {
     pub use crate::assert::{
         Assert, AssertDetail, AssertResult, COMPARATOR_VOCABULARY, ClaimBuilder, DetailKind,
         EachClaim, MAX_RECORDED_PASSES, NoteValue, PASSES_TRUNCATION_SENTINEL_COMPARATOR,
-        PASSES_TRUNCATION_SENTINEL_NAME, PassDetail,
-        SchedulerBaseline, SeqClaim, SeriesField, SetClaim, Verdict, assert_baseline,
-        assert_scx_events_clean,
+        PASSES_TRUNCATION_SENTINEL_NAME, PassDetail, SchedulerBaseline, SeqClaim, SeriesField,
+        SetClaim, Verdict, assert_baseline, assert_scx_events_clean,
     };
     pub use crate::cgroup::CgroupManager;
     pub use crate::claim;
@@ -707,8 +706,9 @@ pub mod prelude {
     pub use crate::ktstr_test;
     pub use crate::scenario::backdrop::Backdrop;
     pub use crate::scenario::ops::{
-        CgroupDef, CpusetSpec, HoldSpec, KernelTarget, KernelValue, Op, Setup, Step, execute_defs,
-        execute_scenario, execute_scenario_with, execute_steps, execute_steps_with,
+        CgroupDef, CpusetSpec, HoldSpec, KernelTarget, KernelValue, KernelValueWidth, Op, Setup,
+        Step, execute_defs, execute_scenario, execute_scenario_with, execute_steps,
+        execute_steps_with,
     };
     pub use crate::scenario::payload_run::{PayloadHandle, PayloadRun};
     pub use crate::scenario::scenarios;

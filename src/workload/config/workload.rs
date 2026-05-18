@@ -265,11 +265,9 @@ impl WorkloadConfig {
     /// the leaf convention used by every per-spec validator in the
     /// project.
     pub fn validate(&self) -> anyhow::Result<()> {
-        self.mem_policy.validate().map_err(|e| {
-            anyhow::anyhow!(
-                "WorkloadConfig.mem_policy (primary group): {e}",
-            )
-        })?;
+        self.mem_policy
+            .validate()
+            .map_err(|e| anyhow::anyhow!("WorkloadConfig.mem_policy (primary group): {e}",))?;
         for (idx, spec) in self.composed.iter().enumerate() {
             spec.mem_policy.validate().map_err(|e| {
                 anyhow::anyhow!(

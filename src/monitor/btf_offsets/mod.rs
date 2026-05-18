@@ -16,9 +16,9 @@
 use std::path::Path;
 use std::sync::{Arc, OnceLock, RwLock};
 
+use crate::sync::RwLockExt;
 use anyhow::{Context, Result, bail};
 use btf_rs::{Btf, Type};
-use crate::sync::RwLockExt;
 
 mod local_storage;
 pub use local_storage::TaskStorageOffsets;

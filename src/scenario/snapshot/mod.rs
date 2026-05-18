@@ -138,13 +138,14 @@ pub(super) const HEX_KEY_PREFIX: &str = "hex:";
 
 mod error;
 
-pub use error::{MissingStatsReason, SnapshotError, SnapshotResult};
+pub use error::{DrainedSnapshotEntry, MissingStatsReason, SnapshotError, SnapshotResult};
 
 mod bridge;
 
 pub use bridge::{
-    BridgeGuard, CaptureCallback, MAX_STORED_EVENTS, MAX_STORED_SNAPSHOTS, MAX_WATCH_SNAPSHOTS,
-    SnapshotBridge, SnapshotBridgeEvent, WatchRegisterCallback, with_active_bridge,
+    BridgeGuard, CaptureCallback, KernelOpCallback, MAX_STORED_EVENTS, MAX_STORED_SNAPSHOTS,
+    MAX_WATCH_SNAPSHOTS, SnapshotBridge, SnapshotBridgeEvent, WatchRegisterCallback,
+    with_active_bridge,
 };
 
 mod entry;

@@ -8451,9 +8451,7 @@ impl KtstrVm {
             tcr_el1: tcr_el1_cache,
             cr3: cr3_cache,
             vmlinux_data: vmlinux_data_for_result,
-            prog_accessor: prog_accessor_slot
-                .lock_unpoisoned()
-                .take(),
+            prog_accessor: prog_accessor_slot.lock_unpoisoned().take(),
             kern_phys_base: kern_phys_base_for_result.load(Ordering::Acquire),
             // Virtio-console handle threaded into `collect_results`
             // for the post-exit `drain_bulk()` call. Carries any

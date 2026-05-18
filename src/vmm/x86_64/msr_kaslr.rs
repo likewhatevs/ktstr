@@ -286,7 +286,10 @@ pub fn derive_virt_kaslr(lstar: u64, entry_syscall_64_link: u64) -> Result<u64, 
 /// whether or not LSTAR is meaningful.
 pub(crate) fn read_and_derive(vcpu: &VcpuFd, entry_syscall_64_link: u64) -> Result<u64> {
     let lstar = read_one_msr(vcpu, MSR_LSTAR)?.ok_or_else(|| {
-        anyhow::anyhow!("derive virt_kaslr_offset: {}", LstarDeriveError::LstarUnsupported)
+        anyhow::anyhow!(
+            "derive virt_kaslr_offset: {}",
+            LstarDeriveError::LstarUnsupported
+        )
     })?;
     derive_virt_kaslr(lstar, entry_syscall_64_link)
         .map_err(|e| anyhow::anyhow!("derive virt_kaslr_offset: {e}"))
@@ -340,8 +343,7 @@ mod tests {
         // Indicates wrong vmlinux for this guest — refuse to compute
         // a wrapped-around-negative u64 offset.
         let lstar = LINK_KVA_TYPICAL - (4 * 1024 * 1024);
-        let err = derive_virt_kaslr(lstar, LINK_KVA_TYPICAL)
-            .expect_err("lstar < link must error");
+        let err = derive_virt_kaslr(lstar, LINK_KVA_TYPICAL).expect_err("lstar < link must error");
         assert!(matches!(
             err,
             LstarDeriveError::LinkAboveLstar { lstar: l, link: k }
@@ -423,13 +425,7 @@ mod tests {
         assert!(LstarDeriveError::NonCanonical { lstar: 0 }.is_retryable());
         // Permanent (wrong inputs, re-read can't fix):
         assert!(!LstarDeriveError::LinkUnknown.is_retryable());
-        assert!(
-            !LstarDeriveError::LinkAboveLstar {
-                lstar: 0,
-                link: 0,
-            }
-            .is_retryable()
-        );
+        assert!(!LstarDeriveError::LinkAboveLstar { lstar: 0, link: 0 }.is_retryable());
         assert!(!LstarDeriveError::Misaligned { offset: 0 }.is_retryable());
     }
 
@@ -440,8 +436,8 @@ mod tests {
         // caller could pass `.unwrap_or(0)` and get a nonsense
         // derived offset (literally lstar itself). The LinkUnknown
         // guard catches this before subtraction.
-        let err = derive_virt_kaslr(aligned_lstar(8), 0)
-            .expect_err("link == 0 must error LinkUnknown");
+        let err =
+            derive_virt_kaslr(aligned_lstar(8), 0).expect_err("link == 0 must error LinkUnknown");
         assert!(matches!(err, LstarDeriveError::LinkUnknown));
     }
 
@@ -454,5 +450,4 @@ mod tests {
         assert!(matches!(err, LstarDeriveError::Misaligned { offset }
                 if offset == (20 * 1024 * 1024) + 4096));
     }
-
 }

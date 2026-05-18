@@ -1188,10 +1188,7 @@ fn evaluate_checks(checks: &[MetricCheck], pm: &PayloadMetrics, stderr: &str) ->
 /// renamer-resistant single source of truth that pairs naturally
 /// with [`missing_metric`] for the absent-metric counterpart.
 fn nan_metric(metric: &str) -> AssertDetail {
-    AssertDetail::new(
-        DetailKind::Other,
-        format!("metric '{metric}' value is NaN"),
-    )
+    AssertDetail::new(DetailKind::Other, format!("metric '{metric}' value is NaN"))
 }
 
 fn missing_metric(metric: &str) -> AssertDetail {
@@ -1218,12 +1215,12 @@ fn exit_code_mismatch_detail(
     stderr: &str,
 ) -> Option<AssertDetail> {
     checks.iter().find_map(|c| match c {
-        MetricCheck::ExitCodeEq(expected) if actual_exit_code != *expected => Some(
-            AssertDetail::new(
+        MetricCheck::ExitCodeEq(expected) if actual_exit_code != *expected => {
+            Some(AssertDetail::new(
                 DetailKind::Other,
                 format_exit_mismatch(actual_exit_code, *expected, stderr),
-            ),
-        ),
+            ))
+        }
         _ => None,
     })
 }

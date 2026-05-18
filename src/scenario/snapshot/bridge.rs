@@ -77,6 +77,33 @@ pub type CaptureCallback = Arc<dyn Fn(&str) -> Option<FailureDumpReport> + Send 
 pub type WatchRegisterCallback =
     Arc<dyn Fn(&str) -> std::result::Result<(), String> + Send + Sync + 'static>;
 
+/// Closure type the bridge invokes for a host-side kernel-memory
+/// write or read (`Op::WriteKernel{Hot,Cold}` /
+/// `Op::ReadKernel{Hot,Cold}`).
+///
+/// The host dispatches the request (a sequence of
+/// `(KernelTarget, KernelValue)` entries, plus mode/direction/tag
+/// metadata in [`crate::vmm::wire::KernelOpRequestPayload`]) against
+/// the resolved guest-memory accessor. Returns
+/// [`crate::vmm::wire::KernelOpReplyPayload`] mirroring the request
+/// id, the success/error status, and (for reads) the read-back
+/// bytes per entry.
+///
+/// Test fixtures install a closure that records the request and
+/// returns a synthetic reply without touching real guest memory
+/// (the in-process bridge surface stays mockable). The in-VM
+/// production path goes through the wire layer
+/// ([`crate::vmm::wire::MsgType::KernelOpRequest`]) and the freeze
+/// coordinator / hot-path worker, NOT this callback — the bridge
+/// keeps it Option<…> so executor tests can install one while real
+/// VM runs leave it unset.
+pub type KernelOpCallback = Arc<
+    dyn Fn(&crate::vmm::wire::KernelOpRequestPayload) -> crate::vmm::wire::KernelOpReplyPayload
+        + Send
+        + Sync
+        + 'static,
+>;
+
 /// Shared state owning the capture closure plus the captured-report
 /// map.
 ///
@@ -257,8 +284,7 @@ pub(super) struct SnapshotStore {
     /// absent. Sample::stats reads `stats.get(tag)` — `None` is the
     /// expected shape for non-periodic tags or when the scheduler
     /// stats request failed.
-    pub(super) stats:
-        HashMap<String, Result<serde_json::Value, super::error::MissingStatsReason>>,
+    pub(super) stats: HashMap<String, Result<serde_json::Value, super::error::MissingStatsReason>>,
     /// Elapsed milliseconds since `run_start` at the moment the
     /// periodic capture fired. Same key set as `reports` for
     /// periodic tags; absent for non-periodic captures. Read by
@@ -361,7 +387,12 @@ impl Drop for WatchSlotGuard<'_> {
 pub struct SnapshotBridge {
     capture: CaptureCallback,
     register_watch: Option<WatchRegisterCallback>,
+    kernel_op: Option<KernelOpCallback>,
     pub(super) snapshots: Arc<Mutex<SnapshotStore>>,
+    /// Per-tag drain log of kernel-op reply payloads. Test fixtures
+    /// inspect this via [`SnapshotBridge::drain_kernel_ops`] after
+    /// `execute_steps` returns to verify each request's outcome.
+    kernel_ops: Arc<Mutex<Vec<(String, crate::vmm::wire::KernelOpReplyPayload)>>>,
     watch_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -397,9 +428,81 @@ impl SnapshotBridge {
         Self {
             capture,
             register_watch: None,
+            kernel_op: None,
             snapshots: Arc::new(Mutex::new(SnapshotStore::new())),
+            kernel_ops: Arc::new(Mutex::new(Vec::new())),
             watch_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Install a kernel-op callback so
+    /// `Op::WriteKernel{Hot,Cold}` / `Op::ReadKernel{Hot,Cold}` ops
+    /// can dispatch host-side guest-memory writes/reads. Without
+    /// one installed, the in-process executor returns "no
+    /// SnapshotBridge installed" and the ops fall through to the
+    /// virtio-console wire path. Test fixtures use this seam to
+    /// record requests and assert on them without touching real
+    /// guest memory.
+    pub fn with_kernel_op(mut self, callback: KernelOpCallback) -> Self {
+        self.kernel_op = Some(callback);
+        self
+    }
+
+    /// Dispatch a kernel-op request through the installed callback.
+    /// Returns `None` when no callback is installed (the executor
+    /// then falls through to the wire path); returns
+    /// `Some(KernelOpReplyPayload)` otherwise and records the
+    /// reply in the per-tag drain log.
+    pub fn dispatch_kernel_op(
+        &self,
+        request: &crate::vmm::wire::KernelOpRequestPayload,
+    ) -> Option<crate::vmm::wire::KernelOpReplyPayload> {
+        let callback = self.kernel_op.as_ref()?;
+        let reply = callback(request);
+        self.kernel_ops
+            .lock_unpoisoned()
+            .push((request.tag.clone(), reply.clone()));
+        Some(reply)
+    }
+
+    /// Drain the per-tag kernel-op reply log. Returns the accumulated
+    /// `(tag, reply)` pairs in insertion order; leaves the bridge's
+    /// own copy empty so subsequent calls see only newer entries.
+    pub fn drain_kernel_ops(&self) -> Vec<(String, crate::vmm::wire::KernelOpReplyPayload)> {
+        std::mem::take(&mut *self.kernel_ops.lock_unpoisoned())
+    }
+
+    /// Look up the first kernel-op reply value recorded under `tag`
+    /// in the kernel-op drain log without consuming the log.
+    ///
+    /// The bulk shape returned by [`Self::drain_kernel_ops`] is
+    /// `Vec<(tag, reply)>` with each reply carrying a
+    /// `Vec<crate::vmm::wire::KernelOpValue>`. For the common
+    /// single-tag single-value read-back lookup, this helper
+    /// collapses the 4-layer unwrap (find by tag → check success →
+    /// index into read_values → match the variant) into a single
+    /// call. Returns `None` when no reply was recorded under `tag`,
+    /// when the reply reported `success = false`, or when the
+    /// reply's `read_values` is empty (e.g. a write-op reply under
+    /// the same tag). Otherwise returns `Some(value)` with the
+    /// first `KernelOpValue` of the first matching reply.
+    ///
+    /// The log is NOT drained — the caller can still inspect via
+    /// [`Self::drain_kernel_ops`] to observe the full per-tag
+    /// history.
+    ///
+    /// **Clone cost.** For `U32` / `U64` the clone is 4 / 8 bytes.
+    /// For [`crate::vmm::wire::KernelOpValue::Bytes`] the clone
+    /// can be up to [`crate::vmm::wire::KERNEL_OP_REPLY_MAX`]
+    /// (1 MiB). Hot paths that repeatedly inspect the same tag
+    /// should prefer [`Self::drain_kernel_ops`] + index into the
+    /// returned Vec to avoid the per-call clone.
+    pub fn kernel_op_value(&self, tag: &str) -> Option<crate::vmm::wire::KernelOpValue> {
+        self.kernel_ops
+            .lock_unpoisoned()
+            .iter()
+            .find(|(t, reply)| t == tag && reply.success && !reply.read_values.is_empty())
+            .map(|(_, reply)| reply.read_values[0].clone())
     }
 
     /// Install a watch-register callback so [`Op::WatchSnapshot`](crate::scenario::ops::Op::WatchSnapshot)
@@ -642,18 +745,12 @@ impl SnapshotBridge {
 
     /// Snapshot count for diagnostic logging.
     pub fn len(&self) -> usize {
-        self.snapshots
-            .lock_unpoisoned()
-            .reports
-            .len()
+        self.snapshots.lock_unpoisoned().reports.len()
     }
 
     /// True when no snapshots have been captured.
     pub fn is_empty(&self) -> bool {
-        self.snapshots
-            .lock_unpoisoned()
-            .reports
-            .is_empty()
+        self.snapshots.lock_unpoisoned().reports.is_empty()
     }
 
     /// True when a stored report already exists for `name`. Lets the
@@ -666,10 +763,7 @@ impl SnapshotBridge {
     /// teardown, presenting tests with a hollow snapshot in place of
     /// the real one.
     pub fn has(&self, name: &str) -> bool {
-        self.snapshots
-            .lock_unpoisoned()
-            .reports
-            .contains_key(name)
+        self.snapshots.lock_unpoisoned().reports.contains_key(name)
     }
 
     /// Take ownership of the captured snapshots, leaving the bridge
@@ -759,34 +853,20 @@ impl SnapshotBridge {
     /// `periodic_000`/`periodic_001`/… in monotonic wall-clock
     /// order, and the temporal-assertion patterns walk the vec
     /// expecting that ordering.
-    pub fn drain_ordered_with_stats(
-        &self,
-    ) -> Vec<(
-        String,
-        FailureDumpReport,
-        Result<serde_json::Value, super::error::MissingStatsReason>,
-        Option<u64>,
-    )> {
+    pub fn drain_ordered_with_stats(&self) -> Vec<super::error::DrainedSnapshotEntry> {
         let mut store = self.snapshots.lock_unpoisoned();
         let order = std::mem::take(&mut store.order);
         let mut reports = std::mem::take(&mut store.reports);
         let mut stats = std::mem::take(&mut store.stats);
         let mut elapsed = std::mem::take(&mut store.elapsed_ms);
-        let mut out: Vec<(
-            String,
-            FailureDumpReport,
-            Result<serde_json::Value, super::error::MissingStatsReason>,
-            Option<u64>,
-        )> = Vec::with_capacity(order.len());
+        let mut out: Vec<super::error::DrainedSnapshotEntry> = Vec::with_capacity(order.len());
         // Bridge-absent stats slot collapses to the typed
         // `NoSchedulerBinary` reason: the capture path that produced
         // this tag never bundled a stats Result (non-periodic Op
         // capture, or periodic without a stats client wired). The
         // periodic path always bundles a Some(Result), so a `None`
         // here is always the "no scheduler binary" case.
-        let stats_fallback = || {
-            Err(super::error::MissingStatsReason::NoSchedulerBinary)
-        };
+        let stats_fallback = || Err(super::error::MissingStatsReason::NoSchedulerBinary);
         for tag in order {
             if let Some(report) = reports.remove(&tag) {
                 let s = stats.remove(&tag).unwrap_or_else(stats_fallback);
@@ -910,4 +990,3 @@ impl Drop for BridgeGuard {
 pub fn with_active_bridge<R>(f: impl FnOnce(&SnapshotBridge) -> R) -> Option<R> {
     ACTIVE_BRIDGE.with(|c| c.borrow().as_ref().map(f))
 }
-

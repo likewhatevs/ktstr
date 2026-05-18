@@ -738,11 +738,7 @@ mod tests {
         use crate::vmm::x86_64::test_helpers::single_vcpu_kvm;
         let vm = single_vcpu_kvm();
         setup_msrs(&vm.vcpus[0], None).unwrap();
-        let data = read_one_msr_required(
-            &vm.vcpus[0],
-            MSR_IA32_MISC_ENABLE,
-            "post-default-seed",
-        );
+        let data = read_one_msr_required(&vm.vcpus[0], MSR_IA32_MISC_ENABLE, "post-default-seed");
         assert_ne!(
             data & MSR_IA32_MISC_ENABLE_FAST_STRING,
             0,
@@ -762,11 +758,7 @@ mod tests {
             ..Default::default()
         }];
         setup_msrs(&vm.vcpus[0], Some(&extra)).unwrap();
-        let data = read_one_msr_required(
-            &vm.vcpus[0],
-            MSR_IA32_MISC_ENABLE,
-            "post-extra-override",
-        );
+        let data = read_one_msr_required(&vm.vcpus[0], MSR_IA32_MISC_ENABLE, "post-extra-override");
         assert_eq!(data, 0, "MISC_ENABLE should be overridden to 0");
     }
 

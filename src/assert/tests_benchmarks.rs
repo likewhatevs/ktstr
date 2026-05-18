@@ -112,8 +112,12 @@ fn assert_benchmarks_p99_fail() {
     )];
     let r = assert_benchmarks(&reports, Some(1000), None, None);
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| matches!(d.kind, DetailKind::Benchmark)
-        && d.message.contains("p99 wake latency")));
+    assert!(
+        r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Benchmark)
+                && d.message.contains("p99 wake latency"))
+    );
 }
 
 /// Unit-boundary pin: the `max_p99_wake_latency_ns` threshold
@@ -196,8 +200,12 @@ fn assert_benchmarks_cv_fail() {
     )];
     let r = assert_benchmarks(&reports, None, Some(0.5), None);
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| matches!(d.kind, DetailKind::Benchmark)
-        && d.message.contains("wake latency CV")));
+    assert!(
+        r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Benchmark)
+                && d.message.contains("wake latency CV"))
+    );
 }
 
 #[test]
@@ -214,8 +222,11 @@ fn assert_benchmarks_iteration_rate_fail() {
     let reports = [rpt_with_latencies(1, vec![], 10, 5_000_000_000)];
     let r = assert_benchmarks(&reports, None, None, Some(100.0));
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| matches!(d.kind, DetailKind::Benchmark)
-        && d.message.contains("iteration rate")));
+    assert!(
+        r.details.iter().any(
+            |d| matches!(d.kind, DetailKind::Benchmark) && d.message.contains("iteration rate")
+        )
+    );
 }
 
 #[test]
@@ -335,8 +346,12 @@ fn plan_benchmarks_p99_via_assert_cgroup() {
     )];
     let r = plan.assert_cgroup(&reports, None, None);
     assert!(!r.passed, "p99 1000ns > 500ns limit");
-    assert!(r.details.iter().any(|d| matches!(d.kind, DetailKind::Benchmark)
-        && d.message.contains("p99 wake latency")));
+    assert!(
+        r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Benchmark)
+                && d.message.contains("p99 wake latency"))
+    );
 }
 
 #[test]
@@ -362,8 +377,12 @@ fn plan_migration_ratio_gate() {
     };
     let r = plan.assert_cgroup(&[w], None, None);
     assert!(!r.passed);
-    assert!(r.details.iter().any(|d| matches!(d.kind, DetailKind::Migration)
-        && d.message.contains("migration ratio")));
+    assert!(
+        r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::Migration)
+                && d.message.contains("migration ratio"))
+    );
 }
 
 #[test]
@@ -411,8 +430,11 @@ fn plan_benchmarks_iteration_rate_via_assert_cgroup() {
     let reports = [rpt_with_latencies(1, vec![], 10, 5_000_000_000)];
     let r = plan.assert_cgroup(&reports, None, None);
     assert!(!r.passed, "2/s < 1000/s floor");
-    assert!(r.details.iter().any(|d| matches!(d.kind, DetailKind::Benchmark)
-        && d.message.contains("iteration rate")));
+    assert!(
+        r.details.iter().any(
+            |d| matches!(d.kind, DetailKind::Benchmark) && d.message.contains("iteration rate")
+        )
+    );
 }
 
 #[test]
@@ -432,8 +454,7 @@ fn assert_throughput_parity_all_zero_cpu_time_fails_when_cv_set() {
     assert!(
         r.details
             .iter()
-            .any(|d| matches!(d.kind, DetailKind::Benchmark)
-                && d.message.contains("CV undefined")),
+            .any(|d| matches!(d.kind, DetailKind::Benchmark) && d.message.contains("CV undefined")),
         "diagnostic must surface the undefined-CV root cause: {:?}",
         r.details
     );

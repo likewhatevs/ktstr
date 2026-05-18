@@ -12,7 +12,9 @@
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use crate::workload::config::{AluWidth, FutexLockMode, SchedClass, WakeMechanism, humantime_serde_helper};
+use crate::workload::config::{
+    AluWidth, FutexLockMode, SchedClass, WakeMechanism, humantime_serde_helper,
+};
 
 use crate::workload::WorkerReport;
 

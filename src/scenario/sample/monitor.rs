@@ -138,11 +138,20 @@ impl<'a> ScxEventsView<'a> {
     pub fn total_pairs(&self) -> Vec<(&'static str, i64)> {
         vec![
             ("select_cpu_fallback", self.deltas.total_fallback),
-            ("select_cpu_fallback_max_burst", self.deltas.max_fallback_burst),
-            ("dispatch_local_dsq_offline", self.deltas.total_dispatch_offline),
+            (
+                "select_cpu_fallback_max_burst",
+                self.deltas.max_fallback_burst,
+            ),
+            (
+                "dispatch_local_dsq_offline",
+                self.deltas.total_dispatch_offline,
+            ),
             ("dispatch_keep_last", self.deltas.total_dispatch_keep_last),
             ("enq_skip_exiting", self.deltas.total_enq_skip_exiting),
-            ("enq_skip_migration_disabled", self.deltas.total_enq_skip_migration_disabled),
+            (
+                "enq_skip_migration_disabled",
+                self.deltas.total_enq_skip_migration_disabled,
+            ),
             ("reenq_immed", self.deltas.total_reenq_immed),
             ("reenq_local_repeat", self.deltas.total_reenq_local_repeat),
             ("refill_slice_dfl", self.deltas.total_refill_slice_dfl),
@@ -213,12 +222,12 @@ mod tests {
     fn series_monitor_view_threads_through_supplied_report() {
         let mut report = MonitorReport::default();
         report.summary.total_samples = 42;
-        report.summary.max_imbalance_ratio = 3.14;
+        report.summary.max_imbalance_ratio = 2.5;
         let series = SampleSeries::from_drained(vec![], Some(report));
         let view = series.monitor().expect("monitor must be Some");
         let summary = view.summary();
         assert_eq!(summary.total_samples, 42);
-        assert_eq!(summary.max_imbalance_ratio, 3.14);
+        assert_eq!(summary.max_imbalance_ratio, 2.5);
     }
 
     /// `view.scx_events()` returns `None` when `event_deltas` is

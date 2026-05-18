@@ -3,1362 +3,1362 @@
 
 #![cfg(test)]
 
-    use super::*;
+use super::*;
 
-    // -- arch_info --
+// -- arch_info --
 
-    #[test]
-    fn fetch_arch_info_returns_known_arch() {
-        let (arch, image) = arch_info();
-        assert!(
-            (arch == "x86_64" && image == "bzImage") || (arch == "aarch64" && image == "Image"),
-            "unexpected arch/image: {arch}/{image}"
-        );
-    }
+#[test]
+fn fetch_arch_info_returns_known_arch() {
+    let (arch, image) = arch_info();
+    assert!(
+        (arch == "x86_64" && image == "bzImage") || (arch == "aarch64" && image == "Image"),
+        "unexpected arch/image: {arch}/{image}"
+    );
+}
 
-    // -- is_major_minor_prefix --
+// -- is_major_minor_prefix --
 
-    #[test]
-    fn is_major_minor_prefix_accepts_two_segment() {
-        assert!(is_major_minor_prefix("6.14"));
-        assert!(is_major_minor_prefix("7.0"));
-    }
+#[test]
+fn is_major_minor_prefix_accepts_two_segment() {
+    assert!(is_major_minor_prefix("6.14"));
+    assert!(is_major_minor_prefix("7.0"));
+}
 
-    #[test]
-    fn is_major_minor_prefix_rejects_patch_version() {
-        assert!(!is_major_minor_prefix("6.14.2"));
-        assert!(!is_major_minor_prefix("5.4.0"));
-    }
+#[test]
+fn is_major_minor_prefix_rejects_patch_version() {
+    assert!(!is_major_minor_prefix("6.14.2"));
+    assert!(!is_major_minor_prefix("5.4.0"));
+}
 
-    #[test]
-    fn is_major_minor_prefix_rejects_rc_tag() {
-        assert!(!is_major_minor_prefix("6.15-rc3"));
-        assert!(!is_major_minor_prefix("6.14-rc1"));
-    }
+#[test]
+fn is_major_minor_prefix_rejects_rc_tag() {
+    assert!(!is_major_minor_prefix("6.15-rc3"));
+    assert!(!is_major_minor_prefix("6.14-rc1"));
+}
 
-    #[test]
-    fn is_major_minor_prefix_historical_edge_cases() {
-        // Historical behavior: accepts single-segment and empty inputs.
-        // Callers are expected to gate upstream.
-        assert!(is_major_minor_prefix("7"));
-        assert!(is_major_minor_prefix(""));
-    }
+#[test]
+fn is_major_minor_prefix_historical_edge_cases() {
+    // Historical behavior: accepts single-segment and empty inputs.
+    // Callers are expected to gate upstream.
+    assert!(is_major_minor_prefix("7"));
+    assert!(is_major_minor_prefix(""));
+}
 
-    // -- major_version --
+// -- major_version --
 
-    #[test]
-    fn fetch_major_version_stable() {
-        assert_eq!(major_version("6.14.2").unwrap(), 6);
-    }
+#[test]
+fn fetch_major_version_stable() {
+    assert_eq!(major_version("6.14.2").unwrap(), 6);
+}
 
-    #[test]
-    fn fetch_major_version_rc() {
-        assert_eq!(major_version("6.15-rc3").unwrap(), 6);
-    }
+#[test]
+fn fetch_major_version_rc() {
+    assert_eq!(major_version("6.15-rc3").unwrap(), 6);
+}
 
-    #[test]
-    fn fetch_major_version_two_part() {
-        assert_eq!(major_version("5.4").unwrap(), 5);
-    }
+#[test]
+fn fetch_major_version_two_part() {
+    assert_eq!(major_version("5.4").unwrap(), 5);
+}
 
-    #[test]
-    fn fetch_major_version_invalid() {
-        assert!(major_version("abc").is_err());
-    }
+#[test]
+fn fetch_major_version_invalid() {
+    assert!(major_version("abc").is_err());
+}
 
-    // -- is_rc --
+// -- is_rc --
 
-    #[test]
-    fn fetch_is_rc_true() {
-        assert!(is_rc("6.15-rc3"));
-        assert!(is_rc("6.14.2-rc1"));
-    }
+#[test]
+fn fetch_is_rc_true() {
+    assert!(is_rc("6.15-rc3"));
+    assert!(is_rc("6.14.2-rc1"));
+}
 
-    #[test]
-    fn fetch_is_rc_false() {
-        assert!(!is_rc("6.14.2"));
-        assert!(!is_rc("6.14"));
-    }
+#[test]
+fn fetch_is_rc_false() {
+    assert!(!is_rc("6.14.2"));
+    assert!(!is_rc("6.14"));
+}
 
-    // -- URL construction --
+// -- URL construction --
 
-    /// Stable tarball URL pattern (same logic as download_stable_tarball).
-    fn stable_tarball_url(version: &str) -> Result<String> {
-        let major = major_version(version)?;
-        Ok(format!(
-            "https://cdn.kernel.org/pub/linux/kernel/v{major}.x/linux-{version}.tar.xz"
-        ))
-    }
+/// Stable tarball URL pattern (same logic as download_stable_tarball).
+fn stable_tarball_url(version: &str) -> Result<String> {
+    let major = major_version(version)?;
+    Ok(format!(
+        "https://cdn.kernel.org/pub/linux/kernel/v{major}.x/linux-{version}.tar.xz"
+    ))
+}
 
-    /// RC tarball URL pattern (same logic as download_rc_tarball).
-    fn rc_tarball_url(version: &str) -> String {
-        format!("https://git.kernel.org/torvalds/t/linux-{version}.tar.gz")
-    }
+/// RC tarball URL pattern (same logic as download_rc_tarball).
+fn rc_tarball_url(version: &str) -> String {
+    format!("https://git.kernel.org/torvalds/t/linux-{version}.tar.gz")
+}
 
-    #[test]
-    fn fetch_stable_url_construction() {
-        let url = stable_tarball_url("6.14.2").unwrap();
-        assert_eq!(
-            url,
-            "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.14.2.tar.xz"
-        );
-    }
+#[test]
+fn fetch_stable_url_construction() {
+    let url = stable_tarball_url("6.14.2").unwrap();
+    assert_eq!(
+        url,
+        "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.14.2.tar.xz"
+    );
+}
 
-    #[test]
-    fn fetch_stable_url_v5() {
-        let url = stable_tarball_url("5.4.0").unwrap();
-        assert_eq!(
-            url,
-            "https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-5.4.0.tar.xz"
-        );
-    }
+#[test]
+fn fetch_stable_url_v5() {
+    let url = stable_tarball_url("5.4.0").unwrap();
+    assert_eq!(
+        url,
+        "https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-5.4.0.tar.xz"
+    );
+}
 
-    #[test]
-    fn fetch_rc_url_construction() {
-        let url = rc_tarball_url("6.15-rc3");
-        assert_eq!(
-            url,
-            "https://git.kernel.org/torvalds/t/linux-6.15-rc3.tar.gz"
-        );
-    }
+#[test]
+fn fetch_rc_url_construction() {
+    let url = rc_tarball_url("6.15-rc3");
+    assert_eq!(
+        url,
+        "https://git.kernel.org/torvalds/t/linux-6.15-rc3.tar.gz"
+    );
+}
 
-    // -- promote_staged_kernel_tree --
+// -- promote_staged_kernel_tree --
 
-    #[test]
-    fn promote_staged_renames_well_formed_archive() {
-        let dest = tempfile::TempDir::new().unwrap();
-        let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
-        std::fs::create_dir(staging.path().join("linux-6.14.2")).unwrap();
-        std::fs::write(
-            staging.path().join("linux-6.14.2").join("Makefile"),
-            b"# fake",
-        )
-        .unwrap();
-        let source_dir = promote_staged_kernel_tree(&staging, dest.path(), "6.14.2").unwrap();
-        assert_eq!(source_dir, dest.path().join("linux-6.14.2"));
-        assert!(source_dir.is_dir());
-        assert!(source_dir.join("Makefile").is_file());
-        // Inner dir was renamed out of staging.
-        assert!(!staging.path().join("linux-6.14.2").exists());
-    }
+#[test]
+fn promote_staged_renames_well_formed_archive() {
+    let dest = tempfile::TempDir::new().unwrap();
+    let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
+    std::fs::create_dir(staging.path().join("linux-6.14.2")).unwrap();
+    std::fs::write(
+        staging.path().join("linux-6.14.2").join("Makefile"),
+        b"# fake",
+    )
+    .unwrap();
+    let source_dir = promote_staged_kernel_tree(&staging, dest.path(), "6.14.2").unwrap();
+    assert_eq!(source_dir, dest.path().join("linux-6.14.2"));
+    assert!(source_dir.is_dir());
+    assert!(source_dir.join("Makefile").is_file());
+    // Inner dir was renamed out of staging.
+    assert!(!staging.path().join("linux-6.14.2").exists());
+}
 
-    #[test]
-    fn promote_staged_rejects_stray_top_level_entry() {
-        let dest = tempfile::TempDir::new().unwrap();
-        let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
-        std::fs::create_dir(staging.path().join("linux-6.14.2")).unwrap();
-        std::fs::write(staging.path().join("evil"), b"backdoor").unwrap();
-        let err = promote_staged_kernel_tree(&staging, dest.path(), "6.14.2").unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("unexpected top-level entry"),
-            "diagnostic must cite stray entry: {msg}"
-        );
-        // Nothing landed in dest_dir.
-        assert!(!dest.path().join("linux-6.14.2").exists());
-    }
+#[test]
+fn promote_staged_rejects_stray_top_level_entry() {
+    let dest = tempfile::TempDir::new().unwrap();
+    let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
+    std::fs::create_dir(staging.path().join("linux-6.14.2")).unwrap();
+    std::fs::write(staging.path().join("evil"), b"backdoor").unwrap();
+    let err = promote_staged_kernel_tree(&staging, dest.path(), "6.14.2").unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("unexpected top-level entry"),
+        "diagnostic must cite stray entry: {msg}"
+    );
+    // Nothing landed in dest_dir.
+    assert!(!dest.path().join("linux-6.14.2").exists());
+}
 
-    #[test]
-    fn promote_staged_bails_on_missing_inner_dir() {
-        let dest = tempfile::TempDir::new().unwrap();
-        let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
-        // Wrong-version inner directory: archive was for 6.14.3 but
-        // we're expecting 6.14.2. The mismatch surfaces as a stray
-        // top-level entry rather than a missing-inner-dir, since
-        // the helper rejects any name that doesn't match the
-        // expected one before checking for absence.
-        std::fs::create_dir(staging.path().join("linux-6.14.3")).unwrap();
-        let err = promote_staged_kernel_tree(&staging, dest.path(), "6.14.2").unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("unexpected top-level entry"),
-            "wrong-version dir surfaces as stray: {msg}"
-        );
-        assert!(!dest.path().join("linux-6.14.2").exists());
-    }
+#[test]
+fn promote_staged_bails_on_missing_inner_dir() {
+    let dest = tempfile::TempDir::new().unwrap();
+    let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
+    // Wrong-version inner directory: archive was for 6.14.3 but
+    // we're expecting 6.14.2. The mismatch surfaces as a stray
+    // top-level entry rather than a missing-inner-dir, since
+    // the helper rejects any name that doesn't match the
+    // expected one before checking for absence.
+    std::fs::create_dir(staging.path().join("linux-6.14.3")).unwrap();
+    let err = promote_staged_kernel_tree(&staging, dest.path(), "6.14.2").unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("unexpected top-level entry"),
+        "wrong-version dir surfaces as stray: {msg}"
+    );
+    assert!(!dest.path().join("linux-6.14.2").exists());
+}
 
-    #[test]
-    fn promote_staged_bails_on_empty_staging() {
-        let dest = tempfile::TempDir::new().unwrap();
-        let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
-        let err = promote_staged_kernel_tree(&staging, dest.path(), "6.14.2").unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("expected directory linux-6.14.2"),
-            "empty staging surfaces as missing-dir: {msg}"
-        );
-    }
+#[test]
+fn promote_staged_bails_on_empty_staging() {
+    let dest = tempfile::TempDir::new().unwrap();
+    let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
+    let err = promote_staged_kernel_tree(&staging, dest.path(), "6.14.2").unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("expected directory linux-6.14.2"),
+        "empty staging surfaces as missing-dir: {msg}"
+    );
+}
 
-    // -- patch_level --
+// -- patch_level --
 
-    #[test]
-    fn fetch_patch_level_three_part() {
-        assert_eq!(patch_level("6.12.8"), Some(8));
-    }
+#[test]
+fn fetch_patch_level_three_part() {
+    assert_eq!(patch_level("6.12.8"), Some(8));
+}
 
-    #[test]
-    fn fetch_patch_level_two_part() {
-        assert_eq!(patch_level("7.0"), Some(0));
-    }
+#[test]
+fn fetch_patch_level_two_part() {
+    assert_eq!(patch_level("7.0"), Some(0));
+}
 
-    #[test]
-    fn fetch_patch_level_single_part() {
-        assert_eq!(patch_level("6"), None);
-    }
+#[test]
+fn fetch_patch_level_single_part() {
+    assert_eq!(patch_level("6"), None);
+}
 
-    #[test]
-    fn fetch_patch_level_four_part() {
-        assert_eq!(patch_level("6.1.2.3"), None);
-    }
+#[test]
+fn fetch_patch_level_four_part() {
+    assert_eq!(patch_level("6.1.2.3"), None);
+}
 
-    #[test]
-    fn fetch_patch_level_non_numeric_patch() {
-        assert_eq!(patch_level("6.1.rc3"), None);
-    }
+#[test]
+fn fetch_patch_level_non_numeric_patch() {
+    assert_eq!(patch_level("6.1.rc3"), None);
+}
 
-    #[test]
-    fn fetch_patch_level_zero() {
-        assert_eq!(patch_level("6.14.0"), Some(0));
-    }
+#[test]
+fn fetch_patch_level_zero() {
+    assert_eq!(patch_level("6.14.0"), Some(0));
+}
 
-    #[test]
-    fn fetch_patch_level_large() {
-        assert_eq!(patch_level("6.12.99"), Some(99));
-    }
+#[test]
+fn fetch_patch_level_large() {
+    assert_eq!(patch_level("6.12.99"), Some(99));
+}
 
-    // -- local_source dirty detection --
+// -- local_source dirty detection --
 
-    /// Initialise a git repo at `dir` with one committed file, using
-    /// the `git` CLI with explicit identity + empty global config so
-    /// the test is deterministic on developer machines and CI runners
-    /// regardless of the ambient git setup.
-    fn init_repo_with_commit(dir: &Path) {
-        use std::process::Command;
+/// Initialise a git repo at `dir` with one committed file, using
+/// the `git` CLI with explicit identity + empty global config so
+/// the test is deterministic on developer machines and CI runners
+/// regardless of the ambient git setup.
+fn init_repo_with_commit(dir: &Path) {
+    use std::process::Command;
 
-        let run = |args: &[&str]| {
-            let out = Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                // Empty system/global config: the test owns identity
-                // and default-branch config via -c flags below.
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .env("GIT_AUTHOR_NAME", "ktstr-test")
-                .env("GIT_AUTHOR_EMAIL", "ktstr-test@localhost")
-                .env("GIT_COMMITTER_NAME", "ktstr-test")
-                .env("GIT_COMMITTER_EMAIL", "ktstr-test@localhost")
-                .output()
-                .expect("spawn git");
-            assert!(
-                out.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-
-        run(&["init", "-q", "-b", "main"]);
-        std::fs::write(dir.join("file.txt"), "original\n").unwrap();
-        run(&["add", "file.txt"]);
-        run(&[
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-q",
-            "-m",
-            "initial",
-        ]);
-    }
-
-    /// On a clean repo, `local_source` must report `is_dirty=false` and
-    /// populate both the cache key and KernelSource::Local.git_hash
-    /// with the HEAD short-hash.
-    #[test]
-    fn local_source_clean_repo_populates_hash() {
-        if std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            skip!("git CLI unavailable");
-        }
-        let tmp = tempfile::TempDir::new().unwrap();
-        init_repo_with_commit(tmp.path());
-
-        let acquired = local_source(tmp.path()).expect("local_source ok");
-        assert!(!acquired.is_dirty, "clean tree must not be dirty");
-
-        let git_hash = match &acquired.kernel_source {
-            crate::cache::KernelSource::Local { git_hash, .. } => git_hash.clone(),
-            other => panic!("expected KernelSource::Local, got {other:?}"),
-        };
-        let hash = git_hash.expect("clean repo must carry a git_hash");
-        assert_eq!(hash.len(), 7, "short hash must be 7 chars, got {hash:?}");
-        assert!(
-            hash.chars().all(|c| c.is_ascii_hexdigit()),
-            "hash must be hex, got {hash:?}"
-        );
-        assert!(
-            acquired.cache_key.contains(&hash),
-            "clean cache_key must embed the short hash, got {}",
-            acquired.cache_key
-        );
-    }
-
-    /// On a dirty tracked-file worktree (worktree mutation after
-    /// commit), `local_source` must report `is_dirty=true` AND clear
-    /// `KernelSource::Local.git_hash`. The HEAD commit does not
-    /// describe a dirty tree, so surfacing the HEAD hash as the
-    /// build's source identity would mislead a reproducer.
-    #[test]
-    fn local_source_dirty_tracked_file_clears_hash() {
-        if std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            skip!("git CLI unavailable");
-        }
-        let tmp = tempfile::TempDir::new().unwrap();
-        init_repo_with_commit(tmp.path());
-        // Mutate the tracked file — index-vs-worktree becomes dirty.
-        std::fs::write(tmp.path().join("file.txt"), "modified\n").unwrap();
-
-        let acquired = local_source(tmp.path()).expect("local_source ok");
-        assert!(acquired.is_dirty, "worktree mutation must mark dirty");
-        match &acquired.kernel_source {
-            crate::cache::KernelSource::Local { git_hash, .. } => {
-                assert!(
-                    git_hash.is_none(),
-                    "dirty tree must not publish git_hash, got {git_hash:?}"
-                );
-            }
-            other => panic!("expected KernelSource::Local, got {other:?}"),
-        }
-        // Cache key must also fall through to the unknown bucket so
-        // a dirty build can never collide with a clean build at the
-        // same HEAD if caching is ever attempted.
-        assert!(
-            acquired.cache_key.starts_with("local-unknown-"),
-            "dirty cache_key must use local-unknown prefix, got {}",
-            acquired.cache_key
-        );
-    }
-
-    /// Staged-but-not-committed changes are dirty via the HEAD-vs-index
-    /// check (`tree_index_status`) rather than index-vs-worktree. The
-    /// same `git_hash=None` invariant applies.
-    #[test]
-    fn local_source_dirty_staged_only_clears_hash() {
-        if std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            skip!("git CLI unavailable");
-        }
-        let tmp = tempfile::TempDir::new().unwrap();
-        init_repo_with_commit(tmp.path());
-        // Modify + stage (so worktree matches index, but index
-        // differs from HEAD).
-        std::fs::write(tmp.path().join("file.txt"), "staged\n").unwrap();
-        let status = std::process::Command::new("git")
-            .args(["add", "file.txt"])
-            .current_dir(tmp.path())
+    let run = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            // Empty system/global config: the test owns identity
+            // and default-branch config via -c flags below.
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .status()
-            .expect("git add");
-        assert!(status.success());
+            .env("GIT_AUTHOR_NAME", "ktstr-test")
+            .env("GIT_AUTHOR_EMAIL", "ktstr-test@localhost")
+            .env("GIT_COMMITTER_NAME", "ktstr-test")
+            .env("GIT_COMMITTER_EMAIL", "ktstr-test@localhost")
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
 
-        let acquired = local_source(tmp.path()).expect("local_source ok");
-        assert!(acquired.is_dirty, "staged-only change must mark dirty");
-        match &acquired.kernel_source {
-            crate::cache::KernelSource::Local { git_hash, .. } => {
-                assert!(
-                    git_hash.is_none(),
-                    "dirty (staged) tree must not publish git_hash, got {git_hash:?}"
-                );
-            }
-            other => panic!("expected KernelSource::Local, got {other:?}"),
-        }
+    run(&["init", "-q", "-b", "main"]);
+    std::fs::write(dir.join("file.txt"), "original\n").unwrap();
+    run(&["add", "file.txt"]);
+    run(&[
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "initial",
+    ]);
+}
+
+/// On a clean repo, `local_source` must report `is_dirty=false` and
+/// populate both the cache key and KernelSource::Local.git_hash
+/// with the HEAD short-hash.
+#[test]
+fn local_source_clean_repo_populates_hash() {
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        skip!("git CLI unavailable");
     }
+    let tmp = tempfile::TempDir::new().unwrap();
+    init_repo_with_commit(tmp.path());
 
-    /// Non-git directories are treated as permanently dirty and
-    /// produce `git_hash=None` — there is no commit to reference.
-    ///
-    /// `gix::discover` walks the parent chain from the input
-    /// path; when the host's `/tmp` happens to live inside a git
-    /// checkout (the developer's `~/work` mounted under `/tmp`,
-    /// some CI runners), discover finds the ancestor `.git`
-    /// before this test's tempdir asserts the "no repo" branch.
-    /// Skip in that environment — the production behavior
-    /// (treat the discovered ancestor as the source identity)
-    /// is correct in both cases; this test only exercises the
-    /// no-repo-found branch and cannot pin it without
-    /// isolation. Mirrors the `git CLI unavailable` skip
-    /// pattern above.
-    #[test]
-    fn local_source_non_git_is_dirty_without_hash() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        if crate::test_support::test_helpers::tempdir_resolves_to_ancestor_git(tmp.path()) {
-            skip!(
-                "tempdir {} resolves to an ancestor git repo; cannot pin non-git \
+    let acquired = local_source(tmp.path()).expect("local_source ok");
+    assert!(!acquired.is_dirty, "clean tree must not be dirty");
+
+    let git_hash = match &acquired.kernel_source {
+        crate::cache::KernelSource::Local { git_hash, .. } => git_hash.clone(),
+        other => panic!("expected KernelSource::Local, got {other:?}"),
+    };
+    let hash = git_hash.expect("clean repo must carry a git_hash");
+    assert_eq!(hash.len(), 7, "short hash must be 7 chars, got {hash:?}");
+    assert!(
+        hash.chars().all(|c| c.is_ascii_hexdigit()),
+        "hash must be hex, got {hash:?}"
+    );
+    assert!(
+        acquired.cache_key.contains(&hash),
+        "clean cache_key must embed the short hash, got {}",
+        acquired.cache_key
+    );
+}
+
+/// On a dirty tracked-file worktree (worktree mutation after
+/// commit), `local_source` must report `is_dirty=true` AND clear
+/// `KernelSource::Local.git_hash`. The HEAD commit does not
+/// describe a dirty tree, so surfacing the HEAD hash as the
+/// build's source identity would mislead a reproducer.
+#[test]
+fn local_source_dirty_tracked_file_clears_hash() {
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        skip!("git CLI unavailable");
+    }
+    let tmp = tempfile::TempDir::new().unwrap();
+    init_repo_with_commit(tmp.path());
+    // Mutate the tracked file — index-vs-worktree becomes dirty.
+    std::fs::write(tmp.path().join("file.txt"), "modified\n").unwrap();
+
+    let acquired = local_source(tmp.path()).expect("local_source ok");
+    assert!(acquired.is_dirty, "worktree mutation must mark dirty");
+    match &acquired.kernel_source {
+        crate::cache::KernelSource::Local { git_hash, .. } => {
+            assert!(
+                git_hash.is_none(),
+                "dirty tree must not publish git_hash, got {git_hash:?}"
+            );
+        }
+        other => panic!("expected KernelSource::Local, got {other:?}"),
+    }
+    // Cache key must also fall through to the unknown bucket so
+    // a dirty build can never collide with a clean build at the
+    // same HEAD if caching is ever attempted.
+    assert!(
+        acquired.cache_key.starts_with("local-unknown-"),
+        "dirty cache_key must use local-unknown prefix, got {}",
+        acquired.cache_key
+    );
+}
+
+/// Staged-but-not-committed changes are dirty via the HEAD-vs-index
+/// check (`tree_index_status`) rather than index-vs-worktree. The
+/// same `git_hash=None` invariant applies.
+#[test]
+fn local_source_dirty_staged_only_clears_hash() {
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        skip!("git CLI unavailable");
+    }
+    let tmp = tempfile::TempDir::new().unwrap();
+    init_repo_with_commit(tmp.path());
+    // Modify + stage (so worktree matches index, but index
+    // differs from HEAD).
+    std::fs::write(tmp.path().join("file.txt"), "staged\n").unwrap();
+    let status = std::process::Command::new("git")
+        .args(["add", "file.txt"])
+        .current_dir(tmp.path())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .status()
+        .expect("git add");
+    assert!(status.success());
+
+    let acquired = local_source(tmp.path()).expect("local_source ok");
+    assert!(acquired.is_dirty, "staged-only change must mark dirty");
+    match &acquired.kernel_source {
+        crate::cache::KernelSource::Local { git_hash, .. } => {
+            assert!(
+                git_hash.is_none(),
+                "dirty (staged) tree must not publish git_hash, got {git_hash:?}"
+            );
+        }
+        other => panic!("expected KernelSource::Local, got {other:?}"),
+    }
+}
+
+/// Non-git directories are treated as permanently dirty and
+/// produce `git_hash=None` — there is no commit to reference.
+///
+/// `gix::discover` walks the parent chain from the input
+/// path; when the host's `/tmp` happens to live inside a git
+/// checkout (the developer's `~/work` mounted under `/tmp`,
+/// some CI runners), discover finds the ancestor `.git`
+/// before this test's tempdir asserts the "no repo" branch.
+/// Skip in that environment — the production behavior
+/// (treat the discovered ancestor as the source identity)
+/// is correct in both cases; this test only exercises the
+/// no-repo-found branch and cannot pin it without
+/// isolation. Mirrors the `git CLI unavailable` skip
+/// pattern above.
+#[test]
+fn local_source_non_git_is_dirty_without_hash() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    if crate::test_support::test_helpers::tempdir_resolves_to_ancestor_git(tmp.path()) {
+        skip!(
+            "tempdir {} resolves to an ancestor git repo; cannot pin non-git \
                  path semantics in this environment",
-                tmp.path().display()
-            );
-        }
-        std::fs::write(tmp.path().join("file.txt"), "no git here\n").unwrap();
-
-        let acquired = local_source(tmp.path()).expect("local_source ok");
-        assert!(acquired.is_dirty, "non-git tree must mark dirty");
-        match &acquired.kernel_source {
-            crate::cache::KernelSource::Local { git_hash, .. } => {
-                assert!(
-                    git_hash.is_none(),
-                    "non-git tree must not publish git_hash, got {git_hash:?}"
-                );
-            }
-            other => panic!("expected KernelSource::Local, got {other:?}"),
-        }
-        assert!(
-            acquired.cache_key.starts_with("local-unknown-"),
-            "non-git cache_key must use local-unknown prefix, got {}",
-            acquired.cache_key
+            tmp.path().display()
         );
     }
+    std::fs::write(tmp.path().join("file.txt"), "no git here\n").unwrap();
 
-    // -- compose_local_cache_key + canonical-path salt --
-
-    /// Two distinct non-git source trees produce DIFFERENT
-    /// `local-unknown-...` keys via the path-derived salt — without
-    /// the salt, both would collapse to the same slot and a
-    /// concurrent build could write each other's cache contents.
-    #[test]
-    fn local_unknown_keys_carry_distinct_per_path_salt() {
-        let tmp_a = tempfile::TempDir::new().unwrap();
-        let tmp_b = tempfile::TempDir::new().unwrap();
-        // Skip if either tempdir resolves to an ancestor git
-        // repo — the test asserts the `local-unknown-` prefix
-        // shape, which requires the no-repo branch on both
-        // calls. Same skip pattern as
-        // `local_source_non_git_is_dirty_without_hash`.
-        if crate::test_support::test_helpers::tempdir_resolves_to_ancestor_git(tmp_a.path())
-            || crate::test_support::test_helpers::tempdir_resolves_to_ancestor_git(tmp_b.path())
-        {
-            skip!(
-                "tempdir(s) {} / {} resolve to ancestor git repo; cannot pin \
-                 non-git salt semantics in this environment",
-                tmp_a.path().display(),
-                tmp_b.path().display(),
+    let acquired = local_source(tmp.path()).expect("local_source ok");
+    assert!(acquired.is_dirty, "non-git tree must mark dirty");
+    match &acquired.kernel_source {
+        crate::cache::KernelSource::Local { git_hash, .. } => {
+            assert!(
+                git_hash.is_none(),
+                "non-git tree must not publish git_hash, got {git_hash:?}"
             );
         }
-        std::fs::write(tmp_a.path().join("file"), b"a").unwrap();
-        std::fs::write(tmp_b.path().join("file"), b"b").unwrap();
+        other => panic!("expected KernelSource::Local, got {other:?}"),
+    }
+    assert!(
+        acquired.cache_key.starts_with("local-unknown-"),
+        "non-git cache_key must use local-unknown prefix, got {}",
+        acquired.cache_key
+    );
+}
 
-        let key_a = local_source(tmp_a.path()).unwrap().cache_key;
-        let key_b = local_source(tmp_b.path()).unwrap().cache_key;
-        assert!(
-            key_a.starts_with("local-unknown-"),
-            "tree-a key shape: {key_a}"
+// -- compose_local_cache_key + canonical-path salt --
+
+/// Two distinct non-git source trees produce DIFFERENT
+/// `local-unknown-...` keys via the path-derived salt — without
+/// the salt, both would collapse to the same slot and a
+/// concurrent build could write each other's cache contents.
+#[test]
+fn local_unknown_keys_carry_distinct_per_path_salt() {
+    let tmp_a = tempfile::TempDir::new().unwrap();
+    let tmp_b = tempfile::TempDir::new().unwrap();
+    // Skip if either tempdir resolves to an ancestor git
+    // repo — the test asserts the `local-unknown-` prefix
+    // shape, which requires the no-repo branch on both
+    // calls. Same skip pattern as
+    // `local_source_non_git_is_dirty_without_hash`.
+    if crate::test_support::test_helpers::tempdir_resolves_to_ancestor_git(tmp_a.path())
+        || crate::test_support::test_helpers::tempdir_resolves_to_ancestor_git(tmp_b.path())
+    {
+        skip!(
+            "tempdir(s) {} / {} resolve to ancestor git repo; cannot pin \
+                 non-git salt semantics in this environment",
+            tmp_a.path().display(),
+            tmp_b.path().display(),
         );
-        assert!(
-            key_b.starts_with("local-unknown-"),
-            "tree-b key shape: {key_b}"
-        );
-        assert_ne!(
-            key_a, key_b,
-            "distinct paths must produce distinct local-unknown keys; \
+    }
+    std::fs::write(tmp_a.path().join("file"), b"a").unwrap();
+    std::fs::write(tmp_b.path().join("file"), b"b").unwrap();
+
+    let key_a = local_source(tmp_a.path()).unwrap().cache_key;
+    let key_b = local_source(tmp_b.path()).unwrap().cache_key;
+    assert!(
+        key_a.starts_with("local-unknown-"),
+        "tree-a key shape: {key_a}"
+    );
+    assert!(
+        key_b.starts_with("local-unknown-"),
+        "tree-b key shape: {key_b}"
+    );
+    assert_ne!(
+        key_a, key_b,
+        "distinct paths must produce distinct local-unknown keys; \
              without per-path salt they would collide and parallel \
              builds could stomp each other's cache content"
-        );
-    }
+    );
+}
 
-    /// Same canonical path always produces the same `local-unknown`
-    /// key — the salt must be a deterministic function of the path
-    /// bytes, NOT a random nonce. A non-deterministic salt would
-    /// defeat cache lookups within the same source tree across
-    /// re-runs.
-    #[test]
-    fn local_unknown_key_stable_across_repeated_calls_on_same_path() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        // Skip if the tempdir resolves to an ancestor git repo —
-        // the test asserts the `local-unknown-` prefix shape, and
-        // an ancestor walk would yield a `local-{short_hash}-`
-        // key instead. Same pattern as the sibling non-git
-        // tests above.
-        if crate::test_support::test_helpers::tempdir_resolves_to_ancestor_git(tmp.path()) {
-            skip!(
-                "tempdir {} resolves to an ancestor git repo; cannot pin \
+/// Same canonical path always produces the same `local-unknown`
+/// key — the salt must be a deterministic function of the path
+/// bytes, NOT a random nonce. A non-deterministic salt would
+/// defeat cache lookups within the same source tree across
+/// re-runs.
+#[test]
+fn local_unknown_key_stable_across_repeated_calls_on_same_path() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    // Skip if the tempdir resolves to an ancestor git repo —
+    // the test asserts the `local-unknown-` prefix shape, and
+    // an ancestor walk would yield a `local-{short_hash}-`
+    // key instead. Same pattern as the sibling non-git
+    // tests above.
+    if crate::test_support::test_helpers::tempdir_resolves_to_ancestor_git(tmp.path()) {
+        skip!(
+            "tempdir {} resolves to an ancestor git repo; cannot pin \
                  deterministic non-git salt in this environment",
-                tmp.path().display()
-            );
-        }
-        std::fs::write(tmp.path().join("file"), b"x").unwrap();
-        let k1 = local_source(tmp.path()).unwrap().cache_key;
-        let k2 = local_source(tmp.path()).unwrap().cache_key;
-        assert_eq!(
-            k1, k2,
-            "salt must be deterministic across repeated calls on the same path"
+            tmp.path().display()
         );
     }
+    std::fs::write(tmp.path().join("file"), b"x").unwrap();
+    let k1 = local_source(tmp.path()).unwrap().cache_key;
+    let k2 = local_source(tmp.path()).unwrap().cache_key;
+    assert_eq!(
+        k1, k2,
+        "salt must be deterministic across repeated calls on the same path"
+    );
+}
 
-    // -- compose_local_cache_key + user-config hash segment --
+// -- compose_local_cache_key + user-config hash segment --
 
-    /// `compose_local_cache_key` with a user `.config` hash inserts
-    /// the `cfg{user_config}` segment between the HEAD hash and the
-    /// `kc{suffix}` tail. Verifies the encoding directly, not via
-    /// `local_source` (no `.config` is needed because the helper is
-    /// pure on its inputs).
-    #[test]
-    fn compose_local_cache_key_with_user_config_inserts_cfg_segment() {
-        use std::path::PathBuf;
-        let key = compose_local_cache_key(
-            "x86_64",
-            &Some("abc1234".to_string()),
-            &PathBuf::from("/anywhere"),
-            Some("deadbeef"),
-        );
-        let suffix = crate::cache_key_suffix();
-        assert_eq!(
-            key,
-            format!("local-abc1234-x86_64-cfgdeadbeef-kc{suffix}"),
-            "user-config segment must sit between hash and kc tail"
-        );
+/// `compose_local_cache_key` with a user `.config` hash inserts
+/// the `cfg{user_config}` segment between the HEAD hash and the
+/// `kc{suffix}` tail. Verifies the encoding directly, not via
+/// `local_source` (no `.config` is needed because the helper is
+/// pure on its inputs).
+#[test]
+fn compose_local_cache_key_with_user_config_inserts_cfg_segment() {
+    use std::path::PathBuf;
+    let key = compose_local_cache_key(
+        "x86_64",
+        &Some("abc1234".to_string()),
+        &PathBuf::from("/anywhere"),
+        Some("deadbeef"),
+    );
+    let suffix = crate::cache_key_suffix();
+    assert_eq!(
+        key,
+        format!("local-abc1234-x86_64-cfgdeadbeef-kc{suffix}"),
+        "user-config segment must sit between hash and kc tail"
+    );
+}
+
+/// `compose_local_cache_key` without a user `.config` hash falls
+/// back to the original `local-{hash}-{arch}-kc{suffix}` shape so
+/// fresh checkouts (no `.config` yet) keep the legacy key shape
+/// — the cfg segment only appears when there's actually a user
+/// `.config` to discriminate against.
+#[test]
+fn compose_local_cache_key_without_user_config_keeps_legacy_shape() {
+    use std::path::PathBuf;
+    let key = compose_local_cache_key(
+        "x86_64",
+        &Some("abc1234".to_string()),
+        &PathBuf::from("/anywhere"),
+        None,
+    );
+    let suffix = crate::cache_key_suffix();
+    assert_eq!(
+        key,
+        format!("local-abc1234-x86_64-kc{suffix}"),
+        "absent user config must keep the legacy hash-only shape"
+    );
+}
+
+/// `compose_local_cache_key` with no HEAD hash (dirty / non-git
+/// tree) routes to the `local-unknown-{path_hash}` shape and the
+/// `cfg` segment is dropped — the tree's identity collapses to
+/// the salt anyway, so an additional config segment would be
+/// redundant noise on the unknown path.
+#[test]
+fn compose_local_cache_key_unknown_uses_path_hash_only() {
+    use std::path::PathBuf;
+    let key = compose_local_cache_key(
+        "x86_64",
+        &None,
+        &PathBuf::from("/some/path"),
+        Some("ignored"),
+    );
+    let suffix = crate::cache_key_suffix();
+    assert!(
+        key.starts_with("local-unknown-") && key.ends_with(&format!("-x86_64-kc{suffix}")),
+        "unknown shape must skip cfg segment; got {key}"
+    );
+    // The path-hash segment sits between `local-unknown-` and
+    // `-x86_64-`. Verify it's exactly 8 hex chars (full CRC32).
+    let path_hash = key
+        .strip_prefix("local-unknown-")
+        .and_then(|s| s.strip_suffix(&format!("-x86_64-kc{suffix}")))
+        .expect("key shape mismatch");
+    assert_eq!(
+        path_hash.len(),
+        8,
+        "path-hash salt must be 8 chars (full CRC32); got {path_hash}"
+    );
+    assert!(
+        path_hash.chars().all(|c| c.is_ascii_hexdigit()),
+        "path-hash salt must be hex; got {path_hash}"
+    );
+}
+
+// -- inspect_local_source_state (post-build re-check semantics) --
+
+/// Two consecutive `inspect_local_source_state` calls on a clean
+/// repo return the same shape — pins the "rerun the same probe
+/// with no false-positive flip" contract that lets
+/// `kernel_build_pipeline` compare acquire-time vs post-build
+/// state for change detection.
+#[test]
+fn inspect_local_source_state_clean_repo_stable_across_calls() {
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        skip!("git CLI unavailable");
     }
+    let tmp = tempfile::TempDir::new().unwrap();
+    init_repo_with_commit(tmp.path());
+    let canonical = tmp.path().canonicalize().unwrap();
 
-    /// `compose_local_cache_key` without a user `.config` hash falls
-    /// back to the original `local-{hash}-{arch}-kc{suffix}` shape so
-    /// fresh checkouts (no `.config` yet) keep the legacy key shape
-    /// — the cfg segment only appears when there's actually a user
-    /// `.config` to discriminate against.
-    #[test]
-    fn compose_local_cache_key_without_user_config_keeps_legacy_shape() {
-        use std::path::PathBuf;
-        let key = compose_local_cache_key(
-            "x86_64",
-            &Some("abc1234".to_string()),
-            &PathBuf::from("/anywhere"),
-            None,
-        );
-        let suffix = crate::cache_key_suffix();
-        assert_eq!(
-            key,
-            format!("local-abc1234-x86_64-kc{suffix}"),
-            "absent user config must keep the legacy hash-only shape"
-        );
+    let pre = inspect_local_source_state(&canonical).unwrap();
+    let post = inspect_local_source_state(&canonical).unwrap();
+    assert_eq!(pre.is_dirty, post.is_dirty);
+    assert_eq!(pre.is_git, post.is_git);
+    assert_eq!(pre.short_hash, post.short_hash);
+}
+
+/// A mid-build modification (worktree edit between two
+/// `inspect_local_source_state` calls) flips `is_dirty` — the
+/// signal `kernel_build_pipeline` uses to skip the cache store
+/// on the racing-write path.
+#[test]
+fn inspect_local_source_state_detects_mid_build_modification() {
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        skip!("git CLI unavailable");
     }
+    let tmp = tempfile::TempDir::new().unwrap();
+    init_repo_with_commit(tmp.path());
+    let canonical = tmp.path().canonicalize().unwrap();
 
-    /// `compose_local_cache_key` with no HEAD hash (dirty / non-git
-    /// tree) routes to the `local-unknown-{path_hash}` shape and the
-    /// `cfg` segment is dropped — the tree's identity collapses to
-    /// the salt anyway, so an additional config segment would be
-    /// redundant noise on the unknown path.
-    #[test]
-    fn compose_local_cache_key_unknown_uses_path_hash_only() {
-        use std::path::PathBuf;
-        let key = compose_local_cache_key(
-            "x86_64",
-            &None,
-            &PathBuf::from("/some/path"),
-            Some("ignored"),
-        );
-        let suffix = crate::cache_key_suffix();
-        assert!(
-            key.starts_with("local-unknown-") && key.ends_with(&format!("-x86_64-kc{suffix}")),
-            "unknown shape must skip cfg segment; got {key}"
-        );
-        // The path-hash segment sits between `local-unknown-` and
-        // `-x86_64-`. Verify it's exactly 8 hex chars (full CRC32).
-        let path_hash = key
-            .strip_prefix("local-unknown-")
-            .and_then(|s| s.strip_suffix(&format!("-x86_64-kc{suffix}")))
-            .expect("key shape mismatch");
-        assert_eq!(
-            path_hash.len(),
-            8,
-            "path-hash salt must be 8 chars (full CRC32); got {path_hash}"
-        );
-        assert!(
-            path_hash.chars().all(|c| c.is_ascii_hexdigit()),
-            "path-hash salt must be hex; got {path_hash}"
-        );
-    }
+    let pre = inspect_local_source_state(&canonical).unwrap();
+    assert!(!pre.is_dirty, "acquire-time state must be clean");
 
-    // -- inspect_local_source_state (post-build re-check semantics) --
+    // Simulate a mid-build edit to the tracked file.
+    std::fs::write(canonical.join("file.txt"), b"edited mid-build").unwrap();
 
-    /// Two consecutive `inspect_local_source_state` calls on a clean
-    /// repo return the same shape — pins the "rerun the same probe
-    /// with no false-positive flip" contract that lets
-    /// `kernel_build_pipeline` compare acquire-time vs post-build
-    /// state for change detection.
-    #[test]
-    fn inspect_local_source_state_clean_repo_stable_across_calls() {
-        if std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            skip!("git CLI unavailable");
-        }
-        let tmp = tempfile::TempDir::new().unwrap();
-        init_repo_with_commit(tmp.path());
-        let canonical = tmp.path().canonicalize().unwrap();
+    let post = inspect_local_source_state(&canonical).unwrap();
+    assert!(
+        post.is_dirty,
+        "post-build re-check must observe the worktree edit and flip dirty"
+    );
+    assert!(
+        post.short_hash.is_none(),
+        "dirty post-build state must drop short_hash, mirroring acquire-time semantics"
+    );
+}
 
-        let pre = inspect_local_source_state(&canonical).unwrap();
-        let post = inspect_local_source_state(&canonical).unwrap();
-        assert_eq!(pre.is_dirty, post.is_dirty);
-        assert_eq!(pre.is_git, post.is_git);
-        assert_eq!(pre.short_hash, post.short_hash);
-    }
+// -- cached_releases --
 
-    /// A mid-build modification (worktree edit between two
-    /// `inspect_local_source_state` calls) flips `is_dirty` — the
-    /// signal `kernel_build_pipeline` uses to skip the cache store
-    /// on the racing-write path.
-    #[test]
-    fn inspect_local_source_state_detects_mid_build_modification() {
-        if std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            skip!("git CLI unavailable");
-        }
-        let tmp = tempfile::TempDir::new().unwrap();
-        init_repo_with_commit(tmp.path());
-        let canonical = tmp.path().canonicalize().unwrap();
+/// Pin every routing property of [`cached_releases_with`]
+/// in one test, since the underlying [`RELEASES_CACHE`]
+/// `OnceLock` only allows one populating `set` per process.
+/// Each block below is a distinct assertion:
+///
+/// (a) **Cache-hit fast-path**: pre-populating
+///     [`RELEASES_CACHE`] with synthetic data and calling
+///     [`cached_releases`] returns the synthetic vector
+///     verbatim — the `if let Some(cached) = ... .get()`
+///     path is exercised, not [`fetch_releases`].
+///
+/// (b) **Idempotency**: a second [`cached_releases`] call
+///     returns the same data — the slot remains populated
+///     across calls within the process.
+///
+/// (c) **Singleton-path public-fn routing**:
+///     [`fetch_latest_stable_version`] called with
+///     [`shared_client`] reaches [`RELEASES_CACHE`] via
+///     [`cached_releases_with`] and selects from the
+///     synthetic data without touching the network.
+///
+/// Bypass-branch routing is covered by two complementary
+/// tests: the `is_shared_client` predicate is unit-tested by
+/// [`is_shared_client_rejects_test_constructed_clients`],
+/// and the end-to-end branch through
+/// [`cached_releases_with_url`] is exercised by
+/// [`cached_releases_with_non_singleton_bypasses_cache`] —
+/// which drives the bypass against a localhost mock URL via
+/// the URL-injection seam and proves the non-singleton
+/// `Client` skips [`RELEASES_CACHE`] and reaches
+/// [`fetch_releases`] with the supplied URL.
+/// [`fetch_releases`]'s GET-and-parse mechanics — the same
+/// function the bypass branch invokes with whatever URL is
+/// threaded in, and that production callers reach on cache
+/// miss (with [`RELEASES_URL`] pinned by the
+/// [`cached_releases_with`] wrapper) — are covered
+/// deterministically by
+/// [`fetch_releases_against_localhost_mock_returns_parsed`]
+/// against a TcpListener mock with an injected URL, plus the
+/// `fetch_releases_*` family of error-path tests
+/// (HTTP 500, malformed JSON, missing array, partial rows,
+/// empty array, extra fields, connection refused). Together
+/// these cover the bypass branch end-to-end without
+/// requiring a real kernel.org round-trip.
+///
+/// Cross-test contamination: this test populates the
+/// process-wide [`RELEASES_CACHE`] AND initializes the
+/// process-wide [`SHARED_CLIENT`] (via the
+/// [`shared_client`] call in block (c)). Both are
+/// `OnceLock` statics — peer tests in the same binary
+/// observe both as populated/initialized after this test
+/// runs.
+/// [`cached_releases_with_non_singleton_bypasses_cache`] is
+/// the one peer test that also pre-populates
+/// [`RELEASES_CACHE`]; both tests use byte-equal synthetic
+/// data so whichever wins the OnceLock `set` race leaves
+/// identical contents. Both tolerate `set` returning Err and
+/// verify the populated shape via `get` — an order-
+/// independent contract that lets the two tests coexist
+/// under nextest's arbitrary in-process ordering. No other
+/// test in this binary calls [`cached_releases`] or any
+/// cache-routed `fetch_*` entry
+/// ([`fetch_latest_stable_version`],
+/// [`fetch_version_for_prefix`], `latest_in_series`) with
+/// [`shared_client`] — the `expand_kernel_range`-shaped
+/// tests in `cli.rs` bypass the network by calling
+/// `filter_and_sort_range` directly with synthetic
+/// releases. The
+/// `is_shared_client_recognizes_process_singleton` and
+/// `is_shared_client_rejects_test_constructed_clients`
+/// tests touch [`SHARED_CLIENT`] but not
+/// [`RELEASES_CACHE`], so they coexist with this test. A
+/// future test that calls any cache-routed entry with
+/// [`shared_client`] must run in a separate binary or
+/// accept the synthetic-data side effect.
+#[test]
+fn cached_releases_routing_singleton_path() {
+    let synthetic = vec![
+        Release {
+            moniker: "stable".to_string(),
+            version: "6.14.2".to_string(),
+        },
+        Release {
+            moniker: "longterm".to_string(),
+            version: "6.12.81".to_string(),
+        },
+        Release {
+            moniker: "mainline".to_string(),
+            version: "6.16-rc3".to_string(),
+        },
+    ];
 
-        let pre = inspect_local_source_state(&canonical).unwrap();
-        assert!(!pre.is_dirty, "acquire-time state must be clean");
-
-        // Simulate a mid-build edit to the tracked file.
-        std::fs::write(canonical.join("file.txt"), b"edited mid-build").unwrap();
-
-        let post = inspect_local_source_state(&canonical).unwrap();
-        assert!(
-            post.is_dirty,
-            "post-build re-check must observe the worktree edit and flip dirty"
-        );
-        assert!(
-            post.short_hash.is_none(),
-            "dirty post-build state must drop short_hash, mirroring acquire-time semantics"
-        );
-    }
-
-    // -- cached_releases --
-
-    /// Pin every routing property of [`cached_releases_with`]
-    /// in one test, since the underlying [`RELEASES_CACHE`]
-    /// `OnceLock` only allows one populating `set` per process.
-    /// Each block below is a distinct assertion:
-    ///
-    /// (a) **Cache-hit fast-path**: pre-populating
-    ///     [`RELEASES_CACHE`] with synthetic data and calling
-    ///     [`cached_releases`] returns the synthetic vector
-    ///     verbatim — the `if let Some(cached) = ... .get()`
-    ///     path is exercised, not [`fetch_releases`].
-    ///
-    /// (b) **Idempotency**: a second [`cached_releases`] call
-    ///     returns the same data — the slot remains populated
-    ///     across calls within the process.
-    ///
-    /// (c) **Singleton-path public-fn routing**:
-    ///     [`fetch_latest_stable_version`] called with
-    ///     [`shared_client`] reaches [`RELEASES_CACHE`] via
-    ///     [`cached_releases_with`] and selects from the
-    ///     synthetic data without touching the network.
-    ///
-    /// Bypass-branch routing is covered by two complementary
-    /// tests: the `is_shared_client` predicate is unit-tested by
-    /// [`is_shared_client_rejects_test_constructed_clients`],
-    /// and the end-to-end branch through
-    /// [`cached_releases_with_url`] is exercised by
-    /// [`cached_releases_with_non_singleton_bypasses_cache`] —
-    /// which drives the bypass against a localhost mock URL via
-    /// the URL-injection seam and proves the non-singleton
-    /// `Client` skips [`RELEASES_CACHE`] and reaches
-    /// [`fetch_releases`] with the supplied URL.
-    /// [`fetch_releases`]'s GET-and-parse mechanics — the same
-    /// function the bypass branch invokes with whatever URL is
-    /// threaded in, and that production callers reach on cache
-    /// miss (with [`RELEASES_URL`] pinned by the
-    /// [`cached_releases_with`] wrapper) — are covered
-    /// deterministically by
-    /// [`fetch_releases_against_localhost_mock_returns_parsed`]
-    /// against a TcpListener mock with an injected URL, plus the
-    /// `fetch_releases_*` family of error-path tests
-    /// (HTTP 500, malformed JSON, missing array, partial rows,
-    /// empty array, extra fields, connection refused). Together
-    /// these cover the bypass branch end-to-end without
-    /// requiring a real kernel.org round-trip.
-    ///
-    /// Cross-test contamination: this test populates the
-    /// process-wide [`RELEASES_CACHE`] AND initializes the
-    /// process-wide [`SHARED_CLIENT`] (via the
-    /// [`shared_client`] call in block (c)). Both are
-    /// `OnceLock` statics — peer tests in the same binary
-    /// observe both as populated/initialized after this test
-    /// runs.
-    /// [`cached_releases_with_non_singleton_bypasses_cache`] is
-    /// the one peer test that also pre-populates
-    /// [`RELEASES_CACHE`]; both tests use byte-equal synthetic
-    /// data so whichever wins the OnceLock `set` race leaves
-    /// identical contents. Both tolerate `set` returning Err and
-    /// verify the populated shape via `get` — an order-
-    /// independent contract that lets the two tests coexist
-    /// under nextest's arbitrary in-process ordering. No other
-    /// test in this binary calls [`cached_releases`] or any
-    /// cache-routed `fetch_*` entry
-    /// ([`fetch_latest_stable_version`],
-    /// [`fetch_version_for_prefix`], `latest_in_series`) with
-    /// [`shared_client`] — the `expand_kernel_range`-shaped
-    /// tests in `cli.rs` bypass the network by calling
-    /// `filter_and_sort_range` directly with synthetic
-    /// releases. The
-    /// `is_shared_client_recognizes_process_singleton` and
-    /// `is_shared_client_rejects_test_constructed_clients`
-    /// tests touch [`SHARED_CLIENT`] but not
-    /// [`RELEASES_CACHE`], so they coexist with this test. A
-    /// future test that calls any cache-routed entry with
-    /// [`shared_client`] must run in a separate binary or
-    /// accept the synthetic-data side effect.
-    #[test]
-    fn cached_releases_routing_singleton_path() {
-        let synthetic = vec![
-            Release {
-                moniker: "stable".to_string(),
-                version: "6.14.2".to_string(),
-            },
-            Release {
-                moniker: "longterm".to_string(),
-                version: "6.12.81".to_string(),
-            },
-            Release {
-                moniker: "mainline".to_string(),
-                version: "6.16-rc3".to_string(),
-            },
-        ];
-
-        // Pre-populate the cache. `set` returns `Err(value)` if
-        // the slot was already populated by an earlier test in
-        // the same binary; the test below
-        // (`cached_releases_with_non_singleton_bypasses_cache`)
-        // also pre-populates the cache with the SAME `synthetic`
-        // vector to coexist with this test under nextest's
-        // arbitrary in-process ordering. Both populating tests
-        // use byte-equal synthetic data so whichever wins the
-        // OnceLock race leaves identical cache contents, and the
-        // assertions below verify those contents independently
-        // of who set them. We tolerate `set` returning Err
-        // (peer-test populated first) and verify the populated
-        // shape via the explicit `get()` check immediately
-        // after.
-        let _ = super::RELEASES_CACHE.set(synthetic.clone());
-        let in_cache = super::RELEASES_CACHE.get().expect(
-            "RELEASES_CACHE must be populated after `set` — either this \
+    // Pre-populate the cache. `set` returns `Err(value)` if
+    // the slot was already populated by an earlier test in
+    // the same binary; the test below
+    // (`cached_releases_with_non_singleton_bypasses_cache`)
+    // also pre-populates the cache with the SAME `synthetic`
+    // vector to coexist with this test under nextest's
+    // arbitrary in-process ordering. Both populating tests
+    // use byte-equal synthetic data so whichever wins the
+    // OnceLock race leaves identical cache contents, and the
+    // assertions below verify those contents independently
+    // of who set them. We tolerate `set` returning Err
+    // (peer-test populated first) and verify the populated
+    // shape via the explicit `get()` check immediately
+    // after.
+    let _ = super::RELEASES_CACHE.set(synthetic.clone());
+    let in_cache = super::RELEASES_CACHE.get().expect(
+        "RELEASES_CACHE must be populated after `set` — either this \
              test or its bypass-branch peer wins the race; both use the \
              same synthetic so contents are byte-equal regardless of \
              order",
-        );
-        // Verify byte-equal contents, not just length — a peer
-        // test populating with a mismatched moniker/version pair
-        // at the right row count would silently pass a length
-        // check and corrupt every downstream assertion.
-        assert_releases_eq(in_cache, &synthetic, "cache populate sanity");
+    );
+    // Verify byte-equal contents, not just length — a peer
+    // test populating with a mismatched moniker/version pair
+    // at the right row count would silently pass a length
+    // check and corrupt every downstream assertion.
+    assert_releases_eq(in_cache, &synthetic, "cache populate sanity");
 
-        // Cache hit: should return the synthetic data verbatim
-        // without any network round-trip. If this errors, either
-        // the OnceLock fast-path is broken or the helper bypasses
-        // the cache and falls through to `fetch_releases` —
-        // either way the cache is dead code.
-        let result = super::cached_releases().expect(
-            "cache hit must return Ok — a network attempt indicates \
+    // Cache hit: should return the synthetic data verbatim
+    // without any network round-trip. If this errors, either
+    // the OnceLock fast-path is broken or the helper bypasses
+    // the cache and falls through to `fetch_releases` —
+    // either way the cache is dead code.
+    let result = super::cached_releases().expect(
+        "cache hit must return Ok — a network attempt indicates \
              the OnceLock fast-path is bypassed",
-        );
-        assert_releases_eq(&result, &synthetic, "cache hit result");
+    );
+    assert_releases_eq(&result, &synthetic, "cache hit result");
 
-        // Idempotency: a second call must return the same data.
-        // The OnceLock has no take-or-reset API, so the slot
-        // remains populated across calls within the test
-        // process. A regression that re-fetched on the second
-        // call would either return network data (different
-        // shape from synthetic) or fail offline.
-        let second = super::cached_releases().expect(
-            "second cache hit must also return Ok — a regression that \
+    // Idempotency: a second call must return the same data.
+    // The OnceLock has no take-or-reset API, so the slot
+    // remains populated across calls within the test
+    // process. A regression that re-fetched on the second
+    // call would either return network data (different
+    // shape from synthetic) or fail offline.
+    let second = super::cached_releases().expect(
+        "second cache hit must also return Ok — a regression that \
              cleared the cache between calls would surface here",
-        );
-        assert_releases_eq(&second, &synthetic, "cache idempotency");
+    );
+    assert_releases_eq(&second, &synthetic, "cache idempotency");
 
-        // End-to-end singleton path through a public fetch
-        // function: `fetch_latest_stable_version(shared_client(),
-        // ...)` must consult `RELEASES_CACHE` via
-        // `cached_releases_with` and return "6.12.81" without
-        // issuing any network request. See
-        // `fetch_latest_stable_version` for the
-        // stable/longterm + patch >= 8 selection rules; against
-        // the synthetic data above the longterm 6.12.81 entry
-        // is the first match. A regression that bypassed the
-        // cache would attempt a real kernel.org fetch.
-        let latest = super::fetch_latest_stable_version(super::shared_client(), "test")
-            .expect("public-fn singleton path must reach cache");
-        assert_eq!(
-            latest, "6.12.81",
-            "fetch_latest_stable_version must select the first \
+    // End-to-end singleton path through a public fetch
+    // function: `fetch_latest_stable_version(shared_client(),
+    // ...)` must consult `RELEASES_CACHE` via
+    // `cached_releases_with` and return "6.12.81" without
+    // issuing any network request. See
+    // `fetch_latest_stable_version` for the
+    // stable/longterm + patch >= 8 selection rules; against
+    // the synthetic data above the longterm 6.12.81 entry
+    // is the first match. A regression that bypassed the
+    // cache would attempt a real kernel.org fetch.
+    let latest = super::fetch_latest_stable_version(super::shared_client(), "test")
+        .expect("public-fn singleton path must reach cache");
+    assert_eq!(
+        latest, "6.12.81",
+        "fetch_latest_stable_version must select the first \
              stable/longterm entry with patch >= 8 from cached \
              synthetic data; got {latest:?}",
-        );
-    }
+    );
+}
 
-    /// End-to-end bypass-branch routing through
-    /// [`cached_releases_with_url`]: a non-singleton `Client`
-    /// MUST skip [`RELEASES_CACHE`] and exercise
-    /// [`fetch_releases`] against the supplied URL, NOT consult
-    /// the cache. Routes through the URL-injection seam
-    /// ([`cached_releases_with_url`]) so the bypass-branch fetch
-    /// hits a localhost [`std::net::TcpListener`] mock that
-    /// returns deterministic non-synthetic data — no real
-    /// kernel.org round-trip, no offline-host timeout penalty.
-    ///
-    /// Coexistence with `cached_releases_routing_singleton_path`:
-    /// both tests pre-populate [`RELEASES_CACHE`] with the SAME
-    /// `synthetic` vector. `OnceLock::set` is a process-wide
-    /// "first writer wins" race — only one `set` succeeds, but
-    /// both tests use byte-equal synthetic so the cache contents
-    /// are identical regardless of which test won. This test
-    /// tolerates `set` returning Err (peer test populated first)
-    /// and proceeds with the populated cache state. The peer
-    /// test's `is_ok()` invariant was relaxed to the same
-    /// tolerance for the same reason.
-    ///
-    /// Mock-served data is deliberately distinct from the
-    /// synthetic cache contents — different version strings (in
-    /// the 9.x range, never seen on real kernel.org) so a
-    /// regression that mis-routed the non-singleton through the
-    /// cache would return the synthetic verbatim and the
-    /// `data != mock_payload` proof would surface as a value
-    /// mismatch. The `Ok(...)` arm of the match below requires a
-    /// successful round-trip to the mock; the `Err(_)` arm is
-    /// retained as a defensive fallback for the (improbable)
-    /// case where mock setup or the underlying TCP exchange
-    /// fails on a constrained test host — bypass is still
-    /// proven because the cache-hit path returns Ok
-    /// unconditionally and any Err means
-    /// [`cached_releases_with_url`] reached [`fetch_releases`],
-    /// which is the bypass branch's only entry.
-    #[test]
-    fn cached_releases_with_non_singleton_bypasses_cache() {
-        // SAME synthetic data the singleton-path test uses —
-        // both populate the cache with byte-equal contents so
-        // either order leaves identical state. Changing this
-        // vector here without updating the peer test would
-        // break the OnceLock-tolerance contract.
-        let synthetic = vec![
-            Release {
-                moniker: "stable".to_string(),
-                version: "6.14.2".to_string(),
-            },
-            Release {
-                moniker: "longterm".to_string(),
-                version: "6.12.81".to_string(),
-            },
-            Release {
-                moniker: "mainline".to_string(),
-                version: "6.16-rc3".to_string(),
-            },
-        ];
+/// End-to-end bypass-branch routing through
+/// [`cached_releases_with_url`]: a non-singleton `Client`
+/// MUST skip [`RELEASES_CACHE`] and exercise
+/// [`fetch_releases`] against the supplied URL, NOT consult
+/// the cache. Routes through the URL-injection seam
+/// ([`cached_releases_with_url`]) so the bypass-branch fetch
+/// hits a localhost [`std::net::TcpListener`] mock that
+/// returns deterministic non-synthetic data — no real
+/// kernel.org round-trip, no offline-host timeout penalty.
+///
+/// Coexistence with `cached_releases_routing_singleton_path`:
+/// both tests pre-populate [`RELEASES_CACHE`] with the SAME
+/// `synthetic` vector. `OnceLock::set` is a process-wide
+/// "first writer wins" race — only one `set` succeeds, but
+/// both tests use byte-equal synthetic so the cache contents
+/// are identical regardless of which test won. This test
+/// tolerates `set` returning Err (peer test populated first)
+/// and proceeds with the populated cache state. The peer
+/// test's `is_ok()` invariant was relaxed to the same
+/// tolerance for the same reason.
+///
+/// Mock-served data is deliberately distinct from the
+/// synthetic cache contents — different version strings (in
+/// the 9.x range, never seen on real kernel.org) so a
+/// regression that mis-routed the non-singleton through the
+/// cache would return the synthetic verbatim and the
+/// `data != mock_payload` proof would surface as a value
+/// mismatch. The `Ok(...)` arm of the match below requires a
+/// successful round-trip to the mock; the `Err(_)` arm is
+/// retained as a defensive fallback for the (improbable)
+/// case where mock setup or the underlying TCP exchange
+/// fails on a constrained test host — bypass is still
+/// proven because the cache-hit path returns Ok
+/// unconditionally and any Err means
+/// [`cached_releases_with_url`] reached [`fetch_releases`],
+/// which is the bypass branch's only entry.
+#[test]
+fn cached_releases_with_non_singleton_bypasses_cache() {
+    // SAME synthetic data the singleton-path test uses —
+    // both populate the cache with byte-equal contents so
+    // either order leaves identical state. Changing this
+    // vector here without updating the peer test would
+    // break the OnceLock-tolerance contract.
+    let synthetic = vec![
+        Release {
+            moniker: "stable".to_string(),
+            version: "6.14.2".to_string(),
+        },
+        Release {
+            moniker: "longterm".to_string(),
+            version: "6.12.81".to_string(),
+        },
+        Release {
+            moniker: "mainline".to_string(),
+            version: "6.16-rc3".to_string(),
+        },
+    ];
 
-        // Pre-populate (tolerate peer-test having already
-        // populated). After this line, RELEASES_CACHE is
-        // guaranteed Some(synthetic) — the only question is
-        // who set it. Verifying the populated shape via `get`
-        // is the order-independent way to confirm the cache
-        // is in the expected state for the bypass assertion.
-        let _ = super::RELEASES_CACHE.set(synthetic.clone());
-        let in_cache = super::RELEASES_CACHE.get().expect(
-            "RELEASES_CACHE must be populated after `set` — either this \
+    // Pre-populate (tolerate peer-test having already
+    // populated). After this line, RELEASES_CACHE is
+    // guaranteed Some(synthetic) — the only question is
+    // who set it. Verifying the populated shape via `get`
+    // is the order-independent way to confirm the cache
+    // is in the expected state for the bypass assertion.
+    let _ = super::RELEASES_CACHE.set(synthetic.clone());
+    let in_cache = super::RELEASES_CACHE.get().expect(
+        "RELEASES_CACHE must be populated after `set` — either this \
              test or `cached_releases_routing_singleton_path` wins the \
              race; both use the same synthetic so contents are \
              byte-equal regardless of order",
-        );
-        // Verify byte-equal contents, not just length. A peer test
-        // populating the cache with the same row count but
-        // different moniker/version would defeat the bypass
-        // assertion below — the `data != mock_payload` check
-        // would still succeed but against the wrong baseline,
-        // missing a peer-data corruption regression.
-        assert_releases_eq(in_cache, &synthetic, "cache populate sanity");
+    );
+    // Verify byte-equal contents, not just length. A peer test
+    // populating the cache with the same row count but
+    // different moniker/version would defeat the bypass
+    // assertion below — the `data != mock_payload` check
+    // would still succeed but against the wrong baseline,
+    // missing a peer-data corruption regression.
+    assert_releases_eq(in_cache, &synthetic, "cache populate sanity");
 
-        // Mock body: 2 entries with version strings (9.x range)
-        // distinct from both the synthetic cache contents and
-        // anything that has ever appeared on real kernel.org.
-        // A regression that mis-routed the non-singleton through
-        // the cache would return the 3-entry synthetic — length
-        // and value mismatch surface immediately.
-        let mock_body = r#"{
+    // Mock body: 2 entries with version strings (9.x range)
+    // distinct from both the synthetic cache contents and
+    // anything that has ever appeared on real kernel.org.
+    // A regression that mis-routed the non-singleton through
+    // the cache would return the 3-entry synthetic — length
+    // and value mismatch surface immediately.
+    let mock_body = r#"{
             "releases": [
                 { "moniker": "stable",   "version": "9.99.99" },
                 { "moniker": "longterm", "version": "9.98.50" }
             ]
         }"#;
-        let (_server, mock_url, _mock) = mock_releases(200, mock_body);
+    let (_server, mock_url, _mock) = mock_releases(200, mock_body);
 
-        // Build a non-singleton client via the shared 5s-timeout
-        // builder helper. The address differs from
-        // `shared_client()`'s OnceLock-stored address, so
-        // `is_shared_client(&non_singleton)` returns false and
-        // `cached_releases_with_url` takes the bypass branch.
-        let non_singleton = test_client();
-        // Sanity check: the predicate that gates cache routing
-        // must report this client as non-singleton. Without
-        // this, a regression that broke `is_shared_client`
-        // (e.g. always returning true) would silently route
-        // this test through the cache and the bypass-branch
-        // proof below would be moot.
-        assert!(
-            !super::is_shared_client(&non_singleton),
-            "test precondition: non-singleton client MUST NOT compare \
+    // Build a non-singleton client via the shared 5s-timeout
+    // builder helper. The address differs from
+    // `shared_client()`'s OnceLock-stored address, so
+    // `is_shared_client(&non_singleton)` returns false and
+    // `cached_releases_with_url` takes the bypass branch.
+    let non_singleton = test_client();
+    // Sanity check: the predicate that gates cache routing
+    // must report this client as non-singleton. Without
+    // this, a regression that broke `is_shared_client`
+    // (e.g. always returning true) would silently route
+    // this test through the cache and the bypass-branch
+    // proof below would be moot.
+    assert!(
+        !super::is_shared_client(&non_singleton),
+        "test precondition: non-singleton client MUST NOT compare \
              equal to the shared_client() singleton — the bypass-branch \
              proof relies on `cached_releases_with_url` taking the \
              non-singleton path",
-        );
+    );
 
-        // Drive the bypass branch through the URL-injection
-        // seam. Mock returns the 2-entry deterministic payload;
-        // a regression that mis-routed through the cache would
-        // return the 3-entry synthetic instead. The match
-        // structure handles both the (expected) Ok path and the
-        // defensive Err fallback for a hypothetical TCP-level
-        // exchange failure.
-        let result = super::cached_releases_with_url(&non_singleton, &mock_url);
+    // Drive the bypass branch through the URL-injection
+    // seam. Mock returns the 2-entry deterministic payload;
+    // a regression that mis-routed through the cache would
+    // return the 3-entry synthetic instead. The match
+    // structure handles both the (expected) Ok path and the
+    // defensive Err fallback for a hypothetical TCP-level
+    // exchange failure.
+    let result = super::cached_releases_with_url(&non_singleton, &mock_url);
 
-        // Mock-payload reference for the Ok-arm assertion. Bypass
-        // routing is proven by `data == mock_payload` (positive
-        // confirmation: the mock URL was actually reached) AND
-        // `data != synthetic` (the cache was skipped). Both
-        // checks together pin BOTH directions of the bypass-vs-
-        // cache routing decision.
-        let mock_payload = vec![
-            Release {
-                moniker: "stable".to_string(),
-                version: "9.99.99".to_string(),
-            },
-            Release {
-                moniker: "longterm".to_string(),
-                version: "9.98.50".to_string(),
-            },
-        ];
-        match result {
-            Ok(data) => {
-                // Positive proof: data must equal the mock
-                // payload byte-for-byte. The cache-hit path
-                // returns the 3-entry synthetic; the bypass
-                // branch reaches the mock and returns the
-                // 2-entry mock payload. Equality against
-                // mock_payload directly tests both the routing
-                // (cache vs bypass) AND the mock-server
-                // exchange (URL injection actually delivered).
-                assert_releases_eq(
-                    &data,
-                    &mock_payload,
-                    "bypass branch must return the mock-served payload",
-                );
-                // Negative proof: data must NOT match the
-                // synthetic cache contents. Redundant with the
-                // positive check above (mock_payload and
-                // synthetic differ on length and values), but
-                // surfaces a clearer assertion message if a
-                // future regression somehow returned a third
-                // shape that happens to equal the synthetic.
-                let same_as_cache = data.len() == synthetic.len()
-                    && data.iter().zip(synthetic.iter()).all(|(got, want)| {
-                        got.moniker == want.moniker && got.version == want.version
-                    });
-                assert!(
-                    !same_as_cache,
-                    "bypass branch returned synthetic data verbatim — \
+    // Mock-payload reference for the Ok-arm assertion. Bypass
+    // routing is proven by `data == mock_payload` (positive
+    // confirmation: the mock URL was actually reached) AND
+    // `data != synthetic` (the cache was skipped). Both
+    // checks together pin BOTH directions of the bypass-vs-
+    // cache routing decision.
+    let mock_payload = vec![
+        Release {
+            moniker: "stable".to_string(),
+            version: "9.99.99".to_string(),
+        },
+        Release {
+            moniker: "longterm".to_string(),
+            version: "9.98.50".to_string(),
+        },
+    ];
+    match result {
+        Ok(data) => {
+            // Positive proof: data must equal the mock
+            // payload byte-for-byte. The cache-hit path
+            // returns the 3-entry synthetic; the bypass
+            // branch reaches the mock and returns the
+            // 2-entry mock payload. Equality against
+            // mock_payload directly tests both the routing
+            // (cache vs bypass) AND the mock-server
+            // exchange (URL injection actually delivered).
+            assert_releases_eq(
+                &data,
+                &mock_payload,
+                "bypass branch must return the mock-served payload",
+            );
+            // Negative proof: data must NOT match the
+            // synthetic cache contents. Redundant with the
+            // positive check above (mock_payload and
+            // synthetic differ on length and values), but
+            // surfaces a clearer assertion message if a
+            // future regression somehow returned a third
+            // shape that happens to equal the synthetic.
+            let same_as_cache = data.len() == synthetic.len()
+                && data
+                    .iter()
+                    .zip(synthetic.iter())
+                    .all(|(got, want)| got.moniker == want.moniker && got.version == want.version);
+            assert!(
+                !same_as_cache,
+                "bypass branch returned synthetic data verbatim — \
                      cache-routing leaked, the non-singleton client \
                      was incorrectly served from RELEASES_CACHE \
                      instead of reaching the localhost mock URL. \
                      Synthetic was {synthetic:?}; got identical {data:?}",
-                );
-            }
-            Err(_) => {
-                // TCP-level exchange failed before mock could
-                // respond (improbable on localhost but tolerated
-                // for robustness on constrained test hosts). The
-                // mere fact that an Err surfaces — rather than
-                // Ok(synthetic) — proves the bypass branch was
-                // taken: the cache-hit path returns Ok
-                // unconditionally because RELEASES_CACHE is
-                // populated with a Vec, not a Result. Bypass is
-                // confirmed; mock-payload positive check is
-                // skipped under this branch.
-            }
+            );
         }
+        Err(_) => {
+            // TCP-level exchange failed before mock could
+            // respond (improbable on localhost but tolerated
+            // for robustness on constrained test hosts). The
+            // mere fact that an Err surfaces — rather than
+            // Ok(synthetic) — proves the bypass branch was
+            // taken: the cache-hit path returns Ok
+            // unconditionally because RELEASES_CACHE is
+            // populated with a Vec, not a Result. Bypass is
+            // confirmed; mock-payload positive check is
+            // skipped under this branch.
+        }
+    }
 
-        // Cache-unchanged invariant: the bypass branch must NOT
-        // populate RELEASES_CACHE. After the bypass call returns,
-        // the cache must still hold the synthetic vector that
-        // was populated during setup. A regression where the
-        // bypass branch wrote its `fetch_releases` result into
-        // RELEASES_CACHE (for instance, if a future refactor
-        // moved the `RELEASES_CACHE.set` call before the
-        // singleton check) would surface here as a cache that
-        // contains the mock payload (or a network-fetched
-        // shape) instead of the synthetic.
-        let post = super::RELEASES_CACHE.get().expect(
-            "RELEASES_CACHE must remain populated after the bypass call — \
+    // Cache-unchanged invariant: the bypass branch must NOT
+    // populate RELEASES_CACHE. After the bypass call returns,
+    // the cache must still hold the synthetic vector that
+    // was populated during setup. A regression where the
+    // bypass branch wrote its `fetch_releases` result into
+    // RELEASES_CACHE (for instance, if a future refactor
+    // moved the `RELEASES_CACHE.set` call before the
+    // singleton check) would surface here as a cache that
+    // contains the mock payload (or a network-fetched
+    // shape) instead of the synthetic.
+    let post = super::RELEASES_CACHE.get().expect(
+        "RELEASES_CACHE must remain populated after the bypass call — \
              a regression that cleared the cache between setup and now \
              would surface here",
-        );
-        assert_releases_eq(
-            post,
-            &synthetic,
-            "cache must remain unchanged after bypass call",
-        );
-    }
+    );
+    assert_releases_eq(
+        post,
+        &synthetic,
+        "cache must remain unchanged after bypass call",
+    );
+}
 
-    /// Create a mockito server with a canned /releases.json
-    /// response. Returns (server, url, mock). The server owns the
-    /// port — no port collisions under parallel nextest.
-    fn mock_releases(status: usize, body: &str) -> (mockito::ServerGuard, String, mockito::Mock) {
-        let mut server = mockito::Server::new();
-        let mock = server
-            .mock("GET", "/releases.json")
-            .with_status(status)
-            .with_body(body)
-            .create();
-        let url = format!("{}/releases.json", server.url());
-        (server, url, mock)
-    }
+/// Create a mockito server with a canned /releases.json
+/// response. Returns (server, url, mock). The server owns the
+/// port — no port collisions under parallel nextest.
+fn mock_releases(status: usize, body: &str) -> (mockito::ServerGuard, String, mockito::Mock) {
+    let mut server = mockito::Server::new();
+    let mock = server
+        .mock("GET", "/releases.json")
+        .with_status(status)
+        .with_body(body)
+        .create();
+    let url = format!("{}/releases.json", server.url());
+    (server, url, mock)
+}
 
-    /// [`fetch_releases`] issues a real HTTP GET against the
-    /// `url` it's handed, parses the response body as
-    /// `releases.json`, and returns the structured
-    /// `Vec<Release>`. Replaces the prior 1ms-connect-timeout
-    /// bypass-arm assertion that required a real kernel.org
-    /// reach with a deterministic localhost TcpListener mock —
-    /// no real network, no flake on slow connect, exit shape
-    /// pinned to "Ok with synthetic data".
-    ///
-    /// Covers [`fetch_releases`]'s GET-and-parse mechanics — the
-    /// same function [`cached_releases_with_url`]'s bypass branch
-    /// invokes with whatever URL is threaded in, and the same
-    /// function production callers reach on cache miss (with
-    /// [`RELEASES_URL`] pinned by the [`cached_releases_with`]
-    /// wrapper). The bypass-branch routing decision (non-singleton
-    /// reaches `fetch_releases` with the supplied URL, NOT
-    /// [`RELEASES_CACHE`]) is verified separately by
-    /// [`is_shared_client_rejects_test_constructed_clients`]
-    /// (predicate-level) and by
-    /// [`cached_releases_with_non_singleton_bypasses_cache`]
-    /// (end-to-end through the cache helper, driven against a
-    /// localhost mock URL via [`cached_releases_with_url`]).
-    #[test]
-    fn fetch_releases_against_localhost_mock_returns_parsed() {
-        let mock_body = r#"{
+/// [`fetch_releases`] issues a real HTTP GET against the
+/// `url` it's handed, parses the response body as
+/// `releases.json`, and returns the structured
+/// `Vec<Release>`. Replaces the prior 1ms-connect-timeout
+/// bypass-arm assertion that required a real kernel.org
+/// reach with a deterministic localhost TcpListener mock —
+/// no real network, no flake on slow connect, exit shape
+/// pinned to "Ok with synthetic data".
+///
+/// Covers [`fetch_releases`]'s GET-and-parse mechanics — the
+/// same function [`cached_releases_with_url`]'s bypass branch
+/// invokes with whatever URL is threaded in, and the same
+/// function production callers reach on cache miss (with
+/// [`RELEASES_URL`] pinned by the [`cached_releases_with`]
+/// wrapper). The bypass-branch routing decision (non-singleton
+/// reaches `fetch_releases` with the supplied URL, NOT
+/// [`RELEASES_CACHE`]) is verified separately by
+/// [`is_shared_client_rejects_test_constructed_clients`]
+/// (predicate-level) and by
+/// [`cached_releases_with_non_singleton_bypasses_cache`]
+/// (end-to-end through the cache helper, driven against a
+/// localhost mock URL via [`cached_releases_with_url`]).
+#[test]
+fn fetch_releases_against_localhost_mock_returns_parsed() {
+    let mock_body = r#"{
             "releases": [
                 { "moniker": "stable",   "version": "9.99.99" },
                 { "moniker": "longterm", "version": "9.98.50" }
             ]
         }"#;
-        let releases =
-            super::parse_releases_body(mock_body).expect("parse_releases_body must succeed");
-        assert_eq!(
-            releases.len(),
-            2,
-            "mock body has 2 releases — parsed vector must match: \
+    let releases = super::parse_releases_body(mock_body).expect("parse_releases_body must succeed");
+    assert_eq!(
+        releases.len(),
+        2,
+        "mock body has 2 releases — parsed vector must match: \
              got {} entries",
-            releases.len(),
-        );
-        assert_eq!(releases[0].moniker, "stable");
-        assert_eq!(releases[0].version, "9.99.99");
-        assert_eq!(releases[1].moniker, "longterm");
-        assert_eq!(releases[1].version, "9.98.50");
-    }
+        releases.len(),
+    );
+    assert_eq!(releases[0].moniker, "stable");
+    assert_eq!(releases[0].version, "9.99.99");
+    assert_eq!(releases[1].moniker, "longterm");
+    assert_eq!(releases[1].version, "9.98.50");
+}
 
-    fn test_client() -> reqwest::blocking::Client {
-        reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .expect("build test client")
-    }
+fn test_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .expect("build test client")
+}
 
-    /// Assert `got` is byte-equal to `want` row-by-row in declared
-    /// order: same length, same `moniker`, and same `version` for
-    /// every index. Shared between the cache-routing tests
-    /// (`cached_releases_routing_singleton_path`,
-    /// `cached_releases_with_non_singleton_bypasses_cache`) so the
-    /// "cache contains the byte-equal synthetic" sanity check has
-    /// one definition. Catches the regression where a peer test
-    /// populates `RELEASES_CACHE` with the right number of rows
-    /// but different content — length-only checks would silently
-    /// pass.
-    ///
-    /// `context` is prefixed onto every assertion message so the
-    /// failure points at the call site rather than this helper.
-    fn assert_releases_eq(got: &[Release], want: &[Release], context: &str) {
+/// Assert `got` is byte-equal to `want` row-by-row in declared
+/// order: same length, same `moniker`, and same `version` for
+/// every index. Shared between the cache-routing tests
+/// (`cached_releases_routing_singleton_path`,
+/// `cached_releases_with_non_singleton_bypasses_cache`) so the
+/// "cache contains the byte-equal synthetic" sanity check has
+/// one definition. Catches the regression where a peer test
+/// populates `RELEASES_CACHE` with the right number of rows
+/// but different content — length-only checks would silently
+/// pass.
+///
+/// `context` is prefixed onto every assertion message so the
+/// failure points at the call site rather than this helper.
+fn assert_releases_eq(got: &[Release], want: &[Release], context: &str) {
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "{context}: length mismatch — got {} entries, want {}",
+        got.len(),
+        want.len(),
+    );
+    for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
         assert_eq!(
-            got.len(),
-            want.len(),
-            "{context}: length mismatch — got {} entries, want {}",
-            got.len(),
-            want.len(),
+            g.moniker, w.moniker,
+            "{context}: row {i} moniker mismatch — got {:?}, want {:?}",
+            g.moniker, w.moniker,
         );
-        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
-            assert_eq!(
-                g.moniker, w.moniker,
-                "{context}: row {i} moniker mismatch — got {:?}, want {:?}",
-                g.moniker, w.moniker,
-            );
-            assert_eq!(
-                g.version, w.version,
-                "{context}: row {i} version mismatch — got {:?}, want {:?}",
-                g.version, w.version,
-            );
-        }
-    }
-
-    /// HTTP 500 from the upstream surfaces as `Err` carrying the
-    /// status code in the message. Pins the
-    /// `if !response.status().is_success()` arm of
-    /// [`fetch_releases`] — a regression that swapped the branch
-    /// (e.g. accepted any 4xx/5xx response) would attempt to
-    /// parse an empty / error body downstream and surface as a
-    /// JSON error with no status hint, masking the real cause.
-    #[test]
-    fn fetch_releases_http_500_surfaces_status_in_error() {
-        // The status-check error format is "fetch {url}: HTTP {status}".
-        // Verify the format directly — no network needed.
-        let url = "https://example.com/releases.json";
-        let msg = format!(
-            "fetch {url}: HTTP {}",
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR
-        );
-        assert!(
-            msg.contains("HTTP 500"),
-            "error message must name the HTTP status code: {msg}",
-        );
-        assert!(
-            msg.contains(url),
-            "error message must include the URL: {msg}",
+        assert_eq!(
+            g.version, w.version,
+            "{context}: row {i} version mismatch — got {:?}, want {:?}",
+            g.version, w.version,
         );
     }
+}
 
-    /// Body that is not valid JSON surfaces as `Err` with the
-    /// `parse releases.json` context attached. Pins
-    /// [`fetch_releases`]'s `serde_json::from_str` branch — a
-    /// regression that swallowed the parse error (e.g. fell back
-    /// to an empty Vec on parse failure) would silently lose
-    /// every release entry and surface as a downstream "no
-    /// matching version" with no upstream hint.
-    #[test]
-    fn fetch_releases_malformed_json_surfaces_parse_error() {
-        // Non-JSON body — `from_str` returns Err on the first
-        // non-whitespace character that is not `{` `[` or a JSON
-        // primitive token.
-        let err = super::parse_releases_body("this is not JSON {")
-            .expect_err("malformed JSON must surface as Err");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("parse releases.json"),
-            "error must carry the `parse releases.json` context so \
+/// HTTP 500 from the upstream surfaces as `Err` carrying the
+/// status code in the message. Pins the
+/// `if !response.status().is_success()` arm of
+/// [`fetch_releases`] — a regression that swapped the branch
+/// (e.g. accepted any 4xx/5xx response) would attempt to
+/// parse an empty / error body downstream and surface as a
+/// JSON error with no status hint, masking the real cause.
+#[test]
+fn fetch_releases_http_500_surfaces_status_in_error() {
+    // The status-check error format is "fetch {url}: HTTP {status}".
+    // Verify the format directly — no network needed.
+    let url = "https://example.com/releases.json";
+    let msg = format!(
+        "fetch {url}: HTTP {}",
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(
+        msg.contains("HTTP 500"),
+        "error message must name the HTTP status code: {msg}",
+    );
+    assert!(
+        msg.contains(url),
+        "error message must include the URL: {msg}",
+    );
+}
+
+/// Body that is not valid JSON surfaces as `Err` with the
+/// `parse releases.json` context attached. Pins
+/// [`fetch_releases`]'s `serde_json::from_str` branch — a
+/// regression that swallowed the parse error (e.g. fell back
+/// to an empty Vec on parse failure) would silently lose
+/// every release entry and surface as a downstream "no
+/// matching version" with no upstream hint.
+#[test]
+fn fetch_releases_malformed_json_surfaces_parse_error() {
+    // Non-JSON body — `from_str` returns Err on the first
+    // non-whitespace character that is not `{` `[` or a JSON
+    // primitive token.
+    let err = super::parse_releases_body("this is not JSON {")
+        .expect_err("malformed JSON must surface as Err");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("parse releases.json"),
+        "error must carry the `parse releases.json` context so \
              an operator distinguishes parse failures from network \
              or status failures: {msg}",
-        );
-    }
+    );
+}
 
-    /// JSON body that parses as a valid object but has no
-    /// `releases` key surfaces as `Err` with the canonical
-    /// "missing releases array" message. Pins [`fetch_releases`]'s
-    /// `json.get("releases").and_then(as_array)` branch — a
-    /// regression that returned an empty Vec instead of erroring
-    /// would mask schema drift (kernel.org renamed the key, a
-    /// proxy injected a wrapper object, etc.) silently.
-    #[test]
-    fn fetch_releases_missing_releases_array_surfaces_error() {
-        let err = super::parse_releases_body("{}")
-            .expect_err("body without `releases` key must surface as Err");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("missing releases array"),
-            "error must say `missing releases array` so an operator \
+/// JSON body that parses as a valid object but has no
+/// `releases` key surfaces as `Err` with the canonical
+/// "missing releases array" message. Pins [`fetch_releases`]'s
+/// `json.get("releases").and_then(as_array)` branch — a
+/// regression that returned an empty Vec instead of erroring
+/// would mask schema drift (kernel.org renamed the key, a
+/// proxy injected a wrapper object, etc.) silently.
+#[test]
+fn fetch_releases_missing_releases_array_surfaces_error() {
+    let err = super::parse_releases_body("{}")
+        .expect_err("body without `releases` key must surface as Err");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("missing releases array"),
+        "error must say `missing releases array` so an operator \
              distinguishes schema drift from parse failure: {msg}",
-        );
-    }
+    );
+}
 
-    /// A row in the `releases` array missing the `moniker` field
-    /// is silently dropped by [`fetch_releases`]'s
-    /// `filter_map(...?...)` chain — the surrounding rows still
-    /// parse, the function returns `Ok` with a shorter `Vec`. Pins
-    /// the per-row tolerance: a single corrupt row must not abort
-    /// the entire fetch, since release-listing schemas occasionally
-    /// land transient malformed rows during deploys.
-    #[test]
-    fn fetch_releases_row_missing_moniker_drops_row() {
-        // Three rows: row 0 valid, row 1 missing moniker, row 2
-        // valid. `filter_map` drops row 1; result must contain
-        // exactly the two surviving rows in declared order.
-        let body = r#"{
+/// A row in the `releases` array missing the `moniker` field
+/// is silently dropped by [`fetch_releases`]'s
+/// `filter_map(...?...)` chain — the surrounding rows still
+/// parse, the function returns `Ok` with a shorter `Vec`. Pins
+/// the per-row tolerance: a single corrupt row must not abort
+/// the entire fetch, since release-listing schemas occasionally
+/// land transient malformed rows during deploys.
+#[test]
+fn fetch_releases_row_missing_moniker_drops_row() {
+    // Three rows: row 0 valid, row 1 missing moniker, row 2
+    // valid. `filter_map` drops row 1; result must contain
+    // exactly the two surviving rows in declared order.
+    let body = r#"{
             "releases": [
                 { "moniker": "stable",   "version": "9.99.99" },
                 { "version": "9.98.99" },
                 { "moniker": "longterm", "version": "9.97.50" }
             ]
         }"#;
-        let releases = super::parse_releases_body(body)
-            .expect("partial-row corruption must NOT abort the fetch");
-        assert_eq!(
-            releases.len(),
-            2,
-            "row missing moniker must be silently dropped — 3 input \
+    let releases =
+        super::parse_releases_body(body).expect("partial-row corruption must NOT abort the fetch");
+    assert_eq!(
+        releases.len(),
+        2,
+        "row missing moniker must be silently dropped — 3 input \
              rows minus 1 corrupt = 2 output: got {} entries",
-            releases.len(),
-        );
-        assert_eq!(releases[0].moniker, "stable");
-        assert_eq!(releases[0].version, "9.99.99");
-        assert_eq!(releases[1].moniker, "longterm");
-        assert_eq!(releases[1].version, "9.97.50");
-    }
+        releases.len(),
+    );
+    assert_eq!(releases[0].moniker, "stable");
+    assert_eq!(releases[0].version, "9.99.99");
+    assert_eq!(releases[1].moniker, "longterm");
+    assert_eq!(releases[1].version, "9.97.50");
+}
 
-    /// A row missing the `version` field is silently dropped — the
-    /// `r.get("version")?` step in [`fetch_releases`]'s filter_map
-    /// returns `None` and the row falls out. Sibling case to the
-    /// missing-moniker test above: both required fields use the
-    /// same `?`-chain pattern, so the same per-row tolerance must
-    /// apply on either side.
-    #[test]
-    fn fetch_releases_row_missing_version_drops_row() {
-        // Row 1 carries `moniker` but no `version` key. The
-        // `r.get("version")?` short-circuits to None; `filter_map`
-        // drops row 1. Surrounding rows must still parse.
-        let body = r#"{
+/// A row missing the `version` field is silently dropped — the
+/// `r.get("version")?` step in [`fetch_releases`]'s filter_map
+/// returns `None` and the row falls out. Sibling case to the
+/// missing-moniker test above: both required fields use the
+/// same `?`-chain pattern, so the same per-row tolerance must
+/// apply on either side.
+#[test]
+fn fetch_releases_row_missing_version_drops_row() {
+    // Row 1 carries `moniker` but no `version` key. The
+    // `r.get("version")?` short-circuits to None; `filter_map`
+    // drops row 1. Surrounding rows must still parse.
+    let body = r#"{
             "releases": [
                 { "moniker": "stable",   "version": "9.99.99" },
                 { "moniker": "linux-next" },
                 { "moniker": "longterm", "version": "9.97.50" }
             ]
         }"#;
-        let releases =
-            super::parse_releases_body(body).expect("row missing version must NOT abort the fetch");
-        assert_eq!(
-            releases.len(),
-            2,
-            "row missing version must be silently dropped — 3 input \
+    let releases =
+        super::parse_releases_body(body).expect("row missing version must NOT abort the fetch");
+    assert_eq!(
+        releases.len(),
+        2,
+        "row missing version must be silently dropped — 3 input \
              rows minus 1 corrupt = 2 output: got {} entries",
-            releases.len(),
-        );
-        assert_eq!(releases[0].moniker, "stable");
-        assert_eq!(releases[0].version, "9.99.99");
-        assert_eq!(releases[1].moniker, "longterm");
-        assert_eq!(releases[1].version, "9.97.50");
-    }
+        releases.len(),
+    );
+    assert_eq!(releases[0].moniker, "stable");
+    assert_eq!(releases[0].version, "9.99.99");
+    assert_eq!(releases[1].moniker, "longterm");
+    assert_eq!(releases[1].version, "9.97.50");
+}
 
-    /// A row whose `moniker` is a numeric value (rather than a
-    /// JSON string) is silently dropped — `r.get("moniker")?`
-    /// returns `Some(Value::Number)`, then `.as_str()?`
-    /// short-circuits because `Value::as_str` returns `None` on
-    /// non-string variants. Pins type-tolerance at the row level:
-    /// a kernel.org schema regression that emitted a numeric
-    /// moniker on one transient row must not abort the entire
-    /// fetch.
-    #[test]
-    fn fetch_releases_row_numeric_moniker_drops_row() {
-        // Row 1 has a numeric moniker (42) — JSON-valid, but
-        // not a string. `r.get("moniker")?.as_str()?` short-
-        // circuits at the `as_str()` step. `filter_map` drops
-        // row 1; the surviving rows must still parse.
-        let body = r#"{
+/// A row whose `moniker` is a numeric value (rather than a
+/// JSON string) is silently dropped — `r.get("moniker")?`
+/// returns `Some(Value::Number)`, then `.as_str()?`
+/// short-circuits because `Value::as_str` returns `None` on
+/// non-string variants. Pins type-tolerance at the row level:
+/// a kernel.org schema regression that emitted a numeric
+/// moniker on one transient row must not abort the entire
+/// fetch.
+#[test]
+fn fetch_releases_row_numeric_moniker_drops_row() {
+    // Row 1 has a numeric moniker (42) — JSON-valid, but
+    // not a string. `r.get("moniker")?.as_str()?` short-
+    // circuits at the `as_str()` step. `filter_map` drops
+    // row 1; the surviving rows must still parse.
+    let body = r#"{
             "releases": [
                 { "moniker": "stable",   "version": "9.99.99" },
                 { "moniker": 42,         "version": "9.98.99" },
                 { "moniker": "longterm", "version": "9.97.50" }
             ]
         }"#;
-        let releases = super::parse_releases_body(body)
-            .expect("row with numeric moniker must NOT abort the fetch");
-        assert_eq!(
-            releases.len(),
-            2,
-            "row with numeric moniker must be silently dropped — 3 \
+    let releases = super::parse_releases_body(body)
+        .expect("row with numeric moniker must NOT abort the fetch");
+    assert_eq!(
+        releases.len(),
+        2,
+        "row with numeric moniker must be silently dropped — 3 \
              input rows minus 1 corrupt = 2 output: got {} entries",
-            releases.len(),
-        );
-        assert_eq!(releases[0].moniker, "stable");
-        assert_eq!(releases[0].version, "9.99.99");
-        assert_eq!(releases[1].moniker, "longterm");
-        assert_eq!(releases[1].version, "9.97.50");
-    }
+        releases.len(),
+    );
+    assert_eq!(releases[0].moniker, "stable");
+    assert_eq!(releases[0].version, "9.99.99");
+    assert_eq!(releases[1].moniker, "longterm");
+    assert_eq!(releases[1].version, "9.97.50");
+}
 
-    /// A row whose `version` is the JSON `null` value is silently
-    /// dropped — `r.get("version")?` returns `Some(Value::Null)`,
-    /// then `.as_str()?` short-circuits because `Value::as_str`
-    /// returns `None` on `Null`. Distinct from the missing-
-    /// version case: there the key is absent, here it is present
-    /// with a non-string value. Both cases must take the same
-    /// row-drop path.
-    #[test]
-    fn fetch_releases_row_null_version_drops_row() {
-        // Row 1 has `version: null` — JSON-valid, key present,
-        // value is the null variant. The `?`-chain short-circuits
-        // at `as_str()`. `filter_map` drops row 1; the surviving
-        // rows must still parse.
-        let body = r#"{
+/// A row whose `version` is the JSON `null` value is silently
+/// dropped — `r.get("version")?` returns `Some(Value::Null)`,
+/// then `.as_str()?` short-circuits because `Value::as_str`
+/// returns `None` on `Null`. Distinct from the missing-
+/// version case: there the key is absent, here it is present
+/// with a non-string value. Both cases must take the same
+/// row-drop path.
+#[test]
+fn fetch_releases_row_null_version_drops_row() {
+    // Row 1 has `version: null` — JSON-valid, key present,
+    // value is the null variant. The `?`-chain short-circuits
+    // at `as_str()`. `filter_map` drops row 1; the surviving
+    // rows must still parse.
+    let body = r#"{
             "releases": [
                 { "moniker": "stable",   "version": "9.99.99" },
                 { "moniker": "mainline", "version": null },
                 { "moniker": "longterm", "version": "9.97.50" }
             ]
         }"#;
-        let releases = super::parse_releases_body(body)
-            .expect("row with null version must NOT abort the fetch");
-        assert_eq!(
-            releases.len(),
-            2,
-            "row with null version must be silently dropped — 3 \
+    let releases =
+        super::parse_releases_body(body).expect("row with null version must NOT abort the fetch");
+    assert_eq!(
+        releases.len(),
+        2,
+        "row with null version must be silently dropped — 3 \
              input rows minus 1 corrupt = 2 output: got {} entries",
-            releases.len(),
-        );
-        assert_eq!(releases[0].moniker, "stable");
-        assert_eq!(releases[0].version, "9.99.99");
-        assert_eq!(releases[1].moniker, "longterm");
-        assert_eq!(releases[1].version, "9.97.50");
-    }
+        releases.len(),
+    );
+    assert_eq!(releases[0].moniker, "stable");
+    assert_eq!(releases[0].version, "9.99.99");
+    assert_eq!(releases[1].moniker, "longterm");
+    assert_eq!(releases[1].version, "9.97.50");
+}
 
-    /// An empty `releases` array surfaces as `Ok(empty Vec)` — not
-    /// an error. Pins [`fetch_releases`]'s "no rows" path: a
-    /// kernel.org outage might briefly return an empty array
-    /// without changing schema, and downstream code
-    /// (`fetch_latest_stable_version`'s filter chain) is already
-    /// equipped to handle an empty `Vec<Release>` (it returns its
-    /// own "no candidate" error) — short-circuiting here would
-    /// surface a misleading parse-failure message instead.
-    #[test]
-    fn fetch_releases_empty_array_returns_empty_vec_ok() {
-        let releases = super::parse_releases_body(r#"{"releases": []}"#)
-            .expect("empty releases array must be Ok, not Err");
-        assert!(
-            releases.is_empty(),
-            "empty input array must produce empty output Vec; got {} entries",
-            releases.len(),
-        );
-    }
+/// An empty `releases` array surfaces as `Ok(empty Vec)` — not
+/// an error. Pins [`fetch_releases`]'s "no rows" path: a
+/// kernel.org outage might briefly return an empty array
+/// without changing schema, and downstream code
+/// (`fetch_latest_stable_version`'s filter chain) is already
+/// equipped to handle an empty `Vec<Release>` (it returns its
+/// own "no candidate" error) — short-circuiting here would
+/// surface a misleading parse-failure message instead.
+#[test]
+fn fetch_releases_empty_array_returns_empty_vec_ok() {
+    let releases = super::parse_releases_body(r#"{"releases": []}"#)
+        .expect("empty releases array must be Ok, not Err");
+    assert!(
+        releases.is_empty(),
+        "empty input array must produce empty output Vec; got {} entries",
+        releases.len(),
+    );
+}
 
-    /// Extra unknown fields on each row are tolerated — the
-    /// `r.get("moniker")?.as_str()?` chain only reads the keys it
-    /// needs, ignoring everything else. Pins forward-compat: a
-    /// future kernel.org schema addition (e.g. `release_date`,
-    /// `signing_key`) must NOT break parsing on the current
-    /// reader. A regression that switched to a strict serde-derive
-    /// shape with `#[serde(deny_unknown_fields)]` would surface
-    /// here.
-    #[test]
-    fn fetch_releases_extra_unknown_fields_tolerated() {
-        // Each row carries fields the current reader doesn't know
-        // about — parser must skip them and still extract moniker
-        // + version cleanly.
-        let body = r#"{
+/// Extra unknown fields on each row are tolerated — the
+/// `r.get("moniker")?.as_str()?` chain only reads the keys it
+/// needs, ignoring everything else. Pins forward-compat: a
+/// future kernel.org schema addition (e.g. `release_date`,
+/// `signing_key`) must NOT break parsing on the current
+/// reader. A regression that switched to a strict serde-derive
+/// shape with `#[serde(deny_unknown_fields)]` would surface
+/// here.
+#[test]
+fn fetch_releases_extra_unknown_fields_tolerated() {
+    // Each row carries fields the current reader doesn't know
+    // about — parser must skip them and still extract moniker
+    // + version cleanly.
+    let body = r#"{
             "released_at": "2026-04-26T00:00:00Z",
             "schema_version": 47,
             "releases": [
@@ -1372,430 +1372,429 @@
             ],
             "trailing_meta": ["a", "b"]
         }"#;
-        let releases = super::parse_releases_body(body)
-            .expect("unknown extra fields must NOT break parsing — forward compat");
-        assert_eq!(
-            releases.len(),
-            1,
-            "extra fields must not affect row count: {} entries",
-            releases.len(),
-        );
-        assert_eq!(releases[0].moniker, "stable");
-        assert_eq!(releases[0].version, "9.99.99");
-    }
+    let releases = super::parse_releases_body(body)
+        .expect("unknown extra fields must NOT break parsing — forward compat");
+    assert_eq!(
+        releases.len(),
+        1,
+        "extra fields must not affect row count: {} entries",
+        releases.len(),
+    );
+    assert_eq!(releases[0].moniker, "stable");
+    assert_eq!(releases[0].version, "9.99.99");
+}
 
-    /// Connection refused (no listener at the bound port) surfaces
-    /// as `Err` carrying the `fetch <url>` context. Synthesized by
-    /// binding a `TcpListener`, capturing its address, then
-    /// dropping the listener BEFORE the client connects — the
-    /// kernel sends RST on the syscall and reqwest's
-    /// `client.get(url).send()` returns its connection error.
-    /// Pins the `with_context(|| format!("fetch {url}"))` branch
-    /// — without the URL context, the bare reqwest error message
-    /// would not name the failed endpoint and operator triage
-    /// would have to dig through the source chain.
-    #[test]
-    fn fetch_releases_connection_refused_surfaces_url_context() {
-        // Bind, capture addr, drop. The drop closes the listener
-        // before any client connects, so the OS-assigned ephemeral
-        // port becomes unreachable. The race window between drop
-        // and connect is acceptably small for a unit test on
-        // localhost — a regression where the connect somehow
-        // succeeded would surface as a different test outcome
-        // (parse failure on empty body) rather than a flake.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind localhost listener");
-        let addr = listener.local_addr().expect("read addr");
-        drop(listener);
-        let url = format!("http://{addr}/releases.json");
-        let client = test_client();
-        let err = super::fetch_releases(&client, &url)
-            .expect_err("connection refused must surface as Err");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("fetch "),
-            "error must carry the `fetch` context (added via \
+/// Connection refused (no listener at the bound port) surfaces
+/// as `Err` carrying the `fetch <url>` context. Synthesized by
+/// binding a `TcpListener`, capturing its address, then
+/// dropping the listener BEFORE the client connects — the
+/// kernel sends RST on the syscall and reqwest's
+/// `client.get(url).send()` returns its connection error.
+/// Pins the `with_context(|| format!("fetch {url}"))` branch
+/// — without the URL context, the bare reqwest error message
+/// would not name the failed endpoint and operator triage
+/// would have to dig through the source chain.
+#[test]
+fn fetch_releases_connection_refused_surfaces_url_context() {
+    // Bind, capture addr, drop. The drop closes the listener
+    // before any client connects, so the OS-assigned ephemeral
+    // port becomes unreachable. The race window between drop
+    // and connect is acceptably small for a unit test on
+    // localhost — a regression where the connect somehow
+    // succeeded would surface as a different test outcome
+    // (parse failure on empty body) rather than a flake.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind localhost listener");
+    let addr = listener.local_addr().expect("read addr");
+    drop(listener);
+    let url = format!("http://{addr}/releases.json");
+    let client = test_client();
+    let err =
+        super::fetch_releases(&client, &url).expect_err("connection refused must surface as Err");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("fetch "),
+        "error must carry the `fetch` context (added via \
              with_context) so an operator distinguishes network \
              failures from parse failures: {msg}",
-        );
-        assert!(
-            msg.contains(&url),
-            "error must include the URL so an operator can trace \
+    );
+    assert!(
+        msg.contains(&url),
+        "error must include the URL so an operator can trace \
              which endpoint failed: {msg}",
-        );
-    }
+    );
+}
 
-    // -- is_shared_client --
+// -- is_shared_client --
 
-    /// `is_shared_client` recognizes the process-wide singleton:
-    /// the [`shared_client`] address is stable across every call
-    /// within a process (`OnceLock::get_or_init` returns the same
-    /// pointer), so passing it to the predicate must yield `true`.
-    /// This is the cache-routing branch of [`cached_releases_with`].
-    #[test]
-    fn is_shared_client_recognizes_process_singleton() {
-        let client = super::shared_client();
-        assert!(
-            super::is_shared_client(client),
-            "shared_client() must satisfy is_shared_client; without \
+/// `is_shared_client` recognizes the process-wide singleton:
+/// the [`shared_client`] address is stable across every call
+/// within a process (`OnceLock::get_or_init` returns the same
+/// pointer), so passing it to the predicate must yield `true`.
+/// This is the cache-routing branch of [`cached_releases_with`].
+#[test]
+fn is_shared_client_recognizes_process_singleton() {
+    let client = super::shared_client();
+    assert!(
+        super::is_shared_client(client),
+        "shared_client() must satisfy is_shared_client; without \
              this, cached_releases_with would route the production \
              singleton through the bypass branch and never populate \
              the cache",
-        );
-        // Stability across calls — the second `shared_client()`
-        // call returns the same address. A regression that
-        // changed `shared_client()` to return by-value or to
-        // construct a new instance per call (rather than
-        // borrowing the OnceLock-stored singleton) would surface
-        // here.
-        assert!(
-            super::is_shared_client(super::shared_client()),
-            "shared_client() must return a stable pointer across \
+    );
+    // Stability across calls — the second `shared_client()`
+    // call returns the same address. A regression that
+    // changed `shared_client()` to return by-value or to
+    // construct a new instance per call (rather than
+    // borrowing the OnceLock-stored singleton) would surface
+    // here.
+    assert!(
+        super::is_shared_client(super::shared_client()),
+        "shared_client() must return a stable pointer across \
              repeated calls; the OnceLock contract guarantees this",
-        );
-    }
+    );
+}
 
-    /// `is_shared_client` rejects test-constructed clients: a
-    /// `reqwest::blocking::Client::new()` call lives at a
-    /// different address from the singleton, so the predicate
-    /// returns `false`. This is the bypass branch of
-    /// [`cached_releases_with`] — tests that build their own
-    /// `Client` and route through the cache helper land here,
-    /// skipping [`RELEASES_CACHE`] (when called via
-    /// [`cached_releases_with`] the request goes to
-    /// [`RELEASES_URL`]; tests that need URL injection on the
-    /// bypass branch call [`cached_releases_with_url`] with a
-    /// mock URL, or [`fetch_releases`] directly).
-    #[test]
-    fn is_shared_client_rejects_test_constructed_clients() {
-        // Force singleton construction before building local
-        // clients so the test exercises the production-path
-        // `ptr::eq` arm of `is_shared_client`, not just the
-        // uninitialized-`SHARED_CLIENT` early-out. Without this,
-        // every assertion below would short-circuit through the
-        // `None` branch — proving only that the optimization
-        // correctly returns false for an uninitialized
-        // singleton, not that the address comparison itself
-        // correctly distinguishes singleton from non-singleton.
-        // A future refactor that broke the `ptr::eq` arm while
-        // leaving the early-out intact would surface here.
-        let _ = super::shared_client();
-        let local = reqwest::blocking::Client::new();
-        assert!(
-            !super::is_shared_client(&local),
-            "a freshly-constructed Client must NOT compare equal to \
+/// `is_shared_client` rejects test-constructed clients: a
+/// `reqwest::blocking::Client::new()` call lives at a
+/// different address from the singleton, so the predicate
+/// returns `false`. This is the bypass branch of
+/// [`cached_releases_with`] — tests that build their own
+/// `Client` and route through the cache helper land here,
+/// skipping [`RELEASES_CACHE`] (when called via
+/// [`cached_releases_with`] the request goes to
+/// [`RELEASES_URL`]; tests that need URL injection on the
+/// bypass branch call [`cached_releases_with_url`] with a
+/// mock URL, or [`fetch_releases`] directly).
+#[test]
+fn is_shared_client_rejects_test_constructed_clients() {
+    // Force singleton construction before building local
+    // clients so the test exercises the production-path
+    // `ptr::eq` arm of `is_shared_client`, not just the
+    // uninitialized-`SHARED_CLIENT` early-out. Without this,
+    // every assertion below would short-circuit through the
+    // `None` branch — proving only that the optimization
+    // correctly returns false for an uninitialized
+    // singleton, not that the address comparison itself
+    // correctly distinguishes singleton from non-singleton.
+    // A future refactor that broke the `ptr::eq` arm while
+    // leaving the early-out intact would surface here.
+    let _ = super::shared_client();
+    let local = reqwest::blocking::Client::new();
+    assert!(
+        !super::is_shared_client(&local),
+        "a freshly-constructed Client must NOT compare equal to \
              the shared_client() singleton — the cache-routing gate \
              relies on this to send fault-injected traffic to the \
              bypass branch",
-        );
-        // Repeat with a builder-configured client, to pin that
-        // ANY non-singleton Client (regardless of how it was
-        // constructed) bypasses the cache.
-        let configured = reqwest::blocking::Client::builder()
-            .connect_timeout(std::time::Duration::from_millis(100))
-            .build()
-            .expect("build local Client");
-        assert!(
-            !super::is_shared_client(&configured),
-            "a builder-configured Client must also bypass the cache; \
+    );
+    // Repeat with a builder-configured client, to pin that
+    // ANY non-singleton Client (regardless of how it was
+    // constructed) bypasses the cache.
+    let configured = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_millis(100))
+        .build()
+        .expect("build local Client");
+    assert!(
+        !super::is_shared_client(&configured),
+        "a builder-configured Client must also bypass the cache; \
              the predicate keys on raw pointer address, not on \
              internal client state",
-        );
-        // Pin the clone caveat documented on `is_shared_client`:
-        // `reqwest::blocking::Client` derives `Clone`, and a
-        // clone is a distinct `Client` struct at a different
-        // address even though it shares the singleton's inner
-        // `Arc<ClientHandle>`. A clone of `shared_client()`
-        // must therefore bypass the cache. A regression that
-        // compared by inner Arc identity (rather than by raw
-        // address) would falsely route the clone through the
-        // cache and get caught here.
-        let cloned = super::shared_client().clone();
-        assert!(
-            !super::is_shared_client(&cloned),
-            "a clone of shared_client() must NOT compare equal to \
+    );
+    // Pin the clone caveat documented on `is_shared_client`:
+    // `reqwest::blocking::Client` derives `Clone`, and a
+    // clone is a distinct `Client` struct at a different
+    // address even though it shares the singleton's inner
+    // `Arc<ClientHandle>`. A clone of `shared_client()`
+    // must therefore bypass the cache. A regression that
+    // compared by inner Arc identity (rather than by raw
+    // address) would falsely route the clone through the
+    // cache and get caught here.
+    let cloned = super::shared_client().clone();
+    assert!(
+        !super::is_shared_client(&cloned),
+        "a clone of shared_client() must NOT compare equal to \
              the singleton — the address differs even though the \
              inner connection-pool Arc is shared. Always pass \
              shared_client() directly when cache routing is desired.",
-        );
-    }
+    );
+}
 
-    /// Subprocess helper for the `None`-branch test below. NOT
-    /// run as part of the normal test suite (`#[ignore]` skips
-    /// it under nextest's default profile); the parent test
-    /// invokes this binary with `--ignored --exact <name>` so
-    /// it executes in a fresh process where `SHARED_CLIENT`
-    /// is guaranteed uninitialized.
-    ///
-    /// The body must NOT call [`shared_client`] under any
-    /// branch — that would `get_or_init` the singleton and
-    /// invalidate the assertion. The same constraint applies
-    /// to indirect callers ([`cached_releases`], the cache-
-    /// routed `fetch_*` family, etc.). Only `is_shared_client`
-    /// against a freshly-constructed local `Client` is safe.
-    ///
-    /// On a successful run the helper exits cleanly (the
-    /// `#[test]` framework reports pass via stdout/exit code 0,
-    /// which the parent test reads). On any panic, exit code
-    /// is non-zero and the parent's `assert!` surfaces the
-    /// failure.
-    #[test]
-    #[ignore]
-    fn is_shared_client_returns_false_uninit_subprocess_helper() {
-        // Pre-condition: SHARED_CLIENT must be uninitialized.
-        // If a future refactor lands a `shared_client()` call
-        // somewhere on the test-binary startup path (lazy
-        // statics, ctor, etc.), this assertion catches it
-        // before the predicate's None branch is exercised on
-        // a state that no longer matches the contract.
-        assert!(
-            super::SHARED_CLIENT.get().is_none(),
-            "subprocess pre-condition violated: SHARED_CLIENT \
+/// Subprocess helper for the `None`-branch test below. NOT
+/// run as part of the normal test suite (`#[ignore]` skips
+/// it under nextest's default profile); the parent test
+/// invokes this binary with `--ignored --exact <name>` so
+/// it executes in a fresh process where `SHARED_CLIENT`
+/// is guaranteed uninitialized.
+///
+/// The body must NOT call [`shared_client`] under any
+/// branch — that would `get_or_init` the singleton and
+/// invalidate the assertion. The same constraint applies
+/// to indirect callers ([`cached_releases`], the cache-
+/// routed `fetch_*` family, etc.). Only `is_shared_client`
+/// against a freshly-constructed local `Client` is safe.
+///
+/// On a successful run the helper exits cleanly (the
+/// `#[test]` framework reports pass via stdout/exit code 0,
+/// which the parent test reads). On any panic, exit code
+/// is non-zero and the parent's `assert!` surfaces the
+/// failure.
+#[test]
+#[ignore]
+fn is_shared_client_returns_false_uninit_subprocess_helper() {
+    // Pre-condition: SHARED_CLIENT must be uninitialized.
+    // If a future refactor lands a `shared_client()` call
+    // somewhere on the test-binary startup path (lazy
+    // statics, ctor, etc.), this assertion catches it
+    // before the predicate's None branch is exercised on
+    // a state that no longer matches the contract.
+    assert!(
+        super::SHARED_CLIENT.get().is_none(),
+        "subprocess pre-condition violated: SHARED_CLIENT \
              was already initialized before is_shared_client \
              was called — the None-branch test cannot prove its \
              contract under that state",
-        );
-        // Predicate against a non-singleton client: must hit
-        // the `None` early-out and return `false` without
-        // initializing the singleton.
-        let local = reqwest::blocking::Client::new();
-        assert!(
-            !super::is_shared_client(&local),
-            "is_shared_client must return false when SHARED_CLIENT \
+    );
+    // Predicate against a non-singleton client: must hit
+    // the `None` early-out and return `false` without
+    // initializing the singleton.
+    let local = reqwest::blocking::Client::new();
+    assert!(
+        !super::is_shared_client(&local),
+        "is_shared_client must return false when SHARED_CLIENT \
              is uninitialized — no client can equal a not-yet-\
              allocated singleton",
-        );
-        // Post-condition: the predicate's None branch MUST NOT
-        // have triggered `get_or_init`. If a regression added
-        // a call to `shared_client()` inside `is_shared_client`,
-        // SHARED_CLIENT would now be `Some(_)` and the
-        // optimization would be dead.
-        assert!(
-            super::SHARED_CLIENT.get().is_none(),
-            "is_shared_client's None branch must NOT initialize \
+    );
+    // Post-condition: the predicate's None branch MUST NOT
+    // have triggered `get_or_init`. If a regression added
+    // a call to `shared_client()` inside `is_shared_client`,
+    // SHARED_CLIENT would now be `Some(_)` and the
+    // optimization would be dead.
+    assert!(
+        super::SHARED_CLIENT.get().is_none(),
+        "is_shared_client's None branch must NOT initialize \
              SHARED_CLIENT — the singleton optimization relies on \
              skipping `get_or_init` when no shared client has \
              been requested yet",
-        );
-    }
+    );
+}
 
-    /// Spawn the helper above as a subprocess (fresh process,
-    /// fresh `SHARED_CLIENT` static) and assert it exits
-    /// cleanly. This is the only way to verify the
-    /// `is_shared_client` `None`-early-out contract under
-    /// `cargo test`'s thread-per-test mode (where multiple
-    /// tests in the same binary share process state and thus
-    /// share `SHARED_CLIENT`); other tests in this binary call
-    /// `shared_client()` (e.g.
-    /// `is_shared_client_recognizes_process_singleton`,
-    /// `cached_releases_routing_singleton_path`) and
-    /// race against this test, initializing `SHARED_CLIENT`
-    /// arbitrarily.
-    ///
-    /// `cargo nextest`'s process-per-test mode would in
-    /// principle isolate this test naturally, but explicit
-    /// subprocess spawning here is defense-in-depth: works
-    /// under both `cargo test` and `cargo nextest` regardless
-    /// of nextest configuration changes that might consolidate
-    /// test processes.
-    ///
-    /// `current_exe()` resolves to the running test binary
-    /// itself; passing `--ignored --exact <name>` runs only
-    /// the helper above and exits 0 on pass / non-zero on
-    /// panic.
-    #[test]
-    fn is_shared_client_returns_false_when_uninit() {
-        let exe =
-            std::env::current_exe().expect("current_exe must resolve for subprocess invocation");
-        // The exact path the helper test runs at is module-
-        // qualified; libtest accepts the full path including
-        // crate prefix. `--exact` disables substring matching
-        // so the filter selects only this one test, even if
-        // a future test name is a prefix of it.
-        let helper_name = "fetch::tests::is_shared_client_returns_false_uninit_subprocess_helper";
-        // `--color=never` strips ANSI escape codes from libtest's
-        // summary line. Without it, terminals that pass color
-        // through to subprocesses (or test runners that set
-        // CLICOLOR_FORCE) would emit `1\x1b[1m passed\x1b[0m` and
-        // the substring search for "1 passed" below would miss.
-        let output = std::process::Command::new(&exe)
-            .arg("--ignored")
-            .arg("--exact")
-            .arg("--color=never")
-            .arg(helper_name)
-            .output()
-            .expect("spawn subprocess helper");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.success(),
-            "subprocess helper failed (exit status {}): \n\
+/// Spawn the helper above as a subprocess (fresh process,
+/// fresh `SHARED_CLIENT` static) and assert it exits
+/// cleanly. This is the only way to verify the
+/// `is_shared_client` `None`-early-out contract under
+/// `cargo test`'s thread-per-test mode (where multiple
+/// tests in the same binary share process state and thus
+/// share `SHARED_CLIENT`); other tests in this binary call
+/// `shared_client()` (e.g.
+/// `is_shared_client_recognizes_process_singleton`,
+/// `cached_releases_routing_singleton_path`) and
+/// race against this test, initializing `SHARED_CLIENT`
+/// arbitrarily.
+///
+/// `cargo nextest`'s process-per-test mode would in
+/// principle isolate this test naturally, but explicit
+/// subprocess spawning here is defense-in-depth: works
+/// under both `cargo test` and `cargo nextest` regardless
+/// of nextest configuration changes that might consolidate
+/// test processes.
+///
+/// `current_exe()` resolves to the running test binary
+/// itself; passing `--ignored --exact <name>` runs only
+/// the helper above and exits 0 on pass / non-zero on
+/// panic.
+#[test]
+fn is_shared_client_returns_false_when_uninit() {
+    let exe = std::env::current_exe().expect("current_exe must resolve for subprocess invocation");
+    // The exact path the helper test runs at is module-
+    // qualified; libtest accepts the full path including
+    // crate prefix. `--exact` disables substring matching
+    // so the filter selects only this one test, even if
+    // a future test name is a prefix of it.
+    let helper_name = "fetch::tests::is_shared_client_returns_false_uninit_subprocess_helper";
+    // `--color=never` strips ANSI escape codes from libtest's
+    // summary line. Without it, terminals that pass color
+    // through to subprocesses (or test runners that set
+    // CLICOLOR_FORCE) would emit `1\x1b[1m passed\x1b[0m` and
+    // the substring search for "1 passed" below would miss.
+    let output = std::process::Command::new(&exe)
+        .arg("--ignored")
+        .arg("--exact")
+        .arg("--color=never")
+        .arg(helper_name)
+        .output()
+        .expect("spawn subprocess helper");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "subprocess helper failed (exit status {}): \n\
              stdout: {}\n\
              stderr: {}",
-            output.status,
-            stdout,
-            stderr,
-        );
-        // libtest exits 0 with "0 passed" when the filter
-        // matches no tests — a future rename of the helper
-        // would silently skip this test under output.status
-        // alone. Pin "1 passed" so a rename surfaces as a
-        // failure, not a silent green.
-        assert!(
-            stdout.contains("1 passed"),
-            "subprocess must run exactly 1 test (helper rename or \
+        output.status,
+        stdout,
+        stderr,
+    );
+    // libtest exits 0 with "0 passed" when the filter
+    // matches no tests — a future rename of the helper
+    // would silently skip this test under output.status
+    // alone. Pin "1 passed" so a rename surfaces as a
+    // failure, not a silent green.
+    assert!(
+        stdout.contains("1 passed"),
+        "subprocess must run exactly 1 test (helper rename or \
              missing #[ignore] attribute would surface here): \n\
              stdout: {stdout}\n\
              stderr: {stderr}",
-        );
-    }
+    );
+}
 
-    // -- DownloadStream watchdog + hashing --
+// -- DownloadStream watchdog + hashing --
 
-    /// `DownloadStream::read` updates the running SHA-256 with every
-    /// byte that flows past, matches a one-shot `Sha256::digest`
-    /// over the same input, and reports the byte count via
-    /// `finalize`. Pins the contract that decoder + tar consumers
-    /// see exactly the bytes the wrapper hashes — a regression that
-    /// hashed `buf` rather than `&buf[..n]` (and therefore included
-    /// uninitialized tail bytes) would surface as a digest mismatch
-    /// against the one-shot baseline.
-    #[test]
-    fn download_stream_finalizes_sha256_over_streamed_bytes() {
-        // Synthetic payload large enough that a default 4 KiB read
-        // buffer cycles through `read` many times — exercises the
-        // hasher.update + last_progress reset on the typical
-        // streaming path.
-        let payload: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
-        let mut stream = super::DownloadStream::new(std::io::Cursor::new(payload.clone()));
-        let mut sink: Vec<u8> = Vec::new();
-        std::io::copy(&mut stream, &mut sink).expect("copy must drain Cursor");
-        assert_eq!(
-            sink, payload,
-            "streamed payload must be byte-equal to source — wrapper \
+/// `DownloadStream::read` updates the running SHA-256 with every
+/// byte that flows past, matches a one-shot `Sha256::digest`
+/// over the same input, and reports the byte count via
+/// `finalize`. Pins the contract that decoder + tar consumers
+/// see exactly the bytes the wrapper hashes — a regression that
+/// hashed `buf` rather than `&buf[..n]` (and therefore included
+/// uninitialized tail bytes) would surface as a digest mismatch
+/// against the one-shot baseline.
+#[test]
+fn download_stream_finalizes_sha256_over_streamed_bytes() {
+    // Synthetic payload large enough that a default 4 KiB read
+    // buffer cycles through `read` many times — exercises the
+    // hasher.update + last_progress reset on the typical
+    // streaming path.
+    let payload: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
+    let mut stream = super::DownloadStream::new(std::io::Cursor::new(payload.clone()));
+    let mut sink: Vec<u8> = Vec::new();
+    std::io::copy(&mut stream, &mut sink).expect("copy must drain Cursor");
+    assert_eq!(
+        sink, payload,
+        "streamed payload must be byte-equal to source — wrapper \
              must NOT alter, drop, or duplicate any data"
-        );
-        let (got_hex, bytes_total) = stream.finalize();
-        assert_eq!(
-            bytes_total as usize,
-            payload.len(),
-            "bytes_total must reflect the actual stream size",
-        );
-        let expected_hex = hex::encode(sha2::Sha256::digest(&payload));
-        assert_eq!(
-            got_hex, expected_hex,
-            "streaming SHA-256 must match the one-shot digest over \
+    );
+    let (got_hex, bytes_total) = stream.finalize();
+    assert_eq!(
+        bytes_total as usize,
+        payload.len(),
+        "bytes_total must reflect the actual stream size",
+    );
+    let expected_hex = hex::encode(sha2::Sha256::digest(&payload));
+    assert_eq!(
+        got_hex, expected_hex,
+        "streaming SHA-256 must match the one-shot digest over \
              the same bytes",
-        );
-    }
+    );
+}
 
-    /// `DownloadStream::read` errors with `ErrorKind::TimedOut` when
-    /// the no-progress window elapses before a byte-producing read.
-    /// Constructs the wrapper with a synthetically-old
-    /// `last_progress` (1 hour ago) and a 1 ms tolerance so the
-    /// watchdog trips on the very first `read()` call. Without the
-    /// watchdog, a stalled CDN connection would leave the download
-    /// blocked indefinitely; this test pins the timeout path that
-    /// catches that case.
-    #[test]
-    fn download_stream_errors_on_no_progress_timeout() {
-        let mut stream = super::DownloadStream {
-            inner: std::io::Cursor::new(vec![0u8; 1024]),
-            hasher: sha2::Sha256::new(),
-            bytes_total: 0,
-            // Simulate "last byte received an hour ago" — the
-            // elapsed comparison against `no_progress_timeout`
-            // is the only branch that can produce TimedOut.
-            last_progress: std::time::Instant::now() - std::time::Duration::from_secs(3600),
-            no_progress_timeout: std::time::Duration::from_millis(1),
-        };
-        let mut buf = [0u8; 16];
-        let err = stream
-            .read(&mut buf)
-            .expect_err("expired no-progress window must surface TimedOut");
-        assert_eq!(
-            err.kind(),
-            std::io::ErrorKind::TimedOut,
-            "watchdog error must carry ErrorKind::TimedOut so \
+/// `DownloadStream::read` errors with `ErrorKind::TimedOut` when
+/// the no-progress window elapses before a byte-producing read.
+/// Constructs the wrapper with a synthetically-old
+/// `last_progress` (1 hour ago) and a 1 ms tolerance so the
+/// watchdog trips on the very first `read()` call. Without the
+/// watchdog, a stalled CDN connection would leave the download
+/// blocked indefinitely; this test pins the timeout path that
+/// catches that case.
+#[test]
+fn download_stream_errors_on_no_progress_timeout() {
+    let mut stream = super::DownloadStream {
+        inner: std::io::Cursor::new(vec![0u8; 1024]),
+        hasher: sha2::Sha256::new(),
+        bytes_total: 0,
+        // Simulate "last byte received an hour ago" — the
+        // elapsed comparison against `no_progress_timeout`
+        // is the only branch that can produce TimedOut.
+        last_progress: std::time::Instant::now() - std::time::Duration::from_secs(3600),
+        no_progress_timeout: std::time::Duration::from_millis(1),
+    };
+    let mut buf = [0u8; 16];
+    let err = stream
+        .read(&mut buf)
+        .expect_err("expired no-progress window must surface TimedOut");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::TimedOut,
+        "watchdog error must carry ErrorKind::TimedOut so \
              upstream `?` chains can route on it: got {:?}",
-            err.kind(),
-        );
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("no body bytes"),
-            "watchdog error message must explain the cause: {msg}",
-        );
-    }
+        err.kind(),
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("no body bytes"),
+        "watchdog error message must explain the cause: {msg}",
+    );
+}
 
-    /// A successful read resets `last_progress`, so the next read
-    /// call's watchdog window is measured from the latest byte
-    /// arrival — not the construction time. Without this reset,
-    /// any download that took longer than the timeout would error
-    /// even if bytes were arriving steadily.
-    #[test]
-    fn download_stream_resets_progress_clock_on_byte_producing_read() {
-        let payload = vec![42u8; 8];
-        let mut stream = super::DownloadStream {
-            inner: std::io::Cursor::new(payload.clone()),
-            hasher: sha2::Sha256::new(),
-            bytes_total: 0,
-            last_progress: std::time::Instant::now() - std::time::Duration::from_secs(30),
-            // Generous timeout: the test's wall-clock between the
-            // watchdog check and the `inner.read()` call cannot
-            // exceed 1s on any sane machine.
-            no_progress_timeout: std::time::Duration::from_secs(60),
-        };
-        let mut buf = [0u8; 16];
-        let n = stream.read(&mut buf).expect("first read must succeed");
-        assert_eq!(n, payload.len());
-        // last_progress must now be very recent — within the last
-        // second or so. A regression that failed to update would
-        // surface here as `elapsed > 30s`.
-        assert!(
-            stream.last_progress.elapsed() < std::time::Duration::from_secs(5),
-            "successful read must update last_progress to ~now; \
+/// A successful read resets `last_progress`, so the next read
+/// call's watchdog window is measured from the latest byte
+/// arrival — not the construction time. Without this reset,
+/// any download that took longer than the timeout would error
+/// even if bytes were arriving steadily.
+#[test]
+fn download_stream_resets_progress_clock_on_byte_producing_read() {
+    let payload = vec![42u8; 8];
+    let mut stream = super::DownloadStream {
+        inner: std::io::Cursor::new(payload.clone()),
+        hasher: sha2::Sha256::new(),
+        bytes_total: 0,
+        last_progress: std::time::Instant::now() - std::time::Duration::from_secs(30),
+        // Generous timeout: the test's wall-clock between the
+        // watchdog check and the `inner.read()` call cannot
+        // exceed 1s on any sane machine.
+        no_progress_timeout: std::time::Duration::from_secs(60),
+    };
+    let mut buf = [0u8; 16];
+    let n = stream.read(&mut buf).expect("first read must succeed");
+    assert_eq!(n, payload.len());
+    // last_progress must now be very recent — within the last
+    // second or so. A regression that failed to update would
+    // surface here as `elapsed > 30s`.
+    assert!(
+        stream.last_progress.elapsed() < std::time::Duration::from_secs(5),
+        "successful read must update last_progress to ~now; \
              got elapsed = {:?}",
-            stream.last_progress.elapsed(),
-        );
-    }
+        stream.last_progress.elapsed(),
+    );
+}
 
-    /// EOF (`Ok(0)`) does NOT update `last_progress`. Without this
-    /// invariant, a misbehaving inner reader that polled past EOF
-    /// could indefinitely reset the watchdog despite delivering no
-    /// real data.
-    #[test]
-    fn download_stream_eof_does_not_reset_progress_clock() {
-        let mut stream = super::DownloadStream {
-            inner: std::io::Cursor::new(Vec::<u8>::new()), // immediate EOF
-            hasher: sha2::Sha256::new(),
-            bytes_total: 0,
-            // 30 minutes ago — well outside any reasonable timeout
-            // but still finite so the test can observe whether
-            // the EOF path updated it.
-            last_progress: std::time::Instant::now() - std::time::Duration::from_secs(1800),
-            no_progress_timeout: std::time::Duration::from_secs(7200),
-        };
-        let pre_progress = stream.last_progress;
-        let mut buf = [0u8; 16];
-        // First call: passes watchdog (timeout 2h, elapsed 30m),
-        // then returns Ok(0) from the empty Cursor.
-        let n = stream.read(&mut buf).expect("EOF must return Ok(0)");
-        assert_eq!(n, 0, "empty Cursor must report EOF");
-        assert_eq!(
-            stream.last_progress, pre_progress,
-            "Ok(0) must NOT update last_progress — only byte-\
+/// EOF (`Ok(0)`) does NOT update `last_progress`. Without this
+/// invariant, a misbehaving inner reader that polled past EOF
+/// could indefinitely reset the watchdog despite delivering no
+/// real data.
+#[test]
+fn download_stream_eof_does_not_reset_progress_clock() {
+    let mut stream = super::DownloadStream {
+        inner: std::io::Cursor::new(Vec::<u8>::new()), // immediate EOF
+        hasher: sha2::Sha256::new(),
+        bytes_total: 0,
+        // 30 minutes ago — well outside any reasonable timeout
+        // but still finite so the test can observe whether
+        // the EOF path updated it.
+        last_progress: std::time::Instant::now() - std::time::Duration::from_secs(1800),
+        no_progress_timeout: std::time::Duration::from_secs(7200),
+    };
+    let pre_progress = stream.last_progress;
+    let mut buf = [0u8; 16];
+    // First call: passes watchdog (timeout 2h, elapsed 30m),
+    // then returns Ok(0) from the empty Cursor.
+    let n = stream.read(&mut buf).expect("EOF must return Ok(0)");
+    assert_eq!(n, 0, "empty Cursor must report EOF");
+    assert_eq!(
+        stream.last_progress, pre_progress,
+        "Ok(0) must NOT update last_progress — only byte-\
              producing reads count as progress",
-        );
-    }
+    );
+}
 
-    // -- parse_sha256_for_file --
+// -- parse_sha256_for_file --
 
-    /// `parse_sha256_for_file` extracts the digest for the matching
-    /// filename from a kernel.org-style sha256sums.asc body. Pins
-    /// the basic happy-path: filename match returns the lowercase
-    /// 64-hex-char digest.
-    #[test]
-    fn parse_sha256_for_file_extracts_matching_entry() {
-        let manifest = "\
+/// `parse_sha256_for_file` extracts the digest for the matching
+/// filename from a kernel.org-style sha256sums.asc body. Pins
+/// the basic happy-path: filename match returns the lowercase
+/// 64-hex-char digest.
+#[test]
+fn parse_sha256_for_file_extracts_matching_entry() {
+    let manifest = "\
 -----BEGIN PGP SIGNED MESSAGE-----
 Hash: SHA256
 
@@ -1806,243 +1805,243 @@ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  linux-6.14.3.t
 ... signature payload ...
 -----END PGP SIGNATURE-----
 ";
-        let got = super::parse_sha256_for_file(manifest, "linux-6.14.2.tar.xz")
-            .expect("matching entry must be found");
-        assert_eq!(
-            got, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "must extract the digest paired with the requested \
+    let got = super::parse_sha256_for_file(manifest, "linux-6.14.2.tar.xz")
+        .expect("matching entry must be found");
+    assert_eq!(
+        got, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "must extract the digest paired with the requested \
              filename, lowercase",
-        );
-    }
+    );
+}
 
-    /// Filename-not-found returns `None` — the caller treats this
-    /// as "no expected hash available" and downgrades to a warning
-    /// per the user-facing instruction.
-    #[test]
-    fn parse_sha256_for_file_returns_none_when_file_absent() {
-        let manifest = "\
+/// Filename-not-found returns `None` — the caller treats this
+/// as "no expected hash available" and downgrades to a warning
+/// per the user-facing instruction.
+#[test]
+fn parse_sha256_for_file_returns_none_when_file_absent() {
+    let manifest = "\
 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  linux-6.14.1.tar.xz
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  linux-6.14.2.tar.xz
 ";
-        let got = super::parse_sha256_for_file(manifest, "linux-9.99.99.tar.xz");
-        assert!(
-            got.is_none(),
-            "missing filename must return None so the caller can \
+    let got = super::parse_sha256_for_file(manifest, "linux-9.99.99.tar.xz");
+    assert!(
+        got.is_none(),
+        "missing filename must return None so the caller can \
              warn-and-continue rather than fabricate a digest: got \
              {got:?}",
-        );
-    }
+    );
+}
 
-    /// Lines whose hash field has the wrong length or non-hex
-    /// characters are silently skipped — pin the per-line tolerance
-    /// against an upstream that briefly publishes a malformed line
-    /// during a deploy. Covers both rejection paths in
-    /// `parse_sha256_for_file`'s validator: short-length and 64-
-    /// char-but-non-hex.
-    #[test]
-    fn parse_sha256_for_file_skips_malformed_hash_lines() {
-        // Line 1: 2-char hash (length-check rejects).
-        // Line 2: 64-char hash with non-hex chars (`g` and `z`)
-        //         (hex-check rejects after length passes).
-        // Line 3: well-formed 64-char hex hash (must parse).
-        let manifest = "\
+/// Lines whose hash field has the wrong length or non-hex
+/// characters are silently skipped — pin the per-line tolerance
+/// against an upstream that briefly publishes a malformed line
+/// during a deploy. Covers both rejection paths in
+/// `parse_sha256_for_file`'s validator: short-length and 64-
+/// char-but-non-hex.
+#[test]
+fn parse_sha256_for_file_skips_malformed_hash_lines() {
+    // Line 1: 2-char hash (length-check rejects).
+    // Line 2: 64-char hash with non-hex chars (`g` and `z`)
+    //         (hex-check rejects after length passes).
+    // Line 3: well-formed 64-char hex hash (must parse).
+    let manifest = "\
 zz  linux-6.14.1.tar.xz
 zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzgg  linux-6.14.2.tar.xz
 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  linux-6.14.3.tar.xz
 ";
-        assert_eq!(
-            super::parse_sha256_for_file(manifest, "linux-6.14.1.tar.xz"),
-            None,
-            "2-char hash must be skipped via the length check",
-        );
-        assert_eq!(
-            super::parse_sha256_for_file(manifest, "linux-6.14.2.tar.xz"),
-            None,
-            "64-char-but-non-hex hash must be skipped via the \
+    assert_eq!(
+        super::parse_sha256_for_file(manifest, "linux-6.14.1.tar.xz"),
+        None,
+        "2-char hash must be skipped via the length check",
+    );
+    assert_eq!(
+        super::parse_sha256_for_file(manifest, "linux-6.14.2.tar.xz"),
+        None,
+        "64-char-but-non-hex hash must be skipped via the \
              ascii-hexdigit check",
-        );
-        assert_eq!(
-            super::parse_sha256_for_file(manifest, "linux-6.14.3.tar.xz")
-                .expect("valid entry must parse"),
-            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        );
-    }
+    );
+    assert_eq!(
+        super::parse_sha256_for_file(manifest, "linux-6.14.3.tar.xz")
+            .expect("valid entry must parse"),
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    );
+}
 
-    /// `parse_sha256_for_file` strips the PGP signature trailer —
-    /// content after `-----BEGIN PGP SIGNATURE-----` is binary
-    /// noise that must NOT be scanned for checksum lines (a chance
-    /// 64-hex-char run inside a signature would otherwise produce
-    /// a false positive).
-    #[test]
-    fn parse_sha256_for_file_ignores_post_signature_content() {
-        // `linux-6.14.99.tar.xz` appears AFTER the signature
-        // marker — must be ignored so the parser can't be tricked
-        // into returning data from the binary blob.
-        let manifest = "\
+/// `parse_sha256_for_file` strips the PGP signature trailer —
+/// content after `-----BEGIN PGP SIGNATURE-----` is binary
+/// noise that must NOT be scanned for checksum lines (a chance
+/// 64-hex-char run inside a signature would otherwise produce
+/// a false positive).
+#[test]
+fn parse_sha256_for_file_ignores_post_signature_content() {
+    // `linux-6.14.99.tar.xz` appears AFTER the signature
+    // marker — must be ignored so the parser can't be tricked
+    // into returning data from the binary blob.
+    let manifest = "\
 -----BEGIN PGP SIGNATURE-----
 ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  linux-6.14.99.tar.xz
 -----END PGP SIGNATURE-----
 ";
-        assert!(
-            super::parse_sha256_for_file(manifest, "linux-6.14.99.tar.xz").is_none(),
-            "lines after the signature marker must be invisible to \
+    assert!(
+        super::parse_sha256_for_file(manifest, "linux-6.14.99.tar.xz").is_none(),
+        "lines after the signature marker must be invisible to \
              the parser",
-        );
-    }
+    );
+}
 
-    // -- resolve_expected_sha256 --
+// -- resolve_expected_sha256 --
 
-    /// `resolve_expected_sha256(skip_sha256 = true)` returns `None`
-    /// without touching the network — the bypass branch must short-
-    /// circuit before any `Client::get`. Pins the security-sensitive
-    /// opt-out's no-network contract: a regression that swapped the
-    /// branch order (e.g. fetching the manifest then ignoring the
-    /// result) would still produce `None` but burn a CDN round-trip
-    /// per build, defeating the "use this when manifest is
-    /// unreachable" use case.
-    #[test]
-    fn resolve_expected_sha256_skip_returns_none_without_network() {
-        // Build a client whose connect attempt would fail loudly if
-        // the bypass branch reached `Client::get`. A 1ms connect
-        // timeout against any external host returns within the
-        // wall-clock budget of this test; the assertion below
-        // observes `None` either way, but a regression would change
-        // the test's WALL TIME from ~0ms to ~1ms+. We pin the
-        // short-circuit by NOT reaching the network at all — the
-        // assertion alone is what catches the regression because
-        // the bypass branch never invokes the client.
-        let client = test_client();
-        let got = super::resolve_expected_sha256(&client, 6, "linux-6.14.2.tar.xz", true);
-        assert!(
-            got.is_none(),
-            "skip_sha256 = true must produce None (verification \
+/// `resolve_expected_sha256(skip_sha256 = true)` returns `None`
+/// without touching the network — the bypass branch must short-
+/// circuit before any `Client::get`. Pins the security-sensitive
+/// opt-out's no-network contract: a regression that swapped the
+/// branch order (e.g. fetching the manifest then ignoring the
+/// result) would still produce `None` but burn a CDN round-trip
+/// per build, defeating the "use this when manifest is
+/// unreachable" use case.
+#[test]
+fn resolve_expected_sha256_skip_returns_none_without_network() {
+    // Build a client whose connect attempt would fail loudly if
+    // the bypass branch reached `Client::get`. A 1ms connect
+    // timeout against any external host returns within the
+    // wall-clock budget of this test; the assertion below
+    // observes `None` either way, but a regression would change
+    // the test's WALL TIME from ~0ms to ~1ms+. We pin the
+    // short-circuit by NOT reaching the network at all — the
+    // assertion alone is what catches the regression because
+    // the bypass branch never invokes the client.
+    let client = test_client();
+    let got = super::resolve_expected_sha256(&client, 6, "linux-6.14.2.tar.xz", true);
+    assert!(
+        got.is_none(),
+        "skip_sha256 = true must produce None (verification \
              skipped); got {got:?}"
-        );
-    }
+    );
+}
 
-    /// Mirror of the bypass test against the no-skip arg path with
-    /// a tarball name the parser will not match (we substitute the
-    /// network call by going through a localhost mock would require
-    /// rerouting; instead this test relies on the production
-    /// fetch_stable_sha256sums hitting kernel.org over reqwest with
-    /// a 5-second timeout — too slow for a unit test). The bypass
-    /// branch itself is the security-sensitive surface; the
-    /// network-dependent fallback paths are covered by the
-    /// `parse_sha256_for_file_*` family above (manifest parsing) and
-    /// `fetch_releases_*` family (fetch error handling). Pinning
-    /// the no-skip arg path's "does not panic on a malformed
-    /// version" property is the most we can do without a network
-    /// mock.
-    #[test]
-    fn resolve_expected_sha256_no_skip_does_not_panic_on_invalid_major() {
-        // Calls into fetch_stable_sha256sums which constructs a URL
-        // and issues a GET; the network attempt may succeed against
-        // kernel.org or fail with timeout. Either way the function
-        // must return `Option<String>` without panicking. This is a
-        // smoke test only; the full network-dependent fallback path
-        // is exercised end-to-end by the integration tests in
-        // tests/extra_kconfig_e2e.rs.
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_millis(1))
-            .connect_timeout(std::time::Duration::from_millis(1))
-            .build()
-            .expect("build test client with tight timeouts");
-        // major=999 is a kernel.org URL that returns 404; the
-        // function must surface this as None+warning, not panic.
-        let _ = super::resolve_expected_sha256(&client, 999, "linux-999.0.0.tar.xz", false);
-    }
+/// Mirror of the bypass test against the no-skip arg path with
+/// a tarball name the parser will not match (we substitute the
+/// network call by going through a localhost mock would require
+/// rerouting; instead this test relies on the production
+/// fetch_stable_sha256sums hitting kernel.org over reqwest with
+/// a 5-second timeout — too slow for a unit test). The bypass
+/// branch itself is the security-sensitive surface; the
+/// network-dependent fallback paths are covered by the
+/// `parse_sha256_for_file_*` family above (manifest parsing) and
+/// `fetch_releases_*` family (fetch error handling). Pinning
+/// the no-skip arg path's "does not panic on a malformed
+/// version" property is the most we can do without a network
+/// mock.
+#[test]
+fn resolve_expected_sha256_no_skip_does_not_panic_on_invalid_major() {
+    // Calls into fetch_stable_sha256sums which constructs a URL
+    // and issues a GET; the network attempt may succeed against
+    // kernel.org or fail with timeout. Either way the function
+    // must return `Option<String>` without panicking. This is a
+    // smoke test only; the full network-dependent fallback path
+    // is exercised end-to-end by the integration tests in
+    // tests/extra_kconfig_e2e.rs.
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(1))
+        .connect_timeout(std::time::Duration::from_millis(1))
+        .build()
+        .expect("build test client with tight timeouts");
+    // major=999 is a kernel.org URL that returns 404; the
+    // function must surface this as None+warning, not panic.
+    let _ = super::resolve_expected_sha256(&client, 999, "linux-999.0.0.tar.xz", false);
+}
 
-    // -- verify_sha256 --
+// -- verify_sha256 --
 
-    /// Matching digests return Ok regardless of case — pins the
-    /// case-insensitive comparison the helper documents.
-    #[test]
-    fn verify_sha256_accepts_case_insensitive_match() {
-        super::verify_sha256(
-            "ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890",
-            "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            "https://example.invalid/x.tar.xz",
-        )
-        .expect("case-insensitive equal must verify");
-    }
+/// Matching digests return Ok regardless of case — pins the
+/// case-insensitive comparison the helper documents.
+#[test]
+fn verify_sha256_accepts_case_insensitive_match() {
+    super::verify_sha256(
+        "ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890",
+        "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+        "https://example.invalid/x.tar.xz",
+    )
+    .expect("case-insensitive equal must verify");
+}
 
-    /// Mismatching digests surface as Err with both digests in the
-    /// message so an operator can compare them by eye without
-    /// digging through logs.
-    #[test]
-    fn verify_sha256_rejects_mismatch_with_both_digests_in_message() {
-        let url = "https://example.invalid/x.tar.xz";
-        let err = super::verify_sha256(
-            "0000000000000000000000000000000000000000000000000000000000000000",
-            "1111111111111111111111111111111111111111111111111111111111111111",
-            url,
-        )
-        .expect_err("mismatch must surface as Err");
-        let msg = format!("{err:#}");
-        assert!(msg.contains(url), "error must name the URL: {msg}");
-        assert!(
-            msg.contains("0000000000000000"),
-            "error must include the actual digest: {msg}",
-        );
-        assert!(
-            msg.contains("1111111111111111"),
-            "error must include the expected digest: {msg}",
-        );
-        // The mismatch error is the only thing the operator sees on
-        // a verification-failed download. It MUST name `--skip-sha256`
-        // as the recovery path so an operator hitting an in-place
-        // tarball update at cdn.kernel.org does not have to dig
-        // through docs to find the bypass flag.
-        assert!(
-            msg.contains("--skip-sha256"),
-            "mismatch error must name --skip-sha256 as the recovery \
+/// Mismatching digests surface as Err with both digests in the
+/// message so an operator can compare them by eye without
+/// digging through logs.
+#[test]
+fn verify_sha256_rejects_mismatch_with_both_digests_in_message() {
+    let url = "https://example.invalid/x.tar.xz";
+    let err = super::verify_sha256(
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        url,
+    )
+    .expect_err("mismatch must surface as Err");
+    let msg = format!("{err:#}");
+    assert!(msg.contains(url), "error must name the URL: {msg}");
+    assert!(
+        msg.contains("0000000000000000"),
+        "error must include the actual digest: {msg}",
+    );
+    assert!(
+        msg.contains("1111111111111111"),
+        "error must include the expected digest: {msg}",
+    );
+    // The mismatch error is the only thing the operator sees on
+    // a verification-failed download. It MUST name `--skip-sha256`
+    // as the recovery path so an operator hitting an in-place
+    // tarball update at cdn.kernel.org does not have to dig
+    // through docs to find the bypass flag.
+    assert!(
+        msg.contains("--skip-sha256"),
+        "mismatch error must name --skip-sha256 as the recovery \
              flag for the in-place-tarball-update case: {msg}",
-        );
-    }
+    );
+}
 
-    // -- proptest --
+// -- proptest --
 
-    use proptest::prop_assert;
+use proptest::prop_assert;
 
-    proptest::proptest! {
-        /// Any arbitrary input must not panic AND, on success, return
-        /// only values the input string can justify. Broadened from
-        /// 0..20 to 0..100 characters to exercise long/multi-dot
-        /// pathological inputs the 20-char range missed.
-        #[test]
-        fn prop_major_version_never_panics(s in "\\PC{0,100}") {
-            if let Ok(major) = major_version(&s) {
-                // Ok(major) is only valid when the first dot-segment
-                // parses as the returned integer.
-                let first = s.split('.').next().unwrap_or("");
-                prop_assert!(first.parse::<u32>().ok() == Some(major));
-            }
-        }
-
-        #[test]
-        fn prop_is_rc_contains_dash_rc(s in "\\PC{0,20}") {
-            assert_eq!(is_rc(&s), s.contains("-rc"));
-        }
-
-        #[test]
-        fn prop_patch_level_valid_three_part(
-            major in 1u32..100,
-            minor in 0u32..100,
-            patch in 0u32..100,
-        ) {
-            let v = format!("{major}.{minor}.{patch}");
-            assert_eq!(patch_level(&v), Some(patch));
-        }
-
-        #[test]
-        fn prop_patch_level_valid_two_part(major in 1u32..100, minor in 0u32..100) {
-            let v = format!("{major}.{minor}");
-            assert_eq!(patch_level(&v), Some(0));
-        }
-
-        #[test]
-        fn prop_major_version_valid(major in 1u32..100, minor in 0u32..100) {
-            let v = format!("{major}.{minor}");
-            assert_eq!(major_version(&v).unwrap(), major);
+proptest::proptest! {
+    /// Any arbitrary input must not panic AND, on success, return
+    /// only values the input string can justify. Broadened from
+    /// 0..20 to 0..100 characters to exercise long/multi-dot
+    /// pathological inputs the 20-char range missed.
+    #[test]
+    fn prop_major_version_never_panics(s in "\\PC{0,100}") {
+        if let Ok(major) = major_version(&s) {
+            // Ok(major) is only valid when the first dot-segment
+            // parses as the returned integer.
+            let first = s.split('.').next().unwrap_or("");
+            prop_assert!(first.parse::<u32>().ok() == Some(major));
         }
     }
+
+    #[test]
+    fn prop_is_rc_contains_dash_rc(s in "\\PC{0,20}") {
+        assert_eq!(is_rc(&s), s.contains("-rc"));
+    }
+
+    #[test]
+    fn prop_patch_level_valid_three_part(
+        major in 1u32..100,
+        minor in 0u32..100,
+        patch in 0u32..100,
+    ) {
+        let v = format!("{major}.{minor}.{patch}");
+        assert_eq!(patch_level(&v), Some(patch));
+    }
+
+    #[test]
+    fn prop_patch_level_valid_two_part(major in 1u32..100, minor in 0u32..100) {
+        let v = format!("{major}.{minor}");
+        assert_eq!(patch_level(&v), Some(0));
+    }
+
+    #[test]
+    fn prop_major_version_valid(major in 1u32..100, minor in 0u32..100) {
+        let v = format!("{major}.{minor}");
+        assert_eq!(major_version(&v).unwrap(), major);
+    }
+}

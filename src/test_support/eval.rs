@@ -1684,6 +1684,8 @@ fn run_ktstr_test_inner_impl(
                 // is_coordinator_internal expansion does not
                 // require a parallel update here.
                 Some(crate::vmm::wire::MsgType::SnapshotRequest)
+                | Some(crate::vmm::wire::MsgType::KernelOpRequest)
+                | Some(crate::vmm::wire::MsgType::KernelOpReply)
                 | Some(crate::vmm::wire::MsgType::SysRdy) => {}
                 None => {
                     tracing::warn!(
@@ -2093,16 +2095,14 @@ fn evaluate_vm_result(
             // removed once every production emitter was audited as
             // kind-tagging its details. `verbose()` forces the
             // section on for operator debugging runs.
-            let console_section = if check_result
-                .details
-                .iter()
-                .any(|d| matches!(
+            let console_section = if check_result.details.iter().any(|d| {
+                matches!(
                     d.kind,
                     crate::assert::DetailKind::SchedulerCrashed
                         | crate::assert::DetailKind::SchedulerExitedCleanly
                         | crate::assert::DetailKind::SchedulerDiedUnknownReason
-                ))
-                || verbose()
+                )
+            }) || verbose()
             {
                 let init_stage = classify_init_stage(result.guest_messages.as_ref());
                 format_console_diagnostics(&result.stderr, result.exit_code, init_stage)

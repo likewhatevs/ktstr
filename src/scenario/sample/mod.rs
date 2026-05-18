@@ -42,8 +42,8 @@
 //! borrows; [`SampleSeries::iter_samples`] yields `Sample<'_>`
 //! bound by the series' own lifetime.
 
-use crate::monitor::dump::FailureDumpReport;
 use crate::monitor::MonitorReport;
+use crate::monitor::dump::FailureDumpReport;
 
 use super::snapshot::{Snapshot, SnapshotResult};
 use crate::assert::temporal::SeriesField;
@@ -111,10 +111,7 @@ pub struct Sample<'a> {
     /// strict patterns like `always_true` and `each` fail the
     /// assertion so a stats-coverage gap can never silently slip
     /// past the call site).
-    pub stats: Result<
-        &'a serde_json::Value,
-        &'a crate::scenario::snapshot::MissingStatsReason,
-    >,
+    pub stats: Result<&'a serde_json::Value, &'a crate::scenario::snapshot::MissingStatsReason>,
 }
 
 /// Ordered collection of [`Sample`]s drained from a
@@ -228,12 +225,7 @@ impl SampleSeries {
     /// [`Self::from_drained`] which accepts the simpler `Option`
     /// shape and collapses absent → `NoSchedulerBinary`.
     pub fn from_drained_typed(
-        drained: Vec<(
-            String,
-            FailureDumpReport,
-            Result<serde_json::Value, crate::scenario::snapshot::MissingStatsReason>,
-            Option<u64>,
-        )>,
+        drained: Vec<crate::scenario::snapshot::DrainedSnapshotEntry>,
         monitor: Option<MonitorReport>,
     ) -> Self {
         let rows = drained
@@ -309,8 +301,6 @@ impl SampleSeries {
             stats: r.stats.as_ref(),
         })
     }
-
-
 }
 
 #[cfg(test)]
@@ -412,5 +402,4 @@ mod tests {
         let series = SampleSeries::from_drained(drained, None).periodic_only();
         assert_eq!(series.len(), 2);
     }
-
 }

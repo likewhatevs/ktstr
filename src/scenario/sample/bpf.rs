@@ -47,14 +47,16 @@ impl SampleSeries {
             // "placeholder, skip" distinctly from "field missing,
             // skip" when rendering the verdict's skip-Note.
             if row.report.is_placeholder {
-                return Err(crate::scenario::snapshot::SnapshotError::PlaceholderSample {
-                    tag: row.tag.clone(),
-                    reason: row
-                        .report
-                        .scx_walker_unavailable
-                        .clone()
-                        .unwrap_or_else(|| "placeholder report".to_string()),
-                });
+                return Err(
+                    crate::scenario::snapshot::SnapshotError::PlaceholderSample {
+                        tag: row.tag.clone(),
+                        reason: row
+                            .report
+                            .scx_walker_unavailable
+                            .clone()
+                            .unwrap_or_else(|| "placeholder report".to_string()),
+                    },
+                );
             }
             let snap = Snapshot::new(&row.report);
             project(&snap)
