@@ -789,6 +789,16 @@ pub mod prelude {
         DiskConfig, DiskThrottle, DiskThrottleValidationError, Filesystem, ThrottleDimension,
     };
     pub use crate::vmm::net_config::NetConfig;
+    // Surfaced for `post_vm` callbacks that drain the snapshot
+    // bridge's per-tag kernel-op reply log via
+    // `VmResult::snapshot_bridge::drain_kernel_ops`: the returned
+    // `Vec<(String, KernelOpReplyPayload)>` carries `read_values`
+    // of `KernelOpValue` variants the callback pattern-matches to
+    // assert on a read-back u32 / u64 / Bytes payload from
+    // `Op::ReadKernel{Hot,Cold}`. Mirrors the existing exports for
+    // `VirtioBlkCountersSnapshot` etc. — observability types the
+    // post_vm contract requires in scope.
+    pub use crate::vmm::wire::{KernelOpReplyPayload, KernelOpValue};
     pub use crate::workload::{
         AffinityIntent, AluWidth, CloneMode, MemPolicy, Migration, MpolFlags, Phase,
         ResolvedAffinity, SchedPolicy, WorkSpec, WorkType, WorkTypeValidationError, WorkerReport,

@@ -472,6 +472,31 @@ impl SnapshotBridge {
         std::mem::take(&mut *self.kernel_ops.lock_unpoisoned())
     }
 
+    /// Record a kernel-op reply produced by the host-side wire-path
+    /// dispatcher into the same per-tag drain log that
+    /// [`Self::dispatch_kernel_op`] populates.
+    ///
+    /// The in-process bridge path stores its replies inside
+    /// `dispatch_kernel_op` (which both invokes the callback AND
+    /// pushes the reply into the log). The wire-path used by ops
+    /// running inside a guest VM produces its reply on the host
+    /// freeze-coordinator and frames it back over virtio-console
+    /// port 1 — there is no callback to drive the push, so the
+    /// host coordinator calls this record-only method directly
+    /// after framing each reply. Without this hook, `post_vm`
+    /// callbacks observing [`crate::vmm::VmResult::snapshot_bridge`]
+    /// would see an empty drain log for any guest-side
+    /// `Op::WriteKernel*` / `Op::ReadKernel*` invocation, defeating
+    /// the asserts-from-replies pattern the gated cold-path e2e
+    /// scaffolding pins.
+    pub fn record_kernel_op_reply(
+        &self,
+        tag: String,
+        reply: crate::vmm::wire::KernelOpReplyPayload,
+    ) {
+        self.kernel_ops.lock_unpoisoned().push((tag, reply));
+    }
+
     /// Look up the first kernel-op reply value recorded under `tag`
     /// in the kernel-op drain log without consuming the log.
     ///

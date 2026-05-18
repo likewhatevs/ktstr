@@ -397,7 +397,7 @@ fn dispatch_one_write(
         // matching pid AND matching start_time identity
         // (anti-PID-reuse). Runs the 8-layer validation chain
         // (pid, start_time, lifetime, on_rq, scx queued-empty,
-        // ext_sched_class, SCHED_EXT policy, start_boottime), then
+        // ext_sched_class, start_boottime), then
         // resolves the dot-separated nested field path via BTF and
         // writes at task_pa + field_offset. Cold-path freeze
         // rendezvous gives us the atomicity contract — every vCPU
@@ -705,17 +705,28 @@ fn dispatch_per_cpu_field_read(
     }
 }
 
-/// `SCHED_EXT` policy value per `include/uapi/linux/sched.h:121`.
-/// Used by the L7 belt-and-suspenders check (alongside L6's
-/// `sched_class` pointer comparison) to confirm the task is
-/// SCX-managed.
-const SCHED_EXT: u32 = 7;
-
-/// `SCHED_RESET_ON_FORK` per `include/uapi/linux/sched.h:124`.
-/// ORed into `task->policy` to flag "revert to SCHED_NORMAL on
-/// fork". Mask out before comparing the policy against
-/// [`SCHED_EXT`].
-const SCHED_RESET_ON_FORK: u32 = 0x40000000;
+/// Width of the start-time identity tolerance window used by L2 of
+/// [`validate_task_for_field_op`]: the conservative maximum of
+/// `1e9 / sysconf(_SC_CLK_TCK)` across typical configurations.
+///
+/// The test author's `expected_start_time_ns` is computed from
+/// `/proc/<pid>/stat` field 22 (`man 5 proc` "starttime"), which the
+/// kernel emits in CLK_TCK ticks — typically 10ms for `CLK_TCK=100`
+/// (USER_HZ on x86_64 default kernels). The kernel's
+/// `task->start_time` carries the exact `ktime_get_ns()` value, so
+/// the userspace-derived `expected_start_time_ns` is always
+/// ROUNDED DOWN to a tick boundary while the kernel's stored value
+/// has sub-tick precision. Without a window, every TaskField op
+/// would fail the L2 identity check on first use.
+///
+/// 10ms is conservative for `CLK_TCK >= 100`. For higher CLK_TCK
+/// (e.g. 1000 → 1ms tick) the window is wider than strictly
+/// necessary but still narrow enough to reject PID-recycled tasks
+/// — the kernel does not recycle a freed PID within 10ms of the
+/// original task's exit under normal scheduling pressure (the
+/// allocator advances the PID counter monotonically and wraps
+/// after `pid_max` ≈ 2^22 entries).
+const START_TIME_PROC_TICK_NS: u64 = 10_000_000;
 
 /// BTF-derived byte offsets needed by the 8-layer task validation in
 /// [`validate_task_for_field_op`] plus the per-thread walker in
@@ -753,10 +764,6 @@ const SCHED_RESET_ON_FORK: u32 = 0x40000000;
 ///   (`const struct sched_class *` = 8 bytes) at sched.h:878.
 ///   Pointer identity-compared against `ext_sched_class` KVA for
 ///   the L6 SCX-only check.
-/// - `policy`: `task_struct.policy` (`unsigned int` = 4 bytes) at
-///   `include/linux/sched.h:920`. Compared against
-///   [`SCHED_EXT`] after masking [`SCHED_RESET_ON_FORK`] for the L7
-///   belt-and-suspenders check.
 /// - `start_boottime`: `task_struct.start_boottime` (`u64` = 8 bytes)
 ///   at sched.h:1130 ("Boot based time in nsecs"). Set by `copy_process`
 ///   at fork via `ktime_get_boottime_ns()`. L8 anti-slab-recycle.
@@ -780,7 +787,6 @@ struct TaskValidationOffsets {
     scx_dsq: usize,
     scx_runnable_node: usize,
     sched_class: usize,
-    policy: usize,
     start_boottime: usize,
     tasks: usize,
     signal: usize,
@@ -811,7 +817,6 @@ impl TaskValidationOffsets {
             scx_dsq: task_resolve("scx.dsq")?,
             scx_runnable_node: task_resolve("scx.runnable_node")?,
             sched_class: task_resolve("sched_class")?,
-            policy: task_resolve("policy")?,
             start_boottime: task_resolve("start_boottime")?,
             tasks: task_resolve("tasks")?,
             signal: task_resolve("signal")?,
@@ -1079,13 +1084,25 @@ fn thread_pa_or_node(
 ///    slab-recycle where the freed task_struct's memory was reused
 ///    for another task with a different pid. Also a sanity check on
 ///    the walker.
-/// 2. **start_time identity**: `task->start_time ==
-///    expected_start_time_ns`. The kernel sets `start_time` once at
-///    fork via `ktime_get_ns()` in `kernel/fork.c::copy_process`;
-///    the value never changes after that. Catches PID-reuse: if the
-///    original worker exited and the kernel recycled the PID for an
-///    unrelated task, the new task's `start_time` will differ from
-///    the captured-at-spawn value, even when the pid matches by
+/// 2. **start_time identity**: `task->start_time in
+///    [expected_start_time_ns, expected_start_time_ns +
+///    START_TIME_PROC_TICK_NS)`. The kernel sets `start_time` once
+///    at fork via `ktime_get_ns()` in `kernel/fork.c::copy_process`
+///    with full nanosecond precision; the value never changes after
+///    that. The only userspace-visible source for that field is
+///    `/proc/<pid>/stat` field 22, which the kernel emits in clock
+///    ticks (1 / `sysconf(_SC_CLK_TCK)`) — typically 10ms — so the
+///    test author's `expected_start_time_ns` is always quantized
+///    DOWN to a tick boundary while the kernel's `task->start_time`
+///    carries the exact ns. Accepting a tick-window (10ms — the
+///    conservative max for `CLK_TCK >= 100`) closes the legitimate
+///    quantization gap without weakening the anti-PID-reuse defense
+///    (the kernel never recycles a PID within 10ms of the original
+///    task's exit under normal scheduling pressure).
+///    Catches PID-reuse: if the original worker exited and the
+///    kernel recycled the PID for an unrelated task, the new task's
+///    `start_time` will be far outside the [+0, +tick) window of the
+///    captured-at-spawn value, even when the pid matches by
 ///    coincidence.
 /// 3. **lifetime**: `task->__state & TASK_DEAD == 0`. A task in the
 ///    final teardown path has the `TASK_DEAD` bit set in `__state`
@@ -1110,11 +1127,17 @@ fn thread_pa_or_node(
 ///    seeds), RT/DL/stop/idle have different vtime semantics, and
 ///    SCX's `dsq_vtime` is the only host-writable preserved
 ///    ordering key in the modern kernel.
-/// 7. **SCHED_EXT policy** (belt-and-suspenders for L6):
+/// 7. (REMOVED). The previous gate required
 ///    `task->policy & ~SCHED_RESET_ON_FORK == SCHED_EXT` per
-///    `include/uapi/linux/sched.h:121`. Defense against future
-///    kernels that introduce dynamic sched_class swap without
-///    updating the static-pointer identity check semantics.
+///    `include/uapi/linux/sched.h:121` as belt-and-suspenders for
+///    L6, but it does not hold: `kernel/sched/ext.c::scx_init_task`
+///    / `scx_enable_task` set `task->sched_class = &ext_sched_class`
+///    when SCX takes over a fair-policy task without modifying
+///    `task->policy`, so a worker forked under `SCHED_NORMAL` keeps
+///    `policy=0` even after SCX claims it. L6 (sched_class pointer
+///    identity) is the canonical SCX-managed gate; `policy` is
+///    unreliable for that purpose. The numbering is preserved so
+///    the surviving gates keep their layer labels.
 /// 8. **anti slab-recycle**: `task->start_boottime != 0`. The
 ///    `start_boottime` field is set by `copy_process` at fork via
 ///    `ktime_get_boottime_ns()` (which is never 0 after boot). A
@@ -1148,12 +1171,25 @@ fn validate_task_for_field_op(
     }
 
     // L2: start_time identity (anti-PID-reuse).
+    //
+    // `expected_start_time_ns` is the test author's value derived
+    // from /proc/<pid>/stat field 22 (jiffies-quantized: integer
+    // ticks * 1e9 / CLK_TCK), so it's always ROUNDED DOWN to a
+    // CLK_TCK boundary. The kernel's `task->start_time` carries
+    // sub-tick precision from `ktime_get_ns()`, so the legitimate
+    // value lands in `[expected, expected + CLK_TCK_NS)`. Accept
+    // a 10ms window (conservative max for CLK_TCK >= 100), which
+    // still rejects PID-recycled tasks whose start_time falls
+    // well outside that range under normal scheduling pressure.
     let observed_start_time = mem.read_u64(task_pa, offs.start_time);
-    if observed_start_time != expected_start_time_ns {
+    let skew = observed_start_time.saturating_sub(expected_start_time_ns);
+    if observed_start_time < expected_start_time_ns || skew >= START_TIME_PROC_TICK_NS {
         return Err(format!(
             "validate_task: task pid={target_pid} start_time identity mismatch — \
-             observed={observed_start_time}ns expected={expected_start_time_ns}ns; \
-             original task exited and PID was recycled for an unrelated task"
+             observed={observed_start_time}ns expected in \
+             [{expected_start_time_ns}, {}]ns; \
+             original task exited and PID was recycled for an unrelated task",
+            expected_start_time_ns + START_TIME_PROC_TICK_NS - 1
         ));
     }
 
@@ -1220,18 +1256,21 @@ fn validate_task_for_field_op(
         ));
     }
 
-    // L7: SCHED_EXT policy belt-and-suspenders.
-    let policy = mem.read_u32(task_pa, offs.policy);
-    if policy & !SCHED_RESET_ON_FORK != SCHED_EXT {
-        return Err(format!(
-            "validate_task: task pid={target_pid} policy={policy} does not match \
-             SCHED_EXT={SCHED_EXT} (mask SCHED_RESET_ON_FORK={SCHED_RESET_ON_FORK:#x}); \
-             sched_class pointer matched ext but policy disagrees — likely a kernel \
-             feature (livepatch / dynamic class swap) that broke the static-pointer \
-             identity"
-        ));
-    }
-
+    // L7 (REMOVED): `task->policy == SCHED_EXT` was a belt-and-
+    // suspenders gate for L6 but it does not actually hold for SCX-
+    // managed tasks. `kernel/sched/ext.c::scx_init_task` /
+    // `scx_enable_task` set `task->sched_class = &ext_sched_class`
+    // when SCX takes over a fair-policy task but does NOT modify
+    // `task->policy` — a worker forked under `SCHED_NORMAL` keeps
+    // `policy=0` (SCHED_NORMAL) even after SCX claims it. Requiring
+    // `policy == SCHED_EXT` rejects every legitimate SCX-managed
+    // task that did not explicitly call `sched_setattr(SCHED_EXT)`,
+    // which is the common case for ktstr's WorkloadHandle (workers
+    // spawn with SchedPolicy::Normal and scx-ktstr's BPF dispatch
+    // claims them). L6 (sched_class pointer identity) is the
+    // canonical SCX-managed gate; the policy field is unreliable
+    // for this check.
+    //
     // L8: anti slab-recycle via start_boottime.
     let start_boottime = mem.read_u64(task_pa, offs.start_boottime);
     if start_boottime == 0 {
@@ -1970,7 +2009,6 @@ mod tests {
         pub(super) const STATE_OFF: usize = 0x20;
         pub(super) const ON_RQ_OFF: usize = 0x28;
         pub(super) const SCHED_CLASS_OFF: usize = 0x30;
-        pub(super) const POLICY_OFF: usize = 0x38;
         pub(super) const START_BOOTTIME_OFF: usize = 0x40;
         pub(super) const SCX_DSQ_OFF: usize = 0x48;
         pub(super) const SCX_RUNNABLE_NODE_OFF: usize = 0x50;
@@ -1987,7 +2025,6 @@ mod tests {
             state: synth_task::STATE_OFF,
             on_rq: synth_task::ON_RQ_OFF,
             sched_class: synth_task::SCHED_CLASS_OFF,
-            policy: synth_task::POLICY_OFF,
             start_boottime: synth_task::START_BOOTTIME_OFF,
             scx_dsq: synth_task::SCX_DSQ_OFF,
             scx_runnable_node: synth_task::SCX_RUNNABLE_NODE_OFF,
@@ -2022,9 +2059,6 @@ mod tests {
         // sched_class = EXT_KVA
         buf[pa + synth_task::SCHED_CLASS_OFF..pa + synth_task::SCHED_CLASS_OFF + 8]
             .copy_from_slice(&EXT_KVA.to_le_bytes());
-        // policy = SCHED_EXT (7)
-        buf[pa + synth_task::POLICY_OFF..pa + synth_task::POLICY_OFF + 4]
-            .copy_from_slice(&SCHED_EXT.to_le_bytes());
         // start_boottime = arbitrary non-zero (1 hour in ns)
         buf[pa + synth_task::START_BOOTTIME_OFF..pa + synth_task::START_BOOTTIME_OFF + 8]
             .copy_from_slice(&3_600_000_000_000u64.to_le_bytes());
@@ -2105,19 +2139,61 @@ mod tests {
     /// L2 (start_time identity mismatch): the kernel sets start_time
     /// ONCE at fork. If the original task exited and the kernel
     /// recycled the PID, the new task's start_time will differ from
-    /// what we captured at spawn.
+    /// what we captured at spawn. The L2 gate accepts a window of
+    /// `[expected, expected + START_TIME_PROC_TICK_NS)` to absorb
+    /// the userspace /proc tick quantization (see L2 doc); this
+    /// test pins the rejection for an observed value BELOW expected
+    /// (the only direction recycle can drift), and the next two
+    /// tests pin the in-window accept + out-of-window reject above.
     #[test]
-    fn validate_task_rejects_start_time_mismatch() {
+    fn validate_task_rejects_start_time_below_window() {
         let mut buf = vec![0u8; 4096];
         paint_valid_task(&mut buf, 0, 12345);
         let kernel = build_test_kernel(&mut buf, Default::default());
         let offs = synth_validation_offsets();
-        let wrong_start_time = DEFAULT_START_TIME + 1_000_000;
-        let err = validate(&kernel, 0, 12345, wrong_start_time, &offs)
-            .expect_err("start_time mismatch must reject");
+        // observed=DEFAULT_START_TIME, expected=DEFAULT_START_TIME + 1ms
+        // → observed < expected, must reject.
+        let too_high_expected = DEFAULT_START_TIME + 1_000_000;
+        let err = validate(&kernel, 0, 12345, too_high_expected, &offs)
+            .expect_err("start_time below window must reject");
         assert!(err.contains("start_time identity mismatch"));
         assert!(err.contains(&format!("observed={DEFAULT_START_TIME}")));
-        assert!(err.contains(&format!("expected={wrong_start_time}")));
+        assert!(err.contains(&format!("expected in [{too_high_expected}")));
+        assert!(err.contains("recycled"));
+    }
+
+    /// L2 accepts an observed start_time within the userspace-tick
+    /// window above the expected value. Pins the legitimate
+    /// jiffies-quantization gap that /proc/<pid>/stat field 22
+    /// introduces.
+    #[test]
+    fn validate_task_accepts_start_time_within_tick_window() {
+        let mut buf = vec![0u8; 4096];
+        paint_valid_task(&mut buf, 0, 12345);
+        let kernel = build_test_kernel(&mut buf, Default::default());
+        let offs = synth_validation_offsets();
+        // observed=DEFAULT_START_TIME, expected=DEFAULT_START_TIME-5ms
+        // → observed - expected = +5ms (within 10ms window).
+        let expected_within_window = DEFAULT_START_TIME - 5_000_000;
+        validate(&kernel, 0, 12345, expected_within_window, &offs)
+            .expect("start_time within tick window must accept");
+    }
+
+    /// L2 rejects an observed start_time MORE than one tick above
+    /// the expected value — characteristic of a PID-recycled task
+    /// whose start_time is fundamentally newer.
+    #[test]
+    fn validate_task_rejects_start_time_above_window() {
+        let mut buf = vec![0u8; 4096];
+        paint_valid_task(&mut buf, 0, 12345);
+        let kernel = build_test_kernel(&mut buf, Default::default());
+        let offs = synth_validation_offsets();
+        // observed=DEFAULT_START_TIME, expected=DEFAULT_START_TIME-20ms
+        // → observed - expected = +20ms (above 10ms window).
+        let expected_below_window = DEFAULT_START_TIME - 20_000_000;
+        let err = validate(&kernel, 0, 12345, expected_below_window, &offs)
+            .expect_err("start_time above window must reject");
+        assert!(err.contains("start_time identity mismatch"));
         assert!(err.contains("recycled"));
     }
 
@@ -2202,39 +2278,6 @@ mod tests {
         assert!(err.contains(&format!("sched_class={fair_kva:#x}")));
         assert!(err.contains("SCX-managed tasks only"));
         assert!(err.contains("SchedPolicy::Ext"));
-    }
-
-    /// L7 (policy != SCHED_EXT): belt-and-suspenders rejection
-    /// catches dynamic sched_class swap futures.
-    #[test]
-    fn validate_task_rejects_non_sched_ext_policy() {
-        let mut buf = vec![0u8; 4096];
-        paint_valid_task(&mut buf, 0, 12345);
-        // Policy = SCHED_NORMAL (0) but sched_class still ext — the
-        // belt-and-suspenders L7 catches this mismatch.
-        buf[synth_task::POLICY_OFF..synth_task::POLICY_OFF + 4]
-            .copy_from_slice(&0u32.to_le_bytes());
-        let kernel = build_test_kernel(&mut buf, Default::default());
-        let offs = synth_validation_offsets();
-        let err = validate(&kernel, 0, 12345, DEFAULT_START_TIME, &offs)
-            .expect_err("policy != SCHED_EXT must reject");
-        assert!(err.contains("policy=0"));
-        assert!(err.contains("SCHED_EXT"));
-    }
-
-    /// L7 accepts SCHED_EXT | SCHED_RESET_ON_FORK (policy with the
-    /// reset-on-fork flag ORed in). The masking step (`policy &
-    /// ~SCHED_RESET_ON_FORK`) strips the flag before comparison.
-    #[test]
-    fn validate_task_accepts_sched_ext_with_reset_on_fork() {
-        let mut buf = vec![0u8; 4096];
-        paint_valid_task(&mut buf, 0, 12345);
-        let policy_with_flag = SCHED_EXT | SCHED_RESET_ON_FORK;
-        buf[synth_task::POLICY_OFF..synth_task::POLICY_OFF + 4]
-            .copy_from_slice(&policy_with_flag.to_le_bytes());
-        let kernel = build_test_kernel(&mut buf, Default::default());
-        let offs = synth_validation_offsets();
-        assert!(validate(&kernel, 0, 12345, DEFAULT_START_TIME, &offs).is_ok());
     }
 
     /// L8 (start_boottime == 0): probable slab-recycle survivor that

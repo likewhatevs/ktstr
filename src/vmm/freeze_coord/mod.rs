@@ -2847,6 +2847,38 @@ impl KtstrVm {
                 // NOT deferred: WATCH only needs the symbol cache,
                 // which is independent of `owned_accessor`.
                 let mut capture_requests_deferred: Vec<SnapshotRequest> = Vec::new();
+                // Cold-op requests received before `owned_accessor`
+                // adoption are queued here instead of being serviced
+                // immediately. Servicing pre-adoption hits the
+                // `Some(owned) = owned_accessor` else-branch at the
+                // ColdOp arm in `freeze_and_dispatch`, which returns a
+                // synthetic `success = false` reply with
+                // "owned_accessor not yet initialised; ColdOp dispatch
+                // dropped". The guest's executor converts that into an
+                // `anyhow::bail!` via `check_kernel_op_reply`, failing
+                // every cold-op test whose first op fires before the
+                // accessor-init worker publishes — a race that hits
+                // boot-fast scenarios (no Backdrop, single Op step)
+                // reliably because the guest reaches `apply_ops` while
+                // KERN_ADDRS / accessor-init is still in flight on the
+                // host. Mirrors `capture_requests_deferred` shape.
+                //
+                // The queue is drained at the accessor-adoption site
+                // by appending its contents back onto
+                // `kernel_op_requests_pending`, so the same iteration's
+                // ColdOp drain dispatches them through the normal
+                // `freeze_and_dispatch(FreezeMode::ColdOp(...))` flow
+                // with the accessor present.
+                //
+                // If the accessor never adopts (worker permanently
+                // failed past its 60 s deadline), the queue is
+                // dropped at coord exit and the guest's blocking
+                // reader on `/dev/vport0p1` times out at the per-Op
+                // 30 s deadline — same observable behaviour as a
+                // late-boot rendezvous timeout. Symmetric with
+                // `capture_requests_deferred`.
+                let mut kernel_op_requests_deferred:
+                    Vec<crate::vmm::wire::KernelOpRequestPayload> = Vec::new();
                 // Periodic-capture state. `periodic_boundaries_ns`
                 // is the precomputed list of `Instant` deadlines
                 // (encoded as nanos-since-`run_start`) at which the
@@ -3209,6 +3241,26 @@ impl KtstrVm {
                             );
                             snapshot_requests_pending.append(
                                 &mut capture_requests_deferred,
+                            );
+                        }
+                        // Symmetric drain of cold-op requests queued
+                        // before adoption. Appending onto
+                        // `kernel_op_requests_pending` routes them
+                        // through this iteration's existing cold-op
+                        // drain (further down the loop body), which
+                        // now has `owned_accessor = Some(...)` so
+                        // `freeze_and_dispatch(FreezeMode::ColdOp)` can
+                        // service the request instead of returning the
+                        // "owned_accessor not yet initialised" error.
+                        if !kernel_op_requests_deferred.is_empty() {
+                            let n = kernel_op_requests_deferred.len();
+                            tracing::info!(
+                                deferred_count = n,
+                                "freeze-coord: draining deferred ColdOp \
+                                 kernel-op requests after owned_accessor adoption"
+                            );
+                            kernel_op_requests_pending.append(
+                                &mut kernel_op_requests_deferred,
                             );
                         }
                     }
@@ -6743,6 +6795,38 @@ impl KtstrVm {
                     // finished modifying that same kernel state.
                     let pending_kernel_ops = std::mem::take(&mut kernel_op_requests_pending);
                     for req in pending_kernel_ops {
+                        // Defer-on-no-accessor gate. Mirrors the
+                        // `owned_accessor.is_none()` check the TLV
+                        // CAPTURE drain runs above. Without this,
+                        // requests landing before the
+                        // accessor-init worker publishes hit the
+                        // ColdOp arm in `freeze_and_dispatch` where
+                        // the `else { defensive error }` branch
+                        // synthesises a `success = false` reply with
+                        // "owned_accessor not yet initialised" — the
+                        // guest's executor converts that into an
+                        // `anyhow::bail!`, failing the test. Boot-
+                        // fast scenarios (single-Op step with no
+                        // Backdrop) hit this race reliably because
+                        // the guest reaches `apply_ops` while
+                        // KERN_ADDRS + accessor-init are still in
+                        // flight on the host. Queue here and the
+                        // adoption site (where the OnceLock-published
+                        // pair lands on this coord) appends the queue
+                        // back onto `kernel_op_requests_pending` so
+                        // the same iteration body's drain dispatches
+                        // them through the normal flow with the
+                        // accessor present.
+                        if owned_accessor.is_none() {
+                            tracing::info!(
+                                request_id = req.request_id,
+                                tag = %req.tag,
+                                "freeze-coord: ColdOp deferred \
+                                 (owned_accessor not yet adopted)"
+                            );
+                            kernel_op_requests_deferred.push(req);
+                            continue;
+                        }
                         // Per-iteration `on_demand_in_flight` gate
                         // acquire: ColdOp dispatch must NOT race a
                         // concurrent CAPTURE / periodic /
@@ -6765,6 +6849,8 @@ impl KtstrVm {
                                             .to_string(),
                                     read_values: Vec::new(),
                                 };
+                                freeze_coord_snapshot_bridge
+                                    .record_kernel_op_reply(req.tag.clone(), reply.clone());
                                 match frame_kernel_op_reply(&reply) {
                                     Ok(frame) => {
                                         freeze_coord_virtio_con
@@ -6829,6 +6915,8 @@ impl KtstrVm {
                                 }
                             }
                         };
+                        freeze_coord_snapshot_bridge
+                            .record_kernel_op_reply(req.tag.clone(), reply.clone());
                         match frame_kernel_op_reply(&reply) {
                             Ok(frame) => {
                                 freeze_coord_virtio_con
