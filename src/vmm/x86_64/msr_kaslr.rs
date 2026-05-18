@@ -120,7 +120,7 @@ const PHYSICAL_ALIGN: u64 = 2 * 1024 * 1024;
 /// non-canonical) needs a paging-aware variant driven by
 /// `KernelSymbols::pgtable_l5_enabled` — that's the canonical-KVA
 /// validity guard's scope, not this module's.
-const KERNEL_HALF_THRESHOLD: u64 = 0xFFFF_8000_0000_0000;
+pub(crate) const KERNEL_HALF_CANONICAL_4LEVEL: u64 = 0xFFFF_8000_0000_0000;
 
 /// Reasons the LSTAR-based virt-KASLR derivation can decline a
 /// reading. Each is recoverable — the caller falls back to an
@@ -196,7 +196,7 @@ impl std::fmt::Display for LstarDeriveError {
             Self::NonCanonical { lstar } => write!(
                 f,
                 "MSR_LSTAR = {lstar:#x}; not in kernel-half canonical range \
-                 (expected bits 63..47 all set, ≥ {KERNEL_HALF_THRESHOLD:#x})"
+                 (expected bits 63..47 all set, ≥ {KERNEL_HALF_CANONICAL_4LEVEL:#x})"
             ),
             Self::LinkAboveLstar { lstar, link } => write!(
                 f,
@@ -246,7 +246,7 @@ pub fn derive_virt_kaslr(lstar: u64, entry_syscall_64_link: u64) -> Result<u64, 
     if entry_syscall_64_link == 0 {
         return Err(LstarDeriveError::LinkUnknown);
     }
-    if lstar < KERNEL_HALF_THRESHOLD {
+    if lstar < KERNEL_HALF_CANONICAL_4LEVEL {
         return Err(LstarDeriveError::NonCanonical { lstar });
     }
     if lstar < entry_syscall_64_link {
@@ -391,10 +391,10 @@ mod tests {
 
     #[test]
     fn derive_at_canonical_threshold_uses_link_guard() {
-        // lstar exactly == KERNEL_HALF_THRESHOLD passes the canonical
+        // lstar exactly == KERNEL_HALF_CANONICAL_4LEVEL passes the canonical
         // guard (strict <); falls through to the link guard. With a
         // higher link KVA this surfaces LinkAboveLstar.
-        let err = derive_virt_kaslr(KERNEL_HALF_THRESHOLD, LINK_KVA_TYPICAL)
+        let err = derive_virt_kaslr(KERNEL_HALF_CANONICAL_4LEVEL, LINK_KVA_TYPICAL)
             .expect_err("lstar < link must produce LinkAboveLstar");
         assert!(matches!(err, LstarDeriveError::LinkAboveLstar { .. }));
     }

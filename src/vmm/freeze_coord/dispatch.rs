@@ -29,6 +29,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 use super::snapshot::decode_snapshot_request;
 use super::state::SnapshotRequest;
+use crate::vmm::x86_64::msr_kaslr::KERNEL_HALF_CANONICAL_4LEVEL;
 
 /// Aggregate of the coordinator-side sinks the TOKEN_TX dispatch can
 /// touch. Bundling them keeps the [`dispatch_bulk_message`] signature
@@ -328,7 +329,7 @@ pub(super) fn dispatch_bulk_message(
                 // a torn / compromised guest payload AND a corrupted
                 // host vmlinux ELF):
                 //
-                //   (l) `link >= KERNEL_HALF_THRESHOLD` —
+                //   (l) `link >= KERNEL_HALF_CANONICAL_4LEVEL` —
                 //       host-side: if the vmlinux ELF parse
                 //       returned a low / garbage `_text` symbol
                 //       (e.g. 0x1000 from a corrupted symbol
@@ -336,7 +337,7 @@ pub(super) fn dispatch_bulk_message(
                 //       Catches the broken-ELF case before gates
                 //       (a)/(b)/(c) below have to.
                 //
-                //   (a) `runtime >= KERNEL_HALF_THRESHOLD` —
+                //   (a) `runtime >= KERNEL_HALF_CANONICAL_4LEVEL` —
                 //       runtime KVA must be in the kernel-half
                 //       canonical range (bits 63..47 all set).
                 //       Rejects non-canonical and userspace
@@ -367,13 +368,12 @@ pub(super) fn dispatch_bulk_message(
                 //       as fallback to BSP MSR (x86) or
                 //       literal-0 (aarch64-only path) rather
                 //       than incorrect data.
-                const KERNEL_HALF_THRESHOLD: u64 = 0xFFFF_8000_0000_0000;
                 const RANDOMIZE_BASE_MAX_OFFSET: u64 = 1 << 30; // 1 GiB
                 if let Some(runtime) = addrs.kernel_text_runtime_kva
-                    && sinks.kernel_text_link_kva >= KERNEL_HALF_THRESHOLD
+                    && sinks.kernel_text_link_kva >= KERNEL_HALF_CANONICAL_4LEVEL
                 {
                     let link = sinks.kernel_text_link_kva;
-                    if runtime >= KERNEL_HALF_THRESHOLD
+                    if runtime >= KERNEL_HALF_CANONICAL_4LEVEL
                         && runtime >= link
                         && (runtime - link) <= RANDOMIZE_BASE_MAX_OFFSET
                     {

@@ -99,15 +99,16 @@ use crate::vmm::wire::{
 /// unmapped or non-canonical addresses (page-walk safety net).
 ///
 /// INTENTIONALLY DIFFERS from
-/// [`crate::vmm::x86_64::msr_kaslr::KERNEL_HALF_THRESHOLD`] +
-/// [`crate::vmm::freeze_coord::dispatch`]'s constant of the same
-/// name (value `0xFFFF_8000_0000_0000`). Those check the LSTAR MSR's
-/// canonical-bits invariant on 4-level x86_64 — a strict per-hw
-/// invariant on a known register. This dispatcher accepts arbitrary
-/// caller-supplied KVAs and must use the looser 5-level superset so
-/// 5-level kernel direct-map/vmalloc/vmemmap addresses are not
-/// false-rejected. See `#68` for a rename cleanup that disambiguates
-/// the two.
+/// [`crate::vmm::x86_64::msr_kaslr::KERNEL_HALF_CANONICAL_4LEVEL`]
+/// (value `0xFFFF_8000_0000_0000`, shared by `freeze_coord::dispatch`
+/// via the same import). That constant checks the 4-level x86_64
+/// canonical-bits invariant on the LSTAR MSR + kernel-text-link KVA
+/// — a strict per-hardware invariant on known-shape inputs. This
+/// dispatcher accepts arbitrary caller-supplied KVAs and must use the
+/// looser 5-level superset so 5-level kernel
+/// direct-map/vmalloc/vmemmap addresses are not false-rejected. The
+/// paired naming (`_CANONICAL_4LEVEL` vs `_CONSERVATIVE_5LEVEL`)
+/// telegraphs which is which.
 ///
 /// [`KernelOpTarget::Direct`] does NOT use this threshold — it uses
 /// runtime `page_offset + dram_size` range validation via
@@ -115,7 +116,7 @@ use crate::vmm::wire::{
 /// path's PA derivation) does `kva.wrapping_sub(page_offset)` with
 /// no safety net — a wrap to an in-bounds-but-wrong PA would silently
 /// no-op at `write_scalar`/`read_scalar`.
-const KERNEL_HALF_THRESHOLD: u64 = 0xFF00_0000_0000_0000;
+const KERNEL_HALF_CONSERVATIVE_5LEVEL: u64 = 0xFF00_0000_0000_0000;
 
 /// Validate that a [`KernelOpTarget::Direct`] target's KVA range is
 /// inside the direct-map region `[page_offset, page_offset + dram_size)`.
@@ -126,7 +127,7 @@ const KERNEL_HALF_THRESHOLD: u64 = 0xFF00_0000_0000_0000;
 /// to a huge PA that the downstream `write_scalar`/`read_scalar`
 /// silently no-ops on (per `src/monitor/reader.rs:639-687`). A KVA
 /// past `page_offset + dram_size` similarly wraps the bounds check.
-/// Either case is a silent-data-loss path the [`KERNEL_HALF_THRESHOLD`]
+/// Either case is a silent-data-loss path the [`KERNEL_HALF_CONSERVATIVE_5LEVEL`]
 /// alone cannot catch.
 ///
 /// Caller derives `len` from the value width (U32=4, U64=8,
@@ -171,7 +172,7 @@ fn validate_direct_target(
 /// the right band ("below kernel-half threshold") rather than
 /// "page unmapped".
 fn validate_kva_target(kva: u64, len: u64) -> Result<(), String> {
-    if kva < KERNEL_HALF_THRESHOLD {
+    if kva < KERNEL_HALF_CONSERVATIVE_5LEVEL {
         return Err(user_half_kva_rejection_reason(kva));
     }
     let _ = kva.checked_add(len).ok_or_else(|| {
@@ -189,7 +190,7 @@ fn validate_kva_target(kva: u64, len: u64) -> Result<(), String> {
 pub(super) fn user_half_kva_rejection_reason(kva: u64) -> String {
     format!(
         "Kva={kva:#x} below kernel-half 5-level conservative threshold \
-         {KERNEL_HALF_THRESHOLD:#x}; use Symbol target or a KVA in the \
+         {KERNEL_HALF_CONSERVATIVE_5LEVEL:#x}; use Symbol target or a KVA in the \
          kernel address space"
     )
 }
@@ -321,7 +322,7 @@ fn dispatch_one_write(
         }
 
         // Vmalloc/vmap writes (page-table walked; Option on unmapped)
-        // — validate against KERNEL_HALF_THRESHOLD (loose 5-level
+        // — validate against KERNEL_HALF_CONSERVATIVE_5LEVEL (loose 5-level
         // conservative bound; page-walk catches non-canonical-hole
         // + unmapped via Option::None safety net).
         (KernelOpTarget::Kva(kva), KernelOpValue::U32(v)) => {
@@ -405,7 +406,7 @@ fn dispatch_one_read(
             ))
         }
 
-        // Vmalloc/vmap reads — validate against KERNEL_HALF_THRESHOLD
+        // Vmalloc/vmap reads — validate against KERNEL_HALF_CONSERVATIVE_5LEVEL
         // (page-walk safety net handles non-canonical-hole + unmapped).
         (KernelOpTarget::Kva(kva), KernelOpValue::U32(_)) => {
             validate_kva_target(*kva, 4)?;
@@ -508,6 +509,33 @@ fn error_reply(request_id: u32, reason: String) -> KernelOpReplyPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vmm::x86_64::msr_kaslr::KERNEL_HALF_CANONICAL_4LEVEL;
+
+    /// Disambiguation invariant pin. The 5-level conservative threshold
+    /// must be PERMISSIVELY LOWER than the 4-level canonical strict
+    /// boundary — any address that satisfies the 4-level canonical
+    /// check also passes the looser 5-level guard, so KASLR-on builds
+    /// that use 5-level paging direct-map / vmalloc / vmemmap KVAs
+    /// (which sit below the 4-level threshold but above the 5-level
+    /// one) are accepted by [`validate_kva_target`] without
+    /// false-rejection. A regression that flipped either value would
+    /// silently break dispatch.rs's kernel-text canonical check OR
+    /// make kernel_op_dispatch.rs over-permissive.
+    #[test]
+    fn kernel_half_consts_5level_below_4level() {
+        assert!(
+            KERNEL_HALF_CONSERVATIVE_5LEVEL < KERNEL_HALF_CANONICAL_4LEVEL,
+            "5-level threshold must be permissively lower than 4-level \
+             canonical (5L={KERNEL_HALF_CONSERVATIVE_5LEVEL:#x}, \
+             4L={KERNEL_HALF_CANONICAL_4LEVEL:#x})",
+        );
+        assert_ne!(
+            KERNEL_HALF_CONSERVATIVE_5LEVEL,
+            KERNEL_HALF_CANONICAL_4LEVEL,
+            "constants must be distinct values (collapsing to one would \
+             defeat the purpose of the split rename)",
+        );
+    }
 
     /// Under-cap reasons pass through unchanged.
     #[test]
@@ -753,19 +781,19 @@ mod tests {
 
     // ---- KVA validation tests ----
 
-    /// T62.1 — boundary inclusive: KVA at exactly KERNEL_HALF_THRESHOLD
+    /// T62.1 — boundary inclusive: KVA at exactly KERNEL_HALF_CONSERVATIVE_5LEVEL
     /// is accepted. Regression guard against off-by-one flipping
     /// the `<` to `<=` (which would reject the canonical bound).
     #[test]
     fn validate_kva_target_accepts_exact_threshold() {
-        assert!(validate_kva_target(KERNEL_HALF_THRESHOLD, 4).is_ok());
+        assert!(validate_kva_target(KERNEL_HALF_CONSERVATIVE_5LEVEL, 4).is_ok());
     }
 
     /// T62.2 — boundary exclusive: KVA one below threshold rejects.
     /// Pins the rejection-side off-by-one symmetric with T62.1.
     #[test]
     fn validate_kva_target_rejects_one_below_threshold() {
-        let kva = KERNEL_HALF_THRESHOLD - 1;
+        let kva = KERNEL_HALF_CONSERVATIVE_5LEVEL - 1;
         let err = validate_kva_target(kva, 4).expect_err("must reject");
         assert!(
             err.contains(&format!("{kva:#x}")),
@@ -824,7 +852,7 @@ mod tests {
         // operator-actionable suggestion. A regression to the wrong
         // bound or dropped rejection surfaces.
         assert!(helper_reason.contains(&format!("{kva:#x}")));
-        assert!(helper_reason.contains(&format!("{KERNEL_HALF_THRESHOLD:#x}")));
+        assert!(helper_reason.contains(&format!("{KERNEL_HALF_CONSERVATIVE_5LEVEL:#x}")));
         assert!(helper_reason.contains("kernel-half"));
         assert!(helper_reason.contains("5-level conservative"));
         assert!(helper_reason.contains("Symbol target"));

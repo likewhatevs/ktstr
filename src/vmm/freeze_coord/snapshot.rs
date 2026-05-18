@@ -28,6 +28,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 use super::super::vcpu::{ImmediateExitHandle, WatchpointArm, vcpu_signal};
 use super::state::SnapshotRequest;
+use crate::vmm::x86_64::msr_kaslr::KERNEL_HALF_CANONICAL_4LEVEL;
 
 /// Frame a `MSG_TYPE_SNAPSHOT_REPLY` TLV — header (16 bytes) plus
 /// [`crate::vmm::wire::SnapshotReplyPayload`] (72 bytes) — into a
@@ -273,7 +274,8 @@ pub(super) fn arm_user_watchpoint(
     let kva = link_kva.wrapping_add(kaslr_offset);
     // Silent-misfire detection: when `kaslr_offset == 0` AND the
     // resolved `link_kva` is in the x86_64 kernel high-half
-    // (canonical-space addresses start at `0xffff_8000_0000_0000`
+    // (canonical-space addresses start at [`KERNEL_HALF_CANONICAL_4LEVEL`]
+    // = `0xffff_8000_0000_0000`
     // per Documentation/arch/x86/x86_64/mm.rst, where the guard
     // hole / hypervisor mapping ends and kernel mappings begin),
     // the watchpoint arms at the link-time address. Under
@@ -296,7 +298,7 @@ pub(super) fn arm_user_watchpoint(
     // fixtures stay silent) from "zero against a kernel-text-
     // looking symbol" (operator-visible signal).
     //
-    // Arch caveats: the `0xffff_8000_0000_0000` threshold is the
+    // Arch caveats: the [`KERNEL_HALF_CANONICAL_4LEVEL`] threshold is the
     // x86_64 canonical-space lower bound (Documentation/arch/
     // x86/x86_64/mm.rst). arm64 layouts differ — VA_BITS=48 puts
     // PAGE_OFFSET at `0xffff_0000_0000_0000` (memory.rst L52), so
@@ -311,7 +313,7 @@ pub(super) fn arm_user_watchpoint(
     // process. The first arm fires the warn, every subsequent
     // arm against the same symbol/KVA stays silent — operators
     // get the signal without log spam dominating a CI run.
-    if kaslr_offset == 0 && link_kva >= 0xffff_8000_0000_0000 {
+    if kaslr_offset == 0 && link_kva >= KERNEL_HALF_CANONICAL_4LEVEL {
         // Process-wide one-shot tracker keyed on `(symbol,
         // link_kva)`. Insertion returns `true` only the first
         // time the pair appears; subsequent arms are silent.
@@ -863,7 +865,7 @@ mod arm_user_watchpoint_tests {
     //!   * Slot reuse: clearing `request_kva` to 0 (the
     //!     coordinator's reset path on a slot fire) makes the
     //!     slot available again on the next arm.
-    use super::{VmlinuxSymbolCache, arm_user_watchpoint};
+    use super::{KERNEL_HALF_CANONICAL_4LEVEL, VmlinuxSymbolCache, arm_user_watchpoint};
     use crate::vmm::vcpu::WatchpointArm;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1236,7 +1238,7 @@ mod arm_user_watchpoint_tests {
 
     /// arm_user_watchpoint logs a `tracing::warn!` when
     /// `kaslr_offset == 0` AND `link_kva` is in the kernel
-    /// high-half (`>= 0xffff_8000_0000_0000`) — the silent-
+    /// high-half (`>= KERNEL_HALF_CANONICAL_4LEVEL`) — the silent-
     /// misfire detection path. Without the warn,
     /// `Op::WatchSnapshot` against a kernel-text symbol under
     /// `CONFIG_RANDOMIZE_BASE=y` would arm at the link-time KVA
@@ -1293,7 +1295,7 @@ mod arm_user_watchpoint_tests {
     }
 
     /// arm_user_watchpoint logs the warn at the EXACT high-half
-    /// boundary (`link_kva == 0xffff_8000_0000_0000`) — the check
+    /// boundary (`link_kva == KERNEL_HALF_CANONICAL_4LEVEL`) — the check
     /// uses `>=` (inclusive). A regression that flipped to `>`
     /// (exclusive) would silently disable the warn for any
     /// symbol resolving exactly to the boundary. Pin the
@@ -1304,8 +1306,9 @@ mod arm_user_watchpoint_tests {
         let wp = Arc::new(WatchpointArm::new().unwrap());
         // Boundary KVA must still be 4-byte aligned (the
         // alignment check at the function tail enforces this);
-        // 0xffff_8000_0000_0000 is 16-byte aligned.
-        let cache = cache_with("test_sym_boundary", 0xffff_8000_0000_0000u64);
+        // KERNEL_HALF_CANONICAL_4LEVEL (= 0xffff_8000_0000_0000) is
+        // 16-byte aligned.
+        let cache = cache_with("test_sym_boundary", KERNEL_HALF_CANONICAL_4LEVEL);
         let bsp_alive = dead_bsp();
         // Arm at exactly the boundary. The kva==0 reject only
         // fires when link_kva + kaslr_offset == 0 — that's not
