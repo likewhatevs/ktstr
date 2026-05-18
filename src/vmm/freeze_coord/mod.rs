@@ -8,6 +8,7 @@
 //! Reopens [`impl KtstrVm`](super::KtstrVm) so the canonical struct
 //! definition stays in [`super`].
 
+mod gate;
 mod kernel_op_dispatch;
 
 use anyhow::{Context, Result};
@@ -6379,32 +6380,35 @@ impl KtstrVm {
                             });
                             continue;
                         }
-                        if freeze_coord_on_demand_in_flight
-                            .swap(true, Ordering::AcqRel)
-                        {
-                            // A user-watchpoint capture is already
-                            // in flight (or a prior iteration
-                            // somehow left the gate set). Reply
-                            // ERR rather than let the guest block
-                            // its full 30 s deadline; the test
-                            // can retry once the in-flight
-                            // capture completes.
-                            let reply = frame_snapshot_reply(
-                                request_id,
-                                crate::vmm::wire::SNAPSHOT_STATUS_ERR,
-                                "another snapshot capture is in flight; retry",
-                            );
-                            freeze_coord_virtio_con
-                                .lock()
-                                .queue_input_port1(&reply);
-                            tracing::warn!(
-                                request_id,
-                                %tag,
-                                kind,
-                                "freeze-coord: snapshot request rejected (in-flight gate held)"
-                            );
-                            continue;
-                        }
+                        let _gate_guard = match gate::OnDemandGateGuard::try_acquire(
+                            &freeze_coord_on_demand_in_flight,
+                        ) {
+                            Some(g) => g,
+                            None => {
+                                // A user-watchpoint capture is already
+                                // in flight (or a prior iteration
+                                // somehow left the gate set). Reply
+                                // ERR rather than let the guest block
+                                // its full 30 s deadline; the test
+                                // can retry once the in-flight
+                                // capture completes.
+                                let reply = frame_snapshot_reply(
+                                    request_id,
+                                    crate::vmm::wire::SNAPSHOT_STATUS_ERR,
+                                    "another snapshot capture is in flight; retry",
+                                );
+                                freeze_coord_virtio_con
+                                    .lock()
+                                    .queue_input_port1(&reply);
+                                tracing::warn!(
+                                    request_id,
+                                    %tag,
+                                    kind,
+                                    "freeze-coord: snapshot request rejected (in-flight gate held)"
+                                );
+                                continue;
+                            }
+                        };
                         match kind {
                             crate::vmm::wire::SNAPSHOT_KIND_CAPTURE => {
                                 tracing::info!(
@@ -6589,8 +6593,6 @@ impl KtstrVm {
                                         "freeze-coord: TLV WATCH deferred \
                                          (kaslr_offset not yet resolved)"
                                     );
-                                    freeze_coord_on_demand_in_flight
-                                        .store(false, Ordering::Release);
                                     capture_requests_deferred.push(SnapshotRequest {
                                         request_id,
                                         kind,
@@ -6708,8 +6710,6 @@ impl KtstrVm {
                                     .queue_input_port1(&reply);
                             }
                         }
-                        freeze_coord_on_demand_in_flight
-                            .store(false, Ordering::Release);
                     }
 
                     // Cold-path Op handler — wire-up landed; freeze +
@@ -6743,53 +6743,60 @@ impl KtstrVm {
                     let pending_kernel_ops = std::mem::take(&mut kernel_op_requests_pending);
                     for req in pending_kernel_ops {
                         // Per-iteration `on_demand_in_flight` gate
-                        // acquire (phd F3): ColdOp dispatch must NOT
-                        // race a concurrent CAPTURE / periodic /
-                        // user-watchpoint rendezvous. Same pattern as
-                        // the snapshot capture sites at the TLV
-                        // CAPTURE (L6363+drift) and periodic (L6946+
-                        // drift) call sites. If the gate is already
-                        // held, reply ERR rather than block — caller
-                        // can re-queue via the host TLV layer.
-                        if freeze_coord_on_demand_in_flight
-                            .swap(true, Ordering::AcqRel)
-                        {
-                            let reply = crate::vmm::wire::KernelOpReplyPayload {
-                                request_id: req.request_id,
-                                success: false,
-                                reason:
-                                    "freeze-coord: on_demand_in_flight gate held; ColdOp deferred; retry"
-                                        .to_string(),
-                                read_values: Vec::new(),
-                            };
-                            match frame_kernel_op_reply(&reply) {
-                                Ok(frame) => {
-                                    freeze_coord_virtio_con
-                                        .lock()
-                                        .queue_input_port1(&frame);
-                                    tracing::warn!(
-                                        request_id = req.request_id,
-                                        tag = %req.tag,
-                                        "freeze-coord: KernelOpRequest rejected \
-                                         (in-flight gate held)"
-                                    );
+                        // acquire: ColdOp dispatch must NOT race a
+                        // concurrent CAPTURE / periodic /
+                        // user-watchpoint rendezvous. Same RAII guard
+                        // pattern as the snapshot capture sites at
+                        // the TLV CAPTURE and periodic call sites.
+                        // If the gate is already held, reply ERR
+                        // rather than block — caller can re-queue
+                        // via the host TLV layer.
+                        let _gate_guard = match gate::OnDemandGateGuard::try_acquire(
+                            &freeze_coord_on_demand_in_flight,
+                        ) {
+                            Some(g) => g,
+                            None => {
+                                let reply = crate::vmm::wire::KernelOpReplyPayload {
+                                    request_id: req.request_id,
+                                    success: false,
+                                    reason:
+                                        "freeze-coord: on_demand_in_flight gate held; ColdOp deferred; retry"
+                                            .to_string(),
+                                    read_values: Vec::new(),
+                                };
+                                match frame_kernel_op_reply(&reply) {
+                                    Ok(frame) => {
+                                        freeze_coord_virtio_con
+                                            .lock()
+                                            .queue_input_port1(&frame);
+                                        tracing::warn!(
+                                            request_id = req.request_id,
+                                            tag = %req.tag,
+                                            "freeze-coord: KernelOpRequest rejected \
+                                             (in-flight gate held)"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            request_id = req.request_id,
+                                            tag = %req.tag,
+                                            error = %e,
+                                            "freeze-coord: KernelOpReply postcard serialize failed \
+                                             (gate-held branch); guest will see transport timeout"
+                                        );
+                                    }
                                 }
-                                Err(e) => {
-                                    tracing::error!(
-                                        request_id = req.request_id,
-                                        tag = %req.tag,
-                                        error = %e,
-                                        "freeze-coord: KernelOpReply postcard serialize failed \
-                                         (gate-held branch); guest will see transport timeout"
-                                    );
-                                }
+                                continue;
                             }
-                            continue;
-                        }
-                        // Gate acquired. Invoke the freeze rendezvous +
-                        // dispatcher; thaw after; clear gate AFTER
-                        // thaw per phd F3 + adversary F18 panic-safety
-                        // ordering. The closure body's V4 split returns
+                        };
+                        // Gate held (RAII `_gate_guard` above). Invoke
+                        // the freeze rendezvous + dispatcher; thaw
+                        // after; the guard's `Drop` releases the gate
+                        // when this for-loop iteration's scope exits.
+                        // Panic-safe by construction: a panic in any of
+                        // the framing / serialize calls below unwinds
+                        // through `Drop` so the gate clears even on
+                        // unwind. The closure body's V4 split returns
                         // FreezeOutcome::KernelOp(reply) for ColdOp
                         // mode; V5 !all_parked ColdOp arm builds an
                         // error reply with rendezvous-timeout context.
@@ -6801,8 +6808,6 @@ impl KtstrVm {
                             FreezeMode::ColdOp(&req),
                         );
                         thaw_and_barrier();
-                        freeze_coord_on_demand_in_flight
-                            .store(false, Ordering::Release);
                         let reply = match outcome {
                             FreezeOutcome::KernelOp(reply) => reply,
                             FreezeOutcome::Captured(_, _)
@@ -6933,24 +6938,27 @@ impl KtstrVm {
                                 if freeze_coord_kill.load(Ordering::Acquire) {
                                     break;
                                 }
-                                if freeze_coord_on_demand_in_flight
-                                    .swap(true, Ordering::AcqRel)
-                                {
-                                    // Gate held — defer (do NOT
-                                    // skip): leave next_periodic_idx
-                                    // as-is so the next iteration
-                                    // retries this same boundary
-                                    // once the gate clears.
-                                    tracing::info!(
-                                        target: "ktstr::failure_dump",
-                                        idx = next_periodic_idx,
-                                        tag = %periodic_tag(next_periodic_idx),
-                                        "freeze-coord: periodic snapshot deferred \
-                                         (in-flight gate held by another capture); \
-                                         retrying next iteration"
-                                    );
-                                    break;
-                                }
+                                let _gate_guard = match gate::OnDemandGateGuard::try_acquire(
+                                    &freeze_coord_on_demand_in_flight,
+                                ) {
+                                    Some(g) => g,
+                                    None => {
+                                        // Gate held — defer (do NOT
+                                        // skip): leave next_periodic_idx
+                                        // as-is so the next iteration
+                                        // retries this same boundary
+                                        // once the gate clears.
+                                        tracing::info!(
+                                            target: "ktstr::failure_dump",
+                                            idx = next_periodic_idx,
+                                            tag = %periodic_tag(next_periodic_idx),
+                                            "freeze-coord: periodic snapshot deferred \
+                                             (in-flight gate held by another capture); \
+                                             retrying next iteration"
+                                        );
+                                        break;
+                                    }
+                                };
                                 let tag = periodic_tag(next_periodic_idx);
                                 tracing::info!(
                                     target: "ktstr::failure_dump",
@@ -7178,8 +7186,6 @@ impl KtstrVm {
                                     }
                                     FreezeOutcome::KernelOp(_) => capture_only_unreachable!(),
                                 }
-                                freeze_coord_on_demand_in_flight
-                                    .store(false, Ordering::Release);
                                 next_periodic_idx =
                                     next_periodic_idx.saturating_add(1);
                                 // Publish the live fire count so
@@ -7247,44 +7253,47 @@ impl KtstrVm {
                             .tag
                             .lock_unpoisoned()
                             .clone();
-                        if freeze_coord_on_demand_in_flight
-                            .swap(true, Ordering::AcqRel)
-                        {
-                            // A capture is already in flight (e.g.
-                            // a CAPTURE-class TLV request still
-                            // holds the gate). Re-arm the slot's
-                            // hit flag so a subsequent iteration
-                            // services it, and write a fresh
-                            // `hit_evt` edge so the outer
-                            // `epoll.wait` wakes promptly — the
-                            // hit_evt drain at the top of this
-                            // iteration consumed the original wake,
-                            // and without a new edge the re-armed
-                            // hit could sit for the full
-                            // POLL_TIMEOUT_MS before re-inspection.
-                            // `continue` (rather than `break`) so
-                            // OTHER slots in the same iteration
-                            // still get checked — each slot's
-                            // `hit` is independent (per-slot
-                            // hardware watchpoint dispatch), so a
-                            // gate-blocked slot N must not strand
-                            // an unrelated fire on slot N+1
-                            // waiting for the next iteration's
-                            // wake. The outer loop's next iteration
-                            // re-evaluates the gate and either
-                            // services the re-armed slot or hits
-                            // the same in-flight branch and
-                            // re-arms again — bounded by the
-                            // single-threaded freeze coordinator's
-                            // serial dispatch of CAPTURE/WATCH,
-                            // which always clears the gate before
-                            // returning here.
-                            freeze_coord_watchpoint.user[slot_idx]
-                                .hit
-                                .store(true, Ordering::Release);
-                            let _ = freeze_coord_watchpoint.hit_evt.write(1);
-                            continue;
-                        }
+                        let _gate_guard = match gate::OnDemandGateGuard::try_acquire(
+                            &freeze_coord_on_demand_in_flight,
+                        ) {
+                            Some(g) => g,
+                            None => {
+                                // A capture is already in flight (e.g.
+                                // a CAPTURE-class TLV request still
+                                // holds the gate). Re-arm the slot's
+                                // hit flag so a subsequent iteration
+                                // services it, and write a fresh
+                                // `hit_evt` edge so the outer
+                                // `epoll.wait` wakes promptly — the
+                                // hit_evt drain at the top of this
+                                // iteration consumed the original wake,
+                                // and without a new edge the re-armed
+                                // hit could sit for the full
+                                // POLL_TIMEOUT_MS before re-inspection.
+                                // `continue` (rather than `break`) so
+                                // OTHER slots in the same iteration
+                                // still get checked — each slot's
+                                // `hit` is independent (per-slot
+                                // hardware watchpoint dispatch), so a
+                                // gate-blocked slot N must not strand
+                                // an unrelated fire on slot N+1
+                                // waiting for the next iteration's
+                                // wake. The outer loop's next iteration
+                                // re-evaluates the gate and either
+                                // services the re-armed slot or hits
+                                // the same in-flight branch and
+                                // re-arms again — bounded by the
+                                // single-threaded freeze coordinator's
+                                // serial dispatch of CAPTURE/WATCH,
+                                // which always clears the gate before
+                                // returning here.
+                                freeze_coord_watchpoint.user[slot_idx]
+                                    .hit
+                                    .store(true, Ordering::Release);
+                                let _ = freeze_coord_watchpoint.hit_evt.write(1);
+                                continue;
+                            }
+                        };
                         tracing::info!(
                             slot_idx,
                             %tag,
@@ -7425,18 +7434,15 @@ impl KtstrVm {
                         // `Acquire` in `arm_user_watchpoint`'s free-slot
                         // search and the per-vCPU `self_arm_watchpoint`
                         // load.
-                        // F18 panic-safety reorder: gate clear MUST
-                        // precede per-slot cleanup. If `tag_guard.clear()`
-                        // or `lock_unpoisoned()` panics, the
-                        // `freeze_coord_on_demand_in_flight=true` state
-                        // would otherwise be stuck for the rest of the
-                        // run — every future TLV CAPTURE / periodic /
-                        // user-watchpoint / ColdOp dispatch would
-                        // reject on the gate-held check, permanently
-                        // deadlocking the coordinator. Comprehensive
-                        // RAII guard pattern in #66.
-                        freeze_coord_on_demand_in_flight
-                            .store(false, Ordering::Release);
+                        //
+                        // Panic-safety: per-slot cleanup runs while
+                        // `_gate_guard` is still alive. A panic in
+                        // `lock_unpoisoned()` or `tag_guard.clear()`
+                        // unwinds through the guard's `Drop`, which
+                        // clears the gate before unwinding out of
+                        // the slot scope. Closes the deadlock-on-
+                        // panic class (see [`gate::OnDemandGateGuard`]
+                        // module doc).
                         {
                             let mut tag_guard = freeze_coord_watchpoint
                                 .user[slot_idx]
@@ -8331,10 +8337,10 @@ impl KtstrVm {
                 //
                 //   1. The "already in flight" branch in the
                 //      hot-path for-loop re-arms the slot's `hit`
-                //      and `break`s when `on_demand_in_flight` is
-                //      true on entry. If kill / bsp_done flips
-                //      before the next iteration runs, the
-                //      re-armed hit is never serviced.
+                //      and `continue`s to the next slot when the
+                //      gate is held on entry. If kill / bsp_done
+                //      flips before the next outer iteration runs,
+                //      the re-armed hit is never serviced.
                 //   2. A vCPU's `latch_user_hit` Release that
                 //      raced the loop exit (kill flipped between
                 //      the for-loop terminating and the next
