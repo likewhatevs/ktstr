@@ -276,3 +276,202 @@ fn scenario_stats_known_metrics_iterates_registry() {
         );
     }
 }
+
+// -- build_phase_buckets pipeline tests ------------------------------
+//
+// These tests construct synthetic `SampleSeries`'s with explicit
+// `step_index` stamping and run them through `build_phase_buckets`
+// end-to-end to verify the bucket-shape contract:
+// * one bucket per observed step_index
+// * label encodes the 1-indexed convention (`BASELINE` /
+//   `Step[k-1]`)
+// * start_ms / end_ms span first..last sample in the bucket
+// * sample_count matches the input count
+//
+// Metric population is exercised separately at the
+// per-metric-arm tests in `src/stats.rs`; these tests verify the
+// bucketing skeleton independent of metric data.
+
+use crate::monitor::dump::{FailureDumpReport, SCHEMA_SINGLE};
+use crate::scenario::sample::SampleSeries;
+use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+
+/// Build a minimal `FailureDumpReport` placeholder for tests.
+/// Carries no BPF state — `MetricDef::read_sample` returns `None`
+/// for every metric on this report, so the resulting
+/// `PhaseBucket.metrics` map is empty. The test exercises the
+/// bucketing shape, not the metric extraction.
+fn fixture_report() -> FailureDumpReport {
+    FailureDumpReport {
+        schema: SCHEMA_SINGLE.to_string(),
+        ..Default::default()
+    }
+}
+
+/// Build a synthetic `DrainedSnapshotEntry` with the given
+/// `step_index` stamp and `elapsed_ms` anchor.
+fn fixture_entry(tag: &str, step_index: u16, elapsed_ms: u64) -> DrainedSnapshotEntry {
+    DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(elapsed_ms),
+        step_index: Some(step_index),
+    }
+}
+
+/// Empty `SampleSeries` -> empty `phases` vec. No BASELINE
+/// bucket is synthesised from nothing; the aggregator yields
+/// the empty shape so the renderer downstream can paint the
+/// "no per-phase data" path correctly (distinct from "BASELINE
+/// existed but had no metrics").
+#[test]
+fn build_phase_buckets_empty_series_yields_empty_phases() {
+    let samples = SampleSeries::from_drained_typed(Vec::new(), None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    assert!(
+        phases.is_empty(),
+        "empty input must yield empty phases, got {phases:?}"
+    );
+}
+
+/// Three samples all stamped under BASELINE (`step_index = 0`)
+/// produce a single PhaseBucket with `label = "BASELINE"`,
+/// `sample_count = 3`, and start/end_ms spanning the first/last
+/// sample's elapsed_ms. Pins the BASELINE label convention.
+#[test]
+fn build_phase_buckets_baseline_only_yields_single_bucket() {
+    let drained = vec![
+        fixture_entry("periodic_000", 0, 100),
+        fixture_entry("periodic_001", 0, 200),
+        fixture_entry("periodic_002", 0, 300),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    assert_eq!(phases.len(), 1, "single phase observed -> single bucket");
+    let bucket = &phases[0];
+    assert_eq!(bucket.step_index, 0);
+    assert_eq!(bucket.label, "BASELINE");
+    assert_eq!(bucket.sample_count, 3);
+    assert_eq!(bucket.start_ms, 100);
+    assert_eq!(bucket.end_ms, 300);
+    assert!(
+        bucket.metrics.is_empty(),
+        "synthetic fixture report carries no BPF state -> metrics empty"
+    );
+}
+
+/// Three phases (BASELINE + Step[0] + Step[1]) round-trip
+/// correctly: 3 buckets emitted in step_index order, labels are
+/// "BASELINE" / "Step[0]" / "Step[1]" per the 1-indexed
+/// convention (scenario Step k lives at step_index k+1), each
+/// bucket counts its own samples, start/end_ms spans the
+/// bucket's window.
+#[test]
+fn build_phase_buckets_three_phases_round_trip_with_correct_labels() {
+    let drained = vec![
+        fixture_entry("periodic_000", 0, 10), // BASELINE
+        fixture_entry("periodic_001", 0, 20), // BASELINE
+        fixture_entry("periodic_002", 1, 100), // Step[0]
+        fixture_entry("periodic_003", 1, 200), // Step[0]
+        fixture_entry("periodic_004", 1, 300), // Step[0]
+        fixture_entry("periodic_005", 2, 400), // Step[1]
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    assert_eq!(phases.len(), 3);
+
+    // Buckets returned in step_index order because SampleSeries::by_phase
+    // returns a BTreeMap keyed by step_index.
+    assert_eq!(phases[0].step_index, 0);
+    assert_eq!(phases[0].label, "BASELINE");
+    assert_eq!(phases[0].sample_count, 2);
+    assert_eq!(phases[0].start_ms, 10);
+    assert_eq!(phases[0].end_ms, 20);
+
+    assert_eq!(phases[1].step_index, 1);
+    assert_eq!(phases[1].label, "Step[0]");
+    assert_eq!(phases[1].sample_count, 3);
+    assert_eq!(phases[1].start_ms, 100);
+    assert_eq!(phases[1].end_ms, 300);
+
+    assert_eq!(phases[2].step_index, 2);
+    assert_eq!(phases[2].label, "Step[1]");
+    assert_eq!(phases[2].sample_count, 1);
+    // Single sample in the bucket: start_ms == end_ms.
+    assert_eq!(phases[2].start_ms, 400);
+    assert_eq!(phases[2].end_ms, 400);
+}
+
+/// Unstamped samples (DrainedSnapshotEntry.step_index = None)
+/// fall under key `0` per SampleSeries::by_phase's
+/// "no stamped index" fallback. The resulting bucket is
+/// labelled "BASELINE" because step_index = 0 is the BASELINE
+/// encoding regardless of whether the original stamp was Some(0)
+/// or None. Pins the fallback semantic — fixture / legacy /
+/// pre-step_index samples don't disappear, they cluster into
+/// BASELINE.
+#[test]
+fn build_phase_buckets_unstamped_samples_cluster_under_baseline() {
+    let unstamped = DrainedSnapshotEntry {
+        tag: "periodic_000".to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(50),
+        step_index: None,
+    };
+    let samples = SampleSeries::from_drained_typed(vec![unstamped], None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    assert_eq!(phases.len(), 1);
+    assert_eq!(phases[0].step_index, 0);
+    assert_eq!(phases[0].label, "BASELINE");
+    assert_eq!(phases[0].sample_count, 1);
+}
+
+/// Non-contiguous step_index sequence (BASELINE + Step[2],
+/// skipping Step[0] and Step[1]) yields exactly the observed
+/// phases — the aggregator does not synthesise empty buckets
+/// for skipped Step ordinals. A test author whose scenario
+/// somehow produced a sparse step_index sequence sees the sparse
+/// shape on the output, not a fictitious dense fill.
+#[test]
+fn build_phase_buckets_skipped_steps_yield_sparse_output() {
+    let drained = vec![
+        fixture_entry("periodic_000", 0, 10),
+        fixture_entry("periodic_001", 3, 500), // Step[2]
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    assert_eq!(phases.len(), 2);
+    assert_eq!(phases[0].step_index, 0);
+    assert_eq!(phases[1].step_index, 3);
+    assert_eq!(phases[1].label, "Step[2]");
+}
+
+/// `ScenarioStats::phase` lookup against the phases built by
+/// `build_phase_buckets` returns the bucket whose step_index
+/// matches, not by vec position. Confirms the integration
+/// between the aggregator output and the accessor surface from
+/// step 1.
+#[test]
+fn build_phase_buckets_integration_with_scenario_stats_phase_accessor() {
+    let drained = vec![
+        fixture_entry("periodic_000", 0, 10),
+        fixture_entry("periodic_001", 1, 100),
+        fixture_entry("periodic_002", 2, 200),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let stats = ScenarioStats {
+        phases,
+        ..Default::default()
+    };
+    assert_eq!(stats.phase(0).map(|p| p.label.as_str()), Some("BASELINE"));
+    assert_eq!(stats.phase(1).map(|p| p.label.as_str()), Some("Step[0]"));
+    assert_eq!(stats.phase(2).map(|p| p.label.as_str()), Some("Step[1]"));
+    assert_eq!(stats.phase(3), None);
+    // `step(0)` is the scenario-side 0-indexed accessor: maps to
+    // phase index 1 (scenario Step 0 lives at step_index 1).
+    assert_eq!(stats.step(0).map(|p| p.label.as_str()), Some("Step[0]"));
+    assert_eq!(stats.step(1).map(|p| p.label.as_str()), Some("Step[1]"));
+}
