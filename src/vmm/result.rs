@@ -277,6 +277,23 @@ pub struct VmResult {
     ///
     /// Always present after a successful `run_vm`; `None`-equivalent
     /// (empty) when the VM crashed before any snapshot fired.
+    ///
+    /// **Drained by `evaluate_vm_result`**: the framework's
+    /// [`crate::test_support::eval`] path drains this bridge to
+    /// auto-populate [`crate::assert::ScenarioStats::phases`]
+    /// before returning the AssertResult. A `post_vm` callback or
+    /// any code path that runs THROUGH `evaluate_vm_result`
+    /// observes an empty bridge here — the periodic captures the
+    /// drain consumed are recovered as the per-phase
+    /// [`crate::assert::PhaseBucket`] entries on
+    /// `result.stats.phases`, which is the framework-curated
+    /// equivalent surface. Integration tests under `tests/` that
+    /// bypass `evaluate_vm_result` (e.g. `tests/stats_bridge_e2e.rs`,
+    /// `tests/temporal_assertions_e2e.rs`) see the bridge intact
+    /// because their entry path never reaches the auto-populate
+    /// site; those consumers continue to call
+    /// `result.snapshot_bridge.drain*()` directly without
+    /// observable contract change.
     pub snapshot_bridge: crate::scenario::snapshot::SnapshotBridge,
     /// Live scheduler-stats client. `Some(_)` when the run wired the
     /// virtio-console port-2 stats bridge (the in-tree path always

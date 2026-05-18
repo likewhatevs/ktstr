@@ -175,14 +175,13 @@ pub enum GaugeAgg {
 ///   - `Peak` → max of finite samples.
 ///   - `Timestamp` → last finite sample.
 ///
-/// Live caller (added alongside this fn but the production wire-in
-/// is staged): [`aggregate_samples_for_phase`] dispatches every
+/// Live caller: [`aggregate_samples_for_phase`] dispatches every
 /// non-Counter kind through this entry point so the per-phase
 /// reduction inherits the flat-run semantic for Gauge / Peak /
-/// Timestamp without restating it. The `dead_code` allow is
-/// removed once the host-side stats-population path consumes
-/// `build_phase_buckets` (which folds `aggregate_samples_for_phase`).
-#[allow(dead_code)]
+/// Timestamp without restating it. That fn is itself folded by
+/// [`crate::assert::build_phase_buckets`] whose live caller is
+/// the host-side `evaluate_vm_result` AssertResult-population
+/// site at `src/test_support/eval.rs`.
 pub fn aggregate_samples(samples: &[f64], kind: MetricKind) -> Option<f64> {
     let finite: Vec<f64> = samples.iter().copied().filter(|x| x.is_finite()).collect();
     if finite.is_empty() {
@@ -218,11 +217,11 @@ pub fn aggregate_samples(samples: &[f64], kind: MetricKind) -> Option<f64> {
 /// `MetricDef::read_sample` (lands in a follow-up commit).
 /// Returns `None` when every reading was `None` / `NaN`.
 ///
-/// `dead_code` allow: pinned via in-file unit tests; the live
-/// production caller (`build_phase_buckets`) lands once the
-/// host-side stats-population path is rewired to feed per-phase
-/// `SampleSeries::by_phase` slices through this entry point.
-#[allow(dead_code)]
+/// Live caller: [`crate::assert::build_phase_buckets`] folds
+/// per-phase sample slices through this entry point and the
+/// result lands on [`crate::assert::PhaseBucket::metrics`]; the
+/// host-side `evaluate_vm_result` at `src/test_support/eval.rs`
+/// is the consumer that drives the call.
 pub fn aggregate_samples_for_phase(metric: &MetricDef, samples: &[f64]) -> Option<f64> {
     match metric.kind {
         MetricKind::Counter => phase_counter_delta(samples),
@@ -245,9 +244,8 @@ pub fn aggregate_samples_for_phase(metric: &MetricDef, samples: &[f64]) -> Optio
 ///     was observed but no per-phase change can be computed).
 ///   - 2+ finite samples -> `Some(max(0.0, last - first))`.
 ///
-/// `dead_code` allow: pinned via in-file unit tests; lives until
-/// `aggregate_samples_for_phase`'s production caller lands.
-#[allow(dead_code)]
+/// Live caller: [`aggregate_samples_for_phase`] dispatches the
+/// Counter variant through this entry point.
 pub fn phase_counter_delta(samples: &[f64]) -> Option<f64> {
     let finite: Vec<f64> = samples.iter().copied().filter(|x| x.is_finite()).collect();
     match finite.as_slice() {
@@ -309,12 +307,11 @@ impl MetricDef {
     /// bucket renderer can paint "no data" vs "real zero"
     /// distinctly without losing information.
     ///
-    /// `dead_code` allow: pinned via in-file unit tests; the
-    /// live production caller lands when the host-side
-    /// stats-population path is rewired to feed per-phase
-    /// `SampleSeries::by_phase` slices through
-    /// [`crate::assert::build_phase_buckets`].
-    #[allow(dead_code)]
+    /// Live caller: [`crate::assert::build_phase_buckets`] calls
+    /// `read_sample` once per [`crate::stats::METRICS`] entry per
+    /// sample to collect the per-sample readings the per-phase
+    /// aggregator folds. The host-side `evaluate_vm_result` at
+    /// `src/test_support/eval.rs` drives the chain.
     pub fn read_sample(&self, _sample: &crate::scenario::sample::Sample<'_>) -> Option<f64> {
         // Per-metric dispatch is staged: every registered metric
         // currently returns None (no per-sample reading available).

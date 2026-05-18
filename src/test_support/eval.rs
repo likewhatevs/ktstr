@@ -2214,6 +2214,37 @@ fn evaluate_vm_result(
             }
         }
 
+        // Auto-populate per-phase metric buckets on the returned
+        // AssertResult. Drains the snapshot bridge for periodic
+        // captures + on-demand fixture-path captures, builds a
+        // SampleSeries, and folds it through
+        // `crate::assert::build_phase_buckets` so the test author
+        // sees `result.stats.phases` populated without needing to
+        // manually stitch the snapshot drain to the metric
+        // aggregator. Single-phase scenarios with no Steps still
+        // run (the bridge may have a periodic capture or two)
+        // but yield a phases vec containing only the BASELINE
+        // bucket; the renderer is sentinel-free so an empty
+        // metrics map paints as "no data" rather than masquerading
+        // as real zeros.
+        //
+        // The bridge drain here is the framework's contract drain;
+        // an integration test that bypasses evaluate_vm_result
+        // (e.g. tests/stats_bridge_e2e.rs) still owns its own
+        // direct `result.snapshot_bridge.drain*()` call path
+        // because those tests instrument the framework rather
+        // than depending on it. Within evaluate_vm_result the
+        // drain is the final consumer.
+        let drained_for_phases =
+            result.snapshot_bridge.drain_ordered_with_stats();
+        let sample_series_for_phases =
+            crate::scenario::sample::SampleSeries::from_drained_typed(
+                drained_for_phases,
+                result.monitor.clone(),
+            );
+        check_result.stats.phases =
+            crate::assert::build_phase_buckets(&sample_series_for_phases);
+
         return Ok(check_result);
     }
 

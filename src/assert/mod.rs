@@ -1419,6 +1419,22 @@ pub struct ScenarioStats {
     /// reading, unchanged in semantics by the introduction of
     /// `phases`.
     ///
+    /// **Auto-populated by the framework**: scenarios that fire
+    /// periodic captures (via
+    /// [`crate::test_support::KtstrTestEntry::num_snapshots`] or
+    /// [`crate::scenario::ops::Op::CaptureSnapshot`]) have this
+    /// field populated automatically inside
+    /// [`crate::test_support::eval`]'s `evaluate_vm_result` —
+    /// test code never needs to call
+    /// [`crate::assert::build_phase_buckets`] manually. The auto-
+    /// populate path drains the snapshot bridge from the
+    /// [`crate::vmm::VmResult`] returned by the framework and folds
+    /// the per-sample readings through
+    /// [`crate::stats::aggregate_samples_for_phase`] per metric.
+    /// Single-phase scenarios that fire no captures leave this
+    /// `vec![]`; the flat-bucket scalars on this struct cover the
+    /// single-phase case.
+    ///
     /// See [`PhaseBucket`] for the per-phase shape.
     pub phases: Vec<PhaseBucket>,
 }
@@ -1562,12 +1578,15 @@ impl ScenarioStats {
 /// "test produced no per-phase data" differently from "test
 /// produced phase data but no readable metrics".
 ///
-/// `dead_code` allow: pinned via in-file unit tests. The live
-/// production caller lands when the host-side stats-population
-/// path in `evaluate_vm_result` is rewired to consume the
-/// drained snapshot bridge into a `SampleSeries` and stamp the
-/// resulting buckets onto `AssertResult.stats.phases`.
-#[allow(dead_code)]
+/// Live production caller:
+/// [`crate::test_support::eval`]-side `evaluate_vm_result` drains
+/// the snapshot bridge, builds a `SampleSeries`, and routes it
+/// through this fn to populate `AssertResult.stats.phases`. The
+/// fn is exposed `pub` (not `pub(crate)`) so out-of-tree consumers
+/// — payload authors writing custom eval paths against the
+/// publicly-drainable `result.snapshot_bridge` — can produce the
+/// same per-phase aggregate shape without re-implementing the
+/// bucketing logic.
 pub fn build_phase_buckets(
     samples: &crate::scenario::sample::SampleSeries,
 ) -> Vec<PhaseBucket> {
