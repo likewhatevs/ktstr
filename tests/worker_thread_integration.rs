@@ -59,12 +59,28 @@ use ktstr::workload::{
 /// basic Thread dispatch path under guest-kernel conditions:
 /// every worker publishes a non-zero gettid(), produces non-zero
 /// work_units, and reports completed=true. A regression in
-/// `spawn_thread_worker` (e.g. start-rendezvous deadlock under a
-/// low-CPU guest topology) would surface here even when the
-/// host-side `spawn_thread_clone_mode_runs_to_completion` passes.
+/// `spawn_thread_worker` (start-rendezvous bookkeeping, exit-evt
+/// signalling, stop-flag observation) would surface here even when
+/// the host-side `spawn_thread_clone_mode_runs_to_completion` passes.
+///
+/// `cores = 4` (not 2) is deliberate. SpinWait is uniquely vulnerable
+/// to vCPU saturation among the WorkType variants in this file — it
+/// has no blocking call in the worker, so two SpinWait threads
+/// happily monopolise both vCPUs of a 2-vCPU guest and starve the
+/// parent test thread + scx-ktstr monitor + scheduler runtime. The
+/// resulting flake (worker doesn't observe `stop` flag within the 5s
+/// THREAD_JOIN_TIMEOUT, reports `completed: false / TimedOut`) was a
+/// test-topology artifact, not a production bug. cores=4 gives the
+/// parent thread + monitor their own vCPUs while leaving two for the
+/// workers. Sibling `thread_integration_mutex_contention` also uses
+/// cores=4 (4 contender workers); the other two siblings
+/// (`thread_integration_futex_ping_pong`,
+/// `thread_integration_page_fault_churn`) stay at cores=2 because
+/// their workers block on futex/madvise and don't saturate vCPUs
+/// the same way.
 #[ktstr_test(
     llcs = 1,
-    cores = 2,
+    cores = 4,
     threads = 1,
     memory_mib = 1024,
     duration_s = 5,
