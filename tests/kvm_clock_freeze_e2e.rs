@@ -75,8 +75,8 @@ const KTSTR_SCHED: Scheduler =
 /// design, or BTF nested-path read of `tk_core.timekeeper.tkr_mono.base`).
 const MAX_CLOCK_ADVANCE_NS: u64 = 30_000_000_000;
 
-const TAG_T0: &str = "jiffies_t0";
-const TAG_T1: &str = "jiffies_t1";
+const TAG_T0: &str = "clock_t0";
+const TAG_T1: &str = "clock_t1";
 
 #[ktstr_test(
     scheduler = KTSTR_SCHED,
