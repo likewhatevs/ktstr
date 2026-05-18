@@ -323,39 +323,64 @@ impl Drop for CgroupGroup<'_> {
 /// - [`Self::payload`] — start a
 ///   [`PayloadRun`](crate::scenario::payload_run::PayloadRun) for a
 ///   given [`Payload`](crate::test_support::Payload).
+///
+/// # Field groups
+///
+/// Each pub field's doc is prefixed with its sub-concern label so the
+/// rustdoc table groups visibly. The six groups are:
+///
+/// - **VM environment** — `cgroups`, `topo`. The host-side
+///   filesystem + topology handles the scenario interacts with.
+/// - **Test timing** — `duration`, `settle`. The wall-clock
+///   budgets that shape every Step's hold-time math.
+/// - **Cgroup defaults** — `workers_per_cgroup`, `work_type_override`.
+///   The merge-time defaults `CgroupDef::merged_works` applies when a
+///   `WorkSpec` leaves them unset.
+/// - **Scheduler state** — `sched_pid`. Liveness-probe target for
+///   inter-step scheduler-death detection.
+/// - **Assertion policy** — `assert`. The merged
+///   default+scheduler+per-test verdict checks
+///   `run_scenario` / `execute_steps` apply.
+/// - **Runtime coordination** — `wait_for_map_write`. Framework-set
+///   gate that custom scenarios typically do not flip.
 pub struct Ctx<'a> {
-    /// Cgroup filesystem operations. `&dyn CgroupOps` (not `&CgroupManager`)
-    /// so scenario code can be driven by an in-memory test double without
-    /// touching `/sys/fs/cgroup`. Production callers pass
-    /// `&CgroupManager` and the auto-coercion is transparent at the call
-    /// site — `ctx.cgroups.set_cpuset(...)` works unchanged.
+    /// **VM environment.** Cgroup filesystem operations. `&dyn CgroupOps`
+    /// (not `&CgroupManager`) so scenario code can be driven by an
+    /// in-memory test double without touching `/sys/fs/cgroup`.
+    /// Production callers pass `&CgroupManager` and the auto-coercion
+    /// is transparent at the call site — `ctx.cgroups.set_cpuset(...)`
+    /// works unchanged.
     pub cgroups: &'a dyn crate::cgroup::CgroupOps,
-    /// VM CPU topology.
+    /// **VM environment.** VM CPU topology.
     pub topo: &'a TestTopology,
-    /// How long to run the workload.
+    /// **Test timing.** How long to run the workload.
     pub duration: Duration,
-    /// Default number of workers per cgroup.
+    /// **Cgroup defaults.** Default number of workers per cgroup.
     pub workers_per_cgroup: usize,
-    /// PID of the running scheduler (for liveness checks), or `None`
-    /// when no scheduler is attached. Stored as `Option<pid_t>` so
-    /// the "no scheduler" state is a distinct variant rather than a
-    /// 0-sentinel — `run_scenario` and step-level liveness probes
-    /// destructure via `if let Some(pid)` instead of `!= 0` guards.
+    /// **Scheduler state.** PID of the running scheduler (for liveness
+    /// checks), or `None` when no scheduler is attached. Stored as
+    /// `Option<pid_t>` so the "no scheduler" state is a distinct
+    /// variant rather than a 0-sentinel — `run_scenario` and
+    /// step-level liveness probes destructure via `if let Some(pid)`
+    /// instead of `!= 0` guards.
     pub sched_pid: Option<libc::pid_t>,
-    /// Time to wait after cgroup creation for scheduler stabilization.
+    /// **Test timing.** Time to wait after cgroup creation for
+    /// scheduler stabilization.
     pub settle: Duration,
-    /// Override work type for scenarios that use `SpinWait` by default.
+    /// **Cgroup defaults.** Override work type for scenarios that use
+    /// `SpinWait` by default.
     pub work_type_override: Option<WorkType>,
-    /// Merged assertion config (default_checks + scheduler + per-test).
-    /// Used by `run_scenario` for data-driven scenarios and by
-    /// `execute_steps` as the default when no explicit checks are
-    /// passed to `execute_steps_with`.
+    /// **Assertion policy.** Merged assertion config (default_checks +
+    /// scheduler + per-test). Used by `run_scenario` for data-driven
+    /// scenarios and by `execute_steps` as the default when no explicit
+    /// checks are passed to `execute_steps_with`.
     pub assert: crate::assert::Assert,
-    /// When true, `execute_steps` polls SHM signal slot 0 after writing
-    /// the scenario start marker, blocking until the host confirms its
-    /// BPF map write is complete. Set automatically by the framework
-    /// when a `KtstrTestEntry` declares `bpf_map_write`; custom
-    /// scenarios typically do not flip this manually.
+    /// **Runtime coordination.** When true, `execute_steps` polls SHM
+    /// signal slot 0 after writing the scenario start marker, blocking
+    /// until the host confirms its BPF map write is complete. Set
+    /// automatically by the framework when a `KtstrTestEntry` declares
+    /// `bpf_map_write`; custom scenarios typically do not flip this
+    /// manually.
     pub wait_for_map_write: bool,
 }
 

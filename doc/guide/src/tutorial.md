@@ -6,6 +6,22 @@ two cgroups with different lifecycle patterns across a multi-LLC
 topology, tunes test duration and the watchdog, and asserts
 fairness, throughput parity, and cpuset isolation.
 
+> **Already have a scheduler binary?** This tutorial teaches ktstr
+> from the ground up. If you have an existing `scx_X` you want to
+> test, jump to one of the targeted recipes instead:
+> [test-new-scheduler.md](recipes/test-new-scheduler.md) (5 minutes,
+> validates basic behavior), [ab-compare.md](recipes/ab-compare.md)
+> (compare two scheduler builds), or
+> [diagnose-slow-scheduler.md](recipes/diagnose-slow-scheduler.md)
+> (debug performance regressions).
+
+> **Need a kernel first?** Before any `#[ktstr_test]` can run you
+> need a bootable kernel. Run `cargo ktstr kernel build` to fetch
+> and build the default kernel, or use `--kernel ../linux` to point
+> at a source tree. See
+> [Getting Started: Build a kernel](getting-started.md#build-a-kernel)
+> for the full kernel-management workflow.
+
 ## What you'll build
 
 A test named `mixed_workloads` that:
@@ -57,6 +73,11 @@ fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 ```
+
+> **Try it.** Once this file compiles, run just this test with
+> `cargo ktstr test --kernel ../linux -- -E 'test(mixed_workloads)'`.
+> A bare-skeleton test passes immediately — the rest of the tutorial
+> adds the workload + assertions on top.
 
 `use ktstr::prelude::*;` brings in every type the test body needs --
 `Ctx`, `AssertResult`, `CgroupDef`, `WorkType`, `CpusetSpec`,
