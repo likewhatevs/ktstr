@@ -175,11 +175,13 @@ pub enum GaugeAgg {
 ///   - `Peak` → max of finite samples.
 ///   - `Timestamp` → last finite sample.
 ///
-/// `dead_code` allow: pinned via in-file unit tests; no
-/// production caller folds samples through this entry point yet,
-/// but the regression-comparison path that consumes
-/// [`MetricKind`] semantics will land here once the multi-snapshot
-/// gauntlet comparison ships.
+/// Live caller (added alongside this fn but the production wire-in
+/// is staged): [`aggregate_samples_for_phase`] dispatches every
+/// non-Counter kind through this entry point so the per-phase
+/// reduction inherits the flat-run semantic for Gauge / Peak /
+/// Timestamp without restating it. The `dead_code` allow is
+/// removed once the host-side stats-population path consumes
+/// `build_phase_buckets` (which folds `aggregate_samples_for_phase`).
 #[allow(dead_code)]
 pub fn aggregate_samples(samples: &[f64], kind: MetricKind) -> Option<f64> {
     let finite: Vec<f64> = samples.iter().copied().filter(|x| x.is_finite()).collect();
@@ -196,6 +198,75 @@ pub fn aggregate_samples(samples: &[f64], kind: MetricKind) -> Option<f64> {
             finite.iter().copied().fold(f64::NEG_INFINITY, f64::max)
         }
     })
+}
+
+/// Per-phase metric reduction with the correct semantic per
+/// [`MetricKind`].
+///
+/// Counter kinds bypass [`aggregate_samples`]'s flat-run `sum`
+/// (which is correct for cross-RUN aggregation, but wrong for
+/// cumulative-since-boot per-phase data — summing 10 samples at
+/// `[100, 150, 175, ...]` yields ~425 instead of the per-phase
+/// delta `175 - 100 = 75`) and route through
+/// [`phase_counter_delta`] instead. All other kinds use
+/// [`aggregate_samples`] verbatim, which is correct for them
+/// (Gauge avg/last/max, Peak max, Timestamp last).
+///
+/// `samples` are the per-Sample readings of `metric` collected
+/// over one phase's window of
+/// [`crate::scenario::sample::Sample`]s via the upcoming
+/// `MetricDef::read_sample` (lands in a follow-up commit).
+/// Returns `None` when every reading was `None` / `NaN`.
+///
+/// `dead_code` allow: pinned via in-file unit tests; the live
+/// production caller (`build_phase_buckets`) lands once the
+/// host-side stats-population path is rewired to feed per-phase
+/// `SampleSeries::by_phase` slices through this entry point.
+#[allow(dead_code)]
+pub fn aggregate_samples_for_phase(metric: &MetricDef, samples: &[f64]) -> Option<f64> {
+    match metric.kind {
+        MetricKind::Counter => phase_counter_delta(samples),
+        _ => aggregate_samples(samples, metric.kind),
+    }
+}
+
+/// Per-phase reduction for [`MetricKind::Counter`]: compute the
+/// last finite sample minus the first finite sample, clamping
+/// negative results (counter reset across a scheduler restart)
+/// to 0 and emitting a `tracing::warn!` so the reset is visible
+/// in stderr. Mirrors the existing
+/// [`crate::monitor::mod`]-side counter-delta clamp pattern used
+/// when reducing cumulative kernel counters across boundaries
+/// for the same reset-detection reason.
+///
+/// Edge cases:
+///   - 0 finite samples -> `None`.
+///   - 1 finite sample -> `Some(0.0)` (self-delta; the metric
+///     was observed but no per-phase change can be computed).
+///   - 2+ finite samples -> `Some(max(0.0, last - first))`.
+///
+/// `dead_code` allow: pinned via in-file unit tests; lives until
+/// `aggregate_samples_for_phase`'s production caller lands.
+#[allow(dead_code)]
+pub fn phase_counter_delta(samples: &[f64]) -> Option<f64> {
+    let finite: Vec<f64> = samples.iter().copied().filter(|x| x.is_finite()).collect();
+    match finite.as_slice() {
+        [] => None,
+        [_only] => Some(0.0),
+        [first, .., last] => {
+            let delta = *last - *first;
+            if delta < 0.0 {
+                tracing::warn!(
+                    first = *first,
+                    last = *last,
+                    "phase_counter_delta: counter reset detected (last < first); clamping to 0"
+                );
+                Some(0.0)
+            } else {
+                Some(delta)
+            }
+        }
+    }
 }
 
 impl MetricDef {
@@ -4146,6 +4217,158 @@ mod tests {
     fn aggregate_samples_timestamp_returns_last() {
         let r = aggregate_samples(&[100.0, 200.0, 300.0], MetricKind::Timestamp);
         assert_eq!(r, Some(300.0));
+    }
+
+    // -- Per-phase reductions --------------------------------------
+
+    /// `phase_counter_delta` returns `last - first` of finite
+    /// samples — the right semantic for a per-phase reduction
+    /// over a cumulative-since-boot counter. Distinct from
+    /// `aggregate_samples(..., Counter)` which sums the samples
+    /// (correct for cross-run aggregation, wrong for per-phase
+    /// deltas).
+    #[test]
+    fn phase_counter_delta_returns_last_minus_first() {
+        // Cumulative-since-boot counter samples in [100, 150, 175,
+        // 200] yield delta 100 across the phase window.
+        assert_eq!(
+            phase_counter_delta(&[100.0, 150.0, 175.0, 200.0]),
+            Some(100.0),
+        );
+        // NaN samples drop from the finite slice; first/last
+        // are computed over the filtered sequence.
+        assert_eq!(
+            phase_counter_delta(&[f64::NAN, 150.0, 175.0, f64::NAN]),
+            Some(25.0),
+        );
+    }
+
+    /// `phase_counter_delta` returns `Some(0.0)` for a phase with
+    /// exactly one finite sample (self-delta — the metric was
+    /// observed but no per-phase change can be computed), and
+    /// `None` only when zero samples are finite. The distinction
+    /// matters for the bucket renderer: `Some(0.0)` paints "phase
+    /// has data, delta is 0"; `None` paints "no data".
+    #[test]
+    fn phase_counter_delta_one_finite_sample_is_self_delta() {
+        assert_eq!(phase_counter_delta(&[42.0]), Some(0.0));
+        assert_eq!(phase_counter_delta(&[f64::NAN, 42.0, f64::NAN]), Some(0.0));
+        assert_eq!(phase_counter_delta(&[]), None);
+        assert_eq!(phase_counter_delta(&[f64::NAN, f64::INFINITY]), None);
+    }
+
+    /// A counter that regresses across a phase window
+    /// (scheduler-restart counter reset, kernel module reload,
+    /// etc.) clamps to 0 rather than emitting a negative delta a
+    /// downstream "negative count is impossible" assertion would
+    /// either misread or trip on. Mirrors the existing
+    /// `monitor::counter_delta` clamp pattern.
+    #[test]
+    fn phase_counter_delta_clamps_negative_to_zero_on_counter_reset() {
+        assert_eq!(
+            phase_counter_delta(&[500.0, 600.0, 100.0]),
+            Some(0.0),
+            "last < first clamps to 0 (counter reset detected)",
+        );
+    }
+
+    /// `aggregate_samples_for_phase` dispatches Counter through
+    /// `phase_counter_delta` (per-phase delta) and every other
+    /// kind through `aggregate_samples` (flat-run semantic). Pins
+    /// the invariant: a Counter-kind metric must NOT collapse
+    /// to a sum across the phase window — that's the bug the
+    /// per-phase aggregator was introduced to fix.
+    #[test]
+    fn aggregate_samples_for_phase_dispatches_on_kind() {
+        let counter = MetricDef {
+            name: "total_test_counter",
+            accessor: |_| None,
+            display_unit: "",
+            polarity: crate::test_support::Polarity::HigherBetter,
+            default_abs: 0.0,
+            default_rel: 0.0,
+            kind: MetricKind::Counter,
+        };
+        // Counter routes through `phase_counter_delta`, NOT
+        // `aggregate_samples`'s sum.
+        assert_eq!(
+            aggregate_samples_for_phase(&counter, &[100.0, 150.0, 175.0]),
+            Some(75.0),
+            "Counter kind must reduce by last - first, not by sum",
+        );
+        assert_ne!(
+            aggregate_samples_for_phase(&counter, &[100.0, 150.0, 175.0]),
+            Some(425.0),
+            "Counter kind MUST NOT collapse to flat-run sum across a phase",
+        );
+
+        let peak = MetricDef {
+            name: "max_test_peak",
+            accessor: |_| None,
+            display_unit: "",
+            polarity: crate::test_support::Polarity::LowerBetter,
+            default_abs: 0.0,
+            default_rel: 0.0,
+            kind: MetricKind::Peak,
+        };
+        // Peak routes through `aggregate_samples` -> max.
+        assert_eq!(
+            aggregate_samples_for_phase(&peak, &[1.0, 5.0, 3.0]),
+            Some(5.0),
+            "Peak kind must reduce by max",
+        );
+
+        let gauge_avg = MetricDef {
+            name: "worst_test_gauge",
+            accessor: |_| None,
+            display_unit: "",
+            polarity: crate::test_support::Polarity::LowerBetter,
+            default_abs: 0.0,
+            default_rel: 0.0,
+            kind: MetricKind::Gauge(GaugeAgg::Avg),
+        };
+        assert_eq!(
+            aggregate_samples_for_phase(&gauge_avg, &[2.0, 4.0, 6.0]),
+            Some(4.0),
+            "Gauge(Avg) kind must reduce by arithmetic mean",
+        );
+    }
+
+    /// All-empty / all-NaN inputs to either entry point return
+    /// `None`. The phase renderer treats absent values as "no
+    /// finite samples for this metric in this phase" — distinct
+    /// from `Some(0.0)` which is a real reduced zero from finite
+    /// samples — so the `None` shape must round-trip.
+    #[test]
+    fn aggregate_samples_for_phase_returns_none_on_empty_or_all_nan() {
+        let counter = MetricDef {
+            name: "total_x",
+            accessor: |_| None,
+            display_unit: "",
+            polarity: crate::test_support::Polarity::HigherBetter,
+            default_abs: 0.0,
+            default_rel: 0.0,
+            kind: MetricKind::Counter,
+        };
+        assert_eq!(aggregate_samples_for_phase(&counter, &[]), None);
+        assert_eq!(
+            aggregate_samples_for_phase(&counter, &[f64::NAN, f64::NAN]),
+            None,
+        );
+        let peak = MetricDef {
+            name: "max_x",
+            accessor: |_| None,
+            display_unit: "",
+            polarity: crate::test_support::Polarity::LowerBetter,
+            default_abs: 0.0,
+            default_rel: 0.0,
+            kind: MetricKind::Peak,
+        };
+        assert_eq!(aggregate_samples_for_phase(&peak, &[]), None);
+        assert_eq!(
+            aggregate_samples_for_phase(&peak, &[f64::NAN, f64::INFINITY]),
+            None,
+        );
     }
 
     /// Every entry in the `METRICS` registry must have a kind set.
