@@ -173,6 +173,40 @@ pub(crate) enum KtstrCommand {
         #[command(subcommand)]
         command: Option<StatsCommand>,
     },
+    /// Re-run the failing subset of a prior sidecar pool.
+    ///
+    /// Scans the sidecar root for failed runs (`!passed && !skipped`),
+    /// dedupes the resulting test names, and emits a `cargo nextest
+    /// run`-compatible filter expression that targets exactly that
+    /// subset. Default is dry-run (prints the filter expression to
+    /// stdout); pass `--exec` to invoke nextest directly.
+    ///
+    /// Distinct from the in-VM auto-repro (`auto_repro = true` on
+    /// `KtstrTestEntry`) which fires within the same test process
+    /// when a primary run fails — `replay` is post-hoc, after the
+    /// test process has exited, for the CI-friendly "re-run last
+    /// session's failures against the new code" workflow.
+    Replay {
+        /// Override the sidecar root. Defaults to
+        /// `test_support::runs_root()` (typically `target/ktstr/`).
+        /// Same semantics as `cargo ktstr stats compare --dir` and
+        /// `cargo ktstr stats list-values --dir`: useful when
+        /// inspecting an archived sidecar tree copied off a CI host.
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+        /// Narrow the failed-sidecar selection by substring match
+        /// on `test_name`. Case-sensitive. Useful when re-running
+        /// only a specific suite under a known regression class.
+        #[arg(long, short = 'E')]
+        filter: Option<String>,
+        /// Invoke `cargo nextest run -E <filter>` instead of
+        /// printing the filter expression. Without `--exec`, the
+        /// command is dry-run: the printed filter can be piped
+        /// into nextest by hand, or pasted into a CI pipeline,
+        /// before committing to the re-run.
+        #[arg(long)]
+        exec: bool,
+    },
     /// Manage cached kernel images.
     Kernel {
         #[command(subcommand)]
