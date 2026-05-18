@@ -928,17 +928,27 @@ pub enum KernelTarget {
     /// maps, vmalloc'd memory, and any other address that does NOT
     /// live in the direct map.
     Kva(u64),
-    /// Per-CPU field of a kernel struct, resolved lazily at op
-    /// dispatch time. The variant carries the symbolic intent only
-    /// (`symbol`, `field`, `cpu`); the resolver — landing with the
-    /// upcoming op handler — will look up `symbol` in the vmlinux
-    /// symbol table, add `__per_cpu_offset[cpu]`, and add the
-    /// BTF-resolved byte offset of `field` within `symbol`'s struct
-    /// type to yield the per-CPU field's runtime KVA.
+    /// Per-CPU field of a kernel struct, resolved at op dispatch
+    /// time. The variant carries the symbolic intent only (`symbol`,
+    /// `field`, `cpu`); the dispatcher looks up `symbol` in the
+    /// vmlinux symbol table, adds `__per_cpu_offset[cpu]`, and adds
+    /// the BTF-resolved byte offset of `field` within `symbol`'s
+    /// struct type to yield the per-CPU field's runtime KVA.
+    ///
+    /// `symbol` must be in the v1 supported set: `runqueues` →
+    /// `struct rq`, `kernel_cpustat` → `struct kernel_cpustat`,
+    /// `kstat` → `struct kernel_stat`, `tick_cpu_sched` →
+    /// `struct tick_sched`. Unknown symbols fail with a typed error
+    /// (the wire variant doesn't carry struct type, so the
+    /// dispatcher maps via a hardcoded table — extend it AND
+    /// `KernelSymbols::from_elf` to add). KASLR-on round-trip
+    /// coverage is an outstanding follow-up; ktstr defaults to
+    /// `nokaslr` so the kaslr_offset slide is 0 on the standard
+    /// test path.
     ///
     /// Lazy resolution keeps the construction surface pure-data
     /// (the test author needs no `GuestKernel`/BTF/symbol-table
-    /// handle to construct the variant); resolution failures will
+    /// handle to construct the variant); resolution failures
     /// surface as op-execution errors at the same layer as
     /// missing-symbol failures in other snapshot ops.
     PerCpuField {

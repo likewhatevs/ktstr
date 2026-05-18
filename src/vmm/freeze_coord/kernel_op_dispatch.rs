@@ -33,12 +33,15 @@
 //!   fails the batch with a typed error (the variant has no read
 //!   semantics — it carries a mask, not a width hint).
 //!
-//! * **`KernelOpTarget::PerCpuField` is not yet supported.** The
-//!   per-CPU symbol-resolution path needs a BTF surface this crate
-//!   has not yet exposed. Entries with a per-CPU target fail with a
-//!   typed `"per-CPU field resolution not yet implemented"` error so
-//!   the caller's test surfaces the limitation deterministically
-//!   instead of silently producing nonsense.
+//! * **`KernelOpTarget::PerCpuField` resolution** uses a hardcoded
+//!   `{symbol → struct_name}` mapping (see
+//!   [`struct_name_for_per_cpu_symbol`]) to bridge the wire variant
+//!   to BTF: `runqueues` → `rq`, `kernel_cpustat` → `kernel_cpustat`,
+//!   etc. Extending the supported symbol set requires an entry there
+//!   AND symbol resolution in
+//!   [`crate::monitor::symbols::KernelSymbols::from_elf`]. Unknown
+//!   symbols fail with a typed error rather than silently producing
+//!   nonsense.
 //!
 //! # Atomicity under freeze rendezvous
 //!
@@ -204,10 +207,10 @@ fn validate_kva_target(kva: u64, len: u64) -> Result<(), String> {
 
 /// Build the typed-error reason for [`validate_kva_target`]'s
 /// user-half rejection. Extracted as a standalone `pub(super) fn`
-/// for the same reason as [`percpufield_v1_deferred_reason`] /
-/// [`oru32_read_rejection_reason`]: the tests that pin the format
-/// invoke the SAME helper the dispatcher uses, avoiding the
-/// tautology where the test re-synthesises the expected string.
+/// for the same reason as [`oru32_read_rejection_reason`]: the
+/// tests that pin the format invoke the SAME helper the dispatcher
+/// uses, avoiding the tautology where the test re-synthesises the
+/// expected string.
 pub(super) fn user_half_kva_rejection_reason(kva: u64) -> String {
     format!(
         "Kva={kva:#x} below kernel-half 5-level conservative threshold \
@@ -379,12 +382,13 @@ fn dispatch_one_write(
                 .ok_or_else(|| format!("write_kva_u32({kva:#x}) for OrU32: page unmapped"))
         }
 
-        // Per-CPU field — deferred until the BTF resolution surface lands.
-        // TODO(#62-followup): apply validate_direct_target /
-        // validate_kva_target (per resolved address class) when the
-        // BTF stub becomes a real implementation.
-        (KernelOpTarget::PerCpuField { symbol, field, cpu }, _) => {
-            Err(percpufield_v1_deferred_reason(symbol, field, *cpu))
+        // Per-CPU field — resolve symbol KVA + __per_cpu_offset[cpu]
+        // arithmetic + BTF nested-path field offset, then write at the
+        // per-CPU instance PA. See [`dispatch_per_cpu_field_write`].
+        // Cold-path freeze rendezvous gives the atomicity contract
+        // shared by every dispatcher arm.
+        (KernelOpTarget::PerCpuField { symbol, field, cpu }, value) => {
+            dispatch_per_cpu_field_write(kernel, btf, symbol, field, *cpu, value)
         }
 
         // Per-task field — SCX-managed tasks only. Walks
@@ -483,11 +487,11 @@ fn dispatch_one_read(
                 })
         }
 
-        // Per-CPU field — same v1 deferral as the write side.
-        // TODO(#62-followup): apply target-aware validation when
-        // BTF stub becomes a real implementation.
-        (KernelOpTarget::PerCpuField { symbol, field, cpu }, _) => {
-            Err(percpufield_v1_deferred_reason(symbol, field, *cpu))
+        // Per-CPU field — same symbol + offset + BTF resolution as
+        // the write side, then read U32 or U64 at the resolved PA.
+        // See [`dispatch_per_cpu_field_read`].
+        (KernelOpTarget::PerCpuField { symbol, field, cpu }, width_hint) => {
+            dispatch_per_cpu_field_read(kernel, btf, symbol, field, *cpu, width_hint)
         }
 
         // Per-task field — same walker + 8-layer validation as the
@@ -518,25 +522,187 @@ fn dispatch_one_read(
     }
 }
 
-/// Build the typed-error reason returned by the dispatcher when a
-/// caller passes a per-CPU field target. The per-CPU resolution
-/// surface (BTF struct-field offset lookup + `__per_cpu_offset[cpu]`
-/// add) lands in a follow-up; until then the dispatcher rejects
-/// deterministically rather than silently producing nonsense.
+/// Hardcoded `{per-CPU symbol → struct name}` mapping. The
+/// `KernelOpTarget::PerCpuField` wire variant carries the symbol
+/// name but not the struct type the symbol is an instance of; this
+/// helper bridges the gap so [`nested_member_byte_offset`] can
+/// resolve the field offset against the correct BTF struct.
 ///
-/// Extracted as a standalone helper so the rejection format lives in
-/// ONE place — the test that pins the format equals what the
-/// dispatcher produces, rather than the tautological pattern where
-/// the test re-synthesises the expected string locally.
-pub(super) fn percpufield_v1_deferred_reason(
+/// v1 set tracks the per-CPU symbols ktstr resolves in
+/// [`crate::monitor::symbols::KernelSymbols`]: `runqueues` → `rq`,
+/// `kernel_cpustat` → `kernel_cpustat`, `kstat` → `kernel_stat`,
+/// `tick_cpu_sched` → `tick_sched`. Adding a per-CPU symbol to the
+/// dispatcher requires an entry here AND the symbol resolution in
+/// `KernelSymbols::from_elf`.
+fn struct_name_for_per_cpu_symbol(symbol: &str) -> Result<&'static str, String> {
+    match symbol {
+        "runqueues" => Ok("rq"),
+        "kernel_cpustat" => Ok("kernel_cpustat"),
+        "kstat" => Ok("kernel_stat"),
+        "tick_cpu_sched" => Ok("tick_sched"),
+        _ => Err(format!(
+            "PerCpuField: unknown per-CPU symbol '{symbol}' (v1 supports: \
+             runqueues, kernel_cpustat, kstat, tick_cpu_sched); extend \
+             struct_name_for_per_cpu_symbol + KernelSymbols::from_elf to add"
+        )),
+    }
+}
+
+/// Resolve a `PerCpuField` target to its guest-memory PA. Shared
+/// between the write and read dispatcher arms.
+///
+/// Steps: look up the symbol's struct type via
+/// [`struct_name_for_per_cpu_symbol`]; resolve the symbol's template
+/// KVA via [`crate::monitor::guest::GuestKernel::symbol_kva`]; read
+/// `__per_cpu_offset[cpu]` from guest memory; compute the per-CPU
+/// instance KVA via [`crate::monitor::symbols::per_cpu_kva`]; resolve
+/// the field's byte offset within the struct via
+/// [`nested_member_byte_offset`]; translate the per-CPU instance KVA
+/// to PA via [`translate_any_kva`]; return PA + field_off.
+///
+/// **KASLR-on caveat**: passes `kaslr_offset=0` to `per_cpu_kva`.
+/// ktstr defaults to `nokaslr` karg (per task #40 defense-in-depth),
+/// so the slide is always 0 for the standard test path. The
+/// KASLR-on round-trip end-to-end test (which would exercise a
+/// non-zero kaslr_offset path via cross-thread BSP MSR_LSTAR
+/// derive) is deferred — see B9 #6 in the umbrella task #14. A
+/// regression that toggled `nokaslr` off without wiring the
+/// kaslr_offset would silently produce wrong per-CPU KVAs and
+/// `translate_any_kva` would bounds-reject to None.
+fn resolve_per_cpu_field_pa(
+    kernel: &GuestKernel,
+    btf: Option<&Btf>,
     symbol: &str,
     field: &str,
     cpu: u32,
-) -> String {
-    format!(
-        "per-CPU field resolution not yet implemented for {symbol}.{field}[cpu={cpu}] \
-         (needs the BTF struct-field offset surface — follow-up task)"
+) -> Result<usize, String> {
+    let btf = btf.ok_or_else(|| {
+        format!(
+            "PerCpuField {symbol}.{field}[cpu={cpu}]: BTF not loaded in this \
+             coordinator — cannot resolve struct layout (vmlinux must carry \
+             CONFIG_DEBUG_INFO_BTF=y output)"
+        )
+    })?;
+
+    let struct_name = struct_name_for_per_cpu_symbol(symbol)?;
+
+    let template_kva = kernel.symbol_kva(symbol).ok_or_else(|| {
+        format!(
+            "PerCpuField {symbol}.{field}[cpu={cpu}]: '{symbol}' symbol absent \
+             from vmlinux symtab"
+        )
+    })?;
+
+    let per_cpu_offset_array_kva = kernel.symbol_kva("__per_cpu_offset").ok_or_else(|| {
+        format!(
+            "PerCpuField {symbol}.{field}[cpu={cpu}]: '__per_cpu_offset' symbol \
+             absent — kernel built without SMP"
+        )
+    })?;
+    let per_cpu_offset_array_pa = kernel.text_kva_to_pa(per_cpu_offset_array_kva);
+    let per_cpu_offset = kernel
+        .mem()
+        .read_u64(per_cpu_offset_array_pa, (cpu as usize) * 8);
+    if per_cpu_offset == 0 && cpu > 0 {
+        return Err(format!(
+            "PerCpuField {symbol}.{field}[cpu={cpu}]: __per_cpu_offset[{cpu}]=0 \
+             (cpu beyond nr_cpu_ids; kernel zero-init slot)"
+        ));
+    }
+
+    // per_cpu_kva formula: template_kva + kaslr_offset + per_cpu_offset.
+    // kaslr_offset = 0 per the doc above (nokaslr default).
+    let per_cpu_kva = crate::monitor::symbols::per_cpu_kva(template_kva, 0, per_cpu_offset);
+
+    let (struct_t, _) = find_struct(btf, struct_name).map_err(|e| {
+        format!(
+            "PerCpuField {symbol}.{field}[cpu={cpu}]: 'struct {struct_name}' BTF \
+             lookup: {e:#}"
+        )
+    })?;
+    let field_off = nested_member_byte_offset(btf, &struct_t, field).map_err(|e| {
+        format!(
+            "PerCpuField {symbol}.{field}[cpu={cpu}]: BTF nested-offset for \
+             '{field}' within '{struct_name}': {e:#}"
+        )
+    })?;
+
+    let walk = kernel.walk_context();
+    let pa = translate_any_kva(
+        kernel.mem(),
+        walk.cr3_pa,
+        walk.page_offset,
+        per_cpu_kva,
+        walk.l5,
+        walk.tcr_el1,
     )
+    .ok_or_else(|| {
+        format!(
+            "PerCpuField {symbol}.{field}[cpu={cpu}]: per_cpu_kva={per_cpu_kva:#x} \
+             unmapped (translate_any_kva returned None)"
+        )
+    })?;
+
+    Ok((pa + field_off as u64) as usize)
+}
+
+/// PerCpuField write — resolve PA + field_off, then write the value.
+/// `OrU32` is supported as a read-modify-write under the same
+/// freeze-rendezvous-epoch contract as the other dispatcher arms (see
+/// module doc + the `rmw-invariant-anchor` comments).
+fn dispatch_per_cpu_field_write(
+    kernel: &GuestKernel,
+    btf: Option<&Btf>,
+    symbol: &str,
+    field: &str,
+    cpu: u32,
+    value: &KernelOpValue,
+) -> Result<(), String> {
+    let pa = resolve_per_cpu_field_pa(kernel, btf, symbol, field, cpu)? as u64;
+    match value {
+        KernelOpValue::U32(v) => {
+            kernel.mem().write_u32(pa, 0, *v);
+            Ok(())
+        }
+        KernelOpValue::U64(v) => {
+            kernel.mem().write_u64(pa, 0, *v);
+            Ok(())
+        }
+        KernelOpValue::OrU32(mask) => {
+            // rmw-invariant-anchor: see OrU32 module doc.
+            let cur = kernel.mem().read_u32(pa, 0);
+            kernel.mem().write_u32(pa, 0, cur | mask);
+            Ok(())
+        }
+        KernelOpValue::Bytes(_) => Err(format!(
+            "PerCpuField {symbol}.{field}[cpu={cpu}]: Bytes write not supported \
+             (per-CPU scheduler fields are scalars)"
+        )),
+    }
+}
+
+/// PerCpuField read — same PA resolution as the write side, then
+/// read U32 or U64 at the resolved PA (width_hint variant picks
+/// which).
+fn dispatch_per_cpu_field_read(
+    kernel: &GuestKernel,
+    btf: Option<&Btf>,
+    symbol: &str,
+    field: &str,
+    cpu: u32,
+    width_hint: &KernelOpValue,
+) -> Result<KernelOpValue, String> {
+    let pa = resolve_per_cpu_field_pa(kernel, btf, symbol, field, cpu)? as u64;
+    match width_hint {
+        KernelOpValue::U32(_) => Ok(KernelOpValue::U32(kernel.mem().read_u32(pa, 0))),
+        KernelOpValue::U64(_) => Ok(KernelOpValue::U64(kernel.mem().read_u64(pa, 0))),
+        KernelOpValue::Bytes(_) => Err(format!(
+            "PerCpuField {symbol}.{field}[cpu={cpu}]: Bytes read not supported"
+        )),
+        KernelOpValue::OrU32(_) => Err(format!(
+            "PerCpuField {symbol}.{field}[cpu={cpu}]: OrU32 has no read semantic"
+        )),
+    }
 }
 
 /// `SCHED_EXT` policy value per `include/uapi/linux/sched.h:121`.
@@ -1230,8 +1396,7 @@ fn dispatch_task_field_read(
 /// direction. OrU32 carries a mask (write semantics), not a width
 /// hint — there is no read semantic to derive. The reason names the
 /// correct read-width Rust symbol so a confused caller can fix at
-/// the call site without source-diving the dispatcher. Extracted
-/// for the same reason as [`percpufield_v1_deferred_reason`].
+/// the call site without source-diving the dispatcher.
 pub(super) fn oru32_read_rejection_reason(mask: u32) -> String {
     format!(
         "OrU32(mask={mask:#x}) cannot be used as a Read width — \
@@ -1328,53 +1493,44 @@ mod tests {
         assert!(helper_reason.contains(&format!("{MASK:#x}")));
     }
 
-    /// PerCpuField target is rejected with a typed v1-limitation
-    /// error on both directions. Mirrors the
-    /// [`read_direction_with_oru32_value_rejects`] approach:
-    /// invokes the SAME helper the production dispatcher calls,
-    /// asserts the dispatcher's error_reply propagates the
-    /// helper's output verbatim (with batch prefix).
-    ///
-    /// Tester T2 (PerCpuField precedence negative pin): also pins
-    /// that the deferred reason does NOT contain validate-KVA
-    /// rejection substrings. A future refactor that wires
-    /// validate_kva_target into the PerCpuField arm (e.g. when the
-    /// BTF stub is replaced) MUST keep the deferred-error
-    /// precedence: PerCpuField has no KVA yet at the dispatch
-    /// boundary, so synthesizing a user-half rejection on it
-    /// produces garbage. Negative-substring pin catches the
-    /// reorder regression.
+    /// PerCpuField unknown-symbol rejection: the hardcoded mapping at
+    /// [`struct_name_for_per_cpu_symbol`] returns Err for symbols
+    /// outside the v1 supported set (runqueues / kernel_cpustat /
+    /// kstat / tick_cpu_sched). A regression that silently accepted
+    /// an unknown symbol would silently look up a wrong BTF struct
+    /// and produce wrong field offsets.
     #[test]
-    fn percpufield_target_v1_deferred_reason_format() {
-        let helper_reason = percpufield_v1_deferred_reason("runqueues", "clock", 3);
-        let batch_reason = format!("entry[0]: {helper_reason}");
-        let reply = error_reply(1, batch_reason.clone());
-        assert!(!reply.success);
-        assert_eq!(reply.reason, batch_reason);
-        // Positive: helper output names the resolution surface +
-        // (symbol, field, cpu) tuple.
-        assert!(helper_reason.contains("per-CPU field resolution"));
-        assert!(helper_reason.contains("runqueues.clock"));
-        assert!(helper_reason.contains("cpu=3"));
-        assert!(helper_reason.contains("BTF struct-field offset surface"));
-        // Negative (tester T2): deferred reason MUST NOT contain
-        // validate-KVA rejection substrings — proves the deferred
-        // error wins over (a hypothetical future) KVA validation
-        // call on the PerCpuField arm.
-        assert!(
-            !helper_reason.contains("kernel-half"),
-            "PerCpuField deferred reason must not contain 'kernel-half' \
-             (validate_kva_target output); reorder regression"
+    fn per_cpu_field_unknown_symbol_rejected() {
+        let err = struct_name_for_per_cpu_symbol("not_a_real_per_cpu_symbol")
+            .expect_err("unknown symbol must reject");
+        assert!(err.contains("PerCpuField"));
+        assert!(err.contains("not_a_real_per_cpu_symbol"));
+        // Enumerate the v1 supported set in the error to give the
+        // caller an actionable next step.
+        assert!(err.contains("runqueues"));
+        assert!(err.contains("kernel_cpustat"));
+        assert!(err.contains("kstat"));
+        assert!(err.contains("tick_cpu_sched"));
+    }
+
+    /// PerCpuField known-symbol mapping: every entry in the v1
+    /// supported set MUST map to the right kernel struct name. A
+    /// regression that swapped the runqueues→rq mapping (e.g. typo
+    /// to "rq_struct") would silently look up the wrong struct.
+    #[test]
+    fn per_cpu_field_known_symbol_mapping() {
+        assert_eq!(struct_name_for_per_cpu_symbol("runqueues").unwrap(), "rq");
+        assert_eq!(
+            struct_name_for_per_cpu_symbol("kernel_cpustat").unwrap(),
+            "kernel_cpustat"
         );
-        assert!(
-            !helper_reason.contains("below kernel-half"),
-            "PerCpuField deferred reason must not contain 'below kernel-half'; \
-             reorder regression"
+        assert_eq!(
+            struct_name_for_per_cpu_symbol("kstat").unwrap(),
+            "kernel_stat"
         );
-        assert!(
-            !helper_reason.contains("5-level conservative"),
-            "PerCpuField deferred reason must not contain '5-level conservative' \
-             (validate_kva_target threshold cite); reorder regression"
+        assert_eq!(
+            struct_name_for_per_cpu_symbol("tick_cpu_sched").unwrap(),
+            "tick_sched"
         );
     }
 
@@ -1407,7 +1563,9 @@ mod tests {
         // Each Kva arm shape `KernelOpTarget::Kva(kva), KernelOpValue::*`
         // MUST be followed within ~10 lines by `validate_kva_target(`.
         // Symbol arms are exempt (vmlinux .symtab kernel-half guarantee);
-        // PerCpuField arms are exempt (v1-deferred error wins).
+        // PerCpuField + TaskField arms are exempt (translate_any_kva
+        // safety-net handles unmapped/out-of-bounds; resolve_per_cpu_field_pa
+        // and find_task_by_pid produce typed errors instead of silent zeros).
 
         // Count Direct arms.
         let direct_arms: Vec<_> = src
