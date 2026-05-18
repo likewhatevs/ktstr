@@ -67,6 +67,8 @@ pub mod stress;
 pub use backdrop::Backdrop;
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU16;
 use std::thread;
 use std::time::Duration;
 
@@ -382,6 +384,32 @@ pub struct Ctx<'a> {
     /// `bpf_map_write`; custom scenarios typically do not flip this
     /// manually.
     pub wait_for_map_write: bool,
+    /// **Phase coordination.** Per-VM atomic publishing the current
+    /// scenario step index. Written by the scenario driver immediately
+    /// before each `run_step` call and read by both the host-side
+    /// freeze-coordinator periodic-capture path and the on-demand
+    /// `Op::CaptureSnapshot` / `Op::WatchSnapshot` apply arms so each
+    /// captured sample carries the step it belongs to.
+    ///
+    /// Encoded per the framework's 1-indexed phase convention: `0` is
+    /// the BASELINE settle window (the initial value), `1..=N` align
+    /// with scenario Step ordinals (`step_idx + 1`). This matches
+    /// [`crate::assert::PhaseBucket::step_index`] so a phase-aware
+    /// sample drops directly into the correct bucket without a
+    /// reindex.
+    ///
+    /// Stored as `AtomicU16` because the wire `StimulusPayload`
+    /// step-index field is also `u16`, so a single shared width
+    /// keeps the host-side bridge map and the guest-published wire
+    /// value type-compatible without narrowing.
+    ///
+    /// Wrapped in `Arc` so the same per-VM publisher can be cloned
+    /// into every consumer thread (scenario driver, freeze-coord,
+    /// on-demand-capture apply arms) without a process-global
+    /// static — multiple in-process VMs (e.g. parallel gauntlet
+    /// variants) each get an independent atomic instead of racing
+    /// on shared global state.
+    pub current_step: Arc<AtomicU16>,
 }
 
 impl std::fmt::Debug for Ctx<'_> {
@@ -399,6 +427,10 @@ impl std::fmt::Debug for Ctx<'_> {
             .field("work_type_override", &self.work_type_override)
             .field("assert", &self.assert)
             .field("wait_for_map_write", &self.wait_for_map_write)
+            .field(
+                "current_step",
+                &self.current_step.load(std::sync::atomic::Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -583,6 +615,7 @@ pub struct CtxBuilder<'a> {
     work_type_override: Option<WorkType>,
     assert: crate::assert::Assert,
     wait_for_map_write: bool,
+    current_step: Arc<AtomicU16>,
 }
 
 impl<'a> CtxBuilder<'a> {
@@ -642,6 +675,19 @@ impl<'a> CtxBuilder<'a> {
         self
     }
 
+    /// Inject a caller-owned per-VM step-index publisher. The
+    /// default `Ctx::builder` already constructs a fresh
+    /// `Arc<AtomicU16>` initialised to `0`, so most callers do
+    /// not need this setter; it exists so the host-side VM runner
+    /// can hand the same Arc to both the scenario driver `Ctx` and
+    /// the freeze-coordinator thread, giving both halves a single
+    /// per-VM source of truth for the current phase.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn current_step(mut self, cs: Arc<AtomicU16>) -> Self {
+        self.current_step = cs;
+        self
+    }
+
     /// Materialise the configured [`Ctx`].
     #[must_use = "dropping a Ctx without running the scenario discards the test setup"]
     pub fn build(self) -> Ctx<'a> {
@@ -655,6 +701,7 @@ impl<'a> CtxBuilder<'a> {
             work_type_override: self.work_type_override,
             assert: self.assert,
             wait_for_map_write: self.wait_for_map_write,
+            current_step: self.current_step,
         }
     }
 }
@@ -678,6 +725,7 @@ impl<'a> Ctx<'a> {
             work_type_override: None,
             assert: crate::assert::Assert::default_checks(),
             wait_for_map_write: false,
+            current_step: Arc::new(AtomicU16::new(0)),
         }
     }
 

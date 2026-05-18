@@ -4596,6 +4596,7 @@ mod tests {
             work_type_override: None,
             assert: crate::assert::Assert::default_checks(),
             wait_for_map_write: false,
+            current_step: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
         };
         let resolved = spec.resolve(&ctx);
         assert_eq!(resolved, cpus);
@@ -4702,6 +4703,7 @@ mod tests {
             work_type_override: None,
             assert: crate::assert::Assert::default_checks(),
             wait_for_map_write: false,
+            current_step: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
         }
     }
 
@@ -6072,6 +6074,7 @@ mod tests {
             work_type_override: None,
             assert: crate::assert::Assert::default_checks(),
             wait_for_map_write: false,
+            current_step: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
         }
     }
 

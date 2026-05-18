@@ -464,6 +464,7 @@ fn split_half_even() {
         work_type_override: None,
         assert: assert::Assert::default_checks(),
         wait_for_map_write: false,
+        current_step: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
     };
     let (a, b) = split_half(&ctx);
     // Last CPU reserved for cgroup 0 → 7 usable, split 3/4
@@ -485,6 +486,7 @@ fn split_half_small() {
         work_type_override: None,
         assert: assert::Assert::default_checks(),
         wait_for_map_write: false,
+        current_step: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
     };
     let (a, b) = split_half(&ctx);
     assert_eq!(a.len() + b.len(), 2);
@@ -504,6 +506,7 @@ fn dfl_wl_propagates_workers() {
         work_type_override: None,
         assert: assert::Assert::default_checks(),
         wait_for_map_write: false,
+        current_step: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
     };
     let wl = dfl_wl(&ctx);
     assert_eq!(wl.num_workers, 7);
