@@ -1077,6 +1077,23 @@ pub const KERNEL_OP_TAG_MAX: usize = 256;
 /// the request_id + truncated tag.
 pub const KERNEL_OP_REASON_MAX: usize = 256;
 
+/// Upper bound on entries per [`KernelOpRequestPayload`] batch.
+/// Without a cap, a hostile or buggy guest could submit a single
+/// request with thousands of entries — each entry would consume a
+/// freeze-rendezvous deadline budget once the cold-path handler
+/// internals land, starving the per-iteration snapshot drain that
+/// runs alongside the kernel-op drain in the coord loop. The
+/// snapshot drain has its own deadlines (Op::CaptureSnapshot has
+/// a 30 s guest-side per-op deadline); a kernel-op batch whose
+/// freeze duration approaches that bound could push the snapshot
+/// past its deadline and silently drop. 64 entries covers every
+/// realistic batch shape (`with_uptime` writing per-CPU `rq.clock`
+/// on 64 CPUs is the canonical use case; larger CPU counts split
+/// across multiple ops with the existing adjacent-fold pre-pass)
+/// while bounding per-call freeze duration well under the
+/// snapshot drain's deadline budget.
+pub const KERNEL_OP_MAX_ENTRIES_PER_BATCH: usize = 64;
+
 /// Outcome of a guest-driven kernel-memory op request: the host
 /// returned a reply (caller inspects [`KernelOpReplyPayload::success`])
 /// or the transport failed (port not open, timeout, malformed frame).

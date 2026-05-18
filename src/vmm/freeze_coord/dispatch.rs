@@ -461,6 +461,23 @@ pub(super) fn dispatch_bulk_message(
                         &msg.payload[..],
                     )
             {
+                // Reject hostile-batch requests at decode time.
+                // A guest publishing entries.len() > the per-batch
+                // cap would force the cold-path freeze-rendezvous
+                // to span thousands of writes, starving the
+                // snapshot drain that runs alongside the kernel-op
+                // drain in the coord loop. Silent drop — the
+                // matching reply path needs a freeze rendezvous to
+                // dispatch through and the per-iteration drain
+                // budget is exactly what the cap is protecting.
+                // Operator-trusted guests stay under the cap by
+                // construction (`with_uptime` 64-CPU = 64 entries);
+                // a buggy or hostile guest publishing 1024+
+                // entries gets dropped at the gate, which the
+                // guest's 30 s per-op deadline surfaces.
+                if req.entries.len() > crate::vmm::wire::KERNEL_OP_MAX_ENTRIES_PER_BATCH {
+                    return None;
+                }
                 // String::truncate panics if the cut lands inside
                 // a multi-byte UTF-8 sequence. A hostile guest
                 // publishing a tag whose 256th byte falls mid-codepoint
