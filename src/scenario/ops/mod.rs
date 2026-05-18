@@ -880,6 +880,22 @@ fn run_scenario(
 
         let mut step_state = StepState::empty(ctx);
         let mut sched_died_during_hold = false;
+        // Publish the 1-indexed phase number for this Step so the
+        // freeze-coordinator periodic-capture path and the on-demand
+        // Op::CaptureSnapshot / Op::WatchSnapshot apply arms all
+        // stamp the captures they take with the correct scenario
+        // phase. The 1-indexed encoding (scenario Step k -> phase
+        // k + 1) reserves phase 0 for the pre-first-Step BASELINE
+        // settle window. `Release` pairs with the consumers'
+        // `Acquire` load so a sample stamped with this value
+        // happens-after any state the Step has set up before
+        // calling run_step.
+        let phase_step_index = u16::try_from(step_idx)
+            .ok()
+            .and_then(|i| i.checked_add(1))
+            .unwrap_or(u16::MAX);
+        ctx.current_step
+            .store(phase_step_index, std::sync::atomic::Ordering::Release);
         let step_res = run_step(
             ctx,
             step,
@@ -1306,9 +1322,26 @@ fn build_stimulus(
         })
     };
 
+    // Encode the 1-indexed phase number per the framework's
+    // phase convention -- the BASELINE (pre-first-Step) window owns
+    // 0, scenario Step k publishes k + 1. Saturate at u16::MAX
+    // (rather than wrap) so a pathological 65k-step scenario still
+    // produces a clipped-high value the host parser can recognise
+    // instead of silently rolling over.
+    let phase_step_index: u16 = u16::try_from(step_idx)
+        .ok()
+        .and_then(|i| i.checked_add(1))
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                field = "step_index",
+                value = step_idx,
+                "StimulusPayload step_index overflowed u16 after 1-indexed encoding; saturating to u16::MAX",
+            );
+            u16::MAX
+        });
     StimulusPayload {
         elapsed_ms: to_u32("elapsed_ms", scenario_start.elapsed().as_millis()),
-        step_index: to_u16("step_index", step_idx),
+        step_index: phase_step_index,
         op_count: to_u16("op_count", ops.len()),
         op_kinds,
         cgroup_count: to_u16("cgroup_count", cgroup_count),
@@ -2691,12 +2724,24 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 //      The host's coordinator stores the captured
                 //      report on its bridge; the test code drains
                 //      the bridge after VM exit.
+                // Stamp the capture with the current scenario phase
+                // (1-indexed: 0 = BASELINE, 1..=N = Step ordinals)
+                // so the drained sample buckets directly into the
+                // matching PhaseBucket without a later reindex.
+                // Reads the per-VM `Ctx::current_step` Arc the Step
+                // loop publishes via `Release` just before
+                // `run_step`; `Acquire` here pairs with that store
+                // for a happens-after on Step state setup.
+                let phase = ctx
+                    .current_step
+                    .load(std::sync::atomic::Ordering::Acquire);
                 let invoked = crate::scenario::snapshot::with_active_bridge(|b| {
-                    let captured = b.capture(name);
+                    let captured = b.capture_with_step(name, phase);
                     if captured {
                         tracing::info!(
                             name = %name,
                             stored = b.len(),
+                            step_index = phase,
                             "Op::CaptureSnapshot: captured diagnostic snapshot"
                         );
                     }
@@ -8298,18 +8343,22 @@ mod tests {
         );
     }
 
-    /// `build_stimulus` passes `step_idx` through the `to_u16` helper
-    /// which saturates to `u16::MAX` with a `tracing::warn!` on
-    /// overflow. The saturation arm is unreachable under realistic
-    /// gauntlet runs — scenarios do not hold 65k+ steps — but the
-    /// guard exists so a pathological scenario cannot silently wrap
-    /// the wire field. Exercise the three interesting values:
+    /// `build_stimulus` encodes the 1-indexed phase number
+    /// (`step_idx + 1`) into the wire `step_index` slot, saturating
+    /// to `u16::MAX` (with a `tracing::warn!`) when the +1 would
+    /// overflow u16. The 0 slot is reserved for the BASELINE
+    /// pre-first-Step window the framework never emits a stimulus
+    /// for, so the lowest wire value `build_stimulus` ever produces
+    /// is 1. Exercise the three interesting values:
     ///
-    /// - `step_idx == 0`: lower boundary, no saturation.
-    /// - `step_idx == u16::MAX as usize`: highest value that fits,
-    ///   still no saturation.
-    /// - `step_idx == u16::MAX as usize + 1`: first overflow, must
-    ///   saturate to `u16::MAX`.
+    /// - `step_idx == 0` -> wire `step_index == 1` (first Step,
+    ///   not BASELINE).
+    /// - `step_idx == u16::MAX as usize - 1` -> wire
+    ///   `step_index == u16::MAX` (highest 1-indexed value that
+    ///   fits without saturation).
+    /// - `step_idx == u16::MAX as usize` -> wire
+    ///   `step_index == u16::MAX` (the +1 overflows; must saturate
+    ///   instead of wrapping to 0).
     #[test]
     fn build_stimulus_saturates_step_idx_at_u16_max() {
         let mock = MockCgroupOps::new();
@@ -8321,34 +8370,34 @@ mod tests {
         let start = std::time::Instant::now();
 
         let zero = build_stimulus(&start, 0, &[], &scenario);
-        assert_eq!(zero.step_index, 0, "step_idx=0 passes through");
-
-        let max = build_stimulus(&start, u16::MAX as usize, &[], &scenario);
         assert_eq!(
-            max.step_index,
-            u16::MAX,
-            "step_idx=u16::MAX passes through unchanged (no saturation)",
+            zero.step_index, 1,
+            "scenario step_idx=0 publishes wire step_index=1 \
+             per the 1-indexed phase encoding (BASELINE owns 0)",
         );
 
-        let overflow = build_stimulus(&start, u16::MAX as usize + 1, &[], &scenario);
+        let last_unsaturated = build_stimulus(&start, u16::MAX as usize - 1, &[], &scenario);
+        assert_eq!(
+            last_unsaturated.step_index,
+            u16::MAX,
+            "scenario step_idx=u16::MAX - 1 publishes wire step_index=u16::MAX \
+             without saturation (highest 1-indexed value that fits)",
+        );
+
+        let overflow = build_stimulus(&start, u16::MAX as usize, &[], &scenario);
         assert_eq!(
             overflow.step_index,
             u16::MAX,
-            "step_idx beyond u16::MAX must saturate to u16::MAX, not wrap",
+            "scenario step_idx=u16::MAX would publish wire step_index=u16::MAX+1 \
+             after the 1-indexed +1, so the encoder must saturate to u16::MAX \
+             rather than wrap to 0",
         );
 
-        // Far-overflow smoke check: u32::MAX as usize is well past
-        // the saturation boundary. The helper must still return
-        // u16::MAX. Note the coincidence that `u32::MAX as u16` also
-        // equals `u16::MAX` (the low 16 bits of `0xFFFF_FFFF_u32`
-        // are `0xFFFF`), so this specific input cannot distinguish
-        // saturation from a straight `as u16` truncation — the
-        // `u16::MAX as usize + 1` assertion above is what pins
-        // saturation (that input truncates to 0, so only saturation
-        // returns u16::MAX). This check therefore guards only the
-        // far-overflow call path (helper handles values past
-        // u16::MAX by orders of magnitude without panicking or
-        // returning nonsense), not the saturation semantics.
+        // Far-overflow smoke check: the helper handles values
+        // orders of magnitude past u16::MAX without panicking or
+        // returning nonsense. The saturated value is u16::MAX
+        // regardless of how far past the boundary `step_idx`
+        // landed.
         let far = build_stimulus(&start, u32::MAX as usize, &[], &scenario);
         assert_eq!(
             far.step_index,
@@ -8426,8 +8475,11 @@ mod tests {
             // In-range call: no saturation, no warn expected.
             let _ = build_stimulus(&start, 0, &[], &scenario);
             // Saturating call: must emit a warn naming the
-            // overflowing field and the offending value.
-            let _ = build_stimulus(&start, u16::MAX as usize + 1, &[], &scenario);
+            // overflowing field and the offending value. The
+            // 1-indexed encoding (`step_idx + 1`) saturates when
+            // the +1 would exceed u16::MAX, which kicks in at
+            // `step_idx == u16::MAX as usize`.
+            let _ = build_stimulus(&start, u16::MAX as usize, &[], &scenario);
         });
 
         let captured = events.lock().unwrap();
@@ -8437,10 +8489,8 @@ mod tests {
             .map(|(_, msg)| msg)
             .collect();
         assert!(
-            warn_hits
-                .iter()
-                .any(|m| m.contains("step_index")
-                    && m.contains("StimulusPayload field overflowed u16")),
+            warn_hits.iter().any(|m| m.contains("step_index")
+                && m.contains("StimulusPayload step_index overflowed u16")),
             "saturation must emit a tracing::warn naming step_index; got warns: {warn_hits:?}",
         );
         // Sanity: no warn should fire for the in-range 0 call.
