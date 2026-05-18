@@ -8,6 +8,8 @@
 //! Reopens [`impl KtstrVm`](super::KtstrVm) so the canonical struct
 //! definition stays in [`super`].
 
+mod kernel_op_dispatch;
+
 use anyhow::{Context, Result};
 use kvm_ioctls::VcpuExit;
 use std::os::fd::AsRawFd;

@@ -883,11 +883,20 @@ impl CpusetSpec {
 ///   returning stale data, and clearing the flag without
 ///   resetting the clock makes downstream BPF readers fall
 ///   back to the host TSC unexpectedly. Atomic bit-set without
-///   read-back (an `OrU64` RMW variant of [`KernelValue`] that
-///   does `flags |= mask` in one host-side step) is the cleaner
-///   shape; until that variant lands, raw RMW via `U64` leaves
-///   a race window between the host-side read and the
-///   host-side write.
+///   read-back is provided by [`KernelValue::OrU32`] — the RMW
+///   variant whose width matches `struct scx_rq.flags` (`u32`
+///   at `kernel/sched/sched.h:802`). Note there is no
+///   `OrU64` sibling: a 64-bit RMW at this field address would
+///   corrupt the adjacent `u32 nr_immed` field at
+///   `kernel/sched/sched.h:803`. Width is the variant tag, so
+///   wrong-width writes are a compile-time error rather than a
+///   silent field-overflow bug at runtime. Pair `OrU32(SCX_RQ_CLK_VALID)`
+///   with the prior `U64(clock_val)` write in a single
+///   `Op::WriteKernelCold` batch so both land under one freeze
+///   rendezvous and the kernel's documented
+///   write-clock-BEFORE-OR-flag ordering (per
+///   `kernel/sched/sched.h:1843-1848` `scx_rq_clock_update`)
+///   holds.
 /// * **`scx-ktstr` private bss / per-CPU scratch** — the
 ///   fixture scheduler exposes a dedicated write surface for
 ///   test use; raw writes there don't propagate into core
@@ -1023,10 +1032,26 @@ pub enum KernelValue {
     /// a single `write_volatile` when alignment holds); torn
     /// intermediate state is observable to concurrent guest readers
     /// in the fallback case.
+    ///
+    /// **For setting individual bits without disturbing the
+    /// surrounding value**, use [`Self::OrU32`] instead — that
+    /// variant performs read-modify-write OR semantics under the
+    /// freeze rendezvous (e.g. setting `SCX_RQ_CLK_VALID` in
+    /// `rq.scx.flags` without clobbering the other 31 flag bits).
+    /// A plain `U32(value)` write replaces every bit; OrU32 sets
+    /// only the bits in the mask.
     U32(u32),
     /// 64-bit unsigned little-endian write. Atomic when the
     /// resolved host PA is 8-byte aligned. See the alignment note
     /// on [`Self::U32`] for the misaligned fall-through behaviour.
+    ///
+    /// **No `OrU64` sibling exists by design.** The canonical
+    /// scheduler-flags use case ([`KernelValue::OrU32`] →
+    /// `struct scx_rq.flags`) is on a `u32` field per
+    /// `kernel/sched/sched.h:802`; a 64-bit RMW at that address
+    /// would corrupt the adjacent `u32 nr_immed` field at
+    /// `kernel/sched/sched.h:803`. If a future u64 RMW use case
+    /// emerges with a verified width, add the variant then.
     U64(u64),
     /// Variable-length byte payload. Written non-atomically; the
     /// `GuestKernel::write_*_bytes` helpers emit a Release fence
@@ -1035,6 +1060,73 @@ pub enum KernelValue {
     /// fence orders the stores but does NOT atomicize the
     /// multi-byte write versus a concurrent guest reader.
     Bytes(Vec<u8>),
+    /// 32-bit unsigned read-modify-write OR. The dispatcher reads
+    /// the live u32 at the resolved host PA, ORs the carried mask
+    /// into it, and writes the new value back. Width is u32 — the
+    /// canonical use case is OR-ing a single-bit kernel flag (e.g.
+    /// `SCX_RQ_CLK_VALID = 1 << 5`) into `struct scx_rq.flags`,
+    /// declared `u32` at `kernel/sched/sched.h:802` inside the
+    /// struct opened at L793. A 64-bit RMW at a u32 field address
+    /// would either silently truncate the upper 32 bits or
+    /// corrupt the adjacent `u32 nr_immed` field at
+    /// `kernel/sched/sched.h:803`, so the variant tag itself
+    /// picks the width and rules out width mismatch at the call
+    /// site.
+    ///
+    /// **Atomicity** (cold-path dispatcher): the host coordinator
+    /// holds the freeze rendezvous for the duration of the RMW —
+    /// every guest vCPU is parked on a futex inside `handle_freeze`
+    /// (no kernel-side writer is scheduled), and the host
+    /// coordinator is the only writer of guest memory in scope.
+    /// `read_u32 → OR mask → write_u32` therefore runs atomic
+    /// **by quiesce**: no concurrent kernel writer can interleave
+    /// between the load and the store. No `compare_exchange` loop
+    /// is required for cold-path dispatch.
+    ///
+    /// At the host CPU level the read and write are separate
+    /// (non-instruction-atomic) operations: a hypothetical
+    /// concurrent host writer of guest memory would be a race.
+    /// The freeze coordinator is the sole such writer by design
+    /// (per the cold-path threat model documented at
+    /// [`super::Op::WriteKernelCold`]), so the parked-vCPU
+    /// contract is sufficient.
+    ///
+    /// **Alignment**: the dispatcher delegates u32 reads/writes
+    /// to [`crate::monitor::guest::GuestKernel`]'s
+    /// `read_*_u32` / `write_*_u32` helpers, which use a
+    /// single-instruction `write_volatile` at 4-byte-aligned host
+    /// PAs and fall through to a per-byte volatile loop on
+    /// misalignment. Under the freeze rendezvous the per-byte
+    /// fallback is safe (no concurrent kernel writer), so
+    /// misaligned PAs do not produce a torn-RMW race —
+    /// but kernel ABI alignment for `u32` fields is enforced by
+    /// the compiler at the kernel side regardless, so misaligned
+    /// PAs for legitimate symbol/field writes do not arise in
+    /// practice.
+    ///
+    /// **Hot-path future** (when [`super::Op::WriteKernelHot`]
+    /// gains `OrU32` support — currently rejected per the
+    /// [`super::Op::WriteKernelHot`] doc): the live-guest race
+    /// model requires a `compare_exchange` loop over
+    /// `core::sync::atomic::AtomicU32::from_ptr` (Rust 1.75+) at
+    /// 4-byte alignment, with explicit rejection of misaligned
+    /// PAs (per-byte fallback cannot be made atomic vs. a live
+    /// kernel writer).
+    ///
+    /// **Ordering**: cold-path dispatch happens while every vCPU
+    /// is parked at the freeze rendezvous, so no concurrent
+    /// guest write races our RMW for single-op use cases. The
+    /// `SCX_RQ_CLK_VALID` case specifically requires
+    /// **write-clock-BEFORE-OR-flag** ordering per the kernel's
+    /// own `scx_rq_clock_update` at `kernel/sched/sched.h:1843-1848`
+    /// (which does `WRITE_ONCE(rq->scx.clock, val)` then
+    /// `smp_store_release(&rq->scx.flags, flags |
+    /// SCX_RQ_CLK_VALID)`); a host-side caller that wants the
+    /// same observable invariant must batch the clock write +
+    /// the OR-flag in the same `Op::WriteKernelCold` batch and
+    /// rely on the freeze rendezvous's vCPU-pause to serialise
+    /// against guest readers.
+    OrU32(u32),
 }
 
 impl KernelValue {
@@ -1051,6 +1143,14 @@ impl KernelValue {
     /// Variable-length byte payload.
     pub fn bytes(data: impl Into<Vec<u8>>) -> Self {
         KernelValue::Bytes(data.into())
+    }
+
+    /// 32-bit unsigned read-modify-write OR mask. See
+    /// [`Self::OrU32`] for the width-, atomicity-, and ordering-
+    /// contract. The canonical use case is OR-ing a single-bit
+    /// kernel flag like `SCX_RQ_CLK_VALID` into `struct scx_rq.flags`.
+    pub const fn or_u32(mask: u32) -> Self {
+        KernelValue::OrU32(mask)
     }
 }
 
@@ -1086,6 +1186,7 @@ impl From<&KernelValue> for crate::vmm::wire::KernelOpValue {
             KernelValue::U32(v) => Self::U32(*v),
             KernelValue::U64(v) => Self::U64(*v),
             KernelValue::Bytes(b) => Self::Bytes(b.clone()),
+            KernelValue::OrU32(mask) => Self::OrU32(*mask),
         }
     }
 }

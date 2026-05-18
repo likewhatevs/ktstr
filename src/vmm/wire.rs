@@ -29,7 +29,7 @@
 //!     → 4 tests → `src/vmm/wire.rs` (this file)
 //!   - `PayloadMetrics` / `RawPayloadOutput`
 //!     → `payload_metrics_postcard_roundtrip` /
-//!       `raw_payload_output_postcard_roundtrip`
+//!     `raw_payload_output_postcard_roundtrip`
 //!     → `src/test_support/payload.rs`
 //!   - `WorkloadConfig` → `payload_roundtrip`
 //!     → `src/test_support/payload.rs`
@@ -949,7 +949,7 @@ pub enum KernelOpTarget {
 }
 
 /// Wire-encoded [`crate::scenario::ops::KernelValue`] variant tag.
-/// Mirrors the three `KernelValue` enum variants 1:1.
+/// Mirrors the four `KernelValue` enum variants 1:1.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum KernelOpValue {
     /// 32-bit unsigned, little-endian on the wire and at the
@@ -961,6 +961,24 @@ pub enum KernelOpValue {
     /// Variable-length byte payload. Written non-atomically; the
     /// dispatcher emits a Release fence after the copy.
     Bytes(Vec<u8>),
+    /// 32-bit unsigned read-modify-write OR mask. The cold-path
+    /// dispatcher reads the live u32 at the resolved host PA,
+    /// ORs the carried mask into it, and writes the new value
+    /// back as two separate `read_u32` / `write_u32` calls —
+    /// atomic by quiesce because the freeze rendezvous parks
+    /// every guest vCPU before the RMW runs (no concurrent
+    /// kernel writer can interleave). No `compare_exchange` loop
+    /// in the cold path. Mirrors
+    /// [`crate::scenario::ops::KernelValue::OrU32`] — see that
+    /// variant's doc for the full atomicity, ordering, and
+    /// width-correctness contract (the canonical
+    /// `SCX_RQ_CLK_VALID` use case + the
+    /// `kernel/sched/sched.h:802` u32-width citation for the
+    /// `struct scx_rq.flags` field that motivated keeping the
+    /// variant u32 rather than u64). Hot-path support is a
+    /// future variant — it would require `AtomicU32::from_ptr`
+    /// + cmpxchg + strict alignment rejection.
+    OrU32(u32),
 }
 
 /// One write/read pair inside a [`KernelOpRequestPayload`] batch.

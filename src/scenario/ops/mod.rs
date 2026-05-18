@@ -10870,6 +10870,58 @@ mod kernel_op_dispatch_tests {
         let bytes_val: crate::vmm::wire::KernelOpValue =
             (&KernelValue::bytes(bytes.clone())).into();
         assert_eq!(bytes_val, crate::vmm::wire::KernelOpValue::Bytes(bytes));
+        // OrU32: width is u32 not u64 (struct scx_rq.flags is u32
+        // per kernel/sched/sched.h:802); a regression that mapped
+        // OrU32 to wire-side U32 or OrU64 (had one existed) would
+        // silently lose the RMW intent at the dispatcher and
+        // either drop the OR or corrupt the adjacent field.
+        let or_val: crate::vmm::wire::KernelOpValue =
+            (&KernelValue::or_u32(1 << 5)).into();
+        assert_eq!(or_val, crate::vmm::wire::KernelOpValue::OrU32(1 << 5));
+        // Edge mask values per tester pass-1 spec: degenerate
+        // zero mask (a tempting wrong-optimization to skip the OR
+        // on `mask == 0` would trip here), all-bits-set mask
+        // (RMW degenerates to a full overwrite — still must
+        // route through OrU32 wire variant, not U32), and a
+        // multi-bit non-power-of-2 mask (catches a regression
+        // that treated OrU32 as single-bit-only).
+        let zero_or: crate::vmm::wire::KernelOpValue =
+            (&KernelValue::or_u32(0)).into();
+        assert_eq!(zero_or, crate::vmm::wire::KernelOpValue::OrU32(0));
+        let max_or: crate::vmm::wire::KernelOpValue =
+            (&KernelValue::or_u32(u32::MAX)).into();
+        assert_eq!(max_or, crate::vmm::wire::KernelOpValue::OrU32(u32::MAX));
+        let multi_bit_or: crate::vmm::wire::KernelOpValue =
+            (&KernelValue::or_u32(0xA5A5_A5A5)).into();
+        assert_eq!(
+            multi_bit_or,
+            crate::vmm::wire::KernelOpValue::OrU32(0xA5A5_A5A5)
+        );
+    }
+
+    /// `KernelValue::OrU32` participates in `PartialEq` distinct
+    /// from its `U32` sibling and distinct from other OrU32 masks.
+    /// A regression that custom-impl'd PartialEq ignoring the
+    /// variant tag (so `OrU32(1) == U32(1)`) would silently
+    /// conflate write modes — `assert_eq!` on collected
+    /// `Vec<KernelValue>` would compare-equal across variants.
+    #[test]
+    fn kernel_value_partial_eq_distinguishes_oru32_from_u32_and_other_masks() {
+        assert_eq!(KernelValue::or_u32(1), KernelValue::or_u32(1));
+        assert_ne!(KernelValue::or_u32(1), KernelValue::or_u32(2));
+        assert_ne!(KernelValue::or_u32(1), KernelValue::u32(1));
+    }
+
+    /// `KernelValue::or_u32` is `const fn` so static contexts can
+    /// declare flag constants without a runtime construction. A
+    /// regression that dropped the `const` modifier would push
+    /// every static use to a runtime build (or a compile error
+    /// at the callsite). This compile-time `const _` assertion
+    /// trips on the regression at the file boundary, not at the
+    /// downstream caller.
+    #[test]
+    fn kernel_value_or_u32_is_const_constructible() {
+        const _OR_AT_COMPILE_TIME: KernelValue = KernelValue::or_u32(1 << 5);
     }
 
     /// `write_entries_from_writes` preserves order and produces one
