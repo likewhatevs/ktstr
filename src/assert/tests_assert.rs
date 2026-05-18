@@ -1467,3 +1467,130 @@ fn evaluate_scx_bpf_error_match_regex_literal_whitespace_matches_byte_for_byte()
         "regex with literal tab must NOT match corpus with a space in that position: {space_no_match:?}",
     );
 }
+
+// -- serde derive on Assert -------------------------------------------
+
+/// Compile-time pin that `Assert` implements `Serialize +
+/// Deserialize`. A future regression that drops either trait would
+/// break sidecar carrying of threshold config; pin it here so the
+/// drop trips at type-check time, not at the sidecar consumer's
+/// deserialize failure.
+#[test]
+fn assert_implements_serialize_and_deserialize() {
+    fn requires<T: serde::Serialize + serde::de::DeserializeOwned>() {}
+    requires::<Assert>();
+}
+
+/// Full round-trip: every numeric / bool field on `Assert` survives
+/// serialize → JSON → deserialize. The two reproducer-string fields
+/// (expect_scx_bpf_error_contains / _matches) are intentionally marked
+/// `#[serde(skip)]` because their `&'static str` shape can't be
+/// deserialized (no lifetime context in the deserializer); the
+/// strings are test-author static literals carried in the test
+/// definition, not runtime data the sidecar needs. See the dedicated
+/// `assert_serde_skips_reproducer_string_fields` test below for the
+/// skip contract.
+#[test]
+fn assert_serde_roundtrip_preserves_every_non_skipped_field() {
+    let a = Assert {
+        not_starved: Some(true),
+        isolation: Some(true),
+        max_gap_ms: Some(1234),
+        max_spread_pct: Some(12.5),
+        max_throughput_cv: Some(0.42),
+        min_work_rate: Some(100.0),
+        max_p99_wake_latency_ns: Some(5_000_000),
+        max_wake_latency_cv: Some(0.7),
+        min_iteration_rate: Some(500.0),
+        max_migration_ratio: Some(0.05),
+        max_imbalance_ratio: Some(2.5),
+        max_local_dsq_depth: Some(64),
+        fail_on_stall: Some(true),
+        sustained_samples: Some(3),
+        max_fallback_rate: Some(0.01),
+        max_keep_last_rate: Some(0.005),
+        enforce_monitor_thresholds: true,
+        min_page_locality: Some(0.95),
+        max_cross_node_migration_ratio: Some(0.02),
+        max_slow_tier_ratio: Some(0.1),
+        expect_scx_bpf_error_contains: None,
+        expect_scx_bpf_error_matches: None,
+    };
+    let json = serde_json::to_string(&a).unwrap();
+    let b: Assert = serde_json::from_str(&json).unwrap();
+    assert_eq!(a.not_starved, b.not_starved);
+    assert_eq!(a.isolation, b.isolation);
+    assert_eq!(a.max_gap_ms, b.max_gap_ms);
+    assert_eq!(a.max_spread_pct, b.max_spread_pct);
+    assert_eq!(a.max_throughput_cv, b.max_throughput_cv);
+    assert_eq!(a.min_work_rate, b.min_work_rate);
+    assert_eq!(a.max_p99_wake_latency_ns, b.max_p99_wake_latency_ns);
+    assert_eq!(a.max_wake_latency_cv, b.max_wake_latency_cv);
+    assert_eq!(a.min_iteration_rate, b.min_iteration_rate);
+    assert_eq!(a.max_migration_ratio, b.max_migration_ratio);
+    assert_eq!(a.max_imbalance_ratio, b.max_imbalance_ratio);
+    assert_eq!(a.max_local_dsq_depth, b.max_local_dsq_depth);
+    assert_eq!(a.fail_on_stall, b.fail_on_stall);
+    assert_eq!(a.sustained_samples, b.sustained_samples);
+    assert_eq!(a.max_fallback_rate, b.max_fallback_rate);
+    assert_eq!(a.max_keep_last_rate, b.max_keep_last_rate);
+    assert_eq!(a.enforce_monitor_thresholds, b.enforce_monitor_thresholds);
+    assert_eq!(a.min_page_locality, b.min_page_locality);
+    assert_eq!(
+        a.max_cross_node_migration_ratio,
+        b.max_cross_node_migration_ratio
+    );
+    assert_eq!(a.max_slow_tier_ratio, b.max_slow_tier_ratio);
+}
+
+/// `expect_scx_bpf_error_contains` and `expect_scx_bpf_error_matches`
+/// are `#[serde(skip)]` because `Option<&'static str>` cannot
+/// round-trip through a borrowed deserializer (no source-string
+/// lifetime to bind to). Pin both invariants:
+///  1. Serialize omits the two reproducer fields from JSON output
+///     entirely (no key, no null).
+///  2. Deserialize of a previously-serialized Assert that HAD those
+///     fields populated produces `None` for both — the skipped
+///     fields default per `Option::default() == None`.
+///
+/// The sidecar use case for `Assert` serde is "threshold config
+/// roundtrip for stats comparison." Reproducer matcher strings are
+/// part of the test definition itself (not per-run data), so
+/// skipping them keeps the wire format clean.
+///
+/// Switching the field type to `Option<Cow<'static, str>>` (which
+/// can deserialize) was considered but rejected: `Cow` is not
+/// `Copy`, which cascade-breaks `declare_scheduler!`'s const-fn
+/// `Scheduler::assert` macro path used by tests that build `Assert`
+/// values in `const` / `static` initializers. Keeping
+/// `Option<&'static str>` + `#[serde(skip)]` preserves the const-
+/// construction surface; the reproducer matcher strings are test-
+/// author static literals carried in the test definition rather than
+/// runtime data the sidecar needs to round-trip. A future
+/// decomposition into a `ReproducerMatchers` sub-config may revisit
+/// this if a use case (e.g. sidecar-loaded test definitions) needs
+/// the strings to survive serialization end-to-end.
+#[test]
+fn assert_serde_skips_reproducer_string_fields() {
+    let a = Assert::NO_OVERRIDES
+        .expect_scx_bpf_error_contains("apply_cell_config")
+        .expect_scx_bpf_error_matches(r"\bEINVAL\b");
+    let json = serde_json::to_string(&a).unwrap();
+    assert!(
+        !json.contains("expect_scx_bpf_error_contains"),
+        "expect_scx_bpf_error_contains must NOT appear in serialized JSON; got: {json}"
+    );
+    assert!(
+        !json.contains("expect_scx_bpf_error_matches"),
+        "expect_scx_bpf_error_matches must NOT appear in serialized JSON; got: {json}"
+    );
+    let b: Assert = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        b.expect_scx_bpf_error_contains, None,
+        "deserialized reproducer-contains field must default to None"
+    );
+    assert_eq!(
+        b.expect_scx_bpf_error_matches, None,
+        "deserialized reproducer-matches field must default to None"
+    );
+}

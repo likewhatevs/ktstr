@@ -2000,8 +2000,23 @@ impl AssertPlan {
 /// assert_eq!(merged.max_imbalance_ratio, Some(5.0)); // from sched
 /// assert_eq!(merged.max_gap_ms, Some(5000));         // from test
 /// ```
+///
+/// # Serde roundtrip — covers the 20 threshold/check fields only
+///
+/// The serde derive at the struct level covers the 20 threshold +
+/// flag fields (every `Option<bool/u64/f64/u32/usize>` plus the bare
+/// `enforce_monitor_thresholds: bool`). The two reproducer-matcher
+/// fields ([`Self::expect_scx_bpf_error_contains`] and
+/// [`Self::expect_scx_bpf_error_matches`]) carry `#[serde(skip)]`
+/// because their `&'static str` shape cannot round-trip through a
+/// borrowed deserializer — see each field's doc for the rationale.
+/// Sidecar consumers comparing
+/// threshold config across runs treat reproducer matcher strings as
+/// part of the test identity (encoded by name in the sidecar key),
+/// not part of the threshold payload, so the skip is operationally
+/// transparent today.
 #[must_use = "builder methods return a new Assert; discard means config is lost"]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Assert {
     // Worker checks
     /// Enable starvation, fairness spread, and gap checks across
@@ -2133,6 +2148,24 @@ pub struct Assert {
     /// composes without cloning. Empty strings are rejected at
     /// evaluation (an empty literal would silently match every
     /// message and turn this assertion into a no-op).
+    /// `#[serde(skip)]` because the field's `&'static str` shape
+    /// cannot round-trip through a borrowed deserializer (no source-
+    /// string lifetime to bind to). Reproducer matcher strings are
+    /// test-author static literals carried in the test definition
+    /// itself, not per-run data the sidecar needs to roundtrip — so
+    /// skipping them on the wire keeps the JSON shape clean without
+    /// losing any sidecar-consumer functionality. Skipped fields
+    /// default to `None` on deserialize per `Option::default()`.
+    ///
+    /// The `Option<Cow<'static, str>>` alternative that WOULD
+    /// roundtrip is rejected because it cascade-breaks
+    /// `Scheduler::assert`'s const-fn (`Cow` has a heap destructor,
+    /// which breaks the const-fn assignment path used by
+    /// `declare_scheduler!` macro statics). A future decomposition
+    /// into a `ReproducerMatchers` sub-config could revisit this if
+    /// sidecar-loaded test definitions ever need the strings to
+    /// survive end-to-end.
+    #[serde(skip)]
     pub expect_scx_bpf_error_contains: Option<&'static str>,
 
     /// Reproducer-mode regex matcher for the captured `scx_bpf_error`
@@ -2169,6 +2202,12 @@ pub struct Assert {
     /// boundary) slips the gate because the empty string
     /// contains no word characters; see the builder docstring
     /// for the operator-direction.
+    /// `#[serde(skip)]` for the same reason as
+    /// [`Self::expect_scx_bpf_error_contains`] above: `&'static str`
+    /// doesn't roundtrip + the matcher pattern is test-definition
+    /// data, not sidecar-roundtrip data. Skipped fields default to
+    /// `None` on deserialize.
+    #[serde(skip)]
     pub expect_scx_bpf_error_matches: Option<&'static str>,
 }
 
