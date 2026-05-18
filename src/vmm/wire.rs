@@ -1053,6 +1053,30 @@ pub struct KernelOpReplyPayload {
 /// buggy host cannot OOM the guest's PID 1 init.
 pub const KERNEL_OP_REPLY_MAX: usize = 1024 * 1024;
 
+/// Upper bound on the bytes of [`KernelOpRequestPayload::tag`] +
+/// [`KernelOpReplyPayload::reason`] strings. Bounds the
+/// hostile-guest attack surface against the wire layer's 16 MiB
+/// bulk-frame cap — without this cap a guest could publish a
+/// multi-megabyte tag, force the coordinator to format it into
+/// the reply's `reason` field, blow [`KERNEL_OP_REPLY_MAX`] when
+/// the reply is framed, and silently drop the reply on the
+/// guest's RX cap — turning a hostile request into a
+/// 30-second-per-op transport timeout. Tags longer than this cap
+/// are truncated at decode time in
+/// `src/vmm/freeze_coord/dispatch.rs`'s `MsgType::KernelOpRequest`
+/// arm; reason strings produced by the coordinator are
+/// `truncate()`-bounded at format time. 256 bytes is generous for
+/// operator-readable tags (test names, scenario phase labels)
+/// while keeping the bounded-surface invariant intact.
+pub const KERNEL_OP_TAG_MAX: usize = 256;
+/// Upper bound on [`KernelOpReplyPayload::reason`] bytes. See
+/// [`KERNEL_OP_TAG_MAX`] for the hostile-guest-attack rationale —
+/// the reason cap covers the reply path the way the tag cap
+/// covers the request path. 256 bytes fits diagnostic messages
+/// like "PA validation rejected: pa=0x... reason=wrong-half" plus
+/// the request_id + truncated tag.
+pub const KERNEL_OP_REASON_MAX: usize = 256;
+
 /// Outcome of a guest-driven kernel-memory op request: the host
 /// returned a reply (caller inspects [`KernelOpReplyPayload::success`])
 /// or the transport failed (port not open, timeout, malformed frame).

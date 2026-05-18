@@ -363,3 +363,71 @@ fn assert_result_missing_required_field_rejected_by_deserialize() {
         );
     }
 }
+
+/// `#[serde(skip)]` semantic pin for the two reproducer-matcher
+/// fields on [`Assert`] (`expect_scx_bpf_error_contains` +
+/// `expect_scx_bpf_error_matches`). Both fields are intentionally
+/// dropped from the wire format — the `&'static str` shape cannot
+/// roundtrip through a borrowed deserializer (no source-string
+/// lifetime to bind to) and the matcher patterns are test-author
+/// static literals, not per-run data the sidecar needs to
+/// roundtrip (see the docstrings on each field for the full
+/// rationale).
+///
+/// This test pins the BYPASS semantic: an `Assert` constructed
+/// with both matcher fields populated MUST serialize to JSON that
+/// OMITS them, AND the JSON must deserialize back into an `Assert`
+/// whose matcher fields are `None`. Together those two properties
+/// prove the `#[serde(skip)]` is wired on BOTH the serialize and
+/// deserialize sides — a regression that dropped the attribute
+/// from either direction would silently start sending matcher
+/// strings on the wire (serialize side) or attempt to deserialize
+/// them and fail at the borrow-lifetime gate (deserialize side).
+#[test]
+fn assert_reproducer_matcher_fields_serde_skip_bypass() {
+    use crate::assert::Assert;
+
+    let with_matchers = Assert::NO_OVERRIDES
+        .expect_scx_bpf_error_contains("apply_cell_config")
+        .expect_scx_bpf_error_matches(r"(?m)^apply_cell_config$");
+
+    assert_eq!(
+        with_matchers.expect_scx_bpf_error_contains,
+        Some("apply_cell_config"),
+        "constructed value must carry the contains matcher",
+    );
+    assert_eq!(
+        with_matchers.expect_scx_bpf_error_matches,
+        Some(r"(?m)^apply_cell_config$"),
+        "constructed value must carry the regex matcher",
+    );
+
+    let json = serde_json::to_string(&with_matchers)
+        .expect("Assert with matchers must serialize cleanly");
+    assert!(
+        !json.contains("expect_scx_bpf_error_contains"),
+        "serialized JSON must OMIT expect_scx_bpf_error_contains \
+         (#[serde(skip)] regressed on serialize side); got: {json}",
+    );
+    assert!(
+        !json.contains("expect_scx_bpf_error_matches"),
+        "serialized JSON must OMIT expect_scx_bpf_error_matches \
+         (#[serde(skip)] regressed on serialize side); got: {json}",
+    );
+
+    let roundtrip: Assert = serde_json::from_str(&json)
+        .expect("serialized matcher-bearing Assert must deserialize");
+    assert_eq!(
+        roundtrip.expect_scx_bpf_error_contains, None,
+        "deserialized contains matcher must be None — \
+         #[serde(skip)] should default-init Option to None per \
+         Option::default(); regression would either deserialize \
+         the omitted field with a non-None value (impossible per \
+         the skip contract) or fail the deserialize entirely.",
+    );
+    assert_eq!(
+        roundtrip.expect_scx_bpf_error_matches, None,
+        "deserialized regex matcher must be None — same rationale \
+         as expect_scx_bpf_error_contains above.",
+    );
+}

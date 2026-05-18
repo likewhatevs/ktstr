@@ -39,6 +39,40 @@ use super::state::SnapshotRequest;
 /// arise. CRC32 is computed over the payload bytes only — matches
 /// the wire-format contract `parse_tlv_stream` enforces on the
 /// guest's `read_bulk_port_frame`.
+/// Frame a `MSG_TYPE_KERNEL_OP_REPLY` TLV — header (16 bytes) plus
+/// the postcard-encoded [`crate::vmm::wire::KernelOpReplyPayload`]
+/// — into a single buffer the coordinator pushes through
+/// [`crate::vmm::virtio_console::VirtioConsole::queue_input_port1`].
+/// Mirrors [`frame_snapshot_reply`]'s atomic-TLV discipline: the
+/// header + payload buffer is built before the queue call so a
+/// partial push that splits header from payload cannot arise. CRC32
+/// is computed over the postcard bytes only.
+///
+/// `Err(postcard::Error)` propagates when the payload would not
+/// serialize (impossible in practice for the typed
+/// `KernelOpReplyPayload` shape, but the typed `Result` keeps the
+/// caller honest about the encode invariant). Caller maps the error
+/// to a tracing event + drops the reply (the guest's blocking
+/// reader times out at its 30 s per-op deadline — same shape as
+/// any other transport failure).
+pub(super) fn frame_kernel_op_reply(
+    reply: &crate::vmm::wire::KernelOpReplyPayload,
+) -> Result<Vec<u8>, postcard::Error> {
+    use crate::vmm::wire::{FRAME_HEADER_SIZE, MSG_TYPE_KERNEL_OP_REPLY, ShmMessage};
+    use zerocopy::IntoBytes;
+    let payload_bytes = postcard::to_allocvec(reply)?;
+    let header = ShmMessage {
+        msg_type: MSG_TYPE_KERNEL_OP_REPLY,
+        length: payload_bytes.len() as u32,
+        crc32: crc32fast::hash(&payload_bytes),
+        _pad: 0,
+    };
+    let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + payload_bytes.len());
+    buf.extend_from_slice(header.as_bytes());
+    buf.extend_from_slice(&payload_bytes);
+    Ok(buf)
+}
+
 pub(super) fn frame_snapshot_reply(request_id: u32, status: u32, reason: &str) -> Vec<u8> {
     use crate::vmm::wire::{
         FRAME_HEADER_SIZE, MSG_TYPE_SNAPSHOT_REPLY, SNAPSHOT_REASON_MAX, ShmMessage,

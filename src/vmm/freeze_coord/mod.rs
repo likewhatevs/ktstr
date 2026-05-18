@@ -69,8 +69,8 @@ use self::lazy_init::{
 };
 #[allow(unused_imports)]
 use self::snapshot::{
-    VmlinuxSymbolCache, arm_user_watchpoint, decode_snapshot_request, frame_snapshot_reply,
-    poll_eventfd_until_ready_or_timeout, snapshot_tagged_path,
+    VmlinuxSymbolCache, arm_user_watchpoint, decode_snapshot_request, frame_kernel_op_reply,
+    frame_snapshot_reply, poll_eventfd_until_ready_or_timeout, snapshot_tagged_path,
 };
 use self::state::{
     BspExitReason, FREEZE_RENDEZVOUS_TIMEOUT, FreezeState, SnapshotRequest,
@@ -2703,6 +2703,25 @@ impl KtstrVm {
                 // a hostile guest force a spurious capture, mirroring
                 // the SCHED_EXIT promotion gate.
                 let mut snapshot_requests_pending: Vec<SnapshotRequest> = Vec::new();
+                // Per-iteration pending KernelOpRequest queue.
+                // [`crate::vmm::freeze_coord::dispatch::dispatch_bulk_message`]'s
+                // `MsgType::KernelOpRequest` arm decodes incoming
+                // postcard frames into
+                // [`crate::vmm::wire::KernelOpRequestPayload`] and
+                // pushes them here; the coord-loop pending-request
+                // processing block (mirrors the
+                // `snapshot_requests_pending` drain shape) takes the
+                // vec, triggers `freeze_and_capture(false)`, runs
+                // `gmem.write_obj` / `gmem.read_obj` per entry while
+                // all vCPUs are parked, and ships a
+                // [`crate::vmm::wire::KernelOpReplyPayload`] back to
+                // the guest over `port1_tx_buf` per request. CRC-bad
+                // frames + malformed postcard payloads never reach
+                // this vec — they drop silently at the dispatch arm
+                // so a hostile guest cannot force a freeze or inject
+                // an unvalidated host-side write target.
+                let mut kernel_op_requests_pending:
+                    Vec<crate::vmm::wire::KernelOpRequestPayload> = Vec::new();
                 // CAPTURE requests received before `owned_accessor`
                 // adoption are queued here instead of being serviced
                 // immediately. Servicing pre-adoption produces a
@@ -2987,6 +3006,8 @@ impl KtstrVm {
                                         sys_rdy_evt: &mut freeze_coord_sys_rdy_evt,
                                         snapshot_requests_pending:
                                             &mut snapshot_requests_pending,
+                                        kernel_op_requests_pending:
+                                            &mut kernel_op_requests_pending,
                                         kern_phys_base: &kern_phys_base,
                                         kern_phys_base_evt: &kern_phys_base_evt,
                                         kern_virt_kaslr: &kern_virt_kaslr,
@@ -5992,6 +6013,96 @@ impl KtstrVm {
                     // the corresponding `KVM_EXIT_DEBUG` and the
                     // user-watchpoint dispatcher (further down the
                     // iteration) drives the matching capture.
+                    // B7 #19 cold-path Op handler — wire-up landed,
+                    // freeze + gmem.write_obj/read_obj handler
+                    // internals are a follow-up task. For now every
+                    // decoded KernelOpRequest replies with a typed
+                    // `success = false` carrying the in-progress
+                    // diagnostic so the guest's executor surfaces
+                    // the error promptly (well under the 30 s per-op
+                    // transport deadline) rather than hanging until
+                    // timeout. Without this drain, the per-iteration
+                    // pending queue would accumulate without bound
+                    // and every guest-side `Op::WriteKernelCold` /
+                    // `Op::ReadKernelCold` would silently hang —
+                    // a silent-drop violation per the project's
+                    // `feedback_no_silent_drops` rule. The error
+                    // text names the umbrella + follow-up so an
+                    // operator catching the error in CI can find
+                    // the live work.
+                    let pending_kernel_ops = std::mem::take(&mut kernel_op_requests_pending);
+                    for req in pending_kernel_ops {
+                        // Bound the reason field at
+                        // KERNEL_OP_REASON_MAX so a hostile guest's
+                        // unbounded `req.tag` (truncated at decode
+                        // to KERNEL_OP_TAG_MAX but still up to 256
+                        // bytes) cannot inflate the reply past
+                        // KERNEL_OP_REPLY_MAX and trip the guest's
+                        // RX cap. Mirrors the SNAPSHOT_REASON_MAX
+                        // truncation pattern at snapshot.rs's
+                        // `frame_snapshot_reply` reason buffer.
+                        let mut reason = format!(
+                            "cold-path Op handler not yet implemented: \
+                             wire-up is in place but the freeze-rendezvous + \
+                             host-side gmem.write_obj/read_obj dispatch is a \
+                             follow-up task (#48 B7-handler-internals). \
+                             Request was: tag={} mode={:?} direction={:?} entries={}",
+                            req.tag,
+                            req.mode,
+                            req.direction,
+                            req.entries.len(),
+                        );
+                        // String::truncate panics if the cut lands
+                        // inside a multi-byte UTF-8 sequence. The
+                        // formatted reason embeds `req.tag` which
+                        // is bounded but may contain multi-byte
+                        // codepoints — the cap could land mid-
+                        // codepoint and crash the coordinator
+                        // thread (host-side DoS via the wire
+                        // path). Walk down from KERNEL_OP_REASON_MAX
+                        // until is_char_boundary returns true; index
+                        // 0 is guaranteed-valid so the loop
+                        // terminates without panic.
+                        if reason.len() > crate::vmm::wire::KERNEL_OP_REASON_MAX {
+                            let mut idx = crate::vmm::wire::KERNEL_OP_REASON_MAX;
+                            while !reason.is_char_boundary(idx) {
+                                idx -= 1;
+                            }
+                            reason.truncate(idx);
+                        }
+                        let reply = crate::vmm::wire::KernelOpReplyPayload {
+                            request_id: req.request_id,
+                            success: false,
+                            reason,
+                            read_values: Vec::new(),
+                        };
+                        match frame_kernel_op_reply(&reply) {
+                            Ok(frame) => {
+                                freeze_coord_virtio_con
+                                    .lock()
+                                    .queue_input_port1(&frame);
+                                tracing::info!(
+                                    request_id = req.request_id,
+                                    tag = %req.tag,
+                                    mode = ?req.mode,
+                                    direction = ?req.direction,
+                                    entries = req.entries.len(),
+                                    "freeze-coord: KernelOpRequest stub-replied (#19 handler \
+                                     internals pending)"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    request_id = req.request_id,
+                                    tag = %req.tag,
+                                    error = %e,
+                                    "freeze-coord: KernelOpReply postcard serialize failed; \
+                                     guest will see transport timeout"
+                                );
+                            }
+                        }
+                    }
+
                     let pending = std::mem::take(&mut snapshot_requests_pending);
                     for SnapshotRequest {
                         request_id,

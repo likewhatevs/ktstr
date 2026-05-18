@@ -67,6 +67,20 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// never reach this Vec — [`decode_snapshot_request`] returns
     /// `None` and the entry is dropped without observable side effect.
     pub snapshot_requests_pending: &'a mut Vec<SnapshotRequest>,
+    /// Per-iteration accumulator for decoded
+    /// `MSG_TYPE_KERNEL_OP_REQUEST` frames. Drained later in the run-
+    /// loop body where `freeze_and_capture` is in scope — each
+    /// pending kernel-op request triggers its own freeze rendezvous,
+    /// runs `gmem.write_obj` / `gmem.read_obj` while every vCPU is
+    /// parked, and ships the
+    /// [`crate::vmm::wire::KernelOpReplyPayload`] back to the guest
+    /// over port-1 RX. CRC-bad frames are silently dropped (a torn
+    /// frame would otherwise let a hostile guest force a freeze or
+    /// inject a write target the host never validated); malformed
+    /// postcard payloads decode to `None` and drop. Bounded by the
+    /// host's port-1 RX queue capacity — guest publishers backpressure
+    /// against that gate rather than this Vec.
+    pub kernel_op_requests_pending: &'a mut Vec<crate::vmm::wire::KernelOpRequestPayload>,
     /// Guest-reported `phys_base + 1`. Stored by the KERN_ADDRS arm
     /// so the monitor thread can pick it up via Acquire load.
     pub kern_phys_base: &'a Arc<std::sync::atomic::AtomicU64>,
@@ -400,6 +414,71 @@ pub(super) fn dispatch_bulk_message(
                 sinks.snapshot_requests_pending.push(req);
             }
             // SnapshotRequest is coordinator-internal — its matching
+            // reply ships over port-1 RX. Do NOT bucket.
+            None
+        }
+        Some(crate::vmm::wire::MsgType::KernelOpRequest) => {
+            // Decode and stash a CRC-valid KernelOpRequest for
+            // dispatch later in this iteration's body where
+            // `freeze_and_capture` + `gmem.write_obj` are in scope.
+            //
+            // CRC-bad frames drop without a reply: a CRC-failed
+            // frame is BY DEFINITION corrupted — the embedded
+            // `request_id` and `tag` cannot be trusted, so
+            // addressing a reply to "the right" request is
+            // impossible. Replying with `request_id=0` or a guessed
+            // id would risk landing the reply against a DIFFERENT
+            // in-flight request and confusing the guest's blocking
+            // reader. Silent drop is the only defensible option for
+            // a corrupted frame; the guest's per-op transport
+            // deadline (30 s) surfaces the failure prominently
+            // enough that an operator catching a timeout in CI can
+            // localize to the wire layer. The same discipline
+            // governs torn `MSG_TYPE_SNAPSHOT_REQUEST` frames at
+            // [`MsgType::SnapshotRequest`] above. Malformed postcard
+            // payloads (valid CRC, invalid serialization) decode to
+            // `None` via `postcard::from_bytes` and drop the same
+            // way for the same reason.
+            //
+            // Hostile-guest tag-length defense: `req.tag` is a
+            // `String` bounded only by the bulk-frame cap (16 MiB)
+            // until decoded here — a hostile guest could publish a
+            // multi-megabyte tag and force the coordinator to
+            // format it into the reply's `reason` field, blow
+            // `KERNEL_OP_REPLY_MAX` when the reply is framed, and
+            // silently drop the reply on the guest's RX cap (op
+            // times out at the 30 s deadline). Truncate the tag at
+            // decode time to `KERNEL_OP_TAG_MAX` — bounded surface
+            // for every downstream consumer (format!, tracing,
+            // reply payload). The host-side cold handler (see
+            // `freeze_coord/mod.rs` pending-request processing)
+            // validates the resolved PA against the kernel-half +
+            // guest-memory-size + width-alignment invariants before
+            // invoking `gmem.write_obj` / `gmem.read_obj`.
+            if msg.crc_ok
+                && let Ok(mut req) =
+                    postcard::from_bytes::<crate::vmm::wire::KernelOpRequestPayload>(
+                        &msg.payload[..],
+                    )
+            {
+                // String::truncate panics if the cut lands inside
+                // a multi-byte UTF-8 sequence. A hostile guest
+                // publishing a tag whose 256th byte falls mid-codepoint
+                // would crash the coordinator thread — that's
+                // host-side DoS through the wire path. Walk down
+                // from KERNEL_OP_TAG_MAX until is_char_boundary
+                // returns true; index 0 is guaranteed-valid so the
+                // loop terminates without panic.
+                if req.tag.len() > crate::vmm::wire::KERNEL_OP_TAG_MAX {
+                    let mut idx = crate::vmm::wire::KERNEL_OP_TAG_MAX;
+                    while !req.tag.is_char_boundary(idx) {
+                        idx -= 1;
+                    }
+                    req.tag.truncate(idx);
+                }
+                sinks.kernel_op_requests_pending.push(req);
+            }
+            // KernelOpRequest is coordinator-internal — its matching
             // reply ships over port-1 RX. Do NOT bucket.
             None
         }

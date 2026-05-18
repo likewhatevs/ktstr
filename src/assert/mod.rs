@@ -994,6 +994,21 @@ impl OutcomeRef<'_> {
     pub fn is_fail(&self) -> bool {
         matches!(self, OutcomeRef::Fail(_))
     }
+    /// Promote a borrowed [`OutcomeRef`] into an owned [`Outcome`]
+    /// by cloning the borrowed [`AssertDetail`] (when present).
+    /// `OutcomeRef::Pass` carries no payload so the conversion is
+    /// allocation-free. Pairs with [`Outcome::as_ref`] for the
+    /// borrow ↔ own round-trip; [`AssertResult::outcome`] delegates
+    /// here so the fold logic stays single-sourced in
+    /// [`AssertResult::outcome_ref`] and any future fold-rule
+    /// change (e.g. a new terminal arm) lands in one place.
+    pub fn to_owned(&self) -> Outcome {
+        match self {
+            OutcomeRef::Pass => Outcome::Pass,
+            OutcomeRef::Skip(d) => Outcome::Skip((*d).clone()),
+            OutcomeRef::Fail(d) => Outcome::Fail((*d).clone()),
+        }
+    }
 }
 
 /// Verdict for a single test scenario.
@@ -1529,17 +1544,19 @@ impl AssertResult {
     /// avoids the per-call `AssertDetail::clone` this accessor
     /// performs on the `Skip` / `Fail` arms.
     pub fn outcome(&self) -> Outcome {
-        if let Some(d) = self.failure_details().next() {
-            Outcome::Fail(d.clone())
-        } else if let Some(d) = self.skip_reasons().next() {
-            if self.outcomes.iter().all(|o| matches!(o, Outcome::Skip(_))) {
-                Outcome::Skip(d.clone())
-            } else {
-                Outcome::Pass
-            }
-        } else {
-            Outcome::Pass
-        }
+        // Delegates to [`Self::outcome_ref`] + [`OutcomeRef::to_owned`]
+        // so the fold rule (Fail > Pass > Skip with the
+        // empty-vec / all-Skip / mixed-Pass-plus-Skip branch
+        // resolution) lives in ONE place. A future change to the
+        // fold lands at `outcome_ref` and propagates here for free;
+        // the drift-guard test
+        // `assert_result_outcome_ref_matches_owned_outcome_shape`
+        // in `tests_assert.rs` was originally written to catch
+        // divergence between two parallel implementations — after
+        // this delegation it instead catches a single-source bug
+        // (e.g. fold-rule + `as_ref`/`to_owned` mapping drift) but
+        // remains load-bearing.
+        self.outcome_ref().to_owned()
     }
 
     /// Borrow the terminal verdict as an [`OutcomeRef`]. Same
