@@ -50,7 +50,7 @@
 //! per-test FICLONE transparently.
 
 use anyhow::Result;
-use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
+use ktstr::assert::AssertResult;
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
@@ -161,17 +161,12 @@ fn scenario_btrfs_filesystem_visible_at_dev_vda(
         );
     }
 
-    let mut result = AssertResult::pass();
-    result.record_fail(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "/mnt/disk0 statfs.f_type=0x{fs_type:x} matches \
-             BTRFS_SUPER_MAGIC — the disk-template lifecycle \
-             (build, atomic install, FICLONE) produced a \
-             pre-formatted btrfs filesystem on /dev/vda"
-        ),
-    ));
-    Ok(result)
+    Ok(AssertResult::pass().with_note(format!(
+        "/mnt/disk0 statfs.f_type=0x{fs_type:x} matches \
+         BTRFS_SUPER_MAGIC — the disk-template lifecycle \
+         (build, atomic install, FICLONE) produced a \
+         pre-formatted btrfs filesystem on /dev/vda"
+    )))
 }
 
 // ----------------------------------------------------------------------------
@@ -285,16 +280,11 @@ fn scenario_ficlone_clone_writable_and_fresh(_ctx: &ktstr::scenario::Ctx) -> Res
         );
     }
 
-    let mut result = AssertResult::pass();
-    result.record_fail(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "FICLONE clone produced a fresh writable btrfs filesystem \
-             at /mnt/disk0; {sentinel_name} did not pre-exist, was \
-             written successfully, and read back byte-identical"
-        ),
-    ));
-    Ok(result)
+    Ok(AssertResult::pass().with_note(format!(
+        "FICLONE clone produced a fresh writable btrfs filesystem \
+         at /mnt/disk0; {sentinel_name} did not pre-exist, was \
+         written successfully, and read back byte-identical"
+    )))
 }
 
 // ----------------------------------------------------------------------------
