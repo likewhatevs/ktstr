@@ -511,6 +511,11 @@ pub enum Op {
     /// dedicated follow-up sub-batch; until that worker exists the
     /// in-guest wire fallback surfaces a transport timeout. The
     /// bridge path works today for executor unit tests.
+    ///
+    /// **See also.** [`KernelTarget`] — scroll to the
+    /// "Semantic risk" section for the single source of truth
+    /// on which scheduler-bookkeeping targets are safe vs
+    /// silently load-bearing.
     WriteKernelHot {
         /// Ordered list of `(target, value)` pairs to write.
         writes: Vec<(KernelTarget, KernelValue)>,
@@ -522,8 +527,9 @@ pub enum Op {
     /// every write in the batch lands while paused, then resume.
     ///
     /// **Batching is a hard correctness requirement.** Multi-CPU
-    /// seeds (e.g. `with_uptime` writing per-CPU `rq.clock` on every
-    /// CPU at the same instant) must land in ONE freeze window —
+    /// seeds (e.g. a planned `with_uptime` helper writing per-CPU
+    /// `rq.clock` on every CPU at the same instant) must land in
+    /// ONE freeze window —
     /// N separate cold-write ops would mean N rendezvous cycles
     /// and observable inter-CPU skew. The variant payload is a
     /// `Vec` precisely to make batched writes the natural shape.
@@ -550,6 +556,11 @@ pub enum Op {
     /// observes any partial state. Use [`Op::WriteKernelHot`] when
     /// the guest is OK with live-write semantics + caller-side
     /// synchronisation.
+    ///
+    /// **See also.** [`KernelTarget`] — scroll to the
+    /// "Semantic risk" section for the single source of truth
+    /// on which scheduler-bookkeeping targets are safe vs
+    /// silently load-bearing.
     WriteKernelCold {
         /// Ordered list of `(target, value)` pairs to write inside
         /// a single freeze rendezvous.
@@ -740,6 +751,148 @@ impl CpusetSpec {
 /// page-table walk for [`Self::Kva`], or per-CPU dereference for
 /// [`Self::PerCpuField`]).
 ///
+/// # Semantic risk — writing to load-bearing scheduler state
+///
+/// ktstr does not gate or filter target addresses. The framework
+/// trusts the test author to know what they are pointing at. That
+/// trust includes a class of fields where a raw write silently
+/// breaks downstream kernel invariants the test author did not
+/// intend to perturb. By design, mitigation is documentation-only:
+/// the framework will not refuse a write nor emit a runtime warn —
+/// the test author owns the choice. The cases to know about:
+///
+/// **Per-runqueue counters maintained by the scheduler classes.**
+/// Raw writes skip the side-effects the kernel encodes in the
+/// maintainer functions, leaving cross-class accounting in an
+/// inconsistent state.
+///
+/// * **`struct rq.nr_running`** — the per-CPU runqueue task count.
+///   `add_nr_running` / `sub_nr_running` (`kernel/sched/sched.h`)
+///   also (a) fire the `sched_update_nr_running_tp` tracepoint and
+///   (b) call `sched_update_tick_dependency(rq)` (the
+///   `NOHZ_FULL` per-CPU tick gating logic); `add_nr_running`
+///   additionally sets the root-domain `overloaded` bit
+///   (`rq->rd->overloaded`) on the `prev_nr < 2 && new_nr >= 2`
+///   transition. A bare 8-byte store skips all of those; the
+///   counter and the root-domain overload signal diverge, the
+///   NOHZ_FULL CPU may stop or start receiving ticks against the
+///   test author's intent, and downstream load-balance decisions
+///   read a count that no longer matches reality.
+/// * **`struct cfs_rq.h_nr_runnable` / `h_nr_queued` /
+///   `h_nr_idle`** (`kernel/sched/sched.h` `struct cfs_rq`) —
+///   hierarchical CFS task counts maintained by
+///   `account_entity_enqueue` / `dequeue` with cascade up the task
+///   group tree. Raw write skips parent-cfs_rq propagation and
+///   breaks group scheduling accounting.
+/// * **`struct rt_rq.rt_nr_running`** (`kernel/sched/sched.h`
+///   `struct rt_rq`) — RT class runqueue task count; updated by
+///   `inc_rt_tasks` / `dec_rt_tasks` which also maintain the
+///   per-rt_rq `overloaded` bit and the `highest_prio.curr/next`
+///   priority-pushable tracking.
+/// * **`struct dl_rq.dl_nr_running` / `running_bw` / `this_bw`**
+///   (`kernel/sched/sched.h` `struct dl_rq`) — DEADLINE class
+///   counters and bandwidth tracking; `add_running_bw` /
+///   `sub_running_bw` (in `kernel/sched/deadline.c`) implement the
+///   admission-control accounting that SUGOV's `cpu_bw_dl()`
+///   consumes for frequency selection. A raw write to any of
+///   these breaks admission control + DVFS.
+///
+/// **PELT (Per-Entity Load Tracking) averages.** These are
+/// exponential moving averages whose internal `_sum` accumulators
+/// are advanced against `cfs_rq_clock_pelt(cfs_rq)` (see
+/// `kernel/sched/fair.c update_load_avg`, which calls into
+/// `kernel/sched/pelt.c __update_load_avg_se` /
+/// `__update_load_avg_cfs_rq`). Writing only the visible
+/// `_avg` value desynchronises it from the `_sum` it was
+/// computed from; the next `update_load_avg` decays both and
+/// corrupts the next several passes.
+///
+/// * **`struct sched_avg`** fields on `task_struct.se.avg` and
+///   `cfs_rq.avg`: `load_avg`, `runnable_avg`, `util_avg`,
+///   `util_est`, plus `load_sum` / `runnable_sum` / `util_sum`
+///   / `last_update_time` / `period_contrib` (see
+///   `include/linux/sched.h struct sched_avg`).
+/// * **`cfs_rq.removed.{load_avg,util_avg,runnable_avg}`** —
+///   pending-decay buffer for departing entities; flushed at the
+///   next `update_load_avg`.
+/// * **`rq.cpu_capacity`** — set by `update_cpu_capacity`
+///   (`kernel/sched/fair.c`, called from the load-balance path
+///   `update_group_capacity`) from per-CPU RT capacity scaling;
+///   initialized at boot in `kernel/sched/core.c sched_init`.
+///   Raw writes are overwritten on the next load-balance tick
+///   that triggers a capacity recomputation.
+///
+/// **Cgroup / task-group accounting.** Updating the task-group
+/// hierarchy bypasses the cascade that the kernel performs over
+/// every group entity.
+///
+/// * **`task_group.shares`** — cgroup CPU shares, normally set
+///   via `sched_group_set_shares` (`kernel/sched/fair.c`) which
+///   cascades into `update_load_set` + walks every task in the
+///   group. Raw write skips the cascade and produces
+///   inconsistent per-entity load weights.
+/// * **`task_group.cfs_bandwidth.{quota, period, runtime}`** —
+///   CFS bandwidth control. `tg_set_cfs_bandwidth`
+///   (`kernel/sched/core.c`) is the cgroup-fs writer; the
+///   per-cfs_rq runtime distribution is performed by
+///   `__refill_cfs_bandwidth_runtime` (`kernel/sched/fair.c`)
+///   gated by the `cfs_bandwidth_used()` static-key
+///   (`kernel/sched/fair.c`) registered via
+///   `start_cfs_bandwidth` (`kernel/sched/fair.c`). Raw writes
+///   skip all of those.
+///
+/// **The right shape for influencing these fields is to drive the
+/// kernel into the desired state through real activity** —
+/// [`Op::SpawnHost`] (inherits the spawner's cgroup) or
+/// [`Op::SpawnWorkers`] (runs inside a named cgroup) of a
+/// synthetic [`WorkloadConfig`](crate::workload::WorkloadConfig)
+/// for fake-load, real preemption pressure for sched_avg.
+///
+/// ## Fields that ARE safe to write raw (with caveats)
+///
+/// * **`jiffies_64`** (`include/linux/jiffies.h`) — the global
+///   timekeeping tick counter. Safe to advance FORWARD only;
+///   backward jumps trigger soft-lockup watchdog warnings and
+///   can stall `time_after_eq` waiters whose expiry now appears
+///   to be in the past in a way the timer wheel cannot
+///   reconcile.
+/// * **Per-CPU `rq.clock`** (`struct rq.clock`,
+///   `kernel/sched/sched.h`) — the scheduler's per-CPU
+///   wall-time clock. Not generically safe: `update_rq_clock`
+///   (`kernel/sched/core.c`) overwrites it at every
+///   scheduling tick + every enqueue/dequeue from
+///   `sched_clock_cpu(cpu)`, so a raw write lasts at most until
+///   the next tick (~1 ms with `HZ=1000`). The
+///   `rq_clock_skip_update()` helper sets `RQCF_REQ_SKIP` in
+///   `rq->clock_update_flags`, which suppresses one
+///   `update_rq_clock` call, but its semantics are tightly
+///   coupled to the RQCF_ACT_SKIP / RQCF_REQ_SKIP state
+///   machine in `__schedule` — a self-contained "freeze
+///   rq.clock at value X across step Y" pattern is the
+///   framework's responsibility (planned), not a one-shot
+///   raw-write primitive. Bumping `rq.clock_task` directly
+///   is also NOT safe — that field is computed by
+///   `update_rq_clock_task` from `rq->clock` minus IRQ and
+///   steal-time deltas (`prev_irq_time` and
+///   `prev_steal_time_rq`) and a raw write desynchronises it
+///   from the inputs.
+/// * **Per-CPU `rq.scx.clock`** (sched_ext per-CPU clock) — safe
+///   ONLY when paired with setting `SCX_RQ_CLK_VALID` in
+///   `rq.scx.flags`. The flag gates `scx_bpf_now()` reads;
+///   writing the clock without the flag leaves `scx_bpf_now()`
+///   returning stale data, and clearing the flag without
+///   resetting the clock makes downstream BPF readers fall
+///   back to the host TSC unexpectedly. Atomic bit-set without
+///   read-back (an `OrU64` RMW variant of [`KernelValue`] that
+///   does `flags |= mask` in one host-side step) is the cleaner
+///   shape; until that variant lands, raw RMW via `U64` leaves
+///   a race window between the host-side read and the
+///   host-side write.
+/// * **`scx-ktstr` private bss / per-CPU scratch** — the
+///   fixture scheduler exposes a dedicated write surface for
+///   test use; raw writes there don't propagate into core
+///   sched code by construction.
+///
 /// # `#[non_exhaustive]`
 ///
 /// `KernelTarget` is `#[non_exhaustive]` — see
@@ -794,6 +947,10 @@ pub enum KernelTarget {
 impl KernelTarget {
     /// Kernel text/data/bss symbol target. Resolves at op-dispatch
     /// time via the runtime kernel image base + KASLR `phys_base`.
+    ///
+    /// **Heads up.** See the `# Semantic risk` section on the
+    /// enclosing [`KernelTarget`] type doc before pointing this
+    /// at a scheduler-bookkeeping symbol.
     pub fn symbol(name: impl Into<Cow<'static, str>>) -> Self {
         KernelTarget::Symbol(name.into())
     }
@@ -803,12 +960,20 @@ impl KernelTarget {
     /// `__per_cpu_offset[cpu]` to the base symbol KVA before
     /// constructing the variant; use [`Self::per_cpu_field`]
     /// instead for the framework-resolved per-CPU shape.
+    ///
+    /// **Heads up.** See the `# Semantic risk` section on the
+    /// enclosing [`KernelTarget`] type doc before pointing this
+    /// at a scheduler-bookkeeping address.
     pub const fn direct(kva: u64) -> Self {
         KernelTarget::Direct(kva)
     }
 
     /// Vmalloc'd / vmap'd KVA target. Translates via page-table
     /// walk through the guest's `CR3`.
+    ///
+    /// **Heads up.** See the `# Semantic risk` section on the
+    /// enclosing [`KernelTarget`] type doc before pointing this
+    /// at a scheduler-bookkeeping address.
     pub const fn kva(kva: u64) -> Self {
         KernelTarget::Kva(kva)
     }
@@ -816,6 +981,10 @@ impl KernelTarget {
     /// Per-CPU field of a kernel struct. Resolves at op-dispatch
     /// time via `symbol_kva + __per_cpu_offset[cpu] + BTF byte
     /// offset of field`.
+    ///
+    /// **Heads up.** See the `# Semantic risk` section on the
+    /// enclosing [`KernelTarget`] type doc before pointing this
+    /// at a per-CPU scheduler-bookkeeping field.
     pub fn per_cpu_field(
         symbol: impl Into<Cow<'static, str>>,
         field: impl Into<Cow<'static, str>>,
