@@ -1543,6 +1543,174 @@ fn assert_serde_roundtrip_preserves_every_non_skipped_field() {
     assert_eq!(a.max_slow_tier_ratio, b.max_slow_tier_ratio);
 }
 
+// -- Outcome enum -----------------------------------------------------
+
+/// Compile-time pin that `Outcome` implements the documented derive
+/// set. A regression that drops Serialize/Deserialize (breaking
+/// sidecar wire-format) or PartialEq/Eq (breaking stats-comparison
+/// tooling) would trip at type-check time.
+#[test]
+fn outcome_implements_expected_traits() {
+    fn requires<T: Clone + std::fmt::Debug + PartialEq + Eq + serde::Serialize + serde::de::DeserializeOwned>() {}
+    requires::<Outcome>();
+}
+
+/// `Outcome::merge` precedence: **Fail > Pass > Skip** per the
+/// production semantic at `AssertResult::merge`
+/// (`passed &= other` plus `skipped &&= other`). Full 9-case
+/// commutative truth table; any one cell flipping would indicate
+/// the precedence flipped. A "Fail > Skip > Pass" alternative would
+/// flip the existing `merge_skip_plus_pass_demotes_skip` test
+/// invariant; the `Fail > Pass > Skip` lattice is the one this
+/// implementation actually realizes.
+#[test]
+fn outcome_merge_precedence_fail_pass_skip() {
+    let d = AssertDetail::new(DetailKind::Other, "payload");
+    let pass = || Outcome::Pass;
+    let skip = || Outcome::Skip(d.clone());
+    let fail = || Outcome::Fail(d.clone());
+    // Skip ∪ Pass → Pass (both orderings)
+    assert!(skip().merge(pass()).is_pass());
+    assert!(pass().merge(skip()).is_pass());
+    // Skip ∪ Fail → Fail (both orderings)
+    assert!(skip().merge(fail()).is_fail());
+    assert!(fail().merge(skip()).is_fail());
+    // Pass ∪ Fail → Fail (both orderings — any failure wins)
+    assert!(pass().merge(fail()).is_fail());
+    assert!(fail().merge(pass()).is_fail());
+    // Identity cases
+    assert!(pass().merge(pass()).is_pass());
+    assert!(skip().merge(skip()).is_skip());
+    assert!(fail().merge(fail()).is_fail());
+}
+
+/// `Outcome::{is_pass, is_skip, is_fail}` 3×3 truth table. A
+/// regression that returned wrong polarity (e.g. `is_skip` silently
+/// returning false for `Skip(_)` because of a pattern-match typo)
+/// would trip here.
+#[test]
+fn outcome_accessor_truth_table() {
+    let d = AssertDetail::new(DetailKind::Other, "x");
+    assert!(Outcome::Pass.is_pass());
+    assert!(!Outcome::Pass.is_skip());
+    assert!(!Outcome::Pass.is_fail());
+
+    assert!(!Outcome::Skip(d.clone()).is_pass());
+    assert!(Outcome::Skip(d.clone()).is_skip());
+    assert!(!Outcome::Skip(d.clone()).is_fail());
+
+    assert!(!Outcome::Fail(d.clone()).is_pass());
+    assert!(!Outcome::Fail(d.clone()).is_skip());
+    assert!(Outcome::Fail(d.clone()).is_fail());
+}
+
+/// `AssertResult::outcome()` Phase-2a derived view over the tri-state
+/// `(passed, skipped, details)` representation. Pins the synthesis
+/// rules so Phase-2b's eventual replacement of the underlying fields
+/// produces the same terminal verdict consumers see today.
+#[test]
+fn assert_result_outcome_derives_from_tri_state() {
+    // Pass result with no notable details → Outcome::Pass.
+    assert!(AssertResult::pass().outcome().is_pass());
+
+    // Skip result → Outcome::Skip carrying the Skip-kind detail.
+    let skip_result = AssertResult::skip("topology missing");
+    let Outcome::Skip(d) = skip_result.outcome() else {
+        panic!("expected Outcome::Skip, got {:?}", skip_result.outcome());
+    };
+    assert_eq!(d.kind, DetailKind::Skip);
+    assert!(d.message.contains("topology missing"));
+
+    // Fail result → Outcome::Fail carrying the non-Skip detail.
+    let fail_result = AssertResult::fail(AssertDetail::new(DetailKind::Starved, "boom"));
+    let Outcome::Fail(d) = fail_result.outcome() else {
+        panic!("expected Outcome::Fail, got {:?}", fail_result.outcome());
+    };
+    assert_eq!(d.kind, DetailKind::Starved);
+    assert!(d.message.contains("boom"));
+}
+
+/// Producer-side defect detector: `outcome()` debug-asserts when a
+/// caller sets `passed=false` without pushing a non-Skip detail.
+/// Pins the panic message so a regression that renames the
+/// producer-defect signal (or removes the assert) trips loudly.
+/// Release builds fall back to the `"unspecified failure"`
+/// placeholder; this test guards the debug-build safety net that
+/// catches the bug at the test site instead of the operator dump.
+#[test]
+#[should_panic(expected = "producer-side defect")]
+fn assert_result_outcome_debug_asserts_on_failure_without_detail() {
+    let mut r = AssertResult::pass();
+    r.passed = false; // simulate a hand-constructed failure without a detail
+    let _ = r.outcome();
+}
+
+/// Same producer-defect detector for the skip axis: `outcome()`
+/// debug-asserts when `skipped=true` is set without pushing a
+/// Skip-kind detail. Mirror of the !passed assert above.
+#[test]
+#[should_panic(expected = "producer-side defect")]
+fn assert_result_outcome_debug_asserts_on_skip_without_detail() {
+    let mut r = AssertResult::pass();
+    r.skipped = true; // skipped flag set, but no Skip-kind detail pushed
+    let _ = r.outcome();
+}
+
+/// Inconsistent-flag fixture: `passed=false, skipped=true`. The
+/// accessor's `!self.passed` branch fires first, returning Fail even
+/// though skipped=true is also set. Pins "Fail dominates inconsistent
+/// state" so a future refactor that flips accessor priority (skip
+/// before fail) trips this test.
+///
+/// Uses a fixture with BOTH a Skip-kind detail and a non-Skip detail
+/// so the debug_assert path in `outcome()` doesn't fire (a non-Skip
+/// detail exists for the Fail branch to consume).
+#[test]
+fn assert_result_outcome_fail_dominates_inconsistent_flags() {
+    let mut r = AssertResult::pass();
+    r.passed = false;
+    r.skipped = true;
+    r.details.push(AssertDetail::new(DetailKind::Skip, "skip reason"));
+    r.details.push(AssertDetail::new(DetailKind::Starved, "real failure"));
+    let Outcome::Fail(d) = r.outcome() else {
+        panic!("expected Outcome::Fail on inconsistent flags, got {:?}", r.outcome());
+    };
+    // Fail branch picks the first non-Skip detail, so the Starved
+    // entry surfaces (not the Skip one) — confirms the priority of
+    // "Fail with real diagnostic" over "Skip with reason" on
+    // contradictory state.
+    assert_eq!(d.kind, DetailKind::Starved);
+    assert!(d.message.contains("real failure"));
+}
+
+/// `Outcome` serde uses the explicit-tag style `#[serde(tag =
+/// "kind", content = "data")]`. Pin the JSON shape so a refactor
+/// that flips to `untagged` or `tag = "type"` trips loudly. Sidecar
+/// consumers will hard-code on the `"kind"` key once Phase-2b
+/// migrates AssertResult to carry Outcomes on the wire.
+#[test]
+fn outcome_serde_uses_tag_kind_content_data() {
+    let d = AssertDetail::new(DetailKind::Other, "msg");
+    let pass_json = serde_json::to_string(&Outcome::Pass).unwrap();
+    assert!(
+        pass_json.contains("\"kind\":\"Pass\""),
+        "Pass must serialize with kind tag: {pass_json}"
+    );
+    let fail_json = serde_json::to_string(&Outcome::Fail(d.clone())).unwrap();
+    assert!(
+        fail_json.contains("\"kind\":\"Fail\""),
+        "Fail must serialize with kind tag: {fail_json}"
+    );
+    assert!(
+        fail_json.contains("\"data\""),
+        "Fail must serialize with content data: {fail_json}"
+    );
+
+    // Roundtrip.
+    let recovered: Outcome = serde_json::from_str(&fail_json).unwrap();
+    assert!(recovered.is_fail());
+}
+
 /// `expect_scx_bpf_error_contains` and `expect_scx_bpf_error_matches`
 /// are `#[serde(skip)]` because `Option<&'static str>` cannot
 /// round-trip through a borrowed deserializer (no source-string

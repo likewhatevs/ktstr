@@ -693,9 +693,10 @@ pub mod prelude {
     // `declare_scheduler!` macro.
     pub use crate::assert::{
         Assert, AssertDetail, AssertResult, COMPARATOR_VOCABULARY, ClaimBuilder, DetailKind,
-        EachClaim, InfoNote, MAX_RECORDED_PASSES, NoteValue, PASSES_TRUNCATION_SENTINEL_COMPARATOR,
-        PASSES_TRUNCATION_SENTINEL_NAME, PassDetail, SchedulerBaseline, SeqClaim, SeriesField,
-        SetClaim, Verdict, assert_baseline, assert_scx_events_clean,
+        EachClaim, InfoNote, MAX_RECORDED_PASSES, NoteValue, Outcome,
+        PASSES_TRUNCATION_SENTINEL_COMPARATOR, PASSES_TRUNCATION_SENTINEL_NAME, PassDetail,
+        SchedulerBaseline, SeqClaim, SeriesField, SetClaim, Verdict, assert_baseline,
+        assert_scx_events_clean,
     };
     pub use crate::cgroup::CgroupManager;
     pub use crate::claim;

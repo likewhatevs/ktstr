@@ -830,6 +830,86 @@ impl From<&str> for NoteValue {
     }
 }
 
+/// Terminal verdict for a single test scenario or merge fold —
+/// strict three-state enum that replaces the `(passed, skipped)`
+/// bool-pair encoding on [`AssertResult`].
+///
+/// Precedence under [`AssertResult::merge`]: **`Fail > Pass > Skip`**.
+/// A merge of any subset that contains at least one `Fail` resolves
+/// to `Fail`; a merge of `Pass + Skip` resolves to `Pass` (Skip is
+/// the weakest outcome — "couldn't check" is dominated by any real
+/// check that ran). Skip-only merges stay Skip. Pass-only merges
+/// stay Pass. The precedence matches the long-standing semantic at
+/// [`AssertResult::merge`] (`passed &= other.passed; skipped &&=
+/// other.skipped`), encoded as a single enum ordering so consumers
+/// can `max()` outcomes without re-deriving the bool-pair table.
+///
+/// Note: Notes do NOT belong here. [`AssertResult::info_notes`]
+/// is the structurally-separate context stream; re-encoding Note
+/// as an `Outcome` variant would re-mix the failure / verdict
+/// surface with the context surface and erase the separation.
+/// Outcome is strictly terminal verdict; notes are non-verdict
+/// context.
+///
+/// `Skip` and `Fail` carry an [`AssertDetail`] payload so the
+/// match arm has the diagnostic in hand without re-walking
+/// `details`. `Pass` carries no payload — there is no failure to
+/// describe.
+///
+/// Phase 2a (this landing) introduces the enum + the
+/// [`AssertResult::outcome`] accessor that folds the existing
+/// `(passed, skipped, details)` representation into the new
+/// `Outcome`. Phase 2b will replace the tri-state fields with an
+/// `outcomes: Vec<Outcome>` field and migrate the ~150 consumer
+/// sites; until then, `Outcome` is a read-only derived view.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "data")]
+pub enum Outcome {
+    Pass,
+    Skip(AssertDetail),
+    Fail(AssertDetail),
+}
+
+impl Outcome {
+    /// True iff `self == Outcome::Pass`.
+    pub fn is_pass(&self) -> bool {
+        matches!(self, Outcome::Pass)
+    }
+
+    /// True iff `self == Outcome::Skip(_)`.
+    pub fn is_skip(&self) -> bool {
+        matches!(self, Outcome::Skip(_))
+    }
+
+    /// True iff `self == Outcome::Fail(_)`.
+    pub fn is_fail(&self) -> bool {
+        matches!(self, Outcome::Fail(_))
+    }
+
+    /// Merge two outcomes per the precedence `Fail > Pass > Skip`.
+    ///
+    /// Discriminant-commutative: the merged Pass/Skip/Fail kind is
+    /// the same regardless of operand order. Idempotent on Pass
+    /// (`Pass.merge(Pass) == Pass`).
+    ///
+    /// Payload semantic (NOT commutative):
+    /// - Same-variant ties (Fail+Fail, Skip+Skip): the LEFT operand's
+    ///   payload wins, so caller-controlled merge ordering produces
+    ///   deterministic detail content.
+    /// - Cross-variant Fail+Skip: the merged outcome is Fail and the
+    ///   payload comes from whichever side carries the Fail (the Skip's
+    ///   payload is dropped — the merged verdict is Fail, so the Skip
+    ///   narrative is irrelevant to the failure record).
+    pub fn merge(self, other: Outcome) -> Outcome {
+        use Outcome::*;
+        match (self, other) {
+            (Fail(d), _) | (_, Fail(d)) => Fail(d),
+            (Pass, _) | (_, Pass) => Pass,
+            (Skip(d), Skip(_)) => Skip(d),
+        }
+    }
+}
+
 /// Verdict for a single test scenario.
 ///
 /// **Wire-format stability**: this struct is postcard-serialized as
@@ -845,12 +925,22 @@ impl From<&str> for NoteValue {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AssertResult {
     /// Whether all checks passed.
+    ///
+    /// **Prefer [`Self::outcome`].** Phase 2b replaces this bool +
+    /// [`Self::skipped`] + [`Self::details`] tri-state with an
+    /// `outcomes: Vec<Outcome>` field; new readers should match on
+    /// `Outcome` so the eventual field removal is a single migration
+    /// instead of cascading bool-pair updates across hundreds of
+    /// sites.
     pub passed: bool,
     /// True when the scenario was skipped (e.g. topology mismatch,
     /// missing resource). `passed` stays `true` so gate callers that
     /// treat skip as "not a failure" continue to work; stats tooling
     /// must subtract skipped runs from pass counts so they don't
     /// count as successful executions.
+    ///
+    /// **Prefer [`Self::outcome`].** Phase 2b removes this field
+    /// (see [`Self::passed`] for the rationale).
     pub skipped: bool,
     /// Human-readable diagnostic messages (failures, warnings), each
     /// tagged with a [`DetailKind`] for structural filtering.
@@ -1201,14 +1291,78 @@ impl AssertResult {
     /// Convenience accessor returning [`Self::skipped`]. Stats tooling
     /// uses this to subtract non-executions from pass counts so
     /// "topology mismatch" runs don't inflate the pass rate.
+    ///
+    /// **Prefer [`Self::outcome`] + [`Outcome::is_skip`].** Phase 2b
+    /// removes the underlying [`Self::skipped`] field; see [`Self::passed`].
     pub fn is_skipped(&self) -> bool {
         self.skipped
     }
     /// Convenience accessor returning the negation of [`Self::passed`].
     /// Mirrors [`Self::is_skipped`] so short-circuit branches reading
     /// "did this claim fail?" don't have to negate `.passed` inline.
+    ///
+    /// **Prefer [`Self::outcome`] + [`Outcome::is_fail`].** Phase 2b
+    /// removes the underlying [`Self::passed`] field; see [`Self::passed`].
     pub fn is_failed(&self) -> bool {
         !self.passed
+    }
+
+    /// Terminal verdict folded into a single [`Outcome`] value.
+    ///
+    /// Phase-2a read-only derived view over the existing
+    /// `(passed, skipped, details)` tri-state representation. Maps:
+    /// - `!self.passed` → `Outcome::Fail(first non-Skip detail or
+    ///   a synthesized "unspecified failure" placeholder when
+    ///   `details` is empty)` so consumers always have a payload to
+    ///   render.
+    /// - `self.skipped` → `Outcome::Skip(first Skip detail, or a
+    ///   synthesized "unspecified skip" placeholder)`.
+    /// - Otherwise → `Outcome::Pass`.
+    ///
+    /// Phase-2b will replace the underlying fields with
+    /// `outcomes: Vec<Outcome>` and this accessor becomes a fold
+    /// over that vec via [`Outcome::merge`] instead of a synthesis
+    /// from bools. Test authors using this accessor today get the
+    /// same terminal verdict regardless of which side of the
+    /// migration they're on.
+    pub fn outcome(&self) -> Outcome {
+        if !self.passed {
+            let candidate = self
+                .details
+                .iter()
+                .find(|d| d.kind != DetailKind::Skip)
+                .cloned();
+            debug_assert!(
+                candidate.is_some(),
+                "AssertResult.passed=false but details has no non-Skip entry — \
+                 producer-side defect: a failure was recorded without an \
+                 accompanying diagnostic. Every site that sets passed=false \
+                 must also push an AssertDetail describing the failure."
+            );
+            let detail = candidate.unwrap_or_else(|| {
+                AssertDetail::new(DetailKind::Other, "unspecified failure")
+            });
+            Outcome::Fail(detail)
+        } else if self.skipped {
+            let candidate = self
+                .details
+                .iter()
+                .find(|d| d.kind == DetailKind::Skip)
+                .cloned();
+            debug_assert!(
+                candidate.is_some(),
+                "AssertResult.skipped=true but details has no Skip-kind entry — \
+                 producer-side defect: a skip was recorded without a reason. \
+                 Every site that sets skipped=true must also push an \
+                 AssertDetail with DetailKind::Skip describing the skip reason."
+            );
+            let detail = candidate.unwrap_or_else(|| {
+                AssertDetail::new(DetailKind::Skip, "unspecified skip")
+            });
+            Outcome::Skip(detail)
+        } else {
+            Outcome::Pass
+        }
     }
     /// Fold `other` into `self`. `passed` is conjoined (any failure
     /// wins), `skipped` is conjoined (both must skip for the merged
