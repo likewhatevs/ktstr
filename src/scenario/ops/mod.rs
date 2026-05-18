@@ -2110,7 +2110,23 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
 /// — so a Step's ops can reach into Backdrop-declared cgroups by
 /// name without the Backdrop leaking implementation details.
 fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result<()> {
-    for op in ops {
+    // Pre-pass: fold runs of adjacent `Op::WriteKernelCold`
+    // singletons into one merged op so that multi-CPU seeds
+    // (e.g. `with_uptime` writing per-CPU `rq.clock` on every CPU
+    // at the same instant) land in ONE freeze rendezvous rather
+    // than N — N separate rendezvous cycles would produce
+    // observable inter-CPU skew.
+    //
+    // Only `Op::WriteKernelCold` merges in this pre-pass; reads
+    // stay one-per-rendezvous until a wire-format follow-up adds
+    // per-entry direction + tag (needed so multi-read batches can
+    // route each reply back to its caller's tag). Any non-cold-
+    // write op is a hard barrier — including hot variants, every
+    // other Op variant, and `Op::WriteKernelHot`. Caller-supplied
+    // `Op::WriteKernelCold` already containing multiple writes
+    // passes through unchanged.
+    let merged = merge_adjacent_cold_writes(ops);
+    for op in &merged {
         match op {
             Op::AddCgroup { name } => {
                 // Mirror the collision check in `apply_setup`
@@ -2869,6 +2885,55 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
         }
     }
     Ok(())
+}
+
+/// Fold runs of adjacent [`Op::WriteKernelCold`] singleton ops
+/// into one merged `Op::WriteKernelCold` with the concatenated
+/// `writes` vec. Caller-supplied multi-write `Op::WriteKernelCold`
+/// ops also fold (their writes vec appends onto the running batch).
+///
+/// Merge eligibility is strictly `Op::WriteKernelCold` adjacent to
+/// `Op::WriteKernelCold` — any other op (including
+/// [`Op::ReadKernelCold`], [`Op::WriteKernelHot`],
+/// [`Op::CaptureSnapshot`], or any unrelated op) is a hard
+/// barrier and starts a new batch.
+///
+/// Reads do NOT merge in this pre-pass — each
+/// [`Op::ReadKernelCold`] still triggers its own freeze
+/// rendezvous. Folding reads requires per-entry tags on the wire
+/// (so each entry's reply lands under its caller's tag), which
+/// lands in a follow-up batch.
+///
+/// Pre-pass cost: one allocation per `apply_ops` call (the
+/// returned `Vec<Op>`). When the input contains no adjacent cold
+/// writes the output is structurally equivalent to the input.
+fn merge_adjacent_cold_writes(ops: &[Op]) -> Vec<Op> {
+    let mut out: Vec<Op> = Vec::with_capacity(ops.len());
+    let mut pending_writes: Option<Vec<(KernelTarget, KernelValue)>> = None;
+    for op in ops {
+        match op {
+            Op::WriteKernelCold { writes } => {
+                // Fold into the running batch; this collapses N
+                // adjacent singletons into one merged op.
+                match &mut pending_writes {
+                    Some(buf) => buf.extend(writes.iter().cloned()),
+                    None => pending_writes = Some(writes.clone()),
+                }
+            }
+            _ => {
+                // Barrier — flush the in-flight cold-write batch
+                // before emitting the non-mergeable op.
+                if let Some(buf) = pending_writes.take() {
+                    out.push(Op::WriteKernelCold { writes: buf });
+                }
+                out.push(op.clone());
+            }
+        }
+    }
+    if let Some(buf) = pending_writes.take() {
+        out.push(Op::WriteKernelCold { writes: buf });
+    }
+    out
 }
 
 /// Build a [`crate::vmm::wire::KernelOpRequestPayload`] from the
@@ -10569,6 +10634,121 @@ mod tests {
         }
         cleanup_state(&mut state);
     }
+
+    /// Three singleton `Op::WriteKernelCold` ops dispatched
+    /// through `apply_ops` produce ONE bridge callback with all 3
+    /// writes — confirms the executor's pre-pass folds adjacent
+    /// singletons into a single freeze rendezvous end-to-end,
+    /// not just at the helper level. Pins the freeze-rendezvous-
+    /// batching contract the [`Op::WriteKernelCold`] doc names
+    /// as a "hard correctness requirement" (no inter-CPU skew).
+    #[test]
+    fn apply_ops_merges_three_adjacent_cold_write_singletons_into_one_dispatch() {
+        use std::sync::Arc;
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<
+            crate::vmm::wire::KernelOpRequestPayload,
+        >::new()));
+        let captured_clone = captured.clone();
+        let kernel_op_cb: crate::scenario::snapshot::KernelOpCallback = Arc::new(move |req| {
+            captured_clone.lock().unwrap().push(req.clone());
+            crate::vmm::wire::KernelOpReplyPayload {
+                request_id: req.request_id,
+                success: true,
+                reason: String::new(),
+                read_values: vec![],
+            }
+        });
+        let bridge = crate::scenario::snapshot::SnapshotBridge::new(Arc::new(|_| None))
+            .with_kernel_op(kernel_op_cb);
+        let _bg = bridge.set_thread_local();
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let ops = vec![
+            Op::write_kernel_cold(
+                KernelTarget::per_cpu_field("runqueues", "clock", 0),
+                KernelValue::u64(100),
+            ),
+            Op::write_kernel_cold(
+                KernelTarget::per_cpu_field("runqueues", "clock", 1),
+                KernelValue::u64(200),
+            ),
+            Op::write_kernel_cold(
+                KernelTarget::per_cpu_field("runqueues", "clock", 2),
+                KernelValue::u64(300),
+            ),
+        ];
+        apply_ops_test(&ctx, &mut state, &ops).expect("merged cold-write batch must dispatch");
+        let payloads = captured.lock().unwrap();
+        assert_eq!(
+            payloads.len(),
+            1,
+            "3 adjacent singletons must collapse into ONE bridge dispatch, got {} dispatches",
+            payloads.len()
+        );
+        assert_eq!(payloads[0].mode, crate::vmm::wire::KernelOpMode::Cold);
+        assert_eq!(
+            payloads[0].direction,
+            crate::vmm::wire::KernelOpDirection::Write
+        );
+        assert_eq!(
+            payloads[0].entries.len(),
+            3,
+            "merged batch must carry all 3 writes in input order"
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// `Op::CaptureSnapshot` between two cold-write singletons
+    /// acts as a hard barrier — the snapshot must observe state
+    /// AFTER the first write but BEFORE the second. Pins the
+    /// "any non-cold-write op is a barrier" generalization in the
+    /// pre-pass: a regression that narrowed the predicate to
+    /// "only kernel ops barrier" would fold across CaptureSnapshot
+    /// and silently break the captured-state-between-writes
+    /// contract.
+    #[test]
+    fn merge_adjacent_cold_writes_capture_snapshot_is_barrier() {
+        use super::merge_adjacent_cold_writes;
+        let ops = vec![
+            Op::write_kernel_cold(KernelTarget::symbol("a"), KernelValue::u64(1)),
+            Op::CaptureSnapshot { name: "mid".into() },
+            Op::write_kernel_cold(KernelTarget::symbol("b"), KernelValue::u64(2)),
+        ];
+        let merged = merge_adjacent_cold_writes(&ops);
+        assert_eq!(merged.len(), 3, "CaptureSnapshot must split cold writes");
+        assert!(matches!(merged[0], Op::WriteKernelCold { ref writes } if writes.len() == 1));
+        assert!(matches!(merged[1], Op::CaptureSnapshot { .. }));
+        assert!(matches!(merged[2], Op::WriteKernelCold { ref writes } if writes.len() == 1));
+    }
+
+    /// A generic non-kernel op (e.g. `Op::AddCgroup`) between two
+    /// cold-write singletons acts as a hard barrier. Pins the
+    /// "any non-cold-write op is a barrier" predicate so a
+    /// regression that narrowed to "only kernel ops barrier" or
+    /// "only Op::Write/Read variants barrier" silently breaks
+    /// sequencing with cgroup setup / payload spawn / etc.
+    #[test]
+    fn merge_adjacent_cold_writes_non_kernel_op_is_barrier() {
+        use super::merge_adjacent_cold_writes;
+        let ops = vec![
+            Op::write_kernel_cold(KernelTarget::symbol("a"), KernelValue::u64(1)),
+            Op::AddCgroup {
+                name: "cg_mid".into(),
+            },
+            Op::write_kernel_cold(KernelTarget::symbol("b"), KernelValue::u64(2)),
+        ];
+        let merged = merge_adjacent_cold_writes(&ops);
+        assert_eq!(
+            merged.len(),
+            3,
+            "non-kernel cgroup op must split cold writes"
+        );
+        assert!(matches!(merged[0], Op::WriteKernelCold { ref writes } if writes.len() == 1));
+        assert!(matches!(merged[1], Op::AddCgroup { .. }));
+        assert!(matches!(merged[2], Op::WriteKernelCold { ref writes } if writes.len() == 1));
+    }
 }
 
 #[cfg(test)]
@@ -10641,8 +10821,8 @@ mod kernel_op_dispatch_tests {
     use std::sync::Arc;
 
     use super::{
-        KernelTarget, KernelValue, build_kernel_op_request, dispatch_kernel_op_request,
-        write_entries_from_writes,
+        KernelTarget, KernelValue, Op, build_kernel_op_request, dispatch_kernel_op_request,
+        merge_adjacent_cold_writes, write_entries_from_writes,
     };
     use crate::scenario::snapshot::{CaptureCallback, KernelOpCallback, SnapshotBridge};
 
@@ -10854,5 +11034,143 @@ mod kernel_op_dispatch_tests {
             msg.contains("symbol 'bogus' not found"),
             "error must surface the host reason: {msg}"
         );
+    }
+
+    /// Three adjacent `Op::WriteKernelCold` singletons fold into
+    /// one merged op with the 3 writes concatenated in input
+    /// order. Pins the multi-CPU-seed shape — `with_uptime`
+    /// writing per-CPU `rq.clock` on every CPU must land in ONE
+    /// freeze rendezvous, not N.
+    #[test]
+    fn merge_adjacent_cold_writes_folds_three_singletons() {
+        let ops = vec![
+            Op::write_kernel_cold(
+                KernelTarget::per_cpu_field("runqueues", "clock", 0),
+                KernelValue::u64(100),
+            ),
+            Op::write_kernel_cold(
+                KernelTarget::per_cpu_field("runqueues", "clock", 1),
+                KernelValue::u64(200),
+            ),
+            Op::write_kernel_cold(
+                KernelTarget::per_cpu_field("runqueues", "clock", 2),
+                KernelValue::u64(300),
+            ),
+        ];
+        let merged = merge_adjacent_cold_writes(&ops);
+        assert_eq!(
+            merged.len(),
+            1,
+            "3 adjacent cold-write singletons must fold to 1 op"
+        );
+        match &merged[0] {
+            Op::WriteKernelCold { writes } => {
+                assert_eq!(writes.len(), 3, "merged batch must carry all 3 writes");
+                match &writes[0].1 {
+                    KernelValue::U64(100) => {}
+                    other => panic!("first entry value mismatch: {other:?}"),
+                }
+                match &writes[2].1 {
+                    KernelValue::U64(300) => {}
+                    other => panic!("third entry value mismatch: {other:?}"),
+                }
+            }
+            other => panic!("expected merged WriteKernelCold, got {other:?}"),
+        }
+    }
+
+    /// An `Op::WriteKernelHot` between two cold-write singletons
+    /// is a hard barrier — the two cold-write singletons emerge as
+    /// 2 separate `Op::WriteKernelCold` ops (one on each side of
+    /// the hot barrier), preserving rendezvous boundaries.
+    #[test]
+    fn merge_adjacent_cold_writes_hot_is_barrier() {
+        let ops = vec![
+            Op::write_kernel_cold(KernelTarget::symbol("a"), KernelValue::u64(1)),
+            Op::write_kernel_hot(KernelTarget::symbol("h"), KernelValue::u64(2)),
+            Op::write_kernel_cold(KernelTarget::symbol("b"), KernelValue::u64(3)),
+        ];
+        let merged = merge_adjacent_cold_writes(&ops);
+        assert_eq!(merged.len(), 3, "hot barrier must split cold writes");
+        assert!(matches!(merged[0], Op::WriteKernelCold { ref writes } if writes.len() == 1));
+        assert!(matches!(merged[1], Op::WriteKernelHot { .. }));
+        assert!(matches!(merged[2], Op::WriteKernelCold { ref writes } if writes.len() == 1));
+    }
+
+    /// An `Op::ReadKernelCold` between two cold-write singletons
+    /// is a hard barrier — reads don't fold into write batches
+    /// in this pre-pass (a follow-up adds per-entry direction +
+    /// tag for mixed-direction folding). The two cold-write
+    /// singletons emerge as 2 separate ops + the read in between.
+    #[test]
+    fn merge_adjacent_cold_writes_read_is_barrier() {
+        let ops = vec![
+            Op::write_kernel_cold(KernelTarget::symbol("a"), KernelValue::u64(1)),
+            Op::read_kernel_cold(
+                "r",
+                KernelTarget::symbol("r"),
+                super::KernelValueWidth::u64(),
+            ),
+            Op::write_kernel_cold(KernelTarget::symbol("b"), KernelValue::u64(2)),
+        ];
+        let merged = merge_adjacent_cold_writes(&ops);
+        assert_eq!(merged.len(), 3, "cold-read barrier must split cold writes");
+        assert!(matches!(merged[0], Op::WriteKernelCold { ref writes } if writes.len() == 1));
+        assert!(matches!(merged[1], Op::ReadKernelCold { .. }));
+        assert!(matches!(merged[2], Op::WriteKernelCold { ref writes } if writes.len() == 1));
+    }
+
+    /// Caller-supplied multi-write `Op::WriteKernelCold` (via
+    /// `Op::write_kernel_cold_batch`) merges with adjacent
+    /// singletons — the multi-write's `writes` vec appends onto
+    /// the running batch in input order.
+    #[test]
+    fn merge_adjacent_cold_writes_appends_multi_write_op() {
+        let ops = vec![
+            Op::write_kernel_cold(KernelTarget::symbol("pre"), KernelValue::u64(0)),
+            Op::write_kernel_cold_batch(vec![
+                (KernelTarget::symbol("a"), KernelValue::u64(1)),
+                (KernelTarget::symbol("b"), KernelValue::u64(2)),
+            ]),
+            Op::write_kernel_cold(KernelTarget::symbol("post"), KernelValue::u64(3)),
+        ];
+        let merged = merge_adjacent_cold_writes(&ops);
+        assert_eq!(
+            merged.len(),
+            1,
+            "singleton+batch+singleton must fold to 1 op"
+        );
+        match &merged[0] {
+            Op::WriteKernelCold { writes } => {
+                assert_eq!(writes.len(), 4);
+                let names: Vec<&str> = writes
+                    .iter()
+                    .map(|(t, _)| match t {
+                        KernelTarget::Symbol(s) => s.as_ref(),
+                        _ => panic!("non-Symbol target"),
+                    })
+                    .collect();
+                assert_eq!(names, vec!["pre", "a", "b", "post"]);
+            }
+            other => panic!("expected merged WriteKernelCold, got {other:?}"),
+        }
+    }
+
+    /// Empty input → empty output. Single cold-write → single
+    /// cold-write (no spurious wrapping). Pre-pass is structurally
+    /// equivalent on inputs with no fold opportunities.
+    #[test]
+    fn merge_adjacent_cold_writes_passes_through_when_nothing_to_fold() {
+        assert!(merge_adjacent_cold_writes(&[]).is_empty());
+        let single = vec![Op::write_kernel_cold(
+            KernelTarget::symbol("x"),
+            KernelValue::u64(42),
+        )];
+        let merged = merge_adjacent_cold_writes(&single);
+        assert_eq!(merged.len(), 1);
+        match &merged[0] {
+            Op::WriteKernelCold { writes } => assert_eq!(writes.len(), 1),
+            other => panic!("expected single WriteKernelCold, got {other:?}"),
+        }
     }
 }

@@ -814,6 +814,14 @@ pub struct KernelOpEntry {
 /// `Op::ReadKernel{Hot,Cold}` invocation including the full
 /// `Vec<(KernelTarget, KernelValue)>` batch — variable-length, hence
 /// the postcard encoding rather than a zerocopy fixed-size struct.
+///
+/// For write-direction payloads the executor's adjacent-cold-op
+/// auto-merge pre-pass folds N adjacent `Op::WriteKernelCold`
+/// singletons into one payload with N entries — multi-CPU seeds
+/// (e.g. `with_uptime` writing per-CPU `rq.clock` on every CPU)
+/// land in ONE freeze rendezvous with no inter-CPU skew. Reads
+/// remain one-per-rendezvous until a follow-up batch adds
+/// per-entry direction + tag.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KernelOpRequestPayload {
     /// Monotonic request id; the host echoes it into the matching

@@ -514,9 +514,12 @@ pub enum Op {
     /// N separate cold-write ops would mean N rendezvous cycles
     /// and observable inter-CPU skew. The variant payload is a
     /// `Vec` precisely to make batched writes the natural shape.
-    /// The executor's adjacent-op auto-merge (which would collapse
-    /// N adjacent singleton cold-write ops into one rendezvous as
-    /// a safety net) is queued as a dedicated follow-up task.
+    /// The executor's `apply_ops` pre-pass auto-merges adjacent
+    /// singleton `Op::WriteKernelCold` ops into one merged op as
+    /// a safety net — N adjacent `write_kernel_cold(...)` calls
+    /// collapse into one rendezvous regardless of whether the
+    /// caller used [`crate::scenario::ops::Step::write_kernel_cold_batch`]
+    /// or chained singletons.
     ///
     /// **Dispatch.** The executor's arm dispatches via the
     /// in-process `SnapshotBridge` callback when one is installed
@@ -583,10 +586,15 @@ pub enum Op {
     /// against the read.
     ///
     /// Use this for: ground-truth reads that must reflect a stable
-    /// guest state, snapshot-style point-in-time reads paired with
-    /// other [`Op::CaptureSnapshot`] / [`Op::WriteKernelCold`] ops
-    /// the executor's adjacent-op auto-merge collapses into the
-    /// same rendezvous.
+    /// guest state, snapshot-style point-in-time reads. Note: each
+    /// `Op::ReadKernelCold` triggers its OWN freeze rendezvous —
+    /// `apply_ops`'s pre-pass folds adjacent
+    /// `Op::WriteKernelCold` ops into one rendezvous but does NOT
+    /// fold reads (per-entry wire tags are needed for the
+    /// multi-read reply-routing contract; queued as a wire-format
+    /// follow-up). For multi-read coherent snapshots, prefer
+    /// [`Op::CaptureSnapshot`] (which already orchestrates a single
+    /// rendezvous for all snapshot reads).
     ///
     /// **Width.** Same `width` semantics as [`Op::ReadKernelHot`]:
     /// pick the read family explicitly so the dispatcher invokes

@@ -648,14 +648,16 @@ impl Op {
     /// the rendezvous-and-batched-writes contract and the
     /// no-inter-CPU-skew guarantee.
     ///
-    /// **Two consecutive singleton calls produce two separate Ops**
-    /// — two freeze rendezvous cycles + observable inter-CPU skew
-    /// between them. For correct multi-CPU seeding always use
-    /// [`Self::write_kernel_cold_batch`]. The executor's
-    /// adjacent-op auto-merge (which would collapse N adjacent
-    /// singleton cold writes into one rendezvous) is queued as a
-    /// dedicated follow-up task; until it lands, callers needing
-    /// inter-CPU-coherent writes MUST batch explicitly.
+    /// **Two consecutive singleton calls fold into one Op via the
+    /// executor's pre-pass.** `apply_ops` auto-merges adjacent
+    /// `Op::WriteKernelCold` ops (singletons OR batches) into one
+    /// merged op that lands in a single freeze rendezvous — no
+    /// inter-CPU skew. [`Self::write_kernel_cold_batch`] is still
+    /// the preferred shape when the batch is known at construction
+    /// time; the auto-merge is a safety net for code that emits
+    /// singletons (e.g. fan-out generators). Reads
+    /// ([`Op::ReadKernelCold`]) act as a hard barrier in the
+    /// pre-pass and do NOT fold with adjacent cold writes.
     pub fn write_kernel_cold(target: KernelTarget, value: KernelValue) -> Self {
         Op::WriteKernelCold {
             writes: vec![(target, value)],
@@ -705,10 +707,12 @@ impl Op {
     /// contract and [`Self::read_kernel_hot`] for the
     /// singleton-only rationale.
     ///
-    /// Until the adjacent-cold-op auto-merge (queued as a dedicated
-    /// follow-up task) lands, each `read_kernel_cold` triggers its
-    /// own freeze rendezvous. Where multiple cold reads are needed
-    /// within the same coherent snapshot, prefer
+    /// Each `read_kernel_cold` triggers its own freeze rendezvous.
+    /// `apply_ops`'s pre-pass folds adjacent `Op::WriteKernelCold`
+    /// ops but does NOT fold reads — per-entry wire tags are
+    /// needed for the multi-read reply-routing contract (queued
+    /// as a wire-format follow-up). Where multiple cold reads are
+    /// needed within the same coherent snapshot, prefer
     /// [`Op::CaptureSnapshot`] (which already orchestrates a single
     /// rendezvous for all snapshot reads).
     pub fn read_kernel_cold(
