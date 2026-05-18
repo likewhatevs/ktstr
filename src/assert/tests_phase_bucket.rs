@@ -448,6 +448,174 @@ fn build_phase_buckets_skipped_steps_yield_sparse_output() {
     assert_eq!(phases[1].label, "Step[2]");
 }
 
+/// Every wired per-sample metric arm extracts its value end-to-end
+/// through the phase aggregator. Builds a 2-phase SampleSeries whose
+/// snapshots
+/// carry KNOWN dsq_states + event_counter_timeline values, runs
+/// build_phase_buckets, and asserts each PhaseBucket.metrics
+/// map contains the three wired keys (max_dsq_depth /
+/// total_fallback / total_keep_last) with values matching the
+/// per-kind reduction (Peak max-of-max for max_dsq_depth;
+/// Counter last-first delta for total_fallback / total_keep_last).
+///
+/// Pins the wiring between MetricDef::read_sample's per-metric
+/// dispatch (stats.rs:read_sample at L315+) and the per-phase
+/// reduction (aggregate_samples_for_phase at L225). A future
+/// refactor that drops a metric from the dispatch silently
+/// produces a missing-key in PhaseBucket.metrics — which the
+/// renderer paints as "absent" but is actually a regression;
+/// without this test, that silent drop is invisible until
+/// caught by an operator manually checking the compare output.
+#[test]
+fn build_phase_buckets_extracts_wired_metric_arms_end_to_end() {
+    use crate::monitor::dump::{EventCounterSample, FailureDumpReport, SCHEMA_SINGLE};
+    use crate::monitor::scx_walker::DsqState;
+
+    // Sample helper that builds a FailureDumpReport carrying
+    // explicit per-CPU dsq depth and cumulative event counters.
+    // local_dsq_depth -> max_dsq_depth Peak (per-CPU max).
+    // fallback / keep_last -> total_fallback / total_keep_last
+    // Counter (cumulative since boot; per-phase delta is the
+    // last-first across phase samples).
+    fn report_with(dsq_depths: &[u32], fallback: i64, keep_last: i64) -> FailureDumpReport {
+        let dsq_states = dsq_depths
+            .iter()
+            .enumerate()
+            .map(|(cpu, &nr)| DsqState {
+                id: 0,
+                origin: format!("local cpu {cpu}"),
+                nr,
+                seq: 0,
+                task_kvas: Vec::new(),
+                truncated: false,
+            })
+            .collect();
+        let event_counter_timeline = vec![EventCounterSample {
+            elapsed_ms: 0,
+            select_cpu_fallback: fallback,
+            dispatch_local_dsq_offline: 0,
+            dispatch_keep_last: keep_last,
+            enq_skip_exiting: 0,
+            enq_skip_migration_disabled: 0,
+            reenq_immed: 0,
+            reenq_local_repeat: 0,
+            refill_slice_dfl: 0,
+            bypass_duration: 0,
+            bypass_dispatch: 0,
+            bypass_activate: 0,
+            insert_not_owned: 0,
+            sub_bypass_dispatch: 0,
+        }];
+        FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            dsq_states,
+            event_counter_timeline,
+            ..Default::default()
+        }
+    }
+
+    fn entry_with(
+        tag: &str,
+        step_index: u16,
+        elapsed_ms: u64,
+        dsq_depths: &[u32],
+        fallback: i64,
+        keep_last: i64,
+    ) -> DrainedSnapshotEntry {
+        DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: report_with(dsq_depths, fallback, keep_last),
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms: Some(elapsed_ms),
+            step_index: Some(step_index),
+        }
+    }
+
+    // Phase 0 (BASELINE): 2 samples
+    //   sample[0]: dsq depths [5, 3] -> max 5; fallback=10; keep_last=20
+    //   sample[1]: dsq depths [4, 8] -> max 8; fallback=15; keep_last=30
+    // Phase 1 (Step[0]): 2 samples
+    //   sample[2]: dsq depths [12, 7] -> max 12; fallback=18; keep_last=35
+    //   sample[3]: dsq depths [9, 11] -> max 11; fallback=25; keep_last=42
+    let drained = vec![
+        entry_with("periodic_000", 0, 10, &[5, 3], 10, 20),
+        entry_with("periodic_001", 0, 20, &[4, 8], 15, 30),
+        entry_with("periodic_002", 1, 100, &[12, 7], 18, 35),
+        entry_with("periodic_003", 1, 200, &[9, 11], 25, 42),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    assert_eq!(phases.len(), 2, "BASELINE + Step[0] -> 2 buckets");
+
+    // BASELINE bucket (step_index = 0):
+    //   max_dsq_depth: per-sample max -> [5, 8]; Peak reduction
+    //     across the phase via aggregate_samples (max-of-max) -> 8
+    //   total_fallback: Counter delta last - first = 15 - 10 = 5
+    //   total_keep_last: Counter delta last - first = 30 - 20 = 10
+    let baseline = &phases[0];
+    assert_eq!(baseline.step_index, 0);
+    assert_eq!(
+        baseline.metrics.get("max_dsq_depth").copied(),
+        Some(8.0),
+        "BASELINE max_dsq_depth: Peak reduction over per-sample [5, 8] yields max 8"
+    );
+    assert_eq!(
+        baseline.metrics.get("total_fallback").copied(),
+        Some(5.0),
+        "BASELINE total_fallback: Counter delta 15 - 10 = 5"
+    );
+    assert_eq!(
+        baseline.metrics.get("total_keep_last").copied(),
+        Some(10.0),
+        "BASELINE total_keep_last: Counter delta 30 - 20 = 10"
+    );
+
+    // Step[0] bucket (step_index = 1):
+    //   max_dsq_depth: per-sample max -> [12, 11]; Peak max 12
+    //   total_fallback: 25 - 18 = 7
+    //   total_keep_last: 42 - 35 = 7
+    let step0 = &phases[1];
+    assert_eq!(step0.step_index, 1);
+    assert_eq!(step0.label, "Step[0]");
+    assert_eq!(
+        step0.metrics.get("max_dsq_depth").copied(),
+        Some(12.0),
+        "Step[0] max_dsq_depth: Peak max of [12, 11] = 12"
+    );
+    assert_eq!(
+        step0.metrics.get("total_fallback").copied(),
+        Some(7.0),
+        "Step[0] total_fallback: Counter delta 25 - 18 = 7"
+    );
+    assert_eq!(
+        step0.metrics.get("total_keep_last").copied(),
+        Some(7.0),
+        "Step[0] total_keep_last: Counter delta 42 - 35 = 7"
+    );
+
+    // No host-only metric should appear in metrics maps —
+    // worst_spread, worst_gap_ms, etc. are cross-cgroup folds
+    // with no per-sample reading and stay absent.
+    for host_only in [
+        "worst_spread",
+        "worst_gap_ms",
+        "worst_migration_ratio",
+        "max_imbalance_ratio",
+        "worst_p99_wake_latency_us",
+        "worst_iterations_per_worker",
+        "worst_page_locality",
+    ] {
+        assert!(
+            !baseline.metrics.contains_key(host_only),
+            "BASELINE must not carry host-only metric {host_only}"
+        );
+        assert!(
+            !step0.metrics.contains_key(host_only),
+            "Step[0] must not carry host-only metric {host_only}"
+        );
+    }
+}
+
 /// `ScenarioStats::phase` lookup against the phases built by
 /// `build_phase_buckets` returns the bucket whose step_index
 /// matches, not by vec position. Confirms the integration

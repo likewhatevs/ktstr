@@ -8912,6 +8912,213 @@ mod tests {
         );
     }
 
+    // -- compare_rows_by per-phase pass tests --------------------------
+    //
+    // These tests exercise the per-row-pair phase intersection that
+    // populates CompareReport.phase_deltas + unpaired_phases. They go
+    // through compare_rows_by directly (rather than the full
+    // compare_partitions which also does filtering/averaging) because
+    // the parallel pass lives inside compare_rows_by's row-pair
+    // iteration and that is the load-bearing surface to pin.
+    //
+    // Each test builds 2 GauntletRows via make_row, attaches phase
+    // buckets explicitly, then asserts the resulting CompareReport
+    // shape against the expected per-phase + unpaired data flow.
+
+    fn make_phase_bucket(
+        step_index: u16,
+        label: &str,
+        metrics: &[(&str, f64)],
+    ) -> crate::assert::PhaseBucket {
+        let metrics_map = metrics
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect();
+        crate::assert::PhaseBucket {
+            step_index,
+            label: label.to_string(),
+            start_ms: 0,
+            end_ms: 100,
+            sample_count: 1,
+            metrics: metrics_map,
+        }
+    }
+
+    /// Matched phases on both sides populate one
+    /// PhaseDeltaRow per phase per metric present in both
+    /// buckets; unpaired_phases stays empty. Pins the matched
+    /// branch of the parallel pass.
+    #[test]
+    fn compare_rows_by_emits_phase_deltas_when_both_sides_have_matched_phases() {
+        let mut row_a = make_row("test_a", "tiny-1llc", true, 0.0);
+        let mut row_b = make_row("test_a", "tiny-1llc", true, 0.0);
+        row_a.phases = vec![
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)]),
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)]),
+        ];
+        row_b.phases = vec![
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 6.0)]),
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 15.0)]),
+        ];
+        let report = compare_rows_by(
+            &[row_a],
+            &[row_b],
+            &[],
+            None,
+            &ComparisonPolicy::default(),
+        );
+        assert_eq!(report.phase_deltas.len(), 2, "2 phases × 1 metric = 2 deltas");
+        assert!(report.unpaired_phases.is_empty(), "both phases matched, no orphans");
+        let baseline = report
+            .phase_deltas
+            .iter()
+            .find(|r| r.step_index == 0)
+            .expect("BASELINE delta present");
+        assert_eq!(baseline.label, "BASELINE");
+        assert_eq!(baseline.a, 5.0);
+        assert_eq!(baseline.b, 6.0);
+        assert_eq!(baseline.delta, 1.0);
+        let step0 = report
+            .phase_deltas
+            .iter()
+            .find(|r| r.step_index == 1)
+            .expect("Step[0] delta present");
+        assert_eq!(step0.label, "Step[0]");
+        assert_eq!(step0.a, 8.0);
+        assert_eq!(step0.b, 15.0);
+        assert_eq!(step0.delta, 7.0);
+    }
+
+    /// A-side has phase [0, 1]; B-side has phase [0, 2].
+    /// Matched phases (step_index = 0) emit PhaseDeltaRow;
+    /// step_index = 1 emits UnpairedPhaseRow side=A;
+    /// step_index = 2 emits UnpairedPhaseRow side=B. Pins the
+    /// cross-cardinality intersection and the surface-don't-drop
+    /// contract for orphan buckets.
+    #[test]
+    fn compare_rows_by_emits_unpaired_phases_when_phase_coverage_differs() {
+        let mut row_a = make_row("test_x", "tiny-1llc", true, 0.0);
+        let mut row_b = make_row("test_x", "tiny-1llc", true, 0.0);
+        row_a.phases = vec![
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 4.0)]),
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 12.0)]),
+        ];
+        row_b.phases = vec![
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)]),
+            make_phase_bucket(2, "Step[1]", &[("max_dsq_depth", 9.0)]),
+        ];
+        let report = compare_rows_by(
+            &[row_a],
+            &[row_b],
+            &[],
+            None,
+            &ComparisonPolicy::default(),
+        );
+        assert_eq!(
+            report.phase_deltas.len(),
+            1,
+            "only BASELINE matches across sides -> 1 delta"
+        );
+        assert_eq!(report.phase_deltas[0].step_index, 0);
+        assert_eq!(report.unpaired_phases.len(), 2, "step 1 (A) + step 2 (B)");
+        let a_orphan = report
+            .unpaired_phases
+            .iter()
+            .find(|u| u.side == ComparePartition::A)
+            .expect("A-only orphan present");
+        assert_eq!(a_orphan.step_index, 1);
+        assert_eq!(a_orphan.label, "Step[0]");
+        let b_orphan = report
+            .unpaired_phases
+            .iter()
+            .find(|u| u.side == ComparePartition::B)
+            .expect("B-only orphan present");
+        assert_eq!(b_orphan.step_index, 2);
+        assert_eq!(b_orphan.label, "Step[1]");
+    }
+
+    /// Empty `phases` on either side suppresses the entire
+    /// per-phase pass (no PhaseDeltaRow, no UnpairedPhaseRow).
+    /// Pins the single-phase legacy-compat short-circuit: a
+    /// legacy sidecar with no phase data on EITHER side does
+    /// not flood the unpaired section with one orphan per
+    /// populated B-side phase.
+    #[test]
+    fn compare_rows_by_skips_phase_pass_when_either_side_phases_empty() {
+        let row_a = make_row("test_y", "tiny-1llc", true, 0.0);
+        let mut row_b = make_row("test_y", "tiny-1llc", true, 0.0);
+        // A has empty phases (legacy sidecar); B has phases.
+        row_b.phases = vec![
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 6.0)]),
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 10.0)]),
+        ];
+        let report = compare_rows_by(
+            &[row_a],
+            &[row_b],
+            &[],
+            None,
+            &ComparisonPolicy::default(),
+        );
+        assert!(
+            report.phase_deltas.is_empty(),
+            "empty-on-either-side short-circuit must suppress all per-phase rows"
+        );
+        assert!(
+            report.unpaired_phases.is_empty(),
+            "empty-on-either-side must not emit orphan rows for B-side phases"
+        );
+    }
+
+    /// Polarity-aware is_regression: a `worst_*`-style
+    /// LowerBetter metric where B > A flags regression=true;
+    /// a `*_iterations`/HigherBetter metric where B > A flags
+    /// regression=false (improvement). Pins the polarity wiring
+    /// that the existing scalar-finding path uses, applied to
+    /// the per-phase pass.
+    #[test]
+    fn compare_rows_by_phase_deltas_respect_metric_polarity() {
+        let mut row_a = make_row("test_z", "tiny-1llc", true, 0.0);
+        let mut row_b = make_row("test_z", "tiny-1llc", true, 0.0);
+        // max_dsq_depth is Peak/LowerBetter — bigger = regression
+        // total_iterations is Counter/HigherBetter — bigger = improvement
+        row_a.phases = vec![make_phase_bucket(
+            0,
+            "BASELINE",
+            &[("max_dsq_depth", 5.0), ("total_iterations", 100.0)],
+        )];
+        row_b.phases = vec![make_phase_bucket(
+            0,
+            "BASELINE",
+            &[("max_dsq_depth", 9.0), ("total_iterations", 200.0)],
+        )];
+        let report = compare_rows_by(
+            &[row_a],
+            &[row_b],
+            &[],
+            None,
+            &ComparisonPolicy::default(),
+        );
+        assert_eq!(report.phase_deltas.len(), 2, "2 metrics in 1 bucket");
+        let dsq = report
+            .phase_deltas
+            .iter()
+            .find(|r| r.metric.name == "max_dsq_depth")
+            .expect("max_dsq_depth delta present");
+        assert!(
+            dsq.is_regression,
+            "max_dsq_depth bigger on B -> regression (LowerBetter polarity)"
+        );
+        let iters = report
+            .phase_deltas
+            .iter()
+            .find(|r| r.metric.name == "total_iterations")
+            .expect("total_iterations delta present");
+        assert!(
+            !iters.is_regression,
+            "total_iterations bigger on B -> improvement (HigherBetter polarity)"
+        );
+    }
+
     // -- format_average_header / format_per_group_pass_counts --
 
     /// `format_average_header` renders the exact header line that
