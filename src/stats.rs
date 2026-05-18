@@ -312,14 +312,68 @@ impl MetricDef {
     /// sample to collect the per-sample readings the per-phase
     /// aggregator folds. The host-side `evaluate_vm_result` at
     /// `src/test_support/eval.rs` drives the chain.
-    pub fn read_sample(&self, _sample: &crate::scenario::sample::Sample<'_>) -> Option<f64> {
-        // Per-metric dispatch is staged: every registered metric
-        // currently returns None (no per-sample reading available).
-        // The phase aggregator surfaces all-None reductions as
-        // absent bucket entries, distinct from real zeros — see
-        // the function's doc comment for the metric inventory and
-        // their pending sources.
-        None
+    pub fn read_sample(&self, sample: &crate::scenario::sample::Sample<'_>) -> Option<f64> {
+        // Per-metric dispatch by registry name. Only the metrics
+        // whose value is genuinely a per-sample reading are wired;
+        // the remaining 16 entries in the METRICS registry are
+        // cross-cgroup folds computed host-side at
+        // `evaluate_vm_result` time (worst-spread, worst-gap-ms,
+        // every `worst_*_wake_latency_*`, worst-iterations-per-
+        // worker, etc.) and have no single-sample equivalent —
+        // they fall through to None below and the phase
+        // aggregator paints them as absent bucket entries
+        // (distinct from a real zero — sentinel-free contract).
+        match self.name {
+            // BPF dsq-state walker captures per-DSQ depth at the
+            // freeze instant. `local_dsq_depth` is the per-CPU
+            // local DSQ; take max across CPUs because the metric
+            // is Peak-kind ("worst depth this instant"). DsqState
+            // sets `origin = "local cpu N"` for local DSQs (see
+            // src/monitor/scx_walker.rs `DsqState::origin`); the
+            // filter pins the metric to the local-DSQ class so
+            // global / bypass / user DSQs do not pollute the
+            // reading.
+            "max_dsq_depth" => sample
+                .snapshot
+                .dsq_states()
+                .iter()
+                .filter(|d| d.origin.starts_with("local cpu "))
+                .map(|d| u64::from(d.nr))
+                .max()
+                .map(|v| v as f64),
+            // Cumulative `select_cpu_fallback` counter at the
+            // freeze instant. The host's event-counter walker
+            // builds a per-tick timeline of CPU-summed counters
+            // (`EventCounterSample` at src/monitor/dump/mod.rs:442);
+            // `.last()` gives the cumulative reading at the most
+            // recent tick within this freeze's capture window.
+            // Counter-kind reduction folds `last - first` across
+            // the phase's sample window, yielding the per-phase
+            // delta (the genuine "how many fallbacks fired during
+            // THIS phase").
+            "total_fallback" => sample
+                .snapshot
+                .event_counter_timeline()
+                .last()
+                .map(|e| e.select_cpu_fallback as f64),
+            // Cumulative `dispatch_keep_last` counter; same
+            // per-tick timeline source as `total_fallback`. Same
+            // Counter-kind reduction semantic; per-phase delta
+            // surfaces the keep-last count for THIS phase.
+            "total_keep_last" => sample
+                .snapshot
+                .event_counter_timeline()
+                .last()
+                .map(|e| e.dispatch_keep_last as f64),
+            // Every other metric stays None. The 16 host-only
+            // names (full list in the doc comment above) compute
+            // cross-cgroup folds at `evaluate_vm_result` time and
+            // have no per-sample equivalent until a per-cgroup
+            // per-sample capture path lands; surfacing them via a
+            // synthetic single-sample value would falsify the
+            // per-phase trajectory the bucket renderer paints.
+            _ => None,
+        }
     }
 
     /// Returns `true` for [`Polarity::LowerBetter`], `false` for
