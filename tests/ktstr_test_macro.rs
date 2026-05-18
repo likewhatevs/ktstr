@@ -217,7 +217,14 @@ fn bare_no_perf_mode_compile(_ctx: &Ctx) -> Result<AssertResult> {
 
 #[ktstr_test(expect_err, host_only = true)]
 fn bare_expect_err_compile(_ctx: &Ctx) -> Result<AssertResult> {
-    Ok(AssertResult::pass())
+    // `expect_err = true` wraps the test body to require a Result::Err
+    // return; an Ok would panic "expected test to fail but it passed"
+    // at the proc-macro wrapper. Returning Err here satisfies the
+    // expect_err contract so this attribute-compile probe runs green
+    // under `cargo ktstr test --kernel ../linux`.
+    Err(anyhow::anyhow!(
+        "expected error to satisfy expect_err = true"
+    ))
 }
 
 #[ktstr_test(fail_on_stall, host_only = true)]
