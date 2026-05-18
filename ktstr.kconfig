@@ -24,6 +24,20 @@ CONFIG_RANDOMIZE_BASE=y
 # MSR_LSTAR (see `crate::vmm::x86_64::msr_kaslr::read_and_derive`).
 # CONFIG_RANDOMIZE_MEMORY is not set
 
+# CONFIG_GCC_PLUGIN_RANDSTRUCT=n keeps `struct task_struct` field order
+# deterministic across builds. The TaskField cold-path Op handler
+# (`src/vmm/freeze_coord/kernel_op_dispatch.rs`) resolves field byte
+# offsets via the live vmlinux's BTF at dispatch time, so RANDSTRUCT
+# layouts ARE correctly handled when BTF is present. This pin is
+# defense-in-depth: a kernel built without BTF coverage for `task_struct`
+# (extremely stripped vmlinux) combined with RANDSTRUCT would silently
+# read garbage at the wrong byte offsets — the TaskField dispatcher's
+# 6-layer validation would catch obvious corruption (pid mismatch,
+# start_boottime=0) but a fortuitous match could land an undetected
+# write. Disabling RANDSTRUCT removes the dependence on BTF coverage
+# for the task_struct subset that TaskField writes.
+# CONFIG_GCC_PLUGIN_RANDSTRUCT is not set
+
 # -- sched_ext + BPF (required) --
 # sched_ext scheduling class. Depends on BPF_SYSCALL + BPF_JIT + DEBUG_INFO_BTF.
 CONFIG_BPF=y

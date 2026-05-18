@@ -5182,6 +5182,7 @@ impl KtstrVm {
                                 let reply = if let Some(owned) = owned_accessor {
                                     kernel_op_dispatch::dispatch_kernel_op_batch(
                                         owned.guest_kernel(),
+                                        dump_btf.as_ref(),
                                         req,
                                     )
                                 } else {

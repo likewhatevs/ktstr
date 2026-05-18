@@ -913,6 +913,65 @@ pub(super) fn resolve_member_struct(btf: &Btf, member: &btf_rs::Member) -> Resul
     super::bpf_map::resolve_to_struct(btf, tid).context("btf: could not resolve member to struct")
 }
 
+/// Resolve a dot-separated nested-member path within a root struct,
+/// accumulating byte offsets through every named composite segment.
+///
+/// Each non-leaf segment must resolve to a struct or union — the
+/// helper descends into the segment's underlying composite via
+/// [`member_byte_offset_with_member`] + [`resolve_member_struct`]
+/// (which follows Const/Volatile/Typedef/TypeTag chains but rejects
+/// pointer indirection). The leaf segment can be any member type;
+/// the final offset is returned as bytes from the root struct.
+///
+/// Used by the cold-path Op dispatcher for `KernelOpTarget::TaskField`
+/// (paths like `"se.vruntime"` against `struct task_struct`) and
+/// `KernelOpTarget::PerCpuField` (paths like `"scx.clock"` against
+/// `struct rq`). Single source of truth for nested-path resolution
+/// so both dispatcher arms produce identical error formats on the
+/// not-a-composite + missing-member + non-byte-aligned cases.
+///
+/// # Errors
+///
+/// - Empty path
+/// - Segment missing from its enclosing struct (`member_byte_offset_with_member` bail)
+/// - Non-leaf segment whose type is not a struct/union (`resolve_member_struct` bail)
+/// - Non-byte-aligned bitfield member at any level
+pub(crate) fn nested_member_byte_offset(
+    btf: &Btf,
+    root: &btf_rs::Struct,
+    path: &str,
+) -> Result<usize> {
+    let parts: Vec<&str> = path.split('.').collect();
+    if parts.is_empty() || parts.iter().any(|p| p.is_empty()) {
+        bail!("btf: nested path '{path}' is empty or has empty segment");
+    }
+    let mut current = root.clone();
+    let mut total: usize = 0;
+    for (i, part) in parts.iter().enumerate() {
+        let is_last = i == parts.len() - 1;
+        if is_last {
+            let leaf = member_byte_offset(btf, &current, part)
+                .with_context(|| format!("btf: nested path '{path}' leaf '{part}'"))?;
+            return Ok(total + leaf);
+        }
+        let (off, member) = member_byte_offset_with_member(btf, &current, part)
+            .with_context(|| format!("btf: nested path '{path}' segment '{part}'"))?;
+        total = total.checked_add(off).ok_or_else(|| {
+            anyhow::anyhow!(
+                "btf: nested path '{path}' segment '{part}' offset overflow ({total} + {off})"
+            )
+        })?;
+        current = resolve_member_struct(btf, &member).with_context(|| {
+            format!(
+                "btf: nested path '{path}' segment '{part}' is not a composite \
+                 (struct/union); cannot descend further"
+            )
+        })?;
+    }
+    // Unreachable: the is_last branch returns from inside the loop.
+    bail!("btf: nested path '{path}' walk exited unexpectedly")
+}
+
 /// Byte offsets for reading struct rq schedstat fields from guest memory.
 ///
 /// Schedstat fields are guarded by `CONFIG_SCHEDSTATS` in the kernel.

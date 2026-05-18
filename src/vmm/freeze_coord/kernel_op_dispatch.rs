@@ -79,11 +79,32 @@
 //! [`tests::or_u32_rmw_anchors_inside_dispatch_one_write`] doc-grep
 //! regression test together enforce the pattern at the source level.
 
+use crate::monitor::btf_offsets::{find_struct, nested_member_byte_offset};
 use crate::monitor::guest::GuestKernel;
+use crate::monitor::idr::translate_any_kva;
 use crate::vmm::wire::{
     KERNEL_OP_REASON_MAX, KernelOpDirection, KernelOpEntry, KernelOpReplyPayload,
     KernelOpRequestPayload, KernelOpTarget, KernelOpValue,
 };
+use btf_rs::Btf;
+
+/// Maximum nodes the [`find_task_by_pid`] walker visits before
+/// surfacing a typed error. Matches the cap in
+/// [`crate::monitor::scx_walker::walk_scx_tasks_global`]'s
+/// `MAX_NODES_PER_LIST` analogue — a corrupt `init_task.tasks` chain
+/// (cycle or wild pointer) must not turn the cold-path dispatcher
+/// into an unbounded read loop. 65536 covers realistic workloads
+/// (pid_max defaults of 32768-4M but typical test VMs run << 4K
+/// tasks) while rejecting pathological chains in a bounded time.
+const MAX_TASK_WALKER_NODES: u32 = 65536;
+
+/// `TASK_DEAD` flag bit on `task_struct.__state` per
+/// `include/linux/sched.h:118` (`#define TASK_DEAD 0x00000080`). A
+/// task with this bit set is in the final teardown path — its
+/// `task_struct` fields are mid-cleanup and writing through them
+/// would corrupt the dying-task state machine. Validation rejects
+/// before any field write.
+const TASK_DEAD: u32 = 0x80;
 
 /// Lower bound for any KVA accepted as a [`KernelOpTarget::Kva`]
 /// target (page-walked, `read_kva_*`/`write_kva_*`).
@@ -204,22 +225,24 @@ pub(super) fn user_half_kva_rejection_reason(kva: u64) -> String {
 /// rendezvous (it lives in the coordinator's `OnceLock`).
 pub(super) fn dispatch_kernel_op_batch(
     kernel: &GuestKernel,
+    btf: Option<&Btf>,
     req: &KernelOpRequestPayload,
 ) -> KernelOpReplyPayload {
     let request_id = req.request_id;
     match req.direction {
-        KernelOpDirection::Write => dispatch_write_batch(kernel, request_id, &req.entries),
-        KernelOpDirection::Read => dispatch_read_batch(kernel, request_id, &req.entries),
+        KernelOpDirection::Write => dispatch_write_batch(kernel, btf, request_id, &req.entries),
+        KernelOpDirection::Read => dispatch_read_batch(kernel, btf, request_id, &req.entries),
     }
 }
 
 fn dispatch_write_batch(
     kernel: &GuestKernel,
+    btf: Option<&Btf>,
     request_id: u32,
     entries: &[KernelOpEntry],
 ) -> KernelOpReplyPayload {
     for (idx, entry) in entries.iter().enumerate() {
-        if let Err(reason) = dispatch_one_write(kernel, &entry.target, &entry.value) {
+        if let Err(reason) = dispatch_one_write(kernel, btf, &entry.target, &entry.value) {
             return error_reply(request_id, format!("entry[{idx}]: {reason}"));
         }
     }
@@ -233,12 +256,13 @@ fn dispatch_write_batch(
 
 fn dispatch_read_batch(
     kernel: &GuestKernel,
+    btf: Option<&Btf>,
     request_id: u32,
     entries: &[KernelOpEntry],
 ) -> KernelOpReplyPayload {
     let mut read_values: Vec<KernelOpValue> = Vec::with_capacity(entries.len());
     for (idx, entry) in entries.iter().enumerate() {
-        match dispatch_one_read(kernel, &entry.target, &entry.value) {
+        match dispatch_one_read(kernel, btf, &entry.target, &entry.value) {
             Ok(v) => read_values.push(v),
             Err(reason) => return error_reply(request_id, format!("entry[{idx}]: {reason}")),
         }
@@ -253,6 +277,7 @@ fn dispatch_read_batch(
 
 fn dispatch_one_write(
     kernel: &GuestKernel,
+    btf: Option<&Btf>,
     target: &KernelOpTarget,
     value: &KernelOpValue,
 ) -> Result<(), String> {
@@ -361,11 +386,34 @@ fn dispatch_one_write(
         (KernelOpTarget::PerCpuField { symbol, field, cpu }, _) => {
             Err(percpufield_v1_deferred_reason(symbol, field, *cpu))
         }
+
+        // Per-task field — SCX-managed tasks only. Walks
+        // `init_task.tasks` (leaders) plus each leader's
+        // `signal->thread_head` (threads) to find the task with
+        // matching pid AND matching start_time identity
+        // (anti-PID-reuse). Runs the 8-layer validation chain
+        // (pid, start_time, lifetime, on_rq, scx queued-empty,
+        // ext_sched_class, SCHED_EXT policy, start_boottime), then
+        // resolves the dot-separated nested field path via BTF and
+        // writes at task_pa + field_offset. Cold-path freeze
+        // rendezvous gives us the atomicity contract — every vCPU
+        // parked at SIGRTMIN delivery, no concurrent task migration
+        // / state transition can race the validate→write sequence.
+        // See [`dispatch_task_field_write`] for the full chain.
+        (
+            KernelOpTarget::TaskField {
+                pid,
+                expected_start_time_ns,
+                field,
+            },
+            value,
+        ) => dispatch_task_field_write(kernel, btf, *pid, *expected_start_time_ns, field, value),
     }
 }
 
 fn dispatch_one_read(
     kernel: &GuestKernel,
+    btf: Option<&Btf>,
     target: &KernelOpTarget,
     width_hint: &KernelOpValue,
 ) -> Result<KernelOpValue, String> {
@@ -442,6 +490,28 @@ fn dispatch_one_read(
             Err(percpufield_v1_deferred_reason(symbol, field, *cpu))
         }
 
+        // Per-task field — same walker + 8-layer validation as the
+        // write side, then read at the task_pa + nested-BTF field
+        // offset. The width_hint variant determines whether we return
+        // a U32 or U64. Cold-path freeze guarantee from
+        // [`dispatch_one_write`]'s TaskField comment applies here too:
+        // every vCPU parked, no concurrent mutator.
+        (
+            KernelOpTarget::TaskField {
+                pid,
+                expected_start_time_ns,
+                field,
+            },
+            width_hint,
+        ) => dispatch_task_field_read(
+            kernel,
+            btf,
+            *pid,
+            *expected_start_time_ns,
+            field,
+            width_hint,
+        ),
+
         // OrU32 width hint is wire-format misuse on the read side —
         // it carries a mask, not a width, and has no read semantics.
         (_, KernelOpValue::OrU32(mask)) => Err(oru32_read_rejection_reason(*mask)),
@@ -467,6 +537,692 @@ pub(super) fn percpufield_v1_deferred_reason(
         "per-CPU field resolution not yet implemented for {symbol}.{field}[cpu={cpu}] \
          (needs the BTF struct-field offset surface — follow-up task)"
     )
+}
+
+/// `SCHED_EXT` policy value per `include/uapi/linux/sched.h:121`.
+/// Used by the L7 belt-and-suspenders check (alongside L6's
+/// `sched_class` pointer comparison) to confirm the task is
+/// SCX-managed.
+const SCHED_EXT: u32 = 7;
+
+/// `SCHED_RESET_ON_FORK` per `include/uapi/linux/sched.h:124`.
+/// ORed into `task->policy` to flag "revert to SCHED_NORMAL on
+/// fork". Mask out before comparing the policy against
+/// [`SCHED_EXT`].
+const SCHED_RESET_ON_FORK: u32 = 0x40000000;
+
+/// BTF-derived byte offsets needed by the 8-layer task validation in
+/// [`validate_task_for_field_op`] plus the per-thread walker in
+/// [`find_task_by_pid`]. Resolved once per `TaskField` dispatch via
+/// [`Self::resolve_from_btf`] (which calls
+/// [`nested_member_byte_offset`] on `struct task_struct` for each
+/// member, and on `struct signal_struct` for the thread-head
+/// linkage).
+///
+/// Field semantics:
+/// - `pid`: `task_struct.pid` (`pid_t`, kernel-side `int` = 4 bytes,
+///   `include/linux/sched.h`). L1 pid-equality check.
+/// - `start_time`: `task_struct.start_time` (`u64`, ns since boot)
+///   at `include/linux/sched.h:1127`. Set ONCE at fork by
+///   `copy_process` via `ktime_get_ns()`. L2 anti-PID-reuse identity
+///   check.
+/// - `state`: `task_struct.__state` (`unsigned int` = 4 bytes) at
+///   `include/linux/sched.h:828`. L3 `state & TASK_DEAD` bit-test.
+/// - `on_rq`: `task_struct.on_rq` (`int` = 4 bytes) at
+///   `include/linux/sched.h:864`. NOT in `sched_entity` — directly
+///   on task_struct. Per `task_on_rq_queued` semantics the value is
+///   0 when the task is sleeping (the L4 invariant).
+/// - `scx_dsq`: `task_struct.scx.dsq` (`struct scx_dispatch_q *` =
+///   8 bytes) — nested through `task_struct.scx` + offset of `dsq`
+///   in `sched_ext_entity` (`include/linux/sched/ext.h:211`). NULL
+///   when task is not queued in any SCX DSQ (L5 part 1).
+/// - `scx_runnable_node`: `task_struct.scx.runnable_node`
+///   (`struct list_head`) — nested through `task_struct.scx` +
+///   offset of `runnable_node` in `sched_ext_entity`
+///   (`include/linux/sched/ext.h:227`, `/* rq->scx.runnable_list */`).
+///   Empty (next == &self) when task is NOT linked into any per-rq
+///   runnable_list. Independent of `scx.dsq` per
+///   `include/linux/sched/ext.h` (L5 part 2).
+/// - `sched_class`: `task_struct.sched_class`
+///   (`const struct sched_class *` = 8 bytes) at sched.h:878.
+///   Pointer identity-compared against `ext_sched_class` KVA for
+///   the L6 SCX-only check.
+/// - `policy`: `task_struct.policy` (`unsigned int` = 4 bytes) at
+///   `include/linux/sched.h:920`. Compared against
+///   [`SCHED_EXT`] after masking [`SCHED_RESET_ON_FORK`] for the L7
+///   belt-and-suspenders check.
+/// - `start_boottime`: `task_struct.start_boottime` (`u64` = 8 bytes)
+///   at sched.h:1130 ("Boot based time in nsecs"). Set by `copy_process`
+///   at fork via `ktime_get_boottime_ns()`. L8 anti-slab-recycle.
+/// - `tasks`: `task_struct.tasks` (`struct list_head` = 16 bytes,
+///   only the .next offset matters) at sched.h:954. Used by the
+///   leader walker for `container_of` math anchored at `init_task.tasks`.
+/// - `signal`: `task_struct.signal` (`struct signal_struct *` = 8
+///   bytes). Per-leader pointer; the leader's signal struct holds
+///   the `thread_head` list anchor for per-thread iteration.
+/// - `signal_thread_head`: offset of `thread_head` (`struct list_head`)
+///   within `struct signal_struct`. Combined with the dereferenced
+///   `signal` pointer to address the per-thread list anchor.
+/// - `thread_node`: `task_struct.thread_node` (`struct list_head`) at
+///   sched.h:1094. Per-task linkage into `signal->thread_head`.
+///   Used by the per-thread walker for `container_of` math.
+struct TaskValidationOffsets {
+    pid: usize,
+    start_time: usize,
+    state: usize,
+    on_rq: usize,
+    scx_dsq: usize,
+    scx_runnable_node: usize,
+    sched_class: usize,
+    policy: usize,
+    start_boottime: usize,
+    tasks: usize,
+    signal: usize,
+    signal_thread_head: usize,
+    thread_node: usize,
+}
+
+impl TaskValidationOffsets {
+    /// Resolve every offset via BTF. A missing field in the kernel's
+    /// task_struct or signal_struct BTF returns a typed error naming
+    /// the missing field.
+    fn resolve_from_btf(btf: &Btf) -> Result<Self, String> {
+        let (task_struct_t, _) = find_struct(btf, "task_struct")
+            .map_err(|e| format!("BTF: 'struct task_struct' lookup: {e:#}"))?;
+        let task_resolve = |path: &str| -> Result<usize, String> {
+            nested_member_byte_offset(btf, &task_struct_t, path)
+                .map_err(|e| format!("BTF: task_struct.{path} offset: {e:#}"))
+        };
+        let (signal_struct_t, _) = find_struct(btf, "signal_struct")
+            .map_err(|e| format!("BTF: 'struct signal_struct' lookup: {e:#}"))?;
+        let signal_thread_head = nested_member_byte_offset(btf, &signal_struct_t, "thread_head")
+            .map_err(|e| format!("BTF: signal_struct.thread_head offset: {e:#}"))?;
+        Ok(Self {
+            pid: task_resolve("pid")?,
+            start_time: task_resolve("start_time")?,
+            state: task_resolve("__state")?,
+            on_rq: task_resolve("on_rq")?,
+            scx_dsq: task_resolve("scx.dsq")?,
+            scx_runnable_node: task_resolve("scx.runnable_node")?,
+            sched_class: task_resolve("sched_class")?,
+            policy: task_resolve("policy")?,
+            start_boottime: task_resolve("start_boottime")?,
+            tasks: task_resolve("tasks")?,
+            signal: task_resolve("signal")?,
+            signal_thread_head,
+            thread_node: task_resolve("thread_node")?,
+        })
+    }
+}
+
+/// Walk the kernel's global task list anchored at `init_task.tasks`,
+/// PLUS each leader's per-signal `thread_head`, returning the KVA
+/// of the `task_struct` whose `pid` matches `target_pid`. Bounded by
+/// [`MAX_TASK_WALKER_NODES`] across BOTH walks combined to defend
+/// against a corrupt list chain.
+///
+/// Two-tier walk:
+///
+/// 1. **Leaders** — `init_task.tasks` is the `LIST_HEAD` anchor for
+///    the `for_each_process` macro at `include/linux/sched/signal.h`
+///    L638-640:
+///    ```text
+///    #define for_each_process(p) \
+///        for (p = &init_task ; (p = next_task(p)) != &init_task ; )
+///    ```
+///    where `next_task(p) = list_entry(p->tasks.next, struct
+///    task_struct, tasks)`. The walker starts at
+///    `init_task.tasks.next`, container_of-decodes each list_head
+///    back to its enclosing `task_struct` (a thread-group leader),
+///    and terminates when the chain returns to the head.
+///
+/// 2. **Threads** — for each leader, walk
+///    `leader->signal->thread_head` per the `for_each_thread` macro
+///    at the same header L654-659. Per-task linkage is
+///    `task_struct.thread_node`. Container_of math:
+///    `thread_kva = thread_node_kva - offsetof(task_struct,
+///    thread_node)`.
+///
+/// `init_task` is `pid = 0` and is intentionally NOT yielded by
+/// `for_each_process` (the macro skips the head). We additionally
+/// EXPLICITLY reject any candidate whose task_kva equals
+/// `init_task_kva` as defense-in-depth: if a future kernel reshapes
+/// the list invariants, init_task must never land in our candidate
+/// set.
+///
+/// Returns:
+/// - `Ok(task_kva)` when a matching pid is found (leader OR
+///   non-leader thread).
+/// - `Err(reason)` on: empty list, unmapped list-head bytes,
+///   walker cap exceeded, unmapped intermediate node (chain broken),
+///   pid not found, or attempt to match init_task itself.
+fn find_task_by_pid(
+    kernel: &GuestKernel,
+    init_task_kva: u64,
+    offs: &TaskValidationOffsets,
+    target_pid: u32,
+) -> Result<u64, String> {
+    let mem = kernel.mem();
+    let walk = kernel.walk_context();
+    let pid_off = offs.pid;
+    let tasks_off = offs.tasks;
+    let signal_off = offs.signal;
+    let signal_thread_head_off = offs.signal_thread_head;
+    let thread_node_off = offs.thread_node;
+
+    // init_task.tasks anchor lives in .data (init_task is a static
+    // global at init/init_task.c:96), so text_kva_to_pa is the right
+    // translation. List nodes (task_struct) live in slab and use
+    // translate_any_kva.
+    let head_kva = init_task_kva.checked_add(tasks_off as u64).ok_or_else(|| {
+        format!(
+            "find_task_by_pid: head_kva overflow init_task={init_task_kva:#x} + \
+             tasks_off={tasks_off}"
+        )
+    })?;
+    let head_pa = kernel.text_kva_to_pa(head_kva);
+
+    // list_head.next is the first u64 in the list_head struct.
+    let mut node_kva = mem.read_u64(head_pa, 0);
+    if node_kva == 0 {
+        return Err(format!(
+            "find_task_by_pid: init_task.tasks.next read as 0 at head_pa={head_pa:#x} \
+             — head bytes unmapped or torn read"
+        ));
+    }
+    if node_kva == head_kva {
+        return Err(format!(
+            "find_task_by_pid: init_task.tasks is empty (head.next == head) — \
+             no user tasks exist; cannot resolve pid={target_pid}"
+        ));
+    }
+
+    let mut visited: u32 = 0;
+
+    // Tier 1: walk leaders via init_task.tasks.
+    while node_kva != head_kva {
+        if visited >= MAX_TASK_WALKER_NODES {
+            return Err(format!(
+                "find_task_by_pid: walker cap {MAX_TASK_WALKER_NODES} exceeded \
+                 scanning for pid={target_pid} (visited={visited}); list may be \
+                 corrupted (cycle) or pid_max exceeded the cap"
+            ));
+        }
+        visited += 1;
+
+        // container_of: task_kva = list_node_kva - offsetof(task, tasks).
+        let leader_kva = node_kva.wrapping_sub(tasks_off as u64);
+
+        // Defense-in-depth: reject init_task even if somehow it
+        // leaked into the candidate set. for_each_process skips the
+        // head by construction, but defensive reject catches future
+        // kernel reshapes or corrupt-chain races.
+        if leader_kva == init_task_kva {
+            return Err(format!(
+                "find_task_by_pid: candidate task_kva={leader_kva:#x} equals \
+                 init_task_kva={init_task_kva:#x} (pid=0 swapper); init_task \
+                 is not a writable target"
+            ));
+        }
+
+        let Some(leader_pa) = translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            leader_kva,
+            walk.l5,
+            walk.tcr_el1,
+        ) else {
+            return Err(format!(
+                "find_task_by_pid: leader task_kva={leader_kva:#x} unmapped \
+                 (visited={visited}); task_struct slab page not present in guest memory"
+            ));
+        };
+
+        let leader_pid = mem.read_u32(leader_pa, pid_off);
+        if leader_pid == target_pid {
+            return Ok(leader_kva);
+        }
+
+        // Tier 2: walk this leader's threads via signal->thread_head.
+        // The signal pointer is at `signal_off` within task_struct;
+        // dereference to get signal_struct KVA; thread_head list_head
+        // is at `signal_thread_head_off` within signal_struct.
+        let signal_kva = mem.read_u64(leader_pa, signal_off);
+        if signal_kva != 0 {
+            let thread_head_kva =
+                signal_kva.wrapping_add(signal_thread_head_off as u64);
+            if let Some(thread_head_pa) = translate_any_kva(
+                mem,
+                walk.cr3_pa,
+                walk.page_offset,
+                thread_head_kva,
+                walk.l5,
+                walk.tcr_el1,
+            ) {
+                let mut thread_node_kva = mem.read_u64(thread_head_pa, 0);
+                while thread_node_kva != 0 && thread_node_kva != thread_head_kva {
+                    if visited >= MAX_TASK_WALKER_NODES {
+                        return Err(format!(
+                            "find_task_by_pid: walker cap {MAX_TASK_WALKER_NODES} \
+                             exceeded inside thread-group of leader_pid={leader_pid} \
+                             scanning for pid={target_pid}"
+                        ));
+                    }
+                    visited += 1;
+
+                    let thread_kva =
+                        thread_node_kva.wrapping_sub(thread_node_off as u64);
+
+                    // The leader's thread_node is also on this list
+                    // — skip it (already checked as leader above).
+                    if thread_kva != leader_kva {
+                        let Some(thread_pa) = translate_any_kva(
+                            mem,
+                            walk.cr3_pa,
+                            walk.page_offset,
+                            thread_kva,
+                            walk.l5,
+                            walk.tcr_el1,
+                        ) else {
+                            // Skip this thread on translate failure
+                            // rather than aborting the whole walk —
+                            // partial visibility is better than none.
+                            // Advance via the node, not the task.
+                            let Some(thread_node_pa) = translate_any_kva(
+                                mem,
+                                walk.cr3_pa,
+                                walk.page_offset,
+                                thread_node_kva,
+                                walk.l5,
+                                walk.tcr_el1,
+                            ) else {
+                                break; // can't advance — break inner loop
+                            };
+                            thread_node_kva = mem.read_u64(thread_node_pa, 0);
+                            continue;
+                        };
+
+                        let thread_pid = mem.read_u32(thread_pa, pid_off);
+                        if thread_pid == target_pid {
+                            return Ok(thread_kva);
+                        }
+                    }
+
+                    // Advance to next thread via thread_node.next.
+                    let next_kva = mem.read_u64(thread_pa_or_node(
+                        mem, walk.cr3_pa, walk.page_offset, walk.l5, walk.tcr_el1,
+                        thread_kva, thread_node_kva, thread_node_off,
+                    ), 0);
+                    if next_kva == 0 {
+                        break; // chain broken — break inner loop
+                    }
+                    thread_node_kva = next_kva;
+                }
+            }
+        }
+
+        // Advance to next leader via this leader's tasks.next.
+        let next_kva = mem.read_u64(leader_pa, tasks_off);
+        if next_kva == 0 {
+            return Err(format!(
+                "find_task_by_pid: list_head.next read as 0 at leader_kva={leader_kva:#x} \
+                 (visited={visited}); chain broken before finding pid={target_pid}"
+            ));
+        }
+        node_kva = next_kva;
+    }
+
+    Err(format!(
+        "find_task_by_pid: pid={target_pid} not found in init_task.tasks \
+         or any leader's signal->thread_head (visited={visited} entries across \
+         leaders + threads)"
+    ))
+}
+
+/// Resolve the PA holding a thread_node's .next pointer. Used by the
+/// per-thread walker to advance after a successful task_pa
+/// translation: prefer reading via task_pa + thread_node_off (one
+/// translate already paid for); fall back to translating node_kva
+/// directly when task_pa is unavailable.
+#[allow(clippy::too_many_arguments)]
+fn thread_pa_or_node(
+    mem: &crate::monitor::reader::GuestMem,
+    cr3_pa: u64,
+    page_offset: u64,
+    l5: bool,
+    tcr_el1: u64,
+    thread_kva: u64,
+    thread_node_kva: u64,
+    thread_node_off: usize,
+) -> u64 {
+    if let Some(task_pa) = translate_any_kva(mem, cr3_pa, page_offset, thread_kva, l5, tcr_el1) {
+        task_pa + thread_node_off as u64
+    } else {
+        translate_any_kva(mem, cr3_pa, page_offset, thread_node_kva, l5, tcr_el1).unwrap_or(0)
+    }
+}
+
+/// Eight-layer task validation chain. Run AFTER the walker locates
+/// the candidate task_struct and BEFORE any field write. Every layer
+/// reads from guest memory at the candidate `task_pa` and rejects
+/// with a typed error naming the specific layer + observed value.
+///
+/// Layer order (fail-fast, cheapest first):
+/// 1. **pid match**: `task->pid == target_pid`. Defense against
+///    slab-recycle where the freed task_struct's memory was reused
+///    for another task with a different pid. Also a sanity check on
+///    the walker.
+/// 2. **start_time identity**: `task->start_time ==
+///    expected_start_time_ns`. The kernel sets `start_time` once at
+///    fork via `ktime_get_ns()` in `kernel/fork.c::copy_process`;
+///    the value never changes after that. Catches PID-reuse: if the
+///    original worker exited and the kernel recycled the PID for an
+///    unrelated task, the new task's `start_time` will differ from
+///    the captured-at-spawn value, even when the pid matches by
+///    coincidence.
+/// 3. **lifetime**: `task->__state & TASK_DEAD == 0`. A task in the
+///    final teardown path has the `TASK_DEAD` bit set in `__state`
+///    (`include/linux/sched.h:118`); writing through it would
+///    corrupt the dying-task state machine.
+/// 4. **runqueue safety**: `task->on_rq == 0`. Per
+///    `task_on_rq_queued` (`kernel/sched/sched.h:2399`) the value
+///    is 0 when the task is sleeping. CFS's red-black tree keys on
+///    `se.vruntime`; mutating it while the task is queued
+///    (on_rq=TASK_ON_RQ_QUEUED=1 or TASK_ON_RQ_MIGRATING=2) corrupts
+///    tree ordering.
+/// 5. **SCX queued-anywhere safety**: `task->scx.dsq == NULL` AND
+///    `task->scx.runnable_node` is list-empty (next == &self). The
+///    `dsq` pointer (`include/linux/sched/ext.h:211`) tracks current
+///    DSQ residence; the `runnable_node` (L227 `/* rq->scx.runnable_list */`)
+///    tracks per-rq runnable bookkeeping INDEPENDENT of `dsq`. Both
+///    must be empty to safely modify scheduler-bookkeeping fields.
+/// 6. **SCX-only sched_class**: `task->sched_class ==
+///    &ext_sched_class`. The dispatcher rejects non-SCX tasks
+///    (fair / RT / DL / stop / idle) because EEVDF's `place_entity`
+///    overwrites `se->vruntime` on enqueue (silently discarding CFS
+///    seeds), RT/DL/stop/idle have different vtime semantics, and
+///    SCX's `dsq_vtime` is the only host-writable preserved
+///    ordering key in the modern kernel.
+/// 7. **SCHED_EXT policy** (belt-and-suspenders for L6):
+///    `task->policy & ~SCHED_RESET_ON_FORK == SCHED_EXT` per
+///    `include/uapi/linux/sched.h:121`. Defense against future
+///    kernels that introduce dynamic sched_class swap without
+///    updating the static-pointer identity check semantics.
+/// 8. **anti slab-recycle**: `task->start_boottime != 0`. The
+///    `start_boottime` field is set by `copy_process` at fork via
+///    `ktime_get_boottime_ns()` (which is never 0 after boot). A
+///    freshly-zeroed slab page has start_boottime=0; a live task
+///    has it non-zero. Catches slab-recycle that survived L1+L2
+///    (pid AND start_time match by coincidence — vanishingly
+///    unlikely but defense-in-depth).
+///
+/// `ext_sched_class_kva` is the resolved `ext_sched_class` KVA the
+/// L6 check compares against. Caller resolves via
+/// `kernel.symbol_kva("ext_sched_class")`; absent symbol (kernel
+/// without CONFIG_SCHED_CLASS_EXT) fails the entire dispatcher path
+/// upstream — see [`resolve_and_validate_task_field`].
+fn validate_task_for_field_op(
+    kernel: &GuestKernel,
+    task_pa: u64,
+    target_pid: u32,
+    expected_start_time_ns: u64,
+    offs: &TaskValidationOffsets,
+    ext_sched_class_kva: u64,
+) -> Result<(), String> {
+    let mem = kernel.mem();
+
+    // L1: pid match (anti slab-recycle + walker sanity).
+    let pid = mem.read_u32(task_pa, offs.pid);
+    if pid != target_pid {
+        return Err(format!(
+            "validate_task: pid mismatch at task_pa={task_pa:#x} — read pid={pid}, \
+             expected {target_pid} (likely slab-recycle since walker found this task)"
+        ));
+    }
+
+    // L2: start_time identity (anti-PID-reuse).
+    let observed_start_time = mem.read_u64(task_pa, offs.start_time);
+    if observed_start_time != expected_start_time_ns {
+        return Err(format!(
+            "validate_task: task pid={target_pid} start_time identity mismatch — \
+             observed={observed_start_time}ns expected={expected_start_time_ns}ns; \
+             original task exited and PID was recycled for an unrelated task"
+        ));
+    }
+
+    // L3: lifetime (TASK_DEAD bit not set).
+    let state = mem.read_u32(task_pa, offs.state);
+    if state & TASK_DEAD != 0 {
+        return Err(format!(
+            "validate_task: task pid={target_pid} is TASK_DEAD (state={state:#x}); \
+             mid-teardown task fields unsafe to write"
+        ));
+    }
+
+    // L4: runqueue safety (on_rq == 0).
+    let on_rq = mem.read_u32(task_pa, offs.on_rq);
+    if on_rq != 0 {
+        return Err(format!(
+            "validate_task: task pid={target_pid} is on_rq={on_rq} (TASK_ON_RQ_QUEUED \
+             or MIGRATING); writing scheduler fields would corrupt rb-tree / DSQ \
+             ordering. Test author must use a blocking workload pattern \
+             (`WorkType::FutexPingPong`, `WorkType::WaitOnFutex`, `WorkType::Sleep`) \
+             so the worker is sleeping at cold-op time"
+        ));
+    }
+
+    // L5: SCX queued-anywhere safety (scx.dsq == NULL AND scx.runnable_node empty).
+    let scx_dsq_ptr = mem.read_u64(task_pa, offs.scx_dsq);
+    if scx_dsq_ptr != 0 {
+        return Err(format!(
+            "validate_task: task pid={target_pid} has scx.dsq={scx_dsq_ptr:#x} (queued \
+             on an SCX DSQ); modifying ordering keys while queued mangles ordering \
+             per include/linux/sched/ext.h:248-254 (dsq_vtime warning). Test author \
+             must use a blocking workload pattern \
+             (`WorkType::FutexPingPong`, `WorkType::WaitOnFutex`, `WorkType::Sleep`)"
+        ));
+    }
+    // scx.runnable_node is a list_head; "empty" means next == &self
+    // (the KVA of the list_head itself). The list_head KVA is
+    // task_kva + offsetof(task_struct, scx.runnable_node). We need
+    // the task_KVA to compare; derive it from task_pa via the
+    // page_offset (slab is direct-mapped).
+    let task_kva = task_pa.wrapping_add(kernel.page_offset());
+    let runnable_node_kva = task_kva.wrapping_add(offs.scx_runnable_node as u64);
+    let runnable_node_next = mem.read_u64(task_pa, offs.scx_runnable_node);
+    if runnable_node_next != 0 && runnable_node_next != runnable_node_kva {
+        return Err(format!(
+            "validate_task: task pid={target_pid} scx.runnable_node is linked \
+             (next={runnable_node_next:#x} != self={runnable_node_kva:#x}); task is \
+             on a per-rq runnable_list. Test author must use a blocking workload \
+             pattern (`WorkType::FutexPingPong`, `WorkType::WaitOnFutex`, \
+             `WorkType::Sleep`)"
+        ));
+    }
+
+    // L6: SCX-only sched_class (must be ext_sched_class).
+    let sched_class_kva = mem.read_u64(task_pa, offs.sched_class);
+    if sched_class_kva != ext_sched_class_kva {
+        return Err(format!(
+            "validate_task: task pid={target_pid} sched_class={sched_class_kva:#x} \
+             is not ext_sched_class={ext_sched_class_kva:#x}; TaskField writes target \
+             SCX-managed tasks only (CFS / RT / DL / stop / idle classes have \
+             different vtime semantics — EEVDF's place_entity overwrites se.vruntime \
+             on enqueue, RT/DL have RT_BANDWIDTH instant-throttle hazards). Spawn \
+             the worker under `SchedPolicy::Ext` to make it SCX-managed"
+        ));
+    }
+
+    // L7: SCHED_EXT policy belt-and-suspenders.
+    let policy = mem.read_u32(task_pa, offs.policy);
+    if policy & !SCHED_RESET_ON_FORK != SCHED_EXT {
+        return Err(format!(
+            "validate_task: task pid={target_pid} policy={policy} does not match \
+             SCHED_EXT={SCHED_EXT} (mask SCHED_RESET_ON_FORK={SCHED_RESET_ON_FORK:#x}); \
+             sched_class pointer matched ext but policy disagrees — likely a kernel \
+             feature (livepatch / dynamic class swap) that broke the static-pointer \
+             identity"
+        ));
+    }
+
+    // L8: anti slab-recycle via start_boottime.
+    let start_boottime = mem.read_u64(task_pa, offs.start_boottime);
+    if start_boottime == 0 {
+        return Err(format!(
+            "validate_task: task pid={target_pid} start_boottime=0 — possibly a \
+             freshly-zeroed slab page mid-slab-recycle; reject rather than risk \
+             writing to dead memory"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Resolve TaskField context (init_task KVA, ext_sched_class KVA,
+/// validation offsets) and find+validate the target task's PA.
+/// Shared between the read and write dispatcher arms — both need
+/// identical setup.
+///
+/// SCX-only: this dispatcher path is for SCX-managed tasks. The
+/// `ext_sched_class` symbol is required; a kernel without
+/// `CONFIG_SCHED_CLASS_EXT` fails the lookup here and the
+/// dispatcher rejects the entire TaskField op.
+fn resolve_and_validate_task_field(
+    kernel: &GuestKernel,
+    btf: Option<&Btf>,
+    pid: u32,
+    expected_start_time_ns: u64,
+) -> Result<(u64, btf_rs::Struct), String> {
+    let btf = btf.ok_or_else(|| {
+        format!(
+            "TaskField pid={pid}: BTF not loaded in this coordinator — cannot resolve \
+             task_struct layout (vmlinux must carry CONFIG_DEBUG_INFO_BTF=y output)"
+        )
+    })?;
+    let init_task_kva = kernel.symbol_kva("init_task").ok_or_else(|| {
+        format!(
+            "TaskField pid={pid}: init_task symbol absent from vmlinux symtab \
+             (heavily stripped vmlinux); cannot anchor the task-list walker"
+        )
+    })?;
+    let ext_sched_class_kva = kernel.symbol_kva("ext_sched_class").ok_or_else(|| {
+        format!(
+            "TaskField pid={pid}: ext_sched_class symbol absent from vmlinux symtab \
+             (kernel built without CONFIG_SCHED_CLASS_EXT=y); TaskField writes are \
+             SCX-only and require sched_ext support"
+        )
+    })?;
+
+    let val_offs = TaskValidationOffsets::resolve_from_btf(btf)?;
+
+    let task_kva = find_task_by_pid(kernel, init_task_kva, &val_offs, pid)?;
+    let walk = kernel.walk_context();
+    let task_pa = translate_any_kva(
+        kernel.mem(),
+        walk.cr3_pa,
+        walk.page_offset,
+        task_kva,
+        walk.l5,
+        walk.tcr_el1,
+    )
+    .ok_or_else(|| {
+        format!(
+            "TaskField pid={pid}: task_kva={task_kva:#x} unmapped at validation step \
+             (slab page disappeared between walker and validator — extreme race)"
+        )
+    })?;
+
+    validate_task_for_field_op(
+        kernel,
+        task_pa,
+        pid,
+        expected_start_time_ns,
+        &val_offs,
+        ext_sched_class_kva,
+    )?;
+
+    let (task_struct_t, _) = find_struct(btf, "task_struct")
+        .map_err(|e| format!("TaskField pid={pid}: 'struct task_struct' BTF lookup: {e:#}"))?;
+
+    Ok((task_pa, task_struct_t))
+}
+
+/// End-to-end TaskField write: resolve init_task + ext_sched_class,
+/// walk leaders + threads to find task by pid + start_time identity,
+/// run 8-layer validation, resolve field byte offset via BTF nested
+/// path, write the value at task_pa + field_off.
+fn dispatch_task_field_write(
+    kernel: &GuestKernel,
+    btf: Option<&Btf>,
+    pid: u32,
+    expected_start_time_ns: u64,
+    field: &str,
+    value: &KernelOpValue,
+) -> Result<(), String> {
+    let (task_pa, task_struct_t) =
+        resolve_and_validate_task_field(kernel, btf, pid, expected_start_time_ns)?;
+
+    // Safe to unwrap: resolve_and_validate_task_field rejected if
+    // btf was None.
+    let btf = btf.expect("checked in resolve_and_validate_task_field");
+
+    let field_off = nested_member_byte_offset(btf, &task_struct_t, field).map_err(|e| {
+        format!("TaskField pid={pid} field={field:?}: BTF nested-offset resolution: {e:#}")
+    })?;
+
+    match value {
+        KernelOpValue::U32(v) => {
+            kernel.mem().write_u32(task_pa, field_off, *v);
+            Ok(())
+        }
+        KernelOpValue::U64(v) => {
+            kernel.mem().write_u64(task_pa, field_off, *v);
+            Ok(())
+        }
+        KernelOpValue::Bytes(_) => Err(format!(
+            "TaskField pid={pid} field={field:?}: Bytes write not supported in v1 — \
+             use U32 or U64 (per-task scheduler fields are scalars)"
+        )),
+        KernelOpValue::OrU32(_) => Err(format!(
+            "TaskField pid={pid} field={field:?}: OrU32 RMW not supported on TaskField \
+             in v1 (no current use case; per-task scheduler fields are scalars not flags)"
+        )),
+    }
+}
+
+/// End-to-end TaskField read: same walker + validation as the write,
+/// then read U32 or U64 at task_pa + field_off (driven by width_hint
+/// variant).
+fn dispatch_task_field_read(
+    kernel: &GuestKernel,
+    btf: Option<&Btf>,
+    pid: u32,
+    expected_start_time_ns: u64,
+    field: &str,
+    width_hint: &KernelOpValue,
+) -> Result<KernelOpValue, String> {
+    let (task_pa, task_struct_t) =
+        resolve_and_validate_task_field(kernel, btf, pid, expected_start_time_ns)?;
+
+    let btf = btf.expect("checked in resolve_and_validate_task_field");
+
+    let field_off = nested_member_byte_offset(btf, &task_struct_t, field).map_err(|e| {
+        format!("TaskField pid={pid} field={field:?}: BTF nested-offset resolution: {e:#}")
+    })?;
+
+    match width_hint {
+        KernelOpValue::U32(_) => Ok(KernelOpValue::U32(kernel.mem().read_u32(task_pa, field_off))),
+        KernelOpValue::U64(_) => Ok(KernelOpValue::U64(kernel.mem().read_u64(task_pa, field_off))),
+        KernelOpValue::Bytes(_) => Err(format!(
+            "TaskField pid={pid} field={field:?}: Bytes read not supported in v1 — \
+             use U32 or U64 width hint"
+        )),
+        KernelOpValue::OrU32(_) => Err(format!(
+            "TaskField pid={pid} field={field:?}: OrU32 has no read semantic (covered \
+             by the dispatcher's read-direction catch-all but explicit here for clarity)"
+        )),
+    }
 }
 
 /// Build the typed-error reason for the wire-misuse case where a
@@ -1041,5 +1797,335 @@ mod tests {
              found {}",
             inside_dow.len()
         );
+    }
+
+    // ---- TaskField walker + validation tests ----
+
+    /// Synthetic task_struct field layout used by every TaskField test
+    /// fixture below. Real kernel offsets are BTF-derived at runtime;
+    /// these synthetic values just need to be (a) distinct, (b)
+    /// non-overlapping for the 32/64-bit reads, and (c) within the
+    /// 4 KiB test buffer.
+    mod synth_task {
+        pub(super) const PID_OFF: usize = 0x10;
+        pub(super) const START_TIME_OFF: usize = 0x18;
+        pub(super) const STATE_OFF: usize = 0x20;
+        pub(super) const ON_RQ_OFF: usize = 0x28;
+        pub(super) const SCHED_CLASS_OFF: usize = 0x30;
+        pub(super) const POLICY_OFF: usize = 0x38;
+        pub(super) const START_BOOTTIME_OFF: usize = 0x40;
+        pub(super) const SCX_DSQ_OFF: usize = 0x48;
+        pub(super) const SCX_RUNNABLE_NODE_OFF: usize = 0x50;
+        pub(super) const TASKS_OFF: usize = 0x60;
+        pub(super) const SIGNAL_OFF: usize = 0x70;
+        pub(super) const SIGNAL_THREAD_HEAD_OFF: usize = 0x10;
+        pub(super) const THREAD_NODE_OFF: usize = 0x78;
+    }
+
+    fn synth_validation_offsets() -> TaskValidationOffsets {
+        TaskValidationOffsets {
+            pid: synth_task::PID_OFF,
+            start_time: synth_task::START_TIME_OFF,
+            state: synth_task::STATE_OFF,
+            on_rq: synth_task::ON_RQ_OFF,
+            sched_class: synth_task::SCHED_CLASS_OFF,
+            policy: synth_task::POLICY_OFF,
+            start_boottime: synth_task::START_BOOTTIME_OFF,
+            scx_dsq: synth_task::SCX_DSQ_OFF,
+            scx_runnable_node: synth_task::SCX_RUNNABLE_NODE_OFF,
+            tasks: synth_task::TASKS_OFF,
+            signal: synth_task::SIGNAL_OFF,
+            signal_thread_head: synth_task::SIGNAL_THREAD_HEAD_OFF,
+            thread_node: synth_task::THREAD_NODE_OFF,
+        }
+    }
+
+    const EXT_KVA: u64 = 0xFFFF_FFFF_8200_0100;
+    const DEFAULT_START_TIME: u64 = 1_700_000_000_000;
+
+    /// Paint a complete "live, SCX-managed, sleepable" task_struct
+    /// at PA `pa` into `buf`. After painting, the task passes all 8
+    /// validation layers. Caller mutates individual fields to
+    /// trigger specific rejections.
+    fn paint_valid_task(buf: &mut [u8], pa: usize, pid: u32) {
+        const PAGE_OFFSET: u64 = 0xFFFF_8880_0000_0000;
+        // pid (u32 LE)
+        buf[pa + synth_task::PID_OFF..pa + synth_task::PID_OFF + 4]
+            .copy_from_slice(&pid.to_le_bytes());
+        // start_time = arbitrary
+        buf[pa + synth_task::START_TIME_OFF..pa + synth_task::START_TIME_OFF + 8]
+            .copy_from_slice(&DEFAULT_START_TIME.to_le_bytes());
+        // state = TASK_RUNNING (0) — not TASK_DEAD
+        buf[pa + synth_task::STATE_OFF..pa + synth_task::STATE_OFF + 4]
+            .copy_from_slice(&0u32.to_le_bytes());
+        // on_rq = 0 (sleeping)
+        buf[pa + synth_task::ON_RQ_OFF..pa + synth_task::ON_RQ_OFF + 4]
+            .copy_from_slice(&0u32.to_le_bytes());
+        // sched_class = EXT_KVA
+        buf[pa + synth_task::SCHED_CLASS_OFF..pa + synth_task::SCHED_CLASS_OFF + 8]
+            .copy_from_slice(&EXT_KVA.to_le_bytes());
+        // policy = SCHED_EXT (7)
+        buf[pa + synth_task::POLICY_OFF..pa + synth_task::POLICY_OFF + 4]
+            .copy_from_slice(&SCHED_EXT.to_le_bytes());
+        // start_boottime = arbitrary non-zero (1 hour in ns)
+        buf[pa + synth_task::START_BOOTTIME_OFF..pa + synth_task::START_BOOTTIME_OFF + 8]
+            .copy_from_slice(&3_600_000_000_000u64.to_le_bytes());
+        // scx.dsq = NULL (not queued)
+        buf[pa + synth_task::SCX_DSQ_OFF..pa + synth_task::SCX_DSQ_OFF + 8]
+            .copy_from_slice(&0u64.to_le_bytes());
+        // scx.runnable_node = list-empty (next points at self)
+        // task_kva = task_pa + PAGE_OFFSET; runnable_node KVA =
+        // task_kva + SCX_RUNNABLE_NODE_OFF.
+        let task_kva = (pa as u64).wrapping_add(PAGE_OFFSET);
+        let self_kva = task_kva.wrapping_add(synth_task::SCX_RUNNABLE_NODE_OFF as u64);
+        buf[pa + synth_task::SCX_RUNNABLE_NODE_OFF..pa + synth_task::SCX_RUNNABLE_NODE_OFF + 8]
+            .copy_from_slice(&self_kva.to_le_bytes());
+    }
+
+    /// Build a synthetic GuestKernel; PAGE_OFFSET set so PA 0 → KVA
+    /// 0xFFFF_8880_0000_0000 (matches real direct-map layout for
+    /// slab-allocated task_structs).
+    fn build_test_kernel(
+        buf: &mut [u8],
+        symbols: std::collections::HashMap<String, u64>,
+    ) -> crate::monitor::guest::GuestKernel {
+        const PAGE_OFFSET: u64 = 0xFFFF_8880_0000_0000;
+        // SAFETY: buf outlives the kernel by virtue of caller keeping
+        // it on the stack; GuestMem::new requires the backing buffer
+        // remain valid for the GuestMem's lifetime.
+        let mem = unsafe {
+            std::sync::Arc::new(crate::monitor::reader::GuestMem::new(
+                buf.as_mut_ptr(),
+                buf.len() as u64,
+            ))
+        };
+        crate::monitor::guest::GuestKernel::new_for_test(
+            mem,
+            symbols,
+            PAGE_OFFSET,
+            0,     // cr3_pa unused for direct-map translation
+            false, // l5 = false (4-level)
+        )
+    }
+
+    fn validate(
+        kernel: &crate::monitor::guest::GuestKernel,
+        task_pa: u64,
+        pid: u32,
+        expected_start_time_ns: u64,
+        offs: &TaskValidationOffsets,
+    ) -> Result<(), String> {
+        validate_task_for_field_op(kernel, task_pa, pid, expected_start_time_ns, offs, EXT_KVA)
+    }
+
+    /// L1-L8 all pass on a freshly-painted valid SCX task.
+    #[test]
+    fn validate_task_happy_path_accepts() {
+        let mut buf = vec![0u8; 4096];
+        paint_valid_task(&mut buf, 0, 12345);
+        let kernel = build_test_kernel(&mut buf, Default::default());
+        let offs = synth_validation_offsets();
+        assert!(validate(&kernel, 0, 12345, DEFAULT_START_TIME, &offs).is_ok());
+    }
+
+    /// L1 (pid mismatch): walker matched a task whose pid changed
+    /// between walker scan and validation read. Defense against slab
+    /// recycle.
+    #[test]
+    fn validate_task_rejects_pid_mismatch() {
+        let mut buf = vec![0u8; 4096];
+        paint_valid_task(&mut buf, 0, 99);
+        let kernel = build_test_kernel(&mut buf, Default::default());
+        let offs = synth_validation_offsets();
+        let err = validate(&kernel, 0, 12345, DEFAULT_START_TIME, &offs)
+            .expect_err("pid mismatch must reject");
+        assert!(err.contains("pid mismatch"), "must name layer: {err}");
+        assert!(err.contains("read pid=99"));
+        assert!(err.contains("expected 12345"));
+    }
+
+    /// L2 (start_time identity mismatch): the kernel sets start_time
+    /// ONCE at fork. If the original task exited and the kernel
+    /// recycled the PID, the new task's start_time will differ from
+    /// what we captured at spawn.
+    #[test]
+    fn validate_task_rejects_start_time_mismatch() {
+        let mut buf = vec![0u8; 4096];
+        paint_valid_task(&mut buf, 0, 12345);
+        let kernel = build_test_kernel(&mut buf, Default::default());
+        let offs = synth_validation_offsets();
+        let wrong_start_time = DEFAULT_START_TIME + 1_000_000;
+        let err = validate(&kernel, 0, 12345, wrong_start_time, &offs)
+            .expect_err("start_time mismatch must reject");
+        assert!(err.contains("start_time identity mismatch"));
+        assert!(err.contains(&format!("observed={DEFAULT_START_TIME}")));
+        assert!(err.contains(&format!("expected={wrong_start_time}")));
+        assert!(err.contains("recycled"));
+    }
+
+    /// L3 (TASK_DEAD): task in final teardown — fields mid-cleanup.
+    #[test]
+    fn validate_task_rejects_task_dead() {
+        let mut buf = vec![0u8; 4096];
+        paint_valid_task(&mut buf, 0, 12345);
+        buf[synth_task::STATE_OFF..synth_task::STATE_OFF + 4]
+            .copy_from_slice(&0x80u32.to_le_bytes());
+        let kernel = build_test_kernel(&mut buf, Default::default());
+        let offs = synth_validation_offsets();
+        let err = validate(&kernel, 0, 12345, DEFAULT_START_TIME, &offs)
+            .expect_err("TASK_DEAD must reject");
+        assert!(err.contains("TASK_DEAD"));
+        assert!(err.contains("state=0x80"));
+    }
+
+    /// L4 (on_rq != 0): task is queued — writing scheduler fields
+    /// would corrupt rb-tree / DSQ ordering.
+    #[test]
+    fn validate_task_rejects_on_rq_queued() {
+        let mut buf = vec![0u8; 4096];
+        paint_valid_task(&mut buf, 0, 12345);
+        buf[synth_task::ON_RQ_OFF..synth_task::ON_RQ_OFF + 4]
+            .copy_from_slice(&1u32.to_le_bytes());
+        let kernel = build_test_kernel(&mut buf, Default::default());
+        let offs = synth_validation_offsets();
+        let err = validate(&kernel, 0, 12345, DEFAULT_START_TIME, &offs)
+            .expect_err("on_rq=1 must reject");
+        assert!(err.contains("on_rq=1"));
+        assert!(err.contains("rb-tree"));
+        assert!(err.contains("WorkType::FutexPingPong"));
+    }
+
+    /// L5 part-1 (scx.dsq != NULL): task is queued on an SCX DSQ.
+    #[test]
+    fn validate_task_rejects_scx_dsq_populated() {
+        let mut buf = vec![0u8; 4096];
+        paint_valid_task(&mut buf, 0, 12345);
+        buf[synth_task::SCX_DSQ_OFF..synth_task::SCX_DSQ_OFF + 8]
+            .copy_from_slice(&0xFFFF_DEAD_BEEFu64.to_le_bytes());
+        let kernel = build_test_kernel(&mut buf, Default::default());
+        let offs = synth_validation_offsets();
+        let err = validate(&kernel, 0, 12345, DEFAULT_START_TIME, &offs)
+            .expect_err("scx.dsq non-NULL must reject");
+        assert!(err.contains("scx.dsq=0xffffdeadbeef"));
+        assert!(err.contains("SCX DSQ"));
+        assert!(err.contains("WorkType::FutexPingPong"));
+    }
+
+    /// L5 part-2 (scx.runnable_node linked): task is on a per-rq
+    /// runnable_list even though scx.dsq is NULL.
+    #[test]
+    fn validate_task_rejects_scx_runnable_node_linked() {
+        let mut buf = vec![0u8; 4096];
+        paint_valid_task(&mut buf, 0, 12345);
+        // Point runnable_node.next at a non-self address (linked).
+        buf[synth_task::SCX_RUNNABLE_NODE_OFF..synth_task::SCX_RUNNABLE_NODE_OFF + 8]
+            .copy_from_slice(&0xFFFF_8881_DEAD_C0DEu64.to_le_bytes());
+        let kernel = build_test_kernel(&mut buf, Default::default());
+        let offs = synth_validation_offsets();
+        let err = validate(&kernel, 0, 12345, DEFAULT_START_TIME, &offs)
+            .expect_err("runnable_node linked must reject");
+        assert!(err.contains("scx.runnable_node is linked"));
+        assert!(err.contains("WorkType::FutexPingPong"));
+    }
+
+    /// L6 (sched_class != ext_sched_class): non-SCX task rejected.
+    #[test]
+    fn validate_task_rejects_non_ext_sched_class() {
+        let mut buf = vec![0u8; 4096];
+        paint_valid_task(&mut buf, 0, 12345);
+        // Set sched_class to a fake fair_sched_class KVA.
+        let fair_kva: u64 = 0xFFFF_FFFF_8200_0000;
+        buf[synth_task::SCHED_CLASS_OFF..synth_task::SCHED_CLASS_OFF + 8]
+            .copy_from_slice(&fair_kva.to_le_bytes());
+        let kernel = build_test_kernel(&mut buf, Default::default());
+        let offs = synth_validation_offsets();
+        let err = validate(&kernel, 0, 12345, DEFAULT_START_TIME, &offs)
+            .expect_err("non-ext sched_class must reject");
+        assert!(err.contains(&format!("sched_class={fair_kva:#x}")));
+        assert!(err.contains("SCX-managed tasks only"));
+        assert!(err.contains("SchedPolicy::Ext"));
+    }
+
+    /// L7 (policy != SCHED_EXT): belt-and-suspenders rejection
+    /// catches dynamic sched_class swap futures.
+    #[test]
+    fn validate_task_rejects_non_sched_ext_policy() {
+        let mut buf = vec![0u8; 4096];
+        paint_valid_task(&mut buf, 0, 12345);
+        // Policy = SCHED_NORMAL (0) but sched_class still ext — the
+        // belt-and-suspenders L7 catches this mismatch.
+        buf[synth_task::POLICY_OFF..synth_task::POLICY_OFF + 4]
+            .copy_from_slice(&0u32.to_le_bytes());
+        let kernel = build_test_kernel(&mut buf, Default::default());
+        let offs = synth_validation_offsets();
+        let err = validate(&kernel, 0, 12345, DEFAULT_START_TIME, &offs)
+            .expect_err("policy != SCHED_EXT must reject");
+        assert!(err.contains("policy=0"));
+        assert!(err.contains("SCHED_EXT"));
+    }
+
+    /// L7 accepts SCHED_EXT | SCHED_RESET_ON_FORK (policy with the
+    /// reset-on-fork flag ORed in). The masking step (`policy &
+    /// ~SCHED_RESET_ON_FORK`) strips the flag before comparison.
+    #[test]
+    fn validate_task_accepts_sched_ext_with_reset_on_fork() {
+        let mut buf = vec![0u8; 4096];
+        paint_valid_task(&mut buf, 0, 12345);
+        let policy_with_flag = SCHED_EXT | SCHED_RESET_ON_FORK;
+        buf[synth_task::POLICY_OFF..synth_task::POLICY_OFF + 4]
+            .copy_from_slice(&policy_with_flag.to_le_bytes());
+        let kernel = build_test_kernel(&mut buf, Default::default());
+        let offs = synth_validation_offsets();
+        assert!(validate(&kernel, 0, 12345, DEFAULT_START_TIME, &offs).is_ok());
+    }
+
+    /// L8 (start_boottime == 0): probable slab-recycle survivor that
+    /// passed L1 + L2 by coincidence.
+    #[test]
+    fn validate_task_rejects_zero_start_boottime() {
+        let mut buf = vec![0u8; 4096];
+        paint_valid_task(&mut buf, 0, 12345);
+        buf[synth_task::START_BOOTTIME_OFF..synth_task::START_BOOTTIME_OFF + 8]
+            .copy_from_slice(&0u64.to_le_bytes());
+        let kernel = build_test_kernel(&mut buf, Default::default());
+        let offs = synth_validation_offsets();
+        let err = validate(&kernel, 0, 12345, DEFAULT_START_TIME, &offs)
+            .expect_err("start_boottime=0 must reject");
+        assert!(err.contains("start_boottime=0"));
+        assert!(err.contains("slab-recycle"));
+    }
+
+    /// Layer ordering: L1 (pid) fires BEFORE L2 (start_time). A task
+    /// with BOTH pid mismatch AND start_time mismatch surfaces the
+    /// pid error.
+    #[test]
+    fn validate_task_layer_order_pid_before_start_time() {
+        let mut buf = vec![0u8; 4096];
+        paint_valid_task(&mut buf, 0, 99);
+        let kernel = build_test_kernel(&mut buf, Default::default());
+        let offs = synth_validation_offsets();
+        // Both mismatched — expect pid error.
+        let err = validate(&kernel, 0, 12345, DEFAULT_START_TIME + 1, &offs)
+            .expect_err("must reject");
+        assert!(err.contains("pid mismatch"), "L1 must fire first: {err}");
+        assert!(!err.contains("start_time identity mismatch"));
+    }
+
+    /// Layer ordering: L2 (start_time) fires BEFORE L3 (TASK_DEAD).
+    #[test]
+    fn validate_task_layer_order_start_time_before_dead() {
+        let mut buf = vec![0u8; 4096];
+        paint_valid_task(&mut buf, 0, 12345);
+        buf[synth_task::STATE_OFF..synth_task::STATE_OFF + 4]
+            .copy_from_slice(&0x80u32.to_le_bytes());
+        let kernel = build_test_kernel(&mut buf, Default::default());
+        let offs = synth_validation_offsets();
+        let err = validate(&kernel, 0, 12345, DEFAULT_START_TIME + 1, &offs)
+            .expect_err("must reject");
+        assert!(
+            err.contains("start_time identity mismatch"),
+            "L2 must fire first: {err}"
+        );
+        assert!(!err.contains("TASK_DEAD"));
     }
 }

@@ -924,9 +924,8 @@ pub enum KernelOpDirection {
 }
 
 /// Wire-encoded [`crate::scenario::ops::KernelTarget`] variant tag.
-/// Mirrors the four `KernelTarget` enum variants 1:1; postcard
-/// encodes the tag + the variant payload that follows in
-/// [`KernelOpTarget`].
+/// Mirrors the `KernelTarget` enum variants 1:1; postcard encodes
+/// the tag + the variant payload that follows in [`KernelOpTarget`].
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum KernelOpTarget {
     /// Kernel symbol (text/data/bss), resolved at dispatch via
@@ -945,6 +944,81 @@ pub enum KernelOpTarget {
         field: String,
         /// CPU index whose per-CPU instance to address.
         cpu: u32,
+    },
+    /// Per-task field of a `struct task_struct` — SCX-managed tasks
+    /// only. Resolved at dispatch time by walking `init_task.tasks`
+    /// plus each leader's `signal->thread_head` to locate the
+    /// `task_struct *` whose `pid` matches AND whose `start_time`
+    /// matches `expected_start_time_ns` (anti-PID-reuse identity
+    /// guard), then adding the BTF-resolved nested-path byte offset
+    /// of `field` within `struct task_struct`.
+    ///
+    /// `pid` is the GUEST-side `pid_t` (positive). Both
+    /// thread-group leaders AND non-leader threads are addressable:
+    /// the walker iterates leaders via `for_each_process` semantics
+    /// (`include/linux/sched/signal.h:639`), and for each leader
+    /// also walks `leader->signal->thread_head` via
+    /// `for_each_thread` semantics (same header L654-659).
+    ///
+    /// `expected_start_time_ns` is the value `task->start_time` had
+    /// at WorkSpec spawn time. The kernel sets `start_time` once via
+    /// `ktime_get_ns()` in `kernel/fork.c::copy_process`
+    /// (`include/linux/sched.h:1127`); the value never changes
+    /// after that. Caller records it at spawn time (e.g. via
+    /// `/proc/<pid>/stat` field 22 + sysconf-to-ns conversion).
+    /// The dispatcher rejects writes when the observed
+    /// `task->start_time` differs — catches the PID-reuse hazard
+    /// where the original worker exited and the kernel recycled
+    /// the PID for an unrelated task.
+    ///
+    /// `field` is a dot-separated nested-member path. **SCX-only**:
+    /// the dispatcher's class/policy gates accept ONLY
+    /// `ext_sched_class` / `SCHED_EXT`. Recommended fields:
+    /// - `"scx.dsq_vtime"` — SCX DSQ priority-queue ordering key;
+    ///   preserved across dequeue/enqueue cycles
+    ///   (`kernel/sched/ext.c`).
+    /// - `"start_boottime"` — task fork timestamp; observable in
+    ///   `/proc/<pid>/stat` field 22.
+    ///
+    /// **DO NOT** write `"se.vruntime"` — EEVDF's `place_entity`
+    /// (`kernel/sched/fair.c:5329-5414`, since 6.6) overwrites
+    /// `se->vruntime` on every enqueue via `avg_vruntime(cfs_rq) -
+    /// se->vlag`. Direct vruntime writes are silently discarded for
+    /// sleeping tasks (which is our validation gate). TaskField
+    /// rejects non-SCX tasks before reaching this field anyway.
+    ///
+    /// Eight-layer task validation before any write/read lands:
+    /// 1. `task->pid == requested_pid` (anti-mismatch),
+    /// 2. `task->start_time == expected_start_time_ns` (anti-PID-reuse
+    ///    identity),
+    /// 3. `task->__state & TASK_DEAD == 0` (lifetime),
+    /// 4. `task->on_rq == 0` (rb-tree / DSQ ordering safety per
+    ///    `task_on_rq_queued` at `kernel/sched/sched.h:2399`),
+    /// 5. `task->scx.dsq == NULL` AND `task->scx.runnable_node` is
+    ///    list-empty (SCX maintains `runnable_node` linkage
+    ///    independent of dsq pointer per
+    ///    `include/linux/sched/ext.h:227`),
+    /// 6. `task->sched_class == &ext_sched_class` (SCX-only),
+    /// 7. `task->policy & ~SCHED_RESET_ON_FORK == SCHED_EXT (= 7)`
+    ///    per `include/uapi/linux/sched.h:121` (belt-and-suspenders
+    ///    for L6),
+    /// 8. `task->start_boottime != 0` (anti-slab-recycle: a
+    ///    freshly-zeroed slab page reads zero; live tasks have this
+    ///    set to non-zero `ktime_get_boottime_ns()` at fork).
+    TaskField {
+        /// Guest-side PID of the target task. Both leaders and
+        /// non-leader threads are addressable via the dispatcher's
+        /// per-thread walker.
+        pid: u32,
+        /// `task->start_time` (`u64`, nanoseconds) recorded at
+        /// WorkSpec spawn time. Used by the L2 anti-PID-reuse
+        /// identity check.
+        expected_start_time_ns: u64,
+        /// Nested member path within `struct task_struct`. Dot-
+        /// separated; first segment is a direct member of
+        /// `task_struct`, subsequent segments descend through named
+        /// composite members.
+        field: String,
     },
 }
 
@@ -1672,6 +1746,14 @@ mod tests {
                         cpu: 3,
                     },
                     value: KernelOpValue::U64(0xDEAD_BEEF_CAFE_F00D),
+                },
+                KernelOpEntry {
+                    target: KernelOpTarget::TaskField {
+                        pid: 12345,
+                        expected_start_time_ns: 1_700_000_000_000,
+                        field: "scx.dsq_vtime".into(),
+                    },
+                    value: KernelOpValue::U64(30 * 86400 * 1_000_000_000),
                 },
             ],
         };

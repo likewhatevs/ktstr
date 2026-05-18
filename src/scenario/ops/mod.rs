@@ -10844,6 +10844,14 @@ mod kernel_op_dispatch_tests {
                     cpu: 5,
                 },
             ),
+            (
+                KernelTarget::task_field(42, 1_700_000_000_000, "scx.dsq_vtime"),
+                crate::vmm::wire::KernelOpTarget::TaskField {
+                    pid: 42,
+                    expected_start_time_ns: 1_700_000_000_000,
+                    field: "scx.dsq_vtime".into(),
+                },
+            ),
         ];
         for (src, want) in cases {
             let got: crate::vmm::wire::KernelOpTarget = src.into();

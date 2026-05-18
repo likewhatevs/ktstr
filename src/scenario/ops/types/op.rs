@@ -951,6 +951,38 @@ pub enum KernelTarget {
         /// CPU index whose per-CPU instance to address.
         cpu: u32,
     },
+    /// Per-task field of `struct task_struct` — SCX-managed tasks
+    /// only (the dispatcher's L6+L7 validation gates reject non-SCX
+    /// tasks). Resolved at dispatch by walking `init_task.tasks`
+    /// plus each leader's `signal->thread_head` to locate the task
+    /// with matching `pid` AND matching `expected_start_time_ns`
+    /// (anti-PID-reuse identity), then adding the BTF-resolved
+    /// nested-path byte offset of `field` within `task_struct`.
+    /// See [`crate::vmm::wire::KernelOpTarget::TaskField`] for the
+    /// 8-layer validation chain the dispatcher applies.
+    ///
+    /// `expected_start_time_ns` is `task->start_time` captured at
+    /// WorkSpec spawn time. Get it via
+    /// [`crate::workload::spawn::WorkloadHandle::worker_pids`] for
+    /// the PID list, then read `/proc/<pid>/stat` field 22 +
+    /// convert from jiffies to ns via
+    /// `* 1_000_000_000 / sysconf(_SC_CLK_TCK)`.
+    TaskField {
+        /// Guest-side `pid_t` of the target task. Both leaders and
+        /// non-leader threads are addressable.
+        pid: u32,
+        /// `task->start_time` (ns) recorded at spawn time. The
+        /// dispatcher's L2 check rejects writes when the observed
+        /// `task->start_time` differs (PID-reuse identity guard).
+        expected_start_time_ns: u64,
+        /// Dot-separated nested-member path within `task_struct`.
+        /// SCX-only fields recommended (e.g. `"scx.dsq_vtime"`,
+        /// `"start_boottime"`). `"se.vruntime"` writes are
+        /// silently discarded by EEVDF's `place_entity` on enqueue
+        /// (`kernel/sched/fair.c:5329-5414` since 6.6) AND rejected
+        /// by the SCX-only class gate; do not use.
+        field: Cow<'static, str>,
+    },
 }
 
 impl KernelTarget {
@@ -1003,6 +1035,87 @@ impl KernelTarget {
             symbol: symbol.into(),
             field: field.into(),
             cpu,
+        }
+    }
+
+    /// Per-task `struct task_struct` field target — SCX-managed
+    /// tasks only. Resolves at dispatch via `init_task.tasks` +
+    /// per-leader `signal->thread_head` walks to find the task
+    /// with matching `pid` AND matching `expected_start_time_ns`
+    /// (anti-PID-reuse), then BTF nested-path offset of `field`.
+    ///
+    /// `expected_start_time_ns` is `task->start_time` (set once by
+    /// `kernel/fork.c::copy_process` via `ktime_get_ns()`).
+    /// Get worker PIDs via
+    /// [`crate::workload::spawn::WorkloadHandle::worker_pids`] then
+    /// read `/proc/<pid>/stat` field 22 at spawn time and convert
+    /// to ns: `field_22_jiffies * 1_000_000_000 /
+    /// sysconf(_SC_CLK_TCK)`.
+    ///
+    /// `field` is dot-separated nested-member path. The dispatcher
+    /// applies an 8-layer validation chain (pid match, start_time
+    /// identity, lifetime, on_rq=0, scx queued-empty, ext
+    /// sched_class, SCHED_EXT policy, start_boottime != 0) before
+    /// the write/read lands — see
+    /// [`crate::vmm::wire::KernelOpTarget::TaskField`] for the full
+    /// contract.
+    ///
+    /// **SCX-only.** The dispatcher rejects non-SCX tasks via the
+    /// class+policy gates. Recommended fields: `"scx.dsq_vtime"`
+    /// (DSQ priority key, preserved across dequeue/enqueue),
+    /// `"start_boottime"` (task fork timestamp).
+    ///
+    /// **Do NOT write `"se.vruntime"`.** EEVDF's `place_entity`
+    /// (`kernel/sched/fair.c:5329-5414`, since 6.6) overwrites
+    /// `se->vruntime` on every enqueue; direct vruntime writes are
+    /// silently discarded for sleeping tasks (our validation gate).
+    /// CFS-class tasks are rejected before reaching the write
+    /// regardless, but the field-level warning is the actionable
+    /// guidance for "why won't my vruntime write stick" debugging.
+    ///
+    /// **Heads up.** The dispatcher's L4 (`on_rq == 0`) + L5
+    /// (`scx.dsq == NULL` AND `scx.runnable_node` empty) gates
+    /// reject writes on queued/running tasks per CFS rb-tree + SCX
+    /// DSQ ordering safety. Test authors must use blocking workload
+    /// patterns (e.g. [`crate::workload::WorkType::FutexPingPong`],
+    /// `WorkType::WaitOnFutex`, `WorkType::Sleep`) so workers are
+    /// sleeping when the cold-path Op fires.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Escape-hatch primitive: seed a specific worker's
+    /// // scx.dsq_vtime to ~30 days. WorkSpec.uptime (separate API)
+    /// // wraps this; use the escape hatch when the scenario knows
+    /// // the exact PID + start_time tuple.
+    /// use ktstr::prelude::*;
+    /// use std::time::Duration;
+    ///
+    /// let workers = handle.worker_pids();         // Vec<libc::pid_t>
+    /// let worker_pid = workers[0] as u32;
+    /// // Read `/proc/<pid>/stat` field 22, convert from jiffies to
+    /// // nanoseconds via `* 1_000_000_000 / sysconf(_SC_CLK_TCK)`.
+    /// // (Helper expected to land alongside WorkSpec.uptime.)
+    /// let start_time_ns: u64 = read_start_time_ns(worker_pid)?;
+    ///
+    /// let seed_vtime_ns = (30 * 86_400_u64) * 1_000_000_000; // 30 days
+    /// let writes = vec![(
+    ///     KernelTarget::task_field(worker_pid, start_time_ns, "scx.dsq_vtime"),
+    ///     KernelValue::u64(seed_vtime_ns),
+    /// )];
+    /// // Worker MUST be in a blocking pattern (FutexPingPong, etc.)
+    /// // at op-fire time; the dispatcher's 8-layer validation
+    /// // rejects writes against runnable/queued tasks.
+    /// ```
+    pub fn task_field(
+        pid: u32,
+        expected_start_time_ns: u64,
+        field: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        KernelTarget::TaskField {
+            pid,
+            expected_start_time_ns,
+            field: field.into(),
         }
     }
 }
@@ -1169,6 +1282,15 @@ impl From<&KernelTarget> for crate::vmm::wire::KernelOpTarget {
                 symbol: symbol.to_string(),
                 field: field.to_string(),
                 cpu: *cpu,
+            },
+            KernelTarget::TaskField {
+                pid,
+                expected_start_time_ns,
+                field,
+            } => Self::TaskField {
+                pid: *pid,
+                expected_start_time_ns: *expected_start_time_ns,
+                field: field.to_string(),
             },
         }
     }
