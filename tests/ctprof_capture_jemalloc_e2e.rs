@@ -26,7 +26,7 @@
 //! the sibling `tests/jemalloc_probe_tests.rs` already exercises.
 
 use anyhow::{Result, anyhow};
-use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
+use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::metric_types::Bytes;
 use ktstr::scenario::Ctx;
