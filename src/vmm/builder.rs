@@ -43,10 +43,49 @@ use super::{KtstrVm, disk_config};
 ///   by [`topology`](Self::topology))
 /// - `performance_mode` — `false` (operator opts in via
 ///   [`performance_mode`](Self::performance_mode))
+/// One scheduler staged into the guest initramfs alongside the
+/// boot-time `scheduler_binary` so the scheduler-lifecycle Ops
+/// (`Op::AttachScheduler` / `Op::ReplaceScheduler`) can swap to a
+/// different scheduler mid-experiment without rebooting the VM.
+///
+/// `name` is the [`Scheduler::name`](crate::test_support::Scheduler::name)
+/// of the source entry — must satisfy the
+/// [`crate::test_support::staged::validate_staged_scheduler_name`]
+/// shape rules (callers pre-validate at
+/// `KtstrTestEntry::validate` time, before any `KtstrVmBuilder`
+/// staging surface fires). `binary` is the host-side resolved
+/// PathBuf the initramfs pipeline copies into the guest at
+/// `/staging/schedulers/<name>/scheduler` per the
+/// [`crate::test_support::staged::staged_scheduler_binary_path`]
+/// mapping. `sched_args` is the per-scheduler CLI argv that
+/// future Op-dispatch reads from
+/// `/staging/schedulers/<name>/sched_args` at spawn time.
+///
+/// `#[allow(dead_code)]` because no consumer exists today — the
+/// initramfs packing pipeline that consumes the staged set lands
+/// in follow-up work. Tests cover the constructor; the allow
+/// clears the moment the first packing call site wires up.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct StagedScheduler {
+    pub(crate) name: String,
+    pub(crate) binary: PathBuf,
+    pub(crate) sched_args: Vec<String>,
+}
+
 pub struct KtstrVmBuilder {
     kernel: Option<PathBuf>,
     init_binary: Option<PathBuf>,
     scheduler_binary: Option<PathBuf>,
+    /// Additional schedulers packed into the initramfs alongside
+    /// the boot-time `scheduler_binary` so future scheduler-
+    /// lifecycle ops can swap mid-experiment. Empty for the common
+    /// single-scheduler case — pays zero initramfs cost when not
+    /// populated. See [`StagedScheduler`] for the per-entry shape
+    /// and the doc on
+    /// [`Self::staged_scheduler`](#method.staged_scheduler) for
+    /// the builder-level contract.
+    staged_schedulers: Vec<StagedScheduler>,
     run_args: Vec<String>,
     sched_args: Vec<String>,
     pub(crate) topology: Topology,
@@ -152,6 +191,7 @@ impl Default for KtstrVmBuilder {
             kernel: None,
             init_binary: None,
             scheduler_binary: None,
+            staged_schedulers: Vec::new(),
             run_args: Vec::new(),
             sched_args: Vec::new(),
             topology: Topology {
@@ -210,6 +250,43 @@ impl KtstrVmBuilder {
     /// init binary; the init spawns it before dispatching the test.
     pub fn scheduler_binary(mut self, path: impl Into<PathBuf>) -> Self {
         self.scheduler_binary = Some(path.into());
+        self
+    }
+
+    /// Stage one additional scheduler into the guest initramfs at
+    /// `/staging/schedulers/<name>/scheduler` + per-scheduler args
+    /// at `/staging/schedulers/<name>/sched_args`. Future
+    /// scheduler-lifecycle ops (`Op::AttachScheduler` /
+    /// `Op::ReplaceScheduler`) resolve a `&'static Scheduler` to
+    /// its staged path via
+    /// [`crate::test_support::staged::staged_scheduler_binary_path`].
+    ///
+    /// Caller responsibility: pre-validate `name` via the
+    /// [`crate::test_support::staged::validate_staged_scheduler_name`]
+    /// shape rules — `KtstrTestEntry::validate` is the production
+    /// gate. The builder accepts whatever passes through; it does
+    /// NOT re-validate. Duplicate names within the staged set
+    /// would land at the same guest path and silently overwrite —
+    /// the validate gate must catch them upstream.
+    ///
+    /// Idempotent only by collection-level semantics: calling
+    /// `staged_scheduler` twice with the SAME name pushes two
+    /// entries that the initramfs packer would resolve to the
+    /// same guest path. The packing pipeline (follow-up work)
+    /// rejects such duplicates at build time as the
+    /// final-line-of-defense beyond the validate gate.
+    #[allow(dead_code)] // production callers (runtime plumb) wire up in follow-up work
+    pub fn staged_scheduler(
+        mut self,
+        name: impl Into<String>,
+        binary: impl Into<PathBuf>,
+        sched_args: Vec<String>,
+    ) -> Self {
+        self.staged_schedulers.push(StagedScheduler {
+            name: name.into(),
+            binary: binary.into(),
+            sched_args,
+        });
         self
     }
 
