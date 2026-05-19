@@ -216,6 +216,21 @@ where
 /// Returns `true` when `/proc/{pid}` exists (process alive or
 /// pre-reap), `false` when it does not (process exited and the
 /// kernel has dropped the procfs entry).
+/// SIGCHLD = SIG_IGN-safe liveness probe via procfs. The guest init
+/// installs `SIGCHLD = SIG_IGN` process-wide (see
+/// [`with_sigchld_default`] doc) so the kernel auto-reaps children
+/// without explicit `waitpid`. Under that disposition `waitpid`
+/// returns `ECHILD` even on a clean exit, so a `Command::status` /
+/// `Child::wait` is the wrong tool for "is this pid still running".
+///
+/// `/proc/{pid}` removal is signal-disposition-independent: the
+/// directory disappears the moment the kernel finishes `release_task`
+/// for the pid (see kernel/exit.c `release_task` →
+/// `proc_flush_pid`), regardless of how SIGCHLD is handled. Polling
+/// `/proc/{pid}` therefore observes the real exit on every code path
+/// where SIGCHLD might be ignored. Returns `true` when `/proc/{pid}`
+/// exists (process alive or pre-reap), `false` when it does not
+/// (process exited and the kernel has dropped the procfs entry).
 fn proc_pid_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
@@ -228,13 +243,13 @@ fn proc_pid_alive(pid: u32) -> bool {
 /// notable case (the scheduler binary either ignored SIGTERM or its
 /// userspace signal handler ran too slow against the grace window).
 //
-// `#[allow(dead_code)]` is the substep-ordering bridge: the helper
-// has no production caller today — the Op::DetachScheduler /
-// Op::RestartScheduler / Op::ReplaceScheduler dispatchers that will
-// consume it land in a follow-up substep. Tests in this module
-// exercise every variant + the InvalidPid error path, so the helper
-// is verified-correct as it lands; the allow becomes a no-op the
-// moment the first production caller wires up.
+// `#[allow(dead_code)]` because the helper has no production caller
+// in this commit — the Op::DetachScheduler / Op::RestartScheduler /
+// Op::ReplaceScheduler dispatchers that will consume it land in
+// follow-up work. Tests in this module exercise every variant + the
+// InvalidPid error path, so the helper is verified-correct as it
+// lands; the allow becomes a no-op the moment the first production
+// caller wires up.
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum KillSchedulerOutcome {
@@ -334,7 +349,7 @@ pub(crate) enum KillSchedulerError {
 /// post-SIGKILL grace is the module-level [`POST_SIGKILL_GRACE`]
 /// const (see that const's doc for the 200ms-vs-magic-number
 /// rationale).
-#[allow(dead_code)] // production callers (Op::*Scheduler dispatch) land in a follow-up substep
+#[allow(dead_code)] // production callers (Op::*Scheduler dispatch) wire up in follow-up work
 pub(crate) fn kill_scheduler_process(
     pid: libc::pid_t,
     sigterm_grace: std::time::Duration,
@@ -378,12 +393,16 @@ pub(crate) fn kill_scheduler_process(
 }
 
 /// Post-SIGKILL grace inside [`kill_scheduler_process`]. SIGKILL
-/// produces an `exit_notify` cascade in the kernel that typically
-/// completes in microseconds; this cap is a defense-in-depth ceiling
-/// for kernel-side scheduling delay, not an expected wait. Carried
-/// as a module-level const so the value is greppable + paired with a
-/// single doc explaining why 200ms instead of left as a magic
-/// number in the call site.
+/// triggers the kernel's `exit_notify` → `release_task` cascade
+/// (kernel/exit.c) which removes `/proc/{pid}`; the wait here is
+/// purely defense-in-depth against pathological kernel scheduling
+/// (D-state hangs, slow workqueues) rather than an expected duration.
+/// A `StillAliveAfterSigkill` firing in production indicates
+/// something structurally wrong with the target process or kernel
+/// state — operators should treat the variant as a debug signal, not
+/// a transient retry case. Carried as a module-level const so the
+/// value is greppable + paired with a single doc explaining the
+/// choice rather than left as a magic number at the call site.
 const POST_SIGKILL_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Poll `/proc/{pid}` for absence up to `timeout`, sleeping at the
@@ -4623,34 +4642,105 @@ mod tests {
     /// SIGCHLD=SIG_IGN for the same reason as the
     /// `_responsive_child_` sibling test — see that test's docs.
     ///
-    /// 100ms post-spawn settle delay before kill_scheduler_process
-    /// fires: the shell must have time to install its SIGTERM trap
-    /// before we send the signal. Without the delay, the
-    /// kill_scheduler_process call can race the shell's `trap`
-    /// builtin and SIGTERM lands on a shell that hasn't yet
-    /// installed the ignore disposition, producing a spurious
-    /// ExitedAfterSigterm. The settle delay is on the order of
-    /// dash/bash startup latency (~ms); 100ms is a defense-in-depth
-    /// margin.
+    /// Synchronizes via filesystem marker rather than a timing-based
+    /// settle delay so the test is immune to CI scheduling jitter.
+    /// The shell does `trap '' TERM; touch <marker>; sleep 30`, the
+    /// test polls for marker existence with a generous 5s deadline,
+    /// THEN sends SIGTERM. This eliminates the race where the kill
+    /// can land before the shell has installed its trap — the marker
+    /// existence is a kernel-observable HAPPENS-AFTER signal proving
+    /// the trap installation already returned. Marker filename uses
+    /// a fixed path because SIGCHLD_TEST_LOCK serializes the tests
+    /// that write SIGCHLD disposition, so concurrent writers cannot
+    /// collide.
     #[test]
     fn kill_scheduler_process_ignoring_sigterm_child_escalates_to_sigkill() {
         let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
         let _restore = SigchldGuard::install(libc::SIG_IGN);
 
+        let marker = "/tmp/ktstr_kill_test_trap_ready";
+        // Clear any stale marker from a prior aborted run.
+        let _ = std::fs::remove_file(marker);
+
         let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg("trap '' TERM; sleep 30")
+            .arg(format!("trap '' TERM; touch {marker}; sleep 30"))
             .spawn()
             .expect("spawn /bin/sh");
         let pid = child.id() as libc::pid_t;
-        // Let the shell install its SIGTERM trap before we signal.
-        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Wait for the marker — proves the trap is installed.
+        let marker_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !std::path::Path::new(marker).exists() {
+            if std::time::Instant::now() >= marker_deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(marker);
+                panic!(
+                    "shell did not create trap-ready marker within 5s — \
+                     /bin/sh failed to start or filesystem is too slow"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
         // Tight SIGTERM grace (200ms) so the test doesn't burn a
-        // full second waiting for the polite-shutdown timeout — but
-        // wide enough that a slow-shell scheduler can't false-fail.
+        // full second on the polite-shutdown timeout. The trap is
+        // confirmed installed via the marker so the shell will
+        // ignore SIGTERM and force the SIGKILL escalation.
         let outcome = kill_scheduler_process(pid, std::time::Duration::from_millis(200));
         let _ = child.wait();
+        let _ = std::fs::remove_file(marker);
         assert_eq!(outcome, Ok(KillSchedulerOutcome::EscalatedToSigkill));
+    }
+
+    /// kill_scheduler_process MUST NOT mutate SCHED_PID — the design
+    /// at L320-327 of rust_init.rs explicitly keeps the helper
+    /// generic-pid (no implicit singleton-pid assumption) and defers
+    /// SCHED_PID ownership to the dispatcher (the future
+    /// Op::DetachScheduler arm). This test pins that contract against
+    /// a future "improvement" that adds an implicit SCHED_PID reset
+    /// for symmetry with the dispatcher path — silent decoupling
+    /// breakage that would couple kill-pid choice to the singleton
+    /// scheduler pid in unintended ways.
+    ///
+    /// Seeds SCHED_PID with a sentinel distinct from any spawnable
+    /// pid (99_999_999 > Linux's default kernel.pid_max), exercises
+    /// kill_scheduler_process against an unrelated /bin/sleep pid,
+    /// and asserts the sentinel survives. Restores SCHED_PID to 0
+    /// at end so subsequent tests see a clean baseline.
+    #[test]
+    fn kill_scheduler_process_does_not_mutate_sched_pid() {
+        let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
+        let _restore = SigchldGuard::install(libc::SIG_IGN);
+
+        let original = SCHED_PID.load(Ordering::Acquire);
+        let sentinel: i32 = 99_999_999;
+        SCHED_PID.store(sentinel, Ordering::Release);
+
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn /bin/sleep");
+        let pid = child.id() as libc::pid_t;
+        let _ = kill_scheduler_process(pid, std::time::Duration::from_millis(500));
+        let _ = child.wait();
+
+        let observed = SCHED_PID.load(Ordering::Acquire);
+        // Restore BEFORE the assert so a failure does not leak
+        // sentinel state to subsequent tests.
+        SCHED_PID.store(original, Ordering::Release);
+
+        assert_eq!(
+            observed, sentinel,
+            "kill_scheduler_process(pid={pid}) mutated SCHED_PID \
+             (sentinel={sentinel}, observed={observed}); the helper \
+             must NOT touch SCHED_PID — that side channel is the \
+             dispatcher's responsibility per the helper's design \
+             decoupling. A future commit that adds an implicit reset \
+             couples the helper to singleton-pid semantics that the \
+             design explicitly avoids."
+        );
     }
 
     /// SIGCHLD signal disposition is process-wide, so the
