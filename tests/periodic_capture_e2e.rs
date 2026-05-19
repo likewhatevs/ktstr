@@ -154,10 +154,7 @@ fn periodic_capture_three_boundaries(ctx: &ktstr::scenario::Ctx) -> Result<Asser
 /// rigour as `assert_periodic_captures` but parameterized on the
 /// configured `num_snapshots` so multiple `#[ktstr_test]` entries
 /// can share the verifier.
-fn assert_at_least_one_real_capture(
-    result: &VmResult,
-    expected_target: u32,
-) -> Result<()> {
+fn assert_at_least_one_real_capture(result: &VmResult, expected_target: u32) -> Result<()> {
     anyhow::ensure!(
         result.periodic_target == expected_target,
         "periodic_target must mirror num_snapshots = {}, got {}",
@@ -213,9 +210,7 @@ fn assert_cgroup_parent_captures(result: &VmResult) -> Result<()> {
     auto_repro = false,
     post_vm = assert_cgroup_parent_captures,
 )]
-fn periodic_capture_with_cgroup_parent_e2e(
-    ctx: &ktstr::scenario::Ctx,
-) -> Result<AssertResult> {
+fn periodic_capture_with_cgroup_parent_e2e(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
@@ -225,4 +220,3 @@ fn periodic_capture_with_cgroup_parent_e2e(
     result.note("6s workload with cgroup_parent set + num_snapshots=2 finished");
     Ok(result)
 }
-

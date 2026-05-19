@@ -248,6 +248,17 @@ pub struct KtstrVm {
     pub(crate) staged_sched_args_packed: Vec<(String, Vec<String>)>,
     pub(crate) run_args: Vec<String>,
     pub(crate) sched_args: Vec<String>,
+    /// Per-test framework-owned parent cgroup for every workload
+    /// cgroup the test author declares via `ctx.cgroup_def(...)`.
+    /// When `Some`, the guest init mkdir's `/sys/fs/cgroup{path}`
+    /// BEFORE the scheduler starts and the guest-side
+    /// `CgroupManager` resolves its root to that path. When
+    /// `None`, the guest falls back to the legacy resolution
+    /// (`--cell-parent-cgroup` in `/sched_args` → default
+    /// `/sys/fs/cgroup/ktstr`). Sourced from
+    /// `KtstrTestEntry::workload_root_cgroup`; never touches the
+    /// scheduler argv.
+    pub(crate) workload_root_cgroup: Option<String>,
     pub(crate) topology: Topology,
     /// Guest memory in MiB. `None` = deferred: computed from actual
     /// initramfs size after the initramfs build completes.
@@ -542,6 +553,7 @@ impl KtstrVm {
             sched_disable: &self.sched_disable_cmds,
             exec_cmd: self.exec_cmd.as_deref(),
             staged_sched_args: &self.staged_sched_args_packed,
+            workload_root_cgroup: self.workload_root_cgroup.as_deref(),
         }
     }
 

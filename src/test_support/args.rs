@@ -258,8 +258,31 @@ pub(crate) fn parse_cell_parent_cgroup<'a>(
 /// surface the bad value via stderr and continue with the default
 /// so the test doesn't silently land on the host cgroup root.
 pub(crate) fn resolve_cgroup_root(args: &[String]) -> String {
-    // Check guest args for --cell-parent-cgroup (passed via sched_args
-    // which are written to /sched_args in the initramfs).
+    // Priority 1: per-test `workload_root_cgroup` from
+    // `KtstrTestEntry`. The host writes the validated absolute
+    // path to `/workload_root_cgroup` in the initramfs suffix
+    // (`vmm::initramfs::build_suffix`) when the test entry sets
+    // it. Empty file / unreadable / invalid path falls through
+    // to the legacy resolution so a stale-image edge case stays
+    // backward compatible.
+    if let Ok(raw) = std::fs::read_to_string("/workload_root_cgroup") {
+        let trimmed = raw.trim();
+        if cell_parent_path_is_valid(trimmed) {
+            return format!("/sys/fs/cgroup{trimmed}");
+        } else if !trimmed.is_empty() {
+            eprintln!(
+                "ktstr_test: ignoring malformed `/workload_root_cgroup` \
+                 value {trimmed:?}; falling back to legacy cgroup-root \
+                 resolution. The host-side gate in `CgroupPath::new` \
+                 normally rejects this at compile time."
+            );
+        }
+    }
+    // Priority 2: `--cell-parent-cgroup` in `/sched_args`. Only
+    // present when the scheduler declaration (or per-test
+    // `extra_sched_args`) explicitly carries the flag; the
+    // framework no longer auto-injects it from
+    // `Scheduler::cgroup_parent`.
     let sched_args = std::fs::read_to_string("/sched_args").unwrap_or_default();
     if let Some(path) = absolute_cell_parent_value(
         parse_cell_parent_cgroup(sched_args.split_whitespace()),
@@ -267,8 +290,8 @@ pub(crate) fn resolve_cgroup_root(args: &[String]) -> String {
     ) {
         return format!("/sys/fs/cgroup{path}");
     }
-    // Also check the process args in case --cell-parent-cgroup was
-    // passed directly (e.g., via extra_sched_args on the test entry).
+    // Priority 3: process argv (matches sched_args parsing for
+    // direct ad-hoc argv injection through `extra_sched_args`).
     if let Some(path) = absolute_cell_parent_value(
         parse_cell_parent_cgroup(args.iter().map(String::as_str)),
         "process argv",

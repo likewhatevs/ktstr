@@ -1009,6 +1009,14 @@ pub struct SuffixParams<'a> {
     /// — empty slice (zero staged schedulers) is the common case
     /// and emits no entries.
     pub staged_sched_args: &'a [(String, Vec<String>)],
+    /// `/workload_root_cgroup` file contents when set. Sourced from
+    /// [`KtstrTestEntry::workload_root_cgroup`](crate::test_support::KtstrTestEntry::workload_root_cgroup);
+    /// the guest's `rust_init` reads this file BEFORE starting the
+    /// scheduler and mkdir's `/sys/fs/cgroup{path}` so the workload
+    /// CgroupManager has its root in place. Absent ⇒ no file
+    /// emitted ⇒ guest falls back to the legacy
+    /// `--cell-parent-cgroup`-or-default resolution.
+    pub workload_root_cgroup: Option<&'a str>,
 }
 
 /// Build the suffix that completes a base archive: `/args` and
@@ -1046,6 +1054,23 @@ pub fn build_suffix(base_len: usize, params: &SuffixParams<'_>) -> Result<Vec<u8
 
     if let Some(cmd) = params.exec_cmd {
         write_entry(&mut suffix, "exec_cmd", cmd.as_bytes(), 0o100644)?;
+    }
+
+    // `/workload_root_cgroup` carries the per-test workload cgroup
+    // root the guest reads in Phase 3 of `rust_init` (just before
+    // `start_scheduler`). The host writes the validated absolute
+    // path verbatim — the guest's `create_workload_root_cgroup_from_file`
+    // re-validates the leading `/` + "not bare /" gate before
+    // calling mkdir, so a stale/hand-edited image with a bad value
+    // still fails closed rather than corrupting unrelated cgroup
+    // state.
+    if let Some(path) = params.workload_root_cgroup {
+        write_entry(
+            &mut suffix,
+            "workload_root_cgroup",
+            path.as_bytes(),
+            0o100644,
+        )?;
     }
 
     // Per-staged-scheduler args files. The staged binary itself is

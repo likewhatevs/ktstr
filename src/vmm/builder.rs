@@ -140,6 +140,14 @@ pub struct KtstrVmBuilder {
     /// periodic-capture loop in the freeze coordinator entirely
     /// (the default).
     num_snapshots: u32,
+    /// Optional per-test workload-cgroup root. Sourced from
+    /// [`crate::test_support::KtstrTestEntry::workload_root_cgroup`].
+    /// When set, the guest init mkdir's the path BEFORE starting
+    /// the scheduler and the guest CgroupManager uses it as the
+    /// parent for every workload cgroup the test declares; when
+    /// unset (the default), the guest falls back to its legacy
+    /// `--cell-parent-cgroup`-or-default resolution.
+    workload_root_cgroup: Option<String>,
 }
 
 /// One scheduler staged into the guest initramfs alongside the
@@ -221,6 +229,7 @@ impl Default for KtstrVmBuilder {
             template_staging_image: None,
             workload_duration: None,
             num_snapshots: 0,
+            workload_root_cgroup: None,
         }
     }
 }
@@ -468,6 +477,21 @@ impl KtstrVmBuilder {
     /// samples.
     pub fn num_snapshots(mut self, n: u32) -> Self {
         self.num_snapshots = n;
+        self
+    }
+
+    /// Set the per-test workload-cgroup root. The guest init
+    /// mkdir's `/sys/fs/cgroup{path}` BEFORE starting the
+    /// scheduler and the guest CgroupManager uses it as the parent
+    /// for every workload cgroup declared via
+    /// [`Ctx::cgroup_def`](crate::scenario::Ctx::cgroup_def).
+    ///
+    /// `path` must be an absolute cgroup path (leading `/`,
+    /// not bare `/`); programmatic callers should pass values
+    /// already validated against
+    /// [`crate::test_support::CgroupPath::new`].
+    pub fn workload_root_cgroup(mut self, path: impl Into<String>) -> Self {
+        self.workload_root_cgroup = Some(path.into());
         self
     }
 
@@ -992,6 +1016,7 @@ impl KtstrVmBuilder {
             template_staging_image: self.template_staging_image,
             workload_duration: self.workload_duration,
             num_snapshots: self.num_snapshots,
+            workload_root_cgroup: self.workload_root_cgroup,
             cast_map,
         })
     }

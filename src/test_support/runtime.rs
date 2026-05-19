@@ -706,6 +706,10 @@ pub(crate) fn build_vm_builder_base(
 
     builder = builder.num_snapshots(entry.num_snapshots);
 
+    if let Some(root) = entry.workload_root_cgroup {
+        builder = builder.workload_root_cgroup(root.as_str().to_string());
+    }
+
     builder.watchdog_timeout(entry.watchdog_timeout)
 }
 

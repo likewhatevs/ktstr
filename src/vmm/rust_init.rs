@@ -1312,6 +1312,10 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // Create the cgroup parent directory before starting the scheduler
     // so it exists when the scheduler looks for it.
     let _s_phase3 = tracing::debug_span!("phase3_scheduler_start").entered();
+    // Per-test workload-cgroup root. Sourced from
+    // `KtstrTestEntry::workload_root_cgroup`. The framework owns
+    // this slot; the scheduler never sees it.
+    create_workload_root_cgroup_from_file();
     create_cgroup_parent_from_sched_args();
     exec_shell_script("/sched_enable");
     // Plumb the probe pipeline's `stop` + `output_done` into
@@ -2350,6 +2354,48 @@ fn write_com2(msg: &str) {
 /// must enable both controllers. Writes are applied root-to-leaf so
 /// each level's prerequisite is already in place when its child is
 /// written.
+/// Materialise the per-test workload-cgroup root declared via
+/// `#[ktstr_test(workload_root_cgroup = "/path")]`. Reads
+/// `/workload_root_cgroup` (written by
+/// [`crate::vmm::initramfs::build_suffix`] when
+/// [`crate::vmm::initramfs::SuffixParams::workload_root_cgroup`] is
+/// `Some`), validates the absolute-path shape, mkdir's
+/// `/sys/fs/cgroup{path}`, and enables `+cpuset +cpu` controllers
+/// along every ancestor so the workload cgroups the test author
+/// creates beneath this root inherit the controllers they need.
+///
+/// Distinct from [`create_cgroup_parent_from_sched_args`]: that one
+/// services the `--cell-parent-cgroup` scheduler-argv knob (only
+/// present when the scheduler declaration explicitly carries the
+/// flag); this one services the framework's per-test workload root
+/// (created unconditionally when the test sets the field). Both
+/// run in Phase 3 before `start_scheduler`; ordering between the
+/// two is `workload_root_cgroup` first so it's visible when a
+/// scheduler that does carry `--cell-parent-cgroup` walks the
+/// cgroup tree at startup.
+#[tracing::instrument]
+fn create_workload_root_cgroup_from_file() {
+    let raw = match fs::read_to_string("/workload_root_cgroup") {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let path = raw.trim();
+    if !crate::test_support::cell_parent_path_is_valid(path) {
+        if !path.is_empty() {
+            write_com2(&format!(
+                "ktstr-init: ignoring malformed `/workload_root_cgroup` \
+                 value {path:?}; skipping workload-cgroup root creation \
+                 (host-side `CgroupPath::new` gate normally rejects this \
+                 at compile time)",
+            ));
+        }
+        return;
+    }
+    let cgroup_dir = format!("/sys/fs/cgroup{path}");
+    mkdir_p(&cgroup_dir);
+    enable_subtree_controllers_to(&cgroup_dir);
+}
+
 #[tracing::instrument]
 fn create_cgroup_parent_from_sched_args() {
     let sched_args = match fs::read_to_string("/sched_args") {

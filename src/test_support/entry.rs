@@ -1377,6 +1377,28 @@ pub struct KtstrTestEntry {
     /// 64 cap also ensures the 3-digit `:03` width on
     /// `periodic_NNN` is always sufficient.
     pub num_snapshots: u32,
+    /// Cgroup directory that the framework creates BEFORE the
+    /// scheduler starts and uses as the parent for every workload
+    /// cgroup the test author declares via [`Ctx::cgroup_def`]
+    /// (`ctx.cgroup_def("cg_0")` etc.). When `Some(path)`, the
+    /// guest mkdir's `/sys/fs/cgroup{path}` and the per-test
+    /// CgroupManager places its children there
+    /// (`/sys/fs/cgroup{path}/cg_0` etc.); when `None`, the
+    /// framework falls back to the legacy resolution
+    /// ([`crate::test_support::args::resolve_cgroup_root`] —
+    /// `--cell-parent-cgroup` in `sched_args` overrides; default
+    /// `/sys/fs/cgroup/ktstr`).
+    ///
+    /// Distinct from [`crate::test_support::Scheduler::cgroup_parent`]:
+    /// `cgroup_parent` is a scheduler-only knob that controls the
+    /// scheduler argv (`--cell-parent-cgroup` flag, only when the
+    /// scheduler declaration explicitly carries it in `sched_args`);
+    /// `workload_root_cgroup` is a framework knob for the workload
+    /// side and never reaches the scheduler argv. A test can set
+    /// `workload_root_cgroup` without affecting the scheduler's
+    /// cgroup placement, and a scheduler can set `cgroup_parent`
+    /// without affecting where workloads land.
+    pub workload_root_cgroup: Option<CgroupPath>,
     /// Whether KASLR is enabled in the guest kernel for this test.
     /// `true` (the default) lets the guest randomize kernel virt + direct-map
     /// addresses (CONFIG_RANDOMIZE_BASE=y + CONFIG_RANDOMIZE_MEMORY=y in
@@ -1480,6 +1502,7 @@ impl KtstrTestEntry {
         disk: None,
         post_vm: None,
         num_snapshots: 0,
+        workload_root_cgroup: None,
         kaslr: true,
     };
 
@@ -2085,6 +2108,17 @@ impl KtstrTestEntry {
     #[must_use = "builder methods consume self; bind the result"]
     pub fn with_num_snapshots(mut self, num_snapshots: u32) -> Self {
         self.num_snapshots = num_snapshots;
+        self
+    }
+
+    /// Override `workload_root_cgroup` with a validated path.
+    /// `path` must satisfy [`CgroupPath::new`]'s requirements
+    /// (starts with `/`, not bare `/`, no `..` components); the
+    /// const-eval gate panics on invalid input so programmatic
+    /// callers see the same validation as the macro path.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub const fn with_workload_root_cgroup(mut self, path: &'static str) -> Self {
+        self.workload_root_cgroup = Some(CgroupPath::new(path));
         self
     }
 }

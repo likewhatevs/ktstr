@@ -449,6 +449,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut config_expr: Option<proc_macro2::TokenStream> = None;
     let mut config_set = false;
     let mut disk: Option<syn::Path> = None;
+    let mut workload_root_cgroup: Option<String> = None;
 
     let attr_parser = syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated;
     let parsed_attrs = match attr_parser.parse(attr) {
@@ -700,6 +701,34 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             }
                             _ => unreachable!(),
                         }
+                    }
+                    "workload_root_cgroup" => {
+                        // `workload_root_cgroup = "/path"` lands in
+                        // KtstrTestEntry::workload_root_cgroup as
+                        // `Some(CgroupPath::new(path))`. The CgroupPath
+                        // const constructor const-panics on malformed
+                        // input (missing leading `/`, bare `/`, `..`
+                        // components), so the validation surface stays
+                        // identical to the runtime
+                        // `Scheduler::cgroup_parent` builder path —
+                        // see `CgroupPath::new` for the gate.
+                        let lit_str = match value {
+                            syn::Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Str(ls),
+                                ..
+                            }) => ls.value(),
+                            _ => {
+                                return syn::Error::new_spanned(
+                                    value,
+                                    "expected string literal for \
+                                     workload_root_cgroup (e.g. \
+                                     `workload_root_cgroup = \"/my_workloads\"`)",
+                                )
+                                .to_compile_error()
+                                .into();
+                            }
+                        };
+                        workload_root_cgroup = Some(lit_str);
                     }
                     _ if BOOL_ATTR_NAMES.contains(&ident.as_str()) => {
                         let lit_bool = match value {
@@ -1699,6 +1728,22 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // `workload_root_cgroup = "/path"` lands in
+    // `KtstrTestEntry::workload_root_cgroup` as
+    // `Some(CgroupPath::new("/path"))`. `CgroupPath::new` is `const fn`
+    // with a compile-time gate (rejects missing leading `/`, bare `/`,
+    // `..` components), so a malformed path panics at const-eval
+    // rather than at boot.
+    let workload_root_cgroup_field = if let Some(ref path) = workload_root_cgroup {
+        quote! {
+            workload_root_cgroup: ::core::option::Option::Some(
+                ::ktstr::test_support::CgroupPath::new(#path),
+            ),
+        }
+    } else {
+        quote! {}
+    };
+
     // Compile-time assert: `config = ...` must be paired with a
     // scheduler that declares `config_file_def`, and vice versa. The
     // macro can't read the scheduler const's value (it sees only a
@@ -1939,6 +1984,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             #post_vm_field
             #config_content_field
             #disk_field
+            #workload_root_cgroup_field
             ..::ktstr::test_support::KtstrTestEntry::DEFAULT
         };
 
