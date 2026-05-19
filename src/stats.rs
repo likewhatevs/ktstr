@@ -168,7 +168,13 @@ pub enum GaugeAgg {
 /// helper); a final all-NaN input also returns `None`.
 ///
 /// Semantics by kind:
-///   - `Counter` → sum of finite samples.
+///   - `Counter` → sum of finite samples — the flat-run reduction
+///     for cross-RUN aggregation. NOT the right semantic for
+///     per-phase reduction of a cumulative-since-boot Counter
+///     (which would over-count). Callers wanting per-phase
+///     Counter reduction use [`aggregate_samples_for_phase`],
+///     which routes Counter through a dedicated last-minus-first
+///     branch instead of dispatching through here.
 ///   - `Gauge(Avg)` → arithmetic mean of finite samples.
 ///   - `Gauge(Last)` → last finite sample.
 ///   - `Gauge(Max)` → max of finite samples.

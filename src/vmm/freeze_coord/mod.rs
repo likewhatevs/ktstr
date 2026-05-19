@@ -7450,6 +7450,27 @@ impl KtstrVm {
                             %tag,
                             "freeze-coord: user watchpoint fire; capturing"
                         );
+                        // Snapshot the current scenario phase NOW —
+                        // BEFORE the freeze rendezvous + file write +
+                        // tracing emit that follow. The trip moment
+                        // is when the vCPU observed KVM_EXIT_DEBUG (it
+                        // set the hit flag and woke this loop). The
+                        // closest the coord thread can get to that
+                        // moment is here, immediately after we observed
+                        // the swap on .hit and acquired the gate guard.
+                        // Capturing later (e.g. just before the bridge
+                        // store at the Captured/Degraded/Suppressed
+                        // arms) would let the scenario driver's
+                        // `current_step.store(Release)` race ahead
+                        // during the freeze+file-write window — under
+                        // slow IO that drift can stamp step-k trip
+                        // data into a step-(k+1) bucket, exactly the
+                        // silent-mis-attribution this stamping was
+                        // meant to prevent. Acquire pairs with the
+                        // scenario writer's Release at
+                        // `src/scenario/ops/mod.rs:903`.
+                        let trip_phase_step_index =
+                            freeze_coord_current_step.load(Ordering::Acquire);
                         // User watchpoint has no while-frozen work,
                         // so thaw immediately.
                         let on_demand = freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false });
@@ -7499,7 +7520,21 @@ impl KtstrVm {
                                 elapsed_ms,
                                 "freeze-coord: user-watchpoint snapshot captured"
                             );
-                            freeze_coord_snapshot_bridge.store(&tag, report);
+                            // Use `trip_phase_step_index` captured at
+                            // the top of this iteration (immediately
+                            // after observing the hit swap, before the
+                            // freeze+file-write window). Per
+                            // USER_RULINGS §B1: stamp from CURRENT_STEP
+                            // atomic at trip moment — NOT at bridge-
+                            // store moment, which can drift by the
+                            // freeze+IO latency.
+                            freeze_coord_snapshot_bridge.store_with_stats_and_step(
+                                &tag,
+                                report,
+                                None,
+                                None,
+                                trip_phase_step_index,
+                            );
                             }
                             FreezeOutcome::Degraded(degraded) => {
                                 // User-watchpoint rendezvous timeout.
@@ -7546,7 +7581,20 @@ impl KtstrVm {
                                         degraded.reason.clone(),
                                     )
                                 };
-                                freeze_coord_snapshot_bridge.store(&tag, placeholder);
+                                // Reuse trip_phase_step_index captured
+                                // at the top of this iteration. Even a
+                                // degraded placeholder must carry the
+                                // TRIP phase, not a post-freeze-rendezvous
+                                // re-read of current_step which can drift
+                                // ahead during the freeze+placeholder
+                                // assembly window.
+                                freeze_coord_snapshot_bridge.store_with_stats_and_step(
+                                    &tag,
+                                    placeholder,
+                                    None,
+                                    None,
+                                    trip_phase_step_index,
+                                );
                             }
                             FreezeOutcome::Suppressed => {
                                 // Unreachable: user-watchpoint passes
@@ -7563,7 +7611,21 @@ impl KtstrVm {
                                     crate::monitor::dump::FailureDumpReport::placeholder(
                                         "user-watchpoint capture suppressed (gate decision)",
                                     );
-                                freeze_coord_snapshot_bridge.store(&tag, placeholder);
+                                // Reuse trip_phase_step_index captured
+                                // at the top of this iteration. The
+                                // Suppressed path is reached on the
+                                // unreachable arm (user-watchpoint
+                                // passes gate_on_exit_kind=false), but
+                                // if it ever fires the placeholder
+                                // still needs the TRIP phase, not the
+                                // post-rendezvous re-read.
+                                freeze_coord_snapshot_bridge.store_with_stats_and_step(
+                                    &tag,
+                                    placeholder,
+                                    None,
+                                    None,
+                                    trip_phase_step_index,
+                                );
                             }
                             FreezeOutcome::KernelOp(_) => capture_only_unreachable!(),
                         }

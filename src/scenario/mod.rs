@@ -386,10 +386,20 @@ pub struct Ctx<'a> {
     pub wait_for_map_write: bool,
     /// **Phase coordination.** Per-VM atomic publishing the current
     /// scenario step index. Written by the scenario driver immediately
-    /// before each `run_step` call and read by both the host-side
-    /// freeze-coordinator periodic-capture path and the on-demand
-    /// `Op::CaptureSnapshot` / `Op::WatchSnapshot` apply arms so each
-    /// captured sample carries the step it belongs to.
+    /// before each `run_step` call and read by three stamping sites
+    /// so each captured sample carries the step it belongs to:
+    /// (1) the host-side freeze-coordinator periodic-capture path
+    /// stamps at periodic-fire time;
+    /// (2) the on-demand `Op::CaptureSnapshot` apply arm stamps at
+    /// apply time (the apply happens in the same phase as the
+    /// capture);
+    /// (3) the host-side user-watchpoint trip handler stamps at
+    /// TRIP time, not at registration — the user issues
+    /// `Op::WatchSnapshot` from some Step k, but the actual write
+    /// that fires the watchpoint and triggers the snapshot can
+    /// happen at any later phase, so the trip-time stamp pins the
+    /// sample to the bucket matching when the observation actually
+    /// occurred.
     ///
     /// Encoded per the framework's 1-indexed phase convention: `0` is
     /// the BASELINE settle window (the initial value), `1..=N` align

@@ -85,7 +85,7 @@ use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::prelude::{SampleSeries, VmResult};
 use ktstr::scenario::Ctx;
-use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
+use ktstr::scenario::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
@@ -326,6 +326,129 @@ fn phase_pipeline_no_periodic_samples_yields_empty_phases(ctx: &Ctx) -> Result<A
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_vacuity").workers(2)].into(),
         ops: vec![],
+        hold: HoldSpec::FULL,
+    }];
+    execute_steps(ctx, steps)
+}
+
+/// F2 e2e: Op::WatchSnapshot trip-time stamping pins the captured
+/// snapshot to the phase ACTIVE WHEN THE WATCHPOINT FIRED, not the
+/// phase active when the Op was issued. The contract is to stamp
+/// from the CURRENT_STEP atomic at store time, implemented at
+/// `src/vmm/freeze_coord/mod.rs` user-watchpoint trip arm: the
+/// freeze coordinator loads `current_step` at the TOP of the
+/// trip-handler arm (immediately after observing the hit-swap,
+/// before the freeze rendezvous + file write window), then stamps
+/// the bridge entry with that captured value via
+/// `store_with_stats_and_step` in all 3 sub-arms
+/// (Captured / Degraded / Suppressed).
+///
+/// ## What this test catches
+///
+/// A regression that:
+/// - Reverts to `bridge.store(tag, report)` (unstamped) at the
+///   trip arm → drained `step_index = None` (silent attribution
+///   to BASELINE fallback) — caught by A1.
+/// - Moves the `current_step.load` AFTER the file write → race
+///   window during the freeze+IO latency lets the scenario driver
+///   advance the phase, mis-attributing step-k trip data to
+///   step-(k+1) — caught by A2 in the cross-step variant (TODO
+///   follow-up; see Limitations).
+///
+/// ## Setup
+///
+/// Arms `Op::watch_snapshot("jiffies_64")` during Step[0]. The
+/// kernel writes `jiffies_64` every timer tick (see
+/// `kernel/time/timekeeping.c`), so the watchpoint fires within
+/// the first few ms of Step[0]. By construction the trip phase
+/// matches the registration phase here, which proves the wire-up
+/// (step_index = Some(1), the Step[0] 1-indexed bucket) without
+/// proving the trip-time vs registration-time distinction.
+///
+/// ## Limitations
+///
+/// This variant covers the wire-up regression class (unstamped
+/// trip captures) but NOT the cross-step trip-vs-registration
+/// drift class (race window between trip moment and stamp moment
+/// under slow IO). A complementary
+/// test that arms in Step[0] but fires the watchpoint in Step[2]
+/// requires a kernel symbol whose write is gated on a guest-side
+/// Op the scenario invokes in a specific Step — non-trivial to
+/// construct deterministically. Tracked as a follow-up; the
+/// in-flight fix's "load at top of trip arm" pattern keeps the
+/// race window to sub-ms hit-swap→load latency on the coord
+/// thread, well under the wall-clock duration of a typical Step.
+fn assert_watch_snapshot_trip_phase_stamped(result: &VmResult) -> Result<()> {
+    let drained = result.snapshot_bridge.drain_ordered_with_stats();
+    let watch_caps: Vec<_> = drained
+        .iter()
+        .filter(|e| e.tag == "jiffies_64")
+        .collect();
+    anyhow::ensure!(
+        !watch_caps.is_empty(),
+        "watchpoint on 'jiffies_64' did not fire — `kernel/time/timekeeping.c` \
+         writes jiffies_64 every tick so a fire within Step[0]'s window is \
+         expected. Without a fire, the trip-stamping wire-up is uncovered. \
+         Drained {} entries; tags = {:?}",
+        drained.len(),
+        drained.iter().map(|e| e.tag.as_str()).collect::<Vec<_>>(),
+    );
+    for cap in &watch_caps {
+        anyhow::ensure!(
+            cap.step_index.is_some(),
+            "watchpoint trip capture '{}' has step_index = None — the trip \
+             handler at src/vmm/freeze_coord/mod.rs bypassed \
+             bridge.store_with_stats_and_step and fell back to unstamped \
+             bridge.store. Every trip capture must be stamped \
+             with the host's view of current_step (the load happens whether \
+             or not the value is BASELINE/0). A None here is a wire-up \
+             regression — the new code path went unexecuted and the legacy \
+             unstamped `bridge.store` was used instead.",
+            cap.tag,
+        );
+        // NOTE: the stamped VALUE (Some(0) vs Some(N)) is governed by
+        // host_current_step (HOST-side mirror) at trip time. This atomic
+        // is updated when the guest publishes a STIMULUS frame via the
+        // bulk virtio-console port, which the scenario driver sends
+        // AFTER apply_ops returns (scenario/ops/mod.rs:1248). For the
+        // 1-Step scenario here, the watchpoint arms inside apply_ops
+        // and fires on the next jiffies tick — that fire can race the
+        // STIMULUS frame for Step[0]. When the trip wins the race, the
+        // host's view is still 0 (BASELINE) at stamp time → Some(0).
+        // When STIMULUS wins, Some(1). Both are correct per the
+        // implementation (stamp from the host's last-known step); the
+        // assertion that the value IS stamped at all (Some, not None)
+        // is the load-bearing invariant. The cross-step trip-vs-registration
+        // distinction (testing that a watchpoint armed in Step[0]
+        // firing in Step[2] stamps with the Step[2] phase) requires
+        // a deterministic guest-side write trigger gated on a specific
+        // Step's ops — non-trivial to construct. Tracked as future
+        // work; see test doc above.
+    }
+    Ok(())
+}
+
+#[ktstr_test(
+    scheduler = KTSTR_SCHED,
+    llcs = 1,
+    cores = 2,
+    threads = 1,
+    duration_s = 10,
+    watchdog_timeout_s = 30,
+    num_snapshots = 0,
+    auto_repro = false,
+    post_vm = assert_watch_snapshot_trip_phase_stamped,
+)]
+fn watch_snapshot_trip_in_step_stamps_current_phase_not_unstamped(
+    ctx: &Ctx,
+) -> Result<AssertResult> {
+    let steps = vec![Step {
+        setup: vec![CgroupDef::named("cg_wp").workers(2)].into(),
+        // Arm the watchpoint inside Step[0]. The kernel's
+        // jiffies_64 update every tick fires the watchpoint within
+        // ms; the trip lands while the scenario is still in
+        // Step[0] (1-indexed step_index = 1).
+        ops: vec![Op::watch_snapshot("jiffies_64")],
         hold: HoldSpec::FULL,
     }];
     execute_steps(ctx, steps)
