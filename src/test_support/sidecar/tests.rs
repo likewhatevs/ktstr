@@ -2622,4 +2622,83 @@ fn scheduler_fingerprint_eevdf_has_no_commit() {
     assert!(kargs.is_empty(), "EEVDF declares no kargs; got: {kargs:?}",);
 }
 
+/// SidecarResult round-trips PhaseBucket data through serde with
+/// every field preserved (step_index, label, start_ms, end_ms,
+/// sample_count, metrics map). Pins the wire contract for the
+/// per-phase metric pipeline — a SidecarResult written with a
+/// populated `stats.phases` vec deserializes back to the same
+/// vec, NOT to an empty default. A regression that drops the
+/// phases field from the sidecar serializer or fails to
+/// reconstitute it on the reader silently loses every per-phase
+/// row downstream consumers depend on (cargo ktstr stats compare's
+/// per-phase delta render, GauntletRow.phases carry-through).
+#[test]
+fn sidecar_round_trip_preserves_phases() {
+    use crate::assert::{PhaseBucket, ScenarioStats};
+    use std::collections::BTreeMap;
+    let mut s0_metrics = BTreeMap::new();
+    s0_metrics.insert("max_dsq_depth".to_string(), 7.0);
+    s0_metrics.insert("total_migrations".to_string(), 42.0);
+    let mut s1_metrics = BTreeMap::new();
+    s1_metrics.insert("max_dsq_depth".to_string(), 12.0);
+    s1_metrics.insert("total_migrations".to_string(), 87.0);
+    let stats = ScenarioStats {
+        phases: vec![
+            PhaseBucket {
+                step_index: 0,
+                label: "BASELINE".to_string(),
+                start_ms: 0,
+                end_ms: 500,
+                sample_count: 3,
+                metrics: BTreeMap::new(),
+            },
+            PhaseBucket {
+                step_index: 1,
+                label: "Step[0]".to_string(),
+                start_ms: 500,
+                end_ms: 5500,
+                sample_count: 10,
+                metrics: s0_metrics.clone(),
+            },
+            PhaseBucket {
+                step_index: 2,
+                label: "Step[1]".to_string(),
+                start_ms: 5500,
+                end_ms: 10500,
+                sample_count: 10,
+                metrics: s1_metrics.clone(),
+            },
+        ],
+        ..ScenarioStats::default()
+    };
+    let sc = SidecarResult {
+        stats,
+        ..SidecarResult::test_fixture()
+    };
+    let json = serde_json::to_string(&sc).expect("must serialize");
+    let loaded: SidecarResult = serde_json::from_str(&json).expect("must deserialize");
+    assert_eq!(
+        loaded.stats.phases.len(),
+        3,
+        "expected 3 phases after round-trip, got {}: {:?}",
+        loaded.stats.phases.len(),
+        loaded.stats.phases,
+    );
+    // Spot-check each bucket's load-bearing fields.
+    let baseline = &loaded.stats.phases[0];
+    assert_eq!(baseline.step_index, 0);
+    assert_eq!(baseline.label, "BASELINE");
+    assert!(baseline.metrics.is_empty());
+    let step0 = &loaded.stats.phases[1];
+    assert_eq!(step0.step_index, 1);
+    assert_eq!(step0.label, "Step[0]");
+    assert_eq!(step0.start_ms, 500);
+    assert_eq!(step0.end_ms, 5500);
+    assert_eq!(step0.sample_count, 10);
+    assert_eq!(step0.metrics, s0_metrics);
+    let step1 = &loaded.stats.phases[2];
+    assert_eq!(step1.step_index, 2);
+    assert_eq!(step1.metrics, s1_metrics);
+}
+
 mod commits;
