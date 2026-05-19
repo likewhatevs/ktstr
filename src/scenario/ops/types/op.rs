@@ -642,18 +642,21 @@ pub enum Op {
     /// running bails with an actionable error rather than silently
     /// stacking schedulers.
     ///
-    /// The `scheduler` reference points at a [`Scheduler`] that the
-    /// test pre-declared via the `staged_schedulers` builder slot on
-    /// [`KtstrTestEntry`]; lifecycle ops can only reference schedulers
-    /// pre-staged into the initramfs so the binary is already
-    /// reachable at apply time. A reference to a non-staged scheduler
-    /// bails with a "stage this scheduler first" diagnostic.
+    /// The `scheduler` reference holds a `'static` lifetime: the
+    /// test author declares each [`Scheduler`] at static scope (via
+    /// `declare_scheduler!` or a `static MY_SCHED: Scheduler = ...`
+    /// item) and passes the borrow into the constructor. The
+    /// guest-side binary-staging mechanism that lets the dispatch
+    /// arm reach the actual scheduler executable is a follow-up
+    /// build-out (see "Not yet implemented" below); today there is
+    /// no `KtstrTestEntry` slot that ships multiple scheduler
+    /// binaries into the initramfs.
     ///
-    /// **NOT YET DISPATCHED.** Substep 1 of #7 lands the variant
-    /// shape, constructor, bit-index, and a stub dispatch arm that
-    /// `bail!`s with an unimplemented diagnostic. The guest-side
-    /// `spawn_scheduler_from_paths` refactor + the host→guest dispatch
-    /// arm land in subsequent substeps.
+    /// **Not yet implemented.** Constructing this op compiles and
+    /// pin-tests pass, but applying it bails with an actionable
+    /// "not yet implemented" diagnostic. The guest-side scheduler-
+    /// lifecycle helpers + the host-to-guest dispatch wire land in
+    /// follow-up work.
     AttachScheduler {
         scheduler: &'static crate::test_support::Scheduler,
     },
@@ -670,14 +673,16 @@ pub enum Op {
     /// `src/scenario/ops/mod.rs:861/973/1223`) short-circuit
     /// correctly.
     ///
-    /// **NOT YET DISPATCHED.** See [`Op::AttachScheduler`] for the
-    /// substep-1 deferral note.
+    /// **Not yet implemented.** See [`Op::AttachScheduler`] — the
+    /// constructor compiles and pin-tests pass, but applying this op
+    /// bails with an actionable "not yet implemented" diagnostic
+    /// until the guest-side `kill_scheduler` helper + `SCHED_PID`
+    /// reset land.
     DetachScheduler,
     /// Detach and re-attach the currently-running scheduler with the
     /// SAME spec it was attached under. Useful for hot-restart
-    /// validation (cf. #11 — state-preservation testing). Bails if no
-    /// scheduler is currently attached (there is no "previous spec"
-    /// to restart against).
+    /// validation. Bails if no scheduler is currently attached
+    /// (there is no "previous spec" to restart against).
     ///
     /// Semantically equivalent to `[DetachScheduler, AttachScheduler
     /// { scheduler: <current> }]` but expressed as a single op so the
@@ -686,8 +691,10 @@ pub enum Op {
     /// without depending on test-author bookkeeping of the current
     /// scheduler.
     ///
-    /// **NOT YET DISPATCHED.** See [`Op::AttachScheduler`] for the
-    /// substep-1 deferral note.
+    /// **Not yet implemented.** See [`Op::AttachScheduler`] — the
+    /// constructor compiles and pin-tests pass, but applying this op
+    /// bails with an actionable "not yet implemented" diagnostic
+    /// until the guest-side restart helper lands.
     RestartScheduler,
     /// Detach the currently-running scheduler and attach a different
     /// one. Equivalent to `[DetachScheduler, AttachScheduler {
@@ -701,13 +708,14 @@ pub enum Op {
     /// distinct `Scheduler` declaration) for the second phase, and
     /// assert a per-phase metric delta across the boundary.
     ///
-    /// Bails if no scheduler is currently attached
-    /// ([`Op::AttachScheduler`] is the correct first-attach op),
-    /// matching `Op::SwapCpusets`'s "both endpoints must exist"
-    /// precondition.
+    /// Bails if no scheduler is currently attached — there is no
+    /// scheduler to detach from, so the "replace" semantic has no
+    /// meaning. Use [`Op::AttachScheduler`] for the first attach.
     ///
-    /// **NOT YET DISPATCHED.** See [`Op::AttachScheduler`] for the
-    /// substep-1 deferral note.
+    /// **Not yet implemented.** See [`Op::AttachScheduler`] — the
+    /// constructor compiles and pin-tests pass, but applying this op
+    /// bails with an actionable "not yet implemented" diagnostic
+    /// until the guest-side detach+spec-swap+spawn dispatch lands.
     ReplaceScheduler {
         scheduler: &'static crate::test_support::Scheduler,
     },

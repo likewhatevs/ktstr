@@ -2920,41 +2920,41 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 );
                 dispatch_kernel_op_request("Op::ReadKernelCold", payload)?;
             }
-            // Substep 1 of #7 lands the variant shape, constructor,
-            // and bit-index; the dispatch path itself comes in
-            // subsequent substeps (guest-side spawn/kill helpers
-            // + host→guest wiring + Ctx::current_scheduler tagging).
-            // Bailing here forces any caller that constructs a
-            // scheduler-lifecycle op to land alongside the dispatch
-            // substep, instead of silently no-op'ing while the
-            // implementation accumulates.
+            // Scheduler-lifecycle ops carry the variant shape +
+            // constructor + bit-index at this stage; the dispatch
+            // path itself is not yet implemented. Bailing here forces
+            // any caller that constructs one of these ops to land
+            // alongside the dispatch implementation, instead of
+            // silently no-op'ing while the host-to-guest wiring +
+            // guest-side spawn/kill helpers accumulate.
             Op::AttachScheduler { scheduler: _ } => {
                 anyhow::bail!(
-                    "Op::AttachScheduler dispatch not yet implemented \
-                     (substep 1 of scheduler-lifecycle work lands the variant; \
-                     guest-side spawn + host wire-up follow in subsequent substeps)"
+                    "Op::AttachScheduler dispatch is not yet implemented \
+                     (variant is declared but the guest-side scheduler \
+                     spawn + host-to-guest dispatch wire are follow-up \
+                     work)"
                 );
             }
             Op::DetachScheduler => {
                 anyhow::bail!(
-                    "Op::DetachScheduler dispatch not yet implemented \
-                     (substep 1 of scheduler-lifecycle work lands the variant; \
-                     guest-side kill + SCHED_PID reset follow in subsequent substeps)"
+                    "Op::DetachScheduler dispatch is not yet implemented \
+                     (variant is declared but the guest-side scheduler \
+                     kill + SCHED_PID reset are follow-up work)"
                 );
             }
             Op::RestartScheduler => {
                 anyhow::bail!(
-                    "Op::RestartScheduler dispatch not yet implemented \
-                     (substep 1 of scheduler-lifecycle work lands the variant; \
-                     guest-side restart wrapper follows in subsequent substeps)"
+                    "Op::RestartScheduler dispatch is not yet implemented \
+                     (variant is declared but the guest-side scheduler \
+                     restart helper is follow-up work)"
                 );
             }
             Op::ReplaceScheduler { scheduler: _ } => {
                 anyhow::bail!(
-                    "Op::ReplaceScheduler dispatch not yet implemented \
-                     (substep 1 of scheduler-lifecycle work lands the variant; \
-                     guest-side detach+spec-swap+spawn + per-phase tagging follow \
-                     in subsequent substeps)"
+                    "Op::ReplaceScheduler dispatch is not yet implemented \
+                     (variant is declared but the guest-side scheduler \
+                     detach + spec swap + spawn + per-phase metric \
+                     tagging are follow-up work)"
                 );
             }
         }
@@ -4063,16 +4063,8 @@ mod tests {
             22,
             "AttachScheduler",
         );
-        assert_eq!(
-            Op::DetachScheduler.discriminant(),
-            23,
-            "DetachScheduler",
-        );
-        assert_eq!(
-            Op::RestartScheduler.discriminant(),
-            24,
-            "RestartScheduler",
-        );
+        assert_eq!(Op::DetachScheduler.discriminant(), 23, "DetachScheduler",);
+        assert_eq!(Op::RestartScheduler.discriminant(), 24, "RestartScheduler",);
         assert_eq!(
             Op::ReplaceScheduler {
                 scheduler: &SCHED_FIXTURE,
@@ -6784,6 +6776,115 @@ mod tests {
         assert!(
             msg.contains("no running payload named 'ghost'"),
             "error must name the missing payload, got: {msg}"
+        );
+    }
+
+    // -- Scheduler-lifecycle stub-dispatch bail tests --
+    //
+    // The 4 scheduler-lifecycle Op variants (AttachScheduler /
+    // DetachScheduler / RestartScheduler / ReplaceScheduler) declare
+    // the variant shape + constructor + bit-index + a stub dispatch
+    // arm that `bail!`s with a "not yet implemented" diagnostic.
+    // These tests pin that the bail fires AND names the specific op
+    // — the load-bearing safety net per `feedback_no_silent_drops`:
+    // if a later commit accidentally replaces the bail with a no-op
+    // `Ok(())` arm (e.g. during dispatch wire-up that's still WIP),
+    // these tests fail loudly. Without them, a stub-bail → quiet-pass
+    // regression would let a test author construct a scheduler-
+    // lifecycle op and watch it silently no-op while believing the
+    // scheduler was attached. The per-variant op-name substring
+    // catch a copy-paste regression that reuses one message across
+    // all 4 arms (the existing pattern in apply_ops bails uses one
+    // unique message per arm — pinned here too).
+
+    /// Pins that Op::AttachScheduler dispatch bails with a message
+    /// naming the op AND "not yet implemented". A future commit that
+    /// wires real dispatch must EITHER replace this test with one
+    /// asserting the real semantic OR keep the stub plus this pin.
+    #[test]
+    fn apply_ops_attach_scheduler_bails_with_not_yet_implemented_message() {
+        static SCHED: crate::test_support::Scheduler = crate::test_support::Scheduler::EEVDF;
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let err = apply_ops_test(&ctx, &mut state, &[Op::attach_scheduler(&SCHED)]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Op::AttachScheduler"),
+            "error must name the op (catches copy-paste regression across the 4 stub arms): {msg}"
+        );
+        assert!(
+            msg.contains("not yet implemented"),
+            "error must say 'not yet implemented' so the operator knows the variant declared \
+             without a working dispatch: {msg}"
+        );
+    }
+
+    /// Pins that Op::DetachScheduler dispatch bails with a message
+    /// naming the op AND "not yet implemented". Distinct from
+    /// AttachScheduler's pin because the stub message must be
+    /// per-variant (catches a copy-paste regression that reuses one
+    /// message string for all 4 arms).
+    #[test]
+    fn apply_ops_detach_scheduler_bails_with_not_yet_implemented_message() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let err = apply_ops_test(&ctx, &mut state, &[Op::detach_scheduler()]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Op::DetachScheduler"),
+            "error must name the op (catches copy-paste regression across the 4 stub arms): {msg}"
+        );
+        assert!(
+            msg.contains("not yet implemented"),
+            "error must say 'not yet implemented' so the operator knows the variant declared \
+             without a working dispatch: {msg}"
+        );
+    }
+
+    /// Pins that Op::RestartScheduler dispatch bails with a message
+    /// naming the op AND "not yet implemented".
+    #[test]
+    fn apply_ops_restart_scheduler_bails_with_not_yet_implemented_message() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let err = apply_ops_test(&ctx, &mut state, &[Op::restart_scheduler()]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Op::RestartScheduler"),
+            "error must name the op (catches copy-paste regression across the 4 stub arms): {msg}"
+        );
+        assert!(
+            msg.contains("not yet implemented"),
+            "error must say 'not yet implemented' so the operator knows the variant declared \
+             without a working dispatch: {msg}"
+        );
+    }
+
+    /// Pins that Op::ReplaceScheduler dispatch bails with a message
+    /// naming the op AND "not yet implemented".
+    #[test]
+    fn apply_ops_replace_scheduler_bails_with_not_yet_implemented_message() {
+        static SCHED: crate::test_support::Scheduler = crate::test_support::Scheduler::EEVDF;
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let err = apply_ops_test(&ctx, &mut state, &[Op::replace_scheduler(&SCHED)]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Op::ReplaceScheduler"),
+            "error must name the op (catches copy-paste regression across the 4 stub arms): {msg}"
+        );
+        assert!(
+            msg.contains("not yet implemented"),
+            "error must say 'not yet implemented' so the operator knows the variant declared \
+             without a working dispatch: {msg}"
         );
     }
 
