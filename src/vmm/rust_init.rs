@@ -1054,11 +1054,8 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // historical pre-derivation behavior).
     let kern_page_offset_base_kva =
         crate::vmm::guest_comms::read_kernel_page_offset_base_from_kallsyms().unwrap_or(0);
-    let kern_addrs = crate::vmm::wire::KernAddrs::new(
-        kern_phys_base,
-        kern_page_offset_base_kva,
-        kern_text_kva,
-    );
+    let kern_addrs =
+        crate::vmm::wire::KernAddrs::new(kern_phys_base, kern_page_offset_base_kva, kern_text_kva);
     // `count_online_cpus()` reads `/sys/devices/system/cpu/online`
     // which `mount_filesystems()` mounted earlier in setup();
     // fallback to 1 yields the floor budget if the read fails.

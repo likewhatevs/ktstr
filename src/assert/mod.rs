@@ -1614,7 +1614,15 @@ fn merge_matched_phase_buckets(a: PhaseBucket, b: PhaseBucket) -> PhaseBucket {
         let merged = match (av, bv) {
             (Some(av), Some(bv)) => {
                 let kind = crate::stats::metric_def(key).map(|m| m.kind);
-                merge_metric_values(kind, av, bv, a.sample_count, b.sample_count, a.end_ms, b.end_ms)
+                merge_metric_values(
+                    kind,
+                    av,
+                    bv,
+                    a.sample_count,
+                    b.sample_count,
+                    a.end_ms,
+                    b.end_ms,
+                )
             }
             (Some(v), None) | (None, Some(v)) => v,
             (None, None) => continue,
@@ -2035,9 +2043,7 @@ pub fn populate_run_ext_metrics_from_phases(
         if pairs.is_empty() {
             continue;
         }
-        if let Some(reduced) =
-            crate::stats::aggregate_samples_weighted(&pairs, def.kind)
-        {
+        if let Some(reduced) = crate::stats::aggregate_samples_weighted(&pairs, def.kind) {
             target.insert(key.clone(), reduced);
         }
     }
@@ -2077,9 +2083,7 @@ pub fn populate_run_ext_metrics(
         if readings.is_empty() {
             continue;
         }
-        if let Some(reduced) =
-            crate::stats::aggregate_samples_for_phase(metric_def, &readings)
-        {
+        if let Some(reduced) = crate::stats::aggregate_samples_for_phase(metric_def, &readings) {
             target.insert(metric_def.name.to_string(), reduced);
         }
     }
@@ -2179,10 +2183,8 @@ pub fn build_phase_buckets(samples: &crate::scenario::sample::SampleSeries) -> V
     // like `avg_imbalance_ratio` that need per-CPU full-class
     // `rq.nr_running`, which the bridge-captured Snapshot does
     // not expose (Snapshot carries scx_rq.nr_running only).
-    let monitor_samples: &[crate::monitor::MonitorSample] = samples
-        .monitor()
-        .map(|m| m.samples())
-        .unwrap_or(&[]);
+    let monitor_samples: &[crate::monitor::MonitorSample] =
+        samples.monitor().map(|m| m.samples()).unwrap_or(&[]);
     let by_phase = samples.by_phase();
     let mut out: Vec<PhaseBucket> = Vec::with_capacity(by_phase.len());
     for (step_index, samples_in_phase) in by_phase {
@@ -2255,9 +2257,7 @@ pub fn build_phase_buckets(samples: &crate::scenario::sample::SampleSeries) -> V
             .filter(|s| in_window(s.elapsed_ms))
             .filter(|s| crate::monitor::sample_looks_valid(s))
             .collect();
-        if !phase_monitor_samples.is_empty()
-            && !metrics.contains_key("avg_imbalance_ratio")
-        {
+        if !phase_monitor_samples.is_empty() && !metrics.contains_key("avg_imbalance_ratio") {
             // Mean of MonitorSample::imbalance_ratio() across the
             // valid samples in the phase window. `imbalance_ratio`
             // is max(nr_running) / max(1, min(nr_running)) per
@@ -2675,9 +2675,8 @@ impl AssertResult {
                 .map(|b| (b.step_index, b))
                 .collect();
             let self_buckets = std::mem::take(&mut self.stats.phases);
-            let mut merged: Vec<PhaseBucket> = Vec::with_capacity(
-                self_buckets.len() + other_by_idx.len(),
-            );
+            let mut merged: Vec<PhaseBucket> =
+                Vec::with_capacity(self_buckets.len() + other_by_idx.len());
             for s_bucket in self_buckets {
                 if let Some(o_bucket) = other_by_idx.remove(&s_bucket.step_index) {
                     merged.push(merge_matched_phase_buckets(s_bucket, o_bucket));

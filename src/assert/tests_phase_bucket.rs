@@ -644,7 +644,6 @@ fn build_phase_buckets_integration_with_scenario_stats_phase_accessor() {
     assert_eq!(stats.step(1).map(|p| p.label.as_str()), Some("Step[1]"));
 }
 
-
 // ---------- Phase newtype ----------
 
 #[test]
@@ -669,7 +668,10 @@ fn phase_step_saturating_at_u16_max_does_not_overflow() {
     assert_eq!(saturated.as_u16(), u16::MAX);
     let still_saturated = crate::assert::Phase::step(u16::MAX);
     assert_eq!(still_saturated.as_u16(), u16::MAX);
-    assert!(!saturated.is_baseline(), "saturating MUST NOT collide with BASELINE");
+    assert!(
+        !saturated.is_baseline(),
+        "saturating MUST NOT collide with BASELINE"
+    );
 }
 
 #[test]
@@ -687,7 +689,10 @@ fn phase_serde_transparent_round_trips_as_bare_u16() {
     // deserializes as a Phase.
     let phase = crate::assert::Phase::step(4);
     let json = serde_json::to_string(&phase).unwrap();
-    assert_eq!(json, "5", "wire format must be the inner 1-indexed u16, not a tagged struct");
+    assert_eq!(
+        json, "5",
+        "wire format must be the inner 1-indexed u16, not a tagged struct"
+    );
     let round_tripped: crate::assert::Phase = serde_json::from_str(&json).unwrap();
     assert_eq!(round_tripped, phase);
     // And the reverse: a raw number deserializes as a Phase.
@@ -721,7 +726,10 @@ fn scenario_stats_has_steps_false_when_only_baseline() {
         }],
         ..Default::default()
     };
-    assert!(!stats.has_steps(), "BASELINE-only must NOT count as 'has steps'");
+    assert!(
+        !stats.has_steps(),
+        "BASELINE-only must NOT count as 'has steps'"
+    );
 }
 
 #[test]
@@ -775,11 +783,11 @@ fn phase_guard_outside_scope_returns_none() {
     // No guard installed → current_phase_label is None and a
     // freshly-constructed AssertDetail inherits None.
     assert!(crate::assert::current_phase_label().is_none());
-    let d = crate::assert::AssertDetail::new(
-        crate::assert::DetailKind::Other,
-        "no guard",
+    let d = crate::assert::AssertDetail::new(crate::assert::DetailKind::Other, "no guard");
+    assert!(
+        d.phase.is_none(),
+        "AssertDetail constructed outside any PhaseGuard must stamp phase=None"
     );
-    assert!(d.phase.is_none(), "AssertDetail constructed outside any PhaseGuard must stamp phase=None");
 }
 
 #[test]
@@ -789,10 +797,7 @@ fn phase_guard_install_step_sets_active_label() {
         crate::assert::current_phase_label().as_deref(),
         Some("Step[0]"),
     );
-    let d = crate::assert::AssertDetail::new(
-        crate::assert::DetailKind::Other,
-        "under Step[0]",
-    );
+    let d = crate::assert::AssertDetail::new(crate::assert::DetailKind::Other, "under Step[0]");
     assert_eq!(d.phase.as_deref(), Some("Step[0]"));
 }
 
@@ -856,11 +861,8 @@ fn phase_guard_infonote_auto_stamps() {
 #[test]
 fn phase_guard_with_phase_builder_overrides_auto_stamp() {
     let _g = crate::assert::PhaseGuard::install_step(0); // "Step[0]"
-    let d = crate::assert::AssertDetail::new(
-        crate::assert::DetailKind::Other,
-        "override",
-    )
-    .with_phase("explicit_override");
+    let d = crate::assert::AssertDetail::new(crate::assert::DetailKind::Other, "override")
+        .with_phase("explicit_override");
     assert_eq!(
         d.phase.as_deref(),
         Some("explicit_override"),
@@ -1055,7 +1057,10 @@ fn build_phase_buckets_avg_dsq_depth_from_snapshot_dsq_states() {
         .get("max_dsq_depth")
         .copied()
         .expect("max_dsq_depth populated alongside avg");
-    assert!((max - 6.0).abs() < f64::EPSILON, "expected max=6.0, got {max}");
+    assert!(
+        (max - 6.0).abs() < f64::EPSILON,
+        "expected max=6.0, got {max}"
+    );
 }
 
 /// Tester B15 BLOCKING: iteration_rate per-phase population via

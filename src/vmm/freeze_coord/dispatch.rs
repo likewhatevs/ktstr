@@ -429,10 +429,7 @@ pub(super) fn dispatch_bulk_message(
                                 tracing::error!(
                                     kern_addrs_derived = format_args!("{offset:#x}"),
                                     lstar_derived = format_args!("{lstar_derived:#x}"),
-                                    delta = format_args!(
-                                        "{:#x}",
-                                        offset ^ lstar_derived
-                                    ),
+                                    delta = format_args!("{:#x}", offset ^ lstar_derived),
                                     "VirtKaslrDivergence: KERN_ADDRS-derived virt-KASLR \
                                      offset disagrees with the previously-published \
                                      MSR_LSTAR-derived value. Both should equal the \

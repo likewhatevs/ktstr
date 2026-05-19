@@ -501,7 +501,8 @@ fn assert_per_step_cpuset_changes_metrics(result: &VmResult) -> Result<()> {
             eprintln!(
                 "WARN: Step[0] bucket has no `max_dsq_depth` (sample_count={}, \
                  keys={:?}); test inconclusive.",
-                step0.sample_count, step0.metrics.keys().collect::<Vec<_>>(),
+                step0.sample_count,
+                step0.metrics.keys().collect::<Vec<_>>(),
             );
             return Ok(());
         }
@@ -512,7 +513,8 @@ fn assert_per_step_cpuset_changes_metrics(result: &VmResult) -> Result<()> {
             eprintln!(
                 "WARN: Step[1] bucket has no `max_dsq_depth` (sample_count={}, \
                  keys={:?}); test inconclusive.",
-                step1.sample_count, step1.metrics.keys().collect::<Vec<_>>(),
+                step1.sample_count,
+                step1.metrics.keys().collect::<Vec<_>>(),
             );
             return Ok(());
         }
@@ -551,7 +553,8 @@ fn assert_per_step_cpuset_changes_metrics(result: &VmResult) -> Result<()> {
              of partitioning by step_index. \
          The all-zero inconclusive case is gated above; reaching THIS \
          branch with equal positive values is a real defect signal.",
-        s0, s1,
+        s0,
+        s1,
     );
     Ok(())
 }
@@ -667,10 +670,7 @@ fn phase_pipeline_per_step_cpuset_differs(ctx: &Ctx) -> Result<AssertResult> {
 /// thread, well under the wall-clock duration of a typical Step.
 fn assert_watch_snapshot_trip_phase_stamped(result: &VmResult) -> Result<()> {
     let drained = result.snapshot_bridge.drain_ordered_with_stats();
-    let watch_caps: Vec<_> = drained
-        .iter()
-        .filter(|e| e.tag == "jiffies_64")
-        .collect();
+    let watch_caps: Vec<_> = drained.iter().filter(|e| e.tag == "jiffies_64").collect();
     anyhow::ensure!(
         !watch_caps.is_empty(),
         "watchpoint on 'jiffies_64' did not fire — `kernel/time/timekeeping.c` \

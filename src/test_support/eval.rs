@@ -1846,10 +1846,8 @@ fn evaluate_vm_result(
         drained_for_phases,
         result.monitor.clone(),
     );
-    let mut early_phase_buckets = crate::assert::build_phase_buckets_with_stimulus(
-        &early_sample_series,
-        stimulus_events,
-    );
+    let mut early_phase_buckets =
+        crate::assert::build_phase_buckets_with_stimulus(&early_sample_series, stimulus_events);
     // Build timeline from the pre-bucketed phases. When no
     // PhaseBuckets exist (scenario had no periodic captures,
     // e.g. single-phase tests) but monitor samples ARE present,

@@ -268,10 +268,7 @@ pub fn aggregate_samples(samples: &[f64], kind: MetricKind) -> Option<f64> {
 /// `merge_metric_values` precedent. Weight sum uses `checked_add`
 /// with fallback to unweighted on overflow so a pathological
 /// caller can't crash the aggregator.
-pub fn aggregate_samples_weighted(
-    pairs: &[(f64, usize)],
-    kind: MetricKind,
-) -> Option<f64> {
+pub fn aggregate_samples_weighted(pairs: &[(f64, usize)], kind: MetricKind) -> Option<f64> {
     let finite: Vec<(f64, usize)> = pairs
         .iter()
         .copied()
@@ -2462,7 +2459,9 @@ pub fn group_and_average_by(
         acc.sum_p99_wake += row.worst_p99_wake_latency_us;
         acc.sum_median_wake += row.worst_median_wake_latency_us;
         acc.sum_wake_cv += row.worst_wake_latency_cv;
-        acc.sum_total_iterations = acc.sum_total_iterations.saturating_add(row.total_iterations);
+        acc.sum_total_iterations = acc
+            .sum_total_iterations
+            .saturating_add(row.total_iterations);
         acc.sum_mean_run_delay += row.worst_mean_run_delay_us;
         acc.sum_tail_ratio += row.worst_wake_latency_tail_ratio;
         acc.sum_iters_per_worker += row.worst_iterations_per_worker;
@@ -2694,11 +2693,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         run_source: sc.run_source.clone(),
         passed: sc.is_pass(),
         skipped: sc.is_skip(),
-        run_sample_count: sc
-            .monitor
-            .as_ref()
-            .map(|m| m.total_samples)
-            .unwrap_or(0),
+        run_sample_count: sc.monitor.as_ref().map(|m| m.total_samples).unwrap_or(0),
         spread: finite_or_zero("spread", sc.stats.worst_spread),
         gap_ms: sc.stats.worst_gap_ms,
         migrations: sc.stats.total_migrations,
@@ -5238,10 +5233,8 @@ mod tests {
     /// pulls the mean above the unweighted midpoint of 15.
     #[test]
     fn aggregate_samples_weighted_gauge_avg_pulls_toward_heavier_sample() {
-        let r = aggregate_samples_weighted(
-            &[(10.0, 5), (20.0, 15)],
-            MetricKind::Gauge(GaugeAgg::Avg),
-        );
+        let r =
+            aggregate_samples_weighted(&[(10.0, 5), (20.0, 15)], MetricKind::Gauge(GaugeAgg::Avg));
         assert_eq!(r, Some(17.5));
     }
 
@@ -5262,10 +5255,8 @@ mod tests {
     /// single-source-of-truth.
     #[test]
     fn aggregate_samples_weighted_gauge_avg_zero_total_weight_falls_back_to_mean() {
-        let r = aggregate_samples_weighted(
-            &[(10.0, 0), (30.0, 0)],
-            MetricKind::Gauge(GaugeAgg::Avg),
-        );
+        let r =
+            aggregate_samples_weighted(&[(10.0, 0), (30.0, 0)], MetricKind::Gauge(GaugeAgg::Avg));
         assert_eq!(r, Some(20.0));
     }
 
@@ -5274,30 +5265,22 @@ mod tests {
     /// weight-sensitive Counter semantics breaks here.
     #[test]
     fn aggregate_samples_weighted_counter_ignores_weights() {
-        let r = aggregate_samples_weighted(
-            &[(10.0, 5), (20.0, 15)],
-            MetricKind::Counter,
-        );
+        let r = aggregate_samples_weighted(&[(10.0, 5), (20.0, 15)], MetricKind::Counter);
         assert_eq!(r, Some(30.0));
     }
 
     /// `Peak` ignores weights — max is weight-independent.
     #[test]
     fn aggregate_samples_weighted_peak_ignores_weights() {
-        let r = aggregate_samples_weighted(
-            &[(10.0, 5), (20.0, 15)],
-            MetricKind::Peak,
-        );
+        let r = aggregate_samples_weighted(&[(10.0, 5), (20.0, 15)], MetricKind::Peak);
         assert_eq!(r, Some(20.0));
     }
 
     /// `Gauge(Max)` ignores weights — max is weight-independent.
     #[test]
     fn aggregate_samples_weighted_gauge_max_ignores_weights() {
-        let r = aggregate_samples_weighted(
-            &[(10.0, 5), (20.0, 15)],
-            MetricKind::Gauge(GaugeAgg::Max),
-        );
+        let r =
+            aggregate_samples_weighted(&[(10.0, 5), (20.0, 15)], MetricKind::Gauge(GaugeAgg::Max));
         assert_eq!(r, Some(20.0));
     }
 
@@ -5305,15 +5288,10 @@ mod tests {
     /// is weight-independent.
     #[test]
     fn aggregate_samples_weighted_gauge_last_and_timestamp_ignore_weights() {
-        let last = aggregate_samples_weighted(
-            &[(10.0, 5), (20.0, 15)],
-            MetricKind::Gauge(GaugeAgg::Last),
-        );
+        let last =
+            aggregate_samples_weighted(&[(10.0, 5), (20.0, 15)], MetricKind::Gauge(GaugeAgg::Last));
         assert_eq!(last, Some(20.0));
-        let ts = aggregate_samples_weighted(
-            &[(10.0, 5), (20.0, 15)],
-            MetricKind::Timestamp,
-        );
+        let ts = aggregate_samples_weighted(&[(10.0, 5), (20.0, 15)], MetricKind::Timestamp);
         assert_eq!(ts, Some(20.0));
     }
 
@@ -9159,10 +9137,12 @@ mod tests {
     fn group_and_average_ext_metrics_unregistered_falls_back_to_arithmetic_mean() {
         let mut a = make_row("t", "tiny-1llc", true, 0.0);
         a.run_sample_count = 5;
-        a.ext_metrics.insert("custom.unregistered".to_string(), 10.0);
+        a.ext_metrics
+            .insert("custom.unregistered".to_string(), 10.0);
         let mut b = make_row("t", "tiny-1llc", true, 0.0);
         b.run_sample_count = 15;
-        b.ext_metrics.insert("custom.unregistered".to_string(), 30.0);
+        b.ext_metrics
+            .insert("custom.unregistered".to_string(), 30.0);
         let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
         let mean = out[0]
             .row

@@ -19,8 +19,8 @@ use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::prelude::*;
-use ktstr::scenario::ops::{HoldSpec, KernelTarget, KernelValueWidth, Op, Step, execute_steps};
 use ktstr::scenario::Ctx;
+use ktstr::scenario::ops::{HoldSpec, KernelTarget, KernelValueWidth, Op, Step, execute_steps};
 
 declare_scheduler!(KTSTR_SCHED, {
     name = "ktstr_sched",

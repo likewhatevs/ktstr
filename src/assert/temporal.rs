@@ -202,8 +202,10 @@ impl<T> SeriesField<T> {
     /// per-sample [`SampleTriple<T>`] the standard [`Self::iter_full`]
     /// yields.
     pub fn by_phase(&self) -> ByPhasePartition<'_, T> {
-        let mut buckets: std::collections::BTreeMap<crate::assert::Phase, Vec<SampleTriple<'_, T>>> =
-            std::collections::BTreeMap::new();
+        let mut buckets: std::collections::BTreeMap<
+            crate::assert::Phase,
+            Vec<SampleTriple<'_, T>>,
+        > = std::collections::BTreeMap::new();
         let mut none_bucket: Vec<SampleTriple<'_, T>> = Vec::new();
         for (((tag, elapsed_ms), value), phase) in self
             .tags
@@ -2151,8 +2153,15 @@ mod tests {
             ],
         );
         let (by_phase, none_bucket) = f.by_phase();
-        assert!(none_bucket.is_empty(), "no None-phase samples in this fixture");
-        assert_eq!(by_phase.len(), 3, "3 distinct phases: BASELINE, Step[0], Step[1]");
+        assert!(
+            none_bucket.is_empty(),
+            "no None-phase samples in this fixture"
+        );
+        assert_eq!(
+            by_phase.len(),
+            3,
+            "3 distinct phases: BASELINE, Step[0], Step[1]"
+        );
         assert_eq!(by_phase[&crate::assert::Phase::BASELINE].len(), 1);
         assert_eq!(by_phase[&crate::assert::Phase::step(0)].len(), 2);
         assert_eq!(by_phase[&crate::assert::Phase::step(1)].len(), 1);

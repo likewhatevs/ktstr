@@ -699,9 +699,23 @@ fn assert_result_merge_per_phase_counter_sums() {
     // merge sums the two reduced values so multiple cgroups'
     // per-phase deltas accumulate.
     let mut a = AssertResult::pass();
-    a.stats.phases = vec![phase_bucket(1, "Step[0]", 0, 100, 5, &[("total_migrations", 25.0)])];
+    a.stats.phases = vec![phase_bucket(
+        1,
+        "Step[0]",
+        0,
+        100,
+        5,
+        &[("total_migrations", 25.0)],
+    )];
     let mut b = AssertResult::pass();
-    b.stats.phases = vec![phase_bucket(1, "Step[0]", 0, 100, 5, &[("total_migrations", 75.0)])];
+    b.stats.phases = vec![phase_bucket(
+        1,
+        "Step[0]",
+        0,
+        100,
+        5,
+        &[("total_migrations", 75.0)],
+    )];
     a.merge(b);
     assert_eq!(a.stats.phases.len(), 1);
     assert_eq!(a.stats.phases[0].metrics["total_migrations"], 100.0);
@@ -712,9 +726,23 @@ fn assert_result_merge_per_phase_peak_takes_max() {
     // `worst_gap_ms` is `MetricKind::Peak`; the per-phase merge
     // takes the max so a worse peak on either side wins.
     let mut a = AssertResult::pass();
-    a.stats.phases = vec![phase_bucket(2, "Step[1]", 0, 100, 5, &[("worst_gap_ms", 12.0)])];
+    a.stats.phases = vec![phase_bucket(
+        2,
+        "Step[1]",
+        0,
+        100,
+        5,
+        &[("worst_gap_ms", 12.0)],
+    )];
     let mut b = AssertResult::pass();
-    b.stats.phases = vec![phase_bucket(2, "Step[1]", 0, 100, 5, &[("worst_gap_ms", 7.0)])];
+    b.stats.phases = vec![phase_bucket(
+        2,
+        "Step[1]",
+        0,
+        100,
+        5,
+        &[("worst_gap_ms", 7.0)],
+    )];
     a.merge(b);
     assert_eq!(a.stats.phases[0].metrics["worst_gap_ms"], 12.0);
 }
@@ -726,9 +754,23 @@ fn assert_result_merge_per_phase_gauge_last_takes_later_end_ms() {
     // the later `end_ms` per `MergeKind::NonCommutative`. The
     // arrival order doesn't decide the winner — the timestamp does.
     let mut a = AssertResult::pass();
-    a.stats.phases = vec![phase_bucket(1, "Step[0]", 0, 200, 5, &[("worst_spread", 0.42)])];
+    a.stats.phases = vec![phase_bucket(
+        1,
+        "Step[0]",
+        0,
+        200,
+        5,
+        &[("worst_spread", 0.42)],
+    )];
     let mut b = AssertResult::pass();
-    b.stats.phases = vec![phase_bucket(1, "Step[0]", 0, 100, 5, &[("worst_spread", 0.11)])];
+    b.stats.phases = vec![phase_bucket(
+        1,
+        "Step[0]",
+        0,
+        100,
+        5,
+        &[("worst_spread", 0.11)],
+    )];
     a.merge(b);
     // a.end_ms = 200 > b.end_ms = 100 → a's value wins.
     assert_eq!(a.stats.phases[0].metrics["worst_spread"], 0.42);
@@ -744,9 +786,23 @@ fn assert_result_merge_per_phase_gauge_last_reverse_picks_later_end_ms() {
     // operand order. `b` has the later `end_ms` so b's value wins
     // even though it's on the right side of the merge.
     let mut a = AssertResult::pass();
-    a.stats.phases = vec![phase_bucket(1, "Step[0]", 0, 100, 5, &[("worst_spread", 0.42)])];
+    a.stats.phases = vec![phase_bucket(
+        1,
+        "Step[0]",
+        0,
+        100,
+        5,
+        &[("worst_spread", 0.42)],
+    )];
     let mut b = AssertResult::pass();
-    b.stats.phases = vec![phase_bucket(1, "Step[0]", 0, 200, 5, &[("worst_spread", 0.11)])];
+    b.stats.phases = vec![phase_bucket(
+        1,
+        "Step[0]",
+        0,
+        200,
+        5,
+        &[("worst_spread", 0.11)],
+    )];
     a.merge(b);
     // b.end_ms = 200 > a.end_ms = 100 → b's value wins.
     assert_eq!(a.stats.phases[0].metrics["worst_spread"], 0.11);
@@ -758,9 +814,23 @@ fn assert_result_merge_per_phase_unpaired_step_indices_keep_both() {
     // One side has step_index 1, the other has step_index 2. The
     // merge keeps both — no-silent-drops contract.
     let mut a = AssertResult::pass();
-    a.stats.phases = vec![phase_bucket(1, "Step[0]", 0, 100, 3, &[("total_migrations", 5.0)])];
+    a.stats.phases = vec![phase_bucket(
+        1,
+        "Step[0]",
+        0,
+        100,
+        3,
+        &[("total_migrations", 5.0)],
+    )];
     let mut b = AssertResult::pass();
-    b.stats.phases = vec![phase_bucket(2, "Step[1]", 100, 200, 3, &[("total_migrations", 8.0)])];
+    b.stats.phases = vec![phase_bucket(
+        2,
+        "Step[1]",
+        100,
+        200,
+        3,
+        &[("total_migrations", 8.0)],
+    )];
     a.merge(b);
     assert_eq!(a.stats.phases.len(), 2);
     // Sorted by step_index for deterministic output.
@@ -776,9 +846,23 @@ fn assert_result_merge_per_phase_unknown_metric_takes_mean() {
     // safest commutative default when the merge can't query
     // `MetricKind`.
     let mut a = AssertResult::pass();
-    a.stats.phases = vec![phase_bucket(0, "BASELINE", 0, 100, 5, &[("custom.metric", 10.0)])];
+    a.stats.phases = vec![phase_bucket(
+        0,
+        "BASELINE",
+        0,
+        100,
+        5,
+        &[("custom.metric", 10.0)],
+    )];
     let mut b = AssertResult::pass();
-    b.stats.phases = vec![phase_bucket(0, "BASELINE", 0, 100, 5, &[("custom.metric", 30.0)])];
+    b.stats.phases = vec![phase_bucket(
+        0,
+        "BASELINE",
+        0,
+        100,
+        5,
+        &[("custom.metric", 30.0)],
+    )];
     a.merge(b);
     assert_eq!(a.stats.phases[0].metrics["custom.metric"], 20.0);
 }
@@ -798,7 +882,14 @@ fn assert_result_merge_per_phase_one_side_only_keeps_value() {
         &[("total_migrations", 7.0), ("worst_gap_ms", 12.0)],
     )];
     let mut b = AssertResult::pass();
-    b.stats.phases = vec![phase_bucket(1, "Step[0]", 0, 100, 5, &[("total_migrations", 3.0)])];
+    b.stats.phases = vec![phase_bucket(
+        1,
+        "Step[0]",
+        0,
+        100,
+        5,
+        &[("total_migrations", 3.0)],
+    )];
     a.merge(b);
     assert_eq!(a.stats.phases[0].metrics["total_migrations"], 10.0);
     assert_eq!(a.stats.phases[0].metrics["worst_gap_ms"], 12.0);
