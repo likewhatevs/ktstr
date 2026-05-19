@@ -6881,6 +6881,26 @@ impl KtstrVm {
                     // the moment the op was issued, not the moment
                     // after an arbitrary-duration kernel-op batch
                     // finished modifying that same kernel state.
+                    // Drain ColdOp requests deferred during the
+                    // pre-KASLR / pre-accessor window once BOTH
+                    // inputs are ready. Mirror of the WATCH-drain
+                    // at the snapshot-request site. Without this,
+                    // a ColdOp deferred when kaslr=0 (e.g. accessor
+                    // adopted but kaslr publish hasn't landed yet)
+                    // would sit in `kernel_op_requests_deferred`
+                    // until the next accessor-adoption fire — which
+                    // is "never" because accessor adopts once.
+                    // Re-queue the deferred list onto pending so
+                    // this iteration's normal dispatch path runs
+                    // with both prerequisites in place.
+                    if coord_kaslr_offset() != 0
+                        && owned_accessor.is_some()
+                        && !kernel_op_requests_deferred.is_empty()
+                    {
+                        kernel_op_requests_pending.append(
+                            &mut kernel_op_requests_deferred,
+                        );
+                    }
                     let pending_kernel_ops = std::mem::take(&mut kernel_op_requests_pending);
                     for req in pending_kernel_ops {
                         // Defer-on-no-accessor gate. Mirrors the
@@ -6905,12 +6925,38 @@ impl KtstrVm {
                         // the same iteration body's drain dispatches
                         // them through the normal flow with the
                         // accessor present.
-                        if owned_accessor.is_none() {
+                        if owned_accessor.is_none()
+                            || coord_kaslr_offset() == 0
+                        {
+                            // ColdOp dispatch resolves per-CPU /
+                            // task-field / symbol KVAs via
+                            // `per_cpu_kva = template + kaslr_offset`
+                            // (kernel_op_dispatch's resolve_per_cpu_
+                            // field_pa) and depends on the prog
+                            // accessor for any field reads that walk
+                            // BPF maps. Both inputs must be ready
+                            // before dispatch:
+                            //   - owned_accessor == None: the ColdOp
+                            //     arm in freeze_and_dispatch hits the
+                            //     defensive "owned_accessor not yet
+                            //     initialised" reply branch.
+                            //   - coord_kaslr_offset() == 0 against a
+                            //     KASLR-on guest: the resolved per_cpu
+                            //     _kva falls on the link-time KVA and
+                            //     trips the kernel-half-floor check
+                            //     in resolve_per_cpu_field_pa (Step
+                            //     4 F hardening at L613 of
+                            //     kernel_op_dispatch.rs).
+                            // Same pattern as the WATCH-deferral at
+                            // L6664-6680; defer + drain when both
+                            // prerequisites land.
                             tracing::info!(
                                 request_id = req.request_id,
                                 tag = %req.tag,
+                                kaslr_resolved = coord_kaslr_offset() != 0,
+                                accessor_adopted = owned_accessor.is_some(),
                                 "freeze-coord: ColdOp deferred \
-                                 (owned_accessor not yet adopted)"
+                                 (owned_accessor or kaslr_offset not yet resolved)"
                             );
                             kernel_op_requests_deferred.push(req);
                             continue;
