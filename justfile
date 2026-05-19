@@ -9,11 +9,18 @@ default:
 fmt:
     cargo fmt --all
 
-# Run all lints (format check + type check + clippy)
+# Run all lints (format check + type check + clippy + rustdoc warnings)
 lint:
     cargo fmt -- --check
     cargo check --workspace --all-targets
     cargo clippy --workspace --all-targets
+    just doc-strict
+
+# Promote every rustdoc warning to an error. RUSTDOCFLAGS reaches every
+# crate in the workspace (including ktstr-macros), where `cargo doc -- -D
+# warnings` would only forward the flag to the top-level invocation.
+doc-strict:
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 
 # Build a test kernel
 kernel-build version="":
@@ -74,7 +81,7 @@ link-check:
 
 # Build API reference
 api-docs:
-    cargo doc --workspace --no-deps
+    cargo doc --workspace --no-deps --all-features
 
 # Build and serve the guide locally
 book-serve:
