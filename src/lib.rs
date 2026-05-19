@@ -629,9 +629,9 @@ pub use crate::probe::process::resolve_func_ip;
 /// The `linkme` crate, re-exported as part of ktstr's public surface
 /// so downstream code can reference it via [`ktstr::linkme`](crate::linkme)
 /// in the `#[linkme(crate = ...)]` annotation that
-/// [`distributed_slice`](crate::distributed_slice) registrations
+/// [`distributed_slice`] registrations
 /// require — without having to add `linkme` as a direct Cargo
-/// dependency. See [`distributed_slice`](crate::distributed_slice)
+/// dependency. See [`distributed_slice`]
 /// for the usage pattern.
 pub use ::linkme;
 

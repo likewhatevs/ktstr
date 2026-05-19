@@ -61,7 +61,7 @@ pub fn current_phase_label() -> Option<std::borrow::Cow<'static, str>> {
     ACTIVE_PHASE.with(|p| p.borrow().clone())
 }
 
-/// RAII scope guard for the [`ACTIVE_PHASE`] thread-local. Install
+/// RAII scope guard for the `ACTIVE_PHASE` thread-local. Install
 /// at scenario-driver `run_step` entry; the guard's `Drop` restores
 /// the prior phase label, supporting cleanly-nested scenario
 /// dispatch (sub-scenarios layer over a parent's phase context
@@ -86,7 +86,7 @@ impl PhaseGuard {
     /// previously-active label for restoration on Drop. Use
     /// [`Self::install_step`] / [`Self::install_baseline`] for the
     /// scenario-driver call sites — they produce the standard
-    /// "Step[k]" / "BASELINE" labels matching the rest of the
+    /// `"Step[k]"` / `"BASELINE"` labels matching the rest of the
     /// pipeline.
     pub fn install(label: impl Into<std::borrow::Cow<'static, str>>) -> Self {
         let previous = ACTIVE_PHASE.with(|p| p.replace(Some(label.into())));
@@ -256,7 +256,9 @@ pub enum DetailKind {
     /// Slow-tier (memory tier) threshold failure.
     SlowTier,
     /// Monitor-subsystem anomaly (imbalance, DSQ depth, rq_clock stall).
-    /// Use `DetailKind::SchedulerDied` for scheduler-liveness failures.
+    /// Use one of [`DetailKind::SchedulerCrashed`] /
+    /// [`DetailKind::SchedulerExitedCleanly`] /
+    /// [`DetailKind::SchedulerDiedUnknownReason`] for scheduler-liveness failures.
     Monitor,
     /// Scheduler process observed to have died (via `sched_pid`
     /// probe returning ESRCH or wait on the leader) AND the BPF
@@ -293,8 +295,10 @@ pub enum DetailKind {
     /// SCX event-counter threshold failure. An error-class
     /// `SCX_EV_*` counter (e.g. `enq_skip_exiting`,
     /// `enq_skip_migration_disabled`, `dispatch_local_dsq_offline`) crossed
-    /// the configured bound. Distinct from
-    /// [`DetailKind::SchedulerDied`] (process-liveness) and
+    /// the configured bound. Distinct from the process-liveness
+    /// variants ([`DetailKind::SchedulerCrashed`] /
+    /// [`DetailKind::SchedulerExitedCleanly`] /
+    /// [`DetailKind::SchedulerDiedUnknownReason`]) and
     /// [`DetailKind::Monitor`] (imbalance / DSQ-depth /
     /// rq_clock-stall): this kind flags individual event-counter
     /// regressions surfaced by [`assert_scx_events_clean`]. The
@@ -330,7 +334,10 @@ pub enum DetailKind {
 /// message format so someone grepping stderr for the canonical
 /// "scheduler process died" string hits every emission site.
 /// Structural routing (the console-dump gate in
-/// `test_support::eval`) goes through [`DetailKind::SchedulerDied`],
+/// `test_support::eval`) goes through the `DetailKind::Scheduler*`
+/// variants ([`DetailKind::SchedulerCrashed`] /
+/// [`DetailKind::SchedulerExitedCleanly`] /
+/// [`DetailKind::SchedulerDiedUnknownReason`]),
 /// NOT this prefix — the prefix is a human-readability contract,
 /// not a detection mechanism. Exposed as `pub(crate)` so emitters
 /// reference the same literal; renaming the prefix is a one-site
@@ -342,7 +349,7 @@ pub enum DetailKind {
 /// longer running") for in-workload vs post-ops detection. The
 /// distinction carried no downstream semantics — every consumer
 /// treated both as equivalent scheduler-death signals — so the
-/// wording was unified onto "died" (shorter, matches the
+/// wording was unified onto "died" (shorter, matches the prior
 /// `SchedulerDied` variant name, and closes a class of "which
 /// wording does this site use?" drift bugs).
 pub(crate) const SCHED_DIED_PREFIX: &str = "scheduler process died";
@@ -354,8 +361,10 @@ pub(crate) const SCHED_DIED_PREFIX: &str = "scheduler process died";
 /// Begins with [`SCHED_DIED_PREFIX`] verbatim, followed by
 /// "unexpectedly after completing step N of M (X.Xs into test)".
 /// The prefix is the operator-visible stderr anchor (see the
-/// prefix doc); structural routing is via
-/// [`DetailKind::SchedulerDied`] on the emitted `AssertDetail`.
+/// prefix doc); structural routing is via one of
+/// [`DetailKind::SchedulerCrashed`] /
+/// [`DetailKind::SchedulerExitedCleanly`] /
+/// [`DetailKind::SchedulerDiedUnknownReason`] on the emitted `AssertDetail`.
 /// Centralized so ops.rs and any future emitter share a single
 /// format.
 pub(crate) fn format_sched_died_after_step(
@@ -374,8 +383,9 @@ pub(crate) fn format_sched_died_after_step(
 ///
 /// Begins with [`SCHED_DIED_PREFIX`] verbatim; shares the prefix
 /// invariant documented on [`format_sched_died_after_step`].
-/// Structural routing is via [`DetailKind::SchedulerDied`] on the
-/// emitted detail.
+/// Structural routing is via one of [`DetailKind::SchedulerCrashed`] /
+/// [`DetailKind::SchedulerExitedCleanly`] /
+/// [`DetailKind::SchedulerDiedUnknownReason`] on the emitted detail.
 pub(crate) fn format_sched_died_after_all_steps(total_steps: usize, elapsed_s: f64) -> String {
     format!(
         "{SCHED_DIED_PREFIX} unexpectedly (detected after all {total_steps} steps completed, {elapsed_s:.1}s elapsed)",
@@ -388,8 +398,9 @@ pub(crate) fn format_sched_died_after_all_steps(total_steps: usize, elapsed_s: f
 ///
 /// Begins with [`SCHED_DIED_PREFIX`] verbatim; shares the prefix
 /// invariant documented on [`format_sched_died_after_step`].
-/// Structural routing is via [`DetailKind::SchedulerDied`] on the
-/// emitted detail. Emitted by `run_scenario` when the
+/// Structural routing is via one of [`DetailKind::SchedulerCrashed`] /
+/// [`DetailKind::SchedulerExitedCleanly`] /
+/// [`DetailKind::SchedulerDiedUnknownReason`] on the emitted detail. Emitted by `run_scenario` when the
 /// liveness-poll inside `run_step`'s hold sleep observes
 /// `process_alive(sched_pid) == false`, replacing the prior
 /// behavior that waited for the post-loop probe to fire (which
@@ -420,7 +431,7 @@ pub struct AssertDetail {
     /// Producers that already know the active phase can stamp via
     /// [`Self::with_phase`].
     ///
-    /// [`Cow<'static, str>`] mirrors [`PassDetail::phase`] for the
+    /// [`Cow`](std::borrow::Cow)`<'static, str>` mirrors [`PassDetail::phase`] for the
     /// same zero-allocation reason: the common case is the per-step
     /// RAII guard's static `&'static str` label staying as
     /// `Cow::Borrowed` (zero alloc); runtime-built `String`s become
@@ -477,10 +488,11 @@ impl AssertDetail {
 }
 
 /// Structured record of a single passing claim — the positive
-/// counterpart to [`AssertDetail`]. Populated by
-/// [`Verdict::record_pass`] at every comparator's pass arm so the
-/// auto-repro renderer (and any other consumer that wants per-claim
-/// fidelity) can iterate passes alongside fails.
+/// counterpart to [`AssertDetail`]. Populated by [`Verdict`]'s
+/// `record_pass_unary` / `record_pass_binary` helpers at every
+/// comparator's pass arm so the auto-repro renderer (and any other
+/// consumer that wants per-claim fidelity) can iterate passes
+/// alongside fails.
 ///
 /// Carries the same shape primitives every comparator naturally has
 /// at the pass site: the claim's `name`, a short `comparator`
@@ -503,7 +515,7 @@ impl AssertDetail {
 /// sets and sequences, so prefix; `is_finite` is scalar-only, so
 /// bare). The prefix policy is part of the vocabulary contract.
 ///
-/// `comparator` is a [`Cow<'static, str>`] so call sites passing a
+/// `comparator` is a [`Cow`](std::borrow::Cow)`<'static, str>` so call sites passing a
 /// `&'static str` literal — the universal case for built-in
 /// comparators — pay zero allocation; runtime-built comparator
 /// labels store as `Cow::Owned`. The same `Cow` shape applies to
@@ -536,7 +548,7 @@ pub struct PassDetail {
     /// thread-local has been installed at the scenario-driver step
     /// loop entry. The auto-repro renderer groups passes by this
     /// field to compose the bracketed `==== PHASE N: <label> ====`
-    /// output. [`Cow<'static, str>`] so the common case (the RAII
+    /// output. [`Cow`](std::borrow::Cow)`<'static, str>` so the common case (the RAII
     /// guard's static `&'static str` label) pays zero allocation.
     pub phase: Option<std::borrow::Cow<'static, str>>,
 }
@@ -969,8 +981,8 @@ impl From<&str> for NoteValue {
 /// readability, but `Outcome` is uniquely wire-encoded via
 /// postcard as part of [`AssertResult`]'s TLV transport from
 /// guest to host (see
-/// [`crate::test_support::output::parse_assert_result_from_drain`]
-/// and [`crate::test_support::test_helpers::assert_result_tlv_entry`]).
+/// `crate::test_support::output::parse_assert_result_from_drain`
+/// and `crate::test_support::test_helpers::assert_result_tlv_entry`).
 /// Postcard is not a self-describing format and cannot decode
 /// adjacently-tagged enums — pre-fix the decode silently failed and
 /// surfaced as `ERR_NO_TEST_FUNCTION_OUTPUT`. The externally-tagged
@@ -1156,7 +1168,8 @@ pub struct AssertResult {
     /// [`Self::outcomes`]: where `outcomes` carries terminal-verdict
     /// records (Fail/Skip/Pass per-check), `passes` carries the
     /// positive confirmations every comparator's pass arm emits via
-    /// [`Verdict::record_pass`].
+    /// [`Verdict`]'s `record_pass_unary` / `record_pass_binary`
+    /// helpers.
     /// Empty in tests that don't exercise the structured-pass path
     /// (the no-claim base case), populated whenever a [`Verdict`]
     /// records claims. The auto-repro renderer iterates both vecs
@@ -1411,7 +1424,7 @@ impl Phase {
 
 impl std::fmt::Display for Phase {
     /// `"BASELINE"` for [`Phase::BASELINE`], `"Step[k]"` for
-    /// [`Phase::step(k)`] (decoded back via the 1-indexed
+    /// [`Phase::step`] (decoded back via the 1-indexed
     /// encoding). Matches the labels [`PhaseBucket`] embeds in
     /// `label` so operators see consistent phase identifiers
     /// across structured-sidecar reads and ad-hoc `format!`
@@ -1453,15 +1466,15 @@ impl From<Phase> for u16 {
 /// is always settle, not first-Step.
 ///
 /// Each bucket carries the metric values reduced over the phase's
-/// sample window. For [`crate::stats::MetricKind::Counter`]
+/// sample window. For `crate::stats::MetricKind::Counter`
 /// metrics the reduction is `last - first` across the phase's
 /// periodic samples (cumulative-counter delta); for `Gauge` /
 /// `Peak` / `Timestamp` it dispatches per the kind via
-/// [`crate::stats::aggregate_samples`]. Missing metric keys mean
+/// `crate::stats::aggregate_samples`. Missing metric keys mean
 /// the phase had no finite samples for that metric.
 ///
-/// Metric keys match [`crate::stats::MetricDef::name`] — see
-/// [`crate::stats::METRICS`] for the canonical list of registered
+/// Metric keys match `crate::stats::MetricDef::name` — see
+/// `crate::stats::METRICS` for the canonical list of registered
 /// metric names a `get` / `phase_metric` lookup expects.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize, crate::Claim)]
 pub struct PhaseBucket {
@@ -1475,7 +1488,7 @@ pub struct PhaseBucket {
     /// Human-readable label. `"BASELINE"` for `step_index = 0`,
     /// `"Step[0]"` / `"Step[1]"` / ... for `step_index = 1..=N`.
     /// Mirrors the formatting used by
-    /// [`crate::timeline::Timeline`]'s phase rendering so operator
+    /// `crate::timeline::Timeline`'s phase rendering so operator
     /// inspection of the formatted diagnostic and the structured
     /// sidecar yield the same phase identifiers.
     pub label: String,
@@ -1494,10 +1507,10 @@ pub struct PhaseBucket {
     /// settle window was shorter than the periodic interval).
     pub sample_count: usize,
     /// Per-metric phase-aggregated values keyed by
-    /// [`crate::stats::MetricDef::name`]. Reduction dispatches on
-    /// [`crate::stats::MetricKind`] — Counter uses last-first
+    /// `crate::stats::MetricDef::name`. Reduction dispatches on
+    /// `crate::stats::MetricKind` — Counter uses last-first
     /// delta over the phase's samples (cumulative-counter
-    /// semantic), other kinds use [`crate::stats::aggregate_samples`]
+    /// semantic), other kinds use `crate::stats::aggregate_samples`
     /// directly. Missing keys mean the phase carried no finite
     /// samples for that metric (sentinel-free: `None` from the
     /// reducer surfaces as "key absent" rather than "value 0.0").
@@ -1506,7 +1519,7 @@ pub struct PhaseBucket {
 
 impl PhaseBucket {
     /// Look up the phase-aggregated value for `metric_name` (a
-    /// [`crate::stats::MetricDef::name`]). Returns `None` when the
+    /// `crate::stats::MetricDef::name`). Returns `None` when the
     /// phase carried no finite samples for that metric — distinct
     /// from `Some(0.0)` which means the reducer produced a real
     /// zero from finite samples.
@@ -1518,7 +1531,7 @@ impl PhaseBucket {
     /// the bucket's `step_index` + `label` + `sample_count` + the set
     /// of metric keys actually present when the metric is absent. Use
     /// when the caller knows the metric MUST be in the bucket (the
-    /// phase fired samples and the metric is in [`crate::stats::METRICS`])
+    /// phase fired samples and the metric is in `crate::stats::METRICS`)
     /// — the panic message tells the operator whether the cause is
     /// "phase produced no samples" (sample_count of 0) or "metric key
     /// typo" (positive sample_count but the key isn't in `metrics`).
@@ -1569,7 +1582,7 @@ impl PhaseBucket {
 /// - `sample_count`: `a + b`. Used as the weighting denominator
 ///   for the `MetricKind::Gauge(GaugeAgg::Avg)` weighted mean.
 ///
-/// Per-metric merge dispatches on the metric's [`crate::stats::MetricKind`]
+/// Per-metric merge dispatches on the metric's `crate::stats::MetricKind`
 /// from the registry via [`crate::stats::metric_def`]:
 /// - `MetricKind::Counter` → `a + b` (the two reduced values are
 ///   per-phase deltas; the merge across cgroups sums per-cgroup
@@ -1589,7 +1602,7 @@ impl PhaseBucket {
 ///   `a`'s value. Captures the "latest-sample-wins" semantic per
 ///   the [`crate::stats::MergeKind::NonCommutative`] contract.
 ///
-/// Unregistered metric names (not in [`crate::stats::METRICS`])
+/// Unregistered metric names (not in `crate::stats::METRICS`)
 /// fall back to a commutative arithmetic mean
 /// `(a + b) / 2.0`. The mean is the safest default for an unknown
 /// kind: sum would over-count Gauge / Timestamp values, max would
@@ -1641,7 +1654,7 @@ fn merge_matched_phase_buckets(a: PhaseBucket, b: PhaseBucket) -> PhaseBucket {
 
 /// Per-metric merge inner helper used by
 /// [`merge_matched_phase_buckets`]. Dispatches on the metric's
-/// [`crate::stats::MetricKind`] (or the unregistered fallback)
+/// `crate::stats::MetricKind` (or the unregistered fallback)
 /// to combine two reduced values into one.
 ///
 /// `a_count` / `b_count` are the source buckets' `sample_count`
@@ -1774,13 +1787,13 @@ pub struct ScenarioStats {
     /// [`crate::test_support::KtstrTestEntry::num_snapshots`] or
     /// [`crate::scenario::ops::Op::CaptureSnapshot`]) have this
     /// field populated automatically inside
-    /// [`crate::test_support::eval`]'s `evaluate_vm_result` —
+    /// `crate::test_support::eval`'s `evaluate_vm_result` —
     /// test code never needs to call
     /// [`crate::assert::build_phase_buckets`] manually. The auto-
     /// populate path drains the snapshot bridge from the
     /// [`crate::vmm::VmResult`] returned by the framework and folds
     /// the per-sample readings through
-    /// [`crate::stats::aggregate_samples_for_phase`] per metric.
+    /// `crate::stats::aggregate_samples_for_phase` per metric.
     /// Single-phase scenarios that fire no captures leave this
     /// `vec![]`; the flat-bucket scalars on this struct cover the
     /// single-phase case.
@@ -1832,14 +1845,14 @@ impl ScenarioStats {
     ///     [`Self::phases`]),
     /// (b) the phase exists but had no finite samples for that
     ///     metric, OR
-    /// (c) `metric` is not a registered [`crate::stats::MetricDef::name`]
+    /// (c) `metric` is not a registered `crate::stats::MetricDef::name`
     ///     (typo case — `is_known_metric` surfaces it).
     ///
     /// Sentinel-free: `Some(0.0)` means the reducer produced a
     /// real zero from finite samples, NOT "missing data".
     ///
-    /// `metric` matches [`crate::stats::MetricDef::name`] — see
-    /// [`crate::stats::METRICS`] for the registered list. When
+    /// `metric` matches `crate::stats::MetricDef::name` — see
+    /// `crate::stats::METRICS` for the registered list. When
     /// debugging an unexpected `None`, gate the lookup on
     /// [`Self::is_known_metric`] to distinguish typos from absent
     /// data.
@@ -1861,8 +1874,8 @@ impl ScenarioStats {
     }
 
     /// True when `name` matches a registered
-    /// [`crate::stats::MetricDef::name`] in
-    /// [`crate::stats::METRICS`]. Use to disambiguate the typo
+    /// `crate::stats::MetricDef::name` in
+    /// `crate::stats::METRICS`. Use to disambiguate the typo
     /// None-cause from [`Self::phase_metric`] / [`Self::step_metric`]:
     /// if the lookup returns `None` and `is_known_metric(name) ==
     /// false`, the metric name is a typo (caller mistake), not
@@ -1873,7 +1886,7 @@ impl ScenarioStats {
 
     /// Iterate the canonical metric names a test author may pass
     /// to [`Self::phase_metric`] / [`Self::step_metric`]. Sourced
-    /// from [`crate::stats::METRICS`].
+    /// from `crate::stats::METRICS`.
     ///
     /// Sample usage for an A/B scheduler-swap assertion that
     /// compares every registered metric across two scenario Steps:
@@ -1937,8 +1950,8 @@ impl ScenarioStats {
 /// * `sample_count` -> the count of samples that fell into the
 ///   bucket
 /// * `metrics` -> per-metric reduction via
-///   [`crate::stats::aggregate_samples_for_phase`] reading each
-///   sample through [`crate::stats::MetricDef::read_sample`].
+///   `crate::stats::aggregate_samples_for_phase` reading each
+///   sample through `crate::stats::MetricDef::read_sample`.
 ///   Metrics whose per-sample reading returns `None` for every
 ///   sample in the bucket are omitted entirely (absent ->
 ///   "no data") rather than collapsed to `Some(0.0)` (real
@@ -1955,7 +1968,7 @@ impl ScenarioStats {
 /// produced phase data but no readable metrics".
 ///
 /// Live production caller:
-/// [`crate::test_support::eval`]-side `evaluate_vm_result` drains
+/// `crate::test_support::eval`-side `evaluate_vm_result` drains
 /// the snapshot bridge, builds a `SampleSeries`, and routes it
 /// through this fn to populate `AssertResult.stats.phases`. The
 /// fn is exposed `pub` (not `pub(crate)`) so out-of-tree consumers
@@ -1964,7 +1977,7 @@ impl ScenarioStats {
 /// same per-phase aggregate shape without re-implementing the
 /// bucketing logic.
 /// Populate cross-RUN aggregate entries for every registered
-/// [`crate::stats::MetricDef`] whose `read_sample` returns finite
+/// `crate::stats::MetricDef` whose `read_sample` returns finite
 /// values across the entire sample series. Writes into
 /// `target` (typically `ScenarioStats::ext_metrics`) under the
 /// metric's registry name — the same key the per-phase
@@ -1980,8 +1993,8 @@ impl ScenarioStats {
 /// the EPSILON guard drops the row) per the adversary's
 /// no-silent-drops finding on #17b.
 ///
-/// Reduction dispatches per [`crate::stats::MetricKind`] via
-/// [`crate::stats::aggregate_samples_for_phase`] — Counter folds
+/// Reduction dispatches per `crate::stats::MetricKind` via
+/// `crate::stats::aggregate_samples_for_phase` — Counter folds
 /// last-minus-first, Gauge variants fold per their `GaugeAgg`,
 /// Peak folds max, Timestamp folds last.
 /// Sibling of [`populate_run_ext_metrics`] that mines per-phase
@@ -2090,9 +2103,9 @@ pub fn populate_run_ext_metrics(
 }
 
 /// [`build_phase_buckets`] enriched with stimulus-event-derived
-/// per-phase `iteration_rate` so [`crate::timeline::Timeline::from_phase_buckets`]
+/// per-phase `iteration_rate` so `crate::timeline::Timeline::from_phase_buckets`
 /// can render the per-phase throughput annotation without going
-/// through the legacy [`crate::timeline::Timeline::build`] path.
+/// through the legacy `crate::timeline::Timeline::build` path.
 ///
 /// For each adjacent pair of stimulus events with
 /// `total_iterations: Some(_)`, the per-phase rate is
@@ -2100,7 +2113,7 @@ pub fn populate_run_ext_metrics(
 /// PhaseBucket window. Phases that don't overlap a stimulus pair
 /// keep their PhaseBucket.metrics map unchanged (no
 /// iteration_rate key). Per the unweighted-mean cross-RUN policy
-/// of [`crate::stats::aggregate_samples`] for `Gauge(Avg)` —
+/// of `crate::stats::aggregate_samples` for `Gauge(Avg)` —
 /// iteration_rate is registered as `Gauge(Avg)` with
 /// `HigherBetter` polarity (more throughput is better) via the
 /// `iteration_rate` registry entry alongside the other Avg-kind

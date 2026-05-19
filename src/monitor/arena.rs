@@ -125,7 +125,7 @@ fn guard_half(page_size: u64) -> u64 {
 const MAX_ARENA_PAGES: u64 = 4096;
 
 /// Number of evenly-spaced stride probes the walker performs across
-/// pgoffs [`MAX_ARENA_PAGES`]..`declared_pages` when `declared_pages`
+/// pgoffs `MAX_ARENA_PAGES`..`declared_pages` when `declared_pages`
 /// exceeds the sequential cap. Lets the walker surface mapped pages
 /// in sparse arenas (e.g. a scheduler that allocated pages near the
 /// 4 GiB end of its user_vm window) without paying the full 1M-page
@@ -216,7 +216,7 @@ pub struct ArenaPage {
     /// and on aarch64 with `TCR_EL1.TG1=0b10`; 16 KiB on aarch64
     /// 16 KiB-granule kernels (Apple Silicon style); 64 KiB on
     /// aarch64 64 KiB-granule kernels. The resolution lives in
-    /// [`guest_page_size`] — the snapshot stamps every captured
+    /// `guest_page_size` — the snapshot stamps every captured
     /// page at that size.
     pub bytes: Vec<u8>,
 }
@@ -232,7 +232,7 @@ pub struct ArenaSnapshot {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pages: Vec<ArenaPage>,
     /// True when the walker stopped sequential enumeration at
-    /// [`MAX_ARENA_PAGES`] before finishing the user_vm window. The
+    /// `MAX_ARENA_PAGES` before finishing the user_vm window. The
     /// stride sweep that follows samples the tail at coarse intervals,
     /// so a hit reaches `pages` even when this flag is set; pgoffs
     /// between sampled positions are still silently skipped.
@@ -241,13 +241,13 @@ pub struct ArenaSnapshot {
     /// Total declared page count. Derived from
     /// `max_entries * page_size` (the BPF map's declared page
     /// capacity, with `page_size` resolved from the guest's
-    /// TCR_EL1 via [`guest_page_size`]), not the user_vm window.
-    /// Reflects any [`MAX_VM_RANGE_BYTES`] cap. Surfaced alongside
+    /// TCR_EL1 via `guest_page_size`), not the user_vm window.
+    /// Reflects any `MAX_VM_RANGE_BYTES` cap. Surfaced alongside
     /// `pages.len()` so consumers can see the
     /// allocated-vs-declared ratio.
     pub declared_pages: u64,
     /// True when `max_entries * page_size` exceeded
-    /// [`MAX_VM_RANGE_BYTES`] (4 GiB) and the walker capped the span
+    /// `MAX_VM_RANGE_BYTES` (4 GiB) and the walker capped the span
     /// before computing `declared_pages`. Indicates a torn / corrupt
     /// `bpf_arena` struct or a freeze-time race against initialization;
     /// the rendered pages still come from valid translates, so the
@@ -256,7 +256,7 @@ pub struct ArenaSnapshot {
     pub span_capped: bool,
     /// Kernel-side base of the arena's user_vm window:
     /// `bpf_arena.kern_vm->addr + GUARD_HALF`. Surfaces here so
-    /// downstream consumers (notably the [`super::sdt_alloc`] tree
+    /// downstream consumers (notably the `super::sdt_alloc` tree
     /// walker) can translate `__arena` pointers without re-reading
     /// `struct bpf_arena` themselves. `0` when the snapshot bailed
     /// before computing the value (kern_vm_kva NULL, vm_addr NULL,
@@ -493,9 +493,9 @@ pub fn snapshot_arena(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ArenaWalkPlan {
     /// Page count the snapshot reports as "declared". Reflects any
-    /// [`MAX_VM_RANGE_BYTES`] cap.
+    /// `MAX_VM_RANGE_BYTES` cap.
     declared_pages: u64,
-    /// True when [`MAX_VM_RANGE_BYTES`] capped the raw span.
+    /// True when `MAX_VM_RANGE_BYTES` capped the raw span.
     span_capped: bool,
     /// True when `declared_pages > MAX_ARENA_PAGES` and the walker
     /// will skip pgoffs in the sparse tail.
@@ -599,7 +599,7 @@ mod tests {
     //     no overflow
 
     /// Page size used for ArenaWalkPlan unit tests. Production code
-    /// resolves the page size from [`guest_page_size`] (which decodes
+    /// resolves the page size from `guest_page_size` (which decodes
     /// the guest's `TCR_EL1.TG1`); the plan tests pin their math
     /// against an explicit 4 KiB so they exercise the same shapes
     /// regardless of the host the test runs on. Granule-specific

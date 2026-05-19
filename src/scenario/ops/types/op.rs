@@ -42,7 +42,7 @@ pub enum Op {
     /// similar. For mid-step cgroups that need cpuset / cpu /
     /// memory / io / pids / workers, use [`Op::add_cgroup_def`]
     /// instead; for setup-time cgroups with the same knobs, declare
-    /// via [`Step::with_defs`].
+    /// via [`super::super::Step::with_defs`].
     AddCgroup { name: Cow<'static, str> },
     /// Create a cgroup mid-step from a full [`CgroupDef`] — cpuset,
     /// cpu/memory/io/pids knobs, and worker spawns all apply in one
@@ -222,7 +222,7 @@ pub enum Op {
     /// run without `--timeout`) will hang the step until the
     /// outer test watchdog fires. For time-boxed long-running
     /// payloads, prefer [`KillPayload`](Self::KillPayload) paired
-    /// with a [`HoldSpec::fixed`] / [`HoldSpec::frac`] step
+    /// with a [`super::super::HoldSpec::fixed`] / [`super::super::HoldSpec::frac`] step
     /// boundary that guarantees forward progress; the payload's
     /// own CLI (`--runtime`, `--timeout`) is the reliable way to
     /// cap a single invocation's runtime.
@@ -537,7 +537,7 @@ pub enum Op {
     /// singleton `Op::WriteKernelCold` ops into one merged op as
     /// a safety net — N adjacent `write_kernel_cold(...)` calls
     /// collapse into one rendezvous regardless of whether the
-    /// caller used [`crate::scenario::ops::Step::write_kernel_cold_batch`]
+    /// caller used [`crate::scenario::ops::Op::write_kernel_cold_batch`]
     /// or chained singletons.
     ///
     /// **Dispatch.** The executor's arm dispatches via the
@@ -580,7 +580,7 @@ pub enum Op {
     /// the test wants to observe without pausing the guest.
     ///
     /// **Width.** The `width` field picks which
-    /// [`crate::monitor::guest::GuestKernel`] `read_*` family the
+    /// `crate::monitor::guest::GuestKernel` `read_*` family the
     /// host dispatcher invokes — `u32` / `u64` / `Bytes(len)`.
     /// The reply lands as a [`crate::vmm::wire::KernelOpValue`] of
     /// the matching shape in the bridge's drain log; a u32 field
@@ -643,7 +643,7 @@ pub enum Op {
     /// stacking schedulers.
     ///
     /// The `scheduler` reference holds a `'static` lifetime: the
-    /// test author declares each [`Scheduler`] at static scope (via
+    /// test author declares each [`crate::test_support::Scheduler`] at static scope (via
     /// `declare_scheduler!` or a `static MY_SCHED: Scheduler = ...`
     /// item) and passes the borrow into the constructor. The
     /// guest-side binary-staging mechanism that lets the dispatch
@@ -998,7 +998,7 @@ pub enum KernelTarget {
     /// Kernel text/data/bss symbol. The host resolves
     /// `name → KVA → PA` via the runtime kernel image base + KASLR
     /// `phys_base`, exactly as
-    /// [`crate::monitor::guest::GuestKernel::write_symbol_u64`]
+    /// `crate::monitor::guest::GuestKernel::write_symbol_u64`
     /// already does for the existing write-symbol helper.
     Symbol(Cow<'static, str>),
     /// Direct-mapped kernel virtual address — translated via
@@ -1051,12 +1051,12 @@ pub enum KernelTarget {
     /// with matching `pid` AND matching `expected_start_time_ns`
     /// (anti-PID-reuse identity), then adding the BTF-resolved
     /// nested-path byte offset of `field` within `task_struct`.
-    /// See [`crate::vmm::wire::KernelOpTarget::TaskField`] for the
+    /// See `crate::vmm::wire::KernelOpTarget::TaskField` for the
     /// 8-layer validation chain the dispatcher applies.
     ///
     /// `expected_start_time_ns` is `task->start_time` captured at
     /// WorkSpec spawn time. Get it via
-    /// [`crate::workload::spawn::WorkloadHandle::worker_pids`] for
+    /// [`crate::workload::WorkloadHandle::worker_pids`] for
     /// the PID list, then read `/proc/<pid>/stat` field 22 +
     /// convert from jiffies to ns via
     /// `* 1_000_000_000 / sysconf(_SC_CLK_TCK)`.
@@ -1140,7 +1140,7 @@ impl KernelTarget {
     /// `expected_start_time_ns` is `task->start_time` (set once by
     /// `kernel/fork.c::copy_process` via `ktime_get_ns()`).
     /// Get worker PIDs via
-    /// [`crate::workload::spawn::WorkloadHandle::worker_pids`] then
+    /// [`crate::workload::WorkloadHandle::worker_pids`] then
     /// read `/proc/<pid>/stat` field 22 at spawn time and convert
     /// to ns: `field_22_jiffies * 1_000_000_000 /
     /// sysconf(_SC_CLK_TCK)`.
@@ -1150,7 +1150,7 @@ impl KernelTarget {
     /// identity, lifetime, on_rq=0, scx queued-empty, ext
     /// sched_class, SCHED_EXT policy, start_boottime != 0) before
     /// the write/read lands — see
-    /// [`crate::vmm::wire::KernelOpTarget::TaskField`] for the full
+    /// `crate::vmm::wire::KernelOpTarget::TaskField` for the full
     /// contract.
     ///
     /// **SCX-only.** The dispatcher rejects non-SCX tasks via the
@@ -1217,7 +1217,7 @@ impl KernelTarget {
 /// shape for the read ops.
 ///
 /// The variant tag picks both the width (`u32` vs `u64` vs a byte
-/// slice) and the underlying [`crate::monitor::guest::GuestKernel`]
+/// slice) and the underlying `crate::monitor::guest::GuestKernel`
 /// write helper the host coordinator will invoke (`write_*_u32`,
 /// `write_*_u64`, `write_*_bytes` per the [`KernelTarget`] class).
 ///
@@ -1232,7 +1232,7 @@ pub enum KernelValue {
     /// 32-bit unsigned little-endian write. Atomic when the
     /// resolved host PA is 4-byte aligned. Misaligned PAs fall
     /// through to a per-byte volatile loop in
-    /// [`super::super::super::monitor::reader::GuestMem`]
+    /// `crate::monitor::reader::GuestMem`
     /// `write_volatile_bytes` (the 4-byte fast path branches on
     /// `ptr.align_offset(align_of::<u32>()) == 0` and only emits
     /// a single `write_volatile` when alignment holds); torn
@@ -1298,7 +1298,7 @@ pub enum KernelValue {
     /// contract is sufficient.
     ///
     /// **Alignment**: the dispatcher delegates u32 reads/writes
-    /// to [`crate::monitor::guest::GuestKernel`]'s
+    /// to `crate::monitor::guest::GuestKernel`'s
     /// `read_*_u32` / `write_*_u32` helpers, which use a
     /// single-instruction `write_volatile` at 4-byte-aligned host
     /// PAs and fall through to a per-byte volatile loop on
@@ -1408,7 +1408,7 @@ impl From<&KernelValue> for crate::vmm::wire::KernelOpValue {
 
 /// Width specifier for the [`Op::ReadKernelHot`] /
 /// [`Op::ReadKernelCold`] ops — picks which
-/// [`crate::monitor::guest::GuestKernel`]
+/// `crate::monitor::guest::GuestKernel`
 /// `read_*_u32` / `read_*_u64` / `read_*_bytes` family the host
 /// dispatcher invokes for the read. Mirrors [`KernelValue`]'s
 /// variant tags but without payload data (reads do not carry an
@@ -1434,7 +1434,7 @@ pub enum KernelValueWidth {
     /// [`KernelValue::U64`]).
     U64,
     /// Read exactly `len` raw bytes. Non-atomic; reads through the
-    /// [`crate::monitor::guest::GuestKernel`] `read_*_bytes`
+    /// `crate::monitor::guest::GuestKernel` `read_*_bytes`
     /// helpers' chunked-page primitive.
     Bytes(usize),
 }

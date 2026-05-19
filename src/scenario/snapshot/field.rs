@@ -1,5 +1,5 @@
 //! [`SnapshotField`] — terminal accessor for a typed read out of a
-//! rendered [`crate::monitor::btf_render::RenderedValue`] tree, plus
+//! rendered `crate::monitor::btf_render::RenderedValue` tree, plus
 //! the lazy traversal helpers ([`walk_dotted_path`],
 //! [`lookup_member`], [`peel_pointer`], [`describe_kind`]) and the
 //! [`render_to_u64`] / [`render_to_i64`] coercion paths the
@@ -11,8 +11,8 @@ use super::{SnapshotError, SnapshotResult};
 
 /// One field's view at the leaf of a dotted-path walk.
 ///
-/// Returned by [`Snapshot::var`], [`SnapshotEntry::get`], and
-/// [`SnapshotEntry::key`]. Terminal `as_*` accessors return
+/// Returned by [`super::Snapshot::var`], [`super::SnapshotEntry::get`], and
+/// [`super::SnapshotEntry::key`]. Terminal `as_*` accessors return
 /// [`SnapshotResult`] so a missing or type-mismatched field
 /// surfaces as a recoverable error rather than a panic.
 #[derive(Debug)]
@@ -29,7 +29,7 @@ pub enum SnapshotField<'a> {
 
 impl<'a> SnapshotField<'a> {
     /// Walk into a sub-field. Composable with
-    /// [`SnapshotEntry::get`].
+    /// [`super::SnapshotEntry::get`].
     pub fn get(&self, path: &str) -> SnapshotField<'a> {
         match self {
             SnapshotField::Value(v) => walk_dotted_path(v, path),
@@ -204,7 +204,7 @@ pub(crate) fn walk_dotted_path<'a>(root: &'a RenderedValue, path: &str) -> Snaps
 }
 
 /// Look up a single top-level member by exact name. Used by
-/// [`Snapshot::var`].
+/// [`super::Snapshot::var`].
 pub(super) fn lookup_member<'a>(value: &'a RenderedValue, name: &str) -> Option<&'a RenderedValue> {
     let v = peel_pointer(value);
     let RenderedValue::Struct { members, .. } = v else {

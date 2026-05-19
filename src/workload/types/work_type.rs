@@ -144,12 +144,12 @@ pub enum WorkType {
     /// [`IdleChurn`](Self::IdleChurn).
     Bursty {
         /// Wall-clock duration of CPU work between sleeps.
-        /// Default 50ms (see [`defaults::BURSTY_BURST_DURATION`]).
+        /// Default 50ms (see [`crate::workload::config::defaults::BURSTY_BURST_DURATION`]).
         #[serde(with = "humantime_serde_helper")]
         burst_duration: Duration,
         /// Wall-clock duration of each sleep period; the worker
         /// off-CPUs via `thread::sleep`. Default 100ms (see
-        /// [`defaults::BURSTY_SLEEP_DURATION`]).
+        /// [`crate::workload::config::defaults::BURSTY_SLEEP_DURATION`]).
         #[serde(with = "humantime_serde_helper")]
         sleep_duration: Duration,
     },
@@ -1161,14 +1161,14 @@ pub enum WorkType {
         /// the call site, matching
         /// [`WakeChain`](Self::WakeChain)'s `work_per_hop`.
         /// Default 1ms (see
-        /// [`defaults::IDLE_CHURN_BURST_DURATION`]). Short
+        /// [`crate::workload::config::defaults::IDLE_CHURN_BURST_DURATION`]). Short
         /// bursts (< 1ms) maximise idle-cycle frequency.
         #[serde(with = "humantime_serde_helper")]
         burst_duration: Duration,
         /// Wall-clock duration of each idle period. Lower bound
         /// — the kernel adds `timer_slack_ns` (~50µs) to the
         /// requested duration. Default 5ms (see
-        /// [`defaults::IDLE_CHURN_SLEEP_DURATION`]). Sub-1ms
+        /// [`crate::workload::config::defaults::IDLE_CHURN_SLEEP_DURATION`]). Sub-1ms
         /// values produce `sched_switch` transitions but skip
         /// tick-stop / C-state entry.
         #[serde(with = "humantime_serde_helper")]
@@ -1326,7 +1326,7 @@ pub enum WorkType {
     /// All three must be `> 0`; both the
     /// [`ipc_variance`](Self::ipc_variance) constructor and
     /// `WorkloadHandle::spawn` reject zeros with
-    /// [`WorkTypeValidationError::ZeroIpcVarianceParam`].
+    /// `WorkTypeValidationError::ZeroIpcVarianceParam`.
     ///
     /// **Stop responsiveness.** The hot and cold inner loops do
     /// not poll [`stop`](crate::workload). The outer

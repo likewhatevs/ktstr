@@ -15,13 +15,13 @@ use super::HEX_KEY_PREFIX;
 /// the specific failure mode rather than the generic "stats
 /// absent". Built by [`From<&crate::vmm::sched_stats::SchedStatsError>`]
 /// for the relay-failure path, plus dedicated variants for the
-/// pre-client gates that the [`SchedStatsError`] enum doesn't
+/// pre-client gates that the `crate::vmm::SchedStatsError` enum doesn't
 /// cover (no scheduler binary configured).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum MissingStatsReason {
     /// No `scheduler_binary` was configured on the run, so the
-    /// freeze coordinator never wired a [`SchedStatsClient`].
+    /// freeze coordinator never wired a `crate::vmm::SchedStatsClient`.
     /// Every periodic sample bypasses the stats request entirely
     /// and lands here.
     NoSchedulerBinary,
@@ -39,7 +39,7 @@ pub enum MissingStatsReason {
     /// flight or about to start.
     Cancelled,
     /// The scheduler returned a non-zero `errno` in the typed
-    /// [`StatsResponse`] envelope. The `args` payload is preserved
+    /// `crate::vmm::StatsResponse` envelope. The `args` payload is preserved
     /// so operators can render the scheduler-side message.
     SchedulerError { errno: i32, args: serde_json::Value },
     /// The typed envelope was decoded but the inner `args` map
@@ -47,10 +47,10 @@ pub enum MissingStatsReason {
     /// mismatch with the scheduler.
     MissingResp { args: serde_json::Value },
     /// The caller passed a stats request larger than the client's
-    /// [`MAX_REQUEST_BYTES`] cap.
+    /// `crate::vmm::sched_stats::MAX_REQUEST_BYTES` cap.
     RequestTooLarge { size: usize, max: usize },
     /// The scheduler's response grew past
-    /// [`MAX_RESPONSE_BYTES`] without ever emitting a newline.
+    /// `crate::vmm::sched_stats::MAX_RESPONSE_BYTES` without ever emitting a newline.
     ResponseTooLarge { size: usize, max: usize },
     /// The shared response mutex was poisoned by a previous
     /// panic; the stats client cannot recover for this sample.
@@ -99,14 +99,14 @@ impl std::fmt::Display for MissingStatsReason {
 
 impl From<&anyhow::Error> for MissingStatsReason {
     /// Downcast the anyhow chain to a typed
-    /// [`SchedStatsError`](crate::vmm::sched_stats::SchedStatsError)
+    /// `crate::vmm::SchedStatsError`
     /// when one is present (every `SchedStatsClient` failure path
     /// boxes a typed variant via `anyhow::anyhow!(SchedStatsError::…)`,
     /// so the downcast succeeds on every well-formed sched_stats
     /// error). Falls back to [`MissingStatsReason::NoScheduler`]
     /// carrying the rendered display when the downcast fails — that
     /// covers serde / IO / other errors that didn't originate inside
-    /// [`SchedStatsClient`] but still surface through the same
+    /// `crate::vmm::SchedStatsClient` but still surface through the same
     /// `Result<_, anyhow::Error>` return.
     fn from(e: &anyhow::Error) -> Self {
         if let Some(typed) = e.downcast_ref::<crate::vmm::sched_stats::SchedStatsError>() {
@@ -175,17 +175,17 @@ pub enum SnapshotError {
         available: Vec<String>,
     },
     /// More than one global-section map exposes a top-level member
-    /// with the requested name, so [`Snapshot::var`] cannot pick a
+    /// with the requested name, so [`super::Snapshot::var`] cannot pick a
     /// deterministic answer. `found_in` lists every map (in capture
     /// order) where the name was seen — the caller should disambiguate
-    /// via [`Snapshot::map`] and walk into the named map directly
+    /// via [`super::Snapshot::map`] and walk into the named map directly
     /// (e.g. `snap.map("scx_obj.bss")?.at(0).get("nr_cpus")`).
     AmbiguousVar {
         requested: String,
         found_in: Vec<String>,
     },
     /// A path component did not match any
-    /// [`RenderedValue::Struct`] member at that depth. `requested`
+    /// `crate::monitor::btf_render::RenderedValue::Struct` member at that depth. `requested`
     /// is the user-supplied lookup string; `walked` is the prefix
     /// that resolved successfully; `component` is the failing
     /// segment; `available` lists the struct's actual member names.
@@ -236,7 +236,7 @@ pub enum SnapshotError {
     /// the traversal so an operator can distinguish "empty map"
     /// (`len == 0`) from "populated map with no predicate hit"
     /// (`len > 0`) and inspect the sample to debug the predicate.
-    /// Keys are rendered via [`RenderedValue`]'s `Display` impl and
+    /// Keys are rendered via `crate::monitor::btf_render::RenderedValue`'s `Display` impl and
     /// each is capped at `NO_MATCH_KEY_CHAR_CAP` chars with an
     /// ellipsis to keep the failure message readable for wide struct
     /// keys.
@@ -256,14 +256,14 @@ pub enum SnapshotError {
     /// `requested` is the user-supplied lookup string.
     EmptyPathComponent { requested: String },
     /// `EntryAccessor::get` was called on a per-CPU entry without
-    /// narrowing to a CPU first via [`SnapshotMap::cpu`].
+    /// narrowing to a CPU first via [`super::SnapshotMap::cpu`].
     PerCpuNotNarrowed { map: String },
     /// Hash entry has no rendered key/value side (BTF type id was
     /// missing at capture time, leaving the hex bytes only).
     NoRendered { map: String, side: String },
-    /// The sample's underlying [`crate::monitor::dump::FailureDumpReport`]
+    /// The sample's underlying `crate::monitor::dump::FailureDumpReport`
     /// is a placeholder produced by
-    /// [`crate::monitor::dump::FailureDumpReport::placeholder`] —
+    /// `crate::monitor::dump::FailureDumpReport::placeholder` —
     /// the freeze-rendezvous path could not collect real data
     /// (typical cause: vCPU rendezvous timed out). Temporal
     /// patterns in [`crate::assert::temporal`] route this variant
@@ -480,7 +480,7 @@ pub type SnapshotResult<T> = std::result::Result<T, SnapshotError>;
 /// Typed shape of one entry drained from the snapshot bridge's
 /// ordered per-tag store. Fields:
 /// * `tag`: snapshot name the report was stored under.
-/// * `report`: [`crate::monitor::dump::FailureDumpReport`] of the
+/// * `report`: `crate::monitor::dump::FailureDumpReport` of the
 ///   captured guest state.
 /// * `stats`: scheduler-side stats JSON or a typed
 ///   [`MissingStatsReason`] when capture happened without a

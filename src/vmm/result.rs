@@ -279,7 +279,7 @@ pub struct VmResult {
     /// (empty) when the VM crashed before any snapshot fired.
     ///
     /// **Drained by `evaluate_vm_result`**: the framework's
-    /// [`crate::test_support::eval`] path drains this bridge to
+    /// `crate::test_support::eval` path drains this bridge to
     /// auto-populate [`crate::assert::ScenarioStats::phases`]
     /// before returning the AssertResult. A `post_vm` callback or
     /// any code path that runs THROUGH `evaluate_vm_result`

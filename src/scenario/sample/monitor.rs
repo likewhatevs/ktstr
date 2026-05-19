@@ -57,7 +57,7 @@ impl<'a> MonitorView<'a> {
     }
 
     /// Borrowed per-tick monitor samples. Each
-    /// [`crate::monitor::MonitorSample`] is one host-side
+    /// `crate::monitor::MonitorSample` is one host-side
     /// observation of the guest's per-CPU runqueue state
     /// (`nr_running`, `local_dsq_depth`, `rq_clock`, optional
     /// event counters). The monitor thread captures these on a

@@ -2,7 +2,7 @@
 //!
 //! Test scenarios use [`Op::CaptureSnapshot`](crate::scenario::ops::Op::CaptureSnapshot)
 //! to request a host-side diagnostic capture mid-run. The capture
-//! result — a [`FailureDumpReport`] — is keyed by the `name` argument
+//! result — a `crate::monitor::dump::FailureDumpReport` — is keyed by the `name` argument
 //! and stored on the scenario's [`SnapshotBridge`], where downstream
 //! test code reaches it via [`Snapshot`] for typed traversal of
 //! BTF-rendered map values, per-CPU entries, and scalar variables.
@@ -18,7 +18,7 @@
 //! 2. **Capture.** When the executor reaches `Op::CaptureSnapshot { name }`,
 //!    it invokes [`SnapshotBridge::capture`] with the name. The
 //!    closure performs the freeze rendezvous (request/reply with
-//!    the freeze coordinator), builds a [`FailureDumpReport`], and
+//!    the freeze coordinator), builds a `crate::monitor::dump::FailureDumpReport`, and
 //!    returns it; the bridge stores it under the name.
 //!
 //! 3. **Inspection.** After the scenario completes, the test author
@@ -65,7 +65,7 @@
 //!    userspace for the doorbell write itself.
 //! 3. The freeze coordinator wakes on `eventfd_signal`, reads the
 //!    tag from the slot, runs `freeze_and_capture`, builds the
-//!    [`FailureDumpReport`], and stores it on the bridge keyed by
+//!    `crate::monitor::dump::FailureDumpReport`, and stores it on the bridge keyed by
 //!    that tag. Reply to the guest is implicit — the
 //!    [`SnapshotBridge::capture`] callback installed in the
 //!    executor's thread-local blocks on a per-request reply
@@ -96,8 +96,8 @@
 //! [`SnapshotMap`], [`SnapshotEntry`], and [`SnapshotField`] form a
 //! lazy borrow chain over the report. Dotted-path lookups (e.g.
 //! `entry.get("ctx.weight.value")`) walk
-//! [`RenderedValue::Struct`] members by name and follow
-//! [`RenderedValue::Ptr`] dereferences transparently — the test
+//! `RenderedValue::Struct` members by name and follow
+//! `RenderedValue::Ptr` dereferences transparently — the test
 //! author writes the dotted path the BTF source would suggest;
 //! pointer chasing is invisible.
 //!

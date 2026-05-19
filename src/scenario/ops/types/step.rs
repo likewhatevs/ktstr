@@ -465,7 +465,7 @@ impl Op {
     ///
     /// For non-default knobs (worker count, affinity, …) construct
     /// a [`WorkSpec`] explicitly and route through
-    /// [`Self::spawn`] — the sugar is intentionally minimal so a
+    /// [`Self::spawn_workers`] — the sugar is intentionally minimal so a
     /// non-default knob forces the explicit-WorkSpec call site.
     pub fn spawn_in_cgroup(cgroup: impl Into<Cow<'static, str>>, work_type: WorkType) -> Self {
         Op::SpawnWorkers {

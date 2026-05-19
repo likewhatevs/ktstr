@@ -29,7 +29,7 @@ use super::{
 /// scalar variables.
 ///
 /// Constructed from a [`FailureDumpReport`] reference (typically
-/// obtained via [`SnapshotBridge::drain`]); the view is cheap to
+/// obtained via [`super::SnapshotBridge::drain`]); the view is cheap to
 /// build — it does not copy the underlying report. Accessor
 /// methods all return further borrowed views that walk the report
 /// in place.
@@ -240,7 +240,7 @@ impl<'a> Snapshot<'a> {
     }
 
     /// Per-CPU `rq->scx` snapshots — one per CPU walked by
-    /// [`crate::monitor::scx_walker`]. Empty when the
+    /// `crate::monitor::scx_walker`. Empty when the
     /// `ScxWalkerCapture` was absent or every CPU's translate
     /// failed (see `FailureDumpReport::scx_walker_unavailable`).
     pub fn rq_scx_states(&self) -> &'a [RqScxState] {
@@ -265,7 +265,7 @@ impl<'a> Snapshot<'a> {
     }
 
     /// Per-CPU CPU-time / softirq / IRQ counter rows. One row per
-    /// CPU enumerated by [`crate::monitor::dump::CpuTimeCapture`].
+    /// CPU enumerated by `crate::monitor::dump::CpuTimeCapture`.
     /// Empty when the capture was not wired or symbol/BTF
     /// resolution failed.
     pub fn per_cpu_time(&self) -> &'a [PerCpuTimeStats] {
@@ -498,7 +498,7 @@ impl<'a> SnapshotMap<'a> {
     /// Get an entry by ordinal index.
     ///
     /// For HASH-style entry lists, returns the `n`-th
-    /// [`FailureDumpEntry`] in the captured order. For per-CPU
+    /// `crate::monitor::dump::FailureDumpEntry` in the captured order. For per-CPU
     /// array maps narrowed via [`Self::cpu`], returns the entry
     /// at key `n` with its per-CPU slot pre-resolved. For ARRAY
     /// maps with a single value, `n == 0` returns the value.

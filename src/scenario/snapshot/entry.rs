@@ -22,7 +22,7 @@ pub enum SnapshotEntry<'a> {
     /// PERCPU_HASH entry — rendered key, inner per-CPU vec.
     PercpuHash(&'a FailureDumpPercpuHashEntry),
     /// Single rendered value (ARRAY map's `value` field, or a
-    /// per-CPU slot resolved via [`SnapshotMap::cpu`]).
+    /// per-CPU slot resolved via [`super::SnapshotMap::cpu`]).
     Value(&'a RenderedValue),
     /// No entry matched.
     Missing(SnapshotError),

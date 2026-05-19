@@ -370,7 +370,7 @@ fn parse_kallsyms(raw: &str) -> std::collections::HashMap<String, u64> {
 /// A failed load (unreadable `/proc/kallsyms` — typical for
 /// unprivileged processes where the file is either missing or
 /// returns zeroed addresses) is rate-limited to one retry per
-/// [`RETRY_MIN_INTERVAL`] (1 s); calls within that window return
+/// `RETRY_MIN_INTERVAL` (1 s); calls within that window return
 /// `None` immediately. This matters both for performance — a caller
 /// resolving N symbols under a permanently unreadable
 /// `/proc/kallsyms` pays one load attempt, not N — and for

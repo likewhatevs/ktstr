@@ -1143,7 +1143,7 @@ pub struct KtstrTestEntry {
     /// staging machinery.
     ///
     /// Staged binary content is hashed into the initramfs cache key
-    /// (see [`BaseKey`](crate::vmm::initramfs_cache)) — rebuilding a
+    /// (see `BaseKey` in `crate::vmm::initramfs_cache`) — rebuilding a
     /// staged scheduler between test runs invalidates the cache
     /// automatically; no manual cache clean is needed.
     pub staged_schedulers: &'static [&'static crate::test_support::Scheduler],
@@ -1385,7 +1385,7 @@ pub struct KtstrTestEntry {
     /// CgroupManager places its children there
     /// (`/sys/fs/cgroup{path}/cg_0` etc.); when `None`, the
     /// framework falls back to the legacy resolution
-    /// ([`crate::test_support::args::resolve_cgroup_root`] —
+    /// (`crate::test_support::args::resolve_cgroup_root` —
     /// `--cell-parent-cgroup` in `sched_args` overrides; default
     /// `/sys/fs/cgroup/ktstr`).
     ///

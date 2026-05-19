@@ -535,9 +535,9 @@ impl MetricDef {
         }
     }
 
-    /// Returns `true` for [`Polarity::LowerBetter`], `false` for
-    /// [`Polarity::HigherBetter`]. [`Polarity::TargetValue`] and
-    /// [`Polarity::Unknown`] branches keep the match total; they
+    /// Returns `true` for [`crate::test_support::Polarity::LowerBetter`], `false` for
+    /// [`crate::test_support::Polarity::HigherBetter`]. [`crate::test_support::Polarity::TargetValue`] and
+    /// [`crate::test_support::Polarity::Unknown`] branches keep the match total; they
     /// are unreachable for the current [`METRICS`] entries (guarded
     /// by the `metric_def_polarity_covers_all_entries` test).
     pub const fn higher_is_worse(&self) -> bool {
@@ -3766,9 +3766,9 @@ pub struct ComparisonPolicy {
 ///   together are confused phrasing).
 ///
 /// The 5 flags trigger renderer behaviour ONLY — the data
-/// layer in [`compare_rows_by`] always emits the full set of
-/// matched [`PhaseDeltaRow`]s and [`UnpairedPhaseRow`]s so
-/// programmatic consumers of [`CompareReport`] see the
+/// layer in `compare_rows_by` always emits the full set of
+/// matched `PhaseDeltaRow`s and `UnpairedPhaseRow`s so
+/// programmatic consumers of `CompareReport` see the
 /// unfiltered surface. Filtering is render-time projection.
 #[derive(Debug, Default, Clone)]
 pub struct PhaseDisplayOptions {
@@ -3792,8 +3792,8 @@ pub struct PhaseDisplayOptions {
     pub steps_only: bool,
     /// `--phase <N>`: within the per-phase block, render only
     /// rows whose `step_index == N`. `0` selects BASELINE;
-    /// `1..=N` selects scenario Step ordinals (1 → Step[0],
-    /// 2 → Step[1], ...). Integer chosen over label so a label
+    /// `1..=N` selects scenario Step ordinals (1 → Step\[0\],
+    /// 2 → Step\[1\], ...). Integer chosen over label so a label
     /// rename (`"Step[0]"` → `"Step:0"`) doesn't break operator
     /// CI invocations. Mutually exclusive with `--steps-only`.
     pub phase: Option<u16>,
@@ -3835,7 +3835,7 @@ impl PhaseDisplayOptions {
     /// step-axis predicates (`--phase <N>` filter and
     /// `--steps-only` BASELINE-suppressor) into a single
     /// row-level decision the renderer can apply uniformly
-    /// across [`PhaseDeltaRow`] and [`UnpairedPhaseRow`] vecs.
+    /// across `PhaseDeltaRow` and `UnpairedPhaseRow` vecs.
     /// Returns `true` when no relevant flag is set (default
     /// path: every step renders).
     pub fn matches_phase(&self, step_index: u16) -> bool {

@@ -34,7 +34,7 @@
 //!   - `WorkloadConfig` → `payload_roundtrip`
 //!     → `src/test_support/payload.rs`
 //!   - `WorkerReport` → `worker_report_postcard_roundtrip` (+ 3 sibling
-//!     pins covering Vec<WorkerReport> + all `ExitInfo` variants)
+//!     pins covering `Vec<WorkerReport>` + all `ExitInfo` variants)
 //!     → `src/workload/spawn/tests_integration.rs`
 //!   - `PersistedCastAnalysis` → see `src/vmm/cast_analysis_load`
 //!     module's tests
@@ -1113,12 +1113,12 @@ pub struct KernelOpRequestPayload {
     pub entries: Vec<KernelOpEntry>,
 }
 
-/// Postcard-encoded payload for [`MsgType::KernelOpReply`].
+/// Postcard-encoded payload for `MsgType::KernelOpReply`.
 ///
 /// Mirrors the request id so the guest's blocking reader can pair
 /// against the original request. Status carries success/failure; on
 /// failure `reason` describes the host-side error. For
-/// [`KernelOpDirection::Read`] requests `read_values` carries the
+/// `KernelOpDirection::Read` requests `read_values` carries the
 /// per-entry bytes the host coordinator read; empty for writes.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KernelOpReplyPayload {
@@ -1131,7 +1131,7 @@ pub struct KernelOpReplyPayload {
     /// Human-readable diagnostic on the failure path; empty on
     /// success.
     pub reason: String,
-    /// For a [`KernelOpDirection::Read`] request: one
+    /// For a `KernelOpDirection::Read` request: one
     /// [`KernelOpValue`] per request entry in iteration order. Empty
     /// for writes.
     pub read_values: Vec<KernelOpValue>,

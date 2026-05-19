@@ -362,7 +362,7 @@ impl SampleSeries {
     ///
     /// The phase-aware aggregator consumes this map to compute
     /// per-phase metric reductions (Counter `last - first` delta,
-    /// Gauge / Peak / Timestamp via [`crate::stats::aggregate_samples`]).
+    /// Gauge / Peak / Timestamp via `crate::stats::aggregate_samples`).
     pub fn by_phase(&self) -> std::collections::BTreeMap<u16, Vec<Sample<'_>>> {
         let mut by_phase: std::collections::BTreeMap<u16, Vec<Sample<'_>>> =
             std::collections::BTreeMap::new();

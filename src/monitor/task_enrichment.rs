@@ -277,8 +277,8 @@ pub struct TaskEnrichment {
     /// `None` when the supplied PC matched nothing OR the caller
     /// supplied no PCs.
     ///
-    /// Set only when [`walk_task_enrichment_with_pcs`] is used; the
-    /// no-PC entry point [`walk_task_enrichment`] always leaves this
+    /// Set only when `walk_task_enrichment_with_pcs` is used; the
+    /// no-PC entry point `walk_task_enrichment` always leaves this
     /// `None`. A stack walker that produces multiple PCs (a future
     /// kernel-side unwinder) would surface them as a `Vec<String>`
     /// in a non_exhaustive struct extension.

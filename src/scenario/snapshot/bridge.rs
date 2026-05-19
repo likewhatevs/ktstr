@@ -83,9 +83,9 @@ pub type WatchRegisterCallback =
 ///
 /// The host dispatches the request (a sequence of
 /// `(KernelTarget, KernelValue)` entries, plus mode/direction/tag
-/// metadata in [`crate::vmm::wire::KernelOpRequestPayload`]) against
+/// metadata in `crate::vmm::wire::KernelOpRequestPayload`) against
 /// the resolved guest-memory accessor. Returns
-/// [`crate::vmm::wire::KernelOpReplyPayload`] mirroring the request
+/// `crate::vmm::wire::KernelOpReplyPayload` mirroring the request
 /// id, the success/error status, and (for reads) the read-back
 /// bytes per entry.
 ///
@@ -93,7 +93,7 @@ pub type WatchRegisterCallback =
 /// returns a synthetic reply without touching real guest memory
 /// (the in-process bridge surface stays mockable). The in-VM
 /// production path goes through the wire layer
-/// ([`crate::vmm::wire::MsgType::KernelOpRequest`]) and the freeze
+/// (`crate::vmm::wire::MsgType::KernelOpRequest`) and the freeze
 /// coordinator / hot-path worker, NOT this callback — the bridge
 /// keeps it Option<…> so executor tests can install one while real
 /// VM runs leave it unset.
@@ -531,8 +531,8 @@ impl SnapshotBridge {
     /// history.
     ///
     /// **Clone cost.** For `U32` / `U64` the clone is 4 / 8 bytes.
-    /// For [`crate::vmm::wire::KernelOpValue::Bytes`] the clone
-    /// can be up to [`crate::vmm::wire::KERNEL_OP_REPLY_MAX`]
+    /// For `crate::vmm::wire::KernelOpValue::Bytes` the clone
+    /// can be up to `crate::vmm::wire::KERNEL_OP_REPLY_MAX`
     /// (1 MiB). Hot paths that repeatedly inspect the same tag
     /// should prefer [`Self::drain_kernel_ops`] + index into the
     /// returned Vec to avoid the per-call clone.

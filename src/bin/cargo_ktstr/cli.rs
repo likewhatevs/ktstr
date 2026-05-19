@@ -1092,7 +1092,7 @@ pub(crate) enum StatsCommand {
 
         /// Within the per-phase tables, show only the named
         /// phase index. `0` selects BASELINE; `1..=N` selects
-        /// scenario Step ordinals (`1` → Step[0], `2` → Step[1],
+        /// scenario Step ordinals (`1` → Step\[0\], `2` → Step\[1\],
         /// ...).
         ///
         /// Integer rather than label so a future label rename

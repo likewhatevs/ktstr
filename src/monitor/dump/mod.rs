@@ -258,7 +258,7 @@ pub struct TaskWalkerEntry {
 ///     nanoseconds; `/proc/stat` divides by `cputime_to_clock_t`.
 ///   - `softirqs[i]`: `kernel_stat::softirqs[i]` cumulative count
 ///     incremented by `kstat_incr_softirqs_this_cpu` on every
-///     softirq raise. Indexed by [`super::btf_offsets::SOFTIRQ_NAMES`].
+///     softirq raise. Indexed by `super::btf_offsets::SOFTIRQ_NAMES`.
 ///   - `irqs_sum`: `kernel_stat::irqs_sum` cumulative count
 ///     incremented by `kstat_incr_irq_this_cpu` on every hardirq.
 ///   - `iowait_sleeptime_ns`: `tick_sched::iowait_sleeptime`
@@ -287,7 +287,7 @@ pub struct PerCpuTimeStats {
     /// `cpustat[CPUTIME_STEAL]` (ns).
     pub cpustat_steal_ns: u64,
     /// `kernel_stat::softirqs[]` per-vector cumulative counts.
-    /// Indexed by [`super::btf_offsets::SOFTIRQ_NAMES`].
+    /// Indexed by `super::btf_offsets::SOFTIRQ_NAMES`.
     pub softirqs: [u64; super::btf_offsets::NR_SOFTIRQS],
     /// `kernel_stat::irqs_sum` cumulative hardirq count.
     pub irqs_sum: u64,
@@ -303,7 +303,7 @@ pub struct PerCpuTimeStats {
 ///
 /// Each row is one row of NUMA event counters summed across all
 /// zones on a single node. The six counters mirror the kernel's
-/// `enum numa_stat_item` (see [`super::btf_offsets::NUMA_HIT`]
+/// `enum numa_stat_item` (see `super::btf_offsets::NUMA_HIT`
 /// etc. for the enum-stable indices). All counters are
 /// monotonic-since-boot; consumers diff against a baseline (or
 /// against another node's row) to extract the test-window delta.
@@ -315,7 +315,7 @@ pub struct PerCpuTimeStats {
 /// observed the expected node-locality distribution.
 ///
 /// **Live walker status:** the wire shape, BTF offsets
-/// ([`super::btf_offsets::NumaStatsOffsets`]), and report field
+/// (`super::btf_offsets::NumaStatsOffsets`), and report field
 /// are wired through. The actual host-side walker that resolves
 /// `node_data[]` and reads per-zone counters is pending; until it
 /// lands, the report's [`FailureDumpReport::per_node_numa`] vec
@@ -358,8 +358,8 @@ pub const REASON_NO_NUMA_WALKER: &str = "no NUMA walker (host-side walker pendin
 /// timeline.
 ///
 /// The freeze coordinator forwards the monitor sampler's accumulated
-/// [`super::MonitorSample`] vec via [`Self::samples`]; the dump path
-/// folds each sample's per-CPU [`super::ScxEventCounters`] into a
+/// `super::MonitorSample` vec via [`Self::samples`]; the dump path
+/// folds each sample's per-CPU `super::ScxEventCounters` into a
 /// single cross-CPU sum and produces one [`EventCounterSample`] per
 /// monitor tick.
 ///
@@ -369,7 +369,7 @@ pub const REASON_NO_NUMA_WALKER: &str = "no NUMA walker (host-side walker pendin
 pub struct EventCounterCapture<'a> {
     /// Periodic monitor samples gathered between VM start and the
     /// freeze trigger. Each sample carries per-CPU
-    /// [`super::ScxEventCounters`] when scx event-stat offsets
+    /// `super::ScxEventCounters` when scx event-stat offsets
     /// resolved; the dump folder skips samples whose CPUs all
     /// reported `event_counters: None`.
     pub samples: &'a [super::MonitorSample],
@@ -427,21 +427,21 @@ pub struct ScxWalkerCapture<'a> {
 /// The kernel stores per-CPU `s64` counters in `scx_sched_pcpu`
 /// (kernel/sched/ext.c); the monitor sampler reads them at every
 /// tick and stores per-CPU `event_counters` on each
-/// [`super::CpuSnapshot`]. The dump path sums across CPUs into the
+/// `super::CpuSnapshot`. The dump path sums across CPUs into the
 /// fields here so a downstream consumer can render the run's
 /// counter timeline (sparkline, delta plot, ...) without
 /// re-iterating the per-CPU vec.
 ///
 /// Field semantics match
-/// [`super::ScxEventCounters`] one-to-one — see that struct's
+/// `super::ScxEventCounters` one-to-one — see that struct's
 /// per-field doc for kernel-source provenance. `total_*` naming
-/// here echoes [`super::ScxEventDeltas`]'s aggregate-across-window
+/// here echoes `super::ScxEventDeltas`'s aggregate-across-window
 /// fields but with per-tick (not per-window) granularity.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct EventCounterSample {
     /// Milliseconds since VM start (mirrors
-    /// [`super::MonitorSample::elapsed_ms`]). Zero on the first
+    /// `super::MonitorSample::elapsed_ms`). Zero on the first
     /// sample.
     pub elapsed_ms: u64,
     /// Sum of `select_cpu_fallback` across all CPUs at this tick.
@@ -473,8 +473,8 @@ pub struct EventCounterSample {
 }
 
 impl EventCounterSample {
-    /// Construct from a [`super::MonitorSample`] by summing every
-    /// CPU's [`super::ScxEventCounters`]. CPUs whose
+    /// Construct from a `super::MonitorSample` by summing every
+    /// CPU's `super::ScxEventCounters`. CPUs whose
     /// `event_counters` is `None` (event-stat offsets unresolved)
     /// contribute 0 to every field.
     ///
@@ -844,7 +844,7 @@ pub const REASON_SDT_ALLOC_DEADLINE_EXCEEDED: &str =
 /// (e.g. `preempt_*` on a kernel without
 /// `CONFIG_TRACE_PREEMPT_TOGGLE`); the counter alone cannot
 /// distinguish those two cases — pair with the attach-state surface
-/// in [`super::probe::process::ProbeDiagnostics`] when the
+/// in `crate::probe::process::ProbeDiagnostics` when the
 /// distinction matters.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -1604,8 +1604,8 @@ pub struct FailureDumpMap {
 /// `producer_pos` and `pending_pos` means a producer is mid-reserve
 /// and the consumer can't advance past `pending_pos`.
 ///
-/// Read via [`crate::monitor::btf_offsets::BpfRingbufOffsets`]; rendered
-/// in [`render_ringbuf_state`].
+/// Read via `crate::monitor::btf_offsets::BpfRingbufOffsets`; rendered
+/// in `render_ringbuf_state`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct FailureDumpRingbuf {
@@ -1640,7 +1640,7 @@ pub struct FailureDumpRingbuf {
 /// the bucket; `pcs` carries the actual u64 PC values when readable
 /// (build-id stacks render the raw bytes hex since the per-entry
 /// shape is `struct bpf_stack_build_id`, not a u64). The dump caps
-/// per-bucket entries at [`MAX_STACK_TRACE_PCS`] to bound memory.
+/// per-bucket entries at `MAX_STACK_TRACE_PCS` to bound memory.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct FailureDumpStackTrace {
@@ -1651,7 +1651,7 @@ pub struct FailureDumpStackTrace {
     /// One entry per non-null bucket pointer. Sorted by bucket id.
     pub entries: Vec<FailureDumpStackTraceEntry>,
     /// True when any populated bucket was truncated at
-    /// [`MAX_STACK_TRACE_PCS`] PCs.
+    /// `MAX_STACK_TRACE_PCS` PCs.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
 }
@@ -1681,25 +1681,25 @@ pub struct FailureDumpStackTraceEntry {
 /// FD-array families store `void *` slots in `bpf_array.ptrs`; each
 /// slot is either NULL (empty) or a kernel pointer (struct bpf_prog *,
 /// struct file *, etc.). The dump path reads up to
-/// [`MAX_FD_ARRAY_SLOTS`] slots, counts non-zero, and lists the
+/// `MAX_FD_ARRAY_SLOTS` slots, counts non-zero, and lists the
 /// populated indices.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct FailureDumpFdArray {
     /// Number of populated (non-zero) slots seen.
     pub populated: u32,
-    /// Total slots scanned. Capped at [`MAX_FD_ARRAY_SLOTS`].
+    /// Total slots scanned. Capped at `MAX_FD_ARRAY_SLOTS`.
     pub scanned: u32,
     /// Indices of populated slots. Truncated to
-    /// [`MAX_FD_ARRAY_INDICES`] entries.
+    /// `MAX_FD_ARRAY_INDICES` entries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub indices: Vec<u32>,
-    /// True when iteration capped at [`MAX_FD_ARRAY_SLOTS`] and
+    /// True when iteration capped at `MAX_FD_ARRAY_SLOTS` and
     /// `scanned < max_entries`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
     /// True when `populated > indices.len()` because
-    /// [`MAX_FD_ARRAY_INDICES`] capped the index list.
+    /// `MAX_FD_ARRAY_INDICES` capped the index list.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub indices_truncated: bool,
 }

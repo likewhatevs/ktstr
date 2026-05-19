@@ -9,7 +9,7 @@ use super::{SnapshotError, SnapshotResult};
 /// One value's view at the leaf of a dotted-path walk over a
 /// [`serde_json::Value`]. Returned by [`stats_path`] / `StatsValue::path`.
 ///
-/// Mirrors the [`SnapshotField`] shape so test authors who already
+/// Mirrors the [`super::SnapshotField`] shape so test authors who already
 /// know the BPF-snapshot accessor surface get the same `as_u64` /
 /// `as_i64` / `as_f64` / `as_bool` / `as_str` terminals on the
 /// scx_stats JSON projection. Errors flow through the same
@@ -130,7 +130,7 @@ impl<'a> JsonField<'a> {
 /// scalar-rooted stats response) hits the typed scalar accessor
 /// directly.
 ///
-/// Mirrors [`Snapshot::var`] / [`SnapshotEntry::get`] in error
+/// Mirrors [`super::Snapshot::var`] / [`super::SnapshotEntry::get`] in error
 /// shape: typos and missing keys surface as
 /// [`SnapshotError::FieldNotFound`] with the available sibling
 /// keys at the failing depth — the same diagnostic experience the

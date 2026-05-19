@@ -149,7 +149,7 @@ pub struct RqScxState {
     /// task list drives both rq->scx state AND per-task records.
     pub runnable_task_kvas: Vec<u64>,
     /// True when the runnable_list walk hit the
-    /// [`MAX_NODES_PER_LIST`] safety cap before reaching the head
+    /// `MAX_NODES_PER_LIST` safety cap before reaching the head
     /// — typical only on a corrupted chain.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub runnable_truncated: bool,
@@ -181,7 +181,7 @@ pub struct DsqState {
     /// the same per-task enrichment pipeline.
     pub task_kvas: Vec<u64>,
     /// True when the DSQ list walk hit the
-    /// [`MAX_NODES_PER_LIST`] cap before reaching the head.
+    /// `MAX_NODES_PER_LIST` cap before reaching the head.
     /// Distinct from `nr`: the kernel may report `nr` larger than
     /// our walk cap on legitimately-deep DSQs.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -246,7 +246,7 @@ pub struct ScxSchedState {
 /// `runqueues + per_cpu_offset[cpu]` (KVA) plus the corresponding PA
 /// via `compute_rq_pas`.
 ///
-/// Cap on visited nodes: [`MAX_NODES_PER_LIST`]. A truncated walk
+/// Cap on visited nodes: `MAX_NODES_PER_LIST`. A truncated walk
 /// surfaces via [`RqScxState::runnable_truncated`].
 ///
 /// Returns `None` when any of the offset sub-groups required for
@@ -519,7 +519,7 @@ const SCX_TASK_CURSOR: u32 = 1 << 31;
 /// stripped vmlinux or kernel without sched_ext) or when the list
 /// head reads as empty (tasks_node points at itself).
 ///
-/// Bounded by [`MAX_NODES_PER_LIST`] to protect against a corrupt
+/// Bounded by `MAX_NODES_PER_LIST` to protect against a corrupt
 /// chain.
 #[allow(dead_code)]
 pub fn walk_scx_tasks_global(

@@ -57,14 +57,14 @@ pub struct WorkSpec {
     /// Optional mode flags for `set_mempolicy(2)`.
     pub mpol_flags: MpolFlags,
     /// Per-worker nice value applied via `setpriority(2)` after
-    /// fork, before the work loop. See [`WorkloadConfig::nice`]
+    /// fork, before the work loop. See [`crate::workload::WorkloadConfig::nice`]
     /// for range, `None`-vs-`Some(n)` semantics, and `CAP_SYS_NICE`
     /// rules.
     ///
     /// To inherit a cgroup-level default stored at
     /// [`CgroupDef::default_nice`](crate::scenario::ops::CgroupDef::default_nice),
     /// leave this `None`. `Some(0)` opts out of the cgroup-level
-    /// merge — see [`WorkloadConfig::nice`] for the underlying
+    /// merge — see [`crate::workload::WorkloadConfig::nice`] for the underlying
     /// `setpriority(PRIO_PROCESS, 0, 0)` semantics.
     pub nice: Option<i32>,
     /// Per-worker comm set via `prctl(PR_SET_NAME)` at thread
@@ -316,7 +316,7 @@ impl WorkSpec {
     /// state is the type-level default `None` — leave the builder
     /// unchained for inherit semantics. Values below the calling
     /// task's current nice require `CAP_SYS_NICE`; see
-    /// [`WorkloadConfig::nice`] for the full `can_nice` rule.
+    /// [`crate::workload::WorkloadConfig::nice`] for the full `can_nice` rule.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn nice(mut self, n: i32) -> Self {
         self.nice = Some(n);

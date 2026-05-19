@@ -199,8 +199,8 @@ impl BoolAttrSlots<'_> {
 /// `None`), so the bare form is the meaningful shorthand.
 ///
 /// The accepted attributes and their defaults are the fields of
-/// [`ktstr::test_support::KtstrTestEntry`] (runtime metadata) and
-/// [`ktstr::assert::Assert`] (checking thresholds). A few are
+/// `ktstr::test_support::KtstrTestEntry` (runtime metadata) and
+/// `ktstr::assert::Assert` (checking thresholds). A few are
 /// worth calling out because their names differ from the underlying
 /// field or because they have nontrivial defaults:
 ///
@@ -324,7 +324,7 @@ impl BoolAttrSlots<'_> {
 ///     expressions). Maps onto
 ///     `KtstrTestEntry::extra_include_files` and is unioned with
 ///     the per-payload specs at `run_ktstr_test` time via
-///     [`KtstrTestEntry::all_include_files`]. Default: `[]`.
+///     `KtstrTestEntry::all_include_files`. Default: `[]`.
 ///     Path resolution: bare names (no `/`) search `PATH`; paths
 ///     containing `/` are absolute or relative to the test process
 ///     current directory; directories are walked recursively at
@@ -2051,7 +2051,7 @@ fn camel_to_screaming_snake(s: &str) -> String {
 ///   scheduler value. No `_PAYLOAD` suffix; the const IS the
 ///   `Scheduler`.
 /// - A hidden `static __KTSTR_SCHED_REG_MITOSIS: &'static Scheduler`
-///   registered in [`KTSTR_SCHEDULERS`](ktstr::test_support::KTSTR_SCHEDULERS)
+///   registered in `KTSTR_SCHEDULERS` (`ktstr::test_support::KTSTR_SCHEDULERS`)
 ///   via linkme so the verifier can discover the declaration by
 ///   spawning the test binary with `--ktstr-list-schedulers`.
 ///
@@ -2083,8 +2083,8 @@ fn camel_to_screaming_snake(s: &str) -> String {
 /// Exactly one scheduler-source must be declared: `binary`,
 /// `binary_path`, or the `kernel_builtin_enable` + `kernel_builtin_disable`
 /// pair. The three options select between the matching
-/// [`SchedulerSpec`] variants. To run under the kernel default
-/// instead, reference [`ktstr::test_support::Scheduler::EEVDF`]
+/// `SchedulerSpec` variants. To run under the kernel default
+/// instead, reference `ktstr::test_support::Scheduler::EEVDF`
 /// directly rather than declaring a new scheduler.
 ///
 /// | Field | Required | Description |
@@ -2092,17 +2092,17 @@ fn camel_to_screaming_snake(s: &str) -> String {
 /// | `name = "..."` | yes | Scheduler name (sidecar / logs). |
 /// | `binary = "..."` | one source | Binary name → `SchedulerSpec::Discover(...)`. Matched against `[[bin]]` names in `target/{debug,release}/`, the test binary's directory, or `KTSTR_SCHEDULER` env var. Often equal to the cargo package name but not required to be. |
 /// | `binary_path = "/abs/path"` | one source | Absolute filesystem path → `SchedulerSpec::Path(...)`. The runtime does not auto-build this variant: the file must already exist at the path when the test runs. Use for prebuilt binaries that live outside the cargo discovery cascade. Macro-time validation rejects empty strings, relative paths, and `~`-prefixed paths (no compile-time tilde expansion); existence is the runtime's job. |
-/// | `kernel_builtin_enable = [..]` + `kernel_builtin_disable = [..]` | one source | Two string-array literals that together select `SchedulerSpec::KernelBuiltin { enable: &[..], disable: &[..] }`. The framework writes the enable commands to the guest's `/sched_enable` and the disable commands to `/sched_disable` (see `src/vmm/initramfs.rs`), and the guest interpreter runs each entry once at scenario start / teardown. Both fields must be set together — setting only one is rejected. The interpreter (`src/vmm/rust_init.rs`) accepts EXACTLY ONE shell-line shape: `echo VALUE > /path` (plus blank lines and `#` comments). Pipes, `>>`, `;`, variable expansion, and any other syntax silently no-ops at runtime, so the macro rejects entries that don't match `echo … > /…` at expand time. At least one of the two arrays must be non-empty: a pair that supplies neither enable nor disable commands is equivalent to the EEVDF baseline — reference [`Scheduler::EEVDF`] for that. Note: `cargo ktstr export` currently bails on KernelBuiltin schedulers (`src/export.rs`); declarations using this variant cannot be reproduced via the export-to-shar workflow until that limitation is lifted. |
+/// | `kernel_builtin_enable = [..]` + `kernel_builtin_disable = [..]` | one source | Two string-array literals that together select `SchedulerSpec::KernelBuiltin { enable: &[..], disable: &[..] }`. The framework writes the enable commands to the guest's `/sched_enable` and the disable commands to `/sched_disable` (see `src/vmm/initramfs.rs`), and the guest interpreter runs each entry once at scenario start / teardown. Both fields must be set together — setting only one is rejected. The interpreter (`src/vmm/rust_init.rs`) accepts EXACTLY ONE shell-line shape: `echo VALUE > /path` (plus blank lines and `#` comments). Pipes, `>>`, `;`, variable expansion, and any other syntax silently no-ops at runtime, so the macro rejects entries that don't match `echo … > /…` at expand time. At least one of the two arrays must be non-empty: a pair that supplies neither enable nor disable commands is equivalent to the EEVDF baseline — reference `Scheduler::EEVDF` for that. Note: `cargo ktstr export` currently bails on KernelBuiltin schedulers (`src/export.rs`); declarations using this variant cannot be reproduced via the export-to-shar workflow until that limitation is lifted. |
 /// | `topology = (numa, llcs, cores, threads)` | no | Default VM topology. Default: `(1, 1, 2, 1)` (from `Scheduler::named`). Validated at compile time: each value must be non-zero, and `llcs` must be a multiple of `numa`. |
 /// | `cgroup_parent = "..."` | no | Cgroup parent path (must begin with `/`). |
 /// | `sched_args = [..]` | no | Scheduler CLI args prepended before per-test `extra_sched_args`. |
 /// | `sysctls = [Sysctl::new("k", "v"), ..]` | no | Guest sysctls. |
 /// | `kargs = [..]` | no | Extra guest kernel cmdline args. |
 /// | `kernels = ["6.14", "7.0..=7.2", ..]` | no | Kernel specs the verifier sweeps. Same parser as the `--kernel` CLI flag — accepts exact versions, ranges (`..` or `..=`, both inclusive), git refs (`git+URL#REF`), paths, and cache keys. Each entry is validated at macro-expand time via the same `KernelId::parse` + `validate` the verifier uses at runtime; empty entries, inverted ranges, and `..`-containing strings whose endpoints aren't version-shaped (e.g. `"abc..def"`) are rejected. |
-/// | `constraints = TopologyConstraints { .. }` | no | Gauntlet preset constraints — maps directly onto [`Scheduler::constraints`]. Filters which gauntlet topology presets exercise this scheduler. When given as a struct literal, the macro additionally cross-checks each literal field against the effective topology (explicit `topology` field if present, otherwise the `(1, 1, 2, 1)` default from `Scheduler::named`) and rejects infeasible pairings; non-struct-literal forms (e.g. `OTHER::CONST_CONSTRAINTS`) skip that check. |
-/// | `assert = Assert::NO_OVERRIDES.method().chain()` | no | Scheduler-wide assertion overrides — maps directly onto [`Scheduler::assert`]. Merged with `Assert::default_checks()` and the per-test `assert` at runtime (`default ← scheduler ← per-test`). Accepts any const-evaluable expression: a const path like `Assert::NO_OVERRIDES`, a const-fn call like `Assert::default_checks()`, or a chain of const-fn setters like `Assert::NO_OVERRIDES.check_not_starved().max_gap_ms(50)`. The macro accepts MethodCall chains and Path-rooted (type/module-prefixed) Calls — only bare single-segment lowercase Calls like `helper()` are rejected as non-const free-fn patterns; non-const methods on a Path receiver slip through and surface as a deep const-eval failure at the spread site. |
+/// | `constraints = TopologyConstraints { .. }` | no | Gauntlet preset constraints — maps directly onto `Scheduler::constraints`. Filters which gauntlet topology presets exercise this scheduler. When given as a struct literal, the macro additionally cross-checks each literal field against the effective topology (explicit `topology` field if present, otherwise the `(1, 1, 2, 1)` default from `Scheduler::named`) and rejects infeasible pairings; non-struct-literal forms (e.g. `OTHER::CONST_CONSTRAINTS`) skip that check. |
+/// | `assert = Assert::NO_OVERRIDES.method().chain()` | no | Scheduler-wide assertion overrides — maps directly onto `Scheduler::assert`. Merged with `Assert::default_checks()` and the per-test `assert` at runtime (`default ← scheduler ← per-test`). Accepts any const-evaluable expression: a const path like `Assert::NO_OVERRIDES`, a const-fn call like `Assert::default_checks()`, or a chain of const-fn setters like `Assert::NO_OVERRIDES.check_not_starved().max_gap_ms(50)`. The macro accepts MethodCall chains and Path-rooted (type/module-prefixed) Calls — only bare single-segment lowercase Calls like `helper()` are rejected as non-const free-fn patterns; non-const methods on a Path receiver slip through and surface as a deep const-eval failure at the spread site. |
 /// | `config_file = "..."` | no | Host-side config file path. |
-/// | `config_file_def = ("--config {file}", "/include-files/cfg.json")` | no | Inline-config plumbing — maps directly onto [`Scheduler::config_file_def`]. 2-tuple of string literals: arg_template (CLI arg with `{file}` placeholder substituted at run time) and guest_path (absolute path where the framework writes the JSON inside the guest). Distinct from `config_file` (which references a pre-existing host file). The macro validates: tuple-arity = 2, both elements non-empty string literals, `{file}` placeholder present in arg_template, guest_path absolute. |
+/// | `config_file_def = ("--config {file}", "/include-files/cfg.json")` | no | Inline-config plumbing — maps directly onto `Scheduler::config_file_def`. 2-tuple of string literals: arg_template (CLI arg with `{file}` placeholder substituted at run time) and guest_path (absolute path where the framework writes the JSON inside the guest). Distinct from `config_file` (which references a pre-existing host file). The macro validates: tuple-arity = 2, both elements non-empty string literals, `{file}` placeholder present in arg_template, guest_path absolute. |
 ///
 /// # Const naming rules
 ///
@@ -3623,7 +3623,7 @@ fn bool_from_lit_expr(expr: &syn::Expr) -> Option<bool> {
 ///
 /// - `binary = "..."` — the binary name resolved by the guest's
 ///   include-files infrastructure (required). Becomes
-///   [`PayloadKind::Binary(name)`](ktstr::test_support::PayloadKind::Binary),
+///   `PayloadKind::Binary(name)` (`ktstr::test_support::PayloadKind::Binary`),
 ///   and is also auto-prepended to the emitted `include_files` slice
 ///   so the binary is packaged into the initramfs without needing a
 ///   separate `#[include_files("...")]` entry. Extra auxiliary files
@@ -3647,7 +3647,7 @@ fn bool_from_lit_expr(expr: &syn::Expr) -> Option<bool> {
 ///   literals appended to the binary's argv when the payload runs.
 ///   May repeat across multiple `#[default_args(...)]` attrs; entries
 ///   accumulate in source order.
-/// - `#[default_check(...)]` — one [`MetricCheck`](ktstr::test_support::MetricCheck)
+/// - `#[default_check(...)]` — one `MetricCheck` (`ktstr::test_support::MetricCheck`)
 ///   construction expression (e.g. `min("iops", 1000.0)`,
 ///   `exit_code_eq(0)`). May repeat; entries accumulate in source
 ///   order. Both `min(...)` and `MetricCheck::min(...)` are accepted: the

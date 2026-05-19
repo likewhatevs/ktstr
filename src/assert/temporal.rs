@@ -135,7 +135,7 @@ impl<T> SeriesField<T> {
 
     /// Per-phase folded reduction: extract the `f64` value from
     /// each Ok-sample (skipping per-sample errors) and route the
-    /// per-phase slice through [`crate::stats::aggregate_samples_for_phase`]
+    /// per-phase slice through `crate::stats::aggregate_samples_for_phase`
     /// so Counter kinds get the cumulative-delta semantic while
     /// other kinds inherit the flat-run aggregator. Returns one
     /// entry per phase that has at least one Ok-sample with a
@@ -179,7 +179,7 @@ impl<T> SeriesField<T> {
     /// unstamped) are skipped — callers wanting them call
     /// [`Self::by_phase`] directly and handle the second-tuple
     /// `none_bucket` themselves. Phases iterate in `Phase` order
-    /// (BASELINE first, then Step[0], Step[1], ...) per the
+    /// (BASELINE first, then Step\[0\], Step\[1\], ...) per the
     /// `BTreeMap` key ordering, which lets temporal-pattern
     /// consumers apply a per-phase reduction without restating
     /// the `by_phase` unpacking at every call site.
