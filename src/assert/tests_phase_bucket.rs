@@ -989,3 +989,225 @@ fn build_phase_buckets_avg_imbalance_excludes_out_of_window_monitor_samples() {
         "out-of-window sample must not contaminate in-window mean (got {avg})",
     );
 }
+
+/// Tester B14 BLOCKING: avg_dsq_depth end-to-end pin through
+/// the registry → build_phase_buckets → PhaseBucket.metrics
+/// path. Without this, a regression where the read_sample
+/// dispatch arm at src/stats.rs returns None silently produces
+/// an empty per-phase entry — operator-visible drop. Synthetic
+/// Snapshot DSQ states produce a known mean across local-cpu
+/// entries.
+#[test]
+fn build_phase_buckets_avg_dsq_depth_from_snapshot_dsq_states() {
+    use crate::monitor::dump::FailureDumpReport;
+    use crate::monitor::scx_walker::DsqState;
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    // Two periodic captures, each carrying 3 local-cpu DSQ
+    // states with depths 2/4/6 → per-sample mean 4.0. Two
+    // identical samples → per-phase mean 4.0.
+    let mk_entry = |tag: &str, ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            dsq_states: vec![
+                DsqState {
+                    origin: "local cpu 0".to_string(),
+                    nr: 2,
+                    ..Default::default()
+                },
+                DsqState {
+                    origin: "local cpu 1".to_string(),
+                    nr: 4,
+                    ..Default::default()
+                },
+                DsqState {
+                    origin: "local cpu 2".to_string(),
+                    nr: 6,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(ms),
+        step_index: Some(1),
+    };
+    let drained = vec![mk_entry("periodic_000", 100), mk_entry("periodic_001", 200)];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let step0 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("Step[0] bucket present");
+    let avg = step0
+        .metrics
+        .get("avg_dsq_depth")
+        .copied()
+        .expect("avg_dsq_depth populated from local-cpu DSQ states");
+    assert!(
+        (avg - 4.0).abs() < f64::EPSILON,
+        "expected per-phase avg of mean(2,4,6)=4.0, got {avg}",
+    );
+    // Also verify max_dsq_depth shipped correctly through the
+    // same DSQ-walker axis.
+    let max = step0
+        .metrics
+        .get("max_dsq_depth")
+        .copied()
+        .expect("max_dsq_depth populated alongside avg");
+    assert!((max - 6.0).abs() < f64::EPSILON, "expected max=6.0, got {max}");
+}
+
+/// Tester B15 BLOCKING: iteration_rate per-phase population via
+/// build_phase_buckets_with_stimulus. Synthetic StimulusEvents
+/// with total_iterations deltas at known boundaries produce a
+/// known per-phase rate.
+#[test]
+fn build_phase_buckets_with_stimulus_populates_iteration_rate() {
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    // Snapshot bridge entries fence two Step windows: Step[0]
+    // at [100, 1100], Step[1] at [1100, 2100]. Stimulus events
+    // carry total_iterations at each boundary. iteration_rate
+    // for Step[1] (curr.elapsed_ms=2100, prev.elapsed_ms=1100,
+    // iter delta 2000) → 2000 / (1000ms/1000) = 2000.0/s.
+    let mk_entry = |tag: &str, step: u16, ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(ms),
+        step_index: Some(step),
+    };
+    let drained = vec![
+        mk_entry("periodic_000", 1, 100),
+        mk_entry("periodic_001", 1, 1100),
+        mk_entry("periodic_002", 2, 1100),
+        mk_entry("periodic_003", 2, 2100),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let stimulus = vec![
+        StimulusEvent {
+            elapsed_ms: 100,
+            label: "Step[0]".to_string(),
+            op_kind: None,
+            detail: None,
+            total_iterations: Some(0),
+        },
+        StimulusEvent {
+            elapsed_ms: 1100,
+            label: "Step[1]".to_string(),
+            op_kind: None,
+            detail: None,
+            total_iterations: Some(1000),
+        },
+        StimulusEvent {
+            elapsed_ms: 2100,
+            label: "end".to_string(),
+            op_kind: None,
+            detail: None,
+            total_iterations: Some(3000),
+        },
+    ];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let step1 = phases
+        .iter()
+        .find(|p| p.step_index == 2)
+        .expect("Step[1] bucket present");
+    let rate = step1
+        .metrics
+        .get("iteration_rate")
+        .copied()
+        .expect("iteration_rate populated for Step[1]");
+    assert!(
+        (rate - 2000.0).abs() < f64::EPSILON,
+        "expected iteration_rate=2000.0 iter/s, got {rate}",
+    );
+}
+
+/// Tester B17 BLOCKING: populate_run_ext_metrics on a populated
+/// series produces the expected entries. Without this, the empty
+/// + no-overwrite tests pass vacuously and the load-bearing
+/// happy path is uncovered.
+#[test]
+fn populate_run_ext_metrics_populated_series_inserts_expected_keys() {
+    use crate::monitor::dump::FailureDumpReport;
+    use crate::monitor::scx_walker::DsqState;
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    let mk_entry = |tag: &str, ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            dsq_states: vec![DsqState {
+                origin: "local cpu 0".to_string(),
+                nr: 5,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(ms),
+        step_index: Some(0),
+    };
+    let drained = vec![mk_entry("periodic_000", 100), mk_entry("periodic_001", 200)];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let mut target = std::collections::BTreeMap::new();
+    crate::assert::populate_run_ext_metrics(&samples, &mut target);
+    // avg_dsq_depth has no typed GauntletRow field → populated.
+    // mean of (5, 5) = 5.0.
+    let avg = target
+        .get("avg_dsq_depth")
+        .copied()
+        .expect("avg_dsq_depth populated for populated series");
+    assert!(
+        (avg - 5.0).abs() < f64::EPSILON,
+        "expected avg_dsq_depth=5.0, got {avg}",
+    );
+    // max_dsq_depth has a typed field → skipped by populate.
+    assert!(
+        !target.contains_key("max_dsq_depth"),
+        "max_dsq_depth has a typed GauntletRow field; must not leak into ext_metrics",
+    );
+}
+
+/// populate_run_ext_metrics_from_phases populates per-phase
+/// metrics that have no read_sample dispatch (avg_imbalance_ratio,
+/// iteration_rate). Weighted-mean fold across phases.
+#[test]
+fn populate_run_ext_metrics_from_phases_folds_per_phase_keys() {
+    use crate::assert::PhaseBucket;
+    use std::collections::BTreeMap;
+    let mut m0 = BTreeMap::new();
+    m0.insert("avg_imbalance_ratio".to_string(), 2.0);
+    let mut m1 = BTreeMap::new();
+    m1.insert("avg_imbalance_ratio".to_string(), 4.0);
+    let phases = vec![
+        PhaseBucket {
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: 0,
+            end_ms: 100,
+            sample_count: 5,
+            metrics: m0,
+        },
+        PhaseBucket {
+            step_index: 2,
+            label: "Step[1]".to_string(),
+            start_ms: 100,
+            end_ms: 200,
+            sample_count: 15,
+            metrics: m1,
+        },
+    ];
+    let mut target = BTreeMap::new();
+    crate::assert::populate_run_ext_metrics_from_phases(&phases, &mut target);
+    // avg_imbalance_ratio is Gauge(Avg) — weighted mean by
+    // sample_count: (2.0*5 + 4.0*15) / 20 = 70/20 = 3.5.
+    let avg = target
+        .get("avg_imbalance_ratio")
+        .copied()
+        .expect("avg_imbalance_ratio folded from per-phase");
+    assert!(
+        (avg - 3.5).abs() < f64::EPSILON,
+        "expected weighted mean 3.5, got {avg}",
+    );
+}

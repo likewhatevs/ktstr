@@ -174,17 +174,17 @@ impl Timeline {
     /// coincide. We compute an offset to align them.
     ///
     /// Returns an empty timeline if either input is empty.
-    // `#[allow(dead_code)]`: the legacy Timeline::build path is
-    // superseded by Timeline::from_phase_buckets in production
-    // (evaluate_vm_result switched in this batch). Retained for
-    // the in-file tests at lines 824+ that pin compute_metrics
-    // behavior — those tests guard the legacy reduction's NaN /
-    // empty / single-phase / event-counter shapes, behavior that
-    // the from_phase_buckets path also relies on indirectly
-    // (PhaseBucket.metrics come from aggregate_samples_for_phase
-    // which mirrors compute_metrics' per-kind reductions). Deletion
-    // is a follow-up cleanup once the new path has soak time.
-    #[allow(dead_code)]
+    /// Build a Timeline from stimulus events + raw monitor
+    /// samples via the per-window `compute_metrics` reduction.
+    /// The production success path uses [`Self::from_phase_buckets`]
+    /// (which folds pre-bucketed PhaseBuckets) ; `build` is the
+    /// fallback evaluate_vm_result takes for monitor-only runs
+    /// (no snapshot bridge captures → PhaseBuckets vec is empty
+    /// but monitor samples exist) so the failure-message
+    /// timeline still renders. Both entry points produce the
+    /// same Timeline field shape; from_phase_buckets is
+    /// preferred when buckets are available because it avoids
+    /// the per-MonitorSample reduction.
     pub fn build(stimulus_events: &[StimulusEvent], monitor_samples: &[MonitorSample]) -> Self {
         if stimulus_events.is_empty() || monitor_samples.is_empty() {
             return Self { phases: Vec::new() };
@@ -700,7 +700,6 @@ fn phase_from_bucket(
 // Metric computation
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 fn compute_metrics(samples: &[&MonitorSample]) -> PhaseMetrics {
     if samples.is_empty() {
         return PhaseMetrics::default();

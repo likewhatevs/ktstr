@@ -2134,20 +2134,27 @@ pub fn build_phase_buckets_with_stimulus(
             continue;
         }
         let rate = (e - s) as f64 / (duration_ms as f64 / 1000.0);
-        // Find the bucket whose [start_ms, end_ms] window contains
-        // curr.elapsed_ms. The single-sample-bucket carve-out
-        // (start_ms == end_ms) requires explicit equality on the
-        // event timestamp — the previous `||` short-circuit
-        // version unconditionally swallowed all events whose
-        // elapsed_ms was >= the bucket's instant, regardless of
-        // boundary. The half-open `< end` matches the
-        // MonitorSample windowing convention so boundary events
-        // don't double-attribute across adjacent buckets.
+        // Attribute to the bucket containing PREV — the rate
+        // measures forward from PREV into the next event, so it
+        // is the rate OBSERVED DURING the phase that PREV's
+        // timestamp falls inside. The legacy Timeline::build
+        // alignment is identical: phase[i] gets the rate from
+        // events[i]→events[i+1], where events[i].elapsed_ms is
+        // the phase's left boundary.
+        //
+        // The single-sample-bucket carve-out (start_ms ==
+        // end_ms) requires explicit equality on the event
+        // timestamp — the previous `||` short-circuit version
+        // unconditionally swallowed all events whose elapsed_ms
+        // was >= the bucket's instant, regardless of boundary.
+        // The half-open `< end` matches the MonitorSample
+        // windowing convention so boundary events don't
+        // double-attribute across adjacent buckets.
         for bucket in buckets.iter_mut() {
             let in_bucket = if bucket.start_ms == bucket.end_ms {
-                curr.elapsed_ms == bucket.start_ms
+                prev.elapsed_ms == bucket.start_ms
             } else {
-                curr.elapsed_ms >= bucket.start_ms && curr.elapsed_ms < bucket.end_ms
+                prev.elapsed_ms >= bucket.start_ms && prev.elapsed_ms < bucket.end_ms
             };
             if in_bucket {
                 bucket
