@@ -450,6 +450,66 @@ impl Timeline {
         }
     }
 
+    /// Build a [`Timeline`] from pre-bucketed
+    /// [`crate::assert::PhaseBucket`]s emitted by the metric pipeline.
+    /// Preferred over [`Self::build`] when the caller already has
+    /// `PhaseBucket`s in hand — avoids re-deriving phase boundaries
+    /// from stimulus events + monitor samples by walking the buckets
+    /// directly.
+    ///
+    /// One [`Phase`] is emitted per bucket, in `step_index` order.
+    /// `PhaseMetrics` fields are populated from the bucket's
+    /// `metrics` map via a name-keyed mapping:
+    ///
+    /// | PhaseBucket metric key  | PhaseMetrics field      |
+    /// |-------------------------|-------------------------|
+    /// | `max_imbalance_ratio`   | `max_imbalance`         |
+    /// | `max_dsq_depth`         | `max_dsq_depth`         |
+    /// | `stuck_count`           | `stall_count`           |
+    /// | `total_fallback`        | `fallback_rate` (rate)  |
+    /// | `total_keep_last`       | `keep_last_rate` (rate) |
+    ///
+    /// Rate fields (`fallback_rate`, `keep_last_rate`) are computed
+    /// by dividing the bucket's reduced counter delta by the
+    /// bucket's window duration in seconds
+    /// (`end_ms - start_ms / 1000.0`). When the window has zero
+    /// duration (degenerate bucket) the rate stays `None`.
+    ///
+    /// Fields that PhaseBucket does NOT carry — `avg_imbalance`,
+    /// `avg_dsq_depth`, `iteration_rate` — default to `0.0` / `None`.
+    /// These are per-sample averages that PhaseBucket's reduced
+    /// metrics map does not preserve; the trade-off is intentional
+    /// (PhaseBucket is the reduced-value wire shape and re-deriving
+    /// averages would require carrying raw samples through).
+    ///
+    /// `changes` (boundary degradation detection) is NOT computed
+    /// here. The existing [`Self::build`] computes changes by
+    /// diffing adjacent `PhaseMetrics` fields including
+    /// `avg_imbalance` and `avg_dsq_depth` — both unavailable from
+    /// PhaseBucket — so a from_phase_buckets-built Timeline emits
+    /// every Phase with `changes = vec![]`. Callers that need
+    /// per-boundary change detection must continue to use
+    /// [`Self::build`] until the PhaseBucket → Timeline render
+    /// pipeline is consolidated.
+    // `#[allow(dead_code)]` until the eval.rs wire-through lands.
+    // The constructor is the API surface needed by a future
+    // production caller; tests below pin the conversion contract
+    // so the contract doesn't drift before the wire-through.
+    #[allow(dead_code)]
+    pub fn from_phase_buckets(
+        phase_buckets: &[crate::assert::PhaseBucket],
+        _ctx: &TimelineContext,
+    ) -> Self {
+        let mut sorted: Vec<&crate::assert::PhaseBucket> = phase_buckets.iter().collect();
+        sorted.sort_by_key(|b| b.step_index);
+        let phases = sorted
+            .into_iter()
+            .enumerate()
+            .map(|(idx, b)| phase_from_bucket(idx, b))
+            .collect();
+        Self { phases }
+    }
+
     /// Test helper — collect all degradation changes across phases.
     /// Retained after the gauntlet analyzer was removed; the scenarios
     /// pipeline consumes `Timeline` via `format_with_context` and does
@@ -465,6 +525,72 @@ impl Timeline {
             }
         }
         out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PhaseBucket → Phase conversion
+// ---------------------------------------------------------------------------
+
+/// Build a [`Phase`] from a [`crate::assert::PhaseBucket`]. The
+/// bucket's `step_index` becomes the phase index; the metric map
+/// is projected onto the named `PhaseMetrics` fields per the table
+/// in [`Timeline::from_phase_buckets`]. Phase 0 (BASELINE) emits
+/// `stimulus = None`; later phases synthesize a [`StimulusEvent`]
+/// whose label / op_kind come from the bucket label so the
+/// failure-message renderer prints a recognizable phase header.
+fn phase_from_bucket(idx: usize, b: &crate::assert::PhaseBucket) -> Phase {
+    let duration_s = if b.end_ms > b.start_ms {
+        (b.end_ms - b.start_ms) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    // Rate computation: counter-delta / duration_s. duration_s == 0
+    // disables the rate (None) — degenerate buckets shouldn't
+    // produce spurious infinities.
+    let rate = |key: &str| -> Option<f64> {
+        if duration_s <= 0.0 {
+            return None;
+        }
+        b.metrics.get(key).map(|v| v / duration_s)
+    };
+    let metrics = PhaseMetrics {
+        sample_count: b.sample_count,
+        avg_imbalance: 0.0,
+        max_imbalance: b.metrics.get("max_imbalance_ratio").copied().unwrap_or(0.0),
+        avg_dsq_depth: 0.0,
+        max_dsq_depth: b
+            .metrics
+            .get("max_dsq_depth")
+            .map(|v| v.round() as u32)
+            .unwrap_or(0),
+        stall_count: b
+            .metrics
+            .get("stuck_count")
+            .map(|v| v.round() as usize)
+            .unwrap_or(0),
+        fallback_rate: rate("total_fallback"),
+        keep_last_rate: rate("total_keep_last"),
+        iteration_rate: None,
+    };
+    let stimulus = if b.step_index == 0 {
+        None
+    } else {
+        Some(StimulusEvent {
+            elapsed_ms: b.start_ms,
+            label: b.label.clone(),
+            op_kind: None,
+            detail: None,
+            total_iterations: None,
+        })
+    };
+    Phase {
+        index: idx,
+        start_ms: b.start_ms,
+        end_ms: b.end_ms,
+        stimulus,
+        metrics,
+        changes: Vec::new(),
     }
 }
 
@@ -1484,6 +1610,122 @@ mod tests {
             throughput_changes.is_empty(),
             "10% change should not trigger throughput change detection"
         );
+    }
+
+    #[test]
+    fn from_phase_buckets_maps_known_metrics_and_renders_phase_block() {
+        use crate::assert::PhaseBucket;
+        use std::collections::BTreeMap;
+        let mut s0_metrics = BTreeMap::new();
+        s0_metrics.insert("max_dsq_depth".to_string(), 7.0);
+        s0_metrics.insert("max_imbalance_ratio".to_string(), 3.5);
+        s0_metrics.insert("total_fallback".to_string(), 200.0);
+        let buckets = vec![
+            PhaseBucket {
+                step_index: 0,
+                label: "BASELINE".to_string(),
+                start_ms: 0,
+                end_ms: 1000,
+                sample_count: 5,
+                metrics: BTreeMap::new(),
+            },
+            PhaseBucket {
+                step_index: 1,
+                label: "Step[0]".to_string(),
+                start_ms: 1000,
+                end_ms: 6000,
+                sample_count: 20,
+                metrics: s0_metrics,
+            },
+        ];
+        let t = Timeline::from_phase_buckets(&buckets, &TimelineContext::default());
+        assert_eq!(t.phases.len(), 2);
+        // Phase 0 (BASELINE) — no stimulus, no metrics.
+        assert!(t.phases[0].stimulus.is_none());
+        assert_eq!(t.phases[0].metrics.sample_count, 5);
+        assert_eq!(t.phases[0].metrics.max_dsq_depth, 0);
+        // Phase 1 (Step[0]) — stimulus set, metrics projected from
+        // the bucket map.
+        assert!(t.phases[1].stimulus.is_some());
+        assert_eq!(t.phases[1].stimulus.as_ref().unwrap().label, "Step[0]");
+        assert_eq!(t.phases[1].metrics.sample_count, 20);
+        assert_eq!(t.phases[1].metrics.max_dsq_depth, 7);
+        assert!((t.phases[1].metrics.max_imbalance - 3.5).abs() < f64::EPSILON);
+        // fallback_rate = 200 / (5000 / 1000) = 40.0 events/s
+        assert_eq!(t.phases[1].metrics.fallback_rate, Some(40.0));
+        // keep_last_rate absent → None (no total_keep_last in metrics map)
+        assert_eq!(t.phases[1].metrics.keep_last_rate, None);
+        // No source for iteration_rate / avg_imbalance / avg_dsq_depth.
+        assert_eq!(t.phases[1].metrics.iteration_rate, None);
+        assert_eq!(t.phases[1].metrics.avg_imbalance, 0.0);
+        assert_eq!(t.phases[1].metrics.avg_dsq_depth, 0.0);
+        // Render produces a non-empty timeline block.
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(formatted.contains("--- timeline ---"));
+        assert!(formatted.contains("BASELINE"));
+        assert!(formatted.contains("Step[0]"));
+    }
+
+    #[test]
+    fn from_phase_buckets_zero_duration_window_emits_no_rate() {
+        use crate::assert::PhaseBucket;
+        use std::collections::BTreeMap;
+        let mut metrics = BTreeMap::new();
+        metrics.insert("total_fallback".to_string(), 100.0);
+        let bucket = PhaseBucket {
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: 500,
+            end_ms: 500,
+            sample_count: 1,
+            metrics,
+        };
+        let t = Timeline::from_phase_buckets(&[bucket], &TimelineContext::default());
+        // Degenerate window (start == end) yields duration_s == 0,
+        // so rate divisions stay None rather than producing
+        // spurious infinities.
+        assert_eq!(t.phases[0].metrics.fallback_rate, None);
+    }
+
+    #[test]
+    fn from_phase_buckets_sorts_by_step_index() {
+        use crate::assert::PhaseBucket;
+        use std::collections::BTreeMap;
+        // Out-of-order input; from_phase_buckets must sort by
+        // step_index so the rendered phase block walks BASELINE
+        // → Step[0] → Step[1] in time order regardless of
+        // how the caller arranged the input vec.
+        let buckets = vec![
+            PhaseBucket {
+                step_index: 2,
+                label: "Step[1]".to_string(),
+                start_ms: 2000,
+                end_ms: 3000,
+                sample_count: 5,
+                metrics: BTreeMap::new(),
+            },
+            PhaseBucket {
+                step_index: 0,
+                label: "BASELINE".to_string(),
+                start_ms: 0,
+                end_ms: 500,
+                sample_count: 2,
+                metrics: BTreeMap::new(),
+            },
+            PhaseBucket {
+                step_index: 1,
+                label: "Step[0]".to_string(),
+                start_ms: 500,
+                end_ms: 2000,
+                sample_count: 5,
+                metrics: BTreeMap::new(),
+            },
+        ];
+        let t = Timeline::from_phase_buckets(&buckets, &TimelineContext::default());
+        assert_eq!(t.phases.len(), 3);
+        assert_eq!(t.phases[0].start_ms, 0);
+        assert_eq!(t.phases[1].start_ms, 500);
+        assert_eq!(t.phases[2].start_ms, 2000);
     }
 
     #[test]
