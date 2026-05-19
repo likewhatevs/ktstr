@@ -1983,6 +1983,103 @@ fn snapshot_bridge_store_with_stats_overwrite_clears_stale_values() {
     assert!(drained[0].elapsed_ms.is_none());
 }
 
+/// `store_with_stats_and_step` populates the parallel
+/// `SnapshotStore.step_index` map and `drain_ordered_with_stats`
+/// surfaces it via `DrainedSnapshotEntry::step_index`. Pins the
+/// step-stamped path's round-trip per plan_17 §3.4.
+#[test]
+fn snapshot_bridge_store_with_stats_and_step_round_trips() {
+    let cb: CaptureCallback = Arc::new(|_| None);
+    let bridge = SnapshotBridge::new(cb);
+    bridge.store_with_stats_and_step(
+        "periodic_000",
+        FailureDumpReport::default(),
+        Some(Ok(serde_json::json!({"phase": "warmup"}))),
+        Some(123),
+        7,
+    );
+    let drained = bridge.drain_ordered_with_stats();
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].tag, "periodic_000");
+    assert_eq!(
+        drained[0].step_index,
+        Some(7),
+        "step-stamped path surfaces step_index Some(N) to the drain consumer",
+    );
+    assert_eq!(drained[0].elapsed_ms, Some(123));
+}
+
+/// Legacy unstamped `store_with_stats` path drains with
+/// `step_index = None` — fixtures and tests that do not care about
+/// phase attribution still drain cleanly. Pins the
+/// None-for-legacy contract (USER_RULINGS §B1 lets non-stamped
+/// paths surface as None rather than collapse to BASELINE).
+#[test]
+fn snapshot_bridge_drain_ordered_with_stats_step_index_none_for_legacy_store() {
+    let cb: CaptureCallback = Arc::new(|_| None);
+    let bridge = SnapshotBridge::new(cb);
+    bridge.store_with_stats(
+        "periodic_legacy",
+        FailureDumpReport::default(),
+        Some(Ok(serde_json::json!({"any": 1}))),
+        Some(50),
+    );
+    let drained = bridge.drain_ordered_with_stats();
+    assert_eq!(drained.len(), 1);
+    assert!(
+        drained[0].step_index.is_none(),
+        "unstamped store path must surface step_index=None (not BASELINE), so the drain consumer can distinguish unstamped fixture captures from explicit phase-0 stamps",
+    );
+}
+
+/// FIFO eviction at `MAX_STORED_SNAPSHOTS` must sweep the
+/// `step_index` map in lock-step with the parallel reports /
+/// stats / elapsed maps. A stranded `step_index` entry whose
+/// paired report has been evicted would silently leak through the
+/// next-drain shape — the parallel-map invariant is exactly the
+/// silent-data-loss class this field exists to guard against.
+#[test]
+fn snapshot_bridge_store_with_stats_and_step_evicts_step_index_in_lockstep() {
+    let cb: CaptureCallback = Arc::new(|_| None);
+    let bridge = SnapshotBridge::new(cb);
+    for i in 0..MAX_STORED_SNAPSHOTS {
+        bridge.store_with_stats_and_step(
+            &format!("tag_{i:04}"),
+            FailureDumpReport::default(),
+            Some(Ok(serde_json::json!({"i": i}))),
+            Some(i as u64),
+            (i as u16) % 8 + 1,
+        );
+    }
+    let overflow_tag = format!("tag_{MAX_STORED_SNAPSHOTS:04}");
+    bridge.store_with_stats_and_step(
+        &overflow_tag,
+        FailureDumpReport::default(),
+        Some(Ok(serde_json::json!({"overflow": true}))),
+        Some(9_999),
+        42,
+    );
+    let drained = bridge.drain_ordered_with_stats();
+    let names: Vec<&str> = drained.iter().map(|e| e.tag.as_str()).collect();
+    assert!(!names.contains(&"tag_0000"), "tag_0000 evicted");
+    let last = drained
+        .iter()
+        .find(|e| e.tag == overflow_tag)
+        .expect("overflow tag resident after evict");
+    assert_eq!(
+        last.step_index,
+        Some(42),
+        "newest survives with its step_index — eviction sweep did not strand the parallel slot",
+    );
+    let stranded = drained
+        .iter()
+        .any(|e| e.tag == "tag_0000" || (e.tag.as_str() < "tag_0001" && e.step_index.is_some()));
+    assert!(
+        !stranded,
+        "no stranded step_index entry survives an evicted report",
+    );
+}
+
 // ---------- stats_path JSON accessor ----------
 
 /// `stats_path` walks a JSON object along a dotted path and

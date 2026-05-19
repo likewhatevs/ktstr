@@ -799,7 +799,7 @@ fn run_scenario(
             // `Op::RunPayload` targeting a just-created backdrop
             // cgroup.
             if !backdrop.ops.is_empty() {
-                apply_ops(ctx, s, &backdrop.ops)?;
+                apply_ops(ctx, s, &backdrop.ops, false)?;
             }
             // Shorthand payloads: one Op::RunPayload per entry,
             // inherited cgroup placement.
@@ -809,7 +809,7 @@ fn run_scenario(
                     .iter()
                     .map(|p| Op::run_payload(p, Vec::<String>::new()))
                     .collect();
-                apply_ops(ctx, s, &ops)?;
+                apply_ops(ctx, s, &ops, false)?;
             }
             Ok::<(), anyhow::Error>(())
         });
@@ -1219,7 +1219,7 @@ fn run_step<'a>(
             // scheduler process exits — whichever fires first.
             let deadline = scenario_start + ctx.duration;
             while std::time::Instant::now() < deadline {
-                drain_on_err!(scenario, apply_ops(ctx, &mut scenario, &step.ops));
+                drain_on_err!(scenario, apply_ops(ctx, &mut scenario, &step.ops, true));
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 // Live `sched_pid()` read so a mid-loop
                 // Op::ReplaceScheduler swap is watched at the NEW
@@ -1234,7 +1234,7 @@ fn run_step<'a>(
         _ => {
             // Ops first (e.g. parent cgroup creation), then
             // CgroupDef setup (children with workers).
-            drain_on_err!(scenario, apply_ops(ctx, &mut scenario, &step.ops));
+            drain_on_err!(scenario, apply_ops(ctx, &mut scenario, &step.ops, false));
             if !step.setup.is_empty() {
                 let defs = step.setup.resolve(ctx);
                 drain_on_err!(scenario, apply_setup(ctx, &mut scenario, &defs));
@@ -2154,7 +2154,12 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
 /// resolve the target name against step-local first, then backdrop
 /// — so a Step's ops can reach into Backdrop-declared cgroups by
 /// name without the Backdrop leaking implementation details.
-fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result<()> {
+fn apply_ops(
+    ctx: &Ctx,
+    state: &mut ScenarioState<'_, '_>,
+    ops: &[Op],
+    in_loop: bool,
+) -> Result<()> {
     // Pre-pass: fold runs of adjacent `Op::WriteKernelCold`
     // singletons into one merged op so that multi-CPU seeds
     // (e.g. `with_uptime` writing per-CPU `rq.clock` on every CPU
@@ -2726,6 +2731,22 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     .with_context(|| format!("Op::UnfreezeCgroup: cgroup '{cgroup}'"))?;
             }
             Op::CaptureSnapshot { name } => {
+                // USER_RULINGS §B2: reject CaptureSnapshot inside any
+                // HoldSpec::Loop step. Each capture forces a freeze
+                // rendezvous; inside a Loop generating a high-rate
+                // pattern (e.g. 100Hz iteration burst), one capture
+                // per iteration would destroy the workload pattern
+                // via 100 freezes/sec. Boundary captures emitted from
+                // a non-Loop Step before/after the Loop step still
+                // give the operator pre/post bracketing.
+                if in_loop {
+                    anyhow::bail!(
+                        "Op::CaptureSnapshot('{name}') inside HoldSpec::Loop forces a freeze \
+                         rendezvous every loop iteration, freezing every vCPU on each iteration \
+                         so the workload no longer runs at the rate you wrote; move the capture \
+                         into a non-Loop Step before or after the Loop step"
+                    );
+                }
                 // Two execution contexts:
                 //   1. Test fixture: a thread-local SnapshotBridge is
                 //      installed (e.g. by the `snapshot_e2e.rs`
@@ -4658,6 +4679,62 @@ mod tests {
         );
     }
 
+    /// USER_RULINGS §B2: `Op::CaptureSnapshot` reached during the
+    /// execution of a `HoldSpec::Loop` step's ops vec must produce a
+    /// hard error that names the observer-effect rationale. A capture
+    /// forces a freeze rendezvous; inside a Loop generating a
+    /// high-rate pattern, even one capture per iteration destroys the
+    /// workload via N freezes/sec. Boundary captures emitted in a
+    /// non-Loop Step before/after the Loop step are the correct
+    /// pattern. The error message must explain the WHY so the test
+    /// author understands the redirect (not just "rejected").
+    #[test]
+    fn holdspec_loop_rejects_capture_snapshot_inside_ops_vec() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let mut ctx = mock_ctx(&mock, &topo);
+        ctx.duration = Duration::from_millis(60);
+        let steps = vec![Step::new(
+            vec![Op::capture_snapshot("inside_loop_capture")],
+            HoldSpec::loop_at(Duration::from_millis(30)),
+        )];
+        // execute_steps catches per-step bail!() and surfaces them as
+        // a Fail outcome on the returned AssertResult so the per-step
+        // teardown (drain_on_err!) still runs. The bail message is
+        // wrapped as `"step N failed: <bail message>"`. The test must
+        // inspect the Fail outcome's message, not unwrap_err.
+        let result = execute_steps(&ctx, steps)
+            .expect("execute_steps returns Ok(AssertResult) even when a step's apply_ops bails");
+        assert!(
+            !result.is_pass(),
+            "scenario with Op::CaptureSnapshot inside HoldSpec::Loop must NOT pass; got: {:?}",
+            result.outcomes,
+        );
+        let fail_msg = result
+            .outcomes
+            .iter()
+            .find_map(|o| match o {
+                crate::assert::Outcome::Fail(detail) => Some(detail.message.clone()),
+                _ => None,
+            })
+            .expect("at least one Fail outcome carrying the §B2 reject message");
+        assert!(
+            fail_msg.contains("Op::CaptureSnapshot")
+                && fail_msg.contains("HoldSpec::Loop")
+                && fail_msg.contains("freezing every vCPU"),
+            "Fail outcome must name the rejected op + the enclosing hold + the \
+             concrete mechanism (every vCPU frozen per iteration) so the operator \
+             understands the redirect from the message alone, not just see \
+             'rejected' or read CLAUDE.md for the 'observer effect' jargon. \
+             got: {fail_msg}",
+        );
+        assert!(
+            fail_msg.contains("non-Loop Step"),
+            "Fail outcome must point to the correct fix (move capture into a non-Loop \
+             Step before/after the Loop step) per USER_RULINGS §B2; got: {fail_msg}",
+        );
+    }
+
     /// The Loop arm's sched-died-early-exit path (mod.rs:1177-1180)
     /// fires when `sleep_or_sched_died` observes the scheduler pid
     /// has exited mid-loop. Setting `sched_died_during_hold = true`
@@ -6565,7 +6642,7 @@ mod tests {
     fn apply_ops_test<'a>(ctx: &'a Ctx<'a>, state: &mut StepState<'a>, ops: &[Op]) -> Result<()> {
         let mut backdrop = BackdropState::empty(ctx);
         let mut scenario = ScenarioState::new(state, &mut backdrop);
-        apply_ops(ctx, &mut scenario, ops)
+        apply_ops(ctx, &mut scenario, ops, false)
     }
 
     #[test]
@@ -7585,7 +7662,7 @@ mod tests {
 
         {
             let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
-            apply_ops(&ctx, &mut scenario, &[Op::remove_cgroup("bd_cg")])
+            apply_ops(&ctx, &mut scenario, &[Op::remove_cgroup("bd_cg")], false)
                 .expect("step-local RemoveCgroup permitted against Backdrop target");
         }
         let calls = mock.calls();
@@ -7604,7 +7681,7 @@ mod tests {
         // Slot is free — re-adding the same name must succeed.
         {
             let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
-            apply_ops(&ctx, &mut scenario, &[Op::add_cgroup("bd_cg")])
+            apply_ops(&ctx, &mut scenario, &[Op::add_cgroup("bd_cg")], false)
                 .expect("AddCgroup with previously-removed name must succeed");
         }
 
@@ -7614,7 +7691,7 @@ mod tests {
             .expect("add second backdrop cgroup");
         {
             let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
-            apply_ops(&ctx, &mut scenario, &[Op::stop_cgroup("bd_cg_2")])
+            apply_ops(&ctx, &mut scenario, &[Op::stop_cgroup("bd_cg_2")], false)
                 .expect("step-local StopCgroup permitted against Backdrop target");
         }
 
@@ -7625,7 +7702,9 @@ mod tests {
         {
             let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
             scenario
-                .with_target_backdrop(|s| apply_ops(&ctx, s, &[Op::remove_cgroup("bd_cg_3")]))
+                .with_target_backdrop(|s| {
+                    apply_ops(&ctx, s, &[Op::remove_cgroup("bd_cg_3")], false)
+                })
                 .expect("backdrop-pass RemoveCgroup permitted against Backdrop target");
         }
 
@@ -7683,6 +7762,7 @@ mod tests {
                 &ctx,
                 &mut scenario,
                 &[Op::move_all_tasks("step_cg", "bd_cg")],
+                false,
             )
             .expect("move into backdrop");
         }
@@ -7740,8 +7820,13 @@ mod tests {
         step_state.handles.push(("src".to_string(), h));
         {
             let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
-            apply_ops(&ctx, &mut scenario, &[Op::move_all_tasks("src", "dst")])
-                .expect("step-to-step move");
+            apply_ops(
+                &ctx,
+                &mut scenario,
+                &[Op::move_all_tasks("src", "dst")],
+                false,
+            )
+            .expect("step-to-step move");
         }
         assert_eq!(step_state.handles.len(), 1);
         assert_eq!(step_state.handles[0].0, "dst");
@@ -7766,7 +7851,13 @@ mod tests {
         step_state.cgroups.add_cgroup_no_cpuset("step").unwrap();
 
         let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
-        let err = apply_ops(&ctx, &mut scenario, &[Op::move_all_tasks("bd", "step")]).unwrap_err();
+        let err = apply_ops(
+            &ctx,
+            &mut scenario,
+            &[Op::move_all_tasks("bd", "step")],
+            false,
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("Backdrop-owned 'bd'") && msg.contains("step-local 'step'"),
@@ -8315,7 +8406,7 @@ mod tests {
                 .add_cgroup_no_cpuset("bd_cg")
                 .expect("add backdrop cgroup");
             let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
-            apply_ops(&ctx, &mut scenario, &[Op::remove_cgroup("bd_cg")])
+            apply_ops(&ctx, &mut scenario, &[Op::remove_cgroup("bd_cg")], false)
                 .expect("remove_cgroup of backdrop target must succeed");
         });
         let warns: Vec<&(tracing::Level, String)> = events
@@ -8365,10 +8456,20 @@ mod tests {
             // in the warn has a non-empty value to substring-match
             // against — guards against a future refactor dropping
             // the step_cgroups field from the warn.
-            apply_ops(&ctx, &mut scenario, &[Op::add_cgroup("step_local_real")])
-                .expect("add step-local cgroup");
-            apply_ops(&ctx, &mut scenario, &[Op::remove_cgroup("bd_typoed_name")])
-                .expect("remove_cgroup of unknown name must succeed (permissive)");
+            apply_ops(
+                &ctx,
+                &mut scenario,
+                &[Op::add_cgroup("step_local_real")],
+                false,
+            )
+            .expect("add step-local cgroup");
+            apply_ops(
+                &ctx,
+                &mut scenario,
+                &[Op::remove_cgroup("bd_typoed_name")],
+                false,
+            )
+            .expect("remove_cgroup of unknown name must succeed (permissive)");
         });
         let warns: Vec<&(tracing::Level, String)> = events
             .iter()
@@ -8483,7 +8584,7 @@ mod tests {
             .add_cgroup_no_cpuset("shared")
             .expect("add backdrop cgroup");
         let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
-        let err = apply_ops(&ctx, &mut scenario, &[Op::add_cgroup("shared")]).expect_err(
+        let err = apply_ops(&ctx, &mut scenario, &[Op::add_cgroup("shared")], false).expect_err(
             "apply_ops must reject a step-local AddCgroup whose \
                          name already lives in the Backdrop",
         );
@@ -8601,6 +8702,7 @@ mod tests {
             &ctx,
             &mut scenario,
             &[Op::add_cgroup_def(CgroupDef::named("persistent"))],
+            false,
         )
         .expect_err("AddCgroupDef must reject a name already tracked by the Backdrop");
         let msg = format!("{err:?}");
@@ -8841,7 +8943,13 @@ mod tests {
 
         {
             let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
-            apply_ops(&ctx, &mut scenario, &[Op::move_all_tasks("src", "dst")]).expect("move");
+            apply_ops(
+                &ctx,
+                &mut scenario,
+                &[Op::move_all_tasks("src", "dst")],
+                false,
+            )
+            .expect("move");
         }
 
         assert_eq!(step_state.handles.len(), 3, "no handles lost");
