@@ -677,20 +677,32 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |r| Some(r.max_dsq_depth as f64),
     },
     MetricDef {
-        // Per-sample mean of local-CPU DSQ depths, reduced per
-        // phase via the Gauge(Avg) path. The Avg/Max pairing with
-        // `max_dsq_depth` mirrors the registry's `avg_imbalance_ratio`
-        // / `max_imbalance_ratio` convention (when the avg sibling
-        // lands per task #81): one row surfaces the typical-load
-        // shape, the other surfaces the worst-instant. Polarity
-        // matches the sibling (LowerBetter — a shallow queue is
-        // healthier than a crowded one). default_abs/default_rel
-        // are half of the Peak sibling's: the Avg of per-CPU local
-        // DSQ depths is structurally lower than the Max across the
-        // same set, so a tighter absolute threshold is appropriate
-        // while keeping the same proportional sensitivity.
+        // Per-sample mean of local-CPU DSQ depths sourced from
+        // the BPF DSQ walker (Snapshot::dsq_states() filtered by
+        // `origin.starts_with("local cpu ")`), reduced per phase
+        // via the Gauge(Avg) path. The DSQ-walker axis is the
+        // authoritative source — it reads the actual scheduler
+        // dispatch queues. The legacy Timeline::build path
+        // computed avg_dsq_depth from MonitorSample.CpuSnapshot.
+        // local_dsq_depth (a per-CPU rq-level metric); the new
+        // DSQ-walker axis is more accurate for an scx scheduler
+        // because it observes the dispatch queue directly rather
+        // than the rq-level reflection.
+        //
+        // Truncation caveat: when scx_walker hits MAX_NODES_PER_LIST
+        // (per src/monitor/scx_walker.rs), the captured DSQs are a
+        // prefix of the full set. The mean then shifts toward the
+        // captured prefix's central tendency; a 64-CPU box capturing
+        // only 20 DSQs reports the mean of those 20, not the mean
+        // over 64. max_dsq_depth (the Peak sibling) is robust to
+        // this (max-of-captured surfaces the deepest queue ever
+        // captured); avg_dsq_depth has no such monotonicity. If
+        // walker truncation becomes routine, add a denom-aware
+        // version that sums-then-divides by the topology's
+        // expected local-CPU count.
+        //
         // Accessor falls back to ext_metrics (no typed GauntletRow
-        // field yet; promotion to typed gated on cross-RUN
+        // field; promoting to typed is gated on cross-RUN
         // aggregation needs surfacing).
         name: "avg_dsq_depth",
         polarity: crate::test_support::Polarity::LowerBetter,
@@ -1029,6 +1041,14 @@ pub fn infer_higher_is_worse(name: &str) -> bool {
         // to the conservative `true` default — correct by luck
         // for DSQ depth (higher = worse) but not by reasoning;
         // these tokens make the inference grounded.
+        //
+        // False-positive caveat: a future metric named
+        // `dsq_throughput` / `dsq_iops` / `cache_depth` /
+        // `tree_depth` would be classified higher-is-worse
+        // here when the truth is the opposite. The fallback
+        // path matters only when METRICS doesn't register the
+        // name explicitly — register every new dsq-or-depth
+        // metric so the token-based inference never runs.
         "_depth",
         "dsq",
     ];
