@@ -405,6 +405,26 @@ impl MetricDef {
                 .map(|d| u64::from(d.nr))
                 .max()
                 .map(|v| v as f64),
+            // Per-sample arithmetic mean of the same local-CPU
+            // DSQ depth readings `max_dsq_depth` walks. Returns
+            // `None` when no local DSQs are present so the bucket
+            // renderer can distinguish "no data" from "real zero"
+            // (sentinel-free contract); a zero-population set
+            // never enters the mean.
+            "avg_dsq_depth" => {
+                let locals: Vec<f64> = sample
+                    .snapshot
+                    .dsq_states()
+                    .iter()
+                    .filter(|d| d.origin.starts_with("local cpu "))
+                    .map(|d| u64::from(d.nr) as f64)
+                    .collect();
+                if locals.is_empty() {
+                    None
+                } else {
+                    Some(locals.iter().sum::<f64>() / locals.len() as f64)
+                }
+            }
             // Cumulative `select_cpu_fallback` counter at the
             // freeze instant. The host's event-counter walker
             // builds a per-tick timeline of CPU-summed counters
@@ -581,6 +601,30 @@ pub static METRICS: &[MetricDef] = &[
         default_rel: 0.50,
         display_unit: "",
         accessor: |r| Some(r.max_dsq_depth as f64),
+    },
+    MetricDef {
+        // Per-sample mean of local-CPU DSQ depths, reduced per
+        // phase via the Gauge(Avg) path. The Avg/Max pairing with
+        // `max_dsq_depth` mirrors the registry's `avg_imbalance_ratio`
+        // / `max_imbalance_ratio` convention (when the avg sibling
+        // lands per task #81): one row surfaces the typical-load
+        // shape, the other surfaces the worst-instant. Polarity
+        // matches the sibling (LowerBetter — a shallow queue is
+        // healthier than a crowded one). default_abs/default_rel
+        // are half of the Peak sibling's: the Avg of per-CPU local
+        // DSQ depths is structurally lower than the Max across the
+        // same set, so a tighter absolute threshold is appropriate
+        // while keeping the same proportional sensitivity.
+        // Accessor falls back to ext_metrics (no typed GauntletRow
+        // field yet; promotion to typed gated on cross-RUN
+        // aggregation needs surfacing).
+        name: "avg_dsq_depth",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Avg),
+        default_abs: 5.0,
+        default_rel: 0.50,
+        display_unit: "",
+        accessor: |_| None,
     },
     MetricDef {
         name: "stuck_count",
@@ -878,6 +922,20 @@ pub fn infer_higher_is_worse(name: &str) -> bool {
         "_ns",
         "migration_ratio",
         "imbalance",
+        // DSQ depth is "lower is better" — a shallower queue
+        // means the scheduler is keeping up. `_depth` and `dsq`
+        // are independently meaningful: `_depth` catches names
+        // like `max_dsq_depth` / `avg_dsq_depth` whose source is
+        // the scheduler's local dispatch queue; `dsq` is the
+        // defensive fallback for future DSQ-related metric names
+        // that don't carry `_depth` (e.g. `dsq_overflow_count`).
+        // Without these tokens, a future refactor that drops a
+        // DSQ metric from the METRICS registry would fall through
+        // to the conservative `true` default — correct by luck
+        // for DSQ depth (higher = worse) but not by reasoning;
+        // these tokens make the inference grounded.
+        "_depth",
+        "dsq",
     ];
     if HIGHER_IS_WORSE_TOKENS.iter().any(|t| name.contains(t)) {
         return true;

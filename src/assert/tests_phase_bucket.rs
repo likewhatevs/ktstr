@@ -867,3 +867,38 @@ fn phase_guard_with_phase_builder_overrides_auto_stamp() {
         "with_phase builder must override the auto-stamp default",
     );
 }
+
+/// `populate_run_ext_metrics` is a no-op for an empty SampleSeries:
+/// `read_sample` returns `None` for every registered metric on the
+/// empty fixture (no DSQ states, no event counters), so nothing
+/// lands in `ext_metrics`. Pins the contract that the helper
+/// never synthesises sentinel zeros from no-data input.
+#[test]
+fn populate_run_ext_metrics_empty_series_inserts_nothing() {
+    let samples = SampleSeries::from_drained_typed(Vec::new(), None);
+    let mut target = std::collections::BTreeMap::new();
+    crate::assert::populate_run_ext_metrics(&samples, &mut target);
+    assert!(
+        target.is_empty(),
+        "no input samples must produce no ext_metrics entries, got {target:?}",
+    );
+}
+
+/// `populate_run_ext_metrics` never overwrites a key already
+/// present in `target` — a typed GauntletRow field that produced
+/// a value via the MetricDef accessor stays untouched. Pins the
+/// "fill the gap, never clobber" contract: cross-RUN comparison
+/// expects the typed-field value when present and the
+/// helper-computed value only when not.
+#[test]
+fn populate_run_ext_metrics_does_not_overwrite_existing_keys() {
+    let samples = SampleSeries::from_drained_typed(Vec::new(), None);
+    let mut target = std::collections::BTreeMap::new();
+    target.insert("avg_dsq_depth".to_string(), 42.0);
+    crate::assert::populate_run_ext_metrics(&samples, &mut target);
+    assert_eq!(
+        target.get("avg_dsq_depth").copied(),
+        Some(42.0),
+        "existing key must survive populate_run_ext_metrics",
+    );
+}

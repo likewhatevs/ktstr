@@ -2245,6 +2245,18 @@ fn evaluate_vm_result(
             result.monitor.clone(),
         );
         check_result.stats.phases = crate::assert::build_phase_buckets(&sample_series_for_phases);
+        // Cross-RUN aggregate fill: for any METRICS entry with a
+        // read_sample wire but no typed GauntletRow field, compute
+        // the per-RUN aggregate from the same samples and write into
+        // stats.ext_metrics. Without this, MetricDef::read returns
+        // None on both sides at cargo ktstr stats compare time, the
+        // EPSILON guard drops the row, and the operator never sees
+        // the metric — a silent data drop. Skips keys already
+        // populated as typed fields or by other producers.
+        crate::assert::populate_run_ext_metrics(
+            &sample_series_for_phases,
+            &mut check_result.stats.ext_metrics,
+        );
 
         return Ok(check_result);
     }

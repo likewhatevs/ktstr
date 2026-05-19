@@ -1954,6 +1954,50 @@ impl ScenarioStats {
 /// publicly-drainable `result.snapshot_bridge` — can produce the
 /// same per-phase aggregate shape without re-implementing the
 /// bucketing logic.
+/// Populate cross-RUN aggregate entries for every registered
+/// [`crate::stats::MetricDef`] whose `read_sample` returns finite
+/// values across the entire sample series. Writes into
+/// `target` (typically `ScenarioStats::ext_metrics`) under the
+/// metric's registry name — the same key the per-phase
+/// [`PhaseBucket::metrics`] uses, so cross-RUN and per-phase
+/// consumers reference the same name.
+///
+/// Existing keys are NOT overwritten — a typed GauntletRow field's
+/// value (populated via the MetricDef accessor at sidecar-write
+/// time) wins on the read path, and this fn fills the gap for
+/// registered metrics that have a `read_sample` wire but no typed
+/// GauntletRow field. Without this fill, `cargo ktstr stats compare`
+/// silently skips the metric (read returns None on both sides;
+/// the EPSILON guard drops the row) per the adversary's
+/// no-silent-drops finding on #17b.
+///
+/// Reduction dispatches per [`crate::stats::MetricKind`] via
+/// [`crate::stats::aggregate_samples_for_phase`] — Counter folds
+/// last-minus-first, Gauge variants fold per their `GaugeAgg`,
+/// Peak folds max, Timestamp folds last.
+pub fn populate_run_ext_metrics(
+    samples: &crate::scenario::sample::SampleSeries,
+    target: &mut std::collections::BTreeMap<String, f64>,
+) {
+    for metric_def in crate::stats::METRICS {
+        if target.contains_key(metric_def.name) {
+            continue;
+        }
+        let readings: Vec<f64> = samples
+            .iter_samples()
+            .filter_map(|s| metric_def.read_sample(&s))
+            .collect();
+        if readings.is_empty() {
+            continue;
+        }
+        if let Some(reduced) =
+            crate::stats::aggregate_samples_for_phase(metric_def, &readings)
+        {
+            target.insert(metric_def.name.to_string(), reduced);
+        }
+    }
+}
+
 pub fn build_phase_buckets(samples: &crate::scenario::sample::SampleSeries) -> Vec<PhaseBucket> {
     let by_phase = samples.by_phase();
     let mut out: Vec<PhaseBucket> = Vec::with_capacity(by_phase.len());
