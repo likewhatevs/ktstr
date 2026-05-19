@@ -557,11 +557,44 @@ pub(crate) fn attempt_auto_repro(
     let (vm_topology, memory_mib) = super::runtime::resolve_vm_topology(entry, topo);
 
     let no_perf_mode = super::runtime::no_perf_mode_for_entry(entry);
+    // Resolve staged schedulers for the auto-repro VM so any
+    // scheduler-lifecycle ops in the replayed scenario can find
+    // their staged binaries at the same /staging/schedulers/<name>/
+    // paths the primary VM used. See eval.rs for the resolve-loop
+    // rationale + KernelBuiltin/Eevdf skip semantics.
+    //
+    // Resolution errors here log + skip rather than propagate: the
+    // auto-repro function returns Option<String> (best-effort), so
+    // a staging-resolve failure for one staged scheduler should not
+    // tear down the whole auto-repro path. The operator still gets
+    // the warn in tracing; the primary VM's failure already landed
+    // its own dump.
+    let mut resolved_staged: Vec<(String, std::path::PathBuf, Vec<String>)> = Vec::new();
+    for staged in entry.staged_schedulers {
+        match super::eval::resolve_scheduler(&staged.binary) {
+            Ok((Some(host_path), _src)) => {
+                resolved_staged.push((
+                    staged.name.to_string(),
+                    host_path,
+                    staged.sched_args.iter().map(|s| s.to_string()).collect(),
+                ));
+            }
+            Ok((None, _)) => {} // KernelBuiltin / Eevdf — no binary
+            Err(e) => {
+                tracing::warn!(
+                    staged_name = %staged.name,
+                    error = %e,
+                    "auto-repro: failed to resolve staged scheduler binary; skipping (Op::AttachScheduler / Op::ReplaceScheduler against this staged entry will fail at dispatch time in the repro VM)"
+                );
+            }
+        }
+    }
     let mut builder = super::runtime::build_vm_builder_base(
         entry,
         kernel,
         ktstr_bin,
         scheduler,
+        &resolved_staged,
         vm_topology,
         memory_mib,
         &cmdline_extra,

@@ -1000,6 +1000,28 @@ fn run_ktstr_test_inner_impl(
     // resolve_scheduler directly on the same spec; the source is
     // stable across identical inputs within a single process run.
     let scheduler = resolve_scheduler(&entry.scheduler.binary)?.0;
+    // Resolve every entry in entry.staged_schedulers via the same
+    // resolve_scheduler cascade — pushes resolved (name, host_path,
+    // sched_args) tuples into the VmBuilder's staging set so future
+    // Op::AttachScheduler / Op::ReplaceScheduler dispatch can find
+    // each staged binary at /staging/schedulers/<name>/scheduler in
+    // the guest. Schedulers whose binary doesn't resolve
+    // (KernelBuiltin / Eevdf — no binary to stage) are silently
+    // dropped; a binary-backed staged scheduler whose host binary
+    // is missing propagates the error so the operator sees the
+    // staging failure at dispatch time rather than at op-dispatch
+    // time inside the VM.
+    let mut resolved_staged: Vec<(String, std::path::PathBuf, Vec<String>)> = Vec::new();
+    for staged in entry.staged_schedulers {
+        let (Some(host_path), _src) = resolve_scheduler(&staged.binary)? else {
+            continue;
+        };
+        resolved_staged.push((
+            staged.name.to_string(),
+            host_path,
+            staged.sched_args.iter().map(|s| s.to_string()).collect(),
+        ));
+    }
     let ktstr_bin = crate::resolve_current_exe()?;
 
     let guest_args = vec![
@@ -1060,6 +1082,7 @@ fn run_ktstr_test_inner_impl(
         &kernel,
         &ktstr_bin,
         scheduler.as_deref(),
+        &resolved_staged,
         vm_topology,
         memory_mib,
         &cmdline_extra,

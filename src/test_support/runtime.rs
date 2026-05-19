@@ -542,6 +542,7 @@ pub(crate) fn build_vm_builder_base(
     kernel: &Path,
     ktstr_bin: &Path,
     scheduler: Option<&Path>,
+    staged_schedulers: &[(String, std::path::PathBuf, Vec<String>)],
     vm_topology: crate::vmm::topology::Topology,
     memory_mib: u32,
     cmdline_extra: &str,
@@ -571,6 +572,18 @@ pub(crate) fn build_vm_builder_base(
 
     if let Some(sched_path) = scheduler {
         builder = builder.scheduler_binary(sched_path);
+    }
+
+    // Push each pre-resolved staged scheduler into the builder's
+    // staging set. Caller is responsible for running each entry
+    // through the resolve_scheduler cascade so this fn stays
+    // infallible (sibling to the boot-time `scheduler: Option<&Path>`
+    // shape which is also caller-resolved). KernelBuiltin / Eevdf
+    // staged entries (no binary to resolve) are skipped at the
+    // caller side; only resolved (name, host_binary, sched_args)
+    // tuples reach this loop.
+    for (name, host_path, sched_args) in staged_schedulers {
+        builder = builder.staged_scheduler(name.clone(), host_path.clone(), sched_args.clone());
     }
 
     // Opt-in jemalloc-probe wiring. An integration test that needs
@@ -1488,6 +1501,7 @@ mod tests {
             &missing_kernel,
             &exe,
             None,
+            &[],
             crate::vmm::topology::Topology::new(1, 1, 1, 1),
             256,
             "",
@@ -1534,6 +1548,7 @@ mod tests {
             &exe,
             &exe,
             None,
+            &[],
             bad_topology,
             256,
             "",
@@ -1568,6 +1583,7 @@ mod tests {
             &exe,
             &exe,
             Some(&missing_scheduler),
+            &[],
             crate::vmm::topology::Topology::new(1, 1, 1, 1),
             256,
             "",
