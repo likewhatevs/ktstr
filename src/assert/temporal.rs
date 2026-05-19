@@ -133,6 +133,69 @@ impl<T> SeriesField<T> {
         self.phases.iter().copied()
     }
 
+    /// Per-phase folded reduction: extract the `f64` value from
+    /// each Ok-sample (skipping per-sample errors) and route the
+    /// per-phase slice through [`crate::stats::aggregate_samples_for_phase`]
+    /// so Counter kinds get the cumulative-delta semantic while
+    /// other kinds inherit the flat-run aggregator. Returns one
+    /// entry per phase that has at least one Ok-sample with a
+    /// finite value; phases with all-err / all-NaN samples are
+    /// absent from the map (consistent with
+    /// `aggregate_samples_for_phase` returning `None` on that
+    /// input). Skips `None`-phase samples — fixture / unstamped
+    /// data does not have a phase key to bucket against.
+    ///
+    /// The API entry point a test author uses to ask "what was the
+    /// per-phase reduction of metric X?" without having to thread
+    /// `by_phase` + the kind-aware reducer manually.
+    pub fn aggregate_by_phase(
+        &self,
+        metric: &crate::stats::MetricDef,
+    ) -> std::collections::BTreeMap<crate::assert::Phase, f64>
+    where
+        T: Copy + Into<f64>,
+    {
+        let (by_phase, _none_bucket) = self.by_phase();
+        let mut out: std::collections::BTreeMap<crate::assert::Phase, f64> =
+            std::collections::BTreeMap::new();
+        for (phase, samples) in by_phase {
+            let finite_values: Vec<f64> = samples
+                .iter()
+                .filter_map(|(_tag, _elapsed, value)| match value {
+                    Ok(v) => Some((*v).into()),
+                    Err(_) => None,
+                })
+                .collect();
+            if let Some(reduced) = crate::stats::aggregate_samples_for_phase(metric, &finite_values)
+            {
+                out.insert(phase, reduced);
+            }
+        }
+        out
+    }
+
+    /// Apply `f` once per phase, with the per-phase slice of
+    /// [`SampleTriple<T>`]s. `None`-phase samples (fixture /
+    /// unstamped) are skipped — callers wanting them call
+    /// [`Self::by_phase`] directly and handle the second-tuple
+    /// `none_bucket` themselves. Phases iterate in `Phase` order
+    /// (BASELINE first, then Step[0], Step[1], ...) per the
+    /// `BTreeMap` key ordering, which lets temporal-pattern
+    /// consumers apply a per-phase reduction without restating
+    /// the `by_phase` unpacking at every call site.
+    ///
+    /// ```ignore
+    /// field.for_each_phase(|phase, samples| {
+    ///     // apply pattern X to samples, scoped to `phase`
+    /// });
+    /// ```
+    pub fn for_each_phase(&self, mut f: impl FnMut(crate::assert::Phase, &[SampleTriple<'_, T>])) {
+        let (by_phase, _none_bucket) = self.by_phase();
+        for (phase, samples) in by_phase {
+            f(phase, &samples);
+        }
+    }
+
     /// Partition samples by phase. `None`-phase samples bucket
     /// into the returned `none_bucket` outside the BTreeMap; phase
     /// values bucket by their `Phase` key. Each bucket retains the
@@ -1894,7 +1957,136 @@ mod tests {
         );
     }
 
-    // ---------- SeriesField phase column (S1.B) ----------
+    // ---------- for_each_phase + aggregate_by_phase ----------
+
+    #[test]
+    fn series_field_for_each_phase_invokes_closure_per_phase_in_phase_order() {
+        let f = SeriesField::<f64>::from_parts_with_phases(
+            "x",
+            vec!["t0".into(), "t1".into(), "t2".into(), "t3".into()],
+            vec![100, 200, 300, 400],
+            vec![Ok(10.0), Ok(20.0), Ok(30.0), Ok(40.0)],
+            vec![
+                Some(crate::assert::Phase::step(1)),
+                Some(crate::assert::Phase::BASELINE),
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(0)),
+            ],
+        );
+        let mut visited: Vec<(crate::assert::Phase, usize)> = Vec::new();
+        f.for_each_phase(|phase, samples| {
+            visited.push((phase, samples.len()));
+        });
+        // BTreeMap key order: BASELINE (0) < Step[0] (1) < Step[1] (2)
+        assert_eq!(
+            visited,
+            vec![
+                (crate::assert::Phase::BASELINE, 1),
+                (crate::assert::Phase::step(0), 2),
+                (crate::assert::Phase::step(1), 1),
+            ],
+            "for_each_phase must iterate phases in BTreeMap (Phase) order",
+        );
+    }
+
+    #[test]
+    fn series_field_for_each_phase_skips_none_phase_samples() {
+        let f = SeriesField::<f64>::from_parts_with_phases(
+            "x",
+            vec!["t0".into(), "t1".into()],
+            vec![100, 200],
+            vec![Ok(1.0), Ok(2.0)],
+            vec![None, Some(crate::assert::Phase::step(0))],
+        );
+        let mut visited: Vec<crate::assert::Phase> = Vec::new();
+        f.for_each_phase(|phase, _| visited.push(phase));
+        assert_eq!(visited, vec![crate::assert::Phase::step(0)]);
+    }
+
+    /// Helper: find a registered MetricDef by name from `crate::stats::METRICS`.
+    fn metric_by_name(name: &str) -> &'static crate::stats::MetricDef {
+        crate::stats::METRICS
+            .iter()
+            .find(|m| m.name == name)
+            .unwrap_or_else(|| panic!("no MetricDef named '{}' in METRICS", name))
+    }
+
+    #[test]
+    fn series_field_aggregate_by_phase_routes_counter_through_last_minus_first() {
+        // Use a registered Counter metric. `total_migrations` is
+        // MetricKind::Counter per stats.rs METRICS.
+        let metric = metric_by_name("total_migrations");
+        assert!(matches!(metric.kind, crate::stats::MetricKind::Counter));
+        let f = SeriesField::<f64>::from_parts_with_phases(
+            "x",
+            vec!["t0".into(), "t1".into(), "t2".into()],
+            vec![100, 200, 300],
+            vec![Ok(100.0), Ok(150.0), Ok(175.0)],
+            vec![
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(0)),
+            ],
+        );
+        let agg = f.aggregate_by_phase(metric);
+        assert_eq!(agg.len(), 1, "1 distinct phase");
+        // Counter last-minus-first: 175 - 100 = 75 (NOT the flat-run sum 425)
+        assert_eq!(
+            agg[&crate::assert::Phase::step(0)],
+            75.0,
+            "Counter routes through phase_counter_delta (last-first), not the flat-run sum aggregate_samples",
+        );
+    }
+
+    #[test]
+    fn series_field_aggregate_by_phase_routes_gauge_through_flat_run_aggregator() {
+        // `worst_spread` is MetricKind::Gauge(GaugeAgg::Last) per stats.rs METRICS.
+        let metric = metric_by_name("worst_spread");
+        assert!(matches!(metric.kind, crate::stats::MetricKind::Gauge(_)));
+        let f = SeriesField::<f64>::from_parts_with_phases(
+            "x",
+            vec!["t0".into(), "t1".into(), "t2".into()],
+            vec![100, 200, 300],
+            vec![Ok(2.0), Ok(4.0), Ok(6.0)],
+            vec![
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(0)),
+            ],
+        );
+        let agg = f.aggregate_by_phase(metric);
+        // Gauge(Last) returns the last finite sample.
+        assert_eq!(agg[&crate::assert::Phase::step(0)], 6.0);
+    }
+
+    #[test]
+    fn series_field_aggregate_by_phase_skips_phases_with_no_finite_samples() {
+        let metric = metric_by_name("worst_spread");
+        let f = SeriesField::<f64>::from_parts_with_phases(
+            "x",
+            vec!["t0".into(), "t1".into()],
+            vec![100, 200],
+            vec![
+                Err(crate::scenario::snapshot::SnapshotError::MissingStats {
+                    tag: "t0".into(),
+                    reason: crate::scenario::snapshot::MissingStatsReason::NoSchedulerBinary,
+                }),
+                Ok(5.0),
+            ],
+            vec![
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(1)),
+            ],
+        );
+        let agg = f.aggregate_by_phase(metric);
+        assert!(
+            !agg.contains_key(&crate::assert::Phase::step(0)),
+            "phase with all-Err samples absent",
+        );
+        assert_eq!(agg[&crate::assert::Phase::step(1)], 5.0);
+    }
+
+    // ---------- SeriesField phase column ----------
 
     #[test]
     fn series_field_from_parts_defaults_phases_to_all_none() {
