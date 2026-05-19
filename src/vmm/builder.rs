@@ -43,6 +43,7 @@ use super::{KtstrVm, disk_config};
 ///   by [`topology`](Self::topology))
 /// - `performance_mode` — `false` (operator opts in via
 ///   [`performance_mode`](Self::performance_mode))
+
 /// One scheduler staged into the guest initramfs alongside the
 /// boot-time `scheduler_binary` so the scheduler-lifecycle Ops
 /// (`Op::AttachScheduler` / `Op::ReplaceScheduler`) can swap to a

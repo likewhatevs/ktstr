@@ -1000,28 +1000,9 @@ fn run_ktstr_test_inner_impl(
     // resolve_scheduler directly on the same spec; the source is
     // stable across identical inputs within a single process run.
     let scheduler = resolve_scheduler(&entry.scheduler.binary)?.0;
-    // Resolve every entry in entry.staged_schedulers via the same
-    // resolve_scheduler cascade — pushes resolved (name, host_path,
-    // sched_args) tuples into the VmBuilder's staging set so future
-    // Op::AttachScheduler / Op::ReplaceScheduler dispatch can find
-    // each staged binary at /staging/schedulers/<name>/scheduler in
-    // the guest. Schedulers whose binary doesn't resolve
-    // (KernelBuiltin / Eevdf — no binary to stage) are silently
-    // dropped; a binary-backed staged scheduler whose host binary
-    // is missing propagates the error so the operator sees the
-    // staging failure at dispatch time rather than at op-dispatch
-    // time inside the VM.
-    let mut resolved_staged: Vec<(String, std::path::PathBuf, Vec<String>)> = Vec::new();
-    for staged in entry.staged_schedulers {
-        let (Some(host_path), _src) = resolve_scheduler(&staged.binary)? else {
-            continue;
-        };
-        resolved_staged.push((
-            staged.name.to_string(),
-            host_path,
-            staged.sched_args.iter().map(|s| s.to_string()).collect(),
-        ));
-    }
+    let resolved_staged = resolve_staged_schedulers_strict(entry, |spec| {
+        resolve_scheduler(spec).map(|(opt, _src)| opt)
+    })?;
     let ktstr_bin = crate::resolve_current_exe()?;
 
     let guest_args = vec![
@@ -2799,6 +2780,49 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 ///   `scx_layered` ahead of a workspace-built one would corrupt
 ///   gauntlet runs whose results must reflect the in-tree
 ///   scheduler revision.
+/// Resolve every entry in `entry.staged_schedulers` via a caller-
+/// supplied resolver, propagating resolver errors strictly (suitable
+/// for the primary-dispatch path where a missing staged binary is a
+/// hard failure operator should see at dispatch time, not later at
+/// Op-dispatch inside the VM). KernelBuiltin / Eevdf staged entries
+/// — whose resolver returns `Ok(None)` — are silently dropped:
+/// they have no binary to stage and the lifecycle ops resolve them
+/// via shell-script slots instead.
+///
+/// Returns `(name, resolved_host_path, sched_args)` tuples in the
+/// SAME order as `entry.staged_schedulers` iteration. Ordering is
+/// load-bearing: the future initramfs packer iterates the result
+/// to emit per-scheduler `/staging/schedulers/<name>/` archive
+/// entries, and parent-directory dependencies are encounter-order
+/// sensitive. Tests pin the order-preservation against a future
+/// refactor that uses `.collect::<HashMap<_,_>>().into_iter()`
+/// (would silently scramble).
+///
+/// `resolver` is a closure rather than a direct call to
+/// [`resolve_scheduler`] so unit tests can drive the order-
+/// preservation contract with a synthetic resolver that returns
+/// known paths without touching the host filesystem.
+pub(crate) fn resolve_staged_schedulers_strict<F>(
+    entry: &KtstrTestEntry,
+    mut resolver: F,
+) -> Result<Vec<(String, PathBuf, Vec<String>)>>
+where
+    F: FnMut(&SchedulerSpec) -> Result<Option<PathBuf>>,
+{
+    let mut out = Vec::with_capacity(entry.staged_schedulers.len());
+    for staged in entry.staged_schedulers {
+        let Some(host_path) = resolver(&staged.binary)? else {
+            continue;
+        };
+        out.push((
+            staged.name.to_string(),
+            host_path,
+            staged.sched_args.iter().map(|s| s.to_string()).collect(),
+        ));
+    }
+    Ok(out)
+}
+
 pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, ResolveSource)> {
     match spec {
         SchedulerSpec::Eevdf | SchedulerSpec::KernelBuiltin { .. } => {
@@ -6638,6 +6662,121 @@ mod tests {
             mismatch_line.contains("matcher_details.is_empty()"),
             "matcher_mismatch must derive from `matcher_details.is_empty()`, \
              not a hardcoded literal; assignment line: {mismatch_line}",
+        );
+    }
+
+    /// `resolve_staged_schedulers_strict` MUST preserve
+    /// `entry.staged_schedulers` iteration order in its returned
+    /// Vec. The future initramfs packer iterates the result to
+    /// emit per-scheduler `/staging/schedulers/<name>/` archive
+    /// entries; a silent reorder (e.g. a refactor that uses
+    /// `.collect::<HashMap<_,_>>().into_iter()`) would silently
+    /// change initramfs staging layout.
+    ///
+    /// Uses a synthetic resolver that returns the spec encoded as
+    /// a path so the order assertion can read back the original
+    /// order without touching the host filesystem.
+    #[test]
+    fn resolve_staged_schedulers_strict_preserves_entry_iteration_order() {
+        use crate::test_support::Scheduler;
+        static FIRST: Scheduler = Scheduler::named("scx_alpha").binary_discover("scx_alpha_bin");
+        static SECOND: Scheduler = Scheduler::named("scx_beta").binary_discover("scx_beta_bin");
+        static THIRD: Scheduler = Scheduler::named("scx_gamma").binary_discover("scx_gamma_bin");
+        static SCHEDS: &[&Scheduler] = &[&FIRST, &SECOND, &THIRD];
+        let entry = crate::test_support::entry::KtstrTestEntry {
+            name: "order_pin",
+            staged_schedulers: SCHEDS,
+            ..crate::test_support::entry::KtstrTestEntry::DEFAULT
+        };
+        let resolved = resolve_staged_schedulers_strict(&entry, |spec| {
+            // Encode the spec as a deterministic synthetic path so
+            // the resolver is pure (no FS) and the test can pin
+            // both the order AND that the resolver was called per
+            // staged entry.
+            let key = match spec {
+                SchedulerSpec::Discover(s) => s.to_string(),
+                _ => "unexpected_variant".to_string(),
+            };
+            Ok(Some(PathBuf::from(format!("/synthetic/{key}"))))
+        })
+        .expect("strict resolver succeeds on synthetic happy path");
+
+        let names: Vec<&str> = resolved.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["scx_alpha", "scx_beta", "scx_gamma"],
+            "resolution MUST preserve entry.staged_schedulers declaration order; \
+             a future refactor that collects via HashMap would silently scramble \
+             initramfs staging layout"
+        );
+        let paths: Vec<String> = resolved
+            .iter()
+            .map(|(_, p, _)| p.display().to_string())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/synthetic/scx_alpha_bin",
+                "/synthetic/scx_beta_bin",
+                "/synthetic/scx_gamma_bin",
+            ],
+            "synthetic resolver paths must align with iteration order — \
+             confirms the per-entry resolver call happens in declaration order"
+        );
+    }
+
+    /// `resolve_staged_schedulers_strict` drops entries whose
+    /// resolver returns `Ok(None)` — matches the
+    /// `KernelBuiltin` / `Eevdf` semantic (no binary to stage).
+    /// Pins the silent-drop behavior so a future refactor that
+    /// changes the dropped-entry handling (e.g. bails on None
+    /// instead of skipping) surfaces here.
+    #[test]
+    fn resolve_staged_schedulers_strict_skips_resolver_none() {
+        use crate::test_support::Scheduler;
+        static BINARY: Scheduler = Scheduler::named("scx_real").binary_discover("scx_real_bin");
+        static BUILTIN: Scheduler = Scheduler::named("scx_builtin").binary_discover("scx_skip");
+        static SCHEDS: &[&Scheduler] = &[&BINARY, &BUILTIN];
+        let entry = crate::test_support::entry::KtstrTestEntry {
+            name: "none_skip",
+            staged_schedulers: SCHEDS,
+            ..crate::test_support::entry::KtstrTestEntry::DEFAULT
+        };
+        let resolved = resolve_staged_schedulers_strict(&entry, |spec| match spec {
+            SchedulerSpec::Discover("scx_skip") => Ok(None),
+            SchedulerSpec::Discover(s) => Ok(Some(PathBuf::from(format!("/synthetic/{s}")))),
+            _ => Ok(None),
+        })
+        .expect("strict resolver succeeds; None entries are dropped not errored");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0, "scx_real");
+    }
+
+    /// `resolve_staged_schedulers_strict` propagates resolver
+    /// errors (vs the auto-repro path's log-and-skip). Pins the
+    /// strict semantic against a refactor that softens to
+    /// log-and-skip — primary-path staging failure MUST surface at
+    /// dispatch time, not silently degrade to "Op::AttachScheduler
+    /// will fail later inside the VM".
+    #[test]
+    fn resolve_staged_schedulers_strict_propagates_resolver_error() {
+        use crate::test_support::Scheduler;
+        static SCHED: Scheduler = Scheduler::named("scx_fail").binary_discover("scx_fail_bin");
+        static SCHEDS: &[&Scheduler] = &[&SCHED];
+        let entry = crate::test_support::entry::KtstrTestEntry {
+            name: "err_propagate",
+            staged_schedulers: SCHEDS,
+            ..crate::test_support::entry::KtstrTestEntry::DEFAULT
+        };
+        let err = resolve_staged_schedulers_strict(&entry, |_spec| {
+            Err::<Option<PathBuf>, _>(anyhow::anyhow!(
+                "synthetic resolver error — staged binary not found on host"
+            ))
+        })
+        .expect_err("strict resolver must propagate error, not swallow");
+        assert!(
+            err.to_string().contains("synthetic resolver error"),
+            "error chain must preserve resolver's message, got: {err:#}"
         );
     }
 }

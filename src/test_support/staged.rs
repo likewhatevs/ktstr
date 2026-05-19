@@ -21,7 +21,8 @@
 /// initramfs builder.
 ///
 /// The list is intentionally narrow — only names the guest init
-/// actually reads (see `src/vmm/rust_init.rs:2603` for `/scheduler`,
+/// actually reads (see `src/vmm/rust_init.rs:2618` for the
+/// `Path::new("/scheduler").exists()` check + L2653 `Command::new("/scheduler")`,
 /// `src/vmm/initramfs.rs:1007-1016` for the suffix file shapes).
 /// Adding a name here is a behavior change for every existing
 /// scheduler whose `name` happens to match; expand cautiously.

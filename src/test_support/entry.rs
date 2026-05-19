@@ -2665,6 +2665,122 @@ mod tests {
         entry.validate().expect("binary-only workloads must pass");
     }
 
+    // -- staged_schedulers validation tests --
+    //
+    // KtstrTestEntry::validate at L1556 walks staged_schedulers and
+    // enforces (a) per-name shape rules via the delegated
+    // validate_staged_scheduler_name + (b) within-set uniqueness
+    // via the BTreeSet insert. Both are silent-data-loss classes
+    // if they regress — invalid names
+    // would land at corrupt guest staging paths; duplicate names
+    // would silently overwrite at the same guest path. The
+    // delegated shape rules are independently tested at
+    // src/test_support/staged.rs; the smoke test below proves
+    // the delegation is wired (catches a future refactor that
+    // inlines dup-check and forgets the shape-check).
+
+    /// Empty `staged_schedulers` slice — the default for every
+    /// test that doesn't use scheduler-lifecycle ops — must validate.
+    #[test]
+    fn validate_accepts_empty_staged_schedulers() {
+        let entry = KtstrTestEntry {
+            name: "no_staged",
+            staged_schedulers: &[],
+            ..KtstrTestEntry::DEFAULT
+        };
+        entry.validate().expect("empty staged_schedulers must pass");
+    }
+
+    /// Two distinct well-formed staged schedulers — both pass shape
+    /// check, names differ. Pins the happy path for the
+    /// mid-experiment swap use case (mitosis args A → mitosis args
+    /// B declared as two distinct schedulers).
+    #[test]
+    fn validate_accepts_well_formed_unique_staged_schedulers() {
+        static SCX_MITOSIS_A: Scheduler =
+            Scheduler::named("scx_mitosis_a").binary_discover("scx_mitosis");
+        static SCX_MITOSIS_B: Scheduler =
+            Scheduler::named("scx_mitosis_b").binary_discover("scx_mitosis");
+        // Slice itself must be `static` so the &'static [...] field
+        // can borrow it; binding the slice literal to a static at the
+        // call site moves the const-promotion responsibility off the
+        // struct-literal expression where lifetime inference can't
+        // see the longer-lived destination.
+        static SCHEDS: &[&Scheduler] = &[&SCX_MITOSIS_A, &SCX_MITOSIS_B];
+        let entry = KtstrTestEntry {
+            name: "staged_two",
+            staged_schedulers: SCHEDS,
+            ..KtstrTestEntry::DEFAULT
+        };
+        entry
+            .validate()
+            .expect("two distinct well-formed staged schedulers must pass");
+    }
+
+    /// Two staged schedulers with the SAME name collide at the
+    /// guest-side staging path (`/staging/schedulers/<name>/`). The
+    /// validate-time dedup catches this before any VM boot; without
+    /// the pin, a regression that drops the BTreeSet insert check
+    /// would silently produce a guest layout where the second
+    /// scheduler overwrites the first.
+    #[test]
+    fn validate_rejects_duplicate_staged_scheduler_names() {
+        static DUPE_A: Scheduler = Scheduler::named("scx_dupe").binary_discover("scx_first");
+        static DUPE_B: Scheduler = Scheduler::named("scx_dupe").binary_discover("scx_second");
+        static SCHEDS: &[&Scheduler] = &[&DUPE_A, &DUPE_B];
+        let entry = KtstrTestEntry {
+            name: "staged_dupe",
+            staged_schedulers: SCHEDS,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("duplicate staged Scheduler.name must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate"),
+            "error must name the duplicate-name violation, got: {msg}"
+        );
+        assert!(
+            msg.contains("scx_dupe"),
+            "error must name the colliding scheduler name, got: {msg}"
+        );
+        assert!(
+            msg.contains("staged_schedulers"),
+            "error must name the field, got: {msg}"
+        );
+    }
+
+    /// A staged scheduler with a shape-violating name (path
+    /// separator) must reject — proves the validate gate delegates
+    /// to validate_staged_scheduler_name. The exhaustive shape
+    /// rejections (empty, NUL, leading dot, reserved names) are
+    /// covered at src/test_support/staged.rs:138+; this smoke test
+    /// pins the delegation site against a future refactor that
+    /// inlines the dup-check and forgets the shape-check.
+    #[test]
+    fn validate_rejects_shape_violating_staged_scheduler_name() {
+        static BAD_SLASH: Scheduler = Scheduler::named("scx/path").binary_discover("scx_x");
+        static SCHEDS: &[&Scheduler] = &[&BAD_SLASH];
+        let entry = KtstrTestEntry {
+            name: "staged_bad_shape",
+            staged_schedulers: SCHEDS,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("path-separator Scheduler.name must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("staged_schedulers"),
+            "error must name the field — proves the `who` context propagated \
+             through the delegate call, got: {msg}"
+        );
+        // The exact shape-message ("path separators") is the
+        // validate_staged_scheduler_name contract pinned at
+        // src/test_support/staged.rs:151-156, not duplicated here.
+    }
+
     /// `validate()` rejects `host_only=true` paired with a
     /// `Some(DiskConfig)`. The combination is unsatisfiable today:
     /// `host_only` skips the VM boot that owns the virtio-blk device
