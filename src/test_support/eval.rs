@@ -1846,7 +1846,7 @@ fn evaluate_vm_result(
         drained_for_phases,
         result.monitor.clone(),
     );
-    let early_phase_buckets = crate::assert::build_phase_buckets_with_stimulus(
+    let mut early_phase_buckets = crate::assert::build_phase_buckets_with_stimulus(
         &early_sample_series,
         stimulus_events,
     );
@@ -2278,7 +2278,7 @@ fn evaluate_vm_result(
         // ScenarioStats.phases below. Reuse the pre-built vec +
         // SampleSeries rather than re-draining (the bridge was
         // already consumed).
-        check_result.stats.phases = early_phase_buckets.clone();
+        check_result.stats.phases = std::mem::take(&mut early_phase_buckets);
         let sample_series_for_phases = &early_sample_series;
         // Cross-RUN aggregate fill: for any METRICS entry with a
         // read_sample wire but no typed GauntletRow field, compute

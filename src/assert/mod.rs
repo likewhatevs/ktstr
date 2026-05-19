@@ -2021,19 +2021,22 @@ pub fn populate_run_ext_metrics_from_phases(
         };
         // Per-phase (value, sample_count) for the kind-aware fold.
         // A phase that doesn't carry the key contributes nothing.
-        let mut values: Vec<f64> = Vec::new();
-        let mut weights: Vec<usize> = Vec::new();
-        for phase in phases {
-            if let Some(v) = phase.metrics.get(key).copied() {
-                values.push(v);
-                weights.push(phase.sample_count.max(1));
-            }
-        }
-        if values.is_empty() {
+        // Lock-step shape enforced by the (f64, usize) pair type.
+        let pairs: Vec<(f64, usize)> = phases
+            .iter()
+            .filter_map(|phase| {
+                phase
+                    .metrics
+                    .get(key)
+                    .copied()
+                    .map(|v| (v, phase.sample_count.max(1)))
+            })
+            .collect();
+        if pairs.is_empty() {
             continue;
         }
         if let Some(reduced) =
-            crate::stats::aggregate_samples(&values, Some(&weights), def.kind)
+            crate::stats::aggregate_samples_weighted(&pairs, def.kind)
         {
             target.insert(key.clone(), reduced);
         }

@@ -1124,10 +1124,10 @@ fn build_phase_buckets_with_stimulus_populates_iteration_rate() {
     );
 }
 
-/// Tester B17 BLOCKING: populate_run_ext_metrics on a populated
-/// series produces the expected entries. Without this, the empty
-/// + no-overwrite tests pass vacuously and the load-bearing
-/// happy path is uncovered.
+/// `populate_run_ext_metrics` on a populated series produces
+/// the expected entries. Without this, the empty test and the
+/// no-overwrite test pass vacuously and the load-bearing happy
+/// path is uncovered.
 #[test]
 fn populate_run_ext_metrics_populated_series_inserts_expected_keys() {
     use crate::monitor::dump::FailureDumpReport;

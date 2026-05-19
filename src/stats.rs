@@ -247,72 +247,97 @@ impl MetricKind {
 /// [`crate::assert::build_phase_buckets`] whose live caller is
 /// the host-side `evaluate_vm_result` AssertResult-population
 /// site at `src/test_support/eval.rs`.
-pub fn aggregate_samples(
-    samples: &[f64],
-    weights: Option<&[usize]>,
+pub fn aggregate_samples(samples: &[f64], kind: MetricKind) -> Option<f64> {
+    let finite: Vec<f64> = samples.iter().copied().filter(|x| x.is_finite()).collect();
+    aggregate_finite(&finite, |_| 1, kind)
+}
+
+/// Weighted variant of [`aggregate_samples`]. Takes a slice of
+/// `(value, weight)` pairs so the lock-step shape is enforced by
+/// the type — there is no length-mismatch class for the caller to
+/// trigger. Weight is consulted for [`MetricKind::Gauge`] with
+/// [`GaugeAgg::Avg`] (weighted mean); other kinds fold by their
+/// natural reduction and ignore weight.
+///
+/// NaN-valued pairs drop along with their weight (filter operates
+/// on the value field — no risk of weights misaligning to other
+/// samples after filtering, unlike the previous parallel-slice
+/// shape).
+///
+/// Zero total weight degenerates to the unweighted mean per the
+/// `merge_metric_values` precedent. Weight sum uses `checked_add`
+/// with fallback to unweighted on overflow so a pathological
+/// caller can't crash the aggregator.
+pub fn aggregate_samples_weighted(
+    pairs: &[(f64, usize)],
     kind: MetricKind,
 ) -> Option<f64> {
-    if let Some(w) = weights {
-        assert_eq!(
-            w.len(),
-            samples.len(),
-            "aggregate_samples: weights len {} does not match samples len {}",
-            w.len(),
-            samples.len(),
-        );
-    }
-    // Zip BEFORE filtering NaN samples so the weight at each index
-    // stays in lock-step with the value. Filter-then-reindex would
-    // misalign weights to wrong values when NaNs land mid-vector.
-    let finite: Vec<(f64, usize)> = samples
+    let finite: Vec<(f64, usize)> = pairs
         .iter()
         .copied()
-        .enumerate()
-        .filter(|(_, x)| x.is_finite())
-        .map(|(i, x)| (x, weights.map(|w| w[i]).unwrap_or(1)))
+        .filter(|(x, _)| x.is_finite())
         .collect();
     if finite.is_empty() {
         return None;
     }
+    let values: Vec<f64> = finite.iter().map(|(x, _)| *x).collect();
+    aggregate_finite(&values, |i| finite[i].1, kind)
+}
+
+/// Inner fold shared by [`aggregate_samples`] (uniform weights)
+/// and [`aggregate_samples_weighted`] (caller-supplied weights).
+/// `weight_for(i)` returns the weight for the i-th element of
+/// `finite`; callers either pass `|_| 1` (unweighted) or a
+/// closure that reads from their pair vec (weighted). Pre-filtered
+/// `finite` carries only NaN-free values so the closure indexes
+/// into a known-good vec without risking shape drift.
+fn aggregate_finite(
+    finite: &[f64],
+    weight_for: impl Fn(usize) -> usize,
+    kind: MetricKind,
+) -> Option<f64> {
+    if finite.is_empty() {
+        return None;
+    }
     Some(match kind {
-        MetricKind::Counter => finite.iter().map(|(x, _)| x).sum(),
+        MetricKind::Counter => finite.iter().sum(),
         MetricKind::Gauge(GaugeAgg::Avg) => {
-            // Weighted mean: sum(v * w) / sum(w). When weights are
-            // None each sample contributes weight=1 above so the
-            // result reduces to arithmetic mean (the legacy
-            // semantic). When the total weight is zero (every
-            // contributor had weight=0 — degenerate input) fall
-            // back to unweighted mean rather than dividing by zero;
-            // mirrors `merge_metric_values` at
-            // `crate::assert::merge_matched_phase_buckets` per the
-            // single-source-of-truth principle for weighted means.
+            // Weighted mean: sum(v * w) / sum(w). Uniform-weight
+            // callers (aggregate_samples) reduce to arithmetic
+            // mean per weight_for == |_| 1. Zero total weight
+            // degenerates to the unweighted mean rather than
+            // dividing by zero; mirrors `merge_metric_values` at
+            // `crate::assert::merge_matched_phase_buckets` per
+            // single-source-of-truth.
             //
             // `checked_add` on the running weight sum so a
             // pathological caller (huge per-RUN sample counts
             // across many runs) saturates to MAX rather than
             // wrapping silently in release. On overflow we
             // collapse to the unweighted-mean fallback so the
-            // returned value stays plausible — operator-facing
-            // dashboards continue to render rather than emit
-            // garbage.
-            let total_weight: Option<usize> = finite
+            // returned value stays plausible.
+            let total_weight: usize = finite
                 .iter()
-                .try_fold(0usize, |acc, (_, w)| acc.checked_add(*w));
-            let total_weight = total_weight.unwrap_or(0);
+                .enumerate()
+                .try_fold(0usize, |acc, (i, _)| acc.checked_add(weight_for(i)))
+                .unwrap_or(0);
             if total_weight == 0 {
-                finite.iter().map(|(x, _)| *x).sum::<f64>() / (finite.len() as f64)
+                finite.iter().sum::<f64>() / (finite.len() as f64)
             } else {
-                finite.iter().map(|(x, w)| *x * (*w as f64)).sum::<f64>()
+                finite
+                    .iter()
+                    .enumerate()
+                    .map(|(i, x)| *x * (weight_for(i) as f64))
+                    .sum::<f64>()
                     / (total_weight as f64)
             }
         }
         MetricKind::Gauge(GaugeAgg::Last) | MetricKind::Timestamp => {
-            finite.last().expect("non-empty by check above").0
+            *finite.last().expect("non-empty by check above")
         }
-        MetricKind::Gauge(GaugeAgg::Max) | MetricKind::Peak => finite
-            .iter()
-            .map(|(x, _)| *x)
-            .fold(f64::NEG_INFINITY, f64::max),
+        MetricKind::Gauge(GaugeAgg::Max) | MetricKind::Peak => {
+            finite.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+        }
     })
 }
 
@@ -342,7 +367,7 @@ pub fn aggregate_samples(
 pub fn aggregate_samples_for_phase(metric: &MetricDef, samples: &[f64]) -> Option<f64> {
     match metric.kind {
         MetricKind::Counter => phase_counter_delta(samples),
-        _ => aggregate_samples(samples, None, metric.kind),
+        _ => aggregate_samples(samples, metric.kind),
     }
 }
 
@@ -2568,9 +2593,7 @@ pub fn group_and_average_by(
                     // (every value was NaN — shouldn't happen post-
                     // sidecar_to_row sanitization but defensive).
                     if let Some(def) = metric_def(&k) {
-                        let values: Vec<f64> = pairs.iter().map(|(v, _)| *v).collect();
-                        let weights: Vec<usize> = pairs.iter().map(|(_, w)| *w).collect();
-                        aggregate_samples(&values, Some(&weights), def.kind).map(|v| (k, v))
+                        aggregate_samples_weighted(&pairs, def.kind).map(|v| (k, v))
                     } else {
                         let n = pairs.len();
                         if n == 0 {
@@ -5154,21 +5177,21 @@ mod tests {
     #[test]
     fn aggregate_samples_counter_sums_finite_values() {
         assert_eq!(
-            aggregate_samples(&[1.0, 2.0, 3.0], None, MetricKind::Counter),
+            aggregate_samples(&[1.0, 2.0, 3.0], MetricKind::Counter),
             Some(6.0),
         );
         assert_eq!(
-            aggregate_samples(&[1.0, f64::NAN, 3.0], None, MetricKind::Counter),
+            aggregate_samples(&[1.0, f64::NAN, 3.0], MetricKind::Counter),
             Some(4.0),
             "NaN samples drop from the sum",
         );
         assert_eq!(
-            aggregate_samples(&[], None, MetricKind::Counter),
+            aggregate_samples(&[], MetricKind::Counter),
             None,
             "empty input → None",
         );
         assert_eq!(
-            aggregate_samples(&[f64::NAN, f64::INFINITY], None, MetricKind::Counter),
+            aggregate_samples(&[f64::NAN, f64::INFINITY], MetricKind::Counter),
             None,
             "all-non-finite → None",
         );
@@ -5177,33 +5200,33 @@ mod tests {
     /// `Gauge(Avg)` reduces by arithmetic mean.
     #[test]
     fn aggregate_samples_gauge_avg_means_finite() {
-        let r = aggregate_samples(&[1.0, 2.0, 3.0], None, MetricKind::Gauge(GaugeAgg::Avg));
+        let r = aggregate_samples(&[1.0, 2.0, 3.0], MetricKind::Gauge(GaugeAgg::Avg));
         assert_eq!(r, Some(2.0));
     }
 
     /// `Gauge(Last)` returns the last finite sample.
     #[test]
     fn aggregate_samples_gauge_last_returns_last() {
-        let r = aggregate_samples(&[1.0, 2.0, 3.0], None, MetricKind::Gauge(GaugeAgg::Last));
+        let r = aggregate_samples(&[1.0, 2.0, 3.0], MetricKind::Gauge(GaugeAgg::Last));
         assert_eq!(r, Some(3.0));
         // NaN at the tail still drops; Last picks the last FINITE.
-        let r = aggregate_samples(&[1.0, 2.0, f64::NAN], None, MetricKind::Gauge(GaugeAgg::Last));
+        let r = aggregate_samples(&[1.0, 2.0, f64::NAN], MetricKind::Gauge(GaugeAgg::Last));
         assert_eq!(r, Some(2.0));
     }
 
     /// `Gauge(Max)` and `Peak` both reduce by max.
     #[test]
     fn aggregate_samples_max_and_peak_pick_largest() {
-        let r = aggregate_samples(&[1.0, 5.0, 3.0], None, MetricKind::Gauge(GaugeAgg::Max));
+        let r = aggregate_samples(&[1.0, 5.0, 3.0], MetricKind::Gauge(GaugeAgg::Max));
         assert_eq!(r, Some(5.0));
-        let r = aggregate_samples(&[1.0, 5.0, 3.0], None, MetricKind::Peak);
+        let r = aggregate_samples(&[1.0, 5.0, 3.0], MetricKind::Peak);
         assert_eq!(r, Some(5.0));
     }
 
     /// `Timestamp` returns the last sample (latest snapshot).
     #[test]
     fn aggregate_samples_timestamp_returns_last() {
-        let r = aggregate_samples(&[100.0, 200.0, 300.0], None, MetricKind::Timestamp);
+        let r = aggregate_samples(&[100.0, 200.0, 300.0], MetricKind::Timestamp);
         assert_eq!(r, Some(300.0));
     }
 
@@ -5214,22 +5237,21 @@ mod tests {
     /// / 20 = 17.5 — a 50%-larger weight on the higher value
     /// pulls the mean above the unweighted midpoint of 15.
     #[test]
-    fn aggregate_samples_gauge_avg_weighted_pulls_toward_heavier_sample() {
-        let r = aggregate_samples(
-            &[10.0, 20.0],
-            Some(&[5, 15]),
+    fn aggregate_samples_weighted_gauge_avg_pulls_toward_heavier_sample() {
+        let r = aggregate_samples_weighted(
+            &[(10.0, 5), (20.0, 15)],
             MetricKind::Gauge(GaugeAgg::Avg),
         );
         assert_eq!(r, Some(17.5));
     }
 
-    /// `Gauge(Avg)` without weights computes the arithmetic mean
-    /// (legacy semantic). The previous test's same value vector
-    /// yields 15.0 here vs 17.5 weighted — the difference is the
-    /// cross-RUN bias [`feedback_metric_dedup_in_refactor`] flags.
+    /// `Gauge(Avg)` without weights (unweighted entry point)
+    /// computes the arithmetic mean (legacy semantic). The
+    /// previous test's same value vector yields 15.0 here vs
+    /// 17.5 weighted — the difference is the cross-RUN bias.
     #[test]
     fn aggregate_samples_gauge_avg_unweighted_is_arithmetic_mean() {
-        let r = aggregate_samples(&[10.0, 20.0], None, MetricKind::Gauge(GaugeAgg::Avg));
+        let r = aggregate_samples(&[10.0, 20.0], MetricKind::Gauge(GaugeAgg::Avg));
         assert_eq!(r, Some(15.0));
     }
 
@@ -5239,10 +5261,9 @@ mod tests {
     /// `crate::assert::merge_matched_phase_buckets` per
     /// single-source-of-truth.
     #[test]
-    fn aggregate_samples_gauge_avg_zero_total_weight_falls_back_to_mean() {
-        let r = aggregate_samples(
-            &[10.0, 30.0],
-            Some(&[0, 0]),
+    fn aggregate_samples_weighted_gauge_avg_zero_total_weight_falls_back_to_mean() {
+        let r = aggregate_samples_weighted(
+            &[(10.0, 0), (30.0, 0)],
             MetricKind::Gauge(GaugeAgg::Avg),
         );
         assert_eq!(r, Some(20.0));
@@ -5252,10 +5273,9 @@ mod tests {
     /// construction. Pinned so a future refactor that introduces
     /// weight-sensitive Counter semantics breaks here.
     #[test]
-    fn aggregate_samples_counter_ignores_weights() {
-        let r = aggregate_samples(
-            &[10.0, 20.0],
-            Some(&[5, 15]),
+    fn aggregate_samples_weighted_counter_ignores_weights() {
+        let r = aggregate_samples_weighted(
+            &[(10.0, 5), (20.0, 15)],
             MetricKind::Counter,
         );
         assert_eq!(r, Some(30.0));
@@ -5263,10 +5283,9 @@ mod tests {
 
     /// `Peak` ignores weights — max is weight-independent.
     #[test]
-    fn aggregate_samples_peak_ignores_weights() {
-        let r = aggregate_samples(
-            &[10.0, 20.0],
-            Some(&[5, 15]),
+    fn aggregate_samples_weighted_peak_ignores_weights() {
+        let r = aggregate_samples_weighted(
+            &[(10.0, 5), (20.0, 15)],
             MetricKind::Peak,
         );
         assert_eq!(r, Some(20.0));
@@ -5274,10 +5293,9 @@ mod tests {
 
     /// `Gauge(Max)` ignores weights — max is weight-independent.
     #[test]
-    fn aggregate_samples_gauge_max_ignores_weights() {
-        let r = aggregate_samples(
-            &[10.0, 20.0],
-            Some(&[5, 15]),
+    fn aggregate_samples_weighted_gauge_max_ignores_weights() {
+        let r = aggregate_samples_weighted(
+            &[(10.0, 5), (20.0, 15)],
             MetricKind::Gauge(GaugeAgg::Max),
         );
         assert_eq!(r, Some(20.0));
@@ -5286,49 +5304,30 @@ mod tests {
     /// `Gauge(Last)` and `Timestamp` ignore weights — last-finite
     /// is weight-independent.
     #[test]
-    fn aggregate_samples_gauge_last_and_timestamp_ignore_weights() {
-        let last = aggregate_samples(
-            &[10.0, 20.0],
-            Some(&[5, 15]),
+    fn aggregate_samples_weighted_gauge_last_and_timestamp_ignore_weights() {
+        let last = aggregate_samples_weighted(
+            &[(10.0, 5), (20.0, 15)],
             MetricKind::Gauge(GaugeAgg::Last),
         );
         assert_eq!(last, Some(20.0));
-        let ts = aggregate_samples(
-            &[10.0, 20.0],
-            Some(&[5, 15]),
+        let ts = aggregate_samples_weighted(
+            &[(10.0, 5), (20.0, 15)],
             MetricKind::Timestamp,
         );
         assert_eq!(ts, Some(20.0));
     }
 
-    /// NaN samples are dropped from the reduction WITH their
-    /// corresponding weights — filter-then-reindex would misalign
-    /// weights to the wrong values when NaNs land mid-vector.
-    /// Verifies the weighted mean only includes weights of finite
-    /// values: (10*5 + 30*20) / (5+20) = 650 / 25 = 26.0; if the
-    /// NaN's weight (10) were also counted in the denominator, the
-    /// result would be 650 / 35 ≈ 18.57.
+    /// NaN-valued pairs drop entirely (value AND weight) — the
+    /// (f64, usize) pair type keeps the weight bound to its
+    /// value so a NaN filter can't misalign weights to other
+    /// samples. (10*5 + 30*20) / (5+20) = 650 / 25 = 26.0.
     #[test]
-    fn aggregate_samples_gauge_avg_drops_nan_weights_in_lockstep() {
-        let r = aggregate_samples(
-            &[10.0, f64::NAN, 30.0],
-            Some(&[5, 10, 20]),
+    fn aggregate_samples_weighted_gauge_avg_drops_nan_pairs_in_lockstep() {
+        let r = aggregate_samples_weighted(
+            &[(10.0, 5), (f64::NAN, 10), (30.0, 20)],
             MetricKind::Gauge(GaugeAgg::Avg),
         );
         assert_eq!(r, Some(26.0));
-    }
-
-    /// Length mismatch between `samples` and `weights` is a
-    /// programmer error and panics — silent re-indexing would
-    /// produce subtly wrong means.
-    #[test]
-    #[should_panic(expected = "weights len")]
-    fn aggregate_samples_weights_length_mismatch_panics() {
-        let _ = aggregate_samples(
-            &[1.0, 2.0, 3.0],
-            Some(&[5, 10]),
-            MetricKind::Gauge(GaugeAgg::Avg),
-        );
     }
 
     // -- Per-phase reductions --------------------------------------
