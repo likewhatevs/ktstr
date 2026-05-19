@@ -3214,6 +3214,21 @@ fn kill_current_scheduler(op_label: &str) -> Result<libc::pid_t> {
     // returning, so the kill below is safe from the prior
     // monitor's pidfd race.
     crate::vmm::rust_init::stop_sched_exit_monitor();
+    // Pin the post-stop invariant for Restart+Replace dispatch
+    // sites: after `stop_sched_exit_monitor` returns, the slot
+    // MUST be empty so the subsequent spawn's
+    // `restart_sched_exit_monitor_with_log` call lands a fresh
+    // monitor without first stop+joining a stale handle. The
+    // `Op::AttachScheduler` site does NOT flow through here (no
+    // prior scheduler to kill); its possibly-non-empty entry is
+    // handled silently by `restart_sched_exit_monitor_with_log`'s
+    // defensive `take()`. debug-only — release builds rely on
+    // that defensive take() as the safety net.
+    debug_assert!(
+        crate::vmm::rust_init::sched_exit_monitor_slot_is_empty(),
+        "kill_current_scheduler did not clear sched_exit_monitor slot — \
+         stop_sched_exit_monitor() must precede the kill (called from {op_label})",
+    );
     // Trigger async scx_disable via sysrq-'S' so the kernel-side
     // disable cascade runs OUT OF BAND from the scheduler's exit
     // path. Without this, `bpf_scx_unreg`

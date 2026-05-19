@@ -155,6 +155,26 @@ pub(crate) fn stop_sched_exit_monitor() {
     }
 }
 
+/// Returns true iff no scheduler-exit monitor is currently installed.
+/// Used by the scenario-Op dispatch layer in `kill_current_scheduler`
+/// to `debug_assert!` that `stop_sched_exit_monitor` properly cleared
+/// the slot before the subsequent spawn restarts the monitor. The
+/// `Op::AttachScheduler` path legitimately bypasses the kill helper
+/// (no prior scheduler to stop) and the defensive `take()` in
+/// [`restart_sched_exit_monitor_with_log`] handles that path's
+/// possibly-non-empty entry — so the invariant is "after kill, slot
+/// is empty," not "always empty before restart." Briefly locks the
+/// slot mutex; release builds where the assertion is a no-op still
+/// pay the lock cost, which is negligible vs the surrounding
+/// procfs writes + signal delivery + polling the dispatch site is
+/// already doing.
+pub(crate) fn sched_exit_monitor_slot_is_empty() -> bool {
+    let Some(slot) = SCHED_EXIT_MONITOR_SLOT.get() else {
+        return true;
+    };
+    slot.lock().unwrap().is_none()
+}
+
 /// Spawn a fresh scheduler-exit monitor for the live SCHED_PID
 /// and install it into the slot. Op handler calls this AFTER the
 /// new scheduler is spawned and SCHED_PID is published, so the
