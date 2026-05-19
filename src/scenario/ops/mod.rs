@@ -4650,8 +4650,24 @@ mod tests {
         // libc::pid_t::MAX is above kernel PID_MAX_LIMIT, so
         // pidfd_open inside sleep_or_sched_died returns ESRCH
         // immediately. Same trick as scenario::process_alive's
-        // no-such-pid test.
+        // no-such-pid test. Publishes via the SCHED_PID atomic
+        // because the death-detection sites in apply_ops read
+        // `crate::vmm::rust_init::sched_pid()` live (swap-aware
+        // for Op::ReplaceScheduler) rather than the
+        // `ctx.sched_pid` snapshot.
         ctx.sched_pid = Some(libc::pid_t::MAX);
+        crate::vmm::rust_init::set_sched_pid(libc::pid_t::MAX);
+        // SCHED_PID is a process-global atomic — restore to 0 on
+        // exit so this test doesn't pollute the empty-pid contract
+        // of neighbor tests (e.g. apply_ops_detach_scheduler_bails_when_no_scheduler_attached)
+        // that read sched_pid() and expect None.
+        struct ResetSchedPid;
+        impl Drop for ResetSchedPid {
+            fn drop(&mut self) {
+                crate::vmm::rust_init::set_sched_pid(0);
+            }
+        }
+        let _reset = ResetSchedPid;
         let steps = vec![Step::new(
             vec![Op::set_cpuset("died_test", CpusetSpec::Llc(0))],
             HoldSpec::loop_at(Duration::from_millis(30)),
