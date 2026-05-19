@@ -3257,12 +3257,13 @@ fn kill_current_scheduler(op_label: &str) -> Result<libc::pid_t> {
 }
 
 /// Spawn helper shared by Attach / Restart / Replace arms.
-/// Calls `spawn_scheduler_from_paths` with the given paths; the
-/// helper itself stores SCHED_PID via the `set_sched_pid` setter on
-/// successful spawn (see `vmm::rust_init::spawn_scheduler_from_paths`'s
-/// SCHED_PID.store call site). Returns an actionable error when
-/// the binary file is missing from the staging tree (initramfs
-/// cpio-pack omission) rather than silently no-op'ing.
+/// Calls `try_spawn_scheduler` (the Result-returning variant) so
+/// the boot-path force_reboot semantics don't apply — a failed
+/// spawn / startup-died / not-attached surfaces as a typed
+/// `anyhow::Error` that bubbles up through `apply_ops` to fail
+/// the test cleanly instead of rebooting the VM. The helper
+/// stores SCHED_PID on successful spawn via the internal
+/// `SCHED_PID.store` call site in `try_spawn_scheduler`.
 fn spawn_scheduler_for_op(
     op_label: &str,
     binary_path: &str,
@@ -3270,18 +3271,22 @@ fn spawn_scheduler_for_op(
     log_path: &str,
     expected_scheduler_name: &str,
 ) -> Result<()> {
-    let (child, _log) =
-        crate::vmm::rust_init::spawn_scheduler_from_paths(binary_path, args_path, log_path, None);
-    if child.is_none() {
-        anyhow::bail!(
+    match crate::vmm::rust_init::try_spawn_scheduler(binary_path, args_path, log_path) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => anyhow::bail!(
             "{op_label}: scheduler binary for '{expected_scheduler_name}' is missing at \
              {binary_path}. The staging cpio pack at initramfs build time should have \
              materialised it via staged_scheduler_binary_path — check that \
              KtstrTestEntry.staged_schedulers contains the named entry and the host-side \
              resolve_staged_schedulers_strict found its binary."
-        );
+        ),
+        Err(e) => anyhow::bail!(
+            "{op_label}: scheduler '{expected_scheduler_name}' spawn failed: {e}. The boot \
+             path would force_reboot on this; the Op dispatch path surfaces it as a typed \
+             test-failure so the operator sees the specific failure mode (spawn vs \
+             startup-died vs not-attached) instead of a bare reboot signal."
+        ),
     }
-    Ok(())
 }
 
 /// Op::AttachScheduler dispatch. Spawns the named staged scheduler

@@ -2672,45 +2672,91 @@ pub(crate) fn start_scheduler(probe_drain: Option<ProbeDrain>) -> (Option<Child>
     spawn_scheduler_from_paths("/scheduler", "/sched_args", "/tmp/sched.log", probe_drain)
 }
 
-/// Spawn a scheduler binary at `binary_path`, reading its CLI argv
-/// from `args_path` (one whitespace-split tokenisation per line) and
-/// teeing its stdout/stderr into `log_path`. Returns the child
-/// process and the log path for downstream consumers (the file is
-/// dumped via the bulk data port on `StartupStatus::Died` and on
-/// the not-attached path).
+/// Failure modes for [`try_spawn_scheduler`]. Distinct variants
+/// per the three observable failure points in the spawn pipeline
+/// so callers can branch on the specific outcome — the boot path
+/// uniformly responds with dump + lifecycle + force_reboot, while
+/// the scheduler-lifecycle Op dispatch path surfaces each variant
+/// as an actionable test-failure diagnostic via the per-variant
+/// `Display` text.
+#[derive(Debug)]
+pub(crate) enum SpawnSchedulerError {
+    /// `Command::spawn` returned `Err` — fork/exec failed at the
+    /// kernel boundary (ENOMEM, EACCES on the binary, EAGAIN from
+    /// rlimit). Carries the underlying `io::Error` so the boot
+    /// path can synthesize a `SCHED_OUTPUT_START / END`-framed
+    /// log payload via `send_sched_log_text`.
+    SpawnFailed(std::io::Error),
+
+    /// `poll_startup` observed the process exit within the
+    /// liveness window — typical for a scheduler that crashes in
+    /// BPF prog load (verifier reject) or argv validation before
+    /// the bind to `/sys/kernel/sched_ext/root/ops` lands.
+    /// `log_path` is the file the spawn helper wrote
+    /// stdout+stderr into; callers use it for `dump_sched_output`.
+    StartupDied { log_path: String },
+
+    /// Process is alive past the liveness window but
+    /// `poll_scx_attached` did NOT observe the bind marker.
+    /// `reason` is one of `"timeout"` (attach poll exhausted) or
+    /// `"sched_ext sysfs absent"` (kernel lacks sched_ext). The
+    /// caller (boot path → `force_reboot`, Op path → bail) uses
+    /// `log_path` to surface the scheduler's own diagnostic
+    /// output.
+    NotAttached {
+        reason: &'static str,
+        log_path: String,
+    },
+}
+
+impl std::fmt::Display for SpawnSchedulerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SpawnFailed(e) => {
+                write!(f, "Command::spawn failed: {e}")
+            }
+            Self::StartupDied { log_path } => {
+                write!(
+                    f,
+                    "scheduler died during the liveness window \
+                     (log captured at {log_path})"
+                )
+            }
+            Self::NotAttached { reason, log_path } => {
+                write!(
+                    f,
+                    "scheduler alive but did not bind to sched_ext: \
+                     {reason} (log captured at {log_path})"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SpawnSchedulerError {}
+
+/// Pure spawn helper — runs the spawn → poll-startup → poll-attached
+/// pipeline and returns a `Result` so callers can choose how to
+/// handle each failure mode. The boot path uniformly responds with
+/// `dump_sched_output` + `send_lifecycle` + `force_reboot`; the
+/// scheduler-lifecycle Op dispatch surfaces each `Err` variant as
+/// a typed test-failure rather than rebooting the VM.
 ///
-/// `probe_drain` is consumed only on the failure paths; passing
-/// `None` is correct for mid-experiment swap callers that don't own
-/// the boot-time probe stack lifetime.
-///
-/// # Path contract
-///
-/// `binary_path` MUST exist when the call lands — the caller is
-/// expected to have verified existence (the boot wrapper relies on
-/// the same precondition: an absent `/scheduler` returns `(None,
-/// None)` via the inline existence probe). The function short-
-/// circuits on a missing binary so a boot launch without a packed
-/// scheduler doesn't crash; for the staged-Op dispatch path the
-/// guest's `staged_scheduler_binary_path()` helper guarantees the
-/// path exists ahead of the call.
-///
-/// `args_path` may be absent — a missing file produces an empty
-/// argv (same behaviour as the boot-time `/sched_args` defaulting
-/// to `String::new()` via `unwrap_or_default()`).
-///
-/// `log_path` is created (or truncated) at function entry. For the
-/// boot path this is `/tmp/sched.log`; mid-experiment Op dispatch
-/// should derive a per-scheduler path so successive swaps don't
-/// overwrite earlier output.
-#[tracing::instrument(skip(probe_drain), fields(binary = %binary_path))]
-pub(crate) fn spawn_scheduler_from_paths(
+/// `Ok(None)` means the binary file is missing — the caller decides
+/// whether that is a degenerate-but-acceptable state (boot path:
+/// no scheduler configured) or a hard error (Op dispatch:
+/// staging pipeline mis-packed). Per the [`SpawnSchedulerError`]
+/// doc, the three failure variants each carry the context the
+/// boot path needs (log_path for dump, io::Error for spawn
+/// failure) so the wrapper can preserve the prior boot-failure
+/// semantics without changes to host-side diagnostics.
+pub(crate) fn try_spawn_scheduler(
     binary_path: &str,
     args_path: &str,
     log_path: &str,
-    probe_drain: Option<ProbeDrain>,
-) -> (Option<Child>, Option<String>) {
+) -> Result<Option<(Child, String)>, SpawnSchedulerError> {
     if !Path::new(binary_path).exists() {
-        return (None, None);
+        return Ok(None);
     }
 
     let sched_args = fs::read_to_string(args_path)
@@ -2724,7 +2770,6 @@ pub(crate) fn spawn_scheduler_from_paths(
     };
 
     let log_file = fs::File::create(log_path).ok();
-
     let stdout = match log_file.as_ref().and_then(|f| f.try_clone().ok()) {
         Some(f) => Stdio::from(f),
         None => Stdio::null(),
@@ -2734,107 +2779,122 @@ pub(crate) fn spawn_scheduler_from_paths(
         None => Stdio::null(),
     };
 
-    // Build RUST_LOG for the scheduler: append libbpf noise suppression
-    // to whatever the guest already has. libbpf emits debug/info messages
-    // through the `log` crate via scx_utils::libbpf_logger; raising its
-    // threshold to warn keeps scheduler output readable.
+    // Build RUST_LOG for the scheduler: append libbpf noise
+    // suppression to whatever the guest already has. libbpf
+    // emits debug/info messages through the `log` crate via
+    // scx_utils::libbpf_logger; raising its threshold to warn
+    // keeps scheduler output readable.
     let sched_rust_log = match std::env::var("RUST_LOG") {
         Ok(existing) => format!("{existing},scx_utils::libbpf_logger=warn"),
         Err(_) => "info,scx_utils::libbpf_logger=warn".to_string(),
     };
 
-    let child = Command::new(binary_path)
+    let mut child = Command::new(binary_path)
         .args(&args)
         .env("RUST_LOG", &sched_rust_log)
         .stdout(stdout)
         .stderr(stderr)
-        .spawn();
+        .spawn()
+        .map_err(SpawnSchedulerError::SpawnFailed)?;
 
-    match child {
-        Ok(mut child) => {
-            // Publish the scheduler PID via the [`SCHED_PID`] atomic
-            // side channel — readers retrieve it through
-            // [`sched_pid`]. The previous implementation called
-            // `std::env::set_var("SCHED_PID", ...)` here, but the
-            // Phase A probe thread spawned earlier in
-            // `ktstr_guest_init` (`start_probe_phase_a`) is alive at
-            // this point, so mutating glibc's global `__environ`
-            // array races with the probe thread's potential
-            // `getenv`/`execve` traffic — documented UB on Linux.
-            // The atomic store is data-race-free and the published
-            // value reaches readers via the same `Acquire`/`Release`
-            // synchronisation the [`sched_pid`] reader uses.
-            //
-            // The `child.id()` value fits in `i32` because Linux pids
-            // are `pid_t` (signed 32-bit on every supported arch).
-            // `kernel.pid_max` is a 22-bit limit by default and the
-            // kernel never returns negative pids from `fork(2)`, so
-            // the cast is exact.
-            SCHED_PID.store(child.id() as i32, Ordering::Release);
+    // Publish the scheduler PID via the [`SCHED_PID`] atomic side
+    // channel — readers retrieve it through [`sched_pid`]. The
+    // previous implementation called `std::env::set_var("SCHED_PID",
+    // ...)` here, but the Phase A probe thread spawned earlier in
+    // `ktstr_guest_init` (`start_probe_phase_a`) is alive at this
+    // point, so mutating glibc's global `__environ` array races
+    // with the probe thread's potential `getenv`/`execve` traffic
+    // — documented UB on Linux. The atomic store is data-race-free
+    // and the published value reaches readers via the same
+    // `Acquire`/`Release` synchronisation the [`sched_pid`] reader
+    // uses.
+    //
+    // The `child.id()` value fits in `i32` because Linux pids are
+    // `pid_t` (signed 32-bit on every supported arch).
+    // `kernel.pid_max` is a 22-bit limit by default and the kernel
+    // never returns negative pids from `fork(2)`, so the cast is
+    // exact.
+    SCHED_PID.store(child.id() as i32, Ordering::Release);
 
-            match poll_startup(
-                &mut child,
+    match poll_startup(
+        &mut child,
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_secs(1),
+    ) {
+        StartupStatus::Died => Err(SpawnSchedulerError::StartupDied {
+            log_path: log_path.to_string(),
+        }),
+        StartupStatus::Alive => {
+            // Verify the scheduler actually BOUND to sched_ext —
+            // a scheduler process can be alive but stuck in its
+            // BPF init (verifier reject, ops mismatch), which
+            // would leave the test running against the default
+            // kernel scheduler without the host ever noticing.
+            // `root/ops` is the post-attach marker.
+            let status = poll_scx_attached(
                 std::time::Duration::from_millis(50),
-                std::time::Duration::from_secs(1),
-            ) {
-                StartupStatus::Died => {
-                    // Scheduler died during startup. Dump the
-                    // scheduler log via the bulk data port — the
-                    // SCHED_OUTPUT_START / SCHED_OUTPUT_END markers
-                    // travel verbatim inside the chunk bytes so
-                    // the host's `parse_sched_output` walker keeps
-                    // working unchanged.
-                    dump_sched_output(log_path);
-                    crate::vmm::guest_comms::send_lifecycle(
-                        crate::vmm::wire::LifecyclePhase::SchedulerDied,
-                        "",
-                    );
-                    crate::vmm::guest_comms::send_exit(1);
-                    // Drain the probe pipeline so PROBE_OUTPUT_END
-                    // hits COM2 before force_reboot rips the VM.
-                    // No-op when no probe stack was supplied.
-                    drain_probe_pipeline(probe_drain.as_ref());
-                    force_reboot();
-                }
-                StartupStatus::Alive => {
-                    // Still running after the liveness window. Now
-                    // verify the scheduler actually BOUND to sched_ext
-                    // — a scheduler process can be alive but stuck in
-                    // its BPF init (verifier reject, ops mismatch),
-                    // which would leave the test running against the
-                    // default kernel scheduler without the host ever
-                    // noticing. `root/ops` is the post-attach marker.
-                    let status = poll_scx_attached(
-                        std::time::Duration::from_millis(50),
-                        std::time::Duration::from_secs(3),
-                    );
-                    if !status.is_attached() {
-                        dump_sched_output(log_path);
-                        let reason = match status {
-                            ScxAttachStatus::Timeout => "timeout",
-                            ScxAttachStatus::SysfsAbsent => "sched_ext sysfs absent",
-                            ScxAttachStatus::Attached => unreachable!(),
-                        };
-                        crate::vmm::guest_comms::send_lifecycle(
-                            crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
-                            reason,
-                        );
-                        crate::vmm::guest_comms::send_exit(1);
-                        // Drain the probe pipeline before reboot —
-                        // see Died-arm comment.
-                        drain_probe_pipeline(probe_drain.as_ref());
-                        force_reboot();
-                    }
-                    (Some(child), Some(log_path.to_string()))
-                }
+                std::time::Duration::from_secs(3),
+            );
+            if !status.is_attached() {
+                let reason = match status {
+                    ScxAttachStatus::Timeout => "timeout",
+                    ScxAttachStatus::SysfsAbsent => "sched_ext sysfs absent",
+                    ScxAttachStatus::Attached => unreachable!(),
+                };
+                return Err(SpawnSchedulerError::NotAttached {
+                    reason,
+                    log_path: log_path.to_string(),
+                });
             }
+            Ok(Some((child, log_path.to_string())))
         }
-        Err(e) => {
+    }
+}
+
+/// Spawn a scheduler binary with BOOT failure semantics: on any
+/// failure mode reported by [`try_spawn_scheduler`], dump the
+/// scheduler log via the bulk data port, signal
+/// `LifecyclePhase::SchedulerDied` / `SchedulerNotAttached` over
+/// guest_comms, send an exit code, drain the probe pipeline, and
+/// call [`force_reboot`]. Used by the boot wrapper
+/// [`start_scheduler`] where a missing or broken scheduler is a
+/// terminal condition.
+///
+/// Mid-experiment scheduler-lifecycle Op dispatch should call
+/// [`try_spawn_scheduler`] directly and surface failures as
+/// typed test-failure diagnostics instead of rebooting the VM.
+///
+/// `Ok(None)` from `try_spawn_scheduler` (binary missing) returns
+/// `(None, None)` — preserves the prior contract where an absent
+/// `/scheduler` is "no scheduler configured" rather than a
+/// failure.
+///
+/// `probe_drain` is consumed only on the force_reboot paths; the
+/// Ok-success path leaves it for the caller to drop normally.
+///
+/// # Path contract
+///
+/// `binary_path` is checked for existence inline; an absent
+/// binary returns `(None, None)`. `args_path` may be absent (an
+/// empty file produces empty argv). `log_path` is created or
+/// truncated at function entry.
+#[tracing::instrument(skip(probe_drain), fields(binary = %binary_path))]
+pub(crate) fn spawn_scheduler_from_paths(
+    binary_path: &str,
+    args_path: &str,
+    log_path: &str,
+    probe_drain: Option<ProbeDrain>,
+) -> (Option<Child>, Option<String>) {
+    match try_spawn_scheduler(binary_path, args_path, log_path) {
+        Ok(None) => (None, None),
+        Ok(Some((child, log))) => (Some(child), Some(log)),
+        Err(SpawnSchedulerError::SpawnFailed(e)) => {
             tracing::error!(err = %e, "ktstr-init: spawn scheduler failed");
-            // Synthesize a minimal sched-log payload framed by the
-            // existing SCHED_OUTPUT_START/END markers so the host's
-            // `parse_sched_output` returns the spawn-failure
-            // diagnostic exactly as the prior COM2 path did.
+            // Synthesize a minimal sched-log payload framed by
+            // the existing SCHED_OUTPUT_START/END markers so the
+            // host's `parse_sched_output` returns the spawn-
+            // failure diagnostic exactly as the prior COM2 path
+            // did.
             crate::vmm::guest_comms::send_sched_log(crate::verifier::SCHED_OUTPUT_START.as_bytes());
             send_sched_log_text(&format!("failed to spawn: {e}"));
             crate::vmm::guest_comms::send_sched_log(crate::verifier::SCHED_OUTPUT_END.as_bytes());
@@ -2843,8 +2903,35 @@ pub(crate) fn spawn_scheduler_from_paths(
                 "",
             );
             crate::vmm::guest_comms::send_exit(1);
-            // Drain the probe pipeline before reboot — see
-            // Died-arm comment.
+            // Drain the probe pipeline before reboot so
+            // PROBE_OUTPUT_END hits COM2 ahead of force_reboot.
+            // No-op when no probe stack was supplied.
+            drain_probe_pipeline(probe_drain.as_ref());
+            force_reboot();
+        }
+        Err(SpawnSchedulerError::StartupDied { log_path }) => {
+            // Scheduler died during startup. Dump the scheduler
+            // log via the bulk data port — the
+            // SCHED_OUTPUT_START / SCHED_OUTPUT_END markers
+            // travel verbatim inside the chunk bytes so the
+            // host's `parse_sched_output` walker keeps working
+            // unchanged.
+            dump_sched_output(&log_path);
+            crate::vmm::guest_comms::send_lifecycle(
+                crate::vmm::wire::LifecyclePhase::SchedulerDied,
+                "",
+            );
+            crate::vmm::guest_comms::send_exit(1);
+            drain_probe_pipeline(probe_drain.as_ref());
+            force_reboot();
+        }
+        Err(SpawnSchedulerError::NotAttached { reason, log_path }) => {
+            dump_sched_output(&log_path);
+            crate::vmm::guest_comms::send_lifecycle(
+                crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
+                reason,
+            );
+            crate::vmm::guest_comms::send_exit(1);
             drain_probe_pipeline(probe_drain.as_ref());
             force_reboot();
         }
