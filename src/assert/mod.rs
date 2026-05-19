@@ -1998,6 +1998,71 @@ pub fn populate_run_ext_metrics(
     }
 }
 
+/// [`build_phase_buckets`] enriched with stimulus-event-derived
+/// per-phase `iteration_rate` so [`crate::timeline::Timeline::from_phase_buckets`]
+/// can render the per-phase throughput annotation without going
+/// through the legacy [`crate::timeline::Timeline::build`] path.
+///
+/// For each adjacent pair of stimulus events with
+/// `total_iterations: Some(_)`, the per-phase rate is
+/// `(later - earlier) / duration_s` where `duration_s` is the
+/// PhaseBucket window. Phases that don't overlap a stimulus pair
+/// keep their PhaseBucket.metrics map unchanged (no
+/// iteration_rate key). Per the unweighted-mean cross-RUN policy
+/// of [`crate::stats::aggregate_samples`] for `Gauge(Avg)` —
+/// iteration_rate is registered as `Gauge(Avg)` with
+/// `HigherBetter` polarity (more throughput is better) via the
+/// `iteration_rate` registry entry alongside the other Avg-kind
+/// metrics.
+///
+/// Live caller: `evaluate_vm_result` at `src/test_support/eval.rs`
+/// — has both the SampleSeries and the stimulus_events vec in scope.
+pub fn build_phase_buckets_with_stimulus(
+    samples: &crate::scenario::sample::SampleSeries,
+    stimulus_events: &[crate::timeline::StimulusEvent],
+) -> Vec<PhaseBucket> {
+    let mut buckets = build_phase_buckets(samples);
+    // Per-phase iteration_rate from stimulus event total_iterations
+    // deltas. Walk events pairwise; for each pair compute the
+    // rate; attribute to the bucket whose window contains the
+    // EARLIER event's timestamp (the rate is measured looking
+    // FORWARD from that event into the phase). Skip pairs where
+    // either side lacks total_iterations.
+    for w in stimulus_events.windows(2) {
+        let prev = &w[0];
+        let curr = &w[1];
+        let (Some(s), Some(e)) = (prev.total_iterations, curr.total_iterations) else {
+            continue;
+        };
+        if e <= s {
+            continue;
+        }
+        let duration_ms = curr.elapsed_ms.saturating_sub(prev.elapsed_ms);
+        if duration_ms == 0 {
+            continue;
+        }
+        let rate = (e - s) as f64 / (duration_ms as f64 / 1000.0);
+        // Find the bucket whose [start_ms, end_ms] window contains
+        // prev.elapsed_ms. Buckets are sorted by step_index per
+        // build_phase_buckets; multiple buckets could in principle
+        // contain the same timestamp (windows may overlap on
+        // boundary samples), so attribute to the FIRST match.
+        for bucket in buckets.iter_mut() {
+            if prev.elapsed_ms >= bucket.start_ms
+                && (bucket.start_ms == bucket.end_ms
+                    || prev.elapsed_ms <= bucket.end_ms)
+            {
+                bucket
+                    .metrics
+                    .entry("iteration_rate".to_string())
+                    .or_insert(rate);
+                break;
+            }
+        }
+    }
+    buckets
+}
+
 pub fn build_phase_buckets(samples: &crate::scenario::sample::SampleSeries) -> Vec<PhaseBucket> {
     // Borrowed per-tick monitor samples (None when no MonitorReport
     // was attached, e.g. host-only fixture tests). When present,

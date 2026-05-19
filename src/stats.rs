@@ -750,6 +750,27 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |r| Some(r.worst_wake_latency_cv),
     },
     MetricDef {
+        // Per-phase worker iterations per second, derived from
+        // adjacent stimulus events' `total_iterations` deltas via
+        // build_phase_buckets_with_stimulus. Higher-is-better
+        // (more throughput); Gauge(Avg) kind because the per-phase
+        // value is already a rate (no further temporal reduction
+        // needed within a phase — one value per phase). The
+        // registry entry exists so MetricDef::read on a
+        // GauntletRow.ext_metrics fallback surfaces it through
+        // cargo ktstr stats compare like any other metric, and so
+        // Timeline::from_phase_buckets reads it by the canonical
+        // name from PhaseBucket.metrics. No typed GauntletRow
+        // field; accessor is the ext_metrics fallback.
+        name: "iteration_rate",
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Avg),
+        default_abs: 1.0,
+        default_rel: 0.30,
+        display_unit: "iter/s",
+        accessor: |_| None,
+    },
+    MetricDef {
         name: "total_iterations",
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::Counter,

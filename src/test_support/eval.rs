@@ -1834,11 +1834,34 @@ fn evaluate_vm_result(
     topo: &Topology,
     repro_fn: &dyn Fn(&str) -> Option<String>,
 ) -> Result<AssertResult> {
-    // Build timeline from stimulus events + monitor samples.
-    let timeline = result
-        .monitor
-        .as_ref()
-        .map(|m| crate::timeline::Timeline::build(stimulus_events, &m.samples));
+    // Build phase buckets early so the failure-message timeline
+    // renderer can drive from the unified PhaseBucket source
+    // (Timeline::from_phase_buckets) rather than re-deriving phases
+    // from raw monitor samples (Timeline::build). The drain
+    // consumes the snapshot bridge; success-path consumers below
+    // read pre-built buckets + the cached SampleSeries instead of
+    // re-draining (the bridge is already empty after this point).
+    let drained_for_phases = result.snapshot_bridge.drain_ordered_with_stats();
+    let early_sample_series = crate::scenario::sample::SampleSeries::from_drained_typed(
+        drained_for_phases,
+        result.monitor.clone(),
+    );
+    let early_phase_buckets = crate::assert::build_phase_buckets_with_stimulus(
+        &early_sample_series,
+        stimulus_events,
+    );
+    // Build timeline from the pre-bucketed phases. None when no
+    // phases (single-phase scenarios with no periodic captures
+    // produce an empty vec) — matches the previous None behavior
+    // for monitor-less results.
+    let timeline = if early_phase_buckets.is_empty() {
+        None
+    } else {
+        Some(crate::timeline::Timeline::from_phase_buckets(
+            &early_phase_buckets,
+            &crate::timeline::TimelineContext::default(),
+        ))
+    };
 
     let sched_label = scheduler_label(&entry.scheduler.binary);
     let output = &result.output;
@@ -2239,12 +2262,15 @@ fn evaluate_vm_result(
         // because those tests instrument the framework rather
         // than depending on it. Within evaluate_vm_result the
         // drain is the final consumer.
-        let drained_for_phases = result.snapshot_bridge.drain_ordered_with_stats();
-        let sample_series_for_phases = crate::scenario::sample::SampleSeries::from_drained_typed(
-            drained_for_phases,
-            result.monitor.clone(),
-        );
-        check_result.stats.phases = crate::assert::build_phase_buckets(&sample_series_for_phases);
+        // Phase buckets were built at evaluate_vm_result entry
+        // (drain happened there) so the unified PhaseBucket source
+        // feeds both the failure-message Timeline render (via
+        // Timeline::from_phase_buckets up top) and the stamped
+        // ScenarioStats.phases below. Reuse the pre-built vec +
+        // SampleSeries rather than re-draining (the bridge was
+        // already consumed).
+        check_result.stats.phases = early_phase_buckets.clone();
+        let sample_series_for_phases = &early_sample_series;
         // Cross-RUN aggregate fill: for any METRICS entry with a
         // read_sample wire but no typed GauntletRow field, compute
         // the per-RUN aggregate from the same samples and write into
@@ -2254,7 +2280,7 @@ fn evaluate_vm_result(
         // the metric — a silent data drop. Skips keys already
         // populated as typed fields or by other producers.
         crate::assert::populate_run_ext_metrics(
-            &sample_series_for_phases,
+            sample_series_for_phases,
             &mut check_result.stats.ext_metrics,
         );
 

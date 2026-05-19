@@ -174,6 +174,17 @@ impl Timeline {
     /// coincide. We compute an offset to align them.
     ///
     /// Returns an empty timeline if either input is empty.
+    // `#[allow(dead_code)]`: the legacy Timeline::build path is
+    // superseded by Timeline::from_phase_buckets in production
+    // (evaluate_vm_result switched in this batch). Retained for
+    // the in-file tests at lines 824+ that pin compute_metrics
+    // behavior — those tests guard the legacy reduction's NaN /
+    // empty / single-phase / event-counter shapes, behavior that
+    // the from_phase_buckets path also relies on indirectly
+    // (PhaseBucket.metrics come from aggregate_samples_for_phase
+    // which mirrors compute_metrics' per-kind reductions). Deletion
+    // is a follow-up cleanup once the new path has soak time.
+    #[allow(dead_code)]
     pub fn build(stimulus_events: &[StimulusEvent], monitor_samples: &[MonitorSample]) -> Self {
         if stimulus_events.is_empty() || monitor_samples.is_empty() {
             return Self { phases: Vec::new() };
@@ -470,6 +481,7 @@ impl Timeline {
     /// | `stuck_count`           | `stall_count`           |
     /// | `total_fallback`        | `fallback_rate` (rate)  |
     /// | `total_keep_last`       | `keep_last_rate` (rate) |
+    /// | `iteration_rate`        | `iteration_rate`        |
     ///
     /// Rate fields (`fallback_rate`, `keep_last_rate`) are computed
     /// by dividing the bucket's reduced counter delta by the
@@ -477,10 +489,13 @@ impl Timeline {
     /// (`end_ms - start_ms / 1000.0`). When the window has zero
     /// duration (degenerate bucket) the rate stays `None`.
     ///
-    /// `iteration_rate` is the only PhaseMetrics field
-    /// from_phase_buckets cannot supply — it requires per-phase
-    /// iteration totals from stimulus events not attached to
-    /// PhaseBucket directly. Defaults to `None`.
+    /// Every PhaseMetrics field has a PhaseBucket source — but
+    /// `iteration_rate` only when build_phase_buckets_with_stimulus
+    /// (not the plain build_phase_buckets) produced the bucket.
+    /// `iteration_rate` requires stimulus events that the per-test
+    /// scenario produces; the plain bucket-builder used by some
+    /// tests doesn't have access to them. Defaults to `None` when
+    /// PhaseBucket.metrics has no `iteration_rate` key.
     ///
     /// `changes` (boundary degradation detection) IS computed
     /// here by diffing adjacent `PhaseMetrics` fields — same
@@ -633,7 +648,10 @@ fn phase_from_bucket(idx: usize, b: &crate::assert::PhaseBucket) -> Phase {
             .unwrap_or(0),
         fallback_rate: rate("total_fallback"),
         keep_last_rate: rate("total_keep_last"),
-        iteration_rate: None,
+        // iteration_rate is already a rate per-phase, not a
+        // counter-over-window — read it verbatim from the
+        // bucket map; do NOT divide by duration.
+        iteration_rate: b.metrics.get("iteration_rate").copied(),
     };
     let stimulus = if b.step_index == 0 {
         None
@@ -660,6 +678,7 @@ fn phase_from_bucket(idx: usize, b: &crate::assert::PhaseBucket) -> Phase {
 // Metric computation
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 fn compute_metrics(samples: &[&MonitorSample]) -> PhaseMetrics {
     if samples.is_empty() {
         return PhaseMetrics::default();
