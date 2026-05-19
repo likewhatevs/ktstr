@@ -331,9 +331,9 @@ pub(crate) enum KillSchedulerError {
 /// 50ms polling interval — matches the existing
 /// [`poll_startup`] cadence so the latency-vs-CPU tradeoff is
 /// consistent across the scheduler-lifecycle helpers. The
-/// post-SIGKILL grace is fixed at 200ms — SIGKILL produces an
-/// `exit_notify` cascade that typically completes in microseconds;
-/// a 200ms cap is a defense-in-depth ceiling, not an expected wait.
+/// post-SIGKILL grace is the module-level [`POST_SIGKILL_GRACE`]
+/// const (see that const's doc for the 200ms-vs-magic-number
+/// rationale).
 #[allow(dead_code)] // production callers (Op::*Scheduler dispatch) land in a follow-up substep
 pub(crate) fn kill_scheduler_process(
     pid: libc::pid_t,
@@ -359,7 +359,8 @@ pub(crate) fn kill_scheduler_process(
     // immediately observe procfs absence.
     let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
 
-    if poll_pid_gone(pid_u32, sigterm_grace) {
+    let interval = std::time::Duration::from_millis(50);
+    if poll_proc_pid_absent(pid_u32, interval, sigterm_grace) {
         return Ok(KillSchedulerOutcome::ExitedAfterSigterm);
     }
 
@@ -369,22 +370,39 @@ pub(crate) fn kill_scheduler_process(
     // scheduler binary was actively ignoring SIGTERM.
     let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
 
-    if poll_pid_gone(pid_u32, std::time::Duration::from_millis(200)) {
+    if poll_proc_pid_absent(pid_u32, interval, POST_SIGKILL_GRACE) {
         Ok(KillSchedulerOutcome::EscalatedToSigkill)
     } else {
         Err(KillSchedulerError::StillAliveAfterSigkill)
     }
 }
 
-/// Poll `/proc/{pid}` for absence up to `timeout`. Returns `true` if
-/// the pid's procfs entry disappears within the budget, `false`
-/// otherwise. Hardcoded 50ms cadence matches
-/// [`poll_startup`]'s pidfd fallback interval, so a scheduler-
-/// lifecycle helper and a startup-detection helper share the same
-/// latency-vs-CPU profile.
-#[allow(dead_code)] // see kill_scheduler_process — same substep-ordering bridge
-fn poll_pid_gone(pid: u32, timeout: std::time::Duration) -> bool {
-    let interval = std::time::Duration::from_millis(50);
+/// Post-SIGKILL grace inside [`kill_scheduler_process`]. SIGKILL
+/// produces an `exit_notify` cascade in the kernel that typically
+/// completes in microseconds; this cap is a defense-in-depth ceiling
+/// for kernel-side scheduling delay, not an expected wait. Carried
+/// as a module-level const so the value is greppable + paired with a
+/// single doc explaining why 200ms instead of left as a magic
+/// number in the call site.
+const POST_SIGKILL_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Poll `/proc/{pid}` for absence up to `timeout`, sleeping at the
+/// caller's `interval` cadence between checks. Returns `true` if the
+/// pid's procfs entry disappears within the budget, `false`
+/// otherwise.
+///
+/// Single source of truth for "wait until the kernel runs
+/// release_task for this pid": [`kill_scheduler_process`] uses it to
+/// observe SIGTERM / SIGKILL aftermath, and [`poll_startup`]'s
+/// pidfd-unavailable fallback uses it to observe early-death during
+/// scheduler launch. Both call sites need the same SIG_IGN-safe
+/// latency profile, so folding the loop here keeps a future EINTR
+/// or signal-pause refinement applied uniformly.
+fn poll_proc_pid_absent(
+    pid: u32,
+    interval: std::time::Duration,
+    timeout: std::time::Duration,
+) -> bool {
     let start = std::time::Instant::now();
     loop {
         if !proc_pid_alive(pid) {
@@ -2475,24 +2493,19 @@ fn poll_startup(
     let pidfd =
         unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_int, 0u32) as libc::c_int };
     if pidfd < 0 {
-        // pidfd_open unsupported on this kernel. `proc_pid_alive`
-        // is the SIG_IGN-safe fallback: the procfs entry vanishes
-        // when the kernel runs `release_task` on the child,
-        // regardless of how SIGCHLD is handled. Sleep-poll at the
-        // caller's `interval` cadence until the deadline elapses;
-        // the upper bound on detection latency is one `interval`.
-        let start = std::time::Instant::now();
-        loop {
-            if !proc_pid_alive(pid) {
-                return StartupStatus::Died;
-            }
-            let now = std::time::Instant::now();
-            if now >= start + timeout {
-                return StartupStatus::Alive;
-            }
-            let remaining = (start + timeout) - now;
-            std::thread::sleep(remaining.min(interval));
-        }
+        // pidfd_open unsupported on this kernel. Procfs polling is
+        // the SIG_IGN-safe fallback: the procfs entry vanishes when
+        // the kernel runs `release_task` on the child, regardless
+        // of how SIGCHLD is handled. The shared
+        // [`poll_proc_pid_absent`] helper carries the loop body so
+        // any future EINTR / signal-pause refinement applies
+        // uniformly here and in [`kill_scheduler_process`]'s
+        // SIGTERM/SIGKILL aftermath polls.
+        return if poll_proc_pid_absent(pid, interval, timeout) {
+            StartupStatus::Died
+        } else {
+            StartupStatus::Alive
+        };
     }
     let start = std::time::Instant::now();
     let result = loop {
