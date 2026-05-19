@@ -31,6 +31,19 @@ use ktstr::test_support::{Scheduler, SchedulerSpec};
 const KTSTR_SCHED: Scheduler =
     Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
+/// Scheduler variant with `cgroup_parent` set. The framework's
+/// `cgroup_parent` slot controls the cgroup-root path used by the
+/// guest CgroupManager and must NOT auto-inject
+/// `--cell-parent-cgroup` into the scheduler's argv — the
+/// `periodic_capture_with_cgroup_parent_e2e` test locks in that
+/// the periodic-capture pipeline still fires when this slot is
+/// populated (the prior auto-inject forced cell-aware schedulers
+/// into userspace_managed_cell_mode and silently 0-fired the
+/// pipeline).
+const KTSTR_SCHED_WITH_CGPAR: Scheduler = Scheduler::named("ktstr_sched_with_cgpar")
+    .binary(SchedulerSpec::Discover("scx-ktstr"))
+    .cgroup_parent("/ktstr_periodic");
+
 /// Host-side check: every periodic capture stored on the bridge
 /// has the expected tag shape, ordering, and non-empty content
 /// (when not a placeholder).
@@ -134,3 +147,82 @@ fn periodic_capture_three_boundaries(ctx: &ktstr::scenario::Ctx) -> Result<Asser
     result.note("10s workload with num_snapshots=3 finished");
     Ok(result)
 }
+
+/// Host-side check that asserts the periodic-capture pipeline
+/// fires at least once with a real capture (non-placeholder), and
+/// that the bridge holds exactly `periodic_fired` entries. Same
+/// rigour as `assert_periodic_captures` but parameterized on the
+/// configured `num_snapshots` so multiple `#[ktstr_test]` entries
+/// can share the verifier.
+fn assert_at_least_one_real_capture(
+    result: &VmResult,
+    expected_target: u32,
+) -> Result<()> {
+    anyhow::ensure!(
+        result.periodic_target == expected_target,
+        "periodic_target must mirror num_snapshots = {}, got {}",
+        expected_target,
+        result.periodic_target,
+    );
+    anyhow::ensure!(
+        result.periodic_fired >= 1,
+        "periodic_fired must be at least 1, got {} of {}",
+        result.periodic_fired,
+        result.periodic_target,
+    );
+    let captured = result.snapshot_bridge.drain_ordered();
+    let periodic_entries: Vec<_> = captured
+        .iter()
+        .filter(|(tag, _)| tag.starts_with("periodic_"))
+        .collect();
+    anyhow::ensure!(
+        periodic_entries.len() == result.periodic_fired as usize,
+        "bridge has {} periodic_* entries but periodic_fired = {}",
+        periodic_entries.len(),
+        result.periodic_fired,
+    );
+    let real_captures = periodic_entries
+        .iter()
+        .filter(|(_, report)| !report.maps.is_empty())
+        .count();
+    anyhow::ensure!(
+        real_captures >= 1,
+        "every periodic entry on the bridge is a placeholder (empty .maps) — \
+         the freeze coordinator never produced a real capture"
+    );
+    Ok(())
+}
+
+fn assert_cgroup_parent_captures(result: &VmResult) -> Result<()> {
+    assert_at_least_one_real_capture(result, 2)
+}
+
+/// `cgroup_parent` set on the scheduler must NOT block the
+/// periodic-capture pipeline. Locks in the decoupling: the prior
+/// auto-inject of `--cell-parent-cgroup` from `cgroup_parent`
+/// switched cell-aware schedulers into userspace_managed_cell_mode
+/// and silently 0-fired the pipeline; with the decoupling in
+/// `runtime::append_base_sched_args`'s `Absent` branch, the
+/// scheduler's argv stays clean and the framework's periodic-
+/// capture loop still gets real captures.
+#[ktstr_test(
+    scheduler = KTSTR_SCHED_WITH_CGPAR,
+    duration_s = 6,
+    watchdog_timeout_s = 12,
+    num_snapshots = 2,
+    auto_repro = false,
+    post_vm = assert_cgroup_parent_captures,
+)]
+fn periodic_capture_with_cgroup_parent_e2e(
+    ctx: &ktstr::scenario::Ctx,
+) -> Result<AssertResult> {
+    let steps = vec![Step {
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
+        ops: vec![],
+        hold: HoldSpec::FULL,
+    }];
+    let mut result = execute_steps(ctx, steps)?;
+    result.note("6s workload with cgroup_parent set + num_snapshots=2 finished");
+    Ok(result)
+}
+
