@@ -631,27 +631,34 @@ fn resolve_per_cpu_field_pa(
     // above for the publisher chain + nokaslr semantics.
     let per_cpu_kva =
         crate::monitor::symbols::per_cpu_kva(template_kva, kaslr_offset, per_cpu_offset);
-    // Step 4 F hardening (audit #89): reject a per-CPU KVA that fell
-    // outside ANY plausible kernel-half — a wrapping_add overflow
-    // (template_kva + kaslr_offset + per_cpu_offset wrapping past
-    // u64::MAX) OR a wildly wrong template_kva (broken symtab) lands
-    // here. Without this guard, the wrong KVA could translate to a
-    // valid-but-wrong guest page and produce silent garbage; with it,
-    // the typed reply error surfaces the failure loud.
+    // Reject a per-CPU KVA that fell outside the kernel half — a
+    // wrapping_add overflow (template_kva + kaslr_offset +
+    // per_cpu_offset wrapping past u64::MAX) OR a wildly wrong
+    // template_kva (broken symtab) lands here. Without this guard,
+    // the wrong KVA could translate to a valid-but-wrong guest page
+    // and produce silent garbage; with it, the typed reply error
+    // surfaces the failure loud.
     //
-    // Threshold: 0xffff_0000_0000_0000 — the LOWER of x86_64's
-    // canonical-half boundary (0xffff_8000_0000_0000) and aarch64's
-    // VA_BITS=48 PAGE_OFFSET (0xffff_0000_0000_0000 per
-    // arch/arm64/include/asm/memory.h:43-45). Cross-arch safe: catches
-    // arithmetic wrap (low addresses) and broken-template low-half
-    // pollution on both x86_64 (slightly looser than strict
-    // canonical-half but still ~2^63-1 worth of rejection space) and
-    // aarch64 (exact PAGE_OFFSET floor).
-    const KERNEL_HALF_FLOOR_CROSS_ARCH: u64 = 0xffff_0000_0000_0000;
-    if per_cpu_kva < KERNEL_HALF_FLOOR_CROSS_ARCH {
+    // Floor: the kernel's own `page_offset` — every per-CPU area
+    // (first chunk in the direct mapping, subsequent chunks in
+    // vmalloc) lives at or above this address, so any value below
+    // it is a wrap or broken-template artifact. The kernel publishes
+    // its runtime `PAGE_OFFSET` through `kernel.walk_context()` (the
+    // monitor reads it from `init_mm.pgd`'s neighborhood at boot),
+    // which means the floor adapts to whichever paging mode the
+    // guest booted with:
+    //   - x86_64 4-level: 0xffff_8880_0000_0000
+    //   - x86_64 5-level: 0xff11_0000_0000_0000
+    //   - aarch64 VA_BITS=48: 0xffff_0000_0000_0000
+    //   - aarch64 VA_BITS=52: 0xfff0_0000_0000_0000
+    // A hardcoded 0xffff_0000_0000_0000 would incorrectly reject
+    // valid 5-level x86_64 direct-mapping addresses (where per-CPU
+    // areas land below the 4-level threshold).
+    let kernel_half_floor = kernel.walk_context().page_offset;
+    if per_cpu_kva < kernel_half_floor {
         return Err(format!(
             "PerCpuField {symbol}.{field}[cpu={cpu}]: per_cpu_kva={per_cpu_kva:#x} \
-             outside kernel-half (< 0xffff_0000_0000_0000) — arithmetic wrap \
+             below kernel page_offset ({kernel_half_floor:#x}) — arithmetic wrap \
              or broken template KVA \
              (template={template_kva:#x} + kaslr={kaslr_offset:#x} + \
              per_cpu_off={per_cpu_offset:#x})"
