@@ -513,3 +513,87 @@ latency, and migration ratio. Counters (`total_workers`, `total_cpus`,
 
 For examples of overriding thresholds at the scheduler and per-test
 level, see [Customize Checking](../recipes/custom-checking.md).
+
+## Phase-aware checks
+
+A scenario built from a `vec![Step, Step, ...]` runs each Step in
+sequence with the framework publishing the active phase as the
+test progresses. Captures fired during a Step (periodic samples,
+`Op::WatchSnapshot` trips, on-demand `Op::CaptureSnapshot` calls)
+stamp with the phase active at capture time, and assertions
+constructed under a Step's hold auto-stamp with the matching
+phase label.
+
+### Encoding
+
+Phases use a 1-indexed convention so the pre-first-Step settle
+window owns the unambiguous `0` slot:
+
+- `Phase::BASELINE` (inner `u16` = `0`) — settle window before
+  Step 0 starts. Captures fired during this window (boot, scheduler
+  attach, pre-Step warmup) land here.
+- `Phase::step(k)` — the `k`-th scenario Step (0-indexed in the
+  scenario `vec`, 1-indexed in the inner `u16`). `Phase::step(0)`
+  is the first Step, `Phase::step(1)` is the second, etc.
+
+Labels render as `"BASELINE"` and `"Step[k]"` (the 0-indexed Step
+number embedded in brackets) across the structured sidecar JSON,
+the formatted timeline diagnostic, and the per-assertion
+`detail.phase` field, so the same identifier appears wherever the
+operator looks.
+
+### Looking up phase metrics on `ScenarioStats`
+
+```rust,ignore
+// Phase-aware accessor by 1-indexed encoded value.
+let baseline = r.stats.phase(0).expect("BASELINE always populated");
+
+// Scenario-side 0-indexed Step accessor (preferred for the
+// "I want metrics for the k-th Step I wrote" case).
+let step_0 = r.stats.step(0).expect("Step 0 ran");
+let step_1 = r.stats.step(1).expect("Step 1 ran");
+
+// Single-metric shortcut.
+let throughput = r.stats.step_metric(0, "throughput");
+
+// Gate on "scenario advanced past BASELINE" before assuming any
+// Step-phase bucket exists — a scenario that bailed in setup or
+// declared zero Steps returns None from every step()/step_metric()
+// lookup and the test either panics on .expect(...) or passes
+// vacuously.
+anyhow::ensure!(
+    r.stats.has_steps(),
+    "scenario produced no Step phases — declare a Step or use \
+     stats.phase(0) for BASELINE",
+);
+```
+
+### `bucket.expect_metric` for actionable failures
+
+`PhaseBucket::expect_metric` panics with a diagnostic naming the
+bucket's `step_index`, `label`, `sample_count`, and the set of
+metric keys actually present — the operator can distinguish
+"phase carried 0 samples" (`sample_count == 0`) from "metric name
+typo" (positive `sample_count` but the key isn't in `metrics`)
+without re-reading the bucket by hand:
+
+```rust,ignore
+let bucket = r.stats.step(0).expect("Step 0 phase bucket");
+let throughput = bucket.expect_metric("throughput");
+```
+
+### Auto-stamped assertion phase
+
+Every `AssertDetail` / `PassDetail` / `InfoNote` constructed
+inside a Step's hold auto-stamps its `phase` field with that
+Step's label. The structured sidecar entry the operator inspects
+post-run reads `detail.phase: "Step[k]"` for failures inside
+Step `k`, `detail.phase: "BASELINE"` for failures during the
+settle window. Explicit overrides chain via the existing
+`.with_phase("custom_label")` builder when the auto-stamp is
+not appropriate (typically only in synthetic test fixtures).
+
+The wire format on `step_index` u16 fields is unchanged across
+this surface — `Phase` is `#[serde(transparent)]` over `u16`, so
+sidecar JSON / typeshare consumers see the same scalar field
+they saw before the typed wrapper landed.
