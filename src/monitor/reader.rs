@@ -91,8 +91,8 @@ pub(crate) struct WalkContext {
 /// where each task enrichment performs dozens of translates per
 /// task.
 ///
-/// Construction goes through [`Self::from_tcr_el1`], which returns
-/// `None` for the same configurations [`GuestMem::walk_aarch64`]
+/// Construction goes through `Aarch64WalkParams::from_tcr_el1`, which returns
+/// `None` for the same configurations `GuestMem::walk_aarch64`
 /// would reject mid-walk: `tcr_el1 == 0`, `T1SZ == 0`, reserved
 /// `TG1 == 0b00`, `va_width < 4`, or `levels_below` outside `[1, 4]`.
 /// On x86_64 the struct is unused (the walker ignores TCR_EL1) and
@@ -121,22 +121,22 @@ pub(crate) struct Aarch64WalkParams {
     /// Index mask for every subsequent level: `(1 << (stride+3)) - 1`.
     pub indexmask_grainsize: u64,
     /// Descriptor address mask: `((1 << 50) - 1) & !indexmask_grainsize`.
-    /// Strips the high attribute / SW bits at [63:50] and the low
-    /// granule bits, preserving the low OA bits [49:granule_log2].
+    /// Strips the high attribute / SW bits at \[63:50\] and the low
+    /// granule bits, preserving the low OA bits \[49:granule_log2\].
     /// Mirrors the kernel's `PTE_ADDR_LOW` from
     /// `arch/arm64/include/asm/pgtable-hwdef.h`
     /// (`((1 << (50 - PAGE_SHIFT)) - 1) << PAGE_SHIFT`).
     ///
-    /// On non-LPA / non-LPA2 kernels bits [49:48] are RES0 by
+    /// On non-LPA / non-LPA2 kernels bits \[49:48\] are RES0 by
     /// hardware contract (Arm ARM D5.3), so the wider mask is
     /// equivalent to a 48-bit mask in practice. The wider mask
     /// matches the kernel's accessor for forward-compatibility:
     /// FEAT_LPA on 64 KiB pages (which ktstr.kconfig leaves
-    /// disabled) places OA bits [49:48] in this region, and only
-    /// the high splice (bits [51:48] of OA in descriptor bits
-    /// [15:12]) is then missing. FEAT_LPA2 (TCR_EL1.DS=1) is
-    /// rejected by [`Self::from_tcr_el1`] because its OA encoding
-    /// also requires a separate splice from descriptor bits [9:8].
+    /// disabled) places OA bits \[49:48\] in this region, and only
+    /// the high splice (bits \[51:48\] of OA in descriptor bits
+    /// \[15:12\]) is then missing. FEAT_LPA2 (TCR_EL1.DS=1) is
+    /// rejected by `Aarch64WalkParams::from_tcr_el1` because its OA encoding
+    /// also requires a separate splice from descriptor bits \[9:8\].
     pub descaddrmask: u64,
 }
 
@@ -568,7 +568,7 @@ impl GuestMem {
     }
 
     /// Write `N` volatile bytes to `ptr`. Mirror of
-    /// [`read_volatile_bytes`] for the store path, including the
+    /// `read_volatile_bytes` for the store path, including the
     /// width-aligned fast paths.
     ///
     /// # Safety
@@ -781,7 +781,7 @@ impl GuestMem {
     /// the read path ([`Self::read_bytes`] callers add `offset` to
     /// `pa` themselves), and `checked_add` here rejects callers
     /// whose `pa + offset` would wrap. The current production caller
-    /// ([`super::bpf_map::write_bpf_map_value`] via [`super::bpf_map::chunked_kva_io`])
+    /// (`super::bpf_map::write_bpf_map_value` via `super::bpf_map::chunked_kva_io`)
     /// passes `offset=0` because the chunked walker already returns
     /// per-page PAs; future callers that already hold a base PA and
     /// want to splice in a field offset can pass non-zero without

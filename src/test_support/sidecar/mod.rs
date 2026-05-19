@@ -496,7 +496,7 @@ impl SidecarResult {
 ///
 /// Single source of truth for "is this file a sidecar?" — used
 /// by [`collect_sidecars_with_errors`]'s parsing walker and by
-/// [`crate::cli::count_sidecar_files`]'s file-count walker. Both
+/// `crate::cli::count_sidecar_files`'s file-count walker. Both
 /// walkers MUST agree on the predicate so `walked` (count) and
 /// `valid + errors` (parse outcomes) reconcile against each
 /// other; a divergence would let a file count toward `walked`
@@ -523,7 +523,7 @@ pub(crate) fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
 
 /// Per-file parse-failure record returned by
 /// [`collect_sidecars_with_errors`] and threaded through
-/// [`crate::cli::WalkStats::errors`] to the renderers.
+/// `crate::cli::WalkStats::errors` to the renderers.
 ///
 /// Named-field struct (rather than a `(PathBuf, String,
 /// Option<String>)` tuple) so call sites read fields by name —
@@ -548,7 +548,7 @@ pub(crate) struct SidecarParseError {
 
 /// Per-file IO-failure record returned by
 /// [`collect_sidecars_with_errors`] and threaded through
-/// [`crate::cli::WalkStats::io_errors`] to the renderers.
+/// `crate::cli::WalkStats::io_errors` to the renderers.
 ///
 /// Captures files where the filename predicate matched but
 /// `std::fs::read_to_string` failed before parsing could begin —
@@ -568,7 +568,7 @@ pub(crate) struct SidecarIoError {
     pub path: std::path::PathBuf,
     /// Verbatim `std::io::Error` Display string. Surfaced through
     /// the JSON channel as the `error` key on
-    /// [`crate::cli::WalkIoError`] entries and through the text
+    /// `crate::cli::WalkIoError` entries and through the text
     /// channel as the `error: ...` line under the `io errors`
     /// trailing block.
     pub raw_error: String,
@@ -1172,7 +1172,7 @@ pub fn newest_run_dir() -> Option<PathBuf> {
 ///
 /// Routes through [`crate::ktstr_kernel_env`] for the raw env value
 /// and [`crate::kernel_path::KernelId`] for variant dispatch so the
-/// three [`KernelId`] variants are honoured symmetrically:
+/// three [`crate::kernel_path::KernelId`] variants are honoured symmetrically:
 ///
 /// - `KernelId::Path(dir)`: read `metadata.json` (cache entry
 ///   layout) or `include/config/kernel.release` (source tree
@@ -1772,7 +1772,7 @@ fn resolve_kernel_source_dir() -> Option<std::path::PathBuf> {
 /// would race other tests reading `KTSTR_KERNEL` /
 /// `KTSTR_CACHE_DIR`).
 ///
-/// Lookup order for [`KernelId::Version`]:
+/// Lookup order for [`crate::kernel_path::KernelId::Version`]:
 /// 1. Tarball-shaped cache key (`{ver}-tarball-{arch}-kc{suffix}`),
 ///    direct lookup. Returns `Some` only if the entry is a
 ///    `KernelSource::Local` carrying a `source_tree_path`.
@@ -1790,7 +1790,7 @@ fn resolve_kernel_source_dir() -> Option<std::path::PathBuf> {
 /// (deleted by the cache pipeline after build), so probing them
 /// for a `kernel_commit` would always fail.
 ///
-/// For [`KernelId::CacheKey`], performs a single direct lookup —
+/// For [`crate::kernel_path::KernelId::CacheKey`], performs a single direct lookup —
 /// the cache key already encodes every detail (source-type
 /// prefix, arch, kconfig hash) so no fallback scan is needed.
 fn resolve_kernel_source_dir_with_cache(

@@ -100,7 +100,7 @@ pub struct PayloadRun<'a> {
     /// Effective check list. Initialized to `payload.default_checks`;
     /// `.check` appends, `.clear_checks` truncates.
     checks: Vec<MetricCheck>,
-    /// User-supplied relative cgroup name (from [`in_cgroup`]). The
+    /// User-supplied relative cgroup name (from the `in_cgroup` arg). The
     /// absolute path is resolved + validated at `.run()`/`.spawn()`.
     /// [`Cow`] keeps static-name callers zero-alloc while still
     /// accepting owned Strings from dynamic call sites.
@@ -336,10 +336,10 @@ fn payload_binary(payload: &Payload) -> Result<&'static str> {
 ///
 /// 1. Skips [`extract_metrics`] entirely — no model dispatch reaches
 ///    any guest call graph.
-/// 2. Emits a [`MSG_TYPE_RAW_PAYLOAD_OUTPUT`](crate::vmm::wire::MSG_TYPE_RAW_PAYLOAD_OUTPUT)
+/// 2. Emits a `MSG_TYPE_RAW_PAYLOAD_OUTPUT`(crate::vmm::wire::MSG_TYPE_RAW_PAYLOAD_OUTPUT)
 ///    SHM message carrying both raw stdout and stderr plus the
 ///    payload's hint and exit code.
-/// 3. Emits a paired [`MSG_TYPE_PAYLOAD_METRICS`] SHM message with
+/// 3. Emits a paired `MSG_TYPE_PAYLOAD_METRICS` SHM message with
 ///    `metrics: vec![]` so per-invocation ordering still aligns with
 ///    sidecar entries.
 /// 4. Evaluates `MetricCheck::ExitCodeEq` checks guest-side and returns
@@ -348,8 +348,8 @@ fn payload_binary(payload: &Payload) -> Result<&'static str> {
 ///    Metric-level checks (`Min`/`Max`/`Range`/`Exists`) cannot be
 ///    evaluated guest-side and hard-assert. The authoritative
 ///    metric verdict is computed host-side post-VM-exit by
-///    [`crate::test_support::eval`] after running
-///    [`crate::test_support::model::extract_via_llm`] on the
+///    `crate::test_support::eval` after running
+///    `crate::test_support::model::extract_via_llm` on the
 ///    captured text and applying the universal LlmExtract invariants
 ///    + the payload's `default_checks`.
 ///
@@ -434,7 +434,7 @@ fn evaluate(
 
 /// Emit a [`PayloadMetrics`] on the guest-to-host bulk data channel
 /// (virtio-console port 1) under
-/// [`MSG_TYPE_PAYLOAD_METRICS`](crate::vmm::wire::MSG_TYPE_PAYLOAD_METRICS).
+/// `MSG_TYPE_PAYLOAD_METRICS`(crate::vmm::wire::MSG_TYPE_PAYLOAD_METRICS).
 ///
 /// The encoding (postcard v1) and the bulk-port fire-and-forget
 /// semantics live inside
@@ -447,9 +447,9 @@ fn emit_payload_metrics(pm: &PayloadMetrics) {
     crate::vmm::guest_comms::send_payload_metrics(pm);
 }
 
-/// Emit a [`RawPayloadOutput`] on the guest-to-host bulk data
+/// Emit a `RawPayloadOutput` on the guest-to-host bulk data
 /// channel (virtio-console port 1) under
-/// [`MSG_TYPE_RAW_PAYLOAD_OUTPUT`](crate::vmm::wire::MSG_TYPE_RAW_PAYLOAD_OUTPUT).
+/// `MSG_TYPE_RAW_PAYLOAD_OUTPUT`(crate::vmm::wire::MSG_TYPE_RAW_PAYLOAD_OUTPUT).
 ///
 /// Mirrors [`emit_payload_metrics`]'s shape — postcard encoding and
 /// backpressure live inside the typed sender.
@@ -465,16 +465,16 @@ fn emit_raw_payload_output(raw: &crate::test_support::RawPayloadOutput) {
 /// the test VM's RAM budget and the cache lives on the host. The
 /// host's `eval.rs` post-VM-exit pipeline drains the SHM ring,
 /// matches `payload_index` between the
-/// [`MSG_TYPE_RAW_PAYLOAD_OUTPUT`] and [`MSG_TYPE_PAYLOAD_METRICS`]
+/// `MSG_TYPE_RAW_PAYLOAD_OUTPUT` and `MSG_TYPE_PAYLOAD_METRICS`
 /// messages emitted by this invocation, runs
-/// [`crate::test_support::model::extract_via_llm`] stdout-primary
+/// `crate::test_support::model::extract_via_llm` stdout-primary
 /// with a stderr-fallback retry, and replaces the empty `metrics`
 /// vec on the matched [`PayloadMetrics`](crate::test_support::PayloadMetrics) slot with the extracted
 /// result before the sidecar write.
 ///
 /// Both messages emitted from this invocation carry the SAME
 /// `payload_index` allocated below from the per-process counter —
-/// the host's [`HashMap<payload_index, vec position>`] pairing is
+/// the host's `HashMap<payload_index, vec position>` pairing is
 /// independent of SHM emission order or interleaving. Raw-output is
 /// still emitted FIRST, then the empty payload-metrics, so a reader
 /// scanning the SHM ring in order sees the pair adjacent; that
@@ -493,7 +493,7 @@ fn emit_raw_payload_output(raw: &crate::test_support::RawPayloadOutput) {
 /// Polarity / unit classification: `metric_hints` carries the
 /// payload's `metrics: &[MetricHint]` slice in owned-strings form
 /// ([`crate::test_support::WireMetricHint`]) so the host's
-/// [`crate::test_support::eval`] post-VM-exit pipeline can call
+/// `crate::test_support::eval` post-VM-exit pipeline can call
 /// [`resolve_polarities_owned`] against the host-extracted
 /// [`Metric`] set. The guest's `&'static [MetricHint]` cannot
 /// round-trip through SHM, so the conversion happens here at the
@@ -1023,7 +1023,7 @@ fn kill_payload_process_group(
 /// Resolve each extracted metric's polarity + unit against the
 /// payload's declared `metrics` hints.
 ///
-/// Unhinted metrics keep [`Polarity::Unknown`] and empty unit.
+/// Unhinted metrics keep [`crate::test_support::Polarity::Unknown`] and empty unit.
 ///
 /// Complexity: O(N + M) — build a `HashMap<&str, &MetricHint>` from
 /// the hint slice once, then look up each metric by name in O(1).
@@ -1050,7 +1050,7 @@ fn resolve_polarities(metrics: &mut [Metric], payload: &Payload) {
 /// host-extracted [`Metric`] set.
 ///
 /// Used by the `OutputFormat::LlmExtract` host-side pipeline in
-/// [`crate::test_support::eval`] — the model-driven extraction runs
+/// `crate::test_support::eval` — the model-driven extraction runs
 /// after VM exit, so the original `&Payload`'s
 /// `&'static [MetricHint]` is unreachable on the host. The guest
 /// converts the static slice to `Vec<WireMetricHint>` at LlmExtract
@@ -1061,7 +1061,7 @@ fn resolve_polarities(metrics: &mut [Metric], payload: &Payload) {
 /// - Empty hints OR empty metrics → no-op fast-path.
 /// - Duplicate hint names → HashMap last-insertion wins.
 /// - Duplicate metric names → each occurrence receives the hint.
-/// - Unhinted metric names → [`Polarity::Unknown`] + empty unit
+/// - Unhinted metric names → [`crate::test_support::Polarity::Unknown`] + empty unit
 ///   (left unchanged from the value the caller provided).
 pub(crate) fn resolve_polarities_owned(
     metrics: &mut [Metric],
@@ -1316,7 +1316,7 @@ fn resolve_cgroup_path(
     Ok(Some(ctx.cgroups.parent_path().join(relative)))
 }
 
-/// Build a [`Command`] with args, piped stdout/stderr, a
+/// Build a [`std::process::Command`] with args, piped stdout/stderr, a
 /// `process_group(0)` request when the payload is not
 /// `uses_parent_pgrp`, and (optionally) a cgroup-placement
 /// pre_exec hook that BLOCKS the child on a read from a
@@ -1843,7 +1843,7 @@ fn spawn_with_cgroup_sync(handles: CgroupSyncHandles) -> Result<libc::pid_t> {
 /// which can't happen until the parent's main thread has
 /// released the pre_exec handshake), drives the
 /// [`spawn_with_cgroup_sync`] protocol on the main thread, then
-/// joins the spawn thread to collect the resulting [`Child`].
+/// joins the spawn thread to collect the resulting [`std::process::Child`].
 ///
 /// If either the spawn or the handshake fails, the caller drops
 /// the remaining pipe handles (via the [`CgroupSyncHandles`]
@@ -2294,7 +2294,7 @@ fn wait_with_deadline(
 }
 
 /// Background path: spawn without waiting. Returns the live
-/// [`Child`] plus a [`SigchldScope`] that must be held for the
+/// [`std::process::Child`] plus a [`SigchldScope`] that must be held for the
 /// child's lifetime — [`PayloadHandle`] keeps it alive until
 /// `.wait()` / `.kill()` / `Drop` so `waitpid` during reap sees
 /// `SIG_DFL` and observes the child's real exit.
@@ -2328,7 +2328,7 @@ fn spawn_child(
 /// and the cap byte count.
 pub(crate) const MAX_CAPTURED_STREAM_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Reap a (possibly already-killed) [`Child`]: wait for it to
+/// Reap a (possibly already-killed) [`std::process::Child`]: wait for it to
 /// exit, drain stdout + stderr, return the captured output.
 ///
 /// Takes `&mut Child` so callers retain ownership and can

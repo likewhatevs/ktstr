@@ -167,7 +167,7 @@ pub fn export_test(test_name: &str, output: Option<PathBuf>) -> Result<()> {
 /// Resolve the scheduler binary for an entry, returning `None` for
 /// EEVDF / kernel-builtin payloads (which don't ship a binary).
 ///
-/// Reuses [`crate::test_support::eval::resolve_scheduler`] so the
+/// Reuses `crate::test_support::eval::resolve_scheduler` so the
 /// resolution cascade matches the in-guest path: `KTSTR_SCHEDULER`
 /// env → sibling exe → target/debug → target/release → auto-build.
 /// The cascade walks both target dirs regardless of which build
@@ -182,9 +182,9 @@ fn resolve_scheduler_for_export(entry: &KtstrTestEntry) -> Result<Option<PathBuf
 /// host-side file plus one set of CLI arguments to the export.
 ///
 /// Mirrors the in-VM path at
-/// [`crate::test_support::eval::run_ktstr_test_inner`] which calls
-/// [`crate::test_support::runtime::config_file_parts`] +
-/// [`crate::test_support::runtime::config_content_parts`] to
+/// `crate::test_support::eval::run_ktstr_test_inner` which calls
+/// `crate::test_support::runtime::config_file_parts` +
+/// `crate::test_support::runtime::config_content_parts` to
 /// resolve the same two slots.
 #[derive(Debug)]
 struct ConfigExportAddition {
@@ -217,7 +217,7 @@ struct ConfigExportAddition {
 ///     guest_path)>)
 ///
 /// Both slots are processed independently; in practice
-/// [`crate::test_support::entry::KtstrTestEntry::validate`] gates
+/// `crate::test_support::KtstrTestEntry::validate` gates
 /// `config_content` to require a matching `config_file_def` and
 /// rejects an unpaired `config_content`, so the inline path emits
 /// at most one addition. The on-disk path is orthogonal and could
@@ -238,7 +238,7 @@ fn compute_config_export_additions(entry: &KtstrTestEntry) -> Result<Vec<ConfigE
 /// Translate `entry.scheduler.config_file` (Option<host path>)
 /// into a [`ConfigExportAddition`]. Hardcoded `--config` arg
 /// matches the in-VM behavior at
-/// [`crate::test_support::runtime::config_file_parts`] and the
+/// `crate::test_support::runtime::config_file_parts` and the
 /// surrounding push at `eval.rs`.
 fn config_file_addition(entry: &KtstrTestEntry) -> Result<Option<ConfigExportAddition>> {
     let Some(config_path) = entry.scheduler.config_file else {

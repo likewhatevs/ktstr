@@ -37,7 +37,7 @@ use polars::prelude::*;
 /// `GauntletRow.ext_metrics: BTreeMap<String, f64>`. Registered
 /// metrics never flow through `ext_metrics`; unregistered metrics
 /// never flow through the typed fields. [`MetricDef::read`] and
-/// [`read_metric`] check the registered-field accessor first and
+/// `read_metric` check the registered-field accessor first and
 /// fall back to an `ext_metrics.get(name)` lookup — a name that
 /// matches neither returns `None`. Consumers that want to
 /// distinguish "registered-but-null" from "unregistered-and-
@@ -373,7 +373,7 @@ pub fn aggregate_samples_for_phase(metric: &MetricDef, samples: &[f64]) -> Optio
 /// negative results (counter reset across a scheduler restart)
 /// to 0 and emitting a `tracing::warn!` so the reset is visible
 /// in stderr. Mirrors the existing
-/// [`crate::monitor::mod`]-side counter-delta clamp pattern used
+/// `crate::monitor`-side counter-delta clamp pattern used
 /// when reducing cumulative kernel counters across boundaries
 /// for the same reset-detection reason.
 ///
@@ -1023,7 +1023,7 @@ pub fn metric_def(name: &str) -> Option<&'static MetricDef> {
 /// kept at the minimum (which would mask the high reading
 /// entirely). Authors who need a different default should register
 /// a [`MetricDef`] in [`METRICS`] or tag the metric via
-/// [`crate::test_support::payload::MetricHint`].
+/// [`crate::test_support::MetricHint`].
 ///
 /// Token order matters when names contain both signals (e.g. the
 /// hypothetical `low_iops_latency_ms` would match `latency` first
@@ -1202,8 +1202,8 @@ pub struct GauntletRow {
     pub work_type: String,
     /// Scheduler binary name carried from the source sidecar
     /// (`SidecarResult::scheduler`). Surfaced through the substring
-    /// filter in [`compare_rows`] and the typed
-    /// [`RowFilter::scheduler`] so users can narrow A/B comparisons
+    /// filter in [`compare_rows_by`] and the typed
+    /// `RowFilter::scheduler` so users can narrow A/B comparisons
     /// by scheduler name.
     pub scheduler: String,
     /// Kernel version carried from the source sidecar
@@ -1223,7 +1223,7 @@ pub struct GauntletRow {
     /// `-dirty` suffix (e.g. `"abcdef1"` or `"abcdef1-dirty"`).
     /// `None` when the sidecar writer could not probe a git repo
     /// at write time (cwd not inside a checkout, or
-    /// [`crate::test_support::sidecar::detect_project_commit`]
+    /// `crate::test_support::sidecar::detect_project_commit`
     /// failed for any reason). Surfaced via the typed
     /// [`RowFilter::project_commits`] for narrowing — when the
     /// user passes `--project-commit abcdef1` (repeatable), rows
@@ -1254,7 +1254,7 @@ pub struct GauntletRow {
     /// time (KTSTR_KERNEL points at a non-git path, the
     /// underlying source is `Tarball` / `Git` rather than
     /// `Local`, or
-    /// [`crate::test_support::sidecar::detect_kernel_commit`]
+    /// `crate::test_support::sidecar::detect_kernel_commit`
     /// failed for any reason).
     ///
     /// Distinct from [`GauntletRow::commit`]: that field tracks
@@ -1275,7 +1275,7 @@ pub struct GauntletRow {
     pub kernel_commit: Option<String>,
     /// Run-environment provenance tag carried from
     /// `SidecarResult::run_source` (`"local"` for developer runs,
-    /// `"ci"` when [`KTSTR_CI_ENV`](crate::test_support::sidecar::KTSTR_CI_ENV)
+    /// `"ci"` when `crate::test_support::sidecar::KTSTR_CI_ENV`
     /// was set at write time, `"archive"` when the consumer pulled
     /// the pool from a non-default `--dir`). `None` for sidecars
     /// produced before the field existed (pre-1.0 disposable
@@ -1740,7 +1740,7 @@ impl RowFilter {
 /// aggregation; this helper preserves duplicates as written.
 ///
 /// Used by [`compare_partitions`] before the surviving rows reach
-/// [`compare_rows`], so the substring-`-E` filter and the typed
+/// [`compare_rows_by`], so the substring-`-E` filter and the typed
 /// filters compose: typed narrows happen first, substring runs over
 /// the surviving set.
 pub fn apply_row_filters(rows: &[GauntletRow], filter: &RowFilter) -> Vec<GauntletRow> {
@@ -2026,7 +2026,7 @@ fn render_vec_dim(values: &[String], bare_label: &str) -> String {
     }
 }
 
-/// Dynamic pairing key for [`compare_rows`] — the tuple of
+/// Dynamic pairing key for [`compare_rows_by`] — the tuple of
 /// values on every NON-slicing dimension, plus the always-pinned
 /// `scenario`. Two rows pair iff their dynamic keys match.
 ///
@@ -2064,7 +2064,7 @@ impl PairingKey {
     /// canonical hex; the per-row `-dirty` distinction is preserved
     /// downstream in the aggregate's `commit` / `kernel_commit`
     /// field via the `+mixed` marker in
-    /// [`group_and_average_by::render_mixed_dirty`].
+    /// `group_and_average_by`'s `render_mixed_dirty` helper.
     pub fn from_row(row: &GauntletRow, pairing_dims: &[Dimension]) -> Self {
         let mut parts = Vec::with_capacity(1 + pairing_dims.len());
         parts.push(row.scenario.clone());
@@ -3547,7 +3547,7 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
     Ok(out)
 }
 
-/// One significant per-metric finding produced by [`compare_rows`].
+/// One significant per-metric finding produced by [`compare_rows_by`].
 ///
 /// `pairing_key` carries the dynamic identity the row pair joined
 /// on — `scenario` plus every NON-slicing dimension's value. The
@@ -3578,7 +3578,7 @@ pub(crate) struct Finding {
     pub is_regression: bool,
 }
 
-/// Aggregate result of comparing two row sets via [`compare_rows`].
+/// Aggregate result of comparing two row sets via [`compare_rows_by`].
 ///
 /// `regressions` and `improvements` count significant entries in
 /// `findings`; `unchanged` counts metrics that fell below the dual
@@ -3674,12 +3674,11 @@ pub(crate) struct PhaseDeltaRow {
 /// One per-phase bucket present on exactly one side of the A/B
 /// comparison. Generated when a matched row pair has phase
 /// coverage asymmetry — e.g. A ran a 3-Step scenario and B ran a
-/// 4-Step version, so B's Step[3] has no A counterpart. The
+/// 4-Step version, so B's Step\[3\] has no A counterpart. The
 /// renderer surfaces these in a dedicated "Phase Coverage
 /// Asymmetry" section so the operator sees explicitly which side
 /// is missing data; silently dropping them would mask the
-/// scenario-shape difference under the
-/// [[feedback_no_silent_drops]] rule.
+/// scenario-shape difference.
 #[derive(Clone, Debug, serde::Serialize)]
 pub(crate) struct UnpairedPhaseRow {
     /// Which side carries the orphan bucket.
@@ -4285,7 +4284,7 @@ pub(crate) fn compare_rows_by(
 ///
 /// Dirty runs reuse the same sidecar filename as their clean HEAD
 /// (the variant hash excludes `commit` / `kernel_commit` per
-/// [`crate::test_support::sidecar`]), so re-running the same test
+/// `crate::test_support::sidecar`), so re-running the same test
 /// from a dirty tree overwrites the previous record. The warning
 /// surfaces this so an operator can decide whether to commit the
 /// working tree before re-running for a reproducible comparison.
@@ -7257,7 +7256,7 @@ mod tests {
     /// [`WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS`] sample floor. Low-N
     /// runs produce p99/median ratios dominated by a single outlier;
     /// the metric accessor must return `None` in that regime so
-    /// [`compare_rows`] short-circuits and emits no finding.
+    /// [`compare_rows_by`] short-circuits and emits no finding.
     ///
     /// Positive side: above the floor, the same delta that was
     /// suppressed below must produce a finding. This proves the

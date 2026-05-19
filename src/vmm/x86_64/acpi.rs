@@ -248,7 +248,7 @@ fn set_sdt_checksum(buf: &mut [u8]) {
 /// Write ACPI tables to guest memory.
 ///
 /// RSDP is at fixed address 0xE0000; remaining tables pack contiguously
-/// after it in order: DSDT, MADT, FADT, SRAT, SLIT, [HMAT], RSDT, XSDT.
+/// after it in order: DSDT, MADT, FADT, SRAT, SLIT, HMAT, RSDT, XSDT.
 ///
 /// SRAT memory affinity uses `NumaMemoryLayout` regions directly,
 /// ensuring GPA ranges match KVM memory slots exactly. HMAT is emitted
@@ -588,8 +588,8 @@ const _: () = assert!(std::mem::size_of::<HmatSllbiHeader>() == 32);
 /// HMAT Memory Side Cache Information Structure (type 2, 32 bytes).
 ///
 /// Matches kernel `acpi_hmat_cache` (actbl1.h). `cache_attributes`
-/// packs line_size in bits [31:16], associativity in [11:8], write
-/// policy in [15:12], cache level in [7:4], total levels in [3:0].
+/// packs line_size in bits \[31:16\], associativity in \[11:8\], write
+/// policy in \[15:12\], cache level in \[7:4\], total levels in \[3:0\].
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default, IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
 struct HmatMsci {

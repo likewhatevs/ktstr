@@ -1,5 +1,5 @@
 //! Local LLM model cache + LlmExtract runtime for
-//! [`OutputFormat::LlmExtract`] payloads.
+//! [`crate::test_support::OutputFormat::LlmExtract`] payloads.
 //!
 //! `OutputFormat::LlmExtract` routes stdout through a small local
 //! model that emits JSON, which the existing
@@ -40,7 +40,7 @@
 //!
 //! [`extract_via_llm`] is the runtime entry point called by
 //! [`extract_metrics`](crate::test_support::extract_metrics) when a
-//! payload's [`OutputFormat::LlmExtract`] fires:
+//! payload's [`crate::test_support::OutputFormat::LlmExtract`] fires:
 //!
 //! 1. [`compose_prompt`] assembles `{LLM_EXTRACT_PROMPT_TEMPLATE}\n\n{focus}STDOUT:\n{body}`.
 //! 2. `load_inference` (module-private) routes the GGUF model
@@ -63,7 +63,7 @@
 //!    `LlamaModel` method `invoke_with_model` calls takes
 //!    `&self` and `LlamaModel` is `Send + Sync`); tests that
 //!    mutate `KTSTR_MODEL_OFFLINE` or `KTSTR_CACHE_DIR` call
-//!    [`reset`] (cfg(test)-only) before asserting offline-gate
+//!    `reset` (cfg(test)-only) before asserting offline-gate
 //!    trip behavior so a previously-memoized `Ok(_)` does not
 //!    bypass the gate.
 //! 3. `invoke_with_model` (module-private) builds a fresh
@@ -103,7 +103,7 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 /// `LlamaCppError::BackendAlreadyInitialized`. A `OnceLock` matches
 /// that contract: every caller observes the same `&'static
 /// LlamaBackend`, and the lazy init lives until the process exits
-/// (we never drop it; doing so would void [`LlamaModel`]s loaded
+/// (we never drop it; doing so would void `LlamaModel`s loaded
 /// against it).
 ///
 /// `init()` returns `Err` only on `BackendAlreadyInitialized` per
@@ -391,7 +391,7 @@ fn prompt_excerpt(prompt: &str) -> String {
 ///
 /// # Test-only reset
 ///
-/// [`reset`] clears the slot and is the hook tests use to
+/// `reset` clears the slot and is the hook tests use to
 /// re-exercise `load_inference` (and through it, `ensure()`'s
 /// offline-gate trip) when they have just mutated `KTSTR_MODEL_OFFLINE`
 /// or `KTSTR_CACHE_DIR`. Without that reset, a successful load in any
@@ -1868,7 +1868,7 @@ fn reject_insecure_url(url: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Default prompt template prepended to every
-/// [`OutputFormat::LlmExtract`] invocation. Kept here as a const so
+/// [`crate::test_support::OutputFormat::LlmExtract`] invocation. Kept here as a const so
 /// tests can assert its exact contents — a silent wording drift
 /// would re-baseline every downstream behavior expectation.
 ///
@@ -1884,7 +1884,7 @@ numbers. No prose, no code fences, no commentary. If no numeric \
 metrics are present, emit `{}`.";
 
 /// Compose the full prompt sent to the inference backend for an
-/// [`OutputFormat::LlmExtract`] invocation.
+/// [`crate::test_support::OutputFormat::LlmExtract`] invocation.
 ///
 /// Shape: `{TEMPLATE}\n\n{hint_line}STDOUT:\n{sanitized_output}` —
 /// the hint is appended as its own line before the STDOUT block so
@@ -1904,7 +1904,7 @@ metrics are present, emit `{}`.";
 /// three substrings from both the body and the hint is the gate that
 /// preserves the wrapper's turn framing. The template is a
 /// module-level `const` so it is not re-scanned. The hint originates
-/// from a `&'static str` on the payload's [`OutputFormat::LlmExtract`]
+/// from a `&'static str` on the payload's [`crate::test_support::OutputFormat::LlmExtract`]
 /// variant (compile-time source text, inside the trust boundary), so
 /// the scrub is defense-in-depth against a future API change that
 /// could route caller-supplied strings into the hint; it is not a
@@ -2578,7 +2578,7 @@ pub(crate) fn reset() {
 ///
 /// A single inference call is made. An infra error or a
 /// JSON-parse failure of the model's response returns an empty
-/// metric set — matching the [`extract_metrics`] contract that
+/// metric set — matching the [`crate::test_support::extract_metrics`] contract that
 /// extraction errors are non-fatal and the downstream
 /// [`MetricCheck`](crate::test_support::MetricCheck) evaluation reports
 /// each referenced metric as missing.

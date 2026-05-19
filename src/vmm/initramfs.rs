@@ -37,8 +37,8 @@ pub(crate) struct MissingLib {
 /// catches libraries the conf-based directory scan misses.
 ///
 /// Format (glibc new format, `glibc-ld.so.cache1.1`):
-///   - 48-byte header: magic[20] + nlibs[4] + len_strings[4] + flags[4] + unused[16]
-///   - nlibs entries of 24 bytes: flags[4] + key[4] + value[4] + osversion[4] + hwcap[8]
+///   - 48-byte header: `magic[20] + nlibs[4] + len_strings[4] + flags[4] + unused[16]`
+///   - nlibs entries of 24 bytes: `flags[4] + key[4] + value[4] + osversion[4] + hwcap[8]`
 ///   - String table: key/value are absolute byte offsets from file start
 static LD_SO_CACHE: LazyLock<HashMap<String, PathBuf>> =
     LazyLock::new(|| parse_ld_so_cache(Path::new("/etc/ld.so.cache")));
@@ -1176,7 +1176,7 @@ pub(crate) fn shm_segment_name(content_hash: u64) -> String {
 /// reaches its normal unlink sites, and `libc::atexit` handlers do
 /// not run on `abort()` either — so the segment leaks *from this
 /// run's perspective*. Cleanup is deferred: the next ktstr run
-/// sweeps orphans via [`crate::vmm::cleanup_stale_shm`], which
+/// sweeps orphans via `crate::vmm::cleanup_stale_shm`, which
 /// non-blockingly `LOCK_EX`'s each stale entry and unlinks it when
 /// no other process holds a lock.
 ///
