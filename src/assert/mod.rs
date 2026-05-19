@@ -1260,6 +1260,106 @@ impl CgroupStats {
     }
 }
 
+/// Identifier for a scenario phase. Newtype over `u16` carrying
+/// the same 1-indexed encoding documented on every other
+/// phase-touching site: `Phase::BASELINE` is the pre-first-Step
+/// settle window (`u16` 0); `Phase::step(k)` is scenario Step `k`
+/// at 1-indexed `u16` `k + 1`. The newtype catches the bug class
+/// where a raw `u16` flows between sites that disagree about
+/// 0-indexed vs 1-indexed Step encoding, and gives operators
+/// readable construction at consumer sites (`Phase::BASELINE` /
+/// `Phase::step(2)` instead of magic `0u16` / `3u16`).
+///
+/// Wire-format identical to a `u16` via `#[serde(transparent)]` —
+/// the on-disk sidecar shape is unchanged from the bare-`u16`
+/// pipeline, and existing JSON / typeshare consumers see the same
+/// scalar field. `.phase_raw()` exposes the inner `u16` for paths
+/// that hand the value to a serializer or formatter that does not
+/// understand the newtype.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct Phase(u16);
+
+impl Phase {
+    /// Pre-first-Step settle window. The framework writes
+    /// `Phase::BASELINE` to `Ctx::current_step` at scenario start
+    /// (before any Step's `current_step.store` advance), so any
+    /// capture taken before the first Step transition stamps with
+    /// this value.
+    pub const BASELINE: Self = Self(0);
+
+    /// Construct a `Phase` for the `zero_indexed`-th scenario Step.
+    /// The 1-indexed encoding (Step 0 → `u16` 1, Step 1 → `u16` 2,
+    /// ...) keeps `BASELINE` unambiguous at `u16` 0. Saturates at
+    /// `u16::MAX` rather than overflowing — a scenario with > 65k
+    /// Steps is pathological and the saturating value still
+    /// distinguishes "well past any real Step" from BASELINE.
+    pub const fn step(zero_indexed: u16) -> Self {
+        Self(zero_indexed.saturating_add(1))
+    }
+
+    /// True iff this is `Phase::BASELINE` (the pre-first-Step
+    /// settle window).
+    pub const fn is_baseline(&self) -> bool {
+        self.0 == 0
+    }
+
+    /// Inner `u16`. Use this when handing the value to a
+    /// serializer / formatter / external consumer that does not
+    /// understand the newtype. Production callers that build a
+    /// `Phase` for downstream comparison should prefer
+    /// `Phase::BASELINE` / `Phase::step(k)` over wrapping a raw
+    /// `u16` themselves.
+    pub const fn as_u16(self) -> u16 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for Phase {
+    /// `"BASELINE"` for [`Phase::BASELINE`], `"Step[k]"` for
+    /// [`Phase::step(k)`] (decoded back via the 1-indexed
+    /// encoding). Matches the labels [`PhaseBucket`] embeds in
+    /// `label` so operators see consistent phase identifiers
+    /// across structured-sidecar reads and ad-hoc `format!`
+    /// output.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_baseline() {
+            write!(f, "BASELINE")
+        } else {
+            write!(f, "Step[{}]", self.0 - 1)
+        }
+    }
+}
+
+impl From<u16> for Phase {
+    /// Wrap a raw 1-indexed encoded value as a [`Phase`]. Production
+    /// paths that already have the encoded value (e.g. drained from
+    /// the host-side mirror of `current_step`, or read out of a
+    /// deserialized sidecar) construct the typed wrapper via this
+    /// conversion without re-deriving the encoding.
+    fn from(value: u16) -> Self {
+        Self(value)
+    }
+}
+
+impl From<Phase> for u16 {
+    fn from(value: Phase) -> Self {
+        value.0
+    }
+}
+
 /// Per-phase metric bucket — one entry per scenario phase in
 /// [`ScenarioStats::phases`].
 ///
@@ -1330,6 +1430,40 @@ impl PhaseBucket {
     /// zero from finite samples.
     pub fn get(&self, metric_name: &str) -> Option<f64> {
         self.metrics.get(metric_name).copied()
+    }
+
+    /// Like [`Self::get`], but panics with a diagnostic message citing
+    /// the bucket's `step_index` + `label` + `sample_count` + the set
+    /// of metric keys actually present when the metric is absent. Use
+    /// when the caller knows the metric MUST be in the bucket (the
+    /// phase fired samples and the metric is in [`crate::stats::METRICS`])
+    /// — the panic message tells the operator whether the cause is
+    /// "phase produced no samples" (sample_count of 0) or "metric key
+    /// typo" (positive sample_count but the key isn't in `metrics`).
+    ///
+    /// ```ignore
+    /// let bucket = r.stats.step(0).expect("Step[0] phase");
+    /// let throughput = bucket.expect_metric("throughput");
+    /// ```
+    pub fn expect_metric(&self, metric_name: &str) -> f64 {
+        self.get(metric_name).unwrap_or_else(|| {
+            panic!(
+                "PhaseBucket::expect_metric: metric '{}' absent from phase \
+                 step_index={} ('{}') with sample_count={}. \
+                 metric keys present in this bucket: {:?}. \
+                 Possible causes: (a) phase carried 0 samples for this \
+                 metric (sample_count==0 means no captures landed in the \
+                 phase at all; sample_count>0 means captures landed but \
+                 the metric extracted no finite values from them); \
+                 (b) metric name typo (verify against \
+                 ScenarioStats::is_known_metric / known_metrics).",
+                metric_name,
+                self.step_index,
+                self.label,
+                self.sample_count,
+                self.metrics.keys().collect::<Vec<_>>(),
+            )
+        })
     }
 }
 
@@ -1535,6 +1669,31 @@ impl ScenarioStats {
     /// ```
     pub fn known_metrics() -> impl Iterator<Item = &'static str> {
         crate::stats::METRICS.iter().map(|m| m.name)
+    }
+
+    /// True iff the scenario produced at least one Step-phase
+    /// bucket (any phase with `step_index >= 1`). False when
+    /// `phases` is empty OR contains only `BASELINE` (the
+    /// pre-first-Step settle window).
+    ///
+    /// Use this to fail a phase-aware assertion BEFORE calling
+    /// [`Self::step`] / [`Self::step_metric`] on a scenario that
+    /// silently never advanced past BASELINE: a test that declared
+    /// no `Step`s, OR a scenario that bailed in setup before any
+    /// `Step` ran, would otherwise see [`Self::step`] return
+    /// `None` for every index and the test would either panic on
+    /// `.expect(...)` or pass vacuously.
+    ///
+    /// ```ignore
+    /// anyhow::ensure!(
+    ///     r.stats.has_steps(),
+    ///     "scenario produced no Step-phase buckets — \
+    ///      declare a Step or use Self::phase(0) for BASELINE",
+    /// );
+    /// let throughput = r.stats.step_metric(0, "throughput");
+    /// ```
+    pub fn has_steps(&self) -> bool {
+        self.phases.iter().any(|p| p.step_index >= 1)
     }
 }
 

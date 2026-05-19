@@ -643,3 +643,127 @@ fn build_phase_buckets_integration_with_scenario_stats_phase_accessor() {
     assert_eq!(stats.step(0).map(|p| p.label.as_str()), Some("Step[0]"));
     assert_eq!(stats.step(1).map(|p| p.label.as_str()), Some("Step[1]"));
 }
+
+
+// ---------- Phase newtype ----------
+
+#[test]
+fn phase_baseline_const_is_u16_zero() {
+    assert_eq!(crate::assert::Phase::BASELINE.as_u16(), 0);
+    assert!(crate::assert::Phase::BASELINE.is_baseline());
+}
+
+#[test]
+fn phase_step_zero_indexed_constructor_encodes_1_indexed() {
+    assert_eq!(crate::assert::Phase::step(0).as_u16(), 1);
+    assert_eq!(crate::assert::Phase::step(1).as_u16(), 2);
+    assert_eq!(crate::assert::Phase::step(7).as_u16(), 8);
+    assert!(!crate::assert::Phase::step(0).is_baseline());
+}
+
+#[test]
+fn phase_step_saturating_at_u16_max_does_not_overflow() {
+    // u16::MAX - 1 + 1 saturates to u16::MAX rather than wrapping
+    // to 0 (which would collide with BASELINE).
+    let saturated = crate::assert::Phase::step(u16::MAX - 1);
+    assert_eq!(saturated.as_u16(), u16::MAX);
+    let still_saturated = crate::assert::Phase::step(u16::MAX);
+    assert_eq!(still_saturated.as_u16(), u16::MAX);
+    assert!(!saturated.is_baseline(), "saturating MUST NOT collide with BASELINE");
+}
+
+#[test]
+fn phase_display_baseline_step_format() {
+    assert_eq!(format!("{}", crate::assert::Phase::BASELINE), "BASELINE");
+    assert_eq!(format!("{}", crate::assert::Phase::step(0)), "Step[0]");
+    assert_eq!(format!("{}", crate::assert::Phase::step(7)), "Step[7]");
+}
+
+#[test]
+fn phase_serde_transparent_round_trips_as_bare_u16() {
+    // #[serde(transparent)] means the wire format is the inner
+    // u16, not a tagged struct. Pin both directions: a Phase
+    // serializes as a JSON number, and a bare JSON number
+    // deserializes as a Phase.
+    let phase = crate::assert::Phase::step(4);
+    let json = serde_json::to_string(&phase).unwrap();
+    assert_eq!(json, "5", "wire format must be the inner 1-indexed u16, not a tagged struct");
+    let round_tripped: crate::assert::Phase = serde_json::from_str(&json).unwrap();
+    assert_eq!(round_tripped, phase);
+    // And the reverse: a raw number deserializes as a Phase.
+    let from_raw: crate::assert::Phase = serde_json::from_str("0").unwrap();
+    assert_eq!(from_raw, crate::assert::Phase::BASELINE);
+}
+
+#[test]
+fn phase_from_u16_wraps_raw_value() {
+    let from: crate::assert::Phase = 3u16.into();
+    assert_eq!(from.as_u16(), 3);
+    let to: u16 = crate::assert::Phase::step(2).into();
+    assert_eq!(to, 3);
+}
+
+// ---------- ScenarioStats::has_steps ----------
+
+#[test]
+fn scenario_stats_has_steps_false_for_empty_phases() {
+    let stats = ScenarioStats::default();
+    assert!(!stats.has_steps());
+}
+
+#[test]
+fn scenario_stats_has_steps_false_when_only_baseline() {
+    let stats = ScenarioStats {
+        phases: vec![crate::assert::PhaseBucket {
+            step_index: 0,
+            label: "BASELINE".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert!(!stats.has_steps(), "BASELINE-only must NOT count as 'has steps'");
+}
+
+#[test]
+fn scenario_stats_has_steps_true_when_any_step_phase_present() {
+    let stats = ScenarioStats {
+        phases: vec![
+            crate::assert::PhaseBucket {
+                step_index: 0,
+                label: "BASELINE".to_string(),
+                ..Default::default()
+            },
+            crate::assert::PhaseBucket {
+                step_index: 1,
+                label: "Step[0]".to_string(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    assert!(stats.has_steps());
+}
+
+// ---------- PhaseBucket::expect_metric ----------
+
+#[test]
+#[should_panic(expected = "metric 'missing' absent from phase step_index=1")]
+fn phase_bucket_expect_metric_panics_with_diagnostic_when_absent() {
+    let bucket = crate::assert::PhaseBucket {
+        step_index: 1,
+        label: "Step[0]".to_string(),
+        sample_count: 3,
+        metrics: std::collections::BTreeMap::from([("throughput".to_string(), 42.0)]),
+        ..Default::default()
+    };
+    bucket.expect_metric("missing");
+}
+
+#[test]
+fn phase_bucket_expect_metric_returns_value_when_present() {
+    let bucket = crate::assert::PhaseBucket {
+        metrics: std::collections::BTreeMap::from([("throughput".to_string(), 42.5)]),
+        ..Default::default()
+    };
+    assert_eq!(bucket.expect_metric("throughput"), 42.5);
+}
