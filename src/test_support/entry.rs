@@ -1115,6 +1115,35 @@ pub struct KtstrTestEntry {
     /// Pure-binary-workload tests use `Scheduler::EEVDF` here and
     /// supply their binary via the `payload` field below.
     pub scheduler: &'static crate::test_support::Scheduler,
+    /// Additional schedulers staged into the guest initramfs alongside
+    /// [`Self::scheduler`] so the scheduler-lifecycle ops
+    /// ([`Op::ReplaceScheduler`](crate::scenario::ops::Op::ReplaceScheduler)
+    /// and siblings) can swap to a different scheduler mid-experiment
+    /// without a VM reboot. The boot-time scheduler is always
+    /// [`Self::scheduler`] — entries here are the candidate set the
+    /// test will swap TO via `Op::AttachScheduler` /
+    /// `Op::ReplaceScheduler`.
+    ///
+    /// Each staged scheduler must have a `Scheduler::name` that is
+    /// unique within the set AND distinct from a small reserved-name
+    /// list (currently `scheduler`, `sched_args`, `init`, `args`,
+    /// `exec_cmd`, `sched_enable`, `sched_disable`) that the
+    /// framework uses for boot-time initramfs entries. Name
+    /// collisions OR reserved-name collisions bail at
+    /// [`Self::validate`] time with an actionable diagnostic naming
+    /// the offending entries.
+    ///
+    /// The boot-time [`Self::scheduler`] is NOT auto-included in this
+    /// set — keep that scheduler in the boot slot and stage only the
+    /// additional candidates the test wants to swap to. Tests that
+    /// don't use scheduler-lifecycle ops leave this field at its
+    /// `&[]` default and pay no initramfs cost for the staging
+    /// machinery.
+    ///
+    /// Not yet wired through to the initramfs pipeline; landing the
+    /// field, builder, and validation contract first so downstream
+    /// staging work has a stable surface to plumb against.
+    pub staged_schedulers: &'static [&'static crate::test_support::Scheduler],
     /// Optional binary payload to run as the primary workload. When
     /// `Some`, the test runs the referenced [`Payload`](crate::test_support::Payload)
     /// (which must be [`PayloadKind::Binary`](crate::test_support::PayloadKind::Binary))
@@ -1411,6 +1440,7 @@ impl KtstrTestEntry {
         constraints: TopologyConstraints::DEFAULT,
         memory_mib: 2048,
         scheduler: &crate::test_support::Scheduler::EEVDF,
+        staged_schedulers: &[],
         payload: None,
         workloads: &[],
         auto_repro: true,
@@ -1509,6 +1539,32 @@ impl KtstrTestEntry {
                  Drop one of host_only or disk.",
                 self.name,
             );
+        }
+        // staged_schedulers names must (a) pass the per-name shape
+        // checks (non-empty, no path separators, no NUL bytes, no
+        // leading dot, not a reserved framework slot — see
+        // [`crate::test_support::staged::validate_staged_scheduler_name`])
+        // and (b) be unique within the set. A collision on either
+        // axis would land two distinct schedulers at the same
+        // guest path — silent overwrite, the second-staged binary
+        // clobbering the first or shadowing a boot-time framework
+        // slot. Bails here at validate time so the error surfaces
+        // ahead of any VM boot or initramfs construction.
+        let mut seen_names: std::collections::BTreeSet<&'static str> =
+            std::collections::BTreeSet::new();
+        let staged_who = format!("KtstrTestEntry '{}'.staged_schedulers", self.name);
+        for staged in self.staged_schedulers {
+            crate::test_support::staged::validate_staged_scheduler_name(&staged_who, staged.name)?;
+            if !seen_names.insert(staged.name) {
+                anyhow::bail!(
+                    "KtstrTestEntry '{}'.staged_schedulers has duplicate \
+                     Scheduler.name '{}'; each staged scheduler must have \
+                     a unique name (the name maps 1:1 to the guest-side \
+                     staging path)",
+                    self.name,
+                    staged.name,
+                );
+            }
         }
         // Defense-in-depth for the programmatic-construction path
         // (struct-literal `KtstrTestEntry { .. }` in integration tests,
@@ -1793,6 +1849,22 @@ impl KtstrTestEntry {
     #[must_use = "builder methods consume self; bind the result"]
     pub fn with_scheduler(mut self, scheduler: &'static crate::test_support::Scheduler) -> Self {
         self.scheduler = scheduler;
+        self
+    }
+
+    /// Override `staged_schedulers` — the candidate set the test can
+    /// swap to mid-experiment via the scheduler-lifecycle ops
+    /// ([`Op::AttachScheduler`](crate::scenario::ops::Op::AttachScheduler) /
+    /// [`Op::ReplaceScheduler`](crate::scenario::ops::Op::ReplaceScheduler)).
+    /// See the field doc on [`Self::staged_schedulers`] for the
+    /// per-scheduler-name uniqueness + reserved-name validation
+    /// contract.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_staged_schedulers(
+        mut self,
+        staged: &'static [&'static crate::test_support::Scheduler],
+    ) -> Self {
+        self.staged_schedulers = staged;
         self
     }
 
