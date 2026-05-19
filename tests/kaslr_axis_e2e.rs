@@ -50,7 +50,7 @@ fn assert_kaslr_on(result: &VmResult) -> Result<()> {
     // 2 MiB slot alignment per arch/x86/boot/compressed/kaslr.c.
     const SLOT: u64 = 2 * 1024 * 1024;
     anyhow::ensure!(
-        off % SLOT == 0,
+        off.is_multiple_of(SLOT),
         "kern_kaslr_offset {off:#x} not 2 MiB aligned — kernel \
          guarantees 2 MiB slot alignment per arch/x86/boot/compressed/\
          kaslr.c::process_mem_region"
@@ -320,12 +320,12 @@ fn assert_page_offset_randomized(result: &VmResult) -> Result<()> {
         "page_offset_base value == 0 — derivation chain failed entirely"
     );
     anyhow::ensure!(
-        pob >= DEFAULT_PAGE_OFFSET && pob < DEFAULT_PAGE_OFFSET + 40 * (1u64 << 40),
+        (DEFAULT_PAGE_OFFSET..DEFAULT_PAGE_OFFSET + 40 * (1u64 << 40)).contains(&pob),
         "page_offset_base = {pob:#x} outside 0xffff_8880.. + 40 TiB range — \
          kaslr_regions[0] picked outside its assigned zone"
     );
     anyhow::ensure!(
-        (pob - DEFAULT_PAGE_OFFSET) % PUD_SIZE == 0,
+        (pob - DEFAULT_PAGE_OFFSET).is_multiple_of(PUD_SIZE),
         "page_offset_base = {pob:#x}, delta from DEFAULT = {:#x} not \
          PUD-aligned (1 GiB) — kernel guarantees PUD alignment per \
          arch/x86/mm/kaslr.c:150 (& PUD_MASK)",
