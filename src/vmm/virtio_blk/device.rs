@@ -121,7 +121,7 @@ pub(crate) type BlkQueue = Queue;
 pub const VIRTIO_BLK_SECTOR_SIZE: u32 = 512;
 
 /// Default capacity (256 MiB) used by virtio_blk tests. Mirrors the
-/// 256-MiB default in [`super::disk_config::DiskConfig::default`].
+/// 256-MiB default in `super::disk_config::DiskConfig::default`.
 ///
 /// Sized for `mkfs.btrfs` minimum without `--mixed`: btrfs needs
 /// ~109 MiB for single-profile metadata and ~256 MiB if it picks DUP
@@ -1226,7 +1226,7 @@ impl VirtioBlk {
     /// Service `VIRTIO_BLK_T_IN` (read) using a single `preadv(2)`
     /// syscall over a vectored iov chain built from the data
     /// segments. Functionally equivalent to
-    /// [`Self::handle_read_impl`] but coalesces N `pread64` syscalls
+    /// `Self::handle_read_impl` but coalesces N `pread64` syscalls
     /// (one per segment) plus N memcpy passes (kernel→scratch then
     /// scratch→guest) into one syscall reading directly into guest
     /// memory.
@@ -1244,7 +1244,7 @@ impl VirtioBlk {
     /// (`drain_bracket_impl`): SIZE_MAX, SEG_MAX, sub-sector,
     /// direction, and out-of-range checks all run upstream. The
     /// per-segment direction check is repeated here as
-    /// defense-in-depth — matching [`Self::handle_read_impl`] —
+    /// defense-in-depth — matching `Self::handle_read_impl` —
     /// so a future caller that bypasses `drain_bracket_impl` and
     /// calls this helper directly cannot smuggle a device-readable
     /// segment into a T_IN chain (which would have `preadv` write
@@ -1259,7 +1259,7 @@ impl VirtioBlk {
     /// `[n..data_len)` byte range is zero-padded by walking the
     /// segments forward from byte `n` and writing zero bytes via
     /// `mem.write_slice`. This mirrors the existing per-segment
-    /// short-read pad in [`Self::handle_read_impl`] and matches the
+    /// short-read pad in `Self::handle_read_impl` and matches the
     /// sparse-file semantic the original implementation relied on.
     ///
     /// Counter taxonomy is preserved exactly:
@@ -1270,7 +1270,7 @@ impl VirtioBlk {
     ///     bytes the device wrote into device-writable buffers).
     ///
     /// `too_many_arguments` allow: same disjoint-borrow shape as
-    /// [`Self::handle_read_impl`] — every parameter is a separate
+    /// `Self::handle_read_impl` — every parameter is a separate
     /// `&self` field that must be passed by reference so the caller
     /// can hold a concurrent mutable borrow of the queues vec.
     #[allow(clippy::too_many_arguments)]
@@ -1332,7 +1332,7 @@ impl VirtioBlk {
                 // be device-writable. Defense-in-depth: the outer
                 // gate in process_requests already rejected this
                 // chain before throttle. Mirrors the same check in
-                // [`Self::handle_read_impl`] so a future caller
+                // `Self::handle_read_impl` so a future caller
                 // that bypasses `drain_bracket_impl` cannot reach
                 // `preadv` with a device-readable buffer.
                 counters.record_io_error();
@@ -1490,7 +1490,7 @@ impl VirtioBlk {
     /// Service `VIRTIO_BLK_T_OUT` (write) using a single `pwritev(2)`
     /// syscall over a vectored iov chain built from the data
     /// segments. Functionally equivalent to
-    /// [`Self::handle_write_impl`] but coalesces N `pwrite64`
+    /// `Self::handle_write_impl` but coalesces N `pwrite64`
     /// syscalls plus N memcpy passes into one syscall writing
     /// directly from guest memory.
     ///
@@ -1501,7 +1501,7 @@ impl VirtioBlk {
     /// (`drain_bracket_impl`): SIZE_MAX, SEG_MAX, sub-sector,
     /// direction, RO-mode, and out-of-range checks all run upstream.
     /// The per-segment direction check is repeated here as
-    /// defense-in-depth — matching [`Self::handle_write_impl`] —
+    /// defense-in-depth — matching `Self::handle_write_impl` —
     /// so a future caller that bypasses `drain_bracket_impl` cannot
     /// smuggle a device-writable segment into a T_OUT chain (which
     /// would have `pwritev` read from a buffer the spec marked
@@ -1512,7 +1512,7 @@ impl VirtioBlk {
     /// signal. Both partial-write (`n < data_len`) and outright
     /// error (`r < 0`) collapse to S_IOERR + an `io_errors` bump,
     /// matching the per-segment behavior in
-    /// [`Self::handle_write_impl`] (which rejects on the first
+    /// `Self::handle_write_impl` (which rejects on the first
     /// `Ok(n)` where `n < seg.len`). The host backing-file
     /// distress signal is preserved.
     ///
@@ -1566,7 +1566,7 @@ impl VirtioBlk {
                 // be device-readable. Defense-in-depth: the outer
                 // gate in process_requests already rejected this
                 // chain before throttle. Mirrors the same check in
-                // [`Self::handle_write_impl`] so a future caller
+                // `Self::handle_write_impl` so a future caller
                 // that bypasses `drain_bracket_impl` cannot reach
                 // `pwritev` against a device-writable buffer.
                 counters.record_io_error();

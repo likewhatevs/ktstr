@@ -395,7 +395,7 @@ pub struct KtstrVm {
     /// or invoking [`disk_template::ensure_template`]. Set
     /// exclusively by [`KtstrVmBuilder::template_staging_image`] for
     /// the disk-template-build VM driver in
-    /// [`disk_template::build_template_via_vm`]; `None` for every
+    /// `disk_template::build_template_via_vm`; `None` for every
     /// other code path. See the builder field's doc for the full
     /// recursion-break rationale.
     pub(crate) template_staging_image: Option<PathBuf>,
@@ -419,7 +419,7 @@ pub struct KtstrVm {
     /// payload and probes its pid.
     pub(crate) jemalloc_alloc_worker_binary: Option<PathBuf>,
     /// Where the freeze coordinator writes the JSON-pretty
-    /// [`monitor::dump::FailureDumpReport`] when an error-class
+    /// `monitor::dump::FailureDumpReport` when an error-class
     /// SCX exit fires. `None` disables the file sink (the dump
     /// still goes to `tracing::error` regardless). The test
     /// framework sets this to a per-test path under the run's
@@ -434,7 +434,7 @@ pub struct KtstrVm {
     /// (mirrors the kernel's `check_rq_for_timeouts`), and a late
     /// one at the same `ktstr_err_exit_detected` latch as the
     /// single-snapshot path. Emits
-    /// [`monitor::dump::DualFailureDumpReport`] instead of the
+    /// `monitor::dump::DualFailureDumpReport` instead of the
     /// single-snapshot `FailureDumpReport`. Only the late snapshot
     /// is required — the early one is `None` when the stall fires
     /// before the half-way threshold trips, and the file is not
@@ -442,9 +442,9 @@ pub struct KtstrVm {
     /// run completed without a stall, so the early snapshot is not
     /// useful as a standalone artifact).
     ///
-    /// Set by [`crate::test_support::probe::attempt_auto_repro`] for
+    /// Set by `crate::test_support::probe::attempt_auto_repro` for
     /// the repro VM only. Primary VMs leave this `false`; their
-    /// freeze coordinator emits a [`monitor::dump::FailureDumpReport`]
+    /// freeze coordinator emits a `monitor::dump::FailureDumpReport`
     /// directly, matching the existing single-snapshot behaviour.
     pub(crate) dual_snapshot: bool,
     /// Workload time budget. When set, the host-side watchdog
@@ -470,7 +470,7 @@ pub struct KtstrVm {
     /// default) disables the periodic-capture loop entirely.
     /// Plumbed through [`KtstrVmBuilder::num_snapshots`]; the
     /// test-entry plumbing comes from
-    /// [`crate::test_support::entry::KtstrTestEntry::num_snapshots`].
+    /// [`crate::test_support::KtstrTestEntry::num_snapshots`].
     pub(crate) num_snapshots: u32,
     /// Lazy on-demand BPF cast-analysis handle for the scheduler
     /// binary's embedded BPF object(s). Populated by
@@ -480,13 +480,13 @@ pub struct KtstrVm {
     /// runs no file I/O or analyzer work at builder time. The
     /// actual analyzer (file read + ELF + BTF + register walk)
     /// runs only when
-    /// [`super::cast_analysis_load::LazyCastMap::get_full`] is
+    /// `super::cast_analysis_load::LazyCastMap::get_full` is
     /// first called from the failure-dump path. Tests that pass
     /// without dumping never trigger analyzer work — the dominant
     /// case under nextest's process-per-test execution model.
     ///
     /// `.get_full()` returns the richer
-    /// [`super::cast_analysis_load::CastAnalysisOutput`] which
+    /// `super::cast_analysis_load::CastAnalysisOutput` which
     /// carries three pieces:
     /// 1. `cast_map`: the
     ///    `(parent_struct, member_offset) -> CastHit` map the
@@ -513,7 +513,7 @@ pub struct KtstrVm {
     /// multi-test drivers). The cast map is threaded into
     /// [`crate::monitor::dump::DumpContext::cast_map`] and the
     /// `(btfs, fwd_index)` pair into
-    /// [`crate::monitor::dump::DumpContext::cross_btf`] at freeze
+    /// `crate::monitor::dump::DumpContext::cross_btf` at freeze
     /// time so the failure-dump renderer can promote `u64` fields
     /// the analyzer flagged into typed-pointer renders via
     /// [`crate::monitor::btf_render::MemReader::cast_lookup`] and

@@ -161,7 +161,7 @@ impl HostTopology {
 
     /// Compute the memoized `host_node_llcs` map from `llc_groups` +
     /// `cpu_to_node`. Uses the same majority-vote NUMA-assignment rule
-    /// as [`llc_numa_node`], so the memoized map and the one-off query
+    /// as [`Self::llc_numa_node`], so the memoized map and the one-off query
     /// method never disagree. Separate fn (not inlined) so
     /// `from_sysfs` and synthetic-test constructors share one path.
     fn compute_host_node_llcs(
@@ -237,7 +237,7 @@ impl HostTopology {
     /// topologies produce identical walks.
     ///
     /// In-tree callers currently reach the same data via
-    /// [`numa_nodes_sorted_by_distance`] and [`numa_nodes_with_capacity`]
+    /// [`Self::numa_nodes_sorted_by_distance`] and [`Self::numa_nodes_with_capacity`]
     /// — both iterate `host_node_llcs` internally — so this accessor
     /// has no direct consumer today. Kept as a stable handle for
     /// future callers (e.g. a planned `ktstr topo --json` NUMA
@@ -309,7 +309,7 @@ impl HostTopology {
     /// [`HostTopology::from_sysfs`] via
     /// [`compute_host_node_llcs`](Self::compute_host_node_llcs)
     /// (memoized in [`host_node_llcs`](Self::host_node_llcs)); use
-    /// [`host_llcs_by_numa_node`](Self::host_llcs_by_numa_node) to
+    /// [`Self::host_llcs_by_numa_node`](Self::host_llcs_by_numa_node) to
     /// iterate the pre-built map. This method stays exposed for
     /// external callers (future `ktstr locks` NUMA column + any
     /// downstream tooling that needs a single-LLC lookup) and
@@ -462,8 +462,8 @@ impl HostTopology {
     /// claim) — stricter than the prior floor-based check, so the
     /// "+1" guest nodes always land on a node with capacity.
     ///
-    /// Implementation composes [`host_llcs_by_numa_node`] +
-    /// [`numa_nodes_with_capacity`] — the same group-by-node + eligibility
+    /// Implementation composes [`Self::host_llcs_by_numa_node`] +
+    /// [`Self::numa_nodes_with_capacity`] — the same group-by-node + eligibility
     /// queries the `--cpu-cap` consolidation PLAN phase uses. The two
     /// callers' SELECTION algorithms differ (perf-mode does modulo
     /// rotation of guest onto host nodes; consolidation does
@@ -641,14 +641,14 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 
     /// Thread-local override for the per-CPU lock prefix. Symmetric
-    /// with [`LLC_LOCK_PREFIX_OVERRIDE`].
+    /// with `LLC_LOCK_PREFIX_OVERRIDE`.
     static CPU_LOCK_PREFIX_OVERRIDE: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Compose the LLC lockfile path for `llc_idx`. Production resolves
 /// via `KTSTR_LOCK_DIR` (fallback `/tmp`); tests can override the
-/// prefix via [`LLC_LOCK_PREFIX_OVERRIDE`] to keep their lockfile
+/// prefix via `LLC_LOCK_PREFIX_OVERRIDE` to keep their lockfile
 /// pool isolated.
 fn llc_lock_path(llc_idx: usize) -> String {
     #[cfg(test)]
@@ -662,7 +662,7 @@ fn llc_lock_path(llc_idx: usize) -> String {
 
 /// Compose the per-CPU lockfile path for `cpu`. Symmetric with
 /// [`llc_lock_path`] — production resolves via `KTSTR_LOCK_DIR`;
-/// tests can override via [`CPU_LOCK_PREFIX_OVERRIDE`].
+/// tests can override via `CPU_LOCK_PREFIX_OVERRIDE`.
 fn cpu_lock_path(cpu: usize) -> String {
     #[cfg(test)]
     {
@@ -887,7 +887,7 @@ pub fn acquire_cpu_locks(
 /// treat that as a bail reason, not a fallback "every CPU" permission:
 /// guessing on a misconfigured host is worse than failing visibly.
 ///
-/// Tests override the return value via [`ALLOWED_CPUS_OVERRIDE`] so
+/// Tests override the return value via `ALLOWED_CPUS_OVERRIDE` so
 /// the 30% default and allowed-cpu filtering are deterministic in
 /// unit tests regardless of the CI runner's real cpuset.
 pub(crate) fn host_allowed_cpus() -> Vec<usize> {
@@ -917,7 +917,7 @@ thread_local! {
     /// Test-only override for [`host_allowed_cpus`]. Set via
     /// [`AllowedCpusGuard`] to make 30%-of-allowed calculations and
     /// plan filtering deterministic in unit tests. Mirrors the
-    /// [`LLC_LOCK_PREFIX_OVERRIDE`] pattern.
+    /// `LLC_LOCK_PREFIX_OVERRIDE` pattern.
     pub(crate) static ALLOWED_CPUS_OVERRIDE: std::cell::RefCell<Option<Vec<usize>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -1370,7 +1370,7 @@ fn try_acquire_llc_plan_locks(
 /// fallback — so plans are always schedulable under cgroup-restricted
 /// runners (CI hosts, systemd slices, sudo under a limited cpuset).
 ///
-/// Consolidation uses the host distance matrix from [`TestTopology`]
+/// Consolidation uses the host distance matrix from [`crate::topology::TestTopology`]
 /// so spill order matches actual NUMA cost. Hosts whose
 /// `/sys/devices/system/node/*/distance` failed to parse degrade to a
 /// numerically-adjacent ordering via the distance closure (`10` for
