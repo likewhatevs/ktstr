@@ -1246,6 +1246,25 @@ pub struct GauntletRow {
     /// lets stats tooling exclude these from pass counts so skipped
     /// runs don't inflate the apparent pass rate.
     pub skipped: bool,
+    /// Number of monitor samples this run was averaged over —
+    /// the natural per-RUN weight for `Gauge(Avg)` metrics when
+    /// folded across multiple runs at cross-RUN comparison time
+    /// (`group_and_average_by`). Sourced from
+    /// `MonitorSummary::total_samples` at sidecar-write time;
+    /// `0` when the monitor did not run for this scenario
+    /// (host-only test, early VM failure). A `0` weight
+    /// degenerates to unweighted mean per the fallback at
+    /// `aggregate_samples`'s zero-total-weight branch.
+    ///
+    /// The field exists because the cross-RUN aggregator
+    /// previously computed unweighted arithmetic mean for every
+    /// metric — biased for `Gauge(Avg)` when runs in a cohort
+    /// had different sample populations (a 5-sample run and a
+    /// 50-sample run contributing equally to the cohort mean).
+    /// Carrying the per-RUN count here lets the aggregator dispatch
+    /// per-`MetricKind` weighted folds via the helper.
+    #[serde(default)]
+    pub run_sample_count: usize,
     /// Worst-case per-cgroup spread across the run. Four names
     /// describe the same quantity across the pipeline:
     /// - [`ScenarioStats::worst_spread`](crate::assert::ScenarioStats::worst_spread)
@@ -2269,9 +2288,22 @@ pub fn group_and_average_by(
         sum_iters_per_worker: f64,
         sum_page_locality: f64,
         sum_cross_node_mig: f64,
-        // Per-ext-metric (sum, count) so a key absent from some
-        // contributors averages only over those that carried it.
-        ext_sums: BTreeMap<String, (f64, u32)>,
+        // Per-ext-metric (value, weight) pairs, accumulated across
+        // contributors. At emit time the kind-aware fold dispatches
+        // each key through `aggregate_samples` with `Some(&weights)`
+        // so Gauge(Avg) metrics get a weighted mean (per the F-C
+        // fix on aggregate_samples) and other kinds fold by their
+        // own semantics. Unregistered metric names (no MetricDef)
+        // fall back to arithmetic mean — same legacy semantic the
+        // previous (sum, u32) shape produced.
+        ext_pairs: BTreeMap<String, Vec<(f64, usize)>>,
+        // Sum of `run_sample_count` across contributors. Carries
+        // through to the aggregated row's `run_sample_count` so a
+        // downstream cross-RUN consumer that further folds these
+        // already-aggregated rows can apply the same weighted
+        // semantic. Also weights the typed-field Gauge(Avg) means
+        // (`imbalance_ratio`) at emit time.
+        sum_run_sample_count: usize,
     }
 
     let mut order: Vec<Key> = Vec::new();
@@ -2312,7 +2344,8 @@ pub fn group_and_average_by(
                 sum_iters_per_worker: 0.0,
                 sum_page_locality: 0.0,
                 sum_cross_node_mig: 0.0,
-                ext_sums: BTreeMap::new(),
+                ext_pairs: BTreeMap::new(),
+                sum_run_sample_count: 0,
             }
         });
         acc.total_observed += 1;
@@ -2362,10 +2395,12 @@ pub fn group_and_average_by(
         acc.sum_iters_per_worker += row.worst_iterations_per_worker;
         acc.sum_page_locality += row.page_locality;
         acc.sum_cross_node_mig += row.cross_node_migration_ratio;
+        acc.sum_run_sample_count += row.run_sample_count;
         for (k, v) in &row.ext_metrics {
-            let entry = acc.ext_sums.entry(k.clone()).or_insert((0.0, 0));
-            entry.0 += *v;
-            entry.1 += 1;
+            acc.ext_pairs
+                .entry(k.clone())
+                .or_default()
+                .push((*v, row.run_sample_count));
         }
     }
 
@@ -2430,6 +2465,13 @@ pub fn group_and_average_by(
             // skipped) collapses to passed=false here.
             passed: !acc.any_failed && !acc.any_skipped && n > 0,
             skipped: acc.any_skipped,
+            // Sum across contributors so the aggregated row's
+            // weight is the cohort's total sample population. A
+            // downstream consumer that further folds these
+            // aggregated rows can apply the same weighted semantic
+            // (a 5-RUN cohort of 50-sample runs weighs 250 vs a
+            // 1-RUN cohort of 10 samples weighting 10).
+            run_sample_count: acc.sum_run_sample_count,
             spread: acc.sum_spread / denom,
             gap_ms: round_u64(acc.sum_gap_ms),
             migrations: round_u64(acc.sum_migrations),
@@ -2450,9 +2492,31 @@ pub fn group_and_average_by(
             page_locality: acc.sum_page_locality / denom,
             cross_node_migration_ratio: acc.sum_cross_node_mig / denom,
             ext_metrics: acc
-                .ext_sums
+                .ext_pairs
                 .into_iter()
-                .map(|(k, (sum, count))| (k, sum / f64::from(count)))
+                .filter_map(|(k, pairs)| {
+                    // Dispatch by registered MetricKind so Gauge(Avg)
+                    // metrics get the weighted-mean fold (matches the
+                    // per-phase merge contract). Unregistered names
+                    // (no metric_def) fall back to arithmetic mean —
+                    // same legacy semantic the previous (sum, count)
+                    // path produced. Skip the key on `None` reduction
+                    // (every value was NaN — shouldn't happen post-
+                    // sidecar_to_row sanitization but defensive).
+                    if let Some(def) = metric_def(&k) {
+                        let values: Vec<f64> = pairs.iter().map(|(v, _)| *v).collect();
+                        let weights: Vec<usize> = pairs.iter().map(|(_, w)| *w).collect();
+                        aggregate_samples(&values, Some(&weights), def.kind).map(|v| (k, v))
+                    } else {
+                        let n = pairs.len();
+                        if n == 0 {
+                            None
+                        } else {
+                            let sum: f64 = pairs.iter().map(|(v, _)| *v).sum();
+                            Some((k, sum / n as f64))
+                        }
+                    }
+                })
                 .collect(),
             // Phase buckets do not aggregate cleanly across an
             // averaged group: two contributors might run different
@@ -2543,6 +2607,11 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         run_source: sc.run_source.clone(),
         passed: sc.is_pass(),
         skipped: sc.is_skip(),
+        run_sample_count: sc
+            .monitor
+            .as_ref()
+            .map(|m| m.total_samples)
+            .unwrap_or(0),
         spread: finite_or_zero("spread", sc.stats.worst_spread),
         gap_ms: sc.stats.worst_gap_ms,
         migrations: sc.stats.total_migrations,
@@ -5418,6 +5487,7 @@ mod tests {
             run_source: None,
             skipped: false,
             passed,
+            run_sample_count: 0,
             spread,
             gap_ms: 50,
             migrations: 10,
@@ -8279,6 +8349,7 @@ mod tests {
             run_source: None,
             passed: true,
             skipped: false,
+            run_sample_count: 0,
             spread: 0.0,
             gap_ms: 0,
             migrations: 0,
@@ -8961,6 +9032,82 @@ mod tests {
         // f64 mean for derived field
         // worst_p99_wake_latency_us: (20 + 40 + 60)/3 = 40.
         assert_eq!(ar.row.worst_p99_wake_latency_us, 40.0);
+    }
+
+    /// `group_and_average_by` propagates `run_sample_count` to the
+    /// aggregated row's `run_sample_count` as the SUM of
+    /// contributor weights so a downstream consumer that further
+    /// folds the aggregated rows can apply the same weighted
+    /// semantic to the next-level cohort.
+    #[test]
+    fn group_and_average_run_sample_count_sums_across_contributors() {
+        let mut a = make_row("t", "tiny-1llc", true, 0.0);
+        a.run_sample_count = 5;
+        let mut b = make_row("t", "tiny-1llc", true, 0.0);
+        b.run_sample_count = 15;
+        let mut c = make_row("t", "tiny-1llc", true, 0.0);
+        c.run_sample_count = 30;
+        let out = group_and_average_by(&[a, b, c], LEGACY_PAIRING_DIMS);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].row.run_sample_count, 50);
+    }
+
+    /// Cross-RUN ext_metrics fold dispatches by registered
+    /// MetricKind — a registered `Gauge(Avg)` metric with two
+    /// contributors carrying different `run_sample_count` weights
+    /// uses the weighted mean rather than arithmetic mean.
+    /// (10 * 5 + 30 * 15) / (5 + 15) = 25.0 vs unweighted 20.0.
+    /// Uses `avg_dsq_depth` (registered as `Gauge(Avg)` per the
+    /// METRICS table) so the dispatch path is exercised against a
+    /// real registry entry, not a synthetic fixture.
+    #[test]
+    fn group_and_average_ext_metrics_gauge_avg_weighted_by_run_sample_count() {
+        let mut a = make_row("t", "tiny-1llc", true, 0.0);
+        a.run_sample_count = 5;
+        a.ext_metrics.insert("avg_dsq_depth".to_string(), 10.0);
+        let mut b = make_row("t", "tiny-1llc", true, 0.0);
+        b.run_sample_count = 15;
+        b.ext_metrics.insert("avg_dsq_depth".to_string(), 30.0);
+        let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
+        assert_eq!(out.len(), 1);
+        let mean = out[0]
+            .row
+            .ext_metrics
+            .get("avg_dsq_depth")
+            .copied()
+            .expect("ext_metrics propagates avg_dsq_depth aggregate");
+        // Weighted mean: (10*5 + 30*15) / 20 = 25.0.
+        // Unweighted would be (10 + 30) / 2 = 20.0.
+        assert!(
+            (mean - 25.0).abs() < f64::EPSILON,
+            "expected weighted mean 25.0, got {mean}",
+        );
+    }
+
+    /// Unregistered ext_metric keys fall back to arithmetic mean
+    /// (same legacy semantic the (sum, count) accumulator
+    /// produced). Pins that the weighted dispatch only fires for
+    /// METRICS-known keys; unknown keys ignore the weights.
+    #[test]
+    fn group_and_average_ext_metrics_unregistered_falls_back_to_arithmetic_mean() {
+        let mut a = make_row("t", "tiny-1llc", true, 0.0);
+        a.run_sample_count = 5;
+        a.ext_metrics.insert("custom.unregistered".to_string(), 10.0);
+        let mut b = make_row("t", "tiny-1llc", true, 0.0);
+        b.run_sample_count = 15;
+        b.ext_metrics.insert("custom.unregistered".to_string(), 30.0);
+        let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
+        let mean = out[0]
+            .row
+            .ext_metrics
+            .get("custom.unregistered")
+            .copied()
+            .expect("ext_metrics propagates custom key");
+        // Arithmetic mean (legacy semantic): (10 + 30) / 2 = 20.0.
+        assert!(
+            (mean - 20.0).abs() < f64::EPSILON,
+            "expected arithmetic mean 20.0, got {mean}",
+        );
     }
 
     /// Different (scenario, topology, work_type) groups produce
