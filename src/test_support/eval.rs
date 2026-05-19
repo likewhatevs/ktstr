@@ -812,6 +812,80 @@ pub(crate) fn run_ktstr_test_inner(
 /// io error. The test failure itself surfaces via the
 /// normal stderr path; the stub is a best-effort augment, so the
 /// helper does not propagate any io::Error.
+/// Build the diagnostic suffix attached to a `post_vm` callback's
+/// `Err` so the test author sees the same scheduler-log /
+/// stage-classifier / monitor sections `evaluate_vm_result`
+/// surfaces on a regular failure. Without this, a `post_vm`
+/// assertion (e.g. `anyhow::ensure!(periodic_fired > 0, ...)`)
+/// fails with only the assertion text — hiding any scheduler
+/// panic, BPF verifier reject, or scx_bpf_error that crashed
+/// the workload before the assertion's precondition could be
+/// met. Surfacing the diagnostic at this layer lets the test
+/// author debug the actual root cause without re-running with
+/// extra tracing.
+fn post_vm_failure_diagnostic_suffix(result: &vmm::VmResult) -> String {
+    let mut out = String::new();
+    // Stage classifier — names the highest-progress lifecycle
+    // phase the guest reached. "payload started but produced no
+    // test result" / "scheduler died during the liveness window"
+    // / similar one-line summaries explain at-a-glance failure
+    // modes.
+    let stage = crate::test_support::output::classify_init_stage(result.guest_messages.as_ref());
+    out.push_str(&format!("\n\nstage: {stage}"));
+    // Periodic-capture pipeline state — the sibling-Claude
+    // mitosis bug surfaced here. Empty bridges + 0-fired counts
+    // signal the periodic loop never reached a boundary; the
+    // adjacent sched_log section usually explains why.
+    out.push_str(&format!(
+        "\nperiodic_fired={} periodic_target={}",
+        result.periodic_fired, result.periodic_target,
+    ));
+    // Scheduler log — extracted from the bulk-port SCHED_LOG
+    // chunks (post-marker-pair) or the legacy stderr stream when
+    // no bulk frames carry the markers. Tail at 200 lines so a
+    // verifier dump doesn't drown the failure summary.
+    let sched_log_merged = crate::verifier::concat_sched_log_chunks(result.guest_messages.as_ref());
+    let sched_log_input: &str = if !sched_log_merged.is_empty() {
+        &sched_log_merged
+    } else {
+        &result.output
+    };
+    if let Some(parsed) = parse_sched_output(sched_log_input) {
+        let collapsed = crate::verifier::collapse_cycles(parsed);
+        let is_verifier = collapsed.contains("processed") && collapsed.contains("insns");
+        let lines: Vec<&str> = collapsed.lines().collect();
+        let tail = if !is_verifier && lines.len() > 200 {
+            let skipped = lines.len() - 200;
+            format!(
+                "[{skipped} lines truncated]\n{}",
+                lines[lines.len() - 200..].join("\n")
+            )
+        } else {
+            collapsed
+        };
+        out.push_str(&format!("\n\n--- scheduler log ---\n{tail}"));
+    }
+    // sched_ext dump — kernel sysrq-S output captured in stderr
+    // when the scheduler panicked / aborted. Empty for clean
+    // exits.
+    if let Some(dump) = extract_sched_ext_dump(&result.stderr)
+        && !dump.is_empty()
+    {
+        out.push_str(&format!("\n\n--- sched_ext dump ---\n{dump}"));
+    }
+    // Monitor summary — schedstat deltas, fallback counts,
+    // runqueue depth observations. One-line vs full Display, no
+    // sample dump.
+    if let Some(monitor) = result.monitor.as_ref() {
+        out.push_str(&format!(
+            "\n\n--- monitor ---\nsamples={} stuck={}",
+            monitor.samples.len(),
+            monitor.summary.stuck_detected,
+        ));
+    }
+    out
+}
+
 fn write_placeholder_failure_dump_if_missing(path: &std::path::Path, result: &vmm::VmResult) {
     if path.exists() {
         return;
@@ -1511,7 +1585,23 @@ fn run_ktstr_test_inner_impl(
         // so spec-promise parity holds even when the failure mode
         // is host-side rather than guest-side.
         write_placeholder_failure_dump_if_missing(&primary_dump_path, &result);
-        return Err(e);
+        // Surface the same scheduler-log / monitor sections
+        // `evaluate_vm_result` attaches on a regular failure. The
+        // post_vm Err path otherwise bypasses every diagnostic
+        // formatter and the test author sees only the assertion
+        // text, hiding the actual root cause (e.g. a scheduler
+        // panic or scx_bpf_error that crashed the workload mid-
+        // step). Built lazily — passing tests never reach here.
+        //
+        // Assertion text comes FIRST, diagnostic suffix appended
+        // — anyhow's `.context()` would invert this (suffix as
+        // outermost message, original as cause), which reads
+        // backwards in test panic output. The `anyhow!` rebuild
+        // preserves the desired ordering at the cost of dropping
+        // the source-error chain (the assertion's source is
+        // typically `None` anyway).
+        let suffix = post_vm_failure_diagnostic_suffix(&result);
+        return Err(anyhow::anyhow!("{e}{suffix}"));
     }
 
     // Release VM resources (CPU/LLC flocks, guest memory) before
