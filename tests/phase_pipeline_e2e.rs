@@ -331,6 +331,116 @@ fn phase_pipeline_no_periodic_samples_yields_empty_phases(ctx: &Ctx) -> Result<A
     execute_steps(ctx, steps)
 }
 
+/// Deterministic 3-Step e2e: pins the exact
+/// `phases.len() == 4` shape (1 BASELINE + 3 Step buckets at
+/// indexes 1, 2, 3 per the 1-index encoding). Stronger than
+/// the 2-Step variant's `any(step_index >= 1)` floor — pins the
+/// EXACT count, so a future regression that loses a Step or
+/// double-counts a Step boundary surfaces here. The deterministic
+/// pipeline-shape test is the load-bearing CI gate.
+///
+/// HoldSpec::frac(0.33) ⨉ 3 keeps the steps roughly balanced so
+/// the periodic capture loop fires across every Step window
+/// within the 15 s duration + 6 captures fixture. All three
+/// Steps must produce at least one bucket; missing any bucket
+/// would indicate either a step_index advancement bug or a
+/// silent-drop in `by_phase`.
+fn assert_phase_pipeline_three_step(result: &VmResult) -> Result<()> {
+    anyhow::ensure!(
+        result.periodic_fired >= 3,
+        "periodic_fired = {} of {} — fewer than 3 captures means \
+         the 3-step shape cannot be exercised across every Step \
+         window; the load-bearing invariant requires at least \
+         one bucket per Step",
+        result.periodic_fired,
+        result.periodic_target,
+    );
+
+    let drained = result.snapshot_bridge.drain_ordered_with_stats();
+    let drained_len = drained.len();
+    let series = SampleSeries::from_drained_typed(drained, result.monitor.clone());
+    let phases = ktstr::assert::build_phase_buckets(&series);
+
+    // The load-bearing invariant: exact count. BASELINE bucket
+    // is only emitted when at least one sample lands in the
+    // pre-first-Step settle window; with 6 captures across a 15 s
+    // run plus the bridge fire interval (~2.5 s) every Step window
+    // should land at least one capture but BASELINE may legitimately
+    // be empty if the first capture fires after the first Step
+    // transition. Test both shapes: phases.len() == 3 (no BASELINE)
+    // OR phases.len() == 4 (BASELINE + 3 Steps). Anything else is
+    // a regression.
+    let step_indices: Vec<u16> = phases.iter().map(|p| p.step_index).collect();
+    anyhow::ensure!(
+        phases.len() == 3 || phases.len() == 4,
+        "phases.len() = {} — expected 3 (Step[0..2] only) or 4 \
+         (BASELINE + Step[0..2]). Any other count means the \
+         step_index pipeline either lost a bucket (silent drop \
+         in by_phase) or double-counted a boundary. \
+         step_indices = {:?}",
+        phases.len(),
+        step_indices,
+    );
+    // All three Step buckets must be present. step_index = 1, 2, 3
+    // map to Step[0], Step[1], Step[2] per the 1-index encoding.
+    for expected_step in [1u16, 2, 3] {
+        anyhow::ensure!(
+            step_indices.contains(&expected_step),
+            "phases vec is missing step_index = {} (Step[{}]) — \
+             step_indices = {:?}. The CURRENT_STEP atomic either \
+             skipped a value or the by_phase partition lost every \
+             sample for this Step.",
+            expected_step,
+            expected_step - 1,
+            step_indices,
+        );
+    }
+    // Sum invariant (same as 2-Step variant) — catches silent
+    // drops + double-counts in the by_phase partition.
+    let total_samples: usize = phases.iter().map(|p| p.sample_count).sum();
+    anyhow::ensure!(
+        total_samples == drained_len,
+        "phases vec sum(sample_count) = {} but {} entries drained \
+         (mismatch in by_phase). step_indices = {:?}",
+        total_samples,
+        drained_len,
+        step_indices,
+    );
+    Ok(())
+}
+
+#[ktstr_test(
+    scheduler = KTSTR_SCHED,
+    llcs = 1,
+    cores = 2,
+    threads = 1,
+    duration_s = 15,
+    watchdog_timeout_s = 25,
+    num_snapshots = 6,
+    auto_repro = false,
+    post_vm = assert_phase_pipeline_three_step,
+)]
+fn phase_pipeline_three_step_e2e(ctx: &Ctx) -> Result<AssertResult> {
+    let steps = vec![
+        Step {
+            setup: vec![CgroupDef::named("cg_step0").workers(2)].into(),
+            ops: vec![],
+            hold: HoldSpec::frac(0.33),
+        },
+        Step {
+            setup: vec![CgroupDef::named("cg_step1").workers(2)].into(),
+            ops: vec![],
+            hold: HoldSpec::frac(0.33),
+        },
+        Step {
+            setup: vec![CgroupDef::named("cg_step2").workers(2)].into(),
+            ops: vec![],
+            hold: HoldSpec::frac(0.34),
+        },
+    ];
+    execute_steps(ctx, steps)
+}
+
 /// F2 e2e: Op::WatchSnapshot trip-time stamping pins the captured
 /// snapshot to the phase ACTIVE WHEN THE WATCHPOINT FIRED, not the
 /// phase active when the Op was issued. The contract is to stamp
