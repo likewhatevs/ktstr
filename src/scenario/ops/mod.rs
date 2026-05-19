@@ -3087,15 +3087,30 @@ fn write_entries_from_writes(
 /// `false` to an `anyhow::Error` so the caller's `?` propagation
 /// surfaces the host-side failure.
 ///
-/// Per-staged-scheduler log path. Mid-experiment swaps must NOT
-/// overwrite each other's logs — the boot scheduler keeps
-/// `/tmp/sched.log`, but every staged scheduler gets a name-keyed
-/// log so failure-dump output stays attributable. Path scheme
-/// `/tmp/sched_<name>.log` is collision-free under the validated
-/// name shape (no path separators, no leading `.`, length-capped
-/// to 128 bytes — see `validate_staged_scheduler_name`).
+/// Per-spawn sequence number used by [`staged_scheduler_log_path`]
+/// to keep successive Op-dispatched spawns of the SAME staged
+/// scheduler from overwriting each other's logs. Monotonic across
+/// the entire scenario lifetime; each call to
+/// `staged_scheduler_log_path` consumes one seq value.
+fn next_sched_spawn_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Per-staged-scheduler log path with a monotonic seq suffix so
+/// mid-experiment swaps don't overwrite each other's logs. The
+/// boot scheduler keeps `/tmp/sched.log` (one spawn, one log);
+/// every staged scheduler gets a name-and-seq-keyed log so
+/// successive Op::ReplaceScheduler or Op::AttachScheduler
+/// dispatches with the SAME staged name don't truncate the first
+/// spawn's failure-dump payload.
+///
+/// Path scheme `/tmp/sched_<name>_<seq>.log` is collision-free
+/// under the validated name shape (no path separators, no leading
+/// `.`, length-capped to 128 bytes per `validate_staged_scheduler_name`)
+/// plus the per-call monotonic seq suffix.
 fn staged_scheduler_log_path(name: &str) -> String {
-    format!("/tmp/sched_{name}.log")
+    format!("/tmp/sched_{name}_{seq}.log", seq = next_sched_spawn_seq())
 }
 
 /// SIGTERM grace window for scheduler-lifecycle Op kill paths.
@@ -7182,24 +7197,40 @@ mod tests {
     }
 
     /// `staged_scheduler_log_path` produces collision-free per-name
-    /// paths so successive Op::AttachScheduler / Op::ReplaceScheduler
-    /// dispatches don't overwrite each other's logs. Pins the
-    /// "/tmp/sched_<name>.log" scheme against a regression that
-    /// drops the per-name keying back to "/tmp/sched.log".
+    /// plus per-seq paths so successive Op::AttachScheduler or
+    /// Op::ReplaceScheduler dispatches with the SAME staged name
+    /// don't overwrite each other's logs. Pins the
+    /// `/tmp/sched_<name>_<seq>.log` scheme against a regression
+    /// that drops either the per-name keying or the per-seq seq
+    /// suffix.
     #[test]
-    fn staged_scheduler_log_path_is_per_name_keyed() {
-        assert_eq!(
-            staged_scheduler_log_path("scx_mitosis_a"),
-            "/tmp/sched_scx_mitosis_a.log",
+    fn staged_scheduler_log_path_is_per_name_and_seq_keyed() {
+        let a1 = staged_scheduler_log_path("scx_mitosis_a");
+        let a2 = staged_scheduler_log_path("scx_mitosis_a");
+        let b1 = staged_scheduler_log_path("scx_mitosis_b");
+        // Same name on consecutive calls must produce distinct
+        // paths via the seq suffix — protects against repeated
+        // Op::ReplaceScheduler with the same staged name losing
+        // the first spawn's failure-dump payload.
+        assert_ne!(a1, a2, "same-name consecutive calls must differ via seq");
+        // Different names must also differ — name keying defends
+        // against parallel dispatch with distinct staged entries.
+        assert_ne!(a1, b1, "different names must produce distinct paths");
+        // Path shape: prefix + name + underscore + numeric seq +
+        // .log. Asserts the seq suffix is purely numeric.
+        assert!(
+            a1.starts_with("/tmp/sched_scx_mitosis_a_"),
+            "missing name + underscore prefix: {a1}"
         );
-        assert_eq!(
-            staged_scheduler_log_path("scx_mitosis_b"),
-            "/tmp/sched_scx_mitosis_b.log",
-        );
-        assert_ne!(
-            staged_scheduler_log_path("scx_mitosis_a"),
-            staged_scheduler_log_path("scx_mitosis_b"),
-            "different names must not collide on the same log path",
+        assert!(a1.ends_with(".log"), "missing .log extension: {a1}");
+        let seq_part = a1
+            .strip_prefix("/tmp/sched_scx_mitosis_a_")
+            .unwrap()
+            .strip_suffix(".log")
+            .unwrap();
+        assert!(
+            seq_part.chars().all(|c| c.is_ascii_digit()),
+            "seq suffix must be all digits: {seq_part:?}"
         );
     }
 
