@@ -990,6 +990,25 @@ pub struct SuffixParams<'a> {
     pub sched_disable: &'a [String],
     /// `/exec_cmd` contents when `--exec` is used; `None` otherwise.
     pub exec_cmd: Option<&'a str>,
+    /// Per-staged-scheduler args files. Each tuple is
+    /// `(scheduler_name, args)`; the suffix emits a
+    /// `staging/schedulers/<name>/sched_args` cpio entry per
+    /// non-empty `args` slice, joined by `\n` to match the
+    /// boot-time `/sched_args` parser shape.
+    ///
+    /// Parent directories (`staging`, `staging/schedulers`,
+    /// `staging/schedulers/<name>`) are registered when the
+    /// matching staged scheduler binary is packed into the base
+    /// archive by [`build_initramfs_base`] (its
+    /// `register_parent_dirs` loop walks every extras entry's
+    /// path components). The base + suffix split is deliberate:
+    /// binary content is stable enough to benefit from the
+    /// content-hash cache; args vary per-run and pay the
+    /// recompress cost regardless. The name MUST satisfy
+    /// [`crate::test_support::staged::validate_staged_scheduler_name`]
+    /// — empty slice (zero staged schedulers) is the common case
+    /// and emits no entries.
+    pub staged_sched_args: &'a [(String, Vec<String>)],
 }
 
 /// Build the suffix that completes a base archive: `/args` and
@@ -1027,6 +1046,28 @@ pub fn build_suffix(base_len: usize, params: &SuffixParams<'_>) -> Result<Vec<u8
 
     if let Some(cmd) = params.exec_cmd {
         write_entry(&mut suffix, "exec_cmd", cmd.as_bytes(), 0o100644)?;
+    }
+
+    // Per-staged-scheduler args files. The staged binary itself is
+    // packed into the base archive by `build_initramfs_base` as an
+    // extras entry under `staging/schedulers/<name>/scheduler`;
+    // its `register_parent_dirs` loop populates the directory
+    // chain so this suffix entry lands inside a pre-existing tree.
+    // Names are pre-validated upstream by
+    // `validate_staged_scheduler_name` (rejects path separators,
+    // NUL bytes, reserved names, dot prefix), so the format! here
+    // cannot produce a path that escapes the staging scope or
+    // collides with a boot-time slot.
+    for (name, args) in params.staged_sched_args {
+        if args.is_empty() {
+            continue;
+        }
+        let archive_path = format!(
+            "{}/sched_args",
+            crate::test_support::staged::staged_scheduler_archive_dir(name)
+        );
+        let data = args.join("\n");
+        write_entry(&mut suffix, &archive_path, data.as_bytes(), 0o100644)?;
     }
 
     // Trailer

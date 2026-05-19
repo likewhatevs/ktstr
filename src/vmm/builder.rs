@@ -43,37 +43,6 @@ use super::{KtstrVm, disk_config};
 ///   by [`topology`](Self::topology))
 /// - `performance_mode` — `false` (operator opts in via
 ///   [`performance_mode`](Self::performance_mode))
-
-/// One scheduler staged into the guest initramfs alongside the
-/// boot-time `scheduler_binary` so the scheduler-lifecycle Ops
-/// (`Op::AttachScheduler` / `Op::ReplaceScheduler`) can swap to a
-/// different scheduler mid-experiment without rebooting the VM.
-///
-/// `name` is the [`Scheduler::name`](crate::test_support::Scheduler::name)
-/// of the source entry — must satisfy the
-/// [`crate::test_support::staged::validate_staged_scheduler_name`]
-/// shape rules (callers pre-validate at
-/// `KtstrTestEntry::validate` time, before any `KtstrVmBuilder`
-/// staging surface fires). `binary` is the host-side resolved
-/// PathBuf the initramfs pipeline copies into the guest at
-/// `/staging/schedulers/<name>/scheduler` per the
-/// [`crate::test_support::staged::staged_scheduler_binary_path`]
-/// mapping. `sched_args` is the per-scheduler CLI argv that
-/// future Op-dispatch reads from
-/// `/staging/schedulers/<name>/sched_args` at spawn time.
-///
-/// `#[allow(dead_code)]` because no consumer exists today — the
-/// initramfs packing pipeline that consumes the staged set lands
-/// in follow-up work. Tests cover the constructor; the allow
-/// clears the moment the first packing call site wires up.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub(crate) struct StagedScheduler {
-    pub(crate) name: String,
-    pub(crate) binary: PathBuf,
-    pub(crate) sched_args: Vec<String>,
-}
-
 pub struct KtstrVmBuilder {
     kernel: Option<PathBuf>,
     init_binary: Option<PathBuf>,
@@ -171,6 +140,30 @@ pub struct KtstrVmBuilder {
     /// periodic-capture loop in the freeze coordinator entirely
     /// (the default).
     num_snapshots: u32,
+}
+
+/// One scheduler staged into the guest initramfs alongside the
+/// boot-time `scheduler_binary` so the scheduler-lifecycle Ops
+/// (`Op::AttachScheduler` / `Op::ReplaceScheduler`) can swap to a
+/// different scheduler mid-experiment without rebooting the VM.
+///
+/// `name` is the [`Scheduler::name`](crate::test_support::Scheduler::name)
+/// of the source entry — must satisfy the
+/// [`crate::test_support::staged::validate_staged_scheduler_name`]
+/// shape rules (callers pre-validate at
+/// `KtstrTestEntry::validate` time, before any `KtstrVmBuilder`
+/// staging surface fires). `binary` is the host-side resolved
+/// PathBuf the initramfs pipeline copies into the guest at
+/// `/staging/schedulers/<name>/scheduler` per the
+/// [`crate::test_support::staged::staged_scheduler_binary_path`]
+/// mapping. `sched_args` is the per-scheduler CLI argv that
+/// future Op-dispatch reads from
+/// `/staging/schedulers/<name>/sched_args` at spawn time.
+#[derive(Debug, Clone)]
+pub(crate) struct StagedScheduler {
+    pub(crate) name: String,
+    pub(crate) binary: PathBuf,
+    pub(crate) sched_args: Vec<String>,
 }
 
 impl Default for KtstrVmBuilder {
@@ -949,10 +942,24 @@ impl KtstrVmBuilder {
             self.scheduler_binary.clone(),
         ));
 
+        // Pre-materialize the (name, args) tuple view so the VM's
+        // `suffix_params()` helper can borrow it without leaking
+        // `StagedScheduler` into the `pub SuffixParams` field
+        // signature. Cheap clone (name is short, args are small);
+        // the duplication is the price for keeping the public
+        // initramfs-suffix surface free of crate-private types.
+        let staged_sched_args_packed: Vec<(String, Vec<String>)> = self
+            .staged_schedulers
+            .iter()
+            .map(|s| (s.name.clone(), s.sched_args.clone()))
+            .collect();
+
         Ok(KtstrVm {
             kernel,
             init_binary: self.init_binary,
             scheduler_binary: self.scheduler_binary,
+            staged_schedulers: self.staged_schedulers,
+            staged_sched_args_packed,
             run_args: self.run_args,
             sched_args: self.sched_args,
             topology: self.topology,

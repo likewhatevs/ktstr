@@ -55,7 +55,7 @@ mod probe_metrics;
 mod profraw;
 mod runtime;
 mod sidecar;
-mod staged;
+pub(crate) mod staged;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 mod timefmt;

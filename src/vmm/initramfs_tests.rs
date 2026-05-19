@@ -292,6 +292,101 @@ fn suffix_omits_empty_optional_entries() {
     assert!(!names.iter().any(|n| n == "sched_enable"));
     assert!(!names.iter().any(|n| n == "sched_disable"));
     assert!(!names.iter().any(|n| n == "exec_cmd"));
+    // Same guard for the staged-scheduler path: empty
+    // `staged_sched_args` must NOT emit `staging/...` entries.
+    assert!(!names.iter().any(|n| n.starts_with("staging/")));
+}
+
+/// Each non-empty `staged_sched_args` entry must materialize as a
+/// `staging/schedulers/<name>/sched_args` cpio entry carrying the
+/// joined argv. The boot-time `/sched_args` parser will read this
+/// at scheduler-spawn time inside the guest — wrong path or
+/// missing entry would silently spawn the staged scheduler with
+/// the WRONG arg vector, masking the very mid-experiment behavior
+/// the lifecycle Ops are designed to expose.
+#[test]
+fn suffix_emits_per_staged_scheduler_args_entries() {
+    let exe = crate::resolve_current_exe().unwrap();
+    let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
+    let staged = vec![
+        (
+            "mitosis_args_a".to_string(),
+            vec!["--slice-us".to_string(), "5000".to_string()],
+        ),
+        (
+            "mitosis_args_b".to_string(),
+            vec!["--slice-us".to_string(), "20000".to_string()],
+        ),
+    ];
+    let suffix = build_suffix(
+        base.len(),
+        &SuffixParams {
+            staged_sched_args: &staged,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut archive = Vec::with_capacity(base.len() + suffix.len());
+    archive.extend_from_slice(&base);
+    archive.extend_from_slice(&suffix);
+    let entries = cpio_entries(&archive);
+
+    for (name, args) in &staged {
+        let archive_path = format!("staging/schedulers/{name}/sched_args");
+        let entry = entries
+            .iter()
+            .find(|(n, ..)| n == &archive_path)
+            .unwrap_or_else(|| panic!("staged args entry missing for {archive_path}"));
+        let expected = args.join("\n");
+        assert_eq!(
+            entry.1 as usize,
+            expected.len(),
+            "{archive_path} size mismatch",
+        );
+        assert_eq!(
+            entry.2, 0o100644,
+            "{archive_path} must be a plain data file (parser reads, init does not exec)",
+        );
+    }
+}
+
+/// A staged entry with empty `args` must be skipped — same is_empty()
+/// guard shape as `sched_args` / `sched_enable`. Catches a future
+/// regression that emits a zero-byte `sched_args` file the boot
+/// parser would then interpret as "no args" silently overriding
+/// whatever the operator intended.
+#[test]
+fn suffix_skips_staged_entries_with_empty_args() {
+    let exe = crate::resolve_current_exe().unwrap();
+    let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
+    let staged = vec![
+        ("populated".to_string(), vec!["--flag".to_string()]),
+        ("empty".to_string(), vec![]),
+    ];
+    let suffix = build_suffix(
+        base.len(),
+        &SuffixParams {
+            staged_sched_args: &staged,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut archive = Vec::with_capacity(base.len() + suffix.len());
+    archive.extend_from_slice(&base);
+    archive.extend_from_slice(&suffix);
+    let names = cpio_entry_names(&archive);
+    assert!(
+        names
+            .iter()
+            .any(|n| n == "staging/schedulers/populated/sched_args"),
+        "populated args must emit an entry: {names:?}"
+    );
+    assert!(
+        !names
+            .iter()
+            .any(|n| n == "staging/schedulers/empty/sched_args"),
+        "empty args must NOT emit a zero-byte entry: {names:?}"
+    );
 }
 
 #[test]

@@ -2751,35 +2751,6 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Resolve a scheduler binary from a `SchedulerSpec`.
-///
-/// Returns the resolved path (if any) paired with the
-/// [`ResolveSource`] naming the discovery branch that produced it.
-/// The source is load-bearing for downstream provenance: only
-/// [`ResolveSource::AutoBuilt`] guarantees the binary matches the
-/// current workspace tree; every other variant locates a
-/// pre-existing file whose git hash is UNKNOWN to this process.
-///
-/// Variant mapping:
-/// - `Eevdf` / `KernelBuiltin { .. }` → `(None, NotFound)` (no
-///   user-space binary).
-/// - `Path(p)` → `(Some(p), Path)` (explicit caller-named path;
-///   validated for existence).
-/// - `Discover(name)` → cascade through `KTSTR_SCHEDULER` env
-///   ([`EnvVar`](ResolveSource::EnvVar)), `$PATH` lookup when
-///   `KTSTR_CARGO_TEST_MODE` is active
-///   ([`PathLookup`](ResolveSource::PathLookup)), sibling of
-///   `current_exe` ([`SiblingDir`](ResolveSource::SiblingDir)),
-///   `target/debug/` ([`TargetDebug`](ResolveSource::TargetDebug)),
-///   `target/release/` ([`TargetRelease`](ResolveSource::TargetRelease)),
-///   on-demand build ([`AutoBuilt`](ResolveSource::AutoBuilt)).
-///   Exhausting every branch is a hard error. The PATH lookup is
-///   only enabled in cargo-test mode so the existing nextest /
-///   `cargo ktstr test` discovery cascade remains canonical
-///   (sibling-of-test-binary first) — pulling a system-wide
-///   `scx_layered` ahead of a workspace-built one would corrupt
-///   gauntlet runs whose results must reflect the in-tree
-///   scheduler revision.
 /// Resolve every entry in `entry.staged_schedulers` via a caller-
 /// supplied resolver, propagating resolver errors strictly (suitable
 /// for the primary-dispatch path where a missing staged binary is a
@@ -2823,6 +2794,35 @@ where
     Ok(out)
 }
 
+/// Resolve a scheduler binary from a `SchedulerSpec`.
+///
+/// Returns the resolved path (if any) paired with the
+/// [`ResolveSource`] naming the discovery branch that produced it.
+/// The source is load-bearing for downstream provenance: only
+/// [`ResolveSource::AutoBuilt`] guarantees the binary matches the
+/// current workspace tree; every other variant locates a
+/// pre-existing file whose git hash is UNKNOWN to this process.
+///
+/// Variant mapping:
+/// - `Eevdf` / `KernelBuiltin { .. }` → `(None, NotFound)` (no
+///   user-space binary).
+/// - `Path(p)` → `(Some(p), Path)` (explicit caller-named path;
+///   validated for existence).
+/// - `Discover(name)` → cascade through `KTSTR_SCHEDULER` env
+///   ([`EnvVar`](ResolveSource::EnvVar)), `$PATH` lookup when
+///   `KTSTR_CARGO_TEST_MODE` is active
+///   ([`PathLookup`](ResolveSource::PathLookup)), sibling of
+///   `current_exe` ([`SiblingDir`](ResolveSource::SiblingDir)),
+///   `target/debug/` ([`TargetDebug`](ResolveSource::TargetDebug)),
+///   `target/release/` ([`TargetRelease`](ResolveSource::TargetRelease)),
+///   on-demand build ([`AutoBuilt`](ResolveSource::AutoBuilt)).
+///   Exhausting every branch is a hard error. The PATH lookup is
+///   only enabled in cargo-test mode so the existing nextest /
+///   `cargo ktstr test` discovery cascade remains canonical
+///   (sibling-of-test-binary first) — pulling a system-wide
+///   `scx_layered` ahead of a workspace-built one would corrupt
+///   gauntlet runs whose results must reflect the in-tree
+///   scheduler revision.
 pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, ResolveSource)> {
     match spec {
         SchedulerSpec::Eevdf | SchedulerSpec::KernelBuiltin { .. } => {

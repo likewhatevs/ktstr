@@ -1124,10 +1124,11 @@ mod tests {
     /// and a regression in (say) the per-CPU `cpufreq_governor`
     /// diff branch would silently produce malformed diff lines.
     ///
-    /// Each entry: short label + mutator that drifts one dimension
-    /// + substring that must appear in the diff body. Catches a
-    /// regression where a particular shape class stops emitting
-    /// rows OR emits rows under a wrong field-name key.
+    /// Each entry is a short label paired with a mutator that
+    /// drifts one dimension and the substring that must appear in
+    /// the diff body. Catches a regression where a particular
+    /// shape class stops emitting rows OR emits rows under a wrong
+    /// field-name key.
     #[test]
     fn compute_host_diff_changed_body_covers_each_dimension_class() {
         fn drift_body(mutate: impl FnOnce(&mut HostContext, &mut HostContext)) -> String {

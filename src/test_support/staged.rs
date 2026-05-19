@@ -36,6 +36,17 @@ pub(crate) const RESERVED_SCHEDULER_NAMES: &[&str] = &[
     "sched_disable",
 ];
 
+/// Maximum byte length for a staged scheduler `name`. Caps the
+/// composed cpio entry path `staging/schedulers/<name>/sched_args`
+/// well under the kernel's PATH_MAX (4096) so a malformed-archive
+/// bail at `init/initramfs.c:296` never surfaces — instead
+/// [`validate_staged_scheduler_name`] rejects the over-length name
+/// with a sharp error. 128 chosen to comfortably exceed every
+/// real-world scheduler name (typically 10-30 bytes, e.g.
+/// `scx_mitosis_args_a`) while leaving headroom for descriptive
+/// variant suffixes.
+pub(crate) const MAX_STAGED_SCHEDULER_NAME_LEN: usize = 128;
+
 /// Reject `name` if it is empty, contains a path separator
 /// (`/` or `\`), contains a `\0` byte, starts with `.`, or matches
 /// a [`RESERVED_SCHEDULER_NAMES`] entry. These rules guarantee that
@@ -56,12 +67,24 @@ pub(crate) fn validate_staged_scheduler_name(who: &str, sched_name: &str) -> any
              would collapse to the staging root directory)",
         );
     }
+    if sched_name.len() > MAX_STAGED_SCHEDULER_NAME_LEN {
+        anyhow::bail!(
+            "{who}: staged Scheduler.name '{sched_name}' is {len} bytes; \
+             the cap is {MAX_STAGED_SCHEDULER_NAME_LEN} bytes so the \
+             composed `staging/schedulers/<name>/sched_args` path stays \
+             well under the kernel's PATH_MAX cpio limit \
+             (init/initramfs.c rejects names > PATH_MAX with a malformed-\
+             archive bail; the cap surfaces a cleaner error here)",
+            len = sched_name.len(),
+        );
+    }
     if sched_name.contains('/') || sched_name.contains('\\') {
         anyhow::bail!(
             "{who}: staged Scheduler.name '{sched_name}' must not contain \
              path separators ('/' or '\\') — they would let the staging \
              path escape its scoped directory or land at an unintended \
-             guest location",
+             guest location. Use '_' or '-' as a separator instead \
+             (e.g. 'scx_mitosis_variant_a').",
         );
     }
     if sched_name.contains('\0') {
@@ -74,7 +97,8 @@ pub(crate) fn validate_staged_scheduler_name(who: &str, sched_name: &str) -> any
         anyhow::bail!(
             "{who}: staged Scheduler.name '{sched_name}' must not start \
              with '.' (would produce a hidden directory in the staging \
-             tree that breaks recursive listing for debugging)",
+             tree that breaks recursive listing for debugging). Use a \
+             name starting with a letter or digit.",
         );
     }
     if RESERVED_SCHEDULER_NAMES.contains(&sched_name) {
@@ -82,7 +106,8 @@ pub(crate) fn validate_staged_scheduler_name(who: &str, sched_name: &str) -> any
             "{who}: staged Scheduler.name '{sched_name}' is reserved \
              (reserved names {RESERVED_SCHEDULER_NAMES:?} collide with \
              framework boot-time initramfs slots and would be silently \
-             overwritten when the suffix archive lands)",
+             overwritten when the suffix archive lands). Pick a name \
+             that does not match any of the reserved entries above.",
         );
     }
     Ok(())
@@ -102,11 +127,13 @@ pub(crate) fn validate_staged_scheduler_name(who: &str, sched_name: &str) -> any
 /// gate which calls the validator on every staged entry before any
 /// path expansion fires.
 //
-// `#[allow(dead_code)]` because no production caller exists today
-// — the initramfs packing pipeline and Op dispatch that will
-// consume the path helpers land in follow-up work. Tests in this
-// module exercise the helpers as they land; the allow becomes a
-// no-op the moment the first production caller wires up.
+// `#[allow(dead_code)]` because the runtime dispatch path that
+// translates `/staging/schedulers/<name>/scheduler` back into a
+// `spawn` is not yet wired; only the cpio-archive view (no
+// leading `/`) has a production consumer today via
+// [`staged_scheduler_archive_dir`]. Tests in this module
+// exercise the guest-path helpers as they land; the allow
+// becomes a no-op the moment the runtime spawn dispatch wires up.
 #[allow(dead_code)]
 pub(crate) fn staged_scheduler_dir(sched_name: &str) -> String {
     format!("/staging/schedulers/{sched_name}")
@@ -131,6 +158,21 @@ pub(crate) fn staged_scheduler_args_path(sched_name: &str) -> String {
     format!("{}/sched_args", staged_scheduler_dir(sched_name))
 }
 
+/// Archive-relative directory (no leading `/`) under which a
+/// staged scheduler's binary + args file are packed in the cpio
+/// initramfs. Mirrors [`staged_scheduler_dir`] with the leading
+/// slash stripped so the result can pass directly as a cpio entry
+/// name (cpio entries are archive-relative; a leading `/` would
+/// create an absolute-path entry the kernel extractor refuses).
+///
+/// Co-located with the guest-path helpers so a future layout
+/// change (e.g. renaming `staging` → `dynsched`) updates a
+/// single module instead of drifting between the packer and the
+/// runtime resolver.
+pub(crate) fn staged_scheduler_archive_dir(sched_name: &str) -> String {
+    format!("staging/schedulers/{sched_name}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,9 +193,60 @@ mod tests {
     #[test]
     fn validate_staged_scheduler_name_rejects_path_separators() {
         let err = validate_staged_scheduler_name("e.staged_schedulers", "a/b").unwrap_err();
-        assert!(format!("{err:#}").contains("path separators"));
+        let msg = format!("{err:#}");
+        assert!(msg.contains("path separators"));
+        // Actionable hint — operator must know WHAT to use, not just
+        // what NOT to use.
+        assert!(msg.contains("'_' or '-'"), "hint missing: {msg}");
         let err = validate_staged_scheduler_name("e.staged_schedulers", "a\\b").unwrap_err();
         assert!(format!("{err:#}").contains("path separators"));
+    }
+
+    #[test]
+    fn validate_staged_scheduler_name_dot_prefix_message_carries_hint() {
+        let err = validate_staged_scheduler_name("e.staged_schedulers", ".hidden").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("letter or digit"),
+            "hint missing on dot-prefix error: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_staged_scheduler_name_reserved_message_lists_reserved_names() {
+        let err = validate_staged_scheduler_name("e.staged_schedulers", "scheduler").unwrap_err();
+        let msg = format!("{err:#}");
+        // Both the reserved-list dump AND an actionable suggestion
+        // must surface so the operator can resolve without guessing.
+        assert!(msg.contains("sched_args"), "reserved list missing: {msg}");
+        assert!(
+            msg.contains("does not match"),
+            "hint missing on reserved error: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_staged_scheduler_name_rejects_overlong_name() {
+        let long_name = "a".repeat(MAX_STAGED_SCHEDULER_NAME_LEN + 1);
+        let err = validate_staged_scheduler_name("e.staged_schedulers", &long_name).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("bytes"),
+            "length-cap error missing 'bytes': {msg}"
+        );
+        assert!(
+            msg.contains(&format!("{}", MAX_STAGED_SCHEDULER_NAME_LEN)),
+            "length-cap error must mention the cap: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_staged_scheduler_name_accepts_name_exactly_at_max_length() {
+        let exact = "a".repeat(MAX_STAGED_SCHEDULER_NAME_LEN);
+        assert!(
+            validate_staged_scheduler_name("e.staged_schedulers", &exact).is_ok(),
+            "name exactly at MAX_STAGED_SCHEDULER_NAME_LEN must be accepted"
+        );
     }
 
     #[test]
@@ -201,5 +294,25 @@ mod tests {
             staged_scheduler_args_path("scx_mitosis"),
             "/staging/schedulers/scx_mitosis/sched_args"
         );
+    }
+
+    #[test]
+    fn staged_scheduler_archive_dir_strips_leading_slash() {
+        assert_eq!(
+            staged_scheduler_archive_dir("scx_mitosis_args_a"),
+            "staging/schedulers/scx_mitosis_args_a"
+        );
+    }
+
+    /// Archive form must be exactly the guest form minus the leading
+    /// `/` — verifies the two helpers stay in lockstep so a future
+    /// layout rename doesn't accidentally diverge the cpio entry
+    /// path from the runtime resolver path.
+    #[test]
+    fn staged_scheduler_archive_dir_matches_guest_dir_without_leading_slash() {
+        let name = "scx_mitosis";
+        let guest = staged_scheduler_dir(name);
+        let archive = staged_scheduler_archive_dir(name);
+        assert_eq!(guest.strip_prefix('/').unwrap(), archive);
     }
 }

@@ -216,6 +216,36 @@ pub struct KtstrVm {
     pub(crate) kernel: PathBuf,
     pub(crate) init_binary: Option<PathBuf>,
     pub(crate) scheduler_binary: Option<PathBuf>,
+    /// Additional schedulers packed into the initramfs alongside
+    /// `scheduler_binary` so the scheduler-lifecycle Ops can swap
+    /// schedulers mid-experiment. Each entry's binary is packed
+    /// into the BASE archive at
+    /// `staging/schedulers/<name>/scheduler` (cache-amortized via
+    /// `BaseKey`'s content hash); its `sched_args` rides the SUFFIX
+    /// at `staging/schedulers/<name>/sched_args` so per-run argv
+    /// changes don't invalidate the base cache.
+    ///
+    /// The materialized
+    /// [`StagedScheduler`](crate::vmm::builder::StagedScheduler)
+    /// shape is held here so `spawn_initramfs_resolve` can hand the
+    /// binary paths to
+    /// [`BaseKey::new`](crate::vmm::initramfs_cache::BaseKey) on
+    /// the resolve thread. The companion
+    /// [`Self::staged_sched_args_packed`] holds the same `(name,
+    /// args)` view in a borrow-friendly tuple form so
+    /// [`Self::suffix_params`] can borrow a slice typed `&[(String,
+    /// Vec<String>)]` without leaking the pub(crate) `StagedScheduler`
+    /// type into the `pub` `SuffixParams` field signature.
+    pub(crate) staged_schedulers: Vec<crate::vmm::builder::StagedScheduler>,
+    /// Pre-materialized `(name, args)` view of
+    /// [`Self::staged_schedulers`] so [`Self::suffix_params`] can
+    /// borrow the slice directly without an intermediate allocation
+    /// per `suffix_params()` call. Cloned from `staged_schedulers`
+    /// once at [`KtstrVmBuilder::build`](crate::vmm::builder::KtstrVmBuilder::build)
+    /// time; the duplication is bounded (name + args, no binary
+    /// path) and stays in sync because both fields are immutable
+    /// after build.
+    pub(crate) staged_sched_args_packed: Vec<(String, Vec<String>)>,
     pub(crate) run_args: Vec<String>,
     pub(crate) sched_args: Vec<String>,
     pub(crate) topology: Topology,
@@ -498,6 +528,12 @@ impl KtstrVm {
     /// `sched_args` / sched-enable / sched-disable / `exec_cmd`
     /// bundling so both x86_64 and aarch64 paths construct the suffix
     /// from the same source of truth.
+    ///
+    /// The `staged_sched_args` slot pulls per-name args from the
+    /// pre-materialized [`Self::staged_sched_args_packed`] view so
+    /// `SuffixParams` can borrow `&[(String, Vec<String>)]` directly
+    /// without exposing the [`crate::vmm::builder::StagedScheduler`]
+    /// type into the `pub` `SuffixParams` field signature.
     fn suffix_params(&self) -> initramfs::SuffixParams<'_> {
         initramfs::SuffixParams {
             args: &self.run_args,
@@ -505,6 +541,7 @@ impl KtstrVm {
             sched_enable: &self.sched_enable_cmds,
             sched_disable: &self.sched_disable_cmds,
             exec_cmd: self.exec_cmd.as_deref(),
+            staged_sched_args: &self.staged_sched_args_packed,
         }
     }
 

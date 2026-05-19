@@ -1134,15 +1134,18 @@ pub struct KtstrTestEntry {
     /// the offending entries.
     ///
     /// The boot-time [`Self::scheduler`] is NOT auto-included in this
-    /// set — keep that scheduler in the boot slot and stage only the
-    /// additional candidates the test wants to swap to. Tests that
-    /// don't use scheduler-lifecycle ops leave this field at its
-    /// `&[]` default and pay no initramfs cost for the staging
-    /// machinery.
+    /// set AND cannot be repeated here — [`Self::validate`] rejects
+    /// any staged entry whose `name` matches the boot scheduler's
+    /// `name`. Keep the boot scheduler in [`Self::scheduler`] and
+    /// stage only the additional candidates the test wants to swap
+    /// to. Tests that don't use scheduler-lifecycle ops leave this
+    /// field at its `&[]` default and pay no initramfs cost for the
+    /// staging machinery.
     ///
-    /// Not yet wired through to the initramfs pipeline; landing the
-    /// field, builder, and validation contract first so downstream
-    /// staging work has a stable surface to plumb against.
+    /// Staged binary content is hashed into the initramfs cache key
+    /// (see [`BaseKey`](crate::vmm::initramfs_cache)) — rebuilding a
+    /// staged scheduler between test runs invalidates the cache
+    /// automatically; no manual cache clean is needed.
     pub staged_schedulers: &'static [&'static crate::test_support::Scheduler],
     /// Optional binary payload to run as the primary workload. When
     /// `Some`, the test runs the referenced [`Payload`](crate::test_support::Payload)
@@ -1544,18 +1547,34 @@ impl KtstrTestEntry {
         // checks (non-empty, no path separators, no NUL bytes, no
         // leading dot, not a reserved framework slot — see
         // [`crate::test_support::staged::validate_staged_scheduler_name`])
-        // and (b) be unique within the set. A collision on either
-        // axis would land two distinct schedulers at the same
-        // guest path — silent overwrite, the second-staged binary
-        // clobbering the first or shadowing a boot-time framework
-        // slot. Bails here at validate time so the error surfaces
-        // ahead of any VM boot or initramfs construction.
+        // and (b) be unique within the set AND disjoint from the
+        // boot scheduler's `name`. A collision on either axis would
+        // land two distinct schedulers at the same guest path —
+        // silent overwrite, the second-staged binary clobbering the
+        // first OR shadowing a boot-time framework slot. The
+        // boot-name seed catches the "stage all the schedulers I
+        // might use" misuse (author includes the boot scheduler in
+        // the staged set thinking it's required there too). Bails
+        // here at validate time so the error surfaces ahead of any
+        // VM boot or initramfs construction.
         let mut seen_names: std::collections::BTreeSet<&'static str> =
             std::collections::BTreeSet::new();
+        seen_names.insert(self.scheduler.name);
         let staged_who = format!("KtstrTestEntry '{}'.staged_schedulers", self.name);
         for staged in self.staged_schedulers {
             crate::test_support::staged::validate_staged_scheduler_name(&staged_who, staged.name)?;
             if !seen_names.insert(staged.name) {
+                if staged.name == self.scheduler.name {
+                    anyhow::bail!(
+                        "KtstrTestEntry '{}'.staged_schedulers cannot include \
+                         the boot scheduler '{}' — the boot slot already \
+                         stages it. Staged entries are the ADDITIONAL \
+                         candidates the test will swap TO via \
+                         Op::AttachScheduler / Op::ReplaceScheduler.",
+                        self.name,
+                        staged.name,
+                    );
+                }
                 anyhow::bail!(
                     "KtstrTestEntry '{}'.staged_schedulers has duplicate \
                      Scheduler.name '{}'; each staged scheduler must have \
@@ -2779,6 +2798,44 @@ mod tests {
         // The exact shape-message ("path separators") is the
         // validate_staged_scheduler_name contract pinned at
         // src/test_support/staged.rs:151-156, not duplicated here.
+    }
+
+    /// A staged scheduler whose `name` matches the boot
+    /// [`KtstrTestEntry::scheduler`]'s name must reject — the boot
+    /// slot already provides that scheduler, and adding it to the
+    /// staged set produces a guest layout where the boot scheduler
+    /// is shadowed by the same binary under
+    /// `/staging/schedulers/<name>/scheduler`. Catches the
+    /// dev-advocate's "stage all the schedulers I might use"
+    /// misuse pattern at validate time.
+    #[test]
+    fn validate_rejects_staged_scheduler_duplicating_boot_scheduler() {
+        static BOOT: Scheduler = Scheduler::named("scx_mitosis").binary_discover("scx_mitosis");
+        static STAGED_COPY: Scheduler =
+            Scheduler::named("scx_mitosis").binary_discover("scx_mitosis");
+        static SCHEDS: &[&Scheduler] = &[&STAGED_COPY];
+        let entry = KtstrTestEntry {
+            name: "staged_dup_of_boot",
+            scheduler: &BOOT,
+            staged_schedulers: SCHEDS,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("staged scheduler duplicating boot scheduler must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("boot scheduler"),
+            "error must name the boot-scheduler violation, got: {msg}"
+        );
+        assert!(
+            msg.contains("scx_mitosis"),
+            "error must name the colliding scheduler, got: {msg}"
+        );
+        assert!(
+            msg.contains("Op::AttachScheduler") || msg.contains("Op::ReplaceScheduler"),
+            "error must point to the lifecycle Ops that USE the staged set, got: {msg}"
+        );
     }
 
     /// `validate()` rejects `host_only=true` paired with a

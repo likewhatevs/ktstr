@@ -122,6 +122,97 @@ pub(crate) fn disk_auto_mount_cmdline_tokens(disk: &disk_config::DiskConfig) -> 
     s
 }
 
+/// Pure helper: assemble the `extras` slice and the [`BaseKey`] from
+/// the resolved scheduler/probe/worker/staged-binary paths. Extracted
+/// out of [`KtstrVm::spawn_initramfs_resolve`] so the staged-extras
+/// path-format contract, the per-staged iteration order, and the
+/// shell-mode-vs-non-shell BaseKey threading can be unit-tested
+/// without spawning the resolve thread or running the full
+/// initramfs build.
+///
+/// Caller responsibilities:
+/// - Pre-compute `staged_extras_names` as
+///   `format!("{}/scheduler", staged_scheduler_archive_dir(&s.name))`
+///   for each staged scheduler (the helper indexes into this vec by
+///   position, so caller MUST keep order identical to
+///   `staged_schedulers`). Materialized externally so the borrow
+///   lifetime ties to the caller's owned Vec.
+/// - Pre-compute `merged_includes` (operator's `include_files` plus
+///   the optional alloc-worker binary).
+/// - Pre-compute `has_jemalloc_extras` = `probe.is_some() ||
+///   worker.is_some()` for shell-mode determination.
+///
+/// Returns `(extras, base_key)`. The extras vec borrows from
+/// `scheduler`, `probe`, `staged_extras_names`, and
+/// `staged_schedulers` — all `'a`-tied to the caller's lifetimes.
+/// The base_key is owned `BaseKey`.
+///
+/// `#[allow(clippy::too_many_arguments)]` — the parameter set is
+/// intrinsically flat (binaries + staging slice + flags); folding
+/// into a builder or struct here would just rename the same
+/// positional ordering. Sibling precedent: `build_vm_builder_base`
+/// in `src/test_support/runtime.rs` uses the same allow for the
+/// same reason.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn assemble_extras_and_key<'a>(
+    payload: &'a std::path::Path,
+    scheduler: Option<&'a std::path::Path>,
+    probe: Option<&'a std::path::Path>,
+    worker: Option<&'a std::path::Path>,
+    staged_schedulers: &'a [crate::vmm::builder::StagedScheduler],
+    staged_extras_names: &'a [String],
+    merged_includes: &'a [(String, PathBuf)],
+    busybox: bool,
+    has_jemalloc_extras: bool,
+) -> Result<(Vec<(&'a str, &'a std::path::Path)>, BaseKey)> {
+    debug_assert_eq!(
+        staged_schedulers.len(),
+        staged_extras_names.len(),
+        "staged_schedulers and staged_extras_names must be co-indexed; \
+         caller mis-built the extras-names slice"
+    );
+
+    let mut extras: Vec<(&str, &std::path::Path)> = Vec::new();
+    if let Some(s) = scheduler {
+        extras.push(("scheduler", s));
+    }
+    if let Some(p) = probe {
+        extras.push(("bin/ktstr-jemalloc-probe", p));
+    }
+    for (idx, staged) in staged_schedulers.iter().enumerate() {
+        extras.push((staged_extras_names[idx].as_str(), staged.binary.as_path()));
+    }
+
+    // Shell-mode determination: busybox flag, non-empty includes,
+    // or any jemalloc extras (probe / worker present). Mirrors the
+    // pre-extraction logic in spawn_initramfs_resolve — kept
+    // explicit here so the helper is a closed unit under test
+    // without a hidden dependency on the caller's shell_mode
+    // computation.
+    let shell_mode = busybox || !merged_includes.is_empty() || has_jemalloc_extras;
+
+    let staged_for_key: Vec<(&str, &std::path::Path)> = staged_schedulers
+        .iter()
+        .map(|s| (s.name.as_str(), s.binary.as_path()))
+        .collect();
+
+    let key = if shell_mode {
+        BaseKey::new_shell(
+            payload,
+            scheduler,
+            probe,
+            worker,
+            &staged_for_key,
+            merged_includes,
+            busybox,
+        )?
+    } else {
+        BaseKey::new(payload, scheduler, probe, worker, &staged_for_key)?
+    };
+
+    Ok((extras, key))
+}
+
 impl KtstrVm {
     /// Construct the optional virtio-blk device for the configured
     /// disk in `self.disks`. Returns `Ok(None)` when no disk is
@@ -471,6 +562,7 @@ impl KtstrVm {
         let probe = self.jemalloc_probe_binary.clone();
         let worker = self.jemalloc_alloc_worker_binary.clone();
         let include_files = self.include_files.clone();
+        let staged_schedulers = self.staged_schedulers.clone();
         let busybox = self.busybox;
         std::thread::Builder::new()
             .name("initramfs-resolve".into())
@@ -489,26 +581,32 @@ impl KtstrVm {
                 // the initramfs by ~900MB per run in debug builds,
                 // which was enough to time out VM init before the
                 // test binary loaded.
-                let mut extras: Vec<(&str, &std::path::Path)> = Vec::new();
-                if let Some(s) = scheduler.as_deref() {
-                    extras.push(("scheduler", s));
-                }
-                if let Some(p) = probe.as_deref() {
-                    extras.push(("bin/ktstr-jemalloc-probe", p));
-                }
-                // Shell-mode cache keying treats ANY include_files
-                // as shell-mode. `jemalloc_alloc_worker_binary` is
-                // still a real include_file at the cache-key layer —
-                // hash it accordingly so a binary-change invalidates
-                // the cache. The probe is hashed explicitly regardless
-                // of its routing (see `BaseKey::new_shell`). The
-                // scheduler stays in the non-shell path.
+                //
+                // Staged schedulers ride the same `extras` path,
+                // packed under `staging/schedulers/<name>/scheduler`
+                // so the cpio extractor's silent parent-dir
+                // requirement gets satisfied via the auto-registered
+                // ancestor entries (see `build_initramfs_base`'s
+                // `register_parent_dirs` loop). Each staged binary
+                // contributes its own DT_NEEDED set to the shared-lib
+                // resolution chain — schedulers built against
+                // different libbpf revisions are correctly handled
+                // without operator intervention.
+                let staged_extras_names: Vec<String> = staged_schedulers
+                    .iter()
+                    .map(|s| {
+                        format!(
+                            "{}/scheduler",
+                            crate::test_support::staged::staged_scheduler_archive_dir(&s.name),
+                        )
+                    })
+                    .collect();
                 let has_jemalloc_extras = probe.as_deref().is_some() || worker.as_deref().is_some();
-                let shell_mode = busybox || !include_files.is_empty() || has_jemalloc_extras;
 
                 // Merge include_files with worker so both the cache
                 // key and the actual archive build see the same
-                // worker entry; the probe is added to extras above.
+                // worker entry; the probe is added to extras inside
+                // `assemble_extras_and_key`.
                 let mut merged_includes: Vec<(String, PathBuf)> = include_files.clone();
                 if let Some(w) = worker.as_deref() {
                     merged_includes.push((
@@ -517,23 +615,17 @@ impl KtstrVm {
                     ));
                 }
 
-                let key = if shell_mode {
-                    BaseKey::new_shell(
-                        &payload,
-                        scheduler.as_deref(),
-                        probe.as_deref(),
-                        worker.as_deref(),
-                        &merged_includes,
-                        busybox,
-                    )?
-                } else {
-                    BaseKey::new(
-                        &payload,
-                        scheduler.as_deref(),
-                        probe.as_deref(),
-                        worker.as_deref(),
-                    )?
-                };
+                let (extras, key) = assemble_extras_and_key(
+                    &payload,
+                    scheduler.as_deref(),
+                    probe.as_deref(),
+                    worker.as_deref(),
+                    &staged_schedulers,
+                    &staged_extras_names,
+                    &merged_includes,
+                    busybox,
+                    has_jemalloc_extras,
+                )?;
 
                 let include_refs: Vec<(&str, &std::path::Path)> = merged_includes
                     .iter()
@@ -1747,6 +1839,217 @@ mod tests {
             s.starts_with(' '),
             "non-empty tokens must start with a space for safe \
              cmdline concatenation; got {s:?}",
+        );
+    }
+
+    /// Helper: build a temp dir with a payload binary + N staged-
+    /// scheduler binaries. Returns the tempdir guard (keep alive)
+    /// plus the payload path and a Vec<StagedScheduler> the test
+    /// can feed to `assemble_extras_and_key`.
+    fn build_synthetic_staged_set(
+        names: &[&str],
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        Vec<crate::vmm::builder::StagedScheduler>,
+    ) {
+        let dir = tempfile::Builder::new()
+            .prefix("ktstr-assemble-test-")
+            .tempdir()
+            .unwrap();
+        let payload = dir.path().join("payload");
+        std::fs::write(&payload, b"payload-content").unwrap();
+        let staged: Vec<crate::vmm::builder::StagedScheduler> = names
+            .iter()
+            .map(|name| {
+                let bin = dir.path().join(format!("staged_bin_{name}"));
+                std::fs::write(&bin, format!("staged-content-{name}").as_bytes()).unwrap();
+                crate::vmm::builder::StagedScheduler {
+                    name: (*name).to_string(),
+                    binary: bin,
+                    sched_args: vec![format!("--variant={name}")],
+                }
+            })
+            .collect();
+        (dir, payload, staged)
+    }
+
+    /// Helper: pre-compute staged_extras_names the same way
+    /// spawn_initramfs_resolve does.
+    fn staged_extras_names_for(staged: &[crate::vmm::builder::StagedScheduler]) -> Vec<String> {
+        staged
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}/scheduler",
+                    crate::test_support::staged::staged_scheduler_archive_dir(&s.name),
+                )
+            })
+            .collect()
+    }
+
+    /// T-3.1: each staged scheduler must land in `extras` under the
+    /// canonical `staging/schedulers/<name>/scheduler` archive path.
+    /// Pins the wire-up against a refactor that synthesizes the
+    /// archive path inline without going through
+    /// `staged_scheduler_archive_dir` — a drift would silently
+    /// desynchronize from the runtime resolver path.
+    #[test]
+    fn assemble_extras_and_key_emits_staged_binary_under_correct_archive_path() {
+        let (_tmp, payload, staged) = build_synthetic_staged_set(&["scx_foo", "scx_bar"]);
+        let names = staged_extras_names_for(&staged);
+        let (extras, _key) = assemble_extras_and_key(
+            payload.as_path(),
+            None,
+            None,
+            None,
+            &staged,
+            &names,
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
+        let extras_names: Vec<&str> = extras.iter().map(|(n, _)| *n).collect();
+        assert!(
+            extras_names.contains(&"staging/schedulers/scx_foo/scheduler"),
+            "missing scx_foo at canonical archive path; got {extras_names:?}",
+        );
+        assert!(
+            extras_names.contains(&"staging/schedulers/scx_bar/scheduler"),
+            "missing scx_bar at canonical archive path; got {extras_names:?}",
+        );
+    }
+
+    /// T-3.2: staged_schedulers iteration order must align with the
+    /// extras-push order so `staged_extras_names[idx]` matches
+    /// `staged_schedulers[idx].binary`. Misalignment would silently
+    /// point name A at binary B's content — disastrous regression
+    /// where tests boot with wrong scheduler binaries under
+    /// correct-looking names.
+    #[test]
+    fn assemble_extras_and_key_preserves_staged_iteration_order_in_extras() {
+        let (_tmp, payload, staged) = build_synthetic_staged_set(&["alpha", "beta", "gamma"]);
+        let names = staged_extras_names_for(&staged);
+        let (extras, _key) = assemble_extras_and_key(
+            payload.as_path(),
+            None,
+            None,
+            None,
+            &staged,
+            &names,
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
+        // Staged entries start after any of scheduler/probe (none
+        // here), so they occupy extras[0..3].
+        for (i, name) in ["alpha", "beta", "gamma"].iter().enumerate() {
+            let (entry_name, entry_path) = extras[i];
+            let expected_name = format!("staging/schedulers/{name}/scheduler");
+            assert_eq!(
+                entry_name, expected_name,
+                "extras[{i}] expected name '{expected_name}', got '{entry_name}'",
+            );
+            // The binary file is named staged_bin_<name> in the
+            // helper; verify the extras entry points at the matching
+            // binary path (binary owns the content for that name).
+            assert!(
+                entry_path
+                    .to_string_lossy()
+                    .ends_with(&format!("staged_bin_{name}")),
+                "extras[{i}] binary path '{}' does not match expected staged_bin_{name}",
+                entry_path.display(),
+            );
+        }
+    }
+
+    /// T-3.3: staged binaries must contribute to BaseKey in BOTH
+    /// shell-mode and non-shell-mode dispatch arms. A regression
+    /// dropping staged_for_key from one arm would silently un-
+    /// invalidate the cache for that mode, contaminating tests
+    /// across staged-set differences. Compares each mode's
+    /// "with-staged" key against an "empty-staged" baseline to
+    /// confirm the staged inputs participate in the digest.
+    #[test]
+    fn assemble_extras_and_key_threads_staged_into_basekey_in_both_modes() {
+        let (_tmp, payload, staged) = build_synthetic_staged_set(&["mitosis_a"]);
+        let names = staged_extras_names_for(&staged);
+        let empty: Vec<crate::vmm::builder::StagedScheduler> = vec![];
+        let empty_names: Vec<String> = vec![];
+
+        // Non-shell-mode arm (busybox=false, no includes, no
+        // jemalloc extras).
+        let (_, key_with_staged_nonshell) = assemble_extras_and_key(
+            payload.as_path(),
+            None,
+            None,
+            None,
+            &staged,
+            &names,
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
+        let (_, key_empty_nonshell) = assemble_extras_and_key(
+            payload.as_path(),
+            None,
+            None,
+            None,
+            &empty,
+            &empty_names,
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
+        assert_ne!(
+            key_with_staged_nonshell, key_empty_nonshell,
+            "non-shell-mode BaseKey must reflect staged contribution",
+        );
+
+        // Shell-mode arm (busybox=true forces shell mode without
+        // requiring any include_files / jemalloc extras).
+        let (_, key_with_staged_shell) = assemble_extras_and_key(
+            payload.as_path(),
+            None,
+            None,
+            None,
+            &staged,
+            &names,
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+        let (_, key_empty_shell) = assemble_extras_and_key(
+            payload.as_path(),
+            None,
+            None,
+            None,
+            &empty,
+            &empty_names,
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+        assert_ne!(
+            key_with_staged_shell, key_empty_shell,
+            "shell-mode BaseKey must reflect staged contribution",
+        );
+
+        // Belt-and-suspenders: shell-mode and non-shell-mode keys
+        // for the SAME staged set must differ (shell-mode keys mix
+        // a "ktstr-shell" sentinel — verify the shell-mode arm
+        // didn't accidentally call BaseKey::new).
+        assert_ne!(
+            key_with_staged_nonshell, key_with_staged_shell,
+            "shell-mode and non-shell-mode keys for same staged set \
+             must differ — confirms each arm calls its respective \
+             BaseKey constructor",
         );
     }
 }

@@ -118,6 +118,7 @@ impl BaseKey {
         scheduler: Option<&Path>,
         probe: Option<&Path>,
         worker: Option<&Path>,
+        staged: &[(&str, &Path)],
     ) -> Result<Self> {
         let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
 
@@ -151,6 +152,8 @@ impl BaseKey {
             None => 0u8.hash(&mut hasher),
         }
 
+        Self::hash_staged(staged, &mut hasher)?;
+
         Ok(BaseKey(hasher.finish()))
     }
 
@@ -165,6 +168,7 @@ impl BaseKey {
         scheduler: Option<&Path>,
         probe: Option<&Path>,
         worker: Option<&Path>,
+        staged: &[(&str, &Path)],
         include_files: &[(String, PathBuf)],
         busybox: bool,
     ) -> Result<Self> {
@@ -217,7 +221,28 @@ impl BaseKey {
             Self::hash_shared_libs(host_path, &mut hasher);
         }
 
+        Self::hash_staged(staged, &mut hasher)?;
+
         Ok(BaseKey(hasher.finish()))
+    }
+
+    /// Hash a set of staged schedulers into the cache key, sorted by
+    /// scheduler name for determinism (caller may pass entries in any
+    /// order). Each entry contributes its name, binary content hash,
+    /// and shared lib content — same shape as the boot-scheduler
+    /// hash chain so a content change in any staged binary invalidates
+    /// the cache. Length is hashed first so two staged sets that share
+    /// an entry prefix cannot collide (e.g. `[a]` vs `[a, b]`).
+    fn hash_staged(staged: &[(&str, &Path)], hasher: &mut AHasher) -> Result<()> {
+        let mut sorted: Vec<(&str, &Path)> = staged.to_vec();
+        sorted.sort_by_key(|(n, _)| *n);
+        sorted.len().hash(hasher);
+        for (name, binary) in &sorted {
+            name.hash(hasher);
+            hash_file(binary)?.hash(hasher);
+            Self::hash_shared_libs(binary, hasher);
+        }
+        Ok(())
     }
 
     /// Hash shared library paths and content samples for a binary so
@@ -640,14 +665,14 @@ mod tests {
     #[test]
     fn base_key_same_inputs_match() {
         let exe = crate::resolve_current_exe().unwrap();
-        let k1 = BaseKey::new(&exe, None, None, None).unwrap();
-        let k2 = BaseKey::new(&exe, None, None, None).unwrap();
+        let k1 = BaseKey::new(&exe, None, None, None, &[]).unwrap();
+        let k2 = BaseKey::new(&exe, None, None, None, &[]).unwrap();
         assert_eq!(k1, k2);
     }
 
     #[test]
     fn base_key_nonexistent_payload_fails() {
-        let result = BaseKey::new(Path::new("/nonexistent/binary"), None, None, None);
+        let result = BaseKey::new(Path::new("/nonexistent/binary"), None, None, None, &[]);
         assert!(result.is_err());
     }
 
@@ -661,10 +686,10 @@ mod tests {
         let bin = tmp.join("payload");
 
         std::fs::write(&bin, b"content_v1").unwrap();
-        let k1 = BaseKey::new(&bin, None, None, None).unwrap();
+        let k1 = BaseKey::new(&bin, None, None, None, &[]).unwrap();
 
         std::fs::write(&bin, b"content_v2").unwrap();
-        let k2 = BaseKey::new(&bin, None, None, None).unwrap();
+        let k2 = BaseKey::new(&bin, None, None, None, &[]).unwrap();
 
         assert_ne!(
             k1, k2,
@@ -675,9 +700,116 @@ mod tests {
     #[test]
     fn base_key_with_scheduler() {
         let exe = crate::resolve_current_exe().unwrap();
-        let k1 = BaseKey::new(&exe, None, None, None).unwrap();
-        let k2 = BaseKey::new(&exe, Some(&exe), None, None).unwrap();
+        let k1 = BaseKey::new(&exe, None, None, None, &[]).unwrap();
+        let k2 = BaseKey::new(&exe, Some(&exe), None, None, &[]).unwrap();
         assert_ne!(k1, k2, "with vs without scheduler should differ");
+    }
+
+    /// Adding a staged scheduler must invalidate the cache key —
+    /// otherwise two tests with different staged sets would silently
+    /// hit the same cached initramfs base and the second test's VM
+    /// would observe the FIRST test's `/staging/schedulers/` tree.
+    /// This is a load-bearing invariant: without it, the entire
+    /// scheduler-lifecycle Op story corrupts under realistic
+    /// parallel test execution.
+    #[test]
+    fn base_key_staged_addition_invalidates() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let empty = BaseKey::new(&exe, None, None, None, &[]).unwrap();
+        let one_staged =
+            BaseKey::new(&exe, None, None, None, &[("alt_args", exe.as_path())]).unwrap();
+        assert_ne!(
+            empty, one_staged,
+            "adding a staged scheduler must change the cache key"
+        );
+    }
+
+    /// Renaming a staged entry while keeping the binary identical
+    /// must invalidate the cache — two `(name, binary)` tuples that
+    /// share a binary path under different names produce different
+    /// archive layouts (`/staging/schedulers/<NAME>/...`) and a
+    /// shared cache key would write the wrong directory.
+    #[test]
+    fn base_key_staged_rename_invalidates() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let a = BaseKey::new(&exe, None, None, None, &[("alpha", exe.as_path())]).unwrap();
+        let b = BaseKey::new(&exe, None, None, None, &[("beta", exe.as_path())]).unwrap();
+        assert_ne!(
+            a, b,
+            "renaming a staged scheduler must change the cache key (archive layout differs)"
+        );
+    }
+
+    /// Caller-side ordering of the staged slice must NOT change the
+    /// resulting key — `hash_staged` sorts by name before mixing into
+    /// the hasher so two `KtstrTestEntry` instances whose
+    /// `staged_schedulers` slices happen to be declared in opposite
+    /// orders still share a cache entry. Without this, the cache
+    /// would unnecessarily rebuild the base whenever an author
+    /// reordered their `[&SchedA, &SchedB]` slice literal.
+    #[test]
+    fn base_key_staged_order_invariant() {
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-staged-order-test-")
+            .tempdir()
+            .unwrap();
+        let tmp = _tempdir_keep_alive.path();
+        let a_bin = tmp.join("a");
+        let b_bin = tmp.join("b");
+        std::fs::write(&a_bin, b"sched_a_content").unwrap();
+        std::fs::write(&b_bin, b"sched_b_content").unwrap();
+        let exe = crate::resolve_current_exe().unwrap();
+
+        let forward = BaseKey::new(
+            &exe,
+            None,
+            None,
+            None,
+            &[("alpha", a_bin.as_path()), ("beta", b_bin.as_path())],
+        )
+        .unwrap();
+        let reverse = BaseKey::new(
+            &exe,
+            None,
+            None,
+            None,
+            &[("beta", b_bin.as_path()), ("alpha", a_bin.as_path())],
+        )
+        .unwrap();
+        assert_eq!(
+            forward, reverse,
+            "staged set ordering must not affect the cache key"
+        );
+    }
+
+    /// A content change in any staged binary must invalidate the
+    /// cache — same shape rule as the boot scheduler. Catches the
+    /// silent-stale-binary failure mode where a developer rebuilds
+    /// `scx_layered`, reruns the test, and would see cached pre-fix
+    /// behavior because the staged hash chain didn't observe the
+    /// content change.
+    #[test]
+    fn base_key_staged_binary_content_invalidates() {
+        let _tempdir_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-staged-content-test-")
+            .tempdir()
+            .unwrap();
+        let tmp = _tempdir_keep_alive.path();
+        let staged_bin = tmp.join("staged");
+        let exe = crate::resolve_current_exe().unwrap();
+
+        std::fs::write(&staged_bin, b"sched_v1_content").unwrap();
+        let v1 = BaseKey::new(&exe, None, None, None, &[("alt", staged_bin.as_path())]).unwrap();
+
+        // mtime granularity guard — same as `hash_file_memoisation_invalidates_on_change`
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&staged_bin, b"sched_v2_content_different_length").unwrap();
+        let v2 = BaseKey::new(&exe, None, None, None, &[("alt", staged_bin.as_path())]).unwrap();
+
+        assert_ne!(
+            v1, v2,
+            "rebuilding a staged scheduler binary must invalidate the cache key"
+        );
     }
 
     #[test]
@@ -747,7 +879,7 @@ mod tests {
     #[test]
     fn base_cache_hit() {
         let exe = crate::resolve_current_exe().unwrap();
-        let key = BaseKey::new(&exe, None, None, None).unwrap();
+        let key = BaseKey::new(&exe, None, None, None, &[]).unwrap();
 
         // Insert a sentinel value.
         let sentinel = Arc::new(vec![0xDE, 0xAD]);
@@ -811,7 +943,7 @@ mod tests {
         let _lock = lock_env();
         let _env = EnvVarGuard::set("KTSTR_CARGO_TEST_MODE", "1");
         let exe = crate::resolve_current_exe().unwrap();
-        let key = BaseKey::new(&exe, None, None, None).unwrap();
+        let key = BaseKey::new(&exe, None, None, None, &[]).unwrap();
 
         // Plant a sentinel in the process-local cache so the
         // call's first-tier lookup returns it without invoking
