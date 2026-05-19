@@ -154,6 +154,64 @@ pub enum GaugeAgg {
     Max,
 }
 
+/// How a per-phase metric reduction merges across two
+/// [`crate::assert::AssertResult`]s that both carry a
+/// [`crate::assert::PhaseBucket`] at the same `step_index`.
+///
+/// Driven by [`MetricKind::merge_kind`] so a future
+/// [`MetricKind`] addition is forced to declare its merge
+/// semantic explicitly (the match is `#[non_exhaustive]`-aware
+/// via the helper rather than a bare `match` in every caller).
+///
+/// The split mirrors the rolling-aggregation contract in
+/// [`AssertResult::merge`](crate::assert::AssertResult::merge): the
+/// per-phase fold must commute so the accumulator pattern
+/// `AssertResult::pass().merge(real_a).merge(real_b)` yields the
+/// same result whether merges arrive in `a→b` or `b→a` order
+/// — EXCEPT for kinds whose reduction is intrinsically the LAST
+/// sample (`Gauge(Last)`, `Timestamp`), where the merge must
+/// resolve to the bucket whose `end_ms` is later.
+///
+/// Counter, Peak, and Gauge(Max/Avg) are commutative because their
+/// reductions are sum / max / weighted-mean respectively — all
+/// associative, commutative folds over reduced values. Gauge(Last)
+/// and Timestamp are NOT commutative under a per-merge cumulative
+/// fold (the "later" sample wins) so the merge uses `end_ms` as
+/// the tiebreaker rather than the operand order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MergeKind {
+    /// The reduction commutes: `merge(a, b) == merge(b, a)`. The
+    /// merge folds the two reduced values via the kind's natural
+    /// commutative operation (Counter → sum, Peak / Gauge(Max) →
+    /// max, Gauge(Avg) → weighted mean by `sample_count`).
+    Commutative,
+    /// The reduction is "the LATEST sample's value" (Gauge(Last),
+    /// Timestamp). The merge resolves to the value from whichever
+    /// bucket has the later `end_ms`; ties keep `self`.
+    NonCommutative,
+}
+
+impl MetricKind {
+    /// Map each [`MetricKind`] variant to the corresponding
+    /// [`MergeKind`] used by per-phase
+    /// [`AssertResult::merge`](crate::assert::AssertResult::merge).
+    /// Centralising the mapping here means a future kind
+    /// addition fails the build until the new variant is wired
+    /// (the inner `match` is exhaustive even though `MetricKind`
+    /// is `#[non_exhaustive]` because this fn lives in the same
+    /// crate).
+    pub fn merge_kind(self) -> MergeKind {
+        match self {
+            MetricKind::Counter => MergeKind::Commutative,
+            MetricKind::Peak => MergeKind::Commutative,
+            MetricKind::Gauge(GaugeAgg::Avg) => MergeKind::Commutative,
+            MetricKind::Gauge(GaugeAgg::Max) => MergeKind::Commutative,
+            MetricKind::Gauge(GaugeAgg::Last) => MergeKind::NonCommutative,
+            MetricKind::Timestamp => MergeKind::NonCommutative,
+        }
+    }
+}
+
 /// Reduce a slice of per-sample readings of the same metric into
 /// one representative value, dispatching on [`MetricKind`]. Used
 /// by sample-windowed comparison paths (e.g. multi-tick monitor

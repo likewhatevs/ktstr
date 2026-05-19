@@ -1549,6 +1549,132 @@ impl PhaseBucket {
     }
 }
 
+/// Merge two [`PhaseBucket`]s sharing the same `step_index` per
+/// the per-MetricKind dispatch in [`crate::stats::MergeKind`].
+/// Called by [`AssertResult::merge`] for matched buckets;
+/// unmatched buckets are appended verbatim by the caller.
+///
+/// Window-invariant merge:
+/// - `step_index`: equal by precondition (caller pairs buckets by
+///   `step_index`), kept from `a`.
+/// - `label`: kept from `a`. By construction the label is derived
+///   purely from `step_index` ("BASELINE" / "Step[k]") so both
+///   sides agree.
+/// - `start_ms`: `min(a.start_ms, b.start_ms)` so the merged
+///   window covers the earliest start of either side.
+/// - `end_ms`: `max(a.end_ms, b.end_ms)` so the merged window
+///   covers the latest end. Drives the [`crate::stats::MergeKind::NonCommutative`]
+///   tiebreak on Gauge(Last) / Timestamp metrics — the value
+///   from the bucket whose `end_ms` is later wins.
+/// - `sample_count`: `a + b`. Used as the weighting denominator
+///   for the `MetricKind::Gauge(GaugeAgg::Avg)` weighted mean.
+///
+/// Per-metric merge dispatches on the metric's [`crate::stats::MetricKind`]
+/// from the registry via [`crate::stats::metric_def`]:
+/// - `MetricKind::Counter` → `a + b` (the two reduced values are
+///   per-phase deltas; the merge across cgroups sums per-cgroup
+///   contributions to the phase delta, mirroring how
+///   `ScenarioStats::total_migrations` adds across cgroups).
+/// - `MetricKind::Peak` and `MetricKind::Gauge(GaugeAgg::Max)` →
+///   `max(a, b)` (the worst-case "peak that fired" survives).
+/// - `MetricKind::Gauge(GaugeAgg::Avg)` → weighted mean
+///   `(a * a_count + b * b_count) / (a_count + b_count)` so the
+///   merged mean is the unbiased combination of both side's
+///   per-phase means weighted by sample population. Falls back to
+///   `(a + b) / 2.0` when both sample_counts are zero (the
+///   per-cgroup default-merge accumulator pattern can produce
+///   this transient before any real merge).
+/// - `MetricKind::Gauge(GaugeAgg::Last)` and `MetricKind::Timestamp`
+///   → value from the bucket with the larger `end_ms`; ties keep
+///   `a`'s value. Captures the "latest-sample-wins" semantic per
+///   the [`crate::stats::MergeKind::NonCommutative`] contract.
+///
+/// Unregistered metric names (not in [`crate::stats::METRICS`])
+/// fall back to a commutative arithmetic mean
+/// `(a + b) / 2.0`. The mean is the safest default for an unknown
+/// kind: sum would over-count Gauge / Timestamp values, max would
+/// lose Counter / Avg signal, and "last" requires a tiebreak the
+/// caller can't compute without the kind. Producers attaching
+/// unregistered metrics to a `PhaseBucket` should add them to
+/// `METRICS` to get the typed merge instead of the fallback.
+fn merge_matched_phase_buckets(a: PhaseBucket, b: PhaseBucket) -> PhaseBucket {
+    debug_assert_eq!(
+        a.step_index, b.step_index,
+        "merge_matched_phase_buckets: caller must pair by step_index",
+    );
+    let mut metrics = std::collections::BTreeMap::new();
+    // Collect every key present on either side; iterate once,
+    // dispatching per the kind of the key (or the unregistered
+    // mean fallback) so the merge is single-pass.
+    let mut keys: std::collections::BTreeSet<&String> = a.metrics.keys().collect();
+    keys.extend(b.metrics.keys());
+    for key in keys {
+        let av = a.metrics.get(key).copied();
+        let bv = b.metrics.get(key).copied();
+        let merged = match (av, bv) {
+            (Some(av), Some(bv)) => {
+                let kind = crate::stats::metric_def(key).map(|m| m.kind);
+                merge_metric_values(kind, av, bv, a.sample_count, b.sample_count, a.end_ms, b.end_ms)
+            }
+            (Some(v), None) | (None, Some(v)) => v,
+            (None, None) => continue,
+        };
+        metrics.insert(key.clone(), merged);
+    }
+    PhaseBucket {
+        step_index: a.step_index,
+        label: a.label,
+        start_ms: a.start_ms.min(b.start_ms),
+        end_ms: a.end_ms.max(b.end_ms),
+        sample_count: a.sample_count + b.sample_count,
+        metrics,
+    }
+}
+
+/// Per-metric merge inner helper used by
+/// [`merge_matched_phase_buckets`]. Dispatches on the metric's
+/// [`crate::stats::MetricKind`] (or the unregistered fallback)
+/// to combine two reduced values into one.
+///
+/// `a_count` / `b_count` are the source buckets' `sample_count`
+/// fields, used as weights for `Gauge(Avg)`. `a_end_ms` /
+/// `b_end_ms` are the source buckets' window-end timestamps,
+/// used to pick the later sample for `Gauge(Last)` / `Timestamp`.
+fn merge_metric_values(
+    kind: Option<crate::stats::MetricKind>,
+    a: f64,
+    b: f64,
+    a_count: usize,
+    b_count: usize,
+    a_end_ms: u64,
+    b_end_ms: u64,
+) -> f64 {
+    use crate::stats::{GaugeAgg, MetricKind};
+    match kind {
+        Some(MetricKind::Counter) => a + b,
+        Some(MetricKind::Peak) | Some(MetricKind::Gauge(GaugeAgg::Max)) => a.max(b),
+        Some(MetricKind::Gauge(GaugeAgg::Avg)) => {
+            let total_count = a_count + b_count;
+            if total_count == 0 {
+                (a + b) / 2.0
+            } else {
+                let a_w = a_count as f64;
+                let b_w = b_count as f64;
+                (a * a_w + b * b_w) / (total_count as f64)
+            }
+        }
+        Some(MetricKind::Gauge(GaugeAgg::Last)) | Some(MetricKind::Timestamp) => {
+            if b_end_ms > a_end_ms { b } else { a }
+        }
+        // Unregistered metric: commutative mean fallback. Sum
+        // would over-count Gauge values; max would lose Counter
+        // signal; "last" needs a tiebreak the caller can't
+        // compute without the kind. Mean is the safest commutative
+        // default.
+        None => (a + b) / 2.0,
+    }
+}
+
 /// Aggregated statistics across all cgroups in a scenario.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, crate::Claim)]
 pub struct ScenarioStats {
@@ -2158,7 +2284,7 @@ impl AssertResult {
     /// Fail in the stream so [`Self::outcome`]'s fold surfaces them,
     /// and Skip survives only when both inputs were Skip-only because
     /// a Pass entry in either side beats Skip per the merge precedence.
-    pub fn merge(&mut self, other: AssertResult) {
+    pub fn merge(&mut self, mut other: AssertResult) {
         /// Lowest-non-zero fold: `*self_field` becomes `other_field`
         /// when `other_field` is strictly positive AND either
         /// `*self_field` is zero (uninitialized sentinel) or
@@ -2257,6 +2383,41 @@ impl AssertResult {
                 entry.min(*v)
             };
         }
+        // Merge `phases` per `step_index`. For matched phases on
+        // both sides, fold per-metric using `MetricKind::merge_kind`
+        // to pick the commutative or NonCommutative path. Unpaired
+        // phases (one side only) carry through verbatim — never
+        // silently dropped, per the no-silent-drops contract. The
+        // result is sorted by `step_index` for a deterministic
+        // observable order regardless of merge-arrival order.
+        //
+        // Move `other.stats.phases` out before the per-cgroup
+        // extend below (which moves the sibling `cgroups` field).
+        // After the take, `other.stats.phases` is an empty Vec —
+        // never read again because the rest of this fn references
+        // only `other.stats.cgroups` and `other.measurements`.
+        let other_phases = std::mem::take(&mut other.stats.phases);
+        if !self.stats.phases.is_empty() || !other_phases.is_empty() {
+            let mut other_by_idx: std::collections::BTreeMap<u16, PhaseBucket> = other_phases
+                .into_iter()
+                .map(|b| (b.step_index, b))
+                .collect();
+            let self_buckets = std::mem::take(&mut self.stats.phases);
+            let mut merged: Vec<PhaseBucket> = Vec::with_capacity(
+                self_buckets.len() + other_by_idx.len(),
+            );
+            for s_bucket in self_buckets {
+                if let Some(o_bucket) = other_by_idx.remove(&s_bucket.step_index) {
+                    merged.push(merge_matched_phase_buckets(s_bucket, o_bucket));
+                } else {
+                    merged.push(s_bucket);
+                }
+            }
+            merged.extend(other_by_idx.into_values());
+            merged.sort_by_key(|b| b.step_index);
+            self.stats.phases = merged;
+        }
+
         // Append per-cgroup stats last: moving `other.stats.cgroups`
         // here consumes `other.stats`, so every scalar/map access
         // above goes through the `&other.stats` reference first.
