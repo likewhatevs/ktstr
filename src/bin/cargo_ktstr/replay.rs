@@ -254,9 +254,10 @@ pub(crate) enum ReplayOutcome {
     /// - The test was removed from the suite between runs.
     /// - The `--filter` narrowed past it.
     /// - nextest crashed before reaching the test.
+    ///
     /// The classifier itself doesn't distinguish — the inline
-    /// triage hint in [`render_outcome_diff`] surfaces all
-    /// three causes for the operator.
+    /// triage hint in [`render_outcome_diff`] surfaces all three
+    /// causes for the operator.
     Dropped,
     /// Test_name has multiple post-replay sidecars and they
     /// DISAGREE — at least one passed and at least one failed.

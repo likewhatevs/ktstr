@@ -3484,10 +3484,10 @@ impl PhaseDisplayOptions {
     /// Returns `true` when no relevant flag is set (default
     /// path: every step renders).
     pub fn matches_phase(&self, step_index: u16) -> bool {
-        if let Some(want) = self.phase {
-            if step_index != want {
-                return false;
-            }
+        if let Some(want) = self.phase
+            && step_index != want
+        {
+            return false;
         }
         if self.steps_only && step_index == 0 {
             return false;
