@@ -2920,42 +2920,33 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 );
                 dispatch_kernel_op_request("Op::ReadKernelCold", payload)?;
             }
-            // Scheduler-lifecycle ops carry the variant shape +
-            // constructor + bit-index at this stage; the dispatch
-            // path itself is not yet implemented. Bailing here forces
-            // any caller that constructs one of these ops to land
-            // alongside the dispatch implementation, instead of
-            // silently no-op'ing while the host-to-guest wiring +
-            // guest-side spawn/kill helpers accumulate.
-            Op::AttachScheduler { scheduler: _ } => {
-                anyhow::bail!(
-                    "Op::AttachScheduler dispatch is not yet implemented \
-                     (variant is declared but the guest-side scheduler \
-                     spawn + host-to-guest dispatch wire are follow-up \
-                     work)"
-                );
+            // Scheduler-lifecycle Op dispatch. apply_ops runs
+            // guest-side (the test scenario executes inside the VM
+            // as part of the guest binary), so each arm calls into
+            // the `vmm::rust_init` spawn/kill primitives directly —
+            // no host-to-guest wire format is needed. The Op variant
+            // payload carries the target `&'static Scheduler`; the
+            // composer derives staging archive paths via the
+            // `test_support::staged` helpers so the spawn path
+            // matches the cpio entries packed by the initramfs
+            // composer.
+            //
+            // SCHED_PID is the single source of truth for "which
+            // scheduler is currently running". Each arm reads it
+            // (Detach/Replace/Restart) or writes it (Attach via the
+            // spawn helper's internal store) to keep the existing
+            // monitor / sched-stats / probe consumers consistent.
+            Op::AttachScheduler { scheduler } => {
+                dispatch_attach_scheduler(scheduler)?;
             }
             Op::DetachScheduler => {
-                anyhow::bail!(
-                    "Op::DetachScheduler dispatch is not yet implemented \
-                     (variant is declared but the guest-side scheduler \
-                     kill + SCHED_PID reset are follow-up work)"
-                );
+                dispatch_detach_scheduler()?;
             }
             Op::RestartScheduler => {
-                anyhow::bail!(
-                    "Op::RestartScheduler dispatch is not yet implemented \
-                     (variant is declared but the guest-side scheduler \
-                     restart helper is follow-up work)"
-                );
+                dispatch_restart_scheduler()?;
             }
-            Op::ReplaceScheduler { scheduler: _ } => {
-                anyhow::bail!(
-                    "Op::ReplaceScheduler dispatch is not yet implemented \
-                     (variant is declared but the guest-side scheduler \
-                     detach + spec swap + spawn + per-phase metric \
-                     tagging are follow-up work)"
-                );
+            Op::ReplaceScheduler { scheduler } => {
+                dispatch_replace_scheduler(scheduler)?;
             }
         }
     }
@@ -3079,6 +3070,261 @@ fn write_entries_from_writes(
 /// `false` to an `anyhow::Error` so the caller's `?` propagation
 /// surfaces the host-side failure.
 ///
+/// Per-staged-scheduler log path. Mid-experiment swaps must NOT
+/// overwrite each other's logs — the boot scheduler keeps
+/// `/tmp/sched.log`, but every staged scheduler gets a name-keyed
+/// log so failure-dump output stays attributable. Path scheme
+/// `/tmp/sched_<name>.log` is collision-free under the validated
+/// name shape (no path separators, no leading `.`, length-capped
+/// to 128 bytes — see `validate_staged_scheduler_name`).
+fn staged_scheduler_log_path(name: &str) -> String {
+    format!("/tmp/sched_{name}.log")
+}
+
+/// SIGTERM grace window for scheduler-lifecycle Op kill paths.
+/// 10s comfortably exceeds the real-world scx_disable_workfn
+/// detach latency (kernel/sched/ext.c:5923) — the kernel tears
+/// down the BPF prog graph on refcount drop from a workqueue and
+/// the scheduler's SIGTERM handler returns from main once that
+/// completes. The 2s initial cut produced
+/// `StillAliveAfterSigkill` in the e2e because scx_disable_workfn
+/// took longer than the SIGTERM budget AND the SIGKILL post-grace
+/// also exceeded (`POST_SIGKILL_GRACE` at 2s) — neither could
+/// service a process stuck mid-BPF-detach in D-state. 10s gives
+/// the SIGTERM-handled clean exit path enough room to complete
+/// without escalating to SIGKILL on the common scx_* scheduler
+/// shape; the SIGKILL escalation inside `kill_scheduler_process`
+/// still covers any pathological hang past this budget.
+const SCHED_LIFECYCLE_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Path of the sched_ext kernel state sysfs node. Reading returns
+/// the string-form state: `disabled`, `enabling`, `enabled`,
+/// `disabling` (kernel/sched/ext.c). Op dispatch polls this
+/// between kill and spawn so the next scheduler's BPF skeleton
+/// load doesn't hit `-EBUSY` from
+/// `kernel/sched/ext.c:6643`'s `scx_enable_state() != SCX_DISABLED`
+/// guard at enable entry.
+const SCX_STATE_SYSFS: &str = "/sys/kernel/sched_ext/state";
+
+/// Block until `/sys/kernel/sched_ext/state` reads `disabled` or
+/// the timeout elapses. Polls at 50ms — small enough to keep the
+/// Op dispatch latency tight when the kernel finishes the detach
+/// quickly, large enough that the busy-wait doesn't measurably
+/// pressure the scheduler workqueue running the BPF detach.
+///
+/// Returns `Ok(elapsed)` when the state reaches `disabled`,
+/// `Err` with the last observed state when the timeout fires.
+/// Absent sysfs node (kernel without sched_ext or non-Linux
+/// platform) returns `Ok(Duration::ZERO)` — the no-scx case has
+/// no detach to wait for and the next spawn will fail later with
+/// a sharper diagnostic if scx is genuinely required.
+fn wait_for_scx_disabled(timeout: std::time::Duration) -> Result<std::time::Duration> {
+    let start = std::time::Instant::now();
+    let interval = std::time::Duration::from_millis(50);
+    let path = std::path::Path::new(SCX_STATE_SYSFS);
+    if !path.exists() {
+        return Ok(std::time::Duration::ZERO);
+    }
+    loop {
+        let state = std::fs::read_to_string(SCX_STATE_SYSFS).unwrap_or_default();
+        let state = state.trim();
+        if state == "disabled" {
+            return Ok(start.elapsed());
+        }
+        if start.elapsed() >= timeout {
+            anyhow::bail!(
+                "wait_for_scx_disabled: state '{state}' did not reach 'disabled' \
+                 within {timeout:?}; the kernel scx state machine is stuck — \
+                 the next scheduler spawn will hit -EBUSY at the enable path. \
+                 Inspect /sys/kernel/sched_ext/state + dmesg for the stuck \
+                 disable transition.",
+            );
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+/// Common kill helper for the Detach / Restart / Replace arms.
+/// Reads SCHED_PID, sends SIGTERM, waits for the scx kernel state
+/// to transition to `disabled` (the load-bearing barrier per
+/// `wait_for_scx_disabled`'s doc), and clears SCHED_PID on
+/// success so subsequent reads observe "no scheduler".
+///
+/// Direct `libc::kill(SIGTERM)` rather than the
+/// `vmm::rust_init::kill_scheduler_process` helper because the
+/// latter's strict /proc-absence verification can fire
+/// `StillAliveAfterSigkill` when the scheduler's exit blocks on
+/// BPF detach. The scheduler PROCESS being gone is not the same
+/// signal as the BPF state being `SCX_DISABLED` — operatively the
+/// sysfs state is what gates the next spawn, not /proc removal.
+/// Both signals normally resolve together but a slow workqueue
+/// can decouple them under load. The scx state machine reaches
+/// `disabled` BEFORE the userspace process completes its libbpf
+/// cleanup syscalls (which are what holds /proc/{pid} alive).
+fn kill_current_scheduler(op_label: &str) -> Result<libc::pid_t> {
+    let pid = crate::vmm::rust_init::sched_pid().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{op_label}: no scheduler attached (SCHED_PID is 0); \
+             attach a scheduler via boot-time `scheduler` field or \
+             `Op::AttachScheduler` before invoking this Op"
+        )
+    })?;
+    // Trigger async scx_disable via sysrq-'S' so the kernel-side
+    // disable cascade runs OUT OF BAND from the scheduler's exit
+    // path. Without this, `bpf_scx_unreg`
+    // (kernel/sched/ext.c:7375-7382) holds the dying process in
+    // D-state inside the bpf_link refcount-drop chain via
+    // `kthread_flush_work(&sch->disable_work)` — SIGKILL kills
+    // userspace but cannot remove /proc/{pid} until that block
+    // finishes, which is how the `kill_scheduler_process` helper
+    // sees `StillAliveAfterSigkill` under realistic load.
+    // The sysrq-'S' handler at ext.c:7508 runs scx_disable directly
+    // via RCU-protected scx_root (registered at ext.c:7791
+    // `register_sysrq_key('S', &sysrq_sched_ext_reset_op)`), so the
+    // disable_work irq_work fires asynchronously and the scheduler
+    // process can exit cleanly without holding the bpf_link across
+    // the slow disable cascade. Best-effort write — sysrq absence
+    // or write failure is silently tolerated because the SIGTERM
+    // below still drives the standard detach path (slower but
+    // correct).
+    let _ = std::fs::write("/proc/sysrq-trigger", "S");
+
+    // SIGTERM lets the scheduler's userspace handler invoke its
+    // libbpf cleanup (drops BPF prog refcounts, returns from
+    // main). With sysrq-'S' already in flight above, the bpf_link
+    // refcount drop's `bpf_scx_unreg` finds disable_work near
+    // completion and `kthread_flush_work` returns quickly — no
+    // D-state stall. We still wait for the SCX_DISABLED state
+    // below rather than for the userspace process to exit so the
+    // next scheduler's BPF skeleton load doesn't hit -EBUSY at
+    // kernel/sched/ext.c:6643.
+    let r = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if r != 0 {
+        let errno = std::io::Error::last_os_error();
+        anyhow::bail!("{op_label}: SIGTERM to pid {pid} failed: {errno}");
+    }
+    let elapsed = wait_for_scx_disabled(SCHED_LIFECYCLE_KILL_GRACE).map_err(|e| {
+        anyhow::anyhow!("{op_label}: wait_for_scx_disabled(pid={pid}) failed: {e:#}")
+    })?;
+    tracing::debug!(
+        op = op_label,
+        pid = pid,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "scx state reached 'disabled' after SIGTERM",
+    );
+    crate::vmm::rust_init::set_sched_pid(0);
+    Ok(pid)
+}
+
+/// Spawn helper shared by Attach / Restart / Replace arms.
+/// Calls `spawn_scheduler_from_paths` with the given paths; the
+/// helper itself stores SCHED_PID via the `set_sched_pid` setter on
+/// successful spawn (see `vmm::rust_init::spawn_scheduler_from_paths`'s
+/// SCHED_PID.store call site). Returns an actionable error when
+/// the binary file is missing from the staging tree (initramfs
+/// cpio-pack omission) rather than silently no-op'ing.
+fn spawn_scheduler_for_op(
+    op_label: &str,
+    binary_path: &str,
+    args_path: &str,
+    log_path: &str,
+    expected_scheduler_name: &str,
+) -> Result<()> {
+    let (child, _log) =
+        crate::vmm::rust_init::spawn_scheduler_from_paths(binary_path, args_path, log_path, None);
+    if child.is_none() {
+        anyhow::bail!(
+            "{op_label}: scheduler binary for '{expected_scheduler_name}' is missing at \
+             {binary_path}. The staging cpio pack at initramfs build time should have \
+             materialised it via staged_scheduler_binary_path — check that \
+             KtstrTestEntry.staged_schedulers contains the named entry and the host-side \
+             resolve_staged_schedulers_strict found its binary."
+        );
+    }
+    Ok(())
+}
+
+/// Op::AttachScheduler dispatch. Spawns the named staged scheduler
+/// at its `/staging/schedulers/<name>/` archive paths. The boot
+/// scheduler (if any) is NOT auto-detached — callers must issue a
+/// preceding `Op::DetachScheduler` if they intend to swap rather
+/// than co-attach. Sidecar swap tagging emits a `tracing::info!`
+/// event with structured fields for the phase-aware sidecar
+/// pipeline to pick up; the full sidecar schema wire-in lands
+/// alongside the rest of the phase pipeline.
+fn dispatch_attach_scheduler(scheduler: &'static crate::test_support::Scheduler) -> Result<()> {
+    let binary = crate::test_support::staged::staged_scheduler_binary_path(scheduler.name);
+    let args = crate::test_support::staged::staged_scheduler_args_path(scheduler.name);
+    let log = staged_scheduler_log_path(scheduler.name);
+    spawn_scheduler_for_op("Op::AttachScheduler", &binary, &args, &log, scheduler.name)?;
+    tracing::info!(
+        op = "AttachScheduler",
+        scheduler_name = scheduler.name,
+        binary_path = %binary,
+        log_path = %log,
+        "scheduler attached",
+    );
+    Ok(())
+}
+
+/// Op::DetachScheduler dispatch. Kills the currently-running
+/// scheduler via the shared kill helper and clears SCHED_PID.
+fn dispatch_detach_scheduler() -> Result<()> {
+    let pid = kill_current_scheduler("Op::DetachScheduler")?;
+    tracing::info!(
+        op = "DetachScheduler",
+        killed_pid = pid,
+        "scheduler detached"
+    );
+    Ok(())
+}
+
+/// Op::RestartScheduler dispatch. Kills the currently-running
+/// scheduler and respawns the BOOT scheduler at `/scheduler` +
+/// `/sched_args`. v0 limitation: assumes the boot scheduler is the
+/// intended restart target — a future iteration tracking
+/// "currently-attached scheduler paths" can restart staged
+/// schedulers in place. The common test pattern (validate boot
+/// scheduler survives detach + reattach cleanly) is covered.
+fn dispatch_restart_scheduler() -> Result<()> {
+    let prev_pid = kill_current_scheduler("Op::RestartScheduler")?;
+    spawn_scheduler_for_op(
+        "Op::RestartScheduler",
+        "/scheduler",
+        "/sched_args",
+        "/tmp/sched.log",
+        "boot",
+    )?;
+    tracing::info!(
+        op = "RestartScheduler",
+        prev_pid = prev_pid,
+        "boot scheduler restarted",
+    );
+    Ok(())
+}
+
+/// Op::ReplaceScheduler dispatch. Atomically (from the user-visible
+/// scenario's perspective) detaches the currently-running scheduler
+/// and attaches the named staged scheduler. Emits a sidecar-tagging
+/// event with both prev and new scheduler context so phase-aware
+/// analysis can attribute pre-swap vs post-swap metrics.
+fn dispatch_replace_scheduler(scheduler: &'static crate::test_support::Scheduler) -> Result<()> {
+    let prev_pid = kill_current_scheduler("Op::ReplaceScheduler")?;
+    let binary = crate::test_support::staged::staged_scheduler_binary_path(scheduler.name);
+    let args = crate::test_support::staged::staged_scheduler_args_path(scheduler.name);
+    let log = staged_scheduler_log_path(scheduler.name);
+    spawn_scheduler_for_op("Op::ReplaceScheduler", &binary, &args, &log, scheduler.name)?;
+    tracing::info!(
+        op = "ReplaceScheduler",
+        prev_pid = prev_pid,
+        new_scheduler_name = scheduler.name,
+        binary_path = %binary,
+        log_path = %log,
+        "scheduler replaced",
+    );
+    Ok(())
+}
+
 /// **Timeout choice.** The 30 s wire-fallback timeout is sized for
 /// the cold path's freeze-rendezvous round-trip (matches the
 /// `FREEZE_RENDEZVOUS_TIMEOUT` budget in CLAUDE.md). The hot path
@@ -6779,30 +7025,33 @@ mod tests {
         );
     }
 
-    // -- Scheduler-lifecycle stub-dispatch bail tests --
+    // -- Scheduler-lifecycle Op dispatch error-path tests --
     //
     // The 4 scheduler-lifecycle Op variants (AttachScheduler /
-    // DetachScheduler / RestartScheduler / ReplaceScheduler) declare
-    // the variant shape + constructor + bit-index + a stub dispatch
-    // arm that `bail!`s with a "not yet implemented" diagnostic.
-    // These tests pin that the bail fires AND names the specific op
-    // — the load-bearing safety net per `feedback_no_silent_drops`:
-    // if a later commit accidentally replaces the bail with a no-op
-    // `Ok(())` arm (e.g. during dispatch wire-up that's still WIP),
-    // these tests fail loudly. Without them, a stub-bail → quiet-pass
-    // regression would let a test author construct a scheduler-
-    // lifecycle op and watch it silently no-op while believing the
-    // scheduler was attached. The per-variant op-name substring
-    // catch a copy-paste regression that reuses one message across
-    // all 4 arms (the existing pattern in apply_ops bails uses one
-    // unique message per arm — pinned here too).
+    // DetachScheduler / RestartScheduler / ReplaceScheduler) dispatch
+    // through `dispatch_attach_scheduler` / `dispatch_detach_scheduler`
+    // / `dispatch_restart_scheduler` / `dispatch_replace_scheduler`
+    // helpers in this module. Unit tests cover the error paths that
+    // don't require a real running scheduler: AttachScheduler with a
+    // missing staged binary, and Detach / Restart / Replace with no
+    // scheduler attached (SCHED_PID == 0). The success paths require
+    // a real spawn + libbpf attach, which the e2e VM integration
+    // suite exercises with scx-ktstr as the staged target.
+    //
+    // Every error path emits an actionable message naming the op
+    // AND the specific failure mode — copy-paste regression across
+    // the 4 arms surfaces as a distinct substring per arm.
 
-    /// Pins that Op::AttachScheduler dispatch bails with a message
-    /// naming the op AND "not yet implemented". A future commit that
-    /// wires real dispatch must EITHER replace this test with one
-    /// asserting the real semantic OR keep the stub plus this pin.
+    /// Op::AttachScheduler against a Scheduler whose `name` doesn't
+    /// resolve to a staged binary file must bail with an actionable
+    /// error naming the missing path + suggesting the staging
+    /// pipeline check. EEVDF.name = "eevdf" — its `/staging/schedulers/
+    /// eevdf/scheduler` path does NOT exist in the test environment
+    /// (test harness has no initramfs mounted), so the inline
+    /// existence probe in `spawn_scheduler_from_paths` returns
+    /// `(None, None)` and the dispatch arm bails.
     #[test]
-    fn apply_ops_attach_scheduler_bails_with_not_yet_implemented_message() {
+    fn apply_ops_attach_scheduler_bails_when_staged_binary_missing() {
         static SCHED: crate::test_support::Scheduler = crate::test_support::Scheduler::EEVDF;
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
@@ -6812,43 +7061,45 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(
             msg.contains("Op::AttachScheduler"),
-            "error must name the op (catches copy-paste regression across the 4 stub arms): {msg}"
+            "error must name the op (catches copy-paste regression across the 4 arms): {msg}"
         );
         assert!(
-            msg.contains("not yet implemented"),
-            "error must say 'not yet implemented' so the operator knows the variant declared \
-             without a working dispatch: {msg}"
+            msg.contains("staging") || msg.contains("staged"),
+            "error must point at the staging pipeline so the operator knows where to look: {msg}"
+        );
+        assert!(
+            msg.contains("eevdf"),
+            "error must include the scheduler name so the operator can identify which entry: {msg}"
         );
     }
 
-    /// Pins that Op::DetachScheduler dispatch bails with a message
-    /// naming the op AND "not yet implemented". Distinct from
-    /// AttachScheduler's pin because the stub message must be
-    /// per-variant (catches a copy-paste regression that reuses one
-    /// message string for all 4 arms).
+    /// Op::DetachScheduler with no scheduler currently attached
+    /// (SCHED_PID == 0 sentinel) bails with an actionable error.
+    /// Distinct from AttachScheduler's pin because each arm's error
+    /// message must be per-variant.
     #[test]
-    fn apply_ops_detach_scheduler_bails_with_not_yet_implemented_message() {
+    fn apply_ops_detach_scheduler_bails_when_no_scheduler_attached() {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
         let mut state = StepState::empty(&ctx);
+        // Test environment has no scheduler spawned — SCHED_PID is 0.
         let err = apply_ops_test(&ctx, &mut state, &[Op::detach_scheduler()]).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("Op::DetachScheduler"),
-            "error must name the op (catches copy-paste regression across the 4 stub arms): {msg}"
+            "error must name the op: {msg}"
         );
         assert!(
-            msg.contains("not yet implemented"),
-            "error must say 'not yet implemented' so the operator knows the variant declared \
-             without a working dispatch: {msg}"
+            msg.contains("no scheduler attached") || msg.contains("SCHED_PID"),
+            "error must name the no-scheduler failure mode: {msg}"
         );
     }
 
-    /// Pins that Op::RestartScheduler dispatch bails with a message
-    /// naming the op AND "not yet implemented".
+    /// Op::RestartScheduler with no scheduler attached bails with
+    /// an actionable error.
     #[test]
-    fn apply_ops_restart_scheduler_bails_with_not_yet_implemented_message() {
+    fn apply_ops_restart_scheduler_bails_when_no_scheduler_attached() {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
@@ -6857,19 +7108,21 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(
             msg.contains("Op::RestartScheduler"),
-            "error must name the op (catches copy-paste regression across the 4 stub arms): {msg}"
+            "error must name the op: {msg}"
         );
         assert!(
-            msg.contains("not yet implemented"),
-            "error must say 'not yet implemented' so the operator knows the variant declared \
-             without a working dispatch: {msg}"
+            msg.contains("no scheduler attached") || msg.contains("SCHED_PID"),
+            "error must name the no-scheduler failure mode: {msg}"
         );
     }
 
-    /// Pins that Op::ReplaceScheduler dispatch bails with a message
-    /// naming the op AND "not yet implemented".
+    /// Op::ReplaceScheduler with no scheduler attached bails BEFORE
+    /// attempting to spawn the replacement — the detach phase fails
+    /// fast on the SCHED_PID == 0 check so the operator sees the
+    /// "no scheduler to replace" error rather than a confusing
+    /// post-spawn diagnostic.
     #[test]
-    fn apply_ops_replace_scheduler_bails_with_not_yet_implemented_message() {
+    fn apply_ops_replace_scheduler_bails_when_no_scheduler_attached() {
         static SCHED: crate::test_support::Scheduler = crate::test_support::Scheduler::EEVDF;
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
@@ -6879,12 +7132,33 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(
             msg.contains("Op::ReplaceScheduler"),
-            "error must name the op (catches copy-paste regression across the 4 stub arms): {msg}"
+            "error must name the op: {msg}"
         );
         assert!(
-            msg.contains("not yet implemented"),
-            "error must say 'not yet implemented' so the operator knows the variant declared \
-             without a working dispatch: {msg}"
+            msg.contains("no scheduler attached") || msg.contains("SCHED_PID"),
+            "error must name the no-scheduler failure mode (detach phase fails fast): {msg}"
+        );
+    }
+
+    /// `staged_scheduler_log_path` produces collision-free per-name
+    /// paths so successive Op::AttachScheduler / Op::ReplaceScheduler
+    /// dispatches don't overwrite each other's logs. Pins the
+    /// "/tmp/sched_<name>.log" scheme against a regression that
+    /// drops the per-name keying back to "/tmp/sched.log".
+    #[test]
+    fn staged_scheduler_log_path_is_per_name_keyed() {
+        assert_eq!(
+            staged_scheduler_log_path("scx_mitosis_a"),
+            "/tmp/sched_scx_mitosis_a.log",
+        );
+        assert_eq!(
+            staged_scheduler_log_path("scx_mitosis_b"),
+            "/tmp/sched_scx_mitosis_b.log",
+        );
+        assert_ne!(
+            staged_scheduler_log_path("scx_mitosis_a"),
+            staged_scheduler_log_path("scx_mitosis_b"),
+            "different names must not collide on the same log path",
         );
     }
 

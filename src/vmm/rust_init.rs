@@ -100,6 +100,20 @@ pub(crate) fn sched_pid() -> Option<libc::pid_t> {
     if v == 0 { None } else { Some(v) }
 }
 
+/// Publish `pid` to the [`SCHED_PID`] side channel. Used by the
+/// scheduler-lifecycle Op dispatch on the guest to swap the live PID
+/// across Detach (`pid = 0`) / Attach (`pid = new child`) /
+/// Replace (`pid = swap`) transitions. The boot path
+/// ([`spawn_scheduler_from_paths`]) calls this directly with the
+/// freshly-spawned `child.id()`.
+///
+/// `Release` ordering pairs with the `Acquire` load in
+/// [`sched_pid`]; the writer's side effects (Op log emit, prior
+/// kill) are visible to the next reader.
+pub(crate) fn set_sched_pid(pid: libc::pid_t) {
+    SCHED_PID.store(pid, Ordering::Release);
+}
+
 /// RAII guard that flips SIGCHLD to a target disposition on
 /// construction and restores the previous handler on drop. Used by
 /// [`with_sigchld_default`] so a panic inside the closure cannot
@@ -394,16 +408,26 @@ pub(crate) fn kill_scheduler_process(
 
 /// Post-SIGKILL grace inside [`kill_scheduler_process`]. SIGKILL
 /// triggers the kernel's `exit_notify` → `release_task` cascade
-/// (kernel/exit.c) which removes `/proc/{pid}`; the wait here is
-/// purely defense-in-depth against pathological kernel scheduling
-/// (D-state hangs, slow workqueues) rather than an expected duration.
-/// A `StillAliveAfterSigkill` firing in production indicates
-/// something structurally wrong with the target process or kernel
-/// state — operators should treat the variant as a debug signal, not
-/// a transient retry case. Carried as a module-level const so the
-/// value is greppable + paired with a single doc explaining the
-/// choice rather than left as a magic number at the call site.
-const POST_SIGKILL_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+/// (kernel/exit.c) which removes `/proc/{pid}`; the wait here covers
+/// both the routine reap path (sub-100ms for a simple userspace
+/// process) AND the scheduler-lifecycle Op kill path where an scx
+/// scheduler's exit blocks on `scx_disable_workfn`
+/// (`kernel/sched/ext.c:5923`) tearing down BPF programs from a
+/// workqueue. BPF tear-down dominates the SIGKILL→/proc removal
+/// latency for scx_* binaries and routinely exceeds 1s on
+/// loaded kernels; 2s leaves comfortable headroom while keeping
+/// the unit-test fast for the simple-process case (the test
+/// closure exits immediately on SIGKILL so the post-SIGKILL poll
+/// returns in <50ms).
+///
+/// A `StillAliveAfterSigkill` firing AFTER this budget indicates a
+/// structurally wrong target — D-state hang, kernel UB, BPF cleanup
+/// deadlock — and operators should treat the variant as a debug
+/// signal, not a transient retry case. Carried as a module-level
+/// const so the value is greppable + paired with a single doc
+/// explaining the choice rather than left as a magic number at the
+/// call site.
+const POST_SIGKILL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Poll `/proc/{pid}` for absence up to `timeout`, sleeping at the
 /// caller's `interval` cadence between checks. Returns `true` if the
@@ -2584,7 +2608,7 @@ fn poll_startup(
 /// success path's drain runs in [`start_sched_exit_monitor`]
 /// instead — it sees the scheduler exit notification and waits on
 /// `output_done` there.
-struct ProbeDrain {
+pub(crate) struct ProbeDrain {
     /// Probe-thread stop request. Setting this wakes the probe
     /// thread out of its ring-buffer poll loop; the thread then
     /// emits its payload and sets `output_done`.
@@ -2611,15 +2635,64 @@ fn drain_probe_pipeline(drain: Option<&ProbeDrain>) {
     d.output_done.wait();
 }
 
-/// Start the scheduler binary if it exists. Returns the child process
-/// and the path to its log file.
+/// Start the boot scheduler binary if it exists. Thin wrapper around
+/// [`spawn_scheduler_from_paths`] supplying the boot-time paths
+/// (`/scheduler` + `/sched_args` + `/tmp/sched.log`). Returns the
+/// child process and the path to its log file.
+///
+/// Mid-experiment scheduler-lifecycle Op dispatch
+/// ([`Op::AttachScheduler`](crate::scenario::ops::Op::AttachScheduler) /
+/// [`Op::ReplaceScheduler`](crate::scenario::ops::Op::ReplaceScheduler))
+/// calls [`spawn_scheduler_from_paths`] directly with paths under
+/// `/staging/schedulers/<name>/` so swap binaries don't shadow the
+/// boot slot.
 #[tracing::instrument(skip(probe_drain))]
-fn start_scheduler(probe_drain: Option<ProbeDrain>) -> (Option<Child>, Option<String>) {
-    if !Path::new("/scheduler").exists() {
+pub(crate) fn start_scheduler(probe_drain: Option<ProbeDrain>) -> (Option<Child>, Option<String>) {
+    spawn_scheduler_from_paths("/scheduler", "/sched_args", "/tmp/sched.log", probe_drain)
+}
+
+/// Spawn a scheduler binary at `binary_path`, reading its CLI argv
+/// from `args_path` (one whitespace-split tokenisation per line) and
+/// teeing its stdout/stderr into `log_path`. Returns the child
+/// process and the log path for downstream consumers (the file is
+/// dumped via the bulk data port on `StartupStatus::Died` and on
+/// the not-attached path).
+///
+/// `probe_drain` is consumed only on the failure paths; passing
+/// `None` is correct for mid-experiment swap callers that don't own
+/// the boot-time probe stack lifetime.
+///
+/// # Path contract
+///
+/// `binary_path` MUST exist when the call lands — the caller is
+/// expected to have verified existence (the boot wrapper relies on
+/// the same precondition: an absent `/scheduler` returns `(None,
+/// None)` via the inline existence probe). The function short-
+/// circuits on a missing binary so a boot launch without a packed
+/// scheduler doesn't crash; for the staged-Op dispatch path the
+/// guest's `staged_scheduler_binary_path()` helper guarantees the
+/// path exists ahead of the call.
+///
+/// `args_path` may be absent — a missing file produces an empty
+/// argv (same behaviour as the boot-time `/sched_args` defaulting
+/// to `String::new()` via `unwrap_or_default()`).
+///
+/// `log_path` is created (or truncated) at function entry. For the
+/// boot path this is `/tmp/sched.log`; mid-experiment Op dispatch
+/// should derive a per-scheduler path so successive swaps don't
+/// overwrite earlier output.
+#[tracing::instrument(skip(probe_drain), fields(binary = %binary_path))]
+pub(crate) fn spawn_scheduler_from_paths(
+    binary_path: &str,
+    args_path: &str,
+    log_path: &str,
+    probe_drain: Option<ProbeDrain>,
+) -> (Option<Child>, Option<String>) {
+    if !Path::new(binary_path).exists() {
         return (None, None);
     }
 
-    let sched_args = fs::read_to_string("/sched_args")
+    let sched_args = fs::read_to_string(args_path)
         .unwrap_or_default()
         .trim()
         .to_string();
@@ -2629,7 +2702,6 @@ fn start_scheduler(probe_drain: Option<ProbeDrain>) -> (Option<Child>, Option<St
         sched_args.split_whitespace().collect()
     };
 
-    let log_path = "/tmp/sched.log";
     let log_file = fs::File::create(log_path).ok();
 
     let stdout = match log_file.as_ref().and_then(|f| f.try_clone().ok()) {
@@ -2650,7 +2722,7 @@ fn start_scheduler(probe_drain: Option<ProbeDrain>) -> (Option<Child>, Option<St
         Err(_) => "info,scx_utils::libbpf_logger=warn".to_string(),
     };
 
-    let child = Command::new("/scheduler")
+    let child = Command::new(binary_path)
         .args(&args)
         .env("RUST_LOG", &sched_rust_log)
         .stdout(stdout)

@@ -376,6 +376,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut scheduler: Option<syn::Path> = None;
     let mut payload: Option<syn::Path> = None;
     let mut workloads: Option<Vec<syn::Path>> = None;
+    let mut staged_schedulers: Option<Vec<syn::Path>> = None;
     let mut auto_repro = true;
     let mut auto_repro_set = false;
     let mut not_starved: Option<bool> = None;
@@ -543,6 +544,37 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             }
                         }
                         workloads = Some(entries);
+                    }
+                    "staged_schedulers" => {
+                        let arr = match value {
+                            syn::Expr::Array(ea) => ea,
+                            _ => {
+                                return syn::Error::new_spanned(
+                                    value,
+                                    "expected array of Scheduler paths for \
+                                     staged_schedulers (e.g. [SCX_VARIANT_A, \
+                                     SCX_VARIANT_B])",
+                                )
+                                .to_compile_error()
+                                .into();
+                            }
+                        };
+                        let mut entries = Vec::with_capacity(arr.elems.len());
+                        for elem in &arr.elems {
+                            match elem {
+                                syn::Expr::Path(ep) => entries.push(ep.path.clone()),
+                                _ => {
+                                    return syn::Error::new_spanned(
+                                        elem,
+                                        "expected Scheduler path in \
+                                         staged_schedulers array",
+                                    )
+                                    .to_compile_error()
+                                    .into();
+                                }
+                            }
+                        }
+                        staged_schedulers = Some(entries);
                     }
                     "bpf_map_write" => {
                         let p = match value {
@@ -959,7 +991,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mib, scheduler, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, expect_scx_bpf_error_contains, expect_scx_bpf_error_matches, extra_sched_args, extra_include_files, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, bpf_map_write, expect_err, host_only, ignore, cleanup_budget_ms, post_vm, config, disk, num_snapshots"),
+                            format!("unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mib, scheduler, staged_schedulers, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, expect_scx_bpf_error_contains, expect_scx_bpf_error_matches, extra_sched_args, extra_include_files, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, bpf_map_write, expect_err, host_only, ignore, cleanup_budget_ms, post_vm, config, disk, num_snapshots"),
                         )
                         .to_compile_error()
                         .into();
@@ -1455,6 +1487,22 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         workloads_slice.iter().map(|p| quote! { &#p }).collect();
     let workloads_tokens = quote! { &[#(#workload_refs),*] };
 
+    // Emit `&'static [&'static Scheduler]` for staged_schedulers.
+    // Each user-supplied path is a `const Scheduler`; take `&` on
+    // each to match the stored type. Empty slice when the attribute
+    // is absent (the common no-staging case) keeps existing tests
+    // working without any per-test change.
+    let staged_schedulers_slice: &[syn::Path] = staged_schedulers.as_deref().unwrap_or(&[]);
+    let staged_sched_refs: Vec<proc_macro2::TokenStream> = staged_schedulers_slice
+        .iter()
+        .map(|p| quote! { &#p })
+        .collect();
+    let staged_schedulers_tokens = if staged_schedulers.is_some() {
+        quote! { staged_schedulers: &[#(#staged_sched_refs),*], }
+    } else {
+        quote! {}
+    };
+
     // Conditionally-emitted KtstrTestEntry fields. Each block is
     // either an empty TokenStream (so the field is left to
     // `..KtstrTestEntry::DEFAULT` in the spread) or a `field: VAL,`
@@ -1854,6 +1902,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             #memory_mib_field
             #payload_field
             #workloads_field
+            #staged_schedulers_tokens
             #auto_repro_field
             #assert_field
             #extra_sched_args_field
