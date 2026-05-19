@@ -221,6 +221,171 @@ pub struct RenderedMember {
     pub value: RenderedValue,
 }
 
+impl RenderedValue {
+    /// Single-step struct-member walk. Returns the named member of a
+    /// `Struct` (or `Truncated{partial: Struct}`), peeling through
+    /// `Ptr{deref: Some}` transparently. `None` for any other variant
+    /// or when the member name is absent.
+    pub fn member(&self, name: &str) -> Option<&RenderedValue> {
+        match self {
+            RenderedValue::Struct { members, .. } => members
+                .iter()
+                .find(|m| m.name == name)
+                .map(|m| &m.value),
+            RenderedValue::Ptr { deref: Some(inner), .. } => inner.member(name),
+            RenderedValue::Truncated { partial, .. } => partial.member(name),
+            _ => None,
+        }
+    }
+
+    /// Array-element walk by 0-indexed position. Returns the i-th
+    /// element of an `Array` (or `Truncated{partial: Array}` —
+    /// `None` if `i` is past what the truncation preserved), peeling
+    /// through `Ptr{deref: Some}`. `None` for any other variant or
+    /// out-of-range index.
+    pub fn index(&self, i: usize) -> Option<&RenderedValue> {
+        match self {
+            RenderedValue::Array { elements, .. } => elements.get(i),
+            RenderedValue::Ptr { deref: Some(inner), .. } => inner.index(i),
+            RenderedValue::Truncated { partial, .. } => partial.index(i),
+            _ => None,
+        }
+    }
+
+    /// Dotted-path walk equivalent to a chain of [`Self::member`]
+    /// calls split on `.`. Empty path returns `Some(self)`; any
+    /// component that fails to resolve returns `None`. Peels through
+    /// `Ptr{deref: Some}` and `Truncated{partial: Struct}` at every
+    /// step.
+    pub fn get(&self, path: &str) -> Option<&RenderedValue> {
+        if path.is_empty() {
+            return Some(self);
+        }
+        let mut current = self;
+        for component in path.split('.') {
+            if component.is_empty() {
+                return None;
+            }
+            current = current.member(component)?;
+        }
+        Some(current)
+    }
+
+    /// Coerce a scalar variant to `u64`. Accepts `Uint`, `Bool`
+    /// (`true=1`, `false=0`), `Char` (raw byte), and `Ptr` (numeric
+    /// address). `Int<0`, `Enum<0`, `Float`, `Struct`, `Array`,
+    /// `Bytes`, `Truncated`, and `Unsupported` return `None`. Peels
+    /// `Ptr{deref: Some}` transparently — the unsigned-pointer
+    /// numeric value still wins.
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            RenderedValue::Uint { value, .. } => Some(*value),
+            RenderedValue::Int { value, .. } if *value >= 0 => Some(*value as u64),
+            RenderedValue::Bool { value } => Some(if *value { 1 } else { 0 }),
+            RenderedValue::Char { value } => Some(*value as u64),
+            RenderedValue::Enum { value, .. } if *value >= 0 => Some(*value as u64),
+            RenderedValue::Ptr { value, .. } => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// Coerce a scalar variant to `i64`. Accepts `Int`, `Uint<=i64::MAX`,
+    /// `Bool`, `Char`, and `Enum`. `Uint>i64::MAX`, `Float`,
+    /// aggregate, and recovery variants return `None`.
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            RenderedValue::Int { value, .. } => Some(*value),
+            RenderedValue::Uint { value, .. } if *value <= i64::MAX as u64 => Some(*value as i64),
+            RenderedValue::Bool { value } => Some(if *value { 1 } else { 0 }),
+            RenderedValue::Char { value } => Some(*value as i64),
+            RenderedValue::Enum { value, .. } => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// Coerce a scalar variant to `f64`. `Float` is the only direct
+    /// source; integer variants widen via `as f64` (with the usual
+    /// precision loss above 2^53).
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            RenderedValue::Float { value, .. } => Some(*value),
+            RenderedValue::Int { value, .. } => Some(*value as f64),
+            RenderedValue::Uint { value, .. } => Some(*value as f64),
+            RenderedValue::Enum { value, .. } => Some(*value as f64),
+            _ => None,
+        }
+    }
+
+    /// Coerce a scalar variant to `bool`. Direct from `Bool`; from
+    /// `Uint`/`Int`/`Char`/`Enum` returns `Some(value != 0)`. `Float`
+    /// and aggregate variants return `None`.
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            RenderedValue::Bool { value } => Some(*value),
+            RenderedValue::Uint { value, .. } => Some(*value != 0),
+            RenderedValue::Int { value, .. } => Some(*value != 0),
+            RenderedValue::Char { value } => Some(*value != 0),
+            RenderedValue::Enum { value, .. } => Some(*value != 0),
+            _ => None,
+        }
+    }
+
+    /// Extract a homogeneous `Vec<u64>` from an `Array` whose every
+    /// element coerces via [`Self::as_u64`]. Returns `None` if self
+    /// is not an `Array` (or `Truncated{partial: Array}`), or if any
+    /// element fails the coercion — the caller cannot rely on a
+    /// partial result. Peels `Ptr{deref: Some}`.
+    pub fn as_u64_array(&self) -> Option<Vec<u64>> {
+        let elements = self.array_elements()?;
+        elements.iter().map(RenderedValue::as_u64).collect()
+    }
+
+    /// Extract a homogeneous `Vec<u32>` from an `Array` whose every
+    /// element coerces via [`Self::as_u64`] and fits in `u32`.
+    /// Out-of-range values return `None` (no silent truncation).
+    pub fn as_u32_array(&self) -> Option<Vec<u32>> {
+        let elements = self.array_elements()?;
+        elements
+            .iter()
+            .map(|e| e.as_u64().and_then(|v| u32::try_from(v).ok()))
+            .collect()
+    }
+
+    /// Extract a homogeneous `Vec<i64>` from an `Array` whose every
+    /// element coerces via [`Self::as_i64`].
+    pub fn as_i64_array(&self) -> Option<Vec<i64>> {
+        let elements = self.array_elements()?;
+        elements.iter().map(RenderedValue::as_i64).collect()
+    }
+
+    /// Extract a homogeneous `Vec<f64>` from an `Array` whose every
+    /// element coerces via [`Self::as_f64`].
+    pub fn as_f64_array(&self) -> Option<Vec<f64>> {
+        let elements = self.array_elements()?;
+        elements.iter().map(RenderedValue::as_f64).collect()
+    }
+
+    /// Extract a homogeneous `Vec<bool>` from an `Array` whose every
+    /// element coerces via [`Self::as_bool`].
+    pub fn as_bool_array(&self) -> Option<Vec<bool>> {
+        let elements = self.array_elements()?;
+        elements.iter().map(RenderedValue::as_bool).collect()
+    }
+
+    /// Internal: borrow the elements slice of an `Array` variant,
+    /// peeling `Ptr{deref: Some}` and `Truncated{partial: Array}`.
+    /// The peel matches [`Self::index`] so consumers see consistent
+    /// behavior between random-access and full-iteration paths.
+    fn array_elements(&self) -> Option<&[RenderedValue]> {
+        match self {
+            RenderedValue::Array { elements, .. } => Some(elements.as_slice()),
+            RenderedValue::Ptr { deref: Some(inner), .. } => inner.array_elements(),
+            RenderedValue::Truncated { partial, .. } => partial.array_elements(),
+            _ => None,
+        }
+    }
+}
+
 impl std::fmt::Display for RenderedValue {
     /// Human-readable rendering for test-failure output. JSON remains
     /// the programmatic form (via `serde_json`); this Display emits

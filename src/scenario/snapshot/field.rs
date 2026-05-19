@@ -137,12 +137,64 @@ impl<'a> SnapshotField<'a> {
         }
     }
 
-    /// Underlying rendered value if present.
-    pub fn rendered(&self) -> Option<&'a RenderedValue> {
+    /// Read as `Vec<u64>` from an [`RenderedValue::Array`] whose
+    /// every element coerces via [`Self::as_u64`]'s rules. Errors
+    /// with [`SnapshotError::TypeMismatch`] when self is not an
+    /// array, or when any element fails the coercion (no partial
+    /// results — the caller cannot tell which element silently
+    /// dropped). Mirrors [`RenderedValue::as_u64_array`] but
+    /// propagates [`SnapshotError::Missing`] through the
+    /// [`SnapshotField::Missing`] arm.
+    pub fn as_u64_array(&self) -> SnapshotResult<Vec<u64>> {
+        render_to_typed_array(self, RenderedValue::as_u64, "u64")
+    }
+
+    /// Read as `Vec<u32>` from an array. Mirrors
+    /// [`RenderedValue::as_u32_array`]; out-of-range values
+    /// (Uint exceeding `u32::MAX`) error rather than truncate.
+    pub fn as_u32_array(&self) -> SnapshotResult<Vec<u32>> {
+        render_to_typed_array(self, |v| v.as_u64().and_then(|x| u32::try_from(x).ok()), "u32")
+    }
+
+    /// Read as `Vec<i64>` from an array. Mirrors
+    /// [`RenderedValue::as_i64_array`].
+    pub fn as_i64_array(&self) -> SnapshotResult<Vec<i64>> {
+        render_to_typed_array(self, RenderedValue::as_i64, "i64")
+    }
+
+    /// Read as `Vec<f64>` from an array. Mirrors
+    /// [`RenderedValue::as_f64_array`].
+    pub fn as_f64_array(&self) -> SnapshotResult<Vec<f64>> {
+        render_to_typed_array(self, RenderedValue::as_f64, "f64")
+    }
+
+    /// Read as `Vec<bool>` from an array. Mirrors
+    /// [`RenderedValue::as_bool_array`].
+    pub fn as_bool_array(&self) -> SnapshotResult<Vec<bool>> {
+        render_to_typed_array(self, RenderedValue::as_bool, "bool")
+    }
+
+    /// Drop into the raw [`RenderedValue`] for direct
+    /// [`RenderedValue::member`] / [`RenderedValue::get`] /
+    /// [`RenderedValue::index`] navigation. Use when the
+    /// pattern-matched-into-known-shape access pattern (Option-
+    /// returning terminals, no rich error context) reads more
+    /// naturally than the SnapshotField's Result-propagating
+    /// chain. `None` for [`SnapshotField::PercpuKey`] (no
+    /// underlying tree) and [`SnapshotField::Missing`].
+    pub fn raw(&self) -> Option<&'a RenderedValue> {
         match self {
             SnapshotField::Value(v) => Some(v),
             _ => None,
         }
+    }
+
+    /// Underlying rendered value if present. Alias for
+    /// [`Self::raw`] kept for older callers; new code should
+    /// prefer [`Self::raw`] which matches the cross-surface
+    /// `.raw()` opt-in-downshift convention.
+    pub fn rendered(&self) -> Option<&'a RenderedValue> {
+        self.raw()
     }
 
     /// Error reference when the field is missing; `None`
@@ -252,6 +304,74 @@ fn describe_kind(v: &RenderedValue) -> String {
         RenderedValue::Unsupported { .. } => "Unsupported",
     }
     .to_string()
+}
+
+/// Shared typed-array coercion used by [`SnapshotField::as_u64_array`]
+/// and siblings. `coerce` is the per-element scalar extractor that
+/// returns `None` when the element fails the coercion (matches the
+/// [`RenderedValue`] inherent `.as_*` Option-returning shape).
+/// `type_name` names the requested element type for diagnostics.
+fn render_to_typed_array<T, F>(
+    field: &SnapshotField<'_>,
+    coerce: F,
+    type_name: &'static str,
+) -> SnapshotResult<Vec<T>>
+where
+    F: Fn(&RenderedValue) -> Option<T>,
+{
+    let value = match field {
+        SnapshotField::Value(v) => *v,
+        SnapshotField::PercpuKey { .. } => {
+            return Err(SnapshotError::TypeMismatch {
+                expected: format!("[{type_name}]"),
+                actual: "Uint(percpu key)".to_string(),
+                requested: String::new(),
+            });
+        }
+        SnapshotField::Missing(err) => return Err(err.clone()),
+    };
+    let elements = match value {
+        RenderedValue::Array { elements, .. } => elements.as_slice(),
+        RenderedValue::Ptr {
+            deref: Some(inner), ..
+        } => match inner.as_ref() {
+            RenderedValue::Array { elements, .. } => elements.as_slice(),
+            other => {
+                return Err(SnapshotError::TypeMismatch {
+                    expected: format!("[{type_name}]"),
+                    actual: describe_kind(other),
+                    requested: String::new(),
+                });
+            }
+        },
+        RenderedValue::Truncated { partial, .. } => match partial.as_ref() {
+            RenderedValue::Array { elements, .. } => elements.as_slice(),
+            other => {
+                return Err(SnapshotError::TypeMismatch {
+                    expected: format!("[{type_name}]"),
+                    actual: format!("Truncated(partial={})", describe_kind(other)),
+                    requested: String::new(),
+                });
+            }
+        },
+        other => {
+            return Err(SnapshotError::TypeMismatch {
+                expected: format!("[{type_name}]"),
+                actual: describe_kind(other),
+                requested: String::new(),
+            });
+        }
+    };
+    let mut out = Vec::with_capacity(elements.len());
+    for (i, element) in elements.iter().enumerate() {
+        let v = coerce(element).ok_or_else(|| SnapshotError::TypeMismatch {
+            expected: format!("[{type_name}]"),
+            actual: format!("{}[{i}]={}", "Array", describe_kind(element)),
+            requested: String::new(),
+        })?;
+        out.push(v);
+    }
+    Ok(out)
 }
 
 /// Shared u64 coercion used by [`SnapshotField::as_u64`].
