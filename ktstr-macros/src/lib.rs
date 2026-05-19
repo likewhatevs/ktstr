@@ -84,7 +84,7 @@ const DEFAULT_MEMORY_MIB: u32 = 2048;
 /// accepts. Used by the NameValue arm's group guard, the bare-form
 /// Path arm's error message, and the user-facing docstring + doc
 /// page; the dispatch table in [`BoolAttrSlots::assign`] is the
-/// matching per-attr behavior. Adding an 11th bool attribute touches:
+/// matching per-attr behavior. Adding a 12th bool attribute touches:
 /// (1) this slice; (2) [`BoolAttrSlots::assign`]; (3) the matching
 /// field(s) on [`BoolAttrSlots`] plus the state-var declaration and
 /// `bool_slots` wiring inside `ktstr_test`; (4) the codegen gate
@@ -101,6 +101,7 @@ const BOOL_ATTR_NAMES: &[&str] = &[
     "fail_on_stall",
     "host_only",
     "ignore",
+    "kaslr",
 ];
 
 /// Mut-ref bundle for the ten bool attributes the `#[ktstr_test]`
@@ -126,6 +127,8 @@ struct BoolAttrSlots<'a> {
     host_only: &'a mut bool,
     host_only_set: &'a mut bool,
     ignore_test: &'a mut bool,
+    kaslr: &'a mut bool,
+    kaslr_set: &'a mut bool,
 }
 
 impl BoolAttrSlots<'_> {
@@ -164,6 +167,10 @@ impl BoolAttrSlots<'_> {
                 *self.host_only_set = true;
             }
             "ignore" => *self.ignore_test = value,
+            "kaslr" => {
+                *self.kaslr = value;
+                *self.kaslr_set = true;
+            }
             _ => return false,
         }
         true
@@ -181,15 +188,15 @@ impl BoolAttrSlots<'_> {
 ///    inside it.
 ///
 /// Every attribute is optional. Most take a `key = value` form; the
-/// ten boolean attributes (`auto_repro`, `not_starved`, `isolation`,
+/// eleven boolean attributes (`auto_repro`, `not_starved`, `isolation`,
 /// `performance_mode`, `no_perf_mode`, `requires_smt`, `expect_err`,
-/// `fail_on_stall`, `host_only`, `ignore`) also accept a bare form
+/// `fail_on_stall`, `host_only`, `ignore`, `kaslr`) also accept a bare form
 /// as shorthand for `= true` — e.g. `#[ktstr_test(host_only)]` is
-/// equivalent to `#[ktstr_test(host_only = true)]`. Of the ten,
-/// `auto_repro` is the only one whose default is `true`, so bare
-/// `auto_repro` is a no-op; `auto_repro = false` is the only way
-/// to disable it. The other nine default to `false` (or `None`),
-/// so the bare form is the meaningful shorthand.
+/// equivalent to `#[ktstr_test(host_only = true)]`. Of the eleven,
+/// `auto_repro` and `kaslr` are the two whose default is `true`, so the
+/// bare form is a no-op; `auto_repro = false` / `kaslr = false` are the
+/// only way to disable each. The other nine default to `false` (or
+/// `None`), so the bare form is the meaningful shorthand.
 ///
 /// The accepted attributes and their defaults are the fields of
 /// [`ktstr::test_support::KtstrTestEntry`] (runtime metadata) and
@@ -432,6 +439,11 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut host_only: bool = false;
     let mut host_only_set = false;
     let mut ignore_test: bool = false;
+    // KASLR defaults to ON (matches ktstr.kconfig CONFIG_RANDOMIZE_BASE=y +
+    // CONFIG_RANDOMIZE_MEMORY=y); `#[ktstr_test(kaslr = false)]` re-injects
+    // `nokaslr` into the guest cmdline for tests that need determinism.
+    let mut kaslr: bool = true;
+    let mut kaslr_set = false;
     let mut cleanup_budget_ms: Option<u64> = None;
     let mut post_vm: Option<syn::Path> = None;
     let mut config_expr: Option<proc_macro2::TokenStream> = None;
@@ -466,6 +478,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         host_only: &mut host_only,
         host_only_set: &mut host_only_set,
         ignore_test: &mut ignore_test,
+        kaslr: &mut kaslr,
+        kaslr_set: &mut kaslr_set,
     };
 
     // Track every attribute key seen on this `#[ktstr_test]` invocation so
@@ -1529,6 +1543,11 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         quote! {}
     };
+    let kaslr_field = if kaslr_set {
+        quote! { kaslr: #kaslr, }
+    } else {
+        quote! {}
+    };
     // Any of the per-check assert fields supplied by the attribute
     // forces emission of the full `assert: Assert { .. }` block. When
     // none are set the spread inherits `Assert::NO_OVERRIDES` from
@@ -1904,6 +1923,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             #workloads_field
             #staged_schedulers_tokens
             #auto_repro_field
+            #kaslr_field
             #assert_field
             #extra_sched_args_field
             #watchdog_timeout_field

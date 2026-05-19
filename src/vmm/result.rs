@@ -322,9 +322,43 @@ pub struct VmResult {
     /// test can compute coverage without re-reading the entry
     /// table.
     pub periodic_target: u32,
+    /// Runtime virt-KASLR offset (kernel-image slide). Captured
+    /// from the freeze coordinator's `kern_virt_kaslr` Arc snapshot
+    /// at run-end via `load(Acquire).saturating_sub(1)`. `0` means
+    /// either (a) KASLR was off — test ran with
+    /// `#[ktstr_test(kaslr = false)]` or
+    /// `Scheduler::kargs(&["nokaslr"])`, OR (b) the derivation
+    /// chain (MSR_LSTAR readback in `vmm::x86_64::msr_kaslr` +
+    /// KERN_ADDRS `_text` path in `freeze_coord::dispatch.rs`) never
+    /// published a non-zero value (early-boot crash, kallsyms masked
+    /// by kptr_restrict, FRED-enabled kernel). E2E test consumers
+    /// distinguish (a) from (b) by reading the test entry's `kaslr`
+    /// attribute alongside this field — see
+    /// [`Self::kaslr_enabled`] for the binary-question companion.
+    pub kern_kaslr_offset: u64,
 }
 
 impl VmResult {
+    /// Whether the guest kernel booted with KASLR enabled (= a
+    /// non-zero virt-KASLR offset published into the freeze
+    /// coordinator's `kern_virt_kaslr` Arc). Returns `true` when
+    /// [`Self::kern_kaslr_offset`] is non-zero. The inverse case
+    /// (returns `false`) covers two scenarios: (a) the test
+    /// explicitly opted out via `#[ktstr_test(kaslr = false)]` or
+    /// `Scheduler::kargs(&["nokaslr"])`, OR (b) the derivation
+    /// chain failed to publish a non-zero value (early-boot crash,
+    /// kallsyms masked, kernel built without `CONFIG_RANDOMIZE_BASE`).
+    /// E2E test consumers distinguish (a) from (b) by reading the
+    /// test entry's `kaslr` attribute alongside this method.
+    ///
+    /// Companion to [`Self::kern_kaslr_offset`] — use this when the
+    /// caller cares about the binary "did KASLR happen?" question
+    /// and use the raw field for exact-offset assertions
+    /// (alignment, entropy-range, etc.).
+    pub fn kaslr_enabled(&self) -> bool {
+        self.kern_kaslr_offset != 0
+    }
+
     /// Minimal "nothing happened" fixture for tests that exercise
     /// code consuming a [`VmResult`] without actually booting a VM
     /// (the sidecar-write tests in `src/test_support/sidecar.rs`
@@ -367,6 +401,7 @@ impl VmResult {
             stats_client: None,
             periodic_fired: 0,
             periodic_target: 0,
+            kern_kaslr_offset: 0,
         }
     }
 }
@@ -569,6 +604,20 @@ pub(crate) struct VmRunState {
     /// `collect_verifier_stats` fallback when the pre-built prog
     /// accessor is unavailable.
     pub(crate) kern_phys_base: u64,
+    /// Runtime virt-KASLR offset (kernel-image slide), captured from
+    /// the freeze coordinator's `kern_virt_kaslr` Arc snapshot at run
+    /// end via `load(Acquire).saturating_sub(1)`. `0` means either
+    /// (a) KASLR was off (test ran with `#[ktstr_test(kaslr = false)]`
+    /// or `Scheduler::kargs(&["nokaslr"])`), or (b) the derivation
+    /// chain (MSR_LSTAR readback at `vmm::x86_64::msr_kaslr` +
+    /// KERN_ADDRS `_text` path at `freeze_coord::dispatch.rs`) never
+    /// published a non-zero value (early-boot crash, kallsyms masked
+    /// by kptr_restrict, FRED-enabled kernel). E2E test consumers
+    /// distinguish (a) from (b) by asserting against the test entry's
+    /// `kaslr` attribute. The companion [`Self::kern_phys_base`]
+    /// carries the kernel-image physical-randomization slide; together
+    /// they identify the KASLR-randomized kernel layout.
+    pub kern_kaslr_offset: u64,
     /// Virtio-console device shared with vCPU threads. Carries the
     /// port-1 (`/dev/vport0p1`) bulk TLV stream from guest to host;
     /// `collect_results` calls `drain_bulk()` after the run to feed

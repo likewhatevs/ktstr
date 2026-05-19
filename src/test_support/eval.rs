@@ -4376,6 +4376,7 @@ mod tests {
             stats_client: None,
             periodic_fired: 0,
             periodic_target: 0,
+            kern_kaslr_offset: 0,
         };
         let assertions = crate::assert::Assert::NO_OVERRIDES
             .max_imbalance_ratio(4.0)
@@ -4720,6 +4721,7 @@ mod tests {
             stats_client: None,
             periodic_fired: 0,
             periodic_target: 0,
+            kern_kaslr_offset: 0,
         };
         let assertions = crate::assert::Assert::NO_OVERRIDES;
         let msg = format!(
@@ -4816,6 +4818,7 @@ mod tests {
             stats_client: None,
             periodic_fired: 0,
             periodic_target: 0,
+            kern_kaslr_offset: 0,
         };
         let assertions = crate::assert::Assert::NO_OVERRIDES
             .max_imbalance_ratio(4.0)

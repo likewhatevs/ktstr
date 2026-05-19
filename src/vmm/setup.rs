@@ -1218,23 +1218,27 @@ impl KtstrVm {
             "sysctl.kernel.sched_schedstats=1 ",
             "delayacct ",
             "sysctl.kernel.task_delayacct=1 ",
-            // KASLR defense-in-depth. The KERN_ADDRS guest channel
-            // (src/vmm/guest_comms.rs::send_kern_addrs) and the BSP
-            // MSR_LSTAR readback (src/vmm/x86_64/msr_kaslr.rs) each
-            // produce a virt-KASLR offset that flows into the
-            // monitor + dump consumers; nokaslr keeps both paths at
-            // a literal 0 offset for kernels we don't control the
-            // build of (distro/production kernels with
-            // CONFIG_RANDOMIZE_BASE=y + CONFIG_RANDOMIZE_MEMORY=y).
-            // Disables both forms at boot — page_offset_base,
-            // vmalloc_base, vmemmap_base, and the kernel image base
-            // all stay at compile-time defaults so the monitor's
-            // template + per_cpu_offset arithmetic in
-            // `monitor::symbols::per_cpu_kva` lands on the right
-            // PA without runtime derivation. Belt + suspenders: the
-            // virt-KASLR derivation paths still run and produce 0,
-            // which matches the disabled state.
-            "nokaslr ",
+            // KASLR is ON by default — `ktstr.kconfig` pins
+            // `CONFIG_RANDOMIZE_BASE=y` (text-image slide) and
+            // `CONFIG_RANDOMIZE_MEMORY=y` (page_offset_base /
+            // vmalloc_base / vmemmap_base direct-map slides). The
+            // host's monitor + dump + freeze_coord consumers derive
+            // the runtime virt-KASLR offset via the
+            // [BSP MSR_LSTAR readback](src/vmm/x86_64/msr_kaslr.rs)
+            // PLUS the [KERN_ADDRS guest-channel `_text` path](src/vmm/guest_comms.rs::send_kern_addrs)
+            // and thread it through `coord_kaslr_offset()` into
+            // every kaslr-aware site (monitor::symbols::per_cpu_kva,
+            // monitor::dump::collect_per_cpu_time, capture_scx::
+            // compute_owned, kernel_op_dispatch::resolve_per_cpu_field_pa).
+            // The runtime `page_offset_base` is read host-side from
+            // /proc/kallsyms (see `vmm::rust_init::build_kern_addrs`)
+            // and shipped via `wire::KernAddrs.page_offset_base` for
+            // `monitor::symbols::kva_to_pa`. Tests that need
+            // determinism opt out via `#[ktstr_test(kaslr = false)]`
+            // or `Scheduler::kargs(&["nokaslr"])` — both re-add the
+            // `nokaslr` token through `runtime::build_cmdline_extra`.
+            // The `kaslr_offset_nonzero_post_boot` + sibling e2e
+            // regression tests guard the derivation chain.
             "KTSTR_GUEST=1",
         )
         .to_string();
@@ -1624,13 +1628,18 @@ impl KtstrVm {
             "sysctl.kernel.sched_schedstats=1 ",
             "delayacct sysctl.kernel.task_delayacct=1 ",
             "kfence.sample_interval=0 ",
-            // KASLR defense-in-depth — see x86_64 cmdline above for
-            // rationale. On aarch64 nokaslr disables the
-            // CONFIG_RANDOMIZE_BASE kernel-image slide (the only
-            // KASLR form on this arch; arm64 has no
-            // CONFIG_RANDOMIZE_MEMORY equivalent — the kernel
-            // direct-map base is fixed by VA_BITS).
-            "nokaslr ",
+            // KASLR is ON by default — see x86_64 cmdline above for
+            // the full host-side derivation chain rationale. On
+            // aarch64 the only KASLR axis is `CONFIG_RANDOMIZE_BASE`
+            // (kernel-image slide); arm64 has no
+            // `CONFIG_RANDOMIZE_MEMORY` equivalent (the kernel
+            // direct-map base is fixed by `VA_BITS` —
+            // `arch/arm64/include/asm/memory.h:43-45`). The
+            // KERN_ADDRS `_text` guest-channel path is the SOLE
+            // virt-KASLR derive on this arch (no MSR_LSTAR equivalent
+            // — MSR_LSTAR is x86 SYSCALL infrastructure). Tests opt
+            // out via `#[ktstr_test(kaslr = false)]` or
+            // `Scheduler::kargs(&["nokaslr"])` — same shape as x86.
             "KTSTR_GUEST=1",
         )
         .to_string();

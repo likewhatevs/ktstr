@@ -880,14 +880,17 @@ pub(crate) fn per_cpu_kva(template_kva: u64, kaslr_offset: u64, per_cpu_off: u64
 /// delta between the link-time `__per_cpu_start` and the
 /// runtime per-CPU base, equivalent to (LSTAR_RUNTIME -
 /// entry_SYSCALL_64_link_KVA) per `crate::vmm::x86_64::msr_kaslr`.
-/// Production callers in `crate::vmm::freeze_coord` currently
-/// pass `0` (the LSTAR-derive needs cross-thread BSP-vcpu
-/// plumbing that has not yet landed); under `CONFIG_RANDOMIZE_BASE=y`
-/// (the default ktstr.kconfig setting) this produces wrong
-/// per-CPU KVAs and `kva_to_pa` bounds-rejects to zero (the
-/// silent-data-corruption mode #31 will fix once the LSTAR-derive
-/// plumbing lands). The helper algebra itself is correct: when
-/// the right value flows in, the formula
+/// Production callers in `crate::vmm::freeze_coord` thread the
+/// shared `kern_virt_kaslr` Arc snapshot via `coord_kaslr_offset()`
+/// — first writer (BSP MSR_LSTAR derive at
+/// `crate::vmm::x86_64::msr_kaslr::read_and_derive` OR the
+/// KERN_ADDRS `_text` path at `crate::vmm::freeze_coord::dispatch`)
+/// populates the Arc with `(offset + 1)` bias; consumers
+/// `.load(Acquire).saturating_sub(1)` to recover the offset. A
+/// literal `0` argument is the KASLR-off / nokaslr-karg /
+/// not-yet-published fallback (`per_cpu_kva` collapses to the
+/// unsigned-add link-time identity). The helper algebra itself is
+/// correct: when the right value flows in, the formula
 /// `template + kaslr + per_cpu_off` matches the kernel's
 /// `per_cpu_ptr()` macro exactly (include/linux/percpu-defs.h).
 ///

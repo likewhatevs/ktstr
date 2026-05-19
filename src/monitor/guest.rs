@@ -216,7 +216,35 @@ impl GuestKernel {
         let phys_base = if phys_base_hint != 0 {
             phys_base_hint
         } else {
-            resolve_phys_base(&mem, &kern_syms, walk_cr3, l5_bootstrap, tcr_el1).unwrap_or(0)
+            // Fail loud when the `phys_base` symbol IS present in
+            // the kernel symtab (CONFIG_RANDOMIZE_BASE=y, x86_64)
+            // but the page-table walk fails to resolve it: refuse
+            // to default to 0 — under KASLR-on, `phys_base = 0`
+            // would silently mis-translate every `text_kva_to_pa`
+            // read (returns the link-time PA instead of the slid
+            // runtime PA). Under KASLR-off / aarch64 (no
+            // `phys_base` symbol), the walk legitimately returns
+            // None and 0 IS the correct value — preserve that path.
+            match resolve_phys_base(&mem, &kern_syms, walk_cr3, l5_bootstrap, tcr_el1) {
+                Some(v) => v,
+                None if kern_syms.phys_base_kva.is_some() => {
+                    anyhow::bail!(
+                        "phys_base symbol present in kernel symtab but \
+                         resolve_phys_base page-table walk failed — \
+                         KASLR-on kernel likely crashed before kallsyms \
+                         became readable, OR kptr_restrict masked the \
+                         symbol resolution, OR the CR3 captured at boot \
+                         predates the kernel's `phys_base` randomization. \
+                         To debug: (1) check guest console for early-boot \
+                         panic, (2) confirm kernel was built with \
+                         CONFIG_KALLSYMS=y, (3) re-run with \
+                         `#[ktstr_test(kaslr = false)]` to confirm \
+                         KASLR-specific (workaround, NOT fix — the test \
+                         won't reproduce the KASLR-only bug class)."
+                    );
+                }
+                None => 0,
+            }
         };
         let l5 = if phys_base == 0 {
             l5_bootstrap
@@ -311,7 +339,35 @@ impl GuestKernel {
         let phys_base = if phys_base_hint != 0 {
             phys_base_hint
         } else {
-            resolve_phys_base(&mem, &kern_syms, walk_cr3, l5_bootstrap, tcr_el1).unwrap_or(0)
+            // Fail loud when the `phys_base` symbol IS present in
+            // the kernel symtab (CONFIG_RANDOMIZE_BASE=y, x86_64)
+            // but the page-table walk fails to resolve it: refuse
+            // to default to 0 — under KASLR-on, `phys_base = 0`
+            // would silently mis-translate every `text_kva_to_pa`
+            // read (returns the link-time PA instead of the slid
+            // runtime PA). Under KASLR-off / aarch64 (no
+            // `phys_base` symbol), the walk legitimately returns
+            // None and 0 IS the correct value — preserve that path.
+            match resolve_phys_base(&mem, &kern_syms, walk_cr3, l5_bootstrap, tcr_el1) {
+                Some(v) => v,
+                None if kern_syms.phys_base_kva.is_some() => {
+                    anyhow::bail!(
+                        "phys_base symbol present in kernel symtab but \
+                         resolve_phys_base page-table walk failed — \
+                         KASLR-on kernel likely crashed before kallsyms \
+                         became readable, OR kptr_restrict masked the \
+                         symbol resolution, OR the CR3 captured at boot \
+                         predates the kernel's `phys_base` randomization. \
+                         To debug: (1) check guest console for early-boot \
+                         panic, (2) confirm kernel was built with \
+                         CONFIG_KALLSYMS=y, (3) re-run with \
+                         `#[ktstr_test(kaslr = false)]` to confirm \
+                         KASLR-specific (workaround, NOT fix — the test \
+                         won't reproduce the KASLR-only bug class)."
+                    );
+                }
+                None => 0,
+            }
         };
 
         // Re-resolve l5 with the live `phys_base` so a future

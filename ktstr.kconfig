@@ -15,14 +15,25 @@
 # paths agree on the same PA). Pinning here keeps the assertion meaningful.
 CONFIG_RANDOMIZE_BASE=y
 
-# CONFIG_RANDOMIZE_MEMORY=n keeps `page_offset_base` at its compile-time
-# default so the host monitor's `kva_to_pa` (which assumes
-# `super::symbols::DEFAULT_PAGE_OFFSET` when the runtime symbol resolve has
-# not landed) is correct during the boot-race window. Independent of the
-# kernel-image text/data KASLR slide: text KASLR comes from
-# CONFIG_RANDOMIZE_BASE=y above and the virtual slide is recovered via
-# MSR_LSTAR (see `crate::vmm::x86_64::msr_kaslr::read_and_derive`).
-# CONFIG_RANDOMIZE_MEMORY is not set
+# CONFIG_RANDOMIZE_MEMORY=y randomizes `page_offset_base`, `vmalloc_base`,
+# and `vmemmap_base` at boot — independent of the kernel-image text/data
+# slide which CONFIG_RANDOMIZE_BASE=y above controls. The runtime
+# `page_offset_base` is recovered host-side by reading the symbol via
+# the guest's `/proc/kallsyms` path in `src/vmm/rust_init.rs build_kern_addrs`,
+# shipping the value through `KernAddrs.page_offset_base` (`src/vmm/wire.rs`),
+# and consuming it in `monitor::symbols::kva_to_pa` — the host falls back
+# to `DEFAULT_PAGE_OFFSET` only when `KernAddrs.page_offset_base == 0`
+# (operator escape via `kargs = ["nokaslr"]` on the scheduler decl or
+# `#[ktstr_test(kaslr = false, ...)]` on individual tests). The
+# `kaslr_page_offset_derivation_nonzero` e2e test guards the runtime value:
+# `(page_offset_base - 0xffff_8880_0000_0000) % (1 << 30) == 0 &&
+# page_offset_base != 0xffff_8880_0000_0000` (PUD-aligned slot per
+# arch/x86/mm/kaslr.c::kernel_randomize_memory; ~1/30000 rerun risk on
+# the legitimate slot-0 randomization outcome). Pinning =y here so an
+# inherited defconfig flip can't silently degrade the test back into a
+# tautology where the buggy and fixed direct-map paths agree on the
+# compile-time default.
+CONFIG_RANDOMIZE_MEMORY=y
 
 # CONFIG_GCC_PLUGIN_RANDSTRUCT=n keeps `struct task_struct` field order
 # deterministic across builds. The TaskField cold-path Op handler

@@ -1377,6 +1377,24 @@ pub struct KtstrTestEntry {
     /// 64 cap also ensures the 3-digit `:03` width on
     /// `periodic_NNN` is always sufficient.
     pub num_snapshots: u32,
+    /// Whether KASLR is enabled in the guest kernel for this test.
+    /// `true` (the default) lets the guest randomize kernel virt + direct-map
+    /// addresses (CONFIG_RANDOMIZE_BASE=y + CONFIG_RANDOMIZE_MEMORY=y in
+    /// `ktstr.kconfig`); `false` appends `nokaslr` to the guest cmdline so
+    /// the kernel-image slide and the `page_offset_base` direct-map randomization
+    /// both stay at compile-time defaults. KASLR-off is the determinism escape
+    /// for tests that depend on fixed kernel addresses or that need to reproduce
+    /// bugs masked by randomization; the default-on case exercises ktstr's
+    /// host-side derivation chain (MSR_LSTAR readback, KERN_ADDRS guest channel,
+    /// /proc/kallsyms `page_offset_base` lookup) end-to-end. The
+    /// `kaslr_*_e2e` regression tests guard the derivation; the
+    /// `kaslr_disabled_via_macro_attribute` regression guards this opt-out.
+    /// Operator-level alternative: `kargs = ["nokaslr"]` on the scheduler decl
+    /// — same effect, declared once for every test that uses the scheduler.
+    /// Combining `kaslr = false` with `kargs = ["nokaslr"]` is redundant
+    /// but harmless — `nokaslr` appearing twice on the cmdline is a no-op
+    /// (kernel parses it as a bool flag, not a value).
+    pub kaslr: bool,
 }
 
 /// Placeholder function for [`KtstrTestEntry::DEFAULT`].
@@ -1462,6 +1480,7 @@ impl KtstrTestEntry {
         disk: None,
         post_vm: None,
         num_snapshots: 0,
+        kaslr: true,
     };
 
     /// Build the default entry. Equivalent to [`Self::DEFAULT`].

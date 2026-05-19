@@ -52,6 +52,21 @@
 //! the natural site, since by that point the guest has executed
 //! enough kernel code to have populated `MSR_LSTAR` on the BSP.
 //!
+//! # Adversarial divergence from reference VMMs (intentional)
+//!
+//! None of {cloud-hypervisor, firecracker, qemu, libkrun} derives
+//! KASLR from MSR_LSTAR readback. They use one of: KVM_TRANSLATE
+//! (pause-gated; cannot satisfy continuous monitor at 100 ms
+//! cadence), vmcoreinfo (one-shot at dump time; not live), or
+//! MSR_KERNEL_GS_BASE per-vCPU (pause-gated). ktstr's live
+//! host-side monitor REQUIRES non-pause-gated host-computed
+//! KASLR-aware PA derivation — the LSTAR readback path here is
+//! one of two such mechanisms (the other being the KERN_ADDRS
+//! guest channel at `src/vmm/freeze_coord/dispatch.rs::295-417`).
+//! Divergence is INTENTIONAL: documented here so future reviewers
+//! don't propose collapsing to a ref-VMM pattern that breaks
+//! continuous monitoring.
+//!
 //! # `MSR_LSTAR == entry_SYSCALL_64_link` ambiguity
 //!
 //! When KASLR is disabled (`nokaslr` cmdline or

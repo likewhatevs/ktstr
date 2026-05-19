@@ -513,11 +513,21 @@ pub struct KernAddrs {
     /// `phys_base = 0`). Compare with the host's expected
     /// load-address to recover the physical KASLR offset.
     pub phys_base: u64,
-    /// Guest-derived `page_offset_base` (the KASLR-direct-map
-    /// slide on x86_64) if the guest derived it; the host today
-    /// always sees 0 here and falls back to a page-table walk via
-    /// `monitor::symbols::resolve_page_offset_with_tcr`. Left in
-    /// the wire format for a future extension.
+    /// Symbol KVA of the guest's `page_offset_base` global (NOT the
+    /// runtime value the symbol points at — host dereferences via
+    /// `monitor::symbols::text_kva_to_pa_with_base` + `read_u64` once
+    /// it has `phys_base` resolved). Populated by
+    /// `vmm::rust_init::build_kern_addrs` reading `/proc/kallsyms`.
+    /// Storage class: `.data..ro_after_init` per
+    /// `arch/x86/kernel/head64.c:63` — written during
+    /// `kernel_randomize_memory()` in `start_kernel`, frozen after
+    /// `mark_rodata_ro`. `0` means (a) arm64 (no `page_offset_base`
+    /// global — `PAGE_OFFSET` is compile-time per
+    /// `arch/arm64/include/asm/memory.h:43-45`), (b)
+    /// CONFIG_RANDOMIZE_MEMORY=n (symbol absent), or (c) kallsyms
+    /// unreadable (kptr_restrict elevated); the host falls back to
+    /// `resolve_page_offset_with_tcr` (the page-table walk) in
+    /// every 0 case.
     pub page_offset_base: u64,
     /// Runtime KVA of `_text` (the kernel image start symbol)
     /// from the guest's `/proc/kallsyms`, when readable. The

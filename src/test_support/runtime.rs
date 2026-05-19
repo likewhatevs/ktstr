@@ -260,6 +260,18 @@ pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
     for &karg in entry.scheduler.kargs {
         parts.push(karg.to_string());
     }
+    // Per-test KASLR opt-out (see `KtstrTestEntry.kaslr` doc). The base
+    // cmdline at `src/vmm/setup.rs` does NOT inject `nokaslr` by default —
+    // KASLR is on. A test that needs determinism sets `kaslr = false` in
+    // its `#[ktstr_test]` attribute; that lands the token here, where it
+    // composes with any operator-supplied `Scheduler::kargs(&["nokaslr"])`
+    // above (kernel parses the flag as a bool; duplicates are harmless).
+    // Mirrored guest-side by `vmm::rust_init::create_cgroup_parent_from_sched_args`
+    // and `monitor::symbols::resolve_page_offset`, both of which handle the
+    // `nokaslr` case via the live-publisher fall back to `DEFAULT_PAGE_OFFSET`.
+    if !entry.kaslr {
+        parts.push("nokaslr".to_string());
+    }
     if let Ok(bt) = std::env::var("RUST_BACKTRACE") {
         parts.push(format!("RUST_BACKTRACE={bt}"));
     }

@@ -1306,11 +1306,17 @@ impl KtstrVm {
         // dispatcher (`src/vmm/freeze_coord/dispatch.rs`'s
         // KERN_ADDRS arm). Both paths CAS-publish the same offset
         // so first-writer wins; the dual sourcing is defense in
-        // depth — `nokaslr` cmdline addition above further keeps
-        // the offset at 0 for kernels we don't control the build
-        // of. Consumers `.load(Acquire)` and subtract 1; the 0
-        // sentinel means "no path has published yet" and the
-        // consumer should use a literal 0 for KASLR-off semantics.
+        // depth — KASLR-on is the default state and both publishers
+        // produce non-zero values on the default path. Tests that
+        // explicitly opt out (`#[ktstr_test(kaslr = false)]` adding
+        // `nokaslr` through `runtime::build_cmdline_extra`, OR
+        // `Scheduler::kargs(&["nokaslr"])` operator escape) keep the
+        // offset at 0 for the duration of that test run. Consumers
+        // `.load(Acquire)` and subtract 1; the 0 sentinel means "no
+        // path has published yet" OR "published as 0 (nokaslr)" —
+        // both produce the same observable behaviour (per-CPU
+        // template arithmetic in `monitor::symbols::per_cpu_kva`
+        // lands on the compile-time base).
         let kern_virt_kaslr: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
         let kern_virt_kaslr_evt = Arc::new(EventFd::new(0).expect("eventfd for kern_virt_kaslr"));
@@ -1947,6 +1953,9 @@ impl KtstrVm {
         }
 
         let kern_phys_base_for_result = kern_phys_base.clone();
+        // Mirror of kern_phys_base_for_result for the kern_virt_kaslr
+        // Arc — snapshot at run-end into VmResult.kern_kaslr_offset.
+        let kern_virt_kaslr_for_result = kern_virt_kaslr.clone();
         // Sibling clone for the BSP loop: the freeze-coord closure
         // below captures `kern_virt_kaslr` by move (the dispatch
         // sink uses it for the guest-channel KERN_ADDRS derive), so
@@ -5250,6 +5259,7 @@ impl KtstrVm {
                                     kernel_op_dispatch::dispatch_kernel_op_batch(
                                         owned.guest_kernel(),
                                         dump_btf.as_ref(),
+                                        coord_kaslr_offset(),
                                         req,
                                     )
                                 } else {
@@ -6425,6 +6435,38 @@ impl KtstrVm {
                     // the corresponding `KVM_EXIT_DEBUG` and the
                     // user-watchpoint dispatcher (further down the
                     // iteration) drives the matching capture.
+                    // Drain WATCH requests deferred during the
+                    // pre-KASLR / pre-accessor window once BOTH
+                    // inputs are ready (kern_virt_kaslr Arc has
+                    // published a non-zero offset AND
+                    // owned_accessor has been adopted). Without
+                    // this drain, a WATCH request deferred for
+                    // either reason would sit in
+                    // `capture_requests_deferred` indefinitely
+                    // (the owned_accessor-adoption drain at the
+                    // accessor-arrival site fires once at
+                    // adoption — if kaslr wasn't ready then, it
+                    // re-defers and needs this loop to catch it
+                    // on the kaslr-ready iteration; symmetrically,
+                    // a WATCH that arrived after adoption but
+                    // before kaslr publication needs this drain).
+                    // Filter to WATCH-kind — CAPTURE entries only
+                    // care about accessor adoption and continue
+                    // through the dedicated accessor-adoption
+                    // drain path.
+                    if coord_kaslr_offset() != 0
+                        && owned_accessor.is_some()
+                        && !capture_requests_deferred.is_empty()
+                    {
+                        let drained = std::mem::take(&mut capture_requests_deferred);
+                        for req in drained {
+                            if req.kind == crate::vmm::wire::SNAPSHOT_KIND_WATCH {
+                                snapshot_requests_pending.push(req);
+                            } else {
+                                capture_requests_deferred.push(req);
+                            }
+                        }
+                    }
                     let pending = std::mem::take(&mut snapshot_requests_pending);
                     for SnapshotRequest {
                         request_id,
@@ -6653,13 +6695,44 @@ impl KtstrVm {
                             }
                             crate::vmm::wire::SNAPSHOT_KIND_WATCH => {
                                 if coord_kaslr_offset() == 0
-                                    && owned_accessor.is_none()
+                                    || owned_accessor.is_none()
                                 {
+                                    // WATCH arms a DR against
+                                    // `link_kva + kaslr_offset` AND
+                                    // every subsequent DR fire drives
+                                    // a `freeze_and_dispatch(Capture)`
+                                    // pass that walks the prog
+                                    // accessor's BPF maps. Both inputs
+                                    // must be ready before the arm:
+                                    //   - kaslr_offset == 0 against a
+                                    //     kernel-high-half symbol
+                                    //     under KASLR-on (the default)
+                                    //     would arm at the link-time
+                                    //     KVA (DR never fires under
+                                    //     the runtime slide) OR hit
+                                    //     the fail-loud Err in
+                                    //     `arm_user_watchpoint`.
+                                    //   - owned_accessor == None means
+                                    //     the per-fire capture walks
+                                    //     an absent accessor and
+                                    //     produces a placeholder /
+                                    //     0-map report — the test
+                                    //     surface sees the slot's tag
+                                    //     with no real data.
+                                    // Defer on either; the
+                                    // per-iteration drain above (which
+                                    // gates on coord_kaslr_offset() !=
+                                    // 0) AND the accessor-adoption
+                                    // drain at the accessor-arrival
+                                    // site both feed the deferred
+                                    // queue back into pending.
                                     tracing::info!(
                                         request_id,
                                         %tag,
+                                        kaslr_resolved = coord_kaslr_offset() != 0,
+                                        accessor_adopted = owned_accessor.is_some(),
                                         "freeze-coord: TLV WATCH deferred \
-                                         (kaslr_offset not yet resolved)"
+                                         (kaslr_offset or owned_accessor not yet resolved)"
                                     );
                                     capture_requests_deferred.push(SnapshotRequest {
                                         request_id,
@@ -9301,6 +9374,16 @@ impl KtstrVm {
             vmlinux_data: vmlinux_data_for_result,
             prog_accessor: prog_accessor_slot.lock_unpoisoned().take(),
             kern_phys_base: kern_phys_base_for_result.load(Ordering::Acquire),
+            // Snapshot the kern_virt_kaslr Arc at run-end. The Arc
+            // stores `actual_offset + 1` (bias) so 0 = "never
+            // published" and `saturating_sub(1)` recovers the actual
+            // value (with 0 meaning either "never published" OR
+            // "published as 0", indistinguishable from the consumer's
+            // perspective — e2e tests distinguish via the test
+            // entry's `kaslr` attribute).
+            kern_kaslr_offset: kern_virt_kaslr_for_result
+                .load(Ordering::Acquire)
+                .saturating_sub(1),
             // Virtio-console handle threaded into `collect_results`
             // for the post-exit `drain_bulk()` call. Carries any
             // port-1 TLV bytes the guest wrote that the freeze
@@ -9938,11 +10021,15 @@ impl KtstrVm {
                 // `setup_per_cpu_areas` + `idt_syscall_init` and at
                 // least one of the two publishers has typically
                 // observed a non-zero value. The 0 sentinel below
-                // matches the `nokaslr` cmdline state (added in
-                // `src/vmm/setup.rs`) where neither publisher
-                // produces a non-zero offset because KASLR was
-                // disabled at boot — the consumer uses a literal 0
-                // and the per-CPU template arithmetic in
+                // matches the nokaslr state — added per-test via
+                // `#[ktstr_test(kaslr = false)]` or
+                // `Scheduler::kargs(&["nokaslr"])`; absent on the
+                // default KASLR-on path. When the cmdline pinned
+                // KASLR off, neither publisher produces a non-zero
+                // offset because the kernel ran with
+                // `nokaslr` and disabled the slide at boot — the
+                // consumer uses a literal 0 and the per-CPU
+                // template arithmetic in
                 // `monitor::symbols::per_cpu_kva` lands on the
                 // compile-time base.
                 let kaslr_offset: u64 = kern_virt_kaslr_shared
@@ -11423,6 +11510,12 @@ impl KtstrVm {
             stats_client,
             periodic_fired: run.periodic_fired,
             periodic_target: run.periodic_target,
+            // Plumb the virt-KASLR snapshot from VmRunState
+            // (populated at `VmRunState { kern_kaslr_offset: ... }`
+            // above) through to the public VmResult slot. E2E tests
+            // read this to assert the KASLR derivation chain
+            // produced a non-zero offset on KASLR-on boots.
+            kern_kaslr_offset: run.kern_kaslr_offset,
         })
     }
 

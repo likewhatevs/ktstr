@@ -399,17 +399,54 @@ pub(super) fn dispatch_bulk_message(
                         // MSR_LSTAR publisher. Both paths derive
                         // the SAME virt-KASLR (KASLR is a single
                         // boot-time slot pick stored in
-                        // `kaslr_offset`), so the CAS-fail branch
-                        // (some other writer already published) is
-                        // a no-op. Release pairs with the consumer
-                        // `.load(Acquire)` at L9130 / L5202.
-                        let _ = sinks.kern_virt_kaslr.compare_exchange(
+                        // `kaslr_offset`). Release pairs with the
+                        // consumer `.load(Acquire)` at L9130 /
+                        // L5202.
+                        //
+                        // CAS-fail cross-check: an EQUAL value is
+                        // the expected no-op (MSR_LSTAR publisher
+                        // won the race). CAS-fail with a DIFFERENT
+                        // value means divergence — either a stale
+                        // vmlinux template, a hostile guest payload
+                        // that forged `_text`, or a kernel mid-boot
+                        // KASLR re-roll bug. Fail loud rather than
+                        // dropping silently; the tracing::error!
+                        // surfaces the delta for operator diagnosis
+                        // without aborting the run (next consumer
+                        // .load() still reads the first-writer-wins
+                        // value).
+                        match sinks.kern_virt_kaslr.compare_exchange(
                             0,
                             biased_offset,
                             std::sync::atomic::Ordering::Release,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        let _ = sinks.kern_virt_kaslr_evt.write(1);
+                            std::sync::atomic::Ordering::Acquire,
+                        ) {
+                            Ok(_) => {
+                                let _ = sinks.kern_virt_kaslr_evt.write(1);
+                            }
+                            Err(existing) if existing != biased_offset => {
+                                let lstar_derived = existing.saturating_sub(1);
+                                tracing::error!(
+                                    kern_addrs_derived = format_args!("{offset:#x}"),
+                                    lstar_derived = format_args!("{lstar_derived:#x}"),
+                                    delta = format_args!(
+                                        "{:#x}",
+                                        offset ^ lstar_derived
+                                    ),
+                                    "VirtKaslrDivergence: KERN_ADDRS-derived virt-KASLR \
+                                     offset disagrees with the previously-published \
+                                     MSR_LSTAR-derived value. Both should equal the \
+                                     boot-time slot pick. Possible causes: stale vmlinux \
+                                     template (rebuild + retest), kernel mid-boot KASLR \
+                                     re-roll, hostile guest payload (KERN_ADDRS _text \
+                                     was forged)."
+                                );
+                            }
+                            Err(_) => {
+                                // CAS-fail with EQUAL value:
+                                // both publishers agree.
+                            }
+                        }
                     }
                 }
             }

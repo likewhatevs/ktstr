@@ -1038,13 +1038,25 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // not derive" and leaves the slot at its prior value (the
     // BSP MSR_LSTAR path may still publish on x86_64).
     let kern_text_kva = crate::vmm::guest_comms::read_kernel_text_from_kallsyms();
+    // `page_offset_base` slot — derive the runtime KVA of the
+    // `page_offset_base` global from /proc/kallsyms (kernel-PhD-
+    // confirmed it lives in `.data..ro_after_init`, declared at
+    // `arch/x86/kernel/head64.c:63`). The KVA here is the symbol's
+    // ADDRESS — the host reads the runtime VALUE (the direct-map
+    // base) by translating this KVA to PA via
+    // `monitor::symbols::text_kva_to_pa_with_base` (using
+    // `kern_phys_base`) and `read_u64`-ing at that PA. Returns
+    // `None` on arm64 (no `page_offset_base` global — `PAGE_OFFSET`
+    // is compile-time per `arch/arm64/include/asm/memory.h:43-45`)
+    // and when CONFIG_RANDOMIZE_MEMORY=n (symbol absent). The
+    // wire field is `u64`, so `None` collapses to 0 — host treats
+    // 0 as "use DEFAULT_PAGE_OFFSET fallback" (matching the
+    // historical pre-derivation behavior).
+    let kern_page_offset_base_kva =
+        crate::vmm::guest_comms::read_kernel_page_offset_base_from_kallsyms().unwrap_or(0);
     let kern_addrs = crate::vmm::wire::KernAddrs::new(
         kern_phys_base,
-        // `page_offset_base` slot — guest does not derive it
-        // today; host falls back to a page-table walk via
-        // `monitor::symbols::resolve_page_offset_with_tcr` when
-        // it needs the direct-map base.
-        0,
+        kern_page_offset_base_kva,
         kern_text_kva,
     );
     // `count_online_cpus()` reads `/sys/devices/system/cpu/online`

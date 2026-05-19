@@ -507,23 +507,48 @@ pub fn send_kern_addrs(addrs: &super::wire::KernAddrs) -> bool {
 /// returns a meaningful value on both x86_64 and aarch64 — and on
 /// any other architecture ktstr might target in future.
 pub fn read_kernel_text_from_kallsyms() -> Option<u64> {
+    read_kallsyms_symbol_kva("_text", &["T", "t"])
+}
+
+/// Read the runtime virtual address of `page_offset_base` (the
+/// CONFIG_RANDOMIZE_MEMORY direct-map slide global) from
+/// `/proc/kallsyms`. Companion to [`read_kernel_text_from_kallsyms`].
+///
+/// `page_offset_base` is declared `unsigned long page_offset_base
+/// __ro_after_init` at `arch/x86/kernel/head64.c:63` (kernel-PhD
+/// confirmed); type letter is `D`/`d` (writable data section, even
+/// though `__ro_after_init` lives in `.data..ro_after_init` which
+/// the linker places in the RO image post-mark_rodata_ro). This
+/// reader returns the RUNTIME KVA of the symbol; the VALUE stored
+/// at that KVA — the direct-map base produced by
+/// `kernel_randomize_memory` at boot — must be read separately by
+/// the host via `text_kva_to_pa_with_base(kva, START_KERNEL_MAP,
+/// phys_base)` followed by `read_u64`. Returns `None` when the
+/// symbol is absent (CONFIG_RANDOMIZE_MEMORY=n, arm64) OR when
+/// kptr_restrict masks the address to 0 (kernel-PhD: default is 0,
+/// ktstr-init runs as PID 1 with CAP_SYSLOG so this is rare).
+pub fn read_kernel_page_offset_base_from_kallsyms() -> Option<u64> {
+    read_kallsyms_symbol_kva("page_offset_base", &["D", "d"])
+}
+
+/// Shared `/proc/kallsyms` symbol-KVA reader. Both
+/// [`read_kernel_text_from_kallsyms`] (type `T`/`t`) and
+/// [`read_kernel_page_offset_base_from_kallsyms`] (type `D`/`d`)
+/// dispatch through here. The 16-char hex format is fixed-width per
+/// `kernel/kallsyms.c::s_show` on 64-bit kernels (kernel-PhD
+/// confirmed); leading zeros are not suppressed. Returns `None` on
+/// (a) `/proc/kallsyms` unreadable, (b) symbol absent, (c)
+/// `addr == 0` (kptr_restrict elevated or symbol stripped — caller
+/// MUST treat as "not readable", not as a legitimate zero KVA).
+fn read_kallsyms_symbol_kva(name: &str, allowed_types: &[&str]) -> Option<u64> {
     let kallsyms = std::fs::read_to_string("/proc/kallsyms").ok()?;
     for line in kallsyms.lines() {
         let mut parts = line.split_ascii_whitespace();
         let addr = parts.next()?;
         let typ = parts.next()?;
-        let name = parts.next()?;
-        // `_text` lives at the kernel image start so its type
-        // letter is `T` (global text) or `t` (local text) in the
-        // kallsyms output. Match both to tolerate kernel build
-        // variants. The kallsyms format is documented at
-        // kernel/kallsyms.c::s_show.
-        if name == "_text" && (typ == "T" || typ == "t") {
+        let sym = parts.next()?;
+        if sym == name && allowed_types.contains(&typ) {
             let kva = u64::from_str_radix(addr, 16).ok()?;
-            // 0 addresses indicate kptr_restrict masking — treat
-            // as "not readable" so the caller skips the
-            // virt-KASLR contribution rather than racing with the
-            // kallsyms read.
             if kva != 0 {
                 return Some(kva);
             }

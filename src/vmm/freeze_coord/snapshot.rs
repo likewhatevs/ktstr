@@ -278,25 +278,29 @@ pub(super) fn arm_user_watchpoint(
     // = `0xffff_8000_0000_0000`
     // per Documentation/arch/x86/x86_64/mm.rst, where the guard
     // hole / hypervisor mapping ends and kernel mappings begin),
-    // the watchpoint arms at the link-time address. Under
-    // `CONFIG_RANDOMIZE_BASE=y` (the default in `ktstr.kconfig`)
-    // the guest kernel's runtime symbol lives at `link_kva +
-    // runtime_kaslr_slide`, so the DR programmed against
-    // `link_kva` never matches a guest write — the operator sees a
-    // valid-looking arm with zero hits and no diagnostic.
+    // arming at the link-time address under `CONFIG_RANDOMIZE_BASE=y`
+    // (the default in `ktstr.kconfig`) would program the DR at a
+    // KVA the guest never writes — the runtime symbol lives at
+    // `link_kva + runtime_kaslr_slide`, and the link-time DR never
+    // fires. The operator would see a valid-looking arm with zero
+    // hits and no diagnostic.
     //
-    // The arm still completes — refusing it would regress every
-    // `Op::WatchSnapshot` user when the host coordinator has not
-    // yet derived the runtime KASLR slide (e.g. before the BSP
-    // `MSR_LSTAR`-based virt_kaslr plumbing lands). The warn is a
-    // defense-in-depth signal that survives that future fix:
-    // `kaslr_offset == 0` is a VALID runtime state even after the
-    // derivation lands (a guest booted with the `nokaslr` cmdline
-    // legitimately has zero slide, and a derivation that falls
-    // back on lookup failure also yields zero). The warn
-    // distinguishes "zero because nokaslr" (low-address synthetic
-    // fixtures stay silent) from "zero against a kernel-text-
-    // looking symbol" (operator-visible signal).
+    // The arm REFUSES with a typed `Err` rather than completing.
+    // This is a deliberate fail-loud: callers get an actionable
+    // diagnostic naming the symbol, the link_kva, and the operator
+    // workaround (`#[ktstr_test(kaslr = false)]`). The warn-once
+    // tracker keeps CI logs readable when many arms target the
+    // same symbol; the `Err` itself fires on every failing arm so
+    // every caller observes the failure.
+    //
+    // Low-address synthetic fixtures (link_kva below the high-half
+    // threshold) bypass the check entirely — those are tests, not
+    // production kernel symbols, and aren't subject to KASLR
+    // slide. Callers that legitimately want to arm against a
+    // post-slide KVA pass `kaslr_offset != 0` (e.g. the coord's
+    // `kern_virt_kaslr` Arc, populated by the MSR_LSTAR readback
+    // path); both branches of `kaslr_offset != 0 OR link_kva <
+    // high-half` skip the gate.
     //
     // Arch caveats: the [`KERNEL_HALF_CANONICAL_4LEVEL`] threshold is the
     // x86_64 canonical-space lower bound (Documentation/arch/
@@ -315,10 +319,13 @@ pub(super) fn arm_user_watchpoint(
     // get the signal without log spam dominating a CI run.
     if kaslr_offset == 0 && link_kva >= KERNEL_HALF_CANONICAL_4LEVEL {
         // Process-wide one-shot tracker keyed on `(symbol,
-        // link_kva)`. Insertion returns `true` only the first
-        // time the pair appears; subsequent arms are silent.
-        // `Mutex<HashSet>` is fine — arm rate is low (handful
-        // per VM run) and contention is bounded.
+        // link_kva)` so the warn line in the Err message is
+        // emitted at most once per unique (symbol, link_kva) per
+        // process — keeps CI logs readable when a test triggers
+        // many WatchSnapshot arms against the same symbol. The
+        // typed Err itself is always returned (no once-per-process
+        // suppression on the error path — every failing arm sees
+        // the same typed reply).
         static WARN_ONCE: std::sync::OnceLock<
             std::sync::Mutex<std::collections::HashSet<(String, u64)>>,
         > = std::sync::OnceLock::new();
@@ -334,14 +341,25 @@ pub(super) fn arm_user_watchpoint(
                 symbol = symbol,
                 link_kva = format_args!("{link_kva:#x}"),
                 "arm_user_watchpoint: kaslr_offset = 0 but link_kva is in \
-                 x86_64 kernel high-half — under CONFIG_RANDOMIZE_BASE=y the \
-                 runtime symbol lives at link_kva + runtime_kaslr_slide, so \
-                 this arm will not match guest writes. Boot the guest with \
-                 the `nokaslr` cmdline argument to use Op::WatchSnapshot, OR \
-                 omit Op::WatchSnapshot from KASLR-on test runs. (Logged \
-                 once per unique symbol/KVA pair per process.)"
+                 x86_64 kernel high-half — the kern_virt_kaslr Arc has not \
+                 yet published a non-zero slide. Returning Err to fail loud \
+                 rather than arming the DR at the link-time KVA (which would \
+                 never match guest writes under CONFIG_RANDOMIZE_BASE=y, \
+                 silently no-op'ing the watch). If the test legitimately \
+                 needs nokaslr semantics, set `#[ktstr_test(kaslr = false)]` \
+                 or `Scheduler::kargs(&[\"nokaslr\"])` so the cmdline pins \
+                 kaslr off and the link-time KVA IS the runtime KVA. \
+                 (Warn logged once per unique symbol/KVA pair per process; \
+                 the Err return fires on every failing arm.)"
             );
         }
+        return Err(format!(
+            "symbol '{symbol}' link_kva {link_kva:#x} is in x86_64 kernel \
+             high-half but kern_virt_kaslr Arc has not published a non-zero \
+             slide (coord_kaslr_offset() == 0); refusing to arm DR at \
+             link-time KVA — would never match guest writes under KASLR-on. \
+             If nokaslr semantics intended, set `#[ktstr_test(kaslr = false)]`."
+        ));
     }
     // `request_kva == 0` is the slot's "free" sentinel — the per-vCPU
     // `self_arm_watchpoint` short-circuits on a zero request_kva, and
@@ -891,6 +909,10 @@ mod arm_user_watchpoint_tests {
     /// aarch64 DBGWVR; without the check the hardware register
     /// load would silently round the address and watch the wrong
     /// 4-byte window.
+    ///
+    /// `kaslr_offset != 0` so the new fail-loud gate (at the head
+    /// of the function, refusing high-half link_kva + zero offset)
+    /// doesn't pre-empt the alignment check this test pins.
     #[test]
     fn rejects_unaligned_kva() {
         let wp = Arc::new(WatchpointArm::new().unwrap());
@@ -900,7 +922,7 @@ mod arm_user_watchpoint_tests {
             &wp,
             &cache,
             "misaligned_sym",
-            0,
+            0x1000_0000,
             &[],
             &[],
             &[],
@@ -1003,17 +1025,23 @@ mod arm_user_watchpoint_tests {
     /// fresh `WatchpointArm` has every slot's `request_kva == 0`
     /// (the free sentinel), so the first arm lands in slot 0
     /// (DR1 on x86_64 / watchpoint 1 on aarch64).
+    ///
+    /// `kaslr_offset != 0` so the fail-loud high-half-zero-offset
+    /// gate doesn't fire; the stored `request_kva` is
+    /// `link_kva + kaslr_offset` (post-slide).
     #[test]
     fn successful_arm_consumes_first_free_slot() {
         let wp = Arc::new(WatchpointArm::new().unwrap());
-        let kva = 0xffff_8000_0000_4000u64;
-        let cache = cache_with("scx_root", kva);
+        let link_kva = 0xffff_8000_0000_4000u64;
+        let kaslr_offset = 0x1000_0000u64;
+        let expected_post_slide_kva = link_kva + kaslr_offset;
+        let cache = cache_with("scx_root", link_kva);
         let bsp_alive = dead_bsp();
         let idx = arm_user_watchpoint(
             &wp,
             &cache,
             "scx_root",
-            0,
+            kaslr_offset,
             &[],
             &[],
             &[],
@@ -1025,8 +1053,8 @@ mod arm_user_watchpoint_tests {
         assert_eq!(idx, 0, "first free slot is index 0");
         assert_eq!(
             wp.user[0].request_kva.load(Ordering::Acquire),
-            kva,
-            "slot 0 must hold the resolved KVA"
+            expected_post_slide_kva,
+            "slot 0 must hold the resolved post-slide KVA"
         );
         let tag = wp.user[0].tag.lock().unwrap().clone();
         assert_eq!(tag, "scx_root", "slot 0 tag must match symbol name");
@@ -1050,10 +1078,15 @@ mod arm_user_watchpoint_tests {
     /// strategy so a regression to a non-deterministic order
     /// (e.g. searching from the back, picking the largest gap)
     /// surfaces here.
+    ///
+    /// `kaslr_offset != 0` so the fail-loud high-half-zero-offset
+    /// gate doesn't fire; the stored `request_kva` is
+    /// `link_kva + kaslr_offset` (post-slide).
     #[test]
     fn arms_consume_slots_in_index_order() {
         let wp = Arc::new(WatchpointArm::new().unwrap());
         let bsp_alive = dead_bsp();
+        let kaslr_offset = 0x1000_0000u64;
         let mut symbols = HashMap::new();
         symbols.insert("sym_a".to_string(), 0xffff_8000_0000_4000u64);
         symbols.insert("sym_b".to_string(), 0xffff_8000_0000_5000u64);
@@ -1062,7 +1095,7 @@ mod arm_user_watchpoint_tests {
             &wp,
             &cache,
             "sym_a",
-            0,
+            kaslr_offset,
             &[],
             &[],
             &[],
@@ -1075,7 +1108,7 @@ mod arm_user_watchpoint_tests {
             &wp,
             &cache,
             "sym_b",
-            0,
+            kaslr_offset,
             &[],
             &[],
             &[],
@@ -1088,11 +1121,11 @@ mod arm_user_watchpoint_tests {
         assert_eq!(i1, 1);
         assert_eq!(
             wp.user[0].request_kva.load(Ordering::Acquire),
-            0xffff_8000_0000_4000u64
+            0xffff_8000_0000_4000u64 + kaslr_offset
         );
         assert_eq!(
             wp.user[1].request_kva.load(Ordering::Acquire),
-            0xffff_8000_0000_5000u64
+            0xffff_8000_0000_5000u64 + kaslr_offset
         );
         assert_eq!(
             wp.user[2].request_kva.load(Ordering::Acquire),
@@ -1107,10 +1140,15 @@ mod arm_user_watchpoint_tests {
     /// production code MUST refuse to enroll more than the
     /// hardware register count (3 user watchpoints across both
     /// x86_64 and aarch64 in this codebase).
+    ///
+    /// `kaslr_offset != 0` so the fail-loud high-half-zero-offset
+    /// gate doesn't fire; the stored `request_kva` is
+    /// `link_kva + kaslr_offset` (post-slide).
     #[test]
     fn arm_returns_error_when_all_slots_occupied() {
         let wp = Arc::new(WatchpointArm::new().unwrap());
         let bsp_alive = dead_bsp();
+        let kaslr_offset = 0x1000_0000u64;
         let mut symbols = HashMap::new();
         symbols.insert("sym_a".to_string(), 0xffff_8000_0000_4000u64);
         symbols.insert("sym_b".to_string(), 0xffff_8000_0000_5000u64);
@@ -1122,7 +1160,7 @@ mod arm_user_watchpoint_tests {
                 &wp,
                 &cache,
                 sym,
-                0,
+                kaslr_offset,
                 &[],
                 &[],
                 &[],
@@ -1136,7 +1174,7 @@ mod arm_user_watchpoint_tests {
             &wp,
             &cache,
             "sym_d",
-            0,
+            kaslr_offset,
             &[],
             &[],
             &[],
@@ -1154,15 +1192,15 @@ mod arm_user_watchpoint_tests {
         // overwrite any earlier slot.
         assert_eq!(
             wp.user[0].request_kva.load(Ordering::Acquire),
-            0xffff_8000_0000_4000u64
+            0xffff_8000_0000_4000u64 + kaslr_offset
         );
         assert_eq!(
             wp.user[1].request_kva.load(Ordering::Acquire),
-            0xffff_8000_0000_5000u64
+            0xffff_8000_0000_5000u64 + kaslr_offset
         );
         assert_eq!(
             wp.user[2].request_kva.load(Ordering::Acquire),
-            0xffff_8000_0000_6000u64
+            0xffff_8000_0000_6000u64 + kaslr_offset
         );
     }
 
@@ -1174,10 +1212,15 @@ mod arm_user_watchpoint_tests {
     /// test stages a 3-slot fill, clears slot 1's KVA in place,
     /// then re-arms and verifies the new arm lands in slot 1
     /// (the freed middle slot, not slot 3 which is still full).
+    ///
+    /// `kaslr_offset != 0` so the fail-loud high-half-zero-offset
+    /// gate doesn't fire; the stored `request_kva` is
+    /// `link_kva + kaslr_offset` (post-slide).
     #[test]
     fn slot_becomes_reusable_after_request_kva_cleared() {
         let wp = Arc::new(WatchpointArm::new().unwrap());
         let bsp_alive = dead_bsp();
+        let kaslr_offset = 0x1000_0000u64;
         let mut symbols = HashMap::new();
         symbols.insert("sym_a".to_string(), 0xffff_8000_0000_4000u64);
         symbols.insert("sym_b".to_string(), 0xffff_8000_0000_5000u64);
@@ -1189,7 +1232,7 @@ mod arm_user_watchpoint_tests {
                 &wp,
                 &cache,
                 sym,
-                0,
+                kaslr_offset,
                 &[],
                 &[],
                 &[],
@@ -1210,7 +1253,7 @@ mod arm_user_watchpoint_tests {
             &wp,
             &cache,
             "sym_d",
-            0,
+            kaslr_offset,
             &[],
             &[],
             &[],
@@ -1222,45 +1265,45 @@ mod arm_user_watchpoint_tests {
         assert_eq!(idx, 1, "freed slot 1 must be reused before slot 2");
         assert_eq!(
             wp.user[1].request_kva.load(Ordering::Acquire),
-            0xffff_8000_0000_8000u64,
-            "freed slot now holds the new KVA"
+            0xffff_8000_0000_8000u64 + kaslr_offset,
+            "freed slot now holds the new post-slide KVA"
         );
         // Slot 0 and slot 2 still hold their original arms.
         assert_eq!(
             wp.user[0].request_kva.load(Ordering::Acquire),
-            0xffff_8000_0000_4000u64
+            0xffff_8000_0000_4000u64 + kaslr_offset
         );
         assert_eq!(
             wp.user[2].request_kva.load(Ordering::Acquire),
-            0xffff_8000_0000_6000u64
+            0xffff_8000_0000_6000u64 + kaslr_offset
         );
     }
 
-    /// arm_user_watchpoint logs a `tracing::warn!` when
-    /// `kaslr_offset == 0` AND `link_kva` is in the kernel
-    /// high-half (`>= KERNEL_HALF_CANONICAL_4LEVEL`) — the silent-
-    /// misfire detection path. Without the warn,
+    /// arm_user_watchpoint returns a typed `Err` AND logs a
+    /// `tracing::warn!` when `kaslr_offset == 0` AND `link_kva`
+    /// is in the kernel high-half (`>= KERNEL_HALF_CANONICAL_4LEVEL`)
+    /// — the silent-misfire fail-loud path. Without the gate,
     /// `Op::WatchSnapshot` against a kernel-text symbol under
     /// `CONFIG_RANDOMIZE_BASE=y` would arm at the link-time KVA
     /// (wrong under runtime KASLR slide) and never fire, with no
     /// operator-visible signal that anything was wrong. Pin the
-    /// warn so a refactor that drops the check (or the warn
-    /// itself) trips here.
+    /// Err+warn so a refactor that drops either (or downgrades
+    /// the Err back to a silent arm) trips here.
     ///
     /// Each test uses a UNIQUE symbol name + link_kva so the
     /// process-wide warn-once tracker fires per test, regardless
     /// of test execution order.
     #[tracing_test::traced_test]
     #[test]
-    fn warns_when_kaslr_zero_against_kernel_high_half() {
+    fn errs_when_kaslr_zero_against_kernel_high_half() {
         let wp = Arc::new(WatchpointArm::new().unwrap());
         let cache = cache_with("test_sym_warn_high_half", 0xffff_8000_0000_4040u64);
         let bsp_alive = dead_bsp();
-        let idx = arm_user_watchpoint(
+        let err = arm_user_watchpoint(
             &wp,
             &cache,
             "test_sym_warn_high_half",
-            0, // kaslr_offset == 0 — triggers the warn
+            0, // kaslr_offset == 0 — triggers the Err+warn
             &[],
             &[],
             &[],
@@ -1268,18 +1311,27 @@ mod arm_user_watchpoint_tests {
             None,
             &bsp_alive,
         )
-        .unwrap();
-        // Arm still succeeds — refusing it would regress every
-        // caller that hasn't yet plumbed the runtime KASLR slide.
-        assert_eq!(idx, 0);
-        assert_eq!(
-            wp.user[0].request_kva.load(Ordering::Acquire),
-            0xffff_8000_0000_4040u64,
-            "arm completes at the link-time KVA even though the warn fires",
+        .unwrap_err();
+        // Err must name the symbol AND the workaround so the
+        // caller has an actionable next step.
+        assert!(
+            err.contains("test_sym_warn_high_half"),
+            "Err must name the symbol, got: {err}"
         );
-        // The warn names the symbol AND points at the `nokaslr`
-        // operator workaround so a user scanning logs sees an
-        // actionable next step rather than an internal task ID.
+        assert!(
+            err.contains("nokaslr") || err.contains("kaslr = false"),
+            "Err must cite the operator workaround, got: {err}"
+        );
+        // No arm completed — the slot remains the free sentinel.
+        for slot in &wp.user {
+            assert_eq!(
+                slot.request_kva.load(Ordering::Acquire),
+                0,
+                "fail-loud path must not write request_kva"
+            );
+        }
+        // The warn line also fires (once per unique sym/KVA),
+        // naming the symbol and the operator workaround.
         assert!(
             logs_contain("arm_user_watchpoint"),
             "expected arm_user_watchpoint warn marker in log output",
@@ -1294,15 +1346,15 @@ mod arm_user_watchpoint_tests {
         );
     }
 
-    /// arm_user_watchpoint logs the warn at the EXACT high-half
-    /// boundary (`link_kva == KERNEL_HALF_CANONICAL_4LEVEL`) — the check
-    /// uses `>=` (inclusive). A regression that flipped to `>`
-    /// (exclusive) would silently disable the warn for any
-    /// symbol resolving exactly to the boundary. Pin the
-    /// inclusive-bound semantic.
+    /// arm_user_watchpoint returns Err + logs the warn at the
+    /// EXACT high-half boundary (`link_kva ==
+    /// KERNEL_HALF_CANONICAL_4LEVEL`) — the gate check uses `>=`
+    /// (inclusive). A regression that flipped to `>` (exclusive)
+    /// would silently allow arming at the boundary. Pin the
+    /// inclusive-bound semantic via the Err return.
     #[tracing_test::traced_test]
     #[test]
-    fn warns_when_link_kva_exactly_at_kernel_high_half_boundary() {
+    fn errs_when_link_kva_exactly_at_kernel_high_half_boundary() {
         let wp = Arc::new(WatchpointArm::new().unwrap());
         // Boundary KVA must still be 4-byte aligned (the
         // alignment check at the function tail enforces this);
@@ -1310,10 +1362,10 @@ mod arm_user_watchpoint_tests {
         // 16-byte aligned.
         let cache = cache_with("test_sym_boundary", KERNEL_HALF_CANONICAL_4LEVEL);
         let bsp_alive = dead_bsp();
-        // Arm at exactly the boundary. The kva==0 reject only
-        // fires when link_kva + kaslr_offset == 0 — that's not
-        // the case here (link_kva != 0).
-        let _idx = arm_user_watchpoint(
+        // Arm at exactly the boundary. With kaslr_offset == 0,
+        // the new gate fires and the call returns Err — the
+        // `>=` check IS inclusive of the boundary value.
+        let err = arm_user_watchpoint(
             &wp,
             &cache,
             "test_sym_boundary",
@@ -1325,7 +1377,11 @@ mod arm_user_watchpoint_tests {
             None,
             &bsp_alive,
         )
-        .unwrap();
+        .unwrap_err();
+        assert!(
+            err.contains("test_sym_boundary"),
+            "boundary-fail Err must name the symbol, got: {err}"
+        );
         assert!(
             logs_contain("arm_user_watchpoint"),
             "link_kva exactly at high-half boundary (>= check is inclusive) must warn",

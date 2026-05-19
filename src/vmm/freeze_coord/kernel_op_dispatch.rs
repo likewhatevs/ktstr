@@ -227,23 +227,31 @@ pub(super) fn user_half_kva_rejection_reason(kva: u64) -> String {
 pub(super) fn dispatch_kernel_op_batch(
     kernel: &GuestKernel,
     btf: Option<&Btf>,
+    kaslr_offset: u64,
     req: &KernelOpRequestPayload,
 ) -> KernelOpReplyPayload {
     let request_id = req.request_id;
     match req.direction {
-        KernelOpDirection::Write => dispatch_write_batch(kernel, btf, request_id, &req.entries),
-        KernelOpDirection::Read => dispatch_read_batch(kernel, btf, request_id, &req.entries),
+        KernelOpDirection::Write => {
+            dispatch_write_batch(kernel, btf, kaslr_offset, request_id, &req.entries)
+        }
+        KernelOpDirection::Read => {
+            dispatch_read_batch(kernel, btf, kaslr_offset, request_id, &req.entries)
+        }
     }
 }
 
 fn dispatch_write_batch(
     kernel: &GuestKernel,
     btf: Option<&Btf>,
+    kaslr_offset: u64,
     request_id: u32,
     entries: &[KernelOpEntry],
 ) -> KernelOpReplyPayload {
     for (idx, entry) in entries.iter().enumerate() {
-        if let Err(reason) = dispatch_one_write(kernel, btf, &entry.target, &entry.value) {
+        if let Err(reason) =
+            dispatch_one_write(kernel, btf, kaslr_offset, &entry.target, &entry.value)
+        {
             return error_reply(request_id, format!("entry[{idx}]: {reason}"));
         }
     }
@@ -258,12 +266,13 @@ fn dispatch_write_batch(
 fn dispatch_read_batch(
     kernel: &GuestKernel,
     btf: Option<&Btf>,
+    kaslr_offset: u64,
     request_id: u32,
     entries: &[KernelOpEntry],
 ) -> KernelOpReplyPayload {
     let mut read_values: Vec<KernelOpValue> = Vec::with_capacity(entries.len());
     for (idx, entry) in entries.iter().enumerate() {
-        match dispatch_one_read(kernel, btf, &entry.target, &entry.value) {
+        match dispatch_one_read(kernel, btf, kaslr_offset, &entry.target, &entry.value) {
             Ok(v) => read_values.push(v),
             Err(reason) => return error_reply(request_id, format!("entry[{idx}]: {reason}")),
         }
@@ -279,6 +288,7 @@ fn dispatch_read_batch(
 fn dispatch_one_write(
     kernel: &GuestKernel,
     btf: Option<&Btf>,
+    kaslr_offset: u64,
     target: &KernelOpTarget,
     value: &KernelOpValue,
 ) -> Result<(), String> {
@@ -386,7 +396,7 @@ fn dispatch_one_write(
         // Cold-path freeze rendezvous gives the atomicity contract
         // shared by every dispatcher arm.
         (KernelOpTarget::PerCpuField { symbol, field, cpu }, value) => {
-            dispatch_per_cpu_field_write(kernel, btf, symbol, field, *cpu, value)
+            dispatch_per_cpu_field_write(kernel, btf, kaslr_offset, symbol, field, *cpu, value)
         }
 
         // Per-task field — SCX-managed tasks only. Walks
@@ -416,6 +426,7 @@ fn dispatch_one_write(
 fn dispatch_one_read(
     kernel: &GuestKernel,
     btf: Option<&Btf>,
+    kaslr_offset: u64,
     target: &KernelOpTarget,
     width_hint: &KernelOpValue,
 ) -> Result<KernelOpValue, String> {
@@ -489,7 +500,7 @@ fn dispatch_one_read(
         // the write side, then read U32 or U64 at the resolved PA.
         // See [`dispatch_per_cpu_field_read`].
         (KernelOpTarget::PerCpuField { symbol, field, cpu }, width_hint) => {
-            dispatch_per_cpu_field_read(kernel, btf, symbol, field, *cpu, width_hint)
+            dispatch_per_cpu_field_read(kernel, btf, kaslr_offset, symbol, field, *cpu, width_hint)
         }
 
         // Per-task field — same walker + 8-layer validation as the
@@ -558,18 +569,24 @@ fn struct_name_for_per_cpu_symbol(symbol: &str) -> Result<&'static str, String> 
 /// [`nested_member_byte_offset`]; translate the per-CPU instance KVA
 /// to PA via [`translate_any_kva`]; return PA + field_off.
 ///
-/// **KASLR-on caveat**: passes `kaslr_offset=0` to `per_cpu_kva`.
-/// ktstr defaults to `nokaslr` karg (per task #40 defense-in-depth),
-/// so the slide is always 0 for the standard test path. The
-/// KASLR-on round-trip end-to-end test (which would exercise a
-/// non-zero kaslr_offset path via cross-thread BSP MSR_LSTAR
-/// derive) is deferred — see B9 #6 in the umbrella task #14. A
-/// regression that toggled `nokaslr` off without wiring the
-/// kaslr_offset would silently produce wrong per-CPU KVAs and
-/// `translate_any_kva` would bounds-reject to None.
+/// **KASLR-on contract**: `kaslr_offset` is the runtime virt-KASLR
+/// slide produced by the freeze coordinator's
+/// `coord_kaslr_offset()` accessor (snapshot of the
+/// `kern_virt_kaslr` Arc published by the MSR_LSTAR-derive at
+/// `mod.rs:10843-10854` AND/OR the KERN_ADDRS `_text` path at
+/// `dispatch.rs:388-396`). Both publishers converge on the same Arc
+/// via CAS; the accessor's `saturating_sub(1)` bias yields 0 when
+/// (a) not yet published (boot-race window) or (b) published as 0
+/// (nokaslr cmdline / `#[ktstr_test(kaslr = false)]`). Passing
+/// 0 collapses `per_cpu_kva` to the link-time identity — correct
+/// for the nokaslr case, silently wrong for "not yet published"
+/// (downstream `translate_any_kva` then bounds-rejects to None,
+/// producing a typed `"per_cpu_kva={kva:#x} unmapped"` reply error
+/// — fail-loud, not silent corruption).
 fn resolve_per_cpu_field_pa(
     kernel: &GuestKernel,
     btf: Option<&Btf>,
+    kaslr_offset: u64,
     symbol: &str,
     field: &str,
     cpu: u32,
@@ -609,8 +626,37 @@ fn resolve_per_cpu_field_pa(
     }
 
     // per_cpu_kva formula: template_kva + kaslr_offset + per_cpu_offset.
-    // kaslr_offset = 0 per the doc above (nokaslr default).
-    let per_cpu_kva = crate::monitor::symbols::per_cpu_kva(template_kva, 0, per_cpu_offset);
+    // kaslr_offset comes from the caller-threaded `coord_kaslr_offset()`
+    // snapshot of the kern_virt_kaslr Arc — see the function-level doc
+    // above for the publisher chain + nokaslr semantics.
+    let per_cpu_kva =
+        crate::monitor::symbols::per_cpu_kva(template_kva, kaslr_offset, per_cpu_offset);
+    // Step 4 F hardening (audit #89): reject a per-CPU KVA that fell
+    // outside ANY plausible kernel-half — a wrapping_add overflow
+    // (template_kva + kaslr_offset + per_cpu_offset wrapping past
+    // u64::MAX) OR a wildly wrong template_kva (broken symtab) lands
+    // here. Without this guard, the wrong KVA could translate to a
+    // valid-but-wrong guest page and produce silent garbage; with it,
+    // the typed reply error surfaces the failure loud.
+    //
+    // Threshold: 0xffff_0000_0000_0000 — the LOWER of x86_64's
+    // canonical-half boundary (0xffff_8000_0000_0000) and aarch64's
+    // VA_BITS=48 PAGE_OFFSET (0xffff_0000_0000_0000 per
+    // arch/arm64/include/asm/memory.h:43-45). Cross-arch safe: catches
+    // arithmetic wrap (low addresses) and broken-template low-half
+    // pollution on both x86_64 (slightly looser than strict
+    // canonical-half but still ~2^63-1 worth of rejection space) and
+    // aarch64 (exact PAGE_OFFSET floor).
+    const KERNEL_HALF_FLOOR_CROSS_ARCH: u64 = 0xffff_0000_0000_0000;
+    if per_cpu_kva < KERNEL_HALF_FLOOR_CROSS_ARCH {
+        return Err(format!(
+            "PerCpuField {symbol}.{field}[cpu={cpu}]: per_cpu_kva={per_cpu_kva:#x} \
+             outside kernel-half (< 0xffff_0000_0000_0000) — arithmetic wrap \
+             or broken template KVA \
+             (template={template_kva:#x} + kaslr={kaslr_offset:#x} + \
+             per_cpu_off={per_cpu_offset:#x})"
+        ));
+    }
 
     let (struct_t, _) = find_struct(btf, struct_name).map_err(|e| {
         format!(
@@ -651,12 +697,13 @@ fn resolve_per_cpu_field_pa(
 fn dispatch_per_cpu_field_write(
     kernel: &GuestKernel,
     btf: Option<&Btf>,
+    kaslr_offset: u64,
     symbol: &str,
     field: &str,
     cpu: u32,
     value: &KernelOpValue,
 ) -> Result<(), String> {
-    let pa = resolve_per_cpu_field_pa(kernel, btf, symbol, field, cpu)? as u64;
+    let pa = resolve_per_cpu_field_pa(kernel, btf, kaslr_offset, symbol, field, cpu)? as u64;
     match value {
         KernelOpValue::U32(v) => {
             kernel.mem().write_u32(pa, 0, *v);
@@ -685,12 +732,13 @@ fn dispatch_per_cpu_field_write(
 fn dispatch_per_cpu_field_read(
     kernel: &GuestKernel,
     btf: Option<&Btf>,
+    kaslr_offset: u64,
     symbol: &str,
     field: &str,
     cpu: u32,
     width_hint: &KernelOpValue,
 ) -> Result<KernelOpValue, String> {
-    let pa = resolve_per_cpu_field_pa(kernel, btf, symbol, field, cpu)? as u64;
+    let pa = resolve_per_cpu_field_pa(kernel, btf, kaslr_offset, symbol, field, cpu)? as u64;
     match width_hint {
         KernelOpValue::U32(_) => Ok(KernelOpValue::U32(kernel.mem().read_u32(pa, 0))),
         KernelOpValue::U64(_) => Ok(KernelOpValue::U64(kernel.mem().read_u64(pa, 0))),
@@ -2369,6 +2417,7 @@ mod tests {
         dispatch_one_write(
             &kernel,
             None,
+            0,
             &KernelOpTarget::Symbol("test_flags".into()),
             &KernelOpValue::OrU32(OR_MASK),
         )
@@ -2419,6 +2468,7 @@ mod tests {
         dispatch_one_write(
             &kernel,
             None,
+            0,
             &KernelOpTarget::Symbol("test_flags".into()),
             &KernelOpValue::OrU32(ALREADY_SET),
         )
