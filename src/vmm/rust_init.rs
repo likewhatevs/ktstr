@@ -220,6 +220,185 @@ fn proc_pid_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
+/// Outcome reported by a successful [`kill_scheduler_process`] call.
+/// Three variants because the operator-visible signal (caller-side
+/// logging, sidecar event) differs by how the child responded:
+/// already-gone callers know there was nothing to do; sigterm-graceful
+/// exit is the scx-convention happy path; sigkill-escalation is the
+/// notable case (the scheduler binary either ignored SIGTERM or its
+/// userspace signal handler ran too slow against the grace window).
+//
+// `#[allow(dead_code)]` is the substep-ordering bridge: the helper
+// has no production caller today — the Op::DetachScheduler /
+// Op::RestartScheduler / Op::ReplaceScheduler dispatchers that will
+// consume it land in a follow-up substep. Tests in this module
+// exercise every variant + the InvalidPid error path, so the helper
+// is verified-correct as it lands; the allow becomes a no-op the
+// moment the first production caller wires up.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum KillSchedulerOutcome {
+    /// `pid` was not alive when the call started — `/proc/{pid}`
+    /// already absent. Treated as success because lifecycle ops
+    /// (Op::DetachScheduler) are idempotent: detaching when nothing
+    /// is running is a no-op, not an error.
+    AlreadyExited,
+    /// SIGTERM landed and the scheduler exited cleanly within the
+    /// grace window. The scx convention (per scx_simple.c
+    /// `sigint_handler` at L37-39 of the upstream
+    /// tools/sched_ext/scx_simple.c) is to catch SIGTERM, drop the
+    /// BPF skeleton, run scx_disable_workfn via the destructor path,
+    /// and exit. This is the operator-visible happy path.
+    ExitedAfterSigterm,
+    /// SIGTERM did not produce an exit within the grace window;
+    /// SIGKILL was sent and the process reaped. The scheduler
+    /// either failed to install its SIGTERM handler, was stuck in
+    /// uninterruptible kernel state, or its handler took longer
+    /// than the grace allowed. Operators may want to inspect the
+    /// scheduler binary's signal-handler implementation when this
+    /// fires.
+    EscalatedToSigkill,
+}
+
+/// Failure modes for [`kill_scheduler_process`]. Both indicate the
+/// caller-supplied invariant (a kill-able pid) was violated or the
+/// kernel refused to honor a SIGKILL — neither is recoverable at the
+/// call site, but both carry distinct operator diagnostics.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum KillSchedulerError {
+    /// `pid` was not a positive pid_t value. POSIX `kill(2)` reserves
+    /// 0 (the caller's process group) and negative values (signal a
+    /// process group) for special semantics — the scheduler-lifecycle
+    /// call site only ever wants to signal a specific known pid, so a
+    /// non-positive value is a programming error in the caller.
+    InvalidPid,
+    /// SIGKILL was sent but `/proc/{pid}` was still present after the
+    /// post-SIGKILL grace window. POSIX guarantees SIGKILL cannot be
+    /// caught or ignored, so this indicates either kernel-side stall
+    /// (rare uninterruptible D-state) or a process that re-spawned a
+    /// new pid before procfs cleaned up — neither plausible in the
+    /// scheduler-binary case but reported distinctly so the caller
+    /// can surface a "scheduler refused to die" diagnostic rather
+    /// than silently believing the detach succeeded.
+    StillAliveAfterSigkill,
+}
+
+/// Send SIGTERM to `pid`, wait up to `sigterm_grace` for the process
+/// to exit (observed via `/proc/{pid}` removal), then escalate to
+/// SIGKILL if the polite shutdown did not land. Returns the variant
+/// that describes how the kill resolved.
+///
+/// # Why procfs polling instead of `waitpid`
+///
+/// The guest init installs SIGCHLD = SIG_IGN globally so PID 1 does
+/// not have to reap every zombie (see [`with_sigchld_default`] and
+/// the doc on [`proc_pid_alive`]). Under that disposition the kernel
+/// auto-reaps children before `waitpid` runs, so `waitpid` returns
+/// `ECHILD` even on a clean exit. `/proc/{pid}` removal is
+/// signal-disposition-independent: the directory disappears the
+/// moment the kernel runs `release_task` for the pid, regardless of
+/// how SIGCHLD is handled. Polling `/proc/{pid}` therefore observes
+/// the real exit on every code path where SIGCHLD might be ignored.
+///
+/// # Why SIGTERM first, SIGKILL fallback
+///
+/// scx schedulers (per the upstream
+/// `tools/sched_ext/scx_simple.c:71-72` convention) install one
+/// shared signal handler for SIGINT + SIGTERM: setting an exit-
+/// request flag that the scheduler's main loop polls, then dropping
+/// the BPF skeleton which triggers the kernel's `scx_disable_workfn`
+/// path. SIGTERM is the safe shutdown signal — every well-behaved
+/// scx scheduler honors it. SIGKILL bypasses the userspace handler
+/// (final-log-flush, graceful destructor) but the kernel still
+/// observes the BPF program refcount drop and runs the disable path,
+/// so the kernel-side scheduler state cleans up regardless. SIGKILL
+/// after a bounded SIGTERM grace is the strict-correctness fallback
+/// for a scheduler binary that has no SIGTERM handler installed or
+/// took longer than `sigterm_grace` to exit.
+///
+/// # Pid lifecycle semantic
+///
+/// This function does NOT mutate [`SCHED_PID`]. The
+/// scheduler-lifecycle dispatcher owns that side channel and is
+/// responsible for storing 0 after a successful detach so subsequent
+/// liveness checks (`sched_pid()` readers) short-circuit. Keeping
+/// the kill helper generic (no implicit singleton-pid assumption)
+/// lets unit tests exercise it against any spawned child pid.
+///
+/// # Poll cadence
+///
+/// 50ms polling interval — matches the existing
+/// [`poll_startup`] cadence so the latency-vs-CPU tradeoff is
+/// consistent across the scheduler-lifecycle helpers. The
+/// post-SIGKILL grace is fixed at 200ms — SIGKILL produces an
+/// `exit_notify` cascade that typically completes in microseconds;
+/// a 200ms cap is a defense-in-depth ceiling, not an expected wait.
+#[allow(dead_code)] // production callers (Op::*Scheduler dispatch) land in a follow-up substep
+pub(crate) fn kill_scheduler_process(
+    pid: libc::pid_t,
+    sigterm_grace: std::time::Duration,
+) -> Result<KillSchedulerOutcome, KillSchedulerError> {
+    if pid <= 0 {
+        return Err(KillSchedulerError::InvalidPid);
+    }
+    let pid_u32 = pid as u32;
+
+    // Already-absent short-circuit: lifecycle ops are idempotent, so a
+    // detach against a non-running scheduler is a no-op success.
+    if !proc_pid_alive(pid_u32) {
+        return Ok(KillSchedulerOutcome::AlreadyExited);
+    }
+
+    // SAFETY: libc::kill is async-signal-safe per POSIX and the
+    // pid was validated above. EPERM (signal denied) or ESRCH
+    // (process exited between the alive check and the kill) are
+    // both observable via the subsequent procfs poll — EPERM means
+    // the process keeps running and we'll escalate to SIGKILL;
+    // ESRCH means the process is already gone and the poll will
+    // immediately observe procfs absence.
+    let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+
+    if poll_pid_gone(pid_u32, sigterm_grace) {
+        return Ok(KillSchedulerOutcome::ExitedAfterSigterm);
+    }
+
+    // SIGTERM grace elapsed — escalate. SAFETY identical to the
+    // SIGTERM call above; SIGKILL cannot be caught or ignored per
+    // POSIX so the kernel will run the exit path even if the
+    // scheduler binary was actively ignoring SIGTERM.
+    let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+
+    if poll_pid_gone(pid_u32, std::time::Duration::from_millis(200)) {
+        Ok(KillSchedulerOutcome::EscalatedToSigkill)
+    } else {
+        Err(KillSchedulerError::StillAliveAfterSigkill)
+    }
+}
+
+/// Poll `/proc/{pid}` for absence up to `timeout`. Returns `true` if
+/// the pid's procfs entry disappears within the budget, `false`
+/// otherwise. Hardcoded 50ms cadence matches
+/// [`poll_startup`]'s pidfd fallback interval, so a scheduler-
+/// lifecycle helper and a startup-detection helper share the same
+/// latency-vs-CPU profile.
+#[allow(dead_code)] // see kill_scheduler_process — same substep-ordering bridge
+fn poll_pid_gone(pid: u32, timeout: std::time::Duration) -> bool {
+    let interval = std::time::Duration::from_millis(50);
+    let start = std::time::Instant::now();
+    loop {
+        if !proc_pid_alive(pid) {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        if now >= start + timeout {
+            return false;
+        }
+        let remaining = (start + timeout) - now;
+        std::thread::sleep(remaining.min(interval));
+    }
+}
+
 /// Async-signal-safe rendering of `value` as lowercase hex (no `0x`
 /// prefix, no leading-zero trim) into the tail of `buf`. Returns the
 /// byte slice covering the rendered digits.
@@ -4327,6 +4506,138 @@ mod tests {
             elapsed < std::time::Duration::from_millis(300),
             "Alive should not overshoot timeout significantly, took {elapsed:?}"
         );
+    }
+
+    // -- kill_scheduler_process tests --
+    //
+    // The kill helper is the building block for Op::DetachScheduler /
+    // Op::RestartScheduler / Op::ReplaceScheduler dispatch (substep
+    // 4+ work). Tests pin the three outcome variants
+    // (AlreadyExited / ExitedAfterSigterm / EscalatedToSigkill) plus
+    // the InvalidPid error path. The escalation test deliberately
+    // installs SIGTERM-ignoring trap to force the SIGKILL branch —
+    // matches the scx-scheduler-without-handler scenario the
+    // EscalatedToSigkill variant is named for.
+
+    /// `pid` <= 0 must surface InvalidPid immediately without
+    /// touching the kernel. POSIX kill(2) reserves 0 (caller's pgrp)
+    /// and negative values (signal pgrp), neither of which the
+    /// scheduler-lifecycle call site ever wants. The check is a
+    /// programming-error guard for callers that fail to validate
+    /// SCHED_PID readouts.
+    #[test]
+    fn kill_scheduler_process_invalid_pid_returns_err() {
+        assert_eq!(
+            kill_scheduler_process(0, std::time::Duration::from_millis(50)),
+            Err(KillSchedulerError::InvalidPid),
+        );
+        assert_eq!(
+            kill_scheduler_process(-1, std::time::Duration::from_millis(50)),
+            Err(KillSchedulerError::InvalidPid),
+        );
+    }
+
+    /// A pid that was never alive (or was reaped before the call)
+    /// surfaces as AlreadyExited — the idempotent-detach case that
+    /// lifecycle Op semantics rely on (detaching nothing is success,
+    /// not error).
+    #[test]
+    fn kill_scheduler_process_already_exited_pid_yields_already_exited() {
+        // Spawn /bin/true and let it exit + reap before kill_scheduler_process
+        // is called. /bin/true exits ~immediately.
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn /bin/true");
+        let pid = child.id() as libc::pid_t;
+        let _ = child.wait();
+        // After wait, /proc/{pid} has been released. Poll briefly
+        // to ensure procfs cleanup has propagated.
+        let mut waits = 0u32;
+        while proc_pid_alive(pid as u32) && waits < 50 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            waits += 1;
+        }
+        assert!(
+            !proc_pid_alive(pid as u32),
+            "procfs should have released the pid after wait"
+        );
+        assert_eq!(
+            kill_scheduler_process(pid, std::time::Duration::from_millis(50)),
+            Ok(KillSchedulerOutcome::AlreadyExited),
+        );
+    }
+
+    /// A responsive child (one that catches SIGTERM and exits)
+    /// produces ExitedAfterSigterm. /bin/sleep installs the default
+    /// SIGTERM handler (terminate-on-signal — kernel-side action,
+    /// no userspace handler, but the kernel exit completes well
+    /// inside the grace window).
+    ///
+    /// Installs SIGCHLD=SIG_IGN for the test duration — matches the
+    /// production guest-init disposition, where the kernel
+    /// auto-reaps children so `/proc/{pid}` disappears at exit
+    /// without an explicit `waitpid`. Without this the test would
+    /// race with the standard SIGCHLD=SIG_DFL test environment that
+    /// keeps the exited child as a zombie (procfs entry persists)
+    /// until the explicit Child::wait, breaking the poll_pid_gone
+    /// observation that kill_scheduler_process relies on.
+    #[test]
+    fn kill_scheduler_process_responsive_child_yields_exited_after_sigterm() {
+        let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
+        let _restore = SigchldGuard::install(libc::SIG_IGN);
+
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn /bin/sleep");
+        let pid = child.id() as libc::pid_t;
+        let outcome = kill_scheduler_process(pid, std::time::Duration::from_millis(500));
+        // Best-effort reap. Under SIG_IGN the kernel auto-reaps so
+        // Child::wait returns ECHILD; the call is harmless either
+        // way. SigchldGuard's Drop restores the previous disposition
+        // before the test exits so subsequent tests aren't poisoned.
+        let _ = child.wait();
+        assert_eq!(outcome, Ok(KillSchedulerOutcome::ExitedAfterSigterm));
+    }
+
+    /// A child that ignores SIGTERM must produce
+    /// EscalatedToSigkill. /bin/sh -c 'trap "" TERM; sleep 30'
+    /// installs an empty SIGTERM trap, so SIGTERM is no-op'd and
+    /// the SIGKILL fallback is the only way to terminate. Pins the
+    /// escalation branch against a regression that drops the
+    /// SIGKILL step or treats SIGTERM-grace-exhausted as success.
+    ///
+    /// SIGCHLD=SIG_IGN for the same reason as the
+    /// `_responsive_child_` sibling test — see that test's docs.
+    ///
+    /// 100ms post-spawn settle delay before kill_scheduler_process
+    /// fires: the shell must have time to install its SIGTERM trap
+    /// before we send the signal. Without the delay, the
+    /// kill_scheduler_process call can race the shell's `trap`
+    /// builtin and SIGTERM lands on a shell that hasn't yet
+    /// installed the ignore disposition, producing a spurious
+    /// ExitedAfterSigterm. The settle delay is on the order of
+    /// dash/bash startup latency (~ms); 100ms is a defense-in-depth
+    /// margin.
+    #[test]
+    fn kill_scheduler_process_ignoring_sigterm_child_escalates_to_sigkill() {
+        let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
+        let _restore = SigchldGuard::install(libc::SIG_IGN);
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 30")
+            .spawn()
+            .expect("spawn /bin/sh");
+        let pid = child.id() as libc::pid_t;
+        // Let the shell install its SIGTERM trap before we signal.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Tight SIGTERM grace (200ms) so the test doesn't burn a
+        // full second waiting for the polite-shutdown timeout — but
+        // wide enough that a slow-shell scheduler can't false-fail.
+        let outcome = kill_scheduler_process(pid, std::time::Duration::from_millis(200));
+        let _ = child.wait();
+        assert_eq!(outcome, Ok(KillSchedulerOutcome::EscalatedToSigkill));
     }
 
     /// SIGCHLD signal disposition is process-wide, so the
