@@ -365,6 +365,10 @@ impl OpKind {
             OpKind::WriteKernelCold => 19,
             OpKind::ReadKernelHot => 20,
             OpKind::ReadKernelCold => 21,
+            OpKind::AttachScheduler => 22,
+            OpKind::DetachScheduler => 23,
+            OpKind::RestartScheduler => 24,
+            OpKind::ReplaceScheduler => 25,
         }
     }
 }
@@ -725,5 +729,34 @@ impl Op {
             target,
             width,
         }
+    }
+
+    /// Attach a scheduler mid-scenario. See [`Op::AttachScheduler`]
+    /// for semantics including the staged-binary requirement and
+    /// idempotency rules.
+    pub const fn attach_scheduler(scheduler: &'static crate::test_support::Scheduler) -> Self {
+        Op::AttachScheduler { scheduler }
+    }
+
+    /// Detach the currently-running scheduler. See
+    /// [`Op::DetachScheduler`] for SCX-detach observation semantics
+    /// and the no-scheduler-is-no-op rule.
+    pub const fn detach_scheduler() -> Self {
+        Op::DetachScheduler
+    }
+
+    /// Detach and re-attach the currently-running scheduler with the
+    /// same spec. See [`Op::RestartScheduler`].
+    pub const fn restart_scheduler() -> Self {
+        Op::RestartScheduler
+    }
+
+    /// Detach the currently-running scheduler and attach a different
+    /// one. See [`Op::ReplaceScheduler`] for the mid-experiment swap
+    /// use case (run mitosis with one args set, swap to mitosis with
+    /// another args set declared as a distinct `&'static Scheduler`,
+    /// assert per-phase metric delta across the boundary).
+    pub const fn replace_scheduler(scheduler: &'static crate::test_support::Scheduler) -> Self {
+        Op::ReplaceScheduler { scheduler }
     }
 }

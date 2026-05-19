@@ -636,6 +636,81 @@ pub enum Op {
         /// value shape.
         width: KernelValueWidth,
     },
+    /// Attach a scheduler mid-scenario: spawn the scheduler binary
+    /// inside the guest and wait for it to attach to sched_ext.
+    /// Idempotent at the apply layer — attaching when one is already
+    /// running bails with an actionable error rather than silently
+    /// stacking schedulers.
+    ///
+    /// The `scheduler` reference points at a [`Scheduler`] that the
+    /// test pre-declared via the `staged_schedulers` builder slot on
+    /// [`KtstrTestEntry`]; lifecycle ops can only reference schedulers
+    /// pre-staged into the initramfs so the binary is already
+    /// reachable at apply time. A reference to a non-staged scheduler
+    /// bails with a "stage this scheduler first" diagnostic.
+    ///
+    /// **NOT YET DISPATCHED.** Substep 1 of #7 lands the variant
+    /// shape, constructor, bit-index, and a stub dispatch arm that
+    /// `bail!`s with an unimplemented diagnostic. The guest-side
+    /// `spawn_scheduler_from_paths` refactor + the host→guest dispatch
+    /// arm land in subsequent substeps.
+    AttachScheduler {
+        scheduler: &'static crate::test_support::Scheduler,
+    },
+    /// Detach the currently-running scheduler: SIGTERM the scheduler
+    /// binary inside the guest, wait for `scx_ops_detach` to run, and
+    /// observe `*scx_root` transition to NULL via the existing freeze
+    /// coordinator detach detection at
+    /// `src/vmm/freeze_coord/mod.rs:2460-2498`. Idempotent at the
+    /// apply layer — detaching when nothing is running is a no-op.
+    ///
+    /// After successful detach the guest's `SCHED_PID` atomic
+    /// (`src/vmm/rust_init.rs:90`) is reset so subsequent liveness
+    /// checks (`ctx.sched_pid` reads in
+    /// `src/scenario/ops/mod.rs:861/973/1223`) short-circuit
+    /// correctly.
+    ///
+    /// **NOT YET DISPATCHED.** See [`Op::AttachScheduler`] for the
+    /// substep-1 deferral note.
+    DetachScheduler,
+    /// Detach and re-attach the currently-running scheduler with the
+    /// SAME spec it was attached under. Useful for hot-restart
+    /// validation (cf. #11 — state-preservation testing). Bails if no
+    /// scheduler is currently attached (there is no "previous spec"
+    /// to restart against).
+    ///
+    /// Semantically equivalent to `[DetachScheduler, AttachScheduler
+    /// { scheduler: <current> }]` but expressed as a single op so the
+    /// in-between detached window stays narrow and so the framework
+    /// can validate state-preservation invariants at the boundary
+    /// without depending on test-author bookkeeping of the current
+    /// scheduler.
+    ///
+    /// **NOT YET DISPATCHED.** See [`Op::AttachScheduler`] for the
+    /// substep-1 deferral note.
+    RestartScheduler,
+    /// Detach the currently-running scheduler and attach a different
+    /// one. Equivalent to `[DetachScheduler, AttachScheduler {
+    /// scheduler: new }]` but expressed as a single op so the
+    /// no-scheduler window is bounded and the per-phase scheduler
+    /// tagging on the sidecar can record the transition atomically.
+    ///
+    /// The mid-experiment swap case the operator typically wants:
+    /// run scheduler A for the first phase of a multi-step test, swap
+    /// to scheduler B (or A-with-different-CLI-args, modeled as a
+    /// distinct `Scheduler` declaration) for the second phase, and
+    /// assert a per-phase metric delta across the boundary.
+    ///
+    /// Bails if no scheduler is currently attached
+    /// ([`Op::AttachScheduler`] is the correct first-attach op),
+    /// matching `Op::SwapCpusets`'s "both endpoints must exist"
+    /// precondition.
+    ///
+    /// **NOT YET DISPATCHED.** See [`Op::AttachScheduler`] for the
+    /// substep-1 deferral note.
+    ReplaceScheduler {
+        scheduler: &'static crate::test_support::Scheduler,
+    },
 }
 
 /// How to compute a cpuset from topology.

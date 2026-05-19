@@ -2920,6 +2920,43 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 );
                 dispatch_kernel_op_request("Op::ReadKernelCold", payload)?;
             }
+            // Substep 1 of #7 lands the variant shape, constructor,
+            // and bit-index; the dispatch path itself comes in
+            // subsequent substeps (guest-side spawn/kill helpers
+            // + host→guest wiring + Ctx::current_scheduler tagging).
+            // Bailing here forces any caller that constructs a
+            // scheduler-lifecycle op to land alongside the dispatch
+            // substep, instead of silently no-op'ing while the
+            // implementation accumulates.
+            Op::AttachScheduler { scheduler: _ } => {
+                anyhow::bail!(
+                    "Op::AttachScheduler dispatch not yet implemented \
+                     (substep 1 of scheduler-lifecycle work lands the variant; \
+                     guest-side spawn + host wire-up follow in subsequent substeps)"
+                );
+            }
+            Op::DetachScheduler => {
+                anyhow::bail!(
+                    "Op::DetachScheduler dispatch not yet implemented \
+                     (substep 1 of scheduler-lifecycle work lands the variant; \
+                     guest-side kill + SCHED_PID reset follow in subsequent substeps)"
+                );
+            }
+            Op::RestartScheduler => {
+                anyhow::bail!(
+                    "Op::RestartScheduler dispatch not yet implemented \
+                     (substep 1 of scheduler-lifecycle work lands the variant; \
+                     guest-side restart wrapper follows in subsequent substeps)"
+                );
+            }
+            Op::ReplaceScheduler { scheduler: _ } => {
+                anyhow::bail!(
+                    "Op::ReplaceScheduler dispatch not yet implemented \
+                     (substep 1 of scheduler-lifecycle work lands the variant; \
+                     guest-side detach+spec-swap+spawn + per-phase tagging follow \
+                     in subsequent substeps)"
+                );
+            }
         }
     }
     Ok(())
@@ -4015,6 +4052,34 @@ mod tests {
             .discriminant(),
             21,
             "ReadKernelCold",
+        );
+        static SCHED_FIXTURE: crate::test_support::Scheduler =
+            crate::test_support::Scheduler::EEVDF;
+        assert_eq!(
+            Op::AttachScheduler {
+                scheduler: &SCHED_FIXTURE,
+            }
+            .discriminant(),
+            22,
+            "AttachScheduler",
+        );
+        assert_eq!(
+            Op::DetachScheduler.discriminant(),
+            23,
+            "DetachScheduler",
+        );
+        assert_eq!(
+            Op::RestartScheduler.discriminant(),
+            24,
+            "RestartScheduler",
+        );
+        assert_eq!(
+            Op::ReplaceScheduler {
+                scheduler: &SCHED_FIXTURE,
+            }
+            .discriminant(),
+            25,
+            "ReplaceScheduler",
         );
     }
 
@@ -8535,6 +8600,14 @@ mod tests {
     static CONSTRUCTOR_TEST_PAYLOAD: crate::test_support::Payload =
         crate::test_support::Payload::binary("constructor-test", "/bin/true");
 
+    /// Static Scheduler used only to address the AttachScheduler /
+    /// ReplaceScheduler constructors. The test never spawns or
+    /// attaches this scheduler — only the `&'static Scheduler`
+    /// reference is consumed. `EEVDF` is the zero-binary baseline
+    /// so the fixture has no init-time cost.
+    static CONSTRUCTOR_TEST_SCHEDULER: crate::test_support::Scheduler =
+        crate::test_support::Scheduler::EEVDF;
+
     #[test]
     fn op_constructor_coverage_is_exhaustive() {
         let w = WorkSpec::default();
@@ -8578,6 +8651,10 @@ mod tests {
                 KernelTarget::symbol("constructor_test_symbol"),
                 KernelValueWidth::u32(),
             ),
+            Op::attach_scheduler(&CONSTRUCTOR_TEST_SCHEDULER),
+            Op::detach_scheduler(),
+            Op::restart_scheduler(),
+            Op::replace_scheduler(&CONSTRUCTOR_TEST_SCHEDULER),
         ];
 
         // Track which variants we observed. Adding a variant to `Op`
@@ -8587,7 +8664,7 @@ mod tests {
         // the bit_index high-water-mark in `OpKind::bit_index`
         // changes** — the runtime index check at `seen[idx] = true`
         // will panic if the new variant's index >= the array length.
-        let mut seen = [false; 22];
+        let mut seen = [false; 26];
         for op in &constructed {
             let idx = match op {
                 Op::AddCgroup { .. } => 0,
@@ -8612,6 +8689,10 @@ mod tests {
                 Op::WriteKernelCold { .. } => 19,
                 Op::ReadKernelHot { .. } => 20,
                 Op::ReadKernelCold { .. } => 21,
+                Op::AttachScheduler { .. } => 22,
+                Op::DetachScheduler => 23,
+                Op::RestartScheduler => 24,
+                Op::ReplaceScheduler { .. } => 25,
             };
             seen[idx] = true;
         }
