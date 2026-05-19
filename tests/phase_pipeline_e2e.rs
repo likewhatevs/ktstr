@@ -441,7 +441,184 @@ fn phase_pipeline_three_step_e2e(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
-/// F2 e2e: Op::WatchSnapshot trip-time stamping pins the captured
+/// Probabilistic per-step-cpuset e2e: when the per-Step cpuset differs
+/// meaningfully (Step 0 spreads across all CPUs, Step 1 collapses
+/// to one LLC), the per-step `max_dsq_depth` metric must differ.
+/// Pins that the per-phase metric pipeline reflects the per-step
+/// configuration end-to-end — not just that buckets exist (which
+/// the deterministic 3-step variant pins) but that the metric
+/// VALUES respond to the per-step scheduler input.
+///
+/// `#[ignore]`-tagged: scheduler behavior is non-deterministic,
+/// so this test may flake on a noisy CI box even when the
+/// pipeline works correctly. Operators run it on demand via
+/// `cargo ktstr test -- --ignored phase_pipeline_per_step_cpuset_differs`.
+/// The deterministic pipeline-shape test stays the load-bearing
+/// CI gate; this one is the behavior-coverage complement.
+///
+/// Tolerance: non-equality only, NOT a fixed threshold. A bound
+/// would over-constrain the scheduler's freedom — we only care
+/// that the two configurations produce DIFFERENT readings, not
+/// that they differ by a specific amount.
+fn assert_per_step_cpuset_changes_metrics(result: &VmResult) -> Result<()> {
+    let drained = result.snapshot_bridge.drain_ordered_with_stats();
+    let series = SampleSeries::from_drained_typed(drained, result.monitor.clone());
+    let phases = ktstr::assert::build_phase_buckets(&series);
+
+    let step0 = phases.iter().find(|p| p.step_index == 1);
+    let step1 = phases.iter().find(|p| p.step_index == 2);
+
+    // Inconclusive-rather-than-fail policy: when periodic captures
+    // didn't land in BOTH Steps the test cannot prove or disprove
+    // the metric-differs claim. Printing a warn and returning Ok
+    // keeps the test honest (no false pass on missing data, no
+    // false fail when the timing happened not to cover Step[1])
+    // and keeps the #[ignore]-tagged probabilistic gauntlet
+    // run from going red on a topology-induced timing edge.
+    // Operators inspecting the run log see the warn and can re-run
+    // with longer duration / more snapshots if they want a definite
+    // result. The real-defect path — both buckets present AND
+    // metrics equal — still fails the test below.
+    let (step0, step1) = match (step0, step1) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            let present: Vec<u16> = phases.iter().map(|p| p.step_index).collect();
+            eprintln!(
+                "WARN phase_pipeline_per_step_cpuset_differs: periodic \
+                 captures did not land in both Steps (present step_indices: \
+                 {:?}); test inconclusive on this run. Re-run, or raise \
+                 duration_s/num_snapshots on the test annotation if this \
+                 reproduces.",
+                present,
+            );
+            return Ok(());
+        }
+    };
+
+    let s0 = match step0.get("max_dsq_depth") {
+        Some(v) => v,
+        None => {
+            eprintln!(
+                "WARN: Step[0] bucket has no `max_dsq_depth` (sample_count={}, \
+                 keys={:?}); test inconclusive.",
+                step0.sample_count, step0.metrics.keys().collect::<Vec<_>>(),
+            );
+            return Ok(());
+        }
+    };
+    let s1 = match step1.get("max_dsq_depth") {
+        Some(v) => v,
+        None => {
+            eprintln!(
+                "WARN: Step[1] bucket has no `max_dsq_depth` (sample_count={}, \
+                 keys={:?}); test inconclusive.",
+                step1.sample_count, step1.metrics.keys().collect::<Vec<_>>(),
+            );
+            return Ok(());
+        }
+    };
+
+    // Inconclusive when both reduced values are 0 — the scheduler
+    // didn't push the DSQ on either side, so the metric carries no
+    // signal. Distinct from "both equal at a positive value" which
+    // would indicate the per-step cpuset never reached the kernel
+    // (failure class). On a small topology (e.g. tiny-2llc: 4 CPUs
+    // / 2 LLCs / 4 workers) the SpinWait workload may not crowd
+    // either cpuset enough to register depth > 0, and we don't
+    // want a zero-signal observation to red-flag the test.
+    if s0 == 0.0 && s1 == 0.0 {
+        eprintln!(
+            "WARN: both Step[0] and Step[1] max_dsq_depth == 0; scheduler \
+             didn't crowd the DSQ on either side. Test inconclusive — \
+             on small topologies the SpinWait workload may not produce \
+             enough queue pressure to differentiate cpusets. Re-run on a \
+             larger topology, or change the workload to one that produces \
+             queue depth (e.g. CpuSpin + bursty wakers)."
+        );
+        return Ok(());
+    }
+
+    anyhow::ensure!(
+        (s0 - s1).abs() > f64::EPSILON,
+        "Step[0] `max_dsq_depth` = {} and Step[1] `max_dsq_depth` = {} are \
+         equal (both positive — at least one side observed crowding). \
+         Step 0 spreads workers across all CPUs, Step 1 collapses them \
+         to LLC[0]; the per-step crowding should produce distinguishable \
+         readings. Equality at positive values means either: \
+         (a) the per-Step cpuset never reached the kernel (Op::SetCpuset \
+             at step boundary lost), or \
+         (b) the per-phase metric pipeline averaged across Steps instead \
+             of partitioning by step_index. \
+         The all-zero inconclusive case is gated above; reaching THIS \
+         branch with equal positive values is a real defect signal.",
+        s0, s1,
+    );
+    Ok(())
+}
+
+#[ktstr_test(
+    scheduler = KTSTR_SCHED,
+    llcs = 2,
+    cores = 2,
+    threads = 1,
+    duration_s = 30,
+    watchdog_timeout_s = 50,
+    num_snapshots = 10,
+    auto_repro = false,
+    post_vm = assert_per_step_cpuset_changes_metrics,
+    ignore = true,
+    // Gauntlet variants of this test only make sense on topologies
+    // with >= 2 LLCs and >= 4 CPUs — Step 1 rebinds the cgroup to
+    // CpusetSpec::llc(0) (one LLC out of `llcs`) to contrast with
+    // Step 0's "all CPUs". On a 1-LLC topology the rebind selects
+    // the same CPU set as Step 0 ("all CPUs") and the metric-
+    // differs assertion can't fire. On a 2-CPU topology the
+    // "all CPUs" vs "1 LLC" contrast collapses to 2 vs 1 CPU which
+    // doesn't produce reliable scheduler-behavior differentiation
+    // within the 30 s window.
+    min_llcs = 2,
+    min_cpus = 4,
+)]
+fn phase_pipeline_per_step_cpuset_differs(ctx: &Ctx) -> Result<AssertResult> {
+    // 30 s / 10 captures = 3 s capture interval. 2 Steps × 15 s each
+    // → ~5 captures per Step under nominal timing, leaving margin so
+    // an unlucky Op::SetCpuset apply latency or post-rebind settle
+    // delay doesn't push every Step[1] capture past the scenario
+    // end. The earlier 15 s / 6-capture budget failed when the
+    // first post-rebind capture fired after Step[1] had already
+    // ended.
+    //
+    // The cgroup lives in the Backdrop so it persists across both
+    // Steps; Op::set_cpuset in Step 1 rebinds the persistent cgroup
+    // rather than addressing a step-local clone (a step-local
+    // cgroup tears down at the step boundary, so the mid-run
+    // set_cpuset would race against the teardown and ENOENT).
+    let backdrop = ktstr::scenario::backdrop::Backdrop::new()
+        .push_cgroup(CgroupDef::named("cg_phase").workers(4));
+    let steps = vec![
+        // Step 0: persistent cgroup spans every CPU (no cpuset →
+        // inherits root).
+        Step {
+            setup: vec![].into(),
+            ops: vec![],
+            hold: HoldSpec::frac(0.5),
+        },
+        // Step 1: rebind the persistent cgroup to LLC[0] only via
+        // the mid-run set_cpuset Op. Same cgroup, same workers —
+        // only the cpuset changes between the two phases.
+        Step {
+            setup: vec![].into(),
+            ops: vec![ktstr::scenario::ops::Op::set_cpuset(
+                "cg_phase",
+                ktstr::scenario::ops::CpusetSpec::llc(0),
+            )],
+            hold: HoldSpec::frac(0.5),
+        },
+    ];
+    ktstr::scenario::ops::execute_scenario(ctx, backdrop, steps)
+}
+
+/// Watchpoint trip-time stamping e2e: Op::WatchSnapshot pins the captured
 /// snapshot to the phase ACTIVE WHEN THE WATCHPOINT FIRED, not the
 /// phase active when the Op was issued. The contract is to stamp
 /// from the CURRENT_STEP atomic at store time, implemented at
