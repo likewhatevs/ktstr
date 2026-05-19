@@ -485,14 +485,19 @@ fn generate_preamble_interpolates_entry_fields() {
     );
 }
 
-/// `generate_preamble` auto-injects `--cell-parent-cgroup <path>`
-/// from the scheduler's `cgroup_parent` slot. Without this, the
-/// exported reproducer launches the scheduler with no cgroup
-/// parent argument and the scheduler lands in the wrong cgroup
-/// tree (or fails to find its expected parent). Pins the in-VM
-/// runtime behavior at the export layer.
+/// `generate_preamble` does NOT auto-inject `--cell-parent-cgroup`
+/// from the scheduler's `cgroup_parent` slot. The two concerns are
+/// decoupled: `cgroup_parent` controls the framework's cgroup root
+/// (where test cgroups live), while `--cell-parent-cgroup` is a
+/// scheduler-specific argv flag that cell-aware schedulers
+/// (scx_mitosis et al.) interpret by enabling
+/// userspace_managed_cell_mode and starting an inotify-driven
+/// CellManager — a mode that interferes with the host-side
+/// periodic-capture pipeline. Schedulers that genuinely need
+/// `--cell-parent-cgroup` must opt in by including it in the
+/// declaration's `sched_args` or the per-test `extra_sched_args`.
 #[test]
-fn generate_preamble_auto_injects_cell_parent_cgroup() {
+fn generate_preamble_does_not_auto_inject_cell_parent_cgroup_from_cgroup_parent() {
     use crate::test_support::{CgroupPath, Scheduler, SchedulerSpec};
     static SCHED_WITH_PARENT: Scheduler = Scheduler {
         name: "sched_with_parent",
@@ -516,24 +521,26 @@ fn generate_preamble_auto_injects_cell_parent_cgroup() {
         kernels: &[],
     };
     let entry = KtstrTestEntry {
-        name: "auto_inject_smoke",
+        name: "no_auto_inject_smoke",
         scheduler: &SCHED_WITH_PARENT,
         ..KtstrTestEntry::DEFAULT
     };
     let preamble = generate_preamble(&entry, true, &[]);
     assert!(
-        preamble.contains("--cell-parent-cgroup") && preamble.contains("/ktstr_export_test"),
-        "preamble must auto-inject --cell-parent-cgroup from \
-             entry.scheduler.cgroup_parent; got: {preamble}"
+        !preamble.contains("--cell-parent-cgroup"),
+        "preamble must NOT auto-inject --cell-parent-cgroup from \
+             entry.scheduler.cgroup_parent (the two concerns are \
+             decoupled); got: {preamble}"
     );
 }
 
-/// `generate_preamble` must NOT duplicate `--cell-parent-cgroup`
-/// when the user already supplied it via `extra_sched_args`.
-/// Duplicate clap args fail with "cannot be used multiple times"
-/// — silent drop of the auto-inject preserves user intent.
+/// `generate_preamble` passes a user-supplied `--cell-parent-cgroup`
+/// through `extra_sched_args` unchanged. The scheduler's
+/// `cgroup_parent` slot has NO bearing on the scheduler's argv
+/// (the two concerns are decoupled); only the explicit
+/// user-supplied flag reaches the scheduler.
 #[test]
-fn generate_preamble_skips_auto_inject_when_user_supplies_cell_parent_cgroup() {
+fn generate_preamble_passes_user_supplied_cell_parent_cgroup_through() {
     use crate::test_support::{CgroupPath, Scheduler, SchedulerSpec};
     static SCHED_WITH_PARENT: Scheduler = Scheduler {
         name: "sched_with_parent_user_supplied",
@@ -557,7 +564,7 @@ fn generate_preamble_skips_auto_inject_when_user_supplies_cell_parent_cgroup() {
         kernels: &[],
     };
     let entry = KtstrTestEntry {
-        name: "auto_inject_skip_smoke",
+        name: "user_supplied_smoke",
         scheduler: &SCHED_WITH_PARENT,
         extra_sched_args: &["--cell-parent-cgroup", "/user_supplied_path"],
         ..KtstrTestEntry::DEFAULT
@@ -569,8 +576,8 @@ fn generate_preamble_skips_auto_inject_when_user_supplies_cell_parent_cgroup() {
     );
     assert!(
         !preamble.contains("/auto_inject_path"),
-        "preamble must NOT auto-inject the scheduler's cgroup_parent \
-             when extra_sched_args already supplies --cell-parent-cgroup; got: {preamble}"
+        "preamble must NOT inject the scheduler's cgroup_parent \
+             into argv (decoupled); got: {preamble}"
     );
 }
 
@@ -941,15 +948,19 @@ fn generate_preamble_prepends_config_addition_prefix() {
 /// parity.
 #[test]
 fn generate_preamble_emits_config_addition_before_base_sched_args() {
-    use crate::test_support::{CgroupPath, Scheduler, SchedulerSpec};
+    use crate::test_support::{Scheduler, SchedulerSpec};
     static SCHED: Scheduler = Scheduler {
         name: "order_pin_test",
         binary: SchedulerSpec::Discover("order_pin_test_bin"),
         sysctls: &[],
         kargs: &[],
         assert: crate::assert::Assert::NO_OVERRIDES,
-        cgroup_parent: Some(CgroupPath::new("/order_pin_parent")),
-        sched_args: &[],
+        // `cgroup_parent` no longer auto-injects --cell-parent-cgroup
+        // (decoupled); pin the scheduler-side flag in
+        // `sched_args` explicitly so this ordering test still
+        // exercises the config-vs-base-sched-args anchor.
+        cgroup_parent: None,
+        sched_args: &["--cell-parent-cgroup", "/order_pin_parent"],
         topology: crate::vmm::topology::Topology {
             llcs: 1,
             cores_per_llc: 1,
@@ -978,7 +989,7 @@ fn generate_preamble_emits_config_addition_before_base_sched_args() {
         .expect("preamble must contain the --config arg from the addition");
     let cgroup_pos = preamble
         .find("--cell-parent-cgroup")
-        .expect("preamble must contain --cell-parent-cgroup from cgroup_parent auto-inject");
+        .expect("preamble must contain --cell-parent-cgroup from the explicit sched_args entry");
     assert!(
         config_pos < cgroup_pos,
         "argv ordering parity with eval.rs:1112-1125: `--config` must \

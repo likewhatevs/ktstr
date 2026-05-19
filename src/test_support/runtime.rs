@@ -462,16 +462,24 @@ pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<Stri
             // used multiple times`.
         }
         super::args::CellParentCgroupArg::Absent => {
-            // No user-supplied flag — auto-inject the scheduler's
-            // default `cgroup_parent` when one is declared. The same
-            // parser is used guest-side by `resolve_cgroup_root` and
-            // `create_cgroup_parent_from_sched_args`, so the auto-
-            // injected two-token form produces identical guest
-            // cgroup-tree creation to a user-supplied value.
-            if let Some(cgroup_path) = entry.scheduler.cgroup_parent {
-                args.push(super::args::CELL_PARENT_CGROUP_FLAG.to_string());
-                args.push(cgroup_path.to_string());
-            }
+            // `cgroup_parent` controls the cgroup root where the
+            // framework places test cgroups (`resolve_cgroup_root`
+            // returns `/sys/fs/cgroup{cgroup_parent}` for guest
+            // CgroupManager). It does NOT auto-inject
+            // `--cell-parent-cgroup` into the scheduler's argv —
+            // cell-aware schedulers (scx_mitosis et al.) interpret
+            // that flag by enabling userspace_managed_cell_mode and
+            // starting an inotify-driven CellManager that can
+            // interfere with the host-side periodic-capture
+            // pipeline. If a scheduler genuinely needs
+            // `--cell-parent-cgroup`, the scheduler declaration's
+            // own `sched_args` array (or the per-test
+            // `extra_sched_args`) must include it explicitly. The
+            // guest-side `create_cgroup_parent_from_sched_args`
+            // mkdir + subtree-controller setup still fires when
+            // `--cell-parent-cgroup` is present in `/sched_args` —
+            // it's gated on the flag's presence, not on whether the
+            // framework injected it vs. the user added it manually.
         }
     }
     args.extend(entry.scheduler.sched_args.iter().map(|s| s.to_string()));
@@ -902,16 +910,17 @@ mod tests {
         assert!(args.is_empty(), "no sched args expected: {args:?}");
     }
 
+    /// `cgroup_parent` does NOT auto-inject `--cell-parent-cgroup`
+    /// into the scheduler argv — the two concerns are decoupled.
+    /// The scheduler-def `sched_args` and the per-test
+    /// `extra_sched_args` flow through unchanged; the `cgroup_parent`
+    /// setting controls the framework's cgroup root but never
+    /// modifies the scheduler's CLI invocation.
     #[test]
-    fn append_base_sched_args_includes_cgroup_parent_and_sched_args() {
-        use super::super::entry::CgroupPath;
-        static CG: CgroupPath = CgroupPath::new("/sys/fs/cgroup/ktstr");
+    fn append_base_sched_args_does_not_auto_inject_cell_parent_cgroup() {
         static SCHED: Scheduler = Scheduler::named("s")
             .cgroup_parent("/sys/fs/cgroup/ktstr")
             .sched_args(&["-v", "--flag"]);
-        // Touch the static so the compiler doesn't drop it; verifies
-        // the path we store matches what cgroup_parent produces.
-        let _ = &CG;
         let entry = KtstrTestEntry {
             name: "sched",
             scheduler: &SCHED,
@@ -923,12 +932,12 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "--cell-parent-cgroup".to_string(),
-                "/sys/fs/cgroup/ktstr".to_string(),
                 "-v".to_string(),
                 "--flag".to_string(),
                 "--extra".to_string(),
             ],
+            "cgroup_parent must not auto-inject --cell-parent-cgroup; \
+             only sched_args + extra_sched_args reach the scheduler"
         );
     }
 
