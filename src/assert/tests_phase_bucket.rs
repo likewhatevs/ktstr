@@ -767,3 +767,103 @@ fn phase_bucket_expect_metric_returns_value_when_present() {
     };
     assert_eq!(bucket.expect_metric("throughput"), 42.5);
 }
+
+// ---------- PhaseGuard (RAII auto-stamp) ----------
+
+#[test]
+fn phase_guard_outside_scope_returns_none() {
+    // No guard installed → current_phase_label is None and a
+    // freshly-constructed AssertDetail inherits None.
+    assert!(crate::assert::current_phase_label().is_none());
+    let d = crate::assert::AssertDetail::new(
+        crate::assert::DetailKind::Other,
+        "no guard",
+    );
+    assert!(d.phase.is_none(), "AssertDetail constructed outside any PhaseGuard must stamp phase=None");
+}
+
+#[test]
+fn phase_guard_install_step_sets_active_label() {
+    let _g = crate::assert::PhaseGuard::install_step(0);
+    assert_eq!(
+        crate::assert::current_phase_label().as_deref(),
+        Some("Step[0]"),
+    );
+    let d = crate::assert::AssertDetail::new(
+        crate::assert::DetailKind::Other,
+        "under Step[0]",
+    );
+    assert_eq!(d.phase.as_deref(), Some("Step[0]"));
+}
+
+#[test]
+fn phase_guard_install_baseline_sets_active_label() {
+    let _g = crate::assert::PhaseGuard::install_baseline();
+    assert_eq!(
+        crate::assert::current_phase_label().as_deref(),
+        Some("BASELINE"),
+    );
+}
+
+#[test]
+fn phase_guard_drop_restores_prior_label() {
+    {
+        let _outer = crate::assert::PhaseGuard::install_step(0); // "Step[0]"
+        assert_eq!(
+            crate::assert::current_phase_label().as_deref(),
+            Some("Step[0]"),
+        );
+        {
+            let _inner = crate::assert::PhaseGuard::install_step(2); // "Step[2]"
+            assert_eq!(
+                crate::assert::current_phase_label().as_deref(),
+                Some("Step[2]"),
+            );
+        } // inner drops → restore Step[0]
+        assert_eq!(
+            crate::assert::current_phase_label().as_deref(),
+            Some("Step[0]"),
+            "inner guard's Drop must restore the outer guard's label",
+        );
+    } // outer drops → restore None
+    assert!(
+        crate::assert::current_phase_label().is_none(),
+        "outermost guard's Drop must restore None",
+    );
+}
+
+#[test]
+fn phase_guard_passdetail_binary_auto_stamps() {
+    let _g = crate::assert::PhaseGuard::install_step(1);
+    let p = crate::assert::PassDetail::binary("metric", "ge", "10.0", "5.0");
+    assert_eq!(p.phase.as_deref(), Some("Step[1]"));
+}
+
+#[test]
+fn phase_guard_passdetail_unary_auto_stamps() {
+    let _g = crate::assert::PhaseGuard::install_step(2);
+    let p = crate::assert::PassDetail::unary("metric", "is_finite", "42.0");
+    assert_eq!(p.phase.as_deref(), Some("Step[2]"));
+}
+
+#[test]
+fn phase_guard_infonote_auto_stamps() {
+    let _g = crate::assert::PhaseGuard::install_baseline();
+    let n = crate::assert::InfoNote::new("settle observed");
+    assert_eq!(n.phase.as_deref(), Some("BASELINE"));
+}
+
+#[test]
+fn phase_guard_with_phase_builder_overrides_auto_stamp() {
+    let _g = crate::assert::PhaseGuard::install_step(0); // "Step[0]"
+    let d = crate::assert::AssertDetail::new(
+        crate::assert::DetailKind::Other,
+        "override",
+    )
+    .with_phase("explicit_override");
+    assert_eq!(
+        d.phase.as_deref(),
+        Some("explicit_override"),
+        "with_phase builder must override the auto-stamp default",
+    );
+}

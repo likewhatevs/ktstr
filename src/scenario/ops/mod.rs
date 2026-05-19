@@ -902,6 +902,16 @@ fn run_scenario(
             .unwrap_or(u16::MAX);
         ctx.current_step
             .store(phase_step_index, std::sync::atomic::Ordering::Release);
+        // Install the assert-side phase guard for the scenario
+        // driver's thread for the duration of this Step. Every
+        // AssertDetail / PassDetail / InfoNote constructed under
+        // the run_step call below auto-stamps its `phase` field
+        // with "Step[<step_idx>]" via the thread-local snapshot
+        // in `crate::assert::current_phase_label`. On Drop the
+        // prior label is restored (BASELINE outside any Step), so
+        // assertions evaluated post-loop (e.g. at scenario
+        // teardown) stamp with the right outer scope.
+        let _phase_guard = crate::assert::PhaseGuard::install_step(step_idx as u16);
         let step_res = run_step(
             ctx,
             step,

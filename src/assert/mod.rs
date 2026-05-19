@@ -33,7 +33,89 @@
 //! chapter of the guide.
 
 use crate::workload::WorkerReport;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+
+thread_local! {
+    /// Thread-local active phase label. Set by the [`PhaseGuard`]
+    /// scope helper at scenario-driver `run_step` entry and read by
+    /// [`AssertDetail::new`] / [`PassDetail::binary`] /
+    /// [`PassDetail::unary`] / [`NoteValue`] producers so every
+    /// detail constructed under a guarded scope auto-stamps its
+    /// `phase` field with the active label without the producer
+    /// having to thread context through every `with_phase` chain.
+    /// `None` outside any guarded scope (boot, BASELINE settle,
+    /// non-scenario test fixtures).
+    static ACTIVE_PHASE: RefCell<Option<std::borrow::Cow<'static, str>>> =
+        const { RefCell::new(None) };
+}
+
+/// Snapshot the active phase label installed by the most recent
+/// [`PhaseGuard::install`] on this thread. `None` outside any
+/// guarded scope. Construction sites for [`AssertDetail`] /
+/// [`PassDetail`] / [`NoteValue`] call this to auto-stamp the
+/// `phase` field; the test author can still override via the
+/// builder `with_phase(...)` chain when an explicit value is
+/// preferred.
+pub fn current_phase_label() -> Option<std::borrow::Cow<'static, str>> {
+    ACTIVE_PHASE.with(|p| p.borrow().clone())
+}
+
+/// RAII scope guard for the [`ACTIVE_PHASE`] thread-local. Install
+/// at scenario-driver `run_step` entry; the guard's `Drop` restores
+/// the prior phase label, supporting cleanly-nested scenario
+/// dispatch (sub-scenarios layer over a parent's phase context
+/// without leaking).
+///
+/// ```ignore
+/// let _guard = PhaseGuard::install_step(0); // Step[0] → "Step[0]"
+/// // ... apply_ops + hold, every assert constructed here stamps
+/// //     phase = Some("Step[0]") automatically ...
+/// // drop on scope exit restores the prior label (BASELINE outside
+/// // any nested Step).
+/// ```
+#[must_use = "PhaseGuard restores the prior phase on Drop — bind it to a local"]
+pub struct PhaseGuard {
+    /// The phase label that was active before this guard installed.
+    /// Restored on Drop so nested guards stack cleanly.
+    previous: Option<std::borrow::Cow<'static, str>>,
+}
+
+impl PhaseGuard {
+    /// Install `label` as the active phase. Captures the
+    /// previously-active label for restoration on Drop. Use
+    /// [`Self::install_step`] / [`Self::install_baseline`] for the
+    /// scenario-driver call sites — they produce the standard
+    /// "Step[k]" / "BASELINE" labels matching the rest of the
+    /// pipeline.
+    pub fn install(label: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        let previous = ACTIVE_PHASE.with(|p| p.replace(Some(label.into())));
+        Self { previous }
+    }
+
+    /// Convenience: install the `"Step[k]"` label for the
+    /// `zero_indexed`-th scenario Step. Matches the label
+    /// [`PhaseBucket`] embeds + the [`Phase::step`] display
+    /// (`Step[0]`, `Step[1]`, ...).
+    pub fn install_step(zero_indexed: u16) -> Self {
+        Self::install(format!("Step[{}]", zero_indexed))
+    }
+
+    /// Convenience: install the `"BASELINE"` label for the
+    /// pre-first-Step settle window. Matches the label
+    /// [`PhaseBucket`] uses for `step_index = 0`.
+    pub fn install_baseline() -> Self {
+        Self::install(std::borrow::Cow::Borrowed("BASELINE"))
+    }
+}
+
+impl Drop for PhaseGuard {
+    fn drop(&mut self) {
+        ACTIVE_PHASE.with(|p| {
+            *p.borrow_mut() = self.previous.take();
+        });
+    }
+}
 
 /// Per-VMA entry parsed from `/proc/self/numa_maps`.
 #[derive(Debug, Clone, Default)]
@@ -351,7 +433,7 @@ impl AssertDetail {
         Self {
             kind,
             message: message.into(),
-            phase: None,
+            phase: current_phase_label(),
         }
     }
 
@@ -476,7 +558,7 @@ impl PassDetail {
             comparator: comparator.into(),
             value: value.into(),
             expected: Some(expected.into()),
-            phase: None,
+            phase: current_phase_label(),
         }
     }
 
@@ -494,7 +576,7 @@ impl PassDetail {
             comparator: comparator.into(),
             value: value.into(),
             expected: None,
-            phase: None,
+            phase: current_phase_label(),
         }
     }
 
@@ -695,7 +777,7 @@ impl InfoNote {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            phase: None,
+            phase: current_phase_label(),
         }
     }
 
