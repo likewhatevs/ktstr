@@ -902,3 +902,90 @@ fn populate_run_ext_metrics_does_not_overwrite_existing_keys() {
         "existing key must survive populate_run_ext_metrics",
     );
 }
+
+/// `build_phase_buckets` populates `avg_imbalance_ratio` from
+/// MonitorSamples windowed by phase. Synthesised samples land in
+/// the Step[0] window; the per-phase mean of their
+/// `imbalance_ratio()` readings (max(nr_running)/max(1, min(nr_running))
+/// per CPU) is stamped on PhaseBucket.metrics. Confirms the F-A
+/// fix wiring: imbalance now flows through PhaseBucket per-phase
+/// rather than only at the run-aggregate MonitorSummary level.
+#[test]
+fn build_phase_buckets_avg_imbalance_ratio_from_monitor_samples() {
+    use crate::monitor::{CpuSnapshot, MonitorReport, MonitorSample};
+    // Three monitor samples covering [50..250 ms]. Sample CPU vecs
+    // produce known imbalance ratios:
+    //   s_50:  cpus=[nr=2, nr=2] -> ratio = 2 / max(1, 2) = 1.0
+    //   s_100: cpus=[nr=4, nr=2] -> ratio = 4 / max(1, 2) = 2.0
+    //   s_200: cpus=[nr=6, nr=2] -> ratio = 6 / max(1, 2) = 3.0
+    // Mean across all three = (1.0 + 2.0 + 3.0) / 3 = 2.0
+    let cpu = |nr: u32| CpuSnapshot {
+        nr_running: nr,
+        ..Default::default()
+    };
+    let mon = MonitorReport {
+        samples: vec![
+            MonitorSample::new(50, vec![cpu(2), cpu(2)]),
+            MonitorSample::new(100, vec![cpu(4), cpu(2)]),
+            MonitorSample::new(200, vec![cpu(6), cpu(2)]),
+        ],
+        ..Default::default()
+    };
+    // Two snapshot bridge entries fence the Step[0] window at
+    // elapsed_ms [50..250]; all three monitor samples land inside.
+    let drained = vec![
+        fixture_entry("periodic_000", 1, 50),
+        fixture_entry("periodic_001", 1, 250),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, Some(mon));
+    let phases = crate::assert::build_phase_buckets(&samples);
+    assert_eq!(phases.len(), 1, "single phase from two same-step samples");
+    let step0 = &phases[0];
+    let avg = step0
+        .metrics
+        .get("avg_imbalance_ratio")
+        .copied()
+        .expect("avg_imbalance_ratio must be populated from MonitorSamples");
+    assert!(
+        (avg - 2.0).abs() < f64::EPSILON,
+        "expected mean = 2.0, got {avg}",
+    );
+}
+
+/// MonitorSamples whose elapsed_ms falls OUTSIDE the phase window
+/// (`[start_ms, end_ms]`) are excluded from the avg_imbalance_ratio
+/// reduction. A sample at elapsed_ms = 9999 with a wildly
+/// different imbalance must not contaminate the in-window mean.
+#[test]
+fn build_phase_buckets_avg_imbalance_excludes_out_of_window_monitor_samples() {
+    use crate::monitor::{CpuSnapshot, MonitorReport, MonitorSample};
+    let cpu = |nr: u32| CpuSnapshot {
+        nr_running: nr,
+        ..Default::default()
+    };
+    let mon = MonitorReport {
+        samples: vec![
+            MonitorSample::new(100, vec![cpu(4), cpu(2)]),
+            MonitorSample::new(150, vec![cpu(4), cpu(2)]),
+            MonitorSample::new(200, vec![cpu(4), cpu(2)]),
+            MonitorSample::new(9999, vec![cpu(100), cpu(2)]),
+        ],
+        ..Default::default()
+    };
+    let drained = vec![
+        fixture_entry("periodic_000", 1, 100),
+        fixture_entry("periodic_001", 1, 200),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, Some(mon));
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let step0 = &phases[0];
+    let avg = step0
+        .metrics
+        .get("avg_imbalance_ratio")
+        .copied()
+        .expect("avg_imbalance_ratio populated");
+    assert!(
+        (avg - 2.0).abs() < f64::EPSILON,
+        "out-of-window sample must not contaminate in-window mean (got {avg})",
+    );
+}

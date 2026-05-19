@@ -634,6 +634,27 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |r| Some(r.imbalance_ratio),
     },
     MetricDef {
+        // Per-phase mean of per-tick imbalance_ratio observations
+        // (max(nr_running) / max(1, min(nr_running)) per CPU; full-
+        // class count). Sourced from MonitorSample (not Snapshot)
+        // because Snapshot exposes only scx_rq.nr_running (SCX-
+        // only) while imbalance is meaningful only across the
+        // full per-CPU runqueue. Populated by build_phase_buckets
+        // via per-phase MonitorSample windowing — bypasses
+        // MetricDef::read_sample (which dispatches off
+        // sample.snapshot only) per the data-axis split. Kind
+        // Gauge(Avg) folds across cgroups via weighted-mean per
+        // sample_count; Polarity::LowerBetter mirrors the Peak
+        // sibling.
+        name: "avg_imbalance_ratio",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Avg),
+        default_abs: 0.5,
+        default_rel: 0.25,
+        display_unit: "x",
+        accessor: |_| None,
+    },
+    MetricDef {
         name: "max_dsq_depth",
         polarity: crate::test_support::Polarity::LowerBetter,
         kind: MetricKind::Peak,

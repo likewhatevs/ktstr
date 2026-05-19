@@ -55,6 +55,33 @@ impl<'a> MonitorView<'a> {
             .as_ref()
             .map(|deltas| ScxEventsView { deltas })
     }
+
+    /// Borrowed per-tick monitor samples. Each
+    /// [`crate::monitor::MonitorSample`] is one host-side
+    /// observation of the guest's per-CPU runqueue state
+    /// (`nr_running`, `local_dsq_depth`, `rq_clock`, optional
+    /// event counters). The monitor thread captures these on a
+    /// fixed cadence independent of the snapshot bridge's
+    /// freeze-rendezvous captures; samples carry their own
+    /// `elapsed_ms` timestamp for windowing.
+    ///
+    /// Empty when the monitor ran but produced no samples (very
+    /// short run, monitor thread exited early). The slot is
+    /// always present — `MonitorView` itself only exists when a
+    /// `MonitorReport` was attached at series construction.
+    ///
+    /// Live caller: [`crate::assert::build_phase_buckets`] windows
+    /// these samples per phase to compute metrics like
+    /// `avg_imbalance_ratio` that need per-CPU `rq.nr_running`
+    /// (full-class count), which the bridge-captured
+    /// [`crate::scenario::snapshot::Snapshot`] does NOT expose
+    /// (Snapshot carries only `scx_rq.nr_running`, the SCX-only
+    /// subset). The two data axes are complementary: Snapshot for
+    /// frozen BPF state at capture instants, MonitorSample for
+    /// per-tick observations across the whole window.
+    pub fn samples(&self) -> &'a [crate::monitor::MonitorSample] {
+        &self.report.samples
+    }
 }
 
 /// Default curated subset of [`ScxEventsView::total_pairs`] counter

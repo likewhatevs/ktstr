@@ -1999,6 +1999,17 @@ pub fn populate_run_ext_metrics(
 }
 
 pub fn build_phase_buckets(samples: &crate::scenario::sample::SampleSeries) -> Vec<PhaseBucket> {
+    // Borrowed per-tick monitor samples (None when no MonitorReport
+    // was attached, e.g. host-only fixture tests). When present,
+    // each PhaseBucket below also folds the monitor samples whose
+    // elapsed_ms lands in the bucket window — supplies metrics
+    // like `avg_imbalance_ratio` that need per-CPU full-class
+    // `rq.nr_running`, which the bridge-captured Snapshot does
+    // not expose (Snapshot carries scx_rq.nr_running only).
+    let monitor_samples: &[crate::monitor::MonitorSample] = samples
+        .monitor()
+        .map(|m| m.samples())
+        .unwrap_or(&[]);
     let by_phase = samples.by_phase();
     let mut out: Vec<PhaseBucket> = Vec::with_capacity(by_phase.len());
     for (step_index, samples_in_phase) in by_phase {
@@ -2041,6 +2052,42 @@ pub fn build_phase_buckets(samples: &crate::scenario::sample::SampleSeries) -> V
                 crate::stats::aggregate_samples_for_phase(metric_def, &per_sample_readings)
             {
                 metrics.insert(metric_def.name.to_string(), reduced);
+            }
+        }
+        // Per-phase MonitorSample windowing (#81 wire-up for
+        // metrics that need per-CPU full-class rq.nr_running).
+        // Filter monitor samples by elapsed_ms in [start_ms,
+        // end_ms]; compute aggregates that require this axis.
+        // Single-sample-counts phases (start_ms == end_ms) use
+        // an inclusive comparison on both bounds so the window
+        // is not empty.
+        let in_window = |ms: u64| -> bool {
+            if start_ms == end_ms {
+                ms == start_ms
+            } else {
+                ms >= start_ms && ms <= end_ms
+            }
+        };
+        let phase_monitor_samples: Vec<&crate::monitor::MonitorSample> = monitor_samples
+            .iter()
+            .filter(|s| in_window(s.elapsed_ms))
+            .collect();
+        if !phase_monitor_samples.is_empty()
+            && !metrics.contains_key("avg_imbalance_ratio")
+        {
+            // Mean of MonitorSample::imbalance_ratio() across the
+            // phase window. `imbalance_ratio` is max(nr_running)
+            // / max(1, min(nr_running)) per CPU — the full-class
+            // count (CFS + scx + rt + dl). Empty-sample phases
+            // would have collapsed before this branch via the
+            // is_empty guard above.
+            let sum: f64 = phase_monitor_samples
+                .iter()
+                .map(|s| s.imbalance_ratio())
+                .sum();
+            let avg = sum / phase_monitor_samples.len() as f64;
+            if avg.is_finite() {
+                metrics.insert("avg_imbalance_ratio".to_string(), avg);
             }
         }
         out.push(PhaseBucket {

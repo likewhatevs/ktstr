@@ -464,6 +464,7 @@ impl Timeline {
     /// | PhaseBucket metric key  | PhaseMetrics field      |
     /// |-------------------------|-------------------------|
     /// | `max_imbalance_ratio`   | `max_imbalance`         |
+    /// | `avg_imbalance_ratio`   | `avg_imbalance`         |
     /// | `max_dsq_depth`         | `max_dsq_depth`         |
     /// | `avg_dsq_depth`         | `avg_dsq_depth`         |
     /// | `stuck_count`           | `stall_count`           |
@@ -476,15 +477,10 @@ impl Timeline {
     /// (`end_ms - start_ms / 1000.0`). When the window has zero
     /// duration (degenerate bucket) the rate stays `None`.
     ///
-    /// Fields that PhaseBucket does NOT carry — `avg_imbalance`,
-    /// `iteration_rate` — default to `0.0` / `None`. `avg_imbalance`
-    /// requires a per-CPU `rq.nr_running` source not currently
-    /// exposed on `Snapshot`; tracked as a follow-up. `iteration_rate`
-    /// requires per-phase iteration totals from stimulus events not
-    /// directly attached to PhaseBucket. The reduced-value contract
-    /// is intentional — re-deriving averages from samples in
-    /// from_phase_buckets would defeat the metric-pipeline goal of
-    /// reducing data once at build_phase_buckets time.
+    /// `iteration_rate` is the only PhaseMetrics field
+    /// from_phase_buckets cannot supply — it requires per-phase
+    /// iteration totals from stimulus events not attached to
+    /// PhaseBucket directly. Defaults to `None`.
     ///
     /// `changes` (boundary degradation detection) is NOT computed
     /// here. The existing [`Self::build`] computes changes by
@@ -560,7 +556,7 @@ fn phase_from_bucket(idx: usize, b: &crate::assert::PhaseBucket) -> Phase {
     };
     let metrics = PhaseMetrics {
         sample_count: b.sample_count,
-        avg_imbalance: 0.0,
+        avg_imbalance: b.metrics.get("avg_imbalance_ratio").copied().unwrap_or(0.0),
         max_imbalance: b.metrics.get("max_imbalance_ratio").copied().unwrap_or(0.0),
         avg_dsq_depth: b.metrics.get("avg_dsq_depth").copied().unwrap_or(0.0),
         max_dsq_depth: b
@@ -1624,6 +1620,7 @@ mod tests {
         s0_metrics.insert("max_dsq_depth".to_string(), 7.0);
         s0_metrics.insert("avg_dsq_depth".to_string(), 2.5);
         s0_metrics.insert("max_imbalance_ratio".to_string(), 3.5);
+        s0_metrics.insert("avg_imbalance_ratio".to_string(), 1.8);
         s0_metrics.insert("total_fallback".to_string(), 200.0);
         let buckets = vec![
             PhaseBucket {
@@ -1657,15 +1654,16 @@ mod tests {
         assert_eq!(t.phases[1].metrics.max_dsq_depth, 7);
         assert!((t.phases[1].metrics.avg_dsq_depth - 2.5).abs() < f64::EPSILON);
         assert!((t.phases[1].metrics.max_imbalance - 3.5).abs() < f64::EPSILON);
+        assert!((t.phases[1].metrics.avg_imbalance - 1.8).abs() < f64::EPSILON);
         // fallback_rate = 200 / (5000 / 1000) = 40.0 events/s
         assert_eq!(t.phases[1].metrics.fallback_rate, Some(40.0));
         // keep_last_rate absent → None (no total_keep_last in metrics map)
         assert_eq!(t.phases[1].metrics.keep_last_rate, None);
-        // avg_dsq_depth is wired (avg of local-CPU DSQ depths
-        // sourced from Snapshot); avg_imbalance and iteration_rate
-        // are not (see fn doc table).
+        // avg_dsq_depth + avg_imbalance are now both wired
+        // (per the doc table). iteration_rate is the only field
+        // PhaseBucket cannot supply directly (depends on stimulus
+        // event totals, not a per-Sample reading).
         assert_eq!(t.phases[1].metrics.iteration_rate, None);
-        assert_eq!(t.phases[1].metrics.avg_imbalance, 0.0);
         // Render produces a non-empty timeline block.
         let formatted = t.format_with_context(&TimelineContext::default());
         assert!(formatted.contains("--- timeline ---"));
