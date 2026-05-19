@@ -4543,8 +4543,8 @@ mod tests {
     // -- kill_scheduler_process tests --
     //
     // The kill helper is the building block for Op::DetachScheduler /
-    // Op::RestartScheduler / Op::ReplaceScheduler dispatch (substep
-    // 4+ work). Tests pin the three outcome variants
+    // Op::RestartScheduler / Op::ReplaceScheduler dispatch (follow-up
+    // work). Tests pin the three outcome variants
     // (AlreadyExited / ExitedAfterSigterm / EscalatedToSigkill) plus
     // the InvalidPid error path. The escalation test deliberately
     // installs SIGTERM-ignoring trap to force the SIGKILL branch —
