@@ -44,6 +44,20 @@ use super::{AssertDetail, DetailKind, Verdict};
 /// failure-path messages name the offending sample without the
 /// caller re-threading the series. Tags and elapsed-ms vectors
 /// are always the same length as `values`.
+/// Per-sample triple `(tag, elapsed_ms, &value)` yielded by
+/// [`SeriesField::iter_full`] and stored in the per-phase buckets
+/// returned by [`SeriesField::by_phase`].
+pub type SampleTriple<'a, T> = (&'a str, u64, &'a SnapshotResult<T>);
+
+/// Return shape of [`SeriesField::by_phase`]: a `BTreeMap` keyed by
+/// `Phase` carrying the samples whose source row had a stamped
+/// step_index, plus a separate `none_bucket` for unstamped /
+/// fixture samples.
+pub type ByPhasePartition<'a, T> = (
+    std::collections::BTreeMap<crate::assert::Phase, Vec<SampleTriple<'a, T>>>,
+    Vec<SampleTriple<'a, T>>,
+);
+
 #[derive(Debug, Clone)]
 #[must_use = "SeriesField records nothing until a temporal pattern is invoked"]
 pub struct SeriesField<T> {
@@ -51,16 +65,46 @@ pub struct SeriesField<T> {
     tags: Vec<String>,
     elapsed_ms: Vec<u64>,
     values: Vec<SnapshotResult<T>>,
+    /// Per-sample scenario phase, mirrored from the
+    /// [`crate::scenario::sample::Sample::step_index`] each value
+    /// was projected from. `None` for unstamped fixture samples
+    /// (no bridge phase context); `Some(phase)` for production
+    /// captures whose source row carried a step_index. Same length
+    /// as `values` (or empty by the from_parts contract — the
+    /// 4-arg constructor fills with all-`None` for backward-compat
+    /// callers that didn't have the phase column yet).
+    phases: Vec<Option<crate::assert::Phase>>,
 }
 
 impl<T> SeriesField<T> {
     /// Build a new field. Internal — projection helpers in
     /// [`crate::scenario::sample`] call this on the series side.
+    /// 4-arg backward-compat constructor: defaults `phases` to all
+    /// `None`. New consumers that have phase context per sample
+    /// should call [`Self::from_parts_with_phases`] instead.
     pub fn from_parts(
         label: impl Into<String>,
         tags: Vec<String>,
         elapsed_ms: Vec<u64>,
         values: Vec<SnapshotResult<T>>,
+    ) -> Self {
+        let phases = vec![None; values.len()];
+        Self::from_parts_with_phases(label, tags, elapsed_ms, values, phases)
+    }
+
+    /// Build a new field with explicit per-sample phase tags.
+    /// `phases.len()` MUST equal `values.len()` — the four parallel
+    /// vecs (tags / elapsed_ms / values / phases) are addressed by
+    /// the same index throughout. Like [`Self::from_parts`], this
+    /// is intended for projection helpers in
+    /// [`crate::scenario::sample`] that already know each sample's
+    /// step_index from the drained bridge tuple.
+    pub fn from_parts_with_phases(
+        label: impl Into<String>,
+        tags: Vec<String>,
+        elapsed_ms: Vec<u64>,
+        values: Vec<SnapshotResult<T>>,
+        phases: Vec<Option<crate::assert::Phase>>,
     ) -> Self {
         // Hard runtime check (not debug_assert_eq!) so the equal-
         // length guarantee documented on iter_full() holds in
@@ -72,12 +116,46 @@ impl<T> SeriesField<T> {
         // diagnose than a panic at the construction site.
         assert_eq!(tags.len(), values.len());
         assert_eq!(elapsed_ms.len(), values.len());
+        assert_eq!(phases.len(), values.len());
         Self {
             label: label.into(),
             tags,
             elapsed_ms,
             values,
+            phases,
         }
+    }
+
+    /// Per-sample phase tag, parallel to `values`. `None` for
+    /// fixture / unstamped samples; `Some(phase)` for production
+    /// captures whose source row carried a `step_index`.
+    pub fn phases_iter(&self) -> impl Iterator<Item = Option<crate::assert::Phase>> + '_ {
+        self.phases.iter().copied()
+    }
+
+    /// Partition samples by phase. `None`-phase samples bucket
+    /// into the returned `none_bucket` outside the BTreeMap; phase
+    /// values bucket by their `Phase` key. Each bucket retains the
+    /// per-sample [`SampleTriple<T>`] the standard [`Self::iter_full`]
+    /// yields.
+    pub fn by_phase(&self) -> ByPhasePartition<'_, T> {
+        let mut buckets: std::collections::BTreeMap<crate::assert::Phase, Vec<SampleTriple<'_, T>>> =
+            std::collections::BTreeMap::new();
+        let mut none_bucket: Vec<SampleTriple<'_, T>> = Vec::new();
+        for (((tag, elapsed_ms), value), phase) in self
+            .tags
+            .iter()
+            .zip(self.elapsed_ms.iter())
+            .zip(self.values.iter())
+            .zip(self.phases.iter())
+        {
+            let triple = (tag.as_str(), *elapsed_ms, value);
+            match phase {
+                Some(p) => buckets.entry(*p).or_default().push(triple),
+                None => none_bucket.push(triple),
+            }
+        }
+        (buckets, none_bucket)
     }
 
     /// Label for failure-message rendering.
@@ -1814,5 +1892,92 @@ mod tests {
             !logs_contain("samples true"),
             "fail arm must NOT emit the positive-confirmation log",
         );
+    }
+
+    // ---------- SeriesField phase column (S1.B) ----------
+
+    #[test]
+    fn series_field_from_parts_defaults_phases_to_all_none() {
+        let f = SeriesField::<f64>::from_parts(
+            "x",
+            vec!["t0".into(), "t1".into()],
+            vec![100, 200],
+            vec![Ok(1.0), Ok(2.0)],
+        );
+        let phases: Vec<_> = f.phases_iter().collect();
+        assert_eq!(phases, vec![None, None]);
+    }
+
+    #[test]
+    fn series_field_from_parts_with_phases_preserves_per_sample_phase() {
+        let f = SeriesField::<f64>::from_parts_with_phases(
+            "x",
+            vec!["t0".into(), "t1".into(), "t2".into()],
+            vec![100, 200, 300],
+            vec![Ok(1.0), Ok(2.0), Ok(3.0)],
+            vec![
+                Some(crate::assert::Phase::BASELINE),
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(1)),
+            ],
+        );
+        let phases: Vec<_> = f.phases_iter().collect();
+        assert_eq!(
+            phases,
+            vec![
+                Some(crate::assert::Phase::BASELINE),
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(1)),
+            ],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn series_field_from_parts_with_phases_rejects_length_mismatch() {
+        let _ = SeriesField::<f64>::from_parts_with_phases(
+            "x",
+            vec!["t0".into(), "t1".into()],
+            vec![100, 200],
+            vec![Ok(1.0), Ok(2.0)],
+            vec![Some(crate::assert::Phase::BASELINE)], // 1 != 2 values
+        );
+    }
+
+    #[test]
+    fn series_field_by_phase_partitions_into_per_phase_buckets() {
+        let f = SeriesField::<f64>::from_parts_with_phases(
+            "x",
+            vec!["t0".into(), "t1".into(), "t2".into(), "t3".into()],
+            vec![100, 200, 300, 400],
+            vec![Ok(10.0), Ok(20.0), Ok(30.0), Ok(40.0)],
+            vec![
+                Some(crate::assert::Phase::BASELINE),
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(1)),
+            ],
+        );
+        let (by_phase, none_bucket) = f.by_phase();
+        assert!(none_bucket.is_empty(), "no None-phase samples in this fixture");
+        assert_eq!(by_phase.len(), 3, "3 distinct phases: BASELINE, Step[0], Step[1]");
+        assert_eq!(by_phase[&crate::assert::Phase::BASELINE].len(), 1);
+        assert_eq!(by_phase[&crate::assert::Phase::step(0)].len(), 2);
+        assert_eq!(by_phase[&crate::assert::Phase::step(1)].len(), 1);
+    }
+
+    #[test]
+    fn series_field_by_phase_collects_none_samples_in_separate_bucket() {
+        let f = SeriesField::<f64>::from_parts_with_phases(
+            "x",
+            vec!["t0".into(), "t1".into()],
+            vec![100, 200],
+            vec![Ok(1.0), Ok(2.0)],
+            vec![None, Some(crate::assert::Phase::step(0))],
+        );
+        let (by_phase, none_bucket) = f.by_phase();
+        assert_eq!(none_bucket.len(), 1, "1 None-phase sample");
+        assert_eq!(by_phase.len(), 1, "1 phase bucket");
+        assert_eq!(by_phase[&crate::assert::Phase::step(0)].len(), 1);
     }
 }
