@@ -89,26 +89,109 @@ fn force_reboot() -> ! {
 /// initialise with and the consumer to filter on.
 static SCHED_PID: AtomicI32 = AtomicI32::new(0);
 
-/// Suppress the [`start_sched_exit_monitor`] thread's
-/// `MSG_TYPE_SCHED_EXIT` send while a scheduler-lifecycle Op is
-/// driving an INTENTIONAL kill of the current scheduler. Without
-/// this gate, the host's freeze coordinator would promote the
-/// guest-emitted SchedExit into the run-wide kill flag (per
-/// `src/vmm/freeze_coord/dispatch.rs` SchedExit arm) and fail the
-/// test as scheduler-died even though the kill was a deliberate
-/// Op::DetachScheduler / Op::RestartScheduler / Op::ReplaceScheduler
-/// step. The Op handler (in `src/scenario/ops/mod.rs`) sets `true`
-/// before SIGTERM and clears `false` after the new scheduler
-/// attaches (Replace) or after the kill completes (Detach).
+/// Active [`SchedExitStop`] handle for the currently-running
+/// scheduler's exit monitor. The boot path installs the initial
+/// handle here via [`install_initial_sched_exit_monitor`]; the
+/// scheduler-lifecycle Op dispatcher swaps it out via
+/// [`stop_sched_exit_monitor`] + [`restart_sched_exit_monitor_with_log`]
+/// so each post-Op scheduler PID gets its own monitor watching it.
 ///
-/// v0 limitation: the monitor is one-shot per scheduler PID — when
-/// the suppressed exit fires, the monitor thread exits and there
-/// is no live monitor for any subsequent scheduler attached via
-/// Op::AttachScheduler / Op::ReplaceScheduler. A real death of the
-/// post-swap scheduler would NOT promote into the run-wide kill
-/// flag. The proper fix (stop + restart the monitor against the
-/// new pid) is a follow-up.
-pub(crate) static SCHED_EXIT_SUPPRESS: AtomicBool = AtomicBool::new(false);
+/// Mutex (not Atomic) because [`SchedExitStop`] is move-only —
+/// `stop_and_join` consumes it. `Option` because Op::DetachScheduler
+/// leaves no scheduler attached, so the slot is empty between
+/// detach and the next attach.
+static SCHED_EXIT_MONITOR_SLOT: OnceLock<std::sync::Mutex<Option<SchedExitStop>>> = OnceLock::new();
+
+/// Boot-captured context that
+/// [`restart_sched_exit_monitor_with_log`] needs to re-supply when
+/// it spawns a fresh monitor against the post-Op scheduler PID.
+/// `suppress_com2` + `probe_output_done` are determined at boot
+/// (based on whether the probe stack is active) and don't change
+/// across Op dispatches — capturing once at install time keeps
+/// the restart helper signature minimal.
+struct SchedExitMonitorBootCtx {
+    suppress_com2: Arc<AtomicBool>,
+    probe_output_done: Option<Arc<crate::sync::Latch>>,
+}
+
+static SCHED_EXIT_MONITOR_BOOT_CTX: OnceLock<SchedExitMonitorBootCtx> = OnceLock::new();
+
+/// Install the boot-time scheduler-exit monitor handle and capture
+/// the dispatch context [`restart_sched_exit_monitor_with_log`]
+/// needs to spawn replacement monitors. Called once at boot
+/// after [`start_sched_exit_monitor`] returns.
+///
+/// `boot_stop` may be `None` when [`start_sched_exit_monitor`]
+/// returned None (no scheduler configured at boot); the slot
+/// stays empty and the first Op::AttachScheduler dispatch
+/// populates it via [`restart_sched_exit_monitor_with_log`].
+pub(crate) fn install_initial_sched_exit_monitor(
+    boot_stop: Option<SchedExitStop>,
+    suppress_com2: Arc<AtomicBool>,
+    probe_output_done: Option<Arc<crate::sync::Latch>>,
+) {
+    let slot = SCHED_EXIT_MONITOR_SLOT.get_or_init(|| std::sync::Mutex::new(None));
+    *slot.lock().unwrap() = boot_stop;
+    let _ = SCHED_EXIT_MONITOR_BOOT_CTX.set(SchedExitMonitorBootCtx {
+        suppress_com2,
+        probe_output_done,
+    });
+}
+
+/// Stop the currently-installed scheduler-exit monitor (if any).
+/// The scheduler-lifecycle Op handler calls this BEFORE SIGTERM-ing
+/// the scheduler so the monitor thread exits cleanly without
+/// sending the `MSG_TYPE_SCHED_EXIT` message that the host's
+/// freeze coordinator would otherwise promote into the run-wide
+/// kill flag (per `src/vmm/freeze_coord/dispatch.rs` SchedExit
+/// arm). Idempotent — a no-op when the slot is already empty.
+pub(crate) fn stop_sched_exit_monitor() {
+    let Some(slot) = SCHED_EXIT_MONITOR_SLOT.get() else {
+        return;
+    };
+    let prev = slot.lock().unwrap().take();
+    if let Some(stop) = prev {
+        stop.stop_and_join();
+    }
+}
+
+/// Spawn a fresh scheduler-exit monitor for the live SCHED_PID
+/// and install it into the slot. Op handler calls this AFTER the
+/// new scheduler is spawned and SCHED_PID is published, so the
+/// monitor watches the post-Op PID. `log_path` is the per-spawn
+/// log file path — for Op::ReplaceScheduler / Op::AttachScheduler
+/// it's the seq-suffixed staged log path; for Op::RestartScheduler
+/// it's `/tmp/sched.log`.
+///
+/// Uses the boot-captured `suppress_com2` + `probe_output_done`
+/// so the new monitor behaves identically to the boot monitor. If
+/// the boot ctx was never installed (degenerate test environment
+/// where `install_initial_sched_exit_monitor` never ran) the
+/// helper is a no-op and the new scheduler stays unmonitored —
+/// the boot path is the only legitimate context that installs
+/// the ctx.
+pub(crate) fn restart_sched_exit_monitor_with_log(log_path: Option<&str>) {
+    let Some(ctx) = SCHED_EXIT_MONITOR_BOOT_CTX.get() else {
+        return;
+    };
+    let slot = SCHED_EXIT_MONITOR_SLOT.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = slot.lock().unwrap();
+    // Defensive: if the Op handler skipped stop_sched_exit_monitor
+    // for any reason, stop_and_join the stale handle before
+    // installing the new one. The take() leaves the slot empty
+    // for the duration of start_sched_exit_monitor — readers in
+    // that window observe "no monitor", which is correct since
+    // the new monitor hasn't been spawned yet.
+    if let Some(prev) = guard.take() {
+        prev.stop_and_join();
+    }
+    *guard = start_sched_exit_monitor(
+        sched_pid().map(|p| p as u32),
+        log_path,
+        ctx.suppress_com2.clone(),
+        ctx.probe_output_done.clone(),
+    );
+}
 
 /// Read the scheduler PID published by [`start_scheduler`]. Returns
 /// `None` when the scheduler has not been spawned yet (the atomic
@@ -1233,12 +1316,26 @@ pub(crate) fn ktstr_guest_init() -> ! {
     let probe_output_done = probe_phase_a
         .as_ref()
         .map(|pa| pa.pipeline.output_done.clone());
-    let sched_exit_stop = start_sched_exit_monitor(
+    // Install the boot-time scheduler-exit monitor handle into
+    // the module-level slot via `install_initial_sched_exit_monitor`
+    // so the scheduler-lifecycle Op dispatcher in
+    // `src/scenario/ops/mod.rs` can swap the monitor across
+    // Op::AttachScheduler / DetachScheduler / RestartScheduler /
+    // ReplaceScheduler. The earlier local-binding pattern held
+    // the SchedExitStop in this stack frame, which made it
+    // unreachable from the Op dispatch path. The shutdown cascade
+    // below calls `stop_sched_exit_monitor` instead of the
+    // pre-refactor local `stop_and_join`. Cloning the Arcs is
+    // cheap and the boot start_sched_exit_monitor call retains
+    // its original semantics — the only difference is the
+    // ownership chain after spawn.
+    let boot_stop = start_sched_exit_monitor(
         sched_child.as_ref().map(|c| c.id()),
         sched_log_path.as_deref(),
-        suppress_com2,
-        probe_output_done,
+        suppress_com2.clone(),
+        probe_output_done.clone(),
     );
+    install_initial_sched_exit_monitor(boot_stop, suppress_com2, probe_output_done);
 
     // Phase 5: Dispatch.
     let _s_phase5 = tracing::debug_span!("phase5_dispatch").entered();
@@ -1281,9 +1378,12 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // returns. After this call the monitor is guaranteed to have
     // exited without sending MSG_TYPE_SCHED_EXIT, so the
     // subsequent child.kill() cannot trigger the race.
-    if let Some(handle) = sched_exit_stop {
-        handle.stop_and_join();
-    }
+    // Stop the live sched_exit_monitor (whichever scheduler PID it
+    // was last installed for — boot or post-Op::Replace) before
+    // tearing down the scheduler child below. The slot may be
+    // empty if the test ran Op::DetachScheduler without a
+    // re-attach; the helper handles that case as a no-op.
+    stop_sched_exit_monitor();
 
     if let Some(ref mut child) = sched_child {
         let _ = child.kill();
@@ -4344,26 +4444,6 @@ fn start_sched_exit_monitor(
                     // before the guest reaches send_exit,
                     // producing exit_code=-1 on a clean run.
                     if stop_clone.load(Ordering::Acquire) {
-                        unsafe {
-                            libc::close(pidfd);
-                        }
-                        return;
-                    }
-                    // Scheduler-lifecycle Op kill suppression. Op
-                    // dispatch sets `SCHED_EXIT_SUPPRESS` true
-                    // before SIGTERM-ing the current scheduler so
-                    // the host doesn't promote our INTENTIONAL kill
-                    // into the run-wide kill flag. Exit without
-                    // sending SchedExit — the monitor thread is
-                    // one-shot per pid; see SCHED_EXIT_SUPPRESS doc
-                    // at rust_init.rs:90 for the v0-limitation
-                    // around post-swap monitor coverage.
-                    if SCHED_EXIT_SUPPRESS.load(Ordering::Acquire) {
-                        tracing::debug!(
-                            "sched_exit_monitor: scheduler exit during \
-                             lifecycle Op kill — suppressing SchedExit \
-                             (run-wide kill flag stays clear)"
-                        );
                         unsafe {
                             libc::close(pidfd);
                         }

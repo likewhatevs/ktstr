@@ -3201,14 +3201,19 @@ fn kill_current_scheduler(op_label: &str) -> Result<libc::pid_t> {
              `Op::AttachScheduler` before invoking this Op"
         )
     })?;
-    // Suppress the guest sched_exit_monitor's SchedExit message —
-    // the host's dispatch.rs SchedExit arm promotes the message
-    // into the run-wide kill flag and would fail the test as
+    // Stop the guest sched_exit_monitor BEFORE SIGTERM so the
+    // monitor thread exits without sending the SchedExit message
+    // that the host's dispatch.rs SchedExit arm would otherwise
+    // promote into the run-wide kill flag (failing the test as
     // scheduler-died even though the kill is an INTENTIONAL
-    // lifecycle Op. The dispatch_* arms clear this flag after the
-    // post-kill sequence completes. See SCHED_EXIT_SUPPRESS doc at
-    // src/vmm/rust_init.rs:90 for the v0 limitation.
-    crate::vmm::rust_init::SCHED_EXIT_SUPPRESS.store(true, std::sync::atomic::Ordering::Release);
+    // lifecycle Op). The post-spawn Attach / Restart / Replace
+    // paths re-install a fresh monitor for the new SCHED_PID via
+    // `restart_sched_exit_monitor_with_log`; Detach leaves the
+    // slot empty because there is no replacement scheduler.
+    // SchedExitStop.stop_and_join joins the monitor thread before
+    // returning, so the kill below is safe from the prior
+    // monitor's pidfd race.
+    crate::vmm::rust_init::stop_sched_exit_monitor();
     // Trigger async scx_disable via sysrq-'S' so the kernel-side
     // disable cascade runs OUT OF BAND from the scheduler's exit
     // path. Without this, `bpf_scx_unreg`
@@ -3302,6 +3307,12 @@ fn dispatch_attach_scheduler(scheduler: &'static crate::test_support::Scheduler)
     let args = crate::test_support::staged::staged_scheduler_args_path(scheduler.name);
     let log = staged_scheduler_log_path(scheduler.name);
     spawn_scheduler_for_op("Op::AttachScheduler", &binary, &args, &log, scheduler.name)?;
+    // Install a fresh sched_exit_monitor against the just-spawned
+    // SCHED_PID so the post-Op scheduler retains death detection.
+    // No prior monitor existed for this slot (Attach is the
+    // "first scheduler" or post-Detach attach); the restart helper
+    // handles the empty-slot case as a fresh install.
+    crate::vmm::rust_init::restart_sched_exit_monitor_with_log(Some(&log));
     tracing::info!(
         op = "AttachScheduler",
         scheduler_name = scheduler.name,
@@ -3340,6 +3351,11 @@ fn dispatch_restart_scheduler() -> Result<()> {
         "/tmp/sched.log",
         "boot",
     )?;
+    // Re-install monitor against the re-spawned boot scheduler's
+    // pid. Boot log path matches the spawn_scheduler_for_op log
+    // arg above so the monitor's failure-dump payload writes to
+    // the same file the re-spawned scheduler uses.
+    crate::vmm::rust_init::restart_sched_exit_monitor_with_log(Some("/tmp/sched.log"));
     tracing::info!(
         op = "RestartScheduler",
         prev_pid = prev_pid,
@@ -3359,6 +3375,11 @@ fn dispatch_replace_scheduler(scheduler: &'static crate::test_support::Scheduler
     let args = crate::test_support::staged::staged_scheduler_args_path(scheduler.name);
     let log = staged_scheduler_log_path(scheduler.name);
     spawn_scheduler_for_op("Op::ReplaceScheduler", &binary, &args, &log, scheduler.name)?;
+    // Re-install monitor against the replacement scheduler's pid
+    // so death detection persists past the swap. The seq-suffixed
+    // log path matches the spawn_scheduler_for_op log arg above so
+    // failure-dump output goes to the new scheduler's own file.
+    crate::vmm::rust_init::restart_sched_exit_monitor_with_log(Some(&log));
     tracing::info!(
         op = "ReplaceScheduler",
         prev_pid = prev_pid,
