@@ -51,22 +51,6 @@ const STAGED_ALT_SCHED: Scheduler =
 /// scx-ktstr's `sched_ext_dump` tracepoint confirm the
 /// post-replace scheduler bound to sched_ext correctly (same
 /// path the boot scheduler exercises).
-// NOTE: `ignore = true` because the framework's host-side scheduler
-// liveness monitor flags Op::ReplaceScheduler's brief no-scheduler
-// window (between the SIGTERM-driven detach and the next scheduler's
-// attach) as "scheduler process died unexpectedly during workload".
-// The dispatch wire-up itself is verified end-to-end inside the VM —
-// the kill path successfully drives the scx state machine to
-// `disabled` (per `wait_for_scx_disabled`) and the spawn path
-// re-publishes SCHED_PID — but the monitor's interpretation needs a
-// lifecycle-aware hook to suppress the false-positive death signal
-// during a known swap. That hook is a separate follow-up (depends on
-// guest→host swap-pending wire format that doesn't exist today). The
-// 5 `scenario::ops::tests::apply_ops_*_scheduler_*` unit tests + the
-// `staged_scheduler_log_path_is_per_name_keyed` pin cover the
-// dispatch correctness; this VM e2e validates the full path once the
-// monitor hook lands. Toggle to `ignore = false` after the
-// monitor-lifecycle wire-up commit.
 #[ktstr_test(
     scheduler = PRIMARY_SCHED,
     staged_schedulers = [STAGED_ALT_SCHED],
@@ -76,7 +60,6 @@ const STAGED_ALT_SCHED: Scheduler =
     memory_mib = 512,
     duration_s = 5,
     cleanup_budget_ms = 5000,
-    ignore = true,
 )]
 fn scheduler_replace_mid_experiment_swaps_via_staged_pack(ctx: &Ctx) -> Result<AssertResult> {
     use ktstr::scenario::ops::{HoldSpec, Op, Step, execute_steps};

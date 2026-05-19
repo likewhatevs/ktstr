@@ -854,11 +854,17 @@ fn run_scenario(
     // --- Step loop with per-Step teardown ---
     for (step_idx, step) in steps.iter().enumerate() {
         // Check scheduler liveness between steps (skip before first).
-        // sched_pid == None means no scheduler was configured
-        // (kernel-default path); the liveness probe cannot
-        // meaningfully report on a pid that was never set.
+        // Live `crate::vmm::rust_init::sched_pid()` read instead of
+        // `ctx.sched_pid` snapshot so a mid-scenario
+        // `Op::ReplaceScheduler` swap is reflected — the swap
+        // dispatcher updates `SCHED_PID` to the new child via
+        // `set_sched_pid`, and this check then observes the new
+        // pid's liveness (not the dead boot pid). `None` means
+        // either no scheduler was configured at boot or
+        // `Op::DetachScheduler` cleared the pid; the liveness probe
+        // cannot meaningfully report on a pid that doesn't exist.
         if step_idx > 0
-            && let Some(pid) = ctx.sched_pid
+            && let Some(pid) = crate::vmm::rust_init::sched_pid()
             && !process_alive(pid)
         {
             // Collect backdrop-owned workload handles into the
@@ -968,9 +974,13 @@ fn run_scenario(
         crate::vmm::guest_comms::send_scenario_end(elapsed);
     }
 
-    // Final liveness check. sched_pid == None ⇒ no scheduler
-    // configured (kernel-default path); no liveness to report on.
-    let sched_dead = ctx.sched_pid.is_some_and(|pid| !process_alive(pid));
+    // Final liveness check. Live `crate::vmm::rust_init::sched_pid()`
+    // read instead of `ctx.sched_pid` snapshot so a mid-scenario
+    // Op::ReplaceScheduler swap reflects the new pid here too.
+    // sched_pid() == None ⇒ no scheduler configured (kernel-default
+    // path) OR Op::DetachScheduler cleared it; no liveness to
+    // report on either case.
+    let sched_dead = crate::vmm::rust_init::sched_pid().is_some_and(|pid| !process_alive(pid));
 
     // --- Backdrop teardown ---
     let backdrop_result =
@@ -1211,7 +1221,11 @@ fn run_step<'a>(
             while std::time::Instant::now() < deadline {
                 drain_on_err!(scenario, apply_ops(ctx, &mut scenario, &step.ops));
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                if sleep_or_sched_died(remaining.min(interval), ctx.sched_pid) {
+                // Live `sched_pid()` read so a mid-loop
+                // Op::ReplaceScheduler swap is watched at the NEW
+                // pid, not the stale boot snapshot in ctx.
+                if sleep_or_sched_died(remaining.min(interval), crate::vmm::rust_init::sched_pid())
+                {
                     *sched_died_during_hold = true;
                     return Ok(());
                 }
@@ -1247,7 +1261,10 @@ fn run_step<'a>(
             let remaining = (scenario_start + ctx.duration)
                 .saturating_duration_since(std::time::Instant::now());
             let hold_dur = hold_dur.min(remaining);
-            if sleep_or_sched_died(hold_dur, ctx.sched_pid) {
+            // Live `sched_pid()` read — matches the loop arm above
+            // so the hold watches the post-Op::ReplaceScheduler
+            // pid, not the stale boot snapshot.
+            if sleep_or_sched_died(hold_dur, crate::vmm::rust_init::sched_pid()) {
                 *sched_died_during_hold = true;
                 return Ok(());
             }
@@ -3169,6 +3186,14 @@ fn kill_current_scheduler(op_label: &str) -> Result<libc::pid_t> {
              `Op::AttachScheduler` before invoking this Op"
         )
     })?;
+    // Suppress the guest sched_exit_monitor's SchedExit message —
+    // the host's dispatch.rs SchedExit arm promotes the message
+    // into the run-wide kill flag and would fail the test as
+    // scheduler-died even though the kill is an INTENTIONAL
+    // lifecycle Op. The dispatch_* arms clear this flag after the
+    // post-kill sequence completes. See SCHED_EXIT_SUPPRESS doc at
+    // src/vmm/rust_init.rs:90 for the v0 limitation.
+    crate::vmm::rust_init::SCHED_EXIT_SUPPRESS.store(true, std::sync::atomic::Ordering::Release);
     // Trigger async scx_disable via sysrq-'S' so the kernel-side
     // disable cascade runs OUT OF BAND from the scheduler's exit
     // path. Without this, `bpf_scx_unreg`

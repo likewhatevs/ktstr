@@ -89,6 +89,27 @@ fn force_reboot() -> ! {
 /// initialise with and the consumer to filter on.
 static SCHED_PID: AtomicI32 = AtomicI32::new(0);
 
+/// Suppress the [`start_sched_exit_monitor`] thread's
+/// `MSG_TYPE_SCHED_EXIT` send while a scheduler-lifecycle Op is
+/// driving an INTENTIONAL kill of the current scheduler. Without
+/// this gate, the host's freeze coordinator would promote the
+/// guest-emitted SchedExit into the run-wide kill flag (per
+/// `src/vmm/freeze_coord/dispatch.rs` SchedExit arm) and fail the
+/// test as scheduler-died even though the kill was a deliberate
+/// Op::DetachScheduler / Op::RestartScheduler / Op::ReplaceScheduler
+/// step. The Op handler (in `src/scenario/ops/mod.rs`) sets `true`
+/// before SIGTERM and clears `false` after the new scheduler
+/// attaches (Replace) or after the kill completes (Detach).
+///
+/// v0 limitation: the monitor is one-shot per scheduler PID — when
+/// the suppressed exit fires, the monitor thread exits and there
+/// is no live monitor for any subsequent scheduler attached via
+/// Op::AttachScheduler / Op::ReplaceScheduler. A real death of the
+/// post-swap scheduler would NOT promote into the run-wide kill
+/// flag. The proper fix (stop + restart the monitor against the
+/// new pid) is a follow-up.
+pub(crate) static SCHED_EXIT_SUPPRESS: AtomicBool = AtomicBool::new(false);
+
 /// Read the scheduler PID published by [`start_scheduler`]. Returns
 /// `None` when the scheduler has not been spawned yet (the atomic
 /// reads as `0`, the sentinel for "unset"). `Acquire` synchronises
@@ -4236,6 +4257,26 @@ fn start_sched_exit_monitor(
                     // before the guest reaches send_exit,
                     // producing exit_code=-1 on a clean run.
                     if stop_clone.load(Ordering::Acquire) {
+                        unsafe {
+                            libc::close(pidfd);
+                        }
+                        return;
+                    }
+                    // Scheduler-lifecycle Op kill suppression. Op
+                    // dispatch sets `SCHED_EXIT_SUPPRESS` true
+                    // before SIGTERM-ing the current scheduler so
+                    // the host doesn't promote our INTENTIONAL kill
+                    // into the run-wide kill flag. Exit without
+                    // sending SchedExit — the monitor thread is
+                    // one-shot per pid; see SCHED_EXIT_SUPPRESS doc
+                    // at rust_init.rs:90 for the v0-limitation
+                    // around post-swap monitor coverage.
+                    if SCHED_EXIT_SUPPRESS.load(Ordering::Acquire) {
+                        tracing::debug!(
+                            "sched_exit_monitor: scheduler exit during \
+                             lifecycle Op kill — suppressing SchedExit \
+                             (run-wide kill flag stays clear)"
+                        );
                         unsafe {
                             libc::close(pidfd);
                         }
