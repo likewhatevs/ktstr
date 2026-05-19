@@ -185,13 +185,21 @@ fn verdict_failing_claims_label_with_stringify_tokens() {
     // `verdict.claim(stringify!(wall_time_ns), ...)`, so the label
     // is the field name verbatim.
     assert!(
-        r.failure_details().next().unwrap().message.contains("wall_time_ns"),
+        r.failure_details()
+            .next()
+            .unwrap()
+            .message
+            .contains("wall_time_ns"),
         "typed accessor failure must label with the field name from \
          stringify!(field) in the derive expansion: {}",
         r.failure_details().next().unwrap().message,
     );
     assert!(
-        r.failure_details().next().unwrap().message.contains("at most 0"),
+        r.failure_details()
+            .next()
+            .unwrap()
+            .message
+            .contains("at most 0"),
         "at_most failure must render the bound: {}",
         r.failure_details().next().unwrap().message,
     );
@@ -200,7 +208,11 @@ fn verdict_failing_claims_label_with_stringify_tokens() {
     // verbatim -- proves the macro reads the expression token, not
     // the variable's underlying source.
     assert!(
-        r.failure_details().nth(1).unwrap().message.contains("iter_count"),
+        r.failure_details()
+            .nth(1)
+            .unwrap()
+            .message
+            .contains("iter_count"),
         "claim! macro failure on a local binding must label with the \
          binding name from stringify!($value): {}",
         r.failure_details().nth(1).unwrap().message,
@@ -209,7 +221,11 @@ fn verdict_failing_claims_label_with_stringify_tokens() {
     // initialized from) MUST NOT appear -- the label tracks the
     // expression token, not the value's provenance.
     assert!(
-        !r.failure_details().nth(1).unwrap().message.contains("iterations"),
+        !r.failure_details()
+            .nth(1)
+            .unwrap()
+            .message
+            .contains("iterations"),
         "claim! must NOT leak the underlying field name when the \
          caller bound it to a different ident: {}",
         r.failure_details().nth(1).unwrap().message,
@@ -218,7 +234,11 @@ fn verdict_failing_claims_label_with_stringify_tokens() {
     // Detail 2: macro on a multi-token expression. Label preserves
     // every token from the input, including method-call parens.
     assert!(
-        r.failure_details().nth(2).unwrap().message.contains("report.cpus_used.len()"),
+        r.failure_details()
+            .nth(2)
+            .unwrap()
+            .message
+            .contains("report.cpus_used.len()"),
         "claim! on an expression must stringify the full token tree: {}",
         r.failure_details().nth(2).unwrap().message,
     );
@@ -242,7 +262,7 @@ fn verdict_merges_external_assert_result_into_pointwise_claims() {
     // Synthesize a failing upstream AssertResult (simulating an
     // `assert_*` returning a failure).
     let mut upstream = AssertResult::pass();
-    
+
     upstream.record_fail(ktstr::assert::AssertDetail::new(
         DetailKind::Other,
         "synthetic upstream failure".to_string(),
@@ -290,7 +310,9 @@ fn verdict_skip_records_skip_kind_with_reason() {
         r.outcomes,
     );
     assert!(r.is_skip(), "skip flag must be set on the result");
-    let skip_detail = r.skip_reasons().find(|d| d.kind == DetailKind::Skip)
+    let skip_detail = r
+        .skip_reasons()
+        .find(|d| d.kind == DetailKind::Skip)
         .expect("at least one Skip-kind detail must be present");
     assert!(
         skip_detail

@@ -317,7 +317,7 @@ fn scenario_watchdog_timing_precision(
             // dominated instead of the 2s host write. Surface as a
             // fatal failure detail; expect_err cannot mask this
             // because we replace the AssertResult.
-            
+
             result.record_fail(ktstr::assert::AssertDetail::new(
                 ktstr::assert::DetailKind::Other,
                 format!(

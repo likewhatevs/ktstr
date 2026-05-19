@@ -72,7 +72,11 @@ fn snapshot_op_drives_bridge_and_stores_report_under_name() {
         hold: HoldSpec::fixed(std::time::Duration::from_millis(1)),
     }];
     let result = execute_steps(&ctx, steps).expect("execute_steps must succeed");
-    assert!(result.is_pass(), "scenario must pass: {:?}", result.outcomes);
+    assert!(
+        result.is_pass(),
+        "scenario must pass: {:?}",
+        result.outcomes
+    );
 
     assert_eq!(
         calls.load(Ordering::Relaxed),
@@ -167,7 +171,11 @@ fn watch_snapshot_op_drives_register_callback() {
         hold: HoldSpec::fixed(std::time::Duration::from_millis(1)),
     }];
     let result = execute_steps(&ctx, steps).expect("execute_steps must succeed");
-    assert!(result.is_pass(), "scenario must pass: {:?}", result.outcomes);
+    assert!(
+        result.is_pass(),
+        "scenario must pass: {:?}",
+        result.outcomes
+    );
     let recorded = attempts.lock().unwrap().clone();
     assert_eq!(recorded.len(), 2);
     assert_eq!(recorded[0], "bss.scx_ktstr.alloc_count");
@@ -202,7 +210,9 @@ fn watch_snapshot_op_max_3_per_scenario_errors_fourth() {
         !result.is_pass(),
         "scenario must fail when 4th watchpoint is registered (cap exceeded)"
     );
-    let detail = result.failure_details().find(|d| d.message.contains("cap exceeded"))
+    let detail = result
+        .failure_details()
+        .find(|d| d.message.contains("cap exceeded"))
         .expect("AssertResult must carry the cap-exceeded message");
     assert!(detail.message.contains("WatchSnapshot"));
     assert_eq!(MAX_WATCH_SNAPSHOTS, 3);
@@ -231,7 +241,9 @@ fn watch_snapshot_op_unresolvable_symbol_bails_immediately() {
     }];
     let result = execute_steps(&ctx, steps).expect("execute_steps returns Ok with stamped error");
     assert!(result.is_fail(), "unresolvable symbol must fail the step");
-    let detail = result.failure_details().find(|d| d.message.contains("did not resolve"))
+    let detail = result
+        .failure_details()
+        .find(|d| d.message.contains("did not resolve"))
         .expect("AssertResult must surface the resolution error");
     assert!(detail.message.contains("absent_symbol"));
 }

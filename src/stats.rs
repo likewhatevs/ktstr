@@ -3831,15 +3831,15 @@ pub(crate) fn compare_rows_by(
                                 continue;
                             };
                             let delta = val_b - val_a;
-                            let rel_thresh = policy
-                                .rel_threshold(metric_def.name, metric_def.default_rel);
+                            let rel_thresh =
+                                policy.rel_threshold(metric_def.name, metric_def.default_rel);
                             let rel_delta = if val_a.abs() > f64::EPSILON {
                                 (delta / val_a).abs()
                             } else {
                                 0.0
                             };
-                            let below_dual_gate = delta.abs() < metric_def.default_abs
-                                || rel_delta < rel_thresh;
+                            let below_dual_gate =
+                                delta.abs() < metric_def.default_abs || rel_delta < rel_thresh;
                             let is_regression = if below_dual_gate {
                                 false
                             } else if metric_def.higher_is_worse() {
@@ -3877,9 +3877,9 @@ pub(crate) fn compare_rows_by(
                             metrics: orphan.metrics.clone(),
                         });
                     }
-                    (None, None) => unreachable!(
-                        "step_index taken from union of a_by_step / b_by_step keys"
-                    ),
+                    (None, None) => {
+                        unreachable!("step_index taken from union of a_by_step / b_by_step keys")
+                    }
                 }
             }
         }
@@ -4440,8 +4440,7 @@ pub fn compare_partitions(
         // into `sorted_deltas` below — the footer hint reads them
         // after the table rendering consumes the Vec.
         let filtered_delta_total = filtered_deltas.len();
-        let filtered_delta_regressions =
-            filtered_deltas.iter().filter(|d| d.is_regression).count();
+        let filtered_delta_regressions = filtered_deltas.iter().filter(|d| d.is_regression).count();
         if !filtered_deltas.is_empty() || !filtered_unpaired.is_empty() {
             println!();
             println!("phase coverage:");
@@ -4488,9 +4487,7 @@ pub fn compare_partitions(
                 println!();
                 println!("phase coverage asymmetry (one-sided phases):");
                 let mut unpaired_table = crate::cli::new_table();
-                unpaired_table.set_header(vec![
-                    "SIDE", "TEST", "PHASE", "METRIC", "VALUE",
-                ]);
+                unpaired_table.set_header(vec!["SIDE", "TEST", "PHASE", "METRIC", "VALUE"]);
                 // Sort by step_index then side then pairing key then
                 // metric name. Time-order (step_index first) reads
                 // most naturally — the reader sees missing data in
@@ -4555,7 +4552,11 @@ pub fn compare_partitions(
                      ({filtered_delta_regressions} regression{plural}). \
                      Filter with --phase N / --phases-only / --steps-only / \
                      --phase-threshold P / --no-phases.",
-                    plural = if filtered_delta_regressions == 1 { "" } else { "s" },
+                    plural = if filtered_delta_regressions == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
                 );
             }
         }
@@ -9154,10 +9155,7 @@ mod tests {
         label: &str,
         metrics: &[(&str, f64)],
     ) -> crate::assert::PhaseBucket {
-        let metrics_map = metrics
-            .iter()
-            .map(|(k, v)| (k.to_string(), *v))
-            .collect();
+        let metrics_map = metrics.iter().map(|(k, v)| (k.to_string(), *v)).collect();
         crate::assert::PhaseBucket {
             step_index,
             label: label.to_string(),
@@ -9184,15 +9182,16 @@ mod tests {
             make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 6.0)]),
             make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 15.0)]),
         ];
-        let report = compare_rows_by(
-            &[row_a],
-            &[row_b],
-            &[],
-            None,
-            &ComparisonPolicy::default(),
+        let report = compare_rows_by(&[row_a], &[row_b], &[], None, &ComparisonPolicy::default());
+        assert_eq!(
+            report.phase_deltas.len(),
+            2,
+            "2 phases × 1 metric = 2 deltas"
         );
-        assert_eq!(report.phase_deltas.len(), 2, "2 phases × 1 metric = 2 deltas");
-        assert!(report.unpaired_phases.is_empty(), "both phases matched, no orphans");
+        assert!(
+            report.unpaired_phases.is_empty(),
+            "both phases matched, no orphans"
+        );
         let baseline = report
             .phase_deltas
             .iter()
@@ -9231,13 +9230,7 @@ mod tests {
             make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)]),
             make_phase_bucket(2, "Step[1]", &[("max_dsq_depth", 9.0)]),
         ];
-        let report = compare_rows_by(
-            &[row_a],
-            &[row_b],
-            &[],
-            None,
-            &ComparisonPolicy::default(),
-        );
+        let report = compare_rows_by(&[row_a], &[row_b], &[], None, &ComparisonPolicy::default());
         assert_eq!(
             report.phase_deltas.len(),
             1,
@@ -9276,13 +9269,7 @@ mod tests {
             make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 6.0)]),
             make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 10.0)]),
         ];
-        let report = compare_rows_by(
-            &[row_a],
-            &[row_b],
-            &[],
-            None,
-            &ComparisonPolicy::default(),
-        );
+        let report = compare_rows_by(&[row_a], &[row_b], &[], None, &ComparisonPolicy::default());
         assert!(
             report.phase_deltas.is_empty(),
             "empty-on-either-side short-circuit must suppress all per-phase rows"
@@ -9325,13 +9312,7 @@ mod tests {
             "BASELINE",
             &[("max_dsq_depth", 25.0), ("total_iterations", 400.0)],
         )];
-        let report = compare_rows_by(
-            &[row_a],
-            &[row_b],
-            &[],
-            None,
-            &ComparisonPolicy::default(),
-        );
+        let report = compare_rows_by(&[row_a], &[row_b], &[], None, &ComparisonPolicy::default());
         assert_eq!(report.phase_deltas.len(), 2, "2 metrics in 1 bucket");
         let dsq = report
             .phase_deltas
@@ -9381,13 +9362,7 @@ mod tests {
             make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 10.0)]),
             make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 25.0)]),
         ];
-        let report = compare_rows_by(
-            &[row_a],
-            &[row_b],
-            &[],
-            None,
-            &ComparisonPolicy::default(),
-        );
+        let report = compare_rows_by(&[row_a], &[row_b], &[], None, &ComparisonPolicy::default());
         assert_eq!(
             report.phase_deltas.len(),
             2,
@@ -9432,7 +9407,9 @@ mod tests {
             ..PhaseDisplayOptions::default()
         };
         let mut policy = ComparisonPolicy::default();
-        policy.per_metric_percent.insert("max_dsq_depth".into(), 99.0);
+        policy
+            .per_metric_percent
+            .insert("max_dsq_depth".into(), 99.0);
         let resolved = opts.rel_threshold(&policy, "max_dsq_depth", 0.50);
         assert_eq!(
             resolved, 0.25,
@@ -9451,7 +9428,9 @@ mod tests {
     fn phase_display_options_rel_threshold_falls_through_to_policy_when_unset() {
         let opts = PhaseDisplayOptions::default(); // phase_threshold = None
         let mut policy = ComparisonPolicy::default();
-        policy.per_metric_percent.insert("max_dsq_depth".into(), 30.0); // 30%
+        policy
+            .per_metric_percent
+            .insert("max_dsq_depth".into(), 30.0); // 30%
         let resolved = opts.rel_threshold(&policy, "max_dsq_depth", 0.50);
         assert_eq!(
             resolved, 0.30,
@@ -9623,7 +9602,11 @@ mod tests {
             "at-boundary delta (rel=0.10, gate=0.10) must pass via >= comparison"
         );
         // delta=5, a=100 → rel = 0.05 < 0.10. Below the gate.
-        let below_gate = PhaseDeltaRow { delta: 5.0, b: 105.0, ..at_gate };
+        let below_gate = PhaseDeltaRow {
+            delta: 5.0,
+            b: 105.0,
+            ..at_gate
+        };
         assert!(
             !opts.passes_delta_threshold(&below_gate),
             "below-boundary delta (rel=0.05, gate=0.10) must be suppressed"

@@ -171,13 +171,11 @@ fn validate_direct_target(
         ));
     }
     let direct_map_end = page_offset.checked_add(dram_size).ok_or_else(|| {
-        format!(
-            "internal: page_offset+dram_size overflow ({page_offset:#x} + {dram_size:#x})"
-        )
+        format!("internal: page_offset+dram_size overflow ({page_offset:#x} + {dram_size:#x})")
     })?;
-    let kva_end = kva.checked_add(len).ok_or_else(|| {
-        format!("Direct kva+len overflow ({kva:#x} + {len:#x})")
-    })?;
+    let kva_end = kva
+        .checked_add(len)
+        .ok_or_else(|| format!("Direct kva+len overflow ({kva:#x} + {len:#x})"))?;
     if kva_end > direct_map_end {
         return Err(format!(
             "Direct kva={kva:#x} len={len} overruns direct-map end {direct_map_end:#x}"
@@ -199,9 +197,9 @@ fn validate_kva_target(kva: u64, len: u64) -> Result<(), String> {
     if kva < KERNEL_HALF_CONSERVATIVE_5LEVEL {
         return Err(user_half_kva_rejection_reason(kva));
     }
-    let _ = kva.checked_add(len).ok_or_else(|| {
-        format!("Kva kva+len overflow ({kva:#x} + {len:#x})")
-    })?;
+    let _ = kva
+        .checked_add(len)
+        .ok_or_else(|| format!("Kva kva+len overflow ({kva:#x} + {len:#x})"))?;
     Ok(())
 }
 
@@ -961,8 +959,7 @@ fn find_task_by_pid(
         // is at `signal_thread_head_off` within signal_struct.
         let signal_kva = mem.read_u64(leader_pa, signal_off);
         if signal_kva != 0 {
-            let thread_head_kva =
-                signal_kva.wrapping_add(signal_thread_head_off as u64);
+            let thread_head_kva = signal_kva.wrapping_add(signal_thread_head_off as u64);
             if let Some(thread_head_pa) = translate_any_kva(
                 mem,
                 walk.cr3_pa,
@@ -982,8 +979,7 @@ fn find_task_by_pid(
                     }
                     visited += 1;
 
-                    let thread_kva =
-                        thread_node_kva.wrapping_sub(thread_node_off as u64);
+                    let thread_kva = thread_node_kva.wrapping_sub(thread_node_off as u64);
 
                     // The leader's thread_node is also on this list
                     // — skip it (already checked as leader above).
@@ -1021,10 +1017,19 @@ fn find_task_by_pid(
                     }
 
                     // Advance to next thread via thread_node.next.
-                    let next_kva = mem.read_u64(thread_pa_or_node(
-                        mem, walk.cr3_pa, walk.page_offset, walk.l5, walk.tcr_el1,
-                        thread_kva, thread_node_kva, thread_node_off,
-                    ), 0);
+                    let next_kva = mem.read_u64(
+                        thread_pa_or_node(
+                            mem,
+                            walk.cr3_pa,
+                            walk.page_offset,
+                            walk.l5,
+                            walk.tcr_el1,
+                            thread_kva,
+                            thread_node_kva,
+                            thread_node_off,
+                        ),
+                        0,
+                    );
                     if next_kva == 0 {
                         break; // chain broken — break inner loop
                     }
@@ -1417,8 +1422,12 @@ fn dispatch_task_field_read(
     })?;
 
     match width_hint {
-        KernelOpValue::U32(_) => Ok(KernelOpValue::U32(kernel.mem().read_u32(task_pa, field_off))),
-        KernelOpValue::U64(_) => Ok(KernelOpValue::U64(kernel.mem().read_u64(task_pa, field_off))),
+        KernelOpValue::U32(_) => Ok(KernelOpValue::U32(
+            kernel.mem().read_u32(task_pa, field_off),
+        )),
+        KernelOpValue::U64(_) => Ok(KernelOpValue::U64(
+            kernel.mem().read_u64(task_pa, field_off),
+        )),
         KernelOpValue::Bytes(_) => Err(format!(
             "TaskField pid={pid} field={field:?}: Bytes read not supported in v1 — \
              use U32 or U64 width hint"
@@ -1664,9 +1673,9 @@ mod tests {
         for (cp, label, padding) in [
             // (codepoint, label for failure context, padding bytes
             // past KERNEL_OP_REASON_MAX to ensure overflow)
-            ("é", "2byte_U+00E9", 4),     // U+00E9, 2 bytes (C3 A9)
-            ("☃", "3byte_U+2603", 6),     // U+2603, 3 bytes (E2 98 83)
-            ("🦀", "4byte_U+1F980", 8),   // U+1F980, 4 bytes
+            ("é", "2byte_U+00E9", 4),      // U+00E9, 2 bytes (C3 A9)
+            ("☃", "3byte_U+2603", 6),      // U+2603, 3 bytes (E2 98 83)
+            ("🦀", "4byte_U+1F980", 8),    // U+1F980, 4 bytes
             ("\u{FEFF}", "BOM_U+FEFF", 6), // U+FEFF, 3 bytes (EF BB BF)
         ] {
             let mut s = String::new();
@@ -2218,8 +2227,7 @@ mod tests {
     fn validate_task_rejects_on_rq_queued() {
         let mut buf = vec![0u8; 4096];
         paint_valid_task(&mut buf, 0, 12345);
-        buf[synth_task::ON_RQ_OFF..synth_task::ON_RQ_OFF + 4]
-            .copy_from_slice(&1u32.to_le_bytes());
+        buf[synth_task::ON_RQ_OFF..synth_task::ON_RQ_OFF + 4].copy_from_slice(&1u32.to_le_bytes());
         let kernel = build_test_kernel(&mut buf, Default::default());
         let offs = synth_validation_offsets();
         let err = validate(&kernel, 0, 12345, DEFAULT_START_TIME, &offs)
@@ -2306,8 +2314,8 @@ mod tests {
         let kernel = build_test_kernel(&mut buf, Default::default());
         let offs = synth_validation_offsets();
         // Both mismatched — expect pid error.
-        let err = validate(&kernel, 0, 12345, DEFAULT_START_TIME + 1, &offs)
-            .expect_err("must reject");
+        let err =
+            validate(&kernel, 0, 12345, DEFAULT_START_TIME + 1, &offs).expect_err("must reject");
         assert!(err.contains("pid mismatch"), "L1 must fire first: {err}");
         assert!(!err.contains("start_time identity mismatch"));
     }
@@ -2321,8 +2329,8 @@ mod tests {
             .copy_from_slice(&0x80u32.to_le_bytes());
         let kernel = build_test_kernel(&mut buf, Default::default());
         let offs = synth_validation_offsets();
-        let err = validate(&kernel, 0, 12345, DEFAULT_START_TIME + 1, &offs)
-            .expect_err("must reject");
+        let err =
+            validate(&kernel, 0, 12345, DEFAULT_START_TIME + 1, &offs).expect_err("must reject");
         assert!(
             err.contains("start_time identity mismatch"),
             "L2 must fire first: {err}"

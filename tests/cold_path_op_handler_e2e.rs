@@ -215,11 +215,7 @@ fn assert_task_field(replies: &[(String, KernelOpReplyPayload)]) -> Result<()> {
 
 fn assert_per_cpu_field(replies: &[(String, KernelOpReplyPayload)]) -> Result<()> {
     let reply = find_reply(replies, TAG_PER_CPU_FIELD)?;
-    anyhow::ensure!(
-        reply.success,
-        "PerCpuField read rejected: {}",
-        reply.reason
-    );
+    anyhow::ensure!(reply.success, "PerCpuField read rejected: {}", reply.reason);
     let value = reply
         .read_values
         .first()

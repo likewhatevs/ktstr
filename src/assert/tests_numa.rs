@@ -146,7 +146,9 @@ fn assert_page_locality_pass() {
 fn assert_page_locality_fail() {
     let r = assert_page_locality(0.5, Some(0.8), 100, 50);
     assert!(r.is_fail());
-    let detail = r.failure_details().find(|d| matches!(d.kind, DetailKind::PageLocality))
+    let detail = r
+        .failure_details()
+        .find(|d| matches!(d.kind, DetailKind::PageLocality))
         .unwrap();
     // Percentage form must accompany the fraction so an operator
     // reading the diagnostic doesn't mentally translate 0.5000 → 50%.
@@ -192,7 +194,9 @@ fn assert_slow_tier_ratio_fail() {
     let nodes: BTreeSet<usize> = [0].into_iter().collect();
     let r = assert_slow_tier_ratio(&pages, 0.5, 100, Some(&nodes));
     assert!(r.is_fail());
-    let detail = r.failure_details().find(|d| matches!(d.kind, DetailKind::SlowTier))
+    let detail = r
+        .failure_details()
+        .find(|d| matches!(d.kind, DetailKind::SlowTier))
         .unwrap();
     // 60% slow-tier (node 2 has 60 pages) vs 50% threshold; both
     // surfaces appear so the operator sees raw ratio AND human %.
@@ -364,7 +368,9 @@ fn assert_cross_node_migration_pass() {
 fn assert_cross_node_migration_fail() {
     let r = assert_cross_node_migration(20, 100, Some(0.1));
     assert!(r.is_fail());
-    let detail = r.failure_details().find(|d| matches!(d.kind, DetailKind::CrossNodeMigration))
+    let detail = r
+        .failure_details()
+        .find(|d| matches!(d.kind, DetailKind::CrossNodeMigration))
         .unwrap();
     // 20% migrated vs 10% threshold; pin both percentage tokens so
     // dropping either form regresses here.
@@ -403,7 +409,9 @@ fn assert_cross_node_migration_inconsistent_zero_total_nonzero_migrated() {
     // rather than silently coercing to ratio=0.0.
     let r = assert_cross_node_migration(5, 0, Some(0.1));
     assert!(!r.is_pass(), "inconsistent input must fail loudly");
-    let detail = r.failure_details().find(|d| d.message.contains("inconsistent"))
+    let detail = r
+        .failure_details()
+        .find(|d| d.message.contains("inconsistent"))
         .unwrap_or_else(|| panic!("expected inconsistent diagnostic, got {:?}", r.outcomes));
     assert!(
         detail.message.contains("5 pages migrated"),
@@ -550,7 +558,9 @@ fn plan_cross_node_migration_emits_one_failure_not_per_worker() {
     };
     let r = plan.assert_cgroup(&[a, b], None, None);
     assert!(r.is_fail());
-    let cross_node_failures = r.failure_details().filter(|d| matches!(d.kind, DetailKind::CrossNodeMigration))
+    let cross_node_failures = r
+        .failure_details()
+        .filter(|d| matches!(d.kind, DetailKind::CrossNodeMigration))
         .count();
     assert_eq!(
         cross_node_failures, 1,
@@ -627,5 +637,8 @@ fn plan_min_page_locality_aggregates_across_cgroup() {
     };
     let nodes: BTreeSet<usize> = [0].into_iter().collect();
     let r = plan.assert_cgroup(&[a, b], None, Some(&nodes));
-    assert!(!r.is_pass(), "cgroup-aggregate locality 0.5 < 0.8 must fail");
+    assert!(
+        !r.is_pass(),
+        "cgroup-aggregate locality 0.5 < 0.8 must fail"
+    );
 }

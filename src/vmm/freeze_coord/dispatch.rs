@@ -472,10 +472,9 @@ pub(super) fn dispatch_bulk_message(
             // guest-memory-size + width-alignment invariants before
             // invoking `gmem.write_obj` / `gmem.read_obj`.
             if msg.crc_ok
-                && let Ok(mut req) =
-                    postcard::from_bytes::<crate::vmm::wire::KernelOpRequestPayload>(
-                        &msg.payload[..],
-                    )
+                && let Ok(mut req) = postcard::from_bytes::<crate::vmm::wire::KernelOpRequestPayload>(
+                    &msg.payload[..],
+                )
             {
                 // String::truncate panics if the cut lands inside
                 // a multi-byte UTF-8 sequence. Any input string

@@ -598,7 +598,6 @@ fn scenario_failure_dump_renders_capture_modules(
     let json = match std::fs::read_to_string(&dump_path) {
         Ok(s) => s,
         Err(e) => {
-            
             result.record_fail(ktstr::assert::AssertDetail::new(
                 ktstr::assert::DetailKind::Other,
                 format!(
@@ -859,7 +858,6 @@ fn scenario_failure_dump_renders_probe_counters(
     let json = match std::fs::read_to_string(&dump_path) {
         Ok(s) => s,
         Err(e) => {
-            
             result.record_fail(ktstr::assert::AssertDetail::new(
                 ktstr::assert::DetailKind::Other,
                 format!(

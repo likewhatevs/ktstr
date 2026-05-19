@@ -199,7 +199,6 @@ fn scenario_cast_analysis_chases_kernel_kptr(ctx: &ktstr::scenario::Ctx) -> Resu
     let json = match std::fs::read_to_string(&dump_path) {
         Ok(s) => s,
         Err(e) => {
-            
             result.record_fail(ktstr::assert::AssertDetail::new(
                 ktstr::assert::DetailKind::Other,
                 format!(
@@ -685,7 +684,6 @@ fn scenario_cast_analysis_chases_bss_to_arena(ctx: &ktstr::scenario::Ctx) -> Res
     let json = match std::fs::read_to_string(&dump_path) {
         Ok(s) => s,
         Err(e) => {
-            
             result.record_fail(ktstr::assert::AssertDetail::new(
                 ktstr::assert::DetailKind::Other,
                 format!(
@@ -1051,7 +1049,6 @@ fn scenario_cast_analysis_sdt_alloc_bridge_resolves_fwd(
     let json = match std::fs::read_to_string(&dump_path) {
         Ok(s) => s,
         Err(e) => {
-            
             result.record_fail(ktstr::assert::AssertDetail::new(
                 ktstr::assert::DetailKind::Other,
                 format!(
@@ -1361,7 +1358,6 @@ fn scenario_cast_analysis_cross_subprog_arena_chase(
     let json = match std::fs::read_to_string(&dump_path) {
         Ok(s) => s,
         Err(e) => {
-            
             result.record_fail(ktstr::assert::AssertDetail::new(
                 ktstr::assert::DetailKind::Other,
                 format!(

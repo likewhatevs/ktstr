@@ -209,7 +209,13 @@ fn claim_ne_pass_and_fail() {
     claim!(v, flag_fail).ne(1);
     let r = v.into_result();
     assert!(r.is_fail());
-    assert!(r.failure_details().next().unwrap().message.contains("flag_fail"));
+    assert!(
+        r.failure_details()
+            .next()
+            .unwrap()
+            .message
+            .contains("flag_fail")
+    );
     assert!(r.failure_details().next().unwrap().message.contains("!="));
 }
 
@@ -225,8 +231,20 @@ fn claim_at_least_boundary_is_inclusive() {
     claim!(v, counter).at_least(100);
     let r = v.into_result();
     assert!(r.is_fail());
-    assert!(r.failure_details().next().unwrap().message.contains("at least 100"));
-    assert!(r.failure_details().next().unwrap().message.contains("counter"));
+    assert!(
+        r.failure_details()
+            .next()
+            .unwrap()
+            .message
+            .contains("at least 100")
+    );
+    assert!(
+        r.failure_details()
+            .next()
+            .unwrap()
+            .message
+            .contains("counter")
+    );
 }
 
 #[test]
@@ -241,7 +259,13 @@ fn claim_at_most_boundary_is_inclusive() {
     claim!(v, counter).at_most(100);
     let r = v.into_result();
     assert!(r.is_fail());
-    assert!(r.failure_details().next().unwrap().message.contains("at most 100"));
+    assert!(
+        r.failure_details()
+            .next()
+            .unwrap()
+            .message
+            .contains("at most 100")
+    );
 }
 
 #[test]
@@ -256,7 +280,13 @@ fn claim_lt_strict_upper_bound() {
     claim!(v, x).lt(100);
     let r = v.into_result();
     assert!(r.is_fail());
-    assert!(r.failure_details().next().unwrap().message.contains("less than 100"));
+    assert!(
+        r.failure_details()
+            .next()
+            .unwrap()
+            .message
+            .contains("less than 100")
+    );
 }
 
 #[test]
@@ -271,7 +301,13 @@ fn claim_gt_strict_lower_bound() {
     claim!(v, x).gt(100);
     let r = v.into_result();
     assert!(r.is_fail());
-    assert!(r.failure_details().next().unwrap().message.contains("greater than 100"));
+    assert!(
+        r.failure_details()
+            .next()
+            .unwrap()
+            .message
+            .contains("greater than 100")
+    );
 }
 
 #[test]
@@ -290,7 +326,13 @@ fn claim_between_inclusive_on_both_ends() {
     claim!(v, below).between(10, 20);
     let r = v.into_result();
     assert!(r.is_fail());
-    assert!(r.failure_details().next().unwrap().message.contains("[10, 20]"));
+    assert!(
+        r.failure_details()
+            .next()
+            .unwrap()
+            .message
+            .contains("[10, 20]")
+    );
 }
 
 #[test]
@@ -314,7 +356,10 @@ fn claim_kind_override_is_persisted_to_detail() {
     claim!(v, p99).kind(DetailKind::Benchmark).at_most(1000);
     let r = v.into_result();
     assert!(r.is_fail());
-    assert_eq!(r.failure_details().next().unwrap().kind, DetailKind::Benchmark);
+    assert_eq!(
+        r.failure_details().next().unwrap().kind,
+        DetailKind::Benchmark
+    );
 }
 
 #[test]
@@ -357,7 +402,13 @@ fn claim_is_finite_fails_for_nan_and_infinities() {
         claim!(v, x).is_finite();
         let r = v.into_result();
         assert!(!r.is_pass(), "{v_val} must fail is_finite");
-        assert!(r.failure_details().next().unwrap().message.contains("expected finite"));
+        assert!(
+            r.failure_details()
+                .next()
+                .unwrap()
+                .message
+                .contains("expected finite")
+        );
     }
 }
 
@@ -375,7 +426,13 @@ fn claim_near_inclusive_at_tolerance_boundary() {
     claim!(v, outside).near(1.0, 0.001);
     let r = v.into_result();
     assert!(r.is_fail());
-    assert!(r.failure_details().next().unwrap().message.contains("near 1"));
+    assert!(
+        r.failure_details()
+            .next()
+            .unwrap()
+            .message
+            .contains("near 1")
+    );
 }
 
 #[test]
@@ -460,10 +517,14 @@ fn verdict_per_claim_kind_override_routes_to_detail() {
         .at_least(0.9);
     let r = v.into_result();
     assert!(r.is_fail());
-    let bench = r.failure_details().find(|d| matches!(d.kind, DetailKind::Benchmark))
+    let bench = r
+        .failure_details()
+        .find(|d| matches!(d.kind, DetailKind::Benchmark))
         .expect("Benchmark kind must propagate");
     assert!(bench.message.contains("p99"));
-    let loc = r.failure_details().find(|d| matches!(d.kind, DetailKind::PageLocality))
+    let loc = r
+        .failure_details()
+        .find(|d| matches!(d.kind, DetailKind::PageLocality))
         .expect("PageLocality kind must propagate");
     assert!(loc.message.contains("locality"));
 }
@@ -475,7 +536,7 @@ fn verdict_merge_folds_in_external_assert_result() {
     claim!(v, a).at_least(50); // pass
 
     let mut external = AssertResult::pass();
-    
+
     external.record_fail(AssertDetail::new(DetailKind::Starved, "tid 7 starved"));
     v.merge(external);
 
@@ -542,8 +603,20 @@ fn claim_against_cgroup_stats_via_derived_accessors() {
     cg.claim_max_gap_ms(&mut v).at_most(10); // 50 > 10 → fail
     let r = v.into_result();
     assert!(r.is_fail());
-    assert!(r.failure_details().next().unwrap().message.contains("max_gap_ms"));
-    assert!(r.failure_details().next().unwrap().message.contains("at most 10"));
+    assert!(
+        r.failure_details()
+            .next()
+            .unwrap()
+            .message
+            .contains("max_gap_ms")
+    );
+    assert!(
+        r.failure_details()
+            .next()
+            .unwrap()
+            .message
+            .contains("at most 10")
+    );
 }
 
 #[test]

@@ -521,7 +521,11 @@ fn scx_sched_state_healthy_exit_kind_claim() {
     crate::claim!(v, healthy.bypass_depth).eq(0);
     crate::claim!(v, healthy.exit_kind).eq(0u32);
     let r = v.into_result();
-    assert!(r.is_pass(), "healthy-state claims must pass: {:?}", r.outcomes);
+    assert!(
+        r.is_pass(),
+        "healthy-state claims must pass: {:?}",
+        r.outcomes
+    );
 
     // Inverse: an aborting scheduler with non-zero exit_kind
     // must fail the same claim sequence.

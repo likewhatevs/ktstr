@@ -1313,8 +1313,7 @@ impl KtstrVm {
         // consumer should use a literal 0 for KASLR-off semantics.
         let kern_virt_kaslr: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let kern_virt_kaslr_evt =
-            Arc::new(EventFd::new(0).expect("eventfd for kern_virt_kaslr"));
+        let kern_virt_kaslr_evt = Arc::new(EventFd::new(0).expect("eventfd for kern_virt_kaslr"));
         // Link-time KVAs from vmlinux for the two virt-KASLR
         // derivation paths. Resolved once here so both the dispatch
         // sinks (the KERN_ADDRS arm subtracts `_text` to derive)
@@ -10779,10 +10778,8 @@ impl KtstrVm {
             #[cfg(target_arch = "x86_64")]
             if entry_syscall_64_link_kva != 0
                 && kern_virt_kaslr_shared.load(Ordering::Acquire) == 0
-                && let Ok(offset) = crate::vmm::x86_64::msr_kaslr::read_and_derive(
-                    bsp,
-                    entry_syscall_64_link_kva,
-                )
+                && let Ok(offset) =
+                    crate::vmm::x86_64::msr_kaslr::read_and_derive(bsp, entry_syscall_64_link_kva)
             {
                 let _ = kern_virt_kaslr_shared.compare_exchange(
                     0,
@@ -12022,8 +12019,7 @@ mod kvm_clock_save_semantics_tests {
 
     #[test]
     fn take_yields_value_once_then_none() {
-        let save: std::cell::RefCell<Option<kvm_clock_data>> =
-            std::cell::RefCell::new(None);
+        let save: std::cell::RefCell<Option<kvm_clock_data>> = std::cell::RefCell::new(None);
         let captured = kvm_clock_data {
             clock: 12345,
             flags: kvm_bindings::KVM_CLOCK_REALTIME,
@@ -12046,8 +12042,7 @@ mod kvm_clock_save_semantics_tests {
 
     #[test]
     fn skip_freeze_path_yields_none_without_write() {
-        let save: std::cell::RefCell<Option<kvm_clock_data>> =
-            std::cell::RefCell::new(None);
+        let save: std::cell::RefCell<Option<kvm_clock_data>> = std::cell::RefCell::new(None);
         assert!(
             save.borrow_mut().take().is_none(),
             "skip-freeze path means no capture → take() must yield None"

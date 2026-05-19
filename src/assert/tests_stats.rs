@@ -138,7 +138,7 @@ fn is_skipped_false_for_pass_result() {
 #[test]
 fn is_skipped_false_for_fail_result() {
     let mut r = AssertResult::pass();
-    
+
     r.record_fail(AssertDetail::new(DetailKind::Starved, "worker starved"));
     assert!(
         !r.is_skipped(),
@@ -165,7 +165,10 @@ fn assert_result_skip_carries_reason() {
     assert!(r.is_skip());
     assert!(!r.is_pass(), "skip is not a pass");
     assert_eq!(r.outcomes.len(), 1);
-    assert_eq!(r.skip_reasons().next().unwrap().message, "topology too small");
+    assert_eq!(
+        r.skip_reasons().next().unwrap().message,
+        "topology too small"
+    );
 }
 
 #[test]

@@ -2235,15 +2235,12 @@ fn evaluate_vm_result(
         // because those tests instrument the framework rather
         // than depending on it. Within evaluate_vm_result the
         // drain is the final consumer.
-        let drained_for_phases =
-            result.snapshot_bridge.drain_ordered_with_stats();
-        let sample_series_for_phases =
-            crate::scenario::sample::SampleSeries::from_drained_typed(
-                drained_for_phases,
-                result.monitor.clone(),
-            );
-        check_result.stats.phases =
-            crate::assert::build_phase_buckets(&sample_series_for_phases);
+        let drained_for_phases = result.snapshot_bridge.drain_ordered_with_stats();
+        let sample_series_for_phases = crate::scenario::sample::SampleSeries::from_drained_typed(
+            drained_for_phases,
+            result.monitor.clone(),
+        );
+        check_result.stats.phases = crate::assert::build_phase_buckets(&sample_series_for_phases);
 
         return Ok(check_result);
     }

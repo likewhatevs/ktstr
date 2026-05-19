@@ -106,7 +106,6 @@ fn validation_wake_chain_pipe_populates_wake_latencies(ctx: &Ctx) -> Result<Asse
 
     let total_samples: usize = reports.iter().map(|r| r.wake_latencies_ns.len()).sum();
     if total_samples == 0 {
-        
         result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
@@ -161,7 +160,6 @@ fn validation_futex_ping_pong_populates_wake_latencies(ctx: &Ctx) -> Result<Asse
 
     let mut result = AssertResult::pass();
     if reports.len() != 2 {
-        
         result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
@@ -175,7 +173,6 @@ fn validation_futex_ping_pong_populates_wake_latencies(ctx: &Ctx) -> Result<Asse
 
     let total_samples: usize = reports.iter().map(|r| r.wake_latencies_ns.len()).sum();
     if total_samples == 0 {
-        
         result.record_fail(AssertDetail::new(
             DetailKind::Other,
             "FutexPingPong captured zero wake_latencies_ns samples — \
@@ -188,7 +185,6 @@ fn validation_futex_ping_pong_populates_wake_latencies(ctx: &Ctx) -> Result<Asse
 
     for r in &reports {
         if r.work_units == 0 {
-            
             result.record_fail(AssertDetail::new(
                 DetailKind::Other,
                 format!(
@@ -244,7 +240,6 @@ fn validation_mutex_contention_populates_iterations(ctx: &Ctx) -> Result<AssertR
 
     let mut result = AssertResult::pass();
     if reports.len() != 4 {
-        
         result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
@@ -258,7 +253,6 @@ fn validation_mutex_contention_populates_iterations(ctx: &Ctx) -> Result<AssertR
 
     let total_iters: u64 = reports.iter().map(|r| r.iterations).sum();
     if total_iters == 0 {
-        
         result.record_fail(AssertDetail::new(
             DetailKind::Other,
             "MutexContention reported zero total iterations — every \
@@ -273,7 +267,6 @@ fn validation_mutex_contention_populates_iterations(ctx: &Ctx) -> Result<AssertR
 
     for r in &reports {
         if r.work_units == 0 {
-            
             result.record_fail(AssertDetail::new(
                 DetailKind::Other,
                 format!(
@@ -326,7 +319,6 @@ fn validation_page_fault_churn_populates_iterations(ctx: &Ctx) -> Result<AssertR
 
     let mut result = AssertResult::pass();
     if reports.len() != 2 {
-        
         result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
@@ -339,7 +331,6 @@ fn validation_page_fault_churn_populates_iterations(ctx: &Ctx) -> Result<AssertR
 
     let total_iters: u64 = reports.iter().map(|r| r.iterations).sum();
     if total_iters == 0 {
-        
         result.record_fail(AssertDetail::new(
             DetailKind::Other,
             "PageFaultChurn reported zero total iterations — the cold \
@@ -352,7 +343,6 @@ fn validation_page_fault_churn_populates_iterations(ctx: &Ctx) -> Result<AssertR
 
     for r in &reports {
         if r.work_units == 0 {
-            
             result.record_fail(AssertDetail::new(
                 DetailKind::Other,
                 format!(
@@ -414,7 +404,6 @@ fn validation_bursty_populates_iterations(ctx: &Ctx) -> Result<AssertResult> {
 
     let mut result = AssertResult::pass();
     if reports.len() != 1 {
-        
         result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
@@ -427,7 +416,6 @@ fn validation_bursty_populates_iterations(ctx: &Ctx) -> Result<AssertResult> {
 
     let r = &reports[0];
     if r.iterations < 2 {
-        
         result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
@@ -441,7 +429,6 @@ fn validation_bursty_populates_iterations(ctx: &Ctx) -> Result<AssertResult> {
         return Ok(result);
     }
     if r.work_units == 0 {
-        
         result.record_fail(AssertDetail::new(
             DetailKind::Other,
             "Bursty reported zero work_units — the burst phase never \

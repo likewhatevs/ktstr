@@ -511,7 +511,9 @@ impl KtstrKvm {
 /// watchdog (`pvclock_touch_watchdogs` in
 /// `arch/x86/kernel/pvclock.c`) skips the freeze interval and
 /// does not fire on long freezes.
-pub(crate) fn kvm_get_clock_via_raw_fd(vm_fd: i32) -> std::io::Result<kvm_bindings::kvm_clock_data> {
+pub(crate) fn kvm_get_clock_via_raw_fd(
+    vm_fd: i32,
+) -> std::io::Result<kvm_bindings::kvm_clock_data> {
     // KVMIO | 0x7c, ioctl_ior_nr! per kvm-ioctls 0.24.0
     // kvm_ioctls.rs:109. `kvm_clock_data` size is 8 (clock) +
     // 4 (flags) + 4 (pad0) + 8 (realtime) + 8 (host_tsc) + 4*4

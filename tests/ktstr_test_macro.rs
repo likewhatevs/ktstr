@@ -98,9 +98,7 @@ fn resolve_func_ip_known_symbol(ctx: &Ctx) -> Result<AssertResult> {
     {
         return Ok(AssertResult::pass());
     }
-    Ok(AssertResult::fail_msg(format!(
-        "schedule address: {ip:?}"
-    )))
+    Ok(AssertResult::fail_msg(format!("schedule address: {ip:?}")))
 }
 
 /// Check that find_test can locate registered entries.

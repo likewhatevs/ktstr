@@ -15,7 +15,10 @@ fn assert_benchmarks_empty_reports() {
     // supplied here cannot be evaluated against zero signal — a
     // silent pass would mask a broken run.
     let r = assert_benchmarks(&[], Some(1000), Some(0.5), Some(100.0));
-    assert!(!r.is_fail(), "empty-reports skip must not surface as failure");
+    assert!(
+        !r.is_fail(),
+        "empty-reports skip must not surface as failure"
+    );
     assert!(r.is_skip(), "no reports must surface as skipped");
     assert!(!r.is_pass(), "skip is not pass");
     let skip_reasons: Vec<&AssertDetail> = r.skip_reasons().collect();
@@ -469,5 +472,9 @@ fn assert_throughput_parity_all_zero_cpu_time_passes_without_cv() {
     a.cpu_time_ns = 0;
     b.cpu_time_ns = 0;
     let r = assert_throughput_parity(&[a, b], None, None);
-    assert!(r.is_pass(), "no CV configured → no failure: {:?}", r.outcomes);
+    assert!(
+        r.is_pass(),
+        "no CV configured → no failure: {:?}",
+        r.outcomes
+    );
 }

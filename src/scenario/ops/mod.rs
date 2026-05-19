@@ -2732,9 +2732,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 // loop publishes via `Release` just before
                 // `run_step`; `Acquire` here pairs with that store
                 // for a happens-after on Step state setup.
-                let phase = ctx
-                    .current_step
-                    .load(std::sync::atomic::Ordering::Acquire);
+                let phase = ctx.current_step.load(std::sync::atomic::Ordering::Acquire);
                 let invoked = crate::scenario::snapshot::with_active_bridge(|b| {
                     let captured = b.capture_with_step(name, phase);
                     if captured {
@@ -4341,14 +4339,16 @@ mod tests {
              got passed=true with details: {:?}",
             result.outcomes,
         );
-        let sched_died_details: Vec<_> = result.failure_details().filter(|d| {
-            matches!(
-                d.kind,
-                crate::assert::DetailKind::SchedulerCrashed
-                    | crate::assert::DetailKind::SchedulerExitedCleanly
-                    | crate::assert::DetailKind::SchedulerDiedUnknownReason
-            )
-        })
+        let sched_died_details: Vec<_> = result
+            .failure_details()
+            .filter(|d| {
+                matches!(
+                    d.kind,
+                    crate::assert::DetailKind::SchedulerCrashed
+                        | crate::assert::DetailKind::SchedulerExitedCleanly
+                        | crate::assert::DetailKind::SchedulerDiedUnknownReason
+                )
+            })
             .collect();
         assert_eq!(
             sched_died_details.len(),
@@ -4445,10 +4445,12 @@ mod tests {
              passed=true with details: {:?}",
             result.outcomes,
         );
-        let other_details: Vec<_> = result.failure_details().filter(|d| {
-            matches!(d.kind, crate::assert::DetailKind::Other)
-                && d.message.contains("injected SetCpuset error mid-iteration")
-        })
+        let other_details: Vec<_> = result
+            .failure_details()
+            .filter(|d| {
+                matches!(d.kind, crate::assert::DetailKind::Other)
+                    && d.message.contains("injected SetCpuset error mid-iteration")
+            })
             .collect();
         assert_eq!(
             other_details.len(),
@@ -10936,8 +10938,7 @@ mod kernel_op_dispatch_tests {
         // OrU32 to wire-side U32 or OrU64 (had one existed) would
         // silently lose the RMW intent at the dispatcher and
         // either drop the OR or corrupt the adjacent field.
-        let or_val: crate::vmm::wire::KernelOpValue =
-            (&KernelValue::or_u32(1 << 5)).into();
+        let or_val: crate::vmm::wire::KernelOpValue = (&KernelValue::or_u32(1 << 5)).into();
         assert_eq!(or_val, crate::vmm::wire::KernelOpValue::OrU32(1 << 5));
         // Edge mask values per tester pass-1 spec: degenerate
         // zero mask (a tempting wrong-optimization to skip the OR
@@ -10946,11 +10947,9 @@ mod kernel_op_dispatch_tests {
         // route through OrU32 wire variant, not U32), and a
         // multi-bit non-power-of-2 mask (catches a regression
         // that treated OrU32 as single-bit-only).
-        let zero_or: crate::vmm::wire::KernelOpValue =
-            (&KernelValue::or_u32(0)).into();
+        let zero_or: crate::vmm::wire::KernelOpValue = (&KernelValue::or_u32(0)).into();
         assert_eq!(zero_or, crate::vmm::wire::KernelOpValue::OrU32(0));
-        let max_or: crate::vmm::wire::KernelOpValue =
-            (&KernelValue::or_u32(u32::MAX)).into();
+        let max_or: crate::vmm::wire::KernelOpValue = (&KernelValue::or_u32(u32::MAX)).into();
         assert_eq!(max_or, crate::vmm::wire::KernelOpValue::OrU32(u32::MAX));
         let multi_bit_or: crate::vmm::wire::KernelOpValue =
             (&KernelValue::or_u32(0xA5A5_A5A5)).into();

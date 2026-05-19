@@ -2760,7 +2760,11 @@ mod tests {
         // a "missing metric" detail from the min check.
         assert_eq!(r.outcomes.len(), 1);
         assert!(
-            r.failure_details().next().unwrap().message.contains("exited with code 42"),
+            r.failure_details()
+                .next()
+                .unwrap()
+                .message
+                .contains("exited with code 42"),
             "details: {:?}",
             r.outcomes
         );
@@ -2780,12 +2784,20 @@ mod tests {
         );
         assert!(r.is_fail());
         assert!(
-            r.failure_details().next().unwrap().message.contains("fatal: config missing"),
+            r.failure_details()
+                .next()
+                .unwrap()
+                .message
+                .contains("fatal: config missing"),
             "stderr tail must appear in detail: {:?}",
             r.outcomes,
         );
         assert!(
-            r.failure_details().next().unwrap().message.contains("stderr:"),
+            r.failure_details()
+                .next()
+                .unwrap()
+                .message
+                .contains("stderr:"),
             "detail must label the stderr block: {:?}",
             r.outcomes,
         );
@@ -2802,7 +2814,11 @@ mod tests {
         assert!(r.is_fail());
         // Empty stderr → no "stderr:" prefix in the detail.
         assert!(
-            !r.failure_details().next().unwrap().message.contains("stderr:"),
+            !r.failure_details()
+                .next()
+                .unwrap()
+                .message
+                .contains("stderr:"),
             "empty stderr must not produce a stderr: block: {:?}",
             r.outcomes,
         );
@@ -3015,7 +3031,11 @@ mod tests {
         let r = evaluate_checks(&checks, &pm, "");
         assert!(r.is_fail());
         assert!(
-            r.failure_details().next().unwrap().message.contains("not found"),
+            r.failure_details()
+                .next()
+                .unwrap()
+                .message
+                .contains("not found"),
             "details: {:?}",
             r.outcomes
         );
@@ -3037,7 +3057,13 @@ mod tests {
         };
         let r = evaluate_checks(&[MetricCheck::min("iops", 100.0)], &pm, "");
         assert!(r.is_fail());
-        assert!(r.failure_details().next().unwrap().message.contains("below minimum"));
+        assert!(
+            r.failure_details()
+                .next()
+                .unwrap()
+                .message
+                .contains("below minimum")
+        );
     }
 
     #[test]
@@ -3056,7 +3082,13 @@ mod tests {
         };
         let r = evaluate_checks(&[MetricCheck::max("lat", 500.0)], &pm, "");
         assert!(r.is_fail());
-        assert!(r.failure_details().next().unwrap().message.contains("exceeds maximum"));
+        assert!(
+            r.failure_details()
+                .next()
+                .unwrap()
+                .message
+                .contains("exceeds maximum")
+        );
     }
 
     #[test]
@@ -3075,7 +3107,13 @@ mod tests {
         };
         let r = evaluate_checks(&[MetricCheck::range("cpu", 0.0, 100.0)], &pm, "");
         assert!(r.is_fail());
-        assert!(r.failure_details().next().unwrap().message.contains("outside"));
+        assert!(
+            r.failure_details()
+                .next()
+                .unwrap()
+                .message
+                .contains("outside")
+        );
     }
 
     /// IEEE 754 makes every comparison against NaN evaluate to
@@ -3104,7 +3142,11 @@ mod tests {
         let r = evaluate_checks(&[MetricCheck::min("iops", 100.0)], &pm, "");
         assert!(!r.is_pass(), "NaN value must fail Min check");
         assert!(
-            r.failure_details().next().unwrap().message.contains("value is NaN"),
+            r.failure_details()
+                .next()
+                .unwrap()
+                .message
+                .contains("value is NaN"),
             "NaN failure must surface the dedicated message: {:?}",
             r.outcomes
         );
@@ -3130,7 +3172,11 @@ mod tests {
         let r = evaluate_checks(&[MetricCheck::max("lat", 500.0)], &pm, "");
         assert!(!r.is_pass(), "NaN value must fail Max check");
         assert!(
-            r.failure_details().next().unwrap().message.contains("value is NaN"),
+            r.failure_details()
+                .next()
+                .unwrap()
+                .message
+                .contains("value is NaN"),
             "NaN failure must surface the dedicated message: {:?}",
             r.outcomes
         );
@@ -3157,7 +3203,11 @@ mod tests {
         let r = evaluate_checks(&[MetricCheck::range("cpu", 0.0, 100.0)], &pm, "");
         assert!(!r.is_pass(), "NaN value must fail Range check");
         assert!(
-            r.failure_details().next().unwrap().message.contains("value is NaN"),
+            r.failure_details()
+                .next()
+                .unwrap()
+                .message
+                .contains("value is NaN"),
             "NaN failure must surface the dedicated message: {:?}",
             r.outcomes
         );
@@ -3236,7 +3286,11 @@ mod tests {
         // The passing check produces no detail; only the failing one
         // shows up. The message must reference the 200 threshold.
         assert!(
-            r.failure_details().next().unwrap().message.contains("below minimum 200"),
+            r.failure_details()
+                .next()
+                .unwrap()
+                .message
+                .contains("below minimum 200"),
             "failing check must cite its threshold: {:?}",
             r.outcomes,
         );

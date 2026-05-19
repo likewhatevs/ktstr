@@ -1734,7 +1734,8 @@ ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
         // Both failures must be visible in the merged details: the
         // host-side at_most claim AND the guest-side Stuck.
         assert!(
-            r.failure_details().any(|d| d.message.contains("at most 5000")),
+            r.failure_details()
+                .any(|d| d.message.contains("at most 5000")),
             "host claim failure missing: {:?}",
             r.outcomes,
         );
@@ -1817,7 +1818,7 @@ ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
     #[test]
     fn format_temporal_assertions_section_empty_without_temporal_details() {
         let mut r = crate::assert::AssertResult::pass();
-        
+
         r.record_fail(AssertDetail::new(DetailKind::Stuck, "tid 7 stuck 2000ms"));
         let s = format_temporal_assertions_section(&r);
         assert!(s.is_empty());
@@ -1827,7 +1828,7 @@ ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
     #[test]
     fn format_temporal_assertions_section_renders_temporal_details() {
         let mut r = crate::assert::AssertResult::pass();
-        
+
         r.record_fail(AssertDetail::new(
             DetailKind::Temporal,
             "counter (nondecreasing): regression at sample periodic_001",

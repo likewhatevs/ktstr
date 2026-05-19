@@ -1974,7 +1974,10 @@ fn neg_tight_imbalance_threshold_catches_mild_imbalance() {
     let v = t.evaluate(&report);
     assert!(!v.passed, "imbalance=1.5 must fail threshold=1.0");
     // Format: "imbalance ratio 1.5 exceeded threshold 1.0 for 2 consecutive samples (ending at sample 2)"
-    let detail = v.failure_details().find(|d| d.contains("imbalance")).unwrap();
+    let detail = v
+        .failure_details()
+        .find(|d| d.contains("imbalance"))
+        .unwrap();
     assert!(detail.contains("ratio"), "must include 'ratio': {detail}");
     assert!(
         detail.contains("exceeded threshold"),
@@ -2045,7 +2048,10 @@ fn neg_tight_dsq_threshold_catches_small_depth() {
     let v = t.evaluate(&report);
     assert!(!v.passed, "dsq_depth=3 must fail threshold=1");
     // Format: "local DSQ depth 3 on cpu0 exceeded threshold 1 for 2 consecutive samples (ending at sample 2)"
-    let detail = v.failure_details().find(|d| d.contains("DSQ depth")).unwrap();
+    let detail = v
+        .failure_details()
+        .find(|d| d.contains("DSQ depth"))
+        .unwrap();
     assert!(detail.contains("3"), "must show depth value: {detail}");
     assert!(detail.contains("cpu0"), "must show CPU number: {detail}");
     assert!(
@@ -2114,7 +2120,9 @@ fn neg_stuck_detection_catches_frozen_rq_clock() {
     };
     let v = t.evaluate(&report);
     assert!(!v.passed, "frozen rq_clock must be detected");
-    let detail = v.failure_details().find(|d| d.contains("rq_clock stall"))
+    let detail = v
+        .failure_details()
+        .find(|d| d.contains("rq_clock stall"))
         .unwrap();
     assert!(detail.contains("cpu0"), "must name frozen CPU: {detail}");
     assert!(
@@ -2180,12 +2188,17 @@ fn neg_combined_imbalance_and_stuck_both_reported() {
     };
     let v = t.evaluate(&report);
     assert!(v.is_fail());
-    let imb = v.failure_details().find(|d| d.contains("imbalance")).unwrap();
+    let imb = v
+        .failure_details()
+        .find(|d| d.contains("imbalance"))
+        .unwrap();
     assert!(
         imb.contains("exceeded threshold 2.0"),
         "imbalance format: {imb}"
     );
-    let stall = v.failure_details().find(|d| d.contains("rq_clock stall"))
+    let stall = v
+        .failure_details()
+        .find(|d| d.contains("rq_clock stall"))
         .unwrap();
     assert!(stall.contains("cpu0"), "stall format: {stall}");
     assert!(
@@ -2683,7 +2696,9 @@ fn neg_fallback_rate_threshold_fires() {
     let v = t.evaluate(&report);
     assert!(!v.passed, "fallback rate must be caught");
     // Format: "fallback rate 200.0/s exceeded threshold 5.0/s for 2 consecutive intervals (ending at sample 2)"
-    let detail = v.failure_details().find(|d| d.contains("fallback rate"))
+    let detail = v
+        .failure_details()
+        .find(|d| d.contains("fallback rate"))
         .unwrap();
     assert!(detail.contains("/s"), "must include rate unit: {detail}");
     assert!(
@@ -2722,7 +2737,9 @@ fn neg_keep_last_rate_threshold_fires() {
     let v = t.evaluate(&report);
     assert!(!v.passed, "keep_last rate must be caught");
     // Format: "keep_last rate .../s exceeded threshold 5.0/s for 2 consecutive intervals ..."
-    let detail = v.failure_details().find(|d| d.contains("keep_last rate"))
+    let detail = v
+        .failure_details()
+        .find(|d| d.contains("keep_last rate"))
         .unwrap();
     assert!(detail.contains("/s"), "must include rate unit: {detail}");
     assert!(

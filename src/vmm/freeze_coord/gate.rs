@@ -107,8 +107,7 @@ mod tests {
         let guard = OnDemandGateGuard::try_acquire(&gate).expect("acquire 1");
         drop(guard);
         assert!(!gate.load(Ordering::Acquire), "gate released by Drop");
-        let _guard2 =
-            OnDemandGateGuard::try_acquire(&gate).expect("acquire 2 after release");
+        let _guard2 = OnDemandGateGuard::try_acquire(&gate).expect("acquire 2 after release");
         assert!(gate.load(Ordering::Acquire), "gate re-held by acquire 2");
     }
 
@@ -121,8 +120,8 @@ mod tests {
         let gate = Arc::new(AtomicBool::new(false));
         let gate_for_catch = gate.clone();
         let result = std::panic::catch_unwind(move || {
-            let _guard = OnDemandGateGuard::try_acquire(&gate_for_catch)
-                .expect("acquire before panic");
+            let _guard =
+                OnDemandGateGuard::try_acquire(&gate_for_catch).expect("acquire before panic");
             panic!("simulated panic mid-critical-section");
         });
         assert!(result.is_err(), "catch_unwind must see the panic");

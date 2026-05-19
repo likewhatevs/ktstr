@@ -1170,7 +1170,6 @@ pub const KERNEL_OP_TAG_MAX: usize = 256;
 /// request_id and the truncated tag.
 pub const KERNEL_OP_REASON_MAX: usize = 256;
 
-
 /// Outcome of a guest-driven kernel-memory op request: the host
 /// returned a reply (caller inspects [`KernelOpReplyPayload::success`])
 /// or the transport failed (port not open, timeout, malformed frame).

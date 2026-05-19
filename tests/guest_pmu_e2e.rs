@@ -284,7 +284,6 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
         // version=0 in the guest is a synthesizer regression —
         // fail the test instead of silently passing.
         if host_likely_has_pmu() {
-            
             result.record_fail(AssertDetail::new(
                 DetailKind::Other,
                 "CPUID leaf 0xA reports version=0 but the host \
@@ -315,7 +314,6 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
 
     // PMU present — assert the synthesized v2 shape.
     if leaf.version != 2 {
-        
         result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
@@ -328,7 +326,6 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
         return Ok(result);
     }
     if leaf.num_gp != 4 {
-        
         result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
@@ -340,7 +337,6 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
         return Ok(result);
     }
     if leaf.gp_width != 48 {
-        
         result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
@@ -352,7 +348,6 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
         return Ok(result);
     }
     if leaf.mask_length != 7 {
-        
         result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
@@ -366,7 +361,6 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
         return Ok(result);
     }
     if leaf.num_fixed != 3 {
-        
         result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
@@ -378,7 +372,6 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
         return Ok(result);
     }
     if leaf.fixed_width != 48 {
-        
         result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
@@ -482,7 +475,7 @@ fn guest_pmu_perf_event_open_counts_instructions(_ctx: &Ctx) -> Result<AssertRes
             }
             PerfOpenResult::Fail(reason) => {
                 let mut result = AssertResult::pass();
-                
+
                 result.record_fail(AssertDetail::new(
                     DetailKind::Other,
                     format!(
@@ -562,7 +555,6 @@ fn guest_pmu_perf_event_open_counts_instructions(_ctx: &Ctx) -> Result<AssertRes
 
     let mut result = AssertResult::pass();
     if count == 0 {
-        
         result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(

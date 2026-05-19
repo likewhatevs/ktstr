@@ -82,7 +82,10 @@ fn assert_result_postcard_roundtrip() {
     measurements.insert("bytes".to_string(), NoteValue::Uint(4096));
     measurements.insert("rate".to_string(), NoteValue::Float(3.15));
     measurements.insert("ok".to_string(), NoteValue::Bool(true));
-    measurements.insert("label".to_string(), NoteValue::Text("benchmark".to_string()));
+    measurements.insert(
+        "label".to_string(),
+        NoteValue::Text("benchmark".to_string()),
+    );
     let r = AssertResult {
         outcomes: vec![
             Outcome::Fail(AssertDetail::new(DetailKind::Other, "fail msg")),
@@ -118,10 +121,16 @@ fn assert_result_postcard_roundtrip() {
     if let Some(NoteValue::Float(f)) = r2.measurements.get("rate") {
         assert!((f - 3.15).abs() < 1e-9);
     } else {
-        panic!("rate must decode to NoteValue::Float, got {:?}", r2.measurements.get("rate"));
+        panic!(
+            "rate must decode to NoteValue::Float, got {:?}",
+            r2.measurements.get("rate")
+        );
     }
     assert_eq!(r2.measurements.get("ok"), Some(&NoteValue::Bool(true)));
-    assert_eq!(r2.measurements.get("label"), Some(&NoteValue::Text("benchmark".to_string())));
+    assert_eq!(
+        r2.measurements.get("label"),
+        Some(&NoteValue::Text("benchmark".to_string()))
+    );
 }
 
 /// Strict-type rejection on `Assert` deserialize. The serde
@@ -324,16 +333,13 @@ fn assert_result_missing_required_field_rejected_by_deserialize() {
     // has no `Default` derive and no `#[serde(default)]` on any
     // field). Loop over each; each removal must fail deserialize
     // with a missing-field error naming the removed field.
-    const REQUIRED_FIELDS: &[&str] = &[
-        "outcomes",
-        "passes",
-        "stats",
-        "measurements",
-        "info_notes",
-    ];
+    const REQUIRED_FIELDS: &[&str] = &["outcomes", "passes", "stats", "measurements", "info_notes"];
 
     let r = AssertResult {
-        outcomes: vec![Outcome::Fail(AssertDetail::new(DetailKind::Other, "detail"))],
+        outcomes: vec![Outcome::Fail(AssertDetail::new(
+            DetailKind::Other,
+            "detail",
+        ))],
         passes: vec![],
         stats: ScenarioStats::default(),
         measurements: std::collections::BTreeMap::new(),
@@ -402,8 +408,8 @@ fn assert_reproducer_matcher_fields_serde_skip_bypass() {
         "constructed value must carry the regex matcher",
     );
 
-    let json = serde_json::to_string(&with_matchers)
-        .expect("Assert with matchers must serialize cleanly");
+    let json =
+        serde_json::to_string(&with_matchers).expect("Assert with matchers must serialize cleanly");
     assert!(
         !json.contains("expect_scx_bpf_error_contains"),
         "serialized JSON must OMIT expect_scx_bpf_error_contains \
@@ -415,8 +421,8 @@ fn assert_reproducer_matcher_fields_serde_skip_bypass() {
          (#[serde(skip)] regressed on serialize side); got: {json}",
     );
 
-    let roundtrip: Assert = serde_json::from_str(&json)
-        .expect("serialized matcher-bearing Assert must deserialize");
+    let roundtrip: Assert =
+        serde_json::from_str(&json).expect("serialized matcher-bearing Assert must deserialize");
     assert_eq!(
         roundtrip.expect_scx_bpf_error_contains, None,
         "deserialized contains matcher must be None — \

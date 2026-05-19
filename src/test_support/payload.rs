@@ -1950,8 +1950,7 @@ mod tests {
             metric_bounds: None,
         };
         let bytes = postcard::to_allocvec(&none_hint).expect("encode None-hint");
-        let back: RawPayloadOutput =
-            postcard::from_bytes(&bytes).expect("decode None-hint");
+        let back: RawPayloadOutput = postcard::from_bytes(&bytes).expect("decode None-hint");
         assert_eq!(back.hint, None);
     }
 }

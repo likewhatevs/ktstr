@@ -1551,7 +1551,10 @@ fn assert_serde_roundtrip_preserves_every_non_skipped_field() {
 /// tooling) would trip at type-check time.
 #[test]
 fn outcome_implements_expected_traits() {
-    fn requires<T: Clone + std::fmt::Debug + PartialEq + Eq + serde::Serialize + serde::de::DeserializeOwned>() {}
+    fn requires<
+        T: Clone + std::fmt::Debug + PartialEq + Eq + serde::Serialize + serde::de::DeserializeOwned,
+    >() {
+    }
     requires::<Outcome>();
 }
 
@@ -1662,7 +1665,11 @@ fn assert_result_outcome_multi_skip_returns_first_payload() {
     let Outcome::Skip(d) = r.outcome() else {
         panic!("expected Skip, got {:?}", r.outcome());
     };
-    assert!(d.message.contains("first"), "first-Skip-wins; got: {}", d.message);
+    assert!(
+        d.message.contains("first"),
+        "first-Skip-wins; got: {}",
+        d.message
+    );
 }
 
 /// `Outcome::as_ref` projection preserves the discriminant +
@@ -1697,7 +1704,10 @@ fn outcome_as_ref_preserves_discriminant_and_payload() {
 #[test]
 fn assert_result_outcome_ref_matches_owned_outcome_shape() {
     // Pass identity: empty stream.
-    assert!(matches!(AssertResult::pass().outcome_ref(), OutcomeRef::Pass));
+    assert!(matches!(
+        AssertResult::pass().outcome_ref(),
+        OutcomeRef::Pass
+    ));
     // Non-empty all-Skip → Skip with first payload.
     let mut all_skip = AssertResult::pass();
     all_skip.record_skip("only-skip");
@@ -1809,7 +1819,10 @@ fn outcome_serde_externally_tagged_roundtrips_via_json_and_postcard() {
     // JSON shape: unit variant serializes as the bare variant
     // name; data variants serialize as `{"<Variant>": {...}}`.
     let pass_json = serde_json::to_string(&Outcome::Pass).unwrap();
-    assert_eq!(pass_json, "\"Pass\"", "Pass must serialize as bare variant name");
+    assert_eq!(
+        pass_json, "\"Pass\"",
+        "Pass must serialize as bare variant name"
+    );
     let fail_json = serde_json::to_string(&Outcome::Fail(d.clone())).unwrap();
     assert!(
         fail_json.starts_with("{\"Fail\":"),

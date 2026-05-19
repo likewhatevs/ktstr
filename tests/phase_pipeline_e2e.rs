@@ -323,12 +323,10 @@ fn assert_phase_pipeline_vacuity(result: &VmResult) -> Result<()> {
     post_vm = assert_phase_pipeline_vacuity,
 )]
 fn phase_pipeline_no_periodic_samples_yields_empty_phases(ctx: &Ctx) -> Result<AssertResult> {
-    let steps = vec![
-        Step {
-            setup: vec![CgroupDef::named("cg_vacuity").workers(2)].into(),
-            ops: vec![],
-            hold: HoldSpec::FULL,
-        },
-    ];
+    let steps = vec![Step {
+        setup: vec![CgroupDef::named("cg_vacuity").workers(2)].into(),
+        ops: vec![],
+        hold: HoldSpec::FULL,
+    }];
     execute_steps(ctx, steps)
 }

@@ -1587,9 +1587,7 @@ impl ScenarioStats {
 /// publicly-drainable `result.snapshot_bridge` — can produce the
 /// same per-phase aggregate shape without re-implementing the
 /// bucketing logic.
-pub fn build_phase_buckets(
-    samples: &crate::scenario::sample::SampleSeries,
-) -> Vec<PhaseBucket> {
+pub fn build_phase_buckets(samples: &crate::scenario::sample::SampleSeries) -> Vec<PhaseBucket> {
     let by_phase = samples.by_phase();
     let mut out: Vec<PhaseBucket> = Vec::with_capacity(by_phase.len());
     for (step_index, samples_in_phase) in by_phase {
@@ -1768,8 +1766,7 @@ impl AssertResult {
     /// [`Outcome::Skip`]. Empty `outcomes` is the Pass identity,
     /// NOT a vacuous Skip — `is_skip()` returns false on empty.
     pub fn is_skip(&self) -> bool {
-        !self.outcomes.is_empty()
-            && self.outcomes.iter().all(|o| matches!(o, Outcome::Skip(_)))
+        !self.outcomes.is_empty() && self.outcomes.iter().all(|o| matches!(o, Outcome::Skip(_)))
     }
 
     /// Iterate every [`Outcome::Fail`]'s payload. Use to extract
@@ -2214,12 +2211,14 @@ impl AssertResult {
                 for o in outcomes {
                     match o {
                         Outcome::Pass => acc.outcomes.push(Outcome::Pass),
-                        Outcome::Fail(d) => acc.outcomes.push(Outcome::Fail(
-                            AssertDetail::new(d.kind, format!("any_of[{idx}]: {}", d.message)),
-                        )),
-                        Outcome::Skip(d) => acc.outcomes.push(Outcome::Skip(
-                            AssertDetail::new(d.kind, format!("any_of[{idx}]: {}", d.message)),
-                        )),
+                        Outcome::Fail(d) => acc.outcomes.push(Outcome::Fail(AssertDetail::new(
+                            d.kind,
+                            format!("any_of[{idx}]: {}", d.message),
+                        ))),
+                        Outcome::Skip(d) => acc.outcomes.push(Outcome::Skip(AssertDetail::new(
+                            d.kind,
+                            format!("any_of[{idx}]: {}", d.message),
+                        ))),
                     }
                 }
                 for n in info_notes {

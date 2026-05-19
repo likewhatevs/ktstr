@@ -370,8 +370,8 @@ fn build_phase_buckets_baseline_only_yields_single_bucket() {
 #[test]
 fn build_phase_buckets_three_phases_round_trip_with_correct_labels() {
     let drained = vec![
-        fixture_entry("periodic_000", 0, 10), // BASELINE
-        fixture_entry("periodic_001", 0, 20), // BASELINE
+        fixture_entry("periodic_000", 0, 10),  // BASELINE
+        fixture_entry("periodic_001", 0, 20),  // BASELINE
         fixture_entry("periodic_002", 1, 100), // Step[0]
         fixture_entry("periodic_003", 1, 200), // Step[0]
         fixture_entry("periodic_004", 1, 300), // Step[0]

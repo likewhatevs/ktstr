@@ -1072,7 +1072,7 @@ pub(crate) enum StatsCommand {
         #[arg(
             long = "phases-only",
             help_heading = "Phase rendering",
-            conflicts_with = "no_phases",
+            conflicts_with = "no_phases"
         )]
         phases_only: bool,
 
@@ -1125,7 +1125,7 @@ pub(crate) enum StatsCommand {
         #[arg(
             long = "phase-threshold",
             help_heading = "Phase rendering",
-            conflicts_with = "no_phases",
+            conflicts_with = "no_phases"
         )]
         phase_threshold: Option<f64>,
     },
@@ -1249,12 +1249,7 @@ mod tests {
     /// before it ships.
     #[test]
     fn compare_phase_flags_phases_only_composes_with_steps_only_and_threshold() {
-        let argv = argv_compare(&[
-            "--phases-only",
-            "--steps-only",
-            "--phase-threshold",
-            "5",
-        ]);
+        let argv = argv_compare(&["--phases-only", "--steps-only", "--phase-threshold", "5"]);
         assert!(
             Cargo::try_parse_from(&argv).is_ok(),
             "--phases-only + --steps-only + --phase-threshold must parse cleanly",
@@ -1268,13 +1263,7 @@ mod tests {
     /// sentinel to the steps-only composition above.
     #[test]
     fn compare_phase_flags_phases_only_composes_with_phase_filter_and_threshold() {
-        let argv = argv_compare(&[
-            "--phases-only",
-            "--phase",
-            "1",
-            "--phase-threshold",
-            "5",
-        ]);
+        let argv = argv_compare(&["--phases-only", "--phase", "1", "--phase-threshold", "5"]);
         assert!(
             Cargo::try_parse_from(&argv).is_ok(),
             "--phases-only + --phase + --phase-threshold must parse cleanly",

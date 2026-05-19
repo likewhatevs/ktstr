@@ -49,13 +49,9 @@ use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::prelude::{KernelOpReplyPayload, KernelOpValue, VmResult};
 use ktstr::scenario::Ctx;
-use ktstr::scenario::ops::{
-    HoldSpec, KernelTarget, KernelValueWidth, Op, Step, execute_steps,
-};
+use ktstr::scenario::ops::{HoldSpec, KernelTarget, KernelValueWidth, Op, Step, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
-use ktstr::workload::{
-    AffinityIntent, SchedPolicy, WorkType, WorkloadConfig, WorkloadHandle,
-};
+use ktstr::workload::{AffinityIntent, SchedPolicy, WorkType, WorkloadConfig, WorkloadHandle};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
@@ -167,13 +163,10 @@ fn assert_clock_advance(result: &VmResult) -> Result<()> {
 }
 
 fn read_u64_tag(replies: &[(String, KernelOpReplyPayload)], tag: &str) -> Result<u64> {
-    let (_t, reply) = replies
-        .iter()
-        .find(|(t, _)| t == tag)
-        .ok_or_else(|| {
-            let tags: Vec<&str> = replies.iter().map(|(t, _)| t.as_str()).collect();
-            anyhow::anyhow!("no reply for tag `{tag}`; captured={tags:?}")
-        })?;
+    let (_t, reply) = replies.iter().find(|(t, _)| t == tag).ok_or_else(|| {
+        let tags: Vec<&str> = replies.iter().map(|(t, _)| t.as_str()).collect();
+        anyhow::anyhow!("no reply for tag `{tag}`; captured={tags:?}")
+    })?;
     anyhow::ensure!(reply.success, "{tag} read rejected: {}", reply.reason);
     match reply.read_values.first() {
         Some(KernelOpValue::U64(v)) => Ok(*v),

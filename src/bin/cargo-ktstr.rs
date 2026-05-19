@@ -47,10 +47,10 @@ mod cli;
 mod kernel;
 #[path = "cargo_ktstr/misc/mod.rs"]
 mod misc;
-#[path = "cargo_ktstr/run_cargo.rs"]
-mod run_cargo;
 #[path = "cargo_ktstr/replay.rs"]
 mod replay;
+#[path = "cargo_ktstr/run_cargo.rs"]
+mod run_cargo;
 #[path = "cargo_ktstr/stats.rs"]
 mod stats;
 #[path = "cargo_ktstr/verifier.rs"]
@@ -119,15 +119,13 @@ fn main() {
             args,
         } => run_cargo::run_llvm_cov(kernel, no_perf_mode, no_skip_mode, args),
         KtstrCommand::Stats { ref command } => stats::run_stats(command),
-        KtstrCommand::Replay { dir, filter, exec } => match replay::run_replay(
-            dir.as_deref(),
-            filter.as_deref(),
-            exec,
-        ) {
-            Ok(0) => Ok(()),
-            Ok(code) => std::process::exit(code),
-            Err(e) => Err(format!("{e:#}")),
-        },
+        KtstrCommand::Replay { dir, filter, exec } => {
+            match replay::run_replay(dir.as_deref(), filter.as_deref(), exec) {
+                Ok(0) => Ok(()),
+                Ok(code) => std::process::exit(code),
+                Err(e) => Err(format!("{e:#}")),
+            }
+        }
         KtstrCommand::Kernel { command } => match command {
             KernelCommand::List { json, range } => match range {
                 Some(r) => {

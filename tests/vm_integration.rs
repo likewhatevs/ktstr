@@ -361,7 +361,6 @@ fn scenario_sched_deadline_real_setattr(ctx: &ktstr::scenario::Ctx) -> Result<As
 
     let mut result = AssertResult::pass();
     if reports.is_empty() {
-        
         result.record_fail(AssertDetail::new(
             DetailKind::Other,
             "SCHED_DEADLINE worker produced no report — sched_setattr likely \
@@ -372,7 +371,6 @@ fn scenario_sched_deadline_real_setattr(ctx: &ktstr::scenario::Ctx) -> Result<As
     }
     let r = &reports[0];
     if !r.completed {
-        
         result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(
@@ -385,7 +383,6 @@ fn scenario_sched_deadline_real_setattr(ctx: &ktstr::scenario::Ctx) -> Result<As
         return Ok(result);
     }
     if r.work_units == 0 {
-        
         result.record_fail(AssertDetail::new(
             DetailKind::Other,
             format!(

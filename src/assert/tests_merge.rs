@@ -92,7 +92,10 @@ fn merge_skip_plus_explicit_pass_demotes_skip() {
     let mut b = AssertResult::pass();
     b.record_pass();
     a.merge(b);
-    assert!(!a.is_skip(), "explicit Pass in the merged stream means not all-Skip");
+    assert!(
+        !a.is_skip(),
+        "explicit Pass in the merged stream means not all-Skip"
+    );
     assert!(a.is_pass(), "explicit Pass + no Fail → is_pass=true");
 }
 
@@ -104,8 +107,11 @@ fn merge_skip_plus_empty_pass_stays_skip() {
     let mut a = AssertResult::skip("optional");
     let b = AssertResult::pass();
     a.merge(b);
-    assert!(a.is_skip(), "empty pass() merges to a no-op; stream stays all-Skip");
-    assert!(!a.is_pass(), "Phase 2b: all-Skip is not pass");
+    assert!(
+        a.is_skip(),
+        "empty pass() merges to a no-op; stream stays all-Skip"
+    );
+    assert!(!a.is_pass(), "all-Skip is not pass");
 }
 
 #[test]
