@@ -1850,17 +1850,26 @@ fn evaluate_vm_result(
         &early_sample_series,
         stimulus_events,
     );
-    // Build timeline from the pre-bucketed phases. None when no
-    // phases (single-phase scenarios with no periodic captures
-    // produce an empty vec) — matches the previous None behavior
-    // for monitor-less results.
-    let timeline = if early_phase_buckets.is_empty() {
-        None
-    } else {
+    // Build timeline from the pre-bucketed phases. When no
+    // PhaseBuckets exist (scenario had no periodic captures,
+    // e.g. single-phase tests) but monitor samples ARE present,
+    // fall back to the legacy Timeline::build path so the
+    // failure-message timeline still renders monitor-derived
+    // metrics. The fallback preserves operator-facing diagnostic
+    // continuity for monitor-only runs — the new from_phase_buckets
+    // path requires snapshot-bridge captures to materialise
+    // PhaseBuckets, which monitor-only runs don't produce.
+    let timeline = if !early_phase_buckets.is_empty() {
         Some(crate::timeline::Timeline::from_phase_buckets(
             &early_phase_buckets,
+            stimulus_events,
             &crate::timeline::TimelineContext::default(),
         ))
+    } else {
+        result
+            .monitor
+            .as_ref()
+            .map(|m| crate::timeline::Timeline::build(stimulus_events, &m.samples))
     };
 
     let sched_label = scheduler_label(&entry.scheduler.binary);
@@ -2281,6 +2290,17 @@ fn evaluate_vm_result(
         // populated as typed fields or by other producers.
         crate::assert::populate_run_ext_metrics(
             sample_series_for_phases,
+            &mut check_result.stats.ext_metrics,
+        );
+        // Sibling fill from per-phase metrics — closes the gap
+        // for avg_imbalance_ratio (MonitorSample-sourced) and
+        // iteration_rate (stimulus-event-sourced). Their
+        // read_sample dispatches return None so the SampleSeries
+        // path above misses them; without this call, those keys
+        // never appear in ext_metrics and cargo ktstr stats
+        // compare silently drops them.
+        crate::assert::populate_run_ext_metrics_from_phases(
+            &check_result.stats.phases,
             &mut check_result.stats.ext_metrics,
         );
 

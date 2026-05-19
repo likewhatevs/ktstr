@@ -402,7 +402,17 @@ impl Op {
         }
     }
 
-    /// Set a cgroup's cpuset.
+    /// Set a cgroup's cpuset mid-step.
+    ///
+    /// **Cgroup must be Backdrop-persistent.** A step-local
+    /// CgroupDef (declared in `step.setup`) tears down at the
+    /// step boundary; rebinding its cpuset in a later step
+    /// races the teardown and writes to a non-existent path
+    /// (ENOENT on `/sys/fs/cgroup/.../cpuset.cpus`). Declare
+    /// the cgroup via `Backdrop::new().push_cgroup(...)` +
+    /// `execute_scenario(ctx, backdrop, steps)` so it lives
+    /// across steps. See `tests/phase_pipeline_e2e.rs::phase_pipeline_per_step_cpuset_differs`
+    /// for the canonical pattern.
     pub fn set_cpuset(cgroup: impl Into<Cow<'static, str>>, cpus: CpusetSpec) -> Self {
         Op::SetCpuset {
             cgroup: cgroup.into(),
@@ -410,7 +420,8 @@ impl Op {
         }
     }
 
-    /// Clear a cgroup's cpuset (allow all CPUs).
+    /// Clear a cgroup's cpuset (allow all CPUs). Same
+    /// Backdrop-persistence requirement as [`Self::set_cpuset`].
     pub fn clear_cpuset(cgroup: impl Into<Cow<'static, str>>) -> Self {
         Op::ClearCpuset {
             cgroup: cgroup.into(),

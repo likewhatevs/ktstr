@@ -503,21 +503,21 @@ impl Timeline {
     /// per-bucket conversion. avg_imbalance + avg_dsq_depth are
     /// supplied by PhaseBucket so the detection runs on the same
     /// fields as the legacy path.
-    // `#[allow(dead_code)]` until the eval.rs wire-through lands.
-    // The constructor is the API surface needed by a future
-    // production caller; tests below pin the conversion contract
-    // so the contract doesn't drift before the wire-through.
-    #[allow(dead_code)]
     pub fn from_phase_buckets(
         phase_buckets: &[crate::assert::PhaseBucket],
+        stimulus_events: &[StimulusEvent],
         _ctx: &TimelineContext,
     ) -> Self {
         let mut sorted: Vec<&crate::assert::PhaseBucket> = phase_buckets.iter().collect();
         sorted.sort_by_key(|b| b.step_index);
+        // Sort stimulus events by elapsed_ms so correlation finds
+        // the closest event for each bucket window deterministically.
+        let mut sorted_events: Vec<&StimulusEvent> = stimulus_events.iter().collect();
+        sorted_events.sort_by_key(|e| e.elapsed_ms);
         let mut phases: Vec<Phase> = sorted
             .into_iter()
             .enumerate()
-            .map(|(idx, b)| phase_from_bucket(idx, b))
+            .map(|(idx, b)| phase_from_bucket(idx, b, &sorted_events))
             .collect();
         // Boundary-change detection — same per-pair diffing logic
         // [`Self::build`] applies. Walks each adjacent (prev, curr)
@@ -616,7 +616,11 @@ impl Timeline {
 /// `stimulus = None`; later phases synthesize a [`StimulusEvent`]
 /// whose label / op_kind come from the bucket label so the
 /// failure-message renderer prints a recognizable phase header.
-fn phase_from_bucket(idx: usize, b: &crate::assert::PhaseBucket) -> Phase {
+fn phase_from_bucket(
+    idx: usize,
+    b: &crate::assert::PhaseBucket,
+    sorted_events: &[&StimulusEvent],
+) -> Phase {
     let duration_s = if b.end_ms > b.start_ms {
         (b.end_ms - b.start_ms) as f64 / 1000.0
     } else {
@@ -656,13 +660,31 @@ fn phase_from_bucket(idx: usize, b: &crate::assert::PhaseBucket) -> Phase {
     let stimulus = if b.step_index == 0 {
         None
     } else {
-        Some(StimulusEvent {
-            elapsed_ms: b.start_ms,
-            label: b.label.clone(),
-            op_kind: None,
-            detail: None,
-            total_iterations: None,
-        })
+        // Correlate with the closest StimulusEvent whose
+        // elapsed_ms falls in [start_ms, end_ms]. Carrying the
+        // real event preserves op_kind + detail in the failure-
+        // message timeline render — `phase_from_bucket`'s prior
+        // synthesis of a placeholder StimulusEvent with op_kind
+        // = None / detail = None produced "Step[N]: ?" headers
+        // that lost the operator-facing per-phase context the
+        // legacy Timeline::build path carried.
+        let correlated = sorted_events.iter().find(|e| {
+            if b.start_ms == b.end_ms {
+                e.elapsed_ms == b.start_ms
+            } else {
+                e.elapsed_ms >= b.start_ms && e.elapsed_ms < b.end_ms
+            }
+        });
+        match correlated {
+            Some(ev) => Some((*ev).clone()),
+            None => Some(StimulusEvent {
+                elapsed_ms: b.start_ms,
+                label: b.label.clone(),
+                op_kind: None,
+                detail: None,
+                total_iterations: None,
+            }),
+        }
     };
     Phase {
         index: idx,
@@ -1721,7 +1743,7 @@ mod tests {
                 metrics: s0_metrics,
             },
         ];
-        let t = Timeline::from_phase_buckets(&buckets, &TimelineContext::default());
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
         assert_eq!(t.phases.len(), 2);
         // Phase 0 (BASELINE) — no stimulus, no metrics.
         assert!(t.phases[0].stimulus.is_none());
@@ -1766,7 +1788,7 @@ mod tests {
             sample_count: 1,
             metrics,
         };
-        let t = Timeline::from_phase_buckets(&[bucket], &TimelineContext::default());
+        let t = Timeline::from_phase_buckets(&[bucket], &[], &TimelineContext::default());
         // Degenerate window (start == end) yields duration_s == 0,
         // so rate divisions stay None rather than producing
         // spurious infinities.
@@ -1807,7 +1829,7 @@ mod tests {
                 metrics: BTreeMap::new(),
             },
         ];
-        let t = Timeline::from_phase_buckets(&buckets, &TimelineContext::default());
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
         assert_eq!(t.phases.len(), 3);
         assert_eq!(t.phases[0].start_ms, 0);
         assert_eq!(t.phases[1].start_ms, 500);

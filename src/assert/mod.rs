@@ -1484,7 +1484,7 @@ pub struct PhaseBucket {
     /// elapsed timestamps).
     pub start_ms: u64,
     /// Phase window end, milliseconds since `run_start`
-    /// (exclusive). `u64::MAX` sentinel when the phase is the
+    /// (inclusive). `u64::MAX` sentinel when the phase is the
     /// trailing window and the scenario ended without a closing
     /// stimulus event — distinguishes "open-ended trailing phase"
     /// from any plausible real timestamp.
@@ -1598,7 +1598,7 @@ impl PhaseBucket {
 /// unregistered metrics to a `PhaseBucket` should add them to
 /// `METRICS` to get the typed merge instead of the fallback.
 fn merge_matched_phase_buckets(a: PhaseBucket, b: PhaseBucket) -> PhaseBucket {
-    debug_assert_eq!(
+    assert_eq!(
         a.step_index, b.step_index,
         "merge_matched_phase_buckets: caller must pair by step_index",
     );
@@ -1778,6 +1778,7 @@ pub struct ScenarioStats {
     /// single-phase case.
     ///
     /// See [`PhaseBucket`] for the per-phase shape.
+    #[serde(default)]
     pub phases: Vec<PhaseBucket>,
 }
 
@@ -1975,12 +1976,95 @@ impl ScenarioStats {
 /// [`crate::stats::aggregate_samples_for_phase`] — Counter folds
 /// last-minus-first, Gauge variants fold per their `GaugeAgg`,
 /// Peak folds max, Timestamp folds last.
+/// Sibling of [`populate_run_ext_metrics`] that mines per-phase
+/// metrics back into the run-level `ext_metrics` map. Closes the
+/// gap for registered metrics whose values live in
+/// `PhaseBucket.metrics` but never reach `ext_metrics` via the
+/// SampleSeries path (their `read_sample` returns `None`):
+/// `avg_imbalance_ratio` (sourced from MonitorSample windowing
+/// inside `build_phase_buckets`) and `iteration_rate` (sourced
+/// from stimulus event totals inside
+/// `build_phase_buckets_with_stimulus`).
+///
+/// Cross-phase fold dispatches on the metric's `MetricKind` via
+/// `aggregate_samples` with per-phase `sample_count` as the
+/// weight — Gauge(Avg) keys get the weighted mean (correct
+/// cross-phase semantic for typical-load metrics), other kinds
+/// fold per their natural reduction. Existing keys in `target`
+/// are not overwritten — `read_sample` path values win when
+/// both produced an entry.
+///
+/// Without this fill, `cargo ktstr stats compare` silently
+/// misses avg_imbalance_ratio + iteration_rate in flat-row
+/// output because `MetricDef::read` falls back to ext_metrics
+/// and finds nothing.
+pub fn populate_run_ext_metrics_from_phases(
+    phases: &[PhaseBucket],
+    target: &mut std::collections::BTreeMap<String, f64>,
+) {
+    if phases.is_empty() {
+        return;
+    }
+    // Collect every metric key that appears on any phase.
+    let mut keys: std::collections::BTreeSet<&String> = std::collections::BTreeSet::new();
+    for phase in phases {
+        for key in phase.metrics.keys() {
+            keys.insert(key);
+        }
+    }
+    for key in keys {
+        if target.contains_key(key) {
+            continue;
+        }
+        let Some(def) = crate::stats::metric_def(key) else {
+            continue;
+        };
+        // Per-phase (value, sample_count) for the kind-aware fold.
+        // A phase that doesn't carry the key contributes nothing.
+        let mut values: Vec<f64> = Vec::new();
+        let mut weights: Vec<usize> = Vec::new();
+        for phase in phases {
+            if let Some(v) = phase.metrics.get(key).copied() {
+                values.push(v);
+                weights.push(phase.sample_count.max(1));
+            }
+        }
+        if values.is_empty() {
+            continue;
+        }
+        if let Some(reduced) =
+            crate::stats::aggregate_samples(&values, Some(&weights), def.kind)
+        {
+            target.insert(key.clone(), reduced);
+        }
+    }
+}
+
 pub fn populate_run_ext_metrics(
     samples: &crate::scenario::sample::SampleSeries,
     target: &mut std::collections::BTreeMap<String, f64>,
 ) {
+    // Metrics that already have a typed GauntletRow field — the
+    // typed accessor populates them at sidecar_to_row time and
+    // MetricDef::read prefers the accessor over ext_metrics, so
+    // writing the same key into ext_metrics here would create
+    // unread sidecar bloat AND a cross-RUN aggregation drift
+    // class (typed-path arithmetic-mean vs ext-path kind-aware
+    // dispatch can produce different values for the same metric).
+    // Only ext-metrics-only registry entries get populated here.
+    const TYPED_FIELD_NAMES: &[&str] = &[
+        "max_dsq_depth",
+        "total_fallback",
+        "total_keep_last",
+        "stuck_count",
+        "total_iterations",
+        "total_migrations",
+    ];
     for metric_def in crate::stats::METRICS {
         if target.contains_key(metric_def.name) {
+            continue;
+        }
+        if TYPED_FIELD_NAMES.contains(&metric_def.name) {
             continue;
         }
         let readings: Vec<f64> = samples
@@ -2024,13 +2108,21 @@ pub fn build_phase_buckets_with_stimulus(
     let mut buckets = build_phase_buckets(samples);
     // Per-phase iteration_rate from stimulus event total_iterations
     // deltas. Walk events pairwise; for each pair compute the
-    // rate; attribute to the bucket whose window contains the
-    // EARLIER event's timestamp (the rate is measured looking
-    // FORWARD from that event into the phase). Skip pairs where
-    // either side lacks total_iterations.
-    for w in stimulus_events.windows(2) {
-        let prev = &w[0];
-        let curr = &w[1];
+    // rate. Sort events by elapsed_ms first so an out-of-order
+    // arrival from the bulk-port drain doesn't silently lose the
+    // delta to saturating_sub (the legacy Timeline::build path at
+    // src/timeline.rs sorts the same way; without the sort, an
+    // inversion produces duration_ms == 0 → skipped, a silent
+    // drop). Attribute to the bucket containing CURR (the
+    // rate's measurement endpoint — the phase in which the
+    // observed iteration count landed); attributing to PREV
+    // misattributes the rate to the wrong phase when prev / curr
+    // straddle a bucket boundary.
+    let mut sorted_events: Vec<&crate::timeline::StimulusEvent> = stimulus_events.iter().collect();
+    sorted_events.sort_by_key(|e| e.elapsed_ms);
+    for w in sorted_events.windows(2) {
+        let prev = w[0];
+        let curr = w[1];
         let (Some(s), Some(e)) = (prev.total_iterations, curr.total_iterations) else {
             continue;
         };
@@ -2043,15 +2135,21 @@ pub fn build_phase_buckets_with_stimulus(
         }
         let rate = (e - s) as f64 / (duration_ms as f64 / 1000.0);
         // Find the bucket whose [start_ms, end_ms] window contains
-        // prev.elapsed_ms. Buckets are sorted by step_index per
-        // build_phase_buckets; multiple buckets could in principle
-        // contain the same timestamp (windows may overlap on
-        // boundary samples), so attribute to the FIRST match.
+        // curr.elapsed_ms. The single-sample-bucket carve-out
+        // (start_ms == end_ms) requires explicit equality on the
+        // event timestamp — the previous `||` short-circuit
+        // version unconditionally swallowed all events whose
+        // elapsed_ms was >= the bucket's instant, regardless of
+        // boundary. The half-open `< end` matches the
+        // MonitorSample windowing convention so boundary events
+        // don't double-attribute across adjacent buckets.
         for bucket in buckets.iter_mut() {
-            if prev.elapsed_ms >= bucket.start_ms
-                && (bucket.start_ms == bucket.end_ms
-                    || prev.elapsed_ms <= bucket.end_ms)
-            {
+            let in_bucket = if bucket.start_ms == bucket.end_ms {
+                curr.elapsed_ms == bucket.start_ms
+            } else {
+                curr.elapsed_ms >= bucket.start_ms && curr.elapsed_ms < bucket.end_ms
+            };
+            if in_bucket {
                 bucket
                     .metrics
                     .entry("iteration_rate".to_string())
@@ -2119,33 +2217,41 @@ pub fn build_phase_buckets(samples: &crate::scenario::sample::SampleSeries) -> V
                 metrics.insert(metric_def.name.to_string(), reduced);
             }
         }
-        // Per-phase MonitorSample windowing (#81 wire-up for
-        // metrics that need per-CPU full-class rq.nr_running).
-        // Filter monitor samples by elapsed_ms in [start_ms,
-        // end_ms]; compute aggregates that require this axis.
-        // Single-sample-counts phases (start_ms == end_ms) use
-        // an inclusive comparison on both bounds so the window
-        // is not empty.
+        // Per-phase MonitorSample windowing (wire-up for metrics
+        // that need per-CPU full-class rq.nr_running). Half-open
+        // `[start_ms, end_ms)` filter so a MonitorSample whose
+        // elapsed_ms equals the boundary timestamp lands in
+        // exactly one bucket (not both adjacent buckets — the
+        // closed-on-right form double-counted boundary samples).
+        // Single-sample phases (start_ms == end_ms) use explicit
+        // equality so the window is not empty.
+        //
+        // Filters via crate::monitor::sample_looks_valid before
+        // the per-sample reduction so an invalid sample (empty
+        // cpus → imbalance_ratio = 1.0 default per
+        // MonitorSample::imbalance_ratio) doesn't pull the mean
+        // toward "perfect balance" and mask a real regression —
+        // matches the legacy Timeline::build path's filter
+        // discipline.
         let in_window = |ms: u64| -> bool {
             if start_ms == end_ms {
                 ms == start_ms
             } else {
-                ms >= start_ms && ms <= end_ms
+                ms >= start_ms && ms < end_ms
             }
         };
         let phase_monitor_samples: Vec<&crate::monitor::MonitorSample> = monitor_samples
             .iter()
             .filter(|s| in_window(s.elapsed_ms))
+            .filter(|s| crate::monitor::sample_looks_valid(s))
             .collect();
         if !phase_monitor_samples.is_empty()
             && !metrics.contains_key("avg_imbalance_ratio")
         {
             // Mean of MonitorSample::imbalance_ratio() across the
-            // phase window. `imbalance_ratio` is max(nr_running)
-            // / max(1, min(nr_running)) per CPU — the full-class
-            // count (CFS + scx + rt + dl). Empty-sample phases
-            // would have collapsed before this branch via the
-            // is_empty guard above.
+            // valid samples in the phase window. `imbalance_ratio`
+            // is max(nr_running) / max(1, min(nr_running)) per
+            // CPU — the full-class count (CFS + scx + rt + dl).
             let sum: f64 = phase_monitor_samples
                 .iter()
                 .map(|s| s.imbalance_ratio())

@@ -179,6 +179,7 @@ pub enum GaugeAgg {
 /// fold (the "later" sample wins) so the merge uses `end_ms` as
 /// the tiebreaker rather than the operand order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum MergeKind {
     /// The reduction commutes: `merge(a, b) == merge(b, a)`. The
     /// merge folds the two reduced values via the kind's natural
@@ -285,7 +286,19 @@ pub fn aggregate_samples(
             // mirrors `merge_metric_values` at
             // `crate::assert::merge_matched_phase_buckets` per the
             // single-source-of-truth principle for weighted means.
-            let total_weight: usize = finite.iter().map(|(_, w)| *w).sum();
+            //
+            // `checked_add` on the running weight sum so a
+            // pathological caller (huge per-RUN sample counts
+            // across many runs) saturates to MAX rather than
+            // wrapping silently in release. On overflow we
+            // collapse to the unweighted-mean fallback so the
+            // returned value stays plausible — operator-facing
+            // dashboards continue to render rather than emit
+            // garbage.
+            let total_weight: Option<usize> = finite
+                .iter()
+                .try_fold(0usize, |acc, (_, w)| acc.checked_add(*w));
+            let total_weight = total_weight.unwrap_or(0);
             if total_weight == 0 {
                 finite.iter().map(|(x, _)| *x).sum::<f64>() / (finite.len() as f64)
             } else {
@@ -2269,12 +2282,15 @@ pub fn group_and_average_by(
         // Sums across passing+non-skipped contributors only.
         // Counts are tracked per ext_metric key separately because
         // a key may be absent from some contributors.
+        // Per-row sum for mean-fold fields (Counter / Gauge(Last) /
+        // Gauge(Avg) — though no typed Gauge(Avg) field exists
+        // today). Arithmetic mean across runs is the operator-
+        // facing cohort-comparison default; per-RUN totals are
+        // averaged to produce a comparable per-run quantity
+        // across cohorts of different run counts.
         sum_spread: f64,
-        sum_gap_ms: u64,
         sum_migrations: u64,
         sum_migration_ratio: f64,
-        sum_imbalance_ratio: f64,
-        sum_max_dsq_depth: u64,
         sum_stuck_count: usize,
         sum_fallback_count: i64,
         sum_keep_last_count: i64,
@@ -2283,11 +2299,21 @@ pub fn group_and_average_by(
         sum_wake_cv: f64,
         sum_total_iterations: u64,
         sum_mean_run_delay: f64,
-        sum_run_delay: f64,
         sum_tail_ratio: f64,
         sum_iters_per_worker: f64,
         sum_page_locality: f64,
         sum_cross_node_mig: f64,
+        // Per-row MAX-fold for Peak-kind fields. Per
+        // `MetricKind::Peak` contract, cross-RUN aggregation
+        // surfaces the worst-instant observed across the cohort —
+        // averaging Peak across runs dilutes the high-water signal
+        // (a 1-run spike at 100 averaged with 4 runs at 0 reports
+        // 20, hiding the actual peak). MAX preserves "did this
+        // peak ever fire in this cohort".
+        max_gap_ms: u64,
+        max_imbalance_ratio: f64,
+        max_max_dsq_depth: u32,
+        max_run_delay_us: f64,
         // Per-ext-metric (value, weight) pairs, accumulated across
         // contributors. At emit time the kind-aware fold dispatches
         // each key through `aggregate_samples` with `Some(&weights)`
@@ -2301,8 +2327,14 @@ pub fn group_and_average_by(
         // through to the aggregated row's `run_sample_count` so a
         // downstream cross-RUN consumer that further folds these
         // already-aggregated rows can apply the same weighted
-        // semantic. Also weights the typed-field Gauge(Avg) means
-        // (`imbalance_ratio`) at emit time.
+        // semantic. Currently no typed Gauge(Avg) field exists
+        // (imbalance_ratio is registered as `max_imbalance_ratio`
+        // kind=Peak, NOT Gauge(Avg) — the Gauge(Avg) sibling
+        // `avg_imbalance_ratio` lands in ext_metrics where the
+        // weighted-mean dispatch already fires); the sum is
+        // preserved here for future typed-field Gauge(Avg)
+        // additions and for downstream cohort-of-cohort
+        // aggregation that wants a meaningful weight.
         sum_run_sample_count: usize,
     }
 
@@ -2326,11 +2358,8 @@ pub fn group_and_average_by(
                 first_project_base: None,
                 first_kernel_base: None,
                 sum_spread: 0.0,
-                sum_gap_ms: 0,
                 sum_migrations: 0,
                 sum_migration_ratio: 0.0,
-                sum_imbalance_ratio: 0.0,
-                sum_max_dsq_depth: 0,
                 sum_stuck_count: 0,
                 sum_fallback_count: 0,
                 sum_keep_last_count: 0,
@@ -2339,11 +2368,14 @@ pub fn group_and_average_by(
                 sum_wake_cv: 0.0,
                 sum_total_iterations: 0,
                 sum_mean_run_delay: 0.0,
-                sum_run_delay: 0.0,
                 sum_tail_ratio: 0.0,
                 sum_iters_per_worker: 0.0,
                 sum_page_locality: 0.0,
                 sum_cross_node_mig: 0.0,
+                max_gap_ms: 0,
+                max_imbalance_ratio: 0.0,
+                max_max_dsq_depth: 0,
+                max_run_delay_us: 0.0,
                 ext_pairs: BTreeMap::new(),
                 sum_run_sample_count: 0,
             }
@@ -2377,25 +2409,35 @@ pub fn group_and_average_by(
         }
         acc.passes_observed += 1;
         acc.sum_spread += row.spread;
-        acc.sum_gap_ms += row.gap_ms;
-        acc.sum_migrations += row.migrations;
+        acc.sum_migrations = acc.sum_migrations.saturating_add(row.migrations);
         acc.sum_migration_ratio += row.migration_ratio;
-        acc.sum_imbalance_ratio += row.imbalance_ratio;
-        acc.sum_max_dsq_depth += u64::from(row.max_dsq_depth);
-        acc.sum_stuck_count += row.stuck_count;
-        acc.sum_fallback_count += row.fallback_count;
-        acc.sum_keep_last_count += row.keep_last_count;
+        acc.sum_stuck_count = acc.sum_stuck_count.saturating_add(row.stuck_count);
+        acc.sum_fallback_count = acc.sum_fallback_count.saturating_add(row.fallback_count);
+        acc.sum_keep_last_count = acc.sum_keep_last_count.saturating_add(row.keep_last_count);
         acc.sum_p99_wake += row.worst_p99_wake_latency_us;
         acc.sum_median_wake += row.worst_median_wake_latency_us;
         acc.sum_wake_cv += row.worst_wake_latency_cv;
-        acc.sum_total_iterations += row.total_iterations;
+        acc.sum_total_iterations = acc.sum_total_iterations.saturating_add(row.total_iterations);
         acc.sum_mean_run_delay += row.worst_mean_run_delay_us;
-        acc.sum_run_delay += row.worst_run_delay_us;
         acc.sum_tail_ratio += row.worst_wake_latency_tail_ratio;
         acc.sum_iters_per_worker += row.worst_iterations_per_worker;
         acc.sum_page_locality += row.page_locality;
         acc.sum_cross_node_mig += row.cross_node_migration_ratio;
-        acc.sum_run_sample_count += row.run_sample_count;
+        // Peak-kind typed fields: cross-RUN aggregation surfaces
+        // the worst-instant observed across the cohort, NOT the
+        // arithmetic mean (which dilutes a single peak across
+        // many quiet runs and hides the high-water signal).
+        acc.max_gap_ms = acc.max_gap_ms.max(row.gap_ms);
+        if row.imbalance_ratio > acc.max_imbalance_ratio {
+            acc.max_imbalance_ratio = row.imbalance_ratio;
+        }
+        acc.max_max_dsq_depth = acc.max_max_dsq_depth.max(row.max_dsq_depth);
+        if row.worst_run_delay_us > acc.max_run_delay_us {
+            acc.max_run_delay_us = row.worst_run_delay_us;
+        }
+        acc.sum_run_sample_count = acc
+            .sum_run_sample_count
+            .saturating_add(row.run_sample_count);
         for (k, v) in &row.ext_metrics {
             acc.ext_pairs
                 .entry(k.clone())
@@ -2411,14 +2453,13 @@ pub fn group_and_average_by(
             .expect("first-seen key must still be in groups map");
         let n = acc.passes_observed;
         let denom = if n == 0 { 1.0 } else { f64::from(n) };
-        // Rounded mean for integer-typed fields. When n == 0 the
-        // sums are all zero, so dividing by 1.0 still yields 0 —
-        // the aggregate's passed=false routes the pair through
-        // skipped_failed downstream and the metrics are never
-        // consulted.
-        let round_u32 = |sum: u64| -> u32 {
-            (sum as f64 / denom).round().clamp(0.0, f64::from(u32::MAX)) as u32
-        };
+        // Rounded mean for integer-typed Counter / mean-fold
+        // fields. When n == 0 the sums are all zero, so dividing
+        // by 1.0 still yields 0 — the aggregate's passed=false
+        // routes the pair through skipped_failed downstream and
+        // the metrics are never consulted. Peak-kind integer
+        // fields (max_dsq_depth) take the MAX-fold path directly
+        // and don't need a rounding helper.
         let round_u64 = |sum: u64| -> u64 { (sum as f64 / denom).round() as u64 };
         let round_i64 = |sum: i64| -> i64 { (sum as f64 / denom).round() as i64 };
         let round_usize = |sum: usize| -> usize { (sum as f64 / denom).round() as usize };
@@ -2473,11 +2514,15 @@ pub fn group_and_average_by(
             // 1-RUN cohort of 10 samples weighting 10).
             run_sample_count: acc.sum_run_sample_count,
             spread: acc.sum_spread / denom,
-            gap_ms: round_u64(acc.sum_gap_ms),
+            // Peak-kind typed fields: MAX across runs (kind-correct
+            // cross-RUN fold; arithmetic mean dilutes the
+            // worst-instant signal).
+            gap_ms: acc.max_gap_ms,
+            imbalance_ratio: acc.max_imbalance_ratio,
+            max_dsq_depth: acc.max_max_dsq_depth,
+            worst_run_delay_us: acc.max_run_delay_us,
             migrations: round_u64(acc.sum_migrations),
             migration_ratio: acc.sum_migration_ratio / denom,
-            imbalance_ratio: acc.sum_imbalance_ratio / denom,
-            max_dsq_depth: round_u32(acc.sum_max_dsq_depth),
             stuck_count: round_usize(acc.sum_stuck_count),
             fallback_count: round_i64(acc.sum_fallback_count),
             keep_last_count: round_i64(acc.sum_keep_last_count),
@@ -2486,7 +2531,6 @@ pub fn group_and_average_by(
             worst_wake_latency_cv: acc.sum_wake_cv / denom,
             total_iterations: round_u64(acc.sum_total_iterations),
             worst_mean_run_delay_us: acc.sum_mean_run_delay / denom,
-            worst_run_delay_us: acc.sum_run_delay / denom,
             worst_wake_latency_tail_ratio: acc.sum_tail_ratio / denom,
             worst_iterations_per_worker: acc.sum_iters_per_worker / denom,
             page_locality: acc.sum_page_locality / denom,
@@ -8999,11 +9043,14 @@ mod tests {
     }
 
     /// Three passing contributors with the same key are folded
-    /// into a single aggregate carrying the arithmetic mean of
-    /// every metric field. f64 means are exact (modulo IEEE
-    /// rounding); u64/i64 means are rounded to nearest.
+    /// into a single aggregate. Per-MetricKind cross-RUN fold:
+    /// Counter / Gauge(Last) typed fields take the arithmetic
+    /// mean (operator-natural cohort comparison); Peak typed
+    /// fields take the MAX (kind-correct — averaging Peak
+    /// dilutes the worst-instant signal). f64 means are exact
+    /// modulo IEEE rounding; u64/i64 means are rounded.
     #[test]
-    fn group_and_average_multi_pass_arithmetic_mean() {
+    fn group_and_average_multi_pass_kind_aware_fold() {
         let mut a = make_row("t", "tiny-1llc", true, 0.0);
         paint_metrics(&mut a, 10.0, 100, 30, 900);
         let mut b = make_row("t", "tiny-1llc", true, 0.0);
@@ -9017,20 +9064,21 @@ mod tests {
         assert_eq!(ar.total_observed, 3);
         assert!(ar.row.passed);
         assert!(!ar.row.skipped);
-        // f64 mean: (10 + 20 + 30) / 3 = 20.0 exactly.
+        // Gauge(Last) f64 mean: (10 + 20 + 30) / 3 = 20.0.
         assert_eq!(ar.row.spread, 20.0);
-        // u64 rounded mean: (100 + 200 + 300) / 3 = 200.0 exactly.
-        assert_eq!(ar.row.gap_ms, 200);
-        // u64 rounded mean: (30 + 60 + 90) / 3 = 60.
+        // Peak u64 MAX (NOT mean — kind-correct cross-RUN fold).
+        // Was 200 under arithmetic-mean; now 300.
+        assert_eq!(ar.row.gap_ms, 300);
+        // Counter u64 mean: (30 + 60 + 90) / 3 = 60.
         assert_eq!(ar.row.migrations, 60);
-        // u64 rounded mean: (900 + 1100 + 1000) / 3 = 1000.
+        // Counter u64 mean: (900 + 1100 + 1000) / 3 = 1000.
         assert_eq!(ar.row.total_iterations, 1000);
-        // i64 mean for fallback_count: (30 + 60 + 90)/3 = 60.
+        // Counter i64 mean for fallback_count: (30 + 60 + 90)/3 = 60.
         assert_eq!(ar.row.fallback_count, 60);
-        // i64 mean for keep_last_count: (-30 + -60 + -90)/3 = -60.
+        // Counter i64 mean for keep_last_count: (-30 + -60 + -90)/3 = -60.
         assert_eq!(ar.row.keep_last_count, -60);
-        // f64 mean for derived field
-        // worst_p99_wake_latency_us: (20 + 40 + 60)/3 = 40.
+        // Gauge(Last) f64 mean for worst_p99_wake_latency_us:
+        // (20 + 40 + 60)/3 = 40.
         assert_eq!(ar.row.worst_p99_wake_latency_us, 40.0);
     }
 
@@ -9152,10 +9200,13 @@ mod tests {
             !ar.row.passed,
             "any failing contributor must flip the aggregate to passed=false",
         );
-        // Mean of only the passing entries: (10 + 30) / 2 = 20.0.
-        // If the failing row leaked in, this would be ~3346.
+        // Mean of only the passing entries' spread (Gauge(Last)):
+        // (10 + 30) / 2 = 20.0. If the failing row leaked in,
+        // this would be ~3346.
         assert_eq!(ar.row.spread, 20.0);
-        assert_eq!(ar.row.gap_ms, 200);
+        // MAX of only the passing entries' gap_ms (Peak): max(100, 300) = 300.
+        // If the failing row leaked into the max, it'd be 99999.
+        assert_eq!(ar.row.gap_ms, 300);
     }
 
     /// Skipped contributors are excluded from the metric mean
@@ -9187,9 +9238,11 @@ mod tests {
             "skipped aggregate must collapse `passed` to false so compare_rows \
              routes the pair through the skipped_failed gate",
         );
-        // Mean of (pass1, pass2): (10 + 50)/2 = 30.0.
+        // Gauge(Last) mean of (pass1, pass2): (10 + 50)/2 = 30.0.
         assert_eq!(ar.row.spread, 30.0);
-        assert_eq!(ar.row.gap_ms, 300);
+        // Peak MAX of (pass1, pass2) gap_ms: max(100, 500) = 500.
+        // Was 300 under arithmetic-mean.
+        assert_eq!(ar.row.gap_ms, 500);
     }
 
     /// All contributors fail: aggregate has `passes_observed = 0`,
