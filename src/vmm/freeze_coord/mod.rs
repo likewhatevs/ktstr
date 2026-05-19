@@ -7254,8 +7254,61 @@ impl KtstrVm {
                         if periodic_boundaries_ns.is_none()
                             && let Some(workload_d) = workload_duration_for_coord
                         {
-                            let scenario_anchor =
+                            // Anchor selection — preferring guest-stamped
+                            // `MSG_TYPE_SCENARIO_START` over the host's
+                            // own scheduler-attach observation.
+                            //
+                            // Primary: the guest's
+                            // `send_scenario_start` (Phase 5 of
+                            // `vmm::rust_init`) writes
+                            // `MSG_TYPE_SCENARIO_START` over the bulk
+                            // port; the host's `dispatch_bulk_message`
+                            // stamps `scenario_start_ns` on first
+                            // CRC-valid arrival. This is the canonical
+                            // anchor and accounts for any guest-side
+                            // delay between scheduler attach and
+                            // workload-start.
+                            //
+                            // Fallback: a scheduler that breaks the
+                            // bulk port (the sibling-reported
+                            // scx_mitosis cell-mode case where the
+                            // guest never gets to / completes
+                            // send_scenario_start) leaves
+                            // scenario_start_ns at 0 forever and the
+                            // periodic-capture pipeline silently
+                            // 0-fires. Synthesise the anchor from
+                            // the host-monitor-observed scheduler-
+                            // attach elapsed time (encoded in
+                            // `watchdog_reset_ns` as
+                            // `attach_elapsed_ns + workload_duration_ns`
+                            // — see `src/monitor/reader.rs::2515-2525`).
+                            // The derived anchor is the moment the
+                            // host saw `*scx_root` transition to
+                            // non-NULL; that's the earliest meaningful
+                            // workload start we can name without a
+                            // guest signal.
+                            let mut scenario_anchor =
                                 scenario_start_ns_for_coord.load(Ordering::Relaxed);
+                            if scenario_anchor == 0 {
+                                let reset_encoded = watchdog_reset_for_coord
+                                    .load(Ordering::Acquire);
+                                if reset_encoded != 0 {
+                                    let workload_ns = workload_d.as_nanos() as u64;
+                                    scenario_anchor =
+                                        reset_encoded.saturating_sub(workload_ns).max(1);
+                                    tracing::warn!(
+                                        target: "ktstr::failure_dump",
+                                        reset_encoded_ns = reset_encoded,
+                                        workload_ns,
+                                        derived_anchor_ns = scenario_anchor,
+                                        "freeze-coord: scenario_start_ns never \
+                                         stamped (guest's send_scenario_start may \
+                                         have been lost — see periodic-capture \
+                                         pipeline docs); deriving anchor from \
+                                         observed scheduler-attach time"
+                                    );
+                                }
+                            }
                             if scenario_anchor != 0 {
                                 let boundaries = compute_periodic_boundaries_ns(
                                     scenario_anchor,

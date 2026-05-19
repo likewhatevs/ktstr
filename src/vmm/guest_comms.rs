@@ -407,8 +407,39 @@ pub fn send_sched_exit(code: i32) {
 }
 
 /// Send a scenario-start marker.
+///
+/// `MSG_TYPE_SCENARIO_START` is load-bearing: the host's freeze
+/// coordinator gates the entire periodic-capture pipeline on the
+/// first CRC-valid arrival (stamps `scenario_start_ns`, which the
+/// capture loop reads as the anchor for boundary computation). A
+/// silent loss here means `periodic_fired` stays at 0 regardless
+/// of how many boundaries the workload should have crossed — the
+/// failure mode the sibling-Claude mitosis report surfaced.
+///
+/// `send_sys_rdy` already retries until the bulk-port multiport
+/// handshake completes, so by Phase 5 the port is normally
+/// already open. The retry here is belt-and-braces for the rare
+/// case where the cached File handle was invalidated between
+/// `send_sys_rdy` and this call (process restart, fd close from
+/// an unrelated path) — a fresh `try_open_bulk_port` on each
+/// retry recovers transparently. 5 retries × 100 ms = 500 ms
+/// total budget, an order of magnitude under the periodic
+/// capture's typical inter-boundary spacing so retries don't
+/// shift downstream timing measurably.
 pub fn send_scenario_start() {
-    write_msg(MsgType::ScenarioStart.wire_value(), &[]);
+    for attempt in 0..5 {
+        if write_msg(MsgType::ScenarioStart.wire_value(), &[]) {
+            return;
+        }
+        if attempt + 1 < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    tracing::warn!(
+        "send_scenario_start: 5 retries failed — bulk port write never \
+         succeeded; periodic captures will see scenario_anchor=0 and \
+         silently 0-fire"
+    );
 }
 
 /// Send a scenario-end marker. Payload: 8-byte LE u64 elapsed
