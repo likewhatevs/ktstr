@@ -1497,32 +1497,28 @@ pub struct PhaseBucket {
     /// elapsed timestamps).
     pub start_ms: u64,
     /// Phase window end, milliseconds since `run_start`
-    /// (inclusive). `u64::MAX` sentinel when the phase is the
-    /// trailing window and the scenario ended without a closing
-    /// stimulus event — distinguishes "open-ended trailing phase"
-    /// from any plausible real timestamp.
+    /// (inclusive). Set to the last bucketed sample's `elapsed_ms`;
+    /// downstream renderers should not assume the value is closed
+    /// against a stimulus event.
     pub end_ms: u64,
     /// Number of periodic samples bucketed into this phase. Zero
     /// when the phase fired no captures (e.g. BASELINE when the
     /// settle window was shorter than the periodic interval).
     pub sample_count: usize,
-    /// Per-metric phase-aggregated values keyed by
-    /// `crate::stats::MetricDef::name`. Reduction dispatches on
-    /// `crate::stats::MetricKind` — Counter uses last-first
-    /// delta over the phase's samples (cumulative-counter
-    /// semantic), other kinds use `crate::stats::aggregate_samples`
-    /// directly. Missing keys mean the phase carried no finite
+    /// Per-metric phase-aggregated values. See the [`PhaseBucket`]
+    /// struct doc for the registry key source and per-kind reduction
+    /// dispatch; missing keys mean the phase carried no finite
     /// samples for that metric (sentinel-free: `None` from the
     /// reducer surfaces as "key absent" rather than "value 0.0").
     pub metrics: std::collections::BTreeMap<String, f64>,
 }
 
 impl PhaseBucket {
-    /// Look up the phase-aggregated value for `metric_name` (a
-    /// `crate::stats::MetricDef::name`). Returns `None` when the
-    /// phase carried no finite samples for that metric — distinct
-    /// from `Some(0.0)` which means the reducer produced a real
-    /// zero from finite samples.
+    /// Look up the phase-aggregated value for `metric_name` (see
+    /// [`PhaseBucket::metrics`] for the registry source). Returns
+    /// `None` when the phase carried no finite samples for that
+    /// metric — distinct from `Some(0.0)` which means the reducer
+    /// produced a real zero from finite samples.
     pub fn get(&self, metric_name: &str) -> Option<f64> {
         self.metrics.get(metric_name).copied()
     }
@@ -1531,8 +1527,8 @@ impl PhaseBucket {
     /// the bucket's `step_index` + `label` + `sample_count` + the set
     /// of metric keys actually present when the metric is absent. Use
     /// when the caller knows the metric MUST be in the bucket (the
-    /// phase fired samples and the metric is in `crate::stats::METRICS`)
-    /// — the panic message tells the operator whether the cause is
+    /// phase fired samples and the metric is registered — see
+    /// [`PhaseBucket::metrics`]) — the panic message tells the operator whether the cause is
     /// "phase produced no samples" (sample_count of 0) or "metric key
     /// typo" (positive sample_count but the key isn't in `metrics`).
     ///
@@ -1845,14 +1841,12 @@ impl ScenarioStats {
     ///     [`Self::phases`]),
     /// (b) the phase exists but had no finite samples for that
     ///     metric, OR
-    /// (c) `metric` is not a registered `crate::stats::MetricDef::name`
-    ///     (typo case — `is_known_metric` surfaces it).
+    /// (c) `metric` is not a registered metric name (typo case —
+    ///     [`Self::is_known_metric`] surfaces it).
     ///
     /// Sentinel-free: `Some(0.0)` means the reducer produced a
-    /// real zero from finite samples, NOT "missing data".
-    ///
-    /// `metric` matches `crate::stats::MetricDef::name` — see
-    /// `crate::stats::METRICS` for the registered list. When
+    /// real zero from finite samples, NOT "missing data". See
+    /// [`PhaseBucket::metrics`] for the registry source. When
     /// debugging an unexpected `None`, gate the lookup on
     /// [`Self::is_known_metric`] to distinguish typos from absent
     /// data.
@@ -1873,20 +1867,20 @@ impl ScenarioStats {
         self.step(scenario_step_idx).and_then(|p| p.get(metric))
     }
 
-    /// True when `name` matches a registered
-    /// `crate::stats::MetricDef::name` in
-    /// `crate::stats::METRICS`. Use to disambiguate the typo
-    /// None-cause from [`Self::phase_metric`] / [`Self::step_metric`]:
-    /// if the lookup returns `None` and `is_known_metric(name) ==
-    /// false`, the metric name is a typo (caller mistake), not
-    /// missing data (legitimately-absent samples).
+    /// True when `name` matches a registered metric (see
+    /// [`PhaseBucket::metrics`] for the registry source). Use to
+    /// disambiguate the typo None-cause from [`Self::phase_metric`]
+    /// / [`Self::step_metric`]: if the lookup returns `None` and
+    /// `is_known_metric(name) == false`, the metric name is a typo
+    /// (caller mistake), not missing data (legitimately-absent
+    /// samples).
     pub fn is_known_metric(name: &str) -> bool {
         crate::stats::METRICS.iter().any(|m| m.name == name)
     }
 
     /// Iterate the canonical metric names a test author may pass
     /// to [`Self::phase_metric`] / [`Self::step_metric`]. Sourced
-    /// from `crate::stats::METRICS`.
+    /// from the registry referenced by [`PhaseBucket::metrics`].
     ///
     /// Sample usage for an A/B scheduler-swap assertion that
     /// compares every registered metric across two scenario Steps:
@@ -1927,93 +1921,23 @@ impl ScenarioStats {
     }
 }
 
-/// Build per-phase metric buckets from a sample series.
-///
-/// Walks [`crate::scenario::sample::SampleSeries::by_phase`] to
-/// group every stamped sample under its bridge-stamped
-/// `step_index` (NOT re-derived from elapsed-ms windows; the
-/// bridge stamp is authoritative because the capture path knows
-/// the phase it fired from while the time window cannot recover
-/// the phase when stimulus events arrive late or out of order).
-///
-/// For each phase observed (BASELINE under `step_index = 0`,
-/// scenario Steps under `step_index = 1..=N` per the 1-indexed
-/// phase convention) emits one [`PhaseBucket`] with:
-///
-/// * `step_index` -> the bucket's key
-/// * `label` -> `"BASELINE"` for `step_index = 0`,
-///   `"Step[k-1]"` for `step_index = k`
-/// * `start_ms` / `end_ms` -> the first / last sample's
-///   `elapsed_ms`; an open-ended trailing window (no closing
-///   stimulus event) keeps `end_ms = u64::MAX` as a sentinel
-///   distinguishable from any plausible real timestamp
-/// * `sample_count` -> the count of samples that fell into the
-///   bucket
-/// * `metrics` -> per-metric reduction via
-///   `crate::stats::aggregate_samples_for_phase` reading each
-///   sample through `crate::stats::MetricDef::read_sample`.
-///   Metrics whose per-sample reading returns `None` for every
-///   sample in the bucket are omitted entirely (absent ->
-///   "no data") rather than collapsed to `Some(0.0)` (real
-///   zero), preserving the sentinel-free contract on the
-///   resulting [`PhaseBucket::metrics`] map.
-///
-/// Returns an empty `Vec` when the input series is empty (no
-/// samples captured), distinct from a returning a single empty
-/// BASELINE bucket — the former means the periodic-capture path
-/// never fired, the latter means it fired but no metric reading
-/// came back. The phase aggregator wire-in keeps the two cases
-/// observably distinct so the downstream renderer can paint
-/// "test produced no per-phase data" differently from "test
-/// produced phase data but no readable metrics".
-///
-/// Live production caller:
-/// `crate::test_support::eval`-side `evaluate_vm_result` drains
-/// the snapshot bridge, builds a `SampleSeries`, and routes it
-/// through this fn to populate `AssertResult.stats.phases`. The
-/// fn is exposed `pub` (not `pub(crate)`) so out-of-tree consumers
-/// — payload authors writing custom eval paths against the
-/// publicly-drainable `result.snapshot_bridge` — can produce the
-/// same per-phase aggregate shape without re-implementing the
-/// bucketing logic.
-/// Populate cross-RUN aggregate entries for every registered
-/// `crate::stats::MetricDef` whose `read_sample` returns finite
-/// values across the entire sample series. Writes into
-/// `target` (typically `ScenarioStats::ext_metrics`) under the
-/// metric's registry name — the same key the per-phase
-/// [`PhaseBucket::metrics`] uses, so cross-RUN and per-phase
-/// consumers reference the same name.
-///
-/// Existing keys are NOT overwritten — a typed GauntletRow field's
-/// value (populated via the MetricDef accessor at sidecar-write
-/// time) wins on the read path, and this fn fills the gap for
-/// registered metrics that have a `read_sample` wire but no typed
-/// GauntletRow field. Without this fill, `cargo ktstr stats compare`
-/// silently skips the metric (read returns None on both sides;
-/// the EPSILON guard drops the row) per the adversary's
-/// no-silent-drops finding on #17b.
-///
-/// Reduction dispatches per `crate::stats::MetricKind` via
-/// `crate::stats::aggregate_samples_for_phase` — Counter folds
-/// last-minus-first, Gauge variants fold per their `GaugeAgg`,
-/// Peak folds max, Timestamp folds last.
 /// Sibling of [`populate_run_ext_metrics`] that mines per-phase
 /// metrics back into the run-level `ext_metrics` map. Closes the
 /// gap for registered metrics whose values live in
 /// `PhaseBucket.metrics` but never reach `ext_metrics` via the
 /// SampleSeries path (their `read_sample` returns `None`):
 /// `avg_imbalance_ratio` (sourced from MonitorSample windowing
-/// inside `build_phase_buckets`) and `iteration_rate` (sourced
+/// inside [`build_phase_buckets`]) and `iteration_rate` (sourced
 /// from stimulus event totals inside
-/// `build_phase_buckets_with_stimulus`).
+/// [`build_phase_buckets_with_stimulus`]).
 ///
-/// Cross-phase fold dispatches on the metric's `MetricKind` via
-/// `aggregate_samples` with per-phase `sample_count` as the
-/// weight — Gauge(Avg) keys get the weighted mean (correct
-/// cross-phase semantic for typical-load metrics), other kinds
-/// fold per their natural reduction. Existing keys in `target`
-/// are not overwritten — `read_sample` path values win when
-/// both produced an entry.
+/// Per-phase reduction dispatch is described on [`PhaseBucket`];
+/// the cross-phase fold here uses `sample_count` as the weight so
+/// Gauge(Avg) keys get the weighted mean (the correct cross-phase
+/// semantic for typical-load metrics) while other kinds fold per
+/// their natural reduction. Existing keys in `target` are not
+/// overwritten — `read_sample` path values win when both produced
+/// an entry.
 ///
 /// Without this fill, `cargo ktstr stats compare` silently
 /// misses avg_imbalance_ratio + iteration_rate in flat-row
@@ -2062,6 +1986,26 @@ pub fn populate_run_ext_metrics_from_phases(
     }
 }
 
+/// Populate cross-RUN aggregate entries for every registered
+/// `crate::stats::MetricDef` whose `read_sample` returns finite
+/// values across the entire sample series. Writes into
+/// `target` (typically `ScenarioStats::ext_metrics`) under the
+/// metric's registry name — the same key the per-phase
+/// [`PhaseBucket::metrics`] uses, so cross-RUN and per-phase
+/// consumers reference the same name.
+///
+/// Existing keys are NOT overwritten — a typed GauntletRow field's
+/// value (populated via the MetricDef accessor at sidecar-write
+/// time) wins on the read path, and this fn fills the gap for
+/// registered metrics that have a `read_sample` wire but no typed
+/// GauntletRow field. Without this fill, `cargo ktstr stats compare`
+/// silently skips the metric (read returns None on both sides;
+/// the EPSILON guard drops the row).
+///
+/// Per-phase reduction dispatch is described on [`PhaseBucket`];
+/// the cross-RUN fold here uses `crate::stats::aggregate_samples_for_phase`
+/// over the full sample series, with TYPED_FIELD_NAMES gating to
+/// avoid duplicating typed-accessor sources.
 pub fn populate_run_ext_metrics(
     samples: &crate::scenario::sample::SampleSeries,
     target: &mut std::collections::BTreeMap<String, f64>,
@@ -2188,6 +2132,41 @@ pub fn build_phase_buckets_with_stimulus(
     buckets
 }
 
+/// Build per-phase metric buckets from a sample series.
+///
+/// Walks [`crate::scenario::sample::SampleSeries::by_phase`] to
+/// group every stamped sample under its bridge-stamped
+/// `step_index` (NOT re-derived from elapsed-ms windows; the
+/// bridge stamp is authoritative because the capture path knows
+/// the phase it fired from while the time window cannot recover
+/// the phase when stimulus events arrive late or out of order).
+///
+/// For each phase observed (BASELINE under `step_index = 0`,
+/// scenario Steps under `step_index = 1..=N` per the 1-indexed
+/// phase convention) emits one [`PhaseBucket`] with `step_index`
+/// as the key, `label` derived per the BASELINE/Step\[k\]
+/// convention, `start_ms` / `end_ms` from the first / last
+/// sample's `elapsed_ms`, `sample_count` from the bucketed
+/// samples, and `metrics` from the per-kind reduction described
+/// on [`PhaseBucket`]. Metrics whose per-sample reading returns
+/// `None` for every sample in the bucket are omitted entirely
+/// (absent → "no data") rather than collapsed to `Some(0.0)`
+/// (real zero), preserving the sentinel-free contract.
+///
+/// Returns an empty `Vec` when the input series is empty (no
+/// samples captured), distinct from returning a single empty
+/// BASELINE bucket — the former means the periodic-capture path
+/// never fired, the latter means it fired but no metric reading
+/// came back.
+///
+/// Live production caller: `evaluate_vm_result` in
+/// `src/test_support/eval.rs` drains the snapshot bridge, builds
+/// a `SampleSeries`, and routes it through this fn to populate
+/// `AssertResult.stats.phases`. Exposed `pub` (not `pub(crate)`)
+/// so out-of-tree consumers — payload authors writing custom
+/// eval paths against the publicly-drainable
+/// `result.snapshot_bridge` — can produce the same per-phase
+/// aggregate shape without re-implementing the bucketing logic.
 pub fn build_phase_buckets(samples: &crate::scenario::sample::SampleSeries) -> Vec<PhaseBucket> {
     // Borrowed per-tick monitor samples (None when no MonitorReport
     // was attached, e.g. host-only fixture tests). When present,
