@@ -2391,22 +2391,35 @@ impl KtstrVm {
                                         }
                                         let _ = accessor_ready_evt_for_worker.write(1);
                                     }
-                                    // Park until either kill (exit) or
-                                    // reinit (loop back into the init
-                                    // retry phase). Negative timeout =
-                                    // wait forever until one fd fires.
-                                    let mut pfds = [
-                                        libc::pollfd { fd: kill_fd, events: libc::POLLIN, revents: 0 },
-                                        libc::pollfd { fd: reinit_fd, events: libc::POLLIN, revents: 0 },
-                                    ];
-                                    unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
-                                    if kill_for_worker.load(Ordering::Acquire) {
-                                        return;
+                                    // Park until kill or reinit. 100 ms
+                                    // poll timeout so a kill_evt missed
+                                    // because of a teardown race (e.g.
+                                    // the coord's own epoll loop drains
+                                    // kill_evt before the worker sees
+                                    // POLLIN) is bounded to ~100 ms of
+                                    // shutdown lag — without the
+                                    // timeout, an indefinite poll on a
+                                    // drained eventfd would never wake
+                                    // and the test would hang at
+                                    // `handle.join()`. Inner loop reads
+                                    // reinit_evt with EAGAIN-tolerant
+                                    // `is_ok()` (eventfd constructed
+                                    // with EFD_NONBLOCK) so the 100 ms
+                                    // timeout wakes are pure kill polls
+                                    // and don't trigger spurious re-init.
+                                    loop {
+                                        let mut pfds = [
+                                            libc::pollfd { fd: kill_fd, events: libc::POLLIN, revents: 0 },
+                                            libc::pollfd { fd: reinit_fd, events: libc::POLLIN, revents: 0 },
+                                        ];
+                                        unsafe { libc::poll(pfds.as_mut_ptr(), 2, 100) };
+                                        if kill_for_worker.load(Ordering::Acquire) {
+                                            return;
+                                        }
+                                        if reinit_for_worker.read().is_ok() {
+                                            break;
+                                        }
                                     }
-                                    // Drain the reinit_evt counter so a
-                                    // subsequent reset wakes us again
-                                    // (eventfd::read consumes the value).
-                                    let _ = reinit_for_worker.read();
                                     continue 'reinit;
                                 }
                             })

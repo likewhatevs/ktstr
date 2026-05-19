@@ -1316,6 +1316,14 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // `KtstrTestEntry::workload_root_cgroup`. The framework owns
     // this slot; the scheduler never sees it.
     create_workload_root_cgroup_from_file();
+    // Per-scheduler cgroup the scheduler process is placed in.
+    // Sourced from `Scheduler::cgroup_parent`. mkdir + enable
+    // controllers here so the tree is ready when `start_scheduler`
+    // spawns the child. Distinct from
+    // `create_cgroup_parent_from_sched_args` (which fires only
+    // when `--cell-parent-cgroup` is present in `/sched_args` for
+    // cell-aware schedulers).
+    create_scheduler_cgroup_parent_from_file();
     create_cgroup_parent_from_sched_args();
     exec_shell_script("/sched_enable");
     // Plumb the probe pipeline's `stop` + `output_done` into
@@ -2375,7 +2383,37 @@ fn write_com2(msg: &str) {
 /// cgroup tree at startup.
 #[tracing::instrument]
 fn create_workload_root_cgroup_from_file() {
-    let raw = match fs::read_to_string("/workload_root_cgroup") {
+    create_cgroup_from_file("/workload_root_cgroup");
+}
+
+/// Materialise the per-scheduler cgroup the scheduler process is
+/// placed in. Reads `/scheduler_cgroup_parent` (written by
+/// [`crate::vmm::initramfs::build_suffix`] when
+/// [`crate::vmm::initramfs::SuffixParams::scheduler_cgroup_parent`]
+/// is `Some` — sourced from
+/// [`crate::test_support::Scheduler::cgroup_parent`]), validates
+/// the absolute-path shape, mkdir's `/sys/fs/cgroup{path}`, and
+/// enables `+cpuset +cpu` controllers along every ancestor so the
+/// scheduler's later cgroup operations find the controllers
+/// already available.
+///
+/// Distinct from [`create_workload_root_cgroup_from_file`] (per-
+/// test workload tree) and from
+/// [`create_cgroup_parent_from_sched_args`] (which fires only
+/// when `--cell-parent-cgroup` is present in `/sched_args` for
+/// cell-aware schedulers).
+#[tracing::instrument]
+fn create_scheduler_cgroup_parent_from_file() {
+    create_cgroup_from_file("/scheduler_cgroup_parent");
+}
+
+/// Shared mkdir + subtree-controller setup for any
+/// framework-stamped cgroup-path file. Centralises the file-read,
+/// path-validation, mkdir, and `enable_subtree_controllers_to`
+/// sequence so future cgroup-path slots reuse the same flow
+/// without duplicating the guard logic.
+fn create_cgroup_from_file(file: &str) {
+    let raw = match fs::read_to_string(file) {
         Ok(s) => s,
         Err(_) => return,
     };
@@ -2383,10 +2421,9 @@ fn create_workload_root_cgroup_from_file() {
     if !crate::test_support::cell_parent_path_is_valid(path) {
         if !path.is_empty() {
             write_com2(&format!(
-                "ktstr-init: ignoring malformed `/workload_root_cgroup` \
-                 value {path:?}; skipping workload-cgroup root creation \
-                 (host-side `CgroupPath::new` gate normally rejects this \
-                 at compile time)",
+                "ktstr-init: ignoring malformed `{file}` value {path:?}; \
+                 skipping cgroup creation (host-side `CgroupPath::new` \
+                 gate normally rejects this at compile time)",
             ));
         }
         return;

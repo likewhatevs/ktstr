@@ -259,6 +259,15 @@ pub struct KtstrVm {
     /// `KtstrTestEntry::workload_root_cgroup`; never touches the
     /// scheduler argv.
     pub(crate) workload_root_cgroup: Option<String>,
+    /// Cgroup the SCHEDULER is placed in. Sourced from
+    /// `Scheduler::cgroup_parent`. When `Some`, the guest init
+    /// mkdir's `/sys/fs/cgroup{path}` + enables `+cpuset +cpu` on
+    /// every ancestor's `subtree_control` BEFORE starting the
+    /// scheduler. Distinct from [`Self::workload_root_cgroup`]
+    /// (workload placement) and from `--cell-parent-cgroup` in
+    /// scheduler argv (cell-aware schedulers interpret that flag
+    /// independently of where the framework places the scheduler).
+    pub(crate) scheduler_cgroup_parent: Option<String>,
     pub(crate) topology: Topology,
     /// Guest memory in MiB. `None` = deferred: computed from actual
     /// initramfs size after the initramfs build completes.
@@ -554,6 +563,7 @@ impl KtstrVm {
             exec_cmd: self.exec_cmd.as_deref(),
             staged_sched_args: &self.staged_sched_args_packed,
             workload_root_cgroup: self.workload_root_cgroup.as_deref(),
+            scheduler_cgroup_parent: self.scheduler_cgroup_parent.as_deref(),
         }
     }
 

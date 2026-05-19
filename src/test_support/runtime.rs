@@ -709,6 +709,9 @@ pub(crate) fn build_vm_builder_base(
     if let Some(root) = entry.workload_root_cgroup {
         builder = builder.workload_root_cgroup(root.as_str().to_string());
     }
+    if let Some(parent) = entry.scheduler.cgroup_parent {
+        builder = builder.scheduler_cgroup_parent(parent.as_str().to_string());
+    }
 
     builder.watchdog_timeout(entry.watchdog_timeout)
 }

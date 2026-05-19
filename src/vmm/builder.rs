@@ -148,6 +148,16 @@ pub struct KtstrVmBuilder {
     /// unset (the default), the guest falls back to its legacy
     /// `--cell-parent-cgroup`-or-default resolution.
     workload_root_cgroup: Option<String>,
+    /// Per-scheduler cgroup the scheduler process is placed in.
+    /// Sourced from
+    /// [`crate::test_support::Scheduler::cgroup_parent`]. When
+    /// set, the guest init mkdir's the path + enables `+cpuset
+    /// +cpu` on every ancestor's `subtree_control` BEFORE starting
+    /// the scheduler. Distinct from
+    /// [`Self::workload_root_cgroup`] (workload placement); the
+    /// two slots cover different concerns and either, both, or
+    /// neither may be set.
+    scheduler_cgroup_parent: Option<String>,
 }
 
 /// One scheduler staged into the guest initramfs alongside the
@@ -230,6 +240,7 @@ impl Default for KtstrVmBuilder {
             workload_duration: None,
             num_snapshots: 0,
             workload_root_cgroup: None,
+            scheduler_cgroup_parent: None,
         }
     }
 }
@@ -492,6 +503,20 @@ impl KtstrVmBuilder {
     /// [`crate::test_support::CgroupPath::new`].
     pub fn workload_root_cgroup(mut self, path: impl Into<String>) -> Self {
         self.workload_root_cgroup = Some(path.into());
+        self
+    }
+
+    /// Set the per-scheduler cgroup the scheduler process is
+    /// placed in. The guest init mkdir's the path + enables
+    /// `+cpuset +cpu` on every ancestor BEFORE starting the
+    /// scheduler. Distinct from
+    /// [`Self::workload_root_cgroup`] (workload placement).
+    ///
+    /// `path` must be an absolute cgroup path (leading `/`,
+    /// not bare `/`); programmatic callers should pre-validate
+    /// via [`crate::test_support::CgroupPath::new`].
+    pub fn scheduler_cgroup_parent(mut self, path: impl Into<String>) -> Self {
+        self.scheduler_cgroup_parent = Some(path.into());
         self
     }
 
@@ -1017,6 +1042,7 @@ impl KtstrVmBuilder {
             workload_duration: self.workload_duration,
             num_snapshots: self.num_snapshots,
             workload_root_cgroup: self.workload_root_cgroup,
+            scheduler_cgroup_parent: self.scheduler_cgroup_parent,
             cast_map,
         })
     }

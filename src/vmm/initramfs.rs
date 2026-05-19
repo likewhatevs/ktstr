@@ -1017,6 +1017,14 @@ pub struct SuffixParams<'a> {
     /// emitted ⇒ guest falls back to the legacy
     /// `--cell-parent-cgroup`-or-default resolution.
     pub workload_root_cgroup: Option<&'a str>,
+    /// `/scheduler_cgroup_parent` file contents when set. Sourced
+    /// from [`crate::test_support::Scheduler::cgroup_parent`]; the
+    /// guest mkdir's `/sys/fs/cgroup{path}` + enables `+cpuset +cpu`
+    /// on every ancestor BEFORE starting the scheduler so the
+    /// scheduler attaches into a ready cgroup tree. Absent ⇒ no
+    /// file emitted ⇒ scheduler runs at the cgroup root without
+    /// explicit framework placement.
+    pub scheduler_cgroup_parent: Option<&'a str>,
 }
 
 /// Build the suffix that completes a base archive: `/args` and
@@ -1068,6 +1076,22 @@ pub fn build_suffix(base_len: usize, params: &SuffixParams<'_>) -> Result<Vec<u8
         write_entry(
             &mut suffix,
             "workload_root_cgroup",
+            path.as_bytes(),
+            0o100644,
+        )?;
+    }
+
+    // `/scheduler_cgroup_parent` carries the per-scheduler cgroup
+    // placement target (from `Scheduler::cgroup_parent`). Same
+    // re-validation flow as workload_root_cgroup — the guest's
+    // `create_scheduler_cgroup_parent_from_file` re-checks the
+    // path-shape gate before mkdir so a stale or hand-edited image
+    // carrying a bad value still fails closed rather than
+    // corrupting unrelated cgroup state.
+    if let Some(path) = params.scheduler_cgroup_parent {
+        write_entry(
+            &mut suffix,
+            "scheduler_cgroup_parent",
             path.as_bytes(),
             0o100644,
         )?;
