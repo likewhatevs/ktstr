@@ -812,80 +812,6 @@ pub(crate) fn run_ktstr_test_inner(
 /// io error. The test failure itself surfaces via the
 /// normal stderr path; the stub is a best-effort augment, so the
 /// helper does not propagate any io::Error.
-/// Build the diagnostic suffix attached to a `post_vm` callback's
-/// `Err` so the test author sees the same scheduler-log /
-/// stage-classifier / monitor sections `evaluate_vm_result`
-/// surfaces on a regular failure. Without this, a `post_vm`
-/// assertion (e.g. `anyhow::ensure!(periodic_fired > 0, ...)`)
-/// fails with only the assertion text — hiding any scheduler
-/// panic, BPF verifier reject, or scx_bpf_error that crashed
-/// the workload before the assertion's precondition could be
-/// met. Surfacing the diagnostic at this layer lets the test
-/// author debug the actual root cause without re-running with
-/// extra tracing.
-fn post_vm_failure_diagnostic_suffix(result: &vmm::VmResult) -> String {
-    let mut out = String::new();
-    // Stage classifier — names the highest-progress lifecycle
-    // phase the guest reached. "payload started but produced no
-    // test result" / "scheduler died during the liveness window"
-    // / similar one-line summaries explain at-a-glance failure
-    // modes.
-    let stage = crate::test_support::output::classify_init_stage(result.guest_messages.as_ref());
-    out.push_str(&format!("\n\nstage: {stage}"));
-    // Periodic-capture pipeline state — the sibling-Claude
-    // mitosis bug surfaced here. Empty bridges + 0-fired counts
-    // signal the periodic loop never reached a boundary; the
-    // adjacent sched_log section usually explains why.
-    out.push_str(&format!(
-        "\nperiodic_fired={} periodic_target={}",
-        result.periodic_fired, result.periodic_target,
-    ));
-    // Scheduler log — extracted from the bulk-port SCHED_LOG
-    // chunks (post-marker-pair) or the legacy stderr stream when
-    // no bulk frames carry the markers. Tail at 200 lines so a
-    // verifier dump doesn't drown the failure summary.
-    let sched_log_merged = crate::verifier::concat_sched_log_chunks(result.guest_messages.as_ref());
-    let sched_log_input: &str = if !sched_log_merged.is_empty() {
-        &sched_log_merged
-    } else {
-        &result.output
-    };
-    if let Some(parsed) = parse_sched_output(sched_log_input) {
-        let collapsed = crate::verifier::collapse_cycles(parsed);
-        let is_verifier = collapsed.contains("processed") && collapsed.contains("insns");
-        let lines: Vec<&str> = collapsed.lines().collect();
-        let tail = if !is_verifier && lines.len() > 200 {
-            let skipped = lines.len() - 200;
-            format!(
-                "[{skipped} lines truncated]\n{}",
-                lines[lines.len() - 200..].join("\n")
-            )
-        } else {
-            collapsed
-        };
-        out.push_str(&format!("\n\n--- scheduler log ---\n{tail}"));
-    }
-    // sched_ext dump — kernel sysrq-S output captured in stderr
-    // when the scheduler panicked / aborted. Empty for clean
-    // exits.
-    if let Some(dump) = extract_sched_ext_dump(&result.stderr)
-        && !dump.is_empty()
-    {
-        out.push_str(&format!("\n\n--- sched_ext dump ---\n{dump}"));
-    }
-    // Monitor summary — schedstat deltas, fallback counts,
-    // runqueue depth observations. One-line vs full Display, no
-    // sample dump.
-    if let Some(monitor) = result.monitor.as_ref() {
-        out.push_str(&format!(
-            "\n\n--- monitor ---\nsamples={} stuck={}",
-            monitor.samples.len(),
-            monitor.summary.stuck_detected,
-        ));
-    }
-    out
-}
-
 fn write_placeholder_failure_dump_if_missing(path: &std::path::Path, result: &vmm::VmResult) {
     if path.exists() {
         return;
@@ -1570,14 +1496,19 @@ fn run_ktstr_test_inner_impl(
     // coordinator populates on every `Op::CaptureSnapshot` /
     // `Op::WatchSnapshot` fire. The `post_vm` hook closes that
     // gap: it runs on the HOST after `vm.run()` returns, with
-    // direct access to the full `VmResult`. An `Err` from the
-    // callback short-circuits the dispatch as a test failure with
-    // the returned diagnostic, before sidecar write or
-    // `evaluate_vm_result`. Tests that don't set `post_vm`
-    // (the default) bypass this branch.
-    if let Some(post_vm) = entry.post_vm
-        && let Err(e) = post_vm(&result)
-    {
+    // direct access to the full `VmResult`.
+    //
+    // The callback's `Err` is captured here and threaded into
+    // `evaluate_vm_result` below so the post_vm failure flows
+    // through the SAME failure path as a guest-side fail
+    // (`result.success=false`): same `--- scheduler log ---`,
+    // `--- sched_ext dump ---`, `--- monitor ---`, and `stage:`
+    // sections; same auto-repro dispatch. The earlier
+    // early-return design bypassed all of that, leaving the
+    // test author with only the bare assertion text on every
+    // post_vm failure.
+    let post_vm_err: Option<anyhow::Error> = entry.post_vm.and_then(|cb| cb(&result).err());
+    if post_vm_err.is_some() {
         // post_vm failure: the guest itself may have returned
         // result.success=true, but the host-side check overrules
         // it as a failure. Emit the placeholder dump too (if not
@@ -1585,23 +1516,6 @@ fn run_ktstr_test_inner_impl(
         // so spec-promise parity holds even when the failure mode
         // is host-side rather than guest-side.
         write_placeholder_failure_dump_if_missing(&primary_dump_path, &result);
-        // Surface the same scheduler-log / monitor sections
-        // `evaluate_vm_result` attaches on a regular failure. The
-        // post_vm Err path otherwise bypasses every diagnostic
-        // formatter and the test author sees only the assertion
-        // text, hiding the actual root cause (e.g. a scheduler
-        // panic or scx_bpf_error that crashed the workload mid-
-        // step). Built lazily — passing tests never reach here.
-        //
-        // Assertion text comes FIRST, diagnostic suffix appended
-        // — anyhow's `.context()` would invert this (suffix as
-        // outermost message, original as cause), which reads
-        // backwards in test panic output. The `anyhow!` rebuild
-        // preserves the desired ordering at the cost of dropping
-        // the source-error chain (the assertion's source is
-        // typically `None` anyway).
-        let suffix = post_vm_failure_diagnostic_suffix(&result);
-        return Err(anyhow::anyhow!("{e}{suffix}"));
     }
 
     // Release VM resources (CPU/LLC flocks, guest memory) before
@@ -1889,6 +1803,7 @@ fn run_ktstr_test_inner_impl(
         &host_extract_failures,
         &vm_topology,
         &repro_fn,
+        post_vm_err.as_ref(),
     );
     eprintln!(
         "evaluate_vm_result (includes auto-repro): {:?}",
@@ -1923,6 +1838,14 @@ fn evaluate_vm_result(
     host_extract_failures: &[crate::assert::AssertDetail],
     topo: &Topology,
     repro_fn: &dyn Fn(&str) -> Option<String>,
+    // Optional Err captured from `KtstrTestEntry::post_vm` so the
+    // host-side assertion failure flows through the SAME failure
+    // path as a guest-side `result.success=false`: same scheduler
+    // log / sched_ext dump / monitor diagnostic, same auto-repro
+    // dispatch. Folded into `check_result` as an AssertDetail
+    // below the parse-success arm so the existing failure-message
+    // construction picks it up without a parallel renderer.
+    post_vm_err: Option<&anyhow::Error>,
 ) -> Result<AssertResult> {
     // Build phase buckets early so the failure-message timeline
     // renderer can drive from the unified PhaseBucket source
@@ -2076,6 +1999,21 @@ fn evaluate_vm_result(
         // sources.
         for detail in host_extract_failures {
             check_result.merge(AssertResult::fail(detail.clone()));
+        }
+
+        // Fold the host-side `post_vm` callback's Err into the
+        // verdict so it flows through the same failure path as
+        // host-extract failures and the guest-stamped check
+        // result. The downstream failure formatter renders the
+        // `--- scheduler log ---` / `--- sched_ext dump ---` /
+        // `--- monitor ---` sections + dispatches `repro_fn`
+        // (auto-repro) from this single point — no parallel
+        // handler needed.
+        if let Some(err) = post_vm_err {
+            check_result.merge(AssertResult::fail(crate::assert::AssertDetail::new(
+                crate::assert::DetailKind::Other,
+                format!("post_vm callback returned Err: {err:#}"),
+            )));
         }
 
         // Cleanup-budget enforcement. When the entry sets
@@ -2503,8 +2441,21 @@ fn evaluate_vm_result(
                 ERR_TIMED_OUT_NO_RESULT.to_string()
             }
         };
+        // Fold the host-side `post_vm` callback's Err into the
+        // parse-fail diagnostic. Most parse-fail paths are
+        // guest-crashed-before-reporting, in which case post_vm
+        // probably wouldn't have run meaningfully — but if the
+        // test author's post_vm did fire and return Err on the
+        // partial result, the failure surface MUST include it.
+        // Prepending the post_vm message keeps the parse-fail
+        // crash diagnostics as the load-bearing body and surfaces
+        // post_vm as a leading "host-side check also reported"
+        // line so the operator sees both signals together.
+        let post_vm_prefix = post_vm_err
+            .map(|e| format!("post_vm callback returned Err: {e:#}\n\n"))
+            .unwrap_or_default();
         let msg = format!(
-            "{}{}ktstr_test '{}'{} [topo={}] {}{}{}{}{}{}{}{}{}",
+            "{post_vm_prefix}{}{}ktstr_test '{}'{} [topo={}] {}{}{}{}{}{}{}{}{}",
             fingerprint_line,
             bug_summary_line(),
             entry.name,
@@ -3810,6 +3761,7 @@ mod tests {
             &[],
             &EVAL_TOPO,
             &no_repro,
+            None,
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -3845,6 +3797,7 @@ mod tests {
             &[],
             &EVAL_TOPO,
             &no_repro,
+            None,
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -3877,6 +3830,7 @@ mod tests {
             &[],
             &EVAL_TOPO,
             &no_repro,
+            None,
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -3919,6 +3873,7 @@ mod tests {
             &[],
             &EVAL_TOPO,
             &repro_fn,
+            None,
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -3961,6 +3916,7 @@ mod tests {
             &[],
             &EVAL_TOPO,
             &repro_fn,
+            None,
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -3994,6 +3950,7 @@ mod tests {
             &[],
             &EVAL_TOPO,
             &no_repro,
+            None,
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -4031,6 +3988,7 @@ mod tests {
             &[],
             &EVAL_TOPO,
             &no_repro,
+            None,
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -4059,6 +4017,7 @@ mod tests {
             &[],
             &EVAL_TOPO,
             &no_repro,
+            None,
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -4088,6 +4047,7 @@ mod tests {
                 &[],
                 &EVAL_TOPO,
                 &no_repro,
+                None,
             )
             .is_ok(),
             "passing AssertResult should return Ok",
@@ -4116,7 +4076,8 @@ mod tests {
                 &[],
                 &[],
                 &EVAL_TOPO,
-                &no_repro
+                &no_repro,
+                None,
             )
             .unwrap_err()
         );
@@ -4154,6 +4115,7 @@ mod tests {
                 &[],
                 &EVAL_TOPO,
                 &no_repro,
+                None,
             )
             .unwrap_err()
         );
@@ -4196,6 +4158,7 @@ mod tests {
                 &[],
                 &EVAL_TOPO,
                 &no_repro,
+                None,
             )
             .is_ok(),
             "cleanup_duration under budget must keep the verdict Ok",
@@ -4228,6 +4191,7 @@ mod tests {
                 &[],
                 &EVAL_TOPO,
                 &no_repro,
+                None,
             )
             .is_ok(),
             "cleanup_duration EQUAL to budget must keep the verdict Ok \
@@ -4263,7 +4227,8 @@ mod tests {
                 &[],
                 &[],
                 &EVAL_TOPO,
-                &no_repro
+                &no_repro,
+                None,
             )
             .unwrap_err()
         );
@@ -4293,7 +4258,8 @@ mod tests {
                 &[],
                 &[],
                 &EVAL_TOPO,
-                &no_repro
+                &no_repro,
+                None,
             )
             .unwrap_err()
         );
@@ -4319,6 +4285,7 @@ mod tests {
             &[],
             &EVAL_TOPO,
             &no_repro,
+            None,
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -4351,6 +4318,7 @@ mod tests {
             &[],
             &EVAL_TOPO,
             &no_repro,
+            None,
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -4383,7 +4351,8 @@ mod tests {
                 &[],
                 &[],
                 &EVAL_TOPO,
-                &no_repro
+                &no_repro,
+                None,
             )
             .unwrap_err()
         );
@@ -4480,7 +4449,8 @@ mod tests {
                 &[],
                 &[],
                 &EVAL_TOPO,
-                &no_repro
+                &no_repro,
+                None,
             )
             .unwrap_err()
         );
@@ -4510,6 +4480,7 @@ mod tests {
             &[],
             &EVAL_TOPO,
             &no_repro,
+            None,
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -4549,6 +4520,7 @@ mod tests {
             &[],
             &EVAL_TOPO,
             &no_repro,
+            None,
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -4583,6 +4555,7 @@ mod tests {
             &[],
             &EVAL_TOPO,
             &no_repro,
+            None,
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -4619,6 +4592,7 @@ mod tests {
             &[],
             &EVAL_TOPO,
             &no_repro,
+            None,
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -4645,6 +4619,7 @@ mod tests {
             &[],
             &EVAL_TOPO,
             &no_repro,
+            None,
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -4667,6 +4642,7 @@ mod tests {
             &[],
             &EVAL_TOPO,
             &no_repro,
+            None,
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -4703,6 +4679,7 @@ mod tests {
             &[],
             &EVAL_TOPO,
             &no_repro,
+            None,
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -4749,7 +4726,8 @@ mod tests {
                 &[],
                 &[],
                 &EVAL_TOPO,
-                &no_repro
+                &no_repro,
+                None,
             )
             .unwrap_err()
         );
@@ -4822,7 +4800,8 @@ mod tests {
                 &[],
                 &[],
                 &EVAL_TOPO,
-                &no_repro
+                &no_repro,
+                None,
             )
             .unwrap_err()
         );
@@ -4922,7 +4901,8 @@ mod tests {
                 &[],
                 &[],
                 &EVAL_TOPO,
-                &no_repro
+                &no_repro,
+                None,
             )
             .unwrap_err()
         );
