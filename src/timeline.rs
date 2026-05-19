@@ -482,15 +482,12 @@ impl Timeline {
     /// iteration totals from stimulus events not attached to
     /// PhaseBucket directly. Defaults to `None`.
     ///
-    /// `changes` (boundary degradation detection) is NOT computed
-    /// here. The existing [`Self::build`] computes changes by
-    /// diffing adjacent `PhaseMetrics` fields including
-    /// `avg_imbalance` and `avg_dsq_depth` — both unavailable from
-    /// PhaseBucket — so a from_phase_buckets-built Timeline emits
-    /// every Phase with `changes = vec![]`. Callers that need
-    /// per-boundary change detection must continue to use
-    /// [`Self::build`] until the PhaseBucket → Timeline render
-    /// pipeline is consolidated.
+    /// `changes` (boundary degradation detection) IS computed
+    /// here by diffing adjacent `PhaseMetrics` fields — same
+    /// detection logic [`Self::build`] uses, applied after the
+    /// per-bucket conversion. avg_imbalance + avg_dsq_depth are
+    /// supplied by PhaseBucket so the detection runs on the same
+    /// fields as the legacy path.
     // `#[allow(dead_code)]` until the eval.rs wire-through lands.
     // The constructor is the API surface needed by a future
     // production caller; tests below pin the conversion contract
@@ -502,11 +499,76 @@ impl Timeline {
     ) -> Self {
         let mut sorted: Vec<&crate::assert::PhaseBucket> = phase_buckets.iter().collect();
         sorted.sort_by_key(|b| b.step_index);
-        let phases = sorted
+        let mut phases: Vec<Phase> = sorted
             .into_iter()
             .enumerate()
             .map(|(idx, b)| phase_from_bucket(idx, b))
             .collect();
+        // Boundary-change detection — same per-pair diffing logic
+        // [`Self::build`] applies. Walks each adjacent (prev, curr)
+        // pair and records significant deltas on the LATER phase's
+        // `changes` vec so the operator sees "what changed when
+        // entering this phase". Skips pairs where either side had
+        // no samples — those phases produce default-zero metrics
+        // and a diff would falsely paint every metric as changed.
+        for i in 1..phases.len() {
+            let before = phases[i - 1].metrics.clone();
+            let after = &phases[i].metrics;
+            if before.sample_count == 0 || after.sample_count == 0 {
+                continue;
+            }
+            let mut changes = Vec::new();
+            changes.extend(detect_change(
+                before.avg_imbalance,
+                after.avg_imbalance,
+                IMBALANCE_THRESHOLD,
+                "imbalance",
+                true,
+            ));
+            changes.extend(detect_change(
+                before.avg_dsq_depth,
+                after.avg_dsq_depth,
+                DSQ_THRESHOLD,
+                "dsq_depth",
+                true,
+            ));
+            if let (Some(bf), Some(af)) = (before.fallback_rate, after.fallback_rate) {
+                changes.extend(detect_change(
+                    bf,
+                    af,
+                    FALLBACK_RATE_THRESHOLD,
+                    "fallback",
+                    true,
+                ));
+            }
+            if let (Some(bk), Some(ak)) = (before.keep_last_rate, after.keep_last_rate) {
+                changes.extend(detect_change(
+                    bk,
+                    ak,
+                    KEEP_LAST_RATE_THRESHOLD,
+                    "keep_last",
+                    true,
+                ));
+            }
+            if let (Some(bi), Some(ai)) = (before.iteration_rate, after.iteration_rate)
+                && bi > 0.0
+            {
+                let rel = (ai - bi) / bi;
+                if rel.abs() > ITERATION_RATE_REL_THRESHOLD {
+                    changes.push(PhaseChange {
+                        direction: if rel < 0.0 {
+                            ChangeDirection::Degraded
+                        } else {
+                            ChangeDirection::Improved
+                        },
+                        metric: "throughput".to_string(),
+                        before: bi,
+                        after: ai,
+                    });
+                }
+            }
+            phases[i].changes = changes;
+        }
         Self { phases }
     }
 
