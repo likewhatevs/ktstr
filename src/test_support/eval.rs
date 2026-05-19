@@ -1498,16 +1498,35 @@ fn run_ktstr_test_inner_impl(
     // gap: it runs on the HOST after `vm.run()` returns, with
     // direct access to the full `VmResult`.
     //
-    // The callback's `Err` is captured here and threaded into
-    // `evaluate_vm_result` below so the post_vm failure flows
-    // through the SAME failure path as a guest-side fail
-    // (`result.success=false`): same `--- scheduler log ---`,
-    // `--- sched_ext dump ---`, `--- monitor ---`, and `stage:`
-    // sections; same auto-repro dispatch. The earlier
-    // early-return design bypassed all of that, leaving the
-    // test author with only the bare assertion text on every
-    // post_vm failure.
-    let post_vm_err: Option<anyhow::Error> = entry.post_vm.and_then(|cb| cb(&result).err());
+    // Suppression contract: skip post_vm entirely when the
+    // guest already reported a failed `AssertResult` (e.g.
+    // `sched_died_during_hold` recorded mid-step at
+    // `src/scenario/ops/mod.rs::966`). The host's typical
+    // post_vm body asserts on workload-derived state
+    // (`snapshot_bridge`, `periodic_fired`, …) — that state is
+    // structurally missing when the scheduler died before the
+    // workload reached the asserted-on phase, so the post_vm
+    // `Err` would surface as a misleading "snapshot bridge
+    // captured nothing" wrapper that obscures the actual
+    // scheduler crash sitting in `--- scheduler log ---`. The
+    // guest-side failure already cascades through
+    // `evaluate_vm_result` with the right diagnostic; running
+    // post_vm here adds noise, not signal.
+    //
+    // The callback's `Err` is threaded into `evaluate_vm_result`
+    // below so the post_vm failure (when it actually runs) flows
+    // through the SAME failure path as a guest-side fail (same
+    // `--- scheduler log ---`, `--- sched_ext dump ---`,
+    // `--- monitor ---`, `stage:` sections; same auto-repro
+    // dispatch).
+    let guest_already_failed = parse_assert_result_from_drain(result.guest_messages.as_ref())
+        .map(|r| !r.is_pass())
+        .unwrap_or(false);
+    let post_vm_err: Option<anyhow::Error> = if guest_already_failed {
+        None
+    } else {
+        entry.post_vm.and_then(|cb| cb(&result).err())
+    };
     if post_vm_err.is_some() {
         // post_vm failure: the guest itself may have returned
         // result.success=true, but the host-side check overrules
