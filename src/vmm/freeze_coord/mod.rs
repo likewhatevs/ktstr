@@ -2112,24 +2112,55 @@ impl KtstrVm {
                 // (was `&'a GuestMem`). The Arc shape lets the worker
                 // own the kernel handle independently of the
                 // coordinator's stack.
-                let accessors_oncelock: Arc<std::sync::OnceLock<(
+                // Re-acquirable accessor slot. Replaces the prior
+                // `OnceLock<...>` shape so the slot can be re-populated
+                // after a scheduler-detach / scheduler-replace event:
+                // the BPF maps the old scheduler used are RCU-
+                // freed when sched_ext unregisters, and the new
+                // scheduler's maps land at fresh kernel-allocated
+                // addresses. Without re-acquisition, post-swap periodic
+                // captures would silently read stale memory (the prior
+                // scheduler's BSS, now recycled) for the lifetime of
+                // the run.
+                //
+                // The worker (spawned below) writes into the slot via
+                // `lock().replace(...)` on every successful init; it
+                // loops on `accessor_reinit_evt` so a reset triggered
+                // by the coordinator's `WatchpointPublishResult::
+                // Detached` / `RebindDisarmed` arms wakes the worker,
+                // re-runs init, and re-publishes a
+                // fresh pair. The coordinator's adopt site
+                // (`owned_accessor.is_none()` check below) takes the
+                // pair out of the slot via `lock().take()` so the
+                // slot returns to `None` and the worker can publish
+                // a future re-acquisition into the same slot.
+                type AccessorPair = (
                     crate::monitor::bpf_map::GuestMemMapAccessorOwned,
                     Option<crate::monitor::bpf_prog::GuestMemProgAccessorOwned>,
-                )>> = Arc::new(std::sync::OnceLock::new());
-                // Borrowed views into the OnceLock pair. Reset to
-                // `Some(...)` on the first scan tick after the worker
-                // publishes; remain `None` while the worker is still
-                // retrying. Each loop body that reads these gates on
-                // `Some` exactly as the prior `Option<...Owned>`-typed
-                // shape did, so no call-site logic changes. Borrowing
-                // is lifetime-clean: the OnceLock is moved into the
-                // worker's clone via `Arc`, the coordinator retains
-                // its own clone, and `&` borrows from a shared `Arc`
-                // are valid for the entire freeze_coord closure scope.
+                );
+                let accessors_slot: Arc<std::sync::Mutex<Option<AccessorPair>>> =
+                    Arc::new(std::sync::Mutex::new(None));
+                // Re-init trigger eventfd. Coordinator writes 1 to
+                // signal a scheduler-detach/-replace; worker's loop
+                // wakes from `poll()` and re-enters the init retry
+                // loop. The fd is non-blocking (EFD_NONBLOCK) so
+                // spurious writes are bounded — multiple writes
+                // before a single read coalesce to one wake.
+                let accessor_reinit_evt: Arc<EventFd> = Arc::new(
+                    EventFd::new(EFD_NONBLOCK)
+                        .expect("eventfd for accessor_reinit"),
+                );
+                // Owned views into the slot. Switched from `Option<&T>`
+                // (borrowed from OnceLock) to `Option<T>` (owned by the
+                // coordinator) so the slot can be re-populated under
+                // the coordinator's feet without invalidating outstanding
+                // borrows. `Option::as_ref()` still yields `Option<&T>`
+                // at every call site, so down-stream code that takes a
+                // reference compiles unchanged.
                 let mut owned_accessor:
-                    Option<&crate::monitor::bpf_map::GuestMemMapAccessorOwned> = None;
+                    Option<crate::monitor::bpf_map::GuestMemMapAccessorOwned> = None;
                 let mut owned_prog_accessor:
-                    Option<&crate::monitor::bpf_prog::GuestMemProgAccessorOwned> = None;
+                    Option<crate::monitor::bpf_prog::GuestMemProgAccessorOwned> = None;
                 // Virt-KASLR offset accessor — re-reads the shared
                 // `kern_virt_kaslr` Arc on every call so consumers
                 // observe the freshest value the BSP MSR_LSTAR path
@@ -2166,6 +2197,21 @@ impl KtstrVm {
                 // a boot that hasn't published the bootstrap symbols
                 // by then is genuinely stuck and the dump path is
                 // unavailable for the rest of the run regardless.
+                //
+                // After a successful publish the worker parks on
+                // `poll(kill_evt | accessor_reinit_evt, -1)` and
+                // re-enters the init-retry phase whenever the
+                // coordinator pulses `accessor_reinit_evt` (see the
+                // `WatchpointPublishResult::Detached` and
+                // `RebindDisarmed` arms in the coord-loop body).
+                // Re-init drops the per-iteration 60 s budget — by
+                // the time the first re-init fires the guest has
+                // already booted to the point of having a live
+                // scheduler attached, so `from_elf_with_hint` should
+                // succeed on the first attempt; the inner retry
+                // still tolerates the brief slab-reuse window between
+                // an old scheduler's BPF map free and the new
+                // scheduler's BPF map load.
                 let accessor_init_handle: Option<std::thread::JoinHandle<()>> = match (
                     freeze_coord_mem.as_ref(),
                     freeze_coord_vmlinux.as_ref(),
@@ -2182,12 +2228,11 @@ impl KtstrVm {
                         let accessor_ready_evt_for_worker = accessor_ready_evt.clone();
                         let kill_for_worker = freeze_coord_kill.clone();
                         let kill_evt_for_worker = freeze_coord_kill_evt.clone();
-                        let oncelock_for_worker = accessors_oncelock.clone();
+                        let slot_for_worker = accessors_slot.clone();
+                        let reinit_for_worker = accessor_reinit_evt.clone();
                         std::thread::Builder::new()
                             .name("vmm-accessor-init".into())
                             .spawn(move || {
-                                let deadline = Instant::now()
-                                    + Duration::from_secs(60);
                                 let _init_t0 = Instant::now();
                                 // poll() on kill_evt so the worker
                                 // wakes instantly on shutdown instead
@@ -2195,6 +2240,10 @@ impl KtstrVm {
                                 let kill_fd = {
                                     use std::os::unix::io::AsRawFd;
                                     kill_evt_for_worker.as_raw_fd()
+                                };
+                                let reinit_fd = {
+                                    use std::os::unix::io::AsRawFd;
+                                    reinit_for_worker.as_raw_fd()
                                 };
                                 let elf = match goblin::elf::Elf::parse(&data_for_worker) {
                                     Ok(e) => e,
@@ -2206,115 +2255,159 @@ impl KtstrVm {
                                         return;
                                     }
                                 };
-                                loop {
-                                    if kill_for_worker.load(Ordering::Acquire) {
-                                        return;
-                                    }
-                                    if Instant::now() >= deadline {
-                                        tracing::warn!(
-                                            "freeze-coord accessor-init worker: \
-                                             60s deadline exceeded; coordinator \
-                                             will run without owned-accessor \
-                                             pair (freeze dump path unavailable)"
-                                        );
-                                        return;
-                                    }
-                                    // Use the guest-reported phys_base
-                                    // (includes kaslr_offset) as a hint
-                                    // so GuestKernel gets the correct
-                                    // value instead of 0 from the
-                                    // failing page-table walk.
-                                    let biased = kern_phys_base_for_worker
-                                        .load(Ordering::Acquire);
-                                    let pb_hint = if biased != 0 {
-                                        biased.wrapping_sub(1)
+                                let mut first_init = true;
+                                'reinit: loop {
+                                    // First init honours the 60 s
+                                    // boot-budget; subsequent re-inits
+                                    // (after a scheduler swap) skip the
+                                    // budget — the guest is already
+                                    // booted and the only reason init
+                                    // could fail is a transient slab-
+                                    // reuse race that resolves within a
+                                    // handful of retries.
+                                    let deadline = if first_init {
+                                        Some(Instant::now() + Duration::from_secs(60))
                                     } else {
-                                        let pb_evt_fd = {
-                                            use std::os::unix::io::AsRawFd;
-                                            kern_phys_base_evt_for_worker.as_raw_fd()
-                                        };
-                                        let mut pfds = [
-                                            libc::pollfd { fd: kill_fd, events: libc::POLLIN, revents: 0 },
-                                            libc::pollfd { fd: pb_evt_fd, events: libc::POLLIN, revents: 0 },
-                                        ];
-                                        unsafe { libc::poll(pfds.as_mut_ptr(), 2, 200) };
-                                        continue;
+                                        None
                                     };
-                                    let tcr_val = tcr_for_worker
-                                        .as_ref()
-                                        .map(|c| c.load(Ordering::Acquire))
-                                        .unwrap_or(0);
-                                    let cr3_val = cr3_for_worker.load(Ordering::Acquire);
-                                    let map_res = crate::monitor::bpf_map::GuestMemMapAccessorOwned
-                                        ::from_elf_with_hint(
-                                            mem_for_worker.clone(),
-                                            &elf,
-                                            &data_for_worker,
-                                            &vmlinux_for_worker,
-                                            tcr_val,
-                                            cr3_val,
-                                            pb_hint,
-                                        );
+                                    first_init = false;
+                                    let publish: Option<AccessorPair> = loop {
+                                        if kill_for_worker.load(Ordering::Acquire) {
+                                            return;
+                                        }
+                                        if let Some(dl) = deadline
+                                            && Instant::now() >= dl
+                                        {
+                                            tracing::warn!(
+                                                "freeze-coord accessor-init worker: \
+                                                 60s deadline exceeded; coordinator \
+                                                 will run without owned-accessor \
+                                                 pair (freeze dump path unavailable)"
+                                            );
+                                            break None;
+                                        }
+                                        // Use the guest-reported phys_base
+                                        // (includes kaslr_offset) as a hint
+                                        // so GuestKernel gets the correct
+                                        // value instead of 0 from the
+                                        // failing page-table walk.
+                                        let biased = kern_phys_base_for_worker
+                                            .load(Ordering::Acquire);
+                                        let pb_hint = if biased != 0 {
+                                            biased.wrapping_sub(1)
+                                        } else {
+                                            let pb_evt_fd = {
+                                                use std::os::unix::io::AsRawFd;
+                                                kern_phys_base_evt_for_worker.as_raw_fd()
+                                            };
+                                            let mut pfds = [
+                                                libc::pollfd { fd: kill_fd, events: libc::POLLIN, revents: 0 },
+                                                libc::pollfd { fd: pb_evt_fd, events: libc::POLLIN, revents: 0 },
+                                            ];
+                                            unsafe { libc::poll(pfds.as_mut_ptr(), 2, 200) };
+                                            continue;
+                                        };
+                                        let tcr_val = tcr_for_worker
+                                            .as_ref()
+                                            .map(|c| c.load(Ordering::Acquire))
+                                            .unwrap_or(0);
+                                        let cr3_val = cr3_for_worker.load(Ordering::Acquire);
+                                        let map_res = crate::monitor::bpf_map::GuestMemMapAccessorOwned
+                                            ::from_elf_with_hint(
+                                                mem_for_worker.clone(),
+                                                &elf,
+                                                &data_for_worker,
+                                                &vmlinux_for_worker,
+                                                tcr_val,
+                                                cr3_val,
+                                                pb_hint,
+                                            );
+                                        if kill_for_worker.load(Ordering::Acquire) {
+                                            return;
+                                        }
+                                        if let Ok(map) = map_res {
+                                            let po = map.guest_kernel()
+                                                .walk_context().page_offset;
+                                            if po & (1u64 << 63) == 0
+                                                || po & 0xFFF != 0
+                                            {
+                                                let mut pfd = libc::pollfd {
+                                                    fd: kill_fd,
+                                                    events: libc::POLLIN,
+                                                    revents: 0,
+                                                };
+                                                unsafe {
+                                                    libc::poll(&mut pfd, 1, 100);
+                                                }
+                                                continue;
+                                            }
+                                            let phys_base =
+                                                map.guest_kernel().phys_base();
+                                            let _ = kern_phys_base_for_worker
+                                                .compare_exchange(
+                                                    0,
+                                                    phys_base.wrapping_add(1),
+                                                    Ordering::Release,
+                                                    Ordering::Relaxed,
+                                                );
+                                            let prog_res = {
+                                                let shared_syms = map.guest_kernel().symbols_arc();
+                                                let kernel = crate::monitor::guest::GuestKernel
+                                                    ::from_elf_with_symbols(
+                                                        mem_for_worker.clone(),
+                                                        shared_syms,
+                                                        &elf,
+                                                        tcr_val,
+                                                        cr3_val,
+                                                        pb_hint,
+                                                    );
+                                                kernel.and_then(|k| {
+                                                    crate::monitor::bpf_prog::GuestMemProgAccessorOwned
+                                                        ::finish(k, &elf, &data_for_worker, &vmlinux_for_worker)
+                                                })
+                                            };
+                                            break Some((map, prog_res.ok()));
+                                        }
+                                        // Wait on kill_evt with 200ms
+                                        // timeout. Wakes instantly on
+                                        // kill; retries on timeout.
+                                        let mut pfd = libc::pollfd {
+                                            fd: kill_fd,
+                                            events: libc::POLLIN,
+                                            revents: 0,
+                                        };
+                                        unsafe {
+                                            libc::poll(&mut pfd, 1, 200);
+                                        }
+                                    };
+                                    if let Some(pair) = publish {
+                                        // Replace any leftover pair (from
+                                        // a re-init race where the coord
+                                        // hasn't yet adopted the previous
+                                        // publish) so the slot always
+                                        // holds the freshest values.
+                                        if let Ok(mut guard) = slot_for_worker.lock() {
+                                            *guard = Some(pair);
+                                        }
+                                        let _ = accessor_ready_evt_for_worker.write(1);
+                                    }
+                                    // Park until either kill (exit) or
+                                    // reinit (loop back into the init
+                                    // retry phase). Negative timeout =
+                                    // wait forever until one fd fires.
+                                    let mut pfds = [
+                                        libc::pollfd { fd: kill_fd, events: libc::POLLIN, revents: 0 },
+                                        libc::pollfd { fd: reinit_fd, events: libc::POLLIN, revents: 0 },
+                                    ];
+                                    unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
                                     if kill_for_worker.load(Ordering::Acquire) {
                                         return;
                                     }
-                                    if let Ok(map) = map_res {
-                                        let po = map.guest_kernel()
-                                            .walk_context().page_offset;
-                                        if po & (1u64 << 63) == 0
-                                            || po & 0xFFF != 0
-                                        {
-                                            let mut pfd = libc::pollfd {
-                                                fd: kill_fd,
-                                                events: libc::POLLIN,
-                                                revents: 0,
-                                            };
-                                            unsafe {
-                                                libc::poll(&mut pfd, 1, 100);
-                                            }
-                                            continue;
-                                        }
-                                        let phys_base =
-                                            map.guest_kernel().phys_base();
-                                        let _ = kern_phys_base_for_worker
-                                            .compare_exchange(
-                                                0,
-                                                phys_base.wrapping_add(1),
-                                                Ordering::Release,
-                                                Ordering::Relaxed,
-                                            );
-                                        let prog_res = {
-                                            let shared_syms = map.guest_kernel().symbols_arc();
-                                            let kernel = crate::monitor::guest::GuestKernel
-                                                ::from_elf_with_symbols(
-                                                    mem_for_worker.clone(),
-                                                    shared_syms,
-                                                    &elf,
-                                                    tcr_val,
-                                                    cr3_val,
-                                                    pb_hint,
-                                                );
-                                            kernel.and_then(|k| {
-                                                crate::monitor::bpf_prog::GuestMemProgAccessorOwned
-                                                    ::finish(k, &elf, &data_for_worker, &vmlinux_for_worker)
-                                            })
-                                        };
-                                        let _ = oncelock_for_worker
-                                            .set((map, prog_res.ok()));
-                                        let _ = accessor_ready_evt_for_worker.write(1);
-                                        return;
-                                    }
-                                    // Wait on kill_evt with 200ms
-                                    // timeout. Wakes instantly on
-                                    // kill; retries on timeout.
-                                    let mut pfd = libc::pollfd {
-                                        fd: kill_fd,
-                                        events: libc::POLLIN,
-                                        revents: 0,
-                                    };
-                                    unsafe {
-                                        libc::poll(&mut pfd, 1, 200);
-                                    }
+                                    // Drain the reinit_evt counter so a
+                                    // subsequent reset wakes us again
+                                    // (eventfd::read consumes the value).
+                                    let _ = reinit_for_worker.read();
+                                    continue 'reinit;
                                 }
                             })
                             .ok()
@@ -3234,10 +3327,13 @@ impl KtstrVm {
                     // run, which the existing call-site `is_some()`
                     // gates already handle gracefully.
                     if scan_tick && owned_accessor.is_none()
-                        && let Some((map, prog)) = accessors_oncelock.get()
+                        && let Some((map, prog)) = accessors_slot
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .take()
                     {
                         owned_accessor = Some(map);
-                        if let Some(prog) = prog.as_ref() {
+                        if let Some(prog) = prog {
                             owned_prog_accessor = Some(prog);
                         }
                         // (virt-KASLR derivation lives in
@@ -3448,7 +3544,7 @@ impl KtstrVm {
                     // cannot keep an unloaded map visible.
                     if scan_tick
                         && cached_bss_pa.is_some()
-                        && let Some(owned) = owned_accessor
+                        && let Some(owned) = owned_accessor.as_ref()
                     {
                         let accessor = owned.as_accessor();
                         let still_valid = match accessor.find_map("probe_bp.bss") {
@@ -3478,7 +3574,7 @@ impl KtstrVm {
                     }
                     if scan_tick
                         && cached_bss_pa.is_none()
-                        && let Some(owned) = owned_accessor
+                        && let Some(owned) = owned_accessor.as_ref()
                         && let Some(ref mem) = freeze_coord_mem
                     {
                         let accessor = owned.as_accessor();
@@ -3695,6 +3791,32 @@ impl KtstrVm {
                                 // republish a fresh PA once the
                                 // scheduler re-attaches.
                                 cached_exit_kind_pa = None;
+                                // Drop the owned BPF map/prog accessors
+                                // and wake the accessor-init worker so
+                                // it re-builds against the kernel state
+                                // the next scheduler will leave behind.
+                                // The owned pair's `GuestKernel` /
+                                // `map_idr_kva` / `prog_idr_kva` /
+                                // `BpfMapOffsets` / `BpfProgOffsets` are
+                                // kernel-boot constants and survive a
+                                // scheduler swap structurally, but the
+                                // per-owner caches (`per_cpu_offsets_
+                                // cache` etc.) and any future scheduler-
+                                // touching state belong with the
+                                // scheduler that was alive when they
+                                // populated. Refreshing here keeps the
+                                // accessor strictly aligned with the
+                                // live scheduler and prevents future
+                                // additions to the accessor surface
+                                // from silently caching across swaps.
+                                owned_accessor = None;
+                                owned_prog_accessor = None;
+                                if let Ok(mut g) = accessors_slot
+                                    .lock()
+                                {
+                                    *g = None;
+                                }
+                                let _ = accessor_reinit_evt.write(1);
                             }
                             WatchpointPublishResult::RebindDisarmed {
                                 previous,
@@ -3716,6 +3838,18 @@ impl KtstrVm {
                                 // next iteration's Published arm
                                 // republishes for the new scheduler.
                                 cached_exit_kind_pa = None;
+                                // Refresh the owned BPF accessors for
+                                // the new scheduler (see the
+                                // `Detached` arm for the full
+                                // rationale).
+                                owned_accessor = None;
+                                owned_prog_accessor = None;
+                                if let Ok(mut g) = accessors_slot
+                                    .lock()
+                                {
+                                    *g = None;
+                                }
+                                let _ = accessor_reinit_evt.write(1);
                             }
                             WatchpointPublishResult::Published {
                                 exit_kind_kva,
@@ -5255,7 +5389,7 @@ impl KtstrVm {
                             // frame the wire reply without traversing the
                             // dump path. Capture mode falls through.
                             if let FreezeMode::ColdOp(req) = &mode {
-                                let reply = if let Some(owned) = owned_accessor {
+                                let reply = if let Some(owned) = owned_accessor.as_ref() {
                                     kernel_op_dispatch::dispatch_kernel_op_batch(
                                         owned.guest_kernel(),
                                         dump_btf.as_ref(),
@@ -5507,7 +5641,7 @@ impl KtstrVm {
                                     }
                                 }
                             }
-                            if let Some(owned) = owned_accessor
+                            if let Some(owned) = owned_accessor.as_ref()
                                 && let Some(ref btf) = dump_btf
                             {
                                 // Build the prog-runtime capture
@@ -8895,28 +9029,39 @@ impl KtstrVm {
                 if !residual.is_empty() {
                     freeze_coord_virtio_con.lock().push_back_bulk(&residual);
                 }
-                // Drop the borrowed views into the OnceLock-owned
-                // accessor pair before joining the init worker. The
-                // worker itself never touches these references — it
-                // only writes to the OnceLock — but explicitly
-                // dropping makes the Arc reference-count transitions
-                // visible at one site instead of leaving the borrows
-                // implicitly alive across the join.
+                // Take owned_prog_accessor out so it can move into
+                // the shared slot below (preferring the live accessor
+                // the coord adopted over any leftover the worker
+                // published into `accessors_slot` post-reset). Drop
+                // the owned map accessor explicitly so the
+                // `Arc<GuestMem>` reference-count transition is
+                // visible at one site instead of implicit across
+                // the join.
+                let owned_prog_for_stash = owned_prog_accessor.take();
                 let _ = owned_accessor;
-                let _ = owned_prog_accessor;
-                // Join the accessor-init worker before the closure
-                // returns. The worker holds an `Arc<GuestMem>` whose
-                // host pointer addresses `vm.guest_mem`; that mapping
-                // is dropped right after run_vm joins the freeze
-                // coordinator thread (`freeze_coord_handle.join()`
-                // in run_vm), so any worker still running past this
-                // join would dereference freed memory through stale
-                // `Arc<GuestMem>` on its next `try_init_*` retry.
-                // The kill flag was flipped by the run-loop tear-down
-                // path; the worker honors it between retries and
-                // exits within ~100 ms (its sleep interval). On the
-                // happy path the worker has long since published the
-                // OnceLock and exited, so the join is a no-op.
+                // Signal the accessor-init worker to exit. The worker
+                // parks on `poll(kill_evt | reinit_evt, -1)` after each
+                // publish (so the coordinator can pulse `reinit_evt`
+                // on a scheduler swap and have the worker re-run
+                // init), which means a `break 'coord` exit path that
+                // didn't already flip `freeze_coord_kill` would leave
+                // the park indefinitely. Set the kill flag and pulse
+                // `kill_evt` here so every loop-exit path converges
+                // on the same teardown contract: the worker's
+                // `kill_for_worker.load()` check at the top of the
+                // inner retry loop (and immediately after the park
+                // wake) observes `true` and returns.
+                //
+                // Also drop reset triggers — the worker holds an
+                // `Arc<GuestMem>` whose host pointer addresses
+                // `vm.guest_mem`; that mapping is dropped right after
+                // run_vm joins the freeze coordinator thread
+                // (`freeze_coord_handle.join()` in run_vm), so any
+                // worker still running past this join would dereference
+                // freed memory through stale `Arc<GuestMem>` on its
+                // next `try_init_*` retry.
+                freeze_coord_kill.store(true, Ordering::Release);
+                let _ = freeze_coord_kill_evt.write(1);
                 if let Some(handle) = accessor_init_handle {
                     let jt = std::time::Instant::now();
                     let _ = handle.join();
@@ -8924,13 +9069,21 @@ impl KtstrVm {
                 }
                 // Extract the prog accessor for collect_verifier_stats
                 // and stash it in the shared slot so run_vm can pass
-                // it to VmRunState.
+                // it to VmRunState. Prefer the coord's live
+                // `owned_prog_for_stash` (the accessor in active use
+                // before teardown); if that's None — e.g. teardown ran
+                // before adoption, or a scheduler-detach reset cleared
+                // it and the worker hadn't republished — fall back to
+                // whatever the worker last left in the slot.
                 {
                     let slot = &prog_accessor_slot_for_coord;
-                    let extracted = Arc::try_unwrap(accessors_oncelock)
-                        .ok()
-                        .and_then(|lock| lock.into_inner())
-                        .and_then(|(_map, prog)| prog);
+                    let extracted = owned_prog_for_stash.or_else(|| {
+                        Arc::try_unwrap(accessors_slot)
+                            .ok()
+                            .and_then(|m| m.into_inner().ok())
+                            .and_then(|maybe| maybe)
+                            .and_then(|(_map, prog)| prog)
+                    });
                     *slot.lock_unpoisoned() = extracted;
                 }
                 eprintln!("CLEANUP: coord closure done {:?}", coord_exit_t.elapsed());
