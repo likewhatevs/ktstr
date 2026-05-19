@@ -91,3 +91,70 @@ fn scheduler_replace_mid_experiment_swaps_via_staged_pack(ctx: &Ctx) -> Result<A
     ];
     execute_steps(ctx, steps)
 }
+
+/// Validates the [`Op::RestartScheduler`](ktstr::scenario::ops::Op::RestartScheduler)
+/// hot-restart path: kills the currently-attached scheduler and
+/// re-spawns the BOOT scheduler at `/scheduler` + `/sched_args` +
+/// `/tmp/sched.log` (the canonical boot paths the wrapper passes
+/// to `spawn_scheduler_from_paths`). Successful restart means:
+///
+/// 1. SCHED_PID atomic reflects a NEW pid post-restart (different
+///    from the boot pid). The Op handler reads SCHED_PID before
+///    kill, SIGTERMs, waits for sched_ext state to reach
+///    `disabled`, spawns, and the spawn helper re-publishes
+///    SCHED_PID via [`set_sched_pid`](ktstr::vmm::rust_init::set_sched_pid).
+/// 2. The post-restart scheduler successfully binds to sched_ext —
+///    verified inside `spawn_scheduler_from_paths` via
+///    `poll_scx_attached` against `/sys/kernel/sched_ext/root/ops`.
+/// 3. The framework's host-side scheduler liveness monitor does
+///    NOT flag the kill as "scheduler died unexpectedly" —
+///    `SCHED_EXIT_SUPPRESS` gates the guest's sched_exit_monitor
+///    from sending the SchedExit message that would otherwise
+///    promote into the run-wide kill flag.
+///
+/// State-preservation note: scheduler BPF state is intentionally
+/// RESET across an Op::RestartScheduler (the kernel teardown +
+/// fresh prog load drops per-CPU + arena state). The test
+/// validates that the restart MECHANICS work — that the scheduler
+/// can be torn down + re-attached cleanly without leaving the
+/// guest in a stuck state. Per-state continuity is a separate
+/// concern outside Op::RestartScheduler's contract.
+#[ktstr_test(
+    scheduler = PRIMARY_SCHED,
+    llcs = 1,
+    cores = 2,
+    threads = 1,
+    memory_mib = 512,
+    duration_s = 5,
+    cleanup_budget_ms = 5000,
+)]
+fn scheduler_restart_mid_experiment_reattaches_cleanly(ctx: &Ctx) -> Result<AssertResult> {
+    use ktstr::scenario::ops::{HoldSpec, Op, Step, execute_steps};
+    let steps = vec![
+        // Pre-restart settle window — boot scheduler runs alone.
+        Step::new(
+            vec![],
+            HoldSpec::fixed(std::time::Duration::from_millis(500)),
+        ),
+        // The restart. RestartScheduler kills the boot scheduler
+        // via the same SIGTERM + sysrq-S + wait_for_scx_disabled
+        // path as ReplaceScheduler, then re-spawns the BOOT
+        // scheduler binary at /scheduler + /sched_args. Failure
+        // here (kill timeout, scx state stuck, attach failure)
+        // bubbles up through the apply_ops error path.
+        Step::new(
+            vec![Op::restart_scheduler()],
+            HoldSpec::fixed(std::time::Duration::from_millis(500)),
+        ),
+        // Post-restart settle window. The freshly-spawned boot
+        // scheduler's bind to sched_ext gets verified by the
+        // spawn helper's attach poll; this hold gives the live
+        // SCHED_PID monitor a window to confirm the post-restart
+        // scheduler runs workload-free without panicking.
+        Step::new(
+            vec![],
+            HoldSpec::fixed(std::time::Duration::from_millis(500)),
+        ),
+    ];
+    execute_steps(ctx, steps)
+}
