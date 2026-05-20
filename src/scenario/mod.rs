@@ -52,6 +52,7 @@
 pub mod affinity;
 pub mod backdrop;
 pub mod basic;
+pub mod bpf_pin;
 pub mod cpuset;
 pub mod dynamic;
 pub mod interaction;

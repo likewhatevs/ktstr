@@ -117,6 +117,14 @@ struct BackdropState<'a> {
     /// via `.kill()` at scenario teardown so the metric-emission
     /// pipeline still fires.
     payload_handles: Vec<PayloadEntry>,
+    /// BPF map fds opened via [`crate::scenario::ops::types::Op::PinBpfMap`].
+    /// Keyed by the map name the caller requested; the
+    /// [`std::os::fd::OwnedFd`] holds an extra refcount on the
+    /// kernel-side `struct bpf_map` so the map survives any
+    /// scheduler-process teardown (including
+    /// [`crate::scenario::ops::types::Op::ReplaceScheduler`]) until
+    /// scenario end. Drops close the fds and release the refcount.
+    pinned_bpf_maps: std::collections::HashMap<String, std::os::fd::OwnedFd>,
 }
 
 impl<'a> BackdropState<'a> {
@@ -127,6 +135,7 @@ impl<'a> BackdropState<'a> {
             handles: Vec::new(),
             cpusets: std::collections::HashMap::new(),
             payload_handles: Vec::new(),
+            pinned_bpf_maps: std::collections::HashMap::new(),
         }
     }
 }
@@ -3030,6 +3039,44 @@ fn apply_ops(
             Op::ReplaceScheduler { scheduler } => {
                 dispatch_replace_scheduler(scheduler)?;
             }
+            Op::PinBpfMap { name } => {
+                // Idempotent — pinning the same name twice no-ops.
+                // The first pin's OwnedFd already holds one extra
+                // refcount via `__bpf_map_inc_not_zero`
+                // (kernel/bpf/syscall.c:4859), which is sufficient
+                // to keep the map alive past any scheduler teardown.
+                // A second pin would bump the kernel refcount AGAIN
+                // and consume another host fd slot, but the test
+                // cannot observe the difference (one extra refcount
+                // and two are both "alive"), so we skip the work.
+                let name_key = name.as_ref().to_string();
+                if let std::collections::hash_map::Entry::Vacant(slot) =
+                    state.backdrop.pinned_bpf_maps.entry(name_key)
+                {
+                    let fd = crate::scenario::bpf_pin::open_bpf_map_fd_by_name(name.as_ref())
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "Op::PinBpfMap({name:?}): {e:#}\n\
+                                 \n\
+                                 Common causes:\n  \
+                                 (a) Target scheduler's BPF object hasn't finished \
+                                 loading. Place this op AFTER a hold long enough for \
+                                 the scheduler to attach (typically ~100ms for the \
+                                 small scx-ktstr fixture, longer for heavyweight \
+                                 schedulers).\n  \
+                                 (b) Step ran before any `Op::AttachScheduler` or \
+                                 before the boot scheduler started; pin must come \
+                                 after the scheduler that owns the map is up.\n  \
+                                 (c) Name exceeds the 15-char usable cap of \
+                                 `BPF_OBJ_NAME_LEN` and was truncated by libbpf when \
+                                 loaded — compare against the observed names in the \
+                                 error above; the kernel-visible name is the \
+                                 truncated form."
+                            )
+                        })?;
+                    slot.insert(fd);
+                }
+            }
         }
     }
     Ok(())
@@ -4672,6 +4719,14 @@ mod tests {
             .discriminant(),
             25,
             "ReplaceScheduler",
+        );
+        assert_eq!(
+            Op::PinBpfMap {
+                name: "scx_test.bss".into(),
+            }
+            .discriminant(),
+            26,
+            "PinBpfMap",
         );
     }
 
@@ -9503,6 +9558,7 @@ mod tests {
             Op::detach_scheduler(),
             Op::restart_scheduler(),
             Op::replace_scheduler(&CONSTRUCTOR_TEST_SCHEDULER),
+            Op::pin_bpf_map("constructor_test.bss"),
         ];
 
         // Track which variants we observed. Adding a variant to `Op`
@@ -9512,7 +9568,7 @@ mod tests {
         // the bit_index high-water-mark in `OpKind::bit_index`
         // changes** — the runtime index check at `seen[idx] = true`
         // will panic if the new variant's index >= the array length.
-        let mut seen = [false; 26];
+        let mut seen = [false; 27];
         for op in &constructed {
             let idx = match op {
                 Op::AddCgroup { .. } => 0,
@@ -9541,6 +9597,7 @@ mod tests {
                 Op::DetachScheduler => 23,
                 Op::RestartScheduler => 24,
                 Op::ReplaceScheduler { .. } => 25,
+                Op::PinBpfMap { .. } => 26,
             };
             seen[idx] = true;
         }

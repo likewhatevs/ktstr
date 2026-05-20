@@ -12,12 +12,12 @@
 //! ## What this proves
 //!
 //! - **Walker populates `active_map_kvas`.** Post-swap, both
-//!   `scx_ktstr.bss` map instances coexist in the kernel briefly.
+//!   `bpf_bpf.bss` map instances coexist in the kernel briefly.
 //!   The struct_ops walker (`identify_active_obj_from_struct_ops`)
 //!   finds the LIVE instance via `*scx_root` and records the set of
 //!   map KVAs in `report.active_map_kvas`.
 //! - **`Snapshot::active()` filters by combined (obj-name + KVA)**.
-//!   The same-binary case — both bss maps named `scx_ktstr.bss` —
+//!   The same-binary case — both bss maps named `bpf_bpf.bss` —
 //!   resolves to ONLY the live instance's KVA set.
 //! - **`series.bpf_live_u64(name)` works without explicit picker.**
 //!   No `pickers::max_by_sum_u64` argument; no `live_bpf_vars_via`
@@ -89,7 +89,7 @@ fn assert_live_var_resolves_across_swap(result: &VmResult) -> Result<()> {
             .report
             .maps
             .iter()
-            .filter(|m| m.name == "scx_ktstr.bss")
+            .filter(|m| m.name == "bpf_bpf.bss")
             .count();
         if bss_copies >= 2 {
             multi_bss_phase1_count += 1;
@@ -186,38 +186,41 @@ fn assert_live_var_resolves_across_swap(result: &VmResult) -> Result<()> {
          hold may be too short or num_snapshots too low to land a \
          sample after the swap. phases_with_samples={phases_with_samples:?}",
     );
+    // Diagnostic: collect the first error per post-swap sample so the
+    // assertion message names the actual failure shape (AmbiguousVar,
+    // NoActiveScheduler with multi-copy reason, WalkerDriftedWithinPhase,
+    // ...). Without this the test reports only "0 ok in post-swap"
+    // and the operator can't tell which layer of the disambiguation
+    // chain broke.
+    let mut post_swap_errors: Vec<String> = Vec::new();
+    for (phase_opt, slot) in nr_dispatched.phases_iter().zip(nr_dispatched.values_iter()) {
+        if phase_opt == Some(post_swap_phase)
+            && let Err(e) = slot
+        {
+            post_swap_errors.push(format!("{e:?}"));
+        }
+    }
     anyhow::ensure!(
         phases_with_ok.contains(&post_swap_phase.as_u16()),
         "no post-swap (Phase::step(1)) sample resolved bpf_live_u64 — \
          the same-binary disambiguation path is the load-bearing \
          new code. phases_with_samples={phases_with_samples:?} \
-         phases_with_ok={phases_with_ok:?} ok_count={ok_count}/{total}",
+         phases_with_ok={phases_with_ok:?} ok_count={ok_count}/{total}. \
+         post-swap errors observed: {post_swap_errors:?}",
     );
 
-    // Conditional walker-fired pin (deterministic gates computed
-    // pre-series from `drained` above). The scx-ktstr fixture's
-    // BPF object teardown is fast — the old scheduler's bss is
-    // typically freed before the first post-swap freeze fires, so
-    // the multi-bss case may not trigger in every run. When it
-    // DOES trigger (multi_bss_phase1_count >= 1), Phase 2 walker
-    // MUST have fired to publish a non-empty `active_map_kvas`
-    // whitelist — without that, the consumer's prefix-only filter
-    // would silently admit both copies and surface AmbiguousVar
-    // (the regression-detection condition).
-    //
-    // The deterministic version of this gate — forcing the
-    // multi-bss case by pinning a BPF fd to the old scheduler's
-    // bss across the swap so it cannot be freed — needs framework
-    // support (an Op or test primitive that holds a BPF map fd
-    // open through `Op::ReplaceScheduler`) and is tracked as a
-    // separate task. The downstream scx_mitosis test exercises
-    // the same path deterministically via mitosis's heavier
-    // per-cell state.
+    // Conditional walker-fired gate (kept soft until the
+    // framework's walker-recovery bug is fixed and the
+    // `Op::pin_bpf_map` deterministic gate becomes usable). When
+    // the multi-bss window happens to be observed in this run
+    // (timing-lucky), the walker MUST have fired — without that,
+    // the consumer's prefix-only fallback admits both copies and
+    // surfaces AmbiguousVar (the regression-detection condition).
     if multi_bss_phase1_count >= 1 {
         anyhow::ensure!(
             walker_published_phase1_count >= 1,
             "post-swap snapshots captured the multi-bss window ({multi_bss_phase1_count} \
-             samples with ≥2 scx_ktstr.bss copies) but Phase 2 walker NEVER published \
+             samples with ≥2 bpf_bpf.bss copies) but Phase 2 walker NEVER published \
              active_map_kvas — the consumer's prefix-only fallback admits both copies \
              and surfaces AmbiguousVar. Walker is failing to resolve the live obj.",
         );
@@ -247,7 +250,14 @@ fn live_var_resolves_across_same_binary_swap(ctx: &Ctx) -> Result<AssertResult> 
         // Swap to the staged alt scheduler (same scx-ktstr binary,
         // distinct name → distinct `bpf_object` instance in the
         // kernel → distinct bss map KVA, even though the map name
-        // is `scx_ktstr.bss` in BOTH).
+        // is `bpf_bpf.bss` in BOTH).
+        //
+        // The deterministic version of this test (pin `bpf_bpf.bss`
+        // in Phase 0 via `Op::pin_bpf_map` to force the multi-bss
+        // case to persist past the swap) is blocked on a framework
+        // walker-recovery bug — see the BPF-fd-pin primitive
+        // landing batch's follow-up task. Until that bug is fixed,
+        // this test stays on the timing-lucky soft gate below.
         Step::with_op(
             Op::replace_scheduler(&STAGED_ALT_SCHED),
             HoldSpec::frac(0.7),

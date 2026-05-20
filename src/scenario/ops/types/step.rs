@@ -387,6 +387,7 @@ impl OpKind {
             OpKind::DetachScheduler => 23,
             OpKind::RestartScheduler => 24,
             OpKind::ReplaceScheduler => 25,
+            OpKind::PinBpfMap => 26,
         }
     }
 }
@@ -787,5 +788,17 @@ impl Op {
     /// assert per-phase metric delta across the boundary).
     pub const fn replace_scheduler(scheduler: &'static crate::test_support::Scheduler) -> Self {
         Op::ReplaceScheduler { scheduler }
+    }
+
+    /// Pin a BPF map by name, holding a refcount on it for the
+    /// scenario lifetime. See [`Op::PinBpfMap`] for the
+    /// motivation (force the same-binary swap-window multi-bss
+    /// case to persist long enough for at least one post-swap
+    /// freeze to observe both bss copies), the ordering
+    /// requirement (pin BEFORE `Op::ReplaceScheduler`), and the
+    /// idempotence contract (same-name re-pin is a no-op; the
+    /// originally-pinned map instance is the one held).
+    pub fn pin_bpf_map(name: impl Into<Cow<'static, str>>) -> Self {
+        Op::PinBpfMap { name: name.into() }
     }
 }

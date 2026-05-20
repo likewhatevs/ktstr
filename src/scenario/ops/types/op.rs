@@ -719,6 +719,92 @@ pub enum Op {
     ReplaceScheduler {
         scheduler: &'static crate::test_support::Scheduler,
     },
+    /// Open a BPF map fd by name and hold it for the scenario lifetime.
+    ///
+    /// **Why this exists.** `Op::ReplaceScheduler` kills the outgoing
+    /// scheduler process; libbpf's drop path then releases the map
+    /// fds the loader was holding. Once the last refcount on a map
+    /// drops, the kernel frees it — typically before any post-swap
+    /// freeze captures, so the multi-bss "same-binary swap window"
+    /// case (two `<obj>.bss` copies coexisting briefly) closes too
+    /// fast to be reliably observed in a test. `PinBpfMap` holds an
+    /// extra refcount on the named map so the kernel keeps it alive
+    /// until the scenario ends.
+    ///
+    /// **Semantics.** Walks the kernel's map ID space (via
+    /// [`libbpf_rs::query::MapInfoIter`], which wraps
+    /// `BPF_MAP_GET_NEXT_ID` + `BPF_MAP_GET_FD_BY_ID` +
+    /// `BPF_OBJ_GET_INFO_BY_FD`) and keeps the fd whose name matches.
+    /// The held fd lives in the scenario's Backdrop state and drops
+    /// (via std `OwnedFd` `Drop`) at scenario teardown. Multiple
+    /// `PinBpfMap` ops with **distinct** names accumulate; pinning the
+    /// **same** name twice is a no-op (the second call returns without
+    /// re-opening the fd, so the originally-pinned map instance is the
+    /// one held — not the second-call-time instance).
+    ///
+    /// **Name truncation.** BPF map names are capped at
+    /// `BPF_OBJ_NAME_LEN = 16` bytes including the trailing NUL, so
+    /// 15 usable chars max per `kernel/bpf/syscall.c`'s
+    /// `bpf_obj_name_cpy`. Pass the kernel-visible name (typically
+    /// `<obj>.bss` / `<obj>.data` / `<obj>.rodata`). When a libbpf
+    /// object name + section suffix exceeds the 15-char cap, libbpf
+    /// truncates the object prefix at load time and the kernel-side
+    /// name is the truncated form; the framework does not auto-
+    /// truncate the user-supplied string, so pass the post-truncation
+    /// form. Reading the map names from a prior
+    /// [`crate::monitor::dump::FailureDumpReport`]'s `maps[].name`
+    /// or via `bpftool map list` is the safe way to discover the
+    /// exact string the kernel sees.
+    ///
+    /// **Order.** Place this op AFTER the scheduler that owns the
+    /// target map has attached (typically a small fixed hold suffices
+    /// — ~100ms for the small scx-ktstr fixture, longer for
+    /// heavyweight schedulers). For the same-binary swap-window
+    /// scenario specifically: pin the **outgoing** scheduler's bss
+    /// **before** `Op::ReplaceScheduler` runs — pinning after the
+    /// swap is too late because the outgoing scheduler's bss has
+    /// already been freed by libbpf's drop path. The pin walker
+    /// picks the lowest-id matching map, so the outgoing copy (the
+    /// older id) is the one held; the incoming scheduler's load
+    /// then creates a second copy that's also kept alive because
+    /// the outgoing refcount blocks the kernel from freeing the id.
+    ///
+    /// **Failure surface.** The pin runs at Step apply time inside
+    /// `execute_steps` / `execute_scenario`. A failure (no matching
+    /// map found in the walk) bails out of the apply path as an
+    /// `Err` from `execute_steps`; the scenario stops before the
+    /// next Step runs and the `post_vm` callback is not invoked.
+    /// The underlying [`libbpf_rs::query::MapInfoIter`] silently
+    /// terminates iteration on any non-`ENOENT` errno from the BPF
+    /// ID walk (including `EPERM` from missing `CAP_SYS_ADMIN`), so
+    /// such errors surface as the no-matching-map case rather than
+    /// a distinct EPERM error — acceptable because ktstr always runs
+    /// as root inside the guest, so the CAP_SYS_ADMIN gate at
+    /// `kernel/bpf/syscall.c:4741` is always satisfied and the EPERM
+    /// path is unreachable in practice.
+    ///
+    /// **Example.**
+    /// ```ignore
+    /// let steps = vec![
+    ///     // Phase 0: primary scheduler runs alone; pin BEFORE the swap.
+    ///     Step::with_op(
+    ///         Op::pin_bpf_map("<obj>.bss"),
+    ///         HoldSpec::frac(0.3),
+    ///     ),
+    ///     // Phase 1: swap to a same-binary alt — the pinned map
+    ///     // keeps the OUTGOING bss alive across the teardown.
+    ///     Step::with_op(
+    ///         Op::replace_scheduler(&STAGED_ALT_SCHED),
+    ///         HoldSpec::frac(0.7),
+    ///     ),
+    /// ];
+    /// ```
+    ///
+    /// **See also.** [`crate::scenario::bpf_pin::open_bpf_map_fd_by_name`]
+    /// for the underlying helper and `tests/live_var_disambiguation_e2e.rs`
+    /// for the swap-window conditional walker-fired gate this pin is
+    /// designed to make deterministic.
+    PinBpfMap { name: Cow<'static, str> },
 }
 
 /// How to compute a cpuset from topology.
