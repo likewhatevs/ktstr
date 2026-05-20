@@ -673,10 +673,20 @@ CtprofMetricDef {
 ```
 
 The `name` field is the canonical metric identifier — used by
-`--sort-by`, `--metrics`, and the `metric-list` output. (The
-`--columns` flag accepts layout names — `group`, `threads`,
-`metric`, `baseline`, `candidate`, `delta`, `%`, `arrow`,
-`value` — not metric names.) Names are ASCII short-form
+`--sort-by`, `--metrics`, and the `metric-list` output. The
+`--columns` flag accepts layout names, not metric names, and
+the accepted set differs by subcommand:
+
+- `ctprof compare --columns` accepts `group`, `threads`,
+  `metric`, `baseline`, `candidate`, `delta`, `%`, `arrow`,
+  `tags`, `uptime`. `value` is rejected on this side — it's
+  the single-snapshot show column.
+- `ctprof show --columns` accepts `group`, `threads`, `metric`,
+  `value`, `tags`, `uptime`. The compare-only set
+  (`baseline`, `candidate`, `delta`, `%`, `arrow`) is
+  rejected on the show side.
+
+Names are ASCII short-form
 (matching the capture-side field name where possible).
 `sched_class` and `config_gates` render as bracketed suffixes
 in `metric-list` output (`[cfs-only]`, `[SCHEDSTATS]`) so
