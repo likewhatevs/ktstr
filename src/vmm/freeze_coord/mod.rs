@@ -925,9 +925,38 @@ impl KtstrVm {
         // `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` directly and stores the
         // resulting report via `bridge.store(name, report)` so the
         // host owns the entire capture pipeline.
+        // Allocate the accessor-init worker's publish-seqno + worker-
+        // state atomics here so the snapshot bridge below adopts the
+        // same Arc the worker (spawned much later at L2237+) bumps on
+        // every successful publish / state transition. The dispatch
+        // for `Op::ReplaceScheduler` / `Op::AttachScheduler` reads the
+        // seqno via the thread-local bridge and waits for it to
+        // advance, gating the op on the new scheduler's BPF accessor
+        // pair landing — see
+        // [`crate::scenario::snapshot::SnapshotBridge::wait_for_accessor_publish_advance`].
+        let accessor_publish_seqno: Arc<std::sync::atomic::AtomicU64> =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let accessor_worker_state: Arc<std::sync::atomic::AtomicU8> =
+            Arc::new(std::sync::atomic::AtomicU8::new(
+                crate::scenario::snapshot::bridge::accessor_worker_state::TRYING,
+            ));
+        // Dispatcher wake EventFd — pulsed by the worker on every
+        // seqno bump AND on FAILED_PERMANENTLY exit so the bridge's
+        // wait paths react at kernel-scheduling-tick latency instead
+        // of the 50 ms sleep tail an atomic-only loop would carry.
+        // EFD_NONBLOCK so a saturating writer never blocks; the
+        // atomic is the source of truth, the fd is just a wake.
+        // Distinct from `accessor_ready_evt` to avoid the dispatcher
+        // racing the coord's epoll loop for the same wake count.
+        let accessor_dispatcher_wake_evt: Arc<EventFd> =
+            Arc::new(EventFd::new(EFD_NONBLOCK).expect("eventfd for accessor_dispatcher_wake"));
         let snapshot_bridge = {
             let cb: crate::scenario::snapshot::CaptureCallback = Arc::new(|_| None);
-            crate::scenario::snapshot::SnapshotBridge::new(cb)
+            crate::scenario::snapshot::SnapshotBridge::new(cb).with_accessor_state(
+                accessor_publish_seqno.clone(),
+                accessor_worker_state.clone(),
+                accessor_dispatcher_wake_evt.clone(),
+            )
         };
 
         // Probes-ready broadcast EventFd. Shared between the monitor
@@ -2252,6 +2281,10 @@ impl KtstrVm {
                         let kill_evt_for_worker = freeze_coord_kill_evt.clone();
                         let slot_for_worker = accessors_slot.clone();
                         let reinit_for_worker = accessor_reinit_evt.clone();
+                        let publish_seqno_for_worker = accessor_publish_seqno.clone();
+                        let worker_state_for_worker = accessor_worker_state.clone();
+                        let dispatcher_wake_for_worker =
+                            accessor_dispatcher_wake_evt.clone();
                         std::thread::Builder::new()
                             .name("vmm-accessor-init".into())
                             .spawn(move || {
@@ -2274,6 +2307,21 @@ impl KtstrVm {
                                             error = %e,
                                             "accessor-init: vmlinux ELF parse failed"
                                         );
+                                        // Mark FAILED_PERMANENTLY so
+                                        // a swap-op wait surfaces the
+                                        // terminal-worker diagnostic
+                                        // rather than the generic
+                                        // deadline-exceeded message.
+                                        worker_state_for_worker.store(
+                                            crate::scenario::snapshot::bridge::accessor_worker_state::FAILED_PERMANENTLY,
+                                            Ordering::Release,
+                                        );
+                                        // Wake any pending dispatcher
+                                        // wait so it surfaces the
+                                        // FAILED_PERMANENTLY bail
+                                        // immediately instead of
+                                        // waiting for its deadline.
+                                        let _ = dispatcher_wake_for_worker.write(1);
                                         return;
                                     }
                                 };
@@ -2306,6 +2354,21 @@ impl KtstrVm {
                                                  will run without owned-accessor \
                                                  pair (freeze dump path unavailable)"
                                             );
+                                            // First-init 60s budget
+                                            // burned without a publish
+                                            // — worker exits after
+                                            // surfacing the break path.
+                                            // Mark FAILED_PERMANENTLY
+                                            // so the dispatch wait sees
+                                            // the terminal state rather
+                                            // than blocking the full
+                                            // deadline on a worker
+                                            // that's already given up.
+                                            worker_state_for_worker.store(
+                                                crate::scenario::snapshot::bridge::accessor_worker_state::FAILED_PERMANENTLY,
+                                                Ordering::Release,
+                                            );
+                                            let _ = dispatcher_wake_for_worker.write(1);
                                             break None;
                                         }
                                         // Use the guest-reported phys_base
@@ -2411,7 +2474,35 @@ impl KtstrVm {
                                         if let Ok(mut guard) = slot_for_worker.lock() {
                                             *guard = Some(pair);
                                         }
+                                        // Bump publish seqno + flip
+                                        // worker_state to SUCCEEDED
+                                        // BEFORE the eventfd writes so
+                                        // any dispatcher poll that
+                                        // wakes on the fd and re-reads
+                                        // the atomic sees the advance.
+                                        // Release ordering pairs with
+                                        // the dispatcher's Acquire
+                                        // loads in
+                                        // wait_for_accessor_publish_advance
+                                        // / wait_for_worker_state_not_trying.
+                                        publish_seqno_for_worker
+                                            .fetch_add(1, Ordering::Release);
+                                        worker_state_for_worker.store(
+                                            crate::scenario::snapshot::bridge::accessor_worker_state::SUCCEEDED,
+                                            Ordering::Release,
+                                        );
+                                        // Two distinct wake fds: the
+                                        // coord drains accessor_ready_evt
+                                        // via its epoll loop, and the
+                                        // dispatcher (Op::AttachScheduler /
+                                        // Op::ReplaceScheduler) drains
+                                        // accessor_dispatcher_wake_evt via
+                                        // its bridge-side poll. Separate
+                                        // fds prevent the two consumers
+                                        // from racing for the same wake
+                                        // count.
                                         let _ = accessor_ready_evt_for_worker.write(1);
+                                        let _ = dispatcher_wake_for_worker.write(1);
                                     }
                                     // Park until kill or reinit. 100 ms
                                     // poll timeout so a kill_evt missed

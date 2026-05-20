@@ -3358,6 +3358,32 @@ fn spawn_scheduler_for_op(
 /// pipeline to pick up; the full sidecar schema wire-in lands
 /// alongside the rest of the phase pipeline.
 fn dispatch_attach_scheduler(scheduler: &'static crate::test_support::Scheduler) -> Result<()> {
+    // Serialize against any in-flight worker publish BEFORE the
+    // dispatcher captures `seqno_before`. The accessor-init worker
+    // has a 60 s boot budget for its first publish; if the user's
+    // test has an auto-boot scheduler config, the worker may be
+    // mid-init for the boot scheduler when the user's
+    // Op::AttachScheduler dispatches. Without this gate, the
+    // dispatcher's read-spawn-wait sequence could be satisfied by
+    // the BOOT scheduler's first publish (seqno 0 → 1) and return
+    // success before the user's scheduler is actually live.
+    //
+    // After this wait, worker_state ∈ {SUCCEEDED, FAILED_PERMANENTLY}
+    // (FAILED → bail) — the boot publish has either landed and
+    // the slab settled, OR the worker has given up and a fresh
+    // attach from a stuck state will hang the same way regardless.
+    // Either way, the seqno captured AFTER this wait reflects a
+    // quiescent slab and any subsequent advance MUST belong to the
+    // worker re-init triggered by THIS op's spawn (the coord's
+    // Published-arm pulse fires reinit_evt for the new scheduler).
+    let boot_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    if let Some(result) = crate::scenario::snapshot::with_active_bridge(|b| {
+        b.wait_for_worker_state_not_trying(boot_deadline, "Op::AttachScheduler")
+    }) {
+        result?;
+    }
+    let seqno_before =
+        crate::scenario::snapshot::with_active_bridge(|b| b.accessor_publish_seqno()).unwrap_or(0);
     let binary = crate::test_support::staged::staged_scheduler_binary_path(scheduler.name);
     let args = crate::test_support::staged::staged_scheduler_args_path(scheduler.name);
     let log = staged_scheduler_log_path(scheduler.name);
@@ -3368,6 +3394,19 @@ fn dispatch_attach_scheduler(scheduler: &'static crate::test_support::Scheduler)
     // "first scheduler" or post-Detach attach); the restart helper
     // handles the empty-slot case as a fresh install.
     crate::vmm::rust_init::restart_sched_exit_monitor_with_log(Some(&log));
+    // 30 s deadline: the coord's Published-arm pulse + worker's
+    // no-deadline reinit budget (post-boot the 60 s gate is gone)
+    // typically lands in <500 ms (one scan tick + tens of ms for
+    // from_elf_with_hint). 30 s gives 60× margin for slow hosts /
+    // cold-cache vmlinux reads on the FIRST post-boot attach,
+    // where the slab may still be settling. Replace uses 5 s
+    // because the kill flushes the slab and the re-init lands
+    // faster; attach onto a freshly-booted system can be slower.
+    wait_for_accessor_publish_or_bail(
+        "Op::AttachScheduler",
+        seqno_before,
+        std::time::Duration::from_secs(30),
+    )?;
     tracing::info!(
         op = "AttachScheduler",
         scheduler_name = scheduler.name,
@@ -3435,6 +3474,31 @@ fn dispatch_replace_scheduler(scheduler: &'static crate::test_support::Scheduler
     // log path matches the spawn_scheduler_for_op log arg above so
     // failure-dump output goes to the new scheduler's own file.
     crate::vmm::rust_init::restart_sched_exit_monitor_with_log(Some(&log));
+    // Capture the publish seqno AFTER kill+spawn (not before kill).
+    // Any worker publish triggered by a prior detach (concurrent
+    // coord scan-tick during our kill) lands while the BPF maps
+    // for the OLD scheduler are still in the slab — that publish
+    // would satisfy a pre-kill-baseline gate and let
+    // `Snapshot::active()` return stale OLD state. Capturing AFTER
+    // the new scheduler is spawned excludes any race-bump from
+    // `seqno_before` so the wait MUST observe a SUBSEQUENT publish,
+    // which structurally has to be the worker re-init triggered by
+    // our newly-spawned scheduler. None → bridge isn't installed
+    // (test harness path); the wait degenerates to Ok(0).
+    let seqno_before =
+        crate::scenario::snapshot::with_active_bridge(|b| b.accessor_publish_seqno()).unwrap_or(0);
+    // 5s deadline: the worker's no-deadline reinit path runs after
+    // a successful first-attach so the typical post-swap reinit
+    // budget is one freeze-coord scan tick (250ms at
+    // src/vmm/freeze_coord/mod.rs SCAN_INTERVAL) plus
+    // from_elf_with_hint's tens of ms. 5s gives 20× margin while
+    // bounding op latency. A timeout surfaces as an actionable
+    // anyhow::bail with the worker-state sentinel attached.
+    wait_for_accessor_publish_or_bail(
+        "Op::ReplaceScheduler",
+        seqno_before,
+        std::time::Duration::from_secs(5),
+    )?;
     tracing::info!(
         op = "ReplaceScheduler",
         prev_pid = prev_pid,
@@ -3444,6 +3508,29 @@ fn dispatch_replace_scheduler(scheduler: &'static crate::test_support::Scheduler
         "scheduler replaced",
     );
     Ok(())
+}
+
+/// Wait helper used by `dispatch_replace_scheduler`. Reads the
+/// active bridge's `wait_for_accessor_publish_advance` and threads
+/// the timeout budget per op. Returns `Ok(())` when the accessor-
+/// init worker has advanced the publish seqno past `seqno_before`,
+/// or when no bridge is installed (unit-test path — the wait
+/// degenerates gracefully). Surfaces the wait error via `?` on
+/// the inner `anyhow::Result` so the op dispatch returns the
+/// worker-state diagnostic verbatim.
+fn wait_for_accessor_publish_or_bail(
+    op_label: &str,
+    seqno_before: u64,
+    budget: std::time::Duration,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + budget;
+    let res = crate::scenario::snapshot::with_active_bridge(|b| {
+        b.wait_for_accessor_publish_advance(seqno_before, deadline, op_label)
+    });
+    match res {
+        Some(Ok(_)) | None => Ok(()),
+        Some(Err(e)) => Err(e),
+    }
 }
 
 /// **Timeout choice.** The 30 s wire-fallback timeout is sized for

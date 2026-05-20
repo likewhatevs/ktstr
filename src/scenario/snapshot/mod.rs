@@ -175,7 +175,7 @@ mod error;
 
 pub use error::{DrainedSnapshotEntry, MissingStatsReason, SnapshotError, SnapshotResult};
 
-mod bridge;
+pub mod bridge;
 
 pub use bridge::{
     BridgeGuard, CaptureCallback, KernelOpCallback, MAX_STORED_EVENTS, MAX_STORED_SNAPSHOTS,

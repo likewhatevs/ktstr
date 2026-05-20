@@ -408,6 +408,66 @@ pub struct SnapshotBridge {
     /// `execute_steps` returns to verify each request's outcome.
     kernel_ops: Arc<Mutex<Vec<(String, crate::vmm::wire::KernelOpReplyPayload)>>>,
     watch_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Monotonic counter bumped by the freeze-coordinator's accessor-
+    /// init worker on every successful slot publish (initial attach +
+    /// each subsequent re-init triggered by scheduler swap). Paired
+    /// with [`Self::accessor_worker_state`] so a scheduler-swap op can
+    /// wait for the new scheduler's BPF maps to land before returning
+    /// success. `None` for bridges built without an accessor (test
+    /// fixtures that never trigger reinit); see
+    /// [`Self::with_accessor_state`].
+    accessor_publish_seqno: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Liveness sentinel for the accessor-init worker — set by the
+    /// worker as it transitions through its retry / publish / exit
+    /// states. Values match [`accessor_worker_state`] module constants
+    /// (Trying / Succeeded / FailedPermanently). The dispatcher in
+    /// `Op::ReplaceScheduler` / `Op::AttachScheduler` reads this on
+    /// timeout so the surfaced error distinguishes "worker still
+    /// trying — bump deadline" from "worker exited — retry will
+    /// hang." `None` mirrors `accessor_publish_seqno`.
+    accessor_worker_state: Option<Arc<std::sync::atomic::AtomicU8>>,
+    /// Dispatcher wake EventFd. The accessor-init worker pulses
+    /// this fd in lock-step with every seqno bump AND on every
+    /// terminal worker_state transition (FAILED_PERMANENTLY).
+    /// Wait paths in [`Self::wait_for_accessor_publish_advance`] /
+    /// [`Self::wait_for_worker_state_not_trying`] `poll(2)` on the
+    /// fd with the remaining deadline so the wake latency is one
+    /// kernel scheduling tick instead of the 50 ms sleep tail an
+    /// atomic-only loop would carry. Distinct from `accessor_ready_evt`
+    /// (which the coord epoll drains) so the dispatcher and the
+    /// coord don't race for the same wake count.
+    ///
+    /// **Single-consumer assumption.** The fd is read (drained) only
+    /// from the wait paths; the bridge is installed thread-local via
+    /// [`Self::set_thread_local`], and each freeze-coordinator
+    /// instance constructs one bridge → one wake fd. Multiple
+    /// concurrent dispatchers sharing the same fd could race for the
+    /// drain edge (the atomic re-check at the top of each wait loop
+    /// keeps that benign — atomic is source of truth — but a missed
+    /// wake adds latency). Per-VM bridge ownership today guarantees
+    /// no such sharing. `None` mirrors the other accessor-state fields.
+    accessor_dispatcher_wake_evt: Option<Arc<vmm_sys_util::eventfd::EventFd>>,
+}
+
+/// State codes for the accessor-init worker, written to the
+/// [`SnapshotBridge::accessor_worker_state`] atomic. Two-bit
+/// encoding leaves the high bits open for future sub-states (e.g.
+/// "shutting down").
+pub mod accessor_worker_state {
+    /// Worker is in its retry loop trying to initialize the BPF
+    /// accessor pair. Both initial-attach and post-swap re-init
+    /// path through this state before reaching Succeeded.
+    pub const TRYING: u8 = 0;
+    /// Worker has published at least one accessor pair successfully.
+    /// Subsequent re-inits also publish via this transition (the
+    /// state stays SUCCEEDED while the seqno bumps).
+    pub const SUCCEEDED: u8 = 1;
+    /// Worker has exited and will not publish again — ELF parse
+    /// failure, the 60 s boot-budget deadline, or some other
+    /// terminal condition the worker detected. A dispatcher seeing
+    /// this on a timeout knows to surface "worker exited" rather
+    /// than "still trying."
+    pub const FAILED_PERMANENTLY: u8 = 2;
 }
 
 impl std::fmt::Debug for SnapshotBridge {
@@ -446,6 +506,207 @@ impl SnapshotBridge {
             snapshots: Arc::new(Mutex::new(SnapshotStore::new())),
             kernel_ops: Arc::new(Mutex::new(Vec::new())),
             watch_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            accessor_publish_seqno: None,
+            accessor_worker_state: None,
+            accessor_dispatcher_wake_evt: None,
+        }
+    }
+
+    /// Install the accessor-init worker's publish-seqno, worker-state,
+    /// and dispatcher-wake EventFd so
+    /// [`Self::wait_for_accessor_publish_advance`] /
+    /// [`Self::wait_for_worker_state_not_trying`] can block scheduler-
+    /// swap ops until the new scheduler's BPF maps land — with kernel-
+    /// scheduling-tick wake latency rather than the 50 ms sleep tail
+    /// an atomic-only loop would carry. Called by the freeze-coordinator
+    /// when it sets up the worker (`vmm-accessor-init` thread); test
+    /// bridges that don't drive a real worker can omit this call and
+    /// the wait becomes a no-op that returns `Ok(0)` immediately.
+    pub fn with_accessor_state(
+        mut self,
+        publish_seqno: Arc<std::sync::atomic::AtomicU64>,
+        worker_state: Arc<std::sync::atomic::AtomicU8>,
+        dispatcher_wake_evt: Arc<vmm_sys_util::eventfd::EventFd>,
+    ) -> Self {
+        self.accessor_publish_seqno = Some(publish_seqno);
+        self.accessor_worker_state = Some(worker_state);
+        self.accessor_dispatcher_wake_evt = Some(dispatcher_wake_evt);
+        self
+    }
+
+    /// Snapshot of the accessor-init worker's current publish seqno.
+    /// Returns 0 for bridges built without an accessor (test fixtures
+    /// — the dispatch wait sees no advance to gate on and the op
+    /// returns immediately). Read with `Acquire` so the seqno orders
+    /// against the worker's `Release` bump.
+    pub fn accessor_publish_seqno(&self) -> u64 {
+        self.accessor_publish_seqno
+            .as_ref()
+            .map(|s| s.load(std::sync::atomic::Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
+    /// Block until the accessor-init worker exits the TRYING state
+    /// (transitions to SUCCEEDED on its first publish, or to
+    /// FAILED_PERMANENTLY on a terminal worker exit). Used by
+    /// `Op::AttachScheduler` to serialize against the worker's
+    /// concurrent boot-publish: capturing the seqno baseline AFTER
+    /// the boot publish completes is the only way to ensure the
+    /// next observed seqno advance belongs to the just-attached
+    /// scheduler rather than to a co-resident boot scheduler that
+    /// finished its 60 s init in parallel. Event-driven via
+    /// `accessor_dispatcher_wake_evt` — wake latency is one
+    /// kernel scheduling tick, not a 50 ms poll. No-op (Ok(())) for
+    /// bridges without an accessor.
+    pub fn wait_for_worker_state_not_trying(
+        &self,
+        deadline: std::time::Instant,
+        op_label: &str,
+    ) -> anyhow::Result<()> {
+        let Some(state) = self.accessor_worker_state.as_ref() else {
+            return Ok(());
+        };
+        loop {
+            let cur = state.load(std::sync::atomic::Ordering::Acquire);
+            if cur != accessor_worker_state::TRYING {
+                if cur == accessor_worker_state::FAILED_PERMANENTLY {
+                    anyhow::bail!(
+                        "{op_label}: accessor-init worker exited \
+                         (FAILED_PERMANENTLY) before this op could run — \
+                         check freeze-coord 'vmm-accessor-init' logs for ELF \
+                         parse or boot-budget failures"
+                    );
+                }
+                return Ok(());
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                anyhow::bail!(
+                    "{op_label}: accessor-init worker stayed in TRYING state \
+                     past the deadline — the worker's first publish has not \
+                     completed. Likely cause: kernel boot stalled before \
+                     accessor's bootstrap symbols became readable. Check \
+                     freeze-coord logs for `accessor-init:` lines"
+                );
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            self.poll_dispatcher_wake(remaining);
+            // Loop back to re-check state. The atomic is the source
+            // of truth — the eventfd is just a fast wake; a spurious
+            // wake (e.g. a publish landing while we're already past
+            // TRYING) drops through to the next state check.
+        }
+    }
+
+    /// Block on the dispatcher-wake EventFd for up to `remaining`.
+    /// Returns regardless of cause (POLLIN, POLLNVAL, timeout) —
+    /// the caller's atomic re-check after poll-return is the source
+    /// of truth; this is just a "wait for SOMETHING to happen".
+    /// `EFD_NONBLOCK`-set fd's `read` is best-effort and ignored
+    /// (the seqno bump or worker_state store carries the actual
+    /// signal). When the bridge was built without a wake fd or
+    /// `remaining` is zero, returns immediately without sleeping.
+    fn poll_dispatcher_wake(&self, remaining: std::time::Duration) {
+        if remaining.is_zero() {
+            return;
+        }
+        let Some(evt) = self.accessor_dispatcher_wake_evt.as_ref() else {
+            // No wake fd — fall back to a short sleep to avoid a
+            // tight busy-loop. This path only fires for tests built
+            // without with_accessor_state; production bridges always
+            // wire the fd.
+            std::thread::sleep(remaining.min(std::time::Duration::from_millis(50)));
+            return;
+        };
+        let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let fd = {
+            use std::os::unix::io::AsRawFd;
+            evt.as_raw_fd()
+        };
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pollfd is a POD struct; libc::poll reads/writes
+        // the slice in-bounds for nfds == 1.
+        unsafe {
+            libc::poll(&mut pfd, 1, ms);
+        }
+        // Drain the counter so a subsequent poll doesn't re-fire
+        // immediately on the same edge. EFD_NONBLOCK so an empty fd
+        // returns EAGAIN — ignore the result.
+        let _ = evt.read();
+    }
+
+    /// Block until the accessor-init worker's publish seqno advances
+    /// past `seqno_before`, or until `deadline` elapses. The dispatch
+    /// for `Op::ReplaceScheduler` / `Op::AttachScheduler` calls this
+    /// after spawning the new scheduler so the op only returns success
+    /// once the new scheduler's BPF accessor pair has been re-published
+    /// and a subsequent `Snapshot::active()` reflects the swap.
+    ///
+    /// On timeout the surfaced error reads the worker-state sentinel
+    /// to distinguish "still trying" (transient — operator can bump
+    /// the deadline) from "worker exited" (terminal — retry will
+    /// hang the same way). Bridges without an accessor (test fixtures
+    /// that omit [`Self::with_accessor_state`]) succeed immediately
+    /// with `Ok(0)` so unit-test scenarios don't synthesize a worker.
+    pub fn wait_for_accessor_publish_advance(
+        &self,
+        seqno_before: u64,
+        deadline: std::time::Instant,
+        op_label: &str,
+    ) -> anyhow::Result<u64> {
+        let (seqno, state) = match (
+            self.accessor_publish_seqno.as_ref(),
+            self.accessor_worker_state.as_ref(),
+        ) {
+            (Some(s), Some(w)) => (s, w),
+            _ => return Ok(0),
+        };
+        // Tight initial check so a publish that already landed
+        // between the dispatcher's pre-spawn `accessor_publish_seqno()`
+        // load and this call returns without sleeping.
+        let cur = seqno.load(std::sync::atomic::Ordering::Acquire);
+        if cur > seqno_before {
+            return Ok(cur);
+        }
+        loop {
+            let cur_state = state.load(std::sync::atomic::Ordering::Acquire);
+            if cur_state == accessor_worker_state::FAILED_PERMANENTLY {
+                anyhow::bail!(
+                    "{op_label}: accessor-init worker exited (FAILED_PERMANENTLY) — \
+                     check freeze-coord 'vmm-accessor-init' logs for ELF parse or \
+                     boot-budget failures; retrying the op will hit the same wall"
+                );
+            }
+            let cur = seqno.load(std::sync::atomic::Ordering::Acquire);
+            if cur > seqno_before {
+                return Ok(cur);
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                let remaining_state = state.load(std::sync::atomic::Ordering::Acquire);
+                anyhow::bail!(
+                    "{op_label}: accessor reinit did not advance publish seqno \
+                     from {seqno_before} within deadline (worker state = \
+                     {remaining_state}; 0=Trying / 1=Succeeded / 2=FailedPermanently). \
+                     A reinit that's stuck in Trying past the deadline indicates the \
+                     coord's scan-tick hasn't observed the rebind or the worker's \
+                     `from_elf_with_hint` retry is hitting a transient address-space \
+                     window — check freeze-coord logs for `accessor-init:` lines"
+                );
+            }
+            // Event-driven via accessor_dispatcher_wake_evt: the
+            // worker writes the fd in lock-step with each seqno
+            // bump and on FAILED_PERMANENTLY exit, so poll wakes at
+            // kernel-scheduling-tick latency. Distinct from the
+            // accessor_ready_evt the coord drains (no second-
+            // consumer race). Tests without an installed wake fd
+            // fall back to a bounded sleep inside poll_dispatcher_wake.
+            let remaining = deadline.saturating_duration_since(now);
+            self.poll_dispatcher_wake(remaining);
         }
     }
 
@@ -1121,4 +1382,170 @@ impl Drop for BridgeGuard {
 /// path.
 pub fn with_active_bridge<R>(f: impl FnOnce(&SnapshotBridge) -> R) -> Option<R> {
     ACTIVE_BRIDGE.with(|c| c.borrow().as_ref().map(f))
+}
+
+#[cfg(test)]
+mod accessor_wait_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU8, AtomicU64};
+    use std::time::{Duration, Instant};
+
+    fn bridge_with_accessor_state() -> (
+        SnapshotBridge,
+        Arc<AtomicU64>,
+        Arc<AtomicU8>,
+        Arc<vmm_sys_util::eventfd::EventFd>,
+    ) {
+        let seqno = Arc::new(AtomicU64::new(0));
+        let worker_state = Arc::new(AtomicU8::new(accessor_worker_state::TRYING));
+        let wake_evt = Arc::new(
+            vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
+                .expect("eventfd for accessor_dispatcher_wake test fixture"),
+        );
+        let cb: CaptureCallback = Arc::new(|_| None);
+        let bridge = SnapshotBridge::new(cb).with_accessor_state(
+            seqno.clone(),
+            worker_state.clone(),
+            wake_evt.clone(),
+        );
+        (bridge, seqno, worker_state, wake_evt)
+    }
+
+    #[test]
+    fn wait_no_accessor_state_returns_ok_zero_immediately() {
+        // Bridge built without with_accessor_state — wait degenerates
+        // to Ok(0) so unit-test scenarios that don't spawn a real
+        // worker don't synthesize one.
+        let cb: CaptureCallback = Arc::new(|_| None);
+        let bridge = SnapshotBridge::new(cb);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        assert_eq!(
+            bridge
+                .wait_for_accessor_publish_advance(0, deadline, "Op::Test")
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn wait_seqno_already_advanced_returns_immediately() {
+        // Pre-advance the seqno so the tight initial check returns
+        // without polling. Validates the "publish landed between
+        // dispatch's load and wait call" race window is handled.
+        let (bridge, seqno, _, _) = bridge_with_accessor_state();
+        seqno.store(5, std::sync::atomic::Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        assert_eq!(
+            bridge
+                .wait_for_accessor_publish_advance(3, deadline, "Op::Test")
+                .unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn wait_observes_worker_publish() {
+        // Pin: worker bumps seqno + pulses dispatcher wake fd on a
+        // side thread; dispatch-style wait observes the advance
+        // within the deadline. Event-driven path — the wake fd
+        // unblocks poll within a kernel-scheduling tick, so the
+        // test should complete well under 500 ms even though the
+        // deadline is 2 s.
+        let (bridge, seqno, _, wake_evt) = bridge_with_accessor_state();
+        let bridge_for_thread = bridge.clone();
+        let seqno_for_thread = seqno.clone();
+        let wake_for_thread = wake_evt.clone();
+        let publisher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            seqno_for_thread.fetch_add(1, std::sync::atomic::Ordering::Release);
+            // Pulse the wake fd in lock-step with the seqno bump,
+            // matching the worker's contract at the freeze_coord
+            // publish site.
+            let _ = wake_for_thread.write(1);
+            let _ = bridge_for_thread; // keep bridge alive for the thread duration
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let t0 = Instant::now();
+        let observed = bridge
+            .wait_for_accessor_publish_advance(0, deadline, "Op::Test")
+            .expect("publish observed within deadline");
+        let elapsed = t0.elapsed();
+        publisher.join().unwrap();
+        assert_eq!(observed, 1);
+        // Event-driven wake — the wait should return shortly after
+        // the 100ms publisher sleep, NOT at the 2s deadline. A 500ms
+        // ceiling leaves plenty of slack for slow CI hosts while
+        // still catching a regression where wait falls back to a
+        // pure-sleep loop.
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "wait did not wake event-driven; took {elapsed:?} \
+             (expected close to 100ms)"
+        );
+    }
+
+    #[test]
+    fn wait_bails_on_worker_failed_permanently() {
+        // Pin: when worker_state flips to FAILED_PERMANENTLY the
+        // wait surfaces the terminal-worker diagnostic instead of
+        // blocking the full deadline.
+        let (bridge, _, worker_state, _) = bridge_with_accessor_state();
+        worker_state.store(
+            accessor_worker_state::FAILED_PERMANENTLY,
+            std::sync::atomic::Ordering::Release,
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let t0 = Instant::now();
+        let err = bridge
+            .wait_for_accessor_publish_advance(0, deadline, "Op::Test")
+            .expect_err("expected terminal-worker bail");
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "wait did not surface terminal state quickly; took {elapsed:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("FAILED_PERMANENTLY"),
+            "bail message missing terminal sentinel: {msg}"
+        );
+        assert!(msg.contains("Op::Test"), "bail missing op label: {msg}");
+    }
+
+    #[test]
+    fn wait_bails_on_deadline_with_worker_state_in_diagnostic() {
+        // Pin: deadline-exceeded surfaces with the worker state
+        // attached so the diagnostic distinguishes stuck-in-Trying
+        // (transient) from FAILED_PERMANENTLY (terminal).
+        let (bridge, _, _, _) = bridge_with_accessor_state();
+        let deadline = Instant::now() + Duration::from_millis(120);
+        let err = bridge
+            .wait_for_accessor_publish_advance(0, deadline, "Op::Test")
+            .expect_err("expected deadline bail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("worker state = 0"),
+            "deadline diagnostic missing worker_state: {msg}"
+        );
+        assert!(
+            msg.contains("Trying"),
+            "deadline diagnostic missing state name table: {msg}"
+        );
+    }
+
+    #[test]
+    fn accessor_publish_seqno_returns_zero_without_accessor_state() {
+        let cb: CaptureCallback = Arc::new(|_| None);
+        let bridge = SnapshotBridge::new(cb);
+        assert_eq!(bridge.accessor_publish_seqno(), 0);
+    }
+
+    #[test]
+    fn accessor_publish_seqno_reads_atomic() {
+        let (bridge, seqno, _, _) = bridge_with_accessor_state();
+        assert_eq!(bridge.accessor_publish_seqno(), 0);
+        seqno.store(42, std::sync::atomic::Ordering::Release);
+        assert_eq!(bridge.accessor_publish_seqno(), 42);
+    }
 }
