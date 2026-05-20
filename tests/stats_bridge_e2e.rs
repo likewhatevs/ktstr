@@ -76,7 +76,7 @@ fn assert_stats_round_trip(result: &VmResult) -> Result<()> {
     // any Err slot bails immediately, so reaching the post-loop
     // assertion proves every slot was Ok and at least one sample
     // existed.
-    let nr_dispatched = series.stats("nr_dispatched", |sv| sv.path("nr_dispatched").as_u64());
+    let nr_dispatched = series.stats("nr_dispatched", |sv| sv.get("nr_dispatched").as_u64());
     let mut any_progress = false;
     for (tag, _elapsed_ms, slot) in nr_dispatched.iter_full() {
         match slot {

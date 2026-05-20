@@ -119,7 +119,7 @@ fn assert_temporal_patterns(result: &VmResult) -> Result<()> {
     // variation while still exercising the comparator path on every
     // periodic boundary.
     series
-        .stats("nr_dispatched", |s| s.path("nr_dispatched").as_u64())
+        .stats("nr_dispatched", |s| s.get("nr_dispatched").as_u64())
         .each(&mut verdict)
         .at_most(DISPATCHED_CEILING);
 

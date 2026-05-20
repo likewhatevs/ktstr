@@ -1886,7 +1886,7 @@ mod tests {
             ),
         ];
         let series = SampleSeries::from_drained(drained, None);
-        let field: SeriesField<u64> = series.stats("counter", |sv| sv.path("counter").as_u64());
+        let field: SeriesField<u64> = series.stats("counter", |sv| sv.get("counter").as_u64());
         // Sanity-check the constructed field's middle slot is
         // exactly the MissingStats variant the spec calls out, so a
         // future refactor that drops or renames the variant fails

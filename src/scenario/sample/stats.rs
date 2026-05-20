@@ -62,10 +62,13 @@ impl SampleSeries {
 }
 
 /// Newtype carrier handed to the [`SampleSeries::stats`] closure.
-/// Wraps a borrowed [`serde_json::Value`] and exposes [`Self::path`]
+/// Wraps a borrowed [`serde_json::Value`] and exposes [`Self::get`]
 /// as a thin facade over [`stats_path`] so the closure body reads
-/// `s.path("layers.batch.util").as_f64()` without an explicit
-/// import.
+/// `s.get("layers.batch.util").as_f64()` without an explicit
+/// import. The `.get(path)` name mirrors
+/// [`crate::scenario::snapshot::SnapshotField::get`] and
+/// [`crate::scenario::snapshot::JsonField::get`] so test authors
+/// see one navigator vocabulary across every accessor surface.
 #[derive(Debug, Clone, Copy)]
 pub struct StatsValue<'a> {
     value: &'a serde_json::Value,
@@ -78,7 +81,7 @@ impl<'a> StatsValue<'a> {
     }
 
     /// Walk along a dotted path. Empty path returns the root.
-    pub fn path(&self, path: &str) -> JsonField<'a> {
+    pub fn get(&self, path: &str) -> JsonField<'a> {
         stats_path(self.value, path)
     }
 }
@@ -96,21 +99,21 @@ impl<'a> StatsPathProjector<'a> {
     pub fn field_u64(&self, key: &str) -> SeriesField<u64> {
         let full_path = join_paths(&self.path, key);
         self.series
-            .stats(key, move |sv| sv.path(&full_path).as_u64())
+            .stats(key, move |sv| sv.get(&full_path).as_u64())
     }
 
     /// Project a JSON key under the resolved path as `i64`.
     pub fn field_i64(&self, key: &str) -> SeriesField<i64> {
         let full_path = join_paths(&self.path, key);
         self.series
-            .stats(key, move |sv| sv.path(&full_path).as_i64())
+            .stats(key, move |sv| sv.get(&full_path).as_i64())
     }
 
     /// Project a JSON key under the resolved path as `f64`.
     pub fn field_f64(&self, key: &str) -> SeriesField<f64> {
         let full_path = join_paths(&self.path, key);
         self.series
-            .stats(key, move |sv| sv.path(&full_path).as_f64())
+            .stats(key, move |sv| sv.get(&full_path).as_f64())
     }
 
     /// Return a sub-projector rooted under `key`. Composable —
@@ -287,7 +290,7 @@ mod tests {
             },
         ];
         let series = SampleSeries::from_drained_typed(drained, None);
-        let field: SeriesField<f64> = series.stats("busy", |s| s.path("busy").as_f64());
+        let field: SeriesField<f64> = series.stats("busy", |s| s.get("busy").as_f64());
         let outcomes: Vec<SnapshotResult<f64>> = field.values_iter().cloned().collect();
         assert_eq!(outcomes.len(), 2);
         assert_eq!(
