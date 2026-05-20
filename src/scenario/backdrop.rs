@@ -548,6 +548,52 @@ mod tests {
         );
     }
 
+    /// Pin: `Backdrop::from_cgroups(vec)` preserves declaration
+    /// order (per [`Backdrop::cgroups`]'s ordering guarantee) and
+    /// leaves payloads/ops empty.
+    #[test]
+    fn from_cgroups_preserves_order_leaves_other_fields_empty() {
+        let b = Backdrop::from_cgroups([
+            CgroupDef::named("cg_a"),
+            CgroupDef::named("cg_b"),
+            CgroupDef::named("cg_c"),
+        ]);
+        assert_eq!(b.cgroups.len(), 3);
+        assert_eq!(b.cgroups[0].name.as_ref(), "cg_a");
+        assert_eq!(b.cgroups[1].name.as_ref(), "cg_b");
+        assert_eq!(b.cgroups[2].name.as_ref(), "cg_c");
+        assert!(b.payloads.is_empty());
+        assert!(b.ops.is_empty());
+    }
+
+    /// Pin: `Vec<CgroupDef>.into_iter().collect::<Backdrop>()` builds
+    /// the same Backdrop as `Backdrop::from_cgroups` — the
+    /// FromIterator impl is the standard-library-style entry point
+    /// for the same construction.
+    #[test]
+    fn from_iterator_matches_from_cgroups() {
+        let defs = vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")];
+        let from_constructor = Backdrop::from_cgroups(defs.clone());
+        let from_iter: Backdrop = defs.into_iter().collect();
+        assert_eq!(from_iter.cgroups.len(), from_constructor.cgroups.len());
+        assert_eq!(
+            from_iter.cgroups[0].name.as_ref(),
+            from_constructor.cgroups[0].name.as_ref()
+        );
+        assert_eq!(
+            from_iter.cgroups[1].name.as_ref(),
+            from_constructor.cgroups[1].name.as_ref()
+        );
+    }
+
+    /// Pin: `Backdrop::from_cgroups(std::iter::empty())` builds an
+    /// empty Backdrop equivalent to `Backdrop::new()`.
+    #[test]
+    fn from_cgroups_empty_input_yields_empty_backdrop() {
+        let b = Backdrop::from_cgroups(std::iter::empty());
+        assert!(b.is_empty());
+    }
+
     /// Lock-step pin: [`Backdrop::default`] must agree with
     /// [`Backdrop::new`] field-by-field. Both produce a no-state
     /// builder seed; a regression where Default seeds a non-empty

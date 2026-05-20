@@ -379,6 +379,77 @@ impl<'a> Snapshot<'a> {
         }
     }
 
+    /// User-supplied disambiguation for the multi-instance case
+    /// where the same scheduler binary is loaded multiple times
+    /// (e.g. an Op::ReplaceScheduler swap between two builds of
+    /// the same scheduler that produce two `<obj>.bss` maps with
+    /// identical obj_name prefix). [`Self::active`]'s principled
+    /// walker resolves the active scheduler by `*scx_root → struct_ops
+    /// map → obj prefix`, but when both instances share the prefix
+    /// the walker returns the prefix and the projection cannot tell
+    /// the bss copies apart — [`Self::live_var`] then errors with
+    /// `NoActiveScheduler { reason: "multiple obj prefixes" }`.
+    ///
+    /// `picker` receives every observed copy of the named variable
+    /// (one entry per `<obj>.bss/.data/.rodata` map carrying it,
+    /// per [`Self::vars`]) and returns the index the caller wants
+    /// (typically chosen by inspecting each candidate's value via
+    /// `SnapshotField::as_u64` / `as_str` and applying a liveness
+    /// or activity fingerprint). The returned index is into the
+    /// slice the picker received — out-of-range returns surface as
+    /// a [`SnapshotError::ProjectionFailed`] so the failure message
+    /// names the picker as the source.
+    ///
+    /// Returns [`SnapshotField::Missing`] when:
+    /// - the snapshot has no copies of `name` (matches
+    ///   [`Self::vars`]`(name).next().is_none()`),
+    /// - `picker` returns `None` (the picker decided no candidate
+    ///   matches its disambiguator), OR
+    /// - `picker` returns `Some(idx)` outside the candidate range.
+    pub fn live_var_via(
+        &self,
+        name: &str,
+        picker: impl FnOnce(&[(&'a str, SnapshotField<'a>)]) -> Option<usize>,
+    ) -> SnapshotField<'a> {
+        let candidates: Vec<(&'a str, SnapshotField<'a>)> = self.vars(name).collect();
+        if candidates.is_empty() {
+            let available: Vec<String> = self
+                .report
+                .maps
+                .iter()
+                .filter(|m| is_global_section_map(&m.name))
+                .map(|m| m.name.clone())
+                .collect();
+            return SnapshotField::Missing(crate::scenario::snapshot::SnapshotError::VarNotFound {
+                requested: name.to_string(),
+                available,
+            });
+        }
+        match picker(&candidates) {
+            Some(idx) if idx < candidates.len() => {
+                let (_obj, field) = candidates.into_iter().nth(idx).unwrap();
+                field
+            }
+            Some(idx) => {
+                SnapshotField::Missing(crate::scenario::snapshot::SnapshotError::ProjectionFailed {
+                    reason: format!(
+                        "live_var_via picker returned index {idx} out of range \
+                         (candidate count = {})",
+                        candidates.len()
+                    ),
+                })
+            }
+            None => {
+                SnapshotField::Missing(crate::scenario::snapshot::SnapshotError::ProjectionFailed {
+                    reason: format!(
+                        "live_var_via picker for '{name}' returned None (no candidate \
+                         matched the supplied disambiguator)"
+                    ),
+                })
+            }
+        }
+    }
+
     /// Number of maps the current view exposes — every captured
     /// map when unfiltered; only maps the [`Self::active`] filter
     /// admits when set.

@@ -3833,3 +3833,112 @@ fn snapshot_field_iter_members_on_empty_array_yields_nothing() {
     let field = SnapshotField::Value(&empty);
     assert_eq!(field.iter_members().count(), 0);
 }
+
+// ---------- live_var_via (Snapshot::live_var_via picker disambig) ----------
+
+/// Build a multi-instance report: two `<obj>.bss` maps, both
+/// carrying the same top-level member `tick`. Mirrors the
+/// pre/post Op::ReplaceScheduler shape where the same scheduler
+/// binary is loaded twice and the principled walker cannot tell
+/// the bss copies apart from prefix alone — the [`Snapshot::live_var_via`]
+/// picker is the disambiguator the caller supplies.
+fn two_instance_report(values: (u64, u64)) -> FailureDumpReport {
+    let mk_bss = |obj: &str, value: u64| FailureDumpMap {
+        name: format!("{obj}.bss"),
+        map_type: 2,
+        value_size: 8,
+        max_entries: 1,
+        value: Some(RenderedValue::Struct {
+            type_name: Some(".bss".into()),
+            members: vec![RenderedMember {
+                name: "tick".into(),
+                value: RenderedValue::Uint { bits: 64, value },
+            }],
+        }),
+        entries: Vec::new(),
+        percpu_entries: Vec::new(),
+        percpu_hash_entries: Vec::new(),
+        arena: None,
+        ringbuf: None,
+        stack_trace: None,
+        fd_array: None,
+        error: None,
+    };
+    FailureDumpReport {
+        schema: SCHEMA_SINGLE.to_string(),
+        maps: vec![mk_bss("alpha", values.0), mk_bss("beta", values.1)],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn live_var_via_picker_selects_named_candidate() {
+    let r = two_instance_report((1, 2));
+    let snap = Snapshot::new(&r);
+    let f = snap.live_var_via("tick", |cands| {
+        cands.iter().position(|(obj, _)| *obj == "beta.bss")
+    });
+    assert_eq!(
+        f.as_u64().unwrap(),
+        2,
+        "picker chose beta.bss → must read beta's tick value",
+    );
+}
+
+#[test]
+fn live_var_via_picker_returns_none_surfaces_projection_failed() {
+    let r = two_instance_report((1, 2));
+    let snap = Snapshot::new(&r);
+    let f = snap.live_var_via("tick", |_| None);
+    let err = f
+        .error()
+        .expect("None picker must surface SnapshotField::Missing");
+    match err {
+        SnapshotError::ProjectionFailed { reason } => {
+            assert!(
+                reason.contains("live_var_via picker for 'tick' returned None"),
+                "reason must name the picker source: {reason}",
+            );
+        }
+        other => panic!("expected ProjectionFailed, got {other:?}"),
+    }
+}
+
+#[test]
+fn live_var_via_picker_out_of_range_surfaces_projection_failed() {
+    let r = two_instance_report((1, 2));
+    let snap = Snapshot::new(&r);
+    let f = snap.live_var_via("tick", |_| Some(99));
+    let err = f.error().expect("out-of-range index must surface error");
+    match err {
+        SnapshotError::ProjectionFailed { reason } => {
+            assert!(
+                reason.contains("index 99 out of range") && reason.contains("count = 2"),
+                "reason must name the bad index AND the candidate count: {reason}",
+            );
+        }
+        other => panic!("expected ProjectionFailed, got {other:?}"),
+    }
+}
+
+#[test]
+fn live_var_via_no_candidates_surfaces_var_not_found() {
+    let r = two_instance_report((1, 2));
+    let snap = Snapshot::new(&r);
+    // Pick a name absent from every bss map — candidates is empty
+    // before the picker is invoked; must surface VarNotFound with
+    // the available globals list (not ProjectionFailed).
+    let f = snap.live_var_via("absent_member", |_| panic!("picker must NOT be called"));
+    let err = f.error().expect("missing var must carry an error");
+    match err {
+        SnapshotError::VarNotFound {
+            requested,
+            available,
+        } => {
+            assert_eq!(requested, "absent_member");
+            assert!(available.contains(&"alpha.bss".to_string()));
+            assert!(available.contains(&"beta.bss".to_string()));
+        }
+        other => panic!("expected VarNotFound, got {other:?}"),
+    }
+}

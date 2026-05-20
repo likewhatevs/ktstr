@@ -580,3 +580,43 @@ pub struct DrainedSnapshotEntry {
     pub elapsed_ms: Option<u64>,
     pub step_index: Option<u16>,
 }
+
+#[cfg(test)]
+mod tests_api_gaps {
+    use super::*;
+
+    /// Pin: `SnapshotError::ProjectionFailed { reason }` renders as
+    /// `projection failed: <reason>` so the temporal-assertion
+    /// failure path surfaces the closure's diagnostic without
+    /// re-wrapping. Closure call-sites synthesize this variant
+    /// when the structured variants (`VarNotFound`, `MapNotFound`,
+    /// `AmbiguousVar`) require an `available: Vec<String>` they
+    /// cannot populate.
+    #[test]
+    fn projection_failed_display_carries_reason() {
+        let e = SnapshotError::ProjectionFailed {
+            reason: "live_var_via picker rejected all 2 candidates".to_string(),
+        };
+        let rendered = format!("{e}");
+        assert_eq!(
+            rendered,
+            "projection failed: live_var_via picker rejected all 2 candidates"
+        );
+    }
+
+    /// Pin: `ProjectionFailed` participates in the same
+    /// `PartialEq` / `Hash` derive set as every other variant —
+    /// pattern-match callers can assert "yes, my projection
+    /// closure failed" without falling through to a `_` arm.
+    #[test]
+    fn projection_failed_eq_and_hash_round_trip() {
+        let a = SnapshotError::ProjectionFailed {
+            reason: "x".to_string(),
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(a);
+        assert!(seen.contains(&b));
+    }
+}
