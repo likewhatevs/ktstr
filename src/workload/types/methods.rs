@@ -669,7 +669,7 @@ impl WorkType {
     /// The `Sequence` variant cannot use [`from_name`](Self::from_name)
     /// because phases require explicit construction; this constructor
     /// is the only typed entry point. Accepts any `IntoIterator<Item =
-    /// Phase>` for `rest` so callers can pass arrays, `Vec`, or
+    /// WorkPhase>` for `rest` so callers can pass arrays, `Vec`, or
     /// builder-style chains.
     ///
     /// Validation fires at spawn time, not construction time; see

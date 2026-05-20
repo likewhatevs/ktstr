@@ -3942,3 +3942,31 @@ fn live_var_via_no_candidates_surfaces_var_not_found() {
         other => panic!("expected VarNotFound, got {other:?}"),
     }
 }
+
+#[test]
+fn live_var_via_placeholder_snapshot_surfaces_placeholder_error() {
+    // Pin sibling-accessor parity: var() and map() both check
+    // is_placeholder first and return SnapshotError::PlaceholderSnapshot
+    // (view.rs:139, 172). live_var_via must do the same — otherwise a
+    // placeholder snapshot silently surfaces as VarNotFound with an
+    // empty `available` list, hiding the real freeze-rendezvous-failed
+    // signal from the caller's match arm.
+    let mut r = FailureDumpReport::default();
+    r.is_placeholder = true;
+    let snap = Snapshot::new(&r);
+    let f = snap.live_var_via("anything", |_| panic!("picker must NOT be called on placeholder"));
+    let err = f
+        .error()
+        .expect("placeholder snapshot must carry an error");
+    match err {
+        SnapshotError::PlaceholderSnapshot { tag } => {
+            assert!(
+                tag.is_none(),
+                "placeholder-from-view path leaves tag = None; per-capture tag \
+                 belongs on placeholder errors that surface through the bridge \
+                 drain, not snapshot view lookups",
+            );
+        }
+        other => panic!("expected PlaceholderSnapshot, got {other:?}"),
+    }
+}

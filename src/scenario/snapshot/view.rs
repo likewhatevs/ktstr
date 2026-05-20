@@ -411,6 +411,13 @@ impl<'a> Snapshot<'a> {
     /// pickers such as `max_by_counter_value`).
     ///
     /// Returns [`SnapshotField::Missing`] when:
+    /// - the snapshot's underlying `FailureDumpReport` is a
+    ///   placeholder (carrying
+    ///   [`SnapshotError::PlaceholderSnapshot`] — matches the
+    ///   sibling [`Self::var`] / [`Self::map`] placeholder-first
+    ///   contract so callers pattern-matching on the error variant
+    ///   distinguish "freeze rendezvous failed" from "name absent
+    ///   from a real capture"),
     /// - the snapshot has no copies of `name` (carrying
     ///   [`SnapshotError::VarNotFound`] with the list of available
     ///   global-section maps),
@@ -425,6 +432,11 @@ impl<'a> Snapshot<'a> {
         name: &str,
         picker: impl FnOnce(&[(&'a str, SnapshotField<'a>)]) -> Option<usize>,
     ) -> SnapshotField<'a> {
+        if self.report.is_placeholder {
+            return SnapshotField::Missing(
+                crate::scenario::snapshot::SnapshotError::PlaceholderSnapshot { tag: None },
+            );
+        }
         let candidates: Vec<(&'a str, SnapshotField<'a>)> = self.vars(name).collect();
         if candidates.is_empty() {
             let available: Vec<String> = self

@@ -1,4 +1,4 @@
-//! Tests for `WorkType`, `Phase`, `WorkTypeValidationError`, and the
+//! Tests for `WorkType`, `WorkPhase`, `WorkTypeValidationError`, and the
 //! WorkType naming surface (`from_name`, `suggest`, `ALL_NAMES`).
 //! Co-located with the type definitions in `types/mod.rs`.
 
@@ -304,7 +304,7 @@ fn mutex_contention_needs_shared_mem() {
 fn mutex_contention_no_cache_buf() {
     assert!(!WorkType::mutex_contention(4, 256, 1024).needs_cache_buf());
 }
-/// `Phase` Duration fields serialize as humantime strings, not
+/// `WorkPhase` Duration fields serialize as humantime strings, not
 /// `{secs, nanos}` objects. Pins the readable wire format that
 /// makes captured `WorkSpec` configs operator-editable.
 #[test]
@@ -437,7 +437,7 @@ fn worktype_serde_roundtrip_table_driven() {
     // Sequence is excluded from the from_name walk; cover it
     // here with an explicit construction so the roundtrip is
     // still proven for every kind of variant. AluHot is included
-    // so Phase's new variant rides the same roundtrip pin.
+    // so WorkPhase's new variant rides the same roundtrip pin.
     let seq = WorkType::Sequence {
         first: WorkPhase::Spin(Duration::from_millis(10)),
         rest: vec![
@@ -459,8 +459,8 @@ fn worktype_serde_roundtrip_table_driven() {
          after-roundtrip={json2}"
     );
     // Pin one humantime field's wire form so a regression that
-    // drops `humantime_serde_helper` from `Phase` surfaces
-    // here even if the other Phase tests are skipped.
+    // drops `humantime_serde_helper` from `WorkPhase` surfaces
+    // here even if the other WorkPhase tests are skipped.
     assert!(
         json.contains(r#""spin":"10ms""#),
         "Sequence first-phase WorkPhase::Spin must serialize \

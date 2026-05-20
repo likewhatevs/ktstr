@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! WorkType, Phase, and WorkTypeValidationError — pure data types
+//! WorkType, WorkPhase, and WorkTypeValidationError — pure data types
 //! and pure-self methods extracted from the parent workload module.
 //!
 //! Re-exported by the parent module so external paths remain

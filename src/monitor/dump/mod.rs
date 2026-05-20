@@ -950,11 +950,13 @@ pub struct FailureDumpReport {
     ///   the struct_ops map's value_kva was not yet populated).
     /// - The matched map's name lacks a `<obj>.` prefix.
     ///
-    /// `Snapshot::active()` uses this as the principled tiebreaker
-    /// when the projection sees multiple obj prefixes in global-section
-    /// maps. On `None` the consumer falls back to the prefix-grouping
-    /// heuristic (single obj → that one; multiple obj → NoActiveScheduler
-    /// with a diagnostic citing #117's fallback path).
+    /// [`crate::scenario::snapshot::Snapshot::active`] uses this as
+    /// the principled tiebreaker when the projection sees multiple
+    /// obj prefixes in global-section maps. On `None` the consumer
+    /// falls back to the prefix-grouping heuristic (single obj →
+    /// that one; multiple obj → `NoActiveScheduler` with a
+    /// diagnostic naming the observed obj_names + the walker's
+    /// failure cause).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_obj_name: Option<String>,
     /// Structured per-allocation views from sdt_alloc-backed

@@ -472,7 +472,7 @@ fn pathology_phase_alu_hot_zero_duration_is_noop() {
     // out an infinite loop in the AluHot arm.
     assert!(
         reports[0].iterations > 0,
-        "Phase after ZERO-duration AluHot must still iterate: {:?}",
+        "WorkPhase after ZERO-duration AluHot must still iterate: {:?}",
         reports[0]
     );
 }
