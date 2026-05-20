@@ -273,6 +273,196 @@ impl<T> SeriesField<T> {
             verdict,
         }
     }
+
+    /// Iterate the [`SampleTriple`]s for one specific phase. Sugar
+    /// for [`Self::by_phase`]`().0.get(&phase).map(...)` that drops
+    /// the tuple-destructure noise the user otherwise repeats at
+    /// every per-phase site. Returns an empty iterator when the
+    /// phase had no samples; callers that need to distinguish
+    /// "empty bucket" from "phase never observed" can use
+    /// [`Self::by_phase`] directly.
+    pub fn phase(&self, phase: crate::assert::Phase) -> Vec<SampleTriple<'_, T>> {
+        self.iter_full()
+            .zip(self.phases.iter())
+            .filter_map(|(triple, p)| {
+                if *p == Some(phase) {
+                    Some(triple)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Single-value reduction for a cumulative counter or any
+    /// metric where "the last sample of the phase" is the
+    /// load-bearing value: returns the last Ok-sample's value
+    /// for `phase`, or `None` when the phase had zero Ok-samples.
+    /// Per-sample errors are skipped so a one-off projection
+    /// hiccup doesn't drop the whole phase. The "value at end of
+    /// phase" semantic is what cross-phase counter comparisons
+    /// (e.g. "dispatch count of Step\[1\] ≤ 0.85 × dispatch count
+    /// of Step\[0\]") almost always want, so this primitive
+    /// removes the closure-over-by_phase-triples boilerplate the
+    /// user otherwise writes at every site.
+    pub fn value_at_phase(&self, phase: crate::assert::Phase) -> Option<T>
+    where
+        T: Copy,
+    {
+        self.iter_full()
+            .zip(self.phases.iter())
+            .filter_map(|((_, _, value), p)| {
+                if *p == Some(phase) {
+                    value.as_ref().ok().copied()
+                } else {
+                    None
+                }
+            })
+            .last()
+    }
+
+    /// Reduce to a per-phase last-Ok-value map. The companion to
+    /// [`Self::value_at_phase`] for callers that want every phase
+    /// at once: each present phase maps to its last successful
+    /// sample's value. Phases with all-Err samples are absent from
+    /// the map. Matches the "cumulative-counter-at-end-of-phase"
+    /// semantic [`Self::aggregate_by_phase`] applies for Counter
+    /// metrics, but skips the kind-aware fold so callers reaching
+    /// for the raw last value don't pay the projection cost.
+    pub fn last_per_phase(&self) -> std::collections::BTreeMap<crate::assert::Phase, T>
+    where
+        T: Copy,
+    {
+        let mut out: std::collections::BTreeMap<crate::assert::Phase, T> =
+            std::collections::BTreeMap::new();
+        for ((_, _, value), p) in self.iter_full().zip(self.phases.iter()) {
+            if let (Some(phase), Ok(v)) = (*p, value) {
+                out.insert(phase, *v);
+            }
+        }
+        out
+    }
+
+    /// Cross-phase comparator: pin `value_at_phase(later) /
+    /// value_at_phase(earlier)` against a ceiling AND record the
+    /// computed ratio + both phase values in the verdict so
+    /// `--nocapture` runs surface the actual numbers without a
+    /// per-test `println!` boilerplate. Records a failure when
+    /// either phase had no Ok-samples, when the earlier value is
+    /// zero (no baseline), or when the ratio exceeds `ceiling`.
+    /// On success records an informational note carrying the
+    /// observed ratio + both values so the operator can see the
+    /// margin against the threshold.
+    ///
+    /// Returns `&mut Verdict` for chaining.
+    pub fn ratio_across_phases<'v>(
+        &self,
+        verdict: &'v mut Verdict,
+        earlier: crate::assert::Phase,
+        later: crate::assert::Phase,
+    ) -> CrossPhaseRatio<'_, 'v, T>
+    where
+        T: Copy + Into<f64> + std::fmt::Display,
+    {
+        let e = self.value_at_phase(earlier);
+        let l = self.value_at_phase(later);
+        CrossPhaseRatio {
+            field: self,
+            verdict,
+            earlier,
+            later,
+            earlier_value: e,
+            later_value: l,
+        }
+    }
+}
+
+/// Cross-phase ratio builder returned by
+/// [`SeriesField::ratio_across_phases`]. Carries the resolved
+/// `(earlier, later)` values so the terminal comparator chain
+/// (`at_most`) can format both values + the ratio into a single
+/// failure-or-note message. Mirrors the [`EachClaim`] shape
+/// (mutable verdict borrow held through the chain).
+#[must_use = "CrossPhaseRatio records nothing until at_most is invoked"]
+pub struct CrossPhaseRatio<'f, 'v, T> {
+    field: &'f SeriesField<T>,
+    verdict: &'v mut Verdict,
+    earlier: crate::assert::Phase,
+    later: crate::assert::Phase,
+    earlier_value: Option<T>,
+    later_value: Option<T>,
+}
+
+impl<'f, 'v, T> CrossPhaseRatio<'f, 'v, T>
+where
+    T: Copy + Into<f64> + std::fmt::Display,
+{
+    /// Pass when `later_value / earlier_value <= ceiling`. On
+    /// failure records a [`DetailKind::Temporal`] detail naming
+    /// the field label, both phase values, the computed ratio,
+    /// and the ceiling so the failure message is self-contained.
+    /// On success records an info note with the same trio so a
+    /// `--nocapture` run surfaces the headroom without a separate
+    /// per-metric `println!`.
+    pub fn at_most(self, ceiling: f64) -> &'v mut Verdict {
+        let label = self.field.label();
+        let earlier_str = match self.earlier_value {
+            Some(v) => format!("{v}"),
+            None => "<no-samples>".to_string(),
+        };
+        let later_str = match self.later_value {
+            Some(v) => format!("{v}"),
+            None => "<no-samples>".to_string(),
+        };
+        let (Some(earlier), Some(later)) = (self.earlier_value, self.later_value) else {
+            push_detail(
+                self.verdict,
+                format!(
+                    "{label}: ratio_across_phases({:?}→{:?}) needs both phases — \
+                     earlier={earlier_str}, later={later_str}",
+                    self.earlier, self.later,
+                ),
+            );
+            return self.verdict;
+        };
+        let earlier_f: f64 = earlier.into();
+        let later_f: f64 = later.into();
+        if earlier_f == 0.0 {
+            push_detail(
+                self.verdict,
+                format!(
+                    "{label}: ratio_across_phases({:?}→{:?}) earlier value is 0 \
+                     (no baseline to ratio against)",
+                    self.earlier, self.later,
+                ),
+            );
+            return self.verdict;
+        }
+        let ratio = later_f / earlier_f;
+        if ratio > ceiling {
+            push_detail(
+                self.verdict,
+                format!(
+                    "{label}: ratio_across_phases({:?}→{:?}) = \
+                     {later_str}/{earlier_str} = {ratio:.4} exceeds ceiling \
+                     {ceiling:.4}",
+                    self.earlier, self.later,
+                ),
+            );
+        } else {
+            // Pass — emit a note that surfaces in the sidecar
+            // info_notes (visible under --nocapture and on the
+            // failure render of any sibling claim) so the operator
+            // sees the headroom against the ceiling without a
+            // separate per-metric println.
+            self.verdict.note(format!(
+                "[{label}] ratio_across_phases({:?}→{:?}) = \
+                 {later_str}/{earlier_str} = {ratio:.4} (ceiling {ceiling:.4})",
+                self.earlier, self.later,
+            ));
+        }
+        self.verdict
+    }
 }
 
 /// Per-sample scalar claim builder returned by
@@ -2180,5 +2370,265 @@ mod tests {
         assert_eq!(none_bucket.len(), 1, "1 None-phase sample");
         assert_eq!(by_phase.len(), 1, "1 phase bucket");
         assert_eq!(by_phase[&crate::assert::Phase::step(0)].len(), 1);
+    }
+
+    // ---------- phase() / value_at_phase() / last_per_phase() / ratio_across_phases() ----------
+
+    #[test]
+    fn phase_returns_only_samples_in_named_phase() {
+        let f = SeriesField::<u64>::from_parts_with_phases(
+            "ticks",
+            vec!["t0".into(), "t1".into(), "t2".into(), "t3".into()],
+            vec![100, 200, 300, 400],
+            vec![Ok(1), Ok(2), Ok(3), Ok(4)],
+            vec![
+                Some(crate::assert::Phase::BASELINE),
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(1)),
+            ],
+        );
+        let step0: Vec<_> = f
+            .phase(crate::assert::Phase::step(0))
+            .into_iter()
+            .map(|(_, _, v)| v.as_ref().copied().ok())
+            .collect();
+        assert_eq!(step0, vec![Some(2), Some(3)]);
+        let step2 = f.phase(crate::assert::Phase::step(2));
+        assert!(
+            step2.is_empty(),
+            "phase with no samples must return empty Vec, got {step2:?}",
+        );
+    }
+
+    #[test]
+    fn value_at_phase_returns_last_ok_for_phase() {
+        let f = SeriesField::<u64>::from_parts_with_phases(
+            "ticks",
+            vec!["t0".into(), "t1".into(), "t2".into()],
+            vec![100, 200, 300],
+            vec![Ok(10), Ok(20), Ok(30)],
+            vec![
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(1)),
+            ],
+        );
+        assert_eq!(
+            f.value_at_phase(crate::assert::Phase::step(0)),
+            Some(20),
+            "value_at_phase returns the LAST Ok-sample for the phase",
+        );
+        assert_eq!(
+            f.value_at_phase(crate::assert::Phase::step(1)),
+            Some(30),
+        );
+        assert_eq!(
+            f.value_at_phase(crate::assert::Phase::step(2)),
+            None,
+            "phase with no samples returns None",
+        );
+    }
+
+    #[test]
+    fn value_at_phase_skips_err_samples_within_phase() {
+        let f = SeriesField::<u64>::from_parts_with_phases(
+            "ticks",
+            vec!["t0".into(), "t1".into()],
+            vec![100, 200],
+            vec![
+                Ok(7),
+                Err(SnapshotError::VarNotFound {
+                    requested: "x".into(),
+                    available: vec![],
+                }),
+            ],
+            vec![
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(0)),
+            ],
+        );
+        assert_eq!(
+            f.value_at_phase(crate::assert::Phase::step(0)),
+            Some(7),
+            "Err in same phase must be skipped; last Ok wins",
+        );
+    }
+
+    #[test]
+    fn last_per_phase_returns_last_ok_per_present_phase() {
+        let f = SeriesField::<u64>::from_parts_with_phases(
+            "ticks",
+            vec!["t0".into(), "t1".into(), "t2".into(), "t3".into()],
+            vec![100, 200, 300, 400],
+            vec![Ok(1), Ok(2), Ok(3), Ok(4)],
+            vec![
+                Some(crate::assert::Phase::BASELINE),
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(1)),
+            ],
+        );
+        let m = f.last_per_phase();
+        assert_eq!(m.len(), 3, "BASELINE + Step[0] + Step[1]");
+        assert_eq!(m[&crate::assert::Phase::BASELINE], 1);
+        assert_eq!(m[&crate::assert::Phase::step(0)], 3);
+        assert_eq!(m[&crate::assert::Phase::step(1)], 4);
+    }
+
+    #[test]
+    fn last_per_phase_omits_phases_with_only_err_samples() {
+        let f = SeriesField::<u64>::from_parts_with_phases(
+            "ticks",
+            vec!["t0".into(), "t1".into()],
+            vec![100, 200],
+            vec![
+                Err(SnapshotError::VarNotFound {
+                    requested: "x".into(),
+                    available: vec![],
+                }),
+                Ok(9),
+            ],
+            vec![
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(1)),
+            ],
+        );
+        let m = f.last_per_phase();
+        assert!(
+            !m.contains_key(&crate::assert::Phase::step(0)),
+            "all-Err phase omitted from last_per_phase, got keys {:?}",
+            m.keys().collect::<Vec<_>>(),
+        );
+        assert_eq!(m[&crate::assert::Phase::step(1)], 9);
+    }
+
+    #[test]
+    fn ratio_across_phases_pass_records_info_note() {
+        // Step[0] = 100, Step[1] = 50 → ratio 0.5, ceiling 0.85 ⇒ pass.
+        let f = SeriesField::<f64>::from_parts_with_phases(
+            "dispatches",
+            vec!["t0".into(), "t1".into()],
+            vec![100, 200],
+            vec![Ok(100.0), Ok(50.0)],
+            vec![
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(1)),
+            ],
+        );
+        let mut v = Verdict::new();
+        f.ratio_across_phases(
+            &mut v,
+            crate::assert::Phase::step(0),
+            crate::assert::Phase::step(1),
+        )
+        .at_most(0.85);
+        let r = v.into_result();
+        assert!(
+            r.is_pass(),
+            "expected pass, got outcomes={:?} details={:?}",
+            r.outcomes,
+            r.failure_details().collect::<Vec<_>>(),
+        );
+        assert!(
+            r.info_notes.iter().any(|n| n.message.contains("dispatches")
+                && n.message.contains("50/100")
+                && n.message.contains("0.5000")
+                && n.message.contains("ceiling 0.8500")),
+            "expected pass info note carrying ratio + ceiling, got {:?}",
+            r.info_notes,
+        );
+    }
+
+    #[test]
+    fn ratio_across_phases_failure_records_detail_with_ratio() {
+        // Step[0] = 10, Step[1] = 20 → ratio 2.0, ceiling 0.85 ⇒ fail.
+        let f = SeriesField::<f64>::from_parts_with_phases(
+            "dispatches",
+            vec!["t0".into(), "t1".into()],
+            vec![100, 200],
+            vec![Ok(10.0), Ok(20.0)],
+            vec![
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(1)),
+            ],
+        );
+        let mut v = Verdict::new();
+        f.ratio_across_phases(
+            &mut v,
+            crate::assert::Phase::step(0),
+            crate::assert::Phase::step(1),
+        )
+        .at_most(0.85);
+        let r = v.into_result();
+        assert!(r.is_fail(), "expected fail, got outcomes={:?}", r.outcomes);
+        assert!(
+            r.failure_details().any(|d| d.kind == DetailKind::Temporal
+                && d.message.contains("dispatches")
+                && d.message.contains("20/10")
+                && d.message.contains("2.0000")
+                && d.message.contains("ceiling 0.8500")),
+            "expected fail detail carrying ratio + ceiling, got {:?}",
+            r.failure_details().collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn ratio_across_phases_missing_phase_fails_with_clear_detail() {
+        // Step[1] has no samples → fail with "needs both phases".
+        let f = SeriesField::<f64>::from_parts_with_phases(
+            "dispatches",
+            vec!["t0".into()],
+            vec![100],
+            vec![Ok(10.0)],
+            vec![Some(crate::assert::Phase::step(0))],
+        );
+        let mut v = Verdict::new();
+        f.ratio_across_phases(
+            &mut v,
+            crate::assert::Phase::step(0),
+            crate::assert::Phase::step(1),
+        )
+        .at_most(0.85);
+        let r = v.into_result();
+        assert!(r.is_fail());
+        assert!(
+            r.failure_details()
+                .any(|d| d.message.contains("needs both phases")
+                    && d.message.contains("later=<no-samples>")),
+            "expected `needs both phases` detail naming the missing side, got {:?}",
+            r.failure_details().collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn ratio_across_phases_zero_baseline_fails_with_clear_detail() {
+        // earlier=0 → fail with "earlier value is 0", not div-by-zero.
+        let f = SeriesField::<f64>::from_parts_with_phases(
+            "dispatches",
+            vec!["t0".into(), "t1".into()],
+            vec![100, 200],
+            vec![Ok(0.0), Ok(5.0)],
+            vec![
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(1)),
+            ],
+        );
+        let mut v = Verdict::new();
+        f.ratio_across_phases(
+            &mut v,
+            crate::assert::Phase::step(0),
+            crate::assert::Phase::step(1),
+        )
+        .at_most(0.85);
+        let r = v.into_result();
+        assert!(r.is_fail());
+        assert!(
+            r.failure_details()
+                .any(|d| d.message.contains("earlier value is 0")
+                    && d.message.contains("no baseline")),
+            "expected `earlier value is 0` detail, got {:?}",
+            r.failure_details().collect::<Vec<_>>(),
+        );
     }
 }

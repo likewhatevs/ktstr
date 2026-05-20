@@ -187,12 +187,20 @@ fn build_series_field<T>(
     let mut values: Vec<SnapshotResult<T>> = Vec::with_capacity(rows.len());
     let mut tags: Vec<String> = Vec::with_capacity(rows.len());
     let mut elapsed: Vec<u64> = Vec::with_capacity(rows.len());
+    let mut phases: Vec<Option<crate::assert::Phase>> = Vec::with_capacity(rows.len());
     for row in rows {
         tags.push(row.tag.clone());
         elapsed.push(row.elapsed_ms);
+        // The drained-bridge step_index is already in the 1-indexed
+        // encoding `crate::assert::Phase` wraps (BASELINE = 0, Step[k]
+        // = k + 1). Thread it through so `SeriesField::phase` /
+        // `value_at_phase` / `last_per_phase` / `ratio_across_phases`
+        // see live phase stamps. Synthetic rows (from `from_drained`
+        // test path) carry `step_index = None` and stay None here.
+        phases.push(row.step_index.map(crate::assert::Phase::from));
         values.push(row_to_slot(row));
     }
-    SeriesField::from_parts(label, tags, elapsed, values)
+    SeriesField::from_parts_with_phases(label, tags, elapsed, values, phases)
 }
 
 impl SampleSeries {

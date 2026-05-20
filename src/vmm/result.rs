@@ -372,7 +372,14 @@ impl VmResult {
     /// If a post_vm callback needs both the raw drain and a series
     /// view, drain the bridge into a local Vec first and construct
     /// the series via [`crate::scenario::sample::SampleSeries::from_drained_typed`].
-    pub fn periodic_series(&mut self) -> crate::scenario::sample::SampleSeries {
+    ///
+    /// Takes `&self` rather than `&mut self` so it composes with the
+    /// `#[ktstr_test(post_vm = ...)]` callback signature
+    /// (`fn(&VmResult) -> Result<()>`). The underlying bridge uses
+    /// interior mutability for its drain queue, so the destructive
+    /// semantics ride on the bridge's lock rather than Rust's
+    /// borrow-check exclusivity.
+    pub fn periodic_series(&self) -> crate::scenario::sample::SampleSeries {
         crate::scenario::sample::SampleSeries::from_drained_typed(
             self.snapshot_bridge.drain_ordered_with_stats(),
             self.monitor.clone(),
