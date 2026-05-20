@@ -33,17 +33,38 @@ use super::{
 /// build — it does not copy the underlying report. Accessor
 /// methods all return further borrowed views that walk the report
 /// in place.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[must_use = "Snapshot is a borrowed view; bind or chain accessors"]
 #[non_exhaustive]
 pub struct Snapshot<'a> {
     report: &'a FailureDumpReport,
+    /// When `Some`, every map-walking accessor filters
+    /// [`FailureDumpReport::maps`] to maps whose `name` begins with
+    /// `<obj>.`. Populated by [`Self::active`] from the snapshot's
+    /// own `scx_sched_state` + `prog_runtime_stats`; `None` when the
+    /// snapshot was constructed via [`Self::new`] (unfiltered).
+    active_obj: Option<&'a str>,
 }
 
 impl<'a> Snapshot<'a> {
-    /// Build a borrowed view over `report`.
+    /// Build a borrowed view over `report` with no active-scheduler
+    /// filter. Every map-walking accessor sees every captured map.
     pub fn new(report: &'a FailureDumpReport) -> Self {
-        Self { report }
+        Self {
+            report,
+            active_obj: None,
+        }
+    }
+
+    /// Iterate maps the current view exposes — every captured map
+    /// when `active_obj` is None; only maps whose name shares the
+    /// `<obj>.` prefix when [`Self::active`] populated the filter.
+    fn maps_iter(&self) -> impl Iterator<Item = &'a FailureDumpMap> + '_ {
+        let active = self.active_obj;
+        self.report.maps.iter().filter(move |m| match active {
+            None => true,
+            Some(obj) => map_belongs_to_obj(&m.name, obj),
+        })
     }
 
     /// Underlying [`FailureDumpReport`] borrowed back to the caller.
@@ -106,18 +127,20 @@ impl<'a> Snapshot<'a> {
         self.report
     }
 
-    /// Look up a BPF map by exact name. Returns
-    /// [`SnapshotError::MapNotFound`] (with the captured map names
-    /// in `available`) when no match is found.
+    /// Look up a BPF map by exact name. Respects the
+    /// [`Self::active`] filter when set — only maps the filter
+    /// admits are considered. Returns [`SnapshotError::MapNotFound`]
+    /// (with the captured map names in `available`) when no match
+    /// is found among the admitted maps.
     pub fn map(&self, name: &str) -> SnapshotResult<SnapshotMap<'a>> {
-        for m in &self.report.maps {
+        for m in self.maps_iter() {
             if m.name == name {
                 return Ok(SnapshotMap { map: m, cpu: None });
             }
         }
         Err(SnapshotError::MapNotFound {
             requested: name.to_string(),
-            available: self.report.maps.iter().map(|m| m.name.clone()).collect(),
+            available: self.maps_iter().map(|m| m.name.clone()).collect(),
         })
     }
 
@@ -140,8 +163,11 @@ impl<'a> Snapshot<'a> {
     /// allocation order. Callers disambiguate via
     /// [`Self::map`] and walk the named map directly.
     pub fn var(&self, name: &str) -> SnapshotField<'a> {
+        if self.report.is_placeholder {
+            return SnapshotField::Missing(SnapshotError::PlaceholderSnapshot { tag: None });
+        }
         let mut hits: Vec<(&'a str, &'a RenderedValue)> = Vec::new();
-        for m in &self.report.maps {
+        for m in self.maps_iter() {
             if !is_global_section_map(&m.name) {
                 continue;
             }
@@ -159,7 +185,7 @@ impl<'a> Snapshot<'a> {
             }),
             _ => {
                 let mut available: Vec<String> = Vec::new();
-                for m in &self.report.maps {
+                for m in self.maps_iter() {
                     if !is_global_section_map(&m.name) {
                         continue;
                     }
@@ -179,9 +205,168 @@ impl<'a> Snapshot<'a> {
         }
     }
 
-    /// Number of maps captured in the report.
+    /// Iterate every global-section copy that carries a top-level
+    /// member named `name`. Yields `(owning_map_name, field)` pairs
+    /// in capture order. Use when [`Self::var`] errors
+    /// [`SnapshotError::AmbiguousVar`] and the caller needs to
+    /// reason across every observed copy explicitly (e.g. summing
+    /// counter deltas across two scheduler instances loaded
+    /// back-to-back in the same scenario).
+    ///
+    /// Respects the [`Self::active`] filter when set, so chained
+    /// `snapshot.active()?.vars(name)` is well-defined — it iterates
+    /// only the active scheduler's copies (typically exactly one,
+    /// since active() filters to one obj_name).
+    pub fn vars(
+        &self,
+        name: &str,
+    ) -> impl Iterator<Item = (&'a str, SnapshotField<'a>)> + '_ {
+        let needle = name.to_string();
+        self.maps_iter().filter_map(move |m| {
+            if !is_global_section_map(&m.name) {
+                return None;
+            }
+            let v = m.value.as_ref()?;
+            let found = lookup_member(v, &needle)?;
+            Some((m.name.as_str(), SnapshotField::Value(found)))
+        })
+    }
+
+    /// Project the snapshot to the currently-active scheduler's
+    /// maps. Returns a filtered [`Snapshot`] whose [`Self::map`] /
+    /// [`Self::var`] / [`Self::vars`] see only the maps whose name
+    /// shares the `<obj>.` prefix of the active scheduler's BPF
+    /// object. Composable: `snapshot.active()?.var(name)`.
+    ///
+    /// # When to use
+    ///
+    /// Tests that swap schedulers mid-scenario (via
+    /// [`crate::scenario::ops::Op::ReplaceScheduler`]) reach for
+    /// `.active()` after the swap so the per-phase post-swap
+    /// snapshots resolve the live scheduler's bss without hitting
+    /// [`SnapshotError::AmbiguousVar`] across both schedulers'
+    /// captured copies. Single-scheduler tests never need
+    /// `.active()` — there is no ambiguity to resolve.
+    ///
+    /// # Signal source
+    ///
+    /// The "active" determination uses the snapshot's already-
+    /// captured `scx_sched_state.sched_kva` (which scheduler instance
+    /// is currently attached per `*scx_root`) + `prog_runtime_stats`
+    /// (per-prog invocation counters) to identify which BPF
+    /// object's progs are advancing. No new wire format is
+    /// introduced.
+    ///
+    /// # Limitations
+    ///
+    /// - Two scheduler instances built from the SAME BPF object
+    ///   (e.g. two scx_mitosis variants loaded with different
+    ///   sched_args) produce identically-prefixed `<obj>.bss` maps.
+    ///   `.active()` cannot disambiguate them at obj-prefix
+    ///   granularity and returns [`SnapshotError::NoActiveScheduler`];
+    ///   tests in this configuration use [`Self::vars`] to iterate
+    ///   every copy and reason explicitly.
+    /// - Right after [`crate::scenario::ops::Op::ReplaceScheduler`]
+    ///   there is up to a 500ms–1s settle window where the new
+    ///   scheduler's prog counters have not advanced yet;
+    ///   `.active()` may return [`SnapshotError::NoActiveScheduler`]
+    ///   for snapshots captured in that window. Tracked as #116.
+    /// - The principled `*scx_root → owning BPF object → maps`
+    ///   walker that would replace the prog-counter proxy with a
+    ///   direct identity link is tracked as #117.
+    ///
+    /// # Lifetime
+    ///
+    /// Pure projection over the frozen `FailureDumpReport`;
+    /// multiple calls return equivalent views. Caching the result
+    /// in a `let active = snapshot.active()?;` binding is fine but
+    /// not required.
+    pub fn active(&self) -> SnapshotResult<Snapshot<'a>> {
+        if self.report.is_placeholder {
+            return Err(SnapshotError::PlaceholderSnapshot { tag: None });
+        }
+        // Group global-section maps by obj_name prefix.
+        let mut obj_names: Vec<&'a str> = Vec::new();
+        for m in &self.report.maps {
+            if !is_global_section_map(&m.name) {
+                continue;
+            }
+            if let Some(obj) = m.name.split('.').next() {
+                if !obj.is_empty() && !obj_names.contains(&obj) {
+                    obj_names.push(obj);
+                }
+            }
+        }
+        // No global-section maps at all — nothing to filter to.
+        if obj_names.is_empty() {
+            return Err(SnapshotError::NoActiveScheduler {
+                reason: "snapshot has no global-section BPF maps (no scheduler attached, or capture did not include bss/data/rodata)".to_string(),
+            });
+        }
+        // Single obj → that's the active one, no ambiguity.
+        if obj_names.len() == 1 {
+            return Ok(Snapshot {
+                report: self.report,
+                active_obj: Some(obj_names[0]),
+            });
+        }
+        // Multiple obj → discriminate via prog-counter sums per obj.
+        // Heuristic: for each candidate obj, sum prog_runtime_stats[i].cnt
+        // where the prog name shares a non-empty prefix with the obj name.
+        // The active scheduler's progs advance their counter; the
+        // inactive scheduler's stay frozen at the swap instant.
+        let mut best: Option<(&'a str, u64)> = None;
+        for obj in &obj_names {
+            let total: u64 = self
+                .report
+                .prog_runtime_stats
+                .iter()
+                .filter(|p| prog_name_matches_obj(&p.name, obj))
+                .map(|p| p.cnt)
+                .sum();
+            match best {
+                None => best = Some((*obj, total)),
+                Some((_, b)) if total > b => best = Some((*obj, total)),
+                _ => {}
+            }
+        }
+        match best {
+            Some((obj, total)) if total > 0 => Ok(Snapshot {
+                report: self.report,
+                active_obj: Some(obj),
+            }),
+            _ => Err(SnapshotError::NoActiveScheduler {
+                reason: format!(
+                    "snapshot has {} candidate scheduler obj names ({:?}) but \
+                     prog_runtime_stats does not distinguish them by activity \
+                     (counters tied at zero, or no progs match any obj prefix); \
+                     use Snapshot::vars(name) to iterate every copy",
+                    obj_names.len(),
+                    obj_names
+                ),
+            }),
+        }
+    }
+
+    /// Convenience for `self.active()?.var(name)`. Returns the
+    /// active scheduler's copy of the named global variable, or a
+    /// [`SnapshotField`] carrying either
+    /// [`SnapshotError::NoActiveScheduler`] (no scheduler identifiable)
+    /// or the standard [`Self::var`] error variants
+    /// ([`SnapshotError::VarNotFound`] / [`SnapshotError::TypeMismatch`]
+    /// from the inner var lookup).
+    pub fn live_var(&self, name: &str) -> SnapshotField<'a> {
+        match self.active() {
+            Ok(snap) => snap.var(name),
+            Err(err) => SnapshotField::Missing(err),
+        }
+    }
+
+    /// Number of maps the current view exposes — every captured
+    /// map when unfiltered; only maps the [`Self::active`] filter
+    /// admits when set.
     pub fn map_count(&self) -> usize {
-        self.report.maps.len()
+        self.maps_iter().count()
     }
 
     /// True when the underlying [`FailureDumpReport`] is a
@@ -407,6 +592,38 @@ impl<'a> Snapshot<'a> {
 /// `<obj>.<section>` naming for a global-section map.
 fn is_global_section_map(name: &str) -> bool {
     name.ends_with(".bss") || name.ends_with(".data") || name.ends_with(".rodata")
+}
+
+/// True when a map name's obj prefix (everything before the first
+/// `.`) matches `obj`. Used by [`Snapshot::maps_iter`] when an
+/// active-scheduler filter is set.
+fn map_belongs_to_obj(map_name: &str, obj: &str) -> bool {
+    map_name
+        .split_once('.')
+        .map(|(prefix, _)| prefix == obj)
+        .unwrap_or(false)
+}
+
+/// True when a prog name's prefix overlaps the obj name's prefix
+/// non-trivially. Used by [`Snapshot::active`] to attribute
+/// `prog_runtime_stats[i].cnt` to a candidate obj.
+///
+/// Heuristic: both names are capped at `BPF_OBJ_NAME_LEN = 16`
+/// chars by the kernel, so a shared 4-char prefix is the cheapest
+/// non-noise signal that a prog likely belongs to that obj's BPF
+/// object. False positives are possible (two schedulers sharing
+/// the same base prefix); those cases surface as a tie that
+/// [`Snapshot::active`] reports via
+/// [`SnapshotError::NoActiveScheduler`]. The principled walker
+/// tracked as #117 replaces this proxy.
+fn prog_name_matches_obj(prog_name: &str, obj: &str) -> bool {
+    const MIN_PREFIX: usize = 4;
+    let prefix_len = prog_name
+        .chars()
+        .zip(obj.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    prefix_len >= MIN_PREFIX
 }
 
 // ---------------------------------------------------------------------------

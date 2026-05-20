@@ -302,6 +302,33 @@ pub enum SnapshotError {
     /// site can decide whether to fail strict or skip with a
     /// rendered Note.
     HostFieldUnavailable { tag: String, cpu: u32 },
+    /// [`super::Snapshot::var`] / [`super::Snapshot::live_var`] /
+    /// [`super::Snapshot::map`] was called on a snapshot whose
+    /// underlying `crate::monitor::dump::FailureDumpReport` is a
+    /// placeholder (the freeze-rendezvous path could not collect
+    /// real data — typical cause: vCPU rendezvous timed out). The
+    /// captured `report.maps` is empty by construction so the
+    /// var/map lookup has nothing to walk. Distinct from
+    /// [`Self::VarNotFound`] (which means "the captured report did
+    /// not contain a global by this name") so the assertion site
+    /// can distinguish "freeze failed" from "typo in field name".
+    /// `tag` carries the capture tag (if any).
+    PlaceholderSnapshot { tag: Option<String> },
+    /// [`super::Snapshot::active`] / [`super::Snapshot::live_var`]
+    /// could not identify a currently-active scheduler from the
+    /// snapshot's `*scx_root` + `prog_runtime_stats`. Typical
+    /// causes: snapshot taken in the dead window between
+    /// [`crate::scenario::ops::Op::DetachScheduler`] +
+    /// [`crate::scenario::ops::Op::AttachScheduler`]; snapshot
+    /// taken in the post-swap settle window before the new
+    /// scheduler's progs have advanced their run counter; snapshot
+    /// captured before any scheduler attached. Distinct from
+    /// [`Self::AmbiguousVar`] (which means "the snapshot has
+    /// multiple scheduler bss copies and the call did not opt
+    /// into active-only filtering") so the assertion site can
+    /// distinguish "no scheduler is running right now" from
+    /// "multiple are running, pick one".
+    NoActiveScheduler { reason: String },
 }
 
 impl std::fmt::Display for SnapshotError {
@@ -333,7 +360,10 @@ impl std::fmt::Display for SnapshotError {
                 write!(
                     f,
                     "snapshot global '{requested}' is ambiguous (found in \
-                     {found_in:?}); use Snapshot::map(name) to disambiguate"
+                     {found_in:?}); use Snapshot::active().var(name) (or the \
+                     shorthand Snapshot::live_var(name)) to pick the active \
+                     scheduler's copy automatically, or Snapshot::map(name) \
+                     to address a specific scheduler's bss explicitly"
                 )
             }
             SnapshotError::FieldNotFound {
@@ -466,6 +496,26 @@ impl std::fmt::Display for SnapshotError {
                     f,
                     "sample '{tag}': per_cpu_time has no entry for cpu {cpu} \
                      (placeholder report or kernel-walker resolution failure)"
+                )
+            }
+            SnapshotError::PlaceholderSnapshot { tag } => match tag {
+                Some(t) => write!(
+                    f,
+                    "snapshot '{t}' is a placeholder — the freeze-rendezvous \
+                     path could not capture real data; no maps to walk"
+                ),
+                None => f.write_str(
+                    "snapshot is a placeholder — the freeze-rendezvous path \
+                     could not capture real data; no maps to walk",
+                ),
+            },
+            SnapshotError::NoActiveScheduler { reason } => {
+                write!(
+                    f,
+                    "snapshot has no currently-active scheduler ({reason}); \
+                     use Snapshot::vars(name) to enumerate every observed \
+                     copy explicitly, or Snapshot::map(\"<obj>.bss\") to \
+                     address a specific scheduler's bss directly"
                 )
             }
         }

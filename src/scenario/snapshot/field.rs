@@ -143,7 +143,7 @@ impl<'a> SnapshotField<'a> {
     /// array, or when any element fails the coercion (no partial
     /// results — the caller cannot tell which element silently
     /// dropped). Mirrors [`RenderedValue::as_u64_array`] but
-    /// propagates [`SnapshotError::Missing`] through the
+    /// propagates the captured [`SnapshotError`] through the
     /// [`SnapshotField::Missing`] arm.
     pub fn as_u64_array(&self) -> SnapshotResult<Vec<u64>> {
         render_to_typed_array(self, RenderedValue::as_u64, "u64")

@@ -53,9 +53,12 @@ impl<'a> JsonField<'a> {
     }
 
     /// Walk further into a sub-field. Composable with the result of
-    /// [`stats_path`] — `stats_path(v, "layers").path("batch.util")`
+    /// [`stats_path`] — `stats_path(v, "layers").get("batch.util")`
     /// is the canonical "drill into a periodic-stats object" shape.
-    pub fn path(&self, path: &str) -> JsonField<'a> {
+    /// Mirrors [`super::SnapshotField::get`] so a test author moves
+    /// between the BTF-rendered and JSON-rendered surfaces without
+    /// re-learning the navigator method name.
+    pub fn get(&self, path: &str) -> JsonField<'a> {
         match self {
             JsonField::Value(v) => walk_json_path(v, path),
             JsonField::Missing(err) => JsonField::Missing(err.clone()),
@@ -122,6 +125,92 @@ impl<'a> JsonField<'a> {
             JsonField::Missing(err) => Err(err.clone()),
         }
     }
+
+    /// Read as `Vec<u64>` from a [`serde_json::Value::Array`] whose
+    /// every element coerces via [`Self::as_u64`]'s rules. Mirrors
+    /// [`super::SnapshotField::as_u64_array`] so JSON-side stats
+    /// reads use the same method name as BTF-side BPF reads.
+    pub fn as_u64_array(&self) -> SnapshotResult<Vec<u64>> {
+        json_to_typed_array(self, json_to_u64, "u64")
+    }
+
+    /// Read as `Vec<u32>` from a JSON array. Mirrors
+    /// [`super::SnapshotField::as_u32_array`]; out-of-range values
+    /// error rather than silently truncate.
+    pub fn as_u32_array(&self) -> SnapshotResult<Vec<u32>> {
+        json_to_typed_array(
+            self,
+            |v| json_to_u64(v).and_then(|x| u32::try_from(x).map_err(|_| SnapshotError::TypeMismatch {
+                expected: "u32".to_string(),
+                actual: "Uint(>u32::MAX)".to_string(),
+                requested: String::new(),
+            })),
+            "u32",
+        )
+    }
+
+    /// Read as `Vec<i64>` from a JSON array. Mirrors
+    /// [`super::SnapshotField::as_i64_array`].
+    pub fn as_i64_array(&self) -> SnapshotResult<Vec<i64>> {
+        json_to_typed_array(self, json_to_i64, "i64")
+    }
+
+    /// Read as `Vec<f64>` from a JSON array. Mirrors
+    /// [`super::SnapshotField::as_f64_array`].
+    pub fn as_f64_array(&self) -> SnapshotResult<Vec<f64>> {
+        json_to_typed_array(self, json_to_f64, "f64")
+    }
+
+    /// Read as `Vec<bool>` from a JSON array of booleans. Mirrors
+    /// [`super::SnapshotField::as_bool_array`]; rejects mixed
+    /// arrays (no implicit truthiness coercion — JSON-side `bool`
+    /// already has a wire shape).
+    pub fn as_bool_array(&self) -> SnapshotResult<Vec<bool>> {
+        json_to_typed_array(
+            self,
+            |v| match v {
+                serde_json::Value::Bool(b) => Ok(*b),
+                other => Err(SnapshotError::TypeMismatch {
+                    expected: "bool".to_string(),
+                    actual: describe_json_kind(other),
+                    requested: String::new(),
+                }),
+            },
+            "bool",
+        )
+    }
+}
+
+/// Shared typed-array coercion used by [`JsonField::as_u64_array`]
+/// and siblings. Mirrors the SnapshotField helper so callers see
+/// uniform diagnostics across surfaces.
+fn json_to_typed_array<T, F>(
+    field: &JsonField<'_>,
+    coerce: F,
+    type_name: &'static str,
+) -> SnapshotResult<Vec<T>>
+where
+    F: Fn(&serde_json::Value) -> SnapshotResult<T>,
+{
+    let value = match field {
+        JsonField::Value(v) => *v,
+        JsonField::Missing(err) => return Err(err.clone()),
+    };
+    let elements = match value {
+        serde_json::Value::Array(a) => a.as_slice(),
+        other => {
+            return Err(SnapshotError::TypeMismatch {
+                expected: format!("[{type_name}]"),
+                actual: describe_json_kind(other),
+                requested: String::new(),
+            });
+        }
+    };
+    let mut out = Vec::with_capacity(elements.len());
+    for element in elements {
+        out.push(coerce(element)?);
+    }
+    Ok(out)
 }
 
 /// Build a [`JsonField`] view rooted at `value` and walk along the
