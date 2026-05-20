@@ -22,6 +22,12 @@ mix, and kernel version. You cannot test this with unit tests because
 the relevant state only exists inside a running kernel. ktstr also
 tests under EEVDF (the kernel's built-in scheduler) as a baseline.
 
+ktstr boots a real Linux kernel image under KVM (KASLR on by
+default) and observes scheduler state by reading guest kernel
+memory and BPF maps directly. The state your assertions see is
+the same state `/proc` and `bpftool` would see if you logged
+into the guest.
+
 Without ktstr, testing means manually booting a VM, setting up cgroups,
 running workloads, and eyeballing whether things went wrong -- with no
 reproducibility across machines because topology varies per host. ktstr
@@ -65,34 +71,39 @@ Add ktstr as a dev-dependency:
 ktstr = "0.5.2"
 ```
 
-This is all test authors need -- run with
-`cargo ktstr test --kernel ../linux` (wraps
-[cargo-nextest](https://nexte.st/) with kernel resolution).
-The `anyhow::Result` referenced in examples below is re-exported
-through `ktstr::prelude`; no separate `anyhow` dev-dependency needed.
+The library is the test-author surface. The `anyhow::Result`
+referenced in examples below is re-exported through
+`ktstr::prelude`; no separate `anyhow` dev-dependency needed.
 
-**Version compatibility:** pin the EXACT ktstr patch version across
-`[dev-dependencies] ktstr = "X.Y.Z"` and `cargo install --locked
---bin cargo-ktstr ktstr@X.Y.Z`. ktstr is pre-1.0 — minor-version
-bumps may break the test-facing API, and patch bumps may break
-unstable internal surfaces (the CI matrix runs against the locked
-patch). Examples below assume 0.5.2; an example from a different
-release may not compile against the crate this README documents.
-
-**Optional CLI tools**:
+Tests are then run through `cargo ktstr test`, which wraps
+[cargo-nextest](https://nexte.st/) with kernel resolution. Install
+both binaries:
 
 ```sh
-cargo install --locked ktstr --bin ktstr --bin cargo-ktstr
+cargo install --locked cargo-nextest
+cargo install --locked --bin ktstr --bin cargo-ktstr ktstr
 ```
 
-This installs the two user-facing binaries:
+This installs:
 
+- `cargo-ktstr` -- the test-runner entry point invoked as
+  `cargo ktstr test`. Wraps nextest with kernel resolution,
+  coverage, verifier stats, shell access, and `cargo ktstr export`
+  for reproducing test scenarios as self-contained shell scripts.
 - `ktstr` -- standalone CLI for kernel cache management,
   interactive VM shells, host-wide per-thread profiling, and
-  lock introspection
-- `cargo-ktstr` -- wraps `cargo nextest run` with kernel resolution,
-  coverage, verifier stats, shell access, and `cargo ktstr export`
-  for reproducing test scenarios as self-contained shell scripts
+  lock introspection. Optional unless you want the standalone
+  diagnostic commands; `cargo-ktstr` already covers the test
+  flow.
+
+**Version compatibility:** pin the EXACT ktstr patch version across
+`[dev-dependencies] ktstr = "X.Y.Z"` and
+`cargo install --locked --bin cargo-ktstr ktstr@X.Y.Z`. ktstr is
+pre-1.0 — minor-version bumps may break the test-facing API, and
+patch bumps may break unstable internal surfaces (the CI matrix
+runs against the locked patch). Examples below assume 0.5.2; an
+example from a different release may not compile against the crate
+this README documents.
 
 The workspace defines two additional `[[bin]]` targets —
 `ktstr-jemalloc-probe` and `ktstr-jemalloc-alloc-worker` — but
@@ -102,8 +113,10 @@ directly. The `--bin` flags above scope the install to just the
 two user-facing entry points; without them, `cargo install`
 would also place the test-fixture binaries on `$PATH`.
 
-`scx-ktstr` (the test fixture scheduler) is built automatically
-by the workspace and does not need a separate install.
+When building from this repo, `scx-ktstr` (the test fixture
+scheduler) is built automatically by the workspace. Downstream
+consumers don't get `scx-ktstr` from `cargo install ktstr`; only
+this repo's own integration tests use it.
 
 ## Setup
 
@@ -121,14 +134,19 @@ it does not build or run on other platforms.
 - autotools (autoconf, autopoint, flex, bison, gawk) -- vendored
   libbpf/libelf/zlib build
 - BTF (`/sys/kernel/btf/vmlinux` -- present by default on most
-  distros; set `KTSTR_KERNEL` if missing)
+  distros; needed for host kernel introspection in some tooling)
 - Internet access on first build (downloads busybox source)
 
 **Optional:**
 
-- Test kernel: Linux 6.12+ with sched_ext for scheduler tests;
-  `cargo ktstr kernel build` fetches and caches one. See
-  [Supported kernels](https://likewhatevs.github.io/ktstr/guide/features.html#supported-kernels).
+- Test kernel with sched_ext for scheduler tests;
+  `cargo ktstr kernel build` fetches and caches one. The build
+  step runs `validate_kernel_config` which requires `CONFIG_SCHED_CLASS_EXT`
+  (present from 6.12); kernels older than that fail the check at
+  build time rather than running with a missing scheduler class.
+  See [Supported kernels](https://likewhatevs.github.io/ktstr/guide/features.html#supported-kernels).
+  Prebuilt kernels resolved via `KTSTR_KERNEL` must contain a
+  vmlinux with embedded BTF.
 
 ```sh
 # Ubuntu/Debian
@@ -148,6 +166,10 @@ for the dynamic-link path if you're modifying the workspace.
 See the [getting started guide](https://likewhatevs.github.io/ktstr/guide/getting-started.html) for kernel discovery and building a test kernel.
 
 ## Quick start
+
+After the install + setup above, the full new-test path is:
+paste an example below into `tests/<name>.rs`, then run
+`cargo ktstr kernel build && cargo ktstr test`.
 
 ### Write a test
 
@@ -189,12 +211,15 @@ declare_scheduler!(MY_SCHED, {
 ```
 
 `binary = "scx_my_sched"` tells ktstr to auto-discover the scheduler
-binary in `target/{debug,release}/`, the directory containing the test
-binary, or an explicit path via `KTSTR_SCHEDULER` env var. If the
-scheduler is a `[[bin]]` target in the same workspace, `cargo build`
-places it there and discovery is automatic. The resolved binary is
-packed into the VM's initramfs. Tests without a `scheduler` attribute
-run under EEVDF (the kernel's default scheduler).
+binary. The resolution cascade is: explicit `KTSTR_SCHEDULER` env
+var → `$PATH` (when invoked under `cargo test`) →
+sibling-of-test-binary → `target/debug/` → `target/release/` →
+on-demand build from the workspace. If the scheduler is a `[[bin]]`
+target in the same workspace, `cargo build` places it where the
+sibling/target steps find it, so discovery is automatic. The
+resolved binary is packed into the VM's initramfs. Tests without a
+`scheduler` attribute run under EEVDF (the kernel's default
+scheduler).
 
 `topology = (numa_nodes, llcs, cores_per_llc, threads_per_core)`
 sets the VM's CPU topology — `topology = (1, 2, 4, 1)` creates 1
@@ -262,13 +287,20 @@ anything else) as part of a test, declare a `Payload` and
 reference it via `payload = ...` (primary slot) or
 `workloads = [...]` (additional slots):
 
+Each test crate declares its own `Payload` consts. Below is a
+self-contained schbench example: the `#[derive(Payload)]` struct
+defines the const, then the test references it. The macro
+generates a `pub const SCHBENCH: Payload` whose name matches the
+struct (uppercased, `Payload` suffix stripped).
+
 ```rust
-// SCHBENCH is a `pub const SCHBENCH: Payload` declared in
-// tests/common/fixtures.rs. Bring it into scope alongside the
-// fixtures module's other re-exports (SCHBENCH_HINTED,
-// SCHBENCH_JSON, etc.) before the test references it.
-mod common; // requires tests/common/fixtures.rs setup -- see tests/common/ in the repo
-use common::fixtures::*;
+use ktstr::prelude::*;
+
+#[derive(Payload)]
+#[payload(binary = "schbench", output = LlmExtract)]
+#[default_args("--runtime", "5", "--message-threads", "2")]
+#[default_check(exit_code_eq(0))]
+pub struct SchbenchPayload;
 
 #[ktstr_test(scheduler = MY_SCHED, payload = SCHBENCH)]
 fn schbench_under_my_sched(ctx: &Ctx) -> Result<AssertResult> {
@@ -281,8 +313,10 @@ See
 [Payload Definitions](https://likewhatevs.github.io/ktstr/guide/writing-tests/scheduler-definitions.html#derive-payload)
 for the `#[derive(Payload)]` macro and the full field surface
 (`default_args`, `default_checks`, `metrics`, `include_files`).
-`tests/common/fixtures.rs` carries reusable examples
-(`SCHBENCH`, `SCHBENCH_HINTED`, `SCHBENCH_JSON`).
+This repo's `tests/common/fixtures.rs` carries reusable
+in-tree examples (`SCHBENCH`, `SCHBENCH_HINTED`, `SCHBENCH_JSON`)
+that other ktstr tests inside this repo import via `mod common`;
+they are not part of the published `ktstr` crate.
 
 ### Run
 
@@ -297,11 +331,16 @@ range (`6.12..6.14`), or a git source (`git+URL#REF`).
 
 `cargo ktstr test` wraps `cargo nextest run` with kernel
 resolution (source tree, version, or cache key), kconfig
-fragment merging, and shell access. Bare `cargo nextest run`
-works only when the kernel image is already on the cache key
-the test binary expects.
+fragment merging, and shell access. Prefer it over a bare
+`cargo nextest run` — the bare invocation only finds a kernel
+when one is already cached under the exact key the test binary
+asks for.
 
-Requires `/dev/kvm`.
+Requires `/dev/kvm` accessible to the invoking user. On most
+distros that means adding the user to the `kvm` group; the
+[Troubleshooting](https://likewhatevs.github.io/ktstr/guide/troubleshooting.html#devkvm-not-accessible)
+page covers permission errors and nested-virt setup for CI
+runners.
 
 Passing tests:
 
@@ -335,6 +374,7 @@ ktstr_test 'two_cgroups' [topo=1n1l2c1t] failed:
 cargo ktstr test                                           # build/resolve kernel + run tests
 cargo ktstr nextest                                        # visible alias for `test`
 cargo ktstr test --kernel ~/linux -- -E 'test(my_test)'    # local source tree + nextest filter
+cargo ktstr replay                                         # re-run only the tests that failed last session
 cargo ktstr coverage                                       # tests under cargo-llvm-cov nextest
 cargo ktstr llvm-cov report --lcov --output-path lcov.info # raw llvm-cov passthrough (report/clean/show-env)
 cargo ktstr kernel build 6.14.2                            # cache a specific version
@@ -344,11 +384,15 @@ cargo ktstr kernel list                                    # list cached kernels
 cargo ktstr kernel clean --keep 3                          # keep 3 most recent
 cargo ktstr model fetch                                    # prefetch the LlmExtract model
 cargo ktstr model status                                   # report whether a SHA-checked model is cached
+cargo ktstr model clean                                    # drop cached model + warm-cache sidecar
 cargo ktstr verifier                                       # BPF verifier sweep (auto-discover kernel)
 cargo ktstr verifier --kernel 6.14.2 --kernel 6.15.0       # sweep across multiple kernels
 cargo ktstr stats                                          # aggregate gauntlet sidecars
 cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15  # diff sidecar partitions across kernels
 cargo ktstr stats show-host --run <key>                    # print archived HostContext for a run
+cargo ktstr stats list-metrics                             # discover the metric vocabulary in archived sidecars
+cargo ktstr stats list-values <metric>                     # dump every recorded value for one metric
+cargo ktstr stats explain-sidecar <path>                   # print the per-file aggregation explanation for one sidecar
 cargo ktstr show-host                                      # print current host context
 cargo ktstr show-thresholds my_test                        # print resolved Assert thresholds for a test
 cargo ktstr export my_test                                 # write a self-contained .run for bare-metal repro
@@ -356,6 +400,9 @@ cargo ktstr shell --kernel 6.14.2                          # interactive VM shel
 cargo ktstr shell --kernel 6.14.2 --no-perf-mode           # shell on shared runners (skip flock/pinning/RT)
 cargo ktstr completions bash                               # shell completions
 ```
+
+`cargo ktstr --help` is the authoritative listing if anything
+in the table above looks stale.
 
 ### Standalone CLI
 
@@ -386,29 +433,6 @@ ktstr completions bash
 
 To reproduce a test scenario as a bare-metal shell script
 without the test harness, use `cargo ktstr export`.
-
-## Release profile — `panic = "abort"`
-
-ktstr's release profile sets `panic = "abort"`. Any panic on any
-thread tears down the entire process without unwinding: `Drop`
-impls do not run, `std::panic::catch_unwind` cannot observe the
-failure, and `libc::abort` delivers SIGABRT before the kernel
-returns control.
-
-Contributors writing library or binary code should write
-panic-free code on every thread that runs in the release profile
-— especially the monitor loop, KVM vCPU threads, and anything
-spawned from `WorkloadHandle`. Relying on `catch_unwind` as a
-soft failure boundary is a bug; introduce explicit `Result`
-plumbing instead. The only escape hatch is `panic_hook` (see
-`src/vmm/vcpu_panic.rs`), which runs synchronously on the
-panicking thread before `libc::abort` to flip kill/exited
-signalling atomics; it does not recover, only classifies.
-
-Tests run under the default `panic = "unwind"` profile, so
-`catch_unwind` works as expected inside `#[test]` bodies — but
-code paths that only execute under the release profile cannot be
-tested for unwind-safety directly.
 
 ## Documentation
 

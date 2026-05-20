@@ -88,6 +88,30 @@ heading IDs that mdbook's slug-generation pipeline produces, slug
 collisions, and other anchors that the source-level check
 cannot see.
 
+## Release profile — `panic = "abort"`
+
+The release profile sets `panic = "abort"` (`Cargo.toml`,
+`[profile.release]`). Any panic on any thread tears down the
+entire process without unwinding: `Drop` impls do not run,
+`std::panic::catch_unwind` cannot observe the failure, and
+`libc::abort` delivers SIGABRT before the kernel returns
+control.
+
+Write panic-free code on every thread that runs in the release
+profile — especially the monitor loop, KVM vCPU threads, and
+anything spawned from `WorkloadHandle`. Relying on
+`catch_unwind` as a soft failure boundary is a bug; introduce
+explicit `Result` plumbing instead. The only escape hatch is
+`panic_hook` (see `src/vmm/vcpu_panic.rs`), which runs
+synchronously on the panicking thread before `libc::abort` to
+flip kill/exited signalling atomics; it does not recover, only
+classifies.
+
+Tests run under the default `panic = "unwind"` profile, so
+`catch_unwind` works as expected inside `#[test]` bodies — but
+code paths that only execute under the release profile cannot
+be tested for unwind-safety directly.
+
 ## liblzma build configuration
 
 ktstr depends on the `xz2` crate with the `static` feature,
