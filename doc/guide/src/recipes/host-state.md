@@ -60,11 +60,18 @@ Prints a `key: value` report covering:
 - Transparent hugepage policy (`thp_enabled`, `thp_defrag`) with
   the bracketed selection preserved verbatim.
 - Every `/proc/sys/kernel/sched_*` tunable, one entry per line.
+- `online_cpus` — count from `HostTopology::online_cpus.len()`.
+- `cpufreq_governor` — per-CPU governor from
+  `/sys/devices/system/cpu/cpuN/cpufreq/scaling_governor`,
+  one line per CPU.
 - NUMA node count (from CPU→node mapping; memory-only nodes
   without CPUs are not counted).
 - `kernel_name` / `kernel_release` / `arch` (from the `uname()`
   syscall).
 - `/proc/cmdline` verbatim.
+- `heap_state` — nested jemalloc allocator state when the binary
+  was built with the `jemalloc-probe` instrumentation; renders
+  `(unknown)` otherwise.
 
 Absent fields render as `(unknown)` — an empty `sched_*` map
 renders as `(empty)` and a missing map renders as `(unknown)`.
@@ -99,12 +106,21 @@ cargo ktstr stats compare --a-project-commit <baseline> --b-project-commit <curr
 Per-side filter flags (`--a-X` / `--b-X`) partition the
 sidecar pool into the two sides of the contrast — slice on
 `project-commit`, `kernel`, `scheduler`, `run-source`, etc.
-depending on what you are diffing. `compare` picks the first sidecar with
-`Some(host)` from each side, collects every host field that
-differs, and prints a side-by-side delta unconditionally as
-part of the compare output (there is no opt-in flag — the
-host-delta section appears whenever the two sides disagree on
-a host field):
+depending on what you are diffing. `compare` picks the first
+sidecar with `Some(host)` from each side, then prints one of
+five host-section shapes depending on what survived capture:
+
+- Neither side carried host context — the host section is
+  omitted entirely (no banner, no rows).
+- One side missing — `host: captured in 'A' only, delta
+  unavailable` (or `'B' only`), so a one-sided pipeline failure
+  is visible rather than silently dropped.
+- Both sides present, every field agrees — `host: identical
+  between 'A' and 'B'` (plus ` (arch: x86_64)` when both sides
+  carry a matching `arch` field).
+- Both sides present, fields differ — the `host delta ('A' →
+  'B'):` banner followed by one indented `key: A → B` row per
+  changed field:
 
 ```text
 host delta ('A' → 'B'):
