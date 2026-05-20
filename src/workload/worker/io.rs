@@ -69,7 +69,7 @@ impl Drop for IoBacking {
     }
 }
 
-/// RAII handle to the simulated-IO tempfile `Phase::Io` uses.
+/// RAII handle to the simulated-IO tempfile `WorkPhase::Io` uses.
 /// Always tempfile-backed (no `/dev/vda` path), so the design is
 /// simpler than [`IoBacking`]: file + path, both unconditional. The
 /// path is unlinked on Drop alongside the file's own Drop closing

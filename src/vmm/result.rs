@@ -359,6 +359,27 @@ impl VmResult {
         self.kern_kaslr_offset != 0
     }
 
+    /// One-line sugar for the recurring `post_vm`-callback boilerplate
+    /// `SampleSeries::from_drained_typed(self.snapshot_bridge.drain_ordered_with_stats(), self.monitor.clone()).periodic_only()`.
+    /// Equivalent in every observable way: same drain, same monitor
+    /// clone, same `periodic_only()` filter — exposed as a single
+    /// method so every benchmarking / per-phase / cross-phase test
+    /// expresses the projection in one statement instead of three.
+    ///
+    /// The bridge drain is destructive (the snapshot bridge yields
+    /// each capture exactly once); calling this method twice on the
+    /// same [`VmResult`] leaves the second call with an empty series.
+    /// If a post_vm callback needs both the raw drain and a series
+    /// view, drain the bridge into a local Vec first and construct
+    /// the series via [`crate::scenario::sample::SampleSeries::from_drained_typed`].
+    pub fn periodic_series(&mut self) -> crate::scenario::sample::SampleSeries {
+        crate::scenario::sample::SampleSeries::from_drained_typed(
+            self.snapshot_bridge.drain_ordered_with_stats(),
+            self.monitor.clone(),
+        )
+        .periodic_only()
+    }
+
     /// Minimal "nothing happened" fixture for tests that exercise
     /// code consuming a [`VmResult`] without actually booting a VM
     /// (the sidecar-write tests in `src/test_support/sidecar.rs`

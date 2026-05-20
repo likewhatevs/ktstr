@@ -800,10 +800,18 @@ pub mod prelude {
     // post_vm contract requires in scope.
     pub use crate::vmm::wire::{KernelOpReplyPayload, KernelOpValue};
     pub use crate::workload::{
-        AffinityIntent, AluWidth, CloneMode, MemPolicy, Migration, MpolFlags, Phase,
-        ResolvedAffinity, SchedPolicy, WorkSpec, WorkType, WorkTypeValidationError, WorkerReport,
+        AffinityIntent, AluWidth, CloneMode, MemPolicy, Migration, MpolFlags, ResolvedAffinity,
+        SchedPolicy, WorkPhase, WorkSpec, WorkType, WorkTypeValidationError, WorkerReport,
         WorkloadConfig, WorkloadHandle,
     };
+    // Surface `Phase` from the assert module (the scenario-step
+    // bucket) so test authors can write `Phase::step(0)` /
+    // `Phase::baseline()` without disambiguating against the
+    // formerly-named workload variant. The workload's compound-
+    // pattern enum is now `WorkPhase` (above) so `Phase` alone
+    // unambiguously means the scenario-phase bucket type users
+    // reach for in `field.value_at_phase(Phase::step(0))` style.
+    pub use crate::assert::Phase;
 }
 
 /// Name of the environment variable that selects a kernel for every

@@ -329,6 +329,22 @@ pub enum SnapshotError {
     /// distinguish "no scheduler is running right now" from
     /// "multiple are running, pick one".
     NoActiveScheduler { reason: String },
+    /// A user-supplied projection closure (the kind passed to
+    /// [`crate::scenario::sample::SampleSeries::bpf`]) signalled
+    /// failure for reasons that don't fit the structured variants
+    /// above. `reason` is the closure's free-form explanation —
+    /// "lookup returned None for sched_id A, B, C" — so the failure
+    /// message stays diagnostic without forcing the closure to
+    /// synthesize an `available: Vec<String>` it cannot populate.
+    ///
+    /// Closures should reach for the structured variants
+    /// ([`Self::VarNotFound`], [`Self::MapNotFound`], etc.) when
+    /// they can; this variant is the escape hatch for higher-level
+    /// disambiguation logic (e.g. "I walked vars(name) and none of
+    /// the candidates matched my active-instance fingerprint").
+    /// Surfaces in temporal-assertion failure messages as
+    /// `projection failed: <reason>`.
+    ProjectionFailed { reason: String },
 }
 
 impl std::fmt::Display for SnapshotError {
@@ -519,6 +535,9 @@ impl std::fmt::Display for SnapshotError {
                      or Snapshot::map(\"<obj>.<section>\") to address a \
                      specific scheduler's bss directly"
                 )
+            }
+            SnapshotError::ProjectionFailed { reason } => {
+                write!(f, "projection failed: {reason}")
             }
         }
     }

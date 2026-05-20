@@ -39,7 +39,7 @@ use ktstr::scenario::ops::{
 };
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 use ktstr::workload::{
-    AffinityIntent, Phase, SchedPolicy, WorkType, WorkloadConfig, WorkloadHandle,
+    AffinityIntent, SchedPolicy, WorkPhase, WorkType, WorkloadConfig, WorkloadHandle,
 };
 use std::time::Duration;
 
@@ -98,7 +98,7 @@ fn read_start_time_ns(pid: libc::pid_t) -> Result<u64> {
 /// arms exercise the freeze-rendezvous-and-thaw path in one boot.
 ///
 /// The worker uses [`WorkType::Sequence`] with a single
-/// [`Phase::Sleep`] longer than the scenario's total budget so the
+/// [`WorkPhase::Sleep`] longer than the scenario's total budget so the
 /// task stays in `TASK_INTERRUPTIBLE` (off-rq, `scx.dsq == NULL`,
 /// `scx.runnable_node` empty) across every cold-path Op fire —
 /// required for the dispatcher's L4 (`on_rq == 0`) + L5 (scx queued-
@@ -116,7 +116,7 @@ fn cold_path_op_handler_roundtrips(ctx: &Ctx) -> Result<AssertResult> {
         num_workers: 1,
         affinity: AffinityIntent::Inherit,
         work_type: WorkType::Sequence {
-            first: Phase::Sleep(block_dur),
+            first: WorkPhase::Sleep(block_dur),
             rest: vec![],
         },
         sched_policy: SchedPolicy::Normal,
@@ -124,7 +124,7 @@ fn cold_path_op_handler_roundtrips(ctx: &Ctx) -> Result<AssertResult> {
     };
     let mut handle = WorkloadHandle::spawn(&config)?;
     handle.start();
-    // Allow the worker to enter Phase::Sleep so the dispatcher's
+    // Allow the worker to enter WorkPhase::Sleep so the dispatcher's
     // on_rq=0 + scx-queued-empty gates pass. 500ms covers the start
     // handshake + scx-ktstr's dispatch latency under a 1-worker,
     // 0-load scenario.

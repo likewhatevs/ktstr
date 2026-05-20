@@ -1115,7 +1115,7 @@ fn render_affinity_all_variants() {
 /// [`render_work_type`] together.
 #[test]
 fn is_unmapped_work_type_split_matches_render() {
-    use crate::workload::{Phase, WorkerReport};
+    use crate::workload::{WorkPhase, WorkerReport};
     use std::sync::atomic::AtomicBool;
 
     // Stub fn pointer for the `Custom` variant — `WorkType::Custom`
@@ -1135,7 +1135,7 @@ fn is_unmapped_work_type_split_matches_render() {
         .filter_map(|n| WorkType::from_name(n))
         .collect();
     all_variants.push(WorkType::Sequence {
-        first: Phase::Spin(Duration::from_millis(1)),
+        first: WorkPhase::Spin(Duration::from_millis(1)),
         rest: Vec::new(),
     });
     all_variants.push(WorkType::Custom {

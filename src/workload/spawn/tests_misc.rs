@@ -374,7 +374,7 @@ fn pathology_alu_hot_scalar_iterates() {
         reports[0]
     );
 }
-/// `Phase::AluHot` inside a `WorkType::Sequence` must reach
+/// `WorkPhase::AluHot` inside a `WorkType::Sequence` must reach
 /// the worker dispatch arm and drive the multiply chain. Pins
 /// `iterations > 0` over the test window — the serde / wire-
 /// format tests in `workload::types::tests` only catch
@@ -386,7 +386,7 @@ fn pathology_phase_alu_hot_in_sequence_iterates() {
     let cfg = WorkloadConfig {
         num_workers: 2,
         work_type: WorkType::Sequence {
-            first: Phase::AluHot {
+            first: WorkPhase::AluHot {
                 width: AluWidth::Widest,
                 duration: Duration::from_millis(50),
             },
@@ -394,7 +394,7 @@ fn pathology_phase_alu_hot_in_sequence_iterates() {
         },
         ..Default::default()
     };
-    let mut h = WorkloadHandle::spawn(&cfg).expect("Phase::AluHot in Sequence must spawn");
+    let mut h = WorkloadHandle::spawn(&cfg).expect("WorkPhase::AluHot in Sequence must spawn");
     h.start();
     std::thread::sleep(Duration::from_millis(200));
     let reports = h.stop_and_collect();
@@ -402,12 +402,12 @@ fn pathology_phase_alu_hot_in_sequence_iterates() {
     for r in &reports {
         assert!(
             r.iterations > 0,
-            "Phase::AluHot in Sequence must complete >=1 outer iteration: {r:?}"
+            "WorkPhase::AluHot in Sequence must complete >=1 outer iteration: {r:?}"
         );
     }
 }
 
-/// `Phase::AluHot` at `AluWidth::Scalar` exercises the
+/// `WorkPhase::AluHot` at `AluWidth::Scalar` exercises the
 /// architecture-independent path through the new dispatch
 /// arm. Mirror of `pathology_alu_hot_scalar_iterates` for
 /// the Sequence-wrapped form so a regression to the SIMD
@@ -417,7 +417,7 @@ fn pathology_phase_alu_hot_scalar_in_sequence_iterates() {
     let cfg = WorkloadConfig {
         num_workers: 1,
         work_type: WorkType::Sequence {
-            first: Phase::AluHot {
+            first: WorkPhase::AluHot {
                 width: AluWidth::Scalar,
                 duration: Duration::from_millis(50),
             },
@@ -425,19 +425,20 @@ fn pathology_phase_alu_hot_scalar_in_sequence_iterates() {
         },
         ..Default::default()
     };
-    let mut h = WorkloadHandle::spawn(&cfg).expect("Phase::AluHot Scalar in Sequence must spawn");
+    let mut h =
+        WorkloadHandle::spawn(&cfg).expect("WorkPhase::AluHot Scalar in Sequence must spawn");
     h.start();
     std::thread::sleep(Duration::from_millis(100));
     let reports = h.stop_and_collect();
     assert_eq!(reports.len(), 1);
     assert!(
         reports[0].iterations > 0,
-        "Phase::AluHot Scalar in Sequence must iterate: {:?}",
+        "WorkPhase::AluHot Scalar in Sequence must iterate: {:?}",
         reports[0]
     );
 }
 
-/// `Phase::AluHot { duration: Duration::ZERO }` must silently
+/// `WorkPhase::AluHot { duration: Duration::ZERO }` must silently
 /// no-op and let the Sequence advance to the next phase. The
 /// deadline `Instant::now() < (Instant::now() + ZERO)` is
 /// immediately false so the inner loop body never executes —
@@ -451,16 +452,16 @@ fn pathology_phase_alu_hot_zero_duration_is_noop() {
     let cfg = WorkloadConfig {
         num_workers: 1,
         work_type: WorkType::Sequence {
-            first: Phase::AluHot {
+            first: WorkPhase::AluHot {
                 width: AluWidth::Scalar,
                 duration: Duration::ZERO,
             },
-            rest: vec![Phase::Spin(Duration::from_millis(20))],
+            rest: vec![WorkPhase::Spin(Duration::from_millis(20))],
         },
         ..Default::default()
     };
     let mut h = WorkloadHandle::spawn(&cfg)
-        .expect("Phase::AluHot ZERO duration must spawn (no validation rejection)");
+        .expect("WorkPhase::AluHot ZERO duration must spawn (no validation rejection)");
     h.start();
     std::thread::sleep(Duration::from_millis(80));
     let reports = h.stop_and_collect();
@@ -476,7 +477,7 @@ fn pathology_phase_alu_hot_zero_duration_is_noop() {
     );
 }
 
-/// `Phase::AluHot` populates `iteration_costs_ns` per chain
+/// `WorkPhase::AluHot` populates `iteration_costs_ns` per chain
 /// batch — pins the per-batch reservoir-sampling path so the
 /// "AluHot at 90% with modulation" use case can observe
 /// scheduler-preemption signal via iteration-cost variance.
@@ -488,7 +489,7 @@ fn pathology_phase_alu_hot_populates_iteration_costs() {
     let cfg = WorkloadConfig {
         num_workers: 1,
         work_type: WorkType::Sequence {
-            first: Phase::AluHot {
+            first: WorkPhase::AluHot {
                 width: AluWidth::Scalar,
                 duration: Duration::from_millis(50),
             },
@@ -496,7 +497,7 @@ fn pathology_phase_alu_hot_populates_iteration_costs() {
         },
         ..Default::default()
     };
-    let mut h = WorkloadHandle::spawn(&cfg).expect("Phase::AluHot must spawn");
+    let mut h = WorkloadHandle::spawn(&cfg).expect("WorkPhase::AluHot must spawn");
     h.start();
     std::thread::sleep(Duration::from_millis(150));
     let reports = h.stop_and_collect();
@@ -504,11 +505,11 @@ fn pathology_phase_alu_hot_populates_iteration_costs() {
     let r = &reports[0];
     assert!(
         !r.iteration_costs_ns.is_empty(),
-        "Phase::AluHot must populate iteration_costs_ns: {r:?}",
+        "WorkPhase::AluHot must populate iteration_costs_ns: {r:?}",
     );
     assert!(
         r.iteration_cost_sample_total >= 1,
-        "Phase::AluHot must record at least one iteration-cost sample: {r:?}",
+        "WorkPhase::AluHot must record at least one iteration-cost sample: {r:?}",
     );
 }
 

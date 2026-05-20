@@ -15,7 +15,7 @@ use crate::workload::config::{AluWidth, humantime_serde_helper};
 /// runs for its specified duration before advancing to the next.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Phase {
+pub enum WorkPhase {
     /// CPU spin for the given duration.
     Spin(#[serde(with = "humantime_serde_helper")] Duration),
     /// Sleep (thread::sleep) for the given duration.
@@ -55,18 +55,18 @@ pub enum Phase {
     },
 }
 
-impl Phase {
-    /// Construct a [`Phase::AluHot`] variant. Sugar for the
+impl WorkPhase {
+    /// Construct a [`WorkPhase::AluHot`] variant. Sugar for the
     /// struct-literal form that brings the struct variant in line
     /// with the tuple-variant constructors — every other [`Phase`]
     /// variant takes a single `Duration` and reads as
-    /// `Phase::Spin(d)` etc.; the struct variant needs an explicit
-    /// `Phase::AluHot { width: ..., duration: ... }` block at every
+    /// `WorkPhase::Spin(d)` etc.; the struct variant needs an explicit
+    /// `WorkPhase::AluHot { width: ..., duration: ... }` block at every
     /// call site, breaking the visual symmetry. `Phase::alu_hot(w, d)`
-    /// restores it so `vec![Phase::Spin(d1), Phase::alu_hot(w, d2),
-    /// Phase::Sleep(d3)]` reads consistently.
+    /// restores it so `vec![WorkPhase::Spin(d1), Phase::alu_hot(w, d2),
+    /// WorkPhase::Sleep(d3)]` reads consistently.
     pub const fn alu_hot(width: AluWidth, duration: Duration) -> Self {
-        Phase::AluHot { width, duration }
+        WorkPhase::AluHot { width, duration }
     }
 }
 mod methods;

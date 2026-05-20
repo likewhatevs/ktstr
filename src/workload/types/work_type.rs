@@ -18,7 +18,7 @@ use crate::workload::config::{
 
 use crate::workload::WorkerReport;
 
-use super::Phase;
+use super::WorkPhase;
 
 /// What each worker process does during a scenario.
 ///
@@ -44,7 +44,7 @@ use super::Phase;
 /// submit/complete + BIO routing paths rather than a synthetic
 /// page-cache + nanosleep loop. Tests that depended on the old
 /// page-cache + sleep behavior should use a [`Sequence`](Self::Sequence)
-/// with [`Phase::Sleep`] (and an arbitrary CPU phase) to model
+/// with [`WorkPhase::Sleep`] (and an arbitrary CPU phase) to model
 /// the simulated-IO-completion pause without doing real disk IO.
 ///
 /// ```
@@ -185,7 +185,10 @@ pub enum WorkType {
     FutexFanOut { fan_out: usize, spin_iters: u64 },
     /// Compound work pattern: loop through phases in order, repeat.
     /// Each phase runs for its duration before the next starts.
-    Sequence { first: Phase, rest: Vec<Phase> },
+    Sequence {
+        first: WorkPhase,
+        rest: Vec<WorkPhase>,
+    },
     /// Rapid fork+_exit cycling. Each iteration forks a child that
     /// immediately calls _exit(0). Parent waitpid's then repeats.
     /// Exercises wake_up_new_task, do_exit, wait_task_zombie.
@@ -1250,7 +1253,7 @@ pub enum WorkType {
     /// shared-memory region; no per-iteration syscall overhead.
     ///
     /// For duty-cycle modulation (e.g. ALU 90 % / Sleep 10 %), use
-    /// [`Phase::AluHot`] inside a [`Sequence`](Self::Sequence) — the
+    /// [`WorkPhase::AluHot`] inside a [`Sequence`](Self::Sequence) — the
     /// composable counterpart with a per-phase duration.
     AluHot {
         /// SIMD / scalar width selector for the multiply chain.

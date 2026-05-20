@@ -1062,7 +1062,7 @@ fn alu_hot_chain_panics_on_widest_in_debug_build() {
     alu_hot_chain(AluWidth::Widest, 1, &mut work_units);
 }
 
-/// `Phase::AluHot` must drive observable retired-instructions counter
+/// `WorkPhase::AluHot` must drive observable retired-instructions counter
 /// progress via the host PMU. A regression that turned the loop into a
 /// no-op (e.g. compiler optimization stripping the work, or a refactor
 /// that defaulted to Duration::ZERO) would silently pass functional

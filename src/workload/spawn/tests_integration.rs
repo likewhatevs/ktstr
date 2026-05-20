@@ -855,8 +855,8 @@ fn spawn_cache_pipe_produces_work() {
 fn spawn_sequence_produces_work() {
     let reports = spawn_and_collect_after(
         WorkType::Sequence {
-            first: Phase::Spin(Duration::from_millis(10)),
-            rest: vec![Phase::Yield(Duration::from_millis(10))],
+            first: WorkPhase::Spin(Duration::from_millis(10)),
+            rest: vec![WorkPhase::Yield(Duration::from_millis(10))],
         },
         1,
         200,

@@ -243,7 +243,7 @@ pub(super) fn worker_main(
     // and advances by 4 KiB per pwrite, wrapping at the stripe end.
     let mut io_seq_cursor: u64 = 0;
     let mut io_iter: u64 = 0;
-    // Phase::Io still uses the legacy tempfile-on-tmpfs
+    // WorkPhase::Io still uses the legacy tempfile-on-tmpfs
     // implementation (separate from IoSyncWrite / IoRandRead /
     // IoConvoy). Keep its own slot so worker cleanup is independent.
     // The [`PhaseIoTempfile`] RAII Drop unlinks the tempfile when
@@ -302,16 +302,16 @@ pub(super) fn worker_main(
     // shot warn. The resolved width persists for the worker's
     // lifetime.
     let mut alu_hot_resolved_width: Option<AluWidth> = None;
-    // Phase::AluHot: one-shot downgrade-warn dedup. Fires the
-    // first time any Phase::AluHot visit resolves to a width
+    // WorkPhase::AluHot: one-shot downgrade-warn dedup. Fires the
+    // first time any WorkPhase::AluHot visit resolves to a width
     // different from what was requested (excluding `Widest`,
     // which is documented as "host's widest"). A single flag
     // suffices because the warn is about "any AluHot phase
     // downgraded in this worker" — the per-width identity is
     // already in the log fields. Per-visit resolution prevents
     // sharing alu_hot_resolved_width with the standalone
-    // WorkType::AluHot arm, which would let a Phase::AluHot
-    // with width X clobber a downstream Phase::AluHot with
+    // WorkType::AluHot arm, which would let a WorkPhase::AluHot
+    // with width X clobber a downstream WorkPhase::AluHot with
     // width Y.
     let mut phase_alu_hot_warn_emitted: bool = false;
     // IpcVariance: persistent 512KB working-set buffer reused
@@ -873,13 +873,13 @@ pub(super) fn worker_main(
                         break;
                     }
                     match phase {
-                        Phase::Spin(dur) => {
+                        WorkPhase::Spin(dur) => {
                             let end = Instant::now() + *dur;
                             while Instant::now() < end && !stop_requested(stop) {
                                 spin_burst(&mut work_units, 1024);
                             }
                         }
-                        Phase::Sleep(dur) => {
+                        WorkPhase::Sleep(dur) => {
                             let before_sleep = Instant::now();
                             std::thread::sleep(*dur);
                             reservoir_push(
@@ -890,13 +890,13 @@ pub(super) fn worker_main(
                             );
                             last_iter_time = Instant::now();
                         }
-                        Phase::Yield(dur) => {
+                        WorkPhase::Yield(dur) => {
                             let end = Instant::now() + *dur;
                             // Batch the deadline + stop check every 64
                             // yields. `yield_now()` is sub-microsecond
                             // on a healthy scheduler; 63 yields of
                             // overshoot is far below the millisecond-
-                            // scale `dur` Phase::Yield typically
+                            // scale `dur` WorkPhase::Yield typically
                             // carries. The two `Instant::now()` calls
                             // around `yield_now` (`before_yield` plus
                             // the `elapsed()` in `reservoir_push`) are
@@ -923,7 +923,7 @@ pub(super) fn worker_main(
                             }
                             last_iter_time = Instant::now();
                         }
-                        Phase::Io(dur) => {
+                        WorkPhase::Io(dur) => {
                             let end = Instant::now() + *dur;
                             let tf = io_seq_file.get_or_insert_with(|| {
                                 let path = std::env::temp_dir()
@@ -935,11 +935,11 @@ pub(super) fn worker_main(
                                     .create(true)
                                     .truncate(true)
                                     .open(&path)
-                                    .expect("failed to create Phase::Io temp file");
+                                    .expect("failed to create WorkPhase::Io temp file");
                                 PhaseIoTempfile { file, path }
                             });
                             let f = &mut tf.file;
-                            // Phase::Io drives the legacy tempfile-on-tmpfs
+                            // WorkPhase::Io drives the legacy tempfile-on-tmpfs
                             // IO scenario (separate from IoSyncWrite /
                             // IoRandRead / IoConvoy on /dev/vda). All four
                             // operations below are best-effort: the loop
@@ -970,18 +970,18 @@ pub(super) fn worker_main(
                             }
                             last_iter_time = Instant::now();
                         }
-                        Phase::AluHot { width, duration } => {
+                        WorkPhase::AluHot { width, duration } => {
                             // Resolve per visit. resolve_alu_width's
                             // is_x86_feature_detected! probes are cached
                             // by std after first call, so per-visit
                             // resolution is O(1). Avoids the cache
                             // collision risk that a single shared
                             // Option<AluWidth> across multiple
-                            // Phase::AluHot phases with different
+                            // WorkPhase::AluHot phases with different
                             // widths would create.
                             let resolved = resolve_alu_width(*width);
                             // One-shot downgrade warn — fires at most
-                            // once per worker across all Phase::AluHot
+                            // once per worker across all WorkPhase::AluHot
                             // visits, matching the standalone
                             // WorkType::AluHot arm's "warn once" shape
                             // without sharing the resolved-width
@@ -997,14 +997,14 @@ pub(super) fn worker_main(
                                     requested = ?width,
                                     resolved = ?resolved,
                                     tid,
-                                    "Phase::AluHot width unavailable on this host; \
+                                    "WorkPhase::AluHot width unavailable on this host; \
                                      downgraded — see [`AluWidth`] doc for \
                                      resolution order"
                                 );
                                 phase_alu_hot_warn_emitted = true;
                             }
                             // Per-chain iteration-cost sampling so
-                            // Phase::AluHot exposes the same
+                            // WorkPhase::AluHot exposes the same
                             // scheduler-preemption signal as the
                             // standalone WorkType::AluHot arm:
                             // AluHot never blocks, so the
@@ -1026,13 +1026,13 @@ pub(super) fn worker_main(
                                 );
                             }
                             // Do NOT reset last_iter_time: AluHot is
-                            // CPU-bound (same event class as Phase::Spin),
+                            // CPU-bound (same event class as WorkPhase::Spin),
                             // so a reset here would artificially hide
                             // preemption stretches crossing the phase
                             // boundary from max_gap_ms — silently
                             // diverging the metric vs. an equivalent
-                            // Phase::Spin Sequence. Symmetric counter
-                            // bookkeeping with Phase::Spin (which also
+                            // WorkPhase::Spin Sequence. Symmetric counter
+                            // bookkeeping with WorkPhase::Spin (which also
                             // never resets) keeps max_gap_ms comparable
                             // when a test swaps Spin↔AluHot.
                         }
@@ -3231,7 +3231,7 @@ pub(super) fn worker_main(
         unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER, &param) };
     }
 
-    // io_seq_file (Phase::Io tempfile), io_disk, and io_buf clean
+    // io_seq_file (WorkPhase::Io tempfile), io_disk, and io_buf clean
     // themselves up via Drop on [`PhaseIoTempfile`] / [`IoBacking`] /
     // [`DirectIoBuf`] when this function returns: file fd closed,
     // host-side tempfile unlinked, heap buffer freed. Intentionally
@@ -3368,7 +3368,7 @@ pub(super) fn worker_main(
 //    user-kernel boundary, so syscall sites act as natural barriers
 //    that force surrounding values to materialize. WorkTypes that
 //    need scheduler events (`FutexFanOut`, `IoSyncWrite`,
-//    `Phase::Yield`)
+//    `WorkPhase::Yield`)
 //    rely on this implicit barrier in addition to the explicit
 //    `black_box` / volatile pairs above.
 //

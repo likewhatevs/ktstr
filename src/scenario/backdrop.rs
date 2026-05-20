@@ -207,6 +207,17 @@ impl Backdrop {
         self
     }
 
+    /// Construct from any [`CgroupDef`] iterator (most commonly a
+    /// `Vec<CgroupDef>` built by a test-side helper). Equivalent to
+    /// `Backdrop::new().extend_cgroups(defs)` but reads as a single
+    /// constructor at the use site; the `FromIterator` impl on
+    /// [`Backdrop`] supports the `.collect()` form for the same case.
+    /// Declaration order is preserved per [`Self::cgroups`].
+    #[must_use = "builder methods return Self; bind the result"]
+    pub fn from_cgroups<I: IntoIterator<Item = CgroupDef>>(defs: I) -> Self {
+        Self::new().extend_cgroups(defs)
+    }
+
     /// Binary-kind payload with no extra args. See [`Self::payloads`]
     /// for lifecycle. For custom args or cgroup placement use
     /// [`Self::push_op`] with [`Op::run_payload`] / [`Op::run_payload_in_cgroup`].
@@ -249,6 +260,16 @@ impl Backdrop {
     /// use persistent state.
     pub fn is_empty(&self) -> bool {
         self.cgroups.is_empty() && self.payloads.is_empty() && self.ops.is_empty()
+    }
+}
+
+/// `Backdrop::from_iter(cgroups)` / `cgroups.into_iter().collect()`
+/// shortcuts for the common "build a Backdrop from a Vec of cgroup
+/// defs" pattern test fixtures repeat. Equivalent to
+/// [`Backdrop::from_cgroups`]; declaration order is preserved.
+impl FromIterator<CgroupDef> for Backdrop {
+    fn from_iter<I: IntoIterator<Item = CgroupDef>>(defs: I) -> Self {
+        Self::from_cgroups(defs)
     }
 }
 

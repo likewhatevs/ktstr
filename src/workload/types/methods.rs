@@ -11,7 +11,7 @@ use crate::workload::config::{AluWidth, FutexLockMode, SchedClass, WakeMechanism
 
 use crate::workload::WorkerReport;
 
-use super::{Phase, WorkType, WorkTypeValidationError};
+use super::{WorkPhase, WorkType, WorkTypeValidationError};
 
 impl WorkType {
     /// PascalCase names for all built-in variants, matching the enum arm names.
@@ -674,7 +674,7 @@ impl WorkType {
     ///
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::Sequence`] variant doc for preconditions.
-    pub fn sequence(first: Phase, rest: impl IntoIterator<Item = Phase>) -> Self {
+    pub fn sequence(first: WorkPhase, rest: impl IntoIterator<Item = WorkPhase>) -> Self {
         WorkType::Sequence {
             first,
             rest: rest.into_iter().collect(),

@@ -569,13 +569,13 @@ fn cover_op_spawn_host(ctx: &Ctx) -> Result<AssertResult> {
 #[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn cover_work_type_sequence(ctx: &Ctx) -> Result<AssertResult> {
     use ktstr::scenario::ops::{CgroupDef, Step, execute_steps};
-    use ktstr::workload::{Phase, WorkType};
+    use ktstr::workload::{WorkPhase, WorkType};
     use std::time::Duration;
     let seq = WorkType::Sequence {
-        first: Phase::Spin(Duration::from_millis(50)),
+        first: WorkPhase::Spin(Duration::from_millis(50)),
         rest: vec![
-            Phase::Yield(Duration::from_millis(20)),
-            Phase::Sleep(Duration::from_millis(30)),
+            WorkPhase::Yield(Duration::from_millis(20)),
+            WorkPhase::Sleep(Duration::from_millis(30)),
         ],
     };
     let steps = vec![Step::with_defs(
