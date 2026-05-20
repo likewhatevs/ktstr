@@ -343,6 +343,74 @@ impl<T> SeriesField<T> {
         out
     }
 
+    /// Reduce to a per-phase first-Ok-value map. The symmetric
+    /// companion to [`Self::last_per_phase`]: each present phase
+    /// maps to its first successful sample's value. Per-sample
+    /// errors are skipped so a one-off projection hiccup at the
+    /// start of a phase doesn't drop the whole phase. Phases with
+    /// all-Err samples are absent from the map.
+    ///
+    /// The load-bearing pairing is
+    /// `last_per_phase - first_per_phase` — the work done WITHIN
+    /// a phase, with no contribution from prior phases — surfaced
+    /// directly via [`Self::counter_delta_per_phase`].
+    pub fn first_per_phase(&self) -> std::collections::BTreeMap<crate::assert::Phase, T>
+    where
+        T: Copy,
+    {
+        let mut out: std::collections::BTreeMap<crate::assert::Phase, T> =
+            std::collections::BTreeMap::new();
+        for ((_, _, value), p) in self.iter_full().zip(self.phases.iter()) {
+            if let (Some(phase), Ok(v)) = (*p, value) {
+                out.entry(phase).or_insert(*v);
+            }
+        }
+        out
+    }
+
+    /// Per-phase cumulative-counter delta: `last_per_phase(p) -
+    /// first_per_phase(p)` for every phase with at least one Ok
+    /// sample. The reducer A/B-compare tests reach for when a
+    /// metric is a cumulative counter still accruing from prior
+    /// phases — `value_at_phase`'s last-sample reading carries
+    /// the whole-run accumulation, which lets prior-phase activity
+    /// muddy the cross-phase ratio. The delta isolates the work
+    /// performed WITHIN each phase so
+    /// `ratio(phase_delta(later) / phase_delta(earlier))` answers
+    /// the question the operator actually asked: "did `later`'s
+    /// activity drop relative to `earlier`'s?"
+    ///
+    /// Single-Ok-sample phases yield a delta of zero (first ==
+    /// last). Phases with all-Err samples are absent. Phases that
+    /// appear in `first_per_phase` but not `last_per_phase` (the
+    /// out-of-order edge case) are also absent — the delta is
+    /// well-defined only when both endpoints are present.
+    ///
+    /// The reducer is intentionally generic: the test author owns
+    /// `(same_delta, cross_delta)`-style compositions (e.g. fold
+    /// two counter-delta maps into a per-phase fraction) without
+    /// the framework needing a registered [`crate::stats::MetricDef`].
+    /// For Counter-typed registered metrics, the equivalent
+    /// MetricDef-aware path is [`Self::aggregate_by_phase`].
+    ///
+    /// **Counter regression**: `T: Sub<Output = T>` — for `u64`
+    /// the subtraction wraps in release builds and panics in debug
+    /// on `last < first`. The reducer assumes the underlying counter
+    /// is non-decreasing within a phase (the common case for BPF
+    /// per-event counters). A regressing counter is a bug in the
+    /// upstream signal, not in the reducer.
+    pub fn counter_delta_per_phase(&self) -> std::collections::BTreeMap<crate::assert::Phase, T>
+    where
+        T: Copy + std::ops::Sub<Output = T>,
+    {
+        let firsts = self.first_per_phase();
+        let lasts = self.last_per_phase();
+        firsts
+            .into_iter()
+            .filter_map(|(phase, first)| lasts.get(&phase).map(|last| (phase, *last - first)))
+            .collect()
+    }
+
     /// Cross-phase comparator: pin `value_at_phase(later) /
     /// value_at_phase(earlier)` against a ceiling AND record the
     /// computed ratio + both phase values in the verdict so
@@ -2501,6 +2569,183 @@ mod tests {
             m.keys().collect::<Vec<_>>(),
         );
         assert_eq!(m[&crate::assert::Phase::step(1)], 9);
+    }
+
+    #[test]
+    fn first_per_phase_returns_first_ok_per_present_phase() {
+        let f = SeriesField::<u64>::from_parts_with_phases(
+            "ticks",
+            vec!["t0".into(), "t1".into(), "t2".into(), "t3".into()],
+            vec![100, 200, 300, 400],
+            vec![Ok(10), Ok(20), Ok(30), Ok(40)],
+            vec![
+                Some(crate::assert::Phase::BASELINE),
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(1)),
+            ],
+        );
+        let m = f.first_per_phase();
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[&crate::assert::Phase::BASELINE], 10);
+        assert_eq!(
+            m[&crate::assert::Phase::step(0)],
+            20,
+            "first Ok in Step[0] is t1=20, NOT t2=30",
+        );
+        assert_eq!(m[&crate::assert::Phase::step(1)], 40);
+    }
+
+    #[test]
+    fn first_per_phase_skips_leading_err_samples_within_phase() {
+        let f = SeriesField::<u64>::from_parts_with_phases(
+            "ticks",
+            vec!["t0".into(), "t1".into()],
+            vec![100, 200],
+            vec![
+                Err(SnapshotError::VarNotFound {
+                    requested: "x".into(),
+                    available: vec![],
+                }),
+                Ok(7),
+            ],
+            vec![
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(0)),
+            ],
+        );
+        assert_eq!(
+            f.first_per_phase()[&crate::assert::Phase::step(0)],
+            7,
+            "leading Err in phase must be skipped; first Ok wins",
+        );
+    }
+
+    #[test]
+    fn counter_delta_per_phase_subtracts_first_from_last() {
+        let f = SeriesField::<u64>::from_parts_with_phases(
+            "ticks",
+            vec!["t0".into(), "t1".into(), "t2".into(), "t3".into()],
+            vec![100, 200, 300, 400],
+            vec![Ok(100), Ok(150), Ok(180), Ok(200)],
+            vec![
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(1)),
+                Some(crate::assert::Phase::step(1)),
+            ],
+        );
+        let m = f.counter_delta_per_phase();
+        assert_eq!(m.len(), 2);
+        assert_eq!(
+            m[&crate::assert::Phase::step(0)],
+            50,
+            "Step[0]: last(150) - first(100) = 50",
+        );
+        assert_eq!(
+            m[&crate::assert::Phase::step(1)],
+            20,
+            "Step[1]: last(200) - first(180) = 20 (NOT 200 - 100 = 100; \
+             prior-phase accumulation excluded)",
+        );
+    }
+
+    #[test]
+    fn counter_delta_per_phase_single_sample_phase_yields_zero() {
+        let f = SeriesField::<u64>::from_parts_with_phases(
+            "ticks",
+            vec!["t0".into()],
+            vec![100],
+            vec![Ok(42)],
+            vec![Some(crate::assert::Phase::step(0))],
+        );
+        let m = f.counter_delta_per_phase();
+        assert_eq!(
+            m[&crate::assert::Phase::step(0)],
+            0,
+            "single Ok sample: first == last → delta of zero",
+        );
+    }
+
+    #[test]
+    fn counter_delta_per_phase_omits_phases_with_only_err_samples() {
+        let f = SeriesField::<u64>::from_parts_with_phases(
+            "ticks",
+            vec!["t0".into(), "t1".into()],
+            vec![100, 200],
+            vec![
+                Err(SnapshotError::VarNotFound {
+                    requested: "x".into(),
+                    available: vec![],
+                }),
+                Ok(5),
+            ],
+            vec![
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(1)),
+            ],
+        );
+        let m = f.counter_delta_per_phase();
+        assert!(
+            !m.contains_key(&crate::assert::Phase::step(0)),
+            "all-Err phase omitted from counter_delta_per_phase",
+        );
+        assert_eq!(
+            m[&crate::assert::Phase::step(1)],
+            0,
+            "single-Ok phase: first(5) == last(5) → delta of zero",
+        );
+    }
+
+    #[test]
+    fn counter_delta_per_phase_composes_with_a_b_ratio() {
+        // Real-world composition exercise: two cumulative counters
+        // (same / cross) projected separately, folded per-phase
+        // into a fraction, then compared across phases. Pins the
+        // load-bearing usage pattern that motivated the reducer.
+        let tags: Vec<String> = (0..4).map(|i| format!("p{i}")).collect();
+        let elapsed = vec![100, 200, 300, 400];
+        let phases = vec![
+            Some(crate::assert::Phase::step(0)),
+            Some(crate::assert::Phase::step(0)),
+            Some(crate::assert::Phase::step(1)),
+            Some(crate::assert::Phase::step(1)),
+        ];
+        // same: 1000 → 1200 in step(0), 1200 → 1800 in step(1)
+        let same = SeriesField::<u64>::from_parts_with_phases(
+            "same",
+            tags.clone(),
+            elapsed.clone(),
+            vec![Ok(1000), Ok(1200), Ok(1200), Ok(1800)],
+            phases.clone(),
+        );
+        // cross: 100 → 200 in step(0), 200 → 300 in step(1)
+        let cross = SeriesField::<u64>::from_parts_with_phases(
+            "cross",
+            tags,
+            elapsed,
+            vec![Ok(100), Ok(200), Ok(200), Ok(300)],
+            phases,
+        );
+        let same_d = same.counter_delta_per_phase();
+        let cross_d = cross.counter_delta_per_phase();
+        let cross_frac = |p: crate::assert::Phase| -> f64 {
+            let s = same_d[&p] as f64;
+            let c = cross_d[&p] as f64;
+            c / (s + c)
+        };
+        // Step[0]: 100 / (200 + 100) = 0.333...
+        // Step[1]: 100 / (600 + 100) = 0.143
+        let f0 = cross_frac(crate::assert::Phase::step(0));
+        let f1 = cross_frac(crate::assert::Phase::step(1));
+        assert!((f0 - 0.333333).abs() < 1e-4, "Step[0] cross_frac = {f0}");
+        assert!((f1 - 0.142857).abs() < 1e-4, "Step[1] cross_frac = {f1}");
+        let ratio = f1 / f0;
+        assert!(
+            ratio < 0.5,
+            "phase-delta cross_frac ratio {ratio} should be well below 0.5 — \
+             prior-phase accumulation would have inflated phase 1's reading",
+        );
     }
 
     #[test]
