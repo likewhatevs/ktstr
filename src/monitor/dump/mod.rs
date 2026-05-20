@@ -1309,7 +1309,7 @@ impl FailureDumpReport {
 /// kernel/bpf/bpf_struct_ops.c on either branch.
 ///
 /// **Why this is more principled than the prefix-grouping heuristic
-/// alone.** The heuristic at [`Snapshot::active`] groups global-section
+/// alone.** The heuristic at [`crate::scenario::snapshot::Snapshot::active`] groups global-section
 /// maps by `<obj>.` prefix and disambiguates "exactly one" → that obj.
 /// Multiple obj prefixes (a scheduler swap that left both old and new
 /// BPF objects' maps in the report, or a side-by-side dual scheduler
@@ -1327,7 +1327,7 @@ impl FailureDumpReport {
 ///   the struct_ops map's value_kva was not yet populated).
 /// - The matched map's name lacks a `<obj>.` prefix.
 ///
-/// Callers fall back to [`Snapshot::active`]'s prefix-grouping
+/// Callers fall back to [`crate::scenario::snapshot::Snapshot::active`]'s prefix-grouping
 /// heuristic on `None`.
 fn identify_active_obj_from_struct_ops(
     maps: &[super::bpf_map::BpfMapInfo],
@@ -1340,7 +1340,7 @@ fn identify_active_obj_from_struct_ops(
         m.map_type == super::bpf_map::BPF_MAP_TYPE_STRUCT_OPS && m.value_kva == Some(sched_kva)
     })?;
     // Phase 2: derive an obj prefix that the projection-side
-    // [`Snapshot::active`] will recognize. The split-on-first-dot rule
+    // [`crate::scenario::snapshot::Snapshot::active`] will recognize. The split-on-first-dot rule
     // matches libbpf's `<obj>.<section>` naming for global-section maps
     // (`<obj>.bss`, `<obj>.data`, `<obj>.rodata`). Struct_ops map names
     // do NOT carry the obj prefix in libbpf (the active struct_ops
@@ -1353,7 +1353,7 @@ fn identify_active_obj_from_struct_ops(
     // name when there is no `.`) AND cross-check that the same prefix
     // appears as the obj of at least one global-section map. If it
     // does, return it — the multi-obj case is principled. If it
-    // doesn't (libbpf naming), return None so [`Snapshot::active`]'s
+    // doesn't (libbpf naming), return None so [`crate::scenario::snapshot::Snapshot::active`]'s
     // prefix-grouping heuristic takes over — which in the
     // single-scheduler case correctly resolves to the only global obj
     // prefix.

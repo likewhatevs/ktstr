@@ -58,12 +58,12 @@ pub enum WorkPhase {
 impl WorkPhase {
     /// Construct a [`WorkPhase::AluHot`] variant. Sugar for the
     /// struct-literal form that brings the struct variant in line
-    /// with the tuple-variant constructors — every other [`Phase`]
+    /// with the tuple-variant constructors — every other [`WorkPhase`]
     /// variant takes a single `Duration` and reads as
     /// `WorkPhase::Spin(d)` etc.; the struct variant needs an explicit
     /// `WorkPhase::AluHot { width: ..., duration: ... }` block at every
-    /// call site, breaking the visual symmetry. `Phase::alu_hot(w, d)`
-    /// restores it so `vec![WorkPhase::Spin(d1), Phase::alu_hot(w, d2),
+    /// call site, breaking the visual symmetry. `WorkPhase::alu_hot(w, d)`
+    /// restores it so `vec![WorkPhase::Spin(d1), WorkPhase::alu_hot(w, d2),
     /// WorkPhase::Sleep(d3)]` reads consistently.
     pub const fn alu_hot(width: AluWidth, duration: Duration) -> Self {
         WorkPhase::AluHot { width, duration }

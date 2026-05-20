@@ -379,33 +379,47 @@ impl<'a> Snapshot<'a> {
         }
     }
 
-    /// User-supplied disambiguation for the multi-instance case
-    /// where the same scheduler binary is loaded multiple times
-    /// (e.g. an Op::ReplaceScheduler swap between two builds of
-    /// the same scheduler that produce two `<obj>.bss` maps with
-    /// identical obj_name prefix). [`Self::active`]'s principled
-    /// walker resolves the active scheduler by `*scx_root → struct_ops
-    /// map → obj prefix`, but when both instances share the prefix
-    /// the walker returns the prefix and the projection cannot tell
-    /// the bss copies apart — [`Self::live_var`] then errors with
-    /// `NoActiveScheduler { reason: "multiple obj prefixes" }`.
+    /// Caller-supplied disambiguator for the multi-bss case where
+    /// [`Self::live_var`] cannot resolve a single live copy by itself.
+    ///
+    /// [`Self::live_var`] delegates to [`Self::active`] to filter the
+    /// snapshot to one scheduler's maps. When [`Self::active`] cannot
+    /// pick a single scheduler — multiple BPF objects with
+    /// global-section maps are present AND the principled
+    /// `*scx_root → struct_ops map → obj prefix` walker did not
+    /// identify the live one — it errors with
+    /// [`SnapshotError::NoActiveScheduler`] (the exact `reason` field
+    /// is the long-form message constructed at the bail site listing
+    /// the observed obj_names + the walker's failure cause), and
+    /// [`Self::live_var`] propagates that as [`SnapshotField::Missing`].
+    ///
+    /// `live_var_via` is the escape hatch: it skips the [`Self::active`]
+    /// filter entirely, enumerates every observed copy of `name` via
+    /// [`Self::vars`], and hands the slice to the caller-supplied
+    /// `picker` to pick one by index. Common case: an
+    /// `Op::ReplaceScheduler` swap between two builds of the same
+    /// scheduler that leaves two `<obj>.bss` maps in the snapshot
+    /// sharing one obj_name prefix.
     ///
     /// `picker` receives every observed copy of the named variable
     /// (one entry per `<obj>.bss/.data/.rodata` map carrying it,
     /// per [`Self::vars`]) and returns the index the caller wants
     /// (typically chosen by inspecting each candidate's value via
     /// `SnapshotField::as_u64` / `as_str` and applying a liveness
-    /// or activity fingerprint). The returned index is into the
-    /// slice the picker received — out-of-range returns surface as
-    /// a [`SnapshotError::ProjectionFailed`] so the failure message
-    /// names the picker as the source.
+    /// or activity fingerprint — see
+    /// [`crate::scenario::snapshot::pickers`] for predefined
+    /// pickers such as `max_by_counter_value`).
     ///
     /// Returns [`SnapshotField::Missing`] when:
-    /// - the snapshot has no copies of `name` (matches
-    ///   [`Self::vars`]`(name).next().is_none()`),
-    /// - `picker` returns `None` (the picker decided no candidate
-    ///   matches its disambiguator), OR
-    /// - `picker` returns `Some(idx)` outside the candidate range.
+    /// - the snapshot has no copies of `name` (carrying
+    ///   [`SnapshotError::VarNotFound`] with the list of available
+    ///   global-section maps),
+    /// - `picker` returns `None` (carrying
+    ///   [`SnapshotError::ProjectionFailed`] naming the picker as
+    ///   the source), OR
+    /// - `picker` returns `Some(idx)` outside the candidate range
+    ///   (carrying [`SnapshotError::ProjectionFailed`] with the bad
+    ///   index and the candidate count).
     pub fn live_var_via(
         &self,
         name: &str,

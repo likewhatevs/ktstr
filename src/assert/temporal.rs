@@ -389,8 +389,8 @@ impl<T> SeriesField<T> {
     /// The reducer is intentionally generic: the test author owns
     /// `(same_delta, cross_delta)`-style compositions (e.g. fold
     /// two counter-delta maps into a per-phase fraction) without
-    /// the framework needing a registered [`crate::stats::MetricDef`].
-    /// For Counter-typed registered metrics, the equivalent
+    /// the framework needing a registered `MetricDef`. For
+    /// Counter-typed registered metrics, the equivalent
     /// MetricDef-aware path is [`Self::aggregate_by_phase`].
     ///
     /// **Counter regression**: `T: Sub<Output = T>` — for `u64`

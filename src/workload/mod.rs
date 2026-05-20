@@ -9,7 +9,7 @@
 //! - [`AffinityIntent`] -- per-worker affinity intent (Inherit, LlcAligned, Exact, etc.)
 //! - [`ResolvedAffinity`] -- resolved CPU affinity for workers
 //! - [`WorkSpec`] -- workload definition for a single group of workers within a cgroup
-//! - [`Phase`] -- a single phase in a [`WorkType::Sequence`] compound work pattern
+//! - [`WorkPhase`] -- a single phase in a [`WorkType::Sequence`] compound work pattern
 //! - [`SchedPolicy`] -- Linux scheduling policy for a worker process
 //! - [`MemPolicy`] -- NUMA memory placement policy for worker processes
 //!
@@ -27,7 +27,7 @@
 //!   [`FutexLockMode`], [`WakeMechanism`], [`AluWidth`]) and
 //!   the `humantime_serde_helper` shared by every `Duration`
 //!   field.
-//! - `types` — [`WorkType`] / [`Phase`] /
+//! - `types` — [`WorkType`] / [`WorkPhase`] /
 //!   [`WorkTypeValidationError`] and the WorkType naming
 //!   surface (`from_name`, `suggest`, `ALL_NAMES`).
 //! - `spawn` — runtime spawn pipeline: [`WorkloadHandle`],
