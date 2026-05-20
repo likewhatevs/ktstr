@@ -502,15 +502,14 @@ pub enum Op {
     /// [`Op::write_kernel_hot`](#method.write_kernel_hot) singleton
     /// constructor wraps a 1-element vec.
     ///
-    /// **Dispatch.** The executor's arm dispatches via the
-    /// in-process `SnapshotBridge` callback when one is installed
-    /// (the test-fixture seam) and falls back to the
-    /// virtio-console port-1 wire path
-    /// (`MsgType::KernelOpRequest`) in-guest. The host-side
-    /// hot-path worker that consumes the wire request lands in a
-    /// dedicated follow-up sub-batch; until that worker exists the
-    /// in-guest wire fallback surfaces a transport timeout. The
-    /// bridge path works today for executor unit tests.
+    /// **Dispatch.** The executor's arm calls
+    /// `dispatch_kernel_op_request` (`src/scenario/ops/mod.rs:3717`), which
+    /// uses the in-process `SnapshotBridge` callback when one is
+    /// installed (the test-fixture seam) and falls back to the
+    /// virtio-console port-1 wire path (`MsgType::KernelOpRequest`)
+    /// in-guest. The wire request is consumed by
+    /// `dispatch_kernel_op_batch` (`src/vmm/freeze_coord/kernel_op_dispatch.rs`),
+    /// invoked from the freeze coordinator's apply path.
     ///
     /// **See also.** [`KernelTarget`] — scroll to the
     /// "Semantic risk" section for the single source of truth
@@ -540,16 +539,14 @@ pub enum Op {
     /// caller used [`crate::scenario::ops::Op::write_kernel_cold_batch`]
     /// or chained singletons.
     ///
-    /// **Dispatch.** The executor's arm dispatches via the
-    /// in-process `SnapshotBridge` callback when one is installed
-    /// (the test-fixture seam) and falls back to the
-    /// virtio-console port-1 wire path
-    /// (`MsgType::KernelOpRequest`) in-guest. The host-side
-    /// freeze-coord cold-path handler that consumes the wire
-    /// request lands in a dedicated follow-up sub-batch; until
-    /// that handler exists the in-guest wire fallback surfaces a
-    /// transport timeout. The bridge path works today for
-    /// executor unit tests.
+    /// **Dispatch.** The executor's arm calls
+    /// `dispatch_kernel_op_request` (`src/scenario/ops/mod.rs:3717`), which
+    /// uses the in-process `SnapshotBridge` callback when one is
+    /// installed (the test-fixture seam) and falls back to the
+    /// virtio-console port-1 wire path (`MsgType::KernelOpRequest`)
+    /// in-guest. The wire request lands at the freeze coordinator's
+    /// rendezvous boundary via
+    /// `dispatch_kernel_op_batch` (`src/vmm/freeze_coord/kernel_op_dispatch.rs`).
     ///
     /// Use this for: multi-field atomic writes, all-CPUs-at-once
     /// seeding, one-shot setup that must complete before the guest
@@ -589,9 +586,8 @@ pub enum Op {
     /// bytes).
     ///
     /// **Dispatch.** Same bridge-first / wire-fallback model as
-    /// [`Op::WriteKernelHot`]; the host-side hot-path worker that
-    /// consumes the wire request is queued as a follow-up
-    /// sub-batch.
+    /// [`Op::WriteKernelHot`]; the wire request is consumed by
+    /// `dispatch_kernel_op_batch` (`src/vmm/freeze_coord/kernel_op_dispatch.rs`).
     ReadKernelHot {
         /// Bridge-keyed tag under which the read result lands.
         tag: Cow<'static, str>,
@@ -625,8 +621,9 @@ pub enum Op {
     /// the matching `GuestKernel::read_*` helper.
     ///
     /// **Dispatch.** Bridge-first / wire-fallback like the other
-    /// `*Kernel*` variants; the host-side freeze-coord cold-path
-    /// handler is queued as a follow-up sub-batch.
+    /// `*Kernel*` variants; the wire request lands at the freeze
+    /// coordinator's rendezvous boundary via
+    /// `dispatch_kernel_op_batch` (`src/vmm/freeze_coord/kernel_op_dispatch.rs`).
     ReadKernelCold {
         /// Bridge-keyed tag under which the read result lands.
         tag: Cow<'static, str>,
@@ -636,65 +633,82 @@ pub enum Op {
         /// value shape.
         width: KernelValueWidth,
     },
-    /// Attach a scheduler mid-scenario: spawn the scheduler binary
-    /// inside the guest and wait for it to attach to sched_ext.
-    /// Idempotent at the apply layer — attaching when one is already
-    /// running bails with an actionable error rather than silently
-    /// stacking schedulers.
+    /// Attach a scheduler mid-scenario: spawn the named staged
+    /// scheduler from `/staging/schedulers/<name>/` inside the guest
+    /// and wait for it to publish its first BPF object accessors.
+    ///
+    /// **Dispatch** (`dispatch_attach_scheduler` at
+    /// `src/scenario/ops/mod.rs:3510`): waits up to 60s for the
+    /// accessor-init worker to quiesce (handles the case where the
+    /// boot scheduler's first publish is still in flight), captures
+    /// the pre-spawn publish seqno, spawns the staged scheduler
+    /// binary, re-installs the sched_exit_monitor against the new
+    /// SCHED_PID, then waits up to 30s for a fresh accessor publish.
+    ///
+    /// **Already-attached behavior.** No framework-level idempotency
+    /// guard: if a scheduler is already running, the kernel rejects
+    /// the new attach at the `scx_enable_state() != SCX_DISABLED`
+    /// gate (`kernel/sched/ext.c:6621`, returns `-EBUSY`); the
+    /// spawned binary exits, no fresh publish lands, and the dispatch
+    /// bails on the 30s publish-wait timeout. Use
+    /// [`Op::DetachScheduler`] (then `AttachScheduler`) or
+    /// [`Op::ReplaceScheduler`] to swap schedulers.
     ///
     /// The `scheduler` reference holds a `'static` lifetime: the
-    /// test author declares each [`crate::test_support::Scheduler`] at static scope (via
-    /// `declare_scheduler!` or a `static MY_SCHED: Scheduler = ...`
-    /// item) and passes the borrow into the constructor. The
-    /// guest-side binary-staging mechanism that lets the dispatch
-    /// arm reach the actual scheduler executable is a follow-up
-    /// build-out (see "Not yet implemented" below); today there is
-    /// no `KtstrTestEntry` slot that ships multiple scheduler
-    /// binaries into the initramfs.
-    ///
-    /// **Not yet implemented.** Constructing this op compiles and
-    /// pin-tests pass, but applying it bails with an actionable
-    /// "not yet implemented" diagnostic. The guest-side scheduler-
-    /// lifecycle helpers + the host-to-guest dispatch wire land in
-    /// follow-up work.
+    /// test author declares each [`crate::test_support::Scheduler`]
+    /// at static scope (via `declare_scheduler!` or a
+    /// `static MY_SCHED: Scheduler = ...` item) and passes the
+    /// borrow into the constructor. The staging slot that ships the
+    /// binary into the initramfs is `KtstrTestEntry::staged_schedulers`;
+    /// the dispatch arm reads its path via
+    /// `test_support::staged::staged_scheduler_binary_path`.
     AttachScheduler {
         scheduler: &'static crate::test_support::Scheduler,
     },
-    /// Detach the currently-running scheduler: SIGTERM the scheduler
-    /// binary inside the guest, wait for `scx_ops_detach` to run, and
-    /// observe `*scx_root` transition to NULL via the existing freeze
-    /// coordinator detach detection at
-    /// `src/vmm/freeze_coord/mod.rs:2460-2498`. Idempotent at the
-    /// apply layer — detaching when nothing is running is a no-op.
+    /// Detach the currently-running scheduler.
     ///
-    /// After successful detach the guest's `SCHED_PID` atomic
-    /// (`src/vmm/rust_init.rs:90`) is reset so subsequent liveness
-    /// checks (`ctx.sched_pid` reads in
-    /// `src/scenario/ops/mod.rs:861/973/1223`) short-circuit
-    /// correctly.
+    /// **Dispatch** (`dispatch_detach_scheduler` →
+    /// `kill_current_scheduler` at `src/scenario/ops/mod.rs:3386`):
+    /// stops the host's sched_exit_monitor so the intentional kill
+    /// isn't promoted into a test-fatal scheduler-died signal,
+    /// writes `'S'` to `/proc/sysrq-trigger` to start the kernel-
+    /// side `scx_disable` cascade asynchronously (avoiding the
+    /// D-state stall inside `bpf_scx_unreg`'s
+    /// `kthread_flush_work(&sch->disable_work)` at
+    /// `kernel/sched/ext.c:7372-7381`), sends `SIGTERM` to the
+    /// scheduler pid, waits up to `SCHED_LIFECYCLE_KILL_GRACE` (10s)
+    /// for the kernel BPF state to reach `SCX_DISABLED`, then
+    /// clears the `SCHED_PID` atomic (defined at
+    /// `src/vmm/rust_init.rs:90`) so subsequent
+    /// `crate::vmm::rust_init::sched_pid()` reads return `None`.
     ///
-    /// **Not yet implemented.** See [`Op::AttachScheduler`] — the
-    /// constructor compiles and pin-tests pass, but applying this op
-    /// bails with an actionable "not yet implemented" diagnostic
-    /// until the guest-side `kill_scheduler` helper + `SCHED_PID`
-    /// reset land.
+    /// Bails when no scheduler is currently attached (SCHED_PID is
+    /// 0), when the SIGTERM syscall fails, or when the
+    /// `SCX_DISABLED` wait times out. NOT idempotent: a second
+    /// detach with no scheduler attached bails rather than no-oping.
+    /// For defensive "ensure clean slate" scaffolds, gate on
+    /// `crate::vmm::rust_init::sched_pid()` returning `Some` before
+    /// emitting the Detach step rather than relying on no-op
+    /// tolerance.
     DetachScheduler,
-    /// Detach and re-attach the currently-running scheduler with the
-    /// SAME spec it was attached under. Useful for hot-restart
-    /// validation. Bails if no scheduler is currently attached
-    /// (there is no "previous spec" to restart against).
+    /// Kill the currently-running scheduler and respawn the BOOT
+    /// scheduler. Useful for hot-restart validation of the boot
+    /// scheduler. Bails if no scheduler is currently attached.
     ///
-    /// Semantically equivalent to `[DetachScheduler, AttachScheduler
-    /// { scheduler: <current> }]` but expressed as a single op so the
-    /// in-between detached window stays narrow and so the framework
-    /// can validate state-preservation invariants at the boundary
-    /// without depending on test-author bookkeeping of the current
-    /// scheduler.
+    /// **v0 limitation.** Always respawns the boot scheduler at
+    /// `/scheduler` + `/sched_args` regardless of which scheduler
+    /// was most-recently attached — after an `Op::AttachScheduler`
+    /// or `Op::ReplaceScheduler` to a staged scheduler, this op
+    /// restarts the BOOT scheduler, not the most-recently-attached
+    /// one. For restarting a staged scheduler, use
+    /// [`Op::ReplaceScheduler`] with the same staged spec.
     ///
-    /// **Not yet implemented.** See [`Op::AttachScheduler`] — the
-    /// constructor compiles and pin-tests pass, but applying this op
-    /// bails with an actionable "not yet implemented" diagnostic
-    /// until the guest-side restart helper lands.
+    /// **Dispatch** (`dispatch_restart_scheduler` at
+    /// `src/scenario/ops/mod.rs:3589`): kills the current scheduler
+    /// via the shared `kill_current_scheduler` helper, spawns the
+    /// boot scheduler from the hardcoded `/scheduler` + `/sched_args`
+    /// paths with log at `/tmp/sched.log`, then re-installs the
+    /// sched_exit_monitor against the re-spawned boot pid.
     RestartScheduler,
     /// Detach the currently-running scheduler and attach a different
     /// one. Equivalent to `[DetachScheduler, AttachScheduler {
@@ -712,10 +726,18 @@ pub enum Op {
     /// scheduler to detach from, so the "replace" semantic has no
     /// meaning. Use [`Op::AttachScheduler`] for the first attach.
     ///
-    /// **Not yet implemented.** See [`Op::AttachScheduler`] — the
-    /// constructor compiles and pin-tests pass, but applying this op
-    /// bails with an actionable "not yet implemented" diagnostic
-    /// until the guest-side detach+spec-swap+spawn dispatch lands.
+    /// **Dispatch** (`dispatch_replace_scheduler` at
+    /// `src/scenario/ops/mod.rs:3616`): kills the current scheduler
+    /// via the shared `kill_current_scheduler` helper, spawns the
+    /// named staged scheduler binary from
+    /// `/staging/schedulers/<name>/`, re-installs the
+    /// sched_exit_monitor against the new SCHED_PID, waits up to
+    /// `REPLACE_NOT_TRYING_DEADLINE_S` (5s) for the accessor-init
+    /// worker to quiesce, captures the pre-publish seqno, then
+    /// waits up to 10s for fresh accessors to publish against the
+    /// new BPF object. The 10s budget aligns with
+    /// `SCHED_LIFECYCLE_KILL_GRACE` and covers a cold-cache vmlinux
+    /// re-parse during the worker reinit.
     ReplaceScheduler {
         scheduler: &'static crate::test_support::Scheduler,
     },
