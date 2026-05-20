@@ -1636,10 +1636,15 @@ pub(super) fn validate_workload_admission(group: &GroupParams) -> Result<()> {
 /// [`WorkloadHandle::start`]; the parent then sends `()` to each
 /// worker's `start_tx` to unblock them in order.
 ///
-/// `tid` is published from inside the closure via `gettid()` after
-/// the start handshake completes, so [`WorkloadHandle::worker_pids`]
-/// reads it post-`start`. A pre-start read returns `0`, which is
-/// the documented sentinel for "not yet running".
+/// Also uses a capacity-1 `mpsc::sync_channel(1)` tid-publish
+/// channel so this function blocks (up to 2 s) until the worker
+/// thread reaches the `gettid()` publish point. That makes
+/// [`WorkloadHandle::worker_pids`] safe to call immediately after
+/// [`WorkloadHandle::spawn`] returns without first calling
+/// [`WorkloadHandle::start`] — the publish happens BEFORE the
+/// start handshake, so post-spawn tid reads always observe the
+/// gettid() value (or spawn would have bailed with a "did not
+/// publish gettid() within 2 s" error).
 ///
 /// SIGUSR1 is process-wide and useless for per-thread stop control,
 /// so this path does not install a signal handler. The parent flips
@@ -1662,6 +1667,16 @@ pub(super) fn spawn_thread_worker(
     // the sender first (mid-spawn cleanup or early bail), `recv()`
     // returns `Err(Disconnected)` and the closure exits cleanly.
     let (start_tx, start_rx) = mpsc::sync_channel::<()>(0);
+    // tid-publish handshake. Capacity 1 so the worker's send is
+    // non-blocking; the parent's `recv_timeout` below blocks until
+    // the worker reaches the publish point. Without this, the
+    // post-spawn `WorkloadHandle::worker_pids()` race-reads the
+    // initial 0 sentinel because the worker thread hasn't been
+    // scheduled to the `tid_thread.store(my_tid, Release)` site yet
+    // — surfaced as a spurious `Thread SpinWait worker reported
+    // non-positive tid=0` test failure in
+    // tests/worker_thread_integration.rs.
+    let (tid_pub_tx, tid_pub_rx) = mpsc::sync_channel::<()>(1);
     let stop = Arc::new(AtomicBool::new(false));
     let tid = Arc::new(AtomicI32::new(0));
     // Per-worker exit eventfd: bumped by a Drop guard inside the
@@ -1734,6 +1749,13 @@ pub(super) fn spawn_thread_worker(
             // every supported target (release-store on the Arc's
             // underlying AtomicI32 is a single instruction).
             tid_thread.store(my_tid, Ordering::Release);
+            // Notify the parent that tid is published. Capacity-1
+            // channel means this send is non-blocking; the parent's
+            // `recv_timeout` below blocks until this fires so
+            // post-spawn callers see populated tids. Drop the
+            // sender after send so any future replays are no-ops.
+            let _ = tid_pub_tx.send(());
+            drop(tid_pub_tx);
 
             // Block on start rendezvous. `Err(_)` means the parent
             // dropped start_tx before sending — return a sentinel
@@ -1781,6 +1803,37 @@ pub(super) fn spawn_thread_worker(
                 group_idx,
             )
         })?;
+
+    // Block until the worker reaches the gettid() publish point.
+    // 2 s deadline is generous: a fresh std::thread on a healthy
+    // host reaches the closure body within microseconds; under
+    // VM/CI pressure ~ms. Anything past 2 s indicates the worker
+    // thread failed to schedule at all — surface as a typed error
+    // rather than letting a downstream `worker_pids()` reader race-
+    // read the initial 0 sentinel and tip over a tid-check assertion.
+    match tid_pub_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        Ok(()) => {}
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            anyhow::bail!(
+                "spawn_thread_worker: worker {} (group {}) did not publish gettid() \
+                 within 2 s of thread::spawn — the worker thread failed to schedule. \
+                 Likely cause: host fd / thread-stack exhaustion, or the std runtime \
+                 thread pool is wedged. tid stays at 0; subsequent worker_pids() \
+                 reads would surface the sentinel.",
+                guard.threads.len() + 1,
+                group_idx,
+            );
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            anyhow::bail!(
+                "spawn_thread_worker: worker {} (group {}) closed tid-publish channel \
+                 without sending — the closure panicked before reaching the gettid() \
+                 publish point. Check the thread name's panic output for the cause.",
+                guard.threads.len() + 1,
+                group_idx,
+            );
+        }
+    }
 
     guard.threads.push(ThreadWorker {
         tid,
@@ -4277,15 +4330,18 @@ impl WorkloadHandle {
     /// # Thread tid publish ordering
     ///
     /// Thread workers publish their `gettid()` via an
-    /// `Arc<AtomicI32>` after the start handshake. The publish uses
-    /// `Release`; this reader uses `Acquire`, pairing release-
-    /// acquire so that any reader who observes a non-zero tid is
-    /// also guaranteed to observe the worker's full post-start
-    /// state. If the caller invokes `worker_pids()` before
-    /// [`start()`](Self::start) returns, the worker may not yet
-    /// have stored its tid and `0` (the `AtomicI32` initial value)
-    /// is reported in those slots. Callers that require post-start
-    /// tids must call `start()` before `worker_pids()`.
+    /// `Arc<AtomicI32>` BEFORE the start handshake (the publish is
+    /// the first thing the worker closure does, before blocking on
+    /// `start_rx`). [`spawn_thread_worker`] blocks on a paired
+    /// rendezvous channel until the worker reaches the publish
+    /// point, so by the time [`WorkloadHandle::spawn`] returns,
+    /// every thread worker's `tid` is non-zero (or spawn would have
+    /// bailed with a "failed to publish gettid() within 2 s"
+    /// error). Post-spawn `worker_pids()` is safe to call without
+    /// first calling [`Self::start`]. The publish uses `Release`;
+    /// this reader uses `Acquire`, pairing release-acquire so that
+    /// any reader observing a non-zero tid is also guaranteed to
+    /// observe the worker's post-publish state.
     ///
     /// # `pcomm` containers
     ///
