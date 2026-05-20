@@ -313,38 +313,50 @@ fn assert_page_offset_randomized(result: &VmResult) -> Result<()> {
         Some(KernelOpValue::U64(v)) => *v,
         other => anyhow::bail!("expected U64, got {other:?}"),
     };
-    // 4- vs 5-level paging changes the kaslr_regions[0] base. The
-    // kernel picks the appropriate `__PAGE_OFFSET_BASE_L{4,5}` at
-    // boot based on the LA57 CPUID bit (arch/x86/include/asm/
-    // page_64_types.h). Both bases live in the kernel half but at
-    // very different addresses; without selecting the right one,
-    // the "in range" assertion below silently rejects a correctly
-    // randomized 5-level layout. Picked from the observed `pob`'s
-    // upper byte: 0xff matches L5 (page_offset zone starts at
-    // 0xff11_0000_0000_0000); anything else (in practice 0xffff)
-    // falls back to L4 (zone starts at 0xffff_8880_0000_0000).
+    // 4- vs 5-level paging changes the kaslr_regions[0] base AND
+    // the region's entropy range. The kernel picks the appropriate
+    // `__PAGE_OFFSET_BASE_L{4,5}` at boot based on the LA57 CPUID
+    // bit (arch/x86/include/asm/page_64_types.h); for the entropy
+    // upper bound, kaslr_regions[0].size_tb is dynamically set to
+    // `1 << (MAX_PHYSMEM_BITS - TB_SHIFT)` (arch/x86/mm/kaslr.c)
+    // where MAX_PHYSMEM_BITS = 46 (L4) or 52 (L5). The actual
+    // entropy a given boot uses is `remain_entropy / N_regions`
+    // bounded by that size — page_offset_base can land anywhere
+    // in `[base, base + size_tb*TiB)`.
+    //
+    // Detection: observed `pob`'s upper byte. 0xff matches L5
+    // (`0xff11_0000_0000_0000` base); anything else (in practice
+    // 0xffff) falls back to L4 (`0xffff_8880_0000_0000` base).
     const DEFAULT_PAGE_OFFSET_L4: u64 = 0xffff_8880_0000_0000;
     const DEFAULT_PAGE_OFFSET_L5: u64 = 0xff11_0000_0000_0000;
+    // kaslr_regions[0].size_tb per paging mode — the upper bound
+    // on the entropy added to the base. MAX_PHYSMEM_BITS values
+    // are stable kernel constants per arch/x86/include/asm/page_*
+    // _types.h. Use the slightly-loose >> instead of `1 << (m - 40)`
+    // expressed as TiB to keep the byte arithmetic readable.
+    const REGION_SIZE_L4: u64 = 64u64 * (1u64 << 40); // 1 << (46 - 40) = 64 TiB
+    const REGION_SIZE_L5: u64 = 4096u64 * (1u64 << 40); // 1 << (52 - 40) = 4096 TiB = 4 PiB
     const PUD_SIZE: u64 = 1 << 30; // 1 GiB
     anyhow::ensure!(
         pob != 0,
         "page_offset_base value == 0 — derivation chain failed entirely"
     );
-    let default_page_offset = if (pob >> 56) == 0xff {
-        DEFAULT_PAGE_OFFSET_L5
+    let (default_page_offset, region_size) = if (pob >> 56) == 0xff {
+        (DEFAULT_PAGE_OFFSET_L5, REGION_SIZE_L5)
     } else {
-        DEFAULT_PAGE_OFFSET_L4
+        (DEFAULT_PAGE_OFFSET_L4, REGION_SIZE_L4)
     };
     anyhow::ensure!(
-        (default_page_offset..default_page_offset + 40 * (1u64 << 40)).contains(&pob),
-        "page_offset_base = {pob:#x} outside {default_page_offset:#x}.. + 40 TiB range — \
-         kaslr_regions[0] picked outside its assigned zone"
+        (default_page_offset..default_page_offset.wrapping_add(region_size)).contains(&pob),
+        "page_offset_base = {pob:#x} outside {default_page_offset:#x}.. + {} TiB range \
+         (kaslr_regions[0].size_tb for this paging mode) — picked outside its assigned zone",
+        region_size / (1u64 << 40),
     );
     anyhow::ensure!(
         (pob - default_page_offset).is_multiple_of(PUD_SIZE),
         "page_offset_base = {pob:#x}, delta from DEFAULT = {:#x} not \
          PUD-aligned (1 GiB) — kernel guarantees PUD alignment per \
-         arch/x86/mm/kaslr.c:150 (& PUD_MASK)",
+         arch/x86/mm/kaslr.c (& PUD_MASK)",
         pob - default_page_offset
     );
     if pob == default_page_offset {
