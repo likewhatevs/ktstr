@@ -672,8 +672,8 @@ pub fn write_metric_list<W: fmt::Write>(w: &mut W) -> fmt::Result {
     let mut dt = crate::cli::new_table();
     dt.set_header(vec!["metric", "unit", "inputs", "description"]);
     for d in CTPROF_DERIVED_METRICS {
-        // Phase 4: ladder is the source of truth — `ratio` and
-        // unit suffixes both fall out of `ScaleLadder::base_unit`
+        // Ladder is the source of truth — `ratio` and unit
+        // suffixes both fall out of `ScaleLadder::base_unit`
         // (with an explicit override for ratio rows where
         // is_ratio is true and the ladder is None).
         let unit_cell = if d.is_ratio {

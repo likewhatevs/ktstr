@@ -29,8 +29,8 @@
 
 use super::{Aggregated, DerivedValue};
 
-/// Closed enumeration of auto-scale ladders driven by phase 4
-/// format dispatch.
+/// Closed enumeration of auto-scale ladders driving format
+/// dispatch.
 ///
 /// Picks the unit family up the type system rather than a free-form
 /// `&'static str` tag. Each `AggRule` variant maps to exactly one

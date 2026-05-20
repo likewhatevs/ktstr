@@ -1,4 +1,4 @@
-//! Tests for `super::scale` (Phase F.2 per-module redistribution).
+//! Tests for `super::scale`.
 
 #![allow(unused_imports)]
 #![allow(clippy::field_reassign_with_default)]
@@ -198,13 +198,12 @@ fn auto_scale_preserves_sign_on_negative_input() {
     assert!((v - (-5000.0 / 1024.0)).abs() < 1e-9);
 }
 
-/// Phase 4: the unknown-unit pass-through behavior was
-/// removed when `auto_scale` migrated from a free-form
-/// `&'static str` unit tag to the closed [`ScaleLadder`]
-/// enum. A registry typo can no longer slip through an
-/// `other => pass-through` arm at render time — every
-/// ladder is named at the type level. The corresponding
-/// `auto_scale_unknown_unit_passes_through` test
+/// The unknown-unit pass-through behavior was removed when
+/// `auto_scale` migrated from a free-form `&'static str` unit
+/// tag to the closed [`ScaleLadder`] enum. A registry typo can
+/// no longer slip through an `other => pass-through` arm at
+/// render time — every ladder is named at the type level. The
+/// corresponding `auto_scale_unknown_unit_passes_through` test
 /// disappeared with that change.
 ///
 /// `format_value_cell` for a Sum aggregate with the Ns ladder:

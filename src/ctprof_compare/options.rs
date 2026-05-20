@@ -466,8 +466,7 @@ impl AggRule {
     /// The auto-scale ladder for this rule's value cell.
     ///
     /// Closed match — adding a new [`AggRule`] variant requires
-    /// adding the ladder mapping here, which is the type-system
-    /// enforcement phase 4 introduces. The mapping is one-to-one
+    /// adding the ladder mapping here. The mapping is one-to-one
     /// with the typed accessor newtype: [`AggRule::SumNs`] →
     /// [`ScaleLadder::Ns`], [`AggRule::SumBytes`] →
     /// [`ScaleLadder::Bytes`], etc.

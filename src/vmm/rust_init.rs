@@ -5113,7 +5113,14 @@ mod tests {
 
         let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg(format!("trap '' TERM; touch {marker}; sleep 30"))
+            // `exec sleep 30` forces sleep to replace sh in-place
+            // so SIGKILL on the sh pid kills the sleep too. Without
+            // `exec`, sh runs `touch` first (which forces sh to stay
+            // around as a process), then forks for `sleep` — and
+            // SIGKILL on the sh pid leaves the orphaned sleep
+            // re-parented to init, surfaced by nextest's leak
+            // detector as a "leaky" test.
+            .arg(format!("trap '' TERM; touch {marker}; exec sleep 30"))
             .spawn()
             .expect("spawn /bin/sh");
         let pid = child.id() as libc::pid_t;

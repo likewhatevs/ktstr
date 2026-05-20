@@ -141,7 +141,7 @@
 //!   future ordinal metrics whose kernel-side type genuinely
 //!   exceeds `u32::MAX`; no field uses it today.
 //! - [`CategoricalString`] — string-valued, mode-aggregated.
-//!   `policy` is the only example after phase 2. The `state` char
+//!   `policy` is the only example. The `state` char
 //!   and `ext_enabled` bool fields stay unwrapped on
 //!   [`crate::ctprof::ThreadState`]; the
 //!   [`crate::ctprof_compare::AggRule::Mode`] accessor coerces
@@ -211,7 +211,7 @@
 //! Every wrapper carries `#[serde(transparent)]` so the JSON
 //! representation matches the unwrapped primitive. The
 //! [`crate::ctprof::ThreadState`] migration to these
-//! newtypes (phase 2) preserves wire format — existing
+//! newtypes preserves wire format — existing
 //! snapshot files (`.ctprof.zst`) deserialize unchanged.
 //!
 //! # What this module is NOT
@@ -548,7 +548,7 @@ pub struct GaugeNs(pub u64);
 /// Routing this kind of field through [`GaugeNs`] would render
 /// it on the ns auto-scale ladder — a unit lie. The dedicated
 /// type makes the intent explicit at the field declaration and
-/// lets the format dispatch in phase 4 pick the unitless ladder
+/// lets the format dispatch pick the unitless ladder
 /// instead.
 ///
 /// Implements [`Maxable`]. Does NOT implement [`Summable`].
@@ -615,7 +615,7 @@ pub struct OrdinalU64(pub u64);
 /// `policy` (SCHED_OTHER, SCHED_FIFO, SCHED_RR, SCHED_BATCH,
 /// SCHED_IDLE, SCHED_DEADLINE, SCHED_EXT) is the only
 /// [`CategoricalString`] field on
-/// [`crate::ctprof::ThreadState`] after phase 2. The
+/// [`crate::ctprof::ThreadState`]. The
 /// `state: char` and `ext_enabled: bool` fields stay unwrapped
 /// — the `AggRule::Mode` accessor coerces them through `String`
 /// via `to_string()`/`Display` at the call site. If a second
@@ -731,11 +731,11 @@ impl From<CpuSet> for Vec<u32> {
 
 // ---------------------------------------------------------------------------
 // `Display` — delegate to the underlying primitive so the
-// auto-scale ladder (phase 4) and ad-hoc `format!("{}", ...)`
+// auto-scale ladder and ad-hoc `format!("{}", ...)`
 // callers can render a wrapped value as a bare integer / string
 // without unwrapping `.0`. Wrappers carry semantic category, not
 // formatting policy: a unit-aware render path is the format
-// dispatch in phase 4, which consults the registry's `unit` tag
+// dispatch, which consults the registry's `unit` tag
 // rather than the wrapper type. `Display` here is the
 // minimal pass-through.
 // ---------------------------------------------------------------------------
@@ -1645,7 +1645,7 @@ mod tests {
 
     /// Serde transparent: every newtype must serialize identically
     /// to its primitive. Pin the JSON shape so the
-    /// `ThreadState` migration (phase 2) preserves existing
+    /// `ThreadState` migration preserves existing
     /// snapshot files.
     #[test]
     fn serde_transparent_matches_primitive() {

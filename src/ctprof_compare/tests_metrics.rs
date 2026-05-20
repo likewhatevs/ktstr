@@ -1,4 +1,4 @@
-//! Tests for `super::metrics` (Phase F.2 per-module redistribution).
+//! Tests for `super::metrics`.
 
 #![allow(unused_imports)]
 #![allow(clippy::field_reassign_with_default)]

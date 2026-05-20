@@ -366,18 +366,17 @@ fn capture_with_inode_cache_collapses_duplicate_binaries() {
 }
 
 // ------------------------------------------------------------
-// Capture-pipeline error paths (Batch A + B)
+// Capture-pipeline error paths.
 //
 // The synthetic-tree happy path is covered by
 // capture_with_synthetic_tree_assembles_thread_state above.
 // The tests below pin the pipeline's behavior against
-// adversarial inputs:
-// - missing/empty proc_root and tgid dirs (Batch A)
-// - non-numeric junk under proc_root (Batch A)
-// - capture_pid_with against pids that don't exist or are
-//   ghost (Batch A + B)
+// hostile inputs:
+// - missing/empty proc_root and tgid dirs
+// - non-numeric junk under proc_root
+// - capture_pid_with against pids that don't exist or are ghost
 // - selectively malformed/corrupted procfs files leaving
-//   the matching ThreadState fields zero-defaulted (Batch B)
+//   the matching ThreadState fields zero-defaulted
 //
 // Each test uses stage_synthetic_proc to lay down a known-
 // good baseline, then mutates one specific axis. Assertions
@@ -386,7 +385,7 @@ fn capture_with_inode_cache_collapses_duplicate_binaries() {
 // mode without re-derivation.
 // ------------------------------------------------------------
 
-/// G1 — proc_root pointing at a directory that does NOT
+/// proc_root pointing at a directory that does NOT
 /// exist must NOT panic. Pipeline collapses to an empty
 /// snapshot via `iter_tgids_at`'s read_dir-fail-→-empty-Vec
 /// guard. Defends against a future change that bubbled the
@@ -412,7 +411,7 @@ fn capture_with_nonexistent_proc_root_produces_empty_snapshot() {
     );
 }
 
-/// G2 — tgid directory present but missing the inner
+/// tgid directory present but missing the inner
 /// `task/` subdirectory. `iter_task_ids_at` returns an
 /// empty vec, so the per-tid loop runs zero iterations and
 /// the tgid contributes no threads. Pins that the missing
@@ -451,7 +450,7 @@ fn capture_with_tgid_missing_task_dir_yields_no_threads_for_that_tgid() {
     assert_eq!(snap.threads[0].tid, live_tid as u32);
 }
 
-/// G3 — non-numeric directory entries under proc_root
+/// non-numeric directory entries under proc_root
 /// (real procfs has `self`, `thread-self`, `sys`, `kpageflags`,
 /// etc.) MUST be filtered by the parse-as-i32 step in
 /// `iter_tgids_at`. Pins the filter so a future refactor
@@ -504,7 +503,7 @@ fn capture_with_non_numeric_proc_entries_are_filtered() {
     assert_eq!(snap.threads[0].tgid, live_tgid as u32);
 }
 
-/// G7 — `capture_pid_with` against a pid whose `/proc/<pid>`
+/// `capture_pid_with` against a pid whose `/proc/<pid>`
 /// directory does not exist must NOT panic. `iter_task_ids_at`
 /// returns empty, the loop iterates zero times, and the
 /// snapshot's `threads` is empty. Pins that the per-pid
@@ -878,7 +877,7 @@ fn capture_with_sleep_runtime_absent_zeroes_voluntary_sleep() {
     assert_eq!(t.block_sum, MonotonicNs(1_100_750_000));
 }
 
-/// G5 — selectively delete EVERY non-comm file under one tid
+/// selectively delete EVERY non-comm file under one tid
 /// to simulate a partial mid-capture race (readdir saw the
 /// dir, then the kernel completed exit cleanup before our
 /// per-file reads). With comm intact, the thread still
@@ -925,7 +924,7 @@ fn capture_with_partial_mid_capture_race_lands_zero_thread() {
     );
 }
 
-/// G6 — `capture_pid_with` ghost filter: a tid directory
+/// `capture_pid_with` ghost filter: a tid directory
 /// under the target pid exists but carries zero readable
 /// files (mid-capture exit). `capture_pid_with`'s
 /// terminal ghost-filter check — same shape as the global
@@ -969,7 +968,7 @@ fn capture_pid_with_filters_ghost_threads() {
     assert_eq!(snap.threads[0].tid, live_tid as u32);
 }
 
-/// G8 — malformed `Cpus_allowed_list:` value (a reversed
+/// malformed `Cpus_allowed_list:` value (a reversed
 /// range like `5-3`) routes through `parse_cpu_list` which
 /// returns `None`. With `use_syscall_affinity=false`, the
 /// capture site has no fallback and `cpu_affinity` stays
@@ -1020,12 +1019,13 @@ fn capture_with_malformed_cpus_allowed_list_yields_empty_affinity() {
     );
 }
 
-/// G11 — huge `Cpus_allowed_list:` range (above the
+/// huge `Cpus_allowed_list:` range (above the
 /// MAX_CPU_RANGE_EXPANSION cap at 64 Ki CPUs) routes
 /// through the `parse_cpu_list` cap and returns `None`.
-/// Same observable effect as G8 (empty Vec) but pins a
-/// distinct adversarial input — a hostile /proc with a
-/// `0-4294967295` cpulist must NOT allocate gigabytes.
+/// Same observable effect as the reversed-range case
+/// (empty Vec) but pins a distinct hostile input — a
+/// hostile /proc with a `0-4294967295` cpulist must NOT
+/// allocate gigabytes.
 #[test]
 fn capture_with_huge_cpu_range_in_status_yields_empty_affinity() {
     let proc_tmp = tempfile::TempDir::new().unwrap();
@@ -1071,12 +1071,13 @@ fn capture_with_huge_cpu_range_in_status_yields_empty_affinity() {
     );
 }
 
-/// G9 — non-numeric directory entries under `<proc_root>/<tgid>/task/`
+/// non-numeric directory entries under `<proc_root>/<tgid>/task/`
 /// MUST be filtered by the parse-as-i32 step in
-/// `iter_task_ids_at`. Mirrors G3 for the per-tgid `task/` subdir
-/// (G3 covers `<proc_root>` itself). Real procfs has only numeric
-/// task entries, but a hostile or malformed test fixture could
-/// stage non-numeric names; the filter must drop them rather
+/// `iter_task_ids_at`. Mirrors the proc_root non-numeric filter
+/// test above, but for the per-tgid `task/` subdir. Real procfs
+/// has only numeric task entries, but a hostile or malformed test
+/// fixture could stage non-numeric names; the filter must drop them
+/// rather
 /// than surface garbage tids.
 #[test]
 fn capture_with_non_numeric_task_entries_are_filtered() {
@@ -1118,7 +1119,7 @@ fn capture_with_non_numeric_task_entries_are_filtered() {
     assert_eq!(snap.threads[0].tid, live_tid as u32);
 }
 
-/// G10 — a tgid emitting a v1-only `cgroup` file (legacy
+/// a tgid emitting a v1-only `cgroup` file (legacy
 /// hierarchy entries, no `0::` unified line) lands the thread
 /// with `cgroup` defaulting to "". The ghost filter does NOT
 /// fire because comm + start_time are intact. The empty cgroup
