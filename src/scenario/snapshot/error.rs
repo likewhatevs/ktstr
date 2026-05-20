@@ -146,6 +146,25 @@ impl From<&crate::vmm::sched_stats::SchedStatsError> for MissingStatsReason {
 }
 
 // ---------------------------------------------------------------------------
+// Excluded map payload
+// ---------------------------------------------------------------------------
+
+/// One captured map that the KVA-whitelist filter rejected.
+/// Payload for [`SnapshotError::ActiveFilterExcludedMaps::excluded_maps`].
+/// The `map_kva` field name matches
+/// [`crate::monitor::dump::FailureDumpMap::map_kva`] (the
+/// source-of-truth field), and a `map_kva == 0` here flags a
+/// capture where the per-map KVA was not recorded (synthetic
+/// fixture or capture-path bug — production captures filter zero
+/// KVAs out at the walker level).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct ExcludedMap {
+    pub name: String,
+    pub map_kva: u64,
+}
+
+// ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
 
@@ -331,14 +350,23 @@ pub enum SnapshotError {
     NoActiveScheduler { reason: String },
     /// [`super::Snapshot::var`] / [`super::Snapshot::map`] (or one
     /// of the `live_*` shortcuts) ran against an active-filtered
-    /// view whose KVA whitelist excluded every captured map that
-    /// shared the active obj prefix. Distinct from
-    /// [`Self::VarNotFound`] (whose `available` list would be
-    /// empty under the active filter even though maps WERE
-    /// captured) so the operator sees the captured map names and
-    /// KVAs that did not pass the filter, the expected KVA set
-    /// the walker populated, and a structural hint about why the
-    /// filter excluded them. Typical causes: stale walker capture
+    /// view where the KVA whitelist excluded EVERY captured map
+    /// that shared the active obj prefix (i.e. the admitted set
+    /// for this obj was empty). Distinct from [`Self::VarNotFound`]
+    /// — `VarNotFound` means "the active filter admitted maps but
+    /// none carry the requested name"; this variant means "the
+    /// active filter admitted zero maps for this obj, so the
+    /// lookup never got the chance to walk anything."
+    ///
+    /// The variant never fires when at least one captured
+    /// `<active_obj>.*` map passes the KVA whitelist — in that
+    /// case the lookup miss is a real typo or absent symbol and
+    /// the standard `VarNotFound` / `MapNotFound` carries the
+    /// admitted list. This narrow firing scope prevents
+    /// false-positives that would otherwise mask genuine typos
+    /// in same-binary post-swap captures.
+    ///
+    /// Typical causes when this DOES fire: stale walker capture
     /// (captured KVAs predate the most recent struct_ops swap),
     /// same-binary post-swap window where the report still
     /// carries the old instance's maps, or a walker bug that
@@ -352,17 +380,37 @@ pub enum SnapshotError {
         /// (`*scx_root → struct_ops map → obj prefix` resolution).
         active_obj: String,
         /// Maps captured under the active obj prefix that the KVA
-        /// whitelist rejected. Each entry is `(map_name,
-        /// map_kva)`; `map_kva == 0` flags a capture where the
-        /// walker did not populate the per-map KVA (stale snapshot
-        /// or capture-path bug).
-        excluded_maps: Vec<(String, u64)>,
+        /// whitelist rejected.
+        excluded_maps: Vec<ExcludedMap>,
         /// KVA whitelist the walker populated for the active obj.
         /// A non-empty set whose every entry mismatched the
         /// captured `map_kva` values points at stale capture or
         /// KVA aliasing; an empty set is unreachable through this
         /// variant (no filter means no exclusion).
-        expected_kvas: Vec<u64>,
+        whitelist_kvas: Vec<u64>,
+    },
+    /// A walker-resolved [`crate::scenario::sample::SampleSeries::bpf_live_u64`]
+    /// / `bpf_live_i64` / `bpf_live_f64` projection detected that
+    /// the snapshot's per-snapshot walker output
+    /// ([`crate::monitor::dump::FailureDumpReport::active_map_kvas`])
+    /// disagrees with an earlier same-phase snapshot's walker
+    /// output for the same lookup. The framework pins the first
+    /// non-empty walker output it sees per phase and surfaces this
+    /// variant for every later same-phase snapshot whose walker
+    /// resolved to a different KVA set — without this gate the
+    /// projected series would silently switch between bss copies
+    /// mid-phase (typical cause: post-`Op::ReplaceScheduler` swap
+    /// window where the walker re-publishes mid-phase) and
+    /// downstream reducers like
+    /// [`crate::assert::temporal::SeriesField::counter_delta_per_phase`]
+    /// would see non-monotonic counter values. The drifted
+    /// samples become per-sample `Err` slots; the temporal
+    /// patterns' standard error-skip semantics apply.
+    WalkerDriftedWithinPhase {
+        phase: crate::assert::Phase,
+        pinned_kvas: Vec<u64>,
+        sample_kvas: Vec<u64>,
+        requested: String,
     },
     /// A user-supplied projection closure (the kind passed to
     /// [`crate::scenario::sample::SampleSeries::bpf`]) signalled
@@ -575,39 +623,68 @@ impl std::fmt::Display for SnapshotError {
                 requested,
                 active_obj,
                 excluded_maps,
-                expected_kvas,
+                whitelist_kvas,
             } => {
+                let excluded_rendered = excluded_maps
+                    .iter()
+                    .map(|m| format!("{}@{:#x}", m.name, m.map_kva))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let some_zero = excluded_maps.iter().any(|m| m.map_kva == 0);
+                let some_alias = excluded_maps
+                    .iter()
+                    .any(|m| m.map_kva != 0 && !whitelist_kvas.contains(&m.map_kva));
+                let cause = match (some_zero, some_alias) {
+                    (false, true) => {
+                        "this snapshot pre-dates your most recent \
+                         Op::ReplaceScheduler / Op::AttachScheduler — \
+                         wait for the next periodic boundary (or re-run \
+                         the test) so the walker re-publishes the live \
+                         scheduler's KVAs"
+                    }
+                    (true, false) => {
+                        "the captured maps have no recorded KVAs — \
+                         the snapshot pre-dates the walker plumbing, \
+                         or the capture path failed to record per-map KVAs"
+                    }
+                    (true, true) => {
+                        "some captured maps lack KVAs and some disagree \
+                         with the walker's whitelist — both \
+                         pre-walker-capture state and a post-swap window \
+                         can produce this; re-run the test to regenerate \
+                         the snapshot"
+                    }
+                    (false, false) => "captured KVAs were neither absent nor in disagreement",
+                };
                 write!(
                     f,
                     "snapshot lookup '{requested}' returned no hits under the \
                      active filter (obj='{active_obj}'): the walker's KVA \
-                     whitelist {expected_kvas:#x?} excluded {n} captured map(s) \
-                     sharing the obj prefix:",
+                     whitelist {whitelist_kvas:#x?} excluded {n} captured map(s) \
+                     sharing the obj prefix: {excluded_rendered} — {cause}. \
+                     Reach for Snapshot::vars('{requested}') to enumerate every \
+                     copy across all obj prefixes, or Snapshot::map(\"<name>\") \
+                     to address one of the excluded maps directly.",
                     n = excluded_maps.len(),
-                )?;
-                for (name, kva) in excluded_maps {
-                    write!(f, " {name}@{kva:#x}")?;
-                }
-                let all_zero = excluded_maps.iter().all(|(_, kva)| *kva == 0);
-                let any_alias = excluded_maps
-                    .iter()
-                    .any(|(_, kva)| *kva != 0 && !expected_kvas.contains(kva));
-                if all_zero {
-                    write!(
-                        f,
-                        " (every captured map_kva is 0 — pre-walker snapshot, \
-                         or the walker did not populate KVAs for this capture)"
-                    )?;
-                } else if any_alias {
-                    write!(
-                        f,
-                        " (captured KVAs disagree with the walker's whitelist — \
-                         stale capture from before the most recent struct_ops \
-                         swap, KVA aliasing across reloads, or a walker bug \
-                         that pinned *scx_root to a different binary's maps)"
-                    )?;
-                }
-                Ok(())
+                )
+            }
+            SnapshotError::WalkerDriftedWithinPhase {
+                phase,
+                pinned_kvas,
+                sample_kvas,
+                requested,
+            } => {
+                write!(
+                    f,
+                    "walker drift within {phase:?}: lookup '{requested}' resolved against \
+                     KVA set {sample_kvas:#x?}, but an earlier same-phase snapshot pinned \
+                     {pinned_kvas:#x?}. The walker re-published mid-phase (typical cause: \
+                     a post-Op::ReplaceScheduler swap window). The drifted sample is \
+                     surfaced as Err so per-phase reducers (counter_delta_per_phase, \
+                     ratio_across_phases) see monotonic Ok-sequences from one walker \
+                     decision; address by stepping the phase past the swap settle window \
+                     or by reading via the explicit picker form."
+                )
             }
             SnapshotError::ProjectionFailed { reason } => {
                 write!(f, "projection failed: {reason}")

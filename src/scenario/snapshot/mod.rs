@@ -173,7 +173,9 @@ pub(super) const HEX_KEY_PREFIX: &str = "hex:";
 
 mod error;
 
-pub use error::{DrainedSnapshotEntry, MissingStatsReason, SnapshotError, SnapshotResult};
+pub use error::{
+    DrainedSnapshotEntry, ExcludedMap, MissingStatsReason, SnapshotError, SnapshotResult,
+};
 
 pub mod bridge;
 

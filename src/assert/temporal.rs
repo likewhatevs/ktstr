@@ -393,21 +393,46 @@ impl<T> SeriesField<T> {
     /// Counter-typed registered metrics, the equivalent
     /// MetricDef-aware path is [`Self::aggregate_by_phase`].
     ///
-    /// **Counter regression**: `T: Sub<Output = T>` — for `u64`
-    /// the subtraction wraps in release builds and panics in debug
-    /// on `last < first`. The reducer assumes the underlying counter
-    /// is non-decreasing within a phase (the common case for BPF
-    /// per-event counters). A regressing counter is a bug in the
-    /// upstream signal, not in the reducer.
+    /// **Counter regression**: when a phase's last sample reads
+    /// LOWER than its first, the reducer emits a `tracing::warn!`
+    /// naming the field label + phase + (first, last) and stores
+    /// `T::default()` for that phase (e.g. `0` for `u64`). The
+    /// underlying counter is assumed non-decreasing within a phase
+    /// (the common case for BPF per-event counters). A regression
+    /// can mean either an upstream-signal bug (the counter source
+    /// itself rolled back) OR a framework picker drift mid-phase
+    /// (e.g. [`crate::scenario::sample::SampleSeries::bpf_live_u64`]
+    /// resolved to different bss copies across same-phase
+    /// snapshots in a post-`Op::ReplaceScheduler` swap window).
+    /// Either way the regression is reported as zero progress
+    /// rather than panicking, so a single bad sample does not
+    /// crash the assertion engine.
     pub fn counter_delta_per_phase(&self) -> std::collections::BTreeMap<crate::assert::Phase, T>
     where
-        T: Copy + std::ops::Sub<Output = T>,
+        T: Copy + PartialOrd + std::ops::Sub<Output = T> + Default + std::fmt::Debug,
     {
         let firsts = self.first_per_phase();
         let lasts = self.last_per_phase();
+        let label = self.label();
         firsts
             .into_iter()
-            .filter_map(|(phase, first)| lasts.get(&phase).map(|last| (phase, *last - first)))
+            .filter_map(|(phase, first)| {
+                lasts.get(&phase).map(|last| {
+                    if *last >= first {
+                        (phase, *last - first)
+                    } else {
+                        tracing::warn!(
+                            label = %label,
+                            ?phase,
+                            ?first,
+                            last = ?*last,
+                            "counter_delta_per_phase: phase counter regressed \
+                             (last < first); reporting zero progress for this phase",
+                        );
+                        (phase, T::default())
+                    }
+                })
+            })
             .collect()
     }
 
@@ -2792,6 +2817,39 @@ mod tests {
             f.first_per_phase()[&crate::assert::Phase::step(0)],
             7,
             "leading Err in phase must be skipped; first Ok wins",
+        );
+    }
+
+    #[test]
+    fn counter_delta_per_phase_regressed_phase_reports_zero_instead_of_panicking() {
+        // Picker drift (or upstream-signal rollback) within a phase
+        // produces `last < first`. The reducer must not panic; it
+        // reports zero progress for that phase and emits a tracing
+        // warn (verified separately via test_log subscribers — here we
+        // pin the no-panic + zero contract).
+        let f = SeriesField::<u64>::from_parts_with_phases(
+            "ticks",
+            vec!["t0".into(), "t1".into(), "t2".into(), "t3".into()],
+            vec![100, 200, 300, 400],
+            // Phase 0: monotonic 100 -> 150 (delta 50).
+            // Phase 1: regressed 1000 -> 200 (would panic in debug
+            // pre-fix, wrap in release).
+            vec![Ok(100), Ok(150), Ok(1000), Ok(200)],
+            vec![
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(1)),
+                Some(crate::assert::Phase::step(1)),
+            ],
+        );
+        let m = f.counter_delta_per_phase();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[&crate::assert::Phase::step(0)], 50);
+        assert_eq!(
+            m[&crate::assert::Phase::step(1)],
+            0,
+            "regressed phase must yield 0 (no progress measurable) \
+             rather than panicking on the underflowed subtraction",
         );
     }
 

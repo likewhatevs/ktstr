@@ -79,26 +79,104 @@ impl SampleSeries {
     /// the resulting [`SeriesField`] is the `name` argument
     /// verbatim.
     pub fn bpf_live_u64(&self, name: &str) -> SeriesField<u64> {
-        let name_owned = name.to_string();
-        self.bpf(name_owned.clone(), move |snap| {
-            snap.live_var(&name_owned).as_u64()
-        })
+        self.bpf_live_phase_stable(name, |f| f.as_u64())
     }
 
     /// Sibling of [`Self::bpf_live_u64`] projecting as `i64`.
     pub fn bpf_live_i64(&self, name: &str) -> SeriesField<i64> {
-        let name_owned = name.to_string();
-        self.bpf(name_owned.clone(), move |snap| {
-            snap.live_var(&name_owned).as_i64()
-        })
+        self.bpf_live_phase_stable(name, |f| f.as_i64())
     }
 
     /// Sibling of [`Self::bpf_live_u64`] projecting as `f64`.
     pub fn bpf_live_f64(&self, name: &str) -> SeriesField<f64> {
+        self.bpf_live_phase_stable(name, |f| f.as_f64())
+    }
+
+    /// Shared phase-stable projector for the `bpf_live_*` trio.
+    ///
+    /// Per-snapshot the underlying [`Snapshot::live_var`] correctly
+    /// disambiguates between bss copies via the walker-populated
+    /// [`crate::monitor::dump::FailureDumpReport::active_map_kvas`].
+    /// But across snapshots in the same phase, the walker can
+    /// re-publish (typical cause: post-`Op::ReplaceScheduler` swap
+    /// window) and successive snapshots can correctly pick
+    /// DIFFERENT bss copies — producing a non-monotonic counter
+    /// series that downstream reducers like
+    /// [`crate::assert::temporal::SeriesField::counter_delta_per_phase`]
+    /// can't reason about.
+    ///
+    /// This projector adds a phase-stability gate on top of the
+    /// per-snapshot pick: for each phase, pin to the FIRST sample
+    /// whose `active_map_kvas` is non-empty. Later same-phase
+    /// snapshots whose `active_map_kvas` matches the pin pass
+    /// through; later same-phase snapshots whose `active_map_kvas`
+    /// differs are surfaced as
+    /// [`SnapshotError::WalkerDriftedWithinPhase`] so the temporal
+    /// patterns' standard error-skip semantics drop them. Samples
+    /// with empty `active_map_kvas` (pre-walker capture) pass
+    /// through unchanged because there's no walker signal to
+    /// compare against — the per-snapshot
+    /// [`SnapshotError::AmbiguousVar`] guard already handles the
+    /// multi-bss-with-empty-walker case at the
+    /// [`Snapshot::var`] layer.
+    fn bpf_live_phase_stable<T, P>(&self, name: &str, project: P) -> SeriesField<T>
+    where
+        P: Fn(&SnapshotField<'_>) -> SnapshotResult<T>,
+    {
+        let label = name.to_string();
         let name_owned = name.to_string();
-        self.bpf(name_owned.clone(), move |snap| {
-            snap.live_var(&name_owned).as_f64()
-        })
+        let mut values: Vec<SnapshotResult<T>> = Vec::with_capacity(self.rows.len());
+        let mut tags: Vec<String> = Vec::with_capacity(self.rows.len());
+        let mut elapsed: Vec<u64> = Vec::with_capacity(self.rows.len());
+        let mut phases: Vec<Option<crate::assert::Phase>> = Vec::with_capacity(self.rows.len());
+        let mut phase_kva_pin: std::collections::BTreeMap<crate::assert::Phase, Vec<u64>> =
+            std::collections::BTreeMap::new();
+        for row in &self.rows {
+            tags.push(row.tag.clone());
+            elapsed.push(row.elapsed_ms);
+            let phase = row.step_index.map(crate::assert::Phase::from);
+            phases.push(phase);
+
+            if row.report.is_placeholder {
+                values.push(Err(
+                    crate::scenario::snapshot::SnapshotError::PlaceholderSample {
+                        tag: row.tag.clone(),
+                        reason: row
+                            .report
+                            .scx_walker_unavailable
+                            .clone()
+                            .unwrap_or_else(|| "placeholder report".to_string()),
+                    },
+                ));
+                continue;
+            }
+            let snap = Snapshot::new(&row.report);
+            let field = snap.live_var(&name_owned);
+            let value = project(&field);
+            let sample_kvas: &[u64] = row.report.active_map_kvas.as_slice();
+
+            match (value, phase) {
+                (Ok(v), Some(ph)) if !sample_kvas.is_empty() => {
+                    let pin = phase_kva_pin
+                        .entry(ph)
+                        .or_insert_with(|| sample_kvas.to_vec());
+                    if pin.as_slice() == sample_kvas {
+                        values.push(Ok(v));
+                    } else {
+                        values.push(Err(
+                            crate::scenario::snapshot::SnapshotError::WalkerDriftedWithinPhase {
+                                phase: ph,
+                                pinned_kvas: pin.clone(),
+                                sample_kvas: sample_kvas.to_vec(),
+                                requested: name_owned.clone(),
+                            },
+                        ));
+                    }
+                }
+                (other, _) => values.push(other),
+            }
+        }
+        SeriesField::from_parts_with_phases(label, tags, elapsed, values, phases)
     }
 
     /// Per-snapshot co-picked BPF projection of N counters from the
@@ -986,5 +1064,196 @@ mod tests {
         // per sample, never split.
         assert_eq!(cross_values, vec![500, 4000]);
         assert_eq!(same_values, vec![600, 6000]);
+    }
+
+    /// Build a single-bss report stamped with the given
+    /// `active_map_kvas` so phase-stability tests can simulate the
+    /// walker resolving to one specific KVA set per snapshot.
+    fn single_bss_report_with_kvas(value: u64, active_kvas: Vec<u64>) -> FailureDumpReport {
+        let bss = FailureDumpMap {
+            name: "scx_obj.bss".into(),
+            map_kva: active_kvas.first().copied().unwrap_or(0),
+            map_type: 2,
+            value_size: 8,
+            max_entries: 1,
+            value: Some(RenderedValue::Struct {
+                type_name: Some("scx_obj.bss".into()),
+                members: vec![RenderedMember {
+                    name: "counter".into(),
+                    value: RenderedValue::Uint { bits: 64, value },
+                }],
+            }),
+            entries: Vec::new(),
+            percpu_entries: Vec::new(),
+            percpu_hash_entries: Vec::new(),
+            arena: None,
+            ringbuf: None,
+            stack_trace: None,
+            fd_array: None,
+            error: None,
+        };
+        FailureDumpReport {
+            schema: crate::monitor::dump::SCHEMA_SINGLE.to_string(),
+            active_obj_name: Some("scx_obj".to_string()),
+            active_map_kvas: active_kvas,
+            maps: vec![bss],
+            ..Default::default()
+        }
+    }
+
+    fn drained_entry(
+        tag: &str,
+        report: FailureDumpReport,
+        step_index: Option<u16>,
+        elapsed_ms: u64,
+    ) -> crate::scenario::snapshot::DrainedSnapshotEntry {
+        crate::scenario::snapshot::DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report,
+            stats: Err(crate::scenario::snapshot::MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms: Some(elapsed_ms),
+            step_index,
+        }
+    }
+
+    /// Walker drift within a phase: sample 0 and sample 1 are in
+    /// the same phase but their `active_map_kvas` differ (the
+    /// walker re-published mid-phase, simulating the post-swap
+    /// settle window). Sample 0 pins the phase to its KVA set;
+    /// sample 1 must surface `WalkerDriftedWithinPhase` so the
+    /// downstream counter-delta reducer sees a single-source
+    /// monotonic series.
+    #[test]
+    fn bpf_live_u64_walker_drift_within_phase_surfaces_drift_error() {
+        let drained = vec![
+            drained_entry(
+                "p001",
+                single_bss_report_with_kvas(100, vec![0x1000]),
+                Some(1),
+                100,
+            ),
+            drained_entry(
+                "p002",
+                single_bss_report_with_kvas(200, vec![0x2000]),
+                Some(1),
+                200,
+            ),
+        ];
+        let series = SampleSeries::from_drained_typed(drained, None);
+        let f = series.bpf_live_u64("counter");
+        let results: Vec<&SnapshotResult<u64>> = f.values_iter().collect();
+        assert_eq!(results.len(), 2);
+        assert!(
+            matches!(results[0], Ok(100)),
+            "first sample pins, got {:?}",
+            results[0]
+        );
+        match results[1] {
+            Err(crate::scenario::snapshot::SnapshotError::WalkerDriftedWithinPhase {
+                pinned_kvas,
+                sample_kvas,
+                requested,
+                ..
+            }) => {
+                assert_eq!(pinned_kvas, &vec![0x1000]);
+                assert_eq!(sample_kvas, &vec![0x2000]);
+                assert_eq!(requested, "counter");
+            }
+            other => panic!("expected WalkerDriftedWithinPhase, got {other:?}"),
+        }
+    }
+
+    /// Walker re-publishes the SAME KVA across same-phase
+    /// samples — no drift. Both samples pass through with Ok
+    /// values.
+    #[test]
+    fn bpf_live_u64_walker_stable_within_phase_passes_through() {
+        let drained = vec![
+            drained_entry(
+                "p001",
+                single_bss_report_with_kvas(100, vec![0x1000]),
+                Some(1),
+                100,
+            ),
+            drained_entry(
+                "p002",
+                single_bss_report_with_kvas(150, vec![0x1000]),
+                Some(1),
+                200,
+            ),
+        ];
+        let series = SampleSeries::from_drained_typed(drained, None);
+        let f = series.bpf_live_u64("counter");
+        let results: Vec<&SnapshotResult<u64>> = f.values_iter().collect();
+        assert!(matches!(results[0], Ok(100)));
+        assert!(matches!(results[1], Ok(150)));
+    }
+
+    /// Walker output is empty (pre-walker capture) for both
+    /// samples — no pin established, no drift detection, both
+    /// pass through unchanged (the per-snapshot AmbiguousVar
+    /// guard at the Snapshot::var layer covers the
+    /// multi-bss-with-empty-walker case separately).
+    #[test]
+    fn bpf_live_u64_empty_walker_output_passes_through() {
+        let drained = vec![
+            drained_entry(
+                "p001",
+                single_bss_report_with_kvas(100, vec![]),
+                Some(1),
+                100,
+            ),
+            drained_entry(
+                "p002",
+                single_bss_report_with_kvas(150, vec![]),
+                Some(1),
+                200,
+            ),
+        ];
+        let series = SampleSeries::from_drained_typed(drained, None);
+        let f = series.bpf_live_u64("counter");
+        let results: Vec<&SnapshotResult<u64>> = f.values_iter().collect();
+        assert!(matches!(results[0], Ok(100)));
+        assert!(matches!(results[1], Ok(150)));
+    }
+
+    /// Different phases get independent pins — drift detection
+    /// resets at phase boundaries. Phase 1 pins to 0x1000;
+    /// phase 2 pins to 0x2000 fresh.
+    #[test]
+    fn bpf_live_u64_pins_reset_at_phase_boundaries() {
+        let drained = vec![
+            drained_entry(
+                "p001",
+                single_bss_report_with_kvas(100, vec![0x1000]),
+                Some(1),
+                100,
+            ),
+            drained_entry(
+                "p002",
+                single_bss_report_with_kvas(150, vec![0x1000]),
+                Some(1),
+                200,
+            ),
+            drained_entry(
+                "p003",
+                single_bss_report_with_kvas(50, vec![0x2000]),
+                Some(2),
+                300,
+            ),
+            drained_entry(
+                "p004",
+                single_bss_report_with_kvas(75, vec![0x2000]),
+                Some(2),
+                400,
+            ),
+        ];
+        let series = SampleSeries::from_drained_typed(drained, None);
+        let f = series.bpf_live_u64("counter");
+        let results: Vec<&SnapshotResult<u64>> = f.values_iter().collect();
+        assert!(matches!(results[0], Ok(100)));
+        assert!(matches!(results[1], Ok(150)));
+        assert!(matches!(results[2], Ok(50)));
+        assert!(matches!(results[3], Ok(75)));
     }
 }

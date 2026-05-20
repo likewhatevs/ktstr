@@ -3508,21 +3508,21 @@ fn snapshot_var_kva_filter_excluded_surfaces_active_filter_excluded_maps() {
             requested,
             active_obj,
             excluded_maps,
-            expected_kvas,
+            whitelist_kvas,
         } => {
             assert_eq!(requested, "counter");
             assert_eq!(active_obj, "alpha");
-            assert_eq!(expected_kvas, vec![0x9999]);
+            assert_eq!(whitelist_kvas, vec![0x9999]);
             assert_eq!(excluded_maps.len(), 2, "both alpha-prefixed maps excluded");
             assert!(
                 excluded_maps
                     .iter()
-                    .any(|(n, k)| n == "alpha.bss" && *k == 0x1000)
+                    .any(|m| m.name == "alpha.bss" && m.map_kva == 0x1000)
             );
             assert!(
                 excluded_maps
                     .iter()
-                    .any(|(n, k)| n == "alpha.data" && *k == 0x2000)
+                    .any(|m| m.name == "alpha.data" && m.map_kva == 0x2000)
             );
         }
         other => panic!("expected ActiveFilterExcludedMaps, got {other:?}"),
@@ -3547,12 +3547,14 @@ fn snapshot_map_kva_filter_excluded_surfaces_active_filter_excluded_maps() {
             requested,
             active_obj,
             excluded_maps,
-            expected_kvas,
+            whitelist_kvas,
         } => {
             assert_eq!(requested, "alpha.bss");
             assert_eq!(active_obj, "alpha");
-            assert_eq!(expected_kvas, vec![0xDEAD]);
-            assert_eq!(excluded_maps, vec![("alpha.bss".to_string(), 0x1000)]);
+            assert_eq!(whitelist_kvas, vec![0xDEAD]);
+            assert_eq!(excluded_maps.len(), 1);
+            assert_eq!(excluded_maps[0].name, "alpha.bss");
+            assert_eq!(excluded_maps[0].map_kva, 0x1000);
         }
         other => panic!("expected ActiveFilterExcludedMaps, got {other:?}"),
     }
@@ -3578,12 +3580,14 @@ fn snapshot_live_vars_via_kva_filter_excluded_surfaces_active_filter_excluded_ma
             requested,
             active_obj,
             excluded_maps,
-            expected_kvas,
+            whitelist_kvas,
         } => {
             assert_eq!(requested, "[a, b]", "joined name list per live_vars_via");
             assert_eq!(active_obj, "alpha");
-            assert_eq!(expected_kvas, vec![0xBEEF]);
-            assert_eq!(excluded_maps, vec![("alpha.bss".to_string(), 0x1000)]);
+            assert_eq!(whitelist_kvas, vec![0xBEEF]);
+            assert_eq!(excluded_maps.len(), 1);
+            assert_eq!(excluded_maps[0].name, "alpha.bss");
+            assert_eq!(excluded_maps[0].map_kva, 0x1000);
         }
         other => panic!("expected ActiveFilterExcludedMaps, got {other:?}"),
     }
@@ -3595,18 +3599,21 @@ fn active_filter_excluded_maps_display_renders_kva_mismatch_hint() {
         requested: "counter".to_string(),
         active_obj: "alpha".to_string(),
         excluded_maps: vec![
-            ("alpha.bss".to_string(), 0x1000),
-            ("alpha.data".to_string(), 0x2000),
+            crate::scenario::snapshot::ExcludedMap {
+                name: "alpha.bss".to_string(),
+                map_kva: 0x1000,
+            },
+            crate::scenario::snapshot::ExcludedMap {
+                name: "alpha.data".to_string(),
+                map_kva: 0x2000,
+            },
         ],
-        expected_kvas: vec![0x9999],
+        whitelist_kvas: vec![0x9999],
     };
     let msg = format!("{err}");
     assert!(msg.contains("counter"), "names the lookup: {msg}");
     assert!(msg.contains("alpha"), "names the active obj: {msg}");
-    assert!(
-        msg.contains("0x9999"),
-        "names the expected whitelist: {msg}"
-    );
+    assert!(msg.contains("0x9999"), "names the whitelist: {msg}");
     assert!(
         msg.contains("alpha.bss@0x1000"),
         "names excluded map: {msg}"
@@ -3616,8 +3623,12 @@ fn active_filter_excluded_maps_display_renders_kva_mismatch_hint() {
         "names excluded map: {msg}"
     );
     assert!(
-        msg.contains("stale capture") || msg.contains("aliasing") || msg.contains("walker bug"),
-        "names the structural hint: {msg}"
+        msg.contains("Op::ReplaceScheduler") || msg.contains("Op::AttachScheduler"),
+        "pure-mismatch hint must name the operation a stale capture would post-date: {msg}"
+    );
+    assert!(
+        msg.contains("Snapshot::vars") && msg.contains("Snapshot::map"),
+        "Display must steer the operator at the escape hatches: {msg}"
     );
 }
 
@@ -3626,15 +3637,175 @@ fn active_filter_excluded_maps_display_renders_zero_kva_hint() {
     let err = SnapshotError::ActiveFilterExcludedMaps {
         requested: "counter".to_string(),
         active_obj: "alpha".to_string(),
-        excluded_maps: vec![("alpha.bss".to_string(), 0)],
-        expected_kvas: vec![0x9999],
+        excluded_maps: vec![crate::scenario::snapshot::ExcludedMap {
+            name: "alpha.bss".to_string(),
+            map_kva: 0,
+        }],
+        whitelist_kvas: vec![0x9999],
     };
     let msg = format!("{err}");
     assert!(
-        msg.contains("every captured map_kva is 0"),
+        msg.contains("no recorded KVAs") || msg.contains("did not record"),
         "all-zero-kva hint must steer the operator at the pre-walker / capture-bug \
          interpretation rather than the KVA-aliasing one: {msg}"
     );
+    assert!(
+        msg.contains("Snapshot::vars") && msg.contains("Snapshot::map"),
+        "Display must steer the operator at the escape hatches even on the zero-kva path: {msg}"
+    );
+}
+
+#[test]
+fn active_filter_excluded_maps_display_renders_mixed_zero_and_mismatched_hint() {
+    let err = SnapshotError::ActiveFilterExcludedMaps {
+        requested: "counter".to_string(),
+        active_obj: "alpha".to_string(),
+        excluded_maps: vec![
+            crate::scenario::snapshot::ExcludedMap {
+                name: "alpha.bss".to_string(),
+                map_kva: 0x1000,
+            },
+            crate::scenario::snapshot::ExcludedMap {
+                name: "alpha.data".to_string(),
+                map_kva: 0,
+            },
+        ],
+        whitelist_kvas: vec![0x9999],
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("some captured maps lack KVAs") && msg.contains("post-swap"),
+        "mixed-cause hint must name BOTH the missing-KVA AND the post-swap-window class \
+         so the operator sees both possible causes: {msg}"
+    );
+}
+
+#[test]
+fn snapshot_live_var_via_kva_filter_excluded_surfaces_active_filter_excluded_maps() {
+    let mut alpha_bss = make_global_map("alpha.bss", vec![("counter", uint_v(42))]);
+    alpha_bss.map_kva = 0x1000;
+    let mut report = make_report_with_maps(vec![alpha_bss]);
+    report.active_obj_name = Some("alpha".to_string());
+    report.active_map_kvas = vec![0xCAFE];
+
+    let snap = Snapshot::new(&report);
+    let active = snap.active().expect("active() succeeds");
+    let err = active
+        .live_var_via("counter", |_| {
+            panic!("picker must not run when filter excluded everything")
+        })
+        .error()
+        .cloned()
+        .expect("live_var_via must surface error from excluded-filter helper");
+    match err {
+        SnapshotError::ActiveFilterExcludedMaps {
+            requested,
+            active_obj,
+            excluded_maps,
+            whitelist_kvas,
+        } => {
+            assert_eq!(
+                requested, "counter",
+                "single-name path keeps the bare name, no joined brackets"
+            );
+            assert_eq!(active_obj, "alpha");
+            assert_eq!(whitelist_kvas, vec![0xCAFE]);
+            assert_eq!(excluded_maps.len(), 1);
+            assert_eq!(excluded_maps[0].name, "alpha.bss");
+        }
+        other => panic!("expected ActiveFilterExcludedMaps, got {other:?}"),
+    }
+}
+
+#[test]
+fn snapshot_live_var_kva_filter_excluded_surfaces_active_filter_excluded_maps() {
+    let mut alpha_bss = make_global_map("alpha.bss", vec![("counter", uint_v(42))]);
+    alpha_bss.map_kva = 0x1000;
+    let mut report = make_report_with_maps(vec![alpha_bss]);
+    report.active_obj_name = Some("alpha".to_string());
+    report.active_map_kvas = vec![0xCAFE];
+
+    let snap = Snapshot::new(&report);
+    let err = snap
+        .live_var("counter")
+        .error()
+        .cloned()
+        .expect("live_var must surface the same excluded-filter error as live_var_via");
+    assert!(
+        matches!(err, SnapshotError::ActiveFilterExcludedMaps { .. }),
+        "live_var convenience wrapper must reach the new variant, got {err:?}"
+    );
+}
+
+#[test]
+fn snapshot_var_kva_filter_admits_all_falls_through_to_var_not_found() {
+    // When the KVA whitelist admits every captured obj-prefix map but the requested
+    // name is not present, the lookup miss is a real absence — we must NOT falsely
+    // steer the operator at the filter. Fall through to VarNotFound.
+    let mut alpha_bss = make_global_map("alpha.bss", vec![("counter", uint_v(42))]);
+    alpha_bss.map_kva = 0x1000;
+    let mut alpha_data = make_global_map("alpha.data", vec![("flag", uint_v(1))]);
+    alpha_data.map_kva = 0x2000;
+    let mut report = make_report_with_maps(vec![alpha_bss, alpha_data]);
+    report.active_obj_name = Some("alpha".to_string());
+    report.active_map_kvas = vec![0x1000, 0x2000];
+
+    let snap = Snapshot::new(&report);
+    let active = snap.active().expect("active() succeeds");
+    let err = active
+        .var("does_not_exist")
+        .error()
+        .cloned()
+        .expect("absent name still yields an error");
+    assert!(
+        matches!(err, SnapshotError::VarNotFound { .. }),
+        "filter admits everything → lookup miss is a real typo, must surface as \
+         VarNotFound (not ActiveFilterExcludedMaps): {err:?}"
+    );
+}
+
+#[test]
+fn snapshot_var_partial_admit_with_missing_name_falls_through_to_var_not_found() {
+    // Same-binary post-swap case: one of two obj-prefix maps survives the KVA
+    // filter, the other is rejected. Requested name is absent from the admitted
+    // map. The variant must NOT fire — the admitted set is non-empty, so the
+    // miss is a real absence, not a filter artefact.
+    let mut alpha_bss = make_global_map("alpha.bss", vec![("counter", uint_v(42))]);
+    alpha_bss.map_kva = 0x1000;
+    let mut alpha_data = make_global_map("alpha.data", vec![("flag", uint_v(1))]);
+    alpha_data.map_kva = 0x2000;
+    let mut report = make_report_with_maps(vec![alpha_bss, alpha_data]);
+    report.active_obj_name = Some("alpha".to_string());
+    report.active_map_kvas = vec![0x1000];
+
+    let snap = Snapshot::new(&report);
+    let active = snap.active().expect("active() succeeds");
+    let err = active
+        .var("flag")
+        .error()
+        .cloned()
+        .expect("absent name still yields an error");
+    assert!(
+        matches!(err, SnapshotError::VarNotFound { .. }),
+        "filter admitted alpha.bss; lookup of 'flag' (genuinely absent from alpha.bss) \
+         must surface as VarNotFound rather than falsely blaming the filter: {err:?}"
+    );
+}
+
+#[test]
+fn active_filter_excluded_maps_serde_round_trip() {
+    let err = SnapshotError::ActiveFilterExcludedMaps {
+        requested: "counter".to_string(),
+        active_obj: "alpha".to_string(),
+        excluded_maps: vec![crate::scenario::snapshot::ExcludedMap {
+            name: "alpha.bss".to_string(),
+            map_kva: 0x1000,
+        }],
+        whitelist_kvas: vec![0x9999, 0xCAFE],
+    };
+    let json = serde_json::to_string(&err).expect("serialize");
+    let back: SnapshotError = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(err, back, "round-trip preserves every field");
 }
 
 #[test]
