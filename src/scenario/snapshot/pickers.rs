@@ -80,6 +80,55 @@ pub fn max_by_counter_value(fields: &[(&str, SnapshotField<'_>)]) -> Option<usiz
         .map(|(i, _)| i)
 }
 
+/// Pick the candidate row whose fields sum to the largest u64 — the
+/// "max-activity bss" heuristic generalized to N co-picked variables.
+/// For each row, the picker `as_u64`-projects every field and
+/// `saturating_add`s them; rows containing ANY field that fails to
+/// project to u64 are dropped entirely (not partial-summed); among
+/// the surviving rows, the one with the largest sum wins.
+///
+/// Pairs with [`super::view::Snapshot::live_vars_via`] for ratio /
+/// fraction metrics: the row whose counters have accumulated the
+/// most TOTAL events is the live scheduler instance, and selecting
+/// that row guarantees all N returned fields come from the same
+/// source map (no cross-bss-copy corruption).
+///
+/// # When this picks WRONG
+///
+/// Inherits every failure mode of [`max_by_counter_value`] (gauges,
+/// sentinel-init counters like `u64::MAX`, immediately-post-swap
+/// windows before the new instance has accumulated past the old's
+/// BSS-zero point), plus one sum-specific mode:
+///
+/// **Any-non-u64-field row excluded.** A single rodata or
+/// non-counter variable accidentally included in the name set
+/// silently makes every candidate row ineligible (every row would
+/// have that non-u64 field). Verify all N names project to u64
+/// counters BEFORE composing the picker.
+///
+/// Sums use `saturating_add`: a row containing a sentinel
+/// `u64::MAX` saturates to `u64::MAX` and wins all comparisons.
+/// Treat that as a sentinel-mode failure (per max_by_counter_value's
+/// caveat).
+///
+/// Ties resolve to the LAST tied row (matches
+/// [`Iterator::max_by_key`] semantics — same as
+/// [`max_by_counter_value`]).
+pub fn max_by_sum_u64(rows: &[(&str, Vec<SnapshotField<'_>>)]) -> Option<usize> {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(i, (_, fields))| {
+            let mut sum: u64 = 0;
+            for f in fields {
+                let v = f.as_u64().ok()?;
+                sum = sum.saturating_add(v);
+            }
+            Some((i, sum))
+        })
+        .max_by_key(|(_, s)| *s)
+        .map(|(i, _)| i)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +216,109 @@ mod tests {
     fn max_by_counter_value_empty_input_returns_none() {
         let fields: Vec<(&str, SnapshotField<'_>)> = vec![];
         assert_eq!(max_by_counter_value(&fields), None);
+    }
+
+    // ---------- max_by_sum_u64 ----------
+
+    #[test]
+    fn max_by_sum_u64_picks_largest_summed_row() {
+        let a1 = u64_field(10);
+        let a2 = u64_field(20);
+        let b1 = u64_field(5);
+        let b2 = u64_field(5);
+        let c1 = u64_field(30);
+        let c2 = u64_field(40);
+        let rows = vec![
+            (
+                "alpha.bss",
+                vec![SnapshotField::Value(&a1), SnapshotField::Value(&a2)],
+            ),
+            (
+                "beta.bss",
+                vec![SnapshotField::Value(&b1), SnapshotField::Value(&b2)],
+            ),
+            (
+                "gamma.bss",
+                vec![SnapshotField::Value(&c1), SnapshotField::Value(&c2)],
+            ),
+        ];
+        assert_eq!(
+            max_by_sum_u64(&rows),
+            Some(2),
+            "row 2 sum = 70, beats row 0 (30) and row 1 (10)",
+        );
+    }
+
+    #[test]
+    fn max_by_sum_u64_tie_picks_last() {
+        let v = u64_field(10);
+        let rows = vec![
+            ("a", vec![SnapshotField::Value(&v), SnapshotField::Value(&v)]),
+            ("b", vec![SnapshotField::Value(&v), SnapshotField::Value(&v)]),
+            ("c", vec![SnapshotField::Value(&v), SnapshotField::Value(&v)]),
+        ];
+        assert_eq!(
+            max_by_sum_u64(&rows),
+            Some(2),
+            "Iterator::max_by_key returns the LAST tied element; \
+             matches max_by_counter_value semantic for caller \
+             consistency",
+        );
+    }
+
+    #[test]
+    fn max_by_sum_u64_drops_rows_with_any_non_u64_field() {
+        let u = u64_field(10);
+        let s = struct_field();
+        let big = u64_field(1000);
+        let rows = vec![
+            // row 0: u64 + Struct → drop entirely (any non-u64 → ineligible)
+            ("alpha", vec![SnapshotField::Value(&u), SnapshotField::Value(&s)]),
+            // row 1: u64 + u64 → eligible, sum = 1010
+            ("beta", vec![SnapshotField::Value(&u), SnapshotField::Value(&big)]),
+            // row 2: Struct + u64 → drop entirely
+            ("gamma", vec![SnapshotField::Value(&s), SnapshotField::Value(&big)]),
+        ];
+        assert_eq!(
+            max_by_sum_u64(&rows),
+            Some(1),
+            "only row 1 survives the any-non-u64-eligibility filter; \
+             picker is NOT partial-summing (Struct + u64 doesn't fall \
+             back to summing the u64 alone)",
+        );
+    }
+
+    #[test]
+    fn max_by_sum_u64_all_rows_have_non_u64_field_returns_none() {
+        let u = u64_field(10);
+        let s = struct_field();
+        let rows = vec![
+            ("alpha", vec![SnapshotField::Value(&u), SnapshotField::Value(&s)]),
+            ("beta", vec![SnapshotField::Value(&s), SnapshotField::Value(&u)]),
+        ];
+        assert_eq!(
+            max_by_sum_u64(&rows),
+            None,
+            "every row has at least one non-u64 field; downstream \
+             live_vars_via surfaces ProjectionFailed",
+        );
+    }
+
+    #[test]
+    fn max_by_sum_u64_empty_rows_returns_none() {
+        let rows: Vec<(&str, Vec<SnapshotField<'_>>)> = vec![];
+        assert_eq!(max_by_sum_u64(&rows), None);
+    }
+
+    #[test]
+    fn max_by_sum_u64_saturates_on_overflow() {
+        let big = u64_field(u64::MAX);
+        let one = u64_field(1);
+        let rows = vec![
+            ("alpha", vec![SnapshotField::Value(&big), SnapshotField::Value(&one)]),
+            ("beta", vec![SnapshotField::Value(&one), SnapshotField::Value(&one)]),
+        ];
+        // alpha saturates to u64::MAX; beta sums to 2. Alpha wins.
+        assert_eq!(max_by_sum_u64(&rows), Some(0));
     }
 }

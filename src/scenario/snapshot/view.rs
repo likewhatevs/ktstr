@@ -401,6 +401,13 @@ impl<'a> Snapshot<'a> {
     /// scheduler that leaves two `<obj>.bss` maps in the snapshot
     /// sharing one obj_name prefix.
     ///
+    /// **For multi-variable arithmetic** (ratios, fractions, deltas
+    /// computed across more than one named field), use
+    /// [`Self::live_vars_via`] instead — it resolves the picker once
+    /// across a name set so independent per-name picks cannot
+    /// corrupt the cross-variable computation by selecting different
+    /// bss copies for different names.
+    ///
     /// `picker` receives every observed copy of the named variable
     /// (one entry per `<obj>.bss/.data/.rodata` map carrying it,
     /// per [`Self::vars`]) and returns the index the caller wants
@@ -473,6 +480,139 @@ impl<'a> Snapshot<'a> {
                     ),
                 })
             }
+        }
+    }
+
+    /// Caller-supplied disambiguator for the multi-bss case where
+    /// **multiple variables from the same scheduler instance** must
+    /// be read consistently — e.g. computing
+    /// `nr_mig_cross_dispatch / (nr_mig_same_dispatch + nr_mig_cross_dispatch)`
+    /// as a cross-LLC dispatch fraction from one scheduler's BPF
+    /// counters.
+    ///
+    /// # Why a separate primitive
+    ///
+    /// Calling [`Self::live_var_via`] N times independently risks
+    /// picking a DIFFERENT bss copy per call: the picker resolves
+    /// each name's candidate set independently, so two consecutive
+    /// `live_var_via("a", picker)` + `live_var_via("b", picker)`
+    /// calls can land on bss copy A for `a` and bss copy B for `b`,
+    /// corrupting any cross-variable arithmetic (ratio, fraction,
+    /// delta). `live_vars_via` resolves the picker ONCE across the
+    /// candidate set for all N names jointly so every returned
+    /// [`SnapshotField`] reads from the same source map.
+    ///
+    /// # Mechanism
+    ///
+    /// Per global-section map, look up each name in input order;
+    /// keep the map as a candidate row iff it has ALL the names
+    /// (intersection semantics — partial-coverage maps are absent
+    /// from the picker's input). The picker receives
+    /// `&[(map_name, fields_in_input_order)]` and returns the
+    /// chosen row's index. The returned `Vec<SnapshotField>` is
+    /// positional, keyed by the input `names` order — `result[0]`
+    /// is `names[0]`'s field from the picked map, `result[1]` is
+    /// `names[1]`'s field, etc.
+    ///
+    /// # See also
+    ///
+    /// - [`Self::live_var_via`] for single-variable disambiguation.
+    /// - [`crate::scenario::snapshot::pickers::max_by_sum_u64`] for
+    ///   the "max-activity bss" heuristic over co-picked u64
+    ///   counters.
+    ///
+    /// # Errors
+    ///
+    /// - [`SnapshotError::PlaceholderSnapshot`] — the underlying
+    ///   `FailureDumpReport` is a placeholder; matches the sibling
+    ///   [`Self::live_var_via`] / [`Self::var`] / [`Self::map`]
+    ///   placeholder-first contract.
+    /// - [`SnapshotError::ProjectionFailed`] — `names` is empty
+    ///   (caller bug: nothing to co-pick), `picker` returns `None`
+    ///   (no candidate matched), or `picker` returns an
+    ///   out-of-range index.
+    /// - [`SnapshotError::VarNotFound`] — no global-section map
+    ///   has ALL the requested names. `requested` carries the
+    ///   joined name list, `available` carries the global-section
+    ///   map names that were scanned.
+    pub fn live_vars_via<P>(
+        &self,
+        names: &[&str],
+        picker: P,
+    ) -> crate::scenario::snapshot::SnapshotResult<Vec<SnapshotField<'a>>>
+    where
+        P: FnOnce(&[(&'a str, Vec<SnapshotField<'a>>)]) -> Option<usize>,
+    {
+        if self.report.is_placeholder {
+            return Err(crate::scenario::snapshot::SnapshotError::PlaceholderSnapshot {
+                tag: None,
+            });
+        }
+        if names.is_empty() {
+            return Err(crate::scenario::snapshot::SnapshotError::ProjectionFailed {
+                reason: "live_vars_via called with an empty names slice — \
+                         co-pick requires at least one name"
+                    .to_string(),
+            });
+        }
+        // Group by MAP: each global-section map becomes a candidate
+        // row IFF it has ALL the requested names. Partial-coverage
+        // maps are dropped from the picker's input — they cannot
+        // answer the co-pick.
+        let mut candidates: Vec<(&'a str, Vec<SnapshotField<'a>>)> = Vec::new();
+        for m in self.maps_iter() {
+            if !is_global_section_map(&m.name) {
+                continue;
+            }
+            let Some(value) = m.value.as_ref() else {
+                continue;
+            };
+            let mut row: Vec<SnapshotField<'a>> = Vec::with_capacity(names.len());
+            let mut all_present = true;
+            for name in names {
+                if let Some(found) = lookup_member(value, name) {
+                    row.push(SnapshotField::Value(found));
+                } else {
+                    all_present = false;
+                    break;
+                }
+            }
+            if all_present {
+                candidates.push((m.name.as_str(), row));
+            }
+        }
+        if candidates.is_empty() {
+            let available: Vec<String> = self
+                .report
+                .maps
+                .iter()
+                .filter(|m| is_global_section_map(&m.name))
+                .map(|m| m.name.clone())
+                .collect();
+            return Err(crate::scenario::snapshot::SnapshotError::VarNotFound {
+                requested: format!("[{}]", names.join(", ")),
+                available,
+            });
+        }
+        match picker(&candidates) {
+            Some(idx) if idx < candidates.len() => {
+                let (_obj, fields) = candidates.into_iter().nth(idx).unwrap();
+                Ok(fields)
+            }
+            Some(idx) => Err(crate::scenario::snapshot::SnapshotError::ProjectionFailed {
+                reason: format!(
+                    "live_vars_via picker returned index {idx} out of range \
+                     (candidate count = {})",
+                    candidates.len()
+                ),
+            }),
+            None => Err(crate::scenario::snapshot::SnapshotError::ProjectionFailed {
+                reason: format!(
+                    "live_vars_via picker for [{}] returned None (no candidate \
+                     matched the supplied disambiguator)",
+                    names.join(", ")
+                ),
+            }),
         }
     }
 

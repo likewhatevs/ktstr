@@ -3943,6 +3943,244 @@ fn live_var_via_no_candidates_surfaces_var_not_found() {
     }
 }
 
+// ---------- live_vars_via (N-name co-picker) ----------
+
+/// Build a multi-instance report carrying TWO bss copies, each
+/// with two named u64 vars (same + cross). Default values follow
+/// the swap pattern: alpha (the "old" inactive scheduler) carries
+/// small frozen counts, beta (the "new" active scheduler) carries
+/// larger accumulating counts. Pickers using `max_by_sum_u64`
+/// should pick beta.
+fn two_instance_two_var_report() -> FailureDumpReport {
+    let mk_bss = |obj: &str, same: u64, cross: u64| FailureDumpMap {
+        name: format!("{obj}.bss"),
+        map_type: 2,
+        value_size: 16,
+        max_entries: 1,
+        value: Some(RenderedValue::Struct {
+            type_name: Some(".bss".into()),
+            members: vec![
+                RenderedMember {
+                    name: "same".into(),
+                    value: RenderedValue::Uint { bits: 64, value: same },
+                },
+                RenderedMember {
+                    name: "cross".into(),
+                    value: RenderedValue::Uint { bits: 64, value: cross },
+                },
+            ],
+        }),
+        entries: Vec::new(),
+        percpu_entries: Vec::new(),
+        percpu_hash_entries: Vec::new(),
+        arena: None,
+        ringbuf: None,
+        stack_trace: None,
+        fd_array: None,
+        error: None,
+    };
+    FailureDumpReport {
+        schema: SCHEMA_SINGLE.to_string(),
+        maps: vec![mk_bss("alpha", 10, 5), mk_bss("beta", 100, 50)],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn live_vars_via_picker_selects_named_candidate() {
+    let r = two_instance_two_var_report();
+    let snap = Snapshot::new(&r);
+    let fields = snap
+        .live_vars_via(&["same", "cross"], |rows| {
+            rows.iter().position(|(obj, _)| *obj == "beta.bss")
+        })
+        .expect("co-pick succeeds");
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0].as_u64().unwrap(), 100, "same from beta");
+    assert_eq!(fields[1].as_u64().unwrap(), 50, "cross from beta");
+}
+
+#[test]
+fn live_vars_via_picker_returns_none_surfaces_projection_failed() {
+    let r = two_instance_two_var_report();
+    let snap = Snapshot::new(&r);
+    let err = snap.live_vars_via(&["same", "cross"], |_| None).unwrap_err();
+    match err {
+        SnapshotError::ProjectionFailed { reason } => {
+            assert!(
+                reason.contains("live_vars_via picker for [same, cross] returned None"),
+                "reason must name the picker AND the input name list, got {reason}",
+            );
+        }
+        other => panic!("expected ProjectionFailed, got {other:?}"),
+    }
+}
+
+#[test]
+fn live_vars_via_picker_out_of_range_surfaces_projection_failed() {
+    let r = two_instance_two_var_report();
+    let snap = Snapshot::new(&r);
+    let err = snap
+        .live_vars_via(&["same", "cross"], |_| Some(99))
+        .unwrap_err();
+    match err {
+        SnapshotError::ProjectionFailed { reason } => {
+            assert!(
+                reason.contains("index 99 out of range") && reason.contains("count = 2"),
+                "reason must name the bad index AND the candidate count, got {reason}",
+            );
+        }
+        other => panic!("expected ProjectionFailed, got {other:?}"),
+    }
+}
+
+#[test]
+fn live_vars_via_no_candidates_surfaces_var_not_found() {
+    let r = two_instance_two_var_report();
+    let snap = Snapshot::new(&r);
+    let err = snap
+        .live_vars_via(&["absent_a", "absent_b"], |_| {
+            panic!("picker must NOT be called when no candidates")
+        })
+        .unwrap_err();
+    match err {
+        SnapshotError::VarNotFound {
+            requested,
+            available,
+        } => {
+            assert!(
+                requested.contains("absent_a") && requested.contains("absent_b"),
+                "requested must list both missing names, got {requested}",
+            );
+            assert!(available.contains(&"alpha.bss".to_string()));
+            assert!(available.contains(&"beta.bss".to_string()));
+        }
+        other => panic!("expected VarNotFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn live_vars_via_placeholder_snapshot_surfaces_placeholder_error() {
+    let mut r = FailureDumpReport::default();
+    r.is_placeholder = true;
+    let snap = Snapshot::new(&r);
+    let err = snap
+        .live_vars_via(&["x"], |_| panic!("picker must NOT be called on placeholder"))
+        .unwrap_err();
+    match err {
+        SnapshotError::PlaceholderSnapshot { tag } => {
+            assert!(tag.is_none());
+        }
+        other => panic!("expected PlaceholderSnapshot, got {other:?}"),
+    }
+}
+
+#[test]
+fn live_vars_via_empty_names_slice_errors() {
+    let r = two_instance_two_var_report();
+    let snap = Snapshot::new(&r);
+    let err = snap
+        .live_vars_via(&[], |_| panic!("picker must NOT be called for empty names"))
+        .unwrap_err();
+    match err {
+        SnapshotError::ProjectionFailed { reason } => {
+            assert!(
+                reason.contains("empty names slice"),
+                "empty-names diagnostic must name the cause, got {reason}",
+            );
+        }
+        other => panic!("expected ProjectionFailed, got {other:?}"),
+    }
+}
+
+#[test]
+fn live_vars_via_partial_coverage_map_excluded() {
+    // alpha has [same, cross]; beta has [same] only (no cross).
+    // Co-pick on [same, cross] must drop beta entirely.
+    let mut r = FailureDumpReport::default();
+    let alpha = FailureDumpMap {
+        name: "alpha.bss".into(),
+        map_type: 2,
+        value_size: 16,
+        max_entries: 1,
+        value: Some(RenderedValue::Struct {
+            type_name: Some(".bss".into()),
+            members: vec![
+                RenderedMember {
+                    name: "same".into(),
+                    value: RenderedValue::Uint { bits: 64, value: 10 },
+                },
+                RenderedMember {
+                    name: "cross".into(),
+                    value: RenderedValue::Uint { bits: 64, value: 5 },
+                },
+            ],
+        }),
+        entries: Vec::new(),
+        percpu_entries: Vec::new(),
+        percpu_hash_entries: Vec::new(),
+        arena: None,
+        ringbuf: None,
+        stack_trace: None,
+        fd_array: None,
+        error: None,
+    };
+    let beta = FailureDumpMap {
+        name: "beta.bss".into(),
+        map_type: 2,
+        value_size: 8,
+        max_entries: 1,
+        value: Some(RenderedValue::Struct {
+            type_name: Some(".bss".into()),
+            members: vec![RenderedMember {
+                name: "same".into(),
+                value: RenderedValue::Uint { bits: 64, value: 999 },
+            }],
+        }),
+        entries: Vec::new(),
+        percpu_entries: Vec::new(),
+        percpu_hash_entries: Vec::new(),
+        arena: None,
+        ringbuf: None,
+        stack_trace: None,
+        fd_array: None,
+        error: None,
+    };
+    r.maps = vec![alpha, beta];
+    r.schema = SCHEMA_SINGLE.to_string();
+    let snap = Snapshot::new(&r);
+    let mut seen_objs: Vec<String> = Vec::new();
+    let fields = snap
+        .live_vars_via(&["same", "cross"], |rows| {
+            for (obj, _) in rows {
+                seen_objs.push((*obj).to_string());
+            }
+            Some(0)
+        })
+        .expect("co-pick succeeds");
+    assert_eq!(seen_objs, vec!["alpha.bss".to_string()]);
+    assert_eq!(fields[0].as_u64().unwrap(), 10);
+    assert_eq!(fields[1].as_u64().unwrap(), 5);
+}
+
+#[test]
+fn live_vars_via_with_max_by_sum_u64_picks_active_instance() {
+    let r = two_instance_two_var_report();
+    let snap = Snapshot::new(&r);
+    let fields = snap
+        .live_vars_via(
+            &["same", "cross"],
+            crate::scenario::snapshot::pickers::max_by_sum_u64,
+        )
+        .expect("co-pick succeeds");
+    assert_eq!(
+        fields[0].as_u64().unwrap(),
+        100,
+        "beta has the larger sum (100+50=150 vs alpha 10+5=15), so beta's same wins",
+    );
+    assert_eq!(fields[1].as_u64().unwrap(), 50, "beta's cross");
+}
+
 #[test]
 fn live_var_via_placeholder_snapshot_surfaces_placeholder_error() {
     // Pin sibling-accessor parity: var() and map() both check
