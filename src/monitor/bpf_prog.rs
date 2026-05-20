@@ -5,13 +5,23 @@
 //! No guest cooperation is needed — all reads go through the guest
 //! physical memory mapping.
 
-use super::btf_offsets::BpfProgOffsets;
+use super::btf_offsets::{BpfMapOffsets, BpfProgOffsets};
 use super::idr::{translate_any_kva, xa_load};
 use super::reader::{GuestMem, WalkContext};
 use super::symbols::text_kva_to_pa_with_base;
 
 /// BPF_PROG_TYPE_STRUCT_OPS from include/uapi/linux/bpf.h.
 const BPF_PROG_TYPE_STRUCT_OPS: u32 = 27;
+
+/// Maximum `used_map_cnt` the walker will iterate. The kernel
+/// enforces a per-prog limit of 64 used_maps in `kernel/bpf/verifier.c`
+/// (`MAX_USED_MAPS = 64`), so a higher value here means the read
+/// raced against `bpf_prog_bind_map`'s "increment cnt, then swap
+/// pointer" sequence and got a stale-pointer + new-cnt observation.
+/// Capping at the kernel's own limit bounds the walk past the old
+/// allocation and matches the upper bound a healthy prog can ever
+/// reach.
+pub const MAX_USED_MAPS: u32 = 64;
 
 /// BPF_OBJ_NAME_LEN from include/linux/bpf.h.
 const BPF_OBJ_NAME_LEN: usize = 16;
@@ -121,6 +131,237 @@ pub(crate) fn find_struct_ops_progs(
     }
 
     progs
+}
+
+/// Walk `prog_idr` for the struct_ops prog whose `aux->used_maps`
+/// array contains `target_struct_ops_map_kva`. When found, scan
+/// the same used_maps for a global-section map (`<obj>.bss` /
+/// `<obj>.data` / `<obj>.rodata`) — that obj prefix names the
+/// scheduler the struct_ops map is published into. Returns the
+/// obj prefix string, or `None` when:
+/// - No struct_ops prog references `target_struct_ops_map_kva`
+///   in its used_maps (capture race: prog freed between the
+///   struct_ops map match and this walk, OR the prog never
+///   registered the struct_ops as a used map).
+/// - The matching prog's used_maps contains no
+///   `<obj>.bss/.data/.rodata` map (prog has no global state —
+///   unexpected for sched_ext but defensive).
+///
+/// # Race-window protocol
+///
+/// `bpf_prog_bind_map` (kernel/bpf/syscall.c) increments
+/// `used_map_cnt` BEFORE swapping `used_maps`, opening a window
+/// where the walker can observe new-cnt + old-pointer and walk
+/// past the old allocation. Mitigations layered:
+/// 1. Reads `used_maps` pointer BEFORE `used_map_cnt` so the cnt
+///    observation never outruns the pointer it indexes into.
+/// 2. Caps cnt at [`MAX_USED_MAPS`] (the kernel's own limit per
+///    `kernel/bpf/verifier.c`); any larger value is impossible
+///    in steady-state.
+///
+/// Even with the cap, a torn read may yield garbage map KVAs in
+/// the trailing slots; `translate_any_kva` returning None on a
+/// non-mapped address silently skips garbage entries, and the
+/// `starts_with`-on-section-suffix check rejects any name that
+/// isn't a well-formed `<X>.<section>` string. Net: the walker
+/// surfaces None on torn reads (caller falls back to heuristic)
+/// rather than publishing a bogus obj prefix.
+///
+/// Safe under the freeze-rendezvous: vCPUs are paused, so
+/// `bpf_prog_bind_map` cannot actually run mid-walk; the
+/// race-window protocol above is defense-in-depth for any
+/// caller that ever invokes this outside the freeze window.
+pub(crate) fn find_obj_name_for_struct_ops_map_kva(
+    mem: &GuestMem,
+    walk: WalkContext,
+    prog_idr_kva: u64,
+    prog_offsets: &BpfProgOffsets,
+    map_offsets: &BpfMapOffsets,
+    start_kernel_map: u64,
+    phys_base: u64,
+    target_struct_ops_map_kva: u64,
+) -> Option<String> {
+    let idr_pa = text_kva_to_pa_with_base(prog_idr_kva, start_kernel_map, phys_base);
+
+    let xa_head = mem.read_u64(idr_pa, prog_offsets.idr_xa_head);
+    if xa_head == 0 {
+        return None;
+    }
+    let idr_next = mem.read_u32(idr_pa, prog_offsets.idr_next).min(65536);
+
+    for id in 0..idr_next {
+        let Some(entry) = xa_load(
+            mem,
+            walk.page_offset,
+            xa_head,
+            id as u64,
+            prog_offsets.xa_node_slots,
+            prog_offsets.xa_node_shift,
+        ) else {
+            continue;
+        };
+        if entry == 0 {
+            continue;
+        }
+        let Some(prog_pa) = translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            entry,
+            walk.l5,
+            walk.tcr_el1,
+        ) else {
+            continue;
+        };
+        let prog_type = mem.read_u32(prog_pa, prog_offsets.prog_type);
+        if prog_type != BPF_PROG_TYPE_STRUCT_OPS {
+            continue;
+        }
+        let aux_kva = mem.read_u64(prog_pa, prog_offsets.prog_aux);
+        if aux_kva == 0 {
+            continue;
+        }
+        let Some(aux_pa) = translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            aux_kva,
+            walk.l5,
+            walk.tcr_el1,
+        ) else {
+            continue;
+        };
+        // Read used_maps pointer FIRST, then cnt — pairs with
+        // bpf_prog_bind_map's cnt-then-pointer mutation order.
+        let used_maps_kva = mem.read_u64(aux_pa, prog_offsets.aux_used_maps);
+        if used_maps_kva == 0 {
+            continue;
+        }
+        let used_map_cnt = mem
+            .read_u32(aux_pa, prog_offsets.aux_used_map_cnt)
+            .min(MAX_USED_MAPS);
+        if used_map_cnt == 0 {
+            continue;
+        }
+        let Some(used_maps_pa) = translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            used_maps_kva,
+            walk.l5,
+            walk.tcr_el1,
+        ) else {
+            continue;
+        };
+
+        // Pass 1: scan for the target struct_ops map KVA.
+        let mut has_target = false;
+        for i in 0..used_map_cnt {
+            let entry_kva = mem.read_u64(used_maps_pa, (i as usize) * 8);
+            if entry_kva == target_struct_ops_map_kva {
+                has_target = true;
+                break;
+            }
+        }
+        if !has_target {
+            continue;
+        }
+        // Pass 2: in the same array, find a global-section map.
+        for i in 0..used_map_cnt {
+            let map_kva = mem.read_u64(used_maps_pa, (i as usize) * 8);
+            if map_kva == 0 || map_kva == target_struct_ops_map_kva {
+                continue;
+            }
+            let Some(map_pa) = translate_any_kva(
+                mem,
+                walk.cr3_pa,
+                walk.page_offset,
+                map_kva,
+                walk.l5,
+                walk.tcr_el1,
+            ) else {
+                continue;
+            };
+            let mut name_buf = [0u8; BPF_OBJ_NAME_LEN];
+            mem.read_bytes(map_pa + map_offsets.map_name as u64, &mut name_buf);
+            let name_len = name_buf
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(BPF_OBJ_NAME_LEN);
+            let name = std::str::from_utf8(&name_buf[..name_len]).ok()?;
+            if let Some(obj) = extract_global_section_obj_prefix(name) {
+                return Some(obj.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// If `map_name` matches `<obj>.bss` / `<obj>.data` / `<obj>.rodata`
+/// (libbpf naming for global-section maps), return `<obj>` (the
+/// prefix before the section suffix). Returns None for any other
+/// map name (struct_ops `ktstr_ops`, libbpf-named kfunc helpers,
+/// hashtables, etc.). Used by the active-obj walker to derive a
+/// scheduler obj prefix from a prog's `used_maps` entries.
+///
+/// The obj prefix returned by this helper is already truncated by
+/// the kernel to fit within `BPF_OBJ_NAME_LEN - section_suffix - 1`
+/// (libbpf's internal_map_name in tools/lib/bpf/libbpf.c). Callers
+/// must match against the same truncated obj prefix when
+/// cross-referencing the captured global-section maps.
+fn extract_global_section_obj_prefix(map_name: &str) -> Option<&str> {
+    for suffix in [".bss", ".data", ".rodata"] {
+        if let Some(prefix) = map_name.strip_suffix(suffix)
+            && !prefix.is_empty()
+        {
+            return Some(prefix);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod extract_global_section_obj_prefix_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_bss_prefix() {
+        assert_eq!(extract_global_section_obj_prefix("ktstr.bss"), Some("ktstr"));
+    }
+
+    #[test]
+    fn extracts_data_prefix() {
+        assert_eq!(
+            extract_global_section_obj_prefix("scx_layered.data"),
+            Some("scx_layered"),
+        );
+    }
+
+    #[test]
+    fn extracts_rodata_prefix() {
+        assert_eq!(
+            extract_global_section_obj_prefix("mitosis.rodata"),
+            Some("mitosis"),
+        );
+    }
+
+    #[test]
+    fn rejects_struct_ops_map_name() {
+        assert_eq!(extract_global_section_obj_prefix("ktstr_ops"), None);
+        assert_eq!(extract_global_section_obj_prefix("mitosis_ops"), None);
+    }
+
+    #[test]
+    fn rejects_unrelated_map_name() {
+        assert_eq!(extract_global_section_obj_prefix("scx_per_task"), None);
+        assert_eq!(extract_global_section_obj_prefix("bpf_runq"), None);
+    }
+
+    #[test]
+    fn rejects_empty_prefix_before_suffix() {
+        // ".bss" with no obj — degenerate map name; skip.
+        assert_eq!(extract_global_section_obj_prefix(".bss"), None);
+    }
 }
 
 /// Per-program runtime stats summed across all CPUs.
@@ -432,6 +673,28 @@ pub trait BpfProgAccessor {
     /// The live-host backend will ignore this argument (the kernel
     /// provides per-CPU sums via `BPF_OBJ_GET_INFO_BY_FD`).
     fn struct_ops_runtime_stats(&self, per_cpu_offsets: &[u64]) -> Vec<ProgRuntimeStats>;
+
+    /// Active-scheduler walker: find the obj prefix for the struct_ops
+    /// map at `target_struct_ops_map_kva` by scanning each struct_ops
+    /// prog's `aux->used_maps` for both the target map AND a sibling
+    /// `<obj>.bss/.data/.rodata` global-section map. The obj prefix
+    /// names the scheduler the struct_ops map is published into.
+    ///
+    /// Returns `None` when no prog references the target map (capture
+    /// race, or non-libbpf-naming case where the existing
+    /// prefix-cross-check in `identify_active_obj_from_struct_ops`
+    /// already resolves the obj directly from the struct_ops map name).
+    /// Callers fall back to the prefix-grouping heuristic on `None`.
+    ///
+    /// Backends: the guest-memory backend walks `prog_idr` via
+    /// [`find_obj_name_for_struct_ops_map_kva`]; the planned live-host
+    /// backend will iterate `BPF_PROG_GET_NEXT_ID` + read each prog's
+    /// `bpf_prog_info::map_ids` via `BPF_OBJ_GET_INFO_BY_FD`.
+    fn find_active_obj_via_used_maps(
+        &self,
+        target_struct_ops_map_kva: u64,
+        map_offsets: &BpfMapOffsets,
+    ) -> Option<String>;
 }
 
 /// Host-side BPF program accessor backed by direct guest physical-memory
@@ -500,6 +763,23 @@ impl BpfProgAccessor for GuestMemProgAccessor<'_> {
             per_cpu_offsets,
             self.kernel.start_kernel_map(),
             self.kernel.phys_base(),
+        )
+    }
+
+    fn find_active_obj_via_used_maps(
+        &self,
+        target_struct_ops_map_kva: u64,
+        map_offsets: &BpfMapOffsets,
+    ) -> Option<String> {
+        find_obj_name_for_struct_ops_map_kva(
+            self.kernel.mem(),
+            self.kernel.walk_context(),
+            self.prog_idr_kva,
+            self.offsets,
+            map_offsets,
+            self.kernel.start_kernel_map(),
+            self.kernel.phys_base(),
+            target_struct_ops_map_kva,
         )
     }
 }
@@ -845,6 +1125,8 @@ mod tests {
             prog_aux: 8,
             aux_verified_insns: 0,
             aux_name: 8,
+            aux_used_maps: 24,
+            aux_used_map_cnt: 32,
             xa_node_slots: 16,
             xa_node_shift: 0,
             idr_xa_head: 0,

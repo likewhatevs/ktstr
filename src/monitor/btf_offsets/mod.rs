@@ -1305,6 +1305,21 @@ pub struct BpfProgOffsets {
     pub aux_verified_insns: usize,
     /// Offset of `name` (char\[BPF_OBJ_NAME_LEN\]) within `struct bpf_prog_aux`.
     pub aux_name: usize,
+    /// Offset of `used_maps` (`struct bpf_map **`) within
+    /// `struct bpf_prog_aux`. Array of `used_map_cnt` map pointers
+    /// the prog references; the active-obj walker iterates this
+    /// array to find a struct_ops prog whose used_maps contains
+    /// both the matched struct_ops map AND a `<obj>.bss/.data/.rodata`
+    /// global-section map (the obj prefix names the active scheduler).
+    pub aux_used_maps: usize,
+    /// Offset of `used_map_cnt` (u32) within `struct bpf_prog_aux`.
+    /// Counts the entries in `used_maps`. Read BEFORE `used_maps`
+    /// and capped at [`crate::monitor::bpf_prog::MAX_USED_MAPS`] to
+    /// bound the walk under the freeze-rendezvous race window
+    /// (`bpf_prog_bind_map` increments cnt then swaps the pointer
+    /// — without a cap, a stale-pointer + new-cnt read could walk
+    /// past the old allocation).
+    pub aux_used_map_cnt: usize,
     /// IDR offsets reused from BpfMapOffsets for walking prog_idr.
     pub xa_node_slots: usize,
     /// Offset of `shift` (u8) within `struct xa_node`.
@@ -1337,6 +1352,8 @@ impl BpfProgOffsets {
         let (bpf_prog_aux, _) = find_struct(btf, "bpf_prog_aux")?;
         let aux_verified_insns = member_byte_offset(btf, &bpf_prog_aux, "verified_insns")?;
         let aux_name = member_byte_offset(btf, &bpf_prog_aux, "name")?;
+        let aux_used_maps = member_byte_offset(btf, &bpf_prog_aux, "used_maps")?;
+        let aux_used_map_cnt = member_byte_offset(btf, &bpf_prog_aux, "used_map_cnt")?;
 
         let idr = IdrOffsets::from_btf(btf)?;
 
@@ -1352,6 +1369,8 @@ impl BpfProgOffsets {
             prog_aux,
             aux_verified_insns,
             aux_name,
+            aux_used_maps,
+            aux_used_map_cnt,
             xa_node_slots: idr.xa_node_slots,
             xa_node_shift: idr.xa_node_shift,
             idr_xa_head: idr.idr_xa_head,

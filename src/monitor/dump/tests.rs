@@ -6968,3 +6968,265 @@ fn collect_per_cpu_time_no_tick_sched_skips_iowait() {
         "missing tick_cpu_sched_kva must surface as None, not zero",
     );
 }
+
+// ---------- identify_active_obj_from_struct_ops walker fallback ----------
+
+/// Synthetic accessor seam for unit-testing the used_maps walker
+/// path through `identify_active_obj_from_struct_ops`. Holds a
+/// canned `(target_struct_ops_map_kva, obj_name)` mapping the
+/// walker would otherwise derive from kernel memory. Returns
+/// canned obj name when the requested target matches; None
+/// otherwise (capture-race simulation).
+struct TestProgAccessor {
+    walker_result: Option<(u64, String)>,
+}
+
+impl super::super::bpf_prog::BpfProgAccessor for TestProgAccessor {
+    fn struct_ops_progs(&self) -> Vec<super::super::bpf_prog::ProgVerifierStats> {
+        Vec::new()
+    }
+    fn struct_ops_runtime_stats(
+        &self,
+        _per_cpu_offsets: &[u64],
+    ) -> Vec<super::super::bpf_prog::ProgRuntimeStats> {
+        Vec::new()
+    }
+    fn find_active_obj_via_used_maps(
+        &self,
+        target_struct_ops_map_kva: u64,
+        _map_offsets: &super::super::btf_offsets::BpfMapOffsets,
+    ) -> Option<String> {
+        self.walker_result.as_ref().and_then(|(target, name)| {
+            if *target == target_struct_ops_map_kva {
+                Some(name.clone())
+            } else {
+                None
+            }
+        })
+    }
+}
+
+fn synthetic_global_section_map(map_kva: u64, name: &str) -> super::super::bpf_map::BpfMapInfo {
+    let (name_bytes, name_len) = name_from_str(name);
+    super::super::bpf_map::BpfMapInfo {
+        map_pa: 0,
+        map_kva,
+        name_bytes,
+        name_len,
+        map_type: super::super::bpf_map::BPF_MAP_TYPE_ARRAY,
+        map_flags: 0,
+        key_size: 0,
+        value_size: 0,
+        max_entries: 1,
+        value_kva: None,
+        btf_kva: 0,
+        btf_value_type_id: 0,
+        btf_vmlinux_value_type_id: 0,
+        btf_key_type_id: 0,
+    }
+}
+
+fn synthetic_struct_ops_map(
+    map_kva: u64,
+    name: &str,
+    sched_kva: u64,
+) -> super::super::bpf_map::BpfMapInfo {
+    let (name_bytes, name_len) = name_from_str(name);
+    super::super::bpf_map::BpfMapInfo {
+        map_pa: 0,
+        map_kva,
+        name_bytes,
+        name_len,
+        map_type: super::super::bpf_map::BPF_MAP_TYPE_STRUCT_OPS,
+        map_flags: 0,
+        key_size: 0,
+        value_size: 0,
+        max_entries: 1,
+        value_kva: Some(sched_kva),
+        btf_kva: 0,
+        btf_value_type_id: 0,
+        btf_vmlinux_value_type_id: 0,
+        btf_key_type_id: 0,
+    }
+}
+
+fn synthetic_sched_state(sched_kva: u64) -> Option<super::super::scx_walker::ScxSchedState> {
+    Some(super::super::scx_walker::ScxSchedState {
+        sched_kva: Some(sched_kva),
+        ..Default::default()
+    })
+}
+
+/// Single libbpf-named struct_ops scenario: struct_ops map name
+/// is `ktstr_ops` (no obj prefix), so the prefix cross-check at
+/// the top of identify_active_obj_from_struct_ops fails; the
+/// walker fallback fires and returns `ktstr`, which the
+/// captured-maps cross-check validates against `ktstr.bss`.
+#[test]
+fn identify_active_obj_libbpf_named_single_scheduler_via_walker() {
+    let sched_kva = 0xffff_0000_0000_a000;
+    let struct_ops_map_kva = 0xffff_0000_0000_b000;
+    let maps = vec![
+        synthetic_struct_ops_map(struct_ops_map_kva, "ktstr_ops", sched_kva),
+        synthetic_global_section_map(0xffff_0000_0000_c000, "ktstr.bss"),
+    ];
+    let scx = synthetic_sched_state(sched_kva);
+    let map_offsets = super::super::btf_offsets::BpfMapOffsets::EMPTY;
+    let accessor = TestProgAccessor {
+        walker_result: Some((struct_ops_map_kva, "ktstr".to_string())),
+    };
+    let result = super::identify_active_obj_from_struct_ops(
+        &maps,
+        &scx,
+        Some((&accessor, &map_offsets)),
+    );
+    assert_eq!(
+        result,
+        Some("ktstr".to_string()),
+        "walker fallback must resolve libbpf-named struct_ops to the obj prefix",
+    );
+}
+
+/// Two libbpf-named struct_ops scenario: the walker disambiguates
+/// by matching against scx_sched_state.sched_kva so the result
+/// names the active (not staged) scheduler.
+#[test]
+fn identify_active_obj_libbpf_named_two_schedulers_picks_active() {
+    let active_sched_kva = 0xffff_0000_0000_a000;
+    let staged_sched_kva = 0xffff_0000_0000_e000;
+    let active_struct_ops_kva = 0xffff_0000_0000_b000;
+    let staged_struct_ops_kva = 0xffff_0000_0000_f000;
+    let maps = vec![
+        // Both struct_ops maps are libbpf-named (no obj prefix).
+        synthetic_struct_ops_map(active_struct_ops_kva, "ktstr_ops", active_sched_kva),
+        synthetic_struct_ops_map(staged_struct_ops_kva, "simple_ops", staged_sched_kva),
+        synthetic_global_section_map(0xffff_0000_0000_c000, "ktstr.bss"),
+        synthetic_global_section_map(0xffff_0000_0000_d000, "scx_simple.bss"),
+    ];
+    let scx = synthetic_sched_state(active_sched_kva);
+    let map_offsets = super::super::btf_offsets::BpfMapOffsets::EMPTY;
+    let accessor = TestProgAccessor {
+        walker_result: Some((active_struct_ops_kva, "ktstr".to_string())),
+    };
+    let result = super::identify_active_obj_from_struct_ops(
+        &maps,
+        &scx,
+        Some((&accessor, &map_offsets)),
+    );
+    assert_eq!(
+        result,
+        Some("ktstr".to_string()),
+        "walker disambiguates to the scheduler whose struct_ops map matches sched_kva",
+    );
+}
+
+/// Walker returns None (capture race: matched struct_ops map's
+/// KVA appears in no prog's used_maps). identify_active_obj should
+/// propagate None — callers fall back to Snapshot::active()'s
+/// prefix-grouping heuristic.
+#[test]
+fn identify_active_obj_walker_returns_none_propagates_none() {
+    let sched_kva = 0xffff_0000_0000_a000;
+    let struct_ops_map_kva = 0xffff_0000_0000_b000;
+    let maps = vec![
+        synthetic_struct_ops_map(struct_ops_map_kva, "ktstr_ops", sched_kva),
+        synthetic_global_section_map(0xffff_0000_0000_c000, "ktstr.bss"),
+    ];
+    let scx = synthetic_sched_state(sched_kva);
+    let map_offsets = super::super::btf_offsets::BpfMapOffsets::EMPTY;
+    let accessor = TestProgAccessor {
+        walker_result: None,
+    };
+    let result = super::identify_active_obj_from_struct_ops(
+        &maps,
+        &scx,
+        Some((&accessor, &map_offsets)),
+    );
+    assert_eq!(
+        result, None,
+        "walker None propagates — heuristic fallback fires upstream",
+    );
+}
+
+/// Captured-maps cross-check: walker returns a name that does
+/// NOT match any `<name>.bss/.data/.rodata` map in the captured
+/// maps[]. The validation check rejects the walker result;
+/// identify_active_obj returns None rather than publishing a
+/// bogus prefix.
+#[test]
+fn identify_active_obj_walker_result_validated_against_captured_maps() {
+    let sched_kva = 0xffff_0000_0000_a000;
+    let struct_ops_map_kva = 0xffff_0000_0000_b000;
+    let maps = vec![
+        synthetic_struct_ops_map(struct_ops_map_kva, "ktstr_ops", sched_kva),
+        synthetic_global_section_map(0xffff_0000_0000_c000, "ktstr.bss"),
+    ];
+    let scx = synthetic_sched_state(sched_kva);
+    let map_offsets = super::super::btf_offsets::BpfMapOffsets::EMPTY;
+    // Walker returns "garbage" — no `garbage.bss/.data/.rodata` in
+    // captured maps[]. Cross-check rejects.
+    let accessor = TestProgAccessor {
+        walker_result: Some((struct_ops_map_kva, "garbage".to_string())),
+    };
+    let result = super::identify_active_obj_from_struct_ops(
+        &maps,
+        &scx,
+        Some((&accessor, &map_offsets)),
+    );
+    assert_eq!(
+        result, None,
+        "validation must reject walker result not backed by a captured global-section map",
+    );
+}
+
+/// Without a prog walker, the existing prefix-grouping path
+/// stays untouched: single-scheduler case with `<obj>.foo`
+/// struct_ops name + `<obj>.bss` resolves correctly without
+/// needing the walker.
+#[test]
+fn identify_active_obj_legacy_path_works_without_walker() {
+    let sched_kva = 0xffff_0000_0000_a000;
+    let maps = vec![
+        synthetic_struct_ops_map(0xffff_0000_0000_b000, "ktstr.ops", sched_kva),
+        synthetic_global_section_map(0xffff_0000_0000_c000, "ktstr.bss"),
+    ];
+    let scx = synthetic_sched_state(sched_kva);
+    let result = super::identify_active_obj_from_struct_ops(&maps, &scx, None);
+    assert_eq!(
+        result,
+        Some("ktstr".to_string()),
+        "prefix cross-check resolves single-scheduler case without walker",
+    );
+}
+
+/// Walker is NOT invoked when the legacy prefix cross-check
+/// already succeeds — even if the walker is provided. Pins that
+/// the legacy path takes precedence; walker is purely a fallback.
+#[test]
+fn identify_active_obj_legacy_path_short_circuits_walker_when_provided() {
+    let sched_kva = 0xffff_0000_0000_a000;
+    let struct_ops_map_kva = 0xffff_0000_0000_b000;
+    let maps = vec![
+        // `ktstr.ops` IS prefix-resolvable. Walker should NOT fire.
+        synthetic_struct_ops_map(struct_ops_map_kva, "ktstr.ops", sched_kva),
+        synthetic_global_section_map(0xffff_0000_0000_c000, "ktstr.bss"),
+    ];
+    let scx = synthetic_sched_state(sched_kva);
+    let map_offsets = super::super::btf_offsets::BpfMapOffsets::EMPTY;
+    // Walker returns a different name — if it were called the
+    // result would be "other". If the legacy path correctly short-
+    // circuits, the result is "ktstr" (from prefix cross-check).
+    let accessor = TestProgAccessor {
+        walker_result: Some((struct_ops_map_kva, "other".to_string())),
+    };
+    let result = super::identify_active_obj_from_struct_ops(
+        &maps,
+        &scx,
+        Some((&accessor, &map_offsets)),
+    );
+    assert_eq!(
+        result,
+        Some("ktstr".to_string()),
+        "legacy prefix cross-check takes precedence; walker is fallback-only",
+    );
+}

@@ -1334,6 +1334,10 @@ impl FailureDumpReport {
 fn identify_active_obj_from_struct_ops(
     maps: &[super::bpf_map::BpfMapInfo],
     scx_sched_state: &Option<super::scx_walker::ScxSchedState>,
+    prog_walker: Option<(
+        &dyn super::bpf_prog::BpfProgAccessor,
+        &super::btf_offsets::BpfMapOffsets,
+    )>,
 ) -> Option<String> {
     let sched_kva = scx_sched_state.as_ref()?.sched_kva?;
     // Phase 1: identify THE struct_ops map currently published into
@@ -1366,15 +1370,40 @@ fn identify_active_obj_from_struct_ops(
     // AND a global-section map — that prog's bss-map prefix is the
     // load-bearing obj name.
     let so_name = active_struct_ops.name();
-    let so_prefix = so_name.split('.').next().filter(|s| !s.is_empty())?;
-    let has_matching_global = maps.iter().any(|m| {
+    let so_prefix = so_name.split('.').next().filter(|s| !s.is_empty());
+    if let Some(prefix) = so_prefix {
+        let has_matching_global = maps.iter().any(|m| {
+            m.map_type != super::bpf_map::BPF_MAP_TYPE_STRUCT_OPS
+                && (m.name().starts_with(&format!("{prefix}.bss"))
+                    || m.name().starts_with(&format!("{prefix}.data"))
+                    || m.name().starts_with(&format!("{prefix}.rodata")))
+        });
+        if has_matching_global {
+            return Some(prefix.to_string());
+        }
+    }
+    // Phase-2 fallback: the struct_ops map name lacks a usable obj
+    // prefix (libbpf default: `ktstr_ops` not `ktstr.ops`) OR the
+    // prefix exists but no `<prefix>.bss/.data/.rodata` global-section
+    // map carries it. Walk `prog.aux->used_maps` for the prog whose
+    // used_maps contains both the matched struct_ops map AND a
+    // sibling global-section map — that map's prefix names the obj.
+    //
+    // The walker's returned prefix MUST appear as a
+    // `<prefix>.<section>` map in the captured `maps[]` (defense
+    // against the walker reading garbage from a torn used_maps
+    // window). Only publish on cross-check success.
+    let (prog_accessor, map_offsets) = prog_walker?;
+    let walker_prefix =
+        prog_accessor.find_active_obj_via_used_maps(active_struct_ops.map_kva, map_offsets)?;
+    let walker_prefix_validated = maps.iter().any(|m| {
         m.map_type != super::bpf_map::BPF_MAP_TYPE_STRUCT_OPS
-            && (m.name().starts_with(&format!("{so_prefix}.bss"))
-                || m.name().starts_with(&format!("{so_prefix}.data"))
-                || m.name().starts_with(&format!("{so_prefix}.rodata")))
+            && (m.name().starts_with(&format!("{walker_prefix}.bss"))
+                || m.name().starts_with(&format!("{walker_prefix}.data"))
+                || m.name().starts_with(&format!("{walker_prefix}.rodata")))
     });
-    if has_matching_global {
-        Some(so_prefix.to_string())
+    if walker_prefix_validated {
+        Some(walker_prefix)
     } else {
         None
     }
@@ -2762,8 +2791,18 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     // FailureDumpReport struct literal moves `scx_sched_state`.
     // `identify_active_obj_from_struct_ops` borrows both `maps` and
     // `scx_sched_state` non-destructively so both are still owned for
-    // the subsequent move into the report.
-    let active_obj_name = identify_active_obj_from_struct_ops(&maps, &scx_sched_state);
+    // the subsequent move into the report. The prog accessor +
+    // BpfMapOffsets pair powers the used_maps walker fallback for the
+    // libbpf-named struct_ops case (`ktstr_ops` etc.) — when absent,
+    // the helper degrades to the prefix-grouping heuristic only.
+    let prog_walker = prog_capture.map(|cap| {
+        (
+            cap.accessor as &dyn super::bpf_prog::BpfProgAccessor,
+            accessor.offsets(),
+        )
+    });
+    let active_obj_name =
+        identify_active_obj_from_struct_ops(&maps, &scx_sched_state, prog_walker);
     let mut report = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
         maps: Vec::with_capacity(maps.len()),
