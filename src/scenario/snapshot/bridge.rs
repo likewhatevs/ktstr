@@ -450,7 +450,7 @@ pub struct SnapshotBridge {
 }
 
 /// State codes for the accessor-init worker, written to the
-/// [`SnapshotBridge::accessor_worker_state`] atomic. Two-bit
+/// `SnapshotBridge::accessor_worker_state` atomic. Two-bit
 /// encoding leaves the high bits open for future sub-states (e.g.
 /// "shutting down").
 pub mod accessor_worker_state {

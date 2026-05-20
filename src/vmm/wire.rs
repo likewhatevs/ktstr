@@ -794,7 +794,7 @@ pub const SNAPSHOT_TAG_MAX: usize = 64;
 /// failing symbol + KVA PLUS the actionable remediation tip (e.g.
 /// `set #[ktstr_test(kaslr = false)]`). The longest such diagnostic
 /// today — Fix C's high-half/zero-offset rejection at
-/// [`crate::vmm::freeze_coord::snapshot::arm_user_watchpoint`] — is
+/// `crate::vmm::freeze_coord::snapshot::arm_user_watchpoint` — is
 /// ~343 bytes when rendered with a typical symbol + KVA; 512 gives
 /// ~170 bytes of headroom for future diagnostics. The original
 /// 64-byte buffer and an intermediate 256-byte size both truncated

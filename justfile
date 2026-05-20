@@ -19,8 +19,12 @@ lint:
 # Promote every rustdoc warning to an error. RUSTDOCFLAGS reaches every
 # crate in the workspace (including ktstr-macros), where `cargo doc -- -D
 # warnings` would only forward the flag to the top-level invocation.
+# `--document-private-items` gates the private-item intra-doc link
+# and broken-html-tag warnings the project cleared in batch — without
+# it a regression would silently slip past CI on a private-symbol
+# rename that broke its intra-doc references.
 doc-strict:
-    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --document-private-items
 
 # Build a test kernel
 kernel-build version="":
