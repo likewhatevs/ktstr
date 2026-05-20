@@ -3216,196 +3216,89 @@ const SCX_STATE_SYSFS: &str = "/sys/kernel/sched_ext/state";
 /// no detach to wait for and the next spawn will fail later with
 /// a sharper diagnostic if scx is genuinely required.
 fn wait_for_scx_disabled(timeout: std::time::Duration) -> Result<std::time::Duration> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::io::{FromRawFd, OwnedFd};
+    use crate::vmm::freeze_coord::evented_wait::{KernfsWaitOutcome, kernfs_evented_wait};
+    use nix::sys::inotify::AddWatchFlags;
 
     let start = std::time::Instant::now();
-    let interval_ms: i32 = 50;
     let path = std::path::Path::new(SCX_STATE_SYSFS);
     if !path.exists() {
         return Ok(std::time::Duration::ZERO);
     }
 
     // Reusable read buffer for the state file. `String::clear` keeps
-    // the heap allocation across iterations so the steady-state
-    // wait costs zero per-iteration allocations. Inlined open+read
-    // (rather than a closure returning &str) avoids the
-    // can't-annotate-closure-lifetime constraint.
+    // the heap allocation across the predicate's iterations.
     let mut buf = String::with_capacity(32);
-
-    // Fast path: re-check state at entry before any wake-source
-    // setup so callers that arrive after the kernel already flipped
-    // to "disabled" pay zero syscall overhead beyond the read itself.
-    let _ = std::fs::File::open(SCX_STATE_SYSFS).and_then(|mut f| {
-        use std::io::Read;
-        f.read_to_string(&mut buf)
-    });
-    if buf.trim_end() == "disabled" {
-        return Ok(start.elapsed());
-    }
-
-    // Two evented wake sources, polled together so a wake on either
-    // re-reads the state file with minimal latency:
-    //
-    // 1. POLLPRI on the open state fd. kernfs delivers POLLPRI when
-    //    the producer calls `sysfs_notify` (kernel/fs/kernfs/file.c
-    //    `kernfs_fop_poll`). scx_set_enable_state doesn't currently
-    //    emit `sysfs_notify`, but if it ever does we get instant
-    //    wakeup.
-    //
-    // 2. inotify on the parent directory `/sys/kernel/sched_ext/`
-    //    for IN_DELETE on "root". kernfs honors directory-delete
-    //    inotify events: when scx_root_disable calls `kobject_del`
-    //    at kernel/sched/ext.c:5859 the kernfs directory entry is
-    //    removed and inotify fires. The kernel comment at L5854-5858
-    //    explicitly orders kobject_del BEFORE the state flip at
-    //    L5865 (scx_set_enable_state(SCX_DISABLED)).
-    //
-    // REQUIRED CADENCE. The `interval_ms` parameter caps each poll(2)
-    // wait at 50 ms. Verified at kernel/sched/ext.c:5735
-    // scx_root_disable: between kobject_del (line 5859, fires
-    // IN_DELETE) and the state flip (line 5865,
-    // scx_set_enable_state(SCX_DISABLED)) the kernel performs
-    // free_kick_syncs() + mutex_unlock(&scx_enable_mutex) + the
-    // atomic_xchg of the state. The gap is sub-microsecond in the
-    // common case but theoretically present. CRITICALLY: scx emits
-    // NO further event for the state-attribute transition — there
-    // is no sysfs_notify on the state attribute and IN_DELETE has
-    // already fired. So an IN_DELETE wake that catches the pre-flip
-    // state has NO further event to wait on. Without the cadence
-    // cap, the loop would block until the overall deadline (typically
-    // SCHED_LIFECYCLE_KILL_GRACE = 10 s) before re-reading. The 50 ms
-    // cap bounds that wait to the next re-read. NOT a polling
-    // fallback for failed evented setup; it is the only mechanism
-    // that closes the kernel-side ordering gap between the IN_DELETE
-    // event and the state-attribute transition. Per the project
-    // rule "guard rail deadlines/timeouts are ok; everything should
-    // be evented not polling" — the 50 ms cap is the necessary
-    // guard rail for a kernel-mechanic gap, not a degraded polling
-    // path.
-    let state_fd: Option<OwnedFd> = {
-        let raw = unsafe { libc::open(c"/sys/kernel/sched_ext/state".as_ptr(), libc::O_RDONLY) };
-        if raw < 0 {
-            None
-        } else {
-            // SAFETY: raw is a valid fd we just opened.
-            Some(unsafe { OwnedFd::from_raw_fd(raw) })
-        }
-    };
-    let inotify_fd: Option<OwnedFd> = {
-        let init = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-        if init < 0 {
-            None
-        } else {
-            // SAFETY: init is a valid fd we just opened.
-            let owned = unsafe { OwnedFd::from_raw_fd(init) };
-            let wd = unsafe {
-                libc::inotify_add_watch(
-                    owned.as_raw_fd(),
-                    c"/sys/kernel/sched_ext/".as_ptr(),
-                    libc::IN_DELETE,
-                )
-            };
-            if wd < 0 { None } else { Some(owned) }
-        }
-    };
-
-    // Build the pollfd set ONCE — fds are stable for the lifetime of
-    // the wait, only revents changes per poll. `nfds` records how
-    // many entries are populated (max 2; the slots not used stay
-    // as the zero-init sentinel with fd=-1 which poll(2) ignores).
-    let mut pfds: [libc::pollfd; 2] = [
-        libc::pollfd {
-            fd: -1,
-            events: 0,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: -1,
-            events: 0,
-            revents: 0,
-        },
-    ];
-    let mut nfds: libc::nfds_t = 0;
-    if let Some(ref fd) = state_fd {
-        pfds[nfds as usize] = libc::pollfd {
-            fd: fd.as_raw_fd(),
-            events: libc::POLLPRI,
-            revents: 0,
-        };
-        nfds += 1;
-    }
-    if let Some(ref fd) = inotify_fd {
-        pfds[nfds as usize] = libc::pollfd {
-            fd: fd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        nfds += 1;
-    }
-    if nfds == 0 {
-        // Both state_fd open and inotify_add_watch failed. We target
-        // kernel 6.12+ where kernfs + inotify are universal, so the
-        // path-exists-but-attribute-fd-unopenable branch indicates a
-        // fundamental env defect. Bail with an actionable recipe.
-        anyhow::bail!(
-            "wait_for_scx_disabled: could not subscribe to evented wake \
-             sources (state fd open failed AND inotify_add_watch on \
-             /sys/kernel/sched_ext/ failed). Diagnose: \
-             (1) does '/sys/kernel/sched_ext/state' exist AND contain \
-             'disabled' or 'enabled'? If absent/garbage the kernel was \
-             built without CONFIG_SCHED_CLASS_EXT — rebuild with that \
-             config. \
-             (2) zcat /proc/config.gz | grep CONFIG_INOTIFY_USER must be \
-             =y — without it the framework's evented wake can't \
-             subscribe; rebuild with CONFIG_INOTIFY_USER=y."
-        );
-    }
-
-    loop {
+    let mut last_state = String::new();
+    let check_done = || -> Option<()> {
         buf.clear();
         let _ = std::fs::File::open(SCX_STATE_SYSFS).and_then(|mut f| {
             use std::io::Read;
             f.read_to_string(&mut buf)
         });
         let state = buf.trim_end();
-        if state == "disabled" {
-            return Ok(start.elapsed());
-        }
-        let elapsed = start.elapsed();
-        if elapsed >= timeout {
+        last_state.clear();
+        last_state.push_str(state);
+        if state == "disabled" { Some(()) } else { None }
+    };
+
+    // Evented wake sources managed by kernfs_evented_wait:
+    //   - inotify on /sys/kernel/sched_ext/ for IN_DELETE (fires
+    //     when scx_root_disable's kobject_del at
+    //     kernel/sched/ext.c:5859 removes the "root" entry)
+    //   - POLLPRI on /sys/kernel/sched_ext/state (future-proofed
+    //     for kernels that add `sysfs_notify` on the attribute)
+    //
+    // REQUIRED CADENCE. Verified at kernel/sched/ext.c:5735
+    // scx_root_disable: between kobject_del (L5859, fires
+    // IN_DELETE) and the state flip (L5865,
+    // scx_set_enable_state(SCX_DISABLED)) the kernel does
+    // free_kick_syncs() + mutex_unlock(&scx_enable_mutex) + the
+    // atomic_xchg. Sub-microsecond gap in the common case but
+    // theoretically present, AND scx emits NO further event for
+    // the state-attribute transition (no sysfs_notify, IN_DELETE
+    // already fired). Without the 50ms cadence cap, an IN_DELETE
+    // wake catching the pre-flip state would block until the
+    // overall deadline before re-reading. The cap is the necessary
+    // guard rail for the kernel-side ordering gap — NOT a polling
+    // fallback for failed evented setup.
+    let cadence = std::time::Duration::from_millis(50);
+    let outcome = kernfs_evented_wait(
+        "/sys/kernel/sched_ext/",
+        AddWatchFlags::IN_DELETE,
+        Some("/sys/kernel/sched_ext/state"),
+        cadence,
+        start + timeout,
+        check_done,
+    );
+
+    match outcome {
+        KernfsWaitOutcome::Done(()) => Ok(start.elapsed()),
+        KernfsWaitOutcome::Timeout => {
             anyhow::bail!(
-                "wait_for_scx_disabled: state '{state}' did not reach 'disabled' \
+                "wait_for_scx_disabled: state '{last_state}' did not reach 'disabled' \
                  within {timeout:?}; the kernel scx state machine is stuck — \
                  the next scheduler spawn will hit -EBUSY at the enable path. \
                  Inspect /sys/kernel/sched_ext/state + dmesg for the stuck \
                  disable transition.",
             );
         }
-        let remaining = timeout - elapsed;
-        let cadence_cap = std::time::Duration::from_millis(interval_ms as u64);
-        let wait_ms = remaining.min(cadence_cap).as_millis().min(i32::MAX as u128) as i32;
-        // SAFETY: pfds has nfds valid entries; nfds <= 2 < array len.
-        // poll(2) resets the revents field of each pollfd in place
-        // before returning, so reusing the same array across iterations
-        // is the documented contract.
-        let _ = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, wait_ms) };
-        // Drain inotify so the fd doesn't stay readable across
-        // iterations and spin the next poll.
-        if let Some(ref fd) = inotify_fd {
-            let mut drain_buf = [0u8; 4096];
-            loop {
-                let n = unsafe {
-                    libc::read(
-                        fd.as_raw_fd(),
-                        drain_buf.as_mut_ptr().cast(),
-                        drain_buf.len(),
-                    )
-                };
-                if n <= 0 {
-                    break;
-                }
-            }
+        KernfsWaitOutcome::NoEventedSource => {
+            // Both state_fd open and inotify_add_watch failed. We
+            // target kernel 6.12+ where kernfs + inotify are
+            // universal, so the path-exists-but-attribute-fd-
+            // unopenable branch indicates a fundamental env defect.
+            anyhow::bail!(
+                "wait_for_scx_disabled: could not subscribe to evented wake \
+                 sources (state fd open failed AND inotify_add_watch on \
+                 /sys/kernel/sched_ext/ failed). Diagnose: \
+                 (1) does '/sys/kernel/sched_ext/state' exist AND contain \
+                 'disabled' or 'enabled'? If absent/garbage the kernel was \
+                 built without CONFIG_SCHED_CLASS_EXT — rebuild with that \
+                 config. \
+                 (2) zcat /proc/config.gz | grep CONFIG_INOTIFY_USER must be \
+                 =y — without it the framework's evented wake can't \
+                 subscribe; rebuild with CONFIG_INOTIFY_USER=y."
+            );
         }
     }
 }

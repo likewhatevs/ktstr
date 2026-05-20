@@ -8,6 +8,7 @@
 //! Reopens [`impl KtstrVm`](super::KtstrVm) so the canonical struct
 //! definition stays in [`super`].
 
+pub(crate) mod evented_wait;
 mod gate;
 mod kernel_op_dispatch;
 
