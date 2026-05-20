@@ -11,14 +11,20 @@ All dev and CI commands are defined in the `justfile` — run
 `just --list` to see available recipes. CI uses the same recipes.
 
 Pre-PR sanity check: run `just lint && just compile-fail && just
-link-check` locally before opening a PR. These mirror the
-`lint`, `compile-fail`, and `docs-link-check` GitHub Actions jobs
-that run on every push and pull-request; the heavier `test` and
-`coverage` jobs run on self-hosted KVM runners and don't need to
-be run locally.
+link-check` locally before opening a PR. These mirror the `lint`,
+`compile-fail`, and `docs-link-check` GitHub Actions jobs that run
+on every push and pull-request; the heavier `test-x64`,
+`test-arm64`, `coverage-x64`, and `coverage-arm64` jobs run on
+self-hosted KVM runners and don't need to be run locally.
+`just compile-fail` shells `cargo nextest run`, so install
+nextest locally (`cargo install --locked cargo-nextest`) before
+running it.
 
-Doc tooling (only needed if you change `doc/guide/src/` or run
-`just docs` / `just link-check` locally):
+Doc tooling (needed only when you change `doc/guide/src/` and
+want to validate locally): `mdbook` for `just docs` (runs
+`mdbook build && mdbook test`); `mdbook-linkcheck2` + `lychee`
+for `just link-check` (runs `mdbook build`, then `mdbook test`,
+then `lychee` against the rendered HTML).
 
 ```
 cargo install mdbook mdbook-linkcheck2 lychee --locked

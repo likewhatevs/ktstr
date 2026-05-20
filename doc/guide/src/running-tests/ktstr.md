@@ -74,6 +74,7 @@ on all exit paths.
 | `--exec CMD` | -- | Run a command in the VM instead of an interactive shell. The VM exits after the command completes. |
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
 | `--cpu-cap N` | unset | Reserve only N host CPUs for the shell VM (integer ≥ 1). **Requires `--no-perf-mode`** — perf-mode already holds every LLC exclusively, so capping under perf-mode would double-reserve. The planner walks whole LLCs in consolidation- and NUMA-aware order, partial-taking the last LLC so `plan.cpus.len() == N` exactly. Mutually exclusive with `KTSTR_BYPASS_LLC_LOCKS=1`. Also settable via `KTSTR_CPU_CAP` env var (CLI flag wins when both are present). |
+| `--disk SPEC` | unset | Attach an in-memory virtio-blk disk. Format: `[fs=][:size=][:ro]`, e.g. `fs=ext4:size=128MiB`. The disk is created fresh from a cached mkfs template per invocation and torn down on shell exit. |
 
 `cargo ktstr shell` runs the same VM boot flow and differs in one
 respect: it accepts raw image file paths for `--kernel` (e.g.

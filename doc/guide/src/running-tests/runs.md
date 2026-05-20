@@ -9,11 +9,14 @@ pair -- there is no separate "baselines" cache.
 > **Warning:** Re-running the suite at the same kernel and
 > project commit reuses the same directory and **deletes prior
 > sidecars** at the first sidecar write of the new run. To
-> preserve a previous run's outputs, archive the directory
-> elsewhere first (e.g. `mv target/ktstr/6.14-abc1234
-> target/ktstr/6.14-abc1234.archived-{date}`) or commit your
-> changes (or amend to drop a `-dirty` suffix) so the next run
-> lands in a separate snapshot directory.
+> preserve a previous run's outputs, move the directory OUT of
+> the runs root (e.g. `mv target/ktstr/6.14-abc1234
+> ~/ktstr-archives/6.14-abc1234.archived-{date}`) — moving it
+> into a sibling under `target/ktstr/` would still let
+> `cargo ktstr stats list` walk into the archived copy because
+> the listing filter only excludes dotfiles. Alternatively
+> commit your changes (or amend to drop a `-dirty` suffix) so
+> the next run lands in a separate snapshot directory.
 
 ## Layout
 
@@ -29,15 +32,18 @@ target/
 ```
 
 Each subdirectory is keyed `{kernel}-{project_commit}`, where
-`{kernel}` is the kernel version resolved from the directory
-`KTSTR_KERNEL` points at — first the `version` field in its
-`metadata.json`, else the content of
-`include/config/kernel.release`, else `unknown` (when
-`KTSTR_KERNEL` is unset or neither file yields a version) — and
-`{project_commit}` is the project tree's HEAD short hex (7 chars),
-suffixed `-dirty` when the worktree differs from HEAD, or the
-literal `unknown` when the test process is not running inside a
-git repository.
+`{kernel}` is the kernel version resolved from whichever kernel
+selector applies — for a path-form `--kernel ../linux` it comes
+from the directory's `metadata.json:version` field, falling back
+to `include/config/kernel.release`; for a version selector
+(`--kernel 6.14`) or cache-key form, the resolved version is
+recorded directly; `unknown` only appears when no selector yields
+a version. `{project_commit}` is the project tree's HEAD short
+hex (7 chars), suffixed `-dirty` when the worktree differs from
+HEAD, or the literal `unknown` when `detect_project_commit`
+returns `None` — including the "test process not inside a git
+repo" case, but also unreadable cwd, an unborn HEAD with no
+commits, or a corrupt repo state.
 
 The commit is discovered by walking parents of the test process's
 working directory until a `.git` marker is found — for a scheduler
@@ -141,10 +147,11 @@ tree copied off a CI host). They do NOT consult
    the **most recent run's first sidecar timestamp** (the prior
    run's sidecars were pre-cleared at the new run's first write,
    so only the new run's timestamps remain). `ARCH` is the
-   `host.arch` value (`x86_64`, `aarch64`, …) from the run's
-   first sidecar, or `-` when no sidecar carries a populated host
-   context. Rows are ordered by directory mtime, most recent
-   first.
+   `host.arch` value (`x86_64`, `aarch64`, …) from the first
+   sidecar in the directory whose `host` field is populated
+   (sidecars without host context are skipped), or `-` when no
+   sidecar in the run carries one. Rows are ordered by directory
+   mtime, most recent first.
 
 4. **Compare** across dimensions:
 

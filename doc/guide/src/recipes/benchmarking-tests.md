@@ -57,7 +57,9 @@ fn perf_positive(ctx: &Ctx) -> Result<AssertResult> {
 Key points:
 - `performance_mode = true` pins vCPUs and uses hugepages for
   deterministic measurements.
-- `Assert::default_checks()` starts from the standard baseline.
+- `Assert::default_checks()` returns `Assert::NO_OVERRIDES` — an
+  all-`None` baseline. Every gate below is opt-in; nothing fails
+  the test until you call one of the chainable setters.
 - Chain `.min_iteration_rate()`, `.max_gap_ms()`, or
   `.max_p99_wake_latency_ns()` to set gates.
 - `execute_steps_with()` applies the `Assert` during worker checks.
@@ -69,8 +71,13 @@ This confirms that the gates actually catch regressions rather than
 passing vacuously.
 
 Use `expect_err = true` on `#[ktstr_test]` to assert that the test
-fails. The macro wraps the test with `assert!(result.is_err())` and
-disables auto-repro automatically.
+fails. The macro wraps the test in a `match` that requires an
+`Err(_)` return: `Ok(_)` panics with "expected error", `Err(_)`
+returns success. Two error classes are treated as SKIP rather than
+FAIL — kernel-unavailable (`/dev/kvm` missing, KVM disabled) and
+resource-contention (host overload, cpuset acquisition failure) —
+so a negative test that can't even boot doesn't pass vacuously.
+Auto-repro is also disabled automatically.
 
 ```rust,ignore
 use ktstr::declare_scheduler;
@@ -201,15 +208,19 @@ use ktstr::prelude::*;
 
 #[derive(Payload)]
 #[payload(binary = "fio")]
-#[include_files("fio", "bench-helper")]
+#[include_files("bench-helper")]
 #[metric(name = "iops", polarity = HigherBetter, unit = "ops/s")]
 struct FioPayload;
 ```
 
 The generated `FIO` const carries `include_files: &["fio",
-"bench-helper"]`. The macro generates a const named by converting
-the struct name to SCREAMING_SNAKE_CASE (stripping any `Payload`
-suffix), so `FioPayload` → `FIO` and `BenchDriver` → `BENCH_DRIVER`.
+"bench-helper"]` — `binary` is auto-prepended by the macro, so
+naming `"fio"` in `#[include_files(...)]` would result in a
+duplicate that the deduplication step collapses (harmless but
+noise). The macro generates a const named by converting the
+struct name to SCREAMING_SNAKE_CASE; the conversion only strips
+a trailing `Payload`, so `FioPayload` → `FIO` and the suffixless
+`BenchDriver` → `BENCH_DRIVER` unchanged.
 When any `#[ktstr_test]` uses `FIO` as a payload or workload, those
 files get resolved and packed into the initramfs automatically —
 no `-i` flag needed on the CLI.
