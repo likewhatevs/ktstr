@@ -93,7 +93,7 @@ let cb: CaptureCallback = std::sync::Arc::new(|_name| {
 let reg: WatchRegisterCallback = std::sync::Arc::new(|symbol: &str| {
     // Host-side unit tests: record the symbol and return Ok. In a
     // booted VM, the host coordinator's pipeline runs instead —
-    // see arm_user_watchpoint in src/vmm/freeze_coord.rs.
+    // see arm_user_watchpoint in src/vmm/freeze_coord/snapshot.rs.
     println!("would arm watchpoint on {symbol}");
     Ok(())
 });
@@ -165,11 +165,12 @@ let steps = vec![Step {
     hold: HoldSpec::FULL,
 }];
 let result = execute_steps(ctx, steps)?;
-assert!(!result.passed);
-// One AssertDetail carries the cap-exceeded message:
+assert!(result.is_fail());
+// failure_details() yields a detail whose message carries:
 //   "Op::WatchSnapshot cap exceeded: scenario already registered 3
-//    watchpoints (3 user watchpoint slots occupied; slot 0 reserved for the
-//    error-class exit_kind trigger)..."
+//    watchpoints (3 user watchpoint slots occupied; slot 0 reserved for
+//    the error-class exit_kind trigger; drop a watch or use
+//    Op::CaptureSnapshot for a time-driven capture instead)"
 ```
 
 A failed register (cap exceeded, callback error, missing

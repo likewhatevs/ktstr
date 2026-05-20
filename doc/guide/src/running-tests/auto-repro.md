@@ -44,7 +44,7 @@ auto-repro falls back to dynamic BPF program discovery in the repro VM.
      re-reads struct fields after the function executes, capturing
      post-mutation state alongside the entry snapshot.
    - Tracepoint trigger (`tp_btf/sched_ext_exit`) fires inside
-     `scx_claim_exit()` (`kernel/sched/ext.c:5896`) after the
+     `scx_claim_exit()` in `kernel/sched/ext.c` after the
      atomic exit-kind claim succeeds — one-shot per scheduler
      instance, in the context of the current task at exit time,
      before the disable work is queued
@@ -84,13 +84,6 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> { ... }
 
 `auto_repro` defaults to `true` in `#[ktstr_test]`.
 
-## Repro mode
-
-During the second VM run, ktstr sets "repro mode" which disables the
-work-conservation watchdog. Workers normally send SIGUSR2 to the
-scheduler when stuck > 2 seconds. In repro mode, the scheduler stays
-alive so BPF assertion probes can fire.
-
 ## Example output
 
 The `demo_host_crash_auto_repro` test triggers a host-initiated crash
@@ -100,7 +93,7 @@ fexit captures post-mutation state, changed fields show an arrow
 (`→`) between entry and exit values:
 
 ```text
-ktstr_test 'demo_host_crash_auto_repro' [sched=scx-ktstr] [topo=1n1l2c1t] failed:
+ktstr_test 'demo_host_crash_auto_repro' [sched=scx-ktstr] [topo=1n1l4c1t] failed:
   scheduler process died unexpectedly during workload (2.0s into test)
 
 --- auto-repro ---
@@ -117,7 +110,7 @@ ktstr_test 'demo_host_crash_auto_repro' [sched=scx-ktstr] [topo=1n1l2c1t] failed
       weight      100
       sticky_cpu  -1
       scx_flags   QUEUED|ENABLED
-  do_enqueue_task                                               kernel/sched/ext.c:1344
+  do_enqueue_task                                               kernel/sched/ext.c
     rq *rq
       cpu         1
     task_struct *p
@@ -189,7 +182,10 @@ fn scenario_yield_heavy(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-Run manually to see full output:
+Run manually to see full output. The `demo_` prefix
+auto-ignores via `KtstrTestEntry::is_ignored`
+(`src/test_support/dispatch.rs:976-978`), so a bare invocation will
+filter the test out — `--run-ignored ignored-only` is required:
 
 ```sh
 cargo ktstr test --kernel ../linux -- --run-ignored ignored-only -E 'test(demo_host_crash_auto_repro)'

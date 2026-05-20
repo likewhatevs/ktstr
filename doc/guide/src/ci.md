@@ -10,11 +10,13 @@ ktstr boots KVM virtual machines. CI runners must provide:
 - Self-hosted runners or a provider that exposes KVM to the guest
 
 GitHub-hosted `ubuntu-latest` runners do **not** expose `/dev/kvm`.
-Use self-hosted runners with KVM labels:
+Use self-hosted runners with project-specific labels (this repo
+uses `ktstr-x64` and `ktstr-arm64`; substitute your own pool's
+labels):
 
 ```yaml
-runs-on: [self-hosted, X64]                              # x86_64 (minimum labels)
-runs-on: [self-hosted, Linux, kvm, kernel-build, ARM64]  # aarch64 (adjust labels to your runner pool)
+runs-on: [ktstr-x64]    # x86_64 self-hosted KVM runner
+runs-on: [ktstr-arm64]  # aarch64 self-hosted KVM runner
 ```
 
 See [Troubleshooting: /dev/kvm not accessible](troubleshooting.md#devkvm-not-accessible)
@@ -40,7 +42,7 @@ on:
 
 jobs:
   test:
-    runs-on: [self-hosted, X64]
+    runs-on: [ktstr-x64]
     env:
       KTSTR_GHA_CACHE: "1"
     steps:
@@ -132,7 +134,7 @@ Run tests under `cargo ktstr coverage` for coverage reports:
 
 ```yaml
 coverage:
-  runs-on: [self-hosted, X64]
+  runs-on: [ktstr-x64]
   steps:
     - uses: actions/checkout@v5
     - uses: dtolnay/rust-toolchain@stable
@@ -181,7 +183,7 @@ subcommands and options.
 aarch64 runners use the same workflow as x64. Copy the x64 workflow
 above and apply these differences:
 
-- Runner labels: `[self-hosted, Linux, kvm, kernel-build, ARM64]`
+- Runner labels: `[ktstr-arm64]` (or your aarch64 self-hosted pool labels)
   (adjust to match your runner pool).
 - Cache key prefix: `arm64` instead of `x64`.
 - `sccache` must be installed on every runner the workflow targets
@@ -216,7 +218,9 @@ environment variables. The CI-relevant ones are `KTSTR_GHA_CACHE`,
 
 The workspace ships a `ci` nextest profile in `.config/nextest.toml`.
 Compared to the default profile, it raises the slow-timeout
-termination threshold from 2 to 3 cycles (`terminate-after = 3`),
+period from 60s to 90s (`slow-timeout.period = "90s"`), raises
+the termination threshold from 2 to 3 cycles
+(`terminate-after = 3`), bumps `retries.count` from 5 to 30,
 defers per-test output until the run completes
 (`failure-output = "final"`), and continues past failures
 (`fail-fast = false`). Use it with `--profile ci`.

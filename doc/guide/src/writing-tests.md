@@ -10,11 +10,16 @@ use ktstr::prelude::*;
 #[ktstr_test(llcs = 1, cores = 2, threads = 1)]
 fn my_test(ctx: &Ctx) -> Result<AssertResult> {
     execute_defs(ctx, vec![
-        CgroupDef::named("cg_0").workers(2),
-        CgroupDef::named("cg_1").workers(2),
+        ctx.cgroup_def("cg_0"),
+        ctx.cgroup_def("cg_1"),
     ])
 }
 ```
+
+`ctx.cgroup_def("name")` is shorthand for
+`CgroupDef::named("name").workers(ctx.workers_per_cgroup)` — the
+common case. Use `CgroupDef::named(...).workers(N).work_type(...)`
+directly when the test needs to customize worker count or work type.
 
 Run with `cargo ktstr test --kernel ../linux`. See
 [Getting Started](getting-started.md) for setup and

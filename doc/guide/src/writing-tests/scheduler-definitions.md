@@ -40,7 +40,11 @@ test-author surface:
 - The scheduler takes no config → omit both fields.
 
 Setting both fields on the same scheduler is a misconfiguration
-and the framework rejects it at validation time.
+— pick one. The framework currently allows both to coexist (the
+`config_file` path is always packed and prepended; the
+`config_file_def`-driven inline config is written when a per-test
+`config = ...` attribute supplies content), but the resulting
+two-config behavior is rarely intended.
 
 `config_file` packs a host-side file into the initramfs at
 `/include-files/{filename}` and prepends `--config /include-files/{filename}`
@@ -283,10 +287,34 @@ const MITOSIS: Scheduler = Scheduler::named("scx_mitosis")
     .assert(Assert::NO_OVERRIDES.max_imbalance_ratio(2.0));
 ```
 
+The common discover-by-name case has sugar:
+`Scheduler::named("foo").binary_discover()` is shorthand for
+`Scheduler::named("foo").binary(SchedulerSpec::Discover("foo"))`.
+
 A manually-defined `Scheduler` is not registered in
 `KTSTR_SCHEDULERS` automatically; the verifier sweep does not
 see it. Use `declare_scheduler!` for any scheduler that should
 participate in `cargo ktstr verifier`.
+
+## Related test-attribute slots
+
+Two `#[ktstr_test]` attributes shape the scheduler runtime in
+ways that complement what `Scheduler` itself declares. They live
+on the test, not on the scheduler, but their interpretation
+depends on the `Scheduler` being referenced:
+
+- `staged_schedulers = [PATH, …]` — additional `&'static Scheduler`
+  consts packed into the guest at boot. Required for tests that
+  invoke `Op::ReplaceScheduler` / `Op::AttachScheduler` since the
+  swap target must be on disk before the runtime swap happens.
+- `workload_root_cgroup = "/path"` — guest cgroup path under which
+  the framework creates the per-test workload cgroups. Decoupled
+  from the scheduler's `cgroup_parent` (which controls scheduler-side
+  cell rooting) — use this when the test author wants workload
+  cgroups to land at a specific path independent of the scheduler.
+
+See [The #\[ktstr_test\] Macro](ktstr-test-macro.md) for both attributes
+in their authoritative attribute-table context.
 
 ## Cgroup parent
 

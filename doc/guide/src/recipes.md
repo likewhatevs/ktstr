@@ -9,9 +9,11 @@ Standalone examples for common tasks. Each recipe is self-contained.
 >   the `test`, `coverage`, `kernel`, `stats`, `show-host`, `verifier`,
 >   `export`, `shell`, and related workflows. Lives in the
 >   `cargo-ktstr` binary; runs on the host.
-> - **`ktstr <subcommand>`** is the standalone binary used inside the
->   guest VM (or for one-off host operations like `ctprof` capture and
->   `topo`). Lives in the `ktstr` binary.
+> - **`ktstr <subcommand>`** is the standalone binary that doubles as
+>   the guest-init binary AND as a host CLI for `ctprof`, `topo`,
+>   `kernel`, `shell`, `locks`, and `completions`. Lives in the
+>   `ktstr` binary. The `kernel` and `shell` surfaces overlap with
+>   `cargo ktstr` for callers without cargo on PATH.
 >
 > Both binaries are installed by `cargo install ktstr --bin ktstr --bin cargo-ktstr`.
 

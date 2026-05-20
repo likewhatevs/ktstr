@@ -6,16 +6,27 @@
 cargo ktstr test --kernel ../linux -- -E 'test(sched_basic_proportional)'
 ```
 
-## Running with verbose output
+The `-E 'test(NAME)'` form is a nextest filterset expression. `test(NAME)`
+is a substring match against the test name; use `test(=NAME)` for an exact
+match. See nextest's filterset docs for the full grammar.
+
+Integration-feature-gated tests need `--features integration`:
+
+```sh
+cargo ktstr test --kernel ../linux --features integration -- -E 'test(stats_bridge_round_trip)'
+```
+
+## Running with a panic backtrace
 
 ```sh
 RUST_BACKTRACE=1 cargo ktstr test --kernel ../linux -- -E 'test(sched_basic_proportional)'
 ```
 
-## Investigating failures
+`RUST_BACKTRACE=1` controls Rust panic backtraces, not VM console
+verbosity. To stream the guest kernel console (dmesg, scheduler logs),
+use the `--dmesg` flag on `cargo ktstr shell`.
 
-Run one test with verbose output to see scheduler logs and kernel
-console:
+## Investigating failures
 
 ```sh
 RUST_BACKTRACE=1 cargo ktstr test --kernel ../linux -- -E 'test(cover_cgroup_cpuset_cross_llc_race)'

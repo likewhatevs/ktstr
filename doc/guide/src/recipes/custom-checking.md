@@ -22,8 +22,11 @@ declare_scheduler!(RELAXED, {
 });
 ```
 
-These overrides sit between `Assert::default_checks()` and per-test
-overrides in the merge chain.
+These scheduler-level overrides are the FIRST layer that can carry
+any actual check — `Assert::default_checks()` is `Self::NO_OVERRIDES`
+(every field `None`), so without either a scheduler-level or a
+per-test override, no assertions run. Per-test overrides on
+`#[ktstr_test]` merge LAST and win.
 
 ## Per-test overrides via #\[ktstr_test\]
 
@@ -70,6 +73,13 @@ fn my_scenario(ctx: &Ctx) -> Result<AssertResult> {
 `execute_steps` (without `_with`) passes `None`, falling back to
 `ctx.assert` (the merged three-layer config: `default_checks` ->
 scheduler -> per-test).
+
+For post_vm callbacks that build assertions via `Verdict`, use
+`v.into_anyhow_or_log()` to close the verdict — it returns
+`Ok(())` on pass and `Err(_)` (with full failure-detail rendering)
+on fail, which is exactly what a `post_vm` callback wants. The
+older `AssertResult::into_anyhow_or_log` does the same for the
+direct-AssertResult path.
 
 See [Ops and Steps](../concepts/ops.md) for the full step execution
 model.

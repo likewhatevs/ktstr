@@ -39,10 +39,12 @@ See [CgroupGroup](../architecture/cgroup-group.md) for drop semantics.
 > example above is required — `use ktstr::prelude::*;` alone does
 > not bring them into scope.
 
-**`collect_all(handles, checks)`** -- stops all workers, collects reports,
-runs worker-level checks when configured, otherwise falls back to
-`assert_not_starved()`. Merges results: if any worker group fails, the
-overall result fails.
+**`collect_all(handles, checks)`** -- stops all workers, collects
+reports, runs worker-level checks when `checks.has_worker_checks()`
+is true; when no worker checks are configured the merge step is
+skipped entirely and the result stays `pass` (no implicit
+"`assert_not_starved` fallback"). Merges results: if any worker
+group fails an enabled check, the overall result fails.
 
 **`dfl_wl(ctx)`** -- creates a `WorkloadConfig` with
 `ctx.workers_per_cgroup` workers and default settings.
@@ -69,8 +71,15 @@ pub struct Ctx<'a> {
     pub work_type_override: Option<WorkType>,
     pub assert: Assert,
     pub wait_for_map_write: bool,
+    pub current_step: Arc<AtomicU16>,
 }
 ```
+
+`current_step` is the live phase counter — `0` during BASELINE,
+`1..=N` while step ordinal N is running. Read via
+`ctx.current_step.load(Ordering::Acquire)` to gate scenario-side
+behavior on phase. The host-side periodic-capture pipeline stamps
+each capture with the same value.
 
 **`cgroups`** -- create/remove cgroups, set cpusets, move tasks. The
 slot is a `&dyn CgroupOps` trait object, not a concrete

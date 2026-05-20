@@ -33,14 +33,22 @@ The spread-default pattern is safe for `WorkloadConfig` specifically
 because its `Default::default()` produces a known-good single-worker
 `SpinWait` baseline that runs without further setup. Do NOT extrapolate
 this guidance to every ktstr type without checking each type's
-`Default` semantics — some have known footguns (e.g. `CgroupDef::default()`
-produces `name = "cg_0"` which collides with the conventional first
-cgroup name in most scenarios). Prefer the named constructors
-(`CgroupDef::named(...)`, `Setup::Defs(...)`, etc.) for types where the
-`Default` is not unambiguously useful.
+`Default` semantics — for instance, `CgroupDef` has **no** `Default`
+impl precisely because a derived `name = ""` would silently produce
+an invalid cgroup. Use the named constructor `CgroupDef::named(...)`
+(and `Setup::Defs(...)`, etc.) instead.
 
-`spawn()` forks `num_workers` child processes. Each child installs a
-SIGUSR1 handler, then blocks on a pipe waiting for the start signal.
+`spawn()` creates `num_workers` worker tasks. The exact shape depends
+on `CloneMode`:
+- **`CloneMode::Fork`** (default): forks N child processes; each child
+  installs a SIGUSR1 handler, then blocks on a pipe waiting for the
+  start signal.
+- **`CloneMode::Thread`**: spawns N threads inside the spawner; they
+  block on a sync channel until `start()` flips a shared flag.
+- **`pcomm` containers**: spawns ONE container process that hosts N
+  threads internally (used when a `WorkSpec::pcomm` is set; the
+  container is named accordingly).
+
 Workers do not begin their workload until `start()` is called.
 
 For grouped work types (the full set: `PipeIo`, `CachePipe`,
@@ -87,11 +95,18 @@ workload's run window to sample forward progress (e.g. to detect stalls
 or compute instantaneous rates); the final per-worker totals come back
 through `stop_and_collect()`.
 
-**`stop_and_collect(self) -> Vec<WorkerReport>`** -- sends SIGUSR1 to
-all workers, reads their serialized `WorkerReport` from report pipes,
-and waits for exit. Auto-starts workers if `start()` was not called.
-Workers that do not respond within a shared 5-second deadline are
-killed with SIGKILL. Consumes the handle.
+**`stop_and_collect(self) -> Vec<WorkerReport>`** -- signals
+workers to stop (SIGUSR1 to fork-mode children; per-thread stop
+flag for thread-mode), then reads their serialized `WorkerReport`
+from report pipes with a shared 5-second collect deadline.
+Auto-starts workers if `start()` was not called. SIGKILL fires
+unconditionally after the read (or on deadline expiry without a
+report) to reap zombies. Consumes the handle. Each `WorkerReport`
+carries `work_units`, `tid`, optional `affinity_error`, and an
+optional `exit_info` discriminator (`Panicked` / `TimedOut` /
+`Killed` / `WaitFailed(errno)` / `Exited(code)`) — see
+[`WorkerReport`](workers.md) for the full shape and the
+sentinel-vs-real-report distinction.
 
 ## Typical usage
 
