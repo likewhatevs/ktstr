@@ -5128,14 +5128,31 @@ impl KtstrVm {
                                     // will not SET because the
                                     // RefCell stays None.
                                     if !skip_freeze {
-                                        let captured = kvm::kvm_get_clock_via_raw_fd(
-                                            vm_fd_raw_for_freeze,
-                                        );
-                                        if let Err(ref e) = captured {
-                                            warn_kvm_clock_failure("GET_CLOCK", e);
+                                        // kvm_clock save/restore is x86_64
+                                        // only — aarch64 KVM does not
+                                        // expose KVM_GET_CLOCK / KVM_SET_CLOCK
+                                        // (pvclock is x86-specific). On
+                                        // aarch64 the guest timer uses
+                                        // CNTVCT_EL0 which the host KVM
+                                        // does not freeze, so the
+                                        // freeze-rendezvous time-skew
+                                        // mitigation doesn't apply.
+                                        #[cfg(target_arch = "x86_64")]
+                                        {
+                                            let captured = kvm::kvm_get_clock_via_raw_fd(
+                                                vm_fd_raw_for_freeze,
+                                            );
+                                            if let Err(ref e) = captured {
+                                                warn_kvm_clock_failure("GET_CLOCK", e);
+                                            }
+                                            *kvm_clock_save_for_freeze.borrow_mut() =
+                                                captured.ok();
                                         }
-                                        *kvm_clock_save_for_freeze.borrow_mut() =
-                                            captured.ok();
+                                        #[cfg(not(target_arch = "x86_64"))]
+                                        {
+                                            let _ = vm_fd_raw_for_freeze;
+                                            let _ = &kvm_clock_save_for_freeze;
+                                        }
                                     }
                                     break;
                                 }
@@ -6237,6 +6254,12 @@ impl KtstrVm {
                         // as a single warn log; guest sees
                         // freeze duration as elapsed kvm_clock
                         // if the restore fails.
+                        // kvm_clock SET — x86_64-only, matching the
+                        // GET site above. Aarch64 path's
+                        // `kvm_clock_save_for_freeze` stays empty
+                        // (the GET-arm is cfg-skipped); the take()
+                        // would be None anyway.
+                        #[cfg(target_arch = "x86_64")]
                         if let Some(mut clock) =
                             kvm_clock_save_for_freeze.borrow_mut().take()
                         {
@@ -6247,6 +6270,11 @@ impl KtstrVm {
                             ) {
                                 warn_kvm_clock_failure("SET_CLOCK", &e);
                             }
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        {
+                            let _ = vm_fd_raw_for_freeze;
+                            let _ = &kvm_clock_save_for_freeze;
                         }
                         freeze_coord_freeze.store(false, Ordering::Release);
                         let _ = freeze_coord_thaw_evt.write(1);
@@ -11445,12 +11473,13 @@ impl KtstrVm {
             // On aarch64 MSR_LSTAR has no equivalent so the BSP
             // path is unavailable; the guest-channel KERN_ADDRS
             // publisher is the sole source on that architecture.
-            // Reference the two args once so the compiler's
+            // Reference the args once so the compiler's
             // dead-code analysis doesn't fire on aarch64 builds.
             #[cfg(not(target_arch = "x86_64"))]
             {
                 let _ = entry_syscall_64_link_kva;
                 let _ = kern_virt_kaslr_shared;
+                let _ = kern_virt_kaslr_evt;
             }
             // Honour a pending freeze before re-entering KVM_RUN.
             // Same drain-dance + park pattern as the AP run loop —

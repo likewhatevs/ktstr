@@ -156,6 +156,21 @@ pub mod aarch64;
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
 
+/// Lower bound for canonical kernel-half virtual addresses, valid
+/// on both x86_64 (4-level paging) and aarch64 (VA_BITS=48). On
+/// x86_64 5-level paging the canonical lower bound is
+/// `0xFF00_0000_0000_0000`, but kernel symbols always live in the
+/// classic upper half so `0xFFFF_8000_0000_0000` is the right
+/// conservative threshold for "this looks like a kernel KVA"
+/// checks (KERN_ADDRS payload validation, watchpoint arm
+/// pre-checks, etc.). x86_64's `msr_kaslr::KERNEL_HALF_CANONICAL_4LEVEL`
+/// is the same value retained under the more specific name for
+/// the LSTAR-derive path; this cross-arch alias exists so
+/// freeze_coord and related callers don't need to reach into
+/// `x86_64::msr_kaslr` (which is x86-only and breaks aarch64
+/// builds).
+pub(crate) const KERNEL_HALF_CANONICAL: u64 = 0xFFFF_8000_0000_0000;
+
 // `acpi`, `boot`, `mptable` are re-exported as part of the public arch
 // surface for downstream tooling. mod.rs itself does not consume them
 // directly (boot/setup pipeline lives in `setup.rs` and reaches them

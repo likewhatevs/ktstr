@@ -28,7 +28,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 use super::super::vcpu::{ImmediateExitHandle, WatchpointArm, vcpu_signal};
 use super::state::SnapshotRequest;
-use crate::vmm::x86_64::msr_kaslr::KERNEL_HALF_CANONICAL_4LEVEL;
+use crate::vmm::KERNEL_HALF_CANONICAL as KERNEL_HALF_CANONICAL_4LEVEL;
 
 /// Frame a `MSG_TYPE_SNAPSHOT_REPLY` TLV — header (16 bytes) plus
 /// [`crate::vmm::wire::SnapshotReplyPayload`] (520 bytes) — into a

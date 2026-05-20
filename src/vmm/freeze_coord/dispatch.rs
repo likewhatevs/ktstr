@@ -29,7 +29,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 use super::snapshot::decode_snapshot_request;
 use super::state::SnapshotRequest;
-use crate::vmm::x86_64::msr_kaslr::KERNEL_HALF_CANONICAL_4LEVEL;
+use crate::vmm::KERNEL_HALF_CANONICAL as KERNEL_HALF_CANONICAL_4LEVEL;
 
 /// Aggregate of the coordinator-side sinks the TOKEN_TX dispatch can
 /// touch. Bundling them keeps the [`dispatch_bulk_message`] signature
