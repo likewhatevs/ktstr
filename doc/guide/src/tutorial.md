@@ -251,9 +251,9 @@ through explicit phases.
 `WorkType::Sequence { first: Phase, rest: Vec<Phase> }` runs each
 phase for its specified duration and then advances to the next; when
 the last phase ends the loop restarts from `first`. Phases:
-`Phase::Spin(Duration)`, `Phase::Sleep(Duration)`,
-`Phase::Yield(Duration)`, `Phase::Io(Duration)`,
-`Phase::AluHot { width: AluWidth, duration: Duration }`. Use the
+`WorkPhase::Spin(Duration)`, `WorkPhase::Sleep(Duration)`,
+`WorkPhase::Yield(Duration)`, `WorkPhase::Io(Duration)`,
+`WorkPhase::AluHot { width: AluWidth, duration: Duration }`. Use the
 `WorkType::sequence(first, rest)` constructor.
 
 `Phase`, `WorkType`, `CpusetSpec`, and `AluWidth` are all in
@@ -279,8 +279,8 @@ fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
         CgroupDef::named("phased_worker")
             .workers(2)
             .work_type(WorkType::sequence(
-                Phase::Spin(Duration::from_millis(100)),
-                [Phase::Yield(Duration::from_millis(20))],
+                WorkPhase::Spin(Duration::from_millis(100)),
+                [WorkPhase::Yield(Duration::from_millis(20))],
             ))
             .cpuset(CpusetSpec::Llc(1)),
     ])
@@ -300,7 +300,7 @@ phasing happens *within* each `phased_worker` worker's loop, while
 `HoldSpec::FULL`. To express phasing across cgroups (e.g. add
 `phased_worker` only for the second half of the run), use
 `execute_steps` with multiple `Step` entries -- see
-[Ops and Steps](concepts/ops.md). Step 9 below adds an `Op::snapshot`
+[Ops and Steps](concepts/ops.md). Step 9 below adds an `Op::capture_snapshot`
 capture into a step's op list.
 
 ## Step 6: Tune execution
@@ -311,8 +311,8 @@ longer / heavier runs:
 
 | Attribute | Default | What it does |
 |---|---|---|
-| `duration_s` | `12` | Per-scenario wall-clock seconds. The framework keeps both cgroups running for `duration_s` seconds, then signals workers to stop and collects reports. |
-| `watchdog_timeout_s` | `5` | sched_ext watchdog fire threshold. Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels and the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override silently no-ops. |
+| `duration_s` | `2` | Per-scenario wall-clock seconds. The framework keeps both cgroups running for `duration_s` seconds, then signals workers to stop and collects reports. |
+| `watchdog_timeout_s` | `4` | sched_ext watchdog fire threshold. Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels and the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override silently no-ops. |
 | `memory_mib` | `2048` | VM memory in MiB. |
 
 `watchdog_timeout_s` is sched_ext's per-task stall threshold — if
@@ -390,8 +390,8 @@ fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
         CgroupDef::named("phased_worker")
             .workers(2)
             .work_type(WorkType::sequence(
-                Phase::Spin(Duration::from_millis(100)),
-                [Phase::Yield(Duration::from_millis(20))],
+                WorkPhase::Spin(Duration::from_millis(100)),
+                [WorkPhase::Yield(Duration::from_millis(20))],
             ))
             .cpuset(CpusetSpec::Llc(1)),
     ])
@@ -508,7 +508,7 @@ see [Running Tests](running-tests.md).
 ## Step 9: Capture a snapshot
 
 Threshold-based assertions tell you something is off; snapshots tell
-you *what* the scheduler's state actually was. `Op::snapshot(name)`
+you *what* the scheduler's state actually was. `Op::capture_snapshot(name)`
 asks the host to freeze every vCPU long enough to read the BPF
 (in-kernel program) map state, vCPU registers, and per-CPU counters
 into a `FailureDumpReport` keyed by `name`, then resumes the guest.
@@ -516,7 +516,7 @@ into a `FailureDumpReport` keyed by `name`, then resumes the guest.
 `execute_defs` (used so far) takes a flat list of cgroups and runs
 them concurrently. To inject a snapshot mid-run, switch to
 `execute_steps`, which takes a list of `Step`s — each step has
-`setup` cgroups, an `ops` list (where `Op::snapshot(...)` lives),
+`setup` cgroups, an `ops` list (where `Op::capture_snapshot(...)` lives),
 and a `hold` duration:
 
 ```rust,ignore
@@ -536,7 +536,7 @@ fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
                     .work_type(WorkType::SpinWait)
                     .cpuset(CpusetSpec::Llc(1)),
             ]),
-            ops: vec![Op::snapshot("after_workload")],
+            ops: vec![Op::capture_snapshot("after_workload")],
             hold: HoldSpec::FULL,
         },
     ])
@@ -698,7 +698,7 @@ for the full lifecycle.
 
 ## Step 14: Periodic capture and temporal assertions
 
-On-demand `Op::snapshot` (Step 9) captures the scheduler's BPF state
+On-demand `Op::capture_snapshot` (Step 9) captures the scheduler's BPF state
 at a point you choose. **Periodic capture** fires automatically at
 evenly-spaced points across the workload window, producing a
 time-ordered `SampleSeries` (the host-side container of drained
@@ -716,22 +716,18 @@ drains the bridge and runs assertions over the time-ordered series:
 use ktstr::prelude::*;
 
 fn check_dispatch_advances(result: &VmResult) -> Result<()> {
-    let series = SampleSeries::from_drained(
+    let series = SampleSeries::from_drained_typed(
         result.snapshot_bridge.drain_ordered_with_stats(),
+        result.monitor.clone(),
     )
     .periodic_only();
 
     let mut v = Verdict::new();
 
-    let nr_dispatched: SeriesField<u64> = series.bpf(
-        "nr_dispatched",
-        |snap| snap.var("nr_dispatched").as_u64(),
-    );
+    let nr_dispatched: SeriesField<u64> = series.bpf_live_u64("nr_dispatched");
     nr_dispatched.nondecreasing(&mut v);
 
-    let r = v.into_result();
-    anyhow::ensure!(r.passed, "temporal assertions failed: {:?}", r.details);
-    Ok(())
+    v.into_anyhow_or_log()
 }
 
 #[ktstr_test(
@@ -840,22 +836,18 @@ declare_scheduler!(KTSTR_SCHED, {
 });
 
 fn check_dispatch_advances(result: &VmResult) -> Result<()> {
-    let series = SampleSeries::from_drained(
+    let series = SampleSeries::from_drained_typed(
         result.snapshot_bridge.drain_ordered_with_stats(),
+        result.monitor.clone(),
     )
     .periodic_only();
 
     let mut v = Verdict::new();
 
-    let nr_dispatched: SeriesField<u64> = series.bpf(
-        "nr_dispatched",
-        |snap| snap.var("nr_dispatched").as_u64(),
-    );
+    let nr_dispatched: SeriesField<u64> = series.bpf_live_u64("nr_dispatched");
     nr_dispatched.nondecreasing(&mut v);
 
-    let r = v.into_result();
-    anyhow::ensure!(r.passed, "temporal assertions failed: {:?}", r.details);
-    Ok(())
+    v.into_anyhow_or_log()
 }
 
 #[ktstr_test(
@@ -881,8 +873,8 @@ fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
         CgroupDef::named("phased_worker")
             .workers(2)
             .work_type(WorkType::sequence(
-                Phase::Spin(Duration::from_millis(100)),
-                [Phase::Yield(Duration::from_millis(20))],
+                WorkPhase::Spin(Duration::from_millis(100)),
+                [WorkPhase::Yield(Duration::from_millis(20))],
             ))
             .cpuset(CpusetSpec::Llc(1)),
     ])
@@ -909,7 +901,7 @@ struct fields appear inline, with `→` between fentry-captured
 entry values and fexit-captured exit values:
 
 ```text
-ktstr_test 'demo_host_crash_auto_repro' [sched=scx-ktstr] [topo=1n1l2c1t] failed:
+ktstr_test 'demo_host_crash_auto_repro' [sched=scx-ktstr] [topo=1n1l4c1t] failed:
   scheduler died
 
 --- auto-repro ---

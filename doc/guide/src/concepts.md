@@ -1,28 +1,37 @@
 # Core Concepts
 
-ktstr tests compose from four layers:
+ktstr tests compose from three layers:
 
-1. **Scenarios** -- what to test: cgroup layout, CPU partitioning,
-   workloads, custom logic.
+1. **[Scenarios](concepts/scenarios.md)** -- what to test: cgroup
+   layout, CPU partitioning, workloads, custom logic. Composed from
+   `Step`s; each `Step` carries a list of [`Op`s](concepts/ops.md)
+   plus a hold spec.
 
-2. **Flags** -- which scheduler features to enable for each run.
+2. **[WorkType](concepts/work-types.md)** -- what each worker
+   process does: CPU spin, yield, I/O, bursty patterns, pipe-based
+   IPC, signal storms, lock contention, page-fault churn, etc.
 
-3. **WorkType** -- what each worker process does: CPU spin, yield,
-   I/O, bursty patterns, pipe-based IPC.
+3. **[Checking](concepts/checking.md)** -- how to evaluate results:
+   starvation, fairness, isolation, scheduling gaps, monitor
+   thresholds, temporal patterns.
 
-4. **Checking** -- how to evaluate results: starvation, fairness,
-   isolation, scheduling gaps, monitor thresholds.
+These compose orthogonally. A scenario runs with every valid
+topology and checks apply uniformly across all runs.
 
-These compose orthogonally. A scenario runs with every valid flag
-combination, and checks apply uniformly across all runs.
+Five supporting concepts complete the picture:
 
-Four supporting concepts complete the picture:
-[Ops and Steps](concepts/ops.md) is the primary API for defining
-scenarios -- most tests use `CgroupDef` and `execute_defs` from
-this module. [TestTopology](concepts/topology.md) provides CPU and
-LLC layout for cpuset partitioning.
-[Performance Mode](concepts/performance-mode.md) applies host-side
-isolation for noise-sensitive measurements.
-[Resource Budget](concepts/resource-budget.md) describes the
-`--cpu-cap` tier that coordinates concurrent no-perf-mode VMs and
-kernel builds via LLC flocks and cgroup v2 cpuset sandboxes.
+- [Ops and Steps](concepts/ops.md) — the primary API for defining
+  scenarios. Most tests use `CgroupDef` + `execute_defs`; tests that
+  need mid-scenario state changes (snapshot, replace scheduler,
+  read/write kernel memory) compose `Op`s into `Step`s and feed
+  them to `execute_steps` or `execute_scenario`.
+- [TestTopology](concepts/topology.md) — CPU and LLC layout for
+  cpuset partitioning.
+- [MemPolicy](concepts/mem-policy.md) — per-cgroup NUMA memory
+  policy (Bind / Preferred / Interleave / WeightedInterleave) for
+  tests that exercise the memory policy subsystem.
+- [Performance Mode](concepts/performance-mode.md) — host-side
+  isolation for noise-sensitive measurements.
+- [Resource Budget](concepts/resource-budget.md) — the `--cpu-cap`
+  tier that coordinates concurrent no-perf-mode VMs and kernel
+  builds via LLC flocks and cgroup v2 cpuset sandboxes.

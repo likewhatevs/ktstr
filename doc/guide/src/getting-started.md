@@ -36,11 +36,16 @@ sudo dnf install clang pkgconf make gcc autoconf gettext-devel flex bison gawk
 
 ```sh
 cargo install cargo-nextest           # required
-cargo install --locked ktstr --bin ktstr --bin cargo-ktstr   # both user-facing binaries (optional)
+cargo install --locked ktstr --bin ktstr --bin cargo-ktstr   # required
 ```
 
 `cargo-nextest` is required. `cargo ktstr test` delegates to nextest
 internally; without it, `cargo ktstr test` will fail.
+
+`cargo-ktstr` and `ktstr` are also required — every primary
+workflow verb in this guide (`cargo ktstr kernel build`, `cargo
+ktstr test`, `cargo ktstr shell`, `ktstr ctprof`) lives on these
+two binaries.
 
 `cargo install --locked ktstr --bin ktstr --bin cargo-ktstr`
 installs the two user-facing binaries (`ktstr` host-side CLI and
@@ -247,12 +252,19 @@ return assertion results. `Ctx` provides the guest topology
 
 ### What gets checked
 
-Every test automatically checks for worker starvation, scheduling
-fairness, scheduling gaps, and host-side runqueue health (including imbalance,
-stalls, dispatch queue depth). These defaults come from
-`Assert::default_checks()` and can be overridden per-scheduler or
-per-test. See [Checking](concepts/checking.md) for the full
-list of checks and thresholds.
+**Nothing, by default.** `Assert::default_checks()` is the all-`None`
+identity (`Self::NO_OVERRIDES`) — every worker check, fairness check,
+monitor threshold, and starvation gate is **opt-in**. A bare
+`#[ktstr_test]` boots the VM, runs the scenario, and reports `pass`
+even if the scheduler stalled, starved workers, or never dispatched
+a task.
+
+To turn checks ON, set the corresponding attribute on the test (or
+on the scheduler the test references) — `not_starved = true`,
+`max_gap_ms = 3000`, `max_imbalance_ratio = 4.0`, etc. The
+[Checking](concepts/checking.md) page enumerates every gate and its
+threshold; [Customize Checking](recipes/custom-checking.md) shows
+the override flow.
 
 ## Run
 

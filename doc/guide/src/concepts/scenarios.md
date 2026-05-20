@@ -2,7 +2,21 @@
 
 Scenarios define the scheduling conditions a test creates. Each
 scenario sets up cgroups, workers, and cpusets to produce a specific
-condition, then verifies the scheduler handles it correctly.
+condition. The `#[ktstr_test]` harness invokes the scenario, captures
+the result, and applies whichever checks the test author opted in
+to (see [Checking](checking.md)).
+
+A scenario is one of:
+
+- A **canned** function from `scenarios::*` (the table below) —
+  picked up by name and called as `scenarios::steady(ctx)`.
+- A **custom** function with signature
+  `fn(&Ctx) -> Result<AssertResult>` ([Custom Scenarios](../writing-tests/custom-scenarios.md)).
+- A **step composition** built from `Step` + `Op` and run via
+  `execute_steps(ctx, vec![...])` or `execute_scenario(ctx,
+  Backdrop::from_cgroups(...), vec![...])` for scenarios that need
+  cross-step state (a long-lived `Backdrop` cgroup set, payload
+  handles, kernel-write seeds — see [Ops and Steps](ops.md)).
 
 ## Canned scenarios (`scenarios::*`)
 
@@ -42,8 +56,21 @@ nested, performance, stress}`. See the
 for the full list.
 
 Most tests use these canned functions or build custom scenarios with
-`CgroupDef` and `execute_defs` / `execute_steps` (see
-[Ops and Steps](ops.md)). Custom scenarios receive a `Ctx` reference
-and use the same building blocks; see
+`CgroupDef` and the executors in `ktstr::scenario::ops`. The five
+executor entry points (all in the prelude):
+
+- `execute_defs(ctx, Vec<CgroupDef>)` — one-shot cgroup setup, run
+  for the full duration, collect reports.
+- `execute_steps(ctx, Vec<Step>)` / `execute_steps_with(ctx,
+  Vec<Step>, Option<&Assert>)` — multi-step composition without a
+  long-lived backdrop.
+- `execute_scenario(ctx, Backdrop, Vec<Step>)` /
+  `execute_scenario_with(ctx, Backdrop, Vec<Step>, Option<&Assert>)`
+  — full composition. Use when a `Backdrop` (long-lived cgroups,
+  persistent payloads, kernel-write seeds) must coexist with
+  per-step ops; see the [Backdrop](../writing-tests/custom-scenarios.md)
+  guide.
+
+Custom scenarios receive a `Ctx` reference; see
 [Custom Scenarios](../writing-tests/custom-scenarios.md) for the
 `Ctx` struct and helper functions.
