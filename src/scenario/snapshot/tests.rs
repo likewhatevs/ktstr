@@ -59,6 +59,7 @@ fn synthetic_report() -> FailureDumpReport {
                                 bits: 32,
                                 value: 1,
                                 variant: Some("SCHED_NORMAL".into()),
+                                is_signed: false,
                             },
                         },
                     ],
@@ -3591,4 +3592,244 @@ fn json_field_as_bool_array_rejects_mixed() {
         field.as_bool_array(),
         Err(SnapshotError::TypeMismatch { .. })
     ));
+}
+
+#[test]
+fn snapshot_field_as_u32_array_on_percpu_key_returns_type_mismatch() {
+    let field = SnapshotField::PercpuKey { key: 7 };
+    let err = field
+        .as_u32_array()
+        .expect_err("percpu key has no array shape");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("percpu key"),
+        "diagnostic must name the percpu-key actual type so the operator \
+         knows the cpu-narrowing went wrong, not the array request: {msg}"
+    );
+}
+
+#[test]
+fn snapshot_field_as_u64_array_on_percpu_key_returns_type_mismatch() {
+    let field = SnapshotField::PercpuKey { key: 42 };
+    let err = field
+        .as_u64_array()
+        .expect_err("percpu key has no array shape");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("percpu key"),
+        "diagnostic must name the percpu-key actual type: {msg}"
+    );
+}
+
+#[test]
+fn snapshot_field_as_i64_array_on_percpu_key_returns_type_mismatch() {
+    let field = SnapshotField::PercpuKey { key: 9 };
+    let err = field
+        .as_i64_array()
+        .expect_err("percpu key has no array shape");
+    assert!(err.to_string().contains("percpu key"));
+}
+
+#[test]
+fn snapshot_field_as_f64_array_on_percpu_key_returns_type_mismatch() {
+    let field = SnapshotField::PercpuKey { key: 11 };
+    let err = field
+        .as_f64_array()
+        .expect_err("percpu key has no array shape");
+    assert!(err.to_string().contains("percpu key"));
+}
+
+#[test]
+fn snapshot_field_as_bool_array_on_percpu_key_returns_type_mismatch() {
+    let field = SnapshotField::PercpuKey { key: 5 };
+    let err = field
+        .as_bool_array()
+        .expect_err("percpu key has no array shape");
+    assert!(err.to_string().contains("percpu key"));
+}
+
+#[test]
+fn snapshot_field_iter_members_walks_array_of_struct() {
+    let arr = RenderedValue::Array {
+        len: 3,
+        elements: vec![
+            RenderedValue::Struct {
+                type_name: Some("entry".into()),
+                members: vec![
+                    RenderedMember {
+                        name: "id".into(),
+                        value: uint_v(10),
+                    },
+                    RenderedMember {
+                        name: "weight".into(),
+                        value: uint_v(100),
+                    },
+                ],
+            },
+            RenderedValue::Struct {
+                type_name: Some("entry".into()),
+                members: vec![
+                    RenderedMember {
+                        name: "id".into(),
+                        value: uint_v(20),
+                    },
+                    RenderedMember {
+                        name: "weight".into(),
+                        value: uint_v(200),
+                    },
+                ],
+            },
+            RenderedValue::Struct {
+                type_name: Some("entry".into()),
+                members: vec![
+                    RenderedMember {
+                        name: "id".into(),
+                        value: uint_v(30),
+                    },
+                    RenderedMember {
+                        name: "weight".into(),
+                        value: uint_v(300),
+                    },
+                ],
+            },
+        ],
+    };
+    let field = SnapshotField::Value(&arr);
+    let ids: Vec<u64> = field
+        .iter_members()
+        .filter_map(|el| el.get("id").as_u64().ok())
+        .collect();
+    assert_eq!(ids, vec![10, 20, 30]);
+}
+
+#[test]
+fn snapshot_field_iter_members_peels_ptr_deref() {
+    let arr_inner = RenderedValue::Array {
+        len: 2,
+        elements: vec![uint_v(7), uint_v(11)],
+    };
+    let ptr_to_arr = RenderedValue::Ptr {
+        value: 0xffff_8000_0000_2000,
+        deref: Some(Box::new(arr_inner)),
+        deref_skipped_reason: None,
+        cast_annotation: None,
+    };
+    let field = SnapshotField::Value(&ptr_to_arr);
+    let scalars: Vec<u64> = field
+        .iter_members()
+        .filter_map(|el| el.as_u64().ok())
+        .collect();
+    assert_eq!(scalars, vec![7, 11]);
+}
+
+#[test]
+fn snapshot_field_iter_members_peels_truncated() {
+    let arr_inner = RenderedValue::Array {
+        len: 5,
+        elements: vec![uint_v(1), uint_v(2), uint_v(3)],
+    };
+    let trunc = RenderedValue::Truncated {
+        needed: 5 * 8,
+        had: 3 * 8,
+        partial: Box::new(arr_inner),
+    };
+    let field = SnapshotField::Value(&trunc);
+    let scalars: Vec<u64> = field
+        .iter_members()
+        .filter_map(|el| el.as_u64().ok())
+        .collect();
+    assert_eq!(scalars, vec![1, 2, 3]);
+}
+
+#[test]
+fn snapshot_field_iter_members_yields_empty_for_non_array_shapes() {
+    let scalar = uint_v(42);
+    assert_eq!(SnapshotField::Value(&scalar).iter_members().count(), 0);
+
+    let s = RenderedValue::Struct {
+        type_name: None,
+        members: vec![RenderedMember {
+            name: "x".into(),
+            value: uint_v(1),
+        }],
+    };
+    assert_eq!(SnapshotField::Value(&s).iter_members().count(), 0);
+
+    assert_eq!(
+        SnapshotField::PercpuKey { key: 3 }.iter_members().count(),
+        0
+    );
+
+    let missing = SnapshotField::Missing(SnapshotError::VarNotFound {
+        requested: "x".into(),
+        available: vec![],
+    });
+    assert_eq!(missing.iter_members().count(), 0);
+}
+
+#[test]
+fn json_field_iter_members_walks_array_of_object() {
+    use serde_json::json;
+    let v = json!({
+        "entries": [
+            {"id": 10, "weight": 100},
+            {"id": 20, "weight": 200},
+            {"id": 30, "weight": 300},
+        ],
+    });
+    let field = stats_path(&v, "entries");
+    let ids: Vec<u64> = field
+        .iter_members()
+        .filter_map(|el| el.get("id").as_u64().ok())
+        .collect();
+    assert_eq!(ids, vec![10, 20, 30]);
+}
+
+#[test]
+fn json_field_iter_members_yields_empty_for_non_array() {
+    use serde_json::json;
+    let scalar = json!(42);
+    assert_eq!(stats_path(&scalar, "").iter_members().count(), 0);
+
+    let obj = json!({"a": 1, "b": 2});
+    assert_eq!(stats_path(&obj, "").iter_members().count(), 0);
+
+    let missing_root = json!({"a": 1});
+    assert_eq!(
+        stats_path(&missing_root, "missing").iter_members().count(),
+        0
+    );
+
+    // JSON null is its own variant — verify iter_members doesn't
+    // treat it as array.
+    let null = json!(null);
+    assert_eq!(stats_path(&null, "").iter_members().count(), 0);
+}
+
+#[test]
+fn json_field_iter_members_walks_array_of_arrays() {
+    use serde_json::json;
+    let v = json!([[1, 2, 3], [4, 5, 6]]);
+    // Each yielded element is itself a JSON array; iter_members on
+    // each yields its scalar elements. Validates that the empty-
+    // iterator fallback doesn't swallow nested arrays.
+    let sums: Vec<u64> = stats_path(&v, "")
+        .iter_members()
+        .map(|inner| inner.iter_members().filter_map(|e| e.as_u64().ok()).sum())
+        .collect();
+    assert_eq!(sums, vec![6, 15]);
+}
+
+#[test]
+fn snapshot_field_iter_members_on_empty_array_yields_nothing() {
+    // Empty Array {len: 0, elements: vec![]} — separately from the
+    // non-array-shapes case, pin that an explicitly-empty array
+    // matches the empty-iterator contract (no surprise yield of a
+    // placeholder element).
+    let empty = RenderedValue::Array {
+        len: 0,
+        elements: vec![],
+    };
+    let field = SnapshotField::Value(&empty);
+    assert_eq!(field.iter_members().count(), 0);
 }

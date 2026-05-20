@@ -96,8 +96,16 @@ const MAX_RENDER_DEPTH: u32 = 32;
 #[allow(dead_code)]
 pub enum RenderedValue {
     /// Signed integer. `bits` is the BTF-declared width.
+    ///
+    /// **Always signed by construction.** The internal `render_int`
+    /// routes `BTF_KIND_INT` with `is_signed() = false` to
+    /// [`Self::Uint`]; `is_signed() = true` to [`Self::Int`]. The
+    /// variant choice IS the signedness tag — no equivalent of
+    /// `Enum::is_signed` is needed because unsigned ints never land
+    /// here.
     Int { bits: u32, value: i64 },
-    /// Unsigned integer. `bits` is the BTF-declared width.
+    /// Unsigned integer. `bits` is the BTF-declared width. See the
+    /// signedness-by-variant note on [`Self::Int`].
     Uint { bits: u32, value: u64 },
     /// Boolean (BTF int with `is_bool()`).
     Bool { value: bool },
@@ -110,10 +118,36 @@ pub enum RenderedValue {
     /// IEEE-754 float (BTF_KIND_FLOAT).
     Float { bits: u32, value: f64 },
     /// Enum value with optional resolved variant name.
+    ///
+    /// `is_signed` tracks the BTF type's signedness so accessors
+    /// downstream can decide whether to reinterpret the bit
+    /// pattern (unsigned: `value as u64` gives the wire bits back
+    /// even when the storage width forces a negative `i64`) or
+    /// treat negative values as out-of-range (signed: a true
+    /// negative enum variant is not coercible to `u64`).
+    ///
+    /// Constructed by the BTF renderer; downstream consumers read
+    /// `is_signed` (or trust the typed accessors like
+    /// [`RenderedValue::as_u64`] to dispatch correctly) rather than
+    /// building `Enum` literals directly. `#[serde(default)]` lets
+    /// pre-`is_signed` archives (test sidecars, captured failure
+    /// dumps) deserialize as `is_signed: false`, the default. Note
+    /// that this changes behavior for old archives carrying a
+    /// negative `value`: pre-field [`RenderedValue::as_u64`] returned
+    /// `None` for any negative stored value (whether the BTF type
+    /// was signed-negative OR unsigned-with-high-bit-set, since the
+    /// renderer never tracked the distinction); post-field, a
+    /// deserialize-as-default `is_signed: false` reinterprets the
+    /// bit pattern via `as u64`. That shift is intentional — old
+    /// archives could not encode the signedness, and the conservative
+    /// "treat as unsigned bits" recovers more cases than the old
+    /// "any negative is rejected" behavior.
     Enum {
         bits: u32,
         value: i64,
         variant: Option<String>,
+        #[serde(default)]
+        is_signed: bool,
     },
     /// Aggregate (struct or union). For unions, only the first member
     /// is meaningful — the renderer emits all members each backed by
@@ -228,11 +262,12 @@ impl RenderedValue {
     /// or when the member name is absent.
     pub fn member(&self, name: &str) -> Option<&RenderedValue> {
         match self {
-            RenderedValue::Struct { members, .. } => members
-                .iter()
-                .find(|m| m.name == name)
-                .map(|m| &m.value),
-            RenderedValue::Ptr { deref: Some(inner), .. } => inner.member(name),
+            RenderedValue::Struct { members, .. } => {
+                members.iter().find(|m| m.name == name).map(|m| &m.value)
+            }
+            RenderedValue::Ptr {
+                deref: Some(inner), ..
+            } => inner.member(name),
             RenderedValue::Truncated { partial, .. } => partial.member(name),
             _ => None,
         }
@@ -246,7 +281,9 @@ impl RenderedValue {
     pub fn index(&self, i: usize) -> Option<&RenderedValue> {
         match self {
             RenderedValue::Array { elements, .. } => elements.get(i),
-            RenderedValue::Ptr { deref: Some(inner), .. } => inner.index(i),
+            RenderedValue::Ptr {
+                deref: Some(inner), ..
+            } => inner.index(i),
             RenderedValue::Truncated { partial, .. } => partial.index(i),
             _ => None,
         }
@@ -283,7 +320,22 @@ impl RenderedValue {
             RenderedValue::Int { value, .. } if *value >= 0 => Some(*value as u64),
             RenderedValue::Bool { value } => Some(if *value { 1 } else { 0 }),
             RenderedValue::Char { value } => Some(*value as u64),
-            RenderedValue::Enum { value, .. } if *value >= 0 => Some(*value as u64),
+            // Signed enums: reject negative values (sign loss).
+            // Unsigned enums: reinterpret the bit pattern via
+            // `as u64` so e.g. an unsigned 64-bit enum variant
+            // with value `0xFFFF_FFFF_FFFF_FFFF` (stored as `i64 = -1`
+            // by the renderer) round-trips back to its true
+            // unsigned wire value.
+            RenderedValue::Enum {
+                value,
+                is_signed: true,
+                ..
+            } if *value >= 0 => Some(*value as u64),
+            RenderedValue::Enum {
+                value,
+                is_signed: false,
+                ..
+            } => Some(*value as u64),
             RenderedValue::Ptr { value, .. } => Some(*value),
             _ => None,
         }
@@ -379,7 +431,9 @@ impl RenderedValue {
     fn array_elements(&self) -> Option<&[RenderedValue]> {
         match self {
             RenderedValue::Array { elements, .. } => Some(elements.as_slice()),
-            RenderedValue::Ptr { deref: Some(inner), .. } => inner.array_elements(),
+            RenderedValue::Ptr {
+                deref: Some(inner), ..
+            } => inner.array_elements(),
             RenderedValue::Truncated { partial, .. } => partial.array_elements(),
             _ => None,
         }
@@ -414,7 +468,7 @@ const INDENT: &str = "  ";
 
 /// Render a [`RenderedValue`] with a caller-supplied starting
 /// indentation depth. Wrapper modules (e.g.
-/// [`crate::monitor::dump::display`]) use this to nest a renderer
+/// `crate::monitor::dump::display`) use this to nest a renderer
 /// output inside their own indented context — passing
 /// `depth = 1` produces output indented one level deeper than the
 /// default `Display::fmt` path (which always starts at `depth = 0`).
@@ -465,19 +519,35 @@ fn write_rendered_value(
             }
         }
         RenderedValue::Float { value, .. } => write!(f, "{value}"),
-        RenderedValue::Enum { value, variant, .. } => match variant {
-            Some(name) => {
-                f.write_str(name)?;
-                f.write_str(" (")?;
-                let mut buf = itoa::Buffer::new();
-                f.write_str(buf.format(*value))?;
-                f.write_str(")")
+        RenderedValue::Enum {
+            value,
+            variant,
+            is_signed,
+            ..
+        } => {
+            // Mirror as_u64's signedness dispatch: unsigned enums
+            // render the bit-pattern u64 value (so an unsigned 64-bit
+            // enum stored as i64=-1 displays as the u64::MAX wire
+            // value, not "-1"); signed enums render the i64
+            // directly. Without this branch, the renderer printed
+            // "-1" for an unsigned u64::MAX, which is exactly the
+            // sign-loss the is_signed field exists to prevent.
+            let mut buf = itoa::Buffer::new();
+            let rendered_value: &str = if *is_signed {
+                buf.format(*value)
+            } else {
+                buf.format(*value as u64)
+            };
+            match variant {
+                Some(name) => {
+                    f.write_str(name)?;
+                    f.write_str(" (")?;
+                    f.write_str(rendered_value)?;
+                    f.write_str(")")
+                }
+                None => f.write_str(rendered_value),
             }
-            None => {
-                let mut buf = itoa::Buffer::new();
-                f.write_str(buf.format(*value))
-            }
-        },
+        }
         RenderedValue::CpuList { cpus } => write!(f, "cpus={{{cpus}}}"),
         RenderedValue::Ptr {
             value,
@@ -1542,7 +1612,7 @@ fn try_render_cpumask_bits(bytes: &[u8], max_cpus: u32) -> Option<RenderedValue>
 }
 
 /// Format a sorted list of CPU IDs as a range-collapsed string.
-/// e.g. [0,1,2,5,7,8,9] → "0-2,5,7-9"
+/// e.g. `[0,1,2,5,7,8,9]` → "0-2,5,7-9"
 ///
 /// Writes to a single `String` with `fmt::Write` so each range
 /// emits at most two integer formats and one comma — half the
@@ -1677,7 +1747,7 @@ pub use super::cast_analysis::CastHit;
 /// struct begins.
 ///
 /// The production
-/// [`super::dump::render_map::AccessorMemReader::resolve_arena_type`]
+/// `super::dump::render_map::AccessorMemReader::resolve_arena_type`
 /// emits exactly two `header_skip` shapes — mid-slot pointers
 /// (header-region or mid-payload offsets) return `None`:
 ///
@@ -1815,7 +1885,7 @@ pub trait MemReader {
     /// branch in the [`btf_rs::Type::Ptr`] arm) but cannot verify
     /// liveness. Cast-recovered kernel kptrs ARE chased through
     /// [`MemReader::read_kva`] when [`MemReader::cast_lookup`]
-    /// returns an [`AddrSpace::Kernel`] hit, even though slab
+    /// returns an `AddrSpace::Kernel` hit, even though slab
     /// liveness is not guaranteed; the heuristic gates and the
     /// `deref_skipped_reason` field on [`RenderedValue::Ptr`]
     /// surface uncertainty without dropping the hit. Default
@@ -1892,7 +1962,7 @@ pub trait MemReader {
     /// transform it into the index key shape they store. The
     /// sdt_alloc bridge stores one entry per slot keyed on
     /// `slot_start & 0xFFFF_FFFF`; the production
-    /// [`super::dump::render_map::AccessorMemReader`] impl uses a
+    /// `super::dump::render_map::AccessorMemReader` impl uses a
     /// range lookup to find the slot whose
     /// `[slot_start, slot_start + elem_size)` range contains the
     /// chased address.
@@ -2103,6 +2173,7 @@ fn render_value_inner(
                 bits: (needed * 8) as u32,
                 value,
                 variant,
+                is_signed: signed,
             }
         }
         Type::Enum64(e) => {
@@ -2132,6 +2203,7 @@ fn render_value_inner(
                 bits: (needed * 8) as u32,
                 value,
                 variant,
+                is_signed: signed,
             }
         }
         Type::Ptr(ptr) => {
@@ -3259,7 +3331,7 @@ fn apply_header_skip(raw_bytes: &[u8], header_skip: usize) -> Option<&[u8]> {
 ///   only meaningful in the entry BTF.
 ///
 /// - [`MemReader::resolve_arena_type`][]: the
-///   [`super::dump::render_map::ArenaSlotIndex`] populates
+///   `super::dump::render_map::ArenaSlotIndex` populates
 ///   [`ArenaResolveHit::target_type_id`] with BTF type ids resolved
 ///   against the **entry BTF** at index-build time (the sdt_alloc
 ///   pre-pass runs against the program BTF, which is the entry BTF
@@ -4503,7 +4575,7 @@ pub(crate) fn peel_modifiers(btf: &Btf, type_id: u32) -> Option<Type> {
 ///   keyed for lookup),
 /// - no sibling [`Type::Struct`]/[`Type::Union`] of the same name
 ///   AND matching aggregate kind (struct vs union, per
-///   [`btf_rs::Fwd::is_struct`] / [`is_union`]) exists in the BTF.
+///   [`btf_rs::Fwd::is_struct`] / `is_union`) exists in the BTF.
 ///
 /// The aggregate-kind match is crucial — a `Fwd` declared as
 /// `struct foo` must NOT resolve to a `union foo` in the same BTF

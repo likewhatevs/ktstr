@@ -36,7 +36,9 @@ impl<'a> SnapshotField<'a> {
             SnapshotField::PercpuKey { .. } => {
                 SnapshotField::Missing(SnapshotError::TypeMismatch {
                     expected: "Struct".to_string(),
-                    actual: "Uint(percpu key)".to_string(),
+                    actual:
+                        "Uint(percpu key) — call as_u64/as_i64/as_f64/as_bool for the key value"
+                            .to_string(),
                     requested: path.to_string(),
                 })
             }
@@ -130,7 +132,8 @@ impl<'a> SnapshotField<'a> {
             },
             SnapshotField::PercpuKey { .. } => Err(SnapshotError::TypeMismatch {
                 expected: "str".to_string(),
-                actual: "Uint(percpu key)".to_string(),
+                actual: "Uint(percpu key) — call as_u64/as_i64/as_f64/as_bool for the key value"
+                    .to_string(),
                 requested: String::new(),
             }),
             SnapshotField::Missing(err) => Err(err.clone()),
@@ -153,7 +156,11 @@ impl<'a> SnapshotField<'a> {
     /// [`RenderedValue::as_u32_array`]; out-of-range values
     /// (Uint exceeding `u32::MAX`) error rather than truncate.
     pub fn as_u32_array(&self) -> SnapshotResult<Vec<u32>> {
-        render_to_typed_array(self, |v| v.as_u64().and_then(|x| u32::try_from(x).ok()), "u32")
+        render_to_typed_array(
+            self,
+            |v| v.as_u64().and_then(|x| u32::try_from(x).ok()),
+            "u32",
+        )
     }
 
     /// Read as `Vec<i64>` from an array. Mirrors
@@ -187,6 +194,35 @@ impl<'a> SnapshotField<'a> {
             SnapshotField::Value(v) => Some(v),
             _ => None,
         }
+    }
+
+    /// Iterate the elements of an array-shaped field as
+    /// [`SnapshotField`]s so chained navigation composes:
+    /// `field.iter_members().filter_map(|el| el.get("name").as_u64().ok())`.
+    /// Bridges the gap left by the scalar `as_*_array` terminals
+    /// on array-of-struct shapes: those terminals coerce each
+    /// element to a scalar via the shared coercion helper and
+    /// return [`SnapshotError::TypeMismatch`] on the first
+    /// non-scalar element, which is exactly what an array-of-struct
+    /// triggers. `iter_members` instead hands the caller each raw
+    /// element so they can chain `.get(field).as_u64()` per element.
+    /// Peels [`RenderedValue::Ptr`] dereferences and
+    /// [`RenderedValue::Truncated`] partial-array wrappers the
+    /// same way [`Self::as_u64_array`] does.
+    ///
+    /// Yields nothing for non-array shapes, percpu-key fields, or
+    /// missing fields — the empty iterator pattern is the natural
+    /// "no elements to walk" representation when the chain just
+    /// wants to fold over what's there. `iter_members` itself never
+    /// surfaces [`SnapshotError::TypeMismatch`]; callers needing to
+    /// distinguish "absent" from "empty" check [`Self::is_present`]
+    /// or [`Self::error`] explicitly.
+    pub fn iter_members(&self) -> impl Iterator<Item = SnapshotField<'a>> + '_ {
+        let elements = match self {
+            SnapshotField::Value(v) => array_elements_of(v),
+            _ => &[],
+        };
+        elements.iter().map(SnapshotField::Value)
     }
 
     /// Error reference when the field is missing; `None`
@@ -298,6 +334,38 @@ fn describe_kind(v: &RenderedValue) -> String {
     .to_string()
 }
 
+/// Shared array-elements walker: peel [`RenderedValue::Ptr`]'s
+/// deref and [`RenderedValue::Truncated`]'s partial recursively
+/// to reach an [`RenderedValue::Array`], returning the elements
+/// slice on success. On a non-array variant (after peeling),
+/// `Err` carries the unwrapped inner value so callers that want
+/// a typed mismatch diagnostic can name the actual variant via
+/// [`describe_kind`].
+fn array_elements_or_mismatch(v: &RenderedValue) -> Result<&[RenderedValue], &RenderedValue> {
+    match v {
+        RenderedValue::Array { elements, .. } => Ok(elements.as_slice()),
+        RenderedValue::Ptr {
+            deref: Some(inner), ..
+        } => array_elements_or_mismatch(inner.as_ref()),
+        RenderedValue::Truncated { partial, .. } => array_elements_or_mismatch(partial.as_ref()),
+        other => Err(other),
+    }
+}
+
+/// Borrow the elements slice of an [`RenderedValue::Array`],
+/// peeling [`RenderedValue::Ptr`]'s deref and
+/// [`RenderedValue::Truncated`]'s partial. Returns the empty
+/// slice for any non-array variant so the caller's iterator
+/// chain yields no elements cleanly. Thin wrapper over
+/// [`array_elements_or_mismatch`] that swallows the typed
+/// mismatch — appropriate for [`SnapshotField::iter_members`]
+/// whose empty-iterator contract distinguishes absent vs empty
+/// via [`SnapshotField::is_present`] / [`SnapshotField::error`]
+/// rather than via a returned error.
+fn array_elements_of(v: &RenderedValue) -> &[RenderedValue] {
+    array_elements_or_mismatch(v).unwrap_or(&[])
+}
+
 /// Shared typed-array coercion used by [`SnapshotField::as_u64_array`]
 /// and siblings. `coerce` is the per-element scalar extractor that
 /// returns `None` when the element fails the coercion (matches the
@@ -316,44 +384,44 @@ where
         SnapshotField::PercpuKey { .. } => {
             return Err(SnapshotError::TypeMismatch {
                 expected: format!("[{type_name}]"),
-                actual: "Uint(percpu key)".to_string(),
+                actual: "Uint(percpu key) — call as_u64/as_i64/as_f64/as_bool for the key value"
+                    .to_string(),
                 requested: String::new(),
             });
         }
         SnapshotField::Missing(err) => return Err(err.clone()),
     };
-    let elements = match value {
-        RenderedValue::Array { elements, .. } => elements.as_slice(),
-        RenderedValue::Ptr {
-            deref: Some(inner), ..
-        } => match inner.as_ref() {
-            RenderedValue::Array { elements, .. } => elements.as_slice(),
-            other => {
-                return Err(SnapshotError::TypeMismatch {
-                    expected: format!("[{type_name}]"),
-                    actual: describe_kind(other),
-                    requested: String::new(),
-                });
+    let elements = array_elements_or_mismatch(value).map_err(|other| {
+        // Diagnostic wrapping mirrors the operator-facing form the
+        // legacy code emitted for the common one-deep cases:
+        //   - top-level `Truncated{partial: NonArray}` reports
+        //     `Truncated(partial=<inner-kind>)` so the operator
+        //     can tell the partial wrapper hid a non-array shape
+        //     (vs the top level just not being an array).
+        //   - all other paths (top-level non-array, top-level Ptr,
+        //     and any deeper-nested wrapper combination) report
+        //     the unwrapped leaf kind directly.
+        // The shared walker recurses through Ptr+Truncated, so
+        // arbitrary nesting around an Array now succeeds (matches
+        // RenderedValue::array_elements semantics at
+        // src/monitor/btf_render/mod.rs). On failure of a nested
+        // shape (e.g. Ptr→Truncated→NonArray), the diagnostic
+        // collapses to the leaf kind rather than narrating the
+        // wrapper stack — sufficient context for the operator
+        // since the wrapper structure is renderer-internal and
+        // not load-bearing for assertions.
+        let actual = match value {
+            RenderedValue::Truncated { .. } => {
+                format!("Truncated(partial={})", describe_kind(other))
             }
-        },
-        RenderedValue::Truncated { partial, .. } => match partial.as_ref() {
-            RenderedValue::Array { elements, .. } => elements.as_slice(),
-            other => {
-                return Err(SnapshotError::TypeMismatch {
-                    expected: format!("[{type_name}]"),
-                    actual: format!("Truncated(partial={})", describe_kind(other)),
-                    requested: String::new(),
-                });
-            }
-        },
-        other => {
-            return Err(SnapshotError::TypeMismatch {
-                expected: format!("[{type_name}]"),
-                actual: describe_kind(other),
-                requested: String::new(),
-            });
+            _ => describe_kind(other),
+        };
+        SnapshotError::TypeMismatch {
+            expected: format!("[{type_name}]"),
+            actual,
+            requested: String::new(),
         }
-    };
+    })?;
     let mut out = Vec::with_capacity(elements.len());
     for (i, element) in elements.iter().enumerate() {
         let v = coerce(element).ok_or_else(|| SnapshotError::TypeMismatch {
@@ -383,11 +451,24 @@ fn render_to_u64(v: &RenderedValue) -> SnapshotResult<u64> {
         }
         RenderedValue::Bool { value } => Ok(u64::from(*value)),
         RenderedValue::Char { value } => Ok(u64::from(*value)),
-        RenderedValue::Enum { value, .. } => {
-            if *value < 0 {
+        RenderedValue::Enum {
+            value, is_signed, ..
+        } => {
+            // Mirror RenderedValue::as_u64's enum dispatch so the two
+            // surfaces agree on signedness handling: unsigned enums
+            // reinterpret the bit pattern (the renderer stores i64,
+            // so an unsigned u64 wire value with the high bit set
+            // arrives here as a negative i64 — `as u64` recovers the
+            // bits); signed enums reject negative variants as
+            // out-of-range. Without this branch, an unsigned 64-bit
+            // enum at u64::MAX (stored as i64=-1) returned
+            // TypeMismatch from this path while RenderedValue::as_u64
+            // returned Some(u64::MAX) — same value, two surfaces
+            // disagreed.
+            if *is_signed && *value < 0 {
                 Err(SnapshotError::TypeMismatch {
                     expected: "u64".to_string(),
-                    actual: "Enum(negative)".to_string(),
+                    actual: "Enum(signed-negative)".to_string(),
                     requested: String::new(),
                 })
             } else {

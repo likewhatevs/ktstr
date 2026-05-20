@@ -140,11 +140,15 @@ impl<'a> JsonField<'a> {
     pub fn as_u32_array(&self) -> SnapshotResult<Vec<u32>> {
         json_to_typed_array(
             self,
-            |v| json_to_u64(v).and_then(|x| u32::try_from(x).map_err(|_| SnapshotError::TypeMismatch {
-                expected: "u32".to_string(),
-                actual: "Uint(>u32::MAX)".to_string(),
-                requested: String::new(),
-            })),
+            |v| {
+                json_to_u64(v).and_then(|x| {
+                    u32::try_from(x).map_err(|_| SnapshotError::TypeMismatch {
+                        expected: "u32".to_string(),
+                        actual: "Uint(>u32::MAX)".to_string(),
+                        requested: String::new(),
+                    })
+                })
+            },
             "u32",
         )
     }
@@ -178,6 +182,24 @@ impl<'a> JsonField<'a> {
             },
             "bool",
         )
+    }
+
+    /// Iterate the elements of a JSON array as [`JsonField`]s so
+    /// chained navigation composes for arrays-of-objects:
+    /// `field.iter_members().filter_map(|el| el.get("name").as_u64().ok())`.
+    /// Mirrors [`super::SnapshotField::iter_members`].
+    ///
+    /// Yields nothing for non-array values or missing fields —
+    /// the empty iterator is the natural "no elements" shape when
+    /// the chain just wants to fold over what's there. Callers
+    /// needing to distinguish "absent" from "empty" check
+    /// [`Self::is_present`] or [`Self::error`] explicitly.
+    pub fn iter_members(&self) -> impl Iterator<Item = JsonField<'a>> + '_ {
+        let elements: &[serde_json::Value] = match self {
+            JsonField::Value(serde_json::Value::Array(a)) => a.as_slice(),
+            _ => &[],
+        };
+        elements.iter().map(JsonField::Value)
     }
 }
 

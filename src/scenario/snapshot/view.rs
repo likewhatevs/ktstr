@@ -228,10 +228,7 @@ impl<'a> Snapshot<'a> {
     /// `report.maps` is empty by construction so nothing matches
     /// anyway — callers needing "is this a placeholder?" use the
     /// `Snapshot::is_placeholder` accessor explicitly).
-    pub fn vars(
-        &self,
-        name: &str,
-    ) -> impl Iterator<Item = (&'a str, SnapshotField<'a>)> + '_ {
+    pub fn vars(&self, name: &str) -> impl Iterator<Item = (&'a str, SnapshotField<'a>)> + '_ {
         let needle = name.to_string();
         self.maps_iter().filter_map(move |m| {
             if !is_global_section_map(&m.name) {
@@ -314,10 +311,11 @@ impl<'a> Snapshot<'a> {
             if !is_global_section_map(&m.name) {
                 continue;
             }
-            if let Some(obj) = m.name.split('.').next() {
-                if !obj.is_empty() && !obj_names.contains(&obj) {
-                    obj_names.push(obj);
-                }
+            if let Some(obj) = m.name.split('.').next()
+                && !obj.is_empty()
+                && !obj_names.contains(&obj)
+            {
+                obj_names.push(obj);
             }
         }
         match obj_names.as_slice() {
@@ -601,7 +599,6 @@ fn map_belongs_to_obj(map_name: &str, obj: &str) -> bool {
         .map(|(prefix, _)| prefix == obj)
         .unwrap_or(false)
 }
-
 
 // ---------------------------------------------------------------------------
 // SnapshotMap

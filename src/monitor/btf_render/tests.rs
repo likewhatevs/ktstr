@@ -16,6 +16,20 @@ fn test_btf() -> Option<Btf> {
     crate::monitor::btf_offsets::load_btf_from_path(&path).ok()
 }
 
+/// Compact constructor for [`RenderedValue::Enum`] in tests.
+/// Mirrors `uint_v` in src/scenario/snapshot/tests.rs:3443 — folds
+/// the 5-field struct literal (now that `is_signed` is part of the
+/// shape) into a one-line call so fixture sites stay readable as
+/// the variant grows.
+fn enum_v(bits: u32, value: i64, variant: Option<&str>, is_signed: bool) -> RenderedValue {
+    RenderedValue::Enum {
+        bits,
+        value,
+        variant: variant.map(String::from),
+        is_signed,
+    }
+}
+
 #[test]
 fn read_uint_le_padding() {
     assert_eq!(read_uint_le(&[0x12, 0x34]), 0x3412);
@@ -155,27 +169,10 @@ fn display_float() {
 #[test]
 fn display_enum_with_and_without_variant() {
     assert_eq!(
-        format!(
-            "{}",
-            RenderedValue::Enum {
-                bits: 32,
-                value: 1,
-                variant: Some("RUNNING".into()),
-            }
-        ),
+        format!("{}", enum_v(32, 1, Some("RUNNING"), false)),
         "RUNNING (1)"
     );
-    assert_eq!(
-        format!(
-            "{}",
-            RenderedValue::Enum {
-                bits: 32,
-                value: 99,
-                variant: None,
-            }
-        ),
-        "99"
-    );
+    assert_eq!(format!("{}", enum_v(32, 99, None, false)), "99");
 }
 
 #[test]
@@ -1496,16 +1493,8 @@ fn is_zero_float() {
 
 #[test]
 fn is_zero_enum() {
-    assert!(is_zero(&RenderedValue::Enum {
-        bits: 32,
-        value: 0,
-        variant: None
-    }));
-    assert!(!is_zero(&RenderedValue::Enum {
-        bits: 32,
-        value: 1,
-        variant: Some("RUNNING".into())
-    }));
+    assert!(is_zero(&enum_v(32, 0, None, false)));
+    assert!(!is_zero(&enum_v(32, 1, Some("RUNNING"), false)));
 }
 
 #[test]
@@ -1582,11 +1571,7 @@ fn is_inline_scalar_accepts_scalars() {
         bits: 64,
         value: 0.0
     }));
-    assert!(is_inline_scalar(&RenderedValue::Enum {
-        bits: 32,
-        value: 0,
-        variant: None,
-    }));
+    assert!(is_inline_scalar(&enum_v(32, 0, None, false)));
     assert!(is_inline_scalar(&RenderedValue::Ptr {
         value: 0,
         deref: None,
@@ -8774,7 +8759,10 @@ fn rendered_value_get_walks_dotted_path() {
 #[test]
 fn rendered_value_get_empty_path_returns_self() {
     let v = uint(5);
-    assert!(matches!(v.get(""), Some(RenderedValue::Uint { value: 5, .. })));
+    assert!(matches!(
+        v.get(""),
+        Some(RenderedValue::Uint { value: 5, .. })
+    ));
 }
 
 #[test]
@@ -8809,10 +8797,7 @@ fn rendered_value_index_walks_array_and_peels() {
 #[test]
 fn rendered_value_as_u64_accepts_scalar_variants() {
     assert_eq!(uint(7).as_u64(), Some(7));
-    assert_eq!(
-        RenderedValue::Int { bits: 32, value: 9 }.as_u64(),
-        Some(9)
-    );
+    assert_eq!(RenderedValue::Int { bits: 32, value: 9 }.as_u64(), Some(9));
     assert_eq!(RenderedValue::Bool { value: true }.as_u64(), Some(1));
     assert_eq!(RenderedValue::Char { value: b'A' }.as_u64(), Some(65));
     assert_eq!(
@@ -8830,7 +8815,11 @@ fn rendered_value_as_u64_accepts_scalar_variants() {
 #[test]
 fn rendered_value_as_u64_rejects_negative_int_and_aggregate() {
     assert_eq!(
-        RenderedValue::Int { bits: 32, value: -1 }.as_u64(),
+        RenderedValue::Int {
+            bits: 32,
+            value: -1
+        }
+        .as_u64(),
         None,
         "negative Int does not silently wrap to u64::MAX"
     );
@@ -8843,6 +8832,34 @@ fn rendered_value_as_u64_rejects_negative_int_and_aggregate() {
         .as_u64(),
         None
     );
+}
+
+#[test]
+fn rendered_value_as_u64_unsigned_enum_high_bit_round_trips() {
+    // Unsigned 64-bit enum whose wire value has the high bit set is
+    // stored as i64 = -1 by the renderer (raw bit pattern preserved
+    // via `as i64`). as_u64() must reinterpret that bit pattern back
+    // to its true unsigned wire value rather than rejecting it.
+    let unsigned_max = enum_v(64, -1_i64, None, false);
+    assert_eq!(unsigned_max.as_u64(), Some(u64::MAX));
+
+    // The same negative storage on a signed enum is a true negative
+    // variant and as_u64() must reject it — silent wrap to u64::MAX
+    // is the sign-loss bug we are guarding against.
+    let signed_negative = enum_v(64, -1_i64, None, true);
+    assert_eq!(signed_negative.as_u64(), None);
+}
+
+#[test]
+fn rendered_value_as_u64_signed_enum_positive_value() {
+    // Positive value on a signed enum coerces cleanly to u64 — the
+    // sign-loss rejection only kicks in for actually-negative values.
+    // Without this pin a renderer regression that always returned
+    // None for is_signed=true (treating all signed enums as
+    // un-coercible) would silently pass the high-bit round-trip test
+    // above.
+    let positive_signed = enum_v(32, 42, None, true);
+    assert_eq!(positive_signed.as_u64(), Some(42));
 }
 
 #[test]
