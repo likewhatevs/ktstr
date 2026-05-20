@@ -293,6 +293,20 @@ impl Verdict {
         self.result
     }
 
+    /// Terminal post_vm-callback helper. Equivalent to
+    /// `self.into_result().into_anyhow_or_log()` — drains the
+    /// accumulator, logs every [`crate::assert::InfoNote`] via
+    /// `tracing::info!`, and bails on any accumulated failure
+    /// (with all failure details concatenated). See
+    /// [`AssertResult::into_anyhow_or_log`] for the full contract.
+    ///
+    /// Use this to collapse a typical post_vm callback's terminal
+    /// `let r = v.into_result(); … bail/log loop` boilerplate
+    /// into a single chainable call.
+    pub fn into_anyhow_or_log(self) -> anyhow::Result<AssertResult> {
+        self.into_result().into_anyhow_or_log()
+    }
+
     /// Mutable handle to the underlying [`AssertResult`]. Used by
     /// the [`crate::assert::temporal`] patterns to push
     /// [`DetailKind::Temporal`] details and flip `passed` without

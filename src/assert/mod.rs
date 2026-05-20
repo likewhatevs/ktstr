@@ -2417,6 +2417,66 @@ impl AssertResult {
             _ => None,
         })
     }
+
+    /// Terminal post_vm-callback helper: route every
+    /// [`Self::info_notes`] entry through `tracing::info!` (so
+    /// `--nocapture` + `RUST_LOG=ktstr=info` users see them, but
+    /// default-noise-level runs stay quiet) and bail on any
+    /// accumulated failure. Returns the [`AssertResult`] back on
+    /// the success/skip path so callers can chain post-bail
+    /// inspection if needed; idiomatic post_vm usage discards it
+    /// with `?;`.
+    ///
+    /// # Failure behavior
+    ///
+    /// Every entry from [`Self::failure_details`] is concatenated
+    /// into the returned `anyhow::Error` message (separated by
+    /// newlines). All failures surface — the helper does NOT drop
+    /// N-1 details when multiple claims failed.
+    ///
+    /// # Note ordering
+    ///
+    /// Info notes are logged BEFORE the failure check fires, so on
+    /// a failed run the operator sees the diagnostic observations
+    /// that led to the failure ALONGSIDE the bail message in their
+    /// log feed (rather than the bail terminating before the notes
+    /// surface).
+    ///
+    /// # `tracing` vs `println!`
+    ///
+    /// Notes are emitted via `tracing::info!` with target
+    /// `"ktstr::assert"` — matches the comparator pass-arm logging
+    /// convention at [`crate::assert::claim`]. Operators set
+    /// `RUST_LOG=ktstr::assert=info` (or broader) to surface them;
+    /// `println!` would bypass the tracing subscriber and bake in
+    /// stdout-only visibility.
+    ///
+    /// # Composability
+    ///
+    /// [`crate::assert::Verdict::into_anyhow_or_log`] is a thin
+    /// wrapper for callers that hold a `Verdict` directly.
+    pub fn into_anyhow_or_log(self) -> anyhow::Result<Self> {
+        for note in &self.info_notes {
+            tracing::info!(target: "ktstr::assert", "{}", note.message);
+        }
+        let failures: Vec<String> = self
+            .failure_details()
+            .map(|d| d.message.clone())
+            .collect();
+        if !failures.is_empty() {
+            let combined = if failures.len() == 1 {
+                failures.into_iter().next().unwrap()
+            } else {
+                let mut out = format!("{} assertion failures:\n", failures.len());
+                for (i, msg) in failures.iter().enumerate() {
+                    out.push_str(&format!("  {}. {}\n", i + 1, msg));
+                }
+                out.trim_end().to_string()
+            };
+            anyhow::bail!("{}", combined);
+        }
+        Ok(self)
+    }
     /// Append an informational annotation to [`Self::info_notes`].
     /// Does NOT alter the terminal verdict ([`Self::outcome`] is unaffected) — a note
     /// is context, not a verdict. Use to surface observed values

@@ -1018,3 +1018,122 @@ fn verdict_log_passes_silent_on_fail_arm() {
     assert!(r.is_fail());
     assert_eq!(r.outcomes.len(), 1);
 }
+
+// ---------- into_anyhow_or_log (AssertResult + Verdict wrapper) ----------
+
+#[tracing_test::traced_test]
+#[test]
+fn into_anyhow_or_log_pass_arm_returns_ok_and_traces_notes() {
+    let mut v = Verdict::new();
+    v.note("observed cross_frac = 0.42");
+    v.note("observed same_frac = 0.58");
+    claim!(v, 10u64).at_least(5);
+    let r = v.into_anyhow_or_log().expect("pass arm returns Ok");
+    assert!(r.is_pass(), "AssertResult preserved on Ok path");
+    assert!(
+        logs_contain("observed cross_frac = 0.42"),
+        "first info_note must be traced via tracing::info!",
+    );
+    assert!(
+        logs_contain("observed same_frac = 0.58"),
+        "second info_note must be traced via tracing::info!",
+    );
+}
+
+#[test]
+fn into_anyhow_or_log_single_failure_arm_returns_err_with_message() {
+    let mut v = Verdict::new();
+    claim!(v, 5u64).at_least(40);
+    let err = v
+        .into_anyhow_or_log()
+        .expect_err("single failure surfaces as Err");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("5") && msg.contains("40") && msg.contains("expected at least"),
+        "single-failure message passes through verbatim (no count prefix); got {msg}",
+    );
+    assert!(
+        !msg.contains("assertion failures:"),
+        "single-failure path should NOT emit the count prefix",
+    );
+}
+
+#[test]
+fn into_anyhow_or_log_multiple_failures_arm_concatenates_every_detail() {
+    let mut v = Verdict::new();
+    claim!(v, 5u64).at_least(40);
+    claim!(v, 100u64).at_most(50);
+    claim!(v, 7u64).at_least(8);
+    let err = v
+        .into_anyhow_or_log()
+        .expect_err("multi-failure surfaces as Err");
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with("3 assertion failures:"),
+        "multi-failure path must lead with count; got {msg:?}",
+    );
+    assert!(msg.contains("1."), "must enumerate detail 1");
+    assert!(msg.contains("2."), "must enumerate detail 2");
+    assert!(msg.contains("3."), "must enumerate detail 3");
+    // Each individual claim's diagnostic survives the concatenation.
+    for needle in ["40", "50", "8"] {
+        assert!(
+            msg.contains(needle),
+            "every individual failure's message must appear in concatenation; \
+             missing '{needle}' in {msg:?}",
+        );
+    }
+}
+
+#[tracing_test::traced_test]
+#[test]
+fn into_anyhow_or_log_notes_traced_before_bail_on_failure() {
+    // The notes-before-bail ordering: even on a failed run the
+    // operator sees the observed-value context that led to the
+    // failure, alongside (not after) the bail message in the log.
+    let mut v = Verdict::new();
+    v.note("observed pre-bail context");
+    claim!(v, 5u64).at_least(40);
+    let _ = v.into_anyhow_or_log();
+    assert!(
+        logs_contain("observed pre-bail context"),
+        "info_notes must surface via tracing::info! BEFORE the bail \
+         path returns, so a failing run carries diagnostic context \
+         alongside the failure message",
+    );
+}
+
+#[test]
+fn into_anyhow_or_log_via_verdict_wrapper_matches_assert_result_path() {
+    // Verdict::into_anyhow_or_log chains into AssertResult — pin
+    // they produce identical Err shapes for the same input.
+    let mut a = Verdict::new();
+    claim!(a, 5u64).at_least(40);
+    let err_via_verdict = a.into_anyhow_or_log().expect_err("err");
+
+    let mut b = Verdict::new();
+    claim!(b, 5u64).at_least(40);
+    let err_via_result = b
+        .into_result()
+        .into_anyhow_or_log()
+        .expect_err("err");
+
+    assert_eq!(
+        err_via_verdict.to_string(),
+        err_via_result.to_string(),
+        "Verdict wrapper must produce the same Err as the underlying AssertResult path",
+    );
+}
+
+#[test]
+fn into_anyhow_or_log_skip_arm_returns_ok() {
+    // Verdict with ONLY a skip outcome — no failures, no passes.
+    // skip is not failure; helper returns Ok.
+    let mut v = Verdict::new();
+    v.result_mut()
+        .record_skip("irrelevant for this test config");
+    let r = v
+        .into_anyhow_or_log()
+        .expect("skip-only verdict returns Ok");
+    assert!(r.is_skipped(), "skip outcome preserved on Ok path");
+}
