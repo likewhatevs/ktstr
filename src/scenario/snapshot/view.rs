@@ -514,6 +514,18 @@ impl<'a> Snapshot<'a> {
     /// is `names[0]`'s field from the picked map, `result[1]` is
     /// `names[1]`'s field, etc.
     ///
+    /// **Single-section constraint.** All `names` must reside in
+    /// the SAME global-section map — typically the scheduler's
+    /// `<obj>.bss`. A `bss` counter co-picked with a `data`
+    /// constant from the same scheduler obj lands in DIFFERENT
+    /// candidate rows (the obj's `.bss` map carries the first
+    /// name, its `.data` map carries the second, neither row has
+    /// both), the intersection collapses to empty, and the helper
+    /// returns [`SnapshotError::VarNotFound`]. If the test reads
+    /// from multiple sections, issue separate `live_vars_via`
+    /// calls (one per section's name group) and compose the
+    /// per-call results caller-side.
+    ///
     /// # See also
     ///
     /// - [`Self::live_var_via`] for single-variable disambiguation.
