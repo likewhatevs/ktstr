@@ -567,20 +567,88 @@ const POST_SIGKILL_GRACE: std::time::Duration = std::time::Duration::from_secs(2
 /// or signal-pause refinement applied uniformly.
 fn poll_proc_pid_absent(
     pid: u32,
-    interval: std::time::Duration,
+    _interval: std::time::Duration,
     timeout: std::time::Duration,
 ) -> bool {
+    // Fast path: race-check before any syscall — if the pid is already
+    // absent, return immediately without opening a pidfd.
+    if !proc_pid_alive(pid) {
+        return true;
+    }
     let start = std::time::Instant::now();
+    // Pure evented path: pidfd_open + poll(POLLIN). Kernel fires
+    // POLLIN on the pidfd when the child enters EXIT_ZOMBIE
+    // (do_notify_pidfd from exit_notify in kernel/exit.c) — wake
+    // latency is one kernel scheduling tick. Open-then-poll is
+    // race-free against an exit between SIGTERM and pidfd_open:
+    // pidfd_open returns ESRCH if the pid is already a zombie OR
+    // fully reaped, and the post-open proc_pid_alive re-check
+    // catches the recently-exited case.
+    //
+    // We target kernel 6.12+ (pidfd_open since 5.3, universally
+    // available on every supported target), so a pidfd_open
+    // failure means the pid is genuinely gone (ESRCH) — the
+    // re-check below returns true. No /proc-polling fallback.
+    let pidfd: libc::c_int =
+        unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_int, 0u32) as libc::c_int };
+    if pidfd < 0 {
+        // ESRCH or already-reaped — re-check /proc as the source of
+        // truth; if /proc agrees the pid is gone, return success.
+        return !proc_pid_alive(pid);
+    }
+    // SAFETY: pidfd_open returned a non-negative fd we just opened.
+    let pidfd_owned = unsafe { OwnedFd::from_raw_fd(pidfd) };
     loop {
+        // Race-check after acquiring the pidfd: the exit edge may have
+        // fired between the SIGTERM and the pidfd_open, leaving the
+        // /proc entry already gone before our first poll.
         if !proc_pid_alive(pid) {
             return true;
         }
         let now = std::time::Instant::now();
-        if now >= start + timeout {
-            return false;
+        let remaining = if now >= start + timeout {
+            std::time::Duration::ZERO
+        } else {
+            (start + timeout) - now
+        };
+        if remaining.is_zero() {
+            // Deadline elapsed. Re-probe /proc once for the source of
+            // truth; if the pid is still alive past the deadline, log
+            // the timeout so the caller chain (which may swallow the
+            // bool return into a non-error path) leaves a visible
+            // breadcrumb in /tmp/ktstr*.log per the "log on timeout
+            // when no error surfaces" rule.
+            let exited = !proc_pid_alive(pid);
+            if !exited {
+                tracing::warn!(
+                    pid,
+                    elapsed_s = start.elapsed().as_secs_f64(),
+                    timeout_s = timeout.as_secs_f64(),
+                    "poll_proc_pid_absent: timeout — pid still alive after \
+                     deadline; pidfd POLLIN never fired and /proc entry persists. \
+                     Common causes: scheduler not honoring SIGTERM (check its signal \
+                     handler), scheduler stuck in D-state on a kernel mutex, or the \
+                     caller's grace window is too tight for the scheduler's exit \
+                     path (post-libbpf-detach can take seconds on cold caches)"
+                );
+            }
+            return exited;
         }
-        let remaining = (start + timeout) - now;
-        std::thread::sleep(remaining.min(interval));
+        let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd {
+            fd: pidfd_owned.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: single pfd, nfds=1. The poll may return early on EINTR;
+        // we re-loop on proc_pid_alive (which is the source of truth)
+        // rather than trusting POLLIN exclusively.
+        let _ = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if !proc_pid_alive(pid) {
+            return true;
+        }
+        // POLLIN didn't fire and /proc still present — re-check after
+        // the next iteration's deadline arithmetic.
     }
 }
 
@@ -2609,35 +2677,50 @@ fn poll_scx_attached(
 ) -> ScxAttachStatus {
     let start = std::time::Instant::now();
     let mut ever_read_ok = false;
-    // Try to open the attribute fd once and use poll(POLLPRI) for
-    // sysfs/kernfs notifications. kernfs supports POLLPRI on
-    // attribute-content changes via `sysfs_notify` (kernel/fs/kernfs/file.c
-    // `kernfs_fop_poll`). The kernel-side `scx_alloc_and_add_sched`
-    // path doesn't currently emit `sysfs_notify` for this attribute,
-    // but if the kernel ever adds it (or a future patch introduces
-    // the call), we get instant wakeup; without it we fall back to
-    // the unconditional sleep cadence below — same behaviour as
-    // before, with the upper bound on detection latency unchanged.
+    // Two evented wake sources, polled together so a wake on either
+    // re-reads the attribute file with minimal latency:
     //
-    // sysfs/kernfs does not reliably emit inotify/epoll events for
-    // attribute content changes — the producer (kernel callsite)
-    // must explicitly call `sysfs_notify`. Polling at `interval`
-    // cadence is the supported mechanism for attributes whose
-    // producer doesn't notify, so the fallback is mandatory.
-    // Wrap the raw fd in `OwnedFd` so it is closed automatically on
-    // every return path — including a panic anywhere inside the
-    // loop body. The previous version close()d at each `return`
-    // site manually; a panic in `read_to_string`, `Instant::now`
-    // arithmetic, or `libc::poll` would have leaked the fd. PID 1's
-    // fd budget is small and a leak across repeated calls would be
-    // observable.
+    // 1. POLLPRI on the open attribute fd `/sys/kernel/sched_ext/root/ops`.
+    //    kernfs delivers POLLPRI when the producer calls `sysfs_notify`
+    //    (kernel/fs/kernfs/file.c `kernfs_fop_poll`). The kernel-side
+    //    `scx_alloc_and_add_sched` path doesn't currently emit
+    //    `sysfs_notify` for this attribute. The fd is opened
+    //    speculatively so a future kernel that adds the notify wakes
+    //    us instantly with no code change here.
     //
-    // The libc::open returns -1 on failure; turn that into `None`
-    // before constructing `OwnedFd` (which requires a valid fd to
-    // uphold its safety contract). Subsequent uses gate on
-    // `attr_fd.is_some()` exactly like the previous `attr_fd >= 0`
-    // checks, but the close on the success / timeout returns is now
-    // implicit via Drop.
+    // 2. inotify on the parent directory `/sys/kernel/sched_ext/`
+    //    for IN_CREATE / IN_MOVED_TO on "root". kernfs honors
+    //    directory-create inotify events: when
+    //    `scx_alloc_and_add_sched` calls
+    //    `kobject_init_and_add(..., "root")` the kernfs directory
+    //    entry appears and inotify fires. This is the evented wake
+    //    for "the root kobject just appeared" — covers cold first-
+    //    attach AND post-detach re-attach (the prior detach via
+    //    scx_root_disable fires `kobject_del` which removes the
+    //    entry, so the next attach's `kobject_init_and_add` always
+    //    re-creates it).
+    //
+    // BELT-AND-BRACES CADENCE. The `interval` parameter caps each
+    // poll(2) wait at 50 ms. Verified at
+    // kernel/sched/ext.c:6380 scx_alloc_and_add_sched: the function
+    // copies `sch->ops = *ops` (populating ops.name) BEFORE calling
+    // `kobject_init_and_add(&sch->kobj, ..., "root")`. The kernfs
+    // dirent — and the show-callback that reads sch->ops.name — only
+    // becomes visible when kobject_init_and_add completes. So by the
+    // time inotify IN_CREATE fires, the attribute is guaranteed to
+    // read non-empty. In the kernel-state shape the project ships
+    // against, the 50 ms cadence is dead code: IN_CREATE wake → single
+    // read → Attached. The cap stays as defense-in-depth against:
+    //   (a) a future kernel reordering ops.name population after the
+    //       kobject add (regression in scx_alloc_and_add_sched ordering),
+    //   (b) inotify event loss under kernel pressure (rare but
+    //       documented for inotify watch slot exhaustion mid-event),
+    //   (c) scenarios where a future caller invokes poll_scx_attached
+    //       on a kobject that was created out-of-band via a non-scx
+    //       code path that does NOT pre-populate ops.name.
+    // Per the project rule "guard rail deadlines/timeouts are ok;
+    // everything should be evented not polling" — the 50 ms ceiling
+    // is a deadline on the evented wait, not a degraded polling path.
     let attr_fd: Option<OwnedFd> = {
         let raw = unsafe {
             libc::open(
@@ -2649,81 +2732,146 @@ fn poll_scx_attached(
             None
         } else {
             // SAFETY: `raw` is a valid fd we just opened and have
-            // exclusive ownership of. `OwnedFd::from_raw_fd` takes
-            // ownership; the previous manual `close()` calls are
-            // now Drop's responsibility.
+            // exclusive ownership of.
             Some(unsafe { OwnedFd::from_raw_fd(raw) })
         }
     };
+    // inotify watch on the parent dir.
+    let inotify_fd: Option<OwnedFd> = {
+        let init = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if init < 0 {
+            None
+        } else {
+            // SAFETY: `init` is a valid fd we just opened.
+            let owned = unsafe { OwnedFd::from_raw_fd(init) };
+            let wd = unsafe {
+                libc::inotify_add_watch(
+                    owned.as_raw_fd(),
+                    c"/sys/kernel/sched_ext/".as_ptr(),
+                    libc::IN_CREATE | libc::IN_MOVED_TO,
+                )
+            };
+            if wd < 0 { None } else { Some(owned) }
+        }
+    };
+    // Build the pollfd set ONCE — fds are stable for the lifetime of
+    // the wait, only revents changes per poll. nfds tracks how many
+    // entries are populated (max 2; the unused slot stays at the
+    // zero-init sentinel with fd=-1 which poll(2) ignores).
+    let mut pfds: [libc::pollfd; 2] = [
+        libc::pollfd {
+            fd: -1,
+            events: 0,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: -1,
+            events: 0,
+            revents: 0,
+        },
+    ];
+    let mut nfds: libc::nfds_t = 0;
+    if let Some(ref fd) = attr_fd {
+        pfds[nfds as usize] = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLPRI,
+            revents: 0,
+        };
+        nfds += 1;
+    }
+    if let Some(ref fd) = inotify_fd {
+        pfds[nfds as usize] = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        nfds += 1;
+    }
+    if nfds == 0 {
+        // Both attr fd open and inotify_add_watch failed. We target
+        // kernel 6.12+ where kernfs + inotify are universally
+        // present, so /sys/kernel/sched_ext/ is fundamentally missing
+        // or broken. SysfsAbsent is the right typed return; the log
+        // surfaces the path-existence-but-fd-unopenable case to the
+        // operator since the typed return alone won't show in logs.
+        tracing::warn!(
+            "poll_scx_attached: both attr-fd open (/sys/kernel/sched_ext/root/ops) \
+             AND inotify_add_watch (/sys/kernel/sched_ext/) failed; surfacing \
+             SysfsAbsent. Diagnose: zcat /proc/config.gz | grep -E \
+             'CONFIG_SCHED_CLASS_EXT|CONFIG_INOTIFY_USER' — both must be =y"
+        );
+        return ScxAttachStatus::SysfsAbsent;
+    }
+    // Reusable read buffer for the attribute file. Keeping the
+    // allocation across iterations is the steady-state fast path.
+    let mut buf = String::with_capacity(64);
     let interval_ms_clamped = interval.as_millis().min(i32::MAX as u128) as i32;
     loop {
-        // The kernel populates `sch->ops.name` before the kobject is
-        // added, so the file becomes readable and non-empty the
-        // moment registration succeeds. Absent / empty => no
-        // registration yet (either no scheduler has reached
-        // scx_alloc_and_add_sched or the sysfs tree is still being
-        // torn down by a previous scheduler's exit).
-        match fs::read_to_string(SYSFS_SCHED_EXT_ROOT_OPS) {
-            Ok(contents) => {
+        buf.clear();
+        let read_outcome = std::fs::File::open(SYSFS_SCHED_EXT_ROOT_OPS).and_then(|mut f| {
+            use std::io::Read;
+            f.read_to_string(&mut buf)
+        });
+        match read_outcome {
+            Ok(_) => {
                 ever_read_ok = true;
-                if !contents.trim().is_empty() {
-                    // `attr_fd` Drop closes the OwnedFd on return.
+                if !buf.trim().is_empty() {
                     return ScxAttachStatus::Attached;
                 }
             }
             Err(_) => {
-                // Leave `ever_read_ok` unchanged — every transient or
-                // permanent failure counts toward SysfsAbsent unless
-                // at least one success flipped the flag.
+                // Leave `ever_read_ok` unchanged.
             }
         }
         let now = std::time::Instant::now();
         if now.duration_since(start) >= timeout {
-            // `attr_fd` Drop closes the OwnedFd on return.
-            return if ever_read_ok {
+            let status = if ever_read_ok {
                 ScxAttachStatus::Timeout
             } else {
                 ScxAttachStatus::SysfsAbsent
             };
+            // Per "log on timeout when no error surfaces": the typed
+            // return is consumed by callers that may not propagate
+            // it as an error (Op dispatch wraps it into NotAttached
+            // which IS an error, but boot-time callers may surface
+            // a synthesized log instead). Log here so a timeout is
+            // always visible in /tmp/ktstr*.log even when the typed
+            // return is later swallowed by retry logic.
+            tracing::warn!(
+                elapsed_s = start.elapsed().as_secs_f64(),
+                timeout_s = timeout.as_secs_f64(),
+                ever_read_ok,
+                status = ?status,
+                "poll_scx_attached: timeout — sched_ext attach not observed \
+                 within deadline"
+            );
+            return status;
         }
         let remaining_ms = (start + timeout - now)
             .as_millis()
             .min(interval_ms_clamped as u128) as i32;
-        if let Some(ref fd) = attr_fd {
-            // poll(POLLPRI) is the kernfs notification mechanism
-            // for attribute content changes. Cap the wait at the
-            // requested polling interval so we never exceed the
-            // caller's responsiveness contract — kernfs may not
-            // emit POLLPRI for this attribute (the kernel-side
-            // callsite must explicitly call `sysfs_notify`), in
-            // which case poll returns 0 at `interval_ms_clamped`
-            // and we re-read.
-            //
-            // sysfs/kernfs does not reliably emit inotify/epoll
-            // events for attribute content changes; this poll is
-            // the supported mechanism per `kernfs_fop_poll` plus
-            // the read-fallback that catches changes the producer
-            // didn't notify on.
-            let mut pfd = libc::pollfd {
-                fd: fd.as_raw_fd(),
-                events: libc::POLLPRI,
-                revents: 0,
-            };
-            // SAFETY: pfd is a single-element pollfd; nfds is 1.
-            // Return value not consulted — the loop re-reads the
-            // file each iteration regardless of poll outcome.
-            let _ = unsafe { libc::poll(&mut pfd, 1, remaining_ms) };
-        } else {
-            // Open failed (e.g. attribute not present yet). Sleep
-            // the polling cadence — sysfs does not provide an
-            // event source for "attribute appears", so we have to
-            // re-attempt the open via `read_to_string` at the
-            // interval the caller requested.
-            //
-            // sysfs/kernfs does not provide an event source for
-            // attribute appearance; polling is the supported
-            // mechanism.
-            std::thread::sleep(std::time::Duration::from_millis(remaining_ms.max(0) as u64));
+        // SAFETY: pfds has nfds valid entries; nfds <= 2 < array len.
+        // poll(2) resets revents in place each call; the array is
+        // safe to reuse across iterations per POSIX.
+        let _ = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, remaining_ms) };
+        // Drain inotify events so the fd doesn't stay readable
+        // and spin the next poll. We only care about the wake,
+        // not the event contents — the attribute re-read is the
+        // source of truth.
+        if let Some(ref fd) = inotify_fd {
+            let mut drain_buf = [0u8; 4096];
+            loop {
+                let n = unsafe {
+                    libc::read(
+                        fd.as_raw_fd(),
+                        drain_buf.as_mut_ptr().cast(),
+                        drain_buf.len(),
+                    )
+                };
+                if n <= 0 {
+                    break;
+                }
+            }
         }
     }
 }
@@ -2906,6 +3054,15 @@ pub(crate) enum SpawnSchedulerError {
     /// the bind to `/sys/kernel/sched_ext/root/ops` lands.
     /// `log_path` is the file the spawn helper wrote
     /// stdout+stderr into; callers use it for `dump_sched_output`.
+    ///
+    /// **Post-mortem state guarantee.** [`try_spawn_scheduler`]
+    /// returns this variant only AFTER clearing [`SCHED_PID`] to 0
+    /// (the dead pid was published optimistically at spawn so the
+    /// sched_exit_monitor caller path could install against a known
+    /// id; the StartupDied branch never gets that far so the spawn
+    /// helper owns the rollback). The process is already reaped via
+    /// `poll_startup`'s internal `try_wait`. No manual cleanup
+    /// required by the caller.
     StartupDied { log_path: String },
 
     /// Process is alive past the liveness window but
@@ -2915,6 +3072,14 @@ pub(crate) enum SpawnSchedulerError {
     /// caller (boot path → `force_reboot`, Op path → bail) uses
     /// `log_path` to surface the scheduler's own diagnostic
     /// output.
+    ///
+    /// **Post-mortem state guarantee.** [`try_spawn_scheduler`]
+    /// returns this variant only AFTER SIGKILLing the orphan
+    /// process (which is alive but not bound to scx, so it would
+    /// otherwise keep running and could late-bind on the next
+    /// scheduler attempt) and waiting on it via `child.wait()` to
+    /// reap the zombie, plus clearing [`SCHED_PID`] to 0. No manual
+    /// cleanup required by the caller.
     NotAttached {
         reason: &'static str,
         log_path: String,
@@ -2930,15 +3095,33 @@ impl std::fmt::Display for SpawnSchedulerError {
             Self::StartupDied { log_path } => {
                 write!(
                     f,
-                    "scheduler died during the liveness window \
-                     (log captured at {log_path})"
+                    "scheduler exited before passing the 1-second liveness gate \
+                     (framework waits for the scheduler binary to remain alive at \
+                     least 1 s before checking for sched_ext bind via /sys/kernel/\
+                     sched_ext/root/ops). Common causes: BPF verifier rejection \
+                     (look for 'libbpf' / 'verifier' lines in the log), missing \
+                     CONFIG_SCHED_CLASS_EXT, scheduler binary segfault at init, \
+                     argv validation failure. Log content rendered below as part \
+                     of the failure dump (log captured at {log_path}); the process \
+                     was reaped and SCHED_PID cleared before this error surfaced."
                 )
             }
             Self::NotAttached { reason, log_path } => {
                 write!(
                     f,
-                    "scheduler alive but did not bind to sched_ext: \
-                     {reason} (log captured at {log_path})"
+                    "scheduler alive but did not bind to sched_ext within the \
+                     attach window: {reason} (framework polls /sys/kernel/sched_ext/\
+                     root/ops for the BPF scheduler attach marker after the \
+                     scheduler binary's liveness gate; this variant surfaces when \
+                     the binary stayed alive but never wrote the bind marker). \
+                     Common causes for 'timeout': BPF program load stalled on a \
+                     slow CI runner past the 10s window, verifier ran long but \
+                     succeeded eventually (bump the window or warm the BPF cache). \
+                     Common causes for 'sched_ext sysfs absent': kernel built \
+                     without CONFIG_SCHED_CLASS_EXT (rebuild with that config). \
+                     Log content rendered below as part of the failure dump (log \
+                     captured at {log_path}); the framework SIGKILLed and reaped \
+                     the orphan + cleared SCHED_PID before this error surfaced."
                 )
             }
         }
@@ -3033,9 +3216,19 @@ pub(crate) fn try_spawn_scheduler(
         std::time::Duration::from_millis(50),
         std::time::Duration::from_secs(1),
     ) {
-        StartupStatus::Died => Err(SpawnSchedulerError::StartupDied {
-            log_path: log_path.to_string(),
-        }),
+        StartupStatus::Died => {
+            // Process already exited — SIGCHLD reaped via poll_startup's
+            // try_wait. SCHED_PID still points at the dead pid; clear so a
+            // subsequent Op dispatch's sched_pid() returns None instead of
+            // the stale dead/recycled id. The pid was published optimistically
+            // at spawn so the sched_exit_monitor caller path can install
+            // against a known id, but the StartupDied branch never gets that
+            // far so we own the rollback.
+            SCHED_PID.store(0, Ordering::Release);
+            Err(SpawnSchedulerError::StartupDied {
+                log_path: log_path.to_string(),
+            })
+        }
         StartupStatus::Alive => {
             // Verify the scheduler actually BOUND to sched_ext —
             // a scheduler process can be alive but stuck in its
@@ -3043,9 +3236,19 @@ pub(crate) fn try_spawn_scheduler(
             // would leave the test running against the default
             // kernel scheduler without the host ever noticing.
             // `root/ops` is the post-attach marker.
+            //
+            // 10s budget aligns with SCHED_LIFECYCLE_KILL_GRACE on
+            // the kill side. A cold-cache BPF verifier + cgroup_init
+            // walking all tasks can plausibly run 5s+ on a slow CI
+            // runner; the prior 3s budget produced sporadic
+            // NotAttached(Timeout) returns under load even when the
+            // scheduler eventually bound seconds later. The 10s
+            // ceiling still surfaces real verifier-reject /
+            // ops-mismatch failures fast enough for an operator to
+            // act, while giving headroom for warm-boot timing.
             let status = poll_scx_attached(
                 std::time::Duration::from_millis(50),
-                std::time::Duration::from_secs(3),
+                std::time::Duration::from_secs(10),
             );
             if !status.is_attached() {
                 let reason = match status {
@@ -3053,6 +3256,21 @@ pub(crate) fn try_spawn_scheduler(
                     ScxAttachStatus::SysfsAbsent => "sched_ext sysfs absent",
                     ScxAttachStatus::Attached => unreachable!(),
                 };
+                // The process is ALIVE (poll_startup said so) but never
+                // bound to sched_ext. If we just return Err, the orphaned
+                // process keeps running and may bind LATE — polluting kernel
+                // state for the next Op dispatch (next AttachScheduler would
+                // see root/ops populated by an unknown owner; next Replace
+                // would race against the stale scheduler's eventual death).
+                // SIGKILL + waitpid here removes the orphan deterministically.
+                // SIGKILL not SIGTERM: the process never bound to scx so there's
+                // no in-kernel scheduler state to tear down via the libbpf path.
+                let pid = child.id() as libc::pid_t;
+                unsafe {
+                    let _ = libc::kill(pid, libc::SIGKILL);
+                }
+                let _ = child.wait();
+                SCHED_PID.store(0, Ordering::Release);
                 return Err(SpawnSchedulerError::NotAttached {
                     reason,
                     log_path: log_path.to_string(),

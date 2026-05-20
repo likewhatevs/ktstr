@@ -127,6 +127,26 @@ pub(super) fn republish_watchpoint_on_rebind(
         watchpoint
             .kind_host_ptr
             .store(std::ptr::null_mut(), Ordering::Release);
+        // Also clear the sticky `hit` flag. The watchpoint fired
+        // on the kernel's `*scx_root->exit_kind` write that
+        // immediately precedes scx_root_disable's
+        // `RCU_INIT_POINTER(scx_root, NULL)` (see
+        // kernel/sched/ext.c:5735 scx_root_disable + L5859
+        // kobject_del); the fire is the in-progress teardown the
+        // disarm path is closing out. Leaving `hit = true` after
+        // a disarm causes the late-trigger arm at
+        // freeze_coord/mod.rs to re-observe `watchpoint_hit =
+        // true` next iteration AND see `request_kva = 0`, falling
+        // into the gate's "prereq missing → do not gate" fallback
+        // at L5600 — which produces a bogus Captured dump for
+        // every intentional Op::Detach / Op::Replace scx_disable.
+        // Real errors are still captured: the BPF
+        // `ktstr_err_exit_detected` latch (probe.bpf.c:687) sets
+        // BEFORE the scx_disable_workfn that runs scx_root_disable,
+        // so `bss_state == Triggered` fires the late-trigger arm
+        // via `compute_err_triggered` independently of
+        // `watchpoint.hit`.
+        watchpoint.hit.store(false, Ordering::Release);
         return WatchpointPublishResult::Detached;
     }
     if last_sched_kva != 0 {
@@ -141,6 +161,13 @@ pub(super) fn republish_watchpoint_on_rebind(
         watchpoint
             .kind_host_ptr
             .store(std::ptr::null_mut(), Ordering::Release);
+        // Same rationale as the Detached arm above: the
+        // pre-rebind fire was on the OLD scheduler's exit_kind
+        // write during its scx_disable; leaving `hit = true`
+        // poisons the late-trigger arm on the new scheduler's
+        // first iteration. BPF bss latch independently catches
+        // real errors on the old scheduler.
+        watchpoint.hit.store(false, Ordering::Release);
         return WatchpointPublishResult::RebindDisarmed {
             previous: last_sched_kva,
             next: sched_kva,

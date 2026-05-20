@@ -1032,16 +1032,39 @@ fn run_scenario(
 /// narrow the remaining window rather than extending it.
 ///
 /// Failure handling: if `pidfd_open` returns `ESRCH`, the scheduler
-/// is already gone — return `true` immediately without sleeping. If
-/// it returns any other unexpected errno (e.g. on a kernel without
-/// `pidfd_open` support), log a warning and fall back to a
-/// `thread::sleep` for the full duration plus a final
-/// [`process_alive`] check. The fallback loses sub-poll-tick
-/// detection latency but preserves the boolean contract.
+/// is already gone — return `true` immediately without sleeping. Any
+/// other failure mode (pidfd_open non-ESRCH, epoll_create1,
+/// epoll_ctl ADD, EpollTimeout::try_from, epoll_wait) panics with an
+/// operator-actionable message. Polling fallbacks were removed per
+/// the project-wide "no polling fallbacks for evented paths" rule:
+/// pidfd_open has shipped since Linux 5.3 and epoll has been
+/// universally available for longer, so a failure here indicates a
+/// catastrophic environment defect (memory pressure exhausting fds,
+/// kernel feature compiled out) rather than a recoverable transient.
+/// A loud panic surfaces the defect immediately; the prior silent
+/// sleep+probe fallback masked it as test flakiness.
 ///
 /// Scheduling jitter under load can leave the actual elapsed time
 /// modestly above `dur`.
-fn sleep_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
+/// Loud panic on env- or code-defect failures inside [`hold_or_sched_died`].
+/// Centralised so every site emits the same module-qualified prefix
+/// `ktstr::scenario::hold_or_sched_died` — operator can grep that exact
+/// string to land at the panic source. `op` names the failed primitive,
+/// `pid` carries the in-scope pid for cross-reference with /proc, `err`
+/// renders the underlying errno or nix error, `advice` is the one-line
+/// remediation classified by failure class (env vs framework code defect).
+#[cold]
+#[track_caller]
+fn panic_evented_hold_defect(
+    op: &str,
+    pid: libc::pid_t,
+    err: impl std::fmt::Display,
+    advice: &str,
+) -> ! {
+    panic!("ktstr::scenario::hold_or_sched_died: {op} failed (pid={pid}): {err} — {advice}");
+}
+
+fn hold_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
     use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 
@@ -1066,17 +1089,20 @@ fn sleep_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
             // even attach a waiter — sched is already dead.
             return true;
         }
-        // Unexpected pidfd_open failure — fall back to a single
-        // sleep + final liveness probe. Logged so unexpected errnos
-        // don't disappear silently.
-        tracing::warn!(
-            target: "ktstr::scenario",
+        // pidfd_open shipped unconditionally in Linux 5.3 and ktstr's
+        // kernel floor is well above that. A non-ESRCH failure (ENOMEM,
+        // ENFILE, EPERM) means the test environment is broken in a way
+        // polling cannot recover from. Panic loudly so the operator
+        // sees the env defect instead of silently losing sched-died
+        // detection for the rest of the hold.
+        panic_evented_hold_defect(
+            "pidfd_open",
             pid,
-            error = %err,
-            "pidfd_open failed; falling back to sleep + final process_alive check"
+            format_args!("{err} (errno {:?})", err.raw_os_error()),
+            "pidfd_open is unconditional from Linux 5.3; failure on a \
+             5.3+ kernel = env defect — check ulimit -n / memory pressure / \
+             cgroup pids.max",
         );
-        thread::sleep(dur);
-        return !process_alive(pid);
     }
     // SAFETY: the syscall succeeded and returned a fresh fd; it is
     // not registered with any other owner.
@@ -1087,30 +1113,28 @@ fn sleep_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
     let epoll = match Epoll::new(EpollCreateFlags::EPOLL_CLOEXEC) {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!(
-                target: "ktstr::scenario",
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&pidfd);
+            panic_evented_hold_defect(
+                "epoll_create1(EPOLL_CLOEXEC)",
                 pid,
-                error = %e,
-                "epoll_create1 failed for pidfd waiter; falling back to sleep + final process_alive check"
+                format_args!("{e} (pidfd={fd})"),
+                "epoll has been universally available since 2.6; failure = \
+                 env defect — check ulimit -n and CONFIG_EPOLL",
             );
-            drop(pidfd);
-            thread::sleep(dur);
-            return !process_alive(pid);
         }
     };
     // `data` field is unused — we only ever watch one fd. The add()
     // syscall still needs an `EpollEvent` with populated events.
     let event = EpollEvent::new(EpollFlags::EPOLLIN, 0);
     if let Err(e) = epoll.add(pidfd.as_fd(), event) {
-        tracing::warn!(
-            target: "ktstr::scenario",
+        panic_evented_hold_defect(
+            "epoll_ctl(ADD)",
             pid,
-            error = %e,
-            "epoll_ctl ADD pidfd failed; falling back to sleep + final process_alive check"
+            e,
+            "epoll_ctl(ADD) on a freshly-opened pidfd should never fail \
+             in a healthy kernel; documented errors (EBADF/EEXIST/ENOMEM) \
+             are env defects — likely fd exhaustion or memory pressure",
         );
-        drop(pidfd);
-        thread::sleep(dur);
-        return !process_alive(pid);
     }
 
     let deadline = std::time::Instant::now() + dur;
@@ -1126,24 +1150,24 @@ fn sleep_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
         }
 
         // `PollTimeout` (aliased as `EpollTimeout`) stores the value
-        // as `i32`, so `TryFrom<u32>` rejects any input larger than
-        // `i32::MAX` (~24.8 days of milliseconds). Clamp `u128 →
-        // u32` and then `u32 → i32`-range so a `Duration::MAX`
-        // remainder saturates to the max accepted value instead of
-        // bubbling up a conversion error.
-        let ms_u32 = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX);
-        let ms_u32 = std::cmp::min(ms_u32, i32::MAX as u32);
-        let timeout_param = match EpollTimeout::try_from(ms_u32) {
+        // as `i32`. Single-pass clamp via `u128 → i32::MAX` so a
+        // `Duration::MAX` remainder saturates at the max accepted
+        // value instead of overflowing through the intermediate u32.
+        let ms_i32 = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let timeout_param = match EpollTimeout::try_from(ms_i32) {
             Ok(t) => t,
             Err(e) => {
-                tracing::warn!(
-                    target: "ktstr::scenario",
+                // ms_i32 was clamped to the i32 range above so
+                // EpollTimeout::try_from (which accepts i32) cannot
+                // overflow. Reaching this arm means the EpollTimeout API
+                // changed shape — code defect, not env transient.
+                panic_evented_hold_defect(
+                    "EpollTimeout::try_from",
                     pid,
-                    error = %e,
-                    "epoll timeout conversion failed; falling back to sleep + final process_alive check"
+                    format_args!("{e} (input={ms_i32})"),
+                    "input was pre-clamped to fit i32; failure indicates an \
+                     upstream nix EpollTimeout API change requiring code update",
                 );
-                thread::sleep(remaining);
-                return !process_alive(pid);
             }
         };
 
@@ -1163,14 +1187,16 @@ fn sleep_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
                 // the remaining window.
             }
             Err(e) => {
-                tracing::warn!(
-                    target: "ktstr::scenario",
+                panic_evented_hold_defect(
+                    "epoll_wait",
                     pid,
-                    error = %e,
-                    "epoll_wait failed; falling back to sleep + final process_alive check"
+                    e,
+                    "epoll_wait on a freshly-created epoll with a single \
+                     valid pidfd cannot legitimately fail outside EINTR; \
+                     documented errors (EBADF/EFAULT/EINVAL) are framework- \
+                     internal memory-safety defects — investigate concurrent \
+                     fd mutation or stack-frame corruption",
                 );
-                thread::sleep(remaining);
-                return !process_alive(pid);
             }
         }
     }
@@ -1234,8 +1260,7 @@ fn run_step<'a>(
                 // Live `sched_pid()` read so a mid-loop
                 // Op::ReplaceScheduler swap is watched at the NEW
                 // pid, not the stale boot snapshot in ctx.
-                if sleep_or_sched_died(remaining.min(interval), crate::vmm::rust_init::sched_pid())
-                {
+                if hold_or_sched_died(remaining.min(interval), crate::vmm::rust_init::sched_pid()) {
                     *sched_died_during_hold = true;
                     return Ok(());
                 }
@@ -1274,7 +1299,7 @@ fn run_step<'a>(
             // Live `sched_pid()` read — matches the loop arm above
             // so the hold watches the post-Op::ReplaceScheduler
             // pid, not the stale boot snapshot.
-            if sleep_or_sched_died(hold_dur, crate::vmm::rust_init::sched_pid()) {
+            if hold_or_sched_died(hold_dur, crate::vmm::rust_init::sched_pid()) {
                 *sched_died_during_hold = true;
                 return Ok(());
             }
@@ -3191,19 +3216,164 @@ const SCX_STATE_SYSFS: &str = "/sys/kernel/sched_ext/state";
 /// no detach to wait for and the next spawn will fail later with
 /// a sharper diagnostic if scx is genuinely required.
 fn wait_for_scx_disabled(timeout: std::time::Duration) -> Result<std::time::Duration> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::io::{FromRawFd, OwnedFd};
+
     let start = std::time::Instant::now();
-    let interval = std::time::Duration::from_millis(50);
+    let interval_ms: i32 = 50;
     let path = std::path::Path::new(SCX_STATE_SYSFS);
     if !path.exists() {
         return Ok(std::time::Duration::ZERO);
     }
+
+    // Reusable read buffer for the state file. `String::clear` keeps
+    // the heap allocation across iterations so the steady-state
+    // wait costs zero per-iteration allocations. Inlined open+read
+    // (rather than a closure returning &str) avoids the
+    // can't-annotate-closure-lifetime constraint.
+    let mut buf = String::with_capacity(32);
+
+    // Fast path: re-check state at entry before any wake-source
+    // setup so callers that arrive after the kernel already flipped
+    // to "disabled" pay zero syscall overhead beyond the read itself.
+    let _ = std::fs::File::open(SCX_STATE_SYSFS).and_then(|mut f| {
+        use std::io::Read;
+        f.read_to_string(&mut buf)
+    });
+    if buf.trim_end() == "disabled" {
+        return Ok(start.elapsed());
+    }
+
+    // Two evented wake sources, polled together so a wake on either
+    // re-reads the state file with minimal latency:
+    //
+    // 1. POLLPRI on the open state fd. kernfs delivers POLLPRI when
+    //    the producer calls `sysfs_notify` (kernel/fs/kernfs/file.c
+    //    `kernfs_fop_poll`). scx_set_enable_state doesn't currently
+    //    emit `sysfs_notify`, but if it ever does we get instant
+    //    wakeup.
+    //
+    // 2. inotify on the parent directory `/sys/kernel/sched_ext/`
+    //    for IN_DELETE on "root". kernfs honors directory-delete
+    //    inotify events: when scx_root_disable calls `kobject_del`
+    //    at kernel/sched/ext.c:5859 the kernfs directory entry is
+    //    removed and inotify fires. The kernel comment at L5854-5858
+    //    explicitly orders kobject_del BEFORE the state flip at
+    //    L5865 (scx_set_enable_state(SCX_DISABLED)).
+    //
+    // REQUIRED CADENCE. The `interval_ms` parameter caps each poll(2)
+    // wait at 50 ms. Verified at kernel/sched/ext.c:5735
+    // scx_root_disable: between kobject_del (line 5859, fires
+    // IN_DELETE) and the state flip (line 5865,
+    // scx_set_enable_state(SCX_DISABLED)) the kernel performs
+    // free_kick_syncs() + mutex_unlock(&scx_enable_mutex) + the
+    // atomic_xchg of the state. The gap is sub-microsecond in the
+    // common case but theoretically present. CRITICALLY: scx emits
+    // NO further event for the state-attribute transition — there
+    // is no sysfs_notify on the state attribute and IN_DELETE has
+    // already fired. So an IN_DELETE wake that catches the pre-flip
+    // state has NO further event to wait on. Without the cadence
+    // cap, the loop would block until the overall deadline (typically
+    // SCHED_LIFECYCLE_KILL_GRACE = 10 s) before re-reading. The 50 ms
+    // cap bounds that wait to the next re-read. NOT a polling
+    // fallback for failed evented setup; it is the only mechanism
+    // that closes the kernel-side ordering gap between the IN_DELETE
+    // event and the state-attribute transition. Per the project
+    // rule "guard rail deadlines/timeouts are ok; everything should
+    // be evented not polling" — the 50 ms cap is the necessary
+    // guard rail for a kernel-mechanic gap, not a degraded polling
+    // path.
+    let state_fd: Option<OwnedFd> = {
+        let raw = unsafe { libc::open(c"/sys/kernel/sched_ext/state".as_ptr(), libc::O_RDONLY) };
+        if raw < 0 {
+            None
+        } else {
+            // SAFETY: raw is a valid fd we just opened.
+            Some(unsafe { OwnedFd::from_raw_fd(raw) })
+        }
+    };
+    let inotify_fd: Option<OwnedFd> = {
+        let init = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if init < 0 {
+            None
+        } else {
+            // SAFETY: init is a valid fd we just opened.
+            let owned = unsafe { OwnedFd::from_raw_fd(init) };
+            let wd = unsafe {
+                libc::inotify_add_watch(
+                    owned.as_raw_fd(),
+                    c"/sys/kernel/sched_ext/".as_ptr(),
+                    libc::IN_DELETE,
+                )
+            };
+            if wd < 0 { None } else { Some(owned) }
+        }
+    };
+
+    // Build the pollfd set ONCE — fds are stable for the lifetime of
+    // the wait, only revents changes per poll. `nfds` records how
+    // many entries are populated (max 2; the slots not used stay
+    // as the zero-init sentinel with fd=-1 which poll(2) ignores).
+    let mut pfds: [libc::pollfd; 2] = [
+        libc::pollfd {
+            fd: -1,
+            events: 0,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: -1,
+            events: 0,
+            revents: 0,
+        },
+    ];
+    let mut nfds: libc::nfds_t = 0;
+    if let Some(ref fd) = state_fd {
+        pfds[nfds as usize] = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLPRI,
+            revents: 0,
+        };
+        nfds += 1;
+    }
+    if let Some(ref fd) = inotify_fd {
+        pfds[nfds as usize] = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        nfds += 1;
+    }
+    if nfds == 0 {
+        // Both state_fd open and inotify_add_watch failed. We target
+        // kernel 6.12+ where kernfs + inotify are universal, so the
+        // path-exists-but-attribute-fd-unopenable branch indicates a
+        // fundamental env defect. Bail with an actionable recipe.
+        anyhow::bail!(
+            "wait_for_scx_disabled: could not subscribe to evented wake \
+             sources (state fd open failed AND inotify_add_watch on \
+             /sys/kernel/sched_ext/ failed). Diagnose: \
+             (1) does '/sys/kernel/sched_ext/state' exist AND contain \
+             'disabled' or 'enabled'? If absent/garbage the kernel was \
+             built without CONFIG_SCHED_CLASS_EXT — rebuild with that \
+             config. \
+             (2) zcat /proc/config.gz | grep CONFIG_INOTIFY_USER must be \
+             =y — without it the framework's evented wake can't \
+             subscribe; rebuild with CONFIG_INOTIFY_USER=y."
+        );
+    }
+
     loop {
-        let state = std::fs::read_to_string(SCX_STATE_SYSFS).unwrap_or_default();
-        let state = state.trim();
+        buf.clear();
+        let _ = std::fs::File::open(SCX_STATE_SYSFS).and_then(|mut f| {
+            use std::io::Read;
+            f.read_to_string(&mut buf)
+        });
+        let state = buf.trim_end();
         if state == "disabled" {
             return Ok(start.elapsed());
         }
-        if start.elapsed() >= timeout {
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
             anyhow::bail!(
                 "wait_for_scx_disabled: state '{state}' did not reach 'disabled' \
                  within {timeout:?}; the kernel scx state machine is stuck — \
@@ -3212,7 +3382,31 @@ fn wait_for_scx_disabled(timeout: std::time::Duration) -> Result<std::time::Dura
                  disable transition.",
             );
         }
-        std::thread::sleep(interval);
+        let remaining = timeout - elapsed;
+        let cadence_cap = std::time::Duration::from_millis(interval_ms as u64);
+        let wait_ms = remaining.min(cadence_cap).as_millis().min(i32::MAX as u128) as i32;
+        // SAFETY: pfds has nfds valid entries; nfds <= 2 < array len.
+        // poll(2) resets the revents field of each pollfd in place
+        // before returning, so reusing the same array across iterations
+        // is the documented contract.
+        let _ = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, wait_ms) };
+        // Drain inotify so the fd doesn't stay readable across
+        // iterations and spin the next poll.
+        if let Some(ref fd) = inotify_fd {
+            let mut drain_buf = [0u8; 4096];
+            loop {
+                let n = unsafe {
+                    libc::read(
+                        fd.as_raw_fd(),
+                        drain_buf.as_mut_ptr().cast(),
+                        drain_buf.len(),
+                    )
+                };
+                if n <= 0 {
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -3474,30 +3668,54 @@ fn dispatch_replace_scheduler(scheduler: &'static crate::test_support::Scheduler
     // log path matches the spawn_scheduler_for_op log arg above so
     // failure-dump output goes to the new scheduler's own file.
     crate::vmm::rust_init::restart_sched_exit_monitor_with_log(Some(&log));
-    // Capture the publish seqno AFTER kill+spawn (not before kill).
-    // Any worker publish triggered by a prior detach (concurrent
-    // coord scan-tick during our kill) lands while the BPF maps
-    // for the OLD scheduler are still in the slab — that publish
-    // would satisfy a pre-kill-baseline gate and let
-    // `Snapshot::active()` return stale OLD state. Capturing AFTER
-    // the new scheduler is spawned excludes any race-bump from
-    // `seqno_before` so the wait MUST observe a SUBSEQUENT publish,
-    // which structurally has to be the worker re-init triggered by
-    // our newly-spawned scheduler. None → bridge isn't installed
-    // (test harness path); the wait degenerates to Ok(0).
+    // Quiesce the worker before capturing the baseline seqno.
+    // Symmetric with Op::AttachScheduler's wait at L3377-3382:
+    // without this gate, a coord scan tick that fired during
+    // kill_current_scheduler (which can take up to
+    // SCHED_LIFECYCLE_KILL_GRACE = 10 s) may still be in a
+    // TRYING worker-state when we capture seqno_before. If that
+    // in-flight publish completes between our seqno_before snapshot
+    // and the wait below, the wait's seqno-advance gate fires on a
+    // publish against OLD scheduler state — the operator's
+    // post-swap `Snapshot::active()` then surfaces stale OLD data
+    // even though the new scheduler is running fine. 5 s deadline
+    // matches Attach's per-pulse expectation (coord scan tick +
+    // from_elf_with_hint at tens-of-ms scale); FAILED arms bail
+    // with the worker-state diagnostic for the caller's `?` to
+    // surface as a typed Op failure. The deadline is tighter than
+    // Attach's first-boot budget because by the time we reach
+    // Replace the slab has been live for the prior scheduler's
+    // whole hold so no first-boot 60 s slab-settle headroom is
+    // needed.
+    let not_trying_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    if let Some(result) = crate::scenario::snapshot::with_active_bridge(|b| {
+        b.wait_for_worker_state_not_trying(not_trying_deadline, "Op::ReplaceScheduler")
+    }) {
+        result?;
+    }
+    // Capture the publish seqno AFTER the worker-not-trying gate
+    // above. The gate guarantees worker_state ∈ {SUCCEEDED,
+    // FAILED_PERMANENTLY}, so any seqno advance the wait below
+    // observes MUST originate from the worker re-init triggered
+    // by our newly-spawned scheduler (the coord's Published-arm
+    // pulse fires reinit_evt for the new BPF object). None →
+    // bridge isn't installed (test harness path); the wait
+    // degenerates to Ok(0).
     let seqno_before =
         crate::scenario::snapshot::with_active_bridge(|b| b.accessor_publish_seqno()).unwrap_or(0);
-    // 5s deadline: the worker's no-deadline reinit path runs after
-    // a successful first-attach so the typical post-swap reinit
-    // budget is one freeze-coord scan tick (250ms at
-    // src/vmm/freeze_coord/mod.rs SCAN_INTERVAL) plus
-    // from_elf_with_hint's tens of ms. 5s gives 20× margin while
-    // bounding op latency. A timeout surfaces as an actionable
-    // anyhow::bail with the worker-state sentinel attached.
+    // 10s deadline: a cold-cache vmlinux re-parse during the worker
+    // reinit can run several seconds on a slow CI runner. The prior 5s
+    // ceiling produced sporadic timeouts when the kernel cache was cold.
+    // 10s aligns with SCHED_LIFECYCLE_KILL_GRACE — still asymmetric vs
+    // Op::AttachScheduler's 30s budget (which covers a from-scratch
+    // attach with no warm worker state to leverage) but covers the
+    // realistic post-swap reinit window with margin. A timeout surfaces
+    // as an actionable anyhow::bail with the worker-state sentinel
+    // attached.
     wait_for_accessor_publish_or_bail(
         "Op::ReplaceScheduler",
         seqno_before,
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(10),
     )?;
     tracing::info!(
         op = "ReplaceScheduler",
@@ -4646,7 +4864,7 @@ mod tests {
     /// completes, the mock's SetCpuset count proves the loop actually
     /// repeated — distinguishing the Loop path from the Fixed/Frac
     /// single-apply path. `sched_pid = None` (inherited from `mock_ctx`)
-    /// makes `sleep_or_sched_died` a plain sleep with no liveness probe
+    /// makes `hold_or_sched_died` a plain sleep with no liveness probe
     /// (verified at mod.rs:993-996), so the loop exits cleanly on the
     /// duration deadline rather than on a spurious dead-scheduler signal.
     /// `duration` is overridden to 150ms (vs `mock_ctx`'s 1-second
@@ -4748,7 +4966,7 @@ mod tests {
     /// that skipped the first apply_ops (0 calls) AND a regression
     /// in the deadline-min logic at mod.rs:1175 that let the second
     /// iteration's sleep underflow (2+ calls). The boundary behavior
-    /// at mod.rs:1175-1179 (`sleep_or_sched_died(remaining.min(interval), ...)`)
+    /// at mod.rs:1175-1179 (`hold_or_sched_died(remaining.min(interval), ...)`)
     /// ensures sleep is capped at the remaining time so the loop
     /// exits promptly on the next deadline check.
     #[test]
@@ -4842,7 +5060,7 @@ mod tests {
     }
 
     /// The Loop arm's sched-died-early-exit path (mod.rs:1177-1180)
-    /// fires when `sleep_or_sched_died` observes the scheduler pid
+    /// fires when `hold_or_sched_died` observes the scheduler pid
     /// has exited mid-loop. Setting `sched_died_during_hold = true`
     /// and returning `Ok(())` is the contract — the outer caller
     /// (mod.rs:911-922) reads the flag and stamps one of
@@ -4856,7 +5074,7 @@ mod tests {
     /// Implementation: use `libc::pid_t::MAX` as the dead pid. The
     /// kernel's PID_MAX_LIMIT (include/linux/threads.h) caps real
     /// pids well below `i32::MAX`, so `pidfd_open` on `pid_t::MAX`
-    /// always returns ESRCH, which `sleep_or_sched_died` maps to
+    /// always returns ESRCH, which `hold_or_sched_died` maps to
     /// "dead, return true." This pattern matches
     /// [`crate::scenario::process_alive_nonexistent_pid`] (the same
     /// trick is used to assert process-alive's no-such-pid path
@@ -4887,7 +5105,7 @@ mod tests {
         // exit on iteration 1 long before this deadline anyway.
         ctx.duration = Duration::from_millis(150);
         // libc::pid_t::MAX is above kernel PID_MAX_LIMIT, so
-        // pidfd_open inside sleep_or_sched_died returns ESRCH
+        // pidfd_open inside hold_or_sched_died returns ESRCH
         // immediately. Same trick as scenario::process_alive's
         // no-such-pid test. Publishes via the SCHED_PID atomic
         // because the death-detection sites in apply_ops read
@@ -4949,7 +5167,7 @@ mod tests {
             .filter(|c| matches!(c, CgroupCall::SetCpuset(name, _) if name == "died_test"))
             .count();
         // First iteration's apply_ops at mod.rs:1175 fires BEFORE
-        // sleep_or_sched_died at mod.rs:1177, so a sched-died-from-
+        // hold_or_sched_died at mod.rs:1177, so a sched-died-from-
         // entry still records exactly one SetCpuset call. A
         // regression that DROPPED the early-exit (loop runs all
         // iterations after the death is observed) would surface as

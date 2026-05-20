@@ -613,24 +613,29 @@ impl SnapshotBridge {
     }
 
     /// Block on the dispatcher-wake EventFd for up to `remaining`.
-    /// Returns regardless of cause (POLLIN, POLLNVAL, timeout) —
-    /// the caller's atomic re-check after poll-return is the source
-    /// of truth; this is just a "wait for SOMETHING to happen".
-    /// `EFD_NONBLOCK`-set fd's `read` is best-effort and ignored
-    /// (the seqno bump or worker_state store carries the actual
-    /// signal). When the bridge was built without a wake fd or
-    /// `remaining` is zero, returns immediately without sleeping.
+    /// Caller's atomic re-check after return is the source of truth.
+    /// Panics if the with_accessor_state coupling invariant is
+    /// violated (see body's unreachable! arm).
+    ///
+    /// Uses raw libc::poll rather than nix::poll::poll because the
+    /// underlying [`vmm_sys_util::eventfd::EventFd`] doesn't impl
+    /// `AsFd`, only `AsRawFd`; the cleaner nix path would require
+    /// an unsafe `BorrowedFd::borrow_raw` wrapper, leaving the
+    /// unsafe surface identical to libc::poll. No net reduction —
+    /// keep the simpler libc call.
     fn poll_dispatcher_wake(&self, remaining: std::time::Duration) {
         if remaining.is_zero() {
             return;
         }
         let Some(evt) = self.accessor_dispatcher_wake_evt.as_ref() else {
-            // No wake fd — fall back to a short sleep to avoid a
-            // tight busy-loop. This path only fires for tests built
-            // without with_accessor_state; production bridges always
-            // wire the fd.
-            std::thread::sleep(remaining.min(std::time::Duration::from_millis(50)));
-            return;
+            unreachable!(
+                "poll_dispatcher_wake reached without an installed wake fd — \
+                 SnapshotBridge::with_accessor_state stores accessor_worker_state \
+                 and accessor_dispatcher_wake_evt together, so any caller that \
+                 passed the worker_state gate must also have the wake fd. A None \
+                 here indicates a bridge constructor that violated the coupling \
+                 invariant"
+            );
         };
         let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
         let fd = {
@@ -717,8 +722,10 @@ impl SnapshotBridge {
             // bump and on FAILED_PERMANENTLY exit, so poll wakes at
             // kernel-scheduling-tick latency. Distinct from the
             // accessor_ready_evt the coord drains (no second-
-            // consumer race). Tests without an installed wake fd
-            // fall back to a bounded sleep inside poll_dispatcher_wake.
+            // consumer race). Reaching poll_dispatcher_wake without
+            // an installed wake fd panics — the early-return at L679
+            // gates this branch on accessor_worker_state.is_some()
+            // and with_accessor_state stores both together.
             let remaining = deadline.saturating_duration_since(now);
             self.poll_dispatcher_wake(remaining);
         }
