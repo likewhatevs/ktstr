@@ -3194,6 +3194,22 @@ fn staged_scheduler_log_path(name: &str) -> String {
 /// still covers any pathological hang past this budget.
 const SCHED_LIFECYCLE_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Deadline for `Op::ReplaceScheduler`'s worker-not-trying gate
+/// (`SnapshotBridge::wait_for_worker_state_not_trying` inside
+/// `dispatch_replace_scheduler`). 5 s matches one freeze-coord scan
+/// tick + `from_elf_with_hint` at tens of ms scale. Asymmetric
+/// against `Op::AttachScheduler`'s first-boot 60 s slab-settle
+/// budget — Replace runs after the prior scheduler held the slab
+/// alive for its whole hold, so no extra warm-up margin is needed.
+/// Bumping this risks pushing total dispatch latency past the
+/// test's `duration_s` budget; lowering it risks spurious
+/// "stayed in TRYING past deadline" bails under cold-cache CI.
+/// A regression that silently changes this value would surface as
+/// either a flake (too tight) or a slow test (too loose), neither
+/// of which produces an actionable signal — the unit test pinning
+/// this const is the canary.
+const REPLACE_NOT_TRYING_DEADLINE_S: u64 = 5;
+
 /// Path of the sched_ext kernel state sysfs node. Reading returns
 /// the string-form state: `disabled`, `enabling`, `enabled`,
 /// `disabling` (kernel/sched/ext.c). Op dispatch polls this
@@ -3580,7 +3596,8 @@ fn dispatch_replace_scheduler(scheduler: &'static crate::test_support::Scheduler
     // Replace the slab has been live for the prior scheduler's
     // whole hold so no first-boot 60 s slab-settle headroom is
     // needed.
-    let not_trying_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let not_trying_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(REPLACE_NOT_TRYING_DEADLINE_S);
     if let Some(result) = crate::scenario::snapshot::with_active_bridge(|b| {
         b.wait_for_worker_state_not_trying(not_trying_deadline, "Op::ReplaceScheduler")
     }) {
@@ -3979,6 +3996,24 @@ mod tests {
     use super::*;
     use crate::workload::{AffinityIntent, WorkSpec, WorkType};
     use strum::IntoEnumIterator;
+
+    /// Pin the `Op::ReplaceScheduler` worker-not-trying gate
+    /// deadline. The 5 s value is load-bearing per
+    /// `REPLACE_NOT_TRYING_DEADLINE_S`'s doc: bumping risks pushing
+    /// total dispatch latency past test `duration_s` budgets;
+    /// lowering risks spurious "stayed in TRYING past deadline"
+    /// bails on cold-cache CI. A regression that silently changes
+    /// it would surface as either a flake or a slow test, neither
+    /// of which gives an actionable signal — this pin is the canary.
+    #[test]
+    fn replace_not_trying_deadline_pinned_to_5s() {
+        assert_eq!(
+            REPLACE_NOT_TRYING_DEADLINE_S, 5,
+            "REPLACE_NOT_TRYING_DEADLINE_S changed away from 5 s; \
+             read its doc and update the dispatch-latency analysis \
+             before relaxing this assertion."
+        );
+    }
 
     /// Exhaustiveness guard for [`OpKind::bit_index`]. A new [`Op`]
     /// variant auto-generates a matching [`OpKind`] variant (via
