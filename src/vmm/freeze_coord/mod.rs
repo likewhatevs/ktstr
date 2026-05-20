@@ -3566,11 +3566,28 @@ impl KtstrVm {
                                 );
                                 per_cpu_offsets_kva_warned = true;
                             }
-                        } else {
-                            let phys_base = owned_accessor
-                                .as_ref()
-                                .map(|a| a.guest_kernel().phys_base())
-                                .unwrap_or(0);
+                        } else if let Some(owned) = owned_accessor.as_ref() {
+                            // Gate the init on `owned_accessor` being
+                            // adopted so `phys_base` is the resolved
+                            // KASLR physical displacement, not the
+                            // bootstrap 0 default. Under a KASLR-on
+                            // guest, `phys_base == 0` makes
+                            // `text_kva_to_pa_with_base` resolve
+                            // `__per_cpu_offset` to a wrong PA — the
+                            // resulting offsets read are garbage from
+                            // an unrelated guest page. The cache then
+                            // holds that garbage permanently (the
+                            // outer `prog_per_cpu_offsets.is_none()`
+                            // gate never retries once Some is set),
+                            // and every downstream per-CPU walker
+                            // (cpu_time, prog_runtime_stats, scx)
+                            // resolves to wrong KVAs and reads zero
+                            // values from random pages. Sibling
+                            // `compute_rq_pas` at L4101-4127 uses
+                            // `kernel.text_kva_to_pa` which threads
+                            // the live `phys_base` from the accessor
+                            // — same source-of-truth.
+                            let phys_base = owned.guest_kernel().phys_base();
                             prog_per_cpu_offsets = try_init_prog_per_cpu_offsets(
                                 mem,
                                 per_cpu_offset_kva,
@@ -6073,6 +6090,30 @@ impl KtstrVm {
                                 FreezeOutcome::Captured(report, capture_start)
                             } else {
                                 // Partial dump: vcpu_regs only.
+                                //
+                                // `per_cpu_time` stays `Vec::new()` because
+                                // the cpu_time walker's prereqs are
+                                // strictly tied to BOTH of the partial-
+                                // path triggers (cf. cpu_time_capture
+                                // construction at L5923):
+                                //   - if we're here because
+                                //     `owned_accessor.is_none()`,
+                                //     `prog_per_cpu_offsets` is also None
+                                //     (its lazy-init at L3569 gates on
+                                //     owned_accessor.is_some() so
+                                //     `phys_base` is the real KASLR
+                                //     displacement, not the bootstrap 0
+                                //     default — without that gate the
+                                //     init would cache garbage permanently
+                                //     under KASLR-on guests).
+                                //   - if we're here because `dump_btf.is_none()`,
+                                //     `dump_cpu_time_offsets` (BTF-derived
+                                //     at L2580) is also None.
+                                // Either way the cpu_time_capture 4-prereq
+                                // match at L5923 falls to `None` and the
+                                // walker can't run. Hardcoded empty here
+                                // matches that result without re-walking
+                                // the prereqs at this site.
                                 let report = crate::monitor::dump::FailureDumpReport {
                                     schema: crate::monitor::dump::SCHEMA_SINGLE.to_string(),
                                     active_map_kvas: Vec::new(),
@@ -7485,6 +7526,63 @@ impl KtstrVm {
                                     break;
                                 }
                                 if freeze_coord_kill.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                // Defer the boundary if the dump
+                                // prerequisites haven't landed yet.
+                                // The `dump_state` path inside the
+                                // 'capture block resolves per-CPU
+                                // KVAs (rq + cpustat + kstat +
+                                // tick_sched) via `per_cpu_kva`
+                                // (`template + kaslr_offset +
+                                // per_cpu_off`); an unpublished
+                                // `kern_virt_kaslr` reads as raw 0,
+                                // collapsing the formula to the
+                                // link-time path. Under a KASLR-on
+                                // guest that resolves to wrong
+                                // pages and reads zero values into
+                                // `per_cpu_time` (a silent-data-
+                                // loss class bug — the field is
+                                // populated but every counter is
+                                // 0). Same rationale as the ColdOp
+                                // gate at L7198 and the WATCH gate
+                                // at L7166: defer until the
+                                // publisher (BSP MSR_LSTAR on
+                                // x86_64 OR guest-channel KERN_ADDRS
+                                // on both arches) lands. Under
+                                // `nokaslr` the publisher still
+                                // fires (with biased-zero) so the
+                                // gate unblocks quickly; the
+                                // predicate distinguishes "publish
+                                // incomplete" from "publish complete
+                                // with offset 0" by reading the raw
+                                // atomic directly.
+                                //
+                                // `owned_accessor` is the second
+                                // half of the prereq set: the FULL
+                                // dump path at L5770 only enters
+                                // when the accessor is adopted;
+                                // otherwise the dump falls through
+                                // to the PARTIAL path at L6075
+                                // which hard-codes `per_cpu_time:
+                                // Vec::new()` and skips every other
+                                // walker output (maps, prog
+                                // runtime, task enrichment, scx
+                                // walker). Defer the boundary so
+                                // the next iteration retries once
+                                // the accessor-init worker
+                                // publishes.
+                                if !kern_virt_kaslr_published() || owned_accessor.is_none() {
+                                    tracing::info!(
+                                        target: "ktstr::failure_dump",
+                                        idx = next_periodic_idx,
+                                        tag = %periodic_tag(next_periodic_idx),
+                                        kaslr_published = kern_virt_kaslr_published(),
+                                        accessor_present = owned_accessor.is_some(),
+                                        "freeze-coord: periodic snapshot deferred \
+                                         (kaslr_offset or owned_accessor not yet \
+                                         published); retrying next iteration"
+                                    );
                                     break;
                                 }
                                 let _gate_guard = match gate::OnDemandGateGuard::try_acquire(
