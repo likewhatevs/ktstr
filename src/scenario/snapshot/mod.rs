@@ -108,6 +108,41 @@
 //! `as_str`) return `Result<T, SnapshotError>` so an absent /
 //! type-mismatched field bubbles up as a recoverable error rather
 //! than panicking.
+//!
+//! # Cross-surface accessor vocabulary
+//!
+//! [`SnapshotField`], [`JsonField`], and
+//! `crate::monitor::btf_render::RenderedValue` share a uniform
+//! method vocabulary so a test author moves between the
+//! BTF-rendered (BPF maps + globals), JSON-rendered (scheduler
+//! stats), and raw-tree surfaces without re-learning syntax:
+//!
+//! | Method                | What it does                                                     |
+//! |-----------------------|------------------------------------------------------------------|
+//! | `.as_u64()`/`.as_i64()`/`.as_f64()`/`.as_bool()` | Typed scalar extract.                  |
+//! | `.as_str()`           | UTF-8 string extract (Enum variant / JSON string).               |
+//! | `.as_u64_array()` / `.as_u32_array()` / `.as_i64_array()` / `.as_f64_array()` / `.as_bool_array()` | Element-typed array extract. |
+//! | `.get(path)`          | Dotted-path walk (`"a.b.c"`); returns a typed sub-view.          |
+//! | `.member(name)`       | Single-step struct-member walk (RenderedValue only; no dots).    |
+//! | `.index(i)`           | Array element by 0-indexed position (RenderedValue only).        |
+//! | `.raw()`              | Drop into the underlying RenderedValue for raw Option-returning navigation. |
+//!
+//! The wrapper types ([`SnapshotField`], [`JsonField`]) return
+//! `Result` with rich [`SnapshotError`] context; the raw
+//! `RenderedValue` layer returns `Option` (the caller has already
+//! pattern-matched into a known variant, so absence is a
+//! programming-error class handled locally). Convert between
+//! layers with `SnapshotField::raw()`.
+//!
+//! For multi-scheduler scenarios (after
+//! [`crate::scenario::ops::Op::ReplaceScheduler`] or two
+//! [`crate::scenario::ops::Op::AttachScheduler`] calls), use
+//! [`Snapshot::active`] to project the view to the currently-
+//! attached scheduler's maps and chain the standard accessors
+//! against it. [`Snapshot::live_var`] is the shorthand for
+//! `self.active()?.var(name)`; [`Snapshot::vars`] iterates every
+//! captured copy when the framework cannot determine "active"
+//! automatically.
 
 /// Maximum number of rendered keys captured into
 /// [`SnapshotError::NoMatch::available_keys`] during a failed

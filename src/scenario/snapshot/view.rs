@@ -131,8 +131,14 @@ impl<'a> Snapshot<'a> {
     /// [`Self::active`] filter when set — only maps the filter
     /// admits are considered. Returns [`SnapshotError::MapNotFound`]
     /// (with the captured map names in `available`) when no match
-    /// is found among the admitted maps.
+    /// is found among the admitted maps, or
+    /// [`SnapshotError::PlaceholderSnapshot`] when the snapshot's
+    /// underlying `FailureDumpReport` is a placeholder (freeze
+    /// rendezvous failed; no maps to walk).
     pub fn map(&self, name: &str) -> SnapshotResult<SnapshotMap<'a>> {
+        if self.report.is_placeholder {
+            return Err(SnapshotError::PlaceholderSnapshot { tag: None });
+        }
         for m in self.maps_iter() {
             if m.name == name {
                 return Ok(SnapshotMap { map: m, cpu: None });
@@ -217,6 +223,11 @@ impl<'a> Snapshot<'a> {
     /// `snapshot.active()?.vars(name)` is well-defined — it iterates
     /// only the active scheduler's copies (typically exactly one,
     /// since active() filters to one obj_name).
+    ///
+    /// Yields nothing on placeholder snapshots (the underlying
+    /// `report.maps` is empty by construction so nothing matches
+    /// anyway — callers needing "is this a placeholder?" use the
+    /// `Snapshot::is_placeholder` accessor explicitly).
     pub fn vars(
         &self,
         name: &str,
@@ -259,21 +270,33 @@ impl<'a> Snapshot<'a> {
     ///
     /// # Limitations
     ///
-    /// - Two scheduler instances built from the SAME BPF object
-    ///   (e.g. two scx_mitosis variants loaded with different
-    ///   sched_args) produce identically-prefixed `<obj>.bss` maps.
-    ///   `.active()` cannot disambiguate them at obj-prefix
-    ///   granularity and returns [`SnapshotError::NoActiveScheduler`];
-    ///   tests in this configuration use [`Self::vars`] to iterate
-    ///   every copy and reason explicitly.
-    /// - Right after [`crate::scenario::ops::Op::ReplaceScheduler`]
-    ///   there is up to a 500ms–1s settle window where the new
-    ///   scheduler's prog counters have not advanced yet;
-    ///   `.active()` may return [`SnapshotError::NoActiveScheduler`]
-    ///   for snapshots captured in that window. Tracked as #116.
-    /// - The principled `*scx_root → owning BPF object → maps`
-    ///   walker that would replace the prog-counter proxy with a
-    ///   direct identity link is tracked as #117.
+    /// The current implementation is honest about its narrow scope:
+    /// it succeeds only when the snapshot contains exactly one BPF
+    /// object's worth of global-section maps. Multi-object snapshots
+    /// (two schedulers loaded back-to-back, or a single scheduler
+    /// composed of multiple BPF objects) return
+    /// [`SnapshotError::NoActiveScheduler`] — there is no reliable
+    /// proxy for "which obj is currently attached" from a frozen
+    /// `FailureDumpReport` alone. Test authors in those configurations
+    /// fall back to [`Self::vars`] to enumerate every copy explicitly,
+    /// or [`Self::map`] to address a specific scheduler's bss directly.
+    ///
+    /// Concrete cases that hit `NoActiveScheduler`:
+    /// - Two scheduler instances loaded back-to-back (e.g.
+    ///   pre/post-[`crate::scenario::ops::Op::ReplaceScheduler`] in a
+    ///   single scenario), even when their BPF object names differ.
+    /// - One scheduler composed of multiple BPF objects (e.g.
+    ///   scx_layered's core + helper objects).
+    /// - A placeholder snapshot (freeze-rendezvous failed to capture
+    ///   any maps).
+    /// - A snapshot taken with no scheduler attached (no
+    ///   global-section maps at all).
+    ///
+    /// A principled `*scx_root → owning BPF object → maps` walker
+    /// that resolves "currently attached" from kernel state directly
+    /// is a follow-up; landing it would make `.active()` succeed for
+    /// every case where exactly one scheduler is attached at capture
+    /// time.
     ///
     /// # Lifetime
     ///
@@ -297,52 +320,27 @@ impl<'a> Snapshot<'a> {
                 }
             }
         }
-        // No global-section maps at all — nothing to filter to.
-        if obj_names.is_empty() {
-            return Err(SnapshotError::NoActiveScheduler {
-                reason: "snapshot has no global-section BPF maps (no scheduler attached, or capture did not include bss/data/rodata)".to_string(),
-            });
-        }
-        // Single obj → that's the active one, no ambiguity.
-        if obj_names.len() == 1 {
-            return Ok(Snapshot {
-                report: self.report,
-                active_obj: Some(obj_names[0]),
-            });
-        }
-        // Multiple obj → discriminate via prog-counter sums per obj.
-        // Heuristic: for each candidate obj, sum prog_runtime_stats[i].cnt
-        // where the prog name shares a non-empty prefix with the obj name.
-        // The active scheduler's progs advance their counter; the
-        // inactive scheduler's stay frozen at the swap instant.
-        let mut best: Option<(&'a str, u64)> = None;
-        for obj in &obj_names {
-            let total: u64 = self
-                .report
-                .prog_runtime_stats
-                .iter()
-                .filter(|p| prog_name_matches_obj(&p.name, obj))
-                .map(|p| p.cnt)
-                .sum();
-            match best {
-                None => best = Some((*obj, total)),
-                Some((_, b)) if total > b => best = Some((*obj, total)),
-                _ => {}
-            }
-        }
-        match best {
-            Some((obj, total)) if total > 0 => Ok(Snapshot {
-                report: self.report,
-                active_obj: Some(obj),
+        match obj_names.as_slice() {
+            [] => Err(SnapshotError::NoActiveScheduler {
+                reason: "snapshot has no global-section BPF maps (no scheduler \
+                         attached, or capture did not include bss/data/rodata)"
+                    .to_string(),
             }),
-            _ => Err(SnapshotError::NoActiveScheduler {
+            [only] => Ok(Snapshot {
+                report: self.report,
+                active_obj: Some(*only),
+            }),
+            multiple => Err(SnapshotError::NoActiveScheduler {
                 reason: format!(
-                    "snapshot has {} candidate scheduler obj names ({:?}) but \
-                     prog_runtime_stats does not distinguish them by activity \
-                     (counters tied at zero, or no progs match any obj prefix); \
-                     use Snapshot::vars(name) to iterate every copy",
-                    obj_names.len(),
-                    obj_names
+                    "snapshot has {} BPF objects with global-section maps \
+                     ({:?}); without the principled *scx_root → owning BPF \
+                     object walker (tracked as #117), the framework cannot \
+                     identify which is currently attached — use \
+                     Snapshot::vars(name) to enumerate every copy or \
+                     Snapshot::map(\"<obj>.<section>\") to address a specific \
+                     scheduler's bss directly",
+                    multiple.len(),
+                    multiple
                 ),
             }),
         }
@@ -604,27 +602,6 @@ fn map_belongs_to_obj(map_name: &str, obj: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// True when a prog name's prefix overlaps the obj name's prefix
-/// non-trivially. Used by [`Snapshot::active`] to attribute
-/// `prog_runtime_stats[i].cnt` to a candidate obj.
-///
-/// Heuristic: both names are capped at `BPF_OBJ_NAME_LEN = 16`
-/// chars by the kernel, so a shared 4-char prefix is the cheapest
-/// non-noise signal that a prog likely belongs to that obj's BPF
-/// object. False positives are possible (two schedulers sharing
-/// the same base prefix); those cases surface as a tie that
-/// [`Snapshot::active`] reports via
-/// [`SnapshotError::NoActiveScheduler`]. The principled walker
-/// tracked as #117 replaces this proxy.
-fn prog_name_matches_obj(prog_name: &str, obj: &str) -> bool {
-    const MIN_PREFIX: usize = 4;
-    let prefix_len = prog_name
-        .chars()
-        .zip(obj.chars())
-        .take_while(|(a, b)| a == b)
-        .count();
-    prefix_len >= MIN_PREFIX
-}
 
 // ---------------------------------------------------------------------------
 // SnapshotMap

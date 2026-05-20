@@ -514,8 +514,10 @@ impl std::fmt::Display for SnapshotError {
                     f,
                     "snapshot has no currently-active scheduler ({reason}); \
                      use Snapshot::vars(name) to enumerate every observed \
-                     copy explicitly, or Snapshot::map(\"<obj>.bss\") to \
-                     address a specific scheduler's bss directly"
+                     copy explicitly, Snapshot::live_var(name) to keep the \
+                     typed error path while opting into the active filter, \
+                     or Snapshot::map(\"<obj>.<section>\") to address a \
+                     specific scheduler's bss directly"
                 )
             }
         }
