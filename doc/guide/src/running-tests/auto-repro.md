@@ -167,7 +167,6 @@ A demo test in this shape (reduced from
 
 ```rust,ignore
 use ktstr::prelude::*;
-use ktstr::test_support::{BpfMapWrite, KtstrTestEntry, run_ktstr_test};
 
 fn scenario_yield_heavy(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(

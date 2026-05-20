@@ -256,6 +256,36 @@ cargo ktstr test -- --workspace               # all workspace tests
 cargo ktstr test -- --retries 2               # nextest retries
 ```
 
+## replay
+
+Re-run only the tests that failed in the last session, by reading
+sidecars under `target/ktstr/` (or `--dir`) and emitting a nextest
+filter expression that targets exactly the failed set:
+
+```sh
+cargo ktstr replay              # print the nextest filter (dry-run)
+cargo ktstr replay --exec       # invoke `cargo nextest run -E <filter>`
+cargo ktstr replay -E starve    # narrow the failed-sidecar selection by substring
+cargo ktstr replay --dir PATH   # source sidecars from an archived tree
+```
+
+Default behaviour is dry-run: the filter prints to stdout so it
+can be piped into nextest by hand or pasted into a CI pipeline
+before committing to the re-run. `--exec` skips the dry-run and
+invokes nextest directly.
+
+Distinct from the in-VM auto-repro (`auto_repro = true` on
+`KtstrTestEntry`), which fires within the same test process when
+the primary run fails; `replay` is post-hoc, after the test
+process has exited, for the CI-friendly "re-run last session's
+failures against the new code" workflow.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dir PATH` | `target/ktstr/` | Override the sidecar root. Same semantics as `cargo ktstr stats compare --dir`. |
+| `-E, --filter SUBSTR` | -- | Substring filter on `test_name` (case-sensitive). |
+| `--exec` | dry-run | Invoke `cargo nextest run` with the computed filter instead of printing it. |
+
 ## coverage
 
 Build the kernel (if needed) and run tests with coverage via
@@ -608,6 +638,46 @@ cargo ktstr shell --kernel 6.14.2
 cargo ktstr shell --topology 1,2,4,1
 cargo ktstr shell -i ./my-binary -i strace
 ```
+
+## funify
+
+Rewrite a JSON dump by replacing every non-metric value with a
+deterministic `adjective-animal` petname, so a downstream LLM can
+reason about the structural shape of the dump without seeing real
+identifiers. Visible alias: `costume`.
+
+```sh
+cargo ktstr funify failure_dump.json                  # stdin or file path
+cargo ktstr funify dump.json --seed demo              # deterministic across invocations
+cargo ktstr funify dump.json --seed demo --pretty     # pretty-printed JSON output
+cat dump.json | cargo ktstr costume --seed demo       # alias + stdin
+```
+
+The walker funifies by default — every value whose containing key
+is NOT on the metric allowlist gets replaced. Values that share
+the same key AND the same payload get the same fun name so
+cross-references inside the dump survive (e.g. `"swift-otter
+migrated from CPU 3 to CPU 7"` stays consistent). Floats always
+pass through; sentinel `u64` values `0` and `u64::MAX` keep their
+kthread / "no value" semantics. Non-JSON input fails fast with
+the underlying serde_json parse error.
+
+The metric allowlist is the source of truth (see
+`ktstr::fun::Funifier::is_metric_passthrough`). It covers
+structural enums (`schema`, `type`, `kind`, `state`, `policy`,
+…), position / lifecycle counts (`size`, `len`, `epoch`, …),
+count suffixes (`*_count`, `*_total`, `*_completed`, …), rates /
+ratios (`*_per_sec`, `*_ratio`, …), units (`*_ns`, `*_bytes`,
+…), statistics (`*_mean`, `*_p99`, …), I/O counters, scheduling
+fields (`priority`, `nice`, `weight`, …), per-rq SCX state,
+DSQ counters, NUMA events, SCX exit-info events, BPF prog runtime,
+and hardware perf counters.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `INPUT` | stdin | Path to the JSON file. `-` or omitted reads from stdin. |
+| `--seed STR` | random per process | Fixed seed for reproducible fun-name assignment across invocations. Omit for a fresh process-local key. |
+| `--pretty` | compact | Pretty-print the output. Default emits compact JSON suitable for piping. |
 
 ## completions
 
@@ -1085,6 +1155,22 @@ missing and what each absence means.
 | `--threshold PCT` | per-metric `default_rel` | Uniform relative significance threshold in percent. Overrides the per-metric `default_rel` for every metric; the absolute gate is always per-metric and cannot be tuned from the CLI. Mutually exclusive with `--policy`. |
 | `--policy FILE` | -- | Path to a JSON `ComparisonPolicy` file with per-metric thresholds. Schema: `{ "default_percent": N, "per_metric_percent": { "worst_spread": 5.0, ... } }`. Priority is per-metric override → `default_percent` → each metric's registry `default_rel`. Per-metric keys are rejected at load time if they do not match a metric in the `METRICS` registry. Mutually exclusive with `--threshold`. |
 | `--dir DIR` | `target/ktstr/` | Alternate runs root for pool collection. Defaults to `test_support::runs_root()` (typically `target/ktstr/`). Useful when comparing archived sidecar trees copied off a CI host. |
+
+#### Phase rendering
+
+The compare output renders per-phase tables in addition to the
+scalar findings table. The flags below tune that rendering. They
+are mutually exclusive with each other only where noted —
+`--no-phases` is the global suppress switch and conflicts with
+every other phase flag; the other four compose.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--no-phases` | off | Suppress the per-phase tables entirely; render only the scalar findings table. Mutually exclusive with every other `--phase…` flag below. |
+| `--phases-only` | off | Render ONLY the per-phase tables; suppress the scalar findings table and the scalar summary footer. The host-context delta still renders. Composes with `--steps-only`, `--phase`, `--phase-threshold`. |
+| `--steps-only` | off | Inside each per-phase table, suppress the BASELINE / CANDIDATE / DELTA / % numeric columns and render only the steps column for that phase. Useful for surveying which phases fired without numerical detail. Composes with `--phase` and `--phase-threshold`. |
+| `--phase N` (repeatable) | every phase | Render only the named phase indices. Repeatable. Indices match the `phase_index` recorded in sidecars. |
+| `--phase-threshold PCT` | inherits `--threshold` | Per-phase significance threshold in percent. Lets per-phase tables use a different threshold from the scalar comparison (e.g. tighter scalar gate but a looser per-phase gate for noisy boundary effects). Inherits the scalar `--threshold` (or registry `default_rel`) when unset. |
 
 ### Prerequisites
 
