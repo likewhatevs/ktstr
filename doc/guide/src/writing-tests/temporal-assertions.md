@@ -39,7 +39,7 @@ let series = SampleSeries::from_drained_typed(drained, monitor).periodic_only();
 ```
 
 `periodic_only()` filters to entries whose tag begins with
-`"periodic_"` — it strips on-demand `Op::snapshot` captures and
+`"periodic_"` — it strips on-demand `Op::capture_snapshot` captures and
 watchpoint fires that share the bridge's tag namespace. Use
 `periodic_ref()` for the borrowed-iterator equivalent when one test
 needs both views from the same series.

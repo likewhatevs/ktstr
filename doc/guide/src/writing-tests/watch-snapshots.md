@@ -15,7 +15,7 @@ aarch64).
 trigger. Use it when the question is "what does the scheduler look
 like *whenever the kernel touches X*?" rather than "what does it
 look like at this point in my scenario?". For time-driven capture,
-use [`Op::snapshot`](snapshots.md) instead.
+use [`Op::capture_snapshot`](snapshots.md) instead.
 
 ## How it works
 
@@ -219,7 +219,7 @@ to demonstrate the full read path.
 ## Reading captures
 
 Once a watchpoint fires, the resulting report is stored on the bridge
-under the tag and read back exactly as `Op::snapshot` captures are.
+under the tag and read back exactly as `Op::capture_snapshot` captures are.
 Every accessor — `Snapshot::map`, `Snapshot::var`,
 `SnapshotMap::at` / `find` / `filter` / `max_by`, dotted-path walks,
 typed terminal reads — is shared. See [Snapshots](snapshots.md) for

@@ -248,7 +248,7 @@ test is to exercise a scheduler against **different lifecycle
 patterns** at once, so swap `phased_worker` for a worker that loops
 through explicit phases.
 
-`WorkType::Sequence { first: Phase, rest: Vec<Phase> }` runs each
+`WorkType::Sequence { first: WorkPhase, rest: Vec<WorkPhase> }` runs each
 phase for its specified duration and then advances to the next; when
 the last phase ends the loop restarts from `first`. Phases:
 `WorkPhase::Spin(Duration)`, `WorkPhase::Sleep(Duration)`,
@@ -746,17 +746,28 @@ fn dispatch_advances(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-`num_snapshots = 5` fires 5 freeze-and-capture boundaries inside the
-10%-90% window of the 20 s workload — at roughly +5 s, +7 s, +10 s,
-+13 s, +15 s. Each capture freezes every vCPU, reads BPF map state,
-and resumes. The host watchdog deadline is extended by each freeze
-duration so captures do not eat into the workload budget. The
-captures are stored under `periodic_000`…`periodic_004` on the
-`SnapshotBridge`.
+`num_snapshots = 5` fires 5 freeze-and-capture boundaries spaced
+evenly inside the 10%-90% window of the 20 s workload. Each capture
+freezes every vCPU, reads BPF map state, and resumes. The host
+watchdog deadline is extended by each freeze duration so captures do
+not eat into the workload budget. The captures are stored under
+`periodic_000`…`periodic_004` on the `SnapshotBridge`.
+
+**Smoke floor.** When `num_snapshots > 0` and the test does not
+declare its own `post_vm`, the macro auto-installs
+`default_post_vm_periodic_fired` — a smoke assertion that at least
+one periodic boundary fired with real (non-placeholder) BPF state.
+Tests that explicitly want only the smoke floor can omit `post_vm`
+entirely; tests with a custom `post_vm` (like the example above)
+take ownership of the periodic verdict in full.
 
 `Verdict` is the assertion accumulator: every pattern call records
-its outcome on the same `Verdict`, and `v.into_result()` consumes it
-into a pass/fail `AssertResult`.
+its outcome on the same `Verdict`. `v.into_anyhow_or_log()` is the
+canonical post_vm convergence — it returns `Ok(())` on pass and
+`Err` (rendering every failure detail) on fail, which is exactly
+what a `post_vm` callback wants. Use `v.into_result()` instead
+when the caller needs to inspect the resulting `AssertResult`
+programmatically.
 
 The seven temporal patterns on `SeriesField`:
 

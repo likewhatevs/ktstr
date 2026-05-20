@@ -373,7 +373,7 @@ scenario:
 
 ```rust,ignore
 Step::new(
-    vec![Op::snapshot("periodic")],
+    vec![Op::capture_snapshot("periodic")],
     HoldSpec::loop_at(Duration::from_secs(2)),
 )
 ```
