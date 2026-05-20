@@ -4223,7 +4223,7 @@ pub mod claim;
 pub mod temporal;
 
 pub use claim::{ClaimBuilder, SeqClaim, SetClaim, Verdict};
-pub use temporal::{EachClaim, SeriesField};
+pub use temporal::{EachClaim, PhaseMapExt, SeriesField};
 
 /// Check that workers only ran on CPUs in `expected`.
 ///

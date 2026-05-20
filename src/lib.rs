@@ -695,8 +695,8 @@ pub mod prelude {
         Assert, AssertDetail, AssertResult, COMPARATOR_VOCABULARY, ClaimBuilder, DetailKind,
         EachClaim, InfoNote, MAX_RECORDED_PASSES, NoteValue, Outcome, OutcomeRef,
         PASSES_TRUNCATION_SENTINEL_COMPARATOR, PASSES_TRUNCATION_SENTINEL_NAME, PassDetail,
-        PhaseBucket, ScenarioStats, SchedulerBaseline, SeqClaim, SeriesField, SetClaim, Verdict,
-        assert_baseline, assert_scx_events_clean,
+        PhaseBucket, PhaseMapExt, ScenarioStats, SchedulerBaseline, SeqClaim, SeriesField,
+        SetClaim, Verdict, assert_baseline, assert_scx_events_clean,
     };
     pub use crate::cgroup::CgroupManager;
     pub use crate::claim;
@@ -747,7 +747,7 @@ pub mod prelude {
     pub use crate::scenario::snapshot::{
         BridgeGuard, CaptureCallback, JsonField, MAX_WATCH_SNAPSHOTS, Snapshot, SnapshotBridge,
         SnapshotEntry, SnapshotError, SnapshotField, SnapshotMap, SnapshotResult,
-        WatchRegisterCallback, stats_path,
+        WatchRegisterCallback, pickers, stats_path,
     };
     pub use crate::scenario::{CgroupGroup, Ctx, collect_all, spawn_diverse};
     // `Payload` in this group is the struct on which

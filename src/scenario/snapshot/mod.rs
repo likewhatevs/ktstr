@@ -186,6 +186,7 @@ pub use bridge::{
 mod entry;
 mod field;
 mod json;
+pub mod pickers;
 mod view;
 
 pub use entry::SnapshotEntry;

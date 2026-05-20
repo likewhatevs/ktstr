@@ -428,14 +428,14 @@ impl<T> SeriesField<T> {
         verdict: &'v mut Verdict,
         earlier: crate::assert::Phase,
         later: crate::assert::Phase,
-    ) -> CrossPhaseRatio<'_, 'v, T>
+    ) -> CrossPhaseRatio<'v, T>
     where
         T: Copy + Into<f64> + std::fmt::Display,
     {
         let e = self.value_at_phase(earlier);
         let l = self.value_at_phase(later);
         CrossPhaseRatio {
-            field: self,
+            label: self.label().to_string(),
             verdict,
             earlier,
             later,
@@ -446,14 +446,22 @@ impl<T> SeriesField<T> {
 }
 
 /// Cross-phase ratio builder returned by
-/// [`SeriesField::ratio_across_phases`]. Carries the resolved
-/// `(earlier, later)` values so the terminal comparator chain
-/// (`at_most`) can format both values + the ratio into a single
-/// failure-or-note message. Mirrors the [`EachClaim`] shape
-/// (mutable verdict borrow held through the chain).
+/// [`SeriesField::ratio_across_phases`] and
+/// [`PhaseMapExt::ratio_across_phases`]. Carries the resolved
+/// `(earlier, later)` values + a caller-supplied label so the
+/// terminal comparator chain (`at_most`) can format both values
+/// + the ratio into a single failure-or-note message. Mirrors
+/// the [`EachClaim`] shape (mutable verdict borrow held through
+/// the chain).
+///
+/// The `label` is origin-neutral: SeriesField's entry point fills
+/// it from the field's `.label()`, the PhaseMap entry point takes
+/// it from the caller. An empty label suppresses the leading
+/// `label:` / `[label]` prefix in the rendered message so the
+/// rest of the diagnostic stays readable.
 #[must_use = "CrossPhaseRatio records nothing until at_most is invoked"]
-pub struct CrossPhaseRatio<'f, 'v, T> {
-    field: &'f SeriesField<T>,
+pub struct CrossPhaseRatio<'v, T> {
+    label: String,
     verdict: &'v mut Verdict,
     earlier: crate::assert::Phase,
     later: crate::assert::Phase,
@@ -461,7 +469,7 @@ pub struct CrossPhaseRatio<'f, 'v, T> {
     later_value: Option<T>,
 }
 
-impl<'f, 'v, T> CrossPhaseRatio<'f, 'v, T>
+impl<'v, T> CrossPhaseRatio<'v, T>
 where
     T: Copy + Into<f64> + std::fmt::Display,
 {
@@ -473,7 +481,16 @@ where
     /// `--nocapture` run surfaces the headroom without a separate
     /// per-metric `println!`.
     pub fn at_most(self, ceiling: f64) -> &'v mut Verdict {
-        let label = self.field.label();
+        let label_prefix = if self.label.is_empty() {
+            String::new()
+        } else {
+            format!("{}: ", self.label)
+        };
+        let note_prefix = if self.label.is_empty() {
+            String::new()
+        } else {
+            format!("[{}] ", self.label)
+        };
         let earlier_str = match self.earlier_value {
             Some(v) => format!("{v}"),
             None => "<no-samples>".to_string(),
@@ -486,7 +503,7 @@ where
             push_detail(
                 self.verdict,
                 format!(
-                    "{label}: ratio_across_phases({:?}→{:?}) needs both phases — \
+                    "{label_prefix}ratio_across_phases({:?}→{:?}) needs both phases — \
                      earlier={earlier_str}, later={later_str}",
                     self.earlier, self.later,
                 ),
@@ -499,7 +516,7 @@ where
             push_detail(
                 self.verdict,
                 format!(
-                    "{label}: ratio_across_phases({:?}→{:?}) earlier value is 0 \
+                    "{label_prefix}ratio_across_phases({:?}→{:?}) earlier value is 0 \
                      (no baseline to ratio against)",
                     self.earlier, self.later,
                 ),
@@ -511,7 +528,7 @@ where
             push_detail(
                 self.verdict,
                 format!(
-                    "{label}: ratio_across_phases({:?}→{:?}) = \
+                    "{label_prefix}ratio_across_phases({:?}→{:?}) = \
                      {later_str}/{earlier_str} = {ratio:.4} exceeds ceiling \
                      {ceiling:.4}",
                     self.earlier, self.later,
@@ -524,12 +541,121 @@ where
             // sees the headroom against the ceiling without a
             // separate per-metric println.
             self.verdict.note(format!(
-                "[{label}] ratio_across_phases({:?}→{:?}) = \
+                "{note_prefix}ratio_across_phases({:?}→{:?}) = \
                  {later_str}/{earlier_str} = {ratio:.4} (ceiling {ceiling:.4})",
                 self.earlier, self.later,
             ));
         }
         self.verdict
+    }
+}
+
+/// Extension trait that lets a pre-reduced per-phase map
+/// (typically the output of [`SeriesField::counter_delta_per_phase`],
+/// [`SeriesField::last_per_phase`], or
+/// [`SeriesField::first_per_phase`]) compose with the
+/// cross-phase comparator chain [`SeriesField::ratio_across_phases`]
+/// exposes — without re-projecting the per-phase values back
+/// through a synthetic [`SeriesField`].
+///
+/// Also surfaces [`Self::zip_per_phase`] so two per-phase maps fold
+/// element-wise into a derived per-phase map (e.g. a cross-LLC
+/// dispatch fraction from two counter-delta maps).
+pub trait PhaseMapExt<T> {
+    /// Fold two per-phase maps element-wise on phase intersection.
+    /// For every phase present in BOTH `self` AND `other`, invoke
+    /// `f(self_value, other_value)` and collect the result keyed
+    /// by phase. Phases present in only one input are absent from
+    /// the result.
+    ///
+    /// **Intersection-only — NOT [`Iterator::zip`] semantics.** This
+    /// pairs values by phase key, not by position; a missing phase
+    /// on either side surfaces as an absence in the result, never
+    /// as a synthesized zero or default. Callers that want to act
+    /// on coverage gaps compare the result map's length against
+    /// either input's length.
+    ///
+    /// Both values are passed BY VALUE — the trait constrains
+    /// `T: Copy` and `U: Copy` to keep the closure body free of
+    /// `*s` / `*c` deref noise that would otherwise dominate every
+    /// composed-metric expression. Non-Copy element types are out
+    /// of scope; per-phase reducers in this crate already return
+    /// scalar `Copy` values (`u64`, `f64`, `i64`).
+    fn zip_per_phase<U, R>(
+        &self,
+        other: &std::collections::BTreeMap<crate::assert::Phase, U>,
+        f: impl FnMut(T, U) -> R,
+    ) -> std::collections::BTreeMap<crate::assert::Phase, R>
+    where
+        T: Copy,
+        U: Copy;
+
+    /// Cross-phase ratio comparator on a pre-reduced per-phase
+    /// map. Mirrors [`SeriesField::ratio_across_phases`]'s
+    /// chain shape — `.at_most(ceiling)` records a failure detail
+    /// or pass info note via the supplied verdict — but operates
+    /// on the map directly so caller-derived per-phase values
+    /// (e.g. a fraction of two counter deltas) skip a synthetic-
+    /// SeriesField intermediate.
+    ///
+    /// Three load-bearing differences from the SeriesField entry:
+    ///
+    /// 1. **No implicit label.** SeriesField pulls its `.label()`
+    ///    for the failure message; the map has no label, so the
+    ///    caller names the metric being compared at the call site.
+    /// 2. **Pre-reduced values.** SeriesField reduces by
+    ///    last-Ok-sample at each comparator call; this trait
+    ///    operates on values already reduced by any compatible
+    ///    upstream reducer ([`SeriesField::counter_delta_per_phase`],
+    ///    [`SeriesField::last_per_phase`], or a caller-defined fold).
+    /// 3. **`T: Copy`** — the map's per-phase value is copied out
+    ///    into the [`CrossPhaseRatio`] carrier's `Option<T>`
+    ///    fields. Matches [`SeriesField::value_at_phase`]'s bound
+    ///    for the same reason.
+    fn ratio_across_phases<'v>(
+        &self,
+        verdict: &'v mut Verdict,
+        label: impl Into<String>,
+        earlier: crate::assert::Phase,
+        later: crate::assert::Phase,
+    ) -> CrossPhaseRatio<'v, T>
+    where
+        T: Copy + Into<f64> + std::fmt::Display;
+}
+
+impl<T> PhaseMapExt<T> for std::collections::BTreeMap<crate::assert::Phase, T> {
+    fn zip_per_phase<U, R>(
+        &self,
+        other: &std::collections::BTreeMap<crate::assert::Phase, U>,
+        mut f: impl FnMut(T, U) -> R,
+    ) -> std::collections::BTreeMap<crate::assert::Phase, R>
+    where
+        T: Copy,
+        U: Copy,
+    {
+        self.iter()
+            .filter_map(|(p, t)| other.get(p).map(|u| (*p, f(*t, *u))))
+            .collect()
+    }
+
+    fn ratio_across_phases<'v>(
+        &self,
+        verdict: &'v mut Verdict,
+        label: impl Into<String>,
+        earlier: crate::assert::Phase,
+        later: crate::assert::Phase,
+    ) -> CrossPhaseRatio<'v, T>
+    where
+        T: Copy + Into<f64> + std::fmt::Display,
+    {
+        CrossPhaseRatio {
+            label: label.into(),
+            verdict,
+            earlier,
+            later,
+            earlier_value: self.get(&earlier).copied(),
+            later_value: self.get(&later).copied(),
+        }
     }
 }
 
@@ -2874,6 +3000,292 @@ mod tests {
                     && d.message.contains("no baseline")),
             "expected `earlier value is 0` detail, got {:?}",
             r.failure_details().collect::<Vec<_>>(),
+        );
+    }
+
+    // ---------- PhaseMapExt::ratio_across_phases (BTreeMap<Phase, T> entry) ----------
+
+    #[test]
+    fn phasemap_ratio_across_phases_pass_records_info_note() {
+        let mut m: std::collections::BTreeMap<crate::assert::Phase, f64> =
+            std::collections::BTreeMap::new();
+        m.insert(crate::assert::Phase::step(0), 10.0);
+        m.insert(crate::assert::Phase::step(1), 5.0);
+        let mut v = Verdict::new();
+        m.ratio_across_phases(
+            &mut v,
+            "cross_frac",
+            crate::assert::Phase::step(0),
+            crate::assert::Phase::step(1),
+        )
+        .at_most(0.85);
+        let r = v.into_result();
+        assert!(r.is_pass(), "expected pass, got {:?}", r.outcomes);
+        assert!(
+            r.info_notes.iter().any(|n| n.message.contains("cross_frac")
+                && n.message.contains("5/10")
+                && n.message.contains("0.5000")
+                && n.message.contains("ceiling 0.8500")),
+            "expected pass info note with caller-supplied label, got {:?}",
+            r.info_notes,
+        );
+    }
+
+    #[test]
+    fn phasemap_ratio_across_phases_failure_records_detail_with_ratio() {
+        let mut m: std::collections::BTreeMap<crate::assert::Phase, f64> =
+            std::collections::BTreeMap::new();
+        m.insert(crate::assert::Phase::step(0), 10.0);
+        m.insert(crate::assert::Phase::step(1), 20.0);
+        let mut v = Verdict::new();
+        m.ratio_across_phases(
+            &mut v,
+            "cross_frac",
+            crate::assert::Phase::step(0),
+            crate::assert::Phase::step(1),
+        )
+        .at_most(0.85);
+        let r = v.into_result();
+        assert!(r.is_fail());
+        assert!(
+            r.failure_details().any(|d| d.kind == DetailKind::Temporal
+                && d.message.contains("cross_frac")
+                && d.message.contains("20/10")
+                && d.message.contains("2.0000")
+                && d.message.contains("ceiling 0.8500")),
+            "expected fail detail with caller-supplied label + ratio, got {:?}",
+            r.failure_details().collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn phasemap_ratio_across_phases_missing_phase_fails_with_clear_detail() {
+        let mut m: std::collections::BTreeMap<crate::assert::Phase, f64> =
+            std::collections::BTreeMap::new();
+        m.insert(crate::assert::Phase::step(0), 10.0);
+        // Phase 1 absent
+        let mut v = Verdict::new();
+        m.ratio_across_phases(
+            &mut v,
+            "cross_frac",
+            crate::assert::Phase::step(0),
+            crate::assert::Phase::step(1),
+        )
+        .at_most(0.85);
+        let r = v.into_result();
+        assert!(r.is_fail());
+        assert!(
+            r.failure_details()
+                .any(|d| d.message.contains("needs both phases")
+                    && d.message.contains("later=<no-samples>")),
+            "expected needs-both-phases detail, got {:?}",
+            r.failure_details().collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn phasemap_ratio_across_phases_zero_baseline_fails_with_clear_detail() {
+        let mut m: std::collections::BTreeMap<crate::assert::Phase, f64> =
+            std::collections::BTreeMap::new();
+        m.insert(crate::assert::Phase::step(0), 0.0);
+        m.insert(crate::assert::Phase::step(1), 5.0);
+        let mut v = Verdict::new();
+        m.ratio_across_phases(
+            &mut v,
+            "cross_frac",
+            crate::assert::Phase::step(0),
+            crate::assert::Phase::step(1),
+        )
+        .at_most(0.85);
+        let r = v.into_result();
+        assert!(r.is_fail());
+        assert!(
+            r.failure_details()
+                .any(|d| d.message.contains("earlier value is 0")
+                    && d.message.contains("no baseline")),
+            "expected zero-baseline detail, got {:?}",
+            r.failure_details().collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn phasemap_ratio_across_phases_disjoint_phase_keys_fails_cleanly() {
+        // BTreeMap is non-empty but neither queried phase exists.
+        let mut m: std::collections::BTreeMap<crate::assert::Phase, f64> =
+            std::collections::BTreeMap::new();
+        m.insert(crate::assert::Phase::BASELINE, 7.0);
+        m.insert(crate::assert::Phase::step(5), 8.0);
+        let mut v = Verdict::new();
+        m.ratio_across_phases(
+            &mut v,
+            "cross_frac",
+            crate::assert::Phase::step(0),
+            crate::assert::Phase::step(1),
+        )
+        .at_most(0.85);
+        let r = v.into_result();
+        assert!(r.is_fail());
+        assert!(
+            r.failure_details()
+                .any(|d| d.message.contains("needs both phases")
+                    && d.message.contains("earlier=<no-samples>")
+                    && d.message.contains("later=<no-samples>")),
+            "both phases absent must surface in detail, got {:?}",
+            r.failure_details().collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn cross_phase_ratio_empty_label_omits_label_prefix() {
+        // Regression pin: with label="", the failure detail must NOT
+        // have a leading ": " from a stale "{label}: " concatenation.
+        let mut m: std::collections::BTreeMap<crate::assert::Phase, f64> =
+            std::collections::BTreeMap::new();
+        m.insert(crate::assert::Phase::step(0), 10.0);
+        m.insert(crate::assert::Phase::step(1), 20.0);
+        let mut v = Verdict::new();
+        m.ratio_across_phases(
+            &mut v,
+            "",
+            crate::assert::Phase::step(0),
+            crate::assert::Phase::step(1),
+        )
+        .at_most(0.85);
+        let r = v.into_result();
+        let first = r
+            .failure_details()
+            .next()
+            .expect("empty label still produces a detail when comparator fails");
+        assert!(
+            first.message.starts_with("ratio_across_phases("),
+            "empty label must omit leading prefix; got {:?}",
+            first.message,
+        );
+    }
+
+    // ---------- PhaseMapExt::zip_per_phase ----------
+
+    #[test]
+    fn zip_per_phase_intersects_phase_keys() {
+        let mut a: std::collections::BTreeMap<crate::assert::Phase, u64> =
+            std::collections::BTreeMap::new();
+        a.insert(crate::assert::Phase::step(0), 10);
+        a.insert(crate::assert::Phase::step(1), 20);
+        a.insert(crate::assert::Phase::step(2), 30);
+        let mut b: std::collections::BTreeMap<crate::assert::Phase, u64> =
+            std::collections::BTreeMap::new();
+        b.insert(crate::assert::Phase::step(1), 100);
+        b.insert(crate::assert::Phase::step(2), 200);
+        b.insert(crate::assert::Phase::step(3), 300);
+        let z = a.zip_per_phase(&b, |s, t| s + t);
+        assert_eq!(z.len(), 2);
+        assert_eq!(z[&crate::assert::Phase::step(1)], 120);
+        assert_eq!(z[&crate::assert::Phase::step(2)], 230);
+        assert!(!z.contains_key(&crate::assert::Phase::step(0)));
+        assert!(!z.contains_key(&crate::assert::Phase::step(3)));
+    }
+
+    #[test]
+    fn zip_per_phase_empty_intersection_yields_empty() {
+        let mut a: std::collections::BTreeMap<crate::assert::Phase, u64> =
+            std::collections::BTreeMap::new();
+        a.insert(crate::assert::Phase::step(0), 1);
+        let mut b: std::collections::BTreeMap<crate::assert::Phase, u64> =
+            std::collections::BTreeMap::new();
+        b.insert(crate::assert::Phase::step(1), 2);
+        let z = a.zip_per_phase(&b, |s, t| s + t);
+        assert!(z.is_empty());
+    }
+
+    #[test]
+    fn zip_per_phase_both_empty_yields_empty() {
+        let a: std::collections::BTreeMap<crate::assert::Phase, u64> =
+            std::collections::BTreeMap::new();
+        let b: std::collections::BTreeMap<crate::assert::Phase, u64> =
+            std::collections::BTreeMap::new();
+        let z = a.zip_per_phase(&b, |s, t| s + t);
+        assert!(z.is_empty());
+    }
+
+    #[test]
+    fn zip_per_phase_heterogeneous_t_u_types() {
+        // Pins T and U can differ — trait isn't accidentally T=U-bound.
+        let mut a: std::collections::BTreeMap<crate::assert::Phase, u64> =
+            std::collections::BTreeMap::new();
+        a.insert(crate::assert::Phase::step(0), 100);
+        a.insert(crate::assert::Phase::step(1), 200);
+        let mut b: std::collections::BTreeMap<crate::assert::Phase, f64> =
+            std::collections::BTreeMap::new();
+        b.insert(crate::assert::Phase::step(0), 0.5);
+        b.insert(crate::assert::Phase::step(1), 2.0);
+        let z = a.zip_per_phase(&b, |s, t| s as f64 * t);
+        assert_eq!(z[&crate::assert::Phase::step(0)], 50.0);
+        assert_eq!(z[&crate::assert::Phase::step(1)], 400.0);
+    }
+
+    #[test]
+    fn zip_per_phase_takes_values_by_value_no_deref_noise() {
+        // The composition body operates on owned T/U directly.
+        // No `*s` / `*c` syntax — pins the bound is `T: Copy + U: Copy`
+        // by-value, not by-reference.
+        let mut a: std::collections::BTreeMap<crate::assert::Phase, u64> =
+            std::collections::BTreeMap::new();
+        a.insert(crate::assert::Phase::step(0), 1000);
+        a.insert(crate::assert::Phase::step(1), 1200);
+        let mut b: std::collections::BTreeMap<crate::assert::Phase, u64> =
+            std::collections::BTreeMap::new();
+        b.insert(crate::assert::Phase::step(0), 100);
+        b.insert(crate::assert::Phase::step(1), 200);
+        let frac = a.zip_per_phase(&b, |s, c| {
+            let total = (s + c) as f64;
+            if total == 0.0 { 0.0 } else { c as f64 / total }
+        });
+        assert!((frac[&crate::assert::Phase::step(0)] - (100.0 / 1100.0)).abs() < 1e-9);
+        assert!((frac[&crate::assert::Phase::step(1)] - (200.0 / 1400.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zip_then_ratio_across_phases_composes_a_b_test() {
+        // End-to-end composition the scx_mitosis test reaches for:
+        // two counter-delta maps → zip into cross_frac → ratio across
+        // phases → verdict mutation.
+        let mut same_d: std::collections::BTreeMap<crate::assert::Phase, u64> =
+            std::collections::BTreeMap::new();
+        same_d.insert(crate::assert::Phase::step(0), 200);
+        same_d.insert(crate::assert::Phase::step(1), 600);
+        let mut cross_d: std::collections::BTreeMap<crate::assert::Phase, u64> =
+            std::collections::BTreeMap::new();
+        cross_d.insert(crate::assert::Phase::step(0), 100);
+        cross_d.insert(crate::assert::Phase::step(1), 100);
+        let frac = same_d.zip_per_phase(&cross_d, |s, c| {
+            let total = (s + c) as f64;
+            if total == 0.0 { 0.0 } else { c as f64 / total }
+        });
+        let mut v = Verdict::new();
+        frac.ratio_across_phases(
+            &mut v,
+            "cross_frac",
+            crate::assert::Phase::step(0),
+            crate::assert::Phase::step(1),
+        )
+        .at_most(0.85);
+        let r = v.into_result();
+        assert!(
+            r.is_pass(),
+            "Step[0] cross_frac = 100/300 ≈ 0.333, Step[1] = 100/700 ≈ 0.143; \
+             ratio 0.143/0.333 ≈ 0.43 well below 0.85 ceiling. \
+             Got outcomes={:?}, details={:?}",
+            r.outcomes,
+            r.failure_details().collect::<Vec<_>>(),
+        );
+        assert!(
+            r.info_notes
+                .iter()
+                .any(|n| n.message.contains("cross_frac")
+                    && n.message.contains("ratio_across_phases")),
+            "expected pass info note carrying the composed-metric label, \
+             got {:?}",
+            r.info_notes,
         );
     }
 }
