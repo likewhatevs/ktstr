@@ -1719,7 +1719,7 @@ fn rendered_passthrough_returns_raw_value() {
     let r = synthetic_report();
     let snap = Snapshot::new(&r);
     let f = snap.var("ctx").get("weight");
-    let rendered = f.rendered().expect("weight is a Value");
+    let rendered = f.raw().expect("weight is a Value");
     match rendered {
         RenderedValue::Uint { bits, value } => {
             assert_eq!(*bits, 32);

@@ -189,14 +189,6 @@ impl<'a> SnapshotField<'a> {
         }
     }
 
-    /// Underlying rendered value if present. Alias for
-    /// [`Self::raw`] kept for older callers; new code should
-    /// prefer [`Self::raw`] which matches the cross-surface
-    /// `.raw()` opt-in-downshift convention.
-    pub fn rendered(&self) -> Option<&'a RenderedValue> {
-        self.raw()
-    }
-
     /// Error reference when the field is missing; `None`
     /// otherwise.
     pub fn error(&self) -> Option<&SnapshotError> {
