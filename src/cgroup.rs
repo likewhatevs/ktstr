@@ -672,7 +672,17 @@ impl CgroupManager {
             );
         }
         self.drain_tasks(name)?;
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Wait for the kernel to reflect the empty state via
+        // cgroup.events `populated 0` (event-driven via inotify on
+        // the events file) before attempting rmdir. The legacy
+        // 50 ms blind sleep was a hopeful settle: too short under
+        // load (rmdir EBUSY) and too long on a quiet host (wasted
+        // tens of ms × every cgroup teardown). Falls through to
+        // rmdir on deadline so the caller still sees the same
+        // EBUSY error if the cgroup is genuinely stuck-populated;
+        // 1 s ceiling matches the prior pessimistic upper bound on
+        // a settling cgroup.
+        wait_for_cgroup_unpopulated(p, std::time::Duration::from_secs(1));
         fs::remove_dir(p).with_context(|| format!("rmdir {}", p.display()))
     }
 
@@ -1432,6 +1442,90 @@ impl CgroupOps for CgroupManager {
 /// `tracing::warn!` — silently dropping either would hide a cgroup
 /// that still contains tasks and send it into cleanup, which then
 /// fails with EBUSY and compounds the confusion.
+/// Block until the cgroup at `cgroup_dir` reports `populated 0` via
+/// its `cgroup.events` file, or until `budget` elapses. Event-driven
+/// via inotify(IN_MODIFY) on the events file so the wait wakes on
+/// the actual kernel state-transition write rather than a blind
+/// sleep. Callers use the return value to decide whether to proceed
+/// (cgroup empty — rmdir will succeed) or to fall through and let
+/// the subsequent rmdir surface EBUSY for a genuinely-stuck cgroup.
+///
+/// Best-effort: a missing `cgroup.events` file (legacy kernels
+/// without cgroup v2 events, non-cgroupfs paths threaded into this
+/// helper by a test fixture, races where the parent dir was already
+/// removed) returns `false` without waiting — the caller falls
+/// through to its rmdir attempt which will surface the actual
+/// error. inotify_init / add_watch failures degrade silently to a
+/// short blocking sleep for the remaining budget.
+fn wait_for_cgroup_unpopulated(cgroup_dir: &Path, budget: std::time::Duration) -> bool {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+    use std::os::unix::io::AsFd;
+
+    let events_path = cgroup_dir.join("cgroup.events");
+    // Tight initial check so a cgroup that's already empty
+    // (extremely common — most drain_tasks call sites finish
+    // synchronously) returns immediately without setting up inotify
+    // or sleeping.
+    if cgroup_events_reports_unpopulated(&events_path) {
+        return true;
+    }
+    let deadline = std::time::Instant::now() + budget;
+    // Inotify on the events file. IN_MODIFY fires every time the
+    // kernel updates the populated count (1 → 0 transition included).
+    // IN_NONBLOCK so read_events returns EAGAIN when empty — we
+    // drive wake-vs-timeout via poll(2).
+    let inotify_result =
+        Inotify::init(InitFlags::IN_CLOEXEC | InitFlags::IN_NONBLOCK).and_then(|i| {
+            i.add_watch(&events_path, AddWatchFlags::IN_MODIFY)?;
+            Ok(i)
+        });
+    loop {
+        if cgroup_events_reports_unpopulated(&events_path) {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let remaining_ms = deadline
+            .duration_since(now)
+            .as_millis()
+            .min(u16::MAX as u128) as u16;
+        match inotify_result.as_ref() {
+            Ok(inotify) => {
+                let fd = inotify.as_fd();
+                let mut pollfds = [PollFd::new(fd, PollFlags::POLLIN)];
+                let _ = poll(&mut pollfds, PollTimeout::from(remaining_ms));
+                let _ = inotify.read_events();
+            }
+            Err(_) => {
+                // Inotify unavailable on this path (legacy kernel,
+                // missing events file, transient race). Fall back
+                // to a brief blocking sleep so the loop still makes
+                // progress under the deadline.
+                std::thread::sleep(
+                    std::time::Duration::from_millis(10).min(deadline.duration_since(now)),
+                );
+            }
+        }
+    }
+}
+
+/// Read `cgroup.events` and return `true` iff it contains a
+/// `populated 0` line. Returns `false` for any read error or for
+/// `populated 1` so the caller can keep waiting. The events file
+/// is a small (~50 byte) flat key/value listing; full read each
+/// poll iteration is cheap and avoids stateful parsing edge cases.
+fn cgroup_events_reports_unpopulated(events_path: &Path) -> bool {
+    match fs::read_to_string(events_path) {
+        Ok(s) => s
+            .lines()
+            .any(|line| line.split_whitespace().eq(["populated", "0"])),
+        Err(_) => false,
+    }
+}
+
 fn drain_pids_to_root(procs_path: &Path, context: &str) {
     let dst = Path::new("/sys/fs/cgroup/cgroup.procs");
     let content = match fs::read_to_string(procs_path) {
@@ -1560,7 +1654,10 @@ fn cleanup_recursive(path: &std::path::Path) {
         );
     }
     drain_pids_to_root(&path.join("cgroup.procs"), &path.display().to_string());
-    std::thread::sleep(std::time::Duration::from_millis(10));
+    // Wait event-driven on cgroup.events `populated 0` rather than
+    // a blind 10 ms sleep — see `wait_for_cgroup_unpopulated`'s doc
+    // for the rationale. 1 s deadline matches `remove_cgroup_inner`.
+    wait_for_cgroup_unpopulated(path, std::time::Duration::from_secs(1));
     if let Err(err) = fs::remove_dir(path) {
         tracing::warn!(
             path = %path.display(),
