@@ -419,7 +419,15 @@ fn dispatch_one_write(
                 field,
             },
             value,
-        ) => dispatch_task_field_write(kernel, btf, *pid, *expected_start_time_ns, field, value),
+        ) => dispatch_task_field_write(
+            kernel,
+            btf,
+            kaslr_offset,
+            *pid,
+            *expected_start_time_ns,
+            field,
+            value,
+        ),
     }
 }
 
@@ -519,6 +527,7 @@ fn dispatch_one_read(
         ) => dispatch_task_field_read(
             kernel,
             btf,
+            kaslr_offset,
             *pid,
             *expected_start_time_ns,
             field,
@@ -1356,6 +1365,7 @@ fn validate_task_for_field_op(
 fn resolve_and_validate_task_field(
     kernel: &GuestKernel,
     btf: Option<&Btf>,
+    kaslr_offset: u64,
     pid: u32,
     expected_start_time_ns: u64,
 ) -> Result<(u64, btf_rs::Struct), String> {
@@ -1371,13 +1381,18 @@ fn resolve_and_validate_task_field(
              (heavily stripped vmlinux); cannot anchor the task-list walker"
         )
     })?;
-    let ext_sched_class_kva = kernel.symbol_kva("ext_sched_class").ok_or_else(|| {
+    let ext_sched_class_link_kva = kernel.symbol_kva("ext_sched_class").ok_or_else(|| {
         format!(
             "TaskField pid={pid}: ext_sched_class symbol absent from vmlinux symtab \
              (kernel built without CONFIG_SCHED_CLASS_EXT=y); TaskField writes are \
              SCX-only and require sched_ext support"
         )
     })?;
+    // The vmlinux symtab carries link-time KVAs; under KASLR-on
+    // the runtime `task->sched_class` carries the slide. Compare
+    // apples to apples: shift the symbol KVA by the runtime
+    // virt-KASLR offset before passing to the validator.
+    let ext_sched_class_kva = ext_sched_class_link_kva.wrapping_add(kaslr_offset);
 
     let val_offs = TaskValidationOffsets::resolve_from_btf(btf)?;
 
@@ -1420,13 +1435,14 @@ fn resolve_and_validate_task_field(
 fn dispatch_task_field_write(
     kernel: &GuestKernel,
     btf: Option<&Btf>,
+    kaslr_offset: u64,
     pid: u32,
     expected_start_time_ns: u64,
     field: &str,
     value: &KernelOpValue,
 ) -> Result<(), String> {
     let (task_pa, task_struct_t) =
-        resolve_and_validate_task_field(kernel, btf, pid, expected_start_time_ns)?;
+        resolve_and_validate_task_field(kernel, btf, kaslr_offset, pid, expected_start_time_ns)?;
 
     // Safe to unwrap: resolve_and_validate_task_field rejected if
     // btf was None.
@@ -1462,13 +1478,14 @@ fn dispatch_task_field_write(
 fn dispatch_task_field_read(
     kernel: &GuestKernel,
     btf: Option<&Btf>,
+    kaslr_offset: u64,
     pid: u32,
     expected_start_time_ns: u64,
     field: &str,
     width_hint: &KernelOpValue,
 ) -> Result<KernelOpValue, String> {
     let (task_pa, task_struct_t) =
-        resolve_and_validate_task_field(kernel, btf, pid, expected_start_time_ns)?;
+        resolve_and_validate_task_field(kernel, btf, kaslr_offset, pid, expected_start_time_ns)?;
 
     let btf = btf.expect("checked in resolve_and_validate_task_field");
 
