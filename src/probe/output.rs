@@ -1,7 +1,7 @@
 //! Probe event formatting: turn captured [`ProbeEvent`]s into the
 //! human-readable report surfaced through auto-repro output.
 //!
-//! Entry points are [`format_probe_events`] and its BPF-aware
+//! Entry points are `format_probe_events` and its BPF-aware
 //! variant [`format_probe_events_with_bpf_locs`]; everything else
 //! here is private formatting helpers plus the field-key decoder
 //! glue that connects BTF types in [`super::btf`] to the typed
@@ -82,7 +82,7 @@ fn format_cpumask_display(cpumask_words: &[u64; 4], nr_cpus: Option<u32>) -> Str
 /// When `start` is present but `end` is missing, returns everything
 /// from after `start` to end-of-buffer — this is intentional and the
 /// truncated-payload recovery path in
-/// [`crate::test_support::probe::extract_probe_output`] depends on
+/// `crate::test_support::probe::extract_probe_output` depends on
 /// it: when the repro VM dies mid-`println!`, COM2 captures the
 /// `start` sentinel plus a partial JSON object but never gets to
 /// emit `end`, and the parser must still see the partial bytes to
@@ -208,9 +208,9 @@ pub fn format_probe_events(
 
 /// Format with BPF source locations pre-resolved from program BTF.
 ///
-/// Same as [`format_probe_events`] but accepts a map of
+/// Same as `format_probe_events` but accepts a map of
 /// `function_name -> "file:line"` for BPF callbacks (from
-/// [`resolve_bpf_source_locs`](super::btf::resolve_bpf_source_locs)).
+/// `resolve_bpf_source_locs`, see `super::btf::resolve_bpf_source_locs`).
 /// BPF source locations are used when blazesym has no match for a
 /// function name.
 ///

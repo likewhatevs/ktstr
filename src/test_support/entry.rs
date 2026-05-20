@@ -2177,7 +2177,7 @@ fn scheduler_index() -> &'static std::collections::HashMap<&'static str, &'stati
 
 /// Build a name → scheduler map from an iterator of registered
 /// schedulers, panicking on the first duplicate name. Factored out
-/// so [`tests`] can exercise the duplicate-detection branch against a
+/// so `tests` can exercise the duplicate-detection branch against a
 /// mock slice — the real [`KTSTR_SCHEDULERS`] is the union of every
 /// `declare_scheduler!` invocation in the linked binary and so
 /// cannot host an intentional duplicate without poisoning every

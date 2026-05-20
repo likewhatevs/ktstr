@@ -49,7 +49,7 @@ use super::mountinfo::{needle_from_path, needle_from_path_with_mountinfo};
 ///
 /// For each matching PID, reads `/proc/{pid}/cmdline`, decodes as
 /// lossy UTF-8, replaces `\0` with ` `, and truncates to
-/// [`super::holder::CMDLINE_MAX_CHARS`] with a `…` suffix on
+/// `super::holder::CMDLINE_MAX_CHARS` with a `…` suffix on
 /// overflow. A cmdline read failure is non-fatal — the entry
 /// carries `"<cmdline unavailable>"` so the pid still surfaces.
 pub(super) fn read_holders_for_needle(needle: &str) -> Result<Vec<HolderInfo>> {

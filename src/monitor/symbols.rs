@@ -572,7 +572,7 @@ pub(crate) fn resolve_page_offset_with_tcr(
 /// then read the live `phys_base` value.
 ///
 /// `cr3_pa` is the BSP's CR3 (KVM_GET_SREGS, masked to a PA per
-/// Intel SDM §4.5: bits [11:0] hold PCID/PCD/PWT control bits and
+/// Intel SDM §4.5: bits `\[11:0\]` hold PCID/PCD/PWT control bits and
 /// must be cleared). `l5` selects the walker variant; resolve
 /// once via [`resolve_pgtable_l5`] BEFORE the first
 /// `resolve_phys_base` call (the L5 read uses `phys_base = 0` and
@@ -704,8 +704,8 @@ pub(crate) fn text_kva_to_pa_with_base(kva: u64, start_kernel_map: u64, phys_bas
 /// (`arch/arm64/include/asm/memory.h`), where `VA_BITS_MIN` depends
 /// on the compile-time `VA_BITS` and the granule. The runtime
 /// values reachable from `TCR_EL1`:
-/// - `T1SZ` (bits [21:16]) → `VA_BITS_runtime = 64 - T1SZ`
-/// - `TG1` (bits [31:30]) → granule (0b01=16 KB, 0b10=4 KB,
+/// - `T1SZ` (bits `\[21:16\]`) → `VA_BITS_runtime = 64 - T1SZ`
+/// - `TG1` (bits `\[31:30\]`) → granule (0b01=16 KB, 0b10=4 KB,
 ///   0b11=64 KB; 0b00 reserved)
 ///
 /// `VA_BITS_MIN` reconstruction (`asm/memory.h:56-64`):
@@ -815,7 +815,7 @@ pub(crate) fn start_kernel_map_for_tcr(tcr_el1: u64) -> Option<u64> {
 /// Read the `__per_cpu_offset` array from guest memory.
 /// Returns per-CPU offsets for each CPU (index = CPU number).
 ///
-/// Each u64 element is read via [`GuestMem::read_u64`], which uses
+/// Each u64 element is read via [`crate::monitor::reader::GuestMem::read_u64`], which uses
 /// per-byte `read_volatile` internally and is alignment-safe even
 /// when `per_cpu_offset_pa` is not 8-aligned. The previous raw
 /// `std::ptr::read_volatile(*const u64)` implementation was UB on

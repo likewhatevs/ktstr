@@ -6,26 +6,26 @@
 //! handler. The handlers themselves live in submodules under
 //! `src/bin/cargo_ktstr/`:
 //!
-//! - [`cli`]    — clap-derived `Cargo` / `CargoSub` / `Ktstr` /
+//! - `cli`    — clap-derived `Cargo` / `CargoSub` / `Ktstr` /
 //!   `KtstrCommand` / `ModelCommand` / `StatsCommand`
 //!   types that drive argument parsing and shell
 //!   completion generation.
-//! - [`kernel`] — `--kernel <SPEC>` resolution shared by the `shell`,
+//! - `kernel` — `--kernel <SPEC>` resolution shared by the `shell`,
 //!   `verifier`, and gauntlet-expansion code paths, plus
 //!   the `kernel build` subcommand dispatcher. Pure
 //!   wire-format helpers (label emission, `KTSTR_KERNEL_LIST`
 //!   encoding, dedup, collision detection) live in the
-//!   inner [`kernel::wire_format`] submodule.
-//! - [`run_cargo`] — `test`, `coverage`, `llvm-cov` dispatchers that
+//!   inner `kernel::wire_format` submodule.
+//! - `run_cargo` — `test`, `coverage`, `llvm-cov` dispatchers that
 //!   wrap `cargo nextest` with the kernel/topology
 //!   gauntlet wire format.
-//! - [`stats`]  — `stats compare` subcommand that diffs
+//! - `stats`  — `stats compare` subcommand that diffs
 //!   `target/stats/` JSON across two kernel/scheduler
 //!   build commits.
-//! - [`verifier`] — `verifier` subcommand that runs a scheduler
+//! - `verifier` — `verifier` subcommand that runs a scheduler
 //!   binary under the BPF-stats verifier and renders
 //!   per-program verified-instruction counts.
-//! - [`misc`]   — smaller subcommand dispatchers, one submodule per
+//! - `misc`   — smaller subcommand dispatchers, one submodule per
 //!   CLI verb: `shell`, `completions`, `funify`,
 //!   `model {fetch,status,clean}`, `export`.
 //! - `parse_tests` (test-only) — clap parse-shape coverage: every

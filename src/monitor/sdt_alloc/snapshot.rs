@@ -19,7 +19,7 @@ pub struct SdtAllocEntry {
     /// distinguish reallocations of the same `idx`.
     pub genn: i32,
     /// Low 32 bits of the user-side arena pointer to the `sdt_data`
-    /// slot. Computed by [`TreeWalker::emit_leaf`] as
+    /// slot. Computed by `TreeWalker::emit_leaf` as
     /// `data_ptr & 0xFFFF_FFFF`, NOT the full user-side VA — slot
     /// addresses already live in the 32-bit `arena.user_vm_start`
     /// window, so the masked low 32 bits are sufficient for
@@ -69,10 +69,10 @@ pub struct SdtAllocatorSnapshot {
     pub allocator_name: String,
     /// Live allocations, in tree-walk order (level 0 → 1 → 2,
     /// monotonic pos at each level). Capped at
-    /// [`MAX_SDT_ALLOC_ENTRIES`].
+    /// `MAX_SDT_ALLOC_ENTRIES`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<SdtAllocEntry>,
-    /// True when the walk stopped at [`MAX_SDT_ALLOC_ENTRIES`] before
+    /// True when the walk stopped at `MAX_SDT_ALLOC_ENTRIES` before
     /// covering every live bit in the bitmaps.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
@@ -95,10 +95,10 @@ pub struct SdtAllocatorSnapshot {
     /// payload size diverges from the declared one.
     pub elem_size: u64,
     /// Diagnostic: the BTF type id used to render payload bytes.
-    /// 0 when [`discover_payload_btf_id`] returned no candidate and
+    /// 0 when `discover_payload_btf_id` returned no candidate and
     /// the renderer fell back to hex.
     pub target_type_id: u32,
-    /// Diagnostic: when [`discover_payload_btf_id`] returned 0, the
+    /// Diagnostic: when `discover_payload_btf_id` returned 0, the
     /// reason (e.g. `"no candidate of size 16"`,
     /// `"ambiguous: 3 candidates"`, `"payload_size == 0"`). Empty on
     /// successful BTF resolve. Lets an operator distinguish the

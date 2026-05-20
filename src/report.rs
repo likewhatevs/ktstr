@@ -14,7 +14,7 @@ use std::fmt;
 /// Prints only — callers drive their own control flow. Some sites
 /// early-return `()`, some return `Err` / `Ok(...)` / `None`, some
 /// `continue` out of a label-driven loop; a single return-forcing
-/// macro cannot serve them all. The [`skip!`](crate::skip) macro in
+/// macro cannot serve them all. The `skip!` macro in
 /// `src/test_macros.rs` wraps this call with a trailing `return;`
 /// for `fn() -> ()` test helpers.
 pub(crate) fn test_skip(reason: impl fmt::Display) {

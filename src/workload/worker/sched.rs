@@ -17,10 +17,10 @@ use super::super::config::SchedPolicy;
 /// `tid` selects which `/proc` path is read:
 /// - `None` → `/proc/self/schedstat`. `/proc/self` resolves to
 ///   `/proc/<TGID>` (the thread-group leader's task_struct), which
-///   is correct for [`CloneMode::Fork`] workers because each fork
+///   is correct for `CloneMode::Fork` workers because each fork
 ///   worker IS its own thread-group leader (`gettid() == getpid()`).
 /// - `Some(tid)` → `/proc/self/task/<tid>/schedstat`. Required for
-///   [`CloneMode::Thread`] workers: every thread in the parent
+///   `CloneMode::Thread` workers: every thread in the parent
 ///   tgid sees the same `/proc/self/schedstat` (the parent's
 ///   leader stats), so reading it from a thread worker reports
 ///   the test runner's stats, not the worker's. The

@@ -14,28 +14,28 @@ use crate::vmm::topology::Topology;
 // (arch/x86/kvm/vmx/pmu_intel.c) clamps these against the host's
 // actual PMU capabilities, so the guest sees min(synthesized, host).
 
-/// PMU architectural version reported in EAX[7:0]. Version 2
+/// PMU architectural version reported in `EAX\[7:0\]`. Version 2
 /// matches Intel SDM "Architectural Performance Monitoring v2".
 const PMU_ARCH_PERFMON_VERSION: u32 = 2;
 
-/// Number of general-purpose counters per logical CPU, EAX[15:8].
+/// Number of general-purpose counters per logical CPU, `EAX\[15:8\]`.
 /// Conservative — Intel hardware ranges from 4 to 8.
 const PMU_NUM_GP_COUNTERS: u32 = 4;
 
-/// General-purpose counter bit width, EAX[23:16]. PMU v2 spec value.
+/// General-purpose counter bit width, `EAX\[23:16\]`. PMU v2 spec value.
 const PMU_GP_COUNTER_WIDTH: u32 = 48;
 
-/// Bit-vector length for the unsupported-event mask, EAX[31:24].
+/// Bit-vector length for the unsupported-event mask, `EAX\[31:24\]`.
 /// Must equal ARCH_PERFMON_EVENTS_COUNT (7) from
 /// arch/x86/include/asm/perf_event.h or intel_pmu_init in
 /// arch/x86/events/intel/core.c returns -ENODEV.
 const PMU_EVENT_MASK_LENGTH: u32 = 7;
 
-/// Number of fixed-function counters, EDX[4:0]. PMU v2 surface = 3
+/// Number of fixed-function counters, `EDX\[4:0\]`. PMU v2 surface = 3
 /// (instructions, cycles, ref-cycles).
 const PMU_NUM_FIXED_COUNTERS: u32 = 3;
 
-/// Fixed-function counter bit width, EDX[12:5]. PMU v2 spec value.
+/// Fixed-function counter bit width, `EDX\[12:5\]`. PMU v2 spec value.
 const PMU_FIXED_COUNTER_WIDTH: u32 = 48;
 
 /// CPU vendor, detected from CPUID leaf 0x0 EBX:EDX:ECX.
@@ -102,7 +102,7 @@ pub fn core_shift(topo: &Topology) -> u32 {
 }
 
 /// Patch cache topology fields in a CPUID EAX register (leaf 0x4 or 0x8000001D).
-/// Sets EAX[25:14] (num_threads_sharing) and EAX[31:26] (num_cores_on_die)
+/// Sets `EAX\[25:14\]` (num_threads_sharing) and `EAX\[31:26\]` (num_cores_on_die)
 /// based on the cache level and VM topology.
 fn patch_cache_topology_eax(entry: &mut kvm_cpuid_entry2, smt: u32, core: u32, cores_per_llc: u32) {
     let cache_level = (entry.eax >> 5) & 0x7;

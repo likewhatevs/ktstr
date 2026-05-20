@@ -363,10 +363,10 @@ fn classify_exit_kind(message: &str, stack: &[StackSymbol]) -> ScxExitKind {
 ///
 /// Scans for the patterns ktstr-aware schedulers (and the
 /// upstream watchdog) tend to emit:
-/// - `task <COMM>:<pid>` (mainline watchdog: "...stalled task <COMM>:<pid>")
+/// - `task <COMM>:<pid>` (mainline watchdog: `...stalled task <COMM>:<pid>`)
 /// - `comm=<COMM>` (some custom schedulers)
 ///
-/// The `task <COMM>` pattern requires the COMM to be followed by
+/// The `task <COMM>` pattern requires the `COMM` to be followed by
 /// `:<digits>` (the watchdog always prints the pid). This avoids
 /// matching prose like "runnable task stall" in the anchor's
 /// parenthesized body, where "stall" is a classification keyword

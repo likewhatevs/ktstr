@@ -221,7 +221,7 @@ pub(crate) struct VcpuPanicCtx {
     pub(crate) exited_evt: Option<Arc<EventFd>>,
     /// kvm_run-mmap-liveness flag. `true` means the thread's
     /// `VcpuFd` (and its `MAP_SHARED` `kvm_run` mapping that
-    /// backs every cross-thread [`ImmediateExitHandle`] copy) is
+    /// backs every cross-thread `ImmediateExitHandle` copy) is
     /// still mapped. The hook flips it to `false` BEFORE the
     /// stack unwind drops `vcpu` so a coordinator iterating a
     /// captured `Vec<ImmediateExitHandle>` can gate each

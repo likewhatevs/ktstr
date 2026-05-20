@@ -205,18 +205,27 @@ fn apply_nice_invokes_setpriority() {
         errno_before, 0,
         "getpriority must succeed before apply_nice; rc={nice_before}"
     );
-    assert_eq!(
-        nice_before, 0,
-        "test must start from default nice 0; observed {nice_before} \
-         (a non-default starting nice indicates external state \
-         leakage from a prior test or runner config)"
-    );
 
-    // Invoke apply_nice(5) — must raise nice via setpriority.
-    // Raising is unconditionally permitted for own-task so this
-    // call cannot fail on permissions and isolates the function
-    // body's syscall path from CAP_SYS_NICE / RLIMIT_NICE.
-    apply_nice(5);
+    // Pick a target that's strictly higher than the starting nice
+    // so the post-call assertion can distinguish "apply_nice
+    // invoked setpriority" from "no-op short-circuit" regardless
+    // of what the starting nice happens to be (tests can inherit
+    // a non-zero nice from the nextest worker or runner config).
+    // Raising nice (increasing the value) is unconditionally
+    // permitted for own-task so the syscall cannot fail on
+    // CAP_SYS_NICE / RLIMIT_NICE. If the starting nice is already
+    // at the maximum (19), we have no room to raise; skip cleanly
+    // with a diagnostic rather than asserting a false invariant.
+    if nice_before >= 19 {
+        eprintln!(
+            "apply_nice_invokes_setpriority: starting nice {nice_before} is at max; \
+             skipping — no room to raise so apply_nice success is indistinguishable \
+             from no-op"
+        );
+        return;
+    }
+    let target = nice_before + 1;
+    apply_nice(target);
 
     unsafe {
         *libc::__errno_location() = 0;
@@ -225,18 +234,19 @@ fn apply_nice_invokes_setpriority() {
     let errno_after = unsafe { *libc::__errno_location() };
     assert_eq!(errno_after, 0, "getpriority must succeed after apply_nice");
     assert_eq!(
-        nice_after, 5,
-        "apply_nice(5) must invoke setpriority and write 5 — \
+        nice_after, target,
+        "apply_nice({target}) must invoke setpriority and write {target} — \
          observed nice {nice_after} after starting at {nice_before}; \
          a no-op (e.g. an early-return short-circuit, the regression \
-         this test guards against) would leave nice at 0",
+         this test guards against) would leave nice at {nice_before}",
     );
 
-    // Restore default. Lowering from 5 to 0 may fail without
-    // CAP_SYS_NICE — that is exactly why the assertion above
-    // tests raising rather than lowering. Best-effort cleanup;
-    // rc is intentionally ignored.
-    let _ = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 0) };
+    // Best-effort restore to the starting nice. Lowering from
+    // target back to nice_before may fail without CAP_SYS_NICE
+    // (that is exactly why the assertion above tests raising
+    // rather than lowering). Best-effort cleanup; rc is
+    // intentionally ignored.
+    let _ = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice_before) };
 }
 /// Positive-nice end-to-end: spawn one worker with `nice = 10`,
 /// verify the worker process actually has nice 10 by reading

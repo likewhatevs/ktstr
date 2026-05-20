@@ -188,7 +188,7 @@ impl KtstrKvm {
     ///
     /// Sets up /dev/kvm, VM fd, TSS, identity map, IRQ chip, vCPUs, and
     /// CPUID — none of which depend on guest memory size. Memory is
-    /// allocated later via [`allocate_and_register_memory`].
+    /// allocated later via `allocate_and_register_memory`.
     pub fn new_deferred(
         topo: Topology,
         use_hugepages: bool,

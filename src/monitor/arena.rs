@@ -19,7 +19,7 @@
 //! The host-side walker mirrors this: read the arena's `kern_vm`
 //! pointer, dereference to get `vm_struct.addr`, add `GUARD_SZ/2`,
 //! then for each pgoff in `0..max_entries` compute `kaddr` and run
-//! [`GuestMem::translate_kva`] (the existing PTE walker against
+//! `GuestMem::translate_kva` (the existing PTE walker against
 //! `init_mm`'s page table). `max_entries` is the BPF map's declared
 //! page capacity from `bpf_map_create()` — it is the source of truth
 //! for "how many pages this arena could hold", regardless of whether
@@ -57,7 +57,7 @@ use super::guest::GuestKernel;
 /// must match the guest's view.
 ///
 /// On x86_64 the guest page granule is fixed at 4 KiB. On aarch64
-/// the granule is encoded in `TCR_EL1.TG1` (bits [31:30]):
+/// the granule is encoded in `TCR_EL1.TG1` (bits `\[31:30\]`):
 ///   - `0b10` → 4 KiB
 ///   - `0b01` → 16 KiB
 ///   - `0b11` → 64 KiB
@@ -294,7 +294,7 @@ pub struct ArenaSnapshot {
 /// dereferences to `vm_struct.addr`, computes
 /// `kern_vm_start = addr + GUARD_HALF`, and for each pgoff in
 /// `0..N` translates `kern_vm_start + (u32)user_addr` via
-/// [`GuestMem::translate_kva`]. Pages that fail to translate are
+/// `GuestMem::translate_kva`. Pages that fail to translate are
 /// "not faulted in" and silently skipped.
 ///
 /// The walker is best-effort: any read failure on `bpf_arena` /

@@ -330,7 +330,7 @@ impl Verdict {
     /// `tracing::info!` event (gated on [`Self::log_passes`]).
     ///
     /// The structured push is unconditional: every comparator's pass
-    /// arm contributes one [`PassDetail`] to the result so the
+    /// arm contributes one [`super::PassDetail`] to the result so the
     /// auto-repro renderer (and any other consumer that wants per-
     /// claim fidelity) can iterate passing assertions alongside
     /// failing ones without re-running the comparators.

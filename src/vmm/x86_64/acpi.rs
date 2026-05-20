@@ -599,11 +599,11 @@ struct HmatMsci {
     memory_proximity_domain: u32,
     _reserved1: u32,
     cache_size: u64,
-    /// Bits [3:0] = total cache levels,
-    /// bits [7:4] = cache level being described,
-    /// bits [11:8] = associativity (0=none,1=direct,2=complex),
-    /// bits [15:12] = write policy (0=none,1=WB,2=WT),
-    /// bits [31:16] = cache line size in bytes.
+    /// Bits `[3:0]` = total cache levels,
+    /// bits `[7:4]` = cache level being described,
+    /// bits `[11:8]` = associativity (0=none,1=direct,2=complex),
+    /// bits `[15:12]` = write policy (0=none,1=WB,2=WT),
+    /// bits `[31:16]` = cache line size in bytes.
     cache_attributes: u32,
     address_mode: u16,
     _num_smbios_handles: u16,

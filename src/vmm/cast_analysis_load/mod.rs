@@ -161,7 +161,7 @@ pub(crate) struct CastAnalysisOutput {
     /// [`crate::monitor::btf_render::MemReader::cast_lookup`] hits
     /// against the per-program BTF the rendered map was loaded from.
     /// Even when the cast hit is empty, the wrapping output is still
-    /// retained because the cross-BTF [`fwd_index`] is independently
+    /// retained because the cross-BTF `fwd_index` is independently
     /// useful — a scheduler whose Fwd pointers all live in
     /// non-typed-pointer-bearing maps still benefits from the index
     /// when the renderer chases those maps' [`Type::Ptr`] arms.
@@ -176,9 +176,9 @@ pub(crate) struct CastAnalysisOutput {
     pub(crate) btfs: Vec<Arc<Btf>>,
     /// `struct_or_union_name -> FwdIndexEntry` for every complete
     /// (`!is_fwd`) [`btf_rs::Type::Struct`] / [`btf_rs::Type::Union`]
-    /// across [`btfs`]. `Typedef` is NOT indexed — typedefs add no
+    /// across `btfs`. `Typedef` is NOT indexed — typedefs add no
     /// body and the chase path peels through them via
-    /// [`peel_modifiers_with_id`] before consulting the index.
+    /// `peel_modifiers_with_id` before consulting the index.
     ///
     /// First-write-wins: when the same name appears in multiple
     /// BTFs the index keeps the first-seen entry. Two distinct
@@ -1584,7 +1584,7 @@ fn find_datasec_btf_id(btf: &Btf, name: &str) -> Option<u32> {
 /// rewrite host-side, except that the BTF id we patch in is the
 /// program-BTF id of the extern `BTF_KIND_FUNC`, not the running
 /// kernel's id. That suffices for cast analysis: the analyzer's
-/// [`crate::monitor::cast_analysis::Analyzer::handle_kfunc_call`]
+/// `crate::monitor::cast_analysis::Analyzer::handle_kfunc_call`
 /// resolves `imm` against the same program BTF (it has no kernel
 /// BTF here), peels `Func -> FuncProto -> return type` through
 /// `Ptr -> Struct/Union`, and types R0 accordingly. The kfunc's
@@ -1735,7 +1735,7 @@ fn patch_kfunc_calls(
 /// relocation against an `STT_FUNC` symbol whose containing section
 /// is one of the program text sections we concatenated into
 /// `text_concat`. Without patching, the cast analyzer's
-/// [`crate::monitor::cast_analysis::Analyzer::analyze`] computes
+/// `crate::monitor::cast_analysis::Analyzer::analyze` computes
 /// `callee_pc = pc + 1 + insn.imm = pc + 1 + (-1) = pc` and
 /// inserts the caller's R1..R5 snapshot into `caller_arg_types`
 /// at the call site itself instead of at the callee's entry PC.

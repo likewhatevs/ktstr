@@ -94,7 +94,7 @@ pub(crate) fn host_page_size() -> u64 {
 /// driving a full `setup_memory` call.
 ///
 /// Token contract (consumed by
-/// [`crate::vmm::rust_init::auto_mount_data_disks`]):
+/// `crate::vmm::rust_init::auto_mount_data_disks`):
 /// * `KTSTR_DISK0_FS=<cache_tag>` — fstype string for the
 ///   `mount(2)` syscall. Reuses `Filesystem::cache_tag()` so the
 ///   on-disk-format identifier and the cmdline value stay in
@@ -760,7 +760,7 @@ impl KtstrVm {
     /// that allocated memory is sufficient for the initramfs.
     ///
     /// x86_64-only: aarch64 uses
-    /// [`Self::join_and_load_initramfs_aarch64`], which computes the
+    /// `Self::join_and_load_initramfs_aarch64`, which computes the
     /// FDT-relative load address from the compressed size after the
     /// suffix is built (the address depends on `memory_mib` AND the
     /// total compressed size, neither of which is known until after
@@ -829,7 +829,7 @@ impl KtstrVm {
     /// Returns `(initrd_addr, initrd_size, memory_mib)`.
     ///
     /// x86_64-only: aarch64 uses
-    /// [`Self::join_compute_memory_and_load_aarch64`], which orders
+    /// `Self::join_compute_memory_and_load_aarch64`, which orders
     /// the load_addr computation after `allocate_and_register_memory`
     /// (the FDT-relative initrd address depends on `memory_mib`,
     /// which is itself computed from the post-compress total size).

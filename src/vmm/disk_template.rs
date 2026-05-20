@@ -51,7 +51,7 @@
 //!    [`crate::vmm::KtstrVm::init_virtio_blk`] — the template-build
 //!    VM cannot recursively re-enter the cache it is itself
 //!    populating. Guest dispatch
-//!    ([`crate::vmm::rust_init::run_disk_template_mode`]) execs
+//!    (`crate::vmm::rust_init::run_disk_template_mode`) execs
 //!    `/bin/<mkfs_binary_name>` against `/dev/vda` (currently
 //!    `mkfs.btrfs` for `Filesystem::Btrfs` per
 //!    [`Filesystem::mkfs_binary_name`]) and reboots cleanly; on
@@ -439,7 +439,7 @@ fn mkfs_version_fingerprint_cache()
 /// deterministic output for `--version` (no timestamp, no
 /// random-id), the fingerprint is stable across runs of the same
 /// binary — verified by the
-/// [`mkfs_version_fingerprint_is_deterministic`] unit test.
+/// `mkfs_version_fingerprint_is_deterministic` unit test.
 ///
 /// # When the version output is non-deterministic
 ///
@@ -672,7 +672,7 @@ fn fsid_bytes(buf: &libc::statfs) -> [u8; std::mem::size_of::<libc::fsid_t>()] {
 /// Acquire an exclusive flock on the per-key cache lockfile.
 ///
 /// **Held ONLY around the mkfs+publish branch of [`ensure_template`].**
-/// The pre-lock [`CacheDir::lookup`] at the top of `ensure_template`
+/// The pre-lock [`crate::cache::CacheDir::lookup`] at the top of `ensure_template`
 /// runs WITHOUT a flock — manifest read is atomic on the read side
 /// and the published template is read-only thereafter, so concurrent
 /// readers (including the per-test fan-out path via
@@ -1140,7 +1140,7 @@ fn create_and_size_staging_image(staging_path: &Path, capacity_bytes: u64) -> Re
 ///    VM cannot recursively re-enter [`ensure_template`] for its
 ///    own `(fs, capacity_bytes)` key. Cmdline carries
 ///    `KTSTR_MODE=disk_template`; the guest dispatch at
-///    [`crate::vmm::rust_init::run_disk_template_mode`] execs the
+///    `crate::vmm::rust_init::run_disk_template_mode` execs the
 ///    embedded `bin/<mkfs_binary_name>` against `/dev/vda`
 ///    (currently `mkfs.btrfs` for `Filesystem::Btrfs` per
 ///    [`Filesystem::mkfs_binary_name`]) and reboots.
@@ -1379,7 +1379,7 @@ fn build_template_via_vm(
 ///   (debris left on disk) are recoverable, false positives
 ///   (deleting live state) are not.
 ///
-/// Mirrors [`crate::cache::clean_orphaned_tmp_dirs`] in
+/// Mirrors `crate::cache::clean_orphaned_tmp_dirs` in
 /// `src/cache.rs` — the disk-template cache and the kernel-image
 /// cache use the same pid-in-suffix + ESRCH-probe contract for
 /// cross-process cleanup. The two are independent because their

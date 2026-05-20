@@ -1567,7 +1567,7 @@ impl PhaseBucket {
 /// - `step_index`: equal by precondition (caller pairs buckets by
 ///   `step_index`), kept from `a`.
 /// - `label`: kept from `a`. By construction the label is derived
-///   purely from `step_index` ("BASELINE" / "Step[k]") so both
+///   purely from `step_index` (`"BASELINE"` / `"Step[k]"`) so both
 ///   sides agree.
 /// - `start_ms`: `min(a.start_ms, b.start_ms)` so the merged
 ///   window covers the earliest start of either side.

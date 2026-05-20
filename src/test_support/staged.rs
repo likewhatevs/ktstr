@@ -50,7 +50,7 @@ pub(crate) const MAX_STAGED_SCHEDULER_NAME_LEN: usize = 128;
 /// Reject `name` if it is empty, contains a path separator
 /// (`/` or `\`), contains a `\0` byte, starts with `.`, or matches
 /// a [`RESERVED_SCHEDULER_NAMES`] entry. These rules guarantee that
-/// a future [`staged_scheduler_path`] call against a validated name
+/// a future `staged_scheduler_path` call against a validated name
 /// produces a path that (a) is unique within the staging tree,
 /// (b) cannot escape the staging directory via path-traversal
 /// (`../`), and (c) does not collide with the framework's own
@@ -142,7 +142,7 @@ pub(crate) fn staged_scheduler_dir(sched_name: &str) -> String {
 /// Guest path of the staged scheduler binary itself.
 /// `<dir>/scheduler` mirrors the boot-time `/scheduler` shape so
 /// the future dispatch code path can reuse the existing
-/// [`Path::new("/scheduler").exists()`] pattern against the staged
+/// `Path::new("/scheduler").exists()` pattern against the staged
 /// path with no shape divergence.
 #[allow(dead_code)] // see staged_scheduler_dir
 pub(crate) fn staged_scheduler_binary_path(sched_name: &str) -> String {

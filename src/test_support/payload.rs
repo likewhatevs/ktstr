@@ -3,7 +3,7 @@
 //! [`Payload`] is the primitive that `#[ktstr_test]` consumes for both
 //! the scheduler slot and the optional binary/workload slots. A
 //! payload's [`PayloadKind`] determines how it's launched: a
-//! [`Scheduler`](crate::test_support::Scheduler) reference invokes the
+//! [`Scheduler`] reference invokes the
 //! existing scheduler-spawn path; a bare binary name spawns the binary
 //! via the runtime [`PayloadRun`](crate::scenario::payload_run::PayloadRun)
 //! builder.
@@ -247,7 +247,7 @@ pub enum PayloadKind {
     /// # Scheduler config files
     ///
     /// Scheduler-kind payloads that set
-    /// [`Scheduler`](crate::test_support::Scheduler)'s `config_file`
+    /// [`Scheduler`]'s `config_file`
     /// field get automatic packaging: the config file is placed at
     /// `/include-files/{filename}` without a `-i` flag — the field
     /// is the source the harness reads.
@@ -913,7 +913,7 @@ impl Default for MetricBounds {
 
 /// Assertion check evaluated against an extracted
 /// [`PayloadMetrics`] (or the exit code for
-/// [`MetricCheck::ExitCodeEq`](MetricCheck::ExitCodeEq)).
+/// [`MetricCheck::ExitCodeEq`]).
 #[derive(Debug, Clone, Copy)]
 pub enum MetricCheck {
     /// Fail when the named metric is below `value`.
@@ -1132,7 +1132,7 @@ pub struct PayloadMetrics {
     /// used or when JSON parsing found no numeric leaves.
     pub metrics: Vec<Metric>,
     /// Process exit code (0 = success). Used by
-    /// [`MetricCheck::ExitCodeEq`](MetricCheck::ExitCodeEq) in the check
+    /// [`MetricCheck::ExitCodeEq`] in the check
     /// evaluation pre-pass.
     pub exit_code: i32,
 }
@@ -1184,7 +1184,7 @@ impl From<&MetricHint> for WireMetricHint {
 /// [`OutputFormat::LlmExtract`].
 ///
 /// Emitted by the guest alongside an empty
-/// [`PayloadMetrics`](PayloadMetrics) so the host can run the
+/// [`PayloadMetrics`] so the host can run the
 /// LLM-backed extraction post-VM-exit. LLM extraction never runs in
 /// the guest: the model (~2.4 GiB) does not fit in guest VM RAM, and
 /// the cache lives on the host. Each `RawPayloadOutput` carries a

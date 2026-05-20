@@ -113,11 +113,11 @@ impl ScaleLadder {
 /// This is render-only; the underlying numeric values used for
 /// sort order and delta math are untouched.
 ///
-/// Phase 4: dispatches on a closed [`ScaleLadder`] enum rather
-/// than a free-form unit string. The mapping from
-/// [`AggRule`] / [`super::DerivedMetricDef`] / cgroup-render call site
+/// Dispatches on a closed [`ScaleLadder`] enum rather than a
+/// free-form unit string. The mapping from
+/// `AggRule` / [`super::DerivedMetricDef`] / cgroup-render call site
 /// to [`ScaleLadder`] lives at the type level — see
-/// [`AggRule::ladder`] and [`super::DerivedMetricDef::ladder`] — so a
+/// `AggRule::ladder` and [`super::DerivedMetricDef::ladder`] — so a
 /// registry typo can no longer fall through an `other =>
 /// pass-through` arm and silently render the unscaled value.
 pub(super) fn auto_scale(value: f64, ladder: ScaleLadder) -> (f64, &'static str) {

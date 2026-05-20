@@ -9,9 +9,9 @@
 //!   [`append_extra_kconfig_suffix`]), pre/post warning passes
 //!   over user fragments, and the post-build critical-options
 //!   check ([`validate_kernel_config`], [`has_sched_ext`]).
-//! - [`build`] — top-level orchestrator ([`kernel_build_pipeline`])
+//! - `build` — top-level orchestrator ([`kernel_build_pipeline`])
 //!   and its two-phase reservation acquisition
-//!   ([`acquire_build_reservation`], [`acquire_source_tree_lock`]).
+//!   (`acquire_build_reservation`, `acquire_source_tree_lock`).
 
 mod build;
 mod kconfig;

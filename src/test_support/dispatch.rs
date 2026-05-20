@@ -1241,17 +1241,17 @@ fn list_tests_all(ignored_only: bool) {
 /// `declared` accepts every entry (no per-scheduler filter).
 ///
 /// Match semantics per spec variant (via [`crate::kernel_path::KernelId::parse`]):
-/// - [`KernelId::Version`]: raw-label string equality OR sanitized-label match
+/// - [`crate::kernel_path::KernelId::Version`]: raw-label string equality OR sanitized-label match
 ///   ([`sanitize_kernel_label`] of the spec string equals the entry's
 ///   sanitized label). Direct match catches the common case where
 ///   the dispatcher resolved `--kernel 6.14.2` and the scheduler
 ///   declared `kernels = ["6.14.2"]`.
-/// - [`KernelId::Range`]: range-membership check on the entry's raw
+/// - [`crate::kernel_path::KernelId::Range`]: range-membership check on the entry's raw
 ///   label via [`crate::kernel_path::decompose_version_for_compare`].
 ///   Lets schedulers declaring `kernels = ["6.14..6.16"]` match
 ///   any operator-supplied kernel whose version falls in
 ///   `[6.14, 6.16]` inclusive.
-/// - [`KernelId::Path`] / [`KernelId::CacheKey`] / [`KernelId::Git`]:
+/// - [`crate::kernel_path::KernelId::Path`] / [`crate::kernel_path::KernelId::CacheKey`] / [`crate::kernel_path::KernelId::Git`]:
 ///   sanitized-label equality — the producer-side encoder
 ///   (`cargo_ktstr/kernel/wire_format.rs`) emits a deterministic
 ///   label per variant (`path_…`, `git_owner_repo_ref`, version
@@ -1809,7 +1809,7 @@ fn export_kernel_for_variant(entry: &KernelEntry) {
 /// VM-bound test names additionally end with
 /// `/{sanitized_kernel_label}` — that suffix is peeled here and
 /// the matching kernel directory is re-exported via
-/// [`KTSTR_KERNEL_ENV`] before the dispatch continues. `host_only`
+/// [`crate::KTSTR_KERNEL_ENV`] before the dispatch continues. `host_only`
 /// tests are short-circuited BEFORE the suffix peel: they never
 /// boot a VM, so the kernel-suffix listing path emits one
 /// `ktstr/{name}: test` entry without a kernel suffix regardless

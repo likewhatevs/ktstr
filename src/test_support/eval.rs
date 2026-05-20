@@ -160,8 +160,8 @@ pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry) {
 /// every guest-side payload-pipeline emission allocates one index
 /// from the per-process counter (see
 /// [`crate::scenario::payload_run`]) and stamps it onto BOTH the
-/// [`MSG_TYPE_RAW_PAYLOAD_OUTPUT`] and the
-/// [`MSG_TYPE_PAYLOAD_METRICS`] message it emits. The host walks
+/// `MSG_TYPE_RAW_PAYLOAD_OUTPUT` and the
+/// `MSG_TYPE_PAYLOAD_METRICS` message it emits. The host walks
 /// `raw_outputs`, looks up each entry's index in a
 /// `HashMap<payload_index, vec position>` built once over
 /// `payload_metrics`, and writes the extracted metrics into the
@@ -6474,8 +6474,8 @@ mod tests {
         });
         let post_vm_gated = call_lines.iter().copied().find(|&i| {
             let window = lines[i.saturating_sub(20)..=i].join("\n");
-            window.contains("if let Some(post_vm) = entry.post_vm")
-                && window.contains("let Err(e) = post_vm(&result)")
+            window.contains("entry.post_vm.and_then(|cb| cb(&result).err())")
+                && window.contains("post_vm_err.is_some()")
         });
         let success_gated = success_gated.unwrap_or_else(|| {
             panic!(
@@ -6485,9 +6485,10 @@ mod tests {
         });
         let post_vm_gated = post_vm_gated.unwrap_or_else(|| {
             panic!(
-                "no production call site is gated by \
-                 `if let Some(post_vm) = entry.post_vm && let Err(e) = post_vm(&result)` \
-                 (post_vm Err branch); production sites at lines: {display_lines:?}",
+                "no production call site is gated by both \
+                 `entry.post_vm.and_then(|cb| cb(&result).err())` (the post_vm_err \
+                 binding source) AND `post_vm_err.is_some()` (the gate); \
+                 production sites at lines: {display_lines:?}",
             )
         });
         // Each gate guards a distinct call site. If the same site
@@ -6521,6 +6522,35 @@ mod tests {
     /// drop the per-site positional check. In that case, the
     /// helper itself takes both args by position; update this test
     /// to walk the helper's `format!()` instead.
+    /// Strip a single leading `{name}` named-argument span from a
+    /// format-string literal so `assert!(starts_with("\"{}{}"))`
+    /// passes when the format string begins with `"{name}{}{}..."`.
+    /// Walks past the opening `"` and one balanced `{ident}` pair
+    /// if present, then re-prefixes the `"` so the caller's
+    /// starts_with check still sees the quote.
+    fn strip_named_arg_prefix(s: &str) -> String {
+        let rest = match s.strip_prefix('"') {
+            Some(r) => r,
+            None => return s.to_string(),
+        };
+        let rest = match rest.strip_prefix('{') {
+            Some(r) => r,
+            None => return s.to_string(),
+        };
+        let end = match rest.find('}') {
+            Some(e) => e,
+            None => return s.to_string(),
+        };
+        let name = &rest[..end];
+        let is_named_arg = !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && name.chars().next().is_some_and(|c| !c.is_ascii_digit());
+        if !is_named_arg {
+            return s.to_string();
+        }
+        format!("\"{}", &rest[end + 1..])
+    }
+
     #[test]
     fn bug_summary_line_immediately_follows_fingerprint_line_in_all_failure_messages() {
         let src = include_str!("eval.rs");
@@ -6588,16 +6618,25 @@ mod tests {
                 .find(|&k| !lines[k].trim().is_empty())
                 .unwrap_or(0);
             let trimmed = lines[fmt_line_idx].trim();
+            // Allow an optional `{name}` named-arg prefix before `{}{}`.
+            // The named arg renders deterministic context (e.g.
+            // `{post_vm_prefix}`) which the failure path may want to
+            // surface BEFORE the BUG SUMMARY — what matters for the
+            // invariant is that fingerprint_line and bug_summary_line
+            // remain adjacent positional args 0+1, not that they are
+            // literally the first characters of the rendered output.
+            let stripped = strip_named_arg_prefix(trimmed);
             assert!(
-                trimmed.starts_with("\"{}{}"),
+                stripped.starts_with("\"{}{}"),
                 "failure-message format!() at eval.rs:{} passes `fingerprint_line,` \
                  then `bug_summary_line(),` as args 0+1, but the preceding format \
                  string literal at eval.rs:{} (`{}`) does NOT start with `\"{{}}{{}}` \
-                 (default positional indices for args 0+1 in order). A regression \
-                 that reordered the format-string indices (e.g. `\"{{2}}{{0}}{{1}}...\"`) \
-                 would render the BUG SUMMARY below the test-name / topology line \
-                 even though the args list still threads `bug_summary_line()` as \
-                 the second positional.",
+                 (default positional indices for args 0+1 in order, optionally \
+                 preceded by a single named-arg span like `{{post_vm_prefix}}`). \
+                 A regression that reordered the format-string indices (e.g. \
+                 `\"{{2}}{{0}}{{1}}...\"`) would render the BUG SUMMARY below \
+                 the test-name / topology line even though the args list still \
+                 threads `bug_summary_line()` as the second positional.",
                 i + 1,
                 fmt_line_idx + 1,
                 trimmed,

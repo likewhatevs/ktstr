@@ -108,7 +108,7 @@ pub(super) const FUTEX_WAIT_TIMEOUT: libc::timespec = libc::timespec {
 /// ([`WorkType::FutexFanOut`] and [`WorkType::FanOutCompute`]) AFTER
 /// each broadcast wake. Gives receivers a short uncontended window
 /// to run to their reservoir-push before the next wake cycle
-/// arrives. Threaded through [`spin_burst`] rather than a raw
+/// arrives. Threaded through `spin_burst` rather than a raw
 /// `std::hint::spin_loop` so the messenger also contributes to
 /// `work_units` — matching FanOutCompute's existing pattern so
 /// both variants' messengers report comparable throughput to
@@ -229,7 +229,7 @@ fn exit_child_error() -> ! {
 ///
 /// Failures are logged once via stderr and do not abort the
 /// worker — matches the [`apply_mempolicy_with_flags`] /
-/// [`set_thread_affinity`] / [`set_sched_policy`] error idiom in
+/// [`set_thread_affinity`] / `set_sched_policy` error idiom in
 /// `worker_main`. The expected failure mode is `EACCES` from
 /// `set_one_prio` → `can_nice` when an unprivileged worker tries
 /// to lower nice (negative niceval) without `CAP_SYS_NICE`.
@@ -851,8 +851,8 @@ pub(super) enum ForkedChildKind {
     /// pcomm thread-group leader hosting worker threads across one
     /// or more logical groups. `groups` records the per-group
     /// `(group_idx, num_workers)` layout in the order threads were
-    /// spawned: groups[0] contributes the first
-    /// `groups[0].1` worker reports, groups[1] the next
+    /// spawned: `groups[0]` contributes the first
+    /// `groups[0].1` worker reports, `groups[1]` the next
     /// `groups[1].1`, and so on. Total expected reports =
     /// `groups.iter().map(|(_, n)| n).sum()`. The layout drives
     /// sentinel distribution: when the JSON payload is missing or
@@ -882,8 +882,9 @@ pub(super) struct ForkedChild {
     /// `WorkerReport` (Worker) or a `serde_json` `Vec<WorkerReport>`
     /// (PcommContainer) per the [`ForkedChildKind`] tag.
     pub report_fd: std::os::unix::io::RawFd,
-    /// Parent-side write end of the start pipe. Closed by [`Self::start`]
-    /// after writing the start byte; set to `-1` thereafter.
+    /// Parent-side write end of the start pipe. Closed by
+    /// [`crate::workload::WorkloadHandle::start`] after writing the
+    /// start byte; set to `-1` thereafter.
     pub start_fd: std::os::unix::io::RawFd,
     /// Per-child decoding shape. See [`ForkedChildKind`].
     pub kind: ForkedChildKind,

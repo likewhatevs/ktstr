@@ -116,7 +116,7 @@ static RELEASES_CACHE: OnceLock<Vec<Release>> = OnceLock::new();
 /// Thin wrapper for callers that don't already thread a `&Client`
 /// — top-level CLI entries like [`crate::cli::expand_kernel_range`]
 /// (under the rayon-driven `cargo ktstr` resolve pipeline) and
-/// [`crate::cli::fetch_active_prefixes`] (the EOL-annotation pass).
+/// `crate::cli::fetch_active_prefixes` (the EOL-annotation pass).
 /// Caching, race semantics, and fault-injection routing are all
 /// documented on [`cached_releases_with`].
 pub(crate) fn cached_releases() -> Result<Vec<Release>> {

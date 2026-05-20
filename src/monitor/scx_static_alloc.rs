@@ -13,8 +13,8 @@
 //! # Why a separate walker
 //!
 //! The renderer's deferred-resolve arena cast path
-//! ([`crate::monitor::dump::render_map::resolve_arena_type_in_index`])
-//! is backed by an [`crate::monitor::dump::render_map::ArenaSlotIndex`]
+//! (`crate::monitor::dump::render_map::resolve_arena_type_in_index`)
+//! is backed by an `crate::monitor::dump::render_map::ArenaSlotIndex`
 //! built from the per-instance sdt_alloc walk. That walk produces one
 //! entry per allocator slot keyed on slot start. `scx_static` slots
 //! have no per-slot metadata the host can recover at freeze time —
@@ -216,7 +216,7 @@ impl ScxStaticOffsets {
 ///   of the region's first byte (`scx_static.memory`'s low 32 bits;
 ///   the high 32 bits are constant inside one arena window so the
 ///   low-32 keying matches the per-pass `ArenaSlotIndex` convention
-///   in [`crate::monitor::dump::render_map::ArenaSlotInfo`]).
+///   in `crate::monitor::dump::render_map::ArenaSlotInfo`).
 /// - `size` — the high-water mark `off`. Bytes in
 ///   `[start_low32, start_low32 + size)` are the live-allocated span;
 ///   bytes past `start_low32 + size` (within the same region's
@@ -310,7 +310,7 @@ impl std::fmt::Display for ScxStaticSnapshot {
 /// `scx_static` region.
 ///
 /// Mirrors the `BTreeMap` keying convention of the per-instance
-/// allocator's [`crate::monitor::dump::render_map::ArenaSlotIndex`]:
+/// allocator's `crate::monitor::dump::render_map::ArenaSlotIndex`:
 /// `start_low32` is the low 32 bits of the region's user-side base
 /// address (4 GiB-alignment of the arena window keeps the high 32
 /// bits constant), and `size` is the live-allocated span (`off`).
@@ -346,7 +346,7 @@ pub type ScxStaticRangeIndex = BTreeMap<u32, u64>;
 /// keep the FIRST entry seen and emit a `tracing::warn!` line so an
 /// operator can diagnose the collision. The first-write-wins policy
 /// matches the per-instance allocator index's collision policy in
-/// [`crate::monitor::dump::render_map::append_arena_slot_index_for_allocator`].
+/// `crate::monitor::dump::render_map::append_arena_slot_index_for_allocator`.
 pub fn build_scx_static_range_index(snapshot: &ScxStaticSnapshot) -> ScxStaticRangeIndex {
     let mut index = ScxStaticRangeIndex::new();
     for range in &snapshot.ranges {
@@ -382,12 +382,12 @@ pub fn build_scx_static_range_index(snapshot: &ScxStaticSnapshot) -> ScxStaticRa
 /// outside every range, or when the masked address would land at
 /// `start + size` exactly (the bound is `<`, not `<=`, mirroring
 /// the per-instance allocator index's slot-end-excluded convention
-/// in [`crate::monitor::dump::render_map::resolve_arena_type_in_index`]).
+/// in `crate::monitor::dump::render_map::resolve_arena_type_in_index`).
 ///
 /// The function is gate-only: it does NOT consult an arena snapshot
 /// to validate that `addr` lives in the arena window. Callers that
 /// need that guarantee compose this helper with
-/// [`crate::monitor::dump::render_map::is_arena_addr_in_snapshot`].
+/// `crate::monitor::dump::render_map::is_arena_addr_in_snapshot`.
 pub fn is_arena_addr_in_scx_static_index(index: &ScxStaticRangeIndex, addr: u64) -> bool {
     if index.is_empty() {
         return false;

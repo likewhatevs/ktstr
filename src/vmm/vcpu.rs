@@ -331,7 +331,7 @@ fn cpu_set_diag_context() -> (usize, std::borrow::Cow<'static, str>) {
 /// CPU from the mask.
 ///
 /// Used by the no-perf + `--cpu-cap` path at
-/// [`KtstrVmBuilder::build`]: every vCPU thread gets the reserved
+/// [`crate::vmm::KtstrVmBuilder::build`]: every vCPU thread gets the reserved
 /// LLC's CPUs as its mask so the vCPU runs inside the resource
 /// budget without fighting the kernel scheduler for a hard pin it
 /// doesn't actually need.

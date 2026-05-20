@@ -77,7 +77,7 @@ pub(crate) const TRANSIENT_HOST_ERRNOS: &[i32] = &[
 /// 1. **Diagnostic banner**: callers embed `{snapshot}` into a
 ///    `ResourceContention.reason` so the operator's SKIP banner names
 ///    `fds=...`, `vmrss=...`, `threads=...`, `near_limit=...`. The
-///    [`Display`] impl produces the same single-line format the
+///    [`std::fmt::Display`] impl produces the same single-line format the
 ///    SKIP banner has always carried, so banner readers and stats
 ///    tooling that grep for these tokens stay backward-compatible.
 /// 2. **Bypass gate**: [`map_transient_to_contention`] reads
@@ -420,7 +420,7 @@ pub(crate) fn map_transient_to_contention(
 /// Falls through to `errno=<raw>` for unmapped values so the
 /// operator can grep for the integer in `man errno` / kernel
 /// sources rather than seeing a useless `<other>`. Returns
-/// [`Cow`] so the common (mapped) case stays zero-allocation while
+/// [`std::borrow::Cow`] so the common (mapped) case stays zero-allocation while
 /// the fallthrough case can format the integer.
 pub(crate) fn errno_name(errno: i32) -> std::borrow::Cow<'static, str> {
     use std::borrow::Cow;

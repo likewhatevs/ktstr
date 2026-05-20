@@ -79,7 +79,7 @@
 //! future refactor that extracts the RMW into a helper invoked
 //! across multiple rendezvous would silently break this invariant —
 //! the `// rmw-invariant-anchor` markers at the OrU32 arms and the
-//! [`tests::or_u32_rmw_anchors_inside_dispatch_one_write`] doc-grep
+//! `tests::or_u32_rmw_anchors_inside_dispatch_one_write` doc-grep
 //! regression test together enforce the pattern at the source level.
 
 use crate::monitor::btf_offsets::{find_struct, nested_member_byte_offset};

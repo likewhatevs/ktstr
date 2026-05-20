@@ -18,7 +18,7 @@
 ///    run on whatever CPUs the OS schedules them onto. No
 ///    peer-coordination flocks are taken; perf-mode behavior is
 ///    governed separately by
-///    [`crate::test_support::runtime::no_perf_mode_active`] and is
+///    `crate::test_support::runtime::no_perf_mode_active` and is
 ///    NOT toggled by this flag.
 /// 3. Skips gauntlet variant expansion in nextest discovery —
 ///    each `#[ktstr_test]` runs once with its declared topology.
@@ -35,7 +35,7 @@
 ///    acknowledged both tradeoffs by setting the env var.
 ///
 /// Empty-string rejection mirrors
-/// [`crate::test_support::runtime::no_perf_mode_active`]: a stray
+/// `crate::test_support::runtime::no_perf_mode_active`: a stray
 /// `KTSTR_CARGO_TEST_MODE=` from CI shell quirks must not silently
 /// flip the harness into degraded coordination mode.
 pub(crate) fn cargo_test_mode_active() -> bool {

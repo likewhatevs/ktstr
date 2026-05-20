@@ -20,10 +20,10 @@
 //!    overrides this ordering when `--sort-by` is set.
 //!
 //! 3. [`CtprofDiff`] — the full comparison result. Aggregates the
-//!    per-thread diff rows ([`Self::rows`]), the derived-metric
-//!    rows ([`Self::derived_rows`]), the unmatched-keys lists
-//!    ([`Self::only_baseline`] / [`Self::only_candidate`]) AFTER
-//!    fudging removes pairs joined via thread-population overlap,
+//!    per-thread diff rows ([`CtprofDiff::rows`]), the derived-metric
+//!    rows ([`CtprofDiff::derived_rows`]), the unmatched-keys lists
+//!    ([`CtprofDiff::only_baseline`] / [`CtprofDiff::only_candidate`])
+//!    AFTER fudging removes pairs joined via thread-population overlap,
 //!    the [`FudgedPair`] entries documenting matched cgroup
 //!    renames, the host PSI snapshots, the per-cgroup smaps_rollup
 //!    maps, and the global sched_ext sysfs snapshot. Consumed by
@@ -33,8 +33,7 @@
 //!
 //! The types in this module are pure data carriers — no rendering
 //! logic, no aggregation logic. Aggregation lives next door in
-//! [`super::aggregate`]; rendering lives in mod.rs (Phase D-E
-//! moves it into render.rs / report.rs).
+//! [`mod@super::aggregate`]; rendering lives in mod.rs.
 
 use std::collections::BTreeMap;
 
@@ -225,7 +224,7 @@ pub struct CtprofDiff {
     /// Each entry is one matched (baseline, candidate) cgroup
     /// pair plus its overlap / Jaccard / residuals / cascade
     /// metadata. Pairs are emitted by the fudge stage of
-    /// [`super::compare`] and consumed by the renderer's "Fudged cgroup
+    /// [`super::compare()`] and consumed by the renderer's "Fudged cgroup
     /// matches" section. Empty under non-cgroup `super::GroupBy` modes
     /// (fudge applies only when keys are cgroup paths).
     pub fudged_pairs: Vec<FudgedPair>,

@@ -12,7 +12,7 @@
 //! walks numeric leaves into [`Metric`]s keyed by dotted paths.
 //!
 //! [`OutputFormat::ExitCode`] returns an empty metric set; exit-code
-//! pass/fail is handled by the [`MetricCheck::ExitCodeEq`] pre-pass
+//! pass/fail is handled by the `MetricCheck::ExitCodeEq` pre-pass
 //! elsewhere.
 //!
 //! [`OutputFormat::LlmExtract`] is HOST-ONLY. The guest-side

@@ -3283,8 +3283,8 @@ fn validate_const_eligible(
 ///   the called fn IS `const fn` but the returned type has a
 ///   non-trivial Drop (any field with a destructor: String, Vec,
 ///   Box, Arc, or any of those transitively via Option, Box, etc.).
-///   Hit by types like KtstrTestEntry (which carries Option<String>
-///   via Option<DiskConfig>); their DEFAULT must remain a
+///   Hit by types like KtstrTestEntry (which carries `Option<String>`
+///   via `Option<DiskConfig>`); their DEFAULT must remain a
 ///   struct-literal const, NOT a const-fn-returning-Self.
 ///
 /// Lowercase free-fn patterns (`build_helper()`) and unrecognized

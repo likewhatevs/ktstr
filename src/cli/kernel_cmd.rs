@@ -352,7 +352,7 @@ pub const EOL_EXPLANATION: &str = eol_explanation_literal!();
 /// then appends a plain-text rendering of the `--json` output
 /// schema so scripted consumers can discover the contract from the
 /// terminal without running `cargo doc`. The schema wording
-/// mirrors the Rust-doc schema on [`super::kernel_list`]; keeping both
+/// mirrors the Rust-doc schema on [fn@super::kernel_list]; keeping both
 /// surfaces terse makes a drift obvious on review. A plain-text
 /// (not JSON/markdown) rendering is used because clap applies no
 /// JSON/markdown formatting pass, so the schema reads as plain

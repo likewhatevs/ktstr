@@ -6,8 +6,8 @@
 //!
 //! - x86_64: serial via port I/O ([`dispatch_io_out`] / [`dispatch_io_in`]),
 //!   virtio-console via MMIO inside [`classify_exit`], i8042 reset for reboot.
-//! - aarch64: serial + virtio-console both via MMIO ([`dispatch_mmio_write`]
-//!   / [`dispatch_mmio_read`]).
+//! - aarch64: serial + virtio-console both via MMIO (`dispatch_mmio_write`
+//!   / `dispatch_mmio_read`).
 
 use crate::sync::MutexExt;
 use crate::vmm::PiMutex;
@@ -93,8 +93,8 @@ pub struct VcpuRegSnapshot {
     /// aarch64 TCR_EL1 register at freeze time. Drives the
     /// granule-agnostic page-table walker
     /// ([`crate::monitor::reader::GuestMem::translate_kva`]):
-    /// TG1 bits [31:30] select the high-half granule (4 KB / 16 KB
-    /// / 64 KB) and T1SZ bits [21:16] determine the high-half VA
+    /// TG1 bits `[31:30]` select the high-half granule (4 KB / 16 KB
+    /// / 64 KB) and T1SZ bits `[21:16]` determine the high-half VA
     /// width (`64 - T1SZ`). Stable after kernel MMU bring-up.
     /// `None` on x86_64 (the register does not exist) and on
     /// aarch64 if the KVM_GET_ONE_REG read fails mid-shutdown.
@@ -233,7 +233,7 @@ pub(crate) fn capture_vcpu_regs(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<VcpuReg
 
 /// Read TCR_EL1 directly from a vCPU. Used at GuestKernel
 /// construction time to feed the page-table walker its granule and
-/// VA-width settings (TG1 in bits [31:30], T1SZ in bits [21:16]).
+/// VA-width settings (TG1 in bits `[31:30]`, T1SZ in bits `[21:16]`).
 ///
 /// Returns `None` on x86_64 (the register does not exist) and on
 /// aarch64 if `KVM_GET_ONE_REG` fails. The caller treats `None` as
@@ -265,7 +265,7 @@ pub(crate) fn read_tcr_el1(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<u64> {
 /// `TTBR1_EL1` from `KVM_GET_ONE_REG`.
 ///
 /// Used by the BSP loop's lazy-CAS to populate the
-/// [`super::freeze_coord::run_bsp_loop`] cr3 cache once the guest
+/// `super::freeze_coord::run_bsp_loop` cr3 cache once the guest
 /// kernel has installed its post-randomization page tables. The
 /// monitor and BPF map writer threads consume the cached value to
 /// resolve `phys_base` via a page-table walk that breaks the

@@ -25,7 +25,7 @@ pub(crate) struct TopoOverride {
 impl From<&TopoOverride> for crate::vmm::topology::Topology {
     /// Construct a VM-builder [`Topology`](crate::vmm::topology::Topology)
     /// from an override's four topology axes. `memory_mib` is discarded —
-    /// VM memory lives on [`vmm::KtstrVm::builder().memory_deferred_min()`]
+    /// VM memory lives on `KtstrVm::builder().memory_deferred_min()`
     /// which the dispatcher sets separately from the topology.
     fn from(t: &TopoOverride) -> Self {
         crate::vmm::topology::Topology::new(t.numa_nodes, t.llcs, t.cores, t.threads)

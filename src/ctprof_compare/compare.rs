@@ -1,5 +1,5 @@
 //! End-to-end comparison pipeline: groups, fudges, derives,
-//! sorts, and lifts the [`super::CtprofSnapshot`] pair into a
+//! sorts, and lifts the [`crate::ctprof::CtprofSnapshot`] pair into a
 //! materialized [`super::CtprofDiff`].
 //!
 //! The pipeline:
@@ -21,7 +21,7 @@
 //!
 //! 2. [`emit_fudged_rows`] handles the N:1 fudge merge: every
 //!    candidate group matched to a single baseline group has its
-//!    metrics merged via [`super::merge_aggregated_into`]; one
+//!    metrics merged via `super::merge_aggregated_into`; one
 //!    row per metric is then emitted with the merged candidate
 //!    side. Display key carries the `[fudged: <leaf>]` marker
 //!    so the renderer can flag the merged row visually.
@@ -74,7 +74,7 @@ use super::{
 ///
 /// Missing values (a group has no row for the named metric, or
 /// the row's `delta` is `None` because the metric is categorical
-/// — even though [`parse_sort_by`] now rejects categorical
+/// — even though `parse_sort_by` now rejects categorical
 /// metrics at the CLI boundary, a programmatic caller can still
 /// construct a [`SortKey`] over a `Mode*` metric directly) are
 /// treated as `f64::NEG_INFINITY` for descending sort and

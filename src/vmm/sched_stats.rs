@@ -308,7 +308,7 @@ struct ClientShared {
     /// Optional run-wide cancel flag. When `Some(flag)` and the
     /// flag reads `true` (Acquire), `request_raw` returns
     /// [`SchedStatsError::Cancelled`] without ever blocking. The
-    /// drainer also watches a paired eventfd ([`Self::cancel_evt`])
+    /// drainer also watches a paired eventfd (`cancel_evt`)
     /// and notifies the response Condvar when it fires so a
     /// blocked `request_raw` wakes immediately on shutdown — no
     /// timeout needed. The host watchdog is the only "timeout"

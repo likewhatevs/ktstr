@@ -5,7 +5,7 @@
 //! freeze coordinator calls [`build`] after the vCPU rendezvous;
 //! when every prerequisite resolves, the returned
 //! [`ScxWalkerOwned`] holds the data the coordinator stack-borrows
-//! into the dump's [`ScxWalkerCapture`].
+//! into the dump's [`crate::monitor::dump::ScxWalkerCapture`].
 //!
 //! The walker passes themselves (per-CPU rq->scx scalars +
 //! runnable_list, per-CPU local DSQ, per-CPU bypass DSQ, per-NUMA-node

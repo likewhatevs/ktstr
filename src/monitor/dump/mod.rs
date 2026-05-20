@@ -8,7 +8,7 @@
 //!
 //! - `BPF_MAP_TYPE_ARRAY` (and the `.bss` / `.data` / `.rodata`
 //!   global-section maps libbpf creates as single-key arrays) — read
-//!   the whole value buffer and render it via [`btf_render::render_value_with_mem`]
+//!   the whole value buffer and render it via [`super::btf_render::render_value_with_mem`]
 //!   so embedded `__arena` pointers chase into the captured arena pages.
 //! - `BPF_MAP_TYPE_HASH` — iterate (key, value) pairs, capped at
 //!   [`MAX_HASH_ENTRIES`].
@@ -1810,7 +1810,7 @@ pub const MAX_ENRICHED_TASKS: usize = 4096;
 ///
 /// Future ktstr probe additions need to be added here AND the
 /// matching `<obj_name>.` prefix needs to be in the
-/// [`render_map`-internal] starts_with list (see [`dump_state`]).
+/// `render_map`-internal starts_with list (see `dump_state`).
 const KTSTR_INTERNAL_MAPS: &[&str] = &[
     "func_meta_map",
     "probe_data",
@@ -1964,7 +1964,7 @@ pub struct DumpContext<'a> {
 /// Built once at the freeze-coordinator side from
 /// [`crate::vmm::cast_analysis_load::CastAnalysisOutput`] and
 /// threaded through [`DumpContext::cross_btf_fwd_index`] into
-/// every per-map [`AccessorMemReader`]. The renderer's
+/// every per-map `AccessorMemReader`. The renderer's
 /// [`super::btf_render::MemReader::cross_btf_resolve_fwd`]
 /// override range-looks up the hit and returns a
 /// [`super::btf_render::CrossBtfRef`] whose `btf` borrow points at
@@ -1976,7 +1976,7 @@ pub struct DumpContext<'a> {
 /// "forward declaration" skip path.
 pub struct CrossBtfFwdIndex<'a> {
     /// Every parsed program BTF in the order
-    /// [`crate::vmm::cast_analysis_load::iter_embedded_bpf_objects`]
+    /// `crate::vmm::cast_analysis_load::iter_embedded_bpf_objects`
     /// yielded the embedded objects. Index 0 is the first object's
     /// BTF, etc. Empty when the scheduler binary had no parseable
     /// `.bpf.objs`. Borrowed from the

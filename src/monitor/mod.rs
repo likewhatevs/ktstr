@@ -466,7 +466,7 @@ pub struct CpuSnapshot {
     /// host (paranoid policy, missing CAP_PERFMON, hardware lacks
     /// the requested counter), when no TID is registered for this
     /// vCPU, or before the per-vCPU counter set was opened on the
-    /// first sample. See [`perf_counters`](crate::monitor::perf_counters).
+    /// first sample. See [`crate::monitor::perf_counters`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vcpu_perf: Option<perf_counters::VcpuPerfSample>,
     /// Sched domain tree for this CPU. Each entry is one domain level,
@@ -1158,18 +1158,18 @@ pub struct MonitorVerdict {
 }
 
 impl MonitorVerdict {
-    /// Convenience accessor mirroring [`AssertResult::is_pass`] so the
+    /// Convenience accessor mirroring [`crate::assert::AssertResult::is_pass`] so the
     /// is_pass / is_fail vocabulary applies uniformly across both
     /// verdict surfaces.
     pub fn is_pass(&self) -> bool {
         self.passed
     }
-    /// Convenience accessor mirroring [`AssertResult::is_fail`].
+    /// Convenience accessor mirroring [`crate::assert::AssertResult::is_fail`].
     pub fn is_fail(&self) -> bool {
         !self.passed
     }
     /// Iterate the violation-detail messages. Naming mirrors
-    /// [`AssertResult::failure_details`] so consumers can swap
+    /// [`crate::assert::AssertResult::failure_details`] so consumers can swap
     /// between the two verdict types with the same vocabulary;
     /// MonitorVerdict's details are `String` rather than
     /// `AssertDetail` because the monitor-thread surface doesn't

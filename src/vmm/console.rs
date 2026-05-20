@@ -82,7 +82,7 @@ pub struct Serial {
     /// `output_contains(needle)` call resumes from
     /// `scanned_len.saturating_sub(needle.len() - 1)` so a needle
     /// straddling the prior cursor still matches. Reset on
-    /// [`Self::drain_output`] / [`Self::clear`] (writer shrinks) and
+    /// [`Self::drain_output`] / `Self::clear` (writer shrinks) and
     /// invalidated when the caller passes a different needle.
     ///
     /// Without this cache the freeze-coordinator's post-thaw COM2
@@ -170,7 +170,7 @@ impl Serial {
     /// position backwards by the drained count, so the cached
     /// offset no longer corresponds to any position in the new
     /// buffer. Reset the cursor to `None`, matching the invariant
-    /// pinned by [`Self::drain_output`] and [`Self::clear`].
+    /// pinned by [`Self::drain_output`] and `Self::clear`.
     ///
     /// **Visibility.** The trim is logged at debug level (matching
     /// the pattern used elsewhere in this file for guest-driven
@@ -409,7 +409,7 @@ impl Serial {
     ///
     /// A different needle invalidates the cache (we must scan the
     /// full buffer for the new pattern). [`Self::drain_output`] /
-    /// [`Self::clear`] also reset the cursor — both shrink the
+    /// `Self::clear` also reset the cursor — both shrink the
     /// writer, after which the absolute byte offsets in the cursor
     /// no longer correspond to any positions in the new buffer.
     #[allow(dead_code)]

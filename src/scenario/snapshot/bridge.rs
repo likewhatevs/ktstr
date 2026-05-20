@@ -317,7 +317,7 @@ pub(super) struct SnapshotStore {
     /// on bridge meta-conditions (eviction, overwrite, missing
     /// capture, invariant violation) without grepping stderr.
     /// Capped at [`MAX_STORED_EVENTS`] via FIFO eviction in
-    /// [`push_event`]; dropped count is tracked in `events_dropped`
+    /// `push_event`; dropped count is tracked in `events_dropped`
     /// and surfaced as a synthetic
     /// [`SnapshotBridgeEvent::EventLogTruncated`] appended at the
     /// tail of the next `drain_events` result so no event loss is

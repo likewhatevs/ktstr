@@ -292,7 +292,7 @@ impl std::fmt::Display for Topology {
     }
 }
 
-/// Error returned by [`Topology::from_str`] when the input does not
+/// Error returned by [`Topology`]'s [`std::str::FromStr`] impl when the input does not
 /// match the `{numa}n{llcs}l{cores}c{threads}t` format or violates a
 /// Topology invariant (each component > 0, `llcs % numa_nodes == 0`,
 /// no `u32` overflow on total CPU count).

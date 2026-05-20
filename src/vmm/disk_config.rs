@@ -711,7 +711,7 @@ impl DiskConfig {
     /// `/mnt/<name>` when [`Self::name`] is set, `/mnt/disk0`
     /// otherwise. Used by the cmdline emission to populate the
     /// `KTSTR_DISK0_MOUNT` token consumed by the guest's
-    /// [`crate::vmm::rust_init::auto_mount_data_disks`].
+    /// `crate::vmm::rust_init::auto_mount_data_disks`.
     #[allow(dead_code)]
     pub(crate) fn auto_mount_path(&self) -> String {
         match self.name {

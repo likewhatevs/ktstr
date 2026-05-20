@@ -1127,7 +1127,7 @@ fn find_balanced_object_end(s: &str) -> Option<usize> {
 ///      exit can come from kworker context where `current` is the
 ///      worker thread, not the causal task.
 ///   4. `bpf_trigger_fires > 0 && exit_kind_snap == ERROR_BPF` —
-///      handler fired with a real causal task in args[0], but
+///      handler fired with a real causal task in `args[0]`, but
 ///      stitch matched no events. Suspected `func_idx_offset` bug
 ///      or ID mismatch between Phase A and Phase B.
 ///   5. fallback — kind value we don't recognize (future kernel

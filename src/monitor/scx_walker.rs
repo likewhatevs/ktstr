@@ -648,7 +648,7 @@ pub fn walk_scx_tasks_global(
 /// `runqueues + 0` — the two differ and `rq_kva == rq_kvas[0]` would
 /// let the phantom row through. Mirrors the canonical `cpu_off == 0
 /// && cpu_index > 0` guard
-/// [`super::bpf_map::read_percpu_array_value`] applies for percpu
+/// `super::bpf_map::read_percpu_array_value` applies for percpu
 /// reads, expressed against the same `__per_cpu_offset[]` array.
 ///
 /// Empty arrays mean "no CPUs walked successfully"; the caller's

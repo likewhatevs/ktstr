@@ -3447,7 +3447,7 @@ pub(crate) const DROP_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// the destructor path.
 ///
 /// Visible to `cfg(test)` builds so the unit-test module can pin
-/// the constant's value via [`reset_join_timeout_matches_drop_budget`]
+/// the constant's value via `reset_join_timeout_matches_drop_budget`
 /// without duplicating the literal. The production callsite in
 /// [`VirtioBlk::stop_worker_and_reclaim_state`] is itself
 /// `cfg(not(test))`, so the const stays unread in test builds —

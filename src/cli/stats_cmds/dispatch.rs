@@ -102,7 +102,7 @@ pub fn show_host() -> String {
 /// `root` cannot be enumerated).
 ///
 /// Threshold is `max(3, query.len() / 3)` — same shape as
-/// [`suggest_closest_test_name`] / [`suggest_closest_scenario_name`]
+/// [`suggest_closest_test_name`] / `suggest_closest_scenario_name`
 /// so the "did you mean?" UX stays uniform across the test-name,
 /// scenario-name, and run-key surfaces. The absolute-3 floor lets
 /// short keys (e.g. `6.14`) tolerate small typos while the

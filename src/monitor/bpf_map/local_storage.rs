@@ -23,7 +23,7 @@
 //!    `hlist_nulls_head`).
 //! 3. The chain links via `bpf_local_storage_elem.map_node`. That
 //!    field is at offset 0 of the elem (asserted at BTF resolve
-//!    time in [`super::super::btf_offsets::resolve_task_storage_offsets`]),
+//!    time in `super::super::btf_offsets::resolve_task_storage_offsets`),
 //!    so each chain `node_kva` IS the elem KVA.
 //! 4. For each elem: copy `value_size` bytes from
 //!    `elem + elem_sdata + sdata_data` (the cacheline-aligned
@@ -79,7 +79,7 @@ const TASK_STORAGE_ITER_MAX: usize = 1_000_000;
 ///
 /// Returns an empty vec when:
 /// - the map type is not one of the four local-storage variants;
-/// - [`TaskStorageOffsets`] is unavailable (kernel BTF lacks the
+/// - `TaskStorageOffsets` is unavailable (kernel BTF lacks the
 ///   local-storage subsystem types);
 /// - the map's `buckets` pointer is null (map allocation failed
 ///   between create and freeze);

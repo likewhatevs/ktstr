@@ -158,7 +158,7 @@ pub(super) const NO_MATCH_KEY_SAMPLE: usize = 3;
 /// failure text per sampled key.
 pub(super) const NO_MATCH_KEY_CHAR_CAP: usize = 80;
 
-/// Discriminator that [`render_entry_key`]'s fallback path prepends
+/// Discriminator that `render_entry_key`'s fallback path prepends
 /// to the raw `key_hex` bytes when an entry's BTF-rendered key was
 /// missing at capture time. [`SnapshotError::NoMatch`]'s `Display`
 /// impl uses the same prefix as the gate for its BTF-missing hint

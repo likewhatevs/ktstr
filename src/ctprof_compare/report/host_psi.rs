@@ -1,7 +1,7 @@
 //! Host-level PSI compare emitter for [`super::write_diff`].
 //!
 //! One sub-table per resource (cpu / memory / io / irq).
-//! Runs independent of [`GroupBy`] because host pressure is
+//! Runs independent of [`super::super::GroupBy`] because host pressure is
 //! the primary scheduler-health signal regardless of which
 //! axis the user grouped per-thread metrics by. Suppressed
 //! when both snapshots' host PSI is all-zero.

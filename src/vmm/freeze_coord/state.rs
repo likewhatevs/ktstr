@@ -135,7 +135,7 @@ pub(super) enum FreezeState {
 
 /// Format the bridge tag for periodic boundary `idx`. The wire shape
 /// — zero-padded 3-digit `"periodic_NNN"` — is documented on
-/// [`crate::test_support::entry::KtstrTestEntry::num_snapshots`] and
+/// [`crate::test_support::KtstrTestEntry::num_snapshots`] and
 /// pinned by the unit tests in this module. Pulled out of the inline
 /// `format!` site so the format string lives at one location and a
 /// future width change does not silently shift between fire path and

@@ -28,7 +28,7 @@ use super::types::*;
 /// sampling, so a 10-hour run with millions of wake events still
 /// caps at 100_000 entries (≈ 800 KiB per worker per buffer).
 ///
-/// Promoted to module scope so [`tests::max_wake_samples_pins_doc_value`]
+/// Promoted to module scope so `tests::max_wake_samples_pins_doc_value`
 /// can pin the value against the documentation cite in
 /// `doc/guide/src/architecture/workers.md`. Both pieces of text
 /// reference 100_000 — the pin trips when one drifts without the

@@ -641,7 +641,7 @@ fn write_all_asm(fd: libc::c_int, bytes: &[u8]) {
 /// without any guest-side diagnostic on COM2.
 ///
 /// This handler closes the gap by emitting a `PANIC:`-prefixed line
-/// — matching the prefix [`extract_panic_message`] anchors on — that
+/// — matching the prefix `extract_panic_message` anchors on — that
 /// names the signal and the faulting address before driving
 /// [`force_reboot`]. The host crash-classification pipeline then
 /// surfaces native faults through the same code path as Rust panics.
@@ -1533,7 +1533,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     force_reboot()
 }
 
-/// Maximum bytes per [`MsgType::Stdout`] / [`MsgType::Stderr`] TLV
+/// Maximum bytes per `MsgType::Stdout` / `MsgType::Stderr` TLV
 /// chunk emitted by the pipe forwarder threads. 4 KiB matches a
 /// page-size pipe read; well under the host-side per-frame cap
 /// [`crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD`] so a chunk fits
@@ -1545,7 +1545,7 @@ const STDIO_CHUNK_BYTES: usize = 4 * 1024;
 /// Pre-bulk-port-migration: dup2'd `/dev/ttyS1` over fd 1 and fd 2 so
 /// every `println!` / `eprintln!` reached the host as a stream of
 /// COM2 bytes.  The bulk-port migration replaces COM2 with one
-/// [`MsgType::Stdout`] / [`MsgType::Stderr`] TLV frame per chunk:
+/// `MsgType::Stdout` / `MsgType::Stderr` TLV frame per chunk:
 ///
 ///   1. Open a pair of `pipe(2)` pipes (one for stdout, one for
 ///      stderr).

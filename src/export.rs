@@ -211,10 +211,10 @@ struct ConfigExportAddition {
 ///
 /// Returns 0, 1, or 2 additions matching the in-VM path's
 /// dual-slot handling:
-///   - `entry.scheduler.config_file` (Option<host path>)
-///   - `entry.config_content` (Option<inline content>) paired
-///     with `entry.scheduler.config_file_def` (Option<(arg_template,
-///     guest_path)>)
+///   - `entry.scheduler.config_file` (`Option<host path>`)
+///   - `entry.config_content` (`Option<inline content>`) paired
+///     with `entry.scheduler.config_file_def`
+///     (`Option<(arg_template, guest_path)>`)
 ///
 /// Both slots are processed independently; in practice
 /// `crate::test_support::KtstrTestEntry::validate` gates
@@ -235,7 +235,7 @@ fn compute_config_export_additions(entry: &KtstrTestEntry) -> Result<Vec<ConfigE
     Ok(out)
 }
 
-/// Translate `entry.scheduler.config_file` (Option<host path>)
+/// Translate `entry.scheduler.config_file` (`Option<host path>`)
 /// into a [`ConfigExportAddition`]. Hardcoded `--config` arg
 /// matches the in-VM behavior at
 /// `crate::test_support::runtime::config_file_parts` and the
@@ -284,9 +284,10 @@ fn config_file_addition(entry: &KtstrTestEntry) -> Result<Option<ConfigExportAdd
     }))
 }
 
-/// Translate `entry.config_content` (Option<inline content>) +
-/// `entry.scheduler.config_file_def` (Option<(arg_template,
-/// guest_path)>) into a [`ConfigExportAddition`] by writing the
+/// Translate `entry.config_content` (`Option<inline content>`) +
+/// `entry.scheduler.config_file_def`
+/// (`Option<(arg_template, guest_path)>`) into a
+/// [`ConfigExportAddition`] by writing the
 /// content bytes to a temp file under `$TMPDIR` and substituting
 /// `{file}` in the arg template with the export-side runtime path
 /// `"$DIR/include/<basename>"`.

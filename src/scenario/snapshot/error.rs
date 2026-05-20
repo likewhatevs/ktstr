@@ -1,5 +1,5 @@
 //! [`SnapshotError`] (every fallible accessor's structured error) plus
-//! its [`Display`] impl and [`SnapshotResult`] alias. Lives in its own
+//! its [`std::fmt::Display`] impl and [`SnapshotResult`] alias. Lives in its own
 //! file so the variant catalogue is easy to scan when adding a new
 //! accessor — `cargo doc` surfaces the same single-page view as the
 //! source.

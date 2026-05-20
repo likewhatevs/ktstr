@@ -248,7 +248,7 @@ impl fmt::Display for Aggregated {
 
 /// Merge `val` into `existing` for the N:1 fudge aggregation
 /// (multiple candidate groups collapsed into one baseline-keyed
-/// row). Mirrors the canonical [`super::aggregate`] semantics on the
+/// row). Mirrors the canonical [fn@super::aggregate] semantics on the
 /// merged-set rather than re-aggregating the per-thread inputs:
 /// per-group summaries are all the merge has access to, so the
 /// merge composes summaries directly.
@@ -323,9 +323,9 @@ pub(super) fn merge_aggregated_into(existing: &mut Aggregated, val: &Aggregated)
 /// ranges (`a-b`), matching the kernel's cpuset display
 /// convention (`cat cpuset.cpus` emits `0-3,8`). Assumes the
 /// input is sorted ascending — capture layer
-/// ([`crate::ctprof::ThreadState::allowed_cpus`]) stores
+/// (`crate::ctprof::ThreadState::cpus_allowed`) stores
 /// sorted cpusets. Empty input returns an empty string. Used
-/// only by [`Aggregated::fmt`]'s Affinity arm; kept here so the
+/// only by `Aggregated`'s `Display::fmt` Affinity arm; kept here so the
 /// renderer and its helper travel together.
 pub(super) fn format_cpu_range(cpus: &[u32]) -> String {
     // Collapse contiguous runs to `a-b`, join with commas. Assumes

@@ -309,7 +309,7 @@ pub fn send_exit(code: i32) {
 ///
 /// Frames with [`MsgType::TestResult`]. Guest and host both use
 /// `postcard` so layout never diverges; the host's
-/// [`crate::test_support::output::parse_assert_result_from_drain`]
+/// `crate::test_support::output::parse_assert_result_from_drain`
 /// decodes with the same library.
 ///
 /// Required: `result` MUST round-trip through postcard without

@@ -2602,7 +2602,7 @@ pub(crate) fn reset() {
 ///   setup-level problem (missing weights, bad SHA, corrupt GGUF).
 ///   The `MetricCheck` evaluator translates the reason into a
 ///   `DetailKind::Other` entry on the `AssertResult` so the user
-///   sees "LlmExtract model load failed: <reason>" instead of an
+///   sees `"LlmExtract model load failed: <reason>"` instead of an
 ///   opaque "metric 'foo' not found" when the real failure was
 ///   that the model never loaded.
 ///

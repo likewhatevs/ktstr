@@ -132,7 +132,7 @@ const MAX_NODES_PER_LIST: u32 = 4096;
 ///    empty/unmapped (guest memory translate fails, capture returns
 ///    None gracefully). Pattern: synthetic
 ///    [`crate::monitor::reader::GuestMem`] buffer +
-///    [`crate::monitor::guest::GuestKernel::new_for_test`] with
+///    `crate::monitor::guest::GuestKernel::new_for_test` with
 ///    known offsets + assert. See `task_enrichment.rs` tests for
 ///    the layout pattern.
 /// 3. **Optional-field round-trip.** New fields landing on

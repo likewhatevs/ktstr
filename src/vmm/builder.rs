@@ -112,7 +112,7 @@ pub struct KtstrVmBuilder {
     /// [`super::disk_template::ensure_template`] (Btrfs branch). The
     /// path-supplied backing exists exclusively for the
     /// disk-template-build VM driver in
-    /// [`super::disk_template::build_template_via_vm`]: that driver
+    /// `super::disk_template::build_template_via_vm`: that driver
     /// materialises a sparse staging image, points the template VM
     /// at it via this field, and recovers the now-formatted file
     /// after VM exit for [`super::disk_template::store_atomic`] to
@@ -627,7 +627,7 @@ impl KtstrVmBuilder {
     ///   device drop.
     /// - `Filesystem::Btrfs`: a host-cached, guest-formatted
     ///   template image produced by a one-shot template VM
-    ///   ([`super::disk_template::build_template_via_vm`]) is
+    ///   (`super::disk_template::build_template_via_vm`) is
     ///   reflink-cloned via `FICLONE` for the per-test backing.
     ///   The host never execs mkfs against a real backing file;
     ///   the kernel inside the template VM is the on-disk-format
@@ -690,7 +690,7 @@ impl KtstrVmBuilder {
     /// Override [`super::KtstrVm::init_virtio_blk`]'s per-test
     /// backing-file allocation with `path`. Internal-only: this is
     /// the seam the disk-template-build VM driver
-    /// ([`super::disk_template::build_template_via_vm`]) uses to
+    /// (`super::disk_template::build_template_via_vm`) uses to
     /// point a template-build guest at a host-staged sparse image,
     /// run `mkfs.<fstype>` against it inside the guest, and recover
     /// the now-formatted bytes after VM exit.

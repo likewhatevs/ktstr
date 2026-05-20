@@ -7,7 +7,7 @@
 //!
 //! `CgroupDef` deliberately has NO `Default` impl — see the note at
 //! the foot of this file (and `tests::assert_not_impl_default!` in
-//! [`super::tests`]) for the rationale (`name = "cg_0"` would
+//! `super::tests`) for the rationale (`name = "cg_0"` would
 //! silently collide with the conventional first cgroup name).
 
 use std::borrow::Cow;
@@ -329,7 +329,7 @@ impl CgroupDef {
         self
     }
 
-    /// Ensure works[0] exists for single-WorkSpec builder methods.
+    /// Ensure `works[0]` exists for single-WorkSpec builder methods.
     fn ensure_default_work(&mut self) {
         if self.works.is_empty() {
             self.works.push(WorkSpec::default());

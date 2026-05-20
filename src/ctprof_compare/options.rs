@@ -1,6 +1,6 @@
 //! User-facing comparison configuration.
 //!
-//! Holds the operator-supplied knobs that drive [`super::compare`]
+//! Holds the operator-supplied knobs that drive [`super::compare()`]
 //! and the aggregation rule taxonomy that the metric registry
 //! ([`super::CTPROF_METRICS`]) is parameterized over.
 //!
@@ -8,7 +8,7 @@
 //!
 //! 1. [`GroupBy`] + [`GroupByOrDefault`] + [`CompareOptions`] +
 //!    [`SortKey`] — the inputs the operator types into the CLI
-//!    or constructs programmatically; [`super::compare`] receives
+//!    or constructs programmatically; [`super::compare()`] receives
 //!    a `&CompareOptions` and dispatches grouping / sort behavior
 //!    accordingly. [`GroupByOrDefault`] is the newtype wrapper
 //!    that gives [`CompareOptions::default`] a meaningful default
@@ -20,7 +20,7 @@
 //!    `fn(&ThreadState) -> SomeNewtype` from [`crate::metric_types`]
 //!    so the compiler enforces wrapper / reducer pairing at
 //!    registry-build time. The dispatch lives in
-//!    [`super::aggregate`].
+//!    [`super::aggregate()`].
 //!
 //! 3. [`AggRule::ladder`] — the per-variant
 //!    [`super::ScaleLadder`] mapping consumed by the cell formatters

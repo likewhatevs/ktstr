@@ -5,7 +5,7 @@
 //! BPF map, dispatching on `info.map_type`:
 //!
 //! - ARRAY / HASH / LRU_HASH / PERCPU_*HASH / PERCPU_ARRAY — read
-//!   bytes via the [`super::bpf_map::BpfMapAccessor`] trait and
+//!   bytes via the [`crate::monitor::bpf_map::BpfMapAccessor`] trait and
 //!   render through BTF when available.
 //! - ARENA — reuse the dump pre-pass snapshot or take a fresh
 //!   page-granular snapshot.
@@ -68,7 +68,7 @@ pub(super) const MAX_PERCPU_KEYS: u32 = 256;
 
 /// Maximum (key, value) pairs the dump path will pull from a HASH map.
 ///
-/// Mirrors [`super::super::btf_render::MAX_ARRAY_ELEMS`] (4096): a
+/// Mirrors `super::super::btf_render::MAX_ARRAY_ELEMS` (4096): a
 /// HASH map with millions of live entries would OOM the host
 /// renderer if iterated unbounded, so the dump caps at 4096 and
 /// surfaces an `error` describing the truncation. The unrendered
@@ -308,7 +308,7 @@ pub(super) fn build_arena_page_index(
 /// `entries` carries the live slot records the sdt_alloc walker
 /// produced (`SdtAllocEntry::user_addr` already masked to the low
 /// 32 bits — see
-/// [`super::super::sdt_alloc::TreeWalker::emit_leaf`]).
+/// `super::super::sdt_alloc::TreeWalker::emit_leaf`).
 /// `target_type_id` is the resolved per-slot payload type;
 /// `header_size` and `elem_size` come from the allocator's `pool`
 /// metadata via [`super::super::sdt_alloc::SdtAllocOffsets`] +
@@ -633,7 +633,7 @@ struct AccessorMemReader<'a> {
     /// Consumed only by the
     /// [`MemReader::resolve_arena_type_meta_fallback`] override
     /// (see [`AccessorMemReader::resolve_arena_type_meta_fallback`]),
-    /// which [`try_sdt_alloc_bridge`] calls only when the chase
+    /// which `try_sdt_alloc_bridge` calls only when the chase
     /// target is `Type::Fwd(_)` AND the per-slot
     /// [`MemReader::resolve_arena_type`] returned `None`. The override
     /// returns the first metadata entry with a resolved
@@ -1424,7 +1424,7 @@ fn resolve_struct_ops_payload_type_id(btf: &Btf, wrapper_type_id: u32) -> Option
 /// schedulers with many tasks point most entries past the snapshot's
 /// `MAX_ARENA_PAGES` sequential prefix, so a `read_arena`-only path
 /// would silently miss them. Mirrors the read path
-/// [`super::super::sdt_alloc::TreeWalker::translate_arena_ptr`] uses
+/// `super::super::sdt_alloc::TreeWalker::translate_arena_ptr` uses
 /// for the sdt_alloc allocator walk.
 ///
 /// The same `mem_reader` is threaded into `render_value_with_mem` for

@@ -1,5 +1,5 @@
 //! Group construction, per-group aggregation, and the cgroup-path
-//! flatten helpers consumed by [`super::compare`].
+//! flatten helpers consumed by [`super::compare()`].
 //!
 //! Three layers:
 //!
@@ -34,7 +34,7 @@
 //!    cgroup-path tightening.
 //!
 //! [`flatten_cgroup_path`] / [`compile_flatten_patterns`] are
-//! the helpers the caller side ([`super::compare`] +
+//! the helpers the caller side ([`super::compare()`] +
 //! [`super::flatten_cgroup_stats`]) uses to apply user-supplied
 //! glob patterns against cgroup paths before bucket assignment.
 
@@ -456,22 +456,22 @@ pub fn build_groups(
 ///
 /// The trait-level shapes split empty handling differently
 /// from the dispatch-level shape:
-/// - [`Summable::sum_across`] returns the additive identity
+/// - `Summable::sum_across` returns the additive identity
 ///   (zero) on an empty input — the trait surface itself
 ///   collapses the empty case. The `Sum*` arms therefore feed
 ///   straight into [`Aggregated::Sum`] without re-checking.
-/// - [`Maxable::max_across`] returns `Option<Self>` (`None`
+/// - `Maxable::max_across` returns `Option<Self>` (`None`
 ///   for empty) so callers can distinguish "no contributors"
 ///   from "all contributors had zero." The dispatch in this
 ///   function collapses `None` to `Aggregated::Max(0)` at the
 ///   call boundary so the historical empty-bucket contract on
 ///   this code path (zero rendered for empty groups) holds
 ///   regardless of the trait's richer shape.
-/// - [`Rangeable::range_across`] returns
+/// - `Rangeable::range_across` returns
 ///   `Option<Range<Self>>`; the dispatch collapses `None` to
 ///   `Aggregated::OrdinalRange { min: 0, max: 0 }` at the call
 ///   boundary.
-/// - [`Modeable::mode_across`] returns
+/// - `Modeable::mode_across` returns
 ///   `Option<(Self, count, total)>`; the dispatch collapses
 ///   `None` to `Aggregated::Mode { value: "", count: 0, total }`
 ///   where `total` is the bucket size (which is non-zero only

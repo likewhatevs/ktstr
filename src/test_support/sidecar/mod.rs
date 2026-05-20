@@ -1859,18 +1859,18 @@ fn resolve_kernel_source_dir_with_cache(
 ///
 /// The hash is over test-identity fields (topology, scheduler,
 /// payload, work_type, sysctls, kargs) — NOT over
-/// [`HostContext`], NOT over `scheduler_commit`, NOT over
+/// [`crate::host_context::HostContext`], NOT over `scheduler_commit`, NOT over
 /// `project_commit`, NOT over `kernel_commit`, and NOT over
-/// `run_source`. The [`HostContext`] exclusion is pinned by
-/// [`sidecar_variant_hash_excludes_host_context`]; the
+/// `run_source`. The [`crate::host_context::HostContext`] exclusion is pinned by
+/// `sidecar_variant_hash_excludes_host_context`; the
 /// `scheduler_commit` exclusion by
-/// [`sidecar_variant_hash_excludes_scheduler_commit`]; the
+/// `sidecar_variant_hash_excludes_scheduler_commit`; the
 /// `project_commit` exclusion by
-/// [`sidecar_variant_hash_excludes_project_commit`]; the
+/// `sidecar_variant_hash_excludes_project_commit`; the
 /// `kernel_commit` exclusion by
-/// [`sidecar_variant_hash_excludes_kernel_commit`]; the
+/// `sidecar_variant_hash_excludes_kernel_commit`; the
 /// `run_source` exclusion by
-/// [`sidecar_variant_hash_excludes_run_source`]. All five are
+/// `sidecar_variant_hash_excludes_run_source`. All five are
 /// deliberate for the same cross-host grouping reason — a
 /// gauntlet rebuilt against a different userspace scheduler
 /// commit, a bumped ktstr checkout, a kernel source tree at a

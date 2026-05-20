@@ -630,9 +630,9 @@ fn find_nla(buf: &[u8], kind: u16) -> Option<&[u8]> {
 /// |  56    | swapin_delay_total           |  8   |
 /// |  64    | cpu_run_real_total           |  8   |
 /// |  72    | cpu_run_virtual_total        |  8   |
-/// |  80    | ac_comm[32]                  | 32   |
+/// |  80    | `ac_comm` (32 bytes)         | 32   |
 /// | 112    | ac_sched (u8, aligned 8)     |  1   |
-/// | 113    | ac_pad[3]                    |  3   |
+/// | 113    | `ac_pad` (3 bytes)           |  3   |
 /// | 120    | ac_uid (u32, aligned 8)      |  4   |
 /// | 124    | ac_gid (u32)                 |  4   |
 /// | 128    | ac_pid (u32)                 |  4   |

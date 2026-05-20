@@ -1572,7 +1572,7 @@ impl ScxRqOffsets {
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub struct TaskStructCoreOffsets {
-    /// Offset of `comm` (char[16]).
+    /// Offset of `comm` (`char[16]`).
     pub comm: usize,
     /// Offset of `pid` (pid_t == int).
     pub pid: usize,

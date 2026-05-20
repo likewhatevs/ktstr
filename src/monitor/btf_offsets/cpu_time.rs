@@ -103,7 +103,7 @@ pub const SOFTIRQ_NAMES: [&str; NR_SOFTIRQS] = [
 /// (`kernel_cpustat`, `kstat`, `tick_cpu_sched`). Per-CPU symbols
 /// carry section-relative offsets in vmlinux's symtab; the per-CPU
 /// KVA for CPU `n` is `<symbol> + __per_cpu_offset[n]` —
-/// [`super::super::symbols::KernelSymbols::cpu_time_symbols`] resolves the
+/// `super::super::symbols::KernelSymbols::cpu_time_symbols` resolves the
 /// symbols and the dump path adds `__per_cpu_offset[cpu]` per CPU.
 ///
 /// Field-presence semantics: a kernel without sched_ext omits no

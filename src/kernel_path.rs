@@ -328,7 +328,7 @@ fn _is_version_string(s: &str) -> bool {
 ///
 /// Used by [`KernelId::validate`] to detect inverted ranges
 /// (`6.16..6.12`, `6.10..6.10-rc3`, `7.0..6.99`), and by
-/// [`crate::cli`]'s range-expansion helper to filter and sort
+/// the `cli` module's range-expansion helper to filter and sort
 /// kernel.org release rows that fall inside a `start..end` interval.
 pub(crate) fn decompose_version_for_compare(s: &str) -> Option<(u64, u64, u64, u64)> {
     let (version_part, rc_part) = match s.split_once("-rc") {
@@ -357,7 +357,7 @@ pub(crate) fn decompose_version_for_compare(s: &str) -> Option<(u64, u64, u64, u
 }
 
 /// Expand a leading `~` or `~/...` in `s` against `$HOME` and
-/// return the resulting [`PathBuf`]. Any other shape (no leading
+/// return the resulting [`std::path::PathBuf`]. Any other shape (no leading
 /// `~`, `~user/...` for a different user, `$HOME` unset or empty)
 /// passes through verbatim — the caller's downstream `is_dir()`
 /// surfaces a regular "no such directory" error instead of being

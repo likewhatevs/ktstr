@@ -27,7 +27,7 @@
 //! [`TimelineEvent`] mirrors the on-the-wire `struct timeline_event`
 //! defined in `src/bpf/intf.h`. Field order, sizes, and the type
 //! constants must stay in lockstep — a unit test
-//! ([`tests::timeline_event_layout_pinned`]) verifies the 40-byte
+//! (`tests::timeline_event_layout_pinned`) verifies the 40-byte
 //! footprint and field offsets against the BPF-side layout.
 
 use serde::{Deserialize, Serialize};

@@ -52,7 +52,7 @@ pub struct PayloadTypeChoice {
 /// The function is intentionally conservative: a wrong type id renders
 /// nonsense field names; falling back to hex always shows the operator
 /// raw bytes they can decode by hand. The returned reason string is
-/// surfaced to the operator via [`SdtAllocatorSnapshot::payload_type_reason`]
+/// surfaced to the operator via `SdtAllocatorSnapshot::payload_type_reason`
 /// so the fallback paths are distinguishable without re-running the
 /// heuristic.
 pub fn discover_payload_btf_id(

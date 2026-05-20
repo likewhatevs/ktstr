@@ -1,8 +1,8 @@
 //! Per-frame dispatch for the virtio-console port-1 bulk TLV stream.
 //!
 //! The freeze coordinator's TOKEN_TX epoll branch drives this module:
-//! after `bulk_assembler.feed(...)` returns a [`BulkMessages`] vec, the
-//! coordinator iterates each [`BulkMessage`] through
+//! after `bulk_assembler.feed(...)` returns a `BulkMessages` vec, the
+//! coordinator iterates each `BulkMessage` through
 //! [`dispatch_bulk_message`] and either pushes a verdict-bearing
 //! [`crate::vmm::wire::ShmEntry`] into the run-wide bucket OR triggers
 //! one of three coordinator-internal side effects (kill flag + eventfd
@@ -182,7 +182,7 @@ pub(super) struct BulkDispatchSinks<'a> {
     pub current_step: &'a std::sync::Arc<std::sync::atomic::AtomicU16>,
 }
 
-/// Classify and dispatch a single [`BulkMessage`] from the port-1
+/// Classify and dispatch a single `BulkMessage` from the port-1
 /// TLV stream. Returns the verdict-bearing [`crate::vmm::wire::ShmEntry`]
 /// to push into the run-wide bucket, or `None` for coordinator-
 /// internal frames whose only effect was on `sinks`.

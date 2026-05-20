@@ -5,28 +5,26 @@
 //! [`ExclusiveLockGuard`] (RAII wrappers around per-key flock
 //! acquisitions), and the [`CacheDir::store`] /
 //! [`CacheDir::lookup`] / [`CacheDir::list`] /
-//! [`CacheDir::clean`] lifecycle methods. The internal
-//! `warn_if_unstripped_vmlinux` and `should_warn_unstripped`
+//! [`CacheDir::clean_all`] / [`CacheDir::clean_keep`] lifecycle methods.
+//! The internal `warn_if_unstripped_vmlinux` and `should_warn_unstripped`
 //! helpers gate a per-lookup warning on entries whose vmlinux
 //! sidecar took the strip-failure fallback in
-//! [`super::vmlinux_strip::strip_vmlinux_debug`].
+//! `super::vmlinux_strip::strip_vmlinux_debug`.
 //!
 //! Sibling modules:
-//! - [`super::metadata`] — pure types ([`KernelSource`],
-//!   [`KernelMetadata`], [`CacheArtifacts`], [`KconfigStatus`],
-//!   [`CacheEntry`], [`ListedEntry`]) plus the
-//!   [`super::metadata::classify_corrupt_reason`] dispatcher and
-//!   [`super::metadata::format_image_missing_reason`] helper that
+//! - `super::metadata` — pure types ([`super::KernelSource`],
+//!   [`super::KernelMetadata`], [`super::CacheArtifacts`], [`super::KconfigStatus`],
+//!   [`super::CacheEntry`], [`super::ListedEntry`]) plus the
+//!   `super::metadata::classify_corrupt_reason` dispatcher and
+//!   `super::metadata::format_image_missing_reason` helper that
 //!   `list` uses to emit corrupt-entry reason strings.
-//! - [`super::housekeeping`] — atomic-rename install primitives
-//!   ([`super::housekeeping::atomic_swap_dirs`],
-//!   [`super::housekeeping::TmpDirGuard`]), cache-key /
+//! - `super::housekeeping` — atomic-rename install primitives
+//!   (`atomic_swap_dirs`, `TmpDirGuard`), cache-key /
 //!   filename validators, the JSON metadata reader
-//!   ([`super::housekeeping::read_metadata`]), and the cross-PID
-//!   orphan-tempdir sweep
-//!   ([`super::housekeeping::clean_orphaned_tmp_dirs`]).
-//! - [`super::vmlinux_strip`] — the ELF strip pipeline
-//!   ([`super::vmlinux_strip::strip_vmlinux_debug`]) `store()`
+//!   (`read_metadata`), and the cross-PID
+//!   orphan-tempdir sweep (`clean_orphaned_tmp_dirs`).
+//! - `super::vmlinux_strip` — the ELF strip pipeline
+//!   (`strip_vmlinux_debug`) `store()`
 //!   invokes when an artifact carries a vmlinux sidecar.
 //! - [`super::resolve`] — env-cascade root resolution that
 //!   `CacheDir::new` and `CacheDir::default_root` flow through.

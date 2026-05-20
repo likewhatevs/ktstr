@@ -11,7 +11,7 @@
 //! BPF program's instruction stream and recording the source / target
 //! struct for every `u64` field that is observed to carry a typed
 //! pointer. The renderer
-//! ([`super::btf_render::render_cast_pointer`]) consumes the resulting
+//! (`super::btf_render::render_cast_pointer`) consumes the resulting
 //! [`CastMap`] via [`super::btf_render::MemReader::cast_lookup`] and
 //! chases the recovered pointer through the address-space-appropriate
 //! reader (arena vs slab/vmalloc) — the same chase shape the
@@ -138,7 +138,7 @@
 //! counter could be mis-rendered as an arena pointer. Every Arena
 //! cast emit therefore requires direct evidence the slot held an
 //! arena VA at runtime: either (a) an observed
-//! [`BPF_ADDR_SPACE_CAST`] (`ALU64 | MOV | X` with `off=1, imm=1`)
+//! `BPF_ADDR_SPACE_CAST` (`ALU64 | MOV | X` with `off=1, imm=1`)
 //! on a value loaded from the slot, or (b) an observed STX of an
 //! [`RegState::ArenaU64FromAlloc`] value into the slot. Slots with
 //! shape-inference evidence ALONE are dropped — the operator can
@@ -180,7 +180,7 @@ pub struct BpfInsn {
     /// Packed register byte: `dst_reg | (src_reg << 4)` — 4 bits each
     /// per the wire format. Use [`Self::dst_reg`] / [`Self::src_reg`]
     /// to read. Private so callers cannot bypass the 4-bit packing
-    /// invariant; [`Self::new`] and [`Self::from_le_bytes`] are the
+    /// invariant; `Self::new` and [`Self::from_le_bytes`] are the
     /// only construction paths.
     regs: u8,
     /// Signed 16-bit offset (PC-relative for jumps, byte offset for
@@ -245,7 +245,7 @@ impl BpfInsn {
     /// the kfunc BTF id has been resolved. `pub(crate)` rather than
     /// `pub` because the wire-format invariants for the packed byte
     /// are framework-internal — external callers should construct a
-    /// fresh [`BpfInsn::new`] instead of mutating.
+    /// fresh `BpfInsn::new` instead of mutating.
     #[inline]
     pub(crate) fn set_src_reg(&mut self, src: u8) {
         self.regs = (self.regs & 0x0f) | ((src & 0x0f) << 4);
@@ -322,7 +322,7 @@ pub(crate) struct FuncEntry {
 ///
 /// `insn_offset` is the call PC (not PC+1); the analyzer applies the
 /// seed inside its [`BPF_OP_CALL`] arm after the standard register
-/// clobber, mirroring how [`Self::handle_kfunc_call`] types R0 from
+/// clobber, mirroring how `Self::handle_kfunc_call` types R0 from
 /// the kfunc's FuncProto return type.
 ///
 /// `alloc_size` is the value of the `size` argument (R1) at the call
@@ -464,7 +464,7 @@ pub struct CastHit {
     /// (the per-slot index collapsed to `None`).
     ///
     /// At chase time the renderer's
-    /// [`super::btf_render::chase_arena_pointer`] consults this
+    /// `super::btf_render::chase_arena_pointer` consults this
     /// field after the [`super::btf_render::MemReader::resolve_arena_type`]
     /// bridge returns no entry: `Some(n)` triggers a size-based
     /// BTF match via [`super::sdt_alloc::discover_payload_btf_id`],
@@ -945,7 +945,7 @@ struct Analyzer<'a> {
     /// - a caller-supplied [`SubprogReturn`] match in the
     ///   `BPF_OP_CALL` arm, OR
     /// - the `ARENA_ALLOC_KFUNC_NAMES` allowlist match in
-    ///   [`Self::handle_kfunc_call`].
+    ///   `Self::handle_kfunc_call`.
     ///
     /// Used by [`Self::finalize`] to gate the F4 mitigation warn
     /// (`allocator helpers may need __always_inline`): the warn
@@ -1114,7 +1114,7 @@ impl<'a> Analyzer<'a> {
     /// `caller_arg_types`, `arena_stx_findings`, and
     /// `arena_alloc_size_index` snapshots, used by [`analyze_casts`]'s
     /// fixpoint loop. The remaining analyzer state is reset to its
-    /// [`Self::new`] default. Only these three maps carry across
+    /// `Self::new` default. Only these three maps carry across
     /// passes:
     ///
     /// - `caller_arg_types` propagates the caller's tracked register
@@ -1130,7 +1130,7 @@ impl<'a> Analyzer<'a> {
     ///   so the linear walk cannot observe the producer's evidence
     ///   in time. Entries are inserted from real allocator-return
     ///   evidence (BPF_PSEUDO_CALL with [`SubprogReturn`] seed,
-    ///   [`Self::handle_kfunc_call`] arena-allocator allowlist hit,
+    ///   `Self::handle_kfunc_call` arena-allocator allowlist hit,
     ///   or [`Self::bridge_map_value_spill`] reading an
     ///   `ArenaU64FromAlloc` stack slot) so carrying them across
     ///   passes is safe — a slot only ends up in this map after the
@@ -2304,7 +2304,7 @@ impl<'a> Analyzer<'a> {
     ///    offset as a plain `u64`, record `(P, off)` in
     ///    [`Self::arena_stx_findings`]. The slot now holds an
     ///    arena pointer, even though BTF declared it `u64` — the
-    ///    renderer's [`MemReader::resolve_arena_type`] bridge
+    ///    renderer's `MemReader::resolve_arena_type` bridge
     ///    resolves the payload type at chase time.
     fn handle_stx(&mut self, dst: usize, src: usize, size: u8, off: i16) {
         if dst >= self.regs.len() || src >= self.regs.len() {
@@ -3039,7 +3039,7 @@ impl<'a> Analyzer<'a> {
         // Arena STX-flow path: directly observed STX of an
         // [`RegState::ArenaU64FromAlloc`] value into a u64 slot.
         // Emit with `target_type_id == 0` — the renderer's
-        // [`MemReader::resolve_arena_type`] bridge resolves the
+        // `MemReader::resolve_arena_type` bridge resolves the
         // payload BTF id at chase time from the live arena snapshot
         // (cross-BTF Fwd resolution). Conflicting slots (also seen
         // as kptr STX) drop here AND on the kptr side.
@@ -3741,7 +3741,7 @@ fn struct_member_at(btf: &Btf, parent_type_id: u32, byte_offset: u32) -> Option<
 /// `Ptr -> Void`.
 ///
 /// `Ptr` ids whose pointee is `0` (the BTF void marker — same
-/// convention as [`FuncProto::return_type_id`] uses) match. The
+/// convention as `FuncProto::return_type_id` uses) match. The
 /// peel walks `Const` / `Volatile` / `Restrict` / `Typedef` /
 /// `TypeTag` / `DeclTag` modifiers only — bridging a `Ptr` we
 /// would never want, since the result of dereferencing an
@@ -3778,7 +3778,7 @@ fn return_peels_to_ptr_void(btf: &Btf, ret_id: u32) -> bool {
         return false;
     };
     // BTF encodes `void *` with the Ptr's pointee type id == 0.
-    // Same convention [`FuncProto::return_type_id`] uses for void
+    // Same convention `FuncProto::return_type_id` uses for void
     // returns at the FuncProto level. Anything else is a typed
     // pointer that arm 1 (`resolve_to_struct_id`) already handled
     // — falling through here would let arm 2 mistakenly tag a

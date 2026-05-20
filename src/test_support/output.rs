@@ -16,7 +16,7 @@
 //!   verbatim (defined in [`crate::verifier`] since that is the
 //!   primary host-side consumer that also parses the BPF verifier
 //!   log carried inside the block).
-//!   [`parse_sched_output`](crate::verifier::parse_sched_output)
+//!   [`crate::verifier::parse_sched_output`]
 //!   extracts the block; [`sched_log_fingerprint`] returns the last
 //!   non-empty line as a failure fingerprint so duplicate failures
 //!   cluster visually in nextest output.

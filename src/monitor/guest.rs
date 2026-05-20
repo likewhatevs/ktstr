@@ -72,7 +72,7 @@ pub struct GuestKernel {
     ///
     /// `None` on x86_64 (TCR_EL1 does not exist) and on aarch64
     /// when `tcr_el1` decodes to an invalid configuration (the
-    /// failure modes [`Aarch64WalkParams::from_tcr_el1`] reports).
+    /// failure modes `Aarch64WalkParams::from_tcr_el1` reports).
     /// Translates fall back to the per-call decode path
     /// ([`GuestMem::translate_kva`]) when cached params are absent.
     /// See [`Self::tcr_el1`] for the immutability contract.

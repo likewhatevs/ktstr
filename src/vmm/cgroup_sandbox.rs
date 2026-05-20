@@ -1,7 +1,7 @@
 //! Build-time cgroup v2 sandbox for kernel compilation under an
 //! [`LlcPlan`](super::host_topology::LlcPlan) reservation.
 //!
-//! Wraps [`CgroupManager`](crate::cgroup::CgroupManager) to enforce CPU
+//! Wraps [`crate::cgroup::CgroupManager`] to enforce CPU
 //! + NUMA memory binding for `make` and its gcc/ld children when the
 //!   user passes `--cpu-cap N`. The sandbox contract is:
 //!

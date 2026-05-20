@@ -844,7 +844,7 @@ pub(super) enum ParseDottedNs {
 /// becomes `.999000` (=999_000 ns). Truncates fractional widths
 /// >6 to the first 6 digits.
 ///
-/// Returns [`Err(ParseDottedNs::Negative)`] when EITHER:
+/// Returns `Err(ParseDottedNs::Negative)` when EITHER:
 /// - the trimmed integer part starts with `-` (kernel emitted
 ///   `-5.000000` for a magnitude ≥ 1ms negative SPLIT_NS via
 ///   `%Ld`), OR
@@ -861,7 +861,7 @@ pub(super) enum ParseDottedNs {
 ///
 /// The caller records the bump in the per-snapshot
 /// [`CtprofParseSummary::negative_dotted_values`] before
-/// folding to zero. Returns [`Err(ParseDottedNs::Malformed)`]
+/// folding to zero. Returns `Err(ParseDottedNs::Malformed)`
 /// for any other parse failure (non-numeric, empty, overflow);
 /// the caller folds to zero silently per the best-effort capture
 /// contract.
@@ -1188,7 +1188,7 @@ pub(super) fn parse_max_or_u64(raw: &str) -> Option<u64> {
 /// The semantic asymmetry vs. [`parse_max_or_u64`] is critical:
 /// for limits, "max" is the absence of a cap (collapse to
 /// `None`); for floors, "max" is a fully-protected floor (it
-/// must NOT collapse to "no floor"). [`merge_min_option`] then
+/// must NOT collapse to "no floor"). `merge_min_option` then
 /// correctly picks `min(u64::MAX, 5G) = 5G` instead of None
 /// when one contributor has full protection and another has a
 /// concrete protection.

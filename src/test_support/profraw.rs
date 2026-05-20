@@ -9,7 +9,7 @@
 //! LLVM runtime symbols via ELF `.symtab` (they have hidden visibility,
 //! so `dlsym` can't see them), serializes profraw into a heap buffer
 //! via `__llvm_profile_write_buffer`, and publishes it through the
-//! guest-to-host SHM ring under [`MSG_TYPE_PROFRAW`].
+//! guest-to-host SHM ring under `MSG_TYPE_PROFRAW`.
 //!
 //! VP data scope: the buffer flush covers coverage counters and
 //! bitmaps only; PGO value-profile data is not preserved.

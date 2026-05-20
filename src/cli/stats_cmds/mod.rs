@@ -6,8 +6,8 @@
 //!   list_values, compare_partitions, show_host, show_run_host,
 //!   show_thresholds, print_stats_report) and the per-test /
 //!   per-run-key fuzzy-match helpers.
-//! - [`explain_sidecar`] — the per-sidecar `Option`-field absence
-//!   diagnostic ([`explain_sidecar`]) with its static catalog,
+//! - `explain_sidecar` — the per-sidecar `Option`-field absence
+//!   diagnostic ([fn@explain_sidecar]) with its static catalog,
 //!   walk-stats helpers, and JSON / text renderers.
 
 mod dispatch;

@@ -762,7 +762,7 @@ impl<'a> Ctx<'a> {
 /// Spawn workers per cgroup, move each handle's worker pids into
 /// its cgroup, then start all handles in a second pass.
 ///
-/// Shared scaffolding for [`run_scenario`] and [`setup_cgroups`] —
+/// Shared scaffolding for `run_scenario` and `setup_cgroups` —
 /// both defer `.start()` until every handle has been spawned and
 /// every worker pid moved, so workers see a stable cgroup
 /// membership at first run. [`spawn_diverse`] does NOT use this
@@ -810,9 +810,9 @@ where
 /// Resolve a [`WorkSpec`]'s `num_workers`, falling back to `default_n` when unset,
 /// and reject `num_workers=0`.
 ///
-/// A cgroup with no workers emits no [`WorkerReport`](crate::workload::WorkerReport)s, so every downstream
+/// A cgroup with no workers emits no [`crate::workload::WorkerReport`]s, so every downstream
 /// assertion vacuously passes. Callers that want "no load" on a cgroup
-/// should either drop the [`WorkSpec`](crate::workload::WorkSpec) entry entirely (letting the default apply)
+/// should either drop the [`crate::workload::WorkSpec`] entry entirely (letting the default apply)
 /// or use a single sentinel worker so assertions have something to check.
 pub(crate) fn resolve_num_workers(work: &WorkSpec, default_n: usize, label: &str) -> Result<usize> {
     let n = work.num_workers.unwrap_or(default_n);
@@ -1056,7 +1056,7 @@ fn format_cpuset_for_diag(cpuset: Option<&BTreeSet<usize>>) -> String {
 /// `threads_per_core == 1` (SMT disabled or non-SMT host), the
 /// cpuset isolates each sibling onto a different cgroup, or the
 /// topology was constructed without per-core sibling data
-/// (`LlcInfo::cores` empty — see [`TestTopology::synthetic`]). The
+/// (`LlcInfo::cores` empty — see `crate::topology::TestTopology::synthetic`). The
 /// error path is explicit, not a silent fallback, because
 /// [`WorkType::SmtSiblingSpin`] and other paired-on-siblings
 /// workloads produce meaningless results without true SMT

@@ -45,7 +45,7 @@ use super::{
 ///
 /// `target_type_id` is the BTF type id the renderer applies to
 /// the bytes after the `tid` header. Pass 0 (or a discovered id from
-/// [`discover_payload_btf_id`]) — 0 routes to a hex dump.
+/// `discover_payload_btf_id`) — 0 routes to a hex dump.
 ///
 /// `payload_type_reason` is a human-readable string describing why
 /// `target_type_id` is 0 (when it is); ignored when the id is
@@ -379,7 +379,7 @@ impl<'a> TreeWalker<'a> {
 
     /// Translate a `__arena` pointer to a guest physical address.
     ///
-    /// Mirrors the formula in [`super::arena`]: the kernel composes
+    /// Mirrors the formula in [`crate::monitor::arena`]: the kernel composes
     /// the actual kern-VA from the LOW 32 bits of the arena pointer
     /// added to `kern_vm_start`. Returns `None` if the translate
     /// fails (page unmapped, PA out of DRAM bounds).

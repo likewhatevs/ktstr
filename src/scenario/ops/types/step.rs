@@ -263,7 +263,7 @@ impl HoldSpec {
     }
 
     /// Hold for a fraction of `ctx.duration` (the scenario duration
-    /// configured on [`Ctx`](crate::scenario::Ctx)). Sugar for
+    /// configured on [`crate::scenario::Ctx`]). Sugar for
     /// `HoldSpec::Frac(f)`; the resolved wall-clock hold is
     /// `ctx.duration * f` (e.g. `0.5` = half the scenario
     /// duration). `f` must be finite and `> 0.0` — see
