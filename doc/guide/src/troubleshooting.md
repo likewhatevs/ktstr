@@ -529,7 +529,8 @@ files in your kernel source directory:
   Older ktstr versions could leave it in cwd when a
   coverage-instrumented `cargo ktstr test` was launched from
   inside the kernel tree. Current ktstr injects
-  `LLVM_PROFILE_FILE=<cargo-ktstr-binary-parent>/llvm-cov-target/default-{pid}-{binary_hash}.profraw`
+  `LLVM_PROFILE_FILE=<cargo-ktstr-binary-parent>/llvm-cov-target/default-%p-%m.profraw`
+  (LLVM's `%p` = process id, `%m` = module signature)
   for the bare `nextest` path so the profraw lands next to the
   cargo-ktstr binary regardless of cwd. See
   [profraw layout](running-tests/cargo-ktstr.md#profraw-layout)

@@ -19,7 +19,7 @@ stay compatible across ktstr version bumps that add new variants:
 | `SetCpuset` | Set a cgroup's cpuset via `CpusetSpec` |
 | `ClearCpuset` | Remove cpuset constraints |
 | `SwapCpusets` | Swap cpusets between two cgroups |
-| `Spawn` | Fork workers into a cgroup |
+| `SpawnWorkers` | Fork workers into a cgroup |
 | `StopCgroup` | Stop a cgroup's workers (see [RemoveCgroup / StopCgroup against Backdrop targets](#removecgroup--stopcgroup-against-backdrop-targets) for the permissive-stop contract) |
 | `SetAffinity` | Set worker affinity via `AffinityIntent` |
 | `SpawnHost` | Spawn workers in the parent cgroup |
@@ -29,8 +29,12 @@ stay compatible across ktstr version bumps that add new variants:
 | `KillPayload` | SIGKILL the named payload, reap the child, evaluate checks, and record metrics. Same `(name, cgroup)` lookup rules as `WaitPayload`. Mirrors step-teardown drain for an explicitly-targeted payload. |
 | `FreezeCgroup` | Freeze every task in the named cgroup via `cgroup.freeze` (kernel-side asynchronous freeze; not a SIGSTOP). Idempotent for already-frozen cgroups. Pair with `UnfreezeCgroup` to release; teardown auto-unfreezes. See [Snapshots](../writing-tests/snapshots.md) for the observer-cgroup deadlock warning. |
 | `UnfreezeCgroup` | Unfreeze every task in the named cgroup via `cgroup.freeze`. Inverse of `FreezeCgroup`. Idempotent. |
-| `Snapshot` | Capture a host-side diagnostic snapshot under `name` via the freeze coordinator: pauses every vCPU, reads BPF map state, vCPU registers, and per-CPU counters into a `FailureDumpReport`, then resumes. The report is keyed by `name` on the active `SnapshotBridge`. No active bridge is a no-op with `tracing::warn!`. See [Snapshots](../writing-tests/snapshots.md). |
-| `WatchSnapshot` | Capture a snapshot whenever the guest writes to the named kernel symbol; one fire = one capture tagged with the symbol path. Symbol resolution at op execution time looks the name up by **verbatim vmlinux ELF symbol-table match** — the requested name must appear in the guest kernel's static symbol table exactly as written (no path expansion, no BTF descent). Maximum 3 watch ops per scenario (3 hardware watchpoint slots; 1 slot reserved for the error-class exit_kind trigger). See [Watch Snapshots](../writing-tests/watch-snapshots.md). |
+| `CaptureSnapshot` | Capture a host-side diagnostic snapshot under `name` via the freeze coordinator: pauses every vCPU, reads BPF map state, vCPU registers, and per-CPU counters into a `FailureDumpReport`, then resumes. The report is keyed by `name` on the active `SnapshotBridge`. No active bridge is a no-op with `tracing::warn!`. See [Snapshots](../writing-tests/snapshots.md). |
+| `WatchSnapshot` | Capture a snapshot whenever the guest writes to the named kernel symbol; one fire = one capture tagged with the symbol path. Symbol resolution at op execution time looks the name up by **verbatim vmlinux ELF symbol-table match** — the requested name must appear in the guest kernel's static symbol table exactly as written (no path expansion, no BTF descent). Maximum 3 watch ops per scenario (the KVM hardware-watchpoint plumbing exposes 4 debug slots; slot 0 is reserved for the error-class `exit_kind` trigger, leaving 3 user slots). See [Watch Snapshots](../writing-tests/watch-snapshots.md). |
+| `ReadKernelHot` / `ReadKernelCold` | Read a kernel-memory location (symbol, KVA, per-CPU field, or task field) via the freeze coordinator. `Hot` runs live against the running vCPU; `Cold` requires a freeze rendezvous. See [`KernelTarget`](#kerneltarget--kernelvalue) for the target enum. |
+| `WriteKernelHot` / `WriteKernelCold` | Write a kernel-memory location. Same target shape as the read ops. Cold-path writes are auto-merged when adjacent ops target the same address to amortize freeze cost. |
+| `TaskField` | Read or write a `struct task_struct` field for a named task via the cold-path freeze rendezvous. Convenience over `KernelTarget::TaskField`. |
+| `AttachScheduler` / `DetachScheduler` / `RestartScheduler` / `ReplaceScheduler` | Manage the live scheduler in the guest mid-scenario. `ReplaceScheduler` swaps to a different staged scheduler binary (declared via the `#[ktstr_test(staged_schedulers = [...])]` attribute). |
 
 Op constructors accept string literals directly (no `.into()` needed):
 
@@ -39,12 +43,12 @@ Op::add_cgroup("cg_0")
 Op::add_cgroup_def(CgroupDef::named("cg_1").workers(4))
 Op::set_cpuset("cg_0", CpusetSpec::disjoint(0, 2))
 Op::stop_cgroup("cg_0")
-Op::spawn("cg_0", WorkSpec::default().workers(4))
+Op::spawn_workers("cg_0", WorkSpec::default().workers(4))
 Op::set_affinity("cg_0", AffinityIntent::random_subset([0, 1, 2, 3], 2))
 Op::spawn_host(WorkSpec::default().workers(4))
 Op::freeze_cgroup("cg_0")
 Op::unfreeze_cgroup("cg_0")
-Op::snapshot("after_spawn")
+Op::capture_snapshot("after_spawn")
 Op::watch_snapshot("jiffies_64")
 ```
 
@@ -81,9 +85,14 @@ docstring at `Op::MoveAllTasks` for the asymmetric-ownership table.
 
 `OpKind` is a payload-free discriminant enum generated from `Op` via
 `#[strum_discriminants]`. It carries the same variant set as `Op`
-(`AddCgroup`, `AddCgroupDef`, `RemoveCgroup`, ..., `RunPayload`,
-`WaitPayload`, `KillPayload`, `FreezeCgroup`, `UnfreezeCgroup`,
-`Snapshot`, `WatchSnapshot`) with none of the inner fields, so it is cheap to
+(every variant in the table above — `AddCgroup`, `AddCgroupDef`,
+`RemoveCgroup`, `SetCpuset`, `ClearCpuset`, `SwapCpusets`,
+`SpawnWorkers`, `StopCgroup`, `SetAffinity`, `SpawnHost`,
+`MoveAllTasks`, `RunPayload`, `WaitPayload`, `KillPayload`,
+`FreezeCgroup`, `UnfreezeCgroup`, `CaptureSnapshot`, `WatchSnapshot`,
+`ReadKernelHot`, `ReadKernelCold`, `WriteKernelHot`, `WriteKernelCold`,
+`TaskField`, `AttachScheduler`, `DetachScheduler`, `RestartScheduler`,
+`ReplaceScheduler`) with none of the inner fields, so it is cheap to
 copy and use as a map key. Framework code uses `OpKind` when it
 only cares WHICH operation ran (per-op statistics, stimulus-event
 tagging, verifier/monitor bookkeeping) without the payload. Test
@@ -261,9 +270,9 @@ Both skip overrides to grouped work types when `num_workers` is not
 divisible by the work type's group size.
 
 WorkSpec type overrides apply only to `CgroupDef` setup, not to raw
-`Op::Spawn`. `Op::Spawn` always uses the work type as given. Use
-`CgroupDef` with `.swappable(true)` when the work type should
-participate in gauntlet overrides.
+`Op::SpawnWorkers`. `Op::SpawnWorkers` always uses the work type as
+given. Use `CgroupDef` with `.swappable(true)` when the work type
+should participate in gauntlet overrides.
 
 ## Step
 
@@ -283,8 +292,8 @@ syntax or the named const-fn for the `Factory` arm:
 
 - `Setup::Defs(defs)` -- variant constructor for the static-list case
   (`Setup::Defs(vec![CgroupDef::named("cg")])`).
-- `Setup::factory(f)` -- named const-fn constructor for the `Factory`
-  arm so the def list can depend on the resolved topology.
+- `Setup::with_factory(f)` -- named const-fn constructor for the
+  `Factory` arm so the def list can depend on the resolved topology.
 
 `Setup::default()` returns `Setup::Defs(Vec::new())` (the ops-only
 path). `Vec<CgroupDef>` also implements `Into<Setup>` for the inline
@@ -296,6 +305,15 @@ produces a `Vec`.
 **`Step::new(ops, hold)`** -- creates a step with ops only (no
 CgroupDef setup). Use when the step only applies dynamic operations
 to an existing topology.
+
+**`Step::hold(hold)`** -- shorthand for a hold-only step with no
+setup and no ops. The canonical shape for phase A in an A/B-style
+two-step scenario (`Step::hold(HoldSpec::frac(0.3))` then
+`Step::with_op(Op::replace_scheduler(&ALT), HoldSpec::frac(0.7))`).
+
+**`Step::with_op(op, hold)`** -- shorthand for a step that runs a
+single op then holds. Pairs naturally with `Step::hold` for two-step
+A/B scenarios.
 
 **`Step::with_defs(defs, hold)`** -- creates a step with CgroupDef
 setup and a hold period. The primary constructor for steps that

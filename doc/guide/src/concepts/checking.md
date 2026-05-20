@@ -474,37 +474,37 @@ accumulate in a loop body.
 
 ### Fields
 
-- `passed: bool` -- whether all checks passed.
-- `skipped: bool` -- distinguishes a passing result that ran every
-  check from one that skipped execution (topology / flag mismatch,
-  prerequisite absent). `AssertResult::skip` sets this; `pass` /
-  `fail` / `fail_msg` leave it `false`.
-- `details: Vec<AssertDetail>` -- structured diagnostic entries; each
-  carries a `kind: DetailKind` (`Other`, `Note`, `Skip`, `Temporal`,
-  …) plus a human-readable `message: String`. Consumers filter by
-  `kind` for routing (failure vs informational note) and read
-  `message` for display.
+- `outcomes: Vec<Outcome>` -- per-claim outcome entries; each
+  carries the claim shape, comparator, and pass/fail/skip status.
+  Verdict is COMPUTED via `is_pass()` / `is_fail()` / `is_skip()`
+  from this vec (no separate `passed: bool` / `skipped: bool`
+  field exists; legacy `is_failed()` / `is_skipped()` are aliases).
+- `passes: Vec<PassDetail>` -- recorded pass details (capped at
+  `MAX_RECORDED_PASSES`). Surfaced via `failure_details()` when
+  composing diagnostic notes.
 - `stats: ScenarioStats` -- aggregated worker telemetry across all
   cgroups (spread, gaps, migrations, wake latency, iterations).
 - `measurements: BTreeMap<String, NoteValue>` -- structured
   per-test measurements keyed by name. Sidecar consumers and
   comparison tooling read this map directly without parsing
-  `details` strings, so populate it (via `Verdict::note_value`
+  failure-message strings, so populate it (via `Verdict::note_value`
   during claim evaluation) for any value a downstream comparison
   needs to lift programmatically.
+- `info_notes: Vec<InfoNote>` -- informational notes (distinct
+  from outcomes/passes) used by `verdict.note(...)`.
 
 ### Merging
 
-`result.merge(other)` combines two results. If `other.passed` is
-false, the merged result is also false. Details and stats are
-accumulated:
+`result.merge(other)` combines two results. If `other` carries any
+failed outcome, the merged result fails. Outcomes, passes, info
+notes, and stats are accumulated:
 
 ```rust,ignore
 let mut combined = AssertResult::pass();
 combined.merge(cgroup_0_result);
 combined.merge(cgroup_1_result);
-// combined.passed is false if either cgroup failed
-// combined.details contains messages from both
+// combined.is_fail() returns true if either cgroup failed
+// combined.failure_details() iterates concatenated failure notes
 ```
 
 Stats merging takes worst values across cgroups for spread, gap, wake

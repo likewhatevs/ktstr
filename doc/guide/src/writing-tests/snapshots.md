@@ -7,12 +7,12 @@ maps, BTF-render every captured value, and bundle the result into a
 `FailureDumpReport` keyed by a name you choose. Test code then reads
 it back via the [`Snapshot`](#reading-the-captured-report) accessor for typed traversal.
 
-`Op::snapshot("name")` is the **on-demand** capture trigger. Use it to
+`Op::capture_snapshot("name")` is the **on-demand** capture trigger. Use it to
 ask "what does the scheduler look like *right now*?" at a precise
 point in the scenario. For automatic capture on a kernel write to a
 specific symbol, see [Watch Snapshots](watch-snapshots.md). For
 **cadenced** capture across the workload window without invoking
-`Op::snapshot` from the scenario body, see
+`Op::capture_snapshot` from the scenario body, see
 [Periodic Capture](periodic-capture.md) — it produces a time-ordered
 [`SampleSeries`](temporal-assertions.md#sampleseries) that flows into
 the [temporal-assertion](temporal-assertions.md) patterns
@@ -21,7 +21,7 @@ the [temporal-assertion](temporal-assertions.md) patterns
 
 ## Issuing a snapshot
 
-`Op::snapshot(name)` is a single op in a [`Step`](../concepts/ops.md)'s op list. The
+`Op::capture_snapshot(name)` is a single op in a [`Step`](../concepts/ops.md)'s op list. The
 executor invokes the active [`SnapshotBridge`](#wiring-the-bridge)'s capture callback,
 which performs the freeze rendezvous and returns the report; the
 bridge stores the report under `name`.
@@ -32,22 +32,22 @@ use ktstr::prelude::*;
 let steps = vec![Step {
     setup: vec![CgroupDef::named("workers").workers(2)].into(),
     ops: vec![
-        Op::snapshot("after_spawn"),
+        Op::capture_snapshot("after_spawn"),
         // ... other ops ...
-        Op::snapshot("after_workload"),
+        Op::capture_snapshot("after_workload"),
     ],
     hold: HoldSpec::FULL,
 }];
 execute_steps(ctx, steps)?;
 ```
 
-A scenario may issue any number of `Op::snapshot` ops with distinct
+A scenario may issue any number of `Op::capture_snapshot` ops with distinct
 names. Reusing a name overwrites the prior capture (and emits a
 `tracing::warn!`).
 
 ## Wiring the bridge
 
-The bridge is what turns an `Op::snapshot` into stored data. The host
+The bridge is what turns an `Op::capture_snapshot` into stored data. The host
 typically wires it before `execute_steps` runs, but a scenario can
 install one inline:
 
@@ -78,7 +78,7 @@ for the scope of the scenario — a bare `let _ = bridge.set_thread_local()`
 drops the guard immediately and clears the bridge before any op runs.
 `must_use` will warn if the return value is discarded entirely.
 
-If no bridge is installed, `Op::snapshot` is a no-op with a
+If no bridge is installed, `Op::capture_snapshot` is a no-op with a
 `tracing::warn!` and the scenario continues. If the capture callback
 returns `None` (capture pipeline unavailable), the bridge stays empty
 and the scenario continues. Existing scenarios that never declare
@@ -209,7 +209,7 @@ The dotted-path walker:
 | `as_bool()` | `bool` | `Bool` direct; `Int`/`Uint`/`Char`/`Enum`/`Ptr` non-zero is true; per-CPU array key |
 | `as_f64()` | `f64` | `Float`, `Int`, `Uint`, `Enum`, per-CPU array key |
 | `as_str()` | `&str` | `Enum` with a resolved variant name |
-| `rendered()` | `Option<&RenderedValue>` | the underlying value when present |
+| `raw()` | `Option<&RenderedValue>` | the underlying value when present |
 
 Type mismatches surface as `SnapshotError::TypeMismatch { expected,
 actual, requested }` — for example, `as_str()` on a `Uint` reports
@@ -362,7 +362,7 @@ fn snapshot_then_inspect(ctx: &Ctx) -> Result<AssertResult> {
     // Run the scenario, capturing once after spawn.
     let steps = vec![Step {
         setup: vec![CgroupDef::named("workers").workers(2)].into(),
-        ops: vec![Op::snapshot("after_spawn")],
+        ops: vec![Op::capture_snapshot("after_spawn")],
         hold: HoldSpec::FULL,
     }];
     let mut result = execute_steps(ctx, steps)?;
@@ -401,18 +401,17 @@ which targets a `BpfMapWrite` constant:
 ```rust,ignore
 use ktstr::prelude::*;
 
-const TRIGGER_FAULT: BpfMapWrite = BpfMapWrite {
-    map_name_suffix: ".bss",   // matched against discovered maps
-    offset: 42,                // byte offset within the map's value
-    value: 1,                  // u32 written by the host
-};
+const TRIGGER_FAULT: BpfMapWrite = BpfMapWrite::new(".bss", 42, 1);
+// args: (map_name_suffix, byte offset within the map's value, u32 value to write).
+// `BpfMapWrite`'s fields are private; `BpfMapWrite::new` is the const
+// constructor (validates inputs at compile time).
 
 #[ktstr_test(bpf_map_write = TRIGGER_FAULT, expect_err = true)]
 fn fault_then_inspect(ctx: &Ctx) -> Result<AssertResult> {
     // The host has already written `1` at `.bss + 42` before
     // the scenario started. Capture and inspect the resulting
     // scheduler state mid-run.
-    /* bridge wiring + Op::snapshot + Snapshot::new as above */
+    /* bridge wiring + Op::capture_snapshot + Snapshot::new as above */
     Ok(AssertResult::pass())
 }
 ```
@@ -428,14 +427,14 @@ contract.
 
 Read+write workflows then compose naturally: the test pre-seeds
 guest state with `bpf_map_write`, lets the scheduler run, and
-asserts on the resulting state with `Op::snapshot` + the
+asserts on the resulting state with `Op::capture_snapshot` + the
 [`Snapshot`](#reading-the-captured-report) accessor:
 
 1. **Write (pre-scenario)** — `bpf_map_write` flips a `.bss` flag
    the scheduler reads.
 2. **Run** — the scenario's ops drive workload behavior; the
    scheduler reacts to the flag.
-3. **Read (mid-scenario)** — `Op::snapshot("after")` captures the
+3. **Read (mid-scenario)** — `Op::capture_snapshot("after")` captures the
    scheduler state at the chosen point.
 4. **Assert** — `Snapshot::var(...).as_u64()` /
    `Snapshot::map(...).find(...).get(...).as_*()` verifies the

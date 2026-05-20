@@ -56,14 +56,15 @@ the function inside it.
 ## Attributes
 
 All attributes are optional with defaults. Most take `key = value`;
-the ten bool attributes (`auto_repro`, `not_starved`, `isolation`,
+the eleven bool attributes (`auto_repro`, `not_starved`, `isolation`,
 `performance_mode`, `no_perf_mode`, `requires_smt`, `expect_err`,
-`fail_on_stall`, `host_only`, `ignore`) also accept a bare form as
-shorthand for `= true` — `#[ktstr_test(host_only)]` is equivalent to
-`#[ktstr_test(host_only = true)]`. `auto_repro` is the only one with
-a `true` default, so bare `auto_repro` is a no-op; use `auto_repro =
-false` to disable. The other nine default to `false` (or `None`),
-so the bare form is the meaningful shorthand for those.
+`fail_on_stall`, `host_only`, `ignore`, `kaslr`) also accept a bare
+form as shorthand for `= true` — `#[ktstr_test(host_only)]` is
+equivalent to `#[ktstr_test(host_only = true)]`. `auto_repro` and
+`kaslr` default to `true`, so bare `auto_repro` / `kaslr` is a no-op;
+use `auto_repro = false` / `kaslr = false` to disable. The other nine
+default to `false` (or `None`), so the bare form is the meaningful
+shorthand for those.
 
 ### Topology
 
@@ -109,7 +110,7 @@ handshake; tests are not expected to override either knob.
 |---|---|---|
 | `scheduler = CONST` | `&Scheduler::EEVDF` | Rust const path to a `&'static Scheduler`. The bare const emitted by `declare_scheduler!` (e.g. `MY_SCHED`) is the expected form. The default `Scheduler::EEVDF` runs tests under the kernel's default scheduler (EEVDF on Linux 6.6+) so tests without an explicit `scheduler =` run under the kernel default. |
 | `extra_sched_args = [...]` | `[]` | Extra CLI args for the scheduler, appended after `Scheduler::sched_args`. |
-| `watchdog_timeout_s` | 5 | scx watchdog override (seconds). Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels (BTF-detected) and via the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override silently no-ops. |
+| `watchdog_timeout_s` | 4 | scx watchdog override (seconds). Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels (BTF-detected) and via the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override silently no-ops. |
 
 ### Payloads
 
@@ -181,15 +182,19 @@ example.
 | Attribute | Default | Description |
 |---|---|---|
 | `auto_repro` | `true` | On scheduler crash, boot a second VM with probes attached. Set to `false` for fast iteration. |
+| `kaslr` | `true` | Boot the guest kernel with KASLR enabled (`CONFIG_RANDOMIZE_BASE=y` + `CONFIG_RANDOMIZE_MEMORY=y`, no `nokaslr` karg). Set to `false` to opt out per-test — appends `nokaslr` to the kernel command line. Scheduler-wide opt-out is available via `Scheduler::kargs(&["nokaslr"])`. |
 | `performance_mode` | `false` | Pin vCPUs to host cores, hugepages, NUMA mbind, RT scheduling, LLC exclusivity validation |
 | `no_perf_mode` | `false` | Decouple the virtual topology from host hardware: build the VM with the declared `numa_nodes` / `llcs` / `cores` / `threads` even on smaller hosts; skip vCPU pinning, hugepages, NUMA mbind, RT scheduling, and KVM exit suppression; relax gauntlet preset filtering to the single "host has enough total CPUs" check. Mutually exclusive with `performance_mode = true` (rejected at compile time by the `#[ktstr_test]` proc macro; `KtstrTestEntry::validate` provides a second-line gate for programmatic-entry construction). Equivalent to setting `KTSTR_NO_PERF_MODE=1` per-test — either source forces the no-perf path. See [Performance Mode](../concepts/performance-mode.md#tier-2-no-perf-mode-with-cpu-cap-reservation). |
-| `duration_s` | 12 | Per-scenario duration in seconds |
+| `duration_s` | 2 | Per-scenario duration in seconds |
 | `expect_err` | `false` | Test expects `run_ktstr_test` to return `Err`; disables auto-repro |
 | `bpf_map_write = CONST` | empty | Rust const path to a `BpfMapWrite`; host writes this value to a BPF map after the scheduler loads. The entry field is a slice; the macro wraps the single path in a one-element slice. |
 | `host_only` | `false` | Run the test function directly on the host instead of inside a VM. Use for tests that need host tools (e.g. cargo, nested VMs) unavailable in the guest initramfs. |
-| `num_snapshots = N` | `0` | Fire `N` periodic `freeze_and_capture(false)` boundaries inside the workload's 10 %–90 % window; each capture is stored on the host `SnapshotBridge` under `periodic_NNN`. `0` disables periodic capture entirely. Validated against `MAX_STORED_SNAPSHOTS` (= 64), `host_only = true`, and a 100 ms minimum-spacing rule. See [Periodic Capture](periodic-capture.md) and [Temporal Assertions](temporal-assertions.md). |
+| `disk = PATH` | `None` | Attach a host-side file as a raw virtio-blk backing for the guest. The path is resolved relative to the workspace at compile time. Mutually exclusive with `host_only = true`. |
+| `staged_schedulers = [PATH, ...]` | `[]` | Additional `&'static Scheduler` consts staged into the VM alongside the primary `scheduler`. Required for tests that invoke `Op::ReplaceScheduler` / `Op::AttachScheduler` — the framework packs every binary into the guest at boot so a runtime swap has its target on disk. |
+| `workload_root_cgroup = "/path"` | `None` | Guest cgroup path under which the framework creates per-test workload cgroups. Decoupled from the scheduler's `cgroup_parent` (which controls scheduler-side cell rooting) — use this when the test author wants workload cgroups to land at a specific path independent of where the scheduler manages cells. |
+| `num_snapshots = N` | `0` | Fire `N` periodic snapshot boundaries inside the workload's 10 %–90 % window; each capture is stored on the host `SnapshotBridge` under `periodic_NNN`. `0` disables periodic capture entirely. Validated against `MAX_STORED_SNAPSHOTS` (= 64), `host_only = true`, and a 100 ms minimum-spacing rule. See [Periodic Capture](periodic-capture.md) and [Temporal Assertions](temporal-assertions.md). |
 | `cleanup_budget_ms = N` | `None` | Sub-watchdog cap on host-side VM teardown wall time. When the budget is exceeded the test's `AssertResult` is folded with a failing `AssertDetail`. `None` disables the check. |
-| `post_vm = PATH` | `None` | Host-side callback invoked after `vm.run()` returns. Signature: `fn(&VmResult) -> anyhow::Result<()>`. Use for assertions that need host-side state — e.g. draining `VmResult.snapshot_bridge` for periodic-capture analysis (see [Periodic Capture](periodic-capture.md)). |
+| `post_vm = PATH` | `default_post_vm_periodic_fired` (when periodic captures are configured) / `None` (otherwise) | Host-side callback invoked after `vm.run()` returns. Signature: `fn(&VmResult) -> anyhow::Result<()>`. Use for assertions that need host-side state — e.g. draining `VmResult.snapshot_bridge` for periodic-capture analysis (see [Periodic Capture](periodic-capture.md)). When `num_snapshots > 0` and `post_vm` is omitted, the macro auto-installs `default_post_vm_periodic_fired` as a smoke floor that asserts at least one periodic boundary fired with real (non-placeholder) BPF state. |
 | `config = EXPR` | `None` | Inline scheduler config content (string literal or path to a `const &'static str`). Written to the guest path declared by the scheduler's `config_file_def`; the framework substitutes `{file}` in the scheduler's arg template with the guest path. Required when the scheduler declares `config_file_def`; rejected when it doesn't. The pairing is enforced at compile time via a `const` assertion against `Payload::config_file_def`, and again at runtime by `KtstrTestEntry::validate`. See [Inline scheduler config](#inline-scheduler-config). |
 
 See [Performance Mode](../concepts/performance-mode.md) for details on

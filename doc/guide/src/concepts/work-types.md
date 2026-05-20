@@ -75,7 +75,7 @@ pub enum WorkType {
     },
 
     // Compound / sequence
-    Sequence { first: Phase, rest: Vec<Phase> },        // Loop through ordered phases (Spin / Sleep / Yield / Io / AluHot).
+    Sequence { first: WorkPhase, rest: Vec<WorkPhase> }, // Loop through ordered phases (Spin / Sleep / Yield / Io / AluHot).
 
     // Lifecycle / scheduling-class churn
     ForkExit,                                           // Rapid fork+_exit cycling; parent waitpid's then repeats.
@@ -144,8 +144,11 @@ pub enum WorkType {
 }
 ```
 
-> **Imports:** `WorkType`, `Phase`, `SchedPolicy`, `AluWidth`,
-> `WorkSpec`, and `WorkloadConfig` are in `ktstr::prelude::*`. The
+> **Imports:** `WorkType`, `WorkPhase`, `SchedPolicy`, `AluWidth`,
+> `WorkSpec`, and `WorkloadConfig` are in `ktstr::prelude::*`.
+> (Note: the prelude also exports an unrelated `Phase` from
+> `crate::assert` — the temporal-assertion phase bucket. The
+> `WorkType::Sequence` variant uses `WorkPhase`, not `Phase`.) The
 > auxiliary enums `FutexLockMode` (used by `PriorityInversion::pi_mode`),
 > `WakeMechanism` (used by `WakeChain::wake`), and `SchedClass`
 > (used by `AsymmetricWaker`) live under `ktstr::workload`. Bring
@@ -269,21 +272,21 @@ working set (three square matrices of u64, O(n^3)). Requires
 repeat. Each phase runs for its specified duration before the next
 starts. Phases are defined via the `Phase` enum:
 
-- `Phase::Spin(Duration)` -- CPU spin for the given duration.
-- `Phase::Sleep(Duration)` -- `thread::sleep` for the given duration.
-- `Phase::Yield(Duration)` -- repeated `sched_yield` for the given duration.
-- `Phase::Io(Duration)` -- simulated I/O (write 64 KB + 100 us sleep) for the given duration.
-- `Phase::AluHot { width: AluWidth, duration: Duration }` -- ALU-bound multiply chain for the given duration. SIMD/scalar `width` resolution matches `WorkType::AluHot`.
+- `WorkPhase::Spin(Duration)` -- CPU spin for the given duration.
+- `WorkPhase::Sleep(Duration)` -- `thread::sleep` for the given duration.
+- `WorkPhase::Yield(Duration)` -- repeated `sched_yield` for the given duration.
+- `WorkPhase::Io(Duration)` -- simulated I/O (write 64 KB + 100 us sleep) for the given duration.
+- `WorkPhase::AluHot { width: AluWidth, duration: Duration }` -- ALU-bound multiply chain for the given duration. SIMD/scalar `width` resolution matches `WorkType::AluHot`.
 
 `Sequence` cannot be constructed via `WorkType::from_name()` because
 it requires explicit phase definitions. Build it directly:
 
 ```rust,ignore
 WorkType::Sequence {
-    first: Phase::Spin(Duration::from_millis(100)),
+    first: WorkPhase::Spin(Duration::from_millis(100)),
     rest: vec![
-        Phase::Sleep(Duration::from_millis(50)),
-        Phase::Yield(Duration::from_millis(20)),
+        WorkPhase::Sleep(Duration::from_millis(50)),
+        WorkPhase::Yield(Duration::from_millis(20)),
     ],
 }
 ```

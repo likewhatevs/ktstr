@@ -35,7 +35,7 @@ it from
 use ktstr::prelude::*;
 
 let drained = vm_result.snapshot_bridge.drain_ordered_with_stats();
-let series = SampleSeries::from_drained(drained).periodic_only();
+let series = SampleSeries::from_drained_typed(drained, monitor).periodic_only();
 ```
 
 `periodic_only()` filters to entries whose tag begins with
@@ -48,11 +48,24 @@ needs both views from the same series.
 
 - `len()`, `is_empty()` — sample count.
 - `iter_samples()` — borrowed `Sample<'_>` views (each carrying
-  `tag`, `elapsed_ms`, `Snapshot<'_>`, `Option<&Value>` stats).
+  `tag`, `elapsed_ms`, `Snapshot<'_>`, `step_index: Option<u16>`,
+  and `stats: Result<&Value, &MissingStatsReason>`).
 - `bpf(label, |snap| …)` / `stats(label, |sv| …)` — manual closure
   projection along the BPF or stats axis.
+- `bpf_live_u64(name)` / `bpf_live_i64(name)` / `bpf_live_f64(name)` —
+  terse shorthand for the BPF axis that resolves `name` via the
+  same auto-disambiguating `Snapshot::live_var` accessor used in
+  multi-scheduler scenarios (no closure to write). Mirror set on
+  the stats axis: `stats_live_u64(path)` / `_i64(path)` / `_f64(path)`.
 - `bpf_map(map_name)` / `stats_path(path)` — typed auto-projection
   helpers (see [Auto-projection](#auto-projection)).
+- Per-phase reducers: `counter_delta_per_phase()`, `last_per_phase()`,
+  `first_per_phase()`, `value_at_phase(phase)`, `by_phase()`, `phase(p)`.
+  Cross-phase: `ratio_across_phases(verdict, label, phase_a, phase_b)`
+  returns a `CrossPhaseRatio` with `at_most`/`at_least`/`between`
+  comparators. `PhaseMapExt` and `FracPair` (re-exported from
+  `crate::assert`) compose per-phase deltas into ratios for swap-A/B
+  patterns.
 
 ## SeriesField
 
@@ -91,7 +104,7 @@ exposing `path("…").as_u64()` / `as_f64()` etc.:
 ```rust,ignore
 let busy: SeriesField<f64> = series.stats(
     "busy",
-    |sv| sv.path("busy").as_f64(),
+    |sv| sv.get("busy").as_f64(),
 );
 ```
 
@@ -195,7 +208,7 @@ excluded so ramp-up does not bias the steady-state baseline.
 
 ```rust,ignore
 let util: SeriesField<f64> = series.stats("busy",
-    |sv| sv.path("busy").as_f64());
+    |sv| sv.get("busy").as_f64());
 util.steady_within(&mut v, /*warmup_ms=*/ 1000, /*tolerance=*/ 0.10);
 ```
 
@@ -314,8 +327,9 @@ series:
 use ktstr::prelude::*;
 
 fn assert_temporal_patterns(result: &VmResult) -> Result<()> {
-    let series = SampleSeries::from_drained(
+    let series = SampleSeries::from_drained_typed(
         result.snapshot_bridge.drain_ordered_with_stats(),
+        result.monitor.clone(),
     )
     .periodic_only();
 
@@ -331,13 +345,11 @@ fn assert_temporal_patterns(result: &VmResult) -> Result<()> {
     // Stats axis: stay under a generous ceiling.
     let stats_dispatched: SeriesField<u64> = series.stats(
         "nr_dispatched",
-        |sv| sv.path("nr_dispatched").as_u64(),
+        |sv| sv.get("nr_dispatched").as_u64(),
     );
     stats_dispatched.each(&mut v).at_most(1_000_000_000u64);
 
-    let r = v.into_result();
-    anyhow::ensure!(r.passed, "temporal assertions failed: {:?}", r.details);
-    Ok(())
+    v.into_anyhow_or_log()
 }
 
 #[ktstr_test(num_snapshots = 3, duration_s = 10, post_vm = assert_temporal_patterns)]

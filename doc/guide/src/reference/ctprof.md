@@ -380,7 +380,7 @@ under the same outer headers.
 ### Aggregation rules
 
 Each metric declares its own aggregation rule
-(`CTPROF_METRICS` in `src/ctprof_compare.rs`). The
+(`CTPROF_METRICS` in `src/ctprof_compare/metrics.rs`). The
 `AggRule` enum is **typed**: each variant binds an accessor of a
 specific `metric_types` newtype (`MonotonicCount`,
 `MonotonicNs`, `PeakNs`, `Bytes`, etc.) so a registry entry that
@@ -488,7 +488,7 @@ with its own auto-scale ladder. They render in a separate
 `## Derived metrics` table below the per-thread table on both
 `compare` and `show`, with rows colored blue to distinguish
 them from the primary table on TTY stdout. Registered in
-`CTPROF_DERIVED_METRICS` in `src/ctprof_compare.rs`.
+`CTPROF_DERIVED_METRICS` in `src/ctprof_compare/metrics.rs`.
 
 The full registry is 17 entries: 8 schedstat / I/O / heap
 derivations plus 9 taskstats-derived (the 8 per-bucket
@@ -547,10 +547,10 @@ measuring a CPU-bound workload (more work done) or a spin-wait
 pathology (more time wasted). The interpretation is scheduler-
 specific and left to the operator.
 
-Sort order: by default, rows are sorted by absolute delta
-(largest movers first) so the most-changed metrics surface at
-the top. Rows with no numeric scalar (`policy`, heterogeneous
-affinity) fall to the bottom.
+Sort order: by default, rows are sorted by descending
+`|delta_pct|` (absolute percent delta — largest movers first) so
+the most-changed metrics surface at the top. Rows with no numeric
+scalar (`policy`, heterogeneous affinity) fall to the bottom.
 
 ## File format
 
@@ -624,7 +624,7 @@ aggregation rules are legal in step 3:
 | `CpuSet` | CPU affinity mask — affinity-aggregated. Example: `cpu_affinity`. |
 | `Range<T>` | Output type of the `Rangeable::range_across` reduction. Carries `min` and `max` of the same `T` with the `min <= max` invariant enforced at construction (`debug_assert!` in `Range::new`). Not stored on `ThreadState` — the `Aggregated::OrdinalRange` boundary unwraps it via `into_tuple()` to a `(i64, i64)` pair widened from the underlying `OrdinalI32` / `OrdinalU32` / `OrdinalU64`. |
 
-Add the field to `ThreadState` in `src/ctprof.rs`:
+Add the field to `ThreadState` in `src/ctprof/mod.rs`:
 
 ```rust,ignore
 // In ThreadState struct definition.
@@ -636,7 +636,7 @@ pub my_new_metric: crate::metric_types::MonotonicCount,
 
 ### 2. Wire the capture path
 
-`capture_thread_at_with_tally` in `src/ctprof.rs` is the
+`capture_thread_at_with_tally` in `src/ctprof/mod.rs` is the
 single per-thread procfs walk. Add the per-source reader (or
 extend an existing one) and stamp the field in the
 `ThreadState { ... }` construction:
@@ -657,7 +657,7 @@ output — see the *Capture is best-effort* section.
 ### 3. Register the metric
 
 Append a `CtprofMetricDef` entry to `CTPROF_METRICS` in
-`src/ctprof_compare.rs`. The `AggRule` variant must match the
+`src/ctprof_compare/metrics.rs`. The `AggRule` variant must match the
 newtype chosen in step 1 — the type system enforces this.
 
 ```rust,ignore

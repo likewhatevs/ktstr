@@ -1,8 +1,8 @@
 # Periodic Capture
 
-`Op::snapshot` is **on-demand** — the test author picks the moment of
+`Op::capture_snapshot` is **on-demand** — the test author picks the moment of
 capture. **Periodic capture** is the cadenced complement: the freeze
-coordinator fires `freeze_and_capture(false)` at evenly-spaced points
+coordinator fires `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` at evenly-spaced points
 across the workload window without the scenario body asking. The
 result is a time-ordered series of `(report, stats, elapsed_ms)`
 samples that flows naturally into the
@@ -62,7 +62,7 @@ Each periodic capture is stored on the host's `SnapshotBridge` under
 3 digits because the bridge cap (see below) maxes out at
 `MAX_STORED_SNAPSHOTS` (= 64 today), so 3 digits always suffices.
 
-Periodic tags coexist with on-demand `Op::snapshot` tags and
+Periodic tags coexist with on-demand `Op::capture_snapshot` tags and
 watchpoint-fire tags on the same bridge. Use
 [`SampleSeries::periodic_only`](temporal-assertions.md#sampleseries) (or
 `periodic_ref()` for the borrowed equivalent) to filter to the
@@ -70,8 +70,8 @@ periodic timeline before assertions.
 
 ## Capture cost
 
-Each periodic boundary fires the same `freeze_and_capture(false)`
-path that `Op::Snapshot` dispatches:
+Each periodic boundary fires the same `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })`
+path that `Op::CaptureSnapshot` dispatches:
 
 1. Every vCPU is parked under `FREEZE_RENDEZVOUS_TIMEOUT` (30 s
    hard ceiling).
@@ -137,7 +137,18 @@ consecutive rendezvous timeouts** and emits a `tracing::warn` naming
 the consecutive-timeout count, so a sustained host overload does
 not pile up dozens of placeholder samples.
 
-`Op::snapshot` captures composed by the test author land on the
+**Boundary deferral on missing prereqs.** Each periodic boundary
+also gates on `kern_virt_kaslr_published() && owned_accessor.is_some()`
+(the same prerequisites the cold-path ColdOp dispatch enforces).
+Under KASLR-on guests (the default) a boundary that would fire
+before the BSP MSR_LSTAR derive / guest-channel KERN_ADDRS publish
+lands is **deferred** to the next outer-loop iteration so the dump
+runs with the real KASLR slide instead of resolving per-CPU KVAs to
+wrong pages. Boundary anchor times are absolute and pause-adjusted,
+so deferral does not lose samples; the boundary fires once the
+publisher lands.
+
+`Op::capture_snapshot` captures composed by the test author land on the
 same bridge alongside the `periodic_NNN` tags; total bridge
 occupancy is `num_snapshots + user_captures` and the bridge
 FIFO-evicts past `MAX_STORED_SNAPSHOTS`.
@@ -148,15 +159,15 @@ The temporal-assertion pipeline runs on the **host**, so the drain
 happens after `vm.run()` returns — typically inside a `post_vm`
 callback. Use
 [`SnapshotBridge::drain_ordered_with_stats`](snapshots.md) to take
-ownership of the captured `(tag, report, stats, elapsed_ms)` tuples
-in insertion order:
+ownership of the captured entries in insertion order:
 
 ```rust,ignore
 use ktstr::prelude::*;
 
 fn post_vm(result: &VmResult) -> Result<()> {
-    let series = SampleSeries::from_drained(
+    let series = SampleSeries::from_drained_typed(
         result.snapshot_bridge.drain_ordered_with_stats(),
+        result.monitor.clone(),
     )
     .periodic_only();
 
@@ -177,13 +188,22 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-`drain_ordered_with_stats` returns a
-`Vec<(String, FailureDumpReport, Option<serde_json::Value>, Option<u64>)>`
-in the order `store()` saw inserts. Periodic boundaries land
-`periodic_000` first, `periodic_NNN` last. The FIFO eviction at
-`MAX_STORED_SNAPSHOTS` drops the oldest tags from `order` and
-`reports` together, so a hot run that overflowed the cap returns
-the most recent `MAX_STORED_SNAPSHOTS` captures in insertion order.
+`drain_ordered_with_stats` returns a `Vec<DrainedSnapshotEntry>` in
+the order `store()` saw inserts. Each entry exposes `tag` (`String`),
+`report` (`FailureDumpReport`), `stats` (`Result<serde_json::Value,
+MissingStatsReason>`), `elapsed_ms` (`Option<u64>`), and `step_index`
+(`Option<u16>` — the phase stamp, 0 = baseline, 1.. = step ordinal).
+Periodic boundaries land `periodic_000` first, `periodic_NNN` last.
+The FIFO eviction at `MAX_STORED_SNAPSHOTS` drops the oldest tags
+from `order` and `reports` together, so a hot run that overflowed
+the cap returns the most recent `MAX_STORED_SNAPSHOTS` captures in
+insertion order.
+
+`SampleSeries::from_drained_typed` is the production-path constructor
+that preserves the typed `stats` failure mode. `SampleSeries::from_drained`
+is a test-fixture convenience that takes the legacy tuple shape
+(`Vec<(String, FailureDumpReport, Option<serde_json::Value>, Option<u64>)>`)
+and collapses `None` stats to `MissingStatsReason::NoSchedulerBinary`.
 
 `drain_ordered` (without `_with_stats`) drops the parallel stats /
 elapsed metadata; use it only when the test does not need either.
@@ -200,7 +220,9 @@ for sample in series.iter_samples() {
     let tag: &str          = sample.tag;          // e.g. "periodic_001"
     let elapsed_ms: u64    = sample.elapsed_ms;   // ms since run_start
     let snap: Snapshot<'_> = sample.snapshot;     // BPF state view
-    let stats: Option<&serde_json::Value> = sample.stats; // scx_stats JSON
+    let stats: Result<&serde_json::Value, &MissingStatsReason>
+                           = sample.stats;         // typed scx_stats result
+    let step_index: Option<u16> = sample.step_index; // phase stamp (0=baseline, 1.. step ordinal)
     // ...
 }
 ```
@@ -213,10 +235,10 @@ the freeze rendezvous, so `elapsed_ms` reflects when the running
 scheduler's stats were observed; BPF state is observed up to
 `FREEZE_RENDEZVOUS_TIMEOUT` later than that anchor.
 
-`stats` is `None` when the stats client was not wired
-(`scheduler_binary` is absent), or the per-sample stats request
-failed (relay rejected, non-zero envelope errno, scheduler not yet
-listening). A `None` slot surfaces through
+`stats` is `Err(MissingStatsReason)` when the stats client was not
+wired (`scheduler_binary` is absent → `NoSchedulerBinary`), or the
+per-sample stats request failed (relay rejected, non-zero envelope
+errno, scheduler not yet listening). An `Err` slot surfaces through
 [`SampleSeries::stats`](temporal-assertions.md#projecting-from-scx_stats-json) as a
 `SnapshotError::MissingStats { tag }` per-sample error — distinct
 from in-JSON path misses so the assertion site can branch on the
