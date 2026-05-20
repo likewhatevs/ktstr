@@ -2422,10 +2422,9 @@ impl AssertResult {
     /// [`Self::info_notes`] entry through `tracing::info!` (so
     /// `--nocapture` + `RUST_LOG=ktstr=info` users see them, but
     /// default-noise-level runs stay quiet) and bail on any
-    /// accumulated failure. Returns the [`AssertResult`] back on
-    /// the success/skip path so callers can chain post-bail
-    /// inspection if needed; idiomatic post_vm usage discards it
-    /// with `?;`.
+    /// accumulated failure. Returns `Ok(())` on the success/skip
+    /// path — idiomatic post_vm usage chains `?` to propagate the
+    /// failure or continue.
     ///
     /// # Failure behavior
     ///
@@ -2455,7 +2454,7 @@ impl AssertResult {
     ///
     /// [`crate::assert::Verdict::into_anyhow_or_log`] is a thin
     /// wrapper for callers that hold a `Verdict` directly.
-    pub fn into_anyhow_or_log(self) -> anyhow::Result<Self> {
+    pub fn into_anyhow_or_log(self) -> anyhow::Result<()> {
         for note in &self.info_notes {
             tracing::info!(target: "ktstr::assert", "{}", note.message);
         }
@@ -2475,7 +2474,7 @@ impl AssertResult {
             };
             anyhow::bail!("{}", combined);
         }
-        Ok(self)
+        Ok(())
     }
     /// Append an informational annotation to [`Self::info_notes`].
     /// Does NOT alter the terminal verdict ([`Self::outcome`] is unaffected) — a note

@@ -1028,8 +1028,11 @@ fn into_anyhow_or_log_pass_arm_returns_ok_and_traces_notes() {
     v.note("observed cross_frac = 0.42");
     v.note("observed same_frac = 0.58");
     claim!(v, 10u64).at_least(5);
-    let r = v.into_anyhow_or_log().expect("pass arm returns Ok");
-    assert!(r.is_pass(), "AssertResult preserved on Ok path");
+    assert!(
+        v.result().is_pass(),
+        "setup must produce a pure-pass outcome so this test exercises the pass arm specifically (not the skip arm, which also routes to Ok)",
+    );
+    v.into_anyhow_or_log().expect("pass arm returns Ok");
     assert!(
         logs_contain("observed cross_frac = 0.42"),
         "first info_note must be traced via tracing::info!",
@@ -1132,8 +1135,10 @@ fn into_anyhow_or_log_skip_arm_returns_ok() {
     let mut v = Verdict::new();
     v.result_mut()
         .record_skip("irrelevant for this test config");
-    let r = v
-        .into_anyhow_or_log()
+    assert!(
+        v.result().is_skip(),
+        "setup must produce a skip-only outcome so this test exercises the skip arm specifically (not the pass arm, which also routes to Ok)",
+    );
+    v.into_anyhow_or_log()
         .expect("skip-only verdict returns Ok");
-    assert!(r.is_skipped(), "skip outcome preserved on Ok path");
 }

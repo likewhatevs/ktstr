@@ -303,7 +303,7 @@ impl Verdict {
     /// Use this to collapse a typical post_vm callback's terminal
     /// `let r = v.into_result(); … bail/log loop` boilerplate
     /// into a single chainable call.
-    pub fn into_anyhow_or_log(self) -> anyhow::Result<AssertResult> {
+    pub fn into_anyhow_or_log(self) -> anyhow::Result<()> {
         self.into_result().into_anyhow_or_log()
     }
 
