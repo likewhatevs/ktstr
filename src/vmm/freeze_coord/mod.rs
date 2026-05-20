@@ -6106,6 +6106,10 @@ impl KtstrVm {
                                     sdt_alloc_unavailable: Some(
                                         "dump prerequisites unavailable".to_string(),
                                     ),
+                                    // Partial dump path: no maps walked,
+                                    // so the struct_ops/scx_root matcher
+                                    // cannot identify an active obj.
+                                    active_obj_name: None,
                                 };
                                 tracing::warn!(
                                     owned_accessor = owned_accessor.is_some(),

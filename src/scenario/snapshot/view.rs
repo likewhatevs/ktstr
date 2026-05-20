@@ -305,7 +305,12 @@ impl<'a> Snapshot<'a> {
         if self.report.is_placeholder {
             return Err(SnapshotError::PlaceholderSnapshot { tag: None });
         }
-        // Group global-section maps by obj_name prefix.
+        // Group global-section maps by obj_name prefix. Same scan
+        // both code paths read: the principled-walker path checks
+        // `active_obj_name` against this set so a stale entry from a
+        // pre-swap capture window (active_obj_name resolved but its
+        // global-section maps no longer in the report) falls through
+        // to the heuristic + diagnostic.
         let mut obj_names: Vec<&'a str> = Vec::new();
         for m in &self.report.maps {
             if !is_global_section_map(&m.name) {
@@ -317,6 +322,21 @@ impl<'a> Snapshot<'a> {
             {
                 obj_names.push(obj);
             }
+        }
+        // Principled tiebreaker: when the freeze-coord captured a
+        // non-None `active_obj_name` via the struct_ops map ↔ scx_root
+        // KVA match (see [`crate::monitor::dump::FailureDumpReport::active_obj_name`]),
+        // prefer that even if multiple obj prefixes show up in
+        // `obj_names`. This is the resolution for the "swap left
+        // both old and new BPF objects' maps in the report" case
+        // the heuristic alone cannot disambiguate.
+        if let Some(active_name) = self.report.active_obj_name.as_deref()
+            && let Some(matched) = obj_names.iter().find(|obj| **obj == active_name).copied()
+        {
+            return Ok(Snapshot {
+                report: self.report,
+                active_obj: Some(matched),
+            });
         }
         match obj_names.as_slice() {
             [] => Err(SnapshotError::NoActiveScheduler {
@@ -331,9 +351,10 @@ impl<'a> Snapshot<'a> {
             multiple => Err(SnapshotError::NoActiveScheduler {
                 reason: format!(
                     "snapshot has {} BPF objects with global-section maps \
-                     ({:?}); without the principled *scx_root → owning BPF \
-                     object walker (tracked as #117), the framework cannot \
-                     identify which is currently attached — use \
+                     ({:?}) and the principled *scx_root walker could not \
+                     identify the active obj at capture time (scx_root \
+                     unresolved, no matching struct_ops map, or the matched \
+                     obj has no global-section maps in this capture) — use \
                      Snapshot::vars(name) to enumerate every copy or \
                      Snapshot::map(\"<obj>.<section>\") to address a specific \
                      scheduler's bss directly",

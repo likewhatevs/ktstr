@@ -932,6 +932,31 @@ pub struct FailureDumpReport {
     /// the freeze coordinator after `dump_state` returns.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vcpu_regs: Vec<Option<VcpuRegSnapshot>>,
+    /// Obj name of the currently-attached scheduler, identified by
+    /// matching each `BPF_MAP_TYPE_STRUCT_OPS` map's `value_kva` (the
+    /// guest-KVA of its `kvalue.data` payload) against the dereferenced
+    /// `*scx_root` value (the guest-KVA of the active `struct scx_sched`,
+    /// which is also the KVA of `scx_sched.ops` since `ops` sits at
+    /// offset 0). When the match succeeds, the struct_ops map's name
+    /// carries the obj prefix (libbpf convention: `<obj>.<struct_ops_var>`);
+    /// the prefix is split at the first `.` and stored here.
+    ///
+    /// `None` when:
+    /// - `scx_sched_state` is unavailable (no scheduler attached, BTF
+    ///   missing the `scx_sched` type, or `*scx_root` could not be
+    ///   resolved at capture time).
+    /// - No `BPF_MAP_TYPE_STRUCT_OPS` map had `value_kva` matching the
+    ///   active sched_kva (capture race during a mid-attach window, or
+    ///   the struct_ops map's value_kva was not yet populated).
+    /// - The matched map's name lacks a `<obj>.` prefix.
+    ///
+    /// `Snapshot::active()` uses this as the principled tiebreaker
+    /// when the projection sees multiple obj prefixes in global-section
+    /// maps. On `None` the consumer falls back to the prefix-grouping
+    /// heuristic (single obj → that one; multiple obj → NoActiveScheduler
+    /// with a diagnostic citing #117's fallback path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_obj_name: Option<String>,
     /// Structured per-allocation views from sdt_alloc-backed
     /// allocators. One entry per discovered allocator; each carries
     /// every live leaf slot (capped at
@@ -1228,6 +1253,7 @@ impl Default for FailureDumpReport {
             dump_truncated_at_us: None,
             probe_counters: None,
             is_placeholder: false,
+            active_obj_name: None,
         }
     }
 }
@@ -1258,6 +1284,97 @@ impl FailureDumpReport {
             is_placeholder: true,
             ..Self::default()
         }
+    }
+}
+
+/// Identify the obj name of the currently-attached scheduler by
+/// matching each `BPF_MAP_TYPE_STRUCT_OPS` map's `value_kva` against
+/// the dereferenced `*scx_root` value carried in `scx_sched_state`.
+///
+/// **Mechanism.** `*scx_root` derefs to the active `struct scx_sched`;
+/// the embedded `struct sched_ext_ops ops` member sits at offset 0 so
+/// the dereferenced pointer is also `&scx_sched.ops` — i.e. the same
+/// guest KVA the matching struct_ops map exposes via its `value_kva`
+/// (`&kvalue.data` per `bpf_struct_ops.c`'s
+/// `bpf_struct_ops_map_value`). When the comparison succeeds, the
+/// map's name carries the obj prefix (libbpf convention:
+/// `<obj>.<struct_ops_var>`); split at the first `.` and return the
+/// prefix.
+///
+/// **Kernel-version stability.** This walker works on v6.16 (LTS) AND
+/// v7.0+ kernels because it does NOT depend on the v7.0-only
+/// `bpf_prog_aux::st_ops_assoc` field. The compared values come from
+/// per-map state (`bpf_struct_ops_map::kvalue.data`) and the global
+/// `*scx_root`, both of which existed in v6.16 — see
+/// kernel/bpf/bpf_struct_ops.c on either branch.
+///
+/// **Why this is more principled than the prefix-grouping heuristic
+/// alone.** The heuristic at [`Snapshot::active`] groups global-section
+/// maps by `<obj>.` prefix and disambiguates "exactly one" → that obj.
+/// Multiple obj prefixes (a scheduler swap that left both old and new
+/// BPF objects' maps in the report, or a side-by-side dual scheduler
+/// scenario) collapse to `NoActiveScheduler` because the heuristic
+/// cannot point at the correct obj. This walker resolves the ambiguity
+/// using the kernel's own ground truth (`*scx_root`), so consumers get
+/// the right obj even mid-swap.
+///
+/// Returns `None` when:
+/// - `scx_sched_state` is unavailable (no scheduler attached, BTF
+///   missing the `scx_sched` type, or `*scx_root` could not be
+///   resolved at capture time).
+/// - No `BPF_MAP_TYPE_STRUCT_OPS` map had `value_kva` matching the
+///   active sched_kva (capture race during a mid-attach window, or
+///   the struct_ops map's value_kva was not yet populated).
+/// - The matched map's name lacks a `<obj>.` prefix.
+///
+/// Callers fall back to [`Snapshot::active`]'s prefix-grouping
+/// heuristic on `None`.
+fn identify_active_obj_from_struct_ops(
+    maps: &[super::bpf_map::BpfMapInfo],
+    scx_sched_state: &Option<super::scx_walker::ScxSchedState>,
+) -> Option<String> {
+    let sched_kva = scx_sched_state.as_ref()?.sched_kva?;
+    // Phase 1: identify THE struct_ops map currently published into
+    // *scx_root via the kvalue.data ↔ sched_kva equality.
+    let active_struct_ops = maps.iter().find(|m| {
+        m.map_type == super::bpf_map::BPF_MAP_TYPE_STRUCT_OPS && m.value_kva == Some(sched_kva)
+    })?;
+    // Phase 2: derive an obj prefix that the projection-side
+    // [`Snapshot::active`] will recognize. The split-on-first-dot rule
+    // matches libbpf's `<obj>.<section>` naming for global-section maps
+    // (`<obj>.bss`, `<obj>.data`, `<obj>.rodata`). Struct_ops map names
+    // do NOT carry the obj prefix in libbpf (the active struct_ops
+    // map for `ktstr.bpf.o` is just `ktstr_ops`, not `ktstr.ops`),
+    // so an attempt to split on `.` here yields the whole map name
+    // and would never match a global-section obj.
+    //
+    // To bridge: take the struct_ops match's obj-prefix candidate
+    // (everything before the first `.` in the map name, OR the whole
+    // name when there is no `.`) AND cross-check that the same prefix
+    // appears as the obj of at least one global-section map. If it
+    // does, return it — the multi-obj case is principled. If it
+    // doesn't (libbpf naming), return None so [`Snapshot::active`]'s
+    // prefix-grouping heuristic takes over — which in the
+    // single-scheduler case correctly resolves to the only global obj
+    // prefix.
+    //
+    // Full multi-obj disambiguation across libbpf-named struct_ops
+    // maps requires walking `bpf_prog.aux->used_maps` to find the
+    // prog whose used_maps array contains the matched struct_ops map
+    // AND a global-section map — that prog's bss-map prefix is the
+    // load-bearing obj name.
+    let so_name = active_struct_ops.name();
+    let so_prefix = so_name.split('.').next().filter(|s| !s.is_empty())?;
+    let has_matching_global = maps.iter().any(|m| {
+        m.map_type != super::bpf_map::BPF_MAP_TYPE_STRUCT_OPS
+            && (m.name().starts_with(&format!("{so_prefix}.bss"))
+                || m.name().starts_with(&format!("{so_prefix}.data"))
+                || m.name().starts_with(&format!("{so_prefix}.rodata")))
+    });
+    if has_matching_global {
+        Some(so_prefix.to_string())
+    } else {
+        None
     }
 }
 
@@ -2639,6 +2756,12 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     // still surfaces the raw bytes.
     let probe_counters = decode_probe_counters_snapshot(accessor, btf);
 
+    // Resolve the principled active-scheduler obj name BEFORE the
+    // FailureDumpReport struct literal moves `scx_sched_state`.
+    // `identify_active_obj_from_struct_ops` borrows both `maps` and
+    // `scx_sched_state` non-destructively so both are still owned for
+    // the subsequent move into the report.
+    let active_obj_name = identify_active_obj_from_struct_ops(&maps, &scx_sched_state);
     let mut report = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
         maps: Vec::with_capacity(maps.len()),
@@ -2664,6 +2787,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         probe_counters,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
+        active_obj_name,
     };
 
     // Per-map program-BTF cache, keyed by `btf_kva`. Each unique

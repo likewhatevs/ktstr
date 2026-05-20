@@ -84,6 +84,7 @@ fn synthetic_report() -> FailureDumpReport {
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
+        active_obj_name: None,
     }
 }
 

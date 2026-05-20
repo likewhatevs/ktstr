@@ -203,6 +203,7 @@ fn report_serde_roundtrip() {
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
+        active_obj_name: None,
     };
     let json = serde_json::to_string(&report).unwrap();
     let parsed: FailureDumpReport = serde_json::from_str(&json).unwrap();
@@ -320,6 +321,7 @@ fn failure_dump_report_serialization_is_infallible_for_max_synthetic_input() {
         probe_counters: Some(ProbeBssCounters::default()),
         scx_static_ranges: Default::default(),
         is_placeholder: false,
+        active_obj_name: None,
     };
 
     let result = serde_json::to_string(&report);
@@ -423,6 +425,7 @@ fn dual_failure_dump_report_serialization_is_infallible_for_max_synthetic_input(
             probe_counters: Some(ProbeBssCounters::default()),
             scx_static_ranges: Default::default(),
             is_placeholder: false,
+            active_obj_name: None,
         }
     }
 
@@ -590,6 +593,7 @@ fn report_display_one_map_with_value() {
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
+        active_obj_name: None,
     };
     let out = format!("{report}");
     // Map header line.
@@ -629,6 +633,7 @@ fn report_display_multiple_maps_separated() {
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
+        active_obj_name: None,
     };
     let out = format!("{report}");
     // Maps separated by a blank line (\n\n).
@@ -749,6 +754,7 @@ fn report_display_includes_vcpu_regs_section() {
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
+        active_obj_name: None,
     };
     let out = format!("{report}");
     // Section header.
@@ -793,6 +799,7 @@ fn report_display_pairs_maps_and_vcpu_regs_with_blank_line() {
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
+        active_obj_name: None,
     };
     let out = format!("{report}");
     // Map block, blank line, vcpu_regs section.
@@ -826,6 +833,7 @@ fn report_display_empty_with_only_vcpu_regs_does_not_say_empty_dump() {
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
+        active_obj_name: None,
     };
     let out = format!("{report}");
     assert_eq!(out, "vcpu_regs:\n  vcpu 0: <unavailable>");
@@ -874,6 +882,7 @@ fn report_display_partial_with_populated_regs_and_empty_maps() {
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
+        active_obj_name: None,
     };
 
     // (a) Display: vcpu_regs section present, no fallback.
@@ -938,6 +947,7 @@ fn dual_report_serde_roundtrip_with_early() {
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
+        active_obj_name: None,
     };
     let late = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
@@ -962,6 +972,7 @@ fn dual_report_serde_roundtrip_with_early() {
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
+        active_obj_name: None,
     };
     let dual = DualFailureDumpReport {
         schema: SCHEMA_DUAL.to_string(),
@@ -1485,6 +1496,7 @@ fn prog_runtime_stats_serde_roundtrip_with_saturation() {
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
+        active_obj_name: None,
     };
     let json = serde_json::to_string(&report).expect("serialize");
     let parsed: FailureDumpReport = serde_json::from_str(&json).expect("deserialize");
@@ -1557,6 +1569,7 @@ fn report_display_renders_prog_runtime_stats() {
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
+        active_obj_name: None,
     };
     let out = format!("{report}");
     assert!(
@@ -1608,6 +1621,7 @@ fn report_display_only_prog_runtime_stats_does_not_say_empty_dump() {
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
+        active_obj_name: None,
     };
     let out = format!("{report}");
     assert!(
