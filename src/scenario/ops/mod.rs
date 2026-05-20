@@ -593,13 +593,13 @@ pub fn execute_steps_with(
 /// the scenario's per-knob writes to land.
 ///
 /// Mapping:
-/// - [`CgroupDef::cpuset`] / [`CgroupDef::cpuset_mems`] → [`Controller::Cpuset`]
-/// - [`CgroupDef::cpu`] → [`Controller::Cpu`]
-/// - [`CgroupDef::memory`] → [`Controller::Memory`]
-/// - [`CgroupDef::pids`] → [`Controller::Pids`]
-/// - [`CgroupDef::io`] → [`Controller::Io`]
+/// - [`CgroupDef::cpuset`] / [`CgroupDef::cpuset_mems`] → `Controller::Cpuset`
+/// - [`CgroupDef::cpu`] → `Controller::Cpu`
+/// - [`CgroupDef::memory`] → `Controller::Memory`
+/// - [`CgroupDef::pids`] → `Controller::Pids`
+/// - [`CgroupDef::io`] → `Controller::Io`
 /// - [`Op::SetCpuset`] / [`Op::ClearCpuset`] / [`Op::SwapCpusets`] /
-///   [`Op::SetAffinity`] → [`Controller::Cpuset`]
+///   [`Op::SetAffinity`] → `Controller::Cpuset`
 /// - Every other [`Op`] variant ([`Op::FreezeCgroup`],
 ///   [`Op::AddCgroup`], [`Op::SpawnWorkers`], [`Op::MoveAllTasks`], etc.)
 ///   touches cgroup-core knobs (`cgroup.freeze`, `cgroup.procs`,
@@ -2797,15 +2797,18 @@ fn apply_ops(
                     if crate::vmm::guest_comms::is_guest() {
                         if SNAPSHOT_TRANSPORT_DEAD.load(Ordering::Relaxed) {
                             // A prior request observed a transport
-                            // failure. Skip the 30 s host-reply wait
-                            // — the latch only flips on
-                            // TransportError, so the host-side
-                            // coordinator is unreachable until the
-                            // process restarts.
-                            tracing::warn!(
-                                name = %name,
-                                "Op::CaptureSnapshot: snapshot transport latched dead; skipping host \
-                                 request to avoid the 30 s timeout per attempt"
+                            // failure. The host-side coordinator is
+                            // unreachable until the process restarts.
+                            // Fail loud: returning Ok here would
+                            // silently mask a structural transport
+                            // loss — tests would pass with no
+                            // captured snapshot. Bail with a typed
+                            // reason instead.
+                            anyhow::bail!(
+                                "Op::CaptureSnapshot('{name}'): snapshot transport latched dead; \
+                                 a prior request observed TransportError and the latch only flips \
+                                 on transport failure (host-side coordinator unreachable until \
+                                 process restart)"
                             );
                         } else {
                             let timeout = std::time::Duration::from_secs(30);
@@ -2881,10 +2884,16 @@ fn apply_ops(
                     None => {
                         if crate::vmm::guest_comms::is_guest() {
                             if SNAPSHOT_TRANSPORT_DEAD.load(Ordering::Relaxed) {
-                                tracing::warn!(
-                                    symbol = %symbol,
-                                    "Op::WatchSnapshot: snapshot transport latched dead; skipping \
-                                     host request to avoid the 30 s timeout per attempt"
+                                // Fail loud: returning Ok here would
+                                // silently mask a structural transport
+                                // loss — a WatchSnapshot that never
+                                // arms looks identical to a healthy
+                                // passing run.
+                                anyhow::bail!(
+                                    "Op::WatchSnapshot('{symbol}'): snapshot transport latched \
+                                     dead; a prior request observed TransportError and the latch \
+                                     only flips on transport failure (host-side coordinator \
+                                     unreachable until process restart)"
                                 );
                             } else {
                                 let timeout = std::time::Duration::from_secs(30);
@@ -3074,7 +3083,7 @@ fn build_kernel_op_request(
 /// Convert an Op-side `(KernelTarget, KernelValue)` write batch into
 /// the wire-side [`crate::vmm::wire::KernelOpEntry`] list, using the
 /// `From<&KernelTarget>` / `From<&KernelValue>` impls in
-/// [`super::types::op`] for the 1:1 enum mapping.
+/// `super::types::op` for the 1:1 enum mapping.
 fn write_entries_from_writes(
     writes: &[(KernelTarget, KernelValue)],
 ) -> Vec<crate::vmm::wire::KernelOpEntry> {

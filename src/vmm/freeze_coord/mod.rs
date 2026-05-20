@@ -321,7 +321,7 @@ pub(super) fn vcpu_none_indices(
 ///   renders ` (atomic write failed; see preceding warn)` so the
 ///   operator knows to scroll up for the warn carrying the underlying
 ///   `io::Error`. The preceding warn fires at the and_then Err arm
-///   in both [`emit_json`]-class closures.
+///   in both `emit_json`-class closures.
 /// - `(None, false)` — operator never wired `failure_dump_path`;
 ///   renders ` (no file sink)` — the quiet expected-behavior case
 ///   for verifier/shell/template builders.
@@ -587,17 +587,17 @@ pub(super) fn write_to_tagged_path(
 /// of conflating "aborted with reason worth recording" and
 /// "legit no-dump suppression" into a single `None`:
 ///
-/// - [`Self::Captured`] — full dump assembled; emit as
+/// - `Self::Captured` — full dump assembled; emit as
 ///   [`crate::monitor::dump::SCHEMA_SINGLE`] (or wrapped into
 ///   [`crate::monitor::dump::SCHEMA_DUAL`] by the dual-snapshot path).
-/// - [`Self::Degraded`] — trigger fired but capture aborted in a way
+/// - `Self::Degraded` — trigger fired but capture aborted in a way
 ///   the operator needs to see (rendezvous timed out, etc.). Carries a
 ///   pre-built [`crate::monitor::dump::DegradedFailureDumpReport`] for
 ///   immediate emission via the
 ///   [`crate::monitor::dump::SCHEMA_DEGRADED`] schema. Per memory
 ///   `feedback_no_silent_drops`: the trigger fired, an operator must
 ///   see something — the degraded JSON IS that something.
-/// - [`Self::Suppressed`] — exit_kind gate decided the trigger was a
+/// - `Self::Suppressed` — exit_kind gate decided the trigger was a
 ///   benign init / teardown write (kind &lt; SCX_EXIT_ERROR) and the
 ///   BPF `.bss` latch agreed it was not an error. Legit "no dump
 ///   needed" — no JSON emitted. The watchpoint hit flag is reset and
@@ -1967,6 +1967,12 @@ impl KtstrVm {
         // wins; second observes its own derivation match the
         // existing slot value).
         let kern_virt_kaslr_for_bsp = kern_virt_kaslr.clone();
+        // Clone the publish-EventFd for the BSP MSR_LSTAR-derive path
+        // (mirrors the KERN_ADDRS-side write at dispatch.rs:427) so
+        // both publishers signal the same eventfd on successful CAS.
+        // No production consumer epolls this fd today, but the
+        // asymmetry would foot-gun a future change that does.
+        let kern_virt_kaslr_evt_for_bsp = kern_virt_kaslr_evt.clone();
         // Effective rendezvous-wait deadline shared by the worker-park
         // and post-thaw barriers downstream. Downstream comments
         // reference `FREEZE_RENDEZVOUS_TIMEOUT` (the 30 s const) as
@@ -2175,6 +2181,22 @@ impl KtstrVm {
                     kern_virt_kaslr
                         .load(std::sync::atomic::Ordering::Acquire)
                         .saturating_sub(1)
+                };
+                // True once the publisher (MSR_LSTAR readback or
+                // KERN_ADDRS chain) has written a `+1`-biased value
+                // — including the biased-0 (raw = 1) write under
+                // `nokaslr` where the actual offset is 0. The raw
+                // atomic distinguishes "unpublished" (load == 0)
+                // from "published as 0" (load == 1, decoded as 0);
+                // [`coord_kaslr_offset`] cannot since both decode
+                // to 0. Defer/drain gates that ask "has the publish
+                // chain landed?" — independent of slide value —
+                // must use this predicate, not the value getter,
+                // otherwise `kaslr = false` test runs defer forever
+                // (the publish DOES land with value 0; the gate keeps
+                // seeing offset == 0 and re-defers).
+                let kern_virt_kaslr_published = || -> bool {
+                    kern_virt_kaslr.load(std::sync::atomic::Ordering::Acquire) != 0
                 };
                 // Spawn the accessor-init worker before entering the
                 // coordinator's epoll loop. The worker:
@@ -6585,8 +6607,10 @@ impl KtstrVm {
                     // Drain WATCH requests deferred during the
                     // pre-KASLR / pre-accessor window once BOTH
                     // inputs are ready (kern_virt_kaslr Arc has
-                    // published a non-zero offset AND
-                    // owned_accessor has been adopted). Without
+                    // PUBLISHED — including the biased-zero CAS
+                    // under nokaslr where the actual slide is 0
+                    // but the raw atomic is 1 — AND owned_accessor
+                    // has been adopted). Without
                     // this drain, a WATCH request deferred for
                     // either reason would sit in
                     // `capture_requests_deferred` indefinitely
@@ -6601,7 +6625,7 @@ impl KtstrVm {
                     // care about accessor adoption and continue
                     // through the dedicated accessor-adoption
                     // drain path.
-                    if coord_kaslr_offset() != 0
+                    if kern_virt_kaslr_published()
                         && owned_accessor.is_some()
                         && !capture_requests_deferred.is_empty()
                     {
@@ -6841,7 +6865,7 @@ impl KtstrVm {
                                     .queue_input_port1(&reply);
                             }
                             crate::vmm::wire::SNAPSHOT_KIND_WATCH => {
-                                if coord_kaslr_offset() == 0
+                                if !kern_virt_kaslr_published()
                                     || owned_accessor.is_none()
                                 {
                                     // WATCH arms a DR against
@@ -6868,18 +6892,19 @@ impl KtstrVm {
                                     //     with no real data.
                                     // Defer on either; the
                                     // per-iteration drain above (which
-                                    // gates on coord_kaslr_offset() !=
-                                    // 0) AND the accessor-adoption
+                                    // gates on kern_virt_kaslr_published()
+                                    // — true post-publish even under
+                                    // nokaslr) AND the accessor-adoption
                                     // drain at the accessor-arrival
                                     // site both feed the deferred
                                     // queue back into pending.
                                     tracing::info!(
                                         request_id,
                                         %tag,
-                                        kaslr_resolved = coord_kaslr_offset() != 0,
+                                        kaslr_published = kern_virt_kaslr_published(),
                                         accessor_adopted = owned_accessor.is_some(),
                                         "freeze-coord: TLV WATCH deferred \
-                                         (kaslr_offset or owned_accessor not yet resolved)"
+                                         (kern_virt_kaslr or owned_accessor not yet published)"
                                     );
                                     capture_requests_deferred.push(SnapshotRequest {
                                         request_id,
@@ -7040,7 +7065,7 @@ impl KtstrVm {
                     // Re-queue the deferred list onto pending so
                     // this iteration's normal dispatch path runs
                     // with both prerequisites in place.
-                    if coord_kaslr_offset() != 0
+                    if kern_virt_kaslr_published()
                         && owned_accessor.is_some()
                         && !kernel_op_requests_deferred.is_empty()
                     {
@@ -7072,9 +7097,7 @@ impl KtstrVm {
                         // the same iteration body's drain dispatches
                         // them through the normal flow with the
                         // accessor present.
-                        if owned_accessor.is_none()
-                            || coord_kaslr_offset() == 0
-                        {
+                        if owned_accessor.is_none() || !kern_virt_kaslr_published() {
                             // ColdOp dispatch resolves per-CPU /
                             // task-field / symbol KVAs via
                             // `per_cpu_kva = template + kaslr_offset`
@@ -7087,23 +7110,30 @@ impl KtstrVm {
                             //     arm in freeze_and_dispatch hits the
                             //     defensive "owned_accessor not yet
                             //     initialised" reply branch.
-                            //   - coord_kaslr_offset() == 0 against a
-                            //     KASLR-on guest: the resolved per_cpu
-                            //     _kva falls on the link-time KVA and
-                            //     trips the kernel-half-floor check
-                            //     in resolve_per_cpu_field_pa (Step
-                            //     4 F hardening at L613 of
-                            //     kernel_op_dispatch.rs).
+                            //   - !kern_virt_kaslr_published(): the
+                            //     publish chain hasn't landed yet
+                            //     (raw atomic still 0). Under a
+                            //     KASLR-on guest dispatching now
+                            //     would resolve per_cpu_kva on the
+                            //     link-time KVA and trip the
+                            //     kernel-half-floor check in
+                            //     resolve_per_cpu_field_pa. Under
+                            //     nokaslr the publisher still fires
+                            //     (with biased-zero) so the gate
+                            //     unblocks quickly; the check
+                            //     correctly distinguishes "publish
+                            //     incomplete" from "publish complete
+                            //     with offset 0".
                             // Same pattern as the WATCH-deferral at
-                            // L6664-6680; defer + drain when both
+                            // L6864-6900; defer + drain when both
                             // prerequisites land.
                             tracing::info!(
                                 request_id = req.request_id,
                                 tag = %req.tag,
-                                kaslr_resolved = coord_kaslr_offset() != 0,
+                                kaslr_published = kern_virt_kaslr_published(),
                                 accessor_adopted = owned_accessor.is_some(),
                                 "freeze-coord: ColdOp deferred \
-                                 (owned_accessor or kaslr_offset not yet resolved)"
+                                 (owned_accessor or kern_virt_kaslr not yet published)"
                             );
                             kernel_op_requests_deferred.push(req);
                             continue;
@@ -9497,6 +9527,7 @@ impl KtstrVm {
                     &cr3_cache,
                     &timed_out_flag,
                     &kern_virt_kaslr_for_bsp,
+                    &kern_virt_kaslr_evt_for_bsp,
                     entry_syscall_64_link_kva,
                 )
             },
@@ -9907,7 +9938,7 @@ impl KtstrVm {
     /// Start the monitor thread if vmlinux is available.
     ///
     /// `probes_ready_evt` is the broadcast EventFd shared with the
-    /// bpf-map-write thread (see [`run_vm`]); the slot-1 wait below
+    /// bpf-map-write thread (see `run_vm`); the slot-1 wait below
     /// `poll`s it instead of bare-sleeping, and writes 1 to it on
     /// detection so any other waiter blocked in `poll` wakes
     /// immediately and re-checks its own readiness condition.
@@ -10742,7 +10773,7 @@ impl KtstrVm {
     ///    blocks on that latch until this thread fires.
     ///
     /// `probes_ready_evt` is the broadcast EventFd shared with the
-    /// monitor thread (see [`run_vm`]); each phase below `poll`s it
+    /// monitor thread (see `run_vm`); each phase below `poll`s it
     /// instead of bare-sleeping, and writes 1 to it on detection so
     /// the monitor (and any future waiter) wakes immediately to
     /// re-check its own readiness condition.
@@ -11054,6 +11085,10 @@ impl KtstrVm {
         // this path — the guest-channel publisher is the sole
         // source on aarch64.
         kern_virt_kaslr_shared: &Arc<std::sync::atomic::AtomicU64>,
+        // EventFd fired when the BSP MSR_LSTAR-derive publishes a
+        // non-zero biased value to `kern_virt_kaslr_shared`. Mirror
+        // of the KERN_ADDRS-path publish at `dispatch.rs`.
+        kern_virt_kaslr_evt: &EventFd,
         // Link-time KVA of `entry_SYSCALL_64` from vmlinux. Passed
         // through to `msr_kaslr::read_and_derive` so the BSP
         // MSR_LSTAR readback can compute the offset. `0` on
@@ -11194,13 +11229,23 @@ impl KtstrVm {
                 && kern_virt_kaslr_shared.load(Ordering::Acquire) == 0
                 && let Ok(offset) =
                     crate::vmm::x86_64::msr_kaslr::read_and_derive(bsp, entry_syscall_64_link_kva)
+                && kern_virt_kaslr_shared
+                    .compare_exchange(
+                        0,
+                        offset.wrapping_add(1),
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
             {
-                let _ = kern_virt_kaslr_shared.compare_exchange(
-                    0,
-                    offset.wrapping_add(1),
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                );
+                // Mirror the KERN_ADDRS-path evt fire at
+                // dispatch.rs:427 so any future epoll-on-publish
+                // consumer (none today, but the eventfd is in
+                // the run-loop fdset and the asymmetry would
+                // foot-gun a future change). No-op on signal-fd
+                // write failure — the atomic is the
+                // load-bearing publication.
+                let _ = kern_virt_kaslr_evt.write(1);
             }
             // On aarch64 MSR_LSTAR has no equivalent so the BSP
             // path is unavailable; the guest-channel KERN_ADDRS

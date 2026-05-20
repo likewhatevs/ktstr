@@ -492,7 +492,7 @@ pub const MSG_TYPE_KERN_ADDRS: u32 = 0x4b41_4452; // "KADR"
 ///   - [`Self::from_payload`]: decodes a 24-byte payload, strips
 ///     the +1 bias on the biased slots, validates the length. Used
 ///     by the host dispatch arm in
-///     [`crate::vmm::freeze_coord::dispatch::dispatch_bulk_message`].
+///     `crate::vmm::freeze_coord::dispatch::dispatch_bulk_message`.
 ///
 /// Field semantics:
 ///   - `phys_base = 0` is a legitimate KASLR-off value (the
@@ -788,8 +788,18 @@ pub const SNAPSHOT_TAG_MAX: usize = 64;
 
 /// Maximum length, in bytes, of a host-supplied reason string carried
 /// inside the [`SnapshotReplyPayload`]. Same semantics as the tag
-/// buffer (NUL-terminated when shorter, truncated when longer).
-pub const SNAPSHOT_REASON_MAX: usize = 64;
+/// buffer (NUL-terminated when shorter, truncated when longer). Sized
+/// to hold typed-Err diagnostics that name the failing condition
+/// (e.g. `kaslr_offset == 0`, `kern_virt_kaslr` Arc state) PLUS the
+/// failing symbol + KVA PLUS the actionable remediation tip (e.g.
+/// `set #[ktstr_test(kaslr = false)]`). The longest such diagnostic
+/// today — Fix C's high-half/zero-offset rejection at
+/// [`crate::vmm::freeze_coord::snapshot::arm_user_watchpoint`] — is
+/// ~343 bytes when rendered with a typical symbol + KVA; 512 gives
+/// ~170 bytes of headroom for future diagnostics. The original
+/// 64-byte buffer and an intermediate 256-byte size both truncated
+/// this message before the remediation tail.
+pub const SNAPSHOT_REASON_MAX: usize = 512;
 
 /// Snapshot request kind: no request pending. Used as the sentinel
 /// value for an uninitialised request slot (this discriminant must
@@ -875,7 +885,7 @@ pub struct SnapshotRequestPayload {
 const _SNAPSHOT_REQUEST_PAYLOAD_SIZE: () =
     assert!(std::mem::size_of::<SnapshotRequestPayload>() == 8 + SNAPSHOT_TAG_MAX);
 
-/// Snapshot reply payload (72 bytes).
+/// Snapshot reply payload (520 bytes: `u32 request_id + u32 status + [u8; 512] reason`).
 ///
 /// Sent host→guest as the payload of a [`MsgType::SnapshotReply`]
 /// frame on virtio-console port 1 RX. Mirrors the request layout —
@@ -929,7 +939,7 @@ pub enum KernelOpDirection {
     /// success/error and the per-write byte count.
     Write,
     /// Read: `values` is empty; reply carries the bytes read into
-    /// [`KernelOpReplyPayload::read_value`].
+    /// `KernelOpReplyPayload::read_values`.
     Read,
 }
 

@@ -417,19 +417,33 @@ fn kaslr_off_watch_snapshot_jiffies_64_errs(ctx: &Ctx) -> Result<AssertResult> {
         vec![Op::watch_snapshot("jiffies_64")],
         HoldSpec::FULL,
     )];
-    let res = execute_steps(ctx, steps);
+    // execute_steps wraps step-level errors into Ok(failed_AssertResult)
+    // via run_scenario's err→stamped-fail conversion at
+    // src/scenario/ops/mod.rs:939-955. Match the canonical pattern
+    // pinned in tests/snapshot_e2e.rs (watch_snapshot_op_unresolvable_
+    // symbol_bails_immediately): unwrap Ok, assert is_fail(), grep the
+    // recorded detail for the typed diagnostic substring.
+    let result = execute_steps(ctx, steps)
+        .expect("execute_steps returns Ok with stamped error under kaslr=false");
     anyhow::ensure!(
-        res.is_err(),
-        "expected Err under kaslr=false for high-half symbol jiffies_64 \
-         — Fix C (snapshot.rs:316-345) did not promote silent-misfire \
-         to Err. Pre-Fix-C arms at link-kva silently; post-Fix-C must \
-         Err."
+        result.is_fail(),
+        "expected stamped failure under kaslr=false for high-half symbol \
+         jiffies_64 — snapshot.rs did not promote silent-misfire to Err. \
+         Without the promotion the arm path would silently arm at the \
+         link-KVA and never fire."
     );
-    let err_string = res.unwrap_err().to_string();
+    let messages: Vec<String> = result
+        .failure_details()
+        .map(|d| d.message.clone())
+        .collect();
     anyhow::ensure!(
-        err_string.contains("kaslr_offset") || err_string.contains("kern_virt_kaslr"),
+        messages
+            .iter()
+            .any(|m| { m.contains("kaslr_offset") || m.contains("kern_virt_kaslr") }),
         "Err message does not cite the kaslr_offset/kern_virt_kaslr \
-         diagnostic — Fix C's typed Err format drifted. Got: '{err_string}'"
+         diagnostic — the typed Err format in snapshot.rs drifted. \
+         Recorded details: {:?}",
+        messages,
     );
     Ok(AssertResult::pass())
 }

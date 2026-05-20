@@ -1348,9 +1348,11 @@ impl KtstrVm {
             // Interactive shell does not run the monitor/dump
             // pipeline that consumes the virt-KASLR offset, so the
             // BSP loop's MSR_LSTAR derive has no consumer. Pass a
-            // throwaway Arc (never read by any thread) and a 0
-            // link KVA to short-circuit the derive attempt.
+            // throwaway Arc + EventFd (never read by any thread)
+            // and a 0 link KVA to short-circuit the derive attempt.
             &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            &vmm_sys_util::eventfd::EventFd::new(0)
+                .expect("eventfd for interactive-shell kern_virt_kaslr publish"),
             0,
         );
 

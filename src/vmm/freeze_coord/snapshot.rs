@@ -31,7 +31,7 @@ use super::state::SnapshotRequest;
 use crate::vmm::x86_64::msr_kaslr::KERNEL_HALF_CANONICAL_4LEVEL;
 
 /// Frame a `MSG_TYPE_SNAPSHOT_REPLY` TLV — header (16 bytes) plus
-/// [`crate::vmm::wire::SnapshotReplyPayload`] (72 bytes) — into a
+/// [`crate::vmm::wire::SnapshotReplyPayload`] (520 bytes) — into a
 /// single buffer the coordinator pushes through
 /// [`crate::vmm::virtio_console::VirtioConsole::queue_input_port1`].
 /// The reply is delivered atomically as one TLV: the buffer is

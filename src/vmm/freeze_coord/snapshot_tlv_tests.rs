@@ -111,8 +111,8 @@ fn decode_full_buffer_tag_uses_full_length() {
     assert!(req.tag.chars().all(|c| c == 'a'));
 }
 
-/// Reply frame is exactly header + 72-byte payload; CRC32
-/// over payload bytes matches the wire-format contract
+/// Reply frame is exactly header + `size_of::<SnapshotReplyPayload>()`;
+/// CRC32 over payload bytes matches the wire-format contract
 /// `parse_tlv_stream` enforces on the guest side.
 #[test]
 fn frame_reply_size_and_crc() {
@@ -170,4 +170,54 @@ fn frame_reply_empty_reason_zero_pads() {
     let payload_bytes = &bytes[FRAME_HEADER_SIZE..];
     let reply = SnapshotReplyPayload::read_from_bytes(payload_bytes).expect("payload decodes");
     assert!(reply.reason.iter().all(|&b| b == 0));
+}
+
+/// Pin three load-bearing substrings of the cold-path "kaslr_offset
+/// == 0 but link_kva is high-half" diagnostic (Fix C at
+/// `freeze_coord/snapshot.rs:316-362`) survive the wire round-trip
+/// without truncation:
+///   - `kaslr_offset` and `kern_virt_kaslr` — the WHY the e2e test
+///     `kaslr_off_watch_snapshot_jiffies_64_errs` greps for to verify
+///     Fix C's typed-Err path fired (not the silent-arm regression).
+///   - `#[ktstr_test(kaslr = false)]` — the actionable remediation
+///     tip the test author needs to see when they trip this rejection.
+///
+/// At the original 64-byte `SNAPSHOT_REASON_MAX` all three substrings
+/// landed past the cut and the e2e failed on truncation rather than
+/// on Fix C semantics. An intermediate 256-byte size fit the WHY
+/// substrings but still truncated the remediation tail. 512 fits
+/// the full rendered diagnostic with headroom. This test guards the
+/// diagnostic capacity from sliding back.
+#[test]
+fn frame_reply_preserves_fix_c_diagnostic_substrings() {
+    let fix_c = "symbol 'jiffies_64' link_kva 0xffffffff812d2000 is in \
+                 x86_64 kernel high-half but kern_virt_kaslr Arc has not \
+                 published a non-zero slide (coord_kaslr_offset() == 0); \
+                 refusing to arm DR at link-time KVA — would never match \
+                 guest writes under KASLR-on. If nokaslr semantics intended, \
+                 set `#[ktstr_test(kaslr = false)]`.";
+    let bytes = frame_snapshot_reply(1, SNAPSHOT_STATUS_ERR, fix_c);
+    let payload_bytes = &bytes[FRAME_HEADER_SIZE..];
+    let reply = SnapshotReplyPayload::read_from_bytes(payload_bytes).expect("payload decodes");
+    let len = reply
+        .reason
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(SNAPSHOT_REASON_MAX);
+    let s = std::str::from_utf8(&reply.reason[..len]).expect("Fix C diagnostic is valid UTF-8");
+    assert!(
+        s.contains("kaslr_offset"),
+        "diagnostic lost 'kaslr_offset' substring; \
+         tests/kaslr_axis_e2e.rs greps for it (recorded reason: {s:?})"
+    );
+    assert!(
+        s.contains("kern_virt_kaslr"),
+        "diagnostic lost 'kern_virt_kaslr' substring; \
+         tests/kaslr_axis_e2e.rs greps for it (recorded reason: {s:?})"
+    );
+    assert!(
+        s.contains("#[ktstr_test(kaslr = false)]"),
+        "diagnostic lost the actionable remediation tip; \
+         test author would not know how to unblock (recorded reason: {s:?})"
+    );
 }
