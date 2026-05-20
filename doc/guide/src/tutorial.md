@@ -74,6 +74,9 @@ fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
+`let _ = ctx;` is just a placeholder so the unused-variable lint
+stays quiet at the skeleton stage; Step 2 onward uses `ctx`.
+
 > **Try it.** Once this file compiles, run just this test with
 > `cargo ktstr test --kernel ../linux -- -E 'test(mixed_workloads)'`.
 > A bare-skeleton test passes immediately — the rest of the tutorial
@@ -256,7 +259,7 @@ the last phase ends the loop restarts from `first`. Phases:
 `WorkPhase::AluHot { width: AluWidth, duration: Duration }`. Use the
 `WorkType::sequence(first, rest)` constructor.
 
-`Phase`, `WorkType`, `CpusetSpec`, and `AluWidth` are all in
+`WorkPhase`, `WorkType`, `CpusetSpec`, and `AluWidth` are all in
 `ktstr::prelude::*`; only `std::time::Duration` needs an extra
 `use` line — added on the first line of the example below:
 
@@ -312,16 +315,16 @@ longer / heavier runs:
 | Attribute | Default | What it does |
 |---|---|---|
 | `duration_s` | `2` | Per-scenario wall-clock seconds. The framework keeps both cgroups running for `duration_s` seconds, then signals workers to stop and collects reports. |
-| `watchdog_timeout_s` | `4` | sched_ext watchdog fire threshold. Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels and the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override silently no-ops. |
+| `watchdog_timeout_s` | `4` | sched_ext watchdog fire threshold. Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels and the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override logs a `tracing::warn!` and continues without overriding. |
 | `memory_mib` | `2048` | VM memory in MiB. |
 
 `watchdog_timeout_s` is sched_ext's per-task stall threshold — if
 a runnable task is not picked for `watchdog_timeout_s` seconds,
 the scheduler exits with `SCX_EXIT_ERROR_STALL`. The scenario
-duration and watchdog are independent; a 12 s scenario with a 5 s
+duration and watchdog are independent; a 12 s scenario with a 4 s
 watchdog is normal. Tune the watchdog only when the scheduler
 under test is expected to legitimately leave a runnable task
-parked longer than the default 5 s.
+parked longer than the default 4 s.
 
 For the run we're building, set the duration to 20 s (so each
 phase iteration repeats many times):
@@ -345,8 +348,13 @@ topology constraints, etc.), see
 
 ## Step 7: Add assertions
 
-Default checks already run with no configuration -- `not_starved` is
-`Some(true)` in `Assert::default_checks()`, which enables:
+Every check is opt-in. `Assert::default_checks()` returns
+`Assert::NO_OVERRIDES` — every threshold field is `None` and
+nothing fails the test until you turn a check on (either at the
+scheduler level via `declare_scheduler! { assert: ... }` or on
+the per-test `#[ktstr_test]` attribute). The first check to
+opt into is `not_starved = true`, which turns on three related
+worker-level checks together:
 
 - **Starvation** -- any worker with zero work units fails the test.
 - **Fairness spread** -- per-cgroup `max(off-CPU%) - min(off-CPU%)`
@@ -360,10 +368,14 @@ Default checks already run with no configuration -- `not_starved` is
   `cfg!(debug_assertions)` gate as spread).
 
 Host-side monitor checks (imbalance ratio, DSQ depth, stall
-detection, fallback / keep-last event rates) are also enabled by
-default with thresholds from `MonitorThresholds::new()`.
+detection, fallback / keep-last event rates) walk every sample
+and record violations in the verdict details, but the default
+`enforce_monitor_thresholds = false` keeps them report-only.
+Set `enforce_monitor_thresholds = true` (or override individual
+thresholds from `MonitorThresholds::new()`) to make them gate
+the test result.
 
-Cpuset isolation is **opt-in** -- enable it with `isolation = true`.
+Cpuset isolation is also opt-in -- enable it with `isolation = true`.
 Override the spread threshold and add throughput-parity gates:
 
 ```rust,ignore
@@ -377,6 +389,7 @@ use ktstr::prelude::*;
     threads = 1,
     duration_s = 20,
     isolation = true,
+    not_starved = true,
     max_spread_pct = 20.0,
     max_throughput_cv = 0.5,
     min_work_rate = 1.0,
@@ -402,11 +415,15 @@ What each new attribute gates:
 
 - `isolation = true` -- workers must only run on CPUs in their
   assigned cpuset; any execution on an unexpected CPU fails the test.
-- `max_spread_pct = 20.0` -- per-cgroup fairness override (the
-  release default is 15.0; this loosens it slightly to absorb noise
-  from the phased worker's yield-driven re-placement). Bare
-  `max_spread_pct = 15.0` would silently match the default and have
-  no observable effect.
+- `not_starved = true` -- enables the starvation/spread/gap trio
+  described above. Without this the next three threshold overrides
+  are parsed but never compared.
+- `max_spread_pct = 20.0` -- per-cgroup fairness override on the
+  threshold the spread check evaluates against. The release default
+  evaluated by the check is 15.0; this loosens it slightly to
+  absorb noise from the phased worker's yield-driven re-placement.
+  Bare `max_spread_pct = 15.0` would silently match the default
+  and have no observable effect.
 - `max_throughput_cv = 0.5` -- coefficient of variation of
   `work_units / cpu_time` across workers. Catches a scheduler that
   gives some workers disproportionately less effective CPU.
@@ -434,6 +451,12 @@ the cache cannot locate. Run `cargo ktstr kernel build` to populate
 the cache, or pass an explicit path to a built kernel source tree —
 see [Getting Started: Build a kernel](getting-started.md#build-a-kernel)
 for the resolution order.
+
+If `cargo ktstr test` reports "scheduler binary not found", the
+declared `binary = "scx_..."` in Step 2 didn't land where the
+discovery cascade looks. Set `KTSTR_SCHEDULER=/path/to/binary`
+to bypass discovery and pin an explicit path, or rebuild the
+scheduler crate so the binary lands under `target/{debug,release}/`.
 
 If a probe-related error surfaces ("probe skeleton load failed",
 "trigger attach failed"), re-run with `RUST_LOG=ktstr=debug` to
@@ -514,10 +537,13 @@ asks the host to freeze every vCPU long enough to read the BPF
 into a `FailureDumpReport` keyed by `name`, then resumes the guest.
 
 `execute_defs` (used so far) takes a flat list of cgroups and runs
-them concurrently. To inject a snapshot mid-run, switch to
-`execute_steps`, which takes a list of `Step`s — each step has
-`setup` cgroups, an `ops` list (where `Op::capture_snapshot(...)` lives),
-and a `hold` duration:
+them concurrently. To inject a snapshot, switch to `execute_steps`,
+which takes a list of `Step`s — each step has `setup` cgroups, an
+`ops` list (where `Op::capture_snapshot(...)` lives), and a `hold`
+duration. Ops fire FIRST in the step, before `setup` cgroups are
+created, so naming a single-step snapshot `"after_workload"` would
+capture an empty guest. Use two steps: a setup step that holds the
+workload, then a follow-up step whose op fires after the hold ends:
 
 ```rust,ignore
 use ktstr::prelude::*;
@@ -536,17 +562,25 @@ fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
                     .work_type(WorkType::SpinWait)
                     .cpuset(CpusetSpec::Llc(1)),
             ]),
-            ops: vec![Op::capture_snapshot("after_workload")],
+            ops: vec![],
             hold: HoldSpec::FULL,
+        },
+        Step {
+            setup: Setup::Defs(Vec::new()),
+            ops: vec![Op::capture_snapshot("after_workload")],
+            hold: HoldSpec::Fixed(std::time::Duration::ZERO),
         },
     ])
 }
 ```
 
-After the scenario completes, the captured report is keyed by name
-on the active `SnapshotBridge` — the host-side store that owns the
-captured `FailureDumpReport` map for the run. Downstream test code
-drains it and walks scalar variables with the dotted-path accessor —
+The first step creates the cgroups and holds them for the full
+scenario duration; the second step's op runs after that hold
+finishes, with the snapshot reflecting the post-workload guest
+state. The captured report is keyed by name on the active
+`SnapshotBridge` — the host-side store that owns the captured
+`FailureDumpReport` map for the run. Downstream test code drains
+it and walks scalar variables with the dotted-path accessor —
 e.g. `snap.var("nr_cpus_onln").as_u64()?` reads a scheduler global
 (any `.bss`/`.data`/`.rodata` symbol; `Snapshot::var` walks all
 three) as a `u64`.
@@ -697,6 +731,13 @@ either source forces the no-perf path. See
 for the full lifecycle.
 
 ## Step 14: Periodic capture and temporal assertions
+
+Step 9 introduced single, on-demand snapshots via
+`Op::capture_snapshot`. This step builds on the same
+SnapshotBridge but switches the framework into the periodic
+capture mode — instead of one snapshot at a step boundary, the
+framework drains a series of captures spaced across the
+scenario's run window.
 
 On-demand `Op::capture_snapshot` (Step 9) captures the scheduler's BPF state
 at a point you choose. **Periodic capture** fires automatically at
