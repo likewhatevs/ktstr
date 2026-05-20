@@ -4332,7 +4332,7 @@ impl WorkloadHandle {
     /// Thread workers publish their `gettid()` via an
     /// `Arc<AtomicI32>` BEFORE the start handshake (the publish is
     /// the first thing the worker closure does, before blocking on
-    /// `start_rx`). [`spawn_thread_worker`] blocks on a paired
+    /// `start_rx`). `spawn_thread_worker` blocks on a paired
     /// rendezvous channel until the worker reaches the publish
     /// point, so by the time [`WorkloadHandle::spawn`] returns,
     /// every thread worker's `tid` is non-zero (or spawn would have
