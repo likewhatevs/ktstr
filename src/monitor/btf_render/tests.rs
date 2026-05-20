@@ -8862,6 +8862,148 @@ fn rendered_value_as_u64_signed_enum_positive_value() {
     assert_eq!(positive_signed.as_u64(), Some(42));
 }
 
+/// End-to-end pin that `render_value_inner` propagates the BTF
+/// `is_signed` flag from the source type into [`RenderedValue::Enum`].
+/// The renderer reads `e.is_signed()` from `btf_rs` and threads it
+/// onto the variant — a refactor that hardcoded `is_signed: false`
+/// (or `true`) would silently break the sign-loss rejection in
+/// [`RenderedValue::as_u64`] and the signed-vs-unsigned Display
+/// rendering. The unit-level `enum_v` fixture tests above pin the
+/// downstream behaviour for a given flag; this test pins that the
+/// flag arrives correctly from BTF in the first place.
+///
+/// Probes one unsigned kernel enum + one signed kernel enum (with
+/// a fallback signed candidate if the primary is absent):
+///   - `hrtimer_mode` (include/linux/hrtimer.h:35): all variants
+///     non-negative (0..=0x0b, HRTIMER_MODE_ABS through
+///     HRTIMER_MODE_REL_PINNED_HARD), expected `is_signed = false`.
+///   - `perf_event_state` (include/linux/perf_event.h:680): includes
+///     `PERF_EVENT_STATE_DEAD = -5`, expected `is_signed = true` so
+///     the renderer sign-extends correctly.
+///   - Fallback signed probe: `cpuhp_state` (include/linux/cpuhotplug.h:57)
+///     declares `CPUHP_INVALID = -1`, present in any kernel BTF with
+///     cpu hotplug support (effectively all production kernels).
+///
+/// Each enum probe is gated on `resolve_ids_by_name` returning a
+/// match. The unsigned arm and at least ONE signed arm MUST land,
+/// otherwise the test panics — a silent SKIP across both signedness
+/// flavours would leave a hardcoded-is_signed regression undetected,
+/// defeating the test's purpose.
+#[test]
+fn render_value_inner_propagates_btf_enum_signedness() {
+    let Some(btf) = test_btf() else {
+        crate::report::test_skip("test_btf returned None");
+        return;
+    };
+
+    let mut unsigned_probe_ran = false;
+    let mut signed_probe_ran = false;
+
+    // ── Unsigned probe: hrtimer_mode ────────────────────────────
+    if let Ok(ids) = btf.resolve_ids_by_name("hrtimer_mode")
+        && let Some(&id) = ids.first()
+    {
+        // HRTIMER_MODE_REL = 0x01; 4-byte enum.
+        let v = render_value(&btf, id, &[0x01, 0x00, 0x00, 0x00]);
+        match v {
+            RenderedValue::Enum {
+                is_signed, value, ..
+            } => {
+                assert!(
+                    !is_signed,
+                    "hrtimer_mode has no negative variants (HRTIMER_MODE_ABS..\
+                     HRTIMER_MODE_REL_PINNED_HARD = 0..=0x0b at \
+                     include/linux/hrtimer.h:35) — BTF must mark it unsigned, \
+                     got is_signed=true (renderer dropped the kind_flag bit)"
+                );
+                assert_eq!(
+                    value, 1,
+                    "wire 0x01 (HRTIMER_MODE_REL) must render as 1; got {value}"
+                );
+                unsigned_probe_ran = true;
+            }
+            other => panic!(
+                "expected RenderedValue::Enum for hrtimer_mode, got {other:?} \
+                 (renderer routed away from the Enum arm)"
+            ),
+        }
+    } else {
+        crate::report::test_skip("BTF missing 'hrtimer_mode' (unsigned-enum probe)");
+    }
+
+    // ── Signed probe: perf_event_state (primary), cpuhp_state (fallback) ──
+    let signed_probe_candidates = &[
+        // (name, negative-variant value, kernel-source citation).
+        (
+            "perf_event_state",
+            -5_i32,
+            "PERF_EVENT_STATE_DEAD = -5 at include/linux/perf_event.h:680",
+        ),
+        (
+            "cpuhp_state",
+            -1_i32,
+            "CPUHP_INVALID = -1 at include/linux/cpuhotplug.h:57",
+        ),
+    ];
+    for (name, neg_value, cite) in signed_probe_candidates {
+        let Ok(ids) = btf.resolve_ids_by_name(name) else {
+            continue;
+        };
+        let Some(&id) = ids.first() else {
+            continue;
+        };
+        let neg_bytes = neg_value.to_le_bytes();
+        let v = render_value(&btf, id, &neg_bytes);
+        match v {
+            RenderedValue::Enum {
+                is_signed, value, ..
+            } => {
+                assert!(
+                    is_signed,
+                    "{name} has a negative variant ({cite}) — BTF must mark it \
+                     signed, got is_signed=false (renderer dropped the kind_flag \
+                     bit)"
+                );
+                assert_eq!(
+                    value, *neg_value as i64,
+                    "wire {neg_value:#x} (truncated to i32) must sign-extend to \
+                     {neg_value}; got {value} (renderer dropped the sign \
+                     extension on a 4-byte signed enum)"
+                );
+                signed_probe_ran = true;
+                break;
+            }
+            other => panic!(
+                "expected RenderedValue::Enum for {name}, got {other:?} (renderer \
+                 routed away from the Enum arm)"
+            ),
+        }
+    }
+    if !signed_probe_ran {
+        crate::report::test_skip(
+            "no signed-enum probe present in BTF: tried perf_event_state \
+             (CONFIG_PERF_EVENTS=y typical) and cpuhp_state (CPU hotplug — \
+             present in any production kernel BTF)",
+        );
+    }
+
+    // A silent SKIP across BOTH signedness flavours would leave a
+    // hardcoded-is_signed regression undetected — the entire point
+    // of this test is to catch a renderer that always returns false
+    // or always returns true. Require at least the unsigned arm AND
+    // at least one signed arm to land, OR fail hard. The granular
+    // `test_skip` lines above keep the diagnostic informative when
+    // only the fallback fires; this final gate rejects a wholly-
+    // SKIPped run.
+    assert!(
+        unsigned_probe_ran && signed_probe_ran,
+        "BTF coverage gap: unsigned_probe_ran={unsigned_probe_ran}, \
+         signed_probe_ran={signed_probe_ran}. Both signedness paths must be \
+         exercised to catch a hardcoded-is_signed regression. Use a kernel BTF \
+         that includes hrtimer_mode AND either perf_event_state or cpuhp_state."
+    );
+}
+
 #[test]
 fn rendered_value_as_u32_array_rejects_overflow() {
     let arr = RenderedValue::Array {
