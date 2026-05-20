@@ -57,9 +57,12 @@ names.
 The `{kernel}` suffix is a sanitized kernel label: `kernel_`
 prefix, lowercase, every non-alphanumeric ASCII character collapsed
 to `_`, consecutive underscores collapsed, trailing underscores
-stripped. So `6.16.1` becomes `kernel_6_16_1` and `../linux`
-becomes `kernel_linux` (after the framework resolves the path to
-its sanitizable label).
+stripped. Version specs render as `kernel_<version>` — `6.16.1`
+becomes `kernel_6_16_1`. Path specs render as
+`kernel_path_<basename>_<hash6>` — `../linux` becomes
+`kernel_path_linux_<hash6>` (and `..._dirty` when the source tree
+is dirty). The 6-char content hash disambiguates two different
+source paths that share a basename.
 
 ## Run analysis
 
@@ -89,13 +92,15 @@ topology class, SMT, workload characteristics) and greedily picks
 tests with the highest marginal coverage per estimated second.
 Duration estimates account for VM boot overhead based on vCPU count.
 
-A summary is printed to stderr during `--list`:
+A summary is printed to stderr during budget-mode `--list` (only
+when `KTSTR_BUDGET_SECS` is set):
 
 ```text
 ktstr budget: 42/1200 tests, 295/300s used, 38/38 configurations covered
 ```
 
-When `KTSTR_BUDGET_SECS` is not set, all tests are listed as usual.
+When `KTSTR_BUDGET_SECS` is not set, all tests are listed as usual
+with no budget summary.
 
 ## Custom scheduler
 

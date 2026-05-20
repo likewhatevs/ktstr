@@ -364,8 +364,10 @@ Available via:
 - `cargo ktstr shell --no-perf-mode`
 - `KTSTR_NO_PERF_MODE=1` (any value; presence is sufficient)
 
-`--cpu-cap N` layers on top of any of the above when present;
-when absent, the 30%-of-allowed default applies automatically.
-The env var is read by every VM builder call site (test harness,
-auto-repro, verifier, shell). The CLI flags set the env var
-before test execution so library consumers inherit it.
+`--cpu-cap N` is the **CLI flag** for `ktstr shell`, `cargo ktstr
+shell`, and `cargo ktstr kernel build` only — `cargo ktstr test`,
+`cargo ktstr coverage`, and `cargo ktstr llvm-cov` do NOT carry the
+flag. For the test/coverage/llvm-cov paths the cap is set via the
+`KTSTR_CPU_CAP` environment variable (the env var is read by every
+VM-builder call site). When absent, the 30%-of-allowed default
+applies automatically.

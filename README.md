@@ -113,7 +113,7 @@ it does not build or run on other platforms.
 **Required:**
 
 - Linux host with `/dev/kvm`
-- Rust >= 1.94.1 (stable, pinned via `rust-toolchain.toml`)
+- Rust 1.94.1 (exact pin via `rust-toolchain.toml`; rustup uses it automatically)
 - [cargo-nextest](https://nexte.st/) -- `cargo ktstr test` delegates
   to nextest internally.
 - clang (BPF skeleton compilation)

@@ -164,14 +164,20 @@ floor guards against `make -j0` (unbounded on GNU make).
 `ktstr locks` (or `cargo ktstr locks`) prints every ktstr flock
 currently held on the host, cross-referenced against
 `/proc/locks` to name each holder by PID + truncated cmdline.
-Read-only — takes no flocks. Four categories:
+Read-only — takes no flocks. Five categories:
 
-1. **LLC locks** under `/tmp/ktstr-llc-*.lock`
-2. **Per-CPU locks** under `/tmp/ktstr-cpu-*.lock`
+1. **LLC locks** under `{KTSTR_LOCK_DIR or /tmp}/ktstr-llc-*.lock`
+2. **Per-CPU locks** under `{KTSTR_LOCK_DIR or /tmp}/ktstr-cpu-*.lock`
 3. **Cache-entry locks** under `{cache_root}/.locks/*.lock`
-4. **Run-dir locks** under
-   `{runs_root}/.locks/{kernel}-{project_commit}.lock` — held
-   for the duration of the (pre-clear + write) cycle by
+4. **Source-tree build locks** at
+   `{cache_root}/.locks/source-{path_hash}.lock` — held for the
+   duration of `cargo ktstr kernel build --source` (and any kernel
+   build resolving a path-spec) so concurrent builds against the
+   same source tree serialize.
+5. **Run-dir locks** under
+   `{runs_root}/.locks/{leaf-dir-name}.lock` (the leaf is
+   conventionally `{kernel}-{project_commit}`) — held for the
+   duration of the (pre-clear + write) cycle by
    `serialize_and_write_sidecar` so two concurrent ktstr
    processes targeting the same run-dir key serialize on the
    sidecar write rather than tearing each other's mid-write
@@ -224,8 +230,9 @@ never calls `CpuCap::resolve`, it goes through
 
 ## Filesystem requirement
 
-Every ktstr lockfile (`/tmp/ktstr-llc-*.lock`,
-`/tmp/ktstr-cpu-*.lock`, `{cache_root}/.locks/*.lock`,
+Every ktstr lockfile (`{KTSTR_LOCK_DIR or /tmp}/ktstr-llc-*.lock`,
+`{KTSTR_LOCK_DIR or /tmp}/ktstr-cpu-*.lock`,
+`{cache_root}/.locks/*.lock`,
 `{runs_root}/.locks/*.lock`) must live on a local filesystem —
 tmpfs, ext4, xfs, btrfs, f2fs, or bcachefs are the
 explicitly-accepted set. `flock(2)` behavior

@@ -9,7 +9,7 @@ Linux kernels in KVM for testing.
 let result = vmm::KtstrVm::builder()
     .kernel(&kernel_path)
     .init_binary(&ktstr_binary)
-    .topology(numa_nodes, llcs, cores_per_llc, threads_per_core)
+    .topology(Topology::new(numa_nodes, llcs, cores_per_llc, threads_per_core))
     .memory_mib(4096)
     .run_args(&["run".into(), "--ktstr-test-fn".into(), "my_test".into()])
     .build()?
@@ -68,14 +68,13 @@ memory, sharing physical pages across concurrent VMs.
 ## Guest-host communication
 
 **Serial console** -- COM2 carries guest stdout/stderr, the
-canonical crash diagnostic transport, and a fallback result
-transport. The guest panic hook writes `PANIC: <info>\n<bt>\n` to
-COM2; the host parses it via `extract_panic_message` and surfaces
-the backtrace in test failure output. Delimited test results
-(between `===KTSTR_TEST_RESULT_START===` /
-`===KTSTR_TEST_RESULT_END===` sentinels) and exit codes
-(`KTSTR_EXIT=N`) are also written to COM2 as a fallback when the
-TLV stream is unavailable.
+canonical crash diagnostic transport. The guest panic hook writes
+`PANIC: <info>\n<bt>\n` to COM2; the host parses it via
+`extract_panic_message` and surfaces the backtrace in test failure
+output. The legacy COM2 result / exit-code fallback (delimited
+`===KTSTR_TEST_RESULT_START===` / `_END===` sentinels and
+`KTSTR_EXIT=N` lines) was removed pre-1.0 — virtio-console port-1
+(below) is the only result transport.
 
 **Virtio-console port 1 TLV stream** -- the primary guest-to-host
 data channel. Carries scenario markers (`MSG_TYPE_SCENARIO_START`,

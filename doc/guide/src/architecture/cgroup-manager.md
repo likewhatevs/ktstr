@@ -8,8 +8,17 @@ use ktstr::prelude::*;
 
 pub struct CgroupManager {
     parent: PathBuf,
+    outstanding_removes: AtomicUsize,
 }
 ```
+
+The `outstanding_removes` counter is a stuck-cgroup safety cap.
+When a `remove_cgroup` write times out (the kernel is sometimes
+slow to reap freezer or BPF state), the counter increments. Once
+more than `MAX_OUTSTANDING_REMOVES` (= 10) removes have failed,
+subsequent `remove_cgroup` calls return `Err` immediately rather
+than continuing to leak per-call writer threads. `outstanding_removes()`
+exposes the count for diagnostics.
 
 ## Construction
 
@@ -25,13 +34,17 @@ cgroups.setup(&controllers)?; // create parent dir, enable cpuset + cpu controll
 
 `new()` sets the parent path. `setup()` takes a
 `&BTreeSet<Controller>` (variants: `Cpuset`, `Cpu`, `Memory`,
-`Pids`, `Io`), creates the parent directory if it does not exist,
-and enables the requested controllers on every ancestor from
-`/sys/fs/cgroup` down to the parent by writing to each level's
-`cgroup.subtree_control`. An empty set creates the directory and
-returns without touching `subtree_control`. The deterministic
-`BTreeSet` iteration order keeps the rendered subtree_control
-write stable between runs.
+`Pids`, `Io` — the controller name tokens written to
+`cgroup.subtree_control`), creates the parent directory if it does
+not exist, checks each requested controller against
+`/sys/fs/cgroup/cgroup.controllers` and bails with a clear
+"controller X not available" error if the kernel didn't expose it,
+then enables the requested controllers on every ancestor from
+`/sys/fs/cgroup` down to AND INCLUDING the parent by writing to
+each level's `cgroup.subtree_control`. An empty set creates the
+directory and returns without touching `subtree_control`. The
+deterministic `BTreeSet` iteration order keeps the rendered
+subtree_control write stable between runs.
 
 ## Methods
 
@@ -41,16 +54,20 @@ write stable between runs.
 Idempotent: no error if the directory already exists. Supports nested
 paths (e.g. `"nested/deep"`). For nested paths, enables ONLY
 `+cpuset` on intermediate cgroups' `subtree_control` — `+cpu`,
-`+memory`, `+memory.swap`, `+io`, and `+pids` are NOT propagated.
-Tests that drive non-cpuset controllers on a nested leaf
+`+memory`, `+io`, and `+pids` are NOT propagated. Tests that drive
+non-cpuset controllers on a nested leaf
 (e.g. `CgroupDef::named("nested/leaf").memory_max(N)`) get `ENOENT`
 at apply-setup time when the missing controller knob is written; see
 [Cgroup controller not enabled](../troubleshooting.md#cgroup-controller-not-enabled)
 for the operator-facing diagnostic shape.
 
-**`remove_cgroup(name)`** -- drains tasks from the child cgroup to the
-cgroup filesystem root, then removes the directory. No error if the
-cgroup does not exist.
+**`remove_cgroup(name)`** -- auto-unfreezes any frozen tasks (a
+frozen task cannot be reparented), drains tasks from the child
+cgroup to the cgroup filesystem root, then waits for
+`cgroup.events` to report `populated 0` via inotify (1s deadline)
+before removing the directory. No error if the cgroup does not
+exist. Returns `Err` once the outstanding-remove cap (10) is
+reached.
 
 **`set_cpuset(name, cpus)`** -- writes `cpuset.cpus` for a child cgroup.
 The `BTreeSet<usize>` is formatted as a compact range string via
@@ -64,10 +81,26 @@ which inherits the parent's cpuset.
 
 **`move_tasks(name, pids)`** -- moves all PIDs from a slice into the
 child cgroup. Tolerates ESRCH (task exited between listing and
-migration) with a warning. Retries EBUSY up to 3 times with 100ms
-backoff for transient rejections from sched_ext BPF
-`cgroup_prep_move` callbacks. Propagates EBUSY after retries
-exhausted. Propagates all other errors immediately.
+migration) with a warning. Up to 3 attempts total (2 retries after
+the initial try) with 100ms backoff for transient EBUSY from
+sched_ext BPF `cgroup_prep_move` callbacks. Bails BEFORE writing
+`cgroup.procs` when `cpuset.cpus` is non-empty but
+`cpuset.mems.effective` reads empty — that combination would
+silently strand the move with no actionable error, so the bail is
+load-bearing. Propagates EBUSY after retries exhausted.
+
+In addition to the public methods above, `CgroupManager` exposes a
+broader knob surface for each controller: `set_cpuset_mems` /
+`clear_cpuset_mems` (memory.mems analogue of set_cpuset), `set_cpu_max`
+/ `set_cpu_weight` (cpu controller), `set_memory_max` / `set_memory_high`
+/ `set_memory_low` / `set_memory_swap_max` (memory + memory.swap),
+`set_io_weight` (io controller), `set_freeze` (cgroup.freeze), and
+`set_pids_max` (pids controller). The `CgroupDef` builder routes its
+per-controller setters through these. The `CgroupOps` trait abstracts
+the surface so test scenarios consume `&dyn CgroupOps` (allowing
+test-double substitution); `validate_cgroup_name` rejects empty
+names, leading slash, NUL bytes, `..`/`.` components, and
+leading-dot components at all entry points.
 
 **`drain_tasks(name)`** -- moves all tasks from a child cgroup to the
 cgroup filesystem root (`/sys/fs/cgroup`) by reading `cgroup.procs`

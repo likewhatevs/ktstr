@@ -21,11 +21,15 @@ bound to any implementor of `CgroupOps` (e.g.
 [`CgroupManager`](cgroup-manager.md) in production, an in-memory fake
 in tests).
 
-**`add_cgroup(name, cpuset) -> Result<()>`** -- creates a cgroup and
-sets its cpuset. The cgroup is tracked for removal on drop.
+**`add_cgroup(name, cpuset) -> Result<()>`** -- creates a cgroup
+and sets its cpuset. Auto-enables the `Cpuset` controller on the
+parent's `cgroup.subtree_control` before creating the child (the
+load-bearing difference vs `add_cgroup_no_cpuset`). The cgroup is
+tracked for removal on drop.
 
 **`add_cgroup_no_cpuset(name) -> Result<()>`** -- creates a cgroup
-without setting a cpuset. The cgroup is tracked for removal on drop.
+without setting a cpuset and without enabling the Cpuset controller
+on the parent. The cgroup is tracked for removal on drop.
 
 **`names() -> &[String]`** -- returns the names of all tracked cgroups.
 

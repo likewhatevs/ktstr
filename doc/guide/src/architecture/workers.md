@@ -127,7 +127,7 @@ Three fields worth calling out explicitly:
 - `exit_info` is `None` on every live-worker-authored report.
   `stop_and_collect` synthesises a sentinel `WorkerReport` with
   `Some(_)` when the worker handed back no (or unparseable) payload
-  — conventional fork workers serialise reports as bincode over the
+  — conventional fork workers serialise reports as postcard over the
   report pipe; `PcommContainer` payloads use serde_json. Either
   decoder failing or the pipe closing empty triggers the sentinel.
   The `WorkerExitInfo` enum
@@ -174,9 +174,11 @@ Three fields worth calling out explicitly:
     `src/workload/worker/tests.rs`, so a silent change to any of
     them trips a build-time assertion.
   - **Every 64 iterations**: IoSyncWrite (16 4-KiB writes per
-    write-then-sleep pair → `gcd(16, 1024) = 16`); IoRandRead and
-    IoConvoy use the same 64-iteration cadence for their per-iteration
-    pread/pwrite mixes.
+    iteration ending in `fdatasync` → `gcd(16, 1024) = 16`).
+    IoRandRead (1 unit/iter via `wrapping_add(1)`) and FanOutCompute
+    worker fall under the 1024-iteration bucket below; IoConvoy
+    increments `work_units` by 2 per iter
+    (`gcd(2, 1024) = 2` → period 512 iters).
   - **Every 1024 iterations**: YieldHeavy (1 unit per yield),
     ForkExit (1 unit per fork+wait), FanOutCompute worker
     (`operations`=5 matrix multiplies per wake, one `work_units`
@@ -256,17 +258,6 @@ Custom workers produce their own `WorkerReport`. The framework does
 not populate any telemetry fields for Custom -- migration tracking,
 gap detection, schedstat deltas, NUMA page counts, and iteration
 counters are only present if the user's `run` function fills them.
-
-## Worker-progress watchdog
-
-Workers send SIGUSR2 to the scheduler when stuck > 2 seconds. The
-default POSIX disposition terminates the scheduler process, which ktstr
-detects as a scheduler death and captures the sched_ext dump from
-dmesg.
-
-In repro mode, the watchdog is disabled to keep the scheduler alive
-for BPF probe assertions. The watchdog does not fire for Custom
-workers because they bypass the framework work loop.
 
 ## RAII cleanup
 

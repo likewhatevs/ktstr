@@ -20,9 +20,12 @@ ktstr models four levels of CPU topology, from largest to smallest:
   threads share a single core's execution resources.
 
 Containment: threads belong to a core, cores belong to an LLC, LLCs
-belong to a NUMA node. For example, `2n4l4c2t` describes 2 NUMA
-nodes, each with 2 LLCs, each LLC with 4 cores, each core with 2
-threads = 32 CPUs total.
+belong to a NUMA node. The render is `{numa}n{llcs}l{cores}c{threads}t`
+where `llcs` is the **total** count across the VM. So `2n4l4c2t`
+describes 2 NUMA nodes with a total of 4 LLCs (2 LLCs/node), 4
+cores per LLC, 2 threads per core = 2 × 4 × 2 = 16 vCPUs per node ×
+2 nodes = 64 vCPUs total. A smaller worked example: `1n2l4c2t` is
+1 × 2 × 4 × 2 = 16 vCPUs.
 
 Most tests use a single NUMA node (the default). NUMA matters when a
 scheduler makes placement decisions based on memory locality.
@@ -59,8 +62,10 @@ numbered sequentially. Used as a fallback when sysfs is incomplete
 inside a guest VM. For the memory-aware variant, see
 `from_vm_topology_with_memory`.
 
-**`synthetic(num_cpus, num_llcs) -> Self`** (test-only) -- creates a
-topology with evenly distributed CPUs across LLCs. Used in unit tests.
+**`synthetic(num_cpus, num_llcs) -> Self`** (`#[cfg(test)]`-gated; not
+callable from user code) -- creates a topology that distributes the
+CPUs across LLCs with the remainder landing on the last LLC.
+Requires `num_cpus >= num_llcs`. Used only in ktstr's own unit tests.
 
 ## Topology queries
 

@@ -71,12 +71,22 @@ pub struct MonitorThresholds {
     pub sustained_samples: usize,
     pub max_fallback_rate: f64,
     pub max_keep_last_rate: f64,
+    pub enforce: bool,
 }
 ```
 
 A violation must persist for `sustained_samples` consecutive samples
 before triggering a failure. This filters transient spikes from cpuset
 transitions and cgroup creation/destruction.
+
+**`enforce` is the on/off gate for the whole pipeline.** The default
+(`MonitorThresholds::new()`) is `enforce: false` — monitor evaluations
+record observations but do NOT fail the test. Test authors opt in to
+enforcement by either setting `enforce: true` on a custom
+`MonitorThresholds`, or using `MonitorThresholds::with_monitor_defaults()`
+which flips it. Setting fields like `fail_on_stall: true` without
+flipping `enforce` is a no-op — every violation will appear in the
+monitor report but the verdict will pass.
 
 ### Stall detection
 
@@ -254,9 +264,12 @@ renderer treats them as integers and the failure dump shows raw
 0xffff…ffff values with no further chase.
 
 The cast analyzer (`monitor::cast_analysis::analyze_casts`) closes
-that gap. The freeze coordinator runs it once per scheduler load,
-before any periodic capture or on-demand snapshot would consume
-its output:
+that gap. The analyzer is lazy: nothing runs at scheduler-load time.
+The first dump that needs cast metadata (any periodic capture,
+on-demand snapshot, or stall dump) triggers `LazyCastMap::get_full`
+from the dump-dispatch path; subsequent dumps in the same VM hit the
+per-VM cache, and a process-wide content-hash cache dedupes across
+VMs that share the same scheduler binary. The analyzer pipeline:
 
 1. The host loads the scheduler binary and locates each `.bpf.o`
    ELF in the build artifacts.
@@ -404,9 +417,20 @@ with the current task pointer and kernel stack.
 ### Fentry/fexit skeleton (`fentry_probe.bpf.c`)
 
 Handles both BPF struct_ops callbacks and kernel function exit
-capture. Loaded in batches of 4 fentry + 4 fexit programs per
-skeleton instance via `set_attach_target`. Shares `probe_data` and
-`func_meta_map` with the kprobe skeleton via `reuse_fd`.
+capture. Each skeleton instance exposes exactly 4 indexed fentry
+slots (`ktstr_fentry_0..3`) and 4 fexit slots (`ktstr_fexit_0..3`),
+attached via `set_attach_target` before load. The Phase B polling
+loop instantiates additional skeletons as needed once the scheduler
+has loaded and the fentry/fexit attach targets become available.
+Shares `probe_data` and `func_meta_map` with the kprobe skeleton via
+`reuse_fd`.
+
+**Phase A / Phase B split.** The kprobe skeleton + trigger fexit
+attach during Phase A (before scheduler load). The fentry/fexit
+skeletons attach during Phase B — a 100 ms polling loop that runs
+AFTER the scheduler binary loads and the callback targets become
+attachable. Operators debugging attach failures should know that the
+fentry/fexit half always lags scheduler load.
 
 A per-slot `is_kernel` rodata flag controls argument access:
 - **BPF callbacks** (`is_kernel=0`): `ctx[0]` is a void pointer to
