@@ -106,25 +106,60 @@ impl SampleSeries {
     /// can't reason about.
     ///
     /// This projector adds a phase-stability gate on top of the
-    /// per-snapshot pick: for each phase, pin to the FIRST sample
-    /// whose `active_map_kvas` is non-empty. Later same-phase
-    /// snapshots whose `active_map_kvas` matches the pin pass
-    /// through; later same-phase snapshots whose `active_map_kvas`
-    /// differs are surfaced as
-    /// [`SnapshotError::WalkerDriftedWithinPhase`] so the temporal
-    /// patterns' standard error-skip semantics drop them. Samples
-    /// with empty `active_map_kvas` (pre-walker capture) pass
-    /// through unchanged because there's no walker signal to
-    /// compare against — the per-snapshot
-    /// [`SnapshotError::AmbiguousVar`] guard already handles the
-    /// multi-bss-with-empty-walker case at the
-    /// [`Snapshot::var`] layer.
+    /// per-snapshot pick. Two checks fire per phase:
+    ///
+    /// 1. **KVA drift within a walker-resolved set.** For each
+    ///    phase, pin to the FIRST sample whose
+    ///    `active_map_kvas` is non-empty. Later same-phase
+    ///    samples whose `active_map_kvas` matches the pin pass
+    ///    through. Later same-phase samples whose `active_map_kvas`
+    ///    differs surface as
+    ///    [`crate::scenario::snapshot::SnapshotError::WalkerDriftedWithinPhase`]
+    ///    (the walker re-published mid-phase, typically because
+    ///    an `Op::ReplaceScheduler` swap fired between snapshots).
+    /// 2. **Cross-scheduler leak via walker-absent samples.** If
+    ///    a phase contains at least one walker-resolved sample
+    ///    (non-empty `active_map_kvas`), every OTHER same-phase
+    ///    sample MUST also be walker-resolved. An empty-kvas
+    ///    sample in such a phase came from a pre-walker capture
+    ///    window OR a different scheduler instance entirely —
+    ///    its `Snapshot::live_var` read cannot be proven to come
+    ///    from the same bss as the pinned samples, so the value
+    ///    is non-comparable. Surface as
+    ///    `WalkerDriftedWithinPhase` with `sample_kvas = []`
+    ///    (the empty vec signals "this sample had no walker
+    ///    output" as distinct from "the walker output disagreed").
+    ///    The temporal patterns' standard error-skip semantics
+    ///    drop these samples from per-phase reducers like
+    ///    `counter_delta_per_phase`.
+    ///
+    /// Samples in a phase with NO walker-resolved siblings pass
+    /// through unchanged — the single-scheduler / pre-walker
+    /// case where the consumer's per-snapshot
+    /// [`Snapshot::active`] resolution is the only signal
+    /// available.
     fn bpf_live_phase_stable<T, P>(&self, name: &str, project: P) -> SeriesField<T>
     where
         P: Fn(&SnapshotField<'_>) -> SnapshotResult<T>,
     {
         let label = name.to_string();
         let name_owned = name.to_string();
+        // Pre-scan: identify phases that ever have a walker-resolved
+        // sample (non-empty active_map_kvas). Walker-absent samples
+        // in those phases are flagged as cross-scheduler-leak risks
+        // by the main loop below.
+        let mut phases_with_walker: std::collections::BTreeSet<crate::assert::Phase> =
+            std::collections::BTreeSet::new();
+        for row in &self.rows {
+            if row.report.is_placeholder {
+                continue;
+            }
+            if !row.report.active_map_kvas.is_empty()
+                && let Some(ph) = row.step_index.map(crate::assert::Phase::from)
+            {
+                phases_with_walker.insert(ph);
+            }
+        }
         let mut values: Vec<SnapshotResult<T>> = Vec::with_capacity(self.rows.len());
         let mut tags: Vec<String> = Vec::with_capacity(self.rows.len());
         let mut elapsed: Vec<u64> = Vec::with_capacity(self.rows.len());
@@ -172,6 +207,26 @@ impl SampleSeries {
                             },
                         ));
                     }
+                }
+                (Ok(_v), Some(ph))
+                    if sample_kvas.is_empty() && phases_with_walker.contains(&ph) =>
+                {
+                    // Cross-scheduler leak guard: this sample had
+                    // no walker output but a sibling sample in the
+                    // same phase did. The Ok value cannot be proven
+                    // to come from the same scheduler as the pinned
+                    // siblings — surface as drift with empty
+                    // sample_kvas to disambiguate from "walker
+                    // output disagreed".
+                    let pinned = phase_kva_pin.get(&ph).cloned().unwrap_or_default();
+                    values.push(Err(
+                        crate::scenario::snapshot::SnapshotError::WalkerDriftedWithinPhase {
+                            phase: ph,
+                            pinned_kvas: pinned,
+                            sample_kvas: Vec::new(),
+                            requested: name_owned.clone(),
+                        },
+                    ));
                 }
                 (other, _) => values.push(other),
             }

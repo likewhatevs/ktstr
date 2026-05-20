@@ -3836,6 +3836,141 @@ fn snapshot_active_on_placeholder_returns_placeholder_error() {
     ));
 }
 
+/// Same-binary `Op::ReplaceScheduler` swap window with the walker
+/// unavailable: two `bpf_bpf.bss` copies share the prefix; the
+/// helper at `monitor/dump/mod.rs` returned `None` so
+/// `active_obj_name` is `None` and `active_map_kvas` is empty.
+/// The consumer's per-section count detects bss_count=2 for the
+/// single prefix and surfaces `NoActiveScheduler` with a
+/// multi-copy reason — preventing the silent `AmbiguousVar`
+/// downstream that this whole batch exists to fix.
+#[test]
+fn snapshot_active_multi_bss_same_name_no_walker_returns_no_active_scheduler() {
+    let mut bss_a = make_global_map("bpf_bpf.bss", vec![("counter", uint_v(1))]);
+    bss_a.map_kva = 0x1000;
+    let mut bss_b = make_global_map("bpf_bpf.bss", vec![("counter", uint_v(2))]);
+    bss_b.map_kva = 0x2000;
+    let report = make_report_with_maps(vec![bss_a, bss_b]);
+    let snap = Snapshot::new(&report);
+    let err = snap
+        .active()
+        .expect_err("multi-bss same-name + no walker => NoActiveScheduler");
+    assert!(matches!(err, SnapshotError::NoActiveScheduler { .. }));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("bpf_bpf.bss × 2"),
+        "diagnostic must name the multi-copy section + count: {msg}"
+    );
+    assert!(
+        msg.contains("max_by_sum_u64") || msg.contains("max_by_counter_value"),
+        "diagnostic must steer at the picker-based disambiguators: {msg}"
+    );
+}
+
+/// Multi-`.data` (rather than `.bss`) symmetrically forces
+/// `NoActiveScheduler` — pins that the consumer's per-section
+/// count check covers all three section types.
+#[test]
+fn snapshot_active_multi_data_same_name_no_walker_returns_no_active_scheduler() {
+    let bss = make_global_map("bpf_bpf.bss", vec![("counter", uint_v(0))]);
+    let mut data_a = make_global_map("bpf_bpf.data", vec![("flag", uint_v(1))]);
+    data_a.map_kva = 0x1000;
+    let mut data_b = make_global_map("bpf_bpf.data", vec![("flag", uint_v(2))]);
+    data_b.map_kva = 0x2000;
+    let report = make_report_with_maps(vec![bss, data_a, data_b]);
+    let snap = Snapshot::new(&report);
+    let err = snap
+        .active()
+        .expect_err("multi-data same-name + no walker => NoActiveScheduler");
+    assert!(matches!(err, SnapshotError::NoActiveScheduler { .. }));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("bpf_bpf.data × 2"),
+        ".data multi-copy must be named in the diagnostic: {msg}"
+    );
+}
+
+/// Multi-`.rodata` symmetrically forces `NoActiveScheduler`.
+#[test]
+fn snapshot_active_multi_rodata_same_name_no_walker_returns_no_active_scheduler() {
+    let bss = make_global_map("bpf_bpf.bss", vec![("counter", uint_v(0))]);
+    let data = make_global_map("bpf_bpf.data", vec![("flag", uint_v(0))]);
+    let mut rodata_a = make_global_map("bpf_bpf.rodata", vec![("const", uint_v(7))]);
+    rodata_a.map_kva = 0x1000;
+    let mut rodata_b = make_global_map("bpf_bpf.rodata", vec![("const", uint_v(7))]);
+    rodata_b.map_kva = 0x2000;
+    let report = make_report_with_maps(vec![bss, data, rodata_a, rodata_b]);
+    let snap = Snapshot::new(&report);
+    let err = snap
+        .active()
+        .expect_err("multi-rodata same-name + no walker => NoActiveScheduler");
+    assert!(matches!(err, SnapshotError::NoActiveScheduler { .. }));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("bpf_bpf.rodata × 2"),
+        ".rodata multi-copy must be named in the diagnostic: {msg}"
+    );
+}
+
+/// Same-binary multi-bss BUT the walker IS available
+/// (`active_obj_name = Some` + `active_map_kvas` non-empty). The
+/// walker-fast-path in `Snapshot::active` returns `Ok` with the
+/// KVA whitelist threaded through; `var("counter")` then narrows
+/// to the single live bss copy via maps_iter's KVA filter and
+/// resolves cleanly. Pins that the new multi-copy detection
+/// does NOT regress the walker-resolved happy path.
+#[test]
+fn snapshot_active_multi_bss_same_name_with_walker_resolves() {
+    let mut live_bss = make_global_map("bpf_bpf.bss", vec![("counter", uint_v(99))]);
+    live_bss.map_kva = 0x1000;
+    let mut stale_bss = make_global_map("bpf_bpf.bss", vec![("counter", uint_v(7))]);
+    stale_bss.map_kva = 0x2000;
+    let mut report = make_report_with_maps(vec![live_bss, stale_bss]);
+    report.active_obj_name = Some("bpf_bpf".to_string());
+    report.active_map_kvas = vec![0x1000];
+    let snap = Snapshot::new(&report);
+    let active = snap
+        .active()
+        .expect("active_obj_name + non-empty active_map_kvas => Ok");
+    let counter = active
+        .var("counter")
+        .as_u64()
+        .expect("KVA filter narrows to the live bss");
+    assert_eq!(
+        counter, 99,
+        "live bss (kva 0x1000, value 99) must be picked, not the stale one (value 7)"
+    );
+}
+
+/// Same-binary multi-bss with `active_obj_name = Some` BUT
+/// `active_map_kvas` empty (walker resolved the obj name via
+/// Phase 1 short-circuit, didn't publish a whitelist; then later
+/// a new bss copy arrived via a swap). The walker-fast-path
+/// detects the multi-copy section AND empty whitelist; surfaces
+/// `NoActiveScheduler` with the multi-copy reason instead of
+/// silently admitting both copies through the obj-prefix-only
+/// filter.
+#[test]
+fn snapshot_active_walker_obj_name_set_but_empty_whitelist_multi_copy_errors() {
+    let mut live_bss = make_global_map("bpf_bpf.bss", vec![("counter", uint_v(99))]);
+    live_bss.map_kva = 0x1000;
+    let mut stale_bss = make_global_map("bpf_bpf.bss", vec![("counter", uint_v(7))]);
+    stale_bss.map_kva = 0x2000;
+    let mut report = make_report_with_maps(vec![live_bss, stale_bss]);
+    report.active_obj_name = Some("bpf_bpf".to_string());
+    // active_map_kvas intentionally empty.
+    let snap = Snapshot::new(&report);
+    let err = snap
+        .active()
+        .expect_err("active_obj_name set + empty whitelist + multi-copy => NoActiveScheduler");
+    assert!(matches!(err, SnapshotError::NoActiveScheduler { .. }));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("bpf_bpf.bss × 2"),
+        "diagnostic must name the multi-copy section: {msg}"
+    );
+}
+
 #[test]
 fn snapshot_var_on_placeholder_returns_placeholder_error() {
     let report = FailureDumpReport::placeholder("freeze_timed_out");

@@ -398,42 +398,53 @@ impl<'a> Snapshot<'a> {
     ///
     /// # Signal source
     ///
-    /// The "active" determination uses the snapshot's already-
-    /// captured `scx_sched_state.sched_kva` (which scheduler instance
-    /// is currently attached per `*scx_root`) + `prog_runtime_stats`
-    /// (per-prog invocation counters) to identify which BPF
-    /// object's progs are advancing. No new wire format is
-    /// introduced.
+    /// "Active" comes from two fields the freeze coordinator
+    /// populates at capture time:
+    /// - [`crate::monitor::dump::FailureDumpReport::active_obj_name`]
+    ///   — set by the principled `*scx_root → struct_ops map →
+    ///   bpf_prog.aux→used_maps` walker (see
+    ///   `monitor/dump/mod.rs` `identify_active_obj_from_struct_ops`).
+    /// - [`crate::monitor::dump::FailureDumpReport::active_map_kvas`]
+    ///   — the live scheduler's `prog.aux->used_maps` KVA set
+    ///   that the same walker publishes. Non-empty iff the walker
+    ///   succeeded via the Phase 2 used_maps path (the
+    ///   same-binary disambiguation case).
     ///
-    /// # Limitations
+    /// When the walker resolved both fields, `active()` uses them
+    /// directly and the obj-prefix scan below is a sanity cross-
+    /// check against the captured map set. When the walker was
+    /// unavailable (placeholder dump, transient swap window before
+    /// the accessor-init worker republished, or kernel built
+    /// without struct_ops support), the obj-prefix scan with
+    /// per-section count fallback decides.
     ///
-    /// The current implementation is honest about its narrow scope:
-    /// it succeeds only when the snapshot contains exactly one BPF
-    /// object's worth of global-section maps. Multi-object snapshots
-    /// (two schedulers loaded back-to-back, or a single scheduler
-    /// composed of multiple BPF objects) return
-    /// [`SnapshotError::NoActiveScheduler`] — there is no reliable
-    /// proxy for "which obj is currently attached" from a frozen
-    /// `FailureDumpReport` alone. Test authors in those configurations
-    /// fall back to [`Self::vars`] to enumerate every copy explicitly,
-    /// or [`Self::map`] to address a specific scheduler's bss directly.
+    /// # Failure cases
     ///
-    /// Concrete cases that hit `NoActiveScheduler`:
-    /// - Two scheduler instances loaded back-to-back (e.g.
-    ///   pre/post-[`crate::scenario::ops::Op::ReplaceScheduler`] in a
-    ///   single scenario), even when their BPF object names differ.
-    /// - One scheduler composed of multiple BPF objects (e.g.
-    ///   scx_layered's core + helper objects).
-    /// - A placeholder snapshot (freeze-rendezvous failed to capture
-    ///   any maps).
-    /// - A snapshot taken with no scheduler attached (no
-    ///   global-section maps at all).
-    ///
-    /// A principled `*scx_root → owning BPF object → maps` walker
-    /// that resolves "currently attached" from kernel state directly
-    /// is a follow-up; landing it would make `.active()` succeed for
-    /// every case where exactly one scheduler is attached at capture
-    /// time.
+    /// - [`SnapshotError::PlaceholderSnapshot`]: the snapshot is a
+    ///   freeze-rendezvous-failure placeholder.
+    /// - [`SnapshotError::NoActiveScheduler`] (no global-section
+    ///   maps): the snapshot has no `<obj>.bss/.data/.rodata` —
+    ///   either no scheduler is attached, or the capture missed
+    ///   the global sections entirely.
+    /// - [`SnapshotError::NoActiveScheduler`] (multiple distinct
+    ///   obj prefixes, walker unavailable): two scheduler instances
+    ///   with DIFFERENT obj names coexist (back-to-back load of
+    ///   distinct binaries, or one scheduler composed of multiple
+    ///   BPF objects) AND the walker did not publish
+    ///   `active_obj_name`. Use [`Self::vars`] to enumerate every
+    ///   copy or [`Self::map`] to address a specific scheduler's
+    ///   bss directly.
+    /// - [`SnapshotError::NoActiveScheduler`] (multi-copy
+    ///   same-prefix, walker unavailable): an
+    ///   [`crate::scenario::ops::Op::ReplaceScheduler`] swap
+    ///   between two builds of the SAME binary left two
+    ///   `<obj>.bss` (or `.data` / `.rodata`) copies with
+    ///   identical names AND the walker did not publish
+    ///   `active_map_kvas` to disambiguate. The obj-prefix filter
+    ///   alone cannot pick the live copy without admitting both.
+    ///   Use [`Self::live_var_via`] / [`Self::live_vars_via`] with
+    ///   `crate::scenario::snapshot::pickers::max_by_sum_u64` to
+    ///   pick by counter activity.
     ///
     /// # Lifetime
     ///
@@ -445,62 +456,100 @@ impl<'a> Snapshot<'a> {
         if self.report.is_placeholder {
             return Err(SnapshotError::PlaceholderSnapshot { tag: None });
         }
-        // Group global-section maps by obj_name prefix. Same scan
-        // both code paths read: the principled-walker path checks
-        // `active_obj_name` against this set so a stale entry from a
-        // pre-swap capture window (active_obj_name resolved but its
-        // global-section maps no longer in the report) falls through
-        // to the heuristic + diagnostic.
+        // Scan global-section maps to collect:
+        //   1. The distinct set of obj_name prefixes (used by the
+        //      multi-obj failure diagnostic).
+        //   2. Per-(prefix, section) counts (used to detect the
+        //      same-binary multi-copy case: two `<prefix>.bss` maps
+        //      coexist with identical names but distinct map KVAs).
+        // The producer-side helper in
+        // `monitor/dump/mod.rs` `count_global_sections_for_prefix`
+        // performs the same count; both sites use strict full-name
+        // equality to stay in lockstep.
         let mut obj_names: Vec<&'a str> = Vec::new();
+        let mut counts: Vec<(&'a str, usize, usize, usize)> = Vec::new();
         for m in &self.report.maps {
             if !is_global_section_map(&m.name) {
                 continue;
             }
-            if let Some(obj) = m.name.split('.').next()
-                && !obj.is_empty()
-                && !obj_names.contains(&obj)
-            {
+            let Some(obj) = m.name.split('.').next() else {
+                continue;
+            };
+            if obj.is_empty() {
+                continue;
+            }
+            if !obj_names.contains(&obj) {
                 obj_names.push(obj);
+                counts.push((obj, 0, 0, 0));
+            }
+            let entry = counts
+                .iter_mut()
+                .find(|(o, _, _, _)| *o == obj)
+                .expect("obj just pushed");
+            // Strict section suffix match — `<obj>.bss` exactly,
+            // not `<obj>.bss.shared` or other multi-segment names.
+            let section = m.name.split('.').nth(1).unwrap_or("");
+            match section {
+                "bss" if m.name == format!("{obj}.bss") => entry.1 += 1,
+                "data" if m.name == format!("{obj}.data") => entry.2 += 1,
+                "rodata" if m.name == format!("{obj}.rodata") => entry.3 += 1,
+                _ => {}
             }
         }
-        // Principled tiebreaker: when the freeze-coord captured a
-        // non-None `active_obj_name` via the struct_ops map ↔ scx_root
-        // KVA match (see [`crate::monitor::dump::FailureDumpReport::active_obj_name`]),
-        // prefer that even if multiple obj prefixes show up in
-        // `obj_names`. This is the resolution for the "swap left
-        // both old and new BPF objects' maps in the report" case
-        // the heuristic alone cannot disambiguate.
+        // Principled fast path: when the freeze-coord captured a
+        // non-None `active_obj_name` via the struct_ops map ↔
+        // scx_root KVA match, prefer that even if multiple obj
+        // prefixes show up in `obj_names`. The KVA whitelist
+        // (`active_map_kvas`) pairs with the obj-name filter in
+        // `maps_iter` — when populated, same-binary multi-copy
+        // resolves to the live copy. When empty AND the matched
+        // prefix has any multi-copy section, the obj-prefix filter
+        // alone would admit both copies → fail loudly with a
+        // multi-copy diagnostic instead of silently surfacing
+        // AmbiguousVar at the var lookup.
         if let Some(active_name) = self.report.active_obj_name.as_deref()
             && let Some(matched) = obj_names.iter().find(|obj| **obj == active_name).copied()
         {
+            if !self.report.active_map_kvas.is_empty() {
+                return Ok(Snapshot {
+                    report: self.report,
+                    active_obj: Some(matched),
+                    active_map_kvas: &self.report.active_map_kvas,
+                });
+            }
+            // Walker did not publish a whitelist. Check the matched
+            // prefix's section counts; if any multi-copy, bail.
+            if let Some(&(_, b, d, r)) = counts.iter().find(|(o, _, _, _)| *o == matched)
+                && (b > 1 || d > 1 || r > 1)
+            {
+                return Err(SnapshotError::NoActiveScheduler {
+                    reason: format_multi_copy_reason(matched, b, d, r),
+                });
+            }
             return Ok(Snapshot {
                 report: self.report,
                 active_obj: Some(matched),
-                // Pair the obj-name match with the walker's KVA
-                // whitelist when populated — both filters are then
-                // required by maps_iter, so a same-binary post-swap
-                // capture (two `<obj>.bss` copies sharing the
-                // prefix) resolves to the live one's KVAs only.
-                // Empty whitelist falls back to obj-prefix only
-                // (still correct for the different-binary case).
-                active_map_kvas: &self.report.active_map_kvas,
+                active_map_kvas: &[],
             });
         }
-        match obj_names.as_slice() {
-            [] => Err(SnapshotError::NoActiveScheduler {
+        match (obj_names.as_slice(), counts.as_slice()) {
+            ([], _) => Err(SnapshotError::NoActiveScheduler {
                 reason: "snapshot has no global-section BPF maps (no scheduler \
                          attached, or capture did not include bss/data/rodata)"
                     .to_string(),
             }),
-            [only] => Ok(Snapshot {
+            ([only], [(_, b, d, r)]) if *b <= 1 && *d <= 1 && *r <= 1 => Ok(Snapshot {
                 report: self.report,
                 active_obj: Some(*only),
-                // Only one obj prefix in the snapshot — no KVA
-                // disambiguation needed; obj-prefix matching is
-                // sufficient.
+                // Only one obj prefix in the snapshot AND no
+                // section has more than one copy — obj-prefix
+                // matching uniquely picks the scheduler's maps.
                 active_map_kvas: &[],
             }),
-            multiple => Err(SnapshotError::NoActiveScheduler {
+            ([only], [(_, b, d, r)]) => Err(SnapshotError::NoActiveScheduler {
+                reason: format_multi_copy_reason(only, *b, *d, *r),
+            }),
+            (multiple, _) => Err(SnapshotError::NoActiveScheduler {
                 reason: format!(
                     "snapshot has {} BPF objects with global-section maps \
                      ({:?}) and the principled *scx_root walker could not \
@@ -517,11 +566,25 @@ impl<'a> Snapshot<'a> {
         }
     }
 
-    /// Convenience for `self.active()?.var(name)`. Returns the
-    /// active scheduler's copy of the named global variable, or a
-    /// [`SnapshotField`] carrying either
-    /// [`SnapshotError::NoActiveScheduler`] (no scheduler identifiable)
-    /// or the standard [`Self::var`] error variants
+    /// Read a single live counter from the active scheduler — the
+    /// **default** for single-variable reads. Convenience for
+    /// `self.active()?.var(name)`.
+    ///
+    /// **For multi-variable arithmetic on multiple counters** —
+    /// fractions, ratios, deltas computed across more than one
+    /// named field — use [`Self::live_vars_via`] instead.
+    /// `live_vars_via` resolves the picker ONCE across a name set
+    /// so independent per-name picks cannot corrupt the
+    /// cross-variable computation by selecting different bss
+    /// copies for different names. Repeatedly calling `live_var`
+    /// for two counters from the same scheduler is correct in the
+    /// walker-resolved case (both reads land in the same scheduler's
+    /// bss) but loses that guarantee on the picker-fallback path
+    /// — silent corruption of ratios.
+    ///
+    /// Returns a [`SnapshotField`] carrying either
+    /// [`SnapshotError::NoActiveScheduler`] (no scheduler
+    /// identifiable) or the standard [`Self::var`] error variants
     /// ([`SnapshotError::VarNotFound`] / [`SnapshotError::TypeMismatch`]
     /// from the inner var lookup).
     pub fn live_var(&self, name: &str) -> SnapshotField<'a> {
@@ -1027,6 +1090,40 @@ fn map_belongs_to_obj(map_name: &str, obj: &str) -> bool {
         .split_once('.')
         .map(|(prefix, _)| prefix == obj)
         .unwrap_or(false)
+}
+
+/// Render the multi-copy-same-prefix diagnostic for
+/// [`Snapshot::active`]. `(bss, data, rodata)` are full-name
+/// equality counts; any value > 1 means the prefix has multiple
+/// copies of that section type in the captured `maps[]` (typical
+/// cause: `Op::ReplaceScheduler` swap between two builds of the
+/// same binary leaves the dying instance's globals adjacent to
+/// the new instance's). The message names which section(s) are
+/// multi-copy and steers the operator at the picker-based
+/// disambiguators.
+fn format_multi_copy_reason(prefix: &str, bss: usize, data: usize, rodata: usize) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if bss > 1 {
+        parts.push(format!("{prefix}.bss × {bss}"));
+    }
+    if data > 1 {
+        parts.push(format!("{prefix}.data × {data}"));
+    }
+    if rodata > 1 {
+        parts.push(format!("{prefix}.rodata × {rodata}"));
+    }
+    let detail = parts.join(", ");
+    format!(
+        "snapshot has multiple same-name copies of {prefix}'s global-section maps \
+         ({detail}) and the principled *scx_root walker did not publish an \
+         active_map_kvas whitelist to disambiguate (transient swap window where \
+         the accessor-init worker has not yet republished, or the walker is \
+         unavailable on this kernel build) — use \
+         `series.live_bpf_vars_via([\"name\"], pickers::max_by_sum_u64)` for \
+         multi-variable counter co-pick, or \
+         `Snapshot::live_var_via(name, pickers::max_by_counter_value)` for a \
+         single-counter pick, to pick by counter activity"
+    )
 }
 
 // ---------------------------------------------------------------------------

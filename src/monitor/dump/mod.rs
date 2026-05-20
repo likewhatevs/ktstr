@@ -1361,6 +1361,41 @@ impl FailureDumpReport {
 /// using the kernel's own ground truth (`*scx_root`), so consumers get
 /// the right obj even mid-swap.
 ///
+/// Returns `Some((obj, kvas))` in one of two shapes:
+///
+/// 1. **Phase 1 short-circuit**: derive `<obj>` from the matched
+///    struct_ops map's name (everything before the first `.`), then
+///    count by full-name equality how many captured maps are named
+///    exactly `<obj>.bss`, `<obj>.data`, `<obj>.rodata`. Short-
+///    circuit when AT LEAST ONE of the three counts is positive
+///    AND NO count exceeds 1. Returns `(obj, vec![])` — the
+///    obj-prefix filter alone identifies the active scheduler's
+///    maps unambiguously. Matching uses full-name equality (not
+///    prefix matching) so it aligns with the consumer's strict
+///    classifier at
+///    [`crate::scenario::snapshot::Snapshot::active`] and the
+///    walker's `strip_suffix(".bss")` in
+///    `monitor::bpf_prog::extract_global_section_obj_prefix`
+///    (private helper, cited by path rather than intra-doc link).
+///
+/// 2. **Phase 2 walk (`used_maps` disambiguation)**: either the
+///    matched struct_ops map's name lacks an obj prefix (libbpf
+///    default naming: `ktstr_ops`, not `ktstr.ops`) OR multiple
+///    copies of `<prefix>.bss` / `.data` / `.rodata` coexist with
+///    the same prefix (the same-binary `Op::ReplaceScheduler`
+///    swap window leaves the dying scheduler's globals adjacent
+///    to the new scheduler's). Walks `bpf_prog.aux->used_maps`
+///    for the prog whose used_maps array contains the matched
+///    struct_ops map; returns the obj prefix derived from a
+///    sibling global-section map AND the full set of used_maps
+///    KVAs. The KVA set is the only way to disambiguate two
+///    same-prefix `<prefix>.bss` maps — the consumer pairs
+///    obj-prefix match with KVA-in-whitelist to pin the live
+///    scheduler's bss. Phase 2 only succeeds when the walker
+///    returns a non-empty `used_map_kvas`; an empty whitelist
+///    cannot disambiguate downstream, so the helper returns
+///    `None` instead of publishing a vacuous prefix.
+///
 /// Returns `None` when:
 /// - `scx_sched_state` is unavailable (no scheduler attached, BTF
 ///   missing the `scx_sched` type, or `*scx_root` could not be
@@ -1368,10 +1403,21 @@ impl FailureDumpReport {
 /// - No `BPF_MAP_TYPE_STRUCT_OPS` map had `value_kva` matching the
 ///   active sched_kva (capture race during a mid-attach window, or
 ///   the struct_ops map's value_kva was not yet populated).
-/// - The matched map's name lacks a `<obj>.` prefix.
+/// - The matched struct_ops map's `map_kva` is `0` — defensive
+///   guard against a corrupt-capture sentinel that would otherwise
+///   match every zero entry in any prog's used_maps array during
+///   the Phase 2 walk.
+/// - Phase 2 was required (ambiguous prefix or libbpf-named
+///   struct_ops) but `prog_walker` was unavailable, or the walker
+///   found no matching prog, or its returned obj prefix had no
+///   sibling `<prefix>.bss/.data/.rodata` in the captured maps,
+///   or its returned `used_map_kvas` was empty.
 ///
 /// Callers fall back to [`crate::scenario::snapshot::Snapshot::active`]'s prefix-grouping
-/// heuristic on `None`.
+/// path on `None`. That path's own per-section-count check enforces
+/// the same multi-copy detection the helper performs here, so a
+/// helper-`None` does not silently downgrade into the prefix-only
+/// AmbiguousVar surface even when the walker is unavailable.
 fn identify_active_obj_from_struct_ops(
     maps: &[super::bpf_map::BpfMapInfo],
     scx_sched_state: &Option<super::scx_walker::ScxSchedState>,
@@ -1381,83 +1427,113 @@ fn identify_active_obj_from_struct_ops(
     )>,
 ) -> Option<(String, Vec<u64>)> {
     let sched_kva = scx_sched_state.as_ref()?.sched_kva?;
-    // Phase 1: identify THE struct_ops map currently published into
-    // *scx_root via the kvalue.data ↔ sched_kva equality.
+    // Identify THE struct_ops map currently published into *scx_root
+    // via the kvalue.data ↔ sched_kva equality.
     let active_struct_ops = maps.iter().find(|m| {
         m.map_type == super::bpf_map::BPF_MAP_TYPE_STRUCT_OPS && m.value_kva == Some(sched_kva)
     })?;
-    // Phase 2: derive an obj prefix that the projection-side
-    // [`crate::scenario::snapshot::Snapshot::active`] will recognize. The split-on-first-dot rule
-    // matches libbpf's `<obj>.<section>` naming for global-section maps
-    // (`<obj>.bss`, `<obj>.data`, `<obj>.rodata`). Struct_ops map names
-    // do NOT carry the obj prefix in libbpf (the active struct_ops
-    // map for `ktstr.bpf.o` is just `ktstr_ops`, not `ktstr.ops`),
-    // so an attempt to split on `.` here yields the whole map name
-    // and would never match a global-section obj.
-    //
-    // To bridge: take the struct_ops match's obj-prefix candidate
-    // (everything before the first `.` in the map name, OR the whole
-    // name when there is no `.`) AND cross-check that the same prefix
-    // appears as the obj of at least one global-section map. If it
-    // does, return it — the multi-obj case is principled. If it
-    // doesn't (libbpf naming), return None so [`crate::scenario::snapshot::Snapshot::active`]'s
-    // prefix-grouping heuristic takes over — which in the
-    // single-scheduler case correctly resolves to the only global obj
-    // prefix.
-    //
-    // Full multi-obj disambiguation across libbpf-named struct_ops
-    // maps requires walking `bpf_prog.aux->used_maps` to find the
-    // prog whose used_maps array contains the matched struct_ops map
-    // AND a global-section map — that prog's bss-map prefix is the
-    // load-bearing obj name.
+    // Defense-in-depth: the captured `map_kva` is the kernel
+    // `struct bpf_map *` address; `0` is the "no identity captured"
+    // sentinel. The Phase 2 walker compares this value byte-for-byte
+    // against entries in each prog's used_maps array, so a zero
+    // target would match every zero entry in any prog's used_maps
+    // (zeros appear for unused slots) and could publish garbage. The
+    // production bpf_map walker already filters zero-KVA entries,
+    // but this guard makes the contract local.
+    if active_struct_ops.map_kva == 0 {
+        return None;
+    }
+    // Phase 1: derive an obj prefix from the struct_ops map's name.
+    // libbpf's current default emits the bare struct_ops var name
+    // (`ktstr_ops`); the split-on-`.` is a defensive fallback for
+    // alternate loader output (or a hypothetical dotted form). On the
+    // bare name the split is a no-op and the cross-check below
+    // correctly rejects via the missing `<name>.{bss,data,rodata}`.
+    // The Phase 1 short-circuit is only safe when the captured
+    // `maps[]` has at most one map per section type for the prefix —
+    // same-binary `Op::ReplaceScheduler` leaves two `<prefix>.bss`
+    // maps coexisting and the obj-prefix filter alone cannot pick
+    // the live one. Multi-copy ambiguity forces Phase 2.
     let so_name = active_struct_ops.name();
     let so_prefix = so_name.split('.').next().filter(|s| !s.is_empty());
     if let Some(prefix) = so_prefix {
-        let has_matching_global = maps.iter().any(|m| {
-            m.map_type != super::bpf_map::BPF_MAP_TYPE_STRUCT_OPS
-                && (m.name().starts_with(&format!("{prefix}.bss"))
-                    || m.name().starts_with(&format!("{prefix}.data"))
-                    || m.name().starts_with(&format!("{prefix}.rodata")))
-        });
-        if has_matching_global {
-            // Phase-1 hit: name resolved from the struct_ops map
-            // name directly. Phase-1 has no used_maps walk → no
-            // map-KVA set to publish; consumer falls back to
-            // obj-prefix matching when active_map_kvas is empty
-            // (still correct semantics, just without same-binary
-            // disambiguation guarantee).
+        let (bss_count, data_count, rodata_count) = count_global_sections_for_prefix(maps, prefix);
+        let has_matching_global = bss_count + data_count + rodata_count > 0;
+        let unambiguous = bss_count <= 1 && data_count <= 1 && rodata_count <= 1;
+        if has_matching_global && unambiguous {
+            // Prefix alone is sufficient: at most one map per section
+            // type carries `<prefix>`. Phase 2's walker is not needed
+            // to disambiguate; publish empty `active_map_kvas`.
             return Some((prefix.to_string(), Vec::new()));
         }
+        // Either no matching global (libbpf-named struct_ops case) OR
+        // multiple `<prefix>.<section>` maps coexist (same-binary swap
+        // window). Both require Phase 2's used_maps walk to identify
+        // the live scheduler's maps unambiguously.
     }
-    // Phase-2 fallback: the struct_ops map name lacks a usable obj
-    // prefix (libbpf default: `ktstr_ops` not `ktstr.ops`) OR the
-    // prefix exists but no `<prefix>.bss/.data/.rodata` global-section
-    // map carries it. Walk `prog.aux->used_maps` for the prog whose
-    // used_maps contains both the matched struct_ops map AND a
-    // sibling global-section map — that map's prefix names the obj.
+    // Phase 2: walk `prog.aux->used_maps` for the prog whose
+    // used_maps array contains the matched struct_ops map. That
+    // prog is the live scheduler's; its used_maps array names the
+    // live scheduler's global-section maps by KVA. The walker
+    // derives `<obj>` from a sibling global-section map's name and
+    // returns the full set of used_maps KVAs.
     //
-    // The walker's returned prefix MUST appear as a
-    // `<prefix>.<section>` map in the captured `maps[]` (defense
-    // against the walker reading garbage from a torn used_maps
-    // window). Only publish on cross-check success.
+    // Two cross-checks gate the return:
+    // 1. The walker's returned prefix MUST appear as a
+    //    `<prefix>.<section>` map in the captured `maps[]` (defense
+    //    against the walker reading garbage from a torn used_maps
+    //    window).
+    // 2. The returned `used_map_kvas` MUST be non-empty. An empty
+    //    set would re-trigger the multi-copy ambiguity downstream
+    //    (obj-prefix filter admits every captured copy) — Phase 2's
+    //    whole purpose is to publish a disambiguating whitelist;
+    //    publishing nothing would defeat it.
     let (prog_accessor, map_offsets) = prog_walker?;
     let walker_match =
         prog_accessor.find_active_obj_via_used_maps(active_struct_ops.map_kva, map_offsets)?;
-    let walker_prefix_validated = maps.iter().any(|m| {
-        m.map_type != super::bpf_map::BPF_MAP_TYPE_STRUCT_OPS
-            && (m
-                .name()
-                .starts_with(&format!("{}.bss", walker_match.obj_name))
-                || m.name()
-                    .starts_with(&format!("{}.data", walker_match.obj_name))
-                || m.name()
-                    .starts_with(&format!("{}.rodata", walker_match.obj_name)))
-    });
-    if walker_prefix_validated {
+    if walker_match.used_map_kvas.is_empty() {
+        return None;
+    }
+    let (wb, wd, wr) = count_global_sections_for_prefix(maps, &walker_match.obj_name);
+    if wb + wd + wr > 0 {
         Some((walker_match.obj_name, walker_match.used_map_kvas))
     } else {
         None
     }
+}
+
+/// Count captured maps named exactly `<prefix>.bss`, `<prefix>.data`,
+/// `<prefix>.rodata`. Full-name equality (not prefix matching) so it
+/// aligns with the consumer's `name.ends_with(".bss"/...)` classifier
+/// at [`crate::scenario::snapshot::Snapshot::active`] and with the
+/// walker's `strip_suffix(".bss")` in
+/// `monitor::bpf_prog::extract_global_section_obj_prefix` (private
+/// helper, cited by path rather than intra-doc link). A hypothetical
+/// `<prefix>.bss.shared` map would count as zero here (the walker
+/// treats it the same way), so the counts stay in lockstep across
+/// the three sites that classify global-section maps for a scheduler
+/// obj.
+///
+/// Skips `BPF_MAP_TYPE_STRUCT_OPS` maps so the active scheduler's
+/// own struct_ops map (which `Snapshot::active` filters by type as
+/// well) never inflates the global-section totals.
+fn count_global_sections_for_prefix(
+    maps: &[super::bpf_map::BpfMapInfo],
+    prefix: &str,
+) -> (usize, usize, usize) {
+    let bss_name = format!("{prefix}.bss");
+    let data_name = format!("{prefix}.data");
+    let rodata_name = format!("{prefix}.rodata");
+    maps.iter()
+        .filter(|m| m.map_type != super::bpf_map::BPF_MAP_TYPE_STRUCT_OPS)
+        .fold((0usize, 0usize, 0usize), |(b, d, r), m| {
+            let n = m.name();
+            (
+                b + usize::from(n == bss_name),
+                d + usize::from(n == data_name),
+                r + usize::from(n == rodata_name),
+            )
+        })
 }
 
 /// Pair of failure-dump snapshots captured at two points in a stall.

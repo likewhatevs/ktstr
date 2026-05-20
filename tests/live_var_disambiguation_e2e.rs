@@ -70,7 +70,37 @@ const STAGED_ALT_SCHED: Scheduler =
 /// samples in BOTH phases proves the filter narrows to the live
 /// copy.
 fn assert_live_var_resolves_across_swap(result: &VmResult) -> Result<()> {
-    let series = result.periodic_series();
+    // Drain the bridge ONCE — the deterministic multi-bss gate at
+    // the end needs to inspect raw `report.maps[]` +
+    // `report.active_map_kvas` per sample (not just the projected
+    // SeriesField). Pre-scan drained for those counts BEFORE
+    // moving it into the series constructor (DrainedSnapshotEntry
+    // is not Clone).
+    use std::collections::BTreeSet;
+    let post_swap_phase = ktstr::assert::Phase::step(1);
+    let drained = result.snapshot_bridge.drain_ordered_with_stats();
+    let mut multi_bss_phase1_count = 0usize;
+    let mut walker_published_phase1_count = 0usize;
+    for row in &drained {
+        if row.step_index != Some(post_swap_phase.as_u16()) {
+            continue;
+        }
+        let bss_copies = row
+            .report
+            .maps
+            .iter()
+            .filter(|m| m.name == "scx_ktstr.bss")
+            .count();
+        if bss_copies >= 2 {
+            multi_bss_phase1_count += 1;
+        }
+        if !row.report.active_map_kvas.is_empty() {
+            walker_published_phase1_count += 1;
+        }
+    }
+    let series =
+        ktstr::scenario::sample::SampleSeries::from_drained_typed(drained, result.monitor.clone())
+            .periodic_only();
     anyhow::ensure!(
         !series.is_empty(),
         "no periodic samples captured — the test cannot exercise \
@@ -113,17 +143,33 @@ fn assert_live_var_resolves_across_swap(result: &VmResult) -> Result<()> {
         first_err.unwrap_or_else(|| "(unset)".to_string()),
     );
 
-    // Hard-pin per-phase resolution: a regression that breaks
-    // the NEW infrastructure (e.g., the KVA filter narrows wrong)
-    // could silently let phase 0 (only primary bss exists, no
-    // ambiguity to resolve) resolve while phase 1 (both bss
-    // copies coexist, requires the KVA filter) consistently
-    // fails — the `ok_count >= 1` check above would pass without
-    // exercising the new code path. Require a successful
-    // resolution in the POST-SWAP phase specifically. Use
-    // SeriesField::phases_iter() to bind each value to its phase.
-    use std::collections::BTreeSet;
-    let post_swap = ktstr::assert::Phase::step(1);
+    // Reject ActiveFilterExcludedMaps too — the KVA filter
+    // narrowing to zero would surface this and we want to know
+    // if it ever happens under the e2e (would indicate stale
+    // walker capture vs. live captured maps).
+    let first_filter_excluded = nr_dispatched.values_iter().find_map(|s| match s {
+        Err(ktstr::scenario::snapshot::SnapshotError::ActiveFilterExcludedMaps { .. }) => {
+            Some(format!("{:?}", s))
+        }
+        _ => None,
+    });
+    anyhow::ensure!(
+        first_filter_excluded.is_none(),
+        "bpf_live_u64 surfaced ActiveFilterExcludedMaps — the KVA whitelist \
+         excluded every captured `<active_obj>.*` map (stale walker capture, \
+         KVA aliasing, or walker mispointing). First: {}",
+        first_filter_excluded.unwrap_or_default(),
+    );
+
+    // Hard-pin per-phase resolution. A regression that breaks
+    // the NEW infrastructure (KVA filter narrows wrong) could
+    // silently let phase 0 (only primary bss exists) resolve
+    // while phase 1 (both bss copies coexist) fails — `ok_count
+    // >= 1` would pass without exercising the new code path.
+    // Require BOTH the post-swap phase to have at least one
+    // sample AND at least one Ok in it; the `if-then` form would
+    // give a free pass when phase 1 happened to have zero
+    // samples (timing).
     let mut phases_with_samples: BTreeSet<u16> = BTreeSet::new();
     let mut phases_with_ok: BTreeSet<u16> = BTreeSet::new();
     for (phase_opt, slot) in nr_dispatched.phases_iter().zip(nr_dispatched.values_iter()) {
@@ -134,15 +180,46 @@ fn assert_live_var_resolves_across_swap(result: &VmResult) -> Result<()> {
             }
         }
     }
-    // The KVA filter's load-bearing case is phase 1 (post-swap,
-    // both bss copies coexist). Require it specifically.
-    if phases_with_samples.contains(&post_swap.as_u16()) {
+    anyhow::ensure!(
+        phases_with_samples.contains(&post_swap_phase.as_u16()),
+        "no post-swap (Phase::step(1)) samples captured — phase-1 \
+         hold may be too short or num_snapshots too low to land a \
+         sample after the swap. phases_with_samples={phases_with_samples:?}",
+    );
+    anyhow::ensure!(
+        phases_with_ok.contains(&post_swap_phase.as_u16()),
+        "no post-swap (Phase::step(1)) sample resolved bpf_live_u64 — \
+         the same-binary disambiguation path is the load-bearing \
+         new code. phases_with_samples={phases_with_samples:?} \
+         phases_with_ok={phases_with_ok:?} ok_count={ok_count}/{total}",
+    );
+
+    // Conditional walker-fired pin (deterministic gates computed
+    // pre-series from `drained` above). The scx-ktstr fixture's
+    // BPF object teardown is fast — the old scheduler's bss is
+    // typically freed before the first post-swap freeze fires, so
+    // the multi-bss case may not trigger in every run. When it
+    // DOES trigger (multi_bss_phase1_count >= 1), Phase 2 walker
+    // MUST have fired to publish a non-empty `active_map_kvas`
+    // whitelist — without that, the consumer's prefix-only filter
+    // would silently admit both copies and surface AmbiguousVar
+    // (the regression-detection condition).
+    //
+    // The deterministic version of this gate — forcing the
+    // multi-bss case by pinning a BPF fd to the old scheduler's
+    // bss across the swap so it cannot be freed — needs framework
+    // support (an Op or test primitive that holds a BPF map fd
+    // open through `Op::ReplaceScheduler`) and is tracked as a
+    // separate task. The downstream scx_mitosis test exercises
+    // the same path deterministically via mitosis's heavier
+    // per-cell state.
+    if multi_bss_phase1_count >= 1 {
         anyhow::ensure!(
-            phases_with_ok.contains(&post_swap.as_u16()),
-            "no post-swap (Phase::step(1)) sample resolved bpf_live_u64 — \
-             the same-binary disambiguation path is the load-bearing \
-             new code. phases_with_samples={phases_with_samples:?} \
-             phases_with_ok={phases_with_ok:?} ok_count={ok_count}/{total}",
+            walker_published_phase1_count >= 1,
+            "post-swap snapshots captured the multi-bss window ({multi_bss_phase1_count} \
+             samples with ≥2 scx_ktstr.bss copies) but Phase 2 walker NEVER published \
+             active_map_kvas — the consumer's prefix-only fallback admits both copies \
+             and surfaces AmbiguousVar. Walker is failing to resolve the live obj.",
         );
     }
     Ok(())
