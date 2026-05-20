@@ -623,6 +623,59 @@ pub trait PhaseMapExt<T> {
         T: Copy + Into<f64> + std::fmt::Display;
 }
 
+/// Per-phase "share of total" reducer. Specialized for the dominant
+/// counter shape (`BTreeMap<Phase, u64>`) because `u64: Into<f64>`
+/// is intentionally absent (cast is lossy) — a generic
+/// [`PhaseMapExt`] method with an `Into<f64>` bound would reject
+/// every counter-delta map test authors actually reach for.
+///
+/// For every phase present in BOTH `self` AND `other`, computes
+/// `self_value as f64 / (self_value + other_value) as f64`. When
+/// both values are zero (sum is zero), the fraction is `0.0`
+/// rather than NaN — the only sound choice when there's no signal
+/// to share. Phases present in only one input drop from the
+/// result, mirroring [`PhaseMapExt::zip_per_phase`]'s
+/// intersection-only semantics.
+///
+/// Targets the "cross-LLC dispatch fraction" idiom (`nr_cross /
+/// (nr_cross + nr_same)`) and similar share-of-total patterns.
+/// The general fold via [`PhaseMapExt::zip_per_phase`] requires
+/// the caller to spell the safe-divide branch inline at every
+/// call site; this trait owns the branch so test code expresses
+/// the metric in one chain.
+pub trait FracPair {
+    /// See trait-level doc for the safe-divide and intersection-only
+    /// semantics.
+    fn frac_pair(
+        &self,
+        other: &Self,
+    ) -> std::collections::BTreeMap<crate::assert::Phase, f64>;
+}
+
+impl FracPair for std::collections::BTreeMap<crate::assert::Phase, u64> {
+    fn frac_pair(
+        &self,
+        other: &Self,
+    ) -> std::collections::BTreeMap<crate::assert::Phase, f64> {
+        self.iter()
+            .filter_map(|(p, n)| {
+                other.get(p).map(|m| {
+                    // `saturating_add` guards against u64 overflow on
+                    // long-running counter pairs (the realistic
+                    // failure is two near-u64::MAX counter deltas;
+                    // wrap would produce a misleading fraction).
+                    // Saturation to u64::MAX still yields a sensible
+                    // fraction `n / u64::MAX` ≈ 0.0 for non-MAX `n`
+                    // and 1.0 for the saturating case, with no NaN.
+                    let total = n.saturating_add(*m);
+                    let frac = if total > 0 { *n as f64 / total as f64 } else { 0.0 };
+                    (*p, frac)
+                })
+            })
+            .collect()
+    }
+}
+
 impl<T> PhaseMapExt<T> for std::collections::BTreeMap<crate::assert::Phase, T> {
     fn zip_per_phase<U, R>(
         &self,
@@ -657,6 +710,7 @@ impl<T> PhaseMapExt<T> for std::collections::BTreeMap<crate::assert::Phase, T> {
             later_value: self.get(&later).copied(),
         }
     }
+
 }
 
 /// Per-sample scalar claim builder returned by
@@ -3286,6 +3340,105 @@ mod tests {
             "expected pass info note carrying the composed-metric label, \
              got {:?}",
             r.info_notes,
+        );
+    }
+
+    /// `frac_pair` collapses the `n / (n + m)` safe-divide closure
+    /// that `zip_per_phase` callers spell inline. Two phase maps
+    /// with overlapping phase keys produce per-phase fractions of
+    /// `self / (self + other)`.
+    #[test]
+    fn frac_pair_computes_share_of_total_per_phase() {
+        let mut cross: std::collections::BTreeMap<crate::assert::Phase, u64> =
+            std::collections::BTreeMap::new();
+        cross.insert(crate::assert::Phase::step(0), 100);
+        cross.insert(crate::assert::Phase::step(1), 100);
+        let mut same: std::collections::BTreeMap<crate::assert::Phase, u64> =
+            std::collections::BTreeMap::new();
+        same.insert(crate::assert::Phase::step(0), 200);
+        same.insert(crate::assert::Phase::step(1), 600);
+        let frac = cross.frac_pair(&same);
+        assert!(
+            (frac[&crate::assert::Phase::step(0)] - (100.0 / 300.0)).abs() < 1e-9,
+            "phase 0: 100/(100+200) = 1/3; got {}",
+            frac[&crate::assert::Phase::step(0)],
+        );
+        assert!(
+            (frac[&crate::assert::Phase::step(1)] - (100.0 / 700.0)).abs() < 1e-9,
+            "phase 1: 100/(100+600) = 1/7; got {}",
+            frac[&crate::assert::Phase::step(1)],
+        );
+    }
+
+    /// When both inputs sum to zero for a phase, `frac_pair`
+    /// MUST yield `0.0` (not NaN). The only sound choice when
+    /// there's no signal to share.
+    #[test]
+    fn frac_pair_zero_total_yields_zero_not_nan() {
+        let mut a: std::collections::BTreeMap<crate::assert::Phase, u64> =
+            std::collections::BTreeMap::new();
+        a.insert(crate::assert::Phase::step(0), 0);
+        let mut b: std::collections::BTreeMap<crate::assert::Phase, u64> =
+            std::collections::BTreeMap::new();
+        b.insert(crate::assert::Phase::step(0), 0);
+        let frac = a.frac_pair(&b);
+        let v = frac[&crate::assert::Phase::step(0)];
+        assert_eq!(v, 0.0, "zero/(zero+zero) must collapse to 0.0, got {v}");
+        assert!(!v.is_nan(), "frac_pair must never produce NaN");
+    }
+
+    /// `frac_pair` MUST saturate on u64 overflow rather than wrap.
+    /// Two near-`u64::MAX` counter deltas wrapping silently would
+    /// produce a wrong fraction. With `saturating_add`, the total
+    /// caps at `u64::MAX` so the fraction is bounded and finite.
+    #[test]
+    fn frac_pair_saturates_on_u64_overflow_no_wrap() {
+        let mut a: std::collections::BTreeMap<crate::assert::Phase, u64> =
+            std::collections::BTreeMap::new();
+        a.insert(crate::assert::Phase::step(0), u64::MAX);
+        let mut b: std::collections::BTreeMap<crate::assert::Phase, u64> =
+            std::collections::BTreeMap::new();
+        b.insert(crate::assert::Phase::step(0), 1);
+        let frac = a.frac_pair(&b);
+        let v = frac[&crate::assert::Phase::step(0)];
+        // u64::MAX.saturating_add(1) == u64::MAX. The fraction is
+        // `u64::MAX as f64 / u64::MAX as f64` — both sides land on
+        // the same f64 value (lossy cast collapses the bottom
+        // ~11 bits) so the ratio is exactly 1.0.
+        assert_eq!(
+            v, 1.0,
+            "saturating_add caps total at u64::MAX; both sides cast to same f64 → 1.0; got {v}",
+        );
+        assert!(!v.is_nan(), "must never produce NaN even at saturation");
+        assert!(v.is_finite(), "must produce a finite value even at saturation");
+    }
+
+    /// Intersection-only semantics: phases present in only one
+    /// input drop from the result. Mirrors `zip_per_phase`.
+    #[test]
+    fn frac_pair_intersects_phase_keys_only() {
+        let mut a: std::collections::BTreeMap<crate::assert::Phase, u64> =
+            std::collections::BTreeMap::new();
+        a.insert(crate::assert::Phase::step(0), 100);
+        a.insert(crate::assert::Phase::step(1), 200);
+        let mut b: std::collections::BTreeMap<crate::assert::Phase, u64> =
+            std::collections::BTreeMap::new();
+        b.insert(crate::assert::Phase::step(1), 100);
+        b.insert(crate::assert::Phase::step(2), 50);
+        let frac = a.frac_pair(&b);
+        assert!(
+            !frac.contains_key(&crate::assert::Phase::step(0)),
+            "phase 0 absent from b — must drop from result",
+        );
+        assert!(
+            !frac.contains_key(&crate::assert::Phase::step(2)),
+            "phase 2 absent from a — must drop from result",
+        );
+        assert_eq!(frac.len(), 1, "only phase 1 is in the intersection");
+        assert!(
+            (frac[&crate::assert::Phase::step(1)] - (200.0 / 300.0)).abs() < 1e-9,
+            "phase 1: 200/(200+100); got {}",
+            frac[&crate::assert::Phase::step(1)],
         );
     }
 }

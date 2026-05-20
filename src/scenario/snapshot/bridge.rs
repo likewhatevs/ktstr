@@ -491,6 +491,20 @@ impl std::fmt::Debug for SnapshotBridge {
     }
 }
 
+/// Match the periodic dispatch loop's tag format exactly:
+/// `"periodic_"` + 3 ASCII digits. Source of truth is the
+/// coordinator's `format!("periodic_{:03}", idx)` emission at
+/// `src/vmm/freeze_coord/state.rs`. Distinct from
+/// `tag.starts_with("periodic_")` (which would accept arbitrary
+/// user `Op::CaptureSnapshot` tags whose names happen to share
+/// that prefix and pollute the `periodic_real_count` floor).
+fn is_periodic_tag(tag: &str) -> bool {
+    match tag.strip_prefix("periodic_") {
+        Some(rest) => rest.len() == 3 && rest.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
+}
+
 impl SnapshotBridge {
     /// Build a bridge from a capture callback. The callback may
     /// freeze the VM, build the report, or return `None` when
@@ -1129,6 +1143,50 @@ impl SnapshotBridge {
         self.snapshots.lock_unpoisoned().reports.is_empty()
     }
 
+    /// Count of stored periodic-tagged reports that carry REAL BPF
+    /// state (not placeholders synthesized by rendezvous timeouts /
+    /// gate suppression). Distinct from
+    /// [`crate::vmm::VmResult::periodic_fired`], which counts every
+    /// periodic boundary the freeze coordinator attempted —
+    /// including the ones that landed only a placeholder when the
+    /// vCPU rendezvous timed out.
+    ///
+    /// This is the "useful data produced" floor: a scheduler that
+    /// attached but produced nothing but placeholders surfaces as
+    /// `periodic_real_count() == 0` here even though
+    /// `periodic_fired` may be `target`. Tests that want a
+    /// stricter smoke-floor than `periodic_fired >= 1` (which
+    /// passes on placeholder-only fills) read this query.
+    ///
+    /// **Tag-format pin.** The coordinator emits periodic tags via
+    /// `format!("periodic_{:03}", idx)` at
+    /// `src/vmm/freeze_coord/state.rs` — always
+    /// `"periodic_"` + exactly 3 ASCII digits. The match here
+    /// enforces that exact shape (NOT a loose prefix) so a user
+    /// `Op::CaptureSnapshot { name: "periodic_kaslr" }` cannot
+    /// collide with the periodic dispatch namespace and pollute
+    /// the count.
+    ///
+    /// **What "real" measures.** A placeholder report may still
+    /// carry `vcpu_regs` from a degraded capture (see
+    /// `src/vmm/freeze_coord/mod.rs` periodic-degraded path —
+    /// `degraded.vcpu_regs` is preserved into the stored
+    /// placeholder). The floor here treats those as "not real"
+    /// because the contract is "the test produced BPF-state data"
+    /// — vcpu_regs alone don't satisfy that. Tests that want the
+    /// looser "any capture-attempt landed" floor read
+    /// [`crate::vmm::VmResult::periodic_fired`] instead.
+    pub fn periodic_real_count(&self) -> u32 {
+        let store = self.snapshots.lock_unpoisoned();
+        let mut n: u32 = 0;
+        for (tag, report) in &store.reports {
+            if is_periodic_tag(tag) && !report.is_placeholder {
+                n = n.saturating_add(1);
+            }
+        }
+        n
+    }
+
     /// True when a stored report already exists for `name`. Lets the
     /// freeze coordinator's final-drain placeholder path skip storing
     /// a degraded "coord exited before capture" report on top of a
@@ -1547,5 +1605,81 @@ mod accessor_wait_tests {
         assert_eq!(bridge.accessor_publish_seqno(), 0);
         seqno.store(42, std::sync::atomic::Ordering::Release);
         assert_eq!(bridge.accessor_publish_seqno(), 42);
+    }
+}
+
+#[cfg(test)]
+mod periodic_tag_tests {
+    use super::*;
+
+    /// `is_periodic_tag` MUST accept the exact format the
+    /// coordinator emits: `"periodic_"` + 3 ASCII digits. Pins the
+    /// canonical shape so a regression that relaxed the matcher
+    /// (e.g., back to `starts_with("periodic_")`) would surface
+    /// immediately via the rejected-tag cases below.
+    #[test]
+    fn is_periodic_tag_accepts_canonical_three_digit_index() {
+        assert!(is_periodic_tag("periodic_000"));
+        assert!(is_periodic_tag("periodic_007"));
+        assert!(is_periodic_tag("periodic_123"));
+        assert!(is_periodic_tag("periodic_999"));
+    }
+
+    /// User-supplied `Op::CaptureSnapshot` tags whose names start
+    /// with `"periodic_"` but DON'T match the strict
+    /// `periodic_NNN` shape MUST be rejected. This is the
+    /// load-bearing defense against tag collision polluting
+    /// `periodic_real_count`.
+    #[test]
+    fn is_periodic_tag_rejects_user_tag_collisions() {
+        assert!(!is_periodic_tag("periodic_kaslr"));
+        assert!(!is_periodic_tag("periodic_user_baseline"));
+        assert!(!is_periodic_tag("periodic_"));
+        assert!(!is_periodic_tag("periodic_1"));
+        assert!(!is_periodic_tag("periodic_12"));
+        assert!(!is_periodic_tag("periodic_1234"));
+        assert!(!is_periodic_tag("periodic_00a"));
+        assert!(!is_periodic_tag("periodic_007 "));
+        assert!(!is_periodic_tag("PERIODIC_000"));
+        assert!(!is_periodic_tag("capture_my_thing"));
+        assert!(!is_periodic_tag(""));
+        assert!(!is_periodic_tag("periodic"));
+    }
+
+    /// `periodic_real_count` MUST count only canonical
+    /// `periodic_NNN` tags. A bridge with a real `periodic_000`
+    /// alongside a real user `periodic_kaslr` capture MUST
+    /// surface count = 1 — the user tag does NOT inflate the
+    /// floor.
+    #[test]
+    fn periodic_real_count_ignores_user_tag_with_periodic_prefix() {
+        let cb: CaptureCallback = Arc::new(|_| None);
+        let bridge = SnapshotBridge::new(cb);
+        // Real periodic capture from the coordinator.
+        let mut real_periodic =
+            crate::monitor::dump::FailureDumpReport::default();
+        real_periodic.schema = crate::monitor::dump::SCHEMA_SINGLE.to_string();
+        real_periodic.is_placeholder = false;
+        bridge.store("periodic_000", real_periodic);
+        // User-supplied CaptureSnapshot tag that happens to start
+        // with "periodic_" — MUST NOT count.
+        let mut user_capture =
+            crate::monitor::dump::FailureDumpReport::default();
+        user_capture.schema = crate::monitor::dump::SCHEMA_SINGLE.to_string();
+        user_capture.is_placeholder = false;
+        bridge.store("periodic_kaslr", user_capture);
+        // A placeholder under a canonical tag — counted as fired
+        // but NOT as real.
+        bridge.store(
+            "periodic_001",
+            crate::monitor::dump::FailureDumpReport::placeholder("rendezvous timed out"),
+        );
+        assert_eq!(
+            bridge.periodic_real_count(),
+            1,
+            "only the canonical periodic_000 real capture counts; \
+             user tag periodic_kaslr (even though real) must be \
+             excluded by the strict matcher",
+        );
     }
 }

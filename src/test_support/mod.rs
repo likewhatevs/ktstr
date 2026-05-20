@@ -90,8 +90,8 @@ pub use dispatch::{
 pub use entry::{
     BinaryKindJson, BpfMapWrite, CgroupPath, KTSTR_SCHEDULERS, KTSTR_TESTS, KtstrTestEntry,
     MemSideCache, NumaDistance, NumaNode, Scheduler, SchedulerJson, SchedulerSpec, Sysctl,
-    Topology, TopologyConstraints, TopologyConstraintsJson, TopologyJson, find_scheduler,
-    find_test,
+    Topology, TopologyConstraints, TopologyConstraintsJson, TopologyJson,
+    default_post_vm_periodic_fired, find_scheduler, find_test,
 };
 pub use eval::{KernelUnavailable, ResolveSource, resolve_scheduler, resolve_test_kernel};
 pub(crate) use eval::{record_skip_sidecar, run_ktstr_test_inner};

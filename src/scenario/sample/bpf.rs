@@ -63,6 +63,100 @@ impl SampleSeries {
         })
     }
 
+    /// Per-snapshot co-picked BPF projection of N counters from the
+    /// SAME global-section map. Lifts [`Snapshot::live_vars_via`] to
+    /// the series level: for each sample, calls the picker ONCE per
+    /// snapshot and projects the resulting `N` `SnapshotField`s as
+    /// `u64` into `N` parallel [`SeriesField`]s.
+    ///
+    /// **Why this exists.** The single-name `Self::bpf` closure shape
+    /// forces tests that need two co-picked counters (e.g.
+    /// `nr_cross_dispatch` + `nr_same_dispatch` from the same
+    /// scheduler bss copy after `Op::ReplaceScheduler`) to call the
+    /// picker TWICE per snapshot — once for each derived
+    /// `SeriesField` — paying picker cost `2N` instead of `N`. The
+    /// per-snapshot dedup happens here: one `live_vars_via` call per
+    /// row, eagerly split into `N` u64 vectors before any
+    /// `SeriesField` materializes.
+    ///
+    /// **Lifetime / coverage gaps surface per field.** If a snapshot
+    /// is a placeholder, every field's slot for that row carries the
+    /// same [`SnapshotError::PlaceholderSample`]. If `live_vars_via`
+    /// fails (no candidate map has all `N` names, or the picker
+    /// returns `None`), every field's slot carries the same
+    /// underlying [`SnapshotError`] — the failure is shared, not
+    /// split. Per-field `.as_u64()` casts that fail (the picked
+    /// field doesn't render as a u64) surface as per-field
+    /// [`SnapshotError::TypeMismatch`] without contaminating sibling
+    /// fields.
+    ///
+    /// The label routed onto each resulting [`SeriesField`] is the
+    /// caller-supplied name from `names` at the matching position.
+    pub fn live_bpf_vars_via<const N: usize, P>(
+        &self,
+        names: [&str; N],
+        picker: P,
+    ) -> [SeriesField<u64>; N]
+    where
+        P: for<'a> Fn(&[(&'a str, Vec<SnapshotField<'a>>)]) -> Option<usize> + Copy,
+    {
+        let mut per_field: [Vec<crate::scenario::snapshot::SnapshotResult<u64>>; N] =
+            std::array::from_fn(|_| Vec::with_capacity(self.rows.len()));
+        let mut tags: Vec<String> = Vec::with_capacity(self.rows.len());
+        let mut elapsed: Vec<u64> = Vec::with_capacity(self.rows.len());
+        let mut phases: Vec<Option<crate::assert::Phase>> = Vec::with_capacity(self.rows.len());
+
+        for row in &self.rows {
+            tags.push(row.tag.clone());
+            elapsed.push(row.elapsed_ms);
+            phases.push(row.step_index.map(crate::assert::Phase::from));
+
+            if row.report.is_placeholder {
+                let err = crate::scenario::snapshot::SnapshotError::PlaceholderSample {
+                    tag: row.tag.clone(),
+                    reason: row
+                        .report
+                        .scx_walker_unavailable
+                        .clone()
+                        .unwrap_or_else(|| "placeholder report".to_string()),
+                };
+                for slot in &mut per_field {
+                    slot.push(Err(err.clone()));
+                }
+                continue;
+            }
+
+            let snap = Snapshot::new(&row.report);
+            // Slice cast: live_vars_via takes &[&str], we hold [&str; N].
+            match snap.live_vars_via(&names, picker) {
+                Ok(fields) => {
+                    debug_assert_eq!(fields.len(), N);
+                    for (i, field) in fields.into_iter().enumerate() {
+                        per_field[i].push(field.as_u64());
+                    }
+                }
+                Err(e) => {
+                    for slot in &mut per_field {
+                        slot.push(Err(e.clone()));
+                    }
+                }
+            }
+        }
+
+        // Build N SeriesFields, each consuming its own per-field
+        // value vector. Tags / elapsed / phases share the same
+        // sample identity across fields — clone for each output.
+        std::array::from_fn(|i| {
+            crate::assert::temporal::SeriesField::from_parts_with_phases(
+                names[i].to_string(),
+                tags.clone(),
+                elapsed.clone(),
+                std::mem::take(&mut per_field[i]),
+                phases.clone(),
+            )
+        })
+    }
+
     /// Auto-project a top-level BPF map's struct members. The
     /// returned [`BpfMapProjector`] auto-discovers struct member
     /// names at sample 0 and exposes them via `.field_u64(name)` /
@@ -531,5 +625,300 @@ mod tests {
             "empty series must yield empty f64_fields, got {} entries",
             f64s.len(),
         );
+    }
+
+    /// Build a synthetic two-bss report: `scx_obj.bss` with `cross
+    /// = a` + `same = b`, and OPTIONALLY a second `scx_other.bss`
+    /// with `cross = c` + `same = d`. Mirrors the post-
+    /// `Op::ReplaceScheduler` shape where two scheduler obj bss
+    /// copies coexist in the same snapshot and `live_vars_via`'s
+    /// picker resolves which one is live by max-sum.
+    fn two_bss_report(
+        primary: (u64, u64),
+        secondary: Option<(u64, u64)>,
+    ) -> FailureDumpReport {
+        fn make_bss(name: &str, cross: u64, same: u64) -> FailureDumpMap {
+            FailureDumpMap {
+                name: name.into(),
+                map_type: 2,
+                value_size: 16,
+                max_entries: 1,
+                value: Some(RenderedValue::Struct {
+                    type_name: Some(name.into()),
+                    members: vec![
+                        RenderedMember {
+                            name: "cross".into(),
+                            value: RenderedValue::Uint {
+                                bits: 64,
+                                value: cross,
+                            },
+                        },
+                        RenderedMember {
+                            name: "same".into(),
+                            value: RenderedValue::Uint {
+                                bits: 64,
+                                value: same,
+                            },
+                        },
+                    ],
+                }),
+                entries: Vec::new(),
+                percpu_entries: Vec::new(),
+                percpu_hash_entries: Vec::new(),
+                arena: None,
+                ringbuf: None,
+                stack_trace: None,
+                fd_array: None,
+                error: None,
+            }
+        }
+        let mut maps = vec![make_bss("scx_obj.bss", primary.0, primary.1)];
+        if let Some((c, s)) = secondary {
+            maps.push(make_bss("scx_other.bss", c, s));
+        }
+        FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            maps,
+            ..Default::default()
+        }
+    }
+
+    /// Single-candidate map: `live_bpf_vars_via` should resolve
+    /// both names from `scx_obj.bss` per sample and produce two
+    /// parallel `SeriesField<u64>`s carrying the per-sample
+    /// `cross` and `same` values.
+    #[test]
+    fn live_bpf_vars_via_single_map_co_picks_both_names() {
+        let drained = vec![
+            (
+                "periodic_000".to_string(),
+                two_bss_report((10, 20), None),
+                None,
+                Some(100),
+            ),
+            (
+                "periodic_001".to_string(),
+                two_bss_report((30, 40), None),
+                None,
+                Some(200),
+            ),
+        ];
+        let series = SampleSeries::from_drained(drained, None);
+        let [cross, same] = series.live_bpf_vars_via(
+            ["cross", "same"],
+            crate::scenario::snapshot::pickers::max_by_sum_u64,
+        );
+        let cross_values: Vec<u64> = cross
+            .values_iter()
+            .filter_map(|r| r.as_ref().ok().copied())
+            .collect();
+        let same_values: Vec<u64> = same
+            .values_iter()
+            .filter_map(|r| r.as_ref().ok().copied())
+            .collect();
+        assert_eq!(cross_values, vec![10, 30]);
+        assert_eq!(same_values, vec![20, 40]);
+    }
+
+    /// Placeholder-mid-series: when one snapshot's report is a
+    /// placeholder (freeze rendezvous failed, walker unavailable),
+    /// EVERY field slot for that row gets the same
+    /// `PlaceholderSample` error — not just one. Pins that the
+    /// per-field substitution at bpf.rs:111-124 doesn't silently
+    /// drop a sample from one field while keeping it in another.
+    #[test]
+    fn live_bpf_vars_via_placeholder_substitutes_into_all_field_slots() {
+        // Build a synthetic placeholder report: is_placeholder=true,
+        // no maps populated. The construction mirrors what
+        // freeze_coord stores when a rendezvous times out.
+        let mut placeholder = FailureDumpReport::default();
+        placeholder.schema = SCHEMA_SINGLE.to_string();
+        placeholder.is_placeholder = true;
+        placeholder.scx_walker_unavailable = Some("rendezvous timed out".to_string());
+        let drained = vec![
+            (
+                "periodic_000".to_string(),
+                two_bss_report((10, 20), None),
+                None,
+                Some(100),
+            ),
+            ("periodic_001".to_string(), placeholder, None, Some(200)),
+            (
+                "periodic_002".to_string(),
+                two_bss_report((30, 40), None),
+                None,
+                Some(300),
+            ),
+        ];
+        let series = SampleSeries::from_drained(drained, None);
+        let [cross, same] = series.live_bpf_vars_via(
+            ["cross", "same"],
+            crate::scenario::snapshot::pickers::max_by_sum_u64,
+        );
+        let cross_results: Vec<bool> = cross.values_iter().map(|r| r.is_ok()).collect();
+        let same_results: Vec<bool> = same.values_iter().map(|r| r.is_ok()).collect();
+        // Sample 0 + 2: ok. Sample 1 (placeholder): err in BOTH
+        // fields. The two fields' Ok/Err patterns must match —
+        // otherwise the per-field split lost coherence.
+        assert_eq!(cross_results, vec![true, false, true]);
+        assert_eq!(same_results, vec![true, false, true]);
+        // The placeholder slot's error must carry the
+        // PlaceholderSample variant (not a generic catch-all).
+        let cross_err = cross
+            .values_iter()
+            .nth(1)
+            .unwrap()
+            .as_ref()
+            .err()
+            .expect("placeholder row produces Err");
+        assert!(
+            matches!(cross_err, crate::scenario::snapshot::SnapshotError::PlaceholderSample { .. }),
+            "placeholder row must surface PlaceholderSample; got {cross_err:?}",
+        );
+    }
+
+    /// When `live_vars_via` itself fails for a row (no candidate
+    /// map has all the names, or the picker returned None), the
+    /// SAME error MUST be substituted into all N field slots for
+    /// that row — not split or dropped. Pins the bpf.rs:135-139
+    /// error-substitution path.
+    #[test]
+    fn live_bpf_vars_via_picker_none_substitutes_into_all_field_slots() {
+        let drained = vec![(
+            "periodic_000".to_string(),
+            two_bss_report((10, 20), Some((30, 40))),
+            None,
+            Some(100),
+        )];
+        let series = SampleSeries::from_drained(drained, None);
+        // Picker that always returns None — forces live_vars_via
+        // to surface ProjectionFailed for the row.
+        let always_none =
+            |_rows: &[(&str, Vec<crate::scenario::snapshot::SnapshotField<'_>>)]| None;
+        let [a, b] = series.live_bpf_vars_via(["cross", "same"], always_none);
+        let a_err = a
+            .values_iter()
+            .next()
+            .unwrap()
+            .as_ref()
+            .err()
+            .expect("picker-None must surface as Err");
+        let b_err = b
+            .values_iter()
+            .next()
+            .unwrap()
+            .as_ref()
+            .err()
+            .expect("picker-None must surface as Err — same row → same Err");
+        // The two field slots' errors must carry the SAME variant.
+        assert!(
+            matches!(a_err, crate::scenario::snapshot::SnapshotError::ProjectionFailed { .. }),
+            "field 0 must carry ProjectionFailed; got {a_err:?}",
+        );
+        assert!(
+            matches!(b_err, crate::scenario::snapshot::SnapshotError::ProjectionFailed { .. }),
+            "field 1 must carry ProjectionFailed; got {b_err:?}",
+        );
+    }
+
+    /// When the picker returns an out-of-range index, `live_vars_via`
+    /// returns `ProjectionFailed` and the SAME error is substituted
+    /// into every field slot for that row. Sibling of the
+    /// picker-None case, distinct underlying failure mode.
+    #[test]
+    fn live_bpf_vars_via_picker_oor_substitutes_into_all_field_slots() {
+        let drained = vec![(
+            "periodic_000".to_string(),
+            two_bss_report((10, 20), Some((30, 40))),
+            None,
+            Some(100),
+        )];
+        let series = SampleSeries::from_drained(drained, None);
+        // Picker that returns an index way past the candidate count.
+        let always_oor =
+            |_rows: &[(&str, Vec<crate::scenario::snapshot::SnapshotField<'_>>)]| Some(999_usize);
+        let [a, b] = series.live_bpf_vars_via(["cross", "same"], always_oor);
+        let a_err = a.values_iter().next().unwrap().as_ref().err().unwrap();
+        let b_err = b.values_iter().next().unwrap().as_ref().err().unwrap();
+        assert!(
+            matches!(a_err, crate::scenario::snapshot::SnapshotError::ProjectionFailed { .. }),
+            "picker-OOR must surface ProjectionFailed in field 0; got {a_err:?}",
+        );
+        assert!(
+            matches!(b_err, crate::scenario::snapshot::SnapshotError::ProjectionFailed { .. }),
+            "picker-OOR must surface ProjectionFailed in field 1; got {b_err:?}",
+        );
+    }
+
+    /// Duplicate names in the request slice: `live_vars_via` pushes
+    /// one field per name (no dedup), so the resulting per-field
+    /// SeriesFields each carry the SAME projected values. Both
+    /// fields are still well-formed (length matches sample count);
+    /// the only "skew" is the trivial one where dup names produce
+    /// dup values. Pins that the per-field split honors `names.len()`
+    /// rather than a deduplicated set.
+    #[test]
+    fn live_bpf_vars_via_duplicate_names_yields_parallel_duplicates() {
+        let drained = vec![(
+            "periodic_000".to_string(),
+            two_bss_report((10, 20), None),
+            None,
+            Some(100),
+        )];
+        let series = SampleSeries::from_drained(drained, None);
+        let [a, b] = series.live_bpf_vars_via(
+            ["cross", "cross"],
+            crate::scenario::snapshot::pickers::max_by_sum_u64,
+        );
+        let av: Vec<u64> = a.values_iter().filter_map(|r| r.as_ref().ok().copied()).collect();
+        let bv: Vec<u64> = b.values_iter().filter_map(|r| r.as_ref().ok().copied()).collect();
+        assert_eq!(av, vec![10], "first slot carries 'cross' = 10");
+        assert_eq!(bv, vec![10], "second slot (duplicate) carries 'cross' = 10");
+        // Pin field-count parity with names.len(): no silent drop.
+        assert_eq!(av.len(), bv.len(), "duplicate-names must not skew per-field length");
+    }
+
+    /// Multi-candidate map: `live_bpf_vars_via` must route both
+    /// names through the SAME picker-selected candidate so the
+    /// downstream ratio's numerator and denominator can't be
+    /// split across two different scheduler obj bss copies. The
+    /// `max_by_sum_u64` picker selects whichever bss has the
+    /// larger `cross + same` sum.
+    #[test]
+    fn live_bpf_vars_via_two_maps_picker_routes_both_through_winner() {
+        let drained = vec![
+            // Sample 0: primary sum 30, secondary sum 1100 → secondary wins
+            (
+                "periodic_000".to_string(),
+                two_bss_report((10, 20), Some((500, 600))),
+                None,
+                Some(100),
+            ),
+            // Sample 1: primary sum 10000, secondary sum 100 → primary wins
+            (
+                "periodic_001".to_string(),
+                two_bss_report((4000, 6000), Some((50, 50))),
+                None,
+                Some(200),
+            ),
+        ];
+        let series = SampleSeries::from_drained(drained, None);
+        let [cross, same] = series.live_bpf_vars_via(
+            ["cross", "same"],
+            crate::scenario::snapshot::pickers::max_by_sum_u64,
+        );
+        let cross_values: Vec<u64> = cross
+            .values_iter()
+            .filter_map(|r| r.as_ref().ok().copied())
+            .collect();
+        let same_values: Vec<u64> = same
+            .values_iter()
+            .filter_map(|r| r.as_ref().ok().copied())
+            .collect();
+        // Sample 0: secondary wins → (500, 600). Sample 1: primary
+        // wins → (4000, 6000). Both names came from the SAME map
+        // per sample, never split.
+        assert_eq!(cross_values, vec![500, 4000]);
+        assert_eq!(same_values, vec![600, 6000]);
     }
 }

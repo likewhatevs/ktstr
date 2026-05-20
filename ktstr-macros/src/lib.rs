@@ -1704,10 +1704,18 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     // The user-supplied path resolves to a `fn(&VmResult) ->
     // Result<()>`. Wrap in `Some(...)` so the entry's
     // `Option<fn(&VmResult) -> Result<()>>` field accepts it.
+    //
+    // When the attribute omits `post_vm = ...`, default to
+    // `ktstr::test_support::default_post_vm_periodic_fired` — the
+    // smoke-floor assertion that at least one periodic snapshot
+    // fired when periodic was configured (no-op when periodic was
+    // disabled). Saves every periodic-configured test from
+    // hand-rolling the "did the scheduler attach + snapshot fire"
+    // boilerplate.
     let post_vm_field = if let Some(ref p) = post_vm {
         quote! { post_vm: Some(#p), }
     } else {
-        quote! {}
+        quote! { post_vm: Some(::ktstr::test_support::default_post_vm_periodic_fired), }
     };
     // `config = EXPR` lands in `KtstrTestEntry::config_content`, which
     // is `Option<&'static str>`. Wrap the user-supplied expression in

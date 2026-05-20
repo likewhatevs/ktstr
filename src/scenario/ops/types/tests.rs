@@ -376,3 +376,92 @@ fn step_set_hold_replaces_hold_preserves_setup_and_ops() {
         after.setup
     );
 }
+
+/// `Step::hold(spec)` MUST be equivalent to `Step::new(vec![],
+/// spec)` — empty setup, empty ops, the given hold. This sugar
+/// targets the "wait phase" pattern in A/B test scenarios where
+/// the test holds before the next op without applying any ops in
+/// the current phase.
+#[test]
+fn step_hold_constructs_no_ops_with_given_hold() {
+    let s = Step::hold(HoldSpec::frac(0.3));
+    assert!(s.ops.is_empty(), "Step::hold must produce empty ops");
+    assert!(
+        matches!(s.setup, Setup::Defs(ref v) if v.is_empty()),
+        "Step::hold must produce empty setup; got {:?}",
+        s.setup,
+    );
+    assert!(
+        matches!(s.hold, HoldSpec::Frac(f) if (f - 0.3).abs() < f64::EPSILON),
+        "Step::hold must carry the supplied HoldSpec verbatim; got {:?}",
+        s.hold,
+    );
+    // Equivalence with the long-form: same field shape.
+    let long = Step::new(Vec::new(), HoldSpec::frac(0.3));
+    assert_eq!(long.ops.len(), s.ops.len());
+    assert!(matches!(
+        (&long.setup, &s.setup),
+        (Setup::Defs(a), Setup::Defs(b)) if a.is_empty() && b.is_empty()
+    ));
+    assert_eq!(long.hold, s.hold);
+}
+
+/// `Step::hold`/`Step::with_op` MUST defer hold-validation to the
+/// scenario runtime — same contract as `Step::new`. A construction
+/// like `Step::hold(HoldSpec::Frac(0.0))` succeeds (no panic), but
+/// downstream `HoldSpec::validate()` rejects with the documented
+/// "must be > 0.0" message. Pins that the new sugar doesn't
+/// bypass validation that `Step::new` defers, nor adds eager
+/// validation that `Step::new` skips.
+#[test]
+fn step_hold_and_with_op_defer_holdspec_validation_to_runtime() {
+    let s_hold = Step::hold(HoldSpec::Frac(0.0));
+    assert!(
+        matches!(s_hold.hold, HoldSpec::Frac(f) if f == 0.0),
+        "Step::hold(Frac(0.0)) MUST construct without panic",
+    );
+    let err = s_hold.hold.validate().expect_err(
+        "Frac(0.0) MUST be rejected by HoldSpec::validate (vacuous + panic-on-Duration::from_secs_f64)",
+    );
+    assert!(
+        err.contains("must be > 0.0"),
+        "validate's diagnostic must name the > 0.0 rule; got {err}",
+    );
+
+    let s_with_op = Step::with_op(Op::add_cgroup("cg_z"), HoldSpec::Frac(0.0));
+    assert!(
+        matches!(s_with_op.hold, HoldSpec::Frac(f) if f == 0.0),
+        "Step::with_op(_, Frac(0.0)) MUST construct without panic",
+    );
+    s_with_op
+        .hold
+        .validate()
+        .expect_err("Same validation rule must apply post-construction");
+}
+
+/// `Step::with_op(op, spec)` MUST be equivalent to
+/// `Step::new(vec![op], spec)` — empty setup, one op, the given
+/// hold. This sugar targets the "swap scheduler / attach
+/// scheduler then hold" pattern. A regression that defaulted the
+/// op into a different position (e.g. setup instead of ops) would
+/// silently change which phase the op runs in.
+#[test]
+fn step_with_op_constructs_single_op_with_given_hold() {
+    let op = Op::add_cgroup("cg_x");
+    let s = Step::with_op(op, HoldSpec::frac(0.7));
+    assert_eq!(s.ops.len(), 1, "Step::with_op must produce exactly one op");
+    assert!(
+        matches!(&s.ops[0], Op::AddCgroup { name } if name.as_ref() == "cg_x"),
+        "Step::with_op must carry the supplied op verbatim",
+    );
+    assert!(
+        matches!(s.setup, Setup::Defs(ref v) if v.is_empty()),
+        "Step::with_op must produce empty setup; got {:?}",
+        s.setup,
+    );
+    assert!(
+        matches!(s.hold, HoldSpec::Frac(f) if (f - 0.7).abs() < f64::EPSILON),
+        "Step::with_op must carry the supplied HoldSpec verbatim; got {:?}",
+        s.hold,
+    );
+}

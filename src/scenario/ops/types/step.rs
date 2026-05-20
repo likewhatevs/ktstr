@@ -135,6 +135,24 @@ impl Step {
         }
     }
 
+    /// Create a step that applies NO ops and just holds. Sugar for
+    /// `Step::new(vec![], hold)` — the most common shape for "wait
+    /// for the workload to settle before the next op" phases in
+    /// A/B test scenarios.
+    #[must_use = "dropping a Step discards its hold for that scenario phase"]
+    pub fn hold(hold: HoldSpec) -> Self {
+        Self::new(Vec::new(), hold)
+    }
+
+    /// Create a step that applies a single op then holds. Sugar for
+    /// `Step::new(vec![op], hold)` — the most common shape for "swap
+    /// scheduler / attach scheduler / replace scheduler then hold"
+    /// phases in A/B test scenarios.
+    #[must_use = "dropping a Step discards its op and hold for that scenario phase"]
+    pub fn with_op(op: Op, hold: HoldSpec) -> Self {
+        Self::new(vec![op], hold)
+    }
+
     /// Create a step with CgroupDef setup and a hold period.
     ///
     /// Most steps only need cgroup definitions and a hold duration.

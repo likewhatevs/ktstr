@@ -2439,6 +2439,66 @@ fn __ktstr_list_schedulers() {
 }
 }
 
+/// Default `post_vm` callback emitted by `#[ktstr_test]` when the
+/// attribute omits `post_vm = ...`. Asserts that at least one
+/// periodic snapshot produced REAL BPF state during the workload
+/// window WHEN periodic was configured (`num_snapshots > 0`); when
+/// periodic was disabled (`num_snapshots == 0`), the helper is a
+/// no-op and returns `Ok`.
+///
+/// This is the smoke-floor for any periodic-configured test:
+/// "the test produced meaningful data." Importantly, the floor
+/// reads
+/// [`SnapshotBridge::periodic_real_count`](crate::scenario::snapshot::SnapshotBridge::periodic_real_count) —
+/// NOT [`VmResult::periodic_fired`](crate::vmm::VmResult::periodic_fired).
+/// The latter counts every periodic boundary the coordinator
+/// attempted, INCLUDING placeholder rows from rendezvous timeouts;
+/// a scheduler that attaches but produces nothing but placeholders
+/// would pass the `periodic_fired >= 1` floor and obscure the
+/// broken-scheduler diagnosis. The real-count floor catches that
+/// case (placeholder-only fills surface as zero) while tolerating
+/// the realistic single-snapshot timeout flake (one real capture
+/// among N is enough to pass the floor).
+///
+/// Tests that need stronger assertions (per-snapshot field reads,
+/// per-phase ratios, etc.) supply their own `post_vm = my_checker`
+/// instead.
+///
+/// The macro routes this fn pointer into [`KtstrTestEntry::post_vm`]
+/// so the runner's existing dispatch path applies it identically
+/// to an author-supplied callback.
+pub fn default_post_vm_periodic_fired(
+    result: &crate::vmm::VmResult,
+) -> anyhow::Result<()> {
+    // Short-circuit when the VM run already failed: the underlying
+    // crash/timeout already drives the test failure with its own
+    // diagnostic. Emitting a periodic-floor Err on top obscures the
+    // real cause (e.g., a scheduler that exited before any periodic
+    // boundary fired would surface as "0 real captures" here
+    // instead of the scheduler-log message that explains the
+    // exit). The runner's own success path renders the crash; let
+    // it.
+    if !result.success {
+        return Ok(());
+    }
+    if result.periodic_target == 0 {
+        return Ok(());
+    }
+    let real = result.snapshot_bridge.periodic_real_count();
+    anyhow::ensure!(
+        real >= 1,
+        "no periodic snapshot produced real BPF state \
+         (periodic_real_count=0, periodic_fired={}, target={}) — \
+         scheduler attached but every snapshot was a placeholder \
+         (typical cause: scheduler stalled during the workload and \
+         the freeze rendezvous timed out fetching state; less \
+         commonly: gate suppression rejected every capture)",
+        result.periodic_fired,
+        result.periodic_target,
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4819,6 +4879,201 @@ mod tests {
             from_trait.assert.enforce_monitor_thresholds,
             from_const.assert.enforce_monitor_thresholds,
             "Assert.enforce_monitor_thresholds drift between Default::default() and DEFAULT"
+        );
+    }
+
+    /// `default_post_vm_periodic_fired` MUST return Ok when periodic
+    /// was NOT configured (`periodic_target == 0`) — the helper is
+    /// a no-op for non-periodic tests so they pass through the
+    /// macro-default path without spurious assertions.
+    #[test]
+    fn default_post_vm_periodic_fired_skips_when_periodic_disabled() {
+        let r = crate::vmm::VmResult {
+            periodic_target: 0,
+            periodic_fired: 0,
+            ..crate::vmm::VmResult::test_fixture()
+        };
+        super::default_post_vm_periodic_fired(&r)
+            .expect("periodic_target == 0 must short-circuit to Ok");
+    }
+
+    /// Build a synthetic non-placeholder `FailureDumpReport` —
+    /// minimal but with `is_placeholder = false`. Used in the
+    /// helpers below to drive the bridge's `periodic_real_count`
+    /// without booting a real VM.
+    fn real_report() -> crate::monitor::dump::FailureDumpReport {
+        let mut r = crate::monitor::dump::FailureDumpReport::default();
+        r.schema = crate::monitor::dump::SCHEMA_SINGLE.to_string();
+        // Default puts `is_placeholder = false`; spell it explicitly
+        // so a future Default-shape change doesn't silently flip the
+        // test fixture.
+        r.is_placeholder = false;
+        r
+    }
+
+    fn placeholder_report(reason: &str) -> crate::monitor::dump::FailureDumpReport {
+        crate::monitor::dump::FailureDumpReport::placeholder(reason)
+    }
+
+    /// When periodic WAS configured AND at least one REAL (non-
+    /// placeholder) snapshot landed on the bridge, the helper
+    /// returns Ok. Pins the smoke-floor contract.
+    #[test]
+    fn default_post_vm_periodic_fired_ok_when_at_least_one_real_landed() {
+        let r = crate::vmm::VmResult {
+            periodic_target: 5,
+            periodic_fired: 1,
+            ..crate::vmm::VmResult::test_fixture()
+        };
+        r.snapshot_bridge.store("periodic_000", real_report());
+        super::default_post_vm_periodic_fired(&r)
+            .expect("at least one real periodic capture must surface as Ok");
+    }
+
+    /// When periodic WAS configured AND every fired snapshot was
+    /// only a placeholder (rendezvous-timeout or gate-suppressed),
+    /// the helper MUST fail — the scheduler attached but produced
+    /// zero useful BPF state. This is the case the new semantic
+    /// catches that the old `periodic_fired >= 1` floor missed.
+    #[test]
+    fn default_post_vm_periodic_fired_fails_when_only_placeholders_landed() {
+        let r = crate::vmm::VmResult {
+            periodic_target: 3,
+            periodic_fired: 3,
+            ..crate::vmm::VmResult::test_fixture()
+        };
+        // All three fires produced placeholders.
+        r.snapshot_bridge
+            .store("periodic_000", placeholder_report("rendezvous timed out"));
+        r.snapshot_bridge
+            .store("periodic_001", placeholder_report("rendezvous timed out"));
+        r.snapshot_bridge
+            .store("periodic_002", placeholder_report("rendezvous timed out"));
+        let err = super::default_post_vm_periodic_fired(&r)
+            .expect_err("placeholder-only fills must surface as Err");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no periodic snapshot produced real BPF state")
+                && msg.contains("periodic_real_count=0")
+                && msg.contains("periodic_fired=3")
+                && msg.contains("target=3"),
+            "diagnostic must name the real-count floor + carry both counters; got {msg}",
+        );
+    }
+
+    /// Pins the load-bearing tag-prefix discrimination: a bridge
+    /// that holds ONLY non-periodic tagged reports (user
+    /// `Op::CaptureSnapshot` captures, watchpoint fires, etc.)
+    /// MUST surface `periodic_real_count == 0` even when those
+    /// non-periodic reports are real (non-placeholder) and present
+    /// in number. A regression that conflated "any real report" with
+    /// "periodic real report" would pass this state spuriously.
+    #[test]
+    fn default_post_vm_periodic_fired_fails_when_only_non_periodic_tagged_reports_present() {
+        let r = crate::vmm::VmResult {
+            periodic_target: 3,
+            periodic_fired: 3,
+            ..crate::vmm::VmResult::test_fixture()
+        };
+        // Populate ONLY non-periodic-tagged reports — these come
+        // from user `Op::CaptureSnapshot` calls or watchpoint
+        // fires, not from the periodic dispatch loop. They MUST
+        // NOT pollute the periodic floor.
+        r.snapshot_bridge.store("user_capture", real_report());
+        r.snapshot_bridge.store("snapshot_baseline", real_report());
+        r.snapshot_bridge.store("watch_my_var", real_report());
+        let err = super::default_post_vm_periodic_fired(&r).expect_err(
+            "non-periodic tags MUST NOT count toward periodic_real_count; \
+             bridge has 3 real reports but none periodic → must Err",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("periodic_real_count=0"),
+            "diagnostic must name the zero real-count; got {msg}",
+        );
+    }
+
+    /// When periodic WAS configured AND ONE real capture landed
+    /// alongside N placeholder timeouts (the realistic flake case),
+    /// the helper MUST return Ok — single-snapshot timeouts under
+    /// load shouldn't punish a working scheduler. Pins the
+    /// tolerance gap that the strict `== periodic_target` floor
+    /// would have failed.
+    #[test]
+    fn default_post_vm_periodic_fired_ok_when_one_real_among_placeholders() {
+        let r = crate::vmm::VmResult {
+            periodic_target: 5,
+            periodic_fired: 5,
+            ..crate::vmm::VmResult::test_fixture()
+        };
+        r.snapshot_bridge
+            .store("periodic_000", placeholder_report("rendezvous timed out"));
+        r.snapshot_bridge.store("periodic_001", real_report());
+        r.snapshot_bridge
+            .store("periodic_002", placeholder_report("rendezvous timed out"));
+        r.snapshot_bridge
+            .store("periodic_003", placeholder_report("rendezvous timed out"));
+        r.snapshot_bridge
+            .store("periodic_004", placeholder_report("rendezvous timed out"));
+        super::default_post_vm_periodic_fired(&r).expect(
+            "one real capture among placeholders must Ok — tolerance for single-snapshot flakes",
+        );
+    }
+
+    /// Pins the early-return semantic at entry.rs:2470: the helper
+    /// short-circuits to Ok on `periodic_target == 0` BEFORE
+    /// checking `periodic_fired`. A regression that swapped these
+    /// checks (e.g., "require fired matches target unconditionally")
+    /// would break tests with `target=0, fired=5` (synthesized
+    /// firings without a configured target). Currently impossible
+    /// in production but cheap to pin.
+    #[test]
+    fn default_post_vm_periodic_fired_target_zero_fired_nonzero_returns_ok() {
+        let r = crate::vmm::VmResult {
+            periodic_target: 0,
+            periodic_fired: 5,
+            ..crate::vmm::VmResult::test_fixture()
+        };
+        super::default_post_vm_periodic_fired(&r)
+            .expect("target == 0 takes priority over fired count; must Ok");
+    }
+
+    /// When `result.success == false` the underlying VM run
+    /// failed (crash / timeout / signal). The default helper MUST
+    /// short-circuit to Ok so the runner's own failure-rendering
+    /// path drives the diagnostic; emitting `periodic_fired=0` on
+    /// top would mask the real cause. Even if periodic was
+    /// configured AND no snapshot fired, the success=false branch
+    /// dominates.
+    #[test]
+    fn default_post_vm_periodic_fired_skips_when_vm_run_failed() {
+        let r = crate::vmm::VmResult {
+            success: false,
+            periodic_target: 5,
+            periodic_fired: 0,
+            ..crate::vmm::VmResult::test_fixture()
+        };
+        super::default_post_vm_periodic_fired(&r)
+            .expect("vm-run-failed must short-circuit to Ok so the runner's diagnostic dominates");
+    }
+
+    /// When periodic WAS configured BUT NO snapshot fired, the
+    /// helper MUST return Err carrying both observed counters in
+    /// the diagnostic. Pins that a regression to "always Ok" would
+    /// surface immediately.
+    #[test]
+    fn default_post_vm_periodic_fired_fails_when_none_fired() {
+        let r = crate::vmm::VmResult {
+            periodic_target: 5,
+            periodic_fired: 0,
+            ..crate::vmm::VmResult::test_fixture()
+        };
+        let err = super::default_post_vm_periodic_fired(&r)
+            .expect_err("periodic_fired == 0 with target > 0 must surface as Err");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("periodic_fired=0") && msg.contains("target=5"),
+            "diagnostic must carry both counters; got {msg}",
         );
     }
 }
