@@ -1,6 +1,6 @@
 //! End-to-end coverage of the per-snapshot scheduler-identity stamp
 //! built in [`FailureDumpReport::active_map_kvas`](ktstr::monitor::dump::FailureDumpReport)
-//! + the KVA-aware filter in
+//! paired with the KVA-aware filter in
 //! [`Snapshot::active`](ktstr::scenario::snapshot::Snapshot::active).
 //!
 //! Boots `scx-ktstr` under one name, swaps to a SECOND `scx-ktstr`
@@ -85,7 +85,9 @@ fn assert_live_var_resolves_across_swap(result: &VmResult) -> Result<()> {
         .values_iter()
         .find_map(|s| s.as_ref().err().map(|e| format!("{e}")));
     let first_ambiguous = nr_dispatched.values_iter().find_map(|s| match s {
-        Err(ktstr::scenario::snapshot::SnapshotError::AmbiguousVar { .. }) => Some(format!("{:?}", s)),
+        Err(ktstr::scenario::snapshot::SnapshotError::AmbiguousVar { .. }) => {
+            Some(format!("{:?}", s))
+        }
         _ => None,
     });
 
@@ -169,7 +171,10 @@ fn live_var_resolves_across_same_binary_swap(ctx: &Ctx) -> Result<AssertResult> 
         // distinct name → distinct `bpf_object` instance in the
         // kernel → distinct bss map KVA, even though the map name
         // is `scx_ktstr.bss` in BOTH).
-        Step::with_op(Op::replace_scheduler(&STAGED_ALT_SCHED), HoldSpec::frac(0.7)),
+        Step::with_op(
+            Op::replace_scheduler(&STAGED_ALT_SCHED),
+            HoldSpec::frac(0.7),
+        ),
     ];
     execute_steps(ctx, steps)
 }

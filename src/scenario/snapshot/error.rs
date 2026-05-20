@@ -329,6 +329,41 @@ pub enum SnapshotError {
     /// distinguish "no scheduler is running right now" from
     /// "multiple are running, pick one".
     NoActiveScheduler { reason: String },
+    /// [`super::Snapshot::var`] / [`super::Snapshot::map`] (or one
+    /// of the `live_*` shortcuts) ran against an active-filtered
+    /// view whose KVA whitelist excluded every captured map that
+    /// shared the active obj prefix. Distinct from
+    /// [`Self::VarNotFound`] (whose `available` list would be
+    /// empty under the active filter even though maps WERE
+    /// captured) so the operator sees the captured map names and
+    /// KVAs that did not pass the filter, the expected KVA set
+    /// the walker populated, and a structural hint about why the
+    /// filter excluded them. Typical causes: stale walker capture
+    /// (captured KVAs predate the most recent struct_ops swap),
+    /// same-binary post-swap window where the report still
+    /// carries the old instance's maps, or a walker bug that
+    /// resolved `*scx_root` against a different binary's map set.
+    ActiveFilterExcludedMaps {
+        /// User-supplied lookup string (the `var` / `map`
+        /// argument). For [`super::Snapshot::live_vars_via`] this
+        /// carries the joined name list `"[a, b, c]"`.
+        requested: String,
+        /// Obj name the active filter pinned to
+        /// (`*scx_root → struct_ops map → obj prefix` resolution).
+        active_obj: String,
+        /// Maps captured under the active obj prefix that the KVA
+        /// whitelist rejected. Each entry is `(map_name,
+        /// map_kva)`; `map_kva == 0` flags a capture where the
+        /// walker did not populate the per-map KVA (stale snapshot
+        /// or capture-path bug).
+        excluded_maps: Vec<(String, u64)>,
+        /// KVA whitelist the walker populated for the active obj.
+        /// A non-empty set whose every entry mismatched the
+        /// captured `map_kva` values points at stale capture or
+        /// KVA aliasing; an empty set is unreachable through this
+        /// variant (no filter means no exclusion).
+        expected_kvas: Vec<u64>,
+    },
     /// A user-supplied projection closure (the kind passed to
     /// [`crate::scenario::sample::SampleSeries::bpf`]) signalled
     /// failure for reasons that don't fit the structured variants
@@ -535,6 +570,44 @@ impl std::fmt::Display for SnapshotError {
                      or Snapshot::map(\"<obj>.<section>\") to address a \
                      specific scheduler's bss directly"
                 )
+            }
+            SnapshotError::ActiveFilterExcludedMaps {
+                requested,
+                active_obj,
+                excluded_maps,
+                expected_kvas,
+            } => {
+                write!(
+                    f,
+                    "snapshot lookup '{requested}' returned no hits under the \
+                     active filter (obj='{active_obj}'): the walker's KVA \
+                     whitelist {expected_kvas:#x?} excluded {n} captured map(s) \
+                     sharing the obj prefix:",
+                    n = excluded_maps.len(),
+                )?;
+                for (name, kva) in excluded_maps {
+                    write!(f, " {name}@{kva:#x}")?;
+                }
+                let all_zero = excluded_maps.iter().all(|(_, kva)| *kva == 0);
+                let any_alias = excluded_maps
+                    .iter()
+                    .any(|(_, kva)| *kva != 0 && !expected_kvas.contains(kva));
+                if all_zero {
+                    write!(
+                        f,
+                        " (every captured map_kva is 0 — pre-walker snapshot, \
+                         or the walker did not populate KVAs for this capture)"
+                    )?;
+                } else if any_alias {
+                    write!(
+                        f,
+                        " (captured KVAs disagree with the walker's whitelist — \
+                         stale capture from before the most recent struct_ops \
+                         swap, KVA aliasing across reloads, or a walker bug \
+                         that pinned *scx_root to a different binary's maps)"
+                    )?;
+                }
+                Ok(())
             }
             SnapshotError::ProjectionFailed { reason } => {
                 write!(f, "projection failed: {reason}")

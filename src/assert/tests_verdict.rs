@@ -1116,10 +1116,7 @@ fn into_anyhow_or_log_via_verdict_wrapper_matches_assert_result_path() {
 
     let mut b = Verdict::new();
     claim!(b, 5u64).at_least(40);
-    let err_via_result = b
-        .into_result()
-        .into_anyhow_or_log()
-        .expect_err("err");
+    let err_via_result = b.into_result().into_anyhow_or_log().expect_err("err");
 
     assert_eq!(
         err_via_verdict.to_string(),

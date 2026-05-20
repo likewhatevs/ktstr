@@ -7106,11 +7106,8 @@ fn identify_active_obj_libbpf_named_single_scheduler_via_walker() {
     let accessor = TestProgAccessor {
         walker_result: Some((struct_ops_map_kva, "ktstr".to_string())),
     };
-    let result = super::identify_active_obj_from_struct_ops(
-        &maps,
-        &scx,
-        Some((&accessor, &map_offsets)),
-    );
+    let result =
+        super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
     assert_eq!(
         result,
         Some(("ktstr".to_string(), Vec::new())),
@@ -7139,11 +7136,8 @@ fn identify_active_obj_libbpf_named_two_schedulers_picks_active() {
     let accessor = TestProgAccessor {
         walker_result: Some((active_struct_ops_kva, "ktstr".to_string())),
     };
-    let result = super::identify_active_obj_from_struct_ops(
-        &maps,
-        &scx,
-        Some((&accessor, &map_offsets)),
-    );
+    let result =
+        super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
     assert_eq!(
         result,
         Some(("ktstr".to_string(), Vec::new())),
@@ -7168,11 +7162,8 @@ fn identify_active_obj_walker_returns_none_propagates_none() {
     let accessor = TestProgAccessor {
         walker_result: None,
     };
-    let result = super::identify_active_obj_from_struct_ops(
-        &maps,
-        &scx,
-        Some((&accessor, &map_offsets)),
-    );
+    let result =
+        super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
     assert_eq!(
         result, None,
         "walker None propagates — heuristic fallback fires upstream",
@@ -7199,11 +7190,8 @@ fn identify_active_obj_walker_result_validated_against_captured_maps() {
     let accessor = TestProgAccessor {
         walker_result: Some((struct_ops_map_kva, "garbage".to_string())),
     };
-    let result = super::identify_active_obj_from_struct_ops(
-        &maps,
-        &scx,
-        Some((&accessor, &map_offsets)),
-    );
+    let result =
+        super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
     assert_eq!(
         result, None,
         "validation must reject walker result not backed by a captured global-section map",
@@ -7250,11 +7238,8 @@ fn identify_active_obj_legacy_path_short_circuits_walker_when_provided() {
     let accessor = TestProgAccessor {
         walker_result: Some((struct_ops_map_kva, "other".to_string())),
     };
-    let result = super::identify_active_obj_from_struct_ops(
-        &maps,
-        &scx,
-        Some((&accessor, &map_offsets)),
-    );
+    let result =
+        super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
     assert_eq!(
         result,
         Some(("ktstr".to_string(), Vec::new())),
@@ -7273,10 +7258,12 @@ fn failure_dump_map_and_report_round_trip_high_u64_kvas() {
     let kaslr_slid: u64 = 0xFFFF_8000_1234_5678;
     let other_kva: u64 = 0xFFFF_8888_AAAA_BBBB;
 
-    let mut m = FailureDumpMap::default();
-    m.name = "scx_test.bss".into();
-    m.map_kva = high_kva;
-    m.map_type = 2;
+    let m = FailureDumpMap {
+        name: "scx_test.bss".into(),
+        map_kva: high_kva,
+        map_type: 2,
+        ..Default::default()
+    };
     let m_json = serde_json::to_string(&m).expect("serialize map");
     let m_back: FailureDumpMap = serde_json::from_str(&m_json).expect("deserialize map");
     assert_eq!(
@@ -7284,8 +7271,10 @@ fn failure_dump_map_and_report_round_trip_high_u64_kvas() {
         "FailureDumpMap.map_kva must round-trip bit-exact across the top of the u64 range",
     );
 
-    let mut r = FailureDumpReport::default();
-    r.active_map_kvas = vec![high_kva, kaslr_slid, other_kva];
+    let r = FailureDumpReport {
+        active_map_kvas: vec![high_kva, kaslr_slid, other_kva],
+        ..Default::default()
+    };
     let r_json = serde_json::to_string(&r).expect("serialize report");
     let r_back: FailureDumpReport = serde_json::from_str(&r_json).expect("deserialize report");
     assert_eq!(
@@ -7324,5 +7313,8 @@ fn failure_dump_map_zero_kva_is_no_identity_sentinel_not_real_capture() {
          got {json}",
     );
     let back: FailureDumpMap = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(back.map_kva, 0, "absent-in-JSON deserializes back to 0 (the sentinel)");
+    assert_eq!(
+        back.map_kva, 0,
+        "absent-in-JSON deserializes back to 0 (the sentinel)"
+    );
 }

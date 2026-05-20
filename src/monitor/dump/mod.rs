@@ -1445,9 +1445,13 @@ fn identify_active_obj_from_struct_ops(
         prog_accessor.find_active_obj_via_used_maps(active_struct_ops.map_kva, map_offsets)?;
     let walker_prefix_validated = maps.iter().any(|m| {
         m.map_type != super::bpf_map::BPF_MAP_TYPE_STRUCT_OPS
-            && (m.name().starts_with(&format!("{}.bss", walker_match.obj_name))
-                || m.name().starts_with(&format!("{}.data", walker_match.obj_name))
-                || m.name().starts_with(&format!("{}.rodata", walker_match.obj_name)))
+            && (m
+                .name()
+                .starts_with(&format!("{}.bss", walker_match.obj_name))
+                || m.name()
+                    .starts_with(&format!("{}.data", walker_match.obj_name))
+                || m.name()
+                    .starts_with(&format!("{}.rodata", walker_match.obj_name)))
     });
     if walker_prefix_validated {
         Some((walker_match.obj_name, walker_match.used_map_kvas))

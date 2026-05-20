@@ -171,6 +171,7 @@ pub(crate) fn find_struct_ops_progs(
 /// `bpf_prog_bind_map` cannot actually run mid-walk; the
 /// race-window protocol above is defense-in-depth for any
 /// caller that ever invokes this outside the freeze window.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn find_obj_name_for_struct_ops_map_kva(
     mem: &GuestMem,
     walk: WalkContext,
@@ -355,7 +356,10 @@ mod extract_global_section_obj_prefix_tests {
 
     #[test]
     fn extracts_bss_prefix() {
-        assert_eq!(extract_global_section_obj_prefix("ktstr.bss"), Some("ktstr"));
+        assert_eq!(
+            extract_global_section_obj_prefix("ktstr.bss"),
+            Some("ktstr")
+        );
     }
 
     #[test]

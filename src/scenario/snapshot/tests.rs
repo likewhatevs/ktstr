@@ -3473,56 +3473,167 @@ fn snapshot_active_single_obj_returns_filtered_view() {
     assert_eq!(active.var("counter").as_u64().ok(), Some(42));
 }
 
-/// Tester's BLOCKING gap (#206 pass-1 F1): when
-/// `active_obj_name` matches an obj prefix in the snapshot AND
-/// `active_map_kvas` is non-empty but contains KVAs that match
-/// NONE of the captured maps' `map_kva` values, the filter
-/// silently narrows to zero. Downstream `var()` reports
-/// `VarNotFound { available: [] }` — operator can't distinguish
-/// "var truly absent from this scheduler's bss" from "every
-/// captured map's KVA was filtered out (KVA aliasing or walker
-/// bug)." Without this test pinning the narrow-to-zero
-/// behavior, a regression that breaks the KVA filter silently
-/// hides as "var absent on user error" instead of surfacing as
-/// a framework correctness regression.
+/// When the active filter has a KVA whitelist whose entries
+/// match NONE of the captured `<active_obj>.*` maps' `map_kva`
+/// values, the filter narrows to zero — but the operator deserves
+/// to see WHICH maps were rejected and WHAT KVAs the walker
+/// expected. A generic `VarNotFound { available: [] }` would leave
+/// the operator unable to tell "var truly absent from this
+/// scheduler's bss" apart from "every captured map's KVA was
+/// filtered out (stale capture / KVA aliasing / walker bug)." The
+/// dedicated `ActiveFilterExcludedMaps` variant surfaces the
+/// captured names + their KVAs, the walker's expected whitelist,
+/// and a structural hint about why the filter excluded them.
 #[test]
-fn snapshot_active_kva_filter_narrows_to_zero_when_no_kva_match() {
+fn snapshot_var_kva_filter_excluded_surfaces_active_filter_excluded_maps() {
     let mut alpha_bss = make_global_map("alpha.bss", vec![("counter", uint_v(42))]);
     alpha_bss.map_kva = 0x1000;
     let mut alpha_data = make_global_map("alpha.data", vec![("flag", uint_v(1))]);
     alpha_data.map_kva = 0x2000;
     let mut report = make_report_with_maps(vec![alpha_bss, alpha_data]);
-    // Walker resolved active_obj_name="alpha" AND populated the
-    // KVA whitelist with a SINGLE KVA that matches NONE of the
-    // captured maps' KVAs (simulates walker output that's
-    // inconsistent with the captured maps[]: e.g., the active
-    // obj's maps weren't in this capture, or KVA aliasing
-    // between captures, or a walker bug).
     report.active_obj_name = Some("alpha".to_string());
     report.active_map_kvas = vec![0x9999];
 
     let snap = Snapshot::new(&report);
-    let active = snap.active().expect("active() succeeds — active_obj_name + captured prefix match");
-    // The KVA filter excludes BOTH captured maps (their KVAs
-    // 0x1000, 0x2000 ∉ {0x9999}). Every accessor on the
-    // narrowed snapshot sees ZERO maps.
-    let counter = active.var("counter");
-    // The fallback in var() returns the live-filter's
-    // diagnostic per pass-2 F2 fix. With zero maps the live
-    // filter yields VarNotFound with empty `available` — the
-    // current diagnostic. This test pins that semantic so a
-    // regression that lets the filter accidentally accept
-    // unmatched-KVA maps (or hides the narrow-to-zero by
-    // erroring on construction) surfaces immediately.
-    let err = counter.error().cloned().expect("zero-map filter yields error");
+    let active = snap
+        .active()
+        .expect("active() succeeds — active_obj_name + captured prefix match");
+    let err = active
+        .var("counter")
+        .error()
+        .cloned()
+        .expect("zero-map filter yields error");
+    match err {
+        SnapshotError::ActiveFilterExcludedMaps {
+            requested,
+            active_obj,
+            excluded_maps,
+            expected_kvas,
+        } => {
+            assert_eq!(requested, "counter");
+            assert_eq!(active_obj, "alpha");
+            assert_eq!(expected_kvas, vec![0x9999]);
+            assert_eq!(excluded_maps.len(), 2, "both alpha-prefixed maps excluded");
+            assert!(
+                excluded_maps
+                    .iter()
+                    .any(|(n, k)| n == "alpha.bss" && *k == 0x1000)
+            );
+            assert!(
+                excluded_maps
+                    .iter()
+                    .any(|(n, k)| n == "alpha.data" && *k == 0x2000)
+            );
+        }
+        other => panic!("expected ActiveFilterExcludedMaps, got {other:?}"),
+    }
+}
+
+#[test]
+fn snapshot_map_kva_filter_excluded_surfaces_active_filter_excluded_maps() {
+    let mut alpha_bss = make_global_map("alpha.bss", vec![("counter", uint_v(42))]);
+    alpha_bss.map_kva = 0x1000;
+    let mut report = make_report_with_maps(vec![alpha_bss]);
+    report.active_obj_name = Some("alpha".to_string());
+    report.active_map_kvas = vec![0xDEAD];
+
+    let snap = Snapshot::new(&report);
+    let active = snap.active().expect("active() succeeds");
+    let err = active
+        .map("alpha.bss")
+        .expect_err("filter excluded the only candidate");
+    match err {
+        SnapshotError::ActiveFilterExcludedMaps {
+            requested,
+            active_obj,
+            excluded_maps,
+            expected_kvas,
+        } => {
+            assert_eq!(requested, "alpha.bss");
+            assert_eq!(active_obj, "alpha");
+            assert_eq!(expected_kvas, vec![0xDEAD]);
+            assert_eq!(excluded_maps, vec![("alpha.bss".to_string(), 0x1000)]);
+        }
+        other => panic!("expected ActiveFilterExcludedMaps, got {other:?}"),
+    }
+}
+
+#[test]
+fn snapshot_live_vars_via_kva_filter_excluded_surfaces_active_filter_excluded_maps() {
+    let mut alpha_bss = make_global_map("alpha.bss", vec![("a", uint_v(1)), ("b", uint_v(2))]);
+    alpha_bss.map_kva = 0x1000;
+    let mut report = make_report_with_maps(vec![alpha_bss]);
+    report.active_obj_name = Some("alpha".to_string());
+    report.active_map_kvas = vec![0xBEEF];
+
+    let snap = Snapshot::new(&report);
+    let active = snap.active().expect("active() succeeds");
+    let err = active
+        .live_vars_via(&["a", "b"], |_| {
+            panic!("picker must not be called when filter excluded everything")
+        })
+        .unwrap_err();
+    match err {
+        SnapshotError::ActiveFilterExcludedMaps {
+            requested,
+            active_obj,
+            excluded_maps,
+            expected_kvas,
+        } => {
+            assert_eq!(requested, "[a, b]", "joined name list per live_vars_via");
+            assert_eq!(active_obj, "alpha");
+            assert_eq!(expected_kvas, vec![0xBEEF]);
+            assert_eq!(excluded_maps, vec![("alpha.bss".to_string(), 0x1000)]);
+        }
+        other => panic!("expected ActiveFilterExcludedMaps, got {other:?}"),
+    }
+}
+
+#[test]
+fn active_filter_excluded_maps_display_renders_kva_mismatch_hint() {
+    let err = SnapshotError::ActiveFilterExcludedMaps {
+        requested: "counter".to_string(),
+        active_obj: "alpha".to_string(),
+        excluded_maps: vec![
+            ("alpha.bss".to_string(), 0x1000),
+            ("alpha.data".to_string(), 0x2000),
+        ],
+        expected_kvas: vec![0x9999],
+    };
+    let msg = format!("{err}");
+    assert!(msg.contains("counter"), "names the lookup: {msg}");
+    assert!(msg.contains("alpha"), "names the active obj: {msg}");
     assert!(
-        matches!(
-            err,
-            SnapshotError::VarNotFound { ref available, .. } if available.is_empty()
-        ) || matches!(err, SnapshotError::AmbiguousVar { .. }),
-        "KVA-filter narrows-to-zero must surface as VarNotFound (empty available) \
-         or AmbiguousVar (post-fallback) — see #208 for the richer diagnostic \
-         work; got {err:?}",
+        msg.contains("0x9999"),
+        "names the expected whitelist: {msg}"
+    );
+    assert!(
+        msg.contains("alpha.bss@0x1000"),
+        "names excluded map: {msg}"
+    );
+    assert!(
+        msg.contains("alpha.data@0x2000"),
+        "names excluded map: {msg}"
+    );
+    assert!(
+        msg.contains("stale capture") || msg.contains("aliasing") || msg.contains("walker bug"),
+        "names the structural hint: {msg}"
+    );
+}
+
+#[test]
+fn active_filter_excluded_maps_display_renders_zero_kva_hint() {
+    let err = SnapshotError::ActiveFilterExcludedMaps {
+        requested: "counter".to_string(),
+        active_obj: "alpha".to_string(),
+        excluded_maps: vec![("alpha.bss".to_string(), 0)],
+        expected_kvas: vec![0x9999],
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("every captured map_kva is 0"),
+        "all-zero-kva hint must steer the operator at the pre-walker / capture-bug \
+         interpretation rather than the KVA-aliasing one: {msg}"
     );
 }
 
@@ -4038,11 +4149,17 @@ fn two_instance_two_var_report() -> FailureDumpReport {
             members: vec![
                 RenderedMember {
                     name: "same".into(),
-                    value: RenderedValue::Uint { bits: 64, value: same },
+                    value: RenderedValue::Uint {
+                        bits: 64,
+                        value: same,
+                    },
                 },
                 RenderedMember {
                     name: "cross".into(),
-                    value: RenderedValue::Uint { bits: 64, value: cross },
+                    value: RenderedValue::Uint {
+                        bits: 64,
+                        value: cross,
+                    },
                 },
             ],
         }),
@@ -4081,7 +4198,9 @@ fn live_vars_via_picker_selects_named_candidate() {
 fn live_vars_via_picker_returns_none_surfaces_projection_failed() {
     let r = two_instance_two_var_report();
     let snap = Snapshot::new(&r);
-    let err = snap.live_vars_via(&["same", "cross"], |_| None).unwrap_err();
+    let err = snap
+        .live_vars_via(&["same", "cross"], |_| None)
+        .unwrap_err();
     match err {
         SnapshotError::ProjectionFailed { reason } => {
             assert!(
@@ -4138,11 +4257,15 @@ fn live_vars_via_no_candidates_surfaces_var_not_found() {
 
 #[test]
 fn live_vars_via_placeholder_snapshot_surfaces_placeholder_error() {
-    let mut r = FailureDumpReport::default();
-    r.is_placeholder = true;
+    let r = FailureDumpReport {
+        is_placeholder: true,
+        ..Default::default()
+    };
     let snap = Snapshot::new(&r);
     let err = snap
-        .live_vars_via(&["x"], |_| panic!("picker must NOT be called on placeholder"))
+        .live_vars_via(&["x"], |_| {
+            panic!("picker must NOT be called on placeholder")
+        })
         .unwrap_err();
     match err {
         SnapshotError::PlaceholderSnapshot { tag } => {
@@ -4186,7 +4309,10 @@ fn live_vars_via_partial_coverage_map_excluded() {
             members: vec![
                 RenderedMember {
                     name: "same".into(),
-                    value: RenderedValue::Uint { bits: 64, value: 10 },
+                    value: RenderedValue::Uint {
+                        bits: 64,
+                        value: 10,
+                    },
                 },
                 RenderedMember {
                     name: "cross".into(),
@@ -4213,7 +4339,10 @@ fn live_vars_via_partial_coverage_map_excluded() {
             type_name: Some(".bss".into()),
             members: vec![RenderedMember {
                 name: "same".into(),
-                value: RenderedValue::Uint { bits: 64, value: 999 },
+                value: RenderedValue::Uint {
+                    bits: 64,
+                    value: 999,
+                },
             }],
         }),
         entries: Vec::new(),
@@ -4268,13 +4397,15 @@ fn live_var_via_placeholder_snapshot_surfaces_placeholder_error() {
     // placeholder snapshot silently surfaces as VarNotFound with an
     // empty `available` list, hiding the real freeze-rendezvous-failed
     // signal from the caller's match arm.
-    let mut r = FailureDumpReport::default();
-    r.is_placeholder = true;
+    let r = FailureDumpReport {
+        is_placeholder: true,
+        ..Default::default()
+    };
     let snap = Snapshot::new(&r);
-    let f = snap.live_var_via("anything", |_| panic!("picker must NOT be called on placeholder"));
-    let err = f
-        .error()
-        .expect("placeholder snapshot must carry an error");
+    let f = snap.live_var_via("anything", |_| {
+        panic!("picker must NOT be called on placeholder")
+    });
+    let err = f.error().expect("placeholder snapshot must carry an error");
     match err {
         SnapshotError::PlaceholderSnapshot { tag } => {
             assert!(

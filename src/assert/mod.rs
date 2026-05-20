@@ -2458,10 +2458,7 @@ impl AssertResult {
         for note in &self.info_notes {
             tracing::info!(target: "ktstr::assert", "{}", note.message);
         }
-        let failures: Vec<String> = self
-            .failure_details()
-            .map(|d| d.message.clone())
-            .collect();
+        let failures: Vec<String> = self.failure_details().map(|d| d.message.clone()).collect();
         if !failures.is_empty() {
             let combined = if failures.len() == 1 {
                 failures.into_iter().next().unwrap()

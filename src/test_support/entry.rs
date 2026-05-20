@@ -2467,9 +2467,7 @@ fn __ktstr_list_schedulers() {
 /// The macro routes this fn pointer into [`KtstrTestEntry::post_vm`]
 /// so the runner's existing dispatch path applies it identically
 /// to an author-supplied callback.
-pub fn default_post_vm_periodic_fired(
-    result: &crate::vmm::VmResult,
-) -> anyhow::Result<()> {
+pub fn default_post_vm_periodic_fired(result: &crate::vmm::VmResult) -> anyhow::Result<()> {
     // Short-circuit when the VM run already failed: the underlying
     // crash/timeout already drives the test failure with its own
     // diagnostic. Emitting a periodic-floor Err on top obscures the
@@ -4902,13 +4900,14 @@ mod tests {
     /// helpers below to drive the bridge's `periodic_real_count`
     /// without booting a real VM.
     fn real_report() -> crate::monitor::dump::FailureDumpReport {
-        let mut r = crate::monitor::dump::FailureDumpReport::default();
-        r.schema = crate::monitor::dump::SCHEMA_SINGLE.to_string();
         // Default puts `is_placeholder = false`; spell it explicitly
         // so a future Default-shape change doesn't silently flip the
         // test fixture.
-        r.is_placeholder = false;
-        r
+        crate::monitor::dump::FailureDumpReport {
+            schema: crate::monitor::dump::SCHEMA_SINGLE.to_string(),
+            is_placeholder: false,
+            ..Default::default()
+        }
     }
 
     fn placeholder_report(reason: &str) -> crate::monitor::dump::FailureDumpReport {

@@ -123,7 +123,12 @@ fn assert_phase_map_ext_pipeline(result: &VmResult) -> Result<()> {
     // missing-phase fail detail (both prove the comparator ran).
     let mut verdict = Verdict::new();
     synthetic_frac
-        .ratio_across_phases(&mut verdict, "synthetic_frac", Phase::step(0), Phase::step(1))
+        .ratio_across_phases(
+            &mut verdict,
+            "synthetic_frac",
+            Phase::step(0),
+            Phase::step(1),
+        )
         .at_most(RATIO_CEILING);
     let r = verdict.into_result();
     let recorded_pass = r

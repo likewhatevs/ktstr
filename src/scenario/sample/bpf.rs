@@ -119,14 +119,15 @@ impl SampleSeries {
     ///
     /// **Lifetime / coverage gaps surface per field.** If a snapshot
     /// is a placeholder, every field's slot for that row carries the
-    /// same [`SnapshotError::PlaceholderSample`]. If `live_vars_via`
-    /// fails (no candidate map has all `N` names, or the picker
-    /// returns `None`), every field's slot carries the same
-    /// underlying [`SnapshotError`] — the failure is shared, not
-    /// split. Per-field `.as_u64()` casts that fail (the picked
-    /// field doesn't render as a u64) surface as per-field
-    /// [`SnapshotError::TypeMismatch`] without contaminating sibling
-    /// fields.
+    /// same [`crate::scenario::snapshot::SnapshotError::PlaceholderSample`].
+    /// If `live_vars_via` fails (no candidate map has all `N` names,
+    /// or the picker returns `None`), every field's slot carries the
+    /// same underlying [`crate::scenario::snapshot::SnapshotError`] —
+    /// the failure is shared, not split. Per-field `.as_u64()` casts
+    /// that fail (the picked field doesn't render as a u64) surface
+    /// as per-field
+    /// [`crate::scenario::snapshot::SnapshotError::TypeMismatch`]
+    /// without contaminating sibling fields.
     ///
     /// The label routed onto each resulting [`SeriesField`] is the
     /// caller-supplied name from `names` at the matching position.
@@ -675,10 +676,7 @@ mod tests {
     /// `Op::ReplaceScheduler` shape where two scheduler obj bss
     /// copies coexist in the same snapshot and `live_vars_via`'s
     /// picker resolves which one is live by max-sum.
-    fn two_bss_report(
-        primary: (u64, u64),
-        secondary: Option<(u64, u64)>,
-    ) -> FailureDumpReport {
+    fn two_bss_report(primary: (u64, u64), secondary: Option<(u64, u64)>) -> FailureDumpReport {
         fn make_bss(name: &str, cross: u64, same: u64) -> FailureDumpMap {
             FailureDumpMap {
                 name: name.into(),
@@ -775,10 +773,12 @@ mod tests {
         // Build a synthetic placeholder report: is_placeholder=true,
         // no maps populated. The construction mirrors what
         // freeze_coord stores when a rendezvous times out.
-        let mut placeholder = FailureDumpReport::default();
-        placeholder.schema = SCHEMA_SINGLE.to_string();
-        placeholder.is_placeholder = true;
-        placeholder.scx_walker_unavailable = Some("rendezvous timed out".to_string());
+        let placeholder = FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            is_placeholder: true,
+            scx_walker_unavailable: Some("rendezvous timed out".to_string()),
+            ..Default::default()
+        };
         let drained = vec![
             (
                 "periodic_000".to_string(),
@@ -813,10 +813,12 @@ mod tests {
             .nth(1)
             .unwrap()
             .as_ref()
-            .err()
-            .expect("placeholder row produces Err");
+            .expect_err("placeholder row produces Err");
         assert!(
-            matches!(cross_err, crate::scenario::snapshot::SnapshotError::PlaceholderSample { .. }),
+            matches!(
+                cross_err,
+                crate::scenario::snapshot::SnapshotError::PlaceholderSample { .. }
+            ),
             "placeholder row must surface PlaceholderSample; got {cross_err:?}",
         );
     }
@@ -845,22 +847,26 @@ mod tests {
             .next()
             .unwrap()
             .as_ref()
-            .err()
-            .expect("picker-None must surface as Err");
+            .expect_err("picker-None must surface as Err");
         let b_err = b
             .values_iter()
             .next()
             .unwrap()
             .as_ref()
-            .err()
-            .expect("picker-None must surface as Err — same row → same Err");
+            .expect_err("picker-None must surface as Err — same row → same Err");
         // The two field slots' errors must carry the SAME variant.
         assert!(
-            matches!(a_err, crate::scenario::snapshot::SnapshotError::ProjectionFailed { .. }),
+            matches!(
+                a_err,
+                crate::scenario::snapshot::SnapshotError::ProjectionFailed { .. }
+            ),
             "field 0 must carry ProjectionFailed; got {a_err:?}",
         );
         assert!(
-            matches!(b_err, crate::scenario::snapshot::SnapshotError::ProjectionFailed { .. }),
+            matches!(
+                b_err,
+                crate::scenario::snapshot::SnapshotError::ProjectionFailed { .. }
+            ),
             "field 1 must carry ProjectionFailed; got {b_err:?}",
         );
     }
@@ -885,11 +891,17 @@ mod tests {
         let a_err = a.values_iter().next().unwrap().as_ref().err().unwrap();
         let b_err = b.values_iter().next().unwrap().as_ref().err().unwrap();
         assert!(
-            matches!(a_err, crate::scenario::snapshot::SnapshotError::ProjectionFailed { .. }),
+            matches!(
+                a_err,
+                crate::scenario::snapshot::SnapshotError::ProjectionFailed { .. }
+            ),
             "picker-OOR must surface ProjectionFailed in field 0; got {a_err:?}",
         );
         assert!(
-            matches!(b_err, crate::scenario::snapshot::SnapshotError::ProjectionFailed { .. }),
+            matches!(
+                b_err,
+                crate::scenario::snapshot::SnapshotError::ProjectionFailed { .. }
+            ),
             "picker-OOR must surface ProjectionFailed in field 1; got {b_err:?}",
         );
     }
@@ -914,12 +926,22 @@ mod tests {
             ["cross", "cross"],
             crate::scenario::snapshot::pickers::max_by_sum_u64,
         );
-        let av: Vec<u64> = a.values_iter().filter_map(|r| r.as_ref().ok().copied()).collect();
-        let bv: Vec<u64> = b.values_iter().filter_map(|r| r.as_ref().ok().copied()).collect();
+        let av: Vec<u64> = a
+            .values_iter()
+            .filter_map(|r| r.as_ref().ok().copied())
+            .collect();
+        let bv: Vec<u64> = b
+            .values_iter()
+            .filter_map(|r| r.as_ref().ok().copied())
+            .collect();
         assert_eq!(av, vec![10], "first slot carries 'cross' = 10");
         assert_eq!(bv, vec![10], "second slot (duplicate) carries 'cross' = 10");
         // Pin field-count parity with names.len(): no silent drop.
-        assert_eq!(av.len(), bv.len(), "duplicate-names must not skew per-field length");
+        assert_eq!(
+            av.len(),
+            bv.len(),
+            "duplicate-names must not skew per-field length"
+        );
     }
 
     /// Multi-candidate map: `live_bpf_vars_via` must route both

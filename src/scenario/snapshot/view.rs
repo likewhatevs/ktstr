@@ -24,6 +24,14 @@ use super::{
     SnapshotField, SnapshotResult,
 };
 
+/// `(active_obj, excluded_maps, expected_kvas)` triple returned
+/// by [`Snapshot::excluded_under_kva_filter`] — the inputs the
+/// [`SnapshotError::ActiveFilterExcludedMaps`] constructor needs.
+/// Aliased to keep the helper's return shape readable at the
+/// call sites and to satisfy clippy's `type_complexity` lint
+/// without splitting the helper.
+type KvaFilterExclusion<'a> = (&'a str, Vec<(String, u64)>, Vec<u64>);
+
 /// Borrowed view over a captured [`FailureDumpReport`] for typed
 /// traversal of BTF-rendered map values, per-CPU entries, and
 /// scalar variables.
@@ -103,6 +111,37 @@ impl<'a> Snapshot<'a> {
         })
     }
 
+    /// Collect every captured map that shares the active obj prefix
+    /// but failed the KVA whitelist filter — the precondition for
+    /// [`SnapshotError::ActiveFilterExcludedMaps`]. Returns `None`
+    /// when the view is not active-filtered, when the KVA whitelist
+    /// is empty (no filter), or when no obj-prefixed map exists at
+    /// all (then `MapNotFound`/`VarNotFound` already captures the
+    /// state). Returns `Some((active_obj, excluded, expected))` only
+    /// when the filter REJECTED maps that would otherwise have been
+    /// admitted by the obj-prefix check, so the caller can emit the
+    /// richer diagnostic.
+    fn excluded_under_kva_filter(&self) -> Option<KvaFilterExclusion<'a>> {
+        let obj = self.active_obj?;
+        if self.active_map_kvas.is_empty() {
+            return None;
+        }
+        let mut excluded: Vec<(String, u64)> = Vec::new();
+        for m in &self.report.maps {
+            if !map_belongs_to_obj(&m.name, obj) {
+                continue;
+            }
+            if m.map_kva != 0 && self.active_map_kvas.contains(&m.map_kva) {
+                continue;
+            }
+            excluded.push((m.name.clone(), m.map_kva));
+        }
+        if excluded.is_empty() {
+            return None;
+        }
+        Some((obj, excluded, self.active_map_kvas.to_vec()))
+    }
+
     /// Underlying [`FailureDumpReport`] borrowed back to the caller.
     ///
     /// **Escape hatch.** Most consumers should reach for the typed
@@ -179,6 +218,14 @@ impl<'a> Snapshot<'a> {
             if m.name == name {
                 return Ok(SnapshotMap { map: m, cpu: None });
             }
+        }
+        if let Some((obj, excluded, expected)) = self.excluded_under_kva_filter() {
+            return Err(SnapshotError::ActiveFilterExcludedMaps {
+                requested: name.to_string(),
+                active_obj: obj.to_string(),
+                excluded_maps: excluded,
+                expected_kvas: expected,
+            });
         }
         Err(SnapshotError::MapNotFound {
             requested: name.to_string(),
@@ -276,6 +323,14 @@ impl<'a> Snapshot<'a> {
                 })
             }
             _ => {
+                if let Some((obj, excluded, expected)) = self.excluded_under_kva_filter() {
+                    return SnapshotField::Missing(SnapshotError::ActiveFilterExcludedMaps {
+                        requested: name.to_string(),
+                        active_obj: obj.to_string(),
+                        excluded_maps: excluded,
+                        expected_kvas: expected,
+                    });
+                }
                 let mut available: Vec<String> = Vec::new();
                 for m in self.maps_iter() {
                     if !is_global_section_map(&m.name) {
@@ -544,6 +599,16 @@ impl<'a> Snapshot<'a> {
         }
         let candidates: Vec<(&'a str, SnapshotField<'a>)> = self.vars(name).collect();
         if candidates.is_empty() {
+            if let Some((obj, excluded, expected)) = self.excluded_under_kva_filter() {
+                return SnapshotField::Missing(
+                    crate::scenario::snapshot::SnapshotError::ActiveFilterExcludedMaps {
+                        requested: name.to_string(),
+                        active_obj: obj.to_string(),
+                        excluded_maps: excluded,
+                        expected_kvas: expected,
+                    },
+                );
+            }
             let available: Vec<String> = self
                 .report
                 .maps
@@ -654,9 +719,9 @@ impl<'a> Snapshot<'a> {
         P: FnOnce(&[(&'a str, Vec<SnapshotField<'a>>)]) -> Option<usize>,
     {
         if self.report.is_placeholder {
-            return Err(crate::scenario::snapshot::SnapshotError::PlaceholderSnapshot {
-                tag: None,
-            });
+            return Err(
+                crate::scenario::snapshot::SnapshotError::PlaceholderSnapshot { tag: None },
+            );
         }
         if names.is_empty() {
             return Err(crate::scenario::snapshot::SnapshotError::ProjectionFailed {
@@ -692,6 +757,16 @@ impl<'a> Snapshot<'a> {
             }
         }
         if candidates.is_empty() {
+            if let Some((obj, excluded, expected)) = self.excluded_under_kva_filter() {
+                return Err(
+                    crate::scenario::snapshot::SnapshotError::ActiveFilterExcludedMaps {
+                        requested: format!("[{}]", names.join(", ")),
+                        active_obj: obj.to_string(),
+                        excluded_maps: excluded,
+                        expected_kvas: expected,
+                    },
+                );
+            }
             let available: Vec<String> = self
                 .report
                 .maps

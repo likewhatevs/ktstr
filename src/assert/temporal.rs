@@ -448,9 +448,9 @@ impl<T> SeriesField<T> {
 /// Cross-phase ratio builder returned by
 /// [`SeriesField::ratio_across_phases`] and
 /// [`PhaseMapExt::ratio_across_phases`]. Carries the resolved
-/// `(earlier, later)` values + a caller-supplied label so the
+/// `(earlier, later)` values and a caller-supplied label so the
 /// terminal comparator chain (`at_most`) can format both values
-/// + the ratio into a single failure-or-note message. Mirrors
+/// and the ratio into a single failure-or-note message. Mirrors
 /// the [`EachClaim`] shape (mutable verdict borrow held through
 /// the chain).
 ///
@@ -646,17 +646,11 @@ pub trait PhaseMapExt<T> {
 pub trait FracPair {
     /// See trait-level doc for the safe-divide and intersection-only
     /// semantics.
-    fn frac_pair(
-        &self,
-        other: &Self,
-    ) -> std::collections::BTreeMap<crate::assert::Phase, f64>;
+    fn frac_pair(&self, other: &Self) -> std::collections::BTreeMap<crate::assert::Phase, f64>;
 }
 
 impl FracPair for std::collections::BTreeMap<crate::assert::Phase, u64> {
-    fn frac_pair(
-        &self,
-        other: &Self,
-    ) -> std::collections::BTreeMap<crate::assert::Phase, f64> {
+    fn frac_pair(&self, other: &Self) -> std::collections::BTreeMap<crate::assert::Phase, f64> {
         self.iter()
             .filter_map(|(p, n)| {
                 other.get(p).map(|m| {
@@ -668,7 +662,11 @@ impl FracPair for std::collections::BTreeMap<crate::assert::Phase, u64> {
                     // fraction `n / u64::MAX` ≈ 0.0 for non-MAX `n`
                     // and 1.0 for the saturating case, with no NaN.
                     let total = n.saturating_add(*m);
-                    let frac = if total > 0 { *n as f64 / total as f64 } else { 0.0 };
+                    let frac = if total > 0 {
+                        *n as f64 / total as f64
+                    } else {
+                        0.0
+                    };
                     (*p, frac)
                 })
             })
@@ -710,7 +708,6 @@ impl<T> PhaseMapExt<T> for std::collections::BTreeMap<crate::assert::Phase, T> {
             later_value: self.get(&later).copied(),
         }
     }
-
 }
 
 /// Per-sample scalar claim builder returned by
@@ -2667,10 +2664,7 @@ mod tests {
             Some(20),
             "value_at_phase returns the LAST Ok-sample for the phase",
         );
-        assert_eq!(
-            f.value_at_phase(crate::assert::Phase::step(1)),
-            Some(30),
-        );
+        assert_eq!(f.value_at_phase(crate::assert::Phase::step(1)), Some(30),);
         assert_eq!(
             f.value_at_phase(crate::assert::Phase::step(2)),
             None,
@@ -3410,7 +3404,10 @@ mod tests {
             "saturating_add caps total at u64::MAX; both sides cast to same f64 → 1.0; got {v}",
         );
         assert!(!v.is_nan(), "must never produce NaN even at saturation");
-        assert!(v.is_finite(), "must produce a finite value even at saturation");
+        assert!(
+            v.is_finite(),
+            "must produce a finite value even at saturation"
+        );
     }
 
     /// Intersection-only semantics: phases present in only one

@@ -253,9 +253,18 @@ mod tests {
     fn max_by_sum_u64_tie_picks_last() {
         let v = u64_field(10);
         let rows = vec![
-            ("a", vec![SnapshotField::Value(&v), SnapshotField::Value(&v)]),
-            ("b", vec![SnapshotField::Value(&v), SnapshotField::Value(&v)]),
-            ("c", vec![SnapshotField::Value(&v), SnapshotField::Value(&v)]),
+            (
+                "a",
+                vec![SnapshotField::Value(&v), SnapshotField::Value(&v)],
+            ),
+            (
+                "b",
+                vec![SnapshotField::Value(&v), SnapshotField::Value(&v)],
+            ),
+            (
+                "c",
+                vec![SnapshotField::Value(&v), SnapshotField::Value(&v)],
+            ),
         ];
         assert_eq!(
             max_by_sum_u64(&rows),
@@ -273,11 +282,20 @@ mod tests {
         let big = u64_field(1000);
         let rows = vec![
             // row 0: u64 + Struct → drop entirely (any non-u64 → ineligible)
-            ("alpha", vec![SnapshotField::Value(&u), SnapshotField::Value(&s)]),
+            (
+                "alpha",
+                vec![SnapshotField::Value(&u), SnapshotField::Value(&s)],
+            ),
             // row 1: u64 + u64 → eligible, sum = 1010
-            ("beta", vec![SnapshotField::Value(&u), SnapshotField::Value(&big)]),
+            (
+                "beta",
+                vec![SnapshotField::Value(&u), SnapshotField::Value(&big)],
+            ),
             // row 2: Struct + u64 → drop entirely
-            ("gamma", vec![SnapshotField::Value(&s), SnapshotField::Value(&big)]),
+            (
+                "gamma",
+                vec![SnapshotField::Value(&s), SnapshotField::Value(&big)],
+            ),
         ];
         assert_eq!(
             max_by_sum_u64(&rows),
@@ -293,8 +311,14 @@ mod tests {
         let u = u64_field(10);
         let s = struct_field();
         let rows = vec![
-            ("alpha", vec![SnapshotField::Value(&u), SnapshotField::Value(&s)]),
-            ("beta", vec![SnapshotField::Value(&s), SnapshotField::Value(&u)]),
+            (
+                "alpha",
+                vec![SnapshotField::Value(&u), SnapshotField::Value(&s)],
+            ),
+            (
+                "beta",
+                vec![SnapshotField::Value(&s), SnapshotField::Value(&u)],
+            ),
         ];
         assert_eq!(
             max_by_sum_u64(&rows),
@@ -315,8 +339,14 @@ mod tests {
         let big = u64_field(u64::MAX);
         let one = u64_field(1);
         let rows = vec![
-            ("alpha", vec![SnapshotField::Value(&big), SnapshotField::Value(&one)]),
-            ("beta", vec![SnapshotField::Value(&one), SnapshotField::Value(&one)]),
+            (
+                "alpha",
+                vec![SnapshotField::Value(&big), SnapshotField::Value(&one)],
+            ),
+            (
+                "beta",
+                vec![SnapshotField::Value(&one), SnapshotField::Value(&one)],
+            ),
         ];
         // alpha saturates to u64::MAX; beta sums to 2. Alpha wins.
         assert_eq!(max_by_sum_u64(&rows), Some(0));

@@ -1656,17 +1656,19 @@ mod periodic_tag_tests {
         let cb: CaptureCallback = Arc::new(|_| None);
         let bridge = SnapshotBridge::new(cb);
         // Real periodic capture from the coordinator.
-        let mut real_periodic =
-            crate::monitor::dump::FailureDumpReport::default();
-        real_periodic.schema = crate::monitor::dump::SCHEMA_SINGLE.to_string();
-        real_periodic.is_placeholder = false;
+        let real_periodic = crate::monitor::dump::FailureDumpReport {
+            schema: crate::monitor::dump::SCHEMA_SINGLE.to_string(),
+            is_placeholder: false,
+            ..Default::default()
+        };
         bridge.store("periodic_000", real_periodic);
         // User-supplied CaptureSnapshot tag that happens to start
         // with "periodic_" — MUST NOT count.
-        let mut user_capture =
-            crate::monitor::dump::FailureDumpReport::default();
-        user_capture.schema = crate::monitor::dump::SCHEMA_SINGLE.to_string();
-        user_capture.is_placeholder = false;
+        let user_capture = crate::monitor::dump::FailureDumpReport {
+            schema: crate::monitor::dump::SCHEMA_SINGLE.to_string(),
+            is_placeholder: false,
+            ..Default::default()
+        };
         bridge.store("periodic_kaslr", user_capture);
         // A placeholder under a canonical tag — counted as fired
         // but NOT as real.
