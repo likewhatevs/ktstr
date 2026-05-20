@@ -46,8 +46,10 @@ use tempfile::TempDir;
 fn synthetic_report() -> FailureDumpReport {
     FailureDumpReport {
         schema: SCHEMA_DUAL.to_string(),
+        active_map_kvas: Vec::new(),
         maps: vec![FailureDumpMap {
             name: "synthetic.bss".into(),
+            map_kva: 0,
             map_type: BPF_MAP_TYPE_ARRAY,
             value_size: 8,
             max_entries: 1,

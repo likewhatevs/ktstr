@@ -87,6 +87,7 @@ fn synthetic_report() -> FailureDumpReport {
     };
     let bss_map = FailureDumpMap {
         name: "bpf.bss".into(),
+        map_kva: 0,
         map_type: 2,
         value_size: 32,
         max_entries: 1,
@@ -102,6 +103,7 @@ fn synthetic_report() -> FailureDumpReport {
     };
     let hash_map = FailureDumpMap {
         name: "scx_per_task".into(),
+        map_kva: 0,
         map_type: 1,
         value_size: 8,
         max_entries: 16,
@@ -174,6 +176,7 @@ fn synthetic_report() -> FailureDumpReport {
     };
     let percpu_map = FailureDumpMap {
         name: "scx_pcpu".into(),
+        map_kva: 0,
         map_type: 6,
         value_size: 8,
         max_entries: 1,
@@ -206,6 +209,7 @@ fn synthetic_report() -> FailureDumpReport {
     };
     FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
+        active_map_kvas: Vec::new(),
         maps: vec![bss_map, hash_map, percpu_map],
         ..Default::default()
     }
@@ -289,6 +293,7 @@ fn snapshot_var_ambiguity_lists_every_match() {
     };
     r.maps.push(FailureDumpMap {
         name: "other.data".into(),
+        map_kva: 0,
         map_type: 2,
         value_size: 32,
         max_entries: 1,
@@ -649,6 +654,7 @@ fn render_entry_key_percpu_hash_fallback_uses_hex_prefix() {
 fn map_find_no_match_on_single_value_array_renders_unavailable_keys() {
     let array_map = FailureDumpMap {
         name: "scx_singleton".into(),
+        map_kva: 0,
         map_type: 2,
         value_size: 8,
         max_entries: 1,
@@ -667,6 +673,7 @@ fn map_find_no_match_on_single_value_array_renders_unavailable_keys() {
     };
     let r = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
+        active_map_kvas: Vec::new(),
         maps: vec![array_map],
         ..Default::default()
     };
@@ -727,6 +734,7 @@ fn map_find_no_match_caps_sampled_keys_at_no_match_key_sample() {
         .collect();
     let hash_map = FailureDumpMap {
         name: "scx_big".into(),
+        map_kva: 0,
         map_type: 1,
         value_size: 4,
         max_entries: 64,
@@ -742,6 +750,7 @@ fn map_find_no_match_caps_sampled_keys_at_no_match_key_sample() {
     };
     let r = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
+        active_map_kvas: Vec::new(),
         maps: vec![hash_map],
         ..Default::default()
     };
@@ -793,6 +802,7 @@ fn map_find_no_match_caps_sampled_keys_at_no_match_key_sample() {
 fn map_find_no_match_preserves_duplicate_keys_in_sample() {
     let hash_map = FailureDumpMap {
         name: "scx_dup".into(),
+        map_kva: 0,
         map_type: 1,
         value_size: 4,
         max_entries: 16,
@@ -849,6 +859,7 @@ fn map_find_no_match_preserves_duplicate_keys_in_sample() {
     };
     let r = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
+        active_map_kvas: Vec::new(),
         maps: vec![hash_map],
         ..Default::default()
     };
@@ -1012,6 +1023,7 @@ fn map_find_no_match_cap_exact_threshold() {
         .collect();
     let hash_map = FailureDumpMap {
         name: "scx_threshold".into(),
+        map_kva: 0,
         map_type: 1,
         value_size: 4,
         max_entries: 16,
@@ -1027,6 +1039,7 @@ fn map_find_no_match_cap_exact_threshold() {
     };
     let r = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
+        active_map_kvas: Vec::new(),
         maps: vec![hash_map],
         ..Default::default()
     };
@@ -1665,6 +1678,7 @@ fn snapshot_bridge_store_overwrite_refreshes_position() {
     // side too.
     let refreshed = FailureDumpReport {
         schema: "refreshed".to_string(),
+        active_map_kvas: Vec::new(),
         ..Default::default()
     };
     bridge.store("tag_0000", refreshed);
@@ -1812,6 +1826,7 @@ fn snapshot_bridge_drain_ordered_preserves_insertion_order() {
     for (i, tag) in inputs.iter().enumerate() {
         let r = FailureDumpReport {
             schema: format!("schema_{i}"),
+            active_map_kvas: Vec::new(),
             ..Default::default()
         };
         bridge.store(tag, r);
@@ -1871,6 +1886,7 @@ fn snapshot_bridge_drain_ordered_overwrite_refreshes_position() {
         "a",
         FailureDumpReport {
             schema: "refreshed".to_string(),
+            active_map_kvas: Vec::new(),
             ..Default::default()
         },
     );
@@ -2265,6 +2281,7 @@ fn snapshot_error_serde_round_trip() {
 fn snapshot_report_escape_hatch_passes_through_underlying_report() {
     let report = FailureDumpReport {
         schema: "escape-hatch-contract-pin".to_string(),
+        active_map_kvas: Vec::new(),
         ..Default::default()
     };
     let snap = Snapshot::new(&report);
@@ -2551,6 +2568,7 @@ fn map_with_shape(
 ) -> FailureDumpMap {
     FailureDumpMap {
         name: name.into(),
+        map_kva: 0,
         arena,
         ringbuf,
         stack_trace,
@@ -2825,6 +2843,7 @@ fn snapshot_accessor_targets_round_trip_through_serde_json() {
         }),
         maps: vec![FailureDumpMap {
             name: "shape_map".into(),
+            map_kva: 0,
             map_type: 0,
             value_size: 0,
             max_entries: 0,
@@ -3422,6 +3441,7 @@ fn make_report_with_maps(maps: Vec<FailureDumpMap>) -> FailureDumpReport {
 fn make_global_map(name: &str, members: Vec<(&str, RenderedValue)>) -> FailureDumpMap {
     FailureDumpMap {
         name: name.to_string(),
+        map_kva: 0,
         map_type: 2,
         max_entries: 1,
         value: Some(RenderedValue::Struct {
@@ -3451,6 +3471,59 @@ fn snapshot_active_single_obj_returns_filtered_view() {
     let snap = Snapshot::new(&report);
     let active = snap.active().expect("single obj => active() succeeds");
     assert_eq!(active.var("counter").as_u64().ok(), Some(42));
+}
+
+/// Tester's BLOCKING gap (#206 pass-1 F1): when
+/// `active_obj_name` matches an obj prefix in the snapshot AND
+/// `active_map_kvas` is non-empty but contains KVAs that match
+/// NONE of the captured maps' `map_kva` values, the filter
+/// silently narrows to zero. Downstream `var()` reports
+/// `VarNotFound { available: [] }` — operator can't distinguish
+/// "var truly absent from this scheduler's bss" from "every
+/// captured map's KVA was filtered out (KVA aliasing or walker
+/// bug)." Without this test pinning the narrow-to-zero
+/// behavior, a regression that breaks the KVA filter silently
+/// hides as "var absent on user error" instead of surfacing as
+/// a framework correctness regression.
+#[test]
+fn snapshot_active_kva_filter_narrows_to_zero_when_no_kva_match() {
+    let mut alpha_bss = make_global_map("alpha.bss", vec![("counter", uint_v(42))]);
+    alpha_bss.map_kva = 0x1000;
+    let mut alpha_data = make_global_map("alpha.data", vec![("flag", uint_v(1))]);
+    alpha_data.map_kva = 0x2000;
+    let mut report = make_report_with_maps(vec![alpha_bss, alpha_data]);
+    // Walker resolved active_obj_name="alpha" AND populated the
+    // KVA whitelist with a SINGLE KVA that matches NONE of the
+    // captured maps' KVAs (simulates walker output that's
+    // inconsistent with the captured maps[]: e.g., the active
+    // obj's maps weren't in this capture, or KVA aliasing
+    // between captures, or a walker bug).
+    report.active_obj_name = Some("alpha".to_string());
+    report.active_map_kvas = vec![0x9999];
+
+    let snap = Snapshot::new(&report);
+    let active = snap.active().expect("active() succeeds — active_obj_name + captured prefix match");
+    // The KVA filter excludes BOTH captured maps (their KVAs
+    // 0x1000, 0x2000 ∉ {0x9999}). Every accessor on the
+    // narrowed snapshot sees ZERO maps.
+    let counter = active.var("counter");
+    // The fallback in var() returns the live-filter's
+    // diagnostic per pass-2 F2 fix. With zero maps the live
+    // filter yields VarNotFound with empty `available` — the
+    // current diagnostic. This test pins that semantic so a
+    // regression that lets the filter accidentally accept
+    // unmatched-KVA maps (or hides the narrow-to-zero by
+    // erroring on construction) surfaces immediately.
+    let err = counter.error().cloned().expect("zero-map filter yields error");
+    assert!(
+        matches!(
+            err,
+            SnapshotError::VarNotFound { ref available, .. } if available.is_empty()
+        ) || matches!(err, SnapshotError::AmbiguousVar { .. }),
+        "KVA-filter narrows-to-zero must surface as VarNotFound (empty available) \
+         or AmbiguousVar (post-fallback) — see #208 for the richer diagnostic \
+         work; got {err:?}",
+    );
 }
 
 #[test]
@@ -3845,6 +3918,7 @@ fn snapshot_field_iter_members_on_empty_array_yields_nothing() {
 fn two_instance_report(values: (u64, u64)) -> FailureDumpReport {
     let mk_bss = |obj: &str, value: u64| FailureDumpMap {
         name: format!("{obj}.bss"),
+        map_kva: 0,
         map_type: 2,
         value_size: 8,
         max_entries: 1,
@@ -3866,6 +3940,7 @@ fn two_instance_report(values: (u64, u64)) -> FailureDumpReport {
     };
     FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
+        active_map_kvas: Vec::new(),
         maps: vec![mk_bss("alpha", values.0), mk_bss("beta", values.1)],
         ..Default::default()
     }
@@ -3954,6 +4029,7 @@ fn live_var_via_no_candidates_surfaces_var_not_found() {
 fn two_instance_two_var_report() -> FailureDumpReport {
     let mk_bss = |obj: &str, same: u64, cross: u64| FailureDumpMap {
         name: format!("{obj}.bss"),
+        map_kva: 0,
         map_type: 2,
         value_size: 16,
         max_entries: 1,
@@ -3981,6 +4057,7 @@ fn two_instance_two_var_report() -> FailureDumpReport {
     };
     FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
+        active_map_kvas: Vec::new(),
         maps: vec![mk_bss("alpha", 10, 5), mk_bss("beta", 100, 50)],
         ..Default::default()
     }
@@ -4100,6 +4177,7 @@ fn live_vars_via_partial_coverage_map_excluded() {
     let mut r = FailureDumpReport::default();
     let alpha = FailureDumpMap {
         name: "alpha.bss".into(),
+        map_kva: 0,
         map_type: 2,
         value_size: 16,
         max_entries: 1,
@@ -4127,6 +4205,7 @@ fn live_vars_via_partial_coverage_map_excluded() {
     };
     let beta = FailureDumpMap {
         name: "beta.bss".into(),
+        map_kva: 0,
         map_type: 2,
         value_size: 8,
         max_entries: 1,

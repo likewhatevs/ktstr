@@ -165,8 +165,10 @@ fn event_counter_sample_serde_roundtrip() {
 fn report_serde_roundtrip() {
     let report = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
+        active_map_kvas: Vec::new(),
         maps: vec![FailureDumpMap {
             name: "scx_demo.bss".into(),
+            map_kva: 0,
             map_type: BPF_MAP_TYPE_ARRAY,
             value_size: 8,
             max_entries: 1,
@@ -247,11 +249,13 @@ fn empty_report_serde() {
 fn failure_dump_report_serialization_is_infallible_for_max_synthetic_input() {
     let report = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
+        active_map_kvas: Vec::new(),
         // Multiple maps: different map types, error vs value-bearing,
         // exercise the per-map serialization dispatch.
         maps: vec![
             FailureDumpMap {
                 name: "synthetic_array.bss".into(),
+                map_kva: 0,
                 map_type: BPF_MAP_TYPE_ARRAY,
                 value_size: 8,
                 max_entries: 1,
@@ -270,6 +274,7 @@ fn failure_dump_report_serialization_is_infallible_for_max_synthetic_input() {
             },
             FailureDumpMap {
                 name: "synthetic_hash.hash".into(),
+                map_kva: 0,
                 map_type: BPF_MAP_TYPE_HASH,
                 value_size: 16,
                 max_entries: 64,
@@ -285,6 +290,7 @@ fn failure_dump_report_serialization_is_infallible_for_max_synthetic_input() {
             },
             FailureDumpMap {
                 name: "synthetic_unsupported.queue".into(),
+                map_kva: 0,
                 map_type: BPF_MAP_TYPE_QUEUE,
                 value_size: 4,
                 max_entries: 0,
@@ -387,8 +393,10 @@ fn dual_failure_dump_report_serialization_is_infallible_for_max_synthetic_input(
     fn max_inner() -> FailureDumpReport {
         FailureDumpReport {
             schema: SCHEMA_SINGLE.to_string(),
+            active_map_kvas: Vec::new(),
             maps: vec![FailureDumpMap {
                 name: "synthetic_array.bss".into(),
+                map_kva: 0,
                 map_type: BPF_MAP_TYPE_ARRAY,
                 value_size: 8,
                 max_entries: 1,
@@ -538,6 +546,7 @@ fn all_snapshot_tags_enumerates_every_pub_const_in_module() {
 fn make_simple_map() -> FailureDumpMap {
     FailureDumpMap {
         name: "scx_demo.bss".into(),
+        map_kva: 0,
         map_type: BPF_MAP_TYPE_ARRAY,
         value_size: 8,
         max_entries: 1,
@@ -572,6 +581,7 @@ fn report_display_empty() {
 fn report_display_one_map_with_value() {
     let report = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
+        active_map_kvas: Vec::new(),
         maps: vec![make_simple_map()],
         vcpu_regs: Vec::new(),
         sdt_allocations: Vec::new(),
@@ -612,6 +622,7 @@ fn report_display_one_map_with_value() {
 fn report_display_multiple_maps_separated() {
     let report = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
+        active_map_kvas: Vec::new(),
         maps: vec![make_simple_map(), make_simple_map()],
         vcpu_regs: Vec::new(),
         sdt_allocations: Vec::new(),
@@ -717,6 +728,7 @@ fn percpu_entry_display_shows_each_cpu() {
 fn report_display_includes_vcpu_regs_section() {
     let report = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
+        active_map_kvas: Vec::new(),
         maps: Vec::new(),
         vcpu_regs: vec![
             Some(VcpuRegSnapshot {
@@ -772,6 +784,7 @@ fn report_display_includes_vcpu_regs_section() {
 fn report_display_pairs_maps_and_vcpu_regs_with_blank_line() {
     let report = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
+        active_map_kvas: Vec::new(),
         maps: vec![make_simple_map()],
         vcpu_regs: vec![Some(VcpuRegSnapshot {
             instruction_pointer: 0x1,
@@ -812,6 +825,7 @@ fn report_display_empty_with_only_vcpu_regs_does_not_say_empty_dump() {
     // render rather than fall through to "(empty failure dump)".
     let report = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
+        active_map_kvas: Vec::new(),
         maps: Vec::new(),
         vcpu_regs: vec![None],
         sdt_allocations: Vec::new(),
@@ -855,6 +869,7 @@ fn report_display_empty_with_only_vcpu_regs_does_not_say_empty_dump() {
 fn report_display_partial_with_populated_regs_and_empty_maps() {
     let report = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
+        active_map_kvas: Vec::new(),
         maps: Vec::new(),
         vcpu_regs: vec![Some(VcpuRegSnapshot {
             instruction_pointer: 0xdead,
@@ -926,6 +941,7 @@ fn report_display_partial_with_populated_regs_and_empty_maps() {
 fn dual_report_serde_roundtrip_with_early() {
     let early = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
+        active_map_kvas: Vec::new(),
         maps: Vec::new(),
         vcpu_regs: vec![None],
         sdt_allocations: Vec::new(),
@@ -951,6 +967,7 @@ fn dual_report_serde_roundtrip_with_early() {
     };
     let late = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
+        active_map_kvas: Vec::new(),
         maps: Vec::new(),
         vcpu_regs: vec![None, None],
         sdt_allocations: Vec::new(),
@@ -1462,6 +1479,7 @@ fn early_snapshot_serializes_as_schema_single() {
 fn prog_runtime_stats_serde_roundtrip_with_saturation() {
     let report = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
+        active_map_kvas: Vec::new(),
         maps: Vec::new(),
         vcpu_regs: Vec::new(),
         sdt_allocations: Vec::new(),
@@ -1535,6 +1553,7 @@ fn prog_runtime_stats_empty_skips_serialization() {
 fn report_display_renders_prog_runtime_stats() {
     let report = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
+        active_map_kvas: Vec::new(),
         maps: Vec::new(),
         vcpu_regs: Vec::new(),
         sdt_allocations: Vec::new(),
@@ -1595,6 +1614,7 @@ fn report_display_renders_prog_runtime_stats() {
 fn report_display_only_prog_runtime_stats_does_not_say_empty_dump() {
     let report = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
+        active_map_kvas: Vec::new(),
         maps: Vec::new(),
         vcpu_regs: Vec::new(),
         sdt_allocations: Vec::new(),
@@ -2229,6 +2249,7 @@ fn percpu_hash_entry_key_skips_when_none() {
 fn map_display_percpu_hash_entries_render() {
     let m = FailureDumpMap {
         name: "percpu_hash".into(),
+        map_kva: 0,
         map_type: BPF_MAP_TYPE_PERCPU_HASH,
         value_size: 4,
         max_entries: 100,
@@ -2363,6 +2384,7 @@ fn pinned_error_unknown_map_type_format() {
 fn map_percpu_hash_entries_skips_when_empty() {
     let m = FailureDumpMap {
         name: "test".into(),
+        map_kva: 0,
         map_type: BPF_MAP_TYPE_HASH,
         value_size: 4,
         max_entries: 1,
@@ -2387,6 +2409,7 @@ fn map_percpu_hash_entries_skips_when_empty() {
 fn map_percpu_hash_entries_round_trip_when_populated() {
     let m = FailureDumpMap {
         name: "ph".into(),
+        map_kva: 0,
         map_type: BPF_MAP_TYPE_PERCPU_HASH,
         value_size: 4,
         max_entries: 1,
@@ -5957,6 +5980,7 @@ fn entry_display_payload_renders_below_value() {
 fn map_display_table_for_homogeneous_entries() {
     let m = FailureDumpMap {
         name: "cbw".into(),
+        map_kva: 0,
         map_type: BPF_MAP_TYPE_HASH,
         value_size: 8,
         max_entries: 64,
@@ -6034,6 +6058,7 @@ fn map_display_skips_table_for_single_entry() {
     // table header overhead exceeds the savings.
     let m = FailureDumpMap {
         name: "single".into(),
+        map_kva: 0,
         map_type: BPF_MAP_TYPE_HASH,
         value_size: 8,
         max_entries: 64,
@@ -6074,6 +6099,7 @@ fn map_display_skips_table_when_payload_present() {
     // table can't carry the per-entry typed payload below each row.
     let m = FailureDumpMap {
         name: "with_payload".into(),
+        map_kva: 0,
         map_type: BPF_MAP_TYPE_HASH,
         value_size: 8,
         max_entries: 64,
@@ -6119,6 +6145,7 @@ fn map_display_skips_table_for_heterogeneous_types() {
     // Different key type names → not homogeneous → no table.
     let m = FailureDumpMap {
         name: "het".into(),
+        map_kva: 0,
         map_type: BPF_MAP_TYPE_HASH,
         value_size: 8,
         max_entries: 64,
@@ -6161,6 +6188,7 @@ fn map_display_skips_table_when_entry_has_no_btf_render() {
     // disqualifies the table.
     let m = FailureDumpMap {
         name: "no_btf".into(),
+        map_kva: 0,
         map_type: BPF_MAP_TYPE_HASH,
         value_size: 8,
         max_entries: 64,
@@ -6995,10 +7023,13 @@ impl super::super::bpf_prog::BpfProgAccessor for TestProgAccessor {
         &self,
         target_struct_ops_map_kva: u64,
         _map_offsets: &super::super::btf_offsets::BpfMapOffsets,
-    ) -> Option<String> {
+    ) -> Option<super::super::bpf_prog::ActiveObjMatch> {
         self.walker_result.as_ref().and_then(|(target, name)| {
             if *target == target_struct_ops_map_kva {
-                Some(name.clone())
+                Some(super::super::bpf_prog::ActiveObjMatch {
+                    obj_name: name.clone(),
+                    used_map_kvas: Vec::new(),
+                })
             } else {
                 None
             }
@@ -7082,7 +7113,7 @@ fn identify_active_obj_libbpf_named_single_scheduler_via_walker() {
     );
     assert_eq!(
         result,
-        Some("ktstr".to_string()),
+        Some(("ktstr".to_string(), Vec::new())),
         "walker fallback must resolve libbpf-named struct_ops to the obj prefix",
     );
 }
@@ -7115,7 +7146,7 @@ fn identify_active_obj_libbpf_named_two_schedulers_picks_active() {
     );
     assert_eq!(
         result,
-        Some("ktstr".to_string()),
+        Some(("ktstr".to_string(), Vec::new())),
         "walker disambiguates to the scheduler whose struct_ops map matches sched_kva",
     );
 }
@@ -7194,7 +7225,7 @@ fn identify_active_obj_legacy_path_works_without_walker() {
     let result = super::identify_active_obj_from_struct_ops(&maps, &scx, None);
     assert_eq!(
         result,
-        Some("ktstr".to_string()),
+        Some(("ktstr".to_string(), Vec::new())),
         "prefix cross-check resolves single-scheduler case without walker",
     );
 }
@@ -7226,7 +7257,72 @@ fn identify_active_obj_legacy_path_short_circuits_walker_when_provided() {
     );
     assert_eq!(
         result,
-        Some("ktstr".to_string()),
+        Some(("ktstr".to_string(), Vec::new())),
         "legacy prefix cross-check takes precedence; walker is fallback-only",
     );
+}
+
+/// Round-trip u64 KVAs at the top of the address space through
+/// `serde_json` and back. Kernel KASLR-slid addresses set the high
+/// bits (typical `0xffff_8000_*` range); a regression to a serde
+/// feature flag that lossily coerced large u64 to f64 would
+/// truncate the bottom ~11 bits. Pins the bit-exact round-trip.
+#[test]
+fn failure_dump_map_and_report_round_trip_high_u64_kvas() {
+    let high_kva: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+    let kaslr_slid: u64 = 0xFFFF_8000_1234_5678;
+    let other_kva: u64 = 0xFFFF_8888_AAAA_BBBB;
+
+    let mut m = FailureDumpMap::default();
+    m.name = "scx_test.bss".into();
+    m.map_kva = high_kva;
+    m.map_type = 2;
+    let m_json = serde_json::to_string(&m).expect("serialize map");
+    let m_back: FailureDumpMap = serde_json::from_str(&m_json).expect("deserialize map");
+    assert_eq!(
+        m_back.map_kva, high_kva,
+        "FailureDumpMap.map_kva must round-trip bit-exact across the top of the u64 range",
+    );
+
+    let mut r = FailureDumpReport::default();
+    r.active_map_kvas = vec![high_kva, kaslr_slid, other_kva];
+    let r_json = serde_json::to_string(&r).expect("serialize report");
+    let r_back: FailureDumpReport = serde_json::from_str(&r_json).expect("deserialize report");
+    assert_eq!(
+        r_back.active_map_kvas,
+        vec![high_kva, kaslr_slid, other_kva],
+        "FailureDumpReport.active_map_kvas must round-trip every u64 bit-exact, \
+         preserving order and top-bit-set addresses",
+    );
+}
+
+/// The kernel never allocates `struct bpf_map` at virtual address
+/// 0 (vmalloc/slab never returns NULL on success). A real capture
+/// reading `info.map_kva` therefore MUST surface a non-zero value;
+/// a zero on the production path indicates either (a) a backend
+/// stub or (b) a null-KVA leak in the BPF walker, both of which
+/// the consumer-side `Snapshot::active` would silently treat as
+/// "no kernel identity" and fall through to obj-prefix matching.
+/// This test pins the zero-KVA sentinel semantic so a regression
+/// where the walker emits 0 for a real map surfaces immediately.
+#[test]
+fn failure_dump_map_zero_kva_is_no_identity_sentinel_not_real_capture() {
+    // Default-constructed (synthetic test fixture path): map_kva = 0
+    // means "no identity recorded".
+    let synthetic = FailureDumpMap::default();
+    assert_eq!(
+        synthetic.map_kva, 0,
+        "Default::default() leaves map_kva = 0 as the no-identity sentinel; \
+         synthetic test fixtures rely on this to skip the field via serde",
+    );
+    // The sentinel survives JSON round-trip: absent in JSON →
+    // deserializes back to 0 (via skip_serializing_if + default).
+    let json = serde_json::to_string(&synthetic).expect("serialize");
+    assert!(
+        !json.contains("map_kva"),
+        "zero map_kva must be omitted from serialized JSON (skip_serializing_if=is_zero_u64); \
+         got {json}",
+    );
+    let back: FailureDumpMap = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back.map_kva, 0, "absent-in-JSON deserializes back to 0 (the sentinel)");
 }

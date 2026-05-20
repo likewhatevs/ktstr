@@ -959,6 +959,46 @@ pub struct FailureDumpReport {
     /// failure cause).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_obj_name: Option<String>,
+    /// Guest-KVAs of every `struct bpf_map` belonging to the
+    /// currently-attached scheduler's loaded BPF object, captured
+    /// alongside [`Self::active_obj_name`] from the same
+    /// `*scx_root → struct_ops map → owning bpf_prog → used_maps`
+    /// walk. The walker enumerates the matched struct_ops prog's
+    /// `used_maps` array and records each entry's KVA so a
+    /// downstream filter can identify the active scheduler's maps
+    /// uniquely — even when two scheduler instances loaded from the
+    /// SAME binary coexist post-[`crate::scenario::ops::Op::ReplaceScheduler`]
+    /// (where their bss / data / rodata maps share the
+    /// `<obj_name>.` prefix and cannot be distinguished by name
+    /// alone).
+    ///
+    /// Empty when:
+    /// - [`Self::active_obj_name`] is `None` (walker did not
+    ///   resolve the active obj — same reasons; see that field's
+    ///   doc).
+    /// - The matched prog's `used_maps` could not be safely read
+    ///   (torn race per the kernel's `used_map_cnt` / `used_maps`
+    ///   pointer publication TOCTOU described at
+    ///   `monitor/bpf_prog.rs::find_obj_name_for_struct_ops_map_kva`).
+    /// - The walker ran but the kernel published an empty
+    ///   `used_maps` for the active prog (no maps registered — an
+    ///   unusual but legal sched_ext shape).
+    ///
+    /// **KVA aliasing caveat:** kernel BPF map allocations are
+    /// vmalloc/slab-backed; a freed map's KVA can be reassigned to a
+    /// new allocation across captures. [`crate::scenario::snapshot::Snapshot::active`]
+    /// combines this set with [`Self::active_obj_name`] (both must
+    /// match) to reject the aliasing case — a KVA hit whose owning
+    /// map name does not share the active obj prefix is treated as
+    /// stale and falls through to the obj-prefix heuristic.
+    ///
+    /// **Within-run identity ONLY.** KVAs reflect kernel address
+    /// space allocation at capture time (subject to KASLR slide).
+    /// Stable for the life of the map within a single VM run; NOT
+    /// comparable across runs. Never persist or compare against
+    /// checked-in baselines.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_map_kvas: Vec<u64>,
     /// Structured per-allocation views from sdt_alloc-backed
     /// allocators. One entry per discovered allocator; each carries
     /// every live leaf slot (capped at
@@ -1234,6 +1274,7 @@ impl Default for FailureDumpReport {
     fn default() -> Self {
         Self {
             schema: SCHEMA_SINGLE.to_string(),
+            active_map_kvas: Vec::new(),
             maps: Vec::new(),
             vcpu_regs: Vec::new(),
             sdt_allocations: Vec::new(),
@@ -1338,7 +1379,7 @@ fn identify_active_obj_from_struct_ops(
         &dyn super::bpf_prog::BpfProgAccessor,
         &super::btf_offsets::BpfMapOffsets,
     )>,
-) -> Option<String> {
+) -> Option<(String, Vec<u64>)> {
     let sched_kva = scx_sched_state.as_ref()?.sched_kva?;
     // Phase 1: identify THE struct_ops map currently published into
     // *scx_root via the kvalue.data ↔ sched_kva equality.
@@ -1379,7 +1420,13 @@ fn identify_active_obj_from_struct_ops(
                     || m.name().starts_with(&format!("{prefix}.rodata")))
         });
         if has_matching_global {
-            return Some(prefix.to_string());
+            // Phase-1 hit: name resolved from the struct_ops map
+            // name directly. Phase-1 has no used_maps walk → no
+            // map-KVA set to publish; consumer falls back to
+            // obj-prefix matching when active_map_kvas is empty
+            // (still correct semantics, just without same-binary
+            // disambiguation guarantee).
+            return Some((prefix.to_string(), Vec::new()));
         }
     }
     // Phase-2 fallback: the struct_ops map name lacks a usable obj
@@ -1394,16 +1441,16 @@ fn identify_active_obj_from_struct_ops(
     // against the walker reading garbage from a torn used_maps
     // window). Only publish on cross-check success.
     let (prog_accessor, map_offsets) = prog_walker?;
-    let walker_prefix =
+    let walker_match =
         prog_accessor.find_active_obj_via_used_maps(active_struct_ops.map_kva, map_offsets)?;
     let walker_prefix_validated = maps.iter().any(|m| {
         m.map_type != super::bpf_map::BPF_MAP_TYPE_STRUCT_OPS
-            && (m.name().starts_with(&format!("{walker_prefix}.bss"))
-                || m.name().starts_with(&format!("{walker_prefix}.data"))
-                || m.name().starts_with(&format!("{walker_prefix}.rodata")))
+            && (m.name().starts_with(&format!("{}.bss", walker_match.obj_name))
+                || m.name().starts_with(&format!("{}.data", walker_match.obj_name))
+                || m.name().starts_with(&format!("{}.rodata", walker_match.obj_name)))
     });
     if walker_prefix_validated {
-        Some(walker_prefix)
+        Some((walker_match.obj_name, walker_match.used_map_kvas))
     } else {
         None
     }
@@ -1679,6 +1726,24 @@ pub struct FailureDumpMap {
     /// `BPF_OBJ_NAME_LEN` (16) by the kernel; libbpf composes
     /// `"<obj_name>.<section>"` for global-section maps.
     pub name: String,
+    /// Guest-KVA of this map's `struct bpf_map` allocation. Unique
+    /// per loaded map instance — two map copies sharing the same
+    /// `name` (e.g. two `<obj>.bss` maps from two scheduler
+    /// instances loaded from the same binary post-
+    /// [`crate::scenario::ops::Op::ReplaceScheduler`]) have distinct
+    /// KVAs and are distinguishable on this field alone.
+    ///
+    /// Sourced from [`crate::monitor::bpf_map::BpfMapInfo::map_kva`]
+    /// at capture time. Within-run stable (the kernel does not
+    /// relocate `struct bpf_map`); not comparable across runs
+    /// (KASLR slide differs).
+    ///
+    /// `0` when capture did not record a KVA (e.g., synthetic test
+    /// fixtures constructed via `..Default::default()`); consumers
+    /// treating `0` as "no kernel identity" gracefully fall back to
+    /// name-based matching.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub map_kva: u64,
     /// Raw `map_type` from `struct bpf_map` (e.g. `BPF_MAP_TYPE_ARRAY`).
     /// Kept as `u32` rather than an enum to avoid bumping a serde
     /// schema each time the kernel adds a kind.
@@ -2801,10 +2866,14 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
             accessor.offsets(),
         )
     });
-    let active_obj_name =
-        identify_active_obj_from_struct_ops(&maps, &scx_sched_state, prog_walker);
+    let (active_obj_name, active_map_kvas) =
+        match identify_active_obj_from_struct_ops(&maps, &scx_sched_state, prog_walker) {
+            Some((name, kvas)) => (Some(name), kvas),
+            None => (None, Vec::new()),
+        };
     let mut report = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
+        active_map_kvas,
         maps: Vec::with_capacity(maps.len()),
         vcpu_regs: Vec::new(),
         sdt_allocations: Vec::new(),

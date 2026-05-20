@@ -44,6 +44,22 @@ pub struct Snapshot<'a> {
     /// own `scx_sched_state` + `prog_runtime_stats`; `None` when the
     /// snapshot was constructed via [`Self::new`] (unfiltered).
     active_obj: Option<&'a str>,
+    /// Optional kernel-map-KVA whitelist used alongside
+    /// [`Self::active_obj`] to defend against the same-binary case
+    /// (two scheduler instances loaded from the same binary, e.g.
+    /// MITOSIS_FIXED + MITOSIS_ADAPTIVE both loading `scx_mitosis`,
+    /// where the obj prefix matches both copies' bss/data/rodata
+    /// maps). When set + non-empty, a map is "active" only if BOTH
+    /// `active_obj` matches its prefix AND its
+    /// [`FailureDumpMap::map_kva`] appears in the whitelist.
+    ///
+    /// `&[]` (empty) when [`Self::active`] resolved a prefix via the
+    /// Phase-1 name path (no walker run → no KVA set captured) OR
+    /// when the snapshot pre-dates the walker plumbing. In that
+    /// case `Snapshot::active`'s filter degrades to obj-prefix
+    /// matching only — still correct for the different-binary case;
+    /// loses the same-binary disambiguation guarantee.
+    active_map_kvas: &'a [u64],
 }
 
 impl<'a> Snapshot<'a> {
@@ -53,17 +69,37 @@ impl<'a> Snapshot<'a> {
         Self {
             report,
             active_obj: None,
+            active_map_kvas: &[],
         }
     }
 
     /// Iterate maps the current view exposes — every captured map
     /// when `active_obj` is None; only maps whose name shares the
     /// `<obj>.` prefix when [`Self::active`] populated the filter.
+    /// When [`Self::active_map_kvas`] is also populated, additionally
+    /// require the map's [`FailureDumpMap::map_kva`] to be in the
+    /// whitelist — this catches the same-binary case where two
+    /// scheduler instances' bss maps share an obj prefix but live at
+    /// distinct kernel addresses.
     fn maps_iter(&self) -> impl Iterator<Item = &'a FailureDumpMap> + '_ {
         let active = self.active_obj;
+        let kva_filter = self.active_map_kvas;
         self.report.maps.iter().filter(move |m| match active {
             None => true,
-            Some(obj) => map_belongs_to_obj(&m.name, obj),
+            Some(obj) => {
+                if !map_belongs_to_obj(&m.name, obj) {
+                    return false;
+                }
+                // Empty whitelist = no KVA filter (phase-1 name path
+                // OR pre-walker snapshot). Non-empty = require the
+                // map's KVA to appear; defends against KVA aliasing
+                // and same-binary post-swap ambiguity per the
+                // FailureDumpReport::active_map_kvas doc.
+                if kva_filter.is_empty() {
+                    return true;
+                }
+                m.map_kva != 0 && kva_filter.contains(&m.map_kva)
+            }
         })
     }
 
@@ -159,15 +195,38 @@ impl<'a> Snapshot<'a> {
     /// [`SnapshotField::Missing`] with
     /// [`SnapshotError::VarNotFound`] (and the union of every
     /// global-section map's top-level member names in `available`)
-    /// when no map exposes the name; or
-    /// [`SnapshotError::AmbiguousVar`] when more than one
-    /// global-section map exposes a top-level member with the same
-    /// name. Two BPF objects sharing a global symbol — common when
-    /// a scenario loads multiple progs into one report — would
-    /// otherwise fall through to an arbitrary first match keyed off
-    /// `report.maps` ordering, which depends on kernel IDR
-    /// allocation order. Callers disambiguate via
-    /// [`Self::map`] and walk the named map directly.
+    /// when no map exposes the name; OR — when more than one
+    /// global-section map exposes the name — auto-falls-back to
+    /// [`Self::live_var`] semantics (delegates to
+    /// [`Self::active`] and re-projects) before yielding
+    /// [`SnapshotError::AmbiguousVar`].
+    ///
+    /// # Auto-fallback contract
+    ///
+    /// When the raw scan finds 2+ hits AND the snapshot is not
+    /// already narrowed by [`Self::active`] (i.e.
+    /// `self.active_obj` is `None`), `var()` invokes
+    /// `self.active().and_then(|s| s.var(name))` and returns
+    /// THAT result directly — whether [`SnapshotField::Value`],
+    /// [`SnapshotError::VarNotFound`], or
+    /// [`SnapshotError::AmbiguousVar`] persisting after the
+    /// live filter narrowed. The fallback exists so post-
+    /// [`crate::scenario::ops::Op::ReplaceScheduler`] callers
+    /// who name a global by string don't have to know about
+    /// [`Self::live_var`] explicitly — the principled
+    /// active-scheduler walker is consulted automatically when
+    /// the raw lookup is ambiguous. [`Self::live_var`] remains
+    /// the explicit-opt-in form for callers who want the live
+    /// filter unconditionally (skip the raw-scan path).
+    ///
+    /// # When `AmbiguousVar` STILL fires
+    ///
+    /// After the auto-fallback. The raw scan found 2+ hits AND
+    /// `active()` failed (no scheduler attached, multi-obj
+    /// without principled walker resolution, etc.). The
+    /// `found_in` list names every map the raw scan saw — the
+    /// operator needs all of them to reason about which obj
+    /// they want to address via [`Self::map`].
     pub fn var(&self, name: &str) -> SnapshotField<'a> {
         if self.report.is_placeholder {
             return SnapshotField::Missing(SnapshotError::PlaceholderSnapshot { tag: None });
@@ -185,10 +244,37 @@ impl<'a> Snapshot<'a> {
         }
         match hits.len() {
             1 => SnapshotField::Value(hits[0].1),
-            n if n > 1 => SnapshotField::Missing(SnapshotError::AmbiguousVar {
-                requested: name.to_string(),
-                found_in: hits.iter().map(|(name, _)| (*name).to_string()).collect(),
-            }),
+            n if n > 1 => {
+                // Ambiguous at the raw-`var` layer — try the
+                // principled active-scheduler resolution before
+                // giving up. When `Snapshot::active()` succeeds it
+                // restricts the projection to the live scheduler's
+                // maps (and, when the walker populated the KVA
+                // whitelist, the live scheduler's specific map
+                // instances even in the same-binary case). If
+                // active() resolves to a Snapshot whose filtered
+                // maps_iter yields exactly one hit, return that.
+                // When the live filter ALSO can't narrow (e.g.,
+                // KVA whitelist excluded every match → narrows to
+                // zero, or live obj has 2+ copies of the same
+                // global — unusual but possible), surface THE
+                // LIVE-FILTERED diagnostic rather than the
+                // pre-filter AmbiguousVar list. The operator who
+                // hits ambiguity post-disambiguation needs to know the
+                // filter ran and what it admitted, not see the
+                // raw all-maps "ambiguous between OLD + NEW bss"
+                // list that misleads them into reaching for a
+                // picker the framework already obviated.
+                if self.active_obj.is_none()
+                    && let Ok(active) = self.active()
+                {
+                    return active.var(name);
+                }
+                SnapshotField::Missing(SnapshotError::AmbiguousVar {
+                    requested: name.to_string(),
+                    found_in: hits.iter().map(|(name, _)| (*name).to_string()).collect(),
+                })
+            }
             _ => {
                 let mut available: Vec<String> = Vec::new();
                 for m in self.maps_iter() {
@@ -336,6 +422,14 @@ impl<'a> Snapshot<'a> {
             return Ok(Snapshot {
                 report: self.report,
                 active_obj: Some(matched),
+                // Pair the obj-name match with the walker's KVA
+                // whitelist when populated — both filters are then
+                // required by maps_iter, so a same-binary post-swap
+                // capture (two `<obj>.bss` copies sharing the
+                // prefix) resolves to the live one's KVAs only.
+                // Empty whitelist falls back to obj-prefix only
+                // (still correct for the different-binary case).
+                active_map_kvas: &self.report.active_map_kvas,
             });
         }
         match obj_names.as_slice() {
@@ -347,6 +441,10 @@ impl<'a> Snapshot<'a> {
             [only] => Ok(Snapshot {
                 report: self.report,
                 active_obj: Some(*only),
+                // Only one obj prefix in the snapshot — no KVA
+                // disambiguation needed; obj-prefix matching is
+                // sufficient.
+                active_map_kvas: &[],
             }),
             multiple => Err(SnapshotError::NoActiveScheduler {
                 reason: format!(

@@ -45,6 +45,41 @@ impl SampleSeries {
         })
     }
 
+    /// Project the live scheduler's stats JSON field at `path` as
+    /// `u64`. Per-row equivalent of `series.stats(label, |s|
+    /// s.get(path).as_u64())` with the boilerplate elided. Mirrors
+    /// [`Self::bpf_live_u64`] for naming parity across axes.
+    ///
+    /// **Why "live" applies — per-request freshness, not a buffer.**
+    /// Each periodic snapshot issues a FRESH `scx_stats` request
+    /// just before the freeze rendezvous fires; the response in
+    /// `row.stats` came from whichever scheduler was alive at
+    /// request-issue time. There is no relay buffer of "the last
+    /// stats we saw" — a stale-pre-swap response cannot land in
+    /// a post-swap sample. After `Op::ReplaceScheduler` the host
+    /// reconnects to the new scheduler's `scx_stats` endpoint
+    /// before the next periodic boundary issues its request, so
+    /// post-swap samples carry the new scheduler's data. The
+    /// `_live` suffix matches the BPF axis naming for cross-axis
+    /// vocabulary consistency AND describes the actual freshness
+    /// guarantee — same semantic across both axes.
+    pub fn stats_live_u64(&self, path: &str) -> SeriesField<u64> {
+        let path_owned = path.to_string();
+        self.stats(path_owned.clone(), move |s| s.get(&path_owned).as_u64())
+    }
+
+    /// Sibling of [`Self::stats_live_u64`] projecting as `i64`.
+    pub fn stats_live_i64(&self, path: &str) -> SeriesField<i64> {
+        let path_owned = path.to_string();
+        self.stats(path_owned.clone(), move |s| s.get(&path_owned).as_i64())
+    }
+
+    /// Sibling of [`Self::stats_live_u64`] projecting as `f64`.
+    pub fn stats_live_f64(&self, path: &str) -> SeriesField<f64> {
+        let path_owned = path.to_string();
+        self.stats(path_owned.clone(), move |s| s.get(&path_owned).as_f64())
+    }
+
     /// Auto-project a stats-JSON sub-tree. The returned
     /// [`StatsPathProjector`] resolves the tree at sample 0 and
     /// exposes object keys via `.key(name)` (for nested layer /
@@ -222,6 +257,7 @@ mod tests {
         };
         let bss_map = FailureDumpMap {
             name: "scx_obj.bss".into(),
+            map_kva: 0,
             map_type: 2,
             value_size: 16,
             max_entries: 1,
@@ -237,6 +273,7 @@ mod tests {
         };
         FailureDumpReport {
             schema: SCHEMA_SINGLE.to_string(),
+            active_map_kvas: Vec::new(),
             maps: vec![bss_map],
             ..Default::default()
         }

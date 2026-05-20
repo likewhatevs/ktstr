@@ -180,7 +180,7 @@ pub(crate) fn find_obj_name_for_struct_ops_map_kva(
     start_kernel_map: u64,
     phys_base: u64,
     target_struct_ops_map_kva: u64,
-) -> Option<String> {
+) -> Option<ActiveObjMatch> {
     let idr_pa = text_kva_to_pa_with_base(prog_idr_kva, start_kernel_map, phys_base);
 
     let xa_head = mem.read_u64(idr_pa, prog_offsets.idr_xa_head);
@@ -254,22 +254,31 @@ pub(crate) fn find_obj_name_for_struct_ops_map_kva(
             continue;
         };
 
-        // Pass 1: scan for the target struct_ops map KVA.
+        // Pass 1: scan for the target struct_ops map KVA AND
+        // simultaneously snapshot every used_maps entry. The full
+        // entry set is what downstream disambiguation uses to
+        // identify the active obj's maps when two scheduler
+        // instances loaded from the same binary share a name prefix
+        // (post-`Op::ReplaceScheduler` swap window).
+        let mut entries: Vec<u64> = Vec::with_capacity(used_map_cnt as usize);
         let mut has_target = false;
         for i in 0..used_map_cnt {
             let entry_kva = mem.read_u64(used_maps_pa, (i as usize) * 8);
+            if entry_kva != 0 {
+                entries.push(entry_kva);
+            }
             if entry_kva == target_struct_ops_map_kva {
                 has_target = true;
-                break;
             }
         }
         if !has_target {
             continue;
         }
-        // Pass 2: in the same array, find a global-section map.
-        for i in 0..used_map_cnt {
-            let map_kva = mem.read_u64(used_maps_pa, (i as usize) * 8);
-            if map_kva == 0 || map_kva == target_struct_ops_map_kva {
+        // Pass 2: in the SAME captured slice, find a global-section
+        // map and derive the obj prefix. Iterates `entries` (already
+        // filtered to non-zero) instead of re-reading guest memory.
+        for &map_kva in &entries {
+            if map_kva == target_struct_ops_map_kva {
                 continue;
             }
             let Some(map_pa) = translate_any_kva(
@@ -288,13 +297,33 @@ pub(crate) fn find_obj_name_for_struct_ops_map_kva(
                 .iter()
                 .position(|&b| b == 0)
                 .unwrap_or(BPF_OBJ_NAME_LEN);
-            let name = std::str::from_utf8(&name_buf[..name_len]).ok()?;
+            let Ok(name) = std::str::from_utf8(&name_buf[..name_len]) else {
+                continue;
+            };
             if let Some(obj) = extract_global_section_obj_prefix(name) {
-                return Some(obj.to_string());
+                return Some(ActiveObjMatch {
+                    obj_name: obj.to_string(),
+                    used_map_kvas: entries,
+                });
             }
         }
     }
     None
+}
+
+/// Result of [`find_obj_name_for_struct_ops_map_kva`]: the matched
+/// scheduler's obj prefix plus the full set of used_maps KVAs from
+/// the matched prog's aux table. The KVA set lets the consumer
+/// distinguish two scheduler instances loaded from the SAME binary
+/// (whose maps share an obj prefix but live at distinct kernel
+/// addresses) — see
+/// [`crate::scenario::snapshot::Snapshot::active`] for the
+/// downstream filter that combines (obj-name match AND KVA-in-set)
+/// to defend against KVA aliasing across captures.
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveObjMatch {
+    pub obj_name: String,
+    pub used_map_kvas: Vec<u64>,
 }
 
 /// If `map_name` matches `<obj>.bss` / `<obj>.data` / `<obj>.rodata`
@@ -694,7 +723,7 @@ pub trait BpfProgAccessor {
         &self,
         target_struct_ops_map_kva: u64,
         map_offsets: &BpfMapOffsets,
-    ) -> Option<String>;
+    ) -> Option<ActiveObjMatch>;
 }
 
 /// Host-side BPF program accessor backed by direct guest physical-memory
@@ -770,7 +799,7 @@ impl BpfProgAccessor for GuestMemProgAccessor<'_> {
         &self,
         target_struct_ops_map_kva: u64,
         map_offsets: &BpfMapOffsets,
-    ) -> Option<String> {
+    ) -> Option<ActiveObjMatch> {
         find_obj_name_for_struct_ops_map_kva(
             self.kernel.mem(),
             self.kernel.walk_context(),

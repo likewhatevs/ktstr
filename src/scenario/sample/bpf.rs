@@ -63,6 +63,44 @@ impl SampleSeries {
         })
     }
 
+    /// Project the live scheduler's `<obj>.<section>` global
+    /// variable named `name` as `u64`. Per-row equivalent of
+    /// `snap.live_var(name).as_u64()`, but with the placeholder
+    /// short-circuit baked in.
+    ///
+    /// **Why this exists.** Single-binary tests can use
+    /// `series.bpf("label", |s| s.var(name).as_u64())` directly —
+    /// `var()` auto-disambiguates via the active-scheduler walker
+    /// when multiple maps share a global symbol (e.g. post-
+    /// `Op::ReplaceScheduler` with two scheduler instances). The
+    /// `bpf_live_u64` helper saves the closure boilerplate AND
+    /// makes the live-resolution semantics visible in the call
+    /// site's NAME, not buried in a projector body. The label on
+    /// the resulting [`SeriesField`] is the `name` argument
+    /// verbatim.
+    pub fn bpf_live_u64(&self, name: &str) -> SeriesField<u64> {
+        let name_owned = name.to_string();
+        self.bpf(name_owned.clone(), move |snap| {
+            snap.live_var(&name_owned).as_u64()
+        })
+    }
+
+    /// Sibling of [`Self::bpf_live_u64`] projecting as `i64`.
+    pub fn bpf_live_i64(&self, name: &str) -> SeriesField<i64> {
+        let name_owned = name.to_string();
+        self.bpf(name_owned.clone(), move |snap| {
+            snap.live_var(&name_owned).as_i64()
+        })
+    }
+
+    /// Sibling of [`Self::bpf_live_u64`] projecting as `f64`.
+    pub fn bpf_live_f64(&self, name: &str) -> SeriesField<f64> {
+        let name_owned = name.to_string();
+        self.bpf(name_owned.clone(), move |snap| {
+            snap.live_var(&name_owned).as_f64()
+        })
+    }
+
     /// Per-snapshot co-picked BPF projection of N counters from the
     /// SAME global-section map. Lifts [`Snapshot::live_vars_via`] to
     /// the series level: for each sample, calls the picker ONCE per
@@ -339,6 +377,7 @@ mod tests {
         };
         let bss_map = FailureDumpMap {
             name: "scx_obj.bss".into(),
+            map_kva: 0,
             map_type: 2,
             value_size: 16,
             max_entries: 1,
@@ -354,6 +393,7 @@ mod tests {
         };
         FailureDumpReport {
             schema: SCHEMA_SINGLE.to_string(),
+            active_map_kvas: Vec::new(),
             maps: vec![bss_map],
             ..Default::default()
         }
@@ -399,6 +439,7 @@ mod tests {
         };
         let bss_map = FailureDumpMap {
             name: "scx_obj.bss".into(),
+            map_kva: 0,
             map_type: 2,
             value_size: 32,
             max_entries: 1,
@@ -414,6 +455,7 @@ mod tests {
         };
         FailureDumpReport {
             schema: SCHEMA_SINGLE.to_string(),
+            active_map_kvas: Vec::new(),
             maps: vec![bss_map],
             ..Default::default()
         }
@@ -640,6 +682,7 @@ mod tests {
         fn make_bss(name: &str, cross: u64, same: u64) -> FailureDumpMap {
             FailureDumpMap {
                 name: name.into(),
+                map_kva: 0,
                 map_type: 2,
                 value_size: 16,
                 max_entries: 1,
@@ -678,6 +721,7 @@ mod tests {
         }
         FailureDumpReport {
             schema: SCHEMA_SINGLE.to_string(),
+            active_map_kvas: Vec::new(),
             maps,
             ..Default::default()
         }

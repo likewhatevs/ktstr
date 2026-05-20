@@ -1669,6 +1669,7 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
         select_sdt_alloc_meta(sdt_alloc_metas, &info_name).cloned();
     let mut out = FailureDumpMap {
         name: info_name.into_owned(),
+        map_kva: info.map_kva,
         map_type: info.map_type,
         value_size: info.value_size,
         max_entries: info.max_entries,

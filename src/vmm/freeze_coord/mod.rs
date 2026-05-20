@@ -6075,6 +6075,7 @@ impl KtstrVm {
                                 // Partial dump: vcpu_regs only.
                                 let report = crate::monitor::dump::FailureDumpReport {
                                     schema: crate::monitor::dump::SCHEMA_SINGLE.to_string(),
+                                    active_map_kvas: Vec::new(),
                                     maps: Vec::new(),
                                     vcpu_regs: collect_vcpu_regs(),
                                     sdt_allocations: Vec::new(),

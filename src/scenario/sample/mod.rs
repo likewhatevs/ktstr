@@ -404,6 +404,7 @@ mod tests {
         };
         let bss_map = FailureDumpMap {
             name: "scx_obj.bss".into(),
+            map_kva: 0,
             map_type: 2,
             value_size: 16,
             max_entries: 1,
@@ -419,6 +420,7 @@ mod tests {
         };
         FailureDumpReport {
             schema: SCHEMA_SINGLE.to_string(),
+            active_map_kvas: Vec::new(),
             maps: vec![bss_map],
             ..Default::default()
         }
