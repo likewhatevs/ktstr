@@ -3405,3 +3405,190 @@ fn snapshot_bridge_events_dropped_resets_after_drain() {
             .all(|e| !matches!(e, SnapshotBridgeEvent::EventLogTruncated { .. }))
     );
 }
+
+// ---------------------------------------------------------------------------
+// v2 unified-accessor API tests: Snapshot::active / vars / live_var
+// + SnapshotField array accessors + JsonField rename and array accessors.
+// ---------------------------------------------------------------------------
+
+fn make_report_with_maps(maps: Vec<FailureDumpMap>) -> FailureDumpReport {
+    let mut r = FailureDumpReport::placeholder("synthetic_test");
+    r.is_placeholder = false;
+    r.maps = maps;
+    r
+}
+
+fn make_global_map(name: &str, members: Vec<(&str, RenderedValue)>) -> FailureDumpMap {
+    FailureDumpMap {
+        name: name.to_string(),
+        map_type: 2,
+        max_entries: 1,
+        value: Some(RenderedValue::Struct {
+            type_name: Some(name.to_string()),
+            members: members
+                .into_iter()
+                .map(|(n, v)| RenderedMember {
+                    name: n.to_string(),
+                    value: v,
+                })
+                .collect(),
+        }),
+        ..FailureDumpMap::default()
+    }
+}
+
+fn uint_v(v: u64) -> RenderedValue {
+    RenderedValue::Uint { bits: 64, value: v }
+}
+
+#[test]
+fn snapshot_active_single_obj_returns_filtered_view() {
+    let report = make_report_with_maps(vec![make_global_map(
+        "scx_test.bss",
+        vec![("counter", uint_v(42))],
+    )]);
+    let snap = Snapshot::new(&report);
+    let active = snap.active().expect("single obj => active() succeeds");
+    assert_eq!(active.var("counter").as_u64().ok(), Some(42));
+}
+
+#[test]
+fn snapshot_active_multi_obj_returns_no_active_scheduler() {
+    let report = make_report_with_maps(vec![
+        make_global_map("scx_a.bss", vec![("counter", uint_v(1))]),
+        make_global_map("scx_b.bss", vec![("counter", uint_v(2))]),
+    ]);
+    let snap = Snapshot::new(&report);
+    let err = snap
+        .active()
+        .expect_err("multiple obj names => NoActiveScheduler");
+    assert!(matches!(err, SnapshotError::NoActiveScheduler { .. }));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("vars(name)"),
+        "diagnostic must steer the operator at vars(): {msg}"
+    );
+}
+
+#[test]
+fn snapshot_active_on_placeholder_returns_placeholder_error() {
+    let report = FailureDumpReport::placeholder("freeze_timed_out");
+    let snap = Snapshot::new(&report);
+    assert!(matches!(
+        snap.active(),
+        Err(SnapshotError::PlaceholderSnapshot { .. })
+    ));
+}
+
+#[test]
+fn snapshot_var_on_placeholder_returns_placeholder_error() {
+    let report = FailureDumpReport::placeholder("freeze_timed_out");
+    let snap = Snapshot::new(&report);
+    let f = snap.var("anything");
+    assert!(matches!(
+        f.error(),
+        Some(SnapshotError::PlaceholderSnapshot { .. })
+    ));
+}
+
+#[test]
+fn snapshot_map_on_placeholder_returns_placeholder_error() {
+    let report = FailureDumpReport::placeholder("freeze_timed_out");
+    let snap = Snapshot::new(&report);
+    assert!(matches!(
+        snap.map("anything"),
+        Err(SnapshotError::PlaceholderSnapshot { .. })
+    ));
+}
+
+#[test]
+fn snapshot_vars_iterates_every_copy() {
+    let report = make_report_with_maps(vec![
+        make_global_map("scx_a.bss", vec![("shared", uint_v(11))]),
+        make_global_map("scx_b.bss", vec![("shared", uint_v(22))]),
+    ]);
+    let snap = Snapshot::new(&report);
+    let mut hits: Vec<(String, u64)> = snap
+        .vars("shared")
+        .filter_map(|(name, f)| f.as_u64().ok().map(|v| (name.to_string(), v)))
+        .collect();
+    hits.sort();
+    assert_eq!(
+        hits,
+        vec![("scx_a.bss".to_string(), 11), ("scx_b.bss".to_string(), 22)],
+    );
+}
+
+#[test]
+fn snapshot_live_var_folds_no_active_scheduler_into_field() {
+    let report = make_report_with_maps(vec![
+        make_global_map("scx_a.bss", vec![("x", uint_v(1))]),
+        make_global_map("scx_b.bss", vec![("x", uint_v(2))]),
+    ]);
+    let snap = Snapshot::new(&report);
+    let f = snap.live_var("x");
+    assert!(matches!(
+        f.error(),
+        Some(SnapshotError::NoActiveScheduler { .. })
+    ));
+}
+
+#[test]
+fn snapshot_field_as_u32_array_success_and_overflow() {
+    let arr_ok = RenderedValue::Array {
+        len: 3,
+        elements: vec![uint_v(1), uint_v(2), uint_v(3)],
+    };
+    let field = SnapshotField::Value(&arr_ok);
+    assert_eq!(field.as_u32_array().unwrap(), vec![1u32, 2, 3]);
+    let arr_overflow = RenderedValue::Array {
+        len: 1,
+        elements: vec![uint_v(u64::from(u32::MAX) + 1)],
+    };
+    let field = SnapshotField::Value(&arr_overflow);
+    assert!(matches!(
+        field.as_u32_array(),
+        Err(SnapshotError::TypeMismatch { .. })
+    ));
+}
+
+#[test]
+fn snapshot_field_as_u64_array_rejects_struct() {
+    let s = RenderedValue::Struct {
+        type_name: None,
+        members: vec![],
+    };
+    let field = SnapshotField::Value(&s);
+    assert!(matches!(
+        field.as_u64_array(),
+        Err(SnapshotError::TypeMismatch { .. })
+    ));
+}
+
+#[test]
+fn json_field_get_renamed_from_path_walks_dotted() {
+    use serde_json::json;
+    let v = json!({"a": {"b": {"c": 42}}});
+    let field = stats_path(&v, "a");
+    let inner = field.get("b.c");
+    assert_eq!(inner.as_u64().unwrap(), 42);
+}
+
+#[test]
+fn json_field_as_u32_array_extracts() {
+    use serde_json::json;
+    let v = json!({"counters": [1, 2, 3]});
+    let field = stats_path(&v, "counters");
+    assert_eq!(field.as_u32_array().unwrap(), vec![1u32, 2, 3]);
+}
+
+#[test]
+fn json_field_as_bool_array_rejects_mixed() {
+    use serde_json::json;
+    let v = json!([true, 1, false]);
+    let field = stats_path(&v, "");
+    assert!(matches!(
+        field.as_bool_array(),
+        Err(SnapshotError::TypeMismatch { .. })
+    ));
+}

@@ -8681,3 +8681,205 @@ fn cast_chase_kernel_cross_btf_fwd_resolve_succeeds() {
          decoded against the sibling BTF",
     );
 }
+
+// ---------------------------------------------------------------------------
+// RenderedValue inherent navigators. These exercise the raw
+// Option-returning surface used by tests that drop below SnapshotField
+// via .raw() and by the failure-dump renderer pipelines.
+// ---------------------------------------------------------------------------
+
+fn struct_with(members: Vec<(&str, RenderedValue)>) -> RenderedValue {
+    RenderedValue::Struct {
+        type_name: None,
+        members: members
+            .into_iter()
+            .map(|(n, v)| RenderedMember {
+                name: n.to_string(),
+                value: v,
+            })
+            .collect(),
+    }
+}
+
+fn uint(value: u64) -> RenderedValue {
+    RenderedValue::Uint { bits: 64, value }
+}
+
+#[test]
+fn rendered_value_member_walks_struct() {
+    let v = struct_with(vec![("foo", uint(7)), ("bar", uint(11))]);
+    assert!(matches!(
+        v.member("foo"),
+        Some(RenderedValue::Uint { value: 7, .. })
+    ));
+    assert!(matches!(
+        v.member("bar"),
+        Some(RenderedValue::Uint { value: 11, .. })
+    ));
+    assert!(v.member("missing").is_none());
+}
+
+#[test]
+fn rendered_value_member_returns_none_for_non_struct() {
+    assert!(uint(0).member("anything").is_none());
+    assert!(
+        RenderedValue::Array {
+            len: 0,
+            elements: vec![],
+        }
+        .member("anything")
+        .is_none()
+    );
+}
+
+#[test]
+fn rendered_value_member_peels_ptr_deref() {
+    let target = struct_with(vec![("inner", uint(42))]);
+    let ptr = RenderedValue::Ptr {
+        value: 0x1000,
+        deref: Some(Box::new(target)),
+        deref_skipped_reason: None,
+        cast_annotation: None,
+    };
+    let inner = ptr.member("inner").expect("ptr deref walks transparently");
+    assert!(matches!(inner, RenderedValue::Uint { value: 42, .. }));
+}
+
+#[test]
+fn rendered_value_member_peels_truncated_partial() {
+    let partial = struct_with(vec![("kept", uint(1))]);
+    let trunc = RenderedValue::Truncated {
+        needed: 64,
+        had: 8,
+        partial: Box::new(partial),
+    };
+    assert!(matches!(
+        trunc.member("kept"),
+        Some(RenderedValue::Uint { value: 1, .. })
+    ));
+}
+
+#[test]
+fn rendered_value_get_walks_dotted_path() {
+    let nested = struct_with(vec![(
+        "outer",
+        struct_with(vec![("middle", struct_with(vec![("leaf", uint(99))]))]),
+    )]);
+    assert!(matches!(
+        nested.get("outer.middle.leaf"),
+        Some(RenderedValue::Uint { value: 99, .. })
+    ));
+}
+
+#[test]
+fn rendered_value_get_empty_path_returns_self() {
+    let v = uint(5);
+    assert!(matches!(v.get(""), Some(RenderedValue::Uint { value: 5, .. })));
+}
+
+#[test]
+fn rendered_value_get_rejects_empty_component() {
+    let v = struct_with(vec![("a", uint(1))]);
+    assert!(v.get("a..").is_none());
+    assert!(v.get("..a").is_none());
+}
+
+#[test]
+fn rendered_value_index_walks_array_and_peels() {
+    let arr = RenderedValue::Array {
+        len: 3,
+        elements: vec![uint(10), uint(20), uint(30)],
+    };
+    assert!(matches!(
+        arr.index(1),
+        Some(RenderedValue::Uint { value: 20, .. })
+    ));
+    assert!(arr.index(99).is_none());
+    let trunc = RenderedValue::Truncated {
+        needed: 12,
+        had: 4,
+        partial: Box::new(arr),
+    };
+    assert!(matches!(
+        trunc.index(2),
+        Some(RenderedValue::Uint { value: 30, .. })
+    ));
+}
+
+#[test]
+fn rendered_value_as_u64_accepts_scalar_variants() {
+    assert_eq!(uint(7).as_u64(), Some(7));
+    assert_eq!(
+        RenderedValue::Int { bits: 32, value: 9 }.as_u64(),
+        Some(9)
+    );
+    assert_eq!(RenderedValue::Bool { value: true }.as_u64(), Some(1));
+    assert_eq!(RenderedValue::Char { value: b'A' }.as_u64(), Some(65));
+    assert_eq!(
+        RenderedValue::Ptr {
+            value: 0xdead_beef,
+            deref: None,
+            deref_skipped_reason: None,
+            cast_annotation: None,
+        }
+        .as_u64(),
+        Some(0xdead_beef)
+    );
+}
+
+#[test]
+fn rendered_value_as_u64_rejects_negative_int_and_aggregate() {
+    assert_eq!(
+        RenderedValue::Int { bits: 32, value: -1 }.as_u64(),
+        None,
+        "negative Int does not silently wrap to u64::MAX"
+    );
+    assert_eq!(struct_with(vec![]).as_u64(), None);
+    assert_eq!(
+        RenderedValue::Array {
+            len: 0,
+            elements: vec![],
+        }
+        .as_u64(),
+        None
+    );
+}
+
+#[test]
+fn rendered_value_as_u32_array_rejects_overflow() {
+    let arr = RenderedValue::Array {
+        len: 2,
+        elements: vec![uint(u32::MAX as u64), uint(u32::MAX as u64 + 1)],
+    };
+    assert_eq!(
+        arr.as_u32_array(),
+        None,
+        "element exceeding u32::MAX errors rather than truncating"
+    );
+}
+
+#[test]
+fn rendered_value_as_u64_array_collects_struct_array() {
+    let arr = RenderedValue::Array {
+        len: 3,
+        elements: vec![uint(1), uint(2), uint(3)],
+    };
+    assert_eq!(arr.as_u64_array(), Some(vec![1, 2, 3]));
+}
+
+#[test]
+fn rendered_value_as_bool_array_via_truncated_peel() {
+    let arr = RenderedValue::Array {
+        len: 2,
+        elements: vec![
+            RenderedValue::Bool { value: true },
+            RenderedValue::Bool { value: false },
+        ],
+    };
+    let trunc = RenderedValue::Truncated {
+        needed: 8,
+        had: 2,
+        partial: Box::new(arr),
+    };
+    assert_eq!(trunc.as_bool_array(), Some(vec![true, false]));
+}
