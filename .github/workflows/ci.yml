@@ -54,6 +54,8 @@ jobs:
       fail-fast: false
       matrix:
         kernel-version: ['6.14', '7.0']
+    env:
+      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v5
       - name: Provision Rust toolchain
@@ -86,6 +88,7 @@ jobs:
         kernel-version: ['6.14', '7.0']
     env:
       CARGO_BUILD_JOBS: "32"
+      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v5
       - name: Provision Rust toolchain
@@ -112,6 +115,8 @@ jobs:
 
   coverage-x64:
     runs-on: [ktstr-x64]
+    env:
+      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v5
       - name: Provision Rust toolchain
@@ -137,6 +142,7 @@ jobs:
     runs-on: [ktstr-arm64]
     env:
       CARGO_BUILD_JOBS: "32"
+      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v5
       - name: Provision Rust toolchain
