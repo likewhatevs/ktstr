@@ -163,6 +163,29 @@ pub(super) fn try_init_prog_per_cpu_offsets(
     // for CPUs that haven't booted yet are simply missing —
     // acceptable, those CPUs have no stats anyway.
     if offsets.contains(&0) {
+        // Diagnostic for the post-cluster-D/B failure shape: emit
+        // pco_pa + the first two slot reads so a failing CI run
+        // pinpoints whether (a) `pco_pa` lands at a wrong address
+        // (off-by-N) and one slot reads literal 0, (b) the guest's
+        // `setup_per_cpu_areas` hasn't populated every slot yet,
+        // OR (c) cached `phys_base` is stale so `pco_pa` resolves
+        // to an unrelated DRAM page reading all-zeros. Emitted at
+        // `tracing::warn` with target `ktstr::failure_dump` so it
+        // lands in CI logs alongside the FINAL DIAG block; bounded
+        // to once per `try_init_prog_per_cpu_offsets` invocation —
+        // the caller already gates the retry on a 250 ms
+        // scan_tick, so volume is naturally rate-limited.
+        tracing::warn!(
+            target: "ktstr::failure_dump",
+            per_cpu_offset_kva = format_args!("{:#x}", per_cpu_offset_kva),
+            start_kernel_map = format_args!("{:#x}", start_kernel_map),
+            phys_base = format_args!("{:#x}", phys_base),
+            pco_pa = format_args!("{:#x}", pco_pa),
+            num_cpus,
+            slot0 = format_args!("{:#x}", offsets.first().copied().unwrap_or(0)),
+            slot1 = format_args!("{:#x}", offsets.get(1).copied().unwrap_or(0)),
+            "freeze-coord: try_init_prog_per_cpu_offsets returning None — one or more slots zero (will retry next scan_tick)"
+        );
         None
     } else {
         Some(offsets)

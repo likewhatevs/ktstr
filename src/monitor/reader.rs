@@ -2948,9 +2948,24 @@ pub(crate) fn monitor_loop(
             let raw_first_8 = mem.read_u64(rq0_pa, 0);
             // Read pco_pa itself to verify __per_cpu_offset[0] value
             let pco0_verify = mem.read_u64(refresh.pco_pa, 0);
+            // Off-by-N probe: read 8 bytes immediately before and 8
+            // bytes immediately after the resolved pco_pa. If the
+            // off-by-8 hypothesis holds (slot 0 garbage, slot 1
+            // valid kernel-half pointer = actual __per_cpu_offset[0]),
+            // pco_at_pa_minus_8 should hold the trailing bytes of
+            // the symbol immediately preceding __per_cpu_offset[]
+            // and pco_at_pa_plus_16 should hold the actual
+            // __per_cpu_offset[2] (typically 0 when only 2 CPUs are
+            // online). If those probes match the kernel-half value
+            // seen as pco1, the symbol resolution is reading 8
+            // bytes ahead of where the kernel actually placed the
+            // array.
+            let pco_at_pa_minus_8 = mem.read_u64(refresh.pco_pa.wrapping_sub(8), 0);
+            let pco_at_pa_plus_16 = mem.read_u64(refresh.pco_pa + 16, 0);
             eprintln!(
                 "FINAL DIAG rq0: clock_off={} nr_off={} raw_clock={raw_clock} raw_nr={raw_nr_running} \
-                 raw_first_8={raw_first_8:#x} pco0_verify={pco0_verify:#x} rq0_pa={rq0_pa:#x} pco_pa={:#x}",
+                 raw_first_8={raw_first_8:#x} pco0_verify={pco0_verify:#x} rq0_pa={rq0_pa:#x} \
+                 pco_pa={:#x} pco_pa_minus_8={pco_at_pa_minus_8:#x} pco_pa_plus_16={pco_at_pa_plus_16:#x}",
                 offsets.rq_clock, offsets.rq_nr_running, refresh.pco_pa,
             );
         }
