@@ -367,24 +367,43 @@ pub(super) fn dispatch_bulk_message(
                 //       wrap into a huge u64 offset.
                 //
                 //   (c) `offset <= RANDOMIZE_BASE_MAX_OFFSET` —
-                //       x86_64 KASLR picks slots in
-                //       `[0, KERNEL_IMAGE_SIZE - KERNEL_BASE)`
-                //       where `KERNEL_IMAGE_SIZE = 1 GiB` per
-                //       arch/x86/include/asm/page_64_types.h.
-                //       An offset above 1 GiB cannot be a real
-                //       KASLR slot and indicates a forged or
-                //       torn payload. aarch64 KASLR slot range
-                //       is `0..KIMAGE_VADDR_SIZE` which is at
-                //       most 4 GiB depending on VA_BITS, so
-                //       the 1 GiB bound is conservative on x86
-                //       and may admit a small range of
-                //       legitimate aarch64 slots above it; the
-                //       worst case is rejecting valid aarch64
-                //       payloads on >47-bit VA, which surfaces
-                //       as fallback to BSP MSR (x86) or
-                //       literal-0 (aarch64-only path) rather
-                //       than incorrect data.
+                //       per-arch upper bound on the legitimate
+                //       KASLR slot range.
+                //       - **x86_64**: `1 GiB` per
+                //         `arch/x86/include/asm/page_64_types.h`
+                //         (`KERNEL_IMAGE_SIZE`).
+                //         `find_random_virt_addr` in
+                //         `arch/x86/boot/compressed/kaslr.c`
+                //         picks within
+                //         `[0, KERNEL_IMAGE_SIZE - KERNEL_BASE)`.
+                //       - **aarch64**: bounded above by the kernel's
+                //         own picker range
+                //         `(VMALLOC_END - KIMAGE_VADDR) / 2` in
+                //         `arch/arm64/kernel/pi/kaslr_early.c:60-61`,
+                //         which under any supported `VA_BITS`
+                //         (48 or 52) is comfortably less than
+                //         `1 << 48` (256 TiB).  The previous
+                //         `1 GiB` bound was the x86_64 invariant
+                //         applied unconditionally and silently
+                //         rejected every legitimate aarch64 KASLR
+                //         offset (kernel picks
+                //         `range/2 + uniform([0, range))` =
+                //         `[range/2, 3*range/2)` where `range` is
+                //         tens of TiB on VA_BITS=48), leaving
+                //         `kern_virt_kaslr` at the unpublished
+                //         sentinel and indefinitely deferring every
+                //         freeze coordinator path that gates on
+                //         `kern_virt_kaslr_published()` (notably
+                //         the periodic-snapshot capture loop and
+                //         the cleanup-time accessor resolution).
+                //       The forged / torn-payload defense is
+                //       preserved at the per-arch bound; anything
+                //       above the kernel's plausible picker range
+                //       still rejects.
+                #[cfg(target_arch = "x86_64")]
                 const RANDOMIZE_BASE_MAX_OFFSET: u64 = 1 << 30; // 1 GiB
+                #[cfg(target_arch = "aarch64")]
+                const RANDOMIZE_BASE_MAX_OFFSET: u64 = 1 << 48; // 256 TiB
                 if let Some(runtime) = addrs.kernel_text_runtime_kva
                     && sinks.kernel_text_link_kva >= KERNEL_HALF_CANONICAL_4LEVEL
                 {
