@@ -375,6 +375,31 @@ fn is_coverage_instrumented_binary() -> bool {
     matches!(vaddrs[0], Some(v) if v != 0)
 }
 
+/// Process-wide cached version of [`is_coverage_instrumented_binary`]
+/// exposed to test sites that need to skip-vs-coverage. Symbol-table
+/// walk runs once per process and is memoised in a `OnceLock<bool>`
+/// so a test that probes the flag at the top of every iteration only
+/// pays the ELF parse once.
+///
+/// Used by VM-booting tests that pass `current_exe()` as the guest
+/// `/init` and trip an AP-kill exit early in boot under coverage —
+/// the instrumented binary's profile-runtime init does not run
+/// cleanly as PID 1 inside the guest's minimal initramfs, surfacing
+/// as `kill set by AP` within a couple of seconds of boot. The tests
+/// affected (e.g. `boot_kernel_with_monitor`,
+/// `monitor_data_valid_latch_records_live_page_offset`,
+/// `sched_domain_data_populated`) exercise host-side monitor
+/// behaviour that has no coverage-relevant code paths, so skipping
+/// them under coverage loses no real assertion coverage; the real
+/// fix is a non-instrumented `/init` binary plumbed through
+/// `init_binary`, deferred to follow-up work.
+#[cfg(test)]
+pub(crate) fn current_binary_is_coverage_instrumented() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(is_coverage_instrumented_binary)
+}
+
 ctor::declarative::ctor! {
 /// Set `LLVM_PROFILE_FILE` to the workspace-local target directory
 /// before the LLVM compiler-rt runtime reads it.

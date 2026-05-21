@@ -53,6 +53,8 @@ mod payload;
 mod probe;
 mod probe_metrics;
 mod profraw;
+#[cfg(test)]
+pub(crate) use profraw::current_binary_is_coverage_instrumented;
 mod runtime;
 mod sidecar;
 pub(crate) mod staged;
