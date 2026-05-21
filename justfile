@@ -32,7 +32,7 @@ kernel-build version="":
 
 # Run tests against a kernel version
 test kernel:
-    cargo run --bin cargo-ktstr -- ktstr test --kernel {{kernel}} -- --profile ci --features integration -j $(( $(nproc) * 5 ))
+    cargo run --bin cargo-ktstr -- ktstr test --kernel {{kernel}} -- --profile ci --features integration -j $(nproc)
 
 # Run trybuild compile_fail fixtures.
 #
