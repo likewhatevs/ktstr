@@ -155,18 +155,37 @@ pub(super) fn try_init_prog_per_cpu_offsets(
     let pco_pa =
         monitor::symbols::text_kva_to_pa_with_base(per_cpu_offset_kva, start_kernel_map, phys_base);
     let offsets = monitor::symbols::read_per_cpu_offsets(mem, pco_pa, num_cpus);
-    // Defer caching until every offset slot is non-zero — a guest
-    // still populating per-CPU areas yields zero entries for the
-    // not-yet-initialised CPUs, and caching that would alias every
-    // such CPU's stats to CPU 0. A retry is cheap; a cached miss is
-    // permanent for the run. For prog_runtime_stats this means stats
-    // for CPUs that haven't booted yet are simply missing —
-    // acceptable, those CPUs have no stats anyway.
-    if offsets.contains(&0) {
+    // Defer caching until every offset slot looks like a legitimate
+    // kernel-half pointer (bit 63 set). Two failure modes the gate
+    // catches:
+    //   * Still-booting guest: not-yet-initialised CPUs read 0 from
+    //     the array (BSS pre-zero before `setup_per_cpu_areas`).
+    //     Caching zero would alias every such CPU's stats to CPU 0.
+    //   * Wrong-PA garbage: an off-by-N or stale-phys_base resolution
+    //     can leave a slot reading a small-magnitude value (the
+    //     arm64 `pco0 = 0x3` shape observed in CI). Treating that as
+    //     a real per-CPU offset would propagate the wrong KVA into
+    //     every downstream prog_runtime_stats walker and produce
+    //     zero-filled samples from random guest pages.
+    //
+    // Every legitimate `__per_cpu_offset[cpu]` value has bit 63 set
+    // on both supported architectures (kernel-half direct-map KVA on
+    // x86_64; high-half delta `pcpu_base_addr - __per_cpu_start +
+    // pcpu_unit_offsets[cpu]` whose subtraction inherits bit 63 on
+    // aarch64). Sibling gate in monitor/reader.rs:2637-2640 uses the
+    // same check on the DATA_VALID latch — keeping them in lockstep
+    // avoids a class of bugs where one gate accepts a value the
+    // other rejects.
+    //
+    // A retry is cheap; a cached miss is permanent for the run. For
+    // prog_runtime_stats this means stats for CPUs that haven't
+    // booted yet (or that resolve through a wrong PA) are simply
+    // missing — degraded, not corrupt.
+    if offsets.is_empty() || !offsets.iter().all(|&v| v & (1u64 << 63) != 0) {
         // Diagnostic for the post-cluster-D/B failure shape: emit
         // pco_pa + the first two slot reads so a failing CI run
         // pinpoints whether (a) `pco_pa` lands at a wrong address
-        // (off-by-N) and one slot reads literal 0, (b) the guest's
+        // (off-by-N) and one slot reads garbage, (b) the guest's
         // `setup_per_cpu_areas` hasn't populated every slot yet,
         // OR (c) cached `phys_base` is stale so `pco_pa` resolves
         // to an unrelated DRAM page reading all-zeros. Emitted at
@@ -184,7 +203,7 @@ pub(super) fn try_init_prog_per_cpu_offsets(
             num_cpus,
             slot0 = format_args!("{:#x}", offsets.first().copied().unwrap_or(0)),
             slot1 = format_args!("{:#x}", offsets.get(1).copied().unwrap_or(0)),
-            "freeze-coord: try_init_prog_per_cpu_offsets returning None — one or more slots zero (will retry next scan_tick)"
+            "freeze-coord: try_init_prog_per_cpu_offsets returning None — one or more slots fail the kernel-half (bit-63) gate (will retry next scan_tick)"
         );
         None
     } else {
