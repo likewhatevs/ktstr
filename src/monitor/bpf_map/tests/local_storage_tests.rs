@@ -642,8 +642,8 @@ fn iter_local_storage_value_size_cap_returns_empty() {
     );
     // Build a fresh BpfMapInfo declaring a value_size beyond
     // MAX_VALUE_SIZE. The walker must early-return BEFORE
-    // touching the bucket array (this is the hostile-guest
-    // safety bound from the pass-3 fix list).
+    // touching the bucket array (the hostile-guest safety
+    // bound).
     let mut hostile = scene.map.clone();
     hostile.value_size = (super::super::MAX_VALUE_SIZE + 1) as u32;
     // SAFETY: scene.buf is a live local Vec<u8> whose backing

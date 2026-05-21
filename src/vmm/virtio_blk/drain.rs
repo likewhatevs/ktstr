@@ -544,7 +544,7 @@ pub(crate) fn drain_bracket_impl(
             // descriptor stays uninitialized. The guest's
             // `virtblk_done` reads `vbr->in_hdr.status` from its
             // published address and observes stale blk-mq tag
-            // bytes — the F15 silent-data-corruption pattern.
+            // bytes — the silent-data-corruption pattern.
             //
             // We therefore drop oversized chains BEFORE extracting
             // status_addr. No add_used, no IOERR publish, no

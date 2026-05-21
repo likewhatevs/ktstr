@@ -965,8 +965,8 @@ fn legacy_disable_enable_notification_toggles_used_flags() {
 /// `signal_needed` stays false — so the irqfd is NEVER
 /// signalled for this chain.
 ///
-/// This pins the F15 contract: NEVER advance the used ring
-/// for a chain whose status byte the guest can't observe.
+/// This pins the contract: NEVER advance the used ring for a
+/// chain whose status byte the guest can't observe.
 /// The guest's `virtblk_done` reads the status byte from
 /// `vbr->in_hdr.status` — initially zero from `__GFP_ZERO`
 /// or stale from prior blk-mq tag use — and `virtblk_result(0)`

@@ -3399,7 +3399,7 @@ fn sched_stats_relay_loop(stop: Arc<AtomicBool>, stop_evt: Arc<vmm_sys_util::eve
         let wait_exit = wait_for_stats_socket(&mut port, &stop, &stop_evt);
         match wait_exit {
             WaitSocketResult::Connected(socket) => {
-                // F14.4: a successful connect refreshes the
+                // A successful connect refreshes the
                 // consecutive-EOF budget. Without this reset, a
                 // run of inotify-wait Ok(0)s could leave the
                 // counter near the cap; if the next session

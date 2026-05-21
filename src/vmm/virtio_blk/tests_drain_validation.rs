@@ -42,7 +42,7 @@ use vm_memory::Address;
 /// the guest's real status byte stays uninitialized — the
 /// guest's `virtblk_done` then reads `vbr->in_hdr.status` from
 /// the stale blk-mq tag bytes, which `virtblk_result(0)` maps
-/// to `BLK_STS_OK` (the F15 silent-data-corruption pattern).
+/// to `BLK_STS_OK` (the silent-data-corruption pattern).
 /// Dropping the chain forces the request to surface via the
 /// hung-task watchdog instead — same blast radius as the
 /// "no status descriptor" branch, which is the documented

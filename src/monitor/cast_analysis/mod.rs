@@ -2945,8 +2945,8 @@ impl<'a> Analyzer<'a> {
             .max_seen_type_id
             .saturating_add(CANDIDATE_SEARCH_SLACK)
             .min(super::sdt_alloc::MAX_BTF_ID_PROBE);
-        // F15 mitigation: warn when the candidate-search slack
-        // capped against the hard ceiling. A scheduler whose largest
+        // Warn when the candidate-search slack capped against the
+        // hard ceiling. A scheduler whose largest
         // touched id is close to MAX_BTF_ID_PROBE means
         // [`build_layout_index`] cannot probe every type the BTF
         // exposes — shape-inference candidates above the cap are

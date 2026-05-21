@@ -4472,9 +4472,9 @@ fn failure_dump_minimal_deserialize_uses_defaults() {
 
 // -- DualFailureDumpReport Display rendering ----------------------
 //
-// The post-pass-3 fix in display.rs distinguishes "early snapshot
-// present with valid jiffies" from "early snapshot present with
-// jiffies bookkeeping not captured" (both early_max_age_jiffies and
+// display.rs distinguishes "early snapshot present with valid
+// jiffies" from "early snapshot present with jiffies bookkeeping
+// not captured" (both early_max_age_jiffies and
 // early_threshold_jiffies are 0). Pin the wire-stable header strings
 // for each branch so a reformatting regression surfaces immediately
 // rather than producing operator-confusing "max_age=0j, threshold=0j"
