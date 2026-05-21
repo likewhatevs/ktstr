@@ -34,6 +34,33 @@
 //! ```
 //! to avoid `AmbiguousVar` post-swap. With active-scheduler
 //! disambiguation the picker dance disappears.
+//!
+//! ## When writing a NEW same-binary swap test
+//!
+//! To get the deterministic disambiguation guarantee this test
+//! exercises, the scenario MUST pin the OUTGOING scheduler's bss
+//! BEFORE `Op::ReplaceScheduler` runs:
+//! ```ignore
+//! let steps = vec![
+//!     Step::with_op(
+//!         Op::pin_bpf_map("<obj>.bss"),
+//!         HoldSpec::fixed(Duration::from_secs(2)),
+//!     ),
+//!     Step::with_op(
+//!         Op::replace_scheduler(&NEW_SCHED),
+//!         HoldSpec::fixed(Duration::from_secs(12)),
+//!     ),
+//! ];
+//! ```
+//! Without the `Op::pin_bpf_map` step, the kernel frees the OUTGOING
+//! bss as soon as libbpf drops its fds, so the multi-bss window is
+//! sub-millisecond and the walker rarely sees the ambiguous case.
+//! Tests that omit the pin will PASS most runs (single-bss path)
+//! and surface `AmbiguousVar` intermittently in CI when timing
+//! happens to land a periodic capture inside the multi-bss window.
+//! Use `HoldSpec::fixed` (NOT `HoldSpec::frac`) for the post-swap
+//! hold so dispatch latency doesn't eat the hold budget via the
+//! `.min(remaining)` clamp at `ops/mod.rs:1305-1307`.
 
 use anyhow::Result;
 use ktstr::assert::AssertResult;
@@ -128,7 +155,12 @@ fn assert_live_var_resolves_across_swap(result: &VmResult) -> Result<()> {
         first_ambiguous.is_none(),
         "bpf_live_u64 surfaced AmbiguousVar — the active-scheduler \
          KVA filter did NOT narrow the same-binary post-swap snapshot. \
-         active-scheduler disambiguation is broken. First ambiguous: {}",
+         If this fires in YOUR test: the scenario likely omits \
+         `Op::pin_bpf_map(\"<obj>.bss\")` BEFORE `Op::ReplaceScheduler`. \
+         Without the pin, the multi-bss window is timing-dependent and \
+         AmbiguousVar surfaces intermittently. See the module-level \
+         \"When writing a NEW same-binary swap test\" section. First \
+         ambiguous: {}",
         first_ambiguous.unwrap_or_default(),
     );
 
@@ -209,22 +241,33 @@ fn assert_live_var_resolves_across_swap(result: &VmResult) -> Result<()> {
          post-swap errors observed: {post_swap_errors:?}",
     );
 
-    // Conditional walker-fired gate (kept soft until the
-    // framework's walker-recovery bug is fixed and the
-    // `Op::pin_bpf_map` deterministic gate becomes usable). When
-    // the multi-bss window happens to be observed in this run
-    // (timing-lucky), the walker MUST have fired — without that,
-    // the consumer's prefix-only fallback admits both copies and
-    // surfaces AmbiguousVar (the regression-detection condition).
-    if multi_bss_phase1_count >= 1 {
-        anyhow::ensure!(
-            walker_published_phase1_count >= 1,
-            "post-swap snapshots captured the multi-bss window ({multi_bss_phase1_count} \
-             samples with ≥2 bpf_bpf.bss copies) but Phase 2 walker NEVER published \
-             active_map_kvas — the consumer's prefix-only fallback admits both copies \
-             and surfaces AmbiguousVar. Walker is failing to resolve the live obj.",
-        );
-    }
+    // Hard deterministic gate. The `Op::pin_bpf_map("bpf_bpf.bss")`
+    // step in Phase 1 of the scenario below holds the OUTGOING
+    // bss alive across the swap, so post-swap captures MUST observe
+    // ≥2 `bpf_bpf.bss` copies (multi-bss window). The target-free
+    // struct_ops walker
+    // (`monitor::bpf_prog::find_active_struct_ops_obj_no_target`)
+    // MUST publish `active_map_kvas` for every multi-bss sample so
+    // the consumer's downstream KVA filter narrows to the live
+    // copy. A miss on either gate is a real regression in the
+    // pin primitive or the target-free walker, respectively.
+    anyhow::ensure!(
+        multi_bss_phase1_count >= 1,
+        "post-swap snapshots NEVER captured the multi-bss window — \
+         the `Op::pin_bpf_map(\"bpf_bpf.bss\")` step in Phase 1 should \
+         have held the OUTGOING bss alive across the swap. Check \
+         the apply-time PinBpfMap log for a bail, OR the post-swap \
+         hold (HoldSpec::fixed) for periodic-boundary distribution.",
+    );
+    anyhow::ensure!(
+        walker_published_phase1_count >= 1,
+        "post-swap snapshots captured the multi-bss window ({multi_bss_phase1_count} \
+         samples with ≥2 bpf_bpf.bss copies) but the active-scheduler walker \
+         NEVER published active_map_kvas. The target-free struct_ops walker is \
+         expected to find the unique alive STRUCT_OPS prog with global-section \
+         maps in used_maps and publish its kva set — see \
+         `monitor::dump::identify_active_obj_from_struct_ops`'s primary path.",
+    );
     Ok(())
 }
 
@@ -237,30 +280,41 @@ fn assert_live_var_resolves_across_swap(result: &VmResult) -> Result<()> {
     cores = 2,
     threads = 1,
     memory_mib = 512,
-    duration_s = 8,
-    watchdog_timeout_s = 15,
-    num_snapshots = 4,
+    duration_s = 15,
+    watchdog_timeout_s = 30,
+    num_snapshots = 8,
     cleanup_budget_ms = 5000,
     post_vm = assert_live_var_resolves_across_swap,
 )]
 fn live_var_resolves_across_same_binary_swap(ctx: &Ctx) -> Result<AssertResult> {
+    use std::time::Duration;
     let steps = vec![
-        // Phase 0: primary scheduler runs alone.
-        Step::hold(HoldSpec::frac(0.3)),
-        // Swap to the staged alt scheduler (same scx-ktstr binary,
-        // distinct name → distinct `bpf_object` instance in the
-        // kernel → distinct bss map KVA, even though the map name
-        // is `bpf_bpf.bss` in BOTH).
-        //
-        // The deterministic version of this test (pin `bpf_bpf.bss`
-        // in Phase 0 via `Op::pin_bpf_map` to force the multi-bss
-        // case to persist past the swap) is blocked on a framework
-        // walker-recovery bug — see the BPF-fd-pin primitive
-        // landing batch's follow-up task. Until that bug is fixed,
-        // this test stays on the timing-lucky soft gate below.
+        // Phase 1 (Phase::step(0) → tag u16=1): primary scheduler
+        // runs alone and we pin its bss via Op::pin_bpf_map. The pin
+        // holds an OwnedFd against `bpf_bpf.bss`, bumping the kernel
+        // refcount via __bpf_map_inc_not_zero so the OUTGOING bss
+        // survives across the swap (kernel only frees the map when
+        // every fd holder releases — see kernel/bpf/syscall.c:955).
+        // 2s settle covers the BPF object load before the pin walks
+        // the map ID space.
+        Step::with_op(
+            Op::pin_bpf_map("bpf_bpf.bss"),
+            HoldSpec::fixed(Duration::from_secs(2)),
+        ),
+        // Phase 2 (Phase::step(1) → tag u16=2): swap to the staged
+        // alt scheduler (same scx-ktstr binary, distinct name →
+        // distinct `bpf_object` instance → distinct bss map_kva,
+        // even though map name is `bpf_bpf.bss` in BOTH). With the
+        // Phase 1 pin, both bss copies coexist throughout this step
+        // — the multi-bss disambiguation path
+        // (identify_active_obj_from_struct_ops's target-free walker)
+        // is exercised on every post-swap capture. HoldSpec::fixed
+        // avoids the frac-based clamp at ops/mod.rs:1305-1307 that
+        // would collapse the post-swap hold to ~0 if dispatch
+        // overran.
         Step::with_op(
             Op::replace_scheduler(&STAGED_ALT_SCHED),
-            HoldSpec::frac(0.7),
+            HoldSpec::fixed(Duration::from_secs(12)),
         ),
     ];
     execute_steps(ctx, steps)

@@ -7001,24 +7001,25 @@ fn collect_per_cpu_time_no_tick_sched_skips_iowait() {
 
 /// Synthetic accessor seam for unit-testing the used_maps walker
 /// path through `identify_active_obj_from_struct_ops`. Holds a
-/// canned `(target_struct_ops_map_kva, obj_name, used_map_kvas)`
-/// triple the walker would otherwise derive from kernel memory.
-/// Returns the canned `ActiveObjMatch` when the requested target
-/// matches; None otherwise (capture-race simulation).
+/// canned `(obj_name, used_map_kvas)` pair the walker would
+/// otherwise derive from kernel memory. The target-free walker
+/// shape (per `find_active_struct_ops_obj_no_target`) returns the
+/// canned `ActiveObjMatch` whenever set; `None` simulates the
+/// no-live-STRUCT_OPS-prog case.
 struct TestProgAccessor {
-    walker_result: Option<(u64, String, Vec<u64>)>,
+    walker_result: Option<(String, Vec<u64>)>,
 }
 
 impl TestProgAccessor {
-    fn returning(target: u64, name: &str) -> Self {
+    fn returning(name: &str) -> Self {
         Self {
-            walker_result: Some((target, name.to_string(), Vec::new())),
+            walker_result: Some((name.to_string(), Vec::new())),
         }
     }
 
-    fn returning_with_kvas(target: u64, name: &str, used_map_kvas: Vec<u64>) -> Self {
+    fn returning_with_kvas(name: &str, used_map_kvas: Vec<u64>) -> Self {
         Self {
-            walker_result: Some((target, name.to_string(), used_map_kvas)),
+            walker_result: Some((name.to_string(), used_map_kvas)),
         }
     }
 
@@ -7039,22 +7040,15 @@ impl super::super::bpf_prog::BpfProgAccessor for TestProgAccessor {
     ) -> Vec<super::super::bpf_prog::ProgRuntimeStats> {
         Vec::new()
     }
-    fn find_active_obj_via_used_maps(
+    fn find_active_struct_ops_obj_no_target(
         &self,
-        target_struct_ops_map_kva: u64,
         _map_offsets: &super::super::btf_offsets::BpfMapOffsets,
     ) -> Option<super::super::bpf_prog::ActiveObjMatch> {
         self.walker_result
             .as_ref()
-            .and_then(|(target, name, kvas)| {
-                if *target == target_struct_ops_map_kva {
-                    Some(super::super::bpf_prog::ActiveObjMatch {
-                        obj_name: name.clone(),
-                        used_map_kvas: kvas.clone(),
-                    })
-                } else {
-                    None
-                }
+            .map(|(name, kvas)| super::super::bpf_prog::ActiveObjMatch {
+                obj_name: name.clone(),
+                used_map_kvas: kvas.clone(),
             })
     }
 }
@@ -7131,8 +7125,7 @@ fn identify_active_obj_libbpf_named_single_scheduler_via_walker() {
     // (correctly) be rejected by the helper's same-prefix-multi-copy
     // defense and never reach the cross-check this test exists for.
     let live_kvas = vec![struct_ops_map_kva, 0xffff_0000_0000_c000];
-    let accessor =
-        TestProgAccessor::returning_with_kvas(struct_ops_map_kva, "ktstr", live_kvas.clone());
+    let accessor = TestProgAccessor::returning_with_kvas("ktstr", live_kvas.clone());
     let result =
         super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
     assert_eq!(
@@ -7165,8 +7158,7 @@ fn identify_active_obj_libbpf_named_two_schedulers_picks_active() {
     // struct_ops map and its sibling bss; Phase 2 requires non-empty
     // kvas to publish.
     let live_kvas = vec![active_struct_ops_kva, 0xffff_0000_0000_c000];
-    let accessor =
-        TestProgAccessor::returning_with_kvas(active_struct_ops_kva, "ktstr", live_kvas.clone());
+    let accessor = TestProgAccessor::returning_with_kvas("ktstr", live_kvas.clone());
     let result =
         super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
     assert_eq!(
@@ -7219,11 +7211,7 @@ fn identify_active_obj_walker_result_validated_against_captured_maps() {
     // cross-check rejects. The kvas list is non-empty so we exercise
     // the validation rejection (not the unrelated empty-kvas
     // rejection that Phase 2 also enforces).
-    let accessor = TestProgAccessor::returning_with_kvas(
-        struct_ops_map_kva,
-        "garbage",
-        vec![struct_ops_map_kva],
-    );
+    let accessor = TestProgAccessor::returning_with_kvas("garbage", vec![struct_ops_map_kva]);
     let result =
         super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
     assert_eq!(
@@ -7278,30 +7266,113 @@ fn identify_active_obj_legacy_path_works_without_walker() {
     );
 }
 
-/// Walker is NOT invoked when the legacy prefix cross-check
-/// already succeeds — even if the walker is provided. Pins that
-/// the legacy path takes precedence; walker is purely a fallback.
+/// Walker returns a name but EMPTY used_map_kvas. The primary-path
+/// `!used_map_kvas.is_empty()` guard in
+/// `identify_active_obj_from_struct_ops` rejects the empty whitelist
+/// (an empty whitelist would defeat downstream KVA narrowing for
+/// multi-copy cases) — control falls through to the prefix-grouping
+/// fallback. With a single unambiguous `<obj>.bss/.data/.rodata`
+/// sibling set, the fallback resolves cleanly.
 #[test]
-fn identify_active_obj_legacy_path_short_circuits_walker_when_provided() {
+fn identify_active_obj_walker_with_empty_kvas_falls_back_to_prefix_grouping() {
     let sched_kva = 0xffff_0000_0000_a000;
     let struct_ops_map_kva = 0xffff_0000_0000_b000;
     let maps = vec![
-        // `ktstr.ops` IS prefix-resolvable. Walker should NOT fire.
+        // `ktstr.ops` is prefix-resolvable. Walker returns "other"
+        // with empty kvas → primary rejects → fallback iterates
+        // `ktstr.ops` struct_ops, finds `ktstr.bss` unambiguous.
         synthetic_struct_ops_map(struct_ops_map_kva, "ktstr.ops", sched_kva),
         synthetic_global_section_map(0xffff_0000_0000_c000, "ktstr.bss"),
     ];
     let scx = synthetic_sched_state(sched_kva);
     let map_offsets = super::super::btf_offsets::BpfMapOffsets::EMPTY;
-    // Walker returns a different name — if it were called the
-    // result would be "other". If the legacy path correctly short-
-    // circuits, the result is "ktstr" (from prefix cross-check).
-    let accessor = TestProgAccessor::returning(struct_ops_map_kva, "other");
+    // Walker returns "other" with EMPTY kvas — primary path's
+    // `!is_empty()` guard rejects, fallback fires and returns the
+    // prefix-grouped "ktstr" result.
+    let accessor = TestProgAccessor::returning("other");
     let result =
         super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
     assert_eq!(
         result,
         Some(("ktstr".to_string(), Vec::new())),
-        "legacy prefix cross-check takes precedence; walker is fallback-only",
+        "walker-with-empty-kvas falls through to prefix-grouping fallback",
+    );
+}
+
+/// PRIMARY-path multi-copy case: walker returns a name + non-empty
+/// kvas, AND the captured `maps[]` has TWO `<prefix>.bss` copies
+/// (the same-binary swap-window scenario). Documents the intended
+/// behavior: the walker's kva set IS the disambiguator at this
+/// layer, so the primary-path cross-check at
+/// `count_global_sections_for_prefix > 0` ADMITS the multi-copy
+/// case — the downstream `Snapshot::active` KVA filter narrows
+/// using the walker's `used_map_kvas` whitelist. The walker MUST
+/// have returned the live scheduler's kvas only (the OLD prog's
+/// used_maps reference the OLD bss kva; that prog was freed
+/// post-detach, so the walker only sees the NEW prog's kvas).
+#[test]
+fn identify_active_obj_walker_publishes_multi_copy_kvas_for_downstream_filter() {
+    let active_sched_kva = 0xffff_0000_0000_a000;
+    let active_struct_ops_kva = 0xffff_0000_0000_b100;
+    let active_bss_kva = 0xffff_0000_0000_c100;
+    let stale_bss_kva = 0xffff_0000_0000_c200;
+    let maps = vec![
+        synthetic_struct_ops_map(active_struct_ops_kva, "bpf_bpf.ops", active_sched_kva),
+        // TWO `bpf_bpf.bss` copies (same-binary swap window).
+        synthetic_global_section_map(active_bss_kva, "bpf_bpf.bss"),
+        synthetic_global_section_map(stale_bss_kva, "bpf_bpf.bss"),
+    ];
+    let scx = synthetic_sched_state(active_sched_kva);
+    let map_offsets = super::super::btf_offsets::BpfMapOffsets::EMPTY;
+    // Walker returns ONLY the active scheduler's kvas (the OLD
+    // prog is gone from prog_idr, so the walker has no way to
+    // include the stale bss).
+    let live_kvas = vec![active_struct_ops_kva, active_bss_kva];
+    let accessor = TestProgAccessor::returning_with_kvas("bpf_bpf", live_kvas.clone());
+    let result =
+        super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
+    assert_eq!(
+        result,
+        Some(("bpf_bpf".to_string(), live_kvas)),
+        "primary path admits multi-copy when walker publishes a \
+         non-empty kvas whitelist; downstream Snapshot::active narrows",
+    );
+}
+
+/// FALLBACK iterates ALL struct_ops maps in `maps[]` order and
+/// returns the FIRST whose prefix has unambiguous global-section
+/// siblings. When two distinct schedulers coexist with NO walker
+/// (e.g. a future test that loads two non-sched_ext struct_ops
+/// objects, OR a misconfigured guest with no `owned_prog_accessor`
+/// rebuild), the fallback picks the first struct_ops in iteration
+/// order regardless of which is "live". Pins this as the
+/// documented behavior — the consumer's `Snapshot::active`
+/// multi-obj fallback at view.rs:535-565 catches the mis-pick
+/// case and surfaces a NoActiveScheduler diagnostic with both
+/// prefixes named.
+#[test]
+fn identify_active_obj_fallback_with_two_distinct_schedulers_returns_first_iteration_order() {
+    let alpha_sched_kva = 0xffff_0000_0000_a000;
+    let alpha_struct_ops_kva = 0xffff_0000_0000_b000;
+    let beta_sched_kva = 0xffff_0000_0000_d000;
+    let beta_struct_ops_kva = 0xffff_0000_0000_e000;
+    let maps = vec![
+        synthetic_struct_ops_map(alpha_struct_ops_kva, "alpha.ops", alpha_sched_kva),
+        synthetic_global_section_map(0xffff_0000_0000_c000, "alpha.bss"),
+        synthetic_struct_ops_map(beta_struct_ops_kva, "beta.ops", beta_sched_kva),
+        synthetic_global_section_map(0xffff_0000_0000_f000, "beta.bss"),
+    ];
+    // Either scheduler could be the "live" one per scx_sched_state;
+    // walker is None so primary-path is skipped. Fallback picks
+    // the FIRST struct_ops in maps[] iteration order.
+    let scx = synthetic_sched_state(beta_sched_kva);
+    let result = super::identify_active_obj_from_struct_ops(&maps, &scx, None);
+    assert_eq!(
+        result,
+        Some(("alpha".to_string(), Vec::new())),
+        "fallback returns first struct_ops in iteration order — \
+         known limitation. Consumer's Snapshot::active multi-obj \
+         fallback catches the mis-pick case downstream",
     );
 }
 
@@ -7349,8 +7420,7 @@ fn identify_active_obj_same_binary_swap_falls_through_to_walker_for_kva_disambig
     // whitelist (the real walker derives these from the prog's
     // aux->used_maps array).
     let live_kvas = vec![active_struct_ops_kva, active_bss_kva, active_data_kva];
-    let accessor =
-        TestProgAccessor::returning_with_kvas(active_struct_ops_kva, "bpf_bpf", live_kvas.clone());
+    let accessor = TestProgAccessor::returning_with_kvas("bpf_bpf", live_kvas.clone());
     let result =
         super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
     assert_eq!(
@@ -7424,8 +7494,7 @@ fn identify_active_obj_ambiguous_data_section_forces_walker() {
     let scx = synthetic_sched_state(active_sched_kva);
     let map_offsets = super::super::btf_offsets::BpfMapOffsets::EMPTY;
     let live_kvas = vec![active_struct_ops_kva, live_data_kva];
-    let accessor =
-        TestProgAccessor::returning_with_kvas(active_struct_ops_kva, "bpf_bpf", live_kvas.clone());
+    let accessor = TestProgAccessor::returning_with_kvas("bpf_bpf", live_kvas.clone());
     let result =
         super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
     assert_eq!(
@@ -7452,8 +7521,7 @@ fn identify_active_obj_ambiguous_rodata_section_forces_walker() {
     let scx = synthetic_sched_state(active_sched_kva);
     let map_offsets = super::super::btf_offsets::BpfMapOffsets::EMPTY;
     let live_kvas = vec![active_struct_ops_kva, live_rodata_kva];
-    let accessor =
-        TestProgAccessor::returning_with_kvas(active_struct_ops_kva, "bpf_bpf", live_kvas.clone());
+    let accessor = TestProgAccessor::returning_with_kvas("bpf_bpf", live_kvas.clone());
     let result =
         super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
     assert_eq!(
@@ -7516,7 +7584,7 @@ fn identify_active_obj_walker_used_map_kvas_published_to_caller() {
     let scx = synthetic_sched_state(sched_kva);
     let map_offsets = super::super::btf_offsets::BpfMapOffsets::EMPTY;
     let kvas = vec![0xdead_beef_0000_0001, 0xdead_beef_0000_0002];
-    let accessor = TestProgAccessor::returning_with_kvas(struct_ops_map_kva, "ktstr", kvas.clone());
+    let accessor = TestProgAccessor::returning_with_kvas("ktstr", kvas.clone());
     let result =
         super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
     assert_eq!(

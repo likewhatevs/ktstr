@@ -133,46 +133,46 @@ pub(crate) fn find_struct_ops_progs(
     progs
 }
 
-/// Walk `prog_idr` for the struct_ops prog whose `aux->used_maps`
-/// array contains `target_struct_ops_map_kva`. When found, scan
-/// the same used_maps for a global-section map (`<obj>.bss` /
-/// `<obj>.data` / `<obj>.rodata`) — that obj prefix names the
-/// scheduler the struct_ops map is published into. Returns the
-/// obj prefix string, or `None` when:
-/// - No struct_ops prog references `target_struct_ops_map_kva`
-///   in its used_maps (capture race: prog freed between the
-///   struct_ops map match and this walk, OR the prog never
-///   registered the struct_ops as a used map).
-/// - The matching prog's used_maps contains no
-///   `<obj>.bss/.data/.rodata` map (prog has no global state —
-///   unexpected for sched_ext but defensive).
+/// Target-free active-scheduler walker. See trait method
+/// [`BpfProgAccessor::find_active_struct_ops_obj_no_target`] for the
+/// motivation (Phase 0 sched_kva==value_kva equality is broken on
+/// kernels where `struct scx_sched` allocates fresh and copies
+/// `sched_ext_ops` into its embedded `ops` field).
 ///
-/// # Race-window protocol
+/// Walks `prog_idr` for the FIRST `BPF_PROG_TYPE_STRUCT_OPS` prog
+/// whose `aux->used_maps` carries a sibling `<obj>.bss/.data/.rodata`
+/// global-section map. Returns that prog's obj prefix + full
+/// used_map_kvas snapshot. Returns `None` when no such prog exists
+/// (no scheduler attached, or only non-libbpf STRUCT_OPS subsystems
+/// active).
 ///
-/// `bpf_prog_bind_map` (kernel/bpf/syscall.c) increments
-/// `used_map_cnt` BEFORE swapping `used_maps`, opening a window
-/// where the walker can observe new-cnt + old-pointer and walk
-/// past the old allocation. Mitigations layered:
-/// 1. Reads `used_maps` pointer BEFORE `used_map_cnt` so the cnt
-///    observation never outruns the pointer it indexes into.
-/// 2. Caps cnt at [`MAX_USED_MAPS`] (the kernel's own limit per
-///    `kernel/bpf/verifier.c`); any larger value is impossible
-///    in steady-state.
+/// **Threat model: ktstr guest VM is single-tenant.** This walker
+/// returns the FIRST match in `prog_idr` iteration order — it does
+/// not assert uniqueness. ktstr-loaded guests are minimal (only
+/// scx-ktstr runs), so in practice only the live sched_ext
+/// scheduler's prog satisfies the filter. Two reinforcing reasons:
 ///
-/// Even with the cap, a torn read may yield garbage map KVAs in
-/// the trailing slots; `translate_any_kva` returning None on a
-/// non-mapped address silently skips garbage entries, and the
-/// `starts_with`-on-section-suffix check rejects any name that
-/// isn't a well-formed `<X>.<section>` string. Net: the walker
-/// surfaces None on torn reads (caller falls back to heuristic)
-/// rather than publishing a bogus obj prefix.
+/// 1. Sched_ext is the only struct_ops subsystem ktstr loads.
+/// 2. The kernel enforces single-attach for sched_ext via the
+///    `scx_enable_state() != SCX_DISABLED` gate at
+///    `kernel/sched/ext.c:6621` — at most one sched_ext STRUCT_OPS
+///    prog is in the ENABLED state at any time. Post-`Op::ReplaceScheduler`,
+///    `kill_current_scheduler` waits for `SCX_DISABLED` before the
+///    new scheduler's load proceeds, and the OLD prog's
+///    `bpf_prog_put_deferred` (invoked synchronously from process
+///    context via `__bpf_prog_put`'s fast path at
+///    `kernel/bpf/syscall.c:2420`) removes the OLD prog from
+///    `prog_idr` before the NEW prog is added.
 ///
-/// Safe under the freeze-rendezvous: vCPUs are paused, so
-/// `bpf_prog_bind_map` cannot actually run mid-walk; the
-/// race-window protocol above is defense-in-depth for any
-/// caller that ever invokes this outside the freeze window.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn find_obj_name_for_struct_ops_map_kva(
+/// If a future setup loads non-sched_ext libbpf-named STRUCT_OPS
+/// progs (e.g. `tcp_congestion_ops`), this filter would need to also
+/// gate on `aux->btf` matching the sched_ext_ops btf type id.
+///
+/// Standard `prog_idr` walk: read xa_head → iterate ids 0..idr_next
+/// → translate each prog kva → filter to STRUCT_OPS → read aux's
+/// used_maps → derive obj prefix from any global-section sibling
+/// map.
+pub(crate) fn find_active_struct_ops_obj_no_target(
     mem: &GuestMem,
     walk: WalkContext,
     prog_idr_kva: u64,
@@ -180,7 +180,6 @@ pub(crate) fn find_obj_name_for_struct_ops_map_kva(
     map_offsets: &BpfMapOffsets,
     start_kernel_map: u64,
     phys_base: u64,
-    target_struct_ops_map_kva: u64,
 ) -> Option<ActiveObjMatch> {
     let idr_pa = text_kva_to_pa_with_base(prog_idr_kva, start_kernel_map, phys_base);
 
@@ -233,7 +232,13 @@ pub(crate) fn find_obj_name_for_struct_ops_map_kva(
             continue;
         };
         // Read used_maps pointer FIRST, then cnt — pairs with
-        // bpf_prog_bind_map's cnt-then-pointer mutation order.
+        // bpf_prog_bind_map's cnt-then-pointer mutation order
+        // (kernel/bpf/syscall.c): the kernel bumps cnt before
+        // swapping the pointer, so cnt-then-pointer reads would
+        // index past the old allocation on a mid-mutation read.
+        // pointer-then-cnt observes cnt ≤ pointer's slot count.
+        // Safe under freeze-rendezvous (vCPUs paused) but the
+        // protocol is defense-in-depth for any out-of-freeze caller.
         let used_maps_kva = mem.read_u64(aux_pa, prog_offsets.aux_used_maps);
         if used_maps_kva == 0 {
             continue;
@@ -255,33 +260,21 @@ pub(crate) fn find_obj_name_for_struct_ops_map_kva(
             continue;
         };
 
-        // Pass 1: scan for the target struct_ops map KVA AND
-        // simultaneously snapshot every used_maps entry. The full
-        // entry set is what downstream disambiguation uses to
-        // identify the active obj's maps when two scheduler
-        // instances loaded from the same binary share a name prefix
-        // (post-`Op::ReplaceScheduler` swap window).
+        // Snapshot every non-zero used_maps entry (downstream
+        // disambiguation needs the full set as the KVA whitelist).
         let mut entries: Vec<u64> = Vec::with_capacity(used_map_cnt as usize);
-        let mut has_target = false;
         for i in 0..used_map_cnt {
             let entry_kva = mem.read_u64(used_maps_pa, (i as usize) * 8);
             if entry_kva != 0 {
                 entries.push(entry_kva);
             }
-            if entry_kva == target_struct_ops_map_kva {
-                has_target = true;
-            }
         }
-        if !has_target {
-            continue;
-        }
-        // Pass 2: in the SAME captured slice, find a global-section
-        // map and derive the obj prefix. Iterates `entries` (already
-        // filtered to non-zero) instead of re-reading guest memory.
+        // Find a global-section map in the snapshot and derive the obj
+        // prefix. If none, this isn't a libbpf-loaded scheduler prog
+        // (could be a different struct_ops subsystem like
+        // tcp_congestion_ops without libbpf-named global maps) — skip
+        // and continue.
         for &map_kva in &entries {
-            if map_kva == target_struct_ops_map_kva {
-                continue;
-            }
             let Some(map_pa) = translate_any_kva(
                 mem,
                 walk.cr3_pa,
@@ -312,7 +305,7 @@ pub(crate) fn find_obj_name_for_struct_ops_map_kva(
     None
 }
 
-/// Result of [`find_obj_name_for_struct_ops_map_kva`]: the matched
+/// Result of [`find_active_struct_ops_obj_no_target`]: the matched
 /// scheduler's obj prefix plus the full set of used_maps KVAs from
 /// the matched prog's aux table. The KVA set lets the consumer
 /// distinguish two scheduler instances loaded from the SAME binary
@@ -707,25 +700,42 @@ pub trait BpfProgAccessor {
     /// provides per-CPU sums via `BPF_OBJ_GET_INFO_BY_FD`).
     fn struct_ops_runtime_stats(&self, per_cpu_offsets: &[u64]) -> Vec<ProgRuntimeStats>;
 
-    /// Active-scheduler walker: find the obj prefix for the struct_ops
-    /// map at `target_struct_ops_map_kva` by scanning each struct_ops
-    /// prog's `aux->used_maps` for both the target map AND a sibling
-    /// `<obj>.bss/.data/.rodata` global-section map. The obj prefix
-    /// names the scheduler the struct_ops map is published into.
+    /// Target-free active-scheduler walker: find the FIRST alive
+    /// `BPF_PROG_TYPE_STRUCT_OPS` prog whose `aux->used_maps` carries
+    /// a sibling `<obj>.bss/.data/.rodata` global-section map, and
+    /// return that prog's obj prefix + full used_map_kvas set.
     ///
-    /// Returns `None` when no prog references the target map (capture
-    /// race, or non-libbpf-naming case where the existing
-    /// prefix-cross-check in `identify_active_obj_from_struct_ops`
-    /// already resolves the obj directly from the struct_ops map name).
-    /// Callers fall back to the prefix-grouping heuristic on `None`.
+    /// **Why this exists.** The prior `value_kva == *scx_root`
+    /// equality approach in `identify_active_obj_from_struct_ops`
+    /// required identifying the active struct_ops map first. That
+    /// equality breaks on kernels where `struct scx_sched` allocates
+    /// a fresh kernel-side struct and COPIES the user's
+    /// `sched_ext_ops` into its embedded `ops` field (offset 0) —
+    /// `*scx_root` then points at the kernel-allocated `scx_sched`
+    /// (whose address equals `&scx_sched.ops`), NOT at the struct_ops
+    /// map's `kvalue.data` buffer (the user's source ops table at a
+    /// separate address). Without a target, this walker iterates
+    /// `prog_idr` and uses the "prog has a global-section map" signal
+    /// directly.
     ///
-    /// Backends: the guest-memory backend walks `prog_idr` via
-    /// [`find_obj_name_for_struct_ops_map_kva`]; the planned live-host
-    /// backend will iterate `BPF_PROG_GET_NEXT_ID` + read each prog's
-    /// `bpf_prog_info::map_ids` via `BPF_OBJ_GET_INFO_BY_FD`.
-    fn find_active_obj_via_used_maps(
+    /// **Uniqueness via ktstr threat model.** This walker returns
+    /// the FIRST match — it does not assert uniqueness. ktstr's guest
+    /// VM is single-tenant (only scx-ktstr runs), and the kernel
+    /// enforces single-attach for sched_ext via the
+    /// `scx_enable_state() != SCX_DISABLED` gate at
+    /// `kernel/sched/ext.c:6621`. So at most one sched_ext STRUCT_OPS
+    /// prog is alive in `prog_idr` at any time, and no other
+    /// struct_ops subsystem (e.g. `tcp_congestion_ops`) ever loads
+    /// in ktstr-managed guests. If a future setup loads non-sched_ext
+    /// libbpf STRUCT_OPS progs, this filter would need to also gate
+    /// on `aux->btf` matching the sched_ext_ops btf type id.
+    ///
+    /// Returns `None` when no live STRUCT_OPS prog has global-section
+    /// maps (no scheduler attached, or only non-sched_ext struct_ops
+    /// subsystems are running). The caller's prefix-grouping fallback
+    /// handles the no-match case.
+    fn find_active_struct_ops_obj_no_target(
         &self,
-        target_struct_ops_map_kva: u64,
         map_offsets: &BpfMapOffsets,
     ) -> Option<ActiveObjMatch>;
 }
@@ -799,12 +809,11 @@ impl BpfProgAccessor for GuestMemProgAccessor<'_> {
         )
     }
 
-    fn find_active_obj_via_used_maps(
+    fn find_active_struct_ops_obj_no_target(
         &self,
-        target_struct_ops_map_kva: u64,
         map_offsets: &BpfMapOffsets,
     ) -> Option<ActiveObjMatch> {
-        find_obj_name_for_struct_ops_map_kva(
+        find_active_struct_ops_obj_no_target(
             self.kernel.mem(),
             self.kernel.walk_context(),
             self.prog_idr_kva,
@@ -812,7 +821,6 @@ impl BpfProgAccessor for GuestMemProgAccessor<'_> {
             map_offsets,
             self.kernel.start_kernel_map(),
             self.kernel.phys_base(),
-            target_struct_ops_map_kva,
         )
     }
 }
