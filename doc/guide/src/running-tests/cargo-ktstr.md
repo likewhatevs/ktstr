@@ -279,7 +279,7 @@ regressions.
 The integer values are also exposed as `pub const`s for tooling
 that drives the harness programmatically:
 
-```rust
+```rust,ignore
 use ktstr::prelude::{EXIT_PASS, EXIT_FAIL, EXIT_INCONCLUSIVE};
 ```
 
