@@ -21,7 +21,7 @@ use super::kconfig::{
     configure_kernel, has_sched_ext, validate_kernel_config, warn_dropped_extra_kconfig_lines,
     warn_extra_kconfig_overrides_baked_in,
 };
-use super::make::{make_kernel_with_output, run_make, run_make_with_output};
+use super::make::{build_make_args, make_kernel_with_output, run_make, run_make_with_output};
 
 /// Result of the post-acquisition kernel build pipeline.
 ///
@@ -682,11 +682,24 @@ pub fn kernel_build_pipeline(
     })?;
 
     // Generate compile_commands.json for local trees (LSP support).
+    // The args MUST match `make_kernel_with_output`'s
+    // (`-jN`, `KCFLAGS=-Wno-error`) — otherwise make's "command line
+    // flag changed" detection invalidates the build's object cache
+    // and recompiles every translation unit single-threaded under
+    // the compile_commands.json rule.  Build the same `-jN +
+    // KCFLAGS=-Wno-error` prefix via `build_make_args`, then append
+    // the target.
     if !acquired.is_temp {
+        let nproc = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let mut cc_args = build_make_args(nproc);
+        cc_args.push("compile_commands.json".into());
+        let cc_arg_refs: Vec<&str> = cc_args.iter().map(|s| s.as_str()).collect();
         Spinner::with_progress(
             "Generating compile_commands.json...",
             "compile_commands.json generated",
-            |sp| run_make_with_output(source_dir, &["compile_commands.json"], Some(sp)),
+            |sp| run_make_with_output(source_dir, &cc_arg_refs, Some(sp)),
         )?;
     }
 
