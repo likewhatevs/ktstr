@@ -6760,15 +6760,23 @@ struct PerCpuTimeScene {
 
 impl PerCpuTimeScene {
     fn build(num_cpus: usize, per_cpu_stride: u64) -> Self {
-        let cpustat_template_kva = 0x1000u64;
-        let kstat_template_kva = 0x2000u64;
-        let tick_template_kva = 0x3000u64;
+        // Templates must sit in the kernel-half (>= 1 << 48) so the
+        // storage-form detection in `per_cpu_kva` classifies them as
+        // post-v6.15 high-half percpu and applies the kaslr slide.
+        // Pair each template with a matching `page_offset` so the
+        // resulting PA = (template - page_offset) + kaslr + per_cpu_off
+        // stays small and fits in the synthetic buffer.
+        const HIGH_HALF_BASE: u64 = 0xffff_0000_0000_0000;
+        let cpustat_template_kva = HIGH_HALF_BASE + 0x1000;
+        let kstat_template_kva = HIGH_HALF_BASE + 0x2000;
+        let tick_template_kva = HIGH_HALF_BASE + 0x3000;
         let per_cpu_offsets: Vec<u64> = (0..num_cpus as u64).map(|i| i * per_cpu_stride).collect();
-        // Buffer must span every CPU's largest read offset. The
-        // max PA we touch is tick_template_kva + max_per_cpu_off +
-        // sizeof(u64). Round up to 0x1000 alignment + 0x1000 pad.
+        // Buffer must span every CPU's largest read offset.  The
+        // max PA we touch is (tick_template - page_offset) +
+        // max_per_cpu_off + sizeof(u64).  Round up to 0x1000
+        // alignment + 0x1000 pad.
         let max_off = per_cpu_offsets.last().copied().unwrap_or(0);
-        let span = tick_template_kva + max_off + 0x1000;
+        let span = (tick_template_kva - HIGH_HALF_BASE) + max_off + 0x1000;
         let buf = vec![0u8; span as usize];
         let offsets = super::super::btf_offsets::CpuTimeOffsets {
             kernel_cpustat_cpustat: 0,
@@ -6802,9 +6810,17 @@ impl PerCpuTimeScene {
                 kaslr_offset,
                 self.per_cpu_offsets[cpu],
             ),
-            0,
+            Self::PAGE_OFFSET,
         )
     }
+
+    /// Direct-map base used by the synthetic fixture.  Templates
+    /// are linked at `PAGE_OFFSET + small_offset`, and the
+    /// production capture under test is configured with the same
+    /// `page_offset` so the resulting PA collapses to
+    /// `small_offset + kaslr_offset + per_cpu_off` and fits in the
+    /// buffer.
+    const PAGE_OFFSET: u64 = 0xffff_0000_0000_0000;
 
     /// Write `value` as 8 LE bytes at `pa` in the backing buffer.
     fn write_u64_at(&mut self, pa: u64, value: u64) {
@@ -6862,7 +6878,7 @@ fn collect_per_cpu_time_zero_kaslr_reads_per_cpu_slot() {
         kstat_kva: scene.kstat_template_kva,
         tick_cpu_sched_kva: Some(scene.tick_template_kva),
         per_cpu_offsets: &scene.per_cpu_offsets,
-        page_offset: 0,
+        page_offset: PerCpuTimeScene::PAGE_OFFSET,
         kaslr_offset: kaslr,
     };
     let out = super::collect_per_cpu_time(&capture);
@@ -6943,7 +6959,7 @@ fn collect_per_cpu_time_non_zero_kaslr_shifts_per_cpu_reads() {
         kstat_kva: scene.kstat_template_kva,
         tick_cpu_sched_kva: Some(scene.tick_template_kva),
         per_cpu_offsets: &scene.per_cpu_offsets,
-        page_offset: 0,
+        page_offset: PerCpuTimeScene::PAGE_OFFSET,
         kaslr_offset: kaslr,
     };
     let out = super::collect_per_cpu_time(&capture);
@@ -6985,7 +7001,7 @@ fn collect_per_cpu_time_no_tick_sched_skips_iowait() {
         // path.
         tick_cpu_sched_kva: None,
         per_cpu_offsets: &scene.per_cpu_offsets,
-        page_offset: 0,
+        page_offset: PerCpuTimeScene::PAGE_OFFSET,
         kaslr_offset: kaslr,
     };
     let out = super::collect_per_cpu_time(&capture);

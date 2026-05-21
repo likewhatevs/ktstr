@@ -2425,18 +2425,23 @@ mod tests {
     /// arithmetic.
     #[test]
     fn oru32_sets_target_bits_preserves_others() {
-        // KVA = start_kernel_map (0xFFFF_FFFF_8000_0000) + PA; the
-        // Symbol path's `text_kva_to_pa` translates via
-        // start_kernel_map, NOT page_offset.
+        // KVA = start_kernel_map + PA; the Symbol path's
+        // `text_kva_to_pa` translates via start_kernel_map, NOT
+        // page_offset.  The const value of start_kernel_map is
+        // arch-specific (0xFFFF_FFFF_8000_0000 on x86_64,
+        // 0xFFFF_8000_8000_0000 on aarch64), so the SYMBOL_KVA is
+        // derived rather than hardcoded — a hardcoded x86_64
+        // value puts the translated PA outside the buffer on
+        // aarch64 and the read silently returns 0.
         const SYMBOL_PA: u64 = 0x40;
-        const SYMBOL_KVA: u64 = 0xFFFF_FFFF_8000_0040;
+        let symbol_kva: u64 = crate::monitor::symbols::START_KERNEL_MAP + SYMBOL_PA;
         const INITIAL_FLAGS: u32 = 0xAAAA_AAAA;
         const OR_MASK: u32 = 0x0000_0001;
         let mut buf = vec![0u8; 4096];
         buf[SYMBOL_PA as usize..SYMBOL_PA as usize + 4]
             .copy_from_slice(&INITIAL_FLAGS.to_le_bytes());
         let mut symbols = std::collections::HashMap::new();
-        symbols.insert("test_flags".to_string(), SYMBOL_KVA);
+        symbols.insert("test_flags".to_string(), symbol_kva);
         let kernel = build_test_kernel(&mut buf, symbols);
         dispatch_one_write(
             &kernel,
@@ -2467,11 +2472,16 @@ mod tests {
     /// skeleton).
     #[test]
     fn oru32_idempotent_on_already_set_bit() {
-        // KVA = start_kernel_map (0xFFFF_FFFF_8000_0000) + PA; the
-        // Symbol path's `text_kva_to_pa` translates via
-        // start_kernel_map, NOT page_offset.
+        // KVA = start_kernel_map + PA; the Symbol path's
+        // `text_kva_to_pa` translates via start_kernel_map, NOT
+        // page_offset.  The const value of start_kernel_map is
+        // arch-specific (0xFFFF_FFFF_8000_0000 on x86_64,
+        // 0xFFFF_8000_8000_0000 on aarch64), so the SYMBOL_KVA is
+        // derived rather than hardcoded — a hardcoded x86_64
+        // value puts the translated PA outside the buffer on
+        // aarch64 and the read silently returns 0.
         const SYMBOL_PA: u64 = 0x40;
-        const SYMBOL_KVA: u64 = 0xFFFF_FFFF_8000_0040;
+        let symbol_kva: u64 = crate::monitor::symbols::START_KERNEL_MAP + SYMBOL_PA;
         const INITIAL_FLAGS: u32 = 0xAAAA_AAAA;
         // Bit 1 is set in 0xA = 1010 — picking 0x2 means OR-ing an
         // already-set bit.
@@ -2480,7 +2490,7 @@ mod tests {
         buf[SYMBOL_PA as usize..SYMBOL_PA as usize + 4]
             .copy_from_slice(&INITIAL_FLAGS.to_le_bytes());
         let mut symbols = std::collections::HashMap::new();
-        symbols.insert("test_flags".to_string(), SYMBOL_KVA);
+        symbols.insert("test_flags".to_string(), symbol_kva);
         let kernel = build_test_kernel(&mut buf, symbols);
         // Sanity: the chosen bit IS set in the initial value (test
         // construction guard).
