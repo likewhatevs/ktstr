@@ -84,6 +84,8 @@ jobs:
       fail-fast: false
       matrix:
         kernel-version: ['6.14', '7.0']
+    env:
+      CARGO_BUILD_JOBS: "32"
     steps:
       - uses: actions/checkout@v5
       - name: Provision Rust toolchain
@@ -133,6 +135,8 @@ jobs:
 
   coverage-arm64:
     runs-on: [ktstr-arm64]
+    env:
+      CARGO_BUILD_JOBS: "32"
     steps:
       - uses: actions/checkout@v5
       - name: Provision Rust toolchain
