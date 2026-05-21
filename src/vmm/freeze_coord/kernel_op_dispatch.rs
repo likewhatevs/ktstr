@@ -1550,7 +1550,7 @@ fn error_reply(request_id: u32, reason: String) -> KernelOpReplyPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vmm::x86_64::msr_kaslr::KERNEL_HALF_CANONICAL_4LEVEL;
+    use crate::vmm::KERNEL_HALF_CANONICAL as KERNEL_HALF_CANONICAL_4LEVEL;
 
     /// Disambiguation invariant pin. The 5-level conservative threshold
     /// must be PERMISSIVELY LOWER than the 4-level canonical strict
