@@ -89,6 +89,7 @@ fn assert_result_postcard_roundtrip() {
     let r = AssertResult {
         outcomes: vec![
             Outcome::Fail(AssertDetail::new(DetailKind::Other, "fail msg")),
+            Outcome::Inconclusive(AssertDetail::new(DetailKind::Other, "inconclusive msg")),
             Outcome::Skip(AssertDetail::new(DetailKind::Skip, "skip msg")),
             Outcome::Pass,
         ],
@@ -101,13 +102,18 @@ fn assert_result_postcard_roundtrip() {
     let r2: AssertResult = postcard::from_bytes(&bytes).expect("postcard decode");
     assert_eq!(r.is_fail(), r2.is_fail());
     assert_eq!(r.is_skip(), r2.is_skip());
+    assert_eq!(r.is_inconclusive(), r2.is_inconclusive());
     assert_eq!(r.outcomes.len(), r2.outcomes.len());
     let r_fails: Vec<_> = r.failure_details().collect();
     let r2_fails: Vec<_> = r2.failure_details().collect();
     assert_eq!(r_fails.len(), r2_fails.len());
     assert_eq!(r_fails[0].message, r2_fails[0].message);
-    let r_skips: Vec<_> = r.skip_reasons().collect();
-    let r2_skips: Vec<_> = r2.skip_reasons().collect();
+    let r_incons: Vec<_> = r.inconclusive_details().collect();
+    let r2_incons: Vec<_> = r2.inconclusive_details().collect();
+    assert_eq!(r_incons.len(), r2_incons.len());
+    assert_eq!(r_incons[0].message, r2_incons[0].message);
+    let r_skips: Vec<_> = r.skip_details().collect();
+    let r2_skips: Vec<_> = r2.skip_details().collect();
     assert_eq!(r_skips.len(), r2_skips.len());
     assert_eq!(r_skips[0].message, r2_skips[0].message);
     assert_eq!(r.info_notes.len(), r2.info_notes.len());

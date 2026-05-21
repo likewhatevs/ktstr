@@ -275,6 +275,7 @@ fn sidecar_result_roundtrip() {
         metrics: vec![],
         passed: true,
         skipped: false,
+        inconclusive: false,
         stats: crate::assert::ScenarioStats {
             cgroups: vec![CgroupStats {
                 num_workers: 4,
@@ -357,6 +358,7 @@ fn sidecar_result_roundtrip() {
         metrics,
         passed,
         skipped,
+        inconclusive,
         stats,
         monitor,
         stimulus_events,
@@ -398,9 +400,13 @@ fn sidecar_result_roundtrip() {
     assert_eq!(host, None, "fixture declared no host context");
     assert_eq!(timestamp, "", "fixture used empty-string timestamp");
     assert_eq!(run_id, "", "fixture used empty-string run_id");
-    // Verdict bits — passed true + skipped false pinned.
+    // Verdict bits — passed true + skipped false + inconclusive
+    // false pinned. The four-state encoding `(passed, skipped,
+    // inconclusive, fail)` is strict mutual exclusion; a regression
+    // that mixed two bits would surface here.
     assert!(passed);
     assert!(!skipped, "fixture declared skipped=false");
+    assert!(!inconclusive, "fixture declared inconclusive=false");
     // Empty-Vec collections — regression guard against a serde
     // regression that dropped `[]` on round-trip.
     assert!(metrics.is_empty(), "fixture declared empty metrics");
@@ -474,7 +480,8 @@ fn sidecar_result_roundtrip() {
 /// - `topology="8n8l16c2t"` (vs fixture `"1n1l1c1t"`).
 /// - `scheduler="scx_audit"` (vs fixture `"eevdf"`).
 /// - `work_type="AuditWork"` (vs fixture `"SpinWait"`).
-/// - `passed=false, skipped=true` (vs fixture `true`, `false`).
+/// - `passed=false, skipped=true, inconclusive=true` (vs fixture
+///   `true`, `false`, `false`).
 /// - Non-empty collections for every `Vec<_>` field.
 /// - `Some(…)` for every `Option<_>` field.
 /// - Non-empty Strings for `timestamp`, `run_id`.
@@ -508,6 +515,7 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
         }],
         passed: false,
         skipped: true,
+        inconclusive: true,
         stats: ScenarioStats {
             cgroups: vec![CgroupStats {
                 num_workers: 3,
@@ -581,6 +589,13 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
     assert_eq!(loaded.metrics[0].metrics[0].value, 42.0);
     assert!(!loaded.passed, "passed must survive as false");
     assert!(loaded.skipped, "skipped must survive as true");
+    assert!(
+        loaded.inconclusive,
+        "inconclusive must survive as true — the audit fixture sets \
+         every verdict bit independently to make field-swap regressions \
+         (e.g. a write-side bug that wrote `inconclusive` into `skipped` \
+         or vice versa) visible on round-trip",
+    );
     assert_eq!(loaded.stats.total_workers, 3);
     assert_eq!(loaded.stats.cgroups.len(), 1);
     assert_eq!(loaded.stats.cgroups[0].num_workers, 3);
@@ -705,6 +720,7 @@ fn sidecar_result_missing_required_field_rejected_by_deserialize() {
         "metrics",
         "passed",
         "skipped",
+        "inconclusive",
         "stats",
         "stimulus_events",
         "work_type",

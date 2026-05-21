@@ -21,13 +21,13 @@ fn assert_benchmarks_empty_reports() {
     );
     assert!(r.is_skip(), "no reports must surface as skipped");
     assert!(!r.is_pass(), "skip is not pass");
-    let skip_reasons: Vec<&AssertDetail> = r.skip_reasons().collect();
+    let skip_details: Vec<&AssertDetail> = r.skip_details().collect();
     assert!(
-        skip_reasons
+        skip_details
             .iter()
             .any(|d| matches!(d.kind, DetailKind::Skip) && d.message.contains("no worker reports")),
         "skip detail must carry the 'no worker reports' reason: {:?}",
-        skip_reasons,
+        skip_details,
     );
 }
 
@@ -234,10 +234,59 @@ fn assert_benchmarks_iteration_rate_fail() {
 }
 
 #[test]
-fn assert_benchmarks_zero_wall_time_skips_rate() {
+fn assert_benchmarks_zero_wall_time_yields_inconclusive() {
+    // Single worker with zero wall_time = all-zero case. Previously
+    // the gate skipped silently and returned Pass; now it records
+    // Inconclusive so a broken run that produced no signal at all
+    // doesn't masquerade as a passing benchmark.
     let reports = [rpt_with_latencies(1, vec![], 10, 0)];
     let r = assert_benchmarks(&reports, None, None, Some(100.0));
-    assert!(r.is_pass(), "zero wall_time should skip rate check");
+    assert!(
+        r.is_inconclusive(),
+        "all-zero wall_time must be Inconclusive, not Pass: {:?}",
+        r.outcomes,
+    );
+    assert!(!r.is_pass(), "must not silently pass on zero denominator");
+    assert!(!r.is_fail(), "no actual rate violation to report");
+    let reason = r
+        .inconclusive_details()
+        .find(|d| d.kind == DetailKind::Benchmark)
+        .unwrap_or_else(|| panic!("expected Inconclusive reason, got {:?}", r.outcomes));
+    assert!(
+        reason.message.contains("zero wall_time_ns"),
+        "diagnostic must name the root cause: {reason}"
+    );
+    assert!(
+        reason.message.contains("able to run"),
+        "diagnostic must surface the operator-actionable hint: {reason}"
+    );
+}
+
+#[test]
+fn assert_benchmarks_mixed_zero_and_nonzero_wall_does_not_short_circuit() {
+    // One worker has zero wall_time (skipped) but another worker has
+    // valid wall_time = the gate evaluates the non-zero worker
+    // normally and does NOT record Inconclusive (only the all-zero
+    // case is Inconclusive). Pins the zero_wall_count == reports.len()
+    // guard — a regression that triggered on any zero-wall worker
+    // would hide real rate failures on the workers that did run.
+    let reports = [
+        rpt_with_latencies(1, vec![], 10, 0),
+        rpt_with_latencies(2, vec![], 1, 5_000_000_000), // 0.2/s < 100/s
+    ];
+    let r = assert_benchmarks(&reports, None, None, Some(100.0));
+    assert!(
+        r.is_fail(),
+        "non-zero-wall worker below floor must fail: {:?}",
+        r.outcomes,
+    );
+    assert!(!r.is_inconclusive(), "only all-zero is Inconclusive");
+    assert!(
+        r.failure_details()
+            .any(|d| d.message.contains("worker 2") && d.message.contains("iteration rate")),
+        "expected worker-2 rate failure: {:?}",
+        r.outcomes,
+    );
 }
 
 #[test]
@@ -253,6 +302,51 @@ fn assert_benchmarks_single_latency_cv_skipped() {
     let reports = [rpt_with_latencies(1, vec![1000], 10, 5_000_000_000)];
     let r = assert_benchmarks(&reports, None, Some(0.1), None);
     assert!(r.is_pass(), "single sample should skip CV check");
+}
+
+/// Wake-latency CV gate with N>=2 samples but every sample is
+/// zero (mean==0) → Inconclusive, not Pass. CV is dispersion /
+/// mean, so a zero mean makes the denominator zero and the
+/// metric undefined. Previously slid past the gate as a silent
+/// Pass (the `if mean > 0` arm was skipped without recording
+/// anything); the Inconclusive arm at mod.rs records a
+/// `DetailKind::Benchmark` carrying the operator hint instead.
+/// Pins the zero-mean CV path explicitly so a regression that
+/// reverts to "skip silently when mean == 0" is caught.
+#[test]
+fn assert_benchmarks_wake_latency_cv_zero_mean_yields_inconclusive() {
+    // Multi-sample worker but every wake-latency sample is zero
+    // (mean == 0, len >= 2 → hits the zero-mean Inconclusive arm).
+    let reports = [rpt_with_latencies(1, vec![0, 0, 0, 0], 10, 5_000_000_000)];
+    let r = assert_benchmarks(&reports, None, Some(0.5), None);
+    assert!(
+        r.is_inconclusive(),
+        "zero-mean wake-latency CV must be Inconclusive, not Pass: {:?}",
+        r.outcomes,
+    );
+    assert!(!r.is_pass(), "must not silently pass on zero denominator");
+    assert!(!r.is_fail(), "no actual CV violation to report");
+    let reason = r
+        .inconclusive_details()
+        .find(|d| d.kind == DetailKind::Benchmark)
+        .unwrap_or_else(|| {
+            panic!(
+                "expected Benchmark Inconclusive reason, got {:?}",
+                r.outcomes
+            )
+        });
+    assert!(
+        reason.message.contains("wake latency CV inconclusive"),
+        "diagnostic must label the gate: {reason}",
+    );
+    assert!(
+        reason.message.contains("zero mean wake"),
+        "diagnostic must name the root cause: {reason}",
+    );
+    assert!(
+        reason.message.contains("non-zero latency"),
+        "diagnostic must surface the operator-actionable hint: {reason}",
+    );
 }
 
 // -- wake latency stats in assert_not_starved --
@@ -412,6 +506,61 @@ fn plan_migration_ratio_gate_pass() {
     assert!(r.is_pass(), "{:?}", r.outcomes);
 }
 
+/// A workload that produced zero iterations across every worker
+/// gives the migration-ratio check a zero denominator. Without the
+/// Inconclusive carve-out, `total_mig as f64 / 0` would collapse
+/// to 0.0 (via the prior `if total_iters > 0 ... else { 0.0 }`
+/// fallback) and 0.0 ≤ threshold would trivially pass — a false
+/// "no migrations under the bar" verdict on a workload that
+/// never ran. Pin that the gate now records an Inconclusive
+/// outcome carrying a `DetailKind::Migration` reason that names
+/// the zero-denominator condition.
+#[test]
+fn plan_migration_ratio_zero_iterations_is_inconclusive_not_pass() {
+    let mut w = rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50);
+    w.migration_count = 5;
+    w.iterations = 0; // zero denominator — workload did not iterate
+    let plan = AssertPlan {
+        not_starved: false,
+        isolation: false,
+        max_gap_ms: None,
+        max_spread_pct: None,
+        max_throughput_cv: None,
+        min_work_rate: None,
+        max_p99_wake_latency_ns: None,
+        max_wake_latency_cv: None,
+        min_iteration_rate: None,
+        max_migration_ratio: Some(0.05),
+        min_page_locality: None,
+        max_cross_node_migration_ratio: None,
+        max_slow_tier_ratio: None,
+    };
+    let r = plan.assert_cgroup(&[w], None, None);
+    assert!(
+        !r.is_pass(),
+        "zero-iteration workload must NOT trivially pass migration-ratio gate; got: {:?}",
+        r.outcomes
+    );
+    assert!(
+        !r.is_fail(),
+        "zero-iteration workload is Inconclusive, not Fail; got: {:?}",
+        r.outcomes
+    );
+    assert!(
+        r.is_inconclusive(),
+        "expected Inconclusive verdict on zero denominator; got: {:?}",
+        r.outcomes
+    );
+    let reasons: Vec<_> = r.inconclusive_details().collect();
+    assert_eq!(reasons.len(), 1, "exactly one Inconclusive reason expected");
+    assert_eq!(reasons[0].kind, DetailKind::Migration);
+    assert!(
+        reasons[0].message.contains("0 iterations") && reasons[0].message.contains("inconclusive"),
+        "Inconclusive reason must name zero-iteration condition; got: {}",
+        reasons[0].message
+    );
+}
+
 #[test]
 fn plan_benchmarks_iteration_rate_via_assert_cgroup() {
     let plan = AssertPlan {
@@ -440,24 +589,137 @@ fn plan_benchmarks_iteration_rate_via_assert_cgroup() {
 }
 
 #[test]
-fn assert_throughput_parity_all_zero_cpu_time_fails_when_cv_set() {
+fn assert_throughput_parity_all_zero_cpu_time_inconclusive_when_cv_set() {
     // When every worker recorded zero cpu_time the per-worker rate
     // is zero, the mean is zero, and CV is mathematically
     // undefined. The previous gate (`mean > 0.0`) silently skipped
     // the check and reported a pass — masking a workload that
-    // never accumulated any CPU time. The fix surfaces it as a
-    // failure so the operator sees the broken run.
+    // never accumulated any CPU time. The fix surfaces it as
+    // Inconclusive: the check ran but had no signal to evaluate;
+    // neither Pass (would mask the broken state) nor Fail (no
+    // actual CV violation observed) is truthful.
     let mut a = rpt(1, 0, 5_000_000_000, 5_000_000_000, &[0], 0);
     let mut b = rpt(2, 0, 5_000_000_000, 5_000_000_000, &[0], 0);
     a.cpu_time_ns = 0;
     b.cpu_time_ns = 0;
     let r = assert_throughput_parity(&[a, b], Some(0.5), None);
-    assert!(!r.is_pass(), "all-zero cpu_time must fail when max_cv set");
+    assert!(
+        r.is_inconclusive(),
+        "all-zero cpu_time must be Inconclusive when max_cv set: {:?}",
+        r.outcomes,
+    );
+    assert!(!r.is_pass(), "must not silently pass on zero denominator");
+    assert!(!r.is_fail(), "no actual CV violation to report");
+    let reason = r
+        .inconclusive_details()
+        .find(|d| d.kind == DetailKind::Benchmark)
+        .unwrap_or_else(|| panic!("expected Inconclusive reason, got {:?}", r.outcomes));
+    assert!(
+        reason.message.contains("zero cpu_time_ns"),
+        "diagnostic must name the root cause: {reason}"
+    );
+    assert!(
+        reason.message.contains("able to run"),
+        "diagnostic must surface the operator-actionable hint: {reason}"
+    );
+}
+
+#[test]
+fn assert_throughput_parity_all_zero_cpu_time_inconclusive_when_min_rate_set() {
+    // Symmetric case for the min_rate floor: per-worker zero-cpu
+    // rates would synthesize N duplicate Fails on data that
+    // couldn't be evaluated. The fix detects all-zero-cpu once
+    // and records a single Inconclusive naming the unevaluated
+    // limit (here `min_rate 100`). Pins the all-zero path under
+    // the min_rate-only branch separately from the CV branch.
+    let mut a = rpt(1, 0, 5_000_000_000, 5_000_000_000, &[0], 0);
+    let mut b = rpt(2, 0, 5_000_000_000, 5_000_000_000, &[0], 0);
+    a.cpu_time_ns = 0;
+    b.cpu_time_ns = 0;
+    let r = assert_throughput_parity(&[a, b], None, Some(100.0));
+    assert!(
+        r.is_inconclusive(),
+        "all-zero cpu_time must be Inconclusive when min_rate set: {:?}",
+        r.outcomes,
+    );
+    assert!(
+        !r.is_fail(),
+        "no per-worker Fail when every worker is zero-cpu"
+    );
+    let reason = r
+        .inconclusive_details()
+        .find(|d| d.kind == DetailKind::Benchmark)
+        .unwrap_or_else(|| panic!("expected Benchmark Inconclusive, got {:?}", r.outcomes));
+    assert!(
+        reason.message.contains("zero cpu_time_ns"),
+        "diagnostic must name the root cause: {reason}"
+    );
+    assert!(
+        reason.message.contains("min_rate 100"),
+        "diagnostic must name the unevaluated limit: {reason}"
+    );
+}
+
+#[test]
+fn assert_throughput_parity_all_zero_cpu_time_emits_single_inconclusive_when_both_limits_set() {
+    // When both `max_cv` and `min_rate` are set AND every worker
+    // recorded zero cpu_time, the same root cause (denominator is
+    // zero) blocks both gates. Emit ONE Inconclusive listing both
+    // unevaluated limits — not two separate records with stuttering
+    // "denominator is zero" diagnostics. Pins the dedup behavior.
+    let mut a = rpt(1, 0, 5_000_000_000, 5_000_000_000, &[0], 0);
+    let mut b = rpt(2, 0, 5_000_000_000, 5_000_000_000, &[0], 0);
+    a.cpu_time_ns = 0;
+    b.cpu_time_ns = 0;
+    let r = assert_throughput_parity(&[a, b], Some(0.5), Some(100.0));
+    assert!(r.is_inconclusive());
+    let inconclusives: Vec<_> = r.inconclusive_details().collect();
+    assert_eq!(
+        inconclusives.len(),
+        1,
+        "all-zero-cpu with both limits set must produce a single Inconclusive, got {:?}",
+        r.outcomes,
+    );
+    let msg = &inconclusives[0].message;
+    assert!(
+        msg.contains("max_cv 0.500"),
+        "must list max_cv limit: {msg}"
+    );
+    assert!(
+        msg.contains("min_rate 100"),
+        "must list min_rate limit: {msg}"
+    );
+    assert!(
+        msg.contains("zero cpu_time_ns"),
+        "must name root cause: {msg}"
+    );
+}
+
+#[test]
+fn assert_throughput_parity_mixed_zero_and_nonzero_cpu_does_not_short_circuit() {
+    // One worker has zero cpu_time (skipped) but another has valid
+    // cpu_time below floor = the gate evaluates the non-zero worker
+    // and records Fail (NOT Inconclusive). Pins the
+    // zero_cpu_count == reports.len() guard — a regression that
+    // triggered on any zero-cpu worker would hide real rate
+    // failures on the workers that did run.
+    let mut a = rpt(1, 0, 5_000_000_000, 5_000_000_000, &[0], 0);
+    let mut b = rpt(2, 1, 5_000_000_000, 5_000_000_000, &[0], 0);
+    a.cpu_time_ns = 0;
+    b.cpu_time_ns = 5_000_000_000;
+    // b: work_units=1, cpu_time_s=5 → rate = 0.2 work/cpu_s
+    let r = assert_throughput_parity(&[a, b], None, Some(100.0));
+    assert!(
+        r.is_fail(),
+        "non-zero-cpu worker below floor must fail: {:?}",
+        r.outcomes,
+    );
+    assert!(!r.is_inconclusive(), "only all-zero is Inconclusive");
     assert!(
         r.failure_details()
-            .any(|d| matches!(d.kind, DetailKind::Benchmark) && d.message.contains("CV undefined")),
-        "diagnostic must surface the undefined-CV root cause: {:?}",
-        r.outcomes
+            .any(|d| d.message.contains("worker 2") && d.message.contains("below floor")),
+        "expected worker-2 below-floor failure: {:?}",
+        r.outcomes,
     );
 }
 

@@ -574,19 +574,6 @@ fn thresholds_default_matches_const() {
 }
 
 #[test]
-fn thresholds_empty_report_passes() {
-    let t = MonitorThresholds::default();
-    let report = MonitorReport {
-        samples: vec![],
-        summary: MonitorSummary::default(),
-        ..Default::default()
-    };
-    let v = t.evaluate(&report);
-    assert!(v.is_pass());
-    assert!(v.details.is_empty());
-}
-
-#[test]
 fn thresholds_balanced_samples_pass() {
     let t = MonitorThresholds::default();
     let samples: Vec<_> = (0..10)
@@ -824,6 +811,15 @@ fn thresholds_stuck_detected_fails() {
 
 #[test]
 fn thresholds_stuck_disabled_passes() {
+    // Test the `fail_on_stall: false` toggle: a CPU with a
+    // stuck `rq_clock` must NOT fail the verdict when stall
+    // detection is disabled. The setup uses 2 CPUs with mixed
+    // rq_clock (cpu0 stuck at 5000/5000, cpu1 advancing
+    // 6000/7500) so `data_looks_valid` returns true (rq_clocks
+    // are not all identical) and the no-signal Inconclusive
+    // arm doesn't fire — the test isolates the
+    // `fail_on_stall=false` toggle from the data-validity
+    // path.
     let t = MonitorThresholds {
         fail_on_stall: false,
         sustained_samples: 100,
@@ -833,11 +829,18 @@ fn thresholds_stuck_disabled_passes() {
         MonitorSample {
             prog_stats: None,
             elapsed_ms: 100,
-            cpus: vec![CpuSnapshot {
-                nr_running: 1,
-                rq_clock: 5000,
-                ..Default::default()
-            }],
+            cpus: vec![
+                CpuSnapshot {
+                    nr_running: 1,
+                    rq_clock: 5000,
+                    ..Default::default()
+                },
+                CpuSnapshot {
+                    nr_running: 1,
+                    rq_clock: 6000,
+                    ..Default::default()
+                },
+            ],
         },
         MonitorSample {
             prog_stats: None,
@@ -847,7 +850,12 @@ fn thresholds_stuck_disabled_passes() {
                     nr_running: 1,
                     rq_clock: 5000,
                     ..Default::default()
-                }, // stuck but stall check disabled
+                }, // cpu0 stuck but stall check disabled
+                CpuSnapshot {
+                    nr_running: 1,
+                    rq_clock: 7500,
+                    ..Default::default()
+                }, // cpu1 advancing so data_looks_valid passes
             ],
         },
     ];
@@ -858,7 +866,11 @@ fn thresholds_stuck_disabled_passes() {
         ..Default::default()
     };
     let v = t.evaluate(&report);
-    assert!(v.passed, "stall disabled should pass: {:?}", v.details);
+    assert!(
+        v.is_pass(),
+        "fail_on_stall=false must pass even with stuck cpu0: {:?}",
+        v.details
+    );
 }
 
 #[test]
@@ -998,6 +1010,33 @@ fn thresholds_multiple_violations() {
 }
 
 #[test]
+fn thresholds_empty_samples_vec_yields_inconclusive() {
+    // Empty samples vec — monitor produced no data at all (the
+    // earliest Inconclusive arm in evaluate). Pin that this surfaces
+    // as Inconclusive (not Pass), distinct from the populated-but-
+    // empty-cpus case which legitimately passes.
+    let t = MonitorThresholds::default();
+    let report = MonitorReport {
+        samples: vec![],
+        summary: MonitorSummary::from_samples(&[]),
+        ..Default::default()
+    };
+    let v = t.evaluate(&report);
+    assert!(
+        v.is_inconclusive(),
+        "no samples must surface as Inconclusive (not Pass) — silent-pass guard. \
+         Got is_pass={}, is_fail={}, summary={}",
+        v.is_pass(),
+        v.is_fail(),
+        v.summary,
+    );
+    assert_eq!(
+        v.summary, "no monitor samples",
+        "summary text must match the dedicated no-samples narrative",
+    );
+}
+
+#[test]
 fn thresholds_empty_cpus_samples_pass() {
     let t = MonitorThresholds::default();
     let samples = vec![
@@ -1023,9 +1062,14 @@ fn thresholds_empty_cpus_samples_pass() {
 }
 
 #[test]
-fn thresholds_uninitialized_memory_passes() {
+fn thresholds_uninitialized_memory_yields_inconclusive() {
     // Simulates what happens when monitor reads guest memory before
-    // kernel initialization: all rq_clocks identical, DSQ depths garbage.
+    // kernel initialization: all rq_clocks identical, DSQ depths
+    // garbage. data_looks_valid rejects the sample, so the verdict
+    // must be Inconclusive (not Pass) — passing on no-signal would
+    // let a CI gate keying off is_pass treat "couldn't measure"
+    // identically to "measured and OK", the silent-pass class the
+    // Inconclusive arm exists to prevent.
     let t = MonitorThresholds::default();
     let garbage_clock = 10314579376562252011u64;
     let samples: Vec<_> = (0..10)
@@ -1056,15 +1100,25 @@ fn thresholds_uninitialized_memory_passes() {
     };
     let v = t.evaluate(&report);
     assert!(
+        v.is_inconclusive(),
+        "uninitialized guest memory must surface as Inconclusive (not Pass) — \
+         silent-pass guard at the MonitorVerdict surface. Got is_pass={}, is_fail={}, summary={}",
         v.is_pass(),
-        "uninitialized guest memory should be skipped: {:?}",
-        v.details
+        v.is_fail(),
+        v.summary,
+    );
+    assert!(
+        !v.is_pass(),
+        "is_pass must be false on the Inconclusive arm (strict mutex)",
     );
 }
 
 #[test]
-fn thresholds_all_same_clocks_passes() {
+fn thresholds_all_same_clocks_yields_inconclusive() {
     // All clocks identical across all CPUs and samples = uninitialized.
+    // data_looks_valid rejects, so the verdict is Inconclusive (not
+    // Pass) — same silent-pass guard as
+    // [`thresholds_uninitialized_memory_yields_inconclusive`].
     let t = MonitorThresholds {
         fail_on_stall: true,
         ..Default::default()
@@ -1111,14 +1165,20 @@ fn thresholds_all_same_clocks_passes() {
     };
     let v = t.evaluate(&report);
     assert!(
+        v.is_inconclusive(),
+        "all-same clocks must surface as Inconclusive (not Pass) — \
+         the no-signal arm cannot masquerade as a measured pass. Got is_pass={}, summary={}",
         v.is_pass(),
-        "all-same clocks should be treated as uninitialized: {:?}",
-        v.details
+        v.summary,
     );
 }
 
 #[test]
-fn thresholds_dsq_over_plausibility_ceiling_passes() {
+fn thresholds_dsq_over_plausibility_ceiling_yields_inconclusive() {
+    // sample_looks_valid rejects when any DSQ depth exceeds the
+    // plausibility ceiling — the verdict is Inconclusive (not
+    // Pass) so the operator sees "couldn't measure" rather than
+    // a silent green light on garbage data.
     let t = MonitorThresholds::default();
     let samples = vec![MonitorSample {
         prog_stats: None,
@@ -1146,9 +1206,11 @@ fn thresholds_dsq_over_plausibility_ceiling_passes() {
     };
     let v = t.evaluate(&report);
     assert!(
+        v.is_inconclusive(),
+        "implausible DSQ depth must surface as Inconclusive (not Pass) — \
+         silent-pass guard. Got is_pass={}, summary={}",
         v.is_pass(),
-        "implausible DSQ depth should skip evaluation: {:?}",
-        v.details
+        v.summary,
     );
 }
 

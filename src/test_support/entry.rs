@@ -1231,6 +1231,29 @@ pub struct KtstrTestEntry {
     /// When true, the test expects run_ktstr_test to return Err.
     /// Disables auto_repro (no point probing a deliberately failing test).
     pub expect_err: bool,
+    /// When true, a terminal Inconclusive verdict (e.g. zero-denominator
+    /// ratio gate that couldn't evaluate) routes to EXIT_PASS instead
+    /// of EXIT_INCONCLUSIVE at the dispatch layer. The test process
+    /// exits 0 and CI gates keying off the per-test exit code see no
+    /// failure. Use only when the test author has reason to accept an
+    /// Inconclusive arm as not-a-failure for this specific test —
+    /// e.g. an exploratory benchmark whose ratio gate may legitimately
+    /// see no signal under certain host topologies. Inconclusive is
+    /// still recorded in the sidecar so stats tooling can surface it,
+    /// and the operator-facing failure dump still renders the
+    /// Inconclusive diagnostic. This flag changes only the dispatch
+    /// exit-code projection.
+    ///
+    /// Mutually orthogonal with [`Self::expect_err`]: when both are
+    /// true and the result is Inconclusive, expect_err still wins
+    /// (expect_err demands a real Fail; Inconclusive doesn't satisfy
+    /// that and routes to EXIT_FAIL with the expect_err unsatisfied
+    /// explainer).
+    ///
+    /// Populated by `#[ktstr_test(allow_inconclusive)]` /
+    /// `#[ktstr_test(allow_inconclusive = true)]` or by direct entry
+    /// construction.
+    pub allow_inconclusive: bool,
     /// When true, the test runs directly on the host instead of
     /// booting a VM. Used for tests that need host tools (cargo,
     /// nested VMs) unavailable in the guest initramfs.
@@ -1495,6 +1518,7 @@ impl KtstrTestEntry {
         no_perf_mode: false,
         duration: Duration::from_secs(12),
         expect_err: false,
+        allow_inconclusive: false,
         host_only: false,
         extra_include_files: &[],
         cleanup_budget: None,
@@ -2018,6 +2042,15 @@ impl KtstrTestEntry {
     #[must_use = "builder methods consume self; bind the result"]
     pub fn with_expect_err(mut self, expect_err: bool) -> Self {
         self.expect_err = expect_err;
+        self
+    }
+
+    /// Override [`Self::allow_inconclusive`]. When true, an
+    /// Inconclusive terminal verdict routes to EXIT_PASS instead
+    /// of EXIT_INCONCLUSIVE at the dispatch layer.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_allow_inconclusive(mut self, allow_inconclusive: bool) -> Self {
+        self.allow_inconclusive = allow_inconclusive;
         self
     }
 

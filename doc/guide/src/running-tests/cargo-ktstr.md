@@ -256,6 +256,33 @@ cargo ktstr test -- --workspace               # all workspace tests
 cargo ktstr test -- --retries 2               # nextest retries
 ```
 
+### Per-test exit codes
+
+Each `#[ktstr_test]` process exits with a code that projects the
+`Fail > Inconclusive > Pass > Skip` verdict lattice to three
+values. CI gates and dashboards triage runs by exit code:
+
+| Code | Verdict      | Meaning                                                                                                                                                |
+|------|--------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `0`  | Pass / Skip  | All assertions passed, or the test never ran (host topology insufficient, resource contention). Skip degenerates to Pass at the process boundary.      |
+| `1`  | Fail         | At least one assertion failed, OR `expect_err = true` and the test produced a Pass / Inconclusive (an `expect_err` test whose gate could not evaluate is unsatisfied just as it would be on a Pass). |
+| `2`  | Inconclusive | A zero-denominator ratio gate could not evaluate — the workload produced no signal to ratio against, so neither pass nor fail is truthful.             |
+
+Exit code `2` is the silent-pass guard: a Pass at a `≤ threshold`
+gate run against a `0 / 0` ratio that synthesized to `0.0` would
+have shipped a false-green CI run. The harness records Inconclusive
+in that case (see [Verdict outcomes](../concepts/checking.md#verdict-outcomes))
+and the dispatch layer projects it to a distinct exit code so
+external tooling can route the run separately from real
+regressions.
+
+The integer values are also exposed as `pub const`s for tooling
+that drives the harness programmatically:
+
+```rust
+use ktstr::prelude::{EXIT_PASS, EXIT_FAIL, EXIT_INCONCLUSIVE};
+```
+
 ## replay
 
 Re-run only the tests that failed in the last session, by reading

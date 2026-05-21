@@ -2209,6 +2209,7 @@ mod tests {
             metrics: Vec::new(),
             passed: true,
             skipped: false,
+            inconclusive: false,
             stats: ktstr::assert::ScenarioStats::default(),
             monitor: None,
             stimulus_events: Vec::new(),

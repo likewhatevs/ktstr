@@ -1037,13 +1037,16 @@ pub(crate) enum StatsCommand {
         /// pairing across A/B sides is ambiguous).
         ///
         /// Aggregation rules under the default (averaging-on)
-        /// path: failing/skipped contributors are excluded from
-        /// the metric mean (they carry failure-mode telemetry,
-        /// not scheduler behaviour); the aggregated row's
-        /// `passed` is the AND across every contributor (a
-        /// single failure flips the aggregate to `failed`,
-        /// which routes the pair through `compare_rows`'
-        /// `skipped_failed` gate).
+        /// path: failing, skipped, and inconclusive contributors
+        /// are excluded from the metric mean (they carry no
+        /// comparable per-run signal); the aggregated row's
+        /// verdict bits fold under the strict 4-state
+        /// `Fail > Inconclusive > Pass > Skip` lattice (any
+        /// failing contributor wins; else any inconclusive
+        /// contributor wins; else any skipped contributor wins;
+        /// only an all-pass cohort yields a real Pass aggregate).
+        /// Aggregate rows that are not real Pass route the pair
+        /// through `compare_rows`' `excluded_pairs` gate.
         #[arg(long = "no-average")]
         no_average: bool,
 

@@ -382,10 +382,137 @@ offer `empty` / `nonempty` / `contains` / `len_eq` / `len_at_most` /
 ### Finishing the verdict
 
 `Verdict::into_result()` consumes the accumulator and returns an
-`AssertResult` with the same `passed` / `details` / `stats` shape as
-the direct-invocation paths. Compose via `AssertResult::merge` to
-combine claim outcomes with `assert_cgroup` / `assert_baseline` /
+`AssertResult` carrying `outcomes` / `passes` / `info_notes` /
+`stats` / `measurements`. The terminal verdict is the fold of the
+`outcomes: Vec<Outcome>` slot per the four-state lattice (see the
+"Verdict outcomes" section below). Compose via `AssertResult::merge`
+to combine claim outcomes with `assert_cgroup` / `assert_baseline` /
 `assert_scx_events_clean` results in the same scenario.
+
+## Verdict outcomes
+
+Every assertion produces an `Outcome` — one of four mutually
+exclusive variants — and `AssertResult` carries the sequence of
+recorded outcomes in `outcomes: Vec<Outcome>`. The terminal
+verdict is the fold over that vec per the lattice
+**`Fail > Inconclusive > Pass > Skip`**.
+
+| Variant | Meaning | When |
+|---|---|---|
+| `Pass` | a real check succeeded | the assertion ran and the value satisfied the threshold |
+| `Skip(d)` | scenario couldn't run | precondition unmet (topology mismatch, missing resource, in-VM `AssertResult::skip` return) |
+| `Inconclusive(d)` | ran but no signal | a ratio gate's denominator legitimately reached zero (zero iterations across all workers under `max_migration_ratio`, zero NUMA pages under `max_slow_tier_ratio`, etc.) so the threshold can't be evaluated |
+| `Fail(d)` | a real check failed | the assertion ran and the value violated the threshold |
+
+`Inconclusive` exists for INSTRUMENT-derived denominators
+(iteration count, sample count, wall-clock interval) that reached
+zero because the workload produced no signal. POLICY-derived
+denominators (e.g. NUMA pages under `MemPolicy::Bind`, where the
+policy specifies that pages will exist) stay `Fail` on zero — the
+policy implies the value should exist, so its absence is a defect
+signal, not "couldn't measure."
+
+### Recording outcomes
+
+Producers append to the `outcomes` vec via atomic mutators that
+return `&mut Self` for chaining:
+
+- `r.record_pass()` — append `Outcome::Pass`.
+- `r.record_skip(reason)` — append `Outcome::Skip(reason)`. Use
+  when the scenario can't run.
+- `r.record_inconclusive(detail)` — append
+  `Outcome::Inconclusive(detail)`. Use when the assertion ran but
+  the denominator (or other input) is zero so the threshold can't
+  be evaluated.
+- `r.record_fail(detail)` — append `Outcome::Fail(detail)`. Use
+  when the assertion ran and the value violated the threshold.
+- `r.record_outcome(o)` — escape hatch for callers that already
+  hold a pre-folded `Outcome`.
+
+Constructors `AssertResult::pass()` / `::skip(reason)` /
+`::fail(detail)` seed the vec with the corresponding variant.
+`pass()` is zero-allocation (empty vec; the merge identity).
+
+### Reading the verdict
+
+- `r.outcome()` — folds the vec into a single `Outcome` per the
+  lattice. Use when matching on the terminal verdict.
+- `r.outcome_ref()` — same fold returning `OutcomeRef<'_>` that
+  borrows the payload in place.
+- `r.is_pass()` — true iff no Fail / Inconclusive was recorded
+  and the stream is not all-Skip. An empty stream (the `pass()`
+  zero-state, which is the merge identity element) returns
+  **true**; a stream containing at least one real Pass marker
+  alongside no Fail / Inconclusive also returns **true**;
+  Inconclusive (a zero-denominator gate didn't pass — it
+  couldn't evaluate) and all-Skip (the scenario didn't run) both
+  return **false**.
+- `r.is_fail()` — true iff at least one Fail was recorded.
+- `r.is_inconclusive()` — true iff at least one Inconclusive was
+  recorded and no Fail was recorded (Fail dominates).
+- `r.is_skip()` — true iff the stream is non-empty and every
+  recorded outcome is Skip.
+- Per-variant payload iterators: `r.failure_details()`,
+  `r.inconclusive_details()`, `r.skip_details()`.
+
+### Merge precedence
+
+`AssertResult::merge` concatenates the `outcomes` vecs. The
+terminal-verdict semantics fall out of the per-variant fold:
+
+- any `Fail` in either operand → merged result is `Fail` (Fail
+  dominates).
+- absent `Fail`, any `Inconclusive` → merged is `Inconclusive`.
+- absent both, at least one `Pass` → merged is `Pass`.
+- all-Skip on both → merged is `Skip`.
+
+Same-discriminant ties (e.g. two `Fail` outcomes from different
+checks) preserve the LEFT operand's payload, so the first recorded
+diagnostic surfaces in the terminal verdict.
+
+### CI gate patterns
+
+```rust,ignore
+// "Real pass" — the assertion ran and succeeded.
+if r.is_pass() {
+    // ship
+}
+
+// "Real fail" — the assertion ran and violated a threshold.
+if r.is_fail() {
+    // block release; surface r.failure_details()
+}
+
+// "Couldn't evaluate" — scenario skipped (precondition unmet) or
+// the assertion ran without enough signal (zero-denominator).
+if r.is_skip() || r.is_inconclusive() {
+    // treat as "no verdict"; review the run inputs
+}
+```
+
+Match-on-outcome is also fine:
+
+```rust,ignore
+match r.outcome() {
+    Outcome::Pass => { /* ship */ }
+    Outcome::Fail(d) => { /* block; surface d */ }
+    Outcome::Inconclusive(d) => { /* operator triages */ }
+    Outcome::Skip(d) => { /* not a verdict; record for stats */ }
+}
+```
+
+### `any_of` summary
+
+`AssertResult::any_of(...)` (disjunction) synthesizes a terminal
+verdict from N branches per the same lattice. The synthesis
+order is: any Pass branch wins (the first passing branch's result
+is returned); absent any Pass, if any branch failed the result is
+`Fail`; absent Pass and Fail, if any branch is `Inconclusive` the
+result is `Inconclusive`; otherwise (all-Skip) the result is
+`Skip`. The failure-path summary line reports
+`X failed, Y inconclusive, Z skipped of N branches` so the
+operator sees the disposition mix without re-walking the per-branch
+details.
 
 ## Constants
 
@@ -413,14 +540,22 @@ aggregated statistics from a scenario run.
 
 ### Construction
 
-- `AssertResult::pass()` -- creates a passing result with empty
-  details and default stats.
-- `AssertResult::skip(reason)` -- creates a passing result with a
-  skip reason in `details` and `skipped = true`. Used when a
-  scenario cannot run under the current topology or flag
-  combination but is not a failure.
+- `AssertResult::pass()` -- creates a passing result with an empty
+  `outcomes` vec and default stats. The empty vec is the Pass
+  identity; merging anything into it yields the same lattice fold
+  as recording outcomes directly.
+- `AssertResult::skip(reason)` -- seeds `outcomes` with one
+  `Outcome::Skip(detail)` carrying the reason. Use when a scenario
+  cannot run under the current topology or flag combination but is
+  not a failure. `is_pass()` reads false on the result (Skip is
+  not Pass — the scenario didn't run).
+- `AssertResult::inconclusive(detail)` -- seeds `outcomes` with one
+  `Outcome::Inconclusive(detail)`. Use when the assertion ran but
+  the denominator was zero so the threshold can't be evaluated.
+  `is_pass()` reads false; `is_inconclusive()` reads true.
 - `AssertResult::fail(detail)` -- failing result carrying a single
-  `AssertDetail`. Mirrors `pass` / `skip` for the failure axis.
+  `AssertDetail`. Mirrors `pass` / `skip` / `inconclusive` for the
+  failure axis.
 - `AssertResult::fail_msg(msg)` -- shortcut for the common case
   where the failure is a plain diagnostic message tagged
   `DetailKind::Other`.
@@ -429,8 +564,8 @@ aggregated statistics from a scenario run.
 
 - `result.note(msg)` -- append an informational annotation to
   `AssertResult::info_notes` (the structurally-separate context
-  stream, distinct from failure-carrying `details`). Does NOT
-  flip `passed` or `skipped` — a note is context, not a verdict.
+  stream, distinct from failure-carrying `outcomes`). Does NOT
+  alter the terminal verdict — a note is context, not a verdict.
   Returns `&mut Self` so calls chain.
 - `result.with_note(msg)` -- builder-style sibling of `note` that
   consumes and returns `self`. Use at the return site to chain a
@@ -443,12 +578,11 @@ aggregated statistics from a scenario run.
 - `result.with_note_value(key, value)` -- builder-style sibling of
   `note_value` that consumes and returns `self`. Pairs naturally
   with `pass()` / `fail_msg(msg)` at the return site.
-- `result.is_skipped()` -- convenience accessor returning
-  `skipped`. Stats tooling uses this to subtract non-executions
-  from pass counts.
-- `result.is_failed()` -- convenience accessor returning
-  `!passed`. Mirrors `is_skipped` so branches reading "did this
-  claim fail?" don't negate `.passed` inline.
+- `result.is_pass()` / `is_fail()` / `is_inconclusive()` /
+  `is_skip()` -- four-state verdict accessors over the
+  `Fail > Inconclusive > Pass > Skip` lattice. See
+  [Verdict outcomes](#verdict-outcomes) for the full table and
+  CI-gate patterns.
 
 ### Composing results: `any_of` and `all_of`
 
@@ -476,9 +610,9 @@ accumulate in a loop body.
 
 - `outcomes: Vec<Outcome>` -- per-claim outcome entries; each
   carries the claim shape, comparator, and pass/fail/skip status.
-  Verdict is COMPUTED via `is_pass()` / `is_fail()` / `is_skip()`
-  from this vec (no separate `passed: bool` / `skipped: bool`
-  field exists; legacy `is_failed()` / `is_skipped()` are aliases).
+  Verdict is COMPUTED via `is_pass()` / `is_fail()` /
+  `is_inconclusive()` / `is_skip()` from this vec (no separate
+  `passed: bool` / `skipped: bool` field exists).
 - `passes: Vec<PassDetail>` -- recorded pass details (capped at
   `MAX_RECORDED_PASSES`). Surfaced via `failure_details()` when
   composing diagnostic notes.
@@ -495,16 +629,20 @@ accumulate in a loop body.
 
 ### Merging
 
-`result.merge(other)` combines two results. If `other` carries any
-failed outcome, the merged result fails. Outcomes, passes, info
-notes, and stats are accumulated:
+`result.merge(other)` combines two results. Outcomes, passes,
+info notes, and stats are accumulated; the terminal verdict
+follows the `Fail > Inconclusive > Pass > Skip` lattice (see
+[Verdict outcomes: Merge precedence](#merge-precedence)):
 
 ```rust,ignore
 let mut combined = AssertResult::pass();
 combined.merge(cgroup_0_result);
 combined.merge(cgroup_1_result);
-// combined.is_fail() returns true if either cgroup failed
+// combined.is_fail() returns true if any cgroup failed
+// combined.is_inconclusive() returns true if any cgroup was
+//   inconclusive AND none failed (Fail dominates Inconclusive)
 // combined.failure_details() iterates concatenated failure notes
+// combined.inconclusive_details() iterates inconclusive payloads
 ```
 
 Stats merging takes worst values across cgroups for spread, gap, wake

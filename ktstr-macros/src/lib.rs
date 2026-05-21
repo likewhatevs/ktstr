@@ -98,6 +98,7 @@ const BOOL_ATTR_NAMES: &[&str] = &[
     "no_perf_mode",
     "requires_smt",
     "expect_err",
+    "allow_inconclusive",
     "fail_on_stall",
     "host_only",
     "ignore",
@@ -123,6 +124,8 @@ struct BoolAttrSlots<'a> {
     requires_smt_set: &'a mut bool,
     expect_err: &'a mut bool,
     expect_err_set: &'a mut bool,
+    allow_inconclusive: &'a mut bool,
+    allow_inconclusive_set: &'a mut bool,
     fail_on_stall: &'a mut Option<bool>,
     host_only: &'a mut bool,
     host_only_set: &'a mut bool,
@@ -160,6 +163,10 @@ impl BoolAttrSlots<'_> {
             "expect_err" => {
                 *self.expect_err = value;
                 *self.expect_err_set = true;
+            }
+            "allow_inconclusive" => {
+                *self.allow_inconclusive = value;
+                *self.allow_inconclusive_set = true;
             }
             "fail_on_stall" => *self.fail_on_stall = Some(value),
             "host_only" => {
@@ -436,6 +443,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut bpf_map_write: Option<syn::Path> = None;
     let mut expect_err: bool = false;
     let mut expect_err_set = false;
+    let mut allow_inconclusive: bool = false;
+    let mut allow_inconclusive_set = false;
     let mut host_only: bool = false;
     let mut host_only_set = false;
     let mut ignore_test: bool = false;
@@ -475,6 +484,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         requires_smt_set: &mut requires_smt_set,
         expect_err: &mut expect_err,
         expect_err_set: &mut expect_err_set,
+        allow_inconclusive: &mut allow_inconclusive,
+        allow_inconclusive_set: &mut allow_inconclusive_set,
         fail_on_stall: &mut fail_on_stall,
         host_only: &mut host_only,
         host_only_set: &mut host_only_set,
@@ -1034,7 +1045,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mib, scheduler, staged_schedulers, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, expect_scx_bpf_error_contains, expect_scx_bpf_error_matches, extra_sched_args, extra_include_files, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, bpf_map_write, expect_err, host_only, ignore, cleanup_budget_ms, post_vm, config, disk, num_snapshots"),
+                            format!("unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mib, scheduler, staged_schedulers, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, expect_scx_bpf_error_contains, expect_scx_bpf_error_matches, extra_sched_args, extra_include_files, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, bpf_map_write, expect_err, allow_inconclusive, host_only, ignore, cleanup_budget_ms, post_vm, config, disk, num_snapshots"),
                         )
                         .to_compile_error()
                         .into();
@@ -1681,6 +1692,11 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         quote! {}
     };
+    let allow_inconclusive_field = if allow_inconclusive_set {
+        quote! { allow_inconclusive: #allow_inconclusive, }
+    } else {
+        quote! {}
+    };
     let host_only_field = if host_only_set {
         quote! { host_only: #host_only, }
     } else {
@@ -1986,6 +2002,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             #duration_field
             #num_snapshots_field
             #expect_err_field
+            #allow_inconclusive_field
             #host_only_field
             #extra_include_files_field
             #cleanup_budget_field

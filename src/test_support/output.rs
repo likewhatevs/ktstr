@@ -588,14 +588,27 @@ pub(crate) fn format_periodic_samples_section(result: &vmm::VmResult) -> String 
 }
 
 /// Format the `--- temporal assertions ---` summary section for
-/// failure output. Walks the failure-detail stream, filters to
-/// entries tagged [`crate::assert::DetailKind::Temporal`], and
-/// renders each as a single line. The section is suppressed when
-/// no temporal-tagged failures are present so non-temporal failure
-/// paths do not pick up an empty section header.
+/// failure output. Walks BOTH the failure-detail and
+/// inconclusive-detail streams, filters to entries tagged
+/// [`crate::assert::DetailKind::Temporal`], and renders each as a
+/// single line. The section is suppressed when no temporal-tagged
+/// detail is present so non-temporal failure paths do not pick up
+/// an empty section header.
+///
+/// Why both streams: temporal patterns can push BOTH `Outcome::Fail`
+/// (via [`crate::assert::temporal::push_detail`]) and
+/// `Outcome::Inconclusive` (via
+/// [`crate::assert::temporal::push_inconclusive`] — e.g. zero-
+/// denominator rate_within / ratio_within); rendering only Fails
+/// would silently drop the Inconclusive diagnostic when the verdict
+/// arm is Inconclusive (no Fail recorded), losing the operator-
+/// visible message that explains WHY the gate could not evaluate.
+/// The caller at [`crate::test_support::eval`]'s failure dumper
+/// runs on both arms.
 pub(crate) fn format_temporal_assertions_section(result: &crate::assert::AssertResult) -> String {
     let temporal: Vec<&crate::assert::AssertDetail> = result
         .failure_details()
+        .chain(result.inconclusive_details())
         .filter(|d| d.kind == crate::assert::DetailKind::Temporal)
         .collect();
     if temporal.is_empty() {
@@ -603,7 +616,7 @@ pub(crate) fn format_temporal_assertions_section(result: &crate::assert::AssertR
     }
     let mut lines: Vec<String> = Vec::with_capacity(temporal.len() + 1);
     lines.push(format!(
-        "{n} temporal assertion violation(s):",
+        "{n} temporal assertion entry(ies):",
         n = temporal.len()
     ));
     for detail in temporal {
@@ -1840,10 +1853,70 @@ ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
         ));
         let s = format_temporal_assertions_section(&r);
         assert!(s.contains("--- temporal assertions ---"));
-        assert!(s.contains("2 temporal assertion violation(s)"));
+        assert!(s.contains("2 temporal assertion entry(ies)"));
         assert!(s.contains("counter (nondecreasing)"));
         assert!(s.contains("load (steady_within"));
         // Non-temporal details must NOT bleed into the section.
         assert!(!s.contains("unrelated failure"));
+    }
+
+    /// Temporal-tagged Inconclusive details (e.g. zero-denominator
+    /// rate_within / ratio_within from temporal.rs's
+    /// push_inconclusive) must flow into the section alongside Fail
+    /// details. The section is reached on both Fail AND Inconclusive
+    /// verdict arms by the failure dumper; rendering only Fails
+    /// would silently drop the Inconclusive diagnostic when the
+    /// verdict arm is Inconclusive, losing the operator-visible
+    /// message that explains WHY the gate could not evaluate.
+    #[test]
+    fn format_temporal_assertions_section_renders_inconclusive_temporal_details() {
+        let mut r = crate::assert::AssertResult::pass();
+
+        r.record_inconclusive(AssertDetail::new(
+            DetailKind::Temporal,
+            "rate_within: zero-denominator at sample periodic_003",
+        ));
+        r.record_inconclusive(AssertDetail::new(
+            DetailKind::Temporal,
+            "ratio_within: zero-denominator at sample periodic_007",
+        ));
+        // Non-Temporal Inconclusive must NOT bleed into the section.
+        r.record_inconclusive(AssertDetail::new(
+            DetailKind::Benchmark,
+            "throughput parity inconclusive: zero cpu_time_ns",
+        ));
+        let s = format_temporal_assertions_section(&r);
+        assert!(s.contains("--- temporal assertions ---"));
+        assert!(s.contains("2 temporal assertion entry(ies)"));
+        assert!(s.contains("rate_within: zero-denominator"));
+        assert!(s.contains("ratio_within: zero-denominator"));
+        // Non-Temporal Inconclusive details must NOT bleed in.
+        assert!(!s.contains("throughput parity inconclusive"));
+    }
+
+    /// Mixed Fail + Inconclusive temporal entries surface in
+    /// emission order (Fail stream first, then Inconclusive
+    /// stream), matching the `failure_details().chain(inconclusive_details())`
+    /// iteration order in the implementation.
+    #[test]
+    fn format_temporal_assertions_section_chains_fail_then_inconclusive() {
+        let mut r = crate::assert::AssertResult::pass();
+
+        r.record_fail(AssertDetail::new(
+            DetailKind::Temporal,
+            "fail temporal entry",
+        ));
+        r.record_inconclusive(AssertDetail::new(
+            DetailKind::Temporal,
+            "inc temporal entry",
+        ));
+        let s = format_temporal_assertions_section(&r);
+        assert!(s.contains("2 temporal assertion entry(ies)"));
+        let fail_pos = s.find("fail temporal entry").unwrap();
+        let inc_pos = s.find("inc temporal entry").unwrap();
+        assert!(
+            fail_pos < inc_pos,
+            "Fail must render before Inconclusive (failure_details chained first): {s}"
+        );
     }
 }

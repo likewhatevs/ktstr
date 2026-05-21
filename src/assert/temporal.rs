@@ -31,7 +31,7 @@
 
 use crate::scenario::snapshot::{SnapshotError, SnapshotResult};
 
-use super::{AssertDetail, DetailKind, Verdict};
+use super::{AssertDetail, DetailKind, Outcome, Verdict};
 
 /// Per-sample column extracted from a
 /// [`SampleSeries`](crate::scenario::sample::SampleSeries). Each
@@ -525,11 +525,16 @@ where
             None => "<no-samples>".to_string(),
         };
         let (Some(earlier), Some(later)) = (self.earlier_value, self.later_value) else {
-            push_detail(
+            // INSTRUMENT-derived: one or both phases produced no
+            // samples, so there is no value to ratio against. The
+            // ratio cannot be computed; record Inconclusive rather
+            // than Fail to distinguish "no signal to evaluate" from
+            // "evaluated and exceeded ceiling."
+            push_inconclusive(
                 self.verdict,
                 format!(
-                    "{label_prefix}ratio_across_phases({:?}→{:?}) needs both phases — \
-                     earlier={earlier_str}, later={later_str}",
+                    "{label_prefix}ratio_across_phases({:?}→{:?}) inconclusive: \
+                     needs both phases — earlier={earlier_str}, later={later_str}",
                     self.earlier, self.later,
                 ),
             );
@@ -538,11 +543,19 @@ where
         let earlier_f: f64 = earlier.into();
         let later_f: f64 = later.into();
         if earlier_f == 0.0 {
-            push_detail(
+            // INSTRUMENT-derived: earlier baseline measured 0, so
+            // later/earlier is undefined. Record Inconclusive — the
+            // ceiling check has no signal to evaluate, neither pass
+            // (would silently green a phase pair with no baseline)
+            // nor fail (no actual ratio violation observed) is
+            // truthful. POLICY-derived zero baselines (a policy
+            // decision to compare against an intentional 0) are
+            // out of scope for this gate.
+            push_inconclusive(
                 self.verdict,
                 format!(
-                    "{label_prefix}ratio_across_phases({:?}→{:?}) earlier value is 0 \
-                     (no baseline to ratio against)",
+                    "{label_prefix}ratio_across_phases({:?}→{:?}) inconclusive: \
+                     earlier value is 0 (no baseline to ratio against)",
                     self.earlier, self.later,
                 ),
             );
@@ -656,11 +669,16 @@ pub trait PhaseMapExt<T> {
 ///
 /// For every phase present in BOTH `self` AND `other`, computes
 /// `self_value as f64 / (self_value + other_value) as f64`. When
-/// both values are zero (sum is zero), the fraction is `0.0`
-/// rather than NaN — the only sound choice when there's no signal
-/// to share. Phases present in only one input drop from the
+/// both values are zero (sum is zero), the phase is **dropped from
+/// the result** — there is no signal to share, and synthesizing
+/// `0.0` would let downstream `at_most` / `ratio_within` gates
+/// silently pass on a zero-event phase pair. Returning no entry
+/// surfaces the absence so the consumer can treat it as
+/// Inconclusive (the same shape as a phase only present in one
+/// input). Phases present in only one input also drop from the
 /// result, mirroring [`PhaseMapExt::zip_per_phase`]'s
-/// intersection-only semantics.
+/// intersection-only semantics; both drop conditions surface
+/// identically as "no entry for this phase."
 ///
 /// Targets the "cross-LLC dispatch fraction" idiom (`nr_cross /
 /// (nr_cross + nr_same)`) and similar share-of-total patterns.
@@ -669,8 +687,8 @@ pub trait PhaseMapExt<T> {
 /// call site; this trait owns the branch so test code expresses
 /// the metric in one chain.
 pub trait FracPair {
-    /// See trait-level doc for the safe-divide and intersection-only
-    /// semantics.
+    /// See trait-level doc for the zero-total drop and
+    /// intersection-only semantics.
     fn frac_pair(&self, other: &Self) -> std::collections::BTreeMap<crate::assert::Phase, f64>;
 }
 
@@ -678,7 +696,7 @@ impl FracPair for std::collections::BTreeMap<crate::assert::Phase, u64> {
     fn frac_pair(&self, other: &Self) -> std::collections::BTreeMap<crate::assert::Phase, f64> {
         self.iter()
             .filter_map(|(p, n)| {
-                other.get(p).map(|m| {
+                other.get(p).and_then(|m| {
                     // `saturating_add` guards against u64 overflow on
                     // long-running counter pairs (the realistic
                     // failure is two near-u64::MAX counter deltas;
@@ -687,12 +705,17 @@ impl FracPair for std::collections::BTreeMap<crate::assert::Phase, u64> {
                     // fraction `n / u64::MAX` ≈ 0.0 for non-MAX `n`
                     // and 1.0 for the saturating case, with no NaN.
                     let total = n.saturating_add(*m);
-                    let frac = if total > 0 {
-                        *n as f64 / total as f64
+                    if total == 0 {
+                        // Zero-total phase: no events observed in
+                        // either input. Drop the entry rather than
+                        // synthesize 0.0 so a downstream `at_most`
+                        // sees absence (= Inconclusive shape) instead
+                        // of a silent pass against any positive
+                        // threshold.
+                        None
                     } else {
-                        0.0
-                    };
-                    (*p, frac)
+                        Some((*p, *n as f64 / total as f64))
+                    }
                 })
             })
             .collect()
@@ -763,7 +786,7 @@ where
     /// hide a coverage gap, so the pattern uses `partial_cmp` and
     /// reports the offending sample distinctly.
     pub fn at_least(self, floor: T) -> &'v mut Verdict {
-        let pre_failures = temporal_failure_count(self.verdict);
+        let pre_outcomes = temporal_outcome_count(self.verdict);
         let label = self.field.label.as_str();
         let n = self.field.values.len();
         for (i, slot) in self.field.values.iter().enumerate() {
@@ -802,7 +825,7 @@ where
                 }
             }
         }
-        maybe_log_pass_temporal(self.verdict, pre_failures, || {
+        maybe_log_pass_temporal(self.verdict, pre_outcomes, || {
             format!("{label} (each.at_least {floor}): all {n} samples passed")
         });
         self.verdict
@@ -812,7 +835,7 @@ where
     /// NaN samples (on `T = f64`) report an incomparable failure
     /// for the same reason documented on [`Self::at_least`].
     pub fn at_most(self, ceiling: T) -> &'v mut Verdict {
-        let pre_failures = temporal_failure_count(self.verdict);
+        let pre_outcomes = temporal_outcome_count(self.verdict);
         let label = self.field.label.as_str();
         let n = self.field.values.len();
         for (i, slot) in self.field.values.iter().enumerate() {
@@ -851,7 +874,7 @@ where
                 }
             }
         }
-        maybe_log_pass_temporal(self.verdict, pre_failures, || {
+        maybe_log_pass_temporal(self.verdict, pre_outcomes, || {
             format!("{label} (each.at_most {ceiling}): all {n} samples passed")
         });
         self.verdict
@@ -871,7 +894,7 @@ where
             );
             return self.verdict;
         }
-        let pre_failures = temporal_failure_count(self.verdict);
+        let pre_outcomes = temporal_outcome_count(self.verdict);
         let n = self.field.values.len();
         for (i, slot) in self.field.values.iter().enumerate() {
             match slot {
@@ -915,7 +938,7 @@ where
                 }
             }
         }
-        maybe_log_pass_temporal(self.verdict, pre_failures, || {
+        maybe_log_pass_temporal(self.verdict, pre_outcomes, || {
             format!("{label} (each.between [{lo}, {hi}]): all {n} samples passed")
         });
         self.verdict
@@ -971,7 +994,7 @@ where
             ));
             return verdict;
         }
-        let pre_failures = temporal_failure_count(verdict);
+        let pre_outcomes = temporal_outcome_count(verdict);
         // Per-sample projection errors are NOT temporal failures —
         // they indicate the underlying field was missing on that
         // sample (e.g. placeholder report from a freeze-rendezvous
@@ -1057,7 +1080,7 @@ where
                 samples = skipped.join(", "),
             ));
         }
-        maybe_log_pass_temporal(verdict, pre_failures, || {
+        maybe_log_pass_temporal(verdict, pre_outcomes, || {
             format!(
                 "{label} ({pat}): all {n} samples passed",
                 label = self.label,
@@ -1096,7 +1119,7 @@ impl SeriesField<f64> {
             ));
             return verdict;
         }
-        let pre_failures = temporal_failure_count(verdict);
+        let pre_outcomes = temporal_outcome_count(verdict);
         // Per-sample projection errors are treated as GAPS — no
         // rate is computed across the gap. Log every gap with the
         // underlying error variant via a Note so a coverage
@@ -1133,11 +1156,12 @@ impl SeriesField<f64> {
             };
             let dt_ms = self.elapsed_ms[i + 1].saturating_sub(self.elapsed_ms[i]) as f64;
             if dt_ms <= 0.0 {
-                push_detail(
+                push_inconclusive(
                     verdict,
                     format!(
                         "{label} (rate_within): zero-time delta between sample {prev_tag} \
-                         (+{prev_elapsed}ms) and {tag} (+{elapsed_ms}ms) — cannot compute rate",
+                         (+{prev_elapsed}ms) and {tag} (+{elapsed_ms}ms) — denominator is \
+                         INSTRUMENT-derived; rate is neither pass nor fail",
                         label = self.label,
                         prev_tag = self.tags[i],
                         prev_elapsed = self.elapsed_ms[i],
@@ -1197,7 +1221,7 @@ impl SeriesField<f64> {
                 samples = gaps.join(", "),
             ));
         }
-        maybe_log_pass_temporal(verdict, pre_failures, || {
+        maybe_log_pass_temporal(verdict, pre_outcomes, || {
             format!(
                 "{label} (rate_within [{lo}, {hi}]): all {n} consecutive-pair rates within band",
                 label = self.label,
@@ -1232,7 +1256,7 @@ impl SeriesField<f64> {
             );
             return verdict;
         }
-        let pre_failures = temporal_failure_count(verdict);
+        let pre_outcomes = temporal_outcome_count(verdict);
         let mut active: Vec<(usize, f64)> = Vec::new();
         let mut skipped: Vec<String> = Vec::new();
         // Track whether any sample's elapsed_ms reached or exceeded
@@ -1315,7 +1339,7 @@ impl SeriesField<f64> {
                 );
             }
         }
-        maybe_log_pass_temporal(verdict, pre_failures, || {
+        maybe_log_pass_temporal(verdict, pre_outcomes, || {
             format!(
                 "{label} (steady_within mean {mean:.4} ±{pct:.1}%): all {n} post-warmup samples in band",
                 label = self.label,
@@ -1349,7 +1373,7 @@ impl SeriesField<f64> {
             );
             return verdict;
         }
-        let pre_failures = temporal_failure_count(verdict);
+        let pre_outcomes = temporal_outcome_count(verdict);
         // Pre-check: counting all successfully-projected samples
         // (within the deadline window) do we have enough evidence
         // to even attempt a 3-consecutive witness? When fewer
@@ -1460,7 +1484,7 @@ impl SeriesField<f64> {
                 ),
             );
         }
-        maybe_log_pass_temporal(verdict, pre_failures, || {
+        maybe_log_pass_temporal(verdict, pre_outcomes, || {
             let where_at = witness_idx
                 .map(|i| {
                     format!(
@@ -1519,7 +1543,7 @@ impl SeriesField<f64> {
             );
             return verdict;
         }
-        let pre_failures = temporal_failure_count(verdict);
+        let pre_outcomes = temporal_outcome_count(verdict);
         // Per-sample projection errors on either lhs or rhs are
         // treated as gaps — no ratio is computed across the pair.
         // Surface every gap with the underlying error variant
@@ -1563,11 +1587,11 @@ impl SeriesField<f64> {
                 }
             };
             if rhs == 0.0 {
-                push_detail(
+                push_inconclusive(
                     verdict,
                     format!(
                         "{label} (ratio_within): rhs == 0 at sample {tag} (+{elapsed_ms}ms) — \
-                         cannot compute ratio",
+                         denominator is INSTRUMENT-derived; ratio is neither pass nor fail",
                         label = self.label,
                         tag = self.tags[i],
                         elapsed_ms = self.elapsed_ms[i],
@@ -1600,7 +1624,7 @@ impl SeriesField<f64> {
                 samples = gaps.join(", "),
             ));
         }
-        maybe_log_pass_temporal(verdict, pre_failures, || {
+        maybe_log_pass_temporal(verdict, pre_outcomes, || {
             format!(
                 "{label} (ratio_within {other} [{lo}, {hi}]): all {n} pair ratios in band",
                 label = self.label,
@@ -1618,7 +1642,7 @@ impl SeriesField<bool> {
     /// invariants — e.g. "scheduler is alive at every periodic
     /// boundary" projected as `snap.var("scheduler_alive").as_bool()`.
     pub fn always_true<'v>(&self, verdict: &'v mut Verdict) -> &'v mut Verdict {
-        let pre_failures = temporal_failure_count(verdict);
+        let pre_outcomes = temporal_outcome_count(verdict);
         for (i, slot) in self.values.iter().enumerate() {
             match slot {
                 Ok(v) => {
@@ -1649,7 +1673,7 @@ impl SeriesField<bool> {
                 }
             }
         }
-        maybe_log_pass_temporal(verdict, pre_failures, || {
+        maybe_log_pass_temporal(verdict, pre_outcomes, || {
             format!(
                 "{label} (always_true): all {n} samples true",
                 label = self.label,
@@ -1666,41 +1690,66 @@ fn push_detail(verdict: &mut Verdict, message: String) {
         .record_fail(AssertDetail::new(DetailKind::Temporal, message));
 }
 
-/// Count `DetailKind::Temporal` Fail outcomes in `verdict`'s
-/// underlying result. Used by [`maybe_log_pass_temporal`] to gate
-/// the positive-confirmation log on "this pattern added zero
-/// Temporal failures." Vacuous-pattern and projection-error skip
+/// Inconclusive-arm sibling of [`push_detail`]. Records one
+/// `Outcome::Inconclusive` with a [`DetailKind::Temporal`] detail.
+/// Use for INSTRUMENT-derived zero-denominator paths — a
+/// zero-time-delta between two consecutive samples in
+/// [`SeriesField::rate_within`] or a zero rhs in
+/// [`SeriesField::ratio_within`] cannot be computed, so the
+/// verdict is neither pass nor fail (see [`Outcome`] doc's
+/// INSTRUMENT vs POLICY carve-out).
+fn push_inconclusive(verdict: &mut Verdict, message: String) {
+    verdict
+        .result_mut()
+        .record_inconclusive(AssertDetail::new(DetailKind::Temporal, message));
+}
+
+/// Count `DetailKind::Temporal` Fail + Inconclusive outcomes in
+/// `verdict`'s underlying result. Used by
+/// [`maybe_log_pass_temporal`] to gate the positive-confirmation
+/// log on "this pattern added zero Temporal Fail or Inconclusive
+/// outcomes." Inconclusives count because a pattern that emitted
+/// only Inconclusives is not in a state where logging "passed"
+/// would be truthful. Vacuous-pattern and projection-error skip
 /// notes live on `AssertResult::info_notes` (a structurally-separate
 /// field from outcomes) and are therefore naturally excluded from
-/// this count, so a pattern that emits notes but no failure
-/// outcomes still trips the positive log.
-fn temporal_failure_count(verdict: &Verdict) -> usize {
+/// this count, so a pattern that emits notes but no Fail or
+/// Inconclusive outcomes still trips the positive log.
+fn temporal_outcome_count(verdict: &Verdict) -> usize {
     verdict
         .result()
-        .failure_details()
-        .filter(|d| matches!(d.kind, DetailKind::Temporal))
+        .outcomes
+        .iter()
+        .filter(|o| {
+            matches!(
+                o,
+                Outcome::Fail(d) | Outcome::Inconclusive(d) if matches!(d.kind, DetailKind::Temporal)
+            )
+        })
         .count()
 }
 
-/// Positive-confirmation mirror of [`push_detail`]. Emits a
-/// `tracing::info!` event naming the temporal pattern and its
-/// sample count IFF [`Verdict::log_passes`] is on AND the calling
-/// pattern added no `DetailKind::Temporal` failures over its run
-/// (compared via `pre_failures` captured at pattern entry via
-/// [`temporal_failure_count`]).
+/// Positive-confirmation mirror of [`push_detail`] /
+/// [`push_inconclusive`]. Emits a `tracing::info!` event naming
+/// the temporal pattern and its sample count IFF
+/// [`Verdict::log_passes`] is on AND the calling pattern added no
+/// `DetailKind::Temporal` Fail or Inconclusive outcomes over its
+/// run (compared via `pre_outcomes` captured at pattern entry via
+/// [`temporal_outcome_count`]).
 ///
 /// The pre/post gate is what makes this a positive confirmation —
-/// a pattern that emitted a [`push_detail`] mid-run stays silent
-/// here so a partial failure does not log a misleading "passed"
-/// event. The closure constructs the message only when both gates
-/// pass, so the `format!` cost is paid only on the explicit
-/// opt-in + a clean pattern run.
+/// a pattern that emitted a [`push_detail`] or [`push_inconclusive`]
+/// mid-run stays silent here so a partial failure or inconclusive
+/// does not log a misleading "passed" event. The closure
+/// constructs the message only when both gates pass, so the
+/// `format!` cost is paid only on the explicit opt-in + a clean
+/// pattern run.
 fn maybe_log_pass_temporal<F: FnOnce() -> String>(
     verdict: &Verdict,
-    pre_failures: usize,
+    pre_outcomes: usize,
     message: F,
 ) {
-    if verdict.log_passes() && temporal_failure_count(verdict) == pre_failures {
+    if verdict.log_passes() && temporal_outcome_count(verdict) == pre_outcomes {
         let m = message();
         tracing::info!(target: "ktstr::assert::temporal", "{m}");
     }
@@ -1733,7 +1782,7 @@ mod tests {
         let f = synthetic_field("counter", vec![(100, 1u64), (200, 2u64), (300, 3u64)]);
         let mut v = Verdict::new();
         f.nondecreasing(&mut v);
-        assert!(v.passed());
+        assert!(v.is_pass());
     }
 
     #[test]
@@ -1762,7 +1811,7 @@ mod tests {
         let f = synthetic_field("ticks", vec![(100, 1.0f64), (200, 2.0f64), (300, 3.0f64)]);
         let mut v = Verdict::new();
         f.rate_within(&mut v, 0.005, 0.02);
-        assert!(v.passed());
+        assert!(v.is_pass());
     }
 
     #[test]
@@ -1770,7 +1819,41 @@ mod tests {
         let f = synthetic_field("ticks", vec![(100, 1.0f64), (200, 100.0f64)]);
         let mut v = Verdict::new();
         f.rate_within(&mut v, 0.0, 0.5);
-        assert!(!v.passed());
+        assert!(!v.is_pass());
+    }
+
+    /// A zero-time delta between two consecutive samples is
+    /// INSTRUMENT-derived (the periodic monitor happened to emit
+    /// two samples with the same elapsed_ms — typically a
+    /// missed-tick coalescence). rate_within must record this as
+    /// Inconclusive, NOT Fail, so a non-measurable interval cannot
+    /// silently flip a real-pass workload into a false-fail. Pins
+    /// the zero-denominator → Inconclusive contract on the rate
+    /// pattern.
+    #[test]
+    fn rate_within_zero_dt_records_inconclusive() {
+        let f = synthetic_field("ticks", vec![(100, 1.0f64), (100, 5.0f64)]);
+        let mut v = Verdict::new();
+        f.rate_within(&mut v, 0.0, 100.0);
+        let r = v.into_result();
+        assert!(
+            r.is_inconclusive(),
+            "zero-dt rate must record Inconclusive: {:?}",
+            r.outcomes,
+        );
+        assert!(
+            !r.is_fail(),
+            "zero-dt is INSTRUMENT-derived; must NOT record Fail: {:?}",
+            r.outcomes,
+        );
+        assert!(
+            r.inconclusive_details()
+                .any(|d| d.kind == DetailKind::Temporal
+                    && d.message.contains("INSTRUMENT-derived")),
+            "inconclusive detail must surface with Temporal kind and \
+             INSTRUMENT-derived wording: {:?}",
+            r.outcomes,
+        );
     }
 
     #[test]
@@ -1788,7 +1871,7 @@ mod tests {
         );
         let mut v = Verdict::new();
         f.steady_within(&mut v, 250, 0.01);
-        assert!(v.passed(), "{:?}", v.into_result().outcomes);
+        assert!(v.is_pass(), "{:?}", v.into_result().outcomes);
     }
 
     #[test]
@@ -1796,7 +1879,7 @@ mod tests {
         let f = synthetic_field("util", vec![(300, 10.0f64), (400, 10.0f64), (500, 50.0f64)]);
         let mut v = Verdict::new();
         f.steady_within(&mut v, 0, 0.10);
-        assert!(!v.passed());
+        assert!(!v.is_pass());
     }
 
     #[test]
@@ -1813,7 +1896,7 @@ mod tests {
         );
         let mut v = Verdict::new();
         f.converges_to(&mut v, 1.0, 0.5, 1000);
-        assert!(v.passed());
+        assert!(v.is_pass());
     }
 
     #[test]
@@ -1821,7 +1904,7 @@ mod tests {
         let f = synthetic_field("load", vec![(100, 10.0f64), (200, 10.0f64), (300, 10.0f64)]);
         let mut v = Verdict::new();
         f.converges_to(&mut v, 1.0, 0.5, 500);
-        assert!(!v.passed());
+        assert!(!v.is_pass());
     }
 
     #[test]
@@ -1829,7 +1912,7 @@ mod tests {
         let f = synthetic_field("alive", vec![(100, true), (200, true)]);
         let mut v = Verdict::new();
         f.always_true(&mut v);
-        assert!(v.passed());
+        assert!(v.is_pass());
     }
 
     #[test]
@@ -1837,7 +1920,7 @@ mod tests {
         let f = synthetic_field("alive", vec![(100, true), (200, false)]);
         let mut v = Verdict::new();
         f.always_true(&mut v);
-        assert!(!v.passed());
+        assert!(!v.is_pass());
     }
 
     #[test]
@@ -1846,7 +1929,7 @@ mod tests {
         let rhs = synthetic_field("rhs", vec![(100, 5.0f64), (200, 10.0f64), (300, 15.0f64)]);
         let mut v = Verdict::new();
         lhs.ratio_within(&mut v, &rhs, 1.5, 2.5);
-        assert!(v.passed());
+        assert!(v.is_pass());
     }
 
     #[test]
@@ -1855,7 +1938,42 @@ mod tests {
         let rhs = synthetic_field("rhs", vec![(100, 5.0f64), (200, 10.0f64)]);
         let mut v = Verdict::new();
         lhs.ratio_within(&mut v, &rhs, 1.5, 2.5);
-        assert!(!v.passed());
+        assert!(!v.is_pass());
+    }
+
+    /// A zero rhs at any sample is INSTRUMENT-derived (the
+    /// projected value happened to be zero — a guest counter that
+    /// reset, an aggregator that produced a zero bucket). The
+    /// ratio_within pattern must record this as Inconclusive, NOT
+    /// Fail, so a non-evaluable ratio cannot silently flip a
+    /// real-pass workload into a false-fail. Pins the
+    /// zero-denominator → Inconclusive contract on the ratio
+    /// pattern.
+    #[test]
+    fn ratio_within_zero_rhs_records_inconclusive() {
+        let lhs = synthetic_field("lhs", vec![(100, 10.0f64)]);
+        let rhs = synthetic_field("rhs", vec![(100, 0.0f64)]);
+        let mut v = Verdict::new();
+        lhs.ratio_within(&mut v, &rhs, 1.5, 2.5);
+        let r = v.into_result();
+        assert!(
+            r.is_inconclusive(),
+            "zero-rhs ratio must record Inconclusive: {:?}",
+            r.outcomes,
+        );
+        assert!(
+            !r.is_fail(),
+            "zero rhs is INSTRUMENT-derived; must NOT record Fail: {:?}",
+            r.outcomes,
+        );
+        assert!(
+            r.inconclusive_details()
+                .any(|d| d.kind == DetailKind::Temporal
+                    && d.message.contains("INSTRUMENT-derived")),
+            "inconclusive detail must surface with Temporal kind and \
+             INSTRUMENT-derived wording: {:?}",
+            r.outcomes,
+        );
     }
 
     #[test]
@@ -1863,7 +1981,7 @@ mod tests {
         let f = synthetic_field("counter", vec![(100, 5u64), (200, 7u64)]);
         let mut v = Verdict::new();
         f.each(&mut v).at_least(3u64);
-        assert!(v.passed());
+        assert!(v.is_pass());
     }
 
     #[test]
@@ -1871,7 +1989,7 @@ mod tests {
         let f = synthetic_field("counter", vec![(100, 5u64), (200, 99u64)]);
         let mut v = Verdict::new();
         f.each(&mut v).at_most(10u64);
-        assert!(!v.passed());
+        assert!(!v.is_pass());
     }
 
     #[test]
@@ -2266,9 +2384,9 @@ mod tests {
 
     /// nondecreasing skips placeholder samples (is_placeholder=true)
     /// with a Note rather than treating them as monotonicity
-    /// regressions or generic projection errors. Verifies F10:
-    /// placeholder reports must NOT silently register as zero
-    /// progress on a counter.
+    /// regressions or generic projection errors. Placeholder
+    /// reports must NOT silently register as zero progress on a
+    /// counter.
     #[test]
     fn nondecreasing_skips_placeholder_samples() {
         use crate::monitor::dump::FailureDumpReport;
@@ -2395,7 +2513,7 @@ mod tests {
         let f = synthetic_field("alive", vec![(100, true), (200, true), (300, true)]);
         let mut v = Verdict::new().with_log_passes(true);
         f.always_true(&mut v);
-        assert!(v.passed());
+        assert!(v.is_pass());
         assert!(
             logs_contain("alive (always_true): all 3 samples true"),
             "positive-confirmation log must name the label, pattern, and sample count",
@@ -2404,7 +2522,7 @@ mod tests {
 
     /// A failed temporal pattern stays silent on the positive
     /// log even when log_passes is on — the pre/post
-    /// `temporal_failure_count` gate ensures a partial-failure
+    /// `temporal_outcome_count` gate ensures a partial-failure
     /// run does not log a misleading "all passed" event.
     #[tracing_test::traced_test]
     #[test]
@@ -2412,7 +2530,7 @@ mod tests {
         let f = synthetic_field("alive", vec![(100, true), (200, false)]);
         let mut v = Verdict::new().with_log_passes(true);
         f.always_true(&mut v);
-        assert!(!v.passed());
+        assert!(!v.is_pass());
         assert!(
             !logs_contain("samples true"),
             "fail arm must NOT emit the positive-confirmation log",
@@ -3051,8 +3169,11 @@ mod tests {
     }
 
     #[test]
-    fn ratio_across_phases_missing_phase_fails_with_clear_detail() {
-        // Step[1] has no samples → fail with "needs both phases".
+    fn ratio_across_phases_missing_phase_is_inconclusive_with_clear_detail() {
+        // Step[1] has no samples → Inconclusive with "needs both
+        // phases" (the ratio cannot be computed; neither pass nor
+        // fail is truthful per the INSTRUMENT-derived zero-signal
+        // contract).
         let f = SeriesField::<f64>::from_parts_with_phases(
             "dispatches",
             vec!["t0".into()],
@@ -3068,19 +3189,28 @@ mod tests {
         )
         .at_most(0.85);
         let r = v.into_result();
-        assert!(r.is_fail());
         assert!(
-            r.failure_details()
+            r.is_inconclusive(),
+            "expected Inconclusive, got {:?}",
+            r.outcomes
+        );
+        assert!(
+            r.inconclusive_details()
                 .any(|d| d.message.contains("needs both phases")
                     && d.message.contains("later=<no-samples>")),
-            "expected `needs both phases` detail naming the missing side, got {:?}",
-            r.failure_details().collect::<Vec<_>>(),
+            "expected `needs both phases` Inconclusive reason naming the missing side, got {:?}",
+            r.inconclusive_details().collect::<Vec<_>>(),
         );
     }
 
     #[test]
-    fn ratio_across_phases_zero_baseline_fails_with_clear_detail() {
-        // earlier=0 → fail with "earlier value is 0", not div-by-zero.
+    fn ratio_across_phases_zero_baseline_is_inconclusive_with_clear_detail() {
+        // earlier=0 → Inconclusive with "earlier value is 0".
+        // earlier_f == 0 means the baseline measured zero; the
+        // ratio later/earlier is undefined (INSTRUMENT-derived
+        // zero denominator). Pre-#434 this was Fail; post-#434
+        // the gate cannot evaluate so the verdict is neither
+        // pass nor fail.
         let f = SeriesField::<f64>::from_parts_with_phases(
             "dispatches",
             vec!["t0".into(), "t1".into()],
@@ -3099,13 +3229,17 @@ mod tests {
         )
         .at_most(0.85);
         let r = v.into_result();
-        assert!(r.is_fail());
         assert!(
-            r.failure_details()
+            r.is_inconclusive(),
+            "expected Inconclusive, got {:?}",
+            r.outcomes
+        );
+        assert!(
+            r.inconclusive_details()
                 .any(|d| d.message.contains("earlier value is 0")
                     && d.message.contains("no baseline")),
-            "expected `earlier value is 0` detail, got {:?}",
-            r.failure_details().collect::<Vec<_>>(),
+            "expected `earlier value is 0` Inconclusive reason, got {:?}",
+            r.inconclusive_details().collect::<Vec<_>>(),
         );
     }
 
@@ -3165,7 +3299,7 @@ mod tests {
     }
 
     #[test]
-    fn phasemap_ratio_across_phases_missing_phase_fails_with_clear_detail() {
+    fn phasemap_ratio_across_phases_missing_phase_is_inconclusive_with_clear_detail() {
         let mut m: std::collections::BTreeMap<crate::assert::Phase, f64> =
             std::collections::BTreeMap::new();
         m.insert(crate::assert::Phase::step(0), 10.0);
@@ -3179,18 +3313,22 @@ mod tests {
         )
         .at_most(0.85);
         let r = v.into_result();
-        assert!(r.is_fail());
         assert!(
-            r.failure_details()
+            r.is_inconclusive(),
+            "expected Inconclusive, got {:?}",
+            r.outcomes
+        );
+        assert!(
+            r.inconclusive_details()
                 .any(|d| d.message.contains("needs both phases")
                     && d.message.contains("later=<no-samples>")),
-            "expected needs-both-phases detail, got {:?}",
-            r.failure_details().collect::<Vec<_>>(),
+            "expected needs-both-phases Inconclusive reason, got {:?}",
+            r.inconclusive_details().collect::<Vec<_>>(),
         );
     }
 
     #[test]
-    fn phasemap_ratio_across_phases_zero_baseline_fails_with_clear_detail() {
+    fn phasemap_ratio_across_phases_zero_baseline_is_inconclusive_with_clear_detail() {
         let mut m: std::collections::BTreeMap<crate::assert::Phase, f64> =
             std::collections::BTreeMap::new();
         m.insert(crate::assert::Phase::step(0), 0.0);
@@ -3204,19 +3342,26 @@ mod tests {
         )
         .at_most(0.85);
         let r = v.into_result();
-        assert!(r.is_fail());
         assert!(
-            r.failure_details()
+            r.is_inconclusive(),
+            "expected Inconclusive, got {:?}",
+            r.outcomes
+        );
+        assert!(
+            r.inconclusive_details()
                 .any(|d| d.message.contains("earlier value is 0")
                     && d.message.contains("no baseline")),
-            "expected zero-baseline detail, got {:?}",
-            r.failure_details().collect::<Vec<_>>(),
+            "expected zero-baseline Inconclusive reason, got {:?}",
+            r.inconclusive_details().collect::<Vec<_>>(),
         );
     }
 
     #[test]
-    fn phasemap_ratio_across_phases_disjoint_phase_keys_fails_cleanly() {
+    fn phasemap_ratio_across_phases_disjoint_phase_keys_is_inconclusive_cleanly() {
         // BTreeMap is non-empty but neither queried phase exists.
+        // Both sides yield <no-samples> → Inconclusive (neither
+        // pass nor fail can be evaluated when both inputs are
+        // missing).
         let mut m: std::collections::BTreeMap<crate::assert::Phase, f64> =
             std::collections::BTreeMap::new();
         m.insert(crate::assert::Phase::BASELINE, 7.0);
@@ -3230,14 +3375,18 @@ mod tests {
         )
         .at_most(0.85);
         let r = v.into_result();
-        assert!(r.is_fail());
         assert!(
-            r.failure_details()
+            r.is_inconclusive(),
+            "expected Inconclusive, got {:?}",
+            r.outcomes
+        );
+        assert!(
+            r.inconclusive_details()
                 .any(|d| d.message.contains("needs both phases")
                     && d.message.contains("earlier=<no-samples>")
                     && d.message.contains("later=<no-samples>")),
-            "both phases absent must surface in detail, got {:?}",
-            r.failure_details().collect::<Vec<_>>(),
+            "both phases absent must surface in Inconclusive reason, got {:?}",
+            r.inconclusive_details().collect::<Vec<_>>(),
         );
     }
 
@@ -3422,11 +3571,18 @@ mod tests {
         );
     }
 
-    /// When both inputs sum to zero for a phase, `frac_pair`
-    /// MUST yield `0.0` (not NaN). The only sound choice when
-    /// there's no signal to share.
+    /// When both inputs sum to zero for a phase, `frac_pair` MUST
+    /// drop the entry rather than synthesize `0.0`. A synthesized
+    /// `0.0` would slip past any downstream `at_most(thr > 0)` gate
+    /// without ever observing the phase pair carries no signal —
+    /// the silent-pass class of bug `Outcome::Inconclusive` was
+    /// introduced to prevent. Dropping the entry surfaces the
+    /// absence so the consumer (typically a `ratio_within` /
+    /// `at_most` chain over the resulting map) treats the missing
+    /// phase the same as one only present on a single side —
+    /// Inconclusive at the comparator boundary, never a silent pass.
     #[test]
-    fn frac_pair_zero_total_yields_zero_not_nan() {
+    fn frac_pair_zero_total_drops_entry_no_silent_pass() {
         let mut a: std::collections::BTreeMap<crate::assert::Phase, u64> =
             std::collections::BTreeMap::new();
         a.insert(crate::assert::Phase::step(0), 0);
@@ -3434,8 +3590,36 @@ mod tests {
             std::collections::BTreeMap::new();
         b.insert(crate::assert::Phase::step(0), 0);
         let frac = a.frac_pair(&b);
+        assert!(
+            !frac.contains_key(&crate::assert::Phase::step(0)),
+            "zero/(zero+zero) must drop entry, not synthesize 0.0; got {frac:?}",
+        );
+        assert!(
+            frac.is_empty(),
+            "no phases survived → empty map; got {frac:?}"
+        );
+    }
+
+    /// One zero side plus a positive other side is NOT a zero-total
+    /// pair — the total is positive and the fraction is `0/(0+m) =
+    /// 0.0` (a real measurement of "self has zero share"). The
+    /// entry MUST be retained because the signal is real even
+    /// though the value is zero. Pins the boundary between
+    /// "real-zero" (kept) and "no-signal" (dropped).
+    #[test]
+    fn frac_pair_zero_self_positive_other_keeps_real_zero() {
+        let mut a: std::collections::BTreeMap<crate::assert::Phase, u64> =
+            std::collections::BTreeMap::new();
+        a.insert(crate::assert::Phase::step(0), 0);
+        let mut b: std::collections::BTreeMap<crate::assert::Phase, u64> =
+            std::collections::BTreeMap::new();
+        b.insert(crate::assert::Phase::step(0), 100);
+        let frac = a.frac_pair(&b);
         let v = frac[&crate::assert::Phase::step(0)];
-        assert_eq!(v, 0.0, "zero/(zero+zero) must collapse to 0.0, got {v}");
+        assert_eq!(
+            v, 0.0,
+            "0/(0+100) is a real-zero measurement, not no-signal; got {v}",
+        );
         assert!(!v.is_nan(), "frac_pair must never produce NaN");
     }
 

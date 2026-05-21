@@ -365,6 +365,41 @@ ktstr_test 'two_cgroups' [topo=1n1l2c1t] failed:
   cg1: workers=2 cpus=2 spread=12.3% gap=890ms migrations=4 iter=14870
 ```
 
+### Exit codes
+
+Per-test process exit codes project the
+`Fail > Inconclusive > Pass > Skip` verdict lattice to three
+values. CI gates and dashboard aggregators triage runs by
+exit code:
+
+| Code | Verdict      | Meaning                                                                                                                                                |
+|------|--------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `0`  | Pass / Skip  | Test passed, or the test never ran (host topology insufficient, resource contention).                                                                  |
+| `1`  | Fail         | At least one assertion failed, OR `expect_err = true` and the test produced a Pass / Inconclusive (an `expect_err` test whose gate could not evaluate is unsatisfied just as it would be on a Pass). |
+| `2`  | Inconclusive | A zero-denominator ratio gate could not evaluate — neither pass nor fail is truthful.                                                                  |
+
+Exit code `2` is distinct from `1` so CI gates can treat
+"could not evaluate" (often a workload that produced no signal —
+zero iterations, zero pages, zero wake events) separately from
+"evaluated and regressed." The constants are exposed as
+`ktstr::prelude::{EXIT_PASS, EXIT_FAIL, EXIT_INCONCLUSIVE}`
+for tooling that drives the harness programmatically.
+
+See the [verdict outcomes guide](doc/guide/src/concepts/checking.md#verdict-outcomes)
+for the full four-state lattice (`Fail > Inconclusive > Pass > Skip`)
+and CI-gate patterns.
+
+Tests that have a reason to accept an Inconclusive arm as
+not-a-failure (e.g. exploratory benchmarks whose ratio gate may
+legitimately see no signal under certain host topologies) can
+opt in with `#[ktstr_test(allow_inconclusive)]`. The dispatch
+layer routes that test's Inconclusive verdict to exit code `0`
+instead of `2`. Inconclusive is still recorded in the sidecar
+and rendered in the failure dump — the flag only relaxes the
+per-test exit-code projection. `expect_err` still dominates: an
+`expect_err` test whose result is Inconclusive remains exit `1`
+regardless of `allow_inconclusive`.
+
 ### cargo-ktstr subcommands
 
 `cargo ktstr` wraps the full workflow and has subcommands beyond

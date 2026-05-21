@@ -31,15 +31,21 @@
 //!
 //! The pool is loaded via
 //! [`ktstr::test_support::collect_pool`], which walks the
-//! sidecar root + one level of per-job subdirectories. Sidecars
-//! are filtered by `!passed && !skipped` — a skipped run is not
-//! a failure (the test refused to execute), and a passed run is
-//! not a candidate for re-running. The `!skipped` clause is
-//! defensive: per the SidecarResult contract at
-//! `src/test_support/sidecar/mod.rs:179-185`, a skipped sidecar
-//! always carries `passed = true`, so `!passed` alone already
-//! excludes skips; keeping `!skipped` guards against a future
-//! contract change that decouples those two fields.
+//! sidecar root + one level of per-job subdirectories.
+//! [`select_failed_names`] filters on
+//! [`ktstr::test_support::SidecarResult::is_fail`], which
+//! evaluates `!passed && !skipped && !inconclusive` — Pass,
+//! Skip, and Inconclusive are all excluded from the replay
+//! queue. Inconclusive runs are excluded because a
+//! zero-denominator gate produced no signal, so re-running the
+//! same scenario would just reproduce the non-measurement (see
+//! the function-level doc on `select_failed_names` for the full
+//! rationale). The four mutually-exclusive bits `(passed,
+//! skipped, inconclusive, fail)` are pinned by the SidecarResult
+//! contract; `write_skip_sidecar` emits a Skip row as
+//! `passed=false, skipped=true, inconclusive=false`, so a Skip
+//! is correctly excluded by both the `!skipped` and `!passed`
+//! conjuncts of `is_fail`.
 //!
 //! ## Filter expression shape
 //!
@@ -238,17 +244,28 @@ pub(crate) fn run_replay(dir: Option<&Path>, filter: Option<&str>, exec: bool) -
 /// the silent-drop failure mode this surface exists to prevent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReplayOutcome {
-    /// EVERY post-replay sidecar for the test_name reports
-    /// `passed=true && !skipped`. Either the fix landed
-    /// between the original run and this replay, or the test
-    /// was passing intermittently (flake) and now passes.
+    /// EVERY post-replay sidecar for the test_name reports a real
+    /// pass (`passed=true && !skipped && !inconclusive`). Either
+    /// the fix landed between the original run and this replay, or
+    /// the test was passing intermittently (flake) and now passes.
     /// Operator sees a green signal here.
     Fixed,
-    /// EVERY post-replay sidecar for the test_name reports
-    /// `!passed || skipped`. The load-bearing case the replay
+    /// EVERY post-replay sidecar for the test_name reports a
+    /// non-pass that is NOT inconclusive (`!passed || skipped`,
+    /// and not `inconclusive`). The load-bearing case the replay
     /// command exists to surface: a regression that survived
     /// the operator's change.
     Persistent,
+    /// EVERY post-replay sidecar for the test_name reports
+    /// `inconclusive = true`. The replay produced no signal the
+    /// gate could evaluate — e.g. every variant hit a
+    /// zero-denominator ratio. Distinct from [`Self::Persistent`]
+    /// (which means the gate ran and failed) and from
+    /// [`Self::Fixed`] (which means the gate ran and passed):
+    /// operator cannot conclude the fix worked, only that the
+    /// replay could not measure. The triage signal is "re-run
+    /// against a workload that produces the missing signal."
+    Inconclusive,
     /// Test_name has no post-replay sidecar. Three plausible
     /// causes the operator should triage in order:
     /// - The test was removed from the suite between runs.
@@ -260,22 +277,32 @@ pub(crate) enum ReplayOutcome {
     /// causes for the operator.
     Dropped,
     /// Test_name has multiple post-replay sidecars and they
-    /// DISAGREE — at least one passed and at least one failed.
-    /// Common when a parameterized test runs across topology
-    /// variants and only some variants reproduce the
-    /// regression. The operator MUST drill in to see which
-    /// variant is still red; surfacing this as `Fixed` would
-    /// silently hide the failing variant.
+    /// DISAGREE — at least two of [`fixed_count`/`persistent_count`/
+    /// `inconclusive_count`] are non-zero. Common when a
+    /// parameterized test runs across topology variants and only
+    /// some variants reproduce the regression or produce the
+    /// signal. The operator MUST drill in to see which variant
+    /// landed in which bucket; surfacing this as `Fixed` would
+    /// silently hide failing or inconclusive variants.
     ///
     /// Never collapse variant disagreement — that would silently
     /// hide a failing variant behind a passing one.
+    ///
+    /// [`fixed_count`]: ReplayOutcome::Mixed::fixed_count
+    /// [`persistent_count`]: ReplayOutcome::Mixed::persistent_count
+    /// [`inconclusive_count`]: ReplayOutcome::Mixed::inconclusive_count
     Mixed {
         /// Count of post-replay sidecars for this test_name
-        /// that passed.
+        /// that passed (real `passed=true && !skipped &&
+        /// !inconclusive`).
         fixed_count: usize,
         /// Count of post-replay sidecars for this test_name
-        /// that failed or skipped.
+        /// that failed or were skipped (non-pass, non-inconclusive).
         persistent_count: usize,
+        /// Count of post-replay sidecars for this test_name
+        /// that were inconclusive (zero-denominator gate; the
+        /// signal needed to evaluate was absent).
+        inconclusive_count: usize,
     },
 }
 
@@ -288,17 +315,25 @@ pub(crate) enum ReplayOutcome {
 /// scheduler variant for a name is visible. Then for each
 /// queued name:
 /// - Empty group → [`ReplayOutcome::Dropped`]
-/// - All variants passed && !skipped → [`ReplayOutcome::Fixed`]
-/// - All variants failed/skipped → [`ReplayOutcome::Persistent`]
-/// - Variants disagree → [`ReplayOutcome::Mixed`] carrying
-///   per-side counts so the operator sees the disagreement
-///   instead of an erroneously-green verdict.
+/// - All variants real pass → [`ReplayOutcome::Fixed`]
+/// - All variants real fail/skip (not inconclusive) →
+///   [`ReplayOutcome::Persistent`]
+/// - All variants inconclusive → [`ReplayOutcome::Inconclusive`]
+/// - Variants disagree across the three buckets →
+///   [`ReplayOutcome::Mixed`] carrying per-bucket counts so the
+///   operator sees the disagreement instead of an erroneously-
+///   green or erroneously-red verdict.
 ///
 /// The Mixed case is the load-bearing addition over a naive
 /// "any-variant-fixed" semantic: collapsing variant
 /// disagreement to Fixed is a silent drop — a parameterized
 /// test where variant A is fixed and variant B is still red
-/// would silently report green.
+/// would silently report green. The Inconclusive variant
+/// addition keeps zero-denominator runs from masquerading as
+/// Persistent regressions — a replay that landed in a workload
+/// with no measurable signal is not a fix-failure, just a
+/// non-measurement, and the operator needs to know the
+/// difference to triage.
 pub(crate) fn classify_replay<'a>(
     queued: &'a BTreeSet<&'a str>,
     post_pool: &'a [ktstr::test_support::SidecarResult],
@@ -313,17 +348,18 @@ pub(crate) fn classify_replay<'a>(
             let outcome = match by_name.get(name) {
                 None => ReplayOutcome::Dropped,
                 Some(variants) => {
-                    let fixed_count = variants
-                        .iter()
-                        .filter(|sc| sc.passed && !sc.skipped)
-                        .count();
-                    let persistent_count = variants.len() - fixed_count;
-                    match (fixed_count, persistent_count) {
-                        (n, 0) if n > 0 => ReplayOutcome::Fixed,
-                        (0, n) if n > 0 => ReplayOutcome::Persistent,
+                    let inconclusive_count =
+                        variants.iter().filter(|sc| sc.is_inconclusive()).count();
+                    let fixed_count = variants.iter().filter(|sc| sc.is_pass()).count();
+                    let persistent_count = variants.len() - fixed_count - inconclusive_count;
+                    match (fixed_count, persistent_count, inconclusive_count) {
+                        (n, 0, 0) if n > 0 => ReplayOutcome::Fixed,
+                        (0, n, 0) if n > 0 => ReplayOutcome::Persistent,
+                        (0, 0, n) if n > 0 => ReplayOutcome::Inconclusive,
                         _ => ReplayOutcome::Mixed {
                             fixed_count,
                             persistent_count,
+                            inconclusive_count,
                         },
                     }
                 }
@@ -342,24 +378,45 @@ pub(crate) fn classify_replay<'a>(
 /// keep the diff short on healthy days; the operator who wants
 /// per-test FIXED detail can grep the live nextest output above.
 fn render_outcome_diff(outcomes: &BTreeMap<&str, ReplayOutcome>) {
-    let (mut fixed, mut persistent, mut dropped, mut mixed) = (0usize, 0usize, 0usize, 0usize);
+    let (mut fixed, mut persistent, mut inconclusive, mut dropped, mut mixed) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
     for o in outcomes.values() {
         match o {
             ReplayOutcome::Fixed => fixed += 1,
             ReplayOutcome::Persistent => persistent += 1,
+            ReplayOutcome::Inconclusive => inconclusive += 1,
             ReplayOutcome::Dropped => dropped += 1,
             ReplayOutcome::Mixed { .. } => mixed += 1,
         }
     }
     eprintln!();
     eprintln!(
-        "ktstr replay: {fixed} FIXED, {persistent} PERSISTENT, {mixed} MIXED, {dropped} DROPPED",
+        "ktstr replay: {fixed} FIXED, {persistent} PERSISTENT, \
+         {inconclusive} INCONCLUSIVE, {mixed} MIXED, {dropped} DROPPED",
     );
-    if persistent > 0 || dropped > 0 || mixed > 0 {
+    if persistent > 0 || dropped > 0 || mixed > 0 || inconclusive > 0 {
         for (name, outcome) in outcomes {
             match outcome {
                 ReplayOutcome::Persistent => {
                     eprintln!("  PERSISTENT {name}");
+                }
+                ReplayOutcome::Inconclusive => {
+                    // Triage hint: an Inconclusive replay means
+                    // the gate could not measure (zero-denominator
+                    // ratio across every variant). The operator
+                    // sees INCONCLUSIVE without context otherwise;
+                    // surfacing the remediation inline ("re-run
+                    // against a workload that produces the missing
+                    // signal") turns the opaque verdict into
+                    // actionable diagnosis without forcing them to
+                    // open a sidecar.
+                    eprintln!(
+                        "  INCONCLUSIVE {name} \
+                         (zero-denominator gate across every variant — \
+                         re-run against a workload that produces the \
+                         missing signal, or drill into the per-variant \
+                         sidecars to see which gates went unevaluated)",
+                    );
                 }
                 ReplayOutcome::Dropped => {
                     // Triage hint: the operator sees DROPPED
@@ -378,15 +435,17 @@ fn render_outcome_diff(outcomes: &BTreeMap<&str, ReplayOutcome>) {
                 ReplayOutcome::Mixed {
                     fixed_count,
                     persistent_count,
+                    inconclusive_count,
                 } => {
                     // Surface variant disagreement explicitly:
                     // a parameterized test with some variants
-                    // fixed and some still red must NOT collapse
-                    // to a green Fixed verdict.
+                    // fixed and some still red (or inconclusive)
+                    // must NOT collapse to a green Fixed verdict.
                     eprintln!(
                         "  MIXED {name} \
                          ({fixed_count} variant(s) fixed, \
-                         {persistent_count} variant(s) still failing — \
+                         {persistent_count} variant(s) still failing, \
+                         {inconclusive_count} variant(s) inconclusive — \
                          drill into the per-variant sidecars to triage)",
                     );
                 }
@@ -570,10 +629,17 @@ fn render_host_diff_section(section: &HostDiffSection) {
 }
 
 /// Select the set of test_names from `pool` whose sidecars
-/// represent real failures (`!passed && !skipped`), optionally
-/// narrowed by a substring filter on test_name. Returns a
-/// BTreeSet for deterministic ascending-order iteration when
-/// the renderer builds the nextest filter expression.
+/// represent real failures (`s.is_fail()`), optionally narrowed
+/// by a substring filter on test_name. Returns a BTreeSet for
+/// deterministic ascending-order iteration when the renderer
+/// builds the nextest filter expression.
+///
+/// Inconclusive runs are deliberately EXCLUDED from the replay
+/// selection: `is_fail()` returns false for Inconclusive, so a
+/// zero-denominator gate that emitted Inconclusive is not
+/// auto-replayed. Inconclusive surfaces in the per-name
+/// outcome diff for operator triage (see `render_outcome_diff`)
+/// — replaying it would re-run the same zero-signal scenario.
 ///
 /// Extracted as a pub(crate) free function so the scan-path
 /// logic can be unit-tested against synthetic SidecarResult
@@ -585,7 +651,7 @@ pub(crate) fn select_failed_names<'a>(
     filter: Option<&str>,
 ) -> BTreeSet<&'a str> {
     pool.iter()
-        .filter(|s| !s.passed && !s.skipped)
+        .filter(|s| s.is_fail())
         .map(|s| s.test_name.as_str())
         .filter(|n| match filter {
             Some(f) => n.contains(f),
@@ -651,9 +717,13 @@ mod tests {
     use ktstr::test_support::SidecarResult;
 
     /// Build a minimal SidecarResult fixture for the scan-path
-    /// tests. Only fields the selector consults (test_name,
-    /// passed, skipped) are meaningful; the rest are
-    /// placeholders that satisfy the struct.
+    /// tests. The selector consults `passed`/`skipped`/`inconclusive`
+    /// via [`SidecarResult::is_fail`] (strict 4-state mutex); this
+    /// helper hardpins `inconclusive: false` for the legacy 3-state
+    /// test cases. Tests that exercise the Inconclusive arm of the
+    /// selector must use [`synth_sidecar_with_inconclusive`] instead.
+    /// The rest of the SidecarResult fields are placeholders that
+    /// satisfy the struct.
     fn synth_sidecar(test_name: &str, passed: bool, skipped: bool) -> SidecarResult {
         SidecarResult {
             test_name: test_name.to_string(),
@@ -665,6 +735,7 @@ mod tests {
             metrics: Vec::new(),
             passed,
             skipped,
+            inconclusive: false,
             stats: ktstr::assert::ScenarioStats::default(),
             monitor: None,
             stimulus_events: Vec::new(),
@@ -687,6 +758,32 @@ mod tests {
         rows.iter()
             .map(|(n, p, s)| synth_sidecar(n, *p, *s))
             .collect()
+    }
+
+    /// Inconclusive-bit-aware synth helper. Mirrors [`synth_sidecar`]
+    /// but lets the test pin the `inconclusive` field too — used by
+    /// the replay classifier tests that exercise the new
+    /// [`ReplayOutcome::Inconclusive`] / mixed-with-inconclusive
+    /// branches. A sidecar where `inconclusive = true` always has
+    /// `passed = false` (the 4-state encoding is mutually
+    /// exclusive); pass `passed = false` at every call site so the
+    /// synth row encodes a legal sidecar shape.
+    fn synth_sidecar_with_inconclusive(
+        test_name: &str,
+        passed: bool,
+        skipped: bool,
+        inconclusive: bool,
+    ) -> SidecarResult {
+        let set_count = u8::from(passed) + u8::from(skipped) + u8::from(inconclusive);
+        debug_assert!(
+            set_count <= 1,
+            "SidecarResult strict 4-state mutex: at most one of \
+             passed/skipped/inconclusive may be true; got \
+             passed={passed}, skipped={skipped}, inconclusive={inconclusive}",
+        );
+        let mut sc = synth_sidecar(test_name, passed, skipped);
+        sc.inconclusive = inconclusive;
+        sc
     }
 
     // -- build_nextest_filter (formatting layer) --
@@ -765,15 +862,19 @@ mod tests {
 
     // -- select_failed_names (scan-path selector) --
 
-    /// Pool with mixed states — only `!passed && !skipped`
-    /// rows are selected. Pins the load-bearing failed-sidecar
-    /// selector logic so a skipped row never collapses into the
-    /// failed set.
+    /// Pool with mixed states — only `is_fail()` rows are
+    /// selected. Pins the load-bearing failed-sidecar selector
+    /// logic so a skipped row never collapses into the failed
+    /// set. All fixture rows have `inconclusive=false` (see
+    /// `synth_sidecar`), so the selector reduces to
+    /// `!passed && !skipped` for these inputs; the
+    /// `!inconclusive` conjunct of `is_fail` is exercised by
+    /// [`select_failed_corner_case_inconclusive_excluded`].
     #[test]
     fn select_failed_skips_passed_and_skipped_keeps_only_real_failures() {
         let pool = synth_pool(&[
             ("test_pass", true, false),   // not selected (passed)
-            ("test_skip", true, true),    // not selected (passed+skipped)
+            ("test_skip", true, true),    // not selected (legacy passed+skipped fixture shape)
             ("test_fail1", false, false), // SELECTED
             ("test_fail2", false, false), // SELECTED
             ("test_corner", false, true), // not selected — !passed but skipped
@@ -812,11 +913,11 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    /// The `!passed && !skipped` condition (vs `!passed` alone)
-    /// — failed+skipped is the awkward intermediate state.
-    /// Pins that this state is EXCLUDED per the explicit
-    /// `&& !skipped` clause; if a future refactor changes it
-    /// to `!passed` alone, this test surfaces the change.
+    /// The `!skipped` conjunct of [`SidecarResult::is_fail`]
+    /// (alongside `!passed && !inconclusive`) is what excludes
+    /// the failed+skipped intermediate state from the replay
+    /// queue. If a future refactor drops the `!skipped` clause
+    /// from `is_fail`, this test surfaces the change.
     #[test]
     fn select_failed_corner_case_failed_and_skipped_excluded() {
         let pool = synth_pool(&[("test_fail_skip", false, true)]);
@@ -824,6 +925,31 @@ mod tests {
         assert!(
             result.is_empty(),
             "failed+skipped must be excluded; the && !skipped guard is load-bearing"
+        );
+    }
+
+    /// The `!inconclusive` conjunct of `SidecarResult::is_fail`
+    /// must exclude inconclusive sidecars from the replay queue —
+    /// a zero-denominator gate that couldn't evaluate is not a
+    /// regression to re-run, and queuing it as a "failure to
+    /// reproduce" would mis-spend replay budget on runs that
+    /// produced no signal in the first place. Pins the
+    /// `inconclusive = true` exclusion at the selector layer
+    /// (the classifier layer is exercised separately by the
+    /// `classify_replay_*_inconclusive*` tests).
+    #[test]
+    fn select_failed_corner_case_inconclusive_excluded() {
+        let pool = vec![
+            synth_sidecar_with_inconclusive("test_inconclusive_only", false, false, true),
+            synth_sidecar_with_inconclusive("test_real_fail", false, false, false),
+        ];
+        let result = select_failed_names(&pool, None);
+        let expected: BTreeSet<&str> = ["test_real_fail"].iter().copied().collect();
+        assert_eq!(
+            result, expected,
+            "inconclusive sidecars must NOT enter the replay queue — \
+             SidecarResult::is_fail requires !inconclusive; a replay of a \
+             zero-denominator run would re-spend budget on a non-measurement"
         );
     }
 
@@ -905,13 +1031,17 @@ mod tests {
         );
     }
 
-    /// Post-replay sidecar that reports `passed=true skipped=true`
-    /// (the SidecarResult "skipped" convention) classifies as
+    /// Post-replay sidecar that is skipped classifies as
     /// PERSISTENT, NOT Fixed. A skipped re-run is not a pass —
     /// the test didn't actually run, so the original failure
-    /// isn't validated as fixed. Pin the `&& !sc.skipped` guard
-    /// in classify_replay against a future regression that
-    /// treats skipped as passed.
+    /// isn't validated as fixed. Pins that `is_pass()`'s
+    /// `!skipped` conjunct keeps a Skip row out of the
+    /// `fixed_count` bucket. The fixture uses `(true, true)`
+    /// (the legacy `synth_sidecar` shape); production
+    /// `write_skip_sidecar` emits `passed=false, skipped=true,
+    /// inconclusive=false` instead, but both shapes yield
+    /// `is_pass() = false` because the `!skipped` conjunct
+    /// dominates either way.
     #[test]
     fn classify_replay_post_skipped_is_persistent_not_fixed() {
         let post_pool = synth_pool(&[("test_skipped", true, true)]);
@@ -943,6 +1073,7 @@ mod tests {
             Some(&ReplayOutcome::Mixed {
                 fixed_count: 1,
                 persistent_count: 1,
+                inconclusive_count: 0,
             }),
             "variant disagreement must surface as Mixed; \
              silent collapse to Fixed would hide the failing variant"
@@ -980,6 +1111,51 @@ mod tests {
             outcomes.get("test_broken"),
             Some(&ReplayOutcome::Persistent),
             "2-of-2 variants failed → Persistent, not Mixed"
+        );
+    }
+
+    /// All variants inconclusive → Inconclusive. Pins the "every
+    /// variant zero-denominator" branch — an inconclusive replay
+    /// must not masquerade as Persistent (which would mislead the
+    /// operator into thinking the fix failed) nor as Fixed (which
+    /// would silently green-light an unmeasured replay).
+    #[test]
+    fn classify_replay_all_variants_inconclusive_classifies_as_inconclusive() {
+        let post_pool = vec![
+            synth_sidecar_with_inconclusive("test_zero_denom", false, false, true),
+            synth_sidecar_with_inconclusive("test_zero_denom", false, false, true),
+        ];
+        let queued: BTreeSet<&str> = ["test_zero_denom"].iter().copied().collect();
+        let outcomes = classify_replay(&queued, &post_pool);
+        assert_eq!(
+            outcomes.get("test_zero_denom"),
+            Some(&ReplayOutcome::Inconclusive),
+            "2-of-2 variants inconclusive → Inconclusive, not Persistent or Fixed"
+        );
+    }
+
+    /// Mixed variants where one passed, one failed, and one was
+    /// inconclusive → Mixed carrying all three counts. Pins the
+    /// three-way disagreement branch — silently dropping the
+    /// inconclusive count would hide a variant the operator needs
+    /// to triage.
+    #[test]
+    fn classify_replay_three_way_mix_classifies_as_mixed_with_inconclusive() {
+        let post_pool = vec![
+            synth_sidecar_with_inconclusive("test_param", true, false, false),
+            synth_sidecar_with_inconclusive("test_param", false, false, false),
+            synth_sidecar_with_inconclusive("test_param", false, false, true),
+        ];
+        let queued: BTreeSet<&str> = ["test_param"].iter().copied().collect();
+        let outcomes = classify_replay(&queued, &post_pool);
+        assert_eq!(
+            outcomes.get("test_param"),
+            Some(&ReplayOutcome::Mixed {
+                fixed_count: 1,
+                persistent_count: 1,
+                inconclusive_count: 1,
+            }),
+            "three-way variant disagreement surfaces every bucket"
         );
     }
 

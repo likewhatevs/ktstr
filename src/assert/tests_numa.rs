@@ -174,6 +174,45 @@ fn assert_page_locality_exact_threshold() {
     assert!(r.is_pass(), "{:?}", r.outcomes);
 }
 
+/// Page-locality is the explicit COUNTER-EXAMPLE to the
+/// zero-denominator-becomes-Inconclusive convention: a workload
+/// that produced no NUMA pages must FAIL the locality gate, not
+/// flip to Inconclusive.
+///
+/// Rationale (`page_locality` doc, mod.rs L170-178): reporting
+/// `1.0` for zero observed pages would silently green broken runs
+/// that produced no NUMA signal; the function deliberately
+/// returns `0.0` instead, and the gate compares it against the
+/// threshold like any other observation. This test pins that the
+/// stays-Fail policy holds for the zero case so a well-meaning
+/// "convert all zero-denominator ratios to Inconclusive" refactor
+/// would trip the assertion and force a deliberate review.
+#[test]
+fn assert_page_locality_zero_observed_stays_fail_not_inconclusive() {
+    // page_locality returned 0.0 (zero total pages observed).
+    // assert_page_locality must FAIL against any positive threshold,
+    // NOT downgrade to Inconclusive.
+    let r = assert_page_locality(0.0, Some(0.8), 0, 0);
+    assert!(
+        r.is_fail(),
+        "zero-page workload must Fail, not Pass/Inconclusive: {:?}",
+        r.outcomes
+    );
+    assert!(
+        !r.is_inconclusive(),
+        "zero-page workload must NOT be Inconclusive (page_locality is the deliberate stays-Fail counter-example): {:?}",
+        r.outcomes
+    );
+    let detail = r
+        .failure_details()
+        .find(|d| matches!(d.kind, DetailKind::PageLocality))
+        .expect("PageLocality detail required");
+    assert!(
+        detail.message.contains("0.00%"),
+        "must surface observed 0% so operator sees the zero-signal cause: {detail}"
+    );
+}
+
 // -- assert_slow_tier_ratio tests --
 
 #[test]
@@ -233,6 +272,57 @@ fn assert_slow_tier_ratio_all_local() {
     let nodes: BTreeSet<usize> = [0].into_iter().collect();
     let r = assert_slow_tier_ratio(&pages, 0.0, 100, Some(&nodes));
     assert!(r.is_pass(), "{:?}", r.outcomes);
+}
+
+/// A cgroup where every worker reported empty (or all-zero) NUMA
+/// pages drops out of the per-worker slow-tier loop. Previously
+/// the gate silently returned Pass; now it records Inconclusive
+/// so a workload that produced no NUMA allocations at all doesn't
+/// masquerade as meeting the slow-tier ratio. Pin the
+/// `evaluated == 0` carve-out in the AssertPlan dispatch.
+#[test]
+fn plan_slow_tier_ratio_no_numa_signal_is_inconclusive() {
+    use super::AssertPlan;
+    use std::collections::BTreeSet;
+    let a = rpt(1, 1000, 1_000_000_000, 0, &[0], 0);
+    let b = rpt(2, 1000, 1_000_000_000, 0, &[0], 0);
+    // Both workers have empty numa_pages — no NUMA signal at all.
+    let plan = AssertPlan {
+        not_starved: false,
+        isolation: false,
+        max_gap_ms: None,
+        max_spread_pct: None,
+        max_throughput_cv: None,
+        min_work_rate: None,
+        max_p99_wake_latency_ns: None,
+        max_wake_latency_cv: None,
+        min_iteration_rate: None,
+        max_migration_ratio: None,
+        min_page_locality: None,
+        max_cross_node_migration_ratio: None,
+        max_slow_tier_ratio: Some(0.1),
+    };
+    let nodes: BTreeSet<usize> = [0].into_iter().collect();
+    let r = plan.assert_cgroup(&[a, b], None, Some(&nodes));
+    assert!(
+        r.is_inconclusive(),
+        "no-NUMA-signal cgroup must be Inconclusive, not Pass: {:?}",
+        r.outcomes,
+    );
+    assert!(!r.is_pass(), "must not silently pass on zero denominator");
+    assert!(!r.is_fail(), "no actual ratio violation to report");
+    let reason = r
+        .inconclusive_details()
+        .find(|d| d.kind == DetailKind::SlowTier)
+        .unwrap_or_else(|| panic!("expected SlowTier Inconclusive, got {:?}", r.outcomes));
+    assert!(
+        reason.message.contains("no worker reported any NUMA pages"),
+        "diagnostic must name the root cause: {reason}"
+    );
+    assert!(
+        reason.message.contains("denominator is zero"),
+        "diagnostic must surface the operator-actionable hint: {reason}"
+    );
 }
 
 // -- Assert NUMA builder and merge tests --
@@ -397,9 +487,33 @@ fn assert_cross_node_migration_exact_threshold() {
 }
 
 #[test]
-fn assert_cross_node_migration_zero_pages() {
+fn assert_cross_node_migration_zero_pages_is_inconclusive() {
+    // Both inputs zero = zero-denominator with no signal — neither
+    // Pass (would silently green a workload that allocated nothing)
+    // nor Fail (no actual ratio violation observed) is truthful.
+    // Pin the Inconclusive outcome and the diagnostic that surfaces
+    // the operator-actionable hint ("did the workload allocate any
+    // memory?").
     let r = assert_cross_node_migration(0, 0, Some(0.1));
-    assert!(r.is_pass(), "zero total pages should pass");
+    assert!(
+        r.is_inconclusive(),
+        "zero total + zero migrated must be Inconclusive, not Pass or Fail: {:?}",
+        r.outcomes,
+    );
+    assert!(!r.is_pass(), "must not silently pass on zero denominator");
+    assert!(!r.is_fail(), "no ratio violation to report");
+    let reason = r
+        .inconclusive_details()
+        .find(|d| d.kind == DetailKind::CrossNodeMigration)
+        .unwrap_or_else(|| panic!("expected Inconclusive reason, got {:?}", r.outcomes));
+    assert!(
+        reason.message.contains("denominator is zero"),
+        "diagnostic must name the root cause: {reason}"
+    );
+    assert!(
+        reason.message.contains("allocate any memory"),
+        "diagnostic must surface the operator-actionable hint: {reason}"
+    );
 }
 
 #[test]

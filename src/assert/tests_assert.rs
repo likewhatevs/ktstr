@@ -1558,16 +1558,19 @@ fn outcome_implements_expected_traits() {
     requires::<Outcome>();
 }
 
-/// `Outcome::merge` precedence: **Fail > Pass > Skip** per the
-/// production semantic at `AssertResult::merge`
-/// (`passed &= other` plus `skipped &&= other`). Full 9-case
-/// commutative truth table; any one cell flipping would indicate
-/// the precedence flipped. A "Fail > Skip > Pass" alternative would
-/// flip the existing `merge_skip_plus_pass_demotes_skip` test
-/// invariant; the `Fail > Pass > Skip` lattice is the one this
-/// implementation actually realizes.
+/// `Outcome::merge` precedence on the **3-variant (Fail / Pass /
+/// Skip) subset** of the full `Fail > Inconclusive > Pass > Skip`
+/// lattice. Full 9-case commutative truth table over these three
+/// variants; any cell flipping would indicate the sub-lattice
+/// reordered. The `Inconclusive` arm of the full lattice is pinned
+/// separately by
+/// [`outcome_merge_precedence_inconclusive_above_pass_below_fail`].
+/// A "Fail > Skip > Pass" alternative would flip the existing
+/// `merge_skip_plus_pass_demotes_skip` test invariant; the
+/// `Fail > Pass > Skip` ordering is the one this implementation
+/// actually realizes on the three-variant subset.
 #[test]
-fn outcome_merge_precedence_fail_pass_skip() {
+fn outcome_merge_precedence_three_variant_subset_fail_pass_skip() {
     let d = AssertDetail::new(DetailKind::Other, "payload");
     let pass = || Outcome::Pass;
     let skip = || Outcome::Skip(d.clone());
@@ -1587,31 +1590,115 @@ fn outcome_merge_precedence_fail_pass_skip() {
     assert!(fail().merge(fail()).is_fail());
 }
 
-/// `Outcome::{is_pass, is_skip, is_fail}` 3×3 truth table. A
-/// regression that returned wrong polarity (e.g. `is_skip` silently
-/// returning false for `Skip(_)` because of a pattern-match typo)
-/// would trip here.
+/// `Outcome::{is_pass, is_skip, is_fail, is_inconclusive}` 4×4 truth
+/// table. A regression that returned wrong polarity (e.g. `is_skip`
+/// silently returning false for `Skip(_)` because of a pattern-match
+/// typo) would trip here.
 #[test]
 fn outcome_accessor_truth_table() {
     let d = AssertDetail::new(DetailKind::Other, "x");
     assert!(Outcome::Pass.is_pass());
     assert!(!Outcome::Pass.is_skip());
     assert!(!Outcome::Pass.is_fail());
+    assert!(!Outcome::Pass.is_inconclusive());
 
     assert!(!Outcome::Skip(d.clone()).is_pass());
     assert!(Outcome::Skip(d.clone()).is_skip());
     assert!(!Outcome::Skip(d.clone()).is_fail());
+    assert!(!Outcome::Skip(d.clone()).is_inconclusive());
 
     assert!(!Outcome::Fail(d.clone()).is_pass());
     assert!(!Outcome::Fail(d.clone()).is_skip());
     assert!(Outcome::Fail(d.clone()).is_fail());
+    assert!(!Outcome::Fail(d.clone()).is_inconclusive());
+
+    assert!(!Outcome::Inconclusive(d.clone()).is_pass());
+    assert!(!Outcome::Inconclusive(d.clone()).is_skip());
+    assert!(!Outcome::Inconclusive(d.clone()).is_fail());
+    assert!(Outcome::Inconclusive(d.clone()).is_inconclusive());
+}
+
+/// `Outcome::merge` precedence around the `Inconclusive` variant.
+/// Lattice: `Fail > Inconclusive > Pass > Skip`. An Inconclusive
+/// dominates Pass and Skip (because "couldn't evaluate" is not a
+/// real Pass), but Fail still dominates Inconclusive (a real
+/// failure beats an unevaluated check). Pins the precedence rule
+/// the verdict pipeline relies on for zero-denominator ratio
+/// asserts.
+#[test]
+fn outcome_merge_precedence_inconclusive_above_pass_below_fail() {
+    let d = AssertDetail::new(DetailKind::Other, "payload");
+    let pass = || Outcome::Pass;
+    let skip = || Outcome::Skip(d.clone());
+    let fail = || Outcome::Fail(d.clone());
+    let inconc = || Outcome::Inconclusive(d.clone());
+    // Inconclusive ∪ Pass → Inconclusive (both orderings)
+    assert!(inconc().merge(pass()).is_inconclusive());
+    assert!(pass().merge(inconc()).is_inconclusive());
+    // Inconclusive ∪ Skip → Inconclusive (both orderings)
+    assert!(inconc().merge(skip()).is_inconclusive());
+    assert!(skip().merge(inconc()).is_inconclusive());
+    // Inconclusive ∪ Fail → Fail (both orderings — Fail dominates)
+    assert!(inconc().merge(fail()).is_fail());
+    assert!(fail().merge(inconc()).is_fail());
+    // Identity (any payload survives — same-discriminant merge).
+    assert!(inconc().merge(inconc()).is_inconclusive());
+
+    // LEFT-payload-tie pin: same-discriminant Inconclusive merges
+    // preserve the LEFT operand's payload (mirrors the Fail+Fail and
+    // Skip+Skip semantic). A regression to RIGHT-wins would silently
+    // change which Inconclusive reason surfaces in the terminal
+    // verdict.
+    let left = AssertDetail::new(DetailKind::Migration, "first-inconc");
+    let right = AssertDetail::new(DetailKind::Benchmark, "second-inconc");
+    let Outcome::Inconclusive(d) = Outcome::Inconclusive(left).merge(Outcome::Inconclusive(right))
+    else {
+        panic!("Inconclusive+Inconclusive must yield Inconclusive");
+    };
+    assert_eq!(d.kind, DetailKind::Migration, "LEFT-wins on payload tie");
+    assert!(d.message.contains("first-inconc"));
+}
+
+/// `AssertResult::record_inconclusive` appends an `Outcome::Inconclusive`
+/// and the payload surfaces via `inconclusive_details()`. Pins that
+/// a Fail-plus-Inconclusive stream reads as Fail (Fail dominates) and
+/// that `is_pass()` returns false for an Inconclusive-only stream so a
+/// zero-denominator ratio doesn't slip past CI gates as Pass.
+#[test]
+fn record_inconclusive_appears_in_inconclusive_details_and_is_not_pass() {
+    let mut r = AssertResult::pass();
+    r.record_inconclusive(AssertDetail::new(
+        DetailKind::Migration,
+        "denominator was zero",
+    ));
+    assert!(!r.is_pass(), "inconclusive must not read as pass");
+    assert!(!r.is_fail());
+    assert!(!r.is_skip());
+    assert!(r.is_inconclusive());
+    let reasons: Vec<_> = r.inconclusive_details().collect();
+    assert_eq!(reasons.len(), 1);
+    assert_eq!(reasons[0].kind, DetailKind::Migration);
+    assert!(reasons[0].message.contains("denominator was zero"));
+    // failure_details must NOT include Inconclusive payloads — they
+    // are a sibling iterator. A regression that folded them in would
+    // misclassify the verdict as a Fail.
+    assert_eq!(r.failure_details().count(), 0);
+
+    // Fail dominates Inconclusive — adding a Fail to an Inconclusive
+    // stream flips is_fail() true and clears is_inconclusive() per
+    // the `Fail > Inconclusive > Pass > Skip` precedence.
+    r.record_fail(AssertDetail::new(DetailKind::Other, "real failure"));
+    assert!(r.is_fail());
+    assert!(!r.is_inconclusive(), "Fail dominates Inconclusive");
 }
 
 /// `AssertResult::outcome()` folds the `outcomes: Vec<Outcome>` slot
 /// into a single terminal verdict per `Outcome::merge`'s precedence
-/// (Fail > Pass > Skip; identity Pass). Pins the synthesis rules so
-/// consumers that read `outcome()` see Pass / Skip / Fail without
-/// depending on the inner vec structure.
+/// (`Fail > Inconclusive > Pass > Skip`; identity Pass). Pins the
+/// three non-Inconclusive arms of the synthesis rules so consumers
+/// that read `outcome()` see Pass / Skip / Fail without depending
+/// on the inner vec structure. The Inconclusive arm is pinned by
+/// [`record_inconclusive_appears_in_inconclusive_details_and_is_not_pass`].
 #[test]
 fn assert_result_outcome_folds_outcomes_vec() {
     // Pass result with no notable details → Outcome::Pass.
@@ -1693,6 +1780,13 @@ fn outcome_as_ref_preserves_discriminant_and_payload() {
     };
     assert_eq!(d.kind, DetailKind::Skip);
     assert!(d.message.contains("missing"));
+    let inconc =
+        Outcome::Inconclusive(AssertDetail::new(DetailKind::Migration, "zero denominator"));
+    let OutcomeRef::Inconclusive(d) = inconc.as_ref() else {
+        panic!("Inconclusive as_ref should be Inconclusive variant");
+    };
+    assert_eq!(d.kind, DetailKind::Migration);
+    assert!(d.message.contains("zero denominator"));
 }
 
 /// `AssertResult::outcome_ref` matches `outcome()` shape across
@@ -1730,6 +1824,60 @@ fn assert_result_outcome_ref_matches_owned_outcome_shape() {
     };
     assert_eq!(d.kind, DetailKind::Stuck);
     assert!(d.message.contains("first-fail"));
+    // Non-empty all-Inconclusive → Inconclusive with first payload
+    // (mirrors the all-Skip branch and the `Outcome::merge` LEFT-
+    // wins payload-tie semantic).
+    let mut all_inconc = AssertResult::pass();
+    all_inconc.record_inconclusive(AssertDetail::new(DetailKind::Migration, "first-inconc"));
+    all_inconc.record_inconclusive(AssertDetail::new(DetailKind::Benchmark, "second-inconc"));
+    let OutcomeRef::Inconclusive(d) = all_inconc.outcome_ref() else {
+        panic!("all-Inconclusive stream should yield Inconclusive");
+    };
+    assert_eq!(d.kind, DetailKind::Migration);
+    assert!(d.message.contains("first-inconc"));
+    // Fail dominates Inconclusive: a Fail-plus-Inconclusive stream
+    // yields Fail (per `Fail > Inconclusive > Pass > Skip`).
+    let mut fail_over_inconc = AssertResult::pass();
+    fail_over_inconc
+        .record_inconclusive(AssertDetail::new(DetailKind::Migration, "denominator-zero"));
+    fail_over_inconc.record_fail(AssertDetail::new(DetailKind::Stuck, "real-fail"));
+    let OutcomeRef::Fail(d) = fail_over_inconc.outcome_ref() else {
+        panic!("Fail+Inconclusive stream should yield Fail");
+    };
+    assert_eq!(d.kind, DetailKind::Stuck);
+    assert!(d.message.contains("real-fail"));
+    // Inconclusive dominates Skip: an Inconclusive-plus-Skip stream
+    // (no Fail, no Pass) yields Inconclusive (per
+    // `Fail > Inconclusive > Pass > Skip`). LEFT-wins payload-tie
+    // semantics carry the first Inconclusive's detail through, even
+    // though the Skip arrived after.
+    let mut inconc_over_skip = AssertResult::pass();
+    inconc_over_skip.record_inconclusive(AssertDetail::new(DetailKind::Benchmark, "left-inconc"));
+    inconc_over_skip.record_skip("right-skip");
+    let OutcomeRef::Inconclusive(d) = inconc_over_skip.outcome_ref() else {
+        panic!(
+            "Inconclusive+Skip stream should yield Inconclusive (Inconclusive > Skip): got {:?}",
+            inconc_over_skip.outcome_ref()
+        );
+    };
+    assert_eq!(d.kind, DetailKind::Benchmark);
+    assert!(d.message.contains("left-inconc"));
+    // Reverse order (Skip first, Inconclusive second) must yield the
+    // same verdict — merge is commutative on lattice precedence even
+    // though LEFT-wins on payload ties. With distinct ranks the rank
+    // alone decides the variant, and the Inconclusive payload wins
+    // because it is the only Inconclusive in the stream.
+    let mut skip_then_inconc = AssertResult::pass();
+    skip_then_inconc.record_skip("left-skip");
+    skip_then_inconc.record_inconclusive(AssertDetail::new(DetailKind::Benchmark, "right-inconc"));
+    let OutcomeRef::Inconclusive(d) = skip_then_inconc.outcome_ref() else {
+        panic!(
+            "Skip+Inconclusive stream should still yield Inconclusive: got {:?}",
+            skip_then_inconc.outcome_ref()
+        );
+    };
+    assert_eq!(d.kind, DetailKind::Benchmark);
+    assert!(d.message.contains("right-inconc"));
 }
 
 /// Mutator semantics: repeated `record_fail` calls append distinct
@@ -1800,7 +1948,7 @@ fn assert_result_record_outcome_pushes_and_observable() {
     r.record_outcome(Outcome::Skip(AssertDetail::new(DetailKind::Skip, "stop")));
     assert_eq!(r.outcomes.len(), 2);
     assert!(r.is_fail(), "Fail dominates the merged outcome");
-    assert_eq!(r.skip_reasons().count(), 1);
+    assert_eq!(r.skip_details().count(), 1);
 }
 
 /// `Outcome` serde uses the externally-tagged default (no
@@ -1847,6 +1995,23 @@ fn outcome_serde_externally_tagged_roundtrips_via_json_and_postcard() {
     let recovered: Outcome = serde_json::from_str(&fail_json).unwrap();
     assert!(recovered.is_fail());
 
+    // Inconclusive serializes with the same externally-tagged shape
+    // — `{"Inconclusive":{...}}` — and roundtrips via JSON. Pin
+    // both so a regression that drops Inconclusive from the wire
+    // format or re-adds `#[serde(tag, content)]` trips loudly.
+    let inconc_detail = AssertDetail::new(DetailKind::Migration, "zero denom");
+    let inconc_json = serde_json::to_string(&Outcome::Inconclusive(inconc_detail.clone())).unwrap();
+    assert!(
+        inconc_json.starts_with("{\"Inconclusive\":"),
+        "Inconclusive must serialize as externally-tagged object: {inconc_json}"
+    );
+    assert!(
+        !inconc_json.contains("\"data\":"),
+        "Inconclusive must not carry the dropped \"data\" wrapper: {inconc_json}"
+    );
+    let inconc_recovered: Outcome = serde_json::from_str(&inconc_json).unwrap();
+    assert!(inconc_recovered.is_inconclusive());
+
     // Postcard roundtrip — the wire format that the TLV path uses.
     // A regression that re-adds `#[serde(tag, content)]` would
     // silently break this and surface only at runtime as
@@ -1857,6 +2022,59 @@ fn outcome_serde_externally_tagged_roundtrips_via_json_and_postcard() {
     let pc_fail = postcard::to_stdvec(&Outcome::Fail(d)).unwrap();
     let pc_fail_recovered: Outcome = postcard::from_bytes(&pc_fail).unwrap();
     assert!(pc_fail_recovered.is_fail());
+    let pc_inconc = postcard::to_stdvec(&Outcome::Inconclusive(inconc_detail)).unwrap();
+    let pc_inconc_recovered: Outcome = postcard::from_bytes(&pc_inconc).unwrap();
+    assert!(pc_inconc_recovered.is_inconclusive());
+}
+
+/// Wire-format byte-sentinel: postcard encodes `Outcome` by
+/// **variant index** (Pass=0, Skip=1, Inconclusive=2, Fail=3), and
+/// that index is the FIRST byte of the encoded payload (varint,
+/// single byte for indices < 128). A refactor that reorders,
+/// removes, or inserts a variant ahead of one of these four would
+/// shift the leading byte and silently reinterpret guest payloads
+/// on the host — a Pass byte becoming Skip, for example, with no
+/// decode error.
+///
+/// Pin the leading byte for every variant so the silent-shift
+/// regression trips at test time rather than at production
+/// runtime. The Outcome enum doc explicitly documents this
+/// stability contract ("Wire-format stability (postcard variant
+/// index)" section) — this test is the enforcement for that
+/// contract.
+#[test]
+fn outcome_postcard_variant_index_byte_sentinel() {
+    let d = AssertDetail::new(DetailKind::Other, "x");
+
+    let pc_pass = postcard::to_stdvec(&Outcome::Pass).unwrap();
+    assert_eq!(
+        pc_pass.first().copied(),
+        Some(0u8),
+        "Outcome::Pass MUST encode with leading variant-index byte 0 (got bytes {pc_pass:?}); \
+         a variant reorder would silently corrupt the TLV wire path",
+    );
+
+    let pc_skip = postcard::to_stdvec(&Outcome::Skip(d.clone())).unwrap();
+    assert_eq!(
+        pc_skip.first().copied(),
+        Some(1u8),
+        "Outcome::Skip MUST encode with leading variant-index byte 1 (got bytes {pc_skip:?})",
+    );
+
+    let pc_inconc = postcard::to_stdvec(&Outcome::Inconclusive(d.clone())).unwrap();
+    assert_eq!(
+        pc_inconc.first().copied(),
+        Some(2u8),
+        "Outcome::Inconclusive MUST encode with leading variant-index byte 2 \
+         (got bytes {pc_inconc:?})",
+    );
+
+    let pc_fail = postcard::to_stdvec(&Outcome::Fail(d)).unwrap();
+    assert_eq!(
+        pc_fail.first().copied(),
+        Some(3u8),
+        "Outcome::Fail MUST encode with leading variant-index byte 3 (got bytes {pc_fail:?})",
+    );
 }
 
 /// `expect_scx_bpf_error_contains` and `expect_scx_bpf_error_matches`

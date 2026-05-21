@@ -311,7 +311,7 @@ fn verdict_skip_records_skip_kind_with_reason() {
     );
     assert!(r.is_skip(), "skip flag must be set on the result");
     let skip_detail = r
-        .skip_reasons()
+        .skip_details()
         .find(|d| d.kind == DetailKind::Skip)
         .expect("at least one Skip-kind detail must be present");
     assert!(

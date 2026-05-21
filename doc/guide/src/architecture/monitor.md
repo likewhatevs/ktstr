@@ -79,14 +79,24 @@ A violation must persist for `sustained_samples` consecutive samples
 before triggering a failure. This filters transient spikes from cpuset
 transitions and cgroup creation/destruction.
 
-**`enforce` is the on/off gate for the whole pipeline.** The default
-(`MonitorThresholds::new()`) is `enforce: false` — monitor evaluations
-record observations but do NOT fail the test. Test authors opt in to
-enforcement by either setting `enforce: true` on a custom
-`MonitorThresholds`, or using `MonitorThresholds::with_monitor_defaults()`
-which flips it. Setting fields like `fail_on_stall: true` without
-flipping `enforce` is a no-op — every violation will appear in the
+**`enforce` is the on/off gate for the threshold-violation path.** The
+default (`MonitorThresholds::new()`) is `enforce: false` — monitor
+evaluations record observations but do NOT fail the test on threshold
+violations. Test authors opt in to enforcement by either setting
+`enforce: true` on a custom `MonitorThresholds`, or using
+`MonitorThresholds::with_monitor_defaults()` which flips it. Setting
+fields like `fail_on_stall: true` without flipping `enforce` is a
+no-op for the violation path — every violation will appear in the
 monitor report but the verdict will pass.
+
+The no-signal arms (empty sample buffer, or `data_looks_valid` rejection
+of uninitialized guest memory) are evaluator-internal and bypass
+`enforce` — they always produce a `MonitorVerdict` with
+`passed: false, inconclusive: true`, which folds into the test's
+`AssertResult` as Inconclusive (exit code 2) regardless of `enforce`.
+"Couldn't evaluate" is not the same as "evaluated and OK," so the
+no-signal path always surfaces distinct from Pass. Only threshold
+*violations* are gated by `enforce`.
 
 ### Stall detection
 

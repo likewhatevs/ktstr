@@ -230,6 +230,11 @@ fn bare_fail_on_stall_compile(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
+#[ktstr_test(allow_inconclusive, host_only = true)]
+fn bare_allow_inconclusive_compile(_ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+
 #[ktstr_test(ignore, host_only = true)]
 fn bare_ignore_compile(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
@@ -320,6 +325,15 @@ fn entry_bare_fail_on_stall() {
         e.assert.fail_on_stall,
         Some(true),
         "bare `fail_on_stall` must set entry.assert.fail_on_stall=Some(true)"
+    );
+}
+
+#[test]
+fn entry_bare_allow_inconclusive() {
+    let e = ktstr::test_support::find_test("bare_allow_inconclusive_compile").unwrap();
+    assert!(
+        e.allow_inconclusive,
+        "bare `allow_inconclusive` must set entry.allow_inconclusive=true"
     );
 }
 

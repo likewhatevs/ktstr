@@ -1069,14 +1069,27 @@ pub struct MonitorThresholds {
     pub max_fallback_rate: f64,
     /// Max sustained dispatch_keep_last events/s across all CPUs.
     pub max_keep_last_rate: f64,
-    /// Promote violations from report-only to pass/fail. When `false`
-    /// (the default), [`MonitorThresholds::evaluate`] still walks every
-    /// sample and records every violation in the verdict's `details`,
-    /// but returns `passed: true` regardless. When `true`, any
-    /// recorded violation also fails the verdict.
+    /// Promote threshold violations from report-only to pass/fail.
+    /// When `false` (the default),
+    /// [`MonitorThresholds::evaluate`] still walks every sample
+    /// and records every violation in the verdict's `details`, but
+    /// returns `passed: true` regardless. When `true`, any recorded
+    /// violation also fails the verdict.
     ///
-    /// Test authors asserting `!verdict.passed` MUST opt into
-    /// enforcement:
+    /// `enforce` gates only the THRESHOLD-VIOLATION path. The
+    /// no-signal Inconclusive arms — empty sample buffer
+    /// ([`MonitorVerdict`] with `summary: "no monitor samples"`)
+    /// and `data_looks_valid` rejection of uninitialized guest
+    /// memory ([`MonitorVerdict`] with
+    /// `summary: "monitor data not yet initialized"`) — fire
+    /// BEFORE `enforce` is consulted and return
+    /// `passed: false, inconclusive: true` regardless of
+    /// `enforce`. "Couldn't evaluate" is not the same as
+    /// "evaluated and OK", so the no-signal path always surfaces
+    /// distinct from Pass.
+    ///
+    /// Test authors asserting `!verdict.passed` on threshold
+    /// violations MUST opt into enforcement:
     /// - For inline `MonitorThresholds { ... }` literals: include
     ///   `enforce: true` before `..Default::default()`.
     /// - For [`Assert`](crate::assert::Assert) builder chains:
@@ -1088,14 +1101,17 @@ pub struct MonitorThresholds {
     ///   [`Assert::monitor_thresholds`](crate::assert::Assert::monitor_thresholds).
     ///
     /// Without this opt-in, a test that sets `fail_on_stall: true`
-    /// and asserts `!verdict.passed` will PASS despite the
-    /// violation: the violation is recorded in `details` and the
-    /// verdict's `summary` carries the report-only advisory
-    /// ("monitor flagged N violation(s) (report-only; pass
-    /// `Assert::with_monitor_defaults` to enforce)"), but `passed`
-    /// stays `true`. The advisory is the operator-visible signal
-    /// that flags missing enforcement; the test still passes
-    /// against `!verdict.passed`.
+    /// and asserts `!verdict.passed` on a THRESHOLD VIOLATION
+    /// will PASS despite the violation: the violation is recorded
+    /// in `details` and the verdict's `summary` carries the
+    /// report-only advisory ("monitor flagged N violation(s)
+    /// (report-only; pass `Assert::with_monitor_defaults` to
+    /// enforce)"), but `passed` stays `true`. The advisory is
+    /// the operator-visible signal that flags missing enforcement;
+    /// the test still passes against `!verdict.passed`. The
+    /// no-signal arms above are not gated by this — use
+    /// `verdict.is_fail()` (rather than `!verdict.passed`) on
+    /// callers that want to ignore the Inconclusive case.
     pub enforce: bool,
 }
 
@@ -1147,26 +1163,141 @@ impl Default for MonitorThresholds {
 }
 
 /// Verdict from evaluating monitor data against thresholds.
+///
+/// Encodes a 3-state outcome under the same `Fail > Inconclusive >
+/// Pass` precedence as [`crate::assert::AssertResult`]. The struct
+/// uses paired bools rather than an enum so existing callers that
+/// read [`Self::passed`] directly continue to compile; the
+/// [`Self::inconclusive`] bit is added alongside under a strict
+/// mutex (at most one of `is_pass`/`is_fail`/`is_inconclusive`
+/// returns true).
+///
+/// - **Pass** (`passed=true, inconclusive=false`): the monitor
+///   walked every sample, no threshold tripped.
+/// - **Inconclusive** (`passed=false, inconclusive=true`): the
+///   monitor had no signal to evaluate — empty sample buffer or
+///   data that fails the
+///   [`MonitorThresholds::data_looks_valid`] plausibility check
+///   (uninitialized guest memory). Distinct from Pass to prevent
+///   the silent-pass class of bug where a CI gate reading
+///   [`Self::is_pass`] would treat "monitor never measured"
+///   identically to "monitor measured and OK".
+/// - **Fail** (`passed=false, inconclusive=false`): the monitor
+///   evaluated samples and at least one threshold was both
+///   tripped and enforced (`MonitorThresholds::enforce = true`).
 #[derive(Debug, Clone)]
 pub struct MonitorVerdict {
-    /// `true` if all thresholds were met.
+    /// `true` if all thresholds were met. False under both Fail
+    /// and Inconclusive — disambiguate via [`Self::inconclusive`]
+    /// or the [`Self::is_pass`] / [`Self::is_fail`] /
+    /// [`Self::is_inconclusive`] strict-mutex accessors.
     pub passed: bool,
-    /// Per-violation detail messages (empty when `passed` is true).
+    /// `true` when the monitor lacked signal to evaluate (no
+    /// samples or data that failed the plausibility check). When
+    /// set, `passed` is always `false` and `details` is empty —
+    /// the operator-visible narrative lives in `summary`. Pinned
+    /// by the strict-mutex invariant: `(passed, inconclusive)`
+    /// is one of `(true, false)`, `(false, true)`, or
+    /// `(false, false)`; `(true, true)` is illegal.
+    pub inconclusive: bool,
+    /// Per-violation detail messages (empty when `passed` is true
+    /// AND when `inconclusive` is true — the no-signal arms carry
+    /// the operator-visible narrative in `summary`, not `details`).
     pub details: Vec<String>,
-    /// One-line summary: "monitor OK" or "monitor FAILED: N violation(s)".
+    /// One-line summary: "monitor OK" / "monitor FAILED: N
+    /// violation(s)" / "no monitor samples" / "monitor data not yet
+    /// initialized".
     pub summary: String,
 }
 
 impl MonitorVerdict {
+    /// Construct an Inconclusive verdict (no signal to evaluate).
+    /// The two no-signal arms in [`MonitorThresholds::evaluate`]
+    /// (empty sample buffer; `data_looks_valid` rejection of
+    /// uninitialized guest memory) both route through this
+    /// constructor so the strict-mutex invariant
+    /// `(passed=false, inconclusive=true)` is enforced at
+    /// construction time rather than by inspection at each
+    /// call site. `details` is always empty on the Inconclusive
+    /// arm — the operator-visible narrative lives in `summary`.
+    ///
+    /// Name matches the variant-named constructor convention on
+    /// sibling types ([`crate::assert::AssertResult::inconclusive`]).
+    pub fn inconclusive(summary: impl Into<String>) -> Self {
+        Self {
+            passed: false,
+            inconclusive: true,
+            details: Vec::new(),
+            summary: summary.into(),
+        }
+    }
     /// Convenience accessor mirroring [`crate::assert::AssertResult::is_pass`] so the
-    /// is_pass / is_fail vocabulary applies uniformly across both
-    /// verdict surfaces.
+    /// `is_pass` / `is_fail` / `is_inconclusive` vocabulary applies
+    /// uniformly across [`crate::assert::AssertResult`] /
+    /// [`crate::test_support::SidecarResult`] / `GauntletRow` (in
+    /// the `stats` module, which is `pub(crate)`) / `MonitorVerdict` /
+    /// `Verdict` (in `assert::claim`, re-exported as
+    /// [`crate::assert::Verdict`]) / [`crate::assert::Outcome`].
+    /// The bare code spans for `GauntletRow` are intentional — the
+    /// containing module is `pub(crate)` so a clickable intra-doc
+    /// link would trip the rustdoc `private_intra_doc_links`
+    /// warning, but the method itself is `pub` within the crate.
+    /// Returns true only on the real-Pass arm — neither Fail nor
+    /// Inconclusive satisfy it. CI gates that want "monitor
+    /// verified OK" semantics call this method and only this
+    /// method.
+    ///
+    /// Skip vocabulary asymmetry: `MonitorVerdict` exposes a
+    /// 3-state surface (`is_pass` / `is_fail` / `is_inconclusive`)
+    /// without an `is_skip` peer, because a monitor never skips by
+    /// design — it either evaluates samples, fails on a threshold,
+    /// or lacks signal (Inconclusive). The sibling 4-state types
+    /// add `is_skip` for the "scenario didn't run" path which has
+    /// no monitor analog.
+    ///
+    /// The accessor `debug_assert!`s the strict-mutex invariant
+    /// `!(passed && inconclusive)` because the type's fields are
+    /// `pub` for ergonomic reads — external code can struct-literal
+    /// an illegal `(true, true)` shape that bypasses
+    /// [`Self::inconclusive`]. The assertion catches the bug at
+    /// test time without paying for the check in release builds.
     pub fn is_pass(&self) -> bool {
-        self.passed
+        debug_assert!(
+            !(self.passed && self.inconclusive),
+            "MonitorVerdict strict 3-state mutex: (passed=true, inconclusive=true) is illegal",
+        );
+        self.passed && !self.inconclusive
     }
     /// Convenience accessor mirroring [`crate::assert::AssertResult::is_fail`].
+    /// Returns true only when the monitor evaluated and a
+    /// threshold tripped — the Inconclusive arm (no signal to
+    /// evaluate) is explicitly excluded so "couldn't measure"
+    /// doesn't masquerade as "measured and broken". Carries the
+    /// same `debug_assert!` strict-mutex guard as [`Self::is_pass`].
     pub fn is_fail(&self) -> bool {
-        !self.passed
+        debug_assert!(
+            !(self.passed && self.inconclusive),
+            "MonitorVerdict strict 3-state mutex: (passed=true, inconclusive=true) is illegal",
+        );
+        !self.passed && !self.inconclusive
+    }
+    /// Convenience accessor mirroring
+    /// [`crate::assert::AssertResult::is_inconclusive`]. True when
+    /// the monitor lacked signal to evaluate (no samples or data
+    /// that failed the plausibility check). Distinct from
+    /// [`Self::is_pass`] (which means the monitor verified the
+    /// scheduler) and [`Self::is_fail`] (which means a threshold
+    /// tripped). CI gates that need "did monitor produce a
+    /// verdict?" should test
+    /// `v.is_pass() || v.is_fail()` and treat
+    /// `is_inconclusive()` as "couldn't measure". Carries the
+    /// same `debug_assert!` strict-mutex guard as [`Self::is_pass`].
+    pub fn is_inconclusive(&self) -> bool {
+        debug_assert!(
+            !(self.passed && self.inconclusive),
+            "MonitorVerdict strict 3-state mutex: (passed=true, inconclusive=true) is illegal",
+        );
+        self.inconclusive
     }
     /// Iterate the violation-detail messages. Naming mirrors
     /// [`crate::assert::AssertResult::failure_details`] so consumers can swap
@@ -1174,6 +1305,18 @@ impl MonitorVerdict {
     /// MonitorVerdict's details are `String` rather than
     /// `AssertDetail` because the monitor-thread surface doesn't
     /// carry kind tags.
+    ///
+    /// No `inconclusive_details` peer: the Inconclusive arms
+    /// (no-signal paths via [`Self::inconclusive`]) carry the
+    /// operator-visible narrative in `summary` rather than a
+    /// per-violation `details` vec. There are no per-detail
+    /// inconclusive payloads to iterate — the singular summary
+    /// IS the narrative. `AssertResult` exposes an
+    /// `inconclusive_details` iterator because each
+    /// `record_inconclusive` push carries its own `AssertDetail`
+    /// payload; the monitor surface produces at most one
+    /// Inconclusive signal per evaluate() call, so the
+    /// peer would always yield zero or one entry.
     #[allow(dead_code)]
     pub fn failure_details(&self) -> impl Iterator<Item = &String> {
         self.details.iter()
@@ -1183,21 +1326,25 @@ impl MonitorVerdict {
 impl MonitorThresholds {
     /// Evaluate a MonitorReport against these thresholds.
     ///
-    /// Returns a passing verdict when samples are empty or when the monitor
-    /// data appears to be uninitialized guest memory (all rq_clocks identical
-    /// across every CPU and sample, or DSQ depths above a plausibility
-    /// ceiling). The monitor thread reads raw guest memory via BTF offsets;
-    /// in short-lived VMs the kernel may not have populated the per-CPU
-    /// runqueue structures before the monitor starts sampling.
+    /// Returns an INCONCLUSIVE verdict when samples are empty or
+    /// when the monitor data appears to be uninitialized guest
+    /// memory (all rq_clocks identical across every CPU and sample,
+    /// or DSQ depths above a plausibility ceiling). The monitor
+    /// thread reads raw guest memory via BTF offsets; in short-lived
+    /// VMs the kernel may not have populated the per-CPU runqueue
+    /// structures before the monitor starts sampling.
+    ///
+    /// The no-signal arms used to return `passed: true` — the
+    /// silent-pass class of bug, where a CI gate keying off
+    /// [`MonitorVerdict::is_pass`] couldn't distinguish "monitor
+    /// verified OK" from "monitor never measured". Inconclusive
+    /// surfaces this distinction explicitly so the operator triages
+    /// it instead of shipping on a non-measurement.
     pub fn evaluate(&self, report: &MonitorReport) -> MonitorVerdict {
         let mut details = Vec::new();
 
         if report.samples.is_empty() {
-            return MonitorVerdict {
-                passed: true,
-                details: vec![],
-                summary: "no monitor samples".into(),
-            };
+            return MonitorVerdict::inconclusive("no monitor samples");
         }
 
         // Validity check: detect uninitialized guest memory.
@@ -1205,11 +1352,7 @@ impl MonitorThresholds {
         // identical, the kernel never wrote to these fields — the monitor
         // was reading zeroed or garbage memory.
         if !Self::data_looks_valid(&report.samples) {
-            return MonitorVerdict {
-                passed: true,
-                details: vec![],
-                summary: "monitor data not yet initialized".into(),
-            };
+            return MonitorVerdict::inconclusive("monitor data not yet initialized");
         }
 
         let mut imbalance = SustainedViolationTracker::default();
@@ -1396,6 +1539,7 @@ impl MonitorThresholds {
 
         MonitorVerdict {
             passed: !failed || !self.enforce,
+            inconclusive: false,
             details,
             summary,
         }

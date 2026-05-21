@@ -580,7 +580,71 @@ fn merge_outcomes_extend_and_stats_sum_coexist() {
     assert_eq!(a.stats.total_iterations, 150, "stats SUM (not max)");
     assert_eq!(a.stats.total_workers, 5);
     assert_eq!(a.failure_details().count(), 1);
-    assert_eq!(a.skip_reasons().count(), 1);
+    assert_eq!(a.skip_details().count(), 1);
+}
+
+/// `AssertResult::merge` Inconclusive precedence: the lattice
+/// is `Fail > Inconclusive > Pass > Skip`. Pin every cell of the
+/// merge lattice involving Inconclusive so a regression that
+/// inverts the ordering surfaces immediately.
+///
+/// Each sub-case constructs two AssertResults, merges them
+/// commutatively (lhs+rhs AND rhs+lhs), and asserts the verdict.
+/// The commutative half catches any non-symmetric short-circuit
+/// (e.g. an early `if self.is_fail() return` that would mask
+/// regressions when Inconclusive appears on the right).
+#[test]
+fn merge_inconclusive_precedence() {
+    fn merged(lhs: AssertResult, rhs: AssertResult) -> AssertResult {
+        let mut a = lhs;
+        a.merge(rhs);
+        a
+    }
+    fn mk_pass() -> AssertResult {
+        AssertResult::pass()
+    }
+    fn mk_skip() -> AssertResult {
+        let mut r = AssertResult::pass();
+        r.record_skip("s");
+        r
+    }
+    fn mk_inconc() -> AssertResult {
+        let mut r = AssertResult::pass();
+        r.record_inconclusive(AssertDetail::new(DetailKind::Other, "i"));
+        r
+    }
+    fn mk_fail() -> AssertResult {
+        let mut r = AssertResult::pass();
+        r.record_fail(AssertDetail::new(DetailKind::Other, "f"));
+        r
+    }
+
+    // Pass + Inconclusive => Inconclusive (both orders).
+    let pi = merged(mk_pass(), mk_inconc());
+    assert!(pi.is_inconclusive() && !pi.is_fail() && !pi.is_pass());
+    let ip = merged(mk_inconc(), mk_pass());
+    assert!(ip.is_inconclusive() && !ip.is_fail() && !ip.is_pass());
+
+    // Skip + Inconclusive => Inconclusive (Inconclusive > Skip).
+    let si = merged(mk_skip(), mk_inconc());
+    assert!(si.is_inconclusive() && !si.is_skip() && !si.is_fail());
+    let is_ = merged(mk_inconc(), mk_skip());
+    assert!(is_.is_inconclusive() && !is_.is_skip() && !is_.is_fail());
+
+    // Fail + Inconclusive => Fail (Fail > Inconclusive).
+    let fi = merged(mk_fail(), mk_inconc());
+    assert!(fi.is_fail() && !fi.is_inconclusive() && !fi.is_pass());
+    let if_ = merged(mk_inconc(), mk_fail());
+    assert!(if_.is_fail() && !if_.is_inconclusive() && !if_.is_pass());
+
+    // Inconclusive + Inconclusive => Inconclusive, both extend.
+    let ii = merged(mk_inconc(), mk_inconc());
+    assert!(ii.is_inconclusive() && !ii.is_fail() && !ii.is_pass());
+    assert_eq!(
+        ii.outcomes.len(),
+        2,
+        "both Inconclusive outcomes extend the merged vec"
+    );
 }
 
 #[test]

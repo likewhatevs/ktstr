@@ -226,18 +226,18 @@ impl Verdict {
         self
     }
 
-    /// Mark the verdict as skipped with the supplied reason. Sets
-    /// `skipped = true` and records the reason as a
-    /// [`DetailKind::Skip`] detail. Use when a precondition is
-    /// missing and the scenario cannot run.
+    /// Mark the verdict as skipped with the supplied reason. Pushes
+    /// one [`Outcome::Skip`] carrying a [`DetailKind::Skip`] detail
+    /// onto the outcome stream. Use when a precondition is missing
+    /// and the scenario cannot run.
     ///
-    /// `passed` is preserved: a verdict whose earlier claim failed
-    /// (`passed = false`) and then transitions to skip stays
-    /// failed. Once a claim records a real failure, masking it
-    /// with a later skip would lie to gate callers — the prior
-    /// failure is real evidence and must surface. Distinct from
+    /// Prior outcomes are preserved: a verdict whose earlier claim
+    /// failed and then transitions to skip stays failed. The merge
+    /// lattice (`Fail > Inconclusive > Pass > Skip`) keeps any
+    /// recorded [`Outcome::Fail`] dominant, so once a claim records
+    /// a real failure, a later skip cannot mask it. Distinct from
     /// [`AssertResult::skip`], which is a CONSTRUCTOR producing a
-    /// fresh passing-skipped envelope from no prior state.
+    /// fresh skipped envelope from no prior state.
     pub fn skip(&mut self, reason: impl Into<String>) -> &mut Self {
         self.result.record_skip(reason);
         self
@@ -252,25 +252,112 @@ impl Verdict {
         self
     }
 
+    /// Mark the verdict as inconclusive with the supplied detail.
+    /// Pushes one [`Outcome::Inconclusive`] carrying `detail` onto
+    /// the outcome stream. Use when the gate APPLIED (preconditions
+    /// were met) but the signal needed to evaluate it was absent —
+    /// e.g. a ratio whose denominator is INSTRUMENT-derived and
+    /// happened to be zero (no migrations observed), so the
+    /// comparison cannot be performed and the verdict is neither
+    /// pass nor fail.
+    ///
+    /// Boundary with [`Self::skip`]: Inconclusive = the gate
+    /// applied but the signal was absent; Skip = the gate's
+    /// precondition was unmet so the gate did not apply at all.
+    /// Boundary with comparator-driven `record_fail`: Inconclusive
+    /// = the denominator is INSTRUMENT-derived (a measurement that
+    /// happened to be zero); Fail = the denominator is
+    /// POLICY-derived (a configured expectation that must hold —
+    /// see the [`Outcome`] doc's `MemPolicy::Bind` carve-out).
+    ///
+    /// Prior outcomes are preserved: a verdict whose earlier claim
+    /// failed and then transitions to inconclusive stays failed
+    /// per the merge lattice (`Fail > Inconclusive > Pass > Skip`).
+    pub fn inconclusive(&mut self, detail: AssertDetail) -> &mut Self {
+        self.result.record_inconclusive(detail);
+        self
+    }
+
+    /// Conditional inconclusive: record `detail` when `cond` is
+    /// true; no-op otherwise. Convenience over
+    /// `if cond { v.inconclusive(detail); }`. Mirrors
+    /// [`Self::skip_if`].
+    pub fn inconclusive_if(&mut self, cond: bool, detail: AssertDetail) -> &mut Self {
+        if cond {
+            self.inconclusive(detail);
+        }
+        self
+    }
+
     /// Fold an external [`AssertResult`] into this verdict. Useful when
     /// a test combines pointwise claims with the result of an upstream
     /// `assert_*` call (e.g. `assert_not_starved`). Mirrors
-    /// [`AssertResult::merge`] semantics — `passed` is conjoined,
-    /// `details` concatenate, aggregate stats adopt the worst per
-    /// dimension.
+    /// [`AssertResult::merge`] semantics — `other.outcomes` are
+    /// appended to this verdict's outcome stream, so the merge
+    /// lattice (`Fail > Inconclusive > Pass > Skip`) folds across
+    /// both sides; `notes`/`measurements` are concatenated;
+    /// aggregate stats adopt the worst per dimension.
     pub fn merge(&mut self, other: AssertResult) -> &mut Self {
         self.result.merge(other);
         self
     }
 
-    /// True iff every claim recorded so far passed and no merged
-    /// upstream result reported a failure. Read-only.
-    pub fn passed(&self) -> bool {
+    /// True iff the folded outcome is [`Outcome::Pass`]. Per
+    /// [`AssertResult::is_pass`], this requires no recorded
+    /// `Fail`, no recorded `Inconclusive`, AND the outcome
+    /// stream is either empty or contains at least one
+    /// non-`Skip` claim. An empty verdict (no claims recorded)
+    /// folds to Pass; an all-`Skip` stream returns `false`
+    /// here — the verdict didn't fail, but it also didn't
+    /// actually run. Read-only. Name matches the rest of the
+    /// 4-state vocabulary across [`AssertResult::is_pass`] /
+    /// [`crate::test_support::SidecarResult::is_pass`] /
+    /// [`Outcome::is_pass`] / [`Self::is_pass`] /
+    /// `MonitorVerdict::is_pass` (in the `monitor` module,
+    /// which is `pub(crate)`) / `GauntletRow::is_pass` (in
+    /// the `stats` module, which is `pub(crate)`). The methods
+    /// are `pub`; only the containing modules are `pub(crate)`,
+    /// so the bare rustdoc links don't resolve from this pub
+    /// item — the code spans on those two are bare to avoid a
+    /// private intra-doc-link warning.
+    ///
+    /// Note: a verdict that recorded one or more [`Outcome::Inconclusive`]
+    /// outcomes returns `false` here even though it did not record a
+    /// hard failure. Use [`Verdict::into_result`] + [`AssertResult::outcome`]
+    /// when callers need to distinguish Pass from Inconclusive from Fail.
+    pub fn is_pass(&self) -> bool {
         self.result.is_pass()
     }
 
-    /// Number of recorded outcomes carrying a payload (Fail + Skip)
-    /// — i.e. recorded diagnostics so far. Pass markers don't count.
+    /// True iff any recorded outcome is [`Outcome::Fail`]. Mirrors
+    /// [`AssertResult::is_fail`] — any Fail in the outcome stream
+    /// dominates under the `Fail > Inconclusive > Pass > Skip`
+    /// lattice, so a single failed claim makes this true regardless
+    /// of how many later inconclusive or pass claims followed.
+    pub fn is_fail(&self) -> bool {
+        self.result.is_fail()
+    }
+
+    /// True iff any recorded outcome is [`Outcome::Inconclusive`] and
+    /// no [`Outcome::Fail`] was recorded. Mirrors
+    /// [`AssertResult::is_inconclusive`]. Fail dominates: a verdict
+    /// with both Fail and Inconclusive outcomes returns false here
+    /// and true from [`Self::is_fail`].
+    pub fn is_inconclusive(&self) -> bool {
+        self.result.is_inconclusive()
+    }
+
+    /// True iff the outcome stream is non-empty and every recorded
+    /// outcome is [`Outcome::Skip`]. Mirrors [`AssertResult::is_skip`].
+    /// An empty verdict (the merge identity) returns false here — it
+    /// is reported as Pass via [`Self::is_pass`], not Skip.
+    pub fn is_skip(&self) -> bool {
+        self.result.is_skip()
+    }
+
+    /// Number of recorded outcomes carrying a payload
+    /// (Fail + Inconclusive + Skip) — i.e. recorded diagnostics so
+    /// far. Pass markers don't count.
     pub fn detail_count(&self) -> usize {
         self.result
             .outcomes

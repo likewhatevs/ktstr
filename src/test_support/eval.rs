@@ -1519,8 +1519,14 @@ fn run_ktstr_test_inner_impl(
     // `--- scheduler log ---`, `--- sched_ext dump ---`,
     // `--- monitor ---`, `stage:` sections; same auto-repro
     // dispatch).
+    // Guest reported a hard Fail (not Skip, not Inconclusive): the
+    // host-side post_vm callback cannot improve on a definite guest
+    // failure, so we suppress it and let the existing fail flow
+    // through. Skip and Inconclusive guest outcomes deliberately
+    // fall through to run post_vm — both leave room for the host
+    // check to add evidence the guest did not collect.
     let guest_already_failed = parse_assert_result_from_drain(result.guest_messages.as_ref())
-        .map(|r| !r.is_pass())
+        .map(|r| r.is_fail())
         .unwrap_or(false);
     let post_vm_err: Option<anyhow::Error> = if guest_already_failed {
         None
@@ -2127,7 +2133,8 @@ fn evaluate_vm_result(
         if !check_result.is_pass() {
             let details = check_result
                 .failure_details()
-                .chain(check_result.skip_reasons())
+                .chain(check_result.inconclusive_details())
+                .chain(check_result.skip_details())
                 .map(|d| d.message.as_str())
                 .collect::<Vec<_>>()
                 .join("\n  ");
@@ -2225,8 +2232,21 @@ fn evaluate_vm_result(
             // claim failures.
             let temporal_section =
                 crate::test_support::output::format_temporal_assertions_section(&check_result);
+            // Skip-only results take an early exit through
+            // `record_skip_sidecar` upstream, so this block only
+            // sees Fail or Inconclusive. Render the lattice verdict
+            // accurately — "failed" for a hard Fail, "inconclusive"
+            // for a zero-denominator Inconclusive — so a CI human
+            // reading the dump can triage without inferring from
+            // exit code alone (dispatch.rs projects Inconclusive to
+            // exit code 2; the verdict word here mirrors that).
+            let verdict_word = if check_result.is_inconclusive() {
+                "inconclusive"
+            } else {
+                "failed"
+            };
             let msg = format!(
-                "{}{}ktstr_test '{}'{} [topo={}] failed:\n  {}{}{}{}{}{}{}{}{}{}{}",
+                "{}{}ktstr_test '{}'{} [topo={}] {verdict_word}:\n  {}{}{}{}{}{}{}{}{}{}{}",
                 fingerprint_line,
                 bug_summary_line(),
                 entry.name,
@@ -2292,6 +2312,22 @@ fn evaluate_vm_result(
                     dump_section,
                 );
                 anyhow::bail!("{msg}");
+            } else if verdict.is_inconclusive() {
+                // Monitor reached the evaluator but had no signal —
+                // no samples, or data that failed the plausibility
+                // check (uninitialized guest memory). Record on
+                // `check_result` as an Inconclusive outcome so the
+                // sidecar / exit-code surface reflects "couldn't
+                // measure" rather than silently passing. Bailing
+                // would conflate Inconclusive with the Fail arm
+                // above; folding into the outcome stream lets the
+                // 4-state pipeline classify the run correctly.
+                check_result.merge(crate::assert::AssertResult::inconclusive(
+                    crate::assert::AssertDetail::new(
+                        crate::assert::DetailKind::Monitor,
+                        format!("monitor evaluation inconclusive: {}", verdict.summary),
+                    ),
+                ));
             }
         }
 
@@ -2544,7 +2580,11 @@ pub(crate) fn format_monitor_section(
     let s = &eval_report.summary;
     let thresholds = merged_assert.monitor_thresholds();
     let verdict = thresholds.evaluate(&eval_report);
-    let verdict_line = if verdict.is_pass() {
+    let verdict_line = if verdict.is_pass() || verdict.is_inconclusive() {
+        // Inconclusive arms (no samples / uninitialized data)
+        // carry their narrative in `summary`, not `details` —
+        // appending `: details.join` would render
+        // "no monitor samples: " with an empty trailer.
         verdict.summary.clone()
     } else {
         format!("{}: {}", verdict.summary, verdict.details.join("; "))

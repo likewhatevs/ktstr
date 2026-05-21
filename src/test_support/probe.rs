@@ -1652,7 +1652,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         }
     };
 
-    let exit_code = if result.is_pass() { 0 } else { 1 };
+    let exit_code = exit_code_for_result(&result);
     publish_result_and_collect(&result, probe_stop, probe_handle);
     Some(exit_code)
 }
@@ -2105,7 +2105,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
         }
     };
 
-    let exit_code = if result.is_pass() { 0 } else { 1 };
+    let exit_code = exit_code_for_result(&result);
     publish_result_and_collect(&result, stop, Some(handle));
     Some(exit_code)
 }
@@ -2361,6 +2361,23 @@ pub(crate) fn finalize_probe_after_unwind() {
 /// The deferred collection runs from
 /// [`finalize_probe_after_unwind`] in `ktstr_guest_init` Phase 6
 /// after `child.wait()` + `/sched_disable`.
+/// Map an [`AssertResult`] to a probe-dispatch exit code per the
+/// `Fail > Inconclusive > Pass > Skip` lattice: Pass → 0, Inconclusive
+/// → 2, every other state → 1 (Skip degenerates to 1 in the probe
+/// path because a skipped probe test produced no signal and the
+/// dispatch caller needs the failure signal to surface). Distinct
+/// codes let CI tooling triage zero-denominator probe runs separately
+/// from real probe failures.
+fn exit_code_for_result(result: &AssertResult) -> i32 {
+    if result.is_pass() {
+        0
+    } else if result.is_inconclusive() {
+        2
+    } else {
+        1
+    }
+}
+
 fn publish_result_and_collect(
     result: &AssertResult,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -2501,6 +2518,48 @@ mod tests {
         // truncated-input tests below exercise.
         let output = format!("{PROBE_OUTPUT_START}\nnot valid json\n{PROBE_OUTPUT_END}");
         assert!(extract_probe_output(&output, None, None).is_none());
+    }
+
+    /// `exit_code_for_result` maps the 4-state verdict lattice
+    /// (`Fail > Inconclusive > Pass > Skip`) to 3 distinct probe-
+    /// dispatch exit codes: Pass → 0, Inconclusive → 2, every other
+    /// state (Fail, Skip, mixed Fail+Inconclusive) → 1. The third
+    /// code lets CI tooling triage zero-denominator probe runs as
+    /// "couldn't measure" rather than conflating them with real
+    /// probe failures. A regression that mapped Inconclusive into
+    /// the Pass branch would silently let a probe scenario whose
+    /// gate could not evaluate slip past the dispatch caller's
+    /// failure signal.
+    #[test]
+    fn exit_code_for_result_pass_inconc_fail_skip_lattice() {
+        use crate::assert::{AssertDetail, AssertResult, DetailKind};
+        // Pass → 0
+        assert_eq!(exit_code_for_result(&AssertResult::pass()), 0);
+        // Inconclusive → 2
+        let inc = AssertResult::inconclusive(AssertDetail::new(
+            DetailKind::Benchmark,
+            "zero-denominator",
+        ));
+        assert_eq!(exit_code_for_result(&inc), 2);
+        // Fail → 1
+        let fail = AssertResult::fail(AssertDetail::new(DetailKind::Other, "real failure"));
+        assert_eq!(exit_code_for_result(&fail), 1);
+        // Skip → 1 (the probe path treats a skip as "no signal —
+        // surface the failure code for the dispatch caller")
+        assert_eq!(exit_code_for_result(&AssertResult::skip("no signal")), 1);
+        // Fail + Inconclusive → 1 (Fail dominates per the lattice)
+        let mut fail_plus_inc =
+            AssertResult::fail(AssertDetail::new(DetailKind::Other, "real failure first"));
+        fail_plus_inc.record_inconclusive(AssertDetail::new(
+            DetailKind::Benchmark,
+            "and a zero-denom gate",
+        ));
+        assert_eq!(exit_code_for_result(&fail_plus_inc), 1);
+        // Inconclusive + Pass → 2 (Inconclusive dominates Pass)
+        let mut inc_plus_pass =
+            AssertResult::inconclusive(AssertDetail::new(DetailKind::Benchmark, "zero-denom"));
+        inc_plus_pass.record_pass();
+        assert_eq!(exit_code_for_result(&inc_plus_pass), 2);
     }
 
     #[test]

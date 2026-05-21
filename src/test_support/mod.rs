@@ -84,8 +84,9 @@ pub use sidecar::{
 };
 
 pub use dispatch::{
-    analyze_sidecars, is_kernel_unavailable, is_resource_contention, ktstr_main,
-    ktstr_test_early_dispatch, run_ktstr_test, sanitize_kernel_label,
+    EXIT_FAIL, EXIT_INCONCLUSIVE, EXIT_PASS, analyze_sidecars, is_kernel_unavailable,
+    is_resource_contention, ktstr_main, ktstr_test_early_dispatch, run_ktstr_test,
+    sanitize_kernel_label,
 };
 pub use entry::{
     BinaryKindJson, BpfMapWrite, CgroupPath, KTSTR_SCHEDULERS, KTSTR_TESTS, KtstrTestEntry,

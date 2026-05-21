@@ -10,13 +10,16 @@ use anyhow::Result;
 /// `write_skip_sidecar` is the path covered by the ResourceContention
 /// skip branch and any early-exit that bails before `run_ktstr_test_inner`
 /// reaches the VM-run call site. The sidecar must be flagged
-/// `skipped: true, passed: true` so stats tooling that subtracts
-/// skipped runs from pass counts sees a recorded skip instead of
-/// a missing file. This regression guards that contract against a
-/// future change that forgets the passed-true flag or drops skip
-/// sidecars entirely for non-VM early exits.
+/// `skipped: true, passed: false, inconclusive: false` so the strict
+/// 4-state mutex `(passed, skipped, inconclusive, fail)` holds and
+/// downstream consumers (`SidecarResult::is_pass()`,
+/// `select_failed_names`, `stats compare`) read the row as a Skip
+/// rather than a Pass. This regression guards that contract against
+/// a future change that flips back to `passed: true` (which would
+/// double-count skipped runs into both pass and skip buckets and
+/// confuse the per-row outcome triage).
 #[test]
-fn write_skip_sidecar_records_passed_true_skipped_true() {
+fn write_skip_sidecar_records_skip_mutex() {
     let _lock = lock_env();
     let tmp = tempfile::Builder::new()
         .prefix("ktstr-sidecar-skip-writes-test-")
@@ -40,12 +43,24 @@ fn write_skip_sidecar_records_passed_true_skipped_true() {
     let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
     assert_eq!(loaded.test_name, "__skip_sidecar_test__");
     assert!(
-        loaded.passed,
-        "skip sidecar must set passed=true so the verdict gate does not flip fail",
+        !loaded.passed,
+        "skip sidecar must set passed=false so the strict 4-state mutex holds and is_pass() returns false",
     );
     assert!(
         loaded.skipped,
         "skip sidecar must set skipped=true so stats tooling excludes from pass count",
+    );
+    assert!(
+        !loaded.inconclusive,
+        "skip sidecar must set inconclusive=false so the strict 4-state mutex holds",
+    );
+    assert!(
+        loaded.is_skip(),
+        "skip sidecar must read as Skip via the accessor",
+    );
+    assert!(
+        !loaded.is_pass() && !loaded.is_fail() && !loaded.is_inconclusive(),
+        "skip sidecar must read exclusively as Skip — not Pass, Fail, or Inconclusive",
     );
     assert_eq!(
         loaded.work_type, "skipped",
@@ -162,6 +177,7 @@ fn sidecar_payload_and_metrics_always_emit_when_empty() {
         metrics,
         passed: _,
         skipped: _,
+        inconclusive: _,
         stats: _,
         monitor,
         stimulus_events,

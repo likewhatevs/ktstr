@@ -29,7 +29,8 @@ fn note_value_from_impls_route_to_correct_variant() {
 
 /// `note_value` writes into [`AssertResult::measurements`] without
 /// altering the verdict. Distinct from [`Self::note`] (which
-/// writes a `String` to `details`) — a producer commonly calls
+/// pushes a [`crate::assert::InfoNote`] onto
+/// [`AssertResult::info_notes`]) — a producer commonly calls
 /// BOTH and they occupy independent buffers.
 #[test]
 fn note_value_records_without_altering_verdict() {
@@ -267,11 +268,13 @@ fn any_of_concatenates_branch_failures_with_index_prefixes() {
         "branch 1 detail must carry index prefix: {:?}",
         r.outcomes,
     );
-    // A summary line names how many branches failed.
+    // A summary line names the per-disposition counts (failed /
+    // inconclusive / skipped) so the operator sees the shape of
+    // the disjunction, not just the failure count.
     assert!(
         r.failure_details()
-            .any(|d| d.message.contains("all 2 branches failed")),
-        "summary line missing: {:?}",
+            .any(|d| d.message.contains("2 failed") && d.message.contains("of 2 branches")),
+        "summary line missing per-disposition counts: {:?}",
         r.outcomes,
     );
 }
@@ -289,6 +292,107 @@ fn any_of_empty_input_fails() {
         "empty disjunction must surface as named failure: {:?}",
         r.outcomes,
     );
+}
+
+/// `any_of` with all branches Inconclusive yields an Inconclusive
+/// verdict (not Fail and not Pass). Pins the discriminant-aware
+/// synthesis at the end of `any_of` — without this, an all-
+/// Inconclusive disjunction would synthesize `Outcome::Fail` and
+/// promote unevaluated branches to a real failure, lying to CI.
+#[test]
+fn any_of_all_inconclusive_branches_yields_inconclusive() {
+    let mut b0 = AssertResult::pass();
+    b0.record_inconclusive(AssertDetail::new(
+        DetailKind::Migration,
+        "zero denom branch 0",
+    ));
+    let mut b1 = AssertResult::pass();
+    b1.record_inconclusive(AssertDetail::new(
+        DetailKind::Benchmark,
+        "zero denom branch 1",
+    ));
+    let r = AssertResult::any_of([b0, b1]);
+    assert!(
+        r.is_inconclusive(),
+        "all-Inconclusive disjunction must yield Inconclusive, not Fail or Pass: {:?}",
+        r.outcomes,
+    );
+    assert!(!r.is_fail(), "must not promote Inconclusive to Fail");
+    assert!(
+        !r.is_pass(),
+        "must not silently pass on unevaluated branches"
+    );
+    // The synthesized summary line names the per-disposition counts.
+    assert!(
+        r.inconclusive_details()
+            .any(|d| d.message.contains("2 inconclusive") && d.message.contains("of 2 branches")),
+        "summary line missing inconclusive count: {:?}",
+        r.outcomes,
+    );
+    // Every branch's payload is prefixed with `any_of[N]:` so the
+    // operator can trace which branch was inconclusive.
+    let inconc_messages: Vec<&str> = r
+        .inconclusive_details()
+        .map(|d| d.message.as_str())
+        .collect();
+    assert!(
+        inconc_messages
+            .iter()
+            .any(|m| m.contains("any_of[0]: zero denom branch 0")),
+        "branch 0 inconclusive missing prefix: {inconc_messages:?}",
+    );
+    assert!(
+        inconc_messages
+            .iter()
+            .any(|m| m.contains("any_of[1]: zero denom branch 1")),
+        "branch 1 inconclusive missing prefix: {inconc_messages:?}",
+    );
+}
+
+/// `any_of` with Fail-plus-Inconclusive branches yields Fail
+/// (real failure dominates an unevaluated check). Pins the
+/// `if n_fail > 0` short-circuit in the synthesis — a regression
+/// to "any Inconclusive demotes to Inconclusive" would silently
+/// hide real failures behind a not-evaluated label.
+#[test]
+fn any_of_fail_plus_inconclusive_yields_fail() {
+    let failing = AssertResult::fail(AssertDetail::new(DetailKind::Other, "real boom"));
+    let mut inconc = AssertResult::pass();
+    inconc.record_inconclusive(AssertDetail::new(DetailKind::Migration, "zero denom"));
+    let r = AssertResult::any_of([failing, inconc]);
+    assert!(
+        r.is_fail(),
+        "Fail+Inconclusive disjunction must yield Fail: {:?}",
+        r.outcomes,
+    );
+    assert!(!r.is_inconclusive());
+    // Summary names both counts (1 fail + 1 inconclusive of 2).
+    assert!(
+        r.failure_details()
+            .any(|d| d.message.contains("1 failed") && d.message.contains("1 inconclusive")),
+        "summary line missing per-disposition counts: {:?}",
+        r.outcomes,
+    );
+}
+
+/// `any_of` with Inconclusive-plus-Skip branches (no Fail, no
+/// Pass) yields Inconclusive — Inconclusive dominates Skip per
+/// `Fail > Inconclusive > Pass > Skip`. Pins that the synthesis
+/// chain falls through to the `n_inc > 0` arm rather than the
+/// all-Skip arm when any branch is Inconclusive.
+#[test]
+fn any_of_inconclusive_plus_skip_yields_inconclusive() {
+    let mut inconc = AssertResult::pass();
+    inconc.record_inconclusive(AssertDetail::new(DetailKind::Migration, "zero denom"));
+    let skip = AssertResult::skip("topology missing");
+    let r = AssertResult::any_of([inconc, skip]);
+    assert!(
+        r.is_inconclusive(),
+        "Inconclusive+Skip disjunction must yield Inconclusive (Inconclusive dominates Skip): {:?}",
+        r.outcomes,
+    );
+    assert!(!r.is_skip());
+    assert!(!r.is_pass());
 }
 
 /// `all_of` is conjunction: passes iff every branch passes.

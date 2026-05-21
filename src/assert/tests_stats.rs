@@ -117,7 +117,7 @@ fn assert_format_human_default_checks_shows_all_none() {
 }
 
 #[test]
-fn is_skipped_true_for_skip_result() {
+fn is_skip_true_for_skip_result() {
     // Skip results must be distinguishable from pass and fail
     // results so stats tooling can subtract them from pass counts
     // — a skipped test is not a successful execution. A skip has
@@ -125,23 +125,23 @@ fn is_skipped_true_for_skip_result() {
     let r = AssertResult::skip("no LLC available");
     assert!(!r.is_fail(), "skip is not a failure");
     assert!(!r.is_pass(), "skip is not a pass");
-    assert!(r.is_skipped(), "skip must report is_skipped");
+    assert!(r.is_skip(), "skip must report is_skip");
 }
 
 #[test]
-fn is_skipped_false_for_pass_result() {
+fn is_skip_false_for_pass_result() {
     let r = AssertResult::pass();
     assert!(r.is_pass());
-    assert!(!r.is_skipped(), "pass is not a skip");
+    assert!(!r.is_skip(), "pass is not a skip");
 }
 
 #[test]
-fn is_skipped_false_for_fail_result() {
+fn is_skip_false_for_fail_result() {
     let mut r = AssertResult::pass();
 
     r.record_fail(AssertDetail::new(DetailKind::Starved, "worker starved"));
     assert!(
-        !r.is_skipped(),
+        !r.is_skip(),
         "fail is not a skip even with non-skip details"
     );
 }
@@ -160,13 +160,13 @@ fn assert_result_pass_defaults() {
 fn assert_result_skip_carries_reason() {
     // A skip terminal verdict is is_skip()=true, with the reason
     // recorded as an Outcome::Skip entry observable via
-    // skip_reasons(). It is NOT a pass (is_pass() returns false).
+    // skip_details(). It is NOT a pass (is_pass() returns false).
     let r = AssertResult::skip("topology too small");
     assert!(r.is_skip());
     assert!(!r.is_pass(), "skip is not a pass");
     assert_eq!(r.outcomes.len(), 1);
     assert_eq!(
-        r.skip_reasons().next().unwrap().message,
+        r.skip_details().next().unwrap().message,
         "topology too small"
     );
 }

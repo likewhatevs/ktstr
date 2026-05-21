@@ -175,14 +175,45 @@ pub struct SidecarResult {
     /// non-`Option` fields fail deserialize on absence. See the
     /// module-level doc for the full contract.
     pub metrics: Vec<PayloadMetrics>,
-    /// Overall pass/fail verdict for this run.
+    /// True when the run is a real pass — every assertion that
+    /// ran produced a positive verdict. Mirrors
+    /// [`crate::assert::AssertResult::is_pass`]. Mutually
+    /// exclusive with [`Self::skipped`] and [`Self::inconclusive`]:
+    /// the three bits `(passed, skipped, inconclusive)` form a
+    /// strict 4-state encoding where at most one is set per
+    /// record. The fourth state — Fail — is the all-false case
+    /// (no dedicated bit; [`Self::is_fail`] derives it). A real
+    /// pass requires `!skipped && !inconclusive` AND at least one
+    /// observed assertion (the empty / all-skip case routes
+    /// through [`Self::skipped`] instead).
     pub passed: bool,
-    /// True when the test was skipped (e.g. topology mismatch,
-    /// missing resource). A skipped test has `passed == true`
-    /// (to keep the verdict gate simple) but downstream stats
-    /// tooling must subtract `skipped` runs from "pass count" to
-    /// avoid reporting non-executions as passes.
+    /// True when the run was skipped (e.g. topology mismatch,
+    /// missing resource, in-VM `AssertResult::skip` return).
+    /// Mutually exclusive with [`Self::passed`] (Pass requires a
+    /// real assertion; an all-skip stream is Skip, not Pass) and
+    /// with [`Self::inconclusive`]. Stats tooling subtracts
+    /// `skipped` runs from "pass count" so non-executions are not
+    /// reported as passes.
     pub skipped: bool,
+    /// True when at least one assertion was [`Outcome::Inconclusive`](crate::assert::Outcome::Inconclusive) —
+    /// the run ran but a zero-denominator ratio gate could not be
+    /// evaluated (e.g. zero iterations across all workers under a
+    /// `max_migration_ratio` check). Mutually exclusive with
+    /// [`Self::passed`] and [`Self::skipped`]; in the
+    /// `Fail > Inconclusive > Pass > Skip` lattice, Inconclusive
+    /// dominates Pass/Skip but loses to Fail, so a run with both
+    /// Inconclusive and Fail outcomes records `inconclusive = false,
+    /// passed = false` (Fail wins) — `inconclusive = true` requires
+    /// `!is_fail() && !is_pass() && !is_skip()`.
+    ///
+    /// Distinct from `passed = false` (Fail) and `skipped = true`
+    /// (precondition unmet) so CI gates and stats tooling can
+    /// triage zero-denominator runs as "workload didn't produce
+    /// the signal the assertion needed" rather than misclassifying
+    /// them as silent passes (prior to the [`Outcome::Inconclusive`](crate::assert::Outcome::Inconclusive)
+    /// variant the zero-denominator case fell out as Pass) or as
+    /// hard failures.
+    pub inconclusive: bool,
     /// Aggregate per-cgroup statistics merged across every worker.
     pub stats: ScenarioStats,
     /// Monitor summary. `None` means the monitor loop did not run
@@ -397,20 +428,54 @@ impl SidecarResult {
     /// Convenience accessor mirroring
     /// [`crate::assert::AssertResult::is_pass`]. SidecarResult is the
     /// wire-format mirror of an AssertResult; this method exposes the
-    /// same is_pass / is_fail / is_skip vocabulary so consumers can swap
-    /// between the two without re-learning field names.
+    /// same is_pass / is_fail / is_skip / is_inconclusive vocabulary
+    /// so consumers can swap between the two without re-learning
+    /// field names.
+    ///
+    /// Returns true only when the run reached a real Pass — neither
+    /// skipped, inconclusive, nor failed. The triple-conjunct guard
+    /// matches AssertResult's `Fail > Inconclusive > Pass > Skip`
+    /// dominance under the strict 4-state mutex this struct encodes.
+    /// CI gates that want "ship-on-pass" semantics call this method
+    /// and only this method.
+    ///
+    /// Part of the `is_pass` / `is_fail` / `is_inconclusive` /
+    /// `is_skip` vocabulary uniform across the verdict surfaces:
+    /// [`crate::assert::AssertResult::is_pass`] / `Self::is_pass` /
+    /// [`crate::assert::Outcome::is_pass`] / `MonitorVerdict::is_pass`
+    /// (in the `monitor` module, which is `pub(crate)`) /
+    /// `Verdict::is_pass` (re-exported at [`crate::assert::Verdict`]) /
+    /// `GauntletRow::is_pass` (in the `stats` module, which is
+    /// `pub(crate)`).
     pub fn is_pass(&self) -> bool {
-        self.passed
+        self.passed && !self.skipped && !self.inconclusive
     }
     /// Convenience accessor mirroring
-    /// [`crate::assert::AssertResult::is_fail`].
+    /// [`crate::assert::AssertResult::is_fail`]. The four-state
+    /// encoding uses three stored bits `(passed, skipped,
+    /// inconclusive)` in strict mutual exclusion (at most one
+    /// set); Fail is the all-false derived state, no dedicated
+    /// bit. `is_fail` reads "none of the three bits are set",
+    /// which under `Fail > Inconclusive > Pass > Skip` dominance
+    /// correctly resolves a mixed Fail+Inconclusive stream as
+    /// Fail.
     pub fn is_fail(&self) -> bool {
-        !self.passed
+        !self.passed && !self.skipped && !self.inconclusive
     }
     /// Convenience accessor mirroring
     /// [`crate::assert::AssertResult::is_skip`].
     pub fn is_skip(&self) -> bool {
         self.skipped
+    }
+    /// Convenience accessor mirroring
+    /// [`crate::assert::AssertResult::is_inconclusive`]. True when
+    /// the run could not be evaluated (zero-denominator ratio gate);
+    /// false on real Pass, real Fail, or Skip. CI gates that gate
+    /// on "did we get a real verdict?" should test
+    /// `r.is_pass() || r.is_fail()` and treat both `is_skip()` and
+    /// `is_inconclusive()` as "couldn't measure".
+    pub fn is_inconclusive(&self) -> bool {
+        self.inconclusive
     }
 }
 
@@ -431,9 +496,10 @@ impl SidecarResult {
     /// Defaults model a passing EEVDF run on a minimal `1n1l1c1t`
     /// topology with no payload and no VM telemetry: `test_name="t"`,
     /// `topology="1n1l1c1t"`, `scheduler="eevdf"`, `work_type="SpinWait"`,
-    /// `passed=true`, `skipped=false`, every [`Option`] `None`, every
-    /// [`Vec`] empty, `stats` is `ScenarioStats::default()`, and both
-    /// `timestamp`/`run_id` are empty strings.
+    /// `passed=true`, `skipped=false`, `inconclusive=false`, every
+    /// [`Option`] `None`, every [`Vec`] empty, `stats` is
+    /// `ScenarioStats::default()`, and both `timestamp`/`run_id` are
+    /// empty strings.
     ///
     /// **Prefer this over local `base = || SidecarResult { ... }`
     /// closures.** A local closure duplicates the default set and
@@ -458,6 +524,7 @@ impl SidecarResult {
             metrics: Vec::new(),
             passed: true,
             skipped: false,
+            inconclusive: false,
             stats: crate::assert::ScenarioStats::default(),
             monitor: None,
             stimulus_events: Vec::new(),
@@ -2610,8 +2677,9 @@ pub(crate) fn write_skip_sidecar(entry: &KtstrTestEntry) -> anyhow::Result<()> {
         // association.
         payload: entry.payload.map(|p| p.name.to_string()),
         metrics: Vec::new(),
-        passed: true,
+        passed: false,
         skipped: true,
+        inconclusive: false,
         stats: Default::default(),
         monitor: None,
         stimulus_events: Vec::new(),
@@ -2678,6 +2746,7 @@ pub(crate) fn write_sidecar(
         metrics: payload_metrics.to_vec(),
         passed: check_result.is_pass(),
         skipped: check_result.is_skip(),
+        inconclusive: check_result.is_inconclusive(),
         stats: check_result.stats.clone(),
         monitor: vm_result.monitor.as_ref().map(|m| m.summary.clone()),
         stimulus_events: stimulus_events.to_vec(),

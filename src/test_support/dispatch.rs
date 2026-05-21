@@ -883,10 +883,45 @@ fn run_ktstr_test_with_topo(entry: &KtstrTestEntry, topo: &TopoOverride) -> Resu
     run_ktstr_test_inner(entry, Some(topo))
 }
 
+/// Process exit code for a Pass verdict (and for the Skip path,
+/// which degenerates to Pass because the test never ran).
+///
+/// Defined as a `pub const` so external tooling (CI gates,
+/// dashboard aggregators, nextest wrappers) can reference the
+/// exit-code triad by name instead of duplicating the integer
+/// literals. The trio [`EXIT_PASS`] / [`EXIT_FAIL`] /
+/// [`EXIT_INCONCLUSIVE`] cover every verdict produced by the
+/// `Fail > Inconclusive > Pass > Skip` lattice when projected
+/// to a process exit code.
+pub const EXIT_PASS: i32 = 0;
+
+/// Process exit code for a Fail verdict (or any expect_err
+/// satisfaction failure).
+///
+/// See [`EXIT_PASS`] for the full triad rationale.
+pub const EXIT_FAIL: i32 = 1;
+
+/// Process exit code for an Inconclusive verdict (a
+/// zero-denominator ratio gate that could not evaluate).
+///
+/// Distinct from [`EXIT_PASS`] (which would silently green an
+/// unevaluated gate) and [`EXIT_FAIL`] (which would conflate
+/// "could not evaluate" with a real regression). External tooling
+/// uses this code to triage Inconclusive runs separately — see
+/// the README "Exit codes" section for the full operator contract.
+pub const EXIT_INCONCLUSIVE: i32 = 2;
+
 /// Run a test result through expect_err logic and return an exit code.
 ///
-/// Returns 0 on pass, 1 on failure. `ResourceContention` returns
-/// 0 — the test never ran, not a real failure. The skip sidecar for
+/// Returns [`EXIT_PASS`] on pass, [`EXIT_FAIL`] on failure, and
+/// [`EXIT_INCONCLUSIVE`] on Inconclusive — the 4-state lattice
+/// `Fail > Inconclusive > Pass > Skip` projects to 3 distinct exit
+/// codes (Skip degenerates to [`EXIT_PASS`] because the test never
+/// ran, mirroring `ResourceContention`). [`EXIT_INCONCLUSIVE`] lets
+/// downstream tooling (CI gates, nextest summary aggregation, the
+/// operator dashboard) triage zero-denominator runs distinctly from
+/// real regressions. `ResourceContention` returns [`EXIT_PASS`] —
+/// the test never ran, not a real failure. The skip sidecar for
 /// this case is written upstream in `run_ktstr_test_inner` at the
 /// ResourceContention propagation site so every caller (including
 /// the library entry point `run_ktstr_test`) records it, not just
@@ -902,14 +937,66 @@ fn run_ktstr_test_with_topo(entry: &KtstrTestEntry, topo: &TopoOverride) -> Resu
 /// contention would land in the `Err(e)` arm below as a regular
 /// failure (exit 1) rather than the skip path (exit 0), turning
 /// every host-resource-exhausted run into a hard test failure.
-fn result_to_exit_code(result: Result<AssertResult>, expect_err: bool) -> i32 {
+fn result_to_exit_code(
+    result: Result<AssertResult>,
+    expect_err: bool,
+    allow_inconclusive: bool,
+) -> i32 {
     let no_skip = std::env::var_os("KTSTR_NO_SKIP_MODE").is_some();
     match result {
-        Ok(_) if expect_err => {
-            eprintln!("expected error but test passed");
-            1
+        Ok(r) if expect_err => {
+            // expect_err inverts on Pass and on Inconclusive: both
+            // are "not a failure" in the operator's mental model,
+            // and an expect_err scenario that produces an
+            // Inconclusive verdict (denominator zero) failed to
+            // produce the expected failure just like a Pass would.
+            // Surface the inconclusive as exit code 2 to preserve
+            // the distinct verdict, but treat it as expect_err
+            // satisfaction failure (exit 1) — the test author
+            // wanted a Fail, not "the gate could not run".
+            //
+            // `allow_inconclusive` does NOT relax the expect_err
+            // contract: expect_err demands a real Fail, and an
+            // Inconclusive verdict does not satisfy that
+            // regardless of how the test author scopes
+            // Inconclusive elsewhere. The dominant gate wins;
+            // `allow_inconclusive` only relaxes the
+            // EXIT_INCONCLUSIVE projection on the no-expect_err
+            // path below.
+            if r.is_inconclusive() {
+                eprintln!(
+                    "expected error but test produced an Inconclusive verdict — \
+                     zero-denominator gate could not evaluate; expect_err is \
+                     unsatisfied"
+                );
+                EXIT_FAIL
+            } else {
+                eprintln!("expected error but test passed");
+                EXIT_FAIL
+            }
         }
-        Ok(_) => 0,
+        Ok(r) if r.is_inconclusive() => {
+            // `allow_inconclusive` opt-in: a test author may have
+            // declared `#[ktstr_test(allow_inconclusive)]` to
+            // signal "this test's Inconclusive arm is acceptable —
+            // don't fail the CI gate." Route to EXIT_PASS in that
+            // case (Inconclusive is still recorded in the sidecar
+            // for stats tooling and the operator-facing failure
+            // dump still renders the diagnostic). When the flag
+            // is unset (the default) the verdict surfaces as
+            // EXIT_INCONCLUSIVE so the operator triages it.
+            if allow_inconclusive {
+                eprintln!(
+                    "test produced an Inconclusive verdict but \
+                     `allow_inconclusive` is set — routing to EXIT_PASS \
+                     for CI gate, sidecar still records Inconclusive"
+                );
+                EXIT_PASS
+            } else {
+                EXIT_INCONCLUSIVE
+            }
+        }
+        Ok(_) => EXIT_PASS,
         Err(e) if is_resource_contention(&e) => {
             let reason = e
                 .chain()
@@ -925,10 +1012,10 @@ fn result_to_exit_code(result: Result<AssertResult>, expect_err: bool) -> i32 {
                      requirement, or drop --no-skip-mode / KTSTR_NO_SKIP_MODE to \
                      accept the skip."
                 );
-                1
+                EXIT_FAIL
             } else {
                 crate::report::test_skip(format_args!("resource contention: {reason}"));
-                0
+                EXIT_PASS
             }
         }
         Err(e) if is_topology_insufficient(&e) => {
@@ -938,10 +1025,10 @@ fn result_to_exit_code(result: Result<AssertResult>, expect_err: bool) -> i32 {
                      Either provision a host with the required CPU / LLC count, or drop \
                      --no-skip-mode / KTSTR_NO_SKIP_MODE to accept the skip."
                 );
-                1
+                EXIT_FAIL
             } else {
                 crate::report::test_skip(format_args!("host topology insufficient: {e:#}"));
-                0
+                EXIT_PASS
             }
         }
         Err(e) if expect_err => {
@@ -957,14 +1044,14 @@ fn result_to_exit_code(result: Result<AssertResult>, expect_err: bool) -> i32 {
                 .any(|c| c.is::<crate::test_support::eval::ScxBpfErrorMatcherMismatch>())
             {
                 eprintln!("{e:#}");
-                1
+                EXIT_FAIL
             } else {
-                0
+                EXIT_PASS
             }
         }
         Err(e) => {
             eprintln!("{e:#}");
-            1
+            EXIT_FAIL
         }
     }
 }
@@ -1893,14 +1980,14 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
     }
 
     let result = run_ktstr_test_inner(entry, None);
-    result_to_exit_code(result, entry.expect_err)
+    result_to_exit_code(result, entry.expect_err, entry.allow_inconclusive)
 }
 
 /// Run a host-only test directly without booting a VM.
 /// Returns an exit code for nextest dispatch.
 fn run_host_only_test(entry: &KtstrTestEntry) -> i32 {
     let result = run_host_only_test_inner(entry);
-    result_to_exit_code(result, entry.expect_err)
+    result_to_exit_code(result, entry.expect_err, entry.allow_inconclusive)
 }
 
 /// Inner host-only dispatch returning `Result<AssertResult>`.
@@ -1977,7 +2064,7 @@ pub(crate) fn run_gauntlet_test(rest: &str) -> i32 {
     }
 
     let result = run_ktstr_test_inner(entry, Some(&topo));
-    result_to_exit_code(result, entry.expect_err)
+    result_to_exit_code(result, entry.expect_err, entry.allow_inconclusive)
 }
 
 /// Collect sidecar JSON files and return the full gauntlet analysis.
@@ -3341,6 +3428,83 @@ mod tests {
              got {} lines: {gauntlet_lines:?}",
             gauntlet_lines.len(),
         );
+    }
+
+    /// `result_to_exit_code` maps the 4-state verdict lattice
+    /// (`Fail > Inconclusive > Pass > Skip`) to 3 distinct
+    /// nextest-dispatch exit codes: Pass → 0, Inconclusive → 2,
+    /// Fail → 1. The distinct Inconclusive code lets CI tooling
+    /// triage zero-denominator runs separately from real
+    /// regressions. A regression that mapped Inconclusive into
+    /// the Pass branch (`Ok(_) => 0`) would silently let a test
+    /// whose ratio gate could not evaluate slip past the CI
+    /// summary as a green run.
+    #[test]
+    fn result_to_exit_code_inconclusive_maps_to_distinct_code() {
+        use crate::assert::{AssertDetail, AssertResult, DetailKind};
+        // Pass → 0 (no expect_err inversion, no allow_inconclusive).
+        assert_eq!(
+            result_to_exit_code(Ok(AssertResult::pass()), false, false),
+            0
+        );
+        // Inconclusive → 2 — distinct from Pass and Fail when
+        // allow_inconclusive is unset.
+        let inc = AssertResult::inconclusive(AssertDetail::new(
+            DetailKind::Benchmark,
+            "zero-denominator",
+        ));
+        assert_eq!(result_to_exit_code(Ok(inc), false, false), 2);
+        // expect_err + Pass → 1 (the test was supposed to fail).
+        assert_eq!(
+            result_to_exit_code(Ok(AssertResult::pass()), true, false),
+            1
+        );
+        // expect_err + Inconclusive → 1 (the test was supposed to
+        // produce a real failure; an Inconclusive verdict does
+        // not satisfy expect_err since the gate could not even
+        // evaluate). Distinct surfaced message in stderr.
+        let inc2 = AssertResult::inconclusive(AssertDetail::new(
+            DetailKind::Benchmark,
+            "zero-denominator under expect_err",
+        ));
+        assert_eq!(result_to_exit_code(Ok(inc2), true, false), 1);
+    }
+
+    /// `allow_inconclusive = true` routes a terminal Inconclusive
+    /// verdict to EXIT_PASS at the dispatch layer, opting the test
+    /// out of the EXIT_INCONCLUSIVE projection. Used by tests that
+    /// have an explicit reason to accept "couldn't evaluate" as
+    /// not-a-failure (e.g. exploratory benchmarks under hosts
+    /// whose topology may legitimately starve the workload).
+    /// expect_err still dominates: an expect_err scenario whose
+    /// result is Inconclusive maps to EXIT_FAIL regardless of
+    /// allow_inconclusive — expect_err demands a real Fail.
+    #[test]
+    fn result_to_exit_code_allow_inconclusive_routes_to_pass() {
+        use crate::assert::{AssertDetail, AssertResult, DetailKind};
+        let inc = AssertResult::inconclusive(AssertDetail::new(
+            DetailKind::Benchmark,
+            "zero-denominator (allow_inconclusive=true)",
+        ));
+        // allow_inconclusive=true, expect_err=false: Inconclusive → 0.
+        assert_eq!(result_to_exit_code(Ok(inc), false, true), 0);
+
+        // Pass + allow_inconclusive=true: still Pass → 0 (no
+        // behavior change on the Pass arm).
+        assert_eq!(
+            result_to_exit_code(Ok(AssertResult::pass()), false, true),
+            0
+        );
+
+        // expect_err + Inconclusive + allow_inconclusive: still
+        // → 1. The expect_err gate dominates; allow_inconclusive
+        // only relaxes the EXIT_INCONCLUSIVE projection on the
+        // no-expect_err path.
+        let inc2 = AssertResult::inconclusive(AssertDetail::new(
+            DetailKind::Benchmark,
+            "zero-denominator under expect_err + allow_inconclusive",
+        ));
+        assert_eq!(result_to_exit_code(Ok(inc2), true, true), 1);
     }
 
     /// Multi-kernel suffix emission is suppressed in

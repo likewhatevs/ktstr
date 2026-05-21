@@ -39,7 +39,7 @@ fn assert_result_note_does_not_flip_passed_or_skipped() {
     assert!(r.is_skip());
     // skip pushed one Outcome::Skip; note pushed to info_notes.
     assert_eq!(r.outcomes.len(), 1);
-    let d = r.skip_reasons().next().unwrap();
+    let d = r.skip_details().next().unwrap();
     assert_eq!(d.kind, DetailKind::Skip);
     assert_eq!(r.info_notes.len(), 1);
     assert!(r.info_notes[0].message.contains("LLCs"));
@@ -123,14 +123,14 @@ fn verdict_empty_is_passing() {
 fn verdict_default_matches_new() {
     let d = Verdict::default();
     let n = Verdict::new();
-    assert_eq!(d.passed(), n.passed());
+    assert_eq!(d.is_pass(), n.is_pass());
     assert_eq!(d.detail_count(), n.detail_count());
 }
 
 #[test]
 fn verdict_assert_verdict_attaches_threshold_config() {
     let v = Assert::default_checks().verdict();
-    assert!(v.passed());
+    assert!(v.is_pass());
     assert!(v.assert().is_some());
 
     let v = Verdict::new();
@@ -202,7 +202,7 @@ fn claim_ne_pass_and_fail() {
     let mut v = Verdict::new();
     let flag_pass = 0u64;
     claim!(v, flag_pass).ne(1);
-    assert!(v.passed());
+    assert!(v.is_pass());
 
     let mut v = Verdict::new();
     let flag_fail = 1u64;
@@ -224,7 +224,7 @@ fn claim_at_least_boundary_is_inclusive() {
     let mut v = Verdict::new();
     let counter = 100u64;
     claim!(v, counter).at_least(100);
-    assert!(v.passed());
+    assert!(v.is_pass());
 
     let mut v = Verdict::new();
     let counter = 99u64;
@@ -252,7 +252,7 @@ fn claim_at_most_boundary_is_inclusive() {
     let mut v = Verdict::new();
     let counter = 100u64;
     claim!(v, counter).at_most(100);
-    assert!(v.passed());
+    assert!(v.is_pass());
 
     let mut v = Verdict::new();
     let counter = 101u64;
@@ -273,7 +273,7 @@ fn claim_lt_strict_upper_bound() {
     let mut v = Verdict::new();
     let x = 99u64;
     claim!(v, x).lt(100);
-    assert!(v.passed());
+    assert!(v.is_pass());
 
     let mut v = Verdict::new();
     let x = 100u64;
@@ -294,7 +294,7 @@ fn claim_gt_strict_lower_bound() {
     let mut v = Verdict::new();
     let x = 101u64;
     claim!(v, x).gt(100);
-    assert!(v.passed());
+    assert!(v.is_pass());
 
     let mut v = Verdict::new();
     let x = 100u64;
@@ -319,7 +319,7 @@ fn claim_between_inclusive_on_both_ends() {
     claim!(v, lo).between(10, 20);
     claim!(v, hi).between(10, 20);
     claim!(v, mid).between(10, 20);
-    assert!(v.passed());
+    assert!(v.is_pass());
 
     let mut v = Verdict::new();
     let below = 9u64;
@@ -381,7 +381,7 @@ fn claim_works_across_concrete_types() {
     claim!(v, counter).eq(1);
     claim!(v, pid).at_least(0);
     claim!(v, len).between(1, 5);
-    assert!(v.passed());
+    assert!(v.is_pass());
 }
 
 #[test]
@@ -390,7 +390,7 @@ fn claim_is_finite_passes_for_normal_values() {
         let mut v = Verdict::new();
         let x = v_val;
         claim!(v, x).is_finite();
-        assert!(v.passed(), "{v_val} should be finite");
+        assert!(v.is_pass(), "{v_val} should be finite");
     }
 }
 
@@ -419,7 +419,7 @@ fn claim_near_inclusive_at_tolerance_boundary() {
     let on_edge = 1.001_f64;
     claim!(v, exact).near(1.0, 0.001);
     claim!(v, on_edge).near(1.0, 0.001);
-    assert!(v.passed());
+    assert!(v.is_pass());
 
     let mut v = Verdict::new();
     let outside = 1.002_f64;
@@ -440,7 +440,7 @@ fn claim_near_nan_input_fails() {
     let mut v = Verdict::new();
     let nan = f64::NAN;
     claim!(v, nan).near(1.0, 0.5);
-    assert!(!v.passed());
+    assert!(!v.is_pass());
 }
 
 #[test]
@@ -467,14 +467,14 @@ fn claim_near_handles_infinity_equality() {
     claim!(v, pos_inf).near(f64::INFINITY, 0.001);
     claim!(v, neg_inf).near(f64::NEG_INFINITY, 0.001);
     assert!(
-        v.passed(),
+        v.is_pass(),
         "infinity == infinity must pass near() despite NaN diff",
     );
 
     let mut v = Verdict::new();
     let pos_inf = f64::INFINITY;
     claim!(v, pos_inf).near(f64::NEG_INFINITY, 0.001);
-    assert!(!v.passed());
+    assert!(!v.is_pass());
 }
 
 #[test]
@@ -557,23 +557,23 @@ fn verdict_merge_folds_in_external_assert_result() {
 }
 
 #[test]
-fn verdict_passed_and_detail_count_are_non_consuming_reads() {
+fn verdict_is_pass_and_detail_count_are_non_consuming_reads() {
     let mut v = Verdict::new();
-    assert!(v.passed());
+    assert!(v.is_pass());
     assert_eq!(v.detail_count(), 0);
 
     let x = 100u64;
     claim!(v, x).at_least(50);
-    assert!(v.passed());
+    assert!(v.is_pass());
     assert_eq!(v.detail_count(), 0);
 
     let y = 5u64;
     claim!(v, y).at_least(50);
-    assert!(!v.passed());
+    assert!(!v.is_pass());
     assert_eq!(v.detail_count(), 1);
 
     // Re-read to confirm peeks are non-consuming.
-    assert!(!v.passed());
+    assert!(!v.is_pass());
     assert_eq!(v.detail_count(), 1);
 
     let z = 200u64;
@@ -674,12 +674,12 @@ fn claim_set_comparators_cover_membership_and_size() {
     v.claim_set("s", &s).subset_of(&allowed);
     let forbidden: BTreeSet<usize> = [10, 11].into_iter().collect();
     v.claim_set("s", &s).disjoint_from(&forbidden);
-    assert!(v.passed());
+    assert!(v.is_pass());
 
     let empty: BTreeSet<usize> = BTreeSet::new();
     let mut v = Verdict::new();
     v.claim_set("s", &empty).empty();
-    assert!(v.passed());
+    assert!(v.is_pass());
 }
 
 #[test]
@@ -691,12 +691,12 @@ fn claim_seq_comparators_cover_membership_and_size() {
     verdict.claim_seq("seq", &v_seq).len_at_most(10);
     verdict.claim_seq("seq", &v_seq).len_at_least(1);
     verdict.claim_seq("seq", &v_seq).nonempty();
-    assert!(verdict.passed());
+    assert!(verdict.is_pass());
 
     let empty: Vec<u64> = vec![];
     let mut verdict = Verdict::new();
     verdict.claim_seq("seq", &empty).empty();
-    assert!(verdict.passed());
+    assert!(verdict.is_pass());
 }
 
 #[test]
@@ -712,7 +712,7 @@ fn verdict_skip_marks_skipped_without_failing() {
     assert!(r.is_skip());
     assert!(!r.is_pass(), "skip is not pass");
     assert!(
-        r.skip_reasons()
+        r.skip_details()
             .any(|d| matches!(d.kind, DetailKind::Skip) && d.message.contains("topology missing"))
     );
 }
@@ -730,13 +730,13 @@ fn verdict_skip_marks_skipped_without_failing() {
 fn verdict_skip_preserves_prior_failure() {
     let mut v = Verdict::new();
     claim!(v, 5u64).at_most(3);
-    assert!(!v.passed(), "prior claim should fail (5 > 3)");
+    assert!(!v.is_pass(), "prior claim should fail (5 > 3)");
     v.skip("precondition missing");
     let r = v.into_result();
     // Skip-after-fail produces a Fail terminal verdict
     // (any-Fail-dominates), with the skip reason recorded as a
     // separate Outcome::Skip entry. The result is is_fail() = true
-    // (failure not masked) AND skip_reasons() carries the skip
+    // (failure not masked) AND skip_details() carries the skip
     // detail. is_skip() is false because the outcomes stream contains
     // both a Fail and a Skip (not all-Skip).
     assert!(
@@ -747,7 +747,7 @@ fn verdict_skip_preserves_prior_failure() {
     // The skip reason and the prior failure must both appear in the
     // appropriate per-variant streams.
     assert!(
-        r.skip_reasons()
+        r.skip_details()
             .any(|d| matches!(d.kind, DetailKind::Skip)
                 && d.message.contains("precondition missing")),
         "skip reason must be recorded: {:?}",
@@ -772,6 +772,82 @@ fn verdict_skip_if_is_conditional() {
 }
 
 #[test]
+fn verdict_inconclusive_records_outcome_and_blocks_pass() {
+    let mut v = Verdict::new();
+    v.inconclusive(AssertDetail::new(DetailKind::Migration, "denominator zero"));
+    let r = v.into_result();
+    assert!(
+        !r.is_pass(),
+        "Inconclusive must NOT fold to Pass — got is_pass={}",
+        r.is_pass(),
+    );
+    assert!(
+        r.is_inconclusive(),
+        "single Inconclusive outcome → is_inconclusive(): {:?}",
+        r.outcomes,
+    );
+    assert!(
+        r.inconclusive_details()
+            .any(|d| d.message.contains("denominator zero")),
+        "inconclusive detail must surface via inconclusive_details(): {:?}",
+        r.outcomes,
+    );
+}
+
+#[test]
+fn verdict_inconclusive_if_is_conditional() {
+    let mut v = Verdict::new();
+    v.inconclusive_if(
+        false,
+        AssertDetail::new(DetailKind::Migration, "would-be inconclusive"),
+    );
+    assert!(!v.into_result().is_inconclusive());
+
+    let mut v = Verdict::new();
+    v.inconclusive_if(
+        true,
+        AssertDetail::new(DetailKind::Migration, "actually inconclusive"),
+    );
+    assert!(v.into_result().is_inconclusive());
+}
+
+#[test]
+fn verdict_inconclusive_does_not_mask_prior_failure() {
+    // Fail dominates Inconclusive per the
+    // `Fail > Inconclusive > Pass > Skip` lattice — a verdict that
+    // recorded a real failure before a later Inconclusive must
+    // surface as Fail, not Inconclusive. Pins the symmetric
+    // counterpart of `verdict_skip_does_not_mask_prior_failure`.
+    let mut v = Verdict::new();
+    let counter = 5u64;
+    claim!(v, counter).at_most(3); // records Fail
+    v.inconclusive(AssertDetail::new(
+        DetailKind::Migration,
+        "later inconclusive",
+    ));
+    let r = v.into_result();
+    assert!(
+        r.is_fail(),
+        "Fail dominates Inconclusive — later inconclusive must NOT mask the earlier fail"
+    );
+    assert!(
+        !r.is_inconclusive(),
+        "is_inconclusive is false when any Fail is recorded"
+    );
+    assert!(
+        r.failure_details().any(|d| d.message.contains("at most 3")),
+        "prior claim failure must be retained: {:?}",
+        r.outcomes,
+    );
+    assert!(
+        r.inconclusive_details()
+            .any(|d| d.message.contains("later inconclusive")),
+        "later inconclusive must still appear in inconclusive_details stream: {:?}",
+        r.outcomes,
+    );
+}
+
+#[test]
 fn verdict_note_does_not_affect_verdict() {
     let mut v = Verdict::new();
     v.note("observed counter=12345");
@@ -792,7 +868,7 @@ fn claim_eq_against_nan_follows_ieee_754() {
     let nan = f64::NAN;
     claim!(v, nan).eq(f64::NAN);
     assert!(
-        !v.passed(),
+        !v.is_pass(),
         "NaN == NaN is false per IEEE 754; eq(NaN) must FAIL",
     );
 
@@ -800,7 +876,7 @@ fn claim_eq_against_nan_follows_ieee_754() {
     let nan = f64::NAN;
     claim!(v, nan).ne(f64::NAN);
     assert!(
-        v.passed(),
+        v.is_pass(),
         "NaN != NaN is true per IEEE 754; ne(NaN) must PASS",
     );
 
@@ -809,7 +885,7 @@ fn claim_eq_against_nan_follows_ieee_754() {
     let mut v = Verdict::new();
     let is_nan = value.is_nan();
     claim!(v, is_nan).eq(true);
-    assert!(v.passed());
+    assert!(v.is_pass());
 }
 
 #[test]
@@ -836,7 +912,7 @@ fn verdict_clone_carries_state() {
     let counter = 5u64;
     claim!(original, counter).at_least(50); // fail → push detail
     let copy = original.clone();
-    assert_eq!(original.passed(), copy.passed());
+    assert_eq!(original.is_pass(), copy.is_pass());
     assert_eq!(original.detail_count(), copy.detail_count());
 
     // Mutating one must not affect the other.
@@ -867,7 +943,7 @@ fn verdict_merge_skipped_does_not_fail_accumulator() {
     assert!(r.is_skip(), "post-merge stream is all-Skip");
     assert!(!r.is_pass(), "all-Skip is not pass");
     assert!(
-        r.skip_reasons()
+        r.skip_details()
             .any(|d| d.message.contains("optional probe")),
         "skip rationale must reach merged outcomes: {:?}",
         r.outcomes
@@ -1138,4 +1214,117 @@ fn into_anyhow_or_log_skip_arm_returns_ok() {
     );
     v.into_anyhow_or_log()
         .expect("skip-only verdict returns Ok");
+}
+
+#[test]
+fn into_anyhow_or_log_single_inconclusive_arm_returns_err_with_inconclusive_preamble() {
+    // Pins the CI-gate invariant from `into_anyhow_or_log`'s
+    // Inconclusive contract: an Inconclusive-only verdict must NOT
+    // route to Ok (which would let a CI gate keying off
+    // `is_ok()` treat a zero-denominator ratio as green). A
+    // single Inconclusive bails with the `"1 inconclusive verdict:"`
+    // preamble — distinct from the `"assertion failures:"` preamble
+    // so an operator triaging the log can immediately tell whether
+    // claims failed or merely lacked signal to evaluate.
+    let mut v = Verdict::new();
+    v.inconclusive(AssertDetail::new(
+        DetailKind::Migration,
+        "denominator zero blocks ratio evaluation",
+    ));
+    assert!(
+        v.result().is_inconclusive(),
+        "setup must produce an Inconclusive-only outcome so this test exercises the Inconclusive arm specifically (not the fail arm, which has its own preamble)",
+    );
+    let err = v
+        .into_anyhow_or_log()
+        .expect_err("inconclusive-only verdict must surface as Err, not Ok — silent-pass guard");
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with("1 inconclusive verdict:"),
+        "single-inconclusive path must lead with the inconclusive-verdict preamble; got {msg:?}",
+    );
+    assert!(
+        !msg.contains("assertion failures:"),
+        "inconclusive path must NOT use the failure preamble — preambles must remain distinguishable for triage; got {msg:?}",
+    );
+    assert!(
+        msg.contains("denominator zero blocks ratio evaluation"),
+        "inconclusive payload must survive into the bail message; got {msg:?}",
+    );
+}
+
+#[test]
+fn into_anyhow_or_log_multiple_inconclusive_arm_concatenates_every_detail() {
+    let mut v = Verdict::new();
+    v.inconclusive(AssertDetail::new(DetailKind::Migration, "ratio A: 0/0"));
+    v.inconclusive(AssertDetail::new(
+        DetailKind::Migration,
+        "ratio B: missing phase",
+    ));
+    v.inconclusive(AssertDetail::new(
+        DetailKind::Migration,
+        "ratio C: zero baseline",
+    ));
+    assert!(
+        v.result().is_inconclusive(),
+        "setup must produce a pure Inconclusive outcome (no failures) so this test exercises the Inconclusive multi-detail arm",
+    );
+    let err = v
+        .into_anyhow_or_log()
+        .expect_err("multi-inconclusive surfaces as Err");
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with("3 inconclusive verdicts:"),
+        "multi-inconclusive path must lead with count; got {msg:?}",
+    );
+    assert!(msg.contains("1."), "must enumerate detail 1");
+    assert!(msg.contains("2."), "must enumerate detail 2");
+    assert!(msg.contains("3."), "must enumerate detail 3");
+    for needle in [
+        "ratio A: 0/0",
+        "ratio B: missing phase",
+        "ratio C: zero baseline",
+    ] {
+        assert!(
+            msg.contains(needle),
+            "every individual inconclusive's message must appear in concatenation; \
+             missing '{needle}' in {msg:?}",
+        );
+    }
+    assert!(
+        !msg.contains("assertion failures:"),
+        "multi-inconclusive path must not emit the failure preamble",
+    );
+}
+
+#[test]
+fn into_anyhow_or_log_fail_dominates_inconclusive_in_bail_preamble() {
+    // Fail > Inconclusive in the merge lattice — pin that the
+    // dominance is reflected at the bail surface too: when both
+    // outcomes are recorded, the failure preamble wins and the
+    // inconclusive bail arm is unreachable. Sister-test to
+    // `verdict_inconclusive_does_not_mask_prior_failure`, which pins
+    // the same dominance at the is_fail / is_inconclusive level.
+    let mut v = Verdict::new();
+    claim!(v, 5u64).at_least(40); // records Fail
+    v.inconclusive(AssertDetail::new(
+        DetailKind::Migration,
+        "sibling inconclusive",
+    ));
+    assert!(
+        v.result().is_fail(),
+        "setup pre-condition: a Fail recorded alongside an Inconclusive must still report is_fail",
+    );
+    let err = v
+        .into_anyhow_or_log()
+        .expect_err("Fail+Inconclusive verdict surfaces as Err");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("expected at least"),
+        "failure narrative must surface — Fail dominates Inconclusive at the bail surface; got {msg:?}",
+    );
+    assert!(
+        !msg.contains("inconclusive verdict"),
+        "inconclusive preamble must NOT appear when a Fail is also recorded — Fail dominates; got {msg:?}",
+    );
 }

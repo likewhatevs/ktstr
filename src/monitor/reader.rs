@@ -4583,9 +4583,15 @@ mod tests {
             "from_samples: idle CPU should not flag stuck"
         );
 
-        // Evaluate verdict: should pass (no stall on idle CPU).
-        // Note: evaluate may pass via data_looks_valid returning false
-        // (all-same clocks with single CPU) — that's consistent behavior.
+        // Evaluate verdict: must not Fail (no stall on idle CPU).
+        // Either Pass or Inconclusive is acceptable here — a
+        // single-CPU idle scenario produces all-same rq_clock
+        // samples, which trips MonitorThresholds::data_looks_valid
+        // returning false, which routes to the no-signal
+        // Inconclusive arm. The test's invariant is "idle CPU
+        // does not surface as a stall," which both Pass and
+        // Inconclusive satisfy; only Fail would mean a stall
+        // detection regression.
         let report = super::super::MonitorReport {
             samples,
             summary,
@@ -4593,8 +4599,9 @@ mod tests {
         };
         let verdict = thresholds.evaluate(&report);
         assert!(
-            verdict.is_pass(),
-            "evaluate: idle CPU should pass: {:?}",
+            !verdict.is_fail(),
+            "evaluate: idle CPU must not surface as stall \
+             (Pass or Inconclusive both acceptable): {:?}",
             verdict.details
         );
     }

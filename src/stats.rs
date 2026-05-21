@@ -1295,12 +1295,33 @@ pub struct GauntletRow {
     /// local), this describes the run-environment provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_source: Option<String>,
+    /// True when the underlying [`AssertResult::is_pass`] returned
+    /// true at sidecar emission time — a real pass with at least one
+    /// observed outcome and no Fail/Inconclusive/Skip. Mutually
+    /// exclusive with [`Self::skipped`] and [`Self::inconclusive`]:
+    /// the three bits encode a strict 4-state verdict where exactly
+    /// one of (Pass, Skip, Inconclusive, Fail) is set per row.
     pub passed: bool,
     /// True when the run was skipped (topology mismatch, missing
-    /// resource). `passed` stays `true` for gate-compat; `skipped`
-    /// lets stats tooling exclude these from pass counts so skipped
-    /// runs don't inflate the apparent pass rate.
+    /// resource). Mutually exclusive with [`Self::passed`] (Skip is
+    /// not Pass; the empty / all-Skip outcomes vec maps to Skip,
+    /// not Pass) and with [`Self::inconclusive`]. Lets stats tooling
+    /// exclude these from pass counts so skipped runs don't inflate
+    /// the apparent pass rate.
     pub skipped: bool,
+    /// True when at least one assertion recorded
+    /// [`crate::assert::Outcome::Inconclusive`] — the run ran but a
+    /// zero-denominator ratio gate could not be evaluated. Mutually
+    /// exclusive with [`Self::passed`] and [`Self::skipped`]; in the
+    /// `Fail > Inconclusive > Pass > Skip` lattice, Inconclusive
+    /// dominates Pass/Skip but loses to Fail, so a row with both
+    /// Inconclusive and Fail outcomes records `inconclusive = false,
+    /// passed = false` (Fail wins). Surfaced as a distinct bit so
+    /// `is_fail` can exclude these from hard-fail counts and
+    /// dashboards can triage zero-denominator runs separately from
+    /// real regressions.
+    #[serde(default)]
+    pub inconclusive: bool,
     /// Number of monitor samples this run was averaged over —
     /// the natural per-RUN weight for `Gauge(Avg)` metrics when
     /// folded across multiple runs at cross-RUN comparison time
@@ -1484,18 +1505,46 @@ impl GauntletRow {
     /// verdict surfaces. GauntletRow is the sidecar-wire shape; its
     /// `passed` bool is populated from `AssertResult::is_pass()` at
     /// sidecar emission time.
+    ///
+    /// Returns true only when the row reached a real Pass — neither
+    /// skipped, inconclusive, nor failed. The triple-conjunct guard
+    /// matches the strict 4-state mutex encoded with three stored
+    /// bits `(passed, skipped, inconclusive)` (Fail is the all-false
+    /// derived state, no dedicated bit), so a manually-constructed
+    /// row that sets `passed = true, skipped = true` (which would
+    /// violate the mutex) still reads as not-pass here.
+    ///
+    /// Part of the `is_pass` / `is_fail` / `is_inconclusive` /
+    /// `is_skip` vocabulary uniform across the verdict surfaces:
+    /// [`crate::assert::AssertResult::is_pass`] /
+    /// [`crate::test_support::SidecarResult::is_pass`] /
+    /// [`crate::assert::Outcome::is_pass`] / `MonitorVerdict::is_pass`
+    /// (in the `monitor` module, which is `pub(crate)`) /
+    /// `Verdict::is_pass` (re-exported at [`crate::assert::Verdict`])
+    /// / `Self::is_pass`.
     pub fn is_pass(&self) -> bool {
-        self.passed
+        self.passed && !self.skipped && !self.inconclusive
     }
     /// Convenience accessor mirroring
-    /// [`crate::assert::AssertResult::is_fail`].
+    /// [`crate::assert::AssertResult::is_fail`]. True only when the
+    /// row is a real failure — not a skip, not an inconclusive
+    /// (zero-denominator) run. Excludes `inconclusive` so a stats
+    /// gate that counts "real regressions" does not conflate
+    /// inconclusive runs with hard failures.
     pub fn is_fail(&self) -> bool {
-        !self.passed
+        !self.passed && !self.skipped && !self.inconclusive
     }
     /// Convenience accessor mirroring
     /// [`crate::assert::AssertResult::is_skip`].
     pub fn is_skip(&self) -> bool {
         self.skipped
+    }
+    /// Convenience accessor mirroring
+    /// [`crate::assert::AssertResult::is_inconclusive`]. True when
+    /// the row reflects a zero-denominator ratio gate that could
+    /// not be evaluated.
+    pub fn is_inconclusive(&self) -> bool {
+        self.inconclusive
     }
 }
 
@@ -2102,50 +2151,83 @@ fn commit_pairing_key_part(value: &Option<String>) -> String {
 }
 
 /// One aggregated `GauntletRow` produced by `group_and_average_by`,
-/// plus the pass-bookkeeping needed to render `N/M` in the per-group
-/// summary block.
+/// plus the pass-bookkeeping needed to render the per-group summary
+/// block (`N/M passed` + the `(S skip, I inc, F fail)` breakdown).
 ///
-/// `row` carries arithmetic-mean metric values across every
-/// non-failing, non-skipped contributor in the group; the
-/// (`scenario`, `topology`, `work_type`, `scheduler`,
-/// `kernel_version`) identity is taken verbatim from the first
-/// contributor in iteration order — every contributor in the group
-/// shares the identity tuple by construction (`scenario`,
-/// `topology`, and `work_type` ARE the group key, and `scheduler`
-/// / `kernel_version` are typed-filter-narrowed at the call site
-/// so they can only vary if the operator passed no `--scheduler` /
-/// `--kernel` filter).
+/// `row` carries arithmetic-mean metric values across every real
+/// Pass contributor in the group; the (`scenario`, `topology`,
+/// `work_type`, `scheduler`, `kernel_version`) identity is taken
+/// verbatim from the first contributor in iteration order — every
+/// contributor in the group shares the identity tuple by
+/// construction (`scenario`, `topology`, and `work_type` ARE the
+/// group key, and `scheduler` / `kernel_version` are
+/// typed-filter-narrowed at the call site so they can only vary if
+/// the operator passed no `--scheduler` / `--kernel` filter).
 ///
-/// `passed` on `row` is the AND across every contributor: a single
-/// failing contributor in the group flips the aggregated row to
-/// `passed = false`, which routes the pair through
-/// `compare_rows`' `skipped_failed` gate. `skipped` follows an
-/// OR rule — any skipped contributor flips the aggregate to
-/// skipped.
+/// The verdict bits on `row` (`passed`, `skipped`, `inconclusive`)
+/// fold under the strict 4-state
+/// `Fail > Inconclusive > Pass > Skip` lattice: any failing
+/// contributor sets the aggregate to Fail (`passed=false`,
+/// `inconclusive=false`, `skipped=false`); else any inconclusive
+/// contributor sets `inconclusive=true`; else any skipped
+/// contributor sets `skipped=true`; only an all-pass cohort yields
+/// `passed=true`. The lattice mechanics match
+/// [`GauntletRow::is_pass`]'s triple-conjunct, so the aggregated
+/// row's accessor reads honestly. Aggregate rows that are not real
+/// Pass route the pair through [`compare_rows_by`]'s
+/// `excluded_pairs` gate.
 ///
-/// `passes_observed` and `total_observed` count the contributors:
-/// `total_observed = group.len()`, `passes_observed` counts entries
-/// where both `passed && !skipped`. Failing/skipped contributors do
-/// NOT participate in the metric mean (they would carry
-/// failure-mode telemetry, not scheduler behaviour); only passing
-/// non-skipped contributors feed the running sums. When no
+/// `passes_observed`, `skips_observed`, `inconclusives_observed`,
+/// `failures_observed` and `total_observed` count contributors per
+/// the strict 4-state mutex: the four bucket counters sum to
+/// `total_observed` because every contributor falls into exactly
+/// one bucket. Only real Pass contributors feed the per-row sums —
+/// failing, inconclusive, and skipped contributors all carry no
+/// comparable per-run signal (failure-mode telemetry; "couldn't
+/// evaluate" non-signal; "didn't run" non-signal). When no
 /// contributor passed cleanly the running sum is zero and the
-/// resulting `row` carries default-zero metric values plus
-/// `passed = false` — the downstream `skipped_failed` gate then
+/// aggregate `row` carries default-zero metric values plus
+/// `passed = false` — the downstream `excluded_pairs` gate then
 /// drops the pair from the regression math.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct AveragedGroup {
     /// Aggregated row carrying arithmetic-mean metric values plus
-    /// the AND-of-contributors `passed` / OR-of-contributors
-    /// `skipped` flags. Fed
-    /// directly into `compare_rows` when `--average` is active.
+    /// the lattice-folded `(passed, skipped, inconclusive)` bits
+    /// matching the `Fail > Inconclusive > Pass > Skip`
+    /// dominance. `passed` is true only when every contributor was
+    /// a real pass; `inconclusive` fires when at least one
+    /// contributor was Inconclusive and none failed; `skipped`
+    /// fires when at least one contributor was Skip and none
+    /// failed or was Inconclusive. Fed directly into
+    /// `compare_rows` when `--average` is active.
     pub row: GauntletRow,
-    /// Number of contributors where both `passed && !skipped`.
-    /// Renders as the numerator of the per-group `N/M` summary.
+    /// Number of contributors that were a real pass
+    /// (`is_pass() == true`). Renders as the numerator of the
+    /// per-group `N/M` summary.
     pub passes_observed: u32,
+    /// Number of contributors that were Skip (`is_skip() == true`).
+    /// Surfaced in the per-group rendering as the "S skipped"
+    /// breakdown so an operator can distinguish "scenario didn't
+    /// run" from real failures.
+    pub skips_observed: u32,
+    /// Number of contributors that were Inconclusive
+    /// (`is_inconclusive() == true`). Surfaced in the per-group
+    /// rendering as the "I inconclusive" breakdown so an operator
+    /// can distinguish "couldn't evaluate" from real failures —
+    /// same defense-in-depth pattern as
+    /// [`format_dimension_summary`]'s inconc bucket.
+    pub inconclusives_observed: u32,
+    /// Number of contributors that were a real Fail
+    /// (`is_fail() == true`). Surfaced in the per-group rendering
+    /// as the "F failed" breakdown.
+    pub failures_observed: u32,
     /// Total contributors in the group (`= group.len()`). Renders
     /// as the denominator of the per-group `N/M` summary.
+    /// Mechanically:
+    /// `total_observed == passes_observed + skips_observed +
+    /// inconclusives_observed + failures_observed`
+    /// under the strict 4-state mutex.
     pub total_observed: u32,
 }
 
@@ -2225,14 +2307,18 @@ fn render_mixed_dirty(
 /// same identity contract.
 ///
 /// Aggregation rules:
-/// - `passed` aggregates as a logical AND across every contributor.
-///   A single fail flips the aggregate to `passed = false`.
-/// - `skipped` aggregates as a logical OR across every contributor:
-///   any single skipped contributor flips the aggregate to
-///   `skipped = true`. The OR aligns with [`compare_rows_by`]' skip
-///   gate (one skipped side drops the pair) — averaging across a
-///   mixed pass-and-skip set would silently dilute the metric mean
-///   with rows that didn't run.
+/// - The verdict bits `(passed, skipped, inconclusive)` aggregate
+///   under the strict 4-state mutex per the
+///   `Fail > Inconclusive > Pass > Skip` lattice. Fail (all-false)
+///   dominates: any failed contributor flips the aggregate's
+///   `passed` to `false` and leaves `skipped`/`inconclusive` clear,
+///   yielding Fail at the aggregate level. Otherwise Inconclusive
+///   dominates: any inconclusive contributor sets the aggregate's
+///   `inconclusive = true`. Otherwise Skip dominates: any skipped
+///   contributor sets `skipped = true`. Only when every contributor
+///   was a real Pass does the aggregate carry `passed = true`. This
+///   matches [`GauntletRow::is_pass`]'s triple-conjunct semantics
+///   so the aggregate's accessor reads honestly.
 /// - Metrics (`f64` / `u64` / `i64` fields, plus `ext_metrics`
 ///   entries) are summed only across contributors where
 ///   `passed && !skipped`, then divided by that count to yield an
@@ -2241,7 +2327,7 @@ fn render_mixed_dirty(
 ///   are therefore excluded from the mean. When no contributor
 ///   passed cleanly, every metric defaults to zero and the
 ///   aggregate's `passed = false` routes the pair to
-///   [`compare_rows_by`]' `skipped_failed` gate.
+///   [`compare_rows_by`]' `excluded_pairs` gate.
 /// - `u64` / `i64` fields take the rounded mean
 ///   (`(sum / count).round() as u64`). The 0.5-unit rounding error
 ///   is well below every integer metric's `default_abs` gate (the
@@ -2294,8 +2380,12 @@ pub fn group_and_average_by(
         first: &'a GauntletRow,
         total_observed: u32,
         passes_observed: u32,
+        skips_observed: u32,
+        inconclusives_observed: u32,
+        failures_observed: u32,
         any_skipped: bool,
         any_failed: bool,
+        any_inconclusive: bool,
         // Tracks whether contributors disagree on the `-dirty`
         // suffix for the project_commit / kernel_commit dimensions.
         // `any_*_clean` is true if any contributor's value is the
@@ -2391,8 +2481,12 @@ pub fn group_and_average_by(
                 first: row,
                 total_observed: 0,
                 passes_observed: 0,
+                skips_observed: 0,
+                inconclusives_observed: 0,
+                failures_observed: 0,
                 any_skipped: false,
                 any_failed: false,
+                any_inconclusive: false,
                 any_project_clean: false,
                 any_project_dirty: false,
                 any_kernel_clean: false,
@@ -2443,10 +2537,24 @@ pub fn group_and_average_by(
         );
         if row.is_skip() {
             acc.any_skipped = true;
+            acc.skips_observed += 1;
             continue;
         }
         if row.is_fail() {
             acc.any_failed = true;
+            acc.failures_observed += 1;
+            continue;
+        }
+        if row.is_inconclusive() {
+            // Inconclusive contributors are not passes (the gate
+            // could not be evaluated) and carry no measured signal
+            // worth folding into the cohort means. Track the bit
+            // for the aggregated verdict's `inconclusive` field
+            // (so the aggregate row reads Inconclusive in the
+            // `Fail > Inconclusive > Pass > Skip` lattice when no
+            // contributor failed) and skip the per-row sums.
+            acc.any_inconclusive = true;
+            acc.inconclusives_observed += 1;
             continue;
         }
         acc.passes_observed += 1;
@@ -2500,7 +2608,7 @@ pub fn group_and_average_by(
         // Rounded mean for integer-typed Counter / mean-fold
         // fields. When n == 0 the sums are all zero, so dividing
         // by 1.0 still yields 0 — the aggregate's passed=false
-        // routes the pair through skipped_failed downstream and
+        // routes the pair through excluded_pairs downstream and
         // the metrics are never consulted. Peak-kind integer
         // fields (max_dsq_depth) take the MAX-fold path directly
         // and don't need a rounding helper.
@@ -2544,12 +2652,23 @@ pub fn group_and_average_by(
             commit: project_commit_rendered,
             kernel_commit: kernel_commit_rendered,
             run_source: acc.first.run_source.clone(),
-            // ALL must pass: any failed or skipped contributor
-            // flips the aggregate. A group with zero
-            // passes_observed (every contributor failed or was
-            // skipped) collapses to passed=false here.
-            passed: !acc.any_failed && !acc.any_skipped && n > 0,
-            skipped: acc.any_skipped,
+            // ALL must pass: any failed, inconclusive, or skipped
+            // contributor flips the aggregate. A group with zero
+            // passes_observed (every contributor failed, was
+            // inconclusive, or was skipped) collapses to
+            // passed=false here. The four-bit verdict is
+            // strict 4-state (exactly one of pass/skip/inconc/fail
+            // set per row); the lattice
+            // `Fail > Inconclusive > Pass > Skip` determines which
+            // bit dominates when a cohort has mixed contributors.
+            // Skip is the lowest-precedence bit — it fires only
+            // when no contributor failed AND no contributor was
+            // inconclusive AND at least one was skipped. Fail
+            // (all-false) dominates Inconclusive dominates Skip;
+            // exactly one of the four states is encoded per row.
+            passed: !acc.any_failed && !acc.any_inconclusive && !acc.any_skipped && n > 0,
+            skipped: !acc.any_failed && !acc.any_inconclusive && acc.any_skipped,
+            inconclusive: !acc.any_failed && acc.any_inconclusive,
             // Sum across contributors so the aggregated row's
             // weight is the cohort's total sample population. A
             // downstream consumer that further folds these
@@ -2620,6 +2739,9 @@ pub fn group_and_average_by(
         out.push(AveragedGroup {
             row: aggregated,
             passes_observed: acc.passes_observed,
+            skips_observed: acc.skips_observed,
+            inconclusives_observed: acc.inconclusives_observed,
+            failures_observed: acc.failures_observed,
             total_observed: acc.total_observed,
         });
     }
@@ -2693,6 +2815,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         run_source: sc.run_source.clone(),
         passed: sc.is_pass(),
         skipped: sc.is_skip(),
+        inconclusive: sc.is_inconclusive(),
         run_sample_count: sc.monitor.as_ref().map(|m| m.total_samples).unwrap_or(0),
         spread: finite_or_zero("spread", sc.stats.worst_spread),
         gap_ms: sc.stats.worst_gap_ms,
@@ -2809,6 +2932,7 @@ fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
     let work_type: Vec<&str> = rows.iter().map(|r| r.work_type.as_str()).collect();
     let passed: Vec<bool> = rows.iter().map(|r| r.is_pass()).collect();
     let skipped: Vec<bool> = rows.iter().map(|r| r.is_skip()).collect();
+    let inconclusive: Vec<bool> = rows.iter().map(|r| r.is_inconclusive()).collect();
     let spread: Vec<f64> = rows.iter().map(|r| r.spread).collect();
     let gap_ms: Vec<f64> = rows.iter().map(|r| r.gap_ms as f64).collect();
     let migrations: Vec<f64> = rows.iter().map(|r| r.migrations as f64).collect();
@@ -2841,6 +2965,7 @@ fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
         "work_type" => &work_type,
         "passed" => &passed,
         "skipped" => &skipped,
+        "inconclusive" => &inconclusive,
         "spread" => &spread,
         "gap_ms" => &gap_ms,
         "migrations" => &migrations,
@@ -2930,7 +3055,39 @@ fn col_mean_std(df: &DataFrame, name: &str) -> (f64, f64) {
 /// separate lazy plans (one collect per metric); polars's group-by
 /// is not free, and re-grouping the same DataFrame on the same key
 /// for each of the 13 metrics paid the partition cost 13 times.
+///
+/// 4-state lattice filtering: only real-pass rows
+/// (`passed && !skipped && !inconclusive`, matching
+/// `GauntletRow::is_pass`) contribute to the per-scenario mean
+/// AND the overall mean/std baseline. Skipped / inconclusive /
+/// failed rows carry default-zero metric values (sidecar_to_row
+/// substitutes zero for non-finite + missing fields), and
+/// including them would silently depress every measured mean — a
+/// scenario with 1 real-pass run (value=100) and 9 inconclusive
+/// runs (value=0) would otherwise report a per-scenario mean of
+/// 10.0 and the same pollution would deflate the cohort-wide
+/// baseline used for the 2-sigma threshold. Filtering on
+/// `is_pass` matches the same defense-in-depth as
+/// `format_dimension_summary`'s pass_count + the
+/// `compare_rows_by` regression-math gate.
 fn find_outliers(df: &DataFrame) -> Vec<Outlier> {
+    // Filter to real-pass rows only so per-scenario means and the
+    // cohort-wide overall_mean/overall_std baseline don't include
+    // zero-default values from skip / inconclusive / fail rows.
+    let pass_only = df
+        .clone()
+        .lazy()
+        .filter(
+            col("passed")
+                .and(col("skipped").not())
+                .and(col("inconclusive").not()),
+        )
+        .collect();
+    let pass_only = match pass_only {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let df = &pass_only;
     let metrics: &[&str] = &[
         "spread",
         "gap_ms",
@@ -3071,16 +3228,33 @@ fn format_dimension_summary(df: &DataFrame, group_col: &str) -> String {
         .lazy()
         .group_by([col(group_col)])
         .agg([
-            // pass_count excludes skipped rows — a skipped run is not
-            // a successful execution and must not inflate pass rate.
-            (col("passed").and(col("skipped").not()))
-                .cast(DataType::UInt32)
-                .sum()
-                .alias("pass_count"),
+            // pass_count excludes skipped and inconclusive rows — a
+            // skipped run did not execute, and an inconclusive run
+            // executed but lacked signal to evaluate. Neither must
+            // inflate the pass rate. Fail is the residual
+            // `total - pass - skip - inconc` under the strict
+            // 4-state mutex, so accounting inconclusive separately
+            // keeps it out of the "failed" bucket below.
+            // The triple-conjunct mirrors `GauntletRow::is_pass`'s
+            // mechanic exactly — defensive belt-and-suspenders gating
+            // against a malformed row reaching the dataframe (the
+            // `passed` column is populated from `is_pass()` so the
+            // mutex SHOULD already hold, but explicit gating makes
+            // the math survive a future column-source refactor).
+            (col("passed")
+                .and(col("skipped").not())
+                .and(col("inconclusive").not()))
+            .cast(DataType::UInt32)
+            .sum()
+            .alias("pass_count"),
             col("skipped")
                 .cast(DataType::UInt32)
                 .sum()
                 .alias("skip_count"),
+            col("inconclusive")
+                .cast(DataType::UInt32)
+                .sum()
+                .alias("inconc_count"),
             col("passed").count().cast(DataType::UInt32).alias("total"),
             col("spread").mean().alias("avg_spread"),
             col("gap_ms").mean().alias("avg_gap_ms"),
@@ -3104,6 +3278,7 @@ fn format_dimension_summary(df: &DataFrame, group_col: &str) -> String {
     let names = col_str(&grouped, group_col);
     let pass_counts = col_u32(&grouped, "pass_count");
     let skip_counts = col_u32(&grouped, "skip_count");
+    let inconc_counts = col_u32(&grouped, "inconc_count");
     let totals = col_u32(&grouped, "total");
     let spreads = col_f64(&grouped, "avg_spread");
     let gaps = col_f64(&grouped, "avg_gap_ms");
@@ -3123,13 +3298,22 @@ fn format_dimension_summary(df: &DataFrame, group_col: &str) -> String {
         let name = names.get(i).unwrap_or("?");
         let pass = pass_counts.get(i).unwrap_or(0);
         let skip = skip_counts.as_ref().and_then(|s| s.get(i)).unwrap_or(0);
+        let inconc = inconc_counts.as_ref().and_then(|s| s.get(i)).unwrap_or(0);
         let total = totals.get(i).unwrap_or(0);
-        let fail = total.saturating_sub(pass).saturating_sub(skip);
+        // Fail is the residual under the strict 4-state mutex
+        // (pass, skip, inconclusive, fail). Subtracting inconc
+        // here is what keeps a zero-denominator-ratio run from
+        // silently rendering as "failed" in the dimension
+        // summary.
+        let fail = total
+            .saturating_sub(pass)
+            .saturating_sub(skip)
+            .saturating_sub(inconc);
         let spread = spreads.get(i).unwrap_or(0.0);
         let gap = gaps.get(i).unwrap_or(0.0);
         let mut line = format!(
-            "  {:<25} {}/{} passed ({} skipped, {} failed)  avg_spread={:.1}%  avg_gap={:.0}ms",
-            name, pass, total, skip, fail, spread, gap
+            "  {:<25} {}/{} passed ({} skipped, {} inconclusive, {} failed)  avg_spread={:.1}%  avg_gap={:.0}ms",
+            name, pass, total, skip, inconc, fail, spread, gap
         );
         if let Some(ref imb) = imbalances {
             let v = imb.get(i).unwrap_or(0.0);
@@ -3582,8 +3766,14 @@ pub(crate) struct Finding {
 ///
 /// `regressions` and `improvements` count significant entries in
 /// `findings`; `unchanged` counts metrics that fell below the dual
-/// gate; `skipped_failed` counts paired (scenario, topology, work_type)
-/// row pairs where either side has `passed=false`. `new_in_b`
+/// gate; `excluded_pairs` counts paired (scenario, topology, work_type)
+/// row pairs where either side is not a real pass — `fail`,
+/// `inconclusive`, and `skip` rows all route here. The field name
+/// captures "excluded from regression math" rather than encoding any
+/// of the three excluded states, because the per-side disposition
+/// (which side, which state) is recoverable from the individual
+/// `GauntletRow::is_*` accessors when the operator drills in.
+/// `new_in_b`
 /// counts B-side rows whose key has no match on the A side; the
 /// converse is `removed_from_a`. The filter (when set) applies to
 /// every counter, so excluded rows do not contribute.
@@ -3601,7 +3791,7 @@ pub(crate) struct CompareReport {
     pub regressions: u32,
     pub improvements: u32,
     pub unchanged: u32,
-    pub skipped_failed: u32,
+    pub excluded_pairs: u32,
     pub new_in_b: u32,
     pub removed_from_a: u32,
     pub findings: Vec<Finding>,
@@ -4006,7 +4196,7 @@ impl ComparisonPolicy {
 /// - A-side rows with no B-side match are counted in `removed_from_a`
 ///   (a separate pass over `rows_a`).
 /// - Paired rows where either side has `passed=false` are dropped
-///   from the regression math and counted in `skipped_failed`: a
+///   from the regression math and counted in `excluded_pairs`: a
 ///   failed scenario's metrics reflect the failure mode (short run,
 ///   stalled workload, missing samples), not the scheduler's
 ///   behavior.
@@ -4072,14 +4262,22 @@ pub(crate) fn compare_rows_by(
             continue;
         };
 
-        // Drop from regression math when either side is a skip or a
-        // failure. Skips carry no executed metrics (the run didn't
-        // happen); failures carry telemetry dominated by the failure
-        // mode (short run, stalled workload), not the scheduler's
-        // behavior — comparing either against a real run produces
+        // Drop from regression math when either side is a skip,
+        // inconclusive, or failure. Skips carry no executed metrics
+        // (the run didn't happen); inconclusive runs ran but lacked
+        // signal to evaluate (zero-denominator ratio gate); failures
+        // carry telemetry dominated by the failure mode (short run,
+        // stalled workload), not the scheduler's behavior —
+        // comparing any of these against a real run produces
         // meaningless deltas.
-        if row_a.is_fail() || row_b.is_fail() || row_a.is_skip() || row_b.is_skip() {
-            report.skipped_failed += 1;
+        if row_a.is_fail()
+            || row_b.is_fail()
+            || row_a.is_inconclusive()
+            || row_b.is_inconclusive()
+            || row_a.is_skip()
+            || row_b.is_skip()
+        {
+            report.excluded_pairs += 1;
             continue;
         }
 
@@ -4928,10 +5126,11 @@ pub fn compare_partitions(
             "summary: {} regressions, {} improvements, {} unchanged",
             report.regressions, report.improvements, report.unchanged,
         );
-        if report.skipped_failed > 0 {
+        if report.excluded_pairs > 0 {
             println!(
-                "  {} pairing-key row pair(s) skipped because one or both sides failed",
-                report.skipped_failed,
+                "  {} pairing-key row pair(s) excluded from regression math because one \
+                 or both sides did not pass (failed, inconclusive, or skipped)",
+                report.excluded_pairs,
             );
         }
         if let (Some(avg_a), Some(avg_b)) = (&avg_a, &avg_b) {
@@ -5104,11 +5303,35 @@ pub(crate) fn format_per_group_pass_counts(
     }
     let mut out = String::new();
     out.push('\n');
-    out.push_str("per-group pass counts (passes_observed/total_observed):\n");
+    out.push_str(
+        "per-group pass counts (passes/total + skip/inconc/fail breakdown when non-zero):\n",
+    );
     for ((scn, topo, wt), (ka, kb)) in keys.into_iter() {
         let fmt_side = |r: Option<&AveragedGroup>| -> String {
-            r.map(|x| format!("{}/{}", x.passes_observed, x.total_observed))
-                .unwrap_or_else(|| "-".to_string())
+            let Some(x) = r else {
+                return "-".to_string();
+            };
+            // Mirror format_dimension_summary's 4-state breakdown —
+            // operators reading per-group lines must be able to
+            // distinguish skip / inconclusive / fail buckets, not
+            // see them collapsed into the (total - pass) denominator
+            // gap. Skip silently rendering buckets that are zero so
+            // the common-case "all passed" line stays terse.
+            let mut s = format!("{}/{}", x.passes_observed, x.total_observed);
+            let mut extras: Vec<String> = Vec::with_capacity(3);
+            if x.skips_observed > 0 {
+                extras.push(format!("{} skip", x.skips_observed));
+            }
+            if x.inconclusives_observed > 0 {
+                extras.push(format!("{} inc", x.inconclusives_observed));
+            }
+            if x.failures_observed > 0 {
+                extras.push(format!("{} fail", x.failures_observed));
+            }
+            if !extras.is_empty() {
+                s.push_str(&format!(" ({})", extras.join(", ")));
+            }
+            s
         };
         out.push_str(&format!(
             "  {scn}/{topo}/{wt}: {a}={pa} {b}={pb}\n",
@@ -5527,6 +5750,7 @@ mod tests {
             run_source: None,
             skipped: false,
             passed,
+            inconclusive: false,
             run_sample_count: 0,
             spread,
             gap_ms: 50,
@@ -5594,6 +5818,57 @@ mod tests {
         );
         // "fast" should show 1/1 passed
         assert!(out.contains("1/1 passed"), "fast: 1/1 passed, got:\n{out}");
+    }
+
+    /// A row whose `inconclusive` bit is set must render in the
+    /// "inconclusive" bucket of the dimension-summary line, NOT
+    /// silently fold into the "failed" bucket as the arithmetic
+    /// `fail = total - pass - skip` would have done. The current
+    /// arithmetic `fail = total - pass - skip - inconc` plus the
+    /// format string `"({} skipped, {} inconclusive, {} failed)"`
+    /// together produce the correct breakdown.
+    ///
+    /// A future polars-aggregation refactor that drops the
+    /// `inconc_count` agg, the `inconclusive` group-by column, or the
+    /// subtraction at the residual would re-introduce the
+    /// misclassification — this test fails loudly in that case.
+    #[test]
+    fn format_dimension_summary_renders_inconclusive_bucket_distinctly() {
+        // Three rows on the same dimension: one Pass, one
+        // Inconclusive (passed=false, inconclusive=true), one Fail
+        // (all-false). Triple-state coverage in one dimension
+        // confirms that the format string surfaces every non-pass
+        // bucket honestly.
+        let mut r_pass = make_row("group_a", "t1", true, 5.0);
+        r_pass.skipped = false;
+        r_pass.inconclusive = false;
+        let mut r_inc = make_row("group_a", "t1", false, 5.0);
+        r_inc.skipped = false;
+        r_inc.inconclusive = true;
+        let mut r_fail = make_row("group_a", "t1", false, 5.0);
+        r_fail.skipped = false;
+        r_fail.inconclusive = false;
+        let rows = vec![r_pass, r_inc, r_fail];
+        let df = build_dataframe(&rows).unwrap();
+        let out = format_dimension_summary(&df, "scenario");
+        assert!(
+            out.contains("1/3 passed"),
+            "expected '1/3 passed' for 1-pass-of-3: got:\n{out}"
+        );
+        assert!(
+            out.contains("1 inconclusive"),
+            "inconclusive row must NOT silently fold into the failed \
+             bucket; got:\n{out}"
+        );
+        assert!(
+            out.contains("1 failed"),
+            "real Fail row must render as 1 failed (not be hidden by \
+             the inconclusive subtraction); got:\n{out}"
+        );
+        assert!(
+            out.contains("0 skipped"),
+            "no Skip contributor; skipped bucket must be 0: got:\n{out}"
+        );
     }
 
     // -- analyze_rows tests --
@@ -6917,7 +7192,7 @@ mod tests {
             "spread up + iterations down both regress"
         );
         assert_eq!(res.improvements, 0);
-        assert_eq!(res.skipped_failed, 0);
+        assert_eq!(res.excluded_pairs, 0);
         let metrics: Vec<&str> = res.findings.iter().map(|d| d.metric.name).collect();
         assert!(metrics.contains(&"worst_spread"));
         assert!(metrics.contains(&"total_iterations"));
@@ -7007,7 +7282,7 @@ mod tests {
     }
 
     #[test]
-    fn compare_rows_skipped_side_drops_pair_into_skipped_failed() {
+    fn compare_rows_skipped_side_drops_pair_into_excluded_pairs() {
         // A skipped row on either side of the comparison must not
         // contribute to regressions/improvements — a skipped run
         // carries no executed metrics, so the pair must short-circuit
@@ -7026,8 +7301,8 @@ mod tests {
         assert_eq!(res.regressions, 0);
         assert_eq!(res.improvements, 0);
         assert_eq!(
-            res.skipped_failed, 1,
-            "skipped side must count as skipped_failed, not produce deltas"
+            res.excluded_pairs, 1,
+            "skipped side must count as excluded_pairs, not produce deltas"
         );
 
         // Symmetrically on the B side.
@@ -7042,7 +7317,7 @@ mod tests {
         );
         assert_eq!(res.regressions, 0);
         assert_eq!(res.improvements, 0);
-        assert_eq!(res.skipped_failed, 1);
+        assert_eq!(res.excluded_pairs, 1);
     }
 
     /// Rows where either side has `passed=false` are dropped from the
@@ -7053,7 +7328,7 @@ mod tests {
     fn compare_rows_skips_failed_scenarios() {
         // Three scenarios, all with the same metric movement. Only
         // test_ok (passed on both sides) should be eligible for the
-        // regression math; the other two are counted as skipped_failed.
+        // regression math; the other two are counted as excluded_pairs.
         let rows_a = vec![
             cmp_row("test_ok", "tiny-1llc", true, 10.0, 1000),
             cmp_row("test_failed_b", "tiny-1llc", true, 10.0, 1000),
@@ -7072,7 +7347,7 @@ mod tests {
             &ComparisonPolicy::uniform(10.0),
         );
         assert_eq!(
-            res.skipped_failed, 2,
+            res.excluded_pairs, 2,
             "test_failed_a and test_failed_b skip"
         );
         // test_ok regresses on worst_spread and total_iterations only.
@@ -7136,7 +7411,7 @@ mod tests {
         assert_eq!(res_none.regressions, 0);
         assert_eq!(res_none.improvements, 0);
         assert_eq!(res_none.unchanged, 0);
-        assert_eq!(res_none.skipped_failed, 0);
+        assert_eq!(res_none.excluded_pairs, 0);
     }
 
     #[test]
@@ -7760,7 +8035,7 @@ mod tests {
 
     /// Filtering is applied before the failed-row gate. A failed row
     /// that the filter excludes never reaches the `passed` check, so
-    /// `skipped_failed` stays at zero -- the failure on the filtered
+    /// `excluded_pairs` stays at zero -- the failure on the filtered
     /// row is invisible by design.
     #[test]
     fn compare_rows_filter_excludes_failed_from_skip_count() {
@@ -7773,7 +8048,7 @@ mod tests {
             cmp_row("beta", "tiny-1llc", true, 30.0, 0),
         ];
         // Without a filter, beta's failed row contributes
-        // skipped_failed=1.
+        // excluded_pairs=1.
         let unfiltered = compare_rows_by(
             &rows_a,
             &rows_b,
@@ -7781,12 +8056,12 @@ mod tests {
             None,
             &ComparisonPolicy::default(),
         );
-        assert_eq!(unfiltered.skipped_failed, 1);
+        assert_eq!(unfiltered.excluded_pairs, 1);
         assert_eq!(unfiltered.regressions, 1, "alpha still regresses");
 
         // Filtering to "alpha" excludes beta entirely; the failed row
         // is filtered out before the passed gate runs, so
-        // skipped_failed=0.
+        // excluded_pairs=0.
         let filtered = compare_rows_by(
             &rows_a,
             &rows_b,
@@ -7794,7 +8069,7 @@ mod tests {
             Some("alpha"),
             &ComparisonPolicy::default(),
         );
-        assert_eq!(filtered.skipped_failed, 0);
+        assert_eq!(filtered.excluded_pairs, 0);
         assert_eq!(filtered.regressions, 1);
         assert_eq!(filtered.findings.len(), 1);
         assert_eq!(filtered.findings[0].scenario, "alpha");
@@ -7859,7 +8134,7 @@ mod tests {
         assert_eq!(res.regressions, 1, "alpha regresses on worst_spread");
         assert_eq!(res.new_in_b, 1, "beta is new on B side");
         assert_eq!(res.removed_from_a, 1, "gamma is removed on B side");
-        assert_eq!(res.skipped_failed, 0);
+        assert_eq!(res.excluded_pairs, 0);
     }
 
     /// The filter applies to every counter, including `new_in_b` and
@@ -8389,6 +8664,7 @@ mod tests {
             run_source: None,
             passed: true,
             skipped: false,
+            inconclusive: false,
             run_sample_count: 0,
             spread: 0.0,
             gap_ms: 0,
@@ -9234,13 +9510,85 @@ mod tests {
         assert!(
             !ar.row.passed,
             "skipped aggregate must collapse `passed` to false so compare_rows \
-             routes the pair through the skipped_failed gate",
+             routes the pair through the excluded_pairs gate",
         );
         // Gauge(Last) mean of (pass1, pass2): (10 + 50)/2 = 30.0.
         assert_eq!(ar.row.spread, 30.0);
         // Peak MAX of (pass1, pass2) gap_ms: max(100, 500) = 500.
         // Was 300 under arithmetic-mean.
         assert_eq!(ar.row.gap_ms, 500);
+    }
+
+    /// Inconclusive contributors are excluded from the metric
+    /// mean and flip the aggregate's `inconclusive` to true (per
+    /// the `Fail > Inconclusive > Pass > Skip` lattice, an
+    /// Inconclusive contributor in an otherwise-passing cohort
+    /// dominates the verdict). `passes_observed` does not count
+    /// them; pathological metrics on the inconclusive row stay
+    /// out of the cohort means. Pins that the inconclusive bit
+    /// surfaces on the aggregate so downstream stats tooling can
+    /// distinguish a cohort that ran-but-couldn't-evaluate from
+    /// one that truly passed.
+    #[test]
+    fn group_and_average_inconclusive_contributors_excluded_from_mean_and_flag_aggregate() {
+        let mut pass1 = make_row("t", "tiny-1llc", true, 0.0);
+        paint_metrics(&mut pass1, 10.0, 100, 30, 1000);
+        // Inconclusive row: passed=false, skipped=false,
+        // inconclusive=true. Pathological metrics on this row
+        // must NOT leak into the mean.
+        let mut inc = make_row("t", "tiny-1llc", false, 0.0);
+        inc.inconclusive = true;
+        paint_metrics(&mut inc, 7777.0, 77777, 77777, 77777);
+        let mut pass2 = make_row("t", "tiny-1llc", true, 0.0);
+        paint_metrics(&mut pass2, 30.0, 300, 90, 2000);
+        let out = group_and_average_by(&[pass1, inc, pass2], LEGACY_PAIRING_DIMS);
+        assert_eq!(out.len(), 1);
+        let ar = &out[0];
+        assert_eq!(ar.passes_observed, 2);
+        assert_eq!(ar.total_observed, 3);
+        assert!(
+            ar.row.inconclusive,
+            "any inconclusive contributor must flip the aggregate to inconclusive=true",
+        );
+        assert!(
+            !ar.row.passed,
+            "an inconclusive contributor must flip the aggregate to passed=false \
+             (Inconclusive dominates Pass per the lattice)",
+        );
+        // Mean of only the passing entries' spread (Gauge(Last)):
+        // (10 + 30) / 2 = 20.0. If the inconclusive row leaked
+        // in, this would be ~2605.
+        assert_eq!(ar.row.spread, 20.0);
+        // MAX of only the passing entries' gap_ms (Peak):
+        // max(100, 300) = 300. Was 77777 under leaked semantics.
+        assert_eq!(ar.row.gap_ms, 300);
+    }
+
+    /// Fail dominates Inconclusive: a cohort with both a Fail and
+    /// an Inconclusive contributor produces `passed=false,
+    /// inconclusive=false` (Fail wins per the
+    /// `Fail > Inconclusive > Pass > Skip` lattice). Pins the
+    /// `inconclusive: acc.any_inconclusive && !acc.any_failed`
+    /// guard so the aggregate verdict surfaces the dominant Fail
+    /// signal rather than the lesser Inconclusive one.
+    #[test]
+    fn group_and_average_fail_dominates_inconclusive_in_aggregate_verdict() {
+        let mut pass = make_row("t", "tiny-1llc", true, 0.0);
+        paint_metrics(&mut pass, 10.0, 100, 30, 1000);
+        let mut inc = make_row("t", "tiny-1llc", false, 0.0);
+        inc.inconclusive = true;
+        paint_metrics(&mut inc, 7777.0, 77777, 77777, 77777);
+        let mut fail = make_row("t", "tiny-1llc", false, 0.0);
+        paint_metrics(&mut fail, 9999.0, 99999, 99999, 99999);
+        let out = group_and_average_by(&[pass, inc, fail], LEGACY_PAIRING_DIMS);
+        assert_eq!(out.len(), 1);
+        let ar = &out[0];
+        assert!(!ar.row.passed, "any Fail must flip passed to false");
+        assert!(
+            !ar.row.inconclusive,
+            "Fail dominates Inconclusive: aggregate must surface as Fail \
+             (inconclusive=false), not Inconclusive",
+        );
     }
 
     /// All contributors fail: aggregate has `passes_observed = 0`,
@@ -9261,7 +9609,7 @@ mod tests {
         assert!(!ar.row.passed);
         // Failed-only group: every metric collapses to its zero
         // default. The aggregate's `passed=false` then routes the
-        // pair through compare_rows' skipped_failed gate.
+        // pair through compare_rows' excluded_pairs gate.
         assert_eq!(ar.row.spread, 0.0);
         assert_eq!(ar.row.gap_ms, 0);
         assert_eq!(ar.row.migrations, 0);
@@ -10255,8 +10603,62 @@ mod tests {
         AveragedGroup {
             row,
             passes_observed,
+            skips_observed: 0,
+            inconclusives_observed: 0,
+            failures_observed: 0,
             total_observed,
         }
+    }
+
+    /// Build an [`AveragedGroup`] with non-zero skip / inc / fail
+    /// counts for the per-group breakdown test below.
+    fn group_with_breakdown(
+        scenario: &str,
+        topology: &str,
+        work_type: &str,
+        passes: u32,
+        skips: u32,
+        incs: u32,
+        fails: u32,
+    ) -> AveragedGroup {
+        let mut row = make_row(scenario, topology, true, 0.0);
+        row.work_type = work_type.into();
+        AveragedGroup {
+            row,
+            passes_observed: passes,
+            skips_observed: skips,
+            inconclusives_observed: incs,
+            failures_observed: fails,
+            total_observed: passes + skips + incs + fails,
+        }
+    }
+
+    /// Regression guard for the per-group 4-state breakdown:
+    /// `format_per_group_pass_counts` must append `(N skip, N inc,
+    /// N fail)` when any non-pass bucket is non-zero, mirroring
+    /// `format_dimension_summary`'s contract. A future refactor that
+    /// drops the breakdown suffix or stops populating the new
+    /// AveragedGroup counters would silently regress the operator's
+    /// per-group view back to the pre-fix `passes_observed /
+    /// total_observed` shape that hid skip / inconc / fail
+    /// distinctions in the M-N gap.
+    #[test]
+    fn format_per_group_pass_counts_renders_skip_inc_fail_breakdown() {
+        let g_a = group_with_breakdown("scn", "topo", "wt", 1, 1, 1, 1);
+        let g_b = group_with_breakdown("scn", "topo", "wt", 4, 0, 0, 0);
+        let out = format_per_group_pass_counts(&[g_a], &[g_b], "A", "B");
+        assert!(
+            out.contains("A=1/4 (1 skip, 1 inc, 1 fail)"),
+            "non-zero buckets must surface in the per-group breakdown for A: {out}"
+        );
+        assert!(
+            out.contains("B=4/4"),
+            "all-pass side must stay terse (no breakdown suffix): {out}"
+        );
+        assert!(
+            !out.contains("B=4/4 ("),
+            "B has zero non-pass buckets — must NOT append empty breakdown: {out}"
+        );
     }
 
     /// Empty input: no groups on either side. The formatter

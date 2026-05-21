@@ -936,18 +936,33 @@ impl From<&str> for NoteValue {
 }
 
 /// Terminal verdict for a single test scenario or merge fold —
-/// strict three-state enum that replaces the `(passed, skipped)`
+/// strict four-state enum that replaces the `(passed, skipped)`
 /// bool-pair encoding on [`AssertResult`].
 ///
-/// Precedence under [`AssertResult::merge`]: **`Fail > Pass > Skip`**.
-/// A merge of any subset that contains at least one `Fail` resolves
-/// to `Fail`; a merge of `Pass + Skip` resolves to `Pass` (Skip is
-/// the weakest outcome — "couldn't check" is dominated by any real
-/// check that ran). Skip-only merges stay Skip. Pass-only merges
-/// stay Pass. The precedence matches the long-standing semantic at
-/// [`AssertResult::merge`] (`passed &= other.passed; skipped &&=
-/// other.skipped`), encoded as a single enum ordering so consumers
-/// can `max()` outcomes without re-deriving the bool-pair table.
+/// Precedence under [`AssertResult::merge`]:
+/// **`Fail > Inconclusive > Pass > Skip`**.
+/// A merge that contains any `Fail` resolves to `Fail`; absent a
+/// `Fail`, any `Inconclusive` resolves to `Inconclusive`; absent
+/// both, a `Pass + Skip` mix resolves to `Pass` (Pass dominates
+/// Skip — a check that actually ran and passed overrides a
+/// sibling check whose precondition was unmet, so the merge does
+/// not falsely demote to Skip on the strength of an unrelated
+/// missing-precondition sibling). Skip-only merges stay Skip.
+/// Pass-only merges stay Pass. Inconclusive sits between Fail
+/// and Pass because "couldn't evaluate" is not a real Pass (an
+/// Inconclusive run must not satisfy `is_pass()`-keyed CI gates)
+/// but also not a hard Fail (no claim was made that the system
+/// did the wrong thing).
+///
+/// `Inconclusive` exists for ratio assertions whose denominator
+/// is an INSTRUMENT-derived measurement (iteration count, sample
+/// count, wall-clock interval) that legitimately reached zero —
+/// the gate has no signal to evaluate against. Distinguish from
+/// `Fail`: a POLICY-derived denominator (e.g. NUMA pages under
+/// `MemPolicy::Bind`, where the policy specifies pages will
+/// exist) staying at zero IS a defect signal and stays as `Fail`
+/// per the existing semantic — see `assert_page_locality` at
+/// [`AssertPlan::assert_cgroup`] for the policy-derived carve-out.
 ///
 /// Note: Notes do NOT belong here. [`AssertResult::info_notes`]
 /// is the structurally-separate context stream; re-encoding Note
@@ -956,25 +971,30 @@ impl From<&str> for NoteValue {
 /// Outcome is strictly terminal verdict; notes are non-verdict
 /// context.
 ///
-/// `Skip` and `Fail` carry an [`AssertDetail`] payload so the
-/// match arm has the diagnostic in hand without re-walking
-/// `details`. `Pass` carries no payload — there is no failure to
-/// describe.
+/// `Skip`, `Inconclusive`, and `Fail` carry an [`AssertDetail`]
+/// payload so the match arm has the diagnostic in hand without
+/// re-walking `details`. `Pass` carries no payload — there is no
+/// failure to describe.
 ///
 /// Outcomes are stored as [`AssertResult::outcomes`] and the
 /// [`AssertResult::outcome`] accessor folds the vec via this enum's
 /// [`Self::merge`] (identity = `Outcome::Pass`). Callers query via
 /// [`AssertResult::is_pass`] / [`AssertResult::is_fail`] /
-/// [`AssertResult::is_skip`] (bool checks),
-/// [`AssertResult::record_fail`] / [`AssertResult::record_skip`] /
-/// [`AssertResult::record_pass`] (atomic mutators), or
-/// [`AssertResult::failure_details`] / [`AssertResult::skip_reasons`]
-/// (per-variant payload iterators).
+/// [`AssertResult::is_skip`] / [`AssertResult::is_inconclusive`]
+/// (bool checks), [`AssertResult::record_fail`] /
+/// [`AssertResult::record_skip`] / [`AssertResult::record_pass`] /
+/// [`AssertResult::record_inconclusive`] (atomic mutators), or
+/// [`AssertResult::failure_details`] / [`AssertResult::skip_details`] /
+/// [`AssertResult::inconclusive_details`] (per-variant payload
+/// iterators).
 ///
 /// **Skip is not Pass**: `is_pass()` returns `false` on skip — a
 /// skipped scenario is "couldn't run", not "passed". Stats tooling
 /// and gate callers that want to count "not a failure" must test
 /// `r.is_pass() || r.is_skip()` rather than bare `r.is_pass()`.
+/// **Inconclusive is not Pass either**: `is_pass()` returns `false`
+/// when any Inconclusive is recorded, so a zero-denominator ratio
+/// gate cannot silently satisfy an `is_pass()`-keyed CI check.
 /// Uses serde's externally-tagged default (no `#[serde(tag,
 /// content)]`). Most ktstr enums adopt the adjacently-tagged
 /// `#[serde(tag = "kind", content = "data")]` style for JSON
@@ -991,15 +1011,55 @@ impl From<&str> for NoteValue {
 /// pins both the JSON shape and the postcard roundtrip so a
 /// refactor that re-adds adjacent tagging trips loudly at test
 /// time rather than at runtime.
+///
+/// # Wire-format stability (postcard variant index)
+///
+/// Postcard encodes externally-tagged enums by **variant index**,
+/// not variant name — the integer position in the `enum` body
+/// becomes part of the wire format. The current encoding is:
+/// `Pass=0`, `Skip=1`, `Inconclusive=2`, `Fail=3`.
+///
+/// **Append-only:** new variants MUST be added at the END of the
+/// variant list. Re-ordering, removing, or inserting a variant
+/// shifts the index of every variant after it and silently
+/// reinterprets in-flight bytes from guest payloads as a
+/// different variant on the host — the failure mode is a `Pass`
+/// reading as `Skip` (or vice versa) with no decode error.
+///
+/// Any change to the variant order or list MUST be accompanied
+/// by an update to `tests_assert.rs::outcome_serde_externally_tagged_*`
+/// (which pins both the JSON shape and the postcard byte
+/// sequence) so a silent-shift regression trips at test time.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Outcome {
+    // Wire-format-stable: variant indices encode into postcard
+    // bytes (Pass=0, Skip=1, Inconclusive=2, Fail=3). Append new
+    // variants ONLY at the end of this list — see the enum doc's
+    // "Wire-format stability" section for the silent-shift hazard
+    // a reorder introduces.
     Pass,
     Skip(AssertDetail),
+    Inconclusive(AssertDetail),
     Fail(AssertDetail),
 }
 
 impl Outcome {
     /// True iff `self == Outcome::Pass`.
+    ///
+    /// Part of the `is_pass` / `is_fail` / `is_inconclusive` /
+    /// `is_skip` vocabulary uniform across the verdict surfaces:
+    /// [`crate::assert::AssertResult::is_pass`] /
+    /// [`crate::test_support::SidecarResult::is_pass`] /
+    /// [`Self::is_pass`] / `MonitorVerdict::is_pass` (in the
+    /// `monitor` module, which is `pub(crate)`) / `Verdict::is_pass`
+    /// (re-exported at [`crate::assert::Verdict`]) /
+    /// `GauntletRow::is_pass` (in the `stats` module, which is
+    /// `pub(crate)`). [`OutcomeRef::is_pass`] is a borrowed-view
+    /// twin of this method on the borrowed [`OutcomeRef`] enum and
+    /// is intentionally NOT counted as a peer surface — it shares
+    /// the boolean semantic for naming parity but is a `&self`
+    /// projection over [`Outcome`], not an independent verdict
+    /// shape.
     pub fn is_pass(&self) -> bool {
         matches!(self, Outcome::Pass)
     }
@@ -1014,32 +1074,45 @@ impl Outcome {
         matches!(self, Outcome::Fail(_))
     }
 
-    /// Merge two outcomes per the precedence `Fail > Pass > Skip`.
+    /// True iff `self == Outcome::Inconclusive(_)`.
+    pub fn is_inconclusive(&self) -> bool {
+        matches!(self, Outcome::Inconclusive(_))
+    }
+
+    /// Merge two outcomes per the precedence
+    /// `Fail > Inconclusive > Pass > Skip`.
     ///
-    /// Discriminant-commutative: the merged Pass/Skip/Fail kind is
-    /// the same regardless of operand order. Idempotent on Pass
-    /// (`Pass.merge(Pass) == Pass`).
+    /// Discriminant-commutative: the merged Pass/Skip/Inconclusive/Fail
+    /// kind is the same regardless of operand order. Idempotent on
+    /// Pass (`Pass.merge(Pass) == Pass`).
     ///
     /// Payload semantic (NOT commutative):
-    /// - Same-variant ties (Fail+Fail, Skip+Skip): the LEFT operand's
-    ///   payload wins, so caller-controlled merge ordering produces
-    ///   deterministic detail content.
-    /// - Cross-variant Fail+Skip: the merged outcome is Fail and the
-    ///   payload comes from whichever side carries the Fail (the Skip's
-    ///   payload is dropped — the merged verdict is Fail, so the Skip
-    ///   narrative is irrelevant to the failure record).
+    /// - Same-variant ties (Fail+Fail, Inconclusive+Inconclusive,
+    ///   Skip+Skip): the LEFT operand's payload wins, so caller-
+    ///   controlled merge ordering produces deterministic detail
+    ///   content.
+    /// - Cross-variant Fail+{Inconclusive,Skip}: the merged outcome is
+    ///   Fail and the payload comes from whichever side carries the
+    ///   Fail (the dominated side's payload is dropped — the merged
+    ///   verdict is Fail, so the dominated narrative is irrelevant to
+    ///   the failure record).
+    /// - Cross-variant Inconclusive+{Pass,Skip}: merged outcome is
+    ///   Inconclusive and the payload comes from whichever side
+    ///   carries the Inconclusive.
     pub fn merge(self, other: Outcome) -> Outcome {
         use Outcome::*;
         match (self, other) {
             (Fail(d), _) | (_, Fail(d)) => Fail(d),
+            (Inconclusive(d), _) | (_, Inconclusive(d)) => Inconclusive(d),
             (Pass, _) | (_, Pass) => Pass,
             (Skip(d), Skip(_)) => Skip(d),
         }
     }
 
     /// Borrow this outcome's payload as an [`OutcomeRef`]. Zero-
-    /// allocation projection — `Pass` carries no payload, `Skip`
-    /// and `Fail` borrow their [`AssertDetail`] in place. Used by
+    /// allocation projection — `Pass` carries no payload; `Skip`,
+    /// `Inconclusive`, and `Fail` borrow their [`AssertDetail`] in
+    /// place. Used by
     /// the verdict-read fast path
     /// ([`AssertResult::outcome_ref`]) and any caller that wants
     /// to inspect the terminal verdict without cloning the
@@ -1050,15 +1123,17 @@ impl Outcome {
         match self {
             Outcome::Pass => OutcomeRef::Pass,
             Outcome::Skip(d) => OutcomeRef::Skip(d),
+            Outcome::Inconclusive(d) => OutcomeRef::Inconclusive(d),
             Outcome::Fail(d) => OutcomeRef::Fail(d),
         }
     }
 }
 
-/// Borrowed view of an [`Outcome`]: same three discriminants but
-/// the `Skip` and `Fail` payloads borrow their [`AssertDetail`]
-/// in place. Returned by [`Outcome::as_ref`] and the zero-clone
-/// verdict-read fast path [`AssertResult::outcome_ref`].
+/// Borrowed view of an [`Outcome`]: same four discriminants but
+/// the `Skip`, `Inconclusive`, and `Fail` payloads borrow their
+/// [`AssertDetail`] in place. Returned by [`Outcome::as_ref`] and
+/// the zero-clone verdict-read fast path
+/// [`AssertResult::outcome_ref`].
 ///
 /// Use when the caller wants the terminal verdict shape (or its
 /// payload) WITHOUT taking ownership — typical sites are
@@ -1069,6 +1144,7 @@ impl Outcome {
 pub enum OutcomeRef<'a> {
     Pass,
     Skip(&'a AssertDetail),
+    Inconclusive(&'a AssertDetail),
     Fail(&'a AssertDetail),
 }
 
@@ -1088,6 +1164,11 @@ impl OutcomeRef<'_> {
     pub fn is_fail(&self) -> bool {
         matches!(self, OutcomeRef::Fail(_))
     }
+    /// True iff `self == OutcomeRef::Inconclusive(_)`. Matches the
+    /// boolean shape of [`Outcome::is_inconclusive`].
+    pub fn is_inconclusive(&self) -> bool {
+        matches!(self, OutcomeRef::Inconclusive(_))
+    }
     /// Promote a borrowed [`OutcomeRef`] into an owned [`Outcome`]
     /// by cloning the borrowed [`AssertDetail`] (when present).
     /// `OutcomeRef::Pass` carries no payload so the conversion is
@@ -1100,6 +1181,7 @@ impl OutcomeRef<'_> {
         match self {
             OutcomeRef::Pass => Outcome::Pass,
             OutcomeRef::Skip(d) => Outcome::Skip((*d).clone()),
+            OutcomeRef::Inconclusive(d) => Outcome::Inconclusive((*d).clone()),
             OutcomeRef::Fail(d) => Outcome::Fail((*d).clone()),
         }
     }
@@ -1111,19 +1193,21 @@ impl OutcomeRef<'_> {
 ///
 /// Inspect the terminal verdict via [`Self::outcome`] (returns the
 /// folded [`Outcome`] enum) or the convenience accessors
-/// [`Self::is_pass`] / [`Self::is_fail`] / [`Self::is_skip`]. Iterate
-/// the per-variant payloads via [`Self::failure_details`] (all
-/// [`Outcome::Fail`] payloads) and [`Self::skip_reasons`] (all
-/// [`Outcome::Skip`] payloads). The legacy [`Self::is_skipped`] /
-/// [`Self::is_failed`] aliases remain for the migration window — new
-/// code prefers the un-suffixed `is_skip` / `is_fail` for naming
-/// parity with [`Outcome::is_skip`] / [`Outcome::is_fail`].
+/// [`Self::is_pass`] / [`Self::is_fail`] / [`Self::is_inconclusive`] /
+/// [`Self::is_skip`]. Iterate the per-variant payloads via
+/// [`Self::failure_details`] (all [`Outcome::Fail`] payloads),
+/// [`Self::inconclusive_details`] (all [`Outcome::Inconclusive`]
+/// payloads), and [`Self::skip_details`] (all [`Outcome::Skip`]
+/// payloads). All four bool accessors mirror
+/// [`Outcome::is_pass`] / [`Outcome::is_fail`] /
+/// [`Outcome::is_inconclusive`] / [`Outcome::is_skip`].
 ///
 /// # Recording outcomes
 ///
 /// Producers use the atomic mutators [`Self::record_fail`] /
-/// [`Self::record_skip`] / [`Self::record_pass`] (each pushes a single
-/// [`Outcome`] variant onto [`Self::outcomes`]) and the escape hatch
+/// [`Self::record_skip`] / [`Self::record_inconclusive`] /
+/// [`Self::record_pass`] (each pushes a single [`Outcome`] variant
+/// onto [`Self::outcomes`]) and the escape hatch
 /// [`Self::record_outcome`] for pre-folded values. Constructors
 /// [`Self::pass`] / [`Self::skip`] / [`Self::fail`] seed the
 /// outcomes vec with the corresponding variant; [`Self::pass`] is
@@ -1143,9 +1227,9 @@ impl OutcomeRef<'_> {
 pub struct AssertResult {
     /// Recorded terminal verdicts in emission order, one entry per
     /// check that explicitly called [`Self::record_pass`],
-    /// [`Self::record_skip`], or [`Self::record_fail`] (plus the
-    /// single entry seeded by [`Self::skip`] / [`Self::fail`]
-    /// constructors).
+    /// [`Self::record_skip`], [`Self::record_inconclusive`], or
+    /// [`Self::record_fail`] (plus the single entry seeded by
+    /// [`Self::skip`] / [`Self::fail`] constructors).
     ///
     /// **Empty `outcomes` is the Pass identity** — [`Self::pass`]
     /// constructs with `outcomes: vec![]`, [`Self::outcome`] folds
@@ -1158,11 +1242,12 @@ pub struct AssertResult {
     /// constructor.
     ///
     /// The folded terminal verdict is computed by [`Self::outcome`]
-    /// per the precedence `Fail > Pass > Skip`. Use
-    /// [`Self::is_pass`] / [`Self::is_fail`] / [`Self::is_skip`] for
-    /// bool checks; use [`Self::failure_details`] /
-    /// [`Self::skip_reasons`] to iterate the per-variant
-    /// [`AssertDetail`] payloads.
+    /// per the precedence `Fail > Inconclusive > Pass > Skip`. Use
+    /// [`Self::is_pass`] / [`Self::is_fail`] /
+    /// [`Self::is_inconclusive`] / [`Self::is_skip`] for bool
+    /// checks; use [`Self::failure_details`] /
+    /// [`Self::inconclusive_details`] / [`Self::skip_details`] to
+    /// iterate the per-variant [`AssertDetail`] payloads.
     pub outcomes: Vec<Outcome>,
     /// Structured records of every passing claim. Counterpart to
     /// [`Self::outcomes`]: where `outcomes` carries terminal-verdict
@@ -2331,11 +2416,44 @@ impl AssertResult {
         Self::fail(AssertDetail::new(DetailKind::Other, msg))
     }
 
+    /// Inconclusive result carrying a single [`AssertDetail`].
+    /// Mirrors [`Self::pass`] / [`Self::skip`] / [`Self::fail`] for
+    /// the inconclusive axis so callers don't hand-roll the struct-
+    /// literal shape at sites that need to construct a fresh
+    /// "couldn't evaluate" envelope (the symmetric peer of
+    /// [`Self::fail`] for INSTRUMENT-derived zero-denominator
+    /// gates). Seeds [`Self::outcomes`] with a single
+    /// [`Outcome::Inconclusive`] carrying the detail. For mutating
+    /// an existing accumulator in place, use
+    /// [`Self::record_inconclusive`].
+    pub fn inconclusive(detail: AssertDetail) -> Self {
+        Self {
+            outcomes: vec![Outcome::Inconclusive(detail)],
+            ..Self::pass()
+        }
+    }
+
+    /// Inconclusive result carrying a single message-only diagnostic.
+    /// Shorthand for `AssertResult::inconclusive(AssertDetail::new(
+    /// DetailKind::Other, msg))` — mirrors [`Self::fail_msg`] for the
+    /// inconclusive axis at call sites where the operator hint is a
+    /// flat string and the structured [`DetailKind`] would always be
+    /// `Other`. Callers that need a specific kind still reach for
+    /// `AssertResult::inconclusive` + `AssertDetail::new(kind, msg)`.
+    pub fn inconclusive_msg(msg: impl Into<String>) -> Self {
+        Self::inconclusive(AssertDetail::new(DetailKind::Other, msg))
+    }
+
     /// Atomically record a Fail outcome carrying `detail`. Replaces
     /// the legacy two-step pattern `r.passed = false; r.details.push(d);`
     /// — collapses the producer-defect window where the discriminant
     /// flipped without a corresponding diagnostic. Returns `&mut Self`
     /// for chaining.
+    ///
+    /// See [`Self::record_inconclusive`] for ratio gates whose
+    /// denominator legitimately reached zero — neither Pass nor
+    /// Fail is truthful there, and Fail-coding a "couldn't evaluate"
+    /// run loses signal in CI triage.
     pub fn record_fail(&mut self, detail: AssertDetail) -> &mut Self {
         self.outcomes.push(Outcome::Fail(detail));
         self
@@ -2345,9 +2463,42 @@ impl AssertResult {
     /// the legacy two-step pattern `r.skipped = true;
     /// r.details.push(AssertDetail::new(DetailKind::Skip, reason));`.
     /// Returns `&mut Self` for chaining.
+    ///
+    /// Boundary with [`Self::record_inconclusive`]: Skip = scenario
+    /// precondition unmet (the check doesn't apply — e.g. host lacks
+    /// the topology the test needs); Inconclusive = precondition met
+    /// and the check applied, but the signal was absent and the gate
+    /// couldn't conclude (e.g. a ratio with a zero denominator).
+    /// Mis-coding an Inconclusive case as Skip drops it from the
+    /// "ran but couldn't evaluate" bucket CI gates need for triage.
     pub fn record_skip(&mut self, reason: impl Into<String>) -> &mut Self {
         self.outcomes
             .push(Outcome::Skip(AssertDetail::new(DetailKind::Skip, reason)));
+        self
+    }
+
+    /// Atomically record an Inconclusive outcome carrying `detail`.
+    /// Signature mirrors [`Self::record_fail`] (takes the full
+    /// [`AssertDetail`] so the producer's [`DetailKind`] flows into
+    /// the inconclusive record for filterable diagnostics — a
+    /// zero-iteration `max_migration_ratio` site emits
+    /// `DetailKind::Migration`, not a flat string). Use for ratio
+    /// gates whose INSTRUMENT-derived denominator (iteration count,
+    /// sample count, wall-clock interval) reached zero: the gate
+    /// has no signal to evaluate, neither Pass nor Fail is a
+    /// truthful verdict. Returns `&mut Self` for chaining.
+    ///
+    /// Boundary with [`Self::record_skip`]: Inconclusive = the gate
+    /// applied (preconditions met) but the signal was absent;
+    /// Skip = the gate's precondition was unmet (e.g. host lacks
+    /// the required topology) so the check did NOT apply. Boundary
+    /// with [`Self::record_fail`]: Inconclusive = denominator is
+    /// INSTRUMENT-derived (a measurement count that happened to be
+    /// zero); Fail = denominator is POLICY-derived (a configured
+    /// expectation that must hold — see the [`Outcome`] doc's
+    /// `MemPolicy::Bind` carve-out for the canonical example).
+    pub fn record_inconclusive(&mut self, detail: AssertDetail) -> &mut Self {
+        self.outcomes.push(Outcome::Inconclusive(detail));
         self
     }
 
@@ -2372,36 +2523,66 @@ impl AssertResult {
         self
     }
 
-    /// True iff the scenario completed without failure and actually
-    /// ran (i.e. wasn't all-Skip). An empty outcomes stream (the
-    /// [`Self::pass`] zero-state, which is the merge identity
-    /// element) satisfies this; any stream containing at least one
-    /// real Pass marker alongside no Fail also satisfies it; an
-    /// all-Skip stream returns false (a skipped scenario didn't
-    /// pass, it didn't run).
+    /// True iff the scenario completed without failure or
+    /// inconclusive verdict and actually ran (i.e. wasn't all-Skip).
+    /// An empty outcomes stream (the [`Self::pass`] zero-state,
+    /// which is the merge identity element) satisfies this; any
+    /// stream containing at least one real Pass marker alongside no
+    /// Fail / Inconclusive also satisfies it; an all-Skip stream
+    /// returns false (a skipped scenario didn't pass, it didn't
+    /// run); any Inconclusive returns false (a zero-denominator
+    /// ratio gate didn't pass, it couldn't evaluate).
     ///
-    /// Mechanically: `!self.is_fail() && !self.is_skip()`. The two
-    /// conjuncts capture "no failure recorded" AND "not vacuously
-    /// satisfied by all-skip".
+    /// Mechanically: `!self.is_fail() && !self.is_inconclusive() &&
+    /// !self.is_skip()`. The three conjuncts capture "no failure
+    /// recorded", "no inconclusive verdict recorded", AND "not
+    /// vacuously satisfied by all-skip".
+    ///
+    /// Part of the `is_pass` / `is_fail` / `is_inconclusive` /
+    /// `is_skip` vocabulary uniform across the verdict surfaces:
+    /// [`AssertResult::is_pass`] /
+    /// [`crate::test_support::SidecarResult::is_pass`] /
+    /// [`Outcome::is_pass`] / `MonitorVerdict::is_pass` (in the
+    /// `monitor` module, which is `pub(crate)`) / `Verdict::is_pass`
+    /// (re-exported at [`crate::assert::Verdict`]) /
+    /// `GauntletRow::is_pass` (in the `stats` module, which is
+    /// `pub(crate)`).
     pub fn is_pass(&self) -> bool {
-        !self.is_fail() && !self.is_skip()
+        !self.is_fail() && !self.is_inconclusive() && !self.is_skip()
     }
 
     /// True iff any recorded outcome is [`Outcome::Fail`]. Any fail
-    /// in the stream dominates per `Fail > Pass > Skip` precedence.
+    /// in the stream dominates per `Fail > Inconclusive > Pass > Skip`
+    /// precedence.
     pub fn is_fail(&self) -> bool {
-        self.outcomes.iter().any(|o| matches!(o, Outcome::Fail(_)))
+        self.outcomes.iter().any(Outcome::is_fail)
     }
 
     /// True iff `outcomes` is non-empty AND every entry is
     /// [`Outcome::Skip`]. Empty `outcomes` is the Pass identity,
     /// NOT a vacuous Skip — `is_skip()` returns false on empty.
     pub fn is_skip(&self) -> bool {
-        !self.outcomes.is_empty() && self.outcomes.iter().all(|o| matches!(o, Outcome::Skip(_)))
+        !self.outcomes.is_empty() && self.outcomes.iter().all(Outcome::is_skip)
+    }
+
+    /// True iff any recorded outcome is [`Outcome::Inconclusive`]
+    /// AND no [`Outcome::Fail`] dominates it. Mirrors the precedence
+    /// `Fail > Inconclusive > Pass > Skip`: a Fail-plus-Inconclusive
+    /// stream is `is_fail() == true` and `is_inconclusive() == false`
+    /// (the Fail wins; Inconclusive is dominated). Used by CI gates
+    /// that want to surface "couldn't evaluate" verdicts distinctly
+    /// from passes and failures.
+    pub fn is_inconclusive(&self) -> bool {
+        !self.is_fail() && self.outcomes.iter().any(Outcome::is_inconclusive)
     }
 
     /// Iterate every [`Outcome::Fail`]'s payload. Use to extract
-    /// failure diagnostics for rendering or stats roll-up.
+    /// failure diagnostics for rendering or stats roll-up. Does NOT
+    /// include [`Outcome::Inconclusive`] payloads —
+    /// [`Self::inconclusive_details`] is the sibling iterator for
+    /// those, and [`Self::into_anyhow_or_log`] bails only on Fail
+    /// so folding Inconclusive into this iterator would break the
+    /// "couldn't evaluate doesn't fail the run" semantic.
     pub fn failure_details(&self) -> impl Iterator<Item = &AssertDetail> {
         self.outcomes.iter().filter_map(|o| match o {
             Outcome::Fail(d) => Some(d),
@@ -2411,9 +2592,28 @@ impl AssertResult {
 
     /// Iterate every [`Outcome::Skip`]'s payload. Use to extract
     /// skip reasons when triaging "scenario didn't run" outcomes.
-    pub fn skip_reasons(&self) -> impl Iterator<Item = &AssertDetail> {
+    /// The `_details` suffix mirrors [`Self::failure_details`] /
+    /// [`Self::inconclusive_details`] — all three yield
+    /// `&AssertDetail` payloads.
+    pub fn skip_details(&self) -> impl Iterator<Item = &AssertDetail> {
         self.outcomes.iter().filter_map(|o| match o {
             Outcome::Skip(d) => Some(d),
+            _ => None,
+        })
+    }
+
+    /// Iterate every [`Outcome::Inconclusive`]'s payload. Use to
+    /// extract diagnostic context for zero-denominator ratio gates
+    /// or other "couldn't evaluate" verdicts when triaging.
+    /// Symmetric with [`Self::failure_details`] /
+    /// [`Self::skip_details`]; not folded into either so the
+    /// failure / skip / inconclusive surfaces remain separately
+    /// addressable. The `_details` suffix mirrors
+    /// [`Self::failure_details`] — both yield `&AssertDetail`
+    /// payloads that drive triage of material verdicts.
+    pub fn inconclusive_details(&self) -> impl Iterator<Item = &AssertDetail> {
+        self.outcomes.iter().filter_map(|o| match o {
+            Outcome::Inconclusive(d) => Some(d),
             _ => None,
         })
     }
@@ -2422,24 +2622,43 @@ impl AssertResult {
     /// [`Self::info_notes`] entry through `tracing::info!` (so
     /// `--nocapture` + `RUST_LOG=ktstr=info` users see them, but
     /// default-noise-level runs stay quiet) and bail on any
-    /// accumulated failure. Returns `Ok(())` on the success/skip
-    /// path — idiomatic post_vm usage chains `?` to propagate the
-    /// failure or continue.
+    /// accumulated failure OR inconclusive verdict. Returns `Ok(())`
+    /// only on the pass / pure-skip path — idiomatic post_vm usage
+    /// chains `?` to propagate the verdict or continue.
     ///
     /// # Failure behavior
     ///
-    /// Every entry from [`Self::failure_details`] is concatenated
-    /// into the returned `anyhow::Error` message (separated by
-    /// newlines). All failures surface — the helper does NOT drop
-    /// N-1 details when multiple claims failed.
+    /// Per the precedence `Fail > Inconclusive > Pass > Skip`, Fail
+    /// dominates Inconclusive: when any [`Outcome::Fail`] is recorded
+    /// the helper bails with the failure narrative, regardless of
+    /// any sibling Inconclusive outcomes. Every entry from
+    /// [`Self::failure_details`] is concatenated into the returned
+    /// `anyhow::Error` message — all failures surface, the helper
+    /// does NOT drop N-1 details when multiple claims failed.
+    ///
+    /// # Inconclusive behavior
+    ///
+    /// When no failure is present but at least one Inconclusive is
+    /// recorded (a zero-denominator ratio gate that couldn't
+    /// evaluate), the helper bails with a distinct preamble
+    /// `"N inconclusive verdict(s):"` carrying every
+    /// [`Self::inconclusive_details`] payload. This prevents the
+    /// silent-pass class of bug where a CI gate keying off
+    /// `into_anyhow_or_log().is_ok()` would treat an Inconclusive
+    /// run as green (the `is_pass()`-keyed invariant fails on
+    /// Inconclusive, so the bail surface must match). The
+    /// `"inconclusive verdict(s)"` preamble distinguishes the bail
+    /// narrative from the failure preamble `"N assertion failures:"`
+    /// so an operator triaging the log can immediately tell whether
+    /// the run failed claims or merely lacked signal to evaluate them.
     ///
     /// # Note ordering
     ///
-    /// Info notes are logged BEFORE the failure check fires, so on
-    /// a failed run the operator sees the diagnostic observations
-    /// that led to the failure ALONGSIDE the bail message in their
-    /// log feed (rather than the bail terminating before the notes
-    /// surface).
+    /// Info notes are logged BEFORE the verdict check fires, so on
+    /// a failed or inconclusive run the operator sees the
+    /// diagnostic observations that led to the verdict ALONGSIDE
+    /// the bail message in their log feed (rather than the bail
+    /// terminating before the notes surface).
     ///
     /// # `tracing` vs `println!`
     ///
@@ -2471,6 +2690,22 @@ impl AssertResult {
             };
             anyhow::bail!("{}", combined);
         }
+        let inconclusives: Vec<String> = self
+            .inconclusive_details()
+            .map(|d| d.message.clone())
+            .collect();
+        if !inconclusives.is_empty() {
+            let combined = if inconclusives.len() == 1 {
+                format!("1 inconclusive verdict: {}", inconclusives[0])
+            } else {
+                let mut out = format!("{} inconclusive verdicts:\n", inconclusives.len());
+                for (i, msg) in inconclusives.iter().enumerate() {
+                    out.push_str(&format!("  {}. {}\n", i + 1, msg));
+                }
+                out.trim_end().to_string()
+            };
+            anyhow::bail!("{}", combined);
+        }
         Ok(())
     }
     /// Append an informational annotation to [`Self::info_notes`].
@@ -2496,42 +2731,33 @@ impl AssertResult {
         self.note(msg);
         self
     }
-    /// Alias for [`Self::is_skip`] so stats tooling reading
-    /// "this scenario was skipped" via `is_skipped()` continues to
-    /// compile; new code should prefer [`Self::is_skip`] for naming
-    /// parity with [`Outcome::is_skip`].
-    pub fn is_skipped(&self) -> bool {
-        self.is_skip()
-    }
-    /// Legacy alias for [`Self::is_fail`]. Kept so short-circuit
-    /// branches reading "did this claim fail?" via `is_failed()`
-    /// continue to compile; new code should prefer [`Self::is_fail`]
-    /// for naming parity with [`Outcome::is_fail`].
-    pub fn is_failed(&self) -> bool {
-        self.is_fail()
-    }
-
     /// Terminal verdict as a single [`Outcome`] value, aligned with
-    /// [`Self::is_pass`] / [`Self::is_fail`] / [`Self::is_skip`]:
+    /// [`Self::is_pass`] / [`Self::is_fail`] /
+    /// [`Self::is_inconclusive`] / [`Self::is_skip`]:
     ///
     /// - any [`Outcome::Fail`] in the stream → [`Outcome::Fail`]
     ///   carrying the first Fail's payload (the LEFT operand wins
     ///   per [`Outcome::merge`]'s payload-tie semantics).
+    /// - else any [`Outcome::Inconclusive`] in the stream →
+    ///   [`Outcome::Inconclusive`] carrying the first
+    ///   Inconclusive's payload (the gate ran but couldn't
+    ///   evaluate; per `Fail > Inconclusive > Pass > Skip` this
+    ///   sits below Fail but above Pass and Skip).
     /// - else non-empty all-[`Outcome::Skip`] → [`Outcome::Skip`]
     ///   carrying the first Skip's payload (a scenario whose only
     ///   recorded gates were skips didn't run — the terminal
     ///   verdict is Skip, not Pass).
     /// - else (empty stream OR at least one explicit
-    ///   [`Outcome::Pass`] marker alongside no Fail) →
-    ///   [`Outcome::Pass`] (the zero-allocation pass identity also
-    ///   lands here).
+    ///   [`Outcome::Pass`] marker alongside no Fail / Inconclusive)
+    ///   → [`Outcome::Pass`] (the zero-allocation pass identity
+    ///   also lands here).
     ///
     /// Diverges from the naive `Outcome::merge` fold over the
     /// identity element [`Outcome::Pass`]: that fold would treat
     /// `[Skip(d)]` as `Pass.merge(Skip(d)) = Pass` per the
-    /// `Fail > Pass > Skip` precedence, contradicting the all-Skip
-    /// branch of [`Self::is_skip`]. This accessor encodes the
-    /// "empty Pass identity" / "real Pass beats Skip" /
+    /// `Fail > Inconclusive > Pass > Skip` precedence, contradicting
+    /// the all-Skip branch of [`Self::is_skip`]. This accessor
+    /// encodes the "empty Pass identity" / "real Pass beats Skip" /
     /// "all-Skip is Skip terminal" distinctions the boolean
     /// accessors enforce.
     ///
@@ -2541,8 +2767,8 @@ impl AssertResult {
     /// performs on the `Skip` / `Fail` arms.
     pub fn outcome(&self) -> Outcome {
         // Delegates to [`Self::outcome_ref`] + [`OutcomeRef::to_owned`]
-        // so the fold rule (Fail > Pass > Skip with the
-        // empty-vec / all-Skip / mixed-Pass-plus-Skip branch
+        // so the fold rule (Fail > Inconclusive > Pass > Skip with
+        // the empty-vec / all-Skip / mixed-Pass-plus-Skip branch
         // resolution) lives in ONE place. A future change to the
         // fold lands at `outcome_ref` and propagates here for free;
         // the drift-guard test
@@ -2555,15 +2781,15 @@ impl AssertResult {
         self.outcome_ref().to_owned()
     }
 
-    /// Borrow the terminal verdict as an [`OutcomeRef`]. Same
-    /// fold semantics as [`Self::outcome`] — `Fail > Pass > Skip`
-    /// precedence, empty-vec / non-empty-all-Skip / mixed-Pass-
-    /// plus-Skip branches all match — but the `Skip(_)` /
-    /// `Fail(_)` arms borrow the source [`AssertDetail`] from
-    /// `self.outcomes` instead of cloning. Use when the caller
-    /// holds the source `AssertResult` and wants the verdict
-    /// payload without the per-call clone (formatter / sidecar
-    /// emit / debug-render paths).
+    /// Borrow the terminal verdict as an [`OutcomeRef`]. Same fold
+    /// semantics as [`Self::outcome`] —
+    /// `Fail > Inconclusive > Pass > Skip` precedence, empty-vec /
+    /// non-empty-all-Skip / mixed-Pass-plus-Skip branches all match
+    /// — but the `Skip(_)` / `Inconclusive(_)` / `Fail(_)` arms
+    /// borrow the source [`AssertDetail`] from `self.outcomes`
+    /// instead of cloning. Use when the caller holds the source
+    /// `AssertResult` and wants the verdict payload without the
+    /// per-call clone (formatter / sidecar emit / debug-render paths).
     ///
     /// Drift guard: `assert_result_outcome_ref_matches_owned_outcome_shape`
     /// in `tests_assert.rs` pins the lockstep with [`Self::outcome`];
@@ -2573,8 +2799,10 @@ impl AssertResult {
     pub fn outcome_ref(&self) -> OutcomeRef<'_> {
         if let Some(d) = self.failure_details().next() {
             OutcomeRef::Fail(d)
-        } else if let Some(d) = self.skip_reasons().next() {
-            if self.outcomes.iter().all(|o| matches!(o, Outcome::Skip(_))) {
+        } else if let Some(d) = self.inconclusive_details().next() {
+            OutcomeRef::Inconclusive(d)
+        } else if let Some(d) = self.skip_details().next() {
+            if self.outcomes.iter().all(Outcome::is_skip) {
                 OutcomeRef::Skip(d)
             } else {
                 OutcomeRef::Pass
@@ -2599,11 +2827,14 @@ impl AssertResult {
     /// the registry (it is a producer-attached typed annotation map,
     /// not a roll-up aggregation surface).
     ///
-    /// Terminal-verdict semantics (any-Fail-dominates, both-must-Skip)
-    /// fall out automatically: appending `other.outcomes` keeps every
-    /// Fail in the stream so [`Self::outcome`]'s fold surfaces them,
-    /// and Skip survives only when both inputs were Skip-only because
-    /// a Pass entry in either side beats Skip per the merge precedence.
+    /// Terminal-verdict semantics fall out automatically per the
+    /// precedence `Fail > Inconclusive > Pass > Skip`: appending
+    /// `other.outcomes` keeps every Fail in the stream so
+    /// [`Self::outcome`]'s fold surfaces them; absent any Fail, any
+    /// Inconclusive in either side dominates Pass/Skip so a
+    /// zero-denominator gate in one branch survives the fold;
+    /// Skip survives only when both inputs were Skip-only because a
+    /// Pass or Inconclusive entry in either side beats Skip.
     pub fn merge(&mut self, mut other: AssertResult) {
         /// Lowest-non-zero fold: `*self_field` becomes `other_field`
         /// when `other_field` is strictly positive AND either
@@ -2821,12 +3052,30 @@ impl AssertResult {
     ///   (last write wins on key collision, matching `merge`).
     ///   `outcomes` follows the first passing branch (typically
     ///   empty per the Pass identity).
-    /// - **All branches fail**: returned result is failing. Every
-    ///   branch's recorded outcomes are re-emitted with each
-    ///   payload's message prefixed by `"any_of[<branch-idx>]: "`
-    ///   so an operator can identify which branch produced which
-    ///   failure. `stats` and `measurements` adopt the FIRST
-    ///   branch's values (an arbitrary choice but deterministic).
+    /// - **No branch passes; at least one fails**: returned result
+    ///   is failing. Every branch's recorded outcomes are re-emitted
+    ///   with each payload's message prefixed by
+    ///   `"any_of[<branch-idx>]: "` so an operator can identify
+    ///   which branch produced which outcome. `stats` and
+    ///   `measurements` adopt the FIRST branch's values (an
+    ///   arbitrary choice but deterministic). A synthesized summary
+    ///   record is appended last carrying the per-disposition
+    ///   counts `(F failed, I inconclusive, S skipped of N branches)`.
+    /// - **No branch passes or fails; at least one is Inconclusive**:
+    ///   returned result is Inconclusive (the disjunction itself
+    ///   could not be evaluated — every branch either was inconclusive
+    ///   or skipped, and per the lattice
+    ///   `Fail > Inconclusive > Pass > Skip` Inconclusive dominates
+    ///   Skip). Same re-emission + summary shape as the fail case,
+    ///   but the synthesized record is [`Outcome::Inconclusive`].
+    ///   Critical: without this arm, all-zero-denominator branches
+    ///   would silently MISCLASSIFY as Fail, defeating the
+    ///   Inconclusive primitive's purpose of preserving "couldn't
+    ///   evaluate" signal.
+    /// - **All branches skipped**: returned result is Skip. Same
+    ///   re-emission + summary shape, with [`Outcome::Skip`] as the
+    ///   synthesized record (every alternative check's precondition
+    ///   was unmet — the disjunction itself didn't run).
     /// - **Empty input**: returned result is failing with a single
     ///   Fail outcome explaining the empty `any_of`. An empty
     ///   disjunction is logically false; this surfaces a producer
@@ -2905,15 +3154,39 @@ impl AssertResult {
             )));
             chosen
         } else {
-            // All branches failed. Re-emit every branch's outcome
+            // No branch passes. Re-emit every branch's outcome
             // stream with branch-index prefixes; adopt the first
             // branch's stats / measurements / passes (deterministic
-            // but arbitrary). Fail/Skip variants keep their kind
-            // discriminant so the operator narrative differentiates
-            // "this branch failed" from "this branch skipped" — the
-            // disjunction still resolves to Fail via the synthesized
-            // summary record appended last.
+            // but arbitrary). Variants keep their kind discriminant
+            // so the operator narrative differentiates "this branch
+            // failed" from "this branch was inconclusive" from
+            // "this branch skipped". The synthesized summary record
+            // appended last carries the per-disposition counts AND
+            // its discriminant follows the precedence
+            // `Fail > Inconclusive > Pass > Skip`:
+            //   - any Fail branch → synth Fail
+            //   - else any Inconclusive → synth Inconclusive
+            //   - else (all Skip) → synth Skip
+            // The Inconclusive arm is load-bearing: without it, a
+            // disjunction of zero-denominator branches would silently
+            // MISCLASSIFY as Fail (or, before that arm existed at
+            // all, surface as a misleading "all branches failed"
+            // verdict on data that simply couldn't be evaluated).
             let total_branches = branches.len();
+            let (n_fail, n_inc, n_skip) =
+                branches
+                    .iter()
+                    .fold((0usize, 0usize, 0usize), |(f, i, s), b| {
+                        if b.is_fail() {
+                            (f + 1, i, s)
+                        } else if b.is_inconclusive() {
+                            (f, i + 1, s)
+                        } else if b.is_skip() {
+                            (f, i, s + 1)
+                        } else {
+                            (f, i, s)
+                        }
+                    });
             let mut iter = branches.into_iter().enumerate();
             let (_, first) = iter.next().expect("non-empty checked above");
             let mut acc = AssertResult {
@@ -2936,6 +3209,9 @@ impl AssertResult {
                             d.kind,
                             format!("any_of[{idx}]: {}", d.message),
                         ))),
+                        Outcome::Inconclusive(d) => acc.outcomes.push(Outcome::Inconclusive(
+                            AssertDetail::new(d.kind, format!("any_of[{idx}]: {}", d.message)),
+                        )),
                         Outcome::Skip(d) => acc.outcomes.push(Outcome::Skip(AssertDetail::new(
                             d.kind,
                             format!("any_of[{idx}]: {}", d.message),
@@ -2951,10 +3227,17 @@ impl AssertResult {
             for (idx, b) in iter {
                 reemit_with_prefix(&mut acc, idx, b.outcomes, b.info_notes);
             }
-            acc.outcomes.push(Outcome::Fail(AssertDetail::new(
-                DetailKind::Other,
-                format!("any_of: all {total_branches} branches failed"),
-            )));
+            let summary = format!(
+                "any_of: no branch passed ({n_fail} failed, {n_inc} inconclusive, {n_skip} skipped of {total_branches} branches)"
+            );
+            let synth = if n_fail > 0 {
+                Outcome::Fail(AssertDetail::new(DetailKind::Other, summary))
+            } else if n_inc > 0 {
+                Outcome::Inconclusive(AssertDetail::new(DetailKind::Other, summary))
+            } else {
+                Outcome::Skip(AssertDetail::new(DetailKind::Skip, summary))
+            };
+            acc.outcomes.push(synth);
             acc
         }
     }
@@ -3127,19 +3410,28 @@ impl AssertPlan {
         if let Some(max_ratio) = self.max_migration_ratio {
             let total_mig: u64 = reports.iter().map(|w| w.migration_count).sum();
             let total_iters: u64 = reports.iter().map(|w| w.iterations).sum();
-            let ratio = if total_iters > 0 {
-                total_mig as f64 / total_iters as f64
-            } else {
-                0.0
-            };
-            if ratio > max_ratio {
-                r.record_fail(AssertDetail::new(
+            if total_iters == 0 {
+                r.record_inconclusive(AssertDetail::new(
                     DetailKind::Migration,
                     format!(
-                        "migration ratio {:.4} exceeds threshold {:.4} ({} migrations / {} iterations)",
-                        ratio, max_ratio, total_mig, total_iters,
+                        "migration ratio inconclusive: 0 iterations across {} workers — \
+                         denominator is zero, ratio cannot be computed; threshold {:.4} \
+                         neither pass nor fail (was the workload able to run?)",
+                        reports.len(),
+                        max_ratio,
                     ),
                 ));
+            } else {
+                let ratio = total_mig as f64 / total_iters as f64;
+                if ratio > max_ratio {
+                    r.record_fail(AssertDetail::new(
+                        DetailKind::Migration,
+                        format!(
+                            "migration ratio {:.4} exceeds threshold {:.4} ({} migrations / {} iterations)",
+                            ratio, max_ratio, total_mig, total_iters,
+                        ),
+                    ));
+                }
             }
         }
         if let Some(min_locality) = self.min_page_locality
@@ -3161,6 +3453,19 @@ impl AssertPlan {
                     }
                 }
             }
+            // POLICY-derived denominator: the page-locality gate is
+            // only reachable when the caller already supplied a
+            // `numa_nodes` set — i.e. the test set a NUMA policy
+            // (typically `MemPolicy::Bind`) declaring that the
+            // workload WILL allocate pages on the expected nodes.
+            // Zero observed pages is therefore a policy violation,
+            // not an instrumentation gap, and stays as Fail (via the
+            // `0.0` coercion that the threshold then fails) per the
+            // [`Outcome`] doc's INSTRUMENT-vs-POLICY carve-out. The
+            // Inconclusive primitive does NOT apply here — see the
+            // sibling `max_migration_ratio` / `max_slow_tier_ratio`
+            // / `assert_cross_node_migration` arms for the
+            // INSTRUMENT-derived counterparts.
             let locality = if total > 0 {
                 local as f64 / total as f64
             } else {
@@ -3205,12 +3510,20 @@ impl AssertPlan {
         if let Some(max_ratio) = self.max_slow_tier_ratio
             && numa_nodes.is_some()
         {
+            // Skip workers with no NUMA signal (empty numa_pages or
+            // zero total) but count them: if every worker dropped
+            // out, the gate had no data to evaluate and previously
+            // silent-passed. Record Inconclusive instead so a
+            // workload that produced no NUMA allocations at all
+            // doesn't masquerade as meeting the slow-tier ratio.
+            let mut evaluated = 0usize;
             for w in reports {
                 if w.numa_pages.is_empty() {
                     continue;
                 }
                 let total: u64 = w.numa_pages.values().sum();
                 if total > 0 {
+                    evaluated += 1;
                     r.merge(assert_slow_tier_ratio(
                         &w.numa_pages,
                         max_ratio,
@@ -3218,6 +3531,18 @@ impl AssertPlan {
                         numa_nodes,
                     ));
                 }
+            }
+            if evaluated == 0 {
+                r.record_inconclusive(AssertDetail::new(
+                    DetailKind::SlowTier,
+                    format!(
+                        "slow-tier ratio inconclusive: no worker reported any NUMA pages \
+                         (across {} workers) — denominator is zero, ratio cannot be computed; \
+                         threshold {max_ratio:.4} neither pass nor fail \
+                         (did the workload allocate any memory?)",
+                        reports.len(),
+                    ),
+                ));
             }
         }
         r
@@ -3295,6 +3620,12 @@ pub fn assert_page_locality(
 /// account for, which is either a measurement gap or an instrumentation
 /// bug, and silently coercing the ratio to 0.0 would let the assertion
 /// pass on data the operator should not trust.
+///
+/// When both inputs are zero (`migrated_pages == 0 && total_pages == 0`)
+/// the gate records Inconclusive — the denominator is zero and the
+/// check has no signal to evaluate; neither Pass (would silently green
+/// a workload that produced no NUMA pages) nor Fail (no actual ratio
+/// violation observed) is truthful.
 pub fn assert_cross_node_migration(
     migrated_pages: u64,
     total_pages: u64,
@@ -3308,6 +3639,15 @@ pub fn assert_cross_node_migration(
                     DetailKind::CrossNodeMigration,
                     format!(
                         "cross-node migration inconsistent: {migrated_pages} pages migrated but 0 pages observed in numa_maps (threshold {threshold:.4})",
+                    ),
+                ));
+            } else {
+                r.record_inconclusive(AssertDetail::new(
+                    DetailKind::CrossNodeMigration,
+                    format!(
+                        "cross-node migration inconclusive: 0 pages observed in numa_maps and 0 pages migrated — \
+                         denominator is zero, ratio cannot be computed; threshold {threshold:.4} \
+                         neither pass nor fail (did the workload allocate any memory?)",
                     ),
                 ));
             }
@@ -4581,6 +4921,15 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
 ///
 /// `min_rate`: minimum work_units per CPU-second. `None` skips the floor check.
 ///
+/// When every worker recorded `cpu_time_ns == 0`, both gates record
+/// their OWN Inconclusive outcome (the CV gate emits a "CV cannot be
+/// computed" detail; the min_rate gate emits a "rates cannot be
+/// computed" detail). Each gate carries its own diagnostic so a
+/// caller that supplies only one of the two threshold parameters
+/// sees the matching Inconclusive message and an operator reading
+/// [`AssertResult::inconclusive_details`] can identify which gate(s)
+/// misfired without re-deriving the inputs.
+///
 /// ```
 /// # use ktstr::assert::assert_throughput_parity;
 /// # use ktstr::workload::WorkerReport;
@@ -4630,39 +4979,63 @@ pub fn assert_throughput_parity(
     let n = rates.len() as f64;
     let mean = rates.iter().sum::<f64>() / n;
 
-    if let Some(cv_limit) = max_cv {
-        // Guard zero-mean explicitly: a CV is undefined when every
-        // rate is zero, and silently passing the check would let a
-        // run where every worker recorded zero cpu_time look "in
-        // parity" when in fact no worker accumulated any CPU time
-        // at all. Surface the broken state so the operator sees it
-        // instead of letting `max_throughput_cv` look green.
-        let all_zero_cpu = reports.iter().all(|w| w.cpu_time_ns == 0);
-        if all_zero_cpu {
+    // Detect the all-zero-cpu condition once so a call with both
+    // `max_cv` and `min_rate` set surfaces a single Inconclusive
+    // listing every threshold that couldn't evaluate, rather than
+    // emitting one record per gate (which produced duplicate
+    // "denominator is zero" diagnostics for the same root cause).
+    let all_zero_cpu = reports.iter().all(|w| w.cpu_time_ns == 0);
+
+    if all_zero_cpu && (max_cv.is_some() || min_rate.is_some()) {
+        let mut limits: Vec<String> = Vec::with_capacity(2);
+        if let Some(cv_limit) = max_cv {
+            limits.push(format!("max_cv {cv_limit:.3}"));
+        }
+        if let Some(floor) = min_rate {
+            limits.push(format!("min_rate {floor:.0}"));
+        }
+        r.record_inconclusive(AssertDetail::new(
+            DetailKind::Benchmark,
+            format!(
+                "throughput parity inconclusive: all {} workers recorded zero cpu_time_ns — \
+                 denominator is zero, rates cannot be computed; {} neither pass nor fail \
+                 (was the workload able to run?)",
+                reports.len(),
+                limits.join(" + "),
+            ),
+        ));
+        return r;
+    }
+
+    if let Some(cv_limit) = max_cv
+        && mean > 0.0
+        && rates.len() >= 2
+    {
+        let variance = rates.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n;
+        let stddev = variance.sqrt();
+        let cv = stddev / mean;
+        if cv > cv_limit {
             r.record_fail(AssertDetail::new(
                 DetailKind::Benchmark,
                 format!(
-                    "throughput CV undefined: all {} workers recorded zero cpu_time_ns (limit {cv_limit:.3})",
-                    reports.len()
+                    "throughput CV {cv:.3} exceeds limit {cv_limit:.3} (mean={mean:.0} work/cpu_s)"
                 ),
             ));
-        } else if mean > 0.0 && rates.len() >= 2 {
-            let variance = rates.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n;
-            let stddev = variance.sqrt();
-            let cv = stddev / mean;
-            if cv > cv_limit {
-                r.record_fail(AssertDetail::new(
-                    DetailKind::Benchmark,
-                    format!(
-                        "throughput CV {cv:.3} exceeds limit {cv_limit:.3} (mean={mean:.0} work/cpu_s)"
-                    ),
-                ));
-            }
         }
     }
 
     if let Some(floor) = min_rate {
+        // Skip per-worker zero-cpu cases: their rate is forced to
+        // 0.0 above, and comparing that to `floor` would synthesize
+        // a guaranteed Fail with a misleading "below floor" message
+        // when the real story is "this worker recorded no CPU time
+        // — the rate is unknowable, not failing". The all-zero-cpu
+        // case is already handled at the top of the function as a
+        // single combined Inconclusive.
         for (i, &rate) in rates.iter().enumerate() {
+            if reports[i].cpu_time_ns == 0 {
+                continue;
+            }
             if rate < floor {
                 r.record_fail(AssertDetail::new(
                     DetailKind::Benchmark,
@@ -4765,12 +5138,40 @@ pub fn assert_benchmarks(
                     ),
                 ));
             }
+        } else {
+            // CV is dispersion / mean. With mean == 0 every captured
+            // wake-latency sample was zero, so the denominator is
+            // zero and CV is undefined — neither pass nor fail is
+            // truthful. The same workload that fails to record
+            // measurable wake latency at all (typically: nothing
+            // actually woke, or every wake landed at <1ns and
+            // truncated to zero in the ns counter) previously slid
+            // past the gate as a silent pass; surface it as
+            // Inconclusive so a broken benchmarking run does not
+            // masquerade as a CV-compliant one.
+            r.record_inconclusive(AssertDetail::new(
+                DetailKind::Benchmark,
+                format!(
+                    "wake latency CV inconclusive: all {} sample(s) had zero mean wake \
+                     latency — denominator is zero, CV cannot be computed; limit \
+                     {cv_limit:.3} neither pass nor fail (did any wake event capture a \
+                     non-zero latency?)",
+                    all_latencies.len(),
+                ),
+            ));
         }
     }
 
     if let Some(rate_floor) = min_iter_rate {
+        // Skip per-worker zero-wall cases (rate is unknowable when
+        // wall_time_ns == 0) but count them: if every worker had
+        // zero wall_time, the gate silently passed before — record
+        // Inconclusive instead so a broken run that produced no
+        // signal at all doesn't masquerade as a passing benchmark.
+        let mut zero_wall_count = 0usize;
         for w in reports {
             if w.wall_time_ns == 0 {
+                zero_wall_count += 1;
                 continue;
             }
             let rate = w.iterations as f64 / (w.wall_time_ns as f64 / 1e9);
@@ -4783,6 +5184,17 @@ pub fn assert_benchmarks(
                     ),
                 ));
             }
+        }
+        if zero_wall_count == reports.len() {
+            r.record_inconclusive(AssertDetail::new(
+                DetailKind::Benchmark,
+                format!(
+                    "min iteration rate inconclusive: all {} workers recorded zero wall_time_ns — \
+                     denominator is zero, rate cannot be computed; floor {rate_floor:.1}/s \
+                     neither pass nor fail (was the workload able to run?)",
+                    reports.len()
+                ),
+            ));
         }
     }
 
