@@ -838,61 +838,112 @@ pub(crate) fn read_per_cpu_offsets(
 ///
 /// Every callsite that walks a per-CPU symbol (`runqueues`,
 /// `kernel_cpustat`, `kstat`, `tick_cpu_sched`, scheduler-event
-/// pcpu fields) computes the same formula — given the link-time
-/// KVA the linker assigned to the per-CPU template
-/// (`template_kva`), the active KASLR slide for the kernel's
-/// virtual mapping (`kaslr_offset`, sourced from the shared
-/// `kern_virt_kaslr` Arc populated by the BSP MSR_LSTAR derive
-/// at [`crate::vmm::x86_64::msr_kaslr::read_and_derive`] on
-/// x86_64 OR the guest-channel KERN_ADDRS `_text` subtraction
-/// at `crate::vmm::freeze_coord::dispatch` on both arches), and
-/// the runtime per-CPU base offset for the target CPU
-/// (`per_cpu_off`, the value read out of `__per_cpu_offset[cpu]`),
-/// the runtime KVA is the simple sum
-/// `template_kva + kaslr_offset + per_cpu_off`. The kernel's
-/// own `per_cpu_ptr()` macro performs the same arithmetic
-/// (`linux:include/linux/percpu-defs.h`); the host monitor
-/// duplicates it because we read guest memory directly rather
-/// than calling into the kernel.
+/// pcpu fields) computes the same formula.  Inputs:
+/// - `template_kva` is the linker value the kernel ELF assigned
+///   to the per-CPU template.  Two storage forms exist depending
+///   on the kernel version (see below).
+/// - `kaslr_offset` is the runtime kernel-image virt slide,
+///   sourced from the shared `kern_virt_kaslr` Arc populated by
+///   the BSP MSR_LSTAR derive at
+///   [`crate::vmm::x86_64::msr_kaslr::read_and_derive`] on
+///   x86_64 OR the guest-channel KERN_ADDRS `_text` subtraction
+///   at `crate::vmm::freeze_coord::dispatch` on both arches.
+/// - `per_cpu_off` is the runtime value read from
+///   `__per_cpu_offset[cpu]`.
+///
+/// Two `template_kva` storage forms — chosen by the kernel build
+/// at link time:
+/// - **Zero-based** (linux v6.14 and earlier on x86_64):
+///   `.data..percpu` is linked at virtual address 0 via
+///   `PERCPU_VADDR(...)` in `arch/x86/kernel/vmlinux.lds.S`.
+///   Per-CPU symbol `st_value`s are small section-relative
+///   offsets (e.g. `runqueues = 0x2f280`) and `__per_cpu_start`
+///   sits at `0`.  At runtime, `setup_per_cpu_areas` computes
+///   `delta = pcpu_base_addr - __per_cpu_start`
+///   (`arch/x86/kernel/setup_percpu.c:163-180` in v6.14), and
+///   with `__per_cpu_start = 0` the stored
+///   `__per_cpu_offset[cpu] = pcpu_base_addr + pcpu_unit_offsets[cpu]`
+///   — already the absolute direct-map KVA of the per-CPU
+///   instance.  The kernel-image KASLR slide does NOT appear
+///   anywhere in this arithmetic; `per_cpu_ptr(&runqueues, cpu)`
+///   collapses to `runqueues.st_value + __per_cpu_offset[cpu]`.
+/// - **High-half** (linux v6.15+ on x86_64; aarch64 on every
+///   release): commit
+///   `9d7de2aa8b41 x86/percpu/64: Use relative percpu offsets`
+///   (in v6.15) merged with
+///   `e23cff686178 percpu: Remove PERCPU_VADDR()` move the
+///   percpu section into normal kernel data.  Per-CPU symbol
+///   `st_value`s become full high-half KVAs (e.g.
+///   `runqueues = 0xffffffff836e5fc0`) and `__per_cpu_start`
+///   sits in the kernel image (e.g. `0xffffffff83950000`).
+///   `setup_per_cpu_areas` still computes
+///   `delta = pcpu_base_addr - __per_cpu_start`, but now
+///   `__per_cpu_start` is itself KASLR-slid at runtime
+///   (`link___per_cpu_start + kaslr_offset`), so
+///   `__per_cpu_offset[cpu] = pcpu_base_addr - link___per_cpu_start - kaslr_offset + pcpu_unit_offsets[cpu]`.
+///   `per_cpu_ptr(&runqueues, cpu)` at runtime evaluates to
+///   `(link___runqueues + kaslr_offset) + __per_cpu_offset[cpu]`
+///   = `link___runqueues - link___per_cpu_start + pcpu_base + unit_off`
+///   = correct per-CPU KVA.  The `kaslr_offset` adds appear on
+///   both sides of the subtraction in `__per_cpu_offset[cpu]`
+///   and cancel.
+///
+/// Combining the two cases: the host-side host-equivalent of
+/// `per_cpu_ptr(&template, cpu)` is
+/// `template_kva + kaslr_offset_if_high_half + per_cpu_off`.
+/// This helper applies the slide ONLY when `template_kva` is in
+/// the kernel half (≥ `KERNEL_HALF_CANONICAL_4LEVEL`); for
+/// zero-based templates the slide is suppressed because the
+/// stored `__per_cpu_offset[cpu]` already encodes the absolute
+/// runtime address.  Documented in
+/// `linux:include/linux/percpu-defs.h:237` (`per_cpu_ptr` macro)
+/// and the per-arch `setup_per_cpu_areas` for the delta.
 ///
 /// Extracted into a single helper so the formula has one audit
-/// point. Production callers route the `kaslr_offset` argument
+/// point.  Production callers route the `kaslr_offset` argument
 /// from the shared Arc snapshot; 0 is the KASLR-off /
 /// nokaslr-karg / not-yet-published fallback (the addition is a
-/// no-op slide and the formula collapses to the unsigned-add
-/// link-time path). Anyone adding a sixth per-CPU walker should
-/// call this helper rather than re-deriving the formula.
+/// no-op slide and the formula collapses to
+/// `template_kva + per_cpu_off`).  Anyone adding a sixth per-CPU
+/// walker should call this helper rather than re-deriving the
+/// formula.
 #[inline]
 pub(crate) fn per_cpu_kva(template_kva: u64, kaslr_offset: u64, per_cpu_off: u64) -> u64 {
-    template_kva
-        .wrapping_add(kaslr_offset)
-        .wrapping_add(per_cpu_off)
+    // Apply the KASLR slide ONLY for high-half templates (v6.15+
+    // post-fix layout). Zero-based templates encode the absolute
+    // runtime address inside `per_cpu_off` already, so adding the
+    // slide would double-count and shift the result outside the
+    // mapped direct-map window.
+    let slide = if template_kva >= crate::vmm::KERNEL_HALF_CANONICAL {
+        kaslr_offset
+    } else {
+        0
+    };
+    template_kva.wrapping_add(slide).wrapping_add(per_cpu_off)
 }
 
 /// Compute the physical address of each CPU's `struct rq`.
 ///
-/// Each CPU's rq is at `runqueues_kva + kaslr_offset +
-/// per_cpu_offset[cpu]` in kernel virtual space (the
-/// [`per_cpu_kva`] formula); subtracting PAGE_OFFSET yields the
-/// guest physical address.
+/// Each CPU's rq is at the [`per_cpu_kva`] of `runqueues_kva` for
+/// that CPU's offset; subtracting `page_offset` yields the guest
+/// physical address.  See [`per_cpu_kva`] for the formula and its
+/// dependence on the kernel's percpu storage form (v6.14
+/// zero-based vs v6.15+ high-half).
 ///
-/// `kaslr_offset` is the VIRTUAL kernel-image KASLR slide — the
-/// delta between the link-time `__per_cpu_start` and the
-/// runtime per-CPU base, equivalent to (LSTAR_RUNTIME -
-/// entry_SYSCALL_64_link_KVA) per `crate::vmm::x86_64::msr_kaslr`.
-/// Production callers in `crate::vmm::freeze_coord` thread the
-/// shared `kern_virt_kaslr` Arc snapshot via `coord_kaslr_offset()`
-/// — first writer (BSP MSR_LSTAR derive at
-/// `crate::vmm::x86_64::msr_kaslr::read_and_derive` OR the
-/// KERN_ADDRS `_text` path at `crate::vmm::freeze_coord::dispatch`)
-/// populates the Arc with `(offset + 1)` bias; consumers
-/// `.load(Acquire).saturating_sub(1)` to recover the offset. A
+/// `kaslr_offset` is the runtime kernel-image virt-KASLR slide,
+/// sourced from the shared `kern_virt_kaslr` Arc populated by the
+/// BSP MSR_LSTAR derive at
+/// [`crate::vmm::x86_64::msr_kaslr::read_and_derive`] (x86_64) OR
+/// the guest-channel KERN_ADDRS `_text` subtraction at
+/// `crate::vmm::freeze_coord::dispatch` (both arches).  Production
+/// callers in `crate::vmm::freeze_coord` thread the snapshot via
+/// `coord_kaslr_offset()` — first writer populates the Arc with
+/// `(offset + 1)` bias; consumers
+/// `.load(Acquire).saturating_sub(1)` to recover the offset.  A
 /// literal `0` argument is the KASLR-off / nokaslr-karg /
-/// not-yet-published fallback (`per_cpu_kva` collapses to the
-/// unsigned-add link-time identity). The helper algebra itself is
-/// correct: when the right value flows in, the formula
-/// `template + kaslr + per_cpu_off` matches the kernel's
-/// `per_cpu_ptr()` macro exactly (include/linux/percpu-defs.h).
+/// not-yet-published fallback ([`per_cpu_kva`] collapses to
+/// `template_kva + per_cpu_off` for both storage forms when
+/// `kaslr_offset == 0`).
 ///
 /// `per_cpu_offsets` slots that are zero produce a PA at
 /// `kva_to_pa(runqueues_kva + kaslr_offset, page_offset)`, which
@@ -1265,6 +1316,60 @@ mod tests {
         assert_eq!(per_cpu_kva(template, kaslr, 0x81_u64), 0u64);
     }
 
+    /// Zero-based template (linux v6.14 and earlier on x86_64,
+    /// where `.data..percpu` linked at vaddr 0 via
+    /// `PERCPU_VADDR(...)`) — the kaslr slide MUST be suppressed,
+    /// because the stored `__per_cpu_offset[cpu]` already encodes
+    /// the absolute runtime per-CPU instance address (kernel's
+    /// `delta = pcpu_base_addr - __per_cpu_start` collapses to
+    /// `pcpu_base_addr` when `__per_cpu_start = 0`).  Failing to
+    /// suppress the slide produces a per-CPU KVA that's
+    /// `kaslr_offset` higher than reality and lands outside the
+    /// mapped direct-map window — the failure mode observed on
+    /// the `kaslr_compute_rq_pas_e2e` test against v6.14.
+    #[test]
+    fn per_cpu_kva_zero_based_template_suppresses_kaslr_slide() {
+        // Section-relative `runqueues.st_value` value observed on
+        // cached v6.14 vmlinux.
+        let template = 0x2f280_u64;
+        let kaslr = 0x17a0_0000_u64;
+        // Direct-map KVA of cpu 0's per-CPU base (post-randomize-
+        // memory, L5).
+        let per_cpu_off = 0xff2f_67ae_3dc0_0000_u64;
+        // Expected: template + per_cpu_off (slide suppressed).
+        let expected = template.wrapping_add(per_cpu_off);
+        assert_eq!(per_cpu_kva(template, kaslr, per_cpu_off), expected);
+        // Cross-check: kaslr = 0 produces the same answer (the
+        // suppression makes the kaslr argument irrelevant for
+        // zero-based templates).
+        assert_eq!(
+            per_cpu_kva(template, kaslr, per_cpu_off),
+            per_cpu_kva(template, 0, per_cpu_off),
+        );
+    }
+
+    /// The high-half / zero-based detection threshold IS
+    /// `KERNEL_HALF_CANONICAL`.  A template at exactly the
+    /// threshold should APPLY the slide (boundary inclusive);
+    /// one below should suppress.  Pins the boundary so a future
+    /// refactor that flips `>=` to `>` is caught.
+    #[test]
+    fn per_cpu_kva_storage_form_detection_boundary() {
+        let kaslr = 0x1_0000_0000_u64;
+        let off = 0x4_0000_u64;
+        let threshold = crate::vmm::KERNEL_HALF_CANONICAL;
+        // Exactly at the threshold: slide applies (high-half).
+        assert_eq!(
+            per_cpu_kva(threshold, kaslr, off),
+            threshold.wrapping_add(kaslr).wrapping_add(off),
+        );
+        // One byte below the threshold: slide suppressed.
+        assert_eq!(
+            per_cpu_kva(threshold - 1, kaslr, off),
+            (threshold - 1).wrapping_add(off),
+        );
+    }
+
     /// Non-zero KASLR slides every per-CPU PA by the same delta
     /// as the no-slide baseline. An older helper had
     /// `(per_cpu_start + kaslr) + (template - per_cpu_start) +
@@ -1284,6 +1389,40 @@ mod tests {
         for (b, s) in baseline.iter().zip(shifted.iter()) {
             assert_eq!(*s, b.wrapping_add(kaslr));
         }
+    }
+
+    /// End-to-end repro for the v6.14 zero-based-percpu failure
+    /// mode observed on `kaslr_compute_rq_pas_e2e`: section-
+    /// relative `runqueues_kva = 0x2f280`, randomized 5-level
+    /// `page_offset_base`, BSP `__per_cpu_offset[0]` populated by
+    /// `setup_per_cpu_areas` with the absolute direct-map KVA
+    /// (because `__per_cpu_start = 0` on this layout, so the
+    /// `delta = pcpu_base_addr - __per_cpu_start` collapses to
+    /// `pcpu_base_addr`).  The correct host PA must fit inside
+    /// the 2 GiB guest DRAM window; the pre-fix formula
+    /// `template + kaslr + per_cpu_off` overshoots and produces
+    /// a PA past `mem.size()`, which is exactly the
+    /// `translate_any_kva returned None` failure.
+    #[test]
+    fn compute_rq_pas_zero_based_v614_repro() {
+        // 5-level direct-map base, post-RANDOMIZE_MEMORY.
+        let page_offset = 0xff2f_67ad_c000_0000_u64;
+        let runqueues = 0x2f280_u64; // section-relative, zero-based.
+        let kaslr = 0x17a0_0000_u64;
+        let pco0 = 0xff2f_67ae_3dc0_0000_u64; // pcpu_base_addr for cpu 0.
+        let pas = compute_rq_pas(runqueues, &[pco0], page_offset, kaslr);
+        let computed_kva = runqueues.wrapping_add(pco0);
+        let expected_pa = computed_kva.wrapping_sub(page_offset);
+        assert_eq!(pas[0], expected_pa);
+        // Pin: the resulting PA fits inside a 2 GiB guest DRAM.
+        const MEM_SIZE: u64 = 0x8000_0000; // 2 GiB
+        assert!(
+            pas[0] < MEM_SIZE,
+            "PA {:#x} must fit inside {} GiB guest DRAM \
+             (regression: pre-fix formula overshot by exactly kaslr_offset)",
+            pas[0],
+            MEM_SIZE >> 30,
+        );
     }
 
     #[test]
