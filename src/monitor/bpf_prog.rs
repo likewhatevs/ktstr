@@ -26,6 +26,95 @@ pub const MAX_USED_MAPS: u32 = 64;
 /// BPF_OBJ_NAME_LEN from include/linux/bpf.h.
 const BPF_OBJ_NAME_LEN: usize = 16;
 
+/// Iterate every alive `BPF_PROG_TYPE_STRUCT_OPS` prog in the
+/// kernel's `prog_idr`, invoking `payload` with each prog's
+/// `(prog_pa, aux_pa, aux_kva)`. The closure returns `Option<T>`;
+/// `Some(value)` is appended to the result vector, `None` skips.
+///
+/// Encapsulates the `prog_idr` walk shared by every per-struct-ops-
+/// prog reader in this module: translate `prog_idr_kva` → `idr_pa`,
+/// read the xarray head, iterate ids 0..idr_next (capped at 65536
+/// for safety against corrupted reads — a real kernel never
+/// approaches that limit), `xa_load` each entry, translate to
+/// `prog_pa`, filter on `prog_type == BPF_PROG_TYPE_STRUCT_OPS`,
+/// then translate `aux_kva` → `aux_pa`. Translation failures or
+/// zero pointers cause the entry to be skipped silently — matches
+/// the prior per-walker behavior and is the right policy under
+/// race conditions (torn reads from slab recycling) where the
+/// alternative is to publish garbage.
+fn for_each_struct_ops_prog<T, F>(
+    mem: &GuestMem,
+    walk: WalkContext,
+    prog_idr_kva: u64,
+    offsets: &BpfProgOffsets,
+    start_kernel_map: u64,
+    phys_base: u64,
+    mut payload: F,
+) -> Vec<T>
+where
+    F: FnMut(u64, u64, u64) -> Option<T>,
+{
+    let idr_pa = text_kva_to_pa_with_base(prog_idr_kva, start_kernel_map, phys_base);
+
+    let xa_head = mem.read_u64(idr_pa, offsets.idr_xa_head);
+    if xa_head == 0 {
+        return Vec::new();
+    }
+    // Cap at 64K entries. A real kernel never has millions of BPF
+    // programs; a larger `idr_next` means the PA is wrong or the
+    // IDR is corrupt. Bounds runaway loops on garbage reads.
+    let idr_next = mem.read_u32(idr_pa, offsets.idr_next).min(65536);
+
+    let mut out = Vec::new();
+    for id in 0..idr_next {
+        let Some(entry) = xa_load(
+            mem,
+            walk.page_offset,
+            xa_head,
+            id as u64,
+            offsets.xa_node_slots,
+            offsets.xa_node_shift,
+        ) else {
+            continue;
+        };
+        if entry == 0 {
+            continue;
+        }
+        let Some(prog_pa) = translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            entry,
+            walk.l5,
+            walk.tcr_el1,
+        ) else {
+            continue;
+        };
+        let prog_type = mem.read_u32(prog_pa, offsets.prog_type);
+        if prog_type != BPF_PROG_TYPE_STRUCT_OPS {
+            continue;
+        }
+        let aux_kva = mem.read_u64(prog_pa, offsets.prog_aux);
+        if aux_kva == 0 {
+            continue;
+        }
+        let Some(aux_pa) = translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            aux_kva,
+            walk.l5,
+            walk.tcr_el1,
+        ) else {
+            continue;
+        };
+        if let Some(value) = payload(prog_pa, aux_pa, aux_kva) {
+            out.push(value);
+        }
+    }
+    out
+}
+
 /// Per-program BPF verifier statistics collected from the host.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProgVerifierStats {
@@ -51,86 +140,28 @@ pub(crate) fn find_struct_ops_progs(
     start_kernel_map: u64,
     phys_base: u64,
 ) -> Vec<ProgVerifierStats> {
-    let idr_pa = text_kva_to_pa_with_base(prog_idr_kva, start_kernel_map, phys_base);
-
-    let xa_head = mem.read_u64(idr_pa, offsets.idr_xa_head);
-    if xa_head == 0 {
-        return Vec::new();
-    }
-    let idr_next = mem.read_u32(idr_pa, offsets.idr_next);
-    // Cap the scan to 64K entries. A real kernel never has
-    // millions of BPF programs; a larger idr_next means the
-    // PA is wrong or the IDR is corrupt.
-    let idr_next = idr_next.min(65536);
-
-    let mut progs = Vec::new();
-
-    for id in 0..idr_next {
-        let Some(entry) = xa_load(
-            mem,
-            walk.page_offset,
-            xa_head,
-            id as u64,
-            offsets.xa_node_slots,
-            offsets.xa_node_shift,
-        ) else {
-            continue;
-        };
-        if entry == 0 {
-            continue;
-        }
-
-        // bpf_prog is SLAB-allocated or vmalloc'd.
-        let Some(prog_pa) = translate_any_kva(
-            mem,
-            walk.cr3_pa,
-            walk.page_offset,
-            entry,
-            walk.l5,
-            walk.tcr_el1,
-        ) else {
-            continue;
-        };
-
-        let prog_type = mem.read_u32(prog_pa, offsets.prog_type);
-        if prog_type != BPF_PROG_TYPE_STRUCT_OPS {
-            continue;
-        }
-
-        let aux_kva = mem.read_u64(prog_pa, offsets.prog_aux);
-        if aux_kva == 0 {
-            continue;
-        }
-
-        // bpf_prog_aux is kmalloc'd (SLAB, direct mapping).
-        let Some(aux_pa) = translate_any_kva(
-            mem,
-            walk.cr3_pa,
-            walk.page_offset,
-            aux_kva,
-            walk.l5,
-            walk.tcr_el1,
-        ) else {
-            continue;
-        };
-
-        let verified_insns = mem.read_u32(aux_pa, offsets.aux_verified_insns);
-
-        let mut name_buf = [0u8; BPF_OBJ_NAME_LEN];
-        mem.read_bytes(aux_pa + offsets.aux_name as u64, &mut name_buf);
-        let name_len = name_buf
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(BPF_OBJ_NAME_LEN);
-        let name = String::from_utf8_lossy(&name_buf[..name_len]).to_string();
-
-        progs.push(ProgVerifierStats {
-            name,
-            verified_insns,
-        });
-    }
-
-    progs
+    for_each_struct_ops_prog(
+        mem,
+        walk,
+        prog_idr_kva,
+        offsets,
+        start_kernel_map,
+        phys_base,
+        |_prog_pa, aux_pa, _aux_kva| {
+            let verified_insns = mem.read_u32(aux_pa, offsets.aux_verified_insns);
+            let mut name_buf = [0u8; BPF_OBJ_NAME_LEN];
+            mem.read_bytes(aux_pa + offsets.aux_name as u64, &mut name_buf);
+            let name_len = name_buf
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(BPF_OBJ_NAME_LEN);
+            let name = String::from_utf8_lossy(&name_buf[..name_len]).to_string();
+            Some(ProgVerifierStats {
+                name,
+                verified_insns,
+            })
+        },
+    )
 }
 
 /// Target-free active-scheduler walker. See trait method
@@ -181,128 +212,92 @@ pub(crate) fn find_active_struct_ops_obj_no_target(
     start_kernel_map: u64,
     phys_base: u64,
 ) -> Option<ActiveObjMatch> {
-    let idr_pa = text_kva_to_pa_with_base(prog_idr_kva, start_kernel_map, phys_base);
-
-    let xa_head = mem.read_u64(idr_pa, prog_offsets.idr_xa_head);
-    if xa_head == 0 {
-        return None;
-    }
-    let idr_next = mem.read_u32(idr_pa, prog_offsets.idr_next).min(65536);
-
-    for id in 0..idr_next {
-        let Some(entry) = xa_load(
-            mem,
-            walk.page_offset,
-            xa_head,
-            id as u64,
-            prog_offsets.xa_node_slots,
-            prog_offsets.xa_node_shift,
-        ) else {
-            continue;
-        };
-        if entry == 0 {
-            continue;
-        }
-        let Some(prog_pa) = translate_any_kva(
-            mem,
-            walk.cr3_pa,
-            walk.page_offset,
-            entry,
-            walk.l5,
-            walk.tcr_el1,
-        ) else {
-            continue;
-        };
-        let prog_type = mem.read_u32(prog_pa, prog_offsets.prog_type);
-        if prog_type != BPF_PROG_TYPE_STRUCT_OPS {
-            continue;
-        }
-        let aux_kva = mem.read_u64(prog_pa, prog_offsets.prog_aux);
-        if aux_kva == 0 {
-            continue;
-        }
-        let Some(aux_pa) = translate_any_kva(
-            mem,
-            walk.cr3_pa,
-            walk.page_offset,
-            aux_kva,
-            walk.l5,
-            walk.tcr_el1,
-        ) else {
-            continue;
-        };
-        // Read used_maps pointer FIRST, then cnt — pairs with
-        // bpf_prog_bind_map's cnt-then-pointer mutation order
-        // (kernel/bpf/syscall.c): the kernel bumps cnt before
-        // swapping the pointer, so cnt-then-pointer reads would
-        // index past the old allocation on a mid-mutation read.
-        // pointer-then-cnt observes cnt ≤ pointer's slot count.
-        // Safe under freeze-rendezvous (vCPUs paused) but the
-        // protocol is defense-in-depth for any out-of-freeze caller.
-        let used_maps_kva = mem.read_u64(aux_pa, prog_offsets.aux_used_maps);
-        if used_maps_kva == 0 {
-            continue;
-        }
-        let used_map_cnt = mem
-            .read_u32(aux_pa, prog_offsets.aux_used_map_cnt)
-            .min(MAX_USED_MAPS);
-        if used_map_cnt == 0 {
-            continue;
-        }
-        let Some(used_maps_pa) = translate_any_kva(
-            mem,
-            walk.cr3_pa,
-            walk.page_offset,
-            used_maps_kva,
-            walk.l5,
-            walk.tcr_el1,
-        ) else {
-            continue;
-        };
-
-        // Snapshot every non-zero used_maps entry (downstream
-        // disambiguation needs the full set as the KVA whitelist).
-        let mut entries: Vec<u64> = Vec::with_capacity(used_map_cnt as usize);
-        for i in 0..used_map_cnt {
-            let entry_kva = mem.read_u64(used_maps_pa, (i as usize) * 8);
-            if entry_kva != 0 {
-                entries.push(entry_kva);
+    // Returns the FIRST matching prog's ActiveObjMatch via Some,
+    // skips non-matching progs with None. `into_iter().next()`
+    // extracts that single match below.
+    for_each_struct_ops_prog(
+        mem,
+        walk,
+        prog_idr_kva,
+        prog_offsets,
+        start_kernel_map,
+        phys_base,
+        |_prog_pa, aux_pa, _aux_kva| {
+            // Read used_maps pointer FIRST, then cnt — pairs with
+            // bpf_prog_bind_map's cnt-then-pointer mutation order
+            // (kernel/bpf/syscall.c): the kernel bumps cnt before
+            // swapping the pointer, so cnt-then-pointer reads
+            // would index past the old allocation on a
+            // mid-mutation read. pointer-then-cnt observes cnt ≤
+            // pointer's slot count. Safe under freeze-rendezvous
+            // (vCPUs paused) but the protocol is defense-in-depth
+            // for any out-of-freeze caller.
+            let used_maps_kva = mem.read_u64(aux_pa, prog_offsets.aux_used_maps);
+            if used_maps_kva == 0 {
+                return None;
             }
-        }
-        // Find a global-section map in the snapshot and derive the obj
-        // prefix. If none, this isn't a libbpf-loaded scheduler prog
-        // (could be a different struct_ops subsystem like
-        // tcp_congestion_ops without libbpf-named global maps) — skip
-        // and continue.
-        for &map_kva in &entries {
-            let Some(map_pa) = translate_any_kva(
+            let used_map_cnt = mem
+                .read_u32(aux_pa, prog_offsets.aux_used_map_cnt)
+                .min(MAX_USED_MAPS);
+            if used_map_cnt == 0 {
+                return None;
+            }
+            let used_maps_pa = translate_any_kva(
                 mem,
                 walk.cr3_pa,
                 walk.page_offset,
-                map_kva,
+                used_maps_kva,
                 walk.l5,
                 walk.tcr_el1,
-            ) else {
-                continue;
-            };
-            let mut name_buf = [0u8; BPF_OBJ_NAME_LEN];
-            mem.read_bytes(map_pa + map_offsets.map_name as u64, &mut name_buf);
-            let name_len = name_buf
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(BPF_OBJ_NAME_LEN);
-            let Ok(name) = std::str::from_utf8(&name_buf[..name_len]) else {
-                continue;
-            };
-            if let Some(obj) = extract_global_section_obj_prefix(name) {
-                return Some(ActiveObjMatch {
-                    obj_name: obj.to_string(),
-                    used_map_kvas: entries,
-                });
+            )?;
+
+            // Snapshot every non-zero used_maps entry (downstream
+            // disambiguation needs the full set as the KVA
+            // whitelist).
+            let mut entries: Vec<u64> = Vec::with_capacity(used_map_cnt as usize);
+            for i in 0..used_map_cnt {
+                let entry_kva = mem.read_u64(used_maps_pa, (i as usize) * 8);
+                if entry_kva != 0 {
+                    entries.push(entry_kva);
+                }
             }
-        }
-    }
-    None
+            // Find a global-section map in the snapshot and derive
+            // the obj prefix. If none, this isn't a libbpf-loaded
+            // scheduler prog (could be a different struct_ops
+            // subsystem like tcp_congestion_ops without libbpf-
+            // named global maps) — return None to skip.
+            for &map_kva in &entries {
+                let Some(map_pa) = translate_any_kva(
+                    mem,
+                    walk.cr3_pa,
+                    walk.page_offset,
+                    map_kva,
+                    walk.l5,
+                    walk.tcr_el1,
+                ) else {
+                    continue;
+                };
+                let mut name_buf = [0u8; BPF_OBJ_NAME_LEN];
+                mem.read_bytes(map_pa + map_offsets.map_name as u64, &mut name_buf);
+                let name_len = name_buf
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(BPF_OBJ_NAME_LEN);
+                let Ok(name) = std::str::from_utf8(&name_buf[..name_len]) else {
+                    continue;
+                };
+                if let Some(obj) = extract_global_section_obj_prefix(name) {
+                    return Some(ActiveObjMatch {
+                        obj_name: obj.to_string(),
+                        used_map_kvas: entries,
+                    });
+                }
+            }
+            None
+        },
+    )
+    .into_iter()
+    .next()
 }
 
 /// Result of [`find_active_struct_ops_obj_no_target`]: the matched
@@ -511,170 +506,123 @@ pub(crate) fn walk_struct_ops_runtime_stats(
     start_kernel_map: u64,
     phys_base: u64,
 ) -> Vec<ProgRuntimeStats> {
-    let idr_pa = text_kva_to_pa_with_base(prog_idr_kva, start_kernel_map, phys_base);
+    for_each_struct_ops_prog(
+        mem,
+        walk,
+        prog_idr_kva,
+        offsets,
+        start_kernel_map,
+        phys_base,
+        |prog_pa, aux_pa, _aux_kva| {
+            let mut name_buf = [0u8; BPF_OBJ_NAME_LEN];
+            mem.read_bytes(aux_pa + offsets.aux_name as u64, &mut name_buf);
+            let name_len = name_buf
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(BPF_OBJ_NAME_LEN);
+            let name = String::from_utf8_lossy(&name_buf[..name_len]).to_string();
 
-    let xa_head = mem.read_u64(idr_pa, offsets.idr_xa_head);
-    if xa_head == 0 {
-        return Vec::new();
-    }
-    let idr_next = mem.read_u32(idr_pa, offsets.idr_next);
-
-    let mut stats_out = Vec::new();
-
-    for id in 0..idr_next {
-        let Some(entry) = xa_load(
-            mem,
-            walk.page_offset,
-            xa_head,
-            id as u64,
-            offsets.xa_node_slots,
-            offsets.xa_node_shift,
-        ) else {
-            continue;
-        };
-        if entry == 0 {
-            continue;
-        }
-
-        let Some(prog_pa) = translate_any_kva(
-            mem,
-            walk.cr3_pa,
-            walk.page_offset,
-            entry,
-            walk.l5,
-            walk.tcr_el1,
-        ) else {
-            continue;
-        };
-
-        let prog_type = mem.read_u32(prog_pa, offsets.prog_type);
-        if prog_type != BPF_PROG_TYPE_STRUCT_OPS {
-            continue;
-        }
-
-        let aux_kva = mem.read_u64(prog_pa, offsets.prog_aux);
-        if aux_kva == 0 {
-            continue;
-        }
-        let Some(aux_pa) = translate_any_kva(
-            mem,
-            walk.cr3_pa,
-            walk.page_offset,
-            aux_kva,
-            walk.l5,
-            walk.tcr_el1,
-        ) else {
-            continue;
-        };
-
-        let mut name_buf = [0u8; BPF_OBJ_NAME_LEN];
-        mem.read_bytes(aux_pa + offsets.aux_name as u64, &mut name_buf);
-        let name_len = name_buf
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(BPF_OBJ_NAME_LEN);
-        let name = String::from_utf8_lossy(&name_buf[..name_len]).to_string();
-
-        let stats_percpu_kva = mem.read_u64(prog_pa, offsets.prog_stats);
-        if stats_percpu_kva == 0 {
-            continue;
-        }
-
-        // Per-CPU sum. saturating_add prevents the
-        // `attempt to add with overflow` panic that's been
-        // observed when uninitialized / scrambled per-CPU pages
-        // yield near-u64::MAX values; see `ProgRuntimeStats`.
-        let mut cnt: u64 = 0;
-        let mut nsecs: u64 = 0;
-        let mut misses: u64 = 0;
-        for (cpu_index, &cpu_off) in per_cpu_offsets.iter().enumerate() {
-            // Out-of-range CPU detection: kernel `setup_per_cpu_areas`
-            // only writes `__per_cpu_offset[cpu]` for CPUs in
-            // `for_each_possible_cpu`, leaving slots beyond
-            // `nr_cpu_ids` at the BSS-initialized 0. Real SMP
-            // kernels assign each possible CPU a strictly-positive
-            // offset for `cpu > 0`; only the BSP (cpu_index == 0)
-            // can legitimately observe a zero offset. Skip
-            // `cpu_off == 0 && cpu_index > 0` to avoid double-
-            // counting CPU 0's stats for every BSS-zero tail slot.
-            // Mirrors the guard in
-            // [`super::bpf_map::read_percpu_array_value`].
-            if cpu_off == 0 && cpu_index > 0 {
-                continue;
+            let stats_percpu_kva = mem.read_u64(prog_pa, offsets.prog_stats);
+            if stats_percpu_kva == 0 {
+                return None;
             }
-            let stats_kva = stats_percpu_kva.wrapping_add(cpu_off);
-            if let Some(stats_pa) = translate_any_kva(
-                mem,
-                walk.cr3_pa,
-                walk.page_offset,
-                stats_kva,
-                walk.l5,
-                walk.tcr_el1,
-            ) && stats_pa < mem.size()
-            {
-                // Batch the three u64 stat reads into one bulk
-                // `read_bytes` covering the contiguous span from
-                // `min(cnt, nsecs, misses)` to `max(...) + 8`. The
-                // kernel's `struct bpf_prog_stats` packs `cnt`,
-                // `nsecs`, and `misses` as adjacent u64_stats_t
-                // (8 bytes each) and the BTF resolver accepts only
-                // layouts where the three fields land in 24
-                // contiguous bytes. The bulk read pays one bounds
-                // check + region resolve instead of three per CPU,
-                // and parses the values from the local buffer
-                // without further volatile loads.
-                let lo = offsets
-                    .stats_cnt
-                    .min(offsets.stats_nsecs)
-                    .min(offsets.stats_misses);
-                let hi = offsets
-                    .stats_cnt
-                    .max(offsets.stats_nsecs)
-                    .max(offsets.stats_misses)
-                    + 8;
-                let span = hi - lo;
-                if span <= 64 {
-                    let mut buf = [0u8; 64];
-                    let n = mem.read_bytes(stats_pa + lo as u64, &mut buf[..span]);
-                    if n == span {
-                        let parse = |off: usize| -> u64 {
-                            let i = off - lo;
-                            u64::from_ne_bytes(buf[i..i + 8].try_into().unwrap())
-                        };
-                        cnt = cnt.saturating_add(parse(offsets.stats_cnt));
-                        nsecs = nsecs.saturating_add(parse(offsets.stats_nsecs));
-                        misses = misses.saturating_add(parse(offsets.stats_misses));
+
+            // Per-CPU sum. saturating_add prevents the
+            // `attempt to add with overflow` panic that's been
+            // observed when uninitialized / scrambled per-CPU pages
+            // yield near-u64::MAX values; see `ProgRuntimeStats`.
+            let mut cnt: u64 = 0;
+            let mut nsecs: u64 = 0;
+            let mut misses: u64 = 0;
+            for (cpu_index, &cpu_off) in per_cpu_offsets.iter().enumerate() {
+                // Out-of-range CPU detection: kernel `setup_per_cpu_areas`
+                // only writes `__per_cpu_offset[cpu]` for CPUs in
+                // `for_each_possible_cpu`, leaving slots beyond
+                // `nr_cpu_ids` at the BSS-initialized 0. Real SMP
+                // kernels assign each possible CPU a strictly-positive
+                // offset for `cpu > 0`; only the BSP (cpu_index == 0)
+                // can legitimately observe a zero offset. Skip
+                // `cpu_off == 0 && cpu_index > 0` to avoid double-
+                // counting CPU 0's stats for every BSS-zero tail slot.
+                // Mirrors the guard in
+                // [`super::bpf_map::read_percpu_array_value`].
+                if cpu_off == 0 && cpu_index > 0 {
+                    continue;
+                }
+                let stats_kva = stats_percpu_kva.wrapping_add(cpu_off);
+                if let Some(stats_pa) = translate_any_kva(
+                    mem,
+                    walk.cr3_pa,
+                    walk.page_offset,
+                    stats_kva,
+                    walk.l5,
+                    walk.tcr_el1,
+                ) && stats_pa < mem.size()
+                {
+                    // Batch the three u64 stat reads into one bulk
+                    // `read_bytes` covering the contiguous span from
+                    // `min(cnt, nsecs, misses)` to `max(...) + 8`. The
+                    // kernel's `struct bpf_prog_stats` packs `cnt`,
+                    // `nsecs`, and `misses` as adjacent u64_stats_t
+                    // (8 bytes each) and the BTF resolver accepts only
+                    // layouts where the three fields land in 24
+                    // contiguous bytes. The bulk read pays one bounds
+                    // check + region resolve instead of three per CPU,
+                    // and parses the values from the local buffer
+                    // without further volatile loads.
+                    let lo = offsets
+                        .stats_cnt
+                        .min(offsets.stats_nsecs)
+                        .min(offsets.stats_misses);
+                    let hi = offsets
+                        .stats_cnt
+                        .max(offsets.stats_nsecs)
+                        .max(offsets.stats_misses)
+                        + 8;
+                    let span = hi - lo;
+                    if span <= 64 {
+                        let mut buf = [0u8; 64];
+                        let n = mem.read_bytes(stats_pa + lo as u64, &mut buf[..span]);
+                        if n == span {
+                            let parse = |off: usize| -> u64 {
+                                let i = off - lo;
+                                u64::from_ne_bytes(buf[i..i + 8].try_into().unwrap())
+                            };
+                            cnt = cnt.saturating_add(parse(offsets.stats_cnt));
+                            nsecs = nsecs.saturating_add(parse(offsets.stats_nsecs));
+                            misses = misses.saturating_add(parse(offsets.stats_misses));
+                        } else {
+                            // Partial copy (page straddle / end-of-DRAM)
+                            // — fall back to scalar reads to retain the
+                            // original semantics.
+                            cnt = cnt.saturating_add(mem.read_u64(stats_pa, offsets.stats_cnt));
+                            nsecs =
+                                nsecs.saturating_add(mem.read_u64(stats_pa, offsets.stats_nsecs));
+                            misses =
+                                misses.saturating_add(mem.read_u64(stats_pa, offsets.stats_misses));
+                        }
                     } else {
-                        // Partial copy (page straddle / end-of-DRAM)
-                        // — fall back to scalar reads to retain the
-                        // original semantics.
+                        // Span exceeds the inline buffer. Should be
+                        // unreachable for the production
+                        // `bpf_prog_stats` layout (24 bytes), but
+                        // tolerate exotic layouts via the scalar path
+                        // rather than panicking.
                         cnt = cnt.saturating_add(mem.read_u64(stats_pa, offsets.stats_cnt));
                         nsecs = nsecs.saturating_add(mem.read_u64(stats_pa, offsets.stats_nsecs));
                         misses =
                             misses.saturating_add(mem.read_u64(stats_pa, offsets.stats_misses));
                     }
-                } else {
-                    // Span exceeds the inline buffer. Should be
-                    // unreachable for the production
-                    // `bpf_prog_stats` layout (24 bytes), but
-                    // tolerate exotic layouts via the scalar path
-                    // rather than panicking.
-                    cnt = cnt.saturating_add(mem.read_u64(stats_pa, offsets.stats_cnt));
-                    nsecs = nsecs.saturating_add(mem.read_u64(stats_pa, offsets.stats_nsecs));
-                    misses = misses.saturating_add(mem.read_u64(stats_pa, offsets.stats_misses));
                 }
             }
-        }
 
-        stats_out.push(ProgRuntimeStats {
-            name,
-            cnt,
-            nsecs,
-            misses,
-        });
-    }
-
-    stats_out
+            Some(ProgRuntimeStats {
+                name,
+                cnt,
+                nsecs,
+                misses,
+            })
+        },
+    )
 }
 
 /// Read-only abstraction over BPF program enumeration and per-program
