@@ -3178,6 +3178,24 @@ impl KtstrVm {
                 let mut scan_tick: bool;
                 let mut first_iter = true;
                 let mut bsp_done_final_pass = false;
+                // Wall-clock cap on the post-BSP_DONE stay-alive
+                // window. Bounds the wait for the
+                // `owned_accessor`-gated drain of
+                // [`capture_requests_deferred`] /
+                // [`kernel_op_requests_deferred`]: if the accessor
+                // hasn't adopted by the cap, surface the empty
+                // reply path rather than blocking the test forever.
+                // 30 s leaves headroom over the accessor-init
+                // worker's own 60 s first-init deadline only in the
+                // genuinely-stuck scenario (worker bailed
+                // FAILED_PERMANENTLY); under healthy boots the
+                // adoption fires within seconds and the stay-alive
+                // exits immediately on the `owned_accessor.is_some()`
+                // path. The cap exists exclusively to keep a
+                // catastrophic prerequisite failure from converting
+                // a test fault into an unbounded test run.
+                let mut bsp_done_final_pass_start: Option<Instant> = None;
+                const DEFERRED_DRAIN_GRACE: Duration = Duration::from_secs(30);
                 // Mirror of `bsp_done_final_pass` for the SCHED_EXIT
                 // kill-promotion-without-bsp-done case: kill can be
                 // promoted by sources other than a clean BSP_DONE —
@@ -3210,16 +3228,45 @@ impl KtstrVm {
                 {
                     if freeze_coord_bsp_done.load(Ordering::Acquire) {
                         if bsp_done_final_pass {
-                            if capture_requests_deferred.is_empty()
+                            // Cover both deferral queues — ColdOp
+                            // requests (`kernel_op_requests_deferred`)
+                            // share the same `owned_accessor`
+                            // adoption gate as capture requests, so
+                            // a test that fires
+                            // `Op::ReadKernelCold` before the
+                            // accessor publishes would otherwise see
+                            // no reply at all (workload ends, deferred
+                            // queue never drains). The wall-clock
+                            // cap at `DEFERRED_DRAIN_GRACE` keeps a
+                            // genuinely-stuck prerequisite from
+                            // hanging the test indefinitely.
+                            let any_deferred = !capture_requests_deferred.is_empty()
+                                || !kernel_op_requests_deferred.is_empty();
+                            let grace_expired = bsp_done_final_pass_start
+                                .map(|t| t.elapsed() >= DEFERRED_DRAIN_GRACE)
+                                .unwrap_or(false);
+                            if !any_deferred
                                 || owned_accessor.is_some()
+                                || grace_expired
                             {
+                                if grace_expired && any_deferred {
+                                    eprintln!(
+                                        "freeze-coord: deferred drain grace ({:?}) expired with queue still non-empty: captures={} kernel_ops={}",
+                                        DEFERRED_DRAIN_GRACE,
+                                        capture_requests_deferred.len(),
+                                        kernel_op_requests_deferred.len(),
+                                    );
+                                }
                                 break 'coord;
                             }
                             eprintln!(
-                                "freeze-coord: staying alive for deferred captures: deferred={} accessor={}",
+                                "freeze-coord: staying alive for deferred requests: captures={} kernel_ops={} accessor={}",
                                 capture_requests_deferred.len(),
+                                kernel_op_requests_deferred.len(),
                                 owned_accessor.is_some()
                             );
+                        } else {
+                            bsp_done_final_pass_start = Some(Instant::now());
                         }
                         bsp_done_final_pass = true;
                     } else if freeze_coord_kill.load(Ordering::Acquire) {
