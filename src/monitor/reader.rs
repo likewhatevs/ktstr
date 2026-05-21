@@ -3686,13 +3686,14 @@ mod tests {
 
     /// `rq_refresh` recomputes `rq_pas` from `__per_cpu_offset[]` each
     /// iteration. Build a buffer where:
-    ///   - byte 0..16 = per-CPU offset table for 2 CPUs
-    ///     (offsets are PAs of the per-CPU rq buffers minus
-    ///     `runqueues_kva`; we set `runqueues_kva = 0` so the offset
-    ///     IS the PA).
+    ///   - byte 0..16 = per-CPU offset table for 2 CPUs. Each entry
+    ///     is `(1<<63) | rq_pa` so the values satisfy the
+    ///     kernel-half gate at the data_valid latch (bare PAs would
+    ///     fail bit-63 and the latch would never fire).
     ///   - rq buffers follow the offset table.
-    ///     With `page_offset = 0`, `kva_to_pa(off + 0, 0) = off` so the
-    ///     recomputed `rq_pas[cpu]` equals the offset slot.
+    ///     With `runqueues_kva = 0` and `page_offset = 1<<63`,
+    ///     `kva_to_pa((1<<63) | rq_pa, 1<<63) = rq_pa` so the
+    ///     recomputed `rq_pas[cpu]` lands on the rq buffer.
     #[test]
     fn monitor_loop_rq_refresh_drives_pas() {
         let offsets = test_offsets();
@@ -3701,10 +3702,13 @@ mod tests {
         let rq1_buf = make_rq_buffer(&offsets, 22, 2, 2, 8888, 0);
         let rq0_pa = pco_size;
         let rq1_pa = pco_size + rq0_buf.len() as u64;
+        const KERNEL_HALF: u64 = 1u64 << 63;
+        let pco0 = KERNEL_HALF | rq0_pa;
+        let pco1 = KERNEL_HALF | rq1_pa;
 
         let mut combined = vec![0u8; pco_size as usize];
-        combined[0..8].copy_from_slice(&rq0_pa.to_ne_bytes());
-        combined[8..16].copy_from_slice(&rq1_pa.to_ne_bytes());
+        combined[0..8].copy_from_slice(&pco0.to_ne_bytes());
+        combined[8..16].copy_from_slice(&pco1.to_ne_bytes());
         combined.extend_from_slice(&rq0_buf);
         combined.extend_from_slice(&rq1_buf);
 
@@ -3733,6 +3737,7 @@ mod tests {
 
         let cfg = MonitorConfig {
             rq_refresh: Some(&refresh),
+            page_offset: KERNEL_HALF,
             ..test_config()
         };
         let MonitorLoopResult { samples, .. } = monitor_loop(
