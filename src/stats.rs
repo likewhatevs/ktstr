@@ -1295,7 +1295,7 @@ pub struct GauntletRow {
     /// local), this describes the run-environment provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_source: Option<String>,
-    /// True when the underlying [`AssertResult::is_pass`] returned
+    /// True when the underlying [`crate::assert::AssertResult::is_pass`] returned
     /// true at sidecar emission time — a real pass with at least one
     /// observed outcome and no Fail/Inconclusive/Skip. Mutually
     /// exclusive with [`Self::skipped`] and [`Self::inconclusive`]:
@@ -2172,9 +2172,9 @@ fn commit_pairing_key_part(value: &Option<String>) -> String {
 /// contributor sets `inconclusive=true`; else any skipped
 /// contributor sets `skipped=true`; only an all-pass cohort yields
 /// `passed=true`. The lattice mechanics match
-/// [`GauntletRow::is_pass`]'s triple-conjunct, so the aggregated
+/// `GauntletRow::is_pass`'s triple-conjunct, so the aggregated
 /// row's accessor reads honestly. Aggregate rows that are not real
-/// Pass route the pair through [`compare_rows_by`]'s
+/// Pass route the pair through `compare_rows_by`'s
 /// `excluded_pairs` gate.
 ///
 /// `passes_observed`, `skips_observed`, `inconclusives_observed`,
@@ -2216,7 +2216,7 @@ pub struct AveragedGroup {
     /// rendering as the "I inconclusive" breakdown so an operator
     /// can distinguish "couldn't evaluate" from real failures —
     /// same defense-in-depth pattern as
-    /// [`format_dimension_summary`]'s inconc bucket.
+    /// `format_dimension_summary`'s inconc bucket.
     pub inconclusives_observed: u32,
     /// Number of contributors that were a real Fail
     /// (`is_fail() == true`). Surfaced in the per-group rendering

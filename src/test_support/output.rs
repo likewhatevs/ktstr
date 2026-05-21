@@ -596,9 +596,9 @@ pub(crate) fn format_periodic_samples_section(result: &vmm::VmResult) -> String 
 /// an empty section header.
 ///
 /// Why both streams: temporal patterns can push BOTH `Outcome::Fail`
-/// (via [`crate::assert::temporal::push_detail`]) and
+/// (via `crate::assert::temporal::push_detail`) and
 /// `Outcome::Inconclusive` (via
-/// [`crate::assert::temporal::push_inconclusive`] — e.g. zero-
+/// `crate::assert::temporal::push_inconclusive` — e.g. zero-
 /// denominator rate_within / ratio_within); rendering only Fails
 /// would silently drop the Inconclusive diagnostic when the verdict
 /// arm is Inconclusive (no Fail recorded), losing the operator-

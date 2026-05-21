@@ -961,8 +961,8 @@ impl From<&str> for NoteValue {
 /// `Fail`: a POLICY-derived denominator (e.g. NUMA pages under
 /// `MemPolicy::Bind`, where the policy specifies pages will
 /// exist) staying at zero IS a defect signal and stays as `Fail`
-/// per the existing semantic — see `assert_page_locality` at
-/// [`AssertPlan::assert_cgroup`] for the policy-derived carve-out.
+/// per the existing semantic — see `assert_page_locality` /
+/// `AssertPlan::assert_cgroup` for the policy-derived carve-out.
 ///
 /// Note: Notes do NOT belong here. [`AssertResult::info_notes`]
 /// is the structurally-separate context stream; re-encoding Note
