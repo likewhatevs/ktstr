@@ -1666,8 +1666,9 @@ mod tests {
     /// latches `page_offset` for every subsequent KVA→PA translation.
     /// This test fails if the latch never fires (`page_offset == 0`),
     /// proving the boot signal + refresh pipeline reaches the
-    /// `__per_cpu_offset[0]` populated && `page_offset_resolved`
-    /// AND condition before the run closes.
+    /// fully-populated `__per_cpu_offset[]` (every slot has bit 63
+    /// set, not just `[0]`) && `page_offset_resolved` AND condition
+    /// before the run closes.
     ///
     /// Rationale: the same wrong `page_offset` would make every
     /// `kva_to_pa` translation off by the KASLR delta and zero out
@@ -1703,9 +1704,12 @@ mod tests {
         );
 
         // x86_64: DATA_VALID requires page_offset_resolved (bit 63 +
-        // 4 KiB alignment + stability gate) AND
-        // __per_cpu_offset[0] != 0. A non-zero `report.page_offset`
-        // proves both conjuncts held during at least one iteration.
+        // 4 KiB alignment + stability gate) AND every
+        // `__per_cpu_offset[]` slot populated (every entry with
+        // bit 63 set, not just `[0]`). A non-zero `report.page_offset`
+        // proves the full gate (page_offset_resolved + non-empty
+        // slice + every slot kernel-half) held during at least one
+        // iteration.
         assert_ne!(
             report.page_offset, 0,
             "DATA_VALID latch never fired during the run — \

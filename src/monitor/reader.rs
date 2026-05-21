@@ -2616,10 +2616,28 @@ pub(crate) fn monitor_loop(
             // exists to prevent. Require every slot to be populated
             // (and the slice to be non-empty so a degenerate
             // `num_cpus == 0` cannot vacuously pass).
+            //
+            // **Kernel-half check (bit 63)**: bare `v != 0` accepts
+            // garbage like `0x3` that can transiently appear when
+            // the host reads `__per_cpu_offset[]` before the guest
+            // BSP has populated it (the bytes at the target PA
+            // are whatever pre-init state holds, not necessarily
+            // zero). Every legitimate `__per_cpu_offset[cpu]` value
+            // has bit 63 set on both supported architectures: x86_64
+            // kernel-half starts at `0xffff_8800_0000_0000`, and on
+            // aarch64 the value is `pcpu_base_addr -
+            // link___per_cpu_start - kaslr_offset +
+            // pcpu_unit_offsets[cpu]` — a u64 subtraction of two
+            // high-half addresses whose result inherits bit 63.
+            // Rejecting `v & (1u64 << 63) == 0` catches `0x3` and
+            // every other small-magnitude garbage without
+            // arch-specific PAGE_OFFSET hardcoding (which would
+            // wrongly reject valid arm64 VA_BITS=47 values when the
+            // gate uses the VA_BITS=48 fallback).
             if !data_valid
                 && page_offset_resolved
                 && !fresh.is_empty()
-                && fresh.iter().all(|&v| v != 0)
+                && fresh.iter().all(|&v| v & (1u64 << 63) != 0)
             {
                 data_valid = true;
                 latched_page_offset = page_offset;
