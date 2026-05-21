@@ -81,7 +81,7 @@ docs:
 link-check:
     mdbook build doc/guide
     mdbook test doc/guide
-    lychee --offline --no-progress doc/guide/book/html
+    lychee --offline --no-progress --exclude-path 'doc/guide/book/html/404.html' doc/guide/book/html
 
 # Build API reference
 api-docs:
