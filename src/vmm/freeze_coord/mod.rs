@@ -7034,14 +7034,13 @@ impl KtstrVm {
                                 if !kern_virt_kaslr_published()
                                     || owned_accessor.is_none()
                                     || owned_prog_accessor.is_none()
-                                    || prog_per_cpu_offsets.is_none()
                                 {
                                     // WATCH arms a DR against
                                     // `link_kva + kaslr_offset` AND
                                     // every subsequent DR fire drives
                                     // a `freeze_and_dispatch(Capture)`
                                     // pass that walks the prog
-                                    // accessor's BPF maps. All four
+                                    // accessor's BPF maps. All three
                                     // inputs must be ready before the
                                     // arm:
                                     //   - kaslr_offset == 0 against a
@@ -7060,23 +7059,16 @@ impl KtstrVm {
                                     //     surface sees the slot's tag
                                     //     with no real data.
                                     //   - owned_prog_accessor == None
-                                    //     OR prog_per_cpu_offsets ==
-                                    //     None means the dump's
-                                    //     `prog_capture` collapses
-                                    //     to `None`
-                                    //     (`freeze_and_dispatch`
-                                    //     constructs it only on
-                                    //     `(Some, Some)`), so
+                                    //     means the dump-side
                                     //     `identify_active_obj_from_struct_ops`
-                                    //     skips its primary walker
-                                    //     path. The report's
-                                    //     `active_map_kvas` stays
-                                    //     empty and same-binary
+                                    //     walker is unavailable; the
+                                    //     report's `active_map_kvas`
+                                    //     stays empty and same-binary
                                     //     scheduler-swap consumers
                                     //     (the pinned-bss
                                     //     disambiguation surface) lose
                                     //     their KVA whitelist.
-                                    // Defer on any of the four; the
+                                    // Defer on any of the three; the
                                     // per-iteration drain above (which
                                     // gates on kern_virt_kaslr_published()
                                     // — true post-publish even under
@@ -7090,11 +7082,9 @@ impl KtstrVm {
                                         kaslr_published = kern_virt_kaslr_published(),
                                         accessor_adopted = owned_accessor.is_some(),
                                         prog_accessor_adopted = owned_prog_accessor.is_some(),
-                                        prog_per_cpu_offsets_adopted = prog_per_cpu_offsets.is_some(),
                                         "freeze-coord: TLV WATCH deferred \
-                                         (kern_virt_kaslr, owned_accessor, \
-                                         owned_prog_accessor, or \
-                                         prog_per_cpu_offsets not yet published)"
+                                         (kern_virt_kaslr, owned_accessor, or \
+                                         owned_prog_accessor not yet published)"
                                     );
                                     capture_requests_deferred.push(SnapshotRequest {
                                         request_id,
@@ -7627,46 +7617,29 @@ impl KtstrVm {
                                 // publishes.
                                 // The dump-side struct_ops walker
                                 // (`identify_active_obj_from_struct_ops`)
-                                // is only invoked when the dump's
-                                // `prog_capture` is `Some`, which
-                                // requires BOTH `owned_prog_accessor`
-                                // AND `prog_per_cpu_offsets` to be
-                                // present at the per-iteration
-                                // construction in
-                                // `freeze_and_dispatch`'s capture
-                                // path (mod.rs:5818-5831 — `(Some,
-                                // Some) => Some(ProgRuntimeCapture)`,
-                                // any other shape collapses to
-                                // `None`). The walker powers the
-                                // primary disambiguation path for
-                                // same-binary scheduler swaps
-                                // (multi-bss windows held alive by
-                                // `Op::PinBpfMap`). If a periodic
-                                // boundary fires before either
-                                // half is ready (worker still
-                                // publishing the prog accessor;
-                                // per-CPU offsets still racing the
-                                // guest's `setup_per_cpu_areas`
-                                // populating every slot), the
-                                // report carries an empty
-                                // `active_map_kvas` and the
-                                // consumer surfaces
+                                // is only invoked when
+                                // `owned_prog_accessor` is present —
+                                // it powers the primary
+                                // disambiguation path for same-binary
+                                // scheduler swaps (multi-bss windows
+                                // held alive by `Op::PinBpfMap`). If
+                                // a periodic boundary fires before
+                                // `owned_prog_accessor` adopts
+                                // (worker still publishing OR
+                                // coordinator hasn't reached the next
+                                // scan_tick after a swap-induced
+                                // reset cleared it), the report
+                                // carries an empty `active_map_kvas`
+                                // and the consumer surfaces
                                 // `NoActiveScheduler` with the
-                                // multi-bss diagnostic — the
-                                // exact failure mode the live_var
-                                // disambiguation test exercises.
-                                // ktstr kernels always carry the
-                                // `prog_idr` and `__per_cpu_offset`
-                                // symbols (CONFIG_BPF=y is mandatory
-                                // for sched_ext), so both halves
-                                // do adopt; the gate just makes
-                                // periodic captures wait for them
-                                // instead of emitting reports the
-                                // walker cannot enrich.
+                                // multi-bss diagnostic. The gate
+                                // makes periodic captures wait for
+                                // the prog accessor instead of
+                                // emitting reports the walker cannot
+                                // enrich.
                                 if !kern_virt_kaslr_published()
                                     || owned_accessor.is_none()
                                     || owned_prog_accessor.is_none()
-                                    || prog_per_cpu_offsets.is_none()
                                 {
                                     tracing::info!(
                                         target: "ktstr::failure_dump",
@@ -7675,11 +7648,9 @@ impl KtstrVm {
                                         kaslr_published = kern_virt_kaslr_published(),
                                         accessor_present = owned_accessor.is_some(),
                                         prog_accessor_present = owned_prog_accessor.is_some(),
-                                        prog_per_cpu_offsets_present = prog_per_cpu_offsets.is_some(),
                                         "freeze-coord: periodic snapshot deferred \
-                                         (kaslr_offset, owned_accessor, \
-                                         owned_prog_accessor, or \
-                                         prog_per_cpu_offsets not yet published); \
+                                         (kaslr_offset, owned_accessor, or \
+                                         owned_prog_accessor not yet published); \
                                          retrying next iteration"
                                     );
                                     break;
