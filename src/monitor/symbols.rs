@@ -892,12 +892,18 @@ pub(crate) fn read_per_cpu_offsets(
 /// `per_cpu_ptr(&template, cpu)` is
 /// `template_kva + kaslr_offset_if_high_half + per_cpu_off`.
 /// This helper applies the slide ONLY when `template_kva` is in
-/// the kernel half (≥ `KERNEL_HALF_CANONICAL_4LEVEL`); for
-/// zero-based templates the slide is suppressed because the
-/// stored `__per_cpu_offset[cpu]` already encodes the absolute
-/// runtime address.  Documented in
-/// `linux:include/linux/percpu-defs.h:237` (`per_cpu_ptr` macro)
-/// and the per-arch `setup_per_cpu_areas` for the delta.
+/// the kernel half (`template_kva >= 1 << 48` — any plausible
+/// kernel-half address satisfies this on every supported
+/// arch+paging combination: x86_64 4-level (>= 0xffff_8000_...),
+/// x86_64 5-level (>= 0xff00_0000_...), aarch64 VA_BITS=48
+/// (>= 0xffff_0000_...), and aarch64 VA_BITS=52 (>=
+/// 0xfff0_0000_...).  Zero-based per-CPU templates are link-time
+/// offsets below 4 GiB, so they fall well under 2^48 and the
+/// slide is suppressed; the stored `__per_cpu_offset[cpu]`
+/// already encodes the absolute runtime address in that case.
+/// Documented in `linux:include/linux/percpu-defs.h:237`
+/// (`per_cpu_ptr` macro) and the per-arch `setup_per_cpu_areas`
+/// for the delta.
 ///
 /// Extracted into a single helper so the formula has one audit
 /// point.  Production callers route the `kaslr_offset` argument
@@ -913,8 +919,13 @@ pub(crate) fn per_cpu_kva(template_kva: u64, kaslr_offset: u64, per_cpu_off: u64
     // post-fix layout). Zero-based templates encode the absolute
     // runtime address inside `per_cpu_off` already, so adding the
     // slide would double-count and shift the result outside the
-    // mapped direct-map window.
-    let slide = if template_kva >= crate::vmm::KERNEL_HALF_CANONICAL {
+    // mapped direct-map window. Threshold is arch-portable: any
+    // kernel-half KVA satisfies `>= 1 << 48` on every supported
+    // arch+paging combination (x86_64 4-level / 5-level, aarch64
+    // VA_BITS=48 / 52), and zero-based per-CPU symbol offsets sit
+    // well under 4 GiB so they always fall below.
+    const HIGH_HALF_THRESHOLD: u64 = 1u64 << 48;
+    let slide = if template_kva >= HIGH_HALF_THRESHOLD {
         kaslr_offset
     } else {
         0
@@ -1348,16 +1359,20 @@ mod tests {
         );
     }
 
-    /// The high-half / zero-based detection threshold IS
-    /// `KERNEL_HALF_CANONICAL`.  A template at exactly the
-    /// threshold should APPLY the slide (boundary inclusive);
-    /// one below should suppress.  Pins the boundary so a future
-    /// refactor that flips `>=` to `>` is caught.
+    /// The high-half / zero-based detection threshold is `1 <<
+    /// 48` (arch-portable: any kernel-half KVA satisfies this on
+    /// every supported arch+paging mode, and zero-based per-CPU
+    /// symbol offsets sit well under 4 GiB so they never reach
+    /// it).  A template at exactly the threshold APPLIES the
+    /// slide (boundary inclusive); one below SUPPRESSES.  Pins
+    /// the boundary so a future refactor that flips `>=` to `>`
+    /// (or moves the threshold back to an x86-only value like
+    /// `KERNEL_HALF_CANONICAL`) is caught.
     #[test]
     fn per_cpu_kva_storage_form_detection_boundary() {
         let kaslr = 0x1_0000_0000_u64;
         let off = 0x4_0000_u64;
-        let threshold = crate::vmm::KERNEL_HALF_CANONICAL;
+        let threshold = 1u64 << 48;
         // Exactly at the threshold: slide applies (high-half).
         assert_eq!(
             per_cpu_kva(threshold, kaslr, off),
