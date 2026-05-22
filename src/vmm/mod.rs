@@ -1778,6 +1778,12 @@ mod tests {
     /// only fire on a real run that produced a `MonitorReport`.
     #[test]
     fn sys_rdy_releases_monitor_before_5s_timeout() {
+        if crate::test_support::current_binary_is_coverage_instrumented() {
+            skip!(
+                "coverage-instrumented /init AP-kill — see boot_kernel_with_monitor \
+                 for the shared rationale."
+            );
+        }
         let kernel = crate::test_support::require_kernel();
         let _vmlinux = crate::test_support::require_vmlinux(&kernel);
         let exe = crate::resolve_current_exe().unwrap();
@@ -1907,6 +1913,12 @@ mod tests {
     ///
     #[test]
     fn first_sample_has_valid_rq_clock_thanks_to_sys_rdy() {
+        if crate::test_support::current_binary_is_coverage_instrumented() {
+            skip!(
+                "coverage-instrumented /init AP-kill — see boot_kernel_with_monitor \
+                 for the shared rationale."
+            );
+        }
         let kernel = crate::test_support::require_kernel();
         let _vmlinux = crate::test_support::require_vmlinux(&kernel);
         let exe = crate::resolve_current_exe().unwrap();
