@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/likewhatevs/ktstr/actions/workflows/ci.yml/badge.svg)](https://github.com/likewhatevs/ktstr/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/likewhatevs/ktstr/graph/badge.svg?token=E7GRAO2KZM)](https://codecov.io/gh/likewhatevs/ktstr)
+[![crates.io](https://img.shields.io/crates/v/ktstr.svg)](https://crates.io/crates/ktstr)
 [![tutorial](https://img.shields.io/badge/docs-tutorial-blue)](https://likewhatevs.github.io/ktstr/guide/tutorial.html)
 [![api](https://img.shields.io/badge/docs-api-blue)](https://likewhatevs.github.io/ktstr/api/ktstr/)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](https://github.com/likewhatevs/ktstr/issues)
