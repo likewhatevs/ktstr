@@ -371,8 +371,30 @@ fn is_coverage_instrumented_binary() -> bool {
         Ok(e) => e,
         Err(_) => return false,
     };
-    let vaddrs = find_symbol_vaddrs(&elf, &["__llvm_profile_runtime"]);
-    matches!(vaddrs[0], Some(v) if v != 0)
+    // Probe for the profile-write-buffer entry point rather than
+    // the bare `__llvm_profile_runtime` marker. The marker is
+    // declared `int __llvm_profile_runtime;` in compiler-rt and
+    // can lose its `.symtab` size on `--gc-sections` /
+    // `-Wl,--strip-debug` paths some toolchains apply to
+    // coverage builds, which trips
+    // [`find_symbol_vaddrs`]'s `st_size == 0` skip and silently
+    // hides instrumented binaries from this probe. The
+    // function-shaped symbols [`try_flush_profraw`] already
+    // resolves (`__llvm_profile_get_size_for_buffer` and
+    // `__llvm_profile_write_buffer`) keep their non-zero
+    // `st_size` because every linker path emits the function
+    // body — they are the reliable presence signal for
+    // instrumented binaries, proved empirically by the fact that
+    // coverage profraw collection in CI succeeds via the same
+    // symtab probe.
+    let vaddrs = find_symbol_vaddrs(
+        &elf,
+        &[
+            "__llvm_profile_write_buffer",
+            "__llvm_profile_get_size_for_buffer",
+        ],
+    );
+    vaddrs.iter().any(|v| matches!(v, Some(va) if *va != 0))
 }
 
 /// Process-wide cached version of [`is_coverage_instrumented_binary`]
