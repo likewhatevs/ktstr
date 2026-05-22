@@ -799,6 +799,20 @@ fn maybe_dispatch_host_test() -> Option<i32> {
     }
 }
 
+/// Coverage-skip name list for VM-booting tests whose guest /init
+/// trips an AP-kill exit early in boot under coverage-instrumented
+/// `current_exe` binaries. See [`run_ktstr_test`] for the gate that
+/// consumes this list and the rationale for skipping at host scope.
+fn coverage_skip_under_instrumented_init(name: &str) -> bool {
+    matches!(
+        name,
+        "live_var_resolves_across_same_binary_swap"
+            | "snapshot_real_capture_op_snapshot"
+            | "snapshot_real_capture_op_watch_snapshot"
+            | "stats_bridge_round_trip"
+    )
+}
+
 /// Host-side entry point: build a VM, boot it with `--ktstr-test-fn=NAME`,
 /// extract profraw from SHM, and return the test result.
 ///
@@ -811,6 +825,27 @@ pub fn run_ktstr_test(entry: &KtstrTestEntry) -> Result<AssertResult> {
     // dynamically) hit the same bail messages the macro produces at
     // compile time.
     entry.validate()?;
+
+    // Host-side coverage skip for VM-booting tests whose guest /init
+    // trips an AP-kill exit under coverage-instrumented `current_exe`
+    // binaries. Per-test in-body skip checks are inert for these tests
+    // because the test body never runs — the guest dies during boot
+    // before reaching `(entry.func)(ctx)`. Catching the case here, on
+    // host, before any VM is built, lets nextest surface a clean SKIP
+    // instead of burning the 31-retry budget on a doomed boot path.
+    // The hardcoded list mirrors the coverage-skip surface other
+    // sites guard locally; deferral until a non-instrumented /init
+    // binary is wired stays the principled fix.
+    if !entry.host_only
+        && crate::test_support::current_binary_is_coverage_instrumented()
+        && coverage_skip_under_instrumented_init(entry.name)
+    {
+        return Ok(AssertResult::skip(format!(
+            "coverage-instrumented /init AP-kill — {}; deferred until \
+             non-instrumented /init binary is wired",
+            entry.name,
+        )));
+    }
 
     // Check if the ctor deferred a prefixed dispatch name via argv
     // rewrite. If so, resolve the topology from the full
