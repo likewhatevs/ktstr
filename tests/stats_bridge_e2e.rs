@@ -183,6 +183,13 @@ fn assert_stats_round_trip(result: &VmResult) -> Result<()> {
     post_vm = assert_stats_round_trip,
 )]
 fn stats_bridge_round_trip(ctx: &Ctx) -> Result<AssertResult> {
+    if ktstr::test_support::current_binary_is_coverage_instrumented() {
+        return Ok(AssertResult::skip(
+            "coverage-instrumented /init AP-kill — same surface as \
+             boot_kernel_with_monitor; deferred until non-instrumented \
+             init binary is wired",
+        ));
+    }
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
