@@ -67,6 +67,13 @@ fn assert_bridge_has_real_capture(result: &VmResult) -> Result<()> {
     post_vm = assert_bridge_has_real_capture,
 )]
 fn snapshot_real_capture_op_snapshot(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
+    if ktstr::test_support::current_binary_is_coverage_instrumented() {
+        return Ok(AssertResult::skip(
+            "coverage-instrumented /init AP-kill — same surface as \
+             boot_kernel_with_monitor; deferred until non-instrumented \
+             init binary is wired",
+        ));
+    }
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![Op::capture_snapshot("mid_run")],
@@ -85,6 +92,13 @@ fn snapshot_real_capture_op_snapshot(ctx: &ktstr::scenario::Ctx) -> Result<Asser
     post_vm = assert_bridge_has_real_capture,
 )]
 fn snapshot_real_capture_op_watch_snapshot(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
+    if ktstr::test_support::current_binary_is_coverage_instrumented() {
+        return Ok(AssertResult::skip(
+            "coverage-instrumented /init AP-kill — same surface as \
+             boot_kernel_with_monitor; deferred until non-instrumented \
+             init binary is wired",
+        ));
+    }
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![Op::watch_snapshot("jiffies_64")],
