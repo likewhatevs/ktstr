@@ -56,7 +56,7 @@ fn cache_dir_store_creates_root_lazily() {
 fn cache_dir_default_root_returns_path() {
     let _lock = lock_env();
     let tmp = TempDir::new().unwrap();
-    let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
+    let _guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
     let resolved = CacheDir::default_root().unwrap();
     assert_eq!(resolved, tmp.path());
 }

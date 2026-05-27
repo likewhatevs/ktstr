@@ -187,8 +187,8 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ("probe/output.rs", "format_probe_events_inner", 330),        // queued: decompose
     ("probe/process.rs", "attach_phase_b_fentry", 494),           // queued: decompose
     ("probe/process.rs", "run_probe_skeleton", 1280),             // queued: decompose
-    ("scenario/ops/mod.rs", "apply_ops", 716),                    // queued: decompose
-    ("scenario/ops/mod.rs", "apply_setup", 507),                  // queued: decompose
+    ("scenario/ops/dispatch.rs", "apply_ops", 1122),              // queued: decompose
+    ("scenario/ops/setup.rs", "apply_setup", 562),                // queued: decompose
     ("scenario/ops/mod.rs", "run_scenario", 300),                 // queued: decompose
     ("stats.rs", "compare_partitions", 242),                      // queued: decompose
     ("stats.rs", "group_and_average_by", 257),                    // queued: decompose

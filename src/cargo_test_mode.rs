@@ -39,7 +39,7 @@
 /// `KTSTR_CARGO_TEST_MODE=` from CI shell quirks must not silently
 /// flip the harness into degraded coordination mode.
 pub(crate) fn cargo_test_mode_active() -> bool {
-    std::env::var("KTSTR_CARGO_TEST_MODE")
+    std::env::var(crate::KTSTR_CARGO_TEST_MODE_ENV)
         .map(|v| !v.is_empty())
         .unwrap_or(false)
 }
@@ -57,9 +57,9 @@ mod tests {
     #[test]
     fn cargo_test_mode_active_set_non_empty() {
         let _lock = lock_env();
-        let _env = EnvVarGuard::set("KTSTR_CARGO_TEST_MODE", "1");
+        let _env = EnvVarGuard::set(crate::KTSTR_CARGO_TEST_MODE_ENV, "1");
         assert!(cargo_test_mode_active());
-        let _env_word = EnvVarGuard::set("KTSTR_CARGO_TEST_MODE", "yes");
+        let _env_word = EnvVarGuard::set(crate::KTSTR_CARGO_TEST_MODE_ENV, "yes");
         assert!(cargo_test_mode_active());
     }
 
@@ -70,7 +70,7 @@ mod tests {
     #[test]
     fn cargo_test_mode_active_empty_string_rejected() {
         let _lock = lock_env();
-        let _env = EnvVarGuard::set("KTSTR_CARGO_TEST_MODE", "");
+        let _env = EnvVarGuard::set(crate::KTSTR_CARGO_TEST_MODE_ENV, "");
         assert!(
             !cargo_test_mode_active(),
             "empty-string KTSTR_CARGO_TEST_MODE must NOT activate; \
@@ -83,7 +83,7 @@ mod tests {
     #[test]
     fn cargo_test_mode_active_unset() {
         let _lock = lock_env();
-        let _env = EnvVarGuard::remove("KTSTR_CARGO_TEST_MODE");
+        let _env = EnvVarGuard::remove(crate::KTSTR_CARGO_TEST_MODE_ENV);
         assert!(!cargo_test_mode_active());
     }
 
@@ -95,7 +95,7 @@ mod tests {
     #[test]
     fn cargo_test_mode_active_zero_string_activates_per_non_empty_contract() {
         let _lock = lock_env();
-        let _env = EnvVarGuard::set("KTSTR_CARGO_TEST_MODE", "0");
+        let _env = EnvVarGuard::set(crate::KTSTR_CARGO_TEST_MODE_ENV, "0");
         assert!(
             cargo_test_mode_active(),
             "\"0\" is non-empty so the bypass activates per the \

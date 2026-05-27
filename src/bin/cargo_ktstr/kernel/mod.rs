@@ -690,11 +690,7 @@ fn kernel_build_one(
     // and the implicit "no cap" default. Conflict with
     // KTSTR_BYPASS_LLC_LOCKS=1 surfaces here so operators see
     // the parse-time error, not an opaque pipeline bail later.
-    if cpu_cap.is_some()
-        && std::env::var("KTSTR_BYPASS_LLC_LOCKS")
-            .ok()
-            .is_some_and(|v| !v.is_empty())
-    {
+    if cpu_cap.is_some() && ktstr::bypass_llc_locks_active() {
         return Err(
             "--cpu-cap conflicts with KTSTR_BYPASS_LLC_LOCKS=1; unset one of them. \
              --cpu-cap is a resource contract; bypass disables the contract entirely."

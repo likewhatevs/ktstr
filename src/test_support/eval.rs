@@ -65,6 +65,35 @@ impl std::fmt::Display for ScxBpfErrorMatcherMismatch {
 
 impl std::error::Error for ScxBpfErrorMatcherMismatch {}
 
+/// Marker error type attached as `anyhow::Context` to the failure
+/// `Err` produced by `evaluate_vm_result` when
+/// [`apply_expect_auto_repro_inversion`] has set
+/// `result.expect_auto_repro_satisfied = true`: the primary VM
+/// produced a Fail AND a shape-valid `.repro.wprof.pb` artifact
+/// landed on disk from the auto-repro VM.
+///
+/// Dispatch (`crate::test_support::dispatch::result_to_exit_code`)
+/// downcasts the error chain for this marker and routes the verdict
+/// to `EXIT_PASS`. The underlying `AssertResult` is NOT mutated —
+/// the original failure detail still surfaces in stderr/dump
+/// rendering so an operator chasing why `expect_auto_repro` fired
+/// sees the original failure trail alongside the inversion notice.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExpectAutoReproSatisfied;
+
+impl std::fmt::Display for ExpectAutoReproSatisfied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "expect_auto_repro satisfied — the primary test failed and the \
+             auto-repro VM produced a shape-valid .repro.wprof.pb artifact; \
+             verdict inverted to PASS"
+        )
+    }
+}
+
+impl std::error::Error for ExpectAutoReproSatisfied {}
+
 // ---------------------------------------------------------------------------
 // Failure-message constants
 // ---------------------------------------------------------------------------
@@ -110,6 +139,122 @@ pub(crate) const ERR_GUEST_CRASHED_PREFIX: &str = "guest crashed:";
 /// skip for stats tooling but cannot meaningfully handle a
 /// sidecar-write failure beyond logging it. The skip itself is
 /// still valid; only post-run stats tooling loses visibility.
+/// Combine the conditional and unconditional `post_vm` failure
+/// signals. When both callbacks fail in the same run, surface
+/// BOTH errors in a single chained message so a debugging
+/// operator sees both regressions on the first pass — a `.or()`
+/// would silently drop the unconditional signal whenever the
+/// conditional also fired, defeating the whole point of the
+/// unconditional callback.
+pub(crate) fn combine_post_vm_errs(
+    conditional: Option<anyhow::Error>,
+    unconditional: Option<anyhow::Error>,
+) -> Option<anyhow::Error> {
+    match (conditional, unconditional) {
+        (Some(c), Some(u)) => Some(anyhow::anyhow!(
+            "post_vm: {c:#}; post_vm_unconditional: {u:#}"
+        )),
+        (Some(c), None) => Some(c),
+        (None, Some(u)) => Some(u),
+        (None, None) => None,
+    }
+}
+
+/// Invoke a `post_vm` / `post_vm_unconditional` callback with panic
+/// catch. Converts a panic to `anyhow::Error` so the panic message
+/// surfaces in the test failure output AND the rest of the
+/// post-VM teardown (`write_placeholder_failure_dump_if_missing`,
+/// `drop(vm)` releasing CPU/LLC flocks + guest memory + kernel-cache
+/// reader flock) still runs.
+///
+/// Without the catch, a panicking callback would unwind past the
+/// placeholder-dump emission and past `drop(vm)`, leaking VM
+/// resources (flocks, guest memory) until process exit or the next
+/// test's drop reclaims them. Same hazard for `Ok` returns from
+/// callbacks that subsequently panic in their inner state — both
+/// paths fold into this single guard.
+///
+/// `label` is woven into the error message so the operator sees
+/// which callback panicked (`post_vm` vs `post_vm_unconditional`)
+/// when both are wired and both fire.
+///
+/// Returns `Some(err)` when the callback returns `Err` OR panics;
+/// returns `None` when the callback returns `Ok(())`. Mirrors the
+/// shape `.err()` produces from `Result` so the caller's
+/// `.and_then(|cb| ...)` flows unchanged.
+///
+/// Under `panic = "abort"` (release builds — see `Cargo.toml
+/// [profile.release]`), `catch_unwind` is a no-op: a panic aborts
+/// the process before this function returns. The wrap is still
+/// safe — `catch_unwind` is always defined, just inert — and the
+/// debug builds get the leak protection that exposes regressions
+/// before they ship.
+/// Dispatch the entry's `post_vm` + `post_vm_unconditional`
+/// callbacks and combine their failure signals.
+///
+/// - `post_vm` runs only when the guest reported a non-Fail
+///   `AssertResult` (Skip / Inconclusive / Pass) — the
+///   `guest_already_failed` parameter folds the
+///   `parse_assert_result_from_drain` lookup the call site does.
+///   The skip mirrors the suppression contract documented on
+///   `KtstrTestEntry::post_vm`.
+///
+/// - `post_vm_unconditional` ALWAYS runs — bypasses the
+///   guest-fail suppression that gates `post_vm`. The callback
+///   owns its own skip-on-crash logic (or doesn't, when the
+///   intent is "assert on host-side artifact regardless of
+///   guest-side outcome").
+///
+/// Both callbacks route through [`invoke_post_vm_callback`] so a
+/// panic in either body becomes an `anyhow::Error` rather than
+/// unwinding past the call site (which would leak VM resources;
+/// see the helper doc).
+///
+/// Returns the combined `Option<anyhow::Error>` via
+/// [`combine_post_vm_errs`]: when both callbacks fail, the
+/// chained message names both errors so the operator sees both
+/// regressions on the first pass instead of a two-pass debug
+/// cycle. `.or()` would silently drop the unconditional fail
+/// when the conditional also fired.
+pub(crate) fn run_post_vm_callbacks(
+    entry: &KtstrTestEntry,
+    result: &crate::vmm::VmResult,
+    guest_already_failed: bool,
+) -> Option<anyhow::Error> {
+    let conditional = if guest_already_failed {
+        None
+    } else {
+        entry
+            .post_vm
+            .and_then(|cb| invoke_post_vm_callback(cb, result, "post_vm"))
+    };
+    let unconditional = entry
+        .post_vm_unconditional
+        .and_then(|cb| invoke_post_vm_callback(cb, result, "post_vm_unconditional"));
+    combine_post_vm_errs(conditional, unconditional)
+}
+
+pub(crate) fn invoke_post_vm_callback(
+    cb: super::PostVmCallback,
+    result: &crate::vmm::VmResult,
+    label: &'static str,
+) -> Option<anyhow::Error> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(result))) {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(e),
+        Err(payload) => {
+            let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "<non-string panic payload>".to_string()
+            };
+            Some(anyhow::anyhow!("{label} callback panicked: {msg}"))
+        }
+    }
+}
+
 pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry) {
     if let Err(e) = write_skip_sidecar(entry) {
         // Dual-emit at warn level: an unwritten skip sidecar costs
@@ -779,7 +924,31 @@ pub(crate) fn run_ktstr_test_inner(
         // tooling sees the same outcome.
         record_skip_sidecar(entry);
     }
-    result
+    // `expect_auto_repro = true` inversion: when the primary VM
+    // failed AND the auto-repro VM landed a shape-valid
+    // `.repro.wprof.pb`, `evaluate_vm_result` attached the
+    // [`ExpectAutoReproSatisfied`] marker to the failure chain.
+    // The dispatch path at `result_to_exit_code` consumes the
+    // marker by routing the verdict to `EXIT_PASS`, but the
+    // `#[ktstr_test]` macro emits a `#[test]` wrapper that calls
+    // `run_ktstr_test` and panics on any `Err` — it never reaches
+    // `result_to_exit_code`. Convert the marker `Err` to `Ok`
+    // here so the macro-emitted wrapper sees a pass; the
+    // diagnostic still surfaces via the `eprintln!("{e:#}")` at
+    // the dispatch arm AND via the per-test stderr capture that
+    // includes the original failure trail under
+    // `--- scheduler log ---`. Without this conversion the
+    // inversion only works for the gauntlet / `run_named_test`
+    // dispatch (which goes through `result_to_exit_code`) and
+    // silently no-ops for direct test invocation, which is the
+    // common case under nextest.
+    match result {
+        Err(e) if e.downcast_ref::<ExpectAutoReproSatisfied>().is_some() => {
+            eprintln!("{e:#}");
+            Ok(AssertResult::pass())
+        }
+        other => other,
+    }
 }
 
 /// Write a placeholder `failure-dump.json` at `path` when the file
@@ -1078,11 +1247,19 @@ fn run_ktstr_test_inner_impl(
         .merge(&entry.scheduler.assert)
         .merge(&entry.assert);
 
+    // wprof: if `#[ktstr_test(wprof)]`, attach wprof to the primary
+    // VM. Auto-repro VM gets the same treatment via probe.rs's
+    // call to the same `attach_wprof_if_requested` helper. A
+    // wprof-tagged test produces a `.wprof.pb` artifact on every
+    // run; failure to load the wprof binary bails loudly rather
+    // than silently dropping the capability.
+    builder = super::runtime::attach_wprof_if_requested(builder, entry, "primary")?;
+
     if let SchedulerSpec::KernelBuiltin { enable, disable } = &entry.scheduler.binary {
         builder = builder.sched_enable_cmds(enable);
         builder = builder.sched_disable_cmds(disable);
     }
-    if entry.scheduler.has_active_scheduling() {
+    if entry.scheduler.has_bpf_scheduler() {
         builder = builder.monitor_thresholds(merged_assert.monitor_thresholds());
     }
 
@@ -1449,6 +1626,28 @@ fn run_ktstr_test_inner_impl(
         }
     };
 
+    // Pre-VM cleanup: delete stale `.wprof.pb` artifacts from a
+    // previous run BEFORE the VM boots, so any file present in the
+    // post_vm callback MUST be fresh from THIS run. Without this,
+    // a dirty-worktree run (project_commit → "unknown") writes its
+    // artifacts into the same sidecar dir as the previous run; if
+    // THIS run's wprof chain regresses (no MsgType::WprofTrace fires
+    // → no new write), the post_vm callback reads the STALE file
+    // and reports PASS — silent regression. Same hazard for the
+    // `.repro.wprof.pb` from the auto-repro VM.
+    //
+    // Gated on `entry.wprof` (== false → no wprof attached, no
+    // artifact will be written, nothing to clean). Errors on the
+    // remove are silently ignored — `NotFound` is the expected
+    // case (first run, or post_vm cleaned up); any other I/O error
+    // is benign here because the post_vm callback will catch a
+    // missing-or-malformed file with its own diagnostic.
+    if entry.wprof {
+        let sidecar = crate::test_support::sidecar_dir();
+        let _ = std::fs::remove_file(sidecar.join(format!("{}.wprof.pb", entry.name)));
+        let _ = std::fs::remove_file(sidecar.join(format!("{}.repro.wprof.pb", entry.name)));
+    }
+
     let vm = match builder.build() {
         Ok(vm) => vm,
         Err(e) => {
@@ -1460,7 +1659,7 @@ fn run_ktstr_test_inner_impl(
             return Err(e.context("build ktstr_test VM"));
         }
     };
-    let result = match vm.run() {
+    let mut result = match vm.run() {
         Ok(r) => r,
         Err(e) => {
             if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
@@ -1471,6 +1670,16 @@ fn run_ktstr_test_inner_impl(
             return Err(e.context("run ktstr_test VM"));
         }
     };
+    // Stamp the macro-emitted test fn name onto the VmResult so
+    // post_vm callbacks can derive per-test sidecar paths via
+    // `result.wprof_pb_path()` / `result.repro_wprof_pb_path()`
+    // instead of hardcoding a fn-name literal that drifts when the
+    // test is renamed. The `entry.name` field is the `&'static str`
+    // the proc-macro emitted; `crate::vmm::VmResult::entry_name` is
+    // `Option<&'static str>` so manually-constructed fixtures bail
+    // loud when the derivation methods are called without a stamped
+    // name.
+    result.entry_name = Some(entry.name);
     // When the primary VM failed but the freeze coordinator never
     // wrote the real failure-dump (i.e. pre-attach failures:
     // send_sys_rdy timeout, VM boot failure, scheduler binary load
@@ -1489,20 +1698,23 @@ fn run_ktstr_test_inner_impl(
         write_placeholder_failure_dump_if_missing(&primary_dump_path, &result);
     }
 
-    // Run the test entry's optional host-side `post_vm` callback.
+    // Run the test entry's optional host-side post_vm callbacks
+    // — TWO independently-dispatched slots: `post_vm` (suppressed
+    // on guest-fail) and `post_vm_unconditional` (always runs).
     // The `#[ktstr_test]` scenario function (`entry.func`) runs
     // INSIDE the guest VM and cannot read host-side state — most
     // notably `VmResult.snapshot_bridge`, which the freeze
     // coordinator populates on every `Op::CaptureSnapshot` /
-    // `Op::WatchSnapshot` fire. The `post_vm` hook closes that
-    // gap: it runs on the HOST after `vm.run()` returns, with
+    // `Op::WatchSnapshot` fire. Both post_vm hooks close that
+    // gap: they run on the HOST after `vm.run()` returns, with
     // direct access to the full `VmResult`.
     //
-    // Suppression contract: skip post_vm entirely when the
-    // guest already reported a failed `AssertResult` (e.g.
-    // `sched_died_during_hold` recorded mid-step at
-    // `src/scenario/ops/mod.rs::966`). The host's typical
-    // post_vm body asserts on workload-derived state
+    // Suppression contract (applies to `post_vm` only;
+    // `post_vm_unconditional` bypasses this gate entirely): skip
+    // post_vm when the guest already reported a hard `Fail`
+    // `AssertResult` (e.g. `sched_died_during_hold` recorded
+    // mid-step at `src/scenario/ops/mod.rs::966`). The host's
+    // typical post_vm body asserts on workload-derived state
     // (`snapshot_bridge`, `periodic_fired`, …) — that state is
     // structurally missing when the scheduler died before the
     // workload reached the asserted-on phase, so the post_vm
@@ -1511,28 +1723,65 @@ fn run_ktstr_test_inner_impl(
     // scheduler crash sitting in `--- scheduler log ---`. The
     // guest-side failure already cascades through
     // `evaluate_vm_result` with the right diagnostic; running
-    // post_vm here adds noise, not signal.
+    // post_vm here adds noise, not signal. Skip and Inconclusive
+    // guest outcomes deliberately fall through to run post_vm —
+    // both leave room for the host check to add evidence the
+    // guest did not collect.
     //
-    // The callback's `Err` is threaded into `evaluate_vm_result`
-    // below so the post_vm failure (when it actually runs) flows
-    // through the SAME failure path as a guest-side fail (same
-    // `--- scheduler log ---`, `--- sched_ext dump ---`,
-    // `--- monitor ---`, `stage:` sections; same auto-repro
-    // dispatch).
-    // Guest reported a hard Fail (not Skip, not Inconclusive): the
-    // host-side post_vm callback cannot improve on a definite guest
-    // failure, so we suppress it and let the existing fail flow
-    // through. Skip and Inconclusive guest outcomes deliberately
-    // fall through to run post_vm — both leave room for the host
-    // check to add evidence the guest did not collect.
+    // `post_vm_unconditional` is for the inverse case: a
+    // host-side artifact (e.g. a `.repro.wprof.pb` written by
+    // the auto-repro VM) that exists EVEN WHEN the guest
+    // reported a fail — the operator wants the artifact-shape
+    // check regardless of the guest-side outcome. The callback
+    // owns its own skip-on-crash logic.
+    //
+    // The combined `Err` (via `combine_post_vm_errs`) is
+    // threaded into `evaluate_vm_result` below so the post_vm
+    // failure(s) flow through the SAME failure path as a
+    // guest-side fail (same `--- scheduler log ---`,
+    // `--- sched_ext dump ---`, `--- monitor ---`, `stage:`
+    // sections; same auto-repro dispatch). When BOTH callbacks
+    // fail, the combined message names both errors so a
+    // debugging operator sees both regressions on the first pass.
+    // wprof Perfetto trace pre-pass: write `.wprof.pb` BEFORE the
+    // post_vm callback fires. The full bulk-frame loop below also
+    // handles `MsgType::WprofTrace`, but it runs AFTER
+    // `run_post_vm_callbacks`, so a `post_vm` body that asserts on
+    // `result.wprof_pb_path()` (e.g. `assert_wprof_pb_landed`)
+    // would see ENOENT even when the guest successfully shipped
+    // the trace. Pre-pass writes the file from the same bulk drain
+    // the main loop later re-encounters and rewrites the same
+    // bytes to the same path — idempotent, no observable effect
+    // beyond unblocking the post_vm check.
+    if let Some(ref bulk) = result.guest_messages {
+        for bulk_entry in &bulk.entries {
+            if crate::vmm::wire::MsgType::from_wire(bulk_entry.msg_type)
+                == Some(crate::vmm::wire::MsgType::WprofTrace)
+                && bulk_entry.crc_ok
+                && !bulk_entry.payload.is_empty()
+            {
+                let wprof_path = crate::test_support::sidecar_dir()
+                    .join(format!("{}.wprof.pb", entry.name));
+                if let Err(e) = std::fs::create_dir_all(
+                    wprof_path
+                        .parent()
+                        .expect("sidecar_dir join always has parent"),
+                ) {
+                    eprintln!("ktstr_test: create sidecar dir for wprof trace: {e}");
+                } else if let Err(e) = std::fs::write(&wprof_path, &bulk_entry.payload) {
+                    eprintln!(
+                        "ktstr_test: write wprof trace to {}: {e}",
+                        wprof_path.display()
+                    );
+                }
+            }
+        }
+    }
+
     let guest_already_failed = parse_assert_result_from_drain(result.guest_messages.as_ref())
         .map(|r| r.is_fail())
         .unwrap_or(false);
-    let post_vm_err: Option<anyhow::Error> = if guest_already_failed {
-        None
-    } else {
-        entry.post_vm.and_then(|cb| cb(&result).err())
-    };
+    let post_vm_err = run_post_vm_callbacks(entry, &result, guest_already_failed);
     if post_vm_err.is_some() {
         // post_vm failure: the guest itself may have returned
         // result.success=true, but the host-side check overrules
@@ -1596,8 +1845,11 @@ fn run_ktstr_test_inner_impl(
 
     // When running with a struct_ops scheduler, check that host-side
     // BPF program enumeration found programs with non-zero verified_insns.
-    if entry.scheduler.has_active_scheduling() && result.success && result.verifier_stats.is_empty()
-    {
+    // Gated on has_bpf_scheduler (excludes KernelBuiltin) — verifier_stats
+    // are a BPF-loader artifact, so KernelBuiltin tests have legitimately
+    // empty verifier_stats and would otherwise trip this warning on every
+    // run.
+    if entry.scheduler.has_bpf_scheduler() && result.success && result.verifier_stats.is_empty() {
         eprintln!("ktstr_test: WARNING: scheduler loaded but verifier_stats is empty");
     }
 
@@ -1635,6 +1887,34 @@ fn run_ktstr_test_inner_impl(
                         && let Err(e) = write_profraw(&bulk_entry.payload)
                     {
                         eprintln!("ktstr_test: write guest profraw: {e}");
+                    }
+                }
+                Some(crate::vmm::wire::MsgType::WprofTrace) => {
+                    // wprof Perfetto trace captured during the
+                    // guest's auto-repro window. Write next to the
+                    // failure-dump JSON so the operator finds both
+                    // in the same per-test directory. NOTE: the
+                    // pre-pass above already wrote this file before
+                    // post_vm fired; this arm rewrites the same
+                    // bytes to the same path (idempotent) so that
+                    // a future bulk-drain consumer added here keeps
+                    // the WprofTrace handling colocated with the
+                    // rest of MsgType dispatch.
+                    if bulk_entry.crc_ok && !bulk_entry.payload.is_empty() {
+                        let wprof_path = crate::test_support::sidecar_dir()
+                            .join(format!("{}.wprof.pb", entry.name));
+                        if let Err(e) = std::fs::create_dir_all(
+                            wprof_path
+                                .parent()
+                                .expect("sidecar_dir join always has parent"),
+                        ) {
+                            eprintln!("ktstr_test: create sidecar dir for wprof trace: {e}");
+                        } else if let Err(e) = std::fs::write(&wprof_path, &bulk_entry.payload) {
+                            eprintln!(
+                                "ktstr_test: write wprof trace to {}: {e}",
+                                wprof_path.display()
+                            );
+                        }
                     }
                 }
                 Some(crate::vmm::wire::MsgType::Stimulus) => {
@@ -1700,7 +1980,6 @@ fn run_ktstr_test_inner_impl(
                     | crate::vmm::wire::MsgType::ScenarioPause
                     | crate::vmm::wire::MsgType::ScenarioResume
                     | crate::vmm::wire::MsgType::Stdout
-                    | crate::vmm::wire::MsgType::Stderr
                     | crate::vmm::wire::MsgType::SchedLog
                     | crate::vmm::wire::MsgType::Lifecycle
                     | crate::vmm::wire::MsgType::ExecExit
@@ -1709,6 +1988,11 @@ fn run_ktstr_test_inner_impl(
                     | crate::vmm::wire::MsgType::SnapshotReply
                     | crate::vmm::wire::MsgType::Crash,
                 ) => {}
+                Some(crate::vmm::wire::MsgType::Stderr) => {
+                    if bulk_entry.crc_ok && !bulk_entry.payload.is_empty() {
+                        eprint!("GUEST: {}", String::from_utf8_lossy(&bulk_entry.payload));
+                    }
+                }
                 // Coordinator-internal frames are stripped before
                 // they reach this loop (see the `is_coordinator_internal`
                 // filter in `collect_results`'s post-run drain plus
@@ -1830,11 +2114,76 @@ fn run_ktstr_test_inner_impl(
         &repro_fn,
         post_vm_err.as_ref(),
     );
+    // Set result.expect_auto_repro_satisfied based on the artifact-on-disk
+    // probe. Called AFTER evaluate_vm_result so the auto-repro VM has had
+    // a chance to land its .repro.wprof.pb artifact via the host's
+    // MsgType::WprofTrace dispatch arm. No-op when expect_auto_repro is
+    // unset or the test passed on its own.
+    apply_expect_auto_repro_inversion(entry, &mut result);
+    // When the helper signaled satisfaction, attach the
+    // [`ExpectAutoReproSatisfied`] marker to the failure chain so
+    // `result_to_exit_code` routes the verdict to `EXIT_PASS`
+    // without mutating the underlying `AssertResult` — the
+    // original failure detail still surfaces in stderr/dump
+    // rendering. The marker rides as `anyhow::Context` (matches
+    // the [`ScxBpfErrorMatcherMismatch`] precedent above) so
+    // `e.chain().any(|c| c.is::<...>())` at the dispatch arm
+    // walks the same chain shape.
+    let eval_result = if result.expect_auto_repro_satisfied {
+        eval_result.map_err(|e| e.context(ExpectAutoReproSatisfied))
+    } else {
+        eval_result
+    };
     eprintln!(
         "evaluate_vm_result (includes auto-repro): {:?}",
         post_vm_t.elapsed()
     );
     eval_result
+}
+
+/// Set `result.expect_auto_repro_satisfied` when the
+/// `expect_auto_repro = true` assertion is satisfied: the test
+/// failed AND a valid `.repro.wprof.pb` artifact landed on disk.
+///
+/// Called AFTER `evaluate_vm_result` returns so the artifact's
+/// presence is observable. When the field is set, the caller
+/// (`run_ktstr_test_inner_impl`) wraps any failure `Err` with the
+/// [`ExpectAutoReproSatisfied`] marker; the dispatch arm
+/// (`crate::test_support::dispatch::result_to_exit_code`)
+/// downcasts the marker and routes the verdict to `EXIT_PASS`
+/// WITHOUT mutating `result.success` or stripping the error chain
+/// (preserves diagnostic visibility — the original fail trail is
+/// available for stderr/dump rendering).
+///
+/// Uses [`crate::test_support::wprof::assert_wprof_pb_shape`] for
+/// the artifact-on-disk probe — closes the partial-write race that
+/// a bare `path.exists()` check would miss: the shape validator
+/// only signals satisfied when the file has reached its minimum
+/// shape-valid size + leading byte. A regression where wprof
+/// crashes mid-write produces a non-shape-valid artifact and the
+/// assertion correctly does NOT cause inversion.
+///
+/// No-op when `entry.expect_auto_repro = false` (preserves prior
+/// behavior — `result.expect_auto_repro_satisfied` stays `false`,
+/// the dispatch arm sees no inversion signal). No-op when
+/// `result.success = true` (test passed on its own; nothing to
+/// invert).
+pub(crate) fn apply_expect_auto_repro_inversion(
+    entry: &KtstrTestEntry,
+    result: &mut vmm::VmResult,
+) {
+    if !entry.expect_auto_repro {
+        return;
+    }
+    if result.success {
+        return;
+    }
+    let Ok(repro_path) = result.repro_wprof_pb_path() else {
+        return;
+    };
+    if crate::test_support::wprof::assert_wprof_pb_shape(&repro_path).is_ok() {
+        result.expect_auto_repro_satisfied = true;
+    }
 }
 
 /// Evaluate a VM result and produce the appropriate error or Ok.
@@ -2999,7 +3348,7 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, Resol
         }
         SchedulerSpec::Discover(name) => {
             // 1. KTSTR_SCHEDULER env var
-            if let Ok(p) = std::env::var("KTSTR_SCHEDULER") {
+            if let Ok(p) = std::env::var(crate::KTSTR_SCHEDULER_ENV) {
                 let path = PathBuf::from(&p);
                 if path.exists() {
                     return Ok((Some(path), ResolveSource::EnvVar));
@@ -3113,7 +3462,7 @@ pub fn resolve_test_kernel() -> Result<PathBuf> {
     // situation — surface it as a regular anyhow error so the
     // panic arm catches it. Skipping on a typo would silently mask
     // the bad path.
-    if let Ok(path) = std::env::var("KTSTR_TEST_KERNEL") {
+    if let Ok(path) = std::env::var(crate::KTSTR_TEST_KERNEL_ENV) {
         let p = PathBuf::from(&path);
         anyhow::ensure!(p.exists(), "KTSTR_TEST_KERNEL not found: {path}");
         return Ok(p);
@@ -3296,6 +3645,186 @@ mod tests {
     use crate::verifier::SCHED_OUTPUT_END;
     use tempfile::TempDir;
 
+    // -- combine_post_vm_errs tests --
+    //
+    // Pin the combine semantics: when both conditional and
+    // unconditional post_vm callbacks fail in the same run,
+    // both errors MUST surface in the combined message so a
+    // debugging operator sees both regressions on the first
+    // pass. A `.or()` shape would silently drop one signal,
+    // defeating the whole point of the unconditional callback.
+
+    /// Both Some → combined message names both errors with the
+    /// `post_vm:` / `post_vm_unconditional:` prefixes so the
+    /// operator can route each failure to the right callback.
+    #[test]
+    fn combine_post_vm_errs_both_fail_surfaces_both_signals() {
+        let c = anyhow::anyhow!("snapshot-bridge captured nothing");
+        let u = anyhow::anyhow!("wprof .pb missing at <path>");
+        let combined = super::combine_post_vm_errs(Some(c), Some(u))
+            .expect("both Some inputs produce Some output");
+        let rendered = format!("{combined:#}");
+        assert!(
+            rendered.contains("post_vm:"),
+            "combined message must label the conditional fail: {rendered}",
+        );
+        assert!(
+            rendered.contains("snapshot-bridge captured nothing"),
+            "conditional fail message must be preserved: {rendered}",
+        );
+        assert!(
+            rendered.contains("post_vm_unconditional:"),
+            "combined message must label the unconditional fail: {rendered}",
+        );
+        assert!(
+            rendered.contains("wprof .pb missing"),
+            "unconditional fail message must be preserved: {rendered}",
+        );
+    }
+
+    /// Conditional Some, unconditional None → return the
+    /// conditional Err unchanged (no labeling overhead when only
+    /// one signal fired).
+    #[test]
+    fn combine_post_vm_errs_only_conditional_passes_through() {
+        let c = anyhow::anyhow!("snapshot-bridge captured nothing");
+        let combined = super::combine_post_vm_errs(Some(c), None)
+            .expect("conditional Some produces Some output");
+        let rendered = format!("{combined:#}");
+        assert_eq!(rendered, "snapshot-bridge captured nothing");
+    }
+
+    /// Unconditional Some, conditional None → return the
+    /// unconditional Err unchanged. Pins that the unconditional
+    /// signal reaches the operator even when post_vm did NOT
+    /// fire (the typical case: guest passed, host-side check
+    /// failed).
+    #[test]
+    fn combine_post_vm_errs_only_unconditional_passes_through() {
+        let u = anyhow::anyhow!("wprof .pb missing at <path>");
+        let combined = super::combine_post_vm_errs(None, Some(u))
+            .expect("unconditional Some produces Some output");
+        let rendered = format!("{combined:#}");
+        assert_eq!(rendered, "wprof .pb missing at <path>");
+    }
+
+    /// Both None → None. Pins the no-op case so the dispatch
+    /// site at `run_ktstr_test_inner_impl` correctly skips the
+    /// placeholder-dump-write when neither callback fired.
+    #[test]
+    fn combine_post_vm_errs_both_none_returns_none() {
+        let combined = super::combine_post_vm_errs(None, None);
+        assert!(combined.is_none());
+    }
+
+    // -- run_post_vm_callbacks tests --
+    //
+    // Pin the dispatch semantics extracted from
+    // `run_ktstr_test_inner_impl` into a testable free function.
+    // Fn-pointer callbacks let the test assert on which slot
+    // fired (Ok / Err / panic) under each combination of
+    // `guest_already_failed` + the entry's two callback slots.
+    // A regression that broke either the guest-fail suppression
+    // contract or the `catch_unwind` panic-catch around the
+    // callbacks would surface in the tests below.
+
+    fn post_vm_ok(_result: &crate::vmm::VmResult) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn post_vm_err_conditional(_result: &crate::vmm::VmResult) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("snapshot-bridge captured nothing"))
+    }
+    fn post_vm_err_unconditional(_result: &crate::vmm::VmResult) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("wprof .pb missing at <path>"))
+    }
+    fn post_vm_panic(_result: &crate::vmm::VmResult) -> anyhow::Result<()> {
+        panic!("simulated callback panic");
+    }
+
+    /// `post_vm_unconditional` fires when guest_already_failed=true
+    /// (where `post_vm` is suppressed). Pins the contract that the
+    /// unconditional callback bypasses the guest-fail suppression
+    /// gate.
+    #[test]
+    fn run_post_vm_callbacks_unconditional_fires_on_guest_fail() {
+        let mut entry = eevdf_entry("test_unconditional_on_guest_fail");
+        entry.post_vm = Some(post_vm_err_conditional);
+        entry.post_vm_unconditional = Some(post_vm_err_unconditional);
+        let result = make_vm_result("", "", 0, false);
+        let combined =
+            super::run_post_vm_callbacks(&entry, &result, /*guest_already_failed=*/ true)
+                .expect("post_vm_unconditional must produce Some(err) when guest failed");
+        let rendered = format!("{combined:#}");
+        // post_vm suppressed: its message must NOT appear.
+        assert!(
+            !rendered.contains("snapshot-bridge captured nothing"),
+            "post_vm must be suppressed on guest-fail: {rendered}",
+        );
+        // post_vm_unconditional fired: its message MUST appear.
+        assert!(
+            rendered.contains("wprof .pb missing"),
+            "post_vm_unconditional must run on guest-fail: {rendered}",
+        );
+    }
+
+    /// `post_vm` suppressed when guest_already_failed=true AND
+    /// `post_vm_unconditional` not set → None. Pins the no-op
+    /// case so the dispatch site correctly skips the
+    /// placeholder-dump-write when only `post_vm` is wired and
+    /// the guest already failed.
+    #[test]
+    fn run_post_vm_callbacks_conditional_suppressed_on_guest_fail() {
+        let mut entry = eevdf_entry("test_conditional_suppressed_on_guest_fail");
+        entry.post_vm = Some(post_vm_err_conditional);
+        entry.post_vm_unconditional = None;
+        let result = make_vm_result("", "", 0, false);
+        let combined =
+            super::run_post_vm_callbacks(&entry, &result, /*guest_already_failed=*/ true);
+        assert!(
+            combined.is_none(),
+            "post_vm must be suppressed AND no unconditional → None: {combined:?}",
+        );
+    }
+
+    /// Both callbacks return Ok → None.
+    #[test]
+    fn run_post_vm_callbacks_both_ok_returns_none() {
+        let mut entry = eevdf_entry("test_both_ok");
+        entry.post_vm = Some(post_vm_ok);
+        entry.post_vm_unconditional = Some(post_vm_ok);
+        let result = make_vm_result("", "", 0, false);
+        let combined =
+            super::run_post_vm_callbacks(&entry, &result, /*guest_already_failed=*/ false);
+        assert!(combined.is_none(), "both Ok → None: {combined:?}");
+    }
+
+    /// `post_vm_unconditional` panic is caught and surfaced as an
+    /// error with the `post_vm_unconditional callback panicked:`
+    /// prefix. Pins the catch_unwind contract — without the wrap,
+    /// the panic would unwind past the dispatch site and leak VM
+    /// resources. The label prefix lets the operator distinguish a
+    /// conditional panic from an unconditional one when both
+    /// callbacks are wired.
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn run_post_vm_callbacks_unconditional_panic_caught() {
+        let mut entry = eevdf_entry("test_unconditional_panic");
+        entry.post_vm = None;
+        entry.post_vm_unconditional = Some(post_vm_panic);
+        let result = make_vm_result("", "", 0, false);
+        let combined = super::run_post_vm_callbacks(&entry, &result, false)
+            .expect("panicking callback must produce Some(err)");
+        let rendered = format!("{combined:#}");
+        assert!(
+            rendered.contains("post_vm_unconditional callback panicked:"),
+            "panic must carry the slot label: {rendered}",
+        );
+        assert!(
+            rendered.contains("simulated callback panic"),
+            "panic message must be preserved: {rendered}",
+        );
+    }
+
     // -- dedupe_include_files tests --
     //
     // Policy pins for the aggregator downstream of
@@ -3407,7 +3936,7 @@ mod tests {
     fn resolve_test_kernel_with_env_var() {
         let _lock = lock_env();
         let exe = crate::resolve_current_exe().unwrap();
-        let _env = EnvVarGuard::set("KTSTR_TEST_KERNEL", &exe);
+        let _env = EnvVarGuard::set(crate::KTSTR_TEST_KERNEL_ENV, &exe);
         let result = resolve_test_kernel();
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), exe);
@@ -3416,7 +3945,7 @@ mod tests {
     #[test]
     fn resolve_test_kernel_with_nonexistent_env_path() {
         let _lock = lock_env();
-        let _env = EnvVarGuard::set("KTSTR_TEST_KERNEL", "/nonexistent/kernel/path");
+        let _env = EnvVarGuard::set(crate::KTSTR_TEST_KERNEL_ENV, "/nonexistent/kernel/path");
         let result = resolve_test_kernel();
         let err = match result {
             Err(e) => e,
@@ -3445,9 +3974,9 @@ mod tests {
         let _lock = lock_env();
         // Clear every candidate env var the discovery cascade reads
         // so the standard-locations branch can't see anything.
-        let _e1 = EnvVarGuard::remove("KTSTR_TEST_KERNEL");
-        let _e2 = EnvVarGuard::remove("KTSTR_KERNEL");
-        let _e3 = EnvVarGuard::remove("KTSTR_KERNEL_LIST");
+        let _e1 = EnvVarGuard::remove(crate::KTSTR_TEST_KERNEL_ENV);
+        let _e2 = EnvVarGuard::remove(crate::KTSTR_KERNEL_ENV);
+        let _e3 = EnvVarGuard::remove(crate::KTSTR_KERNEL_LIST_ENV);
         // `find_kernel()` may still resolve from /lib/modules or a
         // local cache on the host. The test environment isn't
         // guaranteed to be empty, so we accept either outcome:
@@ -3690,7 +4219,7 @@ mod tests {
     #[test]
     fn resolve_scheduler_discover_missing() {
         let _lock = lock_env();
-        let _env = EnvVarGuard::remove("KTSTR_SCHEDULER");
+        let _env = EnvVarGuard::remove(crate::KTSTR_SCHEDULER_ENV);
         let result = resolve_scheduler(&SchedulerSpec::Discover("__nonexistent_scheduler_xyz__"));
         assert!(result.is_err());
     }
@@ -3699,7 +4228,7 @@ mod tests {
     fn resolve_scheduler_discover_via_env() {
         let _lock = lock_env();
         let exe = crate::resolve_current_exe().unwrap();
-        let _env = EnvVarGuard::set("KTSTR_SCHEDULER", &exe);
+        let _env = EnvVarGuard::set(crate::KTSTR_SCHEDULER_ENV, &exe);
         let (path, source) = resolve_scheduler(&SchedulerSpec::Discover("anything")).unwrap();
         assert_eq!(path.unwrap(), exe);
         assert_eq!(
@@ -3720,8 +4249,8 @@ mod tests {
     fn resolve_scheduler_discover_path_lookup_under_cargo_test_mode() {
         use std::os::unix::fs::PermissionsExt;
         let _lock = lock_env();
-        let _no_env = EnvVarGuard::remove("KTSTR_SCHEDULER");
-        let _cargo = EnvVarGuard::set("KTSTR_CARGO_TEST_MODE", "1");
+        let _no_env = EnvVarGuard::remove(crate::KTSTR_SCHEDULER_ENV);
+        let _cargo = EnvVarGuard::set(crate::KTSTR_CARGO_TEST_MODE_ENV, "1");
         let dir = TempDir::new().expect("tempdir");
         let bin_path = dir.path().join("__test_path_scheduler__");
         std::fs::write(&bin_path, b"#!/bin/sh\nexit 0\n").expect("write stub");
@@ -3753,8 +4282,8 @@ mod tests {
     fn resolve_scheduler_discover_path_lookup_inert_without_cargo_test_mode() {
         use std::os::unix::fs::PermissionsExt;
         let _lock = lock_env();
-        let _no_env = EnvVarGuard::remove("KTSTR_SCHEDULER");
-        let _cargo = EnvVarGuard::remove("KTSTR_CARGO_TEST_MODE");
+        let _no_env = EnvVarGuard::remove(crate::KTSTR_SCHEDULER_ENV);
+        let _cargo = EnvVarGuard::remove(crate::KTSTR_CARGO_TEST_MODE_ENV);
         let dir = TempDir::new().expect("tempdir");
         let bin_path = dir.path().join("__test_inert_path_scheduler__");
         std::fs::write(&bin_path, b"#!/bin/sh\nexit 0\n").expect("write stub");
@@ -4461,6 +4990,7 @@ mod tests {
             crate::monitor::MonitorSummary::from_samples_with_threshold(&imbalance_samples, 0);
         let result = crate::vmm::VmResult {
             success: true,
+            expect_auto_repro_satisfied: false,
             exit_code: 0,
             duration: std::time::Duration::from_secs(1),
             timed_out: false,
@@ -4493,6 +5023,7 @@ mod tests {
             periodic_fired: 0,
             periodic_target: 0,
             kern_kaslr_offset: 0,
+            entry_name: None,
         };
         let assertions = crate::assert::Assert::NO_OVERRIDES
             .max_imbalance_ratio(4.0)
@@ -4806,6 +5337,7 @@ mod tests {
         let entry = sched_entry("__eval_sched_exit_monitor__");
         let result = crate::vmm::VmResult {
             success: false,
+            expect_auto_repro_satisfied: false,
             exit_code: 1,
             duration: std::time::Duration::from_secs(1),
             timed_out: false,
@@ -4847,6 +5379,7 @@ mod tests {
             periodic_fired: 0,
             periodic_target: 0,
             kern_kaslr_offset: 0,
+            entry_name: None,
         };
         let assertions = crate::assert::Assert::NO_OVERRIDES;
         let msg = format!(
@@ -4913,6 +5446,7 @@ mod tests {
             crate::monitor::MonitorSummary::from_samples_with_threshold(&imbalance_samples, 0);
         let result = crate::vmm::VmResult {
             success: true,
+            expect_auto_repro_satisfied: false,
             exit_code: 0,
             duration: std::time::Duration::from_secs(1),
             timed_out: false,
@@ -4945,6 +5479,7 @@ mod tests {
             periodic_fired: 0,
             periodic_target: 0,
             kern_kaslr_offset: 0,
+            entry_name: None,
         };
         let assertions = crate::assert::Assert::NO_OVERRIDES
             .max_imbalance_ratio(4.0)
@@ -6380,8 +6915,8 @@ mod tests {
         );
     }
 
-    /// Reason folds the `BUG SUMMARY` extraction (per phd Finding 3
-    /// and the design intent) so the on-disk artifact matches the
+    /// Reason folds the `BUG SUMMARY` extraction (per the design
+    /// intent) so the on-disk artifact matches the
     /// stderr summary instead of being less informative. Synthesize a
     /// `result.output` carrying a `scx_bpf_error` line; the
     /// extract_bug_summary fallback path picks it up and the
@@ -6514,7 +7049,11 @@ mod tests {
         });
         let post_vm_gated = call_lines.iter().copied().find(|&i| {
             let window = lines[i.saturating_sub(20)..=i].join("\n");
-            window.contains("entry.post_vm.and_then(|cb| cb(&result).err())")
+            // The gate's PRE-binding is the `run_post_vm_callbacks(entry,
+            // &result, guest_already_failed)` call (which combines the
+            // `post_vm` and `post_vm_unconditional` dispatch + panic-catch);
+            // the gate itself is `post_vm_err.is_some()`. Match both.
+            window.contains("run_post_vm_callbacks(entry, &result, guest_already_failed)")
                 && window.contains("post_vm_err.is_some()")
         });
         let success_gated = success_gated.unwrap_or_else(|| {
@@ -6526,9 +7065,9 @@ mod tests {
         let post_vm_gated = post_vm_gated.unwrap_or_else(|| {
             panic!(
                 "no production call site is gated by both \
-                 `entry.post_vm.and_then(|cb| cb(&result).err())` (the post_vm_err \
-                 binding source) AND `post_vm_err.is_some()` (the gate); \
-                 production sites at lines: {display_lines:?}",
+                 `run_post_vm_callbacks(entry, &result, guest_already_failed)` \
+                 (the post_vm_err binding source) AND `post_vm_err.is_some()` \
+                 (the gate); production sites at lines: {display_lines:?}",
             )
         });
         // Each gate guards a distinct call site. If the same site
@@ -7004,6 +7543,223 @@ mod tests {
         assert!(
             err.to_string().contains("synthetic resolver error"),
             "error chain must preserve resolver's message, got: {err:#}"
+        );
+    }
+
+    // -- apply_expect_auto_repro_inversion tests --
+    //
+    // Pin the gate matrix for the eval-layer helper that derives
+    // `result.expect_auto_repro_satisfied`. Each test exercises one
+    // bail arm or the satisfaction arm in isolation so a regression
+    // in a single condition surfaces by name. The dispatch-side
+    // verdict flip (Err → EXIT_PASS via the `ExpectAutoReproSatisfied`
+    // marker) is exercised separately at the dispatch.rs layer.
+
+    /// Build a `KtstrTestEntry` with `expect_auto_repro = true`
+    /// bound to the scx-style `SCHED_TEST` fixture. Mirrors
+    /// `sched_entry` but flips the field under test; tests that need
+    /// `expect_auto_repro = false` use `sched_entry(...)` directly.
+    fn expect_auto_repro_entry(name: &'static str) -> KtstrTestEntry {
+        KtstrTestEntry {
+            expect_auto_repro: true,
+            ..sched_entry(name)
+        }
+    }
+
+    /// Build a `VmResult` with `success = false` and the supplied
+    /// `entry_name`. Mirrors the prod call site in
+    /// `run_ktstr_test_inner_impl` where the helper sees a failed
+    /// VM with the macro-stamped entry name.
+    fn failing_vm_result_with_name(name: &'static str) -> crate::vmm::VmResult {
+        crate::vmm::VmResult {
+            success: false,
+            entry_name: Some(name),
+            ..crate::vmm::VmResult::test_fixture()
+        }
+    }
+
+    /// Write a shape-valid `.repro.wprof.pb` artifact at
+    /// `{sidecar_dir}/{name}.repro.wprof.pb`. Mirrors what the host's
+    /// `MsgType::WprofTrace` dispatch arm would produce for a
+    /// successful auto-repro VM that captured a trace. The byte
+    /// pattern matches what `assert_wprof_pb_shape` validates:
+    /// leading `PERFETTO_TRACE_PACKETS_TAG` + size ≥
+    /// `WPROF_PB_MIN_BYTES`.
+    fn write_valid_repro_artifact(sidecar_dir: &std::path::Path, name: &str) {
+        use crate::test_support::wprof::{PERFETTO_TRACE_PACKETS_TAG, WPROF_PB_MIN_BYTES};
+        let mut bytes = vec![PERFETTO_TRACE_PACKETS_TAG];
+        bytes.resize(WPROF_PB_MIN_BYTES, 0);
+        let path = sidecar_dir.join(format!("{name}.repro.wprof.pb"));
+        std::fs::write(&path, &bytes).expect("write valid repro artifact");
+    }
+
+    /// `entry.expect_auto_repro = false` → no-op even with every
+    /// other gate satisfied. Pins the first-line early-return that
+    /// keeps non-opt-in tests on the pre-inversion verdict path.
+    #[test]
+    fn apply_expect_auto_repro_inversion_no_op_when_attr_unset() {
+        let _lock = lock_env();
+        let dir = TempDir::new().expect("tempdir");
+        let _env = EnvVarGuard::set(
+            crate::KTSTR_SIDECAR_DIR_ENV,
+            dir.path().to_str().expect("utf8 tempdir"),
+        );
+        let entry = sched_entry("attr_unset");
+        assert!(!entry.expect_auto_repro, "fixture must leave attr false");
+        write_valid_repro_artifact(dir.path(), "attr_unset");
+        let mut result = failing_vm_result_with_name("attr_unset");
+        apply_expect_auto_repro_inversion(&entry, &mut result);
+        assert!(
+            !result.expect_auto_repro_satisfied,
+            "attr-unset run must leave field false even when artifact is shape-valid"
+        );
+    }
+
+    /// `result.success = true` → no-op. The assertion only inverts
+    /// failures into passes; a test that passed on its own merits
+    /// has nothing to invert.
+    #[test]
+    fn apply_expect_auto_repro_inversion_no_op_when_success_true() {
+        let _lock = lock_env();
+        let dir = TempDir::new().expect("tempdir");
+        let _env = EnvVarGuard::set(
+            crate::KTSTR_SIDECAR_DIR_ENV,
+            dir.path().to_str().expect("utf8 tempdir"),
+        );
+        let entry = expect_auto_repro_entry("success_true");
+        write_valid_repro_artifact(dir.path(), "success_true");
+        let mut result = crate::vmm::VmResult {
+            success: true,
+            entry_name: Some("success_true"),
+            ..crate::vmm::VmResult::test_fixture()
+        };
+        apply_expect_auto_repro_inversion(&entry, &mut result);
+        assert!(
+            !result.expect_auto_repro_satisfied,
+            "success=true run must leave field false even when artifact is shape-valid"
+        );
+    }
+
+    /// `result.entry_name = None` → `repro_wprof_pb_path()` bails
+    /// and the helper exits via the `let Ok(...) else` arm without
+    /// flipping the field. Defense-in-depth against a synthesis
+    /// path that bypasses the eval-layer stamping.
+    #[test]
+    fn apply_expect_auto_repro_inversion_no_op_when_entry_name_none() {
+        let _lock = lock_env();
+        let dir = TempDir::new().expect("tempdir");
+        let _env = EnvVarGuard::set(
+            crate::KTSTR_SIDECAR_DIR_ENV,
+            dir.path().to_str().expect("utf8 tempdir"),
+        );
+        let entry = expect_auto_repro_entry("entry_name_none");
+        let mut result = crate::vmm::VmResult {
+            success: false,
+            entry_name: None,
+            ..crate::vmm::VmResult::test_fixture()
+        };
+        apply_expect_auto_repro_inversion(&entry, &mut result);
+        assert!(
+            !result.expect_auto_repro_satisfied,
+            "entry_name=None must trip the path-resolve bail and leave field false"
+        );
+    }
+
+    /// All upstream gates pass but the artifact never landed on
+    /// disk → `assert_wprof_pb_shape` returns Err on the missing
+    /// file and the helper leaves the field false. Models the
+    /// "auto-repro VM crashed before write" regression.
+    #[test]
+    fn apply_expect_auto_repro_inversion_no_op_when_artifact_missing() {
+        let _lock = lock_env();
+        let dir = TempDir::new().expect("tempdir");
+        let _env = EnvVarGuard::set(
+            crate::KTSTR_SIDECAR_DIR_ENV,
+            dir.path().to_str().expect("utf8 tempdir"),
+        );
+        let entry = expect_auto_repro_entry("artifact_missing");
+        let mut result = failing_vm_result_with_name("artifact_missing");
+        apply_expect_auto_repro_inversion(&entry, &mut result);
+        assert!(
+            !result.expect_auto_repro_satisfied,
+            "missing artifact must trip the shape-check bail and leave field false"
+        );
+    }
+
+    /// Artifact landed but is shorter than `WPROF_PB_MIN_BYTES` →
+    /// `assert_wprof_pb_shape` returns Err on the size gate. Closes
+    /// the partial-write race the bare `path.exists()` check would
+    /// have missed: wprof's `init_pb_trace` always emits ~4 KB of
+    /// interned-string table, so a truncated file means wprof
+    /// aborted mid-write.
+    #[test]
+    fn apply_expect_auto_repro_inversion_no_op_when_artifact_truncated() {
+        use crate::test_support::wprof::{PERFETTO_TRACE_PACKETS_TAG, WPROF_PB_MIN_BYTES};
+        let _lock = lock_env();
+        let dir = TempDir::new().expect("tempdir");
+        let _env = EnvVarGuard::set(
+            crate::KTSTR_SIDECAR_DIR_ENV,
+            dir.path().to_str().expect("utf8 tempdir"),
+        );
+        let entry = expect_auto_repro_entry("artifact_truncated");
+        let mut bytes = vec![PERFETTO_TRACE_PACKETS_TAG];
+        bytes.resize(WPROF_PB_MIN_BYTES - 1, 0);
+        std::fs::write(dir.path().join("artifact_truncated.repro.wprof.pb"), &bytes)
+            .expect("write truncated artifact");
+        let mut result = failing_vm_result_with_name("artifact_truncated");
+        apply_expect_auto_repro_inversion(&entry, &mut result);
+        assert!(
+            !result.expect_auto_repro_satisfied,
+            "truncated artifact must trip the size gate and leave field false"
+        );
+    }
+
+    /// Artifact landed at the right size but starts with the wrong
+    /// leading byte → `assert_wprof_pb_shape` returns Err on the tag
+    /// gate. Models a transport-corruption regression where bytes
+    /// arrived but the wire framing got mangled, OR a
+    /// wrong-format-binary regression where the auto-repro VM wrote
+    /// a non-Perfetto payload.
+    #[test]
+    fn apply_expect_auto_repro_inversion_no_op_when_artifact_wrong_tag() {
+        use crate::test_support::wprof::WPROF_PB_MIN_BYTES;
+        let _lock = lock_env();
+        let dir = TempDir::new().expect("tempdir");
+        let _env = EnvVarGuard::set(
+            crate::KTSTR_SIDECAR_DIR_ENV,
+            dir.path().to_str().expect("utf8 tempdir"),
+        );
+        let entry = expect_auto_repro_entry("artifact_wrong_tag");
+        let mut bytes = vec![0xff]; // any byte != PERFETTO_TRACE_PACKETS_TAG
+        bytes.resize(WPROF_PB_MIN_BYTES, 0);
+        std::fs::write(dir.path().join("artifact_wrong_tag.repro.wprof.pb"), &bytes)
+            .expect("write wrong-tag artifact");
+        let mut result = failing_vm_result_with_name("artifact_wrong_tag");
+        apply_expect_auto_repro_inversion(&entry, &mut result);
+        assert!(
+            !result.expect_auto_repro_satisfied,
+            "wrong-tag artifact must trip the tag gate and leave field false"
+        );
+    }
+
+    /// Every gate passes + a shape-valid artifact is on disk → the
+    /// helper sets the field to true. The single positive arm — pins
+    /// the satisfaction signal end-to-end across the gates.
+    #[test]
+    fn apply_expect_auto_repro_inversion_sets_field_on_valid_artifact() {
+        let _lock = lock_env();
+        let dir = TempDir::new().expect("tempdir");
+        let _env = EnvVarGuard::set(
+            crate::KTSTR_SIDECAR_DIR_ENV,
+            dir.path().to_str().expect("utf8 tempdir"),
+        );
+        let entry = expect_auto_repro_entry("valid_artifact");
+        write_valid_repro_artifact(dir.path(), "valid_artifact");
+        let mut result = failing_vm_result_with_name("valid_artifact");
+        apply_expect_auto_repro_inversion(&entry, &mut result);
+        assert!(
+            result.expect_auto_repro_satisfied,
+            "shape-valid artifact + every upstream gate satisfied must set field true"
         );
     }
 }

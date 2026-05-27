@@ -999,7 +999,7 @@ fn verdict_log_passes_default_off() {
     // mutate KTSTR_LOG_PASSES, and nextest serializes tests by
     // default within a binary, but a cross-binary parallel run
     // could leak. Snapshot + restore.
-    let saved = std::env::var("KTSTR_LOG_PASSES").ok();
+    let saved = std::env::var(crate::KTSTR_LOG_PASSES_ENV).ok();
     // SAFETY: std::env::set_var/remove_var became unsafe in Rust
     // 2024 because the libc environ pointer can race with
     // setenv's realloc across threads. In this binary the risk
@@ -1013,7 +1013,7 @@ fn verdict_log_passes_default_off() {
     // test and the original value is restored before the next
     // test runs.
     unsafe {
-        std::env::remove_var("KTSTR_LOG_PASSES");
+        std::env::remove_var(crate::KTSTR_LOG_PASSES_ENV);
     }
     let v = Verdict::new();
     assert!(
@@ -1024,7 +1024,7 @@ fn verdict_log_passes_default_off() {
     if let Some(prior) = saved {
         // SAFETY: same as above.
         unsafe {
-            std::env::set_var("KTSTR_LOG_PASSES", prior);
+            std::env::set_var(crate::KTSTR_LOG_PASSES_ENV, prior);
         }
     }
 }

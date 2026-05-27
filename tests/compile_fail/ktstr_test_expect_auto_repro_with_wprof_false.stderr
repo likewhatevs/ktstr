@@ -1,0 +1,7 @@
+error: expect_auto_repro = true and wprof = false are mutually exclusive — the .repro.wprof.pb artifact whose presence satisfies the expect_auto_repro assertion is written by the wprof binary attached in the auto-repro VM. Without wprof, no artifact lands and the assertion could never be satisfied. Drop one: set wprof = true (default once the test wants the trace) or drop expect_auto_repro.
+  --> tests/compile_fail/ktstr_test_expect_auto_repro_with_wprof_false.rs:10:1
+   |
+10 | #[ktstr_test(scheduler = SCHED, expect_auto_repro, wprof = false)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)

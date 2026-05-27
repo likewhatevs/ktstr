@@ -595,8 +595,8 @@ pub(super) fn write_to_tagged_path(
 ///   the operator needs to see (rendezvous timed out, etc.). Carries a
 ///   pre-built [`crate::monitor::dump::DegradedFailureDumpReport`] for
 ///   immediate emission via the
-///   [`crate::monitor::dump::SCHEMA_DEGRADED`] schema. Per memory
-///   `feedback_no_silent_drops`: the trigger fired, an operator must
+///   [`crate::monitor::dump::SCHEMA_DEGRADED`] schema. Per the
+///   no-silent-drops policy: the trigger fired, an operator must
 ///   see something — the degraded JSON IS that something.
 /// - `Self::Suppressed` — exit_kind gate decided the trigger was a
 ///   benign init / teardown write (kind &lt; SCX_EXIT_ERROR) and the
@@ -698,7 +698,7 @@ pub(super) enum FreezeMode<'a> {
 /// a silent-drop window: the freeze coordinator's closure runs on
 /// a spawned thread, and a panic anywhere in the closure body would
 /// unwind past the end-of-coord drain that flushes a held
-/// `early_snapshot` to disk. Per memory `feedback_no_silent_drops`,
+/// `early_snapshot` to disk. Per the no-silent-drops policy,
 /// every Captured early MUST reach disk regardless of how the
 /// closure exits.
 ///
@@ -839,6 +839,33 @@ impl Drop for EarlySnapshotGuard {
         // ensures the captured early reaches disk.
         self.drain_to_disk();
     }
+}
+
+/// Free-function inner of [`KtstrVm::has_bpf_scheduler_attached`]
+/// — extracted so the gating predicate can be unit-tested
+/// without constructing a full [`KtstrVm`].
+///
+/// Returns true IFF `scheduler_binary` is `Some`. The
+/// `sched_enable_cmds` parameter is intentionally accepted but
+/// IGNORED: the prior gate OR'd `!sched_enable_cmds.is_empty()`
+/// into the predicate, which falsely signalled "BPF scheduler
+/// attached" for KernelBuiltin sysctl-toggle configs. The
+/// argument stays in the signature so a future caller that
+/// wants to combine both signals (e.g. for a stats-collection
+/// gate that genuinely cares about whether sysctl writes ran)
+/// has a single canonical helper to pass through, and so the
+/// unit tests at the bottom of this file pin both axes of the
+/// truth table — the `None + non-empty cmds` regression-pin
+/// case is the one that demonstrates the fix.
+///
+/// Generic over `P: AsRef<std::path::Path>` so callers can pass
+/// `Option<&PathBuf>` or `Option<&Path>` without an extra ref
+/// dance.
+fn has_bpf_scheduler_attached_inner<P: AsRef<std::path::Path>>(
+    scheduler_binary: Option<&P>,
+    _sched_enable_cmds: &[String],
+) -> bool {
+    scheduler_binary.is_some()
 }
 
 impl KtstrVm {
@@ -4460,10 +4487,9 @@ impl KtstrVm {
                     // legitimately have shifted; ktstr's
                     // same-host freeze mask wants ZERO
                     // adjustment so the guest sees the freeze
-                    // duration as instant. See the project
-                    // CLAUDE.md "reference impl divergences"
-                    // rule for the documentation convention this
-                    // follows.
+                    // duration as instant. Follows the project's
+                    // reference-impl-divergence documentation
+                    // convention.
                     //
                     // Skip-freeze fast path (BSP exited before
                     // gate flip): no clock save needed — no vCPU
@@ -5478,7 +5504,7 @@ impl KtstrVm {
                                          quiesced memory"
                                     );
                                 } else {
-                                    // Per memory `feedback_no_silent_drops`:
+                                    // Per the no-silent-drops policy:
                                     // the trigger fired (the watchpoint hit
                                     // and/or the BPF `.bss` latch flipped),
                                     // so the operator must see something —
@@ -6090,8 +6116,8 @@ impl KtstrVm {
                                         // JSON); the timeline is still
                                         // recorded on `VmResult.monitor.samples`
                                         // for the post-run sidecar consumer.
-                                        // A future task wiring the share
-                                        // populates this with
+                                        // Wiring the share would populate
+                                        // this with
                                         // `Some(EventCounterCapture { samples })`.
                                         event_counter_capture: None,
                                         scx_walker_capture: scx_walker_capture
@@ -6498,7 +6524,7 @@ impl KtstrVm {
                     // teardown (`eprintln!` bypasses the tracing
                     // pipeline), and surface in the same captured
                     // stream the harness already monitors for panic
-                    // messages. Per `feedback_no_silent_drops`: the
+                    // messages. Per the no-silent-drops policy: the
                     // dump fires loudly even when the configured sink
                     // AND the structured log channels are both
                     // unavailable.
@@ -8183,11 +8209,10 @@ impl KtstrVm {
                             // Use `trip_phase_step_index` captured at
                             // the top of this iteration (immediately
                             // after observing the hit swap, before the
-                            // freeze+file-write window). Per
-                            // USER_RULINGS §B1: stamp from CURRENT_STEP
-                            // atomic at trip moment — NOT at bridge-
-                            // store moment, which can drift by the
-                            // freeze+IO latency.
+                            // freeze+file-write window). Stamp from
+                            // CURRENT_STEP atomic at trip moment — NOT
+                            // at bridge-store moment, which can drift
+                            // by the freeze+IO latency.
                             freeze_coord_snapshot_bridge.store_with_stats_and_step(
                                 &tag,
                                 report,
@@ -8727,8 +8752,8 @@ impl KtstrVm {
                         //                         JSON with partial
                         //                         vcpu_regs + trigger-
                         //                         state diagnostics
-                        //                         (per memory
-                        //                         `feedback_no_silent_drops`),
+                        //                         (per the
+                        //                         no-silent-drops policy),
                         //                         then mark Done + kick
                         //                         kill — retrying a
                         //                         timed-out rendezvous
@@ -11714,6 +11739,41 @@ impl KtstrVm {
         (exit_code, timed_out)
     }
 
+    /// Whether the run has a real BPF `struct_ops` scheduler
+    /// attached. Returns true ONLY when `scheduler_binary` is
+    /// `Some` — those are the variants that load a userspace
+    /// BPF program and call `bpf_program__attach_struct_ops`
+    /// (which is what creates `bpf_prog` entries that
+    /// [`collect_verifier_stats`](Self::collect_verifier_stats)
+    /// walks at cleanup time).
+    ///
+    /// Returns true for `SchedulerSpec::Discover(name)` and
+    /// `SchedulerSpec::Path(p)` — both resolve to a
+    /// `scheduler_binary(path)` builder call at
+    /// `src/vmm/builder.rs:scheduler_binary` (which sets
+    /// `self.scheduler_binary = Some(path)`). Returns false
+    /// for `SchedulerSpec::Eevdf` (no scheduler program —
+    /// kernel default; builder never calls
+    /// `scheduler_binary`) and ALSO false for
+    /// `SchedulerSpec::KernelBuiltin { enable, disable }`
+    /// (same — its `sched_enable_cmds` are arbitrary
+    /// `echo X > /sys/...` shell writes wired into a
+    /// separate builder field, sysctl-style toggles around
+    /// kernel-builtin schedulers, that load zero BPF
+    /// programs). A `verifier_stats` walk against an
+    /// Eevdf-or-KernelBuiltin-only run returns an empty Vec
+    /// by construction, so the cost-vs-signal tradeoff
+    /// favors skipping the walk entirely.
+    ///
+    /// Sibling to the inline check at `stats_client`
+    /// construction (~L1126) which uses `self.scheduler_binary.
+    /// is_some()` directly — both gates ask the same
+    /// "is there a userspace BPF binary attached" question
+    /// and share the same answer.
+    fn has_bpf_scheduler_attached(&self) -> bool {
+        has_bpf_scheduler_attached_inner(self.scheduler_binary.as_ref(), &self.sched_enable_cmds)
+    }
+
     /// Shutdown threads and collect output.
     pub(super) fn collect_results(&self, start: Instant, run: VmRunState) -> Result<VmResult> {
         // Whole-cleanup timer for the perf-repro tracing pipeline.
@@ -12031,13 +12091,25 @@ impl KtstrVm {
             crate::test_support::extract_panic_message(&app_output).map(|s| s.to_string());
 
         // Collect BPF verifier stats from host-side memory reads.
-        // Skip when no scheduler is active — struct_ops programs
-        // only exist when a sched_ext scheduler attached (either via
-        // a userspace binary or kernel-built enable commands).
-        let has_scheduler = self.scheduler_binary.is_some() || !self.sched_enable_cmds.is_empty();
+        // Skip when no BPF struct_ops scheduler is attached —
+        // verifier_stats walks the kernel's `bpf_prog` table looking
+        // for struct_ops progs, and those only exist when a sched_ext
+        // BPF binary was loaded and `bpf_program__attach_struct_ops`
+        // succeeded. The userspace binary is the only path that
+        // creates struct_ops; KernelBuiltin's `sched_enable_cmds`
+        // are arbitrary `echo X > /sys/...` writes (sysctl-style
+        // toggles around kernel-builtin schedulers like EEVDF) and
+        // load zero BPF programs, so the previous gate that OR'd in
+        // `!self.sched_enable_cmds.is_empty()` falsely signalled
+        // "scheduler attached" for KernelBuiltin shell-toggle
+        // configs — the walk found nothing (correct) but spent the
+        // syscall + accessor cost, and a downstream `verifier_stats.
+        // is_empty()` assertion couldn't distinguish "correctly
+        // skipped (no BPF)" from "BPF binary failed to attach".
+        let has_bpf_scheduler = self.has_bpf_scheduler_attached();
         let vs_t = std::time::Instant::now();
         let mut vs_path: &'static str = "skipped_no_scheduler";
-        let verifier_stats = if has_scheduler {
+        let verifier_stats = if has_bpf_scheduler {
             if let Some(ref prog) = run.prog_accessor {
                 use crate::monitor::bpf_prog::BpfProgAccessor;
                 vs_path = "prebuilt_accessor";
@@ -12094,6 +12166,11 @@ impl KtstrVm {
 
         Ok(VmResult {
             success: !timed_out && exit_code == 0,
+            // Default false at construction — set true (when applicable)
+            // by the eval-layer inversion site that runs AFTER
+            // evaluate_vm_result, preserving the original success +
+            // error chain for diagnostic visibility.
+            expect_auto_repro_satisfied: false,
             exit_code,
             duration: start.elapsed(),
             timed_out,
@@ -12138,6 +12215,15 @@ impl KtstrVm {
             // read this to assert the KASLR derivation chain
             // produced a non-zero offset on KASLR-on boots.
             kern_kaslr_offset: run.kern_kaslr_offset,
+            // `entry_name` is stamped post-construction in
+            // `test_support::eval::run_ktstr_test_inner_impl`
+            // immediately after `vm.run()` returns (the
+            // `KtstrTestEntry::name` `&'static str` is not in
+            // scope here in `freeze_coord::collect_results` and
+            // shouldn't be — freeze_coord is entry-agnostic).
+            // Leaving it `None` here is correct; the eval-layer
+            // stamping happens before any post_vm callback runs.
+            entry_name: None,
         })
     }
 
@@ -12255,6 +12341,110 @@ impl KtstrVm {
         // dispatches statically.
         use monitor::bpf_prog::BpfProgAccessor;
         accessor.struct_ops_progs()
+    }
+}
+
+#[cfg(test)]
+mod has_bpf_scheduler_attached_tests {
+    //! 4-case truth table for [`has_bpf_scheduler_attached_inner`]
+    //! — the verifier_stats gating predicate. The matrix covers
+    //! every cross-product of `(scheduler_binary, sched_enable_cmds)`
+    //! so a future regression that re-introduces the
+    //! `|| !sched_enable_cmds.is_empty()` clause surfaces here as
+    //! the `binary=None, cmds=non-empty` test flipping from `false`
+    //! to `true`.
+    //!
+    //! The KernelBuiltin false-pass class lived precisely in
+    //! the `binary=None, cmds=non-empty` cell — KernelBuiltin tests
+    //! never set a scheduler binary (they're shell-toggle wrappers
+    //! around kernel-builtin EEVDF/CFS) but DO set enable cmds
+    //! (sysctl-style `echo X > /sys/...` writes). Pre-fix: the gate
+    //! evaluated true and verifier_stats walked the BPF prog table
+    //! for nothing; a downstream `verifier_stats.is_empty()`
+    //! assertion couldn't distinguish "correctly skipped (no BPF)"
+    //! from "BPF binary failed to attach." Post-fix: the gate
+    //! evaluates false, verifier_stats stays an empty Vec by
+    //! construction, and the assertion semantics align with the
+    //! actual kernel state.
+
+    use super::has_bpf_scheduler_attached_inner;
+    use std::path::PathBuf;
+
+    /// BPF binary present, no sysctl enable cmds: the canonical
+    /// `Discover("scx-foo")` / `Path("/usr/local/bin/scx-foo")`
+    /// shape. The gate fires, verifier_stats collection runs.
+    #[test]
+    fn binary_some_cmds_empty_returns_true() {
+        let binary = PathBuf::from("/path/to/scx-foo");
+        let cmds: Vec<String> = Vec::new();
+        assert!(
+            has_bpf_scheduler_attached_inner(Some(&binary), &cmds),
+            "Discover/Path with no enable cmds must gate verifier_stats on"
+        );
+    }
+
+    /// BPF binary present AND sysctl enable cmds set: the rare
+    /// shape where a Discover/Path scheduler ALSO ships
+    /// `sched_enable_cmds` (e.g. to twiddle a sysctl before
+    /// attaching the BPF program). BPF wins — verifier_stats
+    /// collection runs, exactly the same as the binary-only case.
+    #[test]
+    fn binary_some_cmds_non_empty_returns_true() {
+        let binary = PathBuf::from("/path/to/scx-foo");
+        let cmds: Vec<String> = vec!["echo 1 > /sys/kernel/foo".into()];
+        assert!(
+            has_bpf_scheduler_attached_inner(Some(&binary), &cmds),
+            "BPF binary present must gate verifier_stats on regardless of \
+             enable cmds; the `enable cmds` arg is intentionally ignored \
+             once the binary signal flips true"
+        );
+    }
+
+    /// No BPF binary, no sysctl enable cmds: the `SchedulerSpec::
+    /// Eevdf` shape (kernel default scheduler, no scheduler-author
+    /// involvement). Gate stays off, verifier_stats skipped.
+    #[test]
+    fn binary_none_cmds_empty_returns_false() {
+        let binary: Option<&PathBuf> = None;
+        let cmds: Vec<String> = Vec::new();
+        assert!(
+            !has_bpf_scheduler_attached_inner(binary, &cmds),
+            "Eevdf default scheduler (no binary, no cmds) must NOT gate \
+             verifier_stats — there's no BPF prog table to walk"
+        );
+    }
+
+    /// **REGRESSION PIN**: no BPF binary BUT sysctl enable cmds
+    /// non-empty. The `SchedulerSpec::KernelBuiltin { enable: [..],
+    /// disable: [..] }` shape — shell-toggle wrappers around
+    /// kernel-builtin schedulers (EEVDF, CFS) where the test's
+    /// only customization is sysctl-style writes. Pre-fix, the
+    /// `||` clause on `!sched_enable_cmds.is_empty()` fired this
+    /// case `true`, walked the BPF prog table for nothing, and
+    /// masked downstream `verifier_stats.is_empty()` assertions.
+    /// Post-fix, the predicate ignores the cmds and returns
+    /// `false` — verifier_stats stays empty by construction.
+    ///
+    /// A regression that re-introduces the OR-clause flips this
+    /// assertion to `true`. Don't suppress; investigate the
+    /// caller-driven reason and either update the comment +
+    /// predicate together OR fix the regressing change.
+    #[test]
+    fn binary_none_cmds_non_empty_returns_false_regression_pin() {
+        let binary: Option<&PathBuf> = None;
+        let cmds: Vec<String> = vec![
+            "echo Y > /sys/kernel/sched/foo".into(),
+            "echo bar > /proc/sys/kernel/baz".into(),
+        ];
+        assert!(
+            !has_bpf_scheduler_attached_inner(binary, &cmds),
+            "KernelBuiltin (sysctl-toggle, no BPF binary) must NOT gate \
+             verifier_stats on — enable cmds don't load BPF programs. \
+             A regression flipping this to `true` likely re-introduced \
+             the `|| !sched_enable_cmds.is_empty()` clause at the \
+             collect_results predicate; that OR clause was the \
+             false-pass introduction this fix removed"
+        );
     }
 }
 

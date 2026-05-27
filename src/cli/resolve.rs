@@ -1384,7 +1384,7 @@ mod tests {
         let _lock = crate::test_support::test_helpers::lock_env();
         let cache_tmp = tempfile::TempDir::new().expect("cache tempdir");
         let _cache_env = crate::test_support::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
+            crate::KTSTR_CACHE_DIR_ENV,
             cache_tmp.path(),
         );
         let src_tmp = tempfile::TempDir::new().expect("src tempdir");
@@ -1445,11 +1445,13 @@ mod tests {
         let _lock = crate::test_support::test_helpers::lock_env();
         let cache_tmp = tempfile::TempDir::new().expect("cache tempdir");
         let _cache_env = crate::test_support::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
+            crate::KTSTR_CACHE_DIR_ENV,
             cache_tmp.path(),
         );
-        let _bypass_env =
-            crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_BYPASS_LLC_LOCKS", "1");
+        let _bypass_env = crate::test_support::test_helpers::EnvVarGuard::set(
+            crate::KTSTR_BYPASS_LLC_LOCKS_ENV,
+            "1",
+        );
         let src_tmp = tempfile::TempDir::new().expect("src tempdir");
         init_repo_with_commit_for_resolve_test(src_tmp.path());
 
@@ -1507,11 +1509,13 @@ mod tests {
         let _lock = crate::test_support::test_helpers::lock_env();
         let cache_tmp = tempfile::TempDir::new().expect("cache tempdir");
         let _cache_env = crate::test_support::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
+            crate::KTSTR_CACHE_DIR_ENV,
             cache_tmp.path(),
         );
-        let _bypass_env =
-            crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_BYPASS_LLC_LOCKS", "1");
+        let _bypass_env = crate::test_support::test_helpers::EnvVarGuard::set(
+            crate::KTSTR_BYPASS_LLC_LOCKS_ENV,
+            "1",
+        );
         let src_tmp = tempfile::TempDir::new().expect("src tempdir");
         init_repo_with_commit_for_resolve_test(src_tmp.path());
 

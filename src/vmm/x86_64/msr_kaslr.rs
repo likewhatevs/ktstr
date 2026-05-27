@@ -95,10 +95,10 @@
 //! holds the KVM-seeded 0). Reading from BSP avoids the race.
 
 // Consumers of these helpers (KASLR wire-in into freeze_coord and
-// dump paths) land in follow-up commits. Until those land the
-// virt-KASLR primitive items look unused in non-test builds, so
-// suppress dead-code warnings at module scope — the unit tests
-// below DO exercise every fn.
+// dump paths) are not yet wired up, so the virt-KASLR primitive
+// items look unused in non-test builds; suppress dead-code
+// warnings at module scope — the unit tests below DO exercise
+// every fn.
 #![allow(dead_code)]
 
 use anyhow::Result;

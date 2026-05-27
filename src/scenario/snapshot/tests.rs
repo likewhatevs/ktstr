@@ -2029,8 +2029,8 @@ fn snapshot_bridge_store_with_stats_and_step_round_trips() {
 /// Legacy unstamped `store_with_stats` path drains with
 /// `step_index = None` — fixtures and tests that do not care about
 /// phase attribution still drain cleanly. Pins the
-/// None-for-legacy contract (USER_RULINGS §B1 lets non-stamped
-/// paths surface as None rather than collapse to BASELINE).
+/// None-for-legacy contract (non-stamped paths surface as None
+/// rather than collapse to BASELINE).
 #[test]
 fn snapshot_bridge_drain_ordered_with_stats_step_index_none_for_legacy_store() {
     let cb: CaptureCallback = Arc::new(|_| None);

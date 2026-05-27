@@ -20,6 +20,60 @@ use crate::workload::WorkerReport;
 
 use super::WorkPhase;
 
+/// Function-pointer wrapper for the
+/// [`WorkType::Custom`] variant's `run` field.
+///
+/// Wrapping the fn pointer in a newtype lets [`WorkType`]
+/// `#[derive(PartialEq)]` succeed — bare `fn` pointers do not
+/// implement [`PartialEq`], so the enum derive would otherwise
+/// fail. The manual [`PartialEq`] impl below compares function
+/// addresses via [`std::ptr::fn_addr_eq`] (stable since Rust
+/// 1.85.0), the canonical address-comparison primitive for fn
+/// pointers: per its rustdoc, address equality is sufficient to
+/// conclude that calling both functions is equivalent.
+///
+/// # Caveat: address equality is one-direction-only
+///
+/// `fn_addr_eq` may return `false` even for two `CustomFn`
+/// wrapping the SAME fn item — fn-item-to-fn-pointer coercion
+/// can yield distinct addresses for the same item across multiple
+/// coercion sites (rustc + LLVM linker behavior; cross-crate
+/// references especially). Two `CustomFn`s comparing equal IS a
+/// reliable "calls the same function" signal; comparing unequal
+/// is NOT a reliable "calls a different function" signal. Tests
+/// that rely on `assert_eq!(custom_a, custom_b)` between separate
+/// coercion sites may flake — prefer comparing the variant name
+/// (the `WorkType::Custom { name, .. }` field) when test intent
+/// is "same logical custom workload."
+///
+/// `Copy` + `Clone` mirror the underlying `fn` pointer (`fn`
+/// pointers are `Copy`); `Debug` formats the address. No
+/// `serde` derives — the parent [`WorkType::Custom`] variant
+/// carries `#[serde(skip)]` because a `fn` pointer has no
+/// portable wire format.
+#[derive(Copy, Clone, Debug)]
+pub struct CustomFn(pub fn(&AtomicBool) -> WorkerReport);
+
+impl CustomFn {
+    /// Invoke the wrapped work function with the worker's stop
+    /// flag. Used by the worker dispatch arm
+    /// (`src/workload/worker/mod.rs`) so call sites do not have
+    /// to pierce the newtype with `.0` syntax.
+    #[inline]
+    pub fn call(&self, stop: &AtomicBool) -> WorkerReport {
+        (self.0)(stop)
+    }
+}
+
+impl PartialEq for CustomFn {
+    fn eq(&self, other: &Self) -> bool {
+        // `fn_addr_eq` compares the underlying function
+        // addresses — the only meaningful equality semantic for
+        // fn pointers. See type-level doc for rationale.
+        std::ptr::fn_addr_eq(self.0, other.0)
+    }
+}
+
 /// What each worker process does during a scenario.
 ///
 /// Different work types exercise different scheduler code paths:
@@ -85,7 +139,7 @@ use super::WorkPhase;
 /// at compile time from the enum arm names, which this module
 /// re-exposes as [`WorkType::ALL_NAMES`] so a new variant is picked
 /// up automatically without editing a parallel list.
-#[derive(Debug, Clone, strum::VariantNames, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, strum::VariantNames, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 // `#[serde(bound(...))]` overrides the auto-derived lifetime bound. The
 // `Custom` variant is `#[serde(skip)]` (it carries a non-portable `fn`
@@ -327,11 +381,19 @@ pub enum WorkType {
     /// `cargo ktstr export`) must use a built-in variant. Test
     /// authors who want a custom worker should keep `WorkType::Custom`
     /// inline in the test body and not roundtrip the config.
+    ///
+    /// # Construction
+    ///
+    /// Prefer the [`WorkType::custom`] constructor — it takes a
+    /// bare `fn` pointer and transparently wraps it in [`CustomFn`]:
+    /// `WorkType::custom("my_workload", my_fn)`. Struct-literal
+    /// construction requires the wrap explicitly: `WorkType::Custom
+    /// { name: "my_workload".into(), run: CustomFn(my_fn) }`. The
+    /// constructor path is the supported user-facing API; the
+    /// struct-literal form exists for test-internal construction
+    /// where the call site already deals with the newtype directly.
     #[serde(skip)]
-    Custom {
-        name: String,
-        run: fn(&AtomicBool) -> WorkerReport,
-    },
+    Custom { name: String, run: CustomFn },
     /// One waker, N waiters on a SINGLE global futex word, repeated
     /// in batches with a sleep gap. Distinct from
     /// [`FutexFanOut`](Self::FutexFanOut) which uses one futex per

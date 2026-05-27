@@ -3615,7 +3615,7 @@ fn cast_exit() -> BpfInsn {
 /// One-shot helper: emit `BPF_ADDR_SPACE_CAST` (ALU64 | MOV | X
 /// with `off=1`). The analyzer treats `imm=1` as the as(1)→as(0)
 /// cast (arena→kernel), which adds the source's `(struct,
-/// field_offset)` to `arena_confirmed` — the F1 mitigation
+/// field_offset)` to `arena_confirmed` — the arena-evidence
 /// prerequisite for shape-inference findings.
 fn cast_addr_space_cast(dst: u8, src: u8, imm: i32) -> BpfInsn {
     use libbpf_rs::libbpf_sys as bs;
@@ -3692,7 +3692,7 @@ fn cast_pipeline_analyzer_output_drives_renderer_intercept() {
 
     // BPF program:
     //   r2 = *(u64 *)(r1 + 8)   ; load T.f → r2 = LoadedU64Field{T, 8}
-    //   r2 = arena_cast(r2)     ; arena_confirmed evidence (F1)
+    //   r2 = arena_cast(r2)     ; arena_confirmed evidence (arena evidence)
     //   r3 = *(u64 *)(r2 + 0)   ; deref @0 records access (0, 8) under (T, 8)
     //   exit
     let insns = vec![
@@ -3868,7 +3868,7 @@ fn cast_pipeline_modifier_chain_renderer_peels_to_analyzer_struct_id() {
     // index skips them). InitialReg seeds with the typedef wrapper
     // to verify the analyzer's `resolve_to_struct_id` peels through
     // the same chain the renderer does.
-    // F1 mitigation: include arena_space_cast on r2 to
+    // arena-evidence mitigation: include arena_space_cast on r2 to
     // populate arena_confirmed for (T, 8) so the shape-inference
     // finding emits.
     let insns = vec![
@@ -7891,7 +7891,7 @@ fn cast_chase_arena_target_type_id_zero_no_bridge_entry_skips() {
     );
 }
 
-/// G6.1: Dedup short-circuit. When `is_already_rendered` returns
+/// Dedup short-circuit. When `is_already_rendered` returns
 /// true for the chased arena address, `chase_arena_pointer`
 /// surfaces a `Ptr` with `deref: None` and the
 /// `"already rendered in sdt_allocations"` skip reason — no
@@ -7978,7 +7978,7 @@ fn cast_chase_already_rendered_short_circuits() {
     );
 }
 
-/// G6.2: Dedup with miss falls through to normal chase. An
+/// Dedup with miss falls through to normal chase. An
 /// address NOT in `rendered_slot_addrs` proceeds with the
 /// existing chase pipeline (bridge query, peel, read, render).
 /// Pins that the dedup gate is per-address and does not blank
@@ -8051,7 +8051,7 @@ fn cast_chase_already_rendered_miss_proceeds_with_normal_chase() {
     );
 }
 
-/// G6.3: Default `is_already_rendered` returns false. Readers
+/// Default `is_already_rendered` returns false. Readers
 /// without a rendered-slot index (the trait default impl)
 /// proceed with the chase — pins the no-regression case for
 /// every existing renderer that doesn't wire the dedup set.

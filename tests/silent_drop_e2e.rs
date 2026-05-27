@@ -63,13 +63,12 @@
 //!   flag drives it.
 //! - The rendezvous-timeout Degraded emit fires only when the vCPU
 //!   rendezvous misses its `FREEZE_RENDEZVOUS_TIMEOUT`. The
-//!   `KtstrVmBuilder::rendezvous_timeout` setter unlocks this; the
-//!   consumer scenario is tracked separately.
+//!   `KtstrVmBuilder::rendezvous_timeout` setter unlocks this; no
+//!   consumer scenario is covered here.
 
 mod common;
 
 use anyhow::Result;
-use common::dump_paths::failure_dump_path;
 use ktstr::assert::AssertResult;
 use ktstr::prelude::SCHEMA_SINGLE;
 use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
@@ -110,8 +109,10 @@ fn snapshot_sibling_files(test_name: &str) -> Vec<std::path::PathBuf> {
 fn scenario_watchdog_stall_captured_emit_schema(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
-    let test_name = "silent_drop_watchdog_stall_captured_schema";
-    let dump_path = failure_dump_path(test_name);
+    let test_name = ctx
+        .entry_name
+        .ok_or_else(|| anyhow::anyhow!("dispatch must stamp Ctx.entry_name"))?;
+    let dump_path = ctx.failure_dump_path()?;
 
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
@@ -162,8 +163,10 @@ fn scenario_watchdog_stall_captured_emit_schema(
 }
 
 fn scenario_clean_exit_gate_suppresses_dump(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
-    let test_name = "silent_drop_clean_exit_gate_suppression";
-    let dump_path = failure_dump_path(test_name);
+    let test_name = ctx
+        .entry_name
+        .ok_or_else(|| anyhow::anyhow!("dispatch must stamp Ctx.entry_name"))?;
+    let dump_path = ctx.failure_dump_path()?;
 
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
@@ -195,8 +198,10 @@ fn scenario_clean_exit_gate_suppresses_dump(ctx: &ktstr::scenario::Ctx) -> Resul
 fn scenario_watchdog_stall_dump_populates_vcpu_regs_and_maps(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
-    let test_name = "silent_drop_watchdog_stall_captured_content";
-    let dump_path = failure_dump_path(test_name);
+    let test_name = ctx
+        .entry_name
+        .ok_or_else(|| anyhow::anyhow!("dispatch must stamp Ctx.entry_name"))?;
+    let dump_path = ctx.failure_dump_path()?;
 
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
@@ -349,8 +354,10 @@ fn scenario_translate_none_with_latch_idle_suppresses_dump(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
     let _guard = FreezeCoordTestSeamGuard::set(true, false);
-    let test_name = "silent_drop_translate_none_with_latch_idle";
-    let dump_path = failure_dump_path(test_name);
+    let test_name = ctx
+        .entry_name
+        .ok_or_else(|| anyhow::anyhow!("dispatch must stamp Ctx.entry_name"))?;
+    let dump_path = ctx.failure_dump_path()?;
 
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
@@ -396,8 +403,10 @@ fn scenario_translate_none_with_latch_triggered_emits_dump(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
     let _guard = FreezeCoordTestSeamGuard::set(true, true);
-    let test_name = "silent_drop_translate_none_with_latch_triggered";
-    let dump_path = failure_dump_path(test_name);
+    let test_name = ctx
+        .entry_name
+        .ok_or_else(|| anyhow::anyhow!("dispatch must stamp Ctx.entry_name"))?;
+    let dump_path = ctx.failure_dump_path()?;
 
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),

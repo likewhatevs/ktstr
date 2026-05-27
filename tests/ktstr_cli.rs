@@ -293,7 +293,7 @@ fn kernel_list_runs() {
     // kernels" hint on stdout.
     let tmp = tempfile::TempDir::new().unwrap();
     ktstr()
-        .env("KTSTR_CACHE_DIR", tmp.path())
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
         .args(["kernel", "list"])
         .assert()
         .success()
@@ -415,7 +415,7 @@ fn build_legend_fixture_cache() -> tempfile::TempDir {
 fn kernel_list_legends_emit_on_stderr() {
     let cache = build_legend_fixture_cache();
     let out = ktstr()
-        .env("KTSTR_CACHE_DIR", cache.path())
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, cache.path())
         .args(["kernel", "list"])
         .assert()
         .success()
@@ -466,7 +466,7 @@ fn kernel_list_legends_emit_on_stderr() {
 fn kernel_list_legend_ordering_pins_untracked_stale_corrupt() {
     let cache = build_legend_fixture_cache();
     let out = ktstr()
-        .env("KTSTR_CACHE_DIR", cache.path())
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, cache.path())
         .args(["kernel", "list"])
         .assert()
         .success()
@@ -533,8 +533,8 @@ fn kernel_list_legend_ordering_pins_untracked_stale_corrupt() {
 fn ktstr_shell_cpu_cap_with_bypass_errors() {
     let tmp = tempfile::TempDir::new().unwrap();
     ktstr()
-        .env("KTSTR_CACHE_DIR", tmp.path())
-        .env("KTSTR_BYPASS_LLC_LOCKS", "1")
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .env(ktstr::KTSTR_BYPASS_LLC_LOCKS_ENV, "1")
         .args(["shell", "--no-perf-mode", "--cpu-cap", "2"])
         .assert()
         .failure()
@@ -548,8 +548,8 @@ fn ktstr_shell_cpu_cap_with_bypass_errors() {
 fn ktstr_kernel_build_cpu_cap_with_bypass_errors() {
     let tmp = tempfile::TempDir::new().unwrap();
     ktstr()
-        .env("KTSTR_CACHE_DIR", tmp.path())
-        .env("KTSTR_BYPASS_LLC_LOCKS", "1")
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .env(ktstr::KTSTR_BYPASS_LLC_LOCKS_ENV, "1")
         .args([
             "kernel",
             "build",
@@ -576,9 +576,9 @@ fn ktstr_kernel_build_cpu_cap_with_bypass_errors() {
 fn ktstr_library_cpu_cap_env_with_bypass_errors() {
     let tmp = tempfile::TempDir::new().unwrap();
     ktstr()
-        .env("KTSTR_CACHE_DIR", tmp.path())
-        .env("KTSTR_CPU_CAP", "2")
-        .env("KTSTR_BYPASS_LLC_LOCKS", "1")
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .env(ktstr::KTSTR_CPU_CAP_ENV, "2")
+        .env(ktstr::KTSTR_BYPASS_LLC_LOCKS_ENV, "1")
         .args(["shell", "--no-perf-mode"])
         .assert()
         .failure()

@@ -592,7 +592,7 @@ pub fn collect_verifier_output(
 
     let sched_args: Vec<String> = extra_sched_args.to_vec();
 
-    let no_perf_mode = std::env::var("KTSTR_NO_PERF_MODE").is_ok();
+    let no_perf_mode = crate::test_support::runtime::no_perf_mode_active();
     // Pass the validated Topology directly so misorder cannot occur
     // at the builder boundary (the TryFrom above already enforces the
     // type-level invariants).

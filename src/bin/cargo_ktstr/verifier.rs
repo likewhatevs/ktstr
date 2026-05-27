@@ -61,6 +61,10 @@ pub(crate) fn run_verifier(kernel: Vec<String>, raw: bool) -> Result<(), String>
     cmd.env(ktstr::KTSTR_KERNEL_ENV, &resolved[0].1);
     let encoded = encode_kernel_list(&resolved)?;
     cmd.env(ktstr::KTSTR_KERNEL_LIST_ENV, encoded);
+    // Mark this test invocation as cargo-ktstr-orchestrated so
+    // VM-boot tests can skip when run under raw nextest. Mirrors
+    // the `cargo ktstr test` dispatcher in run_cargo.rs.
+    cmd.env(ktstr::KTSTR_ORCHESTRATED_ENV, "1");
     let kernel_count = resolved.len();
 
     eprintln!(

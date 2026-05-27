@@ -945,7 +945,7 @@ fn fudge_n_to_one_merge_sums_sum_metrics() {
 /// (NOT sum). Fudge two candidate cgroups whose Max metric
 /// values are 80 and 50 against one baseline whose Max is
 /// 30 — the merged candidate-side Max must be 80 (max),
-/// not 130 (sum). Pins the F1 fix.
+/// not 130 (sum). Pins the max-of-maxes merge fix.
 #[test]
 fn fudge_n_to_one_merge_max_of_maxes_for_max_metrics() {
     let threads_a = fudge_threads_with("/svc", 10, |t| {
@@ -1007,7 +1007,7 @@ fn fudge_n_to_one_merge_unions_ordinal_range() {
 /// P1: N:1 merge unions Aggregated::Affinity cpusets. Two
 /// candidates with different uniform cpusets merge to a
 /// non-uniform Affinity whose min_cpus / max_cpus span
-/// both. Pins the F3 (Affinity merge arm) fix.
+/// both. Pins the Affinity merge arm fix.
 #[test]
 fn fudge_n_to_one_merge_unions_affinity() {
     let threads_a = fudge_threads_with("/svc", 10, |t| {

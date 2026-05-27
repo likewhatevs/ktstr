@@ -115,7 +115,12 @@ fn cleanup_recursive_removes_nested_dirs_depth_first() {
     fs::create_dir_all(root.join("sibling")).unwrap();
     assert!(root.join("mid/leaf").exists());
     assert!(root.join("sibling").exists());
-    cleanup_recursive(&root);
+    // walk_root is the tmpdir base: every cgroup.procs in this
+    // tree is empty (no pids to drain), so the exact path the
+    // dst points at does not matter for the depth-first removal
+    // assertion. Pass the base so the API contract (walk_root
+    // is the writable cgroup root) is honored.
+    cleanup_recursive(&root, base);
     assert!(
         !root.exists(),
         "cleanup_recursive should remove root and every descendant",
@@ -268,6 +273,146 @@ fn move_tasks_partial_failure() {
 }
 
 #[test]
+fn move_tasks_empty_pids_returns_ok() {
+    // An empty pids slice is the documented "no move requested"
+    // form — must return Ok cleanly (no all-vanished bail). Pins
+    // the explicit empty-slice exemption in `move_tasks` so a
+    // future caller that legitimately passes 0 pids (e.g.
+    // post-Drop teardown sweep, lifecycle no-op) gets the
+    // documented Ok path. Without this exemption, a future
+    // regression that tightened the all-vanished bail to "any
+    // empty slice bails" would mask the legitimate no-op
+    // pattern; this test pins the explicit boundary.
+    let cg = CgroupManager::new("/nonexistent/ktstr-empty");
+    assert!(
+        cg.move_tasks("cg", &[]).is_ok(),
+        "move_tasks with empty pids slice must succeed without \
+         touching any cgroup.procs file (no all-vanished bail)",
+    );
+}
+
+// Direct coverage of the all-vanished + partial-vanish paths via
+// the extracted [`move_tasks_inner`] free function, which takes
+// a caller-supplied per-pid write closure. The unit tests below
+// synthesise ESRCH errors for selected pids so the kernel-side
+// behavior the `move_tasks` bail guards against (every pid
+// vanished pre-migration) is observable without booting a guest.
+// VM-backed e2e at `tests/cgroup_ops_placement_e2e.rs` still
+// exercises the integrated production path.
+
+/// Helper: synthesise an anyhow error wrapping a raw ESRCH io
+/// error — the shape `is_esrch` recognises. The bail-vs-partial
+/// path-selection in `move_tasks_inner` keys off this exact
+/// errno; tests use it to drive each branch deterministically.
+#[cfg(test)]
+fn synth_esrch() -> anyhow::Error {
+    anyhow::Error::new(std::io::Error::from_raw_os_error(libc::ESRCH))
+        .context("synthesised ESRCH for move_tasks_inner unit test")
+}
+
+#[test]
+fn move_tasks_inner_partial_esrch_returns_ok() {
+    // Partial-vanish: 3 pids supplied, 1 ESRCH's, 2 succeed → Ok.
+    // Pins the per-pid ESRCH tolerance that the production
+    // `move_tasks` documents as a legitimate partial-migration
+    // outcome (one of N workers voluntarily exited between the
+    // listing snapshot and the migration write).
+    //
+    // A regression that tightens `vanished == pids.len()` to
+    // `vanished > 0` (over-aggressive bail) flips this from PASS
+    // to FAIL with an actionable message.
+    let pids: [libc::pid_t; 3] = [100, 200, 300];
+    let result = move_tasks_inner("cg_x", &pids, |_name, pid| {
+        if pid == 200 {
+            Err(synth_esrch())
+        } else {
+            Ok(())
+        }
+    });
+    assert!(
+        result.is_ok(),
+        "partial vanish (1 of 3 ESRCH) must NOT trigger the \
+         all-vanished bail; got {:?}",
+        result.err().map(|e| format!("{e:#}")),
+    );
+}
+
+#[test]
+fn move_tasks_inner_all_esrch_bails_with_actionable_diagnostic() {
+    // All-vanished kernel-ESRCH path — every pid in a non-empty
+    // slice ESRCH's. Pins the no-silent-drops bail documented on
+    // the public `CgroupManager::move_tasks` ("# All-vanished
+    // bail" rustdoc section); the bail body itself now lives in
+    // the extracted `move_tasks_inner`. A future regression that
+    // loosens `vanished == pids.len()` to `vanished > 0`
+    // (over-aggressive bail) trips this test.
+    let pids: [libc::pid_t; 2] = [100, 200];
+    let result = move_tasks_inner("cg_x", &pids, |_name, _pid| Err(synth_esrch()));
+    let err = result.expect_err("all-ESRCH must trigger the bail (no silent Ok return)");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("cg_x") && msg.contains("ESRCH"),
+        "diagnostic must name the cgroup + the ESRCH cause; got {msg:?}",
+    );
+    assert!(
+        msg.contains("pre_exec") || msg.contains("scheduler-attach"),
+        "diagnostic must enumerate root-cause hypotheses; got {msg:?}",
+    );
+    assert!(
+        msg.contains("empty pids slice"),
+        "diagnostic must point at the empty-slice escape hatch; got {msg:?}",
+    );
+}
+
+#[test]
+fn move_tasks_inner_non_esrch_error_propagates_immediately() {
+    // The first non-ESRCH error short-circuits with that error
+    // — subsequent pids are NOT attempted. Pins the
+    // first-real-error-wins semantics that distinguishes
+    // tolerable-vanish errors (ESRCH) from real failures
+    // (EBUSY-exhausted, EACCES, EFAULT, etc.).
+    let pids: [libc::pid_t; 3] = [100, 200, 300];
+    let mut visited: Vec<libc::pid_t> = Vec::new();
+    let visited_ref = &mut visited;
+    let result = move_tasks_inner("cg_x", &pids, move |_name, pid| {
+        visited_ref.push(pid);
+        if pid == 200 {
+            Err(
+                anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EBUSY))
+                    .context("synthesised EBUSY (not ESRCH)"),
+            )
+        } else {
+            Ok(())
+        }
+    });
+    assert!(
+        result.is_err(),
+        "non-ESRCH error must propagate, not be tolerated"
+    );
+    assert_eq!(
+        visited,
+        vec![100, 200],
+        "loop must short-circuit at the first non-ESRCH error and NOT visit pid 300",
+    );
+}
+
+#[test]
+fn move_tasks_inner_empty_pids_returns_ok() {
+    // Sibling to the CgroupManager-level test — pin the empty-
+    // slice exemption at the inner-fn layer too. The inner-fn
+    // boundary check is the load-bearing one; the wrapping
+    // CgroupManager::move_tasks delegates without adding any
+    // empty-slice handling of its own.
+    let result = move_tasks_inner("cg_x", &[], |_name, _pid| {
+        panic!("write closure must not be called for empty pids slice")
+    });
+    assert!(
+        result.is_ok(),
+        "empty pids slice must return Ok without invoking the write closure",
+    );
+}
+
+#[test]
 fn drain_tasks_empty_cgroup() {
     let _tempdir_keep_alive = make_inline_tempdir("drain");
     let dir = _tempdir_keep_alive.path();
@@ -280,6 +425,124 @@ fn drain_tasks_empty_cgroup() {
     let cg = CgroupManager::new(dir.to_str().unwrap());
     // drain_tasks on a cgroup with empty procs file should succeed
     assert!(cg.drain_tasks("cg_d").is_ok());
+}
+
+/// `read_procs` against a cgroup whose directory does not exist
+/// must error, NOT silently return `Ok(vec![])`. This is the
+/// deliberate asymmetry with [`CgroupManager::drain_tasks`] which
+/// treats missing as a no-op (best-effort teardown). For a READ
+/// accessor, "no such cgroup" and "cgroup is empty" are distinct
+/// signals the caller must be able to distinguish; collapsing
+/// them would mask a typo'd name or a name not covered by any
+/// `Op::AddCgroup` / `CgroupDef`.
+#[test]
+fn read_procs_nonexistent_source_errors() {
+    let cg = CgroupManager::new("/nonexistent/ktstr-read-procs-test");
+    let err = cg
+        .read_procs("missing_cgroup")
+        .expect_err("missing cgroup directory must surface as Err");
+    // The Err message must name the cgroup name supplied AND the
+    // actionable hint about `Op::AddCgroup` / `workload_root_cgroup`
+    // so an operator hitting this in CI has a starting point.
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("missing_cgroup"),
+        "diagnostic must name the supplied cgroup name; got: {msg}",
+    );
+    assert!(
+        msg.contains("Op::AddCgroup") || msg.contains("workload_root_cgroup"),
+        "diagnostic must surface the actionable hint; got: {msg}",
+    );
+}
+
+/// An empty `cgroup.procs` file (a cgroup that exists but holds
+/// no tasks) must return `Ok(Vec::new())`. The kernel renders an
+/// empty file (zero bytes) for this case — no header, no error —
+/// and lets callers distinguish "no tasks here" from "no such
+/// cgroup."
+#[test]
+fn read_procs_empty_cgroup_returns_empty_vec() {
+    let _tempdir_keep_alive = make_inline_tempdir("read-procs-empty");
+    let dir = _tempdir_keep_alive.path();
+    let dir_d = dir.join("cg_d");
+    fs::create_dir_all(&dir_d).unwrap();
+    fs::write(dir_d.join("cgroup.procs"), "").unwrap();
+    let cg = CgroupManager::new(dir.to_str().unwrap());
+    let pids = cg
+        .read_procs("cg_d")
+        .expect("empty cgroup must return Ok(vec![])");
+    assert!(
+        pids.is_empty(),
+        "empty cgroup.procs must yield empty Vec; got: {pids:?}",
+    );
+}
+
+/// A populated `cgroup.procs` file must yield the pids in file
+/// order (kernel `cgroup_procs_show` writes one decimal pid + '\n'
+/// per entry; the file-order render is deterministic per the
+/// underlying css_set iteration order). Mirrors the production
+/// kernel layout so tests can assert against expected pid sets.
+#[test]
+fn read_procs_returns_pids_in_file_order() {
+    let _tempdir_keep_alive = make_inline_tempdir("read-procs-pids");
+    let dir = _tempdir_keep_alive.path();
+    let dir_d = dir.join("cg_d");
+    fs::create_dir_all(&dir_d).unwrap();
+    // Three pids + trailing '\n' — the exact wire format the
+    // kernel emits.
+    fs::write(dir_d.join("cgroup.procs"), "100\n200\n300\n").unwrap();
+    let cg = CgroupManager::new(dir.to_str().unwrap());
+    let pids = cg
+        .read_procs("cg_d")
+        .expect("populated cgroup.procs must return Ok");
+    assert_eq!(
+        pids,
+        vec![100, 200, 300],
+        "pids must be returned in file order; got: {pids:?}",
+    );
+}
+
+/// Malformed pid lines must be SKIPPED with a `tracing::warn!`
+/// rather than aborting the read or being silently treated as
+/// pids. Mirrors [`drain_pids_to_root`]'s tolerance — the kernel
+/// never emits non-decimal lines today, but the tolerance exists
+/// so a future kernel gaining a header / comment line surfaces
+/// as warns instead of opaque parse errors.
+#[test]
+fn read_procs_skips_malformed_pid_lines() {
+    let _tempdir_keep_alive = make_inline_tempdir("read-procs-malformed");
+    let dir = _tempdir_keep_alive.path();
+    let dir_d = dir.join("cg_d");
+    fs::create_dir_all(&dir_d).unwrap();
+    // Mix valid pids with garbage and an empty middle line.
+    fs::write(dir_d.join("cgroup.procs"), "100\nGARBAGE\n200\n\n300\n").unwrap();
+    let cg = CgroupManager::new(dir.to_str().unwrap());
+    let pids = cg
+        .read_procs("cg_d")
+        .expect("malformed lines must not error; valid pids must surface");
+    assert_eq!(
+        pids,
+        vec![100, 200, 300],
+        "malformed lines must be skipped, valid pids preserved; got: {pids:?}",
+    );
+}
+
+/// `read_procs` must funnel through `validate_cgroup_name` just
+/// like [`CgroupManager::drain_tasks`] / `::move_task` —
+/// rejecting names containing `..`, NUL bytes, leading `.`, or
+/// other shapes that would let an operator escape the parent
+/// directory or write to an unintended cgroup.
+#[test]
+fn read_procs_invalid_name_rejected_by_validate() {
+    let cg = CgroupManager::new("/nonexistent/read-procs-validate");
+    assert!(
+        cg.read_procs("..").is_err(),
+        "parent-directory traversal must be rejected",
+    );
+    assert!(
+        cg.read_procs("name\0withnull").is_err(),
+        "NUL-byte in cgroup name must be rejected",
+    );
 }
 
 #[test]
@@ -1086,8 +1349,11 @@ fn cleanup_recursive_auto_unfreezes_before_drain() {
     fs::write(&freeze_path, "1").unwrap();
     fs::write(dir.join("cgroup.procs"), "").unwrap();
     // `cleanup_recursive` is the free fn the cleanup_all walk
-    // dispatches per directory; call it directly.
-    cleanup_recursive(dir);
+    // dispatches per directory; call it directly. walk_root is
+    // the tmpdir base itself — empty cgroup.procs means no pids
+    // are drained, so the destination path is unobserved here;
+    // the assertion targets the pre-drain unfreeze side effect.
+    cleanup_recursive(dir, dir);
     // The auto-unfreeze must have written "0" to cgroup.freeze
     // before the drain — pinned identically to the
     // remove_cgroup test so a regression on either path
@@ -1334,4 +1600,297 @@ fn move_task_admits_when_effective_mems_file_absent() {
     // gate degrades to accept.
     cg.move_task("cg_x", 1)
         .expect("missing cpuset.mems.effective must admit move_task (read-failure absorb)");
+}
+
+// -- walk_root (cgroup-v2 Mode B/C delegation) ---------------------
+//
+// `CgroupManager::with_walk_root` retargets the cgroup-fs root
+// that `setup` walks down from and `drain_tasks` drains pids to.
+// Default (`Self::new`) is `/sys/fs/cgroup` so Mode A (root-owned
+// tree) keeps working unchanged. Mode B/C (systemd Delegate=yes,
+// container nsdelegate) sets the walk root to the delegation
+// boundary so subtree_control writes never escape the operator's
+// authority.
+
+/// Default constructor must leave `walk_root` at the canonical
+/// cgroup-v2 mount. Pins the Mode A path so a regression that
+/// reassigns the default surfaces here instead of in production.
+#[test]
+fn walk_root_default_is_canonical_root() {
+    let cg = CgroupManager::new("/sys/fs/cgroup/ktstr");
+    assert_eq!(cg.walk_root(), Path::new("/sys/fs/cgroup"));
+}
+
+/// `with_walk_root` rejects a root that is not a prefix of
+/// `parent`. Without the gate, [`CgroupManager::setup_under_root`]'s
+/// `strip_prefix` would silently fail and skip the
+/// `subtree_control` walk, leaving the caller to discover the
+/// misconfiguration via an opaque EACCES on the next `set_*`
+/// write.
+#[test]
+fn with_walk_root_validates_parent_below() {
+    // parent below /sys/fs/cgroup/foo; walk_root /sys/fs/cgroup/bar
+    // → strip_prefix would fail, so with_walk_root must bail.
+    let err = CgroupManager::new("/sys/fs/cgroup/foo/ktstr")
+        .with_walk_root("/sys/fs/cgroup/bar")
+        .expect_err("parent not below walk_root must reject");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("not below walk_root"),
+        "error must cite the prefix invariant; got {msg:?}",
+    );
+}
+
+/// `with_walk_root` admits the parent == walk_root case
+/// (`parent.strip_prefix(parent) = Ok("")`). This is the shape
+/// `src/vmm/cgroup_sandbox.rs` uses — the build sandbox pins
+/// walk_root to its own parent so the subtree_control walk
+/// terminates immediately.
+#[test]
+fn with_walk_root_admits_parent_equals_walk_root() {
+    CgroupManager::new("/sys/fs/cgroup/ktstr-build-foo")
+        .with_walk_root("/sys/fs/cgroup/ktstr-build-foo")
+        .expect("parent == walk_root must be admitted");
+}
+
+/// `Path::starts_with` is component-based — `/sys/fs/cgroup/op/../escape`
+/// component-prefixes `/sys/fs/cgroup/op` while the kernel resolves
+/// the path to `/sys/fs/cgroup/escape` (outside walk_root). Without
+/// upfront `..` rejection, the prefix invariant would be silently
+/// violated; this pin guards against a future refactor that drops
+/// the normalization gate.
+#[test]
+fn with_walk_root_rejects_parent_dir_component_in_parent() {
+    let err = CgroupManager::new("/sys/fs/cgroup/op/../escape")
+        .with_walk_root("/sys/fs/cgroup/op")
+        .expect_err("parent containing `..` MUST be rejected");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("`..`") && msg.contains("parent"),
+        "error must name the `..` violation and the offending side; got: {msg}",
+    );
+}
+
+/// Same hazard from the other side: `with_walk_root("/a/b/..")` would
+/// component-prefix `/a/b/../sub` and similarly violate the canonical
+/// containment the gate claims to enforce.
+#[test]
+fn with_walk_root_rejects_parent_dir_component_in_root() {
+    let err = CgroupManager::new("/sys/fs/cgroup/op/sub")
+        .with_walk_root("/sys/fs/cgroup/op/..")
+        .expect_err("walk_root containing `..` MUST be rejected");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("`..`") && msg.contains("walk_root"),
+        "error must name the `..` violation and the offending side; got: {msg}",
+    );
+}
+
+/// `setup` walks `cgroup.subtree_control` only between
+/// `walk_root` and `parent` — never above the walk root. Pins
+/// the Mode B/C delegation contract: under systemd
+/// `Delegate=yes`, the operator owns subtree_control writes
+/// only inside the delegated subtree, and a walk above the
+/// boundary would EACCES at `user.slice`.
+///
+/// Constructs a 3-level tree:
+///   {tmpdir}/                            ← above-walk_root
+///   {tmpdir}/delegated/                  ← walk_root
+///   {tmpdir}/delegated/inner/            ← parent
+///
+/// Pre-creates `cgroup.subtree_control` at every level + the
+/// `cgroup.controllers` advertisement at walk_root. Asserts the
+/// subtree_control write landed at `delegated` (the walk root)
+/// and `delegated/inner` (the parent), but NOT at `tmpdir` (above
+/// the walk root).
+#[test]
+fn setup_walks_under_walk_root_only() {
+    let _tempdir_keep_alive = make_inline_tempdir("walk-root-only");
+    let tmpdir = _tempdir_keep_alive.path();
+    let delegated = tmpdir.join("delegated");
+    let parent = delegated.join("inner");
+    fs::create_dir_all(&parent).unwrap();
+
+    // Above-walk_root subtree_control: pre-create so we can
+    // observe that the walk did NOT write here. Mark with a
+    // sentinel so a write would overwrite it.
+    fs::write(tmpdir.join("cgroup.subtree_control"), "SENTINEL_ABOVE").unwrap();
+    // Walk-root + parent subtree_control: empty so the
+    // setup write is observable. Pre-create + advertise the
+    // controller availability at walk_root.
+    fs::write(delegated.join("cgroup.controllers"), "cpuset memory").unwrap();
+    fs::write(delegated.join("cgroup.subtree_control"), "").unwrap();
+    fs::write(parent.join("cgroup.subtree_control"), "").unwrap();
+
+    let cg = CgroupManager::new(parent.to_str().unwrap())
+        .with_walk_root(&delegated)
+        .expect("parent below delegated must be admitted");
+    let mut requested = BTreeSet::new();
+    requested.insert(Controller::Cpuset);
+    cg.setup(&requested)
+        .expect("setup must succeed under walk_root");
+
+    // Walk root + parent: walk wrote +cpuset.
+    assert!(
+        fs::read_to_string(delegated.join("cgroup.subtree_control"))
+            .unwrap()
+            .contains("+cpuset"),
+        "walk must write +cpuset at the walk root",
+    );
+    assert!(
+        fs::read_to_string(parent.join("cgroup.subtree_control"))
+            .unwrap()
+            .contains("+cpuset"),
+        "walk must write +cpuset at the parent",
+    );
+    // Above walk root: sentinel intact (no write landed).
+    assert_eq!(
+        fs::read_to_string(tmpdir.join("cgroup.subtree_control")).unwrap(),
+        "SENTINEL_ABOVE",
+        "walk must not cross above walk_root",
+    );
+}
+
+/// `setup` short-circuits the subtree_control walk when
+/// `parent` is outside `walk_root`. Without `with_walk_root`'s
+/// upfront prefix gate, this is the silent-skip path that the
+/// gate exists to prevent. Pins the existing
+/// [`CgroupManager::setup_under_root`] `strip_prefix` early-bail
+/// shape so a refactor that drops the gate fails this test.
+#[test]
+fn setup_above_walk_root_refused() {
+    let _tempdir_keep_alive = make_inline_tempdir("walk-root-above");
+    let tmpdir = _tempdir_keep_alive.path();
+    let walk_root = tmpdir.join("walk-root");
+    let outside_parent = tmpdir.join("outside");
+    fs::create_dir_all(&walk_root).unwrap();
+    fs::create_dir_all(&outside_parent).unwrap();
+
+    let cg = CgroupManager::new(outside_parent.to_str().unwrap());
+    let err = cg
+        .with_walk_root(&walk_root)
+        .expect_err("outside-walk_root parent must refuse");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("not below walk_root"),
+        "error must cite walk_root prefix invariant; got {msg:?}",
+    );
+}
+
+/// `drain_tasks` writes to `{walk_root}/cgroup.procs`, NOT the
+/// canonical `/sys/fs/cgroup/cgroup.procs`. Pins the Mode B/C
+/// drain destination contract: under delegation the operator
+/// owns procs-writability only inside the delegated subtree, and
+/// targeting the canonical root would EACCES at the boundary.
+///
+/// Real cgroupfs is not available in unit-test scope, so this
+/// test exercises the path-construction half of the contract:
+/// asserts that the dst path threaded into `drain_pids_to_root`
+/// is `{walk_root}/cgroup.procs` by writing a fake pid into the
+/// child cgroup, observing the walk-root procs file appended to
+/// (the tmpfs backing the tmpdir is a regular fs where writes
+/// just append rather than triggering kernel-side migration).
+#[test]
+fn drain_pids_writes_to_walk_root_procs() {
+    let _tempdir_keep_alive = make_inline_tempdir("drain-walk-root");
+    let walk_root = _tempdir_keep_alive.path();
+    let parent = walk_root.join("ktstr");
+    let child = parent.join("cg_x");
+    fs::create_dir_all(&child).unwrap();
+
+    // Seed the child cgroup.procs with a fake pid + pre-create
+    // the walk-root cgroup.procs (cgroupfs has it auto; tmpfs
+    // needs an empty file so the write target exists).
+    let child_procs = child.join("cgroup.procs");
+    fs::write(&child_procs, "12345\n").unwrap();
+    let walk_root_procs = walk_root.join("cgroup.procs");
+    fs::write(&walk_root_procs, "").unwrap();
+    // Sentinel at the canonical /sys/fs/cgroup/cgroup.procs would
+    // need root to seed. Instead assert via the positive path
+    // that the write landed at walk_root_procs.
+
+    let cg = CgroupManager::new(parent.to_str().unwrap())
+        .with_walk_root(walk_root)
+        .expect("parent below walk_root must be admitted");
+    cg.drain_tasks("cg_x")
+        .expect("drain_tasks must succeed against tmpfs procs file");
+
+    let written = fs::read_to_string(&walk_root_procs).unwrap();
+    assert!(
+        written.contains("12345"),
+        "drained pid must land in {{walk_root}}/cgroup.procs; got {written:?}",
+    );
+}
+
+/// `cleanup_recursive` threads `walk_root` through every
+/// nested-cgroup pid drain. Pins the Mode B/C teardown
+/// contract: a regression that hardcodes `/sys/fs/cgroup` in
+/// the recursion would lose the delegation safety on every
+/// descendant.
+///
+/// Constructs nested `parent/child` under a tmpdir walk_root,
+/// seeds the child's cgroup.procs with a fake pid, and asserts
+/// the pid lands in the walk_root's cgroup.procs (NOT the
+/// canonical `/sys/fs/cgroup/cgroup.procs`). The recursion-
+/// depth contract is independently pinned by
+/// [`cleanup_recursive_removes_nested_dirs_depth_first`].
+///
+/// Real cgroupfs treats each `fs::write` to `cgroup.procs` as a
+/// per-pid migration request the kernel actions internally;
+/// tmpfs truncates so only the most-recent write content is
+/// observable. The single-pid shape sidesteps the tmpfs
+/// observability gap while still proving the destination path
+/// the drain routes to.
+#[test]
+fn cleanup_recursive_drain_respects_walk_root() {
+    let _tempdir_keep_alive = make_inline_tempdir("cleanup-walk-root");
+    let walk_root = _tempdir_keep_alive.path();
+    let parent = walk_root.join("ktstr");
+    let child = parent.join("child");
+    fs::create_dir_all(&child).unwrap();
+
+    // Walk-root cgroup.procs: the drain sink.
+    let walk_root_procs = walk_root.join("cgroup.procs");
+    fs::write(&walk_root_procs, "").unwrap();
+    // Seed the child's cgroup.procs so the depth-first recursion
+    // drains a pid through walk_root.
+    fs::write(child.join("cgroup.procs"), "2222\n").unwrap();
+
+    cleanup_recursive(&parent, walk_root);
+
+    let written = fs::read_to_string(&walk_root_procs).unwrap();
+    assert!(
+        written.contains("2222"),
+        "child pid must land in walk_root cgroup.procs (not canonical \
+         /sys/fs/cgroup/cgroup.procs); got {written:?}",
+    );
+}
+
+/// `cleanup_all` threads `self.walk_root` to the per-child
+/// `cleanup_recursive` invocation. Pins the cleanup_all →
+/// cleanup_recursive closure handoff so a refactor that drops
+/// the closure (and re-passes the bare fn pointer) loses the
+/// walk_root threading.
+#[test]
+fn cleanup_all_threads_walk_root_to_cleanup_recursive() {
+    let _tempdir_keep_alive = make_inline_tempdir("cleanup-all-walk-root");
+    let walk_root = _tempdir_keep_alive.path();
+    let parent = walk_root.join("ktstr");
+    let child = parent.join("child");
+    fs::create_dir_all(&child).unwrap();
+
+    let walk_root_procs = walk_root.join("cgroup.procs");
+    fs::write(&walk_root_procs, "").unwrap();
+    fs::write(child.join("cgroup.procs"), "3333\n").unwrap();
+
+    let cg = CgroupManager::new(parent.to_str().unwrap())
+        .with_walk_root(walk_root)
+        .expect("parent below walk_root must be admitted");
+    cg.cleanup_all().expect("cleanup_all must succeed on tmpfs");
+
+    let written = fs::read_to_string(&walk_root_procs).unwrap();
+    assert!(
+        written.contains("3333"),
+        "cleanup_all must drain child pids to walk_root cgroup.procs; got {written:?}",
+    );
 }

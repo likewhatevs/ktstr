@@ -321,6 +321,18 @@ pub enum DetailKind {
     /// `test_support::output` aggregates the same kind into
     /// per-assertion pass/fail rows.
     Temporal,
+    /// Host-mode worker stall detected by
+    /// [`crate::scenario::host_stall`]. The polling thread
+    /// observed `Δnr_switches == 0` AND `Δsum_exec_runtime == 0`
+    /// across the configured window for a worker pid — the task
+    /// neither got picked nor preempted for at least
+    /// `STALL_WINDOW * poll_interval` ms. Distinct from
+    /// [`DetailKind::Stuck`] (worker-side report: a worker was
+    /// off-CPU longer than the in-test gap threshold): this kind
+    /// fires from the host-side polling thread when running
+    /// host-mode (no VM boot) and is the only stall signal
+    /// available in that mode.
+    WorkerStalled,
     /// Skip notification (scenario could not run under this topology/flags).
     Skip,
     /// Uncategorized — falls through when a detail has no specific kind.

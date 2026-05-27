@@ -15,6 +15,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use super::probe::{ProbeError, probe_first};
+
 /// Route `cargo ktstr export <NAME>` to the test binary that owns
 /// the named `#[ktstr_test]` registration. cargo-ktstr cannot embed
 /// itself into the .run file because it has no `#[ktstr_test]`
@@ -42,30 +44,14 @@ pub(crate) fn run_export(
     package: Option<String>,
     release: bool,
 ) -> Result<(), String> {
-    let bins = build_test_binaries(package.as_deref(), release)?;
-    if bins.is_empty() {
-        return Err("cargo build --tests produced no executable artifacts; \
-             ensure the workspace has at least one [[test]] target or \
-             a [lib]/[bin] with #[cfg(test)] tests"
-            .to_string());
-    }
-
-    // Track per-candidate stderr by exit-code category so we can
-    // surface the most useful diagnostic on full miss. Exit 2 means
-    // "the test exists in this binary but was rejected by export"
-    // (host_only, bpf_map_write, KernelBuiltin, or I/O failure) —
-    // ALWAYS the most informative outcome, since every other
-    // candidate's exit-1 "not registered" message is uninformative
-    // when the test actually exists somewhere.
-    let mut rejection_stderr: Option<String> = None;
-    let mut last_miss_stderr = String::new();
-    for bin in &bins {
-        let mut cmd = Command::new(bin);
-        cmd.arg(format!("--ktstr-export-test={test}"));
-        if let Some(o) = output.as_deref() {
-            // Resolve relative paths against cwd before forwarding so
-            // the test binary writes to the operator's pwd, not its
-            // own (the binary lives under target/debug/deps/...).
+    let test_flag = format!("--ktstr-export-test={test}");
+    // Resolve relative paths against cwd BEFORE the probe loop so
+    // the test binary writes to the operator's pwd, not its own
+    // (the binary lives under target/debug/deps/...). Done once
+    // outside the loop so a transient cwd change between binaries
+    // can't desync the per-binary output target.
+    let output_flag = match output.as_deref() {
+        Some(o) => {
             let abs = if o.is_absolute() {
                 o.to_path_buf()
             } else {
@@ -73,57 +59,43 @@ pub(crate) fn run_export(
                     .map_err(|e| format!("resolve cwd for --output: {e}"))?
                     .join(o)
             };
-            cmd.arg(format!("--ktstr-export-output={}", abs.display()));
+            Some(format!("--ktstr-export-output={}", abs.display()))
+        }
+        None => None,
+    };
+
+    let configure_cmd = |bin: &std::path::Path| {
+        let mut cmd = Command::new(bin);
+        cmd.arg(&test_flag);
+        if let Some(o) = &output_flag {
+            cmd.arg(o);
         }
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::inherit())
             // Capture stderr so per-candidate "no registered test
-            // named X" diagnostics don't spam the operator's terminal
-            // for every binary we try. We forward the WINNING
-            // binary's stderr (carrying export_test's "wrote ..."
-            // confirmation) below; on full miss we surface the
-            // exit-2 candidate's stderr (rejection reason) when one
-            // exists, falling back to the last exit-1 stderr.
+            // named X" diagnostics don't spam the operator's
+            // terminal for every binary we try. Winner's stderr
+            // is forwarded in on_success below; on full miss the
+            // probe helper surfaces the exit-2 rejection stderr
+            // (or last exit-1 stderr) via ProbeMiss.
             .stderr(std::process::Stdio::piped());
+        cmd
+    };
 
-        let out = cmd
-            .output()
-            .map_err(|e| format!("exec {}: {e}", bin.display()))?;
-        if out.status.success() {
-            // Forward the winner's stderr so the "wrote ..." line
-            // (and any operator-visible diagnostics) reach the
-            // user's terminal.
-            std::io::Write::write_all(&mut std::io::stderr(), &out.stderr)
-                .map_err(|e| format!("forward winner stderr: {e}"))?;
-            return Ok(());
-        }
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        // Exit 2 = "registered but rejected." Save the FIRST one and
-        // keep going (other candidates might still succeed if
-        // multiple binaries register the same test name and one of
-        // them admits it). Exit 1 = "not registered here" — record
-        // as last_miss_stderr for the fallback diagnostic.
-        if out.status.code() == Some(2) {
-            if rejection_stderr.is_none() {
-                rejection_stderr = Some(stderr);
-            }
-        } else {
-            last_miss_stderr = stderr;
-        }
-    }
+    let on_success = |_bin: &std::path::Path, out: &std::process::Output| -> Result<(), String> {
+        // Forward the winner's stderr so the "wrote ..." line (and
+        // any operator-visible diagnostics) reach the user's
+        // terminal.
+        std::io::Write::write_all(&mut std::io::stderr(), &out.stderr)
+            .map_err(|e| format!("forward winner stderr: {e}"))?;
+        Ok(())
+    };
 
-    if let Some(reason) = rejection_stderr {
-        return Err(format!(
-            "test '{test}' is registered but cannot be exported:\n{}",
-            reason.trim_end(),
-        ));
+    match probe_first(package.as_deref(), release, configure_cmd, on_success) {
+        Ok(()) => Ok(()),
+        Err(ProbeError::Setup(msg)) => Err(msg),
+        Err(ProbeError::Miss(miss)) => Err(miss.render(&test, "cannot be exported")),
     }
-    Err(format!(
-        "test '{test}' not found in any workspace test binary ({} candidates tried). \
-         Last stderr from a candidate:\n{}",
-        bins.len(),
-        last_miss_stderr.trim_end(),
-    ))
 }
 
 /// Compile the workspace's test binaries via
@@ -136,7 +108,10 @@ pub(crate) fn run_export(
 /// from `[lib]` / `[bin]` targets). Both shapes carry the
 /// `#[ktstr_test]` distributed-slice registry that the export
 /// dispatcher reads, so both are valid candidates.
-fn build_test_binaries(package: Option<&str>, release: bool) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn build_test_binaries(
+    package: Option<&str>,
+    release: bool,
+) -> Result<Vec<PathBuf>, String> {
     let mut cmd = Command::new("cargo");
     cmd.args(["build", "--tests", "--message-format=json"]);
     if let Some(p) = package {

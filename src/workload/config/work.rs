@@ -22,7 +22,63 @@ use std::borrow::Cow;
 use super::super::{AffinityIntent, WorkType};
 use super::{MemPolicy, MpolFlags, SchedPolicy};
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+/// Validate a `comm` / `pcomm` builder argument.
+///
+/// Centralizes the rejection contract for the task-name fields the
+/// framework writes via `prctl(PR_SET_NAME)`:
+///
+/// - Empty: produces an empty kernel comm (surprising; breaks
+///   scheduler matchers that look for non-empty names).
+/// - Interior NUL: `prctl` takes a C string and would truncate at
+///   the NUL silently.
+/// - Length > 15: `__set_task_comm` (fs/exec.c) writes
+///   `min(strlen(buf), sizeof(tsk->comm) - 1)` bytes and
+///   `TASK_COMM_LEN = 16` (include/linux/sched.h), so any 16th
+///   byte (and beyond) is silently dropped. Rejecting at builder
+///   time means the operator sees the limit at the call site
+///   instead of debugging a truncated comm.
+///
+/// `field` names the call site for the panic message (e.g.
+/// `"WorkSpec::comm"`, `"CgroupDef::pcomm"`) so the operator
+/// can grep the offending builder from the panic.
+///
+/// Panics intentionally — these are builder-time input errors
+/// that the test author must fix at the source. Returning a
+/// `Result` would force every caller to `unwrap` and lose the
+/// site context.
+pub(crate) fn validate_task_comm_string(field: &str, name: &str) {
+    assert!(
+        !name.is_empty(),
+        "{field}: empty string rejected — use `None` (default) for no override, not an empty value",
+    );
+    assert!(
+        !name.contains('\0'),
+        "{field}: string {name:?} contains an interior NUL byte; \
+         prctl(PR_SET_NAME) treats it as a C string and would \
+         truncate at the NUL — strip it before calling .{field}()",
+    );
+    assert!(
+        name.len() <= 15,
+        "{field}: name {name:?} is {} bytes; kernel TASK_COMM_LEN \
+         limit is 15 bytes (TASK_COMM_LEN-1=15 in include/linux/sched.h; \
+         `__set_task_comm` truncates at that cap) — shorten before \
+         calling .{field}()",
+        name.len(),
+    );
+}
+
+// PartialEq (not Eq): the [`Self::workers_pct`] field is `Option<f64>`
+// and `f64` is `PartialEq` only — `f64::partial_cmp(NaN, NaN)` is
+// `None` (IEEE-754 semantics). The [`Self::workers_pct`] builder
+// rejects NaN at construction (see the `assert!` near the top of
+// `impl WorkSpec::workers_pct`), so production `WorkSpec` values
+// are NaN-free in practice — the derive inherits f64's standard
+// semantics without surfacing them at typical call sites. Tests
+// that synthesize WorkSpec values via struct-literal syntax can
+// still introduce NaN; concretely, `assert_eq!(spec, spec)` will
+// FAIL (panic) for a spec containing NaN `workers_pct` because
+// NaN != NaN per IEEE-754. Avoid synthesizing NaN even in tests.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 // See [`WorkType`]'s `#[serde(bound(...))]` comment — embedding
 // `WorkType` here propagates the same lifetime-bound issue, so we
 // pass through the same explicit empty bound.
@@ -40,6 +96,16 @@ pub struct WorkSpec {
     /// SCHED_FIFO worker). For that reason `CgroupDef` does NOT
     /// expose a cgroup-level default for `num_workers` — multi-group
     /// cgroups set the count per-[`WorkSpec`] here.
+    ///
+    /// Type asymmetry with [`crate::workload::WorkloadConfig::num_workers`]
+    /// (`usize`, no Option) is deliberate. `WorkSpec` is the
+    /// declarative spec layer where `None` is a meaningful
+    /// "inherit the cgroup-level default" sentinel;
+    /// [`crate::scenario::resolve_num_workers`] coalesces it to a
+    /// concrete `usize` against the `Ctx` before
+    /// [`crate::workload::WorkloadConfig::for_scenario_engine`]
+    /// constructs the spawn-time config. The coalesce happens at
+    /// the resolution boundary, not silently inside any builder.
     pub num_workers: Option<usize>,
     /// Per-worker affinity intent. Resolved to `ResolvedAffinity` at
     /// runtime via [`resolve_affinity_for_cgroup()`](crate::scenario::resolve_affinity_for_cgroup).
@@ -68,8 +134,10 @@ pub struct WorkSpec {
     /// `setpriority(PRIO_PROCESS, 0, 0)` semantics.
     pub nice: Option<i32>,
     /// Per-worker comm set via `prctl(PR_SET_NAME)` at thread
-    /// creation time (the kernel truncates to `TASK_COMM_LEN - 1 =
-    /// 15` bytes inside `__set_task_comm`). `None` inherits the
+    /// creation time. The setter rejects > 15 bytes
+    /// (TASK_COMM_LEN-1) at construction so the operator sees the
+    /// cap at the call site instead of debugging a kernel-truncated
+    /// comm — see [`validate_task_comm_string`]. `None` inherits the
     /// binary name. Useful for scheduler matchers that filter on
     /// `task->comm` (e.g. layered's `CommPrefix`). The comm is
     /// applied once per worker; it is NOT live-propagated after
@@ -79,20 +147,33 @@ pub struct WorkSpec {
     /// `task->group_leader->comm`. When set, `apply_setup` coalesces
     /// every WorkSpec sharing this `pcomm` value (within one
     /// CgroupDef) into ONE forked thread-group leader. The leader's
-    /// `task->comm` is set via `prctl(PR_SET_NAME)` (kernel
-    /// truncates to `TASK_COMM_LEN - 1 = 15` bytes inside
-    /// `__set_task_comm`), so every worker thread inside observes
-    /// `task->group_leader->comm == pcomm` for the leader's
-    /// lifetime. WorkSpecs with `pcomm = None` (or empty pcomm
-    /// string, treated as `None`) spawn via the conventional fork
-    /// path — one process per worker.
+    /// `task->comm` is set via `prctl(PR_SET_NAME)`; the setter
+    /// rejects > 15 bytes (TASK_COMM_LEN-1) at construction so the
+    /// `task->group_leader->comm == pcomm` invariant every worker
+    /// thread observes for the leader's lifetime matches the
+    /// requested string exactly (no silent kernel truncation).
+    /// WorkSpecs with `pcomm = None` (or empty pcomm string,
+    /// treated as `None`) spawn via the conventional fork path —
+    /// one process per worker.
     ///
-    /// **Dispatch is `apply_setup`-only.** Direct calls to
-    /// [`crate::workload::WorkloadHandle::spawn`] and
-    /// [`crate::scenario::ops::Op::SpawnWorkers`] do NOT honor `pcomm` —
-    /// they always spawn one process per worker (fork mode). To
-    /// drive the pcomm container path without going through
-    /// `CgroupDef`, callers may invoke
+    /// **Dispatch is `apply_setup`-only.** The `WorkSpec::pcomm`
+    /// setter itself always accepts a valid value (subject to the
+    /// existing 15-byte / NUL / empty-string checks). The bail
+    /// fires later at **`WorkloadConfig` dispatch-construction
+    /// time** — direct calls to
+    /// [`crate::workload::WorkloadHandle::spawn`] (composed entries)
+    /// and the scenario-engine spawn-dispatch sites
+    /// ([`crate::scenario::ops::Op::Spawn`] / `apply_setup` non-pcomm
+    /// path) all reject a pcomm-bearing
+    /// WorkSpec when they synthesize the per-spawn `WorkloadConfig`.
+    /// Those paths always fork one process per worker (fork mode),
+    /// so `task->group_leader->comm` would be left at the parent's
+    /// task->comm at fork time (the scenario runner's binary name)
+    /// and scheduler matchers filtering on the leader's comm would
+    /// see zero matches. The bail surfaces the misuse at the call
+    /// site instead of producing a workload that silently fails to
+    /// match its fixture. To drive the pcomm container path without
+    /// going through `CgroupDef`, callers may invoke
     /// [`crate::workload::WorkloadHandle::spawn_pcomm_cgroup`]
     /// directly with a `&[WorkSpec]` slice.
     ///
@@ -109,6 +190,17 @@ pub struct WorkSpec {
     /// `ThreadPoolForeg` and `GPU Process` worker threads
     /// (per-thread comm), or `java` (pcomm) hosting `GC Thread`
     /// and `C2 CompilerThre` worker threads.
+    ///
+    /// Declarative-only field — absent from
+    /// [`crate::workload::WorkloadConfig`] by design (same shape as
+    /// [`Self::num_workers`] / [`Self::workers_pct`]). pcomm is the
+    /// operator-facing intent that drives the apply_setup pcomm-
+    /// aware coalesce path; by the time a `WorkloadConfig` is
+    /// constructed for spawn, the per-WorkSpec pcomm has either
+    /// routed through `spawn_pcomm_cgroup` (then no longer needed
+    /// at the WorkloadConfig layer) or hit the dispatch-construction
+    /// bail at
+    /// [`crate::workload::WorkloadConfig::for_scenario_engine`].
     pub pcomm: Option<Cow<'static, str>>,
     /// Effective UID set via `setresuid(uid, uid, uid)` after fork.
     /// `None` inherits the parent's euid. Useful for scheduler
@@ -133,17 +225,32 @@ pub struct WorkSpec {
     ///   inherited from `ctx.topo.usable_cpuset()` when the
     ///   `CgroupDef` has no `.cpuset(...)`), so the denominator
     ///   matches the declared `CpusetSpec`.
-    /// - `Op::SpawnWorkers` dispatch: the denominator is whatever cpuset is
-    ///   currently recorded for the cgroup. A prior `Op::SetCpuset`
-    ///   that narrowed the cgroup will narrow the denominator too.
-    ///   Workers already spawned by a prior `apply_setup` are not
-    ///   re-counted.
+    /// - `Op::Spawn(SpawnPlacement::Cgroup)` dispatch: the denominator
+    ///   is whatever cpuset is currently recorded for the cgroup. A
+    ///   prior `Op::SetCpuset` that narrowed the cgroup will narrow
+    ///   the denominator too. Workers already spawned by a prior
+    ///   `apply_setup` are not re-counted.
     ///
     /// Cannot coexist with `num_workers = Some(_)` — validation
     /// rejects that combination because it's ambiguous which source
     /// wins. Values > 1.0 are accepted as deliberate oversubscription
     /// (e.g. `workers_pct(2.0)` on a 10-CPU cpuset produces 20
     /// workers). NaN/Inf/negative are rejected at construction time.
+    ///
+    /// Declarative-only field — absent from
+    /// [`crate::workload::WorkloadConfig`] by design. The same
+    /// asymmetry as [`Self::num_workers`]: `WorkSpec` is the
+    /// operator-facing declarative spec where `workers_pct(p)` is
+    /// a meaningful "scale with the cpuset" intent;
+    /// [`Self::resolve_workers_pct`] (called at apply_setup and at
+    /// each dispatch site) computes the concrete worker count
+    /// against the dispatch-time cpuset and writes the result into
+    /// the WorkSpec's `num_workers` field, which then flows through
+    /// the standard `resolve_num_workers` →
+    /// [`crate::workload::WorkloadConfig::num_workers`] migration
+    /// boundary. There is no `workers_pct` field on `WorkloadConfig`
+    /// because by spawn time the scale-with-cpuset intent has
+    /// already collapsed to a concrete count.
     pub workers_pct: Option<f64>,
 }
 
@@ -229,9 +336,10 @@ impl WorkSpec {
     /// Resolve `workers_pct` against a cpuset size into a concrete
     /// `num_workers` count and clear the fractional state, leaving
     /// `num_workers = Some(scaled)` and `workers_pct = None`. Used by
-    /// both `apply_setup` (per-CgroupDef WorkSpec) and `Op::SpawnWorkers`
-    /// (mid-step ad-hoc spawn) so the two paths produce identical
-    /// counts for the same `(pct, cpuset_size)` pair.
+    /// both `apply_setup` (per-CgroupDef WorkSpec) and
+    /// `Op::Spawn(SpawnPlacement::Cgroup)` (mid-step ad-hoc spawn)
+    /// so the two paths produce identical counts for the same
+    /// `(pct, cpuset_size)` pair.
     ///
     /// Rejects the ambiguous `(num_workers = Some, workers_pct =
     /// Some)` combination with an `anyhow::bail!` naming the cgroup.
@@ -324,10 +432,26 @@ impl WorkSpec {
     }
 
     /// Set the worker process name via `prctl(PR_SET_NAME)`.
-    /// Kernel truncates to 15 bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics on programmer-error inputs — same three cases as
+    /// [`Self::pcomm`]:
+    /// - Empty string (silent kernel-comm clobber).
+    /// - Interior NUL byte (prctl C-string truncation).
+    /// - More than 15 bytes (`TASK_COMM_LEN - 1` —
+    ///   `__set_task_comm` truncates at 15 so the framework rejects
+    ///   at construction to keep the kernel-observed comm equal to
+    ///   the requested value).
+    ///
+    /// See [`validate_task_comm_string`] for the centralized
+    /// rationale; `name.len()` is the BYTE length (UTF-8 multi-byte
+    /// chars count as their byte width, not their codepoint count).
     #[must_use = "builder methods consume self; bind the result"]
     pub fn comm(mut self, name: impl Into<Cow<'static, str>>) -> Self {
-        self.comm = Some(name.into());
+        let name: Cow<'static, str> = name.into();
+        validate_task_comm_string("WorkSpec::comm", &name);
+        self.comm = Some(name);
         self
     }
 
@@ -374,28 +498,105 @@ impl WorkSpec {
     ///   first NUL silently, producing a comm value the caller
     ///   didn't ask for. Reject so the operator sees the error
     ///   immediately instead of debugging a truncated comm.
-    ///
-    /// `name.len() > 15` is NOT a panic — the kernel truncates to
-    /// `TASK_COMM_LEN - 1 = 15` bytes inside `__set_task_comm`, and
-    /// some test fixtures intentionally exercise the truncation
-    /// boundary. `apply_setup` emits a `tracing::warn!` at
-    /// dispatch time so operators see the truncation; the actual
-    /// kernel truncation is silent.
+    /// - More than 15 bytes — `__set_task_comm` writes
+    ///   `min(strlen(buf), sizeof(tsk->comm) - 1)` bytes and
+    ///   `TASK_COMM_LEN = 16`, so the 16th byte (and beyond) is
+    ///   silently dropped. Rejecting at construction time means the
+    ///   `task->group_leader->comm == pcomm` invariant the rest of
+    ///   the framework relies on holds exactly, and the operator
+    ///   sees the cap at the call site instead of debugging a
+    ///   truncated comm.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn pcomm(mut self, name: impl Into<Cow<'static, str>>) -> Self {
         let name: Cow<'static, str> = name.into();
-        assert!(
-            !name.is_empty(),
-            "WorkSpec::pcomm: empty pcomm string rejected — \
-             use `None` (default) for no pcomm, not an empty value",
-        );
-        assert!(
-            !name.contains('\0'),
-            "WorkSpec::pcomm: pcomm string {name:?} contains an interior NUL byte; \
-             prctl(PR_SET_NAME) treats it as a C string and would truncate \
-             at the NUL — strip it before calling .pcomm()",
-        );
+        validate_task_comm_string("WorkSpec::pcomm", &name);
         self.pcomm = Some(name);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "WorkSpec::comm: empty string rejected")]
+    fn work_spec_comm_rejects_empty() {
+        let _ = WorkSpec::default().comm("");
+    }
+
+    #[test]
+    #[should_panic(expected = "interior NUL byte")]
+    fn work_spec_comm_rejects_interior_nul() {
+        let _ = WorkSpec::default().comm("foo\0bar");
+    }
+
+    #[test]
+    #[should_panic(expected = "WorkSpec::pcomm: empty string rejected")]
+    fn work_spec_pcomm_rejects_empty() {
+        let _ = WorkSpec::default().pcomm("");
+    }
+
+    #[test]
+    #[should_panic(expected = "interior NUL byte")]
+    fn work_spec_pcomm_rejects_interior_nul() {
+        let _ = WorkSpec::default().pcomm("foo\0bar");
+    }
+
+    #[test]
+    fn work_spec_comm_accepts_15_byte_boundary() {
+        let fifteen = "a".repeat(15);
+        let spec = WorkSpec::default().comm(fifteen.clone());
+        assert_eq!(spec.comm.as_deref(), Some(fifteen.as_str()));
+    }
+
+    #[test]
+    #[should_panic(expected = "WorkSpec::comm: name")]
+    fn work_spec_comm_rejects_16_byte_overflow() {
+        let _ = WorkSpec::default().comm("a".repeat(16));
+    }
+
+    #[test]
+    fn work_spec_pcomm_accepts_15_byte_boundary() {
+        let fifteen = "a".repeat(15);
+        let spec = WorkSpec::default().pcomm(fifteen.clone());
+        assert_eq!(spec.pcomm.as_deref(), Some(fifteen.as_str()));
+    }
+
+    #[test]
+    #[should_panic(expected = "WorkSpec::pcomm: name")]
+    fn work_spec_pcomm_rejects_16_byte_overflow() {
+        let _ = WorkSpec::default().pcomm("a".repeat(16));
+    }
+
+    /// UTF-8 boundary: the length cap is byte-counted, not
+    /// codepoint-counted. 5 Cyrillic chars = 10 bytes (each char in
+    /// U+0400-U+04FF is 2 bytes) — accepts. 8 Cyrillic chars = 16
+    /// bytes — panics. Sanity-check the assumption with `s.len()`
+    /// at runtime so a future Cyrillic literal in this test that
+    /// drifts off the 2-byte assumption surfaces immediately
+    /// instead of as a false acceptance.
+    #[test]
+    fn work_spec_comm_accepts_10_byte_utf8_within_cap() {
+        let cyr10 = "приве";
+        assert_eq!(
+            cyr10.len(),
+            10,
+            "test fixture: cyrillic 5-char must be 10 bytes"
+        );
+        let spec = WorkSpec::default().comm(cyr10);
+        assert_eq!(spec.comm.as_deref(), Some(cyr10));
+    }
+
+    #[test]
+    #[should_panic(expected = "16 bytes")]
+    fn work_spec_comm_rejects_16_byte_utf8_overflow() {
+        let cyr16 = "приветик";
+        assert_eq!(
+            cyr16.len(),
+            16,
+            "test fixture: cyrillic 8-char must be 16 bytes"
+        );
+        let _ = WorkSpec::default().comm(cyr16);
     }
 }

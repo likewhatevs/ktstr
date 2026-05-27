@@ -1549,7 +1549,7 @@ mod tests {
         let _lock = lock_env();
         let tmp = tempfile::tempdir().unwrap();
         let _env_target = EnvVarGuard::set("CARGO_TARGET_DIR", tmp.path());
-        let _env_sidecar = EnvVarGuard::remove("KTSTR_SIDECAR_DIR");
+        let _env_sidecar = EnvVarGuard::remove(crate::KTSTR_SIDECAR_DIR_ENV);
         let runs_root = tmp.path().join("ktstr");
         let run_dir = runs_root.join("run-default-root");
         std::fs::create_dir_all(&run_dir).unwrap();

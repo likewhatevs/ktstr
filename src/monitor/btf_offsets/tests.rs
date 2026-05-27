@@ -392,8 +392,10 @@ fn stage_in_cache(src: &std::path::Path) -> CacheStagedVmlinux {
     std::fs::create_dir_all(&entry_dir).expect("create cache entry dir");
     let vmlinux = entry_dir.join("vmlinux");
     std::fs::copy(src, &vmlinux).expect("copy vmlinux into cache-staged dir");
-    let _cache_env =
-        crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", root.path());
+    let _cache_env = crate::test_support::test_helpers::EnvVarGuard::set(
+        crate::KTSTR_CACHE_DIR_ENV,
+        root.path(),
+    );
     CacheStagedVmlinux {
         _cache_env,
         entry_dir,
@@ -717,8 +719,10 @@ fn sidecar_skipped_when_path_outside_cache_root() {
     let _env = crate::test_support::test_helpers::lock_env();
     // KTSTR_CACHE_DIR points at one tempdir.
     let cache_root = tempfile::TempDir::new().expect("cache root tempdir");
-    let _cache_env =
-        crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", cache_root.path());
+    let _cache_env = crate::test_support::test_helpers::EnvVarGuard::set(
+        crate::KTSTR_CACHE_DIR_ENV,
+        cache_root.path(),
+    );
     // vmlinux lives in a sibling tempdir — outside the cache
     // root, simulating a kernel source tree.
     let source_tree = tempfile::TempDir::new().expect("source-tree tempdir");
@@ -795,7 +799,8 @@ fn sidecar_skipped_when_cache_root_unresolvable() {
     let _env = crate::test_support::test_helpers::lock_env();
     // Strip every variable in the resolution cascade so
     // resolve_cache_root_with_suffix has nothing to walk.
-    let _no_ktstr = crate::test_support::test_helpers::EnvVarGuard::remove("KTSTR_CACHE_DIR");
+    let _no_ktstr =
+        crate::test_support::test_helpers::EnvVarGuard::remove(crate::KTSTR_CACHE_DIR_ENV);
     let _no_xdg = crate::test_support::test_helpers::EnvVarGuard::remove("XDG_CACHE_HOME");
     let _no_home = crate::test_support::test_helpers::EnvVarGuard::remove("HOME");
 
@@ -893,8 +898,10 @@ fn load_btf_symlink_out_of_cache_writes_no_sidecar() {
     let _env = crate::test_support::test_helpers::lock_env();
     // Cache root with no real vmlinux inside it.
     let cache_root = tempfile::TempDir::new().expect("cache-root tempdir");
-    let _cache_env =
-        crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", cache_root.path());
+    let _cache_env = crate::test_support::test_helpers::EnvVarGuard::set(
+        crate::KTSTR_CACHE_DIR_ENV,
+        cache_root.path(),
+    );
     // Real vmlinux in source tree (outside cache).
     let source_tree = tempfile::TempDir::new().expect("source-tree tempdir");
     let real_vmlinux = source_tree.path().join("vmlinux");
@@ -959,8 +966,10 @@ fn load_btf_relative_path_suppresses_sidecar() {
     // is irrelevant for the assertion — we just want the load
     // path to NOT be inside whatever it points at.
     let cache_root = tempfile::TempDir::new().expect("cache-root tempdir");
-    let _cache_env =
-        crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", cache_root.path());
+    let _cache_env = crate::test_support::test_helpers::EnvVarGuard::set(
+        crate::KTSTR_CACHE_DIR_ENV,
+        cache_root.path(),
+    );
     // Stage a real vmlinux in a tempdir, then build a relative
     // path referring to it. The relative path is constructed
     // by stripping the leading `/` from the absolute path; from
@@ -1017,7 +1026,8 @@ fn load_btf_empty_ktstr_cache_dir_falls_through() {
 
     let _env = crate::test_support::test_helpers::lock_env();
     let xdg = tempfile::TempDir::new().expect("xdg tempdir");
-    let _g_ktstr = crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", "");
+    let _g_ktstr =
+        crate::test_support::test_helpers::EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, "");
     let _g_xdg = crate::test_support::test_helpers::EnvVarGuard::set("XDG_CACHE_HOME", xdg.path());
     // Resolved root: <xdg>/ktstr/kernels.
     let resolved_root = xdg.path().join("ktstr").join("kernels");
@@ -1069,8 +1079,10 @@ fn load_btf_fresh_resolution_per_call() {
     // First call: KTSTR_CACHE_DIR points at cache_a → in-cache,
     // sidecar written.
     {
-        let _g =
-            crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", cache_a.path());
+        let _g = crate::test_support::test_helpers::EnvVarGuard::set(
+            crate::KTSTR_CACHE_DIR_ENV,
+            cache_a.path(),
+        );
         assert!(
             !sidecar.exists(),
             "precondition: sidecar must not pre-exist"
@@ -1091,8 +1103,10 @@ fn load_btf_fresh_resolution_per_call() {
     // root resolution would surface here as a stale `true` and
     // the sidecar would reappear.
     {
-        let _g =
-            crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", cache_b.path());
+        let _g = crate::test_support::test_helpers::EnvVarGuard::set(
+            crate::KTSTR_CACHE_DIR_ENV,
+            cache_b.path(),
+        );
         let btf = load_btf_from_path(&vmlinux).expect("second load must succeed");
         let _ = format!("{:?}", btf.resolve_types_by_name("task_struct").is_ok());
         assert!(

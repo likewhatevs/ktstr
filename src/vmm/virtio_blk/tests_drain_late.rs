@@ -469,36 +469,36 @@ fn serial_constant_is_id_bytes_long() {
 }
 
 // ----------------------------------------------------------------
-// T5/T7/T8/T10/T11/T12: notification suppression edge cases.
+// Notification suppression edge cases.
 //
-// T4 (multi-chain unreached threshold) and T9 (error-chain
-// suppression) are pinned above. The remaining tests in this
+// The multi-chain unreached threshold and error-chain
+// suppression cases are pinned above. The remaining tests in this
 // block cover the rest of the notification-bracket surface:
-//   T5  — successive drains spanning the threshold (multi-notify
-//         num_added accounting).
-//   T7  — `needs_notification` Err fault injection: avail-ring
-//         `used_event` GPA unmapped, fail-safe fires the irqfd
-//         via `unwrap_or(true)`.
-//   T8  — `disable_notification` / `enable_notification` toggle
-//         the legacy `VRING_USED_F_NO_NOTIFY` bit observable in
-//         `used.flags`.
-//   T10 — status-write failure must NOT signal the irqfd: an
-//         unmapped `status_addr` produces `publish_completion`
-//         → false, signal_needed stays false, `add_used` is
-//         skipped, the irqfd stays unsignalled.
-//   T11 — multi-notify boundary: a chain enqueued AFTER an
-//         earlier drain returned must not be stranded; a fresh
-//         QUEUE_NOTIFY drains it. The actual `Ok(true)` re-drain
-//         arm is documented as untestable single-threaded (see
-//         `outer_loop_drains_two_pre_queued_chains_in_one_call`)
-//         — this test pins the deterministic surrogate.
-//   T12 — legacy path full chain: post-`process_requests`,
-//         `used.flags` is back to 0, proving the
-//         disable→drain→enable bracket cleared the suppression
-//         flag the device set during the inner drain.
+//   Successive drains spanning the threshold (multi-notify
+//     num_added accounting).
+//   `needs_notification` Err fault injection: avail-ring
+//     `used_event` GPA unmapped, fail-safe fires the irqfd
+//     via `unwrap_or(true)`.
+//   `disable_notification` / `enable_notification` toggle
+//     the legacy `VRING_USED_F_NO_NOTIFY` bit observable in
+//     `used.flags`.
+//   Status-write failure must NOT signal the irqfd: an
+//     unmapped `status_addr` produces `publish_completion`
+//     → false, signal_needed stays false, `add_used` is
+//     skipped, the irqfd stays unsignalled.
+//   Multi-notify boundary: a chain enqueued AFTER an
+//     earlier drain returned must not be stranded; a fresh
+//     QUEUE_NOTIFY drains it. The actual `Ok(true)` re-drain
+//     arm is documented as untestable single-threaded (see
+//     `outer_loop_drains_two_pre_queued_chains_in_one_call`)
+//     — this test pins the deterministic surrogate.
+//   Legacy path full chain: post-`process_requests`,
+//     `used.flags` is back to 0, proving the
+//     disable→drain→enable bracket cleared the suppression
+//     flag the device set during the inner drain.
 // ----------------------------------------------------------------
 
-/// T5: successive `process_requests` drains spanning the
+/// Successive `process_requests` drains spanning the
 /// EVENT_IDX threshold. With `used_event=2`, drain 1 publishes
 /// one chain (next_used=1, threshold unreached, irqfd
 /// suppressed); drain 2 publishes two more chains
@@ -585,7 +585,7 @@ fn event_idx_successive_drains_span_threshold() {
         "interrupt_status bit must be set after drain 1 \
              (V8 split: bit set independent of irqfd)",
     );
-    // T-GAP-F: same bit observable through the MMIO surface.
+    // Same bit observable through the MMIO surface.
     let status = read_reg(&dev, VIRTIO_MMIO_INTERRUPT_STATUS);
     assert_eq!(status & 1, 1);
     assert!(
@@ -658,7 +658,7 @@ fn event_idx_successive_drains_span_threshold() {
     );
 }
 
-/// T7: `needs_notification` Err fault injection. The post-drain
+/// `needs_notification` Err fault injection. The post-drain
 /// `needs_notification` reads `used_event` from the avail ring
 /// (`avail_ring + 4 + size*2`). When that GPA is unmapped, the
 /// call returns `Err(GuestMemory(...))`, and the production
@@ -851,7 +851,7 @@ fn event_idx_needs_notification_err_fires_irqfd_fail_safe() {
     );
 }
 
-/// T8: `disable_notification` / `enable_notification` toggle
+/// `disable_notification` / `enable_notification` toggle
 /// the legacy `VRING_USED_F_NO_NOTIFY` flag observable in
 /// `used.flags`. Pins the QueueT API contract that the
 /// production bracket relies on: when EVENT_IDX is NOT
@@ -866,8 +866,8 @@ fn event_idx_needs_notification_err_fires_irqfd_fail_safe() {
 /// → drain → enable as one synchronous unit, and by the
 /// time the test reads `used.flags` post-call, the flag is
 /// already cleared. This test pins the toggle behaviour at
-/// the bracket's primitive layer; T12 below pins the
-/// process_requests integration.
+/// the bracket's primitive layer; the legacy-path full-chain
+/// test below pins the process_requests integration.
 ///
 /// Per `Queue::set_notification` (queue.rs):
 /// - legacy + disable → write `VRING_USED_F_NO_NOTIFY` to
@@ -959,7 +959,7 @@ fn legacy_disable_enable_notification_toggles_used_flags() {
     assert_eq!(flags4, 0);
 }
 
-/// T10: status-write-failure path. When `publish_completion`
+/// Status-write-failure path. When `publish_completion`
 /// fails to write the status byte (status_addr unmapped),
 /// it returns `false`, the chain is NOT add_used'd, and
 /// `signal_needed` stays false — so the irqfd is NEVER
@@ -1047,7 +1047,8 @@ fn status_write_failure_skips_add_used_and_irqfd() {
     // Legacy path — used_event is irrelevant since the chain
     // is never add_used'd. Using legacy makes the test focus
     // on the publish_completion gate, not the EVENT_IDX
-    // suppression logic (already covered by T9).
+    // suppression logic (already covered by the error-chain
+    // suppression test above).
     wire_device_to_mock(&mut dev, &mock);
 
     // Pre-notify: irqfd MUST be unsignalled.
@@ -1103,7 +1104,7 @@ fn status_write_failure_skips_add_used_and_irqfd() {
     assert_eq!(read_reg(&dev, VIRTIO_MMIO_INTERRUPT_STATUS) & 1, 0);
 }
 
-/// T11: multi-notify boundary regression. A chain enqueued
+/// Multi-notify boundary regression. A chain enqueued
 /// AFTER an earlier QUEUE_NOTIFY drain has returned must not
 /// be stranded; a fresh QUEUE_NOTIFY drains it cleanly. The
 /// guest's ISR updates `used_event` between drains to
@@ -1262,7 +1263,7 @@ fn multi_notify_boundary_drains_subsequent_chain() {
     );
 }
 
-/// T12: legacy-path full-chain integration of the
+/// Legacy-path full-chain integration of the
 /// disable→drain→enable bracket. After
 /// `process_requests` returns, `used.flags` must be back
 /// to 0 — proving `enable_notification` ran at the end of
@@ -1274,14 +1275,15 @@ fn multi_notify_boundary_drains_subsequent_chain() {
 /// normally. `irq_evt` fires unconditionally on the legacy
 /// path because `Queue::needs_notification` returns
 /// `Ok(true)` whenever `event_idx_enabled=false`
-/// (queue.rs line 538). T12's load-bearing assertion is the
+/// (queue.rs line 538). This test's load-bearing assertion is the
 /// post-bracket `used.flags == 0` — the rest of the state
 /// is companion coverage to confirm the chain processed
 /// correctly (so a flag-toggle bug isn't masked by a
 /// chain-drop bug).
 ///
-/// Distinct from T8 (which drives the QueueT API directly):
-/// T12 verifies that `process_requests` invokes the bracket
+/// Distinct from the QueueT-driving toggle test (which drives
+/// the QueueT API directly): this test verifies that
+/// `process_requests` invokes the bracket
 /// in the correct order — `disable_notification` then
 /// drain then `enable_notification` — so the observable
 /// post-call state is the cleared flag.
@@ -1512,7 +1514,7 @@ fn throttle_event_idx_stall_leaves_chain_in_avail_ring() {
     );
 }
 
-/// G4: `mem_unset_warned` latch fires once across multiple
+/// `mem_unset_warned` latch fires once across multiple
 /// pre-`set_mem` notifies. The drain path drops requests when
 /// the shared `mem` slot is None and emits one warn the first
 /// time (in `drain_inline` and `worker_thread_main` via
@@ -1565,7 +1567,7 @@ fn mem_unset_warned_latch_fires_once() {
     assert_eq!(c.io_errors.load(Ordering::Relaxed), 0);
 }
 
-/// T-GAP-G: `INTERRUPT_ACK` clears the
+/// `INTERRUPT_ACK` clears the
 /// `VIRTIO_MMIO_INT_VRING` bit set by a chain completion via
 /// `process_requests`. End-to-end pin: drain a chain through
 /// the public MMIO surface, confirm INTERRUPT_STATUS reflects

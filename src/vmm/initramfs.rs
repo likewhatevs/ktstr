@@ -264,8 +264,27 @@ fn resolve_shared_libs_inner(binary: &Path, extra_interp_hints: &[PathBuf]) -> R
                 // guest dynamic linker can find the lib via either path.
                 let host_str = host_path.to_string_lossy();
                 let host_guest = host_str.strip_prefix('/').unwrap_or(&host_str).to_string();
+                let host_guest_for_alias_check = host_guest.clone();
                 if host_guest != canon_guest {
                     found.push((host_guest, canonical.clone()));
+                }
+
+                // Always emit a standard-path alias at `lib64/<soname>`
+                // so the guest dynamic linker can find the lib via its
+                // default search path even when host resolution picked
+                // a non-standard path (e.g. a build artifact reached
+                // via the host's `LD_LIBRARY_PATH` — common when
+                // `cargo nextest` runs a test binary linked against
+                // libbpf-sys's vendored libelf). Without this alias,
+                // an executable like `/bin/wprof` that does
+                // `dlopen("libelf.so.1")` inside the guest can't see
+                // the lib at all because the guest has no
+                // `/etc/ld.so.cache` and no `LD_LIBRARY_PATH` —
+                // glibc falls back to `/lib64`, `/usr/lib64`, and
+                // nothing else.
+                let standard_alias = format!("lib64/{soname}");
+                if standard_alias != canon_guest && standard_alias != host_guest_for_alias_check {
+                    found.push((standard_alias, canonical.clone()));
                 }
 
                 resolved.push((soname.clone(), host_path, canonical));
@@ -661,7 +680,11 @@ fn is_deleted_self(path: &Path) -> bool {
 /// Init setup (mounts, scheduler start, etc.) is handled by the Rust init
 /// code in `vmm::rust_init`, which runs when the binary detects PID 1.
 ///
-/// When `busybox` is true, embeds busybox at `bin/busybox` for shell mode.
+/// When `busybox_bytes` is `Some`, embeds the provided bytes at
+/// `bin/busybox` for shell mode. Bytes are sourced from
+/// [`crate::vmm::blobs::load_busybox_bytes`] (which reads the
+/// `KTSTR_BUSYBOX_PATH` env var that `cargo-ktstr` sets at startup);
+/// the library does not embed busybox itself.
 ///
 /// Expand `guest_path`'s parent into every ancestor directory component
 /// and insert each into `dirs`. No-op when the path has no parent
@@ -695,7 +718,7 @@ pub fn build_initramfs_base(
     payload: &Path,
     extra_binaries: &[(&str, &Path)],
     include_files: &[(&str, &Path)],
-    busybox: bool,
+    busybox_bytes: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     // Validate include_files and collect metadata (reused in the write
     // loop to avoid a second stat syscall per file).
@@ -876,8 +899,9 @@ pub fn build_initramfs_base(
         "shared_libs dedup"
     );
 
-    // Busybox needs bin/ directory.
-    if busybox {
+    // Busybox goes under bin/. wprof, when set, rides
+    // include_files (which registers its own parent dirs).
+    if busybox_bytes.is_some() {
         dirs.insert("bin".to_string());
     }
     // Include files need their parent directories in the cpio archive.
@@ -916,9 +940,12 @@ pub fn build_initramfs_base(
     // all setup (mounts, scheduler, etc.) before running the test function.
     write_entry(&mut archive, "init", &binary, 0o100755)?;
 
-    // Shell mode: embed busybox.
-    if busybox {
-        write_entry(&mut archive, "bin/busybox", crate::BUSYBOX, 0o100755)?;
+    // Shell mode: embed busybox bytes provided by the caller. The
+    // ktstr library does not own the bytes — they come from the
+    // `KTSTR_BUSYBOX_PATH` env var that cargo-ktstr sets at startup
+    // (see [`crate::vmm::blobs::load_busybox_bytes`]).
+    if let Some(busybox_bytes) = busybox_bytes {
+        write_entry(&mut archive, "bin/busybox", busybox_bytes, 0o100755)?;
     }
 
     // Extra binaries (stripped to reduce initramfs size)

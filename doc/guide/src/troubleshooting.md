@@ -249,47 +249,96 @@ complete failure output format and auto-repro walkthrough.
 ## send_sys_rdy timeout
 
 ```text
-WARN ktstr::vmm::rust_init: ktstr-init: send_sys_rdy retry budget exhausted (10000 ms, 1 vCPUs); see doc/guide/src/troubleshooting.md#send_sys_rdy-timeout for tuning
+WARN ktstr::vmm::rust_init: ktstr-init: send_sys_rdy failed within boot budget; see https://likewhatevs.github.io/ktstr/guide/troubleshooting.html#send_sys_rdy-timeout budget_ms=10000 vcpus=8 elapsed_ms=10142 port_exists=false kern_addrs_sent=false
 ```
 
-The placeholders `(NNNNN ms, V vCPUs)` are the rendered budget (in
-milliseconds) and the guest's online vCPU count.
+The guest-side `ktstr-init` sends a `MSG_TYPE_SYS_RDY` TLV frame
+through the virtio-console bulk port (`/dev/vport0p1`) after the
+VM boots, signaling the host monitor that the guest is ready. The
+retry loop polls for the port device at 100 ms cadence with a
+wall-clock deadline. When the deadline expires the WARN above
+fires, the guest continues running, and the host monitor falls
+through to its `data_valid` gate to start sampling without the
+SYS_RDY trigger; a late SYS_RDY arriving past the host's 5 s
+pre-sample wait is harmless (the freeze coordinator's
+`Option::take` makes the eventfd write fire-once). The test then
+fails through the standard VM-teardown path once the harness gives
+up — see [Scheduler died](#scheduler-died) for that failure
+output.
 
-The guest-side `ktstr-init` writes a `sys_rdy` token to the
-host-shared mmap after the VM boots and dispatches its main thread,
-signaling the guest is ready to receive a test entry. When the host
-does not observe the token within the retry budget, the WARN above
-is logged and the VM proceeds to teardown without ever running the
-test scenario.
+### Diagnostic fields
 
-The retry budget scales with vCPU count between a 10000 ms floor
-and a 30000 ms cap — 150 ms per vCPU once `vcpus >= 67`, capped at
-30 s once `vcpus >= 200`. A 1-vCPU test gets the floor (10000 ms);
-a 126-vCPU test gets 18900 ms; a 200+-vCPU test gets the cap. On
-lightly-loaded hosts the floor covers the boot path comfortably.
+- `port_exists=false` — the virtio-console multiport handshake
+  never completed; `/dev/vport0p1` was never created by the
+  kernel's virtio_console driver. **Common causes**: the guest
+  kernel panicked before the driver probed (look for a kernel
+  oops in the `--- diagnostics ---` console tail; see
+  [Scheduler died](#scheduler-died) for the diagnostics-section
+  layout); the host VMM never sent `PORT_ADD` on the control
+  queue (host-side bug); or `VIRTIO_CONSOLE_F_MULTIPORT` was not
+  negotiated, so the driver took the legacy single-console
+  fallback and never created `/dev/vport0p1`.
+- `port_exists=true, kern_addrs_sent=false` — the port device
+  exists but writes did not go through. Either `writev` returned
+  an error or 0, or `port_fops_write`'s `wait_port_writable`
+  blocked on `host_connected` past the deadline. The kernel's
+  wait has no timeout — a host that never sends `PORT_OPEN`
+  blocks the loop indefinitely inside the syscall and this WARN
+  never fires at all.
+- `port_exists=true, kern_addrs_sent=true` — kern_addrs was
+  delivered but the subsequent sys_rdy write failed or blocked
+  past the deadline.
+- `elapsed_ms` much larger than `budget_ms` — a blocking
+  `writev` (kernel `wait_port_writable` on `host_connected`)
+  consumed wall time beyond the budget. The deadline is checked
+  only between iterations, so a blocked syscall can overshoot.
 
-**Common causes:**
+### Budget
 
-- Heavy host CPU contention from other workloads delaying guest
-  vCPU scheduling.
-- A KASAN / KCSAN / lockdep kernel build that adds substantial
-  boot-path overhead.
-- A guest kernel that panics before `ktstr-init` runs (look for a
-  kernel oops in the `--- diagnostics ---` console tail).
+The budget scales with vCPU count between a 10 s floor and a 30 s
+cap — 150 ms per vCPU once `vcpus >= 67`, capped at 30 s once
+`vcpus >= 200`. Worked examples:
 
-**Fixes:**
+| vCPUs   | budget_ms |
+|---------|-----------|
+| 1       | 10000 (floor) |
+| 8       | 10000 (floor) |
+| 67      | 10050 |
+| 126     | 18900 |
+| 200+    | 30000 (cap) |
 
-- Pass `--no-perf-mode` (or set `KTSTR_NO_PERF_MODE=1`) to disable
-  RT scheduling and exclusive LLC reservation, which reduces the
-  chance of host-side contention starving the guest's vCPU threads.
-  See [Performance mode](concepts/performance-mode.md) for the
-  full flag effect.
-- Reduce the topology for the test (`llcs`, `cores`, `threads`) —
-  fewer vCPUs means a shorter boot path.
-- Reserve CPUs for ktstr via host-side isolation (`isolcpus=`) on
-  the host kernel boot command line. See
+On lightly-loaded hosts the floor covers the boot path
+comfortably.
+
+### Fixes
+
+**If `port_exists=false`** (slow / starved boot preventing the
+driver from probing):
+
+- Pass `--no-perf-mode` (or set `KTSTR_NO_PERF_MODE=1`) to
+  disable RT scheduling and exclusive LLC reservation, which
+  reduces the chance of host-side contention starving the
+  guest's vCPU threads. See
+  [Performance mode](concepts/performance-mode.md) for the full
+  flag effect.
+- Reduce the topology for the test (`llcs`, `cores`, `threads`)
+  — fewer vCPUs means a shorter boot path.
+- Reserve CPUs for ktstr via host-side isolation (`isolcpus=`)
+  on the host kernel boot command line. See
   [Resource budget](concepts/resource-budget.md) for the
   host-side CPU isolation patterns ktstr expects.
+- A KASAN / KCSAN / lockdep kernel build adds substantial
+  boot-path overhead. Re-run on a non-instrumented kernel to
+  rule out instrumentation cost vs. a real boot stall.
+
+**If `port_exists=true`** (port device exists but the host-VMM
+side is not accepting writes):
+
+This is a host-VMM virtio-console state issue, not a guest CPU
+contention issue — the `--no-perf-mode` / topology / isolcpus
+fixes above do not apply. File a bug with the failure-output
+dump (the `--- diagnostics ---` console tail + the WARN line +
+the host-side log if available).
 
 ## Insufficient hugepages
 

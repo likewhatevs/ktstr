@@ -1,0 +1,36 @@
+error[E0603]: module `vmm` is private
+ --> tests/compile_fail/ktstr_test_post_vm_wrong_return_type_rejected.rs:3:12
+  |
+3 | use ktstr::vmm::VmResult;
+  |            ^^^ private module
+  |
+note: the module `vmm` is defined here
+ --> src/lib.rs
+  |
+  | pub(crate) mod vmm;
+  | ^^^^^^^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+  --> tests/compile_fail/ktstr_test_post_vm_wrong_return_type_rejected.rs:16:43
+   |
+16 | #[ktstr_test(scheduler = SCHED, post_vm = bad_post_vm)]
+   | ------------------------------------------^^^^^^^^^^^--
+   | |                                         |
+   | |                                         expected fn pointer, found fn item
+   | arguments to this enum variant are incorrect
+   |
+   = note: expected fn pointer `for<'a> fn(&'a VmResult) -> Result<(), anyhow::Error>`
+                 found fn item `for<'a> fn(&'a {type error}) -> () {bad_post_vm}`
+help: the type constructed contains `for<'a> fn(&'a {type error}) {bad_post_vm}` due to the type of the argument passed
+  --> tests/compile_fail/ktstr_test_post_vm_wrong_return_type_rejected.rs:16:1
+   |
+16 | #[ktstr_test(scheduler = SCHED, post_vm = bad_post_vm)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^-----------^^
+   |                                           |
+   |                                           this argument influences the type of `Some`
+note: tuple variant defined here
+  --> $RUST/core/src/option.rs
+   |
+   |     Some(#[stable(feature = "rust1", since = "1.0.0")] T),
+   |     ^^^^
+   = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)

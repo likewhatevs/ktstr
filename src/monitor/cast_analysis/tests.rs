@@ -572,7 +572,7 @@ fn exit() -> BpfInsn {
 /// cast — arena→kernel. `imm=1<<16` is the as(0)→as(1) cast in
 /// the other direction. Tests use the arena→kernel form to
 /// surface arena_confirmed evidence for shape-inference findings
-/// (F1 mitigation).
+/// (arena-evidence mitigation).
 fn addr_space_cast(dst: u8, src: u8, imm: i32) -> BpfInsn {
     mk_insn(BPF_CLASS_ALU64 | BPF_OP_MOV | BPF_SRC_X, dst, src, 1, imm)
 }
@@ -602,11 +602,11 @@ fn no_initial_seed_yields_empty_map() {
 fn simple_cast_recovers_target() {
     // r1 -> *(T *).
     // r2 = *(u64 *)(r1 + 8)   -- "load u64 at T.f"
-    // r4 = bpf_addr_space_cast(r2, 0, 1)  -- arena_confirmed evidence (F1)
+    // r4 = bpf_addr_space_cast(r2, 0, 1)  -- arena_confirmed evidence (arena evidence)
     // r3 = *(u64 *)(r4 + 0)   -- "use loaded value as Q*"
     //
     // The arena_space_cast on the LoadedU64Field register is the
-    // F1 mitigation prerequisite: shape inference alone is not
+    // arena-evidence prerequisite: shape inference alone is not
     // enough evidence to emit a finding. The `bpf_addr_space_cast`
     // tags `(t_id, 8)` as arena-confirmed, after which the
     // shape-inference finding can fire when exactly one struct
@@ -641,20 +641,20 @@ fn simple_cast_recovers_target() {
     );
 }
 
-/// F1 mitigation: shape-inference candidates without direct
+/// Arena-evidence mitigation: shape-inference candidates without direct
 /// arena evidence (no `BPF_ADDR_SPACE_CAST` AND no STX-flow
 /// allocator-return tag) must drop, even when the (offset, size)
 /// access pattern uniquely matches one BTF candidate. Pin the
 /// drop-without-evidence behaviour against a regression that
-/// would re-enable shape-inference-only emits, which the F1
-/// hostile-input mitigation explicitly forbids: a 33-bit-shaped
+/// would re-enable shape-inference-only emits, which the
+/// arena-evidence mitigation explicitly forbids: a 33-bit-shaped
 /// counter on aarch64 falls inside the 4 GiB arena window and
-/// would render as a chased pointer if the F1 gate weren't here.
+/// would render as a chased pointer if the arena-evidence gate weren't here.
 ///
 /// Same instruction shape as `simple_cast_recovers_target` minus
 /// the `BPF_ADDR_SPACE_CAST`. The companion proof — re-running
 /// with the addr_space_cast added DOES emit — anchors that the
-/// drop is the F1 gate, not a separate analysis defect that
+/// drop is the arena-evidence gate, not a separate analysis defect that
 /// would also have rejected the cast-augmented sequence.
 #[test]
 fn shape_inference_alone_drops_without_arena_confirmed() {
@@ -663,7 +663,7 @@ fn shape_inference_alone_drops_without_arena_confirmed() {
 
     // (a) WITHOUT addr_space_cast: shape inference recognizes
     // the (offset=0, size=8) access against Q's layout, but the
-    // F1 gate at `finalize`'s arena loop demands direct evidence
+    // arena-evidence gate at `finalize`'s arena loop demands direct evidence
     // (`arena_confirmed` OR `arena_stx_findings`). Neither is
     // populated, so the slot drops and the map stays empty.
     let insns_no_evidence = vec![ldx(BPF_SIZE_DW, 2, 1, 8), ldx(BPF_SIZE_DW, 3, 2, 0), exit()];
@@ -681,15 +681,15 @@ fn shape_inference_alone_drops_without_arena_confirmed() {
     assert!(
         map_no_evidence.is_empty(),
         "shape inference without `arena_confirmed` / `arena_stx_findings` \
-             must drop per the F1 mitigation: {map_no_evidence:?}"
+             must drop per the arena-evidence mitigation: {map_no_evidence:?}"
     );
 
     // (b) WITH addr_space_cast on the LoadedU64Field source: the
     // cast populates `arena_confirmed` for (T, 8); the same
     // (offset=0, size=8) access is now matched against Q with
     // direct evidence, so the finding emits. Establishes that
-    // (a)'s empty result is attributable specifically to the F1
-    // gate — without this companion the drop could be explained
+    // (a)'s empty result is attributable specifically to the
+    // arena-evidence gate — without this companion the drop could be explained
     // by an unrelated analysis defect (e.g. shape inference itself
     // failing to match Q's layout for some other reason).
     let insns_with_evidence = vec![
@@ -717,12 +717,12 @@ fn shape_inference_alone_drops_without_arena_confirmed() {
             addr_space: AddrSpace::Arena,
         }),
         "with addr_space_cast evidence the same shape MUST emit, \
-             proving (a)'s empty result is the F1 gate firing: \
+             proving (a)'s empty result is the arena-evidence gate firing: \
              {map_with_evidence:?}"
     );
 }
 
-/// F1 mitigation, multi-offset disambiguation form: a program
+/// Arena-evidence mitigation, multi-offset disambiguation form: a program
 /// whose access pattern uniquely intersects to one candidate
 /// (`Q { u64 @ 0; u32 @ 8 }`) but lacks ANY direct arena
 /// evidence — neither a `BPF_ADDR_SPACE_CAST` nor an STX-flow
@@ -742,11 +742,11 @@ fn shape_inference_alone_drops_without_arena_confirmed() {
 /// preserves single-offset rejection but allows multi-offset
 /// shapes to slip through.
 #[test]
-fn f1_mitigation_rejects_shape_inference_without_evidence() {
+fn arena_evidence_rejects_shape_inference_without_evidence() {
     // BTF: u64(1), u32(2), T(3, u64@8), Q(4, u64@0+u32@8). Q is
     // the ONLY struct in the BTF whose layout satisfies both
     // (offset=0, size=8) and (offset=8, size=4), so shape
-    // inference would resolve to Q if the F1 gate weren't here.
+    // inference would resolve to Q if the arena-evidence gate weren't here.
     let mut strings: Vec<u8> = vec![0];
     let n_u64 = push_name(&mut strings, "u64");
     let n_u32 = push_name(&mut strings, "u32");
@@ -804,7 +804,7 @@ fn f1_mitigation_rejects_shape_inference_without_evidence() {
     // `build_layout_index` resolves to {Q} uniquely. NO
     // addr_space_cast, NO pseudo_call+SubprogReturn — neither
     // `arena_confirmed` nor `arena_stx_findings` populated for
-    // (T, 8). The F1 gate at the head of the arena-emit loop
+    // (T, 8). The arena-evidence gate at the head of the arena-emit loop
     // drops the slot.
     let insns = vec![
         ldx(BPF_SIZE_DW, 2, 1, 8),
@@ -826,8 +826,8 @@ fn f1_mitigation_rejects_shape_inference_without_evidence() {
     assert!(
         map.is_empty(),
         "multi-offset shape inference with NO direct arena evidence \
-             (no addr_space_cast, no STX-flow tag) must drop per F1 \
-             mitigation: {map:?}"
+             (no addr_space_cast, no STX-flow tag) must drop per the \
+             arena-evidence mitigation: {map:?}"
     );
 }
 
@@ -975,7 +975,7 @@ fn multi_offset_disambiguates_target() {
     let t_id = 3;
     let q1_id = 4;
     // Sequence: load r1->T.f (offset 8) into r2; cast r2 to
-    // arena_confirmed (F1 mitigation prerequisite); then deref
+    // arena_confirmed (arena-evidence prerequisite); then deref
     // the cast result at offset 0 (8 bytes) and offset 8 (8 bytes).
     let insns = vec![
         ldx(BPF_SIZE_DW, 2, 1, 8),
@@ -1091,7 +1091,7 @@ fn multiple_distinct_casts_recorded() {
     // Cast 2: T.f2 -> *(Q2*). Read at offset 0 (8 bytes) and
     // offset 8 (4 bytes). Q1 lacks @0 → only Q2 matches.
     // Each LoadedU64Field gets an addr_space_cast applied to it
-    // (F1 mitigation prerequisite for shape-inference findings).
+    // (arena-evidence prerequisite for shape-inference findings).
     let insns = vec![
         // r2 = *(u64 *)(r1 + 8)  -- T.f1 → r2
         ldx(BPF_SIZE_DW, 2, 1, 8),
@@ -1308,7 +1308,7 @@ fn null_check_fall_through_preserves_state() {
         // pc 2: r3 = *r2  (fall-through; r2 still LoadedU64Field)
         // pc 3: exit.
         // BPF_ADDR_SPACE_CAST adds arena_confirmed evidence
-        // (F1 mitigation prerequisite). Apply BEFORE the
+        // (arena-evidence prerequisite). Apply BEFORE the
         // conditional jump so the cast lands on the source
         // u64 value, not the (already-typed) cast result.
         let jcc = mk_insn(*code, 2, 0, 1, 0);
@@ -1386,7 +1386,7 @@ fn deref_at_jump_target_is_dropped() {
 fn mov_x_propagates_loaded_state() {
     // r2 = T.f; r2 = arena_cast(r2); r4 = r2; deref r4 at offset 0.
     // The MOV r4, r2 propagates LoadedU64Field after the
-    // arena_confirmed evidence is recorded (F1 mitigation).
+    // arena_confirmed evidence is recorded (arena-evidence mitigation).
     let (blob, t_id, q_id) = btf_with_source_and_target(8, 0);
     let btf = Btf::from_bytes(&blob).unwrap();
     let insns = vec![
@@ -1893,7 +1893,7 @@ fn mixed_arena_and_kptr_in_one_program() {
     let a_id = 4;
     let m_id = 5;
     let insns = vec![
-        // Arena LDX path with arena_confirmed evidence (F1).
+        // Arena LDX path with arena_confirmed evidence (arena evidence).
         ldx(BPF_SIZE_DW, 2, 1, 0),
         addr_space_cast(2, 2, 1),
         ldx(BPF_SIZE_DW, 3, 2, 0),
@@ -2245,7 +2245,7 @@ fn addr_space_cast_kernel_to_arena_drops_dst() {
     // "dst Unknown, src preserved" (correct) from "both
     // clobbered" (regression where the cast spilled into src).
     let cast = mk_insn(BPF_CLASS_ALU64 | BPF_OP_MOV | BPF_SRC_X, 4, 3, 1, 0x10000);
-    // F1 mitigation: include an arena→kernel cast on r3 to
+    // arena-evidence mitigation: include an arena→kernel cast on r3 to
     // populate `arena_confirmed` for `(T, 8)`. Without it,
     // shape inference alone would not emit the finding. The
     // cast targets a fresh register so r3 retains its
@@ -4416,7 +4416,7 @@ fn member_size_bytes_unsupported_terminals_skipped() {
     let btf = Btf::from_bytes(&blob).unwrap();
     let t_id = 2;
     let u_id = 6;
-    // r2 = *(u64*)(r1 + 8); cast r2 (F1 evidence); r3 =
+    // r2 = *(u64*)(r1 + 8); cast r2 (arena evidence); r3 =
     // *(u64*)(r2 + 24). The pattern (offset=24, size=8) must
     // intersect to {U} only -- Fwd / Func / Void members at
     // offsets 0/8/16 are skipped during layout indexing.
@@ -4513,7 +4513,7 @@ fn build_layout_index_skips_bitfields_in_candidates() {
     let btf = Btf::from_bytes(&blob).unwrap();
     let t_id = 2;
     let q2_id = 4;
-    // Sequence: r2 = *(u64*)(r1 + 8); cast r2 (F1 evidence);
+    // Sequence: r2 = *(u64*)(r1 + 8); cast r2 (arena evidence);
     // r3 = *(u64*)(r2 + 0).
     // Pattern (0, 8): layout includes Q2 only (Q1's bitfield
     // skipped). Map records (T, 8) -> (Q2, Arena).
@@ -4646,7 +4646,7 @@ fn union_works_like_struct_for_layout_and_member_lookup() {
     // Block 2: arena LDX through union target.
     //   r2 = Pointer{SourceU}; r3 = *(u64*)(r2 + 8); r4 = *(u64*)(r3 + 0).
     //   Pattern (0, 8) -> {TargetU}; (SourceU, 8) -> (TargetU, Arena).
-    // Add arena_confirmed evidence (F1) on r3 between the load
+    // Add arena_confirmed evidence (arena evidence) on r3 between the load
     // of SourceU.f and the deref through it.
     let insns = vec![
         stx(BPF_SIZE_DW, 1, 6, 16),
@@ -5424,7 +5424,7 @@ fn mov_x_self_copy_preserves_state() {
     let insns = vec![
         // r2 = *(u64*)(r1+8)  -- r2 = LoadedU64Field{T, 8}
         ldx(BPF_SIZE_DW, 2, 1, 8),
-        // r2 = arena_cast(r2) -- arena_confirmed evidence (F1)
+        // r2 = arena_cast(r2) -- arena_confirmed evidence (arena evidence)
         addr_space_cast(2, 2, 1),
         // r2 = r2             -- self-copy, r2 stays LoadedU64Field
         mov_x(2, 2),
@@ -6901,7 +6901,7 @@ fn initial_reg_duplicate_seeds_last_wins() {
     let s2_id = 3;
     let q_id = 4;
     // Seed R1 first as S1, then as S2 — last wins, R1 = S2.
-    // Sequence: r2 = *(u64*)(r1+16) = S2.f, cast (F1 evidence),
+    // Sequence: r2 = *(u64*)(r1+16) = S2.f, cast (arena evidence),
     // then r3 = *r2 at 0. Records (S2, 16) -> Q. If first seed
     // had won, S1 has no field at offset 16, so no record.
     let insns = vec![
@@ -6994,7 +6994,7 @@ fn large_program_buried_cast_recorded() {
         insns.push(mov_k(0, 0));
     }
     insns.push(ldx(BPF_SIZE_DW, 2, 1, 8));
-    // F1 mitigation: arena_confirmed evidence on r2.
+    // arena-evidence mitigation: arena_confirmed evidence on r2.
     insns.push(addr_space_cast(2, 2, 1));
     insns.push(ldx(BPF_SIZE_DW, 3, 2, 0));
     for _ in 0..4_997 {
@@ -7554,7 +7554,7 @@ fn many_field_struct_records_two_distinct_casts() {
     let q99_id: u32 = 6;
     // f50 at offset 400; f99 at offset 792.
     // Each LoadedU64Field gets an addr_space_cast applied for
-    // F1 mitigation arena_confirmed evidence.
+    // arena-evidence mitigation: arena_confirmed evidence.
     let insns = vec![
         ldx(BPF_SIZE_DW, 2, 1, 400),
         addr_space_cast(2, 2, 1),
@@ -7664,7 +7664,7 @@ fn many_cast_patterns_in_one_program() {
     let btf = Btf::from_bytes(&blob).unwrap();
     let t_id: u32 = 3;
     // Emit one (load + arena_cast + deref) triple per pattern for
-    // F1 mitigation arena_confirmed evidence on each slot.
+    // arena-evidence mitigation: arena_confirmed evidence on each slot.
     let mut insns: Vec<BpfInsn> = Vec::with_capacity(3 * N as usize + 1);
     for i in 0..N {
         insns.push(ldx(BPF_SIZE_DW, 2, 1, (8 * i) as i16));
@@ -8218,7 +8218,7 @@ fn stx_flow_conflict_with_kptr_drops_both() {
 /// shape-inference path's LDX accumulates into `patterns`, AND a
 /// `pseudo_call` + STX-flow path inserts into `arena_stx_findings`.
 /// The two evidence sources combine: STX-flow proves the slot
-/// holds an arena pointer (gates emission past the F1 direct-
+/// holds an arena pointer (gates emission past the arena-evidence direct-
 /// evidence requirement), and shape-inference resolves the
 /// target struct from the observed dereference pattern. The
 /// arena STX-flow loop in [`Analyzer::finalize`] runs the same
@@ -8354,7 +8354,7 @@ fn stx_flow_resolves_target_via_shape_inference_under_alias_tracking() {
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
-        "STX-flow gates emission past F1; shape inference resolves \
+        "STX-flow gates emission past the arena-evidence requirement; shape inference resolves \
              target_type_id from the recorded access pattern (Q is the \
              only struct of size 16 with u64@0 and u64@8): {map:?}"
     );
@@ -9459,7 +9459,7 @@ fn three_way_conflict_arena_kptr_pattern_drops_all() {
 /// on the queried offset directly.
 ///
 /// `addr_space_cast(4, 2, 1)` propagates r2's state into r4 and
-/// inserts `(T_id, 16)` into `arena_confirmed` (the F1 mitigation
+/// inserts `(T_id, 16)` into `arena_confirmed` (the arena-evidence
 /// gate's "direct evidence" channel). The STX-back of r4 mirrors
 /// real schedulers' arena-pointer write-back idiom; its src is
 /// `LoadedU64Field` (cast propagates state verbatim) so the
@@ -9474,7 +9474,7 @@ fn three_way_conflict_arena_kptr_pattern_drops_all() {
 /// only path that adds accesses). Combined with the
 /// `arena_confirmed` evidence, `finalize`'s shape-inference loop
 /// intersects the BTF layout for `(off=0, size=8)`: only
-/// `Q { u64 @ 0 }` matches that shape, so the F1-gated emit fires
+/// `Q { u64 @ 0 }` matches that shape, so the arena-evidence-gated emit fires
 /// with `target_type_id = Q`. The presence of `(T_id, 16) →
 /// CastHit { alloc_size: None, Q_id, Arena }` in the resulting `CastMap` is the
 /// witness that the array peel produced
@@ -9505,7 +9505,7 @@ fn struct_member_at_resolves_array_element_offset() {
     //       falls into the array's range and the test verifies
     //       it resolves to the u64 element type.
     // id 4: struct Q { u64 x @ 0 } — size 8. Unique-shape target
-    //       so the F1-gated shape inference resolves the
+    //       so the arena-evidence-gated shape inference resolves the
     //       cast-confirmed slot to a single candidate. T's only
     //       member is the array (size 32), so T is not a
     //       candidate for the (0, 8) access shape and the

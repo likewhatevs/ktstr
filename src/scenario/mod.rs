@@ -55,6 +55,7 @@ pub mod basic;
 pub mod bpf_pin;
 pub mod cpuset;
 pub mod dynamic;
+pub mod host_stall;
 pub mod interaction;
 pub mod nested;
 pub mod ops;
@@ -346,6 +347,7 @@ impl Drop for CgroupGroup<'_> {
 ///   `run_scenario` / `execute_steps` apply.
 /// - **Runtime coordination** — `wait_for_map_write`. Framework-set
 ///   gate that custom scenarios typically do not flip.
+#[non_exhaustive]
 pub struct Ctx<'a> {
     /// **VM environment.** Cgroup filesystem operations. `&dyn CgroupOps`
     /// (not `&CgroupManager`) so scenario code can be driven by an
@@ -421,6 +423,37 @@ pub struct Ctx<'a> {
     /// variants) each get an independent atomic instead of racing
     /// on shared global state.
     pub current_step: Arc<AtomicU16>,
+    /// **Drift-safe path derivation.** The `&'static str` name of
+    /// the [`KtstrTestEntry`](crate::test_support::KtstrTestEntry)
+    /// the running test body was dispatched as, stamped by the
+    /// guest-side `maybe_dispatch_vm_test_with_args` and the
+    /// host-only dispatch path before the test body runs. Drives
+    /// the body-side path-derivation methods
+    /// [`failure_dump_path`](Self::failure_dump_path),
+    /// [`wprof_pb_path`](Self::wprof_pb_path), and
+    /// [`repro_wprof_pb_path`](Self::repro_wprof_pb_path) — the
+    /// drift-safe replacement for the legacy pattern of
+    /// hardcoding the test fn name as a string literal at the
+    /// callsite. When `Some(name)`, those methods derive the
+    /// sidecar paths from the macro-stamped value at call time,
+    /// so a future test rename surfaces the resulting
+    /// `Result<PathBuf>` bail at compile-time-equivalent-failure
+    /// (a deterministic Err) rather than as a runtime ENOENT
+    /// against a stale literal.
+    ///
+    /// `None` is the manually-constructed-Ctx escape hatch — ad-hoc
+    /// scenario tests that build `Ctx` via
+    /// [`CtxBuilder::build`](CtxBuilder::build) without calling
+    /// [`CtxBuilder::entry_name`](CtxBuilder::entry_name) get
+    /// `None` and a path-derivation method invocation bails with an
+    /// actionable diagnostic naming the missing-stamp scenario.
+    /// Sibling to [`crate::vmm::VmResult::entry_name`] which carries
+    /// the same `&'static str` on the post-VM result struct (the
+    /// two ends of the test-name chain — pre-VM body context vs
+    /// post-VM result — store the same shape so the body-side
+    /// `ctx.failure_dump_path()` and the host-side
+    /// `result.failure_dump_path()` resolve to identical paths).
+    pub entry_name: Option<&'static str>,
 }
 
 impl std::fmt::Debug for Ctx<'_> {
@@ -442,6 +475,7 @@ impl std::fmt::Debug for Ctx<'_> {
                 "current_step",
                 &self.current_step.load(std::sync::atomic::Ordering::Relaxed),
             )
+            .field("entry_name", &self.entry_name)
             .finish()
     }
 }
@@ -485,6 +519,33 @@ impl Ctx<'_> {
     /// per scenario run even for a sustained
     /// misconfiguration — tight enough to leave in place without
     /// a rate limiter.
+    /// Read the live scheduler identity published by the
+    /// `Op::AttachScheduler` / `Op::ReplaceScheduler` /
+    /// `Op::DetachScheduler` dispatch arms. Returns `None` when no
+    /// scheduler is currently attached (the pre-attach state at
+    /// process start and the post-`Op::DetachScheduler` state).
+    ///
+    /// Distinct from `entry.scheduler` (the boot-time descriptor
+    /// from the `#[ktstr_test]` macro): `entry.scheduler` stays
+    /// the same across `Op::ReplaceScheduler` swaps, while
+    /// `ctx.current_scheduler()` reflects the LIVE identity after
+    /// any runtime swap. Consumer sites that care about the
+    /// currently-attached BPF binary (verifier_stats wiring,
+    /// monitor thresholds, auto-repro probe gates) want this
+    /// method; sites that care about the test's declared
+    /// scheduler (test-runner skip/include filtering, sidecar
+    /// `scheduler_name` metadata) want `entry.scheduler`.
+    ///
+    /// v0 limitation: the boot path does not publish the boot
+    /// scheduler into the side channel, so the first observable
+    /// `Some` arrives after the first `Op::AttachScheduler` /
+    /// `Op::ReplaceScheduler` runs. Consumer sites that want a
+    /// fallback should call `.unwrap_or(&entry.scheduler.binary)`
+    /// to combine the live view with the boot descriptor.
+    pub fn current_scheduler(&self) -> Option<&'static crate::test_support::SchedulerSpec> {
+        crate::vmm::rust_init::current_scheduler()
+    }
+
     pub(crate) fn active_sched_pid(&self) -> Option<libc::pid_t> {
         match self.sched_pid {
             Some(p) if p > 0 => Some(p),
@@ -581,6 +642,104 @@ impl Ctx<'_> {
     ) -> crate::scenario::ops::CgroupDef {
         crate::scenario::ops::CgroupDef::named(name).workers(self.workers_per_cgroup)
     }
+
+    /// Per-test failure-dump sidecar path. Derives
+    /// `{sidecar_dir()}/{entry_name}.failure-dump.json` from the
+    /// macro-stamped [`Self::entry_name`] — the drift-safe
+    /// replacement for the legacy pattern of hardcoding the test
+    /// fn name as a string literal at the callsite.
+    ///
+    /// # Sibling to [`crate::vmm::VmResult::failure_dump_path`]
+    ///
+    /// The post-VM result struct carries its own copy of the
+    /// macro-stamped entry name + computes the same path string.
+    /// A test body invocation `ctx.failure_dump_path()` and a
+    /// post-VM `result.failure_dump_path()` resolve to identical
+    /// paths because both stamp from the same
+    /// `entry.name: &'static str` source — proc-macro emission at
+    /// the `#[ktstr_test]` site.
+    ///
+    /// # Errors
+    ///
+    /// Bails when `self.entry_name` is `None`. The `None` shape is
+    /// the manually-constructed-Ctx escape hatch — ad-hoc scenario
+    /// unit tests build [`Ctx`] via [`CtxBuilder::build`] without
+    /// calling [`CtxBuilder::entry_name`]; such a context cannot
+    /// compute a drift-safe path. The bail diagnostic names the
+    /// missing-stamp scenario explicitly so test authors who hit it
+    /// know exactly which builder method to call.
+    pub fn failure_dump_path(&self) -> anyhow::Result<std::path::PathBuf> {
+        let name = self.entry_name.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Ctx::failure_dump_path requires entry_name set by the \
+                 macro-stamped dispatch path \
+                 (`maybe_dispatch_vm_test_with_args`); reached with \
+                 entry_name = None, which means the Ctx was \
+                 constructed via CtxBuilder::build without calling \
+                 .entry_name(...). Call ctx_builder.entry_name(name) \
+                 explicitly, OR if this is a scenario unit-test fixture \
+                 that has no test-entry context, derive the path inline \
+                 (sidecar_dir().join(format!(\"{{name}}.failure-dump.json\"))) \
+                 — the method form is for tests dispatched via \
+                 #[ktstr_test], not for builder-driven fixtures."
+            )
+        })?;
+        Ok(crate::test_support::sidecar_dir().join(format!("{name}.failure-dump.json")))
+    }
+
+    /// Per-test wprof Perfetto-trace sidecar path. Mirror of
+    /// [`Self::failure_dump_path`] for the wprof artifact —
+    /// derives `{sidecar_dir()}/{entry_name}.wprof.pb` from the
+    /// macro-stamped [`Self::entry_name`].
+    ///
+    /// Sibling to [`crate::vmm::VmResult::wprof_pb_path`] —
+    /// the post-VM and pre-VM derivations produce identical paths.
+    /// See [`Self::failure_dump_path`] for the broader contract +
+    /// the manually-constructed-Ctx None-bail diagnostic.
+    ///
+    /// # Errors
+    ///
+    /// Bails when `self.entry_name` is `None` per the same shape
+    /// as [`Self::failure_dump_path`].
+    pub fn wprof_pb_path(&self) -> anyhow::Result<std::path::PathBuf> {
+        let name = self.entry_name.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Ctx::wprof_pb_path requires entry_name set by the \
+                 macro-stamped dispatch path; reached with \
+                 entry_name = None — see Ctx::failure_dump_path \
+                 for the manually-constructed-Ctx workaround."
+            )
+        })?;
+        Ok(crate::test_support::sidecar_dir().join(format!("{name}.wprof.pb")))
+    }
+
+    /// Per-test auto-repro wprof Perfetto-trace sidecar path.
+    /// Mirror of [`Self::wprof_pb_path`] for the auto-repro
+    /// artifact — derives `{sidecar_dir()}/{entry_name}.repro.wprof.pb`
+    /// from the macro-stamped [`Self::entry_name`]. The
+    /// auto-repro variant lands ONLY when the primary VM's
+    /// scenario reports a failure AND the test's
+    /// `#[ktstr_test(auto_repro = true)]` gates the second-VM
+    /// rerun; an absent `.repro.wprof.pb` is the steady state for
+    /// passing tests.
+    ///
+    /// Sibling to [`crate::vmm::VmResult::repro_wprof_pb_path`].
+    ///
+    /// # Errors
+    ///
+    /// Bails when `self.entry_name` is `None` per the same shape
+    /// as [`Self::failure_dump_path`].
+    pub fn repro_wprof_pb_path(&self) -> anyhow::Result<std::path::PathBuf> {
+        let name = self.entry_name.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Ctx::repro_wprof_pb_path requires entry_name set by \
+                 the macro-stamped dispatch path; reached with \
+                 entry_name = None — see Ctx::failure_dump_path for \
+                 the manually-constructed-Ctx workaround."
+            )
+        })?;
+        Ok(crate::test_support::sidecar_dir().join(format!("{name}.repro.wprof.pb")))
+    }
 }
 
 /// Fluent builder for [`Ctx`].
@@ -627,6 +786,7 @@ pub struct CtxBuilder<'a> {
     assert: crate::assert::Assert,
     wait_for_map_write: bool,
     current_step: Arc<AtomicU16>,
+    entry_name: Option<&'static str>,
 }
 
 impl<'a> CtxBuilder<'a> {
@@ -699,6 +859,33 @@ impl<'a> CtxBuilder<'a> {
         self
     }
 
+    /// **Drift-safe path derivation.** Stamp the
+    /// `&'static str` name of the
+    /// [`KtstrTestEntry`](crate::test_support::KtstrTestEntry)
+    /// the dispatched test body was registered as. Drives the
+    /// body-side path-derivation methods on [`Ctx`]
+    /// ([`failure_dump_path`](Ctx::failure_dump_path),
+    /// [`wprof_pb_path`](Ctx::wprof_pb_path),
+    /// [`repro_wprof_pb_path`](Ctx::repro_wprof_pb_path)) so test
+    /// authors get the drift-safe per-test sidecar path without
+    /// re-hardcoding the test fn name in the body — a future test
+    /// rename surfaces a deterministic `Result<PathBuf>` bail
+    /// rather than a runtime ENOENT against a stale literal.
+    ///
+    /// The framework's macro-stamped dispatch path
+    /// (`maybe_dispatch_vm_test_with_args` + the host-only
+    /// dispatcher) calls this with the entry name at Ctx
+    /// construction time, before the test body runs. Ad-hoc
+    /// scenario unit tests that build [`Ctx`] without the dispatch
+    /// path skip this setter, and the path-derivation methods bail
+    /// with an actionable diagnostic — see
+    /// [`Ctx::failure_dump_path`] for the None-case bail shape.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn entry_name(mut self, name: &'static str) -> Self {
+        self.entry_name = Some(name);
+        self
+    }
+
     /// Materialise the configured [`Ctx`].
     #[must_use = "dropping a Ctx without running the scenario discards the test setup"]
     pub fn build(self) -> Ctx<'a> {
@@ -713,6 +900,7 @@ impl<'a> CtxBuilder<'a> {
             assert: self.assert,
             wait_for_map_write: self.wait_for_map_write,
             current_step: self.current_step,
+            entry_name: self.entry_name,
         }
     }
 }
@@ -737,6 +925,7 @@ impl<'a> Ctx<'a> {
             assert: crate::assert::Assert::default_checks(),
             wait_for_map_write: false,
             current_step: Arc::new(AtomicU16::new(0)),
+            entry_name: None,
         }
     }
 

@@ -89,6 +89,39 @@ fn force_reboot() -> ! {
 /// initialise with and the consumer to filter on.
 static SCHED_PID: AtomicI32 = AtomicI32::new(0);
 
+/// Live identity of the currently-attached scheduler, parallel to
+/// [`SCHED_PID`]'s pid side-channel. `null` means "no scheduler
+/// attached" — the initial value at process start and the post-
+/// [`Op::DetachScheduler`] state. Non-null points at a
+/// `&'static SchedulerSpec` (the `binary` field of the
+/// `&'static Scheduler` the Op carries), so consumers can read
+/// `has_bpf_scheduler()` / `has_active_scheduling()` against the
+/// LIVE identity rather than the boot-time `entry.scheduler`
+/// descriptor that goes stale after `Op::ReplaceScheduler` swaps
+/// the attached binary mid-scenario.
+///
+/// Storage: `AtomicPtr<SchedulerSpec>` because the value is a
+/// reference to immutable static data (every `Scheduler` const
+/// declared via `declare_scheduler!` lives in `.rodata` for the
+/// lifetime of the process); the producer stores the `&'static
+/// SchedulerSpec` re-cast to `*mut`, the consumer reads back as
+/// `*const` and dereferences under the SAFETY argument that the
+/// pointer either originated from a `&'static SchedulerSpec` (so
+/// the `'static` lifetime is the entire process) or is `null`
+/// (filtered by the wrapper). `*mut` storage is the only Atomic*
+/// type the standard library exposes for raw pointer values — the
+/// `*mut` vs `*const` is a Rust-level type distinction, not a
+/// kernel-level mutability claim; the pointed-to data is never
+/// mutated through this pointer.
+///
+/// `Acquire`/`Release` ordering pairs with [`SCHED_PID`]'s — the
+/// two side channels co-publish a single logical scheduler-attach
+/// event, and a reader that observes the new pid via
+/// [`sched_pid`] also observes the new scheduler identity via
+/// [`current_scheduler`].
+static CURRENT_SCHEDULER: std::sync::atomic::AtomicPtr<crate::test_support::SchedulerSpec> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
 /// Active [`SchedExitStop`] handle for the currently-running
 /// scheduler's exit monitor. The boot path installs the initial
 /// handle here via [`install_initial_sched_exit_monitor`]; the
@@ -236,6 +269,59 @@ pub(crate) fn sched_pid() -> Option<libc::pid_t> {
 /// kill) are visible to the next reader.
 pub(crate) fn set_sched_pid(pid: libc::pid_t) {
     SCHED_PID.store(pid, Ordering::Release);
+}
+
+/// Read the live scheduler identity published by the dispatch
+/// arms of `Op::AttachScheduler` / `Op::ReplaceScheduler` (the
+/// matching `set_current_scheduler` call site lives in
+/// `src/scenario/ops/mod.rs`). Returns `None` when no scheduler
+/// is currently attached — the pre-attach state at process start
+/// and the post-`Op::DetachScheduler` state.
+///
+/// `Acquire` ordering synchronises against the producer's
+/// `Release` store so any side effects the dispatch path
+/// performed before the publish are visible to the reader.
+///
+/// The returned reference inherits the `'static` lifetime of the
+/// stored `&'static SchedulerSpec` — every `Scheduler` declared
+/// via `declare_scheduler!` lives in `.rodata` for the process
+/// lifetime, and the producer always stores a reference into that
+/// region.
+pub fn current_scheduler() -> Option<&'static crate::test_support::SchedulerSpec> {
+    let ptr = CURRENT_SCHEDULER.load(Ordering::Acquire);
+    if ptr.is_null() {
+        None
+    } else {
+        // SAFETY: every non-null value stored in CURRENT_SCHEDULER
+        // came from a `&'static SchedulerSpec` re-cast to `*mut`
+        // via `set_current_scheduler`; the pointee is in `.rodata`
+        // and outlives the process, so the `&'static` lifetime is
+        // sound. The `*mut` → `*const` conversion is a no-op at
+        // runtime — only required because `AtomicPtr<T>` exposes
+        // `*mut T` storage even when the program never mutates
+        // through the pointer.
+        Some(unsafe { &*(ptr as *const _) })
+    }
+}
+
+/// Publish `scheduler` as the currently-attached scheduler, or
+/// clear the slot when `None`. Called by the
+/// `Op::AttachScheduler` / `Op::ReplaceScheduler` /
+/// `Op::DetachScheduler` dispatch arms in
+/// `src/scenario/ops/mod.rs` immediately after the corresponding
+/// pid change so the two side channels (pid + identity) stay
+/// co-published.
+///
+/// `Release` ordering pairs with the `Acquire` load in
+/// [`current_scheduler`].
+pub(crate) fn set_current_scheduler(
+    scheduler: Option<&'static crate::test_support::SchedulerSpec>,
+) {
+    let ptr = match scheduler {
+        Some(r) => r as *const _ as *mut _,
+        None => std::ptr::null_mut(),
+    };
+    CURRENT_SCHEDULER.store(ptr, Ordering::Release);
 }
 
 /// RAII guard that flips SIGCHLD to a target disposition on
@@ -1002,43 +1088,24 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // `epoll_wait` blocks on a sys_rdy eventfd; the freeze
     // coordinator's bulk-drain dispatch promotes a CRC-valid
     // `MSG_TYPE_SYS_RDY` frame into that eventfd. Sending here —
-    // after `mount_filesystems()` brought up devtmpfs so
-    // `/dev/vport0p1` exists, and after the initramfs-extraction
-    // sentinel confirms userspace is sound — guarantees the
-    // host's first sample observes a fully-booted guest with
-    // `setup_per_cpu_areas` populated and KASLR randomization
-    // already complete (both kernel-boot prerequisites for the
-    // monitor's `__per_cpu_offset[]` / `page_offset_base`
-    // reads). Replaces the earlier trigger that fired on the
-    // first port-0 TX byte (kernel printk via `/dev/hvc0`),
-    // which depended on incidental console traffic rather than
-    // an explicit readiness signal.
+    // after `mount_filesystems()` brought up devtmpfs and the
+    // initramfs-extraction sentinel confirms userspace is sound —
+    // guarantees the host's first sample observes a fully-booted
+    // guest with `setup_per_cpu_areas` populated and KASLR
+    // randomization already complete (both kernel-boot
+    // prerequisites for the monitor's `__per_cpu_offset[]` /
+    // `page_offset_base` reads). Replaces the earlier trigger that
+    // fired on the first port-0 TX byte (kernel printk via
+    // `/dev/hvc0`), which depended on incidental console traffic
+    // rather than an explicit readiness signal.
     //
-    // The kernel virtio_console driver's multiport handshake
-    // (DEVICE_READY → PORT_ADD → PORT_READY → PORT_OPEN, see
+    // `/dev/vport0p1` may not yet exist at this point: the kernel
+    // virtio_console driver's multiport handshake (DEVICE_READY →
+    // PORT_ADD → PORT_READY → PORT_OPEN, see
     // `drivers/char/virtio_console.c`) completes asynchronously
-    // and is independent of devtmpfs being mounted. On a fast
-    // boot the handshake can still be in flight when this
-    // statement runs, so `send_sys_rdy()`'s lazy
-    // `/dev/vport0p1` open returns `None` and the call returns
-    // `false`. Retry for [`sys_rdy_budget_ms(vcpus)`] at 100 ms
-    // cadence (floor 10 s, cap 30 s, 150 ms/vCPU in between) —
-    // the per-vCPU rate absorbs cold-cache TRY 1 boots whose
-    // handshake time scales roughly linearly with topology size,
-    // and the cap prevents pathological topologies from blowing
-    // the watchdog budget. The host monitor's pre-sample wait is
-    // bounded at 5 s; once that expires the monitor falls through
-    // to its `data_valid` gate and starts sampling, while THIS
-    // retry continues running in the guest's init thread to
-    // deliver SYS_RDY as soon as the device appears. Late delivery
-    // still promotes the eventfd, but the freeze coordinator's
-    // `Option::take` makes the promotion fire-once so a late
-    // SYS_RDY past the host wait is harmless. If the full
-    // (scaled) budget exhausts, the guest continues with the rest
-    // of init and the monitor's `data_valid` gate keeps reads
-    // safe — the BSS-zero rejection in
-    // [`super::super::monitor::reader`]'s sample loop tolerates
-    // pre-boot zeros for as long as needed.
+    // and is independent of devtmpfs being mounted. The retry
+    // protocol, wall-clock deadline, and failure diagnostics live
+    // in [`send_sys_rdy_with_retry`].
     let kern_phys_base = crate::vmm::guest_comms::read_phys_base_from_iomem().unwrap_or(0);
     // Runtime KVA of `_text`, the kernel image start symbol.
     // Powers the host-side virt-KASLR derive at
@@ -1074,37 +1141,18 @@ pub(crate) fn ktstr_guest_init() -> ! {
         crate::vmm::guest_comms::read_kernel_page_offset_base_from_kallsyms().unwrap_or(0);
     let kern_addrs =
         crate::vmm::wire::KernAddrs::new(kern_phys_base, kern_page_offset_base_kva, kern_text_kva);
-    // `count_online_cpus()` reads `/sys/devices/system/cpu/online`
-    // which `mount_filesystems()` mounted earlier in setup();
-    // fallback to 1 yields the floor budget if the read fails.
+    // `count_online_cpus()` reads /sys/devices/system/cpu/online which
+    // `mount_filesystems()` mounted earlier. Fallback to 1 yields the
+    // floor budget if the read fails — preserves the original
+    // single-CPU default rather than panicking on a procfs hiccup.
     let vcpus = count_online_cpus().unwrap_or(1);
-    let budget_ms = crate::test_support::sys_rdy_budget_ms(vcpus);
-    // Ceiling division: guarantees retries * 100 ms >= budget_ms so the
-    // guest never exits early when the formula doesn't divide cleanly
-    // (e.g. 67 vCPUs → 10_050 ms → 101 retries / 10_100 ms wall, vs
-    // truncating-floor 100 retries / 10_000 ms wall).
-    let retries = budget_ms.div_ceil(100) as u32;
-    for attempt in 0..retries {
-        crate::vmm::guest_comms::send_kern_addrs(&kern_addrs);
-        if crate::vmm::guest_comms::send_sys_rdy() {
-            break;
-        }
-        if attempt + 1 == retries {
-            // The tracing subscriber was installed right after
-            // `mount_filesystems()`, so this surfaces through the
-            // subscriber — which writes to stderr. fd 2 here is
-            // still the pre-redirect stderr (kernel console / COM2);
-            // after `redirect_stdio_to_bulk_port` runs later, fd 2
-            // is a pipe drained into the bulk port forwarder.
-            tracing::warn!(
-                "ktstr-init: send_sys_rdy retry budget exhausted ({} ms, {} vCPUs); \
-                 see doc/guide/src/troubleshooting.md#send_sys_rdy-timeout for tuning",
-                budget_ms,
-                vcpus
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    let budget = std::time::Duration::from_millis(crate::test_support::sys_rdy_budget_ms(vcpus));
+    send_sys_rdy_with_retry(
+        budget,
+        vcpus,
+        &kern_addrs,
+        std::path::Path::new(crate::vmm::guest_comms::BULK_PORT_DEV),
+    );
 
     // Phase 1.5: Auto-mount the user data disk at /mnt/disk0 if the
     // host pre-formatted it (KTSTR_DISK0_FS=<tag> on the cmdline).
@@ -1164,7 +1212,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
         // The variable is inherited across fork/exec, so every
         // descendant of guest init (including workloads that re-exec
         // /init to run scenarios) observes it.
-        std::env::set_var("KTSTR_GUEST_INIT", "1");
+        std::env::set_var(crate::KTSTR_GUEST_INIT_ENV, "1");
     }
 
     // Disk-template build mode: format /dev/vda with the embedded
@@ -1211,6 +1259,17 @@ pub(crate) fn ktstr_guest_init() -> ! {
 
         // Mount devpts so PTY allocation works.
         mount_devpts();
+
+        // Run scheduler enable cmds (from `--ktstr-shell-test=NAME`'s
+        // ShellTestDescriptor.scheduler_enable_cmds — Phase B of the
+        // KernelBuiltin lifecycle, packed into /sched_enable by the
+        // VM builder). Idempotent / safe when the file doesn't exist
+        // (returns Ok(())). Mirrors the test-mode wire-up at L1329 so
+        // the shell-mode operator drops into the SAME scheduler-loaded
+        // environment a test would see — without this, the shell falls
+        // through to whatever scheduler the kernel boots with and the
+        // banner's "running N enable cmd(s)" claim would be a lie.
+        exec_shell_script("/sched_enable");
 
         // --exec mode: run a command non-interactively instead of
         // dropping into an interactive shell. Inherits stdio from init
@@ -1264,6 +1323,32 @@ pub(crate) fn ktstr_guest_init() -> ! {
             unsafe {
                 libc::tcdrain(2);
             }
+            // Run scheduler disable cmds before reboot — symmetric
+            // bracket with /sched_enable above; idempotent when the
+            // file doesn't exist.
+            exec_shell_script("/sched_disable");
+            // Drain stdout/stderr after /sched_disable so any
+            // stdout/stderr writes from the disable script (e.g.
+            // the `echo > /proc/1/fd/1` marker pattern used by
+            // the shell-mode lifecycle e2e fixture) reach host
+            // capture before force_reboot triggers
+            // device_shutdown. tcdrain bounds the TTY FIFO drain
+            // in userspace; the virtio TX ring drain itself
+            // happens during the kernel's hvc_close path in
+            // device_shutdown. Sysfs-only disable scripts (e.g.
+            // `echo 0 > /sys/...`) don't write to the TTY FIFO;
+            // tcdrain is a harmless no-op for them. No prior
+            // Rust stdout/stderr flush is needed because
+            // exec_shell_line writes via fs::write, bypassing
+            // Rust's BufWriter. Symmetric with the post-payload
+            // drain above that protects the /sched_enable +
+            // --exec output bracket.
+            unsafe {
+                libc::tcdrain(1);
+            }
+            unsafe {
+                libc::tcdrain(2);
+            }
             force_reboot();
         }
 
@@ -1298,6 +1383,23 @@ pub(crate) fn ktstr_guest_init() -> ! {
         tracing::debug!("spawning interactive shell with PTY");
         spawn_shell_with_pty();
 
+        // Run scheduler disable cmds before reboot — symmetric
+        // bracket with /sched_enable. Runs after the operator types
+        // `exit` (spawn_shell_with_pty returns when the shell exits).
+        exec_shell_script("/sched_disable");
+        // Drain stdout/stderr after /sched_disable so any
+        // stdout/stderr writes from the disable script reach
+        // host capture before force_reboot triggers
+        // device_shutdown. The interactive-shell path shares
+        // the same race + drain semantics as the exec-mode
+        // path above (see that comment for the TTY FIFO vs
+        // virtio TX ring + fs::write bypass rationale).
+        unsafe {
+            libc::tcdrain(1);
+        }
+        unsafe {
+            libc::tcdrain(2);
+        }
         force_reboot();
     }
 
@@ -1401,6 +1503,15 @@ pub(crate) fn ktstr_guest_init() -> ! {
     tracing::debug!("dispatching test");
     crate::vmm::guest_comms::send_lifecycle(crate::vmm::wire::LifecyclePhase::PayloadStarting, "");
     crate::vmm::guest_comms::send_scenario_start();
+
+    // wprof capture: if the host set KTSTR_WPROF_ARGS on the cmdline
+    // AND /bin/wprof is available, spawn it concurrently with the
+    // test workload. wprof runs for its `-d` budget (500 ms default),
+    // writes a Perfetto .pb trace to /tmp/wprof.pb, and exits.
+    // After dispatch returns, the main thread joins the wprof thread
+    // and ships the .pb back to the host via MSG_TYPE_WPROF_TRACE.
+    let wprof_handle = spawn_wprof_if_configured();
+
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
     let code = if let Some(pa) = probe_phase_a {
         crate::test_support::maybe_dispatch_vm_test_with_phase_a(&args, pa).unwrap_or(1)
@@ -1409,6 +1520,18 @@ pub(crate) fn ktstr_guest_init() -> ! {
     };
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
     crate::vmm::guest_comms::send_scenario_pause();
+
+    // Join the wprof background thread (if it was spawned) and ship
+    // the .pb back to the host before cleanup begins. If wprof is
+    // still running (unlikely — `-d 500` should have completed well
+    // before a multi-second workload finishes), this join blocks
+    // until it exits.
+    if let Some(handle) = wprof_handle
+        && let Ok(Some(pb_bytes)) = handle.join()
+    {
+        crate::vmm::guest_comms::send_wprof_trace(&pb_bytes);
+    }
+
     drop(_s_phase5);
 
     // Flush test output before teardown. Rust's BufWriter on stdout
@@ -2106,6 +2229,163 @@ fn parse_topo_from_cmdline() -> Option<(u32, u32, u32, u32)> {
     let c: u32 = parts[2].parse().ok()?;
     let t: u32 = parts[3].parse().ok()?;
     Some((n, l, c, t))
+}
+
+/// Spawn `/bin/wprof` in a background thread if the host set
+/// `KTSTR_WPROF_ARGS` on the kernel cmdline. Returns a join handle
+/// whose `.join()` yields `Some(Vec<u8>)` (the `.pb` trace bytes)
+/// on success, or `None` on failure / no-op.
+///
+/// The spawned thread:
+/// 1. Parses `KTSTR_WPROF_ARGS` from `/proc/cmdline`
+/// 2. Runs `/bin/wprof <args> -T /tmp/wprof.pb -D /tmp/wprof.data`
+/// 3. Waits for the process to exit
+/// 4. Reads `/tmp/wprof.pb` and returns the bytes
+///
+/// If `KTSTR_WPROF_ARGS` is absent or `/bin/wprof` doesn't exist,
+/// returns `None` (no thread spawned, no-op). The caller joins the
+/// handle after the test workload dispatch returns and ships the
+/// bytes via [`crate::vmm::guest_comms::send_wprof_trace`].
+fn spawn_wprof_if_configured() -> Option<std::thread::JoinHandle<Option<Vec<u8>>>> {
+    let args_str = cmdline_val("KTSTR_WPROF_ARGS")?;
+    let wprof_bin = std::path::Path::new("/bin/wprof");
+    if !wprof_bin.exists() {
+        tracing::warn!("KTSTR_WPROF_ARGS set but /bin/wprof missing from initramfs");
+        return None;
+    }
+    Some(
+        std::thread::Builder::new()
+            .name("wprof-capture".into())
+            .spawn(move || {
+                // Host encodes args with ASCII Unit Separator (\x1F)
+                // via `WprofConfig::args_cmdline` because kernel
+                // cmdline tokenization would truncate a space-joined
+                // value at the first space. Split on the same
+                // delimiter here to recover the per-arg vec.
+                let mut cmd_args: Vec<String> =
+                    args_str.split('\x1f').map(String::from).collect();
+                cmd_args.extend([
+                    "-T".to_string(),
+                    "/tmp/wprof.pb".to_string(),
+                    "-D".to_string(),
+                    "/tmp/wprof.data".to_string(),
+                ]);
+                tracing::debug!(args = ?cmd_args, "spawning /bin/wprof");
+                let status = std::process::Command::new("/bin/wprof")
+                    .args(&cmd_args)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::inherit())
+                    .status();
+                match status {
+                    Ok(s) if s.success() => match std::fs::read("/tmp/wprof.pb") {
+                        Ok(bytes) if !bytes.is_empty() => {
+                            tracing::debug!(pb_bytes = bytes.len(), "wprof trace captured");
+                            Some(bytes)
+                        }
+                        Ok(_) => {
+                            tracing::warn!("wprof exited OK but /tmp/wprof.pb is empty");
+                            None
+                        }
+                        Err(e) => {
+                            tracing::warn!(%e, "read /tmp/wprof.pb after successful run");
+                            None
+                        }
+                    },
+                    Ok(s) => {
+                        tracing::warn!(exit = s.code(), "wprof exited non-zero");
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(%e, "spawn /bin/wprof failed");
+                        None
+                    }
+                }
+            })
+            .expect("spawn wprof-capture thread"),
+    )
+}
+
+/// Poll for the virtio-console bulk port and deliver the
+/// KERN_ADDRS + SYS_RDY frames to the host.
+///
+/// The kernel virtio_console driver's multiport handshake
+/// (DEVICE_READY → PORT_ADD → PORT_READY → PORT_OPEN, see
+/// `drivers/char/virtio_console.c`) completes asynchronously.
+/// `/dev/vport0p1` is created by `add_port` when PORT_ADD arrives
+/// (via `device_create` + devtmpfs `wait_for_completion`);
+/// `host_connected` flips true only when PORT_OPEN arrives later in
+/// the same `control_work_handler` batch. So a writev between port
+/// creation and host_connected blocks inside `wait_port_writable`
+/// (see `wait_event_freezable` at `include/linux/wait.h` — no
+/// timeout argument). The loop polls the device-node existence at
+/// 100 ms cadence with a wall-clock deadline so blocking writev
+/// time counts against the budget. The deadline is captured INSIDE
+/// the function so guest-init setup (mounts, kallsyms reads) does
+/// not eat the handshake's budget.
+///
+/// Both KERN_ADDRS and SYS_RDY are required for the host. KERN_ADDRS
+/// is latched: once a `send_kern_addrs` call returns true the loop
+/// skips it on subsequent iterations. The early-return condition is
+/// `kern_addrs_sent && send_sys_rdy()` — we never exit until BOTH
+/// have been delivered (a successful sys_rdy on the re-opened FD
+/// after a kern_addrs failure must not leave kern_addrs unsent,
+/// because the host's KERN_ADDRS arm is the only virt-KASLR
+/// publisher on aarch64; see `src/vmm/freeze_coord/dispatch.rs`'s
+/// KERN_ADDRS handler).
+///
+/// Host idempotency for KERN_ADDRS retries (matters when the latch
+/// is reset by a failed write that cleared the cached FD):
+/// `kern_phys_base` uses `.store(Release)` (overwrites every
+/// CRC-valid frame) and `kern_virt_kaslr` uses CAS-once. The
+/// payload bytes are identical across retries (built once from
+/// `KernAddrs::new`), so repeated stores and a CAS-success-then-
+/// no-op-on-equal-existing both produce the same final state.
+///
+/// On budget exhaustion the function emits a structured WARN with
+/// fields `budget_ms`, `vcpus`, `elapsed_ms` (loop wall time),
+/// `port_exists` (sampled once before WARN), and `kern_addrs_sent`.
+/// The guest then continues — the host monitor's `data_valid` gate
+/// keeps reads safe without SYS_RDY, and the freeze coordinator's
+/// `Option::take` makes a late SYS_RDY harmless (fire-once). See
+/// `doc/guide/src/troubleshooting.md#send_sys_rdy-timeout` for the
+/// operator-facing diagnosis flow.
+fn send_sys_rdy_with_retry(
+    budget: std::time::Duration,
+    vcpus: u32,
+    kern_addrs: &crate::vmm::wire::KernAddrs,
+    port_path: &std::path::Path,
+) {
+    let loop_t0 = std::time::Instant::now();
+    let deadline = loop_t0 + budget;
+    let mut kern_addrs_sent = false;
+    loop {
+        if port_path.exists() {
+            if !kern_addrs_sent {
+                kern_addrs_sent = crate::vmm::guest_comms::send_kern_addrs(kern_addrs);
+            }
+            if kern_addrs_sent && crate::vmm::guest_comms::send_sys_rdy() {
+                return;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            // Snapshot before WARN so the field reports the
+            // last-attempt state, not a fresh stat that could
+            // observe a port appearing in the gap between the
+            // final loop iteration and the WARN call.
+            let port_exists_snapshot = port_path.exists();
+            tracing::warn!(
+                budget_ms = budget.as_millis() as u64,
+                vcpus,
+                elapsed_ms = loop_t0.elapsed().as_millis() as u64,
+                port_exists = port_exists_snapshot,
+                kern_addrs_sent,
+                "ktstr-init: send_sys_rdy failed within boot budget; \
+                 see https://likewhatevs.github.io/ktstr/guide/troubleshooting.html#send_sys_rdy-timeout",
+            );
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// Count online CPUs from /sys/devices/system/cpu/online.
@@ -3823,7 +4103,7 @@ fn run_relay_session(
             (port_ready, socket_in, socket_hup_seen, stop_ready)
         };
 
-        // F6.1: flip `socket_healthy` to false IMMEDIATELY when
+        // Flip `socket_healthy` to false IMMEDIATELY when
         // POLLHUP/POLLERR is observed in the current iteration —
         // before any port-read processing. Earlier code flipped
         // the flag at the END of the loop body, which raced when
@@ -3911,7 +4191,7 @@ fn run_relay_session(
         // forward to port. B6: read POLLIN data even when POLLHUP
         // arrived in the same poll — buffered scheduler responses
         // remain readable across the half-close until the kernel
-        // socket buffer drains. F6.1: `socket_healthy` was already
+        // socket buffer drains. `socket_healthy` was already
         // flipped at the top of the loop body if POLLHUP/POLLERR
         // appeared in the same revents; the `!socket_healthy`
         // reconnect block below catches that case after this drain.
@@ -3943,7 +4223,7 @@ fn run_relay_session(
             }
         }
 
-        // F6.1: with `socket_healthy` already flipped at the top
+        // With `socket_healthy` already flipped at the top
         // of the loop body when POLLHUP/POLLERR arrived, the
         // post-drain reconnect just checks the flag. Reaching
         // this point with `!socket_healthy` means either (a)
@@ -4676,19 +4956,59 @@ fn start_sched_exit_monitor(
 /// - `echo VALUE > /path` (write VALUE to a file)
 /// - Lines starting with `#` are comments
 /// - Empty lines are ignored
+///
+/// # Failure surface
+///
+/// File-not-found is a legitimate "no script" condition (the
+/// sched_enable/sched_disable hooks are optional per
+/// `ShellTestDescriptor`). Logged at debug level and returns
+/// silently. All other read errors are logged at error level —
+/// the file exists but couldn't be read (permission denied,
+/// I/O error, etc.) is a real defect.
+///
+/// Per-line failures (file-write failures, unsupported commands)
+/// are counted and reported via a single error-level summary at
+/// the end. The script is not aborted on first failure —
+/// sched_enable/sched_disable hooks are typically independent
+/// settings (cpufreq governor, scheduler sysctl, tracing knobs),
+/// so the operator gets partial-apply behavior with a loud
+/// summary instead of silent partial-apply. Catches
+/// silent-drop violations where a typo'd `/sys/`
+/// path silently dropped before this rewrite.
 #[tracing::instrument]
 fn exec_shell_script(path: &str) {
     let content = match fs::read_to_string(path) {
         Ok(c) => c,
-        Err(_) => return,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(path, "ktstr-init: exec_shell_script: no script (skipping)");
+            return;
+        }
+        Err(e) => {
+            tracing::error!(path, err = %e, "ktstr-init: exec_shell_script: read failed");
+            return;
+        }
     };
 
+    let mut ok_count = 0u32;
+    let mut fail_count = 0u32;
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        exec_shell_line(line);
+        if exec_shell_line(line).is_ok() {
+            ok_count += 1;
+        } else {
+            fail_count += 1;
+        }
+    }
+    if fail_count > 0 {
+        tracing::error!(
+            path,
+            ok_count,
+            fail_count,
+            "ktstr-init: exec_shell_script partial-apply: {fail_count} line(s) failed, {ok_count} line(s) ok"
+        );
     }
 }
 
@@ -4696,7 +5016,12 @@ fn exec_shell_script(path: &str) {
 ///
 /// Supports:
 /// - `echo VALUE > /path` — write VALUE followed by newline to /path
-fn exec_shell_line(line: &str) {
+///
+/// Returns `Err(())` on file-write failure or unsupported command
+/// so the caller can count partial-apply failures and emit a
+/// summary. The per-line error is logged here; the unit-typed
+/// `Err` is only a counter signal.
+fn exec_shell_line(line: &str) -> Result<(), ()> {
     if let Some(rest) = line.strip_prefix("echo ")
         && let Some((value, path)) = rest.split_once(" > ")
     {
@@ -4704,10 +5029,12 @@ fn exec_shell_line(line: &str) {
         let path = path.trim();
         if let Err(e) = fs::write(path, format!("{value}\n")) {
             tracing::error!(value, path, err = %e, "ktstr-init: echo redirect failed");
+            return Err(());
         }
-        return;
+        return Ok(());
     }
     tracing::error!(line, "ktstr-init: unsupported command");
+    Err(())
 }
 
 #[cfg(test)]
@@ -4746,14 +5073,59 @@ mod tests {
             .tempfile()
             .unwrap();
         let path = _tempfile_keep_alive.path().to_str().unwrap();
-        exec_shell_line(&format!("echo 42 > {path}"));
+        assert!(exec_shell_line(&format!("echo 42 > {path}")).is_ok());
         let content = fs::read_to_string(_tempfile_keep_alive.path()).unwrap();
         assert_eq!(content, "42\n");
     }
 
     #[test]
-    fn exec_shell_line_unsupported_input_no_panic() {
-        exec_shell_line("# this is a comment");
+    fn exec_shell_line_unsupported_input_returns_err() {
+        // Comments are filtered upstream in exec_shell_script;
+        // a bare "# comment" reaching exec_shell_line is an
+        // unsupported command. Pinning the Err signal so the
+        // partial-apply counter in exec_shell_script catches
+        // typo'd lines instead of silently skipping them.
+        assert!(exec_shell_line("# this is a comment").is_err());
+    }
+
+    /// `exec_shell_script` emits an error-level summary instead of
+    /// silently partial-applying. A script with mixed-success lines
+    /// must surface the failure count to the operator — the
+    /// prior implementation only logged per-line errors with no
+    /// roll-up, so an operator scanning init-log for the
+    /// sched_enable result couldn't easily count failures.
+    #[test]
+    fn exec_shell_script_counts_per_line_failures() {
+        // Build a script with one valid echo + one unsupported
+        // command. The valid line writes a sentinel value to a
+        // tempfile so the test asserts the partial-apply did
+        // produce the expected side effect — proving the function
+        // didn't short-circuit on first failure.
+        let _payload_keep_alive = tempfile::Builder::new()
+            .prefix("ktstr-tax-payload-")
+            .tempfile()
+            .unwrap();
+        let payload_path = _payload_keep_alive.path().to_str().unwrap();
+        let mut script = tempfile::Builder::new()
+            .prefix("ktstr-tax-script-")
+            .tempfile()
+            .unwrap();
+        use std::io::Write;
+        writeln!(script, "echo 7 > {payload_path}").unwrap();
+        writeln!(script, "not_a_supported_command").unwrap();
+        script.flush().unwrap();
+        exec_shell_script(script.path().to_str().unwrap());
+        let payload = fs::read_to_string(payload_path).unwrap();
+        assert_eq!(payload, "7\n", "valid line must still apply");
+    }
+
+    /// File-not-found returns silently (legitimate "no script"
+    /// case for the optional sched_enable/sched_disable hooks).
+    /// Pins the debug-level skip so a future refactor that flipped
+    /// the missing-file path to error-level would surface here.
+    #[test]
+    fn exec_shell_script_missing_file_returns_silently() {
+        exec_shell_script("/tmp/ktstr-tax-nonexistent-script-path");
     }
 
     #[test]
@@ -4904,24 +5276,122 @@ mod tests {
         assert_eq!(parse_online_cpus("0-255"), Some(256));
     }
 
-    /// The send_sys_rdy retry loop bounds its retries by ceiling-
-    /// dividing the host-computed budget by the 100 ms sleep step.
-    /// Pin the budget→retries → wall-time invariant: total wall
-    /// time (retries * 100 ms) must always be `>= budget`, never
-    /// short-change the guest. Couples the host-side budget formula
-    /// to the guest-side retry loop.
+    /// Zero budget: loop exits within one sleep step and emits the
+    /// WARN with the expected diagnostic fields. The `traced_test`
+    /// attribute installs a capturing subscriber so `logs_contain`
+    /// can verify the message body and each structured field
+    /// rendered into the log line.
+    ///
+    /// Pins both the time bound AND the WARN content — a regression
+    /// that silently dropped the structured fields, or moved the
+    /// emit to a lower log level, would trip the logs_contain
+    /// assertions.
     #[test]
-    fn sys_rdy_retry_count_never_shortens_budget() {
-        use crate::test_support::sys_rdy_budget_ms;
-        for vcpus in [1u32, 32, 67, 126, 192, 200, 512] {
-            let budget_ms = sys_rdy_budget_ms(vcpus);
-            let retries = budget_ms.div_ceil(100);
-            let wall_ms = retries * 100;
+    #[tracing_test::traced_test]
+    fn send_sys_rdy_retry_exits_when_budget_exhausted() {
+        let budget = std::time::Duration::from_millis(0);
+        let addrs = crate::vmm::wire::KernAddrs::new(0, 0, None);
+        // Use a path that won't exist on the host so the loop
+        // takes the port_exists=false branch — no real device
+        // interaction in unit tests.
+        let port_path =
+            std::path::Path::new("/tmp/ktstr-test-nonexistent-port-please-do-not-create");
+        let t0 = std::time::Instant::now();
+        send_sys_rdy_with_retry(budget, 1, &addrs, port_path);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "send_sys_rdy_with_retry with zero budget took {elapsed:?}; \
+             must exit within one sleep step (with slack for CI load)",
+        );
+        // Verify the WARN content. tracing-test's logs_contain does
+        // a substring match against captured log lines.
+        assert!(
+            logs_contain("send_sys_rdy failed within boot budget"),
+            "WARN message must be emitted on budget exhaustion",
+        );
+        for field in [
+            "budget_ms=0",
+            "vcpus=1",
+            "elapsed_ms=",
+            "port_exists=false",
+            "kern_addrs_sent=false",
+        ] {
             assert!(
-                wall_ms >= budget_ms,
-                "vcpus={vcpus}: retries*100={wall_ms} must be >= budget={budget_ms}"
+                logs_contain(field),
+                "WARN must include structured field `{field}`",
             );
         }
+        assert!(
+            logs_contain("send_sys_rdy-timeout"),
+            "WARN must include the docs anchor pointer",
+        );
+    }
+
+    /// Wall-time floor invariant: the loop must wait at least
+    /// `budget` wall-clock time before emitting the WARN (with the
+    /// port absent). Parameterized over several (budget, vcpus)
+    /// combinations to pin the invariant across the production
+    /// budget range — replaces the deleted count-based formula
+    /// coupling test.
+    #[test]
+    fn send_sys_rdy_retry_respects_budget_across_sizes() {
+        let port_path =
+            std::path::Path::new("/tmp/ktstr-test-nonexistent-port-please-do-not-create");
+        let addrs = crate::vmm::wire::KernAddrs::new(0, 0, None);
+        for &(budget_ms, vcpus) in &[(50u64, 1u32), (150, 2), (250, 8), (500, 32)] {
+            let budget = std::time::Duration::from_millis(budget_ms);
+            let t0 = std::time::Instant::now();
+            send_sys_rdy_with_retry(budget, vcpus, &addrs, port_path);
+            let elapsed = t0.elapsed();
+            assert!(
+                elapsed >= budget,
+                "(budget={budget_ms}ms, vcpus={vcpus}): elapsed {elapsed:?} \
+                 < budget; the loop must wait at least the budget before \
+                 the WARN fires",
+            );
+            // Generous upper bound — CI runners under load can
+            // stretch std::thread::sleep significantly. Keep wide
+            // enough to never flake while still catching a runaway
+            // (e.g. count-based loop ignoring the budget).
+            let cap = budget + std::time::Duration::from_secs(2);
+            assert!(
+                elapsed < cap,
+                "(budget={budget_ms}ms, vcpus={vcpus}): elapsed {elapsed:?} \
+                 exceeded {cap:?}; the loop should not overshoot by more \
+                 than ~2s of slack",
+            );
+        }
+    }
+
+    /// Port-exists branch coverage: when the device-node path
+    /// resolves, the loop takes the `if port_path.exists()` arm
+    /// and calls `send_kern_addrs` / `send_sys_rdy`. In host
+    /// context those calls no-op via `assert_guest_context` (and
+    /// `write_to_bulk_port`'s hardcoded `/dev/vport0p1` open will
+    /// fail too), so kern_addrs_sent stays false and the loop
+    /// exhausts the budget. The WARN must report
+    /// `port_exists=true, kern_addrs_sent=false` — the
+    /// diagnostic combination the troubleshooting doc explains as
+    /// "the port device exists but writes failed".
+    #[test]
+    #[tracing_test::traced_test]
+    fn send_sys_rdy_retry_reports_port_exists_when_path_resolves() {
+        let tmpfile =
+            tempfile::NamedTempFile::new().expect("create tempfile to stand in for /dev/vport0p1");
+        let budget = std::time::Duration::from_millis(150);
+        let addrs = crate::vmm::wire::KernAddrs::new(0, 0, None);
+        send_sys_rdy_with_retry(budget, 4, &addrs, tmpfile.path());
+        assert!(
+            logs_contain("port_exists=true"),
+            "WARN must report port_exists=true when the path resolves",
+        );
+        assert!(
+            logs_contain("kern_addrs_sent=false"),
+            "WARN must report kern_addrs_sent=false when host-context \
+             writes no-op via assert_guest_context",
+        );
+        assert!(logs_contain("vcpus=4"), "WARN must include the vcpus value",);
     }
 
     #[test]

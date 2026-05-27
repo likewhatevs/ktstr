@@ -2245,7 +2245,7 @@ fn serialize_and_write_sidecar(sidecar: &SidecarResult, label: &str) -> anyhow::
 /// sidecars land: test isolation, archival capture, custom CI
 /// layouts).
 fn sidecar_dir_override() -> Option<PathBuf> {
-    std::env::var("KTSTR_SIDECAR_DIR")
+    std::env::var(crate::KTSTR_SIDECAR_DIR_ENV)
         .ok()
         .filter(|d| !d.is_empty())
         .map(PathBuf::from)
@@ -2391,10 +2391,8 @@ fn warn_unknown_project_commit_inner(
 /// fresh file. Holding the lock across the bounded walk closes
 /// the window. Two concurrent test PROCESSES that both resolve
 /// to the same `{kernel}-{project_commit}` run dir will both
-/// pre-clear; that cross-process race is out of scope here
-/// (tracked separately under the concurrent-write collision
-/// protection backlog item) and would corrupt each other's
-/// outputs even without pre-clearing.
+/// pre-clear; that cross-process race is out of scope here and
+/// would corrupt each other's outputs even without pre-clearing.
 ///
 /// FAILURE: `read_dir` errors are silently ignored — defensive
 /// behavior for direct callers (e.g. unit tests probing the

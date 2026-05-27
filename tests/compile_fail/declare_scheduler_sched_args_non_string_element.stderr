@@ -1,0 +1,5 @@
+error: declare_scheduler!: element of `sched_args` must be a string literal
+  --> tests/compile_fail/declare_scheduler_sched_args_non_string_element.rs:11:38
+   |
+11 |     sched_args = ["--exit-dump-len", 1048576],
+   |                                      ^^^^^^^

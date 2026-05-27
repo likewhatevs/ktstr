@@ -87,13 +87,14 @@ pub(crate) fn propagate_rust_env_from_cmdline() {
 /// cross-process file access).
 fn parse_rust_env_from_cmdline(cmdline: &str) -> Vec<(&'static str, &str)> {
     let mut out = Vec::new();
+    let sidecar_prefix = format!("{}=", crate::KTSTR_SIDECAR_DIR_ENV);
     for token in cmdline.split_whitespace() {
         if let Some(val) = token.strip_prefix("RUST_BACKTRACE=") {
             out.push(("RUST_BACKTRACE", val));
         } else if let Some(val) = token.strip_prefix("RUST_LOG=") {
             out.push(("RUST_LOG", val));
-        } else if let Some(val) = token.strip_prefix("KTSTR_SIDECAR_DIR=") {
-            out.push(("KTSTR_SIDECAR_DIR", val));
+        } else if let Some(val) = token.strip_prefix(sidecar_prefix.as_str()) {
+            out.push((crate::KTSTR_SIDECAR_DIR_ENV, val));
         }
     }
     out
@@ -440,6 +441,84 @@ fn extract_not_attached_reason(
     None
 }
 
+/// Persist the auto-repro VM's bulk-drain sidecar artifacts to
+/// disk: wprof Perfetto trace + profraw coverage data. The wprof
+/// path uses the `.repro.wprof.pb` infix so it sits beside (not
+/// on top of) the primary VM's `.wprof.pb` from the same test —
+/// the `.repro.` infix matches the convention every other repro-VM
+/// sidecar in the crate already uses
+/// (`.repro.failure-dump.json`, `.repro.probe-payload.partial.json`).
+/// Profraw goes to the shared `llvm-cov-target` dir via
+/// [`crate::test_support::profraw::write_profraw`] whose filename
+/// (pid + counter) makes collision impossible.
+///
+/// Mirrors the primary VM's per-frame dispatch in
+/// `crate::test_support::eval::run_ktstr_test_inner_impl`. Only
+/// the persistable-to-disk variants are replicated here — Stimulus,
+/// PayloadMetrics, and RawPayloadOutput frames from the auto-repro
+/// run are intentionally NOT extracted because they're a duplicate
+/// of the primary's and the verdict context only applies to the
+/// primary's drain.
+///
+/// CRC failures gate the write per arm — a corrupted frame's
+/// payload is undecidable, so writing it would mask the corruption
+/// rather than surface it.
+///
+/// Best-effort: every disk-write failure logs to stderr but never
+/// aborts the auto-repro flow. The caller's job is to surface
+/// repro verdicts; losing a sidecar artifact is observable on the
+/// filesystem (file absent) but should not erase the verdict.
+///
+/// Cross-binary collision safety relies on cargo-nextest's per-test
+/// binary isolation: each test binary runs as its own process under
+/// nextest, so two test binaries with identically-named
+/// `auto_repro=true` tests still write to distinct
+/// `sidecar_dir()`'s by binary lineage. Within a single binary,
+/// `KtstrTestEntry::name` is unique per test fn (the
+/// `#[ktstr_test]` macro derives it from the fn's module-path).
+fn write_auto_repro_sidecar_artifacts(
+    entry: &KtstrTestEntry,
+    repro_result: &crate::vmm::result::VmResult,
+) {
+    let Some(drain) = repro_result.guest_messages.as_ref() else {
+        return;
+    };
+    for bulk_entry in &drain.entries {
+        let kind = crate::vmm::wire::MsgType::from_wire(bulk_entry.msg_type);
+        match kind {
+            Some(crate::vmm::wire::MsgType::Profraw) => {
+                if bulk_entry.crc_ok
+                    && !bulk_entry.payload.is_empty()
+                    && let Err(e) = crate::test_support::profraw::write_profraw(&bulk_entry.payload)
+                {
+                    eprintln!("ktstr_test: auto-repro: write guest profraw: {e}");
+                }
+            }
+            Some(crate::vmm::wire::MsgType::WprofTrace) => {
+                if bulk_entry.crc_ok && !bulk_entry.payload.is_empty() {
+                    let wprof_path = crate::test_support::sidecar::sidecar_dir()
+                        .join(format!("{}.repro.wprof.pb", entry.name));
+                    if let Err(e) = std::fs::create_dir_all(
+                        wprof_path
+                            .parent()
+                            .expect("sidecar_dir join always has parent"),
+                    ) {
+                        eprintln!(
+                            "ktstr_test: auto-repro: create sidecar dir for wprof trace: {e}",
+                        );
+                    } else if let Err(e) = std::fs::write(&wprof_path, &bulk_entry.payload) {
+                        eprintln!(
+                            "ktstr_test: auto-repro: write wprof trace to {}: {e}",
+                            wprof_path.display(),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Attempt auto-repro: extract stack functions from COM2 scheduler output
 /// or COM1 kernel console (fallback), boot a second VM with BPF probes
 /// attached, and return formatted probe data. When no stack functions are
@@ -447,6 +526,7 @@ fn extract_not_attached_reason(
 /// dynamic BPF program discovery in the repro VM.
 /// `console_output` is COM1 kernel console text, used when COM2 has no
 /// extractable functions (e.g. scheduler died before writing output).
+///
 /// Returns `None` if repro cannot be attempted or yields no data.
 ///
 /// `too_many_arguments` allow: each parameter is independent test
@@ -632,6 +712,25 @@ pub(crate) fn attempt_auto_repro(
         .dual_snapshot(true)
         .performance_mode(entry.performance_mode);
 
+    // wprof: if `#[ktstr_test(wprof)]`, attach wprof to the
+    // auto-repro VM via the same helper the primary VM build site
+    // at `crate::test_support::eval::run_ktstr_test_inner_impl`
+    // uses — keeping both arms behind one helper rules out
+    // divergence between the two call sites. The auto-repro VM's
+    // MSG_TYPE_WPROF_TRACE bytes are written by
+    // `write_auto_repro_sidecar_artifacts` below; profraw
+    // coverage data goes to the shared `llvm-cov-target` dir via
+    // `write_profraw` (filename = pid + counter, no collision).
+    builder =
+        match crate::test_support::runtime::attach_wprof_if_requested(builder, entry, "auto-repro")
+        {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("ktstr_test: {e:#}");
+                return None;
+            }
+        };
+
     if let crate::test_support::entry::SchedulerSpec::KernelBuiltin { enable, disable } =
         &entry.scheduler.binary
     {
@@ -642,7 +741,7 @@ pub(crate) fn attempt_auto_repro(
     let merged_assert = crate::assert::Assert::default_checks()
         .merge(&entry.scheduler.assert)
         .merge(&entry.assert);
-    if entry.scheduler.has_active_scheduling() {
+    if entry.scheduler.has_bpf_scheduler() {
         builder = builder.monitor_thresholds(merged_assert.monitor_thresholds());
     }
 
@@ -738,6 +837,19 @@ pub(crate) fn attempt_auto_repro(
         "auto_repro: vm_run",
     );
     drop(vm);
+
+    // Write the auto-repro VM's sidecar artifacts (wprof Perfetto
+    // trace + profraw coverage) BEFORE classify_repro_vm_status
+    // consumes the drain for lifecycle signalling. Mirrors the
+    // primary VM's eval.rs per-frame dispatch but writes wprof under
+    // `${entry.name}.repro.wprof.pb` so primary + repro artifacts
+    // coexist on disk (matches the `.repro.` infix every other
+    // repro-VM sidecar already uses). Without this hop the
+    // auto-repro VM's wprof bytes would be silently dropped — the
+    // host already paid the capture cost in the guest, throwing the
+    // data away would mask exactly the bug the auto-repro VM was
+    // booted to reproduce.
+    write_auto_repro_sidecar_artifacts(entry, &repro_result);
 
     // Forward guest stderr (COM1) and COM2 probe lines when verbose.
     if verbose() {
@@ -1630,6 +1742,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         .work_type_override(work_type_override)
         .assert(merged_assert)
         .wait_for_map_write(!entry.bpf_map_write.is_empty())
+        .entry_name(entry.name)
         .build();
 
     // Send SCENARIO_START so the host-side watchdog resets its hard
@@ -2075,6 +2188,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
         .work_type_override(work_type_override)
         .assert(merged_assert)
         .wait_for_map_write(!entry.bpf_map_write.is_empty())
+        .entry_name(entry.name)
         .build();
 
     // Build the ProbeHandle up front from the destructured Phase A
@@ -3292,7 +3406,7 @@ mod tests {
         );
         assert_eq!(
             parsed,
-            vec![("KTSTR_SIDECAR_DIR", "/host/target/ktstr/run-key")]
+            vec![(crate::KTSTR_SIDECAR_DIR_ENV, "/host/target/ktstr/run-key")]
         );
     }
 
@@ -3307,7 +3421,7 @@ mod tests {
             parsed,
             vec![
                 ("RUST_LOG", "info"),
-                ("KTSTR_SIDECAR_DIR", "/dir"),
+                (crate::KTSTR_SIDECAR_DIR_ENV, "/dir"),
                 ("RUST_BACKTRACE", "1")
             ]
         );
@@ -4686,6 +4800,85 @@ mod tests {
         assert!(
             !primary_reached_workload(Some(&crc_bad)),
             "CRC-bad PayloadStarting frame must NOT count as reached workload",
+        );
+    }
+
+    // -- write_auto_repro_sidecar_artifacts --
+
+    /// Build a minimal `VmResult` whose `guest_messages` is `Some(...)`
+    /// with the supplied entries. All other fields take fixture
+    /// defaults via [`crate::vmm::result::VmResult::test_fixture`].
+    fn vm_result_with_drain(
+        entries: Vec<crate::vmm::wire::ShmEntry>,
+    ) -> crate::vmm::result::VmResult {
+        crate::vmm::result::VmResult {
+            guest_messages: Some(crate::vmm::host_comms::BulkDrainResult { entries }),
+            ..crate::vmm::result::VmResult::test_fixture()
+        }
+    }
+
+    /// A `MsgType::WprofTrace` frame containing a 4-byte protobuf-shaped
+    /// payload (`0x0a 0x02 'h' 'i'` = field=1 wire-type=2 length=2
+    /// followed by "hi"). The bytes don't need to be a real Perfetto
+    /// proto for the helper's write-to-disk contract — the helper is
+    /// payload-opaque.
+    fn wprof_frame(payload: &[u8], crc_ok: bool) -> crate::vmm::wire::ShmEntry {
+        crate::vmm::wire::ShmEntry {
+            msg_type: crate::vmm::wire::MsgType::WprofTrace.wire_value(),
+            payload: payload.to_vec(),
+            crc_ok,
+        }
+    }
+
+    /// CRC-OK WprofTrace frame writes `${entry.name}.repro.wprof.pb`
+    /// to sidecar_dir with the exact payload bytes. Pins the
+    /// no-silent-drop contract on the wprof bulk-drain dispatch arm.
+    #[test]
+    fn write_auto_repro_sidecar_artifacts_writes_wprof_pb() {
+        let _env_lock = crate::test_support::test_helpers::lock_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _sidecar = crate::test_support::test_helpers::EnvVarGuard::set(
+            crate::KTSTR_SIDECAR_DIR_ENV,
+            tmp.path(),
+        );
+        let entry =
+            crate::test_support::test_helpers::eevdf_entry("write_auto_repro_wprof_fixture");
+        let payload = b"\x0a\x02hi";
+        let result = vm_result_with_drain(vec![wprof_frame(payload, true)]);
+        write_auto_repro_sidecar_artifacts(&entry, &result);
+        let pb = tmp
+            .path()
+            .join("write_auto_repro_wprof_fixture.repro.wprof.pb");
+        assert!(pb.exists(), "expected wprof .pb at {}", pb.display());
+        assert_eq!(
+            std::fs::read(&pb).expect("read wprof .pb"),
+            payload,
+            "payload must round-trip byte-for-byte",
+        );
+    }
+
+    /// CRC-bad WprofTrace frames are skipped — a corrupted payload
+    /// would mask the corruption if written. Pins the CRC gate at
+    /// [`write_auto_repro_sidecar_artifacts`].
+    #[test]
+    fn write_auto_repro_sidecar_artifacts_skips_crc_bad_wprof() {
+        let _env_lock = crate::test_support::test_helpers::lock_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _sidecar = crate::test_support::test_helpers::EnvVarGuard::set(
+            crate::KTSTR_SIDECAR_DIR_ENV,
+            tmp.path(),
+        );
+        let entry =
+            crate::test_support::test_helpers::eevdf_entry("write_auto_repro_crc_bad_fixture");
+        let result = vm_result_with_drain(vec![wprof_frame(b"garbage", false)]);
+        write_auto_repro_sidecar_artifacts(&entry, &result);
+        let pb = tmp
+            .path()
+            .join("write_auto_repro_crc_bad_fixture.repro.wprof.pb");
+        assert!(
+            !pb.exists(),
+            "crc_ok=false WprofTrace must NOT produce a sidecar file at {}",
+            pb.display(),
         );
     }
 }

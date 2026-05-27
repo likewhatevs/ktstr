@@ -143,9 +143,34 @@ pub(crate) fn verbose() -> bool {
 /// `cargo ktstr test --no-perf-mode` exports `KTSTR_NO_PERF_MODE=1`
 /// (a non-empty value), so the existing CLI surface is unaffected.
 pub(crate) fn no_perf_mode_active() -> bool {
-    std::env::var("KTSTR_NO_PERF_MODE")
+    std::env::var(crate::KTSTR_NO_PERF_MODE_ENV)
         .map(|v| !v.is_empty())
         .unwrap_or(false)
+}
+
+/// True when `KTSTR_BYPASS_LLC_LOCKS` is set to a NON-EMPTY value.
+///
+/// Centralises the bypass check used at 7 reader sites:
+/// `vmm/builder.rs:909`, `cli/kernel_build/build.rs:102` +
+/// `:473` (the inverse `!bypass_llc_locks_active()` form),
+/// `bin/cargo_ktstr/kernel/mod.rs:694`,
+/// `bin/cargo_ktstr/misc/shell.rs:199`, and `bin/ktstr.rs:592` +
+/// `:1744`. All sites previously spelled the same
+/// `.ok().is_some_and(|v| !v.is_empty())` inline; centralising
+/// eliminates the drift hazard and matches the
+/// `no_perf_mode_active` shape so the empty-string contract is
+/// uniformly enforced.
+///
+/// Set via `--bypass-llc-locks` CLI flag or
+/// `KTSTR_BYPASS_LLC_LOCKS=1` direct export. Empty
+/// (`KTSTR_BYPASS_LLC_LOCKS=` from a Docker `--env` pass-through
+/// without value) does NOT activate per the empty-as-unset
+/// contract — preventing a stray export from silently disabling
+/// LLC flock contention enforcement in CI.
+pub fn bypass_llc_locks_active() -> bool {
+    std::env::var(crate::KTSTR_BYPASS_LLC_LOCKS_ENV)
+        .ok()
+        .is_some_and(|v| !v.is_empty())
 }
 
 /// Effective no-perf-mode for a given test entry. The env override
@@ -314,25 +339,136 @@ pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
     parts.join(" ")
 }
 
+/// Attach wprof configuration to a VM builder when the test entry
+/// declares `#[ktstr_test(wprof)]`.
+///
+/// Shared by [`crate::test_support::eval::run_ktstr_test_inner_impl`]
+/// (primary VM build site) AND
+/// [`crate::test_support::probe::attempt_auto_repro`] (auto-repro VM
+/// build site) so the two wire-ups can't drift. A regression in
+/// either site is impossible to introduce without touching this
+/// helper.
+///
+/// `label` distinguishes the call site in the error path
+/// (`"primary"` vs `"auto-repro"`) — the loaded `WprofConfig` itself
+/// is identical across both sites.
+///
+/// Returns the builder unchanged when `entry.wprof` is false.
+///
+/// # Errors
+///
+/// Bails when `entry.wprof` is true but
+/// [`crate::vmm::wprof::WprofConfig::from_env`] fails (typically
+/// because `cargo-ktstr` did not export `KTSTR_WPROF_PATH` via
+/// `install_env`, or the path it exported is unreadable). The bail
+/// is loud rather than silent because a wprof-tagged test that
+/// silently ran without wprof would produce no `.wprof.pb` artifact
+/// and the test author would not learn the capability dropped.
+pub(crate) fn attach_wprof_if_requested(
+    builder: crate::vmm::KtstrVmBuilder,
+    entry: &KtstrTestEntry,
+    label: &'static str,
+) -> anyhow::Result<crate::vmm::KtstrVmBuilder> {
+    if !entry.wprof {
+        return Ok(builder);
+    }
+    let mut config = crate::vmm::wprof::WprofConfig::from_env().map_err(|e| {
+        anyhow::anyhow!(
+            "ktstr_test: {label}: wprof requested by \
+             #[ktstr_test(wprof)] but WprofConfig::from_env failed: \
+             {e:#}. Ensure cargo-ktstr's install_env exported \
+             KTSTR_WPROF_PATH and the path is readable."
+        )
+    })?;
+    if let Some(custom_args) = entry.wprof_args {
+        config.args = custom_args.split_whitespace().map(String::from).collect();
+    }
+    Ok(builder.wprof(Some(config)))
+}
+
+/// Derive the test VM's memory floor from a CPU count + entry.
+///
+/// Returns `max(cpus * 64, 256, entry.memory_mib)`, then bumps to
+/// [`crate::vmm::wprof::WPROF_MIN_MEMORY_MIB`] when `entry.wprof`
+/// is true and the raw value falls below that floor.
+///
+/// Shared by [`resolve_vm_topology`] (entry-derived topology path)
+/// AND by the dispatch sites that derive memory from a CLI-supplied
+/// or preset-supplied topology before wrapping into a
+/// [`crate::test_support::topo::TopoOverride`] — see
+/// `dispatch::run_ktstr_test_with_topo_str` and
+/// `dispatch::run_gauntlet_test`. Centralizing the derivation here
+/// ensures the wprof floor reaches every code path that boots a
+/// wprof-tagged test, not just the entry-derived one.
+///
+/// The returned value is the LOWER BOUND on guest memory; the
+/// VM builder ultimately uses `.memory_deferred_min(mib)` which
+/// also accounts for the initramfs size, so the final boot memory
+/// may exceed this value.
+pub(crate) fn derive_test_memory_mib(cpus: u32, entry: &KtstrTestEntry) -> u32 {
+    use crate::vmm::wprof::{WPROF_MIN_MEMORY_MIB, apply_wprof_memory_floor};
+    let raw = (cpus * 64).max(256).max(entry.memory_mib);
+    let mem = apply_wprof_memory_floor(raw, entry.wprof);
+    if mem != raw {
+        tracing::info!(
+            test = %entry.name,
+            requested_mib = raw,
+            floored_mib = WPROF_MIN_MEMORY_MIB,
+            "wprof enabled; memory_mib floored to \
+             WPROF_MIN_MEMORY_MIB"
+        );
+    }
+    mem
+}
+
 /// Resolve the VM topology and memory size from an optional
 /// TopoOverride.
 ///
 /// Returns `(topology, memory_mib)` where `topology` is the
 /// `vmm::topology::Topology` passed to the VM builder and `memory_mib`
-/// is the memory allocation in megabytes. When `topo` is `Some`, both
-/// come from the override. When `topo` is `None`, the topology comes
-/// from `entry.topology` and memory is `max(total_cpus * 64, 256,
-/// entry.memory_mib)`. Shared with `attempt_auto_repro` so the repro
-/// VM always sizes memory the same way as the first VM.
+/// is the LOWER BOUND on guest memory (the builder's
+/// `.memory_deferred_min(mib)` may raise the actual allocation
+/// to fit the initramfs). When `topo` is `Some`, both come from
+/// the override and the memory is honored verbatim (per the
+/// override-is-verbatim contract — see `topo.rs:42-44`). When
+/// `topo` is `None`, the topology comes from `entry.topology` and
+/// memory is derived by [`derive_test_memory_mib`]. Shared with
+/// `attempt_auto_repro` so the repro VM always sizes memory the
+/// same way as the first VM — reproducibility requires identical
+/// topology, including the wprof floor when applicable.
+///
+/// When `entry.wprof` is true and a TopoOverride passes a
+/// memory_mib below [`crate::vmm::wprof::WPROF_MIN_MEMORY_MIB`],
+/// the override is still honored verbatim but a warn-level log
+/// fires — wprof may OOM-kill mid-run. The override-is-verbatim
+/// contract takes precedence; the operator owns the decision.
+/// (Dispatch sites that synthesize a TopoOverride from CLI flags
+/// already route through [`derive_test_memory_mib`] before
+/// constructing the override, so the warn path is reachable only
+/// when an operator hand-builds a TopoOverride with explicit memory.)
 pub(crate) fn resolve_vm_topology(
     entry: &KtstrTestEntry,
     topo: Option<&super::topo::TopoOverride>,
 ) -> (crate::vmm::topology::Topology, u32) {
+    use crate::vmm::wprof::WPROF_MIN_MEMORY_MIB;
     match topo {
-        Some(t) => (crate::vmm::topology::Topology::from(t), t.memory_mib),
+        Some(t) => {
+            if entry.wprof && t.memory_mib < WPROF_MIN_MEMORY_MIB {
+                tracing::warn!(
+                    test = %entry.name,
+                    override_mib = t.memory_mib,
+                    wprof_min_mib = WPROF_MIN_MEMORY_MIB,
+                    "wprof enabled with TopoOverride.memory_mib below \
+                     WPROF_MIN_MEMORY_MIB; honoring the override per the \
+                     override-is-verbatim contract, but wprof may OOM-kill \
+                     mid-run"
+                );
+            }
+            (crate::vmm::topology::Topology::from(t), t.memory_mib)
+        }
         None => {
             let cpus = entry.topology.total_cpus();
-            let mem = (cpus * 64).max(256).max(entry.memory_mib);
+            let mem = derive_test_memory_mib(cpus, entry);
             (entry.topology, mem)
         }
     }
@@ -486,8 +622,8 @@ pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<Stri
     args.extend(entry.extra_sched_args.iter().map(|s| s.to_string()));
 }
 
-/// Retry budget for the guest's `send_sys_rdy` loop in
-/// `vmm::rust_init`. Scales with vCPU count because the virtio-console
+/// Retry budget for the guest's [`vmm::rust_init::send_sys_rdy_with_retry`]
+/// loop. Scales with vCPU count because the virtio-console
 /// multiport handshake (DEVICE_READY → PORT_ADD → PORT_READY →
 /// PORT_OPEN per `drivers/char/virtio_console.c`) issues per-CPU work
 /// whose wall time grows roughly linearly with topology size. A
@@ -631,11 +767,11 @@ pub(crate) fn build_vm_builder_base(
     //     // single-threaded here.
     //     unsafe {
     //         std::env::set_var(
-    //             "KTSTR_JEMALLOC_PROBE_BINARY",
+    //             ::ktstr::KTSTR_JEMALLOC_PROBE_BINARY_ENV,
     //             env!("CARGO_BIN_EXE_ktstr-jemalloc-probe"),
     //         );
     //         std::env::set_var(
-    //             "KTSTR_JEMALLOC_ALLOC_WORKER_BINARY",
+    //             ::ktstr::KTSTR_JEMALLOC_ALLOC_WORKER_BINARY_ENV,
     //             env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker"),
     //         );
     //     }
@@ -652,11 +788,11 @@ pub(crate) fn build_vm_builder_base(
     //     // SAFETY: same as proc-macro form above.
     //     unsafe {
     //         std::env::set_var(
-    //             "KTSTR_JEMALLOC_PROBE_BINARY",
+    //             ::ktstr::KTSTR_JEMALLOC_PROBE_BINARY_ENV,
     //             env!("CARGO_BIN_EXE_ktstr-jemalloc-probe"),
     //         );
     //         std::env::set_var(
-    //             "KTSTR_JEMALLOC_ALLOC_WORKER_BINARY",
+    //             ::ktstr::KTSTR_JEMALLOC_ALLOC_WORKER_BINARY_ENV,
     //             env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker"),
     //         );
     //     }
@@ -672,7 +808,7 @@ pub(crate) fn build_vm_builder_base(
     // authors do not need to add it themselves. ctor 1.0 also
     // mandates the `unsafe` marker as the first attribute
     // argument; bare `#[ctor::ctor]` no longer compiles.
-    if let Ok(probe_path) = std::env::var("KTSTR_JEMALLOC_PROBE_BINARY")
+    if let Ok(probe_path) = std::env::var(crate::KTSTR_JEMALLOC_PROBE_BINARY_ENV)
         && !probe_path.is_empty()
     {
         // Pack the probe binary into the guest initramfs at
@@ -682,7 +818,7 @@ pub(crate) fn build_vm_builder_base(
         // from the worker's own ELF, not the init's.
         builder = builder.jemalloc_probe_binary(std::path::PathBuf::from(probe_path));
     }
-    if let Ok(worker_path) = std::env::var("KTSTR_JEMALLOC_ALLOC_WORKER_BINARY")
+    if let Ok(worker_path) = std::env::var(crate::KTSTR_JEMALLOC_ALLOC_WORKER_BINARY_ENV)
         && !worker_path.is_empty()
     {
         // Pack the jemalloc-alloc-worker binary alongside the
@@ -719,7 +855,79 @@ pub(crate) fn build_vm_builder_base(
 #[cfg(test)]
 mod tests {
     use super::super::entry::Scheduler;
+    use super::super::test_helpers::{EnvVarGuard, lock_env};
     use super::*;
+
+    #[test]
+    fn no_perf_mode_active_true_when_env_set_to_value() {
+        let _l = lock_env();
+        let _g = EnvVarGuard::set(crate::KTSTR_NO_PERF_MODE_ENV, "1");
+        assert!(no_perf_mode_active());
+    }
+
+    #[test]
+    fn no_perf_mode_active_false_when_env_unset() {
+        let _l = lock_env();
+        let _g = EnvVarGuard::remove(crate::KTSTR_NO_PERF_MODE_ENV);
+        assert!(!no_perf_mode_active());
+    }
+
+    /// Regression pin: empty-string-as-unset contract. Before the
+    /// env-var-sweep cleanup, the bare `is_ok()` reader returned
+    /// true on
+    /// `KTSTR_NO_PERF_MODE=` (set but empty — e.g. Docker
+    /// `--env KTSTR_NO_PERF_MODE` pass-through fired without a
+    /// value), silently flipping perf-mode OFF for every
+    /// `performance_mode` test. The fix at L146 treats
+    /// empty-as-unset; this test pins that contract for ALL
+    /// consumer sites (shell-mode VM at lib.rs, verifier at
+    /// verifier.rs, dispatch + eval) since they all route
+    /// through this helper.
+    #[test]
+    fn no_perf_mode_active_false_when_env_set_to_empty_string() {
+        let _l = lock_env();
+        let _g = EnvVarGuard::set(crate::KTSTR_NO_PERF_MODE_ENV, "");
+        assert!(
+            !no_perf_mode_active(),
+            "empty-string env must be treated as UNSET — a regression \
+             here flips perf-mode for every consumer that routes \
+             through no_perf_mode_active",
+        );
+    }
+
+    #[test]
+    fn bypass_llc_locks_active_true_when_env_set_to_value() {
+        let _l = lock_env();
+        let _g = EnvVarGuard::set(crate::KTSTR_BYPASS_LLC_LOCKS_ENV, "1");
+        assert!(bypass_llc_locks_active());
+    }
+
+    #[test]
+    fn bypass_llc_locks_active_false_when_env_unset() {
+        let _l = lock_env();
+        let _g = EnvVarGuard::remove(crate::KTSTR_BYPASS_LLC_LOCKS_ENV);
+        assert!(!bypass_llc_locks_active());
+    }
+
+    /// Regression pin: empty-string-as-unset contract for
+    /// KTSTR_BYPASS_LLC_LOCKS. A bare `KTSTR_BYPASS_LLC_LOCKS=`
+    /// (CI shell / Docker `--env` pass-through without value)
+    /// must NOT activate the bypass. The helper enforces this
+    /// uniformly for all 7 reader sites (vmm/builder.rs,
+    /// cli/kernel_build/build.rs ×2, bin/ktstr.rs ×2,
+    /// bin/cargo_ktstr/{kernel/mod, misc/shell}) — a regression
+    /// here flips the contention contract for every caller.
+    #[test]
+    fn bypass_llc_locks_active_false_when_env_set_to_empty_string() {
+        let _l = lock_env();
+        let _g = EnvVarGuard::set(crate::KTSTR_BYPASS_LLC_LOCKS_ENV, "");
+        assert!(
+            !bypass_llc_locks_active(),
+            "empty-string env must be treated as UNSET per the contract \
+             shared with no_perf_mode_active — a regression here flips \
+             LLC flock contention enforcement for every reader",
+        );
+    }
 
     #[test]
     fn config_file_parts_nested_path() {
@@ -761,7 +969,6 @@ mod tests {
     // -- build_cmdline_extra --
 
     use super::super::entry::{KtstrTestEntry, Sysctl};
-    use super::super::test_helpers::{EnvVarGuard, lock_env};
 
     #[test]
     fn build_cmdline_extra_default_is_sidecar_only() {
@@ -774,7 +981,7 @@ mod tests {
         // stable across tests; without the override, the call falls
         // through to the `{kernel}-{commit}` resolver whose output
         // depends on the test process's git state.
-        let _env_sd = EnvVarGuard::set("KTSTR_SIDECAR_DIR", "/tmp/ktstr-test");
+        let _env_sd = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, "/tmp/ktstr-test");
 
         let entry = KtstrTestEntry {
             name: "cmdline_test",
@@ -789,7 +996,7 @@ mod tests {
         let _lock = lock_env();
         let _env_bt = EnvVarGuard::remove("RUST_BACKTRACE");
         let _env_log = EnvVarGuard::remove("RUST_LOG");
-        let _env_sd = EnvVarGuard::set("KTSTR_SIDECAR_DIR", "/tmp/ktstr-test");
+        let _env_sd = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, "/tmp/ktstr-test");
 
         static SYSCTLS: &[Sysctl] = &[Sysctl::new("kernel.foo", "1")];
         static SCHED: Scheduler = Scheduler::named("s").sysctls(SYSCTLS).kargs(&["quiet"]);
@@ -810,7 +1017,7 @@ mod tests {
         let _lock = lock_env();
         let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let _env_log = EnvVarGuard::set("RUST_LOG", "debug");
-        let _env_sd = EnvVarGuard::set("KTSTR_SIDECAR_DIR", "/tmp/ktstr-test");
+        let _env_sd = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, "/tmp/ktstr-test");
 
         let entry = KtstrTestEntry {
             name: "cmd",
@@ -840,7 +1047,7 @@ mod tests {
         // `KTSTR_SIDECAR_DIR=<path>` and uses the override verbatim
         // (host's `sidecar_dir()` honours the env var as the
         // operator-chosen override slot).
-        let _env_sd = EnvVarGuard::set("KTSTR_SIDECAR_DIR", "/explicit/sidecar/dir");
+        let _env_sd = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, "/explicit/sidecar/dir");
 
         let entry = KtstrTestEntry {
             name: "cmd",
@@ -902,6 +1109,174 @@ mod tests {
         };
         let (_topo, mem) = resolve_vm_topology(&entry, None);
         assert_eq!(mem, 8192);
+    }
+
+    #[test]
+    fn resolve_vm_topology_wprof_floors_memory_on_entry_path() {
+        // Entry with wprof=true and memory below the wprof floor.
+        // The entry-derived path must raise memory to WPROF_MIN_MEMORY_MIB.
+        let entry = KtstrTestEntry {
+            name: "wprof_floor",
+            memory_mib: 512,
+            wprof: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let (_topo, mem) = resolve_vm_topology(&entry, None);
+        assert_eq!(
+            mem,
+            crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
+            "wprof=true must bump memory to >= WPROF_MIN_MEMORY_MIB \
+             ({}), got {mem}",
+            crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
+        );
+    }
+
+    #[test]
+    fn resolve_vm_topology_wprof_no_bump_when_already_above_floor() {
+        // Entry already above the wprof floor — must be honored unchanged.
+        let entry = KtstrTestEntry {
+            name: "wprof_high",
+            memory_mib: 8192,
+            wprof: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let (_topo, mem) = resolve_vm_topology(&entry, None);
+        assert_eq!(
+            mem, 8192,
+            "memory_mib above WPROF_MIN_MEMORY_MIB must be honored \
+             unchanged, got {mem}"
+        );
+    }
+
+    #[test]
+    fn resolve_vm_topology_wprof_disabled_does_not_floor() {
+        // wprof=false: the wprof floor must NOT apply, even when
+        // entry.memory_mib falls below WPROF_MIN_MEMORY_MIB. Only
+        // the universal 256 floor + cpu*64 derivation apply.
+        let entry = KtstrTestEntry {
+            name: "no_wprof",
+            memory_mib: 512,
+            wprof: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let (_topo, mem) = resolve_vm_topology(&entry, None);
+        assert_eq!(
+            mem, 512,
+            "wprof=false must not invoke the WPROF_MIN_MEMORY_MIB \
+             floor, got {mem}"
+        );
+    }
+
+    #[test]
+    fn resolve_vm_topology_wprof_no_bump_at_exact_floor() {
+        // Boundary case: derived memory equals WPROF_MIN_MEMORY_MIB
+        // exactly. The handler uses strict `<` so 2048 passes through
+        // unchanged. A regression that flipped to `<=` would be a
+        // 2048→2048 no-op (still unobservable), but a regression
+        // that flipped to `>` (or `>= ... { raw } else { FLOOR }`)
+        // would catastrophically floor every test. This test pins
+        // the strict-less-than direction.
+        let entry = KtstrTestEntry {
+            name: "wprof_exact",
+            memory_mib: crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
+            wprof: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let (_topo, mem) = resolve_vm_topology(&entry, None);
+        assert_eq!(
+            mem,
+            crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
+            "memory_mib equal to WPROF_MIN_MEMORY_MIB must pass \
+             through unchanged (strict-less-than floor condition); \
+             got {mem}"
+        );
+    }
+
+    #[test]
+    fn resolve_vm_topology_wprof_floors_zero_entry_memory_mib() {
+        // Edge case: entry.memory_mib=0 with wprof=true. The raw
+        // derivation `max(cpus*64, 256, 0)` resolves to 256 on the
+        // default 1-CPU topology, which is well below the floor.
+        // wprof must bump to WPROF_MIN_MEMORY_MIB.
+        let entry = KtstrTestEntry {
+            name: "wprof_zero_mib",
+            memory_mib: 0,
+            wprof: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let (_topo, mem) = resolve_vm_topology(&entry, None);
+        assert_eq!(
+            mem,
+            crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
+            "entry.memory_mib=0 with wprof=true must floor to \
+             WPROF_MIN_MEMORY_MIB ({}); got {mem}",
+            crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
+        );
+    }
+
+    #[test]
+    fn derive_test_memory_mib_helper_applies_wprof_floor() {
+        // Direct test of the derivation helper used by BOTH
+        // resolve_vm_topology AND the dispatch.rs sites that
+        // construct TopoOverride from CLI / preset topology
+        // (run_ktstr_test_with_topo_str, run_gauntlet_test).
+        // Pins that the helper applies the wprof floor — a
+        // regression that re-inlined the formula at the dispatch
+        // sites without the wprof check would silently bypass
+        // the floor when `cargo ktstr test --ktstr-topo` runs
+        // against a wprof-tagged test.
+        let entry = KtstrTestEntry {
+            name: "helper",
+            memory_mib: 0,
+            wprof: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mem = derive_test_memory_mib(2, &entry);
+        assert_eq!(
+            mem,
+            crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
+            "helper must floor wprof memory regardless of caller; got {mem}"
+        );
+
+        // wprof=false: derivation returns the raw formula
+        // without any floor.
+        let entry_no_wprof = KtstrTestEntry {
+            wprof: false,
+            ..entry
+        };
+        let mem = derive_test_memory_mib(2, &entry_no_wprof);
+        assert_eq!(
+            mem, 256,
+            "helper with wprof=false must NOT apply the floor; \
+             expected max(2*64, 256, 0)=256, got {mem}"
+        );
+    }
+
+    #[test]
+    fn resolve_vm_topology_override_with_wprof_honors_override_verbatim() {
+        // The override-is-verbatim contract: a TopoOverride with
+        // memory_mib below WPROF_MIN_MEMORY_MIB is honored as the
+        // operator's explicit choice. A warn-level log fires (not
+        // verified in this unit test — tracing capture is out of
+        // scope here) but the boot memory matches the override.
+        let entry = KtstrTestEntry {
+            name: "override_wprof",
+            wprof: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let over = super::super::topo::TopoOverride {
+            numa_nodes: 1,
+            llcs: 1,
+            cores: 1,
+            threads: 1,
+            memory_mib: 512,
+        };
+        let (_topo, mem) = resolve_vm_topology(&entry, Some(&over));
+        assert_eq!(
+            mem, 512,
+            "TopoOverride.memory_mib must be honored verbatim even \
+             with wprof enabled, got {mem}"
+        );
     }
 
     // -- append_base_sched_args --

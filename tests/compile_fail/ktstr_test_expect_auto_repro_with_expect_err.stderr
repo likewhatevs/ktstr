@@ -1,0 +1,7 @@
+error: expect_auto_repro = true and expect_err = true are mutually exclusive — the effective auto-repro gate (entry.auto_repro && scheduler.is_some() && !entry.expect_err) already disables auto-repro when expect_err is set, so the expect_auto_repro assertion could never be satisfied. Drop one: pick expect_err for `deliberate-fail, don't probe` OR pick expect_auto_repro for `deliberate-fail, DO probe`.
+  --> tests/compile_fail/ktstr_test_expect_auto_repro_with_expect_err.rs:11:1
+   |
+11 | #[ktstr_test(scheduler = SCHED, wprof, expect_auto_repro, expect_err = true)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)

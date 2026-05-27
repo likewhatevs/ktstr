@@ -588,11 +588,7 @@ fn kernel_build_one(
     // the implicit "no cap" default. Conflict with
     // KTSTR_BYPASS_LLC_LOCKS=1 surfaces here so operators see the
     // parse-time error, not an opaque pipeline bail later.
-    if cpu_cap.is_some()
-        && std::env::var("KTSTR_BYPASS_LLC_LOCKS")
-            .ok()
-            .is_some_and(|v| !v.is_empty())
-    {
+    if cpu_cap.is_some() && ktstr::bypass_llc_locks_active() {
         anyhow::bail!(
             "--cpu-cap conflicts with KTSTR_BYPASS_LLC_LOCKS=1; unset one of them. \
              --cpu-cap is a resource contract; bypass disables the contract entirely."
@@ -1736,15 +1732,12 @@ fn main() -> Result<()> {
         } => {
             if no_perf_mode {
                 // SAFETY: single-threaded at this point — no concurrent env readers.
-                unsafe { std::env::set_var("KTSTR_NO_PERF_MODE", "1") };
+                unsafe { std::env::set_var(ktstr::KTSTR_NO_PERF_MODE_ENV, "1") };
             }
             if let Some(cap) = cpu_cap {
                 // Parse-time conflict with KTSTR_BYPASS_LLC_LOCKS — see
                 // kernel_build fn for the same check on the build path.
-                if std::env::var("KTSTR_BYPASS_LLC_LOCKS")
-                    .ok()
-                    .is_some_and(|v| !v.is_empty())
-                {
+                if ktstr::bypass_llc_locks_active() {
                     anyhow::bail!(
                         "--cpu-cap conflicts with KTSTR_BYPASS_LLC_LOCKS=1; unset \
                          one of them. --cpu-cap is a resource contract; bypass \
@@ -1760,7 +1753,7 @@ fn main() -> Result<()> {
                 // CLI, env overlay, nested exec) agrees on precedence.
                 cli::CpuCap::new(cap)?;
                 // SAFETY: single-threaded at this point — no concurrent env readers.
-                unsafe { std::env::set_var("KTSTR_CPU_CAP", cap.to_string()) };
+                unsafe { std::env::set_var(ktstr::KTSTR_CPU_CAP_ENV, cap.to_string()) };
             }
             // Shared parse path with `cargo ktstr shell` — surfaces
             // size errors at CLI-argument time, never mid-VM-setup.
@@ -1794,6 +1787,16 @@ fn main() -> Result<()> {
                 dmesg,
                 exec.as_deref(),
                 disk_cfg,
+                // No test-entry context at the operator-driven
+                // `ktstr shell` entry — scheduler enable/disable +
+                // wprof_args overrides + performance_mode are
+                // strictly test-descriptor-driven, so pass the
+                // empty/false defaults the lib's run_shell uses on
+                // no-test-entry paths.
+                None,
+                false,
+                &[],
+                &[],
             )?;
         }
 

@@ -205,7 +205,7 @@ fn help_kernel_build() {
 fn kernel_build_extra_kconfig_nonexistent_path_errors() {
     let tmp = tempfile::TempDir::new().unwrap();
     cargo_ktstr()
-        .env("KTSTR_CACHE_DIR", tmp.path())
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
         .args([
             "kernel",
             "build",
@@ -234,7 +234,7 @@ fn kernel_build_extra_kconfig_directory_errors() {
     let dir = tmp.path().join("not-a-file");
     std::fs::create_dir(&dir).unwrap();
     cargo_ktstr()
-        .env("KTSTR_CACHE_DIR", tmp.path())
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
         .args([
             "kernel",
             "build",
@@ -263,7 +263,7 @@ fn kernel_build_extra_kconfig_invalid_utf8_errors() {
     // fails String::from_utf8 with `Utf8Error`.
     std::fs::write(&path, [0xffu8]).unwrap();
     cargo_ktstr()
-        .env("KTSTR_CACHE_DIR", tmp.path())
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
         .args([
             "kernel",
             "build",
@@ -292,7 +292,7 @@ fn kernel_build_extra_kconfig_empty_file_warns_but_proceeds() {
     let path = tmp.path().join("empty.kconfig");
     std::fs::write(&path, b"").unwrap();
     cargo_ktstr()
-        .env("KTSTR_CACHE_DIR", tmp.path())
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
         // RUST_LOG ensures the tracing::warn! emission lands on
         // stderr where the integration test can observe it.
         .env("RUST_LOG", "warn")
@@ -336,7 +336,7 @@ fn kernel_build_extra_kconfig_symlink_chain_resolves() {
     std::os::unix::fs::symlink(&real, &link1).unwrap();
     std::os::unix::fs::symlink(&link1, &link2).unwrap();
     let assert = cargo_ktstr()
-        .env("KTSTR_CACHE_DIR", tmp.path())
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
         .args([
             "kernel",
             "build",
@@ -371,7 +371,7 @@ fn kernel_build_extra_kconfig_symlink_chain_resolves() {
 fn kernel_build_extra_kconfig_validation_fires_before_source_acquire() {
     let tmp = tempfile::TempDir::new().unwrap();
     cargo_ktstr()
-        .env("KTSTR_CACHE_DIR", tmp.path())
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
         .args([
             "kernel",
             "build",
@@ -528,7 +528,7 @@ fn stats_no_data() {
     // stdout stays clean.
     let tmp = tempfile::tempdir().unwrap();
     cargo_ktstr()
-        .env("KTSTR_SIDECAR_DIR", tmp.path())
+        .env(ktstr::KTSTR_SIDECAR_DIR_ENV, tmp.path())
         .args(["stats"])
         .assert()
         .success()
@@ -546,7 +546,7 @@ fn kernel_list_runs() {
     // kernels" hint on stdout.
     let tmp = tempfile::TempDir::new().unwrap();
     cargo_ktstr()
-        .env("KTSTR_CACHE_DIR", tmp.path())
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
         .args(["kernel", "list"])
         .assert()
         .success()
@@ -579,8 +579,8 @@ fn kernel_list_json() {
 fn cargo_ktstr_shell_cpu_cap_with_bypass_errors() {
     let tmp = tempfile::TempDir::new().unwrap();
     cargo_ktstr()
-        .env("KTSTR_CACHE_DIR", tmp.path())
-        .env("KTSTR_BYPASS_LLC_LOCKS", "1")
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .env(ktstr::KTSTR_BYPASS_LLC_LOCKS_ENV, "1")
         .args(["shell", "--no-perf-mode", "--cpu-cap", "2"])
         .assert()
         .failure()
@@ -597,8 +597,8 @@ fn cargo_ktstr_kernel_build_cpu_cap_with_bypass_errors() {
     // were somehow skipped, we'd get a source-acquire failure (not
     // a network fetch hanging forever in CI).
     cargo_ktstr()
-        .env("KTSTR_CACHE_DIR", tmp.path())
-        .env("KTSTR_BYPASS_LLC_LOCKS", "1")
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .env(ktstr::KTSTR_BYPASS_LLC_LOCKS_ENV, "1")
         .args([
             "kernel",
             "build",
@@ -661,7 +661,7 @@ fn extra_kconfig_cache_roundtrip() {
     // First lookup: extras-built entry must surface.
     let run = |label: &str| {
         let output = cargo_ktstr()
-            .env("KTSTR_CACHE_DIR", tmp.path())
+            .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
             .args(["kernel", "list", "--json"])
             .output()
             .unwrap_or_else(|e| panic!("{label}: kernel list --json must run: {e}"));
@@ -743,7 +743,7 @@ fn extra_kconfig_cache_miss_on_different_content() {
     );
 
     let output = cargo_ktstr()
-        .env("KTSTR_CACHE_DIR", tmp.path())
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
         .args(["kernel", "list", "--json"])
         .output()
         .expect("kernel list --json must run");
@@ -805,8 +805,8 @@ fn extra_kconfig_range_expansion() {
     // rejection of the combination would surface BEFORE the source-
     // acquire path runs.
     let assert_result = cargo_ktstr()
-        .env("KTSTR_CACHE_DIR", tmp.path())
-        .env("KTSTR_BYPASS_LLC_LOCKS", "1")
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .env(ktstr::KTSTR_BYPASS_LLC_LOCKS_ENV, "1")
         .args([
             "kernel",
             "build",
@@ -879,7 +879,7 @@ fn extra_kconfig_kernel_list_shows_hash() {
     .unwrap();
 
     let output = cargo_ktstr()
-        .env("KTSTR_CACHE_DIR", tmp.path())
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
         .args(["kernel", "list", "--json"])
         .output()
         .expect("kernel list --json must run");

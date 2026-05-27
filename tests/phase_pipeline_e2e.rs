@@ -233,7 +233,7 @@ fn assert_phase_pipeline(result: &VmResult) -> Result<()> {
 /// Workload: bare `CgroupDef::named.workers(N)` without an
 /// explicit payload. A4 (max_dsq_depth assertion) depends on
 /// scx-ktstr's per-CPU local DSQ populating from cgroup workers
-/// regardless of payload; per phd recon, scx-ktstr always
+/// regardless of payload; scx-ktstr always
 /// produces "local cpu N" DSQ origins from its
 /// enqueue/dispatch architecture, so the worker-only scenario
 /// is sufficient. If a future scx-ktstr refactor changes when

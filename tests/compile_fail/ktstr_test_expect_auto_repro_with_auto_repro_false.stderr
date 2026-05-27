@@ -1,0 +1,7 @@
+error: expect_auto_repro = true and auto_repro = false are mutually exclusive — expect_auto_repro asserts the auto-repro path FIRED, but auto_repro = false guarantees it cannot fire. Drop one: either set auto_repro = true (default) so the path is enabled, or drop expect_auto_repro = true if the assertion isn't wanted.
+  --> tests/compile_fail/ktstr_test_expect_auto_repro_with_auto_repro_false.rs:10:1
+   |
+10 | #[ktstr_test(scheduler = SCHED, wprof, expect_auto_repro, auto_repro = false)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)

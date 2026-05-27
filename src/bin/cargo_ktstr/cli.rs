@@ -484,6 +484,27 @@ pub(crate) enum KtstrCommand {
     Shell {
         #[arg(long, help = KERNEL_HELP_RAW_OK)]
         kernel: Option<String>,
+        /// Resolve topology + memory + extra-include-files from the
+        /// named `#[ktstr_test]` registration. Probes each test
+        /// binary under the workspace's `cargo build --tests` set
+        /// for an entry whose `KtstrTestEntry::name == <NAME>`;
+        /// ambiguous names (same NAME registered in two binaries)
+        /// bail with a list of the matching binaries. The shell VM
+        /// boots with the test's topology axes (numa_nodes, llcs,
+        /// cores, threads), the test's memory_mib (or its derived
+        /// floor when `entry.wprof` is set), and the union of the
+        /// test's `extra_include_files` with operator-supplied
+        /// `-i` flags. Before VM boot, prints a one-line banner to
+        /// stderr naming the test + scheduler so an operator can
+        /// repro the workload manually after staging debugging
+        /// tools. (PS1-in-guest is a follow-up.) Mutually exclusive
+        /// with `--topology` and `--memory-mib`; `-i` is additive.
+        /// Note: this v1 resolves topology and extra_include_files
+        /// only; the scheduler binary itself is NOT auto-staged
+        /// into the guest — copy it with `-i` if you need to run
+        /// it (see the banner printed on boot).
+        #[arg(long, conflicts_with_all = ["topology", "memory_mib"])]
+        test: Option<String>,
         /// Virtual topology as "numa_nodes,llcs,cores,threads".
         #[arg(long, default_value = "1,1,1,1")]
         topology: String,

@@ -138,10 +138,10 @@ fn run_cargo_sub(
     }
     cmd.args(&args);
     if no_perf_mode {
-        cmd.env("KTSTR_NO_PERF_MODE", "1");
+        cmd.env(ktstr::KTSTR_NO_PERF_MODE_ENV, "1");
     }
     if no_skip_mode {
-        cmd.env("KTSTR_NO_SKIP_MODE", "1");
+        cmd.env(ktstr::KTSTR_NO_SKIP_MODE_ENV, "1");
     }
 
     if let Some(pat) = profraw_inject_for(sub_argv, std::env::var_os("LLVM_PROFILE_FILE")) {
@@ -172,6 +172,14 @@ fn run_cargo_sub(
         let first_dir = &resolved[0].1;
         tracing::debug!("cargo ktstr: using kernel {}", first_dir.display());
         cmd.env(ktstr::KTSTR_KERNEL_ENV, first_dir);
+        // Mark this test invocation as cargo-ktstr-orchestrated so
+        // VM-boot integration tests can distinguish "running via
+        // cargo ktstr test" (resource budgets honored) from raw
+        // `cargo nextest run --lib` (no concurrency cap → VM-boot
+        // tests starve and fail loud with an unrelated "kill set
+        // by AP" shape). See KTSTR_ORCHESTRATED_ENV doc for the
+        // detection-vs-KTSTR_KERNEL discrimination rationale.
+        cmd.env(ktstr::KTSTR_ORCHESTRATED_ENV, "1");
 
         if resolved.len() > 1 {
             let encoded = encode_kernel_list(&resolved)?;
@@ -206,6 +214,29 @@ fn run_cargo_sub(
         .status()
         .map_err(|e| format!("spawn cargo {}: {e}", sub_argv.join(" ")))?;
     cleanup_shm();
+    // Surface where per-test debugging artefacts live so an operator
+    // investigating a failure does not have to grep through `target/`
+    // to find them. Every test that boots a VM may write any of the
+    // artefacts listed in the eprintln block below. The dir is per
+    // (kernel, project commit) so failures from different runs of
+    // the same test don't stomp each other. Printed on BOTH success
+    // and failure: even passing runs leave per-test stats sidecars
+    // — and wprof-tagged passing runs leave a Perfetto `.pb` trace
+    // — worth inspecting.
+    let sidecar_dir = ktstr::test_support::sidecar_dir();
+    eprintln!();
+    eprintln!("cargo ktstr: test outputs in:");
+    eprintln!("  {}", sidecar_dir.display());
+    eprintln!("    *.failure-dump.json       — VM-state JSON when a test crashed or asserted");
+    eprintln!("    *.repro.failure-dump.json — VM-state JSON from the auto-repro retry");
+    eprintln!("    *.sidecar.json            — per-scenario stats + scheduler metadata");
+    eprintln!("    *.wprof.pb                — Perfetto trace from #[ktstr_test(wprof)] tests");
+    eprintln!("    *.repro.wprof.pb          — Perfetto trace from the auto-repro retry");
+    eprintln!(
+        "  (run `cargo ktstr replay --dir {}` to step through a captured failure)",
+        sidecar_dir.display()
+    );
+    eprintln!();
     if status.success() {
         Ok(())
     } else {

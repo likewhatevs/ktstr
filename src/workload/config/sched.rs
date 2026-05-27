@@ -266,7 +266,9 @@ pub enum WakeMechanism {
 /// runs serialized on the same package — the framework does
 /// not currently coordinate this serialization across worker
 /// groups.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AluWidth {
     /// 64-bit scalar integer multiply chain. Drives the integer

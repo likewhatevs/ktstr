@@ -1062,7 +1062,7 @@ fn capture_with_huge_cpu_range_in_status_yields_empty_affinity() {
     );
     // Per-arm isolation: the cap-rejected cpulist must NOT
     // crash the rest of parse_status. csw fields on the same
-    // file still populate. Mirrors G8's isolation check.
+    // file still populate. Mirrors the cross-arm isolation check.
     assert_eq!(
         t.voluntary_csw,
         MonotonicCount(1),

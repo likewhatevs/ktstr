@@ -448,9 +448,9 @@ pub fn build_groups(
 /// `max_across` for [`Maxable`], `range_across` for [`Rangeable`],
 /// `mode_across` for [`Modeable`] — then unwraps to the
 /// untyped scalar that [`Aggregated`] carries today; the
-/// unit-aware format dispatch will land in phase 4 and reads
-/// the registry's `unit` tag rather than the wrapper type, so
-/// `Aggregated` stays scalar-shaped after this phase.
+/// unit-aware format dispatch (which would read the registry's
+/// `unit` tag rather than the wrapper type) is not implemented
+/// yet, so `Aggregated` stays scalar-shaped after this phase.
 ///
 /// # Empty-bucket contract
 ///

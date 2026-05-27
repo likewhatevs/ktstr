@@ -376,8 +376,10 @@ pub(crate) fn map_transient_to_contention(
         // must remain opt-in until the operator has run a soak window
         // confirming their `near_limit` snapshot is reliable on the
         // host.
-        let bypass_requested =
-            std::env::var("KTSTR_CONTENTION_BYPASS").ok().as_deref() == Some("1");
+        let bypass_requested = std::env::var(crate::KTSTR_CONTENTION_BYPASS_ENV)
+            .ok()
+            .as_deref()
+            == Some("1");
         // Typed gate — reads the bool field directly from the
         // snapshot struct. No substring parse against the diagnostic
         // format, so a banner-format change cannot silently desync
@@ -690,8 +692,9 @@ mod tests {
         // the assertions through a hard-error branch instead of the
         // `ResourceContention` branch this test pins.
         let _lock = crate::test_support::test_helpers::lock_env();
-        let _bypass_off =
-            crate::test_support::test_helpers::EnvVarGuard::remove("KTSTR_CONTENTION_BYPASS");
+        let _bypass_off = crate::test_support::test_helpers::EnvVarGuard::remove(
+            crate::KTSTR_CONTENTION_BYPASS_ENV,
+        );
         for &errno in TRANSIENT_HOST_ERRNOS {
             let kvm_err = kvm_ioctls::Error::new(errno);
             let mapped = map_transient_to_contention(kvm_err, "create VM");
@@ -798,8 +801,9 @@ mod tests {
     #[test]
     fn set_user_memory_region_routing_via_map_transient() {
         let _lock = crate::test_support::test_helpers::lock_env();
-        let _bypass_off =
-            crate::test_support::test_helpers::EnvVarGuard::remove("KTSTR_CONTENTION_BYPASS");
+        let _bypass_off = crate::test_support::test_helpers::EnvVarGuard::remove(
+            crate::KTSTR_CONTENTION_BYPASS_ENV,
+        );
         // Every transient errno must classify as ResourceContention
         // when wrapped through map_transient_to_contention with the
         // memslot-install context tag.
@@ -875,8 +879,10 @@ mod tests {
         if snapshot.near_limit {
             return;
         }
-        let _bypass_on =
-            crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CONTENTION_BYPASS", "1");
+        let _bypass_on = crate::test_support::test_helpers::EnvVarGuard::set(
+            crate::KTSTR_CONTENTION_BYPASS_ENV,
+            "1",
+        );
         // ENOMEM is in TRANSIENT_HOST_ERRNOS but with bypass-on +
         // near_limit=false, must NOT classify as ResourceContention.
         let kvm_err = kvm_ioctls::Error::new(libc::ENOMEM);

@@ -75,13 +75,28 @@ pub enum Op {
         a: Cow<'static, str>,
         b: Cow<'static, str>,
     },
-    /// Spawn workers and move them into the target cgroup.
+    /// Spawn workers and place them according to `placement`.
     ///
     /// The work type is used as-is; gauntlet `work_type_override` does
     /// not apply. Use [`CgroupDef`] with `swappable(true)` when the
     /// work type should be overridable.
-    SpawnWorkers {
-        cgroup: Cow<'static, str>,
+    ///
+    /// Placement contract (bullets follow [`SpawnPlacement`] variant
+    /// declaration order):
+    ///   * [`SpawnPlacement::RunnerCgroup`] — spawn workers in the
+    ///     spawner's own cgroup; the handler issues ZERO cgroup ops
+    ///     and the workers inherit whatever cgroup the test runner
+    ///     sits in. `WorkSpec::workers_pct` is rejected for this
+    ///     placement because there's no managed cgroup whose cpuset
+    ///     would supply the percentage denominator.
+    ///   * [`SpawnPlacement::Cgroup`] — spawn workers and move them
+    ///     into the named cgroup; the cgroup must already exist
+    ///     (declared via [`CgroupDef`] in `Step.setup`, via
+    ///     [`Op::AddCgroup`] / [`Op::AddCgroupDef`] earlier in the
+    ///     same step, or on the persistent
+    ///     [`Backdrop`](crate::scenario::Backdrop)).
+    Spawn {
+        placement: SpawnPlacement,
         work: WorkSpec,
     },
     /// Stop all workers in a cgroup (does not remove the cgroup).
@@ -96,17 +111,36 @@ pub enum Op {
         cgroup: Cow<'static, str>,
         affinity: AffinityIntent,
     },
-    /// Spawn workers in the parent cgroup (not in a managed cgroup).
-    ///
-    /// `WorkSpec` is resolved to a `WorkloadConfig` at apply time, matching
-    /// the resolution pattern used by `Op::SpawnWorkers`.
-    SpawnHost { work: WorkSpec },
     /// Move all tasks from one cgroup to another.
     ///
     /// Each task is moved via `cgroup.procs`. If any move fails, the
     /// error propagates and handle name keys are left unchanged (workers
     /// remain addressed under `from`). On success, handle name keys are
     /// updated to `to` so subsequent ops address the moved workers.
+    ///
+    /// # Self-move rejection
+    ///
+    /// A self-move (`from == to`) is rejected at handler entry — the
+    /// kernel cgroup.procs write is idempotent on same-cgroup targets
+    /// so the op would silently no-op, masking either a stale op the
+    /// test author forgot to remove or a typo. The bail names both
+    /// sides so the operator can pick the right fix. The check also
+    /// catches the symmetric empty-string pair (`("", "")`), which
+    /// would otherwise no-op a RunnerCgroup-to-RunnerCgroup transfer.
+    ///
+    /// # Empty-string source
+    ///
+    /// Passing `from = ""` matches workers spawned by
+    /// [`Op::Spawn`] with [`SpawnPlacement::RunnerCgroup`] —
+    /// RunnerCgroup-placement handles are tracked under the
+    /// empty-string key (workers stay in the spawner's own cgroup,
+    /// outside any managed hierarchy). `Op::move_all_tasks("",
+    /// "named")` is the canonical way to materialize
+    /// RunnerCgroup-placement workers into a managed cgroup
+    /// mid-scenario; after the move the captured handles re-key
+    /// to `"named"` and lose their empty-string identity,
+    /// behaving like any other managed worker (lifetime tied to
+    /// `"named"`'s ownership slot per the table below).
     ///
     /// # Lifetime / ownership-direction asymmetry
     ///
@@ -827,6 +861,204 @@ pub enum Op {
     /// for the swap-window conditional walker-fired gate this pin is
     /// designed to make deterministic.
     PinBpfMap { name: Cow<'static, str> },
+    /// Capture the current `cgroup.procs` of `cgroup` and store the
+    /// PID list on the active [`SnapshotBridge`](crate::scenario::snapshot::SnapshotBridge)
+    /// under `tag`.
+    ///
+    /// Synchronous read of the cgroup-v2 `cgroup.procs` pseudofile in
+    /// the dispatching thread (in-scenario — runs wherever
+    /// `execute_scenario` runs; inside the guest VM for #[ktstr_test]
+    /// e2e tests, on the host for host-only scenarios). Returns the
+    /// thread-group leaders (PIDs / TGIDs) the kernel reports at apply
+    /// time. The snapshot is appended to the bridge's per-tag drain
+    /// log; test bodies drain via
+    /// [`SnapshotBridge::drain_cgroup_procs`](crate::scenario::snapshot::SnapshotBridge::drain_cgroup_procs)
+    /// (or the by-tag lookup
+    /// [`SnapshotBridge::cgroup_procs_by_tag`](crate::scenario::snapshot::SnapshotBridge::cgroup_procs_by_tag))
+    /// after the scenario completes to read the captured pids back.
+    ///
+    /// Distinct from [`Op::CaptureSnapshot`]: that op routes through
+    /// the host-side freeze coordinator (TLV transport in production,
+    /// thread-local bridge in test fixtures); this op runs entirely
+    /// in-process against the local cgroupfs.
+    ///
+    /// # Use cases
+    ///
+    /// Pin "did my workers land in cgroup X" assertions without the
+    /// shell-probe + tmpfs-roundtrip pattern. Typical shape:
+    ///
+    /// ```ignore
+    /// use ktstr::prelude::SnapshotBridge;
+    /// use std::sync::Arc;
+    ///
+    /// // Install a bridge (dummy capture cb — only cgroup-procs drain
+    /// // is used). MUST clone before set_thread_local, which consumes
+    /// // self — the clone shares the Arc-internal state and is what
+    /// // we drain on after the scenario completes.
+    /// let bridge = SnapshotBridge::new(Arc::new(|_| None));
+    /// let bridge_for_drain = bridge.clone();
+    /// let _guard = bridge.set_thread_local();
+    ///
+    /// let backdrop = Backdrop::new().push_op(Op::add_cgroup("workers"));
+    /// let steps = vec![
+    ///     Step::new(
+    ///         vec![
+    ///             Op::spawn(SpawnPlacement::cgroup("workers"),
+    ///                       WorkSpec::default().workers(4)),
+    ///             Op::capture_cgroup_procs("after_spawn", "workers"),
+    ///         ],
+    ///         HoldSpec::fixed(Duration::ZERO),
+    ///     ),
+    /// ];
+    /// let _ = execute_scenario(&ctx, backdrop, steps)?;
+    ///
+    /// // Either drain the whole log or look up by tag.
+    /// let after = bridge_for_drain.cgroup_procs_by_tag("after_spawn")
+    ///     .expect("Op::CaptureCgroupProcs(\"after_spawn\", ...) snapshot");
+    /// assert_eq!(after.pids.len(), 4);
+    /// ```
+    ///
+    /// # Within-Step ordering
+    ///
+    /// Ops in a single Step apply sequentially in vec order, so a
+    /// `Op::CaptureCgroupProcs` placed AFTER `Op::Spawn` /
+    /// `Op::MoveAllTasks` observes the post-spawn / post-migrate
+    /// kernel state. The producing ops complete synchronously (their
+    /// `cgroup.procs` writes block on kernel commit), so the capture
+    /// sees every PID those ops placed.
+    ///
+    /// # PID vs TID grain
+    ///
+    /// Reads `cgroup.procs` (thread-group leaders), NOT `cgroup.threads`
+    /// (per-thread TIDs). Grain implications by spawn op:
+    ///
+    /// - `Op::Spawn` → ktstr workers are 1-thread-per-worker, so
+    ///   `workers(N)` produces `N` pids in `cgroup.procs`.
+    /// - `Op::RunPayload` → an `execve`'d binary is ONE process; even
+    ///   if the binary spawns 100 threads, `cgroup.procs` reports the
+    ///   single thread-group leader. Tests asserting per-thread
+    ///   placement would need a sibling `cgroup.threads` accessor
+    ///   (future Op variant if a use case arises).
+    ///
+    /// # Tag uniqueness
+    ///
+    /// `tag` is the snapshot key the test body uses to find the
+    /// capture in the drain log. The apply-ops dispatch rejects an
+    /// empty `tag` with an actionable bail. Multiple captures of
+    /// the same `cgroup` under DIFFERENT tags surface as separate
+    /// entries (lets a scenario capture pre/post snapshots of the
+    /// same cgroup); multiple captures with the same `(tag, cgroup)`
+    /// also append rather than overwrite — tag uniqueness is a caller
+    /// convention, not a framework-enforced contract. The by-tag
+    /// lookup [`SnapshotBridge::cgroup_procs_by_tag`](crate::scenario::snapshot::SnapshotBridge::cgroup_procs_by_tag)
+    /// returns the FIRST match; callers who care about multiplicity
+    /// must use [`SnapshotBridge::drain_cgroup_procs`](crate::scenario::snapshot::SnapshotBridge::drain_cgroup_procs)
+    /// and filter the Vec manually.
+    ///
+    /// # Empty / unknown cgroup
+    ///
+    /// - Empty cgroup (exists but holds no tasks): captured snapshot
+    ///   has `pids = vec![]`. Lets callers assert "no tasks landed
+    ///   here" without conflating with "no such cgroup."
+    /// - Unknown cgroup (directory missing): apply bails with a
+    ///   layered anyhow chain — the outer wrap names the op + tag +
+    ///   cgroup; the inner [`crate::cgroup::CgroupOps::read_procs`]
+    ///   context surfaces the resolved path + the actionable hint
+    ///   about `Op::AddCgroup` / `workload_root_cgroup`. Use
+    ///   `format!("{err:#}")` (alternate display) to flatten both
+    ///   layers in test assertions.
+    ///
+    /// # See also
+    ///
+    /// - [`Op::CaptureSnapshot`] — diagnostic-snapshot capture (full
+    ///   scheduler state dump via FailureDumpReport). Distinct from
+    ///   this op's cgroup-procs read AND drains via a separate
+    ///   `SnapshotBridge::drain` / `drain_ordered` channel, not
+    ///   `drain_cgroup_procs`.
+    /// - [`crate::cgroup::CgroupOps::read_procs`] — the underlying
+    ///   trait method this op dispatches through.
+    CaptureCgroupProcs {
+        /// Snapshot key. Must be non-empty. Used by
+        /// [`SnapshotBridge::drain_cgroup_procs`](crate::scenario::snapshot::SnapshotBridge::drain_cgroup_procs)
+        /// consumers to find this capture in the drain log.
+        tag: Cow<'static, str>,
+        /// Cgroup to read `cgroup.procs` from. Must be a name
+        /// already tracked by the scenario (created via
+        /// `Op::AddCgroup`, a `CgroupDef` in setup, or pushed on
+        /// the Backdrop). Must be non-empty.
+        cgroup: Cow<'static, str>,
+    },
+}
+
+/// Placement target for [`Op::Spawn`].
+///
+/// The previous taxonomy had two ops (`SpawnWorkers` and `SpawnHost`)
+/// representing the two placement choices; the unified `Op::Spawn`
+/// variant parameterises the placement so the framework has ONE
+/// spawn op with the placement as data. `SpawnPlacement` is
+/// `#[non_exhaustive]`; further placements are added here rather
+/// than as new `Op` variants.
+///
+/// # `#[non_exhaustive]`
+///
+/// `SpawnPlacement` is `#[non_exhaustive]` — see
+/// [`crate::non_exhaustive`] for the cross-crate pattern-match and
+/// construction rules shared by every such type.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum SpawnPlacement {
+    /// Spawn workers in the spawner's own cgroup — the test
+    /// runner's cgroup, NOT any managed workload cgroup declared
+    /// via [`CgroupDef`] or [`Op::AddCgroup`]. The handler issues
+    /// ZERO cgroup ops; the workers inherit whatever cgroup the
+    /// test runner sits in.
+    ///
+    /// Inside a guest VM the runner's cgroup is typically the
+    /// root (cgid=1), so RunnerCgroup workers appear in snapshots
+    /// under the root cgroup rather than under your workload's
+    /// named hierarchy.
+    ///
+    /// `WorkSpec::workers_pct` is rejected for this placement —
+    /// there's no managed cgroup whose cpuset would supply the
+    /// percentage denominator. Use an explicit `.workers(N)`
+    /// count, or switch to `Cgroup(name)` against a cgroup whose
+    /// cpuset gives `workers_pct` a denominator.
+    ///
+    /// # Why "RunnerCgroup"?
+    ///
+    /// The previous shape used `SpawnHost` — "host" referred to
+    /// the spawner's own cgroup (analogous to the
+    /// scheduler-observability "host tasks vs workload tasks"
+    /// distinction in sched_ext schedulers, e.g. mitosis's cell
+    /// 0). `RunnerCgroup` names the placement target precisely
+    /// (the test-runner process's cgroup) without the
+    /// host-vs-guest-machine ambiguity that "host" carried.
+    RunnerCgroup,
+    /// Spawn workers and move them into the named managed
+    /// cgroup. The cgroup must already exist when the spawn op
+    /// applies — declared via [`CgroupDef`] in `Step.setup`,
+    /// via [`Op::AddCgroup`] / [`Op::AddCgroupDef`] earlier in
+    /// the same step, or on the persistent
+    /// [`Backdrop`](crate::scenario::Backdrop).
+    Cgroup(Cow<'static, str>),
+}
+
+impl SpawnPlacement {
+    /// Construct [`SpawnPlacement::Cgroup`] from any string-like
+    /// input (`&'static str`, `String`, `Cow<'static, str>`).
+    /// Mirrors the [`impl Into<Cow<'static, str>>`] convention
+    /// used by every other cgroup-name constructor on [`Op`]
+    /// (`Op::add_cgroup`, `Op::spawn_workers`, `Op::move_all_tasks`,
+    /// ...) so callers pass `"name"` not `"name".into()`.
+    pub fn cgroup(name: impl Into<Cow<'static, str>>) -> Self {
+        SpawnPlacement::Cgroup(name.into())
+    }
+
+    /// Construct [`SpawnPlacement::RunnerCgroup`]. Const so it
+    /// composes inside `const` scenarios + builds.
+    pub const fn runner_cgroup() -> Self {
+        SpawnPlacement::RunnerCgroup
+    }
 }
 
 /// How to compute a cpuset from topology.
@@ -1034,8 +1266,9 @@ impl CpusetSpec {
 ///
 /// **The right shape for influencing these fields is to drive the
 /// kernel into the desired state through real activity** —
-/// [`Op::SpawnHost`] (inherits the spawner's cgroup) or
-/// [`Op::SpawnWorkers`] (runs inside a named cgroup) of a
+/// [`Op::Spawn`] with [`SpawnPlacement::RunnerCgroup`] (inherits the spawner's cgroup, typically
+/// cgid=1 inside guest VMs) or
+/// [`Op::Spawn`] with [`SpawnPlacement::Cgroup`] (runs inside a named cgroup) of a
 /// synthetic [`WorkloadConfig`](crate::workload::WorkloadConfig)
 /// for fake-load, real preemption pressure for sched_avg.
 ///

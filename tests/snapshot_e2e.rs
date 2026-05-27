@@ -41,7 +41,7 @@ use ktstr::prelude::{
 };
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{HoldSpec, Op, Step, execute_steps};
-use ktstr::test_support::{Scheduler, SchedulerSpec, sidecar_dir};
+use ktstr::test_support::{Scheduler, SchedulerSpec};
 use ktstr::topology::TestTopology;
 
 #[test]
@@ -406,14 +406,6 @@ static __KTSTR_ENTRY_SNAPSHOT_OP_IN_VM: ktstr::test_support::KtstrTestEntry =
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
-/// Compute the per-test failure-dump path. Mirrors
-/// `tests/failure_dump_e2e.rs::failure_dump_path` (the freeze
-/// coordinator writes `{sidecar_dir()}/{test_name}.failure-dump.json`
-/// when an SCX_EXIT_ERROR_* trigger fires).
-fn watch_snapshot_dump_path(test_name: &str) -> std::path::PathBuf {
-    sidecar_dir().join(format!("{test_name}.failure-dump.json"))
-}
-
 /// Test 2: `Op::watch_snapshot` runs inside scx-ktstr's guest VM and
 /// drives the host-installed `SnapshotBridge`'s `register_watch`
 /// callback. Test invokes scx-ktstr with `--stall-after=1` so the
@@ -427,7 +419,7 @@ fn watch_snapshot_dump_path(test_name: &str) -> std::path::PathBuf {
 fn scenario_watch_snapshot_op_captures_exit_state(
     ctx: &ktstr::scenario::Ctx,
 ) -> anyhow::Result<ktstr::assert::AssertResult> {
-    let dump_path = watch_snapshot_dump_path("watch_snapshot_op_captures_exit_state");
+    let dump_path = ctx.failure_dump_path()?;
 
     // Track every symbol the executor passed through `register_watch`
     // — proves `Op::watch_snapshot` actually drove the bridge instead

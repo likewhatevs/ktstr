@@ -65,8 +65,52 @@ pub enum SchedulerSpec {
 impl SchedulerSpec {
     /// Whether this spec represents an active scheduling policy
     /// (anything other than the kernel default EEVDF).
+    ///
+    /// Returns `true` for every variant except [`Self::Eevdf`] —
+    /// including [`Self::KernelBuiltin`], which runs an in-kernel
+    /// non-default policy via shell enable/disable commands but
+    /// has no userspace BPF binary. Callers that need "the test
+    /// runs SOMETHING other than EEVDF" — e.g. enabling
+    /// repro-section render, switching verbose-output mode on,
+    /// gating non-default-only logic — want this method.
+    ///
+    /// Callers that need "the test runs a userspace BPF
+    /// scheduler binary with verifier-stats / struct_ops slab
+    /// activity" — e.g. wiring monitor thresholds, surfacing
+    /// `verifier_stats` warnings, gating the auto-repro probe —
+    /// want the narrower [`Self::has_bpf_scheduler`] instead.
+    /// `has_active_scheduling` returns `true` for `KernelBuiltin`,
+    /// which is the wrong gate for any code path that assumes a
+    /// BPF binary is attached.
+    ///
+    /// Quick gate-picker: use `has_active_scheduling` when the
+    /// predicate is "non-default scheduling policy"; use
+    /// [`Self::has_bpf_scheduler`] when the predicate is
+    /// "userspace BPF binary attached".
     pub const fn has_active_scheduling(&self) -> bool {
         !matches!(self, SchedulerSpec::Eevdf)
+    }
+
+    /// Whether this spec drives a userspace BPF scheduler binary
+    /// (i.e. attaches a `struct sched_ext_ops` to the kernel).
+    ///
+    /// Returns `true` for [`Self::Discover`] and [`Self::Path`] —
+    /// both variants point at a userspace BPF binary that
+    /// `resolve_scheduler` locates and launches. Returns `false`
+    /// for [`Self::Eevdf`] (no scheduler) and [`Self::KernelBuiltin`]
+    /// (in-kernel policy switched via shell commands, no userspace
+    /// binary, no BPF verifier output, no struct_ops slab activity).
+    ///
+    /// Distinct from [`Self::has_active_scheduling`]: that returns
+    /// `true` for `KernelBuiltin` too (because the kernel IS running
+    /// a non-default scheduling policy), which is the wrong gate
+    /// for code paths that read `verifier_stats`, wire BPF-attach
+    /// monitor thresholds, or probe for the userspace scheduler
+    /// binary's auto-repro hooks. Use this method whenever the
+    /// downstream consumer assumes "BPF binary is loaded and
+    /// running" rather than "the kernel is on a non-EEVDF policy".
+    pub const fn has_bpf_scheduler(&self) -> bool {
+        matches!(self, SchedulerSpec::Discover(_) | SchedulerSpec::Path(_))
     }
 
     /// Short, human-readable name for logging and sidecar output.
@@ -1078,8 +1122,29 @@ impl Scheduler {
     /// at every dispatch decision — the `.binary.` indirection
     /// repeats noise without adding meaning. The forwarder is one
     /// line of glue for a recurring readability win.
+    ///
+    /// Returns `true` for `KernelBuiltin` schedulers. See
+    /// [`Self::has_bpf_scheduler`] for the narrower gate that
+    /// excludes them (the right gate when callers assume a
+    /// userspace BPF binary is attached).
     pub const fn has_active_scheduling(&self) -> bool {
         self.binary.has_active_scheduling()
+    }
+
+    /// Whether this scheduler attaches a userspace BPF binary.
+    /// Forwards to [`SchedulerSpec::has_bpf_scheduler`].
+    ///
+    /// Same `.binary.` elision rationale as
+    /// [`Self::has_active_scheduling`] — saves
+    /// `entry.scheduler.binary.has_bpf_scheduler()` ceremony at
+    /// every BPF-attach-intent dispatch site.
+    ///
+    /// Returns `false` for `KernelBuiltin` (no userspace binary)
+    /// AND `Eevdf` (no scheduler). Use this whenever the caller
+    /// would react to BPF artifacts — `verifier_stats` wiring,
+    /// monitor thresholds, auto-repro probe gating.
+    pub const fn has_bpf_scheduler(&self) -> bool {
+        self.binary.has_bpf_scheduler()
     }
 }
 
@@ -1165,6 +1230,65 @@ pub struct KtstrTestEntry {
     /// When true, a crash triggers an auto-repro run with BPF probes
     /// attached to the crash call chain.
     pub auto_repro: bool,
+    /// When the downstream eval-layer wiring is in place AND this
+    /// field is set to `true`, the test ASSERTS that the auto-repro
+    /// path fired during the run — the intended end-state is a
+    /// verdict inversion converting fail-with-repro-artifact into
+    /// PASS. The canonical pattern: a test deliberately triggers a
+    /// scheduler stall, the auto-repro path captures the repro
+    /// artifact, and the test PASSES because the expected behavior
+    /// (auto-repro firing) happened.
+    ///
+    /// Distinct from [`Self::auto_repro`]:
+    /// - `auto_repro = true` enables the auto-repro capability —
+    ///   the path fires when the primary run fails.
+    /// - `expect_auto_repro = true` asserts the path FIRED.
+    ///
+    /// Current wiring state (HEAD): macro-parser support is in
+    /// place (`#[ktstr_test(expect_auto_repro)]` /
+    /// `#[ktstr_test(expect_auto_repro = true)]` both parse and
+    /// set this field), cross-attribute validation rejects
+    /// structurally-nonsensical combinations at macro-parse
+    /// time (`auto_repro = false`, `expect_err = true`,
+    /// `host_only = true`, `wprof = false`, missing
+    /// `scheduler`), AND the eval-layer inversion that makes
+    /// the assertion observable is wired:
+    /// `crate::test_support::eval::apply_expect_auto_repro_inversion`
+    /// runs after `evaluate_vm_result`, probes the auto-repro
+    /// `.repro.wprof.pb` artifact via the shape validator, and
+    /// (when satisfied) wraps the failure `Err` with the
+    /// `ExpectAutoReproSatisfied` marker; the dispatch arm at
+    /// `crate::test_support::dispatch::result_to_exit_code`
+    /// downcasts the marker and routes the verdict to
+    /// `EXIT_PASS`. Default `false` matches prior behavior
+    /// (no inversion, original verdict stands).
+    pub expect_auto_repro: bool,
+    /// When true, the primary VM (and the auto-repro VM, if it
+    /// fires) spawns `/bin/wprof` concurrently with the test
+    /// workload and ships the resulting Perfetto `.pb` trace back
+    /// to the host via MSG_TYPE_WPROF_TRACE. The host writes the
+    /// trace to `{sidecar_dir}/{test_name}.wprof.pb`, so a tagged
+    /// test produces a trace on every run — not only on failure.
+    /// Default wprof args
+    /// (`-d 500 -e sched --ringbuf-size=256000 --ringbuf-cnt=8`)
+    /// unless overridden by [`Self::wprof_args`].
+    ///
+    /// When the framework can't load the wprof binary
+    /// ([`crate::vmm::wprof::WprofConfig::from_env`] fails — typically
+    /// because `KTSTR_WPROF_PATH` was not set by `cargo-ktstr`'s
+    /// `install_env`), the test fails loudly rather than silently
+    /// running without wprof — per the no-silent-drops contract,
+    /// a declared capability that can't be delivered is an error.
+    ///
+    /// Populated by `#[ktstr_test(wprof)]` or `#[ktstr_test(wprof = true)]`.
+    pub wprof: bool,
+    /// Custom wprof CLI args, overriding
+    /// [`crate::vmm::wprof::WprofConfig::default_args`]. Only
+    /// meaningful when [`Self::wprof`] is `true`. Parsed as
+    /// space-separated tokens.
+    ///
+    /// Populated by `#[ktstr_test(wprof_args = "-d 2000 -e sched,irq")]`.
+    pub wprof_args: Option<&'static str>,
     /// Per-entry assertion overrides merged on top of
     /// `Assert::default_checks()` and the scheduler's `assert`.
     pub assert: crate::assert::Assert,
@@ -1322,7 +1446,95 @@ pub struct KtstrTestEntry {
     /// `None` (the default) skips the callback. When `Some`, the
     /// closure receives `&VmResult` and returns `Result<()>` — an
     /// `Err` fails the test with the returned message.
-    pub post_vm: Option<fn(&crate::vmm::VmResult) -> Result<()>>,
+    ///
+    /// Skipped when the guest already reported a failed
+    /// `AssertResult` — the existing guest-side fail diagnostic
+    /// is more useful than a derivative post_vm `Err` that
+    /// asserts on workload-derived state the crashed guest
+    /// never produced. Tests that need the host-side check to
+    /// run even on guest-fail should use
+    /// [`post_vm_unconditional`](Self::post_vm_unconditional)
+    /// instead.
+    pub post_vm: Option<super::PostVmCallback>,
+    /// Host-side callback invoked after `vm.run()` returns —
+    /// like [`post_vm`](Self::post_vm) — but **UNCONDITIONAL**:
+    /// runs even when the guest already reported a failed
+    /// `AssertResult`.
+    ///
+    /// Use this when the callback must observe host-side state
+    /// regardless of guest-side outcome — e.g. verifying that
+    /// an artifact landed in the sidecar directory even on a
+    /// deliberately-failing fault-injection test.
+    ///
+    /// Setting `post_vm_unconditional` does NOT invert the test
+    /// verdict — a guest-reported fail still fails the test
+    /// even when the unconditional callback returns Ok. The
+    /// primitive lets the callback OBSERVE host-side state
+    /// despite the fail; flipping a forced-fail test to PASS
+    /// requires a separate framework primitive (e.g. an
+    /// `expect_auto_repro = true` attribute that converts
+    /// fail-plus-artifacts-present to PASS) which is intentionally
+    /// out of scope here.
+    ///
+    /// Canonical callback shape (mirrors the framework's
+    /// `default_post_vm_periodic_fired` self-guard):
+    ///
+    /// ```ignore
+    /// fn my_unconditional_check(result: &VmResult) -> anyhow::Result<()> {
+    ///     // Skip when the VM run itself crashed (scheduler
+    ///     // died, watchdog fired, KVM exit during boot) — the
+    ///     // underlying failure already drives the test
+    ///     // diagnostic; layering a "missing state" error on
+    ///     // top obscures the cause.
+    ///     if !result.success {
+    ///         return Ok(());
+    ///     }
+    ///     // Now assert on whatever host-side artifact must
+    ///     // exist when the workload ran to completion.
+    ///     // ...
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// Two suppression layers to be aware of:
+    ///
+    ///   1. FRAMEWORK level: `post_vm` is skipped entirely when
+    ///      the guest already reported a failed `AssertResult`
+    ///      (see the `guest_already_failed` gate in
+    ///      `src/test_support/eval.rs::run_ktstr_test_inner_impl`'s
+    ///      post_vm dispatch site). `post_vm_unconditional`
+    ///      bypasses that suppression and always runs.
+    ///   2. CALLBACK level: the conventional `post_vm` callback
+    ///      body short-circuits via `if !result.success { return
+    ///      Ok(()); }` to silence on crash/watchdog/KVM-boot-exit
+    ///      cases where the guest never produced an AssertResult
+    ///      for the framework gate to fire on; the framework's
+    ///      [`default_post_vm_periodic_fired`] is the canonical
+    ///      example. An unconditional callback that asserts on
+    ///      workload-derived state without an equivalent
+    ///      callback-side guard will surface a misleading
+    ///      "missing state" error on scheduler crashes.
+    ///
+    /// `None` (the default) skips the unconditional callback.
+    /// Both [`post_vm`](Self::post_vm) and `post_vm_unconditional`
+    /// may be set on the same entry — `post_vm` is suppressed on
+    /// guest-fail per its existing contract, `post_vm_unconditional`
+    /// always runs. If both callbacks set on the same entry both
+    /// return `Err`, the framework surfaces both via
+    /// `combine_post_vm_errs` chained as
+    /// `post_vm: <conditional_err>; post_vm_unconditional: <unconditional_err>`
+    /// so a debugging operator sees both regressions on the
+    /// first pass rather than discovering the second one only
+    /// after fixing the first.
+    ///
+    /// Setting the SAME callback fn pointer on BOTH slots will
+    /// invoke it twice on the guest-success path (conditional +
+    /// unconditional) and once on the guest-fail path
+    /// (unconditional only); idempotent callbacks (read-only
+    /// assertions) tolerate this fine, but a side-effecting
+    /// callback (counter increment, file open) should pick exactly
+    /// one slot.
+    pub post_vm_unconditional: Option<super::PostVmCallback>,
     /// Periodic snapshot count: when non-zero, the freeze
     /// coordinator divides the 10%–90% slice of the workload
     /// duration (anchored at the FIRST `MSG_TYPE_SCENARIO_START`
@@ -1510,6 +1722,9 @@ impl KtstrTestEntry {
         payload: None,
         workloads: &[],
         auto_repro: true,
+        expect_auto_repro: false,
+        wprof: false,
+        wprof_args: None,
         assert: crate::assert::Assert::NO_OVERRIDES,
         extra_sched_args: &[],
         watchdog_timeout: Duration::from_secs(5),
@@ -1525,6 +1740,7 @@ impl KtstrTestEntry {
         config_content: None,
         disk: None,
         post_vm: None,
+        post_vm_unconditional: None,
         num_snapshots: 0,
         workload_root_cgroup: None,
         kaslr: true,
@@ -1985,6 +2201,13 @@ impl KtstrTestEntry {
         self
     }
 
+    /// Override `expect_auto_repro`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_expect_auto_repro(mut self, expect_auto_repro: bool) -> Self {
+        self.expect_auto_repro = expect_auto_repro;
+        self
+    }
+
     /// Override `assert`.
     ///
     /// Replaces the entry's per-test overrides wholesale; the assertion
@@ -2123,9 +2346,13 @@ impl KtstrTestEntry {
     ///
     /// The closure runs on the host after `vm.run()` returns with
     /// access to the full `VmResult`; an `Err` from the closure fails
-    /// the test with the returned message.
+    /// the test with the returned message. Skipped when the guest
+    /// already reported a failed `AssertResult` — see
+    /// [`Self::post_vm`] for the suppression contract; use
+    /// [`Self::with_post_vm_unconditional`] when the host-side
+    /// check must run even on guest-fail.
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn with_post_vm(mut self, post_vm: fn(&crate::vmm::VmResult) -> Result<()>) -> Self {
+    pub fn with_post_vm(mut self, post_vm: super::PostVmCallback) -> Self {
         self.post_vm = Some(post_vm);
         self
     }
@@ -2134,6 +2361,31 @@ impl KtstrTestEntry {
     #[must_use = "builder methods consume self; bind the result"]
     pub fn without_post_vm(mut self) -> Self {
         self.post_vm = None;
+        self
+    }
+
+    /// Override `post_vm_unconditional`.
+    ///
+    /// The closure runs on the host after `vm.run()` returns —
+    /// like [`Self::with_post_vm`] — but bypasses the guest-fail
+    /// suppression that gates the conditional [`Self::with_post_vm`]
+    /// callback. An `Err` from the closure fails the test with the
+    /// returned message.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_post_vm_unconditional(
+        mut self,
+        post_vm_unconditional: super::PostVmCallback,
+    ) -> Self {
+        self.post_vm_unconditional = Some(post_vm_unconditional);
+        self
+    }
+
+    /// Clear `post_vm_unconditional` (skip the unconditional host-side
+    /// callback). Does not affect the conditional [`Self::with_post_vm`]
+    /// callback if one is set.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn without_post_vm_unconditional(mut self) -> Self {
+        self.post_vm_unconditional = None;
         self
     }
 
@@ -2584,6 +2836,10 @@ mod tests {
         // so struct-update spreaders also get the right values.
         assert!(d.payload.is_none());
         assert!(d.workloads.is_empty());
+        // post_vm_unconditional defaults to None — the unconditional
+        // dispatch arm in eval.rs is a no-op for the default entry,
+        // matching the macro's omit-when-unset codegen.
+        assert!(d.post_vm_unconditional.is_none());
     }
 
     /// Empirical pin: `..Self::new()` works in a `static` spread.
@@ -2950,7 +3206,7 @@ mod tests {
     /// staged set produces a guest layout where the boot scheduler
     /// is shadowed by the same binary under
     /// `/staging/schedulers/<name>/scheduler`. Catches the
-    /// dev-advocate's "stage all the schedulers I might use"
+    /// "stage all the schedulers I might use"
     /// misuse pattern at validate time.
     #[test]
     fn validate_rejects_staged_scheduler_duplicating_boot_scheduler() {
@@ -5106,6 +5362,43 @@ mod tests {
         assert!(
             msg.contains("periodic_fired=0") && msg.contains("target=5"),
             "diagnostic must carry both counters; got {msg}",
+        );
+    }
+
+    /// `KtstrTestEntry::DEFAULT.expect_auto_repro` is `false`.
+    /// Backward-compat pin: an existing entry constructed via
+    /// `..KtstrTestEntry::DEFAULT` (the canonical spread-init
+    /// pattern in the macro codegen and in user fixtures) MUST
+    /// carry `expect_auto_repro = false` so the new assertion
+    /// opt-in stays off by default. A regression that flipped the
+    /// default to `true` would silently invert every failing
+    /// test's verdict through the dispatch arm.
+    #[test]
+    fn default_expect_auto_repro_is_false() {
+        const {
+            assert!(
+                !super::KtstrTestEntry::DEFAULT.expect_auto_repro,
+                "DEFAULT must keep expect_auto_repro at false for backward-compat opt-in semantics"
+            );
+        }
+    }
+
+    /// `with_expect_auto_repro(true)` flips the field on; passing
+    /// `false` flips it back off. Pins the builder symmetry
+    /// against the sibling `with_auto_repro` / `with_expect_err` /
+    /// `with_host_only` setters and guards against a missing-
+    /// setter regression for the new pub field.
+    #[test]
+    fn with_expect_auto_repro_sets_field() {
+        let entry = super::KtstrTestEntry::DEFAULT.with_expect_auto_repro(true);
+        assert!(
+            entry.expect_auto_repro,
+            "with_expect_auto_repro(true) must set the field true"
+        );
+        let entry = entry.with_expect_auto_repro(false);
+        assert!(
+            !entry.expect_auto_repro,
+            "with_expect_auto_repro(false) must flip the field back to false"
         );
     }
 }

@@ -47,7 +47,7 @@ use ktstr::worker_ready_wait::wait_for_worker_ready;
 fn set_alloc_worker_binary_env_var() {
     unsafe {
         std::env::set_var(
-            "KTSTR_JEMALLOC_ALLOC_WORKER_BINARY",
+            ::ktstr::KTSTR_JEMALLOC_ALLOC_WORKER_BINARY_ENV,
             env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker"),
         );
     }
@@ -124,7 +124,7 @@ const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const KTHREADD_TGID: u32 = 2;
 
 // ---------------------------------------------------------------------------
-// T1 — capture pulls populated allocated_bytes for the alloc-worker
+// Capture pulls populated allocated_bytes for the alloc-worker
 // ---------------------------------------------------------------------------
 
 /// Spawn the alloc-worker with a known size inside the guest, wait
@@ -244,7 +244,7 @@ fn ctprof_capture_records_allocated_bytes_for_jemalloc_alloc_worker(
 }
 
 // ---------------------------------------------------------------------------
-// T2 — capture against a bare guest leaves kthreadd's counters at zero
+// Capture against a bare guest leaves kthreadd's counters at zero
 // ---------------------------------------------------------------------------
 
 /// Boot a minimal guest with NO payload, run
@@ -257,9 +257,10 @@ fn ctprof_capture_records_allocated_bytes_for_jemalloc_alloc_worker(
 /// Either way the per-thread counters land at the absent-counter
 /// default.
 ///
-/// This is the negative complement to T1: T1 proves a real
-/// jemalloc target populates non-zero counters; this test proves
-/// non-jemalloc targets stay at zero — together they pin the
+/// This is the negative complement to the alloc-worker test:
+/// that test proves a real jemalloc target populates non-zero
+/// counters; this one proves non-jemalloc targets stay at zero
+/// — together they pin the
 /// "absent = 0" capture contract on both sides of the boundary.
 #[ktstr_test(llcs = 1, cores = 1, threads = 1)]
 fn ctprof_capture_completes_against_bare_guest(_ctx: &Ctx) -> Result<AssertResult> {
@@ -346,7 +347,7 @@ fn tgids_dump(snap: &ktstr::ctprof::CtprofSnapshot) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// T4 — capture against a churn worker survives the ESRCH race window
+// Capture against a churn worker survives the ESRCH race window
 // ---------------------------------------------------------------------------
 
 /// Boot a guest, spawn the alloc-worker in `--churn` mode (tight

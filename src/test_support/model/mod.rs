@@ -911,7 +911,7 @@ pub(crate) fn resolve_cache_root() -> Result<PathBuf> {
     tracing::debug!(
         home = ?std::env::var("HOME"),
         xdg_cache_home = ?std::env::var("XDG_CACHE_HOME"),
-        ktstr_cache_dir = ?std::env::var("KTSTR_CACHE_DIR"),
+        ktstr_cache_dir = ?std::env::var(crate::KTSTR_CACHE_DIR_ENV),
         "model::resolve_cache_root: env snapshot",
     );
     crate::cache::resolve_cache_root_with_suffix("models")

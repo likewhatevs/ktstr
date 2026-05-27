@@ -386,6 +386,57 @@ impl Drop for WatchSlotGuard<'_> {
     }
 }
 
+/// A single `cgroup.procs` snapshot captured by
+/// [`Op::CaptureCgroupProcs`](crate::scenario::ops::Op::CaptureCgroupProcs).
+///
+/// Tests drain the per-bridge log of these via
+/// [`SnapshotBridge::drain_cgroup_procs`] after the scenario completes,
+/// then assert on the captured `pids` (membership, count, identity)
+/// against the workload they spawned. Carries:
+///
+/// - `tag`: the snapshot key supplied in the Op (lets a scenario
+///   capture pre/post snapshots of the same cgroup at different
+///   points and disambiguate them on drain).
+/// - `cgroup`: the cgroup name the kernel read returned PIDs for.
+/// - `pids`: the thread-group leaders (PIDs / TGIDs) the kernel
+///   reported in `cgroup.procs` at capture time. An empty Vec means
+///   the cgroup existed but held no tasks. A read against a missing
+///   cgroup directory errors at the dispatch arm and never produces
+///   a snapshot — so the presence of a `CgroupProcsSnapshot` in the
+///   drain log implies the read succeeded.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct CgroupProcsSnapshot {
+    /// Snapshot key supplied to
+    /// [`Op::CaptureCgroupProcs`](crate::scenario::ops::Op::CaptureCgroupProcs).
+    /// Distinguishes multiple captures of the same cgroup.
+    pub tag: String,
+    /// Cgroup name the kernel read returned PIDs for.
+    pub cgroup: String,
+    /// Thread-group leaders in the cgroup at capture time.
+    /// `libc::pid_t` is `i32` on Linux; compare against other ktstr
+    /// pid surfaces (`WorkloadHandle::worker_pids()`, etc.) via the
+    /// matching integer type or `as i32` cast when types differ.
+    pub pids: Vec<libc::pid_t>,
+}
+
+impl CgroupProcsSnapshot {
+    /// Construct a `CgroupProcsSnapshot`. The struct is
+    /// `#[non_exhaustive]` so external callers cannot use
+    /// struct-literal syntax — use this constructor instead. The
+    /// framework's [`SnapshotBridge::record_cgroup_procs`] dispatch
+    /// site routes through here so test fixtures that synthesise
+    /// snapshots for drain-consumer testing share the same
+    /// construction path.
+    pub fn new(tag: impl Into<String>, cgroup: impl Into<String>, pids: Vec<libc::pid_t>) -> Self {
+        Self {
+            tag: tag.into(),
+            cgroup: cgroup.into(),
+            pids,
+        }
+    }
+}
+
 /// Host-side capture pipeline that the freeze coordinator routes
 /// [`Op::CaptureSnapshot`](crate::scenario::ops::Op::CaptureSnapshot) and
 /// [`Op::WatchSnapshot`](crate::scenario::ops::Op::WatchSnapshot)
@@ -407,6 +458,15 @@ pub struct SnapshotBridge {
     /// inspect this via [`SnapshotBridge::drain_kernel_ops`] after
     /// `execute_steps` returns to verify each request's outcome.
     kernel_ops: Arc<Mutex<Vec<(String, crate::vmm::wire::KernelOpReplyPayload)>>>,
+    /// Per-tag drain log of cgroup.procs snapshots captured by
+    /// [`Op::CaptureCgroupProcs`](crate::scenario::ops::Op::CaptureCgroupProcs).
+    /// Stored in insertion order so a scenario capturing the same
+    /// cgroup at multiple points (with distinct tags) sees both
+    /// snapshots when draining. Test fixtures drain via
+    /// [`SnapshotBridge::drain_cgroup_procs`] after the scenario
+    /// completes; each entry carries the tag, the cgroup name read,
+    /// and the PIDs the kernel reported in `cgroup.procs`.
+    cgroup_procs: Arc<Mutex<Vec<CgroupProcsSnapshot>>>,
     watch_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Monotonic counter bumped by the freeze-coordinator's accessor-
     /// init worker on every successful slot publish (initial attach +
@@ -519,6 +579,7 @@ impl SnapshotBridge {
             kernel_op: None,
             snapshots: Arc::new(Mutex::new(SnapshotStore::new())),
             kernel_ops: Arc::new(Mutex::new(Vec::new())),
+            cgroup_procs: Arc::new(Mutex::new(Vec::new())),
             watch_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             accessor_publish_seqno: None,
             accessor_worker_state: None,
@@ -766,6 +827,59 @@ impl SnapshotBridge {
     /// own copy empty so subsequent calls see only newer entries.
     pub fn drain_kernel_ops(&self) -> Vec<(String, crate::vmm::wire::KernelOpReplyPayload)> {
         std::mem::take(&mut *self.kernel_ops.lock_unpoisoned())
+    }
+
+    /// Record a `cgroup.procs` snapshot captured by
+    /// [`Op::CaptureCgroupProcs`](crate::scenario::ops::Op::CaptureCgroupProcs).
+    ///
+    /// Appends to the per-bridge log in insertion order. Multiple
+    /// captures of the same `cgroup` (distinguished by `tag`)
+    /// surface as separate entries — the bridge does NOT collapse
+    /// or overwrite on duplicate cgroup names, which lets a scenario
+    /// capture pre/post snapshots of the same cgroup under different
+    /// tags. Multiple captures with the same `(tag, cgroup)` also
+    /// append rather than overwrite; tag uniqueness is a caller
+    /// convention, not a framework-enforced contract.
+    pub fn record_cgroup_procs(&self, tag: String, cgroup: String, pids: Vec<libc::pid_t>) {
+        self.cgroup_procs
+            .lock_unpoisoned()
+            .push(CgroupProcsSnapshot::new(tag, cgroup, pids));
+    }
+
+    /// Drain the per-bridge `cgroup.procs` snapshot log. Returns the
+    /// accumulated [`CgroupProcsSnapshot`]s in insertion order; leaves
+    /// the bridge's own copy empty so subsequent calls observe only
+    /// newer entries. Mirrors [`Self::drain_kernel_ops`]' contract.
+    pub fn drain_cgroup_procs(&self) -> Vec<CgroupProcsSnapshot> {
+        std::mem::take(&mut *self.cgroup_procs.lock_unpoisoned())
+    }
+
+    /// Look up the first `cgroup.procs` snapshot recorded under
+    /// `tag` without consuming the drain log. Returns `None` when no
+    /// snapshot was recorded under that tag (the typical case is a
+    /// typo, a missing capture op, or capture-before-drain ordering
+    /// mistake). For the common single-capture-per-tag pattern this
+    /// collapses the `drain_cgroup_procs().iter().find(|s| s.tag ==
+    /// tag).expect("missing")` 4-combinator dance into a one-liner.
+    ///
+    /// **Clone cost.** Each `CgroupProcsSnapshot` carries `tag`,
+    /// `cgroup`, and `pids: Vec<libc::pid_t>` — the pids vec is
+    /// bounded by the number of tasks in the cgroup at capture
+    /// time (kilobytes at most for realistic test scenarios).
+    /// Mirrors [`Self::kernel_op_value`]'s non-draining-lookup
+    /// shape for sibling-API consistency.
+    ///
+    /// **Duplicate tag.** Returns the FIRST snapshot recorded under
+    /// `tag`. Multiple captures with the same `(tag, cgroup)` are
+    /// stored separately (see [`Self::record_cgroup_procs`]); callers
+    /// who care about the multiplicity should use
+    /// [`Self::drain_cgroup_procs`] and filter the Vec manually.
+    pub fn cgroup_procs_by_tag(&self, tag: &str) -> Option<CgroupProcsSnapshot> {
+        self.cgroup_procs
+            .lock_unpoisoned()
+            .iter()
+            .find(|s| s.tag == tag)
+            .cloned()
     }
 
     /// Record a kernel-op reply produced by the host-side wire-path
@@ -1412,6 +1526,27 @@ impl SnapshotBridge {
     /// sense in that exact thread's call stack — installing a
     /// bridge process-wide would race against parallel test
     /// threads.
+    ///
+    /// # Cloning for drain
+    ///
+    /// `set_thread_local` consumes `self`. The bridge is `Clone`
+    /// (internal state lives behind `Arc<Mutex<_>>`), so callers
+    /// that need to inspect / drain the bridge after the scenario
+    /// runs MUST clone before installing:
+    ///
+    /// ```ignore
+    /// let bridge = SnapshotBridge::new(capture_cb);
+    /// let drain_handle = bridge.clone();      // share the Arc
+    /// let _guard = bridge.set_thread_local(); // consume the original
+    /// // ... execute_scenario runs and records on the thread-local ...
+    /// let snaps = drain_handle.drain_cgroup_procs();
+    /// ```
+    ///
+    /// Both handles share the same underlying snapshot store
+    /// (reports, kernel_ops, cgroup_procs); ops recorded against
+    /// the thread-local are observable via the cloned handle.
+    /// Forgetting to clone is the single most common bridge-flow
+    /// footgun for tests that consume capture results.
     pub fn set_thread_local(self) -> BridgeGuard {
         let prev = ACTIVE_BRIDGE.with(|c| c.borrow_mut().replace(self));
         BridgeGuard { prev }
@@ -1690,5 +1825,82 @@ mod periodic_tag_tests {
              user tag periodic_kaslr (even though real) must be \
              excluded by the strict matcher",
         );
+    }
+}
+
+#[cfg(test)]
+mod cgroup_procs_bridge_tests {
+    use super::*;
+
+    /// Pin the Arc-shared-state invariant for `SnapshotBridge.clone()`:
+    /// a clone made BEFORE `set_thread_local` consumed the original
+    /// sees writes that the consumed bridge made via `record_cgroup_procs`.
+    /// This is the user-facing pattern in tests/cgroup_capture_procs_e2e.rs
+    /// and the doc example on `Op::CaptureCgroupProcs`. A future refactor
+    /// that accidentally turned `cgroup_procs: Arc<Mutex<_>>` into a
+    /// non-Arc field would silently break the e2e drain pattern; this
+    /// test catches it.
+    #[test]
+    fn snapshot_bridge_record_cgroup_procs_visible_via_arc_clone() {
+        let bridge_a = SnapshotBridge::new(Arc::new(|_| None));
+        let bridge_b = bridge_a.clone();
+        bridge_a.record_cgroup_procs("tag".into(), "cg".into(), vec![1, 2]);
+        let drained_b = bridge_b.drain_cgroup_procs();
+        assert_eq!(drained_b.len(), 1);
+        assert_eq!(drained_b[0].tag, "tag");
+        assert_eq!(drained_b[0].cgroup, "cg");
+        assert_eq!(drained_b[0].pids, vec![1, 2]);
+        // A drained THROUGH B — pin that A also sees empty afterward
+        // (single shared Vec under the Arc<Mutex>; drain via either
+        // handle leaves both at empty).
+        assert!(
+            bridge_a.drain_cgroup_procs().is_empty(),
+            "Arc-shared field — B's drain empties A too",
+        );
+    }
+
+    /// Pin the consume-on-drain semantic of `drain_cgroup_procs`. The
+    /// impl uses `std::mem::take` which leaves the source empty after
+    /// the call returns. A future refactor swapping `mem::take` for
+    /// `.clone()` would silently duplicate snapshots across drains;
+    /// this test catches it.
+    #[test]
+    fn snapshot_bridge_drain_cgroup_procs_consumes_via_mem_take() {
+        let bridge = SnapshotBridge::new(Arc::new(|_| None));
+        bridge.record_cgroup_procs("t1".into(), "cg".into(), vec![1]);
+        bridge.record_cgroup_procs("t2".into(), "cg".into(), vec![2]);
+        let drained = bridge.drain_cgroup_procs();
+        assert_eq!(drained.len(), 2);
+        // Second drain MUST yield empty — mem::take left the source
+        // empty after the first drain.
+        let second = bridge.drain_cgroup_procs();
+        assert!(second.is_empty(), "drain must consume; got: {second:?}");
+        // After record-after-drain, only the new entries appear.
+        bridge.record_cgroup_procs("t3".into(), "cg".into(), vec![3]);
+        let third = bridge.drain_cgroup_procs();
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].tag, "t3");
+    }
+
+    /// `cgroup_procs_by_tag` returns the FIRST matching snapshot
+    /// without consuming the drain log. Mirrors `kernel_op_value(tag)`
+    /// semantics. The drain log persists past the lookup so subsequent
+    /// `drain_cgroup_procs` calls observe the same entries.
+    #[test]
+    fn snapshot_bridge_cgroup_procs_by_tag_is_non_draining() {
+        let bridge = SnapshotBridge::new(Arc::new(|_| None));
+        bridge.record_cgroup_procs("tag_a".into(), "cg_x".into(), vec![10, 20]);
+        bridge.record_cgroup_procs("tag_b".into(), "cg_y".into(), vec![30]);
+        // Lookup by tag returns the expected snapshot.
+        let snap_a = bridge.cgroup_procs_by_tag("tag_a").expect("tag_a present");
+        assert_eq!(snap_a.pids, vec![10, 20]);
+        assert_eq!(snap_a.cgroup, "cg_x");
+        // Unknown tag → None.
+        assert!(bridge.cgroup_procs_by_tag("tag_unknown").is_none());
+        // Non-draining: drain still returns both entries.
+        let drained = bridge.drain_cgroup_procs();
+        assert_eq!(drained.len(), 2);
+        // After drain, by_tag finds nothing.
+        assert!(bridge.cgroup_procs_by_tag("tag_a").is_none());
     }
 }

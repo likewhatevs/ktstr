@@ -17,8 +17,10 @@
 //! Verification points:
 //! - `/proc/<tid>/status` `Tgid:` line == leader pid (every worker
 //!   thread shares the leader's tgid).
-//! - `/proc/<leader_pid>/comm` == `pcomm`, kernel-truncated to
-//!   15 bytes (`TASK_COMM_LEN - 1`).
+//! - `/proc/<leader_pid>/comm` == `pcomm` byte-for-byte (the
+//!   `WorkSpec::pcomm` builder rejects > 15 bytes — TASK_COMM_LEN-1
+//!   — so the framework never feeds the kernel a name that
+//!   `__set_task_comm` would truncate).
 //! - When per-thread `comm` is also set, `/proc/<tid>/comm` ==
 //!   that per-thread `comm`, NOT `pcomm` — the per-thread
 //!   `prctl(PR_SET_NAME)` overrides the inherited comm on the
@@ -336,49 +338,6 @@ fn pcomm_stop_and_collect_returns_all_reports() {
     assert!(
         after_fds <= baseline_fds + 1,
         "fd leak: baseline={baseline_fds}, after collect={after_fds}",
-    );
-}
-
-/// Kernel truncates `prctl(PR_SET_NAME)` input to 15 bytes
-/// (`TASK_COMM_LEN - 1`); the 16th byte is reserved for the NUL
-/// terminator. This test pins the truncation contract for
-/// `pcomm`: a >15-byte input is silently truncated, with no
-/// error and no exception. Operators reading `/proc/<leader>/comm`
-/// see the truncated string, not the original input.
-///
-/// `"this_is_a_very_long_name"` is 24 bytes; truncated to 15
-/// gives `"this_is_a_very_"`. Pinning the exact truncation
-/// boundary keeps documentation honest.
-#[test]
-fn pcomm_kernel_truncates_to_15_bytes() {
-    let long_name = "this_is_a_very_long_name";
-    assert!(
-        long_name.len() > 15,
-        "test fixture must exceed TASK_COMM_LEN-1"
-    );
-    let works = vec![pcomm_spec(1, long_name)];
-    let mut h = WorkloadHandle::spawn_pcomm_cgroup(long_name, None, None, &works)
-        .expect("pcomm spawn must succeed");
-    h.start();
-    std::thread::sleep(Duration::from_millis(200));
-    // Read procfs while leader is alive.
-    let pids = h.worker_pids();
-    assert_eq!(pids.len(), 1);
-    let leader_pid = pids[0];
-    let observed = read_comm(leader_pid);
-    let reports = h.stop_and_collect();
-    assert_eq!(reports.len(), 1);
-    assert_eq!(
-        observed.len(),
-        15,
-        "kernel must truncate pcomm to 15 bytes (TASK_COMM_LEN-1=15); \
-         observed length {} for {observed:?}",
-        observed.len(),
-    );
-    assert_eq!(
-        observed,
-        &long_name[..15],
-        "truncated comm must be the leading 15 bytes of pcomm input",
     );
 }
 

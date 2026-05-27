@@ -76,7 +76,7 @@ impl IsolatedCacheDir {
 /// [`IsolatedCacheDir`] for drop semantics.
 pub(crate) fn isolated_cache_dir() -> IsolatedCacheDir {
     let tmp = TempDir::new().expect("tempdir for isolated cache root");
-    let guard = EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
+    let guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
     IsolatedCacheDir { _guard: guard, tmp }
 }
 
@@ -240,6 +240,7 @@ pub(crate) fn make_vm_result(
 ) -> crate::vmm::VmResult {
     crate::vmm::VmResult {
         success: !timed_out && exit_code == 0,
+        expect_auto_repro_satisfied: false,
         exit_code,
         duration: std::time::Duration::from_secs(1),
         timed_out,
@@ -262,6 +263,7 @@ pub(crate) fn make_vm_result(
         periodic_fired: 0,
         periodic_target: 0,
         kern_kaslr_offset: 0,
+        entry_name: None,
     }
 }
 

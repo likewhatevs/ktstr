@@ -170,12 +170,27 @@ impl BaseKey {
         worker: Option<&Path>,
         staged: &[(&str, &Path)],
         include_files: &[(String, PathBuf)],
-        busybox: bool,
+        busybox_bytes: Option<&[u8]>,
     ) -> Result<Self> {
         let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
 
         "ktstr-shell".hash(&mut hasher);
-        busybox.hash(&mut hasher);
+        // Hash the busybox bytes themselves so different busybox
+        // builds produce distinct cache keys (e.g. a busybox rebuild
+        // after build.rs change). None vs Some(_) also distinguishes
+        // shell-mode-with-busybox from shell-mode-without.
+        //
+        // wprof (when set on the builder) rides include_files —
+        // its bytes are hashed there alongside other includes via
+        // `hash_file(path)`, so a rebuilt wprof binary produces a
+        // distinct cache key without a separate slot here.
+        match busybox_bytes {
+            Some(bytes) => {
+                1u8.hash(&mut hasher);
+                bytes.hash(&mut hasher);
+            }
+            None => 0u8.hash(&mut hasher),
+        }
         hash_file(payload)?.hash(&mut hasher);
         Self::hash_shared_libs(payload, &mut hasher);
 
@@ -312,7 +327,7 @@ pub(crate) fn get_or_build_base(
     payload: &Path,
     extras: &[(&str, &Path)],
     include_files: &[(&str, &Path)],
-    busybox: bool,
+    busybox_bytes: Option<Vec<u8>>,
     key: &BaseKey,
 ) -> Result<BaseRef> {
     let cargo_test_mode = crate::cargo_test_mode::cargo_test_mode_active();
@@ -332,7 +347,12 @@ pub(crate) fn get_or_build_base(
         // binaries; under bare `cargo test` the sibling-binary
         // assumption does not hold.
         let t0 = std::time::Instant::now();
-        let data = initramfs::build_initramfs_base(payload, extras, include_files, busybox)?;
+        let data = initramfs::build_initramfs_base(
+            payload,
+            extras,
+            include_files,
+            busybox_bytes.as_deref(),
+        )?;
         let arc = Arc::new(data);
         tracing::debug!(
             elapsed_us = t0.elapsed().as_micros(),
@@ -361,7 +381,12 @@ pub(crate) fn get_or_build_base(
         ShmCreateResult::Winner(fd) => {
             tracing::debug!("initramfs shm: builder (O_EXCL won)");
             let t0 = std::time::Instant::now();
-            let data = initramfs::build_initramfs_base(payload, extras, include_files, busybox)?;
+            let data = initramfs::build_initramfs_base(
+                payload,
+                extras,
+                include_files,
+                busybox_bytes.as_deref(),
+            )?;
             tracing::debug!(
                 elapsed_us = t0.elapsed().as_micros(),
                 bytes = data.len(),
@@ -398,7 +423,8 @@ pub(crate) fn get_or_build_base(
 
     // 3. Fallback: build without SHM coordination.
     let t0 = std::time::Instant::now();
-    let data = initramfs::build_initramfs_base(payload, extras, include_files, busybox)?;
+    let data =
+        initramfs::build_initramfs_base(payload, extras, include_files, busybox_bytes.as_deref())?;
     let arc = Arc::new(data);
     tracing::debug!(
         elapsed_us = t0.elapsed().as_micros(),
@@ -941,7 +967,7 @@ mod tests {
     fn get_or_build_base_cargo_test_mode_uses_process_local_cache() {
         use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
         let _lock = lock_env();
-        let _env = EnvVarGuard::set("KTSTR_CARGO_TEST_MODE", "1");
+        let _env = EnvVarGuard::set(crate::KTSTR_CARGO_TEST_MODE_ENV, "1");
         let exe = crate::resolve_current_exe().unwrap();
         let key = BaseKey::new(&exe, None, None, None, &[]).unwrap();
 
@@ -958,7 +984,7 @@ mod tests {
             .unwrap()
             .insert(key.clone(), sentinel.clone());
 
-        let result = get_or_build_base(&exe, &[], &[], false, &key)
+        let result = get_or_build_base(&exe, &[], &[], None, &key)
             .expect("cargo-test-mode must reuse process-local cache");
         match result {
             BaseRef::Owned(arc) => {

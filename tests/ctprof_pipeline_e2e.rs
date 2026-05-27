@@ -40,10 +40,11 @@ use ktstr::test_support::{OutputFormat, Payload, PayloadKind};
 use ktstr::worker_ready_wait::wait_for_worker_ready;
 
 // ---------------------------------------------------------------------------
-// Initramfs wiring for the alloc-worker — the T3 test below spawns
-// `ktstr-jemalloc-alloc-worker` inside the guest twice, between two
-// captures, to grow `allocated_bytes` across the round-trip. Same
-// ctor pattern as `tests/jemalloc_probe_tests.rs` and
+// Initramfs wiring for the alloc-worker — the round-trip test
+// below spawns `ktstr-jemalloc-alloc-worker` inside the guest
+// twice, between two captures, to grow `allocated_bytes` across
+// the round-trip. Same ctor pattern as
+// `tests/jemalloc_probe_tests.rs` and
 // `tests/ctprof_capture_jemalloc_e2e.rs`; each integration-test
 // crate compiles its own ctor list.
 // ---------------------------------------------------------------------------
@@ -53,7 +54,7 @@ use ktstr::worker_ready_wait::wait_for_worker_ready;
 fn set_alloc_worker_binary_env_var() {
     unsafe {
         std::env::set_var(
-            "KTSTR_JEMALLOC_ALLOC_WORKER_BINARY",
+            ::ktstr::KTSTR_JEMALLOC_ALLOC_WORKER_BINARY_ENV,
             env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker"),
         );
     }
@@ -264,21 +265,21 @@ fn ctprof_pipeline_e2e_capture_write_load_compare(ctx: &Ctx) -> Result<AssertRes
     Ok(candidate_workload_result)
 }
 
-/// Allocation size for the T3 alloc-worker invocations. 16 MiB
+/// Allocation size for the alloc-worker invocations. 16 MiB
 /// matches the value used by the host-side wiring test and the
 /// probe tests so the slop budget transfers without re-tuning.
-const T3_KNOWN_BYTES: u64 = 16 * 1024 * 1024;
+const ALLOC_WORKER_KNOWN_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Worker-ready handshake timeout for T3.
-const T3_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Worker-ready handshake timeout for the alloc-worker.
+const ALLOC_WORKER_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// T3 — round-trip the per-thread `allocated_bytes` field through
+/// Round-trip the per-thread `allocated_bytes` field through
 /// the full capture → write → load → compare pipeline against a
 /// jemalloc-linked target.
 ///
 /// The sibling `ctprof_pipeline_e2e_capture_write_load_compare`
 /// test above proves the SCHEDSTAT / page-fault metric family
-/// survives the pipeline. T3 is the jemalloc-counter complement:
+/// survives the pipeline. This test is the jemalloc-counter complement:
 /// drive two alloc-worker invocations between captures so the
 /// pcomm-grouped sum across the alloc-worker tgid grows by at
 /// least KNOWN_BYTES per invocation; assert the loaded compare
@@ -317,7 +318,7 @@ fn ctprof_pipeline_e2e_allocated_bytes_delta_survives_round_trip(
     // capture (otherwise the second worker's pid would race).
     let mut worker1: PayloadHandle = ctx
         .payload(&JEMALLOC_ALLOC_WORKER)
-        .arg(T3_KNOWN_BYTES.to_string())
+        .arg(ALLOC_WORKER_KNOWN_BYTES.to_string())
         .spawn()?;
     let worker1_pid = worker1
         .pid()
@@ -325,7 +326,7 @@ fn ctprof_pipeline_e2e_allocated_bytes_delta_survives_round_trip(
     wait_for_worker_ready(
         &mut worker1,
         worker1_pid,
-        T3_READY_TIMEOUT,
+        ALLOC_WORKER_READY_TIMEOUT,
         "alloc-worker #1",
         "see jemalloc_alloc_worker exit-code legend",
     )?;
@@ -342,7 +343,7 @@ fn ctprof_pipeline_e2e_allocated_bytes_delta_survives_round_trip(
     // planted value.
     let mut worker2: PayloadHandle = ctx
         .payload(&JEMALLOC_ALLOC_WORKER)
-        .arg(T3_KNOWN_BYTES.to_string())
+        .arg(ALLOC_WORKER_KNOWN_BYTES.to_string())
         .spawn()?;
     let worker2_pid = worker2
         .pid()
@@ -350,7 +351,7 @@ fn ctprof_pipeline_e2e_allocated_bytes_delta_survives_round_trip(
     wait_for_worker_ready(
         &mut worker2,
         worker2_pid,
-        T3_READY_TIMEOUT,
+        ALLOC_WORKER_READY_TIMEOUT,
         "alloc-worker #2",
         "see jemalloc_alloc_worker exit-code legend",
     )?;
@@ -381,18 +382,18 @@ fn ctprof_pipeline_e2e_allocated_bytes_delta_survives_round_trip(
         .map(|t| t.allocated_bytes.0)
         .max()
         .unwrap_or(0);
-    if baseline_alloc < T3_KNOWN_BYTES {
+    if baseline_alloc < ALLOC_WORKER_KNOWN_BYTES {
         return Ok(AssertResult::fail_msg(format!(
             "loaded baseline alloc-worker tgid={worker1_pid} carries \
-             allocated_bytes={baseline_alloc} < KNOWN_BYTES={T3_KNOWN_BYTES}; \
+             allocated_bytes={baseline_alloc} < KNOWN_BYTES={ALLOC_WORKER_KNOWN_BYTES}; \
              the capture-write-load round trip dropped or zero'd the counter \
              before reaching the compare stage",
         )));
     }
-    if candidate_alloc < T3_KNOWN_BYTES {
+    if candidate_alloc < ALLOC_WORKER_KNOWN_BYTES {
         return Ok(AssertResult::fail_msg(format!(
             "loaded candidate alloc-worker tgid={worker2_pid} carries \
-             allocated_bytes={candidate_alloc} < KNOWN_BYTES={T3_KNOWN_BYTES}",
+             allocated_bytes={candidate_alloc} < KNOWN_BYTES={ALLOC_WORKER_KNOWN_BYTES}",
         )));
     }
 
@@ -508,7 +509,7 @@ fn ctprof_pipeline_e2e_allocated_bytes_delta_survives_round_trip(
             ktstr::ctprof_compare::Aggregated::Sum(n) => n,
             _ => 0,
         };
-        baseline_sum >= T3_KNOWN_BYTES && candidate_sum >= T3_KNOWN_BYTES
+        baseline_sum >= ALLOC_WORKER_KNOWN_BYTES && candidate_sum >= ALLOC_WORKER_KNOWN_BYTES
     });
     if !any_loaded {
         let dump: Vec<(String, u64, u64, Option<f64>)> = alloc_worker_rows
@@ -527,7 +528,7 @@ fn ctprof_pipeline_e2e_allocated_bytes_delta_survives_round_trip(
             .collect();
         return Ok(AssertResult::fail_msg(format!(
             "no alloc-worker `allocated_bytes` row carries both baseline \
-             AND candidate sums >= KNOWN_BYTES={T3_KNOWN_BYTES}; the \
+             AND candidate sums >= KNOWN_BYTES={ALLOC_WORKER_KNOWN_BYTES}; the \
              round-trip dropped the counter on at least one side. \
              Observed (group, baseline_sum, candidate_sum, delta): {dump:?}",
         )));
@@ -558,7 +559,7 @@ fn ctprof_pipeline_e2e_allocated_bytes_delta_survives_round_trip(
 
 /// `CompareOptions::default().group_by` must resolve to
 /// `GroupBy::Pcomm`. The default flows through every test in this
-/// file — both the SCHEDSTAT round-trip and the T3 allocated_bytes
+/// file — both the SCHEDSTAT round-trip and the allocated_bytes
 /// round-trip rely on the pcomm grouping axis to merge baseline
 /// and candidate threads under one key. A regression that flipped the
 /// default to `GroupBy::Comm` or `GroupBy::Cgroup` would silently

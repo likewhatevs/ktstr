@@ -86,7 +86,7 @@ pub fn custom_cgroup_pipe_io(ctx: &Ctx) -> Result<AssertResult> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::ops::Setup;
+    use super::super::ops::{Setup, SpawnPlacement};
     use super::*;
     use crate::cgroup::CgroupManager;
     use crate::topology::TestTopology;
@@ -104,6 +104,7 @@ mod tests {
             assert: crate::assert::Assert::default_checks(),
             wait_for_map_write: false,
             current_step: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            entry_name: None,
         }
     }
 
@@ -125,10 +126,13 @@ mod tests {
         assert_eq!(def_names(&steps[0]), ["cg_0", "cg_1"]);
         assert_eq!(steps[0].ops.len(), 1);
         match &steps[0].ops[0] {
-            Op::SpawnHost { work } => {
+            Op::Spawn {
+                placement: SpawnPlacement::RunnerCgroup,
+                work,
+            } => {
                 assert_eq!(work.num_workers, Some(topo.total_cpus()));
             }
-            other => panic!("expected SpawnHost, got {other:?}"),
+            other => panic!("expected Op::Spawn(RunnerCgroup), got {other:?}"),
         }
     }
 
@@ -147,12 +151,24 @@ mod tests {
             .count();
         let spawns = ops
             .iter()
-            .filter(|o| matches!(o, Op::SpawnWorkers { .. }))
+            .filter(|o| {
+                matches!(
+                    o,
+                    Op::Spawn {
+                        placement: SpawnPlacement::Cgroup(_),
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(adds, 2, "two cgroups added");
         assert_eq!(spawns, 8, "4 policies × 2 cgroups = 8 spawns");
         for op in ops {
-            if let Op::SpawnWorkers { work, .. } = op {
+            if let Op::Spawn {
+                placement: SpawnPlacement::Cgroup(_),
+                work,
+            } = op
+            {
                 assert_eq!(work.num_workers, Some(2));
             }
         }
@@ -170,7 +186,10 @@ mod tests {
         let spawns: Vec<_> = ops
             .iter()
             .filter_map(|o| match o {
-                Op::SpawnWorkers { cgroup, work } => Some((cgroup.to_string(), work.num_workers)),
+                Op::Spawn {
+                    placement: SpawnPlacement::Cgroup(cgroup),
+                    work,
+                } => Some((cgroup.to_string(), work.num_workers)),
                 _ => None,
             })
             .collect();

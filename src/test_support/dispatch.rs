@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::assert::AssertResult;
 
@@ -76,10 +76,10 @@ static CAPTURE_ARGV: unsafe extern "C" fn(libc::c_int, *const *mut libc::c_char)
 
 use super::{
     KTSTR_TESTS, KtstrTestEntry, TopoOverride, collect_sidecars, extract_export_output_arg,
-    extract_export_test_arg, extract_test_fn_arg, extract_topo_arg, find_test,
-    format_callback_profile, format_kvm_stats, format_verifier_stats, maybe_dispatch_vm_test,
-    parse_topo_string, propagate_rust_env_from_cmdline, record_skip_sidecar, resolve_test_kernel,
-    run_ktstr_test_inner, sidecar_dir, try_flush_profraw,
+    extract_export_test_arg, extract_shell_test_arg, extract_test_fn_arg, extract_topo_arg,
+    find_test, format_callback_profile, format_kvm_stats, format_verifier_stats,
+    maybe_dispatch_vm_test, parse_topo_string, propagate_rust_env_from_cmdline,
+    record_skip_sidecar, resolve_test_kernel, run_ktstr_test_inner, sidecar_dir, try_flush_profraw,
 };
 
 /// Check if an `anyhow::Error` carries a [`ResourceContention`].
@@ -477,6 +477,9 @@ pub fn ktstr_test_early_dispatch() {
     if let Some(code) = maybe_dispatch_export() {
         std::process::exit(code);
     }
+    if let Some(code) = maybe_dispatch_shell_test() {
+        std::process::exit(code);
+    }
     if let Some(code) = maybe_dispatch_host_test() {
         std::process::exit(code);
     }
@@ -754,6 +757,125 @@ fn maybe_dispatch_export() -> Option<i32> {
     }
 }
 
+/// Shell-self dispatch: if `--ktstr-shell-test=NAME` is present in
+/// argv, look up `NAME` in the binary's own `KTSTR_TESTS` registry,
+/// serialize its shell-relevant fields to stdout as JSON, and exit.
+/// Returns `Some(exit_code)` when dispatched, `None` when absent.
+///
+/// `cargo ktstr shell --test <NAME>` (the cargo-ktstr binary) is a
+/// router that compiles the workspace's tests, exec's each test
+/// binary with this flag, and consumes the first stdout-JSON it
+/// gets (the router bails on ambiguous names — same `NAME`
+/// registered in two binaries). The router applies the
+/// descriptor's topology / memory / extra_include_files to the
+/// shell VM, then prints a one-line banner to stderr BEFORE VM
+/// boot naming the test + scheduler so the operator can repro the
+/// workload manually. (PS1-in-guest is a follow-up.)
+///
+/// # Stdout contract
+///
+/// The test binary MUST keep stdout silent on this dispatch path —
+/// `tracing` output MUST go to stderr. The router parses the entire
+/// stdout as a JSON descriptor; any prefix like an INFO log line
+/// will fail the parse.
+///
+/// # JSON shape
+///
+/// Serialized from [`crate::test_support::ShellTestDescriptor`] via
+/// `serde_json::to_string` — see that struct for the field-by-field
+/// contract. The struct lives in
+/// `crate::test_support::shell_descriptor` so producer and consumer
+/// share a single definition; adding a field there automatically
+/// propagates to both sides.
+///
+/// `scheduler_kind` discriminates `"eevdf" | "discover" | "path" |
+/// "kernel_builtin"` so the banner can hint at how to repro the
+/// scheduler (Discover/Path = userspace binary at `/bin/<n>`;
+/// KernelBuiltin = no binary, the shell-mode boot runs
+/// `scheduler_enable_cmds` before drop-to-busybox and
+/// `scheduler_disable_cmds` on shell exit; Eevdf = no setup needed).
+///
+/// # Exit-code contract
+///
+/// Matches `maybe_dispatch_export`:
+/// - `0`: test registered, JSON emitted to stdout.
+/// - `1`: test not registered in this binary (router falls
+///   through to the next candidate).
+/// - `2`: registered but rejected for shell mode (currently:
+///   `host_only` — no VM to drop into).
+fn maybe_dispatch_shell_test() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    let name = extract_shell_test_arg(&args)?;
+
+    if name.is_empty() {
+        eprintln!("ktstr shell: --ktstr-shell-test= requires a non-empty test name");
+        return Some(1);
+    }
+
+    let entry = match find_test(name) {
+        Some(e) => e,
+        None => {
+            eprintln!("ktstr shell: no registered test named '{name}'");
+            return Some(1);
+        }
+    };
+
+    if entry.host_only {
+        eprintln!(
+            "ktstr shell: test '{name}' has host_only = true; \
+             shell mode requires a guest VM to drop into. \
+             Either run the test directly with `cargo ktstr test {name}` \
+             (host_only tests don't boot a VM) or pick a non-host_only \
+             test for shell mode."
+        );
+        return Some(2);
+    }
+
+    let topo = &entry.topology;
+    let scheduler_kind = crate::test_support::SchedulerKind::from(&entry.scheduler.binary);
+    let (scheduler_enable_cmds, scheduler_disable_cmds) = match &entry.scheduler.binary {
+        crate::test_support::entry::SchedulerSpec::KernelBuiltin { enable, disable } => (
+            enable.iter().copied().map(String::from).collect(),
+            disable.iter().copied().map(String::from).collect(),
+        ),
+        _ => (Vec::new(), Vec::new()),
+    };
+
+    let descriptor = crate::test_support::ShellTestDescriptor {
+        numa_nodes: topo.numa_nodes,
+        llcs: topo.llcs,
+        cores: topo.cores_per_llc,
+        threads: topo.threads_per_core,
+        memory_mib: entry.memory_mib,
+        wprof: entry.wprof,
+        extra_include_files: entry
+            .extra_include_files
+            .iter()
+            .copied()
+            .map(String::from)
+            .collect(),
+        scheduler_name: entry.scheduler.name.to_string(),
+        scheduler_kind,
+        wprof_args: entry.wprof_args.map(String::from),
+        performance_mode: entry.performance_mode,
+        scheduler_enable_cmds,
+        scheduler_disable_cmds,
+    };
+
+    // serde_json::to_string produces RFC-8259-compliant escaping
+    // (`\uXXXX` with 4 hex digits, surrogate pairs for SMP code
+    // points) which Rust's Debug formatter does NOT — Debug uses
+    // `\u{1f4c2}` (braced form) for non-ASCII, breaking
+    // operator-supplied paths with non-ASCII chars (test built
+    // under `/home/<unicode-name>/proj`, `extra_include_files`
+    // listing emoji-named files, etc.). serde_json is already a
+    // workspace dep so adding this call doesn't widen the dep graph.
+    let payload = serde_json::to_string(&descriptor)
+        .expect("ShellTestDescriptor is a plain serde struct with no fallible field types");
+    println!("{payload}");
+    Some(0)
+}
+
 /// Host-side dispatch: if both `--ktstr-test-fn` and `--ktstr-topo` are
 /// present, boot a VM with the specified topology and run the test
 /// inside it. Returns `Some(exit_code)` if dispatched, `None` otherwise.
@@ -781,7 +903,7 @@ fn maybe_dispatch_host_test() -> Option<i32> {
     };
 
     let cpus = llcs * cores * threads;
-    let memory_mib = (cpus * 64).max(256).max(entry.memory_mib);
+    let memory_mib = super::runtime::derive_test_memory_mib(cpus, entry);
     let topo = TopoOverride {
         numa_nodes,
         llcs,
@@ -893,7 +1015,7 @@ fn run_deferred_dispatch(_entry: &KtstrTestEntry, deferred_name: &str) -> Result
             .find(|p| p.name == preset_name)
             .ok_or_else(|| anyhow::anyhow!("unknown preset: {preset_name}"))?;
         let t = &preset.topology;
-        let memory_mib = (t.total_cpus() * 64).max(256).max(entry.memory_mib);
+        let memory_mib = super::runtime::derive_test_memory_mib(t.total_cpus(), entry);
         let topo = TopoOverride {
             numa_nodes: t.numa_nodes,
             llcs: t.llcs,
@@ -977,7 +1099,7 @@ fn result_to_exit_code(
     expect_err: bool,
     allow_inconclusive: bool,
 ) -> i32 {
-    let no_skip = std::env::var_os("KTSTR_NO_SKIP_MODE").is_some();
+    let no_skip = std::env::var_os(crate::KTSTR_NO_SKIP_MODE_ENV).is_some();
     match result {
         Ok(r) if expect_err => {
             // expect_err inverts on Pass and on Inconclusive: both
@@ -1066,6 +1188,35 @@ fn result_to_exit_code(
                 EXIT_PASS
             }
         }
+        Err(e)
+            if e.downcast_ref::<crate::test_support::eval::ExpectAutoReproSatisfied>()
+                .is_some() =>
+        {
+            // `expect_auto_repro = true` was satisfied: the primary
+            // VM produced a Fail AND the auto-repro VM landed a
+            // shape-valid `.repro.wprof.pb`. The eval layer attached
+            // the marker as `anyhow::Context`. `downcast_ref` walks
+            // the anyhow context+source chain (per anyhow's
+            // documentation: "For errors with context, this method
+            // returns true if E matches the type of the context C or
+            // the type of the error on which the context has been
+            // attached"). A `chain().any(|c| c.is::<E>())` walk on
+            // the raw `&dyn StdError` chain would MISS the marker
+            // because anyhow boxes context as `ContextError<C, E>`
+            // whose underlying `is::<C>()` check returns false. The
+            // diagnostic is printed so the operator sees both the
+            // original failure trail and the inversion notice — the
+            // verdict flips to PASS without erasing the failure
+            // detail. Positioned AFTER the ResourceContention /
+            // TopologyInsufficient arms so a skip-class outcome still
+            // wins over inversion (a skip is a skip regardless of the
+            // satisfaction signal). The macro-parse cross-attribute
+            // check rejects `expect_auto_repro` combined with
+            // `expect_err`, so the two inversion paths are mutually
+            // exclusive at the entry layer.
+            eprintln!("{e:#}");
+            EXIT_PASS
+        }
         Err(e) if expect_err => {
             // expect_err inverts a failure into a pass — UNLESS the
             // failure carries the
@@ -1075,8 +1226,18 @@ fn result_to_exit_code(
             // mismatch failure must surface even when expect_err = true:
             // the user authored the matcher to pin THIS specific bug,
             // and a different bug firing is itself a regression.
-            if e.chain()
-                .any(|c| c.is::<crate::test_support::eval::ScxBpfErrorMatcherMismatch>())
+            //
+            // `downcast_ref` walks the anyhow context+source chain
+            // (anyhow's documented "For errors with context, this
+            // method returns true if E matches the type of the context
+            // C or the type of the error on which the context has been
+            // attached" semantics). A `chain().any(|c| c.is::<E>())`
+            // walk on the raw `&dyn StdError` chain would MISS the
+            // marker because anyhow boxes context as
+            // `ContextError<C, E>` whose underlying `is::<C>()` check
+            // returns false.
+            if e.downcast_ref::<crate::test_support::eval::ScxBpfErrorMatcherMismatch>()
+                .is_some()
             {
                 eprintln!("{e:#}");
                 EXIT_FAIL
@@ -1200,7 +1361,7 @@ fn warn_duplicate_test_names_inner<'a, W: std::io::Write>(
 /// the inner `OnceLock` gate.
 fn list_tests(ignored_only: bool) {
     warn_duplicate_test_names_once();
-    let raw = std::env::var("KTSTR_BUDGET_SECS").ok();
+    let raw = std::env::var(crate::KTSTR_BUDGET_SECS_ENV).ok();
     let budget_secs: Option<f64> = raw.as_deref().and_then(|s| match s.parse::<f64>() {
         Ok(v) if v > 0.0 => Some(v),
         Ok(v) => {
@@ -2029,9 +2190,45 @@ fn run_host_only_test(entry: &KtstrTestEntry) -> i32 {
 ///
 /// Builds a minimal Ctx and calls the test function on the host.
 /// Used for tests that need host tools (cargo, nested VMs).
+///
+/// Topology comes from real-host sysfs (`/sys/devices/system/cpu/`)
+/// via [`crate::topology::TestTopology::from_system`]; the test's
+/// declared VM topology is intentionally ignored for host_only
+/// runs because the test author wrote it for a synthetic VM and
+/// the host's actual CPU layout is what `WorkSpec::workers_pct` /
+/// `AffinityIntent::LlcAligned` resolve against. Bails with an
+/// actionable diagnostic when sysfs CPU enumeration fails — the
+/// underlying causes are missing `/sys/devices/system/cpu/online`
+/// (no /sys mount or container masking), unreadable contents (rare
+/// permissions edge), corrupt sysfs string (kernel/hardware bug),
+/// or an empty online-CPU set (degenerate cpuset namespace).
+///
+/// Cgroup parent defaults to `/sys/fs/cgroup/ktstr`; the operator
+/// can override via `KTSTR_HOST_CGROUP_PARENT`. The override path
+/// is validated upfront: it must be non-empty and rooted under
+/// `/sys/fs/cgroup` so an accidental empty/relative/foreign value
+/// produces a clear error instead of an opaque cgroupfs failure
+/// later. Empty-string env value is treated as "unset" and falls
+/// back to the default.
+///
+/// For cgroup-v2 user delegation (Mode B/C: systemd `Delegate=yes`,
+/// container `nsdelegate`), the operator sets
+/// `KTSTR_CGROUP_WALK_ROOT` to the delegation boundary so
+/// [`crate::cgroup::CgroupManager::setup`]'s ancestor
+/// `subtree_control` walk stops there instead of EACCES-ing at
+/// `user.slice` / the container root. Defaults to `/sys/fs/cgroup`
+/// (Mode A: root-owned tree).
 fn run_host_only_test_inner(entry: &KtstrTestEntry) -> Result<AssertResult> {
-    let topo = crate::topology::TestTopology::from_vm_topology(&entry.topology);
-    let cgroups = crate::cgroup::CgroupManager::new("/sys/fs/cgroup/ktstr");
+    let topo = crate::topology::TestTopology::from_system().context(
+        "host_only requires real-host topology from sysfs; \
+         the sysfs CPU enumeration at /sys/devices/system/cpu/online \
+         failed — likely causes: running outside a /sys-mounted \
+         environment, sysfs contents unreadable (permissions / \
+         container mask), corrupt online-CPU string, or a degenerate \
+         cpuset namespace with no online CPUs",
+    )?;
+    let cgroup_parent = resolve_host_cgroup_parent()?;
+    let cgroups = build_host_cgroup_manager(&cgroup_parent)?;
     let merged_assert = crate::assert::Assert::default_checks()
         .merge(&entry.scheduler.assert)
         .merge(&entry.assert);
@@ -2039,8 +2236,124 @@ fn run_host_only_test_inner(entry: &KtstrTestEntry) -> Result<AssertResult> {
         .duration(entry.duration)
         .settle(std::time::Duration::ZERO)
         .assert(merged_assert)
+        .entry_name(entry.name)
         .build();
     (entry.func)(&ctx)
+}
+
+/// Default cgroup parent path for `host_only` tests when
+/// `KTSTR_HOST_CGROUP_PARENT` is unset. Suitable for both root
+/// (writable directly) and non-root (operator pre-creates
+/// `/sys/fs/cgroup/ktstr` with appropriate ownership, OR overrides via
+/// `KTSTR_HOST_CGROUP_PARENT` to point at a path inside a delegated
+/// subtree) invocations. See [`resolve_host_cgroup_parent`] for the
+/// env-override path and [`build_host_cgroup_manager`] for the
+/// cgroup-v2 Mode B/C delegation wire-up.
+///
+/// `pub` so integration tests can pin against it instead of mirroring
+/// the literal in their own assertion strings (tests/host_mode_e2e.rs
+/// uses this to assert the resolve cascade's fallback). Treat as the
+/// canonical default — operators set `KTSTR_HOST_CGROUP_PARENT` to
+/// override.
+pub const DEFAULT_HOST_CGROUP_PARENT: &str = "/sys/fs/cgroup/ktstr";
+
+/// Resolve the cgroup parent path for `host_only` tests.
+///
+/// Reads `KTSTR_HOST_CGROUP_PARENT`. Empty / unset falls back to
+/// `DEFAULT_HOST_CGROUP_PARENT`. A set value must be rooted under
+/// `/sys/fs/cgroup` (no relative paths, no random /tmp dirs) so an
+/// accidental misconfiguration surfaces here rather than as an
+/// opaque cgroupfs failure inside `CgroupManager::setup`.
+///
+/// Non-root callers are admitted: cgroup-v2 user delegation (Mode
+/// B/C: systemd `Delegate=yes`, container `nsdelegate`) is handled
+/// by [`build_host_cgroup_manager`] threading
+/// [`crate::KTSTR_CGROUP_WALK_ROOT_ENV`] into
+/// [`crate::cgroup::CgroupManager::with_walk_root`] so the
+/// `subtree_control` walk bails at the delegation root instead of
+/// EACCES-ing on `user.slice`.
+pub fn resolve_host_cgroup_parent() -> Result<String> {
+    let parent = match std::env::var(crate::KTSTR_HOST_CGROUP_PARENT_ENV) {
+        Ok(s) if !s.is_empty() => s,
+        _ => return Ok(DEFAULT_HOST_CGROUP_PARENT.to_string()),
+    };
+    if !parent.starts_with("/sys/fs/cgroup") || parent == "/sys/fs/cgroup" {
+        anyhow::bail!(
+            "KTSTR_HOST_CGROUP_PARENT={parent:?}: must be rooted under \
+             /sys/fs/cgroup and name a non-root subdirectory \
+             (e.g. /sys/fs/cgroup/ktstr or /sys/fs/cgroup/ktstr-foo); \
+             unset or empty falls back to {DEFAULT_HOST_CGROUP_PARENT}",
+        );
+    }
+    Ok(parent)
+}
+
+/// Build a [`crate::cgroup::CgroupManager`] for a `host_only` test
+/// run, threading [`crate::KTSTR_CGROUP_WALK_ROOT_ENV`] into
+/// [`crate::cgroup::CgroupManager::with_walk_root`] when set.
+///
+/// The walk root override bounds [`crate::cgroup::CgroupManager::setup`]'s
+/// ancestor `subtree_control` walk for cgroup-v2 Mode B/C
+/// delegation: under systemd `Delegate=yes` or a container's
+/// `nsdelegate`, the operator owns subtree_control writes only
+/// inside the delegated subtree. Without the override the walk
+/// starts at `/sys/fs/cgroup` and EACCES-es at `user.slice` or the
+/// container root.
+///
+/// Empty / unset falls through to the default `/sys/fs/cgroup`
+/// (Mode A: root-owned tree). [`crate::cgroup::CgroupManager::with_walk_root`]
+/// validates that the chosen walk root is a prefix of `parent` —
+/// misconfigurations surface as a focused error before the first
+/// cgroupfs write rather than as an opaque downstream EACCES.
+fn build_host_cgroup_manager(cgroup_parent: &str) -> Result<crate::cgroup::CgroupManager> {
+    let cg = crate::cgroup::CgroupManager::new(cgroup_parent);
+    match std::env::var(crate::KTSTR_CGROUP_WALK_ROOT_ENV) {
+        Ok(walk_root) if !walk_root.is_empty() => {
+            // Defense-in-depth: walk_root must be rooted under
+            // /sys/fs/cgroup. Mirrors the sibling
+            // KTSTR_HOST_CGROUP_PARENT_ENV guard above so an operator
+            // typo surfaces here instead of as a downstream cgroupfs
+            // fs::write EACCES.
+            if !walk_root.starts_with("/sys/fs/cgroup") {
+                anyhow::bail!(
+                    "{env}={walk_root:?}: walk root must be rooted under /sys/fs/cgroup \
+                     (e.g. /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service \
+                     for a systemd user session); the value supplied is outside the cgroup-v2 \
+                     mount and would EACCES on the first cgroupfs write",
+                    env = crate::KTSTR_CGROUP_WALK_ROOT_ENV,
+                );
+            }
+            cg.with_walk_root(&walk_root).with_context(|| {
+                format!(
+                    "{env}={walk_root:?}: walk-root override rejected (must be a prefix of \
+                     KTSTR_HOST_CGROUP_PARENT={cgroup_parent:?})",
+                    env = crate::KTSTR_CGROUP_WALK_ROOT_ENV,
+                )
+            })
+        }
+        _ => {
+            // Non-root operators MUST set KTSTR_CGROUP_WALK_ROOT to
+            // their cgroup-v2 delegation root, otherwise the default
+            // /sys/fs/cgroup walk EACCES-es on the first
+            // subtree_control write — opaque from the operator's
+            // perspective. Bail upfront with the env-var names + an
+            // example so the on-ramp is one copy-paste.
+            if unsafe { libc::geteuid() } != 0 {
+                anyhow::bail!(
+                    "non-root operator detected (euid != 0) but {walk_env} is unset/empty; \
+                     ktstr needs a cgroup-v2 delegated subtree under non-root operation \
+                     (systemd Delegate=yes or container nsdelegate). Set {walk_env} to \
+                     the delegation root (e.g. /sys/fs/cgroup/user.slice/user-$(id -u).slice/\
+                     user@$(id -u).service) AND set {parent_env} to a subdirectory under it \
+                     where ktstr can create the test cgroup parent (e.g. \
+                     /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/ktstr)",
+                    walk_env = crate::KTSTR_CGROUP_WALK_ROOT_ENV,
+                    parent_env = crate::KTSTR_HOST_CGROUP_PARENT_ENV,
+                );
+            }
+            Ok(cg)
+        }
+    }
 }
 
 /// Run a gauntlet variant test. `rest` is `{name}/{preset}`.
@@ -2072,7 +2385,7 @@ pub(crate) fn run_gauntlet_test(rest: &str) -> i32 {
     let t = &preset.topology;
     let cpus = t.total_cpus();
 
-    let memory_mib = (cpus * 64).max(256).max(entry.memory_mib);
+    let memory_mib = super::runtime::derive_test_memory_mib(cpus, entry);
     let topo = TopoOverride {
         numa_nodes: t.numa_nodes,
         llcs: t.llcs,
@@ -3355,7 +3668,7 @@ mod tests {
         // is defensive against a parallel test that set it without
         // restoring (would not affect this call's output, but keeps
         // the test's runtime hypothesis explicit).
-        let _budget_guard = EnvVarGuard::remove("KTSTR_BUDGET_SECS");
+        let _budget_guard = EnvVarGuard::remove(crate::KTSTR_BUDGET_SECS_ENV);
 
         let (_, captured) = capture_stdout(|| list_tests_all(false));
         let lines = host_only_listing_lines(&captured);
@@ -3447,9 +3760,9 @@ mod tests {
     fn list_tests_all_cargo_test_mode_skips_gauntlet() {
         use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
         let _env_lock = lock_env();
-        let _cargo = EnvVarGuard::set("KTSTR_CARGO_TEST_MODE", "1");
+        let _cargo = EnvVarGuard::set(crate::KTSTR_CARGO_TEST_MODE_ENV, "1");
         let _no_kernel_list = EnvVarGuard::remove(crate::KTSTR_KERNEL_LIST_ENV);
-        let _budget_guard = EnvVarGuard::remove("KTSTR_BUDGET_SECS");
+        let _budget_guard = EnvVarGuard::remove(crate::KTSTR_BUDGET_SECS_ENV);
 
         let (_, captured) = capture_stdout(|| list_tests_all(false));
         let stdout = std::str::from_utf8(&captured).expect("utf-8");
@@ -3551,9 +3864,9 @@ mod tests {
     fn list_tests_all_cargo_test_mode_ignores_kernel_list() {
         use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
         let _env_lock = lock_env();
-        let _cargo = EnvVarGuard::set("KTSTR_CARGO_TEST_MODE", "1");
+        let _cargo = EnvVarGuard::set(crate::KTSTR_CARGO_TEST_MODE_ENV, "1");
         let _kernel_list = EnvVarGuard::set(crate::KTSTR_KERNEL_LIST_ENV, TWO_KERNEL_LIST);
-        let _budget_guard = EnvVarGuard::remove("KTSTR_BUDGET_SECS");
+        let _budget_guard = EnvVarGuard::remove(crate::KTSTR_BUDGET_SECS_ENV);
 
         let (_, captured) = capture_stdout(|| list_tests_all(false));
         let stdout = std::str::from_utf8(&captured).expect("utf-8");
@@ -3562,6 +3875,276 @@ mod tests {
             "cargo-test-mode must suppress multi-kernel suffix emission \
              even when KTSTR_KERNEL_LIST is set; got stdout containing a \
              sanitized kernel label:\n{stdout}",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // build_host_cgroup_manager — KTSTR_CGROUP_WALK_ROOT_ENV roundtrip
+    // ---------------------------------------------------------------
+
+    /// `build_host_cgroup_manager` threads a non-empty
+    /// `KTSTR_CGROUP_WALK_ROOT_ENV` value into
+    /// `CgroupManager::with_walk_root`. Pins the env-var → walk_root
+    /// wire-up against a refactor that drops the threading.
+    /// Requires root because the no-env-set fallback path bails for
+    /// non-root operators (delegated subtree without explicit walk_root
+    /// would EACCES downstream); skipped on non-root.
+    #[test]
+    fn build_host_cgroup_manager_threads_env_walk_root() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _env_lock = lock_env();
+        let _g = EnvVarGuard::set(
+            crate::KTSTR_CGROUP_WALK_ROOT_ENV,
+            "/sys/fs/cgroup/delegated",
+        );
+        let cg = build_host_cgroup_manager("/sys/fs/cgroup/delegated/ktstr")
+            .expect("env-set walk_root must thread into CgroupManager");
+        assert_eq!(
+            cg.walk_root(),
+            std::path::Path::new("/sys/fs/cgroup/delegated"),
+            "walk_root must match the env value verbatim",
+        );
+    }
+
+    /// Empty `KTSTR_CGROUP_WALK_ROOT_ENV` is observationally
+    /// identical to unset (the empty-string-equals-unset contract).
+    /// Pins the
+    /// `Ok(walk_root) if !walk_root.is_empty()` gate at the
+    /// build_host_cgroup_manager match arm.
+    /// Root-gated: the unset arm bails for non-root operators.
+    #[test]
+    fn build_host_cgroup_manager_empty_env_treated_as_unset() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _env_lock = lock_env();
+        let _g = EnvVarGuard::set(crate::KTSTR_CGROUP_WALK_ROOT_ENV, "");
+        let cg = build_host_cgroup_manager("/sys/fs/cgroup/ktstr")
+            .expect("empty env must fall through to default (root-only)");
+        assert_eq!(
+            cg.walk_root(),
+            std::path::Path::new("/sys/fs/cgroup"),
+            "empty env must select the canonical-root default",
+        );
+    }
+
+    /// Unset `KTSTR_CGROUP_WALK_ROOT_ENV` selects the canonical-root
+    /// default `/sys/fs/cgroup` (Mode A).
+    /// Root-gated: see sibling test for the rationale.
+    #[test]
+    fn build_host_cgroup_manager_unset_env_uses_default() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _env_lock = lock_env();
+        let _g = EnvVarGuard::remove(crate::KTSTR_CGROUP_WALK_ROOT_ENV);
+        let cg = build_host_cgroup_manager("/sys/fs/cgroup/ktstr")
+            .expect("unset env must fall through to default (root-only)");
+        assert_eq!(
+            cg.walk_root(),
+            std::path::Path::new("/sys/fs/cgroup"),
+            "unset env must select the canonical-root default",
+        );
+    }
+
+    /// Non-root operators that omit `KTSTR_CGROUP_WALK_ROOT_ENV`
+    /// MUST bail upfront with a focused error citing both env vars
+    /// and an example delegation path — pins the early-user
+    /// failure mode. Skipped when running as root (the bail
+    /// is gated on `geteuid() != 0`).
+    #[test]
+    fn build_host_cgroup_manager_non_root_unset_bails_with_walk_env() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _env_lock = lock_env();
+        let _g = EnvVarGuard::remove(crate::KTSTR_CGROUP_WALK_ROOT_ENV);
+        let err = build_host_cgroup_manager("/sys/fs/cgroup/ktstr")
+            .expect_err("non-root + no walk_root MUST bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("KTSTR_CGROUP_WALK_ROOT") && msg.contains("KTSTR_HOST_CGROUP_PARENT"),
+            "bail message must cite BOTH env vars to give the operator \
+             a complete on-ramp; got: {msg}",
+        );
+    }
+
+    /// `KTSTR_CGROUP_WALK_ROOT_ENV` values outside `/sys/fs/cgroup`
+    /// MUST bail upfront (defensive guard mirroring the
+    /// sibling `KTSTR_HOST_CGROUP_PARENT_ENV` check). Catches
+    /// operator typos like `/tmp/foo` at config-validation time
+    /// instead of as a downstream fs::write EACCES.
+    #[test]
+    fn build_host_cgroup_manager_env_outside_cgroupfs_bails() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _env_lock = lock_env();
+        let _g = EnvVarGuard::set(crate::KTSTR_CGROUP_WALK_ROOT_ENV, "/tmp/foo");
+        let err = build_host_cgroup_manager("/tmp/foo/ktstr")
+            .expect_err("walk_root outside /sys/fs/cgroup MUST bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("/sys/fs/cgroup") && msg.contains("KTSTR_CGROUP_WALK_ROOT"),
+            "bail message must name both the required prefix and the \
+             env var so the operator can fix the config; got: {msg}",
+        );
+    }
+
+    // -- result_to_exit_code: ExpectAutoReproSatisfied marker tests --
+    //
+    // Pin the dispatch-side verdict flip that consumes the marker
+    // wrapped onto the failure Err by run_ktstr_test_inner_impl
+    // when apply_expect_auto_repro_inversion signaled satisfaction.
+    // The eval-side helper's gates are exercised separately at the
+    // eval.rs tests module; these pin the dispatch-arm match-order
+    // contract.
+
+    /// Err with [`ExpectAutoReproSatisfied`] attached directly →
+    /// the dispatch arm downcasts and routes to [`EXIT_PASS`]. The
+    /// canonical happy-path: helper set the marker, no other arm
+    /// matches first, verdict flips.
+    #[test]
+    fn result_to_exit_code_expect_auto_repro_satisfied_routes_to_pass() {
+        let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!("primary VM failure")
+            .context(crate::test_support::eval::ExpectAutoReproSatisfied));
+        assert_eq!(
+            result_to_exit_code(err, false, false),
+            EXIT_PASS,
+            "ExpectAutoReproSatisfied marker must route Err → EXIT_PASS"
+        );
+    }
+
+    /// Err with the marker nested inside additional `.context()`
+    /// wrapping → the chain walk still surfaces it. Pins the
+    /// `e.chain().any(|c| c.is::<...>())` contract against a
+    /// regression that swaps the chain walk for a top-level
+    /// `downcast_ref` (which would only match the outermost
+    /// context). The eval layer's surrounding context wrappers
+    /// (`"build ktstr_test VM"`, `"run ktstr_test VM"`) make
+    /// nested-marker chains the production-typical shape.
+    #[test]
+    fn result_to_exit_code_expect_auto_repro_satisfied_works_through_nested_context() {
+        let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!("primary VM failure")
+            .context(crate::test_support::eval::ExpectAutoReproSatisfied)
+            .context("run ktstr_test VM")
+            .context("dispatch wrapper"));
+        assert_eq!(
+            result_to_exit_code(err, false, false),
+            EXIT_PASS,
+            "nested ExpectAutoReproSatisfied must still be downcast by the chain walk"
+        );
+    }
+
+    /// Baseline control: Err WITHOUT the marker → [`EXIT_FAIL`].
+    /// Guards against an arm regression that routes every Err to
+    /// EXIT_PASS — the marker's presence MUST be load-bearing for
+    /// the verdict flip. Pairs with the direct-marker test above
+    /// so a one-arm-too-broad regression fails this baseline
+    /// instead of silently green-lighting every failure.
+    #[test]
+    fn result_to_exit_code_plain_err_without_marker_routes_to_fail() {
+        let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!(
+            "primary VM failure without inversion marker"
+        ));
+        assert_eq!(
+            result_to_exit_code(err, false, false),
+            EXIT_FAIL,
+            "Err without ExpectAutoReproSatisfied must route to EXIT_FAIL"
+        );
+    }
+
+    /// `expect_err = true` + both markers attached → the
+    /// ExpectAutoReproSatisfied arm wins because it is positioned
+    /// BEFORE the expect_err arm in the dispatch match. The two
+    /// inversion paths are mutually exclusive at macro-parse (the
+    /// cross-attr check in ktstr_test rejects the combination), so
+    /// this pin guards the order invariant rather than a
+    /// runtime-reachable combo: a programmatic-construction path
+    /// that bypassed the macro MUST still route consistently. The
+    /// scenario also attaches ScxBpfErrorMatcherMismatch so the
+    /// alternative arm has a distinguishing outcome
+    /// (EXIT_FAIL via the matcher-mismatch branch) — without the
+    /// second marker, both arms would converge on EXIT_PASS and the
+    /// precedence claim would not be falsifiable.
+    #[test]
+    fn result_to_exit_code_marker_arm_wins_over_expect_err_arm() {
+        let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!("primary VM failure")
+            .context(crate::test_support::eval::ScxBpfErrorMatcherMismatch)
+            .context(crate::test_support::eval::ExpectAutoReproSatisfied));
+        assert_eq!(
+            result_to_exit_code(err, true, false),
+            EXIT_PASS,
+            "marker arm must win over expect_err arm by match-order positioning \
+             (expect_err arm with ScxBpfErrorMatcherMismatch would return EXIT_FAIL)"
+        );
+    }
+
+    // -- result_to_exit_code: ScxBpfErrorMatcherMismatch (expect_err
+    // arm) tests --
+    //
+    // Pin the two-way verdict the expect_err arm produces depending
+    // on whether the scx_bpf_error matcher mismatch marker is
+    // attached. Until this batch, no test exercised the marker
+    // detection path; the chain walk shape was untested at the
+    // dispatch layer and only protected by the eval.rs structural
+    // source-pin.
+
+    /// `expect_err = true` + Err WITHOUT a matcher-mismatch marker
+    /// → the expect_err arm inverts to [`EXIT_PASS`]. The canonical
+    /// `expected error happened` path.
+    #[test]
+    fn result_to_exit_code_expect_err_without_matcher_marker_routes_to_pass() {
+        let err: Result<crate::assert::AssertResult> =
+            Err(anyhow::anyhow!("primary VM failure (no matcher mismatch)"));
+        assert_eq!(
+            result_to_exit_code(err, true, false),
+            EXIT_PASS,
+            "expect_err arm must invert plain Err to EXIT_PASS"
+        );
+    }
+
+    /// `expect_err = true` + Err WITH the matcher-mismatch marker
+    /// → the expect_err arm REFUSES to invert and returns
+    /// [`EXIT_FAIL`]. The reproducer's matcher narrowed which bug
+    /// counts; a different bug firing must surface as a regression
+    /// even though `expect_err = true` would normally invert.
+    #[test]
+    fn result_to_exit_code_expect_err_with_matcher_mismatch_routes_to_fail() {
+        let err: Result<crate::assert::AssertResult> =
+            Err(anyhow::anyhow!("primary VM failure (matcher mismatch)")
+                .context(crate::test_support::eval::ScxBpfErrorMatcherMismatch));
+        assert_eq!(
+            result_to_exit_code(err, true, false),
+            EXIT_FAIL,
+            "expect_err arm must refuse inversion when ScxBpfErrorMatcherMismatch is attached"
+        );
+    }
+
+    /// `expect_err = true` + Err with the matcher-mismatch marker
+    /// nested INSIDE additional `.context()` wrapping → the
+    /// expect_err arm STILL refuses to invert because anyhow's
+    /// `downcast_ref` walks the context+source chain. Sibling pin
+    /// to `result_to_exit_code_expect_auto_repro_satisfied_works_through_nested_context`
+    /// — the eval-layer wrappers (`"build ktstr_test VM"`,
+    /// `"run ktstr_test VM"`) routinely wrap the inner Err with
+    /// additional context, so nested-marker chains are the
+    /// production-typical shape. A regression that swapped
+    /// `downcast_ref` for a top-level downcast would only match
+    /// the outermost context wrapper — passing the unnested
+    /// sibling test above but silently inverting nested-marker
+    /// regressions in production.
+    #[test]
+    fn result_to_exit_code_matcher_mismatch_through_nested_context_routes_to_fail() {
+        let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!("primary VM failure")
+            .context(crate::test_support::eval::ScxBpfErrorMatcherMismatch)
+            .context("run ktstr_test VM")
+            .context("dispatch wrapper"));
+        assert_eq!(
+            result_to_exit_code(err, true, false),
+            EXIT_FAIL,
+            "nested ScxBpfErrorMatcherMismatch must still be downcast by anyhow's context-aware downcast_ref"
         );
     }
 }

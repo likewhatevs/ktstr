@@ -76,19 +76,10 @@
 use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
-use ktstr::test_support::{Scheduler, SchedulerSpec, sidecar_dir};
+use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-
-/// Mirror of `tests/failure_dump_e2e.rs::failure_dump_path` — the
-/// freeze coordinator writes per-test failure dumps under the same
-/// sidecar dir keyed by test name. The test framework's
-/// `test_support::eval::run_ktstr_test_inner` attaches this path
-/// onto every VM builder; the test only reads it back here.
-fn failure_dump_path(test_name: &str) -> std::path::PathBuf {
-    sidecar_dir().join(format!("{test_name}.failure-dump.json"))
-}
 
 /// Locate scx-ktstr's TASK_STORAGE map (`scx_task_map`) inside the
 /// dump JSON's `maps` array. Used by every cast E2E scenario as the
@@ -187,7 +178,7 @@ fn struct_member<'a>(
 /// `counter` (u32 at offset 8) MUST render as plain integers,
 /// never as Ptr.
 fn scenario_cast_analysis_chases_kernel_kptr(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
-    let dump_path = failure_dump_path("cast_analysis_chases_kernel_kptr");
+    let dump_path = ctx.failure_dump_path()?;
 
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
@@ -672,7 +663,7 @@ fn find_scheduler_bss_map(dump: &serde_json::Value) -> Result<&serde_json::Value
 /// not flag the offset, mirroring the `magic`/`counter` negative-control
 /// pattern from the existing kernel-kptr scenario.
 fn scenario_cast_analysis_chases_bss_to_arena(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
-    let dump_path = failure_dump_path("cast_analysis_chases_bss_to_arena");
+    let dump_path = ctx.failure_dump_path()?;
 
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
@@ -1037,7 +1028,7 @@ static __KTSTR_ENTRY_CAST_ANALYSIS_BSS_TO_ARENA: ktstr::test_support::KtstrTestE
 fn scenario_cast_analysis_sdt_alloc_bridge_resolves_fwd(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
-    let dump_path = failure_dump_path("cast_analysis_sdt_alloc_bridge_resolves_fwd");
+    let dump_path = ctx.failure_dump_path()?;
 
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
@@ -1346,7 +1337,7 @@ fn scenario_cast_analysis_sdt_alloc_bridge_resolves_fwd(
 fn scenario_cast_analysis_cross_subprog_arena_chase(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
-    let dump_path = failure_dump_path("cast_analysis_cross_subprog_arena_chase");
+    let dump_path = ctx.failure_dump_path()?;
 
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),

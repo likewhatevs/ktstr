@@ -30,7 +30,6 @@
 mod common;
 
 use anyhow::Result;
-use common::dump_paths::failure_dump_path;
 use ktstr::assert::AssertResult;
 use ktstr::prelude::SCHEMA_SINGLE;
 use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
@@ -46,7 +45,7 @@ fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Resul
     // it constructs) — no env-var dance, no `set_var` race
     // against parallel tests. This scenario just reads the file
     // back from the same sidecar dir keyed by `test_name`.
-    let dump_path = failure_dump_path("failure_dump_renders_bss_fields");
+    let dump_path = ctx.failure_dump_path()?;
 
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
@@ -585,7 +584,7 @@ static __KTSTR_ENTRY_FAILURE_DUMP_BSS: ktstr::test_support::KtstrTestEntry =
 fn scenario_failure_dump_renders_capture_modules(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
-    let dump_path = failure_dump_path("failure_dump_renders_capture_modules");
+    let dump_path = ctx.failure_dump_path()?;
     let num_cpus = ctx.topo.total_cpus();
 
     let steps = vec![Step {
@@ -846,7 +845,7 @@ static __KTSTR_ENTRY_FAILURE_DUMP_CAPTURES: ktstr::test_support::KtstrTestEntry 
 fn scenario_failure_dump_renders_probe_counters(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
-    let dump_path = failure_dump_path("failure_dump_renders_probe_counters");
+    let dump_path = ctx.failure_dump_path()?;
 
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),

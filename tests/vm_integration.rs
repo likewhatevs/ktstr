@@ -41,17 +41,10 @@
 use anyhow::Result;
 use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
 use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
-use ktstr::test_support::{Scheduler, SchedulerSpec, sidecar_dir};
+use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-
-/// Mirror `failure_dump_e2e.rs::failure_dump_path`. Both sites must
-/// agree with `test_support::eval::run_ktstr_test_inner`'s naming
-/// convention for the per-test sidecar dump file.
-fn failure_dump_path(test_name: &str) -> std::path::PathBuf {
-    sidecar_dir().join(format!("{test_name}.failure-dump.json"))
-}
 
 /// Read and parse the per-test failure-dump JSON. Returns the parsed
 /// `serde_json::Value` so the caller can navigate the schema without
@@ -59,8 +52,8 @@ fn failure_dump_path(test_name: &str) -> std::path::PathBuf {
 /// the scenario if the file is missing — a missing dump file means
 /// the freeze coordinator did not write OR the stall trigger did
 /// not fire, both of which are real regressions.
-fn read_dump_or_fail(test_name: &str) -> Result<serde_json::Value> {
-    let dump_path = failure_dump_path(test_name);
+fn read_dump_or_fail(ctx: &ktstr::scenario::Ctx) -> Result<serde_json::Value> {
+    let dump_path = ctx.failure_dump_path()?;
     let json = std::fs::read_to_string(&dump_path).map_err(|e| {
         anyhow::anyhow!(
             "failure dump file missing at {}: {e} — freeze coordinator did \
@@ -119,7 +112,7 @@ fn scenario_dsq_and_rq_walker_populates_failure_dump(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
     let mut result = run_stalled_workload(ctx)?;
-    let dump = read_dump_or_fail("vm_integration_dsq_and_rq_walker")?;
+    let dump = read_dump_or_fail(ctx)?;
 
     // dsq_states is `skip_serializing_if = "Vec::is_empty"`, so its
     // absence here means the walk produced zero entries. Treat absent
@@ -196,7 +189,7 @@ fn scenario_perf_counters_capture_populates_dump(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
     let mut result = run_stalled_workload(ctx)?;
-    let dump = read_dump_or_fail("vm_integration_perf_counters_capture")?;
+    let dump = read_dump_or_fail(ctx)?;
 
     let vcpu_perf: &[serde_json::Value] = match dump.get("vcpu_perf_at_freeze") {
         Some(v) => v
@@ -268,7 +261,7 @@ fn scenario_event_counter_timeline_populates_dump(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
     let mut result = run_stalled_workload(ctx)?;
-    let dump = read_dump_or_fail("vm_integration_event_counter_timeline")?;
+    let dump = read_dump_or_fail(ctx)?;
 
     let timeline: &[serde_json::Value] = match dump.get("event_counter_timeline") {
         Some(t) => t.as_array().map(|a| a.as_slice()).ok_or_else(|| {
@@ -429,7 +422,7 @@ fn scenario_failure_dump_trigger_minimal_invariants(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
     let mut result = run_stalled_workload(ctx)?;
-    let dump = read_dump_or_fail("vm_integration_failure_dump_trigger")?;
+    let dump = read_dump_or_fail(ctx)?;
 
     let schema = dump
         .get("schema")

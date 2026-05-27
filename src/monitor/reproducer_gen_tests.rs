@@ -1140,7 +1140,7 @@ fn is_unmapped_work_type_split_matches_render() {
     });
     all_variants.push(WorkType::Custom {
         name: "stub-custom".into(),
-        run: stub_custom_fn,
+        run: crate::workload::CustomFn(stub_custom_fn),
     });
 
     // Exhaustiveness gate: every entry in `ALL_NAMES` must

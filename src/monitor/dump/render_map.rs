@@ -365,7 +365,7 @@ pub(super) fn append_arena_slot_index_for_allocator(
                 v.insert(info);
             }
             std::collections::btree_map::Entry::Occupied(o) => {
-                // F6 mitigation: low-32-bit collision probability is
+                // Low-32-bit collision mitigation: probability is
                 // ~1.6% with 8K entries. A real duplicate signals
                 // either a torn snapshot OR (more likely) a low-32
                 // collision between slot starts in different

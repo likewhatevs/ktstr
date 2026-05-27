@@ -44,7 +44,7 @@ use super::metadata::KernelSource;
 ///
 /// Does not create the directory.
 pub(crate) fn resolve_cache_root_with_suffix(suffix: &str) -> anyhow::Result<PathBuf> {
-    match std::env::var("KTSTR_CACHE_DIR") {
+    match std::env::var(crate::KTSTR_CACHE_DIR_ENV) {
         Ok(dir) if !dir.is_empty() => return Ok(PathBuf::from(dir)),
         Ok(_) => { /* empty string -> fall through to fallbacks */ }
         Err(std::env::VarError::NotPresent) => { /* unset -> fall through */ }
@@ -155,7 +155,7 @@ pub(crate) fn resolve_cache_root() -> anyhow::Result<PathBuf> {
 /// Resolution: `KTSTR_LOCK_DIR` when set and non-empty, otherwise
 /// `/tmp`. The fallback matches the historical default.
 pub(crate) fn resolve_lock_dir() -> PathBuf {
-    match std::env::var("KTSTR_LOCK_DIR") {
+    match std::env::var(crate::KTSTR_LOCK_DIR_ENV) {
         Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => PathBuf::from("/tmp"),
     }
@@ -270,7 +270,7 @@ mod tests {
         let _lock = lock_env();
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("custom-cache");
-        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", &dir);
+        let _guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, &dir);
         let root = resolve_cache_root().unwrap();
         assert_eq!(root, dir);
     }
@@ -279,7 +279,7 @@ mod tests {
     fn cache_resolve_root_xdg_cache_home() {
         let _lock = lock_env();
         let tmp = TempDir::new().unwrap();
-        let _guard1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _guard1 = EnvVarGuard::remove(crate::KTSTR_CACHE_DIR_ENV);
         let _guard2 = EnvVarGuard::set("XDG_CACHE_HOME", tmp.path());
         let root = resolve_cache_root().unwrap();
         assert_eq!(root, tmp.path().join("ktstr").join("kernels"));
@@ -289,7 +289,7 @@ mod tests {
     fn cache_resolve_root_empty_ktstr_cache_dir_falls_through() {
         let _lock = lock_env();
         let tmp = TempDir::new().unwrap();
-        let _guard1 = EnvVarGuard::set("KTSTR_CACHE_DIR", "");
+        let _guard1 = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, "");
         let _guard2 = EnvVarGuard::set("XDG_CACHE_HOME", tmp.path());
         let root = resolve_cache_root().unwrap();
         assert_eq!(root, tmp.path().join("ktstr").join("kernels"));
@@ -299,7 +299,7 @@ mod tests {
     fn cache_resolve_root_empty_xdg_falls_to_home() {
         let _lock = lock_env();
         let tmp = TempDir::new().unwrap();
-        let _guard1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _guard1 = EnvVarGuard::remove(crate::KTSTR_CACHE_DIR_ENV);
         let _guard2 = EnvVarGuard::set("XDG_CACHE_HOME", "");
         let _guard3 = EnvVarGuard::set("HOME", tmp.path());
         let root = resolve_cache_root().unwrap();
@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn cache_resolve_root_home_unset_error() {
         let _lock = lock_env();
-        let _guard1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _guard1 = EnvVarGuard::remove(crate::KTSTR_CACHE_DIR_ENV);
         let _guard2 = EnvVarGuard::remove("XDG_CACHE_HOME");
         let _guard3 = EnvVarGuard::remove("HOME");
         let err = resolve_cache_root().unwrap_err();
@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn cache_resolve_root_home_root_slash_error() {
         let _lock = lock_env();
-        let _guard1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _guard1 = EnvVarGuard::remove(crate::KTSTR_CACHE_DIR_ENV);
         let _guard2 = EnvVarGuard::remove("XDG_CACHE_HOME");
         let _guard3 = EnvVarGuard::set("HOME", "/");
         let err = resolve_cache_root().unwrap_err();
@@ -359,7 +359,7 @@ mod tests {
     #[test]
     fn cache_resolve_root_home_empty_error() {
         let _lock = lock_env();
-        let _guard1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _guard1 = EnvVarGuard::remove(crate::KTSTR_CACHE_DIR_ENV);
         let _guard2 = EnvVarGuard::remove("XDG_CACHE_HOME");
         let _guard3 = EnvVarGuard::set("HOME", "");
         let err = resolve_cache_root().unwrap_err();
@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn cache_resolve_root_home_relative_path_error() {
         let _lock = lock_env();
-        let _guard1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _guard1 = EnvVarGuard::remove(crate::KTSTR_CACHE_DIR_ENV);
         let _guard2 = EnvVarGuard::remove("XDG_CACHE_HOME");
         let _guard3 = EnvVarGuard::set("HOME", "relative/dir");
         let err = resolve_cache_root().unwrap_err();
@@ -400,7 +400,7 @@ mod tests {
     #[test]
     fn cache_resolve_root_home_bare_name_relative_error() {
         let _lock = lock_env();
-        let _guard1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _guard1 = EnvVarGuard::remove(crate::KTSTR_CACHE_DIR_ENV);
         let _guard2 = EnvVarGuard::remove("XDG_CACHE_HOME");
         let _guard3 = EnvVarGuard::set("HOME", "tmp");
         let err = resolve_cache_root().unwrap_err();
@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn cache_resolve_root_home_absolute_passes() {
         let _lock = lock_env();
-        let _guard1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _guard1 = EnvVarGuard::remove(crate::KTSTR_CACHE_DIR_ENV);
         let _guard2 = EnvVarGuard::remove("XDG_CACHE_HOME");
         let tmp = TempDir::new().expect("tempdir");
         let _guard3 = EnvVarGuard::set("HOME", tmp.path());
@@ -439,7 +439,7 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         let bytes: &[u8] = b"/tmp/ktstr-\xFFcache";
         let value = OsStr::from_bytes(bytes);
-        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", value);
+        let _guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, value);
         let err = resolve_cache_root()
             .expect_err("non-UTF-8 KTSTR_CACHE_DIR must bail, not silently fall through");
         let msg = err.to_string();
@@ -465,7 +465,7 @@ mod tests {
     fn path_inside_cache_root_accepts_path_inside() {
         let _lock = lock_env();
         let tmp = TempDir::new().unwrap();
-        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
+        let _guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
         let entry = tmp.path().join("kentry");
         std::fs::create_dir_all(&entry).unwrap();
         let vmlinux = entry.join("vmlinux");
@@ -480,7 +480,7 @@ mod tests {
     fn path_inside_cache_root_rejects_path_outside() {
         let _lock = lock_env();
         let cache_root = TempDir::new().unwrap();
-        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", cache_root.path());
+        let _guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, cache_root.path());
         let source_tree = TempDir::new().unwrap();
         let vmlinux = source_tree.path().join("vmlinux");
         std::fs::write(&vmlinux, b"placeholder").unwrap();
@@ -494,7 +494,7 @@ mod tests {
     fn path_inside_cache_root_rejects_bare_filename() {
         let _lock = lock_env();
         let tmp = TempDir::new().unwrap();
-        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
+        let _guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
         let bare = std::path::Path::new("vmlinux");
         assert!(
             !path_inside_cache_root(bare),
@@ -505,7 +505,7 @@ mod tests {
     #[test]
     fn path_inside_cache_root_false_when_unresolvable() {
         let _lock = lock_env();
-        let _g1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _g1 = EnvVarGuard::remove(crate::KTSTR_CACHE_DIR_ENV);
         let _g2 = EnvVarGuard::remove("XDG_CACHE_HOME");
         let _g3 = EnvVarGuard::remove("HOME");
         let dir = TempDir::new().unwrap();
@@ -521,7 +521,7 @@ mod tests {
     fn path_inside_cache_root_false_when_parent_canonicalize_fails() {
         let _lock = lock_env();
         let tmp = TempDir::new().unwrap();
-        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
+        let _guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
         let nonexistent = std::path::Path::new("/this/parent/should/not/exist/vmlinux");
         assert!(
             !nonexistent.parent().unwrap().exists(),
@@ -539,7 +539,7 @@ mod tests {
     fn path_inside_cache_root_follows_symlink_into_cache() {
         let _lock = lock_env();
         let cache_root = TempDir::new().unwrap();
-        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", cache_root.path());
+        let _guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, cache_root.path());
         let entry = cache_root.path().join("kentry");
         std::fs::create_dir_all(&entry).unwrap();
         let real = entry.join("vmlinux");
@@ -563,7 +563,7 @@ mod tests {
     fn path_inside_cache_root_follows_symlink_out_of_cache() {
         let _lock = lock_env();
         let cache_root = TempDir::new().unwrap();
-        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", cache_root.path());
+        let _guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, cache_root.path());
         let outside = TempDir::new().unwrap();
         let real = outside.path().join("vmlinux");
         std::fs::write(&real, b"placeholder").unwrap();
@@ -584,7 +584,7 @@ mod tests {
     fn path_inside_cache_root_empty_ktstr_cache_dir_falls_through() {
         let _lock = lock_env();
         let tmp = TempDir::new().unwrap();
-        let _g1 = EnvVarGuard::set("KTSTR_CACHE_DIR", "");
+        let _g1 = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, "");
         let _g2 = EnvVarGuard::set("XDG_CACHE_HOME", tmp.path());
         let resolved = tmp.path().join("ktstr").join("kernels");
         let entry = resolved.join("kentry");
@@ -608,14 +608,14 @@ mod tests {
         let vmlinux_a = entry_a.join("vmlinux");
         std::fs::write(&vmlinux_a, b"placeholder").unwrap();
         {
-            let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", cache_a.path());
+            let _guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, cache_a.path());
             assert!(
                 path_inside_cache_root(&vmlinux_a),
                 "first call: vmlinux is inside cache_a (the active root)",
             );
         }
         {
-            let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", cache_b.path());
+            let _guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, cache_b.path());
             assert!(
                 !path_inside_cache_root(&vmlinux_a),
                 "second call: KTSTR_CACHE_DIR has moved to cache_b, so the \
@@ -1173,21 +1173,21 @@ mod tests {
     #[test]
     fn lock_dir_uses_ktstr_lock_dir_when_set() {
         let _lock = lock_env();
-        let _guard = EnvVarGuard::set("KTSTR_LOCK_DIR", "/var/run/ktstr");
+        let _guard = EnvVarGuard::set(crate::KTSTR_LOCK_DIR_ENV, "/var/run/ktstr");
         assert_eq!(resolve_lock_dir(), PathBuf::from("/var/run/ktstr"));
     }
 
     #[test]
     fn lock_dir_falls_back_to_tmp_when_unset() {
         let _lock = lock_env();
-        let _guard = EnvVarGuard::remove("KTSTR_LOCK_DIR");
+        let _guard = EnvVarGuard::remove(crate::KTSTR_LOCK_DIR_ENV);
         assert_eq!(resolve_lock_dir(), PathBuf::from("/tmp"));
     }
 
     #[test]
     fn lock_dir_falls_back_to_tmp_when_empty() {
         let _lock = lock_env();
-        let _guard = EnvVarGuard::set("KTSTR_LOCK_DIR", "");
+        let _guard = EnvVarGuard::set(crate::KTSTR_LOCK_DIR_ENV, "");
         assert_eq!(resolve_lock_dir(), PathBuf::from("/tmp"));
     }
 }

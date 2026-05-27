@@ -15,7 +15,7 @@ fn resolve_cache_root_honors_ktstr_cache_dir() {
     // inside `lock_env()` itself, so a panic inside the
     // critical section is safe to recover through.
     let _lock = lock_env();
-    let _env = EnvVarGuard::set("KTSTR_CACHE_DIR", "/explicit/override");
+    let _env = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, "/explicit/override");
     let root = resolve_cache_root().unwrap();
     assert_eq!(root, PathBuf::from("/explicit/override"));
 }
@@ -665,7 +665,7 @@ fn status_surfaces_length_fail_pin_error_for_cached_file() {
 #[test]
 fn resolve_cache_root_honors_xdg_cache_home() {
     let _lock = lock_env();
-    let _env_ktstr = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+    let _env_ktstr = EnvVarGuard::remove(crate::KTSTR_CACHE_DIR_ENV);
     let _env_xdg = EnvVarGuard::set("XDG_CACHE_HOME", "/xdg/caches");
     let root = resolve_cache_root().unwrap();
     assert_eq!(
@@ -681,7 +681,7 @@ fn resolve_cache_root_honors_xdg_cache_home() {
 #[test]
 fn resolve_cache_root_falls_back_to_home_cache() {
     let _lock = lock_env();
-    let _env_ktstr = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+    let _env_ktstr = EnvVarGuard::remove(crate::KTSTR_CACHE_DIR_ENV);
     let _env_xdg = EnvVarGuard::remove("XDG_CACHE_HOME");
     let _env_home = EnvVarGuard::set("HOME", "/home/fake");
     let root = resolve_cache_root().unwrap();
@@ -702,7 +702,7 @@ fn resolve_cache_root_falls_back_to_home_cache() {
 #[test]
 fn resolve_cache_root_treats_empty_ktstr_cache_dir_as_unset() {
     let _lock = lock_env();
-    let _env_ktstr = EnvVarGuard::set("KTSTR_CACHE_DIR", "");
+    let _env_ktstr = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, "");
     let _env_xdg = EnvVarGuard::set("XDG_CACHE_HOME", "/xdg/caches");
     let root = resolve_cache_root().unwrap();
     assert_eq!(
@@ -725,7 +725,7 @@ fn resolve_cache_root_treats_empty_ktstr_cache_dir_as_unset() {
 #[test]
 fn resolve_cache_root_rejects_root_slash_home() {
     let _lock = lock_env();
-    let _env_ktstr = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+    let _env_ktstr = EnvVarGuard::remove(crate::KTSTR_CACHE_DIR_ENV);
     let _env_xdg = EnvVarGuard::remove("XDG_CACHE_HOME");
     let _env_home = EnvVarGuard::set("HOME", "/");
     let err = resolve_cache_root().unwrap_err();
@@ -756,7 +756,7 @@ fn resolve_cache_root_rejects_root_slash_home() {
 #[test]
 fn resolve_cache_root_rejects_empty_home() {
     let _lock = lock_env();
-    let _env_ktstr = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+    let _env_ktstr = EnvVarGuard::remove(crate::KTSTR_CACHE_DIR_ENV);
     let _env_xdg = EnvVarGuard::remove("XDG_CACHE_HOME");
     let _env_home = EnvVarGuard::set("HOME", "");
     let err = resolve_cache_root().unwrap_err();
@@ -776,7 +776,7 @@ fn resolve_cache_root_rejects_empty_home() {
 #[test]
 fn resolve_cache_root_rejects_unset_home() {
     let _lock = lock_env();
-    let _env_ktstr = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+    let _env_ktstr = EnvVarGuard::remove(crate::KTSTR_CACHE_DIR_ENV);
     let _env_xdg = EnvVarGuard::remove("XDG_CACHE_HOME");
     let _env_home = EnvVarGuard::remove("HOME");
     let err = resolve_cache_root().unwrap_err();
@@ -800,7 +800,7 @@ fn resolve_cache_root_rejects_unset_home() {
 #[test]
 fn resolve_cache_root_rejects_relative_home() {
     let _lock = lock_env();
-    let _env_ktstr = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+    let _env_ktstr = EnvVarGuard::remove(crate::KTSTR_CACHE_DIR_ENV);
     let _env_xdg = EnvVarGuard::remove("XDG_CACHE_HOME");
     let _env_home = EnvVarGuard::set("HOME", "relative/dir");
     let err = resolve_cache_root().unwrap_err();
@@ -829,7 +829,7 @@ fn resolve_cache_root_rejects_non_utf8_ktstr_cache_dir() {
     use std::os::unix::ffi::OsStrExt;
     let bytes: &[u8] = b"/tmp/ktstr-\xFFmodels";
     let value = OsStr::from_bytes(bytes);
-    let _env_ktstr = EnvVarGuard::set("KTSTR_CACHE_DIR", value);
+    let _env_ktstr = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, value);
     let err = resolve_cache_root()
         .expect_err("non-UTF-8 KTSTR_CACHE_DIR must bail through the shared helper");
     let msg = err.to_string();

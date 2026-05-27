@@ -1283,6 +1283,8 @@ fn build_template_via_vm(
     // the caller unlinks the staging image, and `ensure_template`
     // propagates the failure up — no peer holds the per-key flock
     // past this point.
+    let busybox_bytes = crate::vmm::blobs::load_busybox_bytes()
+        .context("load busybox blob for disk-template build VM")?;
     let build_result = crate::vmm::KtstrVm::builder()
         .kernel(kernel)
         .topology(crate::vmm::Topology::new(1, 1, 1, 1))
@@ -1292,7 +1294,7 @@ fn build_template_via_vm(
         .disk(disk)
         .template_staging_image(staging_path.clone())
         .include_files(vec![(mkfs_archive_path, mkfs)])
-        .busybox(true)
+        .busybox(Some(busybox_bytes))
         .build();
     // .build() can fail for host-resource reasons (KVM ioctl
     // ENOMEM, sysfs unreadable, hugepage planning) AFTER the

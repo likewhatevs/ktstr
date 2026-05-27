@@ -86,6 +86,30 @@ pub(crate) fn extract_export_test_arg(args: &[String]) -> Option<&str> {
     None
 }
 
+/// Extract `--ktstr-shell-test=NAME` from the argument list. Used by
+/// [`crate::test_support::dispatch::maybe_dispatch_shell_test`] (the
+/// test binary's main-path dispatch) to detect a `cargo ktstr shell
+/// --test <NAME>` descriptor probe — the test binary itself owns
+/// the `KTSTR_TESTS` distributed_slice, so cargo-ktstr probes each
+/// test binary in the workspace to find the registered entry and
+/// serialize its shell-relevant fields (topology, memory_mib,
+/// extra_include_files, scheduler name + kind) back to stdout as
+/// JSON.
+///
+/// Empty values intentionally return `Some("")`; the consumer at
+/// `maybe_dispatch_shell_test` rejects empty names with an
+/// actionable error and exit 1 so the router moves on to the next
+/// candidate. (`extract_export_test_arg` uses the same shape;
+/// the empty-handling lives at the consumer, not the extractor.)
+pub(crate) fn extract_shell_test_arg(args: &[String]) -> Option<&str> {
+    for a in args {
+        if let Some(val) = a.strip_prefix("--ktstr-shell-test=") {
+            return Some(val);
+        }
+    }
+    None
+}
+
 /// Extract `--ktstr-export-output=PATH` from the argument list. Pairs
 /// with [`extract_export_test_arg`] to direct the generated `.run`
 /// file at a specific path; absent means "default to `<test>.run` in

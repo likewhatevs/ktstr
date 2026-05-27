@@ -751,3 +751,95 @@ fn work_type_validation_error_hash_consistent_with_eq() {
     set.insert(e1);
     assert!(set.contains(&e2));
 }
+
+// PartialEq derive sanity tests pinning the typed `assert_eq!`
+// ergonomics. Regression diff-surface for the manual
+// CustomFn::PartialEq impl + the WorkType/WorkPhase/
+// AffinityIntent derives.
+
+mod partial_eq {
+    use super::*;
+    use crate::workload::CustomFn;
+
+    #[test]
+    fn custom_fn_eq_same_fn_pointer() {
+        fn f(_: &AtomicBool) -> WorkerReport {
+            WorkerReport::default()
+        }
+        assert_eq!(
+            CustomFn(f),
+            CustomFn(f),
+            "same fn ptr must be equal — pins fn_addr_eq reflexivity \
+             for fn items obtained from the same source declaration",
+        );
+    }
+
+    #[test]
+    fn custom_fn_neq_different_fn_pointers() {
+        fn f(_: &AtomicBool) -> WorkerReport {
+            WorkerReport::default()
+        }
+        fn g(_: &AtomicBool) -> WorkerReport {
+            WorkerReport::default()
+        }
+        assert_ne!(
+            CustomFn(f),
+            CustomFn(g),
+            "distinct fn ptrs must be unequal — a regression to a \
+             default-always-equal PartialEq would silently break the \
+             diff-surface protection for the Custom variant",
+        );
+    }
+
+    #[test]
+    fn custom_fn_call_delegates_to_inner_fn() {
+        fn marker(_: &AtomicBool) -> WorkerReport {
+            WorkerReport {
+                work_units: 0xdeadbeef,
+                ..Default::default()
+            }
+        }
+        let cf = CustomFn(marker);
+        let stop = AtomicBool::new(false);
+        let via_call = cf.call(&stop);
+        assert_eq!(
+            via_call.work_units, 0xdeadbeef,
+            ".call() must invoke the wrapped fn and propagate its \
+             return value verbatim",
+        );
+    }
+
+    #[test]
+    fn work_type_eq_unit_variants() {
+        assert_eq!(WorkType::SpinWait, WorkType::SpinWait);
+        assert_eq!(WorkType::YieldHeavy, WorkType::YieldHeavy);
+        assert_ne!(WorkType::SpinWait, WorkType::YieldHeavy);
+    }
+
+    #[test]
+    fn work_type_custom_uses_custom_fn_eq() {
+        fn f(_: &AtomicBool) -> WorkerReport {
+            WorkerReport::default()
+        }
+        fn g(_: &AtomicBool) -> WorkerReport {
+            WorkerReport::default()
+        }
+        let a = WorkType::custom("x", f);
+        let a2 = WorkType::custom("x", f);
+        let b = WorkType::custom("x", g);
+        assert_eq!(a, a2, "same fn ptr + same name → equal");
+        assert_ne!(a, b, "different fn ptr → unequal even with same name");
+    }
+
+    #[test]
+    fn work_phase_eq_sanity() {
+        use std::time::Duration;
+        let spin_1ms = WorkPhase::Spin(Duration::from_millis(1));
+        let spin_1ms_clone = WorkPhase::Spin(Duration::from_millis(1));
+        let spin_2ms = WorkPhase::Spin(Duration::from_millis(2));
+        let sleep_1ms = WorkPhase::Sleep(Duration::from_millis(1));
+        assert_eq!(spin_1ms, spin_1ms_clone);
+        assert_ne!(spin_1ms, spin_2ms, "same variant, different Duration");
+        assert_ne!(spin_1ms, sleep_1ms, "different variant, same Duration");
+    }
+}

@@ -61,7 +61,7 @@ static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 /// set. Returns false silently when either is absent (normal for
 /// local dev).
 pub fn is_enabled() -> bool {
-    std::env::var("KTSTR_GHA_CACHE")
+    std::env::var(crate::KTSTR_GHA_CACHE_ENV)
         .ok()
         .is_some_and(|v| v == "1")
         && std::env::var("ACTIONS_CACHE_URL")
@@ -438,42 +438,42 @@ mod tests {
 
     #[test]
     fn remote_cache_disabled_by_default() {
-        let _g1 = EnvVarGuard::remove("KTSTR_GHA_CACHE");
+        let _g1 = EnvVarGuard::remove(crate::KTSTR_GHA_CACHE_ENV);
         let _g2 = EnvVarGuard::remove("ACTIONS_CACHE_URL");
         assert!(!is_enabled());
     }
 
     #[test]
     fn remote_cache_disabled_without_cache_url() {
-        let _g1 = EnvVarGuard::set("KTSTR_GHA_CACHE", "1");
+        let _g1 = EnvVarGuard::set(crate::KTSTR_GHA_CACHE_ENV, "1");
         let _g2 = EnvVarGuard::remove("ACTIONS_CACHE_URL");
         assert!(!is_enabled());
     }
 
     #[test]
     fn remote_cache_disabled_without_gha_flag() {
-        let _g1 = EnvVarGuard::remove("KTSTR_GHA_CACHE");
+        let _g1 = EnvVarGuard::remove(crate::KTSTR_GHA_CACHE_ENV);
         let _g2 = EnvVarGuard::set("ACTIONS_CACHE_URL", "https://example.com");
         assert!(!is_enabled());
     }
 
     #[test]
     fn remote_cache_disabled_with_empty_url() {
-        let _g1 = EnvVarGuard::set("KTSTR_GHA_CACHE", "1");
+        let _g1 = EnvVarGuard::set(crate::KTSTR_GHA_CACHE_ENV, "1");
         let _g2 = EnvVarGuard::set("ACTIONS_CACHE_URL", "");
         assert!(!is_enabled());
     }
 
     #[test]
     fn remote_cache_disabled_with_wrong_flag() {
-        let _g1 = EnvVarGuard::set("KTSTR_GHA_CACHE", "0");
+        let _g1 = EnvVarGuard::set(crate::KTSTR_GHA_CACHE_ENV, "0");
         let _g2 = EnvVarGuard::set("ACTIONS_CACHE_URL", "https://example.com");
         assert!(!is_enabled());
     }
 
     #[test]
     fn remote_cache_enabled_when_both_set() {
-        let _g1 = EnvVarGuard::set("KTSTR_GHA_CACHE", "1");
+        let _g1 = EnvVarGuard::set(crate::KTSTR_GHA_CACHE_ENV, "1");
         let _g2 = EnvVarGuard::set("ACTIONS_CACHE_URL", "https://example.com");
         assert!(is_enabled());
     }
@@ -702,7 +702,7 @@ mod tests {
 
     #[test]
     fn remote_cache_remote_lookup_returns_none_when_disabled() {
-        let _g1 = EnvVarGuard::remove("KTSTR_GHA_CACHE");
+        let _g1 = EnvVarGuard::remove(crate::KTSTR_GHA_CACHE_ENV);
         let _g2 = EnvVarGuard::remove("ACTIONS_CACHE_URL");
         assert!(!is_enabled());
     }
@@ -711,7 +711,7 @@ mod tests {
 
     #[test]
     fn remote_cache_remote_store_when_disabled() {
-        let _g1 = EnvVarGuard::remove("KTSTR_GHA_CACHE");
+        let _g1 = EnvVarGuard::remove(crate::KTSTR_GHA_CACHE_ENV);
         let _g2 = EnvVarGuard::remove("ACTIONS_CACHE_URL");
 
         let tmp = tempfile::TempDir::new().unwrap();

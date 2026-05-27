@@ -25,7 +25,7 @@ fn write_skip_sidecar_records_skip_mutex() {
         .prefix("ktstr-sidecar-skip-writes-test-")
         .tempdir()
         .expect("create tempdir");
-    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp.path());
+    let _env_sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, tmp.path());
 
     fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
         Ok(AssertResult::pass())
@@ -111,7 +111,7 @@ fn write_skip_sidecar_returns_err_when_dir_cannot_be_created() {
         .prefix("ktstr-sidecar-skip-blocker-")
         .tempfile()
         .expect("create blocker tempfile");
-    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", blocker.path());
+    let _env_sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, blocker.path());
 
     fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
         Ok(AssertResult::pass())
@@ -284,7 +284,7 @@ fn write_sidecar_records_entry_payload_name() {
         .prefix("ktstr-sidecar-payload-name-test-")
         .tempdir()
         .expect("create tempdir");
-    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp.path());
+    let _env_sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, tmp.path());
 
     static FIO: Payload = Payload {
         name: "fio",
@@ -336,7 +336,7 @@ fn write_sidecar_forwards_payload_metrics_slice() {
         .prefix("ktstr-sidecar-metrics-slice-test-")
         .tempdir()
         .expect("create tempdir");
-    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp.path());
+    let _env_sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, tmp.path());
 
     fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
         Ok(AssertResult::pass())
@@ -394,7 +394,7 @@ fn write_skip_sidecar_records_entry_payload_name() {
         .prefix("ktstr-sidecar-skip-payload-test-")
         .tempdir()
         .expect("create tempdir");
-    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp.path());
+    let _env_sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, tmp.path());
 
     static STRESS: Payload = Payload {
         name: "stress-ng",
@@ -2093,7 +2093,7 @@ fn resolve_kernel_source_dir_path_metadata_local_returns_source_tree() {
     )
     .expect("write metadata.json");
 
-    let _guard = EnvVarGuard::set("KTSTR_KERNEL", cache_entry.path());
+    let _guard = EnvVarGuard::set(crate::KTSTR_KERNEL_ENV, cache_entry.path());
     assert_eq!(
         super::super::resolve_kernel_source_dir().as_deref(),
         Some(src_tree.path()),
@@ -2115,7 +2115,7 @@ fn resolve_kernel_source_dir_path_no_metadata_returns_env_value() {
     // Deliberately no metadata.json — `recover_local_source_tree`
     // returns None and the Path arm's fallback kicks in.
 
-    let _guard = EnvVarGuard::set("KTSTR_KERNEL", dir.path());
+    let _guard = EnvVarGuard::set(crate::KTSTR_KERNEL_ENV, dir.path());
     assert_eq!(
         super::super::resolve_kernel_source_dir().as_deref(),
         Some(dir.path()),
@@ -2148,7 +2148,7 @@ fn resolve_kernel_source_dir_path_metadata_non_local_falls_through() {
     )
     .expect("write metadata.json");
 
-    let _guard = EnvVarGuard::set("KTSTR_KERNEL", cache_entry.path());
+    let _guard = EnvVarGuard::set(crate::KTSTR_KERNEL_ENV, cache_entry.path());
     assert_eq!(
         super::super::resolve_kernel_source_dir().as_deref(),
         Some(cache_entry.path()),

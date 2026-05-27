@@ -2074,7 +2074,7 @@ fn cpu_cap_effective_count_at_host_boundary() {
 #[test]
 fn cpu_cap_resolve_cli_wins_over_env() {
     let _lock = env_lock();
-    let _env = EnvGuard::set("KTSTR_CPU_CAP", "99");
+    let _env = EnvGuard::set(crate::KTSTR_CPU_CAP_ENV, "99");
     let cap = CpuCap::resolve(Some(3)).unwrap().expect("CLI flag set");
     assert_eq!(cap.effective_count(4).unwrap(), 3, "CLI wins");
 }
@@ -2085,7 +2085,7 @@ fn cpu_cap_resolve_cli_wins_over_env() {
 #[test]
 fn cpu_cap_resolve_no_cli_no_env_returns_none() {
     let _lock = env_lock();
-    let _env = EnvGuard::remove("KTSTR_CPU_CAP");
+    let _env = EnvGuard::remove(crate::KTSTR_CPU_CAP_ENV);
     assert!(CpuCap::resolve(None).unwrap().is_none());
 }
 
@@ -2094,7 +2094,7 @@ fn cpu_cap_resolve_no_cli_no_env_returns_none() {
 #[test]
 fn cpu_cap_resolve_env_set() {
     let _lock = env_lock();
-    let _env = EnvGuard::set("KTSTR_CPU_CAP", "2");
+    let _env = EnvGuard::set(crate::KTSTR_CPU_CAP_ENV, "2");
     let cap = CpuCap::resolve(None)
         .expect("resolve must succeed")
         .expect("env-set cap must yield Some");
@@ -2106,7 +2106,7 @@ fn cpu_cap_resolve_env_set() {
 #[test]
 fn cpu_cap_resolve_empty_env_is_absent() {
     let _lock = env_lock();
-    let _env = EnvGuard::set("KTSTR_CPU_CAP", "");
+    let _env = EnvGuard::set(crate::KTSTR_CPU_CAP_ENV, "");
     assert!(CpuCap::resolve(None).unwrap().is_none());
 }
 
@@ -2115,10 +2115,10 @@ fn cpu_cap_resolve_empty_env_is_absent() {
 #[test]
 fn cpu_cap_resolve_non_numeric_env_errors() {
     let _lock = env_lock();
-    let _env = EnvGuard::set("KTSTR_CPU_CAP", "not-a-number");
+    let _env = EnvGuard::set(crate::KTSTR_CPU_CAP_ENV, "not-a-number");
     let err = CpuCap::resolve(None).expect_err("non-numeric must error");
     let msg = format!("{err:#}");
-    assert!(msg.contains("KTSTR_CPU_CAP"), "msg={msg}");
+    assert!(msg.contains(crate::KTSTR_CPU_CAP_ENV), "msg={msg}");
 }
 
 /// Env var set to `"0"` flows through `CpuCap::new(0)` and
@@ -2128,7 +2128,7 @@ fn cpu_cap_resolve_non_numeric_env_errors() {
 #[test]
 fn cpu_cap_resolve_zero_env_rejected() {
     let _lock = env_lock();
-    let _env = EnvGuard::set("KTSTR_CPU_CAP", "0");
+    let _env = EnvGuard::set(crate::KTSTR_CPU_CAP_ENV, "0");
     let err = CpuCap::resolve(None).expect_err("zero must error");
     let msg = format!("{err:#}");
     assert!(msg.contains("≥ 1"), "msg={msg}");
@@ -2141,7 +2141,7 @@ fn cpu_cap_resolve_zero_env_rejected() {
 #[test]
 fn cpu_cap_resolve_zero_cli_rejected_even_with_valid_env() {
     let _lock = env_lock();
-    let _env = EnvGuard::set("KTSTR_CPU_CAP", "2");
+    let _env = EnvGuard::set(crate::KTSTR_CPU_CAP_ENV, "2");
     let err = CpuCap::resolve(Some(0)).expect_err("cli=0 must error");
     let msg = format!("{err:#}");
     assert!(msg.contains("≥ 1"), "msg={msg}");
@@ -3206,7 +3206,7 @@ fn acquire_llc_plan_cross_node_spill_mems_union() {
 fn acquire_resource_locks_cargo_test_mode_bypasses_flock() {
     use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
     let _lock = lock_env();
-    let _env = EnvVarGuard::set("KTSTR_CARGO_TEST_MODE", "1");
+    let _env = EnvVarGuard::set(crate::KTSTR_CARGO_TEST_MODE_ENV, "1");
     let plan = PinningPlan {
         assignments: vec![(0, 95100)],
         service_cpu: None,
@@ -3233,7 +3233,7 @@ fn acquire_resource_locks_cargo_test_mode_bypasses_flock() {
 fn acquire_resource_locks_cargo_test_mode_empty_string_inert() {
     use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
     let _lock = lock_env();
-    let _env = EnvVarGuard::set("KTSTR_CARGO_TEST_MODE", "");
+    let _env = EnvVarGuard::set(crate::KTSTR_CARGO_TEST_MODE_ENV, "");
     let _llc_prefix = LlcLockPrefixGuard::new();
     let plan = PinningPlan {
         assignments: vec![(0, 95200)],

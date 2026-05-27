@@ -981,7 +981,7 @@ impl CpuCap {
         if let Some(n) = cli_flag {
             return Ok(Some(CpuCap::new(n)?));
         }
-        match std::env::var("KTSTR_CPU_CAP") {
+        match std::env::var(crate::KTSTR_CPU_CAP_ENV) {
             Ok(s) if s.is_empty() => Ok(None),
             Ok(s) => {
                 let n: usize = s

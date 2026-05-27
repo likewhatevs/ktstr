@@ -833,11 +833,12 @@ impl Drop for ThreadWorker {
 ///   leader that owns `num_workers` worker threads across one or
 ///   more logical groups. The leader sets its own `comm` to `pcomm`
 ///   via `prctl(PR_SET_NAME)` before spawning the threads, so every
-///   worker thread's `task->group_leader->comm` is `pcomm` (the
-///   kernel truncates to `TASK_COMM_LEN - 1 = 15` bytes inside
-///   `__set_task_comm`). Reports are a single `serde_json`
-///   `Vec<WorkerReport>` (one entry per worker thread; per-thread
-///   `group_idx` lives inside each `WorkerReport`).
+///   worker thread's `task->group_leader->comm` is `pcomm` exactly
+///   (the [`WorkSpec::pcomm`] builder rejects > 15 bytes —
+///   `TASK_COMM_LEN - 1` — so the framework never feeds the kernel
+///   a name `__set_task_comm` would truncate). Reports are a single
+///   `serde_json` `Vec<WorkerReport>` (one entry per worker thread;
+///   per-thread `group_idx` lives inside each `WorkerReport`).
 ///
 /// Note the per-variant wire-format split: `Worker` uses postcard and
 /// `PcommContainer` uses serde_json. The encodings are dispatched by
@@ -1886,11 +1887,12 @@ pub(super) struct PcommGroupResources {
 
 /// Fork one thread-group leader hosting every worker thread for the
 /// supplied groups: fork the leader, set its `comm` to `pcomm` via
-/// `prctl(PR_SET_NAME)` (the kernel truncates to `TASK_COMM_LEN - 1
-/// = 15` bytes inside `__set_task_comm`), then spawn
-/// `groups[k].num_workers` worker threads per group inside it. Every
+/// `prctl(PR_SET_NAME)`, then spawn `groups[k].num_workers` worker
+/// threads per group inside it. The [`WorkSpec::pcomm`] builder
+/// rejects > 15 bytes (TASK_COMM_LEN-1), so the framework never
+/// feeds the kernel a name `__set_task_comm` would truncate. Every
 /// worker thread shares the leader's tgid, so
-/// `task->group_leader->comm == pcomm` for every worker. Models real
+/// `task->group_leader->comm == pcomm` byte-for-byte. Models real
 /// workloads like `chrome` (pcomm) hosting `ThreadPoolForeg` and
 /// `GPU Process` (per-thread comm via [`WorkSpec::comm`]) or `java`
 /// (pcomm) hosting `GC Thread` and `C2 CompilerThre`.
@@ -1955,7 +1957,10 @@ pub(super) struct PcommGroupResources {
 ///   `stop_requested(&STOP)` on its next loop check.
 /// - `prctl(PR_SET_NAME, pcomm)`: sets the leader's `task->comm`,
 ///   which becomes `task->group_leader->comm` for every spawned
-///   thread (kernel truncates to 15 bytes).
+///   thread byte-for-byte (the [`WorkSpec::pcomm`] builder rejects
+///   names longer than 15 bytes — `TASK_COMM_LEN - 1` — so the
+///   framework never feeds the kernel a name `__set_task_comm`
+///   would truncate).
 /// - `setresuid(container_uid, ...)` / `setresgid(container_gid,
 ///   ...)` (if specified) apply once before the start-byte poll.
 /// - Threads spawn AFTER the start byte arrives, so `start()`'s
@@ -2081,7 +2086,9 @@ pub(super) fn spawn_pcomm_container(
             unsafe {
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
             }
-            if std::env::var_os("KTSTR_GUEST_INIT").is_none() && unsafe { libc::getppid() } == 1 {
+            if std::env::var_os(crate::KTSTR_GUEST_INIT_ENV).is_none()
+                && unsafe { libc::getppid() } == 1
+            {
                 exit_child_success();
             }
             unsafe {
@@ -2137,9 +2144,9 @@ pub(super) fn spawn_pcomm_container(
             // `/proc/self/fd` once and uses raw `libc::close` on
             // each non-kept fd; failure to close (EBADF) is benign
             // — the entry is gone by the time we get to it. Heap
-            // allocation here is acceptable post-fork (PhD-approved
-            // pattern; the conventional fork worker also heap-
-            // allocates in `worker_main`).
+            // allocation here is acceptable post-fork (the
+            // conventional fork worker also heap-allocates in
+            // `worker_main`).
             let mut keep_fds: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
             keep_fds.insert(0);
             keep_fds.insert(1);
@@ -2180,20 +2187,18 @@ pub(super) fn spawn_pcomm_container(
                 );
             }
 
-            // prctl(PR_SET_NAME, pcomm). The kernel truncates to 15
-            // bytes (TASK_COMM_LEN - 1) inside `__set_task_comm`
-            // and accepts any byte string up to that limit including
-            // the empty string. Setting it on the container's tgid
-            // leader makes `task->group_leader->comm == pcomm` for
-            // every spawned thread (kernel/sys.c::prctl_set_name).
-            // CString construction can only fail on an interior
-            // NUL byte; the WorkSpec::pcomm builder rejects those at
-            // declaration time, so the unwrap path is unreachable
-            // for any value that arrives here. `unwrap_or_default`
-            // is a defensive fall-through to an empty CString —
-            // the kernel accepts it; the leader's comm is set to
-            // the empty string and the failure is surfaced to
-            // stderr.
+            // prctl(PR_SET_NAME, pcomm). Setting it on the container's
+            // tgid leader makes `task->group_leader->comm == pcomm`
+            // for every spawned thread (kernel/sys.c::prctl_set_name).
+            // The WorkSpec::pcomm builder rejects empty strings,
+            // interior NULs, and names > 15 bytes (TASK_COMM_LEN - 1)
+            // at declaration time, so neither CString construction
+            // nor `__set_task_comm`'s `min(strlen, TASK_COMM_LEN-1)`
+            // truncation can fire for any value that arrives here.
+            // `unwrap_or_default` is a defensive fall-through to an
+            // empty CString — the kernel accepts it; the leader's
+            // comm is set to the empty string and the failure is
+            // surfaced to stderr.
             let c_pcomm = std::ffi::CString::new(pcomm).unwrap_or_default();
             let prctl_rc = unsafe { libc::prctl(libc::PR_SET_NAME, c_pcomm.as_ptr()) };
             if prctl_rc != 0 {
@@ -2664,9 +2669,9 @@ pub(super) fn spawn_pcomm_container(
 
             // Encode and write the report stream as a single
             // `Vec<WorkerReport>` JSON document via `serde_json`.
-            // serde_json for pcomm Vec<WorkerReport>
-            // design ruling; fork-mode workers use postcard for
-            // single WorkerReport. The pcomm container is a
+            // serde_json for the pcomm `Vec<WorkerReport>`; the
+            // fork-mode workers use postcard for the single
+            // `WorkerReport`. The pcomm container is a
             // fork-mode child and its payload sits on the same
             // per-child pipe used by every other forked worker.
             // The parent decodes via
@@ -2761,11 +2766,12 @@ impl WorkloadHandle {
     /// as worker threads inside a single forked process. Used by
     /// `apply_setup` when a `CgroupDef` declares `pcomm` — every
     /// `WorkSpec` in the same `CgroupDef` is coalesced into one
-    /// thread-group leader whose `task->comm` carries `pcomm` (the
-    /// kernel truncates to `TASK_COMM_LEN - 1 = 15` bytes inside
-    /// `__set_task_comm`). Every spawned thread reads its
-    /// `task->group_leader->comm` as `pcomm` for the leader's
-    /// lifetime.
+    /// thread-group leader whose `task->comm` carries `pcomm`
+    /// exactly (the [`WorkSpec::pcomm`] builder rejects > 15 bytes
+    /// — `TASK_COMM_LEN - 1` — so the framework never feeds the
+    /// kernel a name `__set_task_comm` would truncate). Every
+    /// spawned thread reads its `task->group_leader->comm` as
+    /// `pcomm` for the leader's lifetime.
     ///
     /// `works` must already be fully resolved: each entry's
     /// `num_workers` must be `Some(_)` and `affinity` must be
@@ -3811,7 +3817,7 @@ impl WorkloadHandle {
                     // so its presence is a reliable signal that pid 1 is
                     // the legitimate parent. Host-side workloads leave
                     // the variable unset and retain the orphan detection.
-                    if std::env::var_os("KTSTR_GUEST_INIT").is_none()
+                    if std::env::var_os(crate::KTSTR_GUEST_INIT_ENV).is_none()
                         && unsafe { libc::getppid() } == 1
                     {
                         exit_child_success();
@@ -4895,8 +4901,8 @@ impl WorkloadHandle {
             // Per-kind decoding. `Worker` carries a single postcard
             // `WorkerReport`. `PcommContainer` carries
             // a `serde_json` `Vec<WorkerReport>` — serde_json for
-            // pcomm per task #6 design ruling; fork-mode workers
-            // use postcard for single WorkerReport. Both
+            // the pcomm container; fork-mode workers use postcard
+            // for the single `WorkerReport`. Both
             // payloads ride the EOF-terminated pipe with no length
             // prefix; the parent's `read_to_end` provides framing.
             // On a decode failure, emit one sentinel per expected

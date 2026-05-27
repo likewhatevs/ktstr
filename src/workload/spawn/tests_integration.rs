@@ -523,17 +523,12 @@ fn spawn_pipeio_odd_workers_fails() {
         "expected divisibility error: {msg}"
     );
 }
-#[test]
-fn spawn_zero_workers() {
-    let config = WorkloadConfig {
-        num_workers: 0,
-        ..Default::default()
-    };
-    let h = WorkloadHandle::spawn(&config).unwrap();
-    assert!(h.worker_pids().is_empty());
-    let reports = h.stop_and_collect();
-    assert!(reports.is_empty());
-}
+// `spawn_zero_workers` removed: same root cause as the
+// `snapshot_iterations_empty_handle` deletion below — `WorkloadHandle::
+// spawn(&cfg)` rejects `num_workers = 0` via `WorkloadConfig::validate()`
+// before any handle exists. The validate gate has dedicated coverage at
+// workload.rs:602 + 640.
+
 #[test]
 fn worker_pids_count_matches_num_workers() {
     for n in [1, 3, 5] {
@@ -779,17 +774,13 @@ fn migration_serde_multiple() {
     assert_eq!(m2[2].to_cpu, 0);
 }
 // -- snapshot_iterations tests --
+//
+// `snapshot_iterations_empty_handle` was removed: `WorkloadHandle::
+// spawn(&cfg)` rejects `num_workers = 0` via `WorkloadConfig::
+// validate()` before any handle exists — so the "empty handle"
+// (zero-workers) state is no longer reachable via the public API.
+// The validate gate itself is covered at workload.rs:602 + 640.
 
-#[test]
-fn snapshot_iterations_empty_handle() {
-    let config = WorkloadConfig {
-        num_workers: 0,
-        ..Default::default()
-    };
-    let h = WorkloadHandle::spawn(&config).unwrap();
-    assert!(h.snapshot_iterations().is_empty());
-    drop(h);
-}
 #[test]
 fn snapshot_iterations_running_workers() {
     let config = WorkloadConfig {

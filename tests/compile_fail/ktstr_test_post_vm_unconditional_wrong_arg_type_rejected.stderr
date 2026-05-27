@@ -1,0 +1,24 @@
+error[E0308]: mismatched types
+  --> tests/compile_fail/ktstr_test_post_vm_unconditional_wrong_arg_type_rejected.rs:15:57
+   |
+15 | #[ktstr_test(scheduler = SCHED, post_vm_unconditional = bad_post_vm_unconditional)]
+   | --------------------------------------------------------^^^^^^^^^^^^^^^^^^^^^^^^^--
+   | |                                                       |
+   | |                                                       expected fn pointer, found fn item
+   | arguments to this enum variant are incorrect
+   |
+   = note: expected fn pointer `for<'a> fn(&'a VmResult) -> Result<(), anyhow::Error>`
+                 found fn item `for<'a> fn(&'a str) -> Result<(), anyhow::Error> {bad_post_vm_unconditional}`
+help: the type constructed contains `for<'a> fn(&'a str) -> Result<(), anyhow::Error> {bad_post_vm_unconditional}` due to the type of the argument passed
+  --> tests/compile_fail/ktstr_test_post_vm_unconditional_wrong_arg_type_rejected.rs:15:1
+   |
+15 | #[ktstr_test(scheduler = SCHED, post_vm_unconditional = bad_post_vm_unconditional)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^-------------------------^^
+   |                                                         |
+   |                                                         this argument influences the type of `Some`
+note: tuple variant defined here
+  --> $RUST/core/src/option.rs
+   |
+   |     Some(#[stable(feature = "rust1", since = "1.0.0")] T),
+   |     ^^^^
+   = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -29,7 +29,7 @@ use crate::stats::{ComparisonPolicy, RowFilter};
 /// This is not an error -- regular test runs that skip gauntlet tests
 /// produce no sidecar files.
 pub fn print_stats_report() -> Option<String> {
-    let dir = match std::env::var("KTSTR_SIDECAR_DIR") {
+    let dir = match std::env::var(crate::KTSTR_SIDECAR_DIR_ENV) {
         Ok(d) if !d.is_empty() => Some(std::path::PathBuf::from(d)),
         _ => crate::test_support::newest_run_dir(),
     };

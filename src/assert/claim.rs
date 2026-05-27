@@ -43,7 +43,7 @@ use super::{Assert, AssertDetail, AssertResult, DetailKind, NoteValue, Outcome};
 /// at [`Verdict::new`] time per call; cheap (`getenv` + tiny match)
 /// and respects a mid-process env-var flip without process restart.
 fn log_passes_default() -> bool {
-    match std::env::var("KTSTR_LOG_PASSES") {
+    match std::env::var(crate::KTSTR_LOG_PASSES_ENV) {
         Ok(v) => !(v.is_empty() || v == "0"),
         Err(_) => false,
     }

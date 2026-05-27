@@ -59,6 +59,9 @@ mod verifier;
 #[path = "cargo_ktstr/btf_catalog.rs"]
 mod btf_catalog;
 
+#[path = "cargo_ktstr/blobs.rs"]
+mod blobs;
+
 #[cfg(test)]
 #[path = "cargo_ktstr/parse_tests.rs"]
 mod parse_tests;
@@ -74,6 +77,19 @@ fn main() {
     // for the full rationale; shared across all three ktstr bins so
     // the rationale + SAFETY text lives in one place.
     ktstr::cli::restore_sigpipe_default();
+    // Extract embedded binary blobs to tempfiles and export their
+    // paths via env vars. Done BEFORE tracing subscriber init or
+    // anything else that might spawn a thread — `std::env::set_var`
+    // requires no concurrent reader (see `blobs::install_env` safety
+    // doc). Child processes spawned later (e.g. nextest fanning out
+    // to test bins) inherit these env vars; the `ktstr` library's
+    // blob-loading helpers read from them on demand. A failure here
+    // aborts before any side-effects so the operator gets a clean
+    // error.
+    if let Err(e) = blobs::install_env() {
+        eprintln!("error: extract embedded blobs: {e}");
+        std::process::exit(1);
+    }
     // Mirror `ktstr`'s tracing init (src/bin/ktstr.rs main()) so
     // `tracing::warn!` calls inside `cli::` / `test_support::` surface
     // on stderr instead of being silently dropped. Default to `warn`
@@ -197,6 +213,7 @@ fn main() {
         }
         KtstrCommand::Shell {
             kernel,
+            test,
             topology,
             include_files,
             memory_mib,
@@ -207,6 +224,7 @@ fn main() {
             disk,
         } => misc::run_shell(
             kernel,
+            test,
             topology,
             include_files,
             memory_mib,

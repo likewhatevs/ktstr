@@ -162,7 +162,7 @@ pub(crate) fn assemble_extras_and_key<'a>(
     staged_schedulers: &'a [crate::vmm::builder::StagedScheduler],
     staged_extras_names: &'a [String],
     merged_includes: &'a [(String, PathBuf)],
-    busybox: bool,
+    busybox_bytes: Option<&[u8]>,
     has_jemalloc_extras: bool,
 ) -> Result<(Vec<(&'a str, &'a std::path::Path)>, BaseKey)> {
     debug_assert_eq!(
@@ -189,7 +189,7 @@ pub(crate) fn assemble_extras_and_key<'a>(
     // explicit here so the helper is a closed unit under test
     // without a hidden dependency on the caller's shell_mode
     // computation.
-    let shell_mode = busybox || !merged_includes.is_empty() || has_jemalloc_extras;
+    let shell_mode = busybox_bytes.is_some() || !merged_includes.is_empty() || has_jemalloc_extras;
 
     let staged_for_key: Vec<(&str, &std::path::Path)> = staged_schedulers
         .iter()
@@ -204,7 +204,7 @@ pub(crate) fn assemble_extras_and_key<'a>(
             worker,
             &staged_for_key,
             merged_includes,
-            busybox,
+            busybox_bytes,
         )?
     } else {
         BaseKey::new(payload, scheduler, probe, worker, &staged_for_key)?
@@ -563,7 +563,8 @@ impl KtstrVm {
         let worker = self.jemalloc_alloc_worker_binary.clone();
         let include_files = self.include_files.clone();
         let staged_schedulers = self.staged_schedulers.clone();
-        let busybox = self.busybox;
+        let busybox_bytes = self.busybox_bytes.clone();
+        let wprof_host_path: Option<PathBuf> = self.wprof.as_ref().map(|w| w.host_path.clone());
         std::thread::Builder::new()
             .name("initramfs-resolve".into())
             .spawn(move || -> Result<(BaseRef, BaseKey)> {
@@ -606,13 +607,21 @@ impl KtstrVm {
                 // Merge include_files with worker so both the cache
                 // key and the actual archive build see the same
                 // worker entry; the probe is added to extras inside
-                // `assemble_extras_and_key`.
+                // `assemble_extras_and_key`. wprof (when set) also
+                // rides include_files so DT_NEEDED resolution pulls
+                // its dynamic dependencies (libelf, libz, blazesym
+                // C ABI) into the archive alongside the binary;
+                // without that, wprof fails to load inside the
+                // guest.
                 let mut merged_includes: Vec<(String, PathBuf)> = include_files.clone();
                 if let Some(w) = worker.as_deref() {
                     merged_includes.push((
                         "bin/ktstr-jemalloc-alloc-worker".to_string(),
                         w.to_path_buf(),
                     ));
+                }
+                if let Some(wprof_path) = wprof_host_path.as_deref() {
+                    merged_includes.push(("bin/wprof".to_string(), wprof_path.to_path_buf()));
                 }
 
                 let (extras, key) = assemble_extras_and_key(
@@ -623,7 +632,7 @@ impl KtstrVm {
                     &staged_schedulers,
                     &staged_extras_names,
                     &merged_includes,
-                    busybox,
+                    busybox_bytes.as_deref(),
                     has_jemalloc_extras,
                 )?;
 
@@ -631,7 +640,8 @@ impl KtstrVm {
                     .iter()
                     .map(|(a, p)| (a.as_str(), p.as_path()))
                     .collect();
-                let base = get_or_build_base(&payload, &extras, &include_refs, busybox, &key)?;
+                let base =
+                    get_or_build_base(&payload, &extras, &include_refs, busybox_bytes, &key)?;
                 Ok((base, key))
             })
             .ok()
@@ -1242,7 +1252,7 @@ impl KtstrVm {
             "KTSTR_GUEST=1",
         )
         .to_string();
-        let verbose = std::env::var("KTSTR_VERBOSE")
+        let verbose = std::env::var(crate::KTSTR_VERBOSE_ENV)
             .map(|v| v == "1")
             .unwrap_or(false)
             || std::env::var("RUST_BACKTRACE").is_ok_and(|v| v == "1" || v == "full");
@@ -1327,6 +1337,17 @@ impl KtstrVm {
             cmdline.push_str(" numa_balancing=enable");
         } else {
             cmdline.push_str(" numa_balancing=0");
+        }
+        // wprof handshake — emitted only when the builder attached
+        // a `WprofConfig`. The guest init parses `KTSTR_WPROF_ARGS`
+        // and spawns `/bin/wprof` with the configured args during
+        // auto-repro (`/bin/wprof` is packed by the initramfs
+        // builder when `wprof` is set; see
+        // `vmm::initramfs::build_initramfs_base`'s `wprof_bytes`
+        // arg).
+        if let Some(wprof) = self.wprof.as_ref() {
+            cmdline.push_str(" KTSTR_WPROF_ARGS=");
+            cmdline.push_str(&wprof.args_cmdline());
         }
         if !self.cmdline_extra.is_empty() {
             cmdline.push(' ');
@@ -1648,7 +1669,7 @@ impl KtstrVm {
         // is the only path to early output — and that can fail silently
         // if the FDT node isn't matched by OF_EARLYCON_DECLARE.
         cmdline.push_str(" earlycon=uart,mmio,0x09000000");
-        let verbose = std::env::var("KTSTR_VERBOSE")
+        let verbose = std::env::var(crate::KTSTR_VERBOSE_ENV)
             .map(|v| v == "1")
             .unwrap_or(false)
             || std::env::var("RUST_BACKTRACE").is_ok_and(|v| v == "1" || v == "full");
@@ -1897,7 +1918,7 @@ mod tests {
             .collect()
     }
 
-    /// T-3.1: each staged scheduler must land in `extras` under the
+    /// Each staged scheduler must land in `extras` under the
     /// canonical `staging/schedulers/<name>/scheduler` archive path.
     /// Pins the wire-up against a refactor that synthesizes the
     /// archive path inline without going through
@@ -1915,7 +1936,7 @@ mod tests {
             &staged,
             &names,
             &[],
-            false,
+            None,
             false,
         )
         .unwrap();
@@ -1930,7 +1951,7 @@ mod tests {
         );
     }
 
-    /// T-3.2: staged_schedulers iteration order must align with the
+    /// staged_schedulers iteration order must align with the
     /// extras-push order so `staged_extras_names[idx]` matches
     /// `staged_schedulers[idx].binary`. Misalignment would silently
     /// point name A at binary B's content — disastrous regression
@@ -1948,7 +1969,7 @@ mod tests {
             &staged,
             &names,
             &[],
-            false,
+            None,
             false,
         )
         .unwrap();
@@ -1974,7 +1995,7 @@ mod tests {
         }
     }
 
-    /// T-3.3: staged binaries must contribute to BaseKey in BOTH
+    /// Staged binaries must contribute to BaseKey in BOTH
     /// shell-mode and non-shell-mode dispatch arms. A regression
     /// dropping staged_for_key from one arm would silently un-
     /// invalidate the cache for that mode, contaminating tests
@@ -1988,7 +2009,7 @@ mod tests {
         let empty: Vec<crate::vmm::builder::StagedScheduler> = vec![];
         let empty_names: Vec<String> = vec![];
 
-        // Non-shell-mode arm (busybox=false, no includes, no
+        // Non-shell-mode arm (no busybox, no includes, no
         // jemalloc extras).
         let (_, key_with_staged_nonshell) = assemble_extras_and_key(
             payload.as_path(),
@@ -1998,7 +2019,7 @@ mod tests {
             &staged,
             &names,
             &[],
-            false,
+            None,
             false,
         )
         .unwrap();
@@ -2010,7 +2031,7 @@ mod tests {
             &empty,
             &empty_names,
             &[],
-            false,
+            None,
             false,
         )
         .unwrap();
@@ -2019,8 +2040,9 @@ mod tests {
             "non-shell-mode BaseKey must reflect staged contribution",
         );
 
-        // Shell-mode arm (busybox=true forces shell mode without
+        // Shell-mode arm (Some(bytes) forces shell mode without
         // requiring any include_files / jemalloc extras).
+        let stub_busybox: &[u8] = b"#!/bin/sh\n";
         let (_, key_with_staged_shell) = assemble_extras_and_key(
             payload.as_path(),
             None,
@@ -2029,7 +2051,7 @@ mod tests {
             &staged,
             &names,
             &[],
-            true,
+            Some(stub_busybox),
             false,
         )
         .unwrap();
@@ -2041,7 +2063,7 @@ mod tests {
             &empty,
             &empty_names,
             &[],
-            true,
+            Some(stub_busybox),
             false,
         )
         .unwrap();

@@ -44,7 +44,8 @@ fn template_path_includes_filename_constant() {
     // Isolate from operator state: KTSTR_CACHE_DIR / XDG_CACHE_HOME
     // / $HOME bleed into template_path_for_key via cache_root().
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let _guard = crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
+    let _guard =
+        crate::test_support::test_helpers::EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
     let path = template_path_for_key("btrfs-256m").expect("resolve template path");
     assert!(path.ends_with(format!("btrfs-256m/{TEMPLATE_FILENAME}")));
 }
@@ -56,7 +57,8 @@ fn lookup_missing_returns_none() {
     // KTSTR_CACHE_DIR; setting it for the lifetime of the test
     // via EnvVarGuard isolates per-test state.
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let _guard = crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
+    let _guard =
+        crate::test_support::test_helpers::EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
     let result = lookup("missing-key").expect("lookup must not error on miss");
     assert!(result.is_none());
 }
@@ -64,7 +66,8 @@ fn lookup_missing_returns_none() {
 #[test]
 fn store_atomic_publishes_then_lookup_finds() {
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let _guard = crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
+    let _guard =
+        crate::test_support::test_helpers::EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
     // Stage a fake template under the cache root so the rename
     // is on the same filesystem.
     let cache_root_path = cache_root().unwrap();
@@ -89,7 +92,8 @@ fn store_atomic_idempotent_on_existing_entry() {
     // than raising — by design (both writes produce
     // byte-identical templates for the same key).
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let _guard = crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
+    let _guard =
+        crate::test_support::test_helpers::EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
     let cache_root_path = cache_root().unwrap();
     std::fs::create_dir_all(&cache_root_path).unwrap();
     let staged1 = cache_root_path.join("staged1.img");
@@ -120,7 +124,8 @@ fn store_atomic_idempotent_on_existing_entry() {
 #[test]
 fn store_atomic_unlinks_src_on_idempotent_early_return() {
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let _guard = crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
+    let _guard =
+        crate::test_support::test_helpers::EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
     let cache_root_path = cache_root().unwrap();
     std::fs::create_dir_all(&cache_root_path).unwrap();
     // First publish populates the cache entry.
@@ -296,7 +301,8 @@ fn build_template_via_vm_rejects_raw_filesystem() {
     // bail with a hint at the offending caller rather than as a
     // silent empty template.
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let _guard = crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
+    let _guard =
+        crate::test_support::test_helpers::EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
     let err = build_template_via_vm(Filesystem::Raw, 256 * 1024 * 1024, tmp.path(), "raw-256m")
         .expect_err("Raw must be rejected");
     let msg = err.to_string();
@@ -853,7 +859,8 @@ fn clean_orphaned_tmp_dirs_preserves_lock_subdirectory() {
 #[test]
 fn clean_all_removes_published_entry() {
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let _guard = crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
+    let _guard =
+        crate::test_support::test_helpers::EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
     let cache_root_path = cache_root().unwrap();
     std::fs::create_dir_all(&cache_root_path).unwrap();
     let staged = cache_root_path.join("staged.img");
@@ -884,7 +891,8 @@ fn clean_all_removes_published_entry() {
 #[test]
 fn clean_all_reports_zero_on_empty_cache() {
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let _guard = crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
+    let _guard =
+        crate::test_support::test_helpers::EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
     let count = clean_all().expect("clean_all must succeed on empty");
     assert_eq!(count, 0);
 }
@@ -900,8 +908,10 @@ fn clean_all_handles_missing_cache_root() {
     // (no create_dir_all, no store_atomic call). cache_root()
     // resolves the path string but the directory is absent.
     let nonexistent = tmp.path().join("never-created");
-    let _guard =
-        crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", &nonexistent);
+    let _guard = crate::test_support::test_helpers::EnvVarGuard::set(
+        crate::KTSTR_CACHE_DIR_ENV,
+        &nonexistent,
+    );
     let count = clean_all().expect("missing cache root must not error");
     assert_eq!(count, 0);
 }
@@ -923,7 +933,8 @@ fn clean_all_handles_missing_cache_root() {
 #[test]
 fn clean_all_skips_entry_locked_by_live_peer() {
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let _guard = crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
+    let _guard =
+        crate::test_support::test_helpers::EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
     // Stage a published entry so there's something to skip.
     let cache_root_path = cache_root().unwrap();
     std::fs::create_dir_all(&cache_root_path).unwrap();
@@ -955,7 +966,8 @@ fn clean_all_skips_entry_locked_by_live_peer() {
 #[test]
 fn clean_all_sweeps_debris_alongside_published_entries() {
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let _guard = crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
+    let _guard =
+        crate::test_support::test_helpers::EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
     let cache_root_path = cache_root().unwrap();
     std::fs::create_dir_all(&cache_root_path).unwrap();
     // Published entry.

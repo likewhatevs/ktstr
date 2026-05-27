@@ -130,7 +130,14 @@ fn assert_guest_context(fn_name: &str, msg_type: u32) -> bool {
     true
 }
 
-/// Cached `/dev/vport0p1` writer. Opened lazily on the first
+/// Virtio-console bulk-port device path. Single source of truth for
+/// the guest's bulk-channel filesystem location — referenced by
+/// [`try_open_bulk_port`] (the actual open call) and by
+/// `vmm::rust_init::send_sys_rdy_with_retry` (the existence probe
+/// during boot).
+pub(crate) const BULK_PORT_DEV: &str = "/dev/vport0p1";
+
+/// Cached `BULK_PORT_DEV` writer. Opened lazily on the first
 /// successful `write_to_bulk_port` call after the kernel's
 /// virtio_console driver creates the device node (post multiport
 /// handshake). `OnceLock<Option<...>>` so repeated open failures
@@ -140,11 +147,11 @@ fn assert_guest_context(fn_name: &str, msg_type: u32) -> bool {
 static BULK_PORT_FD: std::sync::OnceLock<std::sync::Mutex<Option<std::fs::File>>> =
     std::sync::OnceLock::new();
 
-/// Try to open `/dev/vport0p1` for writing. Returns None when the
+/// Try to open [`BULK_PORT_DEV`] for writing. Returns None when the
 /// device is not yet present — the kernel virtio_console driver
-/// creates it only after the host emits PORT_OPEN on the c_ivq for
-/// port 1 and the kernel's `find_port_by_id` resolves the
-/// `/sys/class/virtio-ports/vport0p1` entry.
+/// creates it via `device_create` inside `add_port`
+/// (drivers/char/virtio_console.c) only after the host emits
+/// PORT_ADD on the c_ivq for port 1.
 ///
 /// Open mode: read+write, blocking. O_RDWR is required because the
 /// kernel's `port_fops_open` (drivers/char/virtio_console.c) sets
@@ -157,12 +164,12 @@ fn try_open_bulk_port() -> Option<std::fs::File> {
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open("/dev/vport0p1")
+        .open(BULK_PORT_DEV)
         .ok()
 }
 
 /// Write a TLV-framed message to the host through the bulk channel
-/// (virtio-console port 1, `/dev/vport0p1`). The frame format is
+/// (virtio-console port 1, [`BULK_PORT_DEV`]). The frame format is
 /// 16-byte [`ShmMessage`] header + `payload.len()` bytes; the host
 /// parses the same byte stream via [`super::host_comms::parse_tlv_stream`].
 ///
@@ -172,8 +179,8 @@ fn try_open_bulk_port() -> Option<std::fs::File> {
 /// existing fire-and-forget callers (Exit, TestResult, PayloadMetrics,
 /// Profraw, Stimulus, RawPayloadOutput, SchedExit, ScenarioStart,
 /// ScenarioEnd, SnapshotRequest) discard the return at statement
-/// position — only [`send_sys_rdy`]'s retry loop in `ktstr_guest_init`
-/// observes it.
+/// position — only the [`send_sys_rdy`]/[`send_kern_addrs`] retry
+/// loop in `vmm::rust_init::send_sys_rdy_with_retry` observes it.
 ///
 /// Backpressure: the kernel's virtio_console TX path (`hvc_push` /
 /// `port_fops_write`) blocks the writer until the host's
@@ -372,6 +379,19 @@ pub fn send_profraw(buf: &[u8]) {
     write_msg(MsgType::Profraw.wire_value(), buf);
 }
 
+/// Send a wprof Perfetto-format trace blob to the host. Payload:
+/// raw `.pb` bytes produced by `/bin/wprof -T trace.pb` during
+/// auto-repro tracing.
+///
+/// Frames with [`MsgType::WprofTrace`]. The host's freeze
+/// coordinator (`test_support::eval`'s WprofTrace arm) writes the
+/// payload to `<sidecar_dir>/<test_name>.wprof.pb` so the
+/// operator finds it alongside the failure-dump JSON.
+///
+pub fn send_wprof_trace(buf: &[u8]) {
+    write_msg(MsgType::WprofTrace.wire_value(), buf);
+}
+
 /// Send a stimulus event from the guest step executor.
 ///
 /// Payload: byte-serialised [`crate::vmm::wire::StimulusPayload`]
@@ -467,18 +487,18 @@ pub fn send_scenario_resume() {
 /// through the bulk port. The host's freeze coordinator promotes
 /// a CRC-valid SYS_RDY frame into the monitor's boot-complete
 /// eventfd, releasing the monitor's pre-sample epoll wait. Called
-/// from the guest's `ktstr_guest_init` after `mount_filesystems`
-/// completes, so the host's first sample observes a fully-booted
-/// guest with `setup_per_cpu_areas` and KASLR randomization
-/// already done.
+/// from `vmm::rust_init::send_sys_rdy_with_retry` after
+/// `mount_filesystems` completes, so the host's first sample
+/// observes a fully-booted guest with `setup_per_cpu_areas` and
+/// KASLR randomization already done.
 ///
 /// The boolean return lets the caller retry on transient
 /// not-yet-open failures: the multiport handshake completes
 /// independently of `mount_filesystems`'s devtmpfs mount, so a
 /// single call right after the mount can race the handshake. The
-/// retry loop in `ktstr_guest_init` polls until success or budget
-/// exhaustion, ensuring the host eventually observes the signal
-/// rather than silently dropping the boot-complete event.
+/// retry loop in `send_sys_rdy_with_retry` polls until success or
+/// budget exhaustion, ensuring the host eventually observes the
+/// signal rather than silently dropping the boot-complete event.
 pub fn send_sys_rdy() -> bool {
     write_msg(MsgType::SysRdy.wire_value(), &[])
 }
@@ -486,8 +506,8 @@ pub fn send_sys_rdy() -> bool {
 /// Send the typed [`crate::vmm::wire::KernAddrs`] payload to the
 /// host so the monitor can translate kernel virtual addresses
 /// without walking guest page tables. Called from
-/// `ktstr_guest_init` after `mount_filesystems` and before
-/// `send_sys_rdy`.
+/// `vmm::rust_init::send_sys_rdy_with_retry` on the first
+/// port-exists tick, before each [`send_sys_rdy`] attempt.
 ///
 /// The wire layout, the per-field encoding (including the +1
 /// bias on present-bit slots), and the host-side decode contract

@@ -20,20 +20,26 @@
 //!
 //! # Module layout
 //!
-//! Implementation is split across 15 private submodules re-exported
-//! at `test_support::*` for a flat public API: `args` (CLI argument
-//! extraction), `dispatch` (ktstr / cargo-ktstr CLI entry points),
-//! `entry` (scheduler + test-entry types), `eval` (host-side VM
-//! result evaluation), `metrics` (payload stdout → `Metric` list),
-//! `model` (LLM backend + model cache), `output` (guest-output and
-//! console parsing), `payload` (`Payload` / `MetricCheck` / `Metric` /
-//! `Polarity`), `probe` (auto-repro and BPF probe pipeline),
-//! `probe_metrics` (host-side BPF map introspection),
-//! `profraw` (coverage flush), `runtime` (neutral home for
-//! verbose/shm-size/config-file-parts shared by eval and probe so
-//! they don't circularly depend on each other), `sidecar` (per-run
-//! JSON records), `timefmt` (ISO-8601 + run-id helpers), and `topo`
-//! (topology override parsing).
+//! Implementation is split across 17 production submodules
+//! re-exported at `test_support::*` for a flat public API: `args`
+//! (CLI argument extraction), `dispatch` (ktstr / cargo-ktstr CLI
+//! entry points), `entry` (scheduler + test-entry types), `eval`
+//! (host-side VM result evaluation), `metrics` (payload stdout →
+//! `Metric` list), `model` (LLM backend + model cache), `output`
+//! (guest-output and console parsing), `payload` (`Payload` /
+//! `MetricCheck` / `Metric` / `Polarity`), `probe` (auto-repro and
+//! BPF probe pipeline), `probe_metrics` (host-side BPF map
+//! introspection), `profraw` (coverage flush), `runtime` (`pub mod`
+//! — neutral home for verbose/shm-size/config-file-parts shared by
+//! eval and probe so they don't circularly depend on each other),
+//! `shell_descriptor` (wire-format struct shared between the test
+//! binary's `--ktstr-shell-test=<NAME>` producer and cargo-ktstr's
+//! shell-mode consumer), `sidecar` (per-run JSON records), `staged`
+//! (`pub(crate) mod` — staged-payload writer), `timefmt` (ISO-8601
+//! + run-id helpers), and `topo` (topology override parsing).
+//!
+//! A `#[cfg(test)] pub(crate) mod test_helpers` exists for cross-file
+//! test wiring; it is not part of the production surface.
 
 #[cfg(test)]
 use crate::assert::AssertResult;
@@ -54,13 +60,29 @@ mod probe;
 mod probe_metrics;
 mod profraw;
 pub use profraw::current_binary_is_coverage_instrumented;
-mod runtime;
+pub mod runtime;
+mod shell_descriptor;
+pub use shell_descriptor::{SchedulerKind, ShellTestDescriptor};
+pub mod wprof;
+pub use wprof::{PERFETTO_TRACE_PACKETS_TAG, WPROF_PB_MIN_BYTES, assert_wprof_pb_shape};
 mod sidecar;
 pub(crate) mod staged;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 mod timefmt;
 mod topo;
+
+/// Shared callback signature for the
+/// [`KtstrTestEntry::post_vm`](entry::KtstrTestEntry::post_vm) and
+/// [`KtstrTestEntry::post_vm_unconditional`](entry::KtstrTestEntry::post_vm_unconditional)
+/// host-side hooks. Both fields wrap this same shape in `Option<_>`;
+/// the alias collapses the open-coded `fn(&crate::vmm::VmResult)
+/// -> anyhow::Result<()>` repetition at the field declarations and
+/// at the matching `with_post_vm{,_unconditional}` builder
+/// parameters. Future post-VM hooks (e.g. an `expect_auto_repro`
+/// artifact-existence checker) plug into the same shape without
+/// triplicating the signature.
+pub type PostVmCallback = fn(&crate::vmm::VmResult) -> anyhow::Result<()>;
 
 // extract_probe_stack_arg and extract_work_type_arg are reached in
 // production via `super::args::` (probe.rs, eval.rs); the re-export here
@@ -69,8 +91,8 @@ mod topo;
 #[allow(unused_imports)]
 pub(crate) use args::{
     CellParentCgroupArg, cell_parent_path_is_valid, extract_export_output_arg,
-    extract_export_test_arg, extract_probe_stack_arg, extract_test_fn_arg, extract_topo_arg,
-    extract_work_type_arg, parse_cell_parent_cgroup,
+    extract_export_test_arg, extract_probe_stack_arg, extract_shell_test_arg, extract_test_fn_arg,
+    extract_topo_arg, extract_work_type_arg, parse_cell_parent_cgroup,
 };
 pub(crate) use runtime::{append_base_sched_args, content_hash, scratch_dir, sys_rdy_budget_ms};
 #[cfg(test)]
@@ -85,9 +107,9 @@ pub use sidecar::{
 };
 
 pub use dispatch::{
-    EXIT_FAIL, EXIT_INCONCLUSIVE, EXIT_PASS, analyze_sidecars, is_kernel_unavailable,
-    is_resource_contention, ktstr_main, ktstr_test_early_dispatch, run_ktstr_test,
-    sanitize_kernel_label,
+    DEFAULT_HOST_CGROUP_PARENT, EXIT_FAIL, EXIT_INCONCLUSIVE, EXIT_PASS, analyze_sidecars,
+    is_kernel_unavailable, is_resource_contention, ktstr_main, ktstr_test_early_dispatch,
+    resolve_host_cgroup_parent, run_ktstr_test, sanitize_kernel_label,
 };
 pub use entry::{
     BinaryKindJson, BpfMapWrite, CgroupPath, KTSTR_SCHEDULERS, KTSTR_TESTS, KtstrTestEntry,
@@ -167,6 +189,82 @@ pub fn host_capacity() -> (u32, u32, u32) {
 // `skip!("reason: {detail}")` macro (see `src/test_macros.rs`). It
 // emits the canonical `ktstr: SKIP: ...` line and returns from the
 // test.
+
+/// Whether the current test process was launched by a cargo-ktstr
+/// orchestration path (`cargo ktstr test`, `cargo ktstr verifier`)
+/// vs. a raw `cargo nextest run` / `cargo test`.
+///
+/// Reads [`crate::KTSTR_ORCHESTRATED_ENV`]; only checks presence,
+/// not value (cargo-ktstr always sets it to `"1"`, but the marker
+/// semantics are presence-only). Returns `false` when the env var
+/// is unset or unreadable.
+///
+/// Tests that boot real KVM VMs use this to skip when running
+/// under raw nextest, where the 7000+-test concurrency starves
+/// per-VM resource budgets and produces a misleading "kill set by
+/// AP" failure that looks like a real bug. cargo-ktstr's
+/// orchestrator constrains the VM-test concurrency so the budgets
+/// hold; skipping under raw nextest surfaces the operator-error
+/// (wrong runner) without masking real failures during proper
+/// orchestrated runs.
+///
+/// `pub(crate)` — only callers are integration-test helpers under
+/// `src/vmm/mod.rs`'s `#[cfg(test)]` mod. The env-var name itself
+/// is `pub` via [`crate::KTSTR_ORCHESTRATED_ENV`] for
+/// documentation purposes.
+#[cfg(test)]
+#[allow(dead_code)] // called from x86_64-only tests in vmm/mod.rs
+pub(crate) fn cargo_ktstr_orchestrated() -> bool {
+    std::env::var(crate::KTSTR_ORCHESTRATED_ENV).is_ok()
+}
+
+/// Skip-message body for vmm-boot tests that bail when the test
+/// process wasn't launched by cargo-ktstr orchestration. The
+/// canonical extended rationale lives inline at the
+/// `boot_kernel_with_monitor` site; sibling sites reference back
+/// to it via this shared const so a future message tweak lands in
+/// one place instead of four. The 4 sibling sites previously
+/// carried byte-for-byte-identical copies of this string — per
+/// the no-mega-no-dupes policy the 3+-site threshold mandates a
+/// shared const.
+#[cfg(test)]
+#[allow(dead_code)] // referenced from x86_64-only vmm/mod.rs tests
+pub(crate) const SKIP_NOT_ORCHESTRATED_MSG: &str = "raw nextest fan-out starves KVM resource budgets — see \
+     boot_kernel_with_monitor for the shared rationale. Run via \
+     `cargo ktstr test --kernel ../linux`.";
+
+#[cfg(test)]
+mod cargo_ktstr_orchestrated_tests {
+    //! Pin the env-var-presence detection contract. A regression
+    //! that renamed [`crate::KTSTR_ORCHESTRATED_ENV`] silently
+    //! would make every vmm-test skip even under cargo-ktstr
+    //! orchestration (where the env IS set), turning the
+    //! VM-boot test suite into an always-green no-op. Pin the
+    //! two-arm contract (set → true, unset → false) so the rename
+    //! surfaces here.
+    use super::cargo_ktstr_orchestrated;
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+    #[test]
+    fn cargo_ktstr_orchestrated_true_when_env_set() {
+        let _lock = lock_env();
+        let _guard = EnvVarGuard::set(crate::KTSTR_ORCHESTRATED_ENV, "1");
+        assert!(
+            cargo_ktstr_orchestrated(),
+            "KTSTR_ORCHESTRATED set → orchestrated check must return true"
+        );
+    }
+    #[test]
+    fn cargo_ktstr_orchestrated_false_when_env_unset() {
+        let _lock = lock_env();
+        let _guard = EnvVarGuard::remove(crate::KTSTR_ORCHESTRATED_ENV);
+        assert!(
+            !cargo_ktstr_orchestrated(),
+            "KTSTR_ORCHESTRATED absent → orchestrated check must return false \
+             (otherwise raw nextest invocations would run vmm tests and \
+             starve KVM resource budgets)"
+        );
+    }
+}
 
 /// Resolve a kernel image path or panic with an actionable message.
 ///

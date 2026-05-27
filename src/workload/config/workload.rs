@@ -10,8 +10,10 @@
 //!
 //! Validation lives on [`WorkloadConfig::validate`]: it gates
 //! invariants that must hold BEFORE any worker context exists —
-//! currently `mem_policy` empty-nodemask rejection on the primary
-//! group plus every composed entry.
+//! currently `num_workers > 0` (primary + every composed entry;
+//! rejects vacuously-passing zero-worker workloads where every
+//! assertion would trivially pass) and `mem_policy` empty-nodemask
+//! rejection (primary + every composed entry).
 
 use std::borrow::Cow;
 
@@ -19,13 +21,33 @@ use super::super::{AffinityIntent, WorkType};
 use super::{CloneMode, MemPolicy, MpolFlags, SchedPolicy, WorkSpec};
 
 /// Configuration for spawning a group of worker processes.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+//
+// PartialEq (not Eq): the [`Self::composed`] field is
+// `Vec<WorkSpec>`, and `WorkSpec` is `PartialEq`-only because of
+// its `workers_pct: Option<f64>` field — see the derive comment on
+// [`WorkSpec`] for the IEEE-754 NaN rationale. Production
+// WorkSpec values are NaN-free at construction (the
+// `WorkSpec::workers_pct` builder rejects NaN), so the inherited
+// f64 semantics do not surface at typical call sites.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 // See [`WorkType`]'s `#[serde(bound(...))]` comment — embedding
 // `WorkType` propagates the same lifetime-bound issue, so we pass
 // through the same explicit empty bound.
 #[serde(bound(deserialize = ""))]
 pub struct WorkloadConfig {
-    /// Number of worker processes to fork.
+    /// Number of worker processes to fork. Concrete `usize` (not
+    /// `Option`): `WorkloadConfig` is the spawn-time configuration
+    /// passed to `WorkloadHandle::spawn`, by which point the worker
+    /// count must be known. The Option-to-usize coalescing happens
+    /// upstream at [`crate::scenario::resolve_num_workers`], which
+    /// reads [`crate::workload::WorkSpec::num_workers`]
+    /// (`Option<usize>` — `None` falls back to
+    /// `Ctx::workers_per_cgroup`) and produces the resolved value
+    /// passed to [`Self::for_scenario_engine`]. The type asymmetry
+    /// is deliberate: `WorkSpec` is the user-facing declarative
+    /// spec where `None` means "inherit the cgroup-level default",
+    /// `WorkloadConfig` is the spawn-time concrete config where
+    /// `usize` is the only sensible type.
     pub num_workers: usize,
     /// Per-worker affinity intent. Resolved at spawn time via the
     /// same gate as composed entries (see [`Self::composed`]):
@@ -77,10 +99,12 @@ pub struct WorkloadConfig {
     /// How to create each worker. Defaults to [`CloneMode::Fork`].
     pub clone_mode: CloneMode,
     /// Worker process name set via `prctl(PR_SET_NAME)` after fork.
-    /// Kernel truncates to 15 bytes (TASK_COMM_LEN - 1). `None`
-    /// inherits the binary name. Mirrors [`WorkSpec::comm`] so the
-    /// primary group exposes the same scheduler-matcher knob composed
-    /// entries already do.
+    /// The setter rejects > 15 bytes (TASK_COMM_LEN-1) at
+    /// construction so the operator sees the cap at the call site
+    /// instead of debugging a truncated comm. `None` inherits the
+    /// binary name. Mirrors [`WorkSpec::comm`] so the primary group
+    /// exposes the same scheduler-matcher knob composed entries
+    /// already do.
     pub comm: Option<Cow<'static, str>>,
     /// Effective UID set via `setresuid(uid, uid, uid)` after fork.
     /// `None` inherits the parent's euid. Mirrors [`WorkSpec::uid`].
@@ -201,6 +225,92 @@ impl Default for WorkloadConfig {
 }
 
 impl WorkloadConfig {
+    /// Construct a `WorkloadConfig` for scenario-engine spawn
+    /// dispatch (apply_setup non-pcomm, Op::Spawn). The signature
+    /// pins `clone_mode =
+    /// CloneMode::Fork` in the constructor body so callers can't
+    /// accidentally route a Thread-mode workload through these
+    /// sites — a Thread-mode spawn would migrate the scenario
+    /// runner's tgid into the test cgroup when move_tasks fires,
+    /// per `kernel/cgroup/cgroup.c::cgroup_procs_write_start`
+    /// (cgroup.procs writes are process-scoped). The
+    /// previously-needed `debug_assert_eq!(wl.clone_mode, Fork)`
+    /// guards collapse into the type system.
+    ///
+    /// `work_type` is taken as an arg (not pulled from `work.work_type`)
+    /// because apply_setup's per-WorkSpec resolution layers a
+    /// `ctx.work_type_override` over the spec-declared type; passing
+    /// the resolved value keeps that call site honest.
+    ///
+    /// `affinity` is taken as an arg (not `work.affinity`) because
+    /// all three call sites pre-resolve the intent via
+    /// `intent_for_spawn` against the cgroup cpuset before
+    /// dispatch.
+    ///
+    /// **Do NOT pass `work.num_workers.unwrap()` / `work.affinity` /
+    /// `work.work_type` directly** — that bypasses the resolution
+    /// layer (workers_pct → ceil(cpuset * pct), cgroup-cpuset-aware
+    /// intent_for_spawn, work_type override) and silently produces
+    /// wrong counts / wrong affinity / wrong type. Always pass the
+    /// resolved values from `resolve_num_workers` /
+    /// `intent_for_spawn` / `resolve_work_type`; the args/fields
+    /// asymmetry is deliberate and the resolution layer is
+    /// load-bearing.
+    ///
+    /// `composed` always empty: the scenario-engine spawn dispatch
+    /// emits one WorkloadConfig per WorkSpec from the resolved
+    /// `non_pcomm_works` list, so composition is upstream. A future
+    /// "composed in single spawn" optimization would need a
+    /// sibling constructor, not a parameterized one.
+    ///
+    /// Bails when `work.pcomm.is_some()`: the scenario-engine spawn
+    /// dispatch (apply_setup non-pcomm path, Op::Spawn) forks one
+    /// process per worker and does not
+    /// route through `spawn_pcomm_cgroup`, so `task->group_leader->comm`
+    /// would be left at the binary name rather than the requested
+    /// pcomm value — workers spawn but scheduler matchers filtering
+    /// on the group_leader comm see zero matches. Mirrors the
+    /// composed[i].pcomm.is_some() bail at
+    /// `WorkloadHandle::spawn`. Test authors wanting pcomm route via
+    /// `CgroupDef::pcomm` + apply_setup pcomm-aware fan-out, or call
+    /// `WorkloadHandle::spawn_pcomm_cgroup` directly.
+    pub(crate) fn for_scenario_engine(
+        work: &WorkSpec,
+        num_workers: usize,
+        affinity: AffinityIntent,
+        work_type: WorkType,
+    ) -> anyhow::Result<Self> {
+        if work.pcomm.is_some() {
+            anyhow::bail!(
+                "WorkSpec::pcomm is unsupported in the scenario-engine \
+                 spawn dispatch (apply_setup non-pcomm path, \
+                 Op::Spawn) — those sites fork \
+                 one process per worker rather than threading inside \
+                 a pcomm container, so `task->group_leader->comm` \
+                 would stay at the binary name. To run with a \
+                 specific group-leader comm, declare \
+                 `CgroupDef::pcomm` (apply_setup picks up the pcomm-\
+                 aware coalesce path) or call \
+                 `WorkloadHandle::spawn_pcomm_cgroup` directly.",
+            );
+        }
+        Ok(Self {
+            num_workers,
+            affinity,
+            work_type,
+            sched_policy: work.sched_policy,
+            mem_policy: work.mem_policy.clone(),
+            mpol_flags: work.mpol_flags,
+            nice: work.nice,
+            clone_mode: CloneMode::Fork,
+            comm: work.comm.clone(),
+            uid: work.uid,
+            gid: work.gid,
+            numa_node: work.numa_node,
+            composed: Vec::new(),
+        })
+    }
+
     /// Validate the config before spawn. Fails loud on invariants
     /// that the worker-spawn path otherwise handles by silent
     /// degradation — in particular `mem_policy` variants that
@@ -231,27 +341,40 @@ impl WorkloadConfig {
     ///
     /// # What is validated
     ///
-    /// The primary group's `mem_policy` plus every composed
-    /// [`WorkSpec`]'s `mem_policy`. Per-entry errors name the
-    /// offending slot (`"primary"` or `"composed[N] (group_idx M)"`) so
-    /// the test author can locate the misconfigured group.
+    /// Two gates, in order:
+    /// 1. `num_workers > 0` on the primary group and on every
+    ///    composed [`WorkSpec`] entry — zero workers emit no
+    ///    `WorkerReport`s and downstream assertions would vacuously
+    ///    pass. Composed entries also route through `spawn_composed`
+    ///    directly, bypassing the scenario-engine's
+    ///    `resolve_num_workers` resolver, so the gate must live
+    ///    here to catch composed[i].num_workers=0 before the spawn
+    ///    cascade forks anything.
+    /// 2. `mem_policy` on the primary group and on every composed
+    ///    [`WorkSpec`] entry.
+    ///
+    /// Per-entry errors name the offending slot (`"primary"` or
+    /// `"composed[N] (group_idx M)"`) so the test author can
+    /// locate the misconfigured group. Gate (1) runs first so the
+    /// more-fundamental "no workers" diagnostic surfaces before a
+    /// secondary mem_policy failure (which becomes moot when no
+    /// worker exists to bind).
     ///
     /// # Scope
     ///
-    /// Currently validates only `mem_policy` on the primary group +
-    /// each composed [`WorkSpec`]. Other field invariants are
-    /// validated at their own use sites: `num_workers` via
-    /// `WorkSpec::resolve_workers_pct` (and the spawn-time
-    /// `WorkloadHandle::spawn` derivation cascade); [`WorkType`]
-    /// payloads via per-variant constructors and
-    /// `validate_workload_admission`; [`AffinityIntent`] topology
-    /// rules at the scenario-engine
-    /// `resolve_affinity_for_cgroup` resolver. This method is the
-    /// home for invariants that must hold BEFORE any worker context
-    /// (threads, forks, cgroups) exists — `mem_policy` qualifies
-    /// because of the silent-skip + `exit_group` hazard noted
-    /// above; future fields with the same "must-fail-before-spawn"
-    /// shape belong here too.
+    /// Validates `mem_policy` and `num_workers > 0`. Other field
+    /// invariants are validated at their own use sites:
+    /// `workers_pct` via `WorkSpec::resolve_workers_pct`,
+    /// [`WorkType`] payloads via per-variant constructors and
+    /// `validate_workload_admission`, [`AffinityIntent`] topology
+    /// rules at the scenario-engine `resolve_affinity_for_cgroup`
+    /// resolver. This method is the home for invariants that must
+    /// hold BEFORE any worker context (threads, forks, cgroups)
+    /// exists — `mem_policy` qualifies because of the silent-skip +
+    /// `exit_group` hazard noted above; `num_workers == 0`
+    /// qualifies because every downstream gate becomes
+    /// vacuous-pass. Future fields with the same
+    /// "must-fail-before-spawn" shape belong here too.
     ///
     /// # Return type
     ///
@@ -265,6 +388,32 @@ impl WorkloadConfig {
     /// the leaf convention used by every per-spec validator in the
     /// project.
     pub fn validate(&self) -> anyhow::Result<()> {
+        // num_workers gate runs FIRST so the operator sees the more-
+        // fundamental "no workers" diagnostic before mem_policy
+        // failures (which become moot when no worker exists to bind).
+        if self.num_workers == 0 {
+            anyhow::bail!(
+                "WorkloadConfig.num_workers=0 is not allowed — \
+                 zero workers emit no WorkerReports and downstream \
+                 assertions would vacuously pass. Use at least 1 \
+                 worker or drop the WorkloadConfig entirely."
+            );
+        }
+        for (idx, spec) in self.composed.iter().enumerate() {
+            // composed entries route through `spawn_composed` directly,
+            // bypassing the scenario engine's `resolve_num_workers` —
+            // the gate must live here for the spawn entry to catch
+            // composed[i].num_workers=0 before forking.
+            if spec.num_workers == Some(0) {
+                anyhow::bail!(
+                    "WorkloadConfig.composed[{idx}].num_workers=0 \
+                     (group_idx {}): zero workers in a composed group \
+                     emit no WorkerReports for the group; drop the \
+                     entry or use >= 1 worker",
+                    idx + 1,
+                );
+            }
+        }
         self.mem_policy
             .validate()
             .map_err(|e| anyhow::anyhow!("WorkloadConfig.mem_policy (primary group): {e}",))?;
@@ -358,10 +507,24 @@ impl WorkloadConfig {
     }
 
     /// Set the worker process name via `prctl(PR_SET_NAME)`.
-    /// Kernel truncates to 15 bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics on programmer-error inputs — mirrors
+    /// [`crate::workload::WorkSpec::pcomm`]'s `# Panics`:
+    /// - Empty string.
+    /// - Interior NUL byte (prctl C-string truncation).
+    /// - More than 15 bytes (`TASK_COMM_LEN - 1` cap).
+    ///
+    /// See
+    /// [`validate_task_comm_string`](crate::workload::validate_task_comm_string)
+    /// for the centralized rationale; `name.len()` is the BYTE
+    /// length (UTF-8 multi-byte chars count as their byte width).
     #[must_use = "builder methods consume self; bind the result"]
     pub fn comm(mut self, name: impl Into<Cow<'static, str>>) -> Self {
-        self.comm = Some(name.into());
+        let name: Cow<'static, str> = name.into();
+        crate::workload::validate_task_comm_string("WorkloadConfig::comm", &name);
+        self.comm = Some(name);
         self
     }
 
@@ -422,5 +585,102 @@ impl WorkloadConfig {
     pub fn push_composed(mut self, spec: WorkSpec) -> Self {
         self.composed.push(spec);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn validate_rejects_zero_num_workers_on_primary() {
+        let cfg = WorkloadConfig {
+            num_workers: 0,
+            ..Default::default()
+        };
+        let err = cfg.validate().expect_err("num_workers=0 must bail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("num_workers=0 is not allowed"), "{msg}");
+        assert!(msg.contains("vacuously pass"), "{msg}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_num_workers_on_composed_entry() {
+        let cfg = WorkloadConfig {
+            num_workers: 1,
+            composed: vec![WorkSpec::default().workers(0)],
+            ..Default::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("composed[0].num_workers=0 must bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("composed[0]"),
+            "must cite the entry idx: {msg}"
+        );
+        assert!(msg.contains("group_idx 1"), "1-indexed group_idx: {msg}");
+    }
+
+    #[test]
+    fn validate_accepts_one_or_more_workers_on_primary_and_composed() {
+        let cfg = WorkloadConfig {
+            num_workers: 1,
+            composed: vec![WorkSpec::default().workers(2)],
+            ..Default::default()
+        };
+        cfg.validate().expect("1+composed(2) must validate ok");
+    }
+
+    #[test]
+    fn validate_rejects_zero_workers_before_mempolicy() {
+        // Zero workers + invalid mem_policy: zero-worker check must
+        // fire first so the operator's primary diagnostic is the
+        // more-fundamental "no workers" rather than the secondary
+        // "bad mempolicy" message.
+        let cfg = WorkloadConfig {
+            num_workers: 0,
+            mem_policy: MemPolicy::Bind(BTreeSet::new()), // invalid
+            ..Default::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("zero workers + bad policy must bail on num_workers first");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("num_workers=0"),
+            "zero-workers msg surfaces: {msg}"
+        );
+        assert!(!msg.contains("mem_policy"), "mempolicy msg deferred: {msg}");
+    }
+
+    #[test]
+    #[should_panic(expected = "WorkloadConfig::comm: empty string rejected")]
+    fn workload_config_comm_rejects_empty() {
+        let _ = WorkloadConfig::default().comm("");
+    }
+
+    #[test]
+    #[should_panic(expected = "interior NUL byte")]
+    fn workload_config_comm_rejects_interior_nul() {
+        let _ = WorkloadConfig::default().comm("foo\0bar");
+    }
+
+    /// Per-builder boundary pin: a future refactor that re-routes
+    /// WorkloadConfig::comm around the shared
+    /// `validate_task_comm_string` helper would surface here even
+    /// if the helper-level tests still pass.
+    #[test]
+    fn workload_config_comm_accepts_15_byte_boundary() {
+        let fifteen = "a".repeat(15);
+        let cfg = WorkloadConfig::default().comm(fifteen.clone());
+        assert_eq!(cfg.comm.as_deref(), Some(fifteen.as_str()));
+    }
+
+    #[test]
+    #[should_panic(expected = "16 bytes")]
+    fn workload_config_comm_rejects_16_byte_overflow() {
+        let _ = WorkloadConfig::default().comm("a".repeat(16));
     }
 }

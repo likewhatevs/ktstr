@@ -1,0 +1,5 @@
+error: declare_scheduler!: `sched_args` must be an array literal `[..]`
+  --> tests/compile_fail/declare_scheduler_sched_args_not_array.rs:11:5
+   |
+11 |     sched_args = "not_an_array",
+   |     ^^^^^^^^^^

@@ -82,7 +82,23 @@ pub struct KtstrVmBuilder {
     /// backend echoes TX bytes back to RX. v0 supports a single
     /// device. See [`super::KtstrVm::network`].
     network: Option<net_config::NetConfig>,
-    busybox: bool,
+    /// Busybox bytes to pack at `bin/busybox`. `None` skips packing
+    /// (test-mode VMs do not need shell utilities). `Some(bytes)`
+    /// embeds the provided bytes — the library never owns busybox
+    /// itself; bytes come from
+    /// [`crate::vmm::blobs::load_busybox_bytes`] (which reads the
+    /// `KTSTR_BUSYBOX_PATH` env var that `cargo-ktstr` sets at
+    /// startup).
+    pub(crate) busybox_bytes: Option<Vec<u8>>,
+    /// wprof binary + invocation args to ship into the guest at
+    /// `/bin/wprof`. `None` skips packing — most production VMs
+    /// have no use for wprof. `Some` embeds the binary AND records
+    /// the args (rendered onto the cmdline as `KTSTR_WPROF_ARGS=…`
+    /// so guest init can invoke wprof during auto-repro). Bytes
+    /// come from [`crate::vmm::blobs::load_wprof_bytes`] (which
+    /// reads the `KTSTR_WPROF_PATH` env var that `cargo-ktstr`
+    /// sets at startup).
+    pub(crate) wprof: Option<crate::vmm::wprof::WprofConfig>,
     dmesg: bool,
     exec_cmd: Option<String>,
     /// Optional host path to the `ktstr-jemalloc-probe` binary.
@@ -229,7 +245,8 @@ impl Default for KtstrVmBuilder {
             include_files: Vec::new(),
             disks: Vec::new(),
             network: None,
-            busybox: false,
+            busybox_bytes: None,
+            wprof: None,
             dmesg: false,
             exec_cmd: None,
             jemalloc_probe_binary: None,
@@ -755,10 +772,33 @@ impl KtstrVmBuilder {
         self
     }
 
-    /// Embed busybox in the initramfs for shell mode.
+    /// Embed busybox bytes in the initramfs at `bin/busybox` for
+    /// shell mode. `None` skips packing; `Some(bytes)` writes the
+    /// provided bytes. The library does not own the bytes — most
+    /// callers source them from
+    /// [`crate::vmm::blobs::load_busybox_bytes`] which reads the
+    /// `KTSTR_BUSYBOX_PATH` env var that `cargo-ktstr` sets at
+    /// startup.
     #[allow(dead_code)]
-    pub fn busybox(mut self, enabled: bool) -> Self {
-        self.busybox = enabled;
+    pub fn busybox(mut self, bytes: Option<Vec<u8>>) -> Self {
+        self.busybox_bytes = bytes;
+        self
+    }
+
+    /// Embed the wprof tracer binary at `bin/wprof` and record the
+    /// invocation args on the guest cmdline. `None` (default) skips
+    /// packing — most VMs do not need profiling. `Some` makes
+    /// `/bin/wprof` available in the guest and exposes the args
+    /// via `KTSTR_WPROF_ARGS` on the kernel cmdline for guest init
+    /// to invoke during auto-repro.
+    ///
+    /// Source the [`crate::vmm::wprof::WprofConfig`] via
+    /// [`crate::vmm::wprof::WprofConfig::from_env`] which reads
+    /// `KTSTR_WPROF_PATH` (set by `cargo-ktstr` at startup) and
+    /// populates the default args.
+    #[allow(dead_code)]
+    pub fn wprof(mut self, config: Option<crate::vmm::wprof::WprofConfig>) -> Self {
+        self.wprof = config;
         self
     }
 
@@ -866,9 +906,7 @@ impl KtstrVmBuilder {
             // { return None-plan }`. Mirror the CLI check here so
             // the enforcement contract holds for every entry point,
             // not just the ones that go through the binaries.
-            let bypass = std::env::var("KTSTR_BYPASS_LLC_LOCKS")
-                .ok()
-                .is_some_and(|v| !v.is_empty());
+            let bypass = crate::bypass_llc_locks_active();
             let cpu_cap = host_topology::CpuCap::resolve(None)?;
             if bypass {
                 if cpu_cap.is_some() {
@@ -1031,7 +1069,8 @@ impl KtstrVmBuilder {
             include_files: self.include_files,
             disks: self.disks,
             network: self.network,
-            busybox: self.busybox,
+            busybox_bytes: self.busybox_bytes,
+            wprof: self.wprof,
             dmesg: self.dmesg,
             exec_cmd: self.exec_cmd,
             jemalloc_probe_binary: self.jemalloc_probe_binary,

@@ -543,9 +543,30 @@ impl Payload {
     /// payloads; binary-kind payloads always return `false` — a
     /// binary runs under whatever scheduler the test declares, and
     /// does not itself impose one.
+    ///
+    /// Returns `true` for `KernelBuiltin` scheduler-kind payloads.
+    /// See [`Self::has_bpf_scheduler`] for the narrower gate that
+    /// excludes them.
     pub const fn has_active_scheduling(&self) -> bool {
         match self.kind {
             PayloadKind::Scheduler(s) => s.binary.has_active_scheduling(),
+            PayloadKind::Binary(_) => false,
+        }
+    }
+
+    /// True when this payload drives a userspace BPF scheduler
+    /// binary. Forwards to `SchedulerSpec::has_bpf_scheduler` for
+    /// scheduler-kind payloads; binary-kind payloads always return
+    /// `false`.
+    ///
+    /// Distinct from [`Self::has_active_scheduling`]: this excludes
+    /// `KernelBuiltin` scheduler-kind payloads (in-kernel policy,
+    /// no userspace BPF binary). Use whenever the caller assumes a
+    /// BPF binary is attached — verifier_stats wiring, BPF-attach
+    /// monitor thresholds, or auto-repro probe gating.
+    pub const fn has_bpf_scheduler(&self) -> bool {
+        match self.kind {
+            PayloadKind::Scheduler(s) => s.binary.has_bpf_scheduler(),
             PayloadKind::Binary(_) => false,
         }
     }
@@ -1028,8 +1049,7 @@ pub enum MetricSource {
 /// field is wired end-to-end from the payload-pipeline to the
 /// sidecar JSON today so that downstream review tools can start
 /// filtering on it without a schema change — but no production
-/// consumer reads it yet. A follow-up task wires filtering into
-/// `stats compare` output.
+/// consumer reads it yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum MetricStream {

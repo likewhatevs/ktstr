@@ -340,7 +340,7 @@ pub(super) fn worker_main(
     // Custom: delegate entirely to the user function. Affinity and
     // sched_policy are already applied above.
     if let WorkType::Custom { run, .. } = &work_type {
-        return run(stop);
+        return run.call(stop);
     }
 
     let affinity_churn_cpus: Vec<usize> = if matches!(work_type, WorkType::AffinityChurn { .. }) {

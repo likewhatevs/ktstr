@@ -7,14 +7,12 @@
 //! that the rendered output contains the expected columns and
 //! non-zero deltas.
 //!
-//! The fixtures are synthetic (no VM) because the capture-side
-//! implementation lands in parallel. Once `ktstr ctprof capture -o`
-//! is wired end-to-end, a VM-backed integration test will run
-//! the same toy workload twice through real capture and
-//! compare the real snapshots; that test is tracked separately.
-//! This file establishes the compare-only pipeline so the
-//! downstream addition is a drop-in extension rather than a
-//! rewrite.
+//! The fixtures are synthetic (no VM). Once `ktstr ctprof
+//! capture -o` is wired end-to-end, a VM-backed integration test
+//! can run the same toy workload twice through real capture and
+//! compare the real snapshots. This file establishes the
+//! compare-only pipeline so the downstream addition is a drop-in
+//! extension rather than a rewrite.
 
 // Shared ctprof test helpers live under `tests/common/`
 // so the same `make_thread` / `snapshot` / `cgroup_stats_entry`
@@ -1163,7 +1161,7 @@ fn compare_smaps_rollup_renders_header_and_scaled_byte_values() {
     );
 }
 
-/// Section-gate test (F8): when every (process, key) pair has
+/// Section-gate test: when every (process, key) pair has
 /// equal baseline and candidate values, the entire
 /// `## smaps_rollup` header is suppressed (not just per-row
 /// rows). Pins the `any_delta` precheck.

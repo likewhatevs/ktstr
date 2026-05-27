@@ -835,7 +835,7 @@ impl WorkType {
     pub fn custom(name: impl Into<String>, run: fn(&AtomicBool) -> WorkerReport) -> Self {
         WorkType::Custom {
             name: name.into(),
-            run,
+            run: super::work_type::CustomFn(run),
         }
     }
 }

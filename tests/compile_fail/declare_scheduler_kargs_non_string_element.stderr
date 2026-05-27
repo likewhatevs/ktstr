@@ -1,0 +1,5 @@
+error: declare_scheduler!: element of `kargs` must be a string literal
+  --> tests/compile_fail/declare_scheduler_kargs_non_string_element.rs:11:25
+   |
+11 |     kargs = ["nokaslr", 12345],
+   |                         ^^^^^

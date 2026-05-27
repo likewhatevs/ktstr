@@ -57,7 +57,7 @@ use anyhow::{Context, Result};
 /// pool from cgroup cpuset / topology before constructing this
 /// variant; spawn-time `resolve_affinity` samples per-worker.
 /// Construct directly via [`AffinityIntent::random_subset`].
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AffinityIntent {
     /// No affinity constraint -- inherit from parent cgroup.
@@ -149,7 +149,7 @@ impl AffinityIntent {
 /// same shape exists pre/post-resolution; payload presence
 /// distinguishes intent from concrete CPU id(s). See the
 /// [`AffinityIntent`] type doc for the full pre/post mapping table.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResolvedAffinity {
     /// No affinity constraint.

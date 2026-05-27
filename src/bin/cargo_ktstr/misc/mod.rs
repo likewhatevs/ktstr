@@ -20,6 +20,7 @@ mod completions;
 mod export;
 mod funify;
 mod model;
+mod probe;
 mod shell;
 
 pub(crate) use completions::run_completions;

@@ -1169,7 +1169,7 @@ fn iter_text_relocs<'a, 'elf: 'a>(
 /// stash location; non-inlined helpers move the `STX` of the
 /// returned R0 into the helper's own frame (R0 is clobbered at the
 /// caller's call site), so the analyzer never sees the tag flow
-/// across the call boundary. The F4 mitigation surfaces a warn at
+/// across the call boundary. The non-inlined-allocator warn surfaces at
 /// finalize when arena STX evidence is present but no LDX→cast
 /// chain landed for any slot, prompting operators to mark missing
 /// helpers `__always_inline`.

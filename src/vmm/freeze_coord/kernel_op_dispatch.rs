@@ -1809,7 +1809,7 @@ mod tests {
 
     // ---- KVA validation tests ----
 
-    /// T62.1 — boundary inclusive: KVA at exactly KERNEL_HALF_CONSERVATIVE_5LEVEL
+    /// Boundary inclusive: KVA at exactly KERNEL_HALF_CONSERVATIVE_5LEVEL
     /// is accepted. Regression guard against off-by-one flipping
     /// the `<` to `<=` (which would reject the canonical bound).
     #[test]
@@ -1817,8 +1817,9 @@ mod tests {
         assert!(validate_kva_target(KERNEL_HALF_CONSERVATIVE_5LEVEL, 4).is_ok());
     }
 
-    /// T62.2 — boundary exclusive: KVA one below threshold rejects.
-    /// Pins the rejection-side off-by-one symmetric with T62.1.
+    /// Boundary exclusive: KVA one below threshold rejects.
+    /// Pins the rejection-side off-by-one symmetric with the
+    /// inclusive-bound test.
     #[test]
     fn validate_kva_target_rejects_one_below_threshold() {
         let kva = KERNEL_HALF_CONSERVATIVE_5LEVEL - 1;
@@ -1829,15 +1830,15 @@ mod tests {
         );
     }
 
-    /// T62.3 — user-half edge (kva=0). Per CLAUDE.md "no silent drops",
-    /// 0 must fail loud rather than be treated as a sentinel.
+    /// User-half edge (kva=0). Per the project's no-silent-drops
+    /// rule, 0 must fail loud rather than be treated as a sentinel.
     #[test]
     fn validate_kva_target_rejects_zero() {
         let err = validate_kva_target(0, 4).expect_err("kva=0 must reject");
         assert!(err.contains("0x0"));
     }
 
-    /// T62.4 — user-half max (canonical 4-level user-half top).
+    /// User-half max (canonical 4-level user-half top).
     /// Pins that a bit-63 only check is insufficient; the
     /// threshold-based check catches this case.
     #[test]
@@ -1849,7 +1850,7 @@ mod tests {
         );
     }
 
-    /// T62.5 — kernel-half typical KASLR-off + KASLR-on land.
+    /// Kernel-half typical KASLR-off + KASLR-on land.
     /// Pins that real-world kernel KVAs don't false-reject.
     #[test]
     fn validate_kva_target_accepts_kernel_typical() {
@@ -1861,7 +1862,7 @@ mod tests {
         assert!(validate_kva_target(0xFF11_0000_0000_0000, 4).is_ok());
     }
 
-    /// T62 — user_half_kva_rejection_reason format pin via Path B
+    /// user_half_kva_rejection_reason format pin via Path B
     /// helper-extraction integration: the test invokes the SAME
     /// helper the production dispatcher calls and pins error_reply's
     /// propagation through the batch-prefix machinery. A regression
@@ -1886,7 +1887,7 @@ mod tests {
         assert!(helper_reason.contains("Symbol target"));
     }
 
-    /// T62 — validate_direct_target accepts an in-range KVA.
+    /// validate_direct_target accepts an in-range KVA.
     /// Page_offset is a typical 4-level KASLR-off direct-map base.
     #[test]
     fn validate_direct_target_accepts_in_range() {
@@ -1902,7 +1903,7 @@ mod tests {
         );
     }
 
-    /// T62 — validate_direct_target rejects a KVA below page_offset.
+    /// validate_direct_target rejects a KVA below page_offset.
     /// The user-half / canonical-hole class — kva_to_pa would
     /// underflow and wrap.
     #[test]
@@ -1917,7 +1918,7 @@ mod tests {
         assert!(err.contains("would wrap"));
     }
 
-    /// T62 — validate_direct_target rejects a KVA range past the
+    /// validate_direct_target rejects a KVA range past the
     /// direct-map end. The "out the upper end" class.
     #[test]
     fn validate_direct_target_rejects_past_end() {
@@ -1930,7 +1931,7 @@ mod tests {
         assert!(err.contains("overruns direct-map end"));
     }
 
-    /// T62 — validate_direct_target rejects overflow on kva+len.
+    /// validate_direct_target rejects overflow on kva+len.
     /// Pins the checked_add guard.
     #[test]
     fn validate_direct_target_rejects_kva_len_overflow() {
@@ -1942,7 +1943,7 @@ mod tests {
         assert!(err.contains("overflow"));
     }
 
-    /// T62 — validate_kva_target rejects overflow on kva+len.
+    /// validate_kva_target rejects overflow on kva+len.
     #[test]
     fn validate_kva_target_rejects_kva_len_overflow() {
         let kva = u64::MAX - 2;
@@ -1952,7 +1953,7 @@ mod tests {
 
     // ---- same-rendezvous-epoch marker-anchor test ----
 
-    /// T63.1 — Doc-grep / marker-anchor regression test. Every
+    /// Doc-grep / marker-anchor regression test. Every
     /// OrU32 RMW site in the dispatcher MUST carry a
     /// `// rmw-invariant-anchor` comment. The same-rendezvous-epoch
     /// invariant is structural (per-entry sequential walk in
@@ -2468,8 +2469,7 @@ mod tests {
     /// would slip past the [`oru32_sets_target_bits_preserves_others`]
     /// test (which uses a NEW bit) and surface only here.
     ///
-    /// Migrated from `tests/oru64_rmw_e2e.rs` (T33.2 in the original
-    /// skeleton).
+    /// Migrated from `tests/oru64_rmw_e2e.rs`.
     #[test]
     fn oru32_idempotent_on_already_set_bit() {
         // KVA = start_kernel_map + PA; the Symbol path's
@@ -2523,7 +2523,7 @@ mod tests {
     /// break postcard's externally-tagged constraint — the wire-path
     /// reader at the host would silently drop the variant tag).
     ///
-    /// Migrated from `tests/oru64_rmw_e2e.rs` T33.3. The existing
+    /// Migrated from `tests/oru64_rmw_e2e.rs`. The existing
     /// `kernel_op_request_payload_postcard_round_trip` test in
     /// `src/vmm/wire.rs` covers U32/U64/Bytes/PerCpuField/TaskField
     /// but does not include an OrU32 entry — this fills that gap.

@@ -70,7 +70,7 @@ fn find_kernel_preserves_untracked_cache_entries() {
     // KTSTR_KERNEL: unset so find_kernel skips step 1 and falls
     // straight into the cache scan (step 2), which is the branch
     // this test targets.
-    let _kernel_guard = EnvVarGuard::remove("KTSTR_KERNEL");
+    let _kernel_guard = EnvVarGuard::remove(crate::KTSTR_KERNEL_ENV);
 
     // KTSTR_CACHE_DIR: point at an isolated temp dir so the
     // test sees only the Untracked entry we stage below — and
@@ -78,7 +78,7 @@ fn find_kernel_preserves_untracked_cache_entries() {
     // result.
     let tmp = tempfile::TempDir::new().unwrap();
     let cache_root = tmp.path().join("cache");
-    let _cache_guard = EnvVarGuard::set("KTSTR_CACHE_DIR", &cache_root);
+    let _cache_guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, &cache_root);
 
     // Stage one valid image with `ktstr_kconfig_hash = None`
     // (Untracked). `has_vmlinux` stays false so find_kernel's
@@ -144,11 +144,11 @@ fn find_kernel_skips_stale_cache_entry() {
     use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
 
     let _env_lock = lock_env();
-    let _kernel_guard = EnvVarGuard::remove("KTSTR_KERNEL");
+    let _kernel_guard = EnvVarGuard::remove(crate::KTSTR_KERNEL_ENV);
 
     let tmp = tempfile::TempDir::new().unwrap();
     let cache_root = tmp.path().join("cache");
-    let _cache_guard = EnvVarGuard::set("KTSTR_CACHE_DIR", &cache_root);
+    let _cache_guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, &cache_root);
 
     let current_hash = crate::kconfig_hash();
     let stale_hash = format!("{current_hash}-stale");
@@ -357,7 +357,7 @@ fn find_kernel_inverted_range_env_surfaces_swap_diagnostic() {
     let _env_lock = lock_env();
     let tmp = tempfile::TempDir::new().unwrap();
     let cache_root = tmp.path().join("cache");
-    let _cache_guard = EnvVarGuard::set("KTSTR_CACHE_DIR", &cache_root);
+    let _cache_guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, &cache_root);
     let _kernel_guard = EnvVarGuard::set(KTSTR_KERNEL_ENV, "6.16..6.12");
 
     let err = find_kernel().expect_err("inverted range must error");
@@ -385,6 +385,65 @@ fn find_kernel_inverted_range_env_surfaces_swap_diagnostic() {
 #[test]
 fn ktstr_kernel_env_constant_is_literal() {
     assert_eq!(KTSTR_KERNEL_ENV, "KTSTR_KERNEL");
+}
+
+/// Drift-protection bundle for every `pub const KTSTR_*_ENV` in
+/// lib.rs. A regression that changes a const body (e.g.
+/// `KTSTR_GHA_CACHE` → `KTSTR_GH_CACHE`) without updating
+/// downstream tooling (CI scripts, mdbook docs that grep the env
+/// name, Docker run scripts) silently breaks integration for
+/// every external consumer. The compile-check via callsite
+/// references catches a rename of the const NAME but not a
+/// rewrite of the const VALUE; this test pins the value-body
+/// per-const. Bundled because every const is the same shape +
+/// the test failure naming the offending const is enough for
+/// the operator to grep the downstream tooling.
+#[test]
+fn ktstr_env_constants_are_their_literals() {
+    use super::{
+        KTSTR_BUDGET_SECS_ENV, KTSTR_BUSYBOX_PATH_ENV, KTSTR_BYPASS_LLC_LOCKS_ENV,
+        KTSTR_CACHE_DIR_ENV, KTSTR_CARGO_TEST_MODE_ENV, KTSTR_CGROUP_WALK_ROOT_ENV,
+        KTSTR_CONTENTION_BYPASS_ENV, KTSTR_CPU_CAP_ENV, KTSTR_GHA_CACHE_ENV, KTSTR_GUEST_INIT_ENV,
+        KTSTR_HOST_CGROUP_PARENT_ENV, KTSTR_JEMALLOC_ALLOC_WORKER_BINARY_ENV,
+        KTSTR_JEMALLOC_PROBE_BINARY_ENV, KTSTR_KERNEL_ENV, KTSTR_KERNEL_LIST_ENV,
+        KTSTR_KERNEL_PARALLELISM_ENV, KTSTR_LOCK_DIR_ENV, KTSTR_LOG_PASSES_ENV,
+        KTSTR_NO_PERF_MODE_ENV, KTSTR_NO_SKIP_MODE_ENV, KTSTR_ORCHESTRATED_ENV,
+        KTSTR_SCHEDULER_ENV, KTSTR_SIDECAR_DIR_ENV, KTSTR_TEST_KERNEL_ENV, KTSTR_VERBOSE_ENV,
+        KTSTR_VERIFIER_RAW_ENV, KTSTR_WPROF_PATH_ENV,
+    };
+    assert_eq!(KTSTR_KERNEL_ENV, "KTSTR_KERNEL");
+    assert_eq!(KTSTR_KERNEL_LIST_ENV, "KTSTR_KERNEL_LIST");
+    assert_eq!(KTSTR_ORCHESTRATED_ENV, "KTSTR_ORCHESTRATED");
+    assert_eq!(KTSTR_HOST_CGROUP_PARENT_ENV, "KTSTR_HOST_CGROUP_PARENT");
+    assert_eq!(KTSTR_CGROUP_WALK_ROOT_ENV, "KTSTR_CGROUP_WALK_ROOT");
+    assert_eq!(KTSTR_KERNEL_PARALLELISM_ENV, "KTSTR_KERNEL_PARALLELISM");
+    assert_eq!(KTSTR_VERIFIER_RAW_ENV, "KTSTR_VERIFIER_RAW");
+    assert_eq!(KTSTR_NO_PERF_MODE_ENV, "KTSTR_NO_PERF_MODE");
+    assert_eq!(KTSTR_GHA_CACHE_ENV, "KTSTR_GHA_CACHE");
+    assert_eq!(KTSTR_CARGO_TEST_MODE_ENV, "KTSTR_CARGO_TEST_MODE");
+    assert_eq!(KTSTR_CACHE_DIR_ENV, "KTSTR_CACHE_DIR");
+    assert_eq!(KTSTR_LOCK_DIR_ENV, "KTSTR_LOCK_DIR");
+    assert_eq!(KTSTR_VERBOSE_ENV, "KTSTR_VERBOSE");
+    assert_eq!(KTSTR_BYPASS_LLC_LOCKS_ENV, "KTSTR_BYPASS_LLC_LOCKS");
+    assert_eq!(KTSTR_CPU_CAP_ENV, "KTSTR_CPU_CAP");
+    assert_eq!(KTSTR_CONTENTION_BYPASS_ENV, "KTSTR_CONTENTION_BYPASS");
+    assert_eq!(KTSTR_NO_SKIP_MODE_ENV, "KTSTR_NO_SKIP_MODE");
+    assert_eq!(KTSTR_BUDGET_SECS_ENV, "KTSTR_BUDGET_SECS");
+    assert_eq!(KTSTR_SIDECAR_DIR_ENV, "KTSTR_SIDECAR_DIR");
+    assert_eq!(KTSTR_SCHEDULER_ENV, "KTSTR_SCHEDULER");
+    assert_eq!(KTSTR_TEST_KERNEL_ENV, "KTSTR_TEST_KERNEL");
+    assert_eq!(KTSTR_GUEST_INIT_ENV, "KTSTR_GUEST_INIT");
+    assert_eq!(
+        KTSTR_JEMALLOC_PROBE_BINARY_ENV,
+        "KTSTR_JEMALLOC_PROBE_BINARY"
+    );
+    assert_eq!(
+        KTSTR_JEMALLOC_ALLOC_WORKER_BINARY_ENV,
+        "KTSTR_JEMALLOC_ALLOC_WORKER_BINARY"
+    );
+    assert_eq!(KTSTR_BUSYBOX_PATH_ENV, "KTSTR_BUSYBOX_PATH");
+    assert_eq!(KTSTR_WPROF_PATH_ENV, "KTSTR_WPROF_PATH");
+    assert_eq!(KTSTR_LOG_PASSES_ENV, "KTSTR_LOG_PASSES");
 }
 
 // -- extra_kconfig_hash + cache_key_suffix_with_extra --
@@ -837,10 +896,10 @@ fn cache_lookup_same_extras_hits_planted_entry() {
     use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
 
     let _env_lock = lock_env();
-    let _kernel_guard = EnvVarGuard::remove("KTSTR_KERNEL");
+    let _kernel_guard = EnvVarGuard::remove(crate::KTSTR_KERNEL_ENV);
     let tmp = tempfile::TempDir::new().unwrap();
     let cache_root = tmp.path().join("cache");
-    let _cache_guard = EnvVarGuard::set("KTSTR_CACHE_DIR", &cache_root);
+    let _cache_guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, &cache_root);
 
     let extra = "CONFIG_KTSTR_CACHE_ROUNDTRIP_TEST_A=y\n";
     let extra_hash = extra_kconfig_hash(extra);
@@ -887,10 +946,10 @@ fn cache_lookup_different_extras_misses_planted_entry() {
     use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
 
     let _env_lock = lock_env();
-    let _kernel_guard = EnvVarGuard::remove("KTSTR_KERNEL");
+    let _kernel_guard = EnvVarGuard::remove(crate::KTSTR_KERNEL_ENV);
     let tmp = tempfile::TempDir::new().unwrap();
     let cache_root = tmp.path().join("cache");
-    let _cache_guard = EnvVarGuard::set("KTSTR_CACHE_DIR", &cache_root);
+    let _cache_guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, &cache_root);
 
     let extra_a = "CONFIG_KTSTR_CACHE_DISCRIMINATE_A=y\n";
     let extra_b = "CONFIG_KTSTR_CACHE_DISCRIMINATE_B=y\n";
@@ -954,10 +1013,10 @@ fn cache_lookup_bare_and_extras_keys_segregated() {
     use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
 
     let _env_lock = lock_env();
-    let _kernel_guard = EnvVarGuard::remove("KTSTR_KERNEL");
+    let _kernel_guard = EnvVarGuard::remove(crate::KTSTR_KERNEL_ENV);
     let tmp = tempfile::TempDir::new().unwrap();
     let cache_root = tmp.path().join("cache");
-    let _cache_guard = EnvVarGuard::set("KTSTR_CACHE_DIR", &cache_root);
+    let _cache_guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, &cache_root);
 
     let baked = kconfig_hash();
     let extra = "CONFIG_KTSTR_CACHE_SEGREGATE=y\n";
@@ -1039,10 +1098,10 @@ fn cache_entry_has_extra_kconfig_reflects_metadata() {
     use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
 
     let _env_lock = lock_env();
-    let _kernel_guard = EnvVarGuard::remove("KTSTR_KERNEL");
+    let _kernel_guard = EnvVarGuard::remove(crate::KTSTR_KERNEL_ENV);
     let tmp = tempfile::TempDir::new().unwrap();
     let cache_root = tmp.path().join("cache");
-    let _cache_guard = EnvVarGuard::set("KTSTR_CACHE_DIR", &cache_root);
+    let _cache_guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, &cache_root);
 
     let cache = CacheDir::with_root(cache_root.clone());
     let src_dir = tempfile::TempDir::new().unwrap();

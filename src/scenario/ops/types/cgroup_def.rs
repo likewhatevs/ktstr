@@ -40,9 +40,10 @@ use super::{CpuLimits, CpusetSpec, IoLimits, MemoryLimits, PidsLimits};
 /// prose elided this distinction).
 ///
 /// Use `CgroupDef` in `Step::with_defs` for scenarios where cgroups are
-/// created once and run for the step duration. Use `Op::AddCgroup` +
-/// `Op::SpawnWorkers` directly when you need mid-step cgroup creation, removal,
-/// or other dynamic operations between spawn and collect.
+/// created once and run for the step duration. Use `Op::add_cgroup` +
+/// `Op::spawn(SpawnPlacement::cgroup(name), work)` directly when you
+/// need mid-step cgroup creation, removal, or other dynamic operations
+/// between spawn and collect.
 ///
 /// # Resource controllers overview
 ///
@@ -337,6 +338,13 @@ impl CgroupDef {
     }
 
     /// Set [`WorkSpec::num_workers`] on `works[0]` (Group I).
+    ///
+    /// `n` MUST be `>= 1`. `n == 0` is rejected at
+    /// [`WorkloadConfig::validate`] time with an actionable
+    /// diagnostic — a zero-worker spawn would silently produce
+    /// no workload load, vacuously passing scheduler assertions
+    /// that rely on observable contention. Pass `n >= 1`; for
+    /// fraction-of-cpuset sizing use [`Self::workers_pct`].
     #[must_use = "builder methods consume self; bind the result"]
     pub fn workers(mut self, n: usize) -> Self {
         self.ensure_default_work();
@@ -420,9 +428,24 @@ impl CgroupDef {
     }
 
     /// Set [`Self::default_comm`] (Group II).
+    ///
+    /// # Panics
+    ///
+    /// Panics on programmer-error inputs — mirrors
+    /// [`crate::workload::WorkSpec::pcomm`]'s `# Panics`:
+    /// - Empty string.
+    /// - Interior NUL byte.
+    /// - More than 15 bytes (`TASK_COMM_LEN - 1` cap).
+    ///
+    /// See
+    /// [`validate_task_comm_string`](crate::workload::validate_task_comm_string)
+    /// for the centralized rationale; `name.len()` is the BYTE
+    /// length (UTF-8 multi-byte chars count as their byte width).
     #[must_use = "builder methods consume self; bind the result"]
     pub fn comm(mut self, name: impl Into<std::borrow::Cow<'static, str>>) -> Self {
-        self.default_comm = Some(name.into());
+        let name: std::borrow::Cow<'static, str> = name.into();
+        crate::workload::validate_task_comm_string("CgroupDef::comm", &name);
+        self.default_comm = Some(name);
         self
     }
 
@@ -447,8 +470,10 @@ impl CgroupDef {
     /// `works` list pushes a default WorkSpec carrying the value.
     ///
     /// The pcomm string is applied via `prctl(PR_SET_NAME)` on
-    /// the forked thread-group leader (the kernel truncates to
-    /// `TASK_COMM_LEN - 1 = 15` bytes inside `__set_task_comm`).
+    /// the forked thread-group leader. The builder rejects > 15
+    /// bytes (TASK_COMM_LEN-1) at construction so the
+    /// `task->group_leader->comm == pcomm` invariant the framework
+    /// relies on holds exactly.
     /// Setting this triggers the fork-then-thread spawn path in
     /// `apply_setup`: WorkSpecs sharing a `pcomm` value coalesce
     /// into ONE thread-group leader per group; every worker
@@ -476,9 +501,27 @@ impl CgroupDef {
     /// coalescing contract for the empty-works case (the synthesised
     /// `WorkSpec::default()` would have to carry the pcomm without
     /// distinguishing "default" from "explicit override").
+    ///
+    /// # Panics
+    ///
+    /// Panics on programmer-error inputs — mirrors
+    /// [`crate::workload::WorkSpec::pcomm`]'s `# Panics`:
+    /// - Empty string.
+    /// - Interior NUL byte.
+    /// - More than 15 bytes (`TASK_COMM_LEN - 1` cap).
+    ///
+    /// See
+    /// [`validate_task_comm_string`](crate::workload::validate_task_comm_string)
+    /// for the centralized rationale; `name.len()` is the BYTE
+    /// length (UTF-8 multi-byte chars count as their byte width).
     #[must_use = "builder methods consume self; bind the result"]
     pub fn pcomm(mut self, name: impl Into<Cow<'static, str>>) -> Self {
         let name: Cow<'static, str> = name.into();
+        // Validate ONCE before the in-place loop so a bad input
+        // never partially writes the `works` vec — the per-builder
+        // assert fires with a single named site rather than firing
+        // mid-mutation across N entries.
+        crate::workload::validate_task_comm_string("CgroupDef::pcomm", &name);
         if self.works.is_empty() {
             self.works.push(WorkSpec::default());
         }
@@ -817,3 +860,72 @@ impl CgroupDef {
 // the spread-default warning. The compile-time pin of the absence
 // lives in the `#[cfg(test)]` mod below (`assert_not_impl_default!`
 // from `src/test_macros.rs`).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    assert_not_impl_default!(CgroupDef);
+
+    #[test]
+    #[should_panic(expected = "CgroupDef::comm: empty string rejected")]
+    fn cgroup_def_comm_rejects_empty() {
+        let _ = CgroupDef::named("cg").comm("");
+    }
+
+    #[test]
+    #[should_panic(expected = "interior NUL byte")]
+    fn cgroup_def_comm_rejects_interior_nul() {
+        let _ = CgroupDef::named("cg").comm("foo\0bar");
+    }
+
+    /// Pins the validate-on-builder contract: CgroupDef::pcomm
+    /// previously wrote `w.pcomm = Some(...)` directly, bypassing
+    /// WorkSpec::pcomm's asserts. Both builders now route through a
+    /// shared `validate_task_comm_string` helper — this test would
+    /// FAIL the pre-helper implementation and PASS the post-helper
+    /// implementation.
+    #[test]
+    #[should_panic(expected = "CgroupDef::pcomm: empty string rejected")]
+    fn cgroup_def_pcomm_rejects_empty() {
+        let _ = CgroupDef::named("cg").pcomm("");
+    }
+
+    #[test]
+    #[should_panic(expected = "interior NUL byte")]
+    fn cgroup_def_pcomm_rejects_interior_nul() {
+        let _ = CgroupDef::named("cg").pcomm("foo\0bar");
+    }
+
+    /// Per-builder boundary pins: a future refactor that re-routes
+    /// CgroupDef::comm or CgroupDef::pcomm around the shared
+    /// `validate_task_comm_string` helper would surface here even if
+    /// the helper-level tests still pass.
+    #[test]
+    fn cgroup_def_comm_accepts_15_byte_boundary() {
+        let fifteen = "a".repeat(15);
+        let def = CgroupDef::named("cg").comm(fifteen.clone());
+        assert_eq!(def.default_comm.as_deref(), Some(fifteen.as_str()));
+    }
+
+    #[test]
+    #[should_panic(expected = "16 bytes")]
+    fn cgroup_def_comm_rejects_16_byte_overflow() {
+        let _ = CgroupDef::named("cg").comm("a".repeat(16));
+    }
+
+    #[test]
+    fn cgroup_def_pcomm_accepts_15_byte_boundary() {
+        let fifteen = "a".repeat(15);
+        let def = CgroupDef::named("cg").pcomm(fifteen.clone());
+        // pcomm stamps every WorkSpec; default works is one entry.
+        assert_eq!(def.works.len(), 1);
+        assert_eq!(def.works[0].pcomm.as_deref(), Some(fifteen.as_str()));
+    }
+
+    #[test]
+    #[should_panic(expected = "16 bytes")]
+    fn cgroup_def_pcomm_rejects_16_byte_overflow() {
+        let _ = CgroupDef::named("cg").pcomm("a".repeat(16));
+    }
+}

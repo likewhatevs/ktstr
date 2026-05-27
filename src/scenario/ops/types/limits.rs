@@ -274,8 +274,7 @@ pub struct PidsLimits {
 /// IO controller limits (`io.weight`). Per-device throughput caps
 /// (`io.max`) are intentionally not surfaced here — the per-device
 /// interface needs major:minor device-id lookup which has no
-/// in-tree consumer; surface it as a follow-up task when a
-/// concrete use case lands.
+/// in-tree consumer; surface it when a concrete use case lands.
 ///
 /// Set via [`CgroupDef::io_weight`]. Construct directly only when
 /// copying an [`IoLimits`] across [`CgroupDef`]s — the builder

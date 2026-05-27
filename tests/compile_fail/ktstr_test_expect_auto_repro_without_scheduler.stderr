@@ -1,0 +1,7 @@
+error: expect_auto_repro = true requires a scheduler — the auto-repro path re-launches the failing scheduler in a second VM. Without a scheduler attribute, there is nothing to relaunch and the assertion could never be satisfied. Add a scheduler = ... attribute or drop expect_auto_repro = true.
+ --> tests/compile_fail/ktstr_test_expect_auto_repro_without_scheduler.rs:7:1
+  |
+7 | #[ktstr_test(wprof, expect_auto_repro)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)

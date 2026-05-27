@@ -369,8 +369,7 @@ mod tests {
     /// [`SnapshotError::PlaceholderSample`] — NOT
     /// `HostFieldUnavailable`. Mirrors the [`SampleSeries::bpf`]
     /// placeholder-gate pattern so temporal-assertion sites route
-    /// placeholders through their per-sample skip handling (cleaner
-    /// F2 fold-in 2026-05-17).
+    /// placeholders through their per-sample skip handling.
     #[test]
     fn series_host_per_cpu_field_u64_placeholder_surfaces_placeholder_sample_variant() {
         let mk = |val: u64| FailureDumpReport {
@@ -444,8 +443,7 @@ mod tests {
     /// (sample A: cpus 0,1; sample B: cpus 1,2; sample C: cpus 0,2).
     /// Pins the BTreeSet-dedup union from `cpus()` AND per-CPU
     /// filtering in `per_cpu_time_timeline` AND mixed Ok/Err
-    /// pattern in `per_cpu_field_u64` simultaneously. Tester T7
-    /// fold-in 2026-05-17.
+    /// pattern in `per_cpu_field_u64` simultaneously.
     #[test]
     fn series_host_interleaved_multi_cpu_multi_sample_coverage() {
         let mk = |cpus: &[(u32, u64)]| FailureDumpReport {
@@ -510,7 +508,7 @@ mod tests {
     /// `cpus()` is sorted ascending (BTreeSet semantic) regardless
     /// of per_cpu_time insertion order. Pins against a regression
     /// that switched BTreeSet → HashSet → Vec without an explicit
-    /// sort step. Tester T8 fold-in 2026-05-17.
+    /// sort step.
     #[test]
     fn series_host_cpus_sorted_ascending_independent_of_insertion_order() {
         let report = FailureDumpReport {

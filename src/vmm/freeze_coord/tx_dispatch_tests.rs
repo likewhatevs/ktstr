@@ -13,34 +13,34 @@
 //! clause fails here.
 //!
 //! Coverage map:
-//!   * T1 — unknown msg_type lands in the `None` arm (no
+//!   * Unknown msg_type lands in the `None` arm (no
 //!     bucket emission).
-//!   * T2 — CRC-bad SCHED_EXIT must NOT bucket. Pins the
+//!   * CRC-bad SCHED_EXIT must NOT bucket. Pins the
 //!     dispatch-site gate that prevents a torn or hostile-guest
 //!     SchedExit from surfacing as a phantom verdict entry —
 //!     no downstream consumer filters SchedExit on `crc_ok`.
-//!   * T3 — guest-stamped SNAPSHOT_REPLY on TX must NOT
+//!   * Guest-stamped SNAPSHOT_REPLY on TX must NOT
 //!     bucket. Replies are host→guest only; the
 //!     `is_coordinator_internal` classifier lists
 //!     `MsgType::SnapshotReply` so the dispatch routes through
 //!     the `Some(_)` drop arm.
-//!   * T4 — SYS_RDY with non-empty payload must NOT promote
+//!   * SYS_RDY with non-empty payload must NOT promote
 //!     (shape gate). A hostile guest tacking bytes onto a
 //!     SYS_RDY would otherwise smuggle data past the
 //!     coordinator-internal filter; the
 //!     `&& msg.payload.is_empty()` clause is the safety net.
-//!   * T5 — fire-once across HostAssembler::feed boundaries.
+//!   * Fire-once across HostAssembler::feed boundaries.
 //!     Existing tests pin fire-once within one feed; this test
 //!     calls feed twice with two separate SYS_RDY frames and
 //!     asserts only the first promotes.
-//!   * T6 — interleaved batch (SYS_RDY + SCHED_EXIT +
+//!   * Interleaved batch (SYS_RDY + SCHED_EXIT +
 //!     SNAPSHOT_REQUEST + STIMULUS) — every gate fires
 //!     independently and the bucket reflects exactly the
 //!     non-coordinator-internal verdict-bearing entries.
-//!   * T7 — empty bucket short-circuit. A SYS_RDY-only batch
+//!   * Empty bucket short-circuit. A SYS_RDY-only batch
 //!     produces an empty bucket; pinning the post-condition
 //!     keeps the production short-circuit honest.
-//!   * T8 — multiple CRC-valid SCHED_EXIT frames pump kill_evt
+//!   * Multiple CRC-valid SCHED_EXIT frames pump kill_evt
 //!     by 1 per frame (EFD_NONBLOCK accumulation). Pinning the
 //!     count keeps a future "promote-once" optimisation from
 //!     silently changing the wakeup-edge contract.
@@ -207,7 +207,7 @@ fn snapshot_request_bytes(request_id: u32, kind: u32, tag: &str) -> Vec<u8> {
     .to_vec()
 }
 
-/// T1 — Unknown msg_type lands in the `None` arm and DOES
+/// Unknown msg_type lands in the `None` arm and DOES
 /// NOT emit a bucket entry. The dispatch is exhaustive
 /// precisely so a future guest stamping a tag the host
 /// doesn't recognise is surfaced via warn-log rather than
@@ -239,7 +239,7 @@ fn unknown_msg_type_drops_without_bucketing() {
     );
 }
 
-/// T2 — CRC-bad SCHED_EXIT must NOT bucket. Without the
+/// CRC-bad SCHED_EXIT must NOT bucket. Without the
 /// `if msg.crc_ok` gate at the bucket-push site, a torn or
 /// hostile-guest SCHED_EXIT would surface in
 /// `BulkDrainResult.entries` with `crc_ok=false`. No
@@ -275,7 +275,7 @@ fn sched_exit_torn_crc_does_not_bucket() {
     );
 }
 
-/// Positive control for T2: CRC-valid SCHED_EXIT bucketed
+/// Positive control: CRC-valid SCHED_EXIT bucketed
 /// exactly once with the original payload and crc_ok=true.
 /// Dropping the bucket entry on the happy path would lose
 /// the scheduler exit-code diagnostic; this test pins that
@@ -302,7 +302,7 @@ fn sched_exit_valid_crc_buckets_with_payload() {
     assert_eq!(out.kill_evt_counter, 1);
 }
 
-/// T3 — Guest-stamped SNAPSHOT_REPLY on TX must NOT
+/// Guest-stamped SNAPSHOT_REPLY on TX must NOT
 /// bucket. Replies are host→guest only — the host emits
 /// them via `queue_input_port1`. A hostile or malformed
 /// guest stamping MSG_TYPE_SNAPSHOT_REPLY on its TX stream
@@ -339,7 +339,7 @@ fn snapshot_reply_on_tx_does_not_bucket() {
     );
 }
 
-/// T4 — CRC-valid SYS_RDY with non-empty payload must NOT
+/// CRC-valid SYS_RDY with non-empty payload must NOT
 /// promote. The strict shape gate `msg.payload.is_empty()`
 /// is the safety net against a hostile guest tacking bytes
 /// onto a SysRdy frame to smuggle data past the
@@ -377,7 +377,7 @@ fn sys_rdy_with_nonempty_payload_does_not_promote() {
     );
 }
 
-/// T5 — Fire-once across feed boundaries. The closure's
+/// Fire-once across feed boundaries. The closure's
 /// `Option::take` lives on the closure scope, not in the
 /// HostAssembler; a fresh `feed` call should not reset the
 /// one-shot. Two SYS_RDY frames published across two TX
@@ -411,7 +411,7 @@ fn sys_rdy_fires_once_across_two_feed_calls() {
     );
 }
 
-/// T6 — Interleaved batch (SYS_RDY + SCHED_EXIT +
+/// Interleaved batch (SYS_RDY + SCHED_EXIT +
 /// SNAPSHOT_REQUEST + STIMULUS in one drain). Every gate
 /// fires independently and the bucket reflects exactly the
 /// non-coordinator-internal verdict-bearing entries
@@ -458,7 +458,7 @@ fn interleaved_batch_dispatches_all_arms_independently() {
     assert!(!bucketed_tags.contains(&MSG_TYPE_SNAPSHOT_REQUEST));
 }
 
-/// T7 — Empty-bucket short-circuit. A SYS_RDY-only batch
+/// Empty-bucket short-circuit. A SYS_RDY-only batch
 /// produces an empty bucket; the production code's
 /// `if !bucket.is_empty()` check at the bucket-flush site
 /// avoids acquiring the shared `bulk_messages` mutex on
@@ -481,7 +481,7 @@ fn sys_rdy_only_batch_yields_empty_bucket() {
     assert_eq!(out.sys_rdy_counter, 1);
 }
 
-/// T8 — Multiple CRC-valid SCHED_EXIT frames in one batch.
+/// Multiple CRC-valid SCHED_EXIT frames in one batch.
 /// The promotion gate fires per-message: every CRC-valid
 /// SchedExit calls `kill_evt.write(1)`, which on
 /// EFD_NONBLOCK (without EFD_SEMAPHORE) accumulates the

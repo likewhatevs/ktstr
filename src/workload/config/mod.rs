@@ -27,6 +27,7 @@ mod workload;
 pub use mempolicy::{MemPolicy, MpolFlags};
 pub use sched::{AluWidth, FutexLockMode, SchedClass, SchedPolicy, WakeMechanism};
 pub use work::WorkSpec;
+pub(crate) use work::validate_task_comm_string;
 pub use workload::WorkloadConfig;
 
 /// Serde helper for [`std::time::Duration`] using human-readable

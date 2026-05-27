@@ -352,8 +352,8 @@ fn aggregate_finite(
 ///
 /// `samples` are the per-Sample readings of `metric` collected
 /// over one phase's window of
-/// [`crate::scenario::sample::Sample`]s via the upcoming
-/// `MetricDef::read_sample` (lands in a follow-up commit).
+/// [`crate::scenario::sample::Sample`]s via `MetricDef::read_sample`
+/// once that helper is wired through.
 /// Returns `None` when every reading was `None` / `NaN`.
 ///
 /// Live caller: [`crate::assert::build_phase_buckets`] folds
@@ -5985,9 +5985,9 @@ mod tests {
 
     /// `sidecar_to_row` must copy `SidecarResult::project_commit`
     /// into `GauntletRow::commit` verbatim so the typed
-    /// `--project-commit` filter and the upcoming `--a-project-commit` /
-    /// `--b-project-commit` slicers see the value the sidecar writer
-    /// recorded. A regression that left the field at the
+    /// `--project-commit` filter (and any sibling slicers added
+    /// later) see the value the sidecar writer recorded. A
+    /// regression that left the field at the
     /// `Option::default()` (`None`) would silently drop the
     /// commit dimension from every comparison even when the
     /// sidecar had a populated value. Pinned for `None`, clean

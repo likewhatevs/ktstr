@@ -252,12 +252,21 @@ impl<'a> PayloadRun<'a> {
     pub fn run(self) -> Result<(AssertResult, PayloadMetrics)> {
         let binary = payload_binary(self.payload)?;
         let cgroup_path = resolve_cgroup_path(self.ctx, self.cgroup.as_deref(), "PayloadRun::run")?;
+        let cgroup_arg: Option<(&str, &std::path::Path)> = cgroup_path.as_deref().map(|path| {
+            (
+                self.cgroup
+                    .as_deref()
+                    .expect("cgroup_path Some ⇒ cgroup name Some"),
+                path,
+            )
+        });
         let output = spawn_and_wait(
             binary,
             &self.args,
-            cgroup_path.as_deref(),
+            cgroup_arg,
             self.timeout,
             self.payload.uses_parent_pgrp,
+            self.ctx.cgroups,
         )
         .with_context(|| format!("spawn payload '{}'", self.payload.name))?;
         Ok(evaluate(self.payload, &self.checks, output))
@@ -281,11 +290,20 @@ impl<'a> PayloadRun<'a> {
         let binary = payload_binary(self.payload)?;
         let cgroup_path =
             resolve_cgroup_path(self.ctx, self.cgroup.as_deref(), "PayloadRun::spawn")?;
+        let cgroup_arg: Option<(&str, &std::path::Path)> = cgroup_path.as_deref().map(|path| {
+            (
+                self.cgroup
+                    .as_deref()
+                    .expect("cgroup_path Some ⇒ cgroup name Some"),
+                path,
+            )
+        });
         let (child, sigchld) = spawn_child(
             binary,
             &self.args,
-            cgroup_path.as_deref(),
+            cgroup_arg,
             self.payload.uses_parent_pgrp,
+            self.ctx.cgroups,
         )
         .with_context(|| format!("spawn payload '{}'", self.payload.name))?;
         Ok(PayloadHandle {
@@ -1277,11 +1295,11 @@ struct SpawnOutput {
 /// - A leading `/` is tolerated and stripped so `"/workload"` and
 ///   `"workload"` behave identically.
 /// - NUL bytes are rejected — a resolved path with an interior
-///   NUL would truncate inside any `libc` layer that handles it,
-///   and even though the parent-side `std::fs::OpenOptions::open`
-///   used by [`spawn_with_cgroup_sync`] rejects NUL-bearing
-///   paths, catching the bad name up-front gives a clearer
-///   diagnostic than the underlying `open` error.
+///   NUL would truncate inside any `libc` layer that handles it.
+///   The downstream cgroupfs write in
+///   [`crate::cgroup::CgroupOps::place_task_during_handshake`]
+///   would also reject the bad name, but catching it up-front
+///   gives a clearer diagnostic than the underlying write error.
 /// - Any `..` component is rejected to prevent the name from
 ///   escaping the parent cgroup.
 /// - Empty names (or names that strip to empty) are rejected so a
@@ -1320,20 +1338,24 @@ fn resolve_cgroup_path(
 /// `process_group(0)` request when the payload is not
 /// `uses_parent_pgrp`, and (optionally) a cgroup-placement
 /// pre_exec hook that BLOCKS the child on a read from a
-/// caller-owned release pipe until the parent has written the
-/// child's pid to the target `cgroup.procs` via stdlib I/O.
+/// caller-owned release pipe until the parent has placed the
+/// child into the target cgroup via
+/// [`crate::cgroup::CgroupOps::place_task_during_handshake`].
 ///
-/// When `cgroup_path` is `Some`, the returned tuple's second
-/// element is `Some(CgroupSyncHandles)` — a parent-side bundle
-/// of (a) the write end of the release pipe, (b) the read end
-/// of the child-side pid-notify pipe, and (c) the
-/// `cgroup.procs` path. The caller passes it to
+/// When `cgroup` is `Some((name, path))`, the returned tuple's
+/// second element is `Some(CgroupSyncHandles)` — a parent-side
+/// bundle of (a) the write end of the release pipe, (b) the read
+/// end of the child-side pid-notify pipe, (c) the user-facing
+/// `cgroup_name` the placement trait method will receive, and
+/// (d) the absolute `cgroup.procs` path retained for diagnostic
+/// surfaces. The caller passes it to
 /// [`spawn_with_cgroup_sync`], which drives the placement
-/// protocol by reading the child pid, writing it to
-/// `cgroup.procs`, then releasing the child via a single-byte
-/// write on the release pipe.
+/// protocol by reading the child pid, calling
+/// `cgroup_ops.place_task_during_handshake(cgroup_name, child_pid)`,
+/// then releasing the child via a single-byte write on the
+/// release pipe.
 ///
-/// When `cgroup_path` is `None`, the returned handle is `None`
+/// When `cgroup` is `None`, the returned handle is `None`
 /// and callers may invoke `Command::spawn()` on the returned
 /// `Command` directly — no placement protocol is required and
 /// the child's cgroup is inherited from the parent (the ktstr
@@ -1343,7 +1365,7 @@ fn resolve_cgroup_path(
 fn build_command(
     binary: &str,
     args: &[String],
-    cgroup_path: Option<&std::path::Path>,
+    cgroup: Option<(&str, &std::path::Path)>,
     uses_parent_pgrp: bool,
 ) -> Result<(std::process::Command, Option<CgroupSyncHandles>)> {
     use std::os::unix::process::CommandExt;
@@ -1392,10 +1414,11 @@ fn build_command(
         cmd.process_group(0);
     }
 
-    if let Some(cgroup_path) = cgroup_path {
+    if let Some((cgroup_name, cgroup_path)) = cgroup {
         // Two-pipe cgroup-placement handshake. `notify_*` carries
         // the child's pid from its pre_exec hook up to the parent
-        // so the parent can address the `cgroup.procs` write
+        // so the parent can dispatch the placement call via
+        // [`crate::cgroup::CgroupOps::place_task_during_handshake`]
         // (`Command::spawn()` blocks on the stdlib CLOEXEC status
         // pipe until the child execve's, so the pid from
         // `Child::id()` is NOT available to the parent in time).
@@ -1446,6 +1469,7 @@ fn build_command(
         let handles = CgroupSyncHandles {
             notify,
             release,
+            cgroup_name: cgroup_name.to_string(),
             cgroup_procs_path: cgroup_path.join("cgroup.procs"),
         };
         return Ok((cmd, Some(handles)));
@@ -1509,11 +1533,23 @@ impl PipePair {
 /// once the cgroup-placement update is committed; the child's
 /// pre_exec blocks on a read of the read end.
 ///
+/// `cgroup_name` — the user-facing cgroup name the test author
+/// passed in `Op::RunPayload { cgroup: Some(name), .. }` or
+/// `PayloadRun::in_cgroup(name)`. Threaded to
+/// [`crate::cgroup::CgroupOps::place_task_during_handshake`]
+/// at placement time so the trait implementation derives the
+/// cgroup.procs path from its own parent-path knowledge, keeping
+/// the host-side mock observable without touching cgroupfs.
+///
 /// `cgroup_procs_path` — the absolute `<cgroup>/cgroup.procs`
-/// path the parent writes the child pid to.
+/// path, retained for diagnostic surfaces (the path appears in
+/// trait-method `with_context` error messages so a failing
+/// placement still names the exact filesystem path that didn't
+/// accept the write).
 struct CgroupSyncHandles {
     notify: PipePair,
     release: PipePair,
+    cgroup_name: String,
     cgroup_procs_path: PathBuf,
 }
 
@@ -1699,13 +1735,17 @@ fn cgroup_sync_pre_exec(
 ///
 /// Protocol (parent side, main thread):
 /// 1. Read the child's pid bytes from the notify read end.
-/// 2. Open `cgroup.procs` via stdlib (`std::fs::OpenOptions`)
-///    and write the pid's ASCII form plus trailing LF — the
-///    cgroupfs writer accepts either form but many downstream
-///    tools expect LF-terminated decimal. This runs on the
-///    parent (which is ALREADY past `fork(2)` on the main
-///    thread; no AS-safety constraint applies to stdlib paths
-///    that run here).
+/// 2. Dispatch placement via
+///    [`crate::cgroup::CgroupOps::place_task_during_handshake`],
+///    threading the user-facing `cgroup_name` and the just-read
+///    child pid. The trait implementation
+///    ([`crate::cgroup::CgroupManager::place_task_during_handshake`]
+///    in production) derives the `cgroup.procs` path from its own
+///    parent-path knowledge and performs the write under the same
+///    `write_with_timeout` shape as the other cgroupfs writes;
+///    `MockCgroupOps` records the call without touching the
+///    filesystem so handler-level tests can observe placement
+///    against `Op::RunPayload { cgroup: Some(..), .. }`.
 /// 3. Write the single release byte to the release write end,
 ///    then close it so any subsequent short-read / EOF on the
 ///    child side is prompt.
@@ -1714,14 +1754,20 @@ fn cgroup_sync_pre_exec(
 /// The function returns the child pid so callers can cross-check
 /// it against `Child::id()` once the spawn thread returns.
 /// Wrapped in `Result<libc::pid_t>` because the notify read or
-/// the cgroup.procs open/write can fail; a failure drops the
+/// the placement trait call can fail; a failure drops the
 /// handle, which also closes the release write end, giving the
-/// child's pre_exec a fast EOF-driven bail.
-fn spawn_with_cgroup_sync(handles: CgroupSyncHandles) -> Result<libc::pid_t> {
+/// child's pre_exec a fast EOF-driven bail (the trait contract
+/// pins this responsibility on the caller — see
+/// [`crate::cgroup::CgroupOps::place_task_during_handshake`]).
+fn spawn_with_cgroup_sync(
+    handles: CgroupSyncHandles,
+    cgroup_ops: &dyn crate::cgroup::CgroupOps,
+) -> Result<libc::pid_t> {
     use std::io::{Read, Write};
     let CgroupSyncHandles {
         notify,
         release,
+        cgroup_name,
         cgroup_procs_path,
     } = handles;
     // Step 1: read child pid. Keep the parent-side notify_w
@@ -1802,24 +1848,26 @@ fn spawn_with_cgroup_sync(handles: CgroupSyncHandles) -> Result<libc::pid_t> {
          handshake rather than write a bad value to cgroup.procs"
     );
 
-    // Step 2: write pid to cgroup.procs. Stdlib open+write — safe
-    // because we are on the parent's main thread post-fork, not in
-    // a pre_exec context. The payload is LF-terminated decimal so
-    // cgroup_procs_write accepts it regardless of whether the
-    // kernel kstrtoint or token-parse path is in effect.
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&cgroup_procs_path)
+    // Step 2: dispatch placement through the CgroupOps trait so
+    // the production write goes through `CgroupManager` and the
+    // test path's `MockCgroupOps` records the placement for
+    // handler-level observability. The trait implementation
+    // derives the cgroup.procs path from its own parent-path
+    // knowledge; `cgroup_procs_path` is held alongside
+    // `cgroup_name` purely so the error chain still names the
+    // path that didn't accept the write. We are on the parent's
+    // main thread post-fork — no AS-safety constraint applies,
+    // so the trait dispatch's heap allocations and anyhow error
+    // chain are fair game (pre_exec runs on the CHILD side and
+    // never reaches this branch).
+    cgroup_ops
+        .place_task_during_handshake(&cgroup_name, child_pid)
         .with_context(|| {
             format!(
-                "open cgroup.procs at {} for cgroup-sync placement",
+                "place pid {child_pid} into cgroup '{cgroup_name}' (cgroup.procs at {}) for cgroup-sync placement",
                 cgroup_procs_path.display(),
             )
         })?;
-    let line = format!("{child_pid}\n");
-    f.write_all(line.as_bytes())
-        .with_context(|| format!("write pid {child_pid} to {}", cgroup_procs_path.display(),))?;
-    drop(f);
 
     // Step 3: release the child. One byte is enough; the content
     // is ignored by the reader.
@@ -1856,6 +1904,7 @@ fn drive_cgroup_handshake(
     cmd: std::process::Command,
     handles: CgroupSyncHandles,
     binary: &str,
+    cgroup_ops: &dyn crate::cgroup::CgroupOps,
 ) -> Result<std::process::Child> {
     // Move the Command into a thread so its blocking `spawn()`
     // doesn't deadlock with the child's pre_exec handshake.
@@ -1871,7 +1920,7 @@ fn drive_cgroup_handshake(
     // EOF on its release read; the spawn thread will then
     // surface the pre_exec EPIPE through its stdlib error
     // channel.
-    let sync_result = spawn_with_cgroup_sync(handles);
+    let sync_result = spawn_with_cgroup_sync(handles, cgroup_ops);
 
     // Join the spawn thread regardless of sync outcome so a
     // failing handshake does not leak a background std thread.
@@ -2159,14 +2208,15 @@ const _: fn() = || {
 fn spawn_and_wait(
     binary: &str,
     args: &[String],
-    cgroup_path: Option<&std::path::Path>,
+    cgroup: Option<(&str, &std::path::Path)>,
     timeout: Option<Duration>,
     uses_parent_pgrp: bool,
+    cgroup_ops: &dyn crate::cgroup::CgroupOps,
 ) -> Result<SpawnOutput> {
     let _sigchld = SigchldScope::new();
-    let (cmd, sync_handles) = build_command(binary, args, cgroup_path, uses_parent_pgrp)?;
+    let (cmd, sync_handles) = build_command(binary, args, cgroup, uses_parent_pgrp)?;
     let mut child = match sync_handles {
-        Some(handles) => drive_cgroup_handshake(cmd, handles, binary)?,
+        Some(handles) => drive_cgroup_handshake(cmd, handles, binary, cgroup_ops)?,
         None => {
             let mut cmd = cmd;
             cmd.spawn().map_err(|e| spawn_error_context(e, binary))?
@@ -2301,13 +2351,14 @@ fn wait_with_deadline(
 fn spawn_child(
     binary: &str,
     args: &[String],
-    cgroup_path: Option<&std::path::Path>,
+    cgroup: Option<(&str, &std::path::Path)>,
     uses_parent_pgrp: bool,
+    cgroup_ops: &dyn crate::cgroup::CgroupOps,
 ) -> Result<(std::process::Child, SigchldScope)> {
     let sigchld = SigchldScope::new();
-    let (cmd, sync_handles) = build_command(binary, args, cgroup_path, uses_parent_pgrp)?;
+    let (cmd, sync_handles) = build_command(binary, args, cgroup, uses_parent_pgrp)?;
     let child = match sync_handles {
-        Some(handles) => drive_cgroup_handshake(cmd, handles, binary)?,
+        Some(handles) => drive_cgroup_handshake(cmd, handles, binary, cgroup_ops)?,
         None => {
             let mut cmd = cmd;
             cmd.spawn().map_err(|e| spawn_error_context(e, binary))?
@@ -4914,22 +4965,32 @@ mod tests {
         );
     }
 
-    /// When `cgroup_path` is `Some(_)`, `build_command` must
-    /// allocate both pipes and populate the cgroup.procs path.
-    /// The target directory does NOT need to exist at build
-    /// time — the write is deferred to `spawn_with_cgroup_sync`,
-    /// where a missing path surfaces as an actionable "open
-    /// cgroup.procs" error rather than a bail at build.
+    /// When `cgroup` is `Some(_)`, `build_command` must
+    /// allocate both pipes and populate the cgroup.procs path
+    /// plus the cgroup_name passed through. The target directory
+    /// does NOT need to exist at build time — the placement is
+    /// deferred to `spawn_with_cgroup_sync`, where a failure
+    /// surfaces through the [`crate::cgroup::CgroupOps`] trait
+    /// implementation's error context.
     #[test]
     fn build_command_with_cgroup_returns_sync_handles() {
         let fake_cg = std::path::PathBuf::from("/nonexistent/fake-cgroup");
-        let (_cmd, handles) = super::build_command("/bin/true", &[], Some(&fake_cg), false)
-            .expect("build_command must defer cgroup-path validation to sync");
+        let (_cmd, handles) = super::build_command(
+            "/bin/true",
+            &[],
+            Some(("fake-cg", fake_cg.as_path())),
+            false,
+        )
+        .expect("build_command must defer cgroup-path validation to sync");
         let handles = handles.expect("cgroup path ⇒ handles");
         assert_eq!(
             handles.cgroup_procs_path,
             fake_cg.join("cgroup.procs"),
             "handles must carry <cg>/cgroup.procs verbatim",
+        );
+        assert_eq!(
+            handles.cgroup_name, "fake-cg",
+            "handles must carry the user-facing cgroup name verbatim",
         );
         // Both pipes must have valid fds on both ends (pipe2
         // succeeded).
@@ -4990,12 +5051,17 @@ mod tests {
         use std::io::Read;
         use std::os::fd::FromRawFd;
 
-        // Stand-in for cgroup.procs in a temp dir.
-        let tmp_dir = std::env::temp_dir().join(format!("ktstr-cgroup-sync-test-{}", unsafe {
+        // Stand-in for cgroup.procs in a temp dir. The CgroupManager
+        // points at `parent_dir`; the cgroup_name is `cg_leaf`, so
+        // the trait derives `parent_dir/cg_leaf/cgroup.procs` =
+        // `procs_path` — matches the real production resolution.
+        let parent_dir = std::env::temp_dir().join(format!("ktstr-cgroup-sync-test-{}", unsafe {
             libc::getpid()
         }));
-        std::fs::create_dir_all(&tmp_dir).unwrap();
-        let procs_path = tmp_dir.join("cgroup.procs");
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        let leaf_dir = parent_dir.join("cg_leaf");
+        std::fs::create_dir_all(&leaf_dir).unwrap();
+        let procs_path = leaf_dir.join("cgroup.procs");
         std::fs::write(&procs_path, b"").unwrap();
 
         // Allocate two pipe pairs — one notify, one release.
@@ -5054,11 +5120,17 @@ mod tests {
                 },
                 write_fd: release_w,
             },
+            cgroup_name: "cg_leaf".to_string(),
             cgroup_procs_path: procs_path.clone(),
         };
 
+        // CgroupManager.parent_path = parent_dir, so
+        // place_task_during_handshake("cg_leaf", pid) targets
+        // parent_dir/cg_leaf/cgroup.procs = procs_path.
+        let mgr = crate::cgroup::CgroupManager::new(parent_dir.to_str().unwrap());
+
         // Drive the handshake on the main thread.
-        let returned_pid = super::spawn_with_cgroup_sync(handles).unwrap();
+        let returned_pid = super::spawn_with_cgroup_sync(handles, &mgr).unwrap();
         assert_eq!(
             returned_pid, child_pid,
             "spawn_with_cgroup_sync must return the pid it read \
@@ -5072,7 +5144,8 @@ mod tests {
             .expect("child thread completes after release");
 
         // The temp cgroup.procs file must now contain the pid
-        // followed by a newline.
+        // followed by a newline (`CgroupManager::place_task_during_handshake`
+        // writes the same `<pid>\n` shape the bare-stdlib path used).
         let written = std::fs::read_to_string(&procs_path).unwrap();
         assert_eq!(
             written,
@@ -5083,20 +5156,22 @@ mod tests {
 
         // Cleanup.
         let _ = std::fs::remove_file(&procs_path);
-        let _ = std::fs::remove_dir(&tmp_dir);
+        let _ = std::fs::remove_dir(&leaf_dir);
+        let _ = std::fs::remove_dir(&parent_dir);
     }
 
-    /// Failure shape: if the cgroup.procs path cannot be opened
-    /// (parent dir missing), the handshake surfaces an error
-    /// that names the path. The child thread must NOT hang —
-    /// it receives EOF on its release read because the
-    /// handles (carrying the release write end) are dropped on
-    /// the error path.
+    /// Failure shape: if the placement trait call cannot reach the
+    /// target cgroup (parent dir missing), the handshake surfaces
+    /// an error that names both the cgroup_name the trait received
+    /// AND the absolute cgroup.procs path the implementation
+    /// derived. The child thread must NOT hang — it receives EOF
+    /// on its release read because the handles (carrying the
+    /// release write end) are dropped on the error path.
     #[test]
     fn spawn_with_cgroup_sync_errors_on_missing_cgroup_procs_path() {
         use std::os::fd::FromRawFd;
-        let missing_path =
-            std::path::PathBuf::from("/nonexistent/dir/that/does/not/exist/cgroup.procs");
+        let missing_parent = std::path::PathBuf::from("/nonexistent/dir/that/does/not/exist");
+        let missing_path = missing_parent.join("missing-cg").join("cgroup.procs");
 
         let notify = super::PipePair::new().unwrap();
         let release = super::PipePair::new().unwrap();
@@ -5143,14 +5218,16 @@ mod tests {
                 },
                 write_fd: release_w,
             },
+            cgroup_name: "missing-cg".to_string(),
             cgroup_procs_path: missing_path.clone(),
         };
 
-        let err = super::spawn_with_cgroup_sync(handles).unwrap_err();
+        let mgr = crate::cgroup::CgroupManager::new(missing_parent.to_str().unwrap());
+        let err = super::spawn_with_cgroup_sync(handles, &mgr).unwrap_err();
         let rendered = format!("{err:#}");
         assert!(
-            rendered.contains("open cgroup.procs"),
-            "error must name the open step: {rendered}",
+            rendered.contains("missing-cg"),
+            "error must name the user-facing cgroup name: {rendered}",
         );
         assert!(
             rendered.contains("/nonexistent/dir/that/does/not/exist"),
@@ -5198,10 +5275,11 @@ mod tests {
         use std::sync::mpsc;
 
         // Pick a path that cannot possibly open — including a
-        // guaranteed-missing parent dir so the open step fails
-        // hard in `drive_cgroup_handshake`.
-        let missing_cgroup =
-            std::path::PathBuf::from("/nonexistent/ktstr-cgroup-sync-deadlock-guard");
+        // guaranteed-missing parent dir so the placement step
+        // fails hard in `drive_cgroup_handshake`.
+        let missing_parent =
+            std::path::PathBuf::from("/nonexistent/ktstr-cgroup-sync-deadlock-parent");
+        let missing_cgroup = missing_parent.join("deadlock-guard");
 
         // Run the whole exercise in a worker thread so the test
         // driver can time-box it: if the child's release read
@@ -5209,19 +5287,28 @@ mod tests {
         // thread rather than hang the test harness.
         let (tx, rx) = mpsc::channel::<anyhow::Result<()>>();
         let worker = std::thread::spawn(move || {
-            let (cmd, handles) =
-                super::build_command("/bin/true", &[], Some(&missing_cgroup), false)
-                    .expect("build_command");
-            let handles = handles.expect("handles present when cgroup_path is Some");
-            let result = super::drive_cgroup_handshake(cmd, handles, "/bin/true");
+            let (cmd, handles) = super::build_command(
+                "/bin/true",
+                &[],
+                Some(("deadlock-guard", missing_cgroup.as_path())),
+                false,
+            )
+            .expect("build_command");
+            let handles = handles.expect("handles present when cgroup is Some");
+            // CgroupManager whose `parent` does not exist, so
+            // `place_task_during_handshake` will fail on the
+            // bare `<missing>/<cg>/cgroup.procs` write — the
+            // same failure shape the deadlock guard targets.
+            let mgr = crate::cgroup::CgroupManager::new(missing_parent.to_str().unwrap());
+            let result = super::drive_cgroup_handshake(cmd, handles, "/bin/true", &mgr);
             // drive_cgroup_handshake must surface an error
-            // (the cgroup-path open failed) — if it succeeds
+            // (the placement write failed) — if it succeeds
             // that's also a correctness violation because the
             // target directory does not exist.
             let err = result.expect_err("handshake against nonexistent cgroup.procs must Err");
             let rendered = format!("{err:#}");
             assert!(
-                rendered.contains("open cgroup.procs") || rendered.contains("cgroup.procs"),
+                rendered.contains("cgroup.procs") || rendered.contains("deadlock-guard"),
                 "handshake error must name the failing step: {rendered}",
             );
             let _ = tx.send(Ok(()));

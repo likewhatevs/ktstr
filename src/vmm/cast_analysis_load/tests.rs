@@ -865,7 +865,7 @@ fn exit_insn() -> BpfInsn {
     BpfInsn::new(OP_JMP_EXIT, 0, 0, 0, 0)
 }
 
-/// `BPF_ADDR_SPACE_CAST` for the F1 mitigation: ALU64 | MOV | X
+/// `BPF_ADDR_SPACE_CAST` for the arena-evidence mitigation: ALU64 | MOV | X
 /// with `off=1, imm=1` is the as(1)→as(0) (arena→kernel) cast
 /// the analyzer treats as `arena_confirmed` evidence on the
 /// source's `(struct, field_offset)` slot.
@@ -1241,8 +1241,8 @@ fn analyze_one_object_recovers_arena_cast_end_to_end() {
     let btf_blob = build_btf_full(&types, &strings);
     // r2 = *(u64 *)(r1 + 8); r2 = arena_cast(r2);
     // r3 = *(u64 *)(r2 + 0); exit.
-    // The arena_cast adds (T, 8) to arena_confirmed (F1
-    // mitigation prerequisite for the shape-inference finding).
+    // The arena_cast adds (T, 8) to arena_confirmed (arena-evidence
+    // prerequisite for the shape-inference finding).
     let insns = vec![
         ldx_dw_mem(2, 1, 8),
         addr_space_cast_insn(2, 2),
@@ -1363,7 +1363,7 @@ fn cached_cast_analysis_recovers_arena_cast_end_to_end() {
         },
     ];
     let btf_blob = build_btf_full(&types, &strings);
-    // F1 mitigation: include arena_space_cast on r2 so the
+    // Arena-evidence mitigation: include arena_space_cast on r2 so the
     // shape-inference finding emits.
     let insns = vec![
         ldx_dw_mem(2, 1, 8),
@@ -1454,7 +1454,7 @@ fn build_recovers_arena_cast_outer_elf() -> Vec<u8> {
         },
     ];
     let btf_blob = build_btf_full(&types, &strings);
-    // F1 mitigation: include arena_space_cast on r2 so the
+    // Arena-evidence mitigation: include arena_space_cast on r2 so the
     // shape-inference finding emits.
     let insns = vec![
         ldx_dw_mem(2, 1, 8),
@@ -3632,7 +3632,7 @@ fn build_fwd_index_skips_anonymous_structs() {
     );
 }
 
-/// PhD-F gap G1: cross-BTF Fwd resolution — `BTF_KIND_FWD` entries
+/// Cross-BTF Fwd resolution — `BTF_KIND_FWD` entries
 /// must not register in the index even when no complete body
 /// shares the name. The renderer's chase consults the index to
 /// resolve a Fwd terminal to a complete sibling; a Fwd-keyed
@@ -3729,7 +3729,7 @@ fn build_fwd_index_skips_fwd_when_complete_body_in_later_btf() {
     );
 }
 
-/// PhD-F gap G1: a `BTF_KIND_FWD` with `name_off = 0` (no name in
+/// A `BTF_KIND_FWD` with `name_off = 0` (no name in
 /// the strtab) must be silently skipped without panicking the
 /// id-space walk. The btf-rs parser only registers names when
 /// `name_off > 0` (see obj.rs `if bt.name_off > 0`), so the type

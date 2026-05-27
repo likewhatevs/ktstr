@@ -42,11 +42,11 @@ use ktstr::worker_ready_wait::wait_for_worker_ready;
 fn set_probe_binary_env_var() {
     unsafe {
         std::env::set_var(
-            "KTSTR_JEMALLOC_PROBE_BINARY",
+            ::ktstr::KTSTR_JEMALLOC_PROBE_BINARY_ENV,
             env!("CARGO_BIN_EXE_ktstr-jemalloc-probe"),
         );
         std::env::set_var(
-            "KTSTR_JEMALLOC_ALLOC_WORKER_BINARY",
+            ::ktstr::KTSTR_JEMALLOC_ALLOC_WORKER_BINARY_ENV,
             env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker"),
         );
     }
@@ -351,9 +351,8 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
 /// (no busybox applets packed in). All three branches funnel into
 /// `RunOutcome::Fatal` with exit code 1, so the guarantee tested
 /// here is "probe reports fatal and exits non-zero on an invalid
-/// pid". The two skipped branches are tracked as follow-up tasks
-/// and exercised by unit tests in the probe crate
-/// (`find_jemalloc_via_maps` error paths).
+/// pid". The two skipped branches are exercised by unit tests in
+/// the probe crate (`find_jemalloc_via_maps` error paths).
 #[ktstr_test(llcs = 1, cores = 1, threads = 1)]
 fn jemalloc_probe_fatal_on_nonexistent_pid(ctx: &Ctx) -> Result<AssertResult> {
     let fake_pid: i32 = 999_999_999;

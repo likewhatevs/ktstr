@@ -50,6 +50,7 @@
 // directly (the public path is via `KtstrVmBuilder::disk` plus the
 // `Filesystem` enum), but rustdoc requires the module path to be
 // reachable for the existing intra-doc-links to resolve.
+pub mod blobs;
 pub mod cgroup_sandbox;
 pub mod console;
 pub mod disk_config;
@@ -58,6 +59,7 @@ pub mod host_topology;
 pub mod initramfs;
 pub(crate) mod kvm_stats;
 pub mod topology;
+pub mod wprof;
 
 // `pub(crate) mod` — crate-internal sub-modules.
 pub(crate) mod builder;
@@ -414,8 +416,15 @@ pub struct KtstrVm {
     /// other code path. See the builder field's doc for the full
     /// recursion-break rationale.
     pub(crate) template_staging_image: Option<PathBuf>,
-    /// Embed busybox in the initramfs for shell mode.
-    pub(crate) busybox: bool,
+    /// Busybox bytes packed at `bin/busybox`. `None` skips packing;
+    /// `Some(bytes)` writes the provided bytes. Sourced from
+    /// [`crate::vmm::blobs::load_busybox_bytes`].
+    pub(crate) busybox_bytes: Option<Vec<u8>>,
+    /// wprof binary + args packed at `bin/wprof` and exposed on
+    /// the kernel cmdline (`KTSTR_WPROF_ARGS=…`). `None` skips
+    /// packing — most VMs do not need profiling. See
+    /// [`crate::vmm::wprof::WprofConfig`].
+    pub(crate) wprof: Option<crate::vmm::wprof::WprofConfig>,
     /// Forward COM1 (kernel console) to stderr in real-time during
     /// interactive shell mode. Useful for watching virtio probe and
     /// kernel messages alongside the shell session.
@@ -1592,6 +1601,25 @@ mod tests {
     ///
     #[test]
     fn boot_kernel_with_monitor() {
+        // Skip-ordering: orchestration check fires BEFORE the
+        // coverage-instrumented check below. A non-orchestrated
+        // run can't have meaningful coverage-skip distinction
+        // (operator is skipping the test entirely via the wrong-
+        // runner gate), so surfacing the orchestration-skip first
+        // gives the more-actionable diagnostic. The 4 sibling
+        // vmm-boot tests mirror this ordering.
+        if !crate::test_support::cargo_ktstr_orchestrated() {
+            skip!(
+                "test boots a real KVM VM and depends on cargo-ktstr's VM-test \
+                 concurrency cap to keep KVM page allocation, vCPU thread scheduling, \
+                 and freeze rendezvous timing within budget. Raw `cargo nextest run` \
+                 / `cargo test` fans 7000+ tests at full host parallelism and \
+                 produces a misleading `kill set by AP` failure ~5 s after VM start \
+                 that masks the real cause (resource starvation, not a real bug). \
+                 Run via `cargo ktstr test --kernel ../linux` instead, which sets \
+                 KTSTR_ORCHESTRATED and constrains the per-VM resource budgets."
+            );
+        }
         if crate::test_support::current_binary_is_coverage_instrumented() {
             skip!(
                 "coverage-instrumented `current_exe` used as guest /init trips an \
@@ -1688,6 +1716,9 @@ mod tests {
     /// pre-boot." Probing the latched value directly closes that gap.
     #[test]
     fn monitor_data_valid_latch_records_live_page_offset() {
+        if !crate::test_support::cargo_ktstr_orchestrated() {
+            skip!("{}", crate::test_support::SKIP_NOT_ORCHESTRATED_MSG);
+        }
         if crate::test_support::current_binary_is_coverage_instrumented() {
             skip!(
                 "coverage-instrumented /init AP-kill — see boot_kernel_with_monitor \
@@ -1778,6 +1809,9 @@ mod tests {
     /// only fire on a real run that produced a `MonitorReport`.
     #[test]
     fn sys_rdy_releases_monitor_before_5s_timeout() {
+        if !crate::test_support::cargo_ktstr_orchestrated() {
+            skip!("{}", crate::test_support::SKIP_NOT_ORCHESTRATED_MSG);
+        }
         if crate::test_support::current_binary_is_coverage_instrumented() {
             skip!(
                 "coverage-instrumented /init AP-kill — see boot_kernel_with_monitor \
@@ -1913,6 +1947,9 @@ mod tests {
     ///
     #[test]
     fn first_sample_has_valid_rq_clock_thanks_to_sys_rdy() {
+        if !crate::test_support::cargo_ktstr_orchestrated() {
+            skip!("{}", crate::test_support::SKIP_NOT_ORCHESTRATED_MSG);
+        }
         if crate::test_support::current_binary_is_coverage_instrumented() {
             skip!(
                 "coverage-instrumented /init AP-kill — see boot_kernel_with_monitor \
@@ -2139,6 +2176,9 @@ mod tests {
     ///
     #[test]
     fn sched_domain_data_populated() {
+        if !crate::test_support::cargo_ktstr_orchestrated() {
+            skip!("{}", crate::test_support::SKIP_NOT_ORCHESTRATED_MSG);
+        }
         if crate::test_support::current_binary_is_coverage_instrumented() {
             skip!(
                 "coverage-instrumented /init AP-kill — see boot_kernel_with_monitor \

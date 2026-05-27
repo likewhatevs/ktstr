@@ -209,7 +209,7 @@ fn driver_features_gated_by_status() {
 
 #[test]
 fn features_ok_rejected_without_version_1() {
-    // F7: a guest that fails to negotiate VIRTIO_F_VERSION_1 then
+    // A guest that fails to negotiate VIRTIO_F_VERSION_1 then
     // writes FEATURES_OK MUST get the FAILED bit set, NOT silent
     // acceptance. Without VERSION_1 the wire format would be the
     // legacy 10-byte virtio_net_hdr (no num_buffers); our device
@@ -1103,7 +1103,7 @@ fn unknown_register_write_ignored() {
 }
 
 // ---------------------------------------------------------------------------
-// F4: add_used counter taxonomy
+// add_used counter taxonomy
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1120,7 +1120,7 @@ fn tx_add_used_failures_initially_zero() {
 
 #[test]
 fn tx_add_used_failures_distinct_from_tx_chain_invalid() {
-    // F4: a malformed-chain rejection bumps tx_chain_invalid but
+    // A malformed-chain rejection bumps tx_chain_invalid but
     // NOT tx_add_used_failures. The two counters describe distinct
     // failure modes (chain shape vs queue state) and an operator
     // reading them must see them advance independently.
@@ -1153,12 +1153,12 @@ fn tx_add_used_failures_distinct_from_tx_chain_invalid() {
 }
 
 // ---------------------------------------------------------------------------
-// F7: feature-subset rule on FEATURES_OK
+// feature-subset rule on FEATURES_OK
 // ---------------------------------------------------------------------------
 
 #[test]
 fn features_ok_rejected_when_driver_accepts_unoffered_bit() {
-    // F7 (subset rule, virtio-v1.2 §2.2.1): the driver MUST NOT
+    // Subset rule (virtio-v1.2 §2.2.1): the driver MUST NOT
     // accept any feature bit that the device did not offer. Our
     // device only offers VIRTIO_F_VERSION_1 + VIRTIO_NET_F_MAC.
     // A guest that accepts VIRTIO_NET_F_MQ (=22, not offered)
@@ -1234,12 +1234,12 @@ fn features_ok_accepted_with_only_offered_bits() {
 }
 
 // ---------------------------------------------------------------------------
-// G4: regression test for the GPA-overflow fix (F3)
+// Regression test for the GPA-overflow fix
 // ---------------------------------------------------------------------------
 
 #[test]
 fn tx_chain_with_address_overflow_dropped_gracefully() {
-    // F3 regression guard: a TX descriptor whose `addr + len` would
+    // GPA-overflow regression guard: a TX descriptor whose `addr + len` would
     // overflow `u64` MUST drop the chain rather than panic. Our
     // captured-frame loop's `desc_addr.checked_add(skip as u64)`
     // returns None on overflow; this test wires up a descriptor
@@ -1252,7 +1252,8 @@ fn tx_chain_with_address_overflow_dropped_gracefully() {
     // counter bumped and tx_packets at zero. Without the
     // checked_add fix, this test would have panicked the test
     // thread via .expect(), which Rust's test harness catches and
-    // reports as failure — so a future revert of F3 trips here.
+    // reports as failure — so a future revert of the GPA-overflow
+    // fix trips here.
     let (mem, layout) = build_test_memory();
     let mut dev = VirtioNet::new(NetConfig::default());
     dev.set_mem(mem.clone());
@@ -1290,12 +1291,12 @@ fn tx_chain_with_address_overflow_dropped_gracefully() {
 }
 
 // ---------------------------------------------------------------------------
-// G12: regression test for the DRIVER_OK gate (F1)
+// Regression test for the DRIVER_OK gate
 // ---------------------------------------------------------------------------
 
 #[test]
 fn tx_kick_before_driver_ok_ignored() {
-    // F1 regression guard: a guest that writes QUEUE_NOTIFY before
+    // DRIVER_OK regression guard: a guest that writes QUEUE_NOTIFY before
     // DRIVER_OK has been set MUST be ignored — the device is not
     // yet authorised to process virtqueue requests per virtio-v1.2
     // §2.1.2. Our guard at the top of process_tx_loopback returns

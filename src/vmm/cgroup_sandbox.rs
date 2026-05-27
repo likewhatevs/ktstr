@@ -268,7 +268,18 @@ impl BuildSandbox {
                 return Self::degraded_or_err(SandboxDegraded::NoCgroupV2, hard_error_on_degrade);
             }
         };
-        let cg = CgroupManager::new(parent_str);
+        // Set the walk root to the operator's own cgroup parent so
+        // `CgroupManager::setup` never walks above it. Without the
+        // override, a Mode B/C operator running under
+        // `user.slice`-style delegation would EACCES at the
+        // delegation boundary the moment the build sandbox tried to
+        // write `cgroup.subtree_control` higher in the tree. With
+        // the override, the strip-prefix walk inside
+        // `setup_under_root` short-circuits at `parent_abs` itself
+        // because `parent.strip_prefix(parent) = Ok("")`.
+        let cg = CgroupManager::new(parent_str)
+            .with_walk_root(&parent_abs)
+            .context("build sandbox: pin walk_root to operator's own cgroup parent")?;
 
         // Enable +cpuset on the parent's subtree_control so children
         // inherit the controller. Failure here is a degradation
@@ -1335,6 +1346,16 @@ mod tests {
             self.record(&format!("move_tasks({name})"));
             Ok(())
         }
+        fn place_task_during_handshake(
+            &self,
+            cgroup_name: &str,
+            child_pid: libc::pid_t,
+        ) -> Result<()> {
+            self.record(&format!(
+                "place_task_during_handshake({cgroup_name},{child_pid})"
+            ));
+            Ok(())
+        }
         fn clear_subtree_control(&self, name: &str) -> Result<()> {
             self.record(&format!("clear_subtree_control({name})"));
             Ok(())
@@ -1342,6 +1363,10 @@ mod tests {
         fn drain_tasks(&self, name: &str) -> Result<()> {
             self.record(&format!("drain_tasks({name})"));
             Ok(())
+        }
+        fn read_procs(&self, name: &str) -> Result<Vec<libc::pid_t>> {
+            self.record(&format!("read_procs({name})"));
+            Ok(Vec::new())
         }
         fn cleanup_all(&self) -> Result<()> {
             self.record("cleanup_all");

@@ -1097,14 +1097,14 @@ mod tests {
     // every real per-cgroup or per-task allocator.
     //
     // Per-cgroup arena pointers (cgx_raw, llcx_raw) failing to
-    // chase. Test G1.2 below covers `scx_cgroup_ctx`-style names
-    // matching the `*_ctx` arm; G1.5 covers the per-arm ambiguous
-    // fallback; G1.7 covers the continue-to-next-arm path.
+    // chase. Tests below cover `scx_cgroup_ctx`-style names
+    // matching the `*_ctx` arm, the per-arm ambiguous fallback,
+    // and the continue-to-next-arm path.
     //
     // All three tests use the existing `sdta_*` BTF builder helpers
     // declared above to avoid duplicating wire-format logic.
 
-    /// G1.1: Single size-match resolves cleanly. A BTF with one
+    /// Single size-match resolves cleanly. A BTF with one
     /// 16-byte struct named `cgrp_ctx` and one 8-byte int. Calling
     /// `discover_payload_btf_id(&btf, 16, "")` finds `cgrp_ctx`
     /// as the unique size-match; size_matches.len() == 1 routes to
@@ -1159,7 +1159,7 @@ mod tests {
         );
     }
 
-    /// G1.2: Per-cgroup `scx_cgroup_ctx`-style name resolves via
+    /// Per-cgroup `scx_cgroup_ctx`-style name resolves via
     /// the `*_ctx` suffix arm. With one 16-byte struct named
     /// `scx_cgroup_ctx`, this is also a single size-match — the
     /// test pins that the heuristic accepts the per-cgroup name
@@ -1212,7 +1212,7 @@ mod tests {
         assert_eq!(choice.reason, "");
     }
 
-    /// G1.3: `task_ctx` (exact name) wins over `*_ctx` suffix
+    /// `task_ctx` (exact name) wins over `*_ctx` suffix
     /// when both same-size structs exist. The heuristic at
     /// sdt_alloc.rs:646-651 lists arm 1 (`n == "task_ctx"`)
     /// before arm 4 (`*_ctx` suffix). Pin the priority order so
@@ -1280,7 +1280,7 @@ mod tests {
         assert_eq!(choice.reason, "");
     }
 
-    /// G1.5: Ambiguous at the `*_ctx` suffix arm with no upper-arm
+    /// Ambiguous at the `*_ctx` suffix arm with no upper-arm
     /// resolution. Two structs (`cgrp_ctx` and `task_data_ctx`)
     /// both 16 bytes, neither matching exact `task_ctx`,
     /// `*_arena_ctx`, or `*_task_ctx`. Arm 4 (`*_ctx`) gets 2 hits;
@@ -1358,7 +1358,7 @@ mod tests {
         );
     }
 
-    /// G1.7: Per-arm continue resolves at lower arm. TWO `*_arena_ctx`
+    /// Per-arm continue resolves at lower arm. TWO `*_arena_ctx`
     /// structs (ambiguous at arm 2) AND ONE `*_task_ctx` struct
     /// (unambiguous at arm 3). Per the production code at
     /// sdt_alloc.rs:670-674, arm 2's `_ => continue` advances to

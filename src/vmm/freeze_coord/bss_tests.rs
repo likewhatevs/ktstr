@@ -23,7 +23,7 @@
 //!       and `not_resolved_when_mem_none`
 //!
 //! Cases (d) probe reload mid-run, (e) BTF parse failure, and (g)
-//! sched detach survival are tracked separately:
+//! sched detach survival are not covered here:
 //!   (d) and (g) are scoped under the probe-unload
 //!       invalidation, which is the production fix that lands the
 //!       cached_bss_pa reset wiring; this module covers the

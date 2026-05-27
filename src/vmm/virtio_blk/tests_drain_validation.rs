@@ -859,9 +859,9 @@ fn flush_sync_data_baseline_ok_path() {
 }
 
 /// Validation-before-consumption invariant. Drain the
-/// throttle to 0, submit a sub-sector chain (G5 gate). Pin:
-/// io_errors ticks (gate fires) but throttled_count stays 0
-/// (gate is pre-throttle; tokens NOT consumed).
+/// throttle to 0, submit a sub-sector chain. Pin: io_errors
+/// ticks (gate fires) but throttled_count stays 0 (gate is
+/// pre-throttle; tokens NOT consumed).
 #[test]
 fn validation_gates_do_not_consume_throttle_tokens() {
     let cap = 4096u64;
@@ -900,7 +900,7 @@ fn validation_gates_do_not_consume_throttle_tokens() {
         )),
         RawDescriptor::from(SplitDescriptor::new(
             data_addr.0,
-            513, // sub-sector → G5 gate fires
+            513, // sub-sector → alignment gate fires
             VRING_DESC_F_WRITE as u16,
             0,
         )),
@@ -1146,7 +1146,7 @@ fn event_idx_suppresses_irqfd_when_threshold_unreached() {
         0,
         "interrupt_status bit must be set when chain published",
     );
-    // T-GAP-F: same bit observable through the MMIO surface
+    // Same bit observable through the MMIO surface
     // (`read_reg` → `mmio_read` → `interrupt_status` value at
     // VIRTIO_MMIO_INTERRUPT_STATUS). VIRTIO_MMIO_INT_VRING is
     // bit 1 (vring buffer interrupt). Pins that the guest's
@@ -1397,7 +1397,7 @@ fn event_idx_multi_chain_drain_suppresses_below_threshold() {
         "interrupt_status bit must be set after 3 completions \
              even when irqfd suppressed",
     );
-    // T-GAP-F: same bit observable through MMIO surface.
+    // Same bit observable through the MMIO surface.
     let status = read_reg(&dev, VIRTIO_MMIO_INTERRUPT_STATUS);
     assert_eq!(status & 1, 1);
     // irqfd MUST be unsignalled — `needs_notification` saw
@@ -2126,7 +2126,7 @@ fn event_idx_error_chain_suppressed_when_threshold_unreached() {
         "interrupt_status bit must be set after error chain \
              completes, independent of irqfd gate",
     );
-    // T-GAP-F: same bit observable through MMIO surface.
+    // Same bit observable through the MMIO surface.
     let status = read_reg(&dev, VIRTIO_MMIO_INTERRUPT_STATUS);
     assert_eq!(status & 1, 1);
     // The contract this test pins: irqfd suppressed for the

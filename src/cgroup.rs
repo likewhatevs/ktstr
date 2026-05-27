@@ -4,6 +4,22 @@
 //! (default `/sys/fs/cgroup/ktstr`). Provides cpuset assignment,
 //! task migration, and cleanup.
 //!
+//! # Walk root (cgroup-v2 delegation)
+//!
+//! [`CgroupManager`] carries a `walk_root` that bounds two operations:
+//! - [`CgroupManager::setup`] walks every ancestor's
+//!   `cgroup.subtree_control` from `walk_root` down to `parent`;
+//! - [`CgroupManager::drain_tasks`] / [`cleanup_recursive`] drain pids
+//!   into `{walk_root}/cgroup.procs` (a writable root that is exempt
+//!   from the kernel's no-internal-process constraint).
+//!
+//! `walk_root` defaults to `/sys/fs/cgroup` (Mode A: root-owned cgroup
+//! tree). [`CgroupManager::with_walk_root`] retargets it for Mode B/C
+//! delegation (systemd `Delegate=yes`, container `nsdelegate`) where
+//! the operator owns `subtree_control` writes only inside a delegated
+//! subtree. The constructor enforces that `parent` is at or below
+//! `walk_root` so the strip-prefix walk cannot escape.
+//!
 //! # Controller surface
 //!
 //! [`CgroupManager`] enables a fixed controller set in
@@ -363,23 +379,183 @@ const MAX_OUTSTANDING_REMOVES: usize = 10;
 /// underlying writes. The counter is `AtomicUsize` because
 /// scenario code holds the manager behind `&dyn CgroupOps` and
 /// shares it across threads via `&self` borrows.
+///
+/// # Walk root
+///
+/// `walk_root` bounds the cgroup-fs walk for two operations:
+/// 1. [`Self::setup`] walks every ancestor's `cgroup.subtree_control`
+///    between `walk_root` and `parent`.
+/// 2. [`Self::drain_tasks`] and [`cleanup_recursive`] drain pids into
+///    `{walk_root}/cgroup.procs` (the writable root exempt from the
+///    no-internal-process constraint).
+///
+/// Defaults to `/sys/fs/cgroup` in [`Self::new`] for Mode A (root-owned
+/// cgroup tree). Override via [`Self::with_walk_root`] for cgroup-v2
+/// user delegation (Mode B/C: systemd `Delegate=yes`, container
+/// `nsdelegate`). The override is validated against `parent` at
+/// construction — if `parent` is not at or below `walk_root`, the
+/// chained call returns an error rather than letting the strip-prefix
+/// walk fall through to an opaque cgroupfs EACCES at the delegation
+/// boundary.
 #[derive(Debug)]
 pub struct CgroupManager {
     parent: PathBuf,
+    walk_root: PathBuf,
     outstanding_removes: AtomicUsize,
 }
 
+/// Free-function inner of [`CgroupManager::move_tasks`] —
+/// extracted so the per-pid migration loop + ESRCH tolerance +
+/// all-vanished bail can be unit-tested without a real
+/// cgroupfs (which is what surfaces the kernel-side ESRCH that
+/// the bail guards against). The per-pid write closure is
+/// caller-supplied: production callers route through
+/// [`CgroupManager::move_task_with_retry`] (which talks to
+/// real `cgroup.procs` files); unit tests pass a closure that
+/// synthesises [`std::io::Error::from_raw_os_error(libc::ESRCH)`]
+/// for selected pids so the partial-vanish (allowed) and
+/// all-vanished (bail) paths are both directly observable.
+///
+/// The empty-slice exemption (`pids.is_empty() -> Ok`) is
+/// preserved here so the documented "no move requested" form
+/// (post-Drop diagnostic, post-mortem capture) stays a clean
+/// no-op rather than tripping the all-vanished gate.
+fn move_tasks_inner<W>(name: &str, pids: &[libc::pid_t], mut write_one: W) -> Result<()>
+where
+    W: FnMut(&str, libc::pid_t) -> Result<()>,
+{
+    let mut vanished = 0usize;
+    for &pid in pids {
+        if let Err(e) = write_one(name, pid) {
+            if is_esrch(&e) {
+                tracing::warn!(pid, cgroup = name, "task vanished during migration");
+                vanished += 1;
+                continue;
+            }
+            return Err(e);
+        }
+    }
+    if !pids.is_empty() && vanished == pids.len() {
+        anyhow::bail!(
+            "move_tasks to '{name}': ALL {n} pid(s) ESRCH'd before \
+             migration completed (pids: {pids:?}). Likely causes: \
+             (a) `WorkloadHandle::spawn` child pre_exec init-panic \
+             cascade (uid/gid/mempolicy/cgroup-handshake failure \
+             between fork and the start-pipe read — the parent is \
+             blocked on the start-pipe waiting for the child to \
+             reach work-ready and only observes the child's death \
+             via SIGCHLD reap, by which point the pid has already \
+             vanished from any cgroup it was placed in); (b) \
+             scheduler-attach-time cgroup-pull (sched_ext init may \
+             move existing tasks out of test-created cgroups); \
+             (c) external signal (SIGKILL from operator OR \
+             OOM-killer). The silent-Ok path this bail replaces \
+             was a no-silent-drops violation: a downstream \
+             `cgroup.procs` read would see 0 pids with no signal \
+             that ANY migration was even attempted. If the caller \
+             LEGITIMATELY moves an already-vanished cohort \
+             (post-Drop diagnostic), pass an empty pids slice \
+             instead — the empty-slice path returns Ok cleanly \
+             without bailing.",
+            n = pids.len(),
+        );
+    }
+    Ok(())
+}
+
 impl CgroupManager {
+    /// Default cgroup-fs root used by [`Self::new`]. Override per
+    /// instance via [`Self::with_walk_root`] for cgroup-v2 user
+    /// delegation.
+    const DEFAULT_WALK_ROOT: &'static str = "/sys/fs/cgroup";
+
     /// Create a manager rooted at the given cgroup v2 path.
+    ///
+    /// The walk root defaults to `/sys/fs/cgroup` (Mode A: root-owned
+    /// cgroup tree). For cgroup-v2 user delegation (Mode B/C), chain
+    /// [`Self::with_walk_root`] before any [`Self::setup`] call.
     pub fn new(parent: &str) -> Self {
         Self {
             parent: PathBuf::from(parent),
+            walk_root: PathBuf::from(Self::DEFAULT_WALK_ROOT),
             outstanding_removes: AtomicUsize::new(0),
         }
     }
+
+    /// Retarget the cgroup-fs walk root used by [`Self::setup`] and
+    /// [`Self::drain_tasks`].
+    ///
+    /// `root` becomes the upper bound of the
+    /// `cgroup.subtree_control` enable walk and the destination
+    /// `{root}/cgroup.procs` for pid drains. Use for cgroup-v2 user
+    /// delegation (Mode B/C) where the operator owns
+    /// `subtree_control` writes only inside the delegated subtree and
+    /// a blind walk from `/sys/fs/cgroup` would EACCES at the
+    /// `user.slice` / container-root boundary.
+    ///
+    /// Returns an error when:
+    /// - **Either `parent` or `root` contains a `..` component** —
+    ///   [`PathBuf::starts_with`] is component-based and treats `..`
+    ///   as a literal segment, so `/sys/fs/cgroup/op/../escape` would
+    ///   component-prefix `/sys/fs/cgroup/op` while the kernel
+    ///   resolves the path to `/sys/fs/cgroup/escape` (outside the
+    ///   delegation root). Rejecting `..` upfront keeps the prefix
+    ///   invariant honest against canonical-vs-component drift.
+    /// - **The manager's `parent` is not at or below `root`** —
+    ///   without the prefix invariant the [`Self::setup_under_root`]
+    ///   strip-prefix gate would silently skip the subtree_control
+    ///   walk and the caller would see downstream EACCES on the
+    ///   first `set_*` write. Surfaces the misconfiguration upfront
+    ///   with both paths in the error message.
+    pub fn with_walk_root(mut self, root: impl Into<PathBuf>) -> Result<Self> {
+        let root = root.into();
+        // Reject `..` components on either side. `PathBuf::starts_with`
+        // is component-based and treats `..` as a literal segment, so
+        // `/sys/fs/cgroup/operator/../escape` would pass the prefix
+        // check below while the kernel resolves the path to
+        // `/sys/fs/cgroup/escape` (outside walk_root). Either side
+        // carrying `..` is a misconfiguration; bail upfront before the
+        // canonical-vs-component mismatch becomes a downstream EACCES.
+        for (path, label) in [
+            (self.parent.as_path(), "parent"),
+            (root.as_path(), "walk_root"),
+        ] {
+            if path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                bail!(
+                    "CgroupManager::with_walk_root: {label} {path:?} contains `..` components; \
+                     parent and walk_root must be normalized absolute paths because \
+                     PathBuf::starts_with is component-based and `/a/b/../c` is treated as \
+                     starting with `/a/b/..` not the kernel-resolved `/a/c` — the prefix \
+                     invariant would be silently violated",
+                );
+            }
+        }
+        if !self.parent.starts_with(&root) {
+            bail!(
+                "CgroupManager::with_walk_root: parent {:?} is not below walk_root {:?}; \
+                 the subtree_control walk must originate at a root that contains the parent — \
+                 either lower walk_root to a prefix of parent or raise parent to a descendant of \
+                 walk_root",
+                self.parent,
+                root,
+            );
+        }
+        self.walk_root = root;
+        Ok(self)
+    }
+
     /// Path to the parent cgroup directory.
     pub fn parent_path(&self) -> &std::path::Path {
         &self.parent
+    }
+
+    /// Path to the cgroup-fs root [`Self::setup`] walks down from and
+    /// [`Self::drain_tasks`] drains pids to. See [`Self::with_walk_root`].
+    pub fn walk_root(&self) -> &std::path::Path {
+        &self.walk_root
     }
 
     /// Count of un-removed cgroups currently tracked by this
@@ -393,7 +569,7 @@ impl CgroupManager {
 
     /// Create the parent directory and enable the requested cgroup
     /// controllers in every ancestor `cgroup.subtree_control` between
-    /// `/sys/fs/cgroup` and `self.parent`.
+    /// `self.walk_root` (default `/sys/fs/cgroup`) and `self.parent`.
     ///
     /// Pass the controllers the test actually needs — empty set means
     /// "create the parent dir, write nothing to subtree_control". The
@@ -406,10 +582,18 @@ impl CgroupManager {
     /// vice versa. `cgroup.freeze` and `cgroup.procs` are
     /// cgroup-core, ungated by any controller, and need no entry.
     ///
+    /// # Walk root
+    ///
+    /// The ancestor walk stops at `self.walk_root` so cgroup-v2 user
+    /// delegation (Mode B/C) does not attempt subtree_control writes
+    /// above the delegation boundary. [`Self::with_walk_root`]
+    /// retargets the walk; the constructor validates that
+    /// `self.parent` is below `walk_root`.
+    ///
     /// # Availability check
     ///
     /// Each requested controller is verified against
-    /// `/sys/fs/cgroup/cgroup.controllers` before any write. A
+    /// `{walk_root}/cgroup.controllers` before any write. A
     /// requested controller missing from the kernel's available set
     /// surfaces as `controller {ctrl} not available; cgroup.controllers
     /// = {available:?}` rather than the bare ENOENT/EACCES the
@@ -423,16 +607,18 @@ impl CgroupManager {
     /// `tracing::warn!` followed by a downstream EACCES at the
     /// controller-knob write site.
     pub fn setup(&self, controllers: &BTreeSet<Controller>) -> Result<()> {
-        self.setup_under_root(controllers, &PathBuf::from("/sys/fs/cgroup"))
+        self.setup_under_root(controllers, &self.walk_root)
     }
 
     /// Inner setup that takes the cgroup-fs root as an explicit
     /// argument so tests can drive the controller-enable path against
     /// a tmpdir without touching `/sys/fs/cgroup`. Production
-    /// [`Self::setup`] hardcodes `/sys/fs/cgroup`. The strip-prefix
-    /// gate stays — if the parent is outside the supplied root,
-    /// directory creation still happens but no subtree_control walk
-    /// fires (matches the existing "non-cgroup-mount" early-bail).
+    /// [`Self::setup`] threads `self.walk_root` (defaults to
+    /// `/sys/fs/cgroup` via [`Self::new`], overridable via
+    /// [`Self::with_walk_root`]). The strip-prefix gate stays — if
+    /// the parent is outside the supplied root, directory creation
+    /// still happens but no subtree_control walk fires (matches the
+    /// existing "non-cgroup-mount" early-bail).
     fn setup_under_root(&self, controllers: &BTreeSet<Controller>, root: &Path) -> Result<()> {
         if !self.parent.exists() {
             fs::create_dir_all(&self.parent)
@@ -932,7 +1118,7 @@ impl CgroupManager {
     /// `io.max` (per-device throughput cap) is intentionally NOT
     /// surfaced here — the per-device interface needs major:minor
     /// device-id lookup which has no in-tree consumer; surface it
-    /// as a follow-up task when a concrete use case lands.
+    /// when a concrete use case lands.
     pub fn set_io_weight(&self, name: &str, weight: u16) -> Result<()> {
         validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("io.weight");
@@ -1148,25 +1334,70 @@ impl CgroupManager {
         Ok(())
     }
 
+    /// Write `child_pid` to `<cgroup_name>/cgroup.procs` during the
+    /// payload-spawn cgroup-sync handshake.
+    ///
+    /// Distinct from [`Self::move_task`]: this is the
+    /// placement-before-exec write that runs while the child is
+    /// paused in pre_exec between `fork(2)` and `execve(2)`. The
+    /// `move_task` cpuset-ordering gate does NOT apply here —
+    /// placement runs before cpuset is finalised at scenario setup
+    /// time, and the gate would reject otherwise-valid spawn
+    /// requests. Callers that need the gate (post-spawn migration)
+    /// invoke [`Self::move_task`] / [`Self::move_tasks`] instead.
+    ///
+    /// Uses the same `write_with_timeout` shape as the other
+    /// `cgroup.procs` write sites so a wedged cgroupfs is bounded
+    /// to `CGROUP_WRITE_TIMEOUT` rather than blocking the parent
+    /// indefinitely.
+    pub fn place_task_during_handshake(
+        &self,
+        cgroup_name: &str,
+        child_pid: libc::pid_t,
+    ) -> Result<()> {
+        validate_cgroup_name(cgroup_name)?;
+        let cgroup_procs_path = self.parent.join(cgroup_name).join("cgroup.procs");
+        let line = format!("{child_pid}\n");
+        write_with_timeout(&cgroup_procs_path, &line, CGROUP_WRITE_TIMEOUT).with_context(|| {
+            format!(
+                "place pid {child_pid} into cgroup '{cgroup_name}' via {} during cgroup-sync handshake",
+                cgroup_procs_path.display(),
+            )
+        })
+    }
+
     /// Move multiple tasks into a child cgroup by PID.
     ///
-    /// Tolerates ESRCH (task exited between listing and migration).
-    /// Retries EBUSY up to 3 times with 100ms backoff for transient
-    /// rejections from sched_ext BPF `cgroup_prep_move` callbacks
+    /// Tolerates per-pid ESRCH (a task that exited between the listing
+    /// snapshot and the migration write) and logs a warn for each
+    /// vanished pid — partial migration is a legitimate outcome when
+    /// one of N workers has voluntarily exited. Retries EBUSY up to
+    /// 3 times with 100ms backoff for transient rejections from
+    /// sched_ext BPF `cgroup_prep_move` callbacks
     /// (`scx_cgroup_can_attach`). Propagates EBUSY after retries
     /// exhausted. Propagates all other errors immediately.
+    ///
+    /// # All-vanished bail
+    ///
+    /// When `pids` is non-empty AND every supplied pid ESRCH'd, this
+    /// fn bails with an actionable diagnostic rather than silently
+    /// returning Ok. The silent-Ok path violates the project's
+    /// no-silent-drops rule (any data loss must fail loudly):
+    /// a downstream consumer reading the destination
+    /// `cgroup.procs` would see 0 pids and have no idea whether
+    /// the migration was supposed to move 0 or N — masking a real
+    /// test-setup regression (e.g. `WorkloadHandle::spawn` child
+    /// pre_exec init-panic cascade that killed every paused worker
+    /// before move_tasks ran) behind a downstream-state empty-read.
+    ///
+    /// A test that LEGITIMATELY moves only already-exited workers
+    /// (post-Drop diagnostic, post-mortem capture) should pass an
+    /// empty `pids` slice rather than calling with non-empty + all
+    /// pre-vanished — the empty-slice path is the documented "no
+    /// move requested" form that returns Ok cleanly.
     pub fn move_tasks(&self, name: &str, pids: &[libc::pid_t]) -> Result<()> {
         validate_cgroup_name(name)?;
-        for &pid in pids {
-            if let Err(e) = self.move_task_with_retry(name, pid) {
-                if is_esrch(&e) {
-                    tracing::warn!(pid, cgroup = name, "task vanished during migration");
-                    continue;
-                }
-                return Err(e);
-            }
-        }
-        Ok(())
+        move_tasks_inner(name, pids, |n, pid| self.move_task_with_retry(n, pid))
     }
 
     /// Move a single task with bounded EBUSY retry.
@@ -1222,21 +1453,100 @@ impl CgroupManager {
             .with_context(|| format!("clear subtree_control on {name}"))
     }
 
-    /// Move all tasks from a child cgroup to the cgroup root.
+    /// Move all tasks from a child cgroup to the walk-root cgroup.
     ///
-    /// Drains to `/sys/fs/cgroup/cgroup.procs` instead of the parent
-    /// because the parent has `subtree_control` set (enabling cpuset
-    /// for children), and the kernel's no-internal-process constraint
-    /// rejects writes to `cgroup.procs` when `subtree_control` is
-    /// active. The root cgroup is exempt from this constraint.
+    /// Drains to `{self.walk_root}/cgroup.procs` instead of the
+    /// parent because the parent has `subtree_control` set (enabling
+    /// cpuset for children), and the kernel's no-internal-process
+    /// constraint rejects writes to `cgroup.procs` when
+    /// `subtree_control` is active. The walk-root cgroup is the
+    /// uppermost cgroup the operator can write to without crossing
+    /// the delegation boundary; under Mode A it is the canonical
+    /// `/sys/fs/cgroup` root (exempt from the no-internal-process
+    /// constraint), under Mode B/C it is the delegated subtree root
+    /// (which also has procs-writability inside the delegation).
     pub fn drain_tasks(&self, name: &str) -> Result<()> {
         validate_cgroup_name(name)?;
         let src = self.parent.join(name).join("cgroup.procs");
         if !src.exists() {
             return Ok(());
         }
-        drain_pids_to_root(&src, name);
+        let dst = self.walk_root.join("cgroup.procs");
+        drain_pids_to_root(&src, &dst, name);
         Ok(())
+    }
+
+    /// Read `cgroup.procs` of `name`, returning the thread-group
+    /// leaders (PIDs) currently in the cgroup.
+    ///
+    /// Distinct from [`Self::drain_tasks`]:
+    /// - `drain_tasks` MIGRATES tasks to the walk-root and treats a
+    ///   missing `cgroup.procs` file as a no-op (`Ok(())`) so
+    ///   best-effort teardown of an already-rmdir'd cgroup is safe.
+    /// - `read_procs` is a READ accessor for assertions
+    ///   ([`Op::CaptureCgroupProcs`](crate::scenario::ops::Op::CaptureCgroupProcs)
+    ///   and direct callers). A missing `cgroup.procs` file is a
+    ///   real error (cgroup doesn't exist, typo'd name, race with
+    ///   teardown) — propagating it lets the caller distinguish
+    ///   "empty cgroup" from "no such cgroup."
+    ///
+    /// # Semantics
+    ///
+    /// - Returns thread-group leaders (PIDs / TGIDs) as the kernel
+    ///   exposes them via `cgroup_procs_show` in `kernel/cgroup/cgroup.c`.
+    ///   For per-thread TIDs the kernel exposes `cgroup.threads`; this
+    ///   method reads ONLY `cgroup.procs`.
+    /// - Non-atomic snapshot as exposed by the kernel's pidlist
+    ///   iteration (`cgroup_procs_show` / `css_task_iter_next` in
+    ///   `kernel/cgroup/cgroup.c`): the kernel walks the css_set's
+    ///   task list one entry at a time, so a task that joins or exits
+    ///   mid-read can appear in the next read but not this one (or
+    ///   vice versa). The userspace `fs::read_to_string` here returns
+    ///   when seq_file signals EOF; the per-pid atomicity is a kernel
+    ///   property, not an impl one. Callers asserting on membership
+    ///   of a stable task set (e.g. SpinWait workers spawned in the
+    ///   prior op) are unaffected.
+    /// - Empty cgroup: returns `Ok(Vec::new())` (kernel emits an
+    ///   empty file, not an error). Lets callers distinguish "no
+    ///   tasks" from "no such cgroup."
+    /// - Malformed pid lines: skipped with a `tracing::warn!`
+    ///   naming the offending line, matching
+    ///   [`drain_pids_to_root`]'s tolerance. The kernel never emits
+    ///   such lines today; the tolerance exists so a future kernel
+    ///   gaining a header or comment line surfaces as a warn
+    ///   instead of an opaque parse error.
+    pub fn read_procs(&self, name: &str) -> Result<Vec<libc::pid_t>> {
+        validate_cgroup_name(name)?;
+        let procs_path = self.parent.join(name).join("cgroup.procs");
+        let content = fs::read_to_string(&procs_path).with_context(|| {
+            format!(
+                "read cgroup.procs from '{}' (cgroup name '{name}'); the cgroup may not \
+                 exist or may have been removed (check that `Op::AddCgroup(name)` or a \
+                 `CgroupDef` covers this name, and that the test's `workload_root_cgroup` \
+                 is correct)",
+                procs_path.display(),
+            )
+        })?;
+        let mut pids = Vec::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match trimmed.parse::<libc::pid_t>() {
+                Ok(pid) => pids.push(pid),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %procs_path.display(),
+                        cgroup = name,
+                        line = trimmed,
+                        err = %e,
+                        "read_procs: malformed pid line; skipping",
+                    );
+                }
+            }
+        }
+        Ok(pids)
     }
 
     /// Remove all child cgroups under the parent (keeps the parent itself).
@@ -1273,7 +1583,10 @@ impl CgroupManager {
         if !self.parent.exists() {
             return Ok(());
         }
-        if let Err(err) = for_each_child_dir(&self.parent, "cleanup_all", cleanup_recursive) {
+        let walk_root = self.walk_root.clone();
+        if let Err(err) = for_each_child_dir(&self.parent, "cleanup_all", |p| {
+            cleanup_recursive(p, &walk_root)
+        }) {
             tracing::warn!(
                 parent = %self.parent.display(),
                 err = %err,
@@ -1347,12 +1660,47 @@ pub trait CgroupOps {
     /// Move multiple tasks (tolerates ESRCH, retries EBUSY). See
     /// [`CgroupManager::move_tasks`].
     fn move_tasks(&self, name: &str, pids: &[libc::pid_t]) -> Result<()>;
+    /// Place a single task into a child cgroup's `cgroup.procs`
+    /// during the payload-spawn cgroup-sync handshake.
+    ///
+    /// Distinct from [`Self::move_task`] / [`Self::move_tasks`]:
+    /// those run post-spawn for synthetic workers whose pids are
+    /// already in their final cgroup-permissive state. This method
+    /// runs INSIDE the two-pipe handshake between the child's
+    /// pre_exec pid-notify and the parent's release-signal write,
+    /// when the child is paused between `fork(2)` and `execve(2)`.
+    /// The write MUST land BEFORE the release byte so the child's
+    /// `execve` lands in the destination cgroup — this is the
+    /// placement-before-exec invariant required to keep tasks like
+    /// `Op::RunPayload { cgroup: Some(name), ... }` from briefly
+    /// inheriting the parent's cgroup at exec time.
+    ///
+    /// # Caller contract
+    ///
+    /// - MUST be invoked exactly once during the handshake between
+    ///   pid-notify and release-signal.
+    /// - Failure MUST propagate to the caller, which is responsible
+    ///   for dropping the release pipe to unblock the child with
+    ///   EOF so it bails out of pre_exec rather than execve'ing
+    ///   into an unspecified cgroup.
+    /// - The `cgroup_name` argument is the user-facing name the
+    ///   test author passed in `Op::RunPayload { cgroup: Some(name),
+    ///   ... }` or `PayloadRun::in_cgroup(name)` — NOT a derived
+    ///   absolute path. The implementation derives the
+    ///   `cgroup.procs` path from this name plus its own
+    ///   parent-path knowledge.
+    ///
+    /// See [`CgroupManager::place_task_during_handshake`].
+    fn place_task_during_handshake(&self, cgroup_name: &str, child_pid: libc::pid_t) -> Result<()>;
     /// Clear `cgroup.subtree_control` on a child. See
     /// [`CgroupManager::clear_subtree_control`].
     fn clear_subtree_control(&self, name: &str) -> Result<()>;
     /// Drain tasks from a child to the cgroup root. See
     /// [`CgroupManager::drain_tasks`].
     fn drain_tasks(&self, name: &str) -> Result<()>;
+    /// Read `cgroup.procs` of a child, returning thread-group leaders.
+    /// See [`CgroupManager::read_procs`].
+    fn read_procs(&self, name: &str) -> Result<Vec<libc::pid_t>>;
     /// Remove all child cgroups under the parent. See
     /// [`CgroupManager::cleanup_all`].
     fn cleanup_all(&self) -> Result<()>;
@@ -1421,11 +1769,17 @@ impl CgroupOps for CgroupManager {
     fn move_tasks(&self, name: &str, pids: &[libc::pid_t]) -> Result<()> {
         CgroupManager::move_tasks(self, name, pids)
     }
+    fn place_task_during_handshake(&self, cgroup_name: &str, child_pid: libc::pid_t) -> Result<()> {
+        CgroupManager::place_task_during_handshake(self, cgroup_name, child_pid)
+    }
     fn clear_subtree_control(&self, name: &str) -> Result<()> {
         CgroupManager::clear_subtree_control(self, name)
     }
     fn drain_tasks(&self, name: &str) -> Result<()> {
         CgroupManager::drain_tasks(self, name)
+    }
+    fn read_procs(&self, name: &str) -> Result<Vec<libc::pid_t>> {
+        CgroupManager::read_procs(self, name)
     }
     fn cleanup_all(&self) -> Result<()> {
         CgroupManager::cleanup_all(self)
@@ -1526,8 +1880,23 @@ fn cgroup_events_reports_unpopulated(events_path: &Path) -> bool {
     }
 }
 
-fn drain_pids_to_root(procs_path: &Path, context: &str) {
-    let dst = Path::new("/sys/fs/cgroup/cgroup.procs");
+/// Drain all tasks from `procs_path` to `dst` (the walk-root
+/// `cgroup.procs`).
+///
+/// `dst` must be the `cgroup.procs` file at the cgroup-fs root the
+/// caller is permitted to write to (under Mode A: `/sys/fs/cgroup`;
+/// under Mode B/C: the delegated subtree root the operator owns).
+/// The walk-root cgroup is exempt from (or above) the
+/// no-internal-process constraint inside its delegation, so writes
+/// to its `cgroup.procs` succeed even when intermediate cgroups have
+/// `subtree_control` set.
+///
+/// ESRCH (task exited) is silently tolerated; other errors are
+/// logged. A `read_to_string` failure or a malformed pid line is
+/// surfaced via `tracing::warn!` — silently dropping either would
+/// hide a cgroup that still contains tasks and send it into cleanup,
+/// which then fails with EBUSY and compounds the confusion.
+fn drain_pids_to_root(procs_path: &Path, dst: &Path, context: &str) {
     let content = match fs::read_to_string(procs_path) {
         Ok(c) => c,
         Err(e) => {
@@ -1609,9 +1978,22 @@ fn for_each_child_dir(path: &Path, context: &str, mut f: impl FnMut(&Path)) -> s
     Ok(())
 }
 
-fn cleanup_recursive(path: &std::path::Path) {
+/// Depth-first removal of `path` and every descendant cgroup
+/// directory. Drains each cgroup's pids to `{walk_root}/cgroup.procs`
+/// before rmdir.
+///
+/// `walk_root` mirrors [`CgroupManager::walk_root`]: under Mode A it
+/// is `/sys/fs/cgroup` (the canonical cgroup-v2 mount); under Mode
+/// B/C it is the delegated subtree root the operator owns. Threaded
+/// through the recursion so every descendant drain targets the
+/// caller's writable root and never the canonical
+/// `/sys/fs/cgroup/cgroup.procs` (which would EACCES under
+/// delegation).
+fn cleanup_recursive(path: &std::path::Path, walk_root: &Path) {
     // Depth-first: clean children before parent
-    if let Err(err) = for_each_child_dir(path, "cleanup_recursive", cleanup_recursive) {
+    if let Err(err) = for_each_child_dir(path, "cleanup_recursive", |child| {
+        cleanup_recursive(child, walk_root)
+    }) {
         tracing::warn!(
             path = %path.display(),
             err = %err,
@@ -1653,7 +2035,11 @@ fn cleanup_recursive(path: &std::path::Path) {
             "cleanup_recursive: pre-drain unfreeze failed; source-cgroup state-hygiene step skipped",
         );
     }
-    drain_pids_to_root(&path.join("cgroup.procs"), &path.display().to_string());
+    drain_pids_to_root(
+        &path.join("cgroup.procs"),
+        &walk_root.join("cgroup.procs"),
+        &path.display().to_string(),
+    );
     // Wait event-driven on cgroup.events `populated 0` rather than
     // a blind 10 ms sleep — see `wait_for_cgroup_unpopulated`'s doc
     // for the rationale. 1 s deadline matches `remove_cgroup_inner`.

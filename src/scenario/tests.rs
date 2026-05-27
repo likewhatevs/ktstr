@@ -465,6 +465,7 @@ fn split_half_even() {
         assert: assert::Assert::default_checks(),
         wait_for_map_write: false,
         current_step: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+        entry_name: None,
     };
     let (a, b) = split_half(&ctx);
     // Last CPU reserved for cgroup 0 → 7 usable, split 3/4
@@ -487,6 +488,7 @@ fn split_half_small() {
         assert: assert::Assert::default_checks(),
         wait_for_map_write: false,
         current_step: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+        entry_name: None,
     };
     let (a, b) = split_half(&ctx);
     assert_eq!(a.len() + b.len(), 2);
@@ -507,6 +509,7 @@ fn dfl_wl_propagates_workers() {
         assert: assert::Assert::default_checks(),
         wait_for_map_write: false,
         current_step: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+        entry_name: None,
     };
     let wl = dfl_wl(&ctx);
     assert_eq!(wl.num_workers, 7);
@@ -824,11 +827,17 @@ impl crate::cgroup::CgroupOps for DropErrCgroupOps {
     fn move_tasks(&self, _: &str, _: &[libc::pid_t]) -> Result<()> {
         Ok(())
     }
+    fn place_task_during_handshake(&self, _: &str, _: libc::pid_t) -> Result<()> {
+        Ok(())
+    }
     fn clear_subtree_control(&self, _: &str) -> Result<()> {
         Ok(())
     }
     fn drain_tasks(&self, _: &str) -> Result<()> {
         Ok(())
+    }
+    fn read_procs(&self, _: &str) -> Result<Vec<libc::pid_t>> {
+        Ok(Vec::new())
     }
     fn cleanup_all(&self) -> Result<()> {
         Ok(())
@@ -1536,4 +1545,140 @@ fn cgroup_def_with_second_workspec_preserves_helper_seed() {
         Some(5),
         "appended WorkSpec lands as works[1]",
     );
+}
+
+// -- Ctx drift-safe sidecar-path method tests --
+//
+// Mirror of the VmResult sibling tests at src/vmm/result.rs
+// (`vm_result_wprof_pb_path_*`, `vm_result_repro_wprof_pb_path_*`,
+// `vm_result_assert_wprof_pb_landed_*`). The Ctx path-derivation
+// methods carry the same Result<PathBuf>-bail-on-None shape; the
+// tests pin both axes — happy-path-named-suffix and None-bail —
+// for each of the 3 methods.
+
+/// Shared fixture for ctx-method tests: build a Ctx via
+/// CtxBuilder + (optionally) stamp entry_name. CtxBuilder paths
+/// CgroupManager + TestTopology lifetimes onto the returned Ctx,
+/// so the helper has to keep them alive for the caller — return
+/// them as a tuple so the fixture caller binds + drops them in
+/// the right order.
+#[cfg(test)]
+fn ctx_method_test_fixture() -> (crate::cgroup::CgroupManager, crate::topology::TestTopology) {
+    let cgroups = crate::cgroup::CgroupManager::new("/nonexistent/ctx-method-fixture");
+    let topo = crate::topology::TestTopology::synthetic(1, 1);
+    (cgroups, topo)
+}
+
+#[test]
+fn ctx_failure_dump_path_returns_sidecar_named_path() {
+    let (cgroups, topo) = ctx_method_test_fixture();
+    let ctx = Ctx::builder(&cgroups, &topo)
+        .entry_name("ctx_method_fixture_test_fn")
+        .build();
+    let path = ctx
+        .failure_dump_path()
+        .expect("entry_name stamped → path derivation succeeds");
+    let suffix = "ctx_method_fixture_test_fn.failure-dump.json";
+    assert!(
+        path.ends_with(suffix),
+        "expected path to end with {suffix:?}; got {}",
+        path.display(),
+    );
+}
+
+#[test]
+fn ctx_failure_dump_path_bails_when_entry_name_none() {
+    let (cgroups, topo) = ctx_method_test_fixture();
+    // No .entry_name() setter call → builder defaults to None.
+    let ctx = Ctx::builder(&cgroups, &topo).build();
+    let err = ctx
+        .failure_dump_path()
+        .expect_err("None entry_name must bail, not silently produce a garbage path");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("Ctx::failure_dump_path") && msg.contains("entry_name"),
+        "diagnostic must name the method + the missing field; got {msg:?}",
+    );
+    assert!(
+        msg.contains("CtxBuilder"),
+        "diagnostic must point at the CtxBuilder setter for the actionable fix; got {msg:?}",
+    );
+}
+
+#[test]
+fn ctx_wprof_pb_path_returns_sidecar_named_path() {
+    let (cgroups, topo) = ctx_method_test_fixture();
+    let ctx = Ctx::builder(&cgroups, &topo)
+        .entry_name("ctx_method_fixture_wprof_fn")
+        .build();
+    let path = ctx
+        .wprof_pb_path()
+        .expect("entry_name stamped → path derivation succeeds");
+    let suffix = "ctx_method_fixture_wprof_fn.wprof.pb";
+    assert!(
+        path.ends_with(suffix),
+        "expected path to end with {suffix:?}; got {}",
+        path.display(),
+    );
+}
+
+#[test]
+fn ctx_wprof_pb_path_bails_when_entry_name_none() {
+    let (cgroups, topo) = ctx_method_test_fixture();
+    let ctx = Ctx::builder(&cgroups, &topo).build();
+    let err = ctx.wprof_pb_path().expect_err("None entry_name must bail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("Ctx::wprof_pb_path") && msg.contains("entry_name"),
+        "diagnostic must name the method + the missing field; got {msg:?}",
+    );
+}
+
+#[test]
+fn ctx_repro_wprof_pb_path_returns_sidecar_named_path() {
+    let (cgroups, topo) = ctx_method_test_fixture();
+    let ctx = Ctx::builder(&cgroups, &topo)
+        .entry_name("ctx_method_fixture_repro_fn")
+        .build();
+    let path = ctx
+        .repro_wprof_pb_path()
+        .expect("entry_name stamped → path derivation succeeds");
+    let suffix = "ctx_method_fixture_repro_fn.repro.wprof.pb";
+    assert!(
+        path.ends_with(suffix),
+        "expected path to end with {suffix:?}; got {}",
+        path.display(),
+    );
+}
+
+#[test]
+fn ctx_repro_wprof_pb_path_bails_when_entry_name_none() {
+    let (cgroups, topo) = ctx_method_test_fixture();
+    let ctx = Ctx::builder(&cgroups, &topo).build();
+    let err = ctx
+        .repro_wprof_pb_path()
+        .expect_err("None entry_name must bail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("Ctx::repro_wprof_pb_path") && msg.contains("entry_name"),
+        "diagnostic must name the method + the missing field; got {msg:?}",
+    );
+}
+
+/// **Drift firewall**: a future renaming of the method signature
+/// (e.g. accepting a `&str` arg back) flips this from compile-OK
+/// to compile-FAIL — surfaces the regression at the type system
+/// instead of at runtime in the form of mis-stamped path strings.
+#[test]
+fn ctx_path_methods_take_no_arg() {
+    let (cgroups, topo) = ctx_method_test_fixture();
+    let ctx = Ctx::builder(&cgroups, &topo)
+        .entry_name("drift_firewall_fn")
+        .build();
+    // Compile-time pin: each method takes only &self. If a future
+    // refactor adds a `&str` arg back (re-introducing the literal-
+    // drift class), the trailing `()` arg-list breaks compile.
+    let _: anyhow::Result<std::path::PathBuf> = ctx.failure_dump_path();
+    let _: anyhow::Result<std::path::PathBuf> = ctx.wprof_pb_path();
+    let _: anyhow::Result<std::path::PathBuf> = ctx.repro_wprof_pb_path();
 }

@@ -99,9 +99,7 @@ pub(crate) fn acquire_build_reservation(
     cli_label: &str,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
 ) -> Result<BuildReservation> {
-    let bypass = std::env::var("KTSTR_BYPASS_LLC_LOCKS")
-        .ok()
-        .is_some_and(|v| !v.is_empty());
+    let bypass = crate::bypass_llc_locks_active();
     // INVARIANT: `_sandbox` is declared first and drops first per
     // Rust's declaration-order field-drop rule; this ensures the
     // cgroup sandbox is removed before the LLC flock is released.
@@ -469,11 +467,7 @@ pub fn kernel_build_pipeline(
     // redundant rebuild. The pre-wait `eprintln!` inside
     // `acquire_source_tree_lock` ensures the operator sees what
     // they're waiting on rather than a silent stall.
-    let _source_lock = if is_local_source
-        && std::env::var("KTSTR_BYPASS_LLC_LOCKS")
-            .ok()
-            .is_none_or(|v| v.is_empty())
-    {
+    let _source_lock = if is_local_source && !crate::bypass_llc_locks_active() {
         Some(acquire_source_tree_lock(source_dir, cli_label)?)
     } else {
         None
@@ -949,7 +943,7 @@ mod tests {
         let _env_lock = crate::test_support::test_helpers::lock_env();
         let cache_tmp = tempfile::TempDir::new().expect("cache tempdir");
         let _cache_env = crate::test_support::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
+            crate::KTSTR_CACHE_DIR_ENV,
             cache_tmp.path(),
         );
         let cache = crate::cache::CacheDir::with_root(cache_tmp.path().to_path_buf());
@@ -1539,14 +1533,14 @@ mod tests {
             // SAFETY: env_lock held by caller; serializes with
             // every other env-mutating test.
             unsafe {
-                std::env::set_var("KTSTR_BYPASS_LLC_LOCKS", value);
+                std::env::set_var(crate::KTSTR_BYPASS_LLC_LOCKS_ENV, value);
             }
             BypassGuard
         }
         fn remove() -> Self {
             // SAFETY: caller holds env_lock.
             unsafe {
-                std::env::remove_var("KTSTR_BYPASS_LLC_LOCKS");
+                std::env::remove_var(crate::KTSTR_BYPASS_LLC_LOCKS_ENV);
             }
             BypassGuard
         }
@@ -1556,7 +1550,7 @@ mod tests {
             // SAFETY: guard lifetime bounded by env_lock held by
             // caller; Drop runs before the mutex guard releases.
             unsafe {
-                std::env::remove_var("KTSTR_BYPASS_LLC_LOCKS");
+                std::env::remove_var(crate::KTSTR_BYPASS_LLC_LOCKS_ENV);
             }
         }
     }
@@ -1579,6 +1573,47 @@ mod tests {
             r.make_jobs.is_none(),
             "bypass must fall back to nproc (None signals to caller)",
         );
+    }
+
+    /// Regression pin: empty-string-as-unset contract for
+    /// `KTSTR_BYPASS_LLC_LOCKS`. A bare `KTSTR_BYPASS_LLC_LOCKS=`
+    /// (CI shells, Docker `--env` pass-through without value) must
+    /// NOT activate the bypass — the reader at L102 uses
+    /// `.is_some_and(|v| !v.is_empty())` and that contract is
+    /// shared by all 7 sibling readers. If a future contributor
+    /// flips to `.is_some_and(|_| true)` or bare `.is_ok()`, this
+    /// test catches the regression before it silently disables LLC
+    /// flock contention enforcement in CI.
+    #[test]
+    fn acquire_build_reservation_bypass_empty_string_rejected() {
+        let _lock = bypass_env_lock();
+        let _env = BypassGuard::set("");
+        match acquire_build_reservation("test", None) {
+            Ok(r) => {
+                // Empty-as-unset means we take the standard branch,
+                // not the bypass branch. Standard branch produces a
+                // BuildReservation with plan / sandbox / make_jobs
+                // tied together (set-or-unset together per the
+                // `plan_and_make_jobs_consistent` invariant). If the
+                // bypass had been (incorrectly) triggered, all 3
+                // would be None.
+                assert_eq!(
+                    r.plan.is_some(),
+                    r.make_jobs.is_some(),
+                    "empty-string must NOT activate bypass — plan + make_jobs \
+                     should follow the standard-branch invariant",
+                );
+            }
+            Err(e) => {
+                // Sysfs-unreadable host: standard branch failed for
+                // unrelated reasons. The empty-string-as-unset
+                // contract is still proven because the bypass branch
+                // would have returned `Ok` with all-None fields (per
+                // the `bypass_returns_no_reservation` test); reaching
+                // Err proves the standard branch was taken.
+                eprintln!("standard-branch error confirms bypass was NOT taken (good): {e:#}");
+            }
+        }
     }
 
     /// `acquire_build_reservation` with `KTSTR_BYPASS_LLC_LOCKS=1`

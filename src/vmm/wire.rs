@@ -190,6 +190,12 @@ pub enum MsgType {
     /// Host→guest reply to [`MsgType::KernelOpRequest`] (payload:
     /// postcard-encoded [`KernelOpReplyPayload`]).
     KernelOpReply,
+    /// Guest→host wprof Perfetto-format trace blob (payload: raw
+    /// `.pb` bytes from `wprof -T trace.pb`). The freeze
+    /// coordinator writes the payload as `wprof.pb` next to the
+    /// failure-dump JSON so the operator picks it up alongside the
+    /// rest of the per-test debugging artefacts.
+    WprofTrace,
     /// Guest→host system-ready signal (payload: empty).
     ///
     /// Emitted by the guest's `ktstr_guest_init` after
@@ -224,6 +230,7 @@ impl MsgType {
             MsgType::PayloadMetrics => MSG_TYPE_PAYLOAD_METRICS,
             MsgType::RawPayloadOutput => MSG_TYPE_RAW_PAYLOAD_OUTPUT,
             MsgType::Profraw => MSG_TYPE_PROFRAW,
+            MsgType::WprofTrace => MSG_TYPE_WPROF_TRACE,
             MsgType::SnapshotRequest => MSG_TYPE_SNAPSHOT_REQUEST,
             MsgType::SnapshotReply => MSG_TYPE_SNAPSHOT_REPLY,
             MsgType::KernelOpRequest => MSG_TYPE_KERNEL_OP_REQUEST,
@@ -256,6 +263,7 @@ impl MsgType {
             MSG_TYPE_PAYLOAD_METRICS => Some(MsgType::PayloadMetrics),
             MSG_TYPE_RAW_PAYLOAD_OUTPUT => Some(MsgType::RawPayloadOutput),
             MSG_TYPE_PROFRAW => Some(MsgType::Profraw),
+            MSG_TYPE_WPROF_TRACE => Some(MsgType::WprofTrace),
             MSG_TYPE_SNAPSHOT_REQUEST => Some(MsgType::SnapshotRequest),
             MSG_TYPE_SNAPSHOT_REPLY => Some(MsgType::SnapshotReply),
             MSG_TYPE_KERNEL_OP_REQUEST => Some(MsgType::KernelOpRequest),
@@ -409,6 +417,13 @@ pub const MSG_TYPE_RAW_PAYLOAD_OUTPUT: u32 = 0x5241_574f; // "RAWO"
 /// Coverage profraw blob (payload: raw `.profraw` bytes from
 /// `__llvm_profile_get_data`).
 pub const MSG_TYPE_PROFRAW: u32 = 0x5052_4157; // "PRAW"
+
+/// wprof Perfetto-format trace blob (payload: raw `.pb` bytes
+/// produced by `/bin/wprof -T trace.pb` during auto-repro). The
+/// host's freeze coordinator writes the payload to a sibling of
+/// the failure-dump file so the operator finds it under
+/// [`crate::test_support::sidecar_dir`] alongside the JSON dump.
+pub const MSG_TYPE_WPROF_TRACE: u32 = 0x5750_5246; // "WPRF"
 
 /// Guest→host on-demand snapshot request
 /// (payload: [`SnapshotRequestPayload`]).
@@ -1445,6 +1460,7 @@ mod tests {
             MsgType::PayloadMetrics,
             MsgType::RawPayloadOutput,
             MsgType::Profraw,
+            MsgType::WprofTrace,
             MsgType::SnapshotRequest,
             MsgType::SnapshotReply,
             MsgType::KernelOpRequest,
@@ -1494,6 +1510,7 @@ mod tests {
             MSG_TYPE_RAW_PAYLOAD_OUTPUT
         );
         assert_eq!(MsgType::Profraw.wire_value(), MSG_TYPE_PROFRAW);
+        assert_eq!(MsgType::WprofTrace.wire_value(), MSG_TYPE_WPROF_TRACE);
         assert_eq!(
             MsgType::SnapshotRequest.wire_value(),
             MSG_TYPE_SNAPSHOT_REQUEST
@@ -1542,6 +1559,7 @@ mod tests {
             MsgType::PayloadMetrics,
             MsgType::RawPayloadOutput,
             MsgType::Profraw,
+            MsgType::WprofTrace,
             MsgType::Stdout,
             MsgType::Stderr,
             MsgType::SchedLog,

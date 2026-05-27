@@ -13,7 +13,7 @@ use crate::workload::config::{AluWidth, humantime_serde_helper};
 ///
 /// Workers loop through all phases in order, then repeat. Each phase
 /// runs for its specified duration before advancing to the next.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkPhase {
     /// CPU spin for the given duration.
@@ -72,7 +72,7 @@ impl WorkPhase {
 mod methods;
 mod work_type;
 
-pub use work_type::WorkType;
+pub use work_type::{CustomFn, WorkType};
 
 /// Spawn-time validation failures for [`WorkType`] preconditions.
 ///

@@ -12,7 +12,7 @@ use crate::sync::MutexExt;
 use std::path::Path;
 
 // ------------------------------------------------------------
-// T28 — CtprofParseSummary: per-file read-failure tally
+// CtprofParseSummary: per-file read-failure tally
 // ------------------------------------------------------------
 
 /// Stage a synthetic procfs tree for parse-summary tests:
@@ -166,8 +166,8 @@ fn parse_summary_clean_proc_yields_empty_map() {
     assert!(!summary.kernel_config_dominant);
 }
 
-/// Ghost filter discipline (T28.2): a tid that exits between
-/// readdir and the per-file reads (every read fails with
+/// Ghost filter discipline: a tid that exits between readdir
+/// and the per-file reads (every read fails with
 /// ENOENT, comm is empty, ghost filter rejects the tid) must
 /// NOT contribute to the parse-summary tally. Otherwise a
 /// busy host with mid-capture exits would inflate
@@ -350,7 +350,7 @@ fn capture_with_synthetic_tree_yields_no_parse_summary() {
 }
 
 // ------------------------------------------------------------
-// T43 — Additional capture-pipeline error-path tests
+// Additional capture-pipeline error-path tests
 // ------------------------------------------------------------
 
 /// Phase-1 loadavg missing: capture_with must not panic when
@@ -489,8 +489,7 @@ fn capture_with_cgroup_path_traversal_yields_zero_stats() {
 /// Empty `Cpus_allowed_list:` value: `parse_cpu_list("")`
 /// returns None at the empty-input guard, so `cpu_affinity`
 /// lands as the empty Vec. Same observable effect as a
-/// malformed range (G8) but pins the empty-string branch
-/// distinctly.
+/// malformed range but pins the empty-string branch distinctly.
 #[test]
 fn capture_with_empty_cpus_allowed_yields_empty_affinity() {
     let proc_tmp = tempfile::TempDir::new().unwrap();
@@ -571,10 +570,10 @@ fn capture_with_empty_comm_nonzero_start_time_keeps_thread() {
 }
 
 // ------------------------------------------------------------
-// T45 — Additional parse_summary + capture-pipeline coverage
+// Additional parse_summary + capture-pipeline coverage
 // ------------------------------------------------------------
 
-/// W2: every tid is ghost-filtered. With N empty task dirs the
+/// Every tid is ghost-filtered. With N empty task dirs the
 /// ghost filter rejects every tid, so each tid's pending failure
 /// bumps unwind via `discard_pending`. `tids_walked` is bumped
 /// at the call site BEFORE the discard, so it still reads N.
@@ -639,7 +638,7 @@ fn parse_summary_all_ghosts_yields_nonzero_tids_walked_zero_failures() {
     );
 }
 
-/// W3: pin which file-kind tokens count as kernel-config-gated.
+/// Pin which file-kind tokens count as kernel-config-gated.
 /// `kernel_config_dominates` filters on `matches!(t, "schedstat"
 /// | "io")`. Iterate every recognised kebab token solo (one
 /// failure of that kind, no others) and assert the gate flips
@@ -679,7 +678,7 @@ fn parse_summary_kernel_config_token_list_pinned() {
     }
 }
 
-/// W5: tally aggregates across multiple tids. Stage 2 tids
+/// Tally aggregates across multiple tids. Stage 2 tids
 /// where each fails a different file (one missing io, one
 /// missing schedstat). Both bumps must commit (neither tid is
 /// ghost-filtered) and the per-file map carries one entry per
@@ -753,7 +752,7 @@ fn parse_summary_aggregates_across_multiple_tids() {
     );
 }
 
-/// W7: deleting cgroup lands a `"cgroup"` failure. Mirrors the
+/// Deleting cgroup lands a `"cgroup"` failure. Mirrors the
 /// schedstat/io single-failure tests so the cgroup-read tally
 /// path is exercised explicitly — `read_cgroup_at_with_tally`
 /// is the only producer of the `"cgroup"` tag and a future
@@ -797,7 +796,7 @@ fn parse_summary_records_cgroup_failure() {
     );
 }
 
-/// W6: the production gate (`use_syscall_affinity=true`)
+/// The production gate (`use_syscall_affinity=true`)
 /// populates `parse_summary` end-to-end. Mirror of
 /// `capture_with_synthetic_tree_yields_no_parse_summary` but
 /// with the gate flipped — pins that the production-path

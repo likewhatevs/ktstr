@@ -18,7 +18,9 @@ use std::time::Duration;
 use crate::scenario::Ctx;
 use crate::workload::{AffinityIntent, WorkSpec, WorkType};
 
-use super::{CgroupDef, CpusetSpec, KernelTarget, KernelValue, KernelValueWidth, Op, OpKind};
+use super::{
+    CgroupDef, CpusetSpec, KernelTarget, KernelValue, KernelValueWidth, Op, OpKind, SpawnPlacement,
+};
 
 // ---------------------------------------------------------------------------
 // Step / HoldSpec
@@ -125,7 +127,21 @@ pub struct Step {
 }
 
 impl Step {
-    /// Create a step with ops only (no CgroupDef setup).
+    /// Create a step with ops only (no CgroupDef setup). Prefer
+    /// this constructor over the struct-literal `Step { setup,
+    /// ops, hold }` form — the constructor preserves struct
+    /// stability across non_exhaustive field additions
+    /// (e.g. future `Step::with_*` builder methods) and is the
+    /// stable surface tracked by [`Self::with_defs`] +
+    /// [`Self::hold`].
+    ///
+    /// ```ignore
+    /// // Common one-liner: spawn workers then hold for 1s.
+    /// let s = Step::new(vec![Op::add_cgroup("cg_a"), Op::spawn(...)],
+    ///                   HoldSpec::Fixed(Duration::from_secs(1)));
+    /// // For setup-only steps (CgroupDef + spawns) use Step::with_defs.
+    /// // For wait-only phases (no ops) use Step::hold.
+    /// ```
     #[must_use = "dropping a Step discards its ops and hold for that scenario phase"]
     pub fn new(ops: Vec<Op>, hold: HoldSpec) -> Self {
         Self {
@@ -210,7 +226,7 @@ impl Step {
     pub fn with_payload(payload: &'static crate::test_support::Payload, hold: HoldSpec) -> Self {
         Self {
             setup: Setup::Defs(Vec::new()),
-            ops: vec![Op::run_payload(payload, vec![])],
+            ops: vec![Op::run_payload(payload, [] as [&str; 0])],
             hold,
         }
     }
@@ -367,27 +383,27 @@ impl OpKind {
             OpKind::SetCpuset => 3,
             OpKind::ClearCpuset => 4,
             OpKind::SwapCpusets => 5,
-            OpKind::SpawnWorkers => 6,
+            OpKind::Spawn => 6,
             OpKind::StopCgroup => 7,
             OpKind::SetAffinity => 8,
-            OpKind::SpawnHost => 9,
-            OpKind::MoveAllTasks => 10,
-            OpKind::RunPayload => 11,
-            OpKind::WaitPayload => 12,
-            OpKind::KillPayload => 13,
-            OpKind::FreezeCgroup => 14,
-            OpKind::UnfreezeCgroup => 15,
-            OpKind::CaptureSnapshot => 16,
-            OpKind::WatchSnapshot => 17,
-            OpKind::WriteKernelHot => 18,
-            OpKind::WriteKernelCold => 19,
-            OpKind::ReadKernelHot => 20,
-            OpKind::ReadKernelCold => 21,
-            OpKind::AttachScheduler => 22,
-            OpKind::DetachScheduler => 23,
-            OpKind::RestartScheduler => 24,
-            OpKind::ReplaceScheduler => 25,
-            OpKind::PinBpfMap => 26,
+            OpKind::MoveAllTasks => 9,
+            OpKind::RunPayload => 10,
+            OpKind::WaitPayload => 11,
+            OpKind::KillPayload => 12,
+            OpKind::FreezeCgroup => 13,
+            OpKind::UnfreezeCgroup => 14,
+            OpKind::CaptureSnapshot => 15,
+            OpKind::WatchSnapshot => 16,
+            OpKind::WriteKernelHot => 17,
+            OpKind::WriteKernelCold => 18,
+            OpKind::ReadKernelHot => 19,
+            OpKind::ReadKernelCold => 20,
+            OpKind::AttachScheduler => 21,
+            OpKind::DetachScheduler => 22,
+            OpKind::RestartScheduler => 23,
+            OpKind::ReplaceScheduler => 24,
+            OpKind::PinBpfMap => 25,
+            OpKind::CaptureCgroupProcs => 26,
         }
     }
 }
@@ -455,40 +471,42 @@ impl Op {
         }
     }
 
-    /// Spawn workers in a cgroup.
+    /// Spawn workers with the given placement. Canonical constructor
+    /// for [`Op::Spawn`]; [`Self::spawn_workers`] / [`Self::spawn_host`]
+    /// / [`Self::spawn_in_cgroup`] are sugar shortcuts for the two
+    /// common placement choices.
+    pub fn spawn(placement: SpawnPlacement, work: WorkSpec) -> Self {
+        Op::Spawn { placement, work }
+    }
+
+    /// Sugar for [`Self::spawn`]`(`[`SpawnPlacement::cgroup`]`(cgroup), work)`.
+    /// Spawns workers in the named cgroup.
     pub fn spawn_workers(cgroup: impl Into<Cow<'static, str>>, work: WorkSpec) -> Self {
-        Op::SpawnWorkers {
-            cgroup: cgroup.into(),
+        Op::Spawn {
+            placement: SpawnPlacement::Cgroup(cgroup.into()),
             work,
         }
     }
 
-    /// Spawn workers in a cgroup with the given [`WorkType`] and every
-    /// other [`WorkSpec`] knob defaulted. Sugar for the common
-    /// single-knob spawn case where the test only cares about
-    /// `work_type` and is happy with `Default::default()` for
-    /// scheduling policy, affinity, mempolicy, etc. Mirrors the
+    /// Sugar for [`Self::spawn`]`(`[`SpawnPlacement::cgroup`]`(cgroup),
+    /// WorkSpec { work_type, ..WorkSpec::default() })`. Spawn workers
+    /// in a cgroup with the given [`WorkType`] and every other
+    /// [`WorkSpec`] knob defaulted. Sugar for the common single-knob
+    /// spawn case where the test only cares about `work_type` and is
+    /// happy with `Default::default()` for scheduling policy,
+    /// affinity, mempolicy, etc. Mirrors the
     /// [`CgroupDef::named(...).work_type(...)`](super::CgroupDef::work_type)
     /// shape at the Op layer so test authors composing mid-step
     /// spawns get the same one-liner ergonomics as authors composing
     /// CgroupDefs upfront.
     ///
-    /// Equivalent to:
-    ///
-    /// ```ignore
-    /// Op::spawn_workers(
-    ///     cgroup,
-    ///     WorkSpec { work_type, ..WorkSpec::default() },
-    /// )
-    /// ```
-    ///
     /// For non-default knobs (worker count, affinity, …) construct
     /// a [`WorkSpec`] explicitly and route through
-    /// [`Self::spawn_workers`] — the sugar is intentionally minimal so a
+    /// [`Self::spawn`] — the sugar is intentionally minimal so a
     /// non-default knob forces the explicit-WorkSpec call site.
     pub fn spawn_in_cgroup(cgroup: impl Into<Cow<'static, str>>, work_type: WorkType) -> Self {
-        Op::SpawnWorkers {
-            cgroup: cgroup.into(),
+        Op::Spawn {
+            placement: SpawnPlacement::Cgroup(cgroup.into()),
             work: WorkSpec {
                 work_type,
                 ..WorkSpec::default()
@@ -511,9 +529,43 @@ impl Op {
         }
     }
 
-    /// Spawn workers in the parent cgroup.
-    pub const fn spawn_host(work: WorkSpec) -> Self {
-        Op::SpawnHost { work }
+    /// Sugar for [`Self::spawn`]`(`[`SpawnPlacement::runner_cgroup`]`(), work)`.
+    /// Spawns workers in the test runner's own cgroup, outside any
+    /// managed workload cgroup. Use [`Self::spawn`] with
+    /// [`SpawnPlacement::cgroup`] when workers must land in a
+    /// specific named cgroup.
+    ///
+    /// # No `spawn_in_host(work_type)` sugar
+    ///
+    /// The named-cgroup placement has a sibling one-arg sugar
+    /// [`Self::spawn_in_cgroup`]`(cgroup, work_type)` — there is
+    /// deliberately no `spawn_in_host(work_type)` parallel. Real
+    /// runner-cgroup spawns (host contention, off-workload noise)
+    /// almost always need an explicit worker count: the topology
+    /// determines saturation, not a single `work_type`. A 1-arg
+    /// sugar would mislead authors into defaulting `num_workers`
+    /// (currently `Some(ctx.workers_per_cgroup)` via
+    /// `resolve_num_workers`) when an explicit
+    /// `.workers(total_cpus)` (mitosis-style host contention) or
+    /// other tuning is the right call. Construct a [`WorkSpec`]
+    /// explicitly via [`Self::spawn`] (or this constructor) when
+    /// you need non-default knobs.
+    ///
+    /// # Errors
+    ///
+    /// Apply-time errors propagate out of
+    /// [`apply_ops`](crate::scenario::ops):
+    /// - `work.mem_policy.validate()` rejects (e.g. interleave
+    ///   with an empty nodemask)
+    /// - `resolve_num_workers` rejects (`num_workers == Some(0)`)
+    /// - `work.workers_pct` is set (RunnerCgroup placement has no
+    ///   managed cgroup cpuset to scale against)
+    /// - underlying `WorkloadHandle::spawn` fails (clone(2) errno)
+    pub fn spawn_host(work: WorkSpec) -> Self {
+        Op::Spawn {
+            placement: SpawnPlacement::RunnerCgroup,
+            work,
+        }
     }
 
     /// Move all tasks from one cgroup to another.
@@ -529,13 +581,36 @@ impl Op {
 
     /// Spawn a [`Payload`](crate::test_support::Payload) binary in the
     /// background. `args` is appended to `payload.default_args`.
-    /// Placement is inherited from the caller; use
-    /// [`run_payload_in_cgroup`](Self::run_payload_in_cgroup) to put
-    /// the child into a named cgroup.
-    pub fn run_payload(payload: &'static crate::test_support::Payload, args: Vec<String>) -> Self {
+    ///
+    /// # Placement
+    ///
+    /// `cgroup` is `None` — the spawned child inherits the cgroup
+    /// of whatever process invoked `apply_ops` (i.e. the test
+    /// runner's own cgroup, NOT any managed workload cgroup
+    /// declared via [`CgroupDef`] or [`Op::AddCgroup`]). To place
+    /// the child in a managed cgroup, use
+    /// [`run_payload_in_cgroup`](Self::run_payload_in_cgroup).
+    /// Matches the "empty-string key" convention
+    /// [`Op::Spawn`] uses for [`SpawnPlacement::RunnerCgroup`]:
+    /// payloads keyed under `None` are addressable by
+    /// [`Op::wait_payload_in_cgroup`] / [`Op::kill_payload_in_cgroup`]
+    /// with an empty-string `cgroup` argument.
+    ///
+    /// # Args ergonomics
+    ///
+    /// `args` accepts any `IntoIterator` of string-convertible items,
+    /// matching [`std::process::Command::args`] ergonomics. Call
+    /// sites can pass `[]`, `["-c", "echo hi"]`, `vec![...]`, or a
+    /// `Vec<String>` without the `vec!["-c".to_string(), ...]`
+    /// ceremony.
+    pub fn run_payload<I, S>(payload: &'static crate::test_support::Payload, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         Op::RunPayload {
             payload,
-            args,
+            args: args.into_iter().map(Into::into).collect(),
             cgroup: None,
         }
     }
@@ -543,14 +618,37 @@ impl Op {
     /// Spawn a [`Payload`](crate::test_support::Payload) in the
     /// background and place the child in a cgroup (relative to the
     /// scenario's parent cgroup).
-    pub fn run_payload_in_cgroup(
+    ///
+    /// # Placement-before-exec invariant
+    ///
+    /// The cgroup placement is performed via
+    /// [`CgroupOps::place_task_during_handshake`](crate::cgroup::CgroupOps::place_task_during_handshake)
+    /// BEFORE the child process execs — between `clone(2)` /
+    /// `fork(2)` and the `execve` that loads the payload binary.
+    /// Per kernel cgroup-v2 semantics any sched_ext callback the
+    /// scheduler installs fires only after the task is placed in
+    /// its final cgroup; a placement-after-exec sequence would
+    /// let the payload run its first instructions under the
+    /// runner's cgroup, racing the sched_ext callback against
+    /// the spawn syscall. The pre-exec gate gives the scheduler
+    /// a clean first observation of every workload pid.
+    ///
+    /// # Args ergonomics
+    ///
+    /// `args` accepts any `IntoIterator` of string-convertible items;
+    /// see [`Self::run_payload`] for the conversion rule.
+    pub fn run_payload_in_cgroup<I, S>(
         payload: &'static crate::test_support::Payload,
-        args: Vec<String>,
+        args: I,
         cgroup: impl Into<Cow<'static, str>>,
-    ) -> Self {
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         Op::RunPayload {
             payload,
-            args,
+            args: args.into_iter().map(Into::into).collect(),
             cgroup: Some(cgroup.into()),
         }
     }
@@ -561,6 +659,26 @@ impl Op {
     /// or more copies are live (use
     /// [`wait_payload_in_cgroup`](Self::wait_payload_in_cgroup) to
     /// disambiguate).
+    ///
+    /// # Sync contract
+    ///
+    /// Event-driven (waits on the payload's pid via
+    /// [`std::process::Child::wait`]); the framework reaps the
+    /// exit synchronously inside `apply_ops` so the next op runs
+    /// only after the payload has fully terminated and its
+    /// `MetricCheck` results are recorded. NO sleep involved.
+    ///
+    /// # Tmpfs vs persistent-disk
+    ///
+    /// Side-effect files the payload writes to `/tmp/*` live on
+    /// the guest's in-memory tmpfs and are deleted at VM teardown
+    /// (post-`vm.run()`). Post-VM `post_vm` callbacks running on
+    /// the host cannot read them — for host-side asserts, persist
+    /// the file to the sidecar dir via the
+    /// `<sidecar_dir>/<test_name>.<suffix>` convention rather than
+    /// `/tmp`, or do the read INSIDE the scenario via a follow-up
+    /// [`Op::run_payload`] that prints the file contents to
+    /// stdout for the framework's output capture.
     pub fn wait_payload(name: impl Into<Cow<'static, str>>) -> Self {
         Op::WaitPayload {
             name: name.into(),
@@ -645,6 +763,20 @@ impl Op {
         }
     }
 
+    /// Capture the current `cgroup.procs` of `cgroup` under `tag`.
+    /// See [`Op::CaptureCgroupProcs`] for the full per-call contract
+    /// (within-step ordering, PID vs TID grain, empty / unknown
+    /// cgroup behavior, tag uniqueness, drain mechanism).
+    pub fn capture_cgroup_procs(
+        tag: impl Into<Cow<'static, str>>,
+        cgroup: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        Op::CaptureCgroupProcs {
+            tag: tag.into(),
+            cgroup: cgroup.into(),
+        }
+    }
+
     /// Live-vCPU write of a single (target, value) pair. Singleton
     /// convenience that wraps the pair into the
     /// [`Op::WriteKernelHot`] batch shape. See the variant doc for
@@ -656,9 +788,9 @@ impl Op {
     /// multiple hot writes as a single op, use
     /// [`Self::write_kernel_hot_batch`]. The executor's
     /// adjacent-op auto-merge (which would collapse N adjacent
-    /// singleton hot writes into one dispatch) is queued as a
-    /// dedicated follow-up task; until it lands, each
-    /// `write_kernel_hot` call is its own dispatch.
+    /// singleton hot writes into one dispatch) is not
+    /// implemented; each `write_kernel_hot` call is its own
+    /// dispatch.
     pub fn write_kernel_hot(target: KernelTarget, value: KernelValue) -> Self {
         Op::WriteKernelHot {
             writes: vec![(target, value)],

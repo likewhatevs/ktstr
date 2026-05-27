@@ -992,8 +992,8 @@ fn write_sidecar_defaults_to_target_dir_without_env() {
     let _lock = lock_env();
     let target_dir = tempfile::TempDir::new().unwrap();
     let _env_target = EnvVarGuard::set("CARGO_TARGET_DIR", target_dir.path());
-    let _env_sidecar = EnvVarGuard::remove("KTSTR_SIDECAR_DIR");
-    let _env_kernel = EnvVarGuard::remove("KTSTR_KERNEL");
+    let _env_sidecar = EnvVarGuard::remove(crate::KTSTR_SIDECAR_DIR_ENV);
+    let _env_kernel = EnvVarGuard::remove(crate::KTSTR_KERNEL_ENV);
 
     let dir = sidecar_dir();
     // Expected layout: `{CARGO_TARGET_DIR}/ktstr/{kernel}-{project_commit}`.
@@ -1083,8 +1083,8 @@ fn sidecar_dir_empty_override_falls_back_to_default() {
     // defensively-cleared `KTSTR_SIDECAR_DIR=""` operator
     // pattern. EnvVarGuard accepts AsRef<OsStr>, and a
     // zero-length `&str` ("") satisfies that bound.
-    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", "");
-    let _env_kernel = EnvVarGuard::remove("KTSTR_KERNEL");
+    let _env_sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, "");
+    let _env_kernel = EnvVarGuard::remove(crate::KTSTR_KERNEL_ENV);
 
     let dir = sidecar_dir();
     // Compute the expected default the same way `sidecar_dir`
@@ -1478,10 +1478,11 @@ fn warn_unknown_project_commit_inner_emits_expected_substring() {
         "warning must carry the WARNING severity tag; got: {captured:?}",
     );
     assert!(
-        captured.contains("KTSTR_SIDECAR_DIR"),
-        "warning must reference KTSTR_SIDECAR_DIR as the remediation \
+        captured.contains(crate::KTSTR_SIDECAR_DIR_ENV),
+        "warning must reference {} as the remediation \
          knob — operators rely on this hint to disambiguate \
          non-git runs; got: {captured:?}",
+        crate::KTSTR_SIDECAR_DIR_ENV,
     );
 }
 
@@ -1822,7 +1823,7 @@ fn write_sidecar_same_dir_is_last_writer_wins_after_pre_clear() {
     let _lock = lock_env();
     let tmp_dir = tempfile::TempDir::new().unwrap();
     let tmp = tmp_dir.path();
-    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp);
+    let _env_sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, tmp);
 
     fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
         Ok(AssertResult::pass())
@@ -1903,7 +1904,7 @@ fn write_sidecar_override_does_not_pre_clear() {
     let _lock = lock_env();
     let tmp_dir = tempfile::TempDir::new().unwrap();
     let tmp = tmp_dir.path();
-    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp);
+    let _env_sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, tmp);
 
     // Pre-existing sidecar in the override dir — modeling a
     // run the operator wants to preserve.
@@ -1991,8 +1992,8 @@ fn write_sidecar_default_path_two_writes_both_survive() {
     let _lock = lock_env();
     let target_dir = tempfile::TempDir::new().unwrap();
     let _env_target = EnvVarGuard::set("CARGO_TARGET_DIR", target_dir.path());
-    let _env_sidecar = EnvVarGuard::remove("KTSTR_SIDECAR_DIR");
-    let _env_kernel = EnvVarGuard::remove("KTSTR_KERNEL");
+    let _env_sidecar = EnvVarGuard::remove(crate::KTSTR_SIDECAR_DIR_ENV);
+    let _env_kernel = EnvVarGuard::remove(crate::KTSTR_KERNEL_ENV);
 
     // Resolve the default dir AFTER the env mutations so it
     // reflects the tempdir-scoped target. With KTSTR_KERNEL
@@ -2064,7 +2065,7 @@ fn write_sidecar_writes_file() {
     let _lock = lock_env();
     let tmp_dir = tempfile::TempDir::new().unwrap();
     let tmp = tmp_dir.path();
-    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp);
+    let _env_sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, tmp);
 
     fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
         Ok(AssertResult::pass())
@@ -2220,7 +2221,7 @@ fn write_sidecar_variant_hash_distinguishes_work_types() {
     let _lock = lock_env();
     let tmp_dir = tempfile::TempDir::new().unwrap();
     let tmp = tmp_dir.path();
-    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp);
+    let _env_sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, tmp);
 
     fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
         Ok(AssertResult::pass())

@@ -357,15 +357,107 @@ fn synthesize_fallback_llc(cpus: &[usize], numa_node: usize) -> LlcInfo {
     }
 }
 
+/// Intersect a sysfs-online CPU list with an optional
+/// `sched_getaffinity` result. Pure-fn carve-out of
+/// `TestTopology::from_system`'s cross-check so the 3 paths
+/// (narrowed + warn, disjoint + bail, no-affinity-fallback) are
+/// unit-testable without syscall mocking.
+///
+/// - `online_sysfs` — sorted, non-empty CPU list from
+///   `/sys/devices/system/cpu/online`.
+/// - `allowed` — `Some(set)` when [`crate::cpu_util::read_affinity`]
+///   succeeded; `None` on EPERM / ESRCH / syscall failure OR when
+///   the host's CPU count exceeded `AFFINITY_MAX_BITS = 262144`
+///   (cpu_util's ceiling). All None cases fall back to the full
+///   sysfs set (status quo) so a permission failure doesn't drop
+///   real CPUs.
+///
+/// Returns:
+/// - `Ok(intersect)` when the cross-check produced at least one
+///   usable CPU. Emits a `tracing::warn!` when the intersection
+///   was a strict subset (operator running inside a
+///   cgroup-cpuset-namespaced container or under a taskset-
+///   narrowed parent).
+/// - `Err(_)` when `allowed` is `Some` and disjoint from
+///   `online_sysfs` — no CPU is both kernel-online AND
+///   affinity-allowed, so no topology can be built. The
+///   diagnostic includes both the sysfs set and the disjoint
+///   allowed set so the operator can correlate against their
+///   container / taskset config.
+fn intersect_online_with_affinity(
+    online_sysfs: &[usize],
+    allowed: Option<BTreeSet<usize>>,
+) -> Result<Vec<usize>> {
+    let Some(allowed_set) = allowed else {
+        return Ok(online_sysfs.to_vec());
+    };
+    let intersect: Vec<usize> = online_sysfs
+        .iter()
+        .copied()
+        .filter(|c| allowed_set.contains(c))
+        .collect();
+    if intersect.is_empty() {
+        bail!(
+            "sched_getaffinity(0) cpuset is disjoint from \
+             /sys/devices/system/cpu/online (sysfs={online_sysfs:?}, \
+             allowed={allowed_set:?}); no usable CPUs to build a topology \
+             against — operator likely running inside a cpuset cgroup \
+             whose `cpuset.cpus` names CPUs not on this host"
+        );
+    }
+    if intersect.len() < online_sysfs.len() {
+        let dropped: Vec<usize> = online_sysfs
+            .iter()
+            .copied()
+            .filter(|c| !allowed_set.contains(c))
+            .collect();
+        tracing::warn!(
+            sysfs_online_count = online_sysfs.len(),
+            allowed_count = intersect.len(),
+            dropped_cpus = ?dropped,
+            "TestTopology::from_system: sched_getaffinity(0) is \
+             narrower than /sys/devices/system/cpu/online — running \
+             inside a cgroup-cpuset-namespaced container or with a \
+             taskset-restricted parent. Dropped CPUs would EPERM at \
+             sched_setaffinity time; topology now reflects only the \
+             actually-usable CPUs."
+        );
+    }
+    Ok(intersect)
+}
+
 impl TestTopology {
     /// Discover topology from sysfs (reads `/sys/devices/system/cpu/`).
+    ///
+    /// Intersects sysfs's online-CPU set with the calling task's
+    /// `sched_getaffinity(0)` cpuset so the resulting `TestTopology`
+    /// only enumerates CPUs the process can actually run on. In a
+    /// cgroup-cpuset-namespaced container `/sys/devices/system/cpu`
+    /// reports the full host CPU set (not cgroup-filtered per the
+    /// kernel's `drivers/base/cpu.c` registration model), but
+    /// `sched_setaffinity` to CPUs outside the cgroup-allowed set
+    /// later fails with `EPERM`. Without this intersection an operator
+    /// running ktstr inside such a container sees confusing
+    /// affinity-EPERM errors far from the topology read; with it the
+    /// restriction surfaces at construction with a warn that names
+    /// the dropped CPUs.
     pub fn from_system() -> Result<Self> {
         let online_str =
             fs::read_to_string("/sys/devices/system/cpu/online").context("read online cpus")?;
-        let online_cpus = parse_cpu_list(&online_str)?;
-        if online_cpus.is_empty() {
+        let online_cpus_sysfs = parse_cpu_list(&online_str)?;
+        if online_cpus_sysfs.is_empty() {
             bail!("no online CPUs found");
         }
+
+        // Cross-check against sched_getaffinity. read_affinity returns
+        // None on EPERM / ESRCH / syscall failure OR when the host's
+        // CPU count exceeds cpu_util's AFFINITY_MAX_BITS = 262144
+        // ceiling — both cases fall back to the full sysfs set
+        // (status quo). Returns u32 ids; widen to usize for the
+        // intersection.
+        let allowed: Option<BTreeSet<usize>> =
+            crate::cpu_util::read_affinity(0).map(|v| v.into_iter().map(|c| c as usize).collect());
+        let online_cpus = intersect_online_with_affinity(&online_cpus_sysfs, allowed)?;
 
         let mut cpus = BTreeSet::new();
         let mut llc_map: BTreeMap<usize, LlcInfo> = BTreeMap::new();
@@ -962,6 +1054,68 @@ impl TestTopology {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `intersect_online_with_affinity` drops CPUs outside the
+    /// allowed set and preserves sysfs ordering. Pins the
+    /// narrowing-path (Some-allowed) return value separately from
+    /// the tracing::warn side effect, which the surrounding
+    /// production integration paths already exercise.
+    #[test]
+    fn intersect_drops_cpus_outside_allowed_set() {
+        let online = vec![0, 1, 2, 3, 4];
+        let allowed: BTreeSet<usize> = [0, 2, 4].into_iter().collect();
+        let out =
+            intersect_online_with_affinity(&online, Some(allowed)).expect("non-disjoint must Ok");
+        assert_eq!(
+            out,
+            vec![0, 2, 4],
+            "intersection must preserve sysfs order and drop forbidden CPUs"
+        );
+    }
+
+    /// Disjoint allowed-set bails with a diagnostic that includes
+    /// BOTH the sysfs set AND the disjoint allowed set so the
+    /// operator can correlate against the container / taskset
+    /// config that imposed the restriction.
+    #[test]
+    fn intersect_disjoint_allowed_set_bails_with_both_sets() {
+        let online = vec![0, 1, 2, 3];
+        let allowed: BTreeSet<usize> = [4, 5, 6].into_iter().collect();
+        let err =
+            intersect_online_with_affinity(&online, Some(allowed)).expect_err("disjoint must Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("disjoint from"),
+            "bail must use the 'disjoint from' phrasing: {msg}"
+        );
+        assert!(
+            msg.contains("/sys/devices/system/cpu/online"),
+            "bail must cite the sysfs source: {msg}"
+        );
+        assert!(
+            msg.contains("[0, 1, 2, 3]") || msg.contains("sysfs=[0, 1, 2, 3]"),
+            "bail must include the sysfs CPU set verbatim: {msg}"
+        );
+        assert!(
+            msg.contains("4") && msg.contains("5") && msg.contains("6"),
+            "bail must include the disjoint allowed-set CPUs per FAF1: {msg}"
+        );
+    }
+
+    /// None-affinity (EPERM / ESRCH / syscall failure / >262144-CPU
+    /// ceiling) returns the full sysfs set verbatim — fallback
+    /// preserves the pre-sched_getaffinity-cross-check status quo so
+    /// a permission failure doesn't accidentally drop real CPUs.
+    #[test]
+    fn intersect_none_affinity_returns_full_sysfs_set() {
+        let online = vec![0, 1, 2, 3];
+        let out =
+            intersect_online_with_affinity(&online, None).expect("None-affinity must Ok-fallback");
+        assert_eq!(
+            out, online,
+            "None-affinity must return sysfs set verbatim, not narrow"
+        );
+    }
 
     #[test]
     fn cpuset_string_empty() {

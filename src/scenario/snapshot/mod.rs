@@ -180,9 +180,9 @@ pub use error::{
 pub mod bridge;
 
 pub use bridge::{
-    BridgeGuard, CaptureCallback, KernelOpCallback, MAX_STORED_EVENTS, MAX_STORED_SNAPSHOTS,
-    MAX_WATCH_SNAPSHOTS, SnapshotBridge, SnapshotBridgeEvent, WatchRegisterCallback,
-    with_active_bridge,
+    BridgeGuard, CaptureCallback, CgroupProcsSnapshot, KernelOpCallback, MAX_STORED_EVENTS,
+    MAX_STORED_SNAPSHOTS, MAX_WATCH_SNAPSHOTS, SnapshotBridge, SnapshotBridgeEvent,
+    WatchRegisterCallback, with_active_bridge,
 };
 
 mod entry;

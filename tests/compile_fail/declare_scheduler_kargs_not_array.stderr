@@ -1,0 +1,5 @@
+error: declare_scheduler!: `kargs` must be an array literal `[..]`
+  --> tests/compile_fail/declare_scheduler_kargs_not_array.rs:10:5
+   |
+10 |     kargs = "not_an_array",
+   |     ^^^^^

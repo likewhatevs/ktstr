@@ -131,7 +131,7 @@
 //!   the register fire kptr / arena cast findings against the
 //!   datasec's variable layout.
 //!
-//! # F1 mitigation: arena_confirmed evidence required
+//! # Arena-evidence mitigation: arena_confirmed required
 //!
 //! On aarch64 the 4 GiB arena window catches any 33-bit value as
 //! "in arena", so a slot that just happens to hold a 33-bit-shaped
@@ -885,7 +885,7 @@ struct Analyzer<'a> {
     ///    same-shape unrelated structs). `arena_confirmed` is the
     ///    direct evidence that the value held in the slot was an
     ///    arena pointer — required for the shape-inference emit per
-    ///    the F1 hostile-input mitigation. The new STX-flow path
+    ///    the arena-evidence mitigation. The new STX-flow path
     ///    (see [`Self::arena_stx_findings`]) carries its own evidence
     ///    (allocator-return → field) and emits independently.
     arena_confirmed: BTreeSet<(u32, u32)>,
@@ -947,7 +947,7 @@ struct Analyzer<'a> {
     /// - the `ARENA_ALLOC_KFUNC_NAMES` allowlist match in
     ///   `Self::handle_kfunc_call`.
     ///
-    /// Used by [`Self::finalize`] to gate the F4 mitigation warn
+    /// Used by [`Self::finalize`] to gate the non-inlined-allocator warn
     /// (`allocator helpers may need __always_inline`): the warn
     /// must only fire when allocator call sites WERE seen but
     /// produced NO `arena_stx_findings`, which is the actual
@@ -1951,7 +1951,7 @@ impl<'a> Analyzer<'a> {
                             source: None,
                             alloc_size: captured_alloc_size,
                         };
-                        // F4 telemetry: bump the seed-applied
+                        // non-inlined-allocator telemetry: bump the seed-applied
                         // counter so [`Self::finalize`] can
                         // distinguish "we saw allocator call
                         // sites but no slot got tagged" (the
@@ -2795,7 +2795,7 @@ impl<'a> Analyzer<'a> {
                 source: None,
                 alloc_size: None,
             };
-            // F4 telemetry parity with the SubprogReturn arm:
+            // non-inlined-allocator telemetry parity with the SubprogReturn arm:
             // count this as an applied allocator seed so the
             // finalize warn distinguishes "allocator was called
             // but no slot got tagged" from "no allocator was
@@ -3168,7 +3168,7 @@ impl<'a> Analyzer<'a> {
         // recovered by intersecting struct shapes across the
         // observed access pattern.
         //
-        // F1 mitigation: require direct evidence the slot held an
+        // arena-evidence mitigation: require direct evidence the slot held an
         // arena VA before emitting a shape-inference hit. The 4 GiB
         // arena window catches any 33-bit value as "in arena" at
         // chase time, so a slot that just happens to hold a
@@ -3205,7 +3205,7 @@ impl<'a> Analyzer<'a> {
                     parent_type_id = source,
                     field_offset = field_off,
                     accesses = accesses.len(),
-                    "cast_analysis: shape-inference candidate without direct evidence; dropped (F1 mitigation)"
+                    "cast_analysis: shape-inference candidate without direct evidence; dropped (arena-evidence mitigation)"
                 );
                 continue;
             }
@@ -3264,7 +3264,7 @@ impl<'a> Analyzer<'a> {
             // is the safe direction.
         }
 
-        // F4 mitigation: surface allocator call sites that the
+        // non-inlined-allocator warn: surface allocator call sites that the
         // analyzer saw but could not follow into a typed-slot
         // STX. These manifest when a scheduler does not mark its
         // allocator helpers `__always_inline` — the analyzer sees
