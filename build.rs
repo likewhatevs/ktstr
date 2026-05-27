@@ -434,12 +434,16 @@ int main(void) {{
             .expect("make oldconfig");
         assert!(status.success(), "busybox make oldconfig failed");
 
-        // Build busybox.
-        let nproc = std::thread::available_parallelism()
-            .map(|n| n.get().to_string())
-            .unwrap_or_else(|_| "1".to_string());
+        // Build busybox.  Single-threaded `-j1`: busybox is a pure-C
+        // build dominated by gcc invocations that are already
+        // parallelisable inside gcc's own job server when invoked
+        // from a parallel parent; for a one-shot build out of a
+        // build.rs the wall-time difference between `-j1` and
+        // `-jN` is small (single-digit seconds on a developer box),
+        // and `-j1` keeps the build deterministic + race-free
+        // across hosts.
         let status = Command::new("make")
-            .arg(format!("-j{nproc}"))
+            .arg("-j1")
             .current_dir(&busybox_src)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -482,27 +486,17 @@ int main(void) {{
 
     let wprof_bin = out_dir.join("wprof");
     if skip_wprof {
-        // Trybuild + similar lib-only build paths set
-        // KTSTR_SKIP_WPROF_BUILD=1 to opt out of the upstream wprof
-        // clone+make. That make races between `make -jN`'s parallel
-        // cargo build of `libdemangle_c.a` and a sibling `cp` step
-        // (`cp: cannot stat .../libdemangle_c.a: No such file or
-        // directory` → `wprof build failed`), and overriding via
-        // `MAKEFLAGS=-j1` does not help because build.rs passes
-        // `-j{nproc}` on the command line which wins.
+        // Escape hatch for build paths that don't link the wprof
+        // bytes (only `src/bin/cargo_ktstr/blobs.rs` has the
+        // `include_bytes!` site).  Setting `KTSTR_SKIP_WPROF_BUILD=1`
+        // skips the multi-minute upstream wprof clone + compile and
+        // writes a 0-byte placeholder so the `!wprof_bin.exists()`
+        // branch doesn't refire on the next build.
         //
-        // The lib-only build path doesn't link
-        // `src/bin/cargo_ktstr/blobs.rs` (the only `include_bytes!`
-        // site for the wprof binary), so the build artifact at
-        // `$OUT_DIR/wprof` is unused — write a 0-byte placeholder so
-        // the rerun-if-changed gate is satisfied and a stale prior
-        // build doesn't trip the `!wprof_bin.exists()` branch on the
-        // next non-skipped build. A non-trybuild build that
-        // accidentally inherits the env var would still compile;
-        // running the `cargo-ktstr` binary it produces would
-        // try to extract the 0-byte placeholder via
-        // `install_env` and fail at runtime with a focused error
-        // when wprof itself is invoked.
+        // A `cargo-ktstr` built with this flag set would extract the
+        // 0-byte placeholder via `install_env` at startup and fail at
+        // runtime the first time wprof is invoked — the warning
+        // below tags the resulting binary as "do not use".
         println!(
             "cargo:warning=KTSTR_SKIP_WPROF_BUILD set — writing 0-byte \
              $OUT_DIR/wprof placeholder; do NOT use the resulting \
@@ -737,12 +731,25 @@ int main(void) {{
             }
         }
 
-        // Build wprof.
-        let nproc = std::thread::available_parallelism()
-            .map(|n| n.get().to_string())
-            .unwrap_or_else(|_| "1".to_string());
+        // Build wprof.  Single-threaded `-j1` instead of `-j{nproc}`:
+        // the upstream wprof Makefile has a missing prerequisite
+        // edge between the `libdemangle_c.a` build (a recursive
+        // `cargo build` inside the demangle sub-crate) and the
+        // sibling `cp` that copies the produced archive into
+        // wprof's OUTPUT dir.  Under `-jN` the `cp` races the
+        // cargo build and fires before the .a exists, surfacing
+        // as `cp: cannot stat .../libdemangle_c.a` → `wprof build
+        // failed`.  `-j1` serialises the recipe so the dependency
+        // ordering the Makefile *intends* is the ordering it gets.
+        // The wall-time cost is small in practice: the dominant
+        // builds (blazesym, demangle) are individual `cargo build`
+        // invocations that already parallelise internally per
+        // CARGO_BUILD_JOBS / `--jobs`, so `make`'s outer
+        // parallelism would only overlap distinct cargo
+        // invocations against each other — which is exactly the
+        // pattern that triggers the race.
         let status = Command::new("make")
-            .arg(format!("-j{nproc}"))
+            .arg("-j1")
             .current_dir(wprof_src.join("src"))
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
