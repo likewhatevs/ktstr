@@ -932,6 +932,7 @@ fn coverage_skip_under_instrumented_init(name: &str) -> bool {
             | "snapshot_real_capture_op_snapshot"
             | "snapshot_real_capture_op_watch_snapshot"
             | "stats_bridge_round_trip"
+            | "op_spawn_cgroup_empty_string_bails_with_actionable_diagnostic"
     )
 }
 
