@@ -126,8 +126,25 @@ pub(crate) fn read_kernel_init_size(kernel_path: &Path) -> Result<u64> {
 ///
 /// `initramfs_options=size=90%` on the cmdline is consumed by
 /// `init_mount_tree()` (`fs/namespace.c`) when mounting the rootfs
-/// tmpfs. This raises the tmpfs block limit from 50% to 90% of
-/// `totalram_pages`, preventing ENOSPC on large initramfs payloads.
+/// tmpfs — but only on kernels that have commit 1c543509044d
+/// ("fs: Add 'initramfs_options' to set initramfs mount options"),
+/// which landed in v5.4.301 / v5.10.246 / v6.6.113 / v6.12.54 /
+/// v6.17.4. Stable series 6.13.x, 6.14.x, 6.15.x, 6.16.x never
+/// got the backport — on those kernels the parameter is silently
+/// ignored ("Unknown kernel command line parameters …, will be
+/// passed to user space") and the tmpfs uses its 50% default.
+/// Initramfs unpacking then fails with `write error` partway
+/// through if the uncompressed payload exceeds 50% of totalram,
+/// leaving `/init` packed but its dynamic-linker dep missing →
+/// `Failed to execute /init (error -2)` → kernel panic.
+///
+/// To work on every kernel ktstr supports, the formula below
+/// targets the 50% default rather than the 90% bump. Modern
+/// kernels that honor the hint still get the headroom (90% > 50%
+/// means the tmpfs is bigger than we sized for); older kernels
+/// pass too. The cost is ~40% more VM memory per shell-mode VM
+/// vs the 90% formula — measurable but worth the cross-kernel
+/// portability.
 ///
 /// Note: `rootflags=size=90%` would set `root_mount_data`
 /// (`init/do_mounts.c:109`), consumed only by `do_mount_root()` via
@@ -139,22 +156,16 @@ pub(crate) fn read_kernel_init_size(kernel_path: &Path) -> Result<u64> {
 /// created by `shmem_init()` via `kern_mount()` — used for anonymous
 /// shared memory (`shmem_file_setup`), not the rootfs.
 ///
-/// With `initramfs_options=size=90%`, the tmpfs limit is 90% of
-/// `totalram_pages` (not the default 50%):
-///
 /// ```text
 /// totalram_pages(P) = (P - init_size - compressed - P/64) / 4096
-/// tmpfs_max_pages = totalram_pages * 9 / 10
+/// tmpfs_max_pages = totalram_pages / 2
 /// constraint: tmpfs_max_pages >= uncompressed / 4096
 ///
 /// Solving for P:
-/// (P - init_size - compressed - P/64) * 9/10 >= uncompressed
-/// P * 63/64 >= uncompressed * 10/9 + init_size + compressed
-/// P >= (uncompressed * 10/9 + init_size + compressed) * 64/63
+/// (P - init_size - compressed - P/64) / 2 >= uncompressed
+/// P * 63/64 >= 2 * uncompressed + init_size + compressed
+/// P >= (2 * uncompressed + init_size + compressed) * 64/63
 /// ```
-///
-/// In practice, `ceil(uncompressed * 10/9)` is used to ensure
-/// integer rounding does not underallocate.
 ///
 /// ## Workload budget
 ///
@@ -174,19 +185,22 @@ pub(crate) fn initramfs_min_memory_mib(budget: &MemoryBudget) -> u32 {
     let compressed_mib = ceil_mib(budget.compressed_initrd_bytes);
     let uncompressed_mib = ceil_mib(budget.uncompressed_initramfs_bytes);
 
-    // Boot requirement: initramfs_options=size=90% sets the rootfs
-    // tmpfs limit to 90% of totalram_pages.
+    // Boot requirement: the rootfs tmpfs default block limit is 50%
+    // of totalram_pages. `initramfs_options=size=90%` on the cmdline
+    // raises it to 90% on kernels that have the commit (see fn-level
+    // doc) — but 6.13.x / 6.14.x / 6.15.x / 6.16.x silently ignore
+    // the option, so we size for the universal 50% floor.
     //
-    // Constraint: totalram_pages * 9/10 >= uncompressed_pages.
+    // Constraint: totalram_pages / 2 >= uncompressed_pages.
     // totalram_pages = (P - reserved) / PAGE_SIZE.
     // reserved = init_size + compressed + struct_page(P).
     // struct_page(P) = P/64.
     //
     // Solving:
-    //   (P - init_size - compressed - P/64) * 9/10 >= uncompressed
-    //   P * 63/64 >= uncompressed * 10/9 + init_size + compressed
-    //   P >= (ceil(uncompressed * 10/9) + init_size + compressed) * 64/63
-    let uncompressed_scaled = (uncompressed_mib * 10).div_ceil(9);
+    //   (P - init_size - compressed - P/64) / 2 >= uncompressed
+    //   P * 63/64 >= 2 * uncompressed + init_size + compressed
+    //   P >= (2 * uncompressed + init_size + compressed) * 64/63
+    let uncompressed_scaled = uncompressed_mib * 2;
     let content_mib = uncompressed_scaled + init_size_mib + compressed_mib;
 
     // struct page overhead: P/64 is part of reserved, creating a
@@ -229,10 +243,10 @@ mod tests {
     /// hand-computed reference. Inputs:
     ///   uncompressed=10 MiB, init_size=5 MiB, compressed=2 MiB.
     /// Hand trace per `initramfs_min_memory_mib`:
-    ///   uncompressed_scaled = ceil(10*10/9) = ceil(11.111) = 12
-    ///   content_mib         = 12 + 5 + 2 = 19
-    ///   boot_mib            = ceil(19*64/63) = ceil(19.301) = 20
-    ///   total              = 20 + 256 (WORKLOAD_MIB) = 276
+    ///   uncompressed_scaled = 10 * 2 = 20
+    ///   content_mib         = 20 + 5 + 2 = 27
+    ///   boot_mib            = ceil(27*64/63) = ceil(27.428) = 28
+    ///   total              = 28 + 256 (WORKLOAD_MIB) = 284
     #[test]
     fn initramfs_min_memory_mib_known_input() {
         let budget = MemoryBudget {
@@ -240,15 +254,15 @@ mod tests {
             compressed_initrd_bytes: 2 * (1 << 20),
             kernel_init_size: 5 * (1 << 20),
         };
-        assert_eq!(initramfs_min_memory_mib(&budget), 276);
+        assert_eq!(initramfs_min_memory_mib(&budget), 284);
     }
 
     /// Sub-MiB inputs round up to 1 MiB before participating in the
     /// math. A 1-byte initramfs (degenerate but reachable when test
     /// fixtures construct empty payloads) must not silently round
-    /// down to zero and bypass the tmpfs-90% safety factor. With
+    /// down to zero and bypass the tmpfs-50% safety factor. With
     /// uncompressed=1 byte, init=0, compressed=0:
-    ///   uncompressed_scaled = ceil(1*10/9) = 2
+    ///   uncompressed_scaled = 1 * 2 = 2
     ///   content_mib         = 2 + 0 + 0 = 2
     ///   boot_mib            = ceil(2*64/63) = ceil(2.031) = 3
     ///   total              = 3 + 256 = 259
@@ -267,10 +281,10 @@ mod tests {
     /// Verifies the math holds at integration-realistic scales (the
     /// production callers in vmm/mod.rs feed values of this order).
     /// Trace:
-    ///   uncompressed_scaled = ceil(200*10/9) = ceil(222.222) = 223
-    ///   content_mib         = 223 + 30 + 50 = 303
-    ///   boot_mib            = ceil(303*64/63) = ceil(307.809) = 308
-    ///   total              = 308 + 256 = 564
+    ///   uncompressed_scaled = 200 * 2 = 400
+    ///   content_mib         = 400 + 30 + 50 = 480
+    ///   boot_mib            = ceil(480*64/63) = ceil(487.619) = 488
+    ///   total              = 488 + 256 = 744
     #[test]
     fn initramfs_min_memory_mib_larger_input() {
         let budget = MemoryBudget {
@@ -278,7 +292,7 @@ mod tests {
             compressed_initrd_bytes: 50 * (1 << 20),
             kernel_init_size: 30 * (1 << 20),
         };
-        assert_eq!(initramfs_min_memory_mib(&budget), 564);
+        assert_eq!(initramfs_min_memory_mib(&budget), 744);
     }
 
     /// `read_kernel_init_size` on x86_64 reads 4 little-endian bytes
