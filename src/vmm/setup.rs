@@ -1699,6 +1699,18 @@ impl KtstrVm {
         } else {
             cmdline.push_str(" numa_balancing=0");
         }
+        // wprof handshake — mirror of the x86_64 `setup_memory`
+        // emission. Without this, aarch64 guests boot with `wprof`
+        // packed in the initramfs but no `KTSTR_WPROF_ARGS` token
+        // on `/proc/cmdline`, so `spawn_wprof_if_configured` in
+        // `vmm::rust_init` short-circuits and no `.wprof.pb`
+        // artifact is produced; the
+        // `wprof_args_override_propagates_to_guest_cmdline` e2e
+        // also fails its substring check against `/proc/cmdline`.
+        if let Some(wprof) = self.wprof.as_ref() {
+            cmdline.push_str(" KTSTR_WPROF_ARGS=");
+            cmdline.push_str(&wprof.args_cmdline());
+        }
         if !self.cmdline_extra.is_empty() {
             cmdline.push(' ');
             cmdline.push_str(&self.cmdline_extra);
