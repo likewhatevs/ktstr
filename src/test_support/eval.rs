@@ -1760,8 +1760,8 @@ fn run_ktstr_test_inner_impl(
                 && bulk_entry.crc_ok
                 && !bulk_entry.payload.is_empty()
             {
-                let wprof_path = crate::test_support::sidecar_dir()
-                    .join(format!("{}.wprof.pb", entry.name));
+                let wprof_path =
+                    crate::test_support::sidecar_dir().join(format!("{}.wprof.pb", entry.name));
                 if let Err(e) = std::fs::create_dir_all(
                     wprof_path
                         .parent()

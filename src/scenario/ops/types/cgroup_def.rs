@@ -340,7 +340,7 @@ impl CgroupDef {
     /// Set [`WorkSpec::num_workers`] on `works[0]` (Group I).
     ///
     /// `n` MUST be `>= 1`. `n == 0` is rejected at
-    /// [`WorkloadConfig::validate`] time with an actionable
+    /// [`WorkloadConfig::validate`](crate::workload::WorkloadConfig::validate) time with an actionable
     /// diagnostic — a zero-worker spawn would silently produce
     /// no workload load, vacuously passing scheduler assertions
     /// that rely on observable contention. Pass `n >= 1`; for
@@ -438,7 +438,7 @@ impl CgroupDef {
     /// - More than 15 bytes (`TASK_COMM_LEN - 1` cap).
     ///
     /// See
-    /// [`validate_task_comm_string`](crate::workload::validate_task_comm_string)
+    /// `validate_task_comm_string` (in `crate::workload`)
     /// for the centralized rationale; `name.len()` is the BYTE
     /// length (UTF-8 multi-byte chars count as their byte width).
     #[must_use = "builder methods consume self; bind the result"]
@@ -511,7 +511,7 @@ impl CgroupDef {
     /// - More than 15 bytes (`TASK_COMM_LEN - 1` cap).
     ///
     /// See
-    /// [`validate_task_comm_string`](crate::workload::validate_task_comm_string)
+    /// `validate_task_comm_string` (in `crate::workload`)
     /// for the centralized rationale; `name.len()` is the BYTE
     /// length (UTF-8 multi-byte chars count as their byte width).
     #[must_use = "builder methods consume self; bind the result"]

@@ -66,7 +66,7 @@ fn expect_string_literal_value(value: &syn::Expr, error_hint: &str) -> Result<St
     }
 }
 
-/// Extract a [`syn::LitBool`] reference from a `Lit::Bool` value,
+/// Extract a [`struct@syn::LitBool`] reference from a `Lit::Bool` value,
 /// returning a spanned diagnostic for any other expression shape.
 fn expect_bool_literal<'a>(
     value: &'a syn::Expr,
@@ -103,7 +103,7 @@ fn expect_string_or_path_tokens(
     }
 }
 
-/// Extract a [`syn::LitInt`] from an attribute value, returning a
+/// Extract a [`struct@syn::LitInt`] from an attribute value, returning a
 /// spanned diagnostic when the user supplied something other than
 /// an integer literal. Hint is reused as the operator-facing message.
 fn expect_int_literal<'a>(
@@ -119,7 +119,7 @@ fn expect_int_literal<'a>(
     }
 }
 
-/// Extract a [`syn::LitFloat`] from an attribute value, returning a
+/// Extract a [`struct@syn::LitFloat`] from an attribute value, returning a
 /// spanned diagnostic when the user supplied something other than
 /// a float literal.
 fn expect_float_literal<'a>(
@@ -3357,7 +3357,7 @@ fn validate_kernel_name_collision(
 /// fields — `binary` (Discover), `binary_path` (Path), or the paired
 /// `kernel_builtin_{enable,disable}` (KernelBuiltin). Setting more
 /// than one is ambiguous because each maps to a different
-/// [`SchedulerSpec`] variant and they cannot stack; setting none is
+/// `SchedulerSpec` variant and they cannot stack; setting none is
 /// rejected so any user wanting the kernel-default baseline
 /// references `Scheduler::EEVDF` directly rather than declaring a
 /// scheduler with no source.

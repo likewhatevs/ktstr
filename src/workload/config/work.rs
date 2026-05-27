@@ -101,9 +101,9 @@ pub struct WorkSpec {
     /// (`usize`, no Option) is deliberate. `WorkSpec` is the
     /// declarative spec layer where `None` is a meaningful
     /// "inherit the cgroup-level default" sentinel;
-    /// [`crate::scenario::resolve_num_workers`] coalesces it to a
+    /// `resolve_num_workers` coalesces it to a
     /// concrete `usize` against the `Ctx` before
-    /// [`crate::workload::WorkloadConfig::for_scenario_engine`]
+    /// `WorkloadConfig::for_scenario_engine`
     /// constructs the spawn-time config. The coalesce happens at
     /// the resolution boundary, not silently inside any builder.
     pub num_workers: Option<usize>,
@@ -137,7 +137,7 @@ pub struct WorkSpec {
     /// creation time. The setter rejects > 15 bytes
     /// (TASK_COMM_LEN-1) at construction so the operator sees the
     /// cap at the call site instead of debugging a kernel-truncated
-    /// comm — see [`validate_task_comm_string`]. `None` inherits the
+    /// comm — see `validate_task_comm_string`. `None` inherits the
     /// binary name. Useful for scheduler matchers that filter on
     /// `task->comm` (e.g. layered's `CommPrefix`). The comm is
     /// applied once per worker; it is NOT live-propagated after
@@ -200,7 +200,7 @@ pub struct WorkSpec {
     /// routed through `spawn_pcomm_cgroup` (then no longer needed
     /// at the WorkloadConfig layer) or hit the dispatch-construction
     /// bail at
-    /// [`crate::workload::WorkloadConfig::for_scenario_engine`].
+    /// `WorkloadConfig::for_scenario_engine`.
     pub pcomm: Option<Cow<'static, str>>,
     /// Effective UID set via `setresuid(uid, uid, uid)` after fork.
     /// `None` inherits the parent's euid. Useful for scheduler
@@ -242,7 +242,7 @@ pub struct WorkSpec {
     /// asymmetry as [`Self::num_workers`]: `WorkSpec` is the
     /// operator-facing declarative spec where `workers_pct(p)` is
     /// a meaningful "scale with the cpuset" intent;
-    /// [`Self::resolve_workers_pct`] (called at apply_setup and at
+    /// `Self::resolve_workers_pct` (called at apply_setup and at
     /// each dispatch site) computes the concrete worker count
     /// against the dispatch-time cpuset and writes the result into
     /// the WorkSpec's `num_workers` field, which then flows through
@@ -444,7 +444,7 @@ impl WorkSpec {
     ///   at construction to keep the kernel-observed comm equal to
     ///   the requested value).
     ///
-    /// See [`validate_task_comm_string`] for the centralized
+    /// See `validate_task_comm_string` for the centralized
     /// rationale; `name.len()` is the BYTE length (UTF-8 multi-byte
     /// chars count as their byte width, not their codepoint count).
     #[must_use = "builder methods consume self; bind the result"]

@@ -103,8 +103,8 @@ impl From<&crate::test_support::SchedulerSpec> for SchedulerKind {
 /// invoke).
 ///
 /// `wprof_args`, when `Some`, replaces
-/// [`crate::vmm::wprof::WprofConfig::args`] (whose default comes
-/// from [`crate::vmm::wprof::WprofConfig::default_args`]) —
+/// `crate::vmm::wprof::WprofConfig::args` (whose default comes
+/// from `crate::vmm::wprof::WprofConfig::default_args`) —
 /// populated from the test's `#[ktstr_test(wprof_args = "...")]`
 /// attribute. `None` means "use the default wprof args."
 ///
@@ -134,13 +134,13 @@ pub struct ShellTestDescriptor {
     pub scheduler_kind: SchedulerKind,
     /// Custom wprof CLI args, mirroring
     /// `KtstrTestEntry::wprof_args`. When `Some`, the shell VM
-    /// overrides [`crate::vmm::wprof::WprofConfig::args`] with the
+    /// overrides `crate::vmm::wprof::WprofConfig::args` with the
     /// space-tokenised value before booting.
     #[serde(default)]
     pub wprof_args: Option<String>,
     /// Mirrors `KtstrTestEntry::performance_mode`. The shell VM
     /// forwards this to
-    /// [`crate::vmm::KtstrVmBuilder::performance_mode`].
+    /// `crate::vmm::KtstrVmBuilder::performance_mode`.
     #[serde(default)]
     pub performance_mode: bool,
     /// Shell commands invoked before drop-to-busybox when the test's

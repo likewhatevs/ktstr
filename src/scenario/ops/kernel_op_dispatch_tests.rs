@@ -1,4 +1,3 @@
-
 //! Coverage for the kernel-op dispatch surface: the four
 //! `KernelTarget`/`KernelValue` conversion helpers plus
 //! `dispatch_kernel_op_request`'s bridge-first /

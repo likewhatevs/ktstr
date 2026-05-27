@@ -1,4 +1,4 @@
-//! Host-mode worker stall detection via /proc/<pid>/sched polling.
+//! Host-mode worker stall detection via `/proc/<pid>/sched` polling.
 //!
 //! When a scenario runs in host-mode (no VM boot — `!is_guest()` AND
 //! `!cargo_test_mode_active()`), the freeze coordinator / KVM-side
@@ -124,7 +124,7 @@ pub struct SchedSample {
 /// (or a stand-in describing why the read failed). Field
 /// extraction is best-effort: a missing `/proc/<pid>/stack`
 /// (requires `CAP_SYS_ADMIN`) does NOT block the diagnostic;
-/// every field carries its own "[unreadable: <reason>]" stand-in
+/// every field carries its own `"[unreadable: <reason>]"` stand-in
 /// so an operator triaging the stall can tell apart "kernel
 /// didn't expose it" from "monitor failed to read it".
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -158,7 +158,7 @@ pub struct StallDiagnostic {
 /// One stall report: a worker pid plus the sample window that
 /// triggered the stall predicate plus the captured diagnostic.
 ///
-/// Pushed onto [`StallMonitor::reports`] by the polling thread the
+/// Pushed onto `StallMonitor::reports` by the polling thread the
 /// moment the predicate fires. The thread continues running so
 /// subsequent stalls on the same pid (or other pids) also surface,
 /// but a pid is "re-armed" only after observing forward progress

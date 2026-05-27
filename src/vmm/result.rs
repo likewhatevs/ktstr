@@ -362,10 +362,10 @@ pub struct VmResult {
     pub kern_kaslr_offset: u64,
     /// Name of the `#[ktstr_test]` fn whose execution produced this
     /// result. Stamped from
-    /// [`crate::test_support::entry::KtstrTestEntry::name`] (a
+    /// `crate::test_support::entry::KtstrTestEntry::name` (a
     /// `&'static str` the macro emits at compile time) in
     /// `test_support::eval::run_ktstr_test_inner_impl` immediately
-    /// after [`super::KtstrVm::run`] returns and BEFORE the
+    /// after `super::KtstrVm::run` returns and BEFORE the
     /// `post_vm` callback dispatch runs.
     ///
     /// `Some(_)` for every result that flowed through the real

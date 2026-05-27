@@ -482,7 +482,7 @@ impl std::fmt::Debug for Ctx<'_> {
 
 impl Ctx<'_> {
     /// Scheduler pid, filtered to the `> 0` range that
-    /// [`process_alive`] treats as signalable.
+    /// `process_alive` treats as signalable.
     ///
     /// `Ctx::sched_pid` documents `None` as the "no scheduler
     /// configured" state, and the liveness sites destructure with

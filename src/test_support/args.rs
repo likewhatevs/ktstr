@@ -87,7 +87,7 @@ pub(crate) fn extract_export_test_arg(args: &[String]) -> Option<&str> {
 }
 
 /// Extract `--ktstr-shell-test=NAME` from the argument list. Used by
-/// [`crate::test_support::dispatch::maybe_dispatch_shell_test`] (the
+/// `crate::test_support::dispatch::maybe_dispatch_shell_test` (the
 /// test binary's main-path dispatch) to detect a `cargo ktstr shell
 /// --test <NAME>` descriptor probe — the test binary itself owns
 /// the `KTSTR_TESTS` distributed_slice, so cargo-ktstr probes each

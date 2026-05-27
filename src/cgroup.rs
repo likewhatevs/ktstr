@@ -9,7 +9,7 @@
 //! [`CgroupManager`] carries a `walk_root` that bounds two operations:
 //! - [`CgroupManager::setup`] walks every ancestor's
 //!   `cgroup.subtree_control` from `walk_root` down to `parent`;
-//! - [`CgroupManager::drain_tasks`] / [`cleanup_recursive`] drain pids
+//! - [`CgroupManager::drain_tasks`] / `cleanup_recursive` drain pids
 //!   into `{walk_root}/cgroup.procs` (a writable root that is exempt
 //!   from the kernel's no-internal-process constraint).
 //!
@@ -385,7 +385,7 @@ const MAX_OUTSTANDING_REMOVES: usize = 10;
 /// `walk_root` bounds the cgroup-fs walk for two operations:
 /// 1. [`Self::setup`] walks every ancestor's `cgroup.subtree_control`
 ///    between `walk_root` and `parent`.
-/// 2. [`Self::drain_tasks`] and [`cleanup_recursive`] drain pids into
+/// 2. [`Self::drain_tasks`] and `cleanup_recursive` drain pids into
 ///    `{walk_root}/cgroup.procs` (the writable root exempt from the
 ///    no-internal-process constraint).
 ///
@@ -412,7 +412,7 @@ pub struct CgroupManager {
 /// caller-supplied: production callers route through
 /// [`CgroupManager::move_task_with_retry`] (which talks to
 /// real `cgroup.procs` files); unit tests pass a closure that
-/// synthesises [`std::io::Error::from_raw_os_error(libc::ESRCH)`]
+/// synthesises [`std::io::Error::from_raw_os_error`]`(libc::ESRCH)`
 /// for selected pids so the partial-vanish (allowed) and
 /// all-vanished (bail) paths are both directly observable.
 ///
@@ -495,14 +495,14 @@ impl CgroupManager {
     ///
     /// Returns an error when:
     /// - **Either `parent` or `root` contains a `..` component** —
-    ///   [`PathBuf::starts_with`] is component-based and treats `..`
+    ///   [`Path::starts_with`](std::path::Path::starts_with) is component-based and treats `..`
     ///   as a literal segment, so `/sys/fs/cgroup/op/../escape` would
     ///   component-prefix `/sys/fs/cgroup/op` while the kernel
     ///   resolves the path to `/sys/fs/cgroup/escape` (outside the
     ///   delegation root). Rejecting `..` upfront keeps the prefix
     ///   invariant honest against canonical-vs-component drift.
     /// - **The manager's `parent` is not at or below `root`** —
-    ///   without the prefix invariant the [`Self::setup_under_root`]
+    ///   without the prefix invariant the `Self::setup_under_root`
     ///   strip-prefix gate would silently skip the subtree_control
     ///   walk and the caller would see downstream EACCES on the
     ///   first `set_*` write. Surfaces the misconfiguration upfront
@@ -1511,7 +1511,7 @@ impl CgroupManager {
     ///   tasks" from "no such cgroup."
     /// - Malformed pid lines: skipped with a `tracing::warn!`
     ///   naming the offending line, matching
-    ///   [`drain_pids_to_root`]'s tolerance. The kernel never emits
+    ///   `drain_pids_to_root`'s tolerance. The kernel never emits
     ///   such lines today; the tolerance exists so a future kernel
     ///   gaining a header or comment line surfaces as a warn
     ///   instead of an opaque parse error.

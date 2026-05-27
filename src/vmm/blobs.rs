@@ -36,7 +36,7 @@ pub fn load_busybox_bytes() -> Result<Vec<u8>> {
 /// `cargo-ktstr` process (and inherited child processes). Returns
 /// an error if `KTSTR_WPROF_PATH` is unset.
 ///
-/// Preferred over [`load_wprof_bytes`] when the caller intends to
+/// Preferred over `load_wprof_bytes` when the caller intends to
 /// hand the file off to the existing `include_files` initramfs
 /// pipeline, which performs `DT_NEEDED` shared-library resolution
 /// against the binary's ELF — wprof is dynamically linked

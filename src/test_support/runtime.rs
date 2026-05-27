@@ -342,7 +342,7 @@ pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
 /// Attach wprof configuration to a VM builder when the test entry
 /// declares `#[ktstr_test(wprof)]`.
 ///
-/// Shared by [`crate::test_support::eval::run_ktstr_test_inner_impl`]
+/// Shared by `crate::test_support::eval::run_ktstr_test_inner_impl`
 /// (primary VM build site) AND
 /// [`crate::test_support::probe::attempt_auto_repro`] (auto-repro VM
 /// build site) so the two wire-ups can't drift. A regression in
@@ -622,7 +622,7 @@ pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<Stri
     args.extend(entry.extra_sched_args.iter().map(|s| s.to_string()));
 }
 
-/// Retry budget for the guest's [`vmm::rust_init::send_sys_rdy_with_retry`]
+/// Retry budget for the guest's `vmm::rust_init::send_sys_rdy_with_retry`
 /// loop. Scales with vCPU count because the virtio-console
 /// multiport handshake (DEVICE_READY → PORT_ADD → PORT_READY →
 /// PORT_OPEN per `drivers/char/virtio_console.c`) issues per-CPU work

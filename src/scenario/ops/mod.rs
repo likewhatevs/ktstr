@@ -69,13 +69,13 @@ pub use setup::PLACEMENT_LOG_PATH;
 use setup::apply_setup;
 
 mod dispatch;
-use dispatch::{apply_ops, render_cgroup_key};
 #[cfg(test)]
 use dispatch::{
     REPLACE_NOT_TRYING_DEADLINE_S, build_kernel_op_request, dispatch_kernel_op_request,
     merge_adjacent_cold_writes, staged_scheduler_log_path, wait_for_accessor_publish_or_bail,
     wait_for_worker_state_not_trying_or_bail, write_entries_from_writes,
 };
+use dispatch::{apply_ops, render_cgroup_key};
 
 use std::collections::BTreeSet;
 use std::thread;
@@ -89,7 +89,6 @@ use crate::scenario::{CgroupGroup, Ctx, process_alive};
 use crate::vmm::guest_comms;
 use crate::vmm::wire::StimulusPayload;
 use crate::workload::{MemPolicy, WorkloadHandle};
-
 
 // ---------------------------------------------------------------------------
 // Step executor
@@ -1698,7 +1697,6 @@ fn validate_mempolicy_cpuset(
     }
     Ok(())
 }
-
 
 /// Collect step-local worker results and produce an AssertResult.
 ///

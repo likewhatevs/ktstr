@@ -39,11 +39,11 @@ pub struct WorkloadConfig {
     /// `Option`): `WorkloadConfig` is the spawn-time configuration
     /// passed to `WorkloadHandle::spawn`, by which point the worker
     /// count must be known. The Option-to-usize coalescing happens
-    /// upstream at [`crate::scenario::resolve_num_workers`], which
+    /// upstream at `resolve_num_workers`, which
     /// reads [`crate::workload::WorkSpec::num_workers`]
     /// (`Option<usize>` — `None` falls back to
     /// `Ctx::workers_per_cgroup`) and produces the resolved value
-    /// passed to [`Self::for_scenario_engine`]. The type asymmetry
+    /// passed to `Self::for_scenario_engine`. The type asymmetry
     /// is deliberate: `WorkSpec` is the user-facing declarative
     /// spec where `None` means "inherit the cgroup-level default",
     /// `WorkloadConfig` is the spawn-time concrete config where
@@ -270,7 +270,7 @@ impl WorkloadConfig {
     /// would be left at the binary name rather than the requested
     /// pcomm value — workers spawn but scheduler matchers filtering
     /// on the group_leader comm see zero matches. Mirrors the
-    /// composed[i].pcomm.is_some() bail at
+    /// `composed[i].pcomm.is_some()` bail at
     /// `WorkloadHandle::spawn`. Test authors wanting pcomm route via
     /// `CgroupDef::pcomm` + apply_setup pcomm-aware fan-out, or call
     /// `WorkloadHandle::spawn_pcomm_cgroup` directly.
@@ -348,7 +348,7 @@ impl WorkloadConfig {
     ///    pass. Composed entries also route through `spawn_composed`
     ///    directly, bypassing the scenario-engine's
     ///    `resolve_num_workers` resolver, so the gate must live
-    ///    here to catch composed[i].num_workers=0 before the spawn
+    ///    here to catch `composed[i].num_workers=0` before the spawn
     ///    cascade forks anything.
     /// 2. `mem_policy` on the primary group and on every composed
     ///    [`WorkSpec`] entry.
@@ -517,7 +517,7 @@ impl WorkloadConfig {
     /// - More than 15 bytes (`TASK_COMM_LEN - 1` cap).
     ///
     /// See
-    /// [`validate_task_comm_string`](crate::workload::validate_task_comm_string)
+    /// `validate_task_comm_string`
     /// for the centralized rationale; `name.len()` is the BYTE
     /// length (UTF-8 multi-byte chars count as their byte width).
     #[must_use = "builder methods consume self; bind the result"]

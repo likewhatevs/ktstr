@@ -867,7 +867,7 @@ pub enum Op {
     ///
     /// Synchronous read of the cgroup-v2 `cgroup.procs` pseudofile in
     /// the dispatching thread (in-scenario — runs wherever
-    /// `execute_scenario` runs; inside the guest VM for #[ktstr_test]
+    /// `execute_scenario` runs; inside the guest VM for `#[ktstr_test]`
     /// e2e tests, on the host for host-only scenarios). Returns the
     /// thread-group leaders (PIDs / TGIDs) the kernel reports at apply
     /// time. The snapshot is appended to the bridge's per-tag drain

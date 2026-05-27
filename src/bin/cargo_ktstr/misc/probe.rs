@@ -3,7 +3,7 @@
 //! workspace test binary with a discriminator flag.
 //!
 //! Both [`super::export::run_export`] and
-//! [`super::shell::resolve_shell_from_test_entry`] walk the same
+//! `super::shell::resolve_shell_from_test_entry` walk the same
 //! [`super::export::build_test_binaries`] output; they differ only
 //! in (a) stdio shape, (b) per-success disposition (forward stderr
 //! vs parse JSON + push), and (c) stop-on-first vs walk-all

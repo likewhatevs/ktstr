@@ -95,7 +95,7 @@ pub struct KtstrVmBuilder {
     /// have no use for wprof. `Some` embeds the binary AND records
     /// the args (rendered onto the cmdline as `KTSTR_WPROF_ARGS=…`
     /// so guest init can invoke wprof during auto-repro). Bytes
-    /// come from [`crate::vmm::blobs::load_wprof_bytes`] (which
+    /// come from `crate::vmm::blobs::load_wprof_bytes` (which
     /// reads the `KTSTR_WPROF_PATH` env var that `cargo-ktstr`
     /// sets at startup).
     pub(crate) wprof: Option<crate::vmm::wprof::WprofConfig>,

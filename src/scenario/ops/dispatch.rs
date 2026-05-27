@@ -27,7 +27,7 @@ use anyhow::{Context, Result};
 use crate::scenario::Ctx;
 use crate::workload::{ResolvedAffinity, WorkloadConfig, WorkloadHandle};
 
-use super::setup::{apply_setup, append_placement_log};
+use super::setup::{append_placement_log, apply_setup};
 use super::{
     KernelTarget, KernelValue, Op, PayloadEntry, PayloadSource, ScenarioState, SpawnPlacement,
     validate_known_flags, validate_mempolicy_cpuset,
@@ -1585,7 +1585,9 @@ fn spawn_scheduler_for_op(
 /// event with structured fields for the phase-aware sidecar
 /// pipeline to pick up; the full sidecar schema wire-in lands
 /// alongside the rest of the phase pipeline.
-pub(super) fn dispatch_attach_scheduler(scheduler: &'static crate::test_support::Scheduler) -> Result<()> {
+pub(super) fn dispatch_attach_scheduler(
+    scheduler: &'static crate::test_support::Scheduler,
+) -> Result<()> {
     // Serialize against any in-flight worker publish BEFORE the
     // dispatcher captures `seqno_before`. The accessor-init worker
     // has a 60 s boot budget for its first publish; if the user's
@@ -1687,7 +1689,9 @@ pub(super) fn dispatch_restart_scheduler() -> Result<()> {
 /// and attaches the named staged scheduler. Emits a sidecar-tagging
 /// event with both prev and new scheduler context so phase-aware
 /// analysis can attribute pre-swap vs post-swap metrics.
-pub(super) fn dispatch_replace_scheduler(scheduler: &'static crate::test_support::Scheduler) -> Result<()> {
+pub(super) fn dispatch_replace_scheduler(
+    scheduler: &'static crate::test_support::Scheduler,
+) -> Result<()> {
     let prev_pid = kill_current_scheduler("Op::ReplaceScheduler")?;
     let binary = crate::test_support::staged::staged_scheduler_binary_path(scheduler.name);
     let args = crate::test_support::staged::staged_scheduler_args_path(scheduler.name);
@@ -2064,4 +2068,3 @@ pub(super) fn render_cgroup_key(cgroup: &str) -> String {
         format!("'{cgroup}'")
     }
 }
-

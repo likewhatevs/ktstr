@@ -13,7 +13,7 @@
 //! `KTSTR_BUSYBOX_PATH`). Child processes spawned by cargo-ktstr
 //! (e.g. nextest, which fans out to per-test-binary processes)
 //! inherit these env vars; the `ktstr` library's blob-loading
-//! helpers (e.g. [`ktstr::vmm::locate_busybox_bytes`]) read the
+//! helpers (e.g. `ktstr::vmm::load_busybox_bytes`) read the
 //! env vars and load the bytes from disk on demand.
 //!
 //! This mechanism requires that the user always invokes ktstr

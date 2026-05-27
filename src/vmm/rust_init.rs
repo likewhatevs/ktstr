@@ -92,7 +92,7 @@ static SCHED_PID: AtomicI32 = AtomicI32::new(0);
 /// Live identity of the currently-attached scheduler, parallel to
 /// [`SCHED_PID`]'s pid side-channel. `null` means "no scheduler
 /// attached" — the initial value at process start and the post-
-/// [`Op::DetachScheduler`] state. Non-null points at a
+/// `Op::DetachScheduler` state. Non-null points at a
 /// `&'static SchedulerSpec` (the `binary` field of the
 /// `&'static Scheduler` the Op carries), so consumers can read
 /// `has_bpf_scheduler()` / `has_active_scheduling()` against the
@@ -2262,8 +2262,7 @@ fn spawn_wprof_if_configured() -> Option<std::thread::JoinHandle<Option<Vec<u8>>
                 // cmdline tokenization would truncate a space-joined
                 // value at the first space. Split on the same
                 // delimiter here to recover the per-arg vec.
-                let mut cmd_args: Vec<String> =
-                    args_str.split('\x1f').map(String::from).collect();
+                let mut cmd_args: Vec<String> = args_str.split('\x1f').map(String::from).collect();
                 cmd_args.extend([
                     "-T".to_string(),
                     "/tmp/wprof.pb".to_string(),

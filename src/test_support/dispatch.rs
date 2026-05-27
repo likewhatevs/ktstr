@@ -2247,7 +2247,7 @@ fn run_host_only_test_inner(entry: &KtstrTestEntry) -> Result<AssertResult> {
 /// `/sys/fs/cgroup/ktstr` with appropriate ownership, OR overrides via
 /// `KTSTR_HOST_CGROUP_PARENT` to point at a path inside a delegated
 /// subtree) invocations. See [`resolve_host_cgroup_parent`] for the
-/// env-override path and [`build_host_cgroup_manager`] for the
+/// env-override path and `build_host_cgroup_manager` for the
 /// cgroup-v2 Mode B/C delegation wire-up.
 ///
 /// `pub` so integration tests can pin against it instead of mirroring
@@ -2267,7 +2267,7 @@ pub const DEFAULT_HOST_CGROUP_PARENT: &str = "/sys/fs/cgroup/ktstr";
 ///
 /// Non-root callers are admitted: cgroup-v2 user delegation (Mode
 /// B/C: systemd `Delegate=yes`, container `nsdelegate`) is handled
-/// by [`build_host_cgroup_manager`] threading
+/// by `build_host_cgroup_manager` threading
 /// [`crate::KTSTR_CGROUP_WALK_ROOT_ENV`] into
 /// [`crate::cgroup::CgroupManager::with_walk_root`] so the
 /// `subtree_control` walk bails at the delegation root instead of

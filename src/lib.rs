@@ -938,7 +938,7 @@ pub const KTSTR_ORCHESTRATED_ENV: &str = "KTSTR_ORCHESTRATED";
 /// `KTSTR_*_ENV` consts gives the operator the complete env-var
 /// inventory.
 ///
-/// Read by [`crate::test_support::dispatch::resolve_host_cgroup_parent`].
+/// Read by `crate::test_support::dispatch::resolve_host_cgroup_parent`.
 pub const KTSTR_HOST_CGROUP_PARENT_ENV: &str = "KTSTR_HOST_CGROUP_PARENT";
 
 /// Name of the environment variable that overrides the cgroup-fs
@@ -975,7 +975,7 @@ pub const KTSTR_HOST_CGROUP_PARENT_ENV: &str = "KTSTR_HOST_CGROUP_PARENT";
 /// `KTSTR_*_ENV` consts gives the operator the complete env-var
 /// inventory.
 ///
-/// Read by [`crate::test_support::dispatch::resolve_host_cgroup_parent`].
+/// Read by `crate::test_support::dispatch::resolve_host_cgroup_parent`.
 pub const KTSTR_CGROUP_WALK_ROOT_ENV: &str = "KTSTR_CGROUP_WALK_ROOT";
 
 /// Name of the environment variable that overrides the poll cadence
@@ -998,7 +998,7 @@ pub const KTSTR_CGROUP_WALK_ROOT_ENV: &str = "KTSTR_CGROUP_WALK_ROOT";
 /// poller with a zero interval (which would either busy-loop or be
 /// no-op-rejected).
 ///
-/// Read once at [`crate::scenario::host_stall::spawn_monitor`] when the
+/// Read once at `crate::scenario::host_stall::spawn_monitor` when the
 /// scenario engine spawns the monitor; mid-scenario env mutations
 /// are NOT observed by the running thread.
 ///
@@ -1065,7 +1065,7 @@ pub const KTSTR_VERIFIER_RAW_ENV: &str = "KTSTR_VERIFIER_RAW";
 ///
 /// **Empty = unset** per the default contract — empty value is
 /// treated as not set. The canonical reader at
-/// [`crate::test_support::runtime::no_perf_mode_active`] uses
+/// `crate::test_support::runtime::no_perf_mode_active` uses
 /// `.map(|v| !v.is_empty()).unwrap_or(false)` after a prior
 /// regression where CI shells exporting `KTSTR_NO_PERF_MODE=`
 /// silently disabled perf mode for every `performance_mode` test.
@@ -1093,7 +1093,7 @@ pub const KTSTR_GHA_CACHE_ENV: &str = "KTSTR_GHA_CACHE";
 /// `KTSTR_CARGO_TEST_MODE` is for narrower cases like in-process
 /// VMM tests that adapt their resource budgets when run via
 /// `cargo test` / `cargo nextest`. Read via
-/// [`crate::cargo_test_mode::cargo_test_mode_active`]: treats
+/// `crate::cargo_test_mode::cargo_test_mode_active`: treats
 /// unset and empty as disabled; ANY non-empty value enables —
 /// no trim, no special-case strings (`"0"` and `"false"` ENABLE
 /// because they're non-empty).
@@ -1103,16 +1103,16 @@ pub const KTSTR_CARGO_TEST_MODE_ENV: &str = "KTSTR_CARGO_TEST_MODE";
 /// root directory (kernel-build cache, btf-anchor cache, blob
 /// cache, etc.). Empty / unset falls back to the per-user default
 /// (typically `$HOME/.cache/ktstr`). Heavy test usage —
-/// [`crate::test_support::test_helpers::IsolatedCacheDir`] sets it
+/// `crate::test_support::test_helpers::IsolatedCacheDir` sets it
 /// to a temp dir per-test so cache reads don't leak host state
 /// into the test, and post-test the original value is restored
-/// via [`crate::test_support::test_helpers::EnvVarGuard`].
+/// via `crate::test_support::test_helpers::EnvVarGuard`.
 pub const KTSTR_CACHE_DIR_ENV: &str = "KTSTR_CACHE_DIR";
 
 /// Name of the environment variable that overrides ktstr's flock
 /// directory for inter-process resource locking (cpuset / LLC
 /// reservation locks). Empty / unset falls back to the hardcoded
-/// `/tmp` default at [`crate::cache::resolve::resolve_lock_dir`]
+/// `/tmp` default at `crate::cache::resolve::resolve_lock_dir`
 /// (the literal string, not `std::env::temp_dir()` / `TMPDIR`
 /// resolution — historical default kept for stability). Used by
 /// tests + CI environments that need isolated lock-dirs.
@@ -1122,7 +1122,7 @@ pub const KTSTR_LOCK_DIR_ENV: &str = "KTSTR_LOCK_DIR";
 /// in the VMM setup phase. Strict `v == "1"` semantics (only the
 /// literal `"1"` enables; unset / empty / any other value —
 /// including `"true"`, `"yes"`, `"0"` — is disabled). Read at
-/// [`crate::vmm::setup`] L1263-1266 (x86_64 cmdline) and
+/// `crate::vmm::setup` L1263-1266 (x86_64 cmdline) and
 /// L1680-1683 (aarch64 cmdline); both readers identical.
 pub const KTSTR_VERBOSE_ENV: &str = "KTSTR_VERBOSE";
 
@@ -1141,7 +1141,7 @@ pub const KTSTR_BYPASS_LLC_LOCKS_ENV: &str = "KTSTR_BYPASS_LLC_LOCKS";
 /// Name of the environment variable that caps the host CPU count
 /// the scenario engine sees, for testing scaling logic without a
 /// real CPU narrowing. Read at
-/// [`crate::vmm::host_topology`] and set by the `--cpu-cap` CLI
+/// `crate::vmm::host_topology` and set by the `--cpu-cap` CLI
 /// flag in the bin entry points. Empty falls back to the
 /// host's actual CPU count; non-empty numeric value caps the
 /// observed count.
@@ -1169,7 +1169,7 @@ pub const KTSTR_NO_SKIP_MODE_ENV: &str = "KTSTR_NO_SKIP_MODE";
 /// Name of the environment variable that overrides the per-test
 /// budget in seconds for VM-boot dispatch. Empty / unset falls
 /// back to the dispatcher's default. Parsed as f64 seconds at
-/// [`crate::test_support::dispatch`] (accepts fractional values
+/// `crate::test_support::dispatch` (accepts fractional values
 /// like `2.5`); invalid or non-positive values surface a warn
 /// and the default applies.
 pub const KTSTR_BUDGET_SECS_ENV: &str = "KTSTR_BUDGET_SECS";
@@ -1178,20 +1178,20 @@ pub const KTSTR_BUDGET_SECS_ENV: &str = "KTSTR_BUDGET_SECS";
 /// output directory (the per-test `*.sidecar.json` write target).
 /// Empty / unset falls back to the per-test
 /// `target/ktstr/<run-id>` location. Read at
-/// [`crate::test_support::sidecar`] +
-/// [`crate::cli::stats_cmds::dispatch`] (the stats reader).
+/// `crate::test_support::sidecar` +
+/// `crate::cli::stats_cmds::dispatch` (the stats reader).
 pub const KTSTR_SIDECAR_DIR_ENV: &str = "KTSTR_SIDECAR_DIR";
 
 /// Name of the environment variable that overrides the scheduler
 /// binary path test_support::eval uses for in-process scheduler
 /// dispatch. Empty / unset falls back to the workspace's built
-/// scx-ktstr binary. Read at [`crate::test_support::eval`].
+/// scx-ktstr binary. Read at `crate::test_support::eval`.
 pub const KTSTR_SCHEDULER_ENV: &str = "KTSTR_SCHEDULER";
 
 /// Name of the environment variable that overrides the kernel
 /// path the eval dispatch reads (orthogonal to
 /// [`KTSTR_KERNEL_ENV`] which the main entry points use). Read
-/// at [`crate::test_support::eval::resolve_test_kernel`] L3148-
+/// at `crate::test_support::eval::resolve_test_kernel` L3148-
 /// L3152: a set-but-empty `KTSTR_TEST_KERNEL=` surfaces a
 /// `KTSTR_TEST_KERNEL not found:` hard error (typo-loud per
 /// reader comment); ONLY the unset / `Err(NotPresent)` case
@@ -1204,7 +1204,7 @@ pub const KTSTR_TEST_KERNEL_ENV: &str = "KTSTR_TEST_KERNEL";
 /// Name of the environment variable cargo-ktstr's spawn-pipeline
 /// sets to "1" inside the guest-side init binary so the binary
 /// detects it's running as the guest init. Presence check via
-/// `var_os(...).is_none()` at [`crate::workload::spawn`] —
+/// `var_os(...).is_none()` at `crate::workload::spawn` —
 /// absent in host-side dispatch.
 ///
 /// **Deviates from the contract-default empty-as-unset rule**:
@@ -1249,7 +1249,7 @@ pub const KTSTR_LOG_PASSES_ENV: &str = "KTSTR_LOG_PASSES";
 /// `install_env` (see `bin/cargo_ktstr/blobs.rs`) which extracts
 /// the embedded `BUSYBOX_BYTES` to a tempfile and sets this var
 /// to the absolute path; read by
-/// [`crate::vmm::blobs::load_busybox_bytes`]. Both unset and
+/// `crate::vmm::blobs::load_busybox_bytes`. Both unset and
 /// set-but-empty surface a hard error, BUT the diagnostic
 /// differs: unset hits the `Err(_)` arm and surfaces the
 /// "blob is provided by `cargo-ktstr` at startup" install-env
@@ -1266,7 +1266,7 @@ pub const KTSTR_BUSYBOX_PATH_ENV: &str = "KTSTR_BUSYBOX_PATH";
 /// `install_env` (see `bin/cargo_ktstr/blobs.rs`) which extracts
 /// the embedded `WPROF_BYTES` to a tempfile and sets this var to
 /// the absolute path; read by
-/// [`crate::vmm::blobs::load_wprof_path`]. Same error-path
+/// `crate::vmm::blobs::load_wprof_path`. Same error-path
 /// asymmetry as [`KTSTR_BUSYBOX_PATH_ENV`]: unset surfaces the
 /// install-env hint, empty falls through to a generic file-read
 /// error.
@@ -1579,10 +1579,10 @@ pub(crate) fn resolve_current_exe() -> anyhow::Result<std::path::PathBuf> {
 ///   `vmm::KtstrVm::builder`'s `.disk(..)` so the guest probes a
 ///   raw block device sized per `disk.capacity_mib`.
 /// `wprof_args`: when `Some`, replaces
-///   [`vmm::wprof::WprofConfig::args`] (whose default comes from
-///   [`vmm::wprof::WprofConfig::default_args`]) with the tokenised
+///   `vmm::wprof::WprofConfig::args` (whose default comes from
+///   `vmm::wprof::WprofConfig::default_args`) with the tokenised
 ///   value before booting; `None` keeps the default args. Only takes
-///   effect if [`vmm::wprof::WprofConfig::from_env`] succeeded (a
+///   effect if `vmm::wprof::WprofConfig::from_env` succeeded (a
 ///   wprof binary is locatable); otherwise the override has no
 ///   target and is dropped along with the entire wprof config (shell
 ///   mode soft-fails wprof setup so the VM still boots).
@@ -1592,12 +1592,12 @@ pub(crate) fn resolve_current_exe() -> anyhow::Result<std::path::PathBuf> {
 ///   override). Use `None` to defer to defaults; pass `Some("")`
 ///   ONLY when an empty arg list is the intent.
 /// `performance_mode`: forwarded to
-///   [`vmm::KtstrVmBuilder::performance_mode`]; when `true`, the
+///   `vmm::KtstrVmBuilder::performance_mode`; when `true`, the
 ///   builder pins vCPU threads, applies hugepages, NUMA mbinds, and
 ///   promotes vCPU threads to SCHED_FIFO (host-side optimizations).
 /// `sched_enable_cmds` / `sched_disable_cmds`: forwarded to
-///   [`vmm::KtstrVmBuilder::sched_enable_cmds`] /
-///   [`vmm::KtstrVmBuilder::sched_disable_cmds`]. Non-empty when the
+///   `vmm::KtstrVmBuilder::sched_enable_cmds` /
+///   `vmm::KtstrVmBuilder::sched_disable_cmds`. Non-empty when the
 ///   shell is reproducing a test whose scheduler is a
 ///   [`test_support::SchedulerSpec::KernelBuiltin`] variant —
 ///   guest init runs the enable cmds before drop-to-busybox and the

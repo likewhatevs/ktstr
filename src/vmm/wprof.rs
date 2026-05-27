@@ -18,7 +18,7 @@ use anyhow::Result;
 
 /// Minimum guest memory (MiB) for test entries that enable wprof.
 ///
-/// Derivation: [`WprofConfig::default_args`] requests
+/// Derivation: `WprofConfig::default_args` requests
 /// `--ringbuf-size=256000 --ringbuf-cnt=8`. wprof rounds the
 /// 256000 KB request up to the next power of two (262144 KB =
 /// 256 MiB) per ringbuf, times 8 ringbufs = 2048 MiB BPF arena.
@@ -27,10 +27,10 @@ use anyhow::Result;
 /// and a confused test author.
 ///
 /// Applied as a floor by
-/// [`crate::test_support::runtime::derive_test_memory_mib`] —
+/// `crate::test_support::runtime::derive_test_memory_mib` —
 /// the single derivation site shared by the entry-derived
 /// topology path AND every dispatch site that constructs a
-/// [`crate::test_support::topo::TopoOverride`] from CLI / preset
+/// `crate::test_support::topo::TopoOverride` from CLI / preset
 /// topology (so e.g. `cargo ktstr test --ktstr-topo NnNlNcNt` and
 /// gauntlet preset runs honor the floor identically). Both
 /// primary and auto-repro VMs route through the same derivation
@@ -40,14 +40,14 @@ use anyhow::Result;
 /// The floor applies when the derived memory
 /// `max(cpus*64, 256, entry.memory_mib)` falls below 2048 MiB
 /// AND `entry.wprof` is true. An operator-supplied
-/// [`crate::test_support::topo::TopoOverride`] with explicit
+/// `crate::test_support::topo::TopoOverride` with explicit
 /// `memory_mib` is honored verbatim per the override-is-verbatim
 /// contract — a warn-level log fires when the override conflicts
 /// with the floor, but the operator's choice wins. Shell-mode VMs
 /// (`cargo ktstr shell --kernel ...`) bypass this floor entirely;
 /// the operator sets memory size via shell-mode CLI args.
 ///
-/// Tracks [`WprofConfig::default_args`]: a future change to
+/// Tracks `WprofConfig::default_args`: a future change to
 /// `--ringbuf-size` or `--ringbuf-cnt` invalidates the 2048
 /// derivation and this const should move with the args.
 pub const WPROF_MIN_MEMORY_MIB: u32 = 2048;
@@ -61,7 +61,7 @@ pub const WPROF_MIN_MEMORY_MIB: u32 = 2048;
 /// floor formula.
 ///
 /// Single source of truth shared by
-/// [`crate::test_support::runtime::derive_test_memory_mib`] (the
+/// `crate::test_support::runtime::derive_test_memory_mib` (the
 /// test-launch path used by `cargo ktstr test`) AND by
 /// `cargo ktstr shell --test <NAME>`'s router (which constructs a
 /// shell VM matching the named test's topology). A future change

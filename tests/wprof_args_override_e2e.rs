@@ -153,9 +153,7 @@ fn wprof_args_override_propagates_to_guest_cmdline(ctx: &Ctx) -> Result<AssertRe
     // padded inputs must canonicalize the input first OR build
     // the expected token from a post-`split_whitespace` re-join.
     let joined = OVERRIDE_ARGS
-        .iter()
-        .copied()
-        .collect::<Vec<_>>()
+        .to_vec()
         .join(&WPROF_ARGS_CMDLINE_DELIM.to_string());
     let expected = format!("KTSTR_WPROF_ARGS={joined}");
     if !cmdline.contains(&expected) {

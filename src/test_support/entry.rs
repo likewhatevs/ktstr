@@ -1274,7 +1274,7 @@ pub struct KtstrTestEntry {
     /// unless overridden by [`Self::wprof_args`].
     ///
     /// When the framework can't load the wprof binary
-    /// ([`crate::vmm::wprof::WprofConfig::from_env`] fails — typically
+    /// (`crate::vmm::wprof::WprofConfig::from_env` fails — typically
     /// because `KTSTR_WPROF_PATH` was not set by `cargo-ktstr`'s
     /// `install_env`), the test fails loudly rather than silently
     /// running without wprof — per the no-silent-drops contract,
@@ -1283,7 +1283,7 @@ pub struct KtstrTestEntry {
     /// Populated by `#[ktstr_test(wprof)]` or `#[ktstr_test(wprof = true)]`.
     pub wprof: bool,
     /// Custom wprof CLI args, overriding
-    /// [`crate::vmm::wprof::WprofConfig::default_args`]. Only
+    /// `crate::vmm::wprof::WprofConfig::default_args`. Only
     /// meaningful when [`Self::wprof`] is `true`. Parsed as
     /// space-separated tokens.
     ///
