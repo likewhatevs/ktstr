@@ -54,6 +54,7 @@ jobs:
       fail-fast: false
       matrix:
         kernel-version: ['6.14', '7.0']
+        features: ['', 'wprof']
     env:
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
@@ -67,7 +68,7 @@ jobs:
         with:
           tool: cargo-nextest
       - run: just kernel-build ${{ matrix.kernel-version }}
-      - run: just test ${{ matrix.kernel-version }}
+      - run: just test ${{ matrix.kernel-version }} ${{ matrix.features }}
       - if: ${{ !cancelled() }}
         run: just sccache-stats
       - if: ${{ !cancelled() }}
@@ -86,6 +87,7 @@ jobs:
       fail-fast: false
       matrix:
         kernel-version: ['6.14', '7.0']
+        features: ['', 'wprof']
     env:
       CARGO_BUILD_JOBS: "32"
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
@@ -100,7 +102,7 @@ jobs:
         with:
           tool: cargo-nextest
       - run: just kernel-build ${{ matrix.kernel-version }}
-      - run: just test ${{ matrix.kernel-version }}
+      - run: just test ${{ matrix.kernel-version }} ${{ matrix.features }}
       - if: ${{ !cancelled() }}
         run: just sccache-stats
       - if: ${{ !cancelled() }}
@@ -128,7 +130,7 @@ jobs:
         with:
           tool: cargo-llvm-cov,cargo-nextest
       - run: just kernel-build
-      - run: just coverage
+      - run: just coverage wprof
       - if: ${{ !cancelled() }}
         run: just sccache-stats
       - name: Upload coverage to Codecov
@@ -154,7 +156,7 @@ jobs:
         with:
           tool: cargo-llvm-cov,cargo-nextest
       - run: just kernel-build
-      - run: just coverage
+      - run: just coverage wprof
       - if: ${{ !cancelled() }}
         run: just sccache-stats
       - name: Upload coverage to Codecov

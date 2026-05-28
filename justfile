@@ -13,7 +13,9 @@ fmt:
 lint:
     cargo fmt -- --check
     cargo check --workspace --all-targets
+    cargo check --workspace --all-targets --features wprof
     cargo clippy --workspace --all-targets
+    cargo clippy --workspace --all-targets --features wprof
     just doc-strict
 
 # Promote every rustdoc warning to an error. RUSTDOCFLAGS reaches every
@@ -30,9 +32,10 @@ doc-strict:
 kernel-build version="":
     cargo run --bin cargo-ktstr -- ktstr kernel build --skip-sha256 {{version}}
 
-# Run tests against a kernel version
-test kernel:
-    cargo run --bin cargo-ktstr -- ktstr test --kernel {{kernel}} -- --profile ci --features integration -j $(nproc)
+# Run tests against a kernel version. `extra-features` appends to the
+# feature list (e.g. `just test 6.14 wprof` → `--features integration,wprof`).
+test kernel extra-features="":
+    cargo run --bin cargo-ktstr -- ktstr test --kernel {{kernel}} -- --profile ci --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} -j $(nproc)
 
 # Run trybuild compile_fail fixtures.
 #
@@ -50,11 +53,11 @@ test kernel:
 # Regenerate snapshots after intentional diagnostic changes:
 #   TRYBUILD=overwrite just compile-fail
 compile-fail:
-    cargo nextest run --profile ci -E 'binary(compile_fail) & test(=compile_fail)' --run-ignored all
+    cargo nextest run --profile ci --features wprof -E 'binary(compile_fail) & test(=compile_fail)' --run-ignored all
 
-# Run coverage
-coverage:
-    cargo run --bin cargo-ktstr -- ktstr coverage -- --profile ci --lcov --output-path lcov.info --features integration --exclude-from-report scx-ktstr
+# Run coverage. `extra-features` appends to the feature list.
+coverage extra-features="":
+    cargo run --bin cargo-ktstr -- ktstr coverage -- --profile ci --lcov --output-path lcov.info --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} --exclude-from-report scx-ktstr
 
 # Show sccache statistics
 sccache-stats:
