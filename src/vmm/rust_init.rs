@@ -212,9 +212,9 @@ pub(crate) fn sched_exit_monitor_slot_is_empty() -> bool {
 /// and install it into the slot. Op handler calls this AFTER the
 /// new scheduler is spawned and SCHED_PID is published, so the
 /// monitor watches the post-Op PID. `log_path` is the per-spawn
-/// log file path — for Op::ReplaceScheduler / Op::AttachScheduler
-/// it's the seq-suffixed staged log path; for Op::RestartScheduler
-/// it's `/tmp/sched.log`.
+/// log file path — all three lifecycle Ops (Attach, Replace,
+/// Restart) pass the seq-suffixed path from
+/// `staged_scheduler_log_path`.
 ///
 /// Uses the boot-captured `suppress_com2` + `probe_output_done`
 /// so the new monitor behaves identically to the boot monitor. If
@@ -1574,6 +1574,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
             dump_sched_output(log_path);
         }
     }
+    dump_staged_scheduler_logs();
     exec_shell_script("/sched_disable");
 
     // Phase 6b: probe finalisation. Now that the scheduler is
@@ -4268,6 +4269,34 @@ fn dump_sched_output(log_path: &str) {
     crate::vmm::guest_comms::send_sched_log(crate::verifier::SCHED_OUTPUT_START.as_bytes());
     send_sched_log_file(log_path);
     crate::vmm::guest_comms::send_sched_log(crate::verifier::SCHED_OUTPUT_END.as_bytes());
+}
+
+/// Walk `/tmp/sched_*.log` and emit each non-empty file as a
+/// separate `SCHED_OUTPUT_START` / `SCHED_OUTPUT_END` frame.
+/// Captures logs from Op-spawned schedulers (Attach, Replace,
+/// Restart) that the boot path's single `dump_sched_output` call
+/// cannot reach. Sorted by filename so the host sees logs in
+/// spawn order (the monotonic seq suffix from
+/// `staged_scheduler_log_path` guarantees lexicographic = temporal).
+fn dump_staged_scheduler_logs() {
+    let Ok(entries) = fs::read_dir("/tmp") else {
+        return;
+    };
+    let mut paths: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("sched_") && n.ends_with(".log"))
+        })
+        .collect();
+    paths.sort();
+    for p in paths {
+        if let Some(s) = p.to_str() {
+            dump_sched_output(s);
+        }
+    }
 }
 
 /// Read the scheduler log file and emit it to the host as one or

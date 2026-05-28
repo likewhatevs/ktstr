@@ -1664,18 +1664,15 @@ pub(super) fn dispatch_detach_scheduler() -> Result<()> {
 /// scheduler survives detach + reattach cleanly) is covered.
 pub(super) fn dispatch_restart_scheduler() -> Result<()> {
     let prev_pid = kill_current_scheduler("Op::RestartScheduler")?;
+    let log = staged_scheduler_log_path("boot");
     spawn_scheduler_for_op(
         "Op::RestartScheduler",
         "/scheduler",
         "/sched_args",
-        "/tmp/sched.log",
+        &log,
         "boot",
     )?;
-    // Re-install monitor against the re-spawned boot scheduler's
-    // pid. Boot log path matches the spawn_scheduler_for_op log
-    // arg above so the monitor's failure-dump payload writes to
-    // the same file the re-spawned scheduler uses.
-    crate::vmm::rust_init::restart_sched_exit_monitor_with_log(Some("/tmp/sched.log"));
+    crate::vmm::rust_init::restart_sched_exit_monitor_with_log(Some(&log));
     tracing::info!(
         op = "RestartScheduler",
         prev_pid = prev_pid,
