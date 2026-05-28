@@ -1,3 +1,4 @@
+#![cfg(feature = "wprof")]
 //! End-to-end: `#[ktstr_test(scheduler, wprof, expect_auto_repro)]`
 //! produces EXIT_PASS via the verdict-inversion path when the primary
 //! VM's test body fails AND the auto-repro VM lands a shape-valid

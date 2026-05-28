@@ -1,3 +1,4 @@
+#![cfg(feature = "wprof")]
 //! End-to-end: `#[ktstr_test(wprof, auto_repro = true)]` fires
 //! the auto-repro path when the primary VM's scenario reports a
 //! failure.

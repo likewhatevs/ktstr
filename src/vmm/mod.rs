@@ -59,6 +59,7 @@ pub mod host_topology;
 pub mod initramfs;
 pub(crate) mod kvm_stats;
 pub mod topology;
+#[cfg(feature = "wprof")]
 pub mod wprof;
 
 // `pub(crate) mod` — crate-internal sub-modules.
@@ -420,10 +421,7 @@ pub struct KtstrVm {
     /// `Some(bytes)` writes the provided bytes. Sourced from
     /// [`crate::vmm::blobs::load_busybox_bytes`].
     pub(crate) busybox_bytes: Option<Vec<u8>>,
-    /// wprof binary + args packed at `bin/wprof` and exposed on
-    /// the kernel cmdline (`KTSTR_WPROF_ARGS=…`). `None` skips
-    /// packing — most VMs do not need profiling. See
-    /// [`crate::vmm::wprof::WprofConfig`].
+    #[cfg(feature = "wprof")]
     pub(crate) wprof: Option<crate::vmm::wprof::WprofConfig>,
     /// Forward COM1 (kernel console) to stderr in real-time during
     /// interactive shell mode. Useful for watching virtio probe and

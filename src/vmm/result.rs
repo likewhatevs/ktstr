@@ -373,8 +373,8 @@ pub struct VmResult {
     /// `freeze_coord::collect_results` direct-synthesis path
     /// (entry-agnostic boundary; entry is not in scope there) and
     /// for `#[cfg(test)]`-only `Self::test_fixture` callers. The
-    /// path-derivation methods [`Self::wprof_pb_path`] and
-    /// [`Self::repro_wprof_pb_path`] bail with a loud diagnostic
+    /// path-derivation methods `wprof_pb_path` and
+    /// `repro_wprof_pb_path` (require the `wprof` feature) bail with a loud diagnostic
     /// on `None` so any `VmResult` reaching the derivation path
     /// without going through the eval-layer stamping site
     /// surfaces the misuse rather than producing a garbage-named
@@ -486,21 +486,9 @@ impl VmResult {
         }
     }
 
-    /// Per-test sidecar path where the `.wprof.pb` artifact lands
-    /// after `vm.run()` returns. Derives the path as
-    /// `{sidecar_dir()}/{entry_name}.wprof.pb` — mirrors the writer
-    /// site in `test_support::eval::run_ktstr_test_inner`'s
-    /// `MsgType::WprofTrace` handler.
-    ///
-    /// Returns `Err` with an actionable diagnostic when
-    /// [`Self::entry_name`] is `None` (the
-    /// `freeze_coord::collect_results` direct-synthesis path leaves
-    /// it `None` and the eval-layer's `run_ktstr_test_inner_impl`
-    /// stamps `Some(entry.name)` after `vm.run()` returns; a `None`
-    /// reaching this method means the stamping path was bypassed).
-    /// The loud bail is the structural pin for drift-safe test
-    /// naming: a `post_vm` callback that derives the path through
-    /// this method cannot hardcode a stale fn-name literal.
+    /// Per-test sidecar path for the `.wprof.pb` artifact:
+    /// `{sidecar_dir()}/{entry_name}.wprof.pb`.
+    #[cfg(feature = "wprof")]
     pub fn wprof_pb_path(&self) -> anyhow::Result<std::path::PathBuf> {
         let name = self.entry_name.ok_or_else(|| {
             anyhow::anyhow!(
@@ -517,19 +505,8 @@ impl VmResult {
         Ok(crate::test_support::sidecar_dir().join(format!("{name}.wprof.pb")))
     }
 
-    /// Per-test sidecar path where the `.repro.wprof.pb` artifact
-    /// lands when `entry.auto_repro = true` AND the primary VM
-    /// reported failure AND auto-repro fired. Derives the path as
-    /// `{sidecar_dir()}/{entry_name}.repro.wprof.pb` — mirrors the
-    /// auto-repro writer in
-    /// `test_support::eval::run_ktstr_test_inner`. Distinct from
-    /// [`Self::wprof_pb_path`] because the primary-VM and auto-repro
-    /// VM artifacts have different lifecycles: primary always lands
-    /// when wprof attached, auto-repro lands only on the conditional
-    /// re-run.
-    ///
-    /// Returns `Err` symmetric to [`Self::wprof_pb_path`] when
-    /// [`Self::entry_name`] is `None`.
+    /// Per-test sidecar path for the `.repro.wprof.pb` artifact.
+    #[cfg(feature = "wprof")]
     pub fn repro_wprof_pb_path(&self) -> anyhow::Result<std::path::PathBuf> {
         let name = self.entry_name.ok_or_else(|| {
             anyhow::anyhow!(
@@ -568,8 +545,7 @@ impl VmResult {
     ///
     /// # Errors
     ///
-    /// Returns `Err` symmetric to [`Self::wprof_pb_path`] when
-    /// [`Self::entry_name`] is `None`.
+    /// Returns `Err` when [`Self::entry_name`] is `None`.
     pub fn failure_dump_path(&self) -> anyhow::Result<std::path::PathBuf> {
         let name = self.entry_name.ok_or_else(|| {
             anyhow::anyhow!(
@@ -586,25 +562,9 @@ impl VmResult {
         Ok(crate::test_support::sidecar_dir().join(format!("{name}.failure-dump.json")))
     }
 
-    /// Skip-on-fail wrapper that asserts the primary-VM `.wprof.pb`
-    /// landed at the expected sidecar path and satisfies the wprof
-    /// shape contract — file exists, size >=
-    /// [`crate::test_support::wprof::WPROF_PB_MIN_BYTES`], leads
-    /// with [`crate::test_support::wprof::PERFETTO_TRACE_PACKETS_TAG`].
-    ///
-    /// Returns `Ok(())` immediately when `self.success` is `false`
-    /// (the framework's failure path emits its own diagnostic before
-    /// the `post_vm` callback runs; suppressing the assertion here
-    /// avoids drowning the real fail message in a secondary
-    /// missing-artifact failure). Otherwise delegates to
-    /// [`crate::test_support::wprof::assert_wprof_pb_shape`] on
-    /// [`Self::wprof_pb_path`]'s result.
-    ///
-    /// Replaces the inline 7-line `if !result.success { return Ok(());
-    /// } let pb = wprof_pb_path("<literal>"); assert_wprof_pb_shape(&pb)`
-    /// boilerplate previously duplicated across wprof-artifact tests.
-    /// The literal-fn-name footgun is gone — the path derives from
-    /// the macro-stamped [`Self::entry_name`].
+    /// Assert the primary-VM `.wprof.pb` landed and is shape-valid.
+    /// Returns `Ok(())` immediately when `self.success` is false.
+    #[cfg(feature = "wprof")]
     pub fn assert_wprof_pb_landed(&self) -> anyhow::Result<()> {
         if !self.success {
             return Ok(());
@@ -1042,10 +1002,7 @@ mod tests {
         assert_eq!(c.snapshot_bridge.len(), 1);
     }
 
-    /// `wprof_pb_path()` bails on a manually-constructed VmResult
-    /// whose `entry_name` is `None`. Pins the structural drift-safe
-    /// contract: post_vm callbacks that reach this method without the
-    /// eval-layer stamping cannot silently produce a garbage path.
+    #[cfg(feature = "wprof")]
     #[test]
     fn vm_result_wprof_pb_path_bails_when_entry_name_none() {
         let r = VmResult::test_fixture();
@@ -1063,11 +1020,7 @@ mod tests {
         );
     }
 
-    /// Happy-path: `wprof_pb_path()` returns the writer-mirror path
-    /// `{sidecar_dir()}/{entry_name}.wprof.pb` when entry_name is
-    /// populated. Pins the format string against drift between the
-    /// host-side writer (eval.rs MsgType::WprofTrace arm) and this
-    /// derivation method.
+    #[cfg(feature = "wprof")]
     #[test]
     fn vm_result_wprof_pb_path_returns_writer_mirror_path() {
         let r = VmResult {
@@ -1087,9 +1040,7 @@ mod tests {
         );
     }
 
-    /// Symmetric bail-on-None for the auto-repro variant. Same
-    /// rationale as the primary `.wprof.pb` path: silent garbage-path
-    /// construction is the failure mode the loud bail prevents.
+    #[cfg(feature = "wprof")]
     #[test]
     fn vm_result_repro_wprof_pb_path_bails_when_entry_name_none() {
         let r = VmResult::test_fixture();
@@ -1101,9 +1052,7 @@ mod tests {
         assert!(msg.contains("run_ktstr_test_inner_impl"));
     }
 
-    /// Happy-path for the auto-repro variant. Format string
-    /// `{entry_name}.repro.wprof.pb` mirrors the host-side
-    /// auto-repro writer in eval.rs.
+    #[cfg(feature = "wprof")]
     #[test]
     fn vm_result_repro_wprof_pb_path_returns_writer_mirror_path() {
         let r = VmResult {
@@ -1118,18 +1067,7 @@ mod tests {
         );
     }
 
-    /// `assert_wprof_pb_landed()` returns Ok(()) immediately when
-    /// `success` is false WITHOUT touching `entry_name` or reading
-    /// the sidecar file. Pins the framework's "let the runner render
-    /// the real failure" suppression contract: a callback that
-    /// asserts wprof shape on a crashed-VM result would otherwise
-    /// drown the original failure in a missing-artifact secondary.
-    ///
-    /// Uses a `test_fixture` with `success: false` AND `entry_name:
-    /// None`. If the skip-on-fail short-circuit regressed, the
-    /// downstream `entry_name` bail would fire and the test would
-    /// see an `Err`. The `Ok(())` result confirms the short-circuit
-    /// fired BEFORE the entry_name pre-check.
+    #[cfg(feature = "wprof")]
     #[test]
     fn vm_result_assert_wprof_pb_landed_skips_when_success_false() {
         let r = VmResult {

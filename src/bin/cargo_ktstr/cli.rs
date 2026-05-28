@@ -491,8 +491,9 @@ pub(crate) enum KtstrCommand {
         /// ambiguous names (same NAME registered in two binaries)
         /// bail with a list of the matching binaries. The shell VM
         /// boots with the test's topology axes (numa_nodes, llcs,
-        /// cores, threads), the test's memory_mib (or its derived
-        /// floor when `entry.wprof` is set), and the union of the
+        /// cores, threads), the test's memory_mib (with the wprof
+        /// memory floor when the `wprof` feature is enabled and
+        /// `entry.wprof` is set), and the union of the
         /// test's `extra_include_files` with operator-supplied
         /// `-i` flags. Before VM boot, prints a one-line banner to
         /// stderr naming the test + scheduler so an operator can

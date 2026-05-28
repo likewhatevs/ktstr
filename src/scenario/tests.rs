@@ -1605,6 +1605,7 @@ fn ctx_failure_dump_path_bails_when_entry_name_none() {
     );
 }
 
+#[cfg(feature = "wprof")]
 #[test]
 fn ctx_wprof_pb_path_returns_sidecar_named_path() {
     let (cgroups, topo) = ctx_method_test_fixture();
@@ -1622,6 +1623,7 @@ fn ctx_wprof_pb_path_returns_sidecar_named_path() {
     );
 }
 
+#[cfg(feature = "wprof")]
 #[test]
 fn ctx_wprof_pb_path_bails_when_entry_name_none() {
     let (cgroups, topo) = ctx_method_test_fixture();
@@ -1634,6 +1636,7 @@ fn ctx_wprof_pb_path_bails_when_entry_name_none() {
     );
 }
 
+#[cfg(feature = "wprof")]
 #[test]
 fn ctx_repro_wprof_pb_path_returns_sidecar_named_path() {
     let (cgroups, topo) = ctx_method_test_fixture();
@@ -1651,6 +1654,7 @@ fn ctx_repro_wprof_pb_path_returns_sidecar_named_path() {
     );
 }
 
+#[cfg(feature = "wprof")]
 #[test]
 fn ctx_repro_wprof_pb_path_bails_when_entry_name_none() {
     let (cgroups, topo) = ctx_method_test_fixture();
@@ -1679,6 +1683,9 @@ fn ctx_path_methods_take_no_arg() {
     // refactor adds a `&str` arg back (re-introducing the literal-
     // drift class), the trailing `()` arg-list breaks compile.
     let _: anyhow::Result<std::path::PathBuf> = ctx.failure_dump_path();
-    let _: anyhow::Result<std::path::PathBuf> = ctx.wprof_pb_path();
-    let _: anyhow::Result<std::path::PathBuf> = ctx.repro_wprof_pb_path();
+    #[cfg(feature = "wprof")]
+    {
+        let _: anyhow::Result<std::path::PathBuf> = ctx.wprof_pb_path();
+        let _: anyhow::Result<std::path::PathBuf> = ctx.repro_wprof_pb_path();
+    }
 }

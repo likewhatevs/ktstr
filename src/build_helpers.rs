@@ -21,8 +21,9 @@
 /// non-empty dir does, and handles it inside the closure conditional
 /// on `i > 1`).
 ///
-/// Both retry sites in build.rs (busybox tarball download + wprof
-/// git clone) route through this helper so backoff timing, attempt
+/// Retry sites in build.rs (busybox tarball download, and wprof
+/// git clone when the `wprof` feature is enabled) route through
+/// this helper so backoff timing, attempt
 /// counting, and log wording stay in lockstep; a change to the
 /// retry strategy (e.g. jittered backoff, max-attempts bump) only
 /// edits this one function.
@@ -30,9 +31,8 @@
 /// # Panics
 ///
 /// Panics when `max_attempts == 0` — caller bug; the helper has
-/// no work to retry. Both current call sites use `const
-/// MAX_*_ATTEMPTS: u32 = 4` literals, so the assert guards future
-/// callers.
+/// no work to retry. Call sites use `const MAX_*_ATTEMPTS: u32 = 4`
+/// literals; the assert guards future callers.
 fn retry_with_backoff<F, T>(label: &str, max_attempts: u32, mut attempt: F) -> Result<T, String>
 where
     F: FnMut(u32) -> Result<T, String>,
@@ -62,15 +62,11 @@ where
     ))
 }
 
-/// Predicate: does `wprof_src` hold a complete recursive git
-/// clone? A complete clone has both `.git/HEAD` (git init reached)
-/// AND `src/Makefile` (working tree populated). Returns `false`
-/// if either is missing — the caller wipes wprof_src and re-clones.
-///
-/// Pulling this out as a pure-fs predicate makes it unit-testable
-/// without spawning a real `git clone`. The two-file conjunction
-/// catches the "init succeeded, checkout failed" partial state
-/// that the prior Makefile-only check missed.
+/// Does `wprof_src` hold a complete recursive git clone? Requires
+/// both `.git/HEAD` (init reached) AND `src/Makefile` (working tree
+/// populated) — catches "init succeeded, checkout failed" partial
+/// clones that the prior Makefile-only check missed.
+#[cfg(feature = "wprof")]
 fn is_wprof_clone_complete(wprof_src: &std::path::Path) -> bool {
     wprof_src.join(".git").join("HEAD").exists() && wprof_src.join("src").join("Makefile").exists()
 }
@@ -117,6 +113,7 @@ mod tests {
         let _: Result<(), String> = retry_with_backoff("max-zero", 0, |_| Ok(()));
     }
 
+    #[cfg(feature = "wprof")]
     #[test]
     fn is_wprof_clone_complete_rejects_missing_git_head() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -132,6 +129,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "wprof")]
     #[test]
     fn is_wprof_clone_complete_rejects_missing_src_makefile() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -147,6 +145,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "wprof")]
     #[test]
     fn is_wprof_clone_complete_accepts_both_present() {
         let tmp = tempfile::tempdir().expect("tempdir");

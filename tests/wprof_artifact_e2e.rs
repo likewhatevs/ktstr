@@ -1,3 +1,4 @@
+#![cfg(feature = "wprof")]
 //! End-to-end: `#[ktstr_test(wprof)]` produces a `.wprof.pb`
 //! Perfetto trace in the sidecar dir on a passing scx-ktstr run.
 //!

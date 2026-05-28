@@ -34,17 +34,8 @@ use std::io::Write;
 /// Embedded as bytes in the `cargo-ktstr` binary only.
 pub const BUSYBOX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/busybox"));
 
-/// wprof binary (BPF-based system-wide tracer/profiler, BSD-3-Clause,
-/// github.com/anakryiko/wprof), built by `build.rs`. Embedded as
-/// bytes in the `cargo-ktstr` binary only. Loaded into auto-repro
-/// VMs by `ktstr::vmm::blobs::load_wprof_bytes` when the test entry
-/// requests wprof capture.
+#[cfg(feature = "wprof")]
 pub const WPROF_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wprof"));
-
-// Env var names live as pub consts on the library — see
-// [`ktstr::KTSTR_BUSYBOX_PATH_ENV`] and [`ktstr::KTSTR_WPROF_PATH_ENV`].
-// Use those rather than re-spelling the strings here, so the inventory
-// at the top of `lib.rs` stays the single source of truth.
 
 /// Extract a blob to `$TMPDIR/ktstr-blob-{name_hint}-{sha256:16}`.
 ///
@@ -124,13 +115,18 @@ fn extract_to_content_addressed_file(
 /// any code that reads environment variables concurrently.
 pub fn install_env() -> std::io::Result<()> {
     let busybox_path = extract_to_content_addressed_file(BUSYBOX_BYTES, "busybox")?;
-    let wprof_path = extract_to_content_addressed_file(WPROF_BYTES, "wprof")?;
     // SAFETY: per fn-level precondition, the caller (cargo-ktstr's
     // main) calls this before any thread spawn, so no concurrent
     // env reader exists.
     unsafe {
         std::env::set_var(ktstr::KTSTR_BUSYBOX_PATH_ENV, &busybox_path);
-        std::env::set_var(ktstr::KTSTR_WPROF_PATH_ENV, &wprof_path);
+    }
+    #[cfg(feature = "wprof")]
+    {
+        let wprof_path = extract_to_content_addressed_file(WPROF_BYTES, "wprof")?;
+        unsafe {
+            std::env::set_var(ktstr::KTSTR_WPROF_PATH_ENV, &wprof_path);
+        }
     }
     Ok(())
 }

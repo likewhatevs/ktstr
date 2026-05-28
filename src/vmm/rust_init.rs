@@ -1504,12 +1504,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     crate::vmm::guest_comms::send_lifecycle(crate::vmm::wire::LifecyclePhase::PayloadStarting, "");
     crate::vmm::guest_comms::send_scenario_start();
 
-    // wprof capture: if the host set KTSTR_WPROF_ARGS on the cmdline
-    // AND /bin/wprof is available, spawn it concurrently with the
-    // test workload. wprof runs for its `-d` budget (500 ms default),
-    // writes a Perfetto .pb trace to /tmp/wprof.pb, and exits.
-    // After dispatch returns, the main thread joins the wprof thread
-    // and ships the .pb back to the host via MSG_TYPE_WPROF_TRACE.
+    #[cfg(feature = "wprof")]
     let wprof_handle = spawn_wprof_if_configured();
 
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
@@ -1521,11 +1516,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
     crate::vmm::guest_comms::send_scenario_pause();
 
-    // Join the wprof background thread (if it was spawned) and ship
-    // the .pb back to the host before cleanup begins. If wprof is
-    // still running (unlikely — `-d 500` should have completed well
-    // before a multi-second workload finishes), this join blocks
-    // until it exits.
+    #[cfg(feature = "wprof")]
     if let Some(handle) = wprof_handle
         && let Ok(Some(pb_bytes)) = handle.join()
     {
@@ -2232,6 +2223,7 @@ fn parse_topo_from_cmdline() -> Option<(u32, u32, u32, u32)> {
     Some((n, l, c, t))
 }
 
+#[cfg(feature = "wprof")]
 /// Spawn `/bin/wprof` in a background thread if the host set
 /// `KTSTR_WPROF_ARGS` on the kernel cmdline. Returns a join handle
 /// whose `.join()` yields `Some(Vec<u8>)` (the `.pb` trace bytes)

@@ -12,6 +12,9 @@ categories = ["development-tools::testing"]
 [lib]
 proc-macro = true
 
+[features]
+wprof = []
+
 [dependencies]
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"

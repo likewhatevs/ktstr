@@ -379,15 +379,8 @@ pub fn send_profraw(buf: &[u8]) {
     write_msg(MsgType::Profraw.wire_value(), buf);
 }
 
-/// Send a wprof Perfetto-format trace blob to the host. Payload:
-/// raw `.pb` bytes produced by `/bin/wprof -T trace.pb` during
-/// auto-repro tracing.
-///
-/// Frames with [`MsgType::WprofTrace`]. The host's freeze
-/// coordinator (`test_support::eval`'s WprofTrace arm) writes the
-/// payload to `<sidecar_dir>/<test_name>.wprof.pb` so the
-/// operator finds it alongside the failure-dump JSON.
-///
+/// Send a wprof Perfetto-format trace blob to the host.
+#[cfg(feature = "wprof")]
 pub fn send_wprof_trace(buf: &[u8]) {
     write_msg(MsgType::WprofTrace.wire_value(), buf);
 }

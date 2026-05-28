@@ -456,51 +456,35 @@ int main(void) {{
             .expect("copy busybox binary to OUT_DIR");
     }
 
-    // Build wprof from source for guest auto-repro tracing.
-    //
-    // wprof is a BPF-based system-wide tracer/profiler (BSD-3-Clause)
-    // at https://github.com/anakryiko/wprof. The build pulls the
-    // repo recursively (libbpf, bpftool, blazesym, vmlinux.h, usdt,
-    // strobelight-libs submodules), then runs `make -jN` inside
-    // wprof/src/. The output is a static-ish binary that
-    // `cargo-ktstr`'s blobs.rs embeds via `include_bytes!` and
-    // ships in auto-repro VMs at `/bin/wprof`.
-    //
-    // Cache: skip if $OUT_DIR/wprof exists. Run `cargo clean` to
-    // force a rebuild.
-    //
-    // Host deps required for the first build:
-    //   - git (with submodule support)
-    //   - make, gcc, clang (BPF skeletons)
-    //   - elfutils-devel + zlib-devel (libbpf link-time deps)
-    //   - Rust toolchain (blazesym is Rust)
-    //
-    // Network: first build clones github.com/anakryiko/wprof + all
-    // submodules. Cached after.
-    // Re-run when the skip-wprof escape hatch flips.
+    // wprof build: gated behind the `wprof` cargo feature (default
+    // off). When disabled, a 0-byte placeholder at $OUT_DIR/wprof
+    // satisfies the `include_bytes!` site in cargo_ktstr/blobs.rs.
+    // The KTSTR_SKIP_WPROF_BUILD env var remains as a secondary
+    // escape hatch for builds that enable the feature but want to
+    // skip the clone/compile (CI caching, cross-compilation, etc.).
+    let wprof_bin = out_dir.join("wprof");
+    #[cfg(not(feature = "wprof"))]
+    if !wprof_bin.exists() {
+        std::fs::write(&wprof_bin, b"").unwrap_or_else(|e| {
+            panic!(
+                "write 0-byte wprof placeholder {}: {e}",
+                wprof_bin.display()
+            )
+        });
+    }
+    #[cfg(feature = "wprof")]
+    {
     println!("cargo:rerun-if-env-changed=KTSTR_SKIP_WPROF_BUILD");
     let skip_wprof = std::env::var("KTSTR_SKIP_WPROF_BUILD")
         .ok()
         .filter(|v| !v.is_empty())
         .is_some();
 
-    let wprof_bin = out_dir.join("wprof");
     if skip_wprof {
-        // Escape hatch for build paths that don't link the wprof
-        // bytes (only `src/bin/cargo_ktstr/blobs.rs` has the
-        // `include_bytes!` site).  Setting `KTSTR_SKIP_WPROF_BUILD=1`
-        // skips the multi-minute upstream wprof clone + compile and
-        // writes a 0-byte placeholder so the `!wprof_bin.exists()`
-        // branch doesn't refire on the next build.
-        //
-        // A `cargo-ktstr` built with this flag set would extract the
-        // 0-byte placeholder via `install_env` at startup and fail at
-        // runtime the first time wprof is invoked — the warning
-        // below tags the resulting binary as "do not use".
         println!(
             "cargo:warning=KTSTR_SKIP_WPROF_BUILD set — writing 0-byte \
              $OUT_DIR/wprof placeholder; do NOT use the resulting \
-             cargo-ktstr binary"
+             cargo-ktstr binary for wprof capture"
         );
         if !wprof_bin.exists() {
             std::fs::write(&wprof_bin, b"").unwrap_or_else(|e| {
@@ -768,6 +752,7 @@ int main(void) {{
         );
         std::fs::copy(&built_bin, &wprof_bin).expect("copy wprof binary to OUT_DIR");
     }
+    } // #[cfg(feature = "wprof")]
 }
 
 /// Scan src/budget.rs for `const NAME_SHIFT: u32 = N;` declarations

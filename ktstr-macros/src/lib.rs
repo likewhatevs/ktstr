@@ -658,21 +658,12 @@ impl AttrValues {
 ///     path as `payload` — reject at expansion time to catch the
 ///     common "fio as primary AND workload" slip.
 ///   - `auto_repro = bool` (default: `true`)
-///   - `wprof = bool` (default: `false`) — attach `/bin/wprof` to
-///     the test's VM(s) and ship the captured Perfetto trace back
-///     to the host at `{sidecar_dir}/{test_name}.wprof.pb`. The
-///     wire-up applies to BOTH the primary VM and the auto-repro
-///     VM (if it fires), so a wprof-tagged test produces a trace
-///     on every run, not only on failure. Maps onto
-///     `KtstrTestEntry::wprof`. Loud-fails at VM build time when
-///     `cargo-ktstr`'s `install_env` did not export
-///     `KTSTR_WPROF_PATH` (the declared capability cannot be
-///     silently dropped). Pairs with `wprof_args` for custom args.
-///   - `wprof_args = "..."` — override
-///     `WprofConfig::default_args` for wprof invocation. Only
-///     meaningful with `wprof = true`. Parsed as space-separated
-///     tokens (no quoting). Default: `None` (use defaults).
-///     Maps onto `KtstrTestEntry::wprof_args`.
+///   - `wprof = bool` (default: `false`; requires the `wprof`
+///     cargo feature on ktstr) — attach `/bin/wprof` to the
+///     test's VM(s) and ship the Perfetto trace to the host.
+///   - `wprof_args = "..."` (requires the `wprof` cargo feature)
+///     — override `WprofConfig::default_args`. Only meaningful
+///     with `wprof = true`. Parsed as space-separated tokens.
 ///   - `host_only = bool` (default: `false`) — run the test function
 ///     on the host instead of inside a VM
 ///   - `no_perf_mode = bool` (default: `false`) — decouple the
@@ -909,8 +900,8 @@ fn validate_expect_auto_repro_mutex(attrs: &AttrValues) -> syn::Result<()> {
              satisfies the expect_auto_repro assertion is written by \
              the wprof binary attached in the auto-repro VM. Without \
              wprof, no artifact lands and the assertion could never \
-             be satisfied. Drop one: set wprof = true (default once \
-             the test wants the trace) or drop expect_auto_repro.",
+             be satisfied. Drop one: set wprof = true (requires the \
+             `wprof` cargo feature) or drop expect_auto_repro.",
         ));
     }
     if attrs.scheduler.is_none() {
@@ -1681,6 +1672,39 @@ fn ktstr_test_impl(
     // and the destructure below consumes it.
     validate_payload_workloads_dedup(&attrs.payload, attrs.workloads.as_deref().unwrap_or(&[]))?;
     validate_cross_attr(&attrs)?;
+
+    #[cfg(not(feature = "wprof"))]
+    {
+        if attrs.wprof {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "wprof requires the `wprof` cargo feature — add \
+                 `features = [\"wprof\"]` to your ktstr dependency \
+                 in Cargo.toml and rebuild cargo-ktstr with the same \
+                 feature. wprof is opt-in (default off) because it \
+                 pulls a multi-minute build (git clone + BPF compile).",
+            ));
+        }
+        if attrs.wprof_args.is_some() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "wprof_args requires the `wprof` cargo feature — add \
+                 `features = [\"wprof\"]` to your ktstr dependency \
+                 in Cargo.toml and rebuild cargo-ktstr with the same \
+                 feature.",
+            ));
+        }
+        if attrs.expect_auto_repro {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "expect_auto_repro requires the `wprof` cargo feature \
+                 — the .repro.wprof.pb artifact it asserts on is \
+                 produced by the wprof binary, which is only embedded \
+                 when the feature is enabled. Add `features = \
+                 [\"wprof\"]` to your ktstr dependency in Cargo.toml.",
+            ));
+        }
+    }
 
     Ok(emit_entry_static(input, attrs))
 }

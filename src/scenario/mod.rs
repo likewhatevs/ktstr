@@ -429,9 +429,9 @@ pub struct Ctx<'a> {
     /// guest-side `maybe_dispatch_vm_test_with_args` and the
     /// host-only dispatch path before the test body runs. Drives
     /// the body-side path-derivation methods
-    /// [`failure_dump_path`](Self::failure_dump_path),
-    /// [`wprof_pb_path`](Self::wprof_pb_path), and
-    /// [`repro_wprof_pb_path`](Self::repro_wprof_pb_path) — the
+    /// [`failure_dump_path`](Self::failure_dump_path)
+    /// (and `wprof_pb_path` / `repro_wprof_pb_path` when the
+    /// `wprof` feature is enabled) — the
     /// drift-safe replacement for the legacy pattern of
     /// hardcoding the test fn name as a string literal at the
     /// callsite. When `Some(name)`, those methods derive the
@@ -701,6 +701,7 @@ impl Ctx<'_> {
     ///
     /// Bails when `self.entry_name` is `None` per the same shape
     /// as [`Self::failure_dump_path`].
+    #[cfg(feature = "wprof")]
     pub fn wprof_pb_path(&self) -> anyhow::Result<std::path::PathBuf> {
         let name = self.entry_name.ok_or_else(|| {
             anyhow::anyhow!(
@@ -713,22 +714,7 @@ impl Ctx<'_> {
         Ok(crate::test_support::sidecar_dir().join(format!("{name}.wprof.pb")))
     }
 
-    /// Per-test auto-repro wprof Perfetto-trace sidecar path.
-    /// Mirror of [`Self::wprof_pb_path`] for the auto-repro
-    /// artifact — derives `{sidecar_dir()}/{entry_name}.repro.wprof.pb`
-    /// from the macro-stamped [`Self::entry_name`]. The
-    /// auto-repro variant lands ONLY when the primary VM's
-    /// scenario reports a failure AND the test's
-    /// `#[ktstr_test(auto_repro = true)]` gates the second-VM
-    /// rerun; an absent `.repro.wprof.pb` is the steady state for
-    /// passing tests.
-    ///
-    /// Sibling to [`crate::vmm::VmResult::repro_wprof_pb_path`].
-    ///
-    /// # Errors
-    ///
-    /// Bails when `self.entry_name` is `None` per the same shape
-    /// as [`Self::failure_dump_path`].
+    #[cfg(feature = "wprof")]
     pub fn repro_wprof_pb_path(&self) -> anyhow::Result<std::path::PathBuf> {
         let name = self.entry_name.ok_or_else(|| {
             anyhow::anyhow!(
@@ -864,9 +850,8 @@ impl<'a> CtxBuilder<'a> {
     /// [`KtstrTestEntry`](crate::test_support::KtstrTestEntry)
     /// the dispatched test body was registered as. Drives the
     /// body-side path-derivation methods on [`Ctx`]
-    /// ([`failure_dump_path`](Ctx::failure_dump_path),
-    /// [`wprof_pb_path`](Ctx::wprof_pb_path),
-    /// [`repro_wprof_pb_path`](Ctx::repro_wprof_pb_path)) so test
+    /// (`failure_dump_path`, `wprof_pb_path`,
+    /// `repro_wprof_pb_path`) so test
     /// authors get the drift-safe per-test sidecar path without
     /// re-hardcoding the test fn name in the body — a future test
     /// rename surfaces a deterministic `Result<PathBuf>` bail

@@ -480,13 +480,7 @@ pub use vmm::freeze_coord::{
     FREEZE_COORD_TEST_FORCE_BSS_TRIGGERED, FREEZE_COORD_TEST_FORCE_TRANSLATE_NONE,
 };
 
-/// Re-export of [`vmm::wprof::WPROF_MIN_MEMORY_MIB`] and the
-/// shared floor helper so the `cargo-ktstr shell --test <NAME>`
-/// router (in the cargo-ktstr binary crate, external to this lib)
-/// can apply the wprof memory floor when a named test entry has
-/// `wprof = true`. `apply_wprof_memory_floor` is the single
-/// formula shared with `derive_test_memory_mib`; inline copies
-/// are forbidden.
+#[cfg(feature = "wprof")]
 pub use vmm::wprof::{WPROF_MIN_MEMORY_MIB, apply_wprof_memory_floor};
 
 /// Re-export of [`test_support::runtime::bypass_llc_locks_active`]
@@ -1261,15 +1255,7 @@ pub const KTSTR_LOG_PASSES_ENV: &str = "KTSTR_LOG_PASSES";
 /// builds.
 pub const KTSTR_BUSYBOX_PATH_ENV: &str = "KTSTR_BUSYBOX_PATH";
 
-/// Name of the environment variable that points at the wprof
-/// blob on-disk. Exported by `cargo-ktstr`'s startup
-/// `install_env` (see `bin/cargo_ktstr/blobs.rs`) which extracts
-/// the embedded `WPROF_BYTES` to a tempfile and sets this var to
-/// the absolute path; read by
-/// `crate::vmm::blobs::load_wprof_path`. Same error-path
-/// asymmetry as [`KTSTR_BUSYBOX_PATH_ENV`]: unset surfaces the
-/// install-env hint, empty falls through to a generic file-read
-/// error.
+#[cfg(feature = "wprof")]
 pub const KTSTR_WPROF_PATH_ENV: &str = "KTSTR_WPROF_PATH";
 
 /// Shared skip / error hint for call sites that cannot proceed
@@ -1578,19 +1564,11 @@ pub(crate) fn resolve_current_exe() -> anyhow::Result<std::path::PathBuf> {
 ///   `Some`, the framework calls
 ///   `vmm::KtstrVm::builder`'s `.disk(..)` so the guest probes a
 ///   raw block device sized per `disk.capacity_mib`.
-/// `wprof_args`: when `Some`, replaces
-///   `vmm::wprof::WprofConfig::args` (whose default comes from
-///   `vmm::wprof::WprofConfig::default_args`) with the tokenised
-///   value before booting; `None` keeps the default args. Only takes
-///   effect if `vmm::wprof::WprofConfig::from_env` succeeded (a
-///   wprof binary is locatable); otherwise the override has no
-///   target and is dropped along with the entire wprof config (shell
-///   mode soft-fails wprof setup so the VM still boots).
-///   `Some("")` is observationally identical to `Some` with a
-///   whitespace-only string: `split_whitespace()` yields no tokens,
-///   so wprof runs with ZERO args (a deliberate "clear all args"
-///   override). Use `None` to defer to defaults; pass `Some("")`
-///   ONLY when an empty arg list is the intent.
+/// `wprof_args`: requires the `wprof` cargo feature. When the
+///   feature is enabled and `Some`, replaces `WprofConfig::args`
+///   with the tokenised value before booting; `None` keeps the
+///   defaults. Without the feature, this parameter is ignored
+///   (a warning is emitted to stderr if `Some`).
 /// `performance_mode`: forwarded to
 ///   `vmm::KtstrVmBuilder::performance_mode`; when `true`, the
 ///   builder pins vCPU threads, applies hugepages, NUMA mbinds, and
@@ -1689,24 +1667,21 @@ pub fn run_shell(
     use anyhow::Context;
     let busybox_bytes =
         vmm::blobs::load_busybox_bytes().context("load busybox blob for shell-mode VM")?;
-    // wprof is ALWAYS-ON in shell mode — the bytes are free
-    // (already in cargo-ktstr's executable), and an operator
-    // running `cargo ktstr shell` is debugging and may want to
-    // invoke `/bin/wprof` interactively. Soft-fail if loading
-    // the bytes returns an error — shell mode should still boot
-    // even if wprof setup is broken for whatever reason.
-    //
-    // When `wprof_args` is `Some` (the operator is reproducing a
-    // test whose `#[ktstr_test(wprof_args = "...")]` overrides the
-    // defaults), override `WprofConfig::args` with the tokenised
-    // value so `/bin/wprof` is invoked with the same args the test
-    // would see. The override only takes effect when from_env
-    // succeeded; if wprof config could not be loaded there is no
-    // target to override and the override is dropped silently along
-    // with the rest of the wprof config (shell-mode soft-fail).
-    let mut wprof_config = vmm::wprof::WprofConfig::from_env().ok();
-    if let (Some(args_str), Some(cfg)) = (wprof_args, wprof_config.as_mut()) {
-        cfg.args = args_str.split_whitespace().map(String::from).collect();
+    #[cfg(feature = "wprof")]
+    let wprof_config = {
+        let mut cfg = vmm::wprof::WprofConfig::from_env().ok();
+        if let (Some(args_str), Some(c)) = (wprof_args, cfg.as_mut()) {
+            c.args = args_str.split_whitespace().map(String::from).collect();
+        }
+        cfg
+    };
+    #[cfg(not(feature = "wprof"))]
+    if wprof_args.is_some() {
+        eprintln!(
+            "ktstr: wprof_args ignored — ktstr was built without the \
+             `wprof` cargo feature; /bin/wprof will not be available \
+             in the guest"
+        );
     }
     let mut builder = vmm::KtstrVm::builder()
         .kernel(&kernel)
@@ -1715,12 +1690,16 @@ pub fn run_shell(
         .cmdline(&cmdline)
         .include_files(owned_includes)
         .busybox(Some(busybox_bytes))
-        .wprof(wprof_config)
         .dmesg(dmesg)
         .no_perf_mode(no_perf_mode)
         .performance_mode(performance_mode)
         .sched_enable_cmds(sched_enable_cmds)
         .sched_disable_cmds(sched_disable_cmds);
+
+    #[cfg(feature = "wprof")]
+    {
+        builder = builder.wprof(wprof_config);
+    }
 
     if let Some(cmd) = exec {
         builder = builder.exec_cmd(cmd);
@@ -1730,16 +1709,11 @@ pub fn run_shell(
         builder = builder.disk(d);
     }
 
-    // Shell mode always packs the wprof binary plus its DT_NEEDED
-    // libraries, plus busybox, plus any operator-supplied include
-    // files — the resulting initramfs can exceed a test's declared
-    // `memory_mib` (sized for test-mode only). Treat the caller's
-    // value as a FLOOR rather than an exact size: the deferred path
-    // computes memory from the actual initramfs and takes the max of
-    // that and the floor, so a test whose `memory_mib = 256` doesn't
-    // bail at initramfs-size validation under shell mode while still
-    // honouring larger explicit requests (e.g. a 4 GiB operator
-    // override).
+    // Shell-mode initramfs (busybox, operator includes, and wprof
+    // when the `wprof` feature is enabled) can exceed a test's
+    // declared `memory_mib`. Treat the caller's value as a FLOOR;
+    // the deferred path takes the max of it and the actual
+    // initramfs size.
     builder = match memory_mib {
         Some(mib) => builder.memory_deferred_min(mib),
         None => builder.memory_deferred(),

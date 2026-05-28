@@ -63,7 +63,9 @@ pub use profraw::current_binary_is_coverage_instrumented;
 pub mod runtime;
 mod shell_descriptor;
 pub use shell_descriptor::{SchedulerKind, ShellTestDescriptor};
+#[cfg(feature = "wprof")]
 pub mod wprof;
+#[cfg(feature = "wprof")]
 pub use wprof::{PERFETTO_TRACE_PACKETS_TAG, WPROF_PB_MIN_BYTES, assert_wprof_pb_shape};
 mod sidecar;
 pub(crate) mod staged;

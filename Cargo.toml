@@ -279,6 +279,11 @@ debug = "line-tables-only"
 
 [features]
 integration = []
+# Embed the wprof BPF tracer for Perfetto-format profiling in VMs.
+# Default off: first build clones github.com/anakryiko/wprof and
+# compiles libbpf + blazesym (requires git, make, gcc, clang,
+# elfutils-devel, zlib-devel on the host; takes several minutes).
+wprof = ["ktstr-macros/wprof"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_nightly)'] }

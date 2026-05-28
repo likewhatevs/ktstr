@@ -102,11 +102,10 @@ impl From<&crate::test_support::SchedulerSpec> for SchedulerKind {
 /// three variants emit empty vecs (no kernel-builtin shell ops to
 /// invoke).
 ///
-/// `wprof_args`, when `Some`, replaces
-/// `crate::vmm::wprof::WprofConfig::args` (whose default comes
-/// from `crate::vmm::wprof::WprofConfig::default_args`) —
-/// populated from the test's `#[ktstr_test(wprof_args = "...")]`
-/// attribute. `None` means "use the default wprof args."
+/// `wprof_args`: requires the `wprof` cargo feature. When the
+/// feature is enabled and `Some`, replaces `WprofConfig::args`;
+/// without the feature, the value is ignored by `run_shell`.
+/// `None` means "use the default wprof args."
 ///
 /// `performance_mode` mirrors the test's
 /// `#[ktstr_test(performance_mode)]` attribute so the shell VM
@@ -132,10 +131,10 @@ pub struct ShellTestDescriptor {
     pub scheduler_name: String,
     #[serde(default)]
     pub scheduler_kind: SchedulerKind,
-    /// Custom wprof CLI args, mirroring
-    /// `KtstrTestEntry::wprof_args`. When `Some`, the shell VM
-    /// overrides `crate::vmm::wprof::WprofConfig::args` with the
-    /// space-tokenised value before booting.
+    /// Custom wprof CLI args (requires the `wprof` cargo feature).
+    /// When `Some` and the feature is enabled, the shell VM
+    /// overrides `WprofConfig::args` with the space-tokenised
+    /// value before booting.
     #[serde(default)]
     pub wprof_args: Option<String>,
     /// Mirrors `KtstrTestEntry::performance_mode`. The shell VM

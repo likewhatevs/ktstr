@@ -90,14 +90,7 @@ pub struct KtstrVmBuilder {
     /// `KTSTR_BUSYBOX_PATH` env var that `cargo-ktstr` sets at
     /// startup).
     pub(crate) busybox_bytes: Option<Vec<u8>>,
-    /// wprof binary + invocation args to ship into the guest at
-    /// `/bin/wprof`. `None` skips packing — most production VMs
-    /// have no use for wprof. `Some` embeds the binary AND records
-    /// the args (rendered onto the cmdline as `KTSTR_WPROF_ARGS=…`
-    /// so guest init can invoke wprof during auto-repro). Bytes
-    /// come from `crate::vmm::blobs::load_wprof_bytes` (which
-    /// reads the `KTSTR_WPROF_PATH` env var that `cargo-ktstr`
-    /// sets at startup).
+    #[cfg(feature = "wprof")]
     pub(crate) wprof: Option<crate::vmm::wprof::WprofConfig>,
     dmesg: bool,
     exec_cmd: Option<String>,
@@ -246,6 +239,7 @@ impl Default for KtstrVmBuilder {
             disks: Vec::new(),
             network: None,
             busybox_bytes: None,
+            #[cfg(feature = "wprof")]
             wprof: None,
             dmesg: false,
             exec_cmd: None,
@@ -786,17 +780,8 @@ impl KtstrVmBuilder {
     }
 
     /// Embed the wprof tracer binary at `bin/wprof` and record the
-    /// invocation args on the guest cmdline. `None` (default) skips
-    /// packing — most VMs do not need profiling. `Some` makes
-    /// `/bin/wprof` available in the guest and exposes the args
-    /// via `KTSTR_WPROF_ARGS` on the kernel cmdline for guest init
-    /// to invoke during auto-repro.
-    ///
-    /// Source the [`crate::vmm::wprof::WprofConfig`] via
-    /// [`crate::vmm::wprof::WprofConfig::from_env`] which reads
-    /// `KTSTR_WPROF_PATH` (set by `cargo-ktstr` at startup) and
-    /// populates the default args.
-    #[allow(dead_code)]
+    /// invocation args on the guest cmdline.
+    #[cfg(feature = "wprof")]
     pub fn wprof(mut self, config: Option<crate::vmm::wprof::WprofConfig>) -> Self {
         self.wprof = config;
         self
@@ -1070,6 +1055,7 @@ impl KtstrVmBuilder {
             disks: self.disks,
             network: self.network,
             busybox_bytes: self.busybox_bytes,
+            #[cfg(feature = "wprof")]
             wprof: self.wprof,
             dmesg: self.dmesg,
             exec_cmd: self.exec_cmd,

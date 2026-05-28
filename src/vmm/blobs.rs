@@ -31,17 +31,10 @@ pub fn load_busybox_bytes() -> Result<Vec<u8>> {
     load_blob_from_env(crate::KTSTR_BUSYBOX_PATH_ENV, "busybox")
 }
 
-/// Return the on-disk path to the wprof binary that `cargo-ktstr`
-/// extracted at startup. The path lives for the lifetime of the
-/// `cargo-ktstr` process (and inherited child processes). Returns
-/// an error if `KTSTR_WPROF_PATH` is unset.
-///
-/// Preferred over `load_wprof_bytes` when the caller intends to
-/// hand the file off to the existing `include_files` initramfs
-/// pipeline, which performs `DT_NEEDED` shared-library resolution
-/// against the binary's ELF — wprof is dynamically linked
-/// (libelf, libz, blazesym C ABI, etc.) and will fail to run
-/// inside the guest without those libs packed alongside.
+/// Return the on-disk path to the wprof binary extracted by
+/// `cargo-ktstr` at startup. Returns an error if `KTSTR_WPROF_PATH`
+/// is unset.
+#[cfg(feature = "wprof")]
 pub fn load_wprof_path() -> Result<std::path::PathBuf> {
     let env_var = crate::KTSTR_WPROF_PATH_ENV;
     let path = std::env::var(env_var).map_err(|_| {

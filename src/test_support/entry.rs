@@ -1263,31 +1263,14 @@ pub struct KtstrTestEntry {
     /// `EXIT_PASS`. Default `false` matches prior behavior
     /// (no inversion, original verdict stands).
     pub expect_auto_repro: bool,
-    /// When true, the primary VM (and the auto-repro VM, if it
-    /// fires) spawns `/bin/wprof` concurrently with the test
-    /// workload and ships the resulting Perfetto `.pb` trace back
-    /// to the host via MSG_TYPE_WPROF_TRACE. The host writes the
-    /// trace to `{sidecar_dir}/{test_name}.wprof.pb`, so a tagged
-    /// test produces a trace on every run — not only on failure.
-    /// Default wprof args
-    /// (`-d 500 -e sched --ringbuf-size=256000 --ringbuf-cnt=8`)
-    /// unless overridden by [`Self::wprof_args`].
-    ///
-    /// When the framework can't load the wprof binary
-    /// (`crate::vmm::wprof::WprofConfig::from_env` fails — typically
-    /// because `KTSTR_WPROF_PATH` was not set by `cargo-ktstr`'s
-    /// `install_env`), the test fails loudly rather than silently
-    /// running without wprof — per the no-silent-drops contract,
-    /// a declared capability that can't be delivered is an error.
-    ///
-    /// Populated by `#[ktstr_test(wprof)]` or `#[ktstr_test(wprof = true)]`.
+    /// Requires the `wprof` cargo feature; without it, the
+    /// `#[ktstr_test(wprof)]` attribute fails at macro expansion.
+    /// When true, the VM spawns `/bin/wprof` concurrently with the
+    /// workload and ships the Perfetto `.pb` trace to the host.
     pub wprof: bool,
-    /// Custom wprof CLI args, overriding
-    /// `crate::vmm::wprof::WprofConfig::default_args`. Only
-    /// meaningful when [`Self::wprof`] is `true`. Parsed as
-    /// space-separated tokens.
-    ///
-    /// Populated by `#[ktstr_test(wprof_args = "-d 2000 -e sched,irq")]`.
+    /// Custom wprof CLI args (requires the `wprof` cargo feature).
+    /// Overrides `WprofConfig::default_args` when [`Self::wprof`]
+    /// is true. Populated by `#[ktstr_test(wprof_args = "...")]`.
     pub wprof_args: Option<&'static str>,
     /// Per-entry assertion overrides merged on top of
     /// `Assert::default_checks()` and the scheduler's `assert`.

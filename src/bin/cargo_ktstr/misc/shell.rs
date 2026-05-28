@@ -221,17 +221,13 @@ pub(crate) fn run_shell(
         sched_disable_cmds,
     ) = if let Some(name) = test.as_deref() {
         let desc = resolve_shell_from_test_entry(name)?;
-        // Shell mode always packs the wprof binary into the
-        // initramfs (see `ktstr::run_shell` — wprof is ALWAYS-ON
-        // in shell mode so the operator can invoke `/bin/wprof`
-        // interactively) AND wprof itself needs enough guest
-        // memory to allocate its BPF ringbufs (failure surfaces
-        // as `Failed to create BPF ringbuf #N: -12` from wprof's
-        // setup phase). Apply the wprof memory floor regardless
-        // of the test's own `wprof` attribute: the floor is for
-        // *running* wprof, and shell-mode operators always have
-        // that capability available.
-        let mem = ktstr::apply_wprof_memory_floor(desc.memory_mib, true);
+        // When the `wprof` feature is enabled, shell mode packs
+        // the wprof binary and needs enough guest memory for BPF
+        // ringbufs. Without the feature, `/bin/wprof` is not
+        // available in the guest.
+        let mem = desc.memory_mib;
+        #[cfg(feature = "wprof")]
+        let mem = ktstr::apply_wprof_memory_floor(mem, true);
         // Banner: print to stderr BEFORE VM boot. `--exec` consumers
         // see this on stderr (separate from the exec command's
         // stdout); interactive shell consumers see it as a header.

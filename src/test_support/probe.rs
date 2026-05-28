@@ -712,24 +712,20 @@ pub(crate) fn attempt_auto_repro(
         .dual_snapshot(true)
         .performance_mode(entry.performance_mode);
 
-    // wprof: if `#[ktstr_test(wprof)]`, attach wprof to the
-    // auto-repro VM via the same helper the primary VM build site
-    // at `crate::test_support::eval::run_ktstr_test_inner_impl`
-    // uses — keeping both arms behind one helper rules out
-    // divergence between the two call sites. The auto-repro VM's
-    // MSG_TYPE_WPROF_TRACE bytes are written by
-    // `write_auto_repro_sidecar_artifacts` below; profraw
-    // coverage data goes to the shared `llvm-cov-target` dir via
-    // `write_profraw` (filename = pid + counter, no collision).
-    builder =
-        match crate::test_support::runtime::attach_wprof_if_requested(builder, entry, "auto-repro")
-        {
+    #[cfg(feature = "wprof")]
+    {
+        builder = match crate::test_support::runtime::attach_wprof_if_requested(
+            builder,
+            entry,
+            "auto-repro",
+        ) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("ktstr_test: {e:#}");
                 return None;
             }
         };
+    }
 
     if let crate::test_support::entry::SchedulerSpec::KernelBuiltin { enable, disable } =
         &entry.scheduler.binary

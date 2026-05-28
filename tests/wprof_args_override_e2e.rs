@@ -1,3 +1,4 @@
+#![cfg(feature = "wprof")]
 //! End-to-end: `#[ktstr_test(wprof, wprof_args = "...")]` propagates
 //! the override args to the guest kernel cmdline (verbatim) and
 //! still produces a valid `.wprof.pb`.

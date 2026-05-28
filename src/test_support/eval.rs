@@ -1247,13 +1247,10 @@ fn run_ktstr_test_inner_impl(
         .merge(&entry.scheduler.assert)
         .merge(&entry.assert);
 
-    // wprof: if `#[ktstr_test(wprof)]`, attach wprof to the primary
-    // VM. Auto-repro VM gets the same treatment via probe.rs's
-    // call to the same `attach_wprof_if_requested` helper. A
-    // wprof-tagged test produces a `.wprof.pb` artifact on every
-    // run; failure to load the wprof binary bails loudly rather
-    // than silently dropping the capability.
-    builder = super::runtime::attach_wprof_if_requested(builder, entry, "primary")?;
+    #[cfg(feature = "wprof")]
+    {
+        builder = super::runtime::attach_wprof_if_requested(builder, entry, "primary")?;
+    }
 
     if let SchedulerSpec::KernelBuiltin { enable, disable } = &entry.scheduler.binary {
         builder = builder.sched_enable_cmds(enable);
@@ -1626,22 +1623,7 @@ fn run_ktstr_test_inner_impl(
         }
     };
 
-    // Pre-VM cleanup: delete stale `.wprof.pb` artifacts from a
-    // previous run BEFORE the VM boots, so any file present in the
-    // post_vm callback MUST be fresh from THIS run. Without this,
-    // a dirty-worktree run (project_commit → "unknown") writes its
-    // artifacts into the same sidecar dir as the previous run; if
-    // THIS run's wprof chain regresses (no MsgType::WprofTrace fires
-    // → no new write), the post_vm callback reads the STALE file
-    // and reports PASS — silent regression. Same hazard for the
-    // `.repro.wprof.pb` from the auto-repro VM.
-    //
-    // Gated on `entry.wprof` (== false → no wprof attached, no
-    // artifact will be written, nothing to clean). Errors on the
-    // remove are silently ignored — `NotFound` is the expected
-    // case (first run, or post_vm cleaned up); any other I/O error
-    // is benign here because the post_vm callback will catch a
-    // missing-or-malformed file with its own diagnostic.
+    #[cfg(feature = "wprof")]
     if entry.wprof {
         let sidecar = crate::test_support::sidecar_dir();
         let _ = std::fs::remove_file(sidecar.join(format!("{}.wprof.pb", entry.name)));
@@ -1743,16 +1725,7 @@ fn run_ktstr_test_inner_impl(
     // sections; same auto-repro dispatch). When BOTH callbacks
     // fail, the combined message names both errors so a
     // debugging operator sees both regressions on the first pass.
-    // wprof Perfetto trace pre-pass: write `.wprof.pb` BEFORE the
-    // post_vm callback fires. The full bulk-frame loop below also
-    // handles `MsgType::WprofTrace`, but it runs AFTER
-    // `run_post_vm_callbacks`, so a `post_vm` body that asserts on
-    // `result.wprof_pb_path()` (e.g. `assert_wprof_pb_landed`)
-    // would see ENOENT even when the guest successfully shipped
-    // the trace. Pre-pass writes the file from the same bulk drain
-    // the main loop later re-encounters and rewrites the same
-    // bytes to the same path — idempotent, no observable effect
-    // beyond unblocking the post_vm check.
+    #[cfg(feature = "wprof")]
     if let Some(ref bulk) = result.guest_messages {
         for bulk_entry in &bulk.entries {
             if crate::vmm::wire::MsgType::from_wire(bulk_entry.msg_type)
@@ -2155,7 +2128,7 @@ fn run_ktstr_test_inner_impl(
 /// (preserves diagnostic visibility — the original fail trail is
 /// available for stderr/dump rendering).
 ///
-/// Uses [`crate::test_support::wprof::assert_wprof_pb_shape`] for
+/// Uses `crate::test_support::wprof::assert_wprof_pb_shape` for
 /// the artifact-on-disk probe — closes the partial-write race that
 /// a bare `path.exists()` check would miss: the shape validator
 /// only signals satisfied when the file has reached its minimum
@@ -2178,11 +2151,14 @@ pub(crate) fn apply_expect_auto_repro_inversion(
     if result.success {
         return;
     }
-    let Ok(repro_path) = result.repro_wprof_pb_path() else {
-        return;
-    };
-    if crate::test_support::wprof::assert_wprof_pb_shape(&repro_path).is_ok() {
-        result.expect_auto_repro_satisfied = true;
+    #[cfg(feature = "wprof")]
+    {
+        let Ok(repro_path) = result.repro_wprof_pb_path() else {
+            return;
+        };
+        if crate::test_support::wprof::assert_wprof_pb_shape(&repro_path).is_ok() {
+            result.expect_auto_repro_satisfied = true;
+        }
     }
 }
 
@@ -7559,6 +7535,7 @@ mod tests {
     /// bound to the scx-style `SCHED_TEST` fixture. Mirrors
     /// `sched_entry` but flips the field under test; tests that need
     /// `expect_auto_repro = false` use `sched_entry(...)` directly.
+    #[cfg(feature = "wprof")]
     fn expect_auto_repro_entry(name: &'static str) -> KtstrTestEntry {
         KtstrTestEntry {
             expect_auto_repro: true,
@@ -7570,6 +7547,7 @@ mod tests {
     /// `entry_name`. Mirrors the prod call site in
     /// `run_ktstr_test_inner_impl` where the helper sees a failed
     /// VM with the macro-stamped entry name.
+    #[cfg(feature = "wprof")]
     fn failing_vm_result_with_name(name: &'static str) -> crate::vmm::VmResult {
         crate::vmm::VmResult {
             success: false,
@@ -7578,13 +7556,7 @@ mod tests {
         }
     }
 
-    /// Write a shape-valid `.repro.wprof.pb` artifact at
-    /// `{sidecar_dir}/{name}.repro.wprof.pb`. Mirrors what the host's
-    /// `MsgType::WprofTrace` dispatch arm would produce for a
-    /// successful auto-repro VM that captured a trace. The byte
-    /// pattern matches what `assert_wprof_pb_shape` validates:
-    /// leading `PERFETTO_TRACE_PACKETS_TAG` + size ≥
-    /// `WPROF_PB_MIN_BYTES`.
+    #[cfg(feature = "wprof")]
     fn write_valid_repro_artifact(sidecar_dir: &std::path::Path, name: &str) {
         use crate::test_support::wprof::{PERFETTO_TRACE_PACKETS_TAG, WPROF_PB_MIN_BYTES};
         let mut bytes = vec![PERFETTO_TRACE_PACKETS_TAG];
@@ -7593,9 +7565,7 @@ mod tests {
         std::fs::write(&path, &bytes).expect("write valid repro artifact");
     }
 
-    /// `entry.expect_auto_repro = false` → no-op even with every
-    /// other gate satisfied. Pins the first-line early-return that
-    /// keeps non-opt-in tests on the pre-inversion verdict path.
+    #[cfg(feature = "wprof")]
     #[test]
     fn apply_expect_auto_repro_inversion_no_op_when_attr_unset() {
         let _lock = lock_env();
@@ -7615,9 +7585,7 @@ mod tests {
         );
     }
 
-    /// `result.success = true` → no-op. The assertion only inverts
-    /// failures into passes; a test that passed on its own merits
-    /// has nothing to invert.
+    #[cfg(feature = "wprof")]
     #[test]
     fn apply_expect_auto_repro_inversion_no_op_when_success_true() {
         let _lock = lock_env();
@@ -7640,10 +7608,7 @@ mod tests {
         );
     }
 
-    /// `result.entry_name = None` → `repro_wprof_pb_path()` bails
-    /// and the helper exits via the `let Ok(...) else` arm without
-    /// flipping the field. Defense-in-depth against a synthesis
-    /// path that bypasses the eval-layer stamping.
+    #[cfg(feature = "wprof")]
     #[test]
     fn apply_expect_auto_repro_inversion_no_op_when_entry_name_none() {
         let _lock = lock_env();
@@ -7665,10 +7630,7 @@ mod tests {
         );
     }
 
-    /// All upstream gates pass but the artifact never landed on
-    /// disk → `assert_wprof_pb_shape` returns Err on the missing
-    /// file and the helper leaves the field false. Models the
-    /// "auto-repro VM crashed before write" regression.
+    #[cfg(feature = "wprof")]
     #[test]
     fn apply_expect_auto_repro_inversion_no_op_when_artifact_missing() {
         let _lock = lock_env();
@@ -7686,12 +7648,7 @@ mod tests {
         );
     }
 
-    /// Artifact landed but is shorter than `WPROF_PB_MIN_BYTES` →
-    /// `assert_wprof_pb_shape` returns Err on the size gate. Closes
-    /// the partial-write race the bare `path.exists()` check would
-    /// have missed: wprof's `init_pb_trace` always emits ~4 KB of
-    /// interned-string table, so a truncated file means wprof
-    /// aborted mid-write.
+    #[cfg(feature = "wprof")]
     #[test]
     fn apply_expect_auto_repro_inversion_no_op_when_artifact_truncated() {
         use crate::test_support::wprof::{PERFETTO_TRACE_PACKETS_TAG, WPROF_PB_MIN_BYTES};
@@ -7714,12 +7671,7 @@ mod tests {
         );
     }
 
-    /// Artifact landed at the right size but starts with the wrong
-    /// leading byte → `assert_wprof_pb_shape` returns Err on the tag
-    /// gate. Models a transport-corruption regression where bytes
-    /// arrived but the wire framing got mangled, OR a
-    /// wrong-format-binary regression where the auto-repro VM wrote
-    /// a non-Perfetto payload.
+    #[cfg(feature = "wprof")]
     #[test]
     fn apply_expect_auto_repro_inversion_no_op_when_artifact_wrong_tag() {
         use crate::test_support::wprof::WPROF_PB_MIN_BYTES;
@@ -7742,9 +7694,7 @@ mod tests {
         );
     }
 
-    /// Every gate passes + a shape-valid artifact is on disk → the
-    /// helper sets the field to true. The single positive arm — pins
-    /// the satisfaction signal end-to-end across the gates.
+    #[cfg(feature = "wprof")]
     #[test]
     fn apply_expect_auto_repro_inversion_sets_field_on_valid_artifact() {
         let _lock = lock_env();

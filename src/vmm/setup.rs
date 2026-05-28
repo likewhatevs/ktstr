@@ -564,6 +564,7 @@ impl KtstrVm {
         let include_files = self.include_files.clone();
         let staged_schedulers = self.staged_schedulers.clone();
         let busybox_bytes = self.busybox_bytes.clone();
+        #[cfg(feature = "wprof")]
         let wprof_host_path: Option<PathBuf> = self.wprof.as_ref().map(|w| w.host_path.clone());
         std::thread::Builder::new()
             .name("initramfs-resolve".into())
@@ -620,6 +621,7 @@ impl KtstrVm {
                         w.to_path_buf(),
                     ));
                 }
+                #[cfg(feature = "wprof")]
                 if let Some(wprof_path) = wprof_host_path.as_deref() {
                     merged_includes.push(("bin/wprof".to_string(), wprof_path.to_path_buf()));
                 }
@@ -1338,13 +1340,7 @@ impl KtstrVm {
         } else {
             cmdline.push_str(" numa_balancing=0");
         }
-        // wprof handshake — emitted only when the builder attached
-        // a `WprofConfig`. The guest init parses `KTSTR_WPROF_ARGS`
-        // and spawns `/bin/wprof` with the configured args during
-        // auto-repro (`/bin/wprof` is packed by the initramfs
-        // builder when `wprof` is set; see
-        // `vmm::initramfs::build_initramfs_base`'s `wprof_bytes`
-        // arg).
+        #[cfg(feature = "wprof")]
         if let Some(wprof) = self.wprof.as_ref() {
             cmdline.push_str(" KTSTR_WPROF_ARGS=");
             cmdline.push_str(&wprof.args_cmdline());
@@ -1699,14 +1695,7 @@ impl KtstrVm {
         } else {
             cmdline.push_str(" numa_balancing=0");
         }
-        // wprof handshake — mirror of the x86_64 `setup_memory`
-        // emission. Without this, aarch64 guests boot with `wprof`
-        // packed in the initramfs but no `KTSTR_WPROF_ARGS` token
-        // on `/proc/cmdline`, so `spawn_wprof_if_configured` in
-        // `vmm::rust_init` short-circuits and no `.wprof.pb`
-        // artifact is produced; the
-        // `wprof_args_override_propagates_to_guest_cmdline` e2e
-        // also fails its substring check against `/proc/cmdline`.
+        #[cfg(feature = "wprof")]
         if let Some(wprof) = self.wprof.as_ref() {
             cmdline.push_str(" KTSTR_WPROF_ARGS=");
             cmdline.push_str(&wprof.args_cmdline());

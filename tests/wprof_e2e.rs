@@ -1,3 +1,4 @@
+#![cfg(feature = "wprof")]
 //! End-to-end test: wprof embedded in cargo-ktstr, runtime-injected
 //! into a shell-mode VM, accessible at `/bin/wprof` inside the guest.
 //!
@@ -7,7 +8,7 @@
 //!   and the shell-mode VM would not boot)
 //! - the bytes propagate through the env-var injection chain
 //!   (KTSTR_WPROF_PATH → ktstr library reads file via
-//!   `crate::vmm::blobs::load_wprof_bytes` → packs into initramfs)
+//!   `crate::vmm::blobs::load_wprof_path` → packs into initramfs)
 //! - the wprof binary lands at `/bin/wprof` in the guest filesystem
 //!   with executable mode + non-trivial size
 //!

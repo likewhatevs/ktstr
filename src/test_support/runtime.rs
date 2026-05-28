@@ -339,31 +339,7 @@ pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
     parts.join(" ")
 }
 
-/// Attach wprof configuration to a VM builder when the test entry
-/// declares `#[ktstr_test(wprof)]`.
-///
-/// Shared by `crate::test_support::eval::run_ktstr_test_inner_impl`
-/// (primary VM build site) AND
-/// [`crate::test_support::probe::attempt_auto_repro`] (auto-repro VM
-/// build site) so the two wire-ups can't drift. A regression in
-/// either site is impossible to introduce without touching this
-/// helper.
-///
-/// `label` distinguishes the call site in the error path
-/// (`"primary"` vs `"auto-repro"`) — the loaded `WprofConfig` itself
-/// is identical across both sites.
-///
-/// Returns the builder unchanged when `entry.wprof` is false.
-///
-/// # Errors
-///
-/// Bails when `entry.wprof` is true but
-/// [`crate::vmm::wprof::WprofConfig::from_env`] fails (typically
-/// because `cargo-ktstr` did not export `KTSTR_WPROF_PATH` via
-/// `install_env`, or the path it exported is unreadable). The bail
-/// is loud rather than silent because a wprof-tagged test that
-/// silently ran without wprof would produce no `.wprof.pb` artifact
-/// and the test author would not learn the capability dropped.
+#[cfg(feature = "wprof")]
 pub(crate) fn attach_wprof_if_requested(
     builder: crate::vmm::KtstrVmBuilder,
     entry: &KtstrTestEntry,
@@ -388,37 +364,33 @@ pub(crate) fn attach_wprof_if_requested(
 
 /// Derive the test VM's memory floor from a CPU count + entry.
 ///
-/// Returns `max(cpus * 64, 256, entry.memory_mib)`, then bumps to
-/// [`crate::vmm::wprof::WPROF_MIN_MEMORY_MIB`] when `entry.wprof`
-/// is true and the raw value falls below that floor.
-///
-/// Shared by [`resolve_vm_topology`] (entry-derived topology path)
-/// AND by the dispatch sites that derive memory from a CLI-supplied
-/// or preset-supplied topology before wrapping into a
-/// [`crate::test_support::topo::TopoOverride`] — see
-/// `dispatch::run_ktstr_test_with_topo_str` and
-/// `dispatch::run_gauntlet_test`. Centralizing the derivation here
-/// ensures the wprof floor reaches every code path that boots a
-/// wprof-tagged test, not just the entry-derived one.
+/// Returns `max(cpus * 64, 256, entry.memory_mib)`. When the
+/// `wprof` feature is enabled and `entry.wprof` is true, bumps
+/// to `WPROF_MIN_MEMORY_MIB` if below that floor.
 ///
 /// The returned value is the LOWER BOUND on guest memory; the
 /// VM builder ultimately uses `.memory_deferred_min(mib)` which
 /// also accounts for the initramfs size, so the final boot memory
 /// may exceed this value.
 pub(crate) fn derive_test_memory_mib(cpus: u32, entry: &KtstrTestEntry) -> u32 {
-    use crate::vmm::wprof::{WPROF_MIN_MEMORY_MIB, apply_wprof_memory_floor};
     let raw = (cpus * 64).max(256).max(entry.memory_mib);
-    let mem = apply_wprof_memory_floor(raw, entry.wprof);
-    if mem != raw {
-        tracing::info!(
-            test = %entry.name,
-            requested_mib = raw,
-            floored_mib = WPROF_MIN_MEMORY_MIB,
-            "wprof enabled; memory_mib floored to \
-             WPROF_MIN_MEMORY_MIB"
-        );
+    #[cfg(feature = "wprof")]
+    {
+        use crate::vmm::wprof::{WPROF_MIN_MEMORY_MIB, apply_wprof_memory_floor};
+        let mem = apply_wprof_memory_floor(raw, entry.wprof);
+        if mem != raw {
+            tracing::info!(
+                test = %entry.name,
+                requested_mib = raw,
+                floored_mib = WPROF_MIN_MEMORY_MIB,
+                "wprof enabled; memory_mib floored to \
+                 WPROF_MIN_MEMORY_MIB"
+            );
+        }
+        mem
     }
-    mem
+    #[cfg(not(feature = "wprof"))]
+    raw
 }
 
 /// Resolve the VM topology and memory size from an optional
@@ -437,27 +409,21 @@ pub(crate) fn derive_test_memory_mib(cpus: u32, entry: &KtstrTestEntry) -> u32 {
 /// same way as the first VM — reproducibility requires identical
 /// topology, including the wprof floor when applicable.
 ///
-/// When `entry.wprof` is true and a TopoOverride passes a
-/// memory_mib below [`crate::vmm::wprof::WPROF_MIN_MEMORY_MIB`],
-/// the override is still honored verbatim but a warn-level log
-/// fires — wprof may OOM-kill mid-run. The override-is-verbatim
-/// contract takes precedence; the operator owns the decision.
-/// (Dispatch sites that synthesize a TopoOverride from CLI flags
-/// already route through [`derive_test_memory_mib`] before
-/// constructing the override, so the warn path is reachable only
-/// when an operator hand-builds a TopoOverride with explicit memory.)
+/// When the `wprof` feature is enabled and `entry.wprof` is true,
+/// a TopoOverride with memory_mib below the wprof floor triggers
+/// a warn-level log but is still honored verbatim.
 pub(crate) fn resolve_vm_topology(
     entry: &KtstrTestEntry,
     topo: Option<&super::topo::TopoOverride>,
 ) -> (crate::vmm::topology::Topology, u32) {
-    use crate::vmm::wprof::WPROF_MIN_MEMORY_MIB;
     match topo {
         Some(t) => {
-            if entry.wprof && t.memory_mib < WPROF_MIN_MEMORY_MIB {
+            #[cfg(feature = "wprof")]
+            if entry.wprof && t.memory_mib < crate::vmm::wprof::WPROF_MIN_MEMORY_MIB {
                 tracing::warn!(
                     test = %entry.name,
                     override_mib = t.memory_mib,
-                    wprof_min_mib = WPROF_MIN_MEMORY_MIB,
+                    wprof_min_mib = crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
                     "wprof enabled with TopoOverride.memory_mib below \
                      WPROF_MIN_MEMORY_MIB; honoring the override per the \
                      override-is-verbatim contract, but wprof may OOM-kill \
@@ -1111,6 +1077,7 @@ mod tests {
         assert_eq!(mem, 8192);
     }
 
+    #[cfg(feature = "wprof")]
     #[test]
     fn resolve_vm_topology_wprof_floors_memory_on_entry_path() {
         // Entry with wprof=true and memory below the wprof floor.
@@ -1131,6 +1098,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "wprof")]
     #[test]
     fn resolve_vm_topology_wprof_no_bump_when_already_above_floor() {
         // Entry already above the wprof floor — must be honored unchanged.
@@ -1168,6 +1136,18 @@ mod tests {
     }
 
     #[test]
+    fn derive_test_memory_mib_baseline_without_wprof() {
+        let entry = KtstrTestEntry {
+            name: "baseline",
+            memory_mib: 0,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mem = derive_test_memory_mib(2, &entry);
+        assert_eq!(mem, 256, "2 cpus * 64 = 128, floor 256 wins");
+    }
+
+    #[cfg(feature = "wprof")]
+    #[test]
     fn resolve_vm_topology_wprof_no_bump_at_exact_floor() {
         // Boundary case: derived memory equals WPROF_MIN_MEMORY_MIB
         // exactly. The handler uses strict `<` so 2048 passes through
@@ -1192,6 +1172,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "wprof")]
     #[test]
     fn resolve_vm_topology_wprof_floors_zero_entry_memory_mib() {
         // Edge case: entry.memory_mib=0 with wprof=true. The raw
@@ -1214,6 +1195,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "wprof")]
     #[test]
     fn derive_test_memory_mib_helper_applies_wprof_floor() {
         // Direct test of the derivation helper used by BOTH
@@ -1252,6 +1234,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "wprof")]
     #[test]
     fn resolve_vm_topology_override_with_wprof_honors_override_verbatim() {
         // The override-is-verbatim contract: a TopoOverride with
