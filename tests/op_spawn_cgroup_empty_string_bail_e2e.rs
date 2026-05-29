@@ -14,8 +14,10 @@
 //! never reach the cgroup-fs layer.
 //!
 //! Expected behavior:
-//! - `execute_scenario` returns `Err(_)` (scenario engine bails)
-//! - The error chain contains
+//! - `execute_scenario` returns `Ok(AssertResult::fail(...))` —
+//!   `run_scenario` converts a step bail into a failing result, not
+//!   an `Err` (src/scenario/ops/mod.rs)
+//! - A failure detail contains
 //!   `"Op::Spawn(SpawnPlacement::Cgroup): cgroup name is empty"`
 //!   plus the actionable redirect to `SpawnPlacement::runner_cgroup()`
 //! - No cgroup-fs side effects (no `cg_test` dir created — the
@@ -26,7 +28,7 @@
 //! to capture the "failure" would just bail again with the
 //! same message, wasting a kernel boot.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
 use ktstr::ktstr_test;
 use ktstr::prelude::{SpawnPlacement, WorkSpec};
@@ -55,52 +57,61 @@ fn op_spawn_cgroup_empty_string_bails_with_actionable_diagnostic(
         )],
         HoldSpec::fixed(Duration::ZERO),
     )];
-    match execute_scenario(ctx, backdrop, steps) {
-        Ok(_) => Ok(AssertResult::fail(AssertDetail::new(
+    // run_scenario converts a step bail into Ok(AssertResult::fail(...))
+    // carrying the bail message as a failure detail (see
+    // src/scenario/ops/mod.rs) — it does NOT return Err. So a missing
+    // bail surfaces as a passing result, and the diagnostic lives in
+    // the failure details, not an error chain.
+    let result = execute_scenario(ctx, backdrop, steps).context(
+        "execute_scenario returned Err — unexpected; a step bail is \
+         converted to Ok(AssertResult::fail)",
+    )?;
+    if result.is_pass() {
+        return Ok(AssertResult::fail(AssertDetail::new(
             DetailKind::Other,
-            "execute_scenario returned Ok — empty-string \
-             SpawnPlacement::Cgroup MUST bail at apply_ops \
-             entry. Without the bail, the workers would have \
-             spawned, the cgroup-fs move_tasks would have \
-             failed with a less actionable kernel ENOENT, and \
-             the bail's spawn-before-validate hazard the \
-             diagnostic prevents would be live."
+            "execute_scenario produced a passing result — empty-string \
+             SpawnPlacement::Cgroup MUST bail at apply_ops entry. \
+             Without the bail, the workers would have spawned, the \
+             cgroup-fs move_tasks would have failed with a less \
+             actionable kernel ENOENT, and the spawn-before-validate \
+             hazard the diagnostic prevents would be live."
                 .to_string(),
-        ))),
-        Err(e) => {
-            let msg = format!("{e:#}");
-            // Pin the diagnostic shape so a regression that
-            // weakened the bail to bare "cgroup '': not found"
-            // (kernel ENOENT class) surfaces here.
-            if !msg.contains("Op::Spawn(SpawnPlacement::Cgroup)") {
-                return Ok(AssertResult::fail(AssertDetail::new(
-                    DetailKind::Other,
-                    format!(
-                        "expected diagnostic to name \
-                         `Op::Spawn(SpawnPlacement::Cgroup)`; \
-                         got: {msg}"
-                    ),
-                )));
-            }
-            if !msg.contains("cgroup name is empty") {
-                return Ok(AssertResult::fail(AssertDetail::new(
-                    DetailKind::Other,
-                    format!(
-                        "expected diagnostic to cite `cgroup \
-                         name is empty`; got: {msg}"
-                    ),
-                )));
-            }
-            if !msg.contains("SpawnPlacement::runner_cgroup") {
-                return Ok(AssertResult::fail(AssertDetail::new(
-                    DetailKind::Other,
-                    format!(
-                        "expected diagnostic to name the \
-                         runner-cgroup recovery path; got: {msg}"
-                    ),
-                )));
-            }
-            Ok(AssertResult::pass())
-        }
+        )));
     }
+    // Pin the diagnostic shape so a regression that weakened the bail
+    // to a bare "cgroup '': not found" (kernel ENOENT class) surfaces
+    // here. The bail message arrives as a failure detail.
+    let combined = result
+        .failure_details()
+        .map(|d| d.message.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if !combined.contains("Op::Spawn(SpawnPlacement::Cgroup)") {
+        return Ok(AssertResult::fail(AssertDetail::new(
+            DetailKind::Other,
+            format!(
+                "expected the failure detail to name \
+                 `Op::Spawn(SpawnPlacement::Cgroup)`; got: {combined}"
+            ),
+        )));
+    }
+    if !combined.contains("cgroup name is empty") {
+        return Ok(AssertResult::fail(AssertDetail::new(
+            DetailKind::Other,
+            format!(
+                "expected the failure detail to cite `cgroup name is \
+                 empty`; got: {combined}"
+            ),
+        )));
+    }
+    if !combined.contains("SpawnPlacement::runner_cgroup") {
+        return Ok(AssertResult::fail(AssertDetail::new(
+            DetailKind::Other,
+            format!(
+                "expected the failure detail to name the runner-cgroup \
+                 recovery path; got: {combined}"
+            ),
+        )));
+    }
+    Ok(AssertResult::pass())
 }
