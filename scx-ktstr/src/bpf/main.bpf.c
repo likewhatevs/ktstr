@@ -224,6 +224,32 @@ struct {
 	__uint(max_entries, 256);
 } ktstr_cgroup_dispatch_count SEC(".maps");
 
+/* Multi-entry plain BPF_MAP_TYPE_ARRAY fixture for the failure-dump
+ * e2e (tests/failure_dump_e2e.rs::scenario_failure_dump_renders_array_entries).
+ * This is the ONLY plain ARRAY with max_entries > 1 in the repo — it
+ * exists so the host-side renderer's per-key ARRAY walk
+ * (src/monitor/dump/render_map.rs's BPF_MAP_TYPE_ARRAY arm) has live
+ * multi-entry data to surface; nothing inside scx-ktstr reads it back.
+ * Populated once from ktstr_init (runs at scheduler attach, before any
+ * stall can arm), so every entry is stamped at freeze time. The value
+ * is a 16-byte struct (magic + echoed key + pad) so the dump can
+ * assert each key's BTF render, not just key 0. */
+#define KTSTR_ARRAY_ENTRIES 16U
+#define KTSTR_ARRAY_MAGIC 0xABCDEF0123456789ULL
+
+struct ktstr_array_value {
+	__u64 magic;
+	__u32 key_echo;
+	__u32 _pad;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, struct ktstr_array_value);
+	__uint(max_entries, KTSTR_ARRAY_ENTRIES);
+} ktstr_array_fixture SEC(".maps");
+
 /* Single sentinel key for `ktstr_cross_btf_map`. The fixture only
  * uses one entry — distinct keys would diverge the publish and
  * chase helpers' lookups, producing a useless empty entry. */
@@ -427,7 +453,35 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ktstr_init)
 	 * `sizeof(struct ktstr_arena_ctx)` matches the struct that
 	 * `ktstr_init_task` writes into. `scx_task_init` rounds this up
 	 * to 8 bytes inside `lib/sdt_alloc.bpf.c::pool_set_size`. */
-	return scx_task_init(sizeof(struct ktstr_arena_ctx));
+	ret = scx_task_init(sizeof(struct ktstr_arena_ctx));
+	if (ret)
+		return ret;
+
+	/* Stamp every entry of the multi-entry ARRAY fixture so the
+	 * failure-dump renderer's per-key walk has live data to surface.
+	 * `#pragma unroll` is what satisfies the verifier: the original
+	 * `&i` form spilled the loop counter to the stack (the map key is
+	 * passed by address), and the verifier reloads a stack-spilled
+	 * u32 as unbounded each iteration, loses the
+	 * `< KTSTR_ARRAY_ENTRIES` bound, and rejects ktstr_init with
+	 * "infinite loop detected" (-EINVAL at load). Unrolled, the 16
+	 * stamps are straight-line with constant indices — no loop, no
+	 * back-edge. The separate `key` local keeps the loop index off
+	 * the address-taken path. bpf_map_update_elem failure is
+	 * best-effort (verifier-required, never expected on a fresh
+	 * array). */
+	#pragma unroll
+	for (__u32 i = 0; i < KTSTR_ARRAY_ENTRIES; i++) {
+		__u32 key = i;
+		struct ktstr_array_value v = {
+			.magic = KTSTR_ARRAY_MAGIC,
+			.key_echo = i,
+			._pad = 0,
+		};
+		bpf_map_update_elem(&ktstr_array_fixture, &key, &v, BPF_ANY);
+	}
+
+	return 0;
 }
 
 /*

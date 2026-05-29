@@ -263,6 +263,7 @@ mod tests {
             max_entries: 1,
             value: Some(bss_value),
             entries: Vec::new(),
+            array_entries: Vec::new(),
             percpu_entries: Vec::new(),
             percpu_hash_entries: Vec::new(),
             arena: None,

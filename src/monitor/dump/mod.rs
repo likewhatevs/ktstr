@@ -1807,11 +1807,13 @@ impl FailureDumpReportAny {
 
 /// Rendering of one BPF map's contents.
 ///
-/// Unifies the four map-type rendering paths under a single
-/// representation: scalar-valued maps (ARRAY) populate `value`; keyed
-/// maps (HASH) populate `entries`; per-CPU maps populate
-/// `percpu_entries`. Exactly one of these is non-empty for a
-/// successful render; on failure `error` is set and the rest empty.
+/// Unifies the map-type rendering paths under a single
+/// representation: single-entry ARRAY maps (incl. the
+/// `.bss`/`.data`/`.rodata` global sections) populate `value`;
+/// multi-entry ARRAY maps populate `array_entries`; keyed HASH maps
+/// populate `entries`; per-CPU maps populate `percpu_entries`.
+/// Exactly one of these is non-empty for a successful render; on
+/// failure `error` is set and the rest empty.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct FailureDumpMap {
@@ -1847,16 +1849,26 @@ pub struct FailureDumpMap {
     /// Declared maximum entry count from `struct bpf_map.max_entries`.
     /// Surfaces alongside the rendered slice so a consumer can spot
     /// when the dump shows fewer entries than the map declares
-    /// (e.g. multi-entry ARRAY rendering only key 0; HASH map
-    /// truncated at `MAX_HASH_ENTRIES`; PERCPU_ARRAY truncated at
+    /// (e.g. ARRAY / HASH truncated at `MAX_ARRAY_KEYS` /
+    /// `MAX_HASH_ENTRIES`; PERCPU_ARRAY truncated at
     /// `MAX_PERCPU_KEYS`).
     pub max_entries: u32,
-    /// Single-value render (set for ARRAY-style maps).
+    /// Single-value render for a single-entry ARRAY map
+    /// (`max_entries <= 1`, incl. the `.bss`/`.data`/`.rodata`
+    /// global sections). Multi-entry ARRAY maps use `array_entries`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<RenderedValue>,
     /// (key, value) entries for HASH maps.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<FailureDumpEntry>,
+    /// Per-entry values for a multi-entry `BPF_MAP_TYPE_ARRAY` map,
+    /// indexed by the array key (`u32`). Populated for
+    /// `max_entries > 1`; the single-entry case uses `value`, so
+    /// exactly one of `value` / `array_entries` is set for an ARRAY
+    /// render. Capped at `MAX_ARRAY_KEYS`; truncation and per-key
+    /// read failures surface in `error`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub array_entries: Vec<FailureDumpArrayEntry>,
     /// Per-CPU slots for PERCPU_ARRAY maps. Outer Vec indexed by key,
     /// inner Vec indexed by CPU id.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2044,6 +2056,29 @@ pub struct FailureDumpEntry {
     /// at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<RenderedValue>,
+}
+
+/// One entry of a multi-entry `BPF_MAP_TYPE_ARRAY` map: the array key
+/// (`u32`) and its rendered value. Mirrors [`FailureDumpPercpuEntry`]'s
+/// typed `u32` key (ARRAY keys are kernel-imposed indices, not
+/// user-typed bytes) but carries a single value rather than a per-CPU
+/// vector.
+///
+/// `value` is `None` only when the entry's guest page was unmapped at
+/// the freeze instant; a BTF-render miss falls back to
+/// `RenderedValue::Bytes` (hex), so `None` unambiguously means
+/// "unreadable", not "un-rendered". ARRAY values are not
+/// `sdt_data`-arena-chased — no in-tree sched_ext ARRAY stores arena
+/// pointers; add a `payload` field here if one ever does.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct FailureDumpArrayEntry {
+    /// Array index (kernel key).
+    pub key: u32,
+    /// Rendered value (BTF when `btf_value_type_id` is non-zero, hex
+    /// fallback otherwise). `None` when the entry was unreadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<RenderedValue>,
 }
 
 /// One key from a per-CPU array, with one rendered value per CPU

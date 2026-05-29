@@ -58,6 +58,7 @@ fn synthetic_report() -> FailureDumpReport {
                 value: 0xCAFE,
             }),
             entries: Vec::new(),
+            array_entries: Vec::new(),
             percpu_entries: Vec::new(),
             percpu_hash_entries: Vec::new(),
             arena: None,

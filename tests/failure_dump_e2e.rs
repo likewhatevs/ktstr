@@ -31,6 +31,7 @@ mod common;
 
 use anyhow::Result;
 use ktstr::assert::AssertResult;
+use ktstr::ktstr_test;
 use ktstr::prelude::SCHEMA_SINGLE;
 use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
@@ -562,6 +563,191 @@ static __KTSTR_ENTRY_FAILURE_DUMP_BSS: ktstr::test_support::KtstrTestEntry =
         expect_err: true,
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
+
+/// Asserts that the host-side dump renders EVERY entry of a
+/// multi-entry plain `BPF_MAP_TYPE_ARRAY` (not just key 0).
+///
+/// scx-ktstr declares `ktstr_array_fixture` (16 entries of
+/// `struct ktstr_array_value { magic, key_echo, _pad }`) and stamps
+/// each slot in `ktstr_init` at attach. After the `--stall-after=1`
+/// freeze, the dump's renderer walks the ARRAY per key
+/// (src/monitor/dump/render_map.rs) into `array_entries`. This is the
+/// e2e for the "render all entries" change — before it, the renderer
+/// surfaced only key 0 with an "only key 0 shown" error.
+///
+/// User-facing bar: an operator inspecting a stalled scheduler sees
+/// every cell of a multi-entry array, with the right per-key values —
+/// proof the per-key stride math read the correct entry, not key 0
+/// repeated.
+#[ktstr_test(
+    scheduler = KTSTR_SCHED,
+    extra_sched_args = ["--stall-after=1"],
+    watchdog_timeout_s = 3,
+    duration_s = 10,
+    expect_err = true,
+)]
+fn failure_dump_renders_array_entries(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
+    let dump_path = ctx.failure_dump_path()?;
+
+    let steps = vec![Step {
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
+        ops: vec![],
+        hold: HoldSpec::FULL,
+    }];
+    let mut result = execute_steps(ctx, steps)?;
+
+    let json = match std::fs::read_to_string(&dump_path) {
+        Ok(s) => s,
+        Err(e) => {
+            result.record_fail(ktstr::assert::AssertDetail::new(
+                ktstr::assert::DetailKind::Other,
+                format!(
+                    "failure dump file missing at {}: {e} (freeze coordinator did \
+                     not write — the SCX_EXIT_ERROR_STALL latch did not fire or the \
+                     write failed silently)",
+                    dump_path.display()
+                ),
+            ));
+            anyhow::bail!(
+                "failure dump file missing at {} — freeze coordinator did not write \
+                 the JSON dump",
+                dump_path.display()
+            );
+        }
+    };
+
+    let value: serde_json::Value = serde_json::from_str(&json)
+        .map_err(|e| anyhow::anyhow!("dump file is not valid JSON: {e}"))?;
+    let schema = value
+        .get("schema")
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| anyhow::anyhow!("dump JSON missing top-level `schema` field"))?;
+    anyhow::ensure!(
+        schema == SCHEMA_SINGLE,
+        "happy-path dump must carry schema=SCHEMA_SINGLE ({SCHEMA_SINGLE:?}); got {schema}"
+    );
+
+    let maps = value
+        .get("maps")
+        .and_then(|m| m.as_array())
+        .ok_or_else(|| anyhow::anyhow!("dump JSON missing top-level `maps` array"))?;
+
+    // Match by shape, not name: the kernel truncates the declared map
+    // name to 15 chars (BPF_OBJ_NAME_LEN), so pin on map_type==2
+    // (BPF_MAP_TYPE_ARRAY) AND max_entries==KTSTR_ARRAY_ENTRIES, which
+    // uniquely identifies `ktstr_array_fixture` — the only plain ARRAY
+    // with max_entries>1 in the repo (the .bss/.data/.rodata global
+    // sections are ARRAY-typed but max_entries==1).
+    const KTSTR_ARRAY_ENTRIES: u64 = 16;
+    const KTSTR_ARRAY_MAGIC: u64 = 0xABCDEF0123456789;
+    const BPF_MAP_TYPE_ARRAY: u64 = 2;
+    let array_map = maps
+        .iter()
+        .find(|m| {
+            m.get("map_type").and_then(|t| t.as_u64()) == Some(BPF_MAP_TYPE_ARRAY)
+                && m.get("max_entries").and_then(|e| e.as_u64()) == Some(KTSTR_ARRAY_ENTRIES)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "dump has no multi-entry ARRAY fixture (map_type=2, max_entries=16) — \
+                 the scx-ktstr ktstr_array_fixture map is missing from the IDR walk \
+                 or was mis-typed by the renderer. maps={}: {json}",
+                maps.len()
+            )
+        })?;
+
+    let name = array_map.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    anyhow::ensure!(
+        name.contains("array"),
+        "ARRAY fixture name should contain `array` (kernel-truncated \
+         ktstr_array_fixture); got {name:?}"
+    );
+
+    // The whole point of the change: a multi-entry ARRAY populates
+    // `array_entries`, NOT the single-entry `value`.
+    anyhow::ensure!(
+        array_map.get("value").is_none_or(|v| v.is_null()),
+        "multi-entry ARRAY must populate `array_entries`, not the single-entry \
+         `value`: {array_map}"
+    );
+    // 16 < MAX_ARRAY_KEYS (4096) and every entry is mapped → no error.
+    anyhow::ensure!(
+        array_map.get("error").is_none_or(|e| e.is_null()),
+        "ARRAY render must be error-free for 16 mapped entries: {array_map}"
+    );
+
+    let entries = array_map
+        .get("array_entries")
+        .and_then(|a| a.as_array())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "ARRAY fixture has no `array_entries` — the prior 'only key 0' \
+                 behaviour would leave this empty with `value` set: {array_map}"
+            )
+        })?;
+    anyhow::ensure!(
+        entries.len() == KTSTR_ARRAY_ENTRIES as usize,
+        "expected {KTSTR_ARRAY_ENTRIES} array_entries (every key rendered), got {}: \
+         {array_map}",
+        entries.len()
+    );
+
+    // Each entry i: key == i, value is a struct whose `magic` member is
+    // KTSTR_ARRAY_MAGIC and whose `key_echo` echoes the key. Proves the
+    // per-key stride read the correct entry (not key 0 repeated, not a
+    // wrong-stride overlap).
+    for (i, entry) in entries.iter().enumerate() {
+        let key = entry
+            .get("key")
+            .and_then(|k| k.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("array_entries[{i}] missing u32 `key`: {entry}"))?;
+        anyhow::ensure!(
+            key == i as u64,
+            "array_entries[{i}].key == {key}, expected {i} (entries must be key-ordered)"
+        );
+
+        let val = entry.get("value").ok_or_else(|| {
+            anyhow::anyhow!("array_entries[{i}] has no value (unreadable key?): {entry}")
+        })?;
+        anyhow::ensure!(
+            val.get("kind").and_then(|k| k.as_str()) == Some("struct"),
+            "array_entries[{i}].value must render as a struct: {val}"
+        );
+        let members = val
+            .get("members")
+            .and_then(|m| m.as_array())
+            .ok_or_else(|| {
+                anyhow::anyhow!("array_entries[{i}].value struct has no members: {val}")
+            })?;
+        let member_u64 = |nm: &str| -> Option<u64> {
+            members
+                .iter()
+                .find(|m| m.get("name").and_then(|n| n.as_str()) == Some(nm))
+                .and_then(|m| m.get("value"))
+                .and_then(|v| v.get("value"))
+                .and_then(|v| v.as_u64())
+        };
+        let magic = member_u64("magic");
+        let key_echo = member_u64("key_echo");
+        anyhow::ensure!(
+            magic == Some(KTSTR_ARRAY_MAGIC),
+            "array_entries[{i}].magic must be KTSTR_ARRAY_MAGIC (0x{KTSTR_ARRAY_MAGIC:x}); \
+             got {magic:?}: {val}"
+        );
+        anyhow::ensure!(
+            key_echo == Some(i as u64),
+            "array_entries[{i}].key_echo must echo the key {i}; got {key_echo:?}: {val}"
+        );
+    }
+
+    result.note(format!(
+        "multi-entry ARRAY fixture `{name}` rendered all {} keys with correct \
+         magic + echoed key (dump: {})",
+        entries.len(),
+        dump_path.display()
+    ));
+    Ok(result)
+}
 
 /// Asserts that the freeze coordinator's host-side capture modules
 /// (`crate::vmm::capture_scx`, `crate::vmm::capture_tasks`,

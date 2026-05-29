@@ -4,8 +4,8 @@
 //! All `Display` impls for [`super::FailureDumpReport`],
 //! [`super::DualFailureDumpReport`], [`super::FailureDumpReportAny`],
 //! [`super::FailureDumpMap`], [`super::FailureDumpEntry`],
-//! [`super::FailureDumpPercpuEntry`], and
-//! [`super::FailureDumpPercpuHashEntry`] live here so the type
+//! [`super::FailureDumpArrayEntry`], [`super::FailureDumpPercpuEntry`],
+//! and [`super::FailureDumpPercpuHashEntry`] live here so the type
 //! definitions in [`super`] stay focused on the data shape and the
 //! formatting concerns are isolated in one place.
 //!
@@ -16,9 +16,9 @@ use super::super::btf_render::{
     RenderedMember, RenderedValue, is_inline_scalar, is_zero, write_value_at_depth,
 };
 use super::{
-    DegradedFailureDumpReport, DualFailureDumpReport, EventCounterSample, FailureDumpEntry,
-    FailureDumpMap, FailureDumpPercpuEntry, FailureDumpPercpuHashEntry, FailureDumpReport,
-    FailureDumpReportAny, render_sparkline_i64,
+    DegradedFailureDumpReport, DualFailureDumpReport, EventCounterSample, FailureDumpArrayEntry,
+    FailureDumpEntry, FailureDumpMap, FailureDumpPercpuEntry, FailureDumpPercpuHashEntry,
+    FailureDumpReport, FailureDumpReportAny, render_sparkline_i64,
 };
 
 /// Minimum entry count for [`FailureDumpMap`] table rendering. Two
@@ -631,6 +631,10 @@ impl std::fmt::Display for FailureDumpMap {
                 std::fmt::Display::fmt(entry, f)?;
             }
         }
+        for entry in &self.array_entries {
+            f.write_str("\n")?;
+            std::fmt::Display::fmt(entry, f)?;
+        }
         for entry in &self.percpu_entries {
             f.write_str("\n")?;
             std::fmt::Display::fmt(entry, f)?;
@@ -796,6 +800,21 @@ impl std::fmt::Display for FailureDumpEntry {
         if let Some(p) = &self.payload {
             f.write_str("\n  .data ")?;
             write_value_at_depth(f, p, 1)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for FailureDumpArrayEntry {
+    /// `key <N>: <rendered value>` — one line for a flat struct, the
+    /// value's own multi-line body indented one level (depth=1) for a
+    /// nested struct/array. `<unreadable>` marks a key whose guest
+    /// page was unmapped at the freeze instant.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "key {}: ", self.key)?;
+        match &self.value {
+            Some(v) => write_value_at_depth(f, v, 1)?,
+            None => f.write_str("<unreadable>")?,
         }
         Ok(())
     }

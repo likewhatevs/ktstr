@@ -261,19 +261,30 @@ pub struct BpfMapInfo {
     pub map_flags: u32,
     /// `key_size` field value.
     pub key_size: u32,
-    /// `value_size` field value.
+    /// `value_size` field value — the size of ONE entry's value.
+    /// For `BPF_MAP_TYPE_ARRAY` the kernel's per-entry stride is
+    /// `array->elem_size = round_up(value_size, 8)`
+    /// (kernel/bpf/arraymap.c:93) and the value region spans
+    /// `max_entries * elem_size`; a multi-entry ARRAY is read one
+    /// entry at a time via [`BpfMapAccessor::read_array`], not as a
+    /// single `value_size`-byte buffer.
     pub value_size: u32,
     /// `max_entries` field value.
     pub max_entries: u32,
-    /// Guest KVA of the map's value region for single-buffer
-    /// reads. `Some(kva)` when the renderer can read up to `value_size`
-    /// bytes starting at this address; `None` when the map type
-    /// requires a different walker (hash iteration, arena page
-    /// snapshot, …) or the kva resolution failed.
+    /// Guest KVA of the map's value region (entry 0). `Some(kva)`
+    /// when the renderer can read an entry starting at this address;
+    /// `None` when the map type requires a different walker (hash
+    /// iteration, arena page snapshot, …) or the kva resolution
+    /// failed.
     ///
     /// Populated for:
     /// * `BPF_MAP_TYPE_ARRAY` — points at `bpf_array.value` (the
-    ///   inline flex array). Renderer reads `value_size` bytes.
+    ///   inline flex array, entry 0). A single-entry ARRAY
+    ///   (`max_entries <= 1`, incl. `.bss`/`.data`/`.rodata`) reads
+    ///   `value_size` bytes via [`BpfMapAccessor::read_value`]; a
+    ///   multi-entry ARRAY reads entry `k` at
+    ///   `value_kva + k * round_up(value_size, 8)` via
+    ///   [`BpfMapAccessor::read_array`].
     /// * `BPF_MAP_TYPE_STRUCT_OPS` — points at `kvalue.data` (the
     ///   embedded registered struct's bytes, after the
     ///   `bpf_struct_ops_common_value` header). Renderer reads
@@ -798,7 +809,74 @@ pub(crate) fn read_bpf_map_value(
     if len > MAX_VALUE_SIZE {
         return None;
     }
-    let target_kva = base_kva + offset as u64;
+    read_kva_bytes(ctx, base_kva + offset as u64, len)
+}
+
+/// Read the value bytes for one entry of a multi-entry
+/// `BPF_MAP_TYPE_ARRAY` map.
+///
+/// Entries are contiguous starting at `bpf_array.value` with a
+/// per-entry stride of `round_up(value_size, 8)` — the kernel's
+/// `array->elem_size` (kernel/bpf/arraymap.c:93 sets it, :167-176
+/// indexes with it). The value region spans `max_entries *
+/// elem_size`. Unlike [`read_bpf_map_value`], whose bound is one
+/// entry's `value_size`, this reads entry `key` at
+/// `value_kva + key * stride`.
+///
+/// Returns `None` when the map is not `BPF_MAP_TYPE_ARRAY`,
+/// `key >= max_entries` (the kernel's `index_mask` is a Spectre
+/// bound, not a range check — `array_map_lookup_elem` rejects
+/// `index >= max_entries` BEFORE masking, so this replicates the
+/// pre-mask test), `value_size` exceeds `MAX_VALUE_SIZE`, no value
+/// KVA was resolved, the offset would overflow, or any page in the
+/// entry is unmapped. On success the buffer is exactly `value_size`
+/// bytes — the 8-rounded stride is internal padding the kernel's
+/// `copy_map_value` does not copy.
+pub(crate) fn read_bpf_map_array_value(
+    ctx: &AccessorCtx<'_>,
+    map_info: &BpfMapInfo,
+    key: u32,
+) -> Option<Vec<u8>> {
+    if map_info.map_type != BPF_MAP_TYPE_ARRAY {
+        return None;
+    }
+    // Replicate array_map_lookup_elem's pre-mask `index >= max_entries`
+    // rejection (kernel/bpf/arraymap.c:172) — never trust index_mask
+    // to clamp; it only blocks speculation.
+    if key >= map_info.max_entries {
+        return None;
+    }
+    let value_size = map_info.value_size as usize;
+    // Hostile-guest size cap before any allocation, matching
+    // `read_bpf_map_value`.
+    if value_size > MAX_VALUE_SIZE {
+        return None;
+    }
+    let base_kva = map_info.value_kva?;
+    // Per-entry stride is round_up(value_size, 8) = array->elem_size
+    // (kernel/bpf/arraymap.c:93). Same `(x + 7) & !7` rounding the
+    // percpu stride math uses in bpf_syscall.rs.
+    let stride = (value_size + 7) & !7;
+    // key < max_entries (checked above) keeps key * stride within the
+    // `max_entries * stride` value region; checked arithmetic guards a
+    // corrupted max_entries from wrapping the KVA past u64.
+    let offset = (key as u64).checked_mul(stride as u64)?;
+    let target_kva = base_kva.checked_add(offset)?;
+    read_kva_bytes(ctx, target_kva, value_size)
+}
+
+/// Page-walk `len` bytes from guest kernel-virtual address
+/// `target_kva` via [`chunked_kva_io`], returning the bytes or `None`
+/// if any page in the range is unmapped or the copy short-reads
+/// (end-of-DRAM).
+///
+/// Shared by [`read_bpf_map_value`] (byte-range reads bounded by one
+/// entry's `value_size`) and [`read_bpf_map_array_value`] (per-entry
+/// reads into a multi-entry ARRAY bounded by `max_entries * stride`).
+/// This helper performs NO semantic bounds check — callers MUST cap
+/// `len` against `MAX_VALUE_SIZE` and confirm `target_kva` lies in the
+/// map's value region before calling.
+fn read_kva_bytes(ctx: &AccessorCtx<'_>, target_kva: u64, len: usize) -> Option<Vec<u8>> {
     // `Vec::with_capacity` reserves backing storage without zeroing
     // — the zero-fill that `vec![0u8; len]` would have emitted is
     // wasted because every byte gets overwritten by the
@@ -824,8 +902,8 @@ pub(crate) fn read_bpf_map_value(
         let slice =
             unsafe { std::slice::from_raw_parts_mut(buf_ptr.add(dst_off as usize), chunk_len) };
         // GuestMem::read_bytes returns the count actually copied; the
-        // caller has bounds-checked value_size and translate_kva has
-        // confirmed the page is mapped, so a short read here means
+        // caller has bounds-checked the value region and translate_kva
+        // has confirmed the page is mapped, so a short read here means
         // the page crosses end-of-DRAM, which the original byte loop
         // would also have silently short-copied.
         let n = ctx.mem.read_bytes(pa, slice);
@@ -1100,6 +1178,24 @@ pub trait BpfMapAccessor {
     /// surface `bpf_map_lookup_elem` rejection (e.g. `-EINVAL` on
     /// arena maps, kernel-side ACL denials).
     fn read_value(&self, map: &BpfMapInfo, offset: usize, len: usize) -> Option<Vec<u8>>;
+
+    /// Read the value bytes of one entry of a `BPF_MAP_TYPE_ARRAY` map
+    /// by entry index.
+    ///
+    /// Parallels [`Self::read_percpu_array`] (also keyed by entry
+    /// index) but for a plain ARRAY: one value per key, so the return
+    /// is a single `Option<Vec<u8>>` rather than a per-CPU vector. On
+    /// success the buffer is exactly `map.value_size` bytes.
+    ///
+    /// Returns `None` for non-ARRAY maps, `key >= map.max_entries`, or
+    /// when the backing read fails (unmapped guest page on the
+    /// guest-memory backend; `bpf_map_lookup_elem` rejection on the
+    /// live-host backend). Distinct from [`Self::read_value`], which
+    /// stays the byte-range reader for single-entry global-section
+    /// ARRAYs and STRUCT_OPS (both key 0); multi-entry ARRAY indexing
+    /// goes through this method so `read_value`'s key-0 contract is
+    /// untouched.
+    fn read_array(&self, map: &BpfMapInfo, key: u32) -> Option<Vec<u8>>;
 
     /// Iterate every entry in a `BPF_MAP_TYPE_HASH` or
     /// `BPF_MAP_TYPE_LRU_HASH` map.
@@ -1517,6 +1613,10 @@ impl BpfMapAccessor for GuestMemMapAccessor<'_> {
 
     fn read_value(&self, map: &BpfMapInfo, offset: usize, len: usize) -> Option<Vec<u8>> {
         read_bpf_map_value(&self.ctx(), map, offset, len)
+    }
+
+    fn read_array(&self, map: &BpfMapInfo, key: u32) -> Option<Vec<u8>> {
+        read_bpf_map_array_value(&self.ctx(), map, key)
     }
 
     fn iter_hash_map(&self, map: &BpfMapInfo) -> Vec<(Vec<u8>, Vec<u8>)> {

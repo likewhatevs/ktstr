@@ -746,8 +746,9 @@ pub mod prelude {
     pub use crate::monitor::bpf_prog::ProgRuntimeStats;
     pub use crate::monitor::btf_render::{RenderedMember, RenderedValue};
     pub use crate::monitor::dump::{
-        DegradedFailureDumpReport, DualFailureDumpReport, EventCounterSample, FailureDumpEntry,
-        FailureDumpFdArray, FailureDumpMap, FailureDumpPercpuEntry, FailureDumpPercpuHashEntry,
+        DegradedFailureDumpReport, DualFailureDumpReport, EventCounterSample, FailureDumpArrayEntry,
+        FailureDumpEntry, FailureDumpFdArray, FailureDumpMap, FailureDumpPercpuEntry,
+        FailureDumpPercpuHashEntry,
         FailureDumpReport, FailureDumpReportAny, FailureDumpRingbuf, FailureDumpStackTrace,
         FailureDumpStackTraceEntry, PerCpuTimeStats, PerNodeNumaStats, ProbeBssCounters,
         REASON_DEGRADED_RENDEZVOUS_TIMEOUT, SCHEMA_DEGRADED, SCHEMA_DUAL, SCHEMA_SINGLE,

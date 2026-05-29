@@ -571,6 +571,46 @@ impl BpfMapAccessor for BpfSyscallAccessor {
         Some(buf[offset..end].to_vec())
     }
 
+    fn read_array(&self, map: &BpfMapInfo, key: u32) -> Option<Vec<u8>> {
+        let pinned = self.pinned_for(map)?;
+        // ARRAY only. STRUCT_OPS and single-entry global-section maps
+        // go through read_value (key 0); HASH/PERCPU/ARENA have their
+        // own methods. Replicate array_map_lookup_elem's pre-mask
+        // `index >= max_entries` rejection (the kernel's index_mask is
+        // a Spectre bound, not a range check).
+        if map.map_type != BPF_MAP_TYPE_ARRAY {
+            return None;
+        }
+        if key >= map.max_entries {
+            return None;
+        }
+        // BPF_MAP_LOOKUP_ELEM copies value_size bytes for a plain
+        // ARRAY (copy_map_value) — no per-entry stride padding, unlike
+        // the PERCPU_ARRAY path which returns nr_cpus * round_up_8.
+        // Pass the entry index as the key.
+        let mut k: u32 = key;
+        // No MAX_VALUE_SIZE cap here (unlike the guest-memory
+        // `read_bpf_map_array_value`): value_size is sourced from
+        // BPF_OBJ_GET_INFO_BY_FD (kernel-validated metadata), not
+        // corruptible guest DRAM, so the kernel's own value_size
+        // validation guards this allocation.
+        let mut buf = vec![0u8; map.value_size as usize];
+        let attr = BpfAttrMapElem {
+            map_fd: pinned.fd.as_raw_fd() as u32,
+            _pad0: 0,
+            key: &raw mut k as u64,
+            value_or_next_key: buf.as_mut_ptr() as u64,
+            flags: 0,
+        };
+        bpf_call_status(
+            BPF_MAP_LOOKUP_ELEM,
+            &raw const attr as *const u8,
+            std::mem::size_of::<BpfAttrMapElem>(),
+        )
+        .ok()?;
+        Some(buf)
+    }
+
     fn iter_hash_map(&self, map: &BpfMapInfo) -> Vec<(Vec<u8>, Vec<u8>)> {
         let Some(pinned) = self.pinned_for(map) else {
             return Vec::new();

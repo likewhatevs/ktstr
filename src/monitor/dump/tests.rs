@@ -177,6 +177,7 @@ fn report_serde_roundtrip() {
                 value: 42,
             }),
             entries: Vec::new(),
+            array_entries: Vec::new(),
             percpu_entries: Vec::new(),
             percpu_hash_entries: Vec::new(),
             arena: None,
@@ -264,6 +265,7 @@ fn failure_dump_report_serialization_is_infallible_for_max_synthetic_input() {
                     value: 0xCAFE,
                 }),
                 entries: Vec::new(),
+                array_entries: Vec::new(),
                 percpu_entries: Vec::new(),
                 percpu_hash_entries: Vec::new(),
                 arena: None,
@@ -280,6 +282,7 @@ fn failure_dump_report_serialization_is_infallible_for_max_synthetic_input() {
                 max_entries: 64,
                 value: None,
                 entries: Vec::new(),
+                array_entries: Vec::new(),
                 percpu_entries: Vec::new(),
                 percpu_hash_entries: Vec::new(),
                 arena: None,
@@ -296,6 +299,7 @@ fn failure_dump_report_serialization_is_infallible_for_max_synthetic_input() {
                 max_entries: 0,
                 value: None,
                 entries: Vec::new(),
+                array_entries: Vec::new(),
                 percpu_entries: Vec::new(),
                 percpu_hash_entries: Vec::new(),
                 arena: None,
@@ -303,6 +307,38 @@ fn failure_dump_report_serialization_is_infallible_for_max_synthetic_input() {
                 stack_trace: None,
                 fd_array: None,
                 error: Some("type not supported".into()),
+            },
+            // Multi-entry ARRAY: exercises the `array_entries`
+            // serializer dispatch (key-0 readable, key-1 None) so the
+            // Drop-path panic-free precondition covers this field too.
+            FailureDumpMap {
+                name: "synthetic_array.cells".into(),
+                map_kva: 0,
+                map_type: BPF_MAP_TYPE_ARRAY,
+                value_size: 8,
+                max_entries: 3,
+                value: None,
+                entries: Vec::new(),
+                array_entries: vec![
+                    FailureDumpArrayEntry {
+                        key: 0,
+                        value: Some(RenderedValue::Uint {
+                            bits: 64,
+                            value: 0xBEEF,
+                        }),
+                    },
+                    FailureDumpArrayEntry {
+                        key: 1,
+                        value: None,
+                    },
+                ],
+                percpu_entries: Vec::new(),
+                percpu_hash_entries: Vec::new(),
+                arena: None,
+                ringbuf: None,
+                stack_trace: None,
+                fd_array: None,
+                error: None,
             },
         ],
         // Multi-vCPU mix of Some / None to stress the
@@ -349,7 +385,7 @@ fn failure_dump_report_serialization_is_infallible_for_max_synthetic_input() {
     // diagnostic strings or counts.
     let parsed: FailureDumpReport =
         serde_json::from_str(&json).expect("max-synthetic JSON must deserialize cleanly");
-    assert_eq!(parsed.maps.len(), 3);
+    assert_eq!(parsed.maps.len(), 4);
     assert_eq!(parsed.vcpu_regs.len(), 3);
     assert_eq!(parsed.per_cpu_time.len(), 4);
     assert_eq!(parsed.per_node_numa.len(), 2);
@@ -405,6 +441,7 @@ fn dual_failure_dump_report_serialization_is_infallible_for_max_synthetic_input(
                     value: 0xCAFE,
                 }),
                 entries: Vec::new(),
+                array_entries: Vec::new(),
                 percpu_entries: Vec::new(),
                 percpu_hash_entries: Vec::new(),
                 arena: None,
@@ -561,6 +598,7 @@ fn make_simple_map() -> FailureDumpMap {
             }],
         }),
         entries: Vec::new(),
+        array_entries: Vec::new(),
         percpu_entries: Vec::new(),
         percpu_hash_entries: Vec::new(),
         arena: None,
@@ -703,6 +741,94 @@ fn entry_display_falls_back_to_hex_when_no_btf() {
     let out = format!("{entry}");
     assert!(out.contains("ab cd (raw)"), "missing key hex: {out}");
     assert!(out.contains("ef (raw)"), "missing value hex: {out}");
+}
+
+#[test]
+fn array_entry_display_renders_key_and_value() {
+    // `key <N>: <rendered value>` — header carries the u32 index.
+    let entry = FailureDumpArrayEntry {
+        key: 3,
+        value: Some(RenderedValue::Uint {
+            bits: 32,
+            value: 42,
+        }),
+    };
+    let out = format!("{entry}");
+    assert!(out.contains("key 3:"), "missing key: {out}");
+    assert!(out.contains("42"), "missing value: {out}");
+}
+
+#[test]
+fn array_entry_display_marks_unreadable() {
+    // A `None` value (unmapped key) renders the explicit marker so an
+    // operator distinguishes "unreadable" from a zero value.
+    let entry = FailureDumpArrayEntry {
+        key: 9,
+        value: None,
+    };
+    let out = format!("{entry}");
+    assert!(
+        out.contains("key 9: <unreadable>"),
+        "missing unreadable marker: {out}"
+    );
+}
+
+#[test]
+fn array_entries_serde_roundtrip() {
+    let map = FailureDumpMap {
+        name: "scx_demo.cells".into(),
+        map_kva: 0,
+        map_type: BPF_MAP_TYPE_ARRAY,
+        value_size: 8,
+        max_entries: 3,
+        value: None,
+        entries: Vec::new(),
+        array_entries: vec![
+            FailureDumpArrayEntry {
+                key: 0,
+                value: Some(RenderedValue::Uint {
+                    bits: 64,
+                    value: 100,
+                }),
+            },
+            FailureDumpArrayEntry {
+                key: 1,
+                value: Some(RenderedValue::Uint {
+                    bits: 64,
+                    value: 200,
+                }),
+            },
+            FailureDumpArrayEntry {
+                key: 2,
+                value: None,
+            },
+        ],
+        percpu_entries: Vec::new(),
+        percpu_hash_entries: Vec::new(),
+        arena: None,
+        ringbuf: None,
+        stack_trace: None,
+        fd_array: None,
+        error: None,
+    };
+    let json = serde_json::to_string(&map).unwrap();
+    let parsed: FailureDumpMap = serde_json::from_str(&json).unwrap();
+    // Multi-entry ARRAY leaves the single-entry `value` empty.
+    assert!(parsed.value.is_none());
+    assert_eq!(parsed.array_entries.len(), 3);
+    assert_eq!(parsed.array_entries[0].key, 0);
+    assert_eq!(parsed.array_entries[2].key, 2);
+    assert!(
+        parsed.array_entries[2].value.is_none(),
+        "an unreadable key's None value must survive the roundtrip"
+    );
+    match &parsed.array_entries[1].value {
+        Some(RenderedValue::Uint { bits, value }) => {
+            assert_eq!(*bits, 64);
+            assert_eq!(*value, 200);
+        }
+        other => panic!("expected Uint, got {other:?}"),
+    }
 }
 
 #[test]
@@ -1963,15 +2089,25 @@ fn pinned_error_arena_btf_offsets_unavailable() {
     );
 }
 
-/// `multi-entry ARRAY: only key 0 of {N} shown` is rendered by
-/// the BPF_MAP_TYPE_ARRAY arm when `info.max_entries > 1`.
+/// `ARRAY truncated at {MAX_ARRAY_KEYS} keys (max_entries={N})` is
+/// rendered by the BPF_MAP_TYPE_ARRAY arm when `max_entries` exceeds
+/// the cap; `{N} keys unreadable` is appended (or stands alone) when
+/// per-key reads fail. Pins the prose, the constant, and placeholder
+/// ordering — mirrors `pinned_error_percpu_array_truncation`.
 #[test]
-fn pinned_error_multi_entry_array_truncation() {
-    let n: u32 = 7;
-    let rendered = format!("multi-entry ARRAY: only key 0 of {n} shown");
+fn pinned_error_array_truncation() {
+    let max_entries: u32 = 9000;
+    let rendered =
+        format!("ARRAY truncated at {MAX_ARRAY_KEYS} keys (max_entries={max_entries})");
     assert_eq!(
-        rendered, "multi-entry ARRAY: only key 0 of 7 shown",
-        "multi-entry ARRAY truncation string drifted from pin",
+        rendered, "ARRAY truncated at 4096 keys (max_entries=9000)",
+        "ARRAY truncation string OR MAX_ARRAY_KEYS drifted from pin",
+    );
+    let unreadable: u32 = 3;
+    assert_eq!(
+        format!("{unreadable} keys unreadable"),
+        "3 keys unreadable",
+        "ARRAY unreadable-count string drifted from pin",
     );
 }
 
@@ -2255,6 +2391,7 @@ fn map_display_percpu_hash_entries_render() {
         max_entries: 100,
         value: None,
         entries: Vec::new(),
+        array_entries: Vec::new(),
         percpu_entries: Vec::new(),
         percpu_hash_entries: vec![FailureDumpPercpuHashEntry {
             key: Some(RenderedValue::Uint { bits: 32, value: 1 }),
@@ -2390,6 +2527,7 @@ fn map_percpu_hash_entries_skips_when_empty() {
         max_entries: 1,
         value: None,
         entries: Vec::new(),
+        array_entries: Vec::new(),
         percpu_entries: Vec::new(),
         percpu_hash_entries: Vec::new(),
         arena: None,
@@ -2415,6 +2553,7 @@ fn map_percpu_hash_entries_round_trip_when_populated() {
         max_entries: 1,
         value: None,
         entries: Vec::new(),
+        array_entries: Vec::new(),
         percpu_entries: Vec::new(),
         percpu_hash_entries: vec![FailureDumpPercpuHashEntry {
             key: Some(RenderedValue::Uint { bits: 32, value: 1 }),
@@ -5695,6 +5834,178 @@ fn render_map_struct_ops_unmapped_value_returns_error() {
     );
 }
 
+/// A multi-entry plain ARRAY whose value pages are unmapped in this
+/// synthetic guest (cr3 = 0, no page table) surfaces every key as
+/// `value: None`, leaves the single-entry `value` unset, and reports
+/// the unreadable count in `error` — the render arm never aborts on a
+/// per-key read miss. Happy-path rendering (readable keys, correct
+/// values) is covered by the real-VM e2e
+/// (tests/failure_dump_e2e.rs::scenario_failure_dump_renders_array_entries).
+#[test]
+fn render_map_multi_entry_array_all_keys_unreadable() {
+    let page_offset = crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
+    let buf = vec![0u8; 0x4000];
+    // SAFETY: buf is a live local Vec<u8> outliving the GuestMem use.
+    let mem =
+        unsafe { super::super::reader::GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    // cr3 = 0 → no page table, so every value-region read misses: the
+    // synthetic guest has no mapping for value_kva. Drives the render
+    // arm's per-key None path.
+    let kernel = super::super::guest::GuestKernel::new_for_test(
+        std::sync::Arc::new(mem),
+        std::collections::HashMap::new(),
+        page_offset,
+        0,
+        false,
+    );
+    let kernel_ref = unsafe { &*(&kernel as *const _) };
+    let offsets = crate::monitor::btf_offsets::BpfMapOffsets::EMPTY;
+    let accessor =
+        super::super::bpf_map::GuestMemMapAccessor::new_for_test(kernel_ref, &offsets, 0);
+    let (name_bytes, name_len) = name_from_str("test_cells");
+    let info = super::super::bpf_map::BpfMapInfo {
+        map_pa: 0,
+        map_kva: pa_to_kva(0x1000, page_offset),
+        name_bytes,
+        name_len,
+        map_type: super::super::bpf_map::BPF_MAP_TYPE_ARRAY,
+        map_flags: 0,
+        key_size: 4,
+        value_size: 4,
+        max_entries: 3,
+        value_kva: Some(pa_to_kva(0x2000, page_offset)),
+        btf_kva: 0,
+        btf_value_type_id: 0,
+        btf_vmlinux_value_type_id: 0,
+        btf_key_type_id: 0,
+    };
+    let arena_page_index = super::render_map::ArenaPageIndex::new();
+    let sdt_alloc_metas: Vec<super::render_map::SdtAllocMeta> = Vec::new();
+    let ctx = super::render_map::RenderMapCtx {
+        accessor: &accessor,
+        btf: None,
+        num_cpus: 1,
+        arena_offsets: None,
+        shared_arena: None,
+        arena_page_index: &arena_page_index,
+        sdt_alloc_metas: &sdt_alloc_metas,
+        cast_map: None,
+        arena_slot_index: None,
+        cross_btf_fwd_index: None,
+        scx_static_index: None,
+        alloc_size_types: &[],
+        rendered_slot_addrs: None,
+    };
+    let rendered = super::render_map::render_map(&ctx, &info);
+    // Multi-entry path: a slot per key; single-entry `value` unset.
+    assert!(
+        rendered.value.is_none(),
+        "multi-entry ARRAY must use array_entries, not single-entry `value`"
+    );
+    assert_eq!(
+        rendered.array_entries.len(),
+        3,
+        "every key gets an entry slot even when unreadable"
+    );
+    assert_eq!(rendered.array_entries[0].key, 0);
+    assert_eq!(rendered.array_entries[2].key, 2);
+    assert!(
+        rendered.array_entries.iter().all(|e| e.value.is_none()),
+        "every key is unreadable in this synthetic guest"
+    );
+    let err = rendered
+        .error
+        .expect("all-unreadable render must surface an error");
+    assert!(
+        err.contains("3 keys unreadable"),
+        "error must report the unreadable count; got: {err}"
+    );
+}
+
+/// A multi-entry ARRAY declaring more keys than `MAX_ARRAY_KEYS`
+/// renders only the first `MAX_ARRAY_KEYS` entries and records the cap
+/// in `error`, mirroring the PERCPU_ARRAY truncation prose. (Reads
+/// miss in this synthetic guest, so the unreadable count rides
+/// alongside the truncation note, joined with "; ".)
+#[test]
+fn render_map_multi_entry_array_truncates_at_cap() {
+    let page_offset = crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
+    let buf = vec![0u8; 0x4000];
+    // SAFETY: buf is a live local Vec<u8> outliving the GuestMem use.
+    let mem =
+        unsafe { super::super::reader::GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let kernel = super::super::guest::GuestKernel::new_for_test(
+        std::sync::Arc::new(mem),
+        std::collections::HashMap::new(),
+        page_offset,
+        0,
+        false,
+    );
+    let kernel_ref = unsafe { &*(&kernel as *const _) };
+    let offsets = crate::monitor::btf_offsets::BpfMapOffsets::EMPTY;
+    let accessor =
+        super::super::bpf_map::GuestMemMapAccessor::new_for_test(kernel_ref, &offsets, 0);
+    let (name_bytes, name_len) = name_from_str("test_cells");
+    // Declare more keys than the cap so the render arm truncates.
+    let max_entries: u32 = MAX_ARRAY_KEYS + 904;
+    let info = super::super::bpf_map::BpfMapInfo {
+        map_pa: 0,
+        map_kva: pa_to_kva(0x1000, page_offset),
+        name_bytes,
+        name_len,
+        map_type: super::super::bpf_map::BPF_MAP_TYPE_ARRAY,
+        map_flags: 0,
+        key_size: 4,
+        value_size: 4,
+        max_entries,
+        value_kva: Some(pa_to_kva(0x2000, page_offset)),
+        btf_kva: 0,
+        btf_value_type_id: 0,
+        btf_vmlinux_value_type_id: 0,
+        btf_key_type_id: 0,
+    };
+    let arena_page_index = super::render_map::ArenaPageIndex::new();
+    let sdt_alloc_metas: Vec<super::render_map::SdtAllocMeta> = Vec::new();
+    let ctx = super::render_map::RenderMapCtx {
+        accessor: &accessor,
+        btf: None,
+        num_cpus: 1,
+        arena_offsets: None,
+        shared_arena: None,
+        arena_page_index: &arena_page_index,
+        sdt_alloc_metas: &sdt_alloc_metas,
+        cast_map: None,
+        arena_slot_index: None,
+        cross_btf_fwd_index: None,
+        scx_static_index: None,
+        alloc_size_types: &[],
+        rendered_slot_addrs: None,
+    };
+    let rendered = super::render_map::render_map(&ctx, &info);
+    // Only the first MAX_ARRAY_KEYS entries are walked.
+    assert_eq!(
+        rendered.array_entries.len(),
+        MAX_ARRAY_KEYS as usize,
+        "render must cap the walk at MAX_ARRAY_KEYS"
+    );
+    let err = rendered
+        .error
+        .expect("over-cap ARRAY must surface an error");
+    assert!(
+        err.contains(&format!(
+            "ARRAY truncated at {MAX_ARRAY_KEYS} keys (max_entries={max_entries})"
+        )),
+        "error must carry the truncation note; got: {err}"
+    );
+    // The truncation note and the unreadable-count note join with
+    // "; " — pin the separator so a future refactor that changes the
+    // join (newline, or dropping one note when both fire) trips here.
+    assert!(
+        err.contains("; "),
+        "joined-error format (truncation; unreadable count) drifted: {err}"
+    );
+}
+
 /// `find_all_bpf_maps` populates `value_kva = kvalue + data_off` for
 /// STRUCT_OPS maps when `struct_ops_offsets` is resolved. This test
 /// covers the static math without the page-walk to confirm the
@@ -6026,6 +6337,7 @@ fn map_display_table_for_homogeneous_entries() {
                 payload: None,
             },
         ],
+        array_entries: Vec::new(),
         percpu_entries: Vec::new(),
         percpu_hash_entries: Vec::new(),
         arena: None,
@@ -6070,6 +6382,7 @@ fn map_display_skips_table_for_single_entry() {
             value_hex: "02".into(),
             payload: None,
         }],
+        array_entries: Vec::new(),
         percpu_entries: Vec::new(),
         percpu_hash_entries: Vec::new(),
         arena: None,
@@ -6123,6 +6436,7 @@ fn map_display_skips_table_when_payload_present() {
                 payload: None,
             },
         ],
+        array_entries: Vec::new(),
         percpu_entries: Vec::new(),
         percpu_hash_entries: Vec::new(),
         arena: None,
@@ -6166,6 +6480,7 @@ fn map_display_skips_table_for_heterogeneous_types() {
                 payload: None,
             },
         ],
+        array_entries: Vec::new(),
         percpu_entries: Vec::new(),
         percpu_hash_entries: Vec::new(),
         arena: None,
@@ -6209,6 +6524,7 @@ fn map_display_skips_table_when_entry_has_no_btf_render() {
                 payload: None,
             },
         ],
+        array_entries: Vec::new(),
         percpu_entries: Vec::new(),
         percpu_hash_entries: Vec::new(),
         arena: None,

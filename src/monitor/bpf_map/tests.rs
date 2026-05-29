@@ -2288,6 +2288,50 @@ fn read_bpf_map_value_unmapped_returns_none() {
 
 #[test]
 #[cfg(target_arch = "x86_64")]
+fn read_bpf_map_array_value_per_key() {
+    let (mut buf, cr3_pa, kva, data_pa) = setup_page_table();
+    // 3 entries, value_size = 4 → stride = round_up(4, 8) = 8. Write a
+    // distinct pattern at each entry's stride offset so a wrong stride
+    // (e.g. value_size instead of round_up_8) mis-reads.
+    buf[data_pa as usize..data_pa as usize + 4].copy_from_slice(&[0x11, 0x11, 0x11, 0x11]);
+    buf[data_pa as usize + 8..data_pa as usize + 12].copy_from_slice(&[0x22, 0x22, 0x22, 0x22]);
+    buf[data_pa as usize + 16..data_pa as usize + 20].copy_from_slice(&[0x33, 0x33, 0x33, 0x33]);
+    // SAFETY: buf is a live local buffer whose backing storage
+    // outlives the GuestMem use.
+    let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+
+    let info = BpfMapInfo {
+        map_pa: 0,
+        map_kva: 0,
+        name_bytes: name_from_str("test_array").0,
+        name_len: name_from_str("test_array").1,
+        map_type: BPF_MAP_TYPE_ARRAY,
+        map_flags: 0,
+        key_size: 4,
+        value_size: 4,
+        max_entries: 3,
+        value_kva: Some(kva),
+        btf_kva: 0,
+        btf_value_type_id: 0,
+        btf_vmlinux_value_type_id: 0,
+        btf_key_type_id: 0,
+    };
+
+    let ctx = value_ctx(&mem, cr3_pa, false);
+    assert_eq!(read_bpf_map_array_value(&ctx, &info, 0), Some(vec![0x11; 4]));
+    assert_eq!(read_bpf_map_array_value(&ctx, &info, 1), Some(vec![0x22; 4]));
+    assert_eq!(read_bpf_map_array_value(&ctx, &info, 2), Some(vec![0x33; 4]));
+    // key >= max_entries → None (replicates array_map_lookup_elem's
+    // pre-mask range check; never clamps).
+    assert_eq!(read_bpf_map_array_value(&ctx, &info, 3), None);
+    // Non-ARRAY map type → None (this path is plain-ARRAY only).
+    let mut wrong_type = info.clone();
+    wrong_type.map_type = BPF_MAP_TYPE_PERCPU_ARRAY;
+    assert_eq!(read_bpf_map_array_value(&ctx, &wrong_type, 0), None);
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
 fn write_then_read_bpf_map_value_roundtrip() {
     let (mut buf, cr3_pa, kva, _) = setup_page_table();
     // SAFETY: buf is a live local buffer (Vec<u8> or stack array)

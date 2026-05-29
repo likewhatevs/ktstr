@@ -51,8 +51,8 @@ use super::super::btf_render::{
 use super::super::cast_analysis::CastMap;
 
 use super::{
-    CrossBtfFwdIndex, FailureDumpEntry, FailureDumpFdArray, FailureDumpMap, FailureDumpPercpuEntry,
-    FailureDumpPercpuHashEntry, FailureDumpRingbuf, FailureDumpStackTrace,
+    CrossBtfFwdIndex, FailureDumpArrayEntry, FailureDumpEntry, FailureDumpFdArray, FailureDumpMap,
+    FailureDumpPercpuEntry, FailureDumpPercpuHashEntry, FailureDumpRingbuf, FailureDumpStackTrace,
     FailureDumpStackTraceEntry, hex_dump,
 };
 
@@ -75,6 +75,19 @@ pub(super) const MAX_PERCPU_KEYS: u32 = 256;
 /// tail is silently dropped — recording it would itself require
 /// unbounded memory.
 pub(super) const MAX_HASH_ENTRIES: usize = 4096;
+
+/// Maximum entries the dump path will render from a multi-entry
+/// `BPF_MAP_TYPE_ARRAY` map.
+///
+/// Matches [`MAX_HASH_ENTRIES`] (4096), not [`MAX_PERCPU_KEYS`]
+/// (256): plain ARRAY maps are not "one entry per topology level" —
+/// sched_ext schedulers declare large ones (mitosis's `cells` is 256,
+/// `debug_events` is 4096), so a 256 cap would silently truncate real
+/// data. The OOM bound is `MAX_ARRAY_KEYS * MAX_VALUE_SIZE`; per-entry
+/// size is separately capped at `MAX_VALUE_SIZE` inside
+/// `read_bpf_map_array_value`. Entries beyond the cap are dropped and
+/// the truncation surfaces in the map's `error`.
+pub(super) const MAX_ARRAY_KEYS: u32 = 4096;
 
 /// Maximum stack-trace bucket pointers the dump path will probe in a
 /// `BPF_MAP_TYPE_STACK_TRACE` map.
@@ -1675,6 +1688,7 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
         max_entries: info.max_entries,
         value: None,
         entries: Vec::new(),
+        array_entries: Vec::new(),
         percpu_entries: Vec::new(),
         percpu_hash_entries: Vec::new(),
         arena: None,
@@ -1686,62 +1700,84 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
 
     match info.map_type {
         BPF_MAP_TYPE_ARRAY => {
-            // Read the entire value buffer in one shot. Single-entry
-            // global-section maps (.bss / .data / .rodata) declare
-            // value_size as the section size; multi-entry ARRAY maps
-            // declare it as one entry's size — the renderer only sees
-            // one entry's worth of bytes here, which matches the
-            // kernel's value-region layout for ARRAY (each key is
-            // contiguous starting at `bpf_array.value`).
-            //
-            // The BTF type id `btf_value_type_id` describes one entry,
-            // so for max_entries > 1 the renderer would need to be
-            // called per-key. ARRAY maps used by sched_ext today are
-            // either single-entry global sections or per-CPU arrays;
-            // multi-entry plain ARRAYs surface as the first entry
-            // only. The truncation is recorded in `error` and
-            // `max_entries` so the consumer sees the partial render.
-            match accessor.read_value(info, 0, info.value_size as usize) {
-                Some(bytes) => {
-                    // libbpf packs string literals into a section named
-                    // `<obj>.rodata.str1.1` with NO BTF Datasec entry
-                    // — `btf_value_type_id` is 0 and the renderer
-                    // would otherwise emit raw hex. The string-merge
-                    // section's bytes are concatenated nul-terminated
-                    // ASCII (clang's `.str1.1` mergeable section
-                    // produces 1-byte-stride 1-alignment string data
-                    // per the ELF spec); render them as a printable
-                    // ASCII dump with non-printable bytes escaped so
-                    // operators see the actual literals their
-                    // scheduler is using rather than scanning hex.
-                    // Re-use `out.name` (computed once above from
-                    // `info.name()` and stashed into the FailureDumpMap)
-                    // instead of calling `info.name()` a second time.
-                    // `info.name()` allocates whenever the map name
-                    // is non-UTF-8; even on the alloc-free ASCII fast
-                    // path the duplicate `Cow` build is wasted work.
-                    out.value = Some(if is_str_literal_section(&out.name) {
-                        RenderedValue::Bytes {
-                            hex: ascii_str_dump(&bytes),
+            if info.max_entries <= 1 {
+                // Single-entry ARRAY: the global-section maps
+                // (.bss / .data / .rodata) declare value_size as the
+                // section size and max_entries = 1, so one read of the
+                // whole value region renders the section.
+                //
+                // libbpf packs string literals into a section named
+                // `<obj>.rodata.str1.1` with NO BTF Datasec entry —
+                // `btf_value_type_id` is 0 and the renderer would
+                // otherwise emit raw hex. The string-merge section's
+                // bytes are concatenated nul-terminated ASCII (clang's
+                // `.str1.1` mergeable section produces 1-byte-stride
+                // 1-alignment string data per the ELF spec); render
+                // them as a printable ASCII dump with non-printable
+                // bytes escaped so operators see the actual literals.
+                // Re-use `out.name` (computed once above) instead of
+                // calling `info.name()` again — it allocates on a
+                // non-UTF-8 name and even the ASCII fast path rebuilds
+                // a `Cow`.
+                match accessor.read_value(info, 0, info.value_size as usize) {
+                    Some(bytes) => {
+                        out.value = Some(if is_str_literal_section(&out.name) {
+                            RenderedValue::Bytes {
+                                hex: ascii_str_dump(&bytes),
+                            }
+                        } else {
+                            render_value_or_hex(btf, info.btf_value_type_id, &bytes, &mem_reader)
+                        });
+                    }
+                    None => {
+                        out.error = Some("ARRAY value region unreadable (unmapped page?)".into());
+                    }
+                }
+            } else {
+                // Multi-entry ARRAY: entries are contiguous at
+                // `bpf_array.value` with stride round_up(value_size, 8)
+                // (kernel/bpf/arraymap.c:93,167-176). The BTF type id
+                // `btf_value_type_id` describes one entry, so the
+                // renderer is called per-key for keys
+                // 0..min(max_entries, MAX_ARRAY_KEYS). A key whose page
+                // is unmapped lands as `value: None` and the loop never
+                // aborts, so one bad key cannot mask the rest; the
+                // unreadable count and any cap truncation surface in
+                // `error`.
+                let limit = info.max_entries.min(MAX_ARRAY_KEYS);
+                let mut unreadable: u32 = 0;
+                for key in 0..limit {
+                    let value = match accessor.read_array(info, key) {
+                        Some(bytes) => Some(render_value_or_hex(
+                            btf,
+                            info.btf_value_type_id,
+                            &bytes,
+                            &mem_reader,
+                        )),
+                        None => {
+                            unreadable += 1;
+                            None
                         }
-                    } else {
-                        render_value_or_hex(btf, info.btf_value_type_id, &bytes, &mem_reader)
-                    });
+                    };
+                    out.array_entries.push(FailureDumpArrayEntry { key, value });
                 }
-                None => {
-                    out.error = Some("ARRAY value region unreadable (unmapped page?)".into());
+                // Mirror the PERCPU_ARRAY truncation prose so log
+                // scrapers see a consistent shape across cap
+                // diagnostics; append the per-key read-failure count
+                // when any key was unmapped.
+                let mut notes: Vec<String> = Vec::new();
+                if info.max_entries > MAX_ARRAY_KEYS {
+                    notes.push(format!(
+                        "ARRAY truncated at {MAX_ARRAY_KEYS} keys (max_entries={})",
+                        info.max_entries
+                    ));
                 }
-            }
-            // Multi-entry ARRAY: surface the silent truncation. The
-            // single-entry global-section maps (.bss/.data/.rodata)
-            // declare max_entries=1 so this branch is a no-op for
-            // them; only schedulers using BPF_MAP_TYPE_ARRAY with
-            // multiple keys hit it.
-            if out.error.is_none() && info.max_entries > 1 {
-                out.error = Some(format!(
-                    "multi-entry ARRAY: only key 0 of {} shown",
-                    info.max_entries
-                ));
+                if unreadable > 0 {
+                    notes.push(format!("{unreadable} keys unreadable"));
+                }
+                if !notes.is_empty() {
+                    out.error = Some(notes.join("; "));
+                }
             }
         }
         BPF_MAP_TYPE_HASH | BPF_MAP_TYPE_LRU_HASH => {
