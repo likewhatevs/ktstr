@@ -20,59 +20,10 @@
 //! `args` (CLI extraction), and the [`crate::vmm`] VM launcher.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicPtr, Ordering};
 
 use anyhow::{Context, Result};
 
 use crate::assert::AssertResult;
-
-/// Deferred nextest dispatch name set by the ctor's argv rewrite.
-/// When the ctor sees `--exact ktstr/...` or `--exact gauntlet/...`,
-/// it stores the full prefixed name here and overwrites the argv
-/// bytes to the bare test name so libtest can match the `#[test]`
-/// wrapper at main-time (after C++ static constructors complete).
-/// `run_ktstr_test` checks this global to resolve the gauntlet
-/// topology or multi-kernel variant from the original name.
-static DEFERRED_DISPATCH: Mutex<Option<String>> = Mutex::new(None);
-
-/// Raw argv pointer captured at process startup via the
-/// `.init_array.00001` constructor below. `AtomicPtr` rather than
-/// `static mut` so the capture (Release) and the later read in
-/// `rewrite_argv_exact` (Acquire) form a happens-before edge — the
-/// argv string bytes glibc placed before invoking `.init_array`
-/// callbacks are visible to the rewrite via that synchronization
-/// edge. The element type is `*mut libc::c_char` (matching argv's
-/// `*const *mut c_char` shape); cast back to `*const *mut c_char`
-/// before indexing in the consumer.
-static RAW_ARGV: AtomicPtr<*mut libc::c_char> = AtomicPtr::new(std::ptr::null_mut());
-
-/// Numbered link section `.init_array.00001` to force CAPTURE_ARGV
-/// to run BEFORE the unprioritized dispatch ctor (`.init_array`
-/// without a numeric suffix). GNU ld sorts numbered
-/// `.init_array.NN` sections numerically and places them before
-/// plain `.init_array`. The profraw ctor in profraw.rs uses ctor's
-/// `priority = 0` mechanism (which expands to `.init_array.0`) for
-/// the same reason; this entry uses `.00001` so profraw still runs
-/// first, then CAPTURE_ARGV, then the unprioritized dispatch ctor
-/// at `ktstr_test_early_dispatch`.
-///
-/// Cannot use `#[ctor::ctor(priority = N)]` directly because the
-/// ctor crate's macro emits a 0-arg `extern "C" fn() -> CtorRetType`.
-/// glibc passes `(argc, argv, envp)` to `.init_array` callbacks and
-/// argv capture requires the 2-arg signature. Without the numbered
-/// section, link order between this static and the dispatch ctor is
-/// unspecified, so the dispatch ctor's argv-rewrite step would race
-/// against capture and observe a null `RAW_ARGV`.
-#[unsafe(link_section = ".init_array.00001")]
-#[used]
-static CAPTURE_ARGV: unsafe extern "C" fn(libc::c_int, *const *mut libc::c_char) = {
-    unsafe extern "C" fn capture(_argc: libc::c_int, argv: *const *mut libc::c_char) {
-        // Release pairs with Acquire in `rewrite_argv_exact`.
-        RAW_ARGV.store(argv as *mut *mut libc::c_char, Ordering::Release);
-    }
-    capture
-};
 
 use super::{
     KTSTR_TESTS, KtstrTestEntry, TopoOverride, collect_sidecars, extract_export_output_arg,
@@ -144,69 +95,6 @@ pub fn is_kernel_unavailable(e: &anyhow::Error) -> bool {
             .downcast_ref::<crate::test_support::eval::KernelUnavailable>()
             .is_some()
     })
-}
-
-/// Overwrite the argv string at index `arg_idx` with `replacement`.
-///
-/// Uses `RAW_ARGV` captured by the `.init_array.00001` constructor
-/// above. The replacement MUST be shorter than or equal to the
-/// original string — the function null-terminates within the
-/// existing buffer.
-///
-/// When `RAW_ARGV` is still null (the capture ctor did not fire,
-/// or fired AFTER this caller — a regression in `.init_array`
-/// ordering), emits a stderr diagnostic and returns. Without the
-/// warning, the deferred-dispatch path would silently fail to
-/// rewrite argv and libtest would not match the bare test name,
-/// surfacing as an opaque "no test matches" failure further
-/// downstream rather than a clear ordering regression.
-fn rewrite_argv_exact(arg_idx: usize, replacement: &str) {
-    // Acquire pairs with Release in CAPTURE_ARGV's `capture`.
-    let raw = RAW_ARGV.load(Ordering::Acquire) as *const *mut libc::c_char;
-    if raw.is_null() {
-        eprintln!(
-            "ktstr: rewrite_argv_exact called before CAPTURE_ARGV ctor fired \
-             (RAW_ARGV is null). Deferred dispatch will not match libtest's \
-             test name and the run will likely fail. This indicates a \
-             regression in `.init_array` ordering — the `.init_array.00001` \
-             section above must be linked before the unprioritized dispatch \
-             ctor.",
-        );
-        return;
-    }
-    // SAFETY:
-    //   (a) RAW_ARGV was set by glibc passing the live `argv` array
-    //       to CAPTURE_ARGV — the array is the program's actual
-    //       argument vector and remains valid for the lifetime of
-    //       the process.
-    //   (b) argv strings on Linux live in the high end of the
-    //       process stack and are writable by the program (the
-    //       `setproctitle(3)`-style argv-overwrite trick relies on
-    //       exactly this). POSIX does not require this, but on
-    //       Linux/glibc — the only platform ktstr targets — argv
-    //       string memory is mutable.
-    //   (c) `replacement.len() <= original_len` is checked before
-    //       any write, so the in-place overwrite + null terminator
-    //       stays inside the original allocation. No bytes past
-    //       the original null terminator are touched.
-    //   (d) This function is only reachable from
-    //       `ktstr_test_early_dispatch`, an `.init_array` ctor.
-    //       glibc invokes `.init_array` callbacks on the main
-    //       thread before any user thread has spawned, so the
-    //       argv overwrite is single-threaded and race-free.
-    unsafe {
-        let arg = *raw.add(arg_idx);
-        if arg.is_null() {
-            return;
-        }
-        let original_len = libc::strlen(arg as *const libc::c_char);
-        if replacement.len() > original_len {
-            return;
-        }
-        let dst = arg as *mut u8;
-        std::ptr::copy_nonoverlapping(replacement.as_ptr(), dst, replacement.len());
-        *dst.add(replacement.len()) = 0;
-    }
 }
 
 /// A nextest-safe kernel identifier whose construction is gated
@@ -550,7 +438,8 @@ pub fn ktstr_test_early_dispatch() {
                 // collect_verifier_output, prints the result, and
                 // exits. No #[test] wrapper exists for declared
                 // schedulers (declare_scheduler! only emits a static),
-                // so argv-rewrite + DEFERRED_DISPATCH doesn't apply.
+                // so it runs directly via run_verifier_cell — the same
+                // libtest bypass the ktstr/ branch below uses.
                 let code = run_verifier_cell(name);
                 try_flush_profraw();
                 std::process::exit(code);
@@ -566,12 +455,10 @@ pub fn ktstr_test_early_dispatch() {
                     .next()
                     .unwrap_or(name);
 
-                // Reject malformed names like `gauntlet/` (trailing slash,
-                // no test name) and `ktstr/`. Writing an empty replacement
-                // into argv would null-terminate at offset 0, leaving an
-                // empty string libtest would fail to match against any
-                // `#[test]` wrapper — surfacing as an opaque "no test
-                // matches" error instead of a clear malformed-name error.
+                // Reject malformed names like `gauntlet/` (trailing
+                // slash, no test name) and `ktstr/` up front, so the
+                // operator sees a clear error instead of an opaque
+                // "unknown test" from the empty bare name.
                 if bare.is_empty() {
                     eprintln!(
                         "ktstr: malformed --exact test name {name:?} \
@@ -580,8 +467,22 @@ pub fn ktstr_test_early_dispatch() {
                     std::process::exit(1);
                 }
 
-                *DEFERRED_DISPATCH.lock().unwrap() = Some(name.to_string());
-                rewrite_argv_exact(pos + 1, bare);
+                // Run the entry directly, bypassing libtest — the same
+                // pattern as the verifier/ branch above. The previous
+                // dispatch rewrote argv to the bare name and relied on a
+                // #[test] wrapper (emitted only by the #[ktstr_test]
+                // macro) for libtest to match it; raw
+                // `#[distributed_slice(KTSTR_TESTS)]` registrations have
+                // no wrapper, so libtest matched nothing and printed
+                // "running 0 tests" — a silent trivial-pass. run_named_test
+                // resolves the entry from KTSTR_TESTS by name and boots it
+                // for both registration styles, routing gauntlet/ to
+                // run_gauntlet_test (identical topology) and applying the
+                // host_only / performance_mode / bpf_map_write gates the
+                // wrapper path skipped.
+                let code = run_named_test(name);
+                try_flush_profraw();
+                std::process::exit(code);
             }
         }
     } else {
@@ -970,13 +871,6 @@ pub fn run_ktstr_test(entry: &KtstrTestEntry) -> Result<AssertResult> {
         )));
     }
 
-    // Check if the ctor deferred a prefixed dispatch name via argv
-    // rewrite. If so, resolve the topology from the full
-    // gauntlet/multi-kernel name instead of using the entry defaults.
-    if let Some(deferred) = DEFERRED_DISPATCH.lock().unwrap().take() {
-        return run_deferred_dispatch(entry, &deferred);
-    }
-
     if entry.host_only {
         return run_host_only_test_inner(entry);
     }
@@ -986,49 +880,6 @@ pub fn run_ktstr_test(entry: &KtstrTestEntry) -> Result<AssertResult> {
     {
         anyhow::bail!("vmlinux not found, bpf_map_write requires vmlinux");
     }
-    run_ktstr_test_inner(entry, None)
-}
-
-/// Dispatch a test using the full prefixed name that the ctor stored
-/// in [`DEFERRED_DISPATCH`] before rewriting argv. Resolves the
-/// gauntlet topology preset and multi-kernel suffix from the name,
-/// then calls `run_ktstr_test_inner` directly — NOT through the
-/// `run_named_test` → `result_to_exit_code` path, so
-/// `ResourceContention` propagates as `Err` rather than being
-/// swallowed as exit code 0. Called at main-time from the `#[test]`
-/// wrapper, so C++ static constructors have completed.
-fn run_deferred_dispatch(_entry: &KtstrTestEntry, deferred_name: &str) -> Result<AssertResult> {
-    let kernel_list = read_kernel_list();
-    let (test_name, kernel_entry) = strip_kernel_suffix(deferred_name, &kernel_list)
-        .map_err(|e| anyhow::anyhow!("deferred dispatch for '{deferred_name}': {e}"))?;
-    if let Some(ke) = kernel_entry {
-        export_kernel_for_variant(ke);
-    }
-
-    if let Some(rest) = test_name.strip_prefix("gauntlet/") {
-        let parts: Vec<&str> = rest.splitn(2, '/').collect();
-        anyhow::ensure!(parts.len() == 2, "invalid gauntlet name: gauntlet/{rest}");
-        let (bare, preset_name) = (parts[0], parts[1]);
-        let entry = find_test(bare).ok_or_else(|| anyhow::anyhow!("unknown test: {bare}"))?;
-        let presets = crate::vm::gauntlet_presets();
-        let preset = presets
-            .iter()
-            .find(|p| p.name == preset_name)
-            .ok_or_else(|| anyhow::anyhow!("unknown preset: {preset_name}"))?;
-        let t = &preset.topology;
-        let memory_mib = super::runtime::derive_test_memory_mib(t.total_cpus(), entry);
-        let topo = TopoOverride {
-            numa_nodes: t.numa_nodes,
-            llcs: t.llcs,
-            cores: t.cores_per_llc,
-            threads: t.threads_per_core,
-            memory_mib,
-        };
-        return run_ktstr_test_inner(entry, Some(&topo));
-    }
-
-    let bare = test_name.strip_prefix("ktstr/").unwrap_or(test_name);
-    let entry = find_test(bare).ok_or_else(|| anyhow::anyhow!("unknown test: {bare}"))?;
     run_ktstr_test_inner(entry, None)
 }
 
@@ -2120,6 +1971,27 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
     // pass-through arm in `strip_kernel_suffix` returns the input
     // verbatim either way.
     let bare_for_lookup = test_name.strip_prefix("ktstr/").unwrap_or(test_name);
+
+    // Coverage-skip guard, mirroring run_ktstr_test:962-971: a VM-booting
+    // test whose guest /init trips an AP-kill exit under a
+    // coverage-instrumented `current_exe` must skip cleanly here too, or
+    // the ctor -> run_named_test dispatch burns the retry budget on a
+    // doomed boot (the per-test in-body skip never runs — the guest dies
+    // during boot before the test body executes).
+    if let Some(entry) = find_test(bare_for_lookup)
+        && !entry.host_only
+        && crate::test_support::current_binary_is_coverage_instrumented()
+        && coverage_skip_under_instrumented_init(entry.name)
+    {
+        crate::report::test_skip(format_args!(
+            "coverage-instrumented /init AP-kill — {}; deferred until \
+             non-instrumented /init binary is wired",
+            entry.name,
+        ));
+        record_skip_sidecar(entry);
+        return EXIT_PASS;
+    }
+
     if let Some(entry) = find_test(bare_for_lookup)
         && entry.host_only
     {
@@ -2373,6 +2245,25 @@ pub(crate) fn run_gauntlet_test(rest: &str) -> i32 {
             return 1;
         }
     };
+
+    // Coverage-skip guard, mirroring run_named_test / run_ktstr_test: a
+    // VM-booting test whose guest /init trips an AP-kill exit under a
+    // coverage-instrumented current_exe must skip cleanly here too. The
+    // old DEFERRED_DISPATCH path reached run_ktstr_test's guard before
+    // gauntlet topology resolution; the new direct
+    // run_named_test -> run_gauntlet_test path needs its own.
+    if !entry.host_only
+        && crate::test_support::current_binary_is_coverage_instrumented()
+        && coverage_skip_under_instrumented_init(entry.name)
+    {
+        crate::report::test_skip(format_args!(
+            "coverage-instrumented /init AP-kill — {}; deferred until \
+             non-instrumented /init binary is wired",
+            entry.name,
+        ));
+        record_skip_sidecar(entry);
+        return EXIT_PASS;
+    }
 
     let presets = crate::vm::gauntlet_presets();
     let preset = match presets.iter().find(|p| p.name == preset_name) {
