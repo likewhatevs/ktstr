@@ -1894,3 +1894,69 @@ fn cleanup_all_threads_walk_root_to_cleanup_recursive() {
         "cleanup_all must drain child pids to walk_root cgroup.procs; got {written:?}",
     );
 }
+
+// -- default_root_requires_root: privilege-gate truth table --
+//
+// Locks in the lazy non-root gate from `setup_under_root` regardless of
+// the test runner's own euid. The prior coverage was a euid-gated bail
+// test that no-op'd when the suite ran as root (the common case), pinning
+// nothing; here euid (and parent/root) are passed explicitly so every
+// cell runs unconditionally and a revert of the gate flips an assertion.
+// The parent dimension is load-bearing: the gate must fire only for a
+// real cgroupfs operation (parent UNDER the default root), NOT for the
+// non-cgroup-path bail (parent outside it) — the setup_non_cgroup_path
+// regression that motivated this case.
+
+#[test]
+fn default_root_requires_root_under_parent_non_root_requires() {
+    // Mode A: default root + a parent UNDER it + non-root → real cgroup
+    // management (create_dir_all / subtree_control EACCES otherwise).
+    assert!(CgroupManager::default_root_requires_root(
+        std::path::Path::new("/sys/fs/cgroup"),
+        std::path::Path::new("/sys/fs/cgroup/ktstr"),
+        1000,
+    ));
+}
+
+#[test]
+fn default_root_requires_root_under_parent_root_exempt() {
+    // euid 0 manages the kernel-owned default root fine.
+    assert!(!CgroupManager::default_root_requires_root(
+        std::path::Path::new("/sys/fs/cgroup"),
+        std::path::Path::new("/sys/fs/cgroup/ktstr"),
+        0,
+    ));
+}
+
+#[test]
+fn default_root_requires_root_outside_parent_non_root_exempt() {
+    // Non-cgroup-path case: default root but the parent is OUTSIDE it (a
+    // tmpdir) → create_dir_all touches no cgroupfs, the walk is skipped,
+    // no root needed. Pins the setup_non_cgroup_path contract.
+    assert!(!CgroupManager::default_root_requires_root(
+        std::path::Path::new("/sys/fs/cgroup"),
+        std::path::Path::new("/tmp/some-test-dir"),
+        1000,
+    ));
+}
+
+#[test]
+fn default_root_requires_root_delegated_root_non_root_exempt() {
+    // Mode B/C: a delegated walk root (not the default) is exempt even
+    // for a non-root euid — the operator owns subtree_control there.
+    assert!(!CgroupManager::default_root_requires_root(
+        std::path::Path::new("/sys/fs/cgroup/user.slice/deleg"),
+        std::path::Path::new("/sys/fs/cgroup/user.slice/deleg/ktstr"),
+        1000,
+    ));
+}
+
+#[test]
+fn default_root_requires_root_tmpdir_root_non_root_exempt() {
+    // A tmpdir root (the test-harness pattern) is not the default → exempt.
+    assert!(!CgroupManager::default_root_requires_root(
+        std::path::Path::new("/tmp/some-test-root"),
+        std::path::Path::new("/tmp/some-test-root/ktstr"),
+        1000,
+    ));
+}

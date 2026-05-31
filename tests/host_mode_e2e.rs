@@ -17,8 +17,11 @@
 //! fell back to
 //! `from_vm_topology` would report exactly 2 and trip the floor.
 //!
-//! Also covers the `KTSTR_HOST_CGROUP_PARENT` default and the
-//! `WorkSpec::workers_pct(1.0)` opt-in scaling contract.
+//! Also covers the `WorkSpec::workers_pct(1.0)` opt-in scaling
+//! contract. (The `KTSTR_HOST_CGROUP_PARENT` default-resolution
+//! cascade moved to unit tests in `dispatch.rs` —
+//! `resolve_host_cgroup_parent_*` — since it's pure env+const logic
+//! that needs no VM and ignored `ctx`.)
 
 use anyhow::Context;
 use ktstr::assert::AssertResult;
@@ -165,66 +168,6 @@ fn parse_cpu_list(s: &str) -> anyhow::Result<Vec<usize>> {
         }
     }
     Ok(cpus)
-}
-
-/// Pin the `KTSTR_HOST_CGROUP_PARENT` default fallback at
-/// dispatch.rs's `resolve_host_cgroup_parent`. Three layers of
-/// coverage close the silent-pass + tautology risks that an
-/// inline-rederivation of the env→default cascade would carry:
-///
-/// 1. **Const import** — a rename of `DEFAULT_HOST_CGROUP_PARENT`
-///    would compile-fail the test (closes rename drift).
-/// 2. **Literal canary** — `LITERAL_DEFAULT` asserted equal to
-///    the imported const. A value drift in
-///    `DEFAULT_HOST_CGROUP_PARENT` (e.g. someone changes the
-///    string to `/sys/fs/cgroup/ktstr-foo`) trips this assert
-///    even though the import still compiles.
-/// 3. **Real resolve cascade** — calls
-///    `ktstr::test_support::resolve_host_cgroup_parent()` instead
-///    of re-deriving the env→default cascade inline. A behavioural
-///    change inside the helper (e.g. a future override-walk
-///    extension) flows through the test instead of pinning the
-///    obsolete inline cascade.
-#[ktstr_test(host_only)]
-fn host_mode_default_cgroup_parent_resolves(_ctx: &Ctx) -> Result<AssertResult, anyhow::Error> {
-    /// Literal canary intentionally NOT shared with production code:
-    /// drift in `DEFAULT_HOST_CGROUP_PARENT`'s value (vs its name)
-    /// only surfaces if the test owns its own copy of the expected
-    /// string. Update both this const AND the production const
-    /// together; the assert below catches the asymmetric case.
-    const LITERAL_DEFAULT: &str = "/sys/fs/cgroup/ktstr";
-
-    let expected = ktstr::test_support::DEFAULT_HOST_CGROUP_PARENT;
-    if expected != LITERAL_DEFAULT {
-        return Ok(AssertResult::fail_msg(format!(
-            "DEFAULT_HOST_CGROUP_PARENT value drifted: \
-             production = {expected:?}, test canary = {LITERAL_DEFAULT:?}; \
-             update both together"
-        )));
-    }
-
-    // Operator-override path: if KTSTR_HOST_CGROUP_PARENT is set,
-    // skip — the operator opted out of the default. Per
-    // resolve_host_cgroup_parent, an empty env value still falls
-    // back to the default (so the set-empty case keeps testing
-    // the default cascade).
-    let operator_override = std::env::var(ktstr::KTSTR_HOST_CGROUP_PARENT_ENV)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .is_some();
-    if operator_override {
-        return Ok(AssertResult::pass());
-    }
-
-    let resolved = ktstr::test_support::resolve_host_cgroup_parent()
-        .map_err(|e| anyhow::anyhow!("resolve_host_cgroup_parent: {e:#}"))?;
-    if resolved != expected {
-        return Ok(AssertResult::fail_msg(format!(
-            "resolve_host_cgroup_parent fallback drifted: \
-             expected {expected:?} (DEFAULT_HOST_CGROUP_PARENT), got {resolved:?}"
-        )));
-    }
-    Ok(AssertResult::pass())
 }
 
 /// Pin the opt-in scaling contract end-to-end:

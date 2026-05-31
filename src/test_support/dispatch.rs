@@ -1041,6 +1041,26 @@ fn result_to_exit_code(
             }
         }
         Err(e)
+            if e.downcast_ref::<crate::test_support::eval::PostVmAssertionFailure>()
+                .is_some() =>
+        {
+            // A host-side post_vm / post_vm_unconditional callback
+            // failed. This is a real regression that must surface
+            // regardless of expect_err / expect_auto_repro inversion —
+            // those invert a GUEST-side expected failure, but a
+            // HOST-side check is always honored. Positioned AFTER the
+            // resource-contention / topology skip arms (a skip means
+            // the test never ran, so there was no host-side state to
+            // assert) but BEFORE the ExpectAutoReproSatisfied and
+            // expect_err inversion arms so the host-side regression
+            // wins. `downcast_ref` walks the anyhow context+source
+            // chain (the marker rides as `.context(...)` from
+            // run_ktstr_test_inner_impl); a raw `chain().any(is::<C>())`
+            // would miss it (anyhow boxes context as ContextError<C,E>).
+            eprintln!("{e:#}");
+            EXIT_FAIL
+        }
+        Err(e)
             if e.downcast_ref::<crate::test_support::eval::ExpectAutoReproSatisfied>()
                 .is_some() =>
         {
@@ -2178,6 +2198,14 @@ pub fn resolve_host_cgroup_parent() -> Result<String> {
 /// validates that the chosen walk root is a prefix of `parent` —
 /// misconfigurations surface as a focused error before the first
 /// cgroupfs write rather than as an opaque downstream EACCES.
+///
+/// Non-root callers with no walk-root override are admitted here — the
+/// precondition (root, or a cgroup-v2 delegated walk root) is enforced
+/// lazily at [`crate::cgroup::CgroupManager::setup`], the first real
+/// cgroup operation. `host_only` tests that never create a cgroup
+/// (macro-attribute fixtures, host-topology reads, nested-VM verifier
+/// orchestration) therefore run without root; only a test that actually
+/// touches a cgroup hits the deferred non-root error.
 fn build_host_cgroup_manager(cgroup_parent: &str) -> Result<crate::cgroup::CgroupManager> {
     let cg = crate::cgroup::CgroupManager::new(cgroup_parent);
     match std::env::var(crate::KTSTR_CGROUP_WALK_ROOT_ENV) {
@@ -2204,28 +2232,18 @@ fn build_host_cgroup_manager(cgroup_parent: &str) -> Result<crate::cgroup::Cgrou
                 )
             })
         }
-        _ => {
-            // Non-root operators MUST set KTSTR_CGROUP_WALK_ROOT to
-            // their cgroup-v2 delegation root, otherwise the default
-            // /sys/fs/cgroup walk EACCES-es on the first
-            // subtree_control write — opaque from the operator's
-            // perspective. Bail upfront with the env-var names + an
-            // example so the on-ramp is one copy-paste.
-            if unsafe { libc::geteuid() } != 0 {
-                anyhow::bail!(
-                    "non-root operator detected (euid != 0) but {walk_env} is unset/empty; \
-                     ktstr needs a cgroup-v2 delegated subtree under non-root operation \
-                     (systemd Delegate=yes or container nsdelegate). Set {walk_env} to \
-                     the delegation root (e.g. /sys/fs/cgroup/user.slice/user-$(id -u).slice/\
-                     user@$(id -u).service) AND set {parent_env} to a subdirectory under it \
-                     where ktstr can create the test cgroup parent (e.g. \
-                     /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/ktstr)",
-                    walk_env = crate::KTSTR_CGROUP_WALK_ROOT_ENV,
-                    parent_env = crate::KTSTR_HOST_CGROUP_PARENT_ENV,
-                );
-            }
-            Ok(cg)
-        }
+        // No KTSTR_CGROUP_WALK_ROOT override. Return the manager as-is;
+        // the non-root precondition for managing cgroups under the
+        // kernel-owned default walk root is checked lazily in
+        // CgroupManager::setup (first real cgroup use). host_only tests
+        // that never create a cgroup — macro-attribute fixtures,
+        // host-topology reads, nested-VM verifier orchestration — must
+        // not be failed here for a resource they never touch. A
+        // non-root test that does create a cgroup gets the deferred
+        // setup error pointing at with_walk_root; the operator on-ramp
+        // is EITHER to run as root OR to set KTSTR_CGROUP_WALK_ROOT to a
+        // delegated cgroup-v2 subtree (handled by the arm above).
+        _ => Ok(cg),
     }
 }
 
@@ -3841,26 +3859,27 @@ mod tests {
         );
     }
 
-    /// Non-root operators that omit `KTSTR_CGROUP_WALK_ROOT_ENV`
-    /// MUST bail upfront with a focused error citing both env vars
-    /// and an example delegation path — pins the early-user
-    /// failure mode. Skipped when running as root (the bail
-    /// is gated on `geteuid() != 0`).
+    /// With `KTSTR_CGROUP_WALK_ROOT_ENV` unset, `build_host_cgroup_manager`
+    /// returns the manager unconditionally (NOT root-gated): the non-root
+    /// precondition moved to a lazy check at `CgroupManager::setup` (first
+    /// real cgroup use), so host_only tests that never create a cgroup run
+    /// without root. The lazy euid gate itself is locked in by
+    /// `CgroupManager::default_root_requires_root`'s truth table
+    /// (cgroup_tests.rs); this pins that CONSTRUCTION no longer bails for a
+    /// non-root caller (the prior eager bail at this layer was removed).
     #[test]
-    fn build_host_cgroup_manager_non_root_unset_bails_with_walk_env() {
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
+    fn build_host_cgroup_manager_unset_env_defers_non_root_check_to_setup() {
         use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
         let _env_lock = lock_env();
         let _g = EnvVarGuard::remove(crate::KTSTR_CGROUP_WALK_ROOT_ENV);
-        let err = build_host_cgroup_manager("/sys/fs/cgroup/ktstr")
-            .expect_err("non-root + no walk_root MUST bail");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("KTSTR_CGROUP_WALK_ROOT") && msg.contains("KTSTR_HOST_CGROUP_PARENT"),
-            "bail message must cite BOTH env vars to give the operator \
-             a complete on-ramp; got: {msg}",
+        // No euid gate: construction must succeed regardless of euid (the
+        // prior eager non-root bail at this layer was deleted).
+        let cg = build_host_cgroup_manager("/sys/fs/cgroup/ktstr")
+            .expect("build defers the non-root check to setup; construction must succeed");
+        assert_eq!(
+            cg.walk_root(),
+            std::path::Path::new("/sys/fs/cgroup"),
+            "unset env selects the canonical default walk root",
         );
     }
 
@@ -3882,6 +3901,83 @@ mod tests {
             "bail message must name both the required prefix and the \
              env var so the operator can fix the config; got: {msg}",
         );
+    }
+
+    /// `resolve_host_cgroup_parent` with `KTSTR_HOST_CGROUP_PARENT`
+    /// unset falls back to `DEFAULT_HOST_CGROUP_PARENT`. Pure env-read
+    /// and string logic (no fs, no syscall, no root), so unlike the
+    /// `build_host_cgroup_manager_*` tests above these need no geteuid
+    /// gate. Converted from the former host_mode_e2e.rs host_only test
+    /// (which ignored ctx and only exercised this pure cascade — a VM
+    /// boot for nothing).
+    #[test]
+    fn resolve_host_cgroup_parent_env_unset_returns_default() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _env_lock = lock_env();
+        let _g = EnvVarGuard::remove(crate::KTSTR_HOST_CGROUP_PARENT_ENV);
+        let resolved = resolve_host_cgroup_parent().expect("unset env resolves to default");
+        assert_eq!(resolved, DEFAULT_HOST_CGROUP_PARENT);
+    }
+
+    /// Empty `KTSTR_HOST_CGROUP_PARENT` is treated as unset (the
+    /// `Ok(s) if !s.is_empty()` gate) and falls back to the default.
+    #[test]
+    fn resolve_host_cgroup_parent_env_empty_returns_default() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _env_lock = lock_env();
+        let _g = EnvVarGuard::set(crate::KTSTR_HOST_CGROUP_PARENT_ENV, "");
+        let resolved = resolve_host_cgroup_parent().expect("empty env resolves to default");
+        assert_eq!(resolved, DEFAULT_HOST_CGROUP_PARENT);
+    }
+
+    /// A valid override rooted under `/sys/fs/cgroup` (and naming a
+    /// subdirectory) is returned verbatim.
+    #[test]
+    fn resolve_host_cgroup_parent_env_override_returns_value() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _env_lock = lock_env();
+        let _g = EnvVarGuard::set(
+            crate::KTSTR_HOST_CGROUP_PARENT_ENV,
+            "/sys/fs/cgroup/ktstr-foo",
+        );
+        let resolved = resolve_host_cgroup_parent().expect("valid override resolves");
+        assert_eq!(resolved, "/sys/fs/cgroup/ktstr-foo");
+    }
+
+    /// Both invalid-override branches bail: a path outside
+    /// `/sys/fs/cgroup`, and the bare mount root itself (which is not
+    /// a usable parent — it needs a subdirectory). The message names
+    /// the required prefix and the default fallback.
+    #[test]
+    fn resolve_host_cgroup_parent_env_invalid_bails() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _env_lock = lock_env();
+        {
+            let _g = EnvVarGuard::set(crate::KTSTR_HOST_CGROUP_PARENT_ENV, "/tmp/foo");
+            let err = resolve_host_cgroup_parent()
+                .expect_err("override outside /sys/fs/cgroup must bail");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("/sys/fs/cgroup") && msg.contains(DEFAULT_HOST_CGROUP_PARENT),
+                "bail message must name the required prefix and the default \
+                 fallback so the operator can fix the config; got: {msg}",
+            );
+        }
+        {
+            let _g = EnvVarGuard::set(crate::KTSTR_HOST_CGROUP_PARENT_ENV, "/sys/fs/cgroup");
+            resolve_host_cgroup_parent()
+                .expect_err("the bare /sys/fs/cgroup mount root must bail (needs a subdir)");
+        }
+    }
+
+    /// Value-drift canary: `DEFAULT_HOST_CGROUP_PARENT`'s literal must
+    /// stay `/sys/fs/cgroup/ktstr`. Catches an asymmetric change to
+    /// the const value (vs its name) that a rename-only refactor
+    /// wouldn't. Mirrors the LITERAL_DEFAULT canary the host_mode e2e
+    /// test carried before it was converted to these unit tests.
+    #[test]
+    fn default_host_cgroup_parent_literal_pin() {
+        assert_eq!(DEFAULT_HOST_CGROUP_PARENT, "/sys/fs/cgroup/ktstr");
     }
 
     // -- result_to_exit_code: ExpectAutoReproSatisfied marker tests --
@@ -4037,6 +4133,95 @@ mod tests {
             result_to_exit_code(err, true, false),
             EXIT_FAIL,
             "nested ScxBpfErrorMatcherMismatch must still be downcast by anyhow's context-aware downcast_ref"
+        );
+    }
+
+    // -- result_to_exit_code: PostVmAssertionFailure marker tests --
+    //
+    // Pin the dispatch-side verdict the PostVmAssertionFailure arm
+    // produces: a host-side post_vm callback failure is honored even
+    // under expect_err (expect_err inverts a GUEST-side expected
+    // failure, not a HOST-side assertion), and wins over the
+    // ExpectAutoReproSatisfied arm by match-order positioning. The
+    // marker is wrapped onto the failure Err by run_ktstr_test_inner_impl
+    // when post_vm_err is Some.
+
+    /// `expect_err = true` + Err WITH the PostVmAssertionFailure marker
+    /// → the dispatch arm refuses to invert and returns [`EXIT_FAIL`].
+    /// The anti-hollow-test guarantee: a failure-dump render test
+    /// triggers an expected stall (which expect_err would invert to
+    /// PASS) and asserts the dump in post_vm — a wrong render MUST fail
+    /// the test, not silently invert.
+    #[test]
+    fn result_to_exit_code_post_vm_assertion_failure_under_expect_err_routes_to_fail() {
+        let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!(
+            "post_vm callback returned Err: dump render wrong"
+        )
+        .context(crate::test_support::eval::PostVmAssertionFailure));
+        assert_eq!(
+            result_to_exit_code(err, true, false),
+            EXIT_FAIL,
+            "PostVmAssertionFailure marker must refuse expect_err inversion → EXIT_FAIL"
+        );
+    }
+
+    /// Baseline control: `expect_err = true` + Err WITHOUT the marker
+    /// → the expect_err arm inverts to [`EXIT_PASS`]. Pairs with the
+    /// test above so the marker's presence is load-bearing (a
+    /// one-arm-too-broad regression that failed every expect_err Err
+    /// would fail this baseline).
+    #[test]
+    fn result_to_exit_code_expect_err_without_post_vm_marker_routes_to_pass() {
+        let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!(
+            "expected guest-side stall, no host-side check"
+        ));
+        assert_eq!(
+            result_to_exit_code(err, true, false),
+            EXIT_PASS,
+            "expect_err arm must invert a plain Err (no PostVmAssertionFailure) to EXIT_PASS"
+        );
+    }
+
+    /// PostVmAssertionFailure nested INSIDE additional `.context()`
+    /// wrapping → the dispatch arm STILL refuses to invert because
+    /// anyhow's `downcast_ref` walks the context+source chain. The
+    /// eval-layer wrappers (`"build ktstr_test VM"`, `"run ktstr_test
+    /// VM"`) routinely wrap the inner Err, so nested-marker chains are
+    /// the production-typical shape.
+    #[test]
+    fn result_to_exit_code_post_vm_marker_through_nested_context_routes_to_fail() {
+        let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!(
+            "post_vm callback returned Err: dump render wrong"
+        )
+        .context(crate::test_support::eval::PostVmAssertionFailure)
+        .context("run ktstr_test VM")
+        .context("dispatch wrapper"));
+        assert_eq!(
+            result_to_exit_code(err, true, false),
+            EXIT_FAIL,
+            "nested PostVmAssertionFailure must still be downcast by anyhow's context-aware downcast_ref"
+        );
+    }
+
+    /// Both PostVmAssertionFailure AND ExpectAutoReproSatisfied
+    /// attached → the PostVmAssertionFailure arm wins (EXIT_FAIL)
+    /// because it is positioned BEFORE the ExpectAutoReproSatisfied arm
+    /// in the dispatch match. A real host-side regression must override
+    /// an auto-repro satisfaction inversion: the dump assertion failing
+    /// is a regression regardless of whether the repro artifact landed.
+    /// Without the PostVmAssertionFailure marker this same Err would
+    /// route to EXIT_PASS via the ExpectAutoReproSatisfied arm, so the
+    /// precedence claim is falsifiable.
+    #[test]
+    fn result_to_exit_code_post_vm_marker_wins_over_expect_auto_repro() {
+        let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!("primary VM failure")
+            .context(crate::test_support::eval::ExpectAutoReproSatisfied)
+            .context(crate::test_support::eval::PostVmAssertionFailure));
+        assert_eq!(
+            result_to_exit_code(err, false, false),
+            EXIT_FAIL,
+            "PostVmAssertionFailure arm must win over ExpectAutoReproSatisfied by match-order \
+             positioning (ExpectAutoReproSatisfied alone would return EXIT_PASS)"
         );
     }
 }

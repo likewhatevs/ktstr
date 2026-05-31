@@ -610,6 +610,25 @@ impl CgroupManager {
         self.setup_under_root(controllers, &self.walk_root)
     }
 
+    /// Does managing cgroups require root privileges for this
+    /// `(root, parent, euid)`? True only when `root` is the kernel-owned
+    /// default walk root (`/sys/fs/cgroup`), `parent` is actually under
+    /// that root (a real cgroupfs operation — create_dir_all of the
+    /// parent, or the subtree_control walk, that EACCESes for a non-root
+    /// euid), AND the euid is non-root. A `parent` OUTSIDE the root (e.g.
+    /// a tmpdir — the non-cgroup-path early-bail that creates a dir and
+    /// skips the walk) touches no cgroupfs and needs no root. A delegated
+    /// walk root (set via [`Self::with_walk_root`]) is exempt: cgroup-v2
+    /// delegation grants the delegatee write access to
+    /// `cgroup.subtree_control` inside the delegated subtree, so a
+    /// non-root euid can manage it (Documentation/admin-guide/cgroup-v2.rst,
+    /// Delegation). Pure + takes `parent`/`euid` explicitly so the
+    /// privilege gate is unit-tested regardless of the test runner's own
+    /// euid and working directory.
+    fn default_root_requires_root(root: &Path, parent: &Path, euid: u32) -> bool {
+        root == Path::new(Self::DEFAULT_WALK_ROOT) && parent.starts_with(root) && euid != 0
+    }
+
     /// Inner setup that takes the cgroup-fs root as an explicit
     /// argument so tests can drive the controller-enable path against
     /// a tmpdir without touching `/sys/fs/cgroup`. Production
@@ -620,6 +639,34 @@ impl CgroupManager {
     /// still happens but no subtree_control walk fires (matches the
     /// existing "non-cgroup-mount" early-bail).
     fn setup_under_root(&self, controllers: &BTreeSet<Controller>, root: &Path) -> Result<()> {
+        // Managing cgroups under the kernel-owned default walk root
+        // (/sys/fs/cgroup, Mode A) requires root: create_dir_all of a
+        // parent UNDER /sys/fs/cgroup, or the subtree_control walk below,
+        // would EACCES for a non-root caller with an errno that buries
+        // the cause. Fail fast here so the message names the fix. Gated
+        // on the parent being under the root: a parent OUTSIDE it (the
+        // non-cgroup-path early-bail — create a dir, skip the walk)
+        // touches no cgroupfs and needs no root. Checked at setup (first
+        // real cgroup use), NOT at manager construction: host_only tests
+        // that never create a cgroup (macro-attribute fixtures,
+        // host-topology reads, nested-VM verifier orchestration) must not
+        // fail for a resource they never touch. A delegated walk root
+        // (Mode B/C via with_walk_root) is exempt — the operator owns
+        // subtree_control inside the delegated subtree.
+        let euid = unsafe { libc::geteuid() };
+        if Self::default_root_requires_root(root, &self.parent, euid) {
+            return Err(anyhow!(
+                "CgroupManager::setup: cannot manage cgroups under the \
+                 kernel-owned default walk root {root:?} as a non-root \
+                 process (euid {euid}); run as root, or for cgroup-v2 \
+                 user delegation set a delegated walk root via \
+                 CgroupManager::with_walk_root (a systemd Delegate=yes \
+                 subtree or a container nsdelegate root) — when driven by \
+                 cargo-ktstr, set the {walk_env} env var to that delegated \
+                 root",
+                walk_env = crate::KTSTR_CGROUP_WALK_ROOT_ENV,
+            ));
+        }
         if !self.parent.exists() {
             fs::create_dir_all(&self.parent)
                 .with_context(|| format!("mkdir {}", self.parent.display()))?;

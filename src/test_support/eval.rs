@@ -37,6 +37,107 @@ use crate::verifier::{SCHED_OUTPUT_START, parse_sched_output};
 
 use super::runtime::{config_content_parts, config_file_parts, verbose, vm_timeout_from_entry};
 
+/// Sentinel prefix on the `AssertDetail` message that
+/// [`host_side_llm_extract`] emits when the host-side LLM model could
+/// not load (cold-cache offline, or a cached GGUF incompatible with the
+/// linked llama.cpp). The `run_ktstr_test` caller routes on this prefix
+/// to SKIP the test rather than fail it — an unloadable model is an
+/// unmet prerequisite (the extraction cannot run), not a test failure.
+/// Single source of truth shared by the emit site and the caller's
+/// skip check.
+const LLM_MODEL_LOAD_FAILED_PREFIX: &str = "LlmExtract model load failed: ";
+
+/// Decide whether an unloadable host LLM model should SKIP the test (vs
+/// fail it). Returns `Some(skip_reason)` when the host-side extraction
+/// failed only because the model could not load
+/// ([`LLM_MODEL_LOAD_FAILED_PREFIX`]) AND no host-side `post_vm` callback
+/// failed — an unloadable model is an unmet prerequisite, not a test
+/// failure. Returns `None` (fall through to the normal verdict) when
+/// there is no model-load failure, OR a `post_vm` callback failed: a real
+/// host-side regression DOMINATES a missing-prereq skip and must never be
+/// masked by it. Pure so the skip-vs-fail precedence is unit-tested
+/// without the full eval pipeline.
+fn should_skip_on_llm_model_load_failure(
+    host_extract_failures: &[crate::assert::AssertDetail],
+    post_vm_failed: bool,
+) -> Option<String> {
+    if post_vm_failed {
+        return None;
+    }
+    host_extract_failures
+        .iter()
+        .find(|d| d.message.starts_with(LLM_MODEL_LOAD_FAILED_PREFIX))
+        .map(|d| d.message.clone())
+}
+
+#[cfg(test)]
+mod should_skip_on_llm_model_load_failure_tests {
+    //! Truth table for the LLM-model-load skip-vs-fail precedence. Locks
+    //! in that an unloadable model skips, but a host-side post_vm failure
+    //! dominates (no skip — a real regression is never masked), and a
+    //! non-model failure never skips. A revert of any arm flips a cell.
+    use super::{LLM_MODEL_LOAD_FAILED_PREFIX, should_skip_on_llm_model_load_failure};
+    use crate::assert::{AssertDetail, DetailKind};
+
+    fn model_load_failure() -> AssertDetail {
+        AssertDetail::new(
+            DetailKind::Other,
+            format!("{LLM_MODEL_LOAD_FAILED_PREFIX}cold-cache offline"),
+        )
+    }
+
+    #[test]
+    fn model_load_failure_no_post_vm_skips() {
+        // Unmet prerequisite + no host-side regression → SKIP.
+        let failures = vec![model_load_failure()];
+        assert!(should_skip_on_llm_model_load_failure(&failures, false).is_some());
+    }
+
+    #[test]
+    fn model_load_failure_with_post_vm_does_not_skip() {
+        // A post_vm regression dominates the missing-prereq skip → FAIL
+        // (None: fall through to the verdict).
+        let failures = vec![model_load_failure()];
+        assert!(should_skip_on_llm_model_load_failure(&failures, true).is_none());
+    }
+
+    #[test]
+    fn non_model_failure_does_not_skip() {
+        // A non-model-load failure (a real assertion failure) must not be
+        // masked as a skip.
+        let failures = vec![AssertDetail::new(
+            DetailKind::Other,
+            "metric out of declared range".to_string(),
+        )];
+        assert!(should_skip_on_llm_model_load_failure(&failures, false).is_none());
+    }
+
+    #[test]
+    fn no_failures_does_not_skip() {
+        assert!(should_skip_on_llm_model_load_failure(&[], false).is_none());
+    }
+
+    #[test]
+    fn model_load_failure_among_others_skips() {
+        // `.find` scans all entries: a model-load failure that is not the
+        // first detail still triggers the skip, and the returned reason is
+        // the prefix-bearing one (pins the iteration, not just `[0]`).
+        let failures = vec![
+            AssertDetail::new(
+                DetailKind::Other,
+                "metric out of declared range".to_string(),
+            ),
+            model_load_failure(),
+        ];
+        let skip = should_skip_on_llm_model_load_failure(&failures, false);
+        assert!(
+            skip.as_deref()
+                .is_some_and(|m| m.starts_with(LLM_MODEL_LOAD_FAILED_PREFIX)),
+            "the model-load detail (2nd in the vec) must be found + returned; got {skip:?}",
+        );
+    }
+}
+
 /// Marker error type attached as `anyhow::Context` to the failure
 /// `Err` produced when an scx_bpf_error matcher
 /// ([`crate::assert::Assert::expect_scx_bpf_error_contains`] or
@@ -64,6 +165,48 @@ impl std::fmt::Display for ScxBpfErrorMatcherMismatch {
 }
 
 impl std::error::Error for ScxBpfErrorMatcherMismatch {}
+
+/// Marker error type attached as `anyhow::Context` to the failure
+/// `Err` produced by `run_ktstr_test_inner_impl` when a host-side
+/// `post_vm` / `post_vm_unconditional` callback returned `Err`
+/// (which `evaluate_vm_result` has already folded into the verdict —
+/// as an `Other` detail in the parse-success arm, as a message prefix
+/// in the parse-fail arms).
+///
+/// Dispatch (`crate::test_support::dispatch::result_to_exit_code`)
+/// downcasts the error chain for this marker and refuses to invert the
+/// verdict to a pass — even under `expect_err = true`. The semantic
+/// boundary: `expect_err` inverts a GUEST-side expected failure (the
+/// scheduler stalled, the workload bailed), but a HOST-side `post_vm`
+/// assertion is always honored. A failure-dump render test that
+/// triggers an expected stall to PRODUCE the dump, then asserts the
+/// dump's contents in `post_vm`, must fail loudly when the dump renders
+/// wrong — not silently invert to "passed" because the stall it relied
+/// on was "expected". Without the marker, the post_vm diagnostic
+/// surfaces in stderr but the exit code follows the normal expect_err
+/// inversion path (a false PASS).
+///
+/// Mirrors [`ScxBpfErrorMatcherMismatch`]: same `anyhow::Context`
+/// attachment, same `downcast_ref` chain-walk at the dispatch arm. The
+/// dispatch arm is positioned AFTER the resource-contention / topology
+/// skip arms (a skip means the test never ran) but BEFORE the
+/// [`ExpectAutoReproSatisfied`] and `expect_err` inversion arms, so a
+/// real host-side regression wins over any inversion.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PostVmAssertionFailure;
+
+impl std::fmt::Display for PostVmAssertionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "host-side post_vm assertion failed — expect_err inversion bypassed \
+             (a host-side check is honored even when the accompanying guest-side \
+             failure is expected)"
+        )
+    }
+}
+
+impl std::error::Error for PostVmAssertionFailure {}
 
 /// Marker error type attached as `anyhow::Context` to the failure
 /// `Err` produced by `evaluate_vm_result` when
@@ -459,7 +602,7 @@ fn host_side_llm_extract(
                 Err(reason) => {
                     failures.push(crate::assert::AssertDetail::new(
                         crate::assert::DetailKind::Other,
-                        format!("LlmExtract model load failed: {reason}"),
+                        format!("{LLM_MODEL_LOAD_FAILED_PREFIX}{reason}"),
                     ));
                     continue;
                 }
@@ -468,7 +611,7 @@ fn host_side_llm_extract(
         if let Some(reason) = load_err {
             failures.push(crate::assert::AssertDetail::new(
                 crate::assert::DetailKind::Other,
-                format!("LlmExtract model load failed: {reason}"),
+                format!("{LLM_MODEL_LOAD_FAILED_PREFIX}{reason}"),
             ));
             // Leave metrics empty in the PayloadMetrics slot. Skip
             // the structural-sanity check below — running it on an
@@ -930,24 +1073,35 @@ pub(crate) fn run_ktstr_test_inner(
     // [`ExpectAutoReproSatisfied`] marker to the failure chain.
     // The dispatch path at `result_to_exit_code` consumes the
     // marker by routing the verdict to `EXIT_PASS`, but the
-    // `#[ktstr_test]` macro emits a `#[test]` wrapper that calls
-    // `run_ktstr_test` and panics on any `Err` — it never reaches
-    // `result_to_exit_code`. Convert the marker `Err` to `Ok`
-    // here so the macro-emitted wrapper sees a pass; the
-    // diagnostic still surfaces via the `eprintln!("{e:#}")` at
-    // the dispatch arm AND via the per-test stderr capture that
-    // includes the original failure trail under
-    // `--- scheduler log ---`. Without this conversion the
-    // inversion only works for the gauntlet / `run_named_test`
-    // dispatch (which goes through `result_to_exit_code`) and
-    // silently no-ops for direct test invocation, which is the
-    // common case under nextest.
+    // `run_ktstr_test` (the library entry) and the `#[ktstr_test]`
+    // macro's emitted `#[test]` body consume this Result directly —
+    // NOT through `result_to_exit_code` — so the marker-bypass
+    // inversion the dispatch arm performs would be missed on those
+    // paths without this conversion. The canonical `cargo ktstr test`
+    // / nextest path does NOT reach here: the ctor intercepts
+    // `--exact ktstr/<name>` and routes to `run_named_test` →
+    // `result_to_exit_code` (dispatch.rs), which honors the markers via
+    // its own arms. This conversion covers the direct `cargo test`
+    // harness and out-of-tree library callers of `run_ktstr_test`.
+    //
+    // Marker precedence mirrors `result_to_exit_code`: a
+    // `PostVmAssertionFailure` (a host-side post_vm regression) must
+    // NOT be inverted, so it is checked FIRST and kept as an `Err`;
+    // only `ExpectAutoReproSatisfied` with no post_vm failure converts
+    // to `Ok(pass)`. The diagnostic surfaces via the `eprintln!` and
+    // the per-test stderr capture's original failure trail.
     match result {
-        Err(e) if e.downcast_ref::<ExpectAutoReproSatisfied>().is_some() => {
-            eprintln!("{e:#}");
-            Ok(AssertResult::pass())
+        Err(e) => {
+            if e.downcast_ref::<PostVmAssertionFailure>().is_some() {
+                Err(e)
+            } else if e.downcast_ref::<ExpectAutoReproSatisfied>().is_some() {
+                eprintln!("{e:#}");
+                Ok(AssertResult::pass())
+            } else {
+                Err(e)
+            }
         }
-        other => other,
+        Ok(r) => Ok(r),
     }
 }
 
@@ -2005,6 +2159,30 @@ fn run_ktstr_test_inner_impl(
     // raw outputs) for the test verdict to fold in.
     let host_extract_failures = host_side_llm_extract(&mut payload_metrics, &raw_outputs);
 
+    // Gate-skip on an unloadable host LLM model. The model lives
+    // host-side (it is too large to ship into the guest) and is a hard
+    // prerequisite for any LlmExtract payload: when it cannot load
+    // (cold-cache offline, or a cached GGUF incompatible with the linked
+    // llama.cpp), the extraction never runs and the test's metrics are
+    // unfulfillable. The prior code folded this into the verdict as a
+    // failure, failing the whole test on a missing prereq; convert that
+    // same whole-test path to a SKIP so the suite passes where a
+    // compatible model is present and skips where it is not. Re-fetching
+    // cannot help — the incompatibility is with the linked llama.cpp, not
+    // a stale download.
+    // The skip-vs-fail decision — including the rule that a host-side
+    // post_vm failure DOMINATES (no skip), so a real regression is never
+    // masked by a missing model — is should_skip_on_llm_model_load_failure
+    // (truth-tabled). A post_vm Err is folded into the verdict below and
+    // carries the PostVmAssertionFailure marker downstream.
+    if let Some(skip_reason) =
+        should_skip_on_llm_model_load_failure(&host_extract_failures, post_vm_err.is_some())
+    {
+        crate::report::test_skip(format_args!("{}: {}", entry.name, skip_reason));
+        record_skip_sidecar(entry);
+        return Ok(AssertResult::skip(skip_reason));
+    }
+
     // auto_repro is enabled when:
     // - entry.auto_repro is true (default)
     // - a scheduler is running (not EEVDF)
@@ -2100,10 +2278,26 @@ fn run_ktstr_test_inner_impl(
     // original failure detail still surfaces in stderr/dump
     // rendering. The marker rides as `anyhow::Context` (matches
     // the [`ScxBpfErrorMatcherMismatch`] precedent above) so
-    // `e.chain().any(|c| c.is::<...>())` at the dispatch arm
-    // walks the same chain shape.
+    // `downcast_ref::<...>().is_some()` at the dispatch arm finds the
+    // marker through anyhow's context-aware chain walk (a raw
+    // `e.chain().any(|c| c.is::<...>())` would MISS a context-attached
+    // marker — anyhow boxes it as `ContextError<C, E>`).
     let eval_result = if result.expect_auto_repro_satisfied {
         eval_result.map_err(|e| e.context(ExpectAutoReproSatisfied))
+    } else {
+        eval_result
+    };
+    // When a host-side post_vm / post_vm_unconditional callback
+    // returned Err, attach the [`PostVmAssertionFailure`] marker so
+    // result_to_exit_code refuses to invert the verdict under
+    // expect_err: a host-side assertion failure is a real regression
+    // and must surface even when the guest-side failure it accompanies
+    // is "expected". evaluate_vm_result already folded the post_vm Err
+    // into the failure message (Other detail / message prefix), so the
+    // marker governs only the inversion decision, not message content.
+    // Mirrors the ScxBpfErrorMatcherMismatch precedent.
+    let eval_result = if post_vm_err.is_some() {
+        eval_result.map_err(|e| e.context(PostVmAssertionFailure))
     } else {
         eval_result
     };
@@ -2774,6 +2968,23 @@ fn evaluate_vm_result(
     // run) but the crash backtrace appends as a `guest crashed:`
     // section so the operator sees the panic frames the guest
     // emitted before the watchdog fired.
+
+    // Fold the host-side `post_vm` callback's Err into the parse-fail
+    // diagnostic — used by BOTH the timed-out and no-result arms below.
+    // Most parse-fail paths are guest-crashed-before-reporting, in which
+    // case post_vm probably wouldn't have run meaningfully — but if the
+    // test author's post_vm did fire and return Err on the partial
+    // result, the failure surface MUST include it. Prepending the
+    // post_vm message keeps the crash diagnostics as the load-bearing
+    // body and surfaces post_vm as a leading "host-side check also
+    // reported" line so the operator sees both signals together. (The
+    // PostVmAssertionFailure marker that governs the expect_err
+    // inversion decision is attached separately by the caller; this only
+    // controls the rendered message.)
+    let post_vm_prefix = post_vm_err
+        .map(|e| format!("post_vm callback returned Err: {e:#}\n\n"))
+        .unwrap_or_default();
+
     if result.timed_out {
         let crash_section = if let Some(ref guest_crash) = result.crash_message {
             format!("\n\n{ERR_GUEST_CRASHED_PREFIX}\n{guest_crash}")
@@ -2821,19 +3032,6 @@ fn evaluate_vm_result(
                 ERR_TIMED_OUT_NO_RESULT.to_string()
             }
         };
-        // Fold the host-side `post_vm` callback's Err into the
-        // parse-fail diagnostic. Most parse-fail paths are
-        // guest-crashed-before-reporting, in which case post_vm
-        // probably wouldn't have run meaningfully — but if the
-        // test author's post_vm did fire and return Err on the
-        // partial result, the failure surface MUST include it.
-        // Prepending the post_vm message keeps the parse-fail
-        // crash diagnostics as the load-bearing body and surfaces
-        // post_vm as a leading "host-side check also reported"
-        // line so the operator sees both signals together.
-        let post_vm_prefix = post_vm_err
-            .map(|e| format!("post_vm callback returned Err: {e:#}\n\n"))
-            .unwrap_or_default();
         let msg = format!(
             "{post_vm_prefix}{}{}ktstr_test '{}'{} [topo={}] {}{}{}{}{}{}{}{}{}",
             fingerprint_line,
@@ -2875,7 +3073,7 @@ fn evaluate_vm_result(
         ERR_NO_TEST_FUNCTION_OUTPUT.to_string()
     };
     let msg = format!(
-        "{}{}ktstr_test '{}'{} [topo={}] {}{}{}{}{}{}{}",
+        "{post_vm_prefix}{}{}ktstr_test '{}'{} [topo={}] {}{}{}{}{}{}{}",
         fingerprint_line,
         bug_summary_line(),
         entry.name,
