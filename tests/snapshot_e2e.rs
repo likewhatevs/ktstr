@@ -577,6 +577,12 @@ static __KTSTR_ENTRY_WATCH_SNAPSHOT_EXIT: ktstr::test_support::KtstrTestEntry =
 /// `.filter` partitions by count threshold, `.max_by` returns
 /// the highest-count entry. Hand-built JSON because
 /// FailureDumpMap is `#[non_exhaustive]`.
+///
+/// Each entry must carry `key_hex`/`value_hex` (the little-endian byte
+/// rendering of key/value in the spaced-lowercase format `hex_dump`
+/// emits) — `FailureDumpEntry` requires those fields, so omitting them
+/// fails deserialization (the structured `key`/`value` are
+/// `#[serde(default)]`; the hex strings are not).
 const SYNTHETIC_CGROUP_MAP_JSON: &str = r#"{
     "schema": "single",
     "maps": [
@@ -588,15 +594,21 @@ const SYNTHETIC_CGROUP_MAP_JSON: &str = r#"{
             "entries": [
                 {
                     "key": { "kind": "uint", "bits": 64, "value": 1001 },
-                    "value": { "kind": "uint", "bits": 64, "value": 50 }
+                    "key_hex": "e9 03 00 00 00 00 00 00",
+                    "value": { "kind": "uint", "bits": 64, "value": 50 },
+                    "value_hex": "32 00 00 00 00 00 00 00"
                 },
                 {
                     "key": { "kind": "uint", "bits": 64, "value": 1002 },
-                    "value": { "kind": "uint", "bits": 64, "value": 250 }
+                    "key_hex": "ea 03 00 00 00 00 00 00",
+                    "value": { "kind": "uint", "bits": 64, "value": 250 },
+                    "value_hex": "fa 00 00 00 00 00 00 00"
                 },
                 {
                     "key": { "kind": "uint", "bits": 64, "value": 1003 },
-                    "value": { "kind": "uint", "bits": 64, "value": 500 }
+                    "key_hex": "eb 03 00 00 00 00 00 00",
+                    "value": { "kind": "uint", "bits": 64, "value": 500 },
+                    "value_hex": "f4 01 00 00 00 00 00 00"
                 }
             ]
         }
