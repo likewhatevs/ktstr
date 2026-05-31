@@ -82,38 +82,6 @@ use self::state::{
 };
 use self::watchpoint::{WatchpointPublishResult, republish_watchpoint_on_rebind};
 
-/// Test-only seam: when set, the exit_kind gate's `translate_any_kva`
-/// call returns `None` unconditionally — driving the same code path
-/// that fires when a previously-published `*scx_root->exit_kind` KVA
-/// can no longer translate (slab page freed during teardown). E2E
-/// tests for the silent-drop fixes flip this to deterministically
-/// exercise the suppression + BPF-latch-rescue branches without
-/// staging a real translate failure (which depends on
-/// timing-sensitive teardown race windows).
-///
-/// `pub` because integration tests under `tests/` link against the
-/// library's public surface and `#[cfg(test)]`-gated statics are
-/// invisible across that boundary. `#[doc(hidden)]` keeps the symbol
-/// out of the published rustdoc surface. Production callers must
-/// never flip this — setting it forces dump suppression on every
-/// dump-eligible exit, masking real failures (unless
-/// [`FREEZE_COORD_TEST_FORCE_BSS_TRIGGERED`] is also set, which would
-/// instead synthesize a phantom dump on every dump-eligible exit via
-/// the BPF-latch rescue path).
-#[doc(hidden)]
-pub static FREEZE_COORD_TEST_FORCE_TRANSLATE_NONE: AtomicBool = AtomicBool::new(false);
-
-/// Test-only seam: when set, [`bss_read_state`] returns
-/// `BssReadState::Triggered` unconditionally — simulating a BPF probe
-/// latch fire. Combined with [`FREEZE_COORD_TEST_FORCE_TRANSLATE_NONE`]
-/// this drives the "gate would suppress but latch rescues — proceed
-/// with dump" path that the silent-drop fix introduced to recover
-/// dumps when `*scx_root->exit_kind` is unreadable but the BPF probe
-/// has historically observed an error-class exit. See the partner
-/// static's doc for visibility / production-safety guidance.
-#[doc(hidden)]
-pub static FREEZE_COORD_TEST_FORCE_BSS_TRIGGERED: AtomicBool = AtomicBool::new(false);
-
 #[cfg(target_arch = "x86_64")]
 fn warn_kvm_clock_failure(ioctl_phase: &'static str, e: &std::io::Error) {
     // KVM_GET_CLOCK / KVM_SET_CLOCK do not gate on SEV-ES / SEV-SNP /
@@ -246,6 +214,50 @@ pub(super) fn compute_watchpoint_only_trigger(
     bss_state: BssReadState,
 ) -> bool {
     watchpoint_hit && !matches!(bss_state, BssReadState::Triggered)
+}
+
+/// Pure exit_kind gate decision: does the live scheduler exit warrant a
+/// failure dump? `Some(kind)` = `*scx_root->exit_kind` translated and
+/// read as `kind`; `None` = the KVA no longer translates (the slab page
+/// holding `*scx_root` was freed mid-teardown). Returns true only for an
+/// error-class exit (`kind >= SCX_EXIT_ERROR`). `SCX_EXIT_ERROR = 1024`
+/// is the first error-class value in the kernel's `enum scx_exit_kind`;
+/// values below are clean (NONE/DONE) or normal unregister classes
+/// (UNREG/SYSRQ/PARENT) that do not warrant a dump. A non-translating
+/// KVA (`None`) suppresses — there is no scheduler state to capture.
+///
+/// Pure so the gate decision is unit-tested without booting a VM: the
+/// memory translate + read belong to the caller; this is the decision
+/// over their result.
+pub(super) fn exit_kind_warrants_dump(kind: Option<u32>) -> bool {
+    /// First error-class value in the kernel's `enum scx_exit_kind`.
+    const SCX_EXIT_ERROR: u32 = 1024;
+    matches!(kind, Some(k) if k >= SCX_EXIT_ERROR)
+}
+
+/// Decide whether the BPF `.bss` latch rescues a dump the exit_kind
+/// gate decided to suppress. Called only when the gate suppressed
+/// (`gate_decision == false` at the call site): the live
+/// `*scx_root->exit_kind` read as a clean value, or its KVA no longer
+/// translated. The probe's sticky `ktstr_err_exit_detected` latch is
+/// the historical authority — if it independently observed an
+/// error-class exit ([`BssReadState::Triggered`]) AND the cached `.bss`
+/// PA has not gone [`BssReadState::OutOfBounds`] this run
+/// (`bss_oob_warn_logged == false`, so a recycled vmalloc page cannot
+/// synthesise a phantom fire from unrelated bytes), the suppressed dump
+/// is rescued and emitted anyway. Any other state honors the gate's
+/// suppression.
+///
+/// Pure so this F15-class "gate would suppress but latch rescues"
+/// defense is unit-tested without booting a VM: the rescue is a
+/// host-side coordinator decision, and the host/guest process boundary
+/// makes an e2e seam impossible (a static set by the guest payload
+/// never reaches the host coordinator's copy).
+pub(super) fn bss_latch_rescues_suppressed_dump(
+    bss_state: BssReadState,
+    bss_oob_warn_logged: bool,
+) -> bool {
+    matches!(bss_state, BssReadState::Triggered) && !bss_oob_warn_logged
 }
 
 /// Snake-case label for a [`BssReadState`] suitable for embedding in
@@ -4305,8 +4317,9 @@ impl KtstrVm {
                         if freeze_state == FreezeState::Done {
                             (false, BssReadState::NotResolved)
                         } else {
-                            let wp =
-                                freeze_coord_watchpoint.hit.load(Ordering::Acquire);
+                            let wp = freeze_coord_watchpoint
+                                .hit
+                                .load(Ordering::Acquire);
                             let st = bss_read_state(
                                 freeze_coord_mem.as_deref(),
                                 cached_bss_pa,
@@ -5710,11 +5723,7 @@ impl KtstrVm {
                                     (kva, Some(owned), Some(mem)) => {
                                         let kernel = owned.guest_kernel();
                                         let walk = kernel.walk_context();
-                                        let translate_result = if FREEZE_COORD_TEST_FORCE_TRANSLATE_NONE
-                                            .load(Ordering::Relaxed)
-                                        {
-                                            None
-                                        } else {
+                                        let translate_result =
                                             crate::monitor::idr::translate_any_kva(
                                                 mem,
                                                 walk.cr3_pa,
@@ -5722,22 +5731,28 @@ impl KtstrVm {
                                                 kva,
                                                 walk.l5,
                                                 walk.tcr_el1,
-                                            )
-                                        };
+                                            );
+                                        // The gate decision is the pure
+                                        // `exit_kind_warrants_dump` (unit-tested
+                                        // truth table over Some(error)/Some(clean)
+                                        // /None); the per-branch tracing below
+                                        // explains the verdict. `None` =
+                                        // translate failed (slab page freed
+                                        // mid-teardown) → does not warrant a
+                                        // dump.
                                         match translate_result {
                                             Some(pa) => {
                                                 let kind = mem.read_u32(pa, 0);
-                                                // SCX_EXIT_ERROR = 1024 — the
-                                                // first error-class value in
-                                                // `enum scx_exit_kind`. All
-                                                // values below are clean
-                                                // (NONE/DONE) or normal
-                                                // unregister classes
-                                                // (UNREG/SYSRQ/PARENT) that
-                                                // do not warrant a failure
-                                                // dump.
-                                                const SCX_EXIT_ERROR: u32 = 1024;
-                                                if kind < SCX_EXIT_ERROR {
+                                                let warrants =
+                                                    exit_kind_warrants_dump(Some(kind));
+                                                if warrants {
+                                                    tracing::debug!(
+                                                        kind,
+                                                        "freeze-coord: \
+                                                         exit_kind gate passed \
+                                                         (kind >= 1024)"
+                                                    );
+                                                } else {
                                                     tracing::info!(
                                                         kind,
                                                         exit_kind_kva =
@@ -5749,16 +5764,8 @@ impl KtstrVm {
                                                          shutdown / non-error \
                                                          transition)"
                                                     );
-                                                    false
-                                                } else {
-                                                    tracing::debug!(
-                                                        kind,
-                                                        "freeze-coord: \
-                                                         exit_kind gate passed \
-                                                         (kind >= 1024)"
-                                                    );
-                                                    true
                                                 }
+                                                warrants
                                             }
                                             None => {
                                                 // KVA was published but no
@@ -5777,7 +5784,7 @@ impl KtstrVm {
                                                      (scheduler likely torn \
                                                      down) — suppressing dump"
                                                 );
-                                                false
+                                                exit_kind_warrants_dump(None)
                                             }
                                         }
                                     }
@@ -5805,16 +5812,10 @@ impl KtstrVm {
                                     // silently drop a real failure
                                     // dump; the BPF latch is the
                                     // historical authority and wins.
-                                    let bss_state = if FREEZE_COORD_TEST_FORCE_BSS_TRIGGERED
-                                        .load(Ordering::Relaxed)
-                                    {
-                                        BssReadState::Triggered
-                                    } else {
-                                        bss_read_state(
-                                            freeze_coord_mem.as_deref(),
-                                            cached_bss_pa,
-                                        )
-                                    };
+                                    let bss_state = bss_read_state(
+                                        freeze_coord_mem.as_deref(),
+                                        cached_bss_pa,
+                                    );
                                     // The cross-reference Triggered
                                     // override is only safe when the
                                     // cached `.bss` PA has not been
@@ -5860,9 +5861,7 @@ impl KtstrVm {
                                     // that would require the latch
                                     // to fire per (unload, reload)
                                     // cycle rather than once per VM.
-                                    if matches!(bss_state, BssReadState::Triggered)
-                                        && !bss_oob_warn_logged
-                                    {
+                                    if bss_latch_rescues_suppressed_dump(bss_state, bss_oob_warn_logged) {
                                         tracing::warn!(
                                             "freeze-coord: exit_kind gate \
                                              would suppress dump but BPF \
@@ -12341,6 +12340,98 @@ impl KtstrVm {
         // dispatches statically.
         use monitor::bpf_prog::BpfProgAccessor;
         accessor.struct_ops_progs()
+    }
+}
+
+#[cfg(test)]
+mod bss_latch_rescues_suppressed_dump_tests {
+    //! Truth table for [`bss_latch_rescues_suppressed_dump`] — the
+    //! gate-suppress-but-bss-latch-rescue (F15-class) decision, reached
+    //! only when the exit_kind gate decided to suppress. The host/guest
+    //! process boundary makes an e2e seam impossible (a static set by
+    //! the guest test payload never reaches the host coordinator's own
+    //! copy), so this pure-fn table is the honest coverage; the
+    //! dump-emit happy path is exercised by the real-stall watchdog
+    //! tests in tests/silent_drop_e2e.rs.
+    use super::{BssReadState, bss_latch_rescues_suppressed_dump};
+
+    #[test]
+    fn triggered_not_oob_rescues() {
+        // The probe latch independently observed an error-class exit and
+        // the cached `.bss` PA is still valid → rescue the suppressed
+        // dump (the latch is the historical authority).
+        assert!(bss_latch_rescues_suppressed_dump(
+            BssReadState::Triggered,
+            false
+        ));
+    }
+
+    #[test]
+    fn triggered_but_oob_honors_suppression() {
+        // OOB latched this run: a non-zero read on the cached PA could
+        // be recycled vmalloc bytes, not a real fire → do not rescue.
+        assert!(!bss_latch_rescues_suppressed_dump(
+            BssReadState::Triggered,
+            true
+        ));
+    }
+
+    #[test]
+    fn not_triggered_honors_suppression() {
+        assert!(!bss_latch_rescues_suppressed_dump(
+            BssReadState::NotTriggered,
+            false
+        ));
+    }
+
+    #[test]
+    fn out_of_bounds_honors_suppression() {
+        assert!(!bss_latch_rescues_suppressed_dump(
+            BssReadState::OutOfBounds,
+            false
+        ));
+    }
+
+    #[test]
+    fn not_resolved_honors_suppression() {
+        assert!(!bss_latch_rescues_suppressed_dump(
+            BssReadState::NotResolved,
+            false
+        ));
+    }
+}
+
+#[cfg(test)]
+mod exit_kind_warrants_dump_tests {
+    //! Truth table for [`exit_kind_warrants_dump`] — the pure exit_kind
+    //! gate decision. `Some(kind)` = the live `*scx_root->exit_kind`
+    //! read through the translated PA; `None` = the KVA no longer
+    //! translates (slab page freed mid-teardown). Replaces the deleted
+    //! `FREEZE_COORD_TEST_FORCE_TRANSLATE_NONE` host-static seam's
+    //! coverage of the translate-fail branch with a host-side unit test.
+    use super::exit_kind_warrants_dump;
+
+    #[test]
+    fn error_class_warrants_dump() {
+        // SCX_EXIT_ERROR = 1024 is the first error-class value; the
+        // boundary value and anything above it warrant a dump.
+        assert!(exit_kind_warrants_dump(Some(1024)));
+        assert!(exit_kind_warrants_dump(Some(2048)));
+    }
+
+    #[test]
+    fn clean_exit_does_not_warrant_dump() {
+        // NONE/DONE and the normal unregister classes all sit below
+        // SCX_EXIT_ERROR — a clean shutdown must not emit a dump.
+        assert!(!exit_kind_warrants_dump(Some(0)));
+        assert!(!exit_kind_warrants_dump(Some(1023)));
+    }
+
+    #[test]
+    fn translate_failure_does_not_warrant_dump() {
+        // None = the exit_kind KVA no longer translates (scheduler torn
+        // down); there is no state to capture, so suppress.
+        assert!(!exit_kind_warrants_dump(None));
     }
 }
 
