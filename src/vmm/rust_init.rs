@@ -1846,9 +1846,10 @@ fn run_disk_template_mode() -> i32 {
     const MKFS: &str = "/bin/mkfs.btrfs";
     // `-f` forces overwrite of any existing signature so a leftover
     // ext4 magic from a host that recycled the staging file does
-    // not block formatting. `--quiet` keeps the COM2 transcript
-    // small. `/dev/vda` is the singleton virtio-blk device the
-    // host attached.
+    // not block formatting. mkfs runs verbose (no `--quiet`) so its
+    // own diagnostics land in the guest stderr, which the host's
+    // publish gate surfaces on a magic-check failure. `/dev/vda` is
+    // the singleton virtio-blk device the host attached.
     //
     // No `--metadata DUP` override: btrfs picks DUP metadata by
     // default on a single-device fs, which is the desired
@@ -1856,29 +1857,140 @@ fn run_disk_template_mode() -> i32 {
     // VIRTIO_BLK_DEFAULT_CAPACITY_BYTES doc) accommodates DUP.
     tracing::info!(mkfs = MKFS, target = "/dev/vda", "running mkfs.btrfs");
     // SIGCHLD is `SIG_IGN` for the rest of this process (installed by
-    // [`ktstr_guest_init`] for zombie prevention). `Command::status()`
+    // [`ktstr_guest_init`] for zombie prevention). `Command::output()`
     // calls `waitpid(2)` internally; under `SIG_IGN` the kernel
     // auto-reaps the child before `waitpid` runs, so the syscall
     // returns `ECHILD`, the std-lib maps it to
-    // `Err(io::Error::ECHILD)`, and the original `match status`
-    // branch fell into the `Err(_) => 1` arm — surfacing a fixed `1`
-    // exit code for every successful `mkfs.btrfs` run. The host
-    // would then see "template build failed" for a perfectly
-    // formatted image. Restore `SIG_DFL` for the closure's lifetime
-    // so `waitpid` reaps and reports the real status; the
-    // post-closure restore re-installs `SIG_IGN` for any future
-    // child this process spawns.
-    let status = with_sigchld_default(|| {
-        Command::new(MKFS)
-            .args(["-f", "--quiet", "/dev/vda"])
-            .status()
-    });
-    match status {
-        Ok(s) => s.code().unwrap_or(1),
+    // `Err(io::Error::ECHILD)`, and the original `match` branch fell
+    // into the `Err(_) => 1` arm — surfacing a fixed `1` exit code for
+    // every successful `mkfs.btrfs` run. The host would then see
+    // "template build failed" for a perfectly formatted image. Restore
+    // `SIG_DFL` for the closure's lifetime so `waitpid` reaps and
+    // reports the real status; the post-closure restore re-installs
+    // `SIG_IGN` for any future child this process spawns.
+    //
+    // The build VM's stdio forwarders are NOT joined before
+    // `force_reboot`'s `RB_AUTOBOOT`, so bytes still in the
+    // stdout/stderr pipes at reboot are lost (see the dispatch site),
+    // and the host does not drain the bulk-port stdout/stderr frames
+    // for a fast-exiting build VM either — only the EXIT frame and COM2
+    // survive. So capture mkfs's output in-process via
+    // `Command::output()` and surface it on the two channels that DO
+    // survive: the exit code (a pass/no-op verdict) and COM2
+    // (`/dev/ttyS1`, the full text) — so the publish gate can show WHY
+    // a build produced no filesystem.
+    let mut diag = format!(
+        "MKFS_DIAG /dev/vda exists={} /sys/class/block/vda exists={}\n",
+        std::path::Path::new("/dev/vda").exists(),
+        std::path::Path::new("/sys/class/block/vda").exists(),
+    );
+    match std::fs::metadata(MKFS) {
+        Ok(m) => diag.push_str(&format!("MKFS_DIAG {MKFS} size={}\n", m.len())),
+        Err(e) => diag.push_str(&format!("MKFS_DIAG {MKFS} metadata failed: {e}\n")),
+    }
+    let output = with_sigchld_default(|| Command::new(MKFS).args(["-f", "/dev/vda"]).output());
+    let mut code = match output {
+        Ok(o) => {
+            diag.push_str(&format!(
+                "MKFS_DIAG exit={:?}\nMKFS_STDOUT:\n{}\nMKFS_STDERR:\n{}\n",
+                o.status.code(),
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr),
+            ));
+            o.status.code().unwrap_or(1)
+        }
         Err(e) => {
-            tracing::error!(mkfs = MKFS, err = %e, "ktstr-init: failed to spawn mkfs");
+            diag.push_str(&format!("MKFS_DIAG mkfs spawn failed: {e}\n"));
             1
         }
+    };
+    const BTRFS_DEV_MAGIC: u64 = 0x4D5F_5366_5248_425F;
+    let magic = read_dev_vda_magic();
+    let magic_present = magic.as_ref().is_ok_and(|&m| m == BTRFS_DEV_MAGIC);
+    diag.push_str(&format!(
+        "MKFS_DIAG in-guest /dev/vda magic@0x10040 = {}\n",
+        match &magic {
+            Ok(m) => format!("0x{m:016x}"),
+            Err(e) => format!("read failed: {e}"),
+        },
+    ));
+    // Only sync + run the no-op verdict on a clean mkfs exit; a non-zero
+    // mkfs exit propagates through the host's clean-exit gate
+    // (build_template_via_vm), which surfaces mkfs's stderr tail.
+    if code == 0 {
+        if let Some(flush_err) = flush_template_disk() {
+            diag.push_str(&format!("MKFS_DIAG flush: {flush_err}\n"));
+        }
+        // A clean mkfs exit that leaves /dev/vda WITHOUT the btrfs magic
+        // — in the guest's own page-cache view — is a silent no-op.
+        // Override to a distinct exit code so the host's clean-exit check
+        // reports it (the exit code is the only build-VM channel proven
+        // to survive force_reboot, so the verdict lands even if the COM2
+        // diag below is lost). Distinguishes a guest-side no-op from a
+        // host-side write loss (which Layer B's host-magic check catches).
+        if !magic_present {
+            diag.push_str(
+                "MKFS_DIAG VERDICT: mkfs exited 0 but /dev/vda has no btrfs magic \
+                 in-guest — silent no-op (exit overridden to 64)\n",
+            );
+            code = 64;
+        }
+    }
+    // Mirror the diag to COM2 (`/dev/ttyS1`) — the host's
+    // fault-diagnostic serial channel (the panic hook uses it),
+    // captured into `result.output` via `com2_bytes` in
+    // `collect_results`. COM2 is synchronous and survives the immediate
+    // `force_reboot`, unlike the bulk-port stdio forwarders.
+    if let Ok(mut com2) = std::fs::OpenOptions::new().write(true).open("/dev/ttyS1") {
+        use std::io::Write;
+        let _ = com2.write_all(diag.as_bytes());
+        let _ = com2.flush();
+    }
+    code
+}
+
+/// Read the 8-byte little-endian btrfs superblock magic at offset
+/// `0x10040` from `/dev/vda` as the guest sees it through the
+/// block-device page cache. Returns the raw `u64` (the caller compares
+/// it against the expected magic for the no-op verdict — a value
+/// compare, not a fragile string compare) or the io::Error if the
+/// device can't be opened/read. The build-VM diagnostic formats it to
+/// distinguish "mkfs wrote the magic but the host backing lost it" from
+/// "mkfs reported success without writing anything".
+fn read_dev_vda_magic() -> std::io::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open("/dev/vda")?;
+    f.seek(SeekFrom::Start(0x1_0040))?;
+    let mut buf = [0u8; 8];
+    f.read_exact(&mut buf)?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+/// Flush `/dev/vda` to the host backing before `force_reboot`'s
+/// `RB_AUTOBOOT` (which performs no sync). Belt-and-braces:
+/// `bdev_release` already `sync_blockdev`s the page cache when the
+/// last opener closes (block/bdev.c), so a normal buffered write is
+/// already durable on the host by the time mkfs exits — but a guest
+/// path that bypasses the bdev page cache (mmap, an O_DIRECT skip)
+/// would otherwise leave writes unflushed at reboot, and `RB_AUTOBOOT`
+/// abandons them (virtio_blk has no `.shutdown` op that drains IO).
+///
+/// Returns `None` on success or `Some(msg)` describing the failure.
+/// The caller folds the message into the COM2-mirrored diag rather
+/// than logging it: build-VM stderr is dropped at `force_reboot` (the
+/// bulk-port forwarders are not joined before the reboot), so a
+/// `tracing::error!` here would never reach the host.
+fn flush_template_disk() -> Option<String> {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/vda")
+    {
+        Ok(f) => f
+            .sync_all()
+            .err()
+            .map(|e| format!("sync_all(/dev/vda) failed: {e}")),
+        Err(e) => Some(format!("open(/dev/vda) for flush failed: {e}")),
     }
 }
 

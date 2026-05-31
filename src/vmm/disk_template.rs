@@ -518,18 +518,76 @@ fn lock_path_for_key(key: &str) -> Result<PathBuf> {
 
 /// Look up a cached template by key.
 ///
-/// Returns `Some(path)` if the template image exists and is
-/// readable, `None` otherwise (cache miss, partial install, or
-/// removed by hand). Callers materialize a miss via
-/// [`ensure_template`].
-pub(crate) fn lookup(key: &str) -> Result<Option<PathBuf>> {
+/// Returns `Some(path)` when a readable template image exists AND
+/// carries the filesystem's on-disk superblock magic. Returns `None`
+/// on a cache miss, a partial install, a removed-by-hand entry, OR a
+/// content-invalid image (wrong/missing magic — a 0-byte or torn
+/// template): a content-invalid hit is treated as a miss so
+/// [`ensure_template`] rebuilds and self-heals the cache. Propagates
+/// `Err` on an unexpected `stat(2)` failure (e.g. `EACCES`, `EIO`) — a
+/// broken cache root surfaces as a hard error rather than a silent
+/// miss. Callers materialize a miss via [`ensure_template`].
+pub(crate) fn lookup(fs: Filesystem, key: &str) -> Result<Option<PathBuf>> {
     let path = template_path_for_key(key)?;
     match std::fs::metadata(&path) {
-        Ok(meta) if meta.is_file() => Ok(Some(path)),
+        Ok(meta) if meta.is_file() => {
+            // Content-validate: confirm the cached image carries the
+            // filesystem's on-disk superblock magic. A 0-byte / all-zero
+            // template — an unformatted image a prior build published
+            // (the publish gate in build_template_via_vm now blocks
+            // that, but pre-fix caches and torn writes persist) — passes
+            // is_file() yet fails to mount: the guest kernel's superblock
+            // validator returns -EINVAL on the missing magic. Treat a
+            // mismatch as a MISS so ensure_template rebuilds,
+            // self-healing a stale cache without operator action.
+            let Some((offset, magic)) = fs.superblock_magic() else {
+                return Ok(Some(path));
+            };
+            match read_superblock_magic(&path, offset) {
+                Ok(found) if found == magic => Ok(Some(path)),
+                Ok(found) => {
+                    tracing::warn!(
+                        "cached disk template {} lacks the expected filesystem \
+                         superblock magic at offset {:#x} (found {:#018x}, expected \
+                         {:#018x}); treating as a cache miss and rebuilding",
+                        path.display(),
+                        offset,
+                        found,
+                        magic,
+                    );
+                    Ok(None)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "could not read cached disk template {} superblock magic \
+                         ({e:#}); treating as a cache miss and rebuilding",
+                        path.display(),
+                    );
+                    Ok(None)
+                }
+            }
+        }
         Ok(_) => Ok(None),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("stat cached template {path:?}")),
     }
+}
+
+/// Read the 8-byte little-endian superblock magic at `offset` from
+/// `path`. Shared by [`lookup`] (cache content validation) and
+/// [`build_template_via_vm`] (publish gate). A read that runs off the
+/// end of a short image surfaces as an `Err` (`UnexpectedEof`), which
+/// both callers treat as "not a valid template".
+fn read_superblock_magic(path: &Path, offset: u64) -> Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)
+        .with_context(|| format!("open template {path:?} for superblock magic check"))?;
+    f.seek(SeekFrom::Start(offset))
+        .with_context(|| format!("seek to superblock magic offset {offset:#x} in {path:?}"))?;
+    let mut buf = [0u8; 8];
+    f.read_exact(&mut buf)
+        .with_context(|| format!("read superblock magic at {offset:#x} in {path:?}"))?;
+    Ok(u64::from_le_bytes(buf))
 }
 
 /// Atomically install the file at `src_path` as the template for
@@ -545,6 +603,18 @@ pub(crate) fn lookup(key: &str) -> Result<Option<PathBuf>> {
 /// on partial failure the staging directory is removed by the
 /// caller (best-effort), and the live cache always sees either no
 /// entry or a complete entry — never a half-written one.
+///
+/// # Existing entry
+///
+/// When `<cache>/<key>` already exists the function re-validates the
+/// installed image against [`Filesystem::superblock_magic`] before
+/// publishing. A valid existing entry means a concurrent peer already
+/// published (or `lookup` accepted it): `src_path` is discarded and the
+/// existing path returned. An invalid existing entry — the stale
+/// zeros/torn image `lookup` rejected as a miss, which prompted this
+/// rebuild — is removed so the staging rename below installs the fresh
+/// image. Variants with no on-disk magic ([`Filesystem::Raw`]) skip the
+/// re-validation and always treat an existing entry as valid.
 ///
 /// # Failure cleanup
 ///
@@ -567,24 +637,52 @@ pub(crate) fn lookup(key: &str) -> Result<Option<PathBuf>> {
 /// Cleanup errors are best-effort because the original error is the
 /// dominant signal; a `remove_dir_all` failure on top of an already-
 /// failing publish adds no actionable diagnostic for the caller.
-pub(crate) fn store_atomic(key: &str, src_path: &Path) -> Result<PathBuf> {
+pub(crate) fn store_atomic(fs: Filesystem, key: &str, src_path: &Path) -> Result<PathBuf> {
     let root = cache_root()?;
     std::fs::create_dir_all(&root)
         .with_context(|| format!("create disk-template cache root {root:?}"))?;
     let final_dir = root.join(key);
     if final_dir.exists() {
-        // A peer published the entry between our lookup and store
-        // calls. Discard the new one — both should be byte-identical
-        // (same capacity, same fs, same mkfs.btrfs version on the
-        // host). Unlink our now-obsolete staging image before
-        // returning so it does not leak in the cache root: the
-        // success path below moves `src_path` into the staging
-        // directory via rename(2), but on this early return we never
-        // reach that rename and the source file would otherwise sit
-        // in the cache root forever (no other code path GCs an
-        // unattached staging image at this name).
-        let _ = std::fs::remove_file(src_path);
-        return Ok(final_dir.join(TEMPLATE_FILENAME));
+        // A pre-existing cache dir is EITHER a concurrent peer's valid
+        // publish (the race this originally guarded) OR a stale/invalid
+        // entry that [`lookup`]'s read-side validation rejected and the
+        // caller just rebuilt. Re-validate the existing template's
+        // superblock magic before honoring the discard-ours early
+        // return: if it is valid, the peer won and our rebuild is
+        // redundant (discard ours); if it is stale, OUR freshly-built
+        // image is the valid one and must replace the stale dir.
+        // Without this check the discard-ours path keeps a zeros/torn
+        // template alive forever, defeating lookup's self-heal.
+        //
+        // Race-safety: the caller holds the per-key flock
+        // (`ensure_template`), so any concurrent peer's rename has
+        // already completed before this read — `unwrap_or(false)` on a
+        // read error therefore covers only non-peer torn images
+        // (operator intervention, or an OS crash mid-rebuild by a prior
+        // process), never a peer mid-publish.
+        let existing = final_dir.join(TEMPLATE_FILENAME);
+        let existing_valid = match fs.superblock_magic() {
+            Some((offset, magic)) => read_superblock_magic(&existing, offset)
+                .map(|found| found == magic)
+                .unwrap_or(false),
+            None => true,
+        };
+        if existing_valid {
+            // Unlink our now-obsolete staging image before returning so
+            // it does not leak in the cache root (the success path below
+            // renames it into the staging dir; this early return skips
+            // that, and no other code path GCs it at this name).
+            let _ = std::fs::remove_file(src_path);
+            return Ok(existing);
+        }
+        // Stale/invalid existing entry — remove it and fall through to
+        // the rename below, which installs our valid rebuild. If the
+        // subsequent publish rename fails, `final_dir` is already gone
+        // and the next `ensure_template` observes the cache miss and
+        // rebuilds — the removal self-heals rather than stranding a
+        // half-state.
+        std::fs::remove_dir_all(&final_dir)
+            .with_context(|| format!("remove stale cache dir {final_dir:?} before replacing"))?;
     }
     // Pre-flight cross-filesystem check. `rename(2)` returns EXDEV
     // when src and dest live on different filesystems; the caller
@@ -801,10 +899,17 @@ pub(crate) fn clone_to_per_test(src_path: &Path, dest_path: &Path) -> Result<Fil
         .read(true)
         .open(src_path)
         .with_context(|| format!("open template source {src_path:?}"))?;
-    // O_CREAT | O_EXCL — surface stale leftover debris as EEXIST
-    // instead of silently overwriting. See "Stale per-test debris
-    // and EEXIST diagnostics" on this fn's doc comment.
+    // O_RDWR (not O_WRONLY): the returned fd becomes virtio-blk's
+    // backing store, which pread()s for guest READ requests — an
+    // O_WRONLY fd returns EBADF on every read, so the guest sees the
+    // disk as all-I/O-error and a btrfs mount fails EIO (silently
+    // falling back to the initramfs tmpfs). `.read(true)` is
+    // load-bearing; do not drop it. O_CREAT | O_EXCL (create_new)
+    // surfaces stale leftover debris as EEXIST instead of silently
+    // overwriting. See "Stale per-test debris and EEXIST diagnostics"
+    // on this fn's doc comment.
     let dest = OpenOptions::new()
+        .read(true)
         .write(true)
         .create_new(true)
         .open(dest_path)
@@ -1005,7 +1110,7 @@ pub(crate) fn ensure_template(fs: Filesystem, capacity_bytes: u64) -> Result<Pat
         None => NOVERSION_FP.to_string(),
     };
     let key = template_cache_key(fs, capacity_bytes, &version_fp);
-    if let Some(hit) = lookup(&key)? {
+    if let Some(hit) = lookup(fs, &key)? {
         return Ok(hit);
     }
     let root = cache_root()?;
@@ -1025,20 +1130,23 @@ pub(crate) fn ensure_template(fs: Filesystem, capacity_bytes: u64) -> Result<Pat
     let _lock = acquire_template_lock(&key)?;
     // Re-check after acquire — a peer may have published while we
     // waited.
-    if let Some(hit) = lookup(&key)? {
+    if let Some(hit) = lookup(fs, &key)? {
         return Ok(hit);
     }
     let staged = build_template_via_vm(fs, capacity_bytes, &root, &key)
         .with_context(|| format!("build disk template for {key}"))?;
-    // store_atomic moves `staged` into the cache via rename. On
-    // failure (cross-fs detection, staging-dir creation, the rename
-    // itself) `staged` is stranded: the per-key flock prevents a
-    // peer from observing a partial cache entry, but the in-flight
-    // file persists in the cache root until the next build. Unlink
-    // before propagating so retries find a clean root. Best-effort
-    // because the store_atomic error is the dominant signal — a
-    // remove_file failure here adds no actionable diagnostic.
-    let final_path = match store_atomic(&key, &staged) {
+    // store_atomic either renames `staged` into the cache (a miss, or
+    // replacing a stale/invalid existing entry) or discards it (a valid
+    // peer already published — store_atomic unlinks `staged` itself on
+    // that path). On failure (cross-fs detection, staging-dir creation,
+    // the rename itself) `staged` is stranded: the per-key flock
+    // prevents a peer from observing a partial cache entry, but the
+    // in-flight file persists in the cache root until the next build.
+    // Unlink before propagating so retries find a clean root.
+    // Best-effort because the store_atomic error is the dominant
+    // signal — a remove_file failure here adds no actionable
+    // diagnostic.
+    let final_path = match store_atomic(fs, &key, &staged) {
         Ok(p) => p,
         Err(e) => {
             let _ = std::fs::remove_file(&staged);
@@ -1287,8 +1395,25 @@ fn build_template_via_vm(
         .context("load busybox blob for disk-template build VM")?;
     let build_result = crate::vmm::KtstrVm::builder()
         .kernel(kernel)
+        // The build VM boots THIS binary as its guest /init: the ctor's
+        // PID==1 branch dispatches to ktstr_guest_init, which sees
+        // `KTSTR_MODE=disk_template` and runs mkfs against /dev/vda.
+        // Without an init_binary the builder loads NO initramfs at all
+        // (setup.rs gates both `rdinit=/init` and the initramfs blob on
+        // `init_binary.is_some()`), so the guest never reaches userspace,
+        // mkfs never runs, and the staging image stays zero — the root
+        // cause of the empty-template failure this whole path guards.
+        .init_binary(
+            crate::resolve_current_exe()
+                .context("resolve current exe as template-build VM /init")?,
+        )
         .topology(crate::vmm::Topology::new(1, 1, 1, 1))
-        .memory_mib(256)
+        // Defer + auto-size memory from the initramfs: with the test
+        // binary as /init (~47MiB) the initramfs is ~88MiB, which a
+        // fixed 256MiB VM cannot hold (the builder bails "insufficient
+        // for initramfs"). memory_deferred_min sizes to the payload
+        // (floor 256), matching the canonical test-VM path (runtime.rs).
+        .memory_deferred_min(256)
         .timeout(std::time::Duration::from_secs(120))
         .cmdline("KTSTR_MODE=disk_template")
         .disk(disk)
@@ -1330,12 +1455,50 @@ fn build_template_via_vm(
         bail!(
             "template-build VM did not complete cleanly \
              (timed_out={}, exit_code={}, success={}). \
-             Tail of guest stderr: {}",
+             Tail of guest output: {}",
             result.timed_out,
             result.exit_code,
             result.success,
-            tail_lines(&result.stderr, 20),
+            tail_lines(&result.output, 20),
         );
+    }
+    // Publish gate: a clean VM exit does NOT prove the in-guest mkfs
+    // wrote a valid superblock — a silent mkfs failure, or a build path
+    // that never reached mkfs, leaves the staging image unformatted.
+    // Caching an unformatted image strands every future per-test clone
+    // with a -EINVAL mount (the guest kernel's superblock validator
+    // rejects the missing magic). Validate the on-disk magic before the
+    // staging image can be published so a bad build never reaches the
+    // cache — and never re-publishes the stale-empty-template failure
+    // mode that motivated this gate.
+    if let Some((offset, magic)) = fs.superblock_magic() {
+        let found = match read_superblock_magic(&staging_path, offset) {
+            Ok(found) => found,
+            Err(e) => {
+                // A read error here (e.g. a short staging image from a
+                // half-completed mkfs) would otherwise leak the staging
+                // file across retries. Layer A treats a read error as a
+                // cache miss, but Layer B must propagate the unusual
+                // case — so remove the staging image before propagating
+                // so a retry finds a clean cache root.
+                let _ = std::fs::remove_file(&staging_path);
+                return Err(e).with_context(|| {
+                    format!("read superblock magic from freshly-built template {staging_path:?}")
+                });
+            }
+        };
+        if found != magic {
+            let _ = std::fs::remove_file(&staging_path);
+            bail!(
+                "template-build VM exited cleanly but the staging image at \
+                 {staging_path:?} lacks the {} superblock magic at offset {offset:#x} \
+                 (found {found:#018x}, expected {magic:#018x}) — the in-guest mkfs \
+                 reported success without writing a valid filesystem. Refusing to \
+                 cache an unformatted template.\nTail of build-VM guest output:\n{}",
+                fs.cache_tag(),
+                tail_lines(&result.output, 30),
+            );
+        }
     }
     Ok(staging_path)
 }

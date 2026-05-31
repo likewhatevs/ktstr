@@ -87,25 +87,60 @@ impl Filesystem {
     /// non-exhaustive-match build error rather than as a runtime
     /// "binary not found" diagnostic at template-build time.
     ///
-    /// # Two wiring points per variant
+    /// # Per-variant wiring points
     ///
-    /// Adding a new `Filesystem` variant that requires pre-formatting
-    /// requires updating BOTH `Filesystem::mkfs_binary_name` (here)
-    /// AND `mkfs_package_hint` in `src/vmm/disk_template.rs` (the
-    /// private companion fn used by
-    /// [`crate::vmm::disk_template::locate_host_mkfs`]). The latter
-    /// is the distro-package hint surfaced in the "binary not
-    /// found" diagnostic (e.g. `btrfs-progs` for `Btrfs`). Both are
-    /// exhaustive matches over `Filesystem`, so adding a variant
-    /// without filling in `mkfs_package_hint` is a
-    /// non-exhaustive-match build error; this paragraph exists so
-    /// an implementer reading the `mkfs_binary_name` definition
-    /// sees the second wiring point up front rather than
-    /// discovering it at compile time.
+    /// A new `Filesystem` variant that requires pre-formatting wires up
+    /// four per-variant match arms. All are exhaustive matches over
+    /// `Filesystem`, so a missing arm is a non-exhaustive-match build
+    /// error rather than a runtime surprise; this paragraph exists so an
+    /// implementer reading `mkfs_binary_name` sees the companions up
+    /// front:
+    ///
+    /// - `mkfs_binary_name` (here) — the `mkfs.<fstype>` binary name.
+    /// - `mkfs_package_hint` in `src/vmm/disk_template.rs` — the
+    ///   distro-package hint surfaced in the "binary not found"
+    ///   diagnostic (e.g. `btrfs-progs` for `Btrfs`), used by
+    ///   [`crate::vmm::disk_template::locate_host_mkfs`].
+    /// - [`superblock_magic`](Self::superblock_magic) — the on-disk
+    ///   magic that content-validates a built or cached image. A
+    ///   pre-formatting variant that returns `None` there skips
+    ///   content-validation, silently reviving the unformatted-image
+    ///   bug class for that variant.
+    /// - [`cache_tag`](Self::cache_tag) — the short identifier baked
+    ///   into the on-disk cache key.
     pub(crate) fn mkfs_binary_name(self) -> Option<&'static str> {
         match self {
             Filesystem::Raw => None,
             Filesystem::Btrfs => Some("mkfs.btrfs"),
+        }
+    }
+
+    /// On-disk superblock magic for content-validating a cached or
+    /// freshly-built template image, as `(byte_offset, magic_u64)`.
+    ///
+    /// The host reads 8 bytes at `byte_offset`, interprets them
+    /// little-endian, and compares to `magic_u64`. A 0-byte / all-zero
+    /// image — an unformatted staging file a prior build published, or a
+    /// torn write — reads back `0` and is rejected before it can strand
+    /// every per-test clone with a `-EINVAL` mount (the guest kernel's
+    /// superblock validator rejects the missing magic). Returns `None`
+    /// for variants with no on-disk filesystem ([`Filesystem::Raw`]),
+    /// which are never content-validated.
+    ///
+    /// btrfs: `magic` is a `__le64` whose value is `BTRFS_MAGIC =
+    /// 0x4D5F53665248425F` ("_BHRfS_M"). It sits at offset `0x10040` —
+    /// the superblock starts at `BTRFS_SUPER_INFO_OFFSET (65536)` and
+    /// `struct btrfs_super_block` places `magic` after `csum[32]` +
+    /// `fsid[16]` + `bytenr (8)` + `flags (8)` = +64. (Verified against
+    /// the kernel `include/uapi/linux/btrfs_tree.h` struct + the
+    /// `BTRFS_MAGIC` / `BTRFS_CSUM_SIZE` / `BTRFS_FSID_SIZE` defines.)
+    /// The guest kernel rejects a wrong magic in `btrfs_validate_super`
+    /// (fs/btrfs/disk-io.c) with `-EINVAL`; this host check fails the
+    /// same image up front.
+    pub(crate) fn superblock_magic(self) -> Option<(u64, u64)> {
+        match self {
+            Filesystem::Raw => None,
+            Filesystem::Btrfs => Some((0x1_0040, 0x4D5F_5366_5248_425F)),
         }
     }
 }

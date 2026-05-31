@@ -59,7 +59,7 @@ fn lookup_missing_returns_none() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let _guard =
         crate::test_support::test_helpers::EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
-    let result = lookup("missing-key").expect("lookup must not error on miss");
+    let result = lookup(Filesystem::Raw, "missing-key").expect("lookup must not error on miss");
     assert!(result.is_none());
 }
 
@@ -75,10 +75,10 @@ fn store_atomic_publishes_then_lookup_finds() {
     let staged = cache_root_path.join("staged.img");
     std::fs::write(&staged, b"FAKE_TEMPLATE_BODY").unwrap();
     let key = "test-key";
-    let installed = store_atomic(key, &staged).expect("store_atomic publishes");
+    let installed = store_atomic(Filesystem::Raw, key,&staged).expect("store_atomic publishes");
     assert!(installed.ends_with(format!("{key}/{TEMPLATE_FILENAME}")));
     // Now lookup must find it.
-    let found = lookup(key).expect("lookup ok").expect("lookup must hit");
+    let found = lookup(Filesystem::Raw, key).expect("lookup ok").expect("lookup must hit");
     assert_eq!(found, installed);
     // And content survived the rename.
     let body = std::fs::read(&found).unwrap();
@@ -86,11 +86,75 @@ fn store_atomic_publishes_then_lookup_finds() {
 }
 
 #[test]
+fn lookup_btrfs_rejects_magicless_template() {
+    // Layer A self-heal: a cached template lacking the btrfs superblock
+    // magic (a stale all-zero image a prior build published, or a torn
+    // write) must be reported as a MISS so ensure_template rebuilds —
+    // otherwise the guest mount fails -EINVAL on the missing magic.
+    // store_atomic does not validate content, so a magic-less body
+    // publishes; lookup(Btrfs, ...) must reject it while lookup(Raw,
+    // ...) (no content-validation) still finds it.
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let _guard =
+        crate::test_support::test_helpers::EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
+    let cache_root_path = cache_root().unwrap();
+    std::fs::create_dir_all(&cache_root_path).unwrap();
+    let staged = cache_root_path.join("staged.img");
+    // All-zero image larger than the magic offset — the stale-empty
+    // template shape that motivated the fix.
+    std::fs::write(&staged, vec![0u8; 0x1_0048]).unwrap();
+    let key = "btrfs-256m";
+    store_atomic(Filesystem::Raw, key,&staged).expect("store_atomic publishes");
+    assert!(
+        lookup(Filesystem::Raw, key)
+            .expect("raw lookup ok")
+            .is_some(),
+        "Raw lookup skips content-validation and finds the magic-less file",
+    );
+    assert!(
+        lookup(Filesystem::Btrfs, key)
+            .expect("btrfs lookup ok")
+            .is_none(),
+        "Btrfs lookup must reject a template lacking the superblock magic",
+    );
+}
+
+#[test]
+fn lookup_btrfs_accepts_magic_stamped_template() {
+    // Positive half: a template carrying the btrfs superblock magic at
+    // offset 0x10040 is a valid hit under Btrfs content-validation.
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let _guard =
+        crate::test_support::test_helpers::EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
+    let cache_root_path = cache_root().unwrap();
+    std::fs::create_dir_all(&cache_root_path).unwrap();
+    let staged = cache_root_path.join("staged.img");
+    let (offset, magic) = Filesystem::Btrfs
+        .superblock_magic()
+        .expect("btrfs declares a superblock magic");
+    let mut body = vec![0u8; offset as usize + 8];
+    body[offset as usize..offset as usize + 8].copy_from_slice(&magic.to_le_bytes());
+    std::fs::write(&staged, body).unwrap();
+    let key = "btrfs-256m";
+    store_atomic(Filesystem::Raw, key,&staged).expect("store_atomic publishes");
+    assert!(
+        lookup(Filesystem::Btrfs, key)
+            .expect("btrfs lookup ok")
+            .is_some(),
+        "Btrfs lookup must accept a template carrying the superblock magic",
+    );
+}
+
+#[test]
 fn store_atomic_idempotent_on_existing_entry() {
     // If a peer published between lookup() and store_atomic(),
     // the second store_atomic returns the existing path rather
-    // than raising — by design (both writes produce
-    // byte-identical templates for the same key).
+    // than raising. This test uses Filesystem::Raw, whose
+    // superblock_magic() is None, so F1's content re-validate is
+    // skipped and the legacy discard-ours early return holds (the
+    // existing entry wins, ours is discarded). On Filesystem::Btrfs,
+    // F1 re-validates the existing magic and REPLACES a stale entry
+    // instead — see store_atomic_replaces_stale_invalid_btrfs_entry.
     let tmp = tempfile::tempdir().expect("create tempdir");
     let _guard =
         crate::test_support::test_helpers::EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
@@ -99,12 +163,12 @@ fn store_atomic_idempotent_on_existing_entry() {
     let staged1 = cache_root_path.join("staged1.img");
     std::fs::write(&staged1, b"FIRST").unwrap();
     let key = "idem-key";
-    let installed1 = store_atomic(key, &staged1).unwrap();
+    let installed1 = store_atomic(Filesystem::Raw, key,&staged1).unwrap();
     // Second call with a different staging file must return the
     // already-installed path without overwriting it.
     let staged2 = cache_root_path.join("staged2.img");
     std::fs::write(&staged2, b"SECOND").unwrap();
-    let installed2 = store_atomic(key, &staged2).unwrap();
+    let installed2 = store_atomic(Filesystem::Raw, key,&staged2).unwrap();
     assert_eq!(installed1, installed2);
     // Content must remain "FIRST" — store_atomic on an existing
     // entry is a no-op publish.
@@ -121,6 +185,11 @@ fn store_atomic_idempotent_on_existing_entry() {
 /// debris sweep targets `template.img.in-flight.<key>.<pid>` and
 /// `<key>.tmp.<pid>` patterns, not the in-flight name the caller
 /// chose for `src_path`).
+///
+/// Uses `Filesystem::Raw` (superblock_magic() == None) so F1's content
+/// re-validate is skipped and the discard-ours-with-unlink path runs;
+/// on `Filesystem::Btrfs` a stale existing entry would be replaced
+/// instead (see store_atomic_replaces_stale_invalid_btrfs_entry).
 #[test]
 fn store_atomic_unlinks_src_on_idempotent_early_return() {
     let tmp = tempfile::tempdir().expect("create tempdir");
@@ -132,19 +201,64 @@ fn store_atomic_unlinks_src_on_idempotent_early_return() {
     let staged1 = cache_root_path.join("staged1.img");
     std::fs::write(&staged1, b"FIRST").unwrap();
     let key = "early-return-key";
-    store_atomic(key, &staged1).unwrap();
+    store_atomic(Filesystem::Raw, key,&staged1).unwrap();
     // Second call must observe the existing entry, return the
     // already-installed path, AND unlink staged2 so it does not
     // leak.
     let staged2 = cache_root_path.join("staged2.img");
     std::fs::write(&staged2, b"SECOND").unwrap();
-    store_atomic(key, &staged2).unwrap();
+    store_atomic(Filesystem::Raw, key,&staged2).unwrap();
     assert!(
         !staged2.exists(),
         "early-return path must unlink the obsolete staging image \
              at {staged2:?}; without this cleanup the cache root \
              accumulates orphan staging files across every concurrent \
              peer that loses the publish race",
+    );
+}
+
+#[test]
+fn store_atomic_replaces_stale_invalid_btrfs_entry() {
+    // F1: when a Btrfs cache entry already exists but is STALE (no
+    // valid superblock magic), store_atomic must REPLACE it with the
+    // freshly-built image — NOT discard the rebuild and re-bless the
+    // stale entry. Pins the exact failure mode #10 fixed (a 2-day-old
+    // all-zero template survived every rebuild because the discard-ours
+    // early return kept it). FAILS on the pre-F1 code.
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let _guard =
+        crate::test_support::test_helpers::EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
+    let cache_root_path = cache_root().unwrap();
+    std::fs::create_dir_all(&cache_root_path).unwrap();
+    let (offset, magic) = Filesystem::Btrfs
+        .superblock_magic()
+        .expect("btrfs declares a superblock magic");
+    let key = "btrfs-256m-stale-replace";
+    // Pre-seed a STALE cache dir: template.img is all-zero (no magic).
+    let final_dir = cache_root_path.join(key);
+    std::fs::create_dir_all(&final_dir).unwrap();
+    std::fs::write(
+        final_dir.join(TEMPLATE_FILENAME),
+        vec![0u8; offset as usize + 8],
+    )
+    .unwrap();
+    // A fresh staging image carrying the correct btrfs magic.
+    let staged = cache_root_path.join("staged.img");
+    let mut fresh = vec![0u8; offset as usize + 8];
+    fresh[offset as usize..offset as usize + 8].copy_from_slice(&magic.to_le_bytes());
+    std::fs::write(&staged, &fresh).unwrap();
+    // store_atomic with Btrfs MUST replace the stale entry.
+    let installed = store_atomic(Filesystem::Btrfs, key, &staged).expect("replace stale entry");
+    let installed_bytes = std::fs::read(&installed).unwrap();
+    assert_eq!(
+        &installed_bytes[offset as usize..offset as usize + 8],
+        &magic.to_le_bytes(),
+        "F1 must replace the stale cache entry with the fresh rebuild's magic, \
+         not keep the stale zeros",
+    );
+    assert!(
+        !staged.exists(),
+        "the fresh staging image must be consumed by the install rename",
     );
 }
 
@@ -865,13 +979,13 @@ fn clean_all_removes_published_entry() {
     std::fs::create_dir_all(&cache_root_path).unwrap();
     let staged = cache_root_path.join("staged.img");
     std::fs::write(&staged, b"FAKE_TEMPLATE").unwrap();
-    let installed = store_atomic("btrfs-256m", &staged).expect("store_atomic publishes");
+    let installed = store_atomic(Filesystem::Raw, "btrfs-256m",&staged).expect("store_atomic publishes");
     assert!(installed.is_file());
     let count = clean_all().expect("clean_all must succeed");
     assert_eq!(count, 1, "exactly one published entry removed");
     // The published entry directory is gone.
     assert!(
-        lookup("btrfs-256m").expect("lookup ok").is_none(),
+        lookup(Filesystem::Raw, "btrfs-256m").expect("lookup ok").is_none(),
         "published entry must be gone after clean_all",
     );
     // But the lockfile inode survives.
@@ -940,7 +1054,7 @@ fn clean_all_skips_entry_locked_by_live_peer() {
     std::fs::create_dir_all(&cache_root_path).unwrap();
     let staged = cache_root_path.join("staged.img");
     std::fs::write(&staged, b"FAKE_TEMPLATE").unwrap();
-    let installed = store_atomic("btrfs-256m", &staged).expect("store_atomic publishes");
+    let installed = store_atomic(Filesystem::Raw, "btrfs-256m",&staged).expect("store_atomic publishes");
     assert!(installed.is_file());
     // Hold the per-key flock from this process. `clean_all`'s
     // `try_flock(LOCK_EX|LOCK_NB)` against the same file
@@ -952,7 +1066,7 @@ fn clean_all_skips_entry_locked_by_live_peer() {
     assert_eq!(count, 0, "locked entry must not be removed by clean_all",);
     // And the entry directory must still be on disk.
     assert!(
-        lookup("btrfs-256m").expect("lookup ok").is_some(),
+        lookup(Filesystem::Raw, "btrfs-256m").expect("lookup ok").is_some(),
         "locked entry must survive clean_all",
     );
 }
@@ -973,14 +1087,14 @@ fn clean_all_sweeps_debris_alongside_published_entries() {
     // Published entry.
     let staged = cache_root_path.join("staged.img");
     std::fs::write(&staged, b"FAKE_TEMPLATE").unwrap();
-    store_atomic("btrfs-256m", &staged).unwrap();
+    store_atomic(Filesystem::Raw, "btrfs-256m",&staged).unwrap();
     // Dead-pid staging image debris.
     let dead_pid = i32::MAX;
     let debris = cache_root_path.join(format!("template.img.in-flight.btrfs-1024m.{dead_pid}",));
     std::fs::write(&debris, b"DEBRIS").unwrap();
     // Sanity: both exist before clean_all.
     assert!(debris.is_file());
-    assert!(lookup("btrfs-256m").unwrap().is_some());
+    assert!(lookup(Filesystem::Raw, "btrfs-256m").unwrap().is_some());
     let count = clean_all().expect("clean_all must succeed");
     // The returned count covers published entries only (1).
     // The debris removal is documented in clean_all's body
@@ -993,7 +1107,7 @@ fn clean_all_sweeps_debris_alongside_published_entries() {
         "debris must be removed by the embedded sweep",
     );
     assert!(
-        lookup("btrfs-256m").unwrap().is_none(),
+        lookup(Filesystem::Raw, "btrfs-256m").unwrap().is_none(),
         "published entry must be removed by clean_all",
     );
 }

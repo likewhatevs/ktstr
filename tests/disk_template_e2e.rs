@@ -118,36 +118,10 @@ const KTSTR_DISK_BTRFS: ktstr::prelude::DiskConfig = ktstr::prelude::DiskConfig 
 fn scenario_btrfs_filesystem_visible_at_dev_vda(
     _ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
-    use std::ffi::CString;
-
     // The auto-mount path is `/mnt/disk0` for an unnamed disk
-    // (per `DiskConfig::auto_mount_path`). Statfs the mount point
+    // (per `DiskConfig::auto_mount_path`). statfs the mount point
     // and verify f_type == BTRFS_SUPER_MAGIC.
-    let mount_point = CString::new("/mnt/disk0").expect("/mnt/disk0 contains no nul bytes");
-    // SAFETY: statfs writes into a stack-allocated zero-initialized
-    // buffer of the correct layout. The CString is NUL-terminated
-    // for the duration of the call. The kernel returns 0 on success
-    // and -1 with errno set on failure.
-    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::statfs(mount_point.as_ptr(), &mut buf) };
-    if rc != 0 {
-        let errno = std::io::Error::last_os_error();
-        anyhow::bail!(
-            "statfs(/mnt/disk0) failed: {errno}. The disk-template \
-             auto-mount must succeed before the scenario runs — \
-             check that the framework wired Filesystem::Btrfs through \
-             ensure_template and that the guest kernel has \
-             CONFIG_BTRFS_FS."
-        );
-    }
-
-    // Cast f_type through `i64` to match the host-side constant
-    // (which is documented as `__fsword_t`-compatible on 64-bit
-    // Linux). Comparing the raw `f_type` (which is `i64` on
-    // x86_64/aarch64 64-bit Linux) avoids the host-side
-    // sign-extension trap that motivates the `compile_error!` in
-    // `disk_template.rs`.
-    let fs_type = buf.f_type;
+    let fs_type = statfs_f_type("/mnt/disk0")?;
     if fs_type != BTRFS_SUPER_MAGIC {
         anyhow::bail!(
             "/mnt/disk0 has statfs.f_type=0x{fs_type:x}, expected \
@@ -157,7 +131,11 @@ fn scenario_btrfs_filesystem_visible_at_dev_vda(
              (a) the template-build VM ran but mkfs.btrfs reported \
              success without formatting, (b) FICLONE produced a \
              zeroed image instead of a clone, (c) the guest mounted \
-             a different filesystem (check dmesg for mount errors).",
+             a different filesystem (check dmesg for mount errors), \
+             (d) the per-test backing fd was opened without read \
+             access (O_WRONLY) so virtio-blk reads return EBADF and \
+             the guest btrfs mount fails EIO (see clone_to_per_test \
+             OpenOptions).",
         );
     }
 
@@ -167,6 +145,35 @@ fn scenario_btrfs_filesystem_visible_at_dev_vda(
          (build, atomic install, FICLONE) produced a \
          pre-formatted btrfs filesystem on /dev/vda"
     )))
+}
+
+/// statfs a mount point and return its `f_type`. Extracted so both
+/// the template-build test and the FICLONE-clone test gate on
+/// `BTRFS_SUPER_MAGIC` without duplicating the unsafe statfs call.
+fn statfs_f_type(mount_point: &str) -> Result<i64> {
+    use std::ffi::CString;
+    let c = CString::new(mount_point)
+        .map_err(|e| anyhow::anyhow!("mount point {mount_point:?} contains a nul byte: {e}"))?;
+    // SAFETY: statfs writes into a stack-allocated zero-initialized
+    // buffer of the correct layout. The CString is NUL-terminated for
+    // the duration of the call. The kernel returns 0 on success and
+    // -1 with errno set on failure.
+    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statfs(c.as_ptr(), &mut buf) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!(
+            "statfs({mount_point}) failed: {}. The disk-template \
+             auto-mount must succeed before the scenario runs — check \
+             that the framework wired Filesystem::Btrfs through \
+             ensure_template and that the guest kernel has \
+             CONFIG_BTRFS_FS.",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // `f_type` is `__fsword_t` (i64 on x86_64/aarch64 64-bit Linux),
+    // matching the host-side `BTRFS_SUPER_MAGIC` constant's type — the
+    // caller compares raw without a sign-extension cast.
+    Ok(buf.f_type)
 }
 
 // ----------------------------------------------------------------------------
@@ -217,6 +224,27 @@ fn scenario_ficlone_clone_writable_and_fresh(_ctx: &ktstr::scenario::Ctx) -> Res
              btrfs disk-template clone failed. Check guest dmesg \
              for mount errors and verify CONFIG_BTRFS_FS in the \
              guest kernel.",
+        );
+    }
+
+    // Defense in depth against the FICLONE backing-fd access-mode
+    // regression: the per-test clone fd must be O_RDWR so virtio-blk
+    // can pread() guest reads. If it were O_WRONLY, every guest read
+    // returns EBADF, the btrfs mount fails EIO, and /mnt/disk0 falls
+    // back to the initramfs tmpfs rootfs — on which the sentinel
+    // write/read below would still succeed, masking the bug. statfs the
+    // mount and require BTRFS_SUPER_MAGIC so this test fails loudly
+    // instead of silently passing on a tmpfs fallback.
+    let fs_type = statfs_f_type("/mnt/disk0")?;
+    if fs_type != BTRFS_SUPER_MAGIC {
+        anyhow::bail!(
+            "/mnt/disk0 has statfs.f_type=0x{fs_type:x}, expected \
+             BTRFS_SUPER_MAGIC=0x{BTRFS_SUPER_MAGIC:x}. The FICLONE \
+             per-test clone did not mount as btrfs — most likely the \
+             per-test backing fd was opened without read access \
+             (clone_to_per_test OpenOptions missing .read(true)), so \
+             virtio-blk reads return EBADF and the guest btrfs mount \
+             fails EIO, falling back to tmpfs.",
         );
     }
 
@@ -327,7 +355,7 @@ static __KTSTR_ENTRY_FICLONE_CLONE_ISOLATED: ktstr::test_support::KtstrTestEntry
 // ----------------------------------------------------------------------------
 //
 // Both scenarios above are registered with the `KTSTR_TESTS`
-// distributed_slice and run via `cargo ktstr test --filter <name>`,
+// distributed_slice and run via `cargo ktstr test -- -E 'test(<name>)'`,
 // which is the canonical entry for tests that need a real KVM VM
 // (matches `vm_integration.rs`, `failure_dump_e2e.rs`).
 
@@ -358,8 +386,8 @@ fn drive_ktstr_test(scenario_name: &str) {
         .arg("--kernel")
         .arg(&source)
         .arg("--")
-        .arg("--filter")
-        .arg(scenario_name)
+        .arg("-E")
+        .arg(format!("test({scenario_name})"))
         .output()
         .expect("spawn cargo-ktstr test");
 
@@ -367,7 +395,7 @@ fn drive_ktstr_test(scenario_name: &str) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "cargo ktstr test --filter {scenario_name} failed (exit={:?})\n\
+        "cargo ktstr test -E 'test({scenario_name})' failed (exit={:?})\n\
          STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}",
         output.status.code(),
     );
