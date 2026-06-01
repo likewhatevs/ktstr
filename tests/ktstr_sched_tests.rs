@@ -49,13 +49,32 @@ fn sched_dynamic_add(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
-fn scenario_bpf_api(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::AssertResult> {
+fn bpf_api_scenario(
+    ctx: &ktstr::scenario::Ctx,
+    hold: HoldSpec,
+) -> Result<ktstr::assert::AssertResult> {
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
-        hold: HoldSpec::FULL,
+        hold,
     }];
     execute_steps(ctx, steps)
+}
+
+/// Stall-test scenario: holds for the full duration so the host's
+/// `stall=1` write, the scheduler's resulting stall, and the
+/// scx-watchdog teardown all fit inside the scenario window.
+fn scenario_bpf_api(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::AssertResult> {
+    bpf_api_scenario(ctx, HoldSpec::FULL)
+}
+
+/// Link-test scenario: a short fixed hold. The no-op map write only
+/// needs to complete and the scenario to publish a result; the
+/// cold-BTF `bpf_map_write` phase-1 latency is absorbed by the
+/// vm_timeout floor (`vm_timeout_from_entry` adds it for every
+/// bpf_map_write entry), not by this entry's duration.
+fn scenario_bpf_api_link(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::AssertResult> {
+    bpf_api_scenario(ctx, HoldSpec::fixed(std::time::Duration::from_secs(2)))
 }
 
 /// Write stall=0 to the .bss map after scenario starts.
@@ -68,12 +87,17 @@ static BPF_NOOP: BpfMapWrite = BpfMapWrite::new(".bss", 0, 0);
 static __KTSTR_ENTRY_BPF_API: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "sched_bpf_map_api_integration",
-        func: scenario_bpf_api,
+        func: scenario_bpf_api_link,
         scheduler: &KTSTR_SCHED,
         auto_repro: false,
         assert: ktstr::assert::Assert::NO_OVERRIDES.fail_on_stall(false),
         bpf_map_write: &[&BPF_NOOP],
-        duration: std::time::Duration::from_secs(10),
+        // The link scenario holds a fixed 2s. The cold-BTF
+        // bpf_map_write phase-1 latency (the wait_for_map_write block
+        // before the workload) is covered by the vm_timeout floor
+        // vm_timeout_from_entry applies to every bpf_map_write entry —
+        // not by this duration.
+        duration: std::time::Duration::from_secs(2),
         watchdog_timeout: std::time::Duration::from_secs(15),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };

@@ -633,14 +633,32 @@ pub(crate) fn vm_boot_headroom(vcpus: u32) -> Duration {
     KERNEL_INIT_HEADROOM + Duration::from_millis(sys_rdy_budget_ms(vcpus))
 }
 
-/// Derive the host-side VM timeout from the test entry's watchdog
-/// and duration. Adds vCPU-scaled boot headroom so the workload gets
-/// its full duration even after a slow boot on a large topology.
+/// Worst-case host-side latency the guest's `wait_for_map_write` latch
+/// blocks on before a `bpf_map_write` test's workload runs: the host
+/// builds the BPF-map accessor (ELF + BTF parse + symbol HashMap, ~4 s
+/// on a debug vmlinux per the freeze-coord accessor-init comment) in a
+/// retry loop bounded by a 30 s `phase1_deadline`. Under heavy `-j16`
+/// host-compile contention the parse scales and a cold vmlinux read adds
+/// seconds, so the latch can block up to that deadline. Added to the
+/// workload budget for any entry declaring a `bpf_map_write` — a
+/// framework cost every such test pays, not a per-test concern the
+/// author must remember to budget for.
+const COLD_BTF_PHASE1_BUDGET: Duration = Duration::from_secs(30);
+
+/// Derive the host-side VM timeout from the test entry's watchdog and
+/// duration. Adds vCPU-scaled boot headroom so the workload gets its
+/// full duration even after a slow boot on a large topology, plus
+/// [`COLD_BTF_PHASE1_BUDGET`] when the entry declares a `bpf_map_write`
+/// (the guest blocks on the host's cold-BTF accessor build before the
+/// workload starts).
 pub(crate) fn vm_timeout_from_entry(entry: &super::entry::KtstrTestEntry) -> Duration {
-    let base = entry
+    let mut base = entry
         .watchdog_timeout
         .max(entry.duration)
         .max(Duration::from_secs(1));
+    if !entry.bpf_map_write.is_empty() {
+        base += COLD_BTF_PHASE1_BUDGET;
+    }
     base + vm_boot_headroom(entry.topology.total_cpus())
 }
 
@@ -823,6 +841,30 @@ mod tests {
     use super::super::entry::Scheduler;
     use super::super::test_helpers::{EnvVarGuard, lock_env};
     use super::*;
+
+    #[test]
+    fn vm_timeout_from_entry_adds_cold_btf_budget_for_bpf_map_write() {
+        use super::super::entry::{BpfMapWrite, KtstrTestEntry};
+        static W: BpfMapWrite = BpfMapWrite::new(".bss", 0, 0);
+        static WS: &[&BpfMapWrite] = &[&W];
+        let no_write = KtstrTestEntry {
+            name: "no_write",
+            ..KtstrTestEntry::DEFAULT
+        };
+        let with_write = KtstrTestEntry {
+            name: "with_write",
+            bpf_map_write: WS,
+            ..KtstrTestEntry::DEFAULT
+        };
+        // The cold-BTF phase-1 budget is added to the workload base only
+        // when the entry declares a host-side bpf_map_write; the delta
+        // between an otherwise-identical pair is exactly that budget.
+        assert_eq!(
+            vm_timeout_from_entry(&with_write),
+            vm_timeout_from_entry(&no_write) + COLD_BTF_PHASE1_BUDGET,
+            "bpf_map_write entries get the cold-BTF phase-1 budget added",
+        );
+    }
 
     #[test]
     fn no_perf_mode_active_true_when_env_set_to_value() {
