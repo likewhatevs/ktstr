@@ -2338,7 +2338,14 @@ mod tests {
                 .init_binary(&exe)
                 .topology(Topology::new(1, 1, 2, 1))
                 .memory_deferred()
-                .timeout(Duration::from_secs(5))
+                // 15s window (was 5s): the monitor must catch at least one
+                // sample after the kernel builds the sched_domain tree,
+                // which lands late in boot (post-SMP-bringup). A 5s window
+                // flaked on slow hosts where boot consumed it before rq.sd
+                // populated. watchdog_timeout is the guest scx stall
+                // detector, inert here (no scheduler), so only this timeout
+                // bounds the run.
+                .timeout(Duration::from_secs(15))
                 .watchdog_timeout(Duration::from_secs(2))
                 .build()
         );
