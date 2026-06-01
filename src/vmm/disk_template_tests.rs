@@ -75,10 +75,12 @@ fn store_atomic_publishes_then_lookup_finds() {
     let staged = cache_root_path.join("staged.img");
     std::fs::write(&staged, b"FAKE_TEMPLATE_BODY").unwrap();
     let key = "test-key";
-    let installed = store_atomic(Filesystem::Raw, key,&staged).expect("store_atomic publishes");
+    let installed = store_atomic(Filesystem::Raw, key, &staged).expect("store_atomic publishes");
     assert!(installed.ends_with(format!("{key}/{TEMPLATE_FILENAME}")));
     // Now lookup must find it.
-    let found = lookup(Filesystem::Raw, key).expect("lookup ok").expect("lookup must hit");
+    let found = lookup(Filesystem::Raw, key)
+        .expect("lookup ok")
+        .expect("lookup must hit");
     assert_eq!(found, installed);
     // And content survived the rename.
     let body = std::fs::read(&found).unwrap();
@@ -104,7 +106,7 @@ fn lookup_btrfs_rejects_magicless_template() {
     // template shape that motivated the fix.
     std::fs::write(&staged, vec![0u8; 0x1_0048]).unwrap();
     let key = "btrfs-256m";
-    store_atomic(Filesystem::Raw, key,&staged).expect("store_atomic publishes");
+    store_atomic(Filesystem::Raw, key, &staged).expect("store_atomic publishes");
     assert!(
         lookup(Filesystem::Raw, key)
             .expect("raw lookup ok")
@@ -136,7 +138,7 @@ fn lookup_btrfs_accepts_magic_stamped_template() {
     body[offset as usize..offset as usize + 8].copy_from_slice(&magic.to_le_bytes());
     std::fs::write(&staged, body).unwrap();
     let key = "btrfs-256m";
-    store_atomic(Filesystem::Raw, key,&staged).expect("store_atomic publishes");
+    store_atomic(Filesystem::Raw, key, &staged).expect("store_atomic publishes");
     assert!(
         lookup(Filesystem::Btrfs, key)
             .expect("btrfs lookup ok")
@@ -163,12 +165,12 @@ fn store_atomic_idempotent_on_existing_entry() {
     let staged1 = cache_root_path.join("staged1.img");
     std::fs::write(&staged1, b"FIRST").unwrap();
     let key = "idem-key";
-    let installed1 = store_atomic(Filesystem::Raw, key,&staged1).unwrap();
+    let installed1 = store_atomic(Filesystem::Raw, key, &staged1).unwrap();
     // Second call with a different staging file must return the
     // already-installed path without overwriting it.
     let staged2 = cache_root_path.join("staged2.img");
     std::fs::write(&staged2, b"SECOND").unwrap();
-    let installed2 = store_atomic(Filesystem::Raw, key,&staged2).unwrap();
+    let installed2 = store_atomic(Filesystem::Raw, key, &staged2).unwrap();
     assert_eq!(installed1, installed2);
     // Content must remain "FIRST" — store_atomic on an existing
     // entry is a no-op publish.
@@ -201,13 +203,13 @@ fn store_atomic_unlinks_src_on_idempotent_early_return() {
     let staged1 = cache_root_path.join("staged1.img");
     std::fs::write(&staged1, b"FIRST").unwrap();
     let key = "early-return-key";
-    store_atomic(Filesystem::Raw, key,&staged1).unwrap();
+    store_atomic(Filesystem::Raw, key, &staged1).unwrap();
     // Second call must observe the existing entry, return the
     // already-installed path, AND unlink staged2 so it does not
     // leak.
     let staged2 = cache_root_path.join("staged2.img");
     std::fs::write(&staged2, b"SECOND").unwrap();
-    store_atomic(Filesystem::Raw, key,&staged2).unwrap();
+    store_atomic(Filesystem::Raw, key, &staged2).unwrap();
     assert!(
         !staged2.exists(),
         "early-return path must unlink the obsolete staging image \
@@ -979,13 +981,16 @@ fn clean_all_removes_published_entry() {
     std::fs::create_dir_all(&cache_root_path).unwrap();
     let staged = cache_root_path.join("staged.img");
     std::fs::write(&staged, b"FAKE_TEMPLATE").unwrap();
-    let installed = store_atomic(Filesystem::Raw, "btrfs-256m",&staged).expect("store_atomic publishes");
+    let installed =
+        store_atomic(Filesystem::Raw, "btrfs-256m", &staged).expect("store_atomic publishes");
     assert!(installed.is_file());
     let count = clean_all().expect("clean_all must succeed");
     assert_eq!(count, 1, "exactly one published entry removed");
     // The published entry directory is gone.
     assert!(
-        lookup(Filesystem::Raw, "btrfs-256m").expect("lookup ok").is_none(),
+        lookup(Filesystem::Raw, "btrfs-256m")
+            .expect("lookup ok")
+            .is_none(),
         "published entry must be gone after clean_all",
     );
     // But the lockfile inode survives.
@@ -1054,7 +1059,8 @@ fn clean_all_skips_entry_locked_by_live_peer() {
     std::fs::create_dir_all(&cache_root_path).unwrap();
     let staged = cache_root_path.join("staged.img");
     std::fs::write(&staged, b"FAKE_TEMPLATE").unwrap();
-    let installed = store_atomic(Filesystem::Raw, "btrfs-256m",&staged).expect("store_atomic publishes");
+    let installed =
+        store_atomic(Filesystem::Raw, "btrfs-256m", &staged).expect("store_atomic publishes");
     assert!(installed.is_file());
     // Hold the per-key flock from this process. `clean_all`'s
     // `try_flock(LOCK_EX|LOCK_NB)` against the same file
@@ -1066,7 +1072,9 @@ fn clean_all_skips_entry_locked_by_live_peer() {
     assert_eq!(count, 0, "locked entry must not be removed by clean_all",);
     // And the entry directory must still be on disk.
     assert!(
-        lookup(Filesystem::Raw, "btrfs-256m").expect("lookup ok").is_some(),
+        lookup(Filesystem::Raw, "btrfs-256m")
+            .expect("lookup ok")
+            .is_some(),
         "locked entry must survive clean_all",
     );
 }
@@ -1087,7 +1095,7 @@ fn clean_all_sweeps_debris_alongside_published_entries() {
     // Published entry.
     let staged = cache_root_path.join("staged.img");
     std::fs::write(&staged, b"FAKE_TEMPLATE").unwrap();
-    store_atomic(Filesystem::Raw, "btrfs-256m",&staged).unwrap();
+    store_atomic(Filesystem::Raw, "btrfs-256m", &staged).unwrap();
     // Dead-pid staging image debris.
     let dead_pid = i32::MAX;
     let debris = cache_root_path.join(format!("template.img.in-flight.btrfs-1024m.{dead_pid}",));

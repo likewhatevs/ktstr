@@ -2097,8 +2097,7 @@ fn pinned_error_arena_btf_offsets_unavailable() {
 #[test]
 fn pinned_error_array_truncation() {
     let max_entries: u32 = 9000;
-    let rendered =
-        format!("ARRAY truncated at {MAX_ARRAY_KEYS} keys (max_entries={max_entries})");
+    let rendered = format!("ARRAY truncated at {MAX_ARRAY_KEYS} keys (max_entries={max_entries})");
     assert_eq!(
         rendered, "ARRAY truncated at 4096 keys (max_entries=9000)",
         "ARRAY truncation string OR MAX_ARRAY_KEYS drifted from pin",

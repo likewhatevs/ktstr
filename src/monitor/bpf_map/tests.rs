@@ -2318,9 +2318,18 @@ fn read_bpf_map_array_value_per_key() {
     };
 
     let ctx = value_ctx(&mem, cr3_pa, false);
-    assert_eq!(read_bpf_map_array_value(&ctx, &info, 0), Some(vec![0x11; 4]));
-    assert_eq!(read_bpf_map_array_value(&ctx, &info, 1), Some(vec![0x22; 4]));
-    assert_eq!(read_bpf_map_array_value(&ctx, &info, 2), Some(vec![0x33; 4]));
+    assert_eq!(
+        read_bpf_map_array_value(&ctx, &info, 0),
+        Some(vec![0x11; 4])
+    );
+    assert_eq!(
+        read_bpf_map_array_value(&ctx, &info, 1),
+        Some(vec![0x22; 4])
+    );
+    assert_eq!(
+        read_bpf_map_array_value(&ctx, &info, 2),
+        Some(vec![0x33; 4])
+    );
     // key >= max_entries → None (replicates array_map_lookup_elem's
     // pre-mask range check; never clamps).
     assert_eq!(read_bpf_map_array_value(&ctx, &info, 3), None);
