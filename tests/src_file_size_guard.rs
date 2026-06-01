@@ -99,7 +99,6 @@ const EXCEPTIONS: &[(&str, usize)] = &[
     ("monitor/scx_walker.rs", 3055),
     ("host_context.rs", 3041), // queued: split into submodules
     ("test_support/probe.rs", 3027),
-    ("monitor/tests.rs", 3015), // queued: split into submodules
 ];
 
 /// Resolve `<repo>/src` from `CARGO_MANIFEST_DIR`. Cargo always

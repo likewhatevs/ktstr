@@ -40,10 +40,28 @@ pub mod task_enrichment;
 pub mod timeline;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod test_util;
 
 #[cfg(test)]
-pub(crate) mod test_util;
+mod enforce_tests;
+#[cfg(test)]
+mod evaluate_helpers_tests;
+#[cfg(test)]
+mod event_rates_tests;
+#[cfg(test)]
+mod kernel_hz_tests;
+#[cfg(test)]
+mod schedstat_tests;
+#[cfg(test)]
+mod stall_detection_tests;
+#[cfg(test)]
+mod summary_tests;
+#[cfg(test)]
+mod sustained_tracker_tests;
+#[cfg(test)]
+mod thresholds_tests;
+#[cfg(test)]
+mod validity_tests;
 
 /// Guest physical address of the top-level page-table page (CR3 on x86,
 /// TTBR1 on aarch64). Newtype around `u64` so address kinds can't
@@ -1377,12 +1395,9 @@ impl MonitorThresholds {
     /// surfaces this distinction explicitly so the operator triages
     /// it instead of shipping on a non-measurement.
     pub fn evaluate(&self, report: &MonitorReport) -> MonitorVerdict {
-        let mut details = Vec::new();
-
         if report.samples.is_empty() {
             return MonitorVerdict::inconclusive("no monitor samples");
         }
-
         // Validity check: detect uninitialized guest memory.
         // If all rq_clock values across every CPU in every sample are
         // identical, the kernel never wrote to these fields — the monitor
@@ -1391,22 +1406,99 @@ impl MonitorThresholds {
             return MonitorVerdict::inconclusive("monitor data not yet initialized");
         }
 
+        let mut details = Vec::new();
+        let mut failed = false;
+
+        let (imbalance, dsq, worst_dsq_cpu) = self.track_imbalance_and_dsq(&report.samples);
+        if imbalance.sustained(self.sustained_samples) {
+            failed = true;
+            details.push(format!(
+                "imbalance ratio {:.1} exceeded threshold {:.1} for {} consecutive samples (ending at sample {})",
+                imbalance.worst_value,
+                self.max_imbalance_ratio,
+                imbalance.worst_run,
+                imbalance.worst_at,
+            ));
+        }
+        if dsq.sustained(self.sustained_samples) {
+            failed = true;
+            details.push(format!(
+                "local DSQ depth {} on cpu{} exceeded threshold {} for {} consecutive samples (ending at sample {})",
+                dsq.worst_value as u32,
+                worst_dsq_cpu,
+                self.max_local_dsq_depth,
+                dsq.worst_run,
+                dsq.worst_at,
+            ));
+        }
+
+        if self.fail_on_stall {
+            for (cpu, tracker) in self.track_stall(report).iter().enumerate() {
+                if tracker.sustained(self.sustained_samples) {
+                    failed = true;
+                    details.push(format!(
+                        "rq_clock stall on cpu{} for {} consecutive samples (ending at sample {}, clock={})",
+                        cpu,
+                        tracker.worst_run,
+                        tracker.worst_at,
+                        tracker.worst_value as u64,
+                    ));
+                }
+            }
+        }
+
+        let (fallback_rate, keep_last_rate) = self.track_event_rates(&report.samples);
+        if fallback_rate.sustained(self.sustained_samples) {
+            failed = true;
+            details.push(format!(
+                "fallback rate {:.1}/s exceeded threshold {:.1}/s for {} consecutive intervals (ending at sample {})",
+                fallback_rate.worst_value,
+                self.max_fallback_rate,
+                fallback_rate.worst_run,
+                fallback_rate.worst_at,
+            ));
+        }
+        if keep_last_rate.sustained(self.sustained_samples) {
+            failed = true;
+            details.push(format!(
+                "keep_last rate {:.1}/s exceeded threshold {:.1}/s for {} consecutive intervals (ending at sample {})",
+                keep_last_rate.worst_value,
+                self.max_keep_last_rate,
+                keep_last_rate.worst_run,
+                keep_last_rate.worst_at,
+            ));
+        }
+
+        MonitorVerdict {
+            passed: !failed || !self.enforce,
+            inconclusive: false,
+            summary: Self::summarize(failed, self.enforce, details.len()),
+            details,
+        }
+    }
+
+    /// Per-sample loop that tracks imbalance ratio and worst-CPU DSQ
+    /// depth against their thresholds. Returns the (imbalance, dsq,
+    /// worst_dsq_cpu) trio in the same shape the inline form used —
+    /// extracted for readability and direct unit-test coverage.
+    fn track_imbalance_and_dsq(
+        &self,
+        samples: &[MonitorSample],
+    ) -> (SustainedViolationTracker, SustainedViolationTracker, usize) {
         let mut imbalance = SustainedViolationTracker::default();
         let mut dsq = SustainedViolationTracker::default();
         let mut worst_dsq_cpu = 0usize;
 
-        for (i, sample) in report.samples.iter().enumerate() {
+        for (i, sample) in samples.iter().enumerate() {
             if sample.cpus.is_empty() {
                 imbalance.record(false, 0.0, i);
                 dsq.record(false, 0.0, i);
                 continue;
             }
 
-            // Imbalance check.
             let ratio = sample.imbalance_ratio();
             imbalance.record(ratio > self.max_imbalance_ratio, ratio, i);
 
-            // DSQ depth check.
             let mut dsq_violated = false;
             let mut sample_worst_depth = 0u32;
             let mut sample_worst_cpu = 0usize;
@@ -1425,89 +1517,62 @@ impl MonitorThresholds {
             }
         }
 
-        let mut failed = false;
+        (imbalance, dsq, worst_dsq_cpu)
+    }
 
-        if imbalance.sustained(self.sustained_samples) {
-            failed = true;
-            details.push(format!(
-                "imbalance ratio {:.1} exceeded threshold {:.1} for {} consecutive samples (ending at sample {})",
-                imbalance.worst_value,
-                self.max_imbalance_ratio,
-                imbalance.worst_run,
-                imbalance.worst_at,
-            ));
-        }
+    /// Per-CPU stall detection over consecutive sample pairs. Exempts
+    /// idle CPUs (NOHZ stopped the tick so rq_clock legitimately doesn't
+    /// advance) and preempted vCPUs (host stole the core, so the vCPU
+    /// couldn't tick the clock) via [`reader::is_cpu_stuck`].
+    ///
+    /// Returns one [`SustainedViolationTracker`] per CPU. Sized to the
+    /// max `cpus.len()` across the report so a sample with fewer CPUs
+    /// doesn't truncate the per-CPU vector mid-walk.
+    fn track_stall(&self, report: &MonitorReport) -> Vec<SustainedViolationTracker> {
+        let threshold = if report.preemption_threshold_ns > 0 {
+            report.preemption_threshold_ns
+        } else {
+            vcpu_preemption_threshold_ns(None)
+        };
 
-        if dsq.sustained(self.sustained_samples) {
-            failed = true;
-            details.push(format!(
-                "local DSQ depth {} on cpu{} exceeded threshold {} for {} consecutive samples (ending at sample {})",
-                dsq.worst_value as u32,
-                worst_dsq_cpu,
-                self.max_local_dsq_depth,
-                dsq.worst_run,
-                dsq.worst_at,
-            ));
-        }
-
-        // Stuck detection: any CPU whose rq_clock did not advance between
-        // consecutive samples. Uses the sustained_samples window like
-        // imbalance and DSQ checks. Exempt idle CPUs (NOHZ stopped the
-        // tick so rq_clock legitimately doesn't advance) and preempted
-        // vCPUs (host stole the core, so the vCPU couldn't tick the
-        // clock). See `reader::is_cpu_stuck` for the predicate.
-        if self.fail_on_stall {
-            let threshold = if report.preemption_threshold_ns > 0 {
-                report.preemption_threshold_ns
-            } else {
-                vcpu_preemption_threshold_ns(None)
-            };
-
-            let num_cpus = report
-                .samples
-                .iter()
-                .map(|s| s.cpus.len())
-                .max()
-                .unwrap_or(0);
-            let mut stall: Vec<SustainedViolationTracker> =
-                vec![SustainedViolationTracker::default(); num_cpus];
-
-            for i in 1..report.samples.len() {
-                let prev = &report.samples[i - 1];
-                let curr = &report.samples[i];
-                let cpu_count = prev.cpus.len().min(curr.cpus.len());
-                #[allow(clippy::needless_range_loop)]
-                // indexes stall[cpu], prev.cpus[cpu], curr.cpus[cpu]
-                for cpu in 0..cpu_count {
-                    let is_stall =
-                        reader::is_cpu_stuck(&prev.cpus[cpu], &curr.cpus[cpu], threshold);
-                    stall[cpu].record(is_stall, curr.cpus[cpu].rq_clock as f64, i);
-                }
-            }
-
-            #[allow(clippy::needless_range_loop)] // cpu index used in format string
-            for cpu in 0..num_cpus {
-                if stall[cpu].sustained(self.sustained_samples) {
-                    failed = true;
-                    details.push(format!(
-                        "rq_clock stall on cpu{} for {} consecutive samples (ending at sample {}, clock={})",
-                        cpu,
-                        stall[cpu].worst_run,
-                        stall[cpu].worst_at,
-                        stall[cpu].worst_value as u64,
-                    ));
-                }
-            }
-        }
-
-        // Event counter rate checks: compute per-sample-interval rates
-        // and track sustained violations like imbalance.
-        let mut fallback_rate = SustainedViolationTracker::default();
-        let mut keep_last_rate = SustainedViolationTracker::default();
+        let num_cpus = report
+            .samples
+            .iter()
+            .map(|s| s.cpus.len())
+            .max()
+            .unwrap_or(0);
+        let mut stall: Vec<SustainedViolationTracker> =
+            vec![SustainedViolationTracker::default(); num_cpus];
 
         for i in 1..report.samples.len() {
             let prev = &report.samples[i - 1];
             let curr = &report.samples[i];
+            let cpu_count = prev.cpus.len().min(curr.cpus.len());
+            for (cpu, stall_tracker) in stall.iter_mut().enumerate().take(cpu_count) {
+                let is_stall = reader::is_cpu_stuck(&prev.cpus[cpu], &curr.cpus[cpu], threshold);
+                stall_tracker.record(is_stall, curr.cpus[cpu].rq_clock as f64, i);
+            }
+        }
+
+        stall
+    }
+
+    /// Per-interval event-counter rate computation against fallback /
+    /// keep_last thresholds. Returns `(fallback, keep_last)` trackers
+    /// keyed by sample index. Intervals with zero or negative duration,
+    /// or with missing event counters on either side, record a
+    /// non-violation `0.0` so the sustained-window state machine
+    /// continues to advance.
+    fn track_event_rates(
+        &self,
+        samples: &[MonitorSample],
+    ) -> (SustainedViolationTracker, SustainedViolationTracker) {
+        let mut fallback_rate = SustainedViolationTracker::default();
+        let mut keep_last_rate = SustainedViolationTracker::default();
+
+        for i in 1..samples.len() {
+            let prev = &samples[i - 1];
+            let curr = &samples[i];
             let interval_s = curr.elapsed_ms.saturating_sub(prev.elapsed_ms) as f64 / 1000.0;
             if interval_s <= 0.0 {
                 fallback_rate.record(false, 0.0, i);
@@ -1515,7 +1580,6 @@ impl MonitorThresholds {
                 continue;
             }
 
-            // Fallback rate.
             if let (Some(prev_fb), Some(curr_fb)) = (
                 prev.sum_event_field(|e| e.select_cpu_fallback),
                 curr.sum_event_field(|e| e.select_cpu_fallback),
@@ -1526,7 +1590,6 @@ impl MonitorThresholds {
                 fallback_rate.record(false, 0.0, i);
             }
 
-            // Keep-last rate.
             if let (Some(prev_kl), Some(curr_kl)) = (
                 prev.sum_event_field(|e| e.dispatch_keep_last),
                 curr.sum_event_field(|e| e.dispatch_keep_last),
@@ -1538,46 +1601,23 @@ impl MonitorThresholds {
             }
         }
 
-        if fallback_rate.sustained(self.sustained_samples) {
-            failed = true;
-            details.push(format!(
-                "fallback rate {:.1}/s exceeded threshold {:.1}/s for {} consecutive intervals (ending at sample {})",
-                fallback_rate.worst_value,
-                self.max_fallback_rate,
-                fallback_rate.worst_run,
-                fallback_rate.worst_at,
-            ));
-        }
+        (fallback_rate, keep_last_rate)
+    }
 
-        if keep_last_rate.sustained(self.sustained_samples) {
-            failed = true;
-            details.push(format!(
-                "keep_last rate {:.1}/s exceeded threshold {:.1}/s for {} consecutive intervals (ending at sample {})",
-                keep_last_rate.worst_value,
-                self.max_keep_last_rate,
-                keep_last_rate.worst_run,
-                keep_last_rate.worst_at,
-            ));
+    /// Render the verdict summary line. Three arms:
+    /// - no failure → `"monitor OK"`
+    /// - failure with `enforce=true` → terse `"monitor FAILED: N violation(s)"`
+    /// - failure with `enforce=false` → advisory `"flagged ... (report-only; ...)"`
+    fn summarize(failed: bool, enforce: bool, n_details: usize) -> String {
+        if !failed {
+            return "monitor OK".into();
         }
-
-        let summary = if failed {
-            if self.enforce {
-                format!("monitor FAILED: {} violation(s)", details.len())
-            } else {
-                format!(
-                    "monitor flagged {} violation(s) (report-only; pass `Assert::with_monitor_defaults` to enforce)",
-                    details.len()
-                )
-            }
+        if enforce {
+            format!("monitor FAILED: {n_details} violation(s)")
         } else {
-            "monitor OK".into()
-        };
-
-        MonitorVerdict {
-            passed: !failed || !self.enforce,
-            inconclusive: false,
-            details,
-            summary,
+            format!(
+                "monitor flagged {n_details} violation(s) (report-only; pass `Assert::with_monitor_defaults` to enforce)"
+            )
         }
     }
 
