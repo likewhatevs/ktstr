@@ -336,7 +336,16 @@ s32 BPF_STRUCT_OPS(ktstr_select_cpu, struct task_struct *p,
 {
 	bool is_idle = false;
 	s32 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
-	if (is_idle)
+	/* When stalling, skip the idle-CPU direct-dispatch fast path: a
+	 * SCX_DSQ_LOCAL insert here bypasses both SHARED_DSQ and the
+	 * `if (stall) return` guard in ktstr_dispatch, so the task keeps
+	 * running and the kernel watchdog never sees it runnable past
+	 * watchdog_timeout (check_rq_for_timeouts, kernel/sched/ext.c).
+	 * Under host load the idle-CPU rate is high enough that this leak
+	 * suppresses the stall entirely. Gating on `stall` routes the
+	 * wakeup through ktstr_enqueue -> SHARED_DSQ, where the dispatch
+	 * guard holds it and the watchdog fires deterministically. */
+	if (!stall && is_idle)
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
 	__sync_fetch_and_add(&nr_select_cpu, 1);
 	return cpu;
