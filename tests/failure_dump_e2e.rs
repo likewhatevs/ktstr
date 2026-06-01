@@ -1,10 +1,10 @@
 //! End-to-end test for the failure-dump pipeline.
 //!
-//! Boots scx-ktstr with `--stall-after=1`, lets the BPF probe latch
-//! the resulting `SCX_EXIT_ERROR_STALL` exit, and asserts that the
-//! freeze coordinator's host-side dump captures BTF-rendered fields
-//! from the scheduler's `.bss` section AND from the `BPF_MAP_TYPE_ARENA`
-//! map that scx-ktstr's `sdt_alloc`-backed per-task contexts populate.
+//! Each test boots scx-ktstr with `--stall-after=1`, lets the BPF
+//! probe latch the resulting `SCX_EXIT_ERROR_STALL` exit, and asserts
+//! that the freeze coordinator's host-side dump renders a distinct
+//! facet of the captured scheduler state (see the per-test bars
+//! below).
 //!
 //! The freeze coordinator writes the JSON-pretty `FailureDumpReport`
 //! to a per-test path inside the run's sidecar directory
@@ -16,16 +16,24 @@
 //! the run.
 //!
 //! User-facing test bar (per project memory): "I see variable names
-//! and values in the logs when a scheduler stalls." This test
-//! enforces the host-side half of that bar on three axes:
-//!   1. the file at the sidecar-dir path contains `stall`, `crash`
-//!      and other BTF-resolved field names from `scx-ktstr`'s global
-//!      section, not hex offsets;
-//!   2. a `BPF_MAP_TYPE_ARENA` map is present in the dump and at least
-//!      one captured page contains the `KTSTR_ARENA_MAGIC` sentinel
-//!      (proves live-data capture, not zero pages);
-//!   3. `ktstr_alloc_count` in `.bss` is non-zero (cross-validates
-//!      that the alloc path executed before the stall).
+//! and values in the logs when a scheduler stalls." Each test boots
+//! the stall scenario, then asserts on the host-written dump from a
+//! `post_vm_unconditional` callback — the guest is a separate process
+//! and cannot read the host-side dump, and a callback's `Err` is a
+//! hard FAIL (via `PostVmAssertionFailure`) that `expect_err` does
+//! not invert. The four callbacks enforce complementary halves of
+//! that bar:
+//!   - [`check_bss_dump`]: BTF-rendered `.bss` field names (`stall`,
+//!     `crash`), a live `BPF_MAP_TYPE_ARENA` page carrying the
+//!     `KTSTR_ARENA_MAGIC` sentinel, non-zero `ktstr_alloc_count`,
+//!     and populated per-vCPU register snapshots;
+//!   - [`check_array_entries_dump`]: every key of a multi-entry
+//!     `BPF_MAP_TYPE_ARRAY` renders (not just key 0);
+//!   - [`check_capture_dump`]: the freeze coordinator's live-walker
+//!     captures (per-CPU rq->scx state, DSQs, scx_sched scalar,
+//!     task enrichments, NUMA stats);
+//!   - [`check_probe_dump`]: the probe's per-CPU `.bss` counters
+//!     (`trigger_count`, `probe_count`) surface via the host decoder.
 
 mod common;
 
@@ -39,78 +47,81 @@ use ktstr::test_support::{Scheduler, SchedulerSpec};
 const KTSTR_SCHED: Scheduler =
     Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
-fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
-    // The freeze coordinator's file sink is wired by the test
-    // framework (see `test_support::eval::run_ktstr_test_inner`,
-    // which attaches the primary dump path on every VM builder
-    // it constructs) — no env-var dance, no `set_var` race
-    // against parallel tests. This scenario just reads the file
-    // back from the same sidecar dir keyed by `test_name`.
-    let dump_path = ctx.failure_dump_path()?;
+/// Reads the freeze coordinator's host-side failure dump for `result`
+/// and returns the parsed JSON, or a [`post_vm_skip`] request when the
+/// dump carries no maps to verify.
+///
+/// Two load-starvation paths both yield empty `maps`: the PLACEHOLDER
+/// dump (`is_placeholder=true` — rendezvous timeout / coordinator
+/// exited) and the PARTIAL dump (`is_placeholder=false` —
+/// `owned_accessor` / `dump_btf` not ready before the freeze, i.e. the
+/// BPF probe had not attached). In both, the render under test cannot be
+/// verified, so the caller skips (inconclusive). A genuinely-unreadable
+/// or non-JSON dump is a hard error. A real render bug captures maps
+/// (non-empty) and falls through to `Ok`, where the caller's assertion
+/// catches it.
+fn read_failure_dump(result: &VmResult) -> Result<serde_json::Value> {
+    let dump_path = result.failure_dump_path()?;
+    let json = std::fs::read_to_string(&dump_path).with_context(|| {
+        format!(
+            "failure dump file missing at {} — freeze coordinator did not \
+             write the JSON dump (SCX_EXIT_ERROR_STALL latch did not fire or \
+             the write failed silently)",
+            dump_path.display()
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&json)
+        .map_err(|e| anyhow::anyhow!("dump file is not valid JSON: {e}"))?;
+    let no_maps = value
+        .get("maps")
+        .and_then(|m| m.as_array())
+        .is_none_or(|m| m.is_empty());
+    let is_placeholder = value
+        .get("is_placeholder")
+        .and_then(|p| p.as_bool())
+        .unwrap_or(false);
+    if is_placeholder || no_maps {
+        return Err(post_vm_skip(
+            "failure dump has no maps — the BPF probe did not attach, or dump \
+             prerequisites were unavailable before the host watchdog fired \
+             (placeholder or partial-render path under VM starvation); the \
+             render under test cannot be verified",
+        ));
+    }
+    Ok(value)
+}
 
+fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
+    // Adopt the freeze coordinator's accessor before the
+    // --stall-after=1 stall fires, so the dump renders real
+    // .bss/arena state rather than placeholder values (the accessor is
+    // built async and may not be adopted by the time an early stall
+    // freezes the VM). The host-side `check_bss_dump` post_vm callback
+    // does the assertions — the guest is a separate process and cannot
+    // read the host-written dump.
+    await_accessor_ready();
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
-    let mut result = execute_steps(ctx, steps)?;
+    execute_steps(ctx, steps)
+}
 
-    // Read the dump file written by the freeze coordinator. The
-    // file must exist when the scenario reaches here because:
-    //   1. `--stall-after=1` triggers an SCX_EXIT_ERROR_STALL inside
-    //      the guest within ~1 second.
-    //   2. The probe BPF tracepoint fires on the error-class exit.
-    //   3. The freeze coordinator's .bss-poll observes the latch,
-    //      runs `dump_state`, and writes the JSON to the
-    //      builder-configured path before clearing `freeze`.
-    //   4. The watchdog tears the VM down, `execute_steps` returns,
-    //      and we land here on the host side of the same process.
-    //
-    // A theoretical race exists between the guest-side sched_ext
-    // teardown and the host freeze rendezvous — if the guest
-    // userspace dropped the BPF skeleton before the host paused
-    // vCPUs, the arena map would be absent from the IDR walk. In
-    // practice, the vCPU freeze preempts guest userspace reaction:
-    // the error-exit latch flips inside the probe BPF program
-    // (sched_ext_exit tracepoint), the host's .bss poll observes it,
-    // and the freeze coordinator pauses every vCPU before the
-    // guest's userspace `Drop` path can deliberately unload the
-    // skeleton.
-    //
-    // If the file is missing, surface the failure in the
-    // AssertResult details rather than panicking — `expect_err: true`
-    // would otherwise mask a missing-dump regression as a pass.
-    let json = match std::fs::read_to_string(&dump_path) {
-        Ok(s) => s,
-        Err(e) => {
-            result.record_fail(ktstr::assert::AssertDetail::new(
-                ktstr::assert::DetailKind::Other,
-                format!(
-                    "failure dump file missing at {}: {e} (freeze coordinator did \
-                     not write — either the SCX_EXIT_ERROR_STALL latch did not \
-                     fire, owned_accessor / dump_btf was None, or the file \
-                     write failed silently)",
-                    dump_path.display()
-                ),
-            ));
-            anyhow::bail!(
-                "failure dump file missing at {} — freeze coordinator did not \
-                 write the JSON dump",
-                dump_path.display()
-            );
-        }
-    };
+/// Host-side post_vm assertion for `failure_dump_renders_bss_fields`.
+/// Reads the freeze coordinator's dump from the HOST sidecar path and
+/// verifies the scheduler `.bss` BTF render (named fields plus the live
+/// `stall` flag), the per-vCPU register snapshots, and the BPF arena
+/// capture (live `KTSTR_ARENA_MAGIC` pages). Runs unconditionally; its
+/// Err is a hard FAIL via the framework's `PostVmAssertionFailure`
+/// marker even though `expect_err` inverts the stall itself to PASS.
+fn check_bss_dump(result: &VmResult) -> Result<()> {
+    let value = read_failure_dump(result)?;
 
-    // Parse as a generic JSON value. The dump schema is now an
-    // explicit discriminant — `FailureDumpReportAny::from_json`
-    // rejects any blob without a `schema` field — so the test
-    // short-circuits on the schema before reaching the variant-
-    // specific shape. The full-dump happy path expects
-    // [`SCHEMA_SINGLE`]; SCHEMA_DEGRADED on this happy-path test
-    // indicates a regression in the freeze coordinator's
-    // capture-vs-degraded dispatch.
-    let value: serde_json::Value = serde_json::from_str(&json)
-        .map_err(|e| anyhow::anyhow!("dump file is not valid JSON: {e}"))?;
+    // The full-dump happy path expects SCHEMA_SINGLE; a `degraded`
+    // schema here means the freeze coordinator's capture-vs-degraded
+    // dispatch (gate cross-reference or rendezvous-timeout path) fired
+    // when it should not have.
     let schema = value
         .get("schema")
         .and_then(|s| s.as_str())
@@ -124,9 +135,7 @@ fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Resul
     anyhow::ensure!(
         schema == SCHEMA_SINGLE,
         "happy-path dump must carry schema=SCHEMA_SINGLE ({SCHEMA_SINGLE:?}); \
-         got schema={schema} (a `degraded` schema here means the freeze \
-         coordinator's gate cross-reference or rendezvous-timeout path fired \
-         when it should not have)"
+         got schema={schema}"
     );
 
     // Top-level shape: {"maps": [...]}. `non_exhaustive` does not
@@ -156,7 +165,7 @@ fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Resul
         })
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "dump has no scheduler `.bss` map (got {} maps): {json}",
+                "dump has no scheduler `.bss` map (got {} maps): {value}",
                 maps.len()
             )
         })?;
@@ -390,7 +399,7 @@ fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Resul
                  declares one via lib/arena_map.h, so either the dump \
                  path filtered it out, the map enumeration missed it, \
                  or the scheduler failed to load the arena. Got {} \
-                 maps total: {json}",
+                 maps total: {value}",
                 maps.len()
             )
         })?;
@@ -523,22 +532,20 @@ fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Resul
         );
     }
 
-    // Confirming detail so the test log shows the captured value.
-    result.note(format!(
-        "failure-dump file at {} contains scheduler .bss render with \
-         stall={stall_int}, ktstr_alloc_count={alloc_count_int}, \
-         member count={}, vcpu_regs entries={} ({} populated with \
-         non-zero IP), arena pages={} ({total_bytes} bytes, \
-         {magic_hits} pages with KTSTR_ARENA_MAGIC sentinel, \
+    // Confirming detail so the test log shows the captured values.
+    eprintln!(
+        "scheduler .bss render OK: stall={stall_int}, \
+         ktstr_alloc_count={alloc_count_int}, members={}, vcpu_regs={} \
+         ({} populated with non-zero IP), arena pages={} ({total_bytes} \
+         bytes, {magic_hits} with KTSTR_ARENA_MAGIC, \
          declared_pages={declared_pages})",
-        dump_path.display(),
         members.len(),
         vcpu_regs.len(),
         populated_with_ip.len(),
         arena_pages.len(),
-    ));
+    );
 
-    Ok(result)
+    Ok(())
 }
 
 #[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
@@ -556,11 +563,14 @@ static __KTSTR_ENTRY_FAILURE_DUMP_BSS: ktstr::test_support::KtstrTestEntry =
         // teardown stays under the test duration.
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
-        // The scenario itself returns Err to surface a missing-dump
-        // regression as a real failure. Successful rendering returns
-        // a failed AssertResult (the stall is the expected behaviour);
-        // expect_err inverts that to PASS.
+        // expect_err inverts the SCX_EXIT_ERROR_STALL (the expected
+        // outcome of --stall-after=1) to PASS. The real render
+        // assertions live in `check_bss_dump`, a post_vm_unconditional
+        // callback whose Err is a hard FAIL via PostVmAssertionFailure —
+        // so a wrong .bss/arena render fails the test even though the
+        // stall itself is inverted.
         expect_err: true,
+        post_vm_unconditional: Some(check_bss_dump),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
@@ -614,55 +624,15 @@ fn failure_dump_renders_array_entries(ctx: &ktstr::scenario::Ctx) -> Result<Asse
 }
 
 /// Host-side post_vm assertion for `failure_dump_renders_array_entries`.
-/// Reads the freeze coordinator's dump from the HOST sidecar path
-/// ([`VmResult::failure_dump_path`]) and verifies the multi-entry ARRAY
-/// fixture rendered every key. Runs unconditionally (the run "fails"
+/// Reads the freeze coordinator's dump via `read_failure_dump` (the
+/// HOST sidecar path) and verifies the multi-entry ARRAY fixture
+/// rendered every key. Runs unconditionally (the run "fails"
 /// via the expected stall, so a conditional post_vm could be
 /// suppressed); the framework attaches the `PostVmAssertionFailure`
 /// marker to this callback's Err so a wrong render stays a hard FAIL
 /// even though expect_err inverts the stall itself to PASS.
 fn check_array_entries_dump(result: &VmResult) -> Result<()> {
-    let dump_path = result.failure_dump_path()?;
-
-    let json = std::fs::read_to_string(&dump_path).with_context(|| {
-        format!(
-            "failure dump file missing at {} — freeze coordinator did not write \
-             the JSON dump (SCX_EXIT_ERROR_STALL latch did not fire or the write \
-             failed silently)",
-            dump_path.display()
-        )
-    })?;
-
-    let value: serde_json::Value = serde_json::from_str(&json)
-        .map_err(|e| anyhow::anyhow!("dump file is not valid JSON: {e}"))?;
-
-    // Skip (inconclusive) when the dump carries no maps to verify. Two
-    // load-starvation paths both yield empty `maps`: the PLACEHOLDER
-    // dump (is_placeholder=true — rendezvous timeout / coord exited) and
-    // the PARTIAL dump (is_placeholder=FALSE — owned_accessor / dump_btf
-    // not ready before the freeze, i.e. the BPF probe had not attached;
-    // see the freeze coordinator's partial-report path). Either way the
-    // ARRAY fixture render cannot be verified, so the run is
-    // inconclusive. A REAL render bug instead captures maps (non-empty)
-    // and renders the fixture wrong — that falls through to the
-    // assertion below and fails. Gating on "no maps" skips the
-    // inconclusive runs without masking a regression.
-    let no_maps = value
-        .get("maps")
-        .and_then(|m| m.as_array())
-        .is_none_or(|m| m.is_empty());
-    let is_placeholder = value
-        .get("is_placeholder")
-        .and_then(|p| p.as_bool())
-        .unwrap_or(false);
-    if is_placeholder || no_maps {
-        return Err(post_vm_skip(
-            "failure dump has no maps — the BPF probe did not attach, or dump \
-             prerequisites were unavailable before the host watchdog fired \
-             (placeholder or partial-render path under VM starvation); the \
-             ARRAY fixture render cannot be verified",
-        ));
-    }
+    let value = read_failure_dump(result)?;
 
     let schema = value
         .get("schema")
@@ -697,7 +667,7 @@ fn check_array_entries_dump(result: &VmResult) -> Result<()> {
             anyhow::anyhow!(
                 "dump has no multi-entry ARRAY fixture (map_type=2, max_entries=16) — \
                  the scx-ktstr ktstr_array_fixture map is missing from the IDR walk \
-                 or was mis-typed by the renderer. maps={}: {json}",
+                 or was mis-typed by the renderer. maps={}: {value}",
                 maps.len()
             )
         })?;
@@ -788,9 +758,8 @@ fn check_array_entries_dump(result: &VmResult) -> Result<()> {
 
     eprintln!(
         "multi-entry ARRAY fixture `{name}` rendered all {} keys with correct \
-         magic + echoed key (dump: {})",
+         magic + echoed key",
         entries.len(),
-        dump_path.display()
     );
     Ok(())
 }
@@ -816,38 +785,43 @@ fn check_array_entries_dump(result: &VmResult) -> Result<()> {
 fn scenario_failure_dump_renders_capture_modules(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
-    let dump_path = ctx.failure_dump_path()?;
-    let num_cpus = ctx.topo.total_cpus();
-
+    // Adopt the accessor before the --stall-after=1 freeze so the dump
+    // renders a full report (live walker captures present); the
+    // host-side `check_capture_dump` callback does the assertions.
+    await_accessor_ready();
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
-    let mut result = execute_steps(ctx, steps)?;
+    execute_steps(ctx, steps)
+}
 
-    let json = match std::fs::read_to_string(&dump_path) {
-        Ok(s) => s,
-        Err(e) => {
-            result.record_fail(ktstr::assert::AssertDetail::new(
-                ktstr::assert::DetailKind::Other,
-                format!(
-                    "failure dump file missing at {}: {e} (freeze coordinator did \
-                     not write — either the SCX_EXIT_ERROR_STALL latch did not \
-                     fire or the file write failed silently)",
-                    dump_path.display()
-                ),
-            ));
-            anyhow::bail!(
-                "failure dump file missing at {} — freeze coordinator did not \
-                 write the JSON dump",
-                dump_path.display()
-            );
-        }
-    };
+/// Host-side post_vm assertion for `failure_dump_renders_capture_modules`.
+/// Reads the dump via `read_failure_dump` and verifies the freeze
+/// coordinator's live-walker captures (per-CPU rq->scx state, DSQs, the
+/// scx_sched scalar, task enrichments, NUMA stats). Runs unconditionally;
+/// its Err is a hard FAIL via the framework's `PostVmAssertionFailure`
+/// marker even though `expect_err` inverts the stall itself to PASS.
+fn check_capture_dump(result: &VmResult) -> Result<()> {
+    let value = read_failure_dump(result)?;
 
-    let value: serde_json::Value = serde_json::from_str(&json)
-        .map_err(|e| anyhow::anyhow!("dump file is not valid JSON: {e}"))?;
+    // The freeze coordinator captures one `vcpu_regs` slot per booted
+    // vCPU (BSP + APs), so its length is the authoritative online-CPU
+    // count for cross-checking the per-CPU walker below — the post_vm
+    // callback has no `Ctx::topo` to read it from. read_failure_dump has
+    // already gated out the no-maps partial/placeholder dumps, so a full
+    // dump here always carries vcpu_regs.
+    let num_cpus = value
+        .get("vcpu_regs")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "dump JSON missing `vcpu_regs` — cannot determine the expected \
+                 per-CPU count for the walker cross-check. Full JSON: {value}"
+            )
+        })?;
 
     // -- scx_walker capture (rq_scx_states / dsq_states / scx_sched_state) --
     //
@@ -861,7 +835,7 @@ fn scenario_failure_dump_renders_capture_modules(
         anyhow::bail!(
             "scx_walker_unavailable={reason:?} — capture_scx::build returned \
              None or the walker reached no state. Captures must always \
-             produce data when scx-ktstr is loaded. Full JSON: {json}"
+             produce data when scx-ktstr is loaded. Full JSON: {value}"
         );
     }
     let rq_scx_states = value
@@ -870,15 +844,17 @@ fn scenario_failure_dump_renders_capture_modules(
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "dump JSON missing `rq_scx_states` array — capture_scx \
-                 wiring did not populate the field. Full JSON: {json}"
+                 wiring did not populate the field. Full JSON: {value}"
             )
         })?;
     if rq_scx_states.len() != num_cpus {
         anyhow::bail!(
-            "rq_scx_states.len()={} but expected num_cpus={num_cpus} — \
-             walk_rq_scx skipped some CPUs (sub-group offset resolution \
-             failed or per-CPU rq translate failed). Full rq_scx_states: \
-             {rq_scx_states:?}",
+            "rq_scx_states.len()={} != num_cpus={num_cpus} (num_cpus = dump \
+             vcpu_regs.len(), one slot per booted vCPU — freeze_coord \
+             collect_vcpu_regs). walk_rq_scx silently skips a CPU on \
+             sub-group offset / per-CPU rq translate failure, so fewer \
+             entries means a skipped CPU; more means a walker over-count. \
+             Full rq_scx_states: {rq_scx_states:?}",
             rq_scx_states.len(),
         );
     }
@@ -908,14 +884,14 @@ fn scenario_failure_dump_renders_capture_modules(
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "dump JSON missing `dsq_states` array — capture_scx \
-                 wiring did not populate the field. Full JSON: {json}"
+                 wiring did not populate the field. Full JSON: {value}"
             )
         })?;
     if dsq_states.is_empty() {
         anyhow::bail!(
             "dsq_states is empty — walk_dsqs reached no DSQs. The \
              global DSQ (SCX_DSQ_GLOBAL per-node) must always be \
-             reachable when *scx_root is non-null. Full JSON: {json}"
+             reachable when *scx_root is non-null. Full JSON: {value}"
         );
     }
 
@@ -925,7 +901,7 @@ fn scenario_failure_dump_renders_capture_modules(
         anyhow::bail!(
             "scx_sched_state is absent or null — read_scx_sched_state \
              returned None. *scx_root was unreadable or the BTF offsets \
-             didn't resolve. Full JSON: {json}"
+             didn't resolve. Full JSON: {value}"
         );
     }
 
@@ -944,7 +920,7 @@ fn scenario_failure_dump_renders_capture_modules(
             "task_enrichments_unavailable={reason:?} — capture_tasks::build \
              returned None or the walker yielded zero tasks. Captures \
              must always produce data when scx tasks are runnable. Full \
-             JSON: {json}"
+             JSON: {value}"
         );
     }
     let task_enrichments = value
@@ -954,14 +930,14 @@ fn scenario_failure_dump_renders_capture_modules(
             anyhow::anyhow!(
                 "dump JSON missing `task_enrichments` array — \
                  capture_tasks wiring did not populate the field. \
-                 Full JSON: {json}"
+                 Full JSON: {value}"
             )
         })?;
     if task_enrichments.is_empty() {
         anyhow::bail!(
             "task_enrichments is empty — runnable_list walker found no \
              tasks. With workers_per_cgroup>0 driving load, at least \
-             one task must be runnable at freeze time. Full JSON: {json}"
+             one task must be runnable at freeze time. Full JSON: {value}"
         );
     }
     // At least one enrichment must carry an identity that proves the
@@ -1006,25 +982,23 @@ fn scenario_failure_dump_renders_capture_modules(
         anyhow::bail!(
             "per_node_numa is empty AND per_node_numa_unavailable is \
              absent — the dump pipeline broke its own contract that \
-             one of the two must be populated. Full JSON: {json}"
+             one of the two must be populated. Full JSON: {value}"
         );
     }
 
-    result.note(format!(
-        "failure-dump file at {} contains capture-module data: \
-         rq_scx_states.len()={} (num_cpus={num_cpus}), \
+    eprintln!(
+        "capture-module data OK: rq_scx_states.len()={} (num_cpus={num_cpus}), \
          dsq_states.len()={}, scx_sched_state present, \
          task_enrichments.len()={}, per_node_numa.len()={} \
          (unavailable={:?})",
-        dump_path.display(),
         rq_scx_states.len(),
         dsq_states.len(),
         task_enrichments.len(),
         per_node_numa.len(),
         per_node_numa_unavailable,
-    ));
+    );
 
-    Ok(result)
+    Ok(())
 }
 
 #[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
@@ -1042,12 +1016,14 @@ static __KTSTR_ENTRY_FAILURE_DUMP_CAPTURES: ktstr::test_support::KtstrTestEntry 
         // teardown stays under the test duration.
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
-        // The scenario returns a non-failed AssertResult on success
-        // (the stall is the expected trigger that produces the dump);
-        // any capture defect is reported via anyhow::bail! and bubbles
-        // up as an Err. expect_err inverts the AssertResult fail-on-stall
-        // to a pass.
+        // expect_err inverts the SCX_EXIT_ERROR_STALL (the expected
+        // outcome of --stall-after=1) to PASS. The real capture
+        // assertions live in `check_capture_dump`, a
+        // post_vm_unconditional callback whose Err is a hard FAIL via
+        // PostVmAssertionFailure — so a missing/empty capture fails the
+        // test even though the stall itself is inverted.
         expect_err: true,
+        post_vm_unconditional: Some(check_capture_dump),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
@@ -1073,41 +1049,30 @@ static __KTSTR_ENTRY_FAILURE_DUMP_CAPTURES: ktstr::test_support::KtstrTestEntry 
 /// asserts the scheduler's own `.bss` BTF render) and
 /// `scenario_failure_dump_renders_capture_modules` (which asserts
 /// the live walker captures): this test exercises the host-side
-/// host-side `decode_probe_counters_snapshot` reader specifically.
+/// `decode_probe_counters_snapshot` reader specifically.
 fn scenario_failure_dump_renders_probe_counters(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
-    let dump_path = ctx.failure_dump_path()?;
-
+    // Adopt the accessor before the --stall-after=1 freeze so the dump
+    // renders a full report (probe_counters present); the host-side
+    // `check_probe_dump` callback does the assertions.
+    await_accessor_ready();
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
-    let mut result = execute_steps(ctx, steps)?;
+    execute_steps(ctx, steps)
+}
 
-    let json = match std::fs::read_to_string(&dump_path) {
-        Ok(s) => s,
-        Err(e) => {
-            result.record_fail(ktstr::assert::AssertDetail::new(
-                ktstr::assert::DetailKind::Other,
-                format!(
-                    "failure dump file missing at {}: {e} (freeze coordinator did \
-                     not write — either the SCX_EXIT_ERROR_STALL latch did not \
-                     fire or the file write failed silently)",
-                    dump_path.display()
-                ),
-            ));
-            anyhow::bail!(
-                "failure dump file missing at {} — freeze coordinator did not \
-                 write the JSON dump",
-                dump_path.display()
-            );
-        }
-    };
-
-    let value: serde_json::Value = serde_json::from_str(&json)
-        .map_err(|e| anyhow::anyhow!("dump file is not valid JSON: {e}"))?;
+/// Host-side post_vm assertion for `failure_dump_renders_probe_counters`.
+/// Reads the dump via `read_failure_dump` and verifies the probe's
+/// per-CPU `.bss` counters surfaced (non-zero `trigger_count` and
+/// `probe_count`). Runs unconditionally; its Err is a hard FAIL via the
+/// framework's `PostVmAssertionFailure` marker even though `expect_err`
+/// inverts the stall itself to PASS.
+fn check_probe_dump(result: &VmResult) -> Result<()> {
+    let value = read_failure_dump(result)?;
 
     // `probe_counters` is `skip_serializing_if = "Option::is_none"`,
     // so its absence in the JSON means the host-side decoder
@@ -1120,14 +1085,14 @@ fn scenario_failure_dump_renders_probe_counters(
              decode_probe_counters_snapshot returned None. \
              Probe `.bss` map absent, BTF lookup failed, or the \
              `ktstr_pcpu_counters` array offset didn't resolve. \
-             Full JSON: {json}"
+             Full JSON: {value}"
         )
     })?;
     if probe_counters.is_null() {
         anyhow::bail!(
             "`probe_counters` is null — decoder ran but produced None; \
              same prerequisite-missing failure modes as above. \
-             Full JSON: {json}"
+             Full JSON: {value}"
         );
     }
 
@@ -1183,15 +1148,13 @@ fn scenario_failure_dump_renders_probe_counters(
         );
     }
 
-    result.note(format!(
-        "failure-dump file at {} contains probe_counters with \
-         trigger_count={trigger_count}, probe_count={probe_count} \
-         (per-CPU sum walked across CPUs in `.bss` \
-         `ktstr_pcpu_counters` array)",
-        dump_path.display(),
-    ));
+    eprintln!(
+        "probe_counters render OK: trigger_count={trigger_count}, \
+         probe_count={probe_count} (per-CPU sum walked across CPUs in \
+         `.bss` `ktstr_pcpu_counters` array)"
+    );
 
-    Ok(result)
+    Ok(())
 }
 
 #[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
@@ -1210,10 +1173,13 @@ static __KTSTR_ENTRY_FAILURE_DUMP_PROBE_COUNTERS: ktstr::test_support::KtstrTest
         // teardown stays under the test duration.
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
-        // Stall scenarios surface as a failed AssertResult — the
-        // test framework's `expect_err: true` flips that into a
-        // pass, so the scenario itself only returns Err when the
-        // dump renders incorrectly (missing/zero counter).
+        // expect_err inverts the SCX_EXIT_ERROR_STALL (the expected
+        // outcome of --stall-after=1) to PASS. The real counter
+        // assertions live in `check_probe_dump`, a
+        // post_vm_unconditional callback whose Err is a hard FAIL via
+        // PostVmAssertionFailure — so a missing/zero counter fails the
+        // test even though the stall itself is inverted.
         expect_err: true,
+        post_vm_unconditional: Some(check_probe_dump),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
