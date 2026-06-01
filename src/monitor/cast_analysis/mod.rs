@@ -2570,19 +2570,19 @@ impl<'a> Analyzer<'a> {
             }
             StxValueKind::Unknown => {
                 // May-analysis: once a slot is tagged arena by any
-                // path, the finding persists. A non-arena store on
-                // a different path does not invalidate it — the
-                // renderer's resolve_arena_type bridge checks the
-                // runtime VA, which is the ground truth.
-                if false {
-                    tracing::debug!(
-                        parent = key.0,
-                        offset = key.1,
-                        "cast_analysis: arena_stx_findings invalidated \
-                         by non-arena DW store to same slot"
-                    );
-                }
-                self.arena_confirmed.remove(&key);
+                // path (addr_space_cast -> `arena_confirmed`, or an
+                // allocator-return STX -> `arena_stx_findings`), the
+                // finding PERSISTS. A DW store of an untyped value to
+                // the same slot does NOT invalidate it -- the
+                // renderer's `resolve_arena_type` bridge checks the
+                // runtime VA, which is ground truth. This is exactly
+                // the .bss arena-holder pattern: `ktstr_train_bss_to_arena`
+                // casts the slot (-> arena_confirmed) while
+                // `ktstr_init_task` stores the live arena VA into the
+                // same global as an untyped DW; that store must not
+                // undo the cast confirmation. (Removing arena_confirmed
+                // here was the deterministic-drop bug behind the
+                // cast_analysis_chases_bss_to_arena failure.)
             }
         }
     }
@@ -3262,6 +3262,57 @@ impl<'a> Analyzer<'a> {
             }
             // 0 or 2+ candidates -> drop silently. False negative
             // is the safe direction.
+        }
+
+        // Arena direct-evidence deferred-resolve fallback. A slot
+        // confirmed as arena via BPF_ADDR_SPACE_CAST (`arena_confirmed`)
+        // whose LDX access pattern did NOT resolve to a unique BTF
+        // struct above is dropped by the shape-inference loop — the
+        // generic `(u64@0, u32@8, u64@16)`-style shape collides with
+        // vmlinux structs pulled in via `<scx/common.bpf.h>`, so
+        // `candidates.len() == 1` fails. Emit it here with
+        // `target_type_id == 0` so the renderer's
+        // [`super::btf_render::MemReader::resolve_arena_type`] bridge
+        // resolves the concrete type at chase time from the live
+        // sdt_alloc allocator index — the same deferred-resolve recovery
+        // the STX-flow arena path already uses (and the sdt_alloc-bridge
+        // test exercises). A slot whose VA is not in any indexed
+        // allocator surfaces a clear skip-with-reason at chase time and
+        // the renderer's u64 fallback takes over — no wrong render. The
+        // `out.contains_key` / `conflicting` guards keep this strictly
+        // additive: it never overwrites a shape-inference, kptr, or
+        // STX-flow hit, and never emits on a kptr-conflicted slot.
+        for key in self.arena_confirmed.iter().copied() {
+            // Only slots actually dereferenced carry struct evidence.
+            // `arena_confirmed` alone — a BPF_ADDR_SPACE_CAST with no
+            // following LDX through the cast result — has no access
+            // pattern and must emit nothing (preserves
+            // `addr_space_cast_arena_alone_does_not_emit`). This fallback
+            // covers only the slots the shape-inference loop above SAW
+            // (present in `self.patterns` with a non-empty access set and
+            // direct evidence) but DROPPED because the shape intersection
+            // was non-unique.
+            if self.patterns.get(&key).is_none_or(|a| a.is_empty()) {
+                continue;
+            }
+            if out.contains_key(&key) || conflicting.contains(&key) {
+                continue;
+            }
+            let (source, field_off) = key;
+            let alloc_size = self.arena_alloc_size_index.get(&key).copied().flatten();
+            tracing::debug!(
+                parent = source,
+                offset = field_off,
+                "cast_analysis: arena_confirmed deferred-resolve hit emitted (shape ambiguous)"
+            );
+            out.insert(
+                key,
+                CastHit {
+                    target_type_id: 0,
+                    addr_space: AddrSpace::Arena,
+                    alloc_size,
+                },
+            );
         }
 
         // non-inlined-allocator warn: surface allocator call sites that the

@@ -509,6 +509,63 @@ fn btf_with_source_and_target(field_off: u32, target_off: u32) -> (Vec<u8>, u32,
     (build_btf(&types, &strings), 2, 3)
 }
 
+/// Like [`btf_with_source_and_target`] but with TWO same-shape targets
+/// `Q1` (id=3) and `Q2` (id=4), each a struct with a `u64` at offset 0.
+/// A deref of the cast result at offset 0 matches BOTH, so shape
+/// inference's `candidates.len() == 1` check fails and drops the slot --
+/// exercising the deferred-resolve emit path. Source struct `T` (id=2)
+/// has a `u64` at `field_off`. Returns the blob and the `T` id.
+fn btf_source_and_two_targets(field_off: u32) -> (Vec<u8>, u32) {
+    let mut strings: Vec<u8> = vec![0];
+    let n_int = push_name(&mut strings, "u64");
+    let n_t = push_name(&mut strings, "T");
+    let n_q1 = push_name(&mut strings, "Q1");
+    let n_q2 = push_name(&mut strings, "Q2");
+    let n_f = push_name(&mut strings, "f");
+    let n_x = push_name(&mut strings, "x");
+    let types = vec![
+        // id 1: int u64.
+        SynType::Int {
+            name_off: n_int,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        // id 2: struct T { u64 f at field_off }.
+        SynType::Struct {
+            name_off: n_t,
+            size: field_off + 8,
+            members: vec![SynMember {
+                name_off: n_f,
+                type_id: 1,
+                byte_offset: field_off,
+            }],
+        },
+        // id 3: struct Q1 { u64 x at 0 }.
+        SynType::Struct {
+            name_off: n_q1,
+            size: 8,
+            members: vec![SynMember {
+                name_off: n_x,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+        // id 4: struct Q2 { u64 x at 0 } -- same shape as Q1.
+        SynType::Struct {
+            name_off: n_q2,
+            size: 8,
+            members: vec![SynMember {
+                name_off: n_x,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+    ];
+    (build_btf(&types, &strings), 2)
+}
+
 /// Small helper to emit a single [`BpfInsn`] with given fields.
 /// Uses `BpfInsn::new` directly so dst/src register packing is
 /// done by the constructor — no `let mut x = X::default(); x.f = …`
@@ -2220,6 +2277,121 @@ fn addr_space_cast_arena_alone_does_not_emit() {
             addr_space: AddrSpace::Kernel,
         }),
         "STX-only baseline records (T, 8) -> (Q, Kernel): {map_kptr_only:?}"
+    );
+}
+
+/// A `BPF_ADDR_SPACE_CAST` arena confirmation (`imm == 1`) must
+/// SURVIVE a later untyped (`StxValueKind::Unknown`) store to the
+/// same slot. This is the `.bss` arena-holder pattern: one BPF
+/// program casts the slot (recording `arena_confirmed` for it)
+/// while another stores the live arena VA into the same global as
+/// a plain `u64`. May-analysis: the cast evidence persists across
+/// the untyped store, so shape inference still emits the chase
+/// finding and the renderer chases the pointer.
+///
+/// Regression test for the deterministic-drop bug where the
+/// `StxValueKind::Unknown` STX arm removed the `arena_confirmed`
+/// entry, silently demoting the rendered pointer to a raw `u64`.
+/// Without the cast, the untyped store records nothing; with the
+/// cast but the old invalidation, the store cleared the evidence
+/// and the map went empty -- so a non-empty `(T, 8) -> (Q, Arena)`
+/// result proves the confirmation outlived the untyped store.
+#[test]
+fn addr_space_cast_arena_survives_unknown_stx() {
+    let (blob, t_id, q_id) = btf_with_source_and_target(8, 0);
+    let btf = Btf::from_bytes(&blob).unwrap();
+    // r3 = *(u64 *)(r1 + 8)            ; r3 = LoadedU64Field{T, 8}
+    // r4 = (cast as(1) -> as(0)) r3    ; arena_confirmed += (T, 8)
+    // r6 = *(u64 *)(r3 + 0)            ; deref -> shape candidate (T,8)->Q
+    // *(u64 *)(r1 + 8) = r9            ; r9 never set -> StxValueKind::Unknown
+    // The untyped store must NOT clear arena_confirmed for (T, 8),
+    // otherwise shape inference loses its arena evidence and drops
+    // the finding (see shape_inference_alone_drops_without_arena_confirmed).
+    let insns = vec![
+        ldx(BPF_SIZE_DW, 3, 1, 8),
+        addr_space_cast(4, 3, 1),
+        ldx(BPF_SIZE_DW, 6, 3, 0),
+        stx(BPF_SIZE_DW, 1, 9, 8),
+        exit(),
+    ];
+    let map = analyze_casts(
+        &insns,
+        &btf,
+        &[InitialReg {
+            reg: 1,
+            struct_type_id: t_id,
+        }],
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        map.len(),
+        1,
+        "exactly the (T, 8) chase finding expected: {map:?}"
+    );
+    assert_eq!(
+        map.get(&(t_id, 8)),
+        Some(&CastHit {
+            alloc_size: None,
+            target_type_id: q_id,
+            addr_space: AddrSpace::Arena,
+        }),
+        "arena_confirmed must survive the untyped STX so shape \
+             inference still emits (T,8)->(Q, Arena): {map:?}"
+    );
+}
+
+/// The deferred-resolve emit loop (cast_analysis/mod.rs) must emit a
+/// `target_type_id == 0` arena `CastHit` when a slot has arena evidence
+/// (`addr_space_cast` -> `arena_confirmed`) and a deref pattern, but shape
+/// inference cannot UNIQUELY resolve the pointee (>=2 BTF structs match the
+/// deref shape, so the `candidates.len() == 1` check fails). The renderer
+/// then chases via the runtime arena VA (`resolve_arena_type`) at dump time
+/// rather than a static target type.
+///
+/// Distinct from `addr_space_cast_arena_survives_unknown_stx`, whose
+/// single-candidate BTF lets shape inference resolve uniquely (so the
+/// deferred loop never fires). Two same-shape targets Q1/Q2 force the
+/// ambiguous branch -- the only focused unit coverage of the
+/// `target_type_id == 0` emit path (otherwise exercised only end-to-end by
+/// `cast_analysis_chases_bss_to_arena`).
+#[test]
+fn addr_space_cast_ambiguous_shape_emits_deferred_resolve() {
+    let (blob, t_id) = btf_source_and_two_targets(8);
+    let btf = Btf::from_bytes(&blob).unwrap();
+    // r3 = *(u64 *)(r1 + 8)            ; r3 = LoadedU64Field{T, 8}
+    // r4 = (cast as(1) -> as(0)) r3    ; arena_confirmed += (T, 8)
+    // r6 = *(u64 *)(r3 + 0)            ; deref -> pattern (T,8); shape
+    //                                    matches Q1 AND Q2 -> ambiguous
+    // Shape inference drops (T,8) (candidates != 1); the deferred loop
+    // emits target_type_id=0 from arena_confirmed + the pattern.
+    let insns = vec![
+        ldx(BPF_SIZE_DW, 3, 1, 8),
+        addr_space_cast(4, 3, 1),
+        ldx(BPF_SIZE_DW, 6, 3, 0),
+        exit(),
+    ];
+    let map = analyze_casts(
+        &insns,
+        &btf,
+        &[InitialReg {
+            reg: 1,
+            struct_type_id: t_id,
+        }],
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        map.get(&(t_id, 8)),
+        Some(&CastHit {
+            alloc_size: None,
+            target_type_id: 0,
+            addr_space: AddrSpace::Arena,
+        }),
+        "ambiguous shape + arena_confirmed must emit a deferred-resolve \
+             (target_type_id=0) arena CastHit: {map:?}"
     );
 }
 

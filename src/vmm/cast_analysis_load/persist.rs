@@ -5,7 +5,12 @@ use std::path::PathBuf;
 
 use super::FwdIndexEntry;
 
-const SCHEMA_VERSION: u32 = 12;
+// v13 invalidates caches written before the arena_confirmed
+// deferred-resolve loop in src/monitor/cast_analysis/mod.rs landed.
+// Pre-v13 cast maps lack those `target_type_id == 0` arena entries, so a
+// process loading a stale v12 cache would miss them and render the
+// affected BSS u64 fields as plain integers instead of typed pointers.
+const SCHEMA_VERSION: u32 = 13;
 
 #[derive(Serialize, Deserialize)]
 struct PersistedAddrSpace(u8);

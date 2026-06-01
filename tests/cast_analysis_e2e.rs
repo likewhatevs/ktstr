@@ -73,9 +73,13 @@
 //! analyzer, BPF builder, freeze rendezvous, render_cast_pointer,
 //! read_kva) surfaces with the same error path.
 
+mod common;
+
 use anyhow::Result;
+use common::failure_dump::read_failure_dump;
 use ktstr::assert::AssertResult;
-use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
+use ktstr::prelude::VmResult;
+use ktstr::scenario::ops::{HoldSpec, Step, await_accessor_ready, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
@@ -178,34 +182,21 @@ fn struct_member<'a>(
 /// `counter` (u32 at offset 8) MUST render as plain integers,
 /// never as Ptr.
 fn scenario_cast_analysis_chases_kernel_kptr(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
-    let dump_path = ctx.failure_dump_path()?;
-
+    await_accessor_ready();
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
-    let mut result = execute_steps(ctx, steps)?;
+    execute_steps(ctx, steps)
+}
 
-    let json = match std::fs::read_to_string(&dump_path) {
-        Ok(s) => s,
-        Err(e) => {
-            result.record_fail(ktstr::assert::AssertDetail::new(
-                ktstr::assert::DetailKind::Other,
-                format!(
-                    "failure dump file missing at {}: {e} (freeze coordinator did \
-                     not write — either SCX_EXIT_ERROR_STALL never latched, the \
-                     dump path failed silently, or the run was torn down before \
-                     the dump completed)",
-                    dump_path.display()
-                ),
-            ));
-            anyhow::bail!("failure dump file missing at {}", dump_path.display());
-        }
-    };
-
-    let dump: serde_json::Value =
-        serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("dump JSON parse: {e}"))?;
+/// Host-side post_vm assertion for `cast_analysis_chases_kernel_kptr`.
+/// The guest is a separate process and cannot read the host-written
+/// dump, so the chase assertions run here; the callback's Err is a hard
+/// FAIL (`PostVmAssertionFailure`) that `expect_err` does not invert.
+fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
+    let dump = read_failure_dump(result)?;
 
     let task_storage = find_task_storage_map(&dump)?;
     let entries = task_storage
@@ -549,21 +540,20 @@ fn scenario_cast_analysis_chases_kernel_kptr(ctx: &ktstr::scenario::Ctx) -> Resu
         );
     }
 
-    result.note(format!(
-        "cast analysis pipeline E2E: dump at {} carries scx_task_map \
+    eprintln!(
+        "cast analysis pipeline E2E: dump carries scx_task_map \
          with {} entries, {} non-null payloads. Located ktstr_arena_ctx \
          render with cast-chased task_kptr=0x{task_kptr_value:x} → \
          {}{deref_type_name}{{pid={pid_int:?}, comm.kind={comm_kind:?}, \
          member count={}}}; magic=0x{magic_value:016x} (Uint, not chased), \
          counter={counter_value} (Uint, not chased)",
-        dump_path.display(),
         entries.len(),
         payloads.len(),
         if was_truncated { "truncated " } else { "" },
         members.len(),
-    ));
+    );
 
-    Ok(result)
+    Ok(())
 }
 
 #[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
@@ -580,14 +570,51 @@ static __KTSTR_ENTRY_CAST_ANALYSIS_KERNEL_KPTR: ktstr::test_support::KtstrTestEn
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
-        // The scheduler intentionally dies (SCX_EXIT_ERROR_STALL).
-        // The framework would record a failed AssertResult; flip
-        // it to PASS with `expect_err`. Real defects (missing
-        // dump, missing chase) bail via `anyhow::bail!`, which
-        // bubbles up as an Err that `expect_err` cannot mask.
+        // The scheduler intentionally dies (SCX_EXIT_ERROR_STALL);
+        // `expect_err: true` inverts that to PASS. The chase assertions
+        // run in check_cast_analysis_chases_kernel_kptr, a
+        // post_vm_unconditional callback whose Err is a hard FAIL via
+        // PostVmAssertionFailure — `expect_err` does NOT invert it, so a
+        // real chase regression fails the test.
         expect_err: true,
+        post_vm_unconditional: Some(check_cast_analysis_chases_kernel_kptr),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
+
+/// Find the `sdt_allocations` entry whose slot range contains a chased
+/// arena pointer, returning its rendered `payload`. Used by the
+/// bss-to-arena check when the renderer's dedup ("already rendered in
+/// sdt_allocations") skips the inline chase: the typed payload is then in
+/// `dump.sdt_allocations` instead. `user_addr` (sdt_alloc/snapshot.rs) is
+/// the slot start windowed to the low 32 bits (`data_ptr & 0xFFFF_FFFF`);
+/// the chased `arena_value` is the payload pointer (slot_start + header),
+/// so this RANGE-matches `[user_addr, user_addr + elem_size)` rather than
+/// testing equality. `elem_size` is the slot size; slots do not overlap,
+/// so the match is unique.
+fn find_sdt_allocation_by_addr(
+    dump: &serde_json::Value,
+    arena_value: u64,
+) -> Option<&serde_json::Value> {
+    let needle = arena_value & 0xFFFF_FFFF;
+    let allocations = dump.get("sdt_allocations")?.as_array()?;
+    for snapshot in allocations {
+        let Some(elem_size) = snapshot.get("elem_size").and_then(|s| s.as_u64()) else {
+            continue;
+        };
+        let Some(entries) = snapshot.get("entries").and_then(|e| e.as_array()) else {
+            continue;
+        };
+        for entry in entries {
+            let Some(user_addr) = entry.get("user_addr").and_then(|a| a.as_u64()) else {
+                continue;
+            };
+            if user_addr <= needle && needle < user_addr.saturating_add(elem_size) {
+                return entry.get("payload");
+            }
+        }
+    }
+    None
+}
 
 /// Locate the scheduler's `.bss` map inside the dump. Same name-suffix
 /// rule the existing `failure_dump_e2e.rs::scenario_failure_dump_renders_bss_fields`
@@ -663,34 +690,21 @@ fn find_scheduler_bss_map(dump: &serde_json::Value) -> Result<&serde_json::Value
 /// not flag the offset, mirroring the `magic`/`counter` negative-control
 /// pattern from the existing kernel-kptr scenario.
 fn scenario_cast_analysis_chases_bss_to_arena(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
-    let dump_path = ctx.failure_dump_path()?;
-
+    await_accessor_ready();
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
-    let mut result = execute_steps(ctx, steps)?;
+    execute_steps(ctx, steps)
+}
 
-    let json = match std::fs::read_to_string(&dump_path) {
-        Ok(s) => s,
-        Err(e) => {
-            result.record_fail(ktstr::assert::AssertDetail::new(
-                ktstr::assert::DetailKind::Other,
-                format!(
-                    "failure dump file missing at {}: {e} (freeze coordinator did \
-                     not write -- either SCX_EXIT_ERROR_STALL never latched, the \
-                     dump path failed silently, or the run was torn down before \
-                     the dump completed)",
-                    dump_path.display()
-                ),
-            ));
-            anyhow::bail!("failure dump file missing at {}", dump_path.display());
-        }
-    };
-
-    let dump: serde_json::Value =
-        serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("dump JSON parse: {e}"))?;
+/// Host-side post_vm assertion for `cast_analysis_chases_bss_to_arena`.
+/// The guest cannot read the host-written dump, so the BSS→arena chase
+/// assertions run here; the callback's Err is a hard FAIL
+/// (`PostVmAssertionFailure`) that `expect_err` does not invert.
+fn check_cast_analysis_chases_bss_to_arena(result: &VmResult) -> Result<()> {
+    let dump = read_failure_dump(result)?;
 
     let bss_map = find_scheduler_bss_map(&dump)?;
     // The .bss map's `value` is the BTF-rendered Datasec (libbpf
@@ -794,60 +808,87 @@ fn scenario_cast_analysis_chases_bss_to_arena(ctx: &ktstr::scenario::Ctx) -> Res
         );
     }
 
-    // The chase MUST have succeeded: `deref` is `Some(...)` and
-    // `deref_skipped_reason` is None. A populated reason here means
-    // the render reached `read_arena` but it returned None -- most
-    // likely the captured arena snapshot did not include the page
-    // containing the freshest taskc, OR the user_addr fell outside
-    // the snapshot's `[user_vm_start .. user_vm_start + 4G)` window.
-    if let Some(reason) = arena_target
+    // Branch on the chase outcome (three cases):
+    //   (a) `deref` present, no skip reason -> the chase inlined the
+    //       target struct; verify it directly.
+    //   (b) skip reason == "already rendered in sdt_allocations" -> the
+    //       renderer's intentional dedup fired (chase_arena_pointer in
+    //       btf_render/mod.rs): the chased slot is also a typed entry in
+    //       `dump.sdt_allocations`, so the renderer declined to render it
+    //       twice. This is correct production behavior, not a failure --
+    //       the same typed payload is in the dump; verify it THERE.
+    //       Whether the dedup fires is real arena state: it turns on
+    //       whether the task whose taskc sits in `arena_target` is still
+    //       live (its sdt_alloc slot enumerated by the freeze-time
+    //       pre-pass) at the dump moment, so the test must accept both
+    //       outcomes to be deterministic.
+    //   (c) any other skip reason -> a real chase failure; FAIL.
+    let skipped_reason = arena_target
         .get("deref_skipped_reason")
-        .and_then(|r| r.as_str())
-    {
-        anyhow::bail!(
-            "`arena_target` chase was attempted but did not complete: \
-             deref_skipped_reason={reason:?}. The cast analysis flagged the \
-             field correctly, but the renderer could not read the target \
-             struct. Likely causes: read_arena returned None (page outside \
-             captured snapshot), `is_arena_addr` rejected the value (the BSS \
-             write put a non-arena address into the field), or the BTF size \
-             of ktstr_arena_ctx was unresolvable. arena_target value: \
-             0x{arena_value:x}"
-        );
-    }
-    let deref = arena_target.get("deref").ok_or_else(|| {
-        anyhow::anyhow!(
-            "`arena_target` Ptr has no `deref` AND no `deref_skipped_reason` -- \
-             the chase was either not attempted (depth cap, cycle, null value), \
-             or the JSON shape changed. arena_target value: 0x{arena_value:x}; \
-             arena_target: {arena_target}"
-        )
-    })?;
-
-    // The dereffed value must be a Struct whose type_name is
-    // `ktstr_arena_ctx`. `chase_arena_pointer` reads `read_size =
-    // min(btf_size, POINTER_CHASE_CAP)` bytes and renders against the
-    // target type; ktstr_arena_ctx is 24 bytes so no Truncated wrap
-    // is expected here, but accept it for forward compatibility if
-    // the struct ever exceeds POINTER_CHASE_CAP.
-    let (deref_struct, was_truncated) = match deref.get("kind").and_then(|k| k.as_str()) {
-        Some("struct") => (deref, false),
-        Some("truncated") => (
-            deref
-                .get("partial")
-                .ok_or_else(|| anyhow::anyhow!("Truncated has no `partial`: {deref}"))?,
-            true,
-        ),
-        Some(other) => {
-            anyhow::bail!(
-                "`arena_target` deref must be Struct or Truncated{{partial: Struct}}, \
-                 got kind={other:?}; deref: {deref}"
-            );
-        }
-        None => {
-            anyhow::bail!("`arena_target` deref has no `kind` field: {deref}");
-        }
-    };
+        .and_then(|r| r.as_str());
+    let (deref_struct, was_truncated, verify_source): (&serde_json::Value, bool, &str) =
+        match skipped_reason {
+            None => {
+                let deref = arena_target.get("deref").ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "`arena_target` Ptr has no `deref` AND no \
+                         `deref_skipped_reason` -- the chase was either not \
+                         attempted (depth cap, cycle, null value), or the JSON \
+                         shape changed. arena_target value: 0x{arena_value:x}; \
+                         arena_target: {arena_target}"
+                    )
+                })?;
+                // ktstr_arena_ctx is 24 bytes so no Truncated wrap is
+                // expected, but accept it for forward compatibility if the
+                // struct ever exceeds POINTER_CHASE_CAP.
+                match deref.get("kind").and_then(|k| k.as_str()) {
+                    Some("struct") => (deref, false, "inline deref"),
+                    Some("truncated") => (
+                        deref.get("partial").ok_or_else(|| {
+                            anyhow::anyhow!("Truncated has no `partial`: {deref}")
+                        })?,
+                        true,
+                        "inline deref (truncated)",
+                    ),
+                    Some(other) => anyhow::bail!(
+                        "`arena_target` deref must be Struct or \
+                         Truncated{{partial: Struct}}, got kind={other:?}; deref: {deref}"
+                    ),
+                    None => anyhow::bail!("`arena_target` deref has no `kind` field: {deref}"),
+                }
+            }
+            // Must match the dedup reason string emitted at
+            // btf_render/mod.rs (chase_arena_pointer); a drift falls to
+            // the `Some(other)` arm and fails loudly.
+            Some("already rendered in sdt_allocations") => {
+                // The typed payload is in `dump.sdt_allocations`. Match the
+                // chased pointer to its slot by the LOW 32 BITS (sdt_alloc
+                // `user_addr` is `data_ptr & 0xFFFF_FFFF`); range-match
+                // because `arena_target` holds the payload pointer
+                // (slot_start + header) while `user_addr` is the slot start.
+                let payload = find_sdt_allocation_by_addr(&dump, arena_value).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "`arena_target` chase was dedup-skipped (\"already rendered \
+                         in sdt_allocations\") but no sdt_allocations slot's \
+                         [user_addr, user_addr+elem_size) range contains the low 32 \
+                         bits of arena_value=0x{arena_value:x} (0x{:x}). The \
+                         renderer's dedup index claims the slot is rendered there, \
+                         but the dump's sdt_allocations disagree.",
+                        arena_value & 0xFFFF_FFFF
+                    )
+                })?;
+                (payload, false, "sdt_allocations (dedup)")
+            }
+            Some(other) => anyhow::bail!(
+                "`arena_target` chase did not complete: deref_skipped_reason=\
+                 {other:?}. The cast analysis flagged the field correctly, but the \
+                 renderer could not read the target struct. Likely causes: \
+                 read_arena returned None (page outside captured snapshot), \
+                 `is_arena_addr` rejected the value (the BSS write put a non-arena \
+                 address into the field), or the BTF size of ktstr_arena_ctx was \
+                 unresolvable. arena_target value: 0x{arena_value:x}"
+            ),
+        };
     let deref_kind_inner = deref_struct
         .get("kind")
         .and_then(|k| k.as_str())
@@ -959,16 +1000,15 @@ fn scenario_cast_analysis_chases_bss_to_arena(ctx: &ktstr::scenario::Ctx) -> Res
         );
     }
 
-    result.note(format!(
-        "BSS->arena cast pipeline E2E: dump at {} carries `.bss` map with \
-         ktstr_bss_arena_holder render where arena_target=0x{arena_value:x} -> \
+    eprintln!(
+        "BSS->arena cast pipeline E2E ({verify_source}): dump carries `.bss` map \
+         with ktstr_bss_arena_holder render where arena_target=0x{arena_value:x} -> \
          {}{deref_type_name}{{magic=0x{magic_value:016x}, counter={counter_value}}}; \
          bss_plain_counter={plain_value} (Uint, not chased -- negative control)",
-        dump_path.display(),
         if was_truncated { "truncated " } else { "" },
-    ));
+    );
 
-    Ok(result)
+    Ok(())
 }
 
 #[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
@@ -988,10 +1028,13 @@ static __KTSTR_ENTRY_CAST_ANALYSIS_BSS_TO_ARENA: ktstr::test_support::KtstrTestE
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
         // Matches the kernel-kptr scenario: the scheduler intentionally
-        // dies via SCX_EXIT_ERROR_STALL; flip the framework's failed
-        // AssertResult to PASS. Real defects bail via `anyhow::bail!`
-        // and bypass `expect_err`.
+        // dies via SCX_EXIT_ERROR_STALL; `expect_err: true` inverts that
+        // to PASS. The BSS→arena chase assertions run in
+        // check_cast_analysis_chases_bss_to_arena, a post_vm_unconditional
+        // callback whose Err is a hard FAIL via PostVmAssertionFailure —
+        // `expect_err` does NOT invert it.
         expect_err: true,
+        post_vm_unconditional: Some(check_cast_analysis_chases_bss_to_arena),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
@@ -1028,34 +1071,22 @@ static __KTSTR_ENTRY_CAST_ANALYSIS_BSS_TO_ARENA: ktstr::test_support::KtstrTestE
 fn scenario_cast_analysis_sdt_alloc_bridge_resolves_fwd(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
-    let dump_path = ctx.failure_dump_path()?;
-
+    await_accessor_ready();
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
-    let mut result = execute_steps(ctx, steps)?;
+    execute_steps(ctx, steps)
+}
 
-    let json = match std::fs::read_to_string(&dump_path) {
-        Ok(s) => s,
-        Err(e) => {
-            result.record_fail(ktstr::assert::AssertDetail::new(
-                ktstr::assert::DetailKind::Other,
-                format!(
-                    "failure dump file missing at {}: {e} (freeze coordinator did \
-                     not write -- either SCX_EXIT_ERROR_STALL never latched, the \
-                     dump path failed silently, or the run was torn down before \
-                     the dump completed)",
-                    dump_path.display()
-                ),
-            ));
-            anyhow::bail!("failure dump file missing at {}", dump_path.display());
-        }
-    };
-
-    let dump: serde_json::Value =
-        serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("dump JSON parse: {e}"))?;
+/// Host-side post_vm assertion for
+/// `cast_analysis_sdt_alloc_bridge_resolves_fwd`. The guest cannot read
+/// the host-written dump, so the sdt_alloc bridge / Fwd-chase assertions
+/// run here; the callback's Err is a hard FAIL (`PostVmAssertionFailure`)
+/// that `expect_err` does not invert.
+fn check_cast_analysis_sdt_alloc_bridge_resolves_fwd(result: &VmResult) -> Result<()> {
+    let dump = read_failure_dump(result)?;
 
     let task_storage = find_task_storage_map(&dump)?;
     let entries = task_storage
@@ -1298,18 +1329,17 @@ fn scenario_cast_analysis_sdt_alloc_bridge_resolves_fwd(
         );
     }
 
-    result.note(format!(
-        "sdt_alloc bridge E2E: dump at {} carries scx_task_map with \
+    eprintln!(
+        "sdt_alloc bridge E2E: dump carries scx_task_map with \
          {} entries; data_members_seen={data_members_seen}, \
          any_bridge_fired={any_bridge_fired}, payloads_inspected={payloads_inspected}. \
          No entry's `data` showed a 'forward declaration' skip reason; \
          every chased ktstr_arena_ctx payload carries the alloc-time \
          sentinel and counter.",
-        dump_path.display(),
         entries.len(),
-    ));
+    );
 
-    Ok(result)
+    Ok(())
 }
 
 /// Asserts that the cross-subprog arena pointer propagation
@@ -1337,34 +1367,22 @@ fn scenario_cast_analysis_sdt_alloc_bridge_resolves_fwd(
 fn scenario_cast_analysis_cross_subprog_arena_chase(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
-    let dump_path = ctx.failure_dump_path()?;
-
+    await_accessor_ready();
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
-    let mut result = execute_steps(ctx, steps)?;
+    execute_steps(ctx, steps)
+}
 
-    let json = match std::fs::read_to_string(&dump_path) {
-        Ok(s) => s,
-        Err(e) => {
-            result.record_fail(ktstr::assert::AssertDetail::new(
-                ktstr::assert::DetailKind::Other,
-                format!(
-                    "failure dump file missing at {}: {e} (freeze coordinator did \
-                     not write -- either SCX_EXIT_ERROR_STALL never latched, the \
-                     dump path failed silently, or the run was torn down before \
-                     the dump completed)",
-                    dump_path.display()
-                ),
-            ));
-            anyhow::bail!("failure dump file missing at {}", dump_path.display());
-        }
-    };
-
-    let dump: serde_json::Value =
-        serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("dump JSON parse: {e}"))?;
+/// Host-side post_vm assertion for
+/// `cast_analysis_cross_subprog_arena_chase`. The guest cannot read the
+/// host-written dump, so the cross-subprog fixpoint assertions run here;
+/// the callback's Err is a hard FAIL (`PostVmAssertionFailure`) that
+/// `expect_err` does not invert.
+fn check_cast_analysis_cross_subprog_arena_chase(result: &VmResult) -> Result<()> {
+    let dump = read_failure_dump(result)?;
 
     let task_storage = find_task_storage_map(&dump)?;
     let entries = task_storage
@@ -1451,18 +1469,17 @@ fn scenario_cast_analysis_cross_subprog_arena_chase(
         );
     }
 
-    result.note(format!(
-        "cross-subprog arena chase E2E: dump at {} carries scx_task_map \
+    eprintln!(
+        "cross-subprog arena chase E2E: dump carries scx_task_map \
          with {} entries, {} ktstr_arena_ctx payloads. Located \
          stashed_arena_ptr rendered as Ptr with arena annotation -- \
          fixpoint propagation across publish→map→chase subprog boundary \
          is working.",
-        dump_path.display(),
         entries.len(),
         payloads.len(),
-    ));
+    );
 
-    Ok(result)
+    Ok(())
 }
 
 #[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
@@ -1475,7 +1492,13 @@ static __KTSTR_ENTRY_CAST_ANALYSIS_CROSS_SUBPROG: ktstr::test_support::KtstrTest
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
+        // SCX_EXIT_ERROR_STALL is the intentional kill; `expect_err: true`
+        // inverts that to PASS. The cross-subprog fixpoint assertions run
+        // in check_cast_analysis_cross_subprog_arena_chase, a
+        // post_vm_unconditional callback whose Err is a hard FAIL via
+        // PostVmAssertionFailure — `expect_err` does NOT invert it.
         expect_err: true,
+        post_vm_unconditional: Some(check_cast_analysis_cross_subprog_arena_chase),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
@@ -1496,9 +1519,12 @@ static __KTSTR_ENTRY_CAST_ANALYSIS_SDT_ALLOC_BRIDGE: ktstr::test_support::KtstrT
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
-        // SCX_EXIT_ERROR_STALL is the intentional kill; flip the
-        // framework's failed AssertResult to PASS. Real defects
-        // bail via `anyhow::bail!` and bypass `expect_err`.
+        // SCX_EXIT_ERROR_STALL is the intentional kill; `expect_err: true`
+        // inverts that to PASS. The bridge / Fwd-chase assertions run in
+        // check_cast_analysis_sdt_alloc_bridge_resolves_fwd, a
+        // post_vm_unconditional callback whose Err is a hard FAIL via
+        // PostVmAssertionFailure — `expect_err` does NOT invert it.
         expect_err: true,
+        post_vm_unconditional: Some(check_cast_analysis_sdt_alloc_bridge_resolves_fwd),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
