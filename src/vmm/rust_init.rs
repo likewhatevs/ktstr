@@ -4560,6 +4560,12 @@ fn start_trace_pipe() -> (Option<Arc<AtomicBool>>, Option<std::thread::JoinHandl
 /// thread-spawn boundaries without re-resolving the static.
 static BPF_MAP_WRITE_DONE_LATCH: OnceLock<Arc<Latch>> = OnceLock::new();
 
+/// Shared `accessor_ready` latch — fired by `hvc0_poll_loop` on
+/// `SIGNAL_ACCESSOR_READY`, awaited by
+/// `scenario::ops::await_accessor_ready`. Mirrors
+/// [`BPF_MAP_WRITE_DONE_LATCH`].
+static ACCESSOR_READY_LATCH: OnceLock<Arc<Latch>> = OnceLock::new();
+
 /// Lazily materialise and return the shared `bpf_map_write_done`
 /// latch. Both the producer (`hvc0_poll_loop`) and consumer (scenario
 /// `wait_for_map_write` gate) reach for this — the first caller
@@ -4567,6 +4573,17 @@ static BPF_MAP_WRITE_DONE_LATCH: OnceLock<Arc<Latch>> = OnceLock::new();
 /// subsequent caller observes the same instance.
 pub(crate) fn bpf_map_write_done_latch() -> Arc<Latch> {
     BPF_MAP_WRITE_DONE_LATCH
+        .get_or_init(|| Arc::new(Latch::new()))
+        .clone()
+}
+
+/// Lazily materialise and return the shared `accessor_ready` latch.
+/// The producer (`hvc0_poll_loop`, on `SIGNAL_ACCESSOR_READY`) and the
+/// consumer (`scenario::ops::await_accessor_ready`) both reach for this;
+/// the first caller installs the [`Latch`], every subsequent caller
+/// observes the same instance. Mirrors [`bpf_map_write_done_latch`].
+pub(crate) fn accessor_ready_latch() -> Arc<Latch> {
+    ACCESSOR_READY_LATCH
         .get_or_init(|| Arc::new(Latch::new()))
         .clone()
 }
@@ -4712,6 +4729,9 @@ fn hvc0_poll_loop(stop: &AtomicBool, trace_stop: Option<&AtomicBool>) {
         }
         if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_BPF_WRITE_DONE) {
             bpf_map_write_done_latch().set();
+        }
+        if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_ACCESSOR_READY) {
+            accessor_ready_latch().set();
         }
         if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_VC_SHUTDOWN) {
             tracing::info!("ktstr-init: shutdown request received, draining");

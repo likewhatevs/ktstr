@@ -34,7 +34,7 @@ use zerocopy::FromBytes;
 use super::bulk::MAX_BULK_FRAME_PAYLOAD;
 use super::pi_mutex::PiMutex;
 use super::virtio_console::{
-    SIGNAL_BPF_WRITE_DONE, SIGNAL_VC_DUMP, SIGNAL_VC_SHUTDOWN, VirtioConsole,
+    SIGNAL_ACCESSOR_READY, SIGNAL_BPF_WRITE_DONE, SIGNAL_VC_DUMP, SIGNAL_VC_SHUTDOWN, VirtioConsole,
 };
 use super::wire::{FRAME_HEADER_SIZE, ShmEntry, ShmMessage};
 
@@ -203,6 +203,17 @@ pub fn request_shutdown(virtio_con: &Arc<PiMutex<VirtioConsole>>) {
 /// on slot 0) with a single wake byte.
 pub fn request_bpf_map_write_done(virtio_con: &Arc<PiMutex<VirtioConsole>>) {
     virtio_con.lock().queue_input(&[SIGNAL_BPF_WRITE_DONE]);
+}
+
+/// Notify the guest that the freeze coordinator has adopted its
+/// kernel-symbol accessor (`owned_accessor` is `Some`), so a failure
+/// dump captured from now on renders real BPF map values. Pushes
+/// `SIGNAL_ACCESSOR_READY` through the virtio-console RX queue; the
+/// guest's `hvc0_poll_loop` sets the `accessor_ready` latch so a
+/// scenario blocked in `scenario::ops::await_accessor_ready` resumes.
+/// Mirrors [`request_bpf_map_write_done`].
+pub fn request_accessor_ready(virtio_con: &Arc<PiMutex<VirtioConsole>>) {
+    virtio_con.lock().queue_input(&[SIGNAL_ACCESSOR_READY]);
 }
 
 #[cfg(test)]

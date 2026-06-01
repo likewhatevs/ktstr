@@ -114,6 +114,17 @@ pub const SIGNAL_VC_SHUTDOWN: u8 = 0xD3;
 /// `host_comms::request_bpf_map_write_done`.
 pub const SIGNAL_BPF_WRITE_DONE: u8 = 0xBF;
 
+/// RX wake byte: the host freeze coordinator has ADOPTED its
+/// kernel-symbol accessor (`owned_accessor` is now `Some`), so a
+/// failure dump captured from this point renders real BPF map values
+/// instead of placeholders. The guest's `hvc0_poll_loop` recognises
+/// the byte and sets the `accessor_ready` latch so a scenario blocked
+/// in [`crate::scenario::ops::await_accessor_ready`] resumes and
+/// triggers its stall only once the dump path is fully armed. Host side:
+/// `host_comms::request_accessor_ready`, pushed at the coordinator's
+/// accessor-adoption point.
+pub const SIGNAL_ACCESSOR_READY: u8 = 0xAC;
+
 // `NUM_PORTS` lives in [`super::wire`]; re-exported here so existing
 // call sites keep working. Port 0 = console (hvc0); port 1 = bulk
 // TLV stream (`/dev/vport0p1`); port 2 = scheduler-stats relay

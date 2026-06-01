@@ -29,11 +29,11 @@
 
 mod common;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
-use ktstr::prelude::SCHEMA_SINGLE;
-use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
+use ktstr::prelude::{SCHEMA_SINGLE, VmResult};
+use ktstr::scenario::ops::{HoldSpec, Step, await_accessor_ready, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
@@ -579,42 +579,59 @@ static __KTSTR_ENTRY_FAILURE_DUMP_BSS: ktstr::test_support::KtstrTestEntry =
 /// every cell of a multi-entry array, with the right per-key values —
 /// proof the per-key stride math read the correct entry, not key 0
 /// repeated.
+///
+/// The failure dump is written by the freeze coordinator in the HOST
+/// process; the guest is a separate process and cannot read it. The
+/// guest body only triggers the stall that produces the dump — the
+/// assertions run in the [`check_array_entries_dump`]
+/// `post_vm_unconditional` callback, which reads the host sidecar path.
 #[ktstr_test(
     scheduler = KTSTR_SCHED,
     extra_sched_args = ["--stall-after=1"],
     watchdog_timeout_s = 3,
     duration_s = 10,
     expect_err = true,
+    post_vm_unconditional = check_array_entries_dump,
 )]
 fn failure_dump_renders_array_entries(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
-    let dump_path = ctx.failure_dump_path()?;
-
+    // Wait for the freeze coordinator to ADOPT its accessor before the
+    // --stall-after=1 stall fires; otherwise the dump renders placeholder
+    // ARRAY values (the accessor is built async and may not be adopted by
+    // the time an early stall freezes the VM). This host-side gate is what
+    // makes the no-exit-stall dump render real per-key values.
+    await_accessor_ready();
+    // Trigger the --stall-after=1 SCX_EXIT_ERROR_STALL that drives the
+    // freeze coordinator to capture the dump; the host-side
+    // `check_array_entries_dump` post_vm callback does the assertions
+    // (the guest is a separate process and cannot read the
+    // host-written dump).
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
-    let mut result = execute_steps(ctx, steps)?;
+    execute_steps(ctx, steps)
+}
 
-    let json = match std::fs::read_to_string(&dump_path) {
-        Ok(s) => s,
-        Err(e) => {
-            result.record_fail(ktstr::assert::AssertDetail::new(
-                ktstr::assert::DetailKind::Other,
-                format!(
-                    "failure dump file missing at {}: {e} (freeze coordinator did \
-                     not write — the SCX_EXIT_ERROR_STALL latch did not fire or the \
-                     write failed silently)",
-                    dump_path.display()
-                ),
-            ));
-            anyhow::bail!(
-                "failure dump file missing at {} — freeze coordinator did not write \
-                 the JSON dump",
-                dump_path.display()
-            );
-        }
-    };
+/// Host-side post_vm assertion for `failure_dump_renders_array_entries`.
+/// Reads the freeze coordinator's dump from the HOST sidecar path
+/// ([`VmResult::failure_dump_path`]) and verifies the multi-entry ARRAY
+/// fixture rendered every key. Runs unconditionally (the run "fails"
+/// via the expected stall, so a conditional post_vm could be
+/// suppressed); the framework attaches the `PostVmAssertionFailure`
+/// marker to this callback's Err so a wrong render stays a hard FAIL
+/// even though expect_err inverts the stall itself to PASS.
+fn check_array_entries_dump(result: &VmResult) -> Result<()> {
+    let dump_path = result.failure_dump_path()?;
+
+    let json = std::fs::read_to_string(&dump_path).with_context(|| {
+        format!(
+            "failure dump file missing at {} — freeze coordinator did not write \
+             the JSON dump (SCX_EXIT_ERROR_STALL latch did not fire or the write \
+             failed silently)",
+            dump_path.display()
+        )
+    })?;
 
     let value: serde_json::Value = serde_json::from_str(&json)
         .map_err(|e| anyhow::anyhow!("dump file is not valid JSON: {e}"))?;
@@ -740,13 +757,13 @@ fn failure_dump_renders_array_entries(ctx: &ktstr::scenario::Ctx) -> Result<Asse
         );
     }
 
-    result.note(format!(
+    eprintln!(
         "multi-entry ARRAY fixture `{name}` rendered all {} keys with correct \
          magic + echoed key (dump: {})",
         entries.len(),
         dump_path.display()
-    ));
-    Ok(result)
+    );
+    Ok(())
 }
 
 /// Asserts that the freeze coordinator's host-side capture modules

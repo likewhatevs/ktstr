@@ -549,6 +549,44 @@ pub fn execute_defs(ctx: &Ctx, defs: Vec<CgroupDef>) -> Result<AssertResult> {
     execute_steps(ctx, vec![Step::with_defs(defs, HoldSpec::FULL)])
 }
 
+/// Block until the host freeze coordinator has ADOPTED its
+/// kernel-symbol accessor — signalled via the
+/// `SIGNAL_ACCESSOR_READY` wake byte →
+/// `accessor_ready_latch` (set by `hvc0_poll_loop`). A failure dump
+/// captured by a stall AFTER this returns renders real BPF map values
+/// instead of placeholders, because the coordinator's `owned_accessor`
+/// is adopted before the stall fires. Call this in a dump-asserting
+/// scenario before triggering its stall (e.g. before [`execute_steps`]
+/// with a `--stall-after` scheduler).
+///
+/// Guest-only: a no-op on the host (unit tests), where the latch is
+/// never armed. Warn-and-proceed on a 60s timeout — a never-adopted
+/// accessor is a worker failure, and surfacing it as a placeholder dump
+/// is more useful than blocking the test forever (mirrors the
+/// `wait_for_map_write` gate's soft-timeout policy). On that timeout the
+/// "renders real values" guarantee above does NOT hold: the wait returns
+/// without adoption and a subsequent stall may dump placeholders, which
+/// the test's post-VM dump assertions then surface as a failure.
+///
+/// The latch is sticky (level-triggered) and sets once, on the FIRST
+/// adoption. A re-init publish after a scheduler swap
+/// (`Op::ReplaceScheduler`) reuses the same latch, so a later
+/// `await_accessor_ready` returns immediately and does NOT re-synchronise
+/// on the post-swap adoption — today's only caller gates the first stall,
+/// before any swap.
+pub fn await_accessor_ready() {
+    if guest_comms::is_guest() {
+        let latch = crate::vmm::rust_init::accessor_ready_latch();
+        if !latch.wait_timeout(Duration::from_secs(60)) {
+            tracing::warn!(
+                "await_accessor_ready timed out after 60s — host freeze \
+                 coordinator did not signal accessor adoption; a dump from a \
+                 stall after this point may render placeholder map values"
+            );
+        }
+    }
+}
+
 /// Execute a sequence of steps against the given context.
 ///
 /// Convenience wrapper around [`execute_steps_with`] that passes

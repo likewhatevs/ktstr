@@ -3232,7 +3232,12 @@ impl KtstrVm {
                 // exits immediately on the `owned_accessor.is_some()`
                 // path. The cap exists exclusively to keep a
                 // catastrophic prerequisite failure from converting
-                // a test fault into an unbounded test run.
+                // a test fault into an unbounded test run. The
+                // `scenario::ops::await_accessor_ready` pre-stall gate
+                // front-runs this cap for stall-driven dumps (the stall
+                // fires only after adoption), so post-gate it backs only
+                // the never-adopt cases: pre-adoption `Op::CaptureSnapshot`
+                // requests and scenarios that don't await the gate.
                 let mut bsp_done_final_pass_start: Option<Instant> = None;
                 const DEFERRED_DRAIN_GRACE: Duration = Duration::from_secs(30);
                 // Mirror of `bsp_done_final_pass` for the SCHED_EXIT
@@ -3549,6 +3554,15 @@ impl KtstrVm {
                         if let Some(prog) = prog {
                             owned_prog_accessor = Some(prog);
                         }
+                        // Signal the guest that the accessor is adopted
+                        // (`owned_accessor` is now `Some`), so a scenario
+                        // gated on `await_accessor_ready` resumes and triggers
+                        // its stall only now — guaranteeing the freeze dump
+                        // renders real BPF map values, not placeholders.
+                        // Pushed at the adoption point (not the worker's
+                        // SUCCEEDED publish) so the dump path is fully armed
+                        // before the guest can stall.
+                        super::host_comms::request_accessor_ready(&freeze_coord_virtio_con);
                         // (virt-KASLR derivation lives in
                         // `coord_kaslr_offset` above — sourced from
                         // the shared `kern_virt_kaslr` Arc, populated
