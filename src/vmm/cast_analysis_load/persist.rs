@@ -117,9 +117,24 @@ fn cache_dir() -> Option<PathBuf> {
 /// flake.
 const ANALYZER_FINGERPRINT: &str = env!("KTSTR_CAST_ANALYZER_FINGERPRINT");
 
+/// Compile-time fingerprint of the whole `Cargo.lock`, emitted by
+/// build.rs (`cargo_lock_fingerprint`). Folded into the cache key
+/// alongside [`ANALYZER_FINGERPRINT`] so a dependency bump — a `btf-rs`
+/// (BTF parsing) or `libbpf-rs` / `libbpf-sys` (BPF-opcode constants)
+/// version change that can alter the cast map — invalidates the cache
+/// even when the analyzer source is unchanged. Only the cast-analysis
+/// cache folds this in: the kernels / models / disk_template caches are
+/// produced by external tools (Kbuild, downloads, in-VM mkfs) and are
+/// dependency-independent, so fingerprinting them would force pointless
+/// rebuilds.
+const CARGO_LOCK_FINGERPRINT: &str = env!("KTSTR_CARGO_LOCK_FINGERPRINT");
+
 fn cache_path(hash: u64) -> Option<PathBuf> {
-    cache_dir()
-        .map(|d| d.join(format!("v{SCHEMA_VERSION}_{ANALYZER_FINGERPRINT}_{hash:016x}.bin")))
+    cache_dir().map(|d| {
+        d.join(format!(
+            "v{SCHEMA_VERSION}_{ANALYZER_FINGERPRINT}_{CARGO_LOCK_FINGERPRINT}_{hash:016x}.bin"
+        ))
+    })
 }
 
 #[allow(clippy::type_complexity)]

@@ -279,6 +279,18 @@ int main(void) {{
         cast_analyzer_fingerprint()
     );
 
+    // Fingerprint the whole Cargo.lock so the cast-analysis cache
+    // self-invalidates on any dependency bump: persist::cache_path folds
+    // this into the cache key. A btf-rs (BTF parsing) or libbpf-rs /
+    // libbpf-sys (BPF-opcode constants) version change can alter the cast
+    // map with no ktstr source change, so the analyzer-source fingerprint
+    // alone would serve a stale result. Only the cast cache folds this in;
+    // kernels / models / disk_template are dependency-independent.
+    println!(
+        "cargo:rustc-env=KTSTR_CARGO_LOCK_FINGERPRINT={:016x}",
+        cargo_lock_fingerprint()
+    );
+
     // Build busybox from source for guest shell mode.
     // Cache: skip if $OUT_DIR/busybox exists. After build.rs config
     // changes, run `cargo clean` to force a rebuild.
@@ -892,7 +904,11 @@ fn siphash_13(bytes: &[u8]) -> u64 {
 /// over-conservative direction (never a stale serve). Each watched dir
 /// gets a `rerun-if-changed` so cargo re-runs build.rs (recomputing the
 /// env) when the analyzer source changes; a missing watched dir is a
-/// hard error (see the loop body), not a silent skip.
+/// hard error (see the loop body), not a silent skip. Crate-version
+/// drift (btf-rs / libbpf) is handled separately by
+/// [`cargo_lock_fingerprint`], which is folded alongside this into the
+/// cast cache key — so this fingerprint covers only the analyzer's own
+/// source.
 fn cast_analyzer_fingerprint() -> u64 {
     use siphasher::sip::SipHasher13;
     use std::hash::Hasher;
@@ -913,7 +929,10 @@ fn cast_analyzer_fingerprint() -> u64 {
         // / struct-resolve traversal alters the cached cast map for an
         // unchanged binary -- same footgun. Their callees stay within
         // btf-rs (a crate dep) + std, so the watched-source closure ends
-        // here. Whole-subtree rather than per-fn because extracting
+        // here; btf-rs / libbpf crate-version drift is caught by the
+        // whole-Cargo.lock fingerprint folded into the cast cache key
+        // (cargo_lock_fingerprint + persist::cache_path).
+        // Whole-subtree rather than per-fn because extracting
         // individual fns needs a parser; the extra invalidations on
         // unrelated edits in these modules are cheap (one BPF-object
         // re-analysis) and these modules already invalidate other caches
@@ -945,6 +964,35 @@ fn cast_analyzer_fingerprint() -> u64 {
             .unwrap_or_else(|e| panic!("read {} for analyzer fingerprint: {e}", f.display()));
         h.write(&bytes);
     }
+    h.finish()
+}
+
+/// SipHasher13 fingerprint of the entire `Cargo.lock`, emitted by
+/// build.rs as `KTSTR_CARGO_LOCK_FINGERPRINT` and folded into the
+/// cast-analysis cache key (see
+/// `vmm::cast_analysis_load::persist::cache_path`). A dependency bump —
+/// a `btf-rs` (BTF parsing) or `libbpf-rs` / `libbpf-sys` (BPF-opcode
+/// constants) version change — can alter the cast map with no ktstr
+/// source change, so the analyzer-source fingerprint alone would serve a
+/// stale result. Only the cast cache folds this in; the kernels / models
+/// / disk_template caches are produced by external tools and are
+/// dependency-independent. Hashing the WHOLE lockfile invalidates the
+/// cast cache on any dependency bump, even unrelated crates — the safe
+/// over-conservative direction (never a stale serve), costing one cast
+/// re-analysis per scheduler binary per lockfile change.
+/// `rerun-if-changed` re-runs build.rs on a lockfile bump.
+fn cargo_lock_fingerprint() -> u64 {
+    use siphasher::sip::SipHasher13;
+    use std::hash::Hasher;
+    println!("cargo:rerun-if-changed=Cargo.lock");
+    // Fail loud on an unreadable Cargo.lock rather than hashing the
+    // empty-string default (a constant that would let machines with
+    // different dependency sets share a cache entry) — mirrors
+    // cast_analyzer_fingerprint's panic-on-read-failure posture.
+    let lock = std::fs::read_to_string("Cargo.lock")
+        .unwrap_or_else(|e| panic!("read Cargo.lock for dependency fingerprint: {e}"));
+    let mut h = SipHasher13::new_with_keys(0, 0);
+    h.write(lock.as_bytes());
     h.finish()
 }
 
