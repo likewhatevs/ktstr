@@ -6096,6 +6096,12 @@ impl KtstrVm {
                                 // declares `struct foo;` (forward) and
                                 // another defines the body.
                                 let cast_analysis = freeze_coord_cast_map.get_full();
+                                // Single-object only: cast_lookup consults this one
+                                // map by (parent_type_id, offset). Multi-object
+                                // schedulers would need per-btf_kva selection here;
+                                // build_cast_analysis_from_bytes logs a loud error!
+                                // when >1 object carries casts (per-object BTF
+                                // id-spaces collide). See its "Single-object only" note.
                                 let cast_map_ref = cast_analysis
                                     .as_ref()
                                     .and_then(|out| out.cast_maps.first().map(|m| m.as_ref()));

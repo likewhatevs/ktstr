@@ -1599,6 +1599,39 @@ fn lazy_cast_map_get_full_returns_none_for_no_findings() {
     );
 }
 
+/// `objects_with_casts` counts only cast-bearing objects -- the gate
+/// `build_cast_analysis_from_bytes` uses to fail loudly on the
+/// unsupported multi-object case (renderer threads `first()`, cache
+/// merges into one flat map, per-object BTF id-spaces collide).
+#[test]
+fn objects_with_casts_counts_only_cast_bearing_objects() {
+    let empty = Arc::new(CastMap::new());
+    let mut m = CastMap::new();
+    m.insert(
+        (1, 0),
+        CastHit {
+            target_type_id: 2,
+            addr_space: AddrSpace::Arena,
+            alloc_size: None,
+        },
+    );
+    let with_cast = Arc::new(m);
+
+    assert_eq!(objects_with_casts(&[]), 0);
+    assert_eq!(objects_with_casts(std::slice::from_ref(&empty)), 0);
+    assert_eq!(objects_with_casts(std::slice::from_ref(&with_cast)), 1);
+    assert_eq!(
+        objects_with_casts(&[with_cast.clone(), empty.clone()]),
+        1,
+        "empty objects do not count toward the multi-object gate"
+    );
+    assert_eq!(
+        objects_with_casts(&[with_cast.clone(), with_cast.clone()]),
+        2,
+        "two cast-bearing objects is the case the guard fires on"
+    );
+}
+
 // ----- parse_btf_ext_func_entries happy paths --------------------
 
 /// Records produce one [`FuncEntry`] each, with `insn_offset`

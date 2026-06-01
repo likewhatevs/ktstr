@@ -5,11 +5,16 @@ use std::path::PathBuf;
 
 use super::FwdIndexEntry;
 
-// v13 invalidates caches written before the arena_confirmed
-// deferred-resolve loop in src/monitor/cast_analysis/mod.rs landed.
-// Pre-v13 cast maps lack those `target_type_id == 0` arena entries, so a
-// process loading a stale v12 cache would miss them and render the
-// affected BSS u64 fields as plain integers instead of typed pointers.
+// Explicit on-disk FORMAT version for PersistedCastAnalysis. Bump only
+// for wire-layout changes (a field add/remove/retype). Analyzer BEHAVIOR
+// changes no longer need a manual bump: they self-invalidate via
+// ANALYZER_FINGERPRINT (a build.rs hash of the cast-analysis source,
+// folded into cache_path below). v13 was the last manual bump — it
+// invalidated caches written before the arena_confirmed deferred-resolve
+// loop in src/monitor/cast_analysis/mod.rs landed (pre-v13 cast maps lack
+// the `target_type_id == 0` arena entries, so a stale v12 cache rendered
+// the affected BSS u64 fields as plain integers instead of typed
+// pointers).
 const SCHEMA_VERSION: u32 = 13;
 
 #[derive(Serialize, Deserialize)]
@@ -99,8 +104,22 @@ fn cache_dir() -> Option<PathBuf> {
     crate::cache::resolve_cache_root_with_suffix("cast_analysis").ok()
 }
 
+/// Compile-time fingerprint of the cast-analysis source, emitted by
+/// build.rs (`cast_analyzer_fingerprint`) from a SipHash-13 of every
+/// non-test `.rs` under `src/monitor/cast_analysis`,
+/// `src/vmm/cast_analysis_load`, `src/monitor/sdt_alloc` (which
+/// resolves the cached `alloc_size_types`), plus `src/monitor/btf_render` and
+/// `src/monitor/bpf_map` (whose modifier-peel / struct-resolve helpers
+/// resolve every cast's terminal type). Folding it into the cache key makes the
+/// cache self-invalidate whenever the analyzer's behavior changes, with
+/// no manual `SCHEMA_VERSION` bump — closing the footgun where a stale
+/// cache served the old analyzer's output and masked a fixed bug as a
+/// flake.
+const ANALYZER_FINGERPRINT: &str = env!("KTSTR_CAST_ANALYZER_FINGERPRINT");
+
 fn cache_path(hash: u64) -> Option<PathBuf> {
-    cache_dir().map(|d| d.join(format!("v{SCHEMA_VERSION}_{hash:016x}.bin")))
+    cache_dir()
+        .map(|d| d.join(format!("v{SCHEMA_VERSION}_{ANALYZER_FINGERPRINT}_{hash:016x}.bin")))
 }
 
 #[allow(clippy::type_complexity)]
@@ -153,6 +172,15 @@ pub(super) fn try_save(
     btf_count: usize,
     alloc_size_types: &[(u64, String)],
 ) {
+    // Symmetric with get_full's read-side collapse (mod.rs:401/431):
+    // a result with no cast entries AND an empty fwd index loads back
+    // as None, so persisting it only wastes a disk write plus a
+    // recompute on every subsequent run. Skip the write. (alloc_size_types
+    // alone never resurrects a cached result -- the read-side collapse
+    // ignores it -- so it does not gate this guard.)
+    if cast_map.is_empty() && fwd_index.is_empty() {
+        return;
+    }
     let Some(path) = cache_path(hash) else { return };
 
     let persisted = PersistedCastAnalysis {
@@ -255,7 +283,19 @@ mod tests {
         let _env_lock = lock_env();
         let _cache = isolated_cache_dir();
 
-        let cast_map = BTreeMap::new();
+        // Non-empty cast map so try_save actually persists -- the
+        // empty-result guard would otherwise skip the write and this test
+        // would pass vacuously via a nonexistent-file miss instead of
+        // exercising the btf_count check it names.
+        let mut cast_map = BTreeMap::new();
+        cast_map.insert(
+            (1, 0),
+            CastHit {
+                target_type_id: 9,
+                addr_space: AddrSpace::Arena,
+                alloc_size: None,
+            },
+        );
         let fwd_index = HashMap::new();
         let hash = 0x1234_5678_9ABC_DEF0u64;
         try_save(hash, &cast_map, &fwd_index, 3, &[]);
@@ -270,5 +310,25 @@ mod tests {
     fn load_nonexistent_returns_none() {
         let _env_lock = lock_env();
         assert!(try_load(0xFFFF_FFFF_FFFF_FFFFu64, 1).is_none());
+    }
+
+    #[test]
+    fn try_save_skips_empty_result() {
+        let _env_lock = lock_env();
+        let _cache = isolated_cache_dir();
+
+        // An empty result (no cast entries, empty fwd index) loads back as
+        // None via get_full's collapse, so try_save must not persist it --
+        // otherwise every run pays a disk write plus a recompute on the
+        // next load. Verify the write is skipped: try_load finds no file.
+        let cast_map = BTreeMap::new();
+        let fwd_index = HashMap::new();
+        let hash = 0xABCD_1234_5678_9999u64;
+        try_save(hash, &cast_map, &fwd_index, 2, &[]);
+
+        assert!(
+            try_load(hash, 2).is_none(),
+            "empty result must not be persisted"
+        );
     }
 }

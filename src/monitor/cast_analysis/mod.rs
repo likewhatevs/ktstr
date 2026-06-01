@@ -708,18 +708,21 @@ struct Access {
 /// To recover those typings, [`analyze_casts`] runs the forward walk
 /// repeatedly. Each iteration:
 /// 1. Builds a fresh [`Analyzer`] (or one pre-populated with the prior
-///    iteration's `caller_arg_types` and `arena_stx_findings` via
-///    [`Analyzer::with_carryover`]).
+///    iteration's `caller_arg_types`, `arena_stx_findings`, and
+///    `arena_alloc_size_index` via [`Analyzer::with_carryover`]).
 /// 2. Seeds entry registers and runs the full forward walk.
-/// 3. Extracts the post-walk `caller_arg_types` and
-///    `arena_stx_findings` via [`Analyzer::into_carryover`].
-/// 4. Compares both extracted maps against the prior iteration's. If
-///    identical, the fixpoint has been reached.
+/// 3. Extracts the post-walk `caller_arg_types`, `arena_stx_findings`,
+///    and `arena_alloc_size_index` via [`Analyzer::into_carryover`].
+/// 4. Compares all three extracted maps against the prior iteration's.
+///    If identical, the fixpoint has been reached.
 ///
-/// Only `caller_arg_types` and `arena_stx_findings` carry across
-/// passes. The remaining analyzer state — `kptr_findings`, `patterns`,
-/// `arena_confirmed`, the register file, the stack-slot map — is
-/// rebuilt from scratch each pass. Carrying `arena_stx_findings` is
+/// Only `caller_arg_types`, `arena_stx_findings`, and
+/// `arena_alloc_size_index` carry across passes. The remaining analyzer
+/// state — `kptr_findings`, `patterns`, `arena_confirmed`, the register
+/// file, the stack-slot map — is rebuilt from scratch each pass.
+/// `arena_alloc_size_index` carries for the same monotonic-evidence
+/// reason documented on [`Analyzer::with_carryover`]'s field. Carrying
+/// `arena_stx_findings` is
 /// safe because every entry is sourced from direct evidence the slot
 /// held an arena VA (an allocator-return seed, an
 /// `ARENA_ALLOC_KFUNC_NAMES` allowlist hit, or
@@ -774,15 +777,23 @@ pub fn analyze_casts(
             subprog_returns,
         );
         let (next_args, next_stx, next_alloc_size) = a.into_carryover();
-        // Convergence: both `arena_stx_findings` AND
-        // `arena_alloc_size_index` must stabilise. The index is
-        // populated alongside the findings map at every STX site, so
-        // in practice they converge together — but a STX writing the
-        // same slot twice with disagreeing sizes flips the index from
-        // `Some(n)` to `None` without affecting `arena_stx_findings`,
-        // and we want that flip to trigger another pass so the
-        // finalize emits the conservative `None`.
-        if next_stx == arena_stx && next_alloc_size == alloc_size_idx && pass > 0 {
+        // Convergence: ALL THREE carried states — `caller_arg_types`,
+        // `arena_stx_findings`, and `arena_alloc_size_index` — must
+        // stabilise. The index is populated alongside the findings map
+        // at every STX site, so in practice they converge together —
+        // but a STX writing the same slot twice with disagreeing sizes
+        // flips the index from `Some(n)` to `None` without affecting
+        // `arena_stx_findings`, and we want that flip to trigger
+        // another pass so the finalize emits the conservative `None`.
+        // `caller_arg_types` is included so a pass that refines only
+        // cross-subprog argument typings (without touching the STX
+        // maps) cannot be mistaken for a fixpoint and cut a
+        // still-converging analysis short.
+        if next_args == caller_args
+            && next_stx == arena_stx
+            && next_alloc_size == alloc_size_idx
+            && pass > 0
+        {
             // Converged: re-run one more time with the converged
             // carry-over so finalize() sees a fully populated
             // analyzer. `into_carryover` consumed `a` above, so a

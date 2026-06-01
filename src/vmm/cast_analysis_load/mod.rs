@@ -420,13 +420,24 @@ pub(crate) fn cached_cast_analysis_for_scheduler(path: &Path) -> Option<Arc<Cast
                 .flat_map(|m| m.iter())
                 .map(|(&k, &v)| (k, v))
                 .collect();
-            persist::try_save(
-                hash,
-                &merged_for_cache,
-                &out.fwd_index,
-                out.btfs.len(),
-                &out.alloc_size_types,
-            );
+            // Do not cache a lossy multi-object merge. When >1 embedded
+            // object carries casts the flat (parent_id, offset) merge
+            // collides (per-object BTF id-spaces -- see the "Single-object
+            // only" note on build_cast_analysis_from_bytes), which already
+            // logged a loud error!. Caching the collided map would mask
+            // that error on every later cache hit (the build path, and its
+            // error!, is skipped on a hit), turning the loud guard into a
+            // one-shot. Skip the write so the guard re-fires every run
+            // until per-btf_kva selection lands.
+            if objects_with_casts(&out.cast_maps) <= 1 {
+                persist::try_save(
+                    hash,
+                    &merged_for_cache,
+                    &out.fwd_index,
+                    out.btfs.len(),
+                    &out.alloc_size_types,
+                );
+            }
             let total_casts: usize = out.cast_maps.iter().map(|m| m.len()).sum();
             if total_casts == 0 && out.fwd_index.is_empty() {
                 None
@@ -437,12 +448,27 @@ pub(crate) fn cached_cast_analysis_for_scheduler(path: &Path) -> Option<Arc<Cast
         .clone()
 }
 
+/// Count embedded BPF objects that produced at least one cast.
+///
+/// The dump renderer threads a single cast map (`cast_maps.first()`
+/// in the freeze coordinator) and the disk cache merges all objects
+/// into one (`get_full`); both are correct only when at most one
+/// object carries casts. Per-object program BTFs each restart their
+/// user-type ids at `vmlinux_last + 1`, so the same
+/// `(parent_id, offset)` from two objects collides -- the merge
+/// overwrites, `first()` drops. A count > 1 is therefore
+/// unrenderable today; `build_cast_analysis_from_bytes` logs a loud
+/// `error!` so the gap is never silent.
+fn objects_with_casts(cast_maps: &[Arc<CastMap>]) -> usize {
+    cast_maps.iter().filter(|m| !m.is_empty()).count()
+}
+
 /// Run the cast-analysis pipeline on already-loaded scheduler
 /// binary bytes.
 ///
 /// Locates every embedded BPF object inside `.bpf.objs`, parses
 /// each object's program BTF, runs the analyzer per-object, and
-/// returns the merged [`CastMap`] alongside the parsed BTFs and a
+/// returns one [`CastMap`] per object alongside the parsed BTFs and a
 /// name-keyed cross-BTF Fwd resolution index over every complete
 /// struct/union across them. The renderer's chase paths consume
 /// the index when a `BTF_KIND_FWD` pointee in one BTF resolves to
@@ -460,20 +486,28 @@ pub(crate) fn cached_cast_analysis_for_scheduler(path: &Path) -> Option<Arc<Cast
 /// [`cached_cast_analysis_for_scheduler`] for the production
 /// path-driven, content-hash-cached, lazy-on-demand wrapper.
 ///
-/// # Why merge across objects
+/// # Single-object only (multi-object guarded)
 ///
-/// scx schedulers ship a single embedded BPF object per binary
-/// today. The merge is a no-op in that case. Multi-object schedulers
-/// (theoretical) produce one [`CastMap`] per object; merging into a
-/// single map keeps the runtime threading uniform — the renderer's
-/// per-map [`crate::monitor::btf_render::MemReader::cast_lookup`]
-/// dispatches on `(parent_btf_id, offset)` and the BTF type ids in
-/// disjoint program BTFs do not collide because each program BTF is
-/// loaded under its own `btf_kva` at runtime, and the renderer
-/// indexes the cast map only after it has resolved a parent struct
-/// in a specific BTF (so `(parent_id, offset)` is implicitly scoped
-/// to that BTF). The conservative "false negatives are fine, false
-/// positives are not" stance from
+/// scx schedulers ship one embedded BPF object per binary today, so
+/// `cast_maps` has a single entry and the downstream single-map
+/// threading is exact. Multi-object schedulers do not exist and are
+/// NOT handled: [`crate::monitor::btf_render::MemReader::cast_lookup`]
+/// consults one flat map keyed on `(parent_type_id, offset)`, the
+/// freeze coordinator threads only `cast_maps.first()`, and the disk
+/// cache would persist a single merged map. Per-object program BTFs
+/// each restart user-type ids at `vmlinux_last + 1`, so the same
+/// `(parent_id, offset)` from two objects collides -- the merge
+/// overwrites, `first()` drops. Arena resolution is unaffected:
+/// `resolve_arena_type` is already `requesting_btf_kva`-scoped; only
+/// the cast lookup is flat.
+///
+/// `objects_with_casts` detects the multi-object case and
+/// `build_cast_analysis_from_bytes` logs a loud `error!`; `get_full`
+/// then skips the disk write so the `error!` re-fires every run
+/// instead of being masked by a cached lossy map. Correct support
+/// needs per-`btf_kva` cast-map selection, unimplemented because no
+/// multi-object scheduler exists. The conservative "false negatives
+/// are fine, false positives are not" stance from
 /// [`crate::monitor::cast_analysis`] still applies.
 pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput {
     let parse_t0 = std::time::Instant::now();
@@ -540,6 +574,27 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
         objects = cast_maps.len(),
         "cast_analysis: analyze_casts pipeline finished"
     );
+
+    // Fail loudly on the unsupported multi-object case rather than
+    // silently dropping or mis-rendering casts. See `objects_with_casts`
+    // and the "Single-object only" note above: the renderer threads
+    // `cast_maps.first()` and the disk cache merges every object into a
+    // single flat `(parent_id, offset)` map, but per-object program BTFs
+    // restart their id-space at `vmlinux_last + 1`, so casts from objects
+    // 2+ collide on the merge and are dropped by `first()`. No multi-object
+    // scx scheduler ships today; this guards the future.
+    let cast_bearing_objects = objects_with_casts(&cast_maps);
+    if cast_bearing_objects > 1 {
+        tracing::error!(
+            objects = cast_maps.len(),
+            cast_bearing_objects,
+            "cast analysis found casts in more than one embedded BPF object; \
+             multi-object cast rendering is unsupported -- casts from objects \
+             2+ are dropped (renderer) or overwritten (disk cache) because \
+             per-object BTF id-spaces collide. correct support needs \
+             per-btf_kva cast-map selection."
+        );
+    }
 
     // Build the cross-BTF Fwd resolution index over every parsed
     // BTF. `build_fwd_index` walks each BTF's id space looking for

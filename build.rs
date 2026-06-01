@@ -266,6 +266,19 @@ int main(void) {{
     // either enumeration fails the union check.
     generate_shift_registry(&out_dir);
 
+    // Fingerprint the cast-analysis source so the on-disk cast cache
+    // (src/vmm/cast_analysis_load/persist.rs) self-invalidates whenever
+    // the analyzer changes — with no manual SCHEMA_VERSION bump. Without
+    // this, an analyzer-behavior change reuses a stale cached result and
+    // masks a just-fixed analyzer bug as a flake (the 2026-06-01
+    // arena_confirmed-drop bug hid this way for hours). The fn emits
+    // `rerun-if-changed` for the watched dirs so cargo recomputes the env
+    // when the analyzer source changes.
+    println!(
+        "cargo:rustc-env=KTSTR_CAST_ANALYZER_FINGERPRINT={:016x}",
+        cast_analyzer_fingerprint()
+    );
+
     // Build busybox from source for guest shell mode.
     // Cache: skip if $OUT_DIR/busybox exists. After build.rs config
     // changes, run `cargo clean` to force a rebuild.
@@ -861,4 +874,97 @@ fn siphash_13(bytes: &[u8]) -> u64 {
     let mut h = SipHasher13::new_with_keys(0, 0);
     h.write(bytes);
     h.finish()
+}
+
+/// SipHasher13 fingerprint of every non-test `.rs` file under the
+/// cast-analysis source dirs: the analyzer in `src/monitor/cast_analysis`,
+/// its on-demand loader in `src/vmm/cast_analysis_load`,
+/// `src/monitor/sdt_alloc` (whose `discover_payload_btf_id` +
+/// `MAX_BTF_ID_PROBE` resolve the cached `alloc_size_types`), and
+/// `src/monitor/btf_render` + `src/monitor/bpf_map` (whose
+/// `peel_modifiers` / `type_size` / `resolve_to_struct_id` resolve every
+/// cast's terminal type, 20+ call sites in cast_analysis/mod.rs). The
+/// hash is folded into the disk-cache key (`persist.rs::cache_path`) so
+/// the cache self-invalidates on any analyzer change without a manual
+/// `SCHEMA_VERSION` bump. Files named `tests.rs` are excluded; inline
+/// `#[cfg(test)]` modules in the watched `.rs` files are still hashed, so
+/// a test-only edit to such a file does invalidate the cache — the safe,
+/// over-conservative direction (never a stale serve). Each watched dir
+/// gets a `rerun-if-changed` so cargo re-runs build.rs (recomputing the
+/// env) when the analyzer source changes; a missing watched dir is a
+/// hard error (see the loop body), not a silent skip.
+fn cast_analyzer_fingerprint() -> u64 {
+    use siphasher::sip::SipHasher13;
+    use std::hash::Hasher;
+    let mut files: Vec<PathBuf> = Vec::new();
+    for dir in [
+        "src/monitor/cast_analysis",
+        "src/vmm/cast_analysis_load",
+        // sdt_alloc feeds the cached output's `alloc_size_types` via
+        // `discover_payload_btf_id` + `MAX_BTF_ID_PROBE` (see
+        // cast_analysis_load::build_cast_analysis_from_bytes's alloc-size
+        // resolution loop), so a change there alters the cached result and
+        // must invalidate it -- same footgun class this fingerprint closes.
+        "src/monitor/sdt_alloc",
+        // cast_analysis resolves every cast's terminal type through
+        // btf_render::{peel_modifiers,peel_modifiers_with_id,type_size}
+        // and bpf_map::resolve_to_struct_id (20+ call sites in
+        // cast_analysis/mod.rs); a change to either module's modifier-peel
+        // / struct-resolve traversal alters the cached cast map for an
+        // unchanged binary -- same footgun. Their callees stay within
+        // btf-rs (a crate dep) + std, so the watched-source closure ends
+        // here. Whole-subtree rather than per-fn because extracting
+        // individual fns needs a parser; the extra invalidations on
+        // unrelated edits in these modules are cheap (one BPF-object
+        // re-analysis) and these modules already invalidate other caches
+        // when they change.
+        "src/monitor/btf_render",
+        "src/monitor/bpf_map",
+    ] {
+        println!("cargo:rerun-if-changed={dir}");
+        // Fail loud if a watched dir is missing: a typo or a layout move
+        // would otherwise silently drop that dir's contribution and
+        // resurrect the stale-cache footgun this fingerprint exists to
+        // close. collect_fingerprint_files tolerates a missing dir for its
+        // recursion case, so the top-level existence guard lives here.
+        let path = std::path::Path::new(dir);
+        assert!(
+            path.is_dir(),
+            "cast-analysis fingerprint dir missing: {dir} (layout moved? update build.rs)"
+        );
+        collect_fingerprint_files(path, &mut files);
+    }
+    // Sort for a deterministic hash independent of readdir order.
+    files.sort();
+    let mut h = SipHasher13::new_with_keys(0, 0);
+    for f in &files {
+        // Hash the path too so a rename (without content change) still
+        // perturbs the fingerprint.
+        h.write(f.to_string_lossy().as_bytes());
+        let bytes = std::fs::read(f)
+            .unwrap_or_else(|e| panic!("read {} for analyzer fingerprint: {e}", f.display()));
+        h.write(&bytes);
+    }
+    h.finish()
+}
+
+/// Recursively collect non-test `.rs` files under `dir` into `out`.
+/// A missing dir returns no files (tolerant for the recursion case);
+/// the caller asserts each top-level watched dir exists, so a typo'd or
+/// moved analyzer dir fails the build loudly rather than silently
+/// dropping its fingerprint contribution.
+fn collect_fingerprint_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_fingerprint_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
+            && path.file_name().and_then(|n| n.to_str()) != Some("tests.rs")
+        {
+            out.push(path);
+        }
+    }
 }
