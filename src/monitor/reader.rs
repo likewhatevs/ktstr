@@ -2049,25 +2049,6 @@ pub(crate) struct MonitorConfig<'a> {
     /// used unchanged (test path; production callers always populate
     /// this).
     pub rq_refresh: Option<&'a RqRefresh>,
-    /// Optional boot-complete eventfd. When set, [`monitor_loop`]
-    /// blocks on this eventfd (alongside `kill_evt` and a 5 s
-    /// timeout) BEFORE entering the sample loop, so the first
-    /// sample observes a fully booted guest. The eventfd is fired
-    /// by the freeze coordinator's bulk-drain dispatch when the
-    /// guest publishes a CRC-valid
-    /// [`crate::vmm::wire::MSG_TYPE_SYS_RDY`] TLV frame on the
-    /// virtio-console bulk port, which happens after the guest's
-    /// `ktstr_guest_init` completes `mount_filesystems()`. By that
-    /// point `setup_per_cpu_areas` and KASLR randomization have
-    /// long since completed (both happen during kernel boot,
-    /// strictly before userspace init runs) — both prerequisites
-    /// for the per-iteration `__per_cpu_offset[]` /
-    /// `page_offset_base` reads to land in DRAM. When `None` (test
-    /// path or eventfd-create failure), the pre-loop wait is
-    /// skipped entirely; the per-iteration `data_valid` gate in
-    /// the sample loop remains as defense-in-depth against
-    /// pre-boot zeros.
-    pub sys_rdy: Option<&'a EventFd>,
     /// Optional scheduler-attach watchdog reset. When `Some`, the
     /// loop reads `*scx_root` each iteration via
     /// [`WatchdogReset::scx_root_pa`] and, on the first 0 →
@@ -2375,103 +2356,6 @@ pub(crate) fn monitor_loop(
         };
     }
     let mut epoll_buf = [EpollEvent::default(); 2];
-
-    // Pre-sample boot-complete wait. When `cfg.sys_rdy` is set we
-    // register the eventfd alongside `kill_evt` on a dedicated epoll
-    // instance and block for up to 5 s. (The production VM path runs
-    // this wait in the freeze coordinator's `start_monitor` closure and
-    // passes `cfg.sys_rdy = None`, so this branch is the in-`monitor_loop`
-    // fallback for direct callers that set `cfg.sys_rdy`.) The
-    // eventfd is fired by the freeze coordinator's bulk-drain
-    // dispatch when the guest publishes a CRC-valid
-    // [`crate::vmm::wire::MSG_TYPE_SYS_RDY`] TLV frame on the
-    // virtio-console bulk port — sent by `ktstr_guest_init` after
-    // `mount_filesystems()`. By the time the SYS_RDY frame reaches
-    // the host, `setup_per_cpu_areas` has populated
-    // `__per_cpu_offset[]` and the KASLR randomizer has populated
-    // `page_offset_base` (both kernel-boot prerequisites that
-    // complete strictly before userspace init runs), so the first
-    // sample iteration's refresh produces in-DRAM PAs.
-    //
-    // Three exit conditions:
-    //   1. sys_rdy fires: proceed to the sample loop (normal path).
-    //   2. kill_evt fires: VM died before booting. Skip the sample
-    //      loop entirely, returning the empty MonitorLoopResult.
-    //   3. 5 s timeout: the guest never published SYS_RDY (e.g.
-    //      KTSTR_EXIT cmdline triggered an early exit before
-    //      `ktstr_guest_init` reached the SYS_RDY emission, or the
-    //      bulk port wasn't yet open when the guest tried to send).
-    //      Best-effort fall through to the sample loop; reads will
-    //      still hit the per-iteration refresh which tolerates
-    //      pre-boot zeros via the existing `data_valid` gate.
-    if let Some(sys_rdy) = cfg.sys_rdy {
-        let boot_epoll = match Epoll::new() {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(err = %e, "monitor: boot epoll_create1 failed");
-                return MonitorLoopResult {
-                    samples,
-                    drain: crate::vmm::host_comms::BulkDrainResult {
-                        entries: shm_entries,
-                    },
-                    watchdog_observation,
-                    page_offset: latched_page_offset,
-                    preemption_threshold_ns,
-                    boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
-                };
-            }
-        };
-        let boot_fd = sys_rdy.as_raw_fd();
-        if let Err(e) = boot_epoll.ctl(
-            ControlOperation::Add,
-            boot_fd,
-            EpollEvent::new(EventSet::IN, boot_fd as u64),
-        ) {
-            tracing::warn!(err = %e, "monitor: epoll_ctl add sys_rdy failed");
-        }
-        if let Err(e) = boot_epoll.ctl(
-            ControlOperation::Add,
-            kill_fd,
-            EpollEvent::new(EventSet::IN, kill_fd as u64),
-        ) {
-            tracing::warn!(err = %e, "monitor: epoll_ctl add kill_evt (boot wait) failed");
-        }
-        let mut boot_buf = [EpollEvent::default(); 2];
-        // 5 s ceiling: a healthy guest emits SYS_RDY within ~3 s
-        // of boot; longer is a stuck guest. The fallthrough path
-        // (no SYS_RDY) is gated by the per-iteration `data_valid`
-        // latch in the sample loop below, so a missed SYS_RDY does
-        // not produce phantom-zero walks — it just delays the first
-        // valid sample. Tighter timeout means VM teardown does not
-        // wait on this thread joining when the test exits without
-        // sending SYS_RDY (e.g. early-init crash).
-        let timeout_ms: i32 = 5_000;
-        let mut killed = false;
-        match boot_epoll.wait(timeout_ms, &mut boot_buf) {
-            Ok(n) => {
-                for ev in &boot_buf[..n] {
-                    if ev.fd() == kill_fd {
-                        killed = true;
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(err = %e, "monitor: boot epoll_wait failed");
-            }
-        }
-        if killed || kill.load(Ordering::Acquire) {
-            return MonitorLoopResult {
-                samples,
-                drain: crate::vmm::host_comms::BulkDrainResult {
-                    entries: shm_entries,
-                },
-                watchdog_observation,
-                page_offset: latched_page_offset,
-                preemption_threshold_ns,
-                boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
-            };
-        }
-    }
 
     loop {
         if kill.load(Ordering::Acquire) {
@@ -3086,7 +2970,6 @@ mod tests {
             start_kernel_map: super::super::symbols::START_KERNEL_MAP,
             phys_base: 0,
             rq_refresh: None,
-            sys_rdy: None,
             watchdog_reset: None,
         }
     }

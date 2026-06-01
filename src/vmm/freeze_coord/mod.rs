@@ -11111,18 +11111,6 @@ impl KtstrVm {
                     start_kernel_map: start_kernel_map_post_wait,
                     phys_base,
                     rq_refresh: Some(&rq_refresh),
-                    // `sys_rdy: None` — the boot-complete wait has
-                    // already happened above, BEFORE
-                    // `phys_base` resolution and the text-mapped PA
-                    // recomputes. Re-running the wait here would be
-                    // redundant: the freeze coordinator's TOKEN_TX
-                    // handler fires the eventfd exactly once
-                    // (`Option::take` makes the write fire-once), and
-                    // the per-iteration `page_offset` /
-                    // `__per_cpu_offset[]` refresh + `data_valid`
-                    // gate inside `monitor_loop` already covers the
-                    // pre-boot-zero defense in depth.
-                    sys_rdy: None,
                     watchdog_reset: watchdog_reset_cfg,
                 };
                 // `rq_pas` empty: the loop sources every per-CPU
