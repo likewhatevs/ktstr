@@ -351,12 +351,12 @@ pub(crate) fn combine_post_vm_errs(
 /// INCONCLUSIVE — the VM could not produce the artifact the assertion
 /// needs (e.g. a load-starved VM whose BPF probe never attached,
 /// leaving a placeholder failure dump), as distinct from a real
-/// regression. The framework detects the attached [`HostSkipRequest`]
+/// regression. The framework detects the attached `HostSkipRequest`
 /// marker and converts the run to
 /// [`crate::assert::AssertResult::skip`] instead of a failure.
 ///
 /// A genuine `Err` from a sibling callback dominates (see
-/// [`combine_post_vm_errs`]): a skip request never masks a regression.
+/// `combine_post_vm_errs`): a skip request never masks a regression.
 pub fn post_vm_skip(reason: impl Into<String>) -> anyhow::Error {
     anyhow::anyhow!("{}", reason.into()).context(HostSkipRequest)
 }
