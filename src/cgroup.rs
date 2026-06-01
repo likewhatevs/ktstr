@@ -667,12 +667,21 @@ impl CgroupManager {
                 walk_env = crate::KTSTR_CGROUP_WALK_ROOT_ENV,
             ));
         }
+        // No controllers to enable means no subtree_control walk, and the
+        // parent cgroup is only needed when the scenario actually creates
+        // child cgroups -- which `create_cgroup`'s `create_dir_all` makes
+        // lazily -- or enables controllers. Return BEFORE the eager parent
+        // mkdir so a cgroup-free scenario (no CgroupDefs, no workloads --
+        // e.g. snapshot-bridge tests, host-topology reads, macro-attribute
+        // fixtures) runs without root or a cgroup fs. Previously this mkdir
+        // fired unconditionally and EACCES'd a non-root caller (or a
+        // deliberately-unwritable dummy parent like `/nonexistent/...`).
+        if controllers.is_empty() {
+            return Ok(());
+        }
         if !self.parent.exists() {
             fs::create_dir_all(&self.parent)
                 .with_context(|| format!("mkdir {}", self.parent.display()))?;
-        }
-        if controllers.is_empty() {
-            return Ok(());
         }
         if let Ok(rel) = self.parent.strip_prefix(root) {
             let available_path = root.join("cgroup.controllers");

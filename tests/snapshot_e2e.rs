@@ -44,6 +44,15 @@ use ktstr::scenario::ops::{HoldSpec, Op, Step, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 use ktstr::topology::TestTopology;
 
+/// Cgroup parent shared by the pure-host snapshot tests below. Never
+/// created on disk: every step here uses an empty `setup` (no
+/// `CgroupDef`s), so `CgroupManager::setup_under_root` early-returns
+/// on empty controllers before touching the cgroup fs, and
+/// `CgroupManager::new` itself only stores the path. The path is
+/// therefore inert — these tests exercise the snapshot bridge and
+/// executor wiring, not the cgroup hierarchy.
+const HOST_SNAPSHOT_CGROUP: &str = "/nonexistent/ktstr-snapshot-host-test";
+
 #[test]
 fn snapshot_op_drives_bridge_and_stores_report_under_name() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -58,7 +67,7 @@ fn snapshot_op_drives_bridge_and_stores_report_under_name() {
 
     let _guard = bridge.set_thread_local();
 
-    let cgroups = CgroupManager::new("/nonexistent/snapshot_e2e");
+    let cgroups = CgroupManager::new(HOST_SNAPSHOT_CGROUP);
     let vm_topo = ktstr::prelude::Topology::new(1, 1, 2, 1);
     let topo = TestTopology::from_vm_topology(&vm_topo);
     let ctx = Ctx::builder(&cgroups, &topo).build();
@@ -102,9 +111,15 @@ fn snapshot_op_drives_bridge_and_stores_report_under_name() {
     assert!(err.to_string().contains("nonexistent"));
 }
 
+/// A `CaptureSnapshot` op with no thread-local `SnapshotBridge`
+/// installed on the pure-host executor (no guest VM) must fail the
+/// step loudly, not silently no-op — the no-silent-drops contract in
+/// the `Op::CaptureSnapshot` host-mode arm (`scenario/ops/dispatch.rs`).
+/// A silent skip would let snapshot-backed assertions pass against
+/// zero captured data.
 #[test]
-fn snapshot_op_with_no_bridge_is_a_no_op() {
-    let cgroups = CgroupManager::new("/nonexistent/snapshot_e2e_no_bridge");
+fn snapshot_op_without_bridge_fails_loudly() {
+    let cgroups = CgroupManager::new(HOST_SNAPSHOT_CGROUP);
     let vm_topo = ktstr::prelude::Topology::new(1, 1, 2, 1);
     let topo = TestTopology::from_vm_topology(&vm_topo);
     let ctx = Ctx::builder(&cgroups, &topo).build();
@@ -114,12 +129,20 @@ fn snapshot_op_with_no_bridge_is_a_no_op() {
         ops: vec![Op::capture_snapshot("orphan")],
         hold: HoldSpec::fixed(std::time::Duration::from_millis(1)),
     }];
-    let result = execute_steps(&ctx, steps).expect("execute_steps with no bridge must succeed");
+    let result = execute_steps(&ctx, steps).expect("execute_steps returns Ok with stamped error");
     assert!(
-        result.is_pass(),
-        "scenario without a bridge must still pass: {:?}",
+        result.is_fail(),
+        "CaptureSnapshot with no bridge must fail the scenario, not no-op: {:?}",
         result.outcomes
     );
+    let detail = result
+        .failure_details()
+        .find(|d| {
+            d.message
+                .contains("no test-fixture SnapshotBridge installed")
+        })
+        .expect("AssertResult must name the missing bridge");
+    assert!(detail.message.contains("Op::CaptureSnapshot"));
 }
 
 #[test]
@@ -129,7 +152,7 @@ fn snapshot_op_with_failing_capture_does_not_abort_scenario() {
     let bridge_handle = bridge.clone();
     let _guard = bridge.set_thread_local();
 
-    let cgroups = CgroupManager::new("/nonexistent/snapshot_e2e_failing");
+    let cgroups = CgroupManager::new(HOST_SNAPSHOT_CGROUP);
     let vm_topo = ktstr::prelude::Topology::new(1, 1, 2, 1);
     let topo = TestTopology::from_vm_topology(&vm_topo);
     let ctx = Ctx::builder(&cgroups, &topo).build();
@@ -157,7 +180,7 @@ fn watch_snapshot_op_drives_register_callback() {
     let bridge_handle = bridge.clone();
     let _g = bridge.set_thread_local();
 
-    let cgroups = CgroupManager::new("/nonexistent/snapshot_watch_e2e");
+    let cgroups = CgroupManager::new(HOST_SNAPSHOT_CGROUP);
     let vm_topo = ktstr::prelude::Topology::new(1, 1, 2, 1);
     let topo = TestTopology::from_vm_topology(&vm_topo);
     let ctx = Ctx::builder(&cgroups, &topo).build();
@@ -190,7 +213,7 @@ fn watch_snapshot_op_max_3_per_scenario_errors_fourth() {
     let bridge = SnapshotBridge::new(cb).with_watch_register(reg);
     let _g = bridge.set_thread_local();
 
-    let cgroups = CgroupManager::new("/nonexistent/snapshot_watch_e2e_max");
+    let cgroups = CgroupManager::new(HOST_SNAPSHOT_CGROUP);
     let vm_topo = ktstr::prelude::Topology::new(1, 1, 2, 1);
     let topo = TestTopology::from_vm_topology(&vm_topo);
     let ctx = Ctx::builder(&cgroups, &topo).build();
@@ -229,7 +252,7 @@ fn watch_snapshot_op_unresolvable_symbol_bails_immediately() {
     let bridge = SnapshotBridge::new(cb).with_watch_register(reg);
     let _g = bridge.set_thread_local();
 
-    let cgroups = CgroupManager::new("/nonexistent/snapshot_watch_e2e_resolve");
+    let cgroups = CgroupManager::new(HOST_SNAPSHOT_CGROUP);
     let vm_topo = ktstr::prelude::Topology::new(1, 1, 2, 1);
     let topo = TestTopology::from_vm_topology(&vm_topo);
     let ctx = Ctx::builder(&cgroups, &topo).build();

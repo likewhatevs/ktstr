@@ -368,8 +368,10 @@ fn post_vm_attr_compile(ctx: &Ctx) -> Result<AssertResult> {
 }
 
 /// Check that `post_vm = NAME` is threaded into
-/// `KtstrTestEntry.post_vm` as `Some(NAME)` and the default
-/// (no `post_vm = ...` attribute) leaves the field at `None`.
+/// `KtstrTestEntry.post_vm` as `Some(NAME)` and that omitting
+/// `post_vm = ...` defaults the field to
+/// `Some(default_post_vm_periodic_fired)` — the periodic
+/// smoke-floor self-guard the macro injects — not `None`.
 #[test]
 fn entry_post_vm_attr() {
     let with_post = ktstr::test_support::find_test("post_vm_attr_compile").unwrap();
@@ -378,9 +380,18 @@ fn entry_post_vm_attr() {
         "post_vm = NAME must wire onto KtstrTestEntry.post_vm as Some(_)",
     );
     let without_post = ktstr::test_support::find_test("default_attrs_compile").unwrap();
+    // The macro injects `Some(default_post_vm_periodic_fired)` when
+    // `post_vm = ...` is omitted (ktstr-macros codegen). We assert
+    // `is_some()` rather than fn-pointer identity: the
+    // `unpredictable_function_pointer_comparisons` lint rejects comparing
+    // function pointers because addresses are not a reliable identity.
+    // The default callback's behavior has dedicated coverage in the
+    // `default_post_vm_periodic_fired_*` unit tests in
+    // `src/test_support/entry.rs`.
     assert!(
-        without_post.post_vm.is_none(),
-        "post_vm omitted from #[ktstr_test] must leave KtstrTestEntry.post_vm = None",
+        without_post.post_vm.is_some(),
+        "post_vm omitted from #[ktstr_test] must default to \
+         Some(default_post_vm_periodic_fired), not None",
     );
 }
 

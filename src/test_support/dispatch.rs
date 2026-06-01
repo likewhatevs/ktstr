@@ -426,7 +426,7 @@ pub fn ktstr_test_early_dispatch() {
             if args.iter().any(|a| a == "--list") {
                 ktstr_list_only();
                 list_verifier_cells_all();
-                list_plain_tests();
+                list_plain_tests(args.iter().any(|a| a == "--ignored"));
                 std::process::exit(0);
             } else if let Some(pos) = args.iter().position(|a| a == "--exact")
                 && let Some(name) = args.get(pos + 1)
@@ -2395,7 +2395,13 @@ pub fn analyze_sidecars(dir: Option<&std::path::Path>) -> String {
 /// names that don't match any KTSTR_TESTS entry. This lets plain
 /// tests coexist with `#[ktstr_test]` in the same binary without
 /// duplicating the ktstr entries.
-fn list_plain_tests() {
+///
+/// `ignored_only` forwards `--ignored` onto the child `--list` call
+/// so the echoed plain-test set matches the bucket nextest is
+/// enumerating (all tests vs the `#[ignore]`-only subset). Omitting
+/// the flag here lands every plain test in nextest's ignored set and
+/// silently skips them by default — see the body comment.
+fn list_plain_tests(ignored_only: bool) {
     use std::collections::HashSet;
     let ktstr_names: HashSet<&str> = KTSTR_TESTS.iter().map(|e| e.name).collect();
 
@@ -2405,7 +2411,19 @@ fn list_plain_tests() {
     };
     let mut cmd = std::process::Command::new(exe);
     cmd.env_remove("NEXTEST");
-    cmd.args(["--list", "--format", "terse"]);
+    // Forward `--ignored` so the plain-test set echoed here matches the
+    // bucket nextest is asking for. nextest computes its "ignored" set by
+    // re-running the binary with `--list --ignored`; if this child always
+    // lists ALL plain `#[test]` (no `--ignored`), every plain test lands
+    // in nextest's ignored set and is silently skipped by default
+    // (footgun #2). With the flag forwarded, only real `#[ignore]` plain
+    // tests are reported under `--ignored`, so non-ignored plain tests run
+    // by default like any other test.
+    let mut list_args: Vec<&str> = vec!["--list", "--format", "terse"];
+    if ignored_only {
+        list_args.push("--ignored");
+    }
+    cmd.args(&list_args);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::null());
     let output = match cmd.output() {
