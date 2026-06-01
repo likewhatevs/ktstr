@@ -10,4 +10,5 @@
 
 pub mod cargo_ktstr_subprocess;
 pub mod ctprof;
+pub mod failure_dump;
 pub mod fixtures;

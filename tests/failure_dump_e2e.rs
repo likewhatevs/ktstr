@@ -37,59 +37,16 @@
 
 mod common;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use common::failure_dump::read_failure_dump;
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
-use ktstr::prelude::{SCHEMA_SINGLE, VmResult, post_vm_skip};
+use ktstr::prelude::{SCHEMA_SINGLE, VmResult};
 use ktstr::scenario::ops::{HoldSpec, Step, await_accessor_ready, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-
-/// Reads the freeze coordinator's host-side failure dump for `result`
-/// and returns the parsed JSON, or a [`post_vm_skip`] request when the
-/// dump carries no maps to verify.
-///
-/// Two load-starvation paths both yield empty `maps`: the PLACEHOLDER
-/// dump (`is_placeholder=true` — rendezvous timeout / coordinator
-/// exited) and the PARTIAL dump (`is_placeholder=false` —
-/// `owned_accessor` / `dump_btf` not ready before the freeze, i.e. the
-/// BPF probe had not attached). In both, the render under test cannot be
-/// verified, so the caller skips (inconclusive). A genuinely-unreadable
-/// or non-JSON dump is a hard error. A real render bug captures maps
-/// (non-empty) and falls through to `Ok`, where the caller's assertion
-/// catches it.
-fn read_failure_dump(result: &VmResult) -> Result<serde_json::Value> {
-    let dump_path = result.failure_dump_path()?;
-    let json = std::fs::read_to_string(&dump_path).with_context(|| {
-        format!(
-            "failure dump file missing at {} — freeze coordinator did not \
-             write the JSON dump (SCX_EXIT_ERROR_STALL latch did not fire or \
-             the write failed silently)",
-            dump_path.display()
-        )
-    })?;
-    let value: serde_json::Value = serde_json::from_str(&json)
-        .map_err(|e| anyhow::anyhow!("dump file is not valid JSON: {e}"))?;
-    let no_maps = value
-        .get("maps")
-        .and_then(|m| m.as_array())
-        .is_none_or(|m| m.is_empty());
-    let is_placeholder = value
-        .get("is_placeholder")
-        .and_then(|p| p.as_bool())
-        .unwrap_or(false);
-    if is_placeholder || no_maps {
-        return Err(post_vm_skip(
-            "failure dump has no maps — the BPF probe did not attach, or dump \
-             prerequisites were unavailable before the host watchdog fired \
-             (placeholder or partial-render path under VM starvation); the \
-             render under test cannot be verified",
-        ));
-    }
-    Ok(value)
-}
 
 fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     // Adopt the freeze coordinator's accessor before the

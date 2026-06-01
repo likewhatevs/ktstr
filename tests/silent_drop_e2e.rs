@@ -13,31 +13,39 @@
 //! as a production risk — a flipped bit would force universal dump
 //! suppression).
 //!
-//! Three scenarios:
+//! Three scenarios. Each boots its workload, then asserts on the
+//! host-written dump from a `post_vm_unconditional` callback — the
+//! guest is a separate process and cannot read the host-side dump, and
+//! a callback's `Err` is a hard FAIL (`PostVmAssertionFailure`) that
+//! `expect_err` does not invert. The dump-reading scenarios use
+//! `read_dump_skip_placeholder` (skips only a placeholder dump; an
+//! empty `maps` in a real dump is the silent-drop regression they
+//! exist to catch, so it FAILS rather than skips):
 //!
-//! 1. `scenario_watchdog_stall_captured_emit_schema` — a normal
-//!    `--stall-after=1` watchdog stall reaches the late-trigger
-//!    Captured dispatch and must produce `schema = SCHEMA_SINGLE` on
-//!    disk. Pins the happy Captured-emit dispatch; a future
-//!    regression that mis-dispatches to Degraded/Dual/Suppressed on
-//!    the normal stall would surface here.
+//! 1. `scenario_watchdog_stall_captured_emit_schema` /
+//!    `check_captured_emit_schema` — a normal `--stall-after=1`
+//!    watchdog stall reaches the late-trigger Captured dispatch and
+//!    must produce `schema = SCHEMA_SINGLE`. Pins the happy
+//!    Captured-emit dispatch; a future regression that mis-dispatches
+//!    to Degraded/Dual/Suppressed on the normal stall surfaces here.
 //!
-//! 2. `scenario_clean_exit_gate_suppresses_dump` — a clean exit (no
-//!    `--stall-after`, scheduler ends via `Drop`) drives the
-//!    exit_kind gate's `kind < SCX_EXIT_ERROR` branch to suppress
-//!    dump emit. Asserts no primary dump file AND no snapshot-tagged
-//!    sibling files exist. Pins the gate's designed clean-exit
-//!    suppression semantic; a regression that over-fires the gate
-//!    (emitting dumps on clean exits) would surface here.
+//! 2. `scenario_clean_exit_gate_suppresses_dump` /
+//!    `check_clean_exit_gate_suppresses_dump` — a clean exit (no
+//!    `--stall-after`, scheduler ends via `Drop`) drives the exit_kind
+//!    gate's `kind < SCX_EXIT_ERROR` branch to suppress dump emit. The
+//!    callback asserts no primary dump file AND no snapshot-tagged
+//!    sibling files exist on the host. Pins the gate's designed
+//!    clean-exit suppression; a regression that over-fires the gate
+//!    (emitting dumps on clean exits) surfaces here.
 //!
-//! 3. `scenario_watchdog_stall_dump_populates_vcpu_regs_and_maps`
-//!    — like scenario 1 but asserts the Captured dump's `vcpu_regs`
-//!    has at least one entry with a non-zero `instruction_pointer`,
-//!    AND `maps` is non-empty. Pins the content-population invariant
-//!    against a regression where the dump file lands with valid JSON
-//!    but the BPF map enumeration or vCPU register capture silently
-//!    dropped (a failure mode that would have an empty shell pass
-//!    scenario 1's schema check).
+//! 3. `scenario_watchdog_stall_dump_populates_vcpu_regs_and_maps` /
+//!    `check_captured_content` — like scenario 1 but asserts the
+//!    Captured dump's `vcpu_regs` has at least one entry with a
+//!    non-zero `instruction_pointer`, AND `maps` is non-empty. Pins
+//!    the content-population invariant against a regression where the
+//!    dump file lands with valid JSON but the BPF map enumeration or
+//!    vCPU register capture silently dropped (a failure mode that
+//!    would have an empty shell pass scenario 1's schema check).
 //!
 //! Silent-drop fix branches NOT exercised by these scenarios (each
 //! deferred because the trigger is unavailable in the always-on
@@ -54,9 +62,10 @@
 mod common;
 
 use anyhow::Result;
+use common::failure_dump::read_dump_skip_placeholder;
 use ktstr::assert::AssertResult;
-use ktstr::prelude::SCHEMA_SINGLE;
-use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
+use ktstr::prelude::{SCHEMA_SINGLE, VmResult};
+use ktstr::scenario::ops::{HoldSpec, Step, await_accessor_ready, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec, sidecar_dir};
 
 const KTSTR_SCHED: Scheduler =
@@ -94,28 +103,24 @@ fn snapshot_sibling_files(test_name: &str) -> Vec<std::path::PathBuf> {
 fn scenario_watchdog_stall_captured_emit_schema(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
-    let test_name = ctx
-        .entry_name
-        .ok_or_else(|| anyhow::anyhow!("dispatch must stamp Ctx.entry_name"))?;
-    let dump_path = ctx.failure_dump_path()?;
-
+    await_accessor_ready();
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
-    let mut result = execute_steps(ctx, steps)?;
+    execute_steps(ctx, steps)
+}
 
-    let json = std::fs::read_to_string(&dump_path).map_err(|e| {
-        anyhow::anyhow!(
-            "Captured emit silently dropped the dump despite the framework-attached \
-             sink at {} ({e})",
-            dump_path.display()
-        )
-    })?;
-
-    let value: serde_json::Value = serde_json::from_str(&json)
-        .map_err(|e| anyhow::anyhow!("dump file is not valid JSON: {e}; payload: {json}"))?;
+/// Host-side post_vm assertion for `silent_drop_watchdog_stall_captured_schema`.
+/// The guest cannot read the host-written dump, so the schema +
+/// no-sibling assertions run here; the callback's Err is a hard FAIL
+/// (`PostVmAssertionFailure`) that `expect_err` does not invert.
+fn check_captured_emit_schema(result: &VmResult) -> Result<()> {
+    let test_name = result
+        .entry_name
+        .ok_or_else(|| anyhow::anyhow!("VmResult.entry_name is None"))?;
+    let value = read_dump_skip_placeholder(result)?;
 
     let schema = value
         .get("schema")
@@ -140,25 +145,29 @@ fn scenario_watchdog_stall_captured_emit_schema(
         siblings,
     );
 
-    result.note(format!(
-        "Captured emit produced schema={SCHEMA_SINGLE} dump at {}",
-        dump_path.display()
-    ));
-    Ok(result)
+    eprintln!("Captured emit produced schema={SCHEMA_SINGLE} dump");
+    Ok(())
 }
 
 fn scenario_clean_exit_gate_suppresses_dump(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
-    let test_name = ctx
-        .entry_name
-        .ok_or_else(|| anyhow::anyhow!("dispatch must stamp Ctx.entry_name"))?;
-    let dump_path = ctx.failure_dump_path()?;
-
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::fixed(std::time::Duration::from_secs(2)),
     }];
-    let mut result = execute_steps(ctx, steps)?;
+    execute_steps(ctx, steps)
+}
+
+/// Host-side post_vm assertion for `silent_drop_clean_exit_gate_suppression`.
+/// A clean (non-error-class) exit must suppress the dump; the guest
+/// cannot observe the host-side dump path, so the absence check runs
+/// here. Runs unconditionally; its Err is a hard FAIL via
+/// PostVmAssertionFailure.
+fn check_clean_exit_gate_suppresses_dump(result: &VmResult) -> Result<()> {
+    let test_name = result
+        .entry_name
+        .ok_or_else(|| anyhow::anyhow!("VmResult.entry_name is None"))?;
+    let dump_path = result.failure_dump_path()?;
 
     anyhow::ensure!(
         !dump_path.exists(),
@@ -176,33 +185,34 @@ fn scenario_clean_exit_gate_suppresses_dump(ctx: &ktstr::scenario::Ctx) -> Resul
         siblings,
     );
 
-    result.note("clean exit produced no dump artifacts (primary path absent, no tagged siblings)");
-    Ok(result)
+    eprintln!("clean exit produced no dump artifacts (primary path absent, no tagged siblings)");
+    Ok(())
 }
 
 fn scenario_watchdog_stall_dump_populates_vcpu_regs_and_maps(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
-    let test_name = ctx
-        .entry_name
-        .ok_or_else(|| anyhow::anyhow!("dispatch must stamp Ctx.entry_name"))?;
-    let dump_path = ctx.failure_dump_path()?;
-
+    await_accessor_ready();
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
-    let mut result = execute_steps(ctx, steps)?;
+    execute_steps(ctx, steps)
+}
 
-    let json = std::fs::read_to_string(&dump_path).map_err(|e| {
-        anyhow::anyhow!(
-            "Captured invariant test: dump file missing at {} ({e})",
-            dump_path.display()
-        )
-    })?;
-    let value: serde_json::Value = serde_json::from_str(&json)
-        .map_err(|e| anyhow::anyhow!("dump file is not valid JSON: {e}"))?;
+/// Host-side post_vm assertion for `silent_drop_watchdog_stall_captured_content`.
+/// The guest cannot read the host-written dump, so the content-population
+/// assertions run here. A placeholder dump is skipped (inconclusive),
+/// but a real dump that dropped its vcpu_regs or map enumeration is the
+/// silent-drop regression this test exists to catch — so the emptiness
+/// checks hard FAIL (`PostVmAssertionFailure`, which `expect_err` does
+/// not invert). Hence read_dump_skip_placeholder, not read_failure_dump.
+fn check_captured_content(result: &VmResult) -> Result<()> {
+    let test_name = result
+        .entry_name
+        .ok_or_else(|| anyhow::anyhow!("VmResult.entry_name is None"))?;
+    let value = read_dump_skip_placeholder(result)?;
 
     let vcpu_regs = value
         .get("vcpu_regs")
@@ -239,13 +249,12 @@ fn scenario_watchdog_stall_dump_populates_vcpu_regs_and_maps(
         siblings,
     );
 
-    result.note(format!(
-        "Captured dump populated vcpu_regs ({} entries) and maps ({} entries) at {}",
+    eprintln!(
+        "Captured dump populated vcpu_regs ({} entries) and maps ({} entries)",
         vcpu_regs.len(),
         maps.len(),
-        dump_path.display()
-    ));
-    Ok(result)
+    );
+    Ok(())
 }
 
 #[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
@@ -258,7 +267,11 @@ static __KTSTR_ENTRY_SILENT_DROP_WATCHDOG_STALL_CAPTURED_SCHEMA:
     extra_sched_args: &["--stall-after=1"],
     watchdog_timeout: std::time::Duration::from_secs(3),
     duration: std::time::Duration::from_secs(10),
+    // Stall death inverts to PASS; the schema + no-sibling assertions
+    // gate in check_captured_emit_schema (post_vm_unconditional, hard
+    // FAIL via PostVmAssertionFailure that expect_err does not invert).
     expect_err: true,
+    post_vm_unconditional: Some(check_captured_emit_schema),
     ..ktstr::test_support::KtstrTestEntry::DEFAULT
 };
 
@@ -272,7 +285,11 @@ static __KTSTR_ENTRY_SILENT_DROP_CLEAN_EXIT_GATE_SUPPRESSION: ktstr::test_suppor
         extra_sched_args: &[],
         watchdog_timeout: std::time::Duration::from_secs(10),
         duration: std::time::Duration::from_secs(3),
+        // Clean exit (expect_err: false) → the suppression assertion gates
+        // in check_clean_exit_gate_suppresses_dump (post_vm_unconditional);
+        // its Err is a hard FAIL.
         expect_err: false,
+        post_vm_unconditional: Some(check_clean_exit_gate_suppresses_dump),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
@@ -286,6 +303,10 @@ static __KTSTR_ENTRY_SILENT_DROP_WATCHDOG_STALL_CAPTURED_CONTENT:
     extra_sched_args: &["--stall-after=1"],
     watchdog_timeout: std::time::Duration::from_secs(3),
     duration: std::time::Duration::from_secs(10),
+    // Stall death inverts to PASS; the content-population assertions gate
+    // in check_captured_content (post_vm_unconditional, hard FAIL via
+    // PostVmAssertionFailure that expect_err does not invert).
     expect_err: true,
+    post_vm_unconditional: Some(check_captured_content),
     ..ktstr::test_support::KtstrTestEntry::DEFAULT
 };

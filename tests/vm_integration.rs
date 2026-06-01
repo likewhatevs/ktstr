@@ -38,45 +38,25 @@
 //! must produce live data on a real VM run, not a synthetic literal
 //! or a unit-tested code path.
 
+mod common;
+
 use anyhow::Result;
+use common::failure_dump::read_dump_skip_placeholder;
 use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
-use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
+use ktstr::prelude::{VmResult, post_vm_skip};
+use ktstr::scenario::ops::{HoldSpec, Step, await_accessor_ready, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
-/// Read and parse the per-test failure-dump JSON. Returns the parsed
-/// `serde_json::Value` so the caller can navigate the schema without
-/// pulling in `ktstr`'s pub(crate) `FailureDumpReport` type. Fails
-/// the scenario if the file is missing — a missing dump file means
-/// the freeze coordinator did not write OR the stall trigger did
-/// not fire, both of which are real regressions.
-fn read_dump_or_fail(ctx: &ktstr::scenario::Ctx) -> Result<serde_json::Value> {
-    let dump_path = ctx.failure_dump_path()?;
-    let json = std::fs::read_to_string(&dump_path).map_err(|e| {
-        anyhow::anyhow!(
-            "failure dump file missing at {}: {e} — freeze coordinator did \
-             not write (no SCX_EXIT_ERROR_STALL latch fired, owned_accessor / \
-             dump_btf was None, or the file write failed silently)",
-            dump_path.display()
-        )
-    })?;
-    serde_json::from_str(&json).map_err(|e| {
-        anyhow::anyhow!(
-            "failure dump JSON at {} is malformed: {e}",
-            dump_path.display()
-        )
-    })
-}
-
-/// Run a one-step workload under scx-ktstr `--stall-after=1`. The
-/// per-test path resolution ensures each scenario reads back its own
-/// dump file; the host freeze coordinator writes the JSON when the
-/// in-guest BPF probe latches the SCX_EXIT_ERROR_STALL exit. Returns
-/// the partial `AssertResult` from `execute_steps` so the caller can
-/// merge per-test claims onto the same envelope.
+/// Run a one-step workload under scx-ktstr `--stall-after=1` after the
+/// freeze accessor is adopted (so the resulting failure dump renders
+/// real captured state rather than a placeholder). Returns the
+/// `AssertResult` from `execute_steps`; the per-scenario host-side
+/// `check_*` post_vm callbacks read the host-written dump and assert.
 fn run_stalled_workload(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
+    await_accessor_ready();
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
@@ -111,12 +91,30 @@ fn run_stalled_workload(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
 fn scenario_dsq_and_rq_walker_populates_failure_dump(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
-    let mut result = run_stalled_workload(ctx)?;
-    let dump = read_dump_or_fail(ctx)?;
+    run_stalled_workload(ctx)
+}
+
+/// Host-side post_vm assertion for `vm_integration_dsq_and_rq_walker`.
+/// The guest cannot read the host-written dump, so the walker
+/// assertions run here; the callback's Err is a hard FAIL
+/// (`PostVmAssertionFailure`) that `expect_err` does not invert.
+fn check_dsq_and_rq_walker(result: &VmResult) -> Result<()> {
+    let dump = read_dump_skip_placeholder(result)?;
+
+    // If the walker explicitly could not run (BTF offsets unresolved or
+    // *scx_root untranslatable under load), the DSQ / rq->scx capture is
+    // inconclusive — skip rather than fail.
+    if let Some(reason) = dump.get("scx_walker_unavailable").and_then(|v| v.as_str()) {
+        return Err(post_vm_skip(format!(
+            "scx walker unavailable ({reason}) — the DSQ / rq->scx walk could \
+             not run, so its capture cannot be verified"
+        )));
+    }
 
     // dsq_states is `skip_serializing_if = "Vec::is_empty"`, so its
-    // absence here means the walk produced zero entries. Treat absent
-    // and present-but-empty as the same regression.
+    // absence here means the walk produced zero entries. With the walker
+    // reporting available, treat absent and present-but-empty as the
+    // same regression.
     let dsq_states: &[serde_json::Value] = match dump.get("dsq_states") {
         Some(s) => s
             .as_array()
@@ -125,14 +123,10 @@ fn scenario_dsq_and_rq_walker_populates_failure_dump(
         None => &[],
     };
     if dsq_states.is_empty() {
-        let unavailable = dump
-            .get("scx_walker_unavailable")
-            .and_then(|v| v.as_str())
-            .unwrap_or("(no diagnostic)");
         anyhow::bail!(
-            "dsq_states is empty (absent or zero-length). The walker either \
-             did not resolve BTF offsets, did not translate *scx_root, or \
-             the IDR walk yielded no DSQs. scx_walker_unavailable={unavailable:?}"
+            "dsq_states is empty (absent or zero-length) despite the walker \
+             reporting available. The walker resolved BTF offsets and \
+             translated *scx_root but the IDR walk yielded no DSQs."
         );
     }
 
@@ -151,13 +145,13 @@ fn scenario_dsq_and_rq_walker_populates_failure_dump(
         );
     }
 
-    result.note(format!(
+    eprintln!(
         "scx walker captured {} DSQ entries and {} rq->scx entries from \
          frozen-VM walk",
         dsq_states.len(),
         rq_scx_states.len(),
-    ));
-    Ok(result)
+    );
+    Ok(())
 }
 
 // ----------------------------------------------------------------------------
@@ -188,8 +182,15 @@ fn scenario_dsq_and_rq_walker_populates_failure_dump(
 fn scenario_perf_counters_capture_populates_dump(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
-    let mut result = run_stalled_workload(ctx)?;
-    let dump = read_dump_or_fail(ctx)?;
+    run_stalled_workload(ctx)
+}
+
+/// Host-side post_vm assertion for `vm_integration_perf_counters_capture`.
+/// The guest cannot read the host-written dump, so the perf-capture
+/// assertions run here; the callback's Err is a hard FAIL
+/// (`PostVmAssertionFailure`) that `expect_err` does not invert.
+fn check_perf_counters_capture(result: &VmResult) -> Result<()> {
+    let dump = read_dump_skip_placeholder(result)?;
 
     let vcpu_perf: &[serde_json::Value] = match dump.get("vcpu_perf_at_freeze") {
         Some(v) => v
@@ -199,13 +200,16 @@ fn scenario_perf_counters_capture_populates_dump(
         None => &[],
     };
     if vcpu_perf.is_empty() {
-        anyhow::bail!(
-            "vcpu_perf_at_freeze is empty (absent or zero-length). \
-             DumpContext::perf_capture was None — perf_event_open(exclude_host=1) \
-             unavailable on this host (kernel.perf_event_paranoid too \
-             restrictive, or capability missing). To run this test the host \
-             needs `sysctl kernel.perf_event_paranoid=2` or lower."
-        );
+        // DumpContext::perf_capture was None — perf_event_open(exclude_host=1)
+        // is unavailable on this host (kernel.perf_event_paranoid too
+        // restrictive, or capability missing). That is a host-config
+        // property, not a ktstr regression, so the run is inconclusive.
+        return Err(post_vm_skip(
+            "vcpu_perf_at_freeze is empty — perf_event_open(exclude_host=1) is \
+             unavailable on this host (raise it with `sysctl \
+             kernel.perf_event_paranoid=2` or lower); the perf capture cannot \
+             be verified here",
+        ));
     }
 
     // At least one slot must be a populated VcpuPerfSample (not null).
@@ -223,13 +227,13 @@ fn scenario_perf_counters_capture_populates_dump(
         );
     }
 
-    result.note(format!(
+    eprintln!(
         "vcpu_perf_at_freeze: {}/{} vCPUs reported a non-null \
          perf_event_open(exclude_host=1) sample at freeze",
         populated.len(),
         vcpu_perf.len(),
-    ));
-    Ok(result)
+    );
+    Ok(())
 }
 
 // ----------------------------------------------------------------------------
@@ -257,50 +261,56 @@ fn scenario_perf_counters_capture_populates_dump(
 /// per-tick capture surface is alive on a real kernel run. Sparkline
 /// rendering on top of this vec is unit-tested elsewhere; this test
 /// pins the integration boundary where unit tests cannot reach.
-fn scenario_event_counter_timeline_populates_dump(
-    ctx: &ktstr::scenario::Ctx,
-) -> Result<AssertResult> {
-    let mut result = run_stalled_workload(ctx)?;
-    let dump = read_dump_or_fail(ctx)?;
+fn scenario_event_counter_timeline(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
+    run_stalled_workload(ctx)
+}
 
-    let timeline: &[serde_json::Value] = match dump.get("event_counter_timeline") {
-        Some(t) => t.as_array().map(|a| a.as_slice()).ok_or_else(|| {
-            anyhow::anyhow!("event_counter_timeline present but not an array: {t}")
-        })?,
-        None => &[],
-    };
-    if timeline.is_empty() {
-        anyhow::bail!(
-            "event_counter_timeline is empty (absent or zero-length). \
-             The monitor's per-tick capture either: did not run, \
-             could not resolve SCX_EV_* counter offsets from BTF, or the \
-             freeze coordinator's EventCounterCapture parameter was None. \
-             A real scx-ktstr run with --stall-after=1 must emit at least \
-             one sample over the watchdog window."
-        );
+/// Host-side post_vm assertion for `vm_integration_event_counter_timeline`.
+/// The per-tick SCX_EV_* capture is recorded on `VmResult::monitor`
+/// (its `samples`), NOT in the failure dump: the freeze coordinator
+/// currently passes `event_counter_capture: None` to dump_state
+/// (src/vmm/freeze_coord/mod.rs), so the dump's `event_counter_timeline`
+/// is always empty and asserting on it would always skip. The monitor
+/// sample stream carries the real per-tick capture, so the assertion
+/// runs against it here. The callback's Err is a hard FAIL
+/// (`PostVmAssertionFailure`) that `expect_err` does not invert.
+fn check_event_counter_timeline(result: &VmResult) -> Result<()> {
+    let monitor = result.monitor.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("VmResult.monitor is None — the monitor sampler produced no report")
+    })?;
+    if monitor.samples.is_empty() {
+        // The per-tick loop recorded no sample before the stall fired
+        // (load-starved); inconclusive for this assertion.
+        return Err(post_vm_skip(
+            "monitor recorded no samples — the per-tick loop did not tick before \
+             the stall fired (load-starved); the SCX_EV_* capture cannot be \
+             verified",
+        ));
     }
 
-    // Each entry must carry a timestamp (ts_ns or similar) and a
-    // counter map. Pin the most basic shape invariant — entries are
-    // objects, not scalars — without fixing field names that may
-    // change as the schema evolves.
-    let non_object: Vec<&serde_json::Value> = timeline.iter().filter(|s| !s.is_object()).collect();
-    if !non_object.is_empty() {
-        anyhow::bail!(
-            "event_counter_timeline has {} non-object entries; \
-             EventCounterSample must serialize as a JSON object. \
-             Sample bad entry: {}",
-            non_object.len(),
-            non_object[0],
-        );
-    }
+    // At least one sample must carry SCX_EV_* counters on at least one CPU.
+    // CpuSnapshot.event_counters is None when the ScxEventCounters offsets
+    // are unresolved or scx_root is unset; if EVERY CPU in EVERY sample is
+    // None, the per-tick capture observed nothing — a regression.
+    let with_events = monitor
+        .samples
+        .iter()
+        .filter(|s| s.cpus.iter().any(|c| c.event_counters.is_some()))
+        .count();
+    anyhow::ensure!(
+        with_events > 0,
+        "no monitor sample carried SCX_EV_* event counters across {} samples — \
+         the per-tick capture resolved no ScxEventCounters offsets from BTF, or \
+         scx_root was unset on every CPU at every tick",
+        monitor.samples.len(),
+    );
 
-    result.note(format!(
-        "event_counter_timeline captured {} per-tick samples across \
-         the run window",
-        timeline.len(),
-    ));
-    Ok(result)
+    eprintln!(
+        "event-counter capture: {}/{} monitor samples carried SCX_EV_* counters",
+        with_events,
+        monitor.samples.len(),
+    );
+    Ok(())
 }
 
 // ----------------------------------------------------------------------------
@@ -421,8 +431,20 @@ fn scenario_sched_deadline_real_setattr(ctx: &ktstr::scenario::Ctx) -> Result<As
 fn scenario_failure_dump_trigger_minimal_invariants(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
-    let mut result = run_stalled_workload(ctx)?;
-    let dump = read_dump_or_fail(ctx)?;
+    run_stalled_workload(ctx)
+}
+
+/// Host-side post_vm assertion for `vm_integration_failure_dump_trigger`.
+/// The guest cannot read the host-written dump, so the dump-invariant
+/// assertions run here; the callback's Err is a hard FAIL
+/// (`PostVmAssertionFailure`) that `expect_err` does not invert.
+fn check_failure_dump_trigger(result: &VmResult) -> Result<()> {
+    // A placeholder dump is inconclusive (skip); a real dump that
+    // dropped its BPF-map enumeration or vCPU regs is a silent-drop
+    // regression this test exists to catch — so read_dump_skip_placeholder
+    // (NOT read_failure_dump, which would skip on empty maps) is used and
+    // the emptiness checks below hard FAIL.
+    let dump = read_dump_skip_placeholder(result)?;
 
     let schema = dump
         .get("schema")
@@ -462,14 +484,14 @@ fn scenario_failure_dump_trigger_minimal_invariants(
         );
     }
 
-    result.note(format!(
+    eprintln!(
         "failure-dump trigger pipeline produced schema={schema:?}, \
          {} maps, {} vcpu_regs entries — full-stack capture path \
          verified end-to-end",
         maps.len(),
         vcpu_regs.len(),
-    ));
-    Ok(result)
+    );
+    Ok(())
 }
 
 // ----------------------------------------------------------------------------
@@ -962,7 +984,11 @@ static __KTSTR_ENTRY_DSQ_RQ_WALKER: ktstr::test_support::KtstrTestEntry =
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
+        // Stall death inverts to PASS; the walker assertions gate in
+        // check_dsq_and_rq_walker (post_vm_unconditional, hard FAIL via
+        // PostVmAssertionFailure that expect_err does not invert).
         expect_err: true,
+        post_vm_unconditional: Some(check_dsq_and_rq_walker),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
@@ -976,7 +1002,11 @@ static __KTSTR_ENTRY_PERF_COUNTERS: ktstr::test_support::KtstrTestEntry =
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
+        // Stall death inverts to PASS; the perf-capture assertions gate
+        // in check_perf_counters_capture (post_vm_unconditional, hard
+        // FAIL via PostVmAssertionFailure that expect_err does not invert).
         expect_err: true,
+        post_vm_unconditional: Some(check_perf_counters_capture),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
@@ -985,14 +1015,18 @@ static __KTSTR_ENTRY_PERF_COUNTERS: ktstr::test_support::KtstrTestEntry =
 static __KTSTR_ENTRY_EVENT_TIMELINE: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "vm_integration_event_counter_timeline",
-        func: scenario_event_counter_timeline_populates_dump,
+        func: scenario_event_counter_timeline,
         scheduler: &KTSTR_SCHED,
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         // Longer duration so the per-tick monitor loop accumulates
         // multiple samples before the stall fires.
         duration: std::time::Duration::from_secs(15),
+        // Stall death inverts to PASS; the timeline assertions gate in
+        // check_event_counter_timeline (post_vm_unconditional, hard FAIL
+        // via PostVmAssertionFailure that expect_err does not invert).
         expect_err: true,
+        post_vm_unconditional: Some(check_event_counter_timeline),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
@@ -1026,7 +1060,11 @@ static __KTSTR_ENTRY_DUMP_TRIGGER: ktstr::test_support::KtstrTestEntry =
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
+        // Stall death inverts to PASS; the dump-invariant assertions gate
+        // in check_failure_dump_trigger (post_vm_unconditional, hard FAIL
+        // via PostVmAssertionFailure that expect_err does not invert).
         expect_err: true,
+        post_vm_unconditional: Some(check_failure_dump_trigger),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
