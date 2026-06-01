@@ -1,12 +1,13 @@
 //! Unit tests for the `parse_stall_duration_seconds` helper used by
 //! the `watchdog_override_timing_precision` gauntlet entry in
 //! `tests/ktstr_sched_tests.rs`. The helper parses the sched_ext
-//! SCX_EXIT_ERROR_STALL message
-//! (`"{task}[{pid}] failed to run for {secs}.{millis}s"`) emitted by
-//! `kernel/sched/ext.c` scx_exit — the watchdog timing test reads
-//! the guest kernel ring buffer via `ktstr::read_kmsg` and feeds the
-//! result through this helper to recover the kernel's own
-//! stall-duration measurement.
+//! SCX_EXIT_ERROR_STALL message — either
+//! `"{task}[{pid}] failed to run for {secs}.{millis}s"` or
+//! `"watchdog failed to check in for {secs}.{millis}s"` — emitted by
+//! `kernel/sched/ext.c` scx_exit. The watchdog timing test forwards
+//! the guest kernel ring buffer to the host via `ktstr::send_kmsg`
+//! and recovers the kernel's own stall-duration measurement through
+//! this helper.
 //!
 //! Kept in its own file (rather than nested in
 //! `ktstr_sched_tests.rs`) because the ktstr early-dispatch path
@@ -27,18 +28,22 @@ use grok::Grok;
 /// pin the contract via direct input, and the production call
 /// site in `ktstr_sched_tests.rs` uses the same grok pattern.
 fn parse_stall_duration_seconds(kmsg: &str) -> Option<f64> {
-    // Kernel emits `failed to run for %u.%03us` (integer dot integer 's')
-    // per `kernel/sched/ext.c` scx_exit. Decompose into two `INT`
-    // captures — NOT `NUMBER`, because NUMBER expands to BASE10NUM
-    // which already matches `2.004` as a whole decimal and would
-    // greedily consume the `.`, leaving nothing for the second
-    // capture and making the pattern fail to match.
-    // `INT` matches `[+-]?[0-9]+` — an integer with optional sign —
-    // which matches each side of the kernel's printf output
+    // Kernel emits `failed to run for %u.%03us` (per-task,
+    // check_rq_for_timeouts) or `watchdog failed to check in for
+    // %u.%03us` (per-CPU, scx_tick) per `kernel/sched/ext.c` scx_exit.
+    // Decompose the duration into two `INT` captures — NOT `NUMBER`,
+    // because NUMBER expands to BASE10NUM which already matches `2.004`
+    // as a whole decimal and would greedily consume the `.`, leaving
+    // nothing for the second capture and making the pattern fail to
+    // match. `INT` matches `[+-]?[0-9]+` — an integer with optional
+    // sign — which matches each side of the kernel's printf output
     // individually.
     let grok = Grok::with_default_patterns();
     let pattern = grok
-        .compile(r"failed to run for %{INT:seconds}\.%{INT:millis}s", false)
+        .compile(
+            r"(?:failed to run for|watchdog failed to check in for) %{INT:seconds}\.%{INT:millis}s",
+            false,
+        )
         .expect("grok pattern compiles with fancy-regex backend");
     let matches = pattern.match_against(kmsg)?;
     let seconds: u64 = matches.get("seconds")?.parse().ok()?;
@@ -95,4 +100,14 @@ fn computes_seconds_plus_millis_correctly() {
         parse_stall_duration_seconds("b[2] failed to run for 7.999s\n"),
         Some(7.999),
     );
+}
+
+#[test]
+fn parses_watchdog_check_in_form() {
+    // Post-Path-A, a deterministic stall starves the watchdog
+    // wq-kworker, so scx_tick's per-CPU "watchdog failed to check in
+    // for" printk fires instead of check_rq_for_timeouts' per-task
+    // "failed to run for". The parser must match both forms.
+    let kmsg = "[   44.210] sched_ext: watchdog failed to check in for 2.050s\n";
+    assert_eq!(parse_stall_duration_seconds(kmsg), Some(2.050));
 }

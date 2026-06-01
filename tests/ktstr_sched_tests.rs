@@ -1,6 +1,8 @@
 use anyhow::Result;
+use ktstr::WatchdogObservation;
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
+use ktstr::prelude::{VmResult, post_vm_skip};
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CgroupDef, CpusetSpec, HoldSpec, Step, execute_steps};
 use ktstr::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};
@@ -289,33 +291,37 @@ static __KTSTR_ENTRY_AUTO_REPRO: ktstr::test_support::KtstrTestEntry =
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
-// Watchdog timing-precision: parse the kernel's own stall-duration
-// measurement from the guest kernel log and assert it's bounded by
-// the host-written override, not the scx-ktstr BPF default.
+// Watchdog timing-precision: prove the host's `watchdog_timeout=2s`
+// override (set via `KtstrTestEntry::watchdog_timeout`) both LANDED in
+// `scx_sched.watchdog_timeout` in guest memory and was ENFORCED — the
+// watchdog actually fired a stall rather than the scheduler dying via
+// some other exit path. The two-tier assertion lives in the host-side
+// `check_watchdog_timing` post_vm callback (see its doc); this scenario
+// runs the stall and forwards the kmsg evidence.
 //
-// Kernel emits (kernel/sched/ext.c scx_exit SCX_EXIT_ERROR_STALL):
-//   "{task}[{pid}] failed to run for {seconds}.{millis}s"
-// when the watchdog fires. That duration is the kernel's OWN
-// measurement from last-runnable to watchdog-fire — strictly
-// stronger proof than wall-clock elapsed, because it excludes VM
-// boot / scheduler attach / exit plumbing latency.
+// The watchdog stall printk — kernel/sched/ext.c scx_exit
+// SCX_EXIT_ERROR_STALL, one of
+//   "{task}[{pid}] failed to run for {seconds}.{millis}s" or
+//   "watchdog failed to check in for {seconds}.{millis}s"
+// — lands in the guest /dev/kmsg but is suppressed from the COM1
+// console at the default loglevel=0, so the host cannot read it from
+// VmResult.stderr. The scenario forwards the guest kmsg to the host via
+// `ktstr::send_kmsg(read_kmsg())`; the callback reads it back from
+// `VmResult::guest_kmsg` and asserts a stall line is PRESENT.
 //
-// With `watchdog_timeout=2s` + `--stall-after=1s`:
-//   - Host override effective: kernel measures ~2.000s-2.100s
-//     (watchdog tolerance).
-//   - Host override broken (BPF 20s default wins): kernel
-//     measures ~20.000s — fails the < 5s assertion.
+// Why presence, not the kernel-measured duration? Under a deterministic
+// stall (`--stall-after=1`) the scheduler stops dispatching tasks, so
+// the watchdog wq-kworker — itself a task the scheduler must dispatch —
+// is starved and scx_watchdog_workfn runs late; the measured "failed to
+// run for" duration then reflects when the kworker finally ran
+// (~8.7-9.3s observed), not the 2s timeout. The duration is
+// starvation-noise; override effectiveness is proven by tier 1 (the
+// eager in-DRAM readback in `VmResult::watchdog_observation`), not by
+// the duration.
 //
-// `scenario_watchdog_timing_precision` runs the scenario (which
-// returns a failing AssertResult when the scheduler dies), then
-// reads the guest kernel ring buffer via `ktstr::read_kmsg` and
-// parses the stall-duration regex. If the parsed duration exceeds
-// the override budget, the scenario promotes the failure detail to
-// the actionable "override ineffective" message; if not, the
-// original scheduler-died detail stays.
-//
-// `expect_err: true` inverts the AssertResult verdict so the
-// "scheduler died as planned" outcome is the PASS state.
+// `expect_err: true` inverts the SCX_EXIT_ERROR_STALL itself (the
+// "scheduler died as planned" outcome) to the PASS state; the two-tier
+// assertion gates separately in the post_vm callback.
 fn scenario_watchdog_timing_precision(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<ktstr::assert::AssertResult> {
@@ -324,79 +330,92 @@ fn scenario_watchdog_timing_precision(
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
-    let mut result = execute_steps(ctx, steps)?;
-
-    // Read the guest kernel log and look for the sched_ext stall
-    // message. The kmsg buffer carries every printk since boot —
-    // the scx_exit SCX_EXIT_ERROR_STALL entry lands here when the
-    // watchdog fires.
-    let kmsg = ktstr::read_kmsg();
-    let duration_secs = parse_stall_duration_seconds(&kmsg);
-
-    // 5.0s, not tighter: the failure is binary — the kernel-measured
-    // stall is ~2.0-2.1s when the host watchdog_timeout=2s override
-    // applies, or ~20s when scx-ktstr's .timeout_ms=20000 BPF default
-    // dominates; no intermediate value is reachable. A tighter budget
-    // (e.g. 4.0s) catches the same ~20s break but adds flake risk:
-    // under -j16 CI load, KVM vCPU preemption can delay the watchdog
-    // check and stretch the kernel-MEASURED stall toward 3-4s even when
-    // the override IS effective. 5.0s clears that lag with headroom.
-    const OVERRIDE_BUDGET_SECS: f64 = 5.0;
-    if let Some(observed) = duration_secs {
-        if observed > OVERRIDE_BUDGET_SECS {
-            // Host override was ineffective — stall duration
-            // overshot the 5s budget, proving the BPF 20s default
-            // dominated instead of the 2s host write. Surface as a
-            // fatal failure detail; expect_err cannot mask this
-            // because we replace the AssertResult.
-
-            result.record_fail(ktstr::assert::AssertDetail::new(
-                ktstr::assert::DetailKind::Other,
-                format!(
-                    "watchdog override ineffective: kernel measured \
-                     stall duration {observed:.3}s, exceeds \
-                     {OVERRIDE_BUDGET_SECS:.1}s budget (host-write of \
-                     scx_sched.watchdog_timeout=2s did not apply; \
-                     scx-ktstr .timeout_ms=20000 BPF default dominated)",
-                ),
-            ));
-            // Return Err so the framework treats this as a real
-            // failure, not the expected stall — expect_err inverts
-            // the Ok verdict to PASS, but an Err propagates as a
-            // runner-level failure that cannot be inverted.
-            anyhow::bail!(
-                "watchdog override ineffective: kernel-measured stall \
-                 duration {observed:.3}s > {OVERRIDE_BUDGET_SECS:.1}s budget"
-            );
-        }
-        // Override effective — observed ≤ budget. Attach an
-        // informational note so the test log shows the measured
-        // number; the AssertResult keeps its existing
-        // scheduler-died Fail detail (which expect_err inverts to
-        // PASS).
-        result.note(format!(
-            "watchdog override effective: kernel-measured stall \
-             duration {observed:.3}s ≤ {OVERRIDE_BUDGET_SECS:.1}s budget"
-        ));
-    } else {
-        // No stall line in kmsg. Could be a pre-6.16 kernel that
-        // emits a different message, or the watchdog never fired
-        // (scheduler attached but didn't stall, e.g. --stall-after
-        // ignored). Leave the AssertResult unchanged so the
-        // existing scheduler-died detail (or absence) drives the
-        // verdict under expect_err.
-    }
-
+    let result = execute_steps(ctx, steps)?;
+    // Forward the guest /dev/kmsg to the host so the host-side
+    // check_watchdog_timing post_vm callback can read the
+    // kernel-measured stall duration. The scx_exit SCX_EXIT_ERROR_STALL
+    // printk is in /dev/kmsg but suppressed from the COM1 console at the
+    // default loglevel=0, so the host cannot read it from
+    // VmResult.stderr — read_kmsg (guest /dev/kmsg) + send_kmsg bridges
+    // it into VmResult::guest_kmsg().
+    ktstr::send_kmsg(ktstr::read_kmsg().as_bytes());
     Ok(result)
+}
+
+/// Host-side post_vm assertion for `watchdog_override_timing_precision`,
+/// in two tiers. Tier 1: the host's `watchdog_timeout=2s` override
+/// landed in guest memory — `VmResult::watchdog_observation` reports the
+/// jiffies the host wrote vs the value the monitor read back from
+/// `scx_sched.watchdog_timeout`; they must match. That readback is
+/// eager and in-DRAM, so (unlike the kernel-measured stall duration) it is
+/// immune to the watchdog-kworker starvation a deterministic stall
+/// induces. Tier 2: the watchdog actually FIRED a stall — the scenario
+/// forwards the guest kmsg via `ktstr::send_kmsg`, and a
+/// SCX_EXIT_ERROR_STALL stall line must be present (presence, not the
+/// starvation-noisy duration), proving the death was a watchdog stall
+/// rather than a different scx exit. Runs unconditionally; its Err is a
+/// hard FAIL via PostVmAssertionFailure even though expect_err inverts
+/// the scheduler-died outcome to PASS.
+fn check_watchdog_timing(result: &VmResult) -> Result<()> {
+    // Tier 1 — the override value landed in guest memory.
+    let Some(WatchdogObservation {
+        expected_jiffies,
+        observed_jiffies,
+    }) = result.watchdog_observation()
+    else {
+        return Err(post_vm_skip(
+            "no watchdog observation — the monitor recorded no override \
+             readback (scx_root stayed null; the scheduler never attached), \
+             so the override cannot be verified",
+        ));
+    };
+    anyhow::ensure!(
+        observed_jiffies == expected_jiffies,
+        "watchdog override ineffective: the host wrote {expected_jiffies} \
+         jiffies to scx_sched.watchdog_timeout but guest memory reads back \
+         {observed_jiffies} — the host-write missed the field (a kernel \
+         refactor moved the offset, the deref resolved the wrong scx_sched, \
+         or scx-ktstr's .timeout_ms=20000 BPF default overwrote it)"
+    );
+
+    // Tier 2 — the watchdog actually fired a stall (the override was
+    // enforced, not just configured). Presence of a stall line is the
+    // signal; the duration itself reflects when the starved watchdog
+    // kworker finally ran, not the 2s timeout, so it is not asserted.
+    let kmsg = result.guest_kmsg();
+    if kmsg.is_empty() {
+        return Err(post_vm_skip(
+            "guest forwarded no kmsg (send_kmsg did not run, or the VM \
+             exited before the bulk-port forward completed) — the override \
+             readback passed, but the watchdog-fired signal is missing, so \
+             the run is inconclusive",
+        ));
+    }
+    anyhow::ensure!(
+        parse_stall_duration_seconds(&kmsg).is_some(),
+        "watchdog override landed ({observed_jiffies} jiffies) but the guest \
+         kmsg has no SCX_EXIT_ERROR_STALL stall line ('failed to run for' / \
+         'watchdog failed to check in for') — the scheduler exited via a \
+         different path, or the kernel printk format changed. kmsg: {kmsg}"
+    );
+    eprintln!(
+        "watchdog override applied + enforced: scx_sched.watchdog_timeout = \
+         {observed_jiffies} jiffies (matches the host write), and a watchdog \
+         stall fired"
+    );
+    Ok(())
 }
 
 /// Parse the sched_ext stall-duration seconds from a guest kmsg
 /// dump using a two-part grok pattern matching the kernel's
-/// `%u.%03us` printf format. Kernel emits
-/// `{task}[{pid}] failed to run for {secs}.{millis}s` at
-/// `kernel/sched/ext.c scx_exit(sch, SCX_EXIT_ERROR_STALL, ...)`;
-/// return `secs + millis/1000.0` as f64 seconds, or `None` if no
-/// matching line is present.
+/// `%u.%03us` printf format. The watchdog emits one of two messages
+/// at `kernel/sched/ext.c scx_exit(sch, SCX_EXIT_ERROR_STALL, ...)`:
+/// `{task}[{pid}] failed to run for {secs}.{millis}s` (per-task,
+/// check_rq_for_timeouts) or `watchdog failed to check in for
+/// {secs}.{millis}s` (per-CPU, scx_tick); a deterministic stall that
+/// starves the watchdog wq-kworker fires the latter. Return
+/// `secs + millis/1000.0` as f64 seconds, or `None` if neither line
+/// is present.
 ///
 /// Pattern decomposes into two `INT` captures
 /// (`%{INT:seconds}\.%{INT:millis}s`) — NOT `NUMBER`, because
@@ -419,7 +438,10 @@ fn scenario_watchdog_timing_precision(
 fn parse_stall_duration_seconds(kmsg: &str) -> Option<f64> {
     let grok = grok::Grok::with_default_patterns();
     let pattern = grok
-        .compile(r"failed to run for %{INT:seconds}\.%{INT:millis}s", false)
+        .compile(
+            r"(?:failed to run for|watchdog failed to check in for) %{INT:seconds}\.%{INT:millis}s",
+            false,
+        )
         .expect("grok pattern compiles with fancy-regex backend");
     let matches = pattern.match_against(kmsg)?;
     let seconds: u64 = matches.get("seconds")?.parse().ok()?;
@@ -445,7 +467,14 @@ static __KTSTR_ENTRY_WATCHDOG_TIMING: ktstr::test_support::KtstrTestEntry =
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(2),
         duration: std::time::Duration::from_secs(15),
+        // expect_err inverts the SCX_EXIT_ERROR_STALL (the expected
+        // outcome of --stall-after=1) to PASS. The real timing assertion
+        // lives in check_watchdog_timing, a post_vm_unconditional
+        // callback whose Err is a hard FAIL via PostVmAssertionFailure —
+        // so an ineffective override fails the test even though the stall
+        // itself is inverted.
         expect_err: true,
+        post_vm_unconditional: Some(check_watchdog_timing),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 

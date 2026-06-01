@@ -377,6 +377,24 @@ pub fn read_kmsg() -> String {
     }
 }
 
+/// Forward the guest's `/dev/kmsg` ring buffer to the host over the
+/// bulk port, so a host-side post_vm callback can read it via
+/// `VmResult::guest_kmsg`. Mirrors `read_kmsg`: that reads the ring
+/// buffer in the guest process; this forwards the bytes (typically
+/// `read_kmsg().as_bytes()`) to the host. The scx_exit
+/// SCX_EXIT_ERROR_STALL printk lands in /dev/kmsg but is suppressed
+/// from the COM1 console at the default `loglevel=0`, so it never
+/// reaches `VmResult::stderr`; this forward is the only host-visible
+/// path to it.
+pub fn send_kmsg(buf: &[u8]) {
+    crate::vmm::guest_comms::send_dmesg(buf);
+}
+
+/// The host watchdog-override readback, surfaced via
+/// `VmResult::watchdog_observation`. Hidden from rustdoc at its
+/// definition, so this re-export adds no public doc surface.
+pub use crate::monitor::WatchdogObservation;
+
 pub mod assert;
 pub(crate) mod budget;
 pub(crate) mod cargo_test_mode;

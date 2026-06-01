@@ -562,6 +562,46 @@ impl VmResult {
         Ok(crate::test_support::sidecar_dir().join(format!("{name}.failure-dump.json")))
     }
 
+    /// Concatenated guest `/dev/kmsg` content forwarded via
+    /// `crate::send_kmsg`, or empty when no frames arrived (the scenario
+    /// did not forward, or the VM exited before the forward completed).
+    /// Lets a post_vm callback read the guest kernel log even at the
+    /// default `loglevel=0`, where kernel printks never reach the COM1
+    /// console (and thus not `stderr`). Encapsulates the bulk-port
+    /// `ShmEntry` + `MsgType::Dmesg` filter inside the crate.
+    pub fn guest_kmsg(&self) -> String {
+        let Some(drain) = self.guest_messages.as_ref() else {
+            return String::new();
+        };
+        drain
+            .entries
+            .iter()
+            .filter(|e| {
+                e.crc_ok
+                    && !e.payload.is_empty()
+                    && matches!(
+                        crate::vmm::wire::MsgType::from_wire(e.msg_type),
+                        Some(crate::vmm::wire::MsgType::Dmesg)
+                    )
+            })
+            .map(|e| String::from_utf8_lossy(&e.payload).into_owned())
+            .collect::<Vec<String>>()
+            .join("\n")
+    }
+
+    /// The host watchdog-override readback (`expected_jiffies` =
+    /// host-written, `observed_jiffies` = read back from guest memory).
+    /// `None` when the scheduler never attached (no readback recorded).
+    /// A post_vm callback asserts the two are equal to prove the override
+    /// landed; the readback is taken eagerly by the monitor (in-DRAM,
+    /// microseconds), so it is immune to the watchdog-kworker starvation
+    /// that inflates the kernel-measured stall duration. Encapsulates the
+    /// `MonitorReport` access (`WatchdogObservation` is re-exported at the
+    /// crate root for the return type).
+    pub fn watchdog_observation(&self) -> Option<crate::monitor::WatchdogObservation> {
+        self.monitor.as_ref().and_then(|m| m.watchdog_observation)
+    }
+
     /// Assert the primary-VM `.wprof.pb` landed and is shape-valid.
     /// Returns `Ok(())` immediately when `self.success` is false.
     #[cfg(feature = "wprof")]
