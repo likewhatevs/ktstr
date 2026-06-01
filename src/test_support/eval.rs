@@ -333,8 +333,7 @@ pub(crate) fn combine_post_vm_errs(
             // HostSkipRequest marker is intentionally dropped.
             let both_skip = c.downcast_ref::<HostSkipRequest>().is_some()
                 && u.downcast_ref::<HostSkipRequest>().is_some();
-            let combined =
-                anyhow::anyhow!("post_vm: {c:#}; post_vm_unconditional: {u:#}");
+            let combined = anyhow::anyhow!("post_vm: {c:#}; post_vm_unconditional: {u:#}");
             Some(if both_skip {
                 combined.context(HostSkipRequest)
             } else {
