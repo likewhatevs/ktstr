@@ -1983,6 +1983,11 @@ pub(crate) struct MonitorLoopResult {
     /// loop's `0 → super::vcpu_preemption_threshold_ns(None)`
     /// fallback has resolved a concrete value.
     pub(crate) preemption_threshold_ns: u64,
+    /// Outcome of the freeze coordinator's boot-complete wait. Set by
+    /// `start_monitor`'s closure on the production wake-detection path;
+    /// the in-`monitor_loop` test path leaves it `NotConfigured`.
+    /// Forwarded to [`super::MonitorReport::boot_wait_outcome`].
+    pub(crate) boot_wait_outcome: super::BootWaitOutcome,
 }
 
 /// Configuration for the monitor sampling loop.
@@ -2299,6 +2304,7 @@ pub(crate) fn monitor_loop(
                 watchdog_observation,
                 page_offset: latched_page_offset,
                 preemption_threshold_ns,
+                boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
             };
         }
     };
@@ -2313,6 +2319,7 @@ pub(crate) fn monitor_loop(
             watchdog_observation,
             page_offset: latched_page_offset,
             preemption_threshold_ns,
+            boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
         };
     }
     let epoll = match Epoll::new() {
@@ -2327,6 +2334,7 @@ pub(crate) fn monitor_loop(
                 watchdog_observation,
                 page_offset: latched_page_offset,
                 preemption_threshold_ns,
+                boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
             };
         }
     };
@@ -2346,6 +2354,7 @@ pub(crate) fn monitor_loop(
             watchdog_observation,
             page_offset: latched_page_offset,
             preemption_threshold_ns,
+            boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
         };
     }
     if let Err(e) = epoll.ctl(
@@ -2362,13 +2371,17 @@ pub(crate) fn monitor_loop(
             watchdog_observation,
             page_offset: latched_page_offset,
             preemption_threshold_ns,
+            boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
         };
     }
     let mut epoll_buf = [EpollEvent::default(); 2];
 
-    // Pre-sample boot-complete wait. When `cfg.sys_rdy` is set
-    // (production path) we register the eventfd alongside `kill_evt`
-    // on a dedicated epoll instance and block for up to 5 s. The
+    // Pre-sample boot-complete wait. When `cfg.sys_rdy` is set we
+    // register the eventfd alongside `kill_evt` on a dedicated epoll
+    // instance and block for up to 5 s. (The production VM path runs
+    // this wait in the freeze coordinator's `start_monitor` closure and
+    // passes `cfg.sys_rdy = None`, so this branch is the in-`monitor_loop`
+    // fallback for direct callers that set `cfg.sys_rdy`.) The
     // eventfd is fired by the freeze coordinator's bulk-drain
     // dispatch when the guest publishes a CRC-valid
     // [`crate::vmm::wire::MSG_TYPE_SYS_RDY`] TLV frame on the
@@ -2404,6 +2417,7 @@ pub(crate) fn monitor_loop(
                     watchdog_observation,
                     page_offset: latched_page_offset,
                     preemption_threshold_ns,
+                    boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
                 };
             }
         };
@@ -2454,6 +2468,7 @@ pub(crate) fn monitor_loop(
                 watchdog_observation,
                 page_offset: latched_page_offset,
                 preemption_threshold_ns,
+                boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
             };
         }
     }
@@ -2964,6 +2979,7 @@ pub(crate) fn monitor_loop(
         watchdog_observation,
         page_offset: latched_page_offset,
         preemption_threshold_ns,
+        boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
     }
 }
 

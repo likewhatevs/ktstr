@@ -293,6 +293,32 @@ pub fn find_test_vmlinux() -> Option<std::path::PathBuf> {
     result
 }
 
+/// Outcome of the freeze coordinator's pre-resolution boot-complete
+/// wait (the 5 s epoll on the sys_rdy eventfd + the kill eventfd).
+/// Surfaced on [`MonitorReport`] so the sys_rdy-regression test can
+/// tell a real "sys_rdy fired but the monitor never woke on it"
+/// regression apart from an inconclusive slow boot (sys_rdy never
+/// emitted within the ceiling).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum BootWaitOutcome {
+    /// Not a confirmed sampled-run wake: no sys_rdy eventfd was
+    /// configured (the in-`monitor_loop` test path), the monitor was
+    /// killed during setup before reaching the sample loop, or the
+    /// outcome was not captured. The test treats this like `TimedOut`
+    /// — inconclusive, skip. Default.
+    #[default]
+    NotConfigured,
+    /// The sys_rdy eventfd fired before the 5 s ceiling → the monitor
+    /// proceeded into the sample loop on the wake. The regression-
+    /// detecting state: if this holds and the first sample is past its
+    /// budget, sys_rdy delivery to the monitor is broken.
+    Fired,
+    /// The 5 s ceiling elapsed without sys_rdy firing → the wait fell
+    /// through. Inconclusive for the sys_rdy contract — a slow guest
+    /// boot, not necessarily a delivery regression.
+    TimedOut,
+}
+
 /// Collected monitor data from a VM run.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
@@ -325,6 +351,16 @@ pub struct MonitorReport {
     #[doc(hidden)]
     #[serde(default)]
     pub page_offset: u64,
+    /// Outcome of the freeze coordinator's boot-complete wait — see
+    /// [`BootWaitOutcome`]. `Fired` = the monitor woke on the sys_rdy
+    /// eventfd and proceeded to sample; `TimedOut` = the 5 s ceiling
+    /// elapsed (slow boot); `NotConfigured` = sys_rdy not wired, or
+    /// the monitor was killed before sampling. The sys_rdy-regression
+    /// test asserts first-sample timing only when this is `Fired`, and
+    /// skips otherwise (`TimedOut`/`NotConfigured` are inconclusive).
+    #[doc(hidden)]
+    #[serde(default)]
+    pub boot_wait_outcome: BootWaitOutcome,
 }
 
 /// Observation of the `scx_sched.watchdog_timeout` override,

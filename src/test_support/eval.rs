@@ -3231,6 +3231,7 @@ pub(crate) fn trim_settle_samples(
         preemption_threshold_ns: report.preemption_threshold_ns,
         watchdog_observation: report.watchdog_observation,
         page_offset: report.page_offset,
+        boot_wait_outcome: report.boot_wait_outcome,
     }
 }
 
@@ -5176,6 +5177,7 @@ mod tests {
                 preemption_threshold_ns: 0,
                 watchdog_observation: None,
                 page_offset: 0,
+                boot_wait_outcome: crate::monitor::BootWaitOutcome::NotConfigured,
             }),
             guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
                 entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
@@ -5532,6 +5534,7 @@ mod tests {
                 preemption_threshold_ns: 0,
                 watchdog_observation: None,
                 page_offset: 0,
+                boot_wait_outcome: crate::monitor::BootWaitOutcome::NotConfigured,
             }),
             guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
                 entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
@@ -5632,6 +5635,7 @@ mod tests {
                 preemption_threshold_ns: 0,
                 watchdog_observation: None,
                 page_offset: 0,
+                boot_wait_outcome: crate::monitor::BootWaitOutcome::NotConfigured,
             }),
             guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
                 entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(

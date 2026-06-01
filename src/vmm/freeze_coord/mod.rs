@@ -10470,6 +10470,16 @@ impl KtstrVm {
                 // counter has been read by this wait and the
                 // `Option::take` in the freeze-coord TOKEN_TX
                 // handler also fires only once).
+                //
+                // `boot_wait_outcome` (declared here so it survives to the
+                // result-wrap below) records whether the sys_rdy eventfd
+                // fired vs the 5 s ceiling elapsing. It flows ONLY to the
+                // closure-wrap on the sampled-run path; every kill early-
+                // return below carries `NotConfigured`, because a monitor
+                // killed during setup never reaches the sample loop — so
+                // the invariant is `Fired` ⟺ the monitor sampled. Surfaced
+                // on MonitorReport for the sys_rdy-regression test.
+                let mut boot_wait_outcome = monitor::BootWaitOutcome::NotConfigured;
                 if let Some(sys_rdy) = monitor_sys_rdy_evt.as_deref() {
                     use std::os::unix::io::AsRawFd;
                     use vmm_sys_util::epoll::{
@@ -10494,6 +10504,7 @@ impl KtstrVm {
                             watchdog_observation: None,
                             page_offset: 0,
                             preemption_threshold_ns,
+                            boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
                         };
                     }
                     let kill_fd = kill_evt_clone.as_raw_fd();
@@ -10520,7 +10531,25 @@ impl KtstrVm {
                         // the case where neither wake arrives, and
                         // tighter is better because the host VM
                         // teardown waits on this thread joining.
-                        let _ = boot_epoll.wait(5_000, &mut boot_buf);
+                        // Capture the wake source into the local: Fired iff
+                        // the sys_rdy eventfd is among the ready fds, else
+                        // TimedOut on Ok(0). On any kill (kill_fd ready here,
+                        // or kill set before a return below) the kill early-
+                        // returns override to NotConfigured regardless — see
+                        // the decl comment's `Fired ⟺ sampled` invariant.
+                        match boot_epoll.wait(5_000, &mut boot_buf) {
+                            Ok(0) => {
+                                boot_wait_outcome = monitor::BootWaitOutcome::TimedOut;
+                            }
+                            Ok(n) => {
+                                if boot_buf[..n].iter().any(|e| e.fd() == boot_fd) {
+                                    boot_wait_outcome = monitor::BootWaitOutcome::Fired;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(err = %e, "monitor: boot epoll_wait failed");
+                            }
+                        }
                     }
                     if kill_clone.load(std::sync::atomic::Ordering::Acquire) {
                         return monitor::reader::MonitorLoopResult {
@@ -10531,6 +10560,7 @@ impl KtstrVm {
                             watchdog_observation: None,
                             page_offset: 0,
                             preemption_threshold_ns,
+                            boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
                         };
                     }
                 }
@@ -10716,6 +10746,7 @@ impl KtstrVm {
                         watchdog_observation: None,
                         page_offset: 0,
                         preemption_threshold_ns,
+                        boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
                     };
                 }
 
@@ -10815,6 +10846,7 @@ impl KtstrVm {
                         watchdog_observation: None,
                         page_offset: 0,
                         preemption_threshold_ns,
+                        boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
                     };
                 }
 
@@ -10958,6 +10990,7 @@ impl KtstrVm {
                         watchdog_observation: None,
                         page_offset: 0,
                         preemption_threshold_ns,
+                        boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
                     };
                 }
                 // aarch64 TCR_EL1 (granule + T1SZ) for the
@@ -11035,6 +11068,7 @@ impl KtstrVm {
                         watchdog_observation: None,
                         page_offset: 0,
                         preemption_threshold_ns,
+                        boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
                     };
                 }
 
@@ -11094,7 +11128,7 @@ impl KtstrVm {
                 // `rq_pas` empty: the loop sources every per-CPU
                 // PA from `rq_refresh` per iteration so the static
                 // slice would be both stale and redundant.
-                monitor::reader::monitor_loop(
+                let mut __mlr = monitor::reader::monitor_loop(
                     &mem,
                     &[],
                     &offsets,
@@ -11103,7 +11137,12 @@ impl KtstrVm {
                     &kill_evt_clone,
                     run_start,
                     &mon_cfg,
-                )
+                );
+                // The boot-complete wait happened in this closure (above),
+                // not inside monitor_loop (cfg.sys_rdy is None), so stamp
+                // the captured outcome onto the result here.
+                __mlr.boot_wait_outcome = boot_wait_outcome;
+                __mlr
             })
             .context("spawn monitor thread")?;
 
@@ -11929,6 +11968,7 @@ impl KtstrVm {
                     watchdog_observation,
                     page_offset,
                     preemption_threshold_ns,
+                    boot_wait_outcome,
                 }) => {
                     // `preemption_threshold_ns` was resolved once
                     // inside `start_monitor` (and threaded through
@@ -11950,6 +11990,7 @@ impl KtstrVm {
                         preemption_threshold_ns,
                         watchdog_observation,
                         page_offset,
+                        boot_wait_outcome,
                     };
                     (Some(report), drain)
                 }
