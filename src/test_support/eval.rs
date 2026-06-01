@@ -2284,13 +2284,13 @@ fn run_ktstr_test_inner_impl(
     // callback reported a genuine failure, so a real regression is
     // never masked. Detected here, ahead of the eval / auto-repro
     // path, so the run skips rather than failing.
-    if let Some(err) = &post_vm_err {
-        if err.downcast_ref::<HostSkipRequest>().is_some() {
-            let reason = format!("{err:#}");
-            crate::report::test_skip(format_args!("{}: {}", entry.name, reason));
-            record_skip_sidecar(entry);
-            return Ok(AssertResult::skip(reason));
-        }
+    if let Some(err) = &post_vm_err
+        && err.downcast_ref::<HostSkipRequest>().is_some()
+    {
+        let reason = format!("{err:#}");
+        crate::report::test_skip(format_args!("{}: {}", entry.name, reason));
+        record_skip_sidecar(entry);
+        return Ok(AssertResult::skip(reason));
     }
 
     // Gate-skip on an unloadable host LLM model. The model lives
@@ -2473,14 +2473,19 @@ pub(crate) fn apply_expect_auto_repro_inversion(
     entry: &KtstrTestEntry,
     result: &mut vmm::VmResult,
 ) {
-    if !entry.expect_auto_repro {
-        return;
-    }
-    if result.success {
-        return;
-    }
+    // The inversion is wprof-only: it inspects the repro `.wprof.pb`
+    // shape, which exists only under the `wprof` feature. Without it
+    // this is a no-op, so `entry` and `result` go unused.
+    #[cfg(not(feature = "wprof"))]
+    let _ = (entry, result);
     #[cfg(feature = "wprof")]
     {
+        if !entry.expect_auto_repro {
+            return;
+        }
+        if result.success {
+            return;
+        }
         let Ok(repro_path) = result.repro_wprof_pb_path() else {
             return;
         };
