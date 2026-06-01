@@ -378,6 +378,26 @@ fn scenario_yield_heavy(ctx: &Ctx) -> Result<AssertResult> {
 
 static BPF_CRASH: BpfMapWrite = BpfMapWrite::new(".bss", 4, 1);
 
+/// scx-error matcher for the two plain-`expect_err` BPF_CRASH negative
+/// tests (`neg_crash_after_auto_repro`, `neg_host_crash_auto_repro`).
+/// They write `crash=1` via `BPF_CRASH`, which makes `ktstr_dispatch`
+/// call `scx_bpf_error("ktstr: host-triggered crash")` — a BPF-side
+/// abort (`SCX_EXIT_ERROR_BPF`). Plain `expect_err` alone only proves
+/// "the run failed"; pinning the scx-error message proves the failure
+/// is a BPF crash, not a hang/panic/OOM/different exit class.
+///
+/// The dump's `scx_sched_state.exit_kind` is NOT usable here: a crashed
+/// scheduler tears down (scx_disable on the abort) before the freeze
+/// coordinator walks `*scx_root`, so the dump renders with
+/// `scx_walker_unavailable` and `scx_sched_state: null`. The
+/// dmesg-backed scx-error matcher is the reliable surface — the same
+/// one `neg_expect_scx_bpf_error_contains_e2e` uses. `expect_err: true`
+/// is required alongside it (validated in `KtstrTestEntry`).
+const CRASH_ASSERT: ktstr::assert::Assert = ktstr::assert::Assert {
+    expect_scx_bpf_error_contains: Some("ktstr: host-triggered crash"),
+    ..ktstr::assert::Assert::NO_OVERRIDES
+};
+
 #[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_FORCED_STALL: KtstrTestEntry = KtstrTestEntry {
@@ -440,6 +460,7 @@ static __KTSTR_ENTRY_CRASH_AFTER: KtstrTestEntry = KtstrTestEntry {
     scheduler: &KTSTR_SCHED,
     bpf_map_write: &[&BPF_CRASH],
     expect_err: true,
+    assert: CRASH_ASSERT,
     ..KtstrTestEntry::DEFAULT
 };
 
@@ -491,6 +512,7 @@ static __KTSTR_ENTRY_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
     scheduler: &KTSTR_SCHED,
     bpf_map_write: &[&BPF_CRASH],
     expect_err: true,
+    assert: CRASH_ASSERT,
     ..KtstrTestEntry::DEFAULT
 };
 

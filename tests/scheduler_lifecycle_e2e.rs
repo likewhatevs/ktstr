@@ -20,6 +20,7 @@
 use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
+use ktstr::prelude::{SampleSeries, VmResult};
 use ktstr::scenario::Ctx;
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
@@ -48,6 +49,48 @@ const COLD_START_ALT_SCHED: Scheduler =
 const STALL_AFTER_1S_SCHED: Scheduler = Scheduler::named("stall_after_1s")
     .binary(SchedulerSpec::Discover("scx-ktstr"))
     .sched_args(&["--stall-after", "1"]);
+
+/// Host-side `post_vm` shared by the three scheduler-lifecycle tests
+/// (attach / replace / restart). Each runs the lifecycle Op then a
+/// short workload-free settle; on its own that only proves the Op
+/// chain didn't error — NOT that the post-op scheduler actually
+/// schedules. scx-ktstr runs in FULL mode (no `SCX_OPS_SWITCH_PARTIAL`),
+/// so every runnable fair-class guest task — init, kworkers, RCU
+/// kthreads, the runner — flows through `ktstr_dispatch`, which bumps
+/// `nr_dispatched` after `scx_bpf_dsq_move_to_local`. So
+/// `nr_dispatched > 0` at any
+/// periodic sample proves the bound scheduler ran its dispatch path
+/// (past the crash/stall/degrade/slow gates) on system traffic alone —
+/// no dedicated workload needed. A bind-without-dispatch regression (Op
+/// succeeds, scheduler never schedules) reads 0 across every sample and
+/// fails here.
+fn assert_post_op_dispatch(result: &VmResult) -> Result<()> {
+    let series = SampleSeries::from_drained_typed(
+        result.snapshot_bridge.drain_ordered_with_stats(),
+        result.monitor.clone(),
+    )
+    .periodic_only();
+    anyhow::ensure!(
+        !series.is_empty(),
+        "no periodic samples on the bridge — the freeze coordinator never \
+         fired (periodic_target={}, periodic_fired={}); cannot prove the \
+         scheduler dispatched after the lifecycle op",
+        result.periodic_target,
+        result.periodic_fired,
+    );
+    let bpf_dispatched = series.bpf("nr_dispatched", |snap| snap.var("nr_dispatched").as_u64());
+    let any_progress = bpf_dispatched
+        .iter_full()
+        .any(|(_, _, slot)| matches!(slot, Ok(v) if *v > 0));
+    anyhow::ensure!(
+        any_progress,
+        "scx-ktstr nr_dispatched read 0 across every periodic sample — the \
+         scheduler bound to sched_ext (the lifecycle op succeeded) but never \
+         ran its dispatch path. Bind-without-dispatch regression: the post-op \
+         scheduler attached but isn't scheduling.",
+    );
+    Ok(())
+}
 
 /// Boots with `lifecycle_primary` as the boot scheduler, stages
 /// `lifecycle_alt` into `/staging/schedulers/lifecycle_alt/`, and
@@ -80,6 +123,8 @@ const STALL_AFTER_1S_SCHED: Scheduler = Scheduler::named("stall_after_1s")
     memory_mib = 512,
     duration_s = 5,
     cleanup_budget_ms = 5000,
+    num_snapshots = 3,
+    post_vm = assert_post_op_dispatch,
 )]
 fn scheduler_replace_mid_experiment_swaps_via_staged_pack(ctx: &Ctx) -> Result<AssertResult> {
     use ktstr::scenario::ops::{HoldSpec, Op, Step, execute_steps};
@@ -141,6 +186,8 @@ fn scheduler_replace_mid_experiment_swaps_via_staged_pack(ctx: &Ctx) -> Result<A
     memory_mib = 512,
     duration_s = 5,
     cleanup_budget_ms = 5000,
+    num_snapshots = 3,
+    post_vm = assert_post_op_dispatch,
 )]
 fn scheduler_attach_from_cold_start_succeeds(ctx: &Ctx) -> Result<AssertResult> {
     use ktstr::scenario::ops::{HoldSpec, Op, Step, execute_steps};
@@ -346,6 +393,8 @@ fn replace_with_broken_binary_surfaces_startup_died(ctx: &Ctx) -> Result<AssertR
     memory_mib = 512,
     duration_s = 5,
     cleanup_budget_ms = 5000,
+    num_snapshots = 3,
+    post_vm = assert_post_op_dispatch,
 )]
 fn scheduler_restart_mid_experiment_reattaches_cleanly(ctx: &Ctx) -> Result<AssertResult> {
     use ktstr::scenario::ops::{HoldSpec, Op, Step, execute_steps};

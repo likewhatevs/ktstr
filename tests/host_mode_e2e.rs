@@ -67,18 +67,17 @@ fn host_mode_sees_real_host_cpus(ctx: &Ctx) -> Result<AssertResult, anyhow::Erro
         // /sys/devices/system/cpu/online down to the test process's
         // CPU pin (typically 1-2 CPUs). In that env we cannot reliably
         // distinguish a correct from_system routing from a regressed
-        // from_vm_topology fallback (both can return 2). PASS with a
-        // log line so a real-host CI runner (>= 4 sysfs CPUs) still
-        // gates the routing regression below.
-        tracing::warn!(
-            sysfs_cpu_count = sysfs_cpus.len(),
-            topo_cpu_count = topo_cpus.len(),
-            "host_mode_sees_real_host_cpus: sysfs reports < 4 CPUs in \
-             this test env (sandboxed cargo-ktstr context with narrowed \
-             /sys); the regression check below cannot reliably trigger. \
-             Run on a real-host CI with >= 4 visible sysfs CPUs to gate."
-        );
-        return Ok(AssertResult::pass());
+        // from_vm_topology fallback (both can return 2). SKIP — not
+        // PASS — so this env is not counted as a run that actually
+        // verified the routing; a real-host CI runner (>= 4 sysfs CPUs)
+        // still gates the regression below.
+        return Ok(AssertResult::skip(format!(
+            "sysfs reports {} CPUs (< 4) in this test env (sandboxed \
+             cargo-ktstr context with narrowed /sys); the from_system \
+             routing regression check cannot reliably trigger. Run on a \
+             real-host CI with >= 4 visible sysfs CPUs to gate.",
+            sysfs_cpus.len(),
+        )));
     }
     // Distinguishing signal: the synth topo produces CPU ids
     // starting at 0 (1×2×1 → {0, 1}). On a >= 4-CPU host where
@@ -206,20 +205,18 @@ fn host_mode_workers_pct_scales_to_host_cpu_count(
         // CPU count (typically 1-2), not the real host's CPU count.
         // Under that narrowing the workers_pct(1.0) scaling cannot
         // be distinguished from the `from_vm_topology` default-topology
-        // fallback. PASS with a log line so the constraint is
-        // visible; the sibling test `host_mode_sees_real_host_cpus`
+        // fallback. SKIP — not PASS — so this env is not counted as a
+        // passing run; the sibling test `host_mode_sees_real_host_cpus`
         // gates the from_system routing regression via
         // /sys/devices/system/cpu/online cross-check that bypasses
         // the affinity-narrowing layer.
-        tracing::warn!(
-            all_cpus,
-            "host_mode_workers_pct_scales_to_host_cpu_count: ctx.topo \
-             reports < 4 CPUs in this test env (sandboxed cargo-ktstr \
-             context with narrowed sched_getaffinity); the workers_pct \
-             scaling check cannot reliably trigger. Run on a real-host CI \
-             with >= 4 visible CPUs to gate."
-        );
-        return Ok(AssertResult::pass());
+        return Ok(AssertResult::skip(format!(
+            "ctx.topo reports {all_cpus} CPUs (< 4) in this test env \
+             (sandboxed cargo-ktstr context with narrowed \
+             sched_getaffinity); the workers_pct scaling check cannot \
+             reliably trigger. Run on a real-host CI with >= 4 visible \
+             CPUs to gate."
+        )));
     }
     Ok(AssertResult::pass())
 }

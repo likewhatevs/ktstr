@@ -333,6 +333,14 @@ fn scenario_watchdog_timing_precision(
     let kmsg = ktstr::read_kmsg();
     let duration_secs = parse_stall_duration_seconds(&kmsg);
 
+    // 5.0s, not tighter: the failure is binary — the kernel-measured
+    // stall is ~2.0-2.1s when the host watchdog_timeout=2s override
+    // applies, or ~20s when scx-ktstr's .timeout_ms=20000 BPF default
+    // dominates; no intermediate value is reachable. A tighter budget
+    // (e.g. 4.0s) catches the same ~20s break but adds flake risk:
+    // under -j16 CI load, KVM vCPU preemption can delay the watchdog
+    // check and stretch the kernel-MEASURED stall toward 3-4s even when
+    // the override IS effective. 5.0s clears that lag with headroom.
     const OVERRIDE_BUDGET_SECS: f64 = 5.0;
     if let Some(observed) = duration_secs {
         if observed > OVERRIDE_BUDGET_SECS {
