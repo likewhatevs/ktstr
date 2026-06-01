@@ -926,7 +926,12 @@ pub const EXIT_INCONCLUSIVE: i32 = 2;
 /// [`EXIT_INCONCLUSIVE`] on Inconclusive — the 4-state lattice
 /// `Fail > Inconclusive > Pass > Skip` projects to 3 distinct exit
 /// codes (Skip degenerates to [`EXIT_PASS`] because the test never
-/// ran, mirroring `ResourceContention`). [`EXIT_INCONCLUSIVE`] lets
+/// ran, mirroring `ResourceContention`). A Skip routes through the
+/// dedicated FIRST match arm (`Ok(r) if r.is_skip()`), ahead of the
+/// expect_err arm, so an expect_err test that produced no verdict (e.g.
+/// a `post_vm_skip` on a load-starved placeholder dump) is not inverted
+/// into a FAIL — a skipped test cannot "produce the expected error."
+/// [`EXIT_INCONCLUSIVE`] lets
 /// downstream tooling (CI gates, nextest summary aggregation, the
 /// operator dashboard) triage zero-denominator runs distinctly from
 /// real regressions. `ResourceContention` returns [`EXIT_PASS`] —
@@ -953,6 +958,22 @@ fn result_to_exit_code(
 ) -> i32 {
     let no_skip = std::env::var_os(crate::KTSTR_NO_SKIP_MODE_ENV).is_some();
     match result {
+        // A Skip degenerates to EXIT_PASS regardless of expect_err — the
+        // test never evaluated, so there is no guest failure to "expect"
+        // (the `Fail > Inconclusive > Pass > Skip` projection; mirrors the
+        // ResourceContention Err arm below, but on the Ok side). Without
+        // this arm a post_vm_skip under expect_err falls into the
+        // `Ok(r) if expect_err` arm and surfaces as "expected error but
+        // test passed" (EXIT_FAIL) — a load-starvation placeholder-dump
+        // skip becomes a flaky failure. End-to-end chain: a post_vm
+        // callback returns Err(post_vm_skip(..)) → the eval gate detects
+        // the HostSkipRequest marker, reports via report::test_skip, and
+        // returns Ok(AssertResult::skip) → this arm maps it to EXIT_PASS.
+        // is_skip() is true only when `outcomes` is non-empty and every
+        // outcome is Outcome::Skip (assert/mod.rs); the empty-outcomes
+        // Pass identity has is_skip()==false and falls through to the
+        // `Ok(_) => EXIT_PASS` arm.
+        Ok(r) if r.is_skip() => EXIT_PASS,
         Ok(r) if expect_err => {
             // expect_err inverts on Pass and on Inconclusive: both
             // are "not a failure" in the operator's mental model,
@@ -3726,6 +3747,40 @@ mod tests {
             "zero-denominator under expect_err",
         ));
         assert_eq!(result_to_exit_code(Ok(inc2), true, false), 1);
+    }
+
+    /// A Skip verdict maps to EXIT_PASS regardless of expect_err — the
+    /// test never evaluated, so there is no guest failure to "expect."
+    /// Regression guard: a `post_vm_skip` (e.g. a placeholder failure
+    /// dump under VM load) on an `expect_err` test previously fell into
+    /// the `Ok(r) if expect_err` arm and surfaced as "expected error but
+    /// test passed" (EXIT_FAIL), turning a load-starvation skip into a
+    /// flaky failure. The `is_skip()` arm must precede the expect_err
+    /// arms.
+    #[test]
+    fn result_to_exit_code_skip_maps_to_pass_even_under_expect_err() {
+        use crate::assert::AssertResult;
+        // Skip without expect_err → 0 (the `Ok(_)` arm already covers
+        // this; pinned against a match-reorder regression).
+        assert_eq!(
+            result_to_exit_code(
+                Ok(AssertResult::skip("inconclusive: placeholder dump")),
+                false,
+                false
+            ),
+            0
+        );
+        // Skip WITH expect_err → 0. The is_skip arm dominates: a skip is
+        // never "the expected error failed to appear" because the test
+        // never evaluated.
+        assert_eq!(
+            result_to_exit_code(
+                Ok(AssertResult::skip("inconclusive: placeholder dump")),
+                true,
+                false
+            ),
+            0
+        );
     }
 
     /// `allow_inconclusive = true` routes a terminal Inconclusive
