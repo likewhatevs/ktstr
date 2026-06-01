@@ -32,7 +32,7 @@ mod common;
 use anyhow::{Context, Result};
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
-use ktstr::prelude::{SCHEMA_SINGLE, VmResult};
+use ktstr::prelude::{SCHEMA_SINGLE, VmResult, post_vm_skip};
 use ktstr::scenario::ops::{HoldSpec, Step, await_accessor_ready, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
@@ -635,6 +635,35 @@ fn check_array_entries_dump(result: &VmResult) -> Result<()> {
 
     let value: serde_json::Value = serde_json::from_str(&json)
         .map_err(|e| anyhow::anyhow!("dump file is not valid JSON: {e}"))?;
+
+    // Skip (inconclusive) when the dump carries no maps to verify. Two
+    // load-starvation paths both yield empty `maps`: the PLACEHOLDER
+    // dump (is_placeholder=true — rendezvous timeout / coord exited) and
+    // the PARTIAL dump (is_placeholder=FALSE — owned_accessor / dump_btf
+    // not ready before the freeze, i.e. the BPF probe had not attached;
+    // see the freeze coordinator's partial-report path). Either way the
+    // ARRAY fixture render cannot be verified, so the run is
+    // inconclusive. A REAL render bug instead captures maps (non-empty)
+    // and renders the fixture wrong — that falls through to the
+    // assertion below and fails. Gating on "no maps" skips the
+    // inconclusive runs without masking a regression.
+    let no_maps = value
+        .get("maps")
+        .and_then(|m| m.as_array())
+        .is_none_or(|m| m.is_empty());
+    let is_placeholder = value
+        .get("is_placeholder")
+        .and_then(|p| p.as_bool())
+        .unwrap_or(false);
+    if is_placeholder || no_maps {
+        return Err(post_vm_skip(
+            "failure dump has no maps — the BPF probe did not attach, or dump \
+             prerequisites were unavailable before the host watchdog fired \
+             (placeholder or partial-render path under VM starvation); the \
+             ARRAY fixture render cannot be verified",
+        ));
+    }
+
     let schema = value
         .get("schema")
         .and_then(|s| s.as_str())

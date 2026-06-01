@@ -702,6 +702,7 @@ pub mod prelude {
     };
     pub use crate::scenario::payload_run::{PayloadHandle, PayloadRun};
     pub use crate::scenario::scenarios;
+    pub use crate::test_support::post_vm_skip;
     // Snapshot accessor surface and the underlying report shapes
     // a test author needs to inspect the captured BTF-rendered
     // bytes. The renderer types come from monitor::btf_render and

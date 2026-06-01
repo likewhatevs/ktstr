@@ -60,6 +60,7 @@ mod probe;
 mod probe_metrics;
 mod profraw;
 pub use profraw::current_binary_is_coverage_instrumented;
+pub use eval::post_vm_skip;
 pub mod runtime;
 mod shell_descriptor;
 pub use shell_descriptor::{SchedulerKind, ShellTestDescriptor};
