@@ -32,10 +32,15 @@ doc-strict:
 kernel-build version="":
     cargo run --bin cargo-ktstr -- ktstr kernel build --skip-sha256 {{version}}
 
-# Run tests against a kernel version. `extra-features` appends to the
-# feature list (e.g. `just test 6.14 wprof` → `--features integration,wprof`).
+# Run tests against a kernel version. `extra-features` is passed BOTH to
+# the cargo-ktstr build AND appended to the inner test feature list. The
+# build pass matters for a blob-embedding feature like `wprof`: cargo-ktstr
+# only embeds WPROF_BYTES — exported as KTSTR_WPROF_PATH at startup, which
+# the #[ktstr_test(wprof)] tests require — when itself built with the
+# feature. E.g. `just test 6.14 wprof` → cargo-ktstr built `--features
+# wprof`; tests run `--features integration,wprof`.
 test kernel extra-features="":
-    cargo run --bin cargo-ktstr -- ktstr test --kernel {{kernel}} -- --profile ci --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} -j $(nproc)
+    cargo run --bin cargo-ktstr {{ if extra-features != "" { "--features " + extra-features } else { "" } }} -- ktstr test --kernel {{kernel}} -- --profile ci --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} -j $(nproc)
 
 # Run trybuild compile_fail fixtures.
 #
@@ -55,9 +60,11 @@ test kernel extra-features="":
 compile-fail:
     cargo nextest run --profile ci --features wprof -E 'binary(compile_fail) & test(=compile_fail)' --run-ignored all
 
-# Run coverage. `extra-features` appends to the feature list.
+# Run coverage. `extra-features` is passed to the cargo-ktstr build (so a
+# blob-embedding feature like `wprof` is provisioned — see `test`) AND
+# appended to the inner coverage feature list.
 coverage extra-features="":
-    cargo run --bin cargo-ktstr -- ktstr coverage -- --profile ci --lcov --output-path lcov.info --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} --exclude-from-report scx-ktstr
+    cargo run --bin cargo-ktstr {{ if extra-features != "" { "--features " + extra-features } else { "" } }} -- ktstr coverage -- --profile ci --lcov --output-path lcov.info --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} --exclude-from-report scx-ktstr
 
 # Show sccache statistics
 sccache-stats:
