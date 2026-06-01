@@ -222,7 +222,7 @@ fn main() {
             no_perf_mode,
             cpu_cap,
             disk,
-        } => misc::run_shell(
+        } => match misc::run_shell(
             kernel,
             test,
             topology,
@@ -233,7 +233,15 @@ fn main() {
             no_perf_mode,
             cpu_cap,
             disk,
-        ),
+        ) {
+            // Shell mode exits with the guest payload's own exit code
+            // (recovered from the ExecExit bulk frame); interactive mode
+            // (None) exits 0. Diverge here so it does not fall through to
+            // the uniform exit-0 path below; Err routes to the shared
+            // error handler.
+            Ok(opt) => std::process::exit(opt.unwrap_or(0)),
+            Err(e) => Err(e),
+        },
     };
 
     if let Err(e) = result {

@@ -154,7 +154,7 @@ pub(crate) fn run_shell(
     no_perf_mode: bool,
     cpu_cap: Option<usize>,
     disk: Option<String>,
-) -> Result<(), String> {
+) -> Result<Option<i32>, String> {
     if no_perf_mode {
         // SAFETY: single-threaded at this point — main → dispatch →
         // run_shell, no prior thread spawn (ktstr's tokio feature set

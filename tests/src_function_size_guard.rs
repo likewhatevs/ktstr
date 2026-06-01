@@ -230,7 +230,7 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ), // queued: decompose
     ("vmm/freeze_coord/mod.rs", "KtstrVm::start_monitor", 780),   // queued: decompose
     ("vmm/initramfs.rs", "build_initramfs_base", 277),            // queued: decompose
-    ("vmm/mod.rs", "KtstrVm::run_interactive", 626),              // queued: decompose
+    ("vmm/mod.rs", "KtstrVm::run_interactive", 663),              // queued: decompose
     ("vmm/rust_init.rs", "ktstr_guest_init", 616),                // queued: decompose
     ("vmm/rust_init.rs", "run_relay_session", 209),               // queued: decompose
     ("vmm/rust_init.rs", "start_sched_exit_monitor", 222),        // queued: decompose

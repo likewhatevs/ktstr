@@ -816,7 +816,7 @@ impl KtstrVm {
     /// `watchdog_timeout`, `bpf_map_write`, `performance_mode` pinning,
     /// and KVM stats collection. These are test-specific features that
     /// do not apply to interactive shell sessions.
-    pub fn run_interactive(&self) -> Result<()> {
+    pub fn run_interactive(&self) -> Result<Option<i32>> {
         let start = Instant::now();
 
         let initramfs_handle = self.spawn_initramfs_resolve();
@@ -1448,14 +1448,120 @@ impl KtstrVm {
 
         if !exec_mode {
             eprintln!("Connection to VM closed.");
+            return Ok(None);
         }
-        Ok(())
+
+        // Exec mode: recover the payload's exit code from the framed
+        // `MSG_TYPE_EXEC_EXIT` the guest published on the bulk port
+        // (port 1) just before reboot (`guest_comms::send_exec_exit`
+        // writes `code.to_le_bytes()`). Shell mode does NOT run the
+        // freeze-coordinator's bulk dispatch, so this is the sole
+        // host-side consumer of the frame on the interactive path —
+        // without it the payload's exit code is silently lost and the
+        // CLI always reports success. `final_drain` walks port 1's
+        // avail ring once to pick up any chain published without a
+        // trailing QUEUE_NOTIFY, then returns the accumulated TX bytes.
+        let bulk = virtio_con.lock().final_drain();
+        let entries = crate::vmm::host_comms::parse_tlv_stream(&bulk).entries;
+        match Self::exec_exit_from_entries(&entries) {
+            Some(code) => Ok(Some(code)),
+            // no-silent-drops: the guest always emits a CRC-valid
+            // ExecExit before reboot in `--exec` mode, so its absence
+            // means the exit code was lost (the guest panicked or
+            // rebooted before send_exec_exit). Fail loud rather than
+            // masking it as exit 0 — that silent default is the exact
+            // regression this consumer closes.
+            None => anyhow::bail!(
+                "shell --exec '{}' finished but the guest delivered no CRC-valid \
+                 MSG_TYPE_EXEC_EXIT frame; the payload's exit code is unknown (the \
+                 guest may have panicked or rebooted before send_exec_exit)",
+                self.exec_cmd.as_deref().unwrap_or("?")
+            ),
+        }
+    }
+
+    /// Recover the shell `--exec` payload's exit code from the drained
+    /// bulk-port frames: the LAST CRC-valid 4-byte `MSG_TYPE_EXEC_EXIT`
+    /// frame, decoded as a little-endian `i32` (matching the guest's
+    /// `send_exec_exit` `to_le_bytes`). Returns `None` when no such
+    /// frame is present — the caller treats that as a lost exit code and
+    /// fails loud. CRC-failed and wrong-length frames are skipped: a
+    /// torn frame must never promote into a bogus exit code. Last-wins
+    /// is defensive (the guest sends exactly one per exec, then reboots)
+    /// and mirrors the freeze coordinator's MSG_TYPE_EXIT walker.
+    fn exec_exit_from_entries(entries: &[crate::vmm::wire::ShmEntry]) -> Option<i32> {
+        entries
+            .iter()
+            .rev()
+            .find(|e| {
+                e.msg_type == crate::vmm::wire::MSG_TYPE_EXEC_EXIT
+                    && e.crc_ok
+                    && e.payload.len() == 4
+            })
+            .map(|e| i32::from_le_bytes(e.payload[..4].try_into().unwrap()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_exit_from_entries_decodes_last_crc_valid_frame() {
+        use crate::vmm::wire::{MSG_TYPE_EXEC_EXIT, ShmEntry};
+        let mk = |msg_type, payload: Vec<u8>, crc_ok| ShmEntry {
+            msg_type,
+            payload,
+            crc_ok,
+        };
+        // CRC-valid 4-byte ExecExit → decoded little-endian i32.
+        assert_eq!(
+            KtstrVm::exec_exit_from_entries(&[mk(
+                MSG_TYPE_EXEC_EXIT,
+                17i32.to_le_bytes().to_vec(),
+                true
+            )]),
+            Some(17),
+        );
+        // Negative codes round-trip through the LE decode.
+        assert_eq!(
+            KtstrVm::exec_exit_from_entries(&[mk(
+                MSG_TYPE_EXEC_EXIT,
+                (-1i32).to_le_bytes().to_vec(),
+                true
+            )]),
+            Some(-1),
+        );
+        // CRC-failed frame is skipped — a torn frame must never promote
+        // into a bogus exit code.
+        assert_eq!(
+            KtstrVm::exec_exit_from_entries(&[mk(
+                MSG_TYPE_EXEC_EXIT,
+                17i32.to_le_bytes().to_vec(),
+                false
+            )]),
+            None,
+        );
+        // Wrong payload length is skipped.
+        assert_eq!(
+            KtstrVm::exec_exit_from_entries(&[mk(MSG_TYPE_EXEC_EXIT, vec![1, 2, 3], true)]),
+            None,
+        );
+        // No ExecExit frame among other types → None.
+        assert_eq!(
+            KtstrVm::exec_exit_from_entries(&[mk(0xDEAD_BEEF, 0i32.to_le_bytes().to_vec(), true)]),
+            None,
+        );
+        // Multiple ExecExit frames → last (reverse-find) wins.
+        assert_eq!(
+            KtstrVm::exec_exit_from_entries(&[
+                mk(MSG_TYPE_EXEC_EXIT, 1i32.to_le_bytes().to_vec(), true),
+                mk(MSG_TYPE_EXEC_EXIT, 2i32.to_le_bytes().to_vec(), true),
+            ]),
+            Some(2),
+        );
+    }
+
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn ap_mp_state_set_correctly() {

@@ -1592,7 +1592,7 @@ pub fn run_shell(
     performance_mode: bool,
     sched_enable_cmds: &[&str],
     sched_disable_cmds: &[&str],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<i32>> {
     // Re-ignore SIGPIPE for the lifetime of the shell-mode VM. The
     // `cargo-ktstr` main installs SIG_DFL on SIGPIPE (so streaming
     // subcommands like `ktstr kernel list | head` exit cleanly rather

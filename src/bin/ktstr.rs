@@ -1776,7 +1776,7 @@ fn main() -> Result<()> {
                 .map(|(a, p)| (a.as_str(), p.as_path()))
                 .collect();
 
-            ktstr::run_shell(
+            let exec_code = ktstr::run_shell(
                 kernel_path,
                 numa_nodes,
                 llcs,
@@ -1798,6 +1798,10 @@ fn main() -> Result<()> {
                 &[],
                 &[],
             )?;
+            // Exit with the guest payload's own exit code (recovered from
+            // the ExecExit bulk frame in run_interactive); interactive
+            // mode (None) exits 0.
+            std::process::exit(exec_code.unwrap_or(0));
         }
 
         Command::Ctprof { command } => match command {

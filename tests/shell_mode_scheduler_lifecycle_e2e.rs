@@ -438,6 +438,33 @@ fn shell_mode_payload_nonzero_exit_propagates_enable_still_fires() {
     );
 }
 
+/// Companion to the non-zero case: a payload that exits 0 must
+/// propagate as exit 0, NOT be masked into a spurious failure by the
+/// missing-frame fail-loud path. Pins the success direction of the
+/// exit-code-propagation contract — a regression that always reported
+/// non-zero, or that tripped the no-ExecExit-frame bail on a valid
+/// `ExecExit(0)` frame, would fail here.
+#[test]
+fn shell_mode_payload_zero_exit_propagates() {
+    let out = run_cargo_ktstr_shell(
+        "shell_lifecycle_fixture_both",
+        "echo SHELL_LIFECYCLE_PAYLOAD_MARKER; exit 0",
+    );
+    let combined = combined_output(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "subprocess exit code = {:?}; expected 0 (the payload's own \
+         `exit 0`) — a CRC-valid ExecExit(0) frame must surface as 0, \
+         not trip the missing-frame bail. Combined:\n{combined}",
+        out.status.code(),
+    );
+    assert!(
+        combined.contains("SHELL_LIFECYCLE_PAYLOAD_MARKER"),
+        "payload's echo must surface in captured output. Combined:\n{combined}",
+    );
+}
+
 /// Partial-apply: enable cmd list has one line that fails (writes
 /// to a non-existent path) and one line that succeeds (writes the
 /// marker). Per `exec_shell_script` in `src/vmm/rust_init.rs`,

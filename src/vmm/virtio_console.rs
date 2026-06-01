@@ -909,8 +909,9 @@ impl VirtioConsole {
     /// matching host-side notify. A single explicit `process_tx`
     /// call from the host side picks them up.
     ///
-    /// Synchronous call from `collect_results`; the underlying
-    /// `process_tx` is the same code path MMIO QUEUE_NOTIFY
+    /// Synchronous call from `collect_results` (scheduler-test path)
+    /// and `run_interactive` (shell `--exec` exit-code recovery); the
+    /// underlying `process_tx` is the same code path MMIO QUEUE_NOTIFY
     /// uses, including the per-call `TX_PER_CALL_MAX` byte cap and
     /// the `DRIVER_OK` / `F_MULTIPORT` gates. If the guest already
     /// wrote 0 to VIRTIO_MMIO_STATUS, [`Self::reset`] has run; that
