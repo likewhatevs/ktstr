@@ -329,6 +329,7 @@ u32 slow_cnt;
 volatile u64 nr_dispatched;
 volatile u64 nr_enqueued;
 volatile u64 nr_select_cpu;
+volatile u64 nr_yielded;
 
 
 s32 BPF_STRUCT_OPS(ktstr_select_cpu, struct task_struct *p,
@@ -963,10 +964,26 @@ void BPF_STRUCT_OPS(ktstr_dump_task, struct scx_dump_ctx *dctx,
 		     taskc->stashed_arena_ptr);
 }
 
+/* Fixture observability hook: count every ops.yield invocation so the
+ * yield-semantics test can confirm the op fired, and zero the yielder's
+ * slice -- matching the kernel's default sched_yield handling
+ * (yield_task_scx, kernel/sched/ext.c:2148, which zeros the slice when
+ * ops.yield is unimplemented) -- so adding the hook changes nothing but
+ * the counter. A fixture observes yields; it does not arbitrate them, so
+ * the directed yield_to target (@to) gets no special handling.
+ */
+bool BPF_STRUCT_OPS(ktstr_yield, struct task_struct *from, struct task_struct *to)
+{
+	__sync_fetch_and_add(&nr_yielded, 1);
+	from->scx.slice = 0;
+	return false;
+}
+
 SCX_OPS_DEFINE(ktstr_ops,
 	       .select_cpu	= (void *)ktstr_select_cpu,
 	       .enqueue		= (void *)ktstr_enqueue,
 	       .dispatch	= (void *)ktstr_dispatch,
+	       .yield		= (void *)ktstr_yield,
 	       .init_task	= (void *)ktstr_init_task,
 	       .exit_task	= (void *)ktstr_exit_task,
 	       .dump		= (void *)ktstr_dump,

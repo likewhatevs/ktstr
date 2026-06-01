@@ -53,6 +53,13 @@ pub struct KtstrStats {
     /// Cumulative count of `ktstr_select_cpu` invocations.
     #[stat(desc = "Number of select_cpu callbacks observed")]
     pub nr_select_cpu: u64,
+    /// Cumulative count of `ktstr_yield` invocations -- bumped on every
+    /// yield callback (undirected `sched_yield(2)` and directed
+    /// `yield_to(2)` alike). The fixture handler treats both uniformly:
+    /// zero the yielder's slice and return false (see `ktstr_yield` in
+    /// main.bpf.c).
+    #[stat(desc = "Number of yield callbacks observed")]
+    pub nr_yielded: u64,
 }
 
 /// Build the `StatsServerData` instance the scheduler hands to
