@@ -707,7 +707,12 @@ pub(super) fn dispatch_bulk_message(
             // (ScenarioEnd, Exit, TestResult, Crash, PayloadMetrics,
             // RawPayloadOutput, Profraw, Stdout, Stderr, SchedLog,
             // Lifecycle, ExecExit, Dmesg, ProbeOutput) accumulates
-            // into the bucket verbatim. Stimulus has its own typed
+            // into the bucket verbatim. (ExecExit is listed for
+            // completeness but is shell-mode-only -- sent only by
+            // `cargo ktstr shell --exec` and consumed host-side by
+            // `KtstrVm::run_interactive`, not the freeze coordinator;
+            // the scheduler-test path never receives one, so it is
+            // never actually bucketed here.) Stimulus has its own typed
             // arm above (decodes step_index into the host-side
             // mirror, then buckets). SnapshotReply is host→guest
             // only and is filtered out by the

@@ -12117,7 +12117,11 @@ impl KtstrVm {
                 .iter()
                 .rev()
                 .find(|e| e.msg_type == wire::MSG_TYPE_EXIT && e.crc_ok && e.payload.len() == 4)
-                .map(|e| i32::from_ne_bytes(e.payload[..4].try_into().unwrap()))
+                // LE decode: the guest writes the code via `to_le_bytes`
+                // (guest_comms::send_exit), so `from_ne_bytes` would
+                // byte-swap on a big-endian host. Matches the shell-mode
+                // ExecExit decode in `run_interactive`.
+                .map(|e| i32::from_le_bytes(e.payload[..4].try_into().unwrap()))
         });
         // Pre-bulk-port-migration: a COM2 `KTSTR_EXIT=N` sentinel line
         // served as the fallback when no binary `MSG_TYPE_EXIT`
