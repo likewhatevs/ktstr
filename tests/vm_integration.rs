@@ -720,28 +720,31 @@ fn scenario_disk_write_read_roundtrip(_ctx: &ktstr::scenario::Ctx) -> Result<Ass
     Ok(result)
 }
 
-/// Mount `/dev/vda` read-only and assert that an attempted write
-/// fails. Pins the [`DiskConfig::read_only`] knob:
+/// Boot with `/dev/vda` configured read-only and assert the guest
+/// sees a read-only block device end-to-end. Pins the
+/// [`DiskConfig::read_only`] knob:
 ///
-///   1. The host advertises VIRTIO_BLK_F_RO via
-///      [`crate::vmm::virtio_blk::VirtioBlk::with_options`] when
+///   1. The host advertises `VIRTIO_BLK_F_RO` via
+///      `crate::vmm::virtio_blk::VirtioBlk::with_options` when
 ///      `read_only=true`.
-///   2. The guest kernel observes the negotiated F_RO bit and
-///      sets the device's `disk->part0.policy = 1`, which gates
-///      `O_WRONLY`/`O_RDWR` opens with `EROFS`.
-///   3. Defense-in-depth: even if the guest opens the device
-///      O_RDWR (it can't, but supposing a misbehaving guest), the
-///      device's `handle_write` rejects writes with
-///      `VIRTIO_BLK_S_IOERR` per `virtio-v1.2 §5.2.5.1`.
+///   2. The guest kernel observes the negotiated F_RO bit and marks
+///      the gendisk read-only — surfaced at `/sys/block/vda/ro` (==1).
+///   3. The kernel rejects WRITES to a read-only bdev at WRITE time
+///      with `EPERM`, NOT at `open(2)` time: the bdev open path does
+///      not gate on read-only, so `open(O_WRONLY)` SUCCEEDS and the
+///      first `write()` returns `EPERM`. (`EROFS`, the prior
+///      assertion, appears on neither path: userspace `open(2)` is
+///      not gated, and the in-kernel `bdev_file_open_by_path` returns
+///      `EACCES`.)
 ///
-/// This test exercises path (2) — the kernel-enforced read-only
-/// gate at `open(2)` time. Path (3) is unit-tested in
-/// `src/vmm/virtio_blk.rs::tests`. The kernel's `EROFS` is the
-/// surface visible to a guest userspace caller; the in-device
-/// rejection only fires for chains the guest constructs in spite
-/// of the negotiated bit.
+/// So the test reads `/sys/block/vda/ro` (must be `1`) and confirms a
+/// `write()` to an `O_WRONLY` fd returns `EPERM`; reads are unaffected
+/// (F_RO does not gate reads). The in-device write-rejection
+/// (`VIRTIO_BLK_S_IOERR` for a write chain a guest builds despite the
+/// negotiated bit) is unit-tested in `src/vmm/virtio_blk/`.
 fn scenario_disk_read_only_rejects_write(_ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     use std::fs::OpenOptions;
+    use std::io::Write;
 
     let path = std::path::Path::new("/dev/vda");
     // Read-open should still succeed — F_RO doesn't gate reads.
@@ -752,34 +755,63 @@ fn scenario_disk_read_only_rejects_write(_ctx: &ktstr::scenario::Ctx) -> Result<
             .map_err(|e| anyhow::anyhow!("open /dev/vda read-only: {e}"))?;
     }
 
-    let result = OpenOptions::new().write(true).open(path);
-    match result {
-        Ok(_) => {
-            anyhow::bail!(
-                "open(/dev/vda, O_WRONLY) succeeded on a read-only disk. \
-                 Either VIRTIO_BLK_F_RO was not advertised by the host, \
-                 the guest driver did not honor it, or the device's \
-                 read-only gate is broken."
-            );
-        }
+    // The guest kernel marked the gendisk read-only on F_RO
+    // negotiation: /sys/block/vda/ro reads "1".
+    let ro = std::fs::read_to_string("/sys/block/vda/ro").map_err(|e| {
+        anyhow::anyhow!(
+            "read /sys/block/vda/ro: {e} — /dev/vda likely did not \
+             register (virtio_blk probe failed, or it is not a block \
+             device)"
+        )
+    })?;
+    anyhow::ensure!(
+        ro.trim() == "1",
+        "/sys/block/vda/ro is {ro:?}, expected \"1\" — the read-only chain \
+         broke at the host (VIRTIO_BLK_F_RO not advertised) or the guest \
+         (driver did not mark the gendisk read-only)"
+    );
+
+    // open(O_WRONLY) SUCCEEDS — the kernel's bdev open path does not
+    // gate the open on read-only; the write is rejected at write time.
+    let mut fd = OpenOptions::new().write(true).open(path).map_err(|e| {
+        anyhow::anyhow!(
+            "open(/dev/vda, O_WRONLY) failed with {e} — the kernel admits \
+             write-opens on a read-only bdev (rejection is at write time), \
+             so this open must succeed"
+        )
+    })?;
+
+    // The first write() returns EPERM — the kernel rejects writes to a
+    // read-only bdev at write time. This is the read-only enforcement
+    // surface a guest userspace caller actually hits.
+    match fd.write(&[0u8]) {
+        Ok(0) => anyhow::bail!(
+            "write(&[0u8]) to /dev/vda returned Ok(0) (zero progress) — \
+             expected Err(EPERM); the kernel took the write fd but \
+             reported no bytes written instead of rejecting the write"
+        ),
+        Ok(n) => anyhow::bail!(
+            "write({n} bytes) to /dev/vda SUCCEEDED on a read-only disk — \
+             the kernel did not reject the write; VIRTIO_BLK_F_RO is not \
+             honored end-to-end"
+        ),
         Err(e) => {
             let raw_errno = e.raw_os_error();
-            let expected = libc::EROFS;
-            if raw_errno != Some(expected) {
-                anyhow::bail!(
-                    "open(/dev/vda, O_WRONLY) failed with errno={raw_errno:?}, \
-                     expected EROFS ({expected}). The kernel rejected the \
-                     open but for a different reason than read-only — check \
-                     for ENODEV (device missing) or EBUSY (concurrent open)."
-                );
-            }
+            anyhow::ensure!(
+                raw_errno == Some(libc::EPERM),
+                "write to /dev/vda failed errno={raw_errno:?}, expected EPERM \
+                 ({}) — rejected for a reason other than read-only (EIO would \
+                 mean the host's in-device IOERR gate fired; EBADF/EFAULT a \
+                 test bug)",
+                libc::EPERM
+            );
         }
     }
 
     let mut result = AssertResult::pass();
     result.note(
-        "open(/dev/vda, O_WRONLY) returned EROFS as expected — \
-         VIRTIO_BLK_F_RO is honored end-to-end",
+        "/sys/block/vda/ro==1 and write() returned EPERM — VIRTIO_BLK_F_RO \
+         is honored end-to-end (read-only gendisk, write-time rejection)",
     );
     Ok(result)
 }

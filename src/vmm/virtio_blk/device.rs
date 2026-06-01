@@ -463,9 +463,10 @@ pub(crate) struct BlkWorkerState {
     /// during mount-readonly should not see an error). Per
     /// virtio-v1.2 §5.2.5.1, when `F_RO` is negotiated the device
     /// is read-only and the guest driver SHOULD treat the device
-    /// as read-only; how the driver chooses to do that
-    /// (read-only mount, error on `open(O_WRONLY)`, etc.) is
-    /// driver business. The in-device rejection is defense
+    /// as read-only; how the driver chooses to do that is
+    /// driver business — on Linux `open(2)` is not gated and
+    /// writes fail with `EPERM` (no `open`-time error). The
+    /// in-device rejection is defense
     /// against a malicious or buggy guest that ignores the
     /// negotiated feature bit.
     pub(crate) read_only: bool,
