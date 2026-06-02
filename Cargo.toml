@@ -86,7 +86,6 @@ virtio-bindings = "0.2.7"
 virtio-queue = "0.17"
 vm-superio = "0.8.1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
-polars = { version = "0.53.0", default-features = false, features = ["lazy", "describe"] }
 linkme = "0.3"
 ktstr-macros = { version = "0.10.0", path = "ktstr-macros" }
 goblin = { version = "0.10.5", features = ["elf64"] }
@@ -106,13 +105,11 @@ gimli = "0.33"
 rayon = "1"
 # ELF reader/writer. `features = ["build"]` pulls in the full
 # `object::build::elf::Builder` surface used by `elf_strip.rs` and
-# `cache.rs` for SHT_NOBITS rewriting. `cargo tree --duplicates` also
-# lists `object v0.37.3` reached via `ar_archive_writer` (build-dep of
-# `psm` / `stacker` / `polars`) with only the `memchr` feature — that
-# second instance is a build-script compilation artifact and does not
-# link into any shipped binary. The dupe is an artifact of resolver v3
-# keeping build-dep and regular-dep feature graphs separate; unifying
-# would require dropping `polars`, which is not a proportionate fix.
+# `cache.rs` for SHT_NOBITS rewriting. `cargo tree --duplicates` may
+# still report a second `object` instance reached transitively via
+# `ar_archive_writer` (build-dep of `psm` / `stacker`) with only the
+# `memchr` feature; that second instance is a build-script compilation
+# artifact and does not link into any shipped binary.
 object = { version = "0.39", default-features = false, features = ["build"] }
 walkdir = "2"
 indicatif = "0.18"
