@@ -464,7 +464,36 @@ pub mod live_host {
     };
 }
 
+#[cfg(feature = "remote-cache")]
 pub mod remote_cache;
+
+/// No-op stub for the `remote_cache` module when the `remote-cache`
+/// feature is disabled. Exposes the same three entry points consumed
+/// elsewhere in the crate — `is_enabled()`, `remote_lookup()`,
+/// `remote_store()` — so call sites in `cli/resolve.rs` and
+/// `cli/kernel_build/build.rs` compile and behave correctly without
+/// any `#[cfg]` gating at the call site: `is_enabled()` always
+/// returns false, the lookup/store entry points are unreachable in
+/// practice, and the stubs satisfy the trait surface so type-checking
+/// stays uniform across feature configurations.
+#[cfg(not(feature = "remote-cache"))]
+pub mod remote_cache {
+    use crate::cache::{CacheDir, CacheEntry};
+
+    pub fn is_enabled() -> bool {
+        false
+    }
+
+    pub fn remote_lookup(
+        _cache: &CacheDir,
+        _cache_key: &str,
+        _cli_label: &str,
+    ) -> Option<CacheEntry> {
+        None
+    }
+
+    pub fn remote_store(_entry: &CacheEntry, _cli_label: &str) {}
+}
 pub(crate) mod sync;
 pub(crate) mod tar_util;
 pub mod verifier;

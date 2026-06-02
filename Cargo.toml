@@ -45,8 +45,16 @@ reqwest = { version = "0.13", features = ["blocking"] }
 tar = "0.4"
 tempfile = "3"
 xz2 = { version = "0.1", features = ["static"] }
-opendal = { version = "0.56", default-features = false, features = ["services-ghac"] }
-tokio = { version = "1", features = ["rt"] }
+# GitHub Actions cache backend, used only by src/remote_cache.rs.
+# Gated behind the `remote-cache` feature (off by default). With
+# the feature off, remote_cache::is_enabled() returns false
+# unconditionally and the lookup/store entry points become no-ops,
+# so call sites need no `#[cfg]` gating.
+opendal = { version = "0.56", default-features = false, features = ["services-ghac"], optional = true }
+# tokio runtime for opendal's async surface in remote_cache.rs.
+# Tied to the same feature as opendal — neither is referenced
+# anywhere else in the crate.
+tokio = { version = "1", features = ["rt"], optional = true }
 zstd = { version = "0.13", features = ["zstdmt"] }
 lz4_flex = { version = "0.13", features = ["frame"] }
 flate2 = "1"
@@ -301,6 +309,15 @@ wprof = ["ktstr-macros/wprof"]
 # (e.g. `tokio-runtime-worker`) — identical aggregation, less
 # polish. Worth enabling for interactive use of the compare CLI.
 pretty-labels = ["dep:grex"]
+# GitHub Actions cache integration for cargo-ktstr's blob store
+# (`src/remote_cache.rs`). Off by default: only CI runs with
+# `KTSTR_GHA_CACHE=1` + `ACTIONS_CACHE_URL` set actually use the
+# remote backend. With the feature off, `remote_cache::is_enabled()`
+# returns false and the lookup/store entry points are no-ops, so
+# call sites in `cli/resolve.rs` and `cli/kernel_build/build.rs`
+# transparently skip the remote path. Pulls in `opendal` + a
+# minimal `tokio` runtime; saves both transitive trees on local dev.
+remote-cache = ["dep:opendal", "dep:tokio"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_nightly)'] }
