@@ -185,9 +185,12 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 # deterministic strip-trailing-digit prefix; grex is invoked at
 # render time only, on bucket-member literals (≥2 entries), to
 # produce a regex string operators can read or paste into tooling.
+# Gated behind the `pretty-labels` feature (off by default); when
+# the feature is disabled, `pattern_display_label` falls back to
+# the join key unchanged — same observable shape, just less polish.
 # `default-features = false` drops the binary CLI surface (clap,
 # colored, indoc) so only the library trait is pulled in.
-grex = { version = "1.4", default-features = false }
+grex = { version = "1.4", default-features = false, optional = true }
 # SHA-256 for one-shot digest verification of downloaded artifacts
 # (fetch.rs), cache-key fingerprinting (disk_template.rs), seeded
 # key derivation (fun.rs), and model-cache integrity checks
@@ -291,6 +294,13 @@ integration = []
 # compiles libbpf + blazesym (requires git, make, gcc, clang,
 # elfutils-devel, zlib-devel on the host; takes several minutes).
 wprof = ["ktstr-macros/wprof"]
+# Pretty thread-name labels in `ctprof_compare` output. Enables
+# `grex` regex synthesis to render multi-member buckets as a
+# minimal regex (e.g. `tokio-runtime-worker-[0-3]`). With this
+# feature off, `pattern_display_label` falls back to the join key
+# (e.g. `tokio-runtime-worker`) — identical aggregation, less
+# polish. Worth enabling for interactive use of the compare CLI.
+pretty-labels = ["dep:grex"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_nightly)'] }
