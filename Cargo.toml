@@ -71,7 +71,6 @@ kvm-ioctls = "0.24"
 libbpf-rs = { version = "0.26", features = ["vendored"] }
 libbpf-sys = { version = "1.6", features = ["vendored"] }
 linux-loader = { version = "0.13", features = ["bzimage", "elf", "pe"] }
-vm-fdt = "0.3"
 vm-memory = { version = "=0.17.1", features = ["backend-mmap"] }
 vmm-sys-util = "0.15"
 cpio = "0.4.1"
@@ -259,6 +258,14 @@ netlink-packet-generic = "0.4"
 # work without any in-guest overhead.
 perf-event-open-sys = "6"
 ahash = "0.8"
+
+# Flattened device tree writer for the aarch64 boot path
+# (src/vmm/aarch64/fdt.rs). The arch mod itself is already
+# `#[cfg(target_arch = "aarch64")]`-gated, so the dep follows
+# the same target predicate — x86_64 builds (the majority) skip
+# vm-fdt and its transitives entirely.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+vm-fdt = "0.3"
 
 [profile.release]
 lto = "thin"
