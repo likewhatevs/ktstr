@@ -218,6 +218,11 @@ pub(crate) enum KtstrCommand {
     /// `XDG_CACHE_HOME`); `status` reports whether a SHA-checked copy
     /// is already cached; `clean` deletes the cached artifact and
     /// its `.mtime-size` warm-cache sidecar.
+    ///
+    /// Only available when ktstr is built with the `llm` feature
+    /// (on by default; absent under `--no-default-features` builds
+    /// that omit `--features llm`).
+    #[cfg(feature = "llm")]
     Model {
         #[command(subcommand)]
         command: ModelCommand,
@@ -545,6 +550,7 @@ pub(crate) enum KtstrCommand {
     },
 }
 
+#[cfg(feature = "llm")]
 #[derive(Subcommand)]
 pub(crate) enum ModelCommand {
     /// Download the default pinned model and check its SHA-256.

@@ -1,3 +1,9 @@
+// The expected `.so` baseline below assumes the `llm` feature is
+// enabled (so libgomp + libstdc++ are dragged in via llama-cpp-2's
+// `openmp` build). Without the feature the count is smaller and a
+// different baseline would apply; gate the whole test so the
+// expected counts match the configuration they were derived from.
+#![cfg(feature = "llm")]
 //! Pin test for the `ktstr` binary's dynamic library dependency
 //! count.
 //!

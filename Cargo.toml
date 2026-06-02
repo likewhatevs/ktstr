@@ -214,15 +214,21 @@ hex = "0.4"
 # (`greedy()`, `accept()`, `sample()`) used by `invoke_with_model`.
 # Build dep on cmake — the linked llama.cpp C++ sources are built from
 # source via `llama-cpp-sys-2`'s build script.
-llama-cpp-2 = { version = "0.1.145", default-features = false, features = ["openmp", "sampler"] }
+#
+# Gated behind the `llm` feature (in `default` to preserve behavior,
+# but `--no-default-features` consumers can drop it). When the
+# feature is off, the entire `test_support::model` module is
+# compiled out, and downstream callers in `eval.rs`, `payload_run.rs`,
+# and `cargo-ktstr` are gated alongside it.
+llama-cpp-2 = { version = "0.1.145", default-features = false, features = ["openmp", "sampler"], optional = true }
 # Stateful UTF-8 decoder required by `LlamaModel::token_to_piece` —
 # a single token may carry a partial multi-byte UTF-8 sequence and
 # only a stateful decoder can stitch consecutive tokens into valid
 # UTF-8 without dropping bytes. Already a transitive dep of
 # `llama-cpp-2`; pinned as a direct dep so the call site's intent is
 # explicit and survives a future llama-cpp-2 reorganization that
-# changes its re-export surface.
-encoding_rs = "0.8"
+# changes its re-export surface. Tied to the same `llm` feature.
+encoding_rs = { version = "0.8", optional = true }
 # Error-enum derives for the `InferenceError` type that
 # `load_inference` and `invoke_with_model` return. Already a
 # transitive dep via `llama-cpp-2`'s own thiserror-derived error
@@ -296,12 +302,21 @@ panic = "abort"
 debug = "line-tables-only"
 
 [features]
+default = ["llm"]
 integration = []
 # Embed the wprof BPF tracer for Perfetto-format profiling in VMs.
 # Default off: first build clones github.com/anakryiko/wprof and
 # compiles libbpf + blazesym (requires git, make, gcc, clang,
 # elfutils-devel, zlib-devel on the host; takes several minutes).
 wprof = ["ktstr-macros/wprof"]
+# Local-CPU LLM extraction (`OutputFormat::LlmExtract`) via the
+# bundled Qwen3-4B GGUF. Pulls in `llama-cpp-2` (compiles llama.cpp
+# C++ via cmake — minutes of build time on a cold cache) plus
+# `encoding_rs`. Default-ON to preserve current behavior; consumers
+# wanting a leaner library (no LLM inference path) can
+# `--no-default-features` and re-enable just the features they want
+# (e.g. `cargo build --no-default-features --features remote-cache,pretty-labels`).
+llm = ["dep:llama-cpp-2", "dep:encoding_rs"]
 # Pretty thread-name labels in `ctprof_compare` output. Enables
 # `grex` regex synthesis to render multi-member buckets as a
 # minimal regex (e.g. `tokio-runtime-worker-[0-3]`). With this

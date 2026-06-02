@@ -1,3 +1,4 @@
+#![cfg(feature = "llm")]
 //! End-to-end validation of the `OutputFormat::LlmExtract` pipeline.
 //!
 //! Every test in this file boots a ktstr VM, runs `schbench` inside

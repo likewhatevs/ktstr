@@ -69,7 +69,9 @@ mod parse_tests;
 use clap::Parser;
 use ktstr::cli::KernelCommand;
 
-use crate::cli::{Cargo, CargoSub, KtstrCommand, ModelCommand};
+use crate::cli::{Cargo, CargoSub, KtstrCommand};
+#[cfg(feature = "llm")]
+use crate::cli::ModelCommand;
 
 fn main() {
     // Restore SIGPIPE so piping `cargo ktstr ... | head` doesn't
@@ -176,6 +178,7 @@ fn main() {
                 corrupt_only,
             } => ktstr::cli::kernel_clean(keep, force, corrupt_only).map_err(|e| format!("{e:#}")),
         },
+        #[cfg(feature = "llm")]
         KtstrCommand::Model { command } => match command {
             ModelCommand::Fetch => misc::run_model_fetch(),
             ModelCommand::Status => misc::run_model_status(),
