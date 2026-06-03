@@ -1663,11 +1663,17 @@ pub fn run_shell(
         vmm::blobs::load_busybox_bytes().context("load busybox blob for shell-mode VM")?;
     #[cfg(feature = "wprof")]
     let wprof_config = {
-        let mut cfg = vmm::wprof::WprofConfig::from_env().ok();
-        if let (Some(args_str), Some(c)) = (wprof_args, cfg.as_mut()) {
+        // A `wprof`-feature build always provisions the blob via
+        // cargo-ktstr's install_env (KTSTR_WPROF_PATH), so a failed
+        // resolve here is a real defect — fail loud rather than silently
+        // shipping a wprof-less shell VM, which surfaces downstream as a
+        // confusing "/bin/wprof: No such file" inside the guest.
+        let mut c = vmm::wprof::WprofConfig::from_env()
+            .context("resolve wprof for shell mode (the `wprof` feature is enabled)")?;
+        if let Some(args_str) = wprof_args {
             c.args = args_str.split_whitespace().map(String::from).collect();
         }
-        cfg
+        Some(c)
     };
     #[cfg(not(feature = "wprof"))]
     if wprof_args.is_some() {
