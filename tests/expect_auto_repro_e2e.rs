@@ -4,10 +4,9 @@
 //! VM's test body fails AND the auto-repro VM lands a shape-valid
 //! `.repro.wprof.pb` artifact.
 //!
-//! Unlike the `neg_wprof_auto_repro_fires_on_forced_fail` test (in
-//! `tests/wprof_auto_repro_e2e.rs`) which IS expected to fail from
-//! nextest's perspective (the `neg_` prefix advertises that), this
-//! test is POSITIVE: it MUST pass from nextest's perspective.
+//! This test is POSITIVE: it MUST pass from nextest's perspective —
+//! it forces a guest-side failure, the auto-repro VM lands a
+//! shape-valid `.repro.wprof.pb`, and the verdict inverts to PASS.
 //! Failure here means the inversion chain regressed at one of the
 //! load-bearing sites:
 //!
@@ -107,11 +106,11 @@ fn pos_expect_auto_repro_satisfied_on_forced_fail(ctx: &Ctx) -> Result<AssertRes
     }];
     let mut result = execute_steps(ctx, steps)?;
 
-    // Force a failure to drive the auto-repro chain. Unlike the
-    // `neg_` sibling, this test EXPECTS the resulting verdict to
-    // flip to PASS via the expect_auto_repro inversion path. If
-    // nextest reports this test FAILED, the inversion broke at one
-    // of the three sites named in the file header.
+    // Force a failure to drive the auto-repro chain. This test
+    // EXPECTS the resulting verdict to flip to PASS via the
+    // expect_auto_repro inversion path. If nextest reports this
+    // test FAILED, the inversion broke at one of the three sites
+    // named in the file header.
     let expected_repro_pb = ctx.repro_wprof_pb_path()?;
     result.record_fail(AssertDetail::new(
         DetailKind::Other,

@@ -33,13 +33,13 @@
 //!    — bypasses the helper entirely; the fn name lives in the
 //!    suffix-bearing string.
 //!
-//! Vector 2 is the auto-repro fault-injection pattern
-//! (`wprof_auto_repro_e2e.rs` body fn that hardcodes
-//! `"neg_fixture_name.repro.wprof.pb"` for the operator diagnostic
-//! string). Body fns get `&Ctx` not `&VmResult`, so the method-form
-//! migration that fixes vector 1 doesn't apply directly to vector 2;
-//! the regression pin catches both vectors so a future migration
-//! covers the body-callsite class via the same enforcement.
+//! Vector 2 is the auto-repro fault-injection pattern: a test body
+//! fn that assembles `sidecar_dir().join("<fixture>.repro.wprof.pb")`
+//! for an operator diagnostic string. Body fns get `&Ctx` not
+//! `&VmResult`, so the method-form migration that fixes vector 1
+//! doesn't apply directly to vector 2; the regression pin catches
+//! both vectors so a future migration covers the body-callsite class
+//! via the same enforcement.
 //!
 //! ## EXEMPT_FILES
 //!
@@ -62,7 +62,7 @@ const SELF_FILE: &str = "no_hardcoded_dump_path_literals.rs";
 
 /// Files KNOWN to contain forbidden literal patterns today, tracked
 /// under follow-up migrations. Each entry is the path relative to
-/// `tests/` (e.g. `wprof_auto_repro_e2e.rs`). The exempt list
+/// `tests/` (e.g. `foo_e2e.rs`). The exempt list
 /// shrinks as migrations land; an entry that no longer contains a
 /// violation can be safely removed — at which point this test
 /// guards that the site stays clean.
@@ -74,8 +74,7 @@ const SELF_FILE: &str = "no_hardcoded_dump_path_literals.rs";
 /// `ctx.repro_wprof_pb_path()` method form. The duplicate
 /// `fn failure_dump_path` definitions in `cast_analysis_e2e.rs` and
 /// `vm_integration.rs` and the sibling `fn watch_snapshot_dump_path`
-/// in `snapshot_e2e.rs` are deleted; the path-assembly bypass in
-/// `wprof_auto_repro_e2e.rs` is gone; the `common/dump_paths.rs`
+/// in `snapshot_e2e.rs` are deleted; the `common/dump_paths.rs`
 /// helper module is gone too (zero remaining consumers after the
 /// callsite migration, and the format-string single-source-of-truth
 /// now lives in the body of `Ctx::failure_dump_path` and
@@ -96,7 +95,7 @@ const FORBIDDEN_PATTERNS: &[&str] = &[
     "failure_dump_path(\"",
     // Vector 2: path-assembly with the suffix bearing the literal.
     // `sidecar_dir().join("<...>.wprof.pb")` — catches the
-    // wprof_auto_repro_e2e.rs body-callsite pattern. Excludes the
+    // auto-repro body-callsite path-assembly pattern. Excludes the
     // intentional patterns above (which contain `.wprof.pb"` as a
     // substring of the helper name, but always preceded by an open
     // paren — the literal-suffix check below requires the `.pb"`
