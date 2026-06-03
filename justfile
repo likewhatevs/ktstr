@@ -57,6 +57,9 @@ test kernel extra-features="":
 #
 # Regenerate snapshots after intentional diagnostic changes:
 #   TRYBUILD=overwrite just compile-fail
+# Re-bless with the pinned minimal toolchain (no rust-src — see
+# rust-toolchain.toml); rust-src makes rustc emit std-source snippets
+# that won't match CI's minimal toolchain.
 #
 # KTSTR_SKIP_WPROF_BUILD stubs the wprof blob (0-byte $OUT_DIR/wprof):
 # trybuild is compile-only and needs the `wprof` feature (so the

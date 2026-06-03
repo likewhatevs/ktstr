@@ -1,4 +1,8 @@
-# pinned for trybuild stderr stability; bump with re-bless of tests/compile_fail/*.stderr
+# pinned for trybuild stderr stability; bump with re-bless of tests/compile_fail/*.stderr.
+# Re-bless with THIS minimal toolchain: `profile = "minimal"` omits rust-src, so
+# rustc can't read core/src/option.rs and drops the `Some(...)` snippet from the
+# post_vm*_rejected diagnostics — matching CI. A rust-src-equipped bless embeds
+# that snippet and diverges from CI.
 [toolchain]
 channel = "1.94.1"
 profile = "minimal"
