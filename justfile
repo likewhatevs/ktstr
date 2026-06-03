@@ -57,8 +57,14 @@ test kernel extra-features="":
 #
 # Regenerate snapshots after intentional diagnostic changes:
 #   TRYBUILD=overwrite just compile-fail
+#
+# KTSTR_SKIP_WPROF_BUILD stubs the wprof blob (0-byte $OUT_DIR/wprof):
+# trybuild is compile-only and needs the `wprof` feature (so the
+# wprof-gated compile_fail fixtures emit their diagnostics) but not a
+# real blob, and the wprof/blazesym clone-build fails on the
+# GitHub-hosted compile-fail runner (libblazesym_c.a not produced).
 compile-fail:
-    cargo nextest run --profile ci --features wprof -E 'binary(compile_fail) & test(=compile_fail)' --run-ignored all
+    KTSTR_SKIP_WPROF_BUILD=1 cargo nextest run --profile ci --features wprof -E 'binary(compile_fail) & test(=compile_fail)' --run-ignored all
 
 # Run coverage. `extra-features` is passed to the cargo-ktstr build (so a
 # blob-embedding feature like `wprof` is provisioned — see `test`) AND
