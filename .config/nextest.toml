@@ -51,6 +51,25 @@ retries = 6
 filter = "test(gauntlet/)"
 slow-timeout = { period = "120s", terminate-after = 3 }
 
+# disk_template_e2e drives a NESTED `cargo ktstr test` whose guest VM
+# brings up the disk-template lifecycle (one-shot template-build VM +
+# per-test FICLONE clone + scenario VM). That nested boot-readiness
+# handshake is load-sensitive: under host contention from the rest of
+# the suite the guest's send_sys_rdy window (see `sys_rdy_budget_ms`)
+# can slip and the run reports no result. The additive boot-budget
+# scaling widens that window in-VM; these retries absorb the residual
+# host-load jitter so a transient slow boot recovers instead of failing
+# the job. Count is bounded (vs the profile's 30) for a faster failure
+# signal on a genuine break — the flake has been observed recovering by
+# attempt 4, so 12 keeps a ~3x margin — and the longer inter-retry
+# delay lets concurrent VM load subside before each retry. Slow-timeout
+# is generous for the nested template-build + scenario boot, especially
+# under the coverage job's llvm-cov instrumentation.
+[[profile.ci.overrides]]
+filter = "test(disk_template_e2e)"
+slow-timeout = { period = "180s", terminate-after = 3 }
+retries = { backoff = "exponential", count = 12, delay = "3s", jitter = true, max-delay = "10s" }
+
 [[profile.ci.overrides]]
 filter = "binary(compile_fail) & test(=compile_fail)"
 slow-timeout = { period = "180s", terminate-after = 3 }

@@ -1143,8 +1143,9 @@ pub(crate) fn ktstr_guest_init() -> ! {
         crate::vmm::wire::KernAddrs::new(kern_phys_base, kern_page_offset_base_kva, kern_text_kva);
     // `count_online_cpus()` reads /sys/devices/system/cpu/online which
     // `mount_filesystems()` mounted earlier. Fallback to 1 yields the
-    // floor budget if the read fails — preserves the original
-    // single-CPU default rather than panicking on a procfs hiccup.
+    // single-vCPU budget (base + 1×per-vCPU) if the read fails —
+    // preserves the original single-CPU default rather than panicking
+    // on a procfs hiccup.
     let vcpus = count_online_cpus().unwrap_or(1);
     let budget = std::time::Duration::from_millis(crate::test_support::sys_rdy_budget_ms(vcpus));
     send_sys_rdy_with_retry(
@@ -2507,7 +2508,7 @@ fn count_online_cpus() -> Option<u32> {
 /// Returns `None` on any unparseable token, inverted range, or
 /// completely empty content. The `sys_rdy` budget caller at
 /// [`count_online_cpus`]'s primary use defaults to 1 vCPU on `None`
-/// (safe degradation to the floor budget); the topology-print
+/// (safe degradation to the single-vCPU budget); the topology-print
 /// caller skips the MOTD line instead of substituting a default.
 fn parse_online_cpus(content: &str) -> Option<u32> {
     let trimmed = content.trim();

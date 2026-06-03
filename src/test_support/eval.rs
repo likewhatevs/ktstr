@@ -3149,14 +3149,17 @@ fn evaluate_vm_result(
         let watchdog_section = format!(
             "\n\n--- watchdog ---\n\
              elapsed={:?} (VM run wall-clock)\n\
-             vm_timeout={:?} (host watchdog deadline; max(watchdog_timeout, duration))\n\
+             vm_timeout={:?} (host watchdog deadline = max(watchdog_timeout, \
+             duration, 1s) + vCPU-scaled vm_boot_headroom [+ 30s cold-BTF \
+             budget for bpf_map_write tests])\n\
              watchdog_timeout={:?} (scx_sched.watchdog_timeout override)\n\
              duration={:?} (workload duration)\n\
              hint: if the test body needs more wall time, increase \
              duration (the `duration` field on `KtstrTestEntry` / \
-             `#[ktstr_test(duration_ms = ...)]`); the VM timeout is \
-             derived as max(watchdog_timeout, duration) so raising \
-             duration also extends the host watchdog deadline",
+             `#[ktstr_test(duration_ms = ...)]`); the VM timeout adds \
+             vCPU-scaled boot headroom on top of max(watchdog_timeout, \
+             duration, 1s), so raising duration also extends the host \
+             watchdog deadline",
             result.duration, vm_timeout, entry.watchdog_timeout, entry.duration,
         );
         let timeout_reason = {

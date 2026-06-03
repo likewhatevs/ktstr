@@ -589,37 +589,44 @@ pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<Stri
 }
 
 /// Retry budget for the guest's `vmm::rust_init::send_sys_rdy_with_retry`
-/// loop. Scales with vCPU count because the virtio-console
-/// multiport handshake (DEVICE_READY → PORT_ADD → PORT_READY →
-/// PORT_OPEN per `drivers/char/virtio_console.c`) issues per-CPU work
-/// whose wall time grows roughly linearly with topology size. A
-/// 126-vCPU test under host contention has been observed to need
-/// ~10 s for the handshake alone; 150 ms/vCPU gives ~50 % headroom.
+/// loop. Boot-to-readiness wall time is a fixed base PLUS per-vCPU
+/// work: the virtio-console multiport handshake (DEVICE_READY →
+/// PORT_ADD → PORT_READY → PORT_OPEN per `drivers/char/virtio_console.c`)
+/// issues per-CPU work whose wall time grows roughly linearly with
+/// topology size, on top of a fixed device-enumeration / first-CPU
+/// cost. The budget is therefore ADDITIVE — `BASE_MS + vcpus *
+/// PER_VCPU_MS` — not `max(BASE, scaled)`.
 ///
-/// Floored at 10 s (preserves the prior single-CPU default) and
-/// capped at 30 s so pathological topologies (512 vCPUs would naively
-/// land at 76 s) don't blow the watchdog budget.
+/// The earlier `max` form left the per-vCPU term dead below ~67 vCPUs
+/// (since `vcpus * 150` only clears the 10 s floor at 67 vCPUs), so a
+/// 64-vCPU VM got the same 10 s budget as a 1-vCPU VM. Under host
+/// contention a 64-vCPU handshake was observed at ~10 s and timed out
+/// by ~8 ms — the disk-template gauntlet flake. The additive base
+/// gives every topology ~10 s of fixed headroom on top of its linear
+/// per-vCPU term (64 vCPUs → 19.6 s), so a slow handshake under load
+/// no longer races the floor.
+///
+/// Capped at 30 s so pathological topologies don't blow the watchdog:
+/// [`vm_boot_headroom`] adds `KERNEL_INIT_HEADROOM` on top and the
+/// host boot watchdog tracks that sum, so the budget always stays
+/// under the host deadline.
 ///
 /// The const-fn signature lets both the host (`vm_boot_headroom`,
 /// `vm_timeout_from_entry`) and the guest (`vmm::rust_init`) compute
 /// the same budget without trans-VM coordination — the guest reads
 /// its own vCPU count from `/sys/devices/system/cpu/online`.
 pub(crate) const fn sys_rdy_budget_ms(vcpus: u32) -> u64 {
-    const FLOOR_MS: u64 = 10_000;
+    const BASE_MS: u64 = 10_000;
     const CAP_MS: u64 = 30_000;
     const PER_VCPU_MS: u64 = 150;
     let scaled = (vcpus as u64).saturating_mul(PER_VCPU_MS);
-    let bounded = if scaled > CAP_MS { CAP_MS } else { scaled };
-    if bounded > FLOOR_MS {
-        bounded
-    } else {
-        FLOOR_MS
-    }
+    let total = BASE_MS.saturating_add(scaled);
+    if total > CAP_MS { CAP_MS } else { total }
 }
 
 /// Headroom for kernel init, scheduler attach, and BPF verifier time
 /// — the post-sys_rdy phase of guest startup. Distinct from
-/// [`sys_rdy_budget_ms`]'s floor (which is the pre-sys_rdy
+/// [`sys_rdy_budget_ms`]'s base + per-vCPU budget (the pre-sys_rdy
 /// virtio-console handshake budget); the two add together to form
 /// the full [`vm_boot_headroom`].
 const KERNEL_INIT_HEADROOM: Duration = Duration::from_secs(10);
@@ -2038,15 +2045,16 @@ mod tests {
 
     #[test]
     fn vm_timeout_from_entry_uses_watchdog_when_largest() {
-        // DEFAULT topology = 2 vCPUs → sys_rdy_budget_ms = 10_000 (floor)
-        // → vm_boot_headroom = 20 s; base = max(60s, 30s, 1s) = 60s.
+        // DEFAULT topology = 2 vCPUs → sys_rdy_budget_ms = 10_300
+        // (10_000 base + 2×150) → vm_boot_headroom = 20.3 s; base =
+        // max(60s, 30s, 1s) = 60s.
         let entry = KtstrTestEntry {
             name: "wdog",
             watchdog_timeout: Duration::from_secs(60),
             duration: Duration::from_secs(30),
             ..KtstrTestEntry::DEFAULT
         };
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(80));
+        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_millis(80_300));
     }
 
     #[test]
@@ -2057,37 +2065,42 @@ mod tests {
             duration: Duration::from_secs(120),
             ..KtstrTestEntry::DEFAULT
         };
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(140));
+        // base = max(5s, 120s, 1s) = 120s; vm_boot_headroom(2) = 20.3 s.
+        assert_eq!(
+            vm_timeout_from_entry(&entry),
+            Duration::from_millis(140_300)
+        );
     }
 
     #[test]
     fn vm_timeout_from_entry_floor_when_both_small() {
-        // base floors at 1 s; vm_boot_headroom for 2 vCPUs is 20 s.
+        // base floors at 1 s; vm_boot_headroom for 2 vCPUs is 20.3 s.
         let entry = KtstrTestEntry {
             name: "tiny",
             watchdog_timeout: Duration::from_millis(10),
             duration: Duration::from_millis(50),
             ..KtstrTestEntry::DEFAULT
         };
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(21));
+        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_millis(21_300));
     }
 
     #[test]
     fn vm_timeout_from_default_entry() {
         // DEFAULT watchdog = 5 s, duration = 12 s → base = 12 s.
-        // vm_boot_headroom for 2 vCPUs = 20 s → 32 s total.
+        // vm_boot_headroom for 2 vCPUs = 20.3 s → 32.3 s total.
         let entry = KtstrTestEntry {
             name: "default",
             ..KtstrTestEntry::DEFAULT
         };
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(32));
+        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_millis(32_300));
     }
 
     #[test]
     fn vm_timeout_from_entry_scales_headroom_with_topology() {
         // The B2 reporter's case: numa=1, llcs=7, cores=9, threads=2 → 126 vCPUs.
-        // sys_rdy_budget_ms(126) = 18_900 ms → vm_boot_headroom = 28.9 s.
-        // base = max(5 s watchdog, 12 s duration, 1 s) = 12 s → total = 40.9 s.
+        // sys_rdy_budget_ms(126) = 28_900 ms (10_000 base + 126×150) →
+        // vm_boot_headroom = 38.9 s. base = max(5 s watchdog, 12 s
+        // duration, 1 s) = 12 s → total = 50.9 s.
         // Pins the `entry.topology.total_cpus()` → `vm_boot_headroom` wiring.
         let entry = KtstrTestEntry {
             name: "large_topo",
@@ -2101,31 +2114,37 @@ mod tests {
             },
             ..KtstrTestEntry::DEFAULT
         };
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_millis(40_900));
+        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_millis(50_900));
     }
 
     // -- sys_rdy_budget_ms / vm_boot_headroom --
 
     #[test]
-    fn sys_rdy_budget_ms_floor_holds_for_small_topologies() {
-        assert_eq!(sys_rdy_budget_ms(1), 10_000);
-        assert_eq!(sys_rdy_budget_ms(32), 10_000);
-        assert_eq!(sys_rdy_budget_ms(66), 10_000);
+    fn sys_rdy_budget_ms_base_plus_linear_per_vcpu() {
+        // Additive: 10_000 ms base + vcpus × 150. Every topology gets
+        // the base PLUS its per-vCPU term — no dead floor below 67
+        // vCPUs (the bug that gave a 64-vCPU VM the same 10 s as a
+        // 1-vCPU VM).
+        assert_eq!(sys_rdy_budget_ms(1), 10_150);
+        assert_eq!(sys_rdy_budget_ms(32), 14_800);
+        assert_eq!(sys_rdy_budget_ms(66), 19_900);
     }
 
     #[test]
     fn sys_rdy_budget_ms_scales_linearly_in_band() {
-        // 67 vCPUs is the first to exceed the 10 s floor (67*150 = 10050).
-        assert_eq!(sys_rdy_budget_ms(67), 10_050);
-        // The reporter's 126-vCPU case lands at 18.9 s.
-        assert_eq!(sys_rdy_budget_ms(126), 18_900);
-        // 192 vCPUs still under the cap.
-        assert_eq!(sys_rdy_budget_ms(192), 28_800);
+        // 10_000 ms base + vcpus × 150, in the band below the 30 s cap.
+        assert_eq!(sys_rdy_budget_ms(67), 20_050);
+        // The reporter's 126-vCPU case lands at 28.9 s.
+        assert_eq!(sys_rdy_budget_ms(126), 28_900);
+        // 133 vCPUs is the last under the cap (10_000 + 133×150 = 29_950).
+        assert_eq!(sys_rdy_budget_ms(133), 29_950);
     }
 
     #[test]
     fn sys_rdy_budget_ms_caps_at_thirty_seconds() {
-        // 200 vCPUs = exactly the cap (200*150 = 30000).
+        // 134 vCPUs is the first to hit the cap (10_000 + 134×150 =
+        // 30_100, clipped to 30_000).
+        assert_eq!(sys_rdy_budget_ms(134), 30_000);
         assert_eq!(sys_rdy_budget_ms(200), 30_000);
         // Pathological topologies clip — no unbounded budget.
         assert_eq!(sys_rdy_budget_ms(512), 30_000);
@@ -2133,15 +2152,18 @@ mod tests {
     }
 
     #[test]
-    fn sys_rdy_budget_ms_zero_returns_floor() {
-        // Guest fallback when /sys/devices/system/cpu/online is missing.
+    fn sys_rdy_budget_ms_zero_returns_base() {
+        // Guest fallback when /sys/devices/system/cpu/online is missing:
+        // 0 vCPUs → the bare 10_000 ms base (no per-vCPU term).
         assert_eq!(sys_rdy_budget_ms(0), 10_000);
     }
 
     #[test]
     fn vm_boot_headroom_is_ten_plus_sys_rdy_budget() {
-        assert_eq!(vm_boot_headroom(1), Duration::from_secs(20));
-        assert_eq!(vm_boot_headroom(126), Duration::from_millis(28_900));
+        // KERNEL_INIT_HEADROOM (10 s) + sys_rdy_budget_ms(vcpus).
+        assert_eq!(vm_boot_headroom(1), Duration::from_millis(20_150));
+        assert_eq!(vm_boot_headroom(126), Duration::from_millis(38_900));
+        // Capped budget (30 s) → 40 s headroom for huge topologies.
         assert_eq!(vm_boot_headroom(512), Duration::from_secs(40));
     }
 
