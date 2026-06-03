@@ -98,6 +98,47 @@ pub(crate) fn run_export(
     }
 }
 
+/// Assemble the `cargo build --tests --message-format=json` argv,
+/// forwarding the cargo features the running cargo-ktstr was built with.
+///
+/// `cargo build --tests` rebuilds every test target AND its
+/// `CARGO_BIN_EXE` dependencies — cargo-ktstr itself included — over the
+/// shared `target/<profile>/cargo-ktstr` slot. The ktstr crate has no
+/// default features and `wprof` is opt-in (default-off), so omitting the
+/// feature flags rebuilds at `{}`, stripping the embedded wprof blob from
+/// the very binary that sibling integration tests spawn via
+/// `env!("CARGO_BIN_EXE_cargo-ktstr")` — surfacing downstream as a
+/// spurious `/bin/wprof: No such file` inside the guest (the no-wprof
+/// binary's shell-mode path compiles the wprof include out, no error).
+/// Forwarding the running binary's exact feature set makes the rebuild a
+/// fingerprint hit against the already-built artifacts — no downgrade.
+fn build_test_binaries_argv(package: Option<&str>, release: bool) -> Vec<String> {
+    let mut argv = vec![
+        "build".to_string(),
+        "--tests".to_string(),
+        "--message-format=json".to_string(),
+    ];
+    let mut forwarded: Vec<&str> = Vec::new();
+    if cfg!(feature = "wprof") {
+        forwarded.push("wprof");
+    }
+    if cfg!(feature = "integration") {
+        forwarded.push("integration");
+    }
+    if !forwarded.is_empty() {
+        argv.push("--features".to_string());
+        argv.push(forwarded.join(","));
+    }
+    if let Some(p) = package {
+        argv.push("--package".to_string());
+        argv.push(p.to_string());
+    }
+    if release {
+        argv.push("--release".to_string());
+    }
+    argv
+}
+
 /// Compile the workspace's test binaries via
 /// `cargo build --tests --message-format=json` and collect the
 /// resulting executable paths.
@@ -113,13 +154,7 @@ pub(crate) fn build_test_binaries(
     release: bool,
 ) -> Result<Vec<PathBuf>, String> {
     let mut cmd = Command::new("cargo");
-    cmd.args(["build", "--tests", "--message-format=json"]);
-    if let Some(p) = package {
-        cmd.args(["--package", p]);
-    }
-    if release {
-        cmd.arg("--release");
-    }
+    cmd.args(build_test_binaries_argv(package, release));
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit());
 
@@ -164,4 +199,60 @@ pub(crate) fn build_test_binaries(
     bins.sort();
     bins.dedup();
     Ok(bins)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_test_binaries_argv;
+
+    /// Regression pin for the wprof-clobber bug: the test-binary rebuild
+    /// must forward the features the running cargo-ktstr carries, so it
+    /// cannot downgrade the shared `target/<profile>/cargo-ktstr` slot (a
+    /// `CARGO_BIN_EXE` dependency of every test) to a wprof-less binary
+    /// that sibling tests would then spawn. Exercised by both CI legs: the
+    /// no-wprof leg pins the absent-wprof path, the wprof leg pins
+    /// forwarding.
+    #[test]
+    fn argv_forwards_running_binary_features() {
+        let argv = build_test_binaries_argv(None, false);
+        assert_eq!(argv[0], "build");
+        assert_eq!(argv[1], "--tests");
+        assert_eq!(argv[2], "--message-format=json");
+        let features = argv
+            .iter()
+            .position(|a| a == "--features")
+            .map(|i| argv[i + 1].clone());
+        match (cfg!(feature = "wprof"), cfg!(feature = "integration")) {
+            (false, false) => assert!(
+                features.is_none(),
+                "a no-feature build must not pass --features (got {features:?})"
+            ),
+            (want_wprof, want_integration) => {
+                let f = features.expect("a feature build must forward --features");
+                let set: Vec<&str> = f.split(',').collect();
+                assert_eq!(
+                    set.contains(&"wprof"),
+                    want_wprof,
+                    "wprof forwarding (got {f:?})"
+                );
+                assert_eq!(
+                    set.contains(&"integration"),
+                    want_integration,
+                    "integration forwarding (got {f:?})"
+                );
+            }
+        }
+    }
+
+    /// `--package` and `--release` are threaded through verbatim.
+    #[test]
+    fn argv_threads_package_and_release() {
+        let argv = build_test_binaries_argv(Some("scx-ktstr"), true);
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--package" && w[1] == "scx-ktstr"),
+            "argv: {argv:?}"
+        );
+        assert!(argv.iter().any(|a| a == "--release"), "argv: {argv:?}");
+    }
 }
