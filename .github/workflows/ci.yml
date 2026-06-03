@@ -22,20 +22,50 @@ env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
+  # lint + compile-fail run on the self-hosted runner (not ubuntu-latest):
+  # the GitHub-hosted runner's small disk overflows while linking the full
+  # debug test harness (cargo nextest builds every test binary), surfacing
+  # as `No space left on device` and a downstream `ld ... signal 7 [Bus
+  # error]` (the linker mmaps the output and SIGBUSes on a full disk). The
+  # self-hosted runner has ample disk and the build toolchain (clang,
+  # bpftool, sccache) pre-installed. The toolchain is provisioned fresh via
+  # rustup, which honors rust-toolchain.toml (minimal profile, no rust-src)
+  # so the trybuild .stderr snapshots still match the same minimal output.
+  # lint sets no `RUSTFLAGS` override: it does no target-binary linking
+  # (only check/clippy/doc), so it needs no custom linker, and inheriting
+  # .cargo/config.toml keeps the `-D warnings` lint depends on. compile-fail
+  # overrides RUSTFLAGS for the linker (see below).
   lint:
-    runs-on: ubuntu-latest
+    runs-on: [ktstr-x64]
     steps:
       - uses: actions/checkout@v5
-      - uses: ./.github/actions/setup
+      - name: Provision Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+      - run: cargo install just
       - run: just lint
 
   compile-fail:
-    runs-on: ubuntu-latest
+    runs-on: [ktstr-x64]
+    # Match the self-hosted test jobs' linker (clang + mold) — the
+    # default linker is untested on these runners, and compile-fail
+    # links the full test harness. This overrides .cargo/config.toml's
+    # rustflags, dropping `-D warnings`, which is fine: the lint job
+    # enforces `-D warnings` crate-wide (--all-targets, both feature
+    # sets), so compile-fail need not re-gate it.
+    env:
+      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v5
-      - uses: ./.github/actions/setup
+      - name: Provision Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+      - run: cargo install just
+      - uses: taiki-e/install-action@v2
         with:
-          tools: cargo-nextest
+          tool: cargo-nextest
       - run: just compile-fail
 
   docs-link-check:
