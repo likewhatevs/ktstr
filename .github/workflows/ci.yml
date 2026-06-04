@@ -68,6 +68,29 @@ jobs:
           tool: cargo-nextest
       - run: just compile-fail
 
+  # Pins Cargo's `[dev-dependencies]` isolation contract: a downstream
+  # consumer adding ktstr as a dev-dep MUST NOT get ktstr compiled into
+  # their release binary. Drives `tests/devdep-isolation/verify.sh` via
+  # the matching justfile recipe; the fixture lives in a standalone
+  # crate (empty `[workspace]` table) so its resolver and target dir
+  # are independent — exactly the perspective a real downstream
+  # consumer has.
+  #
+  # Runs on the self-hosted runner alongside lint/compile-fail because
+  # the fixture's `cargo build --release` reuses the same Rust
+  # toolchain provisioning step (no kernel/nextest/cargo-llvm-cov needed
+  # — the verify script does NOT run tests, only the prod-side build).
+  devdep-isolation:
+    runs-on: [ktstr-x64]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Provision Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+      - run: cargo install just
+      - run: just devdep-isolation
+
   docs-link-check:
     runs-on: ubuntu-latest
     steps:

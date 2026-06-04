@@ -91,6 +91,44 @@ full menu. The host-tooling deps stay in the installed `cargo-ktstr`
 binary via its `required-features = ["cli-bins"]` declaration —
 `cargo install --locked ktstr` is unaffected.
 
+### ktstr is dev-only — it does not link into your release binary
+
+`[dev-dependencies]` is structurally isolated from prod artifacts by
+Cargo:
+
+- `cargo build` / `cargo build --release` of the downstream crate
+  **does not compile ktstr's source, does not run ktstr's `build.rs`,
+  and does not link any ktstr code into the resulting binary**.
+- The compiler refuses to resolve `use ktstr::...` outside
+  `#[cfg(test)]` / `tests/` / `benches/` / `examples/`, so accidental
+  prod-side imports fail at build time with an `unresolved import`
+  error — not at runtime.
+- ktstr's heavy `build.rs` work (busybox source build, BPF skeleton
+  generation, vendored libbpf C build) runs **only during test
+  compilation**, never during a pure `cargo build --release`.
+
+Quick verification a downstream consumer can run on their own crate:
+
+```sh
+# Release build should compile zero ktstr code:
+cargo build --release 2>&1 | grep -c "Compiling ktstr"        # → 0
+# And the release binary should reference no ktstr symbols:
+nm target/release/<your-bin> 2>/dev/null | grep -c ktstr      # → 0
+# Test build does compile ktstr (and its build.rs runs):
+cargo test --no-run 2>&1 | grep -c "Compiling ktstr"          # → 1+
+```
+
+**Feature-unification caveat.** Cargo's resolver v1 (pre-2021-edition
+default) unifies features across prod *and* dev-deps globally. If
+ktstr enables `libbpf-rs/vendored` and the downstream crate has its
+own prod `libbpf-rs` dep at the same version, the prod libbpf-rs
+would silently flip to vendored under v1. Resolver v2 (Rust 2021
+edition default, `resolver = "2"`) and v3 (Rust 2024 edition default)
+fix this: dev-deps-only feature activations don't affect non-test
+target builds. If your downstream crate is on edition 2021+ this is
+already handled; older crates should set `resolver = "2"` in their
+workspace `Cargo.toml`.
+
 The library is the test-author surface. The `anyhow::Result`
 referenced in examples below is re-exported through
 `ktstr::prelude`; no separate `anyhow` dev-dependency needed.
