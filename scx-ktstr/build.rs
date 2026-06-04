@@ -155,8 +155,10 @@ fn fetch_scx_lib(dest: &Path) {
                  tarball ({tarball_url}): {tarball_err}\n\
                  git clone (sched-ext/scx@{SCX_TAG}): {clone_err}\n\
                  First build requires network access to GitHub.\n\
-                 Workarounds: set HTTPS_PROXY for proxy environments, or\n\
-                 manually place files at {scx_lib_dir}/lib/{{sdt_alloc.bpf.c, sdt_task.bpf.c, scxtest/scx_test.h}}."
+                 Workarounds:\n\
+                   • If behind a proxy, ensure HTTP_PROXY/HTTPS_PROXY environment\n\
+                     variables are set (e.g., export HTTPS_PROXY=http://proxy:8080).\n\
+                   • Or manually place files at {scx_lib_dir}/lib/{{sdt_alloc.bpf.c, sdt_task.bpf.c, scxtest/scx_test.h}}."
             );
         }
     }
@@ -199,8 +201,26 @@ fn stamp_scx_tag(dest: &Path) -> Result<(), String> {
 /// a top-level `<repo>-<tag>/` prefix component that is stripped here
 /// without depending on the exact prefix shape.
 fn fetch_via_tarball(url: &str, dest: &Path) -> Result<(), String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+    // Proxy support: reqwest automatically reads proxy configuration
+    // from environment variables (HTTP_PROXY, HTTPS_PROXY, NO_PROXY
+    // and their lowercase variants). In corporate or restricted
+    // network environments, ensure these variables are set if a
+    // proxy is required to reach github.com.
+    let mut client_builder =
+        reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(60));
+
+    // Explicitly configure proxy from environment if set.
+    if let Ok(proxy_url) = std::env::var("HTTPS_PROXY")
+        .or_else(|_| std::env::var("https_proxy"))
+        .or_else(|_| std::env::var("HTTP_PROXY"))
+        .or_else(|_| std::env::var("http_proxy"))
+    {
+        let proxy = reqwest::Proxy::all(&proxy_url)
+            .map_err(|e| format!("invalid proxy URL {proxy_url}: {e}"))?;
+        client_builder = client_builder.proxy(proxy);
+    }
+
+    let client = client_builder
         .build()
         .map_err(|e| format!("http client: {e}"))?;
     let resp = client

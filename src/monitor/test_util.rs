@@ -8,6 +8,7 @@
 //! modules; a shared parent module is the only path).
 
 use super::bpf_map::BPF_OBJ_NAME_LEN;
+use super::{CpuSnapshot, MonitorSample};
 
 /// Pack a `&str` into the inline name representation
 /// (`name_bytes`, `name_len`) used by
@@ -23,4 +24,33 @@ pub(crate) fn name_from_str(s: &str) -> ([u8; BPF_OBJ_NAME_LEN], u8) {
     let n = bytes.len().min(BPF_OBJ_NAME_LEN);
     buf[..n].copy_from_slice(&bytes[..n]);
     (buf, n as u8)
+}
+
+/// Two-CPU sample whose load is balanced under every default
+/// monitor check: `nr_running=2` on both CPUs, small
+/// `local_dsq_depth`, advancing `rq_clock`. Used as the
+/// "no-violation baseline" by `thresholds_tests`,
+/// `validity_tests`, `event_rates_tests`, and
+/// `schedstat_tests` — keeping it in one place avoids drift
+/// between copies that would silently change what "balanced"
+/// means across test modules.
+pub(crate) fn balanced_sample(elapsed_ms: u64, clock_base: u64) -> MonitorSample {
+    MonitorSample {
+        prog_stats: None,
+        elapsed_ms,
+        cpus: vec![
+            CpuSnapshot {
+                nr_running: 2,
+                rq_clock: clock_base,
+                local_dsq_depth: 3,
+                ..Default::default()
+            },
+            CpuSnapshot {
+                nr_running: 2,
+                rq_clock: clock_base + 100,
+                local_dsq_depth: 2,
+                ..Default::default()
+            },
+        ],
+    }
 }

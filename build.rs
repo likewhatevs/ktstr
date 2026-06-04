@@ -343,10 +343,30 @@ int main(void) {{
                 // machinery so a slow-drip server can hang the build
                 // indefinitely. Buffer the body so the timeout actually
                 // fires.
-                let client = reqwest::blocking::Client::builder()
+                //
+                // Proxy support: reqwest automatically reads proxy configuration
+                // from environment variables (HTTP_PROXY, HTTPS_PROXY, NO_PROXY
+                // and their lowercase variants). In corporate or restricted
+                // network environments, ensure these variables are set if a
+                // proxy is required to reach github.com.
+                let mut client_builder = reqwest::blocking::Client::builder()
                     .timeout(std::time::Duration::from_secs(120))
                     .connect_timeout(std::time::Duration::from_secs(30))
-                    .user_agent(concat!("ktstr-build/", env!("CARGO_PKG_VERSION")))
+                    .user_agent(concat!("ktstr-build/", env!("CARGO_PKG_VERSION")));
+
+                // Explicitly configure proxy from environment if set.
+                // Supports: HTTP_PROXY, HTTPS_PROXY, NO_PROXY (and lowercase variants)
+                if let Ok(proxy_url) = std::env::var("HTTPS_PROXY")
+                    .or_else(|_| std::env::var("https_proxy"))
+                    .or_else(|_| std::env::var("HTTP_PROXY"))
+                    .or_else(|_| std::env::var("http_proxy"))
+                {
+                    let proxy = reqwest::Proxy::all(&proxy_url)
+                        .map_err(|e| format!("invalid proxy URL {proxy_url}: {e}"))?;
+                    client_builder = client_builder.proxy(proxy);
+                }
+
+                let client = client_builder
                     .build()
                     .map_err(|e| format!("http client: {e}"))?;
                 let mut req = client.get(tarball_url);
@@ -422,7 +442,9 @@ int main(void) {{
                         "failed to obtain busybox source.\n\
                          tarball ({tarball_url}): {tarball_err}\n\
                          git clone ({git_url}): {clone_err}\n\
-                         Check network connectivity. First build requires internet access."
+                         Check network connectivity. First build requires internet access.\n\
+                         If behind a proxy, ensure HTTP_PROXY/HTTPS_PROXY environment\n\
+                         variables are set (e.g., export HTTPS_PROXY=http://proxy:8080)."
                     );
                 }
             }
