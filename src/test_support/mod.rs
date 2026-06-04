@@ -92,12 +92,15 @@ pub type PostVmCallback = fn(&crate::vmm::VmResult) -> anyhow::Result<()>;
 // production via `super::args::` (probe.rs, eval.rs); the re-export here
 // preserves the flat-namespace invariant so `test_support::X` resolves
 // uniformly across all CLI arg extractors.
+#[cfg(feature = "export")]
+pub(crate) use args::extract_export_output_arg;
 #[allow(unused_imports)]
 pub(crate) use args::{
-    CellParentCgroupArg, cell_parent_path_is_valid, extract_export_output_arg,
-    extract_export_test_arg, extract_probe_stack_arg, extract_shell_test_arg, extract_test_fn_arg,
-    extract_topo_arg, extract_work_type_arg, parse_cell_parent_cgroup,
+    CellParentCgroupArg, cell_parent_path_is_valid, extract_export_test_arg,
+    extract_probe_stack_arg, extract_shell_test_arg, extract_test_fn_arg, extract_topo_arg,
+    extract_work_type_arg, parse_cell_parent_cgroup,
 };
+#[allow(unused_imports)]
 pub(crate) use runtime::{append_base_sched_args, content_hash, scratch_dir, sys_rdy_budget_ms};
 #[cfg(test)]
 pub(crate) use sidecar::enriched_parse_error_message_for_test;

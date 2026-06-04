@@ -25,12 +25,14 @@ use anyhow::{Context, Result};
 
 use crate::assert::AssertResult;
 
+#[cfg(feature = "export")]
+use super::extract_export_output_arg;
 use super::{
-    KTSTR_TESTS, KtstrTestEntry, TopoOverride, collect_sidecars, extract_export_output_arg,
-    extract_export_test_arg, extract_shell_test_arg, extract_test_fn_arg, extract_topo_arg,
-    find_test, format_callback_profile, format_kvm_stats, format_verifier_stats,
-    maybe_dispatch_vm_test, parse_topo_string, propagate_rust_env_from_cmdline,
-    record_skip_sidecar, resolve_test_kernel, run_ktstr_test_inner, sidecar_dir, try_flush_profraw,
+    KTSTR_TESTS, KtstrTestEntry, TopoOverride, collect_sidecars, extract_export_test_arg,
+    extract_shell_test_arg, extract_test_fn_arg, extract_topo_arg, find_test,
+    format_callback_profile, format_kvm_stats, format_verifier_stats, maybe_dispatch_vm_test,
+    parse_topo_string, propagate_rust_env_from_cmdline, record_skip_sidecar, resolve_test_kernel,
+    run_ktstr_test_inner, sidecar_dir, try_flush_profraw,
 };
 
 /// Check if an `anyhow::Error` carries a [`ResourceContention`].
@@ -621,6 +623,33 @@ fn is_test_sentinel(name: &str) -> bool {
 /// Without the differentiation, an operator who exports a
 /// host_only test would see the misleading "not found" diagnostic
 /// even though the test exists.
+/// Stub for the `export`-feature-disabled build. The router
+/// (`cargo-ktstr.rs::run_export`) execs every candidate test binary
+/// with `--ktstr-export-test=NAME`; without this stub a binary
+/// compiled without `export` would fall through to the nextest
+/// harness, which would surface an opaque "unrecognised argument"
+/// error against an arg the operator never typed. The stub turns
+/// that into an actionable diagnostic by detecting the arg and
+/// emitting a build-config hint, then exiting 2 (matches the
+/// "registered but rejected" exit code so the router surfaces
+/// THIS binary's stderr rather than a sibling's "not registered"
+/// fallthrough). Recompile the test binary with the `export`
+/// feature (folded into `cli-bins` in the default feature set)
+/// to enable the real `cargo ktstr export` flow.
+#[cfg(not(feature = "export"))]
+fn maybe_dispatch_export() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    let _ = extract_export_test_arg(&args)?;
+    eprintln!(
+        "ktstr export: this test binary was built without the `export` cargo \
+         feature, so `cargo ktstr export <name>` cannot reach the export pipeline \
+         from here. Rebuild with the default feature set (or pass \
+         `--features cli-bins`) and retry."
+    );
+    Some(2)
+}
+
+#[cfg(feature = "export")]
 fn maybe_dispatch_export() -> Option<i32> {
     let args: Vec<String> = std::env::args().collect();
     let name = extract_export_test_arg(&args)?;

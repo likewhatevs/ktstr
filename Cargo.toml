@@ -24,7 +24,13 @@ exclude = [".build-cache/", "doc/guide/book/", ".github/", ".githooks/", ".confi
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-clap_complete = "4"
+# Shell-completions generator for the `ktstr completions` /
+# `cargo ktstr completions` subcommands. Only referenced from the
+# bin trees (`src/bin/ktstr.rs` + `src/bin/cargo_ktstr/...`); the
+# library doesn't touch it. Gated behind the `cli-bins` feature so
+# downstream `[dev-dependencies] ktstr = { default-features = false }`
+# consumers drop it from their transitive set.
+clap_complete = { version = "4", optional = true }
 crc32fast = "1.5"
 # Binary serialization for bulk-port TLV payloads (AssertResult,
 # PayloadMetrics, RawPayloadOutput, WorkerReport) and sidecar disk
@@ -136,8 +142,14 @@ memchr = "2"
 # retain struct types that would otherwise be eliminated by inlining +
 # dead-code elimination. tree-sitter-c parses any C formatting without
 # regex fragility.
-tree-sitter = "0.26"
-tree-sitter-c = "0.24"
+#
+# Only referenced from `src/bin/cargo_ktstr/btf_catalog.rs`, included
+# from the `cargo-ktstr` bin. Gated behind the `cli-bins` feature so
+# downstream `[dev-dependencies] ktstr = { default-features = false }`
+# consumers drop them (plus a handful of small transitives —
+# tree-sitter-language, streaming-iterator) from their build.
+tree-sitter = { version = "0.26", optional = true }
+tree-sitter-c = { version = "0.24", optional = true }
 # Human-readable duration parsing for the `--watch <interval>` flag on
 # `ktstr locks`. Accepts "100ms", "1s", "5m", "1h" forms per rev 5 §6.
 # Tiny crate (~2 modules, zero non-std deps).
@@ -163,7 +175,16 @@ strsim = "0.11"
 # so the bash preamble can `base64 -d | tar xz` the binaries on the
 # target host. Lightweight crate, well-audited, used only at export
 # time (not on the test hot path).
-base64 = "0.22"
+#
+# Only referenced from `src/export.rs`. Gated behind the `export`
+# feature; the `cli-bins` feature pulls it in transitively so the
+# bin-install flow is unchanged, and the test-binary dispatch path
+# in `test_support/dispatch.rs::maybe_dispatch_export` is compiled
+# out when the feature is off (a downstream `default-features =
+# false` test binary cannot respond to `cargo ktstr export <name>`,
+# which matches the intent — that flow is host-tooling, not a
+# downstream-author surface).
+base64 = { version = "0.22", optional = true }
 # jemalloc as global allocator for the ktstr/cargo-ktstr binaries.
 # binary-only — the library stays allocator-agnostic so downstream
 # consumers pick their own allocator. `stats` feature compiles
@@ -171,7 +192,13 @@ base64 = "0.22"
 # `tikv-jemalloc-ctl`'s `stats.{allocated,active,resident,mapped}`
 # mallctl reads return populated values instead of failing with
 # EPERM; `host_heap::collect` depends on this.
-tikv-jemallocator = { version = "0.6", features = ["stats"] }
+#
+# Only referenced from the `#[global_allocator]` declarations in the
+# four `src/bin/*.rs` entry points. Gated behind the `cli-bins`
+# feature; with the feature off, `tikv-jemalloc-ctl`'s mallctl reads
+# return Err and `host_heap::collect` lands `None` as documented on
+# the ctl dep below — same observable shape, no allocator swap.
+tikv-jemallocator = { version = "0.6", features = ["stats"], optional = true }
 # Safe wrappers for the jemalloc mallctl introspection surface. Used
 # by `host_heap` to capture the running binary's heap footprint
 # (active / allocated / resident / mapped bytes, arena count) as part
@@ -299,8 +326,38 @@ panic = "abort"
 debug = "line-tables-only"
 
 [features]
-default = ["llm"]
+default = ["llm", "cli-bins"]
 integration = []
+# Dependencies required only by the four `src/bin/*.rs` entry points
+# (`ktstr`, `cargo-ktstr`, `ktstr-jemalloc-probe`,
+# `ktstr-jemalloc-alloc-worker`):
+#   - `tikv-jemallocator` — process-wide `#[global_allocator]` swap.
+#   - `clap_complete`     — `completions` subcommand on `ktstr` /
+#                            `cargo-ktstr`.
+#   - `tree-sitter` + `tree-sitter-c` — BTF type-anchor codegen for
+#                            cargo-ktstr's test/coverage paths.
+# Default-on so `cargo install --locked ktstr` keeps working
+# unchanged; each `[[bin]]` carries `required-features = ["cli-bins"]`
+# so the bin is silently skipped (rather than failing to compile)
+# when the feature is off. Downstream library consumers wanting a
+# leaner dev-dep transitive set drop these by passing
+# `default-features = false`:
+#
+#   [dev-dependencies]
+#   ktstr = { version = "0.10", default-features = false, features = ["llm"] }
+cli-bins = [
+    "dep:tikv-jemallocator",
+    "dep:clap_complete",
+    "dep:tree-sitter",
+    "dep:tree-sitter-c",
+    "export",
+]
+# `cargo ktstr export` self-extracting `.run` file generator
+# (`src/export.rs`). Gates `base64`. Off-by-default for a
+# `default-features = false` library consumer; the `cli-bins`
+# umbrella feature pulls it in so the bin install flow still has the
+# `export` subcommand wired through the test-binary dispatch path.
+export = ["dep:base64"]
 # Embed the wprof BPF tracer for Perfetto-format profiling in VMs.
 # Default off: first build clones github.com/anakryiko/wprof and
 # compiles libbpf + blazesym (requires git, make, gcc, clang,
@@ -403,18 +460,22 @@ tar = "0.4"
 [[bin]]
 name = "ktstr"
 path = "src/bin/ktstr.rs"
+required-features = ["cli-bins"]
 
 [[bin]]
 name = "cargo-ktstr"
 path = "src/bin/cargo-ktstr.rs"
+required-features = ["cli-bins"]
 
 [[bin]]
 name = "ktstr-jemalloc-probe"
 path = "src/bin/jemalloc_probe.rs"
+required-features = ["cli-bins"]
 
 [[bin]]
 name = "ktstr-jemalloc-alloc-worker"
 path = "src/bin/jemalloc_alloc_worker.rs"
+required-features = ["cli-bins"]
 
 [[test]]
 name = "ktstr_sched_tests"

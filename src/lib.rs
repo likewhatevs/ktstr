@@ -154,13 +154,45 @@
 //!
 //! # Library usage
 //!
+//! Default install (full feature set — includes the installed
+//! `ktstr` / `cargo-ktstr` bins' deps and the local LLM extractor):
+//!
 //! ```toml
 //! [dev-dependencies]
-//! ktstr = { version = "0.5" }
+//! ktstr = "0.10"
 //! ```
 //!
-//! The only feature flag is `integration`, which gates
-//! `resolve_func_ip` visibility for integration tests.
+//! Lean dev-dep (drops the host-tooling crates: tikv-jemallocator,
+//! clap_complete, tree-sitter, tree-sitter-c, base64; keeps the
+//! `OutputFormat::LlmExtract` path):
+//!
+//! ```toml
+//! [dev-dependencies]
+//! ktstr = { version = "0.10", default-features = false, features = ["llm"] }
+//! ```
+//!
+//! # Feature flags
+//!
+//! - **`llm`** (default) — `OutputFormat::LlmExtract` via bundled
+//!   Qwen3-4B GGUF. Pulls in `llama-cpp-2` (cmake C++ build).
+//! - **`cli-bins`** (default) — umbrella for deps used only by the
+//!   four `src/bin/*.rs` entry points and the matching test-binary
+//!   dispatch hooks. Pulls in `tikv-jemallocator`, `clap_complete`,
+//!   `tree-sitter`, `tree-sitter-c`, and the `export` feature.
+//! - **`export`** (pulled in by `cli-bins`) — gates
+//!   [`mod@export`] and the `cargo ktstr export` dispatch path in
+//!   the test binary. Drops `base64` from the manifest when off.
+//! - **`wprof`** — embed the wprof BPF tracer in shell-mode VMs.
+//!   First build clones `github.com/anakryiko/wprof` (requires git,
+//!   clang, elfutils-devel, zlib-devel).
+//! - **`pretty-labels`** — grex-based regex synthesis for
+//!   `ctprof_compare` display labels. With the feature off,
+//!   labels fall back to the deterministic join key.
+//! - **`remote-cache`** — GitHub Actions cache backend for blob
+//!   storage. CI-only; off-by-default. Pulls in `opendal` + minimal
+//!   `tokio` runtime.
+//! - **`integration`** — gates `resolve_func_ip` visibility for
+//!   integration tests.
 //!
 //! # Crate organization
 //!
@@ -403,6 +435,7 @@ pub mod cpu_util;
 pub mod ctprof;
 pub mod ctprof_compare;
 pub(crate) mod elf_strip;
+#[cfg(feature = "export")]
 pub mod export;
 pub mod fetch;
 pub mod fun;
@@ -495,6 +528,7 @@ pub mod remote_cache {
     pub fn remote_store(_entry: &CacheEntry, _cli_label: &str) {}
 }
 pub(crate) mod sync;
+#[cfg(any(feature = "export", feature = "remote-cache"))]
 pub(crate) mod tar_util;
 pub mod verifier;
 pub mod vm;

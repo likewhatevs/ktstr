@@ -114,6 +114,7 @@ pub(crate) fn extract_shell_test_arg(args: &[String]) -> Option<&str> {
 /// with [`extract_export_test_arg`] to direct the generated `.run`
 /// file at a specific path; absent means "default to `<test>.run` in
 /// cwd."
+#[cfg(feature = "export")]
 pub(crate) fn extract_export_output_arg(args: &[String]) -> Option<&str> {
     for a in args {
         if let Some(val) = a.strip_prefix("--ktstr-export-output=")
@@ -515,7 +516,12 @@ mod tests {
     }
 
     // -- extract_export_output_arg --
+    //
+    // Gated alongside the function itself (`extract_export_output_arg`
+    // is `#[cfg(feature = "export")]` because the only call site is
+    // the export-feature-gated dispatch path).
 
+    #[cfg(feature = "export")]
     #[test]
     fn extract_export_output_arg_equals() {
         let args = vec![
@@ -525,6 +531,7 @@ mod tests {
         assert_eq!(extract_export_output_arg(&args), Some("/tmp/foo.run"),);
     }
 
+    #[cfg(feature = "export")]
     #[test]
     fn extract_export_output_arg_missing() {
         let args = vec!["test_bin".into()];
@@ -534,6 +541,7 @@ mod tests {
     /// Empty value treated as absent — the export path falls back to
     /// the default `<test>.run` in the current directory rather than
     /// trying to write to an empty path string.
+    #[cfg(feature = "export")]
     #[test]
     fn extract_export_output_arg_empty_value() {
         let args = vec!["test_bin".into(), "--ktstr-export-output=".into()];

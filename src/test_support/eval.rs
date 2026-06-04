@@ -872,6 +872,7 @@ fn host_side_llm_extract(
 ///    so any drift here points at a bypass — the value didn't come
 ///    from the LLM-driven path even though it landed in a slot
 ///    we marked LlmExtract.
+#[cfg(feature = "llm")]
 fn validate_llm_extraction(metrics: &[crate::test_support::Metric]) -> Vec<String> {
     use std::collections::HashSet;
     // Empty-input fast-path mirrors the symmetric helper
@@ -957,6 +958,7 @@ fn validate_llm_extraction(metrics: &[crate::test_support::Metric]) -> Vec<Strin
 /// because `NaN < x` and `NaN > x` both return false. The
 /// universal pass rejects NaN unconditionally, so by the time
 /// `validate_metric_bounds` runs the input is finite.
+#[cfg(feature = "llm")]
 fn validate_metric_bounds(
     metrics: &[crate::test_support::Metric],
     bounds: &crate::test_support::MetricBounds,
@@ -5964,6 +5966,7 @@ mod tests {
     /// its violation case, leaving every other invariant satisfied
     /// so the failure is unambiguously attributable to the mutated
     /// field rather than collateral defaults.
+    #[cfg(feature = "llm")]
     fn llm_metric(name: &str, value: f64) -> crate::test_support::Metric {
         crate::test_support::Metric {
             name: name.to_owned(),
@@ -5979,6 +5982,7 @@ mod tests {
     /// invariant. The diagnostic must call out "duplicate metric
     /// name" so a reader can tell which check fired without
     /// re-reading the function.
+    #[cfg(feature = "llm")]
     #[test]
     fn validate_llm_extraction_duplicate_name_rejects() {
         let metrics = vec![
@@ -6001,6 +6005,7 @@ mod tests {
     /// A NaN value violates the finite-only invariant; the
     /// diagnostic must call out "non-finite" so the reader can tell
     /// which check fired.
+    #[cfg(feature = "llm")]
     #[test]
     fn validate_llm_extraction_nan_rejects() {
         let metrics = vec![llm_metric("latency.p99", f64::NAN)];
@@ -6022,6 +6027,7 @@ mod tests {
     /// diagnostic must mention `MetricSource::LlmExtract` so the
     /// reader can tell which check fired and what the expected
     /// source was.
+    #[cfg(feature = "llm")]
     #[test]
     fn validate_llm_extraction_wrong_source_rejects() {
         let mut metrics = vec![llm_metric("latency.p99", 1.0)];
@@ -6045,6 +6051,7 @@ mod tests {
     /// check (e.g. minimum metric count, value-magnitude bound)
     /// breaks this test instead of silently rejecting valid
     /// extractions.
+    #[cfg(feature = "llm")]
     #[test]
     fn validate_llm_extraction_clean_input_passes() {
         let metrics = vec![
@@ -6066,6 +6073,7 @@ mod tests {
     /// run" UX: a flaky LLM run that produces NaN-valued metrics
     /// with the wrong source tag surfaces both signals to the
     /// test author rather than forcing two debug iterations.
+    #[cfg(feature = "llm")]
     #[test]
     fn validate_llm_extraction_single_metric_multiple_violations() {
         let mut metrics = vec![llm_metric("latency.p99", f64::INFINITY)];
@@ -6100,6 +6108,7 @@ mod tests {
     /// is the "original," the next two are duplicates). Pins the
     /// "report every defect" semantics so a regression to first-
     /// violation-only behavior surfaces here.
+    #[cfg(feature = "llm")]
     #[test]
     fn validate_llm_extraction_multiple_duplicates_each_surface() {
         let metrics = vec![
@@ -6126,6 +6135,7 @@ mod tests {
     /// another, wrong source on a third. Verifies the function
     /// collects across ALL metrics, not just within a single one.
     /// Pins the "see every defect class in one run" UX.
+    #[cfg(feature = "llm")]
     #[test]
     fn validate_llm_extraction_heterogeneous_violations_across_metrics() {
         let mut metrics = vec![
@@ -6174,6 +6184,7 @@ mod tests {
     /// violations on any input — pins the "no bounds declared = no
     /// extra checks" contract that lets payloads opt in to the
     /// pass without paying for it.
+    #[cfg(feature = "llm")]
     #[test]
     fn validate_metric_bounds_none_produces_no_violations() {
         let metrics = vec![
@@ -6193,6 +6204,7 @@ mod tests {
     /// the declared floor. Diagnostic must name both the actual
     /// count and the required minimum so the operator can see the
     /// shortfall at a glance.
+    #[cfg(feature = "llm")]
     #[test]
     fn validate_metric_bounds_min_count_rejects_short_set() {
         let metrics = vec![llm_metric("a", 1.0), llm_metric("b", 2.0)];
@@ -6220,6 +6232,7 @@ mod tests {
 
     /// `min_count` accepts a set whose length equals the floor —
     /// pins the "inclusive lower bound" semantics.
+    #[cfg(feature = "llm")]
     #[test]
     fn validate_metric_bounds_min_count_accepts_at_threshold() {
         let metrics = vec![
@@ -6241,6 +6254,7 @@ mod tests {
     /// `value_min` rejects every metric with value strictly below
     /// the bound. Each violation surfaces independently — a set
     /// with three sub-bound metrics produces three violations.
+    #[cfg(feature = "llm")]
     #[test]
     fn validate_metric_bounds_value_min_rejects_each_below_floor() {
         let metrics = vec![
@@ -6283,6 +6297,7 @@ mod tests {
     /// `value_min` accepts metrics at exactly the bound — pins the
     /// "strictly below" semantics. A regression to `<= ` (which
     /// would reject the boundary) breaks here.
+    #[cfg(feature = "llm")]
     #[test]
     fn validate_metric_bounds_value_min_accepts_at_threshold() {
         let metrics = vec![llm_metric("zero", 0.0)];
@@ -6300,6 +6315,7 @@ mod tests {
 
     /// `value_max` mirrors `value_min` with the inverse inequality.
     /// Pins the symmetric contract.
+    #[cfg(feature = "llm")]
     #[test]
     fn validate_metric_bounds_value_max_rejects_each_above_ceiling() {
         let metrics = vec![
@@ -6336,6 +6352,7 @@ mod tests {
     /// Combined bounds (all three at once): one metric below floor,
     /// one above ceiling, and a too-short set. Three distinct
     /// violations surface.
+    #[cfg(feature = "llm")]
     #[test]
     fn validate_metric_bounds_combined_bounds_each_violation_independent() {
         let metrics = vec![llm_metric("low", -1.0), llm_metric("high", 1e15)];
@@ -6373,6 +6390,7 @@ mod tests {
     /// universal `validate_llm_extraction` accepts empty input as
     /// vacuously valid, but a payload that declared min_count
     /// expects something.
+    #[cfg(feature = "llm")]
     #[test]
     fn validate_metric_bounds_empty_metrics_with_min_count_violates() {
         let bounds = crate::test_support::MetricBounds {
