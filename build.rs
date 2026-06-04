@@ -292,10 +292,55 @@ int main(void) {{
     );
 
     // Build busybox from source for guest shell mode.
-    // Cache: skip if $OUT_DIR/busybox exists. After build.rs config
-    // changes, run `cargo clean` to force a rebuild.
+    //
+    // Hermeticity contract:
+    //
+    //  - The tarball is fetched ONCE per OUT_DIR and cached at
+    //    `$OUT_DIR/busybox`. `cargo clean` forces a re-fetch.
+    //  - The fetched bytes are SHA-256-verified against
+    //    [`BUSYBOX_TARBALL_SHA256`] before extraction. A mismatch
+    //    panics with the actual vs expected hash so the operator
+    //    can decide between "the upstream changed (regenerate the
+    //    pin)" and "the download was tampered (investigate)".
+    //  - `KTSTR_BUSYBOX_TARBALL=<path>` points the build at a
+    //    pre-fetched local tarball — for air-gapped CI runners and
+    //    hermetic CI caches. The SHA pin still applies; the local
+    //    path is a transport substitute, not a verification bypass.
+    //  - `KTSTR_SKIP_BUSYBOX_BUILD=1` writes a 0-byte placeholder at
+    //    `$OUT_DIR/busybox` and skips the compile entirely. Shell
+    //    mode is unavailable in the resulting binary;
+    //    `cargo_ktstr::blobs::install_env` detects the empty blob
+    //    and leaves `KTSTR_BUSYBOX_PATH` unset so consumers fail
+    //    with a clear "shell mode unavailable" rather than an
+    //    opaque "exec format error" on the 0-byte file. Mirrors
+    //    the existing `KTSTR_SKIP_WPROF_BUILD` escape hatch below.
+    //
+    // The pre-pin git-clone fallback was removed alongside this
+    // refactor: a clone bypasses the SHA gate (no tarball to
+    // verify), and `KTSTR_BUSYBOX_TARBALL` covers the
+    // tarball-fetch-failed case more cleanly.
     let busybox_bin = out_dir.join("busybox");
-    if !busybox_bin.exists() {
+    println!("cargo:rerun-if-env-changed=KTSTR_SKIP_BUSYBOX_BUILD");
+    println!("cargo:rerun-if-env-changed=KTSTR_BUSYBOX_TARBALL");
+    let skip_busybox = std::env::var("KTSTR_SKIP_BUSYBOX_BUILD")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_some();
+    if skip_busybox {
+        println!(
+            "cargo:warning=KTSTR_SKIP_BUSYBOX_BUILD set — writing 0-byte \
+             $OUT_DIR/busybox placeholder; shell mode will be unavailable \
+             in the resulting cargo-ktstr binary"
+        );
+        if !busybox_bin.exists() {
+            std::fs::write(&busybox_bin, b"").unwrap_or_else(|e| {
+                panic!(
+                    "write 0-byte busybox placeholder {}: {e}",
+                    busybox_bin.display()
+                )
+            });
+        }
+    } else if !busybox_bin.exists() {
         println!("cargo:warning=compiling busybox (first build only)...");
 
         // Check required tools before attempting build.
@@ -320,134 +365,54 @@ int main(void) {{
             std::fs::remove_dir_all(&busybox_src).expect("remove incomplete busybox-src");
         }
 
-        // Download busybox source: try tarball first, fall back to git clone.
-        // Warning before network access so a hang is diagnosable.
+        // Source the tarball: from a local path when
+        // KTSTR_BUSYBOX_TARBALL is set, otherwise from the pinned
+        // upstream URL with retry. Either path lands in
+        // `tarball_bytes` which is then SHA-verified before any
+        // extraction touches the filesystem.
         if !busybox_src.join("Makefile").exists() {
-            let tarball_url = "https://github.com/mirror/busybox/archive/refs/tags/1_36_1.tar.gz";
-            // Authenticated GitHub requests get 1000/hr per token vs the
-            // 60/hr IP-based unauth limit. GitHub Actions auto-issues
-            // GITHUB_TOKEN per job; outside CI the env var is typically
-            // absent and the request goes unauth, which still works for
-            // public repos at low rate.
-            let github_token = std::env::var("GITHUB_TOKEN").ok();
-            let attempt = |attempt_idx: u32| -> Result<(), String> {
-                let extract_dir = out_dir.join("busybox-extract");
-                if extract_dir.exists() {
-                    let _ = std::fs::remove_dir_all(&extract_dir);
+            const TARBALL_URL: &str =
+                "https://github.com/mirror/busybox/archive/refs/tags/1_36_1.tar.gz";
+            let tarball_bytes = match std::env::var("KTSTR_BUSYBOX_TARBALL")
+                .ok()
+                .filter(|v| !v.is_empty())
+            {
+                Some(local) => {
+                    println!(
+                        "cargo:warning=KTSTR_BUSYBOX_TARBALL set — reading {local} \
+                         instead of fetching from {TARBALL_URL}"
+                    );
+                    std::fs::read(&local).unwrap_or_else(|e| {
+                        panic!(
+                            "read KTSTR_BUSYBOX_TARBALL={local}: {e} — the env \
+                             var must point at a readable tarball matching the \
+                             pinned SHA-256"
+                        )
+                    })
                 }
-                // `timeout()` bounds the whole request including the body
-                // when read via `.bytes()` (which uses `wait::timeout`
-                // internally per `reqwest::blocking::Response::bytes`),
-                // but does NOT apply when reading the response via the
-                // `Read` trait -- streaming bypasses reqwest's timeout
-                // machinery so a slow-drip server can hang the build
-                // indefinitely. Buffer the body so the timeout actually
-                // fires.
-                //
-                // Proxy support: reqwest automatically reads proxy configuration
-                // from environment variables (HTTP_PROXY, HTTPS_PROXY, NO_PROXY
-                // and their lowercase variants). In corporate or restricted
-                // network environments, ensure these variables are set if a
-                // proxy is required to reach github.com.
-                let mut client_builder = reqwest::blocking::Client::builder()
-                    .timeout(std::time::Duration::from_secs(120))
-                    .connect_timeout(std::time::Duration::from_secs(30))
-                    .user_agent(concat!("ktstr-build/", env!("CARGO_PKG_VERSION")));
-
-                // Explicitly configure proxy from environment if set.
-                // Supports: HTTP_PROXY, HTTPS_PROXY, NO_PROXY (and lowercase variants)
-                if let Ok(proxy_url) = std::env::var("HTTPS_PROXY")
-                    .or_else(|_| std::env::var("https_proxy"))
-                    .or_else(|_| std::env::var("HTTP_PROXY"))
-                    .or_else(|_| std::env::var("http_proxy"))
-                {
-                    let proxy = reqwest::Proxy::all(&proxy_url)
-                        .map_err(|e| format!("invalid proxy URL {proxy_url}: {e}"))?;
-                    client_builder = client_builder.proxy(proxy);
-                }
-
-                let client = client_builder
-                    .build()
-                    .map_err(|e| format!("http client: {e}"))?;
-                let mut req = client.get(tarball_url);
-                if let Some(ref token) = github_token {
-                    req = req.bearer_auth(token);
-                }
-                let resp = req
-                    .send()
-                    .and_then(|r| r.error_for_status())
-                    .map_err(|e| format!("attempt {attempt_idx} request: {e}"))?;
-                let body = resp
-                    .bytes()
-                    .map_err(|e| format!("attempt {attempt_idx} body: {e}"))?;
-                let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(body));
-                let mut archive = tar::Archive::new(gz);
-                archive
-                    .unpack(&extract_dir)
-                    .map_err(|e| format!("extract: {e}"))?;
-                let inner = extract_dir.join("busybox-1_36_1");
-                std::fs::rename(&inner, &busybox_src).map_err(|e| {
-                    format!(
-                        "expected extracted directory {} — tarball layout may have changed: {e}",
-                        inner.display()
-                    )
-                })?;
-                std::fs::remove_dir_all(&extract_dir).ok();
-                Ok(())
+                None => fetch_busybox_tarball(TARBALL_URL),
             };
 
-            println!("cargo:warning=downloading busybox source tarball from {tarball_url}");
-            const MAX_TARBALL_ATTEMPTS: u32 = 4;
-            let tarball_err =
-                retry_with_backoff("busybox tarball download", MAX_TARBALL_ATTEMPTS, attempt).err();
+            verify_busybox_tarball_sha256(&tarball_bytes);
 
-            // Fall back to shallow git clone if tarball failed.
-            if !busybox_src.join("Makefile").exists() {
-                let tarball_err = tarball_err.unwrap_or_else(|| "unknown".to_string());
-                let git_url = "https://github.com/mirror/busybox.git";
-                println!(
-                    "cargo:warning=busybox tarball failed ({tarball_err}), \
-                     cloning {git_url} (requires network)"
-                );
-
-                // Clean up any partial state from failed tarball extraction.
-                if busybox_src.exists() {
-                    std::fs::remove_dir_all(&busybox_src).expect("remove partial busybox-src");
-                }
-                let extract_dir = out_dir.join("busybox-extract");
-                if extract_dir.exists() {
-                    std::fs::remove_dir_all(&extract_dir).ok();
-                }
-
-                let interrupt = std::sync::atomic::AtomicBool::new(false);
-                let clone_err = (|| -> Result<(), Box<dyn std::error::Error>> {
-                    let mut prep = gix::prepare_clone(git_url, &busybox_src)?
-                        .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
-                            1.try_into().expect("non-zero"),
-                        ))
-                        .with_ref_name(Some("1_36_1"))?;
-                    let (mut checkout, _) =
-                        prep.fetch_then_checkout(gix::progress::Discard, &interrupt)?;
-                    let (_repo, _) = checkout.main_worktree(gix::progress::Discard, &interrupt)?;
-                    println!("cargo:warning=busybox source cloned via git");
-                    Ok(())
-                })()
-                .err();
-
-                if !busybox_src.join("Makefile").exists() {
-                    let clone_err = clone_err
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "checkout missing Makefile".to_string());
-                    panic!(
-                        "failed to obtain busybox source.\n\
-                         tarball ({tarball_url}): {tarball_err}\n\
-                         git clone ({git_url}): {clone_err}\n\
-                         Check network connectivity. First build requires internet access.\n\
-                         If behind a proxy, ensure HTTP_PROXY/HTTPS_PROXY environment\n\
-                         variables are set (e.g., export HTTPS_PROXY=http://proxy:8080)."
-                    );
-                }
+            // Extract verified bytes into busybox-src/.
+            let extract_dir = out_dir.join("busybox-extract");
+            if extract_dir.exists() {
+                let _ = std::fs::remove_dir_all(&extract_dir);
             }
+            let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(&tarball_bytes[..]));
+            let mut archive = tar::Archive::new(gz);
+            archive
+                .unpack(&extract_dir)
+                .unwrap_or_else(|e| panic!("extract busybox tarball: {e}"));
+            let inner = extract_dir.join("busybox-1_36_1");
+            std::fs::rename(&inner, &busybox_src).unwrap_or_else(|e| {
+                panic!(
+                    "expected extracted directory {} — tarball layout may have changed: {e}",
+                    inner.display()
+                )
+            });
+            std::fs::remove_dir_all(&extract_dir).ok();
         }
 
         // Configure busybox.
@@ -799,6 +764,174 @@ int main(void) {{
             std::fs::copy(&built_bin, &wprof_bin).expect("copy wprof binary to OUT_DIR");
         }
     } // #[cfg(feature = "wprof")]
+}
+
+/// SHA-256 hex digest of the upstream busybox-1.36.1 release tarball
+/// (`busybox-1_36_1.tar.gz` from the `mirror/busybox` github archive).
+///
+/// **Sentinel value**: `""` means the pin is not yet recorded for this
+/// checkout. In that case [`verify_busybox_tarball_sha256`] emits the
+/// computed digest as a `cargo:warning` and continues — first-build
+/// integration. To activate the verification gate, replace the empty
+/// string with the printed digest, then commit. Subsequent builds
+/// fail on mismatch.
+///
+/// **Rotation**: bumping the busybox version requires updating BOTH
+/// the URL in the `fetch_busybox_tarball` call site AND this pin in
+/// lockstep — a partial edit produces a SHA mismatch on the next
+/// fetch (fail-loud, not silent-pull-wrong-bytes).
+///
+/// **Why a custom pin instead of cargo's vendoring**: cargo's
+/// vendoring covers crate sources, not arbitrary C-source tarballs
+/// downloaded by a build script. The verification has to live in
+/// `build.rs` itself.
+const BUSYBOX_TARBALL_SHA256: &str = "";
+
+/// Fetch the upstream busybox tarball with retry; return the raw
+/// gzip-compressed bytes (NOT yet SHA-verified — caller passes the
+/// returned buffer through [`verify_busybox_tarball_sha256`] before
+/// extracting). Extracted from the prior in-line download so the
+/// `KTSTR_BUSYBOX_TARBALL` operator override can read a local file
+/// through the same downstream pipeline.
+fn fetch_busybox_tarball(url: &str) -> Vec<u8> {
+    // Authenticated GitHub requests get 1000/hr per token vs the
+    // 60/hr IP-based unauth limit. GitHub Actions auto-issues
+    // GITHUB_TOKEN per job; outside CI the env var is typically
+    // absent and the request goes unauth, which still works for
+    // public repos at low rate.
+    let github_token = std::env::var("GITHUB_TOKEN").ok();
+    let attempt = |attempt_idx: u32| -> Result<Vec<u8>, String> {
+        // `timeout()` bounds the whole request including the body
+        // when read via `.bytes()` (which uses `wait::timeout`
+        // internally per `reqwest::blocking::Response::bytes`),
+        // but does NOT apply when reading the response via the
+        // `Read` trait -- streaming bypasses reqwest's timeout
+        // machinery so a slow-drip server can hang the build
+        // indefinitely. Buffer the body so the timeout actually
+        // fires.
+        //
+        // Proxy support: reqwest automatically reads proxy configuration
+        // from environment variables (HTTP_PROXY, HTTPS_PROXY, NO_PROXY
+        // and their lowercase variants). In corporate or restricted
+        // network environments, ensure these variables are set if a
+        // proxy is required to reach github.com.
+        let mut client_builder = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .user_agent(concat!("ktstr-build/", env!("CARGO_PKG_VERSION")));
+
+        // Explicitly configure proxy from environment if set.
+        // reqwest reads these automatically, but we configure explicitly
+        // to ensure proxy is used and to provide better error messages.
+        // Supports: HTTP_PROXY, HTTPS_PROXY, NO_PROXY (and lowercase variants)
+        if let Ok(proxy_url) = std::env::var("HTTPS_PROXY")
+            .or_else(|_| std::env::var("https_proxy"))
+            .or_else(|_| std::env::var("HTTP_PROXY"))
+            .or_else(|_| std::env::var("http_proxy"))
+        {
+            let proxy = reqwest::Proxy::all(&proxy_url)
+                .map_err(|e| format!("invalid proxy URL {proxy_url}: {e}"))?;
+            client_builder = client_builder.proxy(proxy);
+        }
+
+        let client = client_builder
+            .build()
+            .map_err(|e| format!("http client: {e}"))?;
+        let mut req = client.get(url);
+        if let Some(ref token) = github_token {
+            req = req.bearer_auth(token);
+        }
+        let resp = req
+            .send()
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| format!("attempt {attempt_idx} request: {e}"))?;
+        let body = resp
+            .bytes()
+            .map_err(|e| format!("attempt {attempt_idx} body: {e}"))?;
+        Ok(body.to_vec())
+    };
+
+    println!("cargo:warning=downloading busybox source tarball from {url}");
+    const MAX_TARBALL_ATTEMPTS: u32 = 4;
+    retry_with_backoff("busybox tarball download", MAX_TARBALL_ATTEMPTS, attempt).unwrap_or_else(
+        |e| {
+            panic!(
+                "failed to obtain busybox source after {MAX_TARBALL_ATTEMPTS} attempts.\n\
+             tarball ({url}): {e}\n\
+             Remediation:\n\
+               • Check network connectivity (the build script needs HTTPS\n\
+                 access to github.com to fetch the upstream tarball).\n\
+               • If behind a proxy, ensure HTTP_PROXY/HTTPS_PROXY environment\n\
+                 variables are set (e.g., export HTTPS_PROXY=http://proxy:8080).\n\
+               • Or set KTSTR_BUSYBOX_TARBALL=<path> to point at a\n\
+                 pre-fetched local copy of {url} — useful for air-gapped\n\
+                 CI runners and hermetic build environments.\n\
+               • Or set KTSTR_SKIP_BUSYBOX_BUILD=1 to skip the busybox\n\
+                 compile entirely (shell mode will be unavailable in the\n\
+                 resulting cargo-ktstr binary).",
+            )
+        },
+    )
+}
+
+/// Verify the downloaded busybox tarball against [`BUSYBOX_TARBALL_SHA256`].
+///
+/// Three outcomes:
+///
+///   - **Pin empty**: log the computed digest as a `cargo:warning` and
+///     continue. First-build bootstrap path — the operator pastes the
+///     printed value into `BUSYBOX_TARBALL_SHA256` to lock the pin.
+///   - **Pin matches**: silent pass.
+///   - **Pin mismatches**: panic with both digests. The operator
+///     investigates: a regenerated upstream archive (github does this
+///     rarely; cf. the 2023 git-archive checksum change) requires a
+///     pin refresh, whereas an unexplained mismatch on a fixed pin
+///     indicates supply-chain tampering and warrants investigation
+///     before the bytes hit the build.
+fn verify_busybox_tarball_sha256(tarball_bytes: &[u8]) {
+    use sha2::{Digest, Sha256};
+    let actual = {
+        let mut hasher = Sha256::new();
+        hasher.update(tarball_bytes);
+        hex_encode_lowercase(&hasher.finalize())
+    };
+    if BUSYBOX_TARBALL_SHA256.is_empty() {
+        println!(
+            "cargo:warning=BUSYBOX_TARBALL_SHA256 is unset — first-build \
+             bootstrap. Computed SHA-256: {actual}\n\
+             To lock the pin: update BUSYBOX_TARBALL_SHA256 in build.rs to\n\
+             this value and commit. Subsequent builds will fail on mismatch."
+        );
+        return;
+    }
+    if !BUSYBOX_TARBALL_SHA256.eq_ignore_ascii_case(&actual) {
+        panic!(
+            "busybox tarball SHA-256 mismatch.\n\
+             expected: {BUSYBOX_TARBALL_SHA256}\n\
+             actual:   {actual}\n\
+             \n\
+             Diagnose:\n\
+               • If the upstream archive was regenerated (rare — github\n\
+                 changed archive generation in early 2023, otherwise these\n\
+                 tarballs are stable for years), update BUSYBOX_TARBALL_SHA256\n\
+                 in build.rs to the new digest after independently verifying\n\
+                 the source.\n\
+               • Otherwise treat as a supply-chain alert: compare against\n\
+                 the upstream SHA published by the busybox maintainers\n\
+                 before continuing."
+        );
+    }
+}
+
+/// Lowercase hex-encode a byte slice. Inlined to avoid pulling `hex`
+/// into `[build-dependencies]` for a single 32-byte digest.
+fn hex_encode_lowercase(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        write!(&mut s, "{b:02x}").expect("write to String never fails");
+    }
+    s
 }
 
 /// Scan src/budget.rs for `const NAME_SHIFT: u32 = N;` declarations

@@ -114,12 +114,23 @@ fn extract_to_content_addressed_file(
 /// Caller MUST invoke this before spawning any thread or calling
 /// any code that reads environment variables concurrently.
 pub fn install_env() -> std::io::Result<()> {
-    let busybox_path = extract_to_content_addressed_file(BUSYBOX_BYTES, "busybox")?;
-    // SAFETY: per fn-level precondition, the caller (cargo-ktstr's
-    // main) calls this before any thread spawn, so no concurrent
-    // env reader exists.
-    unsafe {
-        std::env::set_var(ktstr::KTSTR_BUSYBOX_PATH_ENV, &busybox_path);
+    // Skip the busybox extract+set_var pair when the embedded blob
+    // is empty — that's the `KTSTR_SKIP_BUSYBOX_BUILD=1` path
+    // (build.rs writes a 0-byte placeholder at $OUT_DIR/busybox so
+    // the `include_bytes!` site compiles, but there is no real
+    // binary to extract). Leaving `KTSTR_BUSYBOX_PATH` unset is the
+    // right contract: any consumer that tries to use shell mode
+    // gets a clean "env var not set" / "shell mode unavailable"
+    // signal rather than an opaque "exec format error" the kernel
+    // would emit on an attempted 0-byte exec.
+    if !BUSYBOX_BYTES.is_empty() {
+        let busybox_path = extract_to_content_addressed_file(BUSYBOX_BYTES, "busybox")?;
+        // SAFETY: per fn-level precondition, the caller (cargo-ktstr's
+        // main) calls this before any thread spawn, so no concurrent
+        // env reader exists.
+        unsafe {
+            std::env::set_var(ktstr::KTSTR_BUSYBOX_PATH_ENV, &busybox_path);
+        }
     }
     #[cfg(feature = "wprof")]
     {

@@ -447,9 +447,12 @@ virtio-queue = { version = "0.17", features = ["test-utils"] }
 [build-dependencies]
 cc = "1"
 flate2 = "1"
-gix = { version = "0.83", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation"] }
 libbpf-cargo = "0.26"
 reqwest = { version = "0.13", features = ["blocking"] }
+# SHA-256 for build-script tarball integrity verification (busybox
+# pin in build.rs). Same crate the runtime uses for model artifact
+# verification — single algorithm across every hashing site.
+sha2 = "0.11"
 # Stable hash for BTF content drift detection in build.rs.
 # Reusing the same crate ktstr uses for sidecar_variant_hash keeps
 # the dep graph narrow and pins one algorithm across every hashing
