@@ -45,8 +45,16 @@ reqwest = { version = "0.13", features = ["blocking"] }
 tar = "0.4"
 tempfile = "3"
 xz2 = { version = "0.1", features = ["static"] }
-opendal = { version = "0.56", default-features = false, features = ["services-ghac"] }
-tokio = { version = "1", features = ["rt"] }
+# GitHub Actions cache backend, used only by src/remote_cache.rs.
+# Gated behind the `remote-cache` feature (off by default). With
+# the feature off, remote_cache::is_enabled() returns false
+# unconditionally and the lookup/store entry points become no-ops,
+# so call sites need no `#[cfg]` gating.
+opendal = { version = "0.56", default-features = false, features = ["services-ghac"], optional = true }
+# tokio runtime for opendal's async surface in remote_cache.rs.
+# Tied to the same feature as opendal — neither is referenced
+# anywhere else in the crate.
+tokio = { version = "1", features = ["rt"], optional = true }
 zstd = { version = "0.13", features = ["zstdmt"] }
 lz4_flex = { version = "0.13", features = ["frame"] }
 flate2 = "1"
@@ -71,7 +79,6 @@ kvm-ioctls = "0.24"
 libbpf-rs = { version = "0.26", features = ["vendored"] }
 libbpf-sys = { version = "1.6", features = ["vendored"] }
 linux-loader = { version = "0.13", features = ["bzimage", "elf", "pe"] }
-vm-fdt = "0.3"
 vm-memory = { version = "=0.17.1", features = ["backend-mmap"] }
 vmm-sys-util = "0.15"
 cpio = "0.4.1"
@@ -79,7 +86,6 @@ virtio-bindings = "0.2.7"
 virtio-queue = "0.17"
 vm-superio = "0.8.1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
-polars = { version = "0.53.0", default-features = false, features = ["lazy", "describe"] }
 linkme = "0.3"
 ktstr-macros = { version = "0.10.0", path = "ktstr-macros" }
 goblin = { version = "0.10.5", features = ["elf64"] }
@@ -99,13 +105,11 @@ gimli = "0.33"
 rayon = "1"
 # ELF reader/writer. `features = ["build"]` pulls in the full
 # `object::build::elf::Builder` surface used by `elf_strip.rs` and
-# `cache.rs` for SHT_NOBITS rewriting. `cargo tree --duplicates` also
-# lists `object v0.37.3` reached via `ar_archive_writer` (build-dep of
-# `psm` / `stacker` / `polars`) with only the `memchr` feature — that
-# second instance is a build-script compilation artifact and does not
-# link into any shipped binary. The dupe is an artifact of resolver v3
-# keeping build-dep and regular-dep feature graphs separate; unifying
-# would require dropping `polars`, which is not a proportionate fix.
+# `cache.rs` for SHT_NOBITS rewriting. `cargo tree --duplicates` may
+# still report a second `object` instance reached transitively via
+# `ar_archive_writer` (build-dep of `psm` / `stacker`) with only the
+# `memchr` feature; that second instance is a build-script compilation
+# artifact and does not link into any shipped binary.
 object = { version = "0.39", default-features = false, features = ["build"] }
 walkdir = "2"
 indicatif = "0.18"
@@ -186,9 +190,12 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 # deterministic strip-trailing-digit prefix; grex is invoked at
 # render time only, on bucket-member literals (≥2 entries), to
 # produce a regex string operators can read or paste into tooling.
+# Gated behind the `pretty-labels` feature (off by default); when
+# the feature is disabled, `pattern_display_label` falls back to
+# the join key unchanged — same observable shape, just less polish.
 # `default-features = false` drops the binary CLI surface (clap,
 # colored, indoc) so only the library trait is pulled in.
-grex = { version = "1.4", default-features = false }
+grex = { version = "1.4", default-features = false, optional = true }
 # SHA-256 for one-shot digest verification of downloaded artifacts
 # (fetch.rs), cache-key fingerprinting (disk_template.rs), seeded
 # key derivation (fun.rs), and model-cache integrity checks
@@ -204,15 +211,21 @@ hex = "0.4"
 # (`greedy()`, `accept()`, `sample()`) used by `invoke_with_model`.
 # Build dep on cmake — the linked llama.cpp C++ sources are built from
 # source via `llama-cpp-sys-2`'s build script.
-llama-cpp-2 = { version = "0.1.145", default-features = false, features = ["openmp", "sampler"] }
+#
+# Gated behind the `llm` feature (in `default` to preserve behavior,
+# but `--no-default-features` consumers can drop it). When the
+# feature is off, the entire `test_support::model` module is
+# compiled out, and downstream callers in `eval.rs`, `payload_run.rs`,
+# and `cargo-ktstr` are gated alongside it.
+llama-cpp-2 = { version = "0.1.145", default-features = false, features = ["openmp", "sampler"], optional = true }
 # Stateful UTF-8 decoder required by `LlamaModel::token_to_piece` —
 # a single token may carry a partial multi-byte UTF-8 sequence and
 # only a stateful decoder can stitch consecutive tokens into valid
 # UTF-8 without dropping bytes. Already a transitive dep of
 # `llama-cpp-2`; pinned as a direct dep so the call site's intent is
 # explicit and survives a future llama-cpp-2 reorganization that
-# changes its re-export surface.
-encoding_rs = "0.8"
+# changes its re-export surface. Tied to the same `llm` feature.
+encoding_rs = { version = "0.8", optional = true }
 # Error-enum derives for the `InferenceError` type that
 # `load_inference` and `invoke_with_model` return. Already a
 # transitive dep via `llama-cpp-2`'s own thiserror-derived error
@@ -260,6 +273,14 @@ netlink-packet-generic = "0.4"
 perf-event-open-sys = "6"
 ahash = "0.8"
 
+# Flattened device tree writer for the aarch64 boot path
+# (src/vmm/aarch64/fdt.rs). The arch mod itself is already
+# `#[cfg(target_arch = "aarch64")]`-gated, so the dep follows
+# the same target predicate — x86_64 builds (the majority) skip
+# vm-fdt and its transitives entirely.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+vm-fdt = "0.3"
+
 [profile.release]
 lto = "thin"
 panic = "abort"
@@ -278,12 +299,37 @@ panic = "abort"
 debug = "line-tables-only"
 
 [features]
+default = ["llm"]
 integration = []
 # Embed the wprof BPF tracer for Perfetto-format profiling in VMs.
 # Default off: first build clones github.com/anakryiko/wprof and
 # compiles libbpf + blazesym (requires git, make, gcc, clang,
 # elfutils-devel, zlib-devel on the host; takes several minutes).
 wprof = ["ktstr-macros/wprof"]
+# Local-CPU LLM extraction (`OutputFormat::LlmExtract`) via the
+# bundled Qwen3-4B GGUF. Pulls in `llama-cpp-2` (compiles llama.cpp
+# C++ via cmake — minutes of build time on a cold cache) plus
+# `encoding_rs`. Default-ON to preserve current behavior; consumers
+# wanting a leaner library (no LLM inference path) can
+# `--no-default-features` and re-enable just the features they want
+# (e.g. `cargo build --no-default-features --features remote-cache,pretty-labels`).
+llm = ["dep:llama-cpp-2", "dep:encoding_rs"]
+# Pretty thread-name labels in `ctprof_compare` output. Enables
+# `grex` regex synthesis to render multi-member buckets as a
+# minimal regex (e.g. `tokio-runtime-worker-[0-3]`). With this
+# feature off, `pattern_display_label` falls back to the join key
+# (e.g. `tokio-runtime-worker`) — identical aggregation, less
+# polish. Worth enabling for interactive use of the compare CLI.
+pretty-labels = ["dep:grex"]
+# GitHub Actions cache integration for cargo-ktstr's blob store
+# (`src/remote_cache.rs`). Off by default: only CI runs with
+# `KTSTR_GHA_CACHE=1` + `ACTIONS_CACHE_URL` set actually use the
+# remote backend. With the feature off, `remote_cache::is_enabled()`
+# returns false and the lookup/store entry points are no-ops, so
+# call sites in `cli/resolve.rs` and `cli/kernel_build/build.rs`
+# transparently skip the remote path. Pulls in `opendal` + a
+# minimal `tokio` runtime; saves both transitive trees on local dev.
+remote-cache = ["dep:opendal", "dep:tokio"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_nightly)'] }

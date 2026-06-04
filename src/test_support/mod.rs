@@ -53,6 +53,7 @@ mod dispatch;
 mod entry;
 mod eval;
 mod metrics;
+#[cfg(feature = "llm")]
 mod model;
 mod output;
 mod payload;
@@ -126,6 +127,7 @@ pub use metrics::{
     MAX_WALK_DEPTH, WALK_TRUNCATION_SENTINEL_NAME, extract_metrics, is_truncation_sentinel_name,
     walk_json_leaves,
 };
+#[cfg(feature = "llm")]
 pub use model::{
     CleanReport, DEFAULT_MODEL, LLM_DEBUG_RESPONSES_ENV, ModelSpec, ModelStatus, OFFLINE_ENV,
     ShaVerdict, clean, ensure, status,

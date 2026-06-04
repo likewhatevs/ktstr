@@ -640,6 +640,7 @@ pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry) {
 ///   in `shm_write`, so a CRC drop does NOT inflate `shm_drops`
 ///   yet still loses the raw output. Pairs symmetrically with the
 ///   raw-output orphan-pairing detail above.
+#[cfg(feature = "llm")]
 fn host_side_llm_extract(
     payload_metrics: &mut [crate::test_support::PayloadMetrics],
     raw_outputs: &[crate::test_support::RawPayloadOutput],
@@ -2274,7 +2275,10 @@ fn run_ktstr_test_inner_impl(
     // Returns a flat `Vec<AssertDetail>` of host-side failures
     // (model unavailable, universal invariant violation, orphan
     // raw outputs) for the test verdict to fold in.
+    #[cfg(feature = "llm")]
     let host_extract_failures = host_side_llm_extract(&mut payload_metrics, &raw_outputs);
+    #[cfg(not(feature = "llm"))]
+    let host_extract_failures: Vec<crate::assert::AssertDetail> = Vec::new();
 
     // Gate-skip on a post_vm `HostSkipRequest`: a host-side callback
     // determined the run is inconclusive (the VM could not produce the
@@ -6450,6 +6454,7 @@ mod tests {
     /// "bounds run only on extracted metrics" contract: a regression
     /// that ran bounds on the empty placeholder would falsely
     /// flag every offline-gated test as a min_count violation.
+    #[cfg(feature = "llm")]
     #[test]
     fn host_side_llm_extract_offline_gate_skips_bounds_check() {
         let _env_lock = lock_env();
@@ -6504,6 +6509,7 @@ mod tests {
     // pipeline is exercised by the integration test
     // `llm_extract_e2e_test.rs`.
 
+    #[cfg(feature = "llm")]
     fn empty_raw(payload_index: usize) -> crate::test_support::RawPayloadOutput {
         crate::test_support::RawPayloadOutput {
             payload_index,
@@ -6515,6 +6521,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "llm")]
     fn empty_pm(payload_index: usize) -> crate::test_support::PayloadMetrics {
         crate::test_support::PayloadMetrics {
             payload_index,
@@ -6526,6 +6533,7 @@ mod tests {
     /// Empty raw outputs slice — the function returns immediately
     /// without examining `payload_metrics` or hitting the model.
     /// Pins the no-LlmExtract-payloads happy path.
+    #[cfg(feature = "llm")]
     #[test]
     fn host_side_llm_extract_empty_raw_outputs_returns_no_failures() {
         let mut pm = vec![empty_pm(0), empty_pm(1)];
@@ -6545,6 +6553,7 @@ mod tests {
     /// orphan-raw detail (from the pairing loop) AND the
     /// orphan-PM detail (from the post-loop scan). Pin both so a
     /// regression that drops either path surfaces here.
+    #[cfg(feature = "llm")]
     #[test]
     fn host_side_llm_extract_orphan_raw_output_surfaces_pairing_failure() {
         // PayloadMetrics has payload_index=0; raw output claims
@@ -6584,6 +6593,7 @@ mod tests {
     /// The empty-metrics PM at payload_index=0 also triggers the
     /// post-pairing orphan-PM scan. So we expect 3 orphan-raw
     /// details + 1 orphan-PM combined detail = 4 total failures.
+    #[cfg(feature = "llm")]
     #[test]
     fn host_side_llm_extract_multiple_orphans_each_surface() {
         let mut pm = vec![empty_pm(0)];
@@ -6630,6 +6640,7 @@ mod tests {
     /// — this is a known false-positive case the scan's own diagnostic
     /// prose calls out, since a Json-with-no-leaves payload looks
     /// identical to a dropped LlmExtract from PayloadMetrics alone.
+    #[cfg(feature = "llm")]
     #[test]
     fn host_side_llm_extract_json_zero_leaves_not_conflated_with_llm_placeholder() {
         let mut pm = vec![empty_pm(5)];
@@ -6676,6 +6687,7 @@ mod tests {
     /// Setup: an LlmExtract pair at index 7 (raw + matching PM)
     /// arrives intact; an additional empty PM at index 99 has no
     /// matching raw. The orphan-PM scan flags index 99.
+    #[cfg(feature = "llm")]
     #[test]
     fn host_side_llm_extract_orphan_pm_with_no_matching_raw_surfaces() {
         // Use orphan raws to keep the matched extraction off the
@@ -6712,6 +6724,7 @@ mod tests {
     /// detail for every empty-metrics PM in an LlmExtract test
     /// (which would false-positive on extraction failures that
     /// legitimately leave metrics empty).
+    #[cfg(feature = "llm")]
     #[test]
     fn host_side_llm_extract_no_orphan_pm_when_all_pms_have_matching_raws() {
         // Two matched pairs. After pairing, both PMs remain empty
@@ -6792,6 +6805,7 @@ mod tests {
     /// cache root rather than relying on the operator's home
     /// having no model entry. The reset clears any
     /// previously-memoized `Ok(model)` slot in `MODEL_CACHE`.
+    #[cfg(feature = "llm")]
     #[test]
     fn host_side_llm_extract_with_empty_streams_no_panic_no_metrics() {
         let _env_lock = lock_env();
@@ -6840,6 +6854,7 @@ mod tests {
     /// leave the test passing with empty metrics — a silent
     /// regression that `stats compare` would only catch days
     /// later as zero-metric runs accumulating in the sidecar.
+    #[cfg(feature = "llm")]
     #[test]
     fn host_side_llm_extract_under_offline_gate_surfaces_actionable_detail() {
         let _env_lock = lock_env();
@@ -6921,6 +6936,7 @@ mod tests {
     /// either a SECOND load-failure detail (if extract_via_llm
     /// re-Err'd) or an extracted-metrics outcome that contradicts
     /// the offline-gate contract.
+    #[cfg(feature = "llm")]
     #[test]
     fn host_side_llm_extract_offline_gate_skips_stderr_fallback() {
         let _env_lock = lock_env();
@@ -6965,6 +6981,7 @@ mod tests {
     /// pair. A regression that bailed after the first failure
     /// (e.g. an `if !failures.is_empty() { return failures }` in
     /// the loop) would surface only one detail.
+    #[cfg(feature = "llm")]
     #[test]
     fn host_side_llm_extract_offline_gate_per_pair_failure_detail() {
         let _env_lock = lock_env();
@@ -7018,6 +7035,7 @@ mod tests {
     /// distinct details — one orphan-pairing and one load-failure.
     /// Pins that the orphan path and the model-failure path are
     /// orthogonal contributors to the failure list.
+    #[cfg(feature = "llm")]
     #[test]
     fn host_side_llm_extract_orphan_and_load_failure_both_surface() {
         let _env_lock = lock_env();

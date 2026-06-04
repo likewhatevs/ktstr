@@ -355,16 +355,23 @@ pub(super) fn cgroup_normalize_skeleton(path: &str) -> (String, String, Vec<Stri
 /// Empty `members` returns `key` — defensive against synthetic
 /// inputs; production builds populate `members` for every
 /// bucket.
+///
+/// When built without the `pretty-labels` feature, the grex
+/// regex-synthesis path is compiled out and the function returns
+/// the join key for every input — same bucket identity, just no
+/// rendered regex.
 pub fn pattern_display_label(key: &str, members: &[String]) -> String {
     if members.len() < 2 {
         return key.to_string();
     }
-    let regex = grex::RegExpBuilder::from(members).build();
-    if regex.len() <= key.len() {
-        regex
-    } else {
-        key.to_string()
+    #[cfg(feature = "pretty-labels")]
+    {
+        let regex = grex::RegExpBuilder::from(members).build();
+        if regex.len() <= key.len() {
+            return regex;
+        }
     }
+    key.to_string()
 }
 
 /// Build the union frequency map for pattern-aware grouping

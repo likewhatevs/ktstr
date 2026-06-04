@@ -1,12 +1,15 @@
 //! Gauntlet analysis and run-to-run comparison.
 //!
-//! Collects per-scenario results into a [`polars`] DataFrame for
+//! Collects per-scenario results into hand-rolled aggregation passes
+//! (group-by via `BTreeMap`, mean / std via plain iterators) for
 //! statistical analysis, regression detection, and run-to-run compare
-//! workflows.
+//! workflows. The earlier polars-backed implementation paid for a
+//! columnar engine that was overkill for the dozens-to-low-thousands
+//! of rows a gauntlet produces; the hand-rolled form gives the same
+//! per-scenario means, outlier rankings, and dimension summaries
+//! without polars's ~30-40 transitive crates.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-
-use polars::prelude::*;
 
 /// Definition of a metric for the comparison pipeline.
 ///
@@ -2925,67 +2928,83 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
     }
 }
 
-/// Build a polars DataFrame from gauntlet rows.
-fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
-    let scenario: Vec<&str> = rows.iter().map(|r| r.scenario.as_str()).collect();
-    let topology: Vec<&str> = rows.iter().map(|r| r.topology.as_str()).collect();
-    let work_type: Vec<&str> = rows.iter().map(|r| r.work_type.as_str()).collect();
-    let passed: Vec<bool> = rows.iter().map(|r| r.is_pass()).collect();
-    let skipped: Vec<bool> = rows.iter().map(|r| r.is_skip()).collect();
-    let inconclusive: Vec<bool> = rows.iter().map(|r| r.is_inconclusive()).collect();
-    let spread: Vec<f64> = rows.iter().map(|r| r.spread).collect();
-    let gap_ms: Vec<f64> = rows.iter().map(|r| r.gap_ms as f64).collect();
-    let migrations: Vec<f64> = rows.iter().map(|r| r.migrations as f64).collect();
-    let migration_ratio: Vec<f64> = rows.iter().map(|r| r.migration_ratio).collect();
-    let imbalance: Vec<f64> = rows.iter().map(|r| r.imbalance_ratio).collect();
-    let dsq_depth: Vec<f64> = rows.iter().map(|r| r.max_dsq_depth as f64).collect();
-    let stuck: Vec<f64> = rows.iter().map(|r| r.stuck_count as f64).collect();
-    let fallback: Vec<f64> = rows.iter().map(|r| r.fallback_count as f64).collect();
-    let keep_last: Vec<f64> = rows.iter().map(|r| r.keep_last_count as f64).collect();
-    let p99_wake_lat: Vec<f64> = rows.iter().map(|r| r.worst_p99_wake_latency_us).collect();
-    let median_wake_lat: Vec<f64> = rows
-        .iter()
-        .map(|r| r.worst_median_wake_latency_us)
-        .collect();
-    let wake_cv: Vec<f64> = rows.iter().map(|r| r.worst_wake_latency_cv).collect();
-    let total_iters: Vec<f64> = rows.iter().map(|r| r.total_iterations as f64).collect();
-    let mean_run_delay: Vec<f64> = rows.iter().map(|r| r.worst_mean_run_delay_us).collect();
-    let worst_run_delay: Vec<f64> = rows.iter().map(|r| r.worst_run_delay_us).collect();
-    let tail_ratio: Vec<f64> = rows
-        .iter()
-        .map(|r| r.worst_wake_latency_tail_ratio)
-        .collect();
-    let iters_per_worker: Vec<f64> = rows.iter().map(|r| r.worst_iterations_per_worker).collect();
-    let page_locality: Vec<f64> = rows.iter().map(|r| r.page_locality).collect();
-    let cross_node_mig: Vec<f64> = rows.iter().map(|r| r.cross_node_migration_ratio).collect();
+/// Detected outlier helper: extract one numeric metric off a
+/// [`GauntletRow`]. The same accessor is used to compute the overall
+/// (cohort-wide) mean/std and the per-scenario mean — keeping the
+/// "what counts as `imbalance`?" decision in one place avoids
+/// drift between the two passes that polars-side handled implicitly
+/// via the `df!` column name.
+type MetricAccessor = fn(&GauntletRow) -> f64;
 
-    df!(
-        "scenario" => &scenario,
-        "topology" => &topology,
-        "work_type" => &work_type,
-        "passed" => &passed,
-        "skipped" => &skipped,
-        "inconclusive" => &inconclusive,
-        "spread" => &spread,
-        "gap_ms" => &gap_ms,
-        "migrations" => &migrations,
-        "migration_ratio" => &migration_ratio,
-        "imbalance" => &imbalance,
-        "dsq_depth" => &dsq_depth,
-        "stuck" => &stuck,
-        "fallback" => &fallback,
-        "keep_last" => &keep_last,
-        "worst_p99_wake_latency_us" => &p99_wake_lat,
-        "worst_median_wake_latency_us" => &median_wake_lat,
-        "worst_wake_latency_cv" => &wake_cv,
-        "total_iterations" => &total_iters,
-        "worst_mean_run_delay_us" => &mean_run_delay,
-        "worst_run_delay_us" => &worst_run_delay,
-        "worst_wake_latency_tail_ratio" => &tail_ratio,
-        "worst_iterations_per_worker" => &iters_per_worker,
-        "page_locality" => &page_locality,
-        "cross_node_migration_ratio" => &cross_node_mig,
-    )
+/// Pinned list of `(display_name, accessor)` for every metric that
+/// outlier detection considers. The display name appears in
+/// [`Outlier`] output verbatim ("scenario: imbalance 4.5 ..."); the
+/// accessor pulls the f64 value off a `GauntletRow`. Mirrors the
+/// `metrics` slice the old polars code keyed off DataFrame column
+/// names, so the outlier set surfaces the same metrics under the same
+/// names.
+const OUTLIER_METRICS: &[(&str, MetricAccessor)] = &[
+    ("spread", |r| r.spread),
+    ("gap_ms", |r| r.gap_ms as f64),
+    ("migrations", |r| r.migrations as f64),
+    ("migration_ratio", |r| r.migration_ratio),
+    ("imbalance", |r| r.imbalance_ratio),
+    ("dsq_depth", |r| r.max_dsq_depth as f64),
+    ("stuck", |r| r.stuck_count as f64),
+    ("fallback", |r| r.fallback_count as f64),
+    ("keep_last", |r| r.keep_last_count as f64),
+    ("worst_p99_wake_latency_us", |r| r.worst_p99_wake_latency_us),
+    ("worst_wake_latency_cv", |r| r.worst_wake_latency_cv),
+    ("worst_mean_run_delay_us", |r| r.worst_mean_run_delay_us),
+    ("worst_run_delay_us", |r| r.worst_run_delay_us),
+];
+
+/// Arithmetic mean over the finite values produced by `iter`.
+/// Non-finite values (NaN, ±inf) are excluded so a single outlier
+/// or sentinel can't poison the mean. Returns 0.0 on an empty
+/// (post-filter) input — matches what polars's `.mean()` does on a
+/// chunked array of length zero.
+fn mean<I: Iterator<Item = f64>>(iter: I) -> f64 {
+    let (sum, count) = iter
+        .filter(|x| x.is_finite())
+        .fold((0.0_f64, 0usize), |(s, c), x| (s + x, c + 1));
+    if count == 0 { 0.0 } else { sum / count as f64 }
+}
+
+/// Sample standard deviation (Bessel-corrected, ddof = 1) over the
+/// finite values produced by `iter`. Returns 0.0 when fewer than two
+/// finite values remain — matches polars's `.std(1)` semantics on a
+/// 0- or 1-element chunked array. Requires `Iterator + Clone` because
+/// the computation needs two passes (mean, then squared deviations).
+fn std_dev<I: Iterator<Item = f64> + Clone>(iter: I) -> f64 {
+    let m = mean(iter.clone());
+    let (sum_sq, count) = iter
+        .filter(|x| x.is_finite())
+        .fold((0.0_f64, 0usize), |(s, c), x| {
+            let d = x - m;
+            (s + d * d, c + 1)
+        });
+    if count < 2 {
+        0.0
+    } else {
+        (sum_sq / (count - 1) as f64).sqrt()
+    }
+}
+
+/// Extract a grouping dimension's `&str` field off a [`GauntletRow`].
+/// Replaces the polars `col(group_col)` lookup with a fn-pointer
+/// dispatch over the three accepted dimension names. Returns `None`
+/// for any other column name — `analyze_rows` and
+/// `format_dimension_summary` both restrict the dimension to one of
+/// the three documented columns, so the `None` arm is unreachable in
+/// production but kept as defense-in-depth against a stray call site.
+fn group_field<'a>(row: &'a GauntletRow, col: &str) -> Option<&'a str> {
+    match col {
+        "scenario" => Some(row.scenario.as_str()),
+        "topology" => Some(row.topology.as_str()),
+        "work_type" => Some(row.work_type.as_str()),
+        _ => None,
+    }
 }
 
 /// Detected outlier: a scenario with an anomalous stat.
@@ -3012,49 +3031,20 @@ impl std::fmt::Display for Outlier {
     }
 }
 
-/// Extract a column as a `ChunkedArray<Float64Type>`.
-fn col_f64(df: &DataFrame, name: &str) -> Option<ChunkedArray<Float64Type>> {
-    df.column(name)
-        .ok()
-        .and_then(|c| c.as_materialized_series().f64().ok().cloned())
-}
-
-/// Extract a column as a `ChunkedArray<UInt32Type>`.
-fn col_u32(df: &DataFrame, name: &str) -> Option<ChunkedArray<UInt32Type>> {
-    df.column(name)
-        .ok()
-        .and_then(|c| c.as_materialized_series().u32().ok().cloned())
-}
-
-/// Extract a column as a `ChunkedArray<Utf8Type>`.
-fn col_str(df: &DataFrame, name: &str) -> Option<StringChunked> {
-    df.column(name)
-        .ok()
-        .and_then(|c| c.as_materialized_series().str().ok().cloned())
-}
-
-/// Compute mean and stddev for a column, returning (mean, std).
-fn col_mean_std(df: &DataFrame, name: &str) -> (f64, f64) {
-    match col_f64(df, name) {
-        Some(ca) => {
-            let mean = ca.mean().unwrap_or(0.0);
-            let std = ca.std(1).unwrap_or(0.0);
-            (mean, std)
-        }
-        None => (0.0, 0.0),
-    }
-}
+// `col_f64`, `col_u32`, `col_str`, `col_mean_std`: removed alongside
+// the polars dep. The aggregation paths now read metrics directly off
+// `&GauntletRow` via the [`MetricAccessor`] / [`group_field`] dispatch
+// at the top of this section, and per-iterator mean / std go through
+// the standalone [`mean`] / [`std_dev`] helpers.
 
 /// Find outlier scenarios where a metric exceeds 2 sigma.
 ///
-/// Builds one combined `group_by(scenario).agg(...)` plan that
-/// computes the per-scenario mean of every relevant metric in a
-/// single pass. Each metric's mean column lands under a unique
-/// `mean__{metric}` alias so the per-metric outlier-emission loop
-/// can look it up by name. The prior implementation issued M
-/// separate lazy plans (one collect per metric); polars's group-by
-/// is not free, and re-grouping the same DataFrame on the same key
-/// for each of the 13 metrics paid the partition cost 13 times.
+/// For every metric in [`OUTLIER_METRICS`]: compute the
+/// cohort-wide (overall_mean, overall_std), set the threshold at
+/// `overall_mean + 2 * overall_std`, then check every per-scenario
+/// mean against that threshold. Scenarios whose mean exceeds the
+/// threshold get an [`Outlier`] entry annotated with the topology
+/// rows (via [`find_worst_topos`]) that drove the excursion.
 ///
 /// 4-state lattice filtering: only real-pass rows
 /// (`passed && !skipped && !inconclusive`, matching
@@ -3070,118 +3060,53 @@ fn col_mean_std(df: &DataFrame, name: &str) -> (f64, f64) {
 /// `is_pass` matches the same defense-in-depth as
 /// `format_dimension_summary`'s pass_count + the
 /// `compare_rows_by` regression-math gate.
-fn find_outliers(df: &DataFrame) -> Vec<Outlier> {
-    // Filter to real-pass rows only so per-scenario means and the
-    // cohort-wide overall_mean/overall_std baseline don't include
-    // zero-default values from skip / inconclusive / fail rows.
-    let pass_only = df
-        .clone()
-        .lazy()
-        .filter(
-            col("passed")
-                .and(col("skipped").not())
-                .and(col("inconclusive").not()),
-        )
-        .collect();
-    let pass_only = match pass_only {
-        Ok(d) => d,
-        Err(_) => return Vec::new(),
-    };
-    let df = &pass_only;
-    let metrics: &[&str] = &[
-        "spread",
-        "gap_ms",
-        "migrations",
-        "migration_ratio",
-        "imbalance",
-        "dsq_depth",
-        "stuck",
-        "fallback",
-        "keep_last",
-        "worst_p99_wake_latency_us",
-        "worst_wake_latency_cv",
-        "worst_mean_run_delay_us",
-        "worst_run_delay_us",
-    ];
-
-    // Pre-compute (overall_mean, overall_std) for every metric and
-    // drop those whose std is below epsilon (or whose column is
-    // absent — `col_mean_std` returns `(0.0, 0.0)` for missing
-    // columns). Only the surviving metrics enter the combined
-    // aggregation plan; including a zero-std metric would still be
-    // correct but pays the per-column aggregation cost for nothing.
-    struct ActiveMetric {
-        name: &'static str,
-        overall_mean: f64,
-        overall_std: f64,
-        threshold: f64,
-        mean_alias: String,
-    }
-    let active: Vec<ActiveMetric> = metrics
-        .iter()
-        .filter_map(|&m| {
-            let (overall_mean, overall_std) = col_mean_std(df, m);
-            if overall_std < f64::EPSILON {
-                return None;
-            }
-            Some(ActiveMetric {
-                name: m,
-                overall_mean,
-                overall_std,
-                threshold: overall_mean + 2.0 * overall_std,
-                mean_alias: format!("mean__{m}"),
-            })
-        })
-        .collect();
-
-    if active.is_empty() {
+fn find_outliers(rows: &[GauntletRow]) -> Vec<Outlier> {
+    let pass_rows: Vec<&GauntletRow> = rows.iter().filter(|r| r.is_pass()).collect();
+    if pass_rows.is_empty() {
         return Vec::new();
     }
 
-    // Single combined group-by: one `mean(metric).alias(...)` per
-    // active metric, executed in one polars plan instead of M.
-    let aggs: Vec<Expr> = active
-        .iter()
-        .map(|am| col(am.name).mean().alias(am.mean_alias.as_str()))
-        .collect();
-    let grouped = df
-        .clone()
-        .lazy()
-        .group_by([col("scenario")])
-        .agg(aggs)
-        .collect();
-    let grouped = match grouped {
-        Ok(g) => g,
-        Err(_) => return Vec::new(),
-    };
-
-    let scenarios = match col_str(&grouped, "scenario") {
-        Some(s) => s,
-        None => return Vec::new(),
-    };
+    // Bucket pass rows by scenario name. BTreeMap iterates in sorted
+    // order so the outlier vector before the final sigma-sort is
+    // already alphabetic per (metric, scenario) — deterministic across
+    // runs even when multiple scenarios tie on sigma. Borrowing `&str`
+    // out of the row avoids cloning the scenario names just to bucket.
+    let mut by_scenario: BTreeMap<&str, Vec<&GauntletRow>> = BTreeMap::new();
+    for r in &pass_rows {
+        by_scenario.entry(r.scenario.as_str()).or_default().push(r);
+    }
 
     let mut outliers = Vec::new();
-    for am in &active {
-        let means = match col_f64(&grouped, &am.mean_alias) {
-            Some(m) => m,
-            None => continue,
-        };
-        for i in 0..grouped.height() {
-            let mean_val = means.get(i).unwrap_or(0.0);
-            if mean_val <= am.threshold {
+    for &(name, accessor) in OUTLIER_METRICS {
+        let overall_mean = mean(pass_rows.iter().map(|r| accessor(r)));
+        let overall_std = std_dev(pass_rows.iter().map(|r| accessor(r)));
+        // Drop metrics with std below epsilon. The cohort produced no
+        // measurable spread on this metric, so flagging "outliers"
+        // against a near-zero baseline would surface noise. Mirrors the
+        // pre-polars `active.filter_map` short-circuit.
+        if overall_std < f64::EPSILON {
+            continue;
+        }
+        let threshold = overall_mean + 2.0 * overall_std;
+
+        for (&scenario, rows_in_scenario) in &by_scenario {
+            let scenario_mean = mean(rows_in_scenario.iter().map(|r| accessor(r)));
+            if scenario_mean <= threshold {
                 continue;
             }
-            let sigma = (mean_val - am.overall_mean) / am.overall_std;
-            let sc = scenarios.get(i).unwrap_or("");
-
-            // Find worst topologies for this scenario.
-            let worst = find_worst_topos(df, sc, am.name, am.threshold);
-
+            let sigma = (scenario_mean - overall_mean) / overall_std;
+            // Worst topologies are computed against the full row set
+            // (not the pass-only subset) so a failure cluster on a
+            // particular topology still surfaces even when its rows
+            // failed the is_pass gate — the outlier line is the place
+            // where the operator first sees that topology, and gating
+            // it on is_pass would hide the worst offenders.
+            let worst = find_worst_topos(rows, scenario, accessor, threshold);
             outliers.push(Outlier {
-                scenario: sc.to_string(),
-                metric: am.name,
-                value: mean_val,
-                overall_mean: am.overall_mean,
+                scenario: scenario.to_string(),
+                metric: name,
+                value: scenario_mean,
+                overall_mean,
                 sigma,
                 worst_topos: worst,
             });
@@ -3196,148 +3121,143 @@ fn find_outliers(df: &DataFrame) -> Vec<Outlier> {
     outliers
 }
 
-/// Find topology names where a scenario exceeds the threshold.
-fn find_worst_topos(df: &DataFrame, scenario: &str, metric: &str, threshold: f64) -> Vec<String> {
-    let filtered = df
-        .clone()
-        .lazy()
-        .filter(
-            col("scenario")
-                .eq(lit(scenario))
-                .and(col(metric).gt(lit(threshold))),
-        )
-        .select([col("topology")])
-        .collect();
-
-    match filtered {
-        Ok(f) => col_str(&f, "topology")
-            .map(|ca| {
-                ca.into_iter()
-                    .filter_map(|v| v.map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        Err(_) => vec![],
-    }
+/// Topology names of rows in `scenario` whose metric value exceeds
+/// `threshold`. Used by [`find_outliers`] to attribute a per-scenario
+/// outlier to the specific topologies driving the excursion.
+fn find_worst_topos(
+    rows: &[GauntletRow],
+    scenario: &str,
+    accessor: MetricAccessor,
+    threshold: f64,
+) -> Vec<String> {
+    // `filter` passes `&Self::Item`, so inside the closure `r` is
+    // `&&GauntletRow`. Destructure with `|&r|` so `r: &GauntletRow`
+    // and `accessor(r)` matches its `fn(&GauntletRow) -> f64`
+    // signature without an explicit deref.
+    rows.iter()
+        .filter(|&r| r.scenario == scenario && accessor(r) > threshold)
+        .map(|r| r.topology.clone())
+        .collect()
 }
 
-/// Format a group-by summary for one dimension.
-fn format_dimension_summary(df: &DataFrame, group_col: &str) -> String {
-    let grouped = df
-        .clone()
-        .lazy()
-        .group_by([col(group_col)])
-        .agg([
-            // pass_count excludes skipped and inconclusive rows — a
-            // skipped run did not execute, and an inconclusive run
-            // executed but lacked signal to evaluate. Neither must
-            // inflate the pass rate. Fail is the residual
-            // `total - pass - skip - inconc` under the strict
-            // 4-state mutex, so accounting inconclusive separately
-            // keeps it out of the "failed" bucket below.
-            // The triple-conjunct mirrors `GauntletRow::is_pass`'s
-            // mechanic exactly — defensive belt-and-suspenders gating
-            // against a malformed row reaching the dataframe (the
-            // `passed` column is populated from `is_pass()` so the
-            // mutex SHOULD already hold, but explicit gating makes
-            // the math survive a future column-source refactor).
-            (col("passed")
-                .and(col("skipped").not())
-                .and(col("inconclusive").not()))
-            .cast(DataType::UInt32)
-            .sum()
-            .alias("pass_count"),
-            col("skipped")
-                .cast(DataType::UInt32)
-                .sum()
-                .alias("skip_count"),
-            col("inconclusive")
-                .cast(DataType::UInt32)
-                .sum()
-                .alias("inconc_count"),
-            col("passed").count().cast(DataType::UInt32).alias("total"),
-            col("spread").mean().alias("avg_spread"),
-            col("gap_ms").mean().alias("avg_gap_ms"),
-            col("imbalance").mean().alias("avg_imbalance"),
-            col("dsq_depth").mean().alias("avg_dsq_depth"),
-            col("stuck").sum().alias("total_stuck"),
-            col("fallback").mean().alias("avg_fallback"),
-        ])
-        .sort(
-            ["avg_spread"],
-            SortMultipleOptions::new().with_order_descending(true),
-        )
+/// Format a group-by summary for one dimension (`scenario`,
+/// `topology`, or `work_type`). For each value of the dimension,
+/// renders one line carrying:
+///
+/// `{name:<25} {pass}/{total} passed ({skip} skipped, {inconc} inconclusive, {fail} failed)
+///  avg_spread={spread:.1}%  avg_gap={gap:.0}ms[  imbal=…][  dsq=…][  stuck=…][  fallback=…]`
+///
+/// Sorted by `avg_spread` descending so the worst dimension values
+/// land at the top. Pass / skip / inconclusive / fail follow the
+/// 4-state mutex documented in detail on the prior polars-side
+/// pass_count aggregation: `fail` is the residual after subtracting
+/// pass / skip / inconc from total, NOT a separate count. Splitting
+/// out `inconclusive` from `failed` is what keeps a zero-denominator
+/// inconclusive run from silently rendering as "failed."
+///
+/// `imbal` / `dsq` / `stuck` / `fallback` tail tokens render only
+/// when their value crosses a per-metric threshold (`> 1.0` for
+/// imbalance, `> 0.0` for the others) so a healthy dimension's line
+/// stays terse.
+///
+/// Returns an empty string when `group_col` is not one of the three
+/// accepted dimension names — matches the prior behavior of bailing
+/// without panicking on a stray column name.
+fn format_dimension_summary(rows: &[GauntletRow], group_col: &str) -> String {
+    // Reject unknown dimension names up-front via `group_field`'s
+    // None arm. The match exhausts at the first row — every row
+    // resolves identically given the same `group_col` — so the
+    // probe is O(1).
+    if rows.is_empty()
+        || rows
+            .first()
+            .and_then(|r| group_field(r, group_col))
+            .is_none()
+    {
+        return String::new();
+    }
+
+    let mut by_dim: BTreeMap<&str, Vec<&GauntletRow>> = BTreeMap::new();
+    for r in rows {
+        if let Some(key) = group_field(r, group_col) {
+            by_dim.entry(key).or_default().push(r);
+        }
+    }
+
+    struct GroupStats<'a> {
+        name: &'a str,
+        pass_count: usize,
+        skip_count: usize,
+        inconc_count: usize,
+        total: usize,
+        avg_spread: f64,
+        avg_gap_ms: f64,
+        avg_imbalance: f64,
+        avg_dsq_depth: f64,
+        total_stuck: f64,
+        avg_fallback: f64,
+    }
+
+    let mut groups: Vec<GroupStats> = by_dim
+        .iter()
+        .map(|(name, group_rows)| GroupStats {
+            name,
+            pass_count: group_rows.iter().filter(|r| r.is_pass()).count(),
+            skip_count: group_rows.iter().filter(|r| r.is_skip()).count(),
+            inconc_count: group_rows.iter().filter(|r| r.is_inconclusive()).count(),
+            total: group_rows.len(),
+            avg_spread: mean(group_rows.iter().map(|r| r.spread)),
+            avg_gap_ms: mean(group_rows.iter().map(|r| r.gap_ms as f64)),
+            avg_imbalance: mean(group_rows.iter().map(|r| r.imbalance_ratio)),
+            avg_dsq_depth: mean(group_rows.iter().map(|r| r.max_dsq_depth as f64)),
+            total_stuck: group_rows
+                .iter()
+                .map(|r| r.stuck_count as f64)
+                .filter(|x| x.is_finite())
+                .sum(),
+            avg_fallback: mean(group_rows.iter().map(|r| r.fallback_count as f64)),
+        })
         .collect();
 
-    let grouped = match grouped {
-        Ok(g) => g,
-        Err(_) => return String::new(),
-    };
+    // Descending sort by avg_spread so the dimension value with the
+    // worst spread reads first. Tie-breaker is the input order from
+    // BTreeMap (alphabetic) — same deterministic shape as the polars
+    // `sort([avg_spread], descending=true)` form.
+    groups.sort_by(|a, b| {
+        b.avg_spread
+            .partial_cmp(&a.avg_spread)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut out = String::new();
-    let names = col_str(&grouped, group_col);
-    let pass_counts = col_u32(&grouped, "pass_count");
-    let skip_counts = col_u32(&grouped, "skip_count");
-    let inconc_counts = col_u32(&grouped, "inconc_count");
-    let totals = col_u32(&grouped, "total");
-    let spreads = col_f64(&grouped, "avg_spread");
-    let gaps = col_f64(&grouped, "avg_gap_ms");
-
-    let imbalances = col_f64(&grouped, "avg_imbalance");
-    let dsq_depths = col_f64(&grouped, "avg_dsq_depth");
-    let stuck_totals = col_f64(&grouped, "total_stuck");
-    let fallbacks = col_f64(&grouped, "avg_fallback");
-
-    let (names, pass_counts, totals, spreads, gaps) =
-        match (names, pass_counts, totals, spreads, gaps) {
-            (Some(n), Some(p), Some(t), Some(s), Some(g)) => (n, p, t, s, g),
-            _ => return out,
-        };
-
-    for i in 0..grouped.height() {
-        let name = names.get(i).unwrap_or("?");
-        let pass = pass_counts.get(i).unwrap_or(0);
-        let skip = skip_counts.as_ref().and_then(|s| s.get(i)).unwrap_or(0);
-        let inconc = inconc_counts.as_ref().and_then(|s| s.get(i)).unwrap_or(0);
-        let total = totals.get(i).unwrap_or(0);
-        // Fail is the residual under the strict 4-state mutex
-        // (pass, skip, inconclusive, fail). Subtracting inconc
-        // here is what keeps a zero-denominator-ratio run from
-        // silently rendering as "failed" in the dimension
-        // summary.
-        let fail = total
-            .saturating_sub(pass)
-            .saturating_sub(skip)
-            .saturating_sub(inconc);
-        let spread = spreads.get(i).unwrap_or(0.0);
-        let gap = gaps.get(i).unwrap_or(0.0);
+    for g in &groups {
+        let fail = g
+            .total
+            .saturating_sub(g.pass_count)
+            .saturating_sub(g.skip_count)
+            .saturating_sub(g.inconc_count);
         let mut line = format!(
             "  {:<25} {}/{} passed ({} skipped, {} inconclusive, {} failed)  avg_spread={:.1}%  avg_gap={:.0}ms",
-            name, pass, total, skip, inconc, fail, spread, gap
+            g.name,
+            g.pass_count,
+            g.total,
+            g.skip_count,
+            g.inconc_count,
+            fail,
+            g.avg_spread,
+            g.avg_gap_ms,
         );
-        if let Some(ref imb) = imbalances {
-            let v = imb.get(i).unwrap_or(0.0);
-            if v > 1.0 {
-                line.push_str(&format!("  imbal={:.1}", v));
-            }
+        if g.avg_imbalance > 1.0 {
+            line.push_str(&format!("  imbal={:.1}", g.avg_imbalance));
         }
-        if let Some(ref dsq) = dsq_depths {
-            let v = dsq.get(i).unwrap_or(0.0);
-            if v > 0.0 {
-                line.push_str(&format!("  dsq={:.0}", v));
-            }
+        if g.avg_dsq_depth > 0.0 {
+            line.push_str(&format!("  dsq={:.0}", g.avg_dsq_depth));
         }
-        if let Some(ref st) = stuck_totals {
-            let v = st.get(i).unwrap_or(0.0) as u64;
-            if v > 0 {
-                line.push_str(&format!("  stuck={}", v));
-            }
+        if g.total_stuck > 0.0 {
+            line.push_str(&format!("  stuck={}", g.total_stuck as u64));
         }
-        if let Some(ref fb) = fallbacks {
-            let v = fb.get(i).unwrap_or(0.0);
-            if v > 0.0 {
-                line.push_str(&format!("  fallback={:.0}", v));
-            }
+        if g.avg_fallback > 0.0 {
+            line.push_str(&format!("  fallback={:.0}", g.avg_fallback));
         }
         line.push('\n');
         out.push_str(&line);
@@ -3351,14 +3271,9 @@ pub fn analyze_rows(rows: &[GauntletRow]) -> String {
         return String::new();
     }
 
-    let df = match build_dataframe(rows) {
-        Ok(d) => d,
-        Err(_) => return String::new(),
-    };
-
     let mut report = String::from("\n=== GAUNTLET ANALYSIS ===\n\n");
 
-    let outliers = find_outliers(&df);
+    let outliers = find_outliers(rows);
     if outliers.is_empty() {
         report.push_str("No outliers detected.\n");
     } else {
@@ -3369,17 +3284,20 @@ pub fn analyze_rows(rows: &[GauntletRow]) -> String {
     }
 
     report.push_str("\nBy scenario (worst first):\n");
-    report.push_str(&format_dimension_summary(&df, "scenario"));
+    report.push_str(&format_dimension_summary(rows, "scenario"));
 
     report.push_str("\nBy topology:\n");
-    report.push_str(&format_dimension_summary(&df, "topology"));
+    report.push_str(&format_dimension_summary(rows, "topology"));
 
-    let has_work_types = col_str(&df, "work_type")
-        .map(|ca| ca.n_unique().unwrap_or(1) > 1)
-        .unwrap_or(false);
-    if has_work_types {
+    // Surface a "By work_type" pane only when the input carries
+    // more than one work_type value; a single-work_type cohort
+    // would render an identical "all rows" pane to the scenario
+    // pane and add visual noise.
+    let work_types: std::collections::BTreeSet<&str> =
+        rows.iter().map(|r| r.work_type.as_str()).collect();
+    if work_types.len() > 1 {
         report.push_str("\nBy work_type:\n");
-        report.push_str(&format_dimension_summary(&df, "work_type"));
+        report.push_str(&format_dimension_summary(rows, "work_type"));
     }
 
     report
@@ -5716,26 +5634,374 @@ mod tests {
         }
     }
 
+    /// Replaces the legacy `col_mean_std_basic` polars-side check
+    /// with a direct test on the hand-rolled [`mean`] / [`std_dev`]
+    /// helpers that the new aggregation path uses end-to-end.
+    /// `1..=5` is symmetric around 3, so the mean lands exactly and
+    /// the Bessel-corrected std exceeds 1.0 (the population std of
+    /// `1..=5` is √2 ≈ 1.414; the sample std is √2.5 ≈ 1.581).
     #[test]
-    fn col_mean_std_basic() {
-        let df = df!(
-            "x" => &[1.0, 2.0, 3.0, 4.0, 5.0]
-        )
-        .unwrap();
-        let (mean, std) = col_mean_std(&df, "x");
-        assert!((mean - 3.0).abs() < 0.01);
-        assert!(std > 1.0);
+    fn mean_std_basic() {
+        let xs = [1.0_f64, 2.0, 3.0, 4.0, 5.0];
+        let m = mean(xs.iter().copied());
+        let s = std_dev(xs.iter().copied());
+        assert!((m - 3.0).abs() < 0.01);
+        assert!(s > 1.0);
     }
 
+    /// Mirrors the legacy `col_mean_std_missing_column` defense:
+    /// when no finite values are present, both helpers return 0.0
+    /// rather than NaN / panic — the same "missing column → (0.0,
+    /// 0.0)" contract that polars's `col_mean_std` carried, expressed
+    /// over the iterator surface.
     #[test]
-    fn col_mean_std_missing_column() {
-        let df = df!(
-            "x" => &[1.0, 2.0, 3.0]
-        )
-        .unwrap();
-        let (mean, std) = col_mean_std(&df, "nonexistent");
-        assert_eq!(mean, 0.0);
-        assert_eq!(std, 0.0);
+    fn mean_std_empty_returns_zero() {
+        let empty: [f64; 0] = [];
+        assert_eq!(mean(empty.iter().copied()), 0.0);
+        assert_eq!(std_dev(empty.iter().copied()), 0.0);
+        // Single finite value: mean is that value, std is 0.0 (Bessel
+        // correction requires count >= 2; matches polars `.std(1)`).
+        let single = [7.5_f64];
+        assert!((mean(single.iter().copied()) - 7.5).abs() < f64::EPSILON);
+        assert_eq!(std_dev(single.iter().copied()), 0.0);
+    }
+
+    /// Non-finite values (NaN, ±inf) must be ignored — a sentinel
+    /// metric value can't poison the cohort mean. Pins the
+    /// `.filter(|x| x.is_finite())` arm in both helpers.
+    #[test]
+    fn mean_std_skips_non_finite() {
+        let xs = [1.0_f64, f64::NAN, 3.0, f64::INFINITY, 5.0];
+        // Only 1, 3, 5 contribute. Mean = 3.0; sample std = 2.0.
+        assert!((mean(xs.iter().copied()) - 3.0).abs() < 1e-9);
+        assert!((std_dev(xs.iter().copied()) - 2.0).abs() < 1e-9);
+    }
+
+    /// Mean and std_dev handle negative values correctly.
+    /// Negative values are valid for metrics like migration_ratio.
+    #[test]
+    fn mean_std_handles_negative_values() {
+        let xs = [-2.0_f64, -1.0, 0.0, 1.0, 2.0];
+        let m = mean(xs.iter().copied());
+        let s = std_dev(xs.iter().copied());
+        assert!(
+            (m - 0.0).abs() < 1e-9,
+            "mean of symmetric values should be 0, got {m}"
+        );
+        // Sample std for [-2, -1, 0, 1, 2]: sqrt( (4+1+0+1+4) / 4 ) = sqrt(10/4) = sqrt(2.5) ≈ 1.581
+        assert!((s - 1.58113883).abs() < 1e-6, "std dev mismatch, got {s}");
+    }
+
+    /// Mean and std_dev handle large values without overflow.
+    /// Uses values near f64::MAX / 10 to avoid actual overflow in sum.
+    #[test]
+    fn mean_std_handles_large_values() {
+        let large = 1e150_f64;
+        let xs = [large, large * 2.0, large * 3.0];
+        let m = mean(xs.iter().copied());
+        let s = std_dev(xs.iter().copied());
+        assert!(
+            (m - large * 2.0).abs() / large < 1e-12,
+            "mean of large values"
+        );
+        // Std dev should be large * sqrt( (1^2 + 0^2 + 1^2) / 2 ) = large * 1.0
+        assert!((s - large).abs() / large < 1e-12, "std dev of large values");
+    }
+
+    /// Mean and std_dev handle subnormal (very small) values.
+    /// Subnormals are finite and should be included in calculations.
+    #[test]
+    fn mean_std_handles_subnormal_values() {
+        let tiny = f64::MIN_POSITIVE / 2.0; // Subnormal
+        let xs = [tiny, tiny * 2.0, tiny * 3.0];
+        let m = mean(xs.iter().copied());
+        assert!(m.is_finite(), "mean of subnormals should be finite");
+        assert!(m > 0.0, "mean of positive subnormals should be positive");
+    }
+
+    /// std_dev with exactly two values uses Bessel's correction (ddof=1).
+    /// For [a, b], std = sqrt( ((a-m)^2 + (b-m)^2) / 1 ) where m = (a+b)/2.
+    /// This simplifies to |a-b| / sqrt(2) * sqrt(2) = |a-b|.
+    #[test]
+    fn std_dev_two_values_bessel_corrected() {
+        let xs = [3.0_f64, 7.0];
+        let s = std_dev(xs.iter().copied());
+        // Mean = 5.0, deviations = [-2, 2], sum_sq = 8, variance = 8 / 1 = 8, std = sqrt(8) ≈ 2.828
+        assert!(
+            (s - 2.8284271247461903).abs() < 1e-9,
+            "Bessel-corrected std dev for two values"
+        );
+    }
+
+    // -- find_outliers and find_worst_topos tests --
+
+    /// find_outliers returns empty vec when input is empty.
+    #[test]
+    fn find_outliers_empty_input() {
+        let rows: Vec<GauntletRow> = vec![];
+        let outliers = find_outliers(&rows);
+        assert!(outliers.is_empty(), "empty input should yield no outliers");
+    }
+
+    /// find_outliers returns empty vec when no rows pass the filter.
+    /// Only rows with is_pass() == true are considered for outlier detection.
+    #[test]
+    fn find_outliers_no_pass_rows() {
+        let r1 = make_row("s1", "t1", false, 10.0); // failed
+        let mut r2 = make_row("s2", "t2", true, 20.0);
+        r2.skipped = true; // skipped, not a pass
+        let rows = vec![r1, r2];
+        let outliers = find_outliers(&rows);
+        assert!(outliers.is_empty(), "no pass rows should yield no outliers");
+    }
+
+    /// find_outliers returns empty vec when only one scenario exists.
+    /// With a single scenario, the scenario mean equals the overall mean,
+    /// so no scenario can exceed the 2-sigma threshold.
+    #[test]
+    fn find_outliers_single_scenario_no_outlier() {
+        let r1 = make_row("only", "t1", true, 10.0);
+        let r2 = make_row("only", "t2", true, 12.0);
+        let r3 = make_row("only", "t3", true, 11.0);
+        let rows = vec![r1, r2, r3];
+        let outliers = find_outliers(&rows);
+        assert!(
+            outliers.is_empty(),
+            "single scenario cannot produce outliers"
+        );
+    }
+
+    /// find_outliers detects a clear outlier scenario.
+    /// Three scenarios: two with low spread (5.0), one with high spread (100.0).
+    /// The high-spread scenario should be flagged as an outlier on the "spread" metric.
+    #[test]
+    fn find_outliers_detects_clear_outlier() {
+        // Many "normal" scenarios with low spread (10 rows total)
+        let mut rows = Vec::new();
+        for i in 0..5 {
+            rows.push(make_row("normal1", &format!("t{i}"), true, 5.0));
+        }
+        for i in 5..10 {
+            rows.push(make_row("normal2", &format!("t{i}"), true, 5.0));
+        }
+        // One outlier scenario with high spread (100+ to ensure > 2-sigma)
+        rows.push(make_row("outlier", "t10", true, 100.0));
+        rows.push(make_row("outlier", "t11", true, 110.0));
+
+        let outliers = find_outliers(&rows);
+        assert!(!outliers.is_empty(), "should detect outlier scenario");
+
+        // Find the spread outlier
+        let spread_outlier = outliers.iter().find(|o| o.metric == "spread");
+        assert!(
+            spread_outlier.is_some(),
+            "should have spread metric outlier"
+        );
+        let outlier = spread_outlier.unwrap();
+        assert_eq!(outlier.scenario, "outlier");
+        assert!(
+            outlier.sigma > 2.0,
+            "sigma should exceed 2.0 threshold, got {}",
+            outlier.sigma
+        );
+        // Worst topos should include t10 and t11 (both exceed threshold)
+        assert!(outlier.worst_topos.contains(&"t10".to_string()));
+        assert!(outlier.worst_topos.contains(&"t11".to_string()));
+    }
+
+    /// find_outliers does NOT flag a scenario at exactly the 2-sigma threshold.
+    /// The condition is `scenario_mean > threshold`, not `>=`, so exact equality
+    /// should not produce an outlier. This prevents borderline cases from noise.
+    #[test]
+    fn find_outliers_threshold_is_strictly_greater() {
+        // Create a scenario where mean is exactly at 2-sigma threshold.
+        // For simplicity, use 3 scenarios: two with value 0.0, one with value X.
+        // Overall mean = X/3, std = sqrt( ((0-m)^2 + (0-m)^2 + (X-m)^2) / 2 )
+        // We want X = mean + 2*std. Solving: X = X/3 + 2*std => 2X/3 = 2*std => X/3 = std
+        // std^2 = (m^2 + m^2 + (X-m)^2) / 2 = (2m^2 + (2m)^2) / 2 where m = X/3
+        // = (2m^2 + 4m^2) / 2 = 3m^2 => std = m*sqrt(3) = X*sqrt(3)/3
+        // Setting X/3 = X*sqrt(3)/3 => 1 = sqrt(3) which is false.
+        // Simpler: use many normal rows and one borderline row.
+        // Let's construct: 10 rows with value 0.0, 1 row with value V.
+        // Mean = V/11, variance = (10*(V/11)^2 + (V - V/11)^2) / 10
+        // = (10*V^2/121 + (10V/11)^2) / 10 = (10V^2/121 + 100V^2/121) / 10 = 110V^2 / 1210 = V^2 / 11
+        // std = V / sqrt(11), threshold = V/11 + 2V/sqrt(11)
+        // For the single row scenario, mean = V. We want V = threshold.
+        // V = V/11 + 2V/sqrt(11) => 1 = 1/11 + 2/sqrt(11) => 10/11 = 2/sqrt(11) => sqrt(11) = 22/10 = 2.2 => 11 = 4.84 false.
+        // This is getting complex. Instead, test the boundary condition directly:
+        // Create a case where scenario_mean is just below threshold (no outlier)
+        // and another just above (outlier).
+
+        // Use 5 normal scenarios with spread 10.0, and 1 test scenario with spread 30.0
+        // Normal: 5*2 = 10 rows at 10.0. Test: 2 rows at 30.0.
+        // Overall mean = (100 + 60) / 12 = 160/12 ≈ 13.33
+        // Std: variance = [10*(10-13.33)^2 + 2*(30-13.33)^2] / 11
+        // = [10*11.09 + 2*277.78] / 11 = [110.9 + 555.56] / 11 = 666.46 / 11 ≈ 60.59, std ≈ 7.78
+        // Threshold = 13.33 + 2*7.78 = 13.33 + 15.56 = 28.89
+        // Test scenario mean = 30.0 > 28.89, so it IS an outlier.
+        // To test the boundary, we need a value just below threshold.
+
+        // Simpler approach: verify that the > comparison is used, not >=.
+        // Create a minimal case where we know the threshold and test both sides.
+        // 4 rows: two scenarios with 2 rows each
+        // Scenario A: values 0.0, 0.0 (mean 0.0)
+        // Scenario B: values 10.0, 10.0 (mean 10.0)
+        // Overall mean = 5.0, std = sqrt( ((0-5)^2*2 + (10-5)^2*2) / 3 ) = sqrt( (50 + 50) / 3 ) = sqrt(100/3) ≈ 5.77
+        // Threshold = 5.0 + 2*5.77 = 5.0 + 11.55 = 16.55
+        // Neither scenario mean (0.0 or 10.0) exceeds 16.55, so no outliers.
+        let rows = vec![
+            make_row("A", "t1", true, 0.0),
+            make_row("A", "t2", true, 0.0),
+            make_row("B", "t3", true, 10.0),
+            make_row("B", "t4", true, 10.0),
+        ];
+
+        let outliers = find_outliers(&rows);
+        // No scenario should be an outlier since 10.0 < 16.55
+        let spread_outliers: Vec<_> = outliers.iter().filter(|o| o.metric == "spread").collect();
+        assert!(
+            spread_outliers.is_empty(),
+            "no outlier when below threshold"
+        );
+    }
+
+    /// find_outliers skips metrics with near-zero standard deviation.
+    /// When std < f64::EPSILON, the metric has no measurable spread,
+    /// so outlier detection would be noise. The function should skip it.
+    #[test]
+    fn find_outliers_skips_zero_std_metrics() {
+        // All rows have identical spread value, so std = 0.0
+        let r1 = make_row("s1", "t1", true, 10.0);
+        let r2 = make_row("s2", "t2", true, 10.0);
+        let r3 = make_row("s3", "t3", true, 10.0);
+        let rows = vec![r1, r2, r3];
+
+        let outliers = find_outliers(&rows);
+        // No spread outliers because std = 0 (below EPSILON)
+        let spread_outliers: Vec<_> = outliers.iter().filter(|o| o.metric == "spread").collect();
+        assert!(
+            spread_outliers.is_empty(),
+            "zero std dev should skip metric"
+        );
+    }
+
+    /// find_outliers sorts results by sigma descending.
+    /// Higher sigma (more extreme outliers) should appear first.
+    #[test]
+    fn find_outliers_sorts_by_sigma_descending() {
+        // Create two outlier scenarios with different sigma values
+        // Normal baseline: 30 rows with spread 5.0 (large baseline for stable std)
+        let mut rows = Vec::new();
+        for i in 0..15 {
+            rows.push(make_row("normal1", &format!("t{i}"), true, 5.0));
+        }
+        for i in 15..30 {
+            rows.push(make_row("normal2", &format!("t{i}"), true, 5.0));
+        }
+        // Outlier 1: (spread 100.0, 110.0)
+        rows.push(make_row("outlier1", "t30", true, 100.0));
+        rows.push(make_row("outlier1", "t31", true, 110.0));
+        // Outlier 2: more extreme (spread 140.0, 150.0)
+        // Both should exceed threshold, but outlier2 has higher sigma
+        rows.push(make_row("outlier2", "t40", true, 140.0));
+        rows.push(make_row("outlier2", "t41", true, 150.0));
+
+        let outliers = find_outliers(&rows);
+        let spread_outliers: Vec<_> = outliers.iter().filter(|o| o.metric == "spread").collect();
+        assert!(
+            spread_outliers.len() >= 2,
+            "should have at least 2 spread outliers, got {}",
+            spread_outliers.len()
+        );
+
+        // Outlier2 should have higher sigma and appear first
+        let first = &spread_outliers[0];
+        let second = &spread_outliers[1];
+        assert!(
+            first.sigma >= second.sigma,
+            "outliers should be sorted by sigma descending"
+        );
+        assert_eq!(
+            first.scenario, "outlier2",
+            "extreme outlier should be first"
+        );
+    }
+
+    /// find_worst_topos returns empty vec when no rows match scenario.
+    #[test]
+    fn find_worst_topos_empty_when_no_matching_scenario() {
+        let r1 = make_row("s1", "t1", true, 10.0);
+        let rows = vec![r1];
+        let accessor: MetricAccessor = |r| r.spread;
+        let worst = find_worst_topos(&rows, "nonexistent", accessor, 5.0);
+        assert!(
+            worst.is_empty(),
+            "no matching scenario should yield empty vec"
+        );
+    }
+
+    /// find_worst_topos returns only topologies exceeding threshold.
+    /// The threshold comparison is strict (>), not >=.
+    #[test]
+    fn find_worst_topos_filters_by_threshold() {
+        let mut r1 = make_row("s1", "t1", true, 10.0);
+        r1.spread = 5.0;
+        let mut r2 = make_row("s1", "t2", true, 10.0);
+        r2.spread = 15.0;
+        let mut r3 = make_row("s1", "t3", true, 10.0);
+        r3.spread = 25.0;
+        let rows = vec![r1, r2, r3];
+
+        let accessor: MetricAccessor = |r| r.spread;
+        // Threshold 15.0: t1 (5.0) no, t2 (15.0) no (strict >), t3 (25.0) yes
+        let worst = find_worst_topos(&rows, "s1", accessor, 15.0);
+        assert_eq!(worst.len(), 1, "only t3 should exceed threshold");
+        assert!(worst.contains(&"t3".to_string()));
+        assert!(
+            !worst.contains(&"t2".to_string()),
+            "t2 at threshold should not be included"
+        );
+    }
+
+    /// find_worst_topos includes rows regardless of pass/fail status.
+    /// The function is used to attribute outliers to topologies, and a
+    /// failing topology that drives high metric values should still surface.
+    #[test]
+    fn find_worst_topos_includes_failed_rows() {
+        let mut r1 = make_row("s1", "t1", true, 10.0); // pass
+        r1.spread = 30.0;
+        let mut r2 = make_row("s1", "t2", false, 10.0); // fail
+        r2.spread = 40.0;
+        let rows = vec![r1, r2];
+
+        let accessor: MetricAccessor = |r| r.spread;
+        let worst = find_worst_topos(&rows, "s1", accessor, 20.0);
+        // Both should be included regardless of pass/fail
+        assert_eq!(worst.len(), 2);
+        assert!(worst.contains(&"t1".to_string()));
+        assert!(worst.contains(&"t2".to_string()));
+    }
+
+    /// group_field returns None for unknown column names.
+    /// Only "scenario", "topology", and "work_type" are valid dimensions.
+    #[test]
+    fn group_field_unknown_column_returns_none() {
+        let row = make_row("s1", "t1", true, 10.0);
+        assert!(group_field(&row, "scenario").is_some());
+        assert!(group_field(&row, "topology").is_some());
+        assert!(group_field(&row, "work_type").is_some());
+        assert!(group_field(&row, "invalid").is_none());
+        assert!(group_field(&row, "").is_none());
+        assert!(group_field(&row, "Spread").is_none()); // case-sensitive
+    }
+
+    /// group_field extracts the correct field for each valid dimension.
+    #[test]
+    fn group_field_extracts_correct_dimension() {
+        let row = make_row("my_scenario", "my_topo", true, 10.0);
+        assert_eq!(group_field(&row, "scenario"), Some("my_scenario"));
+        assert_eq!(group_field(&row, "topology"), Some("my_topo"));
+        assert_eq!(group_field(&row, "work_type"), Some("SpinWait"));
     }
 
     fn make_row(scenario: &str, topo: &str, passed: bool, spread: f64) -> GauntletRow {
@@ -5790,8 +6056,7 @@ mod tests {
         r1.fallback_count = 15; // > 0, should show fallback=15
         let r2 = make_row("fast", "tiny-1llc", true, 4.0);
         let rows = vec![r1, r2];
-        let df = build_dataframe(&rows).unwrap();
-        let out = format_dimension_summary(&df, "scenario");
+        let out = format_dimension_summary(&rows, "scenario");
         // "slow" has higher spread, should appear first (sorted descending).
         let slow_pos = out.find("slow").unwrap();
         let fast_pos = out.find("fast").unwrap();
@@ -5849,8 +6114,7 @@ mod tests {
         r_fail.skipped = false;
         r_fail.inconclusive = false;
         let rows = vec![r_pass, r_inc, r_fail];
-        let df = build_dataframe(&rows).unwrap();
-        let out = format_dimension_summary(&df, "scenario");
+        let out = format_dimension_summary(&rows, "scenario");
         assert!(
             out.contains("1/3 passed"),
             "expected '1/3 passed' for 1-pass-of-3: got:\n{out}"

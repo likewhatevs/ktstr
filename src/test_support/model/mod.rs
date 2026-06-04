@@ -1,3 +1,9 @@
+// Entire module is gated behind the `llm` cargo feature. With the
+// feature off, `llama-cpp-2` and `encoding_rs` aren't pulled into
+// the build at all; the consumer call sites in `eval.rs`,
+// `payload_run.rs`, and `cargo-ktstr` carry matching `#[cfg]` gates
+// so the call graph compiles cleanly on the no-llm build.
+#![cfg(feature = "llm")]
 //! Local LLM model cache + LlmExtract runtime for
 //! [`crate::test_support::OutputFormat::LlmExtract`] payloads.
 //!

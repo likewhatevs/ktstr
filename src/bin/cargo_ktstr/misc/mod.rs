@@ -19,6 +19,7 @@
 mod completions;
 mod export;
 mod funify;
+#[cfg(feature = "llm")]
 mod model;
 mod probe;
 mod shell;
@@ -26,5 +27,6 @@ mod shell;
 pub(crate) use completions::run_completions;
 pub(crate) use export::run_export;
 pub(crate) use funify::run_funify;
+#[cfg(feature = "llm")]
 pub(crate) use model::{run_model_clean, run_model_fetch, run_model_status};
 pub(crate) use shell::run_shell;
