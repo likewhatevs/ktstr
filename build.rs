@@ -785,7 +785,8 @@ int main(void) {{
 /// vendoring covers crate sources, not arbitrary C-source tarballs
 /// downloaded by a build script. The verification has to live in
 /// `build.rs` itself.
-const BUSYBOX_TARBALL_SHA256: &str = "";
+const BUSYBOX_TARBALL_SHA256: &str =
+    "ea5494846c51d946e5e801d1c099b438f683af8147e0be24ca4001073143110f";
 
 /// Fetch the upstream busybox tarball with retry; return the raw
 /// gzip-compressed bytes (NOT yet SHA-verified — caller passes the
