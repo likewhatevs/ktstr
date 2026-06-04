@@ -69,9 +69,9 @@ mod parse_tests;
 use clap::Parser;
 use ktstr::cli::KernelCommand;
 
-use crate::cli::{Cargo, CargoSub, KtstrCommand};
 #[cfg(feature = "llm")]
 use crate::cli::ModelCommand;
+use crate::cli::{Cargo, CargoSub, KtstrCommand};
 
 fn main() {
     // Restore SIGPIPE so piping `cargo ktstr ... | head` doesn't

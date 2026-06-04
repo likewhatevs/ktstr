@@ -2953,10 +2953,7 @@ const OUTLIER_METRICS: &[(&str, MetricAccessor)] = &[
     ("stuck", |r| r.stuck_count as f64),
     ("fallback", |r| r.fallback_count as f64),
     ("keep_last", |r| r.keep_last_count as f64),
-    (
-        "worst_p99_wake_latency_us",
-        |r| r.worst_p99_wake_latency_us,
-    ),
+    ("worst_p99_wake_latency_us", |r| r.worst_p99_wake_latency_us),
     ("worst_wake_latency_cv", |r| r.worst_wake_latency_cv),
     ("worst_mean_run_delay_us", |r| r.worst_mean_run_delay_us),
     ("worst_run_delay_us", |r| r.worst_run_delay_us),
@@ -2971,11 +2968,7 @@ fn mean<I: Iterator<Item = f64>>(iter: I) -> f64 {
     let (sum, count) = iter
         .filter(|x| x.is_finite())
         .fold((0.0_f64, 0usize), |(s, c), x| (s + x, c + 1));
-    if count == 0 {
-        0.0
-    } else {
-        sum / count as f64
-    }
+    if count == 0 { 0.0 } else { sum / count as f64 }
 }
 
 /// Sample standard deviation (Bessel-corrected, ddof = 1) over the
@@ -2985,12 +2978,12 @@ fn mean<I: Iterator<Item = f64>>(iter: I) -> f64 {
 /// the computation needs two passes (mean, then squared deviations).
 fn std_dev<I: Iterator<Item = f64> + Clone>(iter: I) -> f64 {
     let m = mean(iter.clone());
-    let (sum_sq, count) =
-        iter.filter(|x| x.is_finite())
-            .fold((0.0_f64, 0usize), |(s, c), x| {
-                let d = x - m;
-                (s + d * d, c + 1)
-            });
+    let (sum_sq, count) = iter
+        .filter(|x| x.is_finite())
+        .fold((0.0_f64, 0usize), |(s, c), x| {
+            let d = x - m;
+            (s + d * d, c + 1)
+        });
     if count < 2 {
         0.0
     } else {
@@ -3080,21 +3073,13 @@ fn find_outliers(rows: &[GauntletRow]) -> Vec<Outlier> {
     // out of the row avoids cloning the scenario names just to bucket.
     let mut by_scenario: BTreeMap<&str, Vec<&GauntletRow>> = BTreeMap::new();
     for r in &pass_rows {
-        by_scenario
-            .entry(r.scenario.as_str())
-            .or_default()
-            .push(r);
+        by_scenario.entry(r.scenario.as_str()).or_default().push(r);
     }
 
     let mut outliers = Vec::new();
     for &(name, accessor) in OUTLIER_METRICS {
-        // `pass_rows.iter()` yields `&&GauntletRow` (iter over a
-        // `Vec<&GauntletRow>`); the `*r` dereferences the outer ref
-        // so the call site matches `accessor: fn(&GauntletRow) -> f64`.
-        // Function-pointer arguments don't auto-deref, so the explicit
-        // `*r` is needed.
-        let overall_mean = mean(pass_rows.iter().map(|r| accessor(*r)));
-        let overall_std = std_dev(pass_rows.iter().map(|r| accessor(*r)));
+        let overall_mean = mean(pass_rows.iter().map(|r| accessor(r)));
+        let overall_std = std_dev(pass_rows.iter().map(|r| accessor(r)));
         // Drop metrics with std below epsilon. The cohort produced no
         // measurable spread on this metric, so flagging "outliers"
         // against a near-zero baseline would surface noise. Mirrors the
@@ -3105,7 +3090,7 @@ fn find_outliers(rows: &[GauntletRow]) -> Vec<Outlier> {
         let threshold = overall_mean + 2.0 * overall_std;
 
         for (&scenario, rows_in_scenario) in &by_scenario {
-            let scenario_mean = mean(rows_in_scenario.iter().map(|r| accessor(*r)));
+            let scenario_mean = mean(rows_in_scenario.iter().map(|r| accessor(r)));
             if scenario_mean <= threshold {
                 continue;
             }
@@ -3183,7 +3168,12 @@ fn format_dimension_summary(rows: &[GauntletRow], group_col: &str) -> String {
     // None arm. The match exhausts at the first row — every row
     // resolves identically given the same `group_col` — so the
     // probe is O(1).
-    if rows.is_empty() || rows.first().and_then(|r| group_field(r, group_col)).is_none() {
+    if rows.is_empty()
+        || rows
+            .first()
+            .and_then(|r| group_field(r, group_col))
+            .is_none()
+    {
         return String::new();
     }
 
@@ -5694,7 +5684,10 @@ mod tests {
         let xs = [-2.0_f64, -1.0, 0.0, 1.0, 2.0];
         let m = mean(xs.iter().copied());
         let s = std_dev(xs.iter().copied());
-        assert!((m - 0.0).abs() < 1e-9, "mean of symmetric values should be 0, got {m}");
+        assert!(
+            (m - 0.0).abs() < 1e-9,
+            "mean of symmetric values should be 0, got {m}"
+        );
         // Sample std for [-2, -1, 0, 1, 2]: sqrt( (4+1+0+1+4) / 4 ) = sqrt(10/4) = sqrt(2.5) ≈ 1.581
         assert!((s - 1.58113883).abs() < 1e-6, "std dev mismatch, got {s}");
     }
@@ -5707,7 +5700,10 @@ mod tests {
         let xs = [large, large * 2.0, large * 3.0];
         let m = mean(xs.iter().copied());
         let s = std_dev(xs.iter().copied());
-        assert!((m - large * 2.0).abs() / large < 1e-12, "mean of large values");
+        assert!(
+            (m - large * 2.0).abs() / large < 1e-12,
+            "mean of large values"
+        );
         // Std dev should be large * sqrt( (1^2 + 0^2 + 1^2) / 2 ) = large * 1.0
         assert!((s - large).abs() / large < 1e-12, "std dev of large values");
     }
@@ -5731,7 +5727,10 @@ mod tests {
         let xs = [3.0_f64, 7.0];
         let s = std_dev(xs.iter().copied());
         // Mean = 5.0, deviations = [-2, 2], sum_sq = 8, variance = 8 / 1 = 8, std = sqrt(8) ≈ 2.828
-        assert!((s - 2.8284271247461903).abs() < 1e-9, "Bessel-corrected std dev for two values");
+        assert!(
+            (s - 2.8284271247461903).abs() < 1e-9,
+            "Bessel-corrected std dev for two values"
+        );
     }
 
     // -- find_outliers and find_worst_topos tests --
@@ -5766,7 +5765,10 @@ mod tests {
         let r3 = make_row("only", "t3", true, 11.0);
         let rows = vec![r1, r2, r3];
         let outliers = find_outliers(&rows);
-        assert!(outliers.is_empty(), "single scenario cannot produce outliers");
+        assert!(
+            outliers.is_empty(),
+            "single scenario cannot produce outliers"
+        );
     }
 
     /// find_outliers detects a clear outlier scenario.
@@ -5791,10 +5793,17 @@ mod tests {
 
         // Find the spread outlier
         let spread_outlier = outliers.iter().find(|o| o.metric == "spread");
-        assert!(spread_outlier.is_some(), "should have spread metric outlier");
+        assert!(
+            spread_outlier.is_some(),
+            "should have spread metric outlier"
+        );
         let outlier = spread_outlier.unwrap();
         assert_eq!(outlier.scenario, "outlier");
-        assert!(outlier.sigma > 2.0, "sigma should exceed 2.0 threshold, got {}", outlier.sigma);
+        assert!(
+            outlier.sigma > 2.0,
+            "sigma should exceed 2.0 threshold, got {}",
+            outlier.sigma
+        );
         // Worst topos should include t10 and t11 (both exceed threshold)
         assert!(outlier.worst_topos.contains(&"t10".to_string()));
         assert!(outlier.worst_topos.contains(&"t11".to_string()));
@@ -5834,22 +5843,26 @@ mod tests {
 
         // Simpler approach: verify that the > comparison is used, not >=.
         // Create a minimal case where we know the threshold and test both sides.
-        let mut rows = Vec::new();
         // 4 rows: two scenarios with 2 rows each
         // Scenario A: values 0.0, 0.0 (mean 0.0)
         // Scenario B: values 10.0, 10.0 (mean 10.0)
         // Overall mean = 5.0, std = sqrt( ((0-5)^2*2 + (10-5)^2*2) / 3 ) = sqrt( (50 + 50) / 3 ) = sqrt(100/3) ≈ 5.77
         // Threshold = 5.0 + 2*5.77 = 5.0 + 11.55 = 16.55
         // Neither scenario mean (0.0 or 10.0) exceeds 16.55, so no outliers.
-        rows.push(make_row("A", "t1", true, 0.0));
-        rows.push(make_row("A", "t2", true, 0.0));
-        rows.push(make_row("B", "t3", true, 10.0));
-        rows.push(make_row("B", "t4", true, 10.0));
+        let rows = vec![
+            make_row("A", "t1", true, 0.0),
+            make_row("A", "t2", true, 0.0),
+            make_row("B", "t3", true, 10.0),
+            make_row("B", "t4", true, 10.0),
+        ];
 
         let outliers = find_outliers(&rows);
         // No scenario should be an outlier since 10.0 < 16.55
         let spread_outliers: Vec<_> = outliers.iter().filter(|o| o.metric == "spread").collect();
-        assert!(spread_outliers.is_empty(), "no outlier when below threshold");
+        assert!(
+            spread_outliers.is_empty(),
+            "no outlier when below threshold"
+        );
     }
 
     /// find_outliers skips metrics with near-zero standard deviation.
@@ -5866,7 +5879,10 @@ mod tests {
         let outliers = find_outliers(&rows);
         // No spread outliers because std = 0 (below EPSILON)
         let spread_outliers: Vec<_> = outliers.iter().filter(|o| o.metric == "spread").collect();
-        assert!(spread_outliers.is_empty(), "zero std dev should skip metric");
+        assert!(
+            spread_outliers.is_empty(),
+            "zero std dev should skip metric"
+        );
     }
 
     /// find_outliers sorts results by sigma descending.
@@ -5892,13 +5908,23 @@ mod tests {
 
         let outliers = find_outliers(&rows);
         let spread_outliers: Vec<_> = outliers.iter().filter(|o| o.metric == "spread").collect();
-        assert!(spread_outliers.len() >= 2, "should have at least 2 spread outliers, got {}", spread_outliers.len());
+        assert!(
+            spread_outliers.len() >= 2,
+            "should have at least 2 spread outliers, got {}",
+            spread_outliers.len()
+        );
 
         // Outlier2 should have higher sigma and appear first
         let first = &spread_outliers[0];
         let second = &spread_outliers[1];
-        assert!(first.sigma >= second.sigma, "outliers should be sorted by sigma descending");
-        assert_eq!(first.scenario, "outlier2", "extreme outlier should be first");
+        assert!(
+            first.sigma >= second.sigma,
+            "outliers should be sorted by sigma descending"
+        );
+        assert_eq!(
+            first.scenario, "outlier2",
+            "extreme outlier should be first"
+        );
     }
 
     /// find_worst_topos returns empty vec when no rows match scenario.
@@ -5908,7 +5934,10 @@ mod tests {
         let rows = vec![r1];
         let accessor: MetricAccessor = |r| r.spread;
         let worst = find_worst_topos(&rows, "nonexistent", accessor, 5.0);
-        assert!(worst.is_empty(), "no matching scenario should yield empty vec");
+        assert!(
+            worst.is_empty(),
+            "no matching scenario should yield empty vec"
+        );
     }
 
     /// find_worst_topos returns only topologies exceeding threshold.
@@ -5928,7 +5957,10 @@ mod tests {
         let worst = find_worst_topos(&rows, "s1", accessor, 15.0);
         assert_eq!(worst.len(), 1, "only t3 should exceed threshold");
         assert!(worst.contains(&"t3".to_string()));
-        assert!(!worst.contains(&"t2".to_string()), "t2 at threshold should not be included");
+        assert!(
+            !worst.contains(&"t2".to_string()),
+            "t2 at threshold should not be included"
+        );
     }
 
     /// find_worst_topos includes rows regardless of pass/fail status.
