@@ -1,4 +1,11 @@
 /target
+# Standalone test-fixture crates (e.g. tests/devdep-isolation/) build
+# into their own target/ directories because they are NOT members of
+# the parent workspace. Cargo.lock files are also regenerated per-build
+# from the fixture's deps; tracking them would churn every time the
+# parent ktstr crate's deps move.
+tests/*/target/
+tests/*/Cargo.lock
 *.profraw
 doc/guide/book/
 .build-cache/

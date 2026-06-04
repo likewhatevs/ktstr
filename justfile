@@ -69,6 +69,16 @@ test kernel extra-features="":
 compile-fail:
     KTSTR_SKIP_WPROF_BUILD=1 cargo nextest run --profile ci --features wprof -E 'binary(compile_fail) & test(=compile_fail)' --run-ignored all
 
+# Verify ktstr stays out of a downstream consumer's release binary.
+# Drives `tests/devdep-isolation/verify.sh`, which builds a tiny
+# fixture crate that takes ktstr as a [dev-dependencies] and asserts:
+#   (1) `cargo build --release` of the fixture does NOT compile ktstr,
+#   (2) the resulting binary contains no `ktstr::` symbols.
+# Pins Cargo's dev-dep isolation contract so a future regression that
+# accidentally widens ktstr's reach into prod builds fails CI loudly.
+devdep-isolation:
+    tests/devdep-isolation/verify.sh
+
 # Run coverage. `extra-features` is passed to the cargo-ktstr build (so a
 # blob-embedding feature like `wprof` is provisioned — see `test`) AND
 # appended to the inner coverage feature list.

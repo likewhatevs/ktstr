@@ -1081,6 +1081,7 @@ fn resolve_polarities(metrics: &mut [Metric], payload: &Payload) {
 /// - Duplicate metric names → each occurrence receives the hint.
 /// - Unhinted metric names → [`crate::test_support::Polarity::Unknown`] + empty unit
 ///   (left unchanged from the value the caller provided).
+#[cfg(feature = "llm")]
 pub(crate) fn resolve_polarities_owned(
     metrics: &mut [Metric],
     hints: &[crate::test_support::WireMetricHint],
@@ -4037,6 +4038,7 @@ mod tests {
     /// Hinted metric receives the polarity + unit from the owned
     /// hint slice. Mirrors `resolve_polarities_applies_hints` for
     /// the LlmExtract path.
+    #[cfg(feature = "llm")]
     #[test]
     fn resolve_polarities_owned_applies_hints() {
         use crate::test_support::{Metric, MetricSource, MetricStream, Polarity, WireMetricHint};
@@ -4090,6 +4092,7 @@ mod tests {
     /// Duplicate hint names: HashMap last-insertion wins. Mirrors
     /// `resolve_polarities_duplicate_hint_names_last_wins` so a
     /// switch to first-wins or multimap surfaces here.
+    #[cfg(feature = "llm")]
     #[test]
     fn resolve_polarities_owned_duplicate_hint_names_last_wins() {
         use crate::test_support::{Metric, MetricSource, MetricStream, Polarity, WireMetricHint};
@@ -4120,6 +4123,7 @@ mod tests {
 
     /// Duplicate metric names: each occurrence gets the same hint.
     /// Mirrors `resolve_polarities_duplicate_metric_names_each_gets_hint`.
+    #[cfg(feature = "llm")]
     #[test]
     fn resolve_polarities_owned_duplicate_metric_names_each_gets_hint() {
         use crate::test_support::{Metric, MetricSource, MetricStream, Polarity, WireMetricHint};
@@ -4156,6 +4160,7 @@ mod tests {
     /// Empty hints OR empty metrics → fast-path no-op. Pins both
     /// branches of the early return so a regression that always
     /// builds the HashMap (or always touches metrics) breaks here.
+    #[cfg(feature = "llm")]
     #[test]
     fn resolve_polarities_owned_empty_inputs_are_noop() {
         use crate::test_support::{Metric, MetricSource, MetricStream, Polarity};
@@ -4191,6 +4196,7 @@ mod tests {
     /// time) and verify the owned form produces identical
     /// post-resolution metrics. Pins the From impl + the helper as
     /// behaviorally equivalent across the SHM boundary.
+    #[cfg(feature = "llm")]
     #[test]
     fn resolve_polarities_owned_matches_from_metric_hint_conversion() {
         use crate::test_support::{

@@ -1,0 +1,44 @@
+# Standalone fixture crate that simulates a downstream consumer adding
+# ktstr as a [dev-dependencies]. NOT a member of the ktstr workspace
+# (the empty `[workspace]` table below breaks workspace inheritance) so
+# its resolver, profile, and lockfile are independent — exactly the
+# perspective a real downstream crate has.
+#
+# Driven by `tests/devdep-isolation/verify.sh` (and the `devdep-isolation`
+# justfile recipe + CI job) which asserts that `cargo build --release`
+# of this fixture compiles zero ktstr code and the resulting binary
+# contains no ktstr symbols. Pins the structural-isolation contract of
+# Cargo's `[dev-dependencies]` so a future refactor that accidentally
+# moves a ktstr-imported symbol into the prod surface (or moves ktstr
+# into the wrong dep section anywhere in the path) fails CI loudly.
+
+[package]
+name = "ktstr-devdep-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+# An MSRV bump in the parent ktstr crate's rust-toolchain.toml applies
+# here automatically because rustup honors the workspace-rooted
+# rust-toolchain.toml when building from inside the workspace tree.
+
+# Empty `[workspace]` makes this crate its own workspace root, breaking
+# inheritance from the parent ktstr `[workspace]`. Without this the
+# fixture would compile every time the parent workspace builds (and
+# share resolver/profile settings with it), defeating the "isolated
+# downstream perspective" the test is checking.
+[workspace]
+
+[dependencies]
+# Intentionally NO ktstr — the prod tree of a real downstream consumer
+# only sees ktstr through dev-deps.
+
+[dev-dependencies]
+# Path dep, lean config — matches the `default-features = false,
+# features = ["llm"]` recipe the README points downstream consumers at.
+# Using the lean config (not full default) exercises the smallest
+# surface the README documents as supported.
+ktstr = { path = "../..", default-features = false, features = ["llm"] }
+
+[[bin]]
+name = "devdep-fixture"
+path = "src/main.rs"
