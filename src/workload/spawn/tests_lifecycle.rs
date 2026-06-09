@@ -503,6 +503,88 @@ fn stop_and_collect_sentinel_exits_for_sigusr1_ignoring_worker() {
         other => panic!("expected TimedOut or Signaled(SIGKILL), got {other:?}",),
     }
 }
+
+/// `sigkill_workers` short-circuits the graceful-collection wait.
+///
+/// Pins the scheduler-crash teardown fix. `ignores_sigusr1_fn`
+/// installs `SIG_IGN` for SIGUSR1, so `stop_and_collect`'s
+/// cooperative stop never lands and — absent a SIGKILL — the worker
+/// drives the collect path to its full shared 5s deadline (this is
+/// exactly the ~5s shape that
+/// `stop_and_collect_sentinel_exits_for_sigusr1_ignoring_worker`
+/// pins for one worker). Pre-delivering SIGKILL to every worker via
+/// [`WorkloadHandle::sigkill_workers`] makes the subsequent
+/// `stop_and_collect` reap already-exiting workers and return
+/// promptly.
+///
+/// The 2s bound is comfortably under that 5s deadline and far above
+/// the sub-second fast path (the SIG_IGN workers park in a 10ms
+/// sleep loop, so SIGKILL drops them immediately with no CPU
+/// contention), so it catches a regression that removes the pre-kill
+/// without flaking on contended CI. Multiple workers exercise the
+/// `sigkill_workers` loop over every child.
+#[test]
+fn sigkill_workers_makes_collect_prompt_for_sigusr1_ignoring_workers() {
+    const N: usize = 4;
+    let config = WorkloadConfig {
+        num_workers: N,
+        affinity: AffinityIntent::Inherit,
+        work_type: WorkType::custom("sigusr1_ignore", ignores_sigusr1_fn),
+        sched_policy: SchedPolicy::Normal,
+        ..Default::default()
+    };
+    let mut h = WorkloadHandle::spawn(&config).unwrap();
+    let pids = h.worker_pids();
+    assert_eq!(pids.len(), N, "fork-mode Custom workload yields one pid per worker");
+    let ready_paths: Vec<_> = pids.iter().map(|&p| ready_file_path(p)).collect();
+    // Clear stale ready files from a prior run that recycled these
+    // PIDs (same rationale as the sentinel test); must run before
+    // start() so we never unlink a live handshake file.
+    for p in &ready_paths {
+        let _ = std::fs::remove_file(p);
+    }
+    h.start();
+    // Wait until every worker has installed SIG_IGN and parked in its
+    // spin window, so all workers are genuinely live at teardown —
+    // the scenario this fix targets.
+    for (&pid, path) in pids.iter().zip(&ready_paths) {
+        wait_for_file_or_panic(
+            path,
+            Duration::from_secs(3),
+            pid,
+            "SIG_IGN install may have failed or child never reached \
+             ignores_sigusr1_fn's ready-file write",
+        );
+    }
+    // Pre-deliver SIGKILL to every worker, then collect. The collect
+    // must NOT pay the 5s cooperative-stop deadline these SIG_IGN
+    // workers would otherwise force.
+    let start = Instant::now();
+    h.sigkill_workers();
+    let reports = h.stop_and_collect();
+    let elapsed = start.elapsed();
+    for p in &ready_paths {
+        let _ = std::fs::remove_file(p);
+    }
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "teardown took {elapsed:?} after sigkill_workers; expected < 2s \
+         (these SIG_IGN workers force stop_and_collect's ~5s deadline \
+         only when SIGKILL is not pre-delivered)",
+    );
+    assert_eq!(reports.len(), N, "one (sentinel) report per worker");
+    // Sentinels: SIGKILL landed before any worker could write a
+    // report, so every report is the zeroed shape — a non-zero
+    // work_units would mean a real report leaked through, i.e. the
+    // worker was collected gracefully rather than killed.
+    for r in &reports {
+        assert_eq!(
+            r.work_units, 0,
+            "sigkill_workers must terminate the worker before it reports; \
+             non-zero work_units means a real report leaked through",
+        );
+    }
+}
 // -- Test-helper unit tests --
 
 /// Happy path: the file appears WITHIN the deadline, so

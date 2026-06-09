@@ -922,6 +922,12 @@ fn run_scenario(
             && let Some(pid) = crate::vmm::rust_init::sched_pid()
             && !process_alive(pid)
         {
+            // Scheduler died between steps: the kernel has disabled
+            // sched_ext and the backdrop workers have fallen back to
+            // the builtin scheduler. SIGKILL them up front so the
+            // collect reap below isn't scheduling-gated behind
+            // still-spinning workers (see `sigkill_handles`).
+            sigkill_handles(&backdrop_state.handles);
             // Collect backdrop-owned workload handles into the
             // result before reporting the crash so whatever the
             // persistent workers produced is still assertable.
@@ -977,6 +983,19 @@ fn run_scenario(
             effective_checks,
             &mut sched_died_during_hold,
         );
+
+        // Scheduler died during this step's hold: the kernel has
+        // disabled sched_ext and the workers (step and backdrop) have
+        // fallen back to the builtin scheduler. If CPU-bound they
+        // would CFS-starve the per-worker reap in the collect calls
+        // below, so SIGKILL them all up front — the reaps then find
+        // already-exiting workers (see `sigkill_handles`). Gated on
+        // the death flag so the normal teardown keeps its graceful
+        // cooperative-stop + report-collection path.
+        if sched_died_during_hold {
+            sigkill_handles(&step_state.handles);
+            sigkill_handles(&backdrop_state.handles);
+        }
 
         if guest_comms::is_guest() {
             crate::vmm::guest_comms::send_scenario_pause();
@@ -1046,6 +1065,14 @@ fn run_scenario(
     // path) OR Op::DetachScheduler cleared it; no liveness to
     // report on either case.
     let sched_dead = crate::vmm::rust_init::sched_pid().is_some_and(|pid| !process_alive(pid));
+
+    // Scheduler died after the last hold: SIGKILL the backdrop
+    // workers up front so the teardown reap below isn't
+    // scheduling-gated behind still-spinning workers that fell back
+    // to the builtin scheduler (see `sigkill_handles`).
+    if sched_dead {
+        sigkill_handles(&backdrop_state.handles);
+    }
 
     // --- Backdrop teardown ---
     let backdrop_result =
@@ -1734,6 +1761,22 @@ fn validate_mempolicy_cpuset(
         );
     }
     Ok(())
+}
+
+/// SIGKILL every worker in `handles` without reaping. Used only on
+/// the scheduler-death paths in [`run_scenario`]: when the scheduler
+/// under test dies, the kernel disables sched_ext and its workers
+/// fall back to the builtin scheduler, so a CPU-bound worker pool
+/// would otherwise make the per-worker `waitpid` reap in the
+/// subsequent [`collect_step`] / [`collect_backdrop`]
+/// scheduling-gated (teardown time scaling with worker count).
+/// Delivering SIGKILL to every worker first lets that reap find
+/// already-exiting workers. See
+/// [`crate::workload::WorkloadHandle::sigkill_workers`].
+fn sigkill_handles(handles: &[(String, WorkloadHandle)]) {
+    for (_, h) in handles {
+        h.sigkill_workers();
+    }
 }
 
 /// Collect step-local worker results and produce an AssertResult.
