@@ -1792,14 +1792,19 @@ fn sigkill_handles(handles: &[(String, WorkloadHandle)]) {
 /// Before draining handles, every step-local cgroup is unfrozen
 /// (`cgroup.freeze` ← 0). An [`Op::FreezeCgroup`] without a paired
 /// [`Op::UnfreezeCgroup`] would leave step-local tasks frozen at
-/// step boundary; killpg/SIGKILL on a frozen task is queued but
-/// never delivered (the task is parked off the runqueue), so
-/// [`drain_all_payload_handles`] hangs and the subsequent
-/// `CgroupGroup::Drop` rmdir hits EBUSY because workers are still
-/// resident. Pre-emptive unfreeze restores the run-state
-/// precondition every cleanup path expects. Failures are logged
-/// at warn level only — a missing freezer file or a cgroup that
-/// was already torn down is benign at teardown time, and
+/// step boundary, where the graceful cooperative stop cannot make
+/// progress: the worker stop is a non-fatal SIGUSR1, and a frozen
+/// task re-enters the freezer trap on a non-fatal signal
+/// (`kernel/signal.c` `do_freezer_trap`) rather than running its
+/// handler — so it never flips its stop flag or reports until
+/// thawed, and `stop_and_collect` burns its full collection
+/// deadline before falling back to a sentinel report. (A fatal
+/// SIGKILL DOES wake and kill a frozen task — it diverges before
+/// the freezer trap — so worker death and the subsequent rmdir are
+/// unaffected by the freeze; the unfreeze only restores the
+/// graceful path's ability to collect real reports.) Failures are
+/// logged at warn level only — a missing freezer file or a cgroup
+/// that was already torn down is benign at teardown time, and
 /// propagating would mask the real workload result.
 fn collect_step(
     step_state: &mut StepState<'_>,
@@ -1807,16 +1812,17 @@ fn collect_step(
     topo: &crate::topology::TestTopology,
     cgroups: &dyn crate::cgroup::CgroupOps,
 ) -> AssertResult {
-    // Unfreeze every step-local cgroup before draining handles or
-    // letting the CgroupGroup RAII guard rmdir them. A live
-    // `cgroup.freeze == 1` blocks SIGKILL delivery (frozen tasks
-    // are off the runqueue) and EBUSYs the rmdir.
+    // Unfreeze every step-local cgroup before the graceful collect.
+    // A frozen worker re-enters the freezer trap on the cooperative
+    // (non-fatal) SIGUSR1 stop instead of running its handler, so it
+    // never reports until thawed. (SIGKILL would still kill it; only
+    // the graceful report path needs the thaw.)
     for name in step_state.cgroups.names() {
         if let Err(e) = cgroups.set_freeze(name, false) {
             tracing::warn!(
                 cgroup = %name,
                 err = %format!("{e:#}"),
-                "collect_step: pre-teardown unfreeze failed; rmdir may EBUSY"
+                "collect_step: pre-teardown unfreeze failed; any frozen workers will yield sentinel reports (still SIGKILL-reaped, no leak)"
             );
         }
     }
@@ -1919,35 +1925,37 @@ fn format_stall_report(report: &crate::scenario::host_stall::StallReport) -> Str
 /// when `backdrop_state` itself drops.
 ///
 /// Mirrors [`collect_step`]'s pre-teardown unfreeze pass over every
-/// tracked cgroup. A backdrop cgroup left frozen at scenario end
-/// blocks SIGKILL delivery to its tasks (frozen tasks are off the
-/// runqueue, see `kernel/cgroup/freezer.c::cgroup_freeze_task`),
-/// which then EBUSYs the rmdir issued by the
-/// `BackdropState::cgroups` RAII drop. The asymmetry between
-/// step-local and backdrop teardown — only the former unfreezing —
-/// would surface as backdrop cgroups leaking on every scenario
+/// tracked cgroup, for the same reason: a backdrop cgroup left
+/// frozen at scenario end cannot run the graceful cooperative stop.
+/// A frozen task re-enters the freezer trap on the non-fatal SIGUSR1
+/// (`kernel/signal.c` `do_freezer_trap`) instead of running its
+/// handler, so its workers never report until thawed. The asymmetry
+/// between step-local and backdrop teardown — only the former
+/// unfreezing — would surface as backdrop workers yielding sentinel
+/// reports (after burning the collection deadline) on every scenario
 /// whose Backdrop froze a cgroup and never unfroze it. Symmetric
-/// unfreeze pre-rmdir is the same bug class
-/// [`super::CgroupGroup::drop`] already prevents at the
-/// CgroupGroup level for the per-step path; this prologue brings
-/// the backdrop path back in line.
+/// unfreeze brings the backdrop path back in line with the per-step
+/// path. (As in `collect_step`, a fatal SIGKILL still kills a frozen
+/// worker, so death and the `BackdropState::cgroups` RAII rmdir are
+/// unaffected by the freeze.)
 fn collect_backdrop(
     backdrop_state: &mut BackdropState<'_>,
     checks: &crate::assert::Assert,
     topo: &crate::topology::TestTopology,
     cgroups: &dyn crate::cgroup::CgroupOps,
 ) -> AssertResult {
-    // Unfreeze every backdrop cgroup before draining handles or
-    // letting the CgroupGroup RAII guard rmdir them. Same rationale
-    // as `collect_step`: a live `cgroup.freeze == 1` blocks SIGKILL
-    // delivery (frozen tasks are off the runqueue) and EBUSYs the
-    // rmdir.
+    // Unfreeze every backdrop cgroup before the graceful collect.
+    // Same rationale as `collect_step`: a frozen worker re-enters
+    // the freezer trap on the cooperative (non-fatal) SIGUSR1 stop
+    // instead of running its handler, so it never reports until
+    // thawed. (SIGKILL would still kill it; only the graceful report
+    // path needs the thaw.)
     for name in backdrop_state.cgroups.names() {
         if let Err(e) = cgroups.set_freeze(name, false) {
             tracing::warn!(
                 cgroup = %name,
                 err = %format!("{e:#}"),
-                "collect_backdrop: pre-teardown unfreeze failed; rmdir may EBUSY"
+                "collect_backdrop: pre-teardown unfreeze failed; any frozen workers will yield sentinel reports (still SIGKILL-reaped, no leak)"
             );
         }
     }
