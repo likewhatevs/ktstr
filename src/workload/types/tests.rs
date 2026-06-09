@@ -640,9 +640,10 @@ fn suggest_rejects_whitespace_padded_inputs() {
 
 #[test]
 fn work_type_all_names_count() {
-    // 38 = 20 historical + 2 fundamental + 7 pathology + 5 coverage-gap
-    //    + 1 idle-transition + 3 compute-primitive variants.
-    assert_eq!(WorkType::ALL_NAMES.len(), 38);
+    // 39 = 20 historical + 2 fundamental + 7 pathology + 5 coverage-gap
+    //    + 1 idle-transition + 3 compute-primitive + 1 cross-affinity
+    //    (CrossAffinityChurn) variant.
+    assert_eq!(WorkType::ALL_NAMES.len(), 39);
 }
 
 #[test]

@@ -1218,3 +1218,52 @@ fn alu_hot_chain_drives_instructions_retired() {
          Observed work_units = {work_units}.",
     );
 }
+
+/// `build_cross_affinity_masks` must yield two masks differing by
+/// EXACTLY one CPU — the invariant that makes every
+/// `CrossAffinityChurn` `sched_setaffinity` a genuine mask change, so
+/// the kernel never `cpumask_equal`-early-returns and the
+/// set_cpus_allowed path runs each iteration. Pins the "genuine mask
+/// change" contract the WorkType's whole effect depends on.
+#[test]
+fn build_cross_affinity_masks_differ_by_exactly_one_cpu() {
+    let cpus = [0usize, 1, 2, 3];
+    let (a, b) = build_cross_affinity_masks(&cpus).expect(">=2 cpus yields a mask pair");
+    let mut a_count = 0usize;
+    let mut b_count = 0usize;
+    let mut differ = 0usize;
+    for &c in &cpus {
+        let in_a = unsafe { libc::CPU_ISSET(c, &a) };
+        let in_b = unsafe { libc::CPU_ISSET(c, &b) };
+        a_count += in_a as usize;
+        b_count += in_b as usize;
+        differ += (in_a != in_b) as usize;
+    }
+    assert_eq!(a_count, cpus.len(), "mask_a must cover every cpu");
+    assert_eq!(b_count, cpus.len() - 1, "mask_b must drop exactly one cpu");
+    assert_eq!(differ, 1, "the two masks must differ by exactly one cpu");
+}
+
+/// A cpuset too small for two distinct masks yields `None` —
+/// `CrossAffinityChurn` is a no-op for such a worker.
+#[test]
+fn build_cross_affinity_masks_none_below_two_cpus() {
+    assert!(build_cross_affinity_masks(&[]).is_none());
+    assert!(build_cross_affinity_masks(&[0]).is_none());
+}
+
+/// `read_sibling_pids` must never include the caller's own pid: the
+/// `CrossAffinityChurn` arm and `WorkerCtx::sibling_pids` both rely on
+/// self being filtered (a worker must not flip its own affinity via
+/// the sibling path; a Custom worker expects peers only). Runs in the
+/// test process's cgroup — the result may be empty where
+/// `cgroup.procs` is unreadable, but must never contain `getpid()`.
+#[test]
+fn read_sibling_pids_excludes_self() {
+    let me = unsafe { libc::getpid() };
+    let sibs = read_sibling_pids();
+    assert!(
+        !sibs.contains(&me),
+        "read_sibling_pids must exclude the caller's own pid {me}; got {sibs:?}"
+    );
+}

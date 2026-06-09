@@ -45,6 +45,7 @@ impl WorkType {
             WorkType::ForkExit => "ForkExit",
             WorkType::NiceSweep => "NiceSweep",
             WorkType::AffinityChurn { .. } => "AffinityChurn",
+            WorkType::CrossAffinityChurn { .. } => "CrossAffinityChurn",
             WorkType::PolicyChurn { .. } => "PolicyChurn",
             WorkType::FanOutCompute { .. } => "FanOutCompute",
             WorkType::PageFaultChurn { .. } => "PageFaultChurn",
@@ -111,6 +112,9 @@ impl WorkType {
             "NiceSweep" => Some(WorkType::NiceSweep),
             "AffinityChurn" => Some(WorkType::AffinityChurn {
                 spin_iters: defaults::AFFINITY_CHURN_SPIN_ITERS,
+            }),
+            "CrossAffinityChurn" => Some(WorkType::CrossAffinityChurn {
+                spin_iters: defaults::CROSS_AFFINITY_CHURN_SPIN_ITERS,
             }),
             "PolicyChurn" => Some(WorkType::PolicyChurn {
                 spin_iters: defaults::POLICY_CHURN_SPIN_ITERS,
@@ -467,6 +471,13 @@ impl WorkType {
     /// [`WorkType::AffinityChurn`] variant doc for preconditions.
     pub const fn affinity_churn(spin_iters: u64) -> Self {
         WorkType::AffinityChurn { spin_iters }
+    }
+
+    /// Rapid cross-task affinity churn: each worker rewrites its
+    /// siblings' affinity. Must run in a dedicated cgroup; see the
+    /// [`WorkType::CrossAffinityChurn`] variant doc for preconditions.
+    pub const fn cross_affinity_churn(spin_iters: u64) -> Self {
+        WorkType::CrossAffinityChurn { spin_iters }
     }
 
     /// Cycle scheduling policies with `spin_iters` CPU work between switches.

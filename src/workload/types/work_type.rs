@@ -257,6 +257,42 @@ pub enum WorkType {
     /// → sched_setaffinity → yield. Exercises affine_move_task and
     /// migration_cpu_stop.
     AffinityChurn { spin_iters: u64 },
+    /// Rapid CROSS-task affinity churn: each worker rewrites every
+    /// SIBLING worker's CPU affinity at high rate, toggling between
+    /// two cpuset sub-masks that differ by one CPU so each
+    /// `sched_setaffinity` is a genuine mask change. Distinct from
+    /// [`AffinityChurn`](Self::AffinityChurn), which churns the
+    /// worker's OWN affinity; this churns its SIBLINGS'.
+    ///
+    /// Each iteration: `spin_burst` → toggle the target mask → for
+    /// each sibling pid `sched_setaffinity(sibling, mask)` → yield.
+    /// Siblings are discovered once at worker entry from the worker's
+    /// own `cgroup.procs` (excluding self) — a flipper sees only the
+    /// peers present when it starts. Declare the target WorkSpec(s)
+    /// BEFORE the `CrossAffinityChurn` WorkSpec in the cohort:
+    /// `apply_setup` spawns, moves into the cgroup, and STARTS each
+    /// WorkSpec serially in declaration order (one `WorkloadHandle`
+    /// per WorkSpec), so a flipper sees only the peers whose WorkSpec
+    /// started before its own (plus its co-flippers — workers within
+    /// one WorkSpec all fork before that spec starts). Targets declared
+    /// AFTER the flippers, or added by a later separate spawn into the
+    /// same cgroup, are NOT seen. Because the sibling set is
+    /// the worker's cgroup membership, this WorkType MUST run in a
+    /// dedicated cgroup (a [`crate::scenario::ops::CgroupDef`]) — in a
+    /// shared or host cgroup it would rewrite the affinity of
+    /// unrelated tasks. A worker with no siblings, or a cpuset smaller
+    /// than 2 CPUs, is a no-op.
+    ///
+    /// Kernel path: `sched_setaffinity(pid)` → `__set_cpus_allowed_ptr`
+    /// → `set_cpus_allowed_common` + `affine_move_task` (→
+    /// `migration_cpu_stop` when the running CPU is toggled out); the
+    /// scheduler's `select_cpu` re-places the task on its next wake. A
+    /// sched_ext scheduler that implements the `ops.set_cpumask` hook
+    /// additionally drives that hook on every change — the cross-CPU
+    /// `set_cpumask` race surface. The scx-ktstr fixture does not
+    /// implement `set_cpumask`, so against it only the generic
+    /// migration path runs.
+    CrossAffinityChurn { spin_iters: u64 },
     /// Cycle through scheduling policies each iteration. Each iteration:
     /// spin_burst → sched_setscheduler to next policy → yield. Cycles
     /// SCHED_OTHER → SCHED_BATCH → SCHED_IDLE (and SCHED_FIFO/SCHED_RR
