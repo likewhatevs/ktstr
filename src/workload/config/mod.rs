@@ -84,6 +84,8 @@ pub mod defaults {
     pub const FUTEX_FAN_OUT_SPIN_ITERS: u64 = 1024;
     // AffinityChurn
     pub const AFFINITY_CHURN_SPIN_ITERS: u64 = 1024;
+    // CrossAffinityChurn
+    pub const CROSS_AFFINITY_CHURN_SPIN_ITERS: u64 = 1024;
     // PolicyChurn
     pub const POLICY_CHURN_SPIN_ITERS: u64 = 1024;
     // FanOutCompute

@@ -1560,8 +1560,33 @@ pub(crate) fn ktstr_guest_init() -> ! {
     stop_sched_exit_monitor();
 
     if let Some(ref mut child) = sched_child {
-        let _ = child.kill();
-        let _ = child.wait();
+        // On a crash the scheduler is shutting down and flushing its
+        // userspace diagnostics to its stderr log. Give it a brief
+        // BOUNDED grace to finish writing and exit on its own BEFORE the
+        // hard kill, so SIGKILL doesn't truncate that output
+        // (`dump_sched_output` below reads the stderr log). Gated on
+        // dump_started (the `sched_ext_dump:` tracepoint fires only on an
+        // error exit) so clean runs pay nothing; the grace returns early
+        // the moment the scheduler exits, and is bounded
+        // (`SCHED_KILL_GRACE`) so a userspace hang can't wedge teardown.
+        let exited_in_grace =
+            scx_dump_started_latch().is_set() && reap_child_bounded(child, SCHED_KILL_GRACE);
+        if !exited_in_grace {
+            let _ = child.kill();
+            // Bounded, evented reap. A SIGKILL'd scheduler normally exits
+            // <<1s — post-crash bypass keeps it CFS-schedulable and it is
+            // not held in the kernel disable (see `SCHED_REAP_TIMEOUT`).
+            // The bound caps the rare case where the process can't take its
+            // pending SIGKILL promptly; the VM reboot below reaps any
+            // straggler, so cap the wait rather than risk blocking teardown.
+            if !reap_child_bounded(child, SCHED_REAP_TIMEOUT) {
+                tracing::warn!(
+                    ?SCHED_REAP_TIMEOUT,
+                    "scheduler did not exit within the reap bound after SIGKILL \
+                     (still uninterruptible — unexpected); leaving it for VM reboot to reap"
+                );
+            }
+        }
         if let Some(ref log_path) = sched_log_path {
             dump_sched_output(log_path);
         }
@@ -1619,6 +1644,28 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // `rb_wait_once`), and that condition only flips when `iter->closed`
     // or `iter->wait_index` change. The non-blocking + poll design
     // sidesteps this by never blocking in the kernel wait at all.
+    // Tier-2 (best-effort ftrace dump): if a sched_ext exit dump started
+    // streaming this run, hold the dump tracepoint open until the reader
+    // has forwarded its end-marker to COM1 (or the bound elapses) BEFORE
+    // disabling it below, so a fast teardown does not disable the
+    // tracepoint mid-emit. Only paid when a dump is in flight — clean runs
+    // never start one. Returns immediately for a small dump; the bound
+    // (`SCX_DUMP_CAPTURE_TIMEOUT`) caps the wait for a LARGE dump, whose
+    // per-task content can take tens of seconds to forward over the slow
+    // PIO COM1 UART. On that bound this ftrace copy is truncated — but the
+    // full dump content is captured independently via the scheduler's
+    // stderr log (`dump_sched_output`; scx_utils reads the same kernel
+    // `ei->dump`) over the fast bulk port, which is the authoritative
+    // copy. Best-effort, not lossless.
+    if scx_dump_started_latch().is_set()
+        && !scx_dump_complete_latch().wait_timeout(SCX_DUMP_CAPTURE_TIMEOUT)
+    {
+        tracing::warn!(
+            ?SCX_DUMP_CAPTURE_TIMEOUT,
+            "sched_ext exit dump did not reach its end-marker within the capture bound \
+             before tracepoint teardown; the rendered dump may be truncated"
+        );
+    }
     let _ = fs::write(TRACE_SCHED_EXT_DUMP_ENABLE, "0");
     if let Some(ref stop) = trace_stop {
         stop.store(true, Ordering::Release);
@@ -3240,6 +3287,55 @@ fn drain_probe_pipeline(drain: Option<&ProbeDrain>) {
     d.output_done.wait();
 }
 
+/// Bound on [`reap_child_bounded`]: how long teardown waits for a
+/// SIGKILL'd scheduler to exit before giving up and letting the VM reboot
+/// reap it. A SIGKILL'd scheduler normally exits <<1s — post-crash bypass
+/// keeps it CFS-schedulable, and it is NOT held in the kernel scx disable:
+/// its `struct_ops` detach (`bpf_scx_unreg`) only `kthread_flush_work`s
+/// the `scx_root_disable` the crash irq_work already kicked, which is
+/// ms-scale (bypass + per-task reclass + one `synchronize_rcu` + the BPF
+/// `ops.exit`, all fast for these schedulers). The bound is a defensive
+/// cap — only a pathological multi-second `ops.exit` or RCU stall could
+/// approach it — so teardown caps the wait rather than risk adding such a
+/// stall to every crashed-scheduler teardown.
+const SCHED_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Grace given to a CRASHED scheduler to finish flushing its userspace
+/// diagnostics to stderr and exit on its own BEFORE the hard SIGKILL, so
+/// the kill doesn't truncate that output (`dump_sched_output` reads it).
+/// Bounded so a userspace hang can't wedge teardown; returns early the
+/// moment the scheduler exits. Only applied on a crash (dump_started).
+const SCHED_KILL_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Wait up to `timeout` for `child` to exit (evented via `pidfd_open` +
+/// `poll`), then reap it. Does NOT send a signal — callers drive the
+/// exit: the crash-grace caller calls this BEFORE `child.kill()` (giving
+/// a self-unregistering scheduler a chance to exit on its own within the
+/// grace), and the post-grace caller calls it AFTER `child.kill()` (to
+/// reap the pending SIGKILL). Returns `true` iff reaped within the
+/// window; on timeout the child is left for the VM reboot to reap —
+/// teardown must not block unboundedly on a wedged process (see
+/// [`SCHED_REAP_TIMEOUT`]).
+fn reap_child_bounded(child: &mut std::process::Child, timeout: std::time::Duration) -> bool {
+    // Fast path: already exited (e.g. a clean scheduler that took the
+    // SIGKILL immediately).
+    if let Ok(Some(_)) = child.try_wait() {
+        return true;
+    }
+    match crate::sync::pidfd_poll_exited(child.id() as libc::pid_t, timeout) {
+        // Readable => zombie => the reap is now non-blocking.
+        crate::sync::PidfdWait::Exited => {
+            let _ = child.wait();
+            true
+        }
+        // Timed out: still alive — leave it for the VM reboot.
+        crate::sync::PidfdWait::TimedOut => false,
+        // pidfd_open failed (ESRCH/gone or env defect): one non-blocking
+        // reap attempt, then give up to the reboot.
+        crate::sync::PidfdWait::NoPidfd => matches!(child.try_wait(), Ok(Some(_))),
+    }
+}
+
 /// Start the boot scheduler binary if it exists. Thin wrapper around
 /// [`spawn_scheduler_from_paths`] supplying the boot-time paths
 /// (`/scheduler` + `/sched_args` + `/tmp/sched.log`). Returns the
@@ -4476,24 +4572,41 @@ fn start_trace_pipe() -> (Option<Arc<AtomicBool>>, Option<std::thread::JoinHandl
                     return;
                 };
                 let mut buf = [0u8; 4096];
-                let mut drain_deadline = None;
+                // Tier-2 (lossless dump): rolling tail so an exit-dump
+                // marker split across two reads is still matched by
+                // `scan_dump_markers`.
+                let mut scan_tail: Vec<u8> = Vec::new();
                 loop {
-                    if drain_deadline.is_none() && stop_clone.load(Ordering::Acquire) {
-                        drain_deadline =
-                            Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
-                    }
-                    if drain_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    // Break promptly once teardown signals stop. The only
+                    // ftrace event ktstr enables, `sched_ext_dump`, fires
+                    // ONLY as the one-shot crash dump (kernel scx_dump_state,
+                    // emitted contiguously before the disable workfn); the
+                    // disable itself emits no further trace. So trace_pipe
+                    // at stop holds only the residual TAIL of that one dump
+                    // still draining — a per-task dump (scx_dump_state with
+                    // dump_all_tasks) whose size scales with runnable-task
+                    // count, forwarded byte-by-byte over the slow PIO COM1
+                    // UART, so its drain time scales with task count — that
+                    // byte-by-byte COM1 forwarding is the tens-of-seconds
+                    // cost (the kernel disable itself is ms-scale), and the
+                    // dump is NOT disable-emitted.
+                    // Forwarding the whole tail pinned `trace_handle.join`
+                    // (the prior `drain_deadline` was checked only between
+                    // polls, never inside the inner drain). Dropping it on
+                    // stop is safe: teardown sets `stop` only AFTER the
+                    // dump-complete latch (end-marker already on COM1) or
+                    // the `SCX_DUMP_CAPTURE_TIMEOUT` bound; on the bound
+                    // this ftrace copy truncates, but the full dump is
+                    // captured via the scheduler's stderr log
+                    // (`dump_sched_output`, scx_utils' `ei->dump`) over the
+                    // fast bulk port — the authoritative copy.
+                    if stop_clone.load(Ordering::Acquire) {
                         break;
                     }
 
                     let mut pollfds = [PollFd::new(trace.as_fd(), PollFlags::POLLIN)];
                     match poll(&mut pollfds, PollTimeout::from(200u16)) {
-                        Ok(0) => {
-                            if drain_deadline.is_some() {
-                                break;
-                            }
-                            continue;
-                        }
+                        Ok(0) => continue,
                         Ok(_) => {}
                         Err(nix::errno::Errno::EINTR) => continue,
                         Err(_) => break,
@@ -4514,20 +4627,24 @@ fn start_trace_pipe() -> (Option<Arc<AtomicBool>>, Option<std::thread::JoinHandl
                         }
                     }
 
-                    // Drain every byte poll says is ready before
-                    // returning to the stop-flag check; otherwise a
-                    // continuous trace stream could starve the stop
-                    // signal for arbitrarily long. Inner-loop exits use
-                    // `break` (not `return`) so the outer poll loop
-                    // observes fd state (POLLHUP/POLLERR) and the
-                    // drain_deadline check on the next iteration —
-                    // terminating the thread from inside the drain
-                    // would skip both.
+                    // Drain the bytes poll reported ready, re-checking
+                    // `stop` after each chunk (below) so a continuous read
+                    // cannot pin the reader here. Inner-loop exits use
+                    // `break` (not `return`) so the outer loop's
+                    // prompt-stop check + poll fd-state handling
+                    // (POLLHUP/POLLERR) run on the next iteration.
                     loop {
                         match trace.read(&mut buf) {
                             Ok(0) => break,
                             Ok(n) => {
                                 let _ = com1.write_all(&buf[..n]);
+                                scan_dump_markers(&buf[..n], &mut scan_tail);
+                                // Re-check stop mid-batch so a continuous
+                                // stream cannot pin the reader here; break
+                                // to the prompt-stop check at the outer top.
+                                if stop_clone.load(Ordering::Acquire) {
+                                    break;
+                                }
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -4540,6 +4657,81 @@ fn start_trace_pipe() -> (Option<Arc<AtomicBool>>, Option<std::thread::JoinHandl
         (Some(stop), handle)
     } else {
         (None, None)
+    }
+}
+
+/// Trailing bytes of the previous trace_pipe chunk retained by
+/// [`scan_dump_markers`] so an exit-dump marker split across a read
+/// boundary is still matched. The longest marker
+/// (`SCX_EV_SUB_BYPASS_DISPATCH`, 26 bytes) fits with margin.
+const SCAN_TAIL_KEEP: usize = 32;
+
+/// Bound on how long teardown waits for the exit dump's end-marker to be
+/// forwarded to COM1 before disabling the `sched_ext_dump` tracepoint.
+/// The kernel builds+emits the whole dump synchronously at crash time
+/// (the `scx_disable_irq_workfn` irq path), so a SMALL dump's marker is
+/// forwarded well before teardown and the wait returns at once. A LARGE
+/// dump (many runnable tasks → scx_dump_state(dump_all_tasks) builds a
+/// per-task dump) can take tens of seconds to forward byte-by-byte over
+/// the slow PIO COM1 UART; this bound caps that so a big crash dump
+/// cannot wedge teardown. On the bound the ftrace copy is truncated; the
+/// authoritative full dump is the scheduler stderr log
+/// (`dump_sched_output`) over the fast bulk port.
+const SCX_DUMP_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Fired by the trace_pipe reader when the `sched_ext_dump` tracepoint
+/// emits its FIRST line this run — i.e. an exit dump started streaming.
+/// Read by teardown to decide whether to wait for completion: clean runs
+/// never start a dump, so they never pay the [`SCX_DUMP_CAPTURE_TIMEOUT`]
+/// wait.
+static SCX_DUMP_STARTED_LATCH: OnceLock<Arc<Latch>> = OnceLock::new();
+
+/// Fired by the trace_pipe reader when the exit dump's end-marker
+/// (`SCX_EV_SUB_BYPASS_DISPATCH`, the last event-counter line, or
+/// `~~~~ TRUNCATED ~~~~`) reaches it — the full dump is captured.
+/// Awaited by teardown before disabling the dump tracepoint so a fast
+/// crash teardown does not truncate the dump mid-emit.
+static SCX_DUMP_COMPLETE_LATCH: OnceLock<Arc<Latch>> = OnceLock::new();
+
+fn scx_dump_started_latch() -> Arc<Latch> {
+    SCX_DUMP_STARTED_LATCH
+        .get_or_init(|| Arc::new(Latch::new()))
+        .clone()
+}
+
+fn scx_dump_complete_latch() -> Arc<Latch> {
+    SCX_DUMP_COMPLETE_LATCH
+        .get_or_init(|| Arc::new(Latch::new()))
+        .clone()
+}
+
+/// True if `needle` occurs in `haystack`.
+fn slice_find(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Scan a freshly-read trace_pipe chunk for the sched_ext exit-dump
+/// start + end markers, firing [`scx_dump_started_latch`] /
+/// [`scx_dump_complete_latch`]. `tail` carries the last
+/// [`SCAN_TAIL_KEEP`] bytes of the previous chunk so a marker split
+/// across a read boundary is still matched. No-op once the dump is
+/// complete (the common case after one full dump).
+fn scan_dump_markers(chunk: &[u8], tail: &mut Vec<u8>) {
+    if scx_dump_complete_latch().is_set() {
+        return;
+    }
+    tail.extend_from_slice(chunk);
+    if !scx_dump_started_latch().is_set() && slice_find(tail, b"sched_ext_dump:") {
+        scx_dump_started_latch().set();
+    }
+    if slice_find(tail, b"SCX_EV_SUB_BYPASS_DISPATCH") || slice_find(tail, b"~~~~ TRUNCATED ~~~~") {
+        scx_dump_complete_latch().set();
+        tail.clear();
+        return;
+    }
+    let excess = tail.len().saturating_sub(SCAN_TAIL_KEEP);
+    if excess > 0 {
+        tail.drain(..excess);
     }
 }
 
@@ -6060,5 +6252,71 @@ mod tests {
             "atomic side channel must not publish via env var",
         );
         SCHED_PID.store(snapshot, Ordering::Release);
+    }
+
+    /// T2 regression: the trace_pipe→COM1 reader's dump-marker scanner
+    /// fires the started + complete latches, and matches the end-marker
+    /// even when it is split across a read boundary (the rolling-tail
+    /// seam — `SCAN_TAIL_KEEP` must exceed the longest marker so the split
+    /// prefix survives into the next chunk).
+    #[test]
+    fn scan_dump_markers_fires_latches_across_chunk_seam() {
+        let mut tail: Vec<u8> = Vec::new();
+        assert!(!scx_dump_started_latch().is_set());
+        assert!(!scx_dump_complete_latch().is_set());
+
+        // First dump line fires the started latch.
+        scan_dump_markers(
+            b"  init-1 [000] d.h1. 1.0: sched_ext_dump: init[1] triggered exit kind 1024:\n",
+            &mut tail,
+        );
+        assert!(
+            scx_dump_started_latch().is_set(),
+            "started latch fires on the first `sched_ext_dump:` line"
+        );
+        assert!(
+            !scx_dump_complete_latch().is_set(),
+            "complete latch unset before the end-marker"
+        );
+
+        // End-marker split across two reads — the rolling tail must match.
+        scan_dump_markers(b"  ...event counters... SCX_EV_SUB_BYPASS", &mut tail);
+        assert!(
+            !scx_dump_complete_latch().is_set(),
+            "a partial end-marker must not fire the complete latch"
+        );
+        scan_dump_markers(b"_DISPATCH: 0\n", &mut tail);
+        assert!(
+            scx_dump_complete_latch().is_set(),
+            "the seam-split end-marker matches via the rolling tail"
+        );
+    }
+
+    /// T3 regression: `reap_child_bounded` reaps a child that exits within
+    /// the bound, and gives up (false) on a still-live child once the
+    /// bound elapses — so a process that can't take its pending SIGKILL
+    /// promptly (the defensive case `SCHED_REAP_TIMEOUT` caps) cannot stall
+    /// teardown.
+    #[test]
+    fn reap_child_bounded_reaps_quick_and_times_out_on_live() {
+        let mut quick = std::process::Command::new("sleep")
+            .arg("0.1")
+            .spawn()
+            .expect("spawn sleep 0.1");
+        assert!(
+            reap_child_bounded(&mut quick, std::time::Duration::from_secs(10)),
+            "a child that exits within the bound is reaped"
+        );
+
+        let mut live = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep 30");
+        assert!(
+            !reap_child_bounded(&mut live, std::time::Duration::from_millis(200)),
+            "a still-live child is not reaped within the bound"
+        );
+        live.kill().unwrap();
+        live.wait().unwrap();
     }
 }

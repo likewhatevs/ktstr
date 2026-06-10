@@ -674,6 +674,7 @@ fn is_unmapped_work_type(w: &WorkType) -> bool {
         | WorkType::ForkExit
         | WorkType::NiceSweep
         | WorkType::AffinityChurn { .. }
+        | WorkType::CrossAffinityChurn { .. }
         | WorkType::PolicyChurn { .. }
         | WorkType::FanOutCompute { .. }
         | WorkType::PageFaultChurn { .. }
@@ -924,6 +925,7 @@ fn render_work_type(w: &WorkType) -> String {
         WorkType::ForkExit => render_work_type_todo("ForkExit"),
         WorkType::NiceSweep => render_work_type_todo("NiceSweep"),
         WorkType::AffinityChurn { .. } => render_work_type_todo("AffinityChurn"),
+        WorkType::CrossAffinityChurn { .. } => render_work_type_todo("CrossAffinityChurn"),
         WorkType::PolicyChurn { .. } => render_work_type_todo("PolicyChurn"),
         WorkType::FanOutCompute { .. } => render_work_type_todo("FanOutCompute"),
         WorkType::PageFaultChurn { .. } => render_work_type_todo("PageFaultChurn"),

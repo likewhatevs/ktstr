@@ -1121,6 +1121,150 @@ fn holdspec_loop_arm_exits_early_when_sched_dies_during_hold() {
     );
 }
 
+/// Custom worker that refuses the cooperative SIGUSR1 stop:
+/// installs `SIG_IGN` for SIGUSR1 and clears any STOP the framework's
+/// handler set before SIG_IGN took effect, then sleeps past
+/// `stop_and_collect`'s 5s collection deadline. A small duplicate of
+/// `spawn::testing::ignores_sigusr1_fn` (a `pub(super)` fixture in the
+/// spawn test tree, not reachable from this module). The STOP clear
+/// makes it race-immune: a SIGUSR1 that lands before SIG_IGN is
+/// installed flips STOP via the default handler, but the clear undoes
+/// it, so the worker keeps sleeping and only a SIGKILL terminates it.
+fn ignores_sigusr1_spin(ctx: &crate::workload::WorkerCtx) -> crate::workload::WorkerReport {
+    use std::sync::atomic::Ordering;
+    let stop = ctx.stop();
+    // SAFETY: runs in a freshly-forked, single-threaded worker child,
+    // where `libc::signal` is async-signal-safe.
+    unsafe {
+        libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+    }
+    stop.store(false, Ordering::Relaxed);
+    let deadline = std::time::Instant::now() + Duration::from_secs(7);
+    while !stop.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    crate::workload::WorkerReport::default()
+}
+
+/// Scheduler-death teardown is prompt: the during-hold crash path
+/// SIGKILLs the step's workers BEFORE collecting them, so the
+/// per-worker reap in `stop_and_collect` does not pay its 5s
+/// cooperative-stop deadline.
+///
+/// Setup mirrors
+/// `holdspec_loop_arm_exits_early_when_sched_dies_during_hold`: a dead
+/// `sched_pid` (`pid_t::MAX`, above PID_MAX_LIMIT → `pidfd_open`
+/// ESRCH) makes `hold_or_sched_died` report the scheduler dead on the
+/// first hold, driving run_scenario's during-hold path. The workers
+/// (`ignores_sigusr1_spin`) ignore SIGUSR1, so the cooperative stop
+/// never lands; without the `sigkill_handles` pre-pass before
+/// `collect_step`, the collect waits out the full 5s deadline (the
+/// `sigkill_workers_makes_collect_prompt_for_sigusr1_ignoring_workers`
+/// test pins that same shape at the WorkloadHandle layer). With the
+/// pre-pass the workers are SIGKILLed up front and the reap returns
+/// promptly.
+///
+/// The 2s bound is well under the 5s deadline and far above the
+/// sub-second fast path (the workers sleep, so SIGKILL drops them
+/// immediately). A regression that removes the during-hold
+/// `sigkill_handles` call surfaces here as a ~5s teardown. This is the
+/// path the scheduler-crash reproducers hit; the inter-step and final
+/// paths apply the same `sigkill_handles` pre-pass to the backdrop
+/// handles before `collect_backdrop`.
+#[test]
+fn during_hold_sched_death_sigkills_workers_before_collect() {
+    let mock = MockCgroupOps::new();
+    let topo = mock_topo();
+    let mut ctx = mock_ctx(&mock, &topo);
+    ctx.duration = Duration::from_secs(10);
+    // Dead scheduler pid (above PID_MAX_LIMIT) → hold_or_sched_died
+    // reports death on the first hold. SCHED_PID is the live read in
+    // run_scenario; restore it on exit (panic-safe) so neighbor tests
+    // keep their no-scheduler contract.
+    ctx.sched_pid = Some(libc::pid_t::MAX);
+    crate::vmm::rust_init::set_sched_pid(libc::pid_t::MAX);
+    struct ResetSchedPid;
+    impl Drop for ResetSchedPid {
+        fn drop(&mut self) {
+            crate::vmm::rust_init::set_sched_pid(0);
+        }
+    }
+    let _reset = ResetSchedPid;
+    // Op::spawn_host spawns real worker processes in the runner's own
+    // cgroup (zero cgroup ops, so MockCgroupOps is untouched). The
+    // workers ignore SIGUSR1, so only the sigkill pre-pass terminates
+    // them promptly.
+    let work = WorkSpec::default()
+        .workers(6)
+        .work_type(WorkType::custom("ignores_sigusr1", ignores_sigusr1_spin));
+    let steps = vec![Step::new(
+        vec![Op::spawn_host(work)],
+        HoldSpec::Fixed(Duration::from_secs(1)),
+    )];
+    let start = std::time::Instant::now();
+    let result =
+        execute_steps(&ctx, steps).expect("execute_steps returns Ok even when the scheduler dies");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "during-hold scheduler-death teardown took {elapsed:?}; expected \
+         < 2s. The SIG_IGN workers force stop_and_collect's ~5s \
+         cooperative-stop deadline unless the during-hold path SIGKILLs \
+         them before collecting (sigkill_handles pre-pass missing?).",
+    );
+    assert!(
+        !result.is_pass(),
+        "scheduler death during the hold must mark the scenario failed; \
+         got passed=true: {:?}",
+        result.outcomes,
+    );
+}
+
+/// `hold_or_sched_died` aborts on the BPF err-exit latch (set at the
+/// crash) WITHOUT waiting for the scheduler PROCESS to exit — the
+/// fast-crash-detection path that keeps crash-repro tests from paying a
+/// slow scheduler's process-exit latency (scx_lavd's process exit trails
+/// the crash by ~1s: its userspace poll loop observes the disable, then
+/// flushes its dump and exits). Forces the probe mirror to `Crashed` and
+/// passes a LIVE pid (this test process, which
+/// never exits during the test): a hold that only watched the pidfd
+/// would block the full 30s, so a sub-2s return proves the latch poll
+/// aborted it.
+#[test]
+fn hold_aborts_on_err_exit_latch_not_process_exit() {
+    use crate::probe::process::{SchedExitKind, sched_exit_kind, set_probe_sched_exit_state};
+    // The mirror is a process-global atomic; reset it (panic-safe) so a
+    // forced `Crashed` does not leak into neighbor tests.
+    struct ResetExitState;
+    impl Drop for ResetExitState {
+        fn drop(&mut self) {
+            set_probe_sched_exit_state(SchedExitKind::Unknown);
+        }
+    }
+    let _reset = ResetExitState;
+    set_probe_sched_exit_state(SchedExitKind::Crashed);
+    assert_eq!(
+        sched_exit_kind(),
+        SchedExitKind::Crashed,
+        "setup: the probe mirror must read Crashed after the override",
+    );
+    // A live thread-group leader that does not exit during the test, so
+    // any abort comes from the latch poll, not the pidfd backstop.
+    let live_pid = unsafe { libc::getpid() };
+    let start = std::time::Instant::now();
+    let died = hold_or_sched_died(Duration::from_secs(30), Some(live_pid));
+    let elapsed = start.elapsed();
+    assert!(
+        died,
+        "hold_or_sched_died must report sched-died when the err-exit latch is Crashed",
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "hold must abort on the latch within ~one poll interval, not wait for \
+         the live process or the full 30s dur; took {elapsed:?}",
+    );
+}
+
 /// The Loop arm's apply_ops error-propagation path: an
 /// `apply_ops` Err on iteration N at mod.rs:1175 exits the loop
 /// via the `drain_on_err!` macro (mod.rs:1151-1161) which

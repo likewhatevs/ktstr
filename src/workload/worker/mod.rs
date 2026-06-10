@@ -336,28 +336,50 @@ pub(super) fn worker_main(
     let mut iteration_costs_ns: Vec<u64> = Vec::with_capacity(MAX_WAKE_SAMPLES);
     let mut iteration_cost_sample_count: u64 = 0;
     let mut iterations: u64 = 0;
-    // AffinityChurn: read effective cpuset once at start via sched_getaffinity.
-    // Custom: delegate entirely to the user function. Affinity and
+    // AffinityChurn / CrossAffinityChurn: read the effective cpuset
+    // once at start via sched_getaffinity (read_effective_cpus).
+    // Custom: hand the user function a WorkerCtx. Affinity and
     // sched_policy are already applied above.
     if let WorkType::Custom { run, .. } = &work_type {
-        return run.call(stop);
+        // The ctx exposes the same effective cpuset and cgroup-sibling
+        // pids the built-in affinity-churn variants compute, so a
+        // custom probe need not re-roll sched_getaffinity or
+        // cgroup.procs parsing. Read both once here, before handing
+        // control to the user function.
+        let cpus = read_effective_cpus();
+        let sibling_pids = read_sibling_pids();
+        let ctx = WorkerCtx::new(stop, &cpus, &sibling_pids);
+        return run.call(&ctx);
     }
 
-    let affinity_churn_cpus: Vec<usize> = if matches!(work_type, WorkType::AffinityChurn { .. }) {
-        let mut cpu_set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-        let ret = unsafe {
-            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut cpu_set)
-        };
-        if ret == 0 {
-            (0..libc::CPU_SETSIZE as usize)
-                .filter(|c| unsafe { libc::CPU_ISSET(*c, &cpu_set) })
-                .collect()
-        } else {
-            Vec::new()
-        }
+    let affinity_churn_cpus: Vec<usize> = if matches!(
+        work_type,
+        WorkType::AffinityChurn { .. } | WorkType::CrossAffinityChurn { .. }
+    ) {
+        read_effective_cpus()
     } else {
         Vec::new()
     };
+    // CrossAffinityChurn: discover the sibling worker pids once at
+    // entry — a flipper sees only the cgroup members present when it
+    // starts (targets must be declared before the flipper WorkSpec;
+    // apply_setup starts WorkSpecs serially in declaration order — see
+    // the WorkType::CrossAffinityChurn doc). Precompute two cpuset
+    // sub-masks one CPU apart, so each sched_setaffinity is a genuine
+    // mask change.
+    let cross_affinity_targets: Vec<libc::pid_t> =
+        if matches!(work_type, WorkType::CrossAffinityChurn { .. }) {
+            read_sibling_pids()
+        } else {
+            Vec::new()
+        };
+    let cross_affinity_masks: Option<(libc::cpu_set_t, libc::cpu_set_t)> =
+        if matches!(work_type, WorkType::CrossAffinityChurn { .. }) {
+            build_cross_affinity_masks(&affinity_churn_cpus)
+        } else {
+            None
+        };
+    let mut cross_affinity_toggle = false;
     // PolicyChurn: build list of (policy, priority) pairs to cycle through.
     // Non-RT policies always available; RT (FIFO/RR) only with CAP_SYS_NICE.
     let policy_churn_policies: Vec<(i32, i32)> =
@@ -1127,6 +1149,43 @@ pub(super) fn worker_main(
                             &cpu_set,
                         );
                     }
+                }
+                let before_yield = Instant::now();
+                std::thread::yield_now();
+                reservoir_push(
+                    &mut wake_latencies_ns,
+                    &mut wake_sample_count,
+                    before_yield.elapsed().as_nanos() as u64,
+                    MAX_WAKE_SAMPLES,
+                );
+                iterations += 1;
+            }
+            WorkType::CrossAffinityChurn { spin_iters } => {
+                spin_burst(&mut work_units, spin_iters);
+                // Toggle every sibling between the two sub-masks. Each
+                // call is a genuine mask change (the masks differ by
+                // one CPU), so the kernel runs the full
+                // set_cpus_allowed path every iteration. No-op when
+                // alone (no siblings) or with a <2-CPU cpuset (no
+                // distinct masks).
+                if let Some((mask_a, mask_b)) = &cross_affinity_masks
+                    && !cross_affinity_targets.is_empty()
+                {
+                    let mask: *const libc::cpu_set_t = if cross_affinity_toggle {
+                        mask_a
+                    } else {
+                        mask_b
+                    };
+                    for &pid in &cross_affinity_targets {
+                        unsafe {
+                            libc::sched_setaffinity(
+                                pid,
+                                std::mem::size_of::<libc::cpu_set_t>(),
+                                mask,
+                            );
+                        }
+                    }
+                    cross_affinity_toggle = !cross_affinity_toggle;
                 }
                 let before_yield = Instant::now();
                 std::thread::yield_now();
@@ -3420,6 +3479,83 @@ pub(super) fn spin_burst(work_units: &mut u64, count: u64) {
         *work_units = std::hint::black_box(work_units.wrapping_add(1));
         std::hint::spin_loop();
     }
+}
+
+/// Read the worker's effective cpuset (the CPUs it may run on) via
+/// `sched_getaffinity(0)`. Returns the set CPU indices, or an empty
+/// vec if the query fails. Shared by the [`WorkType::AffinityChurn`] /
+/// [`WorkType::CrossAffinityChurn`] setup and by `WorkerCtx::cpus` so
+/// the syscall logic lives in one place.
+fn read_effective_cpus() -> Vec<usize> {
+    let mut cpu_set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    let ret =
+        unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut cpu_set) };
+    if ret == 0 {
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|c| unsafe { libc::CPU_ISSET(*c, &cpu_set) })
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Read the calling worker's sibling pids from its cgroup's
+/// `cgroup.procs`, excluding the caller's own pid. Used by the
+/// [`WorkType::CrossAffinityChurn`] arm and by
+/// `WorkerCtx::sibling_pids` so a Custom worker gets the same peer
+/// set without re-deriving it from `/proc`+`/sys`.
+///
+/// cgroup v2: `/proc/self/cgroup` is a single `0::/<rel>` line; the
+/// members live in `/sys/fs/cgroup<rel>/cgroup.procs`. The set is the
+/// worker's CGROUP membership, so this is only meaningful in a
+/// dedicated cgroup (see the `CrossAffinityChurn` doc). Any read
+/// error yields an empty set (the caller treats "no siblings" as a
+/// no-op).
+pub(super) fn read_sibling_pids() -> Vec<libc::pid_t> {
+    let me = unsafe { libc::getpid() };
+    let rel = std::fs::read_to_string("/proc/self/cgroup")
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.strip_prefix("0::").map(|s| s.trim().to_string()))
+        .unwrap_or_else(|| "/".to_string());
+    let procs_path = format!("/sys/fs/cgroup{rel}/cgroup.procs");
+    std::fs::read_to_string(&procs_path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().parse::<libc::pid_t>().ok())
+        .filter(|&pid| pid != me)
+        .collect()
+}
+
+/// Build two cpuset sub-masks that differ by exactly one CPU, from
+/// the worker's effective `cpus`. `mask_a` covers all of `cpus`;
+/// `mask_b` drops the last. Toggling between them makes every
+/// `sched_setaffinity` a genuine mask change (never `cpumask_equal`
+/// to the task's current mask), so the kernel runs the full
+/// `set_cpus_allowed` path each iteration rather than early-returning.
+/// Returns `None` when `cpus` has fewer than 2 entries — no two
+/// distinct masks are possible, so [`WorkType::CrossAffinityChurn`] is
+/// a no-op for that worker.
+pub(super) fn build_cross_affinity_masks(
+    cpus: &[usize],
+) -> Option<(libc::cpu_set_t, libc::cpu_set_t)> {
+    if cpus.len() < 2 {
+        return None;
+    }
+    let make = |drop_last: bool| -> libc::cpu_set_t {
+        let take = if drop_last {
+            cpus.len() - 1
+        } else {
+            cpus.len()
+        };
+        let mut s: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        unsafe { libc::CPU_ZERO(&mut s) };
+        for &c in cpus.iter().take(take) {
+            unsafe { libc::CPU_SET(c, &mut s) };
+        }
+        s
+    };
+    Some((make(false), make(true)))
 }
 
 /// Strided read-modify-write over a cache buffer.

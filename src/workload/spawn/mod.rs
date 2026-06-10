@@ -4842,6 +4842,57 @@ impl WorkloadHandle {
         // (e.g. under degrade mode) don't serially exhaust the VM
         // timeout.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        // Bound on the post-SIGKILL worker reap (below). A worker normally
+        // exits <<1s after SIGKILL (post-crash bypass keeps it
+        // CFS-schedulable). The rare wedge: a sched_setaffinity flipper
+        // stuck uninterruptible in `affine_move_task`'s `wait_for_completion`
+        // — a migration that can't finish until the target becomes
+        // migratable, which during the crash/bypass window can take seconds
+        // — cannot take its pending SIGKILL until that syscall returns, so a
+        // blocking `waitpid` would stall collect for that whole window.
+        // The deadline is SHARED across workers: every such wedge waits out
+        // the SAME crash/bypass window, so once one times out the rest get
+        // the remaining (~0) budget and give up immediately rather than
+        // summing to N×timeout. Mirrors the scheduler-side
+        // `reap_child_bounded` (rust_init.rs); on timeout the zombie is left
+        // for VM reboot to reap (SIGKILL cannot make it exit faster — see
+        // that fn's doc).
+        const WORKER_REAP_TIMEOUT: Duration = Duration::from_secs(3);
+        let mut worker_reap_deadline: Option<Instant> = None;
+        // Evented, bounded reap of a SIGKILLed worker `pid`: wait up to
+        // `timeout` for it to become a zombie (`pidfd_open` + `poll`),
+        // then reap non-blocking. Returns false on timeout (worker still
+        // uninterruptibly wedged — the rare case `WORKER_REAP_TIMEOUT`
+        // documents; left for VM reboot).
+        fn reap_pid_bounded(pid: libc::pid_t, timeout: Duration) -> bool {
+            // Non-blocking reap of `pid` (observed StillAlive just above,
+            // so this succeeds only once it has become a zombie).
+            let reap = || {
+                matches!(
+                    nix::sys::wait::waitpid(
+                        nix::unistd::Pid::from_raw(pid),
+                        Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+                    ),
+                    Ok(nix::sys::wait::WaitStatus::Exited(..))
+                        | Ok(nix::sys::wait::WaitStatus::Signaled(..))
+                )
+            };
+            match crate::sync::pidfd_poll_exited(pid, timeout) {
+                // Readable => zombie => the WNOHANG reap is non-blocking.
+                crate::sync::PidfdWait::Exited => {
+                    let _ = reap();
+                    true
+                }
+                // Still uninterruptibly wedged (see `WORKER_REAP_TIMEOUT`):
+                // leave the zombie-to-be for VM reboot (SIGKILL already
+                // pending).
+                crate::sync::PidfdWait::TimedOut => false,
+                // pidfd_open failed (ESRCH/gone): one non-blocking reap.
+                crate::sync::PidfdWait::NoPidfd => reap(),
+            }
+        }
+
         for child in children {
             let mut buf = Vec::new();
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -4876,7 +4927,17 @@ impl WorkloadHandle {
             let still_running = matches!(waited, Ok(nix::sys::wait::WaitStatus::StillAlive));
             let exit_info_source: Result<nix::sys::wait::WaitStatus, nix::errno::Errno> =
                 if still_running {
-                    let _ = nix::sys::wait::waitpid(npid, None);
+                    // Bounded reap (see `reap_pid_bounded` + the shared
+                    // `worker_reap_deadline` above): replaces a blocking
+                    // `waitpid(npid, None)` that stalled on a worker
+                    // uninterruptibly wedged in an affine_move_task
+                    // migration (seconds; see `WORKER_REAP_TIMEOUT`).
+                    // exit_info stays `StillAlive` either way — the prior
+                    // blocking reap also discarded the status here.
+                    let rd = *worker_reap_deadline
+                        .get_or_insert_with(|| Instant::now() + WORKER_REAP_TIMEOUT);
+                    let remaining = rd.saturating_duration_since(Instant::now());
+                    reap_pid_bounded(child.pid, remaining);
                     Ok(nix::sys::wait::WaitStatus::StillAlive)
                 } else {
                     waited
@@ -5092,6 +5153,73 @@ impl WorkloadHandle {
         }
 
         reports
+    }
+
+    /// Deliver the terminal stop to every live worker without
+    /// reaping. Signal-only: NO `waitpid`, NO fd close, NO consume of
+    /// `self`, no blocking of any kind. Reaping, the fd/region
+    /// cleanup, and (for `stop_and_collect`) report decoding all
+    /// belong to the subsequent [`Self::stop_and_collect`] or
+    /// [`Drop`] — doing any of them here would double-reap. This only
+    /// pre-delivers the terminal signal so that reap finds workers
+    /// already exiting.
+    ///
+    /// # Why (fork mode — the case this exists for)
+    ///
+    /// When the sched_ext scheduler under test errors out, the kernel
+    /// disables sched_ext and its tasks fall back to the builtin
+    /// scheduler, where CPU-bound workers keep spinning under
+    /// contention. The normal reap in `stop_and_collect` SIGKILLs one
+    /// worker then *blocks* in `waitpid` for it while the rest have
+    /// had only the cooperative SIGUSR1 and keep spinning, so each
+    /// dying worker must win a CPU slice against every still-runnable
+    /// sibling before it can run its exit path — the serial reap
+    /// becomes scheduling-gated and teardown time scales with worker
+    /// count. `kill_and_killpg(SIGKILL)` here is delivered, not
+    /// cooperative: once every worker carries a pending SIGKILL none
+    /// re-enters userspace, so no worker competes for the CPU while
+    /// the reap drains them, and each killed worker's report-pipe
+    /// write end closes so the reap's `poll` returns `POLLHUP`
+    /// immediately instead of waiting out its deadline. One
+    /// `kill_and_killpg` per `ForkedChild` covers both a plain worker
+    /// and a pcomm container: SIGKILL on any thread is fatal to the
+    /// whole thread group, and `killpg` additionally reaches
+    /// descendants — every forked child is its own process-group
+    /// leader via `setpgid(0, 0)`, so pgid == child pid (mirrors the
+    /// `killpg` in [`Drop`]).
+    ///
+    /// # Thread mode
+    ///
+    /// Thread-mode workers share the harness tgid and cannot be
+    /// signalled individually, so there is NO SIGKILL fast path for
+    /// them. This flips each worker's cooperative `stop` flag — the
+    /// same store `stop_and_collect` and [`Drop`] already do, just
+    /// earlier — and the worker still only observes it on its next
+    /// futex-wait wake (`WORKER_STOP_POLL_NS`, ~100 ms). It is
+    /// therefore NOT a teardown speedup for thread mode; it is kept
+    /// for symmetry and is cheap and harmless (an idempotent relaxed
+    /// store). The win is fork-mode only, which is where the
+    /// SIGKILL-vs-cooperative distinction exists.
+    ///
+    /// # Frozen cgroups
+    ///
+    /// A cgroup-frozen worker is not a special case here. The freezer
+    /// parks a userspace task in `TASK_INTERRUPTIBLE` (the jobctl
+    /// freezer trap), so a fatal signal wakes it and it exits on its
+    /// next `get_signal` — SIGKILL kills a frozen worker with no
+    /// unfreeze required. (`collect_step` / `collect_backdrop` still
+    /// unfreeze each cgroup as their first teardown step for reasons of
+    /// their own; this method does not depend on that.)
+    pub(crate) fn sigkill_workers(&self) {
+        for child in &self.children {
+            kill_and_killpg(
+                nix::unistd::Pid::from_raw(child.pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        for tw in &self.threads {
+            tw.stop.store(true, Ordering::Relaxed);
+        }
     }
 }
 

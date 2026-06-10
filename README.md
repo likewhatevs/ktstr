@@ -65,69 +65,12 @@ automates this:
 
 ## Installation
 
-Add ktstr as a dev-dependency. The simplest form pulls in the full
-default feature set (matches what the installed `cargo-ktstr` /
-`ktstr` binaries expect):
+Add ktstr as a dev-dependency:
 
 ```toml
 [dev-dependencies]
-ktstr = "0.10"
+ktstr = "0.11"
 ```
-
-For a leaner transitive dep graph in the downstream consumer's
-build, opt out of the host-tooling deps (`tikv-jemallocator`,
-`clap_complete`, `tree-sitter`, `tree-sitter-c`, `base64`) — none
-of which the test-author surface references:
-
-```toml
-[dev-dependencies]
-ktstr = { version = "0.10", default-features = false, features = ["llm"] }
-```
-
-The `llm` feature (default-on) keeps the `OutputFormat::LlmExtract`
-path available; drop it too if no payload in the test crate uses
-`LlmExtract`. See [Feature flags](#feature-flags) below for the
-full menu. The host-tooling deps stay in the installed `cargo-ktstr`
-binary via its `required-features = ["cli-bins"]` declaration —
-`cargo install --locked ktstr` is unaffected.
-
-### ktstr is dev-only — it does not link into your release binary
-
-`[dev-dependencies]` is structurally isolated from prod artifacts by
-Cargo:
-
-- `cargo build` / `cargo build --release` of the downstream crate
-  **does not compile ktstr's source, does not run ktstr's `build.rs`,
-  and does not link any ktstr code into the resulting binary**.
-- The compiler refuses to resolve `use ktstr::...` outside
-  `#[cfg(test)]` / `tests/` / `benches/` / `examples/`, so accidental
-  prod-side imports fail at build time with an `unresolved import`
-  error — not at runtime.
-- ktstr's heavy `build.rs` work (busybox source build, BPF skeleton
-  generation, vendored libbpf C build) runs **only during test
-  compilation**, never during a pure `cargo build --release`.
-
-Quick verification a downstream consumer can run on their own crate:
-
-```sh
-# Release build should compile zero ktstr code:
-cargo build --release 2>&1 | grep -c "Compiling ktstr"        # → 0
-# And the release binary should reference no ktstr symbols:
-nm target/release/<your-bin> 2>/dev/null | grep -c ktstr      # → 0
-# Test build does compile ktstr (and its build.rs runs):
-cargo test --no-run 2>&1 | grep -c "Compiling ktstr"          # → 1+
-```
-
-**Feature-unification caveat.** Cargo's resolver v1 (pre-2021-edition
-default) unifies features across prod *and* dev-deps globally. If
-ktstr enables `libbpf-rs/vendored` and the downstream crate has its
-own prod `libbpf-rs` dep at the same version, the prod libbpf-rs
-would silently flip to vendored under v1. Resolver v2 (Rust 2021
-edition default, `resolver = "2"`) and v3 (Rust 2024 edition default)
-fix this: dev-deps-only feature activations don't affect non-test
-target builds. If your downstream crate is on edition 2021+ this is
-already handled; older crates should set `resolver = "2"` in their
-workspace `Cargo.toml`.
 
 The library is the test-author surface. The `anyhow::Result`
 referenced in examples below is re-exported through
@@ -154,43 +97,12 @@ This installs:
   diagnostic commands; `cargo-ktstr` already covers the test
   flow.
 
-**Note:** if you build the workspace with `--no-default-features`
-the `[[bin]]` targets above are silently skipped (they declare
-`required-features = ["cli-bins"]`). Re-enable explicitly with
-`--features cli-bins` if you need the bins from a no-default build.
-
-### Feature flags
-
-- **`llm`** (default-on) — local-CPU LLM extraction via the
-  bundled Qwen3-4B GGUF (`OutputFormat::LlmExtract`). Pulls in
-  `llama-cpp-2` (cmake C++ build; minutes on cold cache).
-- **`cli-bins`** (default-on) — umbrella for crates used only by
-  the installed `ktstr` / `cargo-ktstr` binaries and the
-  matching test-binary dispatch hooks. Includes `tikv-jemallocator`
-  (process-wide allocator), `clap_complete` (completions),
-  `tree-sitter` + `tree-sitter-c` (BTF anchor codegen), and the
-  `export` feature.
-- **`export`** (pulled in by `cli-bins`) — gates the `export`
-  module and the test-binary's `cargo ktstr export <name>` dispatch
-  arm. Drops `base64` from the manifest when off.
-- **`wprof`** (off-by-default) — embeds the wprof BPF tracer in
-  shell-mode VMs. First build clones `github.com/anakryiko/wprof`
-  and compiles libbpf + blazesym (needs git, clang, elfutils-devel,
-  zlib-devel; takes several minutes).
-- **`pretty-labels`** (off-by-default) — grex-based regex synthesis
-  for `ctprof_compare` display labels. Without it, labels fall back
-  to the deterministic join key (same data, less polish).
-- **`remote-cache`** (off-by-default) — GitHub Actions cache
-  integration for the blob store. CI-only.
-- **`integration`** — gates `resolve_func_ip` visibility for
-  in-repo integration tests.
-
 **Version compatibility:** pin the EXACT ktstr patch version across
 `[dev-dependencies] ktstr = "X.Y.Z"` and
 `cargo install --locked --bin cargo-ktstr ktstr@X.Y.Z`. ktstr is
 pre-1.0 — minor-version bumps may break the test-facing API, and
 patch bumps may break unstable internal surfaces (the CI matrix
-runs against the locked patch). Examples below assume 0.10; an
+runs against the locked patch). Examples below assume 0.11; an
 example from a different release may not compile against the crate
 this README documents.
 

@@ -869,6 +869,16 @@ fn run_scenario(
             Ok::<(), anyhow::Error>(())
         });
         if let Err(err) = setup_res {
+            // Scheduler crashed during backdrop setup (e.g. a worker
+            // tripped the BPF error before the first Step): SIGKILL the
+            // spawned workers up front so the collect reaps below aren't
+            // scheduling-gated behind fallback workers (see
+            // `sigkill_handles`). Gated on `scx_down` (crash-only) so a
+            // non-crash setup error keeps the graceful collect path.
+            if sched_crashed_unexpectedly() {
+                sigkill_handles(&backdrop_state.handles);
+                sigkill_handles(&step_staging.handles);
+            }
             // Collect any workers that DID spawn before the failure
             // so their stats reach the final result instead of being
             // discarded by `WorkloadHandle::drop` (which SIGKILLs
@@ -920,8 +930,14 @@ fn run_scenario(
         // cannot meaningfully report on a pid that doesn't exist.
         if step_idx > 0
             && let Some(pid) = crate::vmm::rust_init::sched_pid()
-            && !process_alive(pid)
+            && (!process_alive(pid) || dispatch::scx_down())
         {
+            // Scheduler died between steps: the kernel has disabled
+            // sched_ext and the backdrop workers have fallen back to
+            // the builtin scheduler. SIGKILL them up front so the
+            // collect reap below isn't scheduling-gated behind
+            // still-spinning workers (see `sigkill_handles`).
+            sigkill_handles(&backdrop_state.handles);
             // Collect backdrop-owned workload handles into the
             // result before reporting the crash so whatever the
             // persistent workers produced is still assertable.
@@ -978,6 +994,19 @@ fn run_scenario(
             &mut sched_died_during_hold,
         );
 
+        // Scheduler died during this step's hold: the kernel has
+        // disabled sched_ext and the workers (step and backdrop) have
+        // fallen back to the builtin scheduler. If CPU-bound they
+        // would CFS-starve the per-worker reap in the collect calls
+        // below, so SIGKILL them all up front — the reaps then find
+        // already-exiting workers (see `sigkill_handles`). Gated on
+        // the death flag so the normal teardown keeps its graceful
+        // cooperative-stop + report-collection path.
+        if sched_died_during_hold || sched_crashed_unexpectedly() {
+            sigkill_handles(&step_state.handles);
+            sigkill_handles(&backdrop_state.handles);
+        }
+
         if guest_comms::is_guest() {
             crate::vmm::guest_comms::send_scenario_pause();
         }
@@ -992,6 +1021,16 @@ fn run_scenario(
         // the error context as a detail, instead of an opaque Err
         // that discards everything.
         if let Err(err) = step_res {
+            // Scheduler may have crashed between the pre-collect gate
+            // above and here (e.g. a non-crash step error, then scx went
+            // down during `collect_step`): SIGKILL the backdrop workers
+            // up front so this collect isn't scheduling-gated behind the
+            // fallback pool (see `sigkill_handles`). Crashed-only gate so
+            // a plain step error with a live scheduler keeps the graceful
+            // cooperative-stop path.
+            if sched_crashed_unexpectedly() {
+                sigkill_handles(&backdrop_state.handles);
+            }
             // Collect Backdrop-owned workload handles into a fresh
             // result first, then merge the accumulated step result
             // on top. `collect_backdrop` drains
@@ -1045,7 +1084,16 @@ fn run_scenario(
     // sched_pid() == None ⇒ no scheduler configured (kernel-default
     // path) OR Op::DetachScheduler cleared it; no liveness to
     // report on either case.
-    let sched_dead = crate::vmm::rust_init::sched_pid().is_some_and(|pid| !process_alive(pid));
+    let sched_dead = crate::vmm::rust_init::sched_pid()
+        .is_some_and(|pid| !process_alive(pid) || dispatch::scx_down());
+
+    // Scheduler died after the last hold: SIGKILL the backdrop
+    // workers up front so the teardown reap below isn't
+    // scheduling-gated behind still-spinning workers that fell back
+    // to the builtin scheduler (see `sigkill_handles`).
+    if sched_dead {
+        sigkill_handles(&backdrop_state.handles);
+    }
 
     // --- Backdrop teardown ---
     let backdrop_result =
@@ -1119,16 +1167,58 @@ fn panic_evented_hold_defect(
     panic!("ktstr::scenario::hold_or_sched_died: {op} failed (pid={pid}): {err} — {advice}");
 }
 
+/// True when a scheduler is still expected running (`sched_pid` set) AND
+/// sched_ext has gone down (`disabling`/`disabled`) — an unexpected
+/// crash/unregister of the scheduler under test, detected via the
+/// probe-independent [`dispatch::scx_down`] sysfs read. Unlike the BPF
+/// err-exit latch (whose host mirror is only populated in the
+/// auto-repro/dump VM, never the primary VM that runs the test), this is
+/// live in the PRIMARY VM. The `sched_pid` guard keeps a clean
+/// [`Op::DetachScheduler`] — which clears the pid before the state
+/// settles to `disabled` — off the SIGKILL fast-path. Used by the
+/// teardown gates that don't already hold the scheduler pid in scope.
+fn sched_crashed_unexpectedly() -> bool {
+    crate::vmm::rust_init::sched_pid().is_some() && dispatch::scx_down()
+}
+
 fn hold_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
+    use crate::probe::process::{SchedExitKind, sched_exit_kind};
     use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 
+    // The BPF err-exit latch (read via `sched_exit_kind`) flips at the
+    // error-class sched_ext exit — i.e. at the crash, before the crashed
+    // scheduler PROCESS exits (a scheduler like scx_lavd observes the
+    // disable through its ~1s userspace poll loop, then flushes its dump
+    // and exits, so its process exit trails the crash by ~that long). Poll
+    // it ALONGSIDE the pidfd so a crash aborts the hold at ~crash time, not
+    // at the process exit. The pidfd remains the backstop for
+    // clean/non-error process exits. 100ms is negligible vs the crash + the
+    // scheduler's exit latency.
+    const ERR_EXIT_POLL: Duration = Duration::from_millis(100);
+    let crashed = || matches!(sched_exit_kind(), SchedExitKind::Crashed);
+
     if dur.is_zero() {
-        return sched_pid.is_some_and(|pid| !process_alive(pid));
+        return crashed()
+            || (sched_pid.is_some() && dispatch::scx_down())
+            || sched_pid.is_some_and(|pid| !process_alive(pid));
     }
+    let deadline = std::time::Instant::now() + dur;
     let Some(pid) = sched_pid else {
-        thread::sleep(dur);
-        return false;
+        // No scheduler pid (host-only run, or the pid was not recorded):
+        // no pidfd to wait on, but the err-exit latch still fires on a
+        // crash — poll it in short intervals instead of sleeping blind
+        // for the whole window.
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return crashed();
+            }
+            if crashed() {
+                return true;
+            }
+            thread::sleep(remaining.min(ERR_EXIT_POLL));
+        }
     };
 
     // `pidfd_open(pid, 0)`: returns an fd that becomes readable when
@@ -1192,23 +1282,40 @@ fn hold_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
         );
     }
 
-    let deadline = std::time::Instant::now() + dur;
     let mut events = [EpollEvent::empty()];
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            // Hold elapsed without a wakeup. Re-probe once via
-            // `process_alive` to catch a race where the pid exited
-            // between the last `epoll_wait` return and the deadline
-            // check (e.g. during EINTR re-entry).
-            return !process_alive(pid);
+            // Hold elapsed without a wakeup. Re-probe ALL signals to
+            // catch a race where the pid exited, the err-exit latch
+            // flipped, or sched_ext went down (sysfs) between the last
+            // `epoll_wait` return and the deadline check (e.g. during
+            // EINTR re-entry). `pid` is `Some` here, so the
+            // scheduler-expected guard for `scx_down` is satisfied.
+            return crashed() || dispatch::scx_down() || !process_alive(pid);
         }
 
-        // `PollTimeout` (aliased as `EpollTimeout`) stores the value
-        // as `i32`. Single-pass clamp via `u128 → i32::MAX` so a
-        // `Duration::MAX` remainder saturates at the max accepted
-        // value instead of overflowing through the intermediate u32.
-        let ms_i32 = remaining.as_millis().min(i32::MAX as u128) as i32;
+        // Abort at the crash, not at the lingering process exit. Two
+        // probe-independent signals fire well before a crashed
+        // scheduler's process exits: the BPF err-exit latch (live only
+        // in the auto-repro/dump VM) and `/sys/kernel/sched_ext/state`
+        // going `disabling`/`disabled` (live in the PRIMARY VM, where the
+        // latch mirror is never populated — this is what makes a primary
+        // VM crash abort the hold at crash time rather than ~1s later at
+        // process exit). `pid` is `Some` here, so the
+        // scheduler-expected guard for `scx_down` holds.
+        if crashed() || dispatch::scx_down() {
+            return true;
+        }
+
+        // Cap the epoll timeout at the latch poll interval so the latch
+        // is re-checked every `ERR_EXIT_POLL`, not only when the pidfd
+        // becomes readable. `PollTimeout` (aliased as `EpollTimeout`)
+        // stores the value as `i32`; single-pass clamp via
+        // `u128 → i32::MAX` so a large remainder saturates at the max
+        // accepted value instead of overflowing through the u32.
+        let poll = remaining.min(ERR_EXIT_POLL);
+        let ms_i32 = poll.as_millis().min(i32::MAX as u128) as i32;
         let timeout_param = match EpollTimeout::try_from(ms_i32) {
             Ok(t) => t,
             Err(e) => {
@@ -1228,9 +1335,9 @@ fn hold_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
 
         match epoll.wait(&mut events, timeout_param) {
             Ok(0) => {
-                // Timeout fired with no ready events. Loop back so
-                // `remaining.is_zero()` at the top handles the
-                // deadline path uniformly.
+                // Poll-interval timeout, no pidfd event. Loop back to
+                // re-check the err-exit latch and the deadline at the
+                // top of the loop.
             }
             Ok(_) => {
                 // pidfd became readable — task transitioned to
@@ -1736,6 +1843,22 @@ fn validate_mempolicy_cpuset(
     Ok(())
 }
 
+/// SIGKILL every worker in `handles` without reaping. Used only on
+/// the scheduler-death paths in [`run_scenario`]: when the scheduler
+/// under test dies, the kernel disables sched_ext and its workers
+/// fall back to the builtin scheduler, so a CPU-bound worker pool
+/// would otherwise make the per-worker `waitpid` reap in the
+/// subsequent [`collect_step`] / [`collect_backdrop`]
+/// scheduling-gated (teardown time scaling with worker count).
+/// Delivering SIGKILL to every worker first lets that reap find
+/// already-exiting workers. See
+/// [`crate::workload::WorkloadHandle::sigkill_workers`].
+fn sigkill_handles(handles: &[(String, WorkloadHandle)]) {
+    for (_, h) in handles {
+        h.sigkill_workers();
+    }
+}
+
 /// Collect step-local worker results and produce an AssertResult.
 ///
 /// Drains step-local handles + payload handles; backdrop state is
@@ -1749,14 +1872,19 @@ fn validate_mempolicy_cpuset(
 /// Before draining handles, every step-local cgroup is unfrozen
 /// (`cgroup.freeze` ← 0). An [`Op::FreezeCgroup`] without a paired
 /// [`Op::UnfreezeCgroup`] would leave step-local tasks frozen at
-/// step boundary; killpg/SIGKILL on a frozen task is queued but
-/// never delivered (the task is parked off the runqueue), so
-/// [`drain_all_payload_handles`] hangs and the subsequent
-/// `CgroupGroup::Drop` rmdir hits EBUSY because workers are still
-/// resident. Pre-emptive unfreeze restores the run-state
-/// precondition every cleanup path expects. Failures are logged
-/// at warn level only — a missing freezer file or a cgroup that
-/// was already torn down is benign at teardown time, and
+/// step boundary, where the graceful cooperative stop cannot make
+/// progress: the worker stop is a non-fatal SIGUSR1, and a frozen
+/// task re-enters the freezer trap on a non-fatal signal
+/// (`kernel/signal.c` `do_freezer_trap`) rather than running its
+/// handler — so it never flips its stop flag or reports until
+/// thawed, and `stop_and_collect` burns its full collection
+/// deadline before falling back to a sentinel report. (A fatal
+/// SIGKILL DOES wake and kill a frozen task — it diverges before
+/// the freezer trap — so worker death and the subsequent rmdir are
+/// unaffected by the freeze; the unfreeze only restores the
+/// graceful path's ability to collect real reports.) Failures are
+/// logged at warn level only — a missing freezer file or a cgroup
+/// that was already torn down is benign at teardown time, and
 /// propagating would mask the real workload result.
 fn collect_step(
     step_state: &mut StepState<'_>,
@@ -1764,16 +1892,17 @@ fn collect_step(
     topo: &crate::topology::TestTopology,
     cgroups: &dyn crate::cgroup::CgroupOps,
 ) -> AssertResult {
-    // Unfreeze every step-local cgroup before draining handles or
-    // letting the CgroupGroup RAII guard rmdir them. A live
-    // `cgroup.freeze == 1` blocks SIGKILL delivery (frozen tasks
-    // are off the runqueue) and EBUSYs the rmdir.
+    // Unfreeze every step-local cgroup before the graceful collect.
+    // A frozen worker re-enters the freezer trap on the cooperative
+    // (non-fatal) SIGUSR1 stop instead of running its handler, so it
+    // never reports until thawed. (SIGKILL would still kill it; only
+    // the graceful report path needs the thaw.)
     for name in step_state.cgroups.names() {
         if let Err(e) = cgroups.set_freeze(name, false) {
             tracing::warn!(
                 cgroup = %name,
                 err = %format!("{e:#}"),
-                "collect_step: pre-teardown unfreeze failed; rmdir may EBUSY"
+                "collect_step: pre-teardown unfreeze failed; any frozen workers will yield sentinel reports (still SIGKILL-reaped, no leak)"
             );
         }
     }
@@ -1876,35 +2005,37 @@ fn format_stall_report(report: &crate::scenario::host_stall::StallReport) -> Str
 /// when `backdrop_state` itself drops.
 ///
 /// Mirrors [`collect_step`]'s pre-teardown unfreeze pass over every
-/// tracked cgroup. A backdrop cgroup left frozen at scenario end
-/// blocks SIGKILL delivery to its tasks (frozen tasks are off the
-/// runqueue, see `kernel/cgroup/freezer.c::cgroup_freeze_task`),
-/// which then EBUSYs the rmdir issued by the
-/// `BackdropState::cgroups` RAII drop. The asymmetry between
-/// step-local and backdrop teardown — only the former unfreezing —
-/// would surface as backdrop cgroups leaking on every scenario
+/// tracked cgroup, for the same reason: a backdrop cgroup left
+/// frozen at scenario end cannot run the graceful cooperative stop.
+/// A frozen task re-enters the freezer trap on the non-fatal SIGUSR1
+/// (`kernel/signal.c` `do_freezer_trap`) instead of running its
+/// handler, so its workers never report until thawed. The asymmetry
+/// between step-local and backdrop teardown — only the former
+/// unfreezing — would surface as backdrop workers yielding sentinel
+/// reports (after burning the collection deadline) on every scenario
 /// whose Backdrop froze a cgroup and never unfroze it. Symmetric
-/// unfreeze pre-rmdir is the same bug class
-/// [`super::CgroupGroup::drop`] already prevents at the
-/// CgroupGroup level for the per-step path; this prologue brings
-/// the backdrop path back in line.
+/// unfreeze brings the backdrop path back in line with the per-step
+/// path. (As in `collect_step`, a fatal SIGKILL still kills a frozen
+/// worker, so death and the `BackdropState::cgroups` RAII rmdir are
+/// unaffected by the freeze.)
 fn collect_backdrop(
     backdrop_state: &mut BackdropState<'_>,
     checks: &crate::assert::Assert,
     topo: &crate::topology::TestTopology,
     cgroups: &dyn crate::cgroup::CgroupOps,
 ) -> AssertResult {
-    // Unfreeze every backdrop cgroup before draining handles or
-    // letting the CgroupGroup RAII guard rmdir them. Same rationale
-    // as `collect_step`: a live `cgroup.freeze == 1` blocks SIGKILL
-    // delivery (frozen tasks are off the runqueue) and EBUSYs the
-    // rmdir.
+    // Unfreeze every backdrop cgroup before the graceful collect.
+    // Same rationale as `collect_step`: a frozen worker re-enters
+    // the freezer trap on the cooperative (non-fatal) SIGUSR1 stop
+    // instead of running its handler, so it never reports until
+    // thawed. (SIGKILL would still kill it; only the graceful report
+    // path needs the thaw.)
     for name in backdrop_state.cgroups.names() {
         if let Err(e) = cgroups.set_freeze(name, false) {
             tracing::warn!(
                 cgroup = %name,
                 err = %format!("{e:#}"),
-                "collect_backdrop: pre-teardown unfreeze failed; rmdir may EBUSY"
+                "collect_backdrop: pre-teardown unfreeze failed; any frozen workers will yield sentinel reports (still SIGKILL-reaped, no leak)"
             );
         }
     }

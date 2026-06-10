@@ -281,7 +281,7 @@ fn spawn_thread_panic_yields_panicked_exit_info() {
     // Custom closure that panics immediately. Returns
     // `WorkerReport` to satisfy the signature; the panic fires
     // before `return` is reached.
-    fn panic_immediately(_stop: &AtomicBool) -> WorkerReport {
+    fn panic_immediately(_ctx: &WorkerCtx) -> WorkerReport {
         panic!("test panic from thread worker");
     }
     let config = WorkloadConfig {
@@ -327,7 +327,8 @@ fn spawn_thread_custom_stop_does_not_touch_global_stop() {
     // the test can pin "the stop loop saw stop=true and exited
     // cleanly" instead of "the worker crashed before reading
     // its arg."
-    fn spin_until_stop(stop: &AtomicBool) -> WorkerReport {
+    fn spin_until_stop(ctx: &WorkerCtx) -> WorkerReport {
+        let stop = ctx.stop();
         let tid: libc::pid_t = unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
         while !stop_requested(stop) {
             std::thread::sleep(Duration::from_millis(10));
@@ -406,7 +407,8 @@ fn spawn_thread_workers_share_tgid() {
     // process so the static is fresh per-test.
     static WORKER_PIDTIDS: Mutex<Vec<(libc::pid_t, libc::pid_t)>> = Mutex::new(Vec::new());
 
-    fn record_pid_tid_then_spin(stop: &AtomicBool) -> WorkerReport {
+    fn record_pid_tid_then_spin(ctx: &WorkerCtx) -> WorkerReport {
+        let stop = ctx.stop();
         let pid: libc::pid_t = unsafe { libc::getpid() };
         let tid: libc::pid_t = unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
         WORKER_PIDTIDS.lock().unwrap().push((pid, tid));
@@ -505,7 +507,8 @@ fn spawn_thread_drop_cleanup() {
     use std::sync::atomic::AtomicUsize;
     static EXITED_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-    fn spin_then_record_exit(stop: &AtomicBool) -> WorkerReport {
+    fn spin_then_record_exit(ctx: &WorkerCtx) -> WorkerReport {
+        let stop = ctx.stop();
         let tid: libc::pid_t = unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
         while !stop_requested(stop) {
             std::thread::sleep(Duration::from_millis(5));
@@ -884,7 +887,8 @@ fn thread_workers_share_tgid_with_harness() {
 /// hang the harness, and this test would fail at the deadline.
 #[test]
 fn thread_stop_and_collect_returns_within_bounded_deadline() {
-    fn spin_until_stop(stop: &AtomicBool) -> WorkerReport {
+    fn spin_until_stop(ctx: &WorkerCtx) -> WorkerReport {
+        let stop = ctx.stop();
         let tid: libc::pid_t = unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
         while !stop_requested(stop) {
             std::thread::sleep(Duration::from_millis(10));

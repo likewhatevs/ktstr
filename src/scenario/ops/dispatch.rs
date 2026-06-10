@@ -1344,6 +1344,115 @@ pub(super) const REPLACE_NOT_TRYING_DEADLINE_S: u64 = 5;
 /// guard at enable entry.
 const SCX_STATE_SYSFS: &str = "/sys/kernel/sched_ext/state";
 
+/// The sched_ext enable-state the kernel exposes as the one-line
+/// content of [`SCX_STATE_SYSFS`] (`scx_enable_state_str`,
+/// kernel `kernel/sched/ext_internal.h`). The enable path is
+/// `Disabled → Enabling → Enabled`; the disable path — taken on BOTH a
+/// runtime error/crash AND a clean unregister — is
+/// `Enabled → Disabling → Disabled`. So [`ScxState::Disabling`] /
+/// [`ScxState::Disabled`] are reached ONLY by going down, never by
+/// coming up (a scheduler mid-spawn reads `Enabling`). The state is
+/// KIND-LESS — a crash and a clean unregister produce the same string;
+/// telling them apart is the caller's job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScxState {
+    Enabling,
+    Enabled,
+    Disabling,
+    Disabled,
+}
+
+impl ScxState {
+    /// The exact sysfs string for this state (matches the kernel's
+    /// `scx_enable_state_str`), for diagnostics.
+    fn as_str(self) -> &'static str {
+        match self {
+            ScxState::Enabling => "enabling",
+            ScxState::Enabled => "enabled",
+            ScxState::Disabling => "disabling",
+            ScxState::Disabled => "disabled",
+        }
+    }
+}
+
+/// Test override for [`scx_state`]: host unit tests have no live scx
+/// scheduler, so they force a state here instead of reading sysfs.
+/// `0` = no override; `1..=4` select a state. Mirrors
+/// [`crate::probe::process::set_probe_sched_exit_state`] — a
+/// process-global atomic, so tests must reset it (RAII) on drop.
+#[cfg(test)]
+static TEST_SCX_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Force [`scx_state`] to return `state` (or `None` to clear the
+/// override and resume reading sysfs). Test-only.
+#[cfg(test)]
+pub(crate) fn set_test_scx_state(state: Option<ScxState>) {
+    use std::sync::atomic::Ordering;
+    let v = match state {
+        None => 0,
+        Some(ScxState::Enabling) => 1,
+        Some(ScxState::Enabled) => 2,
+        Some(ScxState::Disabling) => 3,
+        Some(ScxState::Disabled) => 4,
+    };
+    TEST_SCX_STATE.store(v, Ordering::Release);
+}
+
+/// Read [`SCX_STATE_SYSFS`] and map it to [`ScxState`]. `None` when the
+/// file is absent (kernel without `CONFIG_SCHED_CLASS_EXT`, or the scx
+/// kobject not registered) or the content is unrecognized — callers
+/// treat `None` as "no scx state to act on". A single lock-free kernfs
+/// read (the kernel value is an `atomic_read`), cheap to poll.
+pub(crate) fn scx_state() -> Option<ScxState> {
+    #[cfg(test)]
+    {
+        use std::sync::atomic::Ordering;
+        match TEST_SCX_STATE.load(Ordering::Acquire) {
+            1 => return Some(ScxState::Enabling),
+            2 => return Some(ScxState::Enabled),
+            3 => return Some(ScxState::Disabling),
+            4 => return Some(ScxState::Disabled),
+            _ => {} // 0 = no override; fall through to the real sysfs read
+        }
+    }
+    let mut buf = String::with_capacity(16);
+    std::fs::File::open(SCX_STATE_SYSFS)
+        .and_then(|mut f| {
+            use std::io::Read;
+            f.read_to_string(&mut buf)
+        })
+        .ok()?;
+    parse_scx_state(buf.trim_end())
+}
+
+/// Map a raw `/sys/kernel/sched_ext/state` string to [`ScxState`].
+fn parse_scx_state(s: &str) -> Option<ScxState> {
+    match s {
+        "enabling" => Some(ScxState::Enabling),
+        "enabled" => Some(ScxState::Enabled),
+        "disabling" => Some(ScxState::Disabling),
+        "disabled" => Some(ScxState::Disabled),
+        _ => None,
+    }
+}
+
+/// True when sched_ext is going down or down (`Disabling`/`Disabled`) —
+/// the probe-independent live crash-or-unregister signal readable in the
+/// PRIMARY test VM. (The BPF err-exit latch's host mirror is only
+/// populated by the auto-repro/dump VM's probe poll loop, so it stays
+/// `Unknown` for the whole primary scenario — the crash signal the hold
+/// needs is dead there. The sysfs state needs no probe.) Down-states
+/// ONLY (NOT `!= Enabled`): the enable-ramp `Enabling` and steady
+/// `Enabled` read false, so a scheduler coming up after an
+/// `Op::ReplaceScheduler` swap is never misread as a crash. The
+/// crash-vs-clean-unregister distinction is the caller's (the state is
+/// kind-less): callers gate this on a scheduler still being expected to
+/// run (`sched_pid` set) so a clean `Op::DetachScheduler` — which clears
+/// the pid before this would observe `disabled` — does not trip it.
+pub(crate) fn scx_down() -> bool {
+    matches!(scx_state(), Some(ScxState::Disabling | ScxState::Disabled))
+}
+
 /// Block until `/sys/kernel/sched_ext/state` reads `disabled` or
 /// the timeout elapses. Polls at 50ms — small enough to keep the
 /// Op dispatch latency tight when the kernel finishes the detach
@@ -1366,20 +1475,19 @@ fn wait_for_scx_disabled(timeout: std::time::Duration) -> Result<std::time::Dura
         return Ok(std::time::Duration::ZERO);
     }
 
-    // Reusable read buffer for the state file. `String::clear` keeps
-    // the heap allocation across the predicate's iterations.
-    let mut buf = String::with_capacity(32);
+    // `last_state` carries the most recent observed state into the
+    // timeout error below. Routes through the canonical `scx_state`
+    // reader so there is a single parser for the sysfs file.
     let mut last_state = String::new();
     let check_done = || -> Option<()> {
-        buf.clear();
-        let _ = std::fs::File::open(SCX_STATE_SYSFS).and_then(|mut f| {
-            use std::io::Read;
-            f.read_to_string(&mut buf)
-        });
-        let state = buf.trim_end();
+        let state = scx_state();
         last_state.clear();
-        last_state.push_str(state);
-        if state == "disabled" { Some(()) } else { None }
+        last_state.push_str(state.map_or("<absent>", ScxState::as_str));
+        if state == Some(ScxState::Disabled) {
+            Some(())
+        } else {
+            None
+        }
     };
 
     // Evented wake sources managed by kernfs_evented_wait:
@@ -2063,5 +2171,46 @@ pub(super) fn render_cgroup_key(cgroup: &str) -> String {
         "(no cgroup)".to_string()
     } else {
         format!("'{cgroup}'")
+    }
+}
+
+#[cfg(test)]
+mod scx_state_tests {
+    use super::{ScxState, parse_scx_state, scx_down, set_test_scx_state};
+
+    /// T1 regression: `scx_down()` (the hold-abort / crash signal) fires
+    /// on the DOWN-states ONLY. An `Op::ReplaceScheduler` enable-ramp
+    /// reads `Enabling` and a steady scheduler reads `Enabled`; neither
+    /// must be misread as a crash, or the hold would abort while a new
+    /// scheduler is coming up. (Guards against the "abort on `!= Enabled`"
+    /// bug, which would trip on `Enabling`.)
+    #[test]
+    fn scx_down_only_on_down_states() {
+        for (state, want_down) in [
+            (ScxState::Enabling, false),
+            (ScxState::Enabled, false),
+            (ScxState::Disabling, true),
+            (ScxState::Disabled, true),
+        ] {
+            set_test_scx_state(Some(state));
+            assert_eq!(scx_down(), want_down, "scx_down() for {state:?}");
+        }
+        // Clear the override (hygiene; nextest runs each test in its own
+        // process so it can't leak, but reset anyway). NOT asserting the
+        // post-clear `scx_down()`: that falls through to a real sysfs read
+        // and a host running the tests with sched_ext loaded reads
+        // `disabled` → down — environment-dependent, not the invariant
+        // under test (which is the override-driven table above).
+        set_test_scx_state(None);
+    }
+
+    #[test]
+    fn parse_scx_state_maps_the_kernel_strings() {
+        assert_eq!(parse_scx_state("enabling"), Some(ScxState::Enabling));
+        assert_eq!(parse_scx_state("enabled"), Some(ScxState::Enabled));
+        assert_eq!(parse_scx_state("disabling"), Some(ScxState::Disabling));
+        assert_eq!(parse_scx_state("disabled"), Some(ScxState::Disabled));
+        assert_eq!(parse_scx_state(""), None);
+        assert_eq!(parse_scx_state("bogus"), None);
     }
 }

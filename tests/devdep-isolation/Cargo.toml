@@ -4,8 +4,9 @@
 # its resolver, profile, and lockfile are independent — exactly the
 # perspective a real downstream crate has.
 #
-# Driven by `tests/devdep-isolation/verify.sh` (and the `devdep-isolation`
-# justfile recipe + CI job) which asserts that `cargo build --release`
+# Driven by the `scripts::devdep-isolation` rust-script recipe (in
+# scripts.just, wrapped by the `devdep-isolation` justfile recipe + CI
+# job) which asserts that `cargo build --release`
 # of this fixture compiles zero ktstr code and the resulting binary
 # contains no ktstr symbols. Pins the structural-isolation contract of
 # Cargo's `[dev-dependencies]` so a future refactor that accidentally
@@ -33,10 +34,9 @@ publish = false
 # only sees ktstr through dev-deps.
 
 [dev-dependencies]
-# Path dep, lean config — matches the `default-features = false,
-# features = ["llm"]` recipe the README points downstream consumers at.
-# Using the lean config (not full default) exercises the smallest
-# surface the README documents as supported.
+# Path dep, lean config (default-features = false, features = ["llm"]):
+# exercises dev-dep isolation under the smallest feature surface, with
+# none of the host-tooling deps pulled in.
 ktstr = { path = "../..", default-features = false, features = ["llm"] }
 
 [[bin]]
