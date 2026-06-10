@@ -535,7 +535,11 @@ fn sigkill_workers_makes_collect_prompt_for_sigusr1_ignoring_workers() {
     };
     let mut h = WorkloadHandle::spawn(&config).unwrap();
     let pids = h.worker_pids();
-    assert_eq!(pids.len(), N, "fork-mode Custom workload yields one pid per worker");
+    assert_eq!(
+        pids.len(),
+        N,
+        "fork-mode Custom workload yields one pid per worker"
+    );
     let ready_paths: Vec<_> = pids.iter().map(|&p| ready_file_path(p)).collect();
     // Clear stale ready files from a prior run that recycled these
     // PIDs (same rationale as the sentinel test); must run before

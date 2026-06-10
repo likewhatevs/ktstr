@@ -1277,7 +1277,11 @@ fn worker_ctx_accessors_return_borrowed_state() {
     let cpus = [3usize, 7, 11];
     let siblings: [libc::pid_t; 2] = [100, 200];
     let ctx = WorkerCtx::new(&stop, &cpus, &siblings);
-    assert_eq!(ctx.cpus(), cpus.as_slice(), "cpus() returns the borrowed cpuset");
+    assert_eq!(
+        ctx.cpus(),
+        cpus.as_slice(),
+        "cpus() returns the borrowed cpuset"
+    );
     assert_eq!(
         ctx.sibling_pids(),
         siblings.as_slice(),

@@ -1202,8 +1202,8 @@ fn during_hold_sched_death_sigkills_workers_before_collect() {
         HoldSpec::Fixed(Duration::from_secs(1)),
     )];
     let start = std::time::Instant::now();
-    let result = execute_steps(&ctx, steps)
-        .expect("execute_steps returns Ok even when the scheduler dies");
+    let result =
+        execute_steps(&ctx, steps).expect("execute_steps returns Ok even when the scheduler dies");
     let elapsed = start.elapsed();
     assert!(
         elapsed < Duration::from_secs(2),

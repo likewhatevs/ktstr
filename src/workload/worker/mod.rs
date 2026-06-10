@@ -1171,8 +1171,11 @@ pub(super) fn worker_main(
                 if let Some((mask_a, mask_b)) = &cross_affinity_masks
                     && !cross_affinity_targets.is_empty()
                 {
-                    let mask: *const libc::cpu_set_t =
-                        if cross_affinity_toggle { mask_a } else { mask_b };
+                    let mask: *const libc::cpu_set_t = if cross_affinity_toggle {
+                        mask_a
+                    } else {
+                        mask_b
+                    };
                     for &pid in &cross_affinity_targets {
                         unsafe {
                             libc::sched_setaffinity(
@@ -3540,7 +3543,11 @@ pub(super) fn build_cross_affinity_masks(
         return None;
     }
     let make = |drop_last: bool| -> libc::cpu_set_t {
-        let take = if drop_last { cpus.len() - 1 } else { cpus.len() };
+        let take = if drop_last {
+            cpus.len() - 1
+        } else {
+            cpus.len()
+        };
         let mut s: libc::cpu_set_t = unsafe { std::mem::zeroed() };
         unsafe { libc::CPU_ZERO(&mut s) };
         for &c in cpus.iter().take(take) {

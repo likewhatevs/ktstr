@@ -2176,7 +2176,7 @@ pub(super) fn render_cgroup_key(cgroup: &str) -> String {
 
 #[cfg(test)]
 mod scx_state_tests {
-    use super::{parse_scx_state, scx_down, set_test_scx_state, ScxState};
+    use super::{ScxState, parse_scx_state, scx_down, set_test_scx_state};
 
     /// T1 regression: `scx_down()` (the hold-abort / crash signal) fires
     /// on the DOWN-states ONLY. An `Op::ReplaceScheduler` enable-ramp

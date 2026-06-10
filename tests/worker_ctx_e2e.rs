@@ -38,7 +38,11 @@ fn ctx_flipper(ctx: &WorkerCtx) -> WorkerReport {
     );
     let sz = std::mem::size_of::<libc::cpu_set_t>();
     let make = |drop_last: bool| -> libc::cpu_set_t {
-        let take = if drop_last { cpus.len() - 1 } else { cpus.len() };
+        let take = if drop_last {
+            cpus.len() - 1
+        } else {
+            cpus.len()
+        };
         let mut s: libc::cpu_set_t = unsafe { std::mem::zeroed() };
         unsafe { libc::CPU_ZERO(&mut s) };
         for &c in cpus.iter().take(take) {

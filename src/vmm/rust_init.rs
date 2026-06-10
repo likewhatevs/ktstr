@@ -1569,8 +1569,8 @@ pub(crate) fn ktstr_guest_init() -> ! {
         // error exit) so clean runs pay nothing; the grace returns early
         // the moment the scheduler exits, and is bounded
         // (`SCHED_KILL_GRACE`) so a userspace hang can't wedge teardown.
-        let exited_in_grace = scx_dump_started_latch().is_set()
-            && reap_child_bounded(child, SCHED_KILL_GRACE);
+        let exited_in_grace =
+            scx_dump_started_latch().is_set() && reap_child_bounded(child, SCHED_KILL_GRACE);
         if !exited_in_grace {
             let _ = child.kill();
             // Bounded, evented reap. A SIGKILL'd scheduler normally exits
