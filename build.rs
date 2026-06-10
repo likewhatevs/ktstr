@@ -492,6 +492,57 @@ int main(void) {{
             .filter(|v| !v.is_empty())
             .is_some();
 
+        // Pin to a fixed rev so a clean fetch is reproducible. The
+        // former `git clone --depth=1` only resolved the remote's
+        // default-branch HEAD with no pin — that is how upstream's
+        // wpb/wrust sub-crates silently appeared (HEAD moved). Bump
+        // deliberately, re-verifying the wprof build at the new rev.
+        // The `--depth 1` bare-SHA fetch below works while the rev stays
+        // reachable from a ref: it does today (master's tip) and stays
+        // reachable as master advances (it becomes an ancestor); it
+        // would only break if upstream rewrote history to orphan it.
+        const WPROF_REV: &str = "53162afea658b0474c88212228a94c8c50891781";
+        let wprof_src = out_dir.join("wprof-src");
+
+        // Make the pin authoritative over a cached build. The gate
+        // below (`!wprof_bin.exists()`) builds wprof once and reuses the
+        // cached binary, and `is_wprof_clone_complete` (.git/HEAD +
+        // src/Makefile) does NOT encode the rev — so without this a
+        // cached tree at a DIFFERENT rev (a WPROF_REV bump, a pre-pin
+        // clone that tracked HEAD, or a 0-byte skip placeholder) would
+        // be reused and the pin would be merely advisory. Wipe the clone
+        // AND its binary whenever the clone is incomplete OR not at
+        // WPROF_REV, so the gate re-fetches the pinned rev. A failed
+        // rev-parse (init-only partial clone with no commit) yields
+        // None → treated as a mismatch → wipe (never a panic); the rev
+        // read uses the same hermetic GIT_CONFIG env as the fetch.
+        // One-time on a rev change, then stable. Skipped under
+        // KTSTR_SKIP_WPROF_BUILD (that path writes a rev-less
+        // placeholder by design).
+        let wprof_clone_rev = |dir: &std::path::Path| -> Option<String> {
+            let out = Command::new("git")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .current_dir(dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .ok()?;
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        };
+        if !skip_wprof
+            && (!is_wprof_clone_complete(&wprof_src)
+                || wprof_clone_rev(&wprof_src).as_deref() != Some(WPROF_REV))
+        {
+            if wprof_src.exists() {
+                std::fs::remove_dir_all(&wprof_src).expect("remove stale/incomplete wprof-src");
+            }
+            if wprof_bin.exists() {
+                std::fs::remove_file(&wprof_bin).expect("remove stale wprof binary");
+            }
+        }
+
         if skip_wprof {
             println!(
                 "cargo:warning=KTSTR_SKIP_WPROF_BUILD set — writing 0-byte \
@@ -520,77 +571,52 @@ int main(void) {{
                 }
             }
 
-            // Clone into OUT_DIR like busybox — re-clones on `cargo
+            // Clone into OUT_DIR like busybox — re-fetches on `cargo
             // clean` and stays per-workspace-isolated (matches the
             // shape of the other vendored binary).
             //
-            // Cargo's workspace discovery walks UP from any nested
-            // Cargo.toml. The wprof Makefile shells out to cargo at
-            // exactly TWO sub-crates per `wprof-src/src/Makefile`:
-            // L125 `cd $(LIBBLAZESYM_SRC) && $(CARGO) build` and L133
-            // `cd $(LIBDEMANGLE_SRC) && $(CARGO) build`. blazesym IS
-            // self-contained (its own `[workspace]` + `[workspace.lints]`
-            // at the root of `wprof-src/blazesym/Cargo.toml`) so cargo's
-            // walk terminates there naturally — no patch needed.
-            // demangle (`wprof-src/src/demangle/Cargo.toml`) has neither
-            // `[workspace]` nor lints inheritance, so the upward walk
-            // would reach ktstr-root's `[workspace]` via target/ —
-            // failing with "current package believes it's in a workspace
-            // when it's not." The sentinel patch at L656+ appends an
-            // empty `[workspace]` table to demangle's manifest, which
-            // breaks the walk without losing any inheritance (demangle
-            // has no `[lints] workspace = true`).
-            //
-            // vmlinux.h/ also has a Cargo.toml but the Makefile
-            // references vmlinux.h ONLY as a header source
-            // (`VMLINUX := ../vmlinux.h/include/$(ARCH)/vmlinux.h` at
-            // L41), never via `cd vmlinux.h && cargo X`. If a future
-            // wprof Makefile change adds such an invocation, vmlinux.h's
-            // Cargo.toml will need the same sentinel patch.
+            // The wprof Makefile runs a standalone `cargo build` for
+            // each of its three `src/` sub-crates (demangle, wpb,
+            // wrust → lib*_c.a), none of which carries a `[workspace]`
+            // table. `isolate_wprof_subcrate_workspaces` (invoked below,
+            // before make) appends the sentinel to each so cargo's
+            // upward workspace walk stops at the sub-crate instead of
+            // reaching ktstr-root's `[workspace]` via target/ — see that
+            // helper's doc for the mechanism and scope. blazesym (a
+            // sibling submodule with its own `[workspace]`) and
+            // vmlinux.h (a header dir the Makefile never cargo-builds)
+            // are correctly left untouched.
             //
             // Tradeoff acknowledged: `cargo clean && cargo build`
-            // re-clones the FULL wprof tree (~590MB working tree of
-            // which ~20MB is .git after `--depth=1 --shallow-submodules`)
-            // — measured 60+ seconds wall time on slow CI links.
-            // Within a single cargo invocation, build.rs runs ONCE per
-            // (package, profile, feature-combo) thanks to cargo's
-            // build-script dedup, so multi-target builds against the
-            // same ktstr package amortise the clone. Across different
-            // cargo invocations (e.g. dev iteration switching between
-            // debug and release), each invocation does its own clone.
-            // The cost is acceptable in exchange for: (1) per-workspace
-            // isolation — different ktstr checkouts can't accidentally
-            // share a stale wprof version (the prior cache tracked
-            // upstream HEAD with no pin), (2) `cargo clean` consistency
-            // — no out-of-band `~/.cache/ktstr/wprof-src` rm needed,
-            // (3) drop of ~70 lines of flock + XDG-resolution
-            // infrastructure. Operators who want incremental builds
-            // should prefer `cargo build -p ktstr` over `cargo clean`.
-            let wprof_src = out_dir.join("wprof-src");
-            // .git/HEAD is the strongest single-file signal for clone
-            // completeness vs the prior Makefile-only check. A partial
-            // `git clone` that fails mid-checkout leaves the working
-            // tree empty/incomplete (Makefile possibly absent) but
-            // .git/HEAD is created EARLIER, during init. Require BOTH:
-            // .git/HEAD (init reached) AND src/Makefile (working tree
-            // populated). Failing either means the cache is half-baked
-            // and needs to be wiped before re-clone. The
-            // `is_wprof_clone_complete` predicate (build_helpers.rs)
-            // encodes this rule + has unit-test coverage for each
-            // failure case.
+            // re-fetches the FULL wprof tree (~590MB working tree of
+            // which ~20MB is .git after the `--depth 1` pinned fetch +
+            // shallow submodules) — measured 60+ seconds wall time on
+            // slow CI links. Within a single cargo invocation, build.rs
+            // runs ONCE per (package, profile, feature-combo) thanks to
+            // cargo's build-script dedup, so multi-target builds against
+            // the same ktstr package amortise the fetch. Across
+            // different cargo invocations (e.g. dev iteration switching
+            // between debug and release), each does its own fetch. The
+            // cost buys: (1) per-workspace isolation — different ktstr
+            // checkouts can't share a stale wprof tree; (2) `cargo
+            // clean` consistency — no out-of-band
+            // `~/.cache/ktstr/wprof-src` rm needed; (3) a fixed,
+            // reproducible wprof rev (WPROF_REV) instead of whatever
+            // upstream HEAD happened to be at fetch time. Operators who
+            // want incremental builds should prefer `cargo build -p
+            // ktstr` over `cargo clean`.
+            // The rev-enforcement above already wiped any incomplete or
+            // off-rev clone, so reaching here means wprof_src is either
+            // a complete clone at WPROF_REV (reuse) or absent (fetch).
             let wprof_makefile = wprof_src.join("src").join("Makefile");
-            if wprof_src.exists() && !is_wprof_clone_complete(&wprof_src) {
-                std::fs::remove_dir_all(&wprof_src).expect("remove incomplete wprof-src");
-            }
-
             if !wprof_makefile.exists() {
                 let git_url = "https://github.com/anakryiko/wprof.git";
-                // Recursive clone over flaky networks fails partway
-                // through one of the submodules (libbpf, bpftool,
-                // blazesym, vmlinux.h, usdt, strobelight-libs) — the
-                // shallow `git clone --depth=1 --shallow-submodules`
-                // is one-shot; if it errors, the dir is left in an
-                // incomplete state. Retry with bounded attempts +
+                // The pinned shallow fetch (init + fetch --depth 1 +
+                // checkout + submodule update) is multi-step and not
+                // atomic: a failure partway (commonly a submodule fetch
+                // over a flaky network: libbpf, bpftool, blazesym,
+                // vmlinux.h, usdt, strobelight-libs) leaves wprof_src
+                // half-populated. Retry with bounded attempts +
                 // exponential backoff via the shared
                 // `retry_with_backoff` helper (also used by the
                 // busybox tarball download with `MAX_TARBALL_ATTEMPTS
@@ -598,9 +624,9 @@ int main(void) {{
                 // attempt counting, and log wording.
                 //
                 // Per-attempt cleanup of partial wprof_src lives
-                // INSIDE the closure (see L545+).
+                // INSIDE the closure.
                 println!(
-                    "cargo:warning=cloning {git_url} into {} (recursive — \
+                    "cargo:warning=fetching {git_url} @ {WPROF_REV} into {} (recursive — \
                  pulls libbpf, bpftool, blazesym, vmlinux.h, usdt, \
                  strobelight-libs)",
                     wprof_src.display()
@@ -608,18 +634,19 @@ int main(void) {{
                 const MAX_CLONE_ATTEMPTS: u32 = 4;
                 let clone_attempt = |i: u32| -> Result<(), String> {
                     // After a failed attempt, wprof_src may be in a
-                    // partial-clone state — git refuses to clone into a
-                    // non-empty dir. Wipe before retry; swallow cleanup
+                    // partial-fetch state. Wipe before retry so `git
+                    // init` starts from an empty dir; swallow cleanup
                     // errors with a log so the retry still proceeds (if
-                    // the partial state genuinely blocks the next clone,
-                    // git will surface the error in this iteration's
-                    // status). First attempt skips because the outer
-                    // !exists() check above guaranteed the dir is empty.
+                    // the partial state genuinely blocks the next
+                    // attempt, git will surface the error in this
+                    // iteration's status). First attempt skips because
+                    // the outer !exists() check above guaranteed the dir
+                    // is empty.
                     if i > 1
                         && let Err(e) = std::fs::remove_dir_all(&wprof_src)
                     {
                         println!(
-                            "cargo:warning=wprof partial-clone cleanup before attempt {i} \
+                            "cargo:warning=wprof partial-fetch cleanup before attempt {i} \
                          failed: {e}; continuing to next attempt anyway"
                         );
                     }
@@ -649,36 +676,55 @@ int main(void) {{
                     // per attempt. Passing via `-c key=value` rather
                     // than env vars keeps the setting scoped to this
                     // single invocation.
-                    let status = Command::new("git")
-                        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                        .env("GIT_TERMINAL_PROMPT", "0")
-                        .env("GIT_ASKPASS", "/bin/false")
-                        .arg("-c")
-                        .arg("http.lowSpeedLimit=1000")
-                        .arg("-c")
-                        .arg("http.lowSpeedTime=60")
-                        .arg("clone")
-                        .arg("--recurse-submodules")
-                        .arg("--depth=1")
-                        .arg("--shallow-submodules")
-                        .arg(git_url)
-                        .arg(&wprof_src)
-                        .stdout(Stdio::inherit())
-                        .stderr(Stdio::inherit())
-                        .status()
-                        .expect("spawn git clone for wprof");
-                    if status.success() {
-                        Ok(())
-                    } else {
-                        Err(format!("git clone exited {status}"))
-                    }
+                    let run_git = |args: &[&str]| -> Result<(), String> {
+                        let status = Command::new("git")
+                            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                            .env("GIT_TERMINAL_PROMPT", "0")
+                            .env("GIT_ASKPASS", "/bin/false")
+                            .arg("-c")
+                            .arg("http.lowSpeedLimit=1000")
+                            .arg("-c")
+                            .arg("http.lowSpeedTime=60")
+                            .current_dir(&wprof_src)
+                            .args(args)
+                            .stdout(Stdio::inherit())
+                            .stderr(Stdio::inherit())
+                            .status()
+                            .map_err(|e| format!("spawn git {}: {e}", args.join(" ")))?;
+                        if status.success() {
+                            Ok(())
+                        } else {
+                            Err(format!("git {} exited {status}", args.join(" ")))
+                        }
+                    };
+                    // `git clone --depth=1` only resolves a ref tip, so
+                    // it cannot pin an arbitrary rev. Init an empty repo,
+                    // fetch exactly WPROF_REV at depth 1 (GitHub serves
+                    // any commit reachable from an advertised ref),
+                    // detach onto it, then init submodules pinned by that
+                    // tree's recorded gitlink SHAs. `current_dir` is the
+                    // freshly-created wprof_src for every step.
+                    std::fs::create_dir_all(&wprof_src)
+                        .map_err(|e| format!("create wprof_src dir: {e}"))?;
+                    run_git(&["init", "-q"])?;
+                    run_git(&["remote", "add", "origin", git_url])?;
+                    run_git(&["fetch", "-q", "--depth", "1", "origin", WPROF_REV])?;
+                    run_git(&["checkout", "-q", "--detach", "FETCH_HEAD"])?;
+                    run_git(&[
+                        "submodule",
+                        "update",
+                        "--init",
+                        "--recursive",
+                        "--depth",
+                        "1",
+                    ])
                 };
                 if let Err(err) =
-                    retry_with_backoff("wprof git clone", MAX_CLONE_ATTEMPTS, clone_attempt)
+                    retry_with_backoff("wprof pinned fetch", MAX_CLONE_ATTEMPTS, clone_attempt)
                 {
                     panic!(
-                        "wprof git clone failed after {MAX_CLONE_ATTEMPTS} attempts \
+                        "wprof pinned fetch failed after {MAX_CLONE_ATTEMPTS} attempts \
                      (last error: {err}). Check network connectivity to \
                      {git_url}; if the cache directory is in an \
                      unrecoverable state, `rm -rf {}` and re-run `cargo build`.",
@@ -687,44 +733,13 @@ int main(void) {{
                 }
             }
 
-            // Patch wprof-src/src/demangle/Cargo.toml with a sentinel
-            // `[workspace]` table to break the upward workspace walk
-            // before invoking make. The Makefile shells out to
-            // `cd demangle && cargo build`; without the sentinel,
-            // cargo walks UP from demangle and finds the ktstr
-            // workspace at the repository root (because OUT_DIR is
-            // under target/), failing with "current package believes
-            // it's in a workspace when it's not." An empty `[workspace]`
-            // table tells cargo to stop the walk at demangle — and
-            // since demangle has no lints inheritance, no semantics
-            // are affected.
-            //
-            // Idempotent: subsequent builds SHORT-CIRCUIT when the
-            // exact-line `[workspace]` declaration is already present
-            // (gate at L671). The append path only fires on the first
-            // build after a clean clone. The check matches lines
-            // EXACTLY (not substring) to avoid false-positives on
-            // `[workspace.lints]` or commented `# [workspace]` —
-            // either would trick a substring check into skipping the
-            // append even though the real sentinel table isn't there.
-            let demangle_manifest = wprof_src.join("src").join("demangle").join("Cargo.toml");
-            if demangle_manifest.exists() {
-                let existing = std::fs::read_to_string(&demangle_manifest)
-                    .unwrap_or_else(|e| panic!("read {}: {e}", demangle_manifest.display()));
-                let already_patched = existing.lines().any(|l| l.trim() == "[workspace]");
-                if !already_patched {
-                    use std::io::Write;
-                    let mut f = std::fs::OpenOptions::new()
-                        .append(true)
-                        .open(&demangle_manifest)
-                        .unwrap_or_else(|e| {
-                            panic!("open {} for append: {e}", demangle_manifest.display())
-                        });
-                    f.write_all(b"\n[workspace]\n").unwrap_or_else(|e| {
-                        panic!("append [workspace] to {}: {e}", demangle_manifest.display())
-                    });
-                }
-            }
+            // Isolate every wprof src/ sub-crate from ktstr's workspace
+            // before invoking make, which runs a standalone `cargo
+            // build` per sub-crate (demangle, wpb, wrust → lib*_c.a).
+            // See `isolate_wprof_subcrate_workspaces` for why the
+            // sentinel is required and why the scope is src/ children
+            // only (the blazesym submodule is its own workspace).
+            isolate_wprof_subcrate_workspaces(&wprof_src);
 
             // Build wprof.  Single-threaded `-j1` instead of `-j{nproc}`:
             // the upstream wprof Makefile has a missing prerequisite
@@ -743,8 +758,16 @@ int main(void) {{
             // parallelism would only overlap distinct cargo
             // invocations against each other — which is exactly the
             // pattern that triggers the race.
+            // Clear RUSTC_WORKSPACE_WRAPPER (set to clippy-driver by an
+            // outer `cargo clippy`): the Makefile's inner `cargo build`
+            // of each wprof sub-crate (wpb/wrust/demangle) would
+            // otherwise inherit it and run UPSTREAM wprof code through
+            // ktstr's clippy under `-D warnings`, turning wprof's own
+            // lints (missing_safety_doc, needless_update) into hard build
+            // errors. ktstr does not lint vendored upstream crates.
             let status = Command::new("make")
                 .arg("-j1")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
                 .current_dir(wprof_src.join("src"))
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())

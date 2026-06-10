@@ -71,6 +71,61 @@ fn is_wprof_clone_complete(wprof_src: &std::path::Path) -> bool {
     wprof_src.join(".git").join("HEAD").exists() && wprof_src.join("src").join("Makefile").exists()
 }
 
+/// Append an empty `[workspace]` sentinel to every wprof `src/`
+/// sub-crate manifest that lacks one, so cargo stops its upward
+/// workspace walk at the sub-crate instead of reaching ktstr's
+/// workspace via OUT_DIR (the clone lives under `target/`). The wprof
+/// Makefile runs a standalone `cargo build` for each sub-crate
+/// (`demangle`, `wpb`, `wrust` → `lib*_c.a`); without the sentinel
+/// each fails with "current package believes it's in a workspace when
+/// it's not." This generalizes the former demangle-only patch so a
+/// wprof rev that ships additional sub-crates needs no build.rs edit.
+///
+/// Scope: immediate child dirs of `src/`. A child whose manifest
+/// already declares `[workspace]` is skipped — that covers both the
+/// idempotent re-run case and a hypothetical sub-workspace ROOT under
+/// `src/` (patching it would be wrong; its members are never immediate
+/// `src/` children, so they are never visited). The blazesym submodule
+/// lives outside `src/` and is its own workspace, so it is untouched.
+///
+/// The exact-line check (`l.trim() == "[workspace]"`, not substring)
+/// avoids matching `[workspace.lints]` or a commented `# [workspace]`,
+/// either of which would trick a substring check into skipping a
+/// manifest that lacks the real sentinel table.
+#[cfg(feature = "wprof")]
+fn isolate_wprof_subcrate_workspaces(wprof_src: &std::path::Path) {
+    let src = wprof_src.join("src");
+    let entries = match std::fs::read_dir(&src) {
+        Ok(e) => e,
+        // No `src/` dir means the clone layout changed out from under
+        // us; the wprof build (make in `src/`) will fail loudly next,
+        // so there is nothing to isolate here.
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let manifest = entry.path().join("Cargo.toml");
+        if !manifest.exists() {
+            continue;
+        }
+        let existing = std::fs::read_to_string(&manifest)
+            .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
+        let is_package = existing.lines().any(|l| l.trim() == "[package]");
+        let has_workspace = existing.lines().any(|l| l.trim() == "[workspace]");
+        if is_package && !has_workspace {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&manifest)
+                .unwrap_or_else(|e| panic!("open {} for append: {e}", manifest.display()));
+            f.write_all(b"\n[workspace]\n")
+                .unwrap_or_else(|e| panic!("append [workspace] to {}: {e}", manifest.display()));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +212,100 @@ mod tests {
         assert!(
             is_wprof_clone_complete(src),
             "both files present → clone considered complete",
+        );
+    }
+
+    #[cfg(feature = "wprof")]
+    #[test]
+    fn isolate_patches_subcrate_lacking_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path();
+        let crate_dir = ws.join("src").join("wpb");
+        std::fs::create_dir_all(&crate_dir).expect("create src/wpb");
+        let manifest = crate_dir.join("Cargo.toml");
+        std::fs::write(&manifest, "[package]\nname = \"wpb\"\n").expect("write manifest");
+        isolate_wprof_subcrate_workspaces(ws);
+        let patched = std::fs::read_to_string(&manifest).expect("read manifest");
+        assert!(
+            patched.lines().any(|l| l.trim() == "[workspace]"),
+            "a [package] sub-crate with no [workspace] must get the sentinel",
+        );
+    }
+
+    #[cfg(feature = "wprof")]
+    #[test]
+    fn isolate_skips_manifest_already_carrying_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path();
+        let crate_dir = ws.join("src").join("demangle");
+        std::fs::create_dir_all(&crate_dir).expect("create src/demangle");
+        let manifest = crate_dir.join("Cargo.toml");
+        std::fs::write(&manifest, "[package]\nname = \"demangle\"\n\n[workspace]\n")
+            .expect("write manifest");
+        isolate_wprof_subcrate_workspaces(ws);
+        let after = std::fs::read_to_string(&manifest).expect("read manifest");
+        assert_eq!(
+            after.lines().filter(|l| l.trim() == "[workspace]").count(),
+            1,
+            "an already-patched manifest must not gain a second [workspace] (idempotent)",
+        );
+    }
+
+    #[cfg(feature = "wprof")]
+    #[test]
+    fn isolate_patches_every_src_subcrate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path();
+        for name in ["demangle", "wpb", "wrust"] {
+            let d = ws.join("src").join(name);
+            std::fs::create_dir_all(&d).expect("create src/<name>");
+            std::fs::write(
+                d.join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\n"),
+            )
+            .expect("write manifest");
+        }
+        isolate_wprof_subcrate_workspaces(ws);
+        for name in ["demangle", "wpb", "wrust"] {
+            let m = std::fs::read_to_string(ws.join("src").join(name).join("Cargo.toml"))
+                .expect("read manifest");
+            assert!(
+                m.lines().any(|l| l.trim() == "[workspace]"),
+                "src/{name} must be isolated",
+            );
+        }
+    }
+
+    #[cfg(feature = "wprof")]
+    #[test]
+    fn isolate_leaves_crates_outside_src_untouched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path();
+        // A src/ sub-crate so the isolation loop actually runs.
+        let inner = ws.join("src").join("wpb");
+        std::fs::create_dir_all(&inner).expect("create src/wpb");
+        std::fs::write(inner.join("Cargo.toml"), "[package]\nname = \"wpb\"\n").expect("write");
+        // blazesym is a submodule at <wprof>/blazesym (sibling of src/)
+        // and is its OWN workspace — patching it would break that
+        // workspace, so it must stay untouched.
+        let blaze = ws.join("blazesym");
+        std::fs::create_dir_all(&blaze).expect("create blazesym");
+        let blaze_manifest = blaze.join("Cargo.toml");
+        std::fs::write(&blaze_manifest, "[package]\nname = \"blazesym\"\n").expect("write");
+        isolate_wprof_subcrate_workspaces(ws);
+        assert!(
+            std::fs::read_to_string(&blaze_manifest)
+                .expect("read")
+                .lines()
+                .all(|l| l.trim() != "[workspace]"),
+            "a crate outside src/ (blazesym submodule) must not be patched",
+        );
+        assert!(
+            std::fs::read_to_string(inner.join("Cargo.toml"))
+                .expect("read")
+                .lines()
+                .any(|l| l.trim() == "[workspace]"),
+            "sanity: the src/ sub-crate WAS isolated (loop ran)",
         );
     }
 }
