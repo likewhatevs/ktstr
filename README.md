@@ -82,7 +82,7 @@ both binaries:
 
 ```sh
 cargo install --locked cargo-nextest
-cargo install --locked --bin ktstr --bin cargo-ktstr ktstr
+cargo install --locked ktstr
 ```
 
 This installs:
@@ -105,14 +105,6 @@ patch bumps may break unstable internal surfaces (the CI matrix
 runs against the locked patch). Examples below assume 0.11; an
 example from a different release may not compile against the crate
 this README documents.
-
-The workspace defines two additional `[[bin]]` targets —
-`ktstr-jemalloc-probe` and `ktstr-jemalloc-alloc-worker` — but
-these are test-fixture binaries spawned by integration tests
-(`tests/jemalloc_probe_tests.rs`), not commands operators run
-directly. The `--bin` flags above scope the install to just the
-two user-facing entry points; without them, `cargo install`
-would also place the test-fixture binaries on `$PATH`.
 
 When building from this repo, `scx-ktstr` (the test fixture
 scheduler) is built automatically by the workspace. Downstream

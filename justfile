@@ -16,9 +16,9 @@ fmt:
 lint:
     cargo fmt -- --check
     cargo check --workspace --all-targets
-    cargo check --workspace --all-targets --features wprof
+    cargo check --workspace --all-targets --features wprof,integration
     cargo clippy --workspace --all-targets
-    cargo clippy --workspace --all-targets --features wprof
+    cargo clippy --workspace --all-targets --features wprof,integration
     just doc-strict
 
 # Promote every rustdoc warning to an error. RUSTDOCFLAGS reaches every

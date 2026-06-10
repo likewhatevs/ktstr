@@ -36,7 +36,7 @@ sudo dnf install clang pkgconf make gcc autoconf gettext-devel flex bison gawk
 
 ```sh
 cargo install cargo-nextest           # required
-cargo install --locked ktstr --bin ktstr --bin cargo-ktstr   # required
+cargo install --locked ktstr   # required
 ```
 
 `cargo-nextest` is required. `cargo ktstr test` delegates to nextest
@@ -47,12 +47,12 @@ workflow verb in this guide (`cargo ktstr kernel build`, `cargo
 ktstr test`, `cargo ktstr shell`, `ktstr ctprof`) lives on these
 two binaries.
 
-`cargo install --locked ktstr --bin ktstr --bin cargo-ktstr`
+`cargo install --locked ktstr`
 installs the two user-facing binaries (`ktstr` host-side CLI and
-`cargo-ktstr` dev workflow plugin); the `--bin` flags scope the
-install away from the two test-fixture binaries
-(`ktstr-jemalloc-probe`, `ktstr-jemalloc-alloc-worker`) that the
-crate's integration tests spawn.
+`cargo-ktstr` dev workflow plugin). The two test-fixture binaries
+(`ktstr-jemalloc-probe`, `ktstr-jemalloc-alloc-worker`) the crate's
+integration tests spawn require the non-default `integration`
+feature, so a default install excludes them.
 
 ## Add the dependency
 
