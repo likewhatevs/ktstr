@@ -83,7 +83,7 @@ const KVM_IDENTITY_MAP_ADDRESS: u64 = KVM_TSS_ADDRESS + 3 * 4096;
 const NUM_IOAPIC_PINS: u64 = 24;
 
 /// APIC IDs above this require x2APIC mode (8-bit xAPIC limit).
-const MAX_XAPIC_ID: u32 = 254;
+pub(crate) const MAX_XAPIC_ID: u32 = 254;
 
 /// Per-VM halt poll interval (nanoseconds) for non-performance_mode VMs.
 /// Matches the x86 kernel default (KVM_HALT_POLL_NS_DEFAULT in
@@ -394,6 +394,21 @@ impl KtstrKvm {
         // host-resource pressure, not a test fault — route through
         // the contention classifier so the macro SKIPs cleanly.
         let total = topo.total_cpus();
+        // A topology wider than the host's KVM_CAP_MAX_VCPUS cannot run
+        // here; surface it as a clean skip (a host-capability limit, same
+        // SKIP class as overcommit) before the per-vCPU create loop, rather
+        // than a mid-loop create_vcpu errno. KVM_CAP_MAX_VCPUS is
+        // host-dependent (commonly 1024; CONFIG_KVM_MAX_NR_VCPUS,
+        // arch/x86/kvm/Kconfig).
+        let max_vcpus = kvm.get_max_vcpus();
+        if total as usize > max_vcpus {
+            return Err(anyhow::Error::new(crate::vmm::host_topology::ResourceContention {
+                reason: format!(
+                    "topology requires {total} vCPUs but this host's \
+                     KVM_CAP_MAX_VCPUS is {max_vcpus}; cannot run a VM this wide"
+                ),
+            }));
+        }
         let mut vcpus = Vec::with_capacity(total as usize);
         for cpu_id in 0..total {
             let vcpu = vm_fd.create_vcpu(cpu_id as u64).map_err(|e| {

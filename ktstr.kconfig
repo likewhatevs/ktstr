@@ -177,6 +177,21 @@ CONFIG_BTRFS_FS=y
 # On x86_64, X86_64_ACPI_NUMA is def_bool y when NUMA + ACPI + PCI
 # and selects ACPI_NUMA automatically.
 CONFIG_SMP=y
+# CONFIG_X86_X2APIC=y: x86 guests with >254 vCPUs need x2APIC (32-bit
+# APIC IDs). Legacy xAPIC has only 255 8-bit APIC IDs and the IOAPIC
+# consumes one, capping plain-xAPIC SMP at 254. Without this,
+# MAX_LOCAL_APIC stays 256 (arch/x86/include/asm/apicdef.h) and
+# acpi_parse_x2apic ignores every MADT x2APIC (type-9) entry
+# (arch/x86/kernel/acpi/boot.c — its body is under #ifdef
+# CONFIG_X86_X2APIC), so no CPU with APIC ID >255 can be registered or
+# onlined. x86-only; arm64 ignores the symbol (GICv3 handles wide SMP).
+CONFIG_X86_X2APIC=y
+# CONFIG_NR_CPUS bounds the kernel's compile-time max CPU count. The
+# x86_64 Kconfig default is 64 — far below the wide-SMP topologies ktstr
+# exercises (e.g. 512-vCPU guests). Set to 1024 to match KVM's default
+# KVM_MAX_VCPUS ceiling (CONFIG_KVM_MAX_NR_VCPUS, arch/x86/kvm/Kconfig).
+# Honored on both arches.
+CONFIG_NR_CPUS=1024
 CONFIG_NUMA=y
 # HMAT: parses ACPI HMAT for memory tiering (CXL nodes).
 # NUMA_BALANCING: auto-migrates pages to local node based on access.

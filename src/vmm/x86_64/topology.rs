@@ -468,6 +468,32 @@ pub fn generate_cpuid(
         });
     }
 
+    // Topologies above the xAPIC limit (max APIC ID > 254 — the same
+    // threshold that switches the VMM to split-irqchip) need x2APIC with
+    // extended MSI destination IDs to address CPUs above 255.
+    // KVM_FEATURE_MSI_EXT_DEST_ID (0x40000001 EAX bit 15) makes the guest's
+    // try_to_enable_x2apic raise apic_limit from 255 to 32767
+    // (arch/x86/kernel/apic/apic.c) and pack the high destination bits into
+    // the IOAPIC RTE / MSI address; host KVM decodes them via
+    // x86_msi_msg_get_destid. Without it the guest refuses to online any CPU
+    // whose APIC ID exceeds 255. Gated on the topology so smaller guests'
+    // CPUID is byte-identical to before.
+    let wide_smp = max_apic_id(topo) > crate::vmm::x86_64::kvm::MAX_XAPIC_ID;
+    if wide_smp {
+        if let Some(entry) = entries.iter_mut().find(|e| e.function == 0x4000_0001) {
+            entry.eax |= 1 << 15; // KVM_FEATURE_MSI_EXT_DEST_ID
+        } else {
+            // Defensive: KVM always enumerates 0x40000001 (its PV-features
+            // leaf), but a base CPUID that omitted it would otherwise drop
+            // the bit silently.
+            entries.push(kvm_cpuid_entry2 {
+                function: 0x4000_0001,
+                eax: 1 << 15,
+                ..Default::default()
+            });
+        }
+    }
+
     // KVM_HINTS_REALTIME: CPUID leaf 0x40000001 EDX bit 0.
     // Disables PV spinlocks, PV TLB flush, and PV sched_yield in the
     // guest, and enables haltpoll cpuidle. PV spinlocks require
@@ -478,8 +504,13 @@ pub fn generate_cpuid(
         if let Some(entry) = entries.iter_mut().find(|e| e.function == 0x4000_0001) {
             entry.edx |= 1;
         }
+    }
 
-        // Bump max hypervisor leaf so the guest enumerates 0x40000001.
+    // Both paths above populate leaf 0x40000001 (wide_smp -> EAX
+    // MSI_EXT_DEST_ID; performance_mode -> EDX HINTS_REALTIME); the guest
+    // only enumerates it if 0x40000000 advertises it as the max hypervisor
+    // leaf. Bump once for whichever ran.
+    if wide_smp || performance_mode {
         if let Some(entry) = entries.iter_mut().find(|e| e.function == 0x4000_0000) {
             entry.eax = entry.eax.max(0x4000_0001);
         }
@@ -2729,6 +2760,108 @@ mod tests {
                 "KVM_HINTS_REALTIME should not be set without performance_mode"
             );
         }
+    }
+
+    #[test]
+    fn msi_ext_dest_id_set_for_wide_topology() {
+        // A topology whose max APIC ID exceeds the xAPIC limit (>254) must
+        // advertise KVM_FEATURE_MSI_EXT_DEST_ID (0x40000001 EAX bit 15) so
+        // the guest raises its APIC limit and can address CPUs above 255.
+        let base = vec![
+            kvm_cpuid_entry2 {
+                function: 0,
+                ebx: 0x756e_6547, // "Genu"
+                edx: 0x4965_6e69, // "ineI"
+                ecx: 0x6c65_746e, // "ntel"
+                ..Default::default()
+            },
+            kvm_cpuid_entry2 {
+                function: 0x4000_0000,
+                eax: 0x4000_0000, // max leaf = 0x40000000 initially
+                ..Default::default()
+            },
+            kvm_cpuid_entry2 {
+                function: 0x4000_0001,
+                ..Default::default()
+            },
+        ];
+        let wide = Topology {
+            llcs: 16,
+            cores_per_llc: 16,
+            threads_per_core: 2,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        // Precondition: this topology actually exceeds the xAPIC limit.
+        assert!(
+            max_apic_id(&wide) > crate::vmm::x86_64::kvm::MAX_XAPIC_ID,
+            "test topology must exceed the xAPIC limit; max_apic_id={}",
+            max_apic_id(&wide),
+        );
+        let cpuid = generate_cpuid(&base, &wide, 0, false);
+        let entry = cpuid
+            .iter()
+            .find(|e| e.function == 0x4000_0001)
+            .expect("leaf 0x40000001 should exist");
+        assert_ne!(
+            entry.eax & (1 << 15),
+            0,
+            "MSI_EXT_DEST_ID (EAX bit 15) must be set for >254 APIC IDs"
+        );
+        // The guest enumerates 0x40000001 only if 0x40000000 advertises it.
+        let leaf40 = cpuid
+            .iter()
+            .find(|e| e.function == 0x4000_0000)
+            .expect("leaf 0x40000000 should exist");
+        assert!(
+            leaf40.eax >= 0x4000_0001,
+            "0x40000000.EAX must advertise 0x40000001, got {:#x}",
+            leaf40.eax,
+        );
+    }
+
+    #[test]
+    fn msi_ext_dest_id_absent_for_narrow_topology() {
+        // A topology within the xAPIC limit (<=254) must NOT advertise
+        // MSI_EXT_DEST_ID — its 0x40000001 EAX is unchanged from the base.
+        let base = vec![
+            kvm_cpuid_entry2 {
+                function: 0,
+                ebx: 0x756e_6547,
+                edx: 0x4965_6e69,
+                ecx: 0x6c65_746e,
+                ..Default::default()
+            },
+            kvm_cpuid_entry2 {
+                function: 0x4000_0000,
+                eax: 0x4000_0000,
+                ..Default::default()
+            },
+            kvm_cpuid_entry2 {
+                function: 0x4000_0001,
+                ..Default::default()
+            },
+        ];
+        let narrow = Topology {
+            llcs: 1,
+            cores_per_llc: 2,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        assert!(max_apic_id(&narrow) <= crate::vmm::x86_64::kvm::MAX_XAPIC_ID);
+        let cpuid = generate_cpuid(&base, &narrow, 0, false);
+        let entry = cpuid
+            .iter()
+            .find(|e| e.function == 0x4000_0001)
+            .expect("leaf 0x40000001 should exist");
+        assert_eq!(
+            entry.eax & (1 << 15),
+            0,
+            "MSI_EXT_DEST_ID must not be set for <=254 APIC IDs"
+        );
     }
 
     #[test]
