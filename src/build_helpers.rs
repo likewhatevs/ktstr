@@ -62,6 +62,54 @@ where
     ))
 }
 
+/// Reuse a pre-built blob binary that `cargo-ktstr` already embedded
+/// and extracted, instead of fetching + compiling our own. `cargo-ktstr`
+/// bakes the compiled busybox / wprof into its binary
+/// (`bin/cargo_ktstr/blobs.rs` `BUSYBOX_BYTES` / `WPROF_BYTES`),
+/// extracts them to disk at startup, and hands the child build their
+/// paths via `KTSTR_BUSYBOX_BIN` / `KTSTR_WPROF_BIN`; copying that
+/// binary into `$OUT_DIR/{blob_name}` is byte-equivalent to a local
+/// build's output (both originate from the same pinned source) and
+/// skips the network fetch entirely.
+///
+/// Returns `true` only when `dest` was populated from `src`. Returns
+/// `false` — so the caller falls through to its normal download/compile
+/// path — when `src` is `None`, an empty string, or points at a path
+/// that is not an existing, non-empty regular file (missing, a
+/// directory, or 0-byte). The is-file + non-empty guard is load-bearing:
+/// a `cargo-ktstr` built with `KTSTR_SKIP_{BUSYBOX,WPROF}_BUILD=1`
+/// carries an empty placeholder, and copying that would bake an
+/// un-exec'able blob into the guest initramfs. `install_env` empty-gates
+/// both blobs (so the path var stays unset for an empty blob and the
+/// caller normally never passes such a path — defense in depth); this
+/// guard is the last line. A set-but-unusable path warns; an unset path
+/// is silent (the normal not-under-cargo-ktstr / first-build case).
+fn copy_prebuilt_blob(src: Option<&str>, dest: &std::path::Path, blob_name: &str) -> bool {
+    let src = match src {
+        Some(s) if !s.is_empty() => s,
+        _ => return false,
+    };
+    let src_path = std::path::Path::new(src);
+    match std::fs::metadata(src_path) {
+        Ok(m) if m.is_file() && m.len() > 0 => {}
+        _ => {
+            println!(
+                "cargo:warning=prebuilt {blob_name} at {src} is missing, not a \
+                 regular file, or empty — building {blob_name} from source instead"
+            );
+            return false;
+        }
+    }
+    std::fs::copy(src_path, dest).unwrap_or_else(|e| {
+        panic!(
+            "copy prebuilt {blob_name} from {src} to {}: {e}",
+            dest.display()
+        )
+    });
+    println!("cargo:warning=using embedded {blob_name} from cargo-ktstr (skipped fetch + compile)");
+    true
+}
+
 /// Does `wprof_src` hold a complete recursive git clone? Requires
 /// both `.git/HEAD` (init reached) AND `src/Makefile` (working tree
 /// populated) — catches "init succeeded, checkout failed" partial
@@ -166,6 +214,86 @@ mod tests {
     #[should_panic(expected = "retry_with_backoff requires max_attempts >= 1")]
     fn max_zero_panics_with_actionable_message() {
         let _: Result<(), String> = retry_with_backoff("max-zero", 0, |_| Ok(()));
+    }
+
+    #[test]
+    fn copy_prebuilt_blob_copies_nonempty_source() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src-busybox");
+        std::fs::write(&src, b"BUSYBOX-BINARY-BYTES").expect("write src");
+        let dest = tmp.path().join("out-busybox");
+        assert!(
+            copy_prebuilt_blob(Some(src.to_str().unwrap()), &dest, "busybox"),
+            "a non-empty source must be copied",
+        );
+        assert_eq!(
+            std::fs::read(&dest).expect("read dest"),
+            b"BUSYBOX-BINARY-BYTES",
+            "dest must hold the source bytes verbatim",
+        );
+    }
+
+    #[test]
+    fn copy_prebuilt_blob_rejects_none_and_empty_string() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dest = tmp.path().join("out");
+        assert!(
+            !copy_prebuilt_blob(None, &dest, "busybox"),
+            "None → no copy"
+        );
+        assert!(
+            !copy_prebuilt_blob(Some(""), &dest, "busybox"),
+            "empty path string → no copy",
+        );
+        assert!(
+            !dest.exists(),
+            "dest must not be created when there is no usable source",
+        );
+    }
+
+    #[test]
+    fn copy_prebuilt_blob_rejects_missing_source() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("does-not-exist");
+        let dest = tmp.path().join("out");
+        assert!(
+            !copy_prebuilt_blob(Some(missing.to_str().unwrap()), &dest, "busybox"),
+            "a missing source file → no copy (fall through to build)",
+        );
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn copy_prebuilt_blob_rejects_zero_byte_source() {
+        // A KTSTR_SKIP_BUSYBOX_BUILD-built cargo-ktstr embeds a 0-byte
+        // placeholder; copying it would bake a broken busybox into the
+        // guest initramfs. Must reject and fall through to a real build.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let empty = tmp.path().join("empty-busybox");
+        std::fs::write(&empty, b"").expect("write empty");
+        let dest = tmp.path().join("out");
+        assert!(
+            !copy_prebuilt_blob(Some(empty.to_str().unwrap()), &dest, "busybox"),
+            "a 0-byte source must be rejected, not copied",
+        );
+        assert!(!dest.exists(), "must not copy a 0-byte placeholder");
+    }
+
+    #[test]
+    fn copy_prebuilt_blob_rejects_directory_source() {
+        // A directory reports metadata().len() > 0 on common
+        // filesystems; without the is_file() guard it would pass the
+        // non-empty check and then panic in fs::copy. Must be rejected
+        // (return false) cleanly so the caller falls through to build.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("a-directory");
+        std::fs::create_dir(&dir).expect("create dir");
+        let dest = tmp.path().join("out");
+        assert!(
+            !copy_prebuilt_blob(Some(dir.to_str().unwrap()), &dest, "busybox"),
+            "a directory source must be rejected, not copied",
+        );
+        assert!(!dest.exists());
     }
 
     #[cfg(feature = "wprof")]

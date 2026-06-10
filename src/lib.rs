@@ -1726,9 +1726,12 @@ pub fn run_shell(
         vmm::blobs::load_busybox_bytes().context("load busybox blob for shell-mode VM")?;
     #[cfg(feature = "wprof")]
     let wprof_config = {
-        // A `wprof`-feature build always provisions the blob via
-        // cargo-ktstr's install_env (KTSTR_WPROF_PATH), so a failed
-        // resolve here is a real defect — fail loud rather than silently
+        // A `wprof`-feature build provisions the blob via cargo-ktstr's
+        // install_env (KTSTR_WPROF_PATH) UNLESS it was built with
+        // KTSTR_SKIP_WPROF_BUILD=1 (the documented escape hatch, which
+        // leaves the blob empty so install_env exports no path). A failed
+        // resolve here therefore means that hatch is set or install_env
+        // was bypassed — fail loud either way rather than silently
         // shipping a wprof-less shell VM, which surfaces downstream as a
         // confusing "/bin/wprof: No such file" inside the guest.
         let mut c = vmm::wprof::WprofConfig::from_env()

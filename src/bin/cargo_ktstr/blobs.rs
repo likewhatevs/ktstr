@@ -132,8 +132,14 @@ pub fn install_env() -> std::io::Result<()> {
             std::env::set_var(ktstr::KTSTR_BUSYBOX_PATH_ENV, &busybox_path);
         }
     }
+    // Skip the wprof extract+set_var when the embedded blob is empty —
+    // the `KTSTR_SKIP_WPROF_BUILD=1` path (build.rs writes a 0-byte
+    // $OUT_DIR/wprof placeholder). Mirrors the busybox empty-gate above:
+    // leaving `KTSTR_WPROF_PATH` unset gives consumers a clean "unset"
+    // error and keeps a 0-byte path out of the child build's
+    // `KTSTR_WPROF_BIN`, rather than handing over an empty blob.
     #[cfg(feature = "wprof")]
-    {
+    if !WPROF_BYTES.is_empty() {
         let wprof_path = extract_to_content_addressed_file(WPROF_BYTES, "wprof")?;
         unsafe {
             std::env::set_var(ktstr::KTSTR_WPROF_PATH_ENV, &wprof_path);
