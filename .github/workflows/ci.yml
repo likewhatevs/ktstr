@@ -70,8 +70,9 @@ jobs:
 
   # Pins Cargo's `[dev-dependencies]` isolation contract: a downstream
   # consumer adding ktstr as a dev-dep MUST NOT get ktstr compiled into
-  # their release binary. Drives `tests/devdep-isolation/verify.sh` via
-  # the matching justfile recipe; the fixture lives in a standalone
+  # their release binary. Drives the `scripts::devdep-isolation`
+  # rust-script recipe (scripts.just) via the `devdep-isolation` justfile
+  # wrapper; the fixture lives in a standalone
   # crate (empty `[workspace]` table) so its resolver and target dir
   # are independent — exactly the perspective a real downstream
   # consumer has.
@@ -89,6 +90,7 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
       - run: cargo install just
+      - run: cargo install rust-script --locked
       - run: just devdep-isolation
 
   docs-link-check:

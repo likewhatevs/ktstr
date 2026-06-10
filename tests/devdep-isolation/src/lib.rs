@@ -5,9 +5,9 @@
 //! the verify script asserts on dev-dep isolation, not on this code's
 //! behavior.
 
-/// Sample prod function. The verify script greps `nm`'s output for
-/// `ktstr` symbols, so this function's mangled name (containing the
-/// crate name `ktstr_devdep_fixture`) tests the grep's specificity —
+/// Sample prod function. The verify script searches `nm`'s output for
+/// `ktstr::` symbols, so this function's mangled name (containing the
+/// crate name `ktstr_devdep_fixture`) tests that search's specificity —
 /// a regression that searched for the substring "ktstr" instead of a
 /// `ktstr::` namespace path would false-positive on this symbol.
 pub fn fixture_greeting() -> &'static str {
