@@ -65,31 +65,12 @@ automates this:
 
 ## Installation
 
-Add ktstr as a dev-dependency. The simplest form pulls in the full
-default feature set (matches what the installed `cargo-ktstr` /
-`ktstr` binaries expect):
+Add ktstr as a dev-dependency:
 
 ```toml
 [dev-dependencies]
 ktstr = "0.11"
 ```
-
-For a leaner transitive dep graph in the downstream consumer's
-build, opt out of the host-tooling deps (`tikv-jemallocator`,
-`clap_complete`, `tree-sitter`, `tree-sitter-c`, `base64`) — none
-of which the test-author surface references:
-
-```toml
-[dev-dependencies]
-ktstr = { version = "0.11", default-features = false, features = ["llm"] }
-```
-
-The `llm` feature (default-on) keeps the `OutputFormat::LlmExtract`
-path available; drop it too if no payload in the test crate uses
-`LlmExtract`. See [Feature flags](#feature-flags) below for the
-full menu. The host-tooling deps stay in the installed `cargo-ktstr`
-binary via its `required-features = ["cli-bins"]` declaration —
-`cargo install --locked ktstr` is unaffected.
 
 The library is the test-author surface. The `anyhow::Result`
 referenced in examples below is re-exported through
@@ -115,37 +96,6 @@ This installs:
   lock introspection. Optional unless you want the standalone
   diagnostic commands; `cargo-ktstr` already covers the test
   flow.
-
-**Note:** if you build the workspace with `--no-default-features`
-the `[[bin]]` targets above are silently skipped (they declare
-`required-features = ["cli-bins"]`). Re-enable explicitly with
-`--features cli-bins` if you need the bins from a no-default build.
-
-### Feature flags
-
-- **`llm`** (default-on) — local-CPU LLM extraction via the
-  bundled Qwen3-4B GGUF (`OutputFormat::LlmExtract`). Pulls in
-  `llama-cpp-2` (cmake C++ build; minutes on cold cache).
-- **`cli-bins`** (default-on) — umbrella for crates used only by
-  the installed `ktstr` / `cargo-ktstr` binaries and the
-  matching test-binary dispatch hooks. Includes `tikv-jemallocator`
-  (process-wide allocator), `clap_complete` (completions),
-  `tree-sitter` + `tree-sitter-c` (BTF anchor codegen), and the
-  `export` feature.
-- **`export`** (pulled in by `cli-bins`) — gates the `export`
-  module and the test-binary's `cargo ktstr export <name>` dispatch
-  arm. Drops `base64` from the manifest when off.
-- **`wprof`** (off-by-default) — embeds the wprof BPF tracer in
-  shell-mode VMs. First build clones `github.com/anakryiko/wprof`
-  and compiles libbpf + blazesym (needs git, clang, elfutils-devel,
-  zlib-devel; takes several minutes).
-- **`pretty-labels`** (off-by-default) — grex-based regex synthesis
-  for `ctprof_compare` display labels. Without it, labels fall back
-  to the deterministic join key (same data, less polish).
-- **`remote-cache`** (off-by-default) — GitHub Actions cache
-  integration for the blob store. CI-only.
-- **`integration`** — gates `resolve_func_ip` visibility for
-  in-repo integration tests.
 
 **Version compatibility:** pin the EXACT ktstr patch version across
 `[dev-dependencies] ktstr = "X.Y.Z"` and

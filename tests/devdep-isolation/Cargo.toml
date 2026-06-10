@@ -34,10 +34,9 @@ publish = false
 # only sees ktstr through dev-deps.
 
 [dev-dependencies]
-# Path dep, lean config — matches the `default-features = false,
-# features = ["llm"]` recipe the README points downstream consumers at.
-# Using the lean config (not full default) exercises the smallest
-# surface the README documents as supported.
+# Path dep, lean config (default-features = false, features = ["llm"]):
+# exercises dev-dep isolation under the smallest feature surface, with
+# none of the host-tooling deps pulled in.
 ktstr = { path = "../..", default-features = false, features = ["llm"] }
 
 [[bin]]
