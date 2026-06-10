@@ -3,9 +3,9 @@ use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CgroupDef, Step, execute_steps};
-use ktstr::workload::{WorkType, WorkerReport};
+use ktstr::workload::{WorkType, WorkerCtx, WorkerReport};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 /// MAP_SHARED futex word. All workers forked from the same parent
@@ -41,7 +41,8 @@ fn init_shared_futex() {
 /// cascade that caused PostgreSQL regressions under preemption-heavy
 /// schedulers. Neither MutexContention (no memory pressure under lock)
 /// nor PageFaultChurn (no contention) alone reproduces this interaction.
-fn fault_under_lock(stop: &AtomicBool) -> WorkerReport {
+fn fault_under_lock(ctx: &WorkerCtx) -> WorkerReport {
+    let stop = ctx.stop();
     let tid: libc::pid_t = unsafe { libc::getpid() };
     let start = Instant::now();
     let mut work_units = 0u64;

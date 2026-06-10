@@ -1115,13 +1115,12 @@ fn render_affinity_all_variants() {
 /// [`render_work_type`] together.
 #[test]
 fn is_unmapped_work_type_split_matches_render() {
-    use crate::workload::{WorkPhase, WorkerReport};
-    use std::sync::atomic::AtomicBool;
+    use crate::workload::{WorkPhase, WorkerCtx, WorkerReport};
 
     // Stub fn pointer for the `Custom` variant — `WorkType::Custom`
     // carries a fn pointer and stub_custom_fn is the cheapest
     // closure that satisfies the type without spawning a worker.
-    fn stub_custom_fn(_: &AtomicBool) -> WorkerReport {
+    fn stub_custom_fn(_: &WorkerCtx) -> WorkerReport {
         WorkerReport::default()
     }
 

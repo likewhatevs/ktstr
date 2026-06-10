@@ -160,7 +160,7 @@ pub(super) fn run_in_forked_child<F: FnOnce() -> i32>(body: F) -> i32 {
 }
 // -- Custom work type tests --
 
-pub(super) fn stub_custom_fn(_stop: &AtomicBool) -> WorkerReport {
+pub(super) fn stub_custom_fn(_ctx: &WorkerCtx) -> WorkerReport {
     WorkerReport {
         tid: 0,
         work_units: 0,
@@ -190,7 +190,8 @@ pub(super) fn stub_custom_fn(_stop: &AtomicBool) -> WorkerReport {
         affinity_error: None,
     }
 }
-pub(super) fn custom_spin_fn(stop: &AtomicBool) -> WorkerReport {
+pub(super) fn custom_spin_fn(ctx: &WorkerCtx) -> WorkerReport {
+    let stop = ctx.stop();
     let tid: libc::pid_t = unsafe { libc::getpid() };
     let start = Instant::now();
     let mut work_units = 0u64;
@@ -306,7 +307,8 @@ pub(super) fn wait_for_file_or_panic(
 /// `kill(pid, SIGUSR1)` arrives as a no-op — STOP never flips to
 /// true via the handler, and even code that checks STOP spins
 /// past the deadline.
-pub(super) fn ignores_sigusr1_fn(stop: &AtomicBool) -> WorkerReport {
+pub(super) fn ignores_sigusr1_fn(ctx: &WorkerCtx) -> WorkerReport {
+    let stop = ctx.stop();
     let tid = ignore_sigusr1_and_get_pid();
     // SIG_IGN is now installed. Clear any STOP set by the
     // framework's handler during the handshake window (between
@@ -592,7 +594,8 @@ pub(super) fn fork_and_exec_grandchild_and_publish_pidfile() -> libc::pid_t {
 /// stop_and_collect is forced into its StillAlive escalation
 /// branch. Pairs with
 /// [`stop_and_collect_reaps_custom_grandchild_via_process_group`].
-pub(super) fn forks_grandchild_sleep_fn(stop: &AtomicBool) -> WorkerReport {
+pub(super) fn forks_grandchild_sleep_fn(ctx: &WorkerCtx) -> WorkerReport {
+    let stop = ctx.stop();
     // Ignore SIGUSR1 so stop_and_collect escalates — matches
     // ignores_sigusr1_fn's rationale.
     let worker_pid = ignore_sigusr1_and_get_pid();
@@ -620,7 +623,8 @@ pub(super) fn forks_grandchild_sleep_fn(stop: &AtomicBool) -> WorkerReport {
 /// stop_and_collect sends SIGUSR1 within milliseconds of its
 /// own invocation, so in practice `stop` flips well before 10s
 /// elapses.
-pub(super) fn forks_grandchild_and_exits_cleanly_fn(stop: &AtomicBool) -> WorkerReport {
+pub(super) fn forks_grandchild_and_exits_cleanly_fn(ctx: &WorkerCtx) -> WorkerReport {
+    let stop = ctx.stop();
     let worker_pid = fork_and_exec_grandchild_and_publish_pidfile();
     wait_for_deadline(stop, Duration::from_secs(10));
     WorkerReport {
@@ -636,7 +640,7 @@ pub(super) fn forks_grandchild_and_exits_cleanly_fn(stop: &AtomicBool) -> Worker
 /// `setpgid(0, 0)` it installed at fork time still applies, so
 /// `stop_and_collect`'s unconditional killpg must still reap the
 /// grandchild.
-pub(super) fn forks_grandchild_and_panics_fn(_stop: &AtomicBool) -> WorkerReport {
+pub(super) fn forks_grandchild_and_panics_fn(_ctx: &WorkerCtx) -> WorkerReport {
     // SIG_IGN so a racing SIGUSR1 from stop_and_collect cannot
     // trip the default worker handler before the panic fires;
     // the panic + catch_unwind → _exit(1) path is what this

@@ -52,16 +52,16 @@ use super::WorkPhase;
 /// carries `#[serde(skip)]` because a `fn` pointer has no
 /// portable wire format.
 #[derive(Copy, Clone, Debug)]
-pub struct CustomFn(pub fn(&AtomicBool) -> WorkerReport);
+pub struct CustomFn(pub fn(&WorkerCtx) -> WorkerReport);
 
 impl CustomFn {
-    /// Invoke the wrapped work function with the worker's stop
-    /// flag. Used by the worker dispatch arm
+    /// Invoke the wrapped work function with the worker's execution
+    /// context ([`WorkerCtx`]). Used by the worker dispatch arm
     /// (`src/workload/worker/mod.rs`) so call sites do not have
     /// to pierce the newtype with `.0` syntax.
     #[inline]
-    pub fn call(&self, stop: &AtomicBool) -> WorkerReport {
-        (self.0)(stop)
+    pub fn call(&self, ctx: &WorkerCtx) -> WorkerReport {
+        (self.0)(ctx)
     }
 }
 
@@ -71,6 +71,70 @@ impl PartialEq for CustomFn {
         // addresses — the only meaningful equality semantic for
         // fn pointers. See type-level doc for rationale.
         std::ptr::fn_addr_eq(self.0, other.0)
+    }
+}
+
+/// Execution context handed to a [`WorkType::Custom`] worker function.
+///
+/// Exposes the worker's stop flag plus the parts of its runtime
+/// environment a scheduler probe most often needs — its effective
+/// cpuset and its cgroup-sibling pids — so a custom worker does not
+/// re-roll `sched_getaffinity` or `cgroup.procs` parsing. All three
+/// are captured once, at worker entry, before the work loop runs.
+///
+/// Borrowed, not owned: the framework constructs a `WorkerCtx`
+/// pointing at stack-local data in `worker_main` and passes it by
+/// reference for the duration of the call. A worker that needs the
+/// sibling set or cpuset to outlive a single read should copy what
+/// it needs out of the returned slices.
+#[derive(Copy, Clone, Debug)]
+pub struct WorkerCtx<'a> {
+    stop: &'a AtomicBool,
+    cpus: &'a [usize],
+    sibling_pids: &'a [libc::pid_t],
+}
+
+impl<'a> WorkerCtx<'a> {
+    /// Construct a context from borrowed worker state. Crate-internal:
+    /// only `worker_main` builds one; user code receives `&WorkerCtx`
+    /// and reads it through the accessors.
+    pub(crate) fn new(
+        stop: &'a AtomicBool,
+        cpus: &'a [usize],
+        sibling_pids: &'a [libc::pid_t],
+    ) -> Self {
+        WorkerCtx {
+            stop,
+            cpus,
+            sibling_pids,
+        }
+    }
+
+    /// The worker's stop flag. The work loop must poll this and return
+    /// a [`WorkerReport`] once it reads `true` (flipped by the SIGUSR1
+    /// handler in `CloneMode::Fork`, or a per-worker `AtomicBool` in
+    /// `CloneMode::Thread`).
+    #[inline]
+    pub fn stop(&self) -> &AtomicBool {
+        self.stop
+    }
+
+    /// The worker's effective cpuset — the CPUs it may run on, read
+    /// from `sched_getaffinity` at entry. Empty if the query failed.
+    #[inline]
+    pub fn cpus(&self) -> &[usize] {
+        self.cpus
+    }
+
+    /// The worker's cgroup-sibling pids — every task in the worker's
+    /// own `cgroup.procs` except itself, read at entry. Empty if the
+    /// worker has no siblings or the cgroup could not be read. See
+    /// [`WorkType::CrossAffinityChurn`] for the discovery contract
+    /// (a worker sees only the siblings present when it starts, so
+    /// declaration order matters).
+    #[inline]
+    pub fn sibling_pids(&self) -> &[libc::pid_t] {
+        self.sibling_pids
     }
 }
 
@@ -292,6 +356,15 @@ pub enum WorkType {
     /// `set_cpumask` race surface. The scx-ktstr fixture does not
     /// implement `set_cpumask`, so against it only the generic
     /// migration path runs.
+    ///
+    /// Masks come from the FLIPPER's own cpuset; the kernel clamps each
+    /// `sched_setaffinity(sibling, mask)` to the sibling's cpuset
+    /// (`cpumask_and` in `__sched_setaffinity`), so a sibling whose
+    /// cpuset is fully disjoint from the flipper's gets `-EINVAL` and is
+    /// silently skipped, and one sharing only CPUs outside the one-CPU
+    /// toggle delta sees no per-iteration change. Reliable churn
+    /// therefore wants the flipper and its targets in a shared cpuset —
+    /// the dedicated-`CgroupDef` pattern above guarantees it.
     CrossAffinityChurn { spin_iters: u64 },
     /// Cycle through scheduling policies each iteration. Each iteration:
     /// spin_burst → sched_setscheduler to next policy → yield. Cycles

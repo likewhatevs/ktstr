@@ -1130,8 +1130,9 @@ fn holdspec_loop_arm_exits_early_when_sched_dies_during_hold() {
 /// makes it race-immune: a SIGUSR1 that lands before SIG_IGN is
 /// installed flips STOP via the default handler, but the clear undoes
 /// it, so the worker keeps sleeping and only a SIGKILL terminates it.
-fn ignores_sigusr1_spin(stop: &std::sync::atomic::AtomicBool) -> crate::workload::WorkerReport {
+fn ignores_sigusr1_spin(ctx: &crate::workload::WorkerCtx) -> crate::workload::WorkerReport {
     use std::sync::atomic::Ordering;
+    let stop = ctx.stop();
     // SAFETY: runs in a freshly-forked, single-threaded worker child,
     // where `libc::signal` is async-signal-safe.
     unsafe {

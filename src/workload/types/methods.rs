@@ -4,14 +4,13 @@
 //! [`work_type`](super::work_type) so the impl block can grow without
 //! visually drowning the variant definitions.
 
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::workload::config::{AluWidth, FutexLockMode, SchedClass, WakeMechanism, defaults};
 
 use crate::workload::WorkerReport;
 
-use super::{WorkPhase, WorkType, WorkTypeValidationError};
+use super::{WorkPhase, WorkType, WorkTypeValidationError, WorkerCtx};
 
 impl WorkType {
     /// PascalCase names for all built-in variants, matching the enum arm names.
@@ -830,20 +829,21 @@ impl WorkType {
 
     /// User-supplied work function with a display name.
     ///
-    /// `run` receives a reference to the stop flag (flipped per-mode:
-    /// the SIGUSR1 handler for `CloneMode::Fork`, a per-worker
-    /// `AtomicBool` for `CloneMode::Thread`) and must return a
-    /// [`WorkerReport`] when the flag becomes `true`. The framework
-    /// handles fork / thread spawn, cgroup placement, affinity,
-    /// scheduling policy, and signal setup (Fork mode only); `run`
-    /// owns only the work loop.
+    /// `run` receives a [`WorkerCtx`] exposing the worker's stop flag
+    /// (flipped per-mode: the SIGUSR1 handler for `CloneMode::Fork`, a
+    /// per-worker `AtomicBool` for `CloneMode::Thread`) plus its
+    /// effective cpuset and cgroup-sibling pids, and must return a
+    /// [`WorkerReport`] when the stop flag becomes `true`. The
+    /// framework handles fork / thread spawn, cgroup placement,
+    /// affinity, scheduling policy, and signal setup (Fork mode only);
+    /// `run` owns only the work loop.
     ///
     /// The per-iteration built-in instrumentation (wake-latency samples,
     /// `iter_slot` publish, gap tracking) runs only for built-in variants
     /// and is bypassed for `Custom`. See the [`Custom`](Self::Custom)
     /// variant doc for the full telemetry contract and what `run` must
     /// populate on [`WorkerReport`] to keep downstream assertions honest.
-    pub fn custom(name: impl Into<String>, run: fn(&AtomicBool) -> WorkerReport) -> Self {
+    pub fn custom(name: impl Into<String>, run: fn(&WorkerCtx) -> WorkerReport) -> Self {
         WorkType::Custom {
             name: name.into(),
             run: super::work_type::CustomFn(run),

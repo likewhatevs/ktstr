@@ -585,6 +585,61 @@ fn sigkill_workers_makes_collect_prompt_for_sigusr1_ignoring_workers() {
         );
     }
 }
+
+/// A `Custom` worker receives a [`WorkerCtx`] whose `cpus()` is its
+/// real effective cpuset and whose `sibling_pids()` excludes the
+/// worker's own pid — proof the worker dispatch wires
+/// `read_effective_cpus` + `read_sibling_pids` into the ctx before
+/// handing control to the user fn. Each worker asserts both invariants;
+/// a broken wiring panics the worker, surfacing as a non-`completed`
+/// sentinel report. Sibling *content* (seeing the co-workers) needs a
+/// readable `cgroup.procs`, which may be unreadable here, so only the
+/// always-true excludes-self invariant is checked host-side. The
+/// `worker_ctx_e2e` VM test EXERCISES (does not gate — the scenario
+/// verdict ignores worker completion) a ctx-driven flipper in a real
+/// controlled cgroup; `read_sibling_pids` content is itself pinned by
+/// `read_sibling_pids_excludes_self`.
+#[test]
+fn custom_worker_receives_wired_ctx() {
+    fn assert_ctx_wired(ctx: &WorkerCtx) -> WorkerReport {
+        let me = unsafe { libc::getpid() };
+        assert!(
+            !ctx.cpus().is_empty(),
+            "ctx.cpus() must report the worker's non-empty effective cpuset"
+        );
+        assert!(
+            !ctx.sibling_pids().contains(&me),
+            "ctx.sibling_pids() must exclude the worker's own pid {me}"
+        );
+        while !stop_requested(ctx.stop()) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        WorkerReport {
+            completed: true,
+            ..WorkerReport::default()
+        }
+    }
+    const N: usize = 4;
+    let config = WorkloadConfig {
+        num_workers: N,
+        affinity: AffinityIntent::Inherit,
+        work_type: WorkType::custom("assert_ctx_wired", assert_ctx_wired),
+        sched_policy: SchedPolicy::Normal,
+        ..Default::default()
+    };
+    let mut h = WorkloadHandle::spawn(&config).unwrap();
+    h.start();
+    let reports = h.stop_and_collect();
+    assert_eq!(reports.len(), N, "one report per Custom worker");
+    for (i, r) in reports.iter().enumerate() {
+        assert!(
+            r.completed,
+            "worker {i} must complete cleanly — a non-completed sentinel \
+             means its WorkerCtx assertion (cpus non-empty / siblings \
+             exclude self) panicked, i.e. the dispatch wired the ctx wrong"
+        );
+    }
+}
 // -- Test-helper unit tests --
 
 /// Happy path: the file appears WITHIN the deadline, so

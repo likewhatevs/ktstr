@@ -337,28 +337,26 @@ pub(super) fn worker_main(
     let mut iteration_cost_sample_count: u64 = 0;
     let mut iterations: u64 = 0;
     // AffinityChurn / CrossAffinityChurn: read the effective cpuset
-    // once at start via sched_getaffinity.
-    // Custom: delegate entirely to the user function. Affinity and
+    // once at start via sched_getaffinity (read_effective_cpus).
+    // Custom: hand the user function a WorkerCtx. Affinity and
     // sched_policy are already applied above.
     if let WorkType::Custom { run, .. } = &work_type {
-        return run.call(stop);
+        // The ctx exposes the same effective cpuset and cgroup-sibling
+        // pids the built-in affinity-churn variants compute, so a
+        // custom probe need not re-roll sched_getaffinity or
+        // cgroup.procs parsing. Read both once here, before handing
+        // control to the user function.
+        let cpus = read_effective_cpus();
+        let sibling_pids = read_sibling_pids();
+        let ctx = WorkerCtx::new(stop, &cpus, &sibling_pids);
+        return run.call(&ctx);
     }
 
     let affinity_churn_cpus: Vec<usize> = if matches!(
         work_type,
         WorkType::AffinityChurn { .. } | WorkType::CrossAffinityChurn { .. }
     ) {
-        let mut cpu_set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-        let ret = unsafe {
-            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut cpu_set)
-        };
-        if ret == 0 {
-            (0..libc::CPU_SETSIZE as usize)
-                .filter(|c| unsafe { libc::CPU_ISSET(*c, &cpu_set) })
-                .collect()
-        } else {
-            Vec::new()
-        }
+        read_effective_cpus()
     } else {
         Vec::new()
     };
@@ -3477,6 +3475,24 @@ pub(super) fn spin_burst(work_units: &mut u64, count: u64) {
     for _ in 0..count {
         *work_units = std::hint::black_box(work_units.wrapping_add(1));
         std::hint::spin_loop();
+    }
+}
+
+/// Read the worker's effective cpuset (the CPUs it may run on) via
+/// `sched_getaffinity(0)`. Returns the set CPU indices, or an empty
+/// vec if the query fails. Shared by the [`WorkType::AffinityChurn`] /
+/// [`WorkType::CrossAffinityChurn`] setup and by `WorkerCtx::cpus` so
+/// the syscall logic lives in one place.
+fn read_effective_cpus() -> Vec<usize> {
+    let mut cpu_set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    let ret =
+        unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut cpu_set) };
+    if ret == 0 {
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|c| unsafe { libc::CPU_ISSET(*c, &cpu_set) })
+            .collect()
+    } else {
+        Vec::new()
     }
 }
 

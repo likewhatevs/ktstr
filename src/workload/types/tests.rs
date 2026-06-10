@@ -17,7 +17,7 @@ use std::time::Duration;
 /// a zeroed [`WorkerReport`] so the tests exercise the
 /// enum-variant plumbing (`name`, `worker_group_size`) without
 /// spawning a worker.
-fn stub_custom_fn(_stop: &AtomicBool) -> WorkerReport {
+fn stub_custom_fn(_ctx: &WorkerCtx) -> WorkerReport {
     WorkerReport {
         tid: 0,
         work_units: 0,
@@ -722,7 +722,7 @@ fn workload_enums_use_snake_case_wire_format() {
 /// fails with a serde error pointing at the skipped variant.
 #[test]
 fn worktype_custom_serialize_errors_skipped_variant() {
-    fn noop(_: &AtomicBool) -> WorkerReport {
+    fn noop(_: &WorkerCtx) -> WorkerReport {
         WorkerReport::default()
     }
     let custom = WorkType::custom("my_custom", noop);
@@ -764,7 +764,7 @@ mod partial_eq {
 
     #[test]
     fn custom_fn_eq_same_fn_pointer() {
-        fn f(_: &AtomicBool) -> WorkerReport {
+        fn f(_: &WorkerCtx) -> WorkerReport {
             WorkerReport::default()
         }
         assert_eq!(
@@ -777,10 +777,10 @@ mod partial_eq {
 
     #[test]
     fn custom_fn_neq_different_fn_pointers() {
-        fn f(_: &AtomicBool) -> WorkerReport {
+        fn f(_: &WorkerCtx) -> WorkerReport {
             WorkerReport::default()
         }
-        fn g(_: &AtomicBool) -> WorkerReport {
+        fn g(_: &WorkerCtx) -> WorkerReport {
             WorkerReport::default()
         }
         assert_ne!(
@@ -794,7 +794,7 @@ mod partial_eq {
 
     #[test]
     fn custom_fn_call_delegates_to_inner_fn() {
-        fn marker(_: &AtomicBool) -> WorkerReport {
+        fn marker(_: &WorkerCtx) -> WorkerReport {
             WorkerReport {
                 work_units: 0xdeadbeef,
                 ..Default::default()
@@ -802,7 +802,8 @@ mod partial_eq {
         }
         let cf = CustomFn(marker);
         let stop = AtomicBool::new(false);
-        let via_call = cf.call(&stop);
+        let ctx = WorkerCtx::new(&stop, &[], &[]);
+        let via_call = cf.call(&ctx);
         assert_eq!(
             via_call.work_units, 0xdeadbeef,
             ".call() must invoke the wrapped fn and propagate its \
@@ -819,10 +820,10 @@ mod partial_eq {
 
     #[test]
     fn work_type_custom_uses_custom_fn_eq() {
-        fn f(_: &AtomicBool) -> WorkerReport {
+        fn f(_: &WorkerCtx) -> WorkerReport {
             WorkerReport::default()
         }
-        fn g(_: &AtomicBool) -> WorkerReport {
+        fn g(_: &WorkerCtx) -> WorkerReport {
             WorkerReport::default()
         }
         let a = WorkType::custom("x", f);

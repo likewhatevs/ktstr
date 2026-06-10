@@ -1267,3 +1267,38 @@ fn read_sibling_pids_excludes_self() {
         "read_sibling_pids must exclude the caller's own pid {me}; got {sibs:?}"
     );
 }
+
+/// `WorkerCtx` accessors return the borrowed worker state verbatim,
+/// and `stop()` exposes the live flag — a flip is observable through
+/// the ctx. Pins the read-only contract a `Custom` worker relies on.
+#[test]
+fn worker_ctx_accessors_return_borrowed_state() {
+    let stop = AtomicBool::new(false);
+    let cpus = [3usize, 7, 11];
+    let siblings: [libc::pid_t; 2] = [100, 200];
+    let ctx = WorkerCtx::new(&stop, &cpus, &siblings);
+    assert_eq!(ctx.cpus(), cpus.as_slice(), "cpus() returns the borrowed cpuset");
+    assert_eq!(
+        ctx.sibling_pids(),
+        siblings.as_slice(),
+        "sibling_pids() returns the borrowed peer set"
+    );
+    assert!(!ctx.stop().load(Ordering::Relaxed));
+    stop.store(true, Ordering::Relaxed);
+    assert!(
+        ctx.stop().load(Ordering::Relaxed),
+        "stop() exposes the live flag — a flip is visible through the ctx"
+    );
+}
+
+/// `read_effective_cpus` reports the caller's effective cpuset.
+/// `sched_getaffinity(0)` always yields a non-empty set for a running
+/// task, so the helper the `Custom` ctx and the affinity-churn arms
+/// share must report at least one CPU.
+#[test]
+fn read_effective_cpus_reports_runner_cpuset() {
+    assert!(
+        !read_effective_cpus().is_empty(),
+        "read_effective_cpus must report the runner's non-empty cpuset"
+    );
+}
