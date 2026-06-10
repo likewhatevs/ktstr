@@ -4842,6 +4842,57 @@ impl WorkloadHandle {
         // (e.g. under degrade mode) don't serially exhaust the VM
         // timeout.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        // Bound on the post-SIGKILL worker reap (below). A worker normally
+        // exits <<1s after SIGKILL (post-crash bypass keeps it
+        // CFS-schedulable). The rare wedge: a sched_setaffinity flipper
+        // stuck uninterruptible in `affine_move_task`'s `wait_for_completion`
+        // — a migration that can't finish until the target becomes
+        // migratable, which during the crash/bypass window can take seconds
+        // — cannot take its pending SIGKILL until that syscall returns, so a
+        // blocking `waitpid` would stall collect for that whole window.
+        // The deadline is SHARED across workers: every such wedge waits out
+        // the SAME crash/bypass window, so once one times out the rest get
+        // the remaining (~0) budget and give up immediately rather than
+        // summing to N×timeout. Mirrors the scheduler-side
+        // `reap_child_bounded` (rust_init.rs); on timeout the zombie is left
+        // for VM reboot to reap (SIGKILL cannot make it exit faster — see
+        // that fn's doc).
+        const WORKER_REAP_TIMEOUT: Duration = Duration::from_secs(3);
+        let mut worker_reap_deadline: Option<Instant> = None;
+        // Evented, bounded reap of a SIGKILLed worker `pid`: wait up to
+        // `timeout` for it to become a zombie (`pidfd_open` + `poll`),
+        // then reap non-blocking. Returns false on timeout (worker still
+        // uninterruptibly wedged — the rare case `WORKER_REAP_TIMEOUT`
+        // documents; left for VM reboot).
+        fn reap_pid_bounded(pid: libc::pid_t, timeout: Duration) -> bool {
+            // Non-blocking reap of `pid` (observed StillAlive just above,
+            // so this succeeds only once it has become a zombie).
+            let reap = || {
+                matches!(
+                    nix::sys::wait::waitpid(
+                        nix::unistd::Pid::from_raw(pid),
+                        Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+                    ),
+                    Ok(nix::sys::wait::WaitStatus::Exited(..))
+                        | Ok(nix::sys::wait::WaitStatus::Signaled(..))
+                )
+            };
+            match crate::sync::pidfd_poll_exited(pid, timeout) {
+                // Readable => zombie => the WNOHANG reap is non-blocking.
+                crate::sync::PidfdWait::Exited => {
+                    let _ = reap();
+                    true
+                }
+                // Still uninterruptibly wedged (see `WORKER_REAP_TIMEOUT`):
+                // leave the zombie-to-be for VM reboot (SIGKILL already
+                // pending).
+                crate::sync::PidfdWait::TimedOut => false,
+                // pidfd_open failed (ESRCH/gone): one non-blocking reap.
+                crate::sync::PidfdWait::NoPidfd => reap(),
+            }
+        }
+
         for child in children {
             let mut buf = Vec::new();
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -4876,7 +4927,17 @@ impl WorkloadHandle {
             let still_running = matches!(waited, Ok(nix::sys::wait::WaitStatus::StillAlive));
             let exit_info_source: Result<nix::sys::wait::WaitStatus, nix::errno::Errno> =
                 if still_running {
-                    let _ = nix::sys::wait::waitpid(npid, None);
+                    // Bounded reap (see `reap_pid_bounded` + the shared
+                    // `worker_reap_deadline` above): replaces a blocking
+                    // `waitpid(npid, None)` that stalled on a worker
+                    // uninterruptibly wedged in an affine_move_task
+                    // migration (seconds; see `WORKER_REAP_TIMEOUT`).
+                    // exit_info stays `StillAlive` either way — the prior
+                    // blocking reap also discarded the status here.
+                    let rd = *worker_reap_deadline
+                        .get_or_insert_with(|| Instant::now() + WORKER_REAP_TIMEOUT);
+                    let remaining = rd.saturating_duration_since(Instant::now());
+                    reap_pid_bounded(child.pid, remaining);
                     Ok(nix::sys::wait::WaitStatus::StillAlive)
                 } else {
                     waited

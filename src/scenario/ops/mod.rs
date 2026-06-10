@@ -869,6 +869,16 @@ fn run_scenario(
             Ok::<(), anyhow::Error>(())
         });
         if let Err(err) = setup_res {
+            // Scheduler crashed during backdrop setup (e.g. a worker
+            // tripped the BPF error before the first Step): SIGKILL the
+            // spawned workers up front so the collect reaps below aren't
+            // scheduling-gated behind fallback workers (see
+            // `sigkill_handles`). Gated on `scx_down` (crash-only) so a
+            // non-crash setup error keeps the graceful collect path.
+            if sched_crashed_unexpectedly() {
+                sigkill_handles(&backdrop_state.handles);
+                sigkill_handles(&step_staging.handles);
+            }
             // Collect any workers that DID spawn before the failure
             // so their stats reach the final result instead of being
             // discarded by `WorkloadHandle::drop` (which SIGKILLs
@@ -920,7 +930,7 @@ fn run_scenario(
         // cannot meaningfully report on a pid that doesn't exist.
         if step_idx > 0
             && let Some(pid) = crate::vmm::rust_init::sched_pid()
-            && !process_alive(pid)
+            && (!process_alive(pid) || dispatch::scx_down())
         {
             // Scheduler died between steps: the kernel has disabled
             // sched_ext and the backdrop workers have fallen back to
@@ -992,7 +1002,7 @@ fn run_scenario(
         // already-exiting workers (see `sigkill_handles`). Gated on
         // the death flag so the normal teardown keeps its graceful
         // cooperative-stop + report-collection path.
-        if sched_died_during_hold {
+        if sched_died_during_hold || sched_crashed_unexpectedly() {
             sigkill_handles(&step_state.handles);
             sigkill_handles(&backdrop_state.handles);
         }
@@ -1011,6 +1021,16 @@ fn run_scenario(
         // the error context as a detail, instead of an opaque Err
         // that discards everything.
         if let Err(err) = step_res {
+            // Scheduler may have crashed between the pre-collect gate
+            // above and here (e.g. a non-crash step error, then scx went
+            // down during `collect_step`): SIGKILL the backdrop workers
+            // up front so this collect isn't scheduling-gated behind the
+            // fallback pool (see `sigkill_handles`). Crashed-only gate so
+            // a plain step error with a live scheduler keeps the graceful
+            // cooperative-stop path.
+            if sched_crashed_unexpectedly() {
+                sigkill_handles(&backdrop_state.handles);
+            }
             // Collect Backdrop-owned workload handles into a fresh
             // result first, then merge the accumulated step result
             // on top. `collect_backdrop` drains
@@ -1064,7 +1084,8 @@ fn run_scenario(
     // sched_pid() == None ⇒ no scheduler configured (kernel-default
     // path) OR Op::DetachScheduler cleared it; no liveness to
     // report on either case.
-    let sched_dead = crate::vmm::rust_init::sched_pid().is_some_and(|pid| !process_alive(pid));
+    let sched_dead = crate::vmm::rust_init::sched_pid()
+        .is_some_and(|pid| !process_alive(pid) || dispatch::scx_down());
 
     // Scheduler died after the last hold: SIGKILL the backdrop
     // workers up front so the teardown reap below isn't
@@ -1146,24 +1167,41 @@ fn panic_evented_hold_defect(
     panic!("ktstr::scenario::hold_or_sched_died: {op} failed (pid={pid}): {err} — {advice}");
 }
 
+/// True when a scheduler is still expected running (`sched_pid` set) AND
+/// sched_ext has gone down (`disabling`/`disabled`) — an unexpected
+/// crash/unregister of the scheduler under test, detected via the
+/// probe-independent [`dispatch::scx_down`] sysfs read. Unlike the BPF
+/// err-exit latch (whose host mirror is only populated in the
+/// auto-repro/dump VM, never the primary VM that runs the test), this is
+/// live in the PRIMARY VM. The `sched_pid` guard keeps a clean
+/// [`Op::DetachScheduler`] — which clears the pid before the state
+/// settles to `disabled` — off the SIGKILL fast-path. Used by the
+/// teardown gates that don't already hold the scheduler pid in scope.
+fn sched_crashed_unexpectedly() -> bool {
+    crate::vmm::rust_init::sched_pid().is_some() && dispatch::scx_down()
+}
+
 fn hold_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
     use crate::probe::process::{SchedExitKind, sched_exit_kind};
     use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 
     // The BPF err-exit latch (read via `sched_exit_kind`) flips at the
-    // error-class sched_ext exit — i.e. at the crash, long before a
-    // lingering crashed scheduler PROCESS exits (a scheduler like
-    // scx_lavd can defer its own exit by tens of seconds after its BPF
-    // scheduler is disabled). Poll it ALONGSIDE the pidfd so a crash
-    // aborts the hold at ~crash time, not at the process exit. The
-    // pidfd remains the backstop for clean/non-error process exits.
-    // 100ms is negligible vs the crash + the scheduler's exit latency.
+    // error-class sched_ext exit — i.e. at the crash, before the crashed
+    // scheduler PROCESS exits (a scheduler like scx_lavd observes the
+    // disable through its ~1s userspace poll loop, then flushes its dump
+    // and exits, so its process exit trails the crash by ~that long). Poll
+    // it ALONGSIDE the pidfd so a crash aborts the hold at ~crash time, not
+    // at the process exit. The pidfd remains the backstop for
+    // clean/non-error process exits. 100ms is negligible vs the crash + the
+    // scheduler's exit latency.
     const ERR_EXIT_POLL: Duration = Duration::from_millis(100);
     let crashed = || matches!(sched_exit_kind(), SchedExitKind::Crashed);
 
     if dur.is_zero() {
-        return crashed() || sched_pid.is_some_and(|pid| !process_alive(pid));
+        return crashed()
+            || (sched_pid.is_some() && dispatch::scx_down())
+            || sched_pid.is_some_and(|pid| !process_alive(pid));
     }
     let deadline = std::time::Instant::now() + dur;
     let Some(pid) = sched_pid else {
@@ -1248,17 +1286,25 @@ fn hold_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            // Hold elapsed without a wakeup. Re-probe BOTH signals to
-            // catch a race where the pid exited or the latch flipped
-            // between the last `epoll_wait` return and the deadline
-            // check (e.g. during EINTR re-entry).
-            return crashed() || !process_alive(pid);
+            // Hold elapsed without a wakeup. Re-probe ALL signals to
+            // catch a race where the pid exited, the err-exit latch
+            // flipped, or sched_ext went down (sysfs) between the last
+            // `epoll_wait` return and the deadline check (e.g. during
+            // EINTR re-entry). `pid` is `Some` here, so the
+            // scheduler-expected guard for `scx_down` is satisfied.
+            return crashed() || dispatch::scx_down() || !process_alive(pid);
         }
 
-        // The err-exit latch fires at the crash, before a lingering
-        // crashed scheduler process exits — check it before every
-        // epoll wait so the hold aborts at the crash, not the exit.
-        if crashed() {
+        // Abort at the crash, not at the lingering process exit. Two
+        // probe-independent signals fire well before a crashed
+        // scheduler's process exits: the BPF err-exit latch (live only
+        // in the auto-repro/dump VM) and `/sys/kernel/sched_ext/state`
+        // going `disabling`/`disabled` (live in the PRIMARY VM, where the
+        // latch mirror is never populated — this is what makes a primary
+        // VM crash abort the hold at crash time rather than ~1s later at
+        // process exit). `pid` is `Some` here, so the
+        // scheduler-expected guard for `scx_down` holds.
+        if crashed() || dispatch::scx_down() {
             return true;
         }
 

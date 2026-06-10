@@ -1223,9 +1223,10 @@ fn during_hold_sched_death_sigkills_workers_before_collect() {
 /// `hold_or_sched_died` aborts on the BPF err-exit latch (set at the
 /// crash) WITHOUT waiting for the scheduler PROCESS to exit — the
 /// fast-crash-detection path that keeps crash-repro tests from paying a
-/// slow scheduler's process-exit latency (scx_lavd lingers tens of
-/// seconds after its BPF scheduler is disabled). Forces the probe
-/// mirror to `Crashed` and passes a LIVE pid (this test process, which
+/// slow scheduler's process-exit latency (scx_lavd's process exit trails
+/// the crash by ~1s: its userspace poll loop observes the disable, then
+/// flushes its dump and exits). Forces the probe mirror to `Crashed` and
+/// passes a LIVE pid (this test process, which
 /// never exits during the test): a hold that only watched the pidfd
 /// would block the full 30s, so a sub-2s return proves the latch poll
 /// aborted it.

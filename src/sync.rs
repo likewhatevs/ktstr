@@ -135,6 +135,58 @@ impl Latch {
     }
 }
 
+/// Outcome of [`pidfd_poll_exited`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PidfdWait {
+    /// The pidfd became readable — the process reached `EXIT_ZOMBIE`. The
+    /// caller still reaps it (`Child::wait` / `waitpid`).
+    Exited,
+    /// `timeout` elapsed (or `poll(2)` errored) with the process still
+    /// alive — the caller gives up (e.g. leaves it for a VM reboot).
+    TimedOut,
+    /// `pidfd_open(2)` failed (`ESRCH` — already reaped/gone — or an env
+    /// defect). The caller should fall back to a non-blocking reap.
+    NoPidfd,
+}
+
+/// Wait up to `timeout` for process `pid` to exit, evented via
+/// `pidfd_open(2)` + `poll(2)` — no busy-poll, no signal sent, no reap.
+/// The shared core of ktstr's bounded teardown reaps (the scheduler
+/// reap and the worker reap): a SIGKILLed-but-wedged process — e.g. one
+/// stuck uninterruptible in a syscall (a worker mid-`affine_move_task`
+/// migration during a crash/bypass window) — cannot take its pending
+/// signal until the syscall returns, so an unbounded
+/// `wait`/`waitpid` would stall teardown for that whole window; this
+/// caps the wait and lets the caller give up. The pidfd becomes readable
+/// ONLY at `EXIT_ZOMBIE`, so [`PidfdWait::TimedOut`] means
+/// genuinely-still-alive (not merely signal-pending).
+pub(crate) fn pidfd_poll_exited(pid: libc::pid_t, timeout: std::time::Duration) -> PidfdWait {
+    // SAFETY: pidfd_open(2) on `pid`, flags 0; returns an owned fd (>=0)
+    // or -1 with errno set.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) as libc::c_int };
+    if pidfd < 0 {
+        return PidfdWait::NoPidfd;
+    }
+    let mut pfd = libc::pollfd {
+        fd: pidfd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    // SAFETY: one valid pollfd; the pidfd becomes readable when `pid`
+    // transitions to EXIT_ZOMBIE.
+    let ret = unsafe { libc::poll(&mut pfd, 1, ms) };
+    // SAFETY: closing the pidfd we just opened.
+    unsafe {
+        libc::close(pidfd);
+    }
+    if ret > 0 {
+        PidfdWait::Exited
+    } else {
+        PidfdWait::TimedOut
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +321,35 @@ mod tests {
         assert_eq!(*l.read_unpoisoned(), 123);
         *l.write_unpoisoned() = 456;
         assert_eq!(*l.read_unpoisoned(), 456);
+    }
+
+    /// `pidfd_poll_exited` reports `Exited` once a short-lived child
+    /// reaches `EXIT_ZOMBIE`, and `TimedOut` (the pidfd never became
+    /// readable) while a long-lived child is still alive — the
+    /// bounded-wait contract the teardown reaps depend on.
+    #[test]
+    fn pidfd_poll_exited_distinguishes_exited_from_live() {
+        // A child that exits well within the wait window → Exited.
+        let mut quick = std::process::Command::new("sleep")
+            .arg("0.1")
+            .spawn()
+            .expect("spawn sleep 0.1");
+        assert_eq!(
+            pidfd_poll_exited(quick.id() as libc::pid_t, Duration::from_secs(10)),
+            PidfdWait::Exited,
+        );
+        quick.wait().unwrap(); // reap the zombie pidfd_poll_exited left
+
+        // A child still alive when the (short) bound elapses → TimedOut.
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep 30");
+        assert_eq!(
+            pidfd_poll_exited(sleeper.id() as libc::pid_t, Duration::from_millis(200)),
+            PidfdWait::TimedOut,
+        );
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
     }
 }
