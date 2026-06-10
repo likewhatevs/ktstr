@@ -1220,6 +1220,50 @@ fn during_hold_sched_death_sigkills_workers_before_collect() {
     );
 }
 
+/// `hold_or_sched_died` aborts on the BPF err-exit latch (set at the
+/// crash) WITHOUT waiting for the scheduler PROCESS to exit — the
+/// fast-crash-detection path that keeps crash-repro tests from paying a
+/// slow scheduler's process-exit latency (scx_lavd lingers tens of
+/// seconds after its BPF scheduler is disabled). Forces the probe
+/// mirror to `Crashed` and passes a LIVE pid (this test process, which
+/// never exits during the test): a hold that only watched the pidfd
+/// would block the full 30s, so a sub-2s return proves the latch poll
+/// aborted it.
+#[test]
+fn hold_aborts_on_err_exit_latch_not_process_exit() {
+    use crate::probe::process::{SchedExitKind, sched_exit_kind, set_probe_sched_exit_state};
+    // The mirror is a process-global atomic; reset it (panic-safe) so a
+    // forced `Crashed` does not leak into neighbor tests.
+    struct ResetExitState;
+    impl Drop for ResetExitState {
+        fn drop(&mut self) {
+            set_probe_sched_exit_state(SchedExitKind::Unknown);
+        }
+    }
+    let _reset = ResetExitState;
+    set_probe_sched_exit_state(SchedExitKind::Crashed);
+    assert_eq!(
+        sched_exit_kind(),
+        SchedExitKind::Crashed,
+        "setup: the probe mirror must read Crashed after the override",
+    );
+    // A live thread-group leader that does not exit during the test, so
+    // any abort comes from the latch poll, not the pidfd backstop.
+    let live_pid = unsafe { libc::getpid() };
+    let start = std::time::Instant::now();
+    let died = hold_or_sched_died(Duration::from_secs(30), Some(live_pid));
+    let elapsed = start.elapsed();
+    assert!(
+        died,
+        "hold_or_sched_died must report sched-died when the err-exit latch is Crashed",
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "hold must abort on the latch within ~one poll interval, not wait for \
+         the live process or the full 30s dur; took {elapsed:?}",
+    );
+}
+
 /// The Loop arm's apply_ops error-propagation path: an
 /// `apply_ops` Err on iteration N at mod.rs:1175 exits the loop
 /// via the `drain_on_err!` macro (mod.rs:1151-1161) which

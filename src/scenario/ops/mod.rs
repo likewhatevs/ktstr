@@ -1147,15 +1147,40 @@ fn panic_evented_hold_defect(
 }
 
 fn hold_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
+    use crate::probe::process::{SchedExitKind, sched_exit_kind};
     use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 
+    // The BPF err-exit latch (read via `sched_exit_kind`) flips at the
+    // error-class sched_ext exit — i.e. at the crash, long before a
+    // lingering crashed scheduler PROCESS exits (a scheduler like
+    // scx_lavd can defer its own exit by tens of seconds after its BPF
+    // scheduler is disabled). Poll it ALONGSIDE the pidfd so a crash
+    // aborts the hold at ~crash time, not at the process exit. The
+    // pidfd remains the backstop for clean/non-error process exits.
+    // 100ms is negligible vs the crash + the scheduler's exit latency.
+    const ERR_EXIT_POLL: Duration = Duration::from_millis(100);
+    let crashed = || matches!(sched_exit_kind(), SchedExitKind::Crashed);
+
     if dur.is_zero() {
-        return sched_pid.is_some_and(|pid| !process_alive(pid));
+        return crashed() || sched_pid.is_some_and(|pid| !process_alive(pid));
     }
+    let deadline = std::time::Instant::now() + dur;
     let Some(pid) = sched_pid else {
-        thread::sleep(dur);
-        return false;
+        // No scheduler pid (host-only run, or the pid was not recorded):
+        // no pidfd to wait on, but the err-exit latch still fires on a
+        // crash — poll it in short intervals instead of sleeping blind
+        // for the whole window.
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return crashed();
+            }
+            if crashed() {
+                return true;
+            }
+            thread::sleep(remaining.min(ERR_EXIT_POLL));
+        }
     };
 
     // `pidfd_open(pid, 0)`: returns an fd that becomes readable when
@@ -1219,23 +1244,32 @@ fn hold_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
         );
     }
 
-    let deadline = std::time::Instant::now() + dur;
     let mut events = [EpollEvent::empty()];
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            // Hold elapsed without a wakeup. Re-probe once via
-            // `process_alive` to catch a race where the pid exited
+            // Hold elapsed without a wakeup. Re-probe BOTH signals to
+            // catch a race where the pid exited or the latch flipped
             // between the last `epoll_wait` return and the deadline
             // check (e.g. during EINTR re-entry).
-            return !process_alive(pid);
+            return crashed() || !process_alive(pid);
         }
 
-        // `PollTimeout` (aliased as `EpollTimeout`) stores the value
-        // as `i32`. Single-pass clamp via `u128 → i32::MAX` so a
-        // `Duration::MAX` remainder saturates at the max accepted
-        // value instead of overflowing through the intermediate u32.
-        let ms_i32 = remaining.as_millis().min(i32::MAX as u128) as i32;
+        // The err-exit latch fires at the crash, before a lingering
+        // crashed scheduler process exits — check it before every
+        // epoll wait so the hold aborts at the crash, not the exit.
+        if crashed() {
+            return true;
+        }
+
+        // Cap the epoll timeout at the latch poll interval so the latch
+        // is re-checked every `ERR_EXIT_POLL`, not only when the pidfd
+        // becomes readable. `PollTimeout` (aliased as `EpollTimeout`)
+        // stores the value as `i32`; single-pass clamp via
+        // `u128 → i32::MAX` so a large remainder saturates at the max
+        // accepted value instead of overflowing through the u32.
+        let poll = remaining.min(ERR_EXIT_POLL);
+        let ms_i32 = poll.as_millis().min(i32::MAX as u128) as i32;
         let timeout_param = match EpollTimeout::try_from(ms_i32) {
             Ok(t) => t,
             Err(e) => {
@@ -1255,9 +1289,9 @@ fn hold_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
 
         match epoll.wait(&mut events, timeout_param) {
             Ok(0) => {
-                // Timeout fired with no ready events. Loop back so
-                // `remaining.is_zero()` at the top handles the
-                // deadline path uniformly.
+                // Poll-interval timeout, no pidfd event. Loop back to
+                // re-check the err-exit latch and the deadline at the
+                // top of the loop.
             }
             Ok(_) => {
                 // pidfd became readable — task transitioned to

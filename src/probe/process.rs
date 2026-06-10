@@ -107,6 +107,22 @@ pub fn sched_exit_kind() -> SchedExitKind {
     }
 }
 
+/// Override the cross-thread exit-state mirror. The probe poll thread
+/// is the production writer (it mirrors the BSS `ktstr_err_exit_detected`
+/// latch into [`PROBE_SCHED_EXIT_STATE`]); this lets host-side tests,
+/// where no BPF probe runs, simulate an observed crash latch. Pair a
+/// `Crashed` set with a reset to [`SchedExitKind::Unknown`] so neighbor
+/// tests start from a clean mirror.
+#[cfg(test)]
+pub(crate) fn set_probe_sched_exit_state(kind: SchedExitKind) {
+    let encoded = match kind {
+        SchedExitKind::Unknown => 0,
+        SchedExitKind::Clean => PROBE_EXIT_STATE_CLEAN,
+        SchedExitKind::Crashed => PROBE_EXIT_STATE_CRASHED,
+    };
+    PROBE_SCHED_EXIT_STATE.store(encoded, Ordering::Release);
+}
+
 /// Input for Phase B probe attachment (BPF fentry/fexit).
 ///
 /// Sent via mpsc channel after the scheduler starts and BPF programs
