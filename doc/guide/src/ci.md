@@ -54,7 +54,7 @@ jobs:
         with:
           tool: cargo-nextest
       - name: Install ktstr
-        run: cargo install --path . --locked --bin ktstr --bin cargo-ktstr
+        run: cargo install --path . --locked
       - name: Cache kernel images
         uses: actions/cache@v5
         with:
@@ -84,7 +84,7 @@ strategy:
 steps:
   # ...
   - name: Install ktstr
-    run: cargo install --path . --locked --bin ktstr --bin cargo-ktstr
+    run: cargo install --path . --locked
   - name: Build test kernel
     run: cargo ktstr kernel build ${{ matrix.kernel-version }}
   - run: cargo ktstr test --kernel ${{ matrix.kernel-version }} -- --profile ci --features integration
@@ -144,7 +144,7 @@ coverage:
       with:
         tool: cargo-llvm-cov,cargo-nextest
     - name: Install ktstr
-      run: cargo install --path . --locked --bin ktstr --bin cargo-ktstr
+      run: cargo install --path . --locked
     - name: Cache kernel images
       uses: actions/cache@v5
       with:

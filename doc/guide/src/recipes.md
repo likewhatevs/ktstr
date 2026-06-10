@@ -15,7 +15,7 @@ Standalone examples for common tasks. Each recipe is self-contained.
 >   `ktstr` binary. The `kernel` and `shell` surfaces overlap with
 >   `cargo ktstr` for callers without cargo on PATH.
 >
-> Both binaries are installed by `cargo install ktstr --bin ktstr --bin cargo-ktstr`.
+> Both binaries are installed by `cargo install ktstr`.
 
 - [Test a new scheduler](recipes/test-new-scheduler.md) -- end-to-end
   from binary to integration tests

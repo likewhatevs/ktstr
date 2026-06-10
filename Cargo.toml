@@ -9,7 +9,7 @@ repository = "https://github.com/likewhatevs/ktstr"
 
 [package]
 name = "ktstr"
-version = "0.11.0"
+version = "0.11.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -93,7 +93,7 @@ virtio-queue = "0.17"
 vm-superio = "0.8.1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 linkme = "0.3"
-ktstr-macros = { version = "0.11.0", path = "ktstr-macros" }
+ktstr-macros = { version = "0.11.1", path = "ktstr-macros" }
 goblin = { version = "0.10.5", features = ["elf64"] }
 # Memory-map /proc/self/exe in `try_flush_profraw` instead of reading
 # the whole binary into a Vec<u8>. Coverage-instrumented test binaries
@@ -328,18 +328,19 @@ debug = "line-tables-only"
 [features]
 default = ["llm", "cli-bins"]
 integration = []
-# Dependencies required only by the four `src/bin/*.rs` entry points
-# (`ktstr`, `cargo-ktstr`, `ktstr-jemalloc-probe`,
-# `ktstr-jemalloc-alloc-worker`):
+# Dependencies for the `src/bin/*.rs` entry points. The two
+# user-facing bins (`ktstr`, `cargo-ktstr`) carry
+# `required-features = ["cli-bins"]`; the two jemalloc test fixtures
+# (`ktstr-jemalloc-probe`, `ktstr-jemalloc-alloc-worker`) additionally
+# require `integration`, so a default `cargo install ktstr` builds only
+# the two user-facing bins.
 #   - `tikv-jemallocator` — process-wide `#[global_allocator]` swap.
-#   - `clap_complete`     — `completions` subcommand on `ktstr` /
-#                            `cargo-ktstr`.
+#   - `clap_complete` — `completions` subcommand on `ktstr` / `cargo-ktstr`.
 #   - `tree-sitter` + `tree-sitter-c` — BTF type-anchor codegen for
-#                            cargo-ktstr's test/coverage paths.
-# Default-on so `cargo install --locked ktstr` keeps working
-# unchanged; each `[[bin]]` carries `required-features = ["cli-bins"]`
-# so the bin is silently skipped (rather than failing to compile)
-# when the feature is off. Downstream library consumers wanting a
+#     cargo-ktstr's test/coverage paths.
+# Default-on so `cargo install --locked ktstr` keeps working unchanged;
+# a `[[bin]]` is silently skipped (rather than failing to compile) when
+# its required features are off. Downstream library consumers wanting a
 # leaner dev-dep transitive set drop these by passing
 # `default-features = false`:
 #
@@ -473,12 +474,12 @@ required-features = ["cli-bins"]
 [[bin]]
 name = "ktstr-jemalloc-probe"
 path = "src/bin/jemalloc_probe.rs"
-required-features = ["cli-bins"]
+required-features = ["cli-bins", "integration"]
 
 [[bin]]
 name = "ktstr-jemalloc-alloc-worker"
 path = "src/bin/jemalloc_alloc_worker.rs"
-required-features = ["cli-bins"]
+required-features = ["cli-bins", "integration"]
 
 [[test]]
 name = "ktstr_sched_tests"
@@ -506,6 +507,30 @@ name = "compile_fail"
 
 [[test]]
 name = "jemalloc_probe_tests"
+required-features = ["integration"]
+
+# jemalloc / ctprof integration-test fixtures: each env!s
+# CARGO_BIN_EXE_ktstr-jemalloc-{probe,alloc-worker}, so they build only
+# when the (integration-gated) jemalloc bins do.
+[[test]]
+name = "jemalloc_alloc_worker_exit_codes"
+required-features = ["integration"]
+
+[[test]]
+name = "ctprof_capture_jemalloc_wiring"
+required-features = ["integration"]
+
+[[test]]
+name = "jemalloc_probe_signals_test"
+required-features = ["integration"]
+
+[[test]]
+name = "ctprof_capture_jemalloc_e2e"
+required-features = ["integration"]
+
+[[test]]
+name = "ctprof_pipeline_e2e"
+required-features = ["integration"]
 
 [[test]]
 name = "live_host_pipeline_e2e"
