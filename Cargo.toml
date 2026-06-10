@@ -344,7 +344,7 @@ integration = []
 # `default-features = false`:
 #
 #   [dev-dependencies]
-#   ktstr = { version = "0.10", default-features = false, features = ["llm"] }
+#   ktstr = { version = "0.11", default-features = false, features = ["llm"] }
 cli-bins = [
     "dep:tikv-jemallocator",
     "dep:clap_complete",
