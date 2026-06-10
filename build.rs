@@ -314,6 +314,14 @@ int main(void) {{
     //    with a clear "shell mode unavailable" rather than an
     //    opaque "exec format error" on the 0-byte file. Mirrors
     //    the existing `KTSTR_SKIP_WPROF_BUILD` escape hatch below.
+    //  - `KTSTR_BUSYBOX_BIN=<path>` copies a pre-built busybox binary
+    //    directly into `$OUT_DIR/busybox`, skipping fetch + compile.
+    //    `cargo-ktstr` sets it (via `run_cargo.rs`) to the busybox it
+    //    already embedded and extracted (`bin/cargo_ktstr/blobs.rs`),
+    //    so a downstream `cargo ktstr test` reuses that binary instead
+    //    of re-fetching. Falls through to the fetch path when the path
+    //    is unset / missing / 0-byte. Precedence: SKIP > BIN > TARBALL
+    //    > download.
     //
     // The pre-pin git-clone fallback was removed alongside this
     // refactor: a clone bypasses the SHA gate (no tarball to
@@ -322,6 +330,7 @@ int main(void) {{
     let busybox_bin = out_dir.join("busybox");
     println!("cargo:rerun-if-env-changed=KTSTR_SKIP_BUSYBOX_BUILD");
     println!("cargo:rerun-if-env-changed=KTSTR_BUSYBOX_TARBALL");
+    println!("cargo:rerun-if-env-changed=KTSTR_BUSYBOX_BIN");
     let skip_busybox = std::env::var("KTSTR_SKIP_BUSYBOX_BUILD")
         .ok()
         .filter(|v| !v.is_empty())
@@ -340,7 +349,13 @@ int main(void) {{
                 )
             });
         }
-    } else if !busybox_bin.exists() {
+    } else if !busybox_bin.exists()
+        && !copy_prebuilt_blob(
+            std::env::var("KTSTR_BUSYBOX_BIN").ok().as_deref(),
+            &busybox_bin,
+            "busybox",
+        )
+    {
         println!("cargo:warning=compiling busybox (first build only)...");
 
         // Check required tools before attempting build.
@@ -487,6 +502,7 @@ int main(void) {{
     #[cfg(feature = "wprof")]
     {
         println!("cargo:rerun-if-env-changed=KTSTR_SKIP_WPROF_BUILD");
+        println!("cargo:rerun-if-env-changed=KTSTR_WPROF_BIN");
         let skip_wprof = std::env::var("KTSTR_SKIP_WPROF_BUILD")
             .ok()
             .filter(|v| !v.is_empty())
@@ -503,6 +519,21 @@ int main(void) {{
         // would only break if upstream rewrote history to orphan it.
         const WPROF_REV: &str = "53162afea658b0474c88212228a94c8c50891781";
         let wprof_src = out_dir.join("wprof-src");
+
+        // Prefer the wprof binary cargo-ktstr already embedded
+        // (KTSTR_WPROF_BIN -> the extracted WPROF_BYTES); copying it
+        // skips the recursive git clone + compile. Computed before the
+        // rev-enforcement below so a copied binary is not mistaken for a
+        // stale clone and wiped. Unset/empty/missing/0-byte falls
+        // through to the clone+build (first-ever build, or a SKIP-built
+        // cargo-ktstr).
+        let copied_wprof = !skip_wprof
+            && !wprof_bin.exists()
+            && copy_prebuilt_blob(
+                std::env::var("KTSTR_WPROF_BIN").ok().as_deref(),
+                &wprof_bin,
+                "wprof",
+            );
 
         // Make the pin authoritative over a cached build. The gate
         // below (`!wprof_bin.exists()`) builds wprof once and reuses the
@@ -531,7 +562,8 @@ int main(void) {{
                 .success()
                 .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
         };
-        if !skip_wprof
+        if !copied_wprof
+            && !skip_wprof
             && (!is_wprof_clone_complete(&wprof_src)
                 || wprof_clone_rev(&wprof_src).as_deref() != Some(WPROF_REV))
         {

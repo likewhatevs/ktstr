@@ -74,6 +74,33 @@ pub(crate) fn profraw_inject_for(
     Some(dir.join("default-%p-%m.profraw"))
 }
 
+/// Build-time env vars handing `cargo-ktstr`'s already-extracted
+/// busybox / wprof binaries to the child build, so the downstream
+/// `ktstr` `build.rs` copies them into `$OUT_DIR` instead of
+/// re-fetching + recompiling (see `copy_prebuilt_blob` in
+/// `build_helpers.rs`). `cargo-ktstr` exported `KTSTR_BUSYBOX_PATH` /
+/// `KTSTR_WPROF_PATH` at startup (`bin/cargo_ktstr/blobs.rs`
+/// `install_env`) pointing at the extracted blobs; this re-exports each
+/// present path under the build-time `KTSTR_*_BIN` name `build.rs`
+/// reads. A path var is present only when the embedded blob was
+/// non-empty, so an absent var (cargo-ktstr built without that blob)
+/// yields no pair and the child build falls back to its fetch path.
+/// Pure with respect to its args so a unit test can drive every
+/// present/absent combination.
+fn prebuilt_blob_bin_envs(
+    busybox_path: Option<std::ffi::OsString>,
+    wprof_path: Option<std::ffi::OsString>,
+) -> Vec<(&'static str, std::ffi::OsString)> {
+    let mut pairs = Vec::new();
+    if let Some(p) = busybox_path {
+        pairs.push(("KTSTR_BUSYBOX_BIN", p));
+    }
+    if let Some(p) = wprof_path {
+        pairs.push(("KTSTR_WPROF_BIN", p));
+    }
+    pairs
+}
+
 /// Shared runner for `cargo ktstr test`, `cargo ktstr coverage`, and
 /// `cargo ktstr llvm-cov`.
 ///
@@ -142,6 +169,18 @@ fn run_cargo_sub(
     }
     if no_skip_mode {
         cmd.env(ktstr::KTSTR_NO_SKIP_MODE_ENV, "1");
+    }
+
+    // Hand the child build cargo-ktstr's embedded busybox / wprof so its
+    // build.rs copies them instead of re-downloading (see
+    // prebuilt_blob_bin_envs). KTSTR_WPROF_PATH uses the literal name —
+    // ktstr::KTSTR_WPROF_PATH_ENV is `#[cfg(feature = "wprof")]`, and
+    // this propagation is a harmless no-op when wprof was not embedded.
+    for (var, val) in prebuilt_blob_bin_envs(
+        std::env::var_os(ktstr::KTSTR_BUSYBOX_PATH_ENV),
+        std::env::var_os("KTSTR_WPROF_PATH"),
+    ) {
+        cmd.env(var, val);
     }
 
     if let Some(pat) = profraw_inject_for(sub_argv, std::env::var_os("LLVM_PROFILE_FILE")) {
@@ -530,6 +569,45 @@ mod tests {
         assert!(
             profraw_inject_for(TEST_SUB_ARGV, Some(existing)).is_none(),
             "an operator-set LLVM_PROFILE_FILE must not be overridden",
+        );
+    }
+
+    // -- prebuilt_blob_bin_envs --
+    //
+    // cargo-ktstr re-exports its extracted busybox / wprof paths to the
+    // child build as KTSTR_*_BIN so build.rs copies them instead of
+    // re-fetching. A pair is emitted only for a present source path.
+
+    /// Both paths present → both `KTSTR_*_BIN` pairs, busybox first,
+    /// carrying the exact path values.
+    #[test]
+    fn prebuilt_blob_bin_envs_sets_present_paths() {
+        let pairs = prebuilt_blob_bin_envs(
+            Some(std::ffi::OsString::from("/run/bb")),
+            Some(std::ffi::OsString::from("/run/wp")),
+        );
+        assert_eq!(
+            pairs,
+            vec![
+                ("KTSTR_BUSYBOX_BIN", std::ffi::OsString::from("/run/bb")),
+                ("KTSTR_WPROF_BIN", std::ffi::OsString::from("/run/wp")),
+            ],
+        );
+    }
+
+    /// An absent path yields no pair for that blob — so a cargo-ktstr
+    /// built without a blob never tells the child build to copy a
+    /// nonexistent binary; it falls back to its own fetch path.
+    #[test]
+    fn prebuilt_blob_bin_envs_omits_absent_paths() {
+        assert!(
+            prebuilt_blob_bin_envs(None, None).is_empty(),
+            "no source paths → no env pairs",
+        );
+        assert_eq!(
+            prebuilt_blob_bin_envs(Some(std::ffi::OsString::from("/run/bb")), None),
+            vec![("KTSTR_BUSYBOX_BIN", std::ffi::OsString::from("/run/bb"))],
+            "busybox present, wprof absent → only the busybox pair",
         );
     }
 }
