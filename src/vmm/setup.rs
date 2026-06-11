@@ -1669,6 +1669,22 @@ impl KtstrVm {
         boot::validate_cmdline(&cmdline)?;
 
         let fdt_addr = aarch64::fdt::fdt_address(memory_mib);
+
+        // Wire KVM PV stolen-time so the guest's /proc/stat steal
+        // advances under cpu_budget overcommit. The region is carved
+        // from the top of guest RAM (just below the FDT); create_fdt
+        // below shrinks the /memory node to pvtime_base via the same
+        // helper so the guest never reuses it. setup_pvtime gates on
+        // host support (has_device_attr) and skips cleanly otherwise.
+        let pvtime_base = aarch64::fdt::pvtime_base(memory_mib, self.topology.total_cpus());
+        anyhow::ensure!(
+            pvtime_base >= aarch64::kvm::DRAM_START && pvtime_base < fdt_addr,
+            "guest RAM too small to carve the PVTIME region \
+             (pvtime_base={pvtime_base:#x}, fdt_addr={fdt_addr:#x})"
+        );
+        vm.setup_pvtime(pvtime_base)
+            .context("wire KVM PV stolen-time")?;
+
         let mpidrs =
             aarch64::topology::read_mpidrs(&vm.vcpus).context("read vCPU MPIDRs for FDT")?;
         let hw_cache_level = aarch64::topology::host_cache_levels();

@@ -185,6 +185,19 @@ pub fn fdt_address(memory_mib: u32) -> u64 {
     (dram_end - FDT_MAX_SIZE) & !7
 }
 
+/// Base IPA of the per-vCPU KVM PV stolen-time region, carved from the
+/// top of guest RAM just below the FDT and 64 KB-aligned (the max
+/// aarch64 granule, so the `/memory` shrink lands on a page boundary
+/// for every granule). [`write_memory`] excludes `[pvtime_base,
+/// dram_end)` from `/memory`, and
+/// [`super::kvm::KtstrKvm::setup_pvtime`] points each vCPU's PVTIME IPA
+/// at `pvtime_base + cpu_id * PVTIME_SIZE_PER_CPU`. Computed in one
+/// place so the host IPAs and the FDT carve-out agree exactly.
+pub(crate) fn pvtime_base(memory_mib: u32, total_cpus: u32) -> u64 {
+    let pvtime_size = total_cpus as u64 * super::kvm::PVTIME_SIZE_PER_CPU;
+    (fdt_address(memory_mib) - pvtime_size) & !0xFFFF
+}
+
 fn write_chosen(
     fdt: &mut FdtWriter,
     cmdline: &str,
@@ -215,8 +228,16 @@ fn write_memory(
     numa_layout: &NumaMemoryLayout,
 ) -> Result<()> {
     let mem_size = (memory_mib as u64) << 20;
+    // Top of guest-usable RAM. The PVTIME steal region is carved just
+    // below the FDT (see `pvtime_base`) and MUST be excluded from
+    // /memory: the guest memremaps the SMCCC-returned IPA itself, so if
+    // these pages stayed in /memory the guest could allocate them while
+    // the host writes steal-time into them (silent corruption). The
+    // host PVTIME IPAs point here (aarch64/kvm.rs setup_pvtime).
+    let pvt = pvtime_base(memory_mib, topo.total_cpus());
 
     if topo.numa_nodes <= 1 {
+        let usable = pvt - DRAM_START;
         let name = format!("memory@{DRAM_START:x}");
         let mem = fdt.begin_node(&name).context("begin memory")?;
         fdt.property_string("device_type", "memory")
@@ -226,18 +247,31 @@ fn write_memory(
             &[
                 (DRAM_START >> 32) as u32,
                 DRAM_START as u32,
-                (mem_size >> 32) as u32,
-                mem_size as u32,
+                (usable >> 32) as u32,
+                usable as u32,
             ],
         )
         .context("memory reg")?;
         fdt.end_node(mem).context("end memory")?;
     } else {
-        // Multi-NUMA: one memory node per NumaMemoryLayout region.
+        // Multi-NUMA: one memory node per NumaMemoryLayout region. The
+        // PVTIME carve lives in the top region (the one ending at
+        // dram_end, where the FDT also sits), so shrink that region to
+        // end at `pvt`; the others keep their full size.
+        let dram_end = DRAM_START + mem_size;
         let regions = numa_layout.regions();
         for region in regions {
             let base = region.gpa_start;
-            let length = region.size;
+            let length = if base + region.size == dram_end {
+                anyhow::ensure!(
+                    pvt > base,
+                    "PVTIME carve (pvtime_base={pvt:#x}) underflows the top NUMA \
+                     region base ({base:#x}); top node too small for the carve"
+                );
+                pvt - base
+            } else {
+                region.size
+            };
             let name = format!("memory@{base:x}");
             let mem = fdt.begin_node(&name).context("begin memory")?;
             fdt.property_string("device_type", "memory")
@@ -921,6 +955,11 @@ mod tests {
     /// Check multi-NUMA memory nodes: numa-node-id, reg, contiguity, total size.
     fn check_memory_nodes(topo: &Topology, props: &[(String, String, Vec<u8>)], memory_mib: u32) {
         let mem_size = (memory_mib as u64) << 20;
+        let dram_end = DRAM_START + mem_size;
+        // The top region (the one ending at dram_end) is shrunk to
+        // exclude the PVTIME+FDT carve [pvtime_base, dram_end); every
+        // other region keeps its full size. See `write_memory`.
+        let pvt = pvtime_base(memory_mib, topo.total_cpus());
         let layout = NumaMemoryLayout::compute(topo, memory_mib, DRAM_START, None).unwrap();
         let regions = layout.regions();
 
@@ -946,7 +985,16 @@ mod tests {
             assert_eq!(reg_base, base, "memory region {i}: wrong base address");
 
             let reg_size = ((reg[2] as u64) << 32) | reg[3] as u64;
-            assert_eq!(reg_size, region.size, "memory region {i}: wrong size");
+            // The top region carries the carve; all others are full size.
+            let expected_size = if base + region.size == dram_end {
+                pvt - base
+            } else {
+                region.size
+            };
+            assert_eq!(
+                reg_size, expected_size,
+                "memory region {i}: wrong size (carve-adjusted)"
+            );
 
             if let Some(prev) = prev_end {
                 assert_eq!(
@@ -959,9 +1007,20 @@ mod tests {
             total_size += reg_size;
         }
 
+        // Advertised RAM is exactly [DRAM_START, pvtime_base): the
+        // PVTIME+FDT carve at the top is excluded so the guest never
+        // reuses the steal-time region (kvm.rs setup_pvtime points each
+        // vCPU's PVTIME IPA there).
         assert_eq!(
-            total_size, mem_size,
-            "total memory {total_size:#x} != mem_size {mem_size:#x}"
+            total_size,
+            pvt - DRAM_START,
+            "total advertised memory {total_size:#x} != pvtime_base-DRAM_START {:#x}",
+            pvt - DRAM_START
+        );
+        assert_eq!(
+            prev_end,
+            Some(pvt),
+            "highest /memory region must end at pvtime_base {pvt:#x}"
         );
     }
 
@@ -990,6 +1049,65 @@ mod tests {
         )
         .unwrap();
         check_memory_nodes(&topo, &parse_dtb_props(&dtb), memory_mib);
+    }
+
+    #[test]
+    fn fdt_memory_single_numa_excludes_pvtime_carve() {
+        // Single-NUMA: the sole /memory node must end at pvtime_base, not
+        // dram_end. The PVTIME+FDT carve [pvtime_base, dram_end) is
+        // excluded so the guest never allocates the steal-time region the
+        // host writes into (kvm.rs setup_pvtime points each vCPU's PVTIME
+        // IPA at pvtime_base + cpu_id * PVTIME_SIZE_PER_CPU).
+        let topo = Topology {
+            llcs: 2,
+            cores_per_llc: 4,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let mpidrs = fake_mpidrs(topo.total_cpus());
+        let memory_mib: u32 = 512;
+        let dtb =
+            test_fdt(&topo, &mpidrs, memory_mib, "console=ttyS0", None, None, 2, false).unwrap();
+        let props = parse_dtb_props(&dtb);
+
+        let pvt = pvtime_base(memory_mib, topo.total_cpus());
+        let node = format!("memory@{DRAM_START:x}");
+        let reg = prop_u32_array(&props, &node, "reg").expect("single-NUMA memory reg");
+        assert_eq!(reg.len(), 4, "memory reg must have 4 cells");
+        let reg_base = ((reg[0] as u64) << 32) | reg[1] as u64;
+        let reg_size = ((reg[2] as u64) << 32) | reg[3] as u64;
+        assert_eq!(reg_base, DRAM_START, "single-NUMA memory base");
+        assert_eq!(
+            reg_base + reg_size,
+            pvt,
+            "single-NUMA /memory must end at pvtime_base (carve excluded)"
+        );
+    }
+
+    #[test]
+    fn pvtime_base_carve_below_fdt_and_fits_all_vcpus() {
+        // pvtime_base must be 64KB-aligned (the max aarch64 granule, so
+        // the /memory shrink lands on a page boundary for every granule),
+        // strictly below the FDT, and leave room for one
+        // PVTIME_SIZE_PER_CPU slot per vCPU between it and the FDT — so no
+        // per-vCPU PVTIME IPA spills into the FDT region.
+        let memory_mib: u32 = 512;
+        let per_cpu = crate::vmm::aarch64::kvm::PVTIME_SIZE_PER_CPU;
+        for total_cpus in [1u32, 8, 64, 256] {
+            let pvt = pvtime_base(memory_mib, total_cpus);
+            let fdt = fdt_address(memory_mib);
+            assert_eq!(pvt & 0xFFFF, 0, "pvtime_base {pvt:#x} must be 64KB-aligned");
+            assert!(
+                pvt >= DRAM_START && pvt < fdt,
+                "pvtime_base {pvt:#x} must be in [DRAM_START, fdt_address={fdt:#x})"
+            );
+            assert!(
+                fdt - pvt >= total_cpus as u64 * per_cpu,
+                "carve [{pvt:#x},{fdt:#x}) too small for {total_cpus} vCPUs * {per_cpu}B"
+            );
+        }
     }
 
     #[test]

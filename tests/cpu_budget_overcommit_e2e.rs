@@ -75,10 +75,13 @@ fn cpu_budget_overcommit_accrues_guest_steal(ctx: &Ctx) -> Result<AssertResult> 
         after > before,
         "expected guest steal to accrue under 4x cpu_budget overcommit \
          (8 vCPUs masked to 2 host CPUs) but it did not advance: \
-         before={before} after={after} ticks — either the cpu_budget mask \
-         is not limiting the vCPU threads to the budget's host CPUs, or \
-         guest KVM steal-time accounting (CONFIG_PARAVIRT_TIME_ACCOUNTING, \
-         a required ktstr guest config) is unavailable"
+         before={before} after={after} ticks. Possible causes: (1) the \
+         cpu_budget mask is not limiting the vCPU threads to the budget's \
+         host CPUs; (2) guest steal-time accounting (CONFIG_PARAVIRT_TIME_ACCOUNTING, \
+         a required ktstr guest config) is unavailable; (3) on aarch64, the \
+         host did not wire KVM PV stolen-time (KVM_ARM_VCPU_PVTIME_IPA — see \
+         vmm::aarch64::kvm setup_pvtime; it is skipped when the host kernel \
+         lacks CONFIG_SCHED_INFO, in which case steal cannot advance)"
     );
     Ok(result)
 }

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use kvm_bindings::{
     KVM_ARM_VCPU_PMU_V3_CTRL, KVM_ARM_VCPU_PMU_V3_INIT, KVM_ARM_VCPU_PMU_V3_IRQ,
+    KVM_ARM_VCPU_PVTIME_CTRL, KVM_ARM_VCPU_PVTIME_IPA,
     KVM_DEV_ARM_VGIC_CTRL_INIT, KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_DEV_ARM_VGIC_GRP_CTRL,
     KVM_DEV_ARM_VGIC_GRP_NR_IRQS, KVM_IRQ_ROUTING_IRQCHIP, KVM_VGIC_V3_ADDR_TYPE_DIST,
     KVM_VGIC_V3_ADDR_TYPE_REDIST, KvmIrqRouting, kvm_create_device, kvm_device_attr,
@@ -89,6 +90,13 @@ pub(crate) const SERIAL2_IRQ: u32 = 34;
 /// arch/arm64/kvm/pmu-emul.c pmu_irq_is_valid.
 pub(crate) const PMU_PPI: u32 = 7;
 pub(crate) const PMU_INTID: u32 = PMU_PPI + 16;
+
+/// Per-vCPU KVM PV stolen-time region size. The kernel's
+/// `struct pvclock_vcpu_stolen_time` is 64 bytes and
+/// `KVM_ARM_VCPU_PVTIME_IPA` requires a 64-byte-aligned IPA
+/// (`arch/arm64/kvm/pvtime.c` `kvm_arm_pvtime_set_attr`:
+/// `IS_ALIGNED(ipa, 64)`). Each vCPU gets one such slot.
+pub(crate) const PVTIME_SIZE_PER_CPU: u64 = 64;
 
 /// Number of IRQs for the GIC. Must be a multiple of 32 and >= 64.
 /// 128 covers SPIs 0-95, sufficient for serial + headroom.
@@ -485,6 +493,65 @@ impl KtstrKvm {
             };
             vcpu.set_device_attr(&init_attr)
                 .with_context(|| format!("init PMU on vcpu {cpu_id}"))?;
+        }
+        Ok(())
+    }
+
+    /// Wire KVM PV stolen-time on each vCPU so the guest's
+    /// `/proc/stat` steal advances under overcommit (the arm64 analog
+    /// of x86's guest-MSR-driven `KVM_FEATURE_STEAL_TIME`). Without
+    /// this, `vcpu->arch.steal.base` stays `INVALID_GPA`
+    /// (`arch/arm64/include/asm/kvm_host.h`), `kvm_hypercall_pv_features`
+    /// returns `SMCCC_RET_NOT_SUPPORTED` (`arch/arm64/kvm/pvtime.c`),
+    /// and the guest's `pv_time` driver never enables steal accounting.
+    ///
+    /// `pvtime_base` is a guest IPA the caller carves from the top of
+    /// guest RAM (just below the FDT) and EXCLUDES from the FDT
+    /// `/memory` node, so the guest never reuses those pages while the
+    /// host writes steal-time into them. Each vCPU gets a 64-byte slot
+    /// at `pvtime_base + cpu_id * PVTIME_SIZE_PER_CPU` — 64-byte
+    /// aligned (the kernel's `IS_ALIGNED(ipa, 64)` requirement) and
+    /// inside the already-registered top-DRAM memslot, so the kernel's
+    /// `gfn_to_hva` check at set-attr time
+    /// (`kvm_arm_pvtime_set_attr`) passes without a new memslot.
+    ///
+    /// Gated on host support: KVM advertises the PVTIME vCPU attr only
+    /// when `kvm_arm_pvtime_supported()` (= `!!sched_info_on()`, i.e.
+    /// the host kernel has `CONFIG_SCHED_INFO`). When unsupported the
+    /// `has_device_attr` probe fails and we skip cleanly — guest steal
+    /// then cannot advance and the cpu_budget overcommit test reports
+    /// it.
+    pub(crate) fn setup_pvtime(&self, pvtime_base: u64) -> Result<()> {
+        // KVM_HAS_DEVICE_ATTR support probe on vcpu 0 (addr ignored for
+        // the HAS query); kvm_arm_pvtime_has_attr returns 0 only when
+        // kvm_arm_pvtime_supported().
+        let probe = kvm_device_attr {
+            group: KVM_ARM_VCPU_PVTIME_CTRL,
+            attr: KVM_ARM_VCPU_PVTIME_IPA as u64,
+            addr: 0,
+            flags: 0,
+        };
+        let supported = self
+            .vcpus
+            .first()
+            .is_some_and(|v| v.has_device_attr(&probe).is_ok());
+        if !supported {
+            tracing::warn!(
+                "host KVM lacks the PVTIME vcpu attribute (CONFIG_SCHED_INFO off?); \
+                 guest steal-time will not advance"
+            );
+            return Ok(());
+        }
+        for (cpu_id, vcpu) in self.vcpus.iter().enumerate() {
+            let ipa: u64 = pvtime_base + (cpu_id as u64) * PVTIME_SIZE_PER_CPU;
+            let attr = kvm_device_attr {
+                group: KVM_ARM_VCPU_PVTIME_CTRL,
+                attr: KVM_ARM_VCPU_PVTIME_IPA as u64,
+                addr: &ipa as *const u64 as u64,
+                flags: 0,
+            };
+            vcpu.set_device_attr(&attr)
+                .with_context(|| format!("set PVTIME IPA on vcpu {cpu_id}"))?;
         }
         Ok(())
     }
