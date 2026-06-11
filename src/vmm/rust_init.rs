@@ -3305,7 +3305,11 @@ const SCHED_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// the kill doesn't truncate that output (`dump_sched_output` reads it).
 /// Bounded so a userspace hang can't wedge teardown; returns early the
 /// moment the scheduler exits. Only applied on a crash (dump_started).
-const SCHED_KILL_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
+/// Sized for the USERSPACE flush, not the kernel dump: the kernel's scx
+/// exit dump is bounded and truncated in-kernel, but the scheduler's
+/// userspace flush of it to stderr (plus libbpf teardown) can run past a
+/// shorter window, and the SIGKILL then truncates the tail of THAT output.
+const SCHED_KILL_GRACE: std::time::Duration = std::time::Duration::from_millis(3000);
 
 /// Wait up to `timeout` for `child` to exit (evented via `pidfd_open` +
 /// `poll`), then reap it. Does NOT send a signal — callers drive the
