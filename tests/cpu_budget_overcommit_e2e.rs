@@ -45,7 +45,14 @@ fn read_steal_ticks() -> Result<u64> {
 /// the guest accrues while the host time-shares them onto 2 CPUs is the
 /// observable overcommit symptom — and, since 8 vCPUs <= host CPUs on CI,
 /// evidence the `cpu_budget` mask is enforced.
-#[ktstr_test(llcs = 2, cores = 4, threads = 1, no_perf_mode, cpu_budget = 2, duration_s = 5)]
+#[ktstr_test(
+    llcs = 2,
+    cores = 4,
+    threads = 1,
+    no_perf_mode,
+    cpu_budget = 2,
+    duration_s = 5
+)]
 fn cpu_budget_overcommit_accrues_guest_steal(ctx: &Ctx) -> Result<AssertResult> {
     let total = ctx.topo.total_cpus();
     ensure!(total == 8, "test assumes 8 vCPUs (2 x 4 x 1); got {total}");

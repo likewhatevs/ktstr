@@ -30,7 +30,7 @@ fn assert_fat_l3_presentation(ctx: &Ctx) -> Result<AssertResult> {
     let total = ctx.topo.total_cpus();
     ensure!(num_llcs >= 2, "test needs >=2 LLCs (got {num_llcs})");
     ensure!(
-        total % num_llcs == 0,
+        total.is_multiple_of(num_llcs),
         "uneven topology: {total} cpus / {num_llcs} llcs"
     );
     let cores_per_llc = total / num_llcs;

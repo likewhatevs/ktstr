@@ -71,10 +71,9 @@ pub fn device_irq_by_action_name(action: &str) -> Result<u32> {
             continue;
         };
         if rhs.split_whitespace().last() == Some(action) {
-            return lhs
-                .trim()
-                .parse::<u32>()
-                .map_err(|e| anyhow::anyhow!("non-numeric IRQ '{}' for {action}: {e}", lhs.trim()));
+            return lhs.trim().parse::<u32>().map_err(|e| {
+                anyhow::anyhow!("non-numeric IRQ '{}' for {action}: {e}", lhs.trim())
+            });
         }
     }
     bail!("no /proc/interrupts line with action name {action}")
@@ -86,8 +85,11 @@ pub fn device_irq_by_action_name(action: &str) -> Result<u32> {
 /// single-CPU pin to an APIC ID >= 256 forces the >255 ext-dest encoding.
 #[allow(dead_code)]
 pub fn pin_irq_to_cpu(irq: u32, cpu: usize) -> Result<()> {
-    fs::write(format!("/proc/irq/{irq}/smp_affinity_list"), cpu.to_string())
-        .map_err(|e| anyhow::anyhow!("pin irq {irq} to cpu {cpu}: {e}"))
+    fs::write(
+        format!("/proc/irq/{irq}/smp_affinity_list"),
+        cpu.to_string(),
+    )
+    .map_err(|e| anyhow::anyhow!("pin irq {irq} to cpu {cpu}: {e}"))
 }
 
 /// Per-CPU interrupt count for `irq` on Linux processor `cpu`, from

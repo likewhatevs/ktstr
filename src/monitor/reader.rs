@@ -5769,9 +5769,10 @@ mod tests {
         assert_eq!(mem.size(), 0x1_0000_0000 + 0x4000_0000);
         // A field at the very top of relocated high RAM resolves — would
         // be None if size were total_bytes (4 GiB).
-        assert!(mem
-            .host_ptr_for_pa(0x1_0000_0000 + 0x4000_0000 - 8, 8)
-            .is_some());
+        assert!(
+            mem.host_ptr_for_pa(0x1_0000_0000 + 0x4000_0000 - 8, 8)
+                .is_some()
+        );
         // The gap itself stays unbacked (resolve_ptr None's it).
         assert!(mem.host_ptr_for_pa(0xC000_0000, 8).is_none());
     }

@@ -211,8 +211,7 @@ impl Ioapic {
         // lowest-priority delivery to the least-loaded CPU. We forward the
         // guest's delivery_mode verbatim, so fixed/physical edge device IRQs
         // (v0) never use it.
-        let address_lo =
-            MSI_ADDR_BASE | ((dest & 0xff) << 12) | (dest_mode << 2);
+        let address_lo = MSI_ADDR_BASE | ((dest & 0xff) << 12) | (dest_mode << 2);
         let address_hi = (dest >> 8) << 8;
         let data = vector | (delivery_mode << 8) | (trigger_level << 15);
         MsiRoute {
@@ -364,9 +363,19 @@ mod tests {
         write_rte(&mut io, 4, rte4 | RTE_MASKED_BIT);
         let routes = io.gsi_routes();
         let gsis: Vec<u32> = routes.iter().map(|(g, _)| *g).collect();
-        assert_eq!(routes.len(), 1, "only the unmasked pin is routed; got {gsis:?}");
-        assert!(gsis.contains(&6), "unmasked pin 6 must be routed; got {gsis:?}");
-        assert!(!gsis.contains(&4), "re-masked pin 4 must be omitted; got {gsis:?}");
+        assert_eq!(
+            routes.len(),
+            1,
+            "only the unmasked pin is routed; got {gsis:?}"
+        );
+        assert!(
+            gsis.contains(&6),
+            "unmasked pin 6 must be routed; got {gsis:?}"
+        );
+        assert!(
+            !gsis.contains(&4),
+            "re-masked pin 4 must be omitted; got {gsis:?}"
+        );
         let (_, msi) = routes.iter().find(|(g, _)| *g == 6).expect("pin 6 route");
         assert_eq!(msi.data & 0xff, 0x40, "pin 6 MSI carries vector 0x40");
     }
@@ -384,9 +393,15 @@ mod tests {
         let first = io.gsi_routes();
         assert_eq!(first.len(), 1, "the unmasked pin is routed");
         let dirty = write_rte(&mut io, 6, rte);
-        assert!(dirty, "a redtbl rewrite reports dirty even when the value is unchanged");
+        assert!(
+            dirty,
+            "a redtbl rewrite reports dirty even when the value is unchanged"
+        );
         let second = io.gsi_routes();
-        assert_eq!(first, second, "a redundant RTE rewrite yields an identical route set");
+        assert_eq!(
+            first, second,
+            "a redundant RTE rewrite yields an identical route set"
+        );
     }
 
     /// The guest programs a 64-bit RTE as two 32-bit writes: high word (dest)
@@ -447,7 +462,10 @@ mod tests {
     #[test]
     fn ioregsel_write_is_not_routing_dirty() {
         let mut io = Ioapic::new();
-        assert!(!io.mmio_write(IOREGSEL, &[0x10]), "selecting a reg is not a route change");
+        assert!(
+            !io.mmio_write(IOREGSEL, &[0x10]),
+            "selecting a reg is not a route change"
+        );
     }
 
     #[test]
@@ -493,7 +511,11 @@ mod tests {
         // KVM decode: dest = addr_lo[19:12] | (addr_hi[31:8] << 8).
         let decoded = ((msi.address_lo >> 12) & 0xff) | (((msi.address_hi >> 8) & 0xff_ffff) << 8);
         assert_eq!(decoded, 300, "MSI must round-trip the >255 destination");
-        assert_eq!(msi.address_hi & 0xff, 0, "addr_hi low byte must be zero (KVM requires it)");
+        assert_eq!(
+            msi.address_hi & 0xff,
+            0,
+            "addr_hi low byte must be zero (KVM requires it)"
+        );
     }
 
     #[test]
@@ -502,7 +524,11 @@ mod tests {
         let entry: u64 = 0x20 | RTE_DEST_MODE_BIT;
         write_rte(&mut io, 5, entry);
         let msi = io.redtbl_to_msi(5);
-        assert_ne!(msi.address_lo & (1 << 2), 0, "logical dest mode -> address_lo bit 2");
+        assert_ne!(
+            msi.address_lo & (1 << 2),
+            0,
+            "logical dest mode -> address_lo bit 2"
+        );
     }
 
     #[test]
@@ -511,8 +537,16 @@ mod tests {
         // Guest attempts to set remote_IRR (bit 14) + delivery_status (12).
         let entry: u64 = 0x20 | RTE_REMOTE_IRR_BIT | RTE_DELIV_STATUS_BIT;
         write_rte(&mut io, 6, entry);
-        assert_eq!(io.ioredtbl[6] & RTE_REMOTE_IRR_BIT, 0, "remote_IRR must not be guest-writable");
-        assert_eq!(io.ioredtbl[6] & RTE_DELIV_STATUS_BIT, 0, "delivery_status must not be guest-writable");
+        assert_eq!(
+            io.ioredtbl[6] & RTE_REMOTE_IRR_BIT,
+            0,
+            "remote_IRR must not be guest-writable"
+        );
+        assert_eq!(
+            io.ioredtbl[6] & RTE_DELIV_STATUS_BIT,
+            0,
+            "delivery_status must not be guest-writable"
+        );
     }
 
     #[test]
@@ -524,8 +558,16 @@ mod tests {
         // Simulate the IOAPIC having set remote_IRR on level delivery.
         io.ioredtbl[6] |= RTE_REMOTE_IRR_BIT;
         let pending = io.end_of_interrupt(0x50);
-        assert_eq!(io.ioredtbl[6] & RTE_REMOTE_IRR_BIT, 0, "EOI clears remote_IRR");
-        assert_eq!(pending, vec![6], "unmasked still-level pin reported for re-injection");
+        assert_eq!(
+            io.ioredtbl[6] & RTE_REMOTE_IRR_BIT,
+            0,
+            "EOI clears remote_IRR"
+        );
+        assert_eq!(
+            pending,
+            vec![6],
+            "unmasked still-level pin reported for re-injection"
+        );
     }
 
     #[test]

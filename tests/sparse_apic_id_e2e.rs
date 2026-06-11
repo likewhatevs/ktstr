@@ -18,7 +18,7 @@
 //! This pins the invariant on a MINIMAL sparse topology — 2 LLC x 3 core x 1
 //! thread = 6 vCPUs; 3 cores need a 2-bit field, so `apic_id = (llc<<2)|core`
 //! = {0,1,2,4,5,6} (gap at 3, max 6 > 5) — so it runs on any host without a
-//! >255-vCPU box. The >255 ext-dest path itself is exercised by the
+//! \>255-vCPU box. The >255 ext-dest path itself is exercised by the
 //! `wide_smp_*_irq_e2e` tests on a >=252-CPU host; this is the CI-runnable
 //! root-cause guard. `/proc/cpuinfo` exposes both `apicid` (runtime,
 //! `read_apic_id()`) and `initial apicid` (CPUID leaf 1) per CPU; the fix
@@ -71,7 +71,7 @@ fn read_apicids() -> Result<Vec<(u32, u32)>> {
 
 #[ktstr_test(llcs = 2, cores = 3, threads = 1, no_perf_mode, duration_s = 4)]
 fn sparse_topology_runtime_apicid_matches_declared(ctx: &Ctx) -> Result<AssertResult> {
-    let total = ctx.topo.total_cpus() as usize;
+    let total = ctx.topo.total_cpus();
     ensure!(
         total == 6,
         "expected 6 vCPUs (2 LLC x 3 core x 1 thread), got {total}"

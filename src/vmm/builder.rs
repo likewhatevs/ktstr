@@ -951,7 +951,8 @@ impl KtstrVmBuilder {
                 // `plan.locked_llcs` via `acquire_resource_locks`
                 // just before vCPU spawn so the build-to-run
                 // setup window holds no flocks.
-                let mut plan = host_topology::acquire_llc_plan(&host_topo, &test_topo, effective_cap)?;
+                let mut plan =
+                    host_topology::acquire_llc_plan(&host_topo, &test_topo, effective_cap)?;
                 host_topology::warn_if_cross_node_spill(&plan, &host_topo);
                 // Strip the flock fds — they release on drop. The
                 // plan's `cpus` / `locked_llcs` / `mems` fields

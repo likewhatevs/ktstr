@@ -912,10 +912,19 @@ impl KtstrVm {
         // touch the IOAPIC while the VM runs (at shutdown `kill` stops them
         // before vm drops), so the post-drop window is held-but-unused. `None`
         // for <=254-vCPU guests (in-kernel IOAPIC).
-        let ioapic_handle: Option<Arc<crate::vmm::IoapicHandle>> = vm
-            .ioapic
-            .as_ref()
-            .map(|io| Arc::new(crate::vmm::IoapicHandle::new(io.clone(), vm.vm_fd.as_raw_fd())));
+        // x86-only: `vm.ioapic` (the device) and `IoapicHandle::new` exist
+        // only on the split-irqchip path. On aarch64 `IoapicHandle` is the
+        // uninhabited placeholder and KtstrKvm has no `ioapic` field (the GIC
+        // routes device IRQs), so the handle is always `None` there.
+        #[cfg(target_arch = "x86_64")]
+        let ioapic_handle: Option<Arc<crate::vmm::IoapicHandle>> = vm.ioapic.as_ref().map(|io| {
+            Arc::new(crate::vmm::IoapicHandle::new(
+                io.clone(),
+                vm.vm_fd.as_raw_fd(),
+            ))
+        });
+        #[cfg(not(target_arch = "x86_64"))]
+        let ioapic_handle: Option<Arc<crate::vmm::IoapicHandle>> = None;
 
         // Register serial EventFds with KVM's irqfd for interrupt-driven TX.
         // On x86 split-irqchip (>254 APIC IDs) the serial IRQ routes through

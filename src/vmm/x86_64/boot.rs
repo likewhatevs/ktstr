@@ -885,7 +885,10 @@ mod tests {
         use linux_loader::loader::bootparam::boot_params;
         let params: boot_params = mem.read_obj(GuestAddress(BOOT_PARAMS_ADDR)).unwrap();
         let entries = { params.e820_entries };
-        assert_eq!(entries, 3, "4GB: low + high-below-gap + relocated-above-gap");
+        assert_eq!(
+            entries, 3,
+            "4GB: low + high-below-gap + relocated-above-gap"
+        );
         let size1 = { params.e820_table[1].size };
         assert_eq!(size1, MMIO_GAP_START - HIMEM_START);
         let addr2 = { params.e820_table[2].addr };
@@ -920,8 +923,14 @@ mod tests {
         // e820_table[2] is the above-gap entry (0=EBDA, 1=below-gap).
         let above_addr = { params.e820_table[2].addr };
         let above_size = { params.e820_table[2].size };
-        assert_eq!(above_addr, high.gpa_start, "e820 above-gap addr == numa_mem high gpa_start");
-        assert_eq!(above_size, high.size, "e820 above-gap size == numa_mem high size");
+        assert_eq!(
+            above_addr, high.gpa_start,
+            "e820 above-gap addr == numa_mem high gpa_start"
+        );
+        assert_eq!(
+            above_size, high.size,
+            "e820 above-gap size == numa_mem high size"
+        );
     }
 
     #[test]

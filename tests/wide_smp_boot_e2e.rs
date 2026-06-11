@@ -53,7 +53,10 @@ fn wide_smp_guest_boots_all_cpus_online(ctx: &Ctx) -> Result<AssertResult> {
     let online = read_to_string("/sys/devices/system/cpu/online")
         .map_err(|e| anyhow::anyhow!("read /sys/devices/system/cpu/online: {e}"))?;
     let n_online = count_cpulist(online.trim());
-    eprintln!("WIDE_SMP total_cpus={total} online='{}' n_online={n_online}", online.trim());
+    eprintln!(
+        "WIDE_SMP total_cpus={total} online='{}' n_online={n_online}",
+        online.trim()
+    );
     ensure!(
         n_online == total,
         "expected all {total} vCPUs online, got {n_online} (online='{}')",
@@ -79,7 +82,14 @@ fn wide_smp_guest_boots_all_cpus_online(ctx: &Ctx) -> Result<AssertResult> {
 /// Run: cargo run --bin cargo-ktstr -- ktstr test --kernel ../linux \
 ///        -- -E 'test(wide_smp_guest_boots_all_cpus_online_overcommit)' \
 ///        --success-output immediate
-#[ktstr_test(llcs = 16, cores = 16, threads = 1, no_perf_mode, cpu_budget = 64, duration_s = 4)]
+#[ktstr_test(
+    llcs = 16,
+    cores = 16,
+    threads = 1,
+    no_perf_mode,
+    cpu_budget = 64,
+    duration_s = 4
+)]
 fn wide_smp_guest_boots_all_cpus_online_overcommit(ctx: &Ctx) -> Result<AssertResult> {
     let total = ctx.topo.total_cpus();
     ensure!(

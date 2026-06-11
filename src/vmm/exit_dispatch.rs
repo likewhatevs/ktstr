@@ -1343,11 +1343,11 @@ pub(crate) fn classify_exit(
             // Userspace IOAPIC (split-irqchip). Cold: the guest reads the
             // redirection table only during IRQ setup. Checked after the hot
             // virtio ranges so a virtio MMIO exit never reaches here.
-            if let Some(io) = ioapic {
-                if let Some(off) = io.in_range(*addr) {
-                    io.mmio_read(off, data);
-                    return Some(ExitAction::Continue);
-                }
+            if let Some(io) = ioapic
+                && let Some(off) = io.in_range(*addr)
+            {
+                io.mmio_read(off, data);
+                return Some(ExitAction::Continue);
             }
             for b in data.iter_mut() {
                 *b = 0xff;
@@ -1379,22 +1379,22 @@ pub(crate) fn classify_exit(
             }
             // Userspace IOAPIC (split-irqchip), checked after the hot virtio
             // ranges. An RTE write rebuilds the MSI routing table (cold path).
-            if let Some(io) = ioapic {
-                if let Some(off) = io.in_range(*addr) {
-                    if let Err(e) = io.mmio_write(off, data) {
-                        // A failed KVM_SET_GSI_ROUTING leaves the guest's
-                        // just-programmed device IRQ unrouted — it will not
-                        // deliver and the device hangs on first use. Loud +
-                        // counted (surfaced at teardown via routing_failures())
-                        // so a hung-device test reports the cause instead of an
-                        // opaque timeout.
-                        tracing::error!(
-                            count = io.routing_failures(),
-                            "ioapic: KVM_SET_GSI_ROUTING failed: {e:#}"
-                        );
-                    }
-                    return Some(ExitAction::Continue);
+            if let Some(io) = ioapic
+                && let Some(off) = io.in_range(*addr)
+            {
+                if let Err(e) = io.mmio_write(off, data) {
+                    // A failed KVM_SET_GSI_ROUTING leaves the guest's
+                    // just-programmed device IRQ unrouted — it will not
+                    // deliver and the device hangs on first use. Loud +
+                    // counted (surfaced at teardown via routing_failures())
+                    // so a hung-device test reports the cause instead of an
+                    // opaque timeout.
+                    tracing::error!(
+                        count = io.routing_failures(),
+                        "ioapic: KVM_SET_GSI_ROUTING failed: {e:#}"
+                    );
                 }
+                return Some(ExitAction::Continue);
             }
             Some(ExitAction::Continue)
         }

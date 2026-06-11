@@ -163,7 +163,14 @@ impl NumaMemoryLayout {
                     if size == 0 {
                         continue;
                     }
-                    push_node_regions(&mut regions, i as u32, size, &mut linear, dram_base, mmio_gap);
+                    push_node_regions(
+                        &mut regions,
+                        i as u32,
+                        size,
+                        &mut linear,
+                        dram_base,
+                        mmio_gap,
+                    );
                 }
 
                 anyhow::ensure!(
@@ -173,7 +180,14 @@ impl NumaMemoryLayout {
             }
             None => {
                 if numa_nodes <= 1 {
-                    push_node_regions(&mut regions, 0, total_bytes, &mut linear, dram_base, mmio_gap);
+                    push_node_regions(
+                        &mut regions,
+                        0,
+                        total_bytes,
+                        &mut linear,
+                        dram_base,
+                        mmio_gap,
+                    );
                 } else {
                     let per_node_mib = total_memory_mib / numa_nodes;
                     for i in 0..numa_nodes {
@@ -928,7 +942,10 @@ mod tests {
         assert_eq!(layout.regions()[2].node_id, 1);
         assert_eq!(layout.regions()[2].gpa_start, 0x1_0000_0000);
         // node 1 keeps its full 4 GiB across the split.
-        assert_eq!(layout.regions()[1].size + layout.regions()[2].size, 4096 << 20);
+        assert_eq!(
+            layout.regions()[1].size + layout.regions()[2].size,
+            4096 << 20
+        );
         // Dense slots, gap unbacked.
         assert_eq!(layout.regions()[2].slot, 2);
         for r in layout.regions() {
@@ -960,9 +977,24 @@ mod tests {
         let kvm = kvm_ioctls::Kvm::new().unwrap();
         let vm_fd = kvm.create_vm().unwrap();
         let alloc = layout.allocate_and_register(&vm_fd, false, false).unwrap();
-        assert!(alloc.guest_mem.get_host_address(GuestAddress(0xC000_0000)).is_err());
-        assert!(alloc.guest_mem.get_host_address(GuestAddress(0xFEC0_0000)).is_err());
+        assert!(
+            alloc
+                .guest_mem
+                .get_host_address(GuestAddress(0xC000_0000))
+                .is_err()
+        );
+        assert!(
+            alloc
+                .guest_mem
+                .get_host_address(GuestAddress(0xFEC0_0000))
+                .is_err()
+        );
         assert!(alloc.guest_mem.get_host_address(GuestAddress(0)).is_ok());
-        assert!(alloc.guest_mem.get_host_address(GuestAddress(0x1_0000_0000)).is_ok());
+        assert!(
+            alloc
+                .guest_mem
+                .get_host_address(GuestAddress(0x1_0000_0000))
+                .is_ok()
+        );
     }
 }

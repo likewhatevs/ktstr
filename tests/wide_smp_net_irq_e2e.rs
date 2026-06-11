@@ -80,7 +80,11 @@ fn iface_mac(iface: &str) -> Result<[u8; 6]> {
             .map_err(|e| anyhow::anyhow!("MAC octet '{octet}' for {iface} not hex: {e}"))?;
         n = i + 1;
     }
-    ensure!(n == 6, "MAC for {iface} has {n} octets, expected 6: {:?}", s.trim());
+    ensure!(
+        n == 6,
+        "MAC for {iface} has {n} octets, expected 6: {:?}",
+        s.trim()
+    );
     Ok(mac)
 }
 
@@ -109,12 +113,20 @@ fn iface_up(fd: i32, iface: &str) -> Result<()> {
     // SAFETY: ifr_name is set; SIOCGIFFLAGS reads current flags into the
     // ifru_flags union arm, SIOCSIFFLAGS writes them back with IFF_UP set.
     let rc = unsafe { libc::ioctl(fd, libc::SIOCGIFFLAGS, &mut ifr) };
-    ensure!(rc == 0, "SIOCGIFFLAGS {iface}: {}", std::io::Error::last_os_error());
+    ensure!(
+        rc == 0,
+        "SIOCGIFFLAGS {iface}: {}",
+        std::io::Error::last_os_error()
+    );
     unsafe {
         ifr.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
     }
     let rc = unsafe { libc::ioctl(fd, libc::SIOCSIFFLAGS, &ifr) };
-    ensure!(rc == 0, "SIOCSIFFLAGS up {iface}: {}", std::io::Error::last_os_error());
+    ensure!(
+        rc == 0,
+        "SIOCSIFFLAGS up {iface}: {}",
+        std::io::Error::last_os_error()
+    );
     Ok(())
 }
 
@@ -127,7 +139,11 @@ fn open_and_drive(iface: &str, ifindex: i32, mac: [u8; 6], count: usize) -> Resu
     let proto = (libc::ETH_P_ALL as u16).to_be() as libc::c_int;
     // SAFETY: standard AF_PACKET raw socket creation.
     let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, proto) };
-    ensure!(fd >= 0, "socket(AF_PACKET): {}", std::io::Error::last_os_error());
+    ensure!(
+        fd >= 0,
+        "socket(AF_PACKET): {}",
+        std::io::Error::last_os_error()
+    );
 
     iface_up(fd, iface).inspect_err(|_| unsafe {
         libc::close(fd);

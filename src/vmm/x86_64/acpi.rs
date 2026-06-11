@@ -1104,8 +1104,8 @@ mod tests {
             distances: None,
         };
         let layout = test_layout(&topo, 512);
-        let err = setup_acpi(&mem, &topo, &layout)
-            .expect_err("512-NUMA SLIT must overflow the ISA hole");
+        let err =
+            setup_acpi(&mem, &topo, &layout).expect_err("512-NUMA SLIT must overflow the ISA hole");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("SLIT alone") && msg.contains("ISA hole"),

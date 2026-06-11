@@ -179,10 +179,7 @@ fn assert_cannot_drain_abort(result: &VmResult) -> Result<()> {
     // With `loglevel=7` (scheduler kargs) the guest kernel routes the
     // `scx_bpf_error` printk to COM1, captured as `result.stderr`. Match the
     // stable prefix of the reason (the "(cell, llc=N)" suffix varies).
-    if result
-        .stderr
-        .contains("no CPUs in any LLC; cannot drain")
-    {
+    if result.stderr.contains("no CPUs in any LLC; cannot drain") {
         anyhow::bail!(
             "scx_mitosis drain-abort bug present: recalc_cell_llc_counts aborted \
              (cell has no CPUs in any LLC; cannot drain)"

@@ -417,16 +417,44 @@ pub fn generate_cpuid(
         // L2=none(0x0), L3=inclusive|complex(0x6). The kernel reads only
         // EAX/EBX/ECX from 0x8000001D, so EDX flags are informational.
         entries.push(amd_cache_subleaf(
-            0, 1, 1, true, L1_CACHE_SIZE_KIB, L1_CACHE_WAYS, smt_sharing, 0x1,
+            0,
+            1,
+            1,
+            true,
+            L1_CACHE_SIZE_KIB,
+            L1_CACHE_WAYS,
+            smt_sharing,
+            0x1,
         )); // L1 data
         entries.push(amd_cache_subleaf(
-            1, 2, 1, true, L1_CACHE_SIZE_KIB, L1_CACHE_WAYS, smt_sharing, 0x1,
+            1,
+            2,
+            1,
+            true,
+            L1_CACHE_SIZE_KIB,
+            L1_CACHE_WAYS,
+            smt_sharing,
+            0x1,
         )); // L1 instruction
         entries.push(amd_cache_subleaf(
-            2, 3, 2, false, L2_CACHE_SIZE_KIB, L2_CACHE_WAYS, smt_sharing, 0x0,
+            2,
+            3,
+            2,
+            false,
+            L2_CACHE_SIZE_KIB,
+            L2_CACHE_WAYS,
+            smt_sharing,
+            0x0,
         )); // L2 unified
         entries.push(amd_cache_subleaf(
-            3, 3, 3, true, L3_CACHE_SIZE_KIB, L3_CACHE_WAYS, llc_sharing, 0x6,
+            3,
+            3,
+            3,
+            true,
+            L3_CACHE_SIZE_KIB,
+            L3_CACHE_WAYS,
+            llc_sharing,
+            0x6,
         )); // L3 unified (the LLC)
         // Terminator: type 0 (EAX[4:0]=0) ends the kernel's subleaf walk.
         entries.push(kvm_cpuid_entry2 {
@@ -500,20 +528,19 @@ pub fn generate_cpuid(
     // CONFIG_PARAVIRT_SPINLOCKS (not in ktstr.kconfig, so no-op for ktstr
     // guests). Only set in performance_mode to avoid disabling PV
     // optimizations in functional tests.
-    if performance_mode {
-        if let Some(entry) = entries.iter_mut().find(|e| e.function == 0x4000_0001) {
-            entry.edx |= 1;
-        }
+    if performance_mode && let Some(entry) = entries.iter_mut().find(|e| e.function == 0x4000_0001)
+    {
+        entry.edx |= 1;
     }
 
     // Both paths above populate leaf 0x40000001 (wide_smp -> EAX
     // MSI_EXT_DEST_ID; performance_mode -> EDX HINTS_REALTIME); the guest
     // only enumerates it if 0x40000000 advertises it as the max hypervisor
     // leaf. Bump once for whichever ran.
-    if wide_smp || performance_mode {
-        if let Some(entry) = entries.iter_mut().find(|e| e.function == 0x4000_0000) {
-            entry.eax = entry.eax.max(0x4000_0001);
-        }
+    if (wide_smp || performance_mode)
+        && let Some(entry) = entries.iter_mut().find(|e| e.function == 0x4000_0000)
+    {
+        entry.eax = entry.eax.max(0x4000_0001);
     }
 
     entries
@@ -1645,7 +1672,11 @@ mod tests {
         if let Some(entry) = leaf {
             // ECX[7:0] = CPUs per package - 1 (all CPUs, package-scoped)
             let nc = entry.ecx & 0xff;
-            assert_eq!(nc, topo.total_cpus() - 1, "NC should be cpus_per_package - 1");
+            assert_eq!(
+                nc,
+                topo.total_cpus() - 1,
+                "NC should be cpus_per_package - 1"
+            );
             // ECX[15:12] = APIC-ID core-id size = the package shift
             let apic_id_size = (entry.ecx >> 12) & 0xf;
             assert_eq!(
@@ -2465,7 +2496,9 @@ mod tests {
             let core_sub = cpuid
                 .iter()
                 .find(|e| e.function == 0xb && e.index == 1)
-                .unwrap_or_else(|| panic!("{vendor}: 0xB Core subleaf (index 1) must be synthesized"));
+                .unwrap_or_else(|| {
+                    panic!("{vendor}: 0xB Core subleaf (index 1) must be synthesized")
+                });
             assert_eq!(
                 (core_sub.ecx >> 8) & 0xff,
                 2,
@@ -2477,7 +2510,10 @@ mod tests {
                     .iter()
                     .filter(|e| e.function == 0xb && e.index == idx)
                     .count();
-                assert_eq!(n, 1, "{vendor}: exactly one 0xB subleaf at index {idx}, got {n}");
+                assert_eq!(
+                    n, 1,
+                    "{vendor}: exactly one 0xB subleaf at index {idx}, got {n}"
+                );
             }
             // 0x1F is emitted for Intel guests only; AMD falls through to 0xB.
             let has_1f = cpuid.iter().any(|e| e.function == 0x1f);

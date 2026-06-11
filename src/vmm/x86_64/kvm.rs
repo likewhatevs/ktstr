@@ -461,12 +461,14 @@ impl KtstrKvm {
         // arch/x86/kvm/Kconfig).
         let max_vcpus = kvm.get_max_vcpus();
         if total as usize > max_vcpus {
-            return Err(anyhow::Error::new(crate::vmm::host_topology::ResourceContention {
-                reason: format!(
-                    "topology requires {total} vCPUs but this host's \
+            return Err(anyhow::Error::new(
+                crate::vmm::host_topology::ResourceContention {
+                    reason: format!(
+                        "topology requires {total} vCPUs but this host's \
                      KVM_CAP_MAX_VCPUS is {max_vcpus}; cannot run a VM this wide"
-                ),
-            }));
+                    ),
+                },
+            ));
         }
         // The vcpu_id passed below is apic_id(topo, cpu_id), whose sparse
         // range can exceed the vCPU count; KVM_CREATE_VCPU requires the id be
@@ -728,7 +730,10 @@ pub(crate) fn kvm_set_gsi_routing_via_raw_fd(
 /// extended-destination MSI the IOAPIC translated the guest's RTE into.
 fn build_device_msi_routing(routes: &[(u32, MsiRoute)]) -> Result<KvmIrqRouting> {
     let mut routing = KvmIrqRouting::new(routes.len()).map_err(|e| {
-        anyhow::anyhow!("allocate kvm_irq_routing for {} routes: {e:?}", routes.len())
+        anyhow::anyhow!(
+            "allocate kvm_irq_routing for {} routes: {e:?}",
+            routes.len()
+        )
     })?;
     let slice = routing.as_mut_slice();
     for (i, (gsi, msi)) in routes.iter().enumerate() {
@@ -919,7 +924,9 @@ impl IoapicHandle {
     /// otherwise `None`. Lets the run-loop dispatcher route an MMIO exit
     /// without importing the device's base/size constants.
     pub(crate) fn in_range(&self, addr: u64) -> Option<u64> {
-        (addr >= IOAPIC_BASE && addr < IOAPIC_BASE + IOAPIC_SIZE).then(|| addr - IOAPIC_BASE)
+        (IOAPIC_BASE..IOAPIC_BASE + IOAPIC_SIZE)
+            .contains(&addr)
+            .then(|| addr - IOAPIC_BASE)
     }
 }
 
@@ -951,10 +958,7 @@ mod tests {
                 if ok {
                     Ok(())
                 } else {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "injected install failure",
-                    ))
+                    Err(std::io::Error::other("injected install failure"))
                 }
             })
         };
@@ -964,7 +968,11 @@ mod tests {
         // unmasked route) → route change → install #1.
         step(IOREGSEL, &[lo_reg], true).unwrap();
         step(IOWIN, &0x40u32.to_le_bytes(), true).unwrap();
-        assert_eq!(installs.get(), 1, "programming an unmasked RTE installs once");
+        assert_eq!(
+            installs.get(),
+            1,
+            "programming an unmasked RTE installs once"
+        );
 
         // Rewrite the identical lo dword: the register file reports dirty, but
         // the route set is byte-identical → dedup SKIPS the install ioctl.
@@ -985,7 +993,11 @@ mod tests {
             "an injected install failure propagates as an error"
         );
         assert_eq!(installs.get(), 2, "the changed RTE attempts an install");
-        assert_eq!(handle.routing_failures(), 1, "the failed install is counted");
+        assert_eq!(
+            handle.routing_failures(),
+            1,
+            "the failed install is counted"
+        );
 
         // Retry the SAME changed RTE with a succeeding installer. Because the
         // failed install did not cache 0x50, this must install AGAIN (count 3)

@@ -198,7 +198,7 @@ pub use aarch64::kvm;
 
 /// Arch-neutral handle for the userspace IOAPIC. On x86_64 it is the real
 /// device handle ([`x86_64::kvm::IoapicHandle`], the split-irqchip /
-/// >255-vCPU path); on other targets it is uninhabited, so the run loop's
+/// \>255-vCPU path); on other targets it is uninhabited, so the run loop's
 /// `Option<&IoapicHandle>` is always `None` and the (x86-only) IOAPIC
 /// dispatch arms are never compile-reached.
 #[cfg(target_arch = "x86_64")]
@@ -882,12 +882,18 @@ impl KtstrVm {
         // spawn_ap_threads + run_bsp_loop so the interactive shell's serial /
         // virtio-console IRQs route via the userspace IOAPIC. `None` for
         // <=254 vCPUs (in-kernel IOAPIC).
+        // x86-only (mirrors run_vm): aarch64 has no userspace IOAPIC — the
+        // GIC routes device IRQs and `IoapicHandle` is the uninhabited
+        // placeholder — so the handle is always `None` there.
+        #[cfg(target_arch = "x86_64")]
         let ioapic_handle: Option<Arc<crate::vmm::IoapicHandle>> = vm.ioapic.as_ref().map(|io| {
             Arc::new(crate::vmm::IoapicHandle::new(
                 io.clone(),
                 std::os::unix::io::AsRawFd::as_raw_fd(&*vm.vm_fd),
             ))
         });
+        #[cfg(not(target_arch = "x86_64"))]
+        let ioapic_handle: Option<Arc<crate::vmm::IoapicHandle>> = None;
 
         // Virtio-console for shell I/O via /dev/hvc0.
         let mut vc = virtio_console::VirtioConsole::new();
@@ -1471,10 +1477,10 @@ impl KtstrVm {
         // routes device IRQs via the GIC, and `IoapicHandle` is an
         // empty-enum placeholder there with no `routing_failures`).
         #[cfg(target_arch = "x86_64")]
-        if let Some(io) = &ioapic_handle {
-            if let Some(msg) = routing_failure_summary(io.routing_failures()) {
-                eprintln!("{msg}");
-            }
+        if let Some(io) = &ioapic_handle
+            && let Some(msg) = routing_failure_summary(io.routing_failures())
+        {
+            eprintln!("{msg}");
         }
 
         // Exec mode fallback: if virtio-console produced no output
