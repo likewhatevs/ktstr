@@ -3561,20 +3561,19 @@ mod tests {
     }
 
     /// Stub func for the host_only listing-test entry. The listers
-    /// never invoke `func` — they only iterate `KTSTR_TESTS` to
-    /// emit names — so an Err-returning stub is sufficient and
-    /// matches the pattern `default_test_func` uses in
-    /// `entry::DEFAULT`. If a future regression accidentally drove
-    /// dispatch through this entry, the bail message would surface
-    /// the misroute rather than silently passing.
+    /// (`list_tests_all` / `list_tests_budget`) only iterate
+    /// `KTSTR_TESTS` to emit names and never call `func` — but every
+    /// `KTSTR_TESTS` entry is ALSO reachable by the run dispatcher: a
+    /// full `cargo ktstr test` run executes it, exactly like the sibling
+    /// `__unit_test_dummy__` sentinel. So the func must be a harmless
+    /// pass, not an error. `host_only = true` runs it on the host with
+    /// no VM and it asserts nothing. (An earlier Err-bailing stub
+    /// assumed the entry was never dispatched, which made every full
+    /// run fail when the dispatcher reached it.)
     fn host_only_listing_stub(
         _ctx: &crate::scenario::Ctx,
     ) -> anyhow::Result<crate::assert::AssertResult> {
-        anyhow::bail!(
-            "host_only_listing_test_entry::func called — entry exists \
-             only to drive the host_only kernel-suffix skip tests in \
-             list_tests_all / list_tests_budget; func should never run"
-        )
+        Ok(crate::assert::AssertResult::pass())
     }
 
     /// Distinct sentinel name so the listing-output filters in the
