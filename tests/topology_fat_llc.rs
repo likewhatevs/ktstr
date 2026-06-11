@@ -32,8 +32,11 @@ fn count_cpulist(s: &str) -> usize {
         .sum()
 }
 
-#[ktstr_test(llcs = 4, cores = 4, threads = 1, no_perf_mode, duration_s = 4)]
-fn multi_llc_guest_presents_fat_l3(ctx: &Ctx) -> Result<AssertResult> {
+/// Assert the guest presents fat shared-L3 domains: exactly `num_llcs`
+/// distinct level-3 `shared_cpu_list` domains, each shared by all
+/// `cores_per_llc` CPUs of its LLC. (Schedulers read index3/shared_cpu_list
+/// to build their LLC map; a per-CPU L3 makes every CPU its own LLC.)
+fn assert_fat_l3_presentation(ctx: &Ctx) -> Result<AssertResult> {
     let num_llcs = ctx.topo.num_llcs();
     let total = ctx.topo.total_cpus();
     ensure!(num_llcs >= 2, "test needs >=2 LLCs (got {num_llcs})");
@@ -84,4 +87,35 @@ fn multi_llc_guest_presents_fat_l3(ctx: &Ctx) -> Result<AssertResult> {
         );
     }
     Ok(AssertResult::pass())
+}
+
+#[ktstr_test(llcs = 4, cores = 4, threads = 1, no_perf_mode, duration_s = 4)]
+fn multi_llc_guest_presents_fat_l3(ctx: &Ctx) -> Result<AssertResult> {
+    assert_fat_l3_presentation(ctx)
+}
+
+/// The same fat-L3 contract at the wide-SMP scale: a 256-vCPU guest
+/// (16 LLCs x 16 cores, top APIC ID 255 > 254 -> split-irqchip boot path).
+/// Pins that the host-synthesized cache-topology CPUID presents 16 fat-L3
+/// domains, each shared by all 16 CPUs of its LLC, at 256 vCPUs.
+///
+/// The >255-unique coverage is the boot and the grouping, NOT the cache
+/// synthesis: `num_threads_sharing` is encoded purely from cores-per-LLC
+/// (topology.rs `patch_cache_topology_eax`), independent of vCPU count, so
+/// a per-CPU-collapse or mis-size regression is already caught by the
+/// 16-vCPU sibling. This variant adds (a) all 256 APs coming online — the
+/// per-CPU /sys scan reads every CPU's L3 only if the split-irqchip boot
+/// brought them all up — and (b) the guest's `llc_id = apicid >> order(..)`
+/// grouping holding across the upper-half (128-255) APIC-ID range the
+/// sibling (APIC IDs 0-15) never reaches, where an apic-id-width or
+/// truncation bug would surface.
+#[ktstr_test(llcs = 16, cores = 16, threads = 1, no_perf_mode, duration_s = 4)]
+fn multi_llc_guest_presents_fat_l3_wide_smp(ctx: &Ctx) -> Result<AssertResult> {
+    ensure!(
+        ctx.topo.total_cpus() > 254,
+        "wide-smp variant needs >254 vCPUs to exercise the split-irqchip \
+         cache presentation (got {})",
+        ctx.topo.total_cpus()
+    );
+    assert_fat_l3_presentation(ctx)
 }
