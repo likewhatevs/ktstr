@@ -10,11 +10,12 @@
 /// multi-NUMA topologies. It provides latency and bandwidth attributes
 /// that the kernel uses to compute abstract distance (adistance) for
 /// memory tiering and NUMA optimization.
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 use zerocopy::IntoBytes;
 
 use super::topology::apic_id;
+use crate::vmm::kvm::HIMEM_START;
 use crate::vmm::numa_mem::NumaMemoryLayout;
 use crate::vmm::topology::Topology;
 
@@ -262,6 +263,39 @@ pub fn setup_acpi(
 
     let emit_hmat = topo.numa_nodes > 1;
 
+    // The ACPI tables pack into the legacy ISA hole
+    // [RSDP_ADDR + RSDP_SIZE, HIMEM_START). Reject any topology whose
+    // tables would overflow it BEFORE the u32 per-table size math, so
+    // neither the O(num_cpus) SRAT/MADT terms nor the O(numa_nodes²)
+    // SLIT/HMAT terms can wrap u32 (a wrapped size defeats the precise
+    // end-of-pack check below and lets a write_* scribble past the hole
+    // into guest RAM). setup_acpi is a pub fn: a direct caller can pass a
+    // topology the kvm.rs max_vcpus gate would reject, so the guards live
+    // here, not only at VM build.
+    //
+    // The cap is the correct ceiling, not merely a guard: the guest
+    // kernel's MAX_NUMNODES = 1 << CONFIG_NODES_SHIFT = 64 (x86_64 default
+    // 6; ktstr does not override it), and its SRAT parser drops nodes
+    // >= MAX_NUMNODES, so a guest cannot use more NUMA nodes than the
+    // ~130 KiB hole trivially fits (a 64-node SLIT is 4 KiB). If
+    // CONFIG_NODES_SHIFT is ever raised toward the x86 max of 10
+    // (MAX_NUMNODES 1024, a 1 MiB SLIT), revisit: the hole would no longer
+    // fit a usable node count and the tables would need relocating to a
+    // high reserved region.
+    let acpi_table_space = HIMEM_START - (RSDP_ADDR + RSDP_SIZE);
+
+    // CPU axis: SRAT has one CpuAffinity per vCPU and MADT one APIC entry
+    // per vCPU, both O(num_cpus). Bound it in u64 so the u32 sizing below
+    // cannot wrap.
+    let cpu_table_bytes = num_cpus as u64
+        * (std::mem::size_of::<SratCpuAffinity>() + std::mem::size_of::<MadtX2Apic>()) as u64;
+    ensure!(
+        cpu_table_bytes <= acpi_table_space,
+        "ACPI CPU tables (SRAT + MADT, {cpu_table_bytes} bytes for {num_cpus} \
+         vCPUs) exceed the ISA hole table space ({acpi_table_space} bytes) — \
+         would clobber guest RAM",
+    );
+
     // Compute table sizes.
     let dsdt_size: u64 = 36;
 
@@ -272,14 +306,26 @@ pub fn setup_acpi(
     // SRAT: one CPU affinity per vCPU + one memory affinity per layout
     // region (nodes with memory). CPU-only nodes with zero memory do not
     // get a memory affinity entry.
-    let num_mem_regions = numa_layout.regions().len() as u32;
-    let srat_size: u64 =
-        (48 + std::mem::size_of::<SratCpuAffinity>() as u32 * num_cpus
-            + std::mem::size_of::<SratMemAffinity>() as u32 * num_mem_regions) as u64;
+    let num_mem_regions = numa_layout.regions().len() as u64;
+    let srat_size: u64 = 48
+        + std::mem::size_of::<SratCpuAffinity>() as u64 * num_cpus as u64
+        + std::mem::size_of::<SratMemAffinity>() as u64 * num_mem_regions;
 
     // SLIT: NxN distance matrix where N = NUMA node count.
     let n = topo.numa_nodes as u64;
     let slit_size: u64 = 36 + 8 + n * n;
+
+    // NUMA axis: SLIT is O(numa_nodes²) and dominates; HMAT is also
+    // O(numa_nodes²). Reject when the SLIT alone cannot fit, which also
+    // bounds numa_nodes so compute_hmat_size's u32 math below cannot wrap.
+    ensure!(
+        slit_size <= acpi_table_space,
+        "ACPI SLIT alone ({slit_size} bytes, numa_nodes={}, O(n²)) exceeds the \
+         ISA hole table space ({acpi_table_space} bytes [{:#x}, {HIMEM_START:#x})) \
+         — would clobber guest RAM",
+        topo.numa_nodes,
+        RSDP_ADDR + RSDP_SIZE
+    );
 
     let hmat_size: u64 = if emit_hmat {
         compute_hmat_size(topo, numa_layout) as u64
@@ -317,6 +363,21 @@ pub fn setup_acpi(
     cursor += rsdt_size;
 
     let xsdt_addr = cursor;
+    let acpi_end = xsdt_addr + xsdt_size;
+
+    // Precise fit: the full contiguous pack must end within the ISA hole;
+    // above HIMEM_START is guest RAM (E820_RAM) the guest allocates over.
+    // The CPU and SLIT pre-checks above bound num_cpus and numa_nodes, so
+    // every per-table u32 size summed here is wrap-safe.
+    ensure!(
+        acpi_end <= HIMEM_START,
+        "ACPI tables overflow the ISA hole [{RSDP_ADDR:#x}, {HIMEM_START:#x}): \
+         end {acpi_end:#x} ({} bytes) for numa_nodes={}, cpus={} — would clobber \
+         guest RAM",
+        acpi_end - RSDP_ADDR,
+        topo.numa_nodes,
+        num_cpus
+    );
 
     let layout = AcpiLayout {
         dsdt_addr,
@@ -1027,6 +1088,103 @@ mod tests {
     const _: () = assert!(std::mem::size_of::<MadtX2ApicNmi>() == 12);
     const _: () = assert!(std::mem::size_of::<SratCpuAffinity>() == 24);
     const _: () = assert!(std::mem::size_of::<SratMemAffinity>() == 40);
+
+    #[test]
+    fn acpi_rejects_slit_dominated_overflow_at_extreme_numa() {
+        // SLIT is O(numa_nodes²); 512 nodes → ~256 KiB, far past the ~128 KiB
+        // ISA-hole table space. The early u64 SLIT check must reject it
+        // loudly (and keep the u32 HMAT size math from wrapping).
+        let mem = test_mem(16);
+        let topo = Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 512,
+            nodes: None,
+            distances: None,
+        };
+        let layout = test_layout(&topo, 512);
+        let err = setup_acpi(&mem, &topo, &layout)
+            .expect_err("512-NUMA SLIT must overflow the ISA hole");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("SLIT alone") && msg.contains("ISA hole"),
+            "error must name the SLIT-dominated ISA-hole overflow, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn acpi_rejects_cpu_table_overflow_at_extreme_vcpu_count() {
+        // SRAT + MADT scale O(num_cpus) and are summed against the ISA hole;
+        // a topology with enough vCPUs to overflow it must be rejected loudly
+        // (and before the u32 per-CPU sizing can wrap). 4096 vCPUs × ~40 B
+        // exceeds the ~128 KiB hole. setup_acpi is a pub fn, so this guards
+        // direct callers that bypass the VM-build max_vcpus gate.
+        let mem = test_mem(16);
+        let topo = Topology {
+            llcs: 4096,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let layout = test_layout(&topo, 256);
+        let err = setup_acpi(&mem, &topo, &layout)
+            .expect_err("4096-vCPU ACPI CPU tables must overflow the ISA hole");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("CPU tables") && msg.contains("ISA hole"),
+            "error must name the CPU-table ISA-hole overflow, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn acpi_rejects_total_overflow_when_slit_alone_fits() {
+        // 361 nodes: SLIT alone (~127 KiB) still fits the ~128 KiB hole, but
+        // the full pack (SLIT + SRAT + HMAT + ...) exceeds it. The precise
+        // end-of-tables check must catch the case the SLIT pre-check passes.
+        let mem = test_mem(16);
+        let topo = Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 361,
+            nodes: None,
+            distances: None,
+        };
+        let layout = test_layout(&topo, 361);
+        let err = setup_acpi(&mem, &topo, &layout)
+            .expect_err("361-NUMA total tables must overflow the ISA hole");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("tables overflow") && msg.contains("ISA hole"),
+            "error must name the total-pack ISA-hole overflow, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn acpi_tables_fit_at_wide_smp_topology() {
+        // The widest realistic scheduler-test topology (256 vCPUs, 16 NUMA)
+        // must fit the ISA hole with room to spare — the overflow ceiling is
+        // far above any real topology.
+        let mem = test_mem(16);
+        let topo = Topology {
+            llcs: 16,
+            cores_per_llc: 16,
+            threads_per_core: 1,
+            numa_nodes: 16,
+            nodes: None,
+            distances: None,
+        };
+        let l = test_setup(&mem, &topo, 4096);
+        let end = l.xsdt_addr + l.xsdt_size;
+        assert!(
+            end <= HIMEM_START,
+            "wide-SMP ACPI tables must fit the ISA hole: end={end:#x} \
+             HIMEM_START={HIMEM_START:#x}"
+        );
+    }
 
     #[test]
     fn rsdp_signature_and_checksum() {
