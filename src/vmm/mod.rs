@@ -587,7 +587,16 @@ impl KtstrVm {
     /// without exposing the [`crate::vmm::builder::StagedScheduler`]
     /// type into the `pub` `SuffixParams` field signature.
     fn suffix_params(&self) -> initramfs::SuffixParams<'_> {
+        // Production invariant: the initramfs path is reached only with an
+        // init_binary (spawn_initramfs_resolve bails otherwise), so payload
+        // is always Some here. A None would make build_suffix emit an
+        // /init-less, unbootable image silently — trip it in debug/test.
+        debug_assert!(
+            self.init_binary.is_some(),
+            "suffix_params: production initramfs path requires init_binary (the /init payload)"
+        );
         initramfs::SuffixParams {
+            payload: self.init_binary.as_deref(),
             args: &self.run_args,
             sched_args: &self.sched_args,
             sched_enable: &self.sched_enable_cmds,

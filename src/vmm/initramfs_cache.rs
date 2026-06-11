@@ -1,11 +1,13 @@
 //! Two-tier initramfs cache: per-process HashMap + cross-process POSIX
 //! shm.
 //!
-//! Each VM run produces an initramfs blob keyed by the content hashes
-//! of the payload binary, optional scheduler / probe / worker
-//! binaries, include files, and shell-mode flags. Building the blob
-//! is expensive (10s of MB of cpio assembly + LZ4 compression), so
-//! the cache amortises the cost across:
+//! Each VM run produces an initramfs base blob keyed on the payload's
+//! shared-lib SET (not the payload's own content — its /init bytes ride
+//! the per-run suffix) plus the content hashes of the optional
+//! scheduler / probe / worker binaries packed into the base, include
+//! files, and shell-mode flags. Building the blob is expensive (10s of
+//! MB of cpio assembly + LZ4 compression), so the cache amortises the
+//! cost across:
 //!
 //! - **Same-process tests**: a `HashMap<BaseKey, Arc<Vec<u8>>>`
 //!   keeps the in-flight blob hot without a syscall.
@@ -14,11 +16,14 @@
 //!   a single builder; losers `LOCK_SH`-block on the segment until
 //!   the winner finishes, then `mmap` it zero-copy.
 //!
-//! The `BaseKey` content-hash spans every byte the build consumes
-//! (binary content + shared-lib content) so a recompile invalidates
-//! the cache without operator intervention. Stale segments from a
-//! previous compression format are GC'd once per process on the first
-//! `get_or_build_base` call via a `LOCK_EX | LOCK_NB` probe.
+//! The `BaseKey` hashes the payload's shared-lib set + interpreter (the
+//! bytes the base packs FROM the payload — not the payload itself) and
+//! the full content of the scheduler / probe / worker binaries written
+//! into the base. So a scheduler/probe/worker recompile invalidates the
+//! cache, while a payload recompile that keeps the same lib set is a HIT
+//! (the payload's content lives only in the per-run suffix). Stale
+//! segments from a previous compression format are GC'd once per process
+//! on the first `get_or_build_base` call via a `LOCK_EX | LOCK_NB` probe.
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -32,11 +37,13 @@ use ahash::AHasher;
 
 use super::initramfs;
 
-/// Cache key for base initramfs. Derived from content hashes of the
-/// payload binary and its shared libs, plus the optional scheduler
-/// binary and its shared libs. Shell mode additionally mixes in a
-/// sentinel, include files, and the busybox flag; see [`Self::new`]
-/// and [`Self::new_shell`] for per-constructor inputs.
+/// Cache key for base initramfs. Derived from the payload's shared-lib
+/// SET + interpreter (NOT the payload's content — its /init bytes ride
+/// the per-run suffix), plus the content hashes of the optional
+/// scheduler / probe / worker binaries packed into the base and their
+/// shared libs. Shell mode additionally mixes in a sentinel, include
+/// files, and the busybox flag; see [`Self::new`] and [`Self::new_shell`]
+/// for per-constructor inputs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BaseKey(pub(crate) u64);
 
@@ -99,11 +106,14 @@ pub(crate) fn hash_file(path: &Path) -> Result<u64> {
 }
 
 impl BaseKey {
-    /// Hashes the payload binary content, payload shared libs, and
-    /// the optional scheduler / probe / alloc-worker binary content
-    /// and shared libs. Each optional input participates
-    /// symmetrically because each changes the bytes written into
-    /// the initramfs. Explicit parameters keep the cache key
+    /// Hashes the payload's shared-lib SET — NOT its content: `/init`
+    /// lives in the per-run suffix (`build_suffix`), so the base archive
+    /// depends only on which libraries the payload pulls in, not on the
+    /// payload bytes. A payload recompile that keeps the same libs is a
+    /// base-cache hit. The optional scheduler / probe / alloc-worker
+    /// binaries DO have their content hashed — they are written into the
+    /// base, so each changes the base bytes. Each optional input
+    /// participates symmetrically. Explicit parameters keep the cache key
     /// sensitive to these inputs regardless of the routing choice —
     /// the probe currently rides the extras path (stripped) while
     /// the worker rides `include_files` (verbatim), but the hash
@@ -122,7 +132,19 @@ impl BaseKey {
     ) -> Result<Self> {
         let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
 
-        hash_file(payload)?.hash(&mut hasher);
+        // Payload CONTENT is not hashed: /init lives in the per-run
+        // suffix, not the base. Only the payload's shared-lib SET shapes
+        // the base, so a payload recompile that keeps the same libs is a
+        // base-cache hit. Still fail fast if the payload is missing or
+        // not a regular file — `hash_shared_libs` swallows resolve errors,
+        // and the base build would fail later anyway.
+        let payload_meta = std::fs::metadata(payload)
+            .with_context(|| format!("stat payload for cache key: {}", payload.display()))?;
+        anyhow::ensure!(
+            payload_meta.is_file(),
+            "payload for cache key is not a regular file: {}",
+            payload.display()
+        );
         Self::hash_shared_libs(payload, &mut hasher);
 
         match scheduler {
@@ -160,7 +182,7 @@ impl BaseKey {
     /// Shell mode key: hashes a sentinel, include files, and the
     /// busybox flag so different shell configurations get distinct
     /// cache keys. Include file archive paths and content are hashed
-    /// so the same payload + same includes = cache hit, while
+    /// so the same payload libs + same includes = cache hit, while
     /// different includes = cache miss. `probe` and `worker` are
     /// hashed for the same reasons as [`BaseKey::new`].
     pub(crate) fn new_shell(
@@ -191,7 +213,18 @@ impl BaseKey {
             }
             None => 0u8.hash(&mut hasher),
         }
-        hash_file(payload)?.hash(&mut hasher);
+        // Payload CONTENT is not hashed (see `BaseKey::new`): /init is in
+        // the per-run suffix; only the payload's shared-lib SET shapes the
+        // base, so a recompile keeping the same libs is a cache hit. Fail
+        // fast if the payload is missing or not a regular file (see
+        // `BaseKey::new`).
+        let payload_meta = std::fs::metadata(payload)
+            .with_context(|| format!("stat payload for cache key: {}", payload.display()))?;
+        anyhow::ensure!(
+            payload_meta.is_file(),
+            "payload for cache key is not a regular file: {}",
+            payload.display()
+        );
         Self::hash_shared_libs(payload, &mut hasher);
 
         match scheduler {
@@ -264,6 +297,18 @@ impl BaseKey {
     /// the cache key changes when any shared lib is updated on the host.
     fn hash_shared_libs(binary: &Path, hasher: &mut AHasher) {
         if let Ok(result) = initramfs::resolve_shared_libs(binary) {
+            // The PT_INTERP (dynamic linker) is packed into the base by
+            // build_initramfs_base but is NOT a DT_NEEDED entry, so it's
+            // absent from `found`. Hash its path + content: the base
+            // depends on it, and the payload's own content is no
+            // longer hashed, so an interp swap with an unchanged DT_NEEDED
+            // set would otherwise serve a stale base.
+            if let Some(interp) = &result.interpreter {
+                interp.as_bytes().hash(hasher);
+                if let Ok(sample) = hash_file(Path::new(interp)) {
+                    sample.hash(hasher);
+                }
+            }
             let mut entries: Vec<_> = result.found.iter().map(|(_, p)| p.clone()).collect();
             entries.sort();
             for p in &entries {
@@ -703,23 +748,42 @@ mod tests {
     }
 
     #[test]
-    fn base_key_different_content_differs() {
-        let _tempdir_keep_alive = tempfile::Builder::new()
-            .prefix("ktstr-cache-content-test-")
+    fn base_key_same_libs_content_change_matches() {
+        // /init lives in the per-run suffix now, so the base key tracks
+        // the payload's shared-lib SET, not its content. Two payloads with
+        // the same libs but different bytes must produce the SAME base key
+        // — that is the cache-hit-across-recompile property the lib-set keying buys.
+        let exe = crate::resolve_current_exe().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("ktstr-cache-libs-test-")
             .tempdir()
             .unwrap();
-        let tmp = _tempdir_keep_alive.path();
-        let bin = tmp.join("payload");
+        let a = dir.path().join("payload_a");
+        let b = dir.path().join("payload_b");
 
-        std::fs::write(&bin, b"content_v1").unwrap();
-        let k1 = BaseKey::new(&bin, None, None, None, &[]).unwrap();
-
-        std::fs::write(&bin, b"content_v2").unwrap();
-        let k2 = BaseKey::new(&bin, None, None, None, &[]).unwrap();
-
+        // Both are copies of the same real ELF (identical DT_NEEDED), so
+        // they resolve to the same lib set. `b` gets trailing bytes
+        // appended so its CONTENT differs; goblin parses by header/section
+        // offset, leaving the resolved libs unchanged.
+        std::fs::copy(&exe, &a).unwrap();
+        std::fs::copy(&exe, &b).unwrap();
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&b).unwrap();
+            f.write_all(b"\x00ktstr-distinct-trailing-bytes").unwrap();
+        }
         assert_ne!(
-            k1, k2,
-            "different file content should produce different key"
+            std::fs::read(&a).unwrap(),
+            std::fs::read(&b).unwrap(),
+            "test setup: payload bytes must differ"
+        );
+
+        let ka = BaseKey::new(&a, None, None, None, &[]).unwrap();
+        let kb = BaseKey::new(&b, None, None, None, &[]).unwrap();
+        assert_eq!(
+            ka, kb,
+            "payload content change with an unchanged lib set must NOT \
+             change the base key (else the base cache misses every recompile)"
         );
     }
 

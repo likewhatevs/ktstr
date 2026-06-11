@@ -671,21 +671,6 @@ fn is_deleted_self(path: &Path) -> bool {
         && target_str.trim_end_matches(" (deleted)") == path.to_string_lossy().as_ref()
 }
 
-/// Build the base cpio archive: /init binary, extra binaries, and shared
-/// libraries. Does NOT include /args, trailer, or 512-byte padding. The
-/// returned bytes are a valid cpio prefix that `build_suffix` can complete
-/// with per-invocation args.
-///
-/// The test binary is packed as `/init` (the kernel's rdinit entry point).
-/// Init setup (mounts, scheduler start, etc.) is handled by the Rust init
-/// code in `vmm::rust_init`, which runs when the binary detects PID 1.
-///
-/// When `busybox_bytes` is `Some`, embeds the provided bytes at
-/// `bin/busybox` for shell mode. Bytes are sourced from
-/// [`crate::vmm::blobs::load_busybox_bytes`] (which reads the
-/// `KTSTR_BUSYBOX_PATH` env var that `cargo-ktstr` sets at startup);
-/// the library does not embed busybox itself.
-///
 /// Expand `guest_path`'s parent into every ancestor directory component
 /// and insert each into `dirs`. No-op when the path has no parent
 /// (e.g. top-level files like `init`). The component walk produces every
@@ -702,17 +687,33 @@ fn register_parent_dirs(dirs: &mut BTreeSet<String>, guest_path: &str) {
     }
 }
 
+/// Build the base cpio archive: directories, `bin/busybox` (shell mode),
+/// extra binaries, include files, and shared libraries. Does NOT include
+/// `/init`, `/args`, the sentinel, trailer, or 512-byte padding — those
+/// are the per-run suffix ([`build_suffix`]). The returned bytes are a
+/// valid cpio prefix `build_suffix` completes. `/init` is deliberately
+/// NOT here: keeping the payload's bytes out of the base means a payload
+/// recompile that leaves the shared-lib set unchanged hits the base cache
+/// (the base depends only on the lib SET, resolved from `payload`, not
+/// its content).
+///
+/// When `busybox_bytes` is `Some`, embeds the provided bytes at
+/// `bin/busybox` for shell mode. Bytes are sourced from
+/// [`crate::vmm::blobs::load_busybox_bytes`] (which reads the
+/// `KTSTR_BUSYBOX_PATH` env var that `cargo-ktstr` sets at startup);
+/// the library does not embed busybox itself.
+///
 /// `include_files` adds files verbatim to the archive (no strip_debug).
 /// Each entry is `(archive_path, host_path)`. ELF files get shared library
 /// resolution; non-ELF files are copied as-is. Symlinks are followed to
 /// their target; the target must be a regular file (FIFOs, device nodes,
-/// and sockets are rejected). Archive
-/// paths must not contain `..` components. Callers expand directories into
-/// individual file entries before calling this function (see
-/// `cli::resolve_include_files`).
+/// and sockets are rejected). Archive paths must not contain `..`
+/// components. Callers expand directories into individual file entries
+/// before calling this function (see `cli::resolve_include_files`).
 ///
-/// The init binary is `strip_debug`'d before being written into the
-/// archive. Extras are stripped the same way.
+/// Extra binaries are `strip_debug`'d before being written. `payload` is
+/// read only for shared-lib resolution (its `/init` bytes are written by
+/// [`build_suffix`]).
 #[tracing::instrument(skip_all, fields(payload = %payload.display(), includes = include_files.len()))]
 pub fn build_initramfs_base(
     payload: &Path,
@@ -762,10 +763,6 @@ pub fn build_initramfs_base(
         validated_includes.push((archive_path, host_path, meta.permissions().mode()));
     }
 
-    let binary = {
-        let _s = tracing::debug_span!("strip_debug").entered();
-        strip_debug(payload).with_context(|| format!("strip/read binary: {}", payload.display()))?
-    };
     let mut archive = Vec::new();
 
     // Collect directory entries needed for shared libraries and includes.
@@ -936,10 +933,6 @@ pub fn build_initramfs_base(
         write_entry(&mut archive, dir, &[], 0o40755)?;
     }
 
-    // Test binary as /init — the Rust init code detects PID 1 and performs
-    // all setup (mounts, scheduler, etc.) before running the test function.
-    write_entry(&mut archive, "init", &binary, 0o100755)?;
-
     // Shell mode: embed busybox bytes provided by the caller. The
     // ktstr library does not own the bytes — they come from the
     // `KTSTR_BUSYBOX_PATH` env var that cargo-ktstr sets at startup
@@ -992,10 +985,6 @@ pub fn build_initramfs_base(
         }
     }
 
-    // Sentinel: last entry before the suffix. The guest init checks for
-    // this file to detect incomplete initramfs extraction.
-    write_entry(&mut archive, ".ktstr_init_ok", &[], 0o100644)?;
-
     drop(_s_write);
 
     Ok(archive)
@@ -1006,6 +995,12 @@ pub fn build_initramfs_base(
 /// `SuffixParams` without copying `Vec<String>` fields.
 #[derive(Default)]
 pub struct SuffixParams<'a> {
+    /// The test binary, packed as `/init` (the kernel's rdinit entry).
+    /// `strip_debug`'d into the suffix — not the cached base — so a
+    /// payload recompile that leaves the shared-lib set unchanged is a
+    /// base-cache hit. `None` only in suffix-shape unit tests; every
+    /// real boot path sets it from the VM's `init_binary`.
+    pub payload: Option<&'a Path>,
     /// `/args` contents — one entry per line.
     pub args: &'a [String],
     /// `/sched_args` contents, or empty to skip the entry.
@@ -1054,13 +1049,28 @@ pub struct SuffixParams<'a> {
     pub scheduler_cgroup_parent: Option<&'a str>,
 }
 
-/// Build the suffix that completes a base archive: `/args` and
-/// `/sched_args` entries, optional `/sched_enable` and `/sched_disable`
-/// shell scripts for kernel-built schedulers, optional `/exec_cmd`,
-/// trailer, and 512-byte padding. `base_len` is needed to compute the
-/// padding. The returned Vec is typically ~200 bytes.
+/// Build the suffix that completes a base archive: `/init` (the
+/// `strip_debug`'d test binary), `/args` and `/sched_args` entries,
+/// optional `/sched_enable` and `/sched_disable` shell scripts for
+/// kernel-built schedulers, optional `/exec_cmd`, the `.ktstr_init_ok`
+/// sentinel (last entry — its absence flags incomplete extraction),
+/// trailer, and 512-byte
+/// padding. `base_len` is needed to compute the padding. `/init` lives
+/// here, not the base, so a payload recompile is a base-cache hit; it
+/// dominates the suffix size (the other entries are ~200 bytes total).
 pub fn build_suffix(base_len: usize, params: &SuffixParams<'_>) -> Result<Vec<u8>> {
     let mut suffix = Vec::new();
+
+    // Test binary as /init — detects PID 1 and runs all setup before the
+    // test (see `vmm::rust_init`). It lives in the per-run suffix, not the
+    // cached base, so the base archive is independent of payload
+    // recompiles; `strip_debug` here is the per-run cost. `None` only in
+    // suffix-shape unit tests.
+    if let Some(payload) = params.payload {
+        let binary = strip_debug(payload)
+            .with_context(|| format!("strip/read init binary: {}", payload.display()))?;
+        write_entry(&mut suffix, "init", &binary, 0o100755)?;
+    }
 
     // Args file
     let args_data = params.args.join("\n");
@@ -1145,6 +1155,13 @@ pub fn build_suffix(base_len: usize, params: &SuffixParams<'_>) -> Result<Vec<u8
         let data = args.join("\n");
         write_entry(&mut suffix, &archive_path, data.as_bytes(), 0o100644)?;
     }
+
+    // Sentinel: the LAST entry before the trailer. The kernel extracts the
+    // whole initramfs before exec'ing /init, so this file's ABSENCE means
+    // the kernel silently dropped late cpio entries under memory pressure
+    // (do_name's filp_open ENOMEM returns without error — skips the entry
+    // but keeps consuming the stream). The guest's `rust_init` checks for it.
+    write_entry(&mut suffix, ".ktstr_init_ok", &[], 0o100644)?;
 
     // Trailer
     cpio::newc::trailer(&mut suffix as &mut dyn Write).context("write cpio trailer")?;

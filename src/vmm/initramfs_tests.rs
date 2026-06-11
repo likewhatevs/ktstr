@@ -21,10 +21,11 @@ fn build_suffix_args(base_len: usize, args: &[String], sched_args: &[String]) ->
 }
 
 /// Thin test wrapper that produces a complete cpio newc archive by
-/// concatenating [`build_initramfs_base`] and [`build_suffix_args`]
-/// output. Production callers build base and suffix separately so
-/// they can stream the parts into guest memory without an
-/// intermediate `Vec`; the monolithic form is only needed for
+/// concatenating [`build_initramfs_base`] and [`build_suffix`] output.
+/// Passes `payload` to the suffix so the assembled archive carries
+/// `/init` (the base no longer does). Production callers build base and
+/// suffix separately so they can stream the parts into guest memory
+/// without an intermediate `Vec`; the monolithic form is only needed for
 /// round-trip archive-shape assertions in tests.
 fn build_initramfs(
     payload: &Path,
@@ -32,7 +33,14 @@ fn build_initramfs(
     args: &[String],
 ) -> Result<Vec<u8>> {
     let base = build_initramfs_base(payload, extra_binaries, &[], None)?;
-    let suffix = build_suffix_args(base.len(), args, &[])?;
+    let suffix = build_suffix(
+        base.len(),
+        &SuffixParams {
+            payload: Some(payload),
+            args,
+            ..Default::default()
+        },
+    )?;
     let mut archive = Vec::with_capacity(base.len() + suffix.len());
     archive.extend_from_slice(&base);
     archive.extend_from_slice(&suffix);
@@ -70,6 +78,23 @@ fn cpio_entries(archive: &[u8]) -> Vec<(String, u32, u32, u32)> {
         remaining = reader.finish().unwrap();
     }
     entries
+}
+
+/// Extract a single cpio entry's data bytes by name (None if absent).
+fn cpio_entry_data(archive: &[u8], target: &str) -> Option<Vec<u8>> {
+    let mut remaining: &[u8] = archive;
+    while let Ok(mut reader) = cpio::newc::Reader::new(remaining) {
+        if reader.entry().is_trailer() {
+            break;
+        }
+        if reader.entry().name() == target {
+            let mut data = Vec::new();
+            std::io::Read::read_to_end(&mut reader, &mut data).ok()?;
+            return Some(data);
+        }
+        remaining = reader.finish().unwrap();
+    }
+    None
 }
 
 #[test]
@@ -167,7 +192,15 @@ fn split_matches_monolithic() {
     let args = vec!["run".into(), "--json".into(), "scenario".into()];
     let monolithic = build_initramfs(&exe, &[], &args).unwrap();
     let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
-    let suffix = build_suffix_args(base.len(), &args, &[]).unwrap();
+    let suffix = build_suffix(
+        base.len(),
+        &SuffixParams {
+            payload: Some(&exe),
+            args: &args,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let mut split = Vec::with_capacity(base.len() + suffix.len());
     split.extend_from_slice(&base);
     split.extend_from_slice(&suffix);
@@ -827,11 +860,55 @@ fn strip_debug_nonexistent_fails() {
 }
 
 #[test]
-fn build_initramfs_base_contains_init() {
+fn init_lives_in_suffix_not_base() {
     let exe = crate::resolve_current_exe().unwrap();
     let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
-    let s = String::from_utf8_lossy(&base);
-    assert!(s.contains("init"), "base should contain init entry");
+
+    // The base must NOT carry /init or the sentinel — keeping the
+    // payload's bytes out of the base is what makes it cacheable across
+    // payload recompiles.
+    let base_names = cpio_entry_names(&base);
+    assert!(
+        !base_names.iter().any(|n| n == "init"),
+        "base must not contain an init entry (got {base_names:?})"
+    );
+    assert!(
+        !base_names.iter().any(|n| n == ".ktstr_init_ok"),
+        "sentinel must be in the suffix, not the base (got {base_names:?})"
+    );
+
+    // The assembled archive (base ++ suffix) carries exactly one /init,
+    // mode 0755, content == strip_debug(payload).
+    let suffix = build_suffix(
+        base.len(),
+        &SuffixParams {
+            payload: Some(&exe),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut archive = base.clone();
+    archive.extend_from_slice(&suffix);
+
+    let inits: Vec<_> = cpio_entries(&archive)
+        .into_iter()
+        .filter(|(name, ..)| name == "init")
+        .collect();
+    assert_eq!(inits.len(), 1, "exactly one init entry; got {inits:?}");
+    assert_eq!(inits[0].2 & 0o777, 0o755, "/init must be mode 0755");
+
+    let want = strip_debug(&exe).unwrap();
+    let got = cpio_entry_data(&archive, "init").expect("init entry data");
+    assert_eq!(got, want, "/init content must equal strip_debug(payload)");
+
+    // The sentinel is the LAST non-trailer entry, so its presence proves
+    // the whole archive extracted without truncation.
+    let names = cpio_entry_names(&archive);
+    assert_eq!(
+        names.last().map(String::as_str),
+        Some(".ktstr_init_ok"),
+        "sentinel must be the last entry (got {names:?})"
+    );
 }
 
 #[test]
@@ -841,12 +918,25 @@ fn build_initramfs_base_includes_extra_shared_libs() {
     let extras: Vec<(&str, &Path)> = vec![("scheduler", sched.as_path())];
     let base = build_initramfs_base(&exe, &extras, &[], None).unwrap();
     let s = String::from_utf8_lossy(&base);
+
+    // Every shared lib the extra resolves to must be packed into the base.
+    // Assert the resolved SET rather than a hardcoded soname: whether the
+    // scheduler static- or dynamic-links libbpf/libelf is a property of
+    // the scx-ktstr build, not of build_initramfs_base's lib-packing
+    // (which is what this test guards).
+    let resolved = resolve_shared_libs(sched.as_path()).unwrap();
     assert!(
-        s.contains("lib64/libelf"),
-        "initramfs with scx-ktstr extra should contain libelf; \
-             resolved libs: {:?}",
-        resolve_shared_libs(sched.as_path()).unwrap().found
+        !resolved.found.is_empty(),
+        "scx-ktstr should resolve at least its C-runtime libs"
     );
+    for (guest_path, _host) in &resolved.found {
+        assert!(
+            s.contains(guest_path.as_str()),
+            "base must contain extra's resolved lib {guest_path}; \
+             resolved set: {:?}",
+            resolved.found
+        );
+    }
 }
 
 #[test]
