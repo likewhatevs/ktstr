@@ -2573,7 +2573,59 @@ mod tests {
         );
     }
 
-    /// #23 (host-independence): on a forced-AMD base that OMITS 0x80000006
+    /// qemu-parity guard (host-independent, synthetic AMD base): pin the EDX
+    /// cache-property flags the synthesized 0x8000001D subleaves carry. These
+    /// mirror qemu's `legacy_amd_cache_info` (target/i386/cpu.c): L1d/L1i =
+    /// no-write-invalidate (0x1), L2 = none (0x0), L3 = inclusive|complex
+    /// (0x6). The kernel reads only EAX/EBX/ECX from 0x8000001D, so EDX is
+    /// informational — but a regression in these flag bytes would silently
+    /// diverge from qemu's emitted CPUID. Asserting the subleaf ORDER (index
+    /// 0=L1d, 1=L1i, 2=L2, 3=L3, by type/level) catches a reorder that would
+    /// mis-attribute the flags. (EAX/EBX/ECX geometry and the chain order are
+    /// covered by amd_cache_leaves_synthesized_host_independent.)
+    #[test]
+    fn amd_cache_0x8000001d_edx_flags_pinned() {
+        let base = vec![kvm_cpuid_entry2 {
+            function: 0,
+            ebx: 0x6874_7541, // "Auth"
+            edx: 0x6974_6e65, // "enti"
+            ecx: 0x444d_4163, // "cAMD"
+            ..Default::default()
+        }];
+        let topo = Topology {
+            llcs: 2,
+            cores_per_llc: 4,
+            threads_per_core: 2,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let cpuid = generate_cpuid(&base, &topo, 0, false);
+        // (type, level, edx) per subleaf index 0..3 — type from EAX[4:0],
+        // level from EAX[7:5], edx = the cache-property flags.
+        let subleaves: Vec<(u32, u32, u32)> = (0..4)
+            .map(|i| {
+                let e = cpuid
+                    .iter()
+                    .find(|e| e.function == 0x8000_001d && e.index == i)
+                    .unwrap_or_else(|| panic!("0x8000001D subleaf {i} must be synthesized"));
+                (e.eax & 0x1f, (e.eax >> 5) & 0x7, e.edx)
+            })
+            .collect();
+        assert_eq!(
+            subleaves,
+            vec![
+                (1, 1, 0x1), // index 0: L1d, level 1, no-write-invalidate
+                (2, 1, 0x1), // index 1: L1i, level 1, no-write-invalidate
+                (3, 2, 0x0), // index 2: L2 unified, level 2, no flags
+                (3, 3, 0x6), // index 3: L3 unified, level 3, inclusive|complex
+            ],
+            "0x8000001D subleaves must emit L1d/L1i/L2/L3 in order with qemu \
+             legacy_amd_cache_info EDX flags (0x1/0x1/0x0/0x6)"
+        );
+    }
+
+    /// Host-independence: on a forced-AMD base that OMITS 0x80000006
     /// entirely (vs masking its EDX to 0), the synthesis must PUSH the leaf
     /// so the L3-detection gate (cpuid_amd_hygon_has_l3_cache = EDX != 0)
     /// still holds — symmetric with the 0x8000001D synthesis.
