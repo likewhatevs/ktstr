@@ -17,20 +17,9 @@ use ktstr::scenario::Ctx;
 use std::collections::BTreeSet;
 use std::fs::read_to_string;
 
-/// Count the CPUs named by a Linux cpulist string ("0-3", "0,2,4", "0-3,8").
-fn count_cpulist(s: &str) -> usize {
-    s.split(',')
-        .filter(|p| !p.trim().is_empty())
-        .map(|p| match p.trim().split_once('-') {
-            Some((a, b)) => {
-                let a: usize = a.trim().parse().unwrap_or(0);
-                let b: usize = b.trim().parse().unwrap_or(0);
-                b.saturating_sub(a) + 1
-            }
-            None => 1,
-        })
-        .sum()
-}
+#[path = "common/cpulist.rs"]
+mod cpulist;
+use cpulist::count_cpulist;
 
 /// Assert the guest presents fat shared-L3 domains: exactly `num_llcs`
 /// distinct level-3 `shared_cpu_list` domains, each shared by all
