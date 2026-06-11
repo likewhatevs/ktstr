@@ -27,6 +27,12 @@
 //!        -- -E 'test(net_irq_delivers_to_apic_id_above_255)' \
 //!        --success-output immediate
 
+// The >255-APIC-ID MSI ext-dest-id path is x86-only: aarch64 uses the GIC
+// (SPIs; no APIC/IOAPIC/MSI destination) and /proc/cpuinfo has no `apicid`
+// field, so find_apic_above_255 returns Err before any I/O. The arm64
+// high-vCPU device-IRQ equivalent (GIC SPI delivery) is a separate test.
+#![cfg(target_arch = "x86_64")]
+
 use anyhow::{Result, bail, ensure};
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
