@@ -506,10 +506,6 @@ name = "verifier_pipeline"
 name = "compile_fail"
 
 [[test]]
-name = "mitosis_stall_repro"
-required-features = ["integration"]
-
-[[test]]
 name = "jemalloc_probe_tests"
 required-features = ["integration"]
 
