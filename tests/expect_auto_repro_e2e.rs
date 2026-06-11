@@ -137,3 +137,59 @@ fn pos_expect_auto_repro_satisfied_on_forced_fail(ctx: &Ctx) -> Result<AssertRes
 
     Ok(result)
 }
+
+/// The same forced-fail auto-repro inversion as
+/// `pos_expect_auto_repro_satisfied_on_forced_fail`, but at the xAPIC
+/// ceiling: a 256-vCPU (16 LLCs x 16 cores, top APIC ID 255 > 254 ->
+/// split-irqchip) primary VM forces a fail, and the auto-repro VM — ALSO
+/// 256-vCPU — must boot, replay the failing scheduler, and land a
+/// shape-valid `.repro.wprof.pb`, flipping the verdict to PASS. Proves the
+/// auto-repro relaunch + the VM-to-VM `WprofTrace` artifact transport
+/// survive a >255-vCPU repro VM (a second wide-SMP boot + freeze + wprof
+/// capture), the >255 hop neither the boot test nor the snapshot e2e
+/// covers.
+#[ktstr_test(
+    scheduler = KTSTR_SCHED,
+    llcs = 16,
+    cores = 16,
+    threads = 1,
+    no_perf_mode,
+    duration_s = 3,
+    watchdog_timeout_s = 120,
+    wprof,
+    auto_repro = true,
+    expect_auto_repro,
+)]
+fn pos_expect_auto_repro_satisfied_wide_smp(ctx: &Ctx) -> Result<AssertResult> {
+    let total = ctx.topo.total_cpus();
+    anyhow::ensure!(
+        total > 254,
+        "need a >254-vCPU topology to exercise the split-irqchip auto-repro \
+         path (got {total})"
+    );
+    let steps = vec![Step {
+        setup: vec![
+            ctx.cgroup_def("wl")
+                .workers(1)
+                .work_type(WorkType::SpinWait),
+        ]
+        .into(),
+        ops: vec![],
+        hold: HoldSpec::FULL,
+    }];
+    let mut result = execute_steps(ctx, steps)?;
+    let expected_repro_pb = ctx.repro_wprof_pb_path()?;
+    result.record_fail(AssertDetail::new(
+        DetailKind::Other,
+        format!(
+            "forced fail to drive the auto-repro chain at 256 vCPUs — the \
+             verdict MUST invert to PASS via expect_auto_repro. A nextest \
+             FAIL means the >255 auto-repro VM did not boot / replay / land \
+             {repro}; the inversion chain is detailed on the sibling \
+             pos_expect_auto_repro_satisfied_on_forced_fail.",
+            repro = expected_repro_pb.display(),
+        ),
+    ));
+
+    Ok(result)
+}

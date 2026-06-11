@@ -209,3 +209,45 @@ fn principled_active_scheduler_walker_resolves_active_obj(
     );
     Ok(result)
 }
+
+/// Snapshot capture at the xAPIC ceiling: a 256-vCPU (16 LLCs x 16 cores,
+/// top APIC ID 255 > 254 -> split-irqchip / userspace-IOAPIC path) guest
+/// fires `Op::capture_snapshot`, and the host asserts the bridge captured
+/// real BTF-rendered BPF state. Proves the snapshot pipeline works at
+/// >255 vCPUs: the freeze coordinator's rendezvous kicks all 256 vCPU
+/// threads (SIGRTMIN to every AP), the BPF-map walk reads scx-ktstr's
+/// state, and serialization round-trips through SHM — none of which is
+/// otherwise exercised above the 254-APIC-ID split-irqchip boundary.
+#[ktstr_test(
+    scheduler = KTSTR_SCHED,
+    llcs = 16,
+    cores = 16,
+    threads = 1,
+    no_perf_mode,
+    duration_s = 10,
+    watchdog_timeout_s = 60,
+    auto_repro = false,
+    post_vm = assert_bridge_has_real_capture,
+)]
+fn snapshot_real_capture_wide_smp(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
+    if ktstr::test_support::current_binary_is_coverage_instrumented() {
+        return Ok(AssertResult::skip(
+            "coverage-instrumented /init AP-kill — same surface as the \
+             sibling captures; deferred until a non-instrumented init binary",
+        ));
+    }
+    let total = ctx.topo.total_cpus();
+    anyhow::ensure!(
+        total > 254,
+        "need a >254-vCPU topology to exercise the split-irqchip snapshot \
+         path (got {total})"
+    );
+    let steps = vec![Step {
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
+        ops: vec![Op::capture_snapshot("wide_smp")],
+        hold: HoldSpec::FULL,
+    }];
+    let mut result = execute_steps(ctx, steps)?;
+    result.note("256-vCPU Op::capture_snapshot('wide_smp') SHM request succeeded");
+    Ok(result)
+}
