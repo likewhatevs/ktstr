@@ -13,7 +13,7 @@ use std::sync::Arc;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 use super::ioapic::{IOAPIC_BASE, IOAPIC_SIZE, Ioapic, MsiRoute};
-use super::topology::{generate_cpuid, max_apic_id};
+use super::topology::{apic_id, generate_cpuid, max_apic_id};
 use crate::vmm::numa_mem::{NumaMemoryLayout, ReservationGuard};
 use crate::vmm::pi_mutex::PiMutex;
 use crate::vmm::topology::Topology;
@@ -468,10 +468,39 @@ impl KtstrKvm {
                 ),
             }));
         }
+        // The vcpu_id passed below is apic_id(topo, cpu_id), whose sparse
+        // range can exceed the vCPU count; KVM_CREATE_VCPU requires the id be
+        // < KVM_CAP_MAX_VCPU_ID. Skip cleanly if the host's cap is too low,
+        // same class as the max_vcpus check above.
+        // `max_apic_id` is the u32 already bound above for the split-irqchip
+        // decision; reuse it.
+        let max_vcpu_id = kvm.get_max_vcpu_id();
+        if (max_apic_id as usize) >= max_vcpu_id {
+            return Err(anyhow::Error::new(
+                crate::vmm::host_topology::ResourceContention {
+                    reason: format!(
+                        "topology's max APIC ID {max_apic_id} (the KVM vcpu_id) is \
+                         >= this host's KVM_CAP_MAX_VCPU_ID {max_vcpu_id}; cannot \
+                         create a vCPU at that ID"
+                    ),
+                },
+            ));
+        }
         let mut vcpus = Vec::with_capacity(total as usize);
         for cpu_id in 0..total {
-            let vcpu = vm_fd.create_vcpu(cpu_id as u64).map_err(|e| {
-                crate::vmm::map_transient_to_contention(e, format!("create vCPU {cpu_id}"))
+            // vcpu_id = apic_id, not cpu_id: KVM hardwires the in-kernel LAPIC
+            // x2apic_id to vcpu_id (arch/x86/kvm/lapic.c kvm_apic_set_x2apic_id,
+            // read-only), and an MSI/IPI dest plus the guest's read_apic_id()
+            // resolve against it. The CPUID/MADT advertise the sparse apic_id,
+            // so vcpu_id must equal it or sparse APIC IDs are unrouteable. The
+            // vcpus Vec stays indexed by cpu_id (push order); only the KVM
+            // vcpu_id changes (a no-op for dense topologies where apic==cpu_id).
+            let aid = apic_id(&topo, cpu_id);
+            let vcpu = vm_fd.create_vcpu(aid as u64).map_err(|e| {
+                crate::vmm::map_transient_to_contention(
+                    e,
+                    format!("create vCPU cpu_id={cpu_id} apic_id={aid}"),
+                )
             })?;
 
             let cpuid_entries =
