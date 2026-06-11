@@ -933,6 +933,29 @@ fn default_cpu_budget(allowed_cpus: usize) -> usize {
     allowed_cpus.saturating_mul(30).div_ceil(100).max(1)
 }
 
+/// No-perf CPU budget when no explicit `--cpu-cap` (or `cpu_budget` knob) is
+/// set: at least the VM's own vCPU count, clamped to the allowed cpuset.
+///
+/// The rationale is TEST VALIDITY, not boot speed — do not "optimize" this
+/// back to a flat 30%. A scheduler test measures how the GUEST scheduler
+/// places tasks across the guest's CPUs. If the VM's vCPU threads are
+/// oversubscribed on the host (256 vCPUs sharing the 30% default mask is
+/// ~95 pCPUs = 2.7x), the HOST scheduler time-slices them, so guest vCPUs
+/// stall for reasons unrelated to the workload — a host-contention confound
+/// that invalidates the guest-scheduler measurement (the silent-wrong-answer
+/// class the project guards against). Sizing the budget to `>= vcpus` gives
+/// the guest's CPUs real host CPUs, so its scheduler view tracks real
+/// concurrency. (A wide boot also drops ~0.7s as the kernel's parallel AP
+/// bring-up runs unthrottled, but that is incidental.)
+///
+/// Floored at the 30% `default_cpu_budget` so small VMs (vcpus < 30%) keep
+/// the cross-test concurrency headroom; clamped to `allowed_cpus` so it never
+/// exceeds the process cpuset. An explicit cap LOWER than vcpus is the
+/// deliberate opt-in to oversubscribe for contention testing.
+pub(crate) fn no_perf_cpu_budget(allowed_cpus: usize, vm_vcpus: usize) -> usize {
+    default_cpu_budget(allowed_cpus).max(vm_vcpus.min(allowed_cpus))
+}
+
 /// Parsed `--cpu-cap N` value. N is a CPU count: the planner reserves
 /// exactly N host CPUs by walking whole LLCs in contention- /
 /// NUMA-aware order (filtered to the calling process's allowed

@@ -905,13 +905,33 @@ impl KtstrVmBuilder {
                 (None, Vec::new(), None)
             } else if let Ok(host_topo) = host_topology::HostTopology::cached() {
                 let test_topo = crate::topology::TestTopology::from_system()?;
+                // Effective budget: an explicit --cpu-cap / KTSTR_CPU_CAP
+                // wins; otherwise size the budget to the VM's own vCPU count
+                // so a wide VM's boot-time parallel AP bringup is not
+                // throttled by the 30% default mask (the "8 vs 200" boot
+                // oversubscription). Computed here rather than folded into
+                // `cpu_cap` so the bypass-conflict check above still keys on
+                // the *explicit* cap only.
+                let effective_cap = match cpu_cap {
+                    Some(c) => Some(c),
+                    None => {
+                        let allowed = host_topology::host_allowed_cpus().len();
+                        let vcpus = (self.topology.llcs
+                            * self.topology.cores_per_llc
+                            * self.topology.threads_per_core)
+                            as usize;
+                        Some(host_topology::CpuCap::new(
+                            host_topology::no_perf_cpu_budget(allowed, vcpus),
+                        )?)
+                    }
+                };
                 // Compute the plan and immediately drop the flocks:
                 // we want the plan SHAPE on KtstrVm but not the
                 // RAII fds. `run()` re-takes fresh `LOCK_SH` on
                 // `plan.locked_llcs` via `acquire_resource_locks`
                 // just before vCPU spawn so the build-to-run
                 // setup window holds no flocks.
-                let mut plan = host_topology::acquire_llc_plan(&host_topo, &test_topo, cpu_cap)?;
+                let mut plan = host_topology::acquire_llc_plan(&host_topo, &test_topo, effective_cap)?;
                 host_topology::warn_if_cross_node_spill(&plan, &host_topo);
                 // Strip the flock fds — they release on drop. The
                 // plan's `cpus` / `locked_llcs` / `mems` fields
