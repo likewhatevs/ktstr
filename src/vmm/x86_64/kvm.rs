@@ -409,6 +409,44 @@ impl KtstrKvm {
             .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
             .context("get_supported_cpuid")?;
 
+        // Reject (rather than silently truncate) a VM whose RAM relocates
+        // above the guest's addressable physical space. generate_cpuid leaves
+        // CPUID leaf 0x8000_0008 EAX = the host's MAXPHYADDR (it patches only
+        // ECX), so the guest's phys-addr width is the host's. If the relocated
+        // RAM top exceeds 1<<phys_bits, the guest kernel silently caps
+        // last_pfn at max_arch_pfn (e820__end_ram_pfn) and boots with less RAM
+        // than advertised — a silent data drop. Surface it as a
+        // host-capability skip, same class as the max_vcpus check below.
+        //
+        // Reference note: qemu likewise rejects (its phys-bits-too-low
+        // hard-fail), never truncates. cloud-hypervisor instead caps the
+        // guest MAXPHYADDR at 46 and sizes the layout from it (migration
+        // portability); ktstr has no migration, so it exposes the host's
+        // MAXPHYADDR and rejects. libkrun and firecracker also leave the
+        // host's MAXPHYADDR but lack this RAM bound, so the check is a
+        // correct superset. Bounds the RAM top only; widen to max(RAM, MMIO)
+        // top if a high MMIO window above RAM is ever added.
+        if let Some(layout) = &numa_layout {
+            let phys_bits = base_cpuid
+                .as_slice()
+                .iter()
+                .find(|e| e.function == 0x8000_0008)
+                .map(|e| e.eax & 0xff)
+                .unwrap_or(36);
+            if let Some(top) = layout.ram_top_exceeds_phys_bits(phys_bits) {
+                return Err(anyhow::Error::new(
+                    crate::vmm::host_topology::ResourceContention {
+                        reason: format!(
+                            "guest RAM top {top:#x} exceeds the guest MAXPHYADDR \
+                             (1<<{phys_bits}); this host's physical-address \
+                             width cannot back a VM this large without the guest \
+                             silently truncating RAM"
+                        ),
+                    },
+                ));
+            }
+        }
+
         // Create vCPUs with topology-specific CPUID. KVM_CREATE_VCPU
         // allocates per-vCPU kernel memory (struct kvm_vcpu, kvm_run
         // page, posted-interrupt descriptor); EMFILE / ENOMEM here is

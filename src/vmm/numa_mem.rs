@@ -217,6 +217,33 @@ impl NumaMemoryLayout {
         self.regions[0].gpa_start
     }
 
+    /// Highest GPA backed by RAM (one past the last byte). Robust to
+    /// region ordering — takes the max over all regions rather than
+    /// assuming `regions` is GPA-sorted.
+    pub fn top_gpa(&self) -> u64 {
+        self.regions
+            .iter()
+            .map(|r| r.gpa_start + r.size)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// If the relocated RAM top exceeds the guest's addressable physical
+    /// space (`1 << phys_bits`), return that top GPA; otherwise `None`.
+    /// Without rejecting this, RAM above the guest MAXPHYADDR is SILENTLY
+    /// truncated by the guest kernel (e820__end_ram_pfn caps last_pfn at
+    /// max_arch_pfn), so the guest boots with less RAM than advertised.
+    /// `phys_bits >= 64` means no limit (the full u64 GPA space).
+    pub fn ram_top_exceeds_phys_bits(&self, phys_bits: u32) -> Option<u64> {
+        let limit = if phys_bits >= 64 {
+            u64::MAX
+        } else {
+            1u64 << phys_bits
+        };
+        let top = self.top_gpa();
+        (top > limit).then_some(top)
+    }
+
     /// Test helper — GPA immediately after the last node's memory.
     #[cfg(test)]
     pub fn end_gpa(&self) -> u64 {
@@ -842,6 +869,31 @@ mod tests {
         }
         assert!(layout.region_for_gpa(0xC000_0000).is_none());
         assert!(layout.region_for_gpa(0xFEC0_0000).is_none());
+    }
+
+    #[test]
+    fn ram_top_exceeds_phys_bits_rejects_above_maxphyaddr() {
+        // 8 GiB single node on x86 relocates above the 4 GiB MMIO gap -> top
+        // GPA ~9 GiB. A 33-bit guest MAXPHYADDR (8 GiB) is exceeded -> must
+        // reject (else the guest silently truncates RAM); a 40-bit one
+        // (1 TiB) is not; >=64 means no limit.
+        let topo = Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let layout = NumaMemoryLayout::compute(&topo, 8192, 0, X86_GAP).unwrap();
+        let top = layout.top_gpa();
+        assert!(
+            top > (1u64 << 33),
+            "8 GiB relocated above the gap should exceed 1<<33: {top:#x}"
+        );
+        assert_eq!(layout.ram_top_exceeds_phys_bits(33), Some(top));
+        assert_eq!(layout.ram_top_exceeds_phys_bits(40), None);
+        assert_eq!(layout.ram_top_exceeds_phys_bits(64), None);
     }
 
     #[test]
