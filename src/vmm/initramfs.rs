@@ -139,6 +139,39 @@ fn resolve_shared_libs_with_extra_interp_hints(
     resolve_shared_libs_inner(binary, extra_interp_hints)
 }
 
+/// Resolve a non-standard interpreter's *own* shared-library dependencies.
+///
+/// A standard system linker (glibc/musl `ld.so`) is statically linked with no
+/// deps, so this returns an empty set for it (`is_standard_interpreter`). A
+/// custom-toolchain linker can instead be dynamically linked with its own
+/// `libA -> libB` chain alongside it; `build_initramfs_base` packs that chain
+/// into the base and `BaseKey::hash_shared_libs` hashes it, so both go through
+/// this one helper and the cache key covers exactly the set the base packs.
+///
+/// Seeds the BFS with the linker's parent and sibling lib dirs (the linker has
+/// no PT_INTERP of its own, so the auto-derived hint set would be empty) so the
+/// linker's toolchain-local deps resolve against the same dirs the parent
+/// binary's resolution used.
+pub(crate) fn resolve_interpreter_deps(interp: &str) -> Result<SharedLibs> {
+    if is_standard_interpreter(interp) {
+        return Ok(SharedLibs {
+            found: vec![],
+            missing: vec![],
+            interpreter: None,
+        });
+    }
+    let interp_path = Path::new(interp);
+    let mut interp_hints: Vec<PathBuf> = Vec::new();
+    if let Some(parent) = interp_path.parent() {
+        interp_hints.push(parent.to_path_buf());
+        if let Some(grandparent) = parent.parent() {
+            interp_hints.push(grandparent.join("lib"));
+            interp_hints.push(grandparent.join("lib64"));
+        }
+    }
+    resolve_shared_libs_with_extra_interp_hints(interp_path, &interp_hints)
+}
+
 #[tracing::instrument(skip_all, fields(binary = %binary.display(), extra_hints = extra_interp_hints.len()))]
 fn resolve_shared_libs_inner(binary: &Path, extra_interp_hints: &[PathBuf]) -> Result<SharedLibs> {
     // Cache results by canonical path AND extra-hint set — avoids
@@ -850,32 +883,18 @@ pub fn build_initramfs_base(
                     tracing::debug!("interpreter original path matches canonical, no alias needed");
                 }
 
-                // Non-standard interpreters may have their own shared lib
-                // deps (custom toolchain linkers alongside their libs).
-                // The linker has no PT_INTERP itself, so calling
-                // resolve_shared_libs without extra hints would BFS its
-                // DT_NEEDED only against system search paths and miss
-                // toolchain-local libs (and their transitive deps). Feed
-                // the linker's parent and sibling lib dirs in as extra
-                // interp-relative hints so the linker's own libA→libB
-                // chain is discovered against the same toolchain dirs
-                // the parent binary's BFS already used.
-                if !is_standard_interpreter(interp) {
-                    let mut interp_hints: Vec<PathBuf> = Vec::new();
-                    if let Some(parent) = interp_path.parent() {
-                        interp_hints.push(parent.to_path_buf());
-                        if let Some(grandparent) = parent.parent() {
-                            interp_hints.push(grandparent.join("lib"));
-                            interp_hints.push(grandparent.join("lib64"));
-                        }
-                    }
-                    if let Ok(interp_result) =
-                        resolve_shared_libs_with_extra_interp_hints(interp_path, &interp_hints)
-                    {
-                        for (g, h) in interp_result.found {
-                            register_parent_dirs(&mut dirs, &g);
-                            shared_libs.push((g, h));
-                        }
+                // A non-standard interpreter (custom toolchain linker) can
+                // itself be dynamically linked with its own libA->libB chain
+                // alongside it; resolve_interpreter_deps walks that chain
+                // (seeding the linker's parent + sibling lib dirs, since the
+                // linker has no PT_INTERP of its own) and returns empty for a
+                // standard, statically-linked ld.so. The cache key hashes the
+                // same set (BaseKey::hash_shared_libs) so an interp-dep change
+                // invalidates the base.
+                if let Ok(interp_result) = resolve_interpreter_deps(interp) {
+                    for (g, h) in interp_result.found {
+                        register_parent_dirs(&mut dirs, &g);
+                        shared_libs.push((g, h));
                     }
                 }
             }

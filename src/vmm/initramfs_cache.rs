@@ -297,6 +297,9 @@ impl BaseKey {
     /// the cache key changes when any shared lib is updated on the host.
     fn hash_shared_libs(binary: &Path, hasher: &mut AHasher) {
         if let Ok(result) = initramfs::resolve_shared_libs(binary) {
+            // The payload's DT_NEEDED closure; the interp's own deps (below)
+            // are folded in before the single sorted hash pass.
+            let mut entries: Vec<_> = result.found.iter().map(|(_, p)| p.clone()).collect();
             // The PT_INTERP (dynamic linker) is packed into the base by
             // build_initramfs_base but is NOT a DT_NEEDED entry, so it's
             // absent from `found`. Hash its path + content: the base
@@ -308,8 +311,16 @@ impl BaseKey {
                 if let Ok(sample) = hash_file(Path::new(interp)) {
                     sample.hash(hasher);
                 }
+                // A non-standard interp (custom toolchain linker) can itself
+                // be dynamically linked; build_initramfs_base packs its own
+                // dep chain, so fold those host paths into the hashed set too
+                // — else an interp-dep change (interp binary unchanged) would
+                // serve a stale base. resolve_interpreter_deps is the same
+                // resolution the base packer uses (empty for a standard ld.so).
+                if let Ok(interp_deps) = initramfs::resolve_interpreter_deps(interp) {
+                    entries.extend(interp_deps.found.into_iter().map(|(_, p)| p));
+                }
             }
-            let mut entries: Vec<_> = result.found.iter().map(|(_, p)| p.clone()).collect();
             entries.sort();
             for p in &entries {
                 // `to_str()` loses every non-UTF-8 path (Linux

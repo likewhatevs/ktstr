@@ -574,6 +574,53 @@ fn resolve_shared_libs_dynamic_binary() {
 }
 
 #[test]
+fn resolve_interpreter_deps_walks_nonstandard_interp_deps() {
+    // The cache key (BaseKey::hash_shared_libs) and the base packer
+    // (build_initramfs_base) both fold a non-standard interpreter's OWN
+    // shared-lib deps in via resolve_interpreter_deps. A standard ld.so is
+    // statically linked (no deps) and must resolve to an EMPTY set so the
+    // common case adds nothing. A custom-toolchain linker can itself be
+    // dynamically linked; its dep chain must be resolved so the base packs
+    // it and the key hashes it (else an interp-dep change serves a stale
+    // base). Model the non-standard interp with a copy of a real dynamic
+    // binary at a non-standard path — it presents a DT_NEEDED chain (libc)
+    // exactly like a toolchain linker would.
+    let sh = Path::new("/bin/sh");
+    if !sh.exists() || !is_elf(sh) {
+        skip!("/bin/sh not an ELF");
+    }
+    let sh_libs = resolve_shared_libs(sh).unwrap();
+    if sh_libs.found.is_empty() {
+        skip!("/bin/sh statically linked on this host");
+    }
+
+    // The host's own (standard) ld.so is statically linked, so its dep set
+    // is empty — the common case adds nothing to the hashed set.
+    if let Some(std_interp) = &sh_libs.interpreter {
+        let deps = resolve_interpreter_deps(std_interp).unwrap();
+        assert!(
+            deps.found.is_empty(),
+            "standard interp {std_interp} (statically linked) must resolve to \
+             no deps, got {:?}",
+            deps.found
+        );
+    }
+
+    // A non-standard interp (a copy of the dynamic /bin/sh at a
+    // toolchain-like path) -> its own DT_NEEDED chain is walked.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fake_ld = tmp.path().join("ld-fake-toolchain.so");
+    std::fs::copy(sh, &fake_ld).unwrap();
+    let deps = resolve_interpreter_deps(fake_ld.to_str().unwrap()).unwrap();
+    assert!(
+        deps.found.iter().any(|(g, _)| g.contains("libc")),
+        "a non-standard interpreter's own deps (libc) must be resolved so the \
+         base packs them and the cache key hashes them; got {:?}",
+        deps.found
+    );
+}
+
+#[test]
 fn elf_dynamic_needed_extracts_sonames() {
     let sh = Path::new("/bin/sh");
     if !sh.exists() || !is_elf(sh) {
