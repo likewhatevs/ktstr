@@ -10723,49 +10723,17 @@ impl KtstrVm {
                     let _ = kern_phys_base_evt.write(1);
                 }
 
-                // Virt-KASLR offset published by either the BSP
-                // MSR_LSTAR readback
-                // (`src/vmm/x86_64/msr_kaslr::read_and_derive`
-                // invoked from `run_bsp_loop`) or the guest-channel
-                // KERN_ADDRS handler
-                // (`src/vmm/freeze_coord/dispatch.rs`'s KERN_ADDRS
-                // arm). Both writers CAS-publish the SAME offset
-                // (KASLR is a single boot-time slot pick) into
-                // `kern_virt_kaslr_shared` with `+1` bias; first
-                // writer wins, second observes the existing value
-                // via CAS-fail and is a no-op. By the time this
-                // line executes the sys_rdy wait above has already
-                // returned, so the guest has run far past
-                // `setup_per_cpu_areas` + `idt_syscall_init` and at
-                // least one of the two publishers has typically
-                // observed a non-zero value. The 0 sentinel below
-                // matches the nokaslr state — added per-test via
-                // `#[ktstr_test(kaslr = false)]` or
-                // `Scheduler::kargs(&["nokaslr"])`; absent on the
-                // default KASLR-on path. When the cmdline pinned
-                // KASLR off, neither publisher produces a non-zero
-                // offset because the kernel ran with
-                // `nokaslr` and disabled the slide at boot — the
-                // consumer uses a literal 0 and the per-CPU
-                // template arithmetic in
-                // `monitor::symbols::per_cpu_kva` lands on the
-                // compile-time base.
-                let kaslr_offset: u64 = kern_virt_kaslr_shared
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    .saturating_sub(1);
-                // `saturating_sub(1)` folds the `+1` bias:
-                //   stored == 0 (no publisher fired)    → 0
-                //   stored == 1 (KASLR off, offset=0)   → 0
-                //   stored == N (offset N-1)            → N-1
-                // The two 0 cases collapse to the same observable
-                // behaviour: the per-CPU template arithmetic in
-                // `monitor::symbols::per_cpu_kva` lands on the
-                // compile-time base, which is correct for both
-                // "KASLR off" and "no publisher yet" — the latter
-                // is rare (sys_rdy already fired) and the worst
-                // outcome is a single early sample reading a
-                // pre-KASLR PA that fails the BSS-zero gate in
-                // `monitor::reader`.
+                // The KASLR slide is published into `kern_virt_kaslr_shared`
+                // (`+1`-biased) by the BSP MSR_LSTAR readback
+                // (`src/vmm/x86_64/msr_kaslr::read_and_derive`, x86_64-only)
+                // or the guest-channel KERN_ADDRS handler
+                // (`src/vmm/freeze_coord/dispatch.rs`, both arches). It is
+                // NOT snapshotted here: the monitor re-reads the Arc every
+                // sample iteration via `RqRefresh::kaslr_offset` (the clone
+                // below). A once-captured value would be 0 — mis-sliding
+                // every per-CPU KVA for the run — whenever the monitor's
+                // sys_rdy wait resolves via timeout before the (single,
+                // no-retry on aarch64) publisher fires.
 
                 // Kill check between sys_rdy wait and the long-tail
                 // setup work below (page-table walks, watchdog override
@@ -10951,7 +10919,7 @@ impl KtstrVm {
                 let rq_refresh = monitor::reader::RqRefresh {
                     pco_pa,
                     runqueues_kva: symbols.runqueues,
-                    kaslr_offset,
+                    kaslr_offset: kern_virt_kaslr_shared.clone(),
                     num_cpus,
                     page_offset_base_pa,
                     event: event_refresh,

@@ -1826,19 +1826,26 @@ pub(crate) struct RqRefresh {
     /// CPU's offset to compute the per-CPU rq KVA, then reduced
     /// to a PA via [`super::symbols::kva_to_pa`].
     pub runqueues_kva: u64,
-    /// Virtual KASLR slide for the per-CPU walker. Sourced from
-    /// the shared `kern_virt_kaslr` Arc populated by either the
-    /// BSP MSR_LSTAR derive
-    /// (`crate::vmm::x86_64::msr_kaslr::read_and_derive`,
-    /// x86_64-only) or the guest-channel KERN_ADDRS `_text`
-    /// subtraction
+    /// Shared `+1`-biased KASLR-slide Arc (`kern_virt_kaslr`),
+    /// **re-read every sample iteration** by [`monitor_loop`]
+    /// (consumer applies `.load(Acquire).saturating_sub(1)`).
+    /// Published by either the BSP MSR_LSTAR derive
+    /// (`crate::vmm::x86_64::msr_kaslr::read_and_derive`, x86_64-only)
+    /// or the guest-channel KERN_ADDRS `_text` subtraction
     /// (`crate::vmm::freeze_coord::dispatch::dispatch_bulk_message`,
-    /// both arches). The monitor thread loads the Arc once per
-    /// `RqRefresh` construction (after sys_rdy fires, so both
-    /// publishers have had time to populate); 0 fallback matches
-    /// KASLR-off / nokaslr-karg semantics and collapses
-    /// [`super::symbols::per_cpu_kva`] to the no-slide formula.
-    pub kaslr_offset: u64,
+    /// both arches). Re-reading per-iteration (rather than
+    /// snapshotting at construction) is required because on aarch64
+    /// the slide has a single publisher with no retry, and the
+    /// monitor's pre-sample sys_rdy wait can resolve via its timeout
+    /// before that publisher fires — a once-captured `0` would then
+    /// mis-slide every per-CPU KVA for the whole run (out-of-DRAM PAs
+    /// → silent-zero reads). The raw value distinguishes "no publisher
+    /// yet" (0) from "published, KASLR-off" (1); after the bias fold
+    /// both collapse to the no-slide formula in
+    /// [`super::symbols::per_cpu_kva`], while the `data_valid` latch
+    /// gates on the raw value being non-zero so a pre-publish sample
+    /// never latches garbage PAs.
+    pub kaslr_offset: std::sync::Arc<AtomicU64>,
     /// Number of CPUs (entries to read from `__per_cpu_offset[]`).
     pub num_cpus: u32,
     /// PA of the `page_offset_base` symbol (text-mapped). When
@@ -2542,25 +2549,42 @@ pub(crate) fn monitor_loop(
             // arch-specific PAGE_OFFSET hardcoding (which would
             // wrongly reject valid arm64 VA_BITS=47 values when the
             // gate uses the VA_BITS=48 fallback).
+            // Per-iteration KASLR-slide re-read. The slide Arc may be
+            // unpublished (raw 0) when `RqRefresh` is built (the
+            // monitor's pre-sample sys_rdy wait can resolve via its
+            // timeout before the single, no-retry aarch64 publisher
+            // fires), so a once-captured value would mis-slide every
+            // per-CPU KVA for the run. Re-read it here, alongside the
+            // `__per_cpu_offset[]` refresh, so the first post-publish
+            // sample computes correct PAs.
+            let kaslr_raw = refresh.kaslr_offset.load(Ordering::Acquire);
+            let kaslr_live = kaslr_raw.saturating_sub(1);
+            // Gate the latch on the slide being published (raw != 0:
+            // N>=2 is a real offset, 1 is the biased KASLR-off/nokaslr
+            // case, 0 is "no publisher yet"). Without this the latch
+            // could fire on a pre-publish sample whose rq PAs are
+            // garbage (valid per-CPU offsets but a zero slide).
             if !data_valid
                 && page_offset_resolved
+                && kaslr_raw != 0
                 && !fresh.is_empty()
                 && fresh.iter().all(|&v| v & (1u64 << 63) != 0)
             {
                 data_valid = true;
                 latched_page_offset = page_offset;
                 eprintln!(
-                    "DATA_VALID latched at iter={} page_offset={:#x} pco0={:#x}",
+                    "DATA_VALID latched at iter={} page_offset={:#x} pco0={:#x} kaslr={:#x}",
                     diag_iter,
                     page_offset,
                     fresh.first().copied().unwrap_or(0),
+                    kaslr_live,
                 );
             }
             rq_pas_buf = super::symbols::compute_rq_pas(
                 refresh.runqueues_kva,
                 &fresh,
                 page_offset,
-                refresh.kaslr_offset,
+                kaslr_live,
             );
             // `event_pcpu_pas` requires both fresh `__per_cpu_offset[]`
             // AND a non-null `*scx_root` (a scheduler must be
@@ -2846,7 +2870,7 @@ pub(crate) fn monitor_loop(
             pco1 = fresh.get(1).copied().unwrap_or(0),
             rq = refresh.runqueues_kva,
             ms = mem.size(),
-            ko = refresh.kaslr_offset,
+            ko = refresh.kaslr_offset.load(Ordering::Acquire).saturating_sub(1),
             rq0 = rq_pas_buf.first().copied().unwrap_or(0),
         );
         if let Some(&rq0_pa) = rq_pas_buf.first() {
@@ -3632,7 +3656,10 @@ mod tests {
             num_cpus: 2,
             page_offset_base_pa: None,
             event: None,
-            kaslr_offset: 0,
+            // Biased 1 = "published, KASLR-off" (slide 0): non-zero so the
+            // data_valid latch fires, while saturating_sub(1) keeps the
+            // no-slide formula this test's PAs rely on.
+            kaslr_offset: std::sync::Arc::new(AtomicU64::new(1)),
         };
 
         let handle = {
@@ -3666,6 +3693,122 @@ mod tests {
         assert_eq!(samples[0].cpus[0].nr_running, 11);
         assert_eq!(samples[0].cpus[1].rq_clock, 8888);
         assert_eq!(samples[0].cpus[1].nr_running, 22);
+    }
+
+    /// Regression: the monitor must RE-READ the KASLR-slide Arc each
+    /// iteration, not snapshot it at `RqRefresh` construction. On aarch64
+    /// the slide has a single no-retry publisher, and the monitor's
+    /// pre-sample sys_rdy wait can resolve via timeout before it fires —
+    /// a once-captured `0` then mis-slides every per-CPU KVA for the run.
+    ///
+    /// Layout makes the slide load-bearing (unlike the suppressed-slide
+    /// tests above): `runqueues_kva` is high-half so `per_cpu_kva` applies
+    /// the slide, and `pco[i] = rq_pa[i] - SLIDE`, so the rq PA
+    /// `= slide + pco[i]` lands on the rq buffer (`= rq_pa[i]`) ONLY when
+    /// the live slide equals `SLIDE`; with the unpublished slide (`0`) it
+    /// lands off-buffer (silent-zero). The Arc starts unpublished (raw 0):
+    /// early samples must show the `data_valid` gate held (cpus empty);
+    /// after a helper publishes `SLIDE` (biased `SLIDE+1`), a later sample
+    /// must observe the planted rq_clock. A regression to snapshotting the
+    /// Arc keeps the slide at 0 forever → the late sample never populates →
+    /// the `expect` below fails deterministically (no boot timing, no arch
+    /// dependence — pure host-side mock).
+    #[test]
+    fn monitor_loop_rq_refresh_rereads_kaslr_slide() {
+        const KERNEL_HALF: u64 = 1u64 << 63;
+        const SLIDE: u64 = 0x1000;
+        let offsets = test_offsets();
+        let pco_size: u64 = 16; // 2 CPUs * 8 bytes
+        let rq0_buf = make_rq_buffer(&offsets, 11, 1, 1, 7777, 0);
+        let rq1_buf = make_rq_buffer(&offsets, 22, 2, 2, 8888, 0);
+        let rq0_pa = pco_size;
+        let rq1_pa = pco_size + rq0_buf.len() as u64;
+        // pco[i] = rq_pa[i] - SLIDE: with runqueues_kva = KERNEL_HALF and
+        // page_offset = KERNEL_HALF, the rq PA reduces to `slide + pco[i]`,
+        // which is rq_pa[i] when slide == SLIDE and off-buffer when slide
+        // == 0. The wrapping sub yields a bit-63-set offset so the
+        // data_valid bit-63 gate's precondition holds.
+        let pco0 = rq0_pa.wrapping_sub(SLIDE);
+        let pco1 = rq1_pa.wrapping_sub(SLIDE);
+        assert!(
+            pco0 & KERNEL_HALF != 0 && pco1 & KERNEL_HALF != 0,
+            "test layout invariant: per-CPU offsets must have bit 63 set"
+        );
+
+        let mut combined = vec![0u8; pco_size as usize];
+        combined[0..8].copy_from_slice(&pco0.to_ne_bytes());
+        combined[8..16].copy_from_slice(&pco1.to_ne_bytes());
+        combined.extend_from_slice(&rq0_buf);
+        combined.extend_from_slice(&rq1_buf);
+
+        // SAFETY: combined is a live local buffer outliving the GuestMem use.
+        let mem = unsafe { GuestMem::new(combined.as_ptr() as *mut u8, combined.len() as u64) };
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
+
+        let kaslr = std::sync::Arc::new(AtomicU64::new(0)); // unpublished
+        let refresh = RqRefresh {
+            pco_pa: 0,
+            runqueues_kva: KERNEL_HALF, // high-half → per_cpu_kva applies the slide
+            num_cpus: 2,
+            page_offset_base_pa: None,
+            event: None,
+            kaslr_offset: std::sync::Arc::clone(&kaslr),
+        };
+
+        // Publish the slide partway through the run (+1 bias).
+        let publisher = {
+            let kaslr = std::sync::Arc::clone(&kaslr);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(40));
+                kaslr.store(SLIDE + 1, Ordering::Release);
+            })
+        };
+        let stopper = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(120));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let cfg = MonitorConfig {
+            rq_refresh: Some(&refresh),
+            page_offset: KERNEL_HALF,
+            ..test_config()
+        };
+        let MonitorLoopResult { samples, .. } = monitor_loop(
+            &mem,
+            &[],
+            &offsets,
+            Duration::from_millis(10),
+            &kill,
+            &kill_evt,
+            Instant::now(),
+            &cfg,
+        );
+        publisher.join().unwrap();
+        stopper.join().unwrap();
+
+        // Pre-publish: the gate must have held (raw 0 → not latched).
+        assert!(
+            samples.iter().any(|s| s.cpus.is_empty()),
+            "expected at least one pre-publish sample with the data_valid gate held"
+        );
+        // Post-publish: a later sample must observe the planted rq_clock,
+        // proving the loop re-read the Arc and recomputed PAs with the live
+        // slide. A snapshot would keep slide 0 → off-buffer → empty forever.
+        let s = samples
+            .iter()
+            .rev()
+            .find(|s| !s.cpus.is_empty())
+            .expect(
+                "no sample observed the published slide — the monitor snapshotted \
+                 kaslr_offset instead of re-reading it per iteration",
+            );
+        assert_eq!(s.cpus.len(), 2);
+        assert_eq!(s.cpus[0].rq_clock, 7777);
+        assert_eq!(s.cpus[1].rq_clock, 8888);
     }
 
     /// Boot-race regression test. Same layout as the refresh test, but
@@ -3703,7 +3846,10 @@ mod tests {
             num_cpus: 2,
             page_offset_base_pa: None,
             event: None,
-            kaslr_offset: 0,
+            // Raw 0 = "no publisher yet": stays unlatched (this test
+            // asserts cpus stays empty; the all-zero offset table also
+            // fails the bit-63 gate, so the outcome is unchanged).
+            kaslr_offset: std::sync::Arc::new(AtomicU64::new(0)),
         };
 
         let handle = {
