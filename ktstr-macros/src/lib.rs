@@ -5305,7 +5305,11 @@ mod tests {
     /// `#[ktstr_test(expect_auto_repro)]` (bare form) emits
     /// `expect_auto_repro: true` as a field on the
     /// `KtstrTestEntry` struct literal. Pins the bare-flag arm of
-    /// the macro's bool-slot parser.
+    /// the macro's bool-slot parser. Gated on the `wprof` feature: the
+    /// attr pairs `wprof` with `expect_auto_repro` (the latter requires the
+    /// former), and the macro only accepts `wprof` when the feature is on —
+    /// so this case can only parse successfully under `--features wprof`.
+    #[cfg(feature = "wprof")]
     #[test]
     fn macro_parses_expect_auto_repro_bare_to_true() {
         let attr = quote! { scheduler = SCHED, wprof, expect_auto_repro };
@@ -5323,7 +5327,10 @@ mod tests {
     }
 
     /// `#[ktstr_test(expect_auto_repro = true)]` emits
-    /// `expect_auto_repro: true`. Pins the explicit-true arm.
+    /// `expect_auto_repro: true`. Pins the explicit-true arm. Gated on the
+    /// `wprof` feature (the attr requires `wprof`, accepted only with the
+    /// feature on).
+    #[cfg(feature = "wprof")]
     #[test]
     fn macro_parses_expect_auto_repro_explicit_true() {
         let attr = quote! { scheduler = SCHED, wprof, expect_auto_repro = true };

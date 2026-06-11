@@ -72,6 +72,16 @@ test kernel extra-features="":
 compile-fail:
     KTSTR_SKIP_WPROF_BUILD=1 cargo nextest run --profile ci --features wprof -E 'binary(compile_fail) & test(=compile_fail)' --run-ignored all
 
+# Run the ktstr-macros proc-macro crate's host unit tests (attr parsing,
+# codegen, cross-attr validation). cargo-ktstr's VM test runner only
+# discovers the main ktstr crate's #[ktstr_test] binaries, NOT this
+# proc-macro crate, so without an explicit run these never execute in CI.
+# `--features wprof` (ktstr-macros's own feature — a pure cfg, no blob
+# build) so the wprof-gated expect_auto_repro parse tests run too; the
+# feature-agnostic tests run regardless.
+test-macros:
+    cargo nextest run -p ktstr-macros --features wprof
+
 # Verify ktstr stays out of a downstream consumer's release binary.
 # Thin wrapper over the `scripts::devdep-isolation` rust-script recipe
 # (see scripts.just): it builds the dev-dep fixture and asserts
