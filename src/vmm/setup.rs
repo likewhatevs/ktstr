@@ -1624,7 +1624,12 @@ impl KtstrVm {
         // the earliest boot stage. Without it, stdout-path auto-detection
         // is the only path to early output — and that can fail silently
         // if the FDT node isn't matched by OF_EARLYCON_DECLARE.
-        cmdline.push_str(" earlycon=uart,mmio,0x09000000");
+        // earlycon base is derived from SERIAL_MMIO_BASE so it tracks the
+        // device-window placement (aarch64/kvm.rs) and can never drift.
+        cmdline.push_str(&format!(
+            " earlycon=uart,mmio,{:#x}",
+            aarch64::kvm::SERIAL_MMIO_BASE
+        ));
         let verbose = std::env::var(crate::KTSTR_VERBOSE_ENV)
             .map(|v| v == "1")
             .unwrap_or(false)

@@ -35,8 +35,27 @@ pub(crate) const GIC_REDIST_BASE: u64 = GIC_DIST_BASE + GIC_DIST_SIZE;
 /// Size per redistributor: 128 KB (RD_base + SGI_base).
 pub(crate) const GIC_REDIST_SIZE_PER_CPU: u64 = 0x2_0000;
 
-/// ns16550a serial MMIO base address. SPI 33.
-pub(crate) const SERIAL_MMIO_BASE: u64 = 0x0900_0000;
+/// Maximum vCPUs the VMM places GIC redistributors for. Pinned to the
+/// guest kernel's CONFIG_NR_CPUS (ktstr.kconfig) — the guest brings up
+/// at most this many CPUs, so the redistributor region never needs to
+/// hold more than this.
+pub(crate) const MAX_VCPUS: u32 = 512;
+
+/// Worst-case end of the redistributor region: MAX_VCPUS redistributors
+/// from GIC_REDIST_BASE. The device MMIO window starts here so the
+/// redistributor (sized to the actual vCPU count, <= MAX_VCPUS) can
+/// never grow into a device region.
+pub(crate) const GIC_REDIST_MAX_END: u64 =
+    GIC_REDIST_BASE + MAX_VCPUS as u64 * GIC_REDIST_SIZE_PER_CPU;
+
+/// ns16550a serial MMIO base address. SPI 33. Placed at GIC_REDIST_MAX_END
+/// (above the worst-case redistributor region), NOT just below DRAM: the
+/// GICv3 redistributor grows from GIC_REDIST_BASE with vCPU count, and a
+/// redistributor frame landing on a device page would shadow that device
+/// (KVM's in-kernel vGIC claims the GPA on the MMIO bus, so the guest's
+/// accesses never reach the userspace device). All other device bases are
+/// chained off this one, so they relocate with it.
+pub(crate) const SERIAL_MMIO_BASE: u64 = GIC_REDIST_MAX_END;
 
 /// ns16550a serial MMIO size: one 4 KB page covering the 8-byte register
 /// window. KVM/OS accesses are 4-byte aligned; the page-sized region
@@ -394,11 +413,14 @@ impl KtstrKvm {
         let redist_addr: u64 = GIC_REDIST_BASE;
         let redist_size = num_cpus as u64 * GIC_REDIST_SIZE_PER_CPU;
         anyhow::ensure!(
-            GIC_REDIST_BASE + redist_size <= DRAM_START,
-            "GIC redistributor region (ends at {:#x}) overlaps DRAM at {:#x} for {} CPUs",
+            GIC_REDIST_BASE + redist_size <= SERIAL_MMIO_BASE,
+            "GIC redistributor region (ends at {:#x}) overlaps the device MMIO \
+             window at {:#x} for {} CPUs (max {}); a redistributor frame on a \
+             device page would shadow that device",
             GIC_REDIST_BASE + redist_size,
-            DRAM_START,
+            SERIAL_MMIO_BASE,
             num_cpus,
+            MAX_VCPUS,
         );
         let redist_attr = kvm_device_attr {
             group: KVM_DEV_ARM_VGIC_GRP_ADDR,
@@ -660,12 +682,18 @@ mod tests {
     }
 
     #[test]
-    fn gic_redist_does_not_overlap_dram() {
-        // Maximum vCPUs that fit: (DRAM_START - GIC_REDIST_BASE) / GIC_REDIST_SIZE_PER_CPU
-        let max_cpus = (DRAM_START - GIC_REDIST_BASE) / GIC_REDIST_SIZE_PER_CPU;
+    fn gic_redist_fits_max_vcpus_below_devices() {
+        // The redistributor region grows from GIC_REDIST_BASE with vCPU
+        // count; the first obstacle above it is the device MMIO window at
+        // SERIAL_MMIO_BASE (NOT DRAM_START, far above — bounding there was
+        // the original bug: the redist could grow through serial/virtio).
+        // Real capacity is bounded at the device window and must cover
+        // MAX_VCPUS redistributors.
+        let max_cpus = (SERIAL_MMIO_BASE - GIC_REDIST_BASE) / GIC_REDIST_SIZE_PER_CPU;
         assert!(
-            max_cpus >= 128,
-            "layout should support at least 128 vCPUs, got {max_cpus}"
+            max_cpus >= MAX_VCPUS as u64,
+            "device window must sit above MAX_VCPUS={} redistributors; fits only {max_cpus}",
+            MAX_VCPUS
         );
     }
 
@@ -686,6 +714,11 @@ mod tests {
         const { assert!(VIRTIO_BLK_MMIO_BASE + crate::vmm::virtio_blk::VIRTIO_MMIO_SIZE <= DRAM_START) };
         const { assert!(VIRTIO_NET_MMIO_BASE < DRAM_START) };
         const { assert!(VIRTIO_NET_MMIO_BASE + crate::vmm::virtio_net::VIRTIO_MMIO_SIZE <= DRAM_START) };
+        // The redistributor region for MAX_VCPUS vCPUs must end at or below
+        // the device window, so no redistributor frame can shadow a device.
+        // SERIAL_MMIO_BASE = GIC_REDIST_MAX_END by construction; this guard
+        // catches a future literal base set below the redistributor max.
+        const { assert!(SERIAL_MMIO_BASE >= GIC_REDIST_MAX_END) };
     }
 
     /// PMU_PPI must reside in the GIC PPI namespace (0..15). Values

@@ -1825,8 +1825,8 @@ mod tests_aarch64 {
         let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
         let mut buf = [0u8; 4];
-        // 0x10_0000 is below SERIAL_MMIO_BASE (0x0900_0000) and inside
-        // no virtio device window — picked so no early-return matches.
+        // 0x10_0000 is below the device MMIO window (SERIAL_MMIO_BASE) and
+        // inside no virtio device window — picked so no early-return matches.
         dispatch_mmio_read(
             &com1, &com2, None, None, None, /* addr */ 0x10_0000, &mut buf,
         );
