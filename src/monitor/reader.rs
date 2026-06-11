@@ -377,7 +377,6 @@ impl GuestMem {
         use vm_memory::GuestMemory;
 
         let dram_base = layout.dram_base();
-        let total_size = layout.total_bytes();
         let mut regions = Vec::with_capacity(layout.regions().len());
         for nr in layout.regions() {
             let host_ptr = guest_mem
@@ -390,8 +389,18 @@ impl GuestMem {
             });
         }
 
+        // `size` is the DRAM-relative offset EXTENT (max offset+size),
+        // NOT the RAM total. Under MMIO-gap relocation the high region's
+        // offset (gpa_start - dram_base) jumps above the gap, so the
+        // addressable offset space exceeds sum(region.size) by the gap
+        // size; the `pa < size` bounds checks must admit the full
+        // high-RAM offset range. resolve_ptr's per-region `local <
+        // r.size` still rejects the actual hole. (Matches
+        // from_regions_for_test; equals total_bytes when no gap.)
+        let size = regions.iter().map(|r| r.offset + r.size).max().unwrap_or(0);
+
         Self {
-            size: total_size,
+            size,
             regions,
             page_tlb: std::sync::Mutex::new(None),
         }
@@ -5734,5 +5743,36 @@ mod tests {
         let n = mem.write_bytes_at(u64::MAX - 7, 8, &[0xBB; 4]);
         assert_eq!(n, 0, "wraparound to 0 must return 0 bytes written");
         assert_eq!(buf, snapshot, "no aliasing into low DRAM is permitted");
+    }
+
+    #[test]
+    fn from_layout_size_admits_relocated_high_ram() {
+        // Regression (MMIO-gap relocate): from_layout's `size` must be
+        // the DRAM-relative offset EXTENT (max offset+size), NOT
+        // total_bytes(). A 4 GiB x86 VM relocates its in-gap RAM to
+        // [4 GiB, 5 GiB); if `size` were total_bytes (4 GiB) the `pa <
+        // size` bounds would silently reject the top 1 GiB of high RAM
+        // (zero reads / dropped writes for kernel structs landing there).
+        // from_regions_for_test already used the extent; this pins the
+        // production from_layout path.
+        use crate::vmm::numa_mem::NumaMemoryLayout;
+        use crate::vmm::topology::Topology;
+        let topo = Topology::new(1, 2, 4, 2);
+        let gap = Some((0xC000_0000u64, 0x1_0000_0000u64));
+        let layout = NumaMemoryLayout::compute(&topo, 4096, 0, gap).unwrap();
+        let kvm = kvm_ioctls::Kvm::new().unwrap();
+        let vm_fd = kvm.create_vm().unwrap();
+        let alloc = layout.allocate_and_register(&vm_fd, false, false).unwrap();
+        let mem = GuestMem::from_layout(&layout, &alloc.guest_mem);
+        // Offset extent = high region offset (4 GiB) + its size (1 GiB) =
+        // 5 GiB; RAM total is only 4 GiB.
+        assert_eq!(mem.size(), 0x1_0000_0000 + 0x4000_0000);
+        // A field at the very top of relocated high RAM resolves — would
+        // be None if size were total_bytes (4 GiB).
+        assert!(mem
+            .host_ptr_for_pa(0x1_0000_0000 + 0x4000_0000 - 8, 8)
+            .is_some());
+        // The gap itself stays unbacked (resolve_ptr None's it).
+        assert!(mem.host_ptr_for_pa(0xC000_0000, 8).is_none());
     }
 }

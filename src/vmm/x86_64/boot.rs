@@ -174,12 +174,15 @@ pub fn write_boot_params(
     };
     e820_idx += 1;
 
-    // High memory: 1MB onwards.
-    //
-    // Three cases:
-    //   usable_size <= MMIO_GAP_START (3GB): fits below gap
-    //   usable_size <= MMIO_GAP_END (4GB):   extends into gap, memory in gap is lost
-    //   usable_size >  MMIO_GAP_END:         extends beyond gap, split into two entries
+    // High memory: 1MB onwards. RAM that would fall in the MMIO gap
+    // [MMIO_GAP_START, MMIO_GAP_END) is RELOCATED above MMIO_GAP_END
+    // (not dropped), preserving total RAM and matching numa_mem's
+    // relocated KVM memslots (numa_mem::linear_to_gpa) byte-for-byte.
+    // The host memslots and this e820 MUST agree, or the guest sees RAM
+    // where a device's MMIO lives (or vice versa).
+    //   usable_size <= MMIO_GAP_START: one entry [1MB, usable_size)
+    //   usable_size >  MMIO_GAP_START: [1MB, gap_start) +
+    //                          [gap_end, gap_end + (usable_size - gap_start))
     if usable_size <= MMIO_GAP_START {
         params.e820_table[e820_idx] = boot_e820_entry {
             addr: HIMEM_START,
@@ -188,22 +191,21 @@ pub fn write_boot_params(
         };
         e820_idx += 1;
     } else {
-        // Below MMIO gap
+        // Below the gap.
         params.e820_table[e820_idx] = boot_e820_entry {
             addr: HIMEM_START,
             size: MMIO_GAP_START - HIMEM_START,
             type_: E820_RAM,
         };
         e820_idx += 1;
-        // Above MMIO gap (only if memory extends beyond it)
-        if usable_size > MMIO_GAP_END {
-            params.e820_table[e820_idx] = boot_e820_entry {
-                addr: MMIO_GAP_END,
-                size: usable_size - MMIO_GAP_END,
-                type_: E820_RAM,
-            };
-            e820_idx += 1;
-        }
+        // Above the gap: the overflow (all RAM past gap_start),
+        // relocated to begin at gap_end. Total RAM preserved.
+        params.e820_table[e820_idx] = boot_e820_entry {
+            addr: MMIO_GAP_END,
+            size: usable_size - MMIO_GAP_START,
+            type_: E820_RAM,
+        };
+        e820_idx += 1;
     }
     params.e820_entries = e820_idx as u8;
 
@@ -868,20 +870,58 @@ mod tests {
         let addr2 = { params.e820_table[2].addr };
         let size2 = { params.e820_table[2].size };
         assert_eq!(addr2, MMIO_GAP_END);
-        assert_eq!(size2, (5120u64 << 20) - MMIO_GAP_END);
+        // RELOCATE: the above-gap entry holds ALL RAM past gap_start (the
+        // in-gap GiB is relocated here, not lost) = usable - MMIO_GAP_START.
+        assert_eq!(size2, (5120u64 << 20) - MMIO_GAP_START);
     }
 
     #[test]
-    fn e820_4gb_no_above_gap_entry() {
-        // 4 GB exactly equals MMIO_GAP_END — no memory above the gap.
+    fn e820_4gb_relocates_gap_above() {
+        // 4 GB: [HIMEM, gap_start) below the gap + 1 GiB RELOCATED above
+        // gap_end. The old behavior LOST that GiB (usable=4GB but the
+        // guest saw ~3GB); relocate preserves it.
         let mem = test_mem(4096);
         write_boot_params(&mem, "console=ttyS0", 4096, None, None, None).unwrap();
         use linux_loader::loader::bootparam::boot_params;
         let params: boot_params = mem.read_obj(GuestAddress(BOOT_PARAMS_ADDR)).unwrap();
         let entries = { params.e820_entries };
-        assert_eq!(entries, 2, "4GB: low + high-below-gap (no above-gap)");
+        assert_eq!(entries, 3, "4GB: low + high-below-gap + relocated-above-gap");
         let size1 = { params.e820_table[1].size };
         assert_eq!(size1, MMIO_GAP_START - HIMEM_START);
+        let addr2 = { params.e820_table[2].addr };
+        let size2 = { params.e820_table[2].size };
+        assert_eq!(addr2, MMIO_GAP_END);
+        assert_eq!(size2, (4096u64 << 20) - MMIO_GAP_START);
+    }
+
+    #[test]
+    fn e820_above_gap_matches_numa_mem_high_region() {
+        // The e820 high entry and numa_mem's relocated high region derive
+        // the split INDEPENDENTLY from the same MMIO_GAP_* consts; pin
+        // that they agree byte-for-byte. This is the load-bearing invariant:
+        // host memslots == guest e820, or the guest sees RAM where a
+        // device's MMIO lives. Closes the drift surface (a future edit to
+        // one path that diverges from the other fails here).
+        use crate::vmm::numa_mem::NumaMemoryLayout;
+        use crate::vmm::topology::Topology;
+        let mib = 4096u32;
+        let topo = Topology::new(1, 2, 4, 2);
+        let layout =
+            NumaMemoryLayout::compute(&topo, mib, 0, Some((MMIO_GAP_START, MMIO_GAP_END))).unwrap();
+        let high = layout
+            .regions()
+            .iter()
+            .find(|r| r.gpa_start >= MMIO_GAP_END)
+            .expect("relocated high region");
+        let mem = test_mem(mib);
+        write_boot_params(&mem, "console=ttyS0", mib, None, None, None).unwrap();
+        use linux_loader::loader::bootparam::boot_params;
+        let params: boot_params = mem.read_obj(GuestAddress(BOOT_PARAMS_ADDR)).unwrap();
+        // e820_table[2] is the above-gap entry (0=EBDA, 1=below-gap).
+        let above_addr = { params.e820_table[2].addr };
+        let above_size = { params.e820_table[2].size };
+        assert_eq!(above_addr, high.gpa_start, "e820 above-gap addr == numa_mem high gpa_start");
+        assert_eq!(above_size, high.size, "e820 above-gap size == numa_mem high size");
     }
 
     #[test]

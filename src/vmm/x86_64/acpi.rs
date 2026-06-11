@@ -611,9 +611,27 @@ struct HmatMsci {
 
 const _: () = assert!(std::mem::size_of::<HmatMsci>() == 32);
 
+/// HMAT targets are per-proximity-domain (per NUMA node), NOT per
+/// memory range. A node split across the MMIO gap yields two
+/// `NodeRegion`s with the same `node_id`; emitting one HMAT target per
+/// region would duplicate the proximity domain (malformed HMAT). Dedup
+/// to the distinct `node_id`s, preserving first-seen (ascending-GPA)
+/// order. (SRAT, by contrast, is correctly per-range — two
+/// memory-affinity entries with the same domain are valid and expected,
+/// confirmed against the guest's acpi_parse_memory_affinity.)
+fn hmat_target_nodes(numa_layout: &NumaMemoryLayout) -> Vec<u32> {
+    let mut nodes = Vec::new();
+    for region in numa_layout.regions() {
+        if !nodes.contains(&region.node_id) {
+            nodes.push(region.node_id);
+        }
+    }
+    nodes
+}
+
 fn compute_hmat_size(topo: &Topology, numa_layout: &NumaMemoryLayout) -> u32 {
     let num_initiators = topo.cpu_bearing_nodes();
-    let num_targets = numa_layout.regions().len() as u32;
+    let num_targets = hmat_target_nodes(numa_layout).len() as u32;
     let num_mpdas = num_targets;
 
     // SDT header (36) + 4 reserved bytes = 40.
@@ -658,7 +676,7 @@ fn write_hmat(
     let initiators: Vec<u32> = (0..topo.numa_nodes)
         .filter(|&n| topo.llcs_in_node(n) > 0)
         .collect();
-    let targets: Vec<u32> = numa_layout.regions().iter().map(|r| r.node_id).collect();
+    let targets: Vec<u32> = hmat_target_nodes(numa_layout);
 
     // Type 0: MPDA — one per memory target, mapping to its closest
     // CPU-bearing initiator. flags=3: bit 0 (PROCESSOR_PD_VALID) +
@@ -958,7 +976,7 @@ mod tests {
     }
 
     fn test_layout(topo: &Topology, mib: u32) -> NumaMemoryLayout {
-        NumaMemoryLayout::compute(topo, mib, 0).unwrap()
+        NumaMemoryLayout::compute(topo, mib, 0, None).unwrap()
     }
 
     fn test_setup(mem: &GuestMemoryMmap, topo: &Topology, mib: u32) -> AcpiLayout {
@@ -1962,7 +1980,7 @@ mod tests {
     fn hmat_emitted_with_cxl() {
         let topo = Topology::with_nodes(4, 1, &CXL_NODES);
         let mem = test_mem(16);
-        let layout = NumaMemoryLayout::compute(&topo, 640, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
         let l = setup_acpi(&mem, &topo, &layout).unwrap();
         assert!(l.hmat_size > 0, "HMAT must be emitted with CXL nodes");
     }
@@ -1971,7 +1989,7 @@ mod tests {
     fn hmat_checksum() {
         let topo = Topology::with_nodes(4, 1, &CXL_NODES);
         let mem = test_mem(16);
-        let layout = NumaMemoryLayout::compute(&topo, 640, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
         let l = setup_acpi(&mem, &topo, &layout).unwrap();
         let hmat = read_table(&mem, l.hmat_addr);
         let sum: u8 = hmat.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
@@ -1982,7 +2000,7 @@ mod tests {
     fn hmat_header_fields() {
         let topo = Topology::with_nodes(4, 1, &CXL_NODES);
         let mem = test_mem(16);
-        let layout = NumaMemoryLayout::compute(&topo, 640, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
         let l = setup_acpi(&mem, &topo, &layout).unwrap();
         let hmat = read_table(&mem, l.hmat_addr);
         assert_eq!(&hmat[..4], b"HMAT");
@@ -1998,7 +2016,7 @@ mod tests {
     fn hmat_mpda_count_and_flags() {
         let topo = Topology::with_nodes(4, 1, &CXL_NODES);
         let mem = test_mem(16);
-        let layout = NumaMemoryLayout::compute(&topo, 640, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
         let l = setup_acpi(&mem, &topo, &layout).unwrap();
         let hmat = read_table(&mem, l.hmat_addr);
 
@@ -2030,7 +2048,7 @@ mod tests {
     fn hmat_mpda_cxl_initiator() {
         let topo = Topology::with_nodes(4, 1, &CXL_NODES);
         let mem = test_mem(16);
-        let layout = NumaMemoryLayout::compute(&topo, 640, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
         let l = setup_acpi(&mem, &topo, &layout).unwrap();
         let hmat = read_table(&mem, l.hmat_addr);
 
@@ -2064,7 +2082,7 @@ mod tests {
     fn hmat_sllbi_latency_and_bandwidth() {
         let topo = Topology::with_nodes(4, 1, &CXL_NODES);
         let mem = test_mem(16);
-        let layout = NumaMemoryLayout::compute(&topo, 640, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
         let l = setup_acpi(&mem, &topo, &layout).unwrap();
         let hmat = read_table(&mem, l.hmat_addr);
 
@@ -2095,7 +2113,7 @@ mod tests {
     fn hmat_sllbi_cxl_entries_differ() {
         let topo = Topology::with_nodes(4, 1, &CXL_NODES);
         let mem = test_mem(16);
-        let layout = NumaMemoryLayout::compute(&topo, 640, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
         let l = setup_acpi(&mem, &topo, &layout).unwrap();
         let hmat = read_table(&mem, l.hmat_addr);
 
@@ -2129,7 +2147,7 @@ mod tests {
     fn hmat_rsdt_xsdt_include_pointer() {
         let topo = Topology::with_nodes(4, 1, &CXL_NODES);
         let mem = test_mem(16);
-        let layout = NumaMemoryLayout::compute(&topo, 640, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
         let l = setup_acpi(&mem, &topo, &layout).unwrap();
 
         // RSDT should have 5 entries (FADT, MADT, SRAT, SLIT, HMAT).

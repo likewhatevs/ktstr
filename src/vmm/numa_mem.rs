@@ -59,9 +59,64 @@ pub struct NodeRegion {
 #[derive(Debug, Clone)]
 pub struct NumaMemoryLayout {
     /// Per-node regions sorted by ascending GPA. Regions are
-    /// contiguous: `regions[i+1].gpa_start == regions[i].gpa_start +
-    /// regions[i].size`.
+    /// GPA-contiguous EXCEPT they skip the MMIO gap
+    /// `[mmio_gap.0, mmio_gap.1)` (the x86 sub-4GB device hole): a node
+    /// whose RAM crosses the gap is split into a below-gap region and an
+    /// above-gap region relocated to `gap_end`, both carrying the same
+    /// `node_id`. Total RAM is preserved (the in-gap bytes move above
+    /// the gap, not dropped). The host VA backing stays packed and
+    /// contiguous (sum of region sizes); see `allocate_and_register`.
     regions: Vec<NodeRegion>,
+}
+
+/// Map a gap-free linear RAM offset (0-based within guest DRAM) to its
+/// guest physical address, relocating offsets at/after the MMIO gap to
+/// above `gap_end` so no RAM lands in the `[gap_start, gap_end)`
+/// device-MMIO hole (where virtio + IOAPIC + LAPIC live). This is the
+/// shared split primitive: `compute` (KVM slot GPAs) and the e820
+/// builder both derive their below/above boundary from the same gap so
+/// the host memslots and the guest e820 agree byte-for-byte.
+pub(crate) fn linear_to_gpa(linear: u64, dram_base: u64, mmio_gap: Option<(u64, u64)>) -> u64 {
+    match mmio_gap {
+        Some((gap_start, gap_end)) if dram_base + linear >= gap_start => {
+            gap_end + (dram_base + linear - gap_start)
+        }
+        _ => dram_base + linear,
+    }
+}
+
+/// Append the GPA region(s) for one node of `size` bytes occupying the
+/// gap-free linear range `[*linear, *linear + size)`, advancing
+/// `*linear` by `size`. Yields two regions (same `node_id`, the second
+/// relocated to `gap_end`) when the node straddles the MMIO-gap
+/// boundary, else one. `slot` is the dense running region index.
+fn push_node_regions(
+    regions: &mut Vec<NodeRegion>,
+    node_id: u32,
+    size: u64,
+    linear: &mut u64,
+    dram_base: u64,
+    mmio_gap: Option<(u64, u64)>,
+) {
+    // Linear offset at which the gap begins; pieces below it stay in
+    // place, pieces at/after it relocate above `gap_end`.
+    let boundary = mmio_gap.map(|(gap_start, _)| gap_start - dram_base);
+    let mut remaining = size;
+    while remaining > 0 {
+        let ls = *linear;
+        let piece = match boundary {
+            Some(b) if ls < b => (b - ls).min(remaining),
+            _ => remaining,
+        };
+        regions.push(NodeRegion {
+            node_id,
+            gpa_start: linear_to_gpa(ls, dram_base, mmio_gap),
+            size: piece,
+            slot: regions.len() as u32,
+        });
+        *linear += piece;
+        remaining -= piece;
+    }
 }
 
 impl NumaMemoryLayout {
@@ -74,9 +129,25 @@ impl NumaMemoryLayout {
     /// topologies, must equal the sum of all `NumaNode::memory_mib`.
     /// For uniform topologies, memory is divided evenly across
     /// `numa_nodes` nodes.
-    pub fn compute(topo: &Topology, total_memory_mib: u32, dram_base: u64) -> Result<Self> {
+    /// `mmio_gap`: `Some((gap_start, gap_end))` on x86_64 (the sub-4GB
+    /// device-MMIO hole `[0xC000_0000, 0x1_0000_0000)`); `None` on
+    /// aarch64 (no low MMIO hole inside DRAM). RAM that would land in
+    /// the gap is relocated above `gap_end` so the host registers no
+    /// memslot over the device window (otherwise RAM shadows virtio +
+    /// IOAPIC and their MMIO never traps).
+    pub fn compute(
+        topo: &Topology,
+        total_memory_mib: u32,
+        dram_base: u64,
+        mmio_gap: Option<(u64, u64)>,
+    ) -> Result<Self> {
         let total_bytes = (total_memory_mib as u64) << 20;
         let numa_nodes = topo.numa_nodes;
+
+        let mut regions = Vec::new();
+        // Gap-free running offset into guest DRAM; GPAs are derived from
+        // it via `linear_to_gpa` so the gap is skipped exactly once.
+        let mut linear = 0u64;
 
         match topo.nodes {
             Some(nodes) => {
@@ -87,65 +158,48 @@ impl NumaMemoryLayout {
                      sum of node memory_mib ({node_total_mib})"
                 );
 
-                let mut regions = Vec::with_capacity(numa_nodes as usize);
-                let mut gpa = dram_base;
-
                 for (i, node) in nodes.iter().enumerate() {
                     let size = (node.memory_mib as u64) << 20;
                     if size == 0 {
                         continue;
                     }
-                    regions.push(NodeRegion {
-                        node_id: i as u32,
-                        gpa_start: gpa,
-                        size,
-                        slot: regions.len() as u32,
-                    });
-                    gpa += size;
+                    push_node_regions(&mut regions, i as u32, size, &mut linear, dram_base, mmio_gap);
                 }
 
                 anyhow::ensure!(
                     !regions.is_empty(),
                     "at least one node must have non-zero memory"
                 );
-
-                Ok(Self { regions })
             }
             None => {
                 if numa_nodes <= 1 {
-                    let region = NodeRegion {
-                        node_id: 0,
-                        gpa_start: dram_base,
-                        size: total_bytes,
-                        slot: 0,
-                    };
-                    return Ok(Self {
-                        regions: vec![region],
-                    });
+                    push_node_regions(&mut regions, 0, total_bytes, &mut linear, dram_base, mmio_gap);
+                } else {
+                    let per_node_mib = total_memory_mib / numa_nodes;
+                    for i in 0..numa_nodes {
+                        let mib = if i == numa_nodes - 1 {
+                            total_memory_mib - per_node_mib * (numa_nodes - 1)
+                        } else {
+                            per_node_mib
+                        };
+                        let size = (mib as u64) << 20;
+                        push_node_regions(&mut regions, i, size, &mut linear, dram_base, mmio_gap);
+                    }
                 }
-
-                let per_node_mib = total_memory_mib / numa_nodes;
-                let mut regions = Vec::with_capacity(numa_nodes as usize);
-                let mut gpa = dram_base;
-                for i in 0..numa_nodes {
-                    let mib = if i == numa_nodes - 1 {
-                        total_memory_mib - per_node_mib * (numa_nodes - 1)
-                    } else {
-                        per_node_mib
-                    };
-                    let size = (mib as u64) << 20;
-                    regions.push(NodeRegion {
-                        node_id: i,
-                        gpa_start: gpa,
-                        size,
-                        slot: i,
-                    });
-                    gpa += size;
-                }
-
-                Ok(Self { regions })
             }
         }
+
+        // Relocate preserves total RAM (in-gap bytes move above the gap,
+        // never dropped). This is the qemu invariant ram_size == below +
+        // above; it also guards the e820 / SRAT consumers, which read
+        // sum(region.size) as the advertised RAM.
+        debug_assert_eq!(
+            regions.iter().map(|r| r.size).sum::<u64>(),
+            total_bytes,
+            "relocate must preserve total guest RAM"
+        );
+
+        Ok(Self { regions })
     }
 
     /// Per-node regions sorted by ascending GPA.
@@ -239,9 +293,18 @@ impl NumaMemoryLayout {
 
         let mut guest_regions: Vec<GuestRegionMmap> = Vec::with_capacity(self.regions.len());
 
+        // Host VA is PACKED (gap-free): the reservation is sum-of-sizes,
+        // so each region's VA offset is the running cumulative size, NOT
+        // gpa_start - dram_base. Under MMIO-gap relocation a high
+        // region's gpa_start jumps above gap_end; gpa_start - dram_base
+        // would index past the packed reservation end (OOB MAP_FIXED).
+        // The KVM slot still pairs guest_phys_addr = gpa_start (gapped)
+        // with this packed userspace_addr below.
+        let mut va_offset = 0usize;
         for region in &self.regions {
-            let offset = (region.gpa_start - self.dram_base()) as usize;
+            let offset = va_offset;
             let node_size = region.size as usize;
+            va_offset += node_size;
             let node_addr = unsafe { (reservation as *mut u8).add(offset) as *mut libc::c_void };
 
             // Step 2: Per-node MAP_FIXED mmap.
@@ -427,7 +490,7 @@ mod tests {
     #[test]
     fn uniform_single_region() {
         let topo = Topology::new(1, 2, 4, 2);
-        let layout = NumaMemoryLayout::compute(&topo, 256, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 256, 0, None).unwrap();
         assert!(layout.is_single_region());
         assert_eq!(layout.total_bytes(), 256 << 20);
         assert_eq!(layout.regions().len(), 1);
@@ -441,7 +504,7 @@ mod tests {
     #[test]
     fn uniform_multi_numa_splits_evenly() {
         let topo = Topology::new(2, 4, 2, 1);
-        let layout = NumaMemoryLayout::compute(&topo, 512, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 512, 0, None).unwrap();
         assert_eq!(layout.regions().len(), 2);
         assert_eq!(layout.regions()[0].node_id, 0);
         assert_eq!(layout.regions()[0].size, 256 << 20);
@@ -455,7 +518,7 @@ mod tests {
     #[test]
     fn uniform_multi_numa_remainder() {
         let topo = Topology::new(3, 3, 2, 1);
-        let layout = NumaMemoryLayout::compute(&topo, 100, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 100, 0, None).unwrap();
         assert_eq!(layout.regions().len(), 3);
         let sizes: Vec<u64> = layout.regions().iter().map(|r| r.size).collect();
         assert_eq!(sizes[0], 33 << 20);
@@ -469,7 +532,7 @@ mod tests {
     #[test]
     fn with_nodes_two_regions() {
         let topo = Topology::with_nodes(4, 2, &TWO_NODES);
-        let layout = NumaMemoryLayout::compute(&topo, 512, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 512, 0, None).unwrap();
         assert!(!layout.is_single_region());
         assert_eq!(layout.regions().len(), 2);
 
@@ -495,7 +558,7 @@ mod tests {
     #[test]
     fn asymmetric_node_memory() {
         let topo = Topology::with_nodes(2, 1, &ASYM_NODES);
-        let layout = NumaMemoryLayout::compute(&topo, 512, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 512, 0, None).unwrap();
         assert_eq!(layout.regions().len(), 2);
         assert_eq!(layout.regions()[0].size, 128 << 20);
         assert_eq!(layout.regions()[1].size, 384 << 20);
@@ -511,7 +574,7 @@ mod tests {
     #[test]
     fn cxl_memory_only_node() {
         let topo = Topology::with_nodes(4, 1, &CXL_NODES);
-        let layout = NumaMemoryLayout::compute(&topo, 640, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
         assert_eq!(layout.regions().len(), 3);
 
         assert_eq!(layout.regions()[0].node_id, 0);
@@ -529,7 +592,7 @@ mod tests {
     #[test]
     fn cxl_zero_memory_node_skipped() {
         let topo = Topology::with_nodes(4, 1, &CXL_ZERO_MEM);
-        let layout = NumaMemoryLayout::compute(&topo, 512, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 512, 0, None).unwrap();
         assert_eq!(layout.regions().len(), 2);
         assert_eq!(layout.regions()[0].node_id, 0);
         assert_eq!(layout.regions()[1].node_id, 2);
@@ -539,7 +602,7 @@ mod tests {
     fn aarch64_dram_base() {
         let topo = Topology::with_nodes(4, 2, &TWO_NODES);
         let dram_base = 0x4000_0000u64;
-        let layout = NumaMemoryLayout::compute(&topo, 512, dram_base).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 512, dram_base, None).unwrap();
         assert_eq!(layout.dram_base(), dram_base);
         assert_eq!(layout.regions()[0].gpa_start, dram_base);
         assert_eq!(layout.regions()[1].gpa_start, dram_base + (256 << 20));
@@ -549,14 +612,14 @@ mod tests {
     #[test]
     fn memory_mismatch_error() {
         let topo = Topology::with_nodes(4, 2, &TWO_NODES);
-        let err = NumaMemoryLayout::compute(&topo, 1024, 0).unwrap_err();
+        let err = NumaMemoryLayout::compute(&topo, 1024, 0, None).unwrap_err();
         assert!(format!("{err}").contains("must equal"), "got: {err}");
     }
 
     #[test]
     fn region_for_gpa_lookup() {
         let topo = Topology::with_nodes(4, 2, &TWO_NODES);
-        let layout = NumaMemoryLayout::compute(&topo, 512, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 512, 0, None).unwrap();
 
         let r = layout.region_for_gpa(0).unwrap();
         assert_eq!(r.node_id, 0);
@@ -574,7 +637,7 @@ mod tests {
     fn region_for_gpa_with_dram_base() {
         let dram_base = 0x4000_0000u64;
         let topo = Topology::with_nodes(4, 2, &TWO_NODES);
-        let layout = NumaMemoryLayout::compute(&topo, 512, dram_base).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 512, dram_base, None).unwrap();
 
         assert!(layout.region_for_gpa(0).is_none());
         assert_eq!(layout.region_for_gpa(dram_base).unwrap().node_id, 0);
@@ -590,7 +653,7 @@ mod tests {
     #[test]
     fn region_for_node_lookup() {
         let topo = Topology::with_nodes(4, 2, &TWO_NODES);
-        let layout = NumaMemoryLayout::compute(&topo, 512, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 512, 0, None).unwrap();
 
         assert_eq!(layout.region_for_node(0).unwrap().gpa_start, 0);
         assert_eq!(layout.region_for_node(1).unwrap().gpa_start, 256 << 20);
@@ -600,7 +663,7 @@ mod tests {
     #[test]
     fn slot_assignment_contiguous() {
         let topo = Topology::with_nodes(4, 1, &CXL_NODES);
-        let layout = NumaMemoryLayout::compute(&topo, 640, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
         for (i, r) in layout.regions().iter().enumerate() {
             assert_eq!(r.slot, i as u32);
         }
@@ -610,7 +673,7 @@ mod tests {
     fn single_node_with_nodes() {
         static ONE: [NumaNode; 1] = [NumaNode::new(4, 512)];
         let topo = Topology::with_nodes(2, 1, &ONE);
-        let layout = NumaMemoryLayout::compute(&topo, 512, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 512, 0, None).unwrap();
         assert!(layout.is_single_region());
         assert_eq!(layout.regions()[0].size, 512 << 20);
     }
@@ -618,7 +681,7 @@ mod tests {
     #[test]
     fn allocate_register_single_region() {
         let topo = Topology::new(1, 1, 1, 1);
-        let layout = NumaMemoryLayout::compute(&topo, 64, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 64, 0, None).unwrap();
 
         let kvm = kvm_ioctls::Kvm::new().unwrap();
         let vm_fd = kvm.create_vm().unwrap();
@@ -634,7 +697,7 @@ mod tests {
     #[test]
     fn allocate_register_multi_node_per_region() {
         let topo = Topology::with_nodes(4, 2, &TWO_NODES);
-        let layout = NumaMemoryLayout::compute(&topo, 512, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 512, 0, None).unwrap();
 
         let kvm = kvm_ioctls::Kvm::new().unwrap();
         let vm_fd = kvm.create_vm().unwrap();
@@ -651,7 +714,7 @@ mod tests {
     #[test]
     fn contiguous_host_va() {
         let topo = Topology::with_nodes(4, 2, &TWO_NODES);
-        let layout = NumaMemoryLayout::compute(&topo, 512, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 512, 0, None).unwrap();
 
         let kvm = kvm_ioctls::Kvm::new().unwrap();
         let vm_fd = kvm.create_vm().unwrap();
@@ -670,7 +733,7 @@ mod tests {
     #[test]
     fn cross_region_write_read() {
         let topo = Topology::with_nodes(4, 2, &TWO_NODES);
-        let layout = NumaMemoryLayout::compute(&topo, 512, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 512, 0, None).unwrap();
 
         let kvm = kvm_ioctls::Kvm::new().unwrap();
         let vm_fd = kvm.create_vm().unwrap();
@@ -697,7 +760,7 @@ mod tests {
     #[test]
     fn uniform_multi_numa_allocate() {
         let topo = Topology::new(2, 2, 2, 1);
-        let layout = NumaMemoryLayout::compute(&topo, 128, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 128, 0, None).unwrap();
         assert_eq!(layout.regions().len(), 2);
 
         let kvm = kvm_ioctls::Kvm::new().unwrap();
@@ -715,7 +778,7 @@ mod tests {
     #[test]
     fn reservation_guard_munmaps_on_drop() {
         let topo = Topology::new(1, 1, 1, 1);
-        let layout = NumaMemoryLayout::compute(&topo, 64, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 64, 0, None).unwrap();
 
         let kvm = kvm_ioctls::Kvm::new().unwrap();
         let vm_fd = kvm.create_vm().unwrap();
@@ -733,7 +796,7 @@ mod tests {
     #[test]
     fn three_node_allocation() {
         let topo = Topology::with_nodes(4, 1, &CXL_NODES);
-        let layout = NumaMemoryLayout::compute(&topo, 640, 0).unwrap();
+        let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
         assert_eq!(layout.regions().len(), 3);
 
         let kvm = kvm_ioctls::Kvm::new().unwrap();
@@ -745,5 +808,109 @@ mod tests {
         assert_eq!(alloc.guest_mem.iter().count(), 3);
         let total: u64 = alloc.guest_mem.iter().map(|r| r.len()).sum();
         assert_eq!(total, 640 << 20);
+    }
+
+    // --- MMIO-gap relocate ---
+
+    const X86_GAP: Option<(u64, u64)> = Some((0xC000_0000, 0x1_0000_0000));
+
+    #[test]
+    fn relocate_single_node_crossing_gap() {
+        // 4 GiB single node on x86: RAM crosses MMIO_GAP_START (3 GiB).
+        let topo = Topology::new(1, 2, 4, 2);
+        let layout = NumaMemoryLayout::compute(&topo, 4096, 0, X86_GAP).unwrap();
+        // Split into two regions, SAME node_id, total preserved (no GiB lost).
+        assert_eq!(layout.regions().len(), 2);
+        assert_eq!(layout.total_bytes(), 4096 << 20);
+        let r0 = &layout.regions()[0];
+        let r1 = &layout.regions()[1];
+        assert_eq!(r0.node_id, 0);
+        assert_eq!(r0.gpa_start, 0);
+        assert_eq!(r0.size, 0xC000_0000); // [0, 3 GiB)
+        assert_eq!(r1.node_id, 0); // relocated half keeps the node id
+        assert_eq!(r1.gpa_start, 0x1_0000_0000); // begins at 4 GiB
+        assert_eq!(r1.size, (4096u64 << 20) - 0xC000_0000); // overflow above the gap
+        assert_eq!(r0.slot, 0);
+        assert_eq!(r1.slot, 1); // dense slots
+        // Regression pin: no region overlaps the MMIO gap; the device
+        // window (virtio 0xC000_0000, IOAPIC 0xFEC0_0000) is not RAM.
+        for r in layout.regions() {
+            assert!(
+                r.gpa_start >= 0x1_0000_0000 || r.gpa_start + r.size <= 0xC000_0000,
+                "region {r:?} overlaps the MMIO gap"
+            );
+        }
+        assert!(layout.region_for_gpa(0xC000_0000).is_none());
+        assert!(layout.region_for_gpa(0xFEC0_0000).is_none());
+    }
+
+    #[test]
+    fn relocate_below_gap_no_split() {
+        // 2 GiB single node stays below the gap: one region, no relocate.
+        let topo = Topology::new(1, 2, 4, 2);
+        let layout = NumaMemoryLayout::compute(&topo, 2048, 0, X86_GAP).unwrap();
+        assert_eq!(layout.regions().len(), 1);
+        assert_eq!(layout.regions()[0].gpa_start, 0);
+        assert_eq!(layout.regions()[0].size, 2048 << 20);
+    }
+
+    static STRADDLE_NODES: [NumaNode; 2] = [NumaNode::new(2, 2048), NumaNode::new(2, 4096)];
+
+    #[test]
+    fn relocate_multi_node_straddle() {
+        // node0 = 2 GiB (wholly below gap); node1 = 4 GiB (straddles the
+        // 3 GiB boundary) → split, both halves keep node_id 1.
+        let topo = Topology::with_nodes(4, 1, &STRADDLE_NODES);
+        let layout = NumaMemoryLayout::compute(&topo, 6144, 0, X86_GAP).unwrap();
+        assert_eq!(layout.regions().len(), 3);
+        assert_eq!(layout.total_bytes(), 6144 << 20);
+        // node 0 — below the gap, no split.
+        assert_eq!(layout.regions()[0].node_id, 0);
+        assert_eq!(layout.regions()[0].gpa_start, 0);
+        assert_eq!(layout.regions()[0].size, 2048 << 20);
+        // node 1 low — [2 GiB, 3 GiB).
+        assert_eq!(layout.regions()[1].node_id, 1);
+        assert_eq!(layout.regions()[1].gpa_start, 2048 << 20);
+        assert_eq!(layout.regions()[1].size, 0xC000_0000 - (2048 << 20));
+        // node 1 high — relocated to 4 GiB, SAME node_id.
+        assert_eq!(layout.regions()[2].node_id, 1);
+        assert_eq!(layout.regions()[2].gpa_start, 0x1_0000_0000);
+        // node 1 keeps its full 4 GiB across the split.
+        assert_eq!(layout.regions()[1].size + layout.regions()[2].size, 4096 << 20);
+        // Dense slots, gap unbacked.
+        assert_eq!(layout.regions()[2].slot, 2);
+        for r in layout.regions() {
+            assert!(r.gpa_start >= 0x1_0000_0000 || r.gpa_start + r.size <= 0xC000_0000);
+        }
+    }
+
+    #[test]
+    fn relocate_none_is_noop_even_when_range_crosses_gap() {
+        // aarch64 passes None: a 16 GiB VM at DRAM_START spans
+        // [1 GiB, 17 GiB), crossing [3 GiB, 4 GiB) — but that is real RAM
+        // on aarch64 (MMIO is below DRAM_START), so it must NOT be carved.
+        let topo = Topology::new(1, 2, 4, 2);
+        let dram_base = 0x4000_0000u64;
+        let layout = NumaMemoryLayout::compute(&topo, 16384, dram_base, None).unwrap();
+        assert_eq!(layout.regions().len(), 1);
+        assert_eq!(layout.regions()[0].gpa_start, dram_base);
+        assert_eq!(layout.regions()[0].size, 16384 << 20);
+    }
+
+    #[test]
+    fn relocate_allocate_leaves_gap_unbacked() {
+        // End-to-end regression pin at the allocate level: a >3 GiB
+        // layout registers NO KVM memslot over the device window, so the
+        // guest's MMIO there traps. RAM below and above the gap is backed.
+        use vm_memory::{GuestAddress, GuestMemory};
+        let topo = Topology::new(1, 2, 4, 2);
+        let layout = NumaMemoryLayout::compute(&topo, 4096, 0, X86_GAP).unwrap();
+        let kvm = kvm_ioctls::Kvm::new().unwrap();
+        let vm_fd = kvm.create_vm().unwrap();
+        let alloc = layout.allocate_and_register(&vm_fd, false, false).unwrap();
+        assert!(alloc.guest_mem.get_host_address(GuestAddress(0xC000_0000)).is_err());
+        assert!(alloc.guest_mem.get_host_address(GuestAddress(0xFEC0_0000)).is_err());
+        assert!(alloc.guest_mem.get_host_address(GuestAddress(0)).is_ok());
+        assert!(alloc.guest_mem.get_host_address(GuestAddress(0x1_0000_0000)).is_ok());
     }
 }

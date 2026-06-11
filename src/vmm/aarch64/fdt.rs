@@ -575,7 +575,7 @@ mod tests {
     }
 
     fn test_layout(topo: &Topology, mib: u32) -> NumaMemoryLayout {
-        NumaMemoryLayout::compute(topo, mib, DRAM_START).unwrap()
+        NumaMemoryLayout::compute(topo, mib, DRAM_START, None).unwrap()
     }
 
     fn test_fdt(
@@ -921,7 +921,7 @@ mod tests {
     /// Check multi-NUMA memory nodes: numa-node-id, reg, contiguity, total size.
     fn check_memory_nodes(topo: &Topology, props: &[(String, String, Vec<u8>)], memory_mib: u32) {
         let mem_size = (memory_mib as u64) << 20;
-        let layout = NumaMemoryLayout::compute(topo, memory_mib, DRAM_START).unwrap();
+        let layout = NumaMemoryLayout::compute(topo, memory_mib, DRAM_START, None).unwrap();
         let regions = layout.regions();
 
         let mut prev_end: Option<u64> = None;

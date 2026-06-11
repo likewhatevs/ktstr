@@ -197,7 +197,7 @@ impl KtstrKvm {
     /// since memory_mib was unknown at construction time and
     /// `use_hugepages` may have been false.
     pub fn allocate_and_register_memory(&mut self, memory_mib: u32) -> Result<()> {
-        let layout = NumaMemoryLayout::compute(&self.topology, memory_mib, DRAM_START)?;
+        let layout = NumaMemoryLayout::compute(&self.topology, memory_mib, DRAM_START, None)?;
         let alloc =
             layout.allocate_and_register(&self.vm_fd, self.use_hugepages, self.performance_mode)?;
         // SAFETY: guest_mem is ManuallyDrop — explicit drop before
@@ -223,7 +223,7 @@ impl KtstrKvm {
 
         let (guest_mem, numa_layout, reservation) = match memory_mib {
             Some(mb) => {
-                let layout = NumaMemoryLayout::compute(&topo, mb, DRAM_START)?;
+                let layout = NumaMemoryLayout::compute(&topo, mb, DRAM_START, None)?;
                 let alloc =
                     layout.allocate_and_register(&vm_fd, use_hugepages, performance_mode)?;
                 (alloc.guest_mem, Some(layout), Some(alloc.reservation))
