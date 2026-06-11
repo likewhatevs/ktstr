@@ -703,16 +703,12 @@ impl KtstrVmBuilder {
     /// virtio device.
     ///
     /// v0 supports a single device; calling this method twice
-    /// overwrites the prior `NetConfig`.
-    ///
-    /// `dead_code` allow: kept as the public builder entry point
-    /// for attaching a virtio-net device; the production VM-bring-up
-    /// path in [`super::setup`] currently never enables networking
-    /// for a test, but the device, builder field, and config type
-    /// are all wired so a scenario can opt in.
-    #[allow(dead_code)]
-    pub fn network(mut self, config: net_config::NetConfig) -> Self {
-        self.network = Some(config);
+    /// overwrites the prior `NetConfig`. Reached via the
+    /// `#[ktstr_test(network = ...)]` attribute
+    /// (`test_support::runtime::build_vm_builder_base` calls this when the
+    /// entry sets `network`), or directly by raw-library callers.
+    pub fn network(mut self, network: net_config::NetConfig) -> Self {
+        self.network = Some(network);
         self
     }
 

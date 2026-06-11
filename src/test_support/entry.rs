@@ -1425,12 +1425,20 @@ pub struct KtstrTestEntry {
     /// `crate::vmm::KtstrVmBuilder::disk` in
     /// `crate::test_support::runtime::build_vm_builder_base` so the
     /// guest sees a raw block device sized per `cfg.capacity_mib`.
-    /// The `#[ktstr_test]` macro does not currently surface this
-    /// slot — direct construction via `..KtstrTestEntry::DEFAULT`
-    /// is the only path. Mutually exclusive with `host_only`:
-    /// `validate` rejects the combination because `host_only`
-    /// skips the VM boot that owns the disk lifecycle.
+    /// Surfaced by `#[ktstr_test(disk = PATH)]`, `with_disk`, or direct
+    /// construction via `..KtstrTestEntry::DEFAULT`. Mutually exclusive
+    /// with `host_only`: `validate` rejects the combination because
+    /// `host_only` skips the VM boot that owns the disk lifecycle.
     pub disk: Option<crate::vmm::disk_config::DiskConfig>,
+    /// Optional virtio-net device attached to the VM (in-VMM loopback
+    /// backend). `None` (the default) boots without a NIC; `Some(cfg)`
+    /// calls `crate::vmm::KtstrVmBuilder::network` in
+    /// `crate::test_support::runtime::build_vm_builder_base`. Surfaced by
+    /// `#[ktstr_test(network = PATH)]`, `with_network`, or direct
+    /// construction. Mutually exclusive with `host_only`: `validate`
+    /// rejects the combination because `host_only` skips the VM boot that
+    /// owns the virtio-net device.
+    pub network: Option<crate::vmm::net_config::NetConfig>,
     /// Host-side callback invoked after `vm.run()` returns, with
     /// access to the full `VmResult`. Runs on the HOST, not inside
     /// the guest. Use for assertions that need host-side state
@@ -1734,6 +1742,7 @@ impl KtstrTestEntry {
         cleanup_budget: None,
         config_content: None,
         disk: None,
+        network: None,
         post_vm: None,
         post_vm_unconditional: None,
         num_snapshots: 0,
@@ -1817,6 +1826,15 @@ impl KtstrTestEntry {
                  host_only skips the VM boot that owns the virtio-blk \
                  device lifecycle, so the disk would never be attached. \
                  Drop one of host_only or disk.",
+                self.name,
+            );
+        }
+        if self.host_only && self.network.is_some() {
+            anyhow::bail!(
+                "KtstrTestEntry '{}'.host_only=true with network=Some(..) — \
+                 host_only skips the VM boot that owns the virtio-net \
+                 device lifecycle, so the NIC would never be attached. \
+                 Drop one of host_only or network.",
                 self.name,
             );
         }
@@ -2370,6 +2388,25 @@ impl KtstrTestEntry {
     #[must_use = "builder methods consume self; bind the result"]
     pub fn with_disk(mut self, disk: crate::vmm::disk_config::DiskConfig) -> Self {
         self.disk = Some(disk);
+        self
+    }
+
+    /// Override `network`.
+    ///
+    /// Pairs with the `host_only = false` requirement enforced by
+    /// [`Self::validate`] — `host_only = true` with a `Some(..)` network
+    /// is rejected because host-only skips the VM boot that owns the
+    /// virtio-net device.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_network(mut self, network: crate::vmm::net_config::NetConfig) -> Self {
+        self.network = Some(network);
+        self
+    }
+
+    /// Clear `network` (boot without a virtio-net device).
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn without_network(mut self) -> Self {
+        self.network = None;
         self
     }
 
@@ -3371,6 +3408,77 @@ mod tests {
         entry
             .validate()
             .expect("host_only=false + disk=Some must validate");
+    }
+
+    /// `host_only=true` with `network=Some(..)` is rejected for the same
+    /// reason as disk: host_only skips the VM boot that owns the virtio-net
+    /// device lifecycle, so the NIC would never attach. Mirrors the disk
+    /// gate so the macro-surfaced `network =` attribute can't silently
+    /// pair with `host_only`.
+    #[test]
+    fn validate_rejects_host_only_with_network() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "host_only_with_network",
+            func: good_test_func,
+            host_only: true,
+            network: Some(crate::vmm::net_config::NetConfig::default()),
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("host_only=true + network=Some must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("host_only=true") && msg.contains("network"),
+            "expected host_only+network diagnostic, got: {msg}",
+        );
+        assert!(
+            msg.contains("host_only_with_network"),
+            "error must name the offending entry, got: {msg}",
+        );
+    }
+
+    /// `host_only=true` with `network=None` is the legitimate host-side
+    /// shape (no NIC). Pins the happy path so a future edit to the gate
+    /// doesn't flip polarity and reject legitimate host-only tests.
+    #[test]
+    fn validate_accepts_host_only_without_network() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "host_only_no_network",
+            func: good_test_func,
+            host_only: true,
+            network: None,
+            ..KtstrTestEntry::DEFAULT
+        };
+        entry
+            .validate()
+            .expect("host_only=true + network=None must validate");
+    }
+
+    /// `host_only=false` (the default) with `network=Some(..)` is the
+    /// canonical NIC-attached VM test. Pins that the gate fires only on
+    /// the host_only conflict, not on every `network=Some(..)` entry.
+    #[test]
+    fn validate_accepts_vm_with_network() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "vm_with_network",
+            func: good_test_func,
+            host_only: false,
+            network: Some(crate::vmm::net_config::NetConfig::default()),
+            ..KtstrTestEntry::DEFAULT
+        };
+        entry
+            .validate()
+            .expect("host_only=false + network=Some must validate");
     }
 
     /// `validate()` rejects `cpu_budget = Some(0)` — a zero host-CPU

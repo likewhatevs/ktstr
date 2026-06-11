@@ -21,22 +21,27 @@
 //! (13 << 5) | (8 << 1) | 1 = 433, so vCPUs in the upper LLCs (llc >= 8)
 //! have APIC ID >= 256 without needing a > 256-vCPU host.
 //!
-//! virtio-blk alone is the complete proof: the > 255 ext-dest routing is
-//! device-agnostic (the same userspace-IOAPIC + KVM_SET_GSI_ROUTING path for
-//! every virtio device). virtio-net adds device-type coverage but needs
-//! separate test-attach infra + an AF_PACKET payload (a follow-up).
+//! virtio-blk proves the routing; the > 255 ext-dest path is device-agnostic
+//! (the same userspace-IOAPIC + KVM_SET_GSI_ROUTING for every virtio device).
+//! The sibling `wide_smp_net_irq_e2e.rs` adds the virtio-net device-type leg
+//! (the `network =` attr + an AF_PACKET payload); the APIC-ID/IRQ-count
+//! scaffolding both share lives in `common/wide_smp_irq.rs`.
 //!
 //! Run: cargo run --bin cargo-ktstr -- ktstr test --kernel ../linux \
 //!        -- -E 'test(device_irq_delivers_to_apic_id_above_255)' \
 //!        --success-output immediate
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::prelude::{DiskConfig, DiskThrottle, Filesystem};
 use ktstr::scenario::Ctx;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+
+#[path = "common/wide_smp_irq.rs"]
+mod wide_smp_irq;
+use wide_smp_irq::{device_irq_by_action_name, find_apic_above_255, irq_count, pin_irq_to_cpu};
 
 /// Raw 256 MiB virtio-blk disk. Raw (no filesystem) so the guest writes
 /// directly to /dev/vda to drive request completions. Struct-literal because
@@ -56,36 +61,8 @@ const KTSTR_DISK_EXTDEST: DiskConfig = DiskConfig {
     no_auto_mount: false,
 };
 
-/// Parse `/proc/cpuinfo` into `(processor_number, apic_id)` pairs. The
-/// per-CPU interrupt-count column in `/proc/interrupts` is indexed by the
-/// Linux processor number, while the ext-dest path is selected by APIC ID --
-/// and under the sparse encoding the two differ -- so the test maps between
-/// them here.
-fn cpu_apicids() -> Result<Vec<(usize, u32)>> {
-    let text = fs::read_to_string("/proc/cpuinfo")?;
-    let mut out = Vec::new();
-    let mut cur_cpu: Option<usize> = None;
-    for line in text.lines() {
-        let Some((key, val)) = line.split_once(':') else {
-            continue;
-        };
-        match key.trim() {
-            "processor" => cur_cpu = val.trim().parse().ok(),
-            "apicid" => {
-                if let (Some(cpu), Ok(apic)) = (cur_cpu, val.trim().parse::<u32>()) {
-                    out.push((cpu, apic));
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(out)
-}
-
-/// Discover the virtio-blk IRQ number without hardcoding the GSI. The disk's
-/// sysfs parent is the virtio device, whose basename ("virtioN") is the
-/// `/proc/interrupts` action name; the matching line's leading `<IRQ>:` is
-/// the Linux IRQ number.
+/// The virtio-blk IRQ number: /dev/vda's sysfs parent is the virtio device,
+/// whose basename ("virtioN") is the `/proc/interrupts` action name.
 fn virtio_blk_irq() -> Result<(u32, String)> {
     let dev = fs::canonicalize("/sys/block/vda/device")?;
     let name = dev
@@ -93,46 +70,8 @@ fn virtio_blk_irq() -> Result<(u32, String)> {
         .and_then(|n| n.to_str())
         .ok_or_else(|| anyhow::anyhow!("no basename for {dev:?}"))?
         .to_string();
-    let irqs = fs::read_to_string("/proc/interrupts")?;
-    for line in irqs.lines() {
-        let Some((lhs, rhs)) = line.split_once(':') else {
-            continue;
-        };
-        // The action name is the last whitespace token on the line.
-        if rhs.split_whitespace().last() == Some(name.as_str()) {
-            let irq: u32 = lhs.trim().parse().map_err(|e| {
-                anyhow::anyhow!("non-numeric IRQ '{}' for {name}: {e}", lhs.trim())
-            })?;
-            return Ok((irq, name));
-        }
-    }
-    bail!("no /proc/interrupts line with action name {name}")
-}
-
-/// Read the per-CPU interrupt count for `irq` on Linux processor `cpu`.
-///
-/// x86_64 `/proc/interrupts` layout (no Edge/Level column -- that field is
-/// gated on CONFIG_GENERIC_IRQ_SHOW_LEVEL, which x86 does not select):
-///   `<IRQ>: <c0> <c1> ... <cN-1>  IO-APIC  <hwirq>  <action>`
-/// The first N tokens after `:` are the per-online-CPU counts, indexed by
-/// processor number; the chip name follows. `cpu` is always < N here (all
-/// 252 vCPUs are online), so `tokens[cpu]` is a count, never the chip name.
-fn irq_count(irq: u32, cpu: usize) -> Result<u64> {
-    let irqs = fs::read_to_string("/proc/interrupts")?;
-    let prefix = format!("{irq}:");
-    for line in irqs.lines() {
-        if line.trim_start().starts_with(&prefix) {
-            let rhs = line.split_once(':').unwrap().1;
-            let tokens: Vec<&str> = rhs.split_whitespace().collect();
-            let tok = tokens.get(cpu).ok_or_else(|| {
-                anyhow::anyhow!("cpu {cpu} column missing for irq {irq} (line: {line:?})")
-            })?;
-            return tok.parse::<u64>().map_err(|e| {
-                anyhow::anyhow!("count column {cpu} for irq {irq} not numeric ('{tok}'): {e}")
-            });
-        }
-    }
-    bail!("irq {irq} not found in /proc/interrupts")
+    let irq = device_irq_by_action_name(&name)?;
+    Ok((irq, name))
 }
 
 /// Drive virtio-blk request completions by writing + fsync'ing + reading raw
@@ -174,30 +113,15 @@ fn device_irq_delivers_to_apic_id_above_255(ctx: &Ctx) -> Result<AssertResult> {
     );
 
     // Pick a vCPU whose APIC ID exceeds 255 (the ext-dest threshold). cpu# !=
-    // apic_id under the sparse encoding, so select by APIC ID via /proc/cpuinfo.
-    let apicids = cpu_apicids()?;
-    let (target_cpu, target_apic) = apicids
-        .iter()
-        .copied()
-        .find(|&(_, apic)| apic >= 256)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no vCPU with APIC ID >= 256 (max seen {}); the topology did \
-                 not mint a >255 APIC ID, so the ext-dest path cannot be exercised",
-                apicids.iter().map(|&(_, a)| a).max().unwrap_or(0)
-            )
-        })?;
+    // apic_id under the sparse encoding, so select by APIC ID.
+    let (target_cpu, target_apic) = find_apic_above_255()?;
 
     // Discover the virtio-blk IRQ by device name (no hardcoded GSI).
     let (irq, dev_name) = virtio_blk_irq()?;
 
     // Pin that IRQ to the target CPU. Under x2APIC physical mode this writes
     // the target CPU's exact APIC ID (>= 256) into the RTE destination.
-    fs::write(
-        format!("/proc/irq/{irq}/smp_affinity_list"),
-        target_cpu.to_string(),
-    )
-    .map_err(|e| anyhow::anyhow!("pin irq {irq} to cpu {target_cpu}: {e}"))?;
+    pin_irq_to_cpu(irq, target_cpu)?;
 
     // Baseline after pinning, drive I/O, then re-read the target CPU's count.
     let before = irq_count(irq, target_cpu)?;

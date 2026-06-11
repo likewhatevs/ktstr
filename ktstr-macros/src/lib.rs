@@ -355,6 +355,7 @@ struct AttrValues {
     post_vm: Option<syn::Path>,
     post_vm_unconditional: Option<syn::Path>,
     disk: Option<syn::Path>,
+    network: Option<syn::Path>,
     // -- Assert overrides (Option<T>) --
     not_starved: Option<bool>,
     isolation: Option<bool>,
@@ -454,6 +455,7 @@ impl Default for AttrValues {
             post_vm: None,
             post_vm_unconditional: None,
             disk: None,
+            network: None,
             // Assert overrides
             not_starved: None,
             isolation: None,
@@ -727,6 +729,11 @@ impl AttrValues {
 ///     `host_only` skips the VM boot that owns the device lifecycle,
 ///     so a `disk` attached under `host_only` would never bind;
 ///     `KtstrTestEntry::validate` rejects the pairing at runtime.
+///   - `network = PATH` — path to a `const NetConfig` attaching a
+///     virtio-net device (in-VMM loopback backend). Construct via
+///     `NetConfig::DEFAULT.mac(...)` or `NetConfig::DEFAULT` (const-fn
+///     chain). Maps onto `KtstrTestEntry::network`. Default: `None`
+///     (no NIC). Like `disk`, mutually exclusive with `host_only`.
 ///   - `config = EXPR` — inline scheduler config content, written
 ///     into the guest at the path declared by the scheduler's
 ///     `config_file_def`. `EXPR` is either a string literal or a
@@ -1352,6 +1359,15 @@ fn ktstr_test_impl(
                              or similar const-fn chain",
                         )?);
                     }
+                    "network" => {
+                        attrs.network = Some(expect_path_value(
+                            value,
+                            "expected path for network (e.g. MY_NET \
+                             where MY_NET is a `const NetConfig`); \
+                             construct via `NetConfig::DEFAULT.mac(...)` \
+                             or similar const-fn chain",
+                        )?);
+                    }
                     "config" => {
                         let tokens = expect_string_or_path_tokens(
                             value,
@@ -1642,7 +1658,7 @@ fn ktstr_test_impl(
                         return Err(syn::Error::new_spanned(
                             path,
                             format!(
-                                "unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mib, scheduler, staged_schedulers, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, expect_scx_bpf_error_contains, expect_scx_bpf_error_matches, extra_sched_args, extra_include_files, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, cpu_budget, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, bpf_map_write, expect_err, allow_inconclusive, host_only, ignore, cleanup_budget_ms, post_vm, post_vm_unconditional, config, disk, num_snapshots, wprof, wprof_args"
+                                "unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mib, scheduler, staged_schedulers, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, expect_scx_bpf_error_contains, expect_scx_bpf_error_matches, extra_sched_args, extra_include_files, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, cpu_budget, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, bpf_map_write, expect_err, allow_inconclusive, host_only, ignore, cleanup_budget_ms, post_vm, post_vm_unconditional, config, disk, network, num_snapshots, wprof, wprof_args"
                             ),
                         ));
                     }
@@ -1786,6 +1802,7 @@ fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2::TokenStre
         post_vm,
         post_vm_unconditional,
         disk,
+        network,
         not_starved,
         isolation,
         max_gap_ms,
@@ -2177,6 +2194,7 @@ fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2::TokenStre
     // at emission. The struct is `Clone` so spreading a const ref
     // into a `static` initializer works.
     let disk_field = some_wrapped_entry_field(&disk, quote! { disk });
+    let network_field = some_wrapped_entry_field(&network, quote! { network });
 
     // `workload_root_cgroup = "/path"` lands in
     // `KtstrTestEntry::workload_root_cgroup` as
@@ -2399,6 +2417,7 @@ fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2::TokenStre
             #post_vm_unconditional_field
             #config_content_field
             #disk_field
+            #network_field
             #workload_root_cgroup_field
             ..::ktstr::test_support::KtstrTestEntry::DEFAULT
         };
@@ -5045,6 +5064,7 @@ mod tests {
         assert!(d.post_vm.is_none());
         assert!(d.post_vm_unconditional.is_none());
         assert!(d.disk.is_none());
+        assert!(d.network.is_none());
 
         // -- Assert overrides --
         assert_eq!(d.not_starved, None);
