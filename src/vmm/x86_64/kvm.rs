@@ -1,16 +1,21 @@
 use anyhow::{Context, Result};
 use kvm_bindings::{
     KVM_CAP_HALT_POLL, KVM_CAP_SPLIT_IRQCHIP, KVM_CAP_X2APIC_API, KVM_CAP_X86_DISABLE_EXITS,
-    KVM_CLOCK_TSC_STABLE, KVM_PIT_SPEAKER_DUMMY, KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK,
-    KVM_X2APIC_API_USE_32BIT_IDS, KVM_X86_DISABLE_EXITS_HLT, KVM_X86_DISABLE_EXITS_PAUSE,
-    kvm_enable_cap, kvm_pit_config,
+    KVM_CLOCK_TSC_STABLE, KVM_IRQ_ROUTING_MSI, KVM_PIT_SPEAKER_DUMMY,
+    KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK, KVM_X2APIC_API_USE_32BIT_IDS,
+    KVM_X86_DISABLE_EXITS_HLT, KVM_X86_DISABLE_EXITS_PAUSE, KvmIrqRouting, kvm_enable_cap,
+    kvm_irq_routing, kvm_irq_routing_entry, kvm_irq_routing_entry__bindgen_ty_1,
+    kvm_irq_routing_msi, kvm_irq_routing_msi__bindgen_ty_1, kvm_pit_config,
 };
 use kvm_ioctls::{Cap, Kvm, VcpuFd, VmFd};
 use std::mem::ManuallyDrop;
+use std::sync::Arc;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
+use super::ioapic::{IOAPIC_BASE, IOAPIC_SIZE, Ioapic, MsiRoute};
 use super::topology::{generate_cpuid, max_apic_id};
 use crate::vmm::numa_mem::{NumaMemoryLayout, ReservationGuard};
+use crate::vmm::pi_mutex::PiMutex;
 use crate::vmm::topology::Topology;
 
 /// Physical address where the kernel is loaded.
@@ -50,20 +55,19 @@ pub(crate) const VIRTIO_BLK_MMIO_BASE: u64 = MMIO_GAP_START + 0x1000;
 /// Each virtio-mmio device occupies `VIRTIO_MMIO_SIZE = 0x1000`.
 pub(crate) const VIRTIO_NET_MMIO_BASE: u64 = MMIO_GAP_START + 0x2000;
 
-/// IRQ for virtio-console (GSI routed through IOAPIC).
-/// Uses IRQ 5 — available with full IRQ chip. With split IRQ chip
-/// (no IOAPIC), MSI would be needed; not supported for now.
+/// GSI for virtio-console. On the in-kernel-irqchip path the in-kernel
+/// IOAPIC routes this GSI; on split-irqchip (>254 APIC IDs) the userspace
+/// IOAPIC translates the guest's RTE for it into an MSI route.
 pub(crate) const VIRTIO_CONSOLE_IRQ: u32 = 5;
 
-/// IRQ for virtio-block (GSI 6, full IRQ chip). Same constraints as
-/// virtio-console — split-irqchip not supported. IOAPIC GSI ≤23
-/// limit leaves ample free slots for additional virtio devices
-/// after COM1=4, COM2=3, virtio-console=5, virtio-blk=6.
+/// GSI for virtio-block. Routed via the in-kernel IOAPIC (<=254) or the
+/// userspace IOAPIC (split-irqchip, >254). The IOAPIC's 24-line cap leaves
+/// ample free slots after COM1=4, COM2=3, virtio-console=5, virtio-blk=6.
 pub(crate) const VIRTIO_BLK_IRQ: u32 = 6;
 
-/// IRQ for virtio-net (GSI 7, full IRQ chip). Same constraints as
-/// virtio-blk — split-irqchip not supported. Still well within the
-/// IOAPIC's 24-line cap.
+/// GSI for virtio-net. Routed via the in-kernel IOAPIC (<=254) or the
+/// userspace IOAPIC (split-irqchip, >254); well within the IOAPIC's
+/// 24-line cap.
 pub(crate) const VIRTIO_NET_IRQ: u32 = 7;
 
 /// E820 memory type: usable RAM.
@@ -125,6 +129,11 @@ pub struct KtstrKvm {
     /// Split IRQ chip mode: LAPIC in kernel, PIC/IOAPIC emulated in userspace.
     /// Enabled when any APIC ID exceeds the 8-bit xAPIC limit (254).
     pub(crate) split_irqchip: bool,
+    /// Userspace IOAPIC device, present only on the split-irqchip path.
+    /// The run loops wrap it in an [`IoapicHandle`] (device + raw VM fd) to
+    /// service IOAPIC MMIO and reprogram MSI routes; `None` for <=254-vCPU
+    /// guests, which use the in-kernel IOAPIC.
+    pub(crate) ioapic: Option<Arc<PiMutex<Ioapic>>>,
     /// Whether hugepages were requested at construction time.
     /// Stored so deferred memory allocation uses the same backing.
     use_hugepages: bool,
@@ -304,6 +313,12 @@ impl KtstrKvm {
                 .create_pit2(pit_config)
                 .map_err(|e| crate::vmm::map_transient_to_contention(e, "create PIT"))?;
         }
+
+        // Userspace IOAPIC device for the split-irqchip path (no in-kernel
+        // IOAPIC there). `None` for <=254-vCPU guests. The run loops build an
+        // IoapicHandle around this to translate guest RTE writes into MSI
+        // routes; see `super::ioapic` and `IoapicHandle`.
+        let ioapic = split_irqchip.then(|| Arc::new(PiMutex::new(Ioapic::new())));
 
         // Disable PAUSE and HLT VM exits in performance mode.
         // Two separate enable_cap calls: kvm_disable_exits() uses |=
@@ -496,6 +511,7 @@ impl KtstrKvm {
             numa_layout,
             has_immediate_exit,
             split_irqchip,
+            ioapic,
             use_hugepages,
             performance_mode,
             _reservation: reservation,
@@ -598,9 +614,207 @@ pub(crate) fn kvm_set_clock_via_raw_fd(
     }
 }
 
+/// Call `KVM_SET_GSI_ROUTING` via a raw VM fd (libc::ioctl direct).
+/// Sibling of [`kvm_set_clock_via_raw_fd`] for the userspace-IOAPIC
+/// (split-irqchip / >255-vCPU) path: an AP run loop holds only a cached
+/// Copy raw vm fd, not `&vm.vm_fd`, and reprograms the device MSI routes
+/// when the guest writes the IOAPIC redirection table. Mirrors
+/// `kvm_ioctls::VmFd::set_gsi_routing` — same ioctl, same `kvm_irq_routing`
+/// FAM payload. `KVM_SET_GSI_ROUTING` is a whole-table replace
+/// (virt/kvm/irqchip.c `kvm_set_irq_routing`, under `kvm->irq_lock` plus an
+/// SRCU grace period), so the caller passes the COMPLETE route set.
+pub(crate) fn kvm_set_gsi_routing_via_raw_fd(
+    vm_fd: i32,
+    routing: &KvmIrqRouting,
+) -> std::io::Result<()> {
+    // ioctl_iow_nr!(KVM_SET_GSI_ROUTING, KVMIO=0xAE, 0x6a, kvm_irq_routing)
+    // = _IOW(0xAE, 0x6a, size_of::<kvm_irq_routing>()) = 0x4008_AE6A. The
+    // encoded size is the FAM HEADER (nr:u32 + flags:u32 = 8); the kernel
+    // reads `nr` entries past the pointer.
+    const _: () = assert!(std::mem::size_of::<kvm_irq_routing>() == 8);
+    const KVM_SET_GSI_ROUTING_IOCTL: libc::c_ulong = 0x4008_AE6A;
+    // SAFETY: `vm_fd` is a live kvm vm fd (cached from vm.vm_fd.as_raw_fd(),
+    // valid for the run loop's lifetime). `as_fam_struct_ref()` points at a
+    // `kvm_irq_routing` whose `nr` matches the entries the kernel reads.
+    let rc = unsafe {
+        libc::ioctl(
+            vm_fd,
+            KVM_SET_GSI_ROUTING_IOCTL,
+            routing.as_fam_struct_ref() as *const kvm_irq_routing,
+        )
+    };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Build a `KVM_SET_GSI_ROUTING` table from the IOAPIC's `(gsi, MsiRoute)`
+/// set. Each entry is a `KVM_IRQ_ROUTING_MSI` route carrying the
+/// extended-destination MSI the IOAPIC translated the guest's RTE into.
+fn build_device_msi_routing(routes: &[(u32, MsiRoute)]) -> Result<KvmIrqRouting> {
+    let mut routing = KvmIrqRouting::new(routes.len()).map_err(|e| {
+        anyhow::anyhow!("allocate kvm_irq_routing for {} routes: {e:?}", routes.len())
+    })?;
+    let slice = routing.as_mut_slice();
+    for (i, (gsi, msi)) in routes.iter().enumerate() {
+        slice[i] = kvm_irq_routing_entry {
+            gsi: *gsi,
+            type_: KVM_IRQ_ROUTING_MSI,
+            flags: 0,
+            pad: 0,
+            u: kvm_irq_routing_entry__bindgen_ty_1 {
+                msi: kvm_irq_routing_msi {
+                    address_lo: msi.address_lo,
+                    address_hi: msi.address_hi,
+                    data: msi.data,
+                    __bindgen_anon_1: kvm_irq_routing_msi__bindgen_ty_1 { pad: 0 },
+                },
+            },
+        };
+    }
+    Ok(routing)
+}
+
+/// Owns the userspace IOAPIC device plus the cached raw VM fd needed to
+/// reprogram KVM's MSI routing table. Cloned (via `Arc`) into each AP run
+/// loop on the split-irqchip path; `None` on the in-kernel-irqchip path
+/// (<=254 vCPUs), where the kernel IOAPIC delivers device IRQs directly.
+pub(crate) struct IoapicHandle {
+    ioapic: Arc<PiMutex<Ioapic>>,
+    vm_fd_raw: i32,
+    /// Count of failed `KVM_SET_GSI_ROUTING` installs. A failure leaves a
+    /// guest-programmed device IRQ unrouted — it will not deliver and the
+    /// device hangs on first use. Bumped in `mmio_write`, read at teardown
+    /// (`routing_failures`) so a hung-device test reports the count instead of
+    /// an opaque timeout.
+    routing_failures: std::sync::atomic::AtomicU64,
+}
+
+impl IoapicHandle {
+    pub(crate) fn new(ioapic: Arc<PiMutex<Ioapic>>, vm_fd_raw: i32) -> Self {
+        IoapicHandle {
+            ioapic,
+            vm_fd_raw,
+            routing_failures: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Service a guest MMIO read of the IOAPIC window.
+    pub(crate) fn mmio_read(&self, offset: u64, data: &mut [u8]) {
+        self.ioapic.lock().mmio_read(offset, data);
+    }
+
+    /// Service a guest MMIO write of the IOAPIC window. If the write changed
+    /// a redirection entry, rebuild and install the full MSI routing table.
+    /// The route snapshot is taken under the device lock; the ioctl (which
+    /// waits an SRCU grace period) runs unlocked so it never stalls another
+    /// vCPU's IOAPIC access against the vCPU-thread blocking budget.
+    pub(crate) fn mmio_write(&self, offset: u64, data: &[u8]) -> Result<()> {
+        let routes = {
+            let mut io = self.ioapic.lock();
+            if io.mmio_write(offset, data) {
+                Some(io.gsi_routes())
+            } else {
+                None
+            }
+        };
+        if let Some(routes) = routes {
+            let routing = build_device_msi_routing(&routes)?;
+            if let Err(e) = kvm_set_gsi_routing_via_raw_fd(self.vm_fd_raw, &routing) {
+                self.routing_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(anyhow::anyhow!("KVM_SET_GSI_ROUTING: {e}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Service a `KVM_EXIT_IOAPIC_EOI` for `vector` (clears remote-IRR on a
+    /// matching level entry; a no-op for the edge device pins of v0).
+    pub(crate) fn eoi(&self, vector: u8) {
+        // v0 is edge-only, so end_of_interrupt's returned pending-pins Vec is
+        // always empty (edge entries never set remote-IRR, and this IOAPIC is a
+        // register-file + MSI translator that never *services* a pin, so
+        // remote-IRR is never set at all). The Vec is intentionally dropped;
+        // the debug_assert is a tripwire so that adding a level-triggered
+        // device WITHOUT completing level re-injection fails loudly in tests
+        // instead of silently dropping the re-assert and wedging the line.
+        let pending = self.ioapic.lock().end_of_interrupt(vector);
+        debug_assert!(
+            pending.is_empty(),
+            "v0 IOAPIC is edge-only but EOI returned {} pin(s) needing level \
+             re-injection — a level-triggered device was added without \
+             completing level support (re-injection is dropped here)",
+            pending.len()
+        );
+    }
+
+    /// Number of failed `KVM_SET_GSI_ROUTING` installs since VM start. Read at
+    /// teardown to surface routing failures into the result (a nonzero count
+    /// explains a device that never delivered IRQs).
+    pub(crate) fn routing_failures(&self) -> u64 {
+        self.routing_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// If `addr` lies in the IOAPIC MMIO window, the offset within it;
+    /// otherwise `None`. Lets the run-loop dispatcher route an MMIO exit
+    /// without importing the device's base/size constants.
+    pub(crate) fn in_range(&self, addr: u64) -> Option<u64> {
+        (addr >= IOAPIC_BASE && addr < IOAPIC_BASE + IOAPIC_SIZE).then(|| addr - IOAPIC_BASE)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_device_msi_routing_lays_out_fam_entries() {
+        let routes = vec![
+            (
+                4u32,
+                MsiRoute {
+                    address_lo: 0xFEE0_1004,
+                    address_hi: 0x0000_0100,
+                    data: 0x0000_8030,
+                },
+            ),
+            (
+                6u32,
+                MsiRoute {
+                    address_lo: 0xFEE0_2000,
+                    address_hi: 0x0000_0000,
+                    data: 0x0000_0040,
+                },
+            ),
+        ];
+        let mut routing = build_device_msi_routing(&routes).expect("build routing");
+        let entries = routing.as_mut_slice();
+        assert_eq!(entries.len(), 2, "one FAM entry per route");
+        for (i, (gsi, msi)) in routes.iter().enumerate() {
+            let e = &entries[i];
+            assert_eq!(e.gsi, *gsi, "entry {i} gsi");
+            assert_eq!(e.type_, KVM_IRQ_ROUTING_MSI, "entry {i} type is MSI");
+            assert_eq!(e.flags, 0, "entry {i} flags");
+            // SAFETY: every entry was built as the `.msi` union variant above.
+            let m = unsafe { e.u.msi };
+            assert_eq!(m.address_lo, msi.address_lo, "entry {i} address_lo");
+            assert_eq!(m.address_hi, msi.address_hi, "entry {i} address_hi");
+            assert_eq!(m.data, msi.data, "entry {i} data");
+        }
+    }
+
+    #[test]
+    fn build_device_msi_routing_empty_is_valid() {
+        // All-masked IOAPIC -> empty route set -> nr=0 table (the re-mask-all
+        // case the kernel reviewer verified: FamStructWrapper::new(0) yields a
+        // valid header-only kvm_irq_routing{nr:0}).
+        let mut routing = build_device_msi_routing(&[]).expect("empty routing");
+        assert_eq!(routing.as_mut_slice().len(), 0, "no entries for empty set");
+    }
     use std::os::fd::AsRawFd;
     use vm_memory::GuestMemory;
 

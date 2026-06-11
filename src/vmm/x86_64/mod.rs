@@ -1,5 +1,6 @@
 pub mod acpi;
 pub mod boot;
+pub(crate) mod ioapic;
 pub mod kvm;
 pub mod mptable;
 pub(crate) mod msr_indices;

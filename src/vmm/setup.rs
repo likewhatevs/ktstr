@@ -407,37 +407,15 @@ impl KtstrVm {
         blk.set_mem((*vm.guest_mem).clone());
         let blk_arc = Arc::new(PiMutex::new(blk));
 
-        // irqfd registration. On x86_64 with split irqchip, IOAPIC
-        // routing is unavailable: the kernel's split-irqchip mode
-        // emulates the LAPIC in-kernel and leaves PIC/IOAPIC to
-        // userspace. The framework does not implement userspace IOAPIC
-        // dispatch for virtio-mmio, and the kernel virtio_blk driver
-        // has no `mq_ops->timeout` (drivers/block/virtio_blk.c) and no
-        // polling fallback — without an IRQ delivery path, blk-mq
-        // hangs on every request until the hung-task watchdog fires
-        // (default 120 s). Reject loudly here so a topology that
-        // exceeds the 8-bit xAPIC limit (max APIC ID > 254) surfaces
-        // immediately instead of producing a silent guest hang.
-        #[cfg(target_arch = "x86_64")]
-        if vm.split_irqchip {
-            anyhow::bail!(
-                "virtio-blk requires irqfd; split-irqchip mode has no \
-                 IOAPIC and the kernel virtio_mmio driver has no polling \
-                 fallback — reduce topology so all APIC IDs are at or below 254 (MAX_XAPIC_ID)",
-            );
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            vm.vm_fd
-                .register_irqfd(blk_arc.lock().irq_evt(), kvm::VIRTIO_BLK_IRQ)
-                .context("register virtio-blk irqfd")?;
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            vm.vm_fd
-                .register_irqfd(blk_arc.lock().irq_evt(), kvm::VIRTIO_BLK_IRQ)
-                .context("register virtio-blk irqfd")?;
-        }
+        // irqfd registration. On x86's split-irqchip path (max APIC ID > 254)
+        // the device IRQ is delivered via the userspace IOAPIC: register_irqfd
+        // binds the GSI's eventfd, and the guest's IOAPIC RTE write installs
+        // the matching MSI route (see super::x86_64::ioapic + IoapicHandle).
+        // On the in-kernel-irqchip (x86 <=254) and aarch64 (GIC) paths the
+        // kernel routes the GSI directly. The call is identical on both arches.
+        vm.vm_fd
+            .register_irqfd(blk_arc.lock().irq_evt(), kvm::VIRTIO_BLK_IRQ)
+            .context("register virtio-blk irqfd")?;
 
         Ok(Some(blk_arc))
     }
@@ -450,8 +428,8 @@ impl KtstrVm {
     ///   - the configured MAC baked into config space,
     ///   - guest memory set so subsequent `process_tx_loopback` calls
     ///     can read TX descriptor data and write into RX descriptors,
-    ///   - the irqfd registered with the VM (rejected on x86 split
-    ///     irqchip via `bail!()` below, matching virtio-blk).
+    ///   - the irqfd registered with the VM (delivered via the userspace
+    ///     IOAPIC on x86 split-irqchip, the in-kernel IOAPIC/GIC otherwise).
     ///
     /// The framework reserves a single MMIO base + IRQ pair
     /// (`VIRTIO_NET_MMIO_BASE` / `VIRTIO_NET_IRQ`); the builder's
@@ -468,31 +446,13 @@ impl KtstrVm {
         dev.set_mem((*vm.guest_mem).clone());
         let net_arc = Arc::new(PiMutex::new(dev));
 
-        // irqfd registration. Same split-irqchip rejection rationale
-        // as virtio-blk above: the kernel virtio_net driver depends
-        // on IRQ-driven NAPI to wake on RX, and an undelivered IRQ
-        // produces a silent guest hang. Reject loudly so the test
-        // setup is caught here.
-        #[cfg(target_arch = "x86_64")]
-        if vm.split_irqchip {
-            anyhow::bail!(
-                "virtio-net requires irqfd; split-irqchip mode has no \
-                 IOAPIC and the kernel virtio_mmio driver has no polling \
-                 fallback — reduce topology so all APIC IDs are at or below 254 (MAX_XAPIC_ID)",
-            );
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            vm.vm_fd
-                .register_irqfd(net_arc.lock().irq_evt(), kvm::VIRTIO_NET_IRQ)
-                .context("register virtio-net irqfd")?;
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            vm.vm_fd
-                .register_irqfd(net_arc.lock().irq_evt(), kvm::VIRTIO_NET_IRQ)
-                .context("register virtio-net irqfd")?;
-        }
+        // irqfd registration. On x86's split-irqchip path (>254 APIC IDs) the
+        // device IRQ routes through the userspace IOAPIC (the guest's RTE write
+        // installs the MSI route); on the in-kernel-irqchip (x86 <=254) and
+        // aarch64 (GIC) paths the kernel routes the GSI. Identical on both.
+        vm.vm_fd
+            .register_irqfd(net_arc.lock().irq_evt(), kvm::VIRTIO_NET_IRQ)
+            .context("register virtio-net irqfd")?;
 
         Ok(Some(net_arc))
     }

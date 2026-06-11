@@ -196,6 +196,16 @@ pub use aarch64::boot;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::kvm;
 
+/// Arch-neutral handle for the userspace IOAPIC. On x86_64 it is the real
+/// device handle ([`x86_64::kvm::IoapicHandle`], the split-irqchip /
+/// >255-vCPU path); on other targets it is uninhabited, so the run loop's
+/// `Option<&IoapicHandle>` is always `None` and the (x86-only) IOAPIC
+/// dispatch arms are never compile-reached.
+#[cfg(target_arch = "x86_64")]
+pub(crate) use x86_64::kvm::IoapicHandle;
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) enum IoapicHandle {}
+
 pub use topology::Topology;
 
 use anyhow::{Context, Result};
@@ -836,23 +846,28 @@ impl KtstrVm {
         let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
         let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
 
+        // Userspace IOAPIC handle for the split-irqchip path (>254 vCPUs),
+        // mirroring run_vm: the device + the raw VM fd, threaded into
+        // spawn_ap_threads + run_bsp_loop so the interactive shell's serial /
+        // virtio-console IRQs route via the userspace IOAPIC. `None` for
+        // <=254 vCPUs (in-kernel IOAPIC).
+        let ioapic_handle: Option<Arc<crate::vmm::IoapicHandle>> = vm.ioapic.as_ref().map(|io| {
+            Arc::new(crate::vmm::IoapicHandle::new(
+                io.clone(),
+                std::os::unix::io::AsRawFd::as_raw_fd(&*vm.vm_fd),
+            ))
+        });
+
         // Virtio-console for shell I/O via /dev/hvc0.
         let mut vc = virtio_console::VirtioConsole::new();
         vc.set_mem((*vm.guest_mem).clone());
         let virtio_con = Arc::new(PiMutex::new(vc));
 
-        // Split-irqchip rejection: see freeze_coord.rs run_vm for the
-        // full rationale. Without an IOAPIC, COM1/COM2/virtio-console
-        // have no IRQ delivery path and the guest hangs on first I/O.
-        #[cfg(target_arch = "x86_64")]
-        if vm.split_irqchip {
-            anyhow::bail!(
-                "interactive shell requires irqfd; split-irqchip mode \
-                 has no IOAPIC and the guest's serial / virtio-console \
-                 drivers have no polling fallback — reduce topology \
-                 so all APIC IDs are at or below 254 (MAX_XAPIC_ID)",
-            );
-        }
+        // Register serial + virtio-console irqfds. On x86 split-irqchip
+        // (>254 APIC IDs) the routes are installed by the userspace IOAPIC
+        // when the guest programs its RTEs (ioapic_handle above is threaded
+        // into the run loops); on the in-kernel-irqchip (x86 <=254) and
+        // aarch64 (GIC) paths the kernel routes the GSIs directly.
         #[cfg(target_arch = "x86_64")]
         {
             vm.vm_fd
@@ -986,6 +1001,7 @@ impl KtstrVm {
             Some(&virtio_con),
             virtio_blk.as_ref(),
             virtio_net.as_ref(),
+            ioapic_handle.as_ref(),
             &kill,
             &kill_evt,
             &freeze,
@@ -1340,6 +1356,7 @@ impl KtstrVm {
             Some(&virtio_con),
             virtio_blk.as_ref(),
             virtio_net.as_ref(),
+            ioapic_handle.as_ref(),
             &kill,
             &freeze,
             &watchpoint,

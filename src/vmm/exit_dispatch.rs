@@ -10,6 +10,7 @@
 //!   / `dispatch_mmio_read`).
 
 use crate::sync::MutexExt;
+use crate::vmm::IoapicHandle;
 use crate::vmm::PiMutex;
 use crate::vmm::vcpu::{SCX_EXIT_ERROR_THRESHOLD, WatchpointArm, self_arm_watchpoint};
 use crate::vmm::{console, kvm, virtio_blk, virtio_console, virtio_net};
@@ -876,6 +877,7 @@ pub(crate) fn vcpu_run_loop_unified(
     virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
     virtio_blk: Option<&Arc<PiMutex<virtio_blk::VirtioBlk>>>,
     virtio_net: Option<&Arc<PiMutex<virtio_net::VirtioNet>>>,
+    ioapic: Option<&Arc<IoapicHandle>>,
     kill: &Arc<AtomicBool>,
     kill_evt: &Arc<EventFd>,
     freeze: &Arc<AtomicBool>,
@@ -1006,6 +1008,7 @@ pub(crate) fn vcpu_run_loop_unified(
                     virtio_con.map(|a| a.as_ref()),
                     virtio_blk.map(|a| a.as_ref()),
                     virtio_net.map(|a| a.as_ref()),
+                    ioapic.map(|a| a.as_ref()),
                     &mut exit,
                 ) {
                     Some(ExitAction::Continue) | None => {}
@@ -1267,12 +1270,14 @@ pub(crate) enum ExitAction {
 /// On aarch64, serial and virtio-console are dispatched via MMIO.
 /// On x86_64, serial is dispatched via port I/O; virtio-console via MMIO.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
 pub(crate) fn classify_exit(
     com1: &PiMutex<console::Serial>,
     com2: &PiMutex<console::Serial>,
     virtio_con: Option<&PiMutex<virtio_console::VirtioConsole>>,
     virtio_blk: Option<&PiMutex<virtio_blk::VirtioBlk>>,
     virtio_net: Option<&PiMutex<virtio_net::VirtioNet>>,
+    ioapic: Option<&IoapicHandle>,
     exit: &mut VcpuExit,
 ) -> Option<ExitAction> {
     match exit {
@@ -1335,6 +1340,15 @@ pub(crate) fn classify_exit(
                     return Some(ExitAction::Continue);
                 }
             }
+            // Userspace IOAPIC (split-irqchip). Cold: the guest reads the
+            // redirection table only during IRQ setup. Checked after the hot
+            // virtio ranges so a virtio MMIO exit never reaches here.
+            if let Some(io) = ioapic {
+                if let Some(off) = io.in_range(*addr) {
+                    io.mmio_read(off, data);
+                    return Some(ExitAction::Continue);
+                }
+            }
             for b in data.iter_mut() {
                 *b = 0xff;
             }
@@ -1362,6 +1376,35 @@ pub(crate) fn classify_exit(
                     vn.lock().mmio_write(*addr - base, data);
                     return Some(ExitAction::Continue);
                 }
+            }
+            // Userspace IOAPIC (split-irqchip), checked after the hot virtio
+            // ranges. An RTE write rebuilds the MSI routing table (cold path).
+            if let Some(io) = ioapic {
+                if let Some(off) = io.in_range(*addr) {
+                    if let Err(e) = io.mmio_write(off, data) {
+                        // A failed KVM_SET_GSI_ROUTING leaves the guest's
+                        // just-programmed device IRQ unrouted — it will not
+                        // deliver and the device hangs on first use. Loud +
+                        // counted (surfaced at teardown via routing_failures())
+                        // so a hung-device test reports the cause instead of an
+                        // opaque timeout.
+                        tracing::error!(
+                            count = io.routing_failures(),
+                            "ioapic: KVM_SET_GSI_ROUTING failed: {e:#}"
+                        );
+                    }
+                    return Some(ExitAction::Continue);
+                }
+            }
+            Some(ExitAction::Continue)
+        }
+        #[cfg(target_arch = "x86_64")]
+        VcpuExit::IoapicEoi(vector) => {
+            // Split-irqchip level-EOI exit. Edge device pins (v0) never raise
+            // it; serviced defensively so a level entry's remote-IRR is
+            // cleared rather than wedging the line.
+            if let Some(io) = ioapic {
+                io.eoi(*vector);
             }
             Some(ExitAction::Continue)
         }
@@ -1527,7 +1570,7 @@ mod tests {
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
         let data = [I8042_CMD_RESET_CPU];
         let mut exit = VcpuExit::IoOut(I8042_CMD_PORT, &data);
-        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
         assert!(
             matches!(action, Some(ExitAction::Shutdown)),
             "IoOut(0x64, [0xFE]) — i8042 reset — must classify as Shutdown"
@@ -1541,7 +1584,7 @@ mod tests {
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
         let data = [b'Z'];
         let mut exit = VcpuExit::IoOut(console::COM1_BASE, &data);
-        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
         assert!(
             matches!(action, Some(ExitAction::Continue)),
             "IoOut to COM1 must classify as Continue (no reboot)"
@@ -1562,7 +1605,7 @@ mod tests {
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
         let mut data = [0xFFu8; 1];
         let mut exit = VcpuExit::IoIn(console::COM1_BASE, &mut data);
-        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
         assert!(
             matches!(action, Some(ExitAction::Continue)),
             "IoIn to COM1 must classify as Continue"
@@ -1587,7 +1630,7 @@ mod tests {
         // which ktstr does not back with any MMIO device.
         let mut buf = [0u8; 4];
         let mut exit = VcpuExit::MmioRead(0x1000, &mut buf);
-        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
         assert!(
             matches!(action, Some(ExitAction::Continue)),
             "Unmapped MMIO read must classify as Continue (not Fatal)"
@@ -1612,7 +1655,7 @@ mod tests {
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
         let data = [0xAAu8, 0xBB];
         let mut exit = VcpuExit::MmioWrite(0x1000, &data);
-        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
         assert!(
             matches!(action, Some(ExitAction::Continue)),
             "Unmapped MMIO write must classify as Continue"
@@ -1641,7 +1684,7 @@ mod tests_arch_neutral {
         let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
         let mut exit = VcpuExit::Hlt;
-        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
         assert!(action.is_none(), "Hlt must classify as None");
     }
 
@@ -1650,7 +1693,7 @@ mod tests_arch_neutral {
         let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
         let mut exit = VcpuExit::Shutdown;
-        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
         assert!(
             matches!(action, Some(ExitAction::Shutdown)),
             "Shutdown variant must classify as ExitAction::Shutdown"
@@ -1666,7 +1709,7 @@ mod tests_arch_neutral {
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
         let data: [u64; 0] = [];
         let mut exit = VcpuExit::SystemEvent(KVM_SYSTEM_EVENT_SHUTDOWN, &data);
-        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
         assert!(
             matches!(action, Some(ExitAction::Shutdown)),
             "SystemEvent(SHUTDOWN=1) must classify as Shutdown"
@@ -1682,7 +1725,7 @@ mod tests_arch_neutral {
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
         let data: [u64; 0] = [];
         let mut exit = VcpuExit::SystemEvent(KVM_SYSTEM_EVENT_RESET, &data);
-        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
         assert!(
             matches!(action, Some(ExitAction::Shutdown)),
             "SystemEvent(RESET=2) must classify as Shutdown"
@@ -1703,7 +1746,7 @@ mod tests_arch_neutral {
         // WAKEUP, S2IDLE, SUSPEND} — picked to defend against future
         // expansion of the legitimate set without flipping this test.
         let mut exit = VcpuExit::SystemEvent(99, &data);
-        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
         assert!(
             matches!(action, Some(ExitAction::Continue)),
             "SystemEvent with unknown type must classify as Continue, \
@@ -1721,7 +1764,7 @@ mod tests_arch_neutral {
         let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
         let mut exit = VcpuExit::FailEntry(0xdead_beef, 7);
-        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
         match action {
             Some(ExitAction::Fatal(Some(reason))) => assert_eq!(
                 reason, 0xdead_beef,
@@ -1742,7 +1785,7 @@ mod tests_arch_neutral {
         let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
         let mut exit = VcpuExit::InternalError;
-        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
         assert!(
             matches!(action, Some(ExitAction::Fatal(None))),
             "InternalError must classify as Fatal(None)"
@@ -1833,7 +1876,7 @@ mod tests_aarch64 {
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
         let data = [b'Q'];
         let mut exit = VcpuExit::MmioWrite(kvm::SERIAL_MMIO_BASE, &data);
-        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
         assert!(
             matches!(action, Some(ExitAction::Continue)),
             "aarch64 MmioWrite to serial must classify as Continue"
@@ -1853,7 +1896,7 @@ mod tests_aarch64 {
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
         let mut buf = [0u8; 4];
         let mut exit = VcpuExit::MmioRead(0x10_0000, &mut buf);
-        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
         assert!(
             matches!(action, Some(ExitAction::Continue)),
             "Unmapped aarch64 MMIO read must classify as Continue"

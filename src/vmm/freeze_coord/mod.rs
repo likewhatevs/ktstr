@@ -904,25 +904,25 @@ impl KtstrVm {
     ) -> Result<VmRunState> {
         let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
         let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
+        // Userspace IOAPIC handle for the split-irqchip path: the device + the
+        // (Copy) raw VM fd, so each run loop reprograms MSI routes on a guest
+        // RTE write without borrowing `&vm.vm_fd`. Created here, in the same
+        // scope as the device handles, so it is visible to both the BSP loop
+        // and the per-AP spawn. The raw fd is alive for `run_vm`; the APs only
+        // touch the IOAPIC while the VM runs (at shutdown `kill` stops them
+        // before vm drops), so the post-drop window is held-but-unused. `None`
+        // for <=254-vCPU guests (in-kernel IOAPIC).
+        let ioapic_handle: Option<Arc<crate::vmm::IoapicHandle>> = vm
+            .ioapic
+            .as_ref()
+            .map(|io| Arc::new(crate::vmm::IoapicHandle::new(io.clone(), vm.vm_fd.as_raw_fd())));
 
         // Register serial EventFds with KVM's irqfd for interrupt-driven TX.
-        // Split-irqchip mode lacks IOAPIC routing (LAPIC-only kernel
-        // emulation; PIC/IOAPIC live in userspace and the framework
-        // does not implement the userspace IOAPIC dispatch). Without
-        // an IRQ delivery path the guest's serial driver hangs on the
-        // first TX/RX wake — the kernel uart driver has no polling
-        // fallback. Reject loudly so test setups exceeding the
-        // 8-bit xAPIC limit (max APIC ID > 254) are caught here
-        // instead of producing a silent guest hang.
-        #[cfg(target_arch = "x86_64")]
-        if vm.split_irqchip {
-            anyhow::bail!(
-                "serial COM1/COM2 require irqfd; split-irqchip mode \
-                 has no IOAPIC and the kernel uart driver has no \
-                 polling fallback — reduce topology so all APIC IDs \
-                 are at or below 254 (MAX_XAPIC_ID)",
-            );
-        }
+        // On x86 split-irqchip (>254 APIC IDs) the serial IRQ routes through
+        // the userspace IOAPIC (ioapic_handle above is threaded into the run
+        // loops; the guest's RTE write installs the MSI route); on the
+        // in-kernel-irqchip (x86 <=254) and aarch64 (GIC) paths the kernel
+        // routes the GSI directly.
         #[cfg(target_arch = "x86_64")]
         {
             vm.vm_fd
@@ -1082,9 +1082,13 @@ impl KtstrVm {
         let mut vc = virtio_console::VirtioConsole::new();
         vc.set_mem((*vm.guest_mem).clone());
         let virtio_con = Arc::new(PiMutex::new(vc));
-        // x86_64: split_irqchip bailed above (line ~137); reaching
-        // here implies a unified kernel irqchip, so irqfd registration
-        // is safe. aarch64: GICv3 is always kernel-side.
+        // Register the virtio-console irqfd. On x86 split-irqchip (>254 APIC
+        // IDs) the route is installed by the userspace IOAPIC when the guest
+        // programs the RTE — the irqfd is inert until then, and
+        // kvm_irq_routing_update rebinds it on the KVM_SET_GSI_ROUTING that
+        // the RTE write triggers. On the in-kernel-irqchip (x86 <=254) and
+        // aarch64 (GICv3) paths the kernel routes the GSI directly.
+        // register_irqfd works in all three modes (irqchip_in_kernel).
         vm.vm_fd
             .register_irqfd(virtio_con.lock().irq_evt(), kvm::VIRTIO_CONSOLE_IRQ)
             .context("register virtio-console irqfd")?;
@@ -1259,6 +1263,7 @@ impl KtstrVm {
             Some(&virtio_con),
             virtio_blk.as_ref(),
             virtio_net.as_ref(),
+            ioapic_handle.as_ref(),
             &kill,
             &kill_evt,
             &freeze,
@@ -9867,6 +9872,7 @@ impl KtstrVm {
                     Some(&virtio_con),
                     virtio_blk.as_ref(),
                     virtio_net.as_ref(),
+                    ioapic_handle.as_ref(),
                     &kill,
                     &freeze,
                     &watchpoint,
@@ -9922,6 +9928,25 @@ impl KtstrVm {
             "BSP: exited run loop, code={exit_code} timed_out={timed_out} \
              (run-loop sentinel — final exit code comes from bulk port / COM2 in collect_results)"
         );
+
+        // Surface IOAPIC routing-install failures (split-irqchip path). A
+        // nonzero count means a guest-programmed device IRQ never got its MSI
+        // route, so the device hung on first use — report it loudly so a
+        // hung-device test shows the cause instead of an opaque timeout.
+        // Per-failure errors are already logged in classify_exit; this is the
+        // run-level summary. Fires on both clean-exit and watchdog-timeout
+        // paths (run_bsp_loop returns from both before reaching here).
+        #[cfg(target_arch = "x86_64")]
+        if let Some(io) = ioapic_handle.as_ref() {
+            let n = io.routing_failures();
+            if n > 0 {
+                tracing::error!(
+                    count = n,
+                    "ioapic: {n} KVM_SET_GSI_ROUTING install(s) failed this run — \
+                     device IRQs for those pins did not deliver"
+                );
+            }
+        }
 
         // Join the watchdog before dropping `bsp`. The watchdog holds an
         // ImmediateExitHandle pointing into bsp's kvm_run mmap. If bsp is
@@ -10097,6 +10122,7 @@ impl KtstrVm {
         virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
         virtio_blk: Option<&Arc<PiMutex<virtio_blk::VirtioBlk>>>,
         virtio_net: Option<&Arc<PiMutex<virtio_net::VirtioNet>>>,
+        ioapic: Option<&Arc<crate::vmm::IoapicHandle>>,
         kill: &Arc<AtomicBool>,
         kill_evt: &Arc<EventFd>,
         freeze: &Arc<AtomicBool>,
@@ -10132,6 +10158,7 @@ impl KtstrVm {
             let vc_clone = virtio_con.cloned();
             let vblk_clone = virtio_blk.cloned();
             let vnet_clone = virtio_net.cloned();
+            let ioapic_clone = ioapic.cloned();
             let exited = Arc::new(AtomicBool::new(false));
             let exited_clone = exited.clone();
             let parked = Arc::new(AtomicBool::new(false));
@@ -10245,6 +10272,7 @@ impl KtstrVm {
                             vc_clone.as_ref(),
                             vblk_clone.as_ref(),
                             vnet_clone.as_ref(),
+                            ioapic_clone.as_ref(),
                             &kill_clone,
                             &kill_evt_clone,
                             &freeze_clone,
@@ -11436,6 +11464,7 @@ impl KtstrVm {
         virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
         virtio_blk: Option<&Arc<PiMutex<virtio_blk::VirtioBlk>>>,
         virtio_net: Option<&Arc<PiMutex<virtio_net::VirtioNet>>>,
+        ioapic: Option<&Arc<crate::vmm::IoapicHandle>>,
         kill: &Arc<AtomicBool>,
         freeze: &Arc<AtomicBool>,
         watchpoint: &Arc<WatchpointArm>,
@@ -11725,6 +11754,7 @@ impl KtstrVm {
                         virtio_con.map(|a| a.as_ref()),
                         virtio_blk.map(|a| a.as_ref()),
                         virtio_net.map(|a| a.as_ref()),
+                        ioapic.map(|a| a.as_ref()),
                         &mut exit,
                     ) {
                         Some(ExitAction::Continue) | None => {}
