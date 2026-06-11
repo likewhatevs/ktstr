@@ -570,6 +570,28 @@ struct RunLocks {
     pinning_plan: Option<host_topology::PinningPlan>,
 }
 
+/// Human-readable summary of the userspace IOAPIC's device-IRQ routing
+/// failures, for `run_interactive`'s teardown. `None` when there were none.
+/// `n` is `IoapicHandle::routing_failures()` — the count of
+/// `KVM_SET_GSI_ROUTING` installs that errored, each leaving a
+/// guest-programmed device IRQ unrouted (the device hangs on first use).
+/// Surfaced in interactive mode because the operator's terminal shows the
+/// guest console, not the host's per-failure tracing, so an unrouted IRQ
+/// would otherwise be a silent device hang. x86-only: the userspace IOAPIC
+/// (and `IoapicHandle::routing_failures`) is split-irqchip-specific; on
+/// aarch64 `IoapicHandle` is an empty-enum placeholder (the GIC routes
+/// device IRQs directly), so there is nothing to summarize.
+#[cfg(target_arch = "x86_64")]
+fn routing_failure_summary(n: u64) -> Option<String> {
+    (n > 0).then(|| {
+        format!(
+            "WARNING: {n} device-IRQ routing failure(s) during this run \
+             (KVM_SET_GSI_ROUTING errored) — affected devices' interrupts \
+             were not delivered, so those devices may have hung"
+        )
+    })
+}
+
 impl KtstrVm {
     pub fn builder() -> KtstrVmBuilder {
         KtstrVmBuilder::default()
@@ -1440,6 +1462,21 @@ impl KtstrVm {
         // _raw_guard drops here, restoring terminal and signal handlers.
         drop(_raw_guard);
 
+        // Surface any device-IRQ routing failures the userspace IOAPIC hit
+        // during the run. The operator's terminal showed the guest console,
+        // not the host's per-failure tracing, so an unrouted IRQ would
+        // otherwise be a silent device hang. Printed after the raw-mode
+        // restore so it lands on the operator's terminal. x86-only: the
+        // userspace IOAPIC exists only on the split-irqchip path (aarch64
+        // routes device IRQs via the GIC, and `IoapicHandle` is an
+        // empty-enum placeholder there with no `routing_failures`).
+        #[cfg(target_arch = "x86_64")]
+        if let Some(io) = &ioapic_handle {
+            if let Some(msg) = routing_failure_summary(io.routing_failures()) {
+                eprintln!("{msg}");
+            }
+        }
+
         // Exec mode fallback: if virtio-console produced no output
         // (kernel lacks CONFIG_VIRTIO_CONSOLE, guest fell back to
         // COM2), print COM2 output to stdout so the caller sees it.
@@ -1531,6 +1568,20 @@ impl KtstrVm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn routing_failure_summary_none_when_zero_else_counts() {
+        assert!(
+            routing_failure_summary(0).is_none(),
+            "no routing failures → no summary"
+        );
+        let msg = routing_failure_summary(3).expect("n>0 → summary");
+        assert!(
+            msg.contains("3 device-IRQ routing failure"),
+            "summary names the count: {msg:?}"
+        );
+    }
 
     #[test]
     fn exec_exit_from_entries_decodes_last_crc_valid_frame() {
