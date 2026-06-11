@@ -48,14 +48,16 @@ pub(crate) const IOAPIC_SIZE: u64 = 0x1000;
 pub(crate) const NUM_PINS: usize = 24;
 
 // MMIO register offsets within the window (indirect-access scheme).
-const IOREGSEL: u64 = 0x00; // index latch (selects the register IOWIN accesses)
-const IOWIN: u64 = 0x10; // data window (reads/writes the selected register)
+// IOREGSEL/IOWIN/REG_REDTBL_BASE are pub(crate) so the kvm.rs IoapicHandle
+// dedup test can drive the register interface without a live KVM fd.
+pub(crate) const IOREGSEL: u64 = 0x00; // index latch (selects the register IOWIN accesses)
+pub(crate) const IOWIN: u64 = 0x10; // data window (reads/writes the selected register)
 const IOEOI: u64 = 0x40; // write-only EOI register (valid when version >= 0x20)
 
 // Register indices selectable through IOREGSEL.
 const REG_ID: u32 = 0x00;
 const REG_VER: u32 = 0x01;
-const REG_REDTBL_BASE: u32 = 0x10; // entry i: low dword 0x10+2i, high dword 0x11+2i
+pub(crate) const REG_REDTBL_BASE: u32 = 0x10; // entry i: low dword 0x10+2i, high dword 0x11+2i
 
 /// IOAPIC version. 0x20 advertises the EOI register; the high byte of the
 /// VER register reports the max redirection entry (NUM_PINS - 1).

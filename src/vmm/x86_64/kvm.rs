@@ -710,12 +710,13 @@ pub(crate) struct IoapicHandle {
     /// MMIO access.
     ///
     /// This dedup is intentionally stronger than the reference userspace
-    /// IOAPICs: qemu and libkrun both re-issue `KVM_SET_GSI_ROUTING` on every
-    /// redtbl write (qemu's change-counting dedup applies only to its PCI-MSI
-    /// path, not the IOAPIC). Skipping an unchanged table is safe because the
-    /// ioctl is a whole-table replace KVM applies idempotently -- an identical
-    /// re-install only burns an SRCU grace period (virt/kvm/irqchip.c
-    /// `kvm_set_irq_routing` has no unchanged-table early-out).
+    /// IOAPICs: qemu, cloud-hypervisor, and libkrun all re-issue
+    /// `KVM_SET_GSI_ROUTING` on every redtbl write (qemu's change-counting
+    /// dedup applies only to its PCI-MSI path, not the IOAPIC). Skipping an
+    /// unchanged table is safe because the ioctl is a whole-table replace
+    /// KVM applies idempotently -- an identical re-install only burns an
+    /// SRCU grace period (virt/kvm/irqchip.c `kvm_set_irq_routing` has no
+    /// unchanged-table early-out).
     last_installed: PiMutex<Option<Vec<(u32, MsiRoute)>>>,
 }
 
@@ -746,7 +747,31 @@ impl IoapicHandle {
     /// the cache stays consistent with KVM's table — installs serialize on
     /// `last_installed` (one whole-table replace at a time) and the cache is
     /// updated in the same critical section as each install.
+    ///
+    /// Delegates to [`Self::mmio_write_with`] passing the real
+    /// `KVM_SET_GSI_ROUTING` installer; the seam exists only so a host-side
+    /// test can inject a counting/failing installer.
     pub(crate) fn mmio_write(&self, offset: u64, data: &[u8]) -> Result<()> {
+        let fd = self.vm_fd_raw;
+        self.mmio_write_with(offset, data, move |routing| {
+            kvm_set_gsi_routing_via_raw_fd(fd, routing)
+        })
+    }
+
+    /// [`Self::mmio_write`] with the routing install injected as `install`,
+    /// so a host-side test drives the dedup + cache-on-success logic with a
+    /// counting/failing closure instead of a live KVM fd. The production
+    /// caller passes the real `KVM_SET_GSI_ROUTING` installer. `install` runs
+    /// at most once per call — only when the write changed a route AND the
+    /// set differs from `last_installed` — hence `FnOnce`. (No reference VMM
+    /// exposes such a seam or unit-tests this path; they re-install
+    /// unconditionally — see the `last_installed` divergence note.)
+    fn mmio_write_with(
+        &self,
+        offset: u64,
+        data: &[u8],
+        install: impl FnOnce(&KvmIrqRouting) -> std::io::Result<()>,
+    ) -> Result<()> {
         let routes = {
             let mut io = self.ioapic.lock();
             if io.mmio_write(offset, data) {
@@ -763,7 +788,7 @@ impl IoapicHandle {
                 return Ok(());
             }
             let routing = build_device_msi_routing(&routes)?;
-            if let Err(e) = kvm_set_gsi_routing_via_raw_fd(self.vm_fd_raw, &routing) {
+            if let Err(e) = install(&routing) {
                 self.routing_failures
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Err(anyhow::anyhow!("KVM_SET_GSI_ROUTING: {e}"));
@@ -814,6 +839,79 @@ impl IoapicHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `IoapicHandle` dedups a redundant GSI-routing install (skips the
+    /// ioctl when the route set is byte-identical to the last successful
+    /// install) AND caches only on success (a failed install must not poison
+    /// a later identical retry). Drives the real `mmio_write_with` dedup path
+    /// with an injected counting/failing installer — no live KVM fd. No
+    /// reference VMM unit-tests this path (they re-install unconditionally).
+    #[test]
+    fn ioapic_handle_dedups_install_and_caches_on_success_only() {
+        use crate::vmm::x86_64::ioapic::{IOREGSEL, IOWIN, REG_REDTBL_BASE};
+        use std::cell::Cell;
+
+        let handle = IoapicHandle::new(std::sync::Arc::new(PiMutex::new(Ioapic::new())), -1);
+        // Pin 6's low-dword redtbl register (entry i lo = REG_REDTBL_BASE + 2i).
+        let lo_reg = (REG_REDTBL_BASE + 2 * 6) as u8;
+        let installs = Cell::new(0u32);
+
+        // Drive one IOAPIC MMIO write through the dedup path with an injected
+        // installer that bumps `installs` and returns Ok/Err per `ok`.
+        let step = |off: u64, data: &[u8], ok: bool| -> Result<()> {
+            handle.mmio_write_with(off, data, |_routing| {
+                installs.set(installs.get() + 1);
+                if ok {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "injected install failure",
+                    ))
+                }
+            })
+        };
+
+        // Program pin 6's RTE: select the lo reg (not a route change → no
+        // install), then write vector 0x40 with the mask bit clear (an
+        // unmasked route) → route change → install #1.
+        step(IOREGSEL, &[lo_reg], true).unwrap();
+        step(IOWIN, &0x40u32.to_le_bytes(), true).unwrap();
+        assert_eq!(installs.get(), 1, "programming an unmasked RTE installs once");
+
+        // Rewrite the identical lo dword: the register file reports dirty, but
+        // the route set is byte-identical → dedup SKIPS the install ioctl.
+        step(IOREGSEL, &[lo_reg], true).unwrap();
+        step(IOWIN, &0x40u32.to_le_bytes(), true).unwrap();
+        assert_eq!(
+            installs.get(),
+            1,
+            "a redundant RTE rewrite must dedup (no second install)"
+        );
+
+        // Cache-on-success-only: change the vector (0x50) with a FAILING
+        // installer → the install is attempted (count 2) but errors, so
+        // `last_installed` must NOT be updated to the 0x50 route set.
+        step(IOREGSEL, &[lo_reg], true).unwrap();
+        assert!(
+            step(IOWIN, &0x50u32.to_le_bytes(), false).is_err(),
+            "an injected install failure propagates as an error"
+        );
+        assert_eq!(installs.get(), 2, "the changed RTE attempts an install");
+        assert_eq!(handle.routing_failures(), 1, "the failed install is counted");
+
+        // Retry the SAME changed RTE with a succeeding installer. Because the
+        // failed install did not cache 0x50, this must install AGAIN (count 3)
+        // rather than dedup-skip — proving a failed install never wedges a
+        // device behind a poisoned cache.
+        step(IOREGSEL, &[lo_reg], true).unwrap();
+        step(IOWIN, &0x50u32.to_le_bytes(), true).unwrap();
+        assert_eq!(
+            installs.get(),
+            3,
+            "a failed install must not poison the cache — the identical retry re-installs"
+        );
+    }
 
     #[test]
     fn build_device_msi_routing_lays_out_fam_entries() {
