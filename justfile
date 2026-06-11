@@ -12,14 +12,32 @@ default:
 fmt:
     cargo fmt --all
 
-# Run all lints (format check + type check + clippy + rustdoc warnings)
+# Run all lints: format check, type check (x2 feature sets), clippy
+# (x2), and rustdoc-warnings-as-errors. Every leg runs even when an
+# earlier one fails; the recipe then reports the full set of failing
+# legs and exits non-zero if any failed, so one CI run yields a
+# complete lint-failure inventory instead of stopping at the first.
 lint:
-    cargo fmt -- --check
-    cargo check --workspace --all-targets
-    cargo check --workspace --all-targets --features wprof,integration
-    cargo clippy --workspace --all-targets
-    cargo clippy --workspace --all-targets --features wprof,integration
-    just doc-strict
+    #!/usr/bin/env bash
+    set -uo pipefail
+    failed=()
+    run() {
+        local label="$1"; shift
+        echo "=== lint leg: ${label} ==="
+        if ! "$@"; then failed+=("${label}"); fi
+    }
+    run "fmt --check"              cargo fmt -- --check
+    run "check"                    cargo check --workspace --all-targets
+    run "check wprof,integration"  cargo check --workspace --all-targets --features wprof,integration
+    run "clippy"                   cargo clippy --workspace --all-targets
+    run "clippy wprof,integration" cargo clippy --workspace --all-targets --features wprof,integration
+    run "doc-strict"               just doc-strict
+    if [ ${#failed[@]} -ne 0 ]; then
+        echo
+        echo "lint: ${#failed[@]} leg(s) FAILED: ${failed[*]}"
+        exit 1
+    fi
+    echo "lint: all legs passed"
 
 # Promote every rustdoc warning to an error. RUSTDOCFLAGS reaches every
 # crate in the workspace (including ktstr-macros), where `cargo doc -- -D
@@ -43,7 +61,7 @@ kernel-build version="":
 # feature. E.g. `just test 6.14 wprof` → cargo-ktstr built `--features
 # wprof`; tests run `--features integration,wprof`.
 test kernel extra-features="":
-    cargo run --bin cargo-ktstr {{ if extra-features != "" { "--features " + extra-features } else { "" } }} -- ktstr test --kernel {{kernel}} -- --profile ci --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} -j $(nproc)
+    cargo run --bin cargo-ktstr {{ if extra-features != "" { "--features " + extra-features } else { "" } }} -- ktstr test --kernel {{kernel}} -- --profile ci --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} --no-fail-fast -j $(nproc)
 
 # Run trybuild compile_fail fixtures.
 #
@@ -70,7 +88,7 @@ test kernel extra-features="":
 # real blob, and the wprof/blazesym clone-build fails on the
 # GitHub-hosted compile-fail runner (libblazesym_c.a not produced).
 compile-fail:
-    KTSTR_SKIP_WPROF_BUILD=1 cargo nextest run --profile ci --features wprof -E 'binary(compile_fail) & test(=compile_fail)' --run-ignored all
+    KTSTR_SKIP_WPROF_BUILD=1 cargo nextest run --profile ci --features wprof -E 'binary(compile_fail) & test(=compile_fail)' --run-ignored all --no-fail-fast
 
 # Run the ktstr-macros proc-macro crate's host unit tests (attr parsing,
 # codegen, cross-attr validation). cargo-ktstr's VM test runner only
@@ -80,7 +98,7 @@ compile-fail:
 # build) so the wprof-gated expect_auto_repro parse tests run too; the
 # feature-agnostic tests run regardless.
 test-macros:
-    cargo nextest run -p ktstr-macros --features wprof
+    cargo nextest run -p ktstr-macros --features wprof --no-fail-fast
 
 # Verify ktstr stays out of a downstream consumer's release binary.
 # Thin wrapper over the `scripts::devdep-isolation` rust-script recipe
