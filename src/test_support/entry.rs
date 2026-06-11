@@ -2202,6 +2202,14 @@ impl KtstrTestEntry {
         self
     }
 
+    /// Clear `cpu_budget` (auto-size the no-perf vCPU mask to the vCPU
+    /// count).
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn without_cpu_budget(mut self) -> Self {
+        self.cpu_budget = None;
+        self
+    }
+
     /// Override `scheduler`.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn with_scheduler(mut self, scheduler: &'static crate::test_support::Scheduler) -> Self {
@@ -3006,10 +3014,13 @@ mod tests {
             .with_name("clear_test")
             .with_payload(&FIO)
             .with_cleanup_budget(Duration::from_secs(10))
+            .with_cpu_budget(8)
             .without_payload()
-            .without_cleanup_budget();
+            .without_cleanup_budget()
+            .without_cpu_budget();
         assert!(entry.payload.is_none());
         assert!(entry.cleanup_budget.is_none());
+        assert!(entry.cpu_budget.is_none());
     }
 
     #[test]
