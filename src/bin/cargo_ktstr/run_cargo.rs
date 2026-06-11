@@ -220,6 +220,38 @@ fn run_cargo_sub(
         // detection-vs-KTSTR_KERNEL discrimination rationale.
         cmd.env(ktstr::KTSTR_ORCHESTRATED_ENV, "1");
 
+        // Probe each resolved kernel's commit ONCE here, in the
+        // orchestrator, and pass a `dir=commit;...` map down via
+        // KTSTR_KERNEL_COMMIT so the sidecar writer skips a redundant gix
+        // HEAD + dirty-walk in every per-test nextest process (that walk
+        // is memoized per process but not across processes — N tests
+        // would re-pay it). Keyed by the same dir string exported as
+        // KTSTR_KERNEL / KTSTR_KERNEL_LIST so each sidecar can look
+        // itself up. `;` joins entries, `=` splits dir from commit;
+        // neither appears in a short hash (hex + optional `-dirty`), and
+        // a kernel path containing either would already have broken
+        // KTSTR_KERNEL_LIST's own encoding. The commit is resolved via
+        // source_dir_for (the same resolution the sidecar uses) then
+        // detect_kernel_commit, so the value matches the sidecar's
+        // fallback exactly — including clean Path kernels whose resolved
+        // dir is a cache entry, not a git tree. Kernels with no
+        // recoverable source (transient Range/Git, or a Version/CacheKey
+        // cache miss) probe to None and are omitted; their sidecar falls
+        // back to the same (correct) None.
+        let commit_map = resolved
+            .iter()
+            .filter_map(|(_, dir)| {
+                let raw = dir.display().to_string();
+                let commit = ktstr::test_support::source_dir_for(&raw)
+                    .and_then(|src| ktstr::test_support::detect_kernel_commit(&src))?;
+                Some(format!("{raw}={commit}"))
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+        if !commit_map.is_empty() {
+            cmd.env(ktstr::KTSTR_KERNEL_COMMIT_ENV, commit_map);
+        }
+
         if resolved.len() > 1 {
             let encoded = encode_kernel_list(&resolved)?;
             eprintln!(

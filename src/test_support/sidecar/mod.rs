@@ -1604,7 +1604,19 @@ pub fn repo_is_dirty(repo: &gix::Repository) -> Option<bool> {
 /// tree, or `head_tree()` failure. Each failed leg degrades to
 /// "treat as clean" rather than aborting the probe, because
 /// metadata must not gate sidecar writes.
-pub(crate) fn detect_kernel_commit(kernel_dir: &std::path::Path) -> Option<String> {
+///
+/// `pub` (not `pub(crate)`) + `#[doc(hidden)]` for the same reason as
+/// `repo_is_dirty`: `cargo-ktstr` is a separate `[[bin]]` crate that
+/// consumes `ktstr` as a dependency and calls this in `run_cargo` once
+/// per resolved kernel to pre-compute the `dir=commit` map it exports
+/// via [`crate::KTSTR_KERNEL_COMMIT_ENV`], letting each per-test process
+/// skip its own gix dirty-walk. Hidden from rustdoc — a probe helper
+/// with no stable API contract. The env fast-path that CONSUMES that
+/// map lives at the sidecar call site (`kernel_commit_for_sidecar`), not
+/// here, so this stays a pure directory→commit walk safe for the
+/// orchestrator to call while building the map.
+#[doc(hidden)]
+pub fn detect_kernel_commit(kernel_dir: &std::path::Path) -> Option<String> {
     // Per-process, path-keyed memoization of the SUCCESS case
     // only. Same rationale as `detect_project_commit`: gauntlet
     // runs invoke this function once per sidecar — thousands of
@@ -1808,19 +1820,35 @@ pub(crate) fn apply_archive_source_override(pool: &mut [SidecarResult]) {
 /// Returns `None` when the env var is unset, when no source
 /// tree path is recoverable, or when the cache lookup fails.
 fn resolve_kernel_source_dir() -> Option<std::path::PathBuf> {
+    source_dir_for(&crate::ktstr_kernel_env()?)
+}
+
+/// Resolve a `KTSTR_KERNEL` identifier string to the on-disk SOURCE
+/// tree whose git HEAD is the kernel's commit (or `None` for transient
+/// Range/Git specs or an unrecoverable cache lookup).
+///
+/// `pub` + `#[doc(hidden)]` for the same reason as `detect_kernel_commit`:
+/// the cargo-ktstr `[[bin]]` calls this in `run_cargo` to pre-compute the
+/// [`crate::KTSTR_KERNEL_COMMIT_ENV`] map. Computing the map value via THIS
+/// function (then `detect_kernel_commit`) makes the map identical to the
+/// sidecar's own fallback (`resolve_kernel_source_dir().and_then(
+/// detect_kernel_commit)`), so a clean Path kernel — whose resolved dir is
+/// a cache entry, not a git tree — still gets its real source commit into
+/// the map instead of re-paying a per-test walk.
+#[doc(hidden)]
+pub fn source_dir_for(raw: &str) -> Option<std::path::PathBuf> {
     use crate::kernel_path::KernelId;
-    let raw = crate::ktstr_kernel_env()?;
-    let id = KernelId::parse(&raw);
+    let id = KernelId::parse(raw);
     match id {
         KernelId::Path(_) => {
-            let p = std::path::Path::new(&raw);
+            let p = std::path::Path::new(raw);
             // Cache-entry layout: `metadata.json` carries the
             // `KernelSource::Local::source_tree_path` recorded at
             // build time. Source-tree layout (dirty path that
             // skipped cache store): no metadata, so the env value
             // IS the source tree. The shared helper handles both.
             crate::cache::recover_local_source_tree(p)
-                .or_else(|| Some(std::path::PathBuf::from(&raw)))
+                .or_else(|| Some(std::path::PathBuf::from(raw)))
         }
         KernelId::Version(_) | KernelId::CacheKey(_) => {
             let cache = crate::cache::CacheDir::new().ok()?;
@@ -1910,6 +1938,44 @@ fn resolve_kernel_source_dir_with_cache(
         // None covers any future caller that adds a new arm.
         _ => None,
     }
+}
+
+/// The kernel commit recorded in a sidecar: the env fast-path first,
+/// then the in-process gix walk.
+///
+/// cargo-ktstr pre-probes every resolved kernel's HEAD once and exports
+/// a `dir=commit;...` map in [`crate::KTSTR_KERNEL_COMMIT_ENV`], keyed
+/// by the dir it also exports as `KTSTR_KERNEL`. This process looks
+/// itself up by its own [`crate::ktstr_kernel_env`] value — string-equal
+/// to the map key by construction, since cargo-ktstr built both from the
+/// same resolved dir. A hit skips `detect_kernel_commit`'s gix HEAD +
+/// dirty-walk, which is memoized per process but NOT across the per-test
+/// nextest processes (so without the map each of N processes re-pays
+/// it).
+///
+/// Keying on `ktstr_kernel_env()` (the raw `KTSTR_KERNEL`) rather than
+/// on `resolve_kernel_source_dir()` is deliberate — that is exactly the
+/// key cargo-ktstr used. The map's commit VALUE matches this function's
+/// own fallback because cargo-ktstr computes it via the SAME resolution
+/// (`source_dir_for` then `detect_kernel_commit`); a kernel with no
+/// recoverable source tree is simply absent from the map, so the miss
+/// falls through to the identical resolve-and-walk here.
+///
+/// Miss / absent env / empty commit → the walk. Optimization only.
+fn kernel_commit_for_sidecar() -> Option<String> {
+    if let Some(self_dir) = crate::ktstr_kernel_env()
+        && let Ok(raw) = std::env::var(crate::KTSTR_KERNEL_COMMIT_ENV)
+    {
+        for seg in raw.split(';') {
+            if let Some((dir, commit)) = seg.rsplit_once('=')
+                && dir == self_dir
+                && !commit.is_empty()
+            {
+                return Some(commit.to_string());
+            }
+        }
+    }
+    resolve_kernel_source_dir().and_then(|d| detect_kernel_commit(&d))
 }
 
 /// Compute a stable 64-bit discriminator over the fields that
@@ -2690,7 +2756,7 @@ pub(crate) fn write_skip_sidecar(entry: &KtstrTestEntry) -> anyhow::Result<()> {
         sysctls,
         kargs,
         kernel_version: detect_kernel_version(),
-        kernel_commit: resolve_kernel_source_dir().and_then(|d| detect_kernel_commit(&d)),
+        kernel_commit: kernel_commit_for_sidecar(),
         timestamp: now_iso8601(),
         run_id: generate_run_id(),
         host: Some(crate::host_context::collect_host_context()),
@@ -2754,7 +2820,7 @@ pub(crate) fn write_sidecar(
         sysctls,
         kargs,
         kernel_version: detect_kernel_version(),
-        kernel_commit: resolve_kernel_source_dir().and_then(|d| detect_kernel_commit(&d)),
+        kernel_commit: kernel_commit_for_sidecar(),
         timestamp: now_iso8601(),
         run_id: generate_run_id(),
         host: Some(crate::host_context::collect_host_context()),

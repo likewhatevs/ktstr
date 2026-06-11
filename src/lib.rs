@@ -950,6 +950,27 @@ pub const KTSTR_KERNEL_ENV: &str = "KTSTR_KERNEL";
 /// place instead of fanning out to every call site.
 pub const KTSTR_KERNEL_LIST_ENV: &str = "KTSTR_KERNEL_LIST";
 
+/// Name of the environment variable cargo-ktstr sets to a
+/// `dir=commit;dir=commit;...` map of each resolved SOURCE kernel's
+/// short commit hash (with a `-dirty` suffix when the tree is dirty),
+/// keyed by the same directory string exported in [`KTSTR_KERNEL_ENV`]
+/// / [`KTSTR_KERNEL_LIST_ENV`].
+///
+/// cargo-ktstr probes each kernel's git HEAD ONCE in the orchestrator
+/// and records it here. The sidecar writer reads this map and looks
+/// itself up (by its own `KTSTR_KERNEL` dir) instead of re-running a
+/// gix HEAD read + dirty-walk over the kernel tree in every per-test
+/// nextest process. That walk is memoized per process but NOT across
+/// processes, so without this map each of N test processes re-pays the
+/// full dirty-walk (seconds on a large kernel checkout).
+///
+/// Optimization only: a missing entry, absent env, or decode failure
+/// falls back to the in-process resolve-and-walk, which is always
+/// correct. Kernels with no recoverable source tree (transient
+/// Range/Git specs, or a Version/CacheKey cache miss) are absent from
+/// the map, and the fallback yields the same `None` for them.
+pub const KTSTR_KERNEL_COMMIT_ENV: &str = "KTSTR_KERNEL_COMMIT";
+
 /// Name of the environment variable cargo-ktstr sets to signal
 /// "this test process was launched by a cargo-ktstr orchestration
 /// path, not raw `cargo nextest`". cargo-ktstr's `test` and

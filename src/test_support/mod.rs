@@ -110,7 +110,8 @@ pub(crate) use sidecar::{
     is_run_directory, is_sidecar_filename,
 };
 pub use sidecar::{
-    SidecarResult, collect_pool, newest_run_dir, repo_is_dirty, runs_root, sidecar_dir,
+    SidecarResult, collect_pool, detect_kernel_commit, newest_run_dir, repo_is_dirty, runs_root,
+    sidecar_dir, source_dir_for,
 };
 
 pub use dispatch::{
