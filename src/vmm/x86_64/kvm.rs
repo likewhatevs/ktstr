@@ -748,6 +748,26 @@ impl IoapicHandle {
     /// `last_installed` (one whole-table replace at a time) and the cache is
     /// updated in the same critical section as each install.
     ///
+    /// Cross-vCPU atomicity is traded for that latency, diverging from every
+    /// reference userspace IOAPIC: qemu (one BQL across redtbl-write →
+    /// route-commit), cloud-hypervisor (one device mutex across the install),
+    /// and libkrun (device mutex held across a synchronous worker-hop install)
+    /// are all single-lock atomic and accept the peer-vCPU IOAPIC-MMIO stall
+    /// for the SRCU-grace-period ioctl; we release the `ioapic` lock first to
+    /// keep that ioctl off the vCPU blocking budget. The resulting window —
+    /// two vCPUs racing the IOAPIC, an older snapshot installing after a newer
+    /// one and leaving KVM's table briefly stale — is unreachable for a
+    /// spec-compliant guest: Linux serializes every IOAPIC RTE program under
+    /// one global `ioapic_lock` (the `ioapic_write_entry`,
+    /// `ioapic_set_affinity`, and `eoi_ioapic_pin` paths in
+    /// arch/x86/kernel/apic/io_apic.c), so only one vCPU programs the IOAPIC
+    /// at a time. A guest that races its own IOAPIC can transiently install a
+    /// stale-but-valid whole-table replace built only from its own programmed
+    /// routes; it self-corrects on the next RTE write (which re-snapshots the
+    /// current register file) and can only mis-route its own device IRQs to
+    /// its own APICs — no host memory is touched and no unprogrammed route is
+    /// installable.
+    ///
     /// Delegates to [`Self::mmio_write_with`] passing the real
     /// `KVM_SET_GSI_ROUTING` installer; the seam exists only so a host-side
     /// test can inject a counting/failing installer.
