@@ -82,7 +82,7 @@ const RTE_VIRT_DESTID_8_14_MASK: u64 = 0x7f;
 const RTE_RO_BITS: u64 = RTE_DELIV_STATUS_BIT | RTE_REMOTE_IRR_BIT;
 
 /// LAPIC MSI address base (`APIC_DEFAULT_PHYS_BASE`). The 15-bit destination's
-/// low 8 bits go to address_lo[19:12]; bits [14:8] go to address_hi[31:8] (the
+/// low 8 bits go to address_lo\[19:12\]; bits \[14:8\] go to address_hi\[31:8\] (the
 /// `destid_8_31` field), which is the extended-destination-ID path KVM decodes
 /// when `KVM_FEATURE_MSI_EXT_DEST_ID` + x2APIC-API 32-bit IDs are enabled.
 const MSI_ADDR_BASE: u32 = 0xFEE0_0000;
@@ -100,7 +100,7 @@ pub(crate) struct MsiRoute {
 pub(crate) struct Ioapic {
     /// The register index latched by a write to IOREGSEL.
     ioregsel: u8,
-    /// IOAPIC ID (REG_ID bits [27:24]).
+    /// IOAPIC ID (REG_ID bits \[27:24\]).
     id: u32,
     /// The 24 redirection-table entries.
     ioredtbl: [u64; NUM_PINS],

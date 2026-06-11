@@ -159,8 +159,8 @@ const L3_CACHE_WAYS: u32 = 16;
 /// `X86_ENC_ASSOC` / AMD APM): 16-way -> 0x8.
 const ASSOC_ENC_16WAY: u32 = 0x8;
 /// Leaf 0x80000006 ECX (L2) / EDX (L3) descriptors, matching the
-/// 0x8000001D L2/L3 geometry. EDX[31:18]=L3 size/512KiB nonzero is the AMD
-/// L3-detection gate (cpuid_amd_hygon_has_l3_cache). ECX[31:16]=L2 size KiB.
+/// 0x8000001D L2/L3 geometry. EDX\[31:18\]=L3 size/512KiB nonzero is the AMD
+/// L3-detection gate (cpuid_amd_hygon_has_l3_cache). ECX\[31:16\]=L2 size KiB.
 const L80000006_ECX: u32 =
     (L2_CACHE_SIZE_KIB << 16) | (ASSOC_ENC_16WAY << 12) | (1 << 8) | CACHE_LINE_SIZE;
 const L80000006_EDX: u32 =
@@ -169,11 +169,11 @@ const L80000006_EDX: u32 =
 /// Build one AMD cache-topology subleaf (leaf 0x8000001D), encoded per the
 /// AMD APM / qemu `encode_cache_cpuid8000001d`. `cache_type` is 1=data,
 /// 2=instruction, 3=unified. `num_threads_sharing` is the count MINUS ONE
-/// of logical CPUs sharing this cache (EAX[25:14]) — the field the guest
-/// kernel reads to compute llc_id. EAX[31:26] (num_cores) and EAX[9]
+/// of logical CPUs sharing this cache (EAX\[25:14\]) — the field the guest
+/// kernel reads to compute llc_id. EAX\[31:26\] (num_cores) and EAX\[9\]
 /// (fully-associative) are left 0, matching qemu's 0x8000001D (only the
-/// Intel leaf 0x4 encodes num_cores). EBX[11:0]=line-1, [21:12]=partitions-1
-/// (0, one partition), [31:22]=ways-1; ECX=sets-1; EDX=property flags.
+/// Intel leaf 0x4 encodes num_cores). EBX\[11:0\]=line-1, \[21:12\]=partitions-1
+/// (0, one partition), \[31:22\]=ways-1; ECX=sets-1; EDX=property flags.
 #[allow(clippy::too_many_arguments)]
 fn amd_cache_subleaf(
     index: u32,
