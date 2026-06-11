@@ -28,6 +28,15 @@
 //!        -- -E 'test(sparse_topology_runtime_apicid_matches_declared)' \
 //!        --success-output immediate
 
+// `apicid` / `initial apicid` in /proc/cpuinfo are emitted only by x86's
+// show_cpuinfo_core (under CONFIG_SMP); aarch64 has no such field, so on an
+// arm64 guest read_apicids() yields 0 and this test would misreport an
+// AP-bringup failure (the failure observed on the arm64 CI runner). The whole
+// test is an x86 LAPIC/MADT/x2apic invariant — the aarch64 GIC affinity model
+// has no apic_id notion — so gate the file to x86_64. A sparse arm64 MPIDR
+// invariant, if warranted, would be a separate test.
+#![cfg(target_arch = "x86_64")]
+
 use anyhow::{Result, ensure};
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
