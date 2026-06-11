@@ -187,11 +187,15 @@ CONFIG_SMP=y
 # onlined. x86-only; arm64 ignores the symbol (GICv3 handles wide SMP).
 CONFIG_X86_X2APIC=y
 # CONFIG_NR_CPUS bounds the kernel's compile-time max CPU count. The
-# x86_64 Kconfig default is 64 — far below the wide-SMP topologies ktstr
-# exercises (e.g. 512-vCPU guests). Set to 1024 to match KVM's default
-# KVM_MAX_VCPUS ceiling (CONFIG_KVM_MAX_NR_VCPUS, arch/x86/kvm/Kconfig).
-# Honored on both arches.
-CONFIG_NR_CPUS=1024
+# x86_64 default is 64 — far below the wide-SMP topologies ktstr exercises.
+# x86_64 caps the Kconfig range at 512 without CONFIG_MAXSMP
+# (arch/x86/Kconfig: NR_CPUS_RANGE_END=512 unless MAXSMP selects
+# CPUMASK_OFFSTACK); an out-of-range value is silently dropped back to the
+# default 64. 512 is therefore the max settable without MAXSMP, which we
+# avoid because it force-selects DEBUG_KERNEL (can perturb scheduling
+# timing — unwanted in a scheduler test tool). 512 covers ktstr's wide-SMP
+# guests (the 256-vCPU split-irqchip e2e; the documented 512 ceiling).
+CONFIG_NR_CPUS=512
 CONFIG_NUMA=y
 # HMAT: parses ACPI HMAT for memory tiering (CXL nodes).
 # NUMA_BALANCING: auto-migrates pages to local node based on access.

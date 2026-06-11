@@ -19,8 +19,7 @@
 //! - [`parse_kconfig_symbol`] / [`render_kconfig_value`] are the
 //!   shared primitives behind those warning passes.
 //! - [`validate_kernel_config`] is the post-build critical-option
-//!   pass; [`has_sched_ext`] is the short-circuit probe driving
-//!   `kernel_build_pipeline`'s configure-skip.
+//!   pass.
 
 use std::path::Path;
 
@@ -385,14 +384,6 @@ pub fn configure_kernel(kernel_dir: &Path, fragment: &str) -> Result<()> {
     Ok(())
 }
 
-/// Check if a kernel .config contains CONFIG_SCHED_CLASS_EXT=y.
-pub fn has_sched_ext(kernel_dir: &std::path::Path) -> bool {
-    let config = kernel_dir.join(".config");
-    std::fs::read_to_string(config)
-        .map(|s| s.lines().any(|l| l == "CONFIG_SCHED_CLASS_EXT=y"))
-        .unwrap_or(false)
-}
-
 /// Critical `.config` options checked by [`validate_kernel_config`].
 ///
 /// Each entry pairs a `CONFIG_X` name with a diagnostic hint —
@@ -488,61 +479,6 @@ pub fn validate_kernel_config(kernel_dir: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -- has_sched_ext --
-
-    #[test]
-    fn cli_has_sched_ext_present() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            tmp.path().join(".config"),
-            "CONFIG_SOMETHING=y\nCONFIG_SCHED_CLASS_EXT=y\nCONFIG_OTHER=m\n",
-        )
-        .unwrap();
-        assert!(has_sched_ext(tmp.path()));
-    }
-
-    #[test]
-    fn cli_has_sched_ext_absent() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            tmp.path().join(".config"),
-            "CONFIG_SOMETHING=y\nCONFIG_OTHER=m\n",
-        )
-        .unwrap();
-        assert!(!has_sched_ext(tmp.path()));
-    }
-
-    #[test]
-    fn cli_has_sched_ext_module_not_builtin() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(tmp.path().join(".config"), "CONFIG_SCHED_CLASS_EXT=m\n").unwrap();
-        assert!(!has_sched_ext(tmp.path()));
-    }
-
-    #[test]
-    fn cli_has_sched_ext_commented_out() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            tmp.path().join(".config"),
-            "# CONFIG_SCHED_CLASS_EXT is not set\n",
-        )
-        .unwrap();
-        assert!(!has_sched_ext(tmp.path()));
-    }
-
-    #[test]
-    fn cli_has_sched_ext_no_config_file() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        assert!(!has_sched_ext(tmp.path()));
-    }
-
-    #[test]
-    fn cli_has_sched_ext_empty_config() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(tmp.path().join(".config"), "").unwrap();
-        assert!(!has_sched_ext(tmp.path()));
-    }
 
     // -- validate_kernel_config --
 
@@ -993,6 +929,23 @@ CONFIG_FOO=y\n\
 # == Tracing ==\n\
 CONFIG_BAR=m\n";
         assert!(all_fragment_lines_present(fragment, config));
+    }
+
+    #[test]
+    fn all_fragment_lines_present_changed_baked_in_with_sched_ext_present() {
+        // Regression for the configure-skip bug: the prior `has_sched_ext`
+        // proxy reported "configured" whenever CONFIG_SCHED_CLASS_EXT=y
+        // persisted in a stale `.config`, so an edited baked-in symbol
+        // (CONFIG_NR_CPUS 64->512) was silently never re-applied and the
+        // built kernel mismatched its cache key. `all_fragment_lines_present`
+        // must read the changed value as not-present even when sched_ext is
+        // present, so the build.rs gate reconfigures.
+        let config = "CONFIG_SCHED_CLASS_EXT=y\nCONFIG_NR_CPUS=64\n";
+        let fragment = "CONFIG_SCHED_CLASS_EXT=y\nCONFIG_NR_CPUS=512\n";
+        assert!(
+            !all_fragment_lines_present(fragment, config),
+            "changed CONFIG_NR_CPUS (64->512) must read as not-present even with sched_ext=y"
+        );
     }
 
     // -- is_kconfig_semantic_line predicate --

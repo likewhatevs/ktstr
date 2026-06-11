@@ -25,9 +25,9 @@ pub use kernel_cmd::{
 pub use kernel_list::{format_entry_row, kernel_clean, kernel_list, kernel_list_range_preview};
 
 pub use kernel_build::{
-    KernelBuildResult, append_extra_kconfig_suffix, configure_kernel, has_sched_ext,
-    kernel_build_pipeline, make_kernel_with_output, read_extra_kconfig, run_make,
-    run_make_with_output, validate_kernel_config,
+    KernelBuildResult, append_extra_kconfig_suffix, configure_kernel, kernel_build_pipeline,
+    make_kernel_with_output, read_extra_kconfig, run_make, run_make_with_output,
+    validate_kernel_config,
 };
 
 pub use parse::{DISK_HELP, parse_disk_arg, parse_disk_size_mib, parse_topology_string};
