@@ -717,6 +717,13 @@ pub(crate) fn build_vm_builder_base(
         .workload_duration(entry.duration)
         .no_perf_mode(no_perf_mode);
 
+    // Per-test no-perf CPU budget override (#[ktstr_test(cpu_budget = N)]).
+    // None leaves the builder's auto-size (vCPU count) in place; only the
+    // no-perf path consumes it.
+    if let Some(budget) = entry.cpu_budget {
+        builder = builder.cpu_budget(budget);
+    }
+
     if let Some(sched_path) = scheduler {
         builder = builder.scheduler_binary(sched_path);
     }

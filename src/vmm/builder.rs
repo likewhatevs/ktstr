@@ -61,6 +61,10 @@ pub struct KtstrVmBuilder {
     pub(crate) topology: Topology,
     pub(crate) memory_mib: Option<u32>,
     memory_min_mib: u32,
+    /// Per-test no-perf host-CPU budget override (`#[ktstr_test(cpu_budget)]`).
+    /// `None` auto-sizes to the vCPU count; `Some(n)` forces that budget
+    /// (n < vcpus → overcommit). An explicit `--cpu-cap` still wins.
+    pub(crate) cpu_budget: Option<u32>,
     pub(crate) cmdline_extra: String,
     pub(crate) timeout: Duration,
     pub(crate) monitor_thresholds: Option<crate::monitor::MonitorThresholds>,
@@ -225,6 +229,7 @@ impl Default for KtstrVmBuilder {
             },
             memory_mib: Some(256),
             memory_min_mib: 0,
+            cpu_budget: None,
             cmdline_extra: String::new(),
             timeout: Duration::from_secs(12),
             monitor_thresholds: None,
@@ -381,6 +386,19 @@ impl KtstrVmBuilder {
     pub fn memory_deferred_min(mut self, min_mib: u32) -> Self {
         self.memory_mib = None;
         self.memory_min_mib = min_mib;
+        self
+    }
+
+    /// Override the no-perf host-CPU budget — the number of host CPUs the
+    /// VM's vCPU threads share. The default (unset) auto-sizes to the VM's
+    /// vCPU count; setting `budget` < vcpus forces CPU overcommit (used by
+    /// `#[ktstr_test(cpu_budget = N)]` for contention tests). Only takes
+    /// effect on the no-perf path; an explicit `--cpu-cap` / `KTSTR_CPU_CAP`
+    /// overrides it. A `budget` of 0 is floored to 1 here so this low-level
+    /// setter never produces a zero-CPU mask; the `#[ktstr_test]` macro and
+    /// `KtstrTestEntry::validate` reject 0 before it reaches this setter.
+    pub fn cpu_budget(mut self, budget: u32) -> Self {
+        self.cpu_budget = Some(budget);
         self
     }
 
@@ -920,9 +938,15 @@ impl KtstrVmBuilder {
                             * self.topology.cores_per_llc
                             * self.topology.threads_per_core)
                             as usize;
-                        Some(host_topology::CpuCap::new(
-                            host_topology::no_perf_cpu_budget(allowed, vcpus),
-                        )?)
+                        // A per-test `cpu_budget` (#[ktstr_test]) overrides the
+                        // auto-size: clamp to [1, allowed] so a test can force
+                        // overcommit (budget < vcpus) without exceeding the host
+                        // allowance. Absent → size to the vCPU count.
+                        let budget = match self.cpu_budget {
+                            Some(n) => (n as usize).clamp(1, allowed.max(1)),
+                            None => host_topology::no_perf_cpu_budget(allowed, vcpus),
+                        };
+                        Some(host_topology::CpuCap::new(budget)?)
                     }
                 };
                 // Compute the plan and immediately drop the flocks:
@@ -1272,6 +1296,13 @@ mod tests {
         let b = KtstrVmBuilder::default().topology(Topology::new(1, 2, 4, 2));
         assert_eq!(b.topology.total_cpus(), 16);
         assert_eq!(b.topology.llcs, 2);
+    }
+
+    #[test]
+    fn builder_cpu_budget_setter() {
+        assert_eq!(KtstrVmBuilder::default().cpu_budget, None);
+        let b = KtstrVmBuilder::default().cpu_budget(16);
+        assert_eq!(b.cpu_budget, Some(16));
     }
 
     #[test]

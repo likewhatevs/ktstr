@@ -1171,6 +1171,17 @@ pub struct KtstrTestEntry {
     /// Guest memory in MiB (binary mebibytes; conversion at
     /// VM-launch is `value << 20` bytes, not `value * 1_000_000`).
     pub memory_mib: u32,
+    /// Host-CPU budget for the no-perf vCPU mask — the number of host
+    /// CPUs the VM's vCPU threads share. `None` auto-sizes to the vCPU
+    /// count (so a wide VM's parallel AP bringup isn't throttled);
+    /// `Some(n)` with `n` < vCPU count forces CPU overcommit for
+    /// contention testing. `Some(0)` is rejected (a zero budget cannot
+    /// run a VM). Requires `no_perf_mode`: the budget sizes only the
+    /// no-perf vCPU-thread mask, so setting it without `no_perf_mode` is
+    /// rejected (by the `#[ktstr_test]` macro and by `validate`) rather
+    /// than silently ignored. An explicit `--cpu-cap` / `KTSTR_CPU_CAP`
+    /// overrides it. Set by `#[ktstr_test(cpu_budget = N)]`.
+    pub cpu_budget: Option<u32>,
     /// Primary scheduler that drives the test. Defaults to
     /// [`Scheduler::EEVDF`] (the no-scx-scheduler placeholder; tests
     /// then run under the kernel's default scheduling class).
@@ -1700,6 +1711,7 @@ impl KtstrTestEntry {
         },
         constraints: TopologyConstraints::DEFAULT,
         memory_mib: 2048,
+        cpu_budget: None,
         scheduler: &crate::test_support::Scheduler::EEVDF,
         staged_schedulers: &[],
         payload: None,
@@ -1888,6 +1900,39 @@ impl KtstrTestEntry {
                  (\"I want pinning\" vs. \"I explicitly don't want \
                  pinning\"). Drop one of them.",
                 self.name,
+            );
+        }
+        // `cpu_budget` of zero cannot run a VM. The builder would
+        // otherwise clamp it to 1 (builder.rs effective_cap), silently
+        // running with a budget the author never asked for. Reject
+        // explicitly — mirrors the macro's compile-time reject and the
+        // memory_mib / cleanup_budget_ms zero-rejects in
+        // validate_cross_attr.
+        if self.cpu_budget == Some(0) {
+            anyhow::bail!(
+                "KtstrTestEntry '{}'.cpu_budget=Some(0) — a zero host-CPU \
+                 budget cannot run a VM. Use a positive budget, or drop \
+                 cpu_budget to auto-size the no-perf mask to the vCPU count.",
+                self.name,
+            );
+        }
+        // `cpu_budget` is consulted only on the no_perf_mode path
+        // (builder.rs sizes the shared vCPU-thread mask from it). A
+        // budget set without no_perf_mode is a silent no-op — the VM
+        // runs with the default mask and the requested overcommit never
+        // happens, so a contention test would quietly run un-contended.
+        // Reject at validate time (nextest discovery) for the
+        // programmatic-construction path; ktstr-macros enforces the same
+        // gate at compile time for the `#[ktstr_test]` path.
+        if self.cpu_budget.is_some() && !self.no_perf_mode {
+            anyhow::bail!(
+                "KtstrTestEntry '{}'.cpu_budget={:?} with no_perf_mode=false \
+                 — cpu_budget sizes the no-perf vCPU-thread mask and is \
+                 ignored unless no_perf_mode is set (under performance_mode \
+                 vCPUs are pinned 1:1). Set no_perf_mode=true or drop \
+                 cpu_budget.",
+                self.name,
+                self.cpu_budget,
             );
         }
         if (self.assert.expect_scx_bpf_error_contains.is_some()
@@ -2126,6 +2171,16 @@ impl KtstrTestEntry {
     #[must_use = "builder methods consume self; bind the result"]
     pub fn with_memory_mib(mut self, memory_mib: u32) -> Self {
         self.memory_mib = memory_mib;
+        self
+    }
+
+    /// Override `cpu_budget` (the no-perf host-CPU budget; `n` below the
+    /// vCPU count forces overcommit). Sets `Some(n)`; the default is
+    /// `None` (auto-size to the vCPU count). `validate` rejects `Some(0)`
+    /// and rejects a budget set without `no_perf_mode`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_cpu_budget(mut self, cpu_budget: u32) -> Self {
+        self.cpu_budget = Some(cpu_budget);
         self
     }
 
@@ -2874,6 +2929,24 @@ mod tests {
         entry.validate().expect("chained entry must validate");
     }
 
+    /// `with_cpu_budget` chains and produces a validating overcommit
+    /// entry. cpu_budget requires no_perf_mode (it sizes the no-perf
+    /// vCPU mask), so the two are set together — pinning the setter pair
+    /// against the validate gate. (cpu_budget is kept out of the
+    /// performance_mode chain above because the two are contradictory.)
+    #[test]
+    fn ktstr_test_entry_with_cpu_budget_chains_with_no_perf_mode() {
+        let entry = KtstrTestEntry::DEFAULT
+            .with_name("cpu_budget_chain")
+            .with_cpu_budget(16)
+            .with_no_perf_mode(true);
+        assert_eq!(entry.cpu_budget, Some(16));
+        assert!(entry.no_perf_mode);
+        entry
+            .validate()
+            .expect("cpu_budget + no_perf_mode chain must validate");
+    }
+
     /// `without_<field>` returns the original Option<T> field to
     /// `None`. The chain symmetry pin: `with_X(v).without_X() ==
     /// DEFAULT-state for that field`.
@@ -3298,6 +3371,79 @@ mod tests {
         entry
             .validate()
             .expect("host_only=false + disk=Some must validate");
+    }
+
+    /// `validate()` rejects `cpu_budget = Some(0)` — a zero host-CPU
+    /// budget cannot run a VM (the builder would otherwise silently
+    /// clamp it to 1). Pins the programmatic-construction guard that
+    /// mirrors the macro's compile-time zero-reject.
+    #[test]
+    fn validate_rejects_cpu_budget_zero() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "cpu_budget_zero",
+            func: good_test_func,
+            cpu_budget: Some(0),
+            no_perf_mode: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("cpu_budget=Some(0) must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("cpu_budget") && msg.contains("cpu_budget_zero"),
+            "expected cpu_budget zero diagnostic naming the entry, got: {msg}",
+        );
+    }
+
+    /// `validate()` rejects `cpu_budget` set without `no_perf_mode` —
+    /// the budget sizes only the no-perf vCPU mask, so it would be a
+    /// silent no-op under performance/default mode. Pins the
+    /// programmatic-construction guard mirroring the macro's gate.
+    #[test]
+    fn validate_rejects_cpu_budget_without_no_perf_mode() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "cpu_budget_no_no_perf",
+            func: good_test_func,
+            cpu_budget: Some(4),
+            no_perf_mode: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("cpu_budget without no_perf_mode must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("cpu_budget") && msg.contains("no_perf_mode"),
+            "expected cpu_budget/no_perf_mode diagnostic, got: {msg}",
+        );
+    }
+
+    /// `cpu_budget` with `no_perf_mode = true` is the legitimate
+    /// overcommit shape — pins the happy path against the two rejection
+    /// paths so a future edit can't flip polarity and reject every
+    /// valid overcommit test.
+    #[test]
+    fn validate_accepts_cpu_budget_with_no_perf_mode() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "cpu_budget_with_no_perf",
+            func: good_test_func,
+            cpu_budget: Some(4),
+            no_perf_mode: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        entry
+            .validate()
+            .expect("cpu_budget + no_perf_mode must validate");
     }
 
     /// `validate()` rejects `num_snapshots` greater than the bridge

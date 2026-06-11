@@ -406,6 +406,7 @@ pub(crate) fn require_bpf_prog_offsets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ktstr_test;
     use linkme::distributed_slice;
 
     // Register a test entry in the distributed slice for unit testing find_test.
@@ -439,5 +440,44 @@ mod tests {
     fn find_test_from_distributed_slice() {
         // KTSTR_TESTS should contain at least the __unit_test_dummy__ entry.
         assert!(!KTSTR_TESTS.is_empty());
+    }
+
+    // Macro-codegen coverage for the cpu_budget attr: drive the real
+    // #[ktstr_test] expansion (the parse arm + the Some(n)/None field-emit
+    // arms) and assert the emitted KtstrTestEntry carries the right
+    // cpu_budget. host_only keeps the probe from booting a VM; no_perf_mode
+    // satisfies the macro's cpu_budget-requires-no_perf_mode gate. find_test
+    // reads the registered entry from KTSTR_TESTS without invoking the body.
+    // This RUNS in CI (a src/ #[cfg(test)] unit test), unlike the
+    // ktstr-macros crate's own suite which cargo-ktstr does not discover.
+    #[ktstr_test(cpu_budget = 7, host_only, no_perf_mode)]
+    fn cpu_budget_codegen_probe(_ctx: &Ctx) -> Result<AssertResult> {
+        Ok(AssertResult::pass())
+    }
+
+    #[ktstr_test(host_only)]
+    fn cpu_budget_codegen_probe_none(_ctx: &Ctx) -> Result<AssertResult> {
+        Ok(AssertResult::pass())
+    }
+
+    #[test]
+    fn cpu_budget_attr_emits_some() {
+        let e = find_test("cpu_budget_codegen_probe")
+            .expect("the cpu_budget probe entry must be registered");
+        assert_eq!(
+            e.cpu_budget,
+            Some(7),
+            "#[ktstr_test(cpu_budget = 7)] must emit cpu_budget: Some(7)"
+        );
+    }
+
+    #[test]
+    fn omitted_cpu_budget_defaults_none() {
+        let e = find_test("cpu_budget_codegen_probe_none")
+            .expect("the no-cpu_budget probe entry must be registered");
+        assert_eq!(
+            e.cpu_budget, None,
+            "omitting cpu_budget must leave the DEFAULT None (no field emitted)"
+        );
     }
 }
