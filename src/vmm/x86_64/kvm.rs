@@ -696,6 +696,27 @@ pub(crate) struct IoapicHandle {
     /// (`routing_failures`) so a hung-device test reports the count instead of
     /// an opaque timeout.
     routing_failures: std::sync::atomic::AtomicU64,
+    /// The route set most recently installed via `KVM_SET_GSI_ROUTING`.
+    /// `mmio_write` skips the install ioctl (which waits an SRCU grace
+    /// period) when the freshly-computed `gsi_routes()` set is byte-identical
+    /// — the guest programs each 64-bit RTE as two 32-bit MMIO writes, and
+    /// the high-word write of a still-masked entry yields the same
+    /// `is_masked`-filtered route set as before it, so roughly half the
+    /// per-RTE installs are redundant. Guarded by its own mutex, not the
+    /// `ioapic` lock: the compare + ioctl + cache update run as one critical
+    /// section so the cache can never diverge from KVM's actual routing table
+    /// under concurrent IOAPIC programming, while the `ioapic` lock is
+    /// released first so a slow install never stalls another vCPU's IOAPIC
+    /// MMIO access.
+    ///
+    /// This dedup is intentionally stronger than the reference userspace
+    /// IOAPICs: qemu and libkrun both re-issue `KVM_SET_GSI_ROUTING` on every
+    /// redtbl write (qemu's change-counting dedup applies only to its PCI-MSI
+    /// path, not the IOAPIC). Skipping an unchanged table is safe because the
+    /// ioctl is a whole-table replace KVM applies idempotently -- an identical
+    /// re-install only burns an SRCU grace period (virt/kvm/irqchip.c
+    /// `kvm_set_irq_routing` has no unchanged-table early-out).
+    last_installed: PiMutex<Option<Vec<(u32, MsiRoute)>>>,
 }
 
 impl IoapicHandle {
@@ -704,6 +725,7 @@ impl IoapicHandle {
             ioapic,
             vm_fd_raw,
             routing_failures: std::sync::atomic::AtomicU64::new(0),
+            last_installed: PiMutex::new(None),
         }
     }
 
@@ -713,10 +735,17 @@ impl IoapicHandle {
     }
 
     /// Service a guest MMIO write of the IOAPIC window. If the write changed
-    /// a redirection entry, rebuild and install the full MSI routing table.
-    /// The route snapshot is taken under the device lock; the ioctl (which
-    /// waits an SRCU grace period) runs unlocked so it never stalls another
-    /// vCPU's IOAPIC access against the vCPU-thread blocking budget.
+    /// a redirection entry, rebuild the full MSI routing table and install it
+    /// — unless it is byte-identical to the last install, in which case the
+    /// (SRCU-grace-period) ioctl is skipped (see the `last_installed` cache).
+    ///
+    /// The route snapshot is taken under the `ioapic` lock, which is then
+    /// released; the compare + ioctl + cache update run under the separate
+    /// `last_installed` lock. So a slow install never stalls another vCPU's
+    /// IOAPIC MMIO access (the `ioapic` lock is free during the ioctl), and
+    /// the cache stays consistent with KVM's table — installs serialize on
+    /// `last_installed` (one whole-table replace at a time) and the cache is
+    /// updated in the same critical section as each install.
     pub(crate) fn mmio_write(&self, offset: u64, data: &[u8]) -> Result<()> {
         let routes = {
             let mut io = self.ioapic.lock();
@@ -727,12 +756,21 @@ impl IoapicHandle {
             }
         };
         if let Some(routes) = routes {
+            let mut last = self.last_installed.lock();
+            if last.as_deref() == Some(routes.as_slice()) {
+                // Unchanged from the last successful install — skip the
+                // whole-table replace and its SRCU grace period.
+                return Ok(());
+            }
             let routing = build_device_msi_routing(&routes)?;
             if let Err(e) = kvm_set_gsi_routing_via_raw_fd(self.vm_fd_raw, &routing) {
                 self.routing_failures
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Err(anyhow::anyhow!("KVM_SET_GSI_ROUTING: {e}"));
             }
+            // Cache only after a successful install so a failed ioctl never
+            // makes a later identical attempt skip a needed retry.
+            *last = Some(routes);
         }
         Ok(())
     }

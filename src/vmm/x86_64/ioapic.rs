@@ -262,6 +262,22 @@ impl Ioapic {
     /// `KVM_SET_GSI_ROUTING` replaces the whole table, so the caller installs
     /// this full set on each routing change; masked pins are omitted (no
     /// route -> an irqfd kick on that pin is dropped, matching the mask).
+    ///
+    /// No vector-coherence gate is needed on the emitted routes. A guest
+    /// reprogramming an already-unmasked RTE (e.g. an IRQ affinity change)
+    /// writes the 64-bit entry as two 32-bit MMIO writes, so the caller can
+    /// momentarily install a transient `{new dest, old vector}` route between
+    /// them. That transient is never delivered: `KVM_SET_GSI_ROUTING` only
+    /// swaps the routing table -- it never injects (virt/kvm/irqchip.c
+    /// `kvm_set_irq_routing`) -- and an MSI route fires only when its bound
+    /// irqfd's eventfd is kicked by the device asserting (virt/kvm/eventfd.c
+    /// `irqfd_wakeup`), which reads the cached entry after the guest has
+    /// finished both writes. Even a device assertion landing inside the
+    /// two-write window resolves correctly: the kernel writes the new dest
+    /// first (arch/x86/kernel/apic/io_apic.c `__ioapic_write_entry`) and keeps
+    /// the old vector live across affinity migration (arch/x86/kernel/apic/
+    /// vector.c -- the old vector is freed only after `irq_complete_move`), so
+    /// `{new dest, old vector}` still lands on a valid handler.
     pub(crate) fn gsi_routes(&self) -> Vec<(u32, MsiRoute)> {
         (0..NUM_PINS)
             .filter(|&pin| !self.is_masked(pin))
@@ -351,6 +367,56 @@ mod tests {
         assert!(!gsis.contains(&4), "re-masked pin 4 must be omitted; got {gsis:?}");
         let (_, msi) = routes.iter().find(|(g, _)| *g == 6).expect("pin 6 route");
         assert_eq!(msi.data & 0xff, 0x40, "pin 6 MSI carries vector 0x40");
+    }
+
+    /// A redundant RTE rewrite re-reports dirty (write_indirect flags every
+    /// redtbl dword write) but yields a byte-identical route set — exactly the
+    /// case `IoapicHandle::mmio_write` dedups, skipping the redundant
+    /// `KVM_SET_GSI_ROUTING` (whole-table replace + SRCU grace period).
+    #[test]
+    fn gsi_routes_identical_across_redundant_rte_rewrite() {
+        let mut io = Ioapic::new();
+        // Unmasked pin 6, vector 0x40, dest 2.
+        let rte = 0x40u64 | (2u64 << RTE_DESTID_0_7_SHIFT);
+        write_rte(&mut io, 6, rte);
+        let first = io.gsi_routes();
+        assert_eq!(first.len(), 1, "the unmasked pin is routed");
+        let dirty = write_rte(&mut io, 6, rte);
+        assert!(dirty, "a redtbl rewrite reports dirty even when the value is unchanged");
+        let second = io.gsi_routes();
+        assert_eq!(first, second, "a redundant RTE rewrite yields an identical route set");
+    }
+
+    /// The guest programs a 64-bit RTE as two 32-bit writes: high word (dest)
+    /// first while the entry is still masked, low word (vector + unmask) last
+    /// (the kernel's `__ioapic_write_entry` order). The high-word write leaves
+    /// the entry masked, so the route set is unchanged and `IoapicHandle`
+    /// dedups the install away; only the unmasking low-word write changes the
+    /// set — roughly halving the installs for each RTE the guest programs.
+    #[test]
+    fn gsi_routes_unchanged_on_masked_high_word_then_changes_on_unmask() {
+        let mut io = Ioapic::new();
+        let pin = 6usize;
+        let lo_reg = (REG_REDTBL_BASE + 2 * pin as u32) as u8;
+        let hi_reg = lo_reg + 1;
+        let before = io.gsi_routes();
+        assert!(before.is_empty(), "all pins reset masked → empty route set");
+        // High word: dest 2 in destid_0_7 ([63:56] → high dword [31:24]). The
+        // entry stays masked (the low dword keeps its reset masked value).
+        io.mmio_write(IOREGSEL, &[hi_reg]);
+        let dirty_hi = io.mmio_write(IOWIN, &(2u32 << 24).to_le_bytes());
+        assert!(dirty_hi, "redtbl high-word write reports dirty");
+        assert_eq!(
+            io.gsi_routes(),
+            before,
+            "still masked after the high-word write → route set unchanged (dedup skips)"
+        );
+        // Low word: vector 0x40, mask bit (16) clear → unmask.
+        io.mmio_write(IOREGSEL, &[lo_reg]);
+        let dirty_lo = io.mmio_write(IOWIN, &0x40u32.to_le_bytes());
+        assert!(dirty_lo, "redtbl low-word write reports dirty");
+        let after = io.gsi_routes();
+        assert_eq!(after.len(), 1, "unmasking installs the route");
     }
 
     #[test]
