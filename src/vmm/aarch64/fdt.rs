@@ -29,6 +29,16 @@ const GIC_PPI: u32 = 1;
 const IRQ_TYPE_EDGE_RISING: u32 = 1;
 
 /// IRQ_TYPE_LEVEL_LOW for timer PPIs (active-low per arm spec).
+///
+/// cloud-hypervisor, firecracker, AND qemu all emit LEVEL_HIGH (4) for the
+/// arch-timer PPIs; ktstr's LEVEL_LOW is nonetheless correct and the
+/// divergence is benign. arm arch-timer PPIs are architecturally
+/// active-low; the kernel's check_ppi_trigger (drivers/clocksource/
+/// arm_arch_timer.c) accepts either polarity as-is (only out-of-range
+/// values are forced + warned), and KVM's vgic forces all PPIs to
+/// VGIC_CONFIG_LEVEL with no polarity dimension — so HIGH vs LOW is
+/// cosmetic for these PPIs under KVM. Do NOT "correct" this to HIGH to
+/// match the reference VMMs.
 const IRQ_TYPE_LEVEL_LOW: u32 = 8;
 
 /// IRQ_TYPE_LEVEL_HIGH for the PMU PPI. Matches qemu virt
@@ -193,6 +203,25 @@ pub fn fdt_address(memory_mib: u32) -> u64 {
 /// [`super::kvm::KtstrKvm::setup_pvtime`] points each vCPU's PVTIME IPA
 /// at `pvtime_base + cpu_id * PVTIME_SIZE_PER_CPU`. Computed in one
 /// place so the host IPAs and the FDT carve-out agree exactly.
+///
+/// Divergence: qemu places PV-stolen-time in a separate fixed region in
+/// device-IO space below DRAM (VIRT_PVTIME = 0x090a0000, hw/arm/virt.c;
+/// VIRT_MEM starts at 1 GiB), with its own RAM-backed MemoryRegion. ktstr
+/// instead carves from the top of guest RAM so the IPA stays inside the
+/// registered guest-RAM memslots — no extra device region or memslot.
+/// The cost of that choice: the carve overlaps the address range the
+/// initrd would otherwise use, so `aarch64_initrd_addr` anchors the initrd
+/// below `pvtime_base` (qemu needs no such bound — its region is below DRAM).
+///
+/// firecracker uses the SAME carve-and-exclude ktstr does: it reserves a
+/// general in-RAM system region (SYSTEM_MEM, at the bottom of DRAM, shared
+/// with VMGenID), allocates the steal-time IPA from it
+/// (allocate_pvtime_region), and drops the region from `/memory`
+/// (create_memory_node starts the node SYSTEM_MEM_SIZE above DRAM_MEM_START),
+/// differing from us only in placement (its bottom-of-RAM vs our top-of-RAM).
+/// So carve-and-exclude is the
+/// mainstream pattern and only qemu's separate-device-region diverges;
+/// cloud-hypervisor and libkrun have no aarch64 pvtime at all.
 pub(crate) fn pvtime_base(memory_mib: u32, total_cpus: u32) -> u64 {
     let pvtime_size = total_cpus as u64 * super::kvm::PVTIME_SIZE_PER_CPU;
     (fdt_address(memory_mib) - pvtime_size) & !0xFFFF
@@ -495,6 +524,21 @@ fn write_serial(fdt: &mut FdtWriter, base: u64, alias: &str, irq: u32) -> Result
     Ok(())
 }
 
+/// Emit a `virtio_mmio` device-tree node (compatible / reg / interrupts /
+/// interrupt-parent).
+///
+/// Intentionally NO `dma-coherent` property: none of ktstr's virtio
+/// devices (blk, net, console) negotiate VIRTIO_F_ACCESS_PLATFORM
+/// (bit 33). Without that bit the
+/// guest virtio_ring takes the DMA-quirk path (vring_use_map_api ==
+/// false, drivers/virtio/virtio_ring.c): guest-physical addresses + a
+/// plain write-back-cacheable ring (alloc_pages_exact, not
+/// dma_alloc_coherent), so the DMA API — hence `dma-coherent` /
+/// of_dma_is_coherent — is never consulted. Under KVM same-arch the host
+/// maps the same physical guest RAM, so no coherency gap exists. We
+/// diverge from firecracker (which emits `dma-coherent`) deliberately:
+/// for a no-ACCESS_PLATFORM feature set the property is inert, not
+/// load-bearing.
 fn write_virtio_mmio(fdt: &mut FdtWriter, base: u64, size: u64, irq: u32) -> Result<()> {
     let name = format!("virtio_mmio@{base:x}");
     let node = fdt.begin_node(&name).context("begin virtio_mmio")?;
