@@ -2432,8 +2432,55 @@ impl KtstrVm {
                                         // failing page-table walk.
                                         let biased = kern_phys_base_for_worker
                                             .load(Ordering::Acquire);
+                                        let tcr_val = tcr_for_worker
+                                            .as_ref()
+                                            .map(|c| c.load(Ordering::Acquire))
+                                            .unwrap_or(0);
+                                        let cr3_val = cr3_for_worker.load(Ordering::Acquire);
                                         let pb_hint = if biased != 0 {
                                             biased.wrapping_sub(1)
+                                        } else if cfg!(target_arch = "aarch64")
+                                            && tcr_val != 0
+                                            && cr3_val != 0
+                                        {
+                                            // aarch64 accessor decouple: phys_base =
+                                            // code_start - ram_start = text_offset = 0 for a
+                                            // relocatable kernel (CONFIG_RANDOMIZE_BASE pinned
+                                            // in ktstr.kconfig; KERNEL_LOAD_ADDR == DRAM_START,
+                                            // aarch64/kvm.rs:22/90), so from_elf_with_hint with
+                                            // hint=0 yields the IDENTICAL accessor as the
+                                            // eventual KERN_ADDRS hint (which also resolves
+                                            // phys_base to 0 via wrapping_sub(1)). Build the
+                                            // accessor the moment the MMU is up (tcr_el1 + cr3
+                                            // programmed, early boot) instead of blocking on
+                                            // KERN_ADDRS, whose delivery waits on the guest's
+                                            // slow bulk-port-1 virtio_console handshake (~9s
+                                            // post-attach) and otherwise defers every periodic
+                                            // capture into the final scenario step (collapsing
+                                            // the per-phase pipeline to one bucket). The KASLR
+                                            // text offset still arrives via KERN_ADDRS for the
+                                            // kaslr publish gate (~L7751); only the map-accessor
+                                            // build is unblocked here. The host runs the guest
+                                            // same-arch under KVM, so cfg!(target_arch) is the
+                                            // guest arch. x86_64 keeps waiting for the real
+                                            // phys_base (no fixed-zero guarantee there).
+                                            //
+                                            // cr3 stability: the cached cr3 (TTBR1, read by the
+                                            // BSP loop) is swapper_pg_dir here, NOT the transient
+                                            // init_pg_dir. map_kernel installs init_pg_dir then
+                                            // switches to swapper_pg_dir inside the PI stub
+                                            // (arch/arm64/kernel/pi/map_kernel.c) while the MMU
+                                            // comes online — no MMIO/interrupt occurs, so the vCPU
+                                            // never exits to userspace in that window and the BSP
+                                            // loop's first non-zero TTBR1 read is already
+                                            // swapper_pg_dir (a stable .bss symbol, never freed).
+                                            // A future change adding any very-early guest exit
+                                            // could latch init_pg_dir (reclaimed by free_initmem)
+                                            // → the cached cr3 would then walk garbage; validating
+                                            // cr3 == swapper_pg_dir's PA before accepting this
+                                            // early build would catch that (deferred — the PA
+                                            // derivation is VA_BITS-sensitive).
+                                            0
                                         } else {
                                             let pb_evt_fd = {
                                                 use std::os::unix::io::AsRawFd;
@@ -2446,11 +2493,6 @@ impl KtstrVm {
                                             unsafe { libc::poll(pfds.as_mut_ptr(), 2, 200) };
                                             continue;
                                         };
-                                        let tcr_val = tcr_for_worker
-                                            .as_ref()
-                                            .map(|c| c.load(Ordering::Acquire))
-                                            .unwrap_or(0);
-                                        let cr3_val = cr3_for_worker.load(Ordering::Acquire);
                                         let map_res = crate::monitor::bpf_map::GuestMemMapAccessorOwned
                                             ::from_elf_with_hint(
                                                 mem_for_worker.clone(),
@@ -3210,6 +3252,15 @@ impl KtstrVm {
                 // a subsequent iteration finds the gate clear — the
                 // 10% buffer is the slack budget for this wait.
                 let mut periodic_boundaries_ns: Option<Vec<u64>> = None;
+                // Anchor (`scenario_start_ns` or the derived fallback) the
+                // boundaries were computed against; retained at loop scope
+                // so each periodic-fire store can derive its capture's
+                // workload-relative `boundary_offset_ms` = boundary_ns -
+                // anchor_ns, which `build_phase_buckets_with_stimulus` maps
+                // onto the guest step timeline (the run_start-relative fire
+                // time is ~uniform across the deferred burst and useless
+                // for per-phase attribution).
+                let mut periodic_anchor_ns: u64 = 0;
                 let mut next_periodic_idx: u32 = 0;
                 // Consecutive parked-vCPU rendezvous failures during
                 // periodic capture. Reset to 0 on every successful
@@ -7643,6 +7694,7 @@ impl KtstrVm {
                                     workload_duration_ns = workload_d.as_nanos() as u64,
                                     "freeze-coord: periodic snapshot boundaries computed"
                                 );
+                                periodic_anchor_ns = scenario_anchor;
                                 periodic_boundaries_ns = Some(boundaries);
                             }
                         }
@@ -7945,6 +7997,11 @@ impl KtstrVm {
                                         report,
                                         stats_value,
                                         Some(sample_elapsed_ms_anchor),
+                                        Some(
+                                            boundaries[next_periodic_idx as usize]
+                                                .saturating_sub(periodic_anchor_ns)
+                                                / 1_000_000,
+                                        ),
                                         phase_step_index,
                                     );
                                     // Successful capture resets the
@@ -8021,6 +8078,11 @@ impl KtstrVm {
                                             placeholder,
                                             stats_value,
                                             Some(sample_elapsed_ms_anchor),
+                                            Some(
+                                                boundaries[next_periodic_idx as usize]
+                                                    .saturating_sub(periodic_anchor_ns)
+                                                    / 1_000_000,
+                                            ),
                                             degraded_phase_step_index,
                                         );
                                         periodic_consecutive_timeouts =
@@ -8056,6 +8118,11 @@ impl KtstrVm {
                                             placeholder,
                                             stats_value,
                                             Some(sample_elapsed_ms_anchor),
+                                            Some(
+                                                boundaries[next_periodic_idx as usize]
+                                                    .saturating_sub(periodic_anchor_ns)
+                                                    / 1_000_000,
+                                            ),
                                             suppressed_phase_step_index,
                                         );
                                     }
@@ -8256,6 +8323,10 @@ impl KtstrVm {
                                 report,
                                 None,
                                 None,
+                                // On-demand watchpoint: no periodic boundary,
+                                // so no workload-relative offset; the trip
+                                // phase below is authoritative.
+                                None,
                                 trip_phase_step_index,
                             );
                             }
@@ -8316,6 +8387,10 @@ impl KtstrVm {
                                     placeholder,
                                     None,
                                     None,
+                                    // On-demand watchpoint: no periodic
+                                    // boundary, so no workload-relative
+                                    // offset; the trip phase is authoritative.
+                                    None,
                                     trip_phase_step_index,
                                 );
                             }
@@ -8346,6 +8421,10 @@ impl KtstrVm {
                                     &tag,
                                     placeholder,
                                     None,
+                                    None,
+                                    // On-demand watchpoint: no periodic
+                                    // boundary, so no workload-relative
+                                    // offset; the trip phase is authoritative.
                                     None,
                                     trip_phase_step_index,
                                 );
@@ -10652,17 +10731,18 @@ impl KtstrVm {
                 // PA derivation (pco_pa, scx_root_pa,
                 // page_offset_base_pa) into an out-of-DRAM address;
                 // every subsequent monitor read returns 0 and
-                // `data_valid` never latches. Brief retry-until-
-                // non-zero closes the window: by the time SYS_RDY
-                // fires the BSP has been in the run loop for
+                // `data_valid` never latches. The guest-reported-
+                // phys_base wait below closes the window: by the time
+                // SYS_RDY fires the BSP has been in the run loop for
                 // hundreds of ms in steady state, so the vast
-                // majority of paths return on the first load. The
-                // 500-iteration cap (500 ms total) handles the
-                // pathological case where the BSP genuinely never
-                // populated the cache (early-boot crash, kill
-                // before first iteration); in that case `phys_base`
-                // falls back to 0 and the downstream `data_valid`
-                // gate keeps every walk safe.
+                // majority of paths resolve on the first poll. Its
+                // bounded budget (30 iterations x 100 ms = 3 s) handles
+                // the pathological case where neither the guest-
+                // reported value nor the cr3-derived resolve ever
+                // returns (early-boot crash, kill before first
+                // iteration); in that case `phys_base` falls back to 0
+                // and the downstream `data_valid` gate keeps every
+                // walk safe.
                 // Wait for guest-reported phys_base. The guest
                 // reads it from /proc/iomem and writes
                 // `phys_base + 1` (biased +1 so the AtomicU64's

@@ -317,6 +317,7 @@ mod tests {
                 report: synthetic_report(10),
                 stats: Ok(synthetic_stats(50.0)),
                 elapsed_ms: Some(100),
+                boundary_offset_ms: None,
                 step_index: None,
             },
             DrainedSnapshotEntry {
@@ -324,6 +325,7 @@ mod tests {
                 report: synthetic_report(20),
                 stats: Err(MissingStatsReason::NoSchedulerBinary),
                 elapsed_ms: Some(200),
+                boundary_offset_ms: None,
                 step_index: None,
             },
         ];

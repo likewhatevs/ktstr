@@ -493,7 +493,11 @@ pub mod scenario;
 pub(crate) mod stats;
 pub(crate) mod taskstats;
 pub mod test_support;
-pub(crate) mod timeline;
+// `pub` (not `pub(crate)`): `assert::build_phase_buckets_with_stimulus`
+// takes `timeline::StimulusEvent` in its public signature, and result
+// analyzers (e2e tests folding `VmResult::stimulus_events` through that
+// fn) need to name the type and call `StimulusEvent::from_wire`.
+pub mod timeline;
 pub mod topology;
 
 /// Public surface for the live-host introspection pipeline.

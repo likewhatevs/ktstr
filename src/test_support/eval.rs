@@ -2169,20 +2169,7 @@ fn run_ktstr_test_inner_impl(
                         && let Some(ev) =
                             crate::vmm::wire::StimulusEvent::from_payload(&bulk_entry.payload)
                     {
-                        stimulus_events.push(crate::timeline::StimulusEvent {
-                            elapsed_ms: ev.elapsed_ms as u64,
-                            label: format!("StepStart[{}]", ev.step_index),
-                            op_kind: Some(format!("ops={}", ev.op_count)),
-                            detail: Some(format!(
-                                "{} cgroups, {} workers",
-                                ev.cgroup_count, ev.worker_count,
-                            )),
-                            total_iterations: if ev.total_iterations > 0 {
-                                Some(ev.total_iterations)
-                            } else {
-                                None
-                            },
-                        });
+                        stimulus_events.push(crate::timeline::StimulusEvent::from_wire(&ev));
                     }
                 }
                 Some(crate::vmm::wire::MsgType::PayloadMetrics) => {

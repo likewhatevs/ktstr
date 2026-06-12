@@ -1,7 +1,7 @@
 //! Stimulus/phase correlation for scenario execution.
 //!
 //! Correlates [`StimulusEvent`]s (cgroup operations, cpuset changes)
-//! with [`MonitorSample`] windows to
+//! with `MonitorSample` windows to
 //! measure per-phase scheduler behavior degradation. Produces
 //! [`Timeline`] entries consumed by the stats and reporting pipeline.
 
@@ -48,6 +48,46 @@ pub struct StimulusEvent {
     /// Cumulative worker iterations at this event. Used to compute
     /// per-phase throughput (iterations/s).
     pub total_iterations: Option<u64>,
+    /// 1-indexed scenario step this event belongs to (the same
+    /// encoding the bridge stamps: `1..=N` for Step ordinals), or
+    /// `None` for non-step events. Carried explicitly from the wire
+    /// `StimulusPayload.step_index` so the periodic-capture phase
+    /// attribution can map a capture's workload-relative boundary
+    /// offset onto the guest's own step timeline without parsing the
+    /// human-readable `label`.
+    pub step_index: Option<u16>,
+}
+
+impl StimulusEvent {
+    /// Build a timeline event from a deserialized wire stimulus event.
+    /// Centralizes the wire→timeline mapping so the production eval path
+    /// (`evaluate_vm_result`) and out-of-tree consumers — e2e tests that
+    /// fold `VmResult::stimulus_events` through
+    /// [`crate::assert::build_phase_buckets_with_stimulus`] — produce
+    /// identical events. The wire `step_index` is the bridge 1-indexed
+    /// convention (`Step[k]` -> `k + 1`, BASELINE owns 0); the human
+    /// `label` renders the 0-indexed Scenario-Step ordinal
+    /// (`step_index - 1`) to match the `PhaseBucket` `Step[k]` labels,
+    /// while the `step_index` field keeps the 1-indexed wire value for
+    /// phase-bucket remap. `total_iterations == 0` collapses to `None`
+    /// (the "no counter yet" sentinel) rather than a spurious `Some(0)`.
+    pub fn from_wire(ev: &crate::vmm::wire::StimulusEvent) -> Self {
+        Self {
+            elapsed_ms: ev.elapsed_ms as u64,
+            label: format!("StepStart[{}]", ev.step_index.saturating_sub(1)),
+            op_kind: Some(format!("ops={}", ev.op_count)),
+            detail: Some(format!(
+                "{} cgroups, {} workers",
+                ev.cgroup_count, ev.worker_count,
+            )),
+            total_iterations: if ev.total_iterations > 0 {
+                Some(ev.total_iterations)
+            } else {
+                None
+            },
+            step_index: Some(ev.step_index),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -683,6 +723,10 @@ fn phase_from_bucket(
                 op_kind: None,
                 detail: None,
                 total_iterations: None,
+                // Synthetic placeholder for a bucket with no
+                // correlated stimulus event; no authoritative step
+                // ordinal to carry.
+                step_index: None,
             }),
         }
     };
@@ -849,6 +893,7 @@ mod tests {
             op_kind: None,
             detail: None,
             total_iterations: None,
+            step_index: None,
         }
     }
 
@@ -976,6 +1021,7 @@ mod tests {
             op_kind: Some("SetCpuset".to_string()),
             detail: Some("4 cpus".to_string()),
             total_iterations: None,
+            step_index: None,
         };
         let events = vec![stimulus(0, "ScenarioStart"), e];
         let samples: Vec<MonitorSample> = (5..25)
@@ -1587,6 +1633,7 @@ mod tests {
             op_kind: None,
             detail: None,
             total_iterations: Some(total_iterations),
+            step_index: None,
         }
     }
 

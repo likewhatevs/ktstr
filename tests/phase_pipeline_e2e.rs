@@ -129,7 +129,12 @@ fn assert_phase_pipeline(result: &VmResult) -> Result<()> {
     // produce 2× the sample_count.
     let drained_len = drained.len();
     let series = SampleSeries::from_drained_typed(drained, result.monitor.clone());
-    let phases = ktstr::assert::build_phase_buckets(&series);
+    let stimulus: Vec<ktstr::timeline::StimulusEvent> = result
+        .stimulus_events
+        .iter()
+        .map(ktstr::timeline::StimulusEvent::from_wire)
+        .collect();
+    let phases = ktstr::assert::build_phase_buckets_with_stimulus(&series, &stimulus);
 
     // A1 — at least one Step bucket present (step_index >= 1)
     // alongside whatever BASELINE bucket may have landed.
@@ -359,7 +364,12 @@ fn assert_phase_pipeline_three_step(result: &VmResult) -> Result<()> {
     let drained = result.snapshot_bridge.drain_ordered_with_stats();
     let drained_len = drained.len();
     let series = SampleSeries::from_drained_typed(drained, result.monitor.clone());
-    let phases = ktstr::assert::build_phase_buckets(&series);
+    let stimulus: Vec<ktstr::timeline::StimulusEvent> = result
+        .stimulus_events
+        .iter()
+        .map(ktstr::timeline::StimulusEvent::from_wire)
+        .collect();
+    let phases = ktstr::assert::build_phase_buckets_with_stimulus(&series, &stimulus);
 
     // The load-bearing invariant: exact count. BASELINE bucket
     // is only emitted when at least one sample lands in the
@@ -463,7 +473,12 @@ fn phase_pipeline_three_step_e2e(ctx: &Ctx) -> Result<AssertResult> {
 fn assert_per_step_cpuset_changes_metrics(result: &VmResult) -> Result<()> {
     let drained = result.snapshot_bridge.drain_ordered_with_stats();
     let series = SampleSeries::from_drained_typed(drained, result.monitor.clone());
-    let phases = ktstr::assert::build_phase_buckets(&series);
+    let stimulus: Vec<ktstr::timeline::StimulusEvent> = result
+        .stimulus_events
+        .iter()
+        .map(ktstr::timeline::StimulusEvent::from_wire)
+        .collect();
+    let phases = ktstr::assert::build_phase_buckets_with_stimulus(&series, &stimulus);
 
     let step0 = phases.iter().find(|p| p.step_index == 1);
     let step1 = phases.iter().find(|p| p.step_index == 2);

@@ -127,6 +127,18 @@ pub struct Sample<'a> {
     /// [`SampleSeries::by_phase`] to bucket samples per scenario
     /// phase for the phase-aware aggregator.
     pub step_index: Option<u16>,
+    /// Workload-relative boundary offset (ms) this periodic capture
+    /// was scheduled for (`boundary_ns - scenario_anchor_ns`), or
+    /// `None` for non-periodic / on-demand captures. Distinct from
+    /// `elapsed_ms` (run_start-relative fire time, ~uniform across a
+    /// deferred-fire burst). Read by
+    /// [`crate::assert::build_phase_buckets`] /
+    /// [`crate::assert::build_phase_buckets_with_stimulus`] to
+    /// attribute the capture to the guest step whose stimulus window
+    /// contains this offset, and as the workload-relative bucket
+    /// start/end. `None` falls back to `elapsed_ms` + the stored
+    /// `step_index` (today's behavior for on-demand captures).
+    pub boundary_offset_ms: Option<u64>,
 }
 
 /// Ordered collection of [`Sample`]s drained from a
@@ -164,6 +176,10 @@ struct SampleRow {
     report: FailureDumpReport,
     stats: Result<serde_json::Value, crate::scenario::snapshot::MissingStatsReason>,
     elapsed_ms: u64,
+    /// Workload-relative boundary offset (ms) for periodic captures;
+    /// `None` for non-periodic / on-demand. Mirrored from
+    /// [`super::snapshot::DrainedSnapshotEntry::boundary_offset_ms`].
+    boundary_offset_ms: Option<u64>,
     /// Scenario phase index stamped at capture time by the
     /// step-aware bridge entry points, mirrored from
     /// [`super::snapshot::DrainedSnapshotEntry::step_index`].
@@ -239,6 +255,8 @@ impl SampleSeries {
                     crate::scenario::snapshot::MissingStatsReason::NoSchedulerBinary,
                 )),
                 elapsed_ms: elapsed_ms.unwrap_or(0),
+                // Fixture/tuple path carries no scheduled boundary offset.
+                boundary_offset_ms: None,
                 // Unstamped fixture path: samples surface with
                 // `step_index = None` and fall under the by_phase
                 // fallback bucket. Production callers thread the
@@ -270,6 +288,7 @@ impl SampleSeries {
                     report,
                     stats,
                     elapsed_ms,
+                    boundary_offset_ms,
                     step_index,
                     ..
                 } = entry;
@@ -278,6 +297,7 @@ impl SampleSeries {
                     report,
                     stats,
                     elapsed_ms: elapsed_ms.unwrap_or(0),
+                    boundary_offset_ms,
                     step_index,
                 }
             })
@@ -346,6 +366,7 @@ impl SampleSeries {
             snapshot: Snapshot::new(&r.report),
             stats: r.stats.as_ref(),
             step_index: r.step_index,
+            boundary_offset_ms: r.boundary_offset_ms,
         })
     }
 

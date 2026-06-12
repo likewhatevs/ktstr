@@ -728,6 +728,12 @@ pub struct DrainedSnapshotEntry {
     pub report: crate::monitor::dump::FailureDumpReport,
     pub stats: std::result::Result<serde_json::Value, MissingStatsReason>,
     pub elapsed_ms: Option<u64>,
+    /// Workload-relative boundary offset (ms) a periodic capture was
+    /// scheduled for (`boundary_ns - scenario_anchor_ns`); `None` for
+    /// non-periodic / on-demand captures. Distinct from `elapsed_ms`
+    /// (run_start-relative fire time). See
+    /// [`crate::scenario::snapshot::SnapshotBridge`]'s store doc.
+    pub boundary_offset_ms: Option<u64>,
     pub step_index: Option<u16>,
 }
 

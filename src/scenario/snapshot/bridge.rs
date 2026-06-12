@@ -291,6 +291,18 @@ pub(super) struct SnapshotStore {
     /// [`SnapshotBridge::drain_ordered_with_stats`] to populate
     /// `Sample::elapsed_ms` without recomputing.
     pub(super) elapsed_ms: HashMap<String, u64>,
+    /// Workload-relative boundary OFFSET (periodic `boundary_ns -
+    /// scenario_anchor_ns`, in ms) this periodic capture was
+    /// SCHEDULED for — distinct from `elapsed_ms`, which is the
+    /// run_start-relative FIRE time (~uniform across the deferred-fire
+    /// burst, so useless for per-phase attribution). Same key set as
+    /// `reports` for periodic tags; absent for non-periodic / on-demand
+    /// captures. Drained into
+    /// [`super::error::DrainedSnapshotEntry::boundary_offset_ms`] and
+    /// consumed by `build_phase_buckets[_with_stimulus]` to attribute
+    /// the capture to the guest step whose stimulus window contains
+    /// this offset, and as the workload-relative bucket start/end.
+    pub(super) boundary_offset_ms: HashMap<String, u64>,
     /// Per-VM scenario step index stamped on the capture by the
     /// step-aware entry points
     /// ([`SnapshotBridge::capture_with_step`] /
@@ -338,6 +350,7 @@ impl SnapshotStore {
             reports: HashMap::new(),
             stats: HashMap::new(),
             elapsed_ms: HashMap::new(),
+            boundary_offset_ms: HashMap::new(),
             step_index: HashMap::new(),
             order: VecDeque::new(),
             events: Vec::new(),
@@ -1073,7 +1086,7 @@ impl SnapshotBridge {
                 });
             return false;
         };
-        self.store_internal(name, report, None, None, Some(step_index));
+        self.store_internal(name, report, None, None, None, Some(step_index));
         true
     }
 
@@ -1091,7 +1104,7 @@ impl SnapshotBridge {
     /// of an existing tag also warns and replaces the prior report
     /// in place without disturbing FIFO ordering of other entries.
     pub fn store(&self, name: &str, report: FailureDumpReport) {
-        self.store_internal(name, report, None, None, None);
+        self.store_internal(name, report, None, None, None, None);
     }
 
     /// Bundle a [`FailureDumpReport`] with the scx_stats JSON and
@@ -1114,7 +1127,7 @@ impl SnapshotBridge {
         stats: Option<Result<serde_json::Value, super::error::MissingStatsReason>>,
         elapsed_ms: Option<u64>,
     ) {
-        self.store_internal(name, report, stats, elapsed_ms, None);
+        self.store_internal(name, report, stats, elapsed_ms, None, None);
     }
 
     /// Step-aware variant of [`Self::store_with_stats`]: bundles the
@@ -1138,9 +1151,17 @@ impl SnapshotBridge {
         report: FailureDumpReport,
         stats: Option<Result<serde_json::Value, super::error::MissingStatsReason>>,
         elapsed_ms: Option<u64>,
+        boundary_offset_ms: Option<u64>,
         step_index: u16,
     ) {
-        self.store_internal(name, report, stats, elapsed_ms, Some(step_index));
+        self.store_internal(
+            name,
+            report,
+            stats,
+            elapsed_ms,
+            boundary_offset_ms,
+            Some(step_index),
+        );
     }
 
     fn store_internal(
@@ -1149,6 +1170,7 @@ impl SnapshotBridge {
         report: FailureDumpReport,
         stats: Option<Result<serde_json::Value, super::error::MissingStatsReason>>,
         elapsed_ms: Option<u64>,
+        boundary_offset_ms: Option<u64>,
         step_index: Option<u16>,
     ) {
         let mut store = self.snapshots.lock_unpoisoned();
@@ -1192,6 +1214,14 @@ impl SnapshotBridge {
                     store.elapsed_ms.remove(name);
                 }
             }
+            match boundary_offset_ms {
+                Some(v) => {
+                    store.boundary_offset_ms.insert(name.to_string(), v);
+                }
+                None => {
+                    store.boundary_offset_ms.remove(name);
+                }
+            }
             match step_index {
                 Some(v) => {
                     store.step_index.insert(name.to_string(), v);
@@ -1208,6 +1238,9 @@ impl SnapshotBridge {
         }
         if let Some(v) = elapsed_ms {
             store.elapsed_ms.insert(name.to_string(), v);
+        }
+        if let Some(v) = boundary_offset_ms {
+            store.boundary_offset_ms.insert(name.to_string(), v);
         }
         if let Some(v) = step_index {
             store.step_index.insert(name.to_string(), v);
@@ -1230,6 +1263,7 @@ impl SnapshotBridge {
                 store.reports.clear();
                 store.stats.clear();
                 store.elapsed_ms.clear();
+                store.boundary_offset_ms.clear();
                 store.step_index.clear();
                 break;
             };
@@ -1246,10 +1280,11 @@ impl SnapshotBridge {
                 });
             }
             // Sweep the parallel maps in lock-step so a stranded
-            // stats / elapsed / step_index entry cannot outlive its
-            // report.
+            // stats / elapsed / boundary_offset / step_index entry
+            // cannot outlive its report.
             store.stats.remove(&evicted);
             store.elapsed_ms.remove(&evicted);
+            store.boundary_offset_ms.remove(&evicted);
             store.step_index.remove(&evicted);
         }
     }
@@ -1416,6 +1451,7 @@ impl SnapshotBridge {
         let mut reports = std::mem::take(&mut store.reports);
         let mut stats = std::mem::take(&mut store.stats);
         let mut elapsed = std::mem::take(&mut store.elapsed_ms);
+        let mut boundary_offset = std::mem::take(&mut store.boundary_offset_ms);
         let mut step_index = std::mem::take(&mut store.step_index);
         let mut out: Vec<super::error::DrainedSnapshotEntry> = Vec::with_capacity(order.len());
         // Bridge-absent stats slot collapses to the typed
@@ -1429,12 +1465,14 @@ impl SnapshotBridge {
             if let Some(report) = reports.remove(&tag) {
                 let s = stats.remove(&tag).unwrap_or_else(stats_fallback);
                 let e = elapsed.remove(&tag);
+                let bo = boundary_offset.remove(&tag);
                 let phase = step_index.remove(&tag);
                 out.push(super::error::DrainedSnapshotEntry {
                     tag,
                     report,
                     stats: s,
                     elapsed_ms: e,
+                    boundary_offset_ms: bo,
                     step_index: phase,
                 });
             }
@@ -1458,12 +1496,14 @@ impl SnapshotBridge {
             });
             let s = stats.remove(&tag).unwrap_or_else(stats_fallback);
             let e = elapsed.remove(&tag);
+            let bo = boundary_offset.remove(&tag);
             let phase = step_index.remove(&tag);
             out.push(super::error::DrainedSnapshotEntry {
                 tag,
                 report,
                 stats: s,
                 elapsed_ms: e,
+                boundary_offset_ms: bo,
                 step_index: phase,
             });
         }

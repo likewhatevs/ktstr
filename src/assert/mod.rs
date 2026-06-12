@@ -2143,10 +2143,25 @@ pub fn populate_run_ext_metrics(
     }
 }
 
-/// [`build_phase_buckets`] enriched with stimulus-event-derived
-/// per-phase `iteration_rate` so `crate::timeline::Timeline::from_phase_buckets`
-/// can render the per-phase throughput annotation without going
-/// through the legacy `crate::timeline::Timeline::build` path.
+/// Phase buckets attributed against the guest stimulus timeline, then
+/// enriched with stimulus-event-derived per-phase `iteration_rate`.
+///
+/// Unlike the plain [`build_phase_buckets`] (which groups by the
+/// bridge-stamped step_index), this re-groups each periodic capture by
+/// the guest step whose stimulus window contains the capture's
+/// workload-relative boundary offset (`Sample::boundary_offset_ms`).
+/// That offset is derived from the boundary schedule rather than the
+/// fire time, so it is immune to the deferred-fire burst that makes
+/// every capture stamp the same late CURRENT_STEP (the
+/// `phases.len() == 1` collapse). Captures with no offset (on-demand /
+/// fixture) fall back to their stamped step_index. Because the bucket
+/// windows are then workload-relative, the run-relative monitor samples
+/// are shifted by the stimulus/monitor clock skew before windowing.
+///
+/// The `iteration_rate` enrichment lets
+/// `crate::timeline::Timeline::from_phase_buckets` render the per-phase
+/// throughput annotation without going through the legacy
+/// `crate::timeline::Timeline::build` path.
 ///
 /// For each adjacent pair of stimulus events with
 /// `total_iterations: Some(_)`, the per-phase rate is
@@ -2166,7 +2181,41 @@ pub fn build_phase_buckets_with_stimulus(
     samples: &crate::scenario::sample::SampleSeries,
     stimulus_events: &[crate::timeline::StimulusEvent],
 ) -> Vec<PhaseBucket> {
-    let mut buckets = build_phase_buckets(samples);
+    let monitor_samples: &[crate::monitor::MonitorSample] =
+        samples.monitor().map(|m| m.samples()).unwrap_or(&[]);
+    // Re-group periodic captures by the guest step whose stimulus
+    // window contains each capture's workload-relative boundary offset,
+    // NOT the step_index stamped at (deferred) fire time. Under the
+    // dump-prerequisite gate the periodic boundaries can all fire in a
+    // burst once the accessor adopts, so every capture stamps the same
+    // late CURRENT_STEP and the naive grouping collapses to one phase;
+    // the scheduled offset is the timing-independent truth. Captures
+    // with no offset (on-demand / fixture) keep their stamped
+    // step_index via the fallback. step_starts is the step-start
+    // timeline in scenario-relative (guest monotonic) ms — the same
+    // frame as boundary_offset_ms.
+    let mut step_starts: Vec<(u64, u16)> = stimulus_events
+        .iter()
+        .filter_map(|e| e.step_index.map(|k| (e.elapsed_ms, k)))
+        .collect();
+    step_starts.sort_by_key(|(ms, _)| *ms);
+    let mut by_phase: std::collections::BTreeMap<u16, Vec<crate::scenario::sample::Sample<'_>>> =
+        std::collections::BTreeMap::new();
+    for sample in samples.iter_samples() {
+        let key = match sample.boundary_offset_ms {
+            Some(offset) => remap_offset_to_step(offset, &step_starts),
+            None => sample.step_index.unwrap_or(0),
+        };
+        by_phase.entry(key).or_default().push(sample);
+    }
+    // Bucket windows are workload-relative (boundary-offset) here, so the
+    // monitor samples (run-relative) are shifted by the stimulus/monitor
+    // clock skew before windowing.
+    let mut buckets = buckets_from_grouped(
+        by_phase,
+        monitor_samples,
+        monitor_clock_offset(stimulus_events, monitor_samples),
+    );
     // Per-phase iteration_rate from stimulus event total_iterations
     // deltas. Walk events pairwise; for each pair compute the
     // rate. Sort events by elapsed_ms first so an out-of-order
@@ -2174,11 +2223,7 @@ pub fn build_phase_buckets_with_stimulus(
     // delta to saturating_sub (the legacy Timeline::build path at
     // src/timeline.rs sorts the same way; without the sort, an
     // inversion produces duration_ms == 0 → skipped, a silent
-    // drop). Attribute to the bucket containing CURR (the
-    // rate's measurement endpoint — the phase in which the
-    // observed iteration count landed); attributing to PREV
-    // misattributes the rate to the wrong phase when prev / curr
-    // straddle a bucket boundary.
+    // drop).
     let mut sorted_events: Vec<&crate::timeline::StimulusEvent> = stimulus_events.iter().collect();
     sorted_events.sort_by_key(|e| e.elapsed_ms);
     for w in sorted_events.windows(2) {
@@ -2195,27 +2240,34 @@ pub fn build_phase_buckets_with_stimulus(
             continue;
         }
         let rate = (e - s) as f64 / (duration_ms as f64 / 1000.0);
-        // Attribute to the bucket containing PREV — the rate
-        // measures forward from PREV into the next event, so it
-        // is the rate OBSERVED DURING the phase that PREV's
-        // timestamp falls inside. The legacy Timeline::build
-        // alignment is identical: phase[i] gets the rate from
-        // events[i]→events[i+1], where events[i].elapsed_ms is
-        // the phase's left boundary.
+        // Attribute the rate to the step PREV starts: the pair
+        // (prev, curr) measures iterations accumulated from prev's
+        // step-start to curr's — the throughput DURING prev's step.
+        // Match by prev.step_index, NOT a timestamp window: the bucket
+        // windows here are workload-relative capture offsets (the step
+        // INTERIOR, 10-90% of the workload per
+        // compute_periodic_boundaries_ns), so prev.elapsed_ms — the
+        // step-START — lands in the inter-step gap, inside no bucket's
+        // [start_ms, end_ms) window; a window match would drop every
+        // rate. This mirrors the legacy Timeline::build alignment:
+        // phase[i] gets events[i]→events[i+1] where events[i] is
+        // phase[i]'s left boundary = prev.
         //
-        // The single-sample-bucket carve-out (start_ms ==
-        // end_ms) requires explicit equality on the event
-        // timestamp — the previous `||` short-circuit version
-        // unconditionally swallowed all events whose elapsed_ms
-        // was >= the bucket's instant, regardless of boundary.
-        // The half-open `< end` matches the MonitorSample
-        // windowing convention so boundary events don't
-        // double-attribute across adjacent buckets.
+        // Stimulus events without a step stamp (step_index == None:
+        // legacy / synthetic callers) fall back to the timestamp
+        // window — half-open [start_ms, end_ms) with a single-sample
+        // (start == end) equality carve-out so a boundary event lands
+        // in exactly one bucket.
         for bucket in buckets.iter_mut() {
-            let in_bucket = if bucket.start_ms == bucket.end_ms {
-                prev.elapsed_ms == bucket.start_ms
-            } else {
-                prev.elapsed_ms >= bucket.start_ms && prev.elapsed_ms < bucket.end_ms
+            let in_bucket = match prev.step_index {
+                Some(k) => bucket.step_index == k,
+                None => {
+                    if bucket.start_ms == bucket.end_ms {
+                        prev.elapsed_ms == bucket.start_ms
+                    } else {
+                        prev.elapsed_ms >= bucket.start_ms && prev.elapsed_ms < bucket.end_ms
+                    }
+                }
             };
             if in_bucket {
                 bucket
@@ -2266,15 +2318,44 @@ pub fn build_phase_buckets_with_stimulus(
 /// aggregate shape without re-implementing the bucketing logic.
 pub fn build_phase_buckets(samples: &crate::scenario::sample::SampleSeries) -> Vec<PhaseBucket> {
     // Borrowed per-tick monitor samples (None when no MonitorReport
-    // was attached, e.g. host-only fixture tests). When present,
-    // each PhaseBucket below also folds the monitor samples whose
-    // elapsed_ms lands in the bucket window — supplies metrics
-    // like `avg_imbalance_ratio` that need per-CPU full-class
-    // `rq.nr_running`, which the bridge-captured Snapshot does
-    // not expose (Snapshot carries scx_rq.nr_running only).
+    // was attached, e.g. host-only fixture tests).
     let monitor_samples: &[crate::monitor::MonitorSample] =
         samples.monitor().map(|m| m.samples()).unwrap_or(&[]);
-    let by_phase = samples.by_phase();
+    // Group by the bridge-stamped step_index. Without a stimulus
+    // timeline to remap against, the stamped index is the only phase
+    // signal available — see `build_phase_buckets_with_stimulus` for
+    // the offset-remap that corrects a deferred-fire burst (every
+    // capture stamping the same late CURRENT_STEP). The bucket window
+    // and the monitor folding share the run-relative frame here, so
+    // the clock offset is `0`; synthetic / legacy fixture samples carry
+    // `boundary_offset_ms = None` and the window falls back to
+    // `elapsed_ms`.
+    buckets_from_grouped(samples.by_phase(), monitor_samples, 0)
+}
+
+/// Assemble [`PhaseBucket`]s from a pre-grouped phase map. Shared by
+/// [`build_phase_buckets`] (grouping by the bridge-stamped step_index)
+/// and [`build_phase_buckets_with_stimulus`] (grouping by the
+/// offset-remapped step).
+///
+/// `monitor_to_window_offset_ms` is subtracted from each
+/// [`crate::monitor::MonitorSample`] `elapsed_ms` before the window
+/// test, bringing the monitor sample's run-relative timestamp into the
+/// bucket-window frame: `0` when both share the run-relative frame, the
+/// stimulus/monitor clock skew (see [`monitor_clock_offset`]) when the
+/// window is workload-relative (boundary-offset) but the monitor samples
+/// remain run-relative.
+///
+/// Each bucket folds the monitor samples whose (shifted) elapsed_ms
+/// lands in the bucket window — supplying metrics like
+/// `avg_imbalance_ratio` that need per-CPU full-class `rq.nr_running`,
+/// which the bridge-captured Snapshot does not expose (Snapshot carries
+/// scx_rq.nr_running only).
+fn buckets_from_grouped(
+    by_phase: std::collections::BTreeMap<u16, Vec<crate::scenario::sample::Sample<'_>>>,
+    monitor_samples: &[crate::monitor::MonitorSample],
+    monitor_to_window_offset_ms: i64,
+) -> Vec<PhaseBucket> {
     let mut out: Vec<PhaseBucket> = Vec::with_capacity(by_phase.len());
     for (step_index, samples_in_phase) in by_phase {
         let label = if step_index == 0 {
@@ -2291,10 +2372,26 @@ pub fn build_phase_buckets(samples: &crate::scenario::sample::SampleSeries) -> V
             format!("Step[{}]", step_index.saturating_sub(1))
         };
         let sample_count = samples_in_phase.len();
-        let (start_ms, end_ms) = match samples_in_phase.as_slice() {
-            [] => (0, u64::MAX),
-            [only] => (only.elapsed_ms, only.elapsed_ms),
-            [first, .., last] => (first.elapsed_ms, last.elapsed_ms),
+        // Bucket window: prefer each capture's workload-relative
+        // scheduled boundary offset (stable across a deferred-fire
+        // burst) over the run-relative fire time; fall back to
+        // `elapsed_ms` per-sample when no offset was stamped (synthetic
+        // / on-demand). min/max rather than first/last because the
+        // offset-remap in the stimulus path can reorder samples
+        // relative to drain order.
+        let win =
+            |s: &crate::scenario::sample::Sample<'_>| s.boundary_offset_ms.unwrap_or(s.elapsed_ms);
+        let (start_ms, end_ms) = if samples_in_phase.is_empty() {
+            (0, u64::MAX)
+        } else {
+            let mut lo = u64::MAX;
+            let mut hi = 0u64;
+            for s in &samples_in_phase {
+                let w = win(s);
+                lo = lo.min(w);
+                hi = hi.max(w);
+            }
+            (lo, hi)
         };
         let mut metrics: std::collections::BTreeMap<String, f64> =
             std::collections::BTreeMap::new();
@@ -2319,9 +2416,11 @@ pub fn build_phase_buckets(samples: &crate::scenario::sample::SampleSeries) -> V
             }
         }
         // Per-phase MonitorSample windowing (wire-up for metrics
-        // that need per-CPU full-class rq.nr_running). Half-open
-        // `[start_ms, end_ms)` filter so a MonitorSample whose
-        // elapsed_ms equals the boundary timestamp lands in
+        // that need per-CPU full-class rq.nr_running). The monitor
+        // sample's run-relative elapsed_ms is shifted into the
+        // bucket-window frame (subtract `monitor_to_window_offset_ms`)
+        // before the half-open `[start_ms, end_ms)` test so a
+        // MonitorSample whose timestamp equals the boundary lands in
         // exactly one bucket (not both adjacent buckets — the
         // closed-on-right form double-counted boundary samples).
         // Single-sample phases (start_ms == end_ms) use explicit
@@ -2334,11 +2433,16 @@ pub fn build_phase_buckets(samples: &crate::scenario::sample::SampleSeries) -> V
         // toward "perfect balance" and mask a real regression —
         // matches the legacy Timeline::build path's filter
         // discipline.
-        let in_window = |ms: u64| -> bool {
+        let in_window = |monitor_ms: u64| -> bool {
+            let shifted = monitor_ms as i64 - monitor_to_window_offset_ms;
+            if shifted < 0 {
+                return false;
+            }
+            let m = shifted as u64;
             if start_ms == end_ms {
-                ms == start_ms
+                m == start_ms
             } else {
-                ms >= start_ms && ms < end_ms
+                m >= start_ms && m < end_ms
             }
         };
         let phase_monitor_samples: Vec<&crate::monitor::MonitorSample> = monitor_samples
@@ -2370,6 +2474,58 @@ pub fn build_phase_buckets(samples: &crate::scenario::sample::SampleSeries) -> V
         });
     }
     out
+}
+
+/// Map a capture's workload-relative boundary offset (ms since scenario
+/// start) to the guest step active at that instant: the `step_index` of
+/// the latest stimulus step-start at or before the offset, or `0`
+/// (BASELINE) when the offset precedes the first step-start.
+/// `step_starts` must be sorted ascending by elapsed_ms.
+///
+/// This is the timing-independent attribution at the heart of the
+/// deferred-fire fix: the scheduled boundary offset is computed from the
+/// boundary schedule (not the fire time), so it survives a burst of
+/// captures that all fire — and would all stamp the same late
+/// CURRENT_STEP — after the dump-prerequisite gate clears.
+fn remap_offset_to_step(offset_ms: u64, step_starts: &[(u64, u16)]) -> u16 {
+    let mut step = 0u16;
+    for (start_ms, k) in step_starts {
+        if *start_ms <= offset_ms {
+            step = *k;
+        } else {
+            break;
+        }
+    }
+    step
+}
+
+/// Clock skew (ms) between the host monitor's run-relative timeline and
+/// the guest's scenario-relative stimulus timeline, computed the same
+/// way as [`crate::timeline::Timeline::build`]: the first significant
+/// monitor sample (elapsed > 500 ms, non-empty cpus) and the earliest
+/// stimulus event roughly coincide at scenario start. Returns
+/// `first_monitor_ms - first_stimulus_ms`; subtract from a monitor
+/// sample's elapsed_ms to reach the scenario-relative (boundary-offset)
+/// window frame. `0` when either timeline is empty (nothing to align,
+/// so the run-relative frames are used as-is).
+fn monitor_clock_offset(
+    stimulus_events: &[crate::timeline::StimulusEvent],
+    monitor_samples: &[crate::monitor::MonitorSample],
+) -> i64 {
+    if stimulus_events.is_empty() || monitor_samples.is_empty() {
+        return 0;
+    }
+    let first_stimulus_ms = stimulus_events
+        .iter()
+        .map(|e| e.elapsed_ms)
+        .min()
+        .unwrap_or(0);
+    let first_monitor_ms = monitor_samples
+        .iter()
+        .find(|s| s.elapsed_ms > 500 && !s.cpus.is_empty())
+        .map(|s| s.elapsed_ms)
+        .unwrap_or_else(|| monitor_samples.first().map(|s| s.elapsed_ms).unwrap_or(0));
+    first_monitor_ms as i64 - first_stimulus_ms as i64
 }
 
 impl AssertResult {
