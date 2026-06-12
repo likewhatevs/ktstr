@@ -2381,48 +2381,69 @@ impl KtstrVm {
                                 };
                                 let mut first_init = true;
                                 'reinit: loop {
-                                    // First init honours the 60 s
-                                    // boot-budget; subsequent re-inits
-                                    // (after a scheduler swap) skip the
-                                    // budget — the guest is already
-                                    // booted and the only reason init
-                                    // could fail is a transient slab-
-                                    // reuse race that resolves within a
-                                    // handful of retries.
-                                    let deadline = if first_init {
-                                        Some(Instant::now() + Duration::from_secs(60))
+                                    // First init honours the 60 s boot
+                                    // budget. Re-inits (after a scheduler
+                                    // swap) get a shorter 30 s budget: the
+                                    // guest is already booted, so a
+                                    // transient slab-reuse race resolves
+                                    // within a handful of retries; a wedged
+                                    // swap that never rebuilds must still
+                                    // stop retrying (the prior deadline=None
+                                    // busy-looped every ~100-200 ms until
+                                    // kill).
+                                    let is_first_init = first_init;
+                                    let deadline = if is_first_init {
+                                        Instant::now() + Duration::from_secs(60)
                                     } else {
-                                        None
+                                        Instant::now() + Duration::from_secs(30)
                                     };
                                     first_init = false;
                                     let publish: Option<AccessorPair> = loop {
                                         if kill_for_worker.load(Ordering::Acquire) {
                                             return;
                                         }
-                                        if let Some(dl) = deadline
-                                            && Instant::now() >= dl
-                                        {
+                                        if Instant::now() >= deadline {
+                                            if is_first_init {
+                                                tracing::warn!(
+                                                    "freeze-coord accessor-init worker: \
+                                                     60s first-init deadline exceeded; \
+                                                     coordinator will run without an \
+                                                     owned-accessor pair (freeze dump \
+                                                     path unavailable)"
+                                                );
+                                                // First-init budget burned
+                                                // without ever publishing —
+                                                // no accessor exists. Mark
+                                                // FAILED_PERMANENTLY so the
+                                                // dispatch wait sees the
+                                                // terminal state instead of
+                                                // blocking the full deadline
+                                                // on a worker that gave up.
+                                                worker_state_for_worker.store(
+                                                    crate::scenario::snapshot::bridge::accessor_worker_state::FAILED_PERMANENTLY,
+                                                    Ordering::Release,
+                                                );
+                                                let _ = dispatcher_wake_for_worker.write(1);
+                                                break None;
+                                            }
+                                            // Re-init budget exceeded — a
+                                            // wedged scheduler swap that did
+                                            // not settle. Do NOT mark
+                                            // FAILED_PERMANENTLY: a prior
+                                            // accessor is still in the slot
+                                            // and a later swap may rebuild
+                                            // cleanly. Stop busy-spinning —
+                                            // break to the park loop below,
+                                            // wait for the next reinit_evt,
+                                            // and keep the prior accessor
+                                            // usable.
                                             tracing::warn!(
                                                 "freeze-coord accessor-init worker: \
-                                                 60s deadline exceeded; coordinator \
-                                                 will run without owned-accessor \
-                                                 pair (freeze dump path unavailable)"
+                                                 30s re-init deadline exceeded \
+                                                 (scheduler swap did not settle); \
+                                                 keeping the prior accessor and \
+                                                 parking for the next reset"
                                             );
-                                            // First-init 60s budget
-                                            // burned without a publish
-                                            // — worker exits after
-                                            // surfacing the break path.
-                                            // Mark FAILED_PERMANENTLY
-                                            // so the dispatch wait sees
-                                            // the terminal state rather
-                                            // than blocking the full
-                                            // deadline on a worker
-                                            // that's already given up.
-                                            worker_state_for_worker.store(
-                                                crate::scenario::snapshot::bridge::accessor_worker_state::FAILED_PERMANENTLY,
-                                                Ordering::Release,
-                                            );
-                                            let _ = dispatcher_wake_for_worker.write(1);
                                             break None;
                                         }
                                         // Use the guest-reported phys_base
