@@ -81,7 +81,9 @@
 mod common;
 
 use anyhow::Result;
-use common::cargo_ktstr_subprocess::{combined_output, run_cargo_ktstr_shell};
+use common::cargo_ktstr_subprocess::{
+    combined_output, run_cargo_ktstr_shell, run_cargo_ktstr_shell_with_timeout,
+};
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::prelude::{Scheduler, SchedulerSpec};
@@ -198,6 +200,32 @@ fn shell_lifecycle_fixture_partial_fail(_ctx: &Ctx) -> Result<AssertResult> {
 }
 
 // ---- SUBPROCESS TESTS ---------------------------------------------
+
+/// A `--exec` payload that never exits must be force-killed at
+/// `--exec-timeout`, not block the BSP run loop forever. A panic-less
+/// guest hang leaves the guest halted (the BSP `bsp.run()` blocks in
+/// KVM_RUN, and flipping `kill` alone never unblocks it), so the
+/// run_interactive watchdog kicks the vCPU (immediate_exit + SIGRTMIN)
+/// at the deadline. `sleep 600` hangs well past the 8s timeout, so the
+/// run must end in the DISTINCT exec-timeout error — not the generic
+/// no-EXEC_EXIT-frame message, and not a wedge. 8s is comfortably past
+/// the ~4s boot-to-payload so the kill lands during the hang.
+#[test]
+fn shell_exec_timeout_force_kills_hanging_payload() {
+    let out = run_cargo_ktstr_shell_with_timeout("shell_lifecycle_fixture_both", "sleep 600", "8s");
+    let combined = combined_output(&out);
+    assert!(
+        !out.status.success(),
+        "a timed-out --exec must exit non-zero (the payload never \
+         delivered an exit code); got success.\n{combined}",
+    );
+    assert!(
+        combined.contains("exceeded") && combined.contains("exec-timeout"),
+        "expected the distinct exec-timeout error (proves the watchdog \
+         fired and the no-frame bail took the timed_out branch), \
+         got:\n{combined}",
+    );
+}
 
 /// Happy path: enable + disable both set, payload runs between
 /// them. Pins the canonical lifecycle and the ENABLE-before-payload

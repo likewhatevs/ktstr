@@ -50,12 +50,24 @@ const INITRD_ADDR: u64 = 0x800_0000; // 128 MiB
 /// the overlay path reaches `mmap` with a valid alignment regardless
 /// of host page size.
 #[cfg(target_arch = "aarch64")]
-fn aarch64_initrd_addr(memory_mib: u32, initrd_max_size: u64) -> u64 {
-    let fdt_addr = aarch64::fdt::fdt_address(memory_mib);
+fn aarch64_initrd_addr(memory_mib: u32, total_cpus: u32, initrd_max_size: u64) -> u64 {
+    // Ceiling is the PVTIME carve base, NOT the FDT address. setup_pvtime
+    // registers the per-vCPU steal-time IPAs in [pvtime_base, fdt_addr) and
+    // write_memory shrinks the advertised /memory to END at pvtime_base. An
+    // initrd whose top enters that carve is corrupted two independent ways:
+    // (1) on the FIRST KVM_RUN, before any guest code executes, the host
+    // writes the 8-byte stolen_time field at steal_base+8 (the kvm_update_
+    // stolen_time call from check_vcpu_requests) — the full 64-byte struct
+    // is zeroed later, guest-triggered via the PV_TIME_ST hypercall, after
+    // initrd unpack; and (2) the carve is outside advertised RAM, so the
+    // guest kernel never memblock-reserves those pages. Either clobbers the
+    // initramfs and the guest's /init never starts. Anchor the whole initrd
+    // below pvtime_base so it stays in advertised RAM, clear of the carve.
+    let ceiling = aarch64::fdt::pvtime_base(memory_mib, total_cpus);
     let page_size = host_page_size();
     let mask = !(page_size - 1);
-    // Place initrd just below FDT, host-page-aligned.
-    let load_addr = (fdt_addr - initrd_max_size) & mask;
+    // Place initrd just below the PVTIME carve, host-page-aligned.
+    let load_addr = (ceiling - initrd_max_size) & mask;
     assert!(
         load_addr >= kvm::DRAM_START,
         "initrd load address underflows DRAM_START"
@@ -120,6 +132,45 @@ pub(crate) fn disk_auto_mount_cmdline_tokens(disk: &disk_config::DiskConfig) -> 
         s.push_str(" KTSTR_DISK0_RO=1");
     }
     s
+}
+
+/// Guest kernel cmdline flags common to both arches, with the
+/// arch-specific tail spliced in. Centralized so a flag added once
+/// applies to x86_64 AND aarch64: a per-arch drift here previously left
+/// `sysctl.vm.overcommit_memory=1` on x86 only, OOM-ing the aarch64
+/// guest /init on its allocator reservation.
+///
+/// `arch_extra` is the per-arch tail (x86_64: no_timer_check /
+/// clocksource / i8042 / pci=off / reboot=k; aarch64: kfence). Callers
+/// append dynamic tokens (earlycon, loglevel, rdinit, disk auto-mount,
+/// numa, wprof, cmdline_extra) after this base. Cmdline params are
+/// order-independent, so the common-then-arch ordering is irrelevant.
+fn base_guest_cmdline(arch_extra: &str) -> String {
+    // KASLR is ON by default — ktstr.kconfig pins CONFIG_RANDOMIZE_BASE=y
+    // (text-image slide; x86 also CONFIG_RANDOMIZE_MEMORY=y for the
+    // direct-map slides). The host derives the runtime virt-KASLR offset
+    // (x86: MSR_LSTAR readback + KERN_ADDRS _text; aarch64: KERN_ADDRS
+    // _text only — no MSR_LSTAR) and threads it via coord_kaslr_offset()
+    // into every kaslr-aware site. Tests opt out via
+    // #[ktstr_test(kaslr = false)] / Scheduler::kargs(&["nokaslr"]).
+    //
+    // vm.overcommit_memory=1 (OVERCOMMIT_ALWAYS): the guest /init is a
+    // jemalloc-backed test binary that maps more virtual address space
+    // than its resident set. Under the default heuristic (mode 0)
+    // __vm_enough_memory rejects a single mapping larger than free RAM,
+    // so on a deferred-sized guest the /init aborts with "memory
+    // allocation of N bytes failed" before the workload runs. ALWAYS mode
+    // admits the mapping; the small resident set stays within guest RAM
+    // so no OOM-kill follows. (arm64's arch_mm_preinit auto-enables
+    // ALWAYS only for PAGE_SIZE>=16K with <=128 physpages.)
+    format!(
+        "console=ttyS0 nomodules mitigations=off random.trust_cpu=on \
+         swiotlb=noforce panic=-1 lockdown=none \
+         sysctl.kernel.unprivileged_bpf_disabled=0 \
+         sysctl.kernel.sched_schedstats=1 delayacct \
+         sysctl.kernel.task_delayacct=1 sysctl.vm.overcommit_memory=1 \
+         {arch_extra} KTSTR_GUEST=1"
+    )
 }
 
 /// Pure helper: assemble the `extras` slice and the [`BaseKey`] from
@@ -1180,40 +1231,10 @@ impl KtstrVm {
         //                                              zero on every kernel built with
         //                                              CONFIG_TASK_DELAY_ACCT=y but boot-time
         //                                              off (the upstream default since v5.14).
-        let mut cmdline = concat!(
-            "console=ttyS0 nomodules mitigations=off ",
-            "no_timer_check clocksource=kvm-clock ",
-            "random.trust_cpu=on swiotlb=noforce ",
-            "i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd ",
-            "pci=off reboot=k panic=-1 lockdown=none ",
-            "sysctl.kernel.unprivileged_bpf_disabled=0 ",
-            "sysctl.kernel.sched_schedstats=1 ",
-            "delayacct ",
-            "sysctl.kernel.task_delayacct=1 ",
-            // KASLR is ON by default — `ktstr.kconfig` pins
-            // `CONFIG_RANDOMIZE_BASE=y` (text-image slide) and
-            // `CONFIG_RANDOMIZE_MEMORY=y` (page_offset_base /
-            // vmalloc_base / vmemmap_base direct-map slides). The
-            // host's monitor + dump + freeze_coord consumers derive
-            // the runtime virt-KASLR offset via the
-            // [BSP MSR_LSTAR readback](src/vmm/x86_64/msr_kaslr.rs)
-            // PLUS the [KERN_ADDRS guest-channel `_text` path](src/vmm/guest_comms.rs::send_kern_addrs)
-            // and thread it through `coord_kaslr_offset()` into
-            // every kaslr-aware site (monitor::symbols::per_cpu_kva,
-            // monitor::dump::collect_per_cpu_time, capture_scx::
-            // compute_owned, kernel_op_dispatch::resolve_per_cpu_field_pa).
-            // The runtime `page_offset_base` is read host-side from
-            // /proc/kallsyms (see `vmm::rust_init::build_kern_addrs`)
-            // and shipped via `wire::KernAddrs.page_offset_base` for
-            // `monitor::symbols::kva_to_pa`. Tests that need
-            // determinism opt out via `#[ktstr_test(kaslr = false)]`
-            // or `Scheduler::kargs(&["nokaslr"])` — both re-add the
-            // `nokaslr` token through `runtime::build_cmdline_extra`.
-            // The `kaslr_offset_nonzero_post_boot` + sibling e2e
-            // regression tests guard the derivation chain.
-            "KTSTR_GUEST=1",
-        )
-        .to_string();
+        let mut cmdline = base_guest_cmdline(
+            "no_timer_check clocksource=kvm-clock i8042.noaux i8042.nomux \
+             i8042.nopnp i8042.dumbkbd pci=off reboot=k",
+        );
         let verbose = std::env::var(crate::KTSTR_VERBOSE_ENV)
             .map(|v| v == "1")
             .unwrap_or(false)
@@ -1380,7 +1401,7 @@ impl KtstrVm {
     /// NUMA-aware placement.
     ///
     /// Uses the same LZ4 SHM compress cache and COW overlay path as the
-    /// x86_64 [`Self::setup_memory`] flow. The shared helpers
+    /// x86_64 `Self::setup_memory` flow. The shared helpers
     /// ([`Self::get_or_compress_base`], [`Self::compress_and_load_initrd`],
     /// [`Self::try_cow_overlay`]) are arch-neutral; this function differs
     /// from the x86_64 driver only in (a) computing the initrd load
@@ -1505,7 +1526,11 @@ impl KtstrVm {
             );
         }
 
-        let load_addr = aarch64_initrd_addr(memory_mib, compressed_size as u64);
+        let load_addr = aarch64_initrd_addr(
+            memory_mib,
+            self.topology.total_cpus(),
+            compressed_size as u64,
+        );
         let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
         Ok((Some(load_addr), Some(size)))
     }
@@ -1570,9 +1595,14 @@ impl KtstrVm {
         vm.allocate_and_register_memory(memory_mib)
             .with_context(|| format!("allocate deferred memory ({memory_mib}MiB, aarch64)"))?;
 
-        // Compute load_addr only AFTER memory_mib is known (it determines
-        // the FDT position, and the initrd sits just below FDT).
-        let load_addr = aarch64_initrd_addr(memory_mib, compressed_size as u64);
+        // Compute load_addr only AFTER memory_mib is known: it determines
+        // the FDT position and thus pvtime_base, and the initrd now sits
+        // just below pvtime_base (the PVTIME carve), not the FDT.
+        let load_addr = aarch64_initrd_addr(
+            memory_mib,
+            self.topology.total_cpus(),
+            compressed_size as u64,
+        );
 
         let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
         Ok((Some(load_addr), Some(size)))
@@ -1596,30 +1626,7 @@ impl KtstrVm {
         //                              driver faults to catch in the
         //                              test VM, and KFENCE adds boot-time
         //                              page-allocation pressure.
-        let mut cmdline = concat!(
-            "console=ttyS0 ",
-            "nomodules mitigations=off ",
-            "random.trust_cpu=on swiotlb=noforce ",
-            "panic=-1 lockdown=none ",
-            "sysctl.kernel.unprivileged_bpf_disabled=0 ",
-            "sysctl.kernel.sched_schedstats=1 ",
-            "delayacct sysctl.kernel.task_delayacct=1 ",
-            "kfence.sample_interval=0 ",
-            // KASLR is ON by default — see x86_64 cmdline above for
-            // the full host-side derivation chain rationale. On
-            // aarch64 the only KASLR axis is `CONFIG_RANDOMIZE_BASE`
-            // (kernel-image slide); arm64 has no
-            // `CONFIG_RANDOMIZE_MEMORY` equivalent (the kernel
-            // direct-map base is fixed by `VA_BITS` —
-            // `arch/arm64/include/asm/memory.h:43-45`). The
-            // KERN_ADDRS `_text` guest-channel path is the SOLE
-            // virt-KASLR derive on this arch (no MSR_LSTAR equivalent
-            // — MSR_LSTAR is x86 SYSCALL infrastructure). Tests opt
-            // out via `#[ktstr_test(kaslr = false)]` or
-            // `Scheduler::kargs(&["nokaslr"])` — same shape as x86.
-            "KTSTR_GUEST=1",
-        )
-        .to_string();
+        let mut cmdline = base_guest_cmdline("kfence.sample_interval=0");
         // earlycon is always enabled so the kernel has a console from
         // the earliest boot stage. Without it, stdout-path auto-detection
         // is the only path to early output — and that can fail silently
@@ -1742,6 +1749,36 @@ impl KtstrVm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for the PVTIME/initrd overlap: the initrd top
+    /// must stay below pvtime_base, never entering the steal-time carve
+    /// `[pvtime_base, fdt_addr)`. Otherwise the host clobbers the initramfs
+    /// before the guest unpacks it — kvm_update_stolen_time writes the
+    /// 8-byte stolen_time field (steal_base+8) from check_vcpu_requests on
+    /// the FIRST KVM_RUN, before guest code executes — and, independently,
+    /// the carve is outside advertised /memory so the guest never reserves
+    /// those pages; either way /init never starts. The earlier PVTIME tests only
+    /// checked the /memory math, never the initrd-vs-carve relationship.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn aarch64_initrd_stays_below_pvtime_carve() {
+        use crate::vmm::{aarch64::fdt::pvtime_base, kvm::DRAM_START};
+        for &(mem, cpus) in &[(512u32, 2u32), (512, 8), (2048, 256), (4096, 512)] {
+            let pvt = pvtime_base(mem, cpus);
+            // A near-max initrd that still fits below the carve.
+            let max = pvt - DRAM_START - (1 << 20);
+            let load = aarch64_initrd_addr(mem, cpus, max);
+            assert!(
+                load >= DRAM_START,
+                "initrd underflows DRAM_START (mem={mem} cpus={cpus} load={load:#x})"
+            );
+            assert!(
+                load + max <= pvt,
+                "initrd top {:#x} entered the PVTIME carve at {pvt:#x} (mem={mem} cpus={cpus})",
+                load + max
+            );
+        }
+    }
 
     /// `Filesystem::Raw` disks emit no auto-mount cmdline tokens.
     /// The host has nothing to advertise: no on-disk fs to mount,

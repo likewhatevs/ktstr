@@ -247,6 +247,41 @@
 // `extern crate self as ktstr` is a pure name-binding.
 extern crate self as ktstr;
 
+// Global allocator for every binary linking this crate — the shipped
+// bins (ktstr, cargo-ktstr, the jemalloc fixtures; all carry
+// `required-features = ["cli-bins"]`) and, since `integration` pulls
+// `cli-bins` (Cargo.toml), every `#[ktstr_test]` integration-test binary
+// (the framework packs it as the guest `/init` — vmm::initramfs
+// strip+packs the test binary as rdinit). The guest-`/init` use is
+// incidental, NOT a fix: a memory-constrained guest `/init` is kept alive
+// by `vm.overcommit_memory=1` on the guest cmdline
+// (vmm::setup::base_guest_cmdline), not by this allocator — the System
+// allocator boots the guest fine under that sysctl (verified by running
+// the shell-lifecycle suite with jemalloc disabled: 12/12 pass). Gated on
+// `cli-bins`, which provides `tikv-jemallocator`; lean
+// `default-features = false` library consumers (which never boot guests)
+// keep the System allocator. The bins/probe that previously declared
+// their own jemalloc now inherit this one; `jemalloc_alloc_worker`
+// keeps its own because it does not link this crate (pure `#[path]`).
+#[cfg(feature = "cli-bins")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// Defense-in-depth for the e2e jemalloc-fixture invariant: `integration`
+// pulls `cli-bins` (Cargo.toml), so the jemalloc introspection fixtures
+// (`ktstr-jemalloc-probe` / `-alloc-worker`, gated on cli-bins +
+// integration) build when their e2es do — those e2es
+// `env!(CARGO_BIN_EXE_…)` the fixture bins. If the implication is ever
+// severed the fixtures don't build and their e2es fail to compile. Fail
+// the build loudly with the cause rather than ship the foot-gun.
+#[cfg(all(feature = "integration", not(feature = "cli-bins")))]
+compile_error!(
+    "feature `integration` requires `cli-bins`: the jemalloc \
+     introspection fixtures (ktstr-jemalloc-probe / -alloc-worker) are \
+     gated on cli-bins and their e2es env!(CARGO_BIN_EXE_…) them. Build \
+     with `--features integration` (which pulls cli-bins) or add cli-bins."
+);
+
 #[allow(
     clippy::all,
     dead_code,
@@ -1671,6 +1706,7 @@ pub fn run_shell(
     memory_mib: Option<u32>,
     dmesg: bool,
     exec: Option<&str>,
+    exec_timeout: std::time::Duration,
     disk: Option<vmm::disk_config::DiskConfig>,
     wprof_args: Option<&str>,
     performance_mode: bool,
@@ -1789,7 +1825,9 @@ pub fn run_shell(
     }
 
     if let Some(cmd) = exec {
-        builder = builder.exec_cmd(cmd);
+        // exec_timeout bounds the payload's wall-clock (panic-less hang
+        // guard); only meaningful in exec mode, so set it alongside.
+        builder = builder.exec_cmd(cmd).exec_timeout(exec_timeout);
     }
 
     if let Some(d) = disk {

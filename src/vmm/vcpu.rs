@@ -1112,19 +1112,19 @@ pub(crate) fn self_arm_watchpoint(
 /// ```
 ///
 ///   bit 0       E   = 1 (enable)
-///   bits [2:1]  PAC = 0b11 (EL0+EL1, any security state)
-///   bits [4:3]  LSC = 0b10 (store/write only — matches the
+///   bits \[2:1\]  PAC = 0b11 (EL0+EL1, any security state)
+///   bits \[4:3\]  LSC = 0b10 (store/write only — matches the
 ///                          x86 R/W=01 semantic the freeze
 ///                          coordinator already encodes)
-///   bits [12:5] BAS = which bytes of the 8-byte block at
+///   bits \[12:5\] BAS = which bytes of the 8-byte block at
 ///                     DBGWVR fire. For a 4-byte watch on a
 ///                     4-byte aligned KVA, BAS = 0xF
 ///                     shifted left by `kva & 0x7`.
-///   bits [15:13] HMC = 0
-///   bits [19:16] SSC = 0
+///   bits \[15:13\] HMC = 0
+///   bits \[19:16\] SSC = 0
 ///   bit 20       WT  = 0 (unlinked)
-///   bits [23:21] LBN = 0
-///   bits [28:24] MASK = 0 (no address mask; we never use
+///   bits \[23:21\] LBN = 0
+///   bits \[28:24\] MASK = 0 (no address mask; we never use
 ///                          larger ranges)
 ///
 /// Concrete WCR values:
@@ -1133,7 +1133,7 @@ pub(crate) fn self_arm_watchpoint(
 ///   - 4-byte write at doubleword offset 4:
 ///     `0x1 | (3 << 1) | (2 << 3) | (0xF << 9)` = `0x1E17`
 ///
-/// DBGWVR holds bits VA[52:2] in the architectural form
+/// DBGWVR holds bits VA\[52:2\] in the architectural form
 /// `RESS | VA[52:49] | VA[48:2] | 0 0`; the kernel sign-
 /// extends as required. We pass `kva & ~0x7` so the bottom
 /// 3 bits are zero (8-byte aligned base), and BAS picks the

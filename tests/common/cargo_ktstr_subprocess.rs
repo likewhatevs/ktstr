@@ -27,16 +27,53 @@ pub const CARGO_KTSTR_BINARY: &str = env!("CARGO_BIN_EXE_cargo-ktstr");
 /// non-perf path is sufficient for shell-mode lifecycle pins.
 #[cfg(unix)]
 pub fn run_cargo_ktstr_shell(fixture: &str, exec: &str) -> std::process::Output {
-    std::process::Command::new(CARGO_KTSTR_BINARY)
-        .arg("ktstr")
+    run_cargo_ktstr_shell_inner(fixture, exec, None)
+}
+
+/// Like [`run_cargo_ktstr_shell`] but with an explicit
+/// `--exec-timeout` (humantime, e.g. `"3s"`). Used by the
+/// panic-less-hang test: a `--exec` payload that never exits
+/// must be force-killed at the deadline rather than blocking the BSP
+/// run loop forever.
+#[cfg(unix)]
+pub fn run_cargo_ktstr_shell_with_timeout(
+    fixture: &str,
+    exec: &str,
+    exec_timeout: &str,
+) -> std::process::Output {
+    run_cargo_ktstr_shell_inner(fixture, exec, Some(exec_timeout))
+}
+
+#[cfg(unix)]
+fn run_cargo_ktstr_shell_inner(
+    fixture: &str,
+    exec: &str,
+    exec_timeout: Option<&str>,
+) -> std::process::Output {
+    let mut cmd = std::process::Command::new(CARGO_KTSTR_BINARY);
+    cmd.arg("ktstr")
         .arg("shell")
         .arg("--no-perf-mode")
         .arg("--test")
         .arg(fixture)
         .arg("--exec")
-        .arg(exec)
-        .output()
-        .expect("spawn cargo-ktstr shell --test")
+        .arg(exec);
+    if let Some(t) = exec_timeout {
+        cmd.arg("--exec-timeout").arg(t);
+    }
+    // Reuse THIS already-built test binary for `--test` fixture
+    // resolution instead of forcing cargo-ktstr to re-run
+    // `cargo build --tests` — which, spawned from nextest (TEST
+    // profile), re-compiles the whole test set and blows past the
+    // slow-timeout (see build_test_binaries). current_exe() is the
+    // nextest-built test binary that carries the fixture's
+    // `#[ktstr_test]` registration.
+    cmd.env(
+        "KTSTR_TEST_BINARY",
+        std::env::current_exe().expect("current_exe for KTSTR_TEST_BINARY"),
+    )
+    .output()
+    .expect("spawn cargo-ktstr shell --test")
 }
 
 /// Combined stdout + stderr from a subprocess Output, with a

@@ -153,6 +153,23 @@ pub(crate) fn build_test_binaries(
     package: Option<&str>,
     release: bool,
 ) -> Result<Vec<PathBuf>, String> {
+    // Reuse an already-built test binary instead of re-running
+    // `cargo build --tests` when the caller points us at one via
+    // KTSTR_TEST_BINARY (e.g. an integration test already running inside a
+    // freshly-built test binary under nextest, which sets it to its own
+    // `current_exe`). Without this, resolving a `cargo ktstr shell --test`
+    // fixture from inside a nextest run triggers a cold `cargo build
+    // --tests` (DEV profile) that re-compiles the whole test set — the
+    // running test binary was built TEST profile, so the fingerprints miss
+    // — over the shared target slot, blowing past nextest's slow-timeout
+    // (the test is SIGTERM'd mid-`Compiling`). The named binary carries the
+    // same `#[ktstr_test]` distributed-slice registry the probe reads, so
+    // resolution is identical, just build-free.
+    if let Ok(bin) = std::env::var("KTSTR_TEST_BINARY")
+        && !bin.is_empty()
+    {
+        return Ok(vec![PathBuf::from(bin)]);
+    }
     let mut cmd = Command::new("cargo");
     cmd.args(build_test_binaries_argv(package, release));
     cmd.stdout(std::process::Stdio::piped())

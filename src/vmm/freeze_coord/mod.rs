@@ -2489,22 +2489,27 @@ impl KtstrVm {
                                                     Ordering::Release,
                                                     Ordering::Relaxed,
                                                 );
-                                            let prog_res = {
-                                                let shared_syms = map.guest_kernel().symbols_arc();
-                                                let kernel = crate::monitor::guest::GuestKernel
-                                                    ::from_elf_with_symbols(
-                                                        mem_for_worker.clone(),
-                                                        shared_syms,
-                                                        &elf,
-                                                        tcr_val,
-                                                        cr3_val,
-                                                        pb_hint,
-                                                    );
-                                                kernel.and_then(|k| {
-                                                    crate::monitor::bpf_prog::GuestMemProgAccessorOwned
-                                                        ::finish(k, &elf, &data_for_worker, &vmlinux_for_worker)
-                                                })
-                                            };
+                                            // Reuse the map accessor's already-built
+                                            // GuestKernel for the prog accessor instead of
+                                            // rebuilding it. The kernel image (symbols,
+                                            // TTBR1/TCR/phys_base, page_offset) is identical
+                                            // for both accessors — only prog_idr_kva +
+                                            // prog offsets differ. Rebuilding via
+                                            // from_elf_with_symbols re-parsed the full
+                                            // vmlinux symtab and re-walked the page tables
+                                            // (~7 s on aarch64), which delayed the accessor
+                                            // publish past the periodic-capture window so
+                                            // no snapshot ever fired (periodic_fired=0).
+                                            // Cloning shares the Arc-backed `mem` +
+                                            // `symbols` — cheap — and `finish` only adds the
+                                            // prog IDR symbol + BTF offsets.
+                                            let prog_res =
+                                                crate::monitor::bpf_prog::GuestMemProgAccessorOwned::finish(
+                                                    map.guest_kernel().clone(),
+                                                    &elf,
+                                                    &data_for_worker,
+                                                    &vmlinux_for_worker,
+                                                );
                                             break Some((map, prog_res.ok()));
                                         }
                                         // Wait on kill_evt with 200ms
@@ -11764,6 +11769,27 @@ impl KtstrVm {
                             exit_reason = BspExitReason::Fatal;
                             break;
                         }
+                    }
+                    // Guest kernel panic latched on COM1 at ingest (e.g.
+                    // OOM → "...Attempted to kill init! exitcode=0x…")? The
+                    // latch fires only once the banner line is newline-
+                    // terminated, so classify_exit just drained the '\n'
+                    // that completed it.
+                    // Abort fast with the cause rather than spinning to the
+                    // watchdog / 24h interactive timeout. Propagate kill so
+                    // peers + the freeze coordinator tear down promptly,
+                    // like the Fatal arm.
+                    if let Some(line) = com1.lock().take_panic() {
+                        eprintln!(
+                            "BSP: guest kernel panic — aborting run: {line} \
+                             (if OOM: raise memory_mib or shrink the initramfs)"
+                        );
+                        kill.store(true, Ordering::Release);
+                        if let Some(kev) = kill_evt {
+                            let _ = kev.write(1);
+                        }
+                        exit_reason = BspExitReason::GuestPanic;
+                        break;
                     }
                 }
                 Err(e) => {

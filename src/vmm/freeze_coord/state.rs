@@ -72,6 +72,16 @@ pub(super) enum BspExitReason {
     /// `bsp.run()` returned a non-EINTR/EAGAIN errno. Indicates a
     /// permanent KVM_RUN failure on the BSP vCPU fd.
     RunError,
+    /// A guest kernel panic (e.g. OOM → "Kernel panic - not syncing:
+    /// Attempted to kill init! exitcode=0x…") was latched on COM1 (the
+    /// kernel console) at ingest and observed by the run loop, which breaks
+    /// immediately rather than spinning to the watchdog or the 24h
+    /// interactive-shell timeout (the gap that turned guest OOM into a
+    /// cryptic "test timed out"). Falls under the "every other variant →
+    /// exit_code=-1" rule above (no clean MSG_TYPE_EXIT follows a panic);
+    /// the latched panic line is logged at break time so the operator sees
+    /// the cause.
+    GuestPanic,
 }
 
 /// Decoded contents of a guest-side `MSG_TYPE_SNAPSHOT_REQUEST` TLV

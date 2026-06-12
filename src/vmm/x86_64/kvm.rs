@@ -420,7 +420,7 @@ impl KtstrKvm {
         //
         // Reference note: qemu likewise rejects (its phys-bits-too-low
         // hard-fail), never truncates. cloud-hypervisor instead caps the
-        // guest MAXPHYADDR at 46 and sizes the layout from it (migration
+        // guest MAXPHYADDR at 46 and sizes the MMIO/device area from it (migration
         // portability); ktstr has no migration, so it exposes the host's
         // MAXPHYADDR and rejects. libkrun and firecracker also leave the
         // host's MAXPHYADDR but lack this RAM bound, so the check is a

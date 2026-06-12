@@ -37,6 +37,13 @@ use super::symbols::{
 ///   per-CPU data, physically contiguous memory.
 /// - **Vmalloc/vmap**: Page table walk via CR3. Used for BPF maps,
 ///   vmalloc'd memory, module text.
+///
+/// `Clone` is cheap: `mem` and `symbols` are `Arc` (shared, not deep-
+/// copied) and every other field is a `Copy` scalar. The freeze-coord
+/// accessor-init worker clones the map accessor's kernel to build the
+/// prog accessor without re-parsing the vmlinux symtab or re-walking
+/// the page tables.
+#[derive(Clone)]
 pub struct GuestKernel {
     /// Owning handle to the host-mapped guest DRAM. `Arc` so the
     /// freeze coordinator's worker thread can build a `GuestKernel`

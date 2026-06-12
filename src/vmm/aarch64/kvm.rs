@@ -1,12 +1,11 @@
 use anyhow::{Context, Result};
 use kvm_bindings::{
     KVM_ARM_VCPU_PMU_V3_CTRL, KVM_ARM_VCPU_PMU_V3_INIT, KVM_ARM_VCPU_PMU_V3_IRQ,
-    KVM_ARM_VCPU_PVTIME_CTRL, KVM_ARM_VCPU_PVTIME_IPA,
-    KVM_DEV_ARM_VGIC_CTRL_INIT, KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_DEV_ARM_VGIC_GRP_CTRL,
-    KVM_DEV_ARM_VGIC_GRP_NR_IRQS, KVM_IRQ_ROUTING_IRQCHIP, KVM_VGIC_V3_ADDR_TYPE_DIST,
-    KVM_VGIC_V3_ADDR_TYPE_REDIST, KvmIrqRouting, kvm_create_device, kvm_device_attr,
-    kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3, kvm_irq_routing_entry,
-    kvm_irq_routing_entry__bindgen_ty_1, kvm_irq_routing_irqchip,
+    KVM_ARM_VCPU_PVTIME_CTRL, KVM_ARM_VCPU_PVTIME_IPA, KVM_DEV_ARM_VGIC_CTRL_INIT,
+    KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_DEV_ARM_VGIC_GRP_CTRL, KVM_DEV_ARM_VGIC_GRP_NR_IRQS,
+    KVM_IRQ_ROUTING_IRQCHIP, KVM_VGIC_V3_ADDR_TYPE_DIST, KVM_VGIC_V3_ADDR_TYPE_REDIST,
+    KvmIrqRouting, kvm_create_device, kvm_device_attr, kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3,
+    kvm_irq_routing_entry, kvm_irq_routing_entry__bindgen_ty_1, kvm_irq_routing_irqchip,
 };
 use kvm_ioctls::{Cap, DeviceFd, Kvm, VcpuFd, VmFd};
 use std::mem::ManuallyDrop;
@@ -493,6 +492,7 @@ impl KtstrKvm {
     ///   1. KVM_ARM_VCPU_PMU_V3_IRQ — programs vcpu->arch.pmu.irq_num
     ///   2. KVM_ARM_VCPU_PMU_V3_INIT — checks irq is initialised, marks
     ///      pmu.created = true (further attr writes return -EBUSY).
+    ///
     /// PMU_INTID is a PPI in the global intid namespace (16..32), so
     /// the same value is used for every vcpu per pmu_irq_is_valid.
     fn init_pmuv3(vcpus: &[VcpuFd]) -> Result<()> {

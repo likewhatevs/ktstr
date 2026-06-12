@@ -98,6 +98,11 @@ pub struct KtstrVmBuilder {
     pub(crate) wprof: Option<crate::vmm::wprof::WprofConfig>,
     dmesg: bool,
     exec_cmd: Option<String>,
+    /// Wall-clock bound for a shell `--exec` payload. A panic-less
+    /// guest hang otherwise blocks the BSP run loop ~forever; the
+    /// `run_interactive` watchdog kicks the vCPU after this deadline.
+    /// Default 120s; consulted only in `--exec` (exec_mode) runs.
+    exec_timeout: Duration,
     /// Optional host path to the `ktstr-jemalloc-probe` binary.
     /// When `Some`, the probe is packed into the guest initramfs at
     /// `bin/ktstr-jemalloc-probe` and becomes spawnable by bare name
@@ -248,6 +253,7 @@ impl Default for KtstrVmBuilder {
             wprof: None,
             dmesg: false,
             exec_cmd: None,
+            exec_timeout: Duration::from_secs(120),
             jemalloc_probe_binary: None,
             jemalloc_alloc_worker_binary: None,
             failure_dump_path: None,
@@ -818,6 +824,16 @@ impl KtstrVmBuilder {
         self
     }
 
+    /// Wall-clock bound for a `--exec` payload before the VM is
+    /// force-killed (a panic-less guest hang otherwise blocks the BSP
+    /// run loop ~forever). Default 120s. Consulted only in `--exec`
+    /// runs; interactive shell sessions are unbounded.
+    #[allow(dead_code)]
+    pub fn exec_timeout(mut self, t: Duration) -> Self {
+        self.exec_timeout = t;
+        self
+    }
+
     /// Validate the builder configuration and materialise a [`super::KtstrVm`].
     ///
     /// Returns `Err` for missing required inputs (kernel, init binary),
@@ -1100,6 +1116,7 @@ impl KtstrVmBuilder {
             wprof: self.wprof,
             dmesg: self.dmesg,
             exec_cmd: self.exec_cmd,
+            exec_timeout: self.exec_timeout,
             jemalloc_probe_binary: self.jemalloc_probe_binary,
             jemalloc_alloc_worker_binary: self.jemalloc_alloc_worker_binary,
             failure_dump_path: self.failure_dump_path,
@@ -1411,6 +1428,18 @@ mod tests {
     fn builder_rendezvous_timeout_override() {
         let b = KtstrVmBuilder::default().rendezvous_timeout(Duration::from_millis(100));
         assert_eq!(b.rendezvous_timeout, Some(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn builder_exec_timeout_default() {
+        let b = KtstrVmBuilder::default();
+        assert_eq!(b.exec_timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn builder_exec_timeout_override() {
+        let b = KtstrVmBuilder::default().exec_timeout(Duration::from_secs(30));
+        assert_eq!(b.exec_timeout, Duration::from_secs(30));
     }
 
     #[test]

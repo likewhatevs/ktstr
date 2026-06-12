@@ -27,6 +27,14 @@ declare_scheduler!(KTSTR_SCHED, {
     binary = "scx-ktstr",
 });
 
+// x86_64-only: `assert_kaslr_on` pins x86 RANDOMIZE_BASE invariants —
+// 2 MiB slot alignment (arch/x86/boot/compressed/kaslr.c) and the 1 GiB
+// RANDOMIZE_BASE_MAX_OFFSET cap. arm64's kernel-image slide is neither
+// 2 MiB-aligned nor <1 GiB (it spans the middle half of the VMALLOC
+// region — tens of TiB), so the arm64 equivalent is the separate
+// `kaslr_offset_nonzero_post_boot_aarch64` below, with arch-correct
+// assertions (4 KiB aligned, no upper bound).
+#[cfg(target_arch = "x86_64")]
 #[ktstr_test(
     scheduler = KTSTR_SCHED,
     duration_s = 2,
@@ -37,6 +45,7 @@ fn kaslr_offset_nonzero_post_boot(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
+#[cfg(target_arch = "x86_64")]
 fn assert_kaslr_on(result: &VmResult) -> Result<()> {
     let off = result.kern_kaslr_offset;
     anyhow::ensure!(
@@ -192,14 +201,43 @@ fn assert_kaslr_aarch64(result: &VmResult) -> Result<()> {
          readback minus link-time _text)"
     );
     anyhow::ensure!(
-        off % 4096 == 0,
+        off.is_multiple_of(4096),
         "aarch64 kern_kaslr_offset {off:#x} not 4 KiB aligned — \
          page-aligned slide invariant violated"
     );
-    // NOTE: no upper bound — arm64 RANDOMIZE_BASE entropy varies by
-    // config (MODULES_VSIZE / 4096); page-aligned + non-zero is the
-    // load-bearing pin per arch/arm64/kernel/kaslr.c. Don't add a
-    // 1 GiB cap here (x86-only invariant).
+    // Upper bound — the arm64 analogue of x86's RANDOMIZE_BASE_MAX_OFFSET.
+    // arch/arm64/kernel/pi/kaslr_early.c:60-61 places the kernel image in
+    // the MIDDLE HALF of [KIMAGE_VADDR, VMALLOC_END]:
+    //   range = (VMALLOC_END - KIMAGE_VADDR) / 2;
+    //   off   = range/2 + ((u128)range * seed >> 64)   ∈ [range/2, 3·range/2)
+    // (map_kernel.c:245,281 then ORs the MIN_KIMG_ALIGN-masked high bits
+    // with pa_base % MIN_KIMG_ALIGN). Our kernel is built
+    // CONFIG_ARM64_VA_BITS_52=y / 4 KiB pages (LPA2), so VA_BITS=52 but
+    // VA_BITS_MIN=48 (memory.h:56-64). Because VA_BITS != VA_BITS_MIN,
+    // VMALLOC_END takes the vabits_actual-dependent branch (pgtable.h:27-28)
+    // — vabits_actual is a RUNTIME value (48 without FEAT_LPA2/LVA, 52 with),
+    // so the healthy window shifts with the host CPU: ≈[31.5, 94.5) TiB at
+    // vabits_actual=48 (our KVM guest — no LPA2 exposed), ≈[16.5, 49.5) TiB
+    // at vabits_actual=52. A hardcoded range/2 floor would false-fail across
+    // hosts, so we pin only the host-INDEPENDENT ceiling
+    // 1<<(VA_BITS_MIN−1) = 1<<47 (128 TiB): both vabits_actual maxes are
+    // < 2^47, while a derivation bug (wrap to ~2^64, or off-by-a-region)
+    // lands ≥ 2^47. VA_BITS_MIN is fixed at 48 for our config, so this never
+    // false-fails on any host. (off != 0 above catches the no-slide
+    // failure host-independently.)
+    //
+    // (The 4 KiB-alignment assert above is correct, NOT 2 MiB: map_kernel.c
+    // :245 folds pa_base % MIN_KIMG_ALIGN into the slide, and the kernel
+    // only guarantees pa_base 4 KiB-aligned.)
+    const VA_BITS_MIN: u32 = 48;
+    anyhow::ensure!(
+        off < (1u64 << (VA_BITS_MIN - 1)),
+        "aarch64 kern_kaslr_offset {off:#x} exceeds the VA_BITS_MIN=48 \
+         kernel-image window (1<<47 = 128 TiB) — KASLR slide derivation \
+         bug; the healthy arm64 slide is vabits_actual-dependent, \
+         ≈[31.5, 94.5) TiB (vactual=48) or ≈[16.5, 49.5) TiB (vactual=52), \
+         per arch/arm64/kernel/pi/kaslr_early.c:60-61"
+    );
     Ok(())
 }
 

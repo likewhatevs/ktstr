@@ -992,8 +992,17 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // sees every byte even on a wedged guest.
     install_fatal_signal_handlers();
     std::panic::set_hook(Box::new(|info| {
+        // Write the `PANIC:` header FIRST — cheap, no symbolization —
+        // so the diagnostic reaches the host even when the subsequent
+        // backtrace symbolization (which faults in the binary's DWARF,
+        // hundreds of MiB for a debuginfo-heavy test binary) allocates
+        // beyond a memory-pressured guest's headroom and aborts. The
+        // host's `extract_panic_message` keys on this `PANIC:` prefix.
+        let head = format!("PANIC: {info}\n");
+        let _ = fs::write(COM2, &head);
+        let _ = fs::write(COM1, &head);
         let bt = std::backtrace::Backtrace::force_capture();
-        let msg = format!("PANIC: {info}\n{bt}\n");
+        let msg = format!("{bt}\n");
         // COM2 / COM1 serial. COM2 is the canonical crash log
         // destination for the host's serial-capture path; the
         // host parses the `PANIC:` prefix via

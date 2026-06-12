@@ -327,7 +327,15 @@ debug = "line-tables-only"
 
 [features]
 default = ["llm", "cli-bins"]
-integration = []
+# `integration` pulls `cli-bins` because the jemalloc introspection
+# fixtures (`ktstr-jemalloc-{probe,alloc-worker}`, gated on cli-bins +
+# integration) are `env!(CARGO_BIN_EXE_…)`'d by their e2es, and cargo
+# resolves features per-build — so the whole e2e suite needs cli-bins for
+# those fixtures to build. (The guest-`/init` memory-constrained OOM is
+# fixed by `vm.overcommit_memory=1` on the guest cmdline, NOT the
+# allocator, so the e2e `/init`'s jemalloc is incidental.) lib.rs
+# `compile_error!`s if this implication is ever broken.
+integration = ["cli-bins"]
 # Dependencies for the `src/bin/*.rs` entry points. The two
 # user-facing bins (`ktstr`, `cargo-ktstr`) carry
 # `required-features = ["cli-bins"]`; the two jemalloc test fixtures

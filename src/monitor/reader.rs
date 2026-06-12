@@ -148,7 +148,7 @@ impl Aarch64WalkParams {
     ///
     /// Rejects FEAT_LPA2 (`TCR_EL1.DS == 1`, bit 59) because the
     /// walker's [`Self::descaddrmask`] cannot recover OA bits
-    /// [51:50] from descriptor bits [9:8] — those bits are masked
+    /// \[51:50\] from descriptor bits \[9:8\] — those bits are masked
     /// out as low descriptor metadata. Without that splice, valid
     /// LPA2 PTEs translate to wrong PAs that read attacker-controlled
     /// guest memory or out-of-range addresses. Returning `None` here
@@ -1074,27 +1074,27 @@ impl GuestMem {
     /// translation tables with the matching stride/level configuration.
     /// Handles block descriptors at intermediate levels for huge pages.
     ///
-    /// TG1 encoding (TCR_EL1[31:30], distinct from TG0[15:14]):
+    /// TG1 encoding (TCR_EL1\[31:30\], distinct from TG0\[15:14\]):
     /// `0b01` = 16 KB (stride 11), `0b10` = 4 KB (stride 9),
     /// `0b11` = 64 KB (stride 13). `0b00` is reserved per Arm ARM
     /// D17.2.139 and the walker rejects it as unmapped. T1SZ in bits
-    /// [21:16]; VA width = `64 - T1SZ`. Starting level computed as
+    /// \[21:16\]; VA width = `64 - T1SZ`. Starting level computed as
     /// `4 - (va_width - 4) / stride` — the bottom of the descriptor
     /// cascade is always level 3.
     ///
     /// Descriptor format (ARMv8 D5.3):
-    /// - bits [1:0] = 0b00: invalid
-    /// - bits [1:0] = 0b01: block descriptor (intermediate levels) or
+    /// - bits \[1:0\] = 0b00: invalid
+    /// - bits \[1:0\] = 0b01: block descriptor (intermediate levels) or
     ///   reserved (level 3, treated as invalid)
-    /// - bits [1:0] = 0b11: table descriptor (intermediate levels) or
+    /// - bits \[1:0\] = 0b11: table descriptor (intermediate levels) or
     ///   page descriptor (level 3)
-    /// - OA layout: the walker recovers low OA bits [49:granule_log2]
+    /// - OA layout: the walker recovers low OA bits \[49:granule_log2\]
     ///   via `descaddrmask` (matching the kernel's `PTE_ADDR_LOW`).
-    ///   On non-LPA / non-LPA2 kernels bits [49:48] are RES0 by
-    ///   hardware so the practical OA range is [47:granule_log2].
+    ///   On non-LPA / non-LPA2 kernels bits \[49:48\] are RES0 by
+    ///   hardware so the practical OA range is \[47:granule_log2\].
     ///   No high-OA splice is applied. FEAT_LPA2 (`TCR_EL1.DS=1`)
     ///   is rejected by [`Aarch64WalkParams::from_tcr_el1`] because
-    ///   it requires the [9:8]→[51:50] splice; FEAT_LPA on the 64
+    ///   it requires the \[9:8\]→\[51:50\] splice; FEAT_LPA on the 64
     ///   KiB granule is undetectable from `TCR_EL1` alone but
     ///   ktstr.kconfig does not enable `CONFIG_ARM64_PA_BITS_52`,
     ///   so the assumption holds for the kernel under test.
@@ -1115,8 +1115,8 @@ impl GuestMem {
     /// require kconfig opt-ins (`CONFIG_ARM64_PA_BITS_52`,
     /// `CONFIG_ARM64_VA_BITS_52`) that ktstr.kconfig does not enable.
     /// A future user that pins those configs must extend this walker
-    /// with the high-OA splice (PTE_ADDR_HIGH bits [15:12] for
-    /// FEAT_LPA on 64 KiB pages, [9:8] for FEAT_LPA2 on 4 KiB / 16
+    /// with the high-OA splice (PTE_ADDR_HIGH bits \[15:12\] for
+    /// FEAT_LPA on 64 KiB pages, \[9:8\] for FEAT_LPA2 on 4 KiB / 16
     /// KiB) before the monitor reads guest page tables.
     #[cfg(target_arch = "aarch64")]
     fn walk_aarch64(&self, ttbr_pa: u64, kva: Kva, tcr_el1: u64) -> Option<u64> {
@@ -1157,12 +1157,27 @@ impl GuestMem {
         let mut indexmask: u64 = params.first_indexmask;
         let descaddrmask: u64 = params.descaddrmask;
 
-        // Translation table base: TTBR1_EL1 bits [47:0] — but the caller
-        // already passed a DRAM-relative offset (text_kva_to_pa_with_base
-        // of the pgd symbol), so we treat `ttbr_pa` directly as the
-        // table's GuestMem offset and only mask off any ASID-style high
-        // bits.
-        let mut descaddr: u64 = ttbr_pa & ((!0u64) >> (64 - 48));
+        // Translation table base: the caller passes the raw TTBR1_EL1
+        // value (`GuestKernel::cr3_pa`, sourced from KVM_GET_ONE_REG /
+        // `read_cr3`) — the pgd's ABSOLUTE guest PA, the same address
+        // space as the descriptor payloads below. `to_offset` converts
+        // those payloads to GuestMem (DRAM-relative) offsets; the
+        // initial table base must be converted identically. Omitting
+        // this left the first table read DRAM_START too high → invalid
+        // descriptor → the walk failed for every TTBR1 KVA that needs a
+        // real walk (vmalloc / kimage); direct-map KVAs use the
+        // `page_offset` formula in `translate_any_kva` and never reach
+        // here, which is why it only surfaced once map discovery walked
+        // a vmalloc-backed `bpf_map`. Strip the ASID before the
+        // DRAM-relative subtract: TTBR1_EL1 is `BADDR | ASID<<48` (kernel
+        // mmu_context.h phys_to_ttbr), so bits[63:48]=ASID and the
+        // translation-table base lives in [47:0]; `& ((!0u64) >> 16)` keeps
+        // [47:0]. The 48-bit mask is exact for our config — vabits_actual=48
+        // (FEAT_LPA2 rejected by `from_tcr_el1`) + guest RAM <4 GiB ⇒ the
+        // pgd PA never sets bits[51:48], so there is no FEAT_LPA2 BADDR
+        // splice (kernel phys_to_ttbr 52-bit form) to recover; nothing is
+        // truncated. A future 52-bit-PA guest would need that splice here.
+        let mut descaddr: u64 = (ttbr_pa & ((!0u64) >> (64 - 48))).checked_sub(DRAM_START)?;
 
         // Convert a descriptor's GPA payload to a DRAM-relative offset.
         // `checked_sub` rejects descriptors whose payload addresses fall
@@ -2870,7 +2885,10 @@ pub(crate) fn monitor_loop(
             pco1 = fresh.get(1).copied().unwrap_or(0),
             rq = refresh.runqueues_kva,
             ms = mem.size(),
-            ko = refresh.kaslr_offset.load(Ordering::Acquire).saturating_sub(1),
+            ko = refresh
+                .kaslr_offset
+                .load(Ordering::Acquire)
+                .saturating_sub(1),
             rq0 = rq_pas_buf.first().copied().unwrap_or(0),
         );
         if let Some(&rq0_pa) = rq_pas_buf.first() {
@@ -3798,14 +3816,10 @@ mod tests {
         // Post-publish: a later sample must observe the planted rq_clock,
         // proving the loop re-read the Arc and recomputed PAs with the live
         // slide. A snapshot would keep slide 0 → off-buffer → empty forever.
-        let s = samples
-            .iter()
-            .rev()
-            .find(|s| !s.cpus.is_empty())
-            .expect(
-                "no sample observed the published slide — the monitor snapshotted \
+        let s = samples.iter().rev().find(|s| !s.cpus.is_empty()).expect(
+            "no sample observed the published slide — the monitor snapshotted \
                  kaslr_offset instead of re-reading it per iteration",
-            );
+        );
         assert_eq!(s.cpus.len(), 2);
         assert_eq!(s.cpus[0].rq_clock, 7777);
         assert_eq!(s.cpus[1].rq_clock, 8888);

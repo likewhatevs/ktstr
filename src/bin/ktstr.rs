@@ -1,6 +1,5 @@
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
+// Global allocator (jemalloc) is provided centrally by the ktstr
+// library crate (src/lib.rs) and inherited by this bin.
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -61,6 +60,14 @@ enum Command {
         /// The VM exits after the command completes.
         #[arg(long)]
         exec: Option<String>,
+
+        /// Max wall-clock for a `--exec` payload before the VM is
+        /// force-killed (a panic-less guest hang otherwise blocks
+        /// forever). Parsed by humantime: `30s`, `5m`, `1h`. Ignored
+        /// without `--exec`. Must exceed guest boot (a few seconds): a
+        /// near-zero value force-kills before the payload runs.
+        #[arg(long, value_parser = humantime::parse_duration, default_value = "120s")]
+        exec_timeout: std::time::Duration,
 
         /// Disable all performance mode features (flock, pinning, RT
         /// scheduling, hugepages, NUMA mbind, KVM exit suppression).
@@ -1726,6 +1733,7 @@ fn main() -> Result<()> {
             memory_mib,
             dmesg,
             exec,
+            exec_timeout,
             no_perf_mode,
             cpu_cap,
             disk,
@@ -1786,6 +1794,7 @@ fn main() -> Result<()> {
                 memory_mib,
                 dmesg,
                 exec.as_deref(),
+                exec_timeout,
                 disk_cfg,
                 // No test-entry context at the operator-driven
                 // `ktstr shell` entry — scheduler enable/disable +

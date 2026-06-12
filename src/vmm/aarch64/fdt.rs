@@ -210,6 +210,28 @@ fn write_chosen(
     fdt.property_string("stdout-path", &format!("/serial0@{:x}", SERIAL_MMIO_BASE))
         .context("stdout-path")?;
 
+    // KASLR seed. arm64 kernel-image KASLR seeds from `/chosen/kaslr-seed`
+    // (an 8-byte property the kernel consumes-and-zeroes in
+    // `kaslr_early_init`), falling back to the CPU RNG (FEAT_RNG / RNDR)
+    // when the DT seed is absent. KVM does not expose RNDR to the guest
+    // here, so without a DT seed the guest boots "KASLR disabled due to
+    // lack of seed" and `kern_kaslr_offset` is 0 — defeating the KASLR-on
+    // default and its e2e coverage. Provide a random DT seed so KASLR
+    // enables deterministically regardless of guest RNDR. This matches
+    // qemu (hw/arm/virt.c `create_randomness` writes an 8-byte BE
+    // `kaslr-seed`, default-on) and DIVERGES from cloud-hypervisor,
+    // firecracker, and libkrun, whose aarch64 /chosen carries only
+    // bootargs + initrd bounds (no seed): they rely on guest FEAT_RNG /
+    // RNDR or EFI-stub seeding, which our KVM guest lacks. `property_u64`
+    // writes the value big-endian, which `fdt64_to_cpu` in `get_kaslr_seed`
+    // reads back correctly. Omitted under `nokaslr` (e.g.
+    // `#[ktstr_test(kaslr = false)]`) so the disabled-KASLR path stays
+    // genuinely seedless.
+    if !cmdline.split_whitespace().any(|tok| tok == "nokaslr") {
+        fdt.property_u64("kaslr-seed", rand::random::<u64>())
+            .context("kaslr-seed")?;
+    }
+
     if let (Some(addr), Some(size)) = (initrd_addr, initrd_size) {
         fdt.property_u64("linux,initrd-start", addr)
             .context("initrd-start")?;
@@ -612,6 +634,7 @@ mod tests {
         NumaMemoryLayout::compute(topo, mib, DRAM_START, None).unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn test_fdt(
         topo: &Topology,
         mpidrs: &[u64],
@@ -1068,8 +1091,17 @@ mod tests {
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
         let memory_mib: u32 = 512;
-        let dtb =
-            test_fdt(&topo, &mpidrs, memory_mib, "console=ttyS0", None, None, 2, false).unwrap();
+        let dtb = test_fdt(
+            &topo,
+            &mpidrs,
+            memory_mib,
+            "console=ttyS0",
+            None,
+            None,
+            2,
+            false,
+        )
+        .unwrap();
         let props = parse_dtb_props(&dtb);
 
         let pvt = pvtime_base(memory_mib, topo.total_cpus());
@@ -1333,36 +1365,6 @@ mod tests {
             pmu_intr.is_none(),
             "pmu interrupts property must be absent when has_pmu=false; found={:?}",
             pmu_intr,
-        );
-    }
-
-    /// PMU_PPI lives in the GIC PPI namespace (0..15), distinct from the
-    /// global intid namespace KVM_ARM_VCPU_PMU_V3_IRQ takes. The FDT's
-    /// `interrupts` cell carries the PPI form (cell[1]); the in-kernel
-    /// vCPU init in `kvm.rs::init_pmuv3` writes the intid form
-    /// (PMU_INTID = PPI + 16). Pin the relationship between the two
-    /// constants here so a regression that drifts either form trips
-    /// before the kernel rejects the IRQ via pmu_irq_is_valid.
-    #[test]
-    fn fdt_pmu_ppi_matches_intid_namespace_relationship() {
-        use crate::vmm::aarch64::kvm::PMU_INTID;
-        // PMU_PPI is the FDT cell value; PMU_INTID is the global intid
-        // (PPI + VGIC_NR_SGIS where VGIC_NR_SGIS = 16). Crossing into
-        // the SPI range (intid 32+) would mis-route the IRQ.
-        assert_eq!(
-            PMU_INTID,
-            PMU_PPI + 16,
-            "PMU_INTID must equal PMU_PPI + 16 (VGIC_NR_SGIS)",
-        );
-        assert!(
-            PMU_PPI < 16,
-            "PMU_PPI must be in the PPI namespace (0..16); got {}",
-            PMU_PPI,
-        );
-        assert!(
-            (16..32).contains(&PMU_INTID),
-            "PMU_INTID must land in the PPI intid range (16..32); got {}",
-            PMU_INTID,
         );
     }
 

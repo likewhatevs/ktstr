@@ -38,9 +38,8 @@
 //! would look for `src/bin/cargo-ktstr/<mod>.rs`, an underscore-vs-hyphen
 //! mismatch with the actual `src/bin/cargo_ktstr/` directory.
 
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
+// Global allocator (jemalloc) is provided centrally by the ktstr
+// library crate (src/lib.rs) and inherited by this bin.
 #[path = "cargo_ktstr/cli.rs"]
 mod cli;
 #[path = "cargo_ktstr/kernel/mod.rs"]
@@ -222,6 +221,7 @@ fn main() {
             memory_mib,
             dmesg,
             exec,
+            exec_timeout,
             no_perf_mode,
             cpu_cap,
             disk,
@@ -233,6 +233,7 @@ fn main() {
             memory_mib,
             dmesg,
             exec,
+            exec_timeout,
             no_perf_mode,
             cpu_cap,
             disk,

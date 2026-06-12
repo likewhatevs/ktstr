@@ -234,6 +234,10 @@ impl NumaMemoryLayout {
     /// Highest GPA backed by RAM (one past the last byte). Robust to
     /// region ordering — takes the max over all regions rather than
     /// assuming `regions` is GPA-sorted.
+    ///
+    /// x86_64-only: its sole caller is `ram_top_exceeds_phys_bits`,
+    /// the CPUID-MAXPHYADDR RAM guard, which has no aarch64 caller.
+    #[cfg(target_arch = "x86_64")]
     pub fn top_gpa(&self) -> u64 {
         self.regions
             .iter()
@@ -248,6 +252,11 @@ impl NumaMemoryLayout {
     /// truncated by the guest kernel (e820__end_ram_pfn caps last_pfn at
     /// max_arch_pfn), so the guest boots with less RAM than advertised.
     /// `phys_bits >= 64` means no limit (the full u64 GPA space).
+    ///
+    /// x86_64-only: `phys_bits` is the guest's CPUID 0x8000_0008
+    /// MAXPHYADDR and the sole caller is `x86_64::kvm`. There is
+    /// currently no aarch64 caller.
+    #[cfg(target_arch = "x86_64")]
     pub fn ram_top_exceeds_phys_bits(&self, phys_bits: u32) -> Option<u64> {
         let limit = if phys_bits >= 64 {
             u64::MAX
@@ -886,6 +895,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn ram_top_exceeds_phys_bits_rejects_above_maxphyaddr() {
         // 8 GiB single node on x86 relocates above the 4 GiB MMIO gap -> top
         // GPA ~9 GiB. A 33-bit guest MAXPHYADDR (8 GiB) is exceeded -> must

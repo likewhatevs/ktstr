@@ -4,7 +4,7 @@
 //! [`ExitAction`] (Continue / Shutdown / Fatal); arch-specific I/O is
 //! dispatched inline so the surrounding loop only sees the action.
 //!
-//! - x86_64: serial via port I/O ([`dispatch_io_out`] / [`dispatch_io_in`]),
+//! - x86_64: serial via port I/O (`dispatch_io_out` / `dispatch_io_in`),
 //!   virtio-console via MMIO inside [`classify_exit`], i8042 reset for reboot.
 //! - aarch64: serial + virtio-console both via MMIO (`dispatch_mmio_write`
 //!   / `dispatch_mmio_read`).
@@ -2669,7 +2669,7 @@ mod vcpu_reg_snapshot_tests {
             0xffff_ffff_8100_1000,
             0xffff_ffff_8100_1004,
             0xffff_ffff_8100_1008,
-            0xffff_ffff_8100_100C,
+            0xffff_ffff_8100_100c,
         ];
         // EC = 0x32 (software step) with single_step_pending = false
         // — must NOT latch and must not flip pending state.
