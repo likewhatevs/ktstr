@@ -61,7 +61,7 @@ kernel-build version="":
 # feature. E.g. `just test 6.14 wprof` → cargo-ktstr built `--features
 # wprof`; tests run `--features integration,wprof`.
 test kernel extra-features="":
-    cargo run --bin cargo-ktstr {{ if extra-features != "" { "--features " + extra-features } else { "" } }} -- ktstr test --kernel {{kernel}} -- --profile ci --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} --no-fail-fast -j $(nproc)
+    cargo run --bin cargo-ktstr {{ if extra-features != "" { "--features " + extra-features } else { "" } }} -- ktstr test --kernel {{kernel}} -- --profile ci --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} --no-fail-fast
 
 # Run trybuild compile_fail fixtures.
 #
