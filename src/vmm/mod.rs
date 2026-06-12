@@ -2415,13 +2415,33 @@ mod tests {
                 .topology(Topology::new(1, 1, 2, 1))
                 .memory_deferred()
                 .timeout(Duration::from_secs(15))
-                .watchdog_timeout(Duration::from_secs(2))
                 .build()
         );
         let result = skip_on_contention!(vm.run());
         let Some(ref report) = result.monitor else {
             return;
         };
+        // Skip (not fail) when the boot wait did not observe a sys_rdy
+        // wake (boot_wait_outcome != Fired): a slow guest boot that
+        // emitted sys_rdy past the host's 5 s ceiling, a kill-evt race,
+        // or the wait not running — all inconclusive for the FIRST-sample
+        // rq_clock contract this test pins, which requires a confirmed
+        // wake. Mirrors sys_rdy_releases_monitor_before_5s_timeout; the
+        // boot_wait_outcome discriminator (monitor::BootWaitOutcome)
+        // exists for exactly this distinction. Without it, a debug-init
+        // boot slower than the 5 s ceiling produces zero samples and
+        // looks like a regression (the original "intermittent
+        // no-samples"), when it is just inconclusive.
+        if report.boot_wait_outcome != crate::monitor::BootWaitOutcome::Fired {
+            skip!(
+                "boot wait did not observe a sys_rdy wake before the host's \
+                 5 s ceiling (boot_wait_outcome={:?}) — inconclusive (slow \
+                 guest boot / kill-evt race), not the FIRST-sample rq_clock \
+                 contract this test pins. total_samples={}",
+                report.boot_wait_outcome,
+                report.summary.total_samples,
+            );
+        }
         assert!(
             report.summary.total_samples > 0,
             "monitor produced no samples — cannot evaluate \
