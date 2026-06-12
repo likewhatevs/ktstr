@@ -519,21 +519,25 @@ pub(crate) fn get_or_compress_base_shm(content_hash: u64, base_bytes: &[u8]) -> 
         return initramfs::lz4_legacy_compress(base_bytes);
     }
 
-    // Fast path: an already-written compressed segment.
+    let seg_name = initramfs::shm_lz4_segment_name(content_hash);
+
+    // Fast path: an already-written compressed segment. Pin it so a
+    // peer's cleanup_stale_shm cannot unlink it before try_cow_overlay.
     if let Some(lz4) = initramfs::shm_load_lz4(content_hash) {
+        hold_shm_lock(&seg_name);
         return lz4;
     }
 
     // SHM race gate: O_EXCL elects a single compressor.
-    let seg_name = initramfs::shm_lz4_segment_name(content_hash);
     match shm_try_create_excl(&seg_name) {
         ShmCreateResult::Winner(fd) => {
             tracing::debug!("lz4_base: compressor (O_EXCL won)");
             let lz4 = initramfs::lz4_legacy_compress(base_bytes);
-            // Winner writes + releases. No re-load and no process-hold:
-            // the caller already has the bytes, and try_cow_overlay
-            // re-opens the segment by hash for the COW mapping.
             shm_write_and_release(fd, &lz4, &seg_name);
+            // Pin the segment for the process lifetime so a peer's
+            // cleanup_stale_shm cannot unlink it before this VM's
+            // try_cow_overlay re-opens it by hash for the COW mapping.
+            hold_shm_lock(&seg_name);
             return lz4;
         }
         ShmCreateResult::Exists => {
@@ -543,11 +547,13 @@ pub(crate) fn get_or_compress_base_shm(content_hash: u64, base_bytes: &[u8]) -> 
             // Winner failure the segment is unlinked/zeroed and the
             // load misses, falling through to the fallback.
             if let Some(lz4) = initramfs::shm_load_lz4(content_hash) {
+                hold_shm_lock(&seg_name);
                 return lz4;
             }
         }
         ShmCreateResult::Error => {
             if let Some(lz4) = initramfs::shm_load_lz4(content_hash) {
+                hold_shm_lock(&seg_name);
                 return lz4;
             }
         }
@@ -558,8 +564,11 @@ pub(crate) fn get_or_compress_base_shm(content_hash: u64, base_bytes: &[u8]) -> 
     // so a later reader still finds it. Mirrors get_or_build_base's
     // fallback (the store is the non-blocking-skip writer).
     let lz4 = initramfs::lz4_legacy_compress(base_bytes);
-    if let Err(e) = initramfs::shm_store_lz4(content_hash, &lz4) {
-        tracing::warn!("shm_store_lz4: {e:#}");
+    match initramfs::shm_store_lz4(content_hash, &lz4) {
+        // Stored (or skipped because a peer holds it) -- pin so it
+        // survives cleanup until try_cow_overlay.
+        Ok(()) => hold_shm_lock(&seg_name),
+        Err(e) => tracing::warn!("shm_store_lz4: {e:#}"),
     }
     lz4
 }
@@ -628,19 +637,20 @@ fn cleanup_stale_shm(current: &BaseKey) {
 /// segments this process built or loaded.
 static HELD_SHM_LOCKS: Mutex<Vec<rustix::fd::OwnedFd>> = Mutex::new(Vec::new());
 
+/// Pin one SHM segment with a process-lifetime `LOCK_SH` so a peer's
+/// `cleanup_stale_shm` cannot unlink it. Best-effort: a miss (segment
+/// absent, or `LOCK_SH` contended by a writer's `LOCK_EX`) is a no-op.
+/// The base and lz4 segments are pinned separately, each after its own
+/// segment exists -- `get_or_build_base` pins the base, and
+/// `get_or_compress_base_shm` pins the lz4 once it has been written.
 fn hold_shm_lock(shm_name: &str) {
-    for name in [
-        shm_name.to_string(),
-        shm_name.replace("ktstr-base-", "ktstr-lz4-"),
-    ] {
-        if let Ok(fd) = rustix::shm::open(
-            name.as_str(),
-            rustix::shm::OFlags::RDONLY,
-            rustix::fs::Mode::empty(),
-        ) && rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockShared).is_ok()
-        {
-            HELD_SHM_LOCKS.lock().unwrap().push(fd);
-        }
+    if let Ok(fd) = rustix::shm::open(
+        shm_name,
+        rustix::shm::OFlags::RDONLY,
+        rustix::fs::Mode::empty(),
+    ) && rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockShared).is_ok()
+    {
+        HELD_SHM_LOCKS.lock().unwrap().push(fd);
     }
 }
 
@@ -1148,5 +1158,44 @@ mod tests {
         // Clean up so this test does not leak state into siblings
         // (shared `base_cache()` Mutex outlives the test).
         base_cache().lock().unwrap().remove(&key);
+    }
+
+    /// Regression: get_or_compress_base_shm pins the lz4 segment via
+    /// hold_shm_lock so a peer's cleanup_stale_shm cannot unlink it.
+    /// cleanup only unlinks a segment it can grab LOCK_EX on (its
+    /// NonBlockingLockExclusive unlink-gate); a held LOCK_SH makes that
+    /// probe return EWOULDBLOCK, so cleanup skips the segment. This pins
+    /// that gate deterministically and single-process (same two-fd flock
+    /// independence as shm_load_base_holds_lock_until_drop).
+    #[test]
+    fn held_lz4_segment_survives_cleanup_lock_probe() {
+        let hash = 0x9EED_C0DE_9EED_C0DEu64;
+        let name = initramfs::shm_lz4_segment_name(hash);
+        let _ = rustix::shm::unlink(name.as_str()); // clean any stale segment
+
+        // Create the lz4 segment, then pin it (process-lifetime LOCK_SH).
+        let mut data = initramfs::LZ4_LEGACY_MAGIC.to_vec();
+        data.extend_from_slice(&[0x33u8; 64]);
+        initramfs::shm_store_lz4(hash, &data).unwrap();
+        hold_shm_lock(&name);
+
+        // cleanup_stale_shm's unlink gate is a NonBlockingLockExclusive
+        // probe; from a fresh fd it must fail while our LOCK_SH is held,
+        // so cleanup would `continue` past this segment instead of
+        // unlinking it.
+        let fd = rustix::shm::open(
+            name.as_str(),
+            rustix::shm::OFlags::RDONLY,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("open the pinned lz4 segment");
+        let probe = rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive);
+        assert!(
+            matches!(probe, Err(e) if e == rustix::io::Errno::WOULDBLOCK),
+            "cleanup's LOCK_EX probe must be blocked by the held LOCK_SH (got {probe:?})",
+        );
+        drop(fd);
+
+        let _ = rustix::shm::unlink(name.as_str());
     }
 }
