@@ -892,6 +892,51 @@ fn shm_load_base_holds_lock_until_drop() {
 }
 
 #[test]
+fn shm_store_skips_write_when_reader_holds_lock_sh() {
+    // Regression (x86 CI wedge): shm_store takes a NON-BLOCKING
+    // LOCK_EX and SKIPS the write when a reader holds LOCK_SH (a live
+    // MappedShm / COW overlay). A blocking LOCK_EX starved indefinitely
+    // under sustained host concurrency: Linux flock grants no writer
+    // preference, so VM-lifetime LOCK_SH readers perpetually jumped the
+    // queue and wedged the suite. The skip also preserves the SIGBUS
+    // invariant: it never ftruncates a segment a reader is mapping.
+    //
+    // Same-process flock conflict: the reader's fd holds LOCK_SH and
+    // shm_store opens a second fd for LOCK_EX; flock(2) treats the two
+    // fds independently, so the writer genuinely contends.
+    let hash = 0x5117_F10C_5117_F10Cu64;
+    shm_unlink_base(hash); // clean any stale segment
+
+    let original = [0x55u8; 256];
+    shm_store_base(hash, &original).unwrap();
+    let reader = shm_load_base(hash).expect("load must succeed");
+
+    // Writer with DIFFERENT content while the reader holds LOCK_SH:
+    // must return Ok WITHOUT blocking (a blocking LOCK_EX would
+    // self-deadlock this thread and hang) and WITHOUT rewriting the
+    // live segment.
+    shm_store_base(hash, &[0xAAu8; 512]).expect("shm_store must skip (Ok), not block");
+
+    // The reader's mapped view is untouched: the write was skipped.
+    assert!(
+        reader.as_ref().iter().all(|&b| b == 0x55),
+        "reader bytes must be unchanged: shm_store skipped, did not rewrite/truncate",
+    );
+    drop(reader);
+
+    // Once the reader releases LOCK_SH, the cache is not wedged: a
+    // writer acquires LOCK_EX and the write takes effect.
+    shm_store_base(hash, &[0xCCu8; 128]).expect("shm_store must write after reader drops");
+    let reloaded = shm_load_base(hash).expect("reload after write");
+    assert!(
+        reloaded.as_ref().len() == 128 && reloaded.as_ref().iter().all(|&b| b == 0xCC),
+        "post-drop write must take effect",
+    );
+    drop(reloaded);
+    shm_unlink_base(hash);
+}
+
+#[test]
 fn strip_debug_current_exe() {
     let exe = crate::resolve_current_exe().unwrap();
     let data = strip_debug(&exe).unwrap();

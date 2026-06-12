@@ -1372,11 +1372,24 @@ pub(crate) fn shm_load_base(content_hash: u64) -> Option<MappedShm> {
 /// takes an exclusive flock, `ftruncate`s to `data.len()`, `mmap`s
 /// `PROT_WRITE | MAP_SHARED`, copies, and cleans up.
 ///
-/// Concurrency: `LOCK_EX` blocks while any reader holds `LOCK_SH` on
-/// the same segment (e.g. a live `MappedShm` or `CowOverlayGuard`).
-/// The writer thus waits for in-flight VMs before truncating — which
-/// is what prevents the `SIGBUS` class of bug addressed by the
-/// reader-side flock lifetime in `shm_load_base` and `cow_overlay`.
+/// Concurrency: the write takes a NON-BLOCKING `LOCK_EX`
+/// (`NonBlockingLockExclusive`); on contention it SKIPS rather than
+/// blocking. This preserves the `SIGBUS`-prevention invariant (never
+/// `ftruncate` a segment a reader has COW-mapped) by construction:
+/// `LOCK_EX` is granted only when no reader holds `LOCK_SH`, so a
+/// successful acquire guarantees no live mapping, and on contention we
+/// skip (never truncate). The reader-side flock lifetime lives in
+/// `shm_load_base` (via `MappedShm`), `shm_open_lz4`, and
+/// `cow_overlay`.
+///
+/// A blocking `LOCK_EX` here starved indefinitely: Linux flock grants
+/// no writer preference, so under sustained host concurrency fresh
+/// `LOCK_SH` readers (each held for a VM's lifetime) perpetually jump
+/// ahead of the waiting writer, wedging the suite. Skipping is correct
+/// because writes are content-addressed (below): a held segment has
+/// the same hash, hence the same bytes, so the skipped rewrite was
+/// redundant; `try_cow_overlay` re-opens by hash, so a peer's write is
+/// still COW-shared.
 ///
 /// Writes are content-addressed at the caller: callers hash `data`
 /// to form the segment name. When two callers write the same content
@@ -1396,14 +1409,6 @@ fn shm_store(name: &str, data: &[u8]) -> Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("shm_open: {e}"))?;
 
-    // Surfaces the wait explicitly: with readers holding LOCK_SH
-    // for VM lifetime, concurrent test runs can block here for
-    // seconds. Without this, the user sees silent hang.
-    tracing::info!(
-        segment = name,
-        data_len = data.len(),
-        "shm_store: waiting for LOCK_EX"
-    );
     // Post-flock error paths (ftruncate/mmap failure) call shm_unlink
     // before the OwnedFd drop so a half-initialized segment (empty /
     // corrupt / wrong size) does not persist in /dev/shm where the
@@ -1414,15 +1419,32 @@ fn shm_store(name: &str, data: &[u8]) -> Result<()> {
     // just opened then failed to rewrite; content-addressing makes
     // recovery cheap — the next writer re-creates with the same hash.
     //
-    // Pre-flock (shm_open succeeded, flock failed) does NOT unlink:
-    // the segment may be a pre-existing valid one that a peer writer
-    // holds LOCK_EX on, and we must not destroy another process's
-    // cache entry on our own flock error.
+    // Flock failure (shm_open succeeded, LOCK_EX not acquired) does
+    // NOT unlink: the segment may be a pre-existing valid one a peer
+    // holds (a LOCK_SH reader via a live COW overlay, or a LOCK_EX
+    // writer), and we must not destroy another process's cache entry
+    // on our own contention (EWOULDBLOCK) or flock error.
     //
     // Success path does NOT unlink — the segment IS the cache. The
     // OwnedFd's drop handles close() on every path.
-    rustix::fs::flock(&fd, rustix::fs::FlockOperation::LockExclusive)
-        .map_err(|e| anyhow::anyhow!("flock: {e}"))?;
+    match rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {}
+        Err(e) if e == rustix::io::Errno::WOULDBLOCK => {
+            // A reader holds LOCK_SH (live COW overlay / MappedShm) or
+            // a peer holds LOCK_EX. The segment is in use or being
+            // written by the peer; skip the write. Content-addressing
+            // makes our rewrite redundant, and try_cow_overlay re-opens
+            // by hash so the peer's segment is still COW-shared. Do NOT
+            // unlink: the segment may be a valid one a peer is reading.
+            tracing::debug!(
+                segment = name,
+                data_len = data.len(),
+                "shm_store: LOCK_EX contended, skipping cache write"
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(anyhow::anyhow!("flock: {e}")),
+    }
 
     let raw_fd = fd.as_raw_fd();
     unsafe {
