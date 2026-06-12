@@ -17,7 +17,7 @@ use std::time::Instant;
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use super::KtstrVm;
-use super::initramfs_cache::{BaseKey, BaseRef, get_or_build_base};
+use super::initramfs_cache::{BaseKey, BaseRef, get_or_build_base, get_or_compress_base_shm};
 use super::memory_budget::{MemoryBudget, initramfs_min_memory_mib, read_kernel_init_size};
 use super::pi_mutex::PiMutex;
 use super::{disk_config, disk_template, host_topology, initramfs, virtio_blk, virtio_net};
@@ -932,51 +932,11 @@ impl KtstrVm {
         }
     }
 
-    /// Get or build the compressed base. Checks LZ4 SHM first, then
-    /// compresses and stores.
+    /// Get or build the compressed base, delegating to the SHM
+    /// one-compressor election in `initramfs_cache`. Thin wrapper: the
+    /// SHM logic uses no builder state, only the content hash.
     fn get_or_compress_base(&self, base_bytes: &[u8], key: &BaseKey) -> Result<Vec<u8>> {
-        // Try loading compressed base from LZ4 SHM.
-        if let Some((fd, len)) = initramfs::shm_open_lz4(key.0) {
-            use std::os::fd::AsRawFd;
-            let mut buf = vec![0u8; len];
-            unsafe {
-                let ptr = libc::mmap(
-                    std::ptr::null_mut(),
-                    len,
-                    libc::PROT_READ,
-                    libc::MAP_SHARED,
-                    fd.as_raw_fd(),
-                    0,
-                );
-                if ptr != libc::MAP_FAILED {
-                    std::ptr::copy_nonoverlapping(ptr as *const u8, buf.as_mut_ptr(), len);
-                    libc::munmap(ptr, len);
-                    initramfs::shm_close_fd(fd);
-
-                    // Validate LZ4 legacy magic. Stale segments from a
-                    // previous compression format (zstd) must be discarded.
-                    if buf.len() >= 4 && buf[..4] == initramfs::LZ4_LEGACY_MAGIC {
-                        tracing::debug!(bytes = len, "lz4_base cache hit (shm)");
-                        return Ok(buf);
-                    }
-                    tracing::warn!(
-                        bytes = len,
-                        magic = format!("{:02x}{:02x}{:02x}{:02x}", buf[0], buf[1], buf[2], buf[3]),
-                        "stale compressed shm segment (wrong magic), recompressing"
-                    );
-                } else {
-                    initramfs::shm_close_fd(fd);
-                }
-            }
-        }
-
-        // Compress with LZ4 legacy format.
-        let lz4 = initramfs::lz4_legacy_compress(base_bytes);
-
-        if let Err(e) = initramfs::shm_store_lz4(key.0, &lz4) {
-            tracing::warn!("shm_store_lz4: {e:#}");
-        }
-        Ok(lz4)
+        Ok(get_or_compress_base_shm(key.0, base_bytes))
     }
 
     /// Try to COW-overlay the compressed base from LZ4 SHM into guest

@@ -499,6 +499,71 @@ pub(crate) fn get_or_build_base(
     Ok(BaseRef::Owned(arc))
 }
 
+/// Get or build the LZ4-compressed base, electing a single compressor
+/// via the same `O_EXCL` race gate as [`get_or_build_base`] -- rather
+/// than letting every cold-cache worker recompress and race to write.
+///
+/// Fast path: load the cached compressed segment. On a miss, `O_EXCL`
+/// elects one Winner to compress + write; losers block on the Winner's
+/// `LOCK_EX` (via `shm_open_lz4`'s blocking `LOCK_SH`) and then load the
+/// result. Every failure path falls back to local compression and
+/// always yields bytes -- there is no fatal error.
+///
+/// `KTSTR_CARGO_TEST_MODE` skips the SHM coordination entirely, like
+/// `get_or_build_base`: under bare `cargo test` each invocation is
+/// independent and the `O_EXCL` gate would only surface as confusing
+/// flock contention.
+pub(crate) fn get_or_compress_base_shm(content_hash: u64, base_bytes: &[u8]) -> Vec<u8> {
+    // Bare `cargo test`: skip the SHM layer entirely, compress locally.
+    if crate::cargo_test_mode::cargo_test_mode_active() {
+        return initramfs::lz4_legacy_compress(base_bytes);
+    }
+
+    // Fast path: an already-written compressed segment.
+    if let Some(lz4) = initramfs::shm_load_lz4(content_hash) {
+        return lz4;
+    }
+
+    // SHM race gate: O_EXCL elects a single compressor.
+    let seg_name = initramfs::shm_lz4_segment_name(content_hash);
+    match shm_try_create_excl(&seg_name) {
+        ShmCreateResult::Winner(fd) => {
+            tracing::debug!("lz4_base: compressor (O_EXCL won)");
+            let lz4 = initramfs::lz4_legacy_compress(base_bytes);
+            // Winner writes + releases. No re-load and no process-hold:
+            // the caller already has the bytes, and try_cow_overlay
+            // re-opens the segment by hash for the COW mapping.
+            shm_write_and_release(fd, &lz4, &seg_name);
+            return lz4;
+        }
+        ShmCreateResult::Exists => {
+            tracing::debug!("lz4_base: waiting for compressor (EEXIST)");
+            // Blocks on the Winner's LOCK_EX inside shm_open_lz4, so by
+            // the time the read is granted the Winner has written; on
+            // Winner failure the segment is unlinked/zeroed and the
+            // load misses, falling through to the fallback.
+            if let Some(lz4) = initramfs::shm_load_lz4(content_hash) {
+                return lz4;
+            }
+        }
+        ShmCreateResult::Error => {
+            if let Some(lz4) = initramfs::shm_load_lz4(content_hash) {
+                return lz4;
+            }
+        }
+    }
+
+    // Fallback: the Winner failed (write error -> segment unlinked) or
+    // the post-wait load missed. Compress locally and best-effort store
+    // so a later reader still finds it. Mirrors get_or_build_base's
+    // fallback (the store is the non-blocking-skip writer).
+    let lz4 = initramfs::lz4_legacy_compress(base_bytes);
+    if let Err(e) = initramfs::shm_store_lz4(content_hash, &lz4) {
+        tracing::warn!("shm_store_lz4: {e:#}");
+    }
+    lz4
+}
+
 /// Remove stale SHM segments from `/dev/shm` that don't match `current`.
 /// Only unlinks segments not held by any process (`LOCK_EX | LOCK_NB`).
 /// Parallel nextest workers hold `LOCK_SH` on their segments for the

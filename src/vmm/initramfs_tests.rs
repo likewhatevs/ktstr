@@ -937,6 +937,36 @@ fn shm_store_skips_write_when_reader_holds_lock_sh() {
 }
 
 #[test]
+fn shm_load_lz4_roundtrips_and_rejects_non_lz4() {
+    // shm_load_lz4 (the #2 shared loader): round-trips an LZ4-magic
+    // segment, and rejects a segment whose first bytes are not the LZ4
+    // legacy magic (a stale zstd/gzip segment or a truncated write).
+    let hash = 0x0CA5_E1F2_0CA5_E1F2u64;
+    let lz4_name = shm_lz4_segment_name(hash);
+    let _ = rustix::shm::unlink(lz4_name.as_str()); // clean any stale segment
+
+    // LZ4-magic-prefixed bytes round-trip store -> load.
+    let mut data = LZ4_LEGACY_MAGIC.to_vec();
+    data.extend_from_slice(&[0x11u8; 64]);
+    shm_store_lz4(hash, &data).unwrap();
+    assert_eq!(
+        shm_load_lz4(hash).as_deref(),
+        Some(data.as_slice()),
+        "LZ4-magic segment must round-trip",
+    );
+
+    // A segment lacking the LZ4 legacy magic is rejected as stale.
+    let _ = rustix::shm::unlink(lz4_name.as_str());
+    shm_store_lz4(hash, &[0xDEu8; 64]).unwrap();
+    assert!(
+        shm_load_lz4(hash).is_none(),
+        "segment lacking the LZ4 legacy magic must be rejected",
+    );
+
+    let _ = rustix::shm::unlink(lz4_name.as_str());
+}
+
+#[test]
 fn strip_debug_current_exe() {
     let exe = crate::resolve_current_exe().unwrap();
     let data = strip_debug(&exe).unwrap();

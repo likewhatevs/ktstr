@@ -1511,7 +1511,7 @@ pub(crate) fn shm_unlink_base(content_hash: u64) {
 /// previous compression formats (zstd, gzip). The target arch tag
 /// keeps cross-arch caches separate on hosts where both ktstr
 /// binaries share `/dev/shm`.
-fn shm_lz4_segment_name(content_hash: u64) -> String {
+pub(crate) fn shm_lz4_segment_name(content_hash: u64) -> String {
     format!("/ktstr-lz4-{SHM_ARCH_TAG}-{content_hash:016x}")
 }
 
@@ -1539,6 +1539,56 @@ pub(crate) fn shm_open_lz4(content_hash: u64) -> Option<(std::os::fd::OwnedFd, u
 /// Store compressed initramfs data into an LZ4 SHM segment.
 pub(crate) fn shm_store_lz4(content_hash: u64, data: &[u8]) -> Result<()> {
     shm_store(&shm_lz4_segment_name(content_hash), data)
+}
+
+/// Load + copy the LZ4-compressed base from its SHM segment into an
+/// owned `Vec`, validating the LZ4 legacy magic. Returns `None` on
+/// miss, mmap failure, or a stale/wrong-format segment (rejecting
+/// data written by a previous compression format, e.g. zstd/gzip, or
+/// a truncated write). The shared flock taken by [`shm_open_lz4`] is
+/// released before returning; the bytes are copied out, so the
+/// segment need not stay pinned. This is the owned-`Vec` analog of
+/// [`shm_load_base`] (which returns a borrowed `MappedShm`); the LZ4
+/// GET path hands the bytes back to the caller and does not retain
+/// the fd.
+pub(crate) fn shm_load_lz4(content_hash: u64) -> Option<Vec<u8>> {
+    use std::os::fd::AsRawFd;
+    let (fd, len) = shm_open_lz4(content_hash)?;
+    let mut buf = vec![0u8; len];
+    // SAFETY: `fd` is a live RDONLY shm fd from shm_open_lz4 holding a
+    // shared flock; the segment is at least `len` bytes (its fstat).
+    // The mmap is PROT_READ/MAP_SHARED over exactly `len` bytes, fully
+    // copied out before munmap; no pointer escapes the block.
+    unsafe {
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd.as_raw_fd(),
+            0,
+        );
+        if ptr == libc::MAP_FAILED {
+            shm_close_fd(fd);
+            return None;
+        }
+        std::ptr::copy_nonoverlapping(ptr as *const u8, buf.as_mut_ptr(), len);
+        libc::munmap(ptr, len);
+    }
+    shm_close_fd(fd);
+
+    if buf.len() >= 4 && buf[..4] == LZ4_LEGACY_MAGIC {
+        tracing::debug!(bytes = len, "lz4_base cache hit (shm)");
+        Some(buf)
+    } else {
+        let head = &buf[..buf.len().min(8)];
+        tracing::warn!(
+            bytes = len,
+            ?head,
+            "stale/truncated compressed shm segment (bad LZ4 magic), recompressing"
+        );
+        None
+    }
 }
 
 /// RAII guard for a live COW-overlay mapping.
