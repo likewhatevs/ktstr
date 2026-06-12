@@ -213,8 +213,8 @@ impl Serial {
     }
 
     /// Latch the first guest kernel-panic line seen in freshly-captured
-    /// output. Called from both DATA-store paths ([`Self::handle_out`] on
-    /// x86, [`Self::inner_write`] on aarch64) AFTER the byte is appended
+    /// output. Called from both DATA-store paths (`handle_out` on
+    /// x86, `inner_write` on aarch64) AFTER the byte is appended
     /// and BEFORE [`Self::enforce_output_cap`] — so the latch is set at
     /// ingest and a panic that later scrolls past the cap is never lost.
     ///
