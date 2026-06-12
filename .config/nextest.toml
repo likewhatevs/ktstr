@@ -24,17 +24,6 @@ path = "junit.xml"
 [profile.ci]
 slow-timeout = { period = "90s", terminate-after = 3 }
 retries = { backoff = "exponential", count = 30, delay = "1s", jitter = true, max-delay = "3s" }
-# Cap concurrent VM-test boots in CI, mirroring profile.default's
-# test-threads=16 (its comment explains the rationale: VM-pinning /
-# cpuset / RLIMIT-touching tests must not over-subscribe). The `test`
-# recipe's `-j $(nproc)` — which uncapped this and let ~nproc guests
-# boot at once — is removed alongside this. On a slow/contended runner
-# (guests run an order of magnitude slower than a dev box) that
-# uncapped concurrency self-contends past the slow-timeout and wedges;
-# 16 keeps each boot un-oversubscribed so it finishes in time. retries
-# stays at 30: it absorbs genuine ResourceContention flakes, a concern
-# separate from — and not fixed by — the concurrency cap.
-test-threads = 16
 failure-output = "final"
 fail-fast = false
 
