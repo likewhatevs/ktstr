@@ -9042,3 +9042,183 @@ fn rendered_value_as_bool_array_via_truncated_peel() {
     };
     assert_eq!(trunc.as_bool_array(), Some(vec![true, false]));
 }
+
+// ---- bpf_cpumask __kptr deref: positive-path render -------------
+//
+// The Type::Ptr arm chases a `struct bpf_cpumask`/`cpumask` kptr
+// member to a CpuList by reading the bitmap via MemReader::read_kva
+// (mod.rs:2309-2434). The existing tests only pin the no-op/skip
+// paths (try_render_cpumask_bits byte-decode, and
+// arena_chase_bridge_address_outside_window_is_no_op which asserts
+// deref.is_none()). These pin the SUCCESS path end-to-end: a
+// `cpumask` pointee + a mock read_kva returning a real bitmap must
+// render `Ptr{ value, deref: Some(CpuList{cpus}) }`.
+
+/// Build `outer { mask: *cpumask }` where `struct cpumask` has a u64
+/// `bits` member (size > 0 so the kptr branch's incomplete-type gate
+/// passes). `pointee_name` selects "cpumask" or "bpf_cpumask" — both
+/// must match the name predicate. Returns `(btf, outer_type_id)`.
+fn cpumask_kptr_outer_btf(pointee_name: &str) -> (Btf, u32) {
+    let mut strings: Vec<u8> = vec![0];
+    let mut push = |name: &str| -> u32 {
+        let off = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        off
+    };
+    let n_u64 = push("u64");
+    let n_pointee = push(pointee_name);
+    let n_bits = push("bits");
+    let n_outer = push("outer");
+    let n_mask = push("mask");
+    let types = vec![
+        // id 1: u64 (the cpumask's bits member element)
+        CastSynType::Int {
+            name_off: n_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        // id 2: struct cpumask { u64 bits; } — size 8 > 0
+        CastSynType::Struct {
+            name_off: n_pointee,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_bits,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+        // id 3: *cpumask (the kptr)
+        CastSynType::Ptr { type_id: 2 },
+        // id 4: struct outer { *cpumask mask; }
+        CastSynType::Struct {
+            name_off: n_outer,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_mask,
+                type_id: 3,
+                byte_offset: 0,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic cpumask BTF parses");
+    (btf, 4)
+}
+
+/// A 1024-byte cpumask read (CPUMASK_READ_CAP) with the given low
+/// 64-bit word; the rest of the slab read is zero.
+fn cpumask_read_bytes(word0: u64) -> Vec<u8> {
+    let mut b = vec![0u8; 1024];
+    b[..8].copy_from_slice(&word0.to_le_bytes());
+    b
+}
+
+#[test]
+fn cpumask_kptr_member_chases_to_cpu_list() {
+    for name in ["cpumask", "bpf_cpumask"] {
+        let (btf, outer_id) = cpumask_kptr_outer_btf(name);
+        let val: u64 = 0xFFFF_8000_0010_0000; // kernel kptr VA the slot holds
+        let outer_bytes = val.to_le_bytes().to_vec();
+        // bits 0, 1, 3 set → "0-1,3" after range collapse.
+        let mut kva = std::collections::HashMap::new();
+        kva.insert(val, cpumask_read_bytes(0b0000_1011));
+        let reader = CastStubReader {
+            kva_bytes_at: kva,
+            ..Default::default()
+        };
+
+        let v = render_value_with_mem(&btf, outer_id, &outer_bytes, &reader);
+        let RenderedValue::Struct { ref members, .. } = v else {
+            panic!("expected Struct render for {name}, got {v:?}");
+        };
+        let RenderedValue::Ptr {
+            value,
+            ref deref,
+            ref deref_skipped_reason,
+            ref cast_annotation,
+            ..
+        } = members[0].value
+        else {
+            panic!(
+                "mask field must render as Ptr for {name}; got {:?}",
+                members[0].value
+            );
+        };
+        assert_eq!(value, val, "raw pointer retained alongside deref ({name})");
+        assert!(
+            deref_skipped_reason.is_none(),
+            "valid cpumask must not skip ({name}): {deref_skipped_reason:?}"
+        );
+        assert!(cast_annotation.is_none(), "kptr branch leaves cast_annotation None ({name})");
+        match deref.as_deref() {
+            Some(RenderedValue::CpuList { cpus }) => {
+                assert_eq!(cpus, "0-1,3", "decoded cpu set ({name})")
+            }
+            other => panic!("expected deref Some(CpuList) for {name}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn cpumask_kptr_null_pointer_no_chase() {
+    let (btf, outer_id) = cpumask_kptr_outer_btf("bpf_cpumask");
+    let outer_bytes = 0u64.to_le_bytes().to_vec(); // NULL kptr
+    // read_kva should never be consulted; empty reader.
+    let reader = CastStubReader::default();
+    let v = render_value_with_mem(&btf, outer_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        value,
+        ref deref,
+        ref deref_skipped_reason,
+        ..
+    } = members[0].value
+    else {
+        panic!("mask field must render as Ptr; got {:?}", members[0].value);
+    };
+    assert_eq!(value, 0);
+    assert!(deref.is_none(), "NULL kptr must not chase");
+    assert!(
+        deref_skipped_reason.is_none(),
+        "NULL kptr is a clean skip with no reason, got {deref_skipped_reason:?}"
+    );
+}
+
+#[test]
+fn cpumask_kptr_plausibility_gate_rejects_freed_slab_pattern() {
+    let (btf, outer_id) = cpumask_kptr_outer_btf("cpumask");
+    let val: u64 = 0xFFFF_8000_0010_0000;
+    let outer_bytes = val.to_le_bytes().to_vec();
+    // word0 top byte == 0xff: the freed-slab freelist-pointer pattern
+    // the plausibility gate (mod.rs:2372) rejects.
+    let mut kva = std::collections::HashMap::new();
+    kva.insert(val, cpumask_read_bytes(0xFF00_0000_0000_0000));
+    let reader = CastStubReader {
+        kva_bytes_at: kva,
+        ..Default::default()
+    };
+    let v = render_value_with_mem(&btf, outer_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        ref deref,
+        ref deref_skipped_reason,
+        ..
+    } = members[0].value
+    else {
+        panic!("mask field must render as Ptr; got {:?}", members[0].value);
+    };
+    assert!(deref.is_none(), "freed-slab pattern must not decode to a CpuList");
+    assert!(
+        deref_skipped_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("plausibility")),
+        "skip reason must cite the plausibility gate, got {deref_skipped_reason:?}"
+    );
+}
