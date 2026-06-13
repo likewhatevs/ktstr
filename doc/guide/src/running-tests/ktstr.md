@@ -72,13 +72,17 @@ on all exit paths.
 | `--memory-mib MiB` | auto | Guest memory in mebibytes (minimum 128). `--memory-mib 2048` allocates `2048 << 20` = 2 GiB. When absent, estimated from payload and include file sizes. |
 | `--dmesg` | off | Forward kernel console (COM1/dmesg) to stderr in real-time. Sets loglevel=7 for verbose kernel output. |
 | `--exec CMD` | -- | Run a command in the VM instead of an interactive shell. The VM exits after the command completes. |
+| `--exec-timeout DURATION` | `120s` | Max wall-clock for a `--exec` payload before the VM is force-killed. Parsed by humantime (`30s`, `5m`, `1h`). Ignored without `--exec`. |
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
 | `--cpu-cap N` | unset | Reserve only N host CPUs for the shell VM (integer ≥ 1). **Requires `--no-perf-mode`** — perf-mode already holds every LLC exclusively, so capping under perf-mode would double-reserve. The planner walks whole LLCs in consolidation- and NUMA-aware order, partial-taking the last LLC so `plan.cpus.len() == N` exactly. Mutually exclusive with `KTSTR_BYPASS_LLC_LOCKS=1`. Also settable via `KTSTR_CPU_CAP` env var (CLI flag wins when both are present). |
-| `--disk SPEC` | unset | Attach an in-memory virtio-blk disk. Format: `[fs=][:size=][:ro]`, e.g. `fs=ext4:size=128MiB`. The disk is created fresh from a cached mkfs template per invocation and torn down on shell exit. |
+| `--disk SIZE` | unset | Attach a raw (unformatted) virtio-blk disk at `/dev/vda`, backed by a fresh sparse tempfile per invocation. SIZE is a human-readable IEC size (case-insensitive suffix `b`, `kib`, `mib`, `gib`); SI suffixes (`kb`/`mb`/`gb`) are rejected. Size must be a positive whole number of MiB, e.g. `256mib`, `1gib`. |
 
-`cargo ktstr shell` runs the same VM boot flow and differs in one
-respect: it accepts raw image file paths for `--kernel` (e.g.
-`bzImage`, `Image`). Source-tree directories auto-build and no-kernel
+`cargo ktstr shell` runs the same VM boot flow and differs in two
+respects: it accepts raw image file paths for `--kernel` (e.g.
+`bzImage`, `Image`), and it adds a `--test NAME` flag that derives
+topology / memory / include-files from a registered `#[ktstr_test]`
+(mutually exclusive with `--topology` and `--memory-mib`; `-i` is
+additive). Source-tree directories auto-build and no-kernel
 invocations auto-download — same as `ktstr shell`.
 
 ### ctprof
@@ -113,8 +117,14 @@ activity over the window. Instantaneous gauges and categorical
 scalars are point-in-time readings that can legitimately differ
 between two probes of the same thread. Per-cgroup aggregates
 (`cpu.stat`, `memory.current`) are captured once per distinct
-path. Capture is read-only; nothing is attached, no kprobes, no
-tracing.
+path. Capture does not modify thread state and uses no kprobes or
+kernel tracing. The jemalloc-only memory fields
+(`allocated_bytes`/`deallocated_bytes`) are read by briefly
+`ptrace`-attaching each thread of jemalloc-linked processes
+(`PTRACE_SEIZE`), which needs root, `CAP_SYS_PTRACE`, or
+`kernel.yama.ptrace_scope=0`; targets not linked against jemalloc, or
+where the attach is denied, land those two fields at zero while the
+rest of the snapshot still populates.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -137,16 +147,17 @@ taskstats kconfig gating.
 |------|---------|-------------|
 | `BASELINE` | required | Path to the baseline `.ctprof.zst` snapshot. |
 | `CANDIDATE` | required | Path to the candidate `.ctprof.zst` snapshot. |
-| `--group-by AXIS` | `pcomm` | Grouping axis: `pcomm` (process name), `cgroup` (cgroup v2 path), `comm` (thread-name pattern, token-normalized), or `comm-exact` (synonym for `comm --no-thread-normalize`). |
+| `--group-by AXIS` | `all` | Grouping axis: `all` (default; runs cgroup → pcomm → comm, folding renamed-but-identical cgroups together), `pcomm` (process name), `cgroup` (cgroup v2 path), `comm` (thread-name pattern, token-normalized), or `comm-exact` (synonym for `comm --no-thread-normalize`). |
 | `--cgroup-flatten GLOB` | -- | Glob pattern that collapses dynamic cgroup path segments before grouping (e.g. `'/kubepods/*/workload'`). Repeatable; explicit globs apply before auto-normalize. |
 | `--no-thread-normalize` | off | Disable token-based pattern normalization for `--group-by comm`. Threads group by literal `comm`. |
 | `--no-cg-normalize` | off | Disable token-based normalization for `--group-by cgroup`. Cgroup paths group by literal post-flatten path. |
 | `--sort-by SPEC` | by largest `\|delta_pct\|` | Multi-key sort spec: `metric1[:dir1],metric2[:dir2],...`. Each `metric` is a name from `ctprof metric-list`; each `dir` is `asc` or `desc` (default `desc`). |
-| `--display-format FORMAT` | `full` | Per-row column layout. `full` (default 7 columns), `delta-only` (drop baseline+candidate), `no-pct`, `arrow` (collapse baseline/candidate/delta into one cell), or `pct-only`. |
-| `--columns NAMES` | -- | Comma-separated column list overriding `--display-format`. Valid names: `group`, `threads`, `metric`, `baseline`, `candidate`, `delta`, `%`, `arrow`. Order is the rendered order. |
+| `--display-format FORMAT` | `arrow` | Per-row column layout. `arrow` (default; collapses baseline/candidate into a single `baseline → candidate` cell), `full` (7 columns), `delta-only` (drop baseline+candidate), `no-pct`, or `pct-only`. |
+| `--columns NAMES` | -- | Comma-separated column list overriding `--display-format`. Valid names: `group`, `threads`, `metric`, `baseline`, `candidate`, `delta`, `%`, `arrow`, `tags`, `uptime`. Order is the rendered order. |
 | `--sections NAMES` | every | Comma-separated sub-table list. Valid names: `primary`, `taskstats-delay`, `derived`, `cgroup-stats`, `cgroup-limits`, `memory-stat`, `memory-events`, `pressure`, `host-pressure`, `smaps-rollup`, `sched-ext`. Empty renders every section that has data. |
 | `--metrics NAMES` | every | Comma-separated metric-name allowlist for primary + derived rows. Names must come from `ctprof metric-list`. Composes multiplicatively with `--sections`. |
 | `--wrap` | off | Wrap table cells to fit terminal width. Only fires when stdout is a TTY; piped output stays unwrapped so awk/grep pipelines see the same byte sequence. |
+| `--limit N` | `500` | Maximum rendered lines per section; sections that exceed it are truncated with a notice. `0` disables truncation. |
 
 **`show`** renders a single snapshot's per-(group, metric)
 values without diff math. Same flag vocabulary as `compare`,
@@ -165,10 +176,11 @@ ktstr ctprof show snapshot.ctprof.zst --sections taskstats-delay
 | `--no-thread-normalize` | off | Same as `compare`. |
 | `--no-cg-normalize` | off | Same as `compare`. |
 | `--sort-by SPEC` | alphabetical | Sort spec; ranks groups by absolute aggregated value (no delta — single snapshot). |
-| `--columns NAMES` | -- | Comma-separated column list. Show-only valid names: `group`, `threads`, `metric`, `value`. The compare-only column names are rejected at parse time. |
+| `--columns NAMES` | -- | Comma-separated column list. Show-only valid names: `group`, `threads`, `metric`, `value`, `tags`, `uptime`. The compare-only column names are rejected at parse time. |
 | `--sections NAMES` | every | Same as `compare`. |
 | `--metrics NAMES` | every | Same as `compare`. |
 | `--wrap` | off | Same as `compare`. |
+| `--limit N` | `500` | Same as `compare`. |
 
 **`metric-list`** prints every registered metric (primary +
 derived) with its description, unit, kconfig gate, and
@@ -189,10 +201,11 @@ peer (PID + cmdline) without disturbing any of its flocks.
 
 Scans four lock-file roots:
 
-- `/tmp/ktstr-llc-*.lock` — per-LLC reservations held by
-  perf-mode test runs and `--cpu-cap`-bounded builds.
-- `/tmp/ktstr-cpu-*.lock` — per-CPU reservations from the
-  same flow.
+- `{KTSTR_LOCK_DIR}/ktstr-llc-*.lock` (default `/tmp`) — per-LLC
+  reservations held by perf-mode test runs and `--cpu-cap`-bounded
+  builds.
+- `{KTSTR_LOCK_DIR}/ktstr-cpu-*.lock` (default `/tmp`) — per-CPU
+  reservations from the same flow.
 - `{cache_root}/.locks/*.lock` — cache-entry locks held
   during `kernel build` writes, and `source-{path_hash}.lock`
   files held for the duration of `kernel build --source` and

@@ -10,10 +10,12 @@ The `-E 'test(NAME)'` form is a nextest filterset expression. `test(NAME)`
 is a substring match against the test name; use `test(=NAME)` for an exact
 match. See nextest's filterset docs for the full grammar.
 
-Integration-feature-gated tests need `--features integration`:
+Integration-feature-gated tests (e.g. the jemalloc probe e2es) need
+`--features integration`, placed after the `--` separator so it is
+forwarded to the underlying `cargo nextest run`:
 
 ```sh
-cargo ktstr test --kernel ../linux --features integration -- -E 'test(stats_bridge_round_trip)'
+cargo ktstr test --kernel ../linux -- --features integration -E 'test(jemalloc_probe_external_target_observes_known_allocation)'
 ```
 
 ## Running with a panic backtrace

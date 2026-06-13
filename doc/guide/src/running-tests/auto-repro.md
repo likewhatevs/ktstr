@@ -60,11 +60,12 @@ auto-repro falls back to dynamic BPF program discovery in the repro VM.
    line_info for BPF).
 
 7. **Diagnostic tails** -- the last 40 lines of the repro VM's
-   scheduler log (COM2, cycle-collapsed), sched_ext dump (COM1), and
-   kernel console (COM1) are appended after the probe output when
-   non-empty. A duration line reports total repro VM wall time. When
-   probe data is absent, a crash reproduction status line indicates
-   whether the crash reproduced.
+   scheduler log (COM2, cycle-collapsed), sched_ext dump (COM1), the
+   freeze-coordinator failure-dump JSON (when an error-class SCX exit
+   fired), and kernel console (COM1) are appended after the probe
+   output when non-empty. A duration line reports total repro VM wall
+   time. When probe data is absent, a crash reproduction status line
+   indicates whether the crash reproduced.
 
 ## Requirements
 
@@ -127,7 +128,8 @@ ktstr_test 'demo_host_crash_auto_repro' [sched=scx-ktstr] [topo=1n1l4c1t] failed
 
 After the probe data, the auto-repro section includes the repro VM
 duration and the last 40 lines of the repro VM's scheduler log,
-sched_ext dump, and dmesg (each only when non-empty).
+sched_ext dump, inline failure-dump JSON, and dmesg (each only when
+non-empty).
 
 ## When the primary VM never reached the workload
 
@@ -181,10 +183,10 @@ fn scenario_yield_heavy(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-Run manually to see full output. The `demo_` prefix
-auto-ignores via `KtstrTestEntry::is_ignored`
-(`src/test_support/dispatch.rs:976-978`), so a bare invocation will
-filter the test out — `--run-ignored ignored-only` is required:
+Run manually to see full output. The `demo_` prefix auto-ignores via
+the `is_ignored` filter in `src/test_support/dispatch.rs`, so a bare
+invocation will filter the test out — `--run-ignored ignored-only` is
+required:
 
 ```sh
 cargo ktstr test --kernel ../linux -- --run-ignored ignored-only -E 'test(demo_host_crash_auto_repro)'

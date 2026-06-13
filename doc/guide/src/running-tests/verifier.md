@@ -108,8 +108,8 @@ declaration acts as a **per-scheduler filter** on the matrix:
 ```sh
 # Scheduler declares kernels = ["6.14..6.16"]
 # Operator runs --kernel 6.14.2 --kernel 6.15.0 --kernel 6.17.0
-# Dispatcher's KTSTR_KERNEL_LIST: kernel_6_14_2, kernel_6_15_0,
-#                                 kernel_6_17_0
+# Dispatcher's KTSTR_KERNEL_LIST labels: 6.14.2, 6.15.0, 6.17.0
+#   (sanitized to kernel_6_14_2 etc. in the cell names below)
 # Scheduler filter: 6.14.2 ∈ [6.14, 6.16] ✓
 #                   6.15.0 ∈ [6.14, 6.16] ✓
 #                   6.17.0 ∈ [6.14, 6.16] ✗ — rejected
@@ -215,7 +215,10 @@ pipeline:
 `scx_ops_load!`, enabling a code path the BPF verifier
 rejects. On failure, libbpf prints the verifier log to stderr.
 
-**`--verify-loop`** — sets a `.rodata` variable that enables
-an unrolled loop followed by `while(1)` in `ktstr_dispatch`.
-The verifier rejects the infinite loop and libbpf prints the
-full instruction trace to stderr, exercising cycle collapse.
+**`--verify-loop`** — sets a `.rodata` variable that enables an
+unrolled 8-iteration loop followed by a store through a null pointer
+in `ktstr_dispatch`. The null-pointer store is the invalid access the
+verifier rejects (deliberately not a `while(1)`, whose infinite-loop
+analysis could keep `scx_ops_load` from returning within the host's
+scheduler-attach poll). On rejection libbpf prints the full
+instruction trace to stderr, exercising cycle collapse.
