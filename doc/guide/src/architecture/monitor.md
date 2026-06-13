@@ -354,10 +354,11 @@ parsed embedded program BTF and records a
 `name -> (btfs index, type_id)` entry for every complete
 (`!is_fwd`) `Type::Struct` / `Type::Union`. First-write-wins on
 duplicate names: when the same name appears in multiple BTFs the
-index keeps the first-seen entry. Anonymous types and `Typedef`
-are not indexed (no name to key on, and typedefs add no body —
-the chase peels through them via `peel_modifiers_with_id` before
-consulting the index). The index is threaded through
+index keeps the first-seen entry. A named `typedef` over an
+anonymous `struct`/`union` is also indexed (under its `_t`-stripped
+base name, pointing at the anonymous aggregate's type id), to recover
+a body that only carries a name via the typedef alias; types with no
+usable name are not indexed. The index is threaded through
 `DumpContext::cross_btf_fwd_index` and exposed to the renderer via
 `MemReader::cross_btf_resolve_fwd`. When `chase_arena_pointer` /
 `render_cast_pointer` peel a chase target through

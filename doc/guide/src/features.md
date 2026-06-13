@@ -122,7 +122,7 @@ catalog aggregator.)
 - `CgroupDef` — declarative cgroup: name + cpuset + workload(s)
 - `Step` — sequence of ops followed by a hold period
 - `Op` — atomic operation (add/remove cgroup, set/swap/clear cpuset, spawn, stop, set affinity, move tasks)
-- `CpusetSpec` — topology-relative cpuset (LLC-aligned, disjoint, overlapping, range, exact)
+- `CpusetSpec` — topology-relative cpuset (LLC-aligned, NUMA-aligned, disjoint, overlapping, range, exact)
 - `HoldSpec` — hold duration (fractional, fixed, or looped)
 - `AffinityIntent` — per-worker affinity (inherit, random subset, LLC-aligned, SMT-sibling-pair, cross-cgroup, single CPU, exact)
 - `SchedPolicy` — Linux scheduling policy (Normal, Batch, Idle, Fifo, RoundRobin, Deadline)

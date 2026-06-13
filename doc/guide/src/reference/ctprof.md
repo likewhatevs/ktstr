@@ -261,7 +261,7 @@ doesn't expose this" from "every tid raced exit" from
 | `blkio_delay_*` | `delayacct_blkio_start` / `_end` (`kernel/delayacct.c`) | Synchronous block I/O wait. Updates serialize through `task->delays->lock` so count + total are atomic (unlike `cpu_*`). The canonical delay-accounting block-I/O reading; distinct from schedstat `iowait_sum`. |
 | `swapin_delay_*` | `delayacct_swapin_start` / `_end` (`include/linux/delayacct.h`) | Swap-in wait. **OVERLAPS** with `thrashing_*` — every thrashing event is also a swapin event from the syscall layer; do not sum the two. |
 | `freepages_delay_*` | `delayacct_freepages_start` / `_end` (called from `mm/vmscan.c`; impl in `kernel/delayacct.c`) | Direct memory reclaim wait. |
-| `thrashing_delay_*` | `delayacct_thrashing_start` / `_end` (`mm/workingset.c`) | Thrashing wait. Refines swapin tracking — see `swapin_*`. |
+| `thrashing_delay_*` | `delayacct_thrashing_start` / `_end` (called from `mm/filemap.c` and `mm/page_io.c`; impl in `kernel/delayacct.c`) | Thrashing wait. Refines swapin tracking — see `swapin_*`. |
 | `compact_delay_*` | `delayacct_compact_start` / `_end` (called from `mm/page_alloc.c`; impl in `kernel/delayacct.c`) | Memory-compaction wait. |
 | `wpcopy_delay_*` | `delayacct_wpcopy_start` / `_end` (called from `mm/memory.c` and `mm/hugetlb.c`; impl in `kernel/delayacct.c`) | Write-protect-copy (CoW) fault wait. Introduced in taskstats v13. |
 | `irq_delay_*` | `delayacct_irq` (`kernel/delayacct.c`) | IRQ-handler windows charged to the task by IRQ accounting. Introduced in taskstats v14. |

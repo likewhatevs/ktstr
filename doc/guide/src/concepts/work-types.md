@@ -14,7 +14,7 @@ pub enum WorkType {
     SpinWait,                            // Tight CPU spin loop (1024 iterations per cycle).
     YieldHeavy,                          // Repeated sched_yield with minimal CPU work.
     Mixed,                               // CPU spin burst followed by sched_yield.
-    AluHot { width: AluWidth },          // Dependent integer multiply chain at high IPC (>= 2.0); optional SIMD width.
+    AluHot { width: AluWidth },          // Independent multiply chains (four parallel streams) at high IPC (>= 2.0); optional SIMD width.
     SmtSiblingSpin,                      // Tight PAUSE-spin from a paired worker pinned to two SMT siblings.
     IpcVariance {                        // Alternating high-IPC (multiplies) / low-IPC (random cache touches) phases.
         hot_iters: u64,
@@ -81,6 +81,7 @@ pub enum WorkType {
     ForkExit,                                           // Rapid fork+_exit cycling; parent waitpid's then repeats.
     NiceSweep,                                          // Cycle nice level from -20 to 19 across iterations.
     AffinityChurn { spin_iters: u64 },                  // Rapid self-directed sched_setaffinity to random CPUs.
+    CrossAffinityChurn { spin_iters: u64 },             // Rapid cross-task (sibling) sched_setaffinity churn.
     PolicyChurn { spin_iters: u64 },                    // Cycle SCHED_OTHER -> BATCH -> IDLE (-> FIFO/RR if CAP_SYS_NICE).
     NumaMigrationChurn { period_ms: u64 },              // Rotate sched_setaffinity across NUMA nodes.
     CgroupChurn { groups: usize, cycle_ms: u64 },       // Cycle cgroup membership between sibling cgroups.

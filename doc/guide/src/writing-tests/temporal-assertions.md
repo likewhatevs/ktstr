@@ -158,9 +158,8 @@ Every pattern takes `&mut Verdict` and returns the same `&mut
 Verdict` so chains of assertions stack onto one accumulator. Each
 PATTERN is a method on `SeriesField` (distinct from `each(...)`,
 which returns the per-sample comparator builder covered in its own
-section below). `nondecreasing` and `strictly_increasing` share the
-same section heading; the seven patterns are six sections plus the
-shared one.
+section below). The seven patterns occupy six sections, one of which
+(`nondecreasing` / `strictly_increasing`) is shared.
 
 ### `nondecreasing` / `strictly_increasing`
 

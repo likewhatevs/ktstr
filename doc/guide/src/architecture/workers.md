@@ -150,8 +150,9 @@ Three fields worth calling out explicitly:
   `work_units` contributions:
   - **Every outer iteration (period = 1 iter)**: SpinWait (1024),
     Mixed (1024), Bursty (each outer iter runs `spin_burst(1024)`
-    some number of times inside the `burst_ms` loop — always a
-    multiple of 1024), PipeIo (`burst_iters`=1024), FutexPingPong
+    some number of times inside the `burst_duration` loop — always a
+    multiple of 1024),
+    PipeIo (`burst_iters`=1024), FutexPingPong
     (`spin_iters`=1024), CachePressure (1024 strided RMW steps),
     CacheYield (1024 strided RMW steps), CachePipe
     (`burst_iters`=1024), FutexFanOut receiver

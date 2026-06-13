@@ -123,8 +123,9 @@ cargo ktstr verifier --kernel 6.14.2 --kernel 6.15.0 --kernel 6.17.0
 
 # No --kernel: dispatcher auto-discovers one kernel via the
 # cache + filesystem chain and synthesizes a single-entry
-# KTSTR_KERNEL_LIST. The auto-discovered entry's label is
-# derived from the resolved path (`kernel_path_<basename>_<hash6>`).
+# KTSTR_KERNEL_LIST. The auto-discovered entry's raw label is
+# derived from the resolved path (`path_<basename>_<hash6>`;
+# sanitized to `kernel_path_<basename>_<hash6>` in cell names).
 # Schedulers with non-empty `kernels = [...]` may filter the
 # entry out — operators wanting deterministic coverage should
 # always pass --kernel.
