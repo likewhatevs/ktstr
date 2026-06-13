@@ -9222,3 +9222,93 @@ fn cpumask_kptr_plausibility_gate_rejects_freed_slab_pattern() {
         "skip reason must cite the plausibility gate, got {deref_skipped_reason:?}"
     );
 }
+
+// ---- llc_cpumask inline-bitmap render -------------------------------
+//
+// `struct llc_cpumask { unsigned long bits[NR]; }` (scx_mitosis) is an
+// inline NON-kptr bitmap. Its BTF name must be in render_struct's
+// embedded cpumask-detection list so the bytes render as a CpuList
+// rather than a raw u64 array. A synthetic BTF avoids a vmlinux
+// dependency (the name is scheduler-specific, absent from vmlinux).
+
+#[test]
+fn llc_cpumask_struct_renders_as_cpu_list() {
+    let mut strings: Vec<u8> = vec![0];
+    let mut push = |name: &str| -> u32 {
+        let off = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        off
+    };
+    let n_u64 = push("u64");
+    let n_llc = push("llc_cpumask");
+    let n_bits = push("bits");
+    // struct llc_cpumask { u64 bits; } — the renderer treats the whole
+    // struct's bytes as the bitmap, so a single-word stand-in exercises
+    // the name-detection arm (real scx_mitosis declares bits[128]).
+    let types = vec![
+        CastSynType::Int {
+            name_off: n_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        CastSynType::Struct {
+            name_off: n_llc,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_bits,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic llc_cpumask BTF parses");
+    // bits 0, 2, 5 set.
+    let bytes = 0b10_0101u64.to_le_bytes();
+    match render_value(&btf, 2, &bytes) {
+        RenderedValue::CpuList { cpus } => assert_eq!(cpus, "0,2,5"),
+        other => panic!("expected CpuList for llc_cpumask, got {other:?}"),
+    }
+}
+
+/// Plausibility gate must NOT reject a fully-online <=64-CPU mask: an
+/// all-ones first word (0xFFFF..FFFF) is a valid mask, not a freed-slab
+/// freelist pointer (a real next pointer carries address bits and is
+/// never all-ones / non-canonical). Regression for the gate
+/// false-positive — on the pre-fix top-byte-0xff check this read would
+/// skip with a "plausibility" reason instead of decoding cpus 0-63.
+#[test]
+fn cpumask_kptr_all_ones_word_decodes_not_rejected() {
+    let (btf, outer_id) = cpumask_kptr_outer_btf("bpf_cpumask");
+    let val: u64 = 0xFFFF_8000_0010_0000;
+    let outer_bytes = val.to_le_bytes().to_vec();
+    // word0 all ones (CPUs 0-63 online), higher words zero.
+    let mut kva = std::collections::HashMap::new();
+    kva.insert(val, cpumask_read_bytes(u64::MAX));
+    let reader = CastStubReader {
+        kva_bytes_at: kva,
+        ..Default::default()
+    };
+    let v = render_value_with_mem(&btf, outer_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        ref deref,
+        ref deref_skipped_reason,
+        ..
+    } = members[0].value
+    else {
+        panic!("mask field must render as Ptr; got {:?}", members[0].value);
+    };
+    match deref.as_deref() {
+        Some(RenderedValue::CpuList { cpus }) => assert_eq!(cpus, "0-63"),
+        other => panic!(
+            "all-ones mask must decode to cpus 0-63, got {other:?} \
+             (skip reason {deref_skipped_reason:?})"
+        ),
+    }
+}

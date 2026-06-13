@@ -2348,28 +2348,27 @@ fn render_value_inner(
                         // Best-effort plausibility heuristic on
                         // `bits[0]`: a freed slab object's first
                         // qword is often a freelist next pointer,
-                        // which on x86_64 / aarch64 typically lands
-                        // in the kernel direct-map range
-                        // (0xffff800000000000+, top byte 0xff). We
-                        // reject reads where the top byte is
-                        // exactly 0xff as a probable stale-pointer
-                        // pattern. The `nr_cpu_ids` cap below
-                        // backstops this: even when
-                        // SLAB_FREELIST_HARDENED XOR-encodes the
-                        // next pointer (defeating the top-byte
-                        // gate), set bits beyond `nr_cpu_ids` are
-                        // dropped rather than rendered as phantom
-                        // cpu ids. Caveats:
-                        //   * False-positive: a fully-online 64-CPU
-                        //     mask (0xFFFFFFFFFFFFFFFF in word 0)
-                        //     is indistinguishable from the
-                        //     0xff... pointer pattern at this gate
-                        //     and gets rejected, surfacing as raw
-                        //     hex.
-                        // The gate is intentionally cheap; a
-                        // production-grade detector would walk the
-                        // SLUB metadata to confirm liveness.
-                        if bits0 >> 56 != 0xff {
+                        // which on x86_64 / aarch64 lands in the
+                        // canonical kernel range
+                        // (0xffff8000_00000000+, top byte 0xff).
+                        // Reject a top-byte-0xff first word as a
+                        // probable stale-pointer pattern — EXCEPT an
+                        // all-ones word (`u64::MAX`), which is a
+                        // fully-online <=64-CPU mask. 0xFFFF..FFFF is
+                        // non-canonical and is never a real freelist
+                        // next pointer (a next pointer carries address
+                        // bits, so it is never all-ones), so decoding
+                        // it as a mask cannot alias a live kernel
+                        // pointer. The `nr_cpu_ids` cap below
+                        // backstops the heuristic: even when
+                        // SLAB_FREELIST_HARDENED XOR-encodes the next
+                        // pointer (defeating the top-byte gate), set
+                        // bits beyond `nr_cpu_ids` are dropped rather
+                        // than rendered as phantom cpu ids. The gate
+                        // is intentionally cheap; a production-grade
+                        // detector would walk the SLUB metadata to
+                        // confirm liveness.
+                        if bits0 == u64::MAX || bits0 >> 56 != 0xff {
                             let mut cpus = Vec::new();
                             // Walk every full u64 in the read.
                             // `bits_bytes.len()` is at least 8
@@ -2395,8 +2394,11 @@ fn render_value_inner(
                                 // would otherwise enumerate phantom
                                 // CPU IDs; bail out of the walk when
                                 // a later word looks like a kernel
-                                // address rather than mask bits.
-                                if word >> 56 == 0xff {
+                                // address rather than mask bits. An
+                                // all-ones word is a fully-online
+                                // 64-CPU chunk, not a pointer, so it is
+                                // decoded (same exception as bits[0]).
+                                if word != u64::MAX && word >> 56 == 0xff {
                                     break;
                                 }
                                 for bit in 0..64u32 {
@@ -2685,6 +2687,16 @@ fn render_struct(
                 if bytes.len() >= 16
                     && let Some(cpu_list) = try_render_cpumask_bits(&bytes[8..], max_cpus)
                 {
+                    return cpu_list;
+                }
+            }
+            "llc_cpumask" => {
+                // scx_mitosis per-LLC inline bitmap:
+                // `struct llc_cpumask { unsigned long bits[NR]; }` —
+                // bits at offset 0, the whole struct IS the mask (a
+                // plain inline array, not a bpf_cpumask kptr). Decode
+                // the raw bytes like cpumask_t.
+                if let Some(cpu_list) = try_render_cpumask_bits(bytes, max_cpus) {
                     return cpu_list;
                 }
             }
