@@ -299,12 +299,15 @@ const volatile int scattershot = 0;
 const volatile int slow = 0;
 
 /* When non-zero, ktstr_dispatch contains a #pragma unroll loop
- * followed by while(1). The compiler unrolls the loop into
- * sequential copies of the same instruction block. The trailing
- * while(1) forces verifier rejection so libbpf prints the full
- * trace to stderr. collapse_cycles() compresses the repetitive
- * unrolled output. const volatile (.rodata) so the verifier
- * prunes the path when verify_loop=0. */
+ * followed by a store through a null pointer. The compiler unrolls
+ * the loop into sequential copies of the same instruction block.
+ * The trailing null-pointer store is the invalid access that forces
+ * verifier rejection so libbpf prints the full trace to stderr
+ * (deliberately NOT a while(1): an infinite loop's verifier analysis
+ * could keep scx_ops_load from returning within the host's
+ * scheduler-attach poll). collapse_cycles() compresses the
+ * repetitive unrolled output. const volatile (.rodata) so the
+ * verifier prunes the path when verify_loop=0. */
 const volatile int verify_loop = 0;
 
 /* Runtime-mutable degrade flag. Set from userspace via .bss map write,
