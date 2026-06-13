@@ -98,6 +98,40 @@ fn assert_stats_round_trip(result: &VmResult) -> Result<()> {
          workload (was scx-ktstr loaded?)"
     );
 
+    // Exact-value fidelity: scx-ktstr's `ktstr_init` stamps the BSS
+    // field `stats_magic` with a fixed sentinel (KTSTR_STATS_MAGIC in
+    // scx-ktstr/src/bpf/main.bpf.c). Assert the host receives that
+    // EXACT value over the relay. The `nr_dispatched > 0` check above
+    // would pass on any stray non-zero cardinal; this pins a known
+    // 64-bit value end-to-end and fails if the bridge drops,
+    // truncates, re-types, or zero-fills the field. The constant
+    // mirrors the C #define — they must stay in sync.
+    const KTSTR_STATS_MAGIC: u64 = 0x5354_4154_7374_6174; // "STATstat"
+    let magic = series.stats("stats_magic", |sv| sv.get("stats_magic").as_u64());
+    let mut saw_magic = false;
+    for (tag, _elapsed_ms, slot) in magic.iter_full() {
+        match slot {
+            Ok(v) => {
+                anyhow::ensure!(
+                    *v == KTSTR_STATS_MAGIC,
+                    "stats_magic mismatch at sample {tag}: got {v:#018x}, \
+                     expected {KTSTR_STATS_MAGIC:#018x} — the scx_stats \
+                     relay did not deliver the emitted value byte-exact"
+                );
+                saw_magic = true;
+            }
+            Err(e) => anyhow::bail!(
+                "stats projection for `stats_magic` failed at sample \
+                 {tag}: {e}"
+            ),
+        }
+    }
+    anyhow::ensure!(
+        saw_magic,
+        "no stats_magic value observed across periodic samples — the \
+         relay never delivered the sentinel field"
+    );
+
     // series.monitor() consume-path assertion: the host-side
     // MonitorReport must wire through SampleSeries (via
     // `result.monitor.clone()` at the from_drained call site) and
