@@ -32,7 +32,7 @@ Environment variables that control ktstr behavior.
 | `KTSTR_WORKER_READY_MARKER_OVERRIDE` | Override the per-test temp dir where worker-ready inotify markers land. Default writes a per-test subdirectory under the system temp. Set when the default location is on a `noexec` or quota-constrained filesystem. Test-binary scope only. | None (per-test default under `/tmp`) |
 | `KTSTR_HOST_CGROUP_PARENT` | Override the cgroup-v2 parent directory under which `#[ktstr_test(host_only)]` tests create per-test cgroups. The default `/sys/fs/cgroup/ktstr` matches the always-root invariant. Validated upfront: empty string falls back to the default; a set value must be rooted under `/sys/fs/cgroup` and name a non-root subdirectory (e.g. `/sys/fs/cgroup/ktstr-foo`) — relative paths, empty strings via concat, or `/sys/fs/cgroup` itself are rejected with an actionable diagnostic. Non-root callers setting this env var are rejected: `CgroupManager::setup` walks every ancestor's `cgroup.subtree_control` from `/sys/fs/cgroup` down to the configured parent, which requires write access on each — cgroup-v2 user-delegation (`nsdelegate`-namespaced cgroup2 / `systemd-run --user --scope` with `Delegate=cpu cpuset memory io pids`) would need a delegation-root-aware walk that isn't yet implemented. host_only tests resolve real-host topology via `/sys/devices/system/cpu/online`; the parent override only affects WHERE per-test cgroups land, not WHICH CPUs the topology reports. | `/sys/fs/cgroup/ktstr` |
 | `RUST_BACKTRACE` | Gates verbose diagnostic output on failure. Also enables verbose VM console output (same as `KTSTR_VERBOSE=1`) when set to `"1"` or `"full"`. Propagated to the guest. | None |
-| `RUST_LOG` | Controls every ktstr tracing filter — guest-side and host-side. **Guest-side**: propagated to the VM kernel command line and parsed by the guest tracing subscriber, so guest events are filtered by the same `RUST_LOG` value the host process saw at launch. **Host-side**: applied via the `EnvFilter` the inference engine installs on first call to `global_backend()` (`tracing_subscriber::fmt::try_init()` — a no-op when an outer subscriber was already installed). Two host-side targets are useful in practice: `"llama-cpp-2"` (literal hyphens — the `Metadata::target()` set by `llama_cpp_2::send_logs_to_tracing(LogOptions::default())`, carrying llama.cpp / GGML log lines: model-load progress, GGUF parse chatter, KV-cache reservation notes, error reasons) and `"ktstr::flock"` (the `module_path!()` default for `src/flock.rs`, where the shared flock-timeout primitive emits a `tracing::debug!("waiting on flock at …")` event on each `Ok(None)` poll iteration). Examples: `RUST_LOG=llama-cpp-2=info` widens model-load logging to INFO; `RUST_LOG=ktstr::flock=debug` surfaces flock-contention heartbeats; `RUST_LOG=llama-cpp-2=off` suppresses llama.cpp output entirely. `EnvFilter` does prefix-matching on `meta.target()` without underscore normalization (the hyphenated llama-cpp-2 target is a string literal, not a Rust path). The default `EnvFilter` derived from an unset `RUST_LOG` keeps only ERROR-level events, which is exactly the C-side rejection-reason text behind otherwise-opaque `InferenceError::ModelLoad` / `LlamaModelLoadError::NullResult` failures. Operators wanting a different sink (file, alternate format) can install their own subscriber FIRST — `try_init()` becomes a no-op and the operator's subscriber receives the events. | None (host-side: ERROR-level events on stderr) |
+| `RUST_LOG` | Controls every ktstr tracing filter — guest-side and host-side. **Guest-side**: propagated to the VM kernel command line and parsed by the guest tracing subscriber, so guest events are filtered by the same `RUST_LOG` value the host process saw at launch. **Host-side**: applied via the `EnvFilter` the inference engine installs on first call to `global_backend()` (`tracing_subscriber::fmt::try_init()` — a no-op when an outer subscriber was already installed). Two host-side targets are useful in practice: `"llama-cpp-2"` (literal hyphens — the `Metadata::target()` set by `llama_cpp_2::send_logs_to_tracing(LogOptions::default())`, carrying llama.cpp / GGML log lines: model-load progress, GGUF parse chatter, KV-cache reservation notes, error reasons) and `"ktstr::flock::acquire"` (the `module_path!()` default for `src/flock/acquire.rs`, where the shared flock-timeout primitive emits a `tracing::debug!("waiting on flock at …")` event on each poll iteration that loops back). Examples: `RUST_LOG=llama-cpp-2=info` widens model-load logging to INFO; `RUST_LOG=ktstr::flock=debug` surfaces flock-contention heartbeats; `RUST_LOG=llama-cpp-2=off` suppresses llama.cpp output entirely. `EnvFilter` does prefix-matching on `meta.target()` without underscore normalization (the hyphenated llama-cpp-2 target is a string literal, not a Rust path). The default `EnvFilter` derived from an unset `RUST_LOG` keeps only ERROR-level events, which is exactly the C-side rejection-reason text behind otherwise-opaque `InferenceError::ModelLoad` / `LlamaModelLoadError::NullResult` failures. Operators wanting a different sink (file, alternate format) can install their own subscriber FIRST — `try_init()` becomes a no-op and the operator's subscriber receives the events. | None (host-side: ERROR-level events on stderr) |
 
 ## jemalloc probe wiring
 
@@ -100,26 +100,28 @@ added.
 
 ## VM-internal
 
-Set by the host on the guest kernel command line and read by the
-guest init (via `/proc/cmdline`). Not intended for user
+Mostly set by the host on the guest kernel command line and read by
+the guest init (via `/proc/cmdline`); a few (noted below) are
+process-internal markers set inside the guest. Not intended for user
 configuration; listed here for debugging.
 
 | Variable | Description |
 |---|---|
-| `SCHED_PID` | PID of the scheduler process inside the guest, published after scheduler spawn. |
-| `KTSTR_MODE` | Guest execution mode (`run` for test dispatch, `shell` for interactive shell). |
+| `KTSTR_MODE` | Guest execution mode. `shell` requests the interactive shell; `disk_template` requests a one-shot mkfs template-build VM. Absent (no `KTSTR_MODE` token) means the default test-dispatch path. |
 | `KTSTR_TOPO` | Topology string (`numa_nodes,llcs,cores,threads`) for guest-side scenario resolution. |
-| `KTSTR_SHM_BASE` | Host-physical base address of the SHM ring region (hex). |
-| `KTSTR_SHM_SIZE` | Size in bytes of the SHM ring region (hex). |
 | `KTSTR_TERM` | Terminal type forwarded from the host (sets guest `TERM`). |
 | `KTSTR_COLORTERM` | Color capability forwarded from the host (sets guest `COLORTERM`). |
 | `KTSTR_COLS` | Host terminal column count, used to size the guest pty when available. |
 | `KTSTR_ROWS` | Host terminal row count, used to size the guest pty when available. |
-| `KTSTR_GUEST_INIT` | Marker set by `ktstr-init` (the guest PID-1 binary) and consumed by `src/workload/spawn` to detect re-entrant worker spawns under PID-1 init. |
+| `KTSTR_GUEST_INIT` | Process-internal marker set by the guest init (`ktstr-init`) via `std::env::set_var` — NOT a host-emitted cmdline token. Read via `std::env::var_os` by `src/workload/spawn` to detect re-entrant worker spawns under PID-1 init. |
 | `KTSTR_DISK0_FS` / `KTSTR_DISK0_MOUNT` / `KTSTR_DISK0_RO` | Disk-attach metadata (fs type, mount point, ro flag) emitted by `src/vmm/setup.rs` when `#[ktstr_test(disk = ...)]` is set and consumed by `src/vmm/rust_init.rs` to mount the virtio-blk backing inside the guest. |
 
-Sentinel tokens (`===KTSTR_TEST_RESULT_START===`,
-`===KTSTR_TEST_RESULT_END===`, `KTSTR_EXIT=N`,
-`KTSTR_INIT_STARTED`, `KTSTR_PAYLOAD_STARTING`, `KTSTR_EXEC_EXIT`)
-are protocol markers written to COM2; they are not environment
-variables.
+Guest↔host signaling uses bulk-port TLV frames on the virtio-console
+port-1 channel — `MSG_TYPE_TEST_RESULT` (test verdict),
+`MSG_TYPE_EXIT` (exit code), `MSG_TYPE_LIFECYCLE` (boot/payload phases
+and scheduler-attach failures), and `MsgType::ExecExit` (shell-exec
+exit code); see `src/vmm/wire.rs`. The earlier COM2 string sentinels
+(`RESULT_START`/`RESULT_END`, `KTSTR_EXIT:`, `KTSTR_INIT_STARTED`,
+`KTSTR_PAYLOAD_STARTING`, `KTSTR_EXEC_EXIT=N`) have been removed — the
+guest no longer emits them and the host no longer scrapes them. None
+of these are environment variables.
