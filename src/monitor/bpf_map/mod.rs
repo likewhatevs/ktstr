@@ -11,8 +11,11 @@
 //! - xa_node structs are SLAB-allocated (direct mapping): use `kva_to_pa`.
 //! - bpf_map/bpf_array may be kmalloc'd or vmalloc'd: use `translate_any_kva`.
 //! - .bss value region is vmalloc'd: use `translate_kva`.
-//! - Per-CPU values (`BPF_MAP_TYPE_PERCPU_ARRAY`) are in the direct mapping:
-//!   use `kva_to_pa` with `__per_cpu_offset[cpu]`.
+//! - Per-CPU values (`PERCPU_ARRAY` / `PERCPU_HASH`) live in dynamic
+//!   per-CPU memory — the embedded first chunk is in the direct
+//!   mapping, larger allocations are vmalloc'd. Add
+//!   `__per_cpu_offset[cpu]` to the `__percpu` base and read the value
+//!   page-by-page via `read_percpu_value_bytes` (`translate_any_kva`).
 
 use crate::sync::MutexExt;
 use anyhow::Context;
@@ -866,17 +869,37 @@ pub(crate) fn read_bpf_map_array_value(
 }
 
 /// Page-walk `len` bytes from guest kernel-virtual address
-/// `target_kva` via [`chunked_kva_io`], returning the bytes or `None`
-/// if any page in the range is unmapped or the copy short-reads
-/// (end-of-DRAM).
+/// `target_kva` into a fresh buffer, resolving each 4 KiB page through
+/// `translate`. The translator abstracts WHICH KVA→PA strategy
+/// applies: [`read_kva_bytes`] passes the PTE-only `translate_kva`
+/// (vmalloc'd `.bss` value region); [`read_percpu_value_bytes`]
+/// passes `translate_any_kva` (direct-mapping-first, for per-CPU
+/// values that may live in either the direct mapping or vmalloc).
 ///
-/// Shared by [`read_bpf_map_value`] (byte-range reads bounded by one
-/// entry's `value_size`) and [`read_bpf_map_array_value`] (per-entry
-/// reads into a multi-entry ARRAY bounded by `max_entries * stride`).
-/// This helper performs NO semantic bounds check — callers MUST cap
-/// `len` against `MAX_VALUE_SIZE` and confirm `target_kva` lies in the
-/// map's value region before calling.
-fn read_kva_bytes(ctx: &AccessorCtx<'_>, target_kva: u64, len: usize) -> Option<Vec<u8>> {
+/// Walking page-by-page is mandatory, not an optimization. A
+/// vmalloc-backed range (a `.bss` map's value region, or a large
+/// dynamic per-CPU allocation) occupies physically discontiguous
+/// order-0 frames, so a value crossing a page boundary lives in
+/// non-adjacent guest physical memory. A single translate of the
+/// first page followed by one bulk read of `len` bytes would copy
+/// whatever frame happens to sit after the first page — garbage — for
+/// every byte past that boundary.
+///
+/// Returns `None` if any page is unmapped (`translate` returns
+/// `None`) or the copy short-reads (`read_bytes` returns fewer bytes
+/// than the chunk at end-of-DRAM); the buffer is adopted via
+/// `set_len` only once every byte is proven written. Performs NO
+/// semantic bounds check: `target_kva` must lie in the value region.
+/// The `.bss`/ARRAY value-region callers additionally cap `len`
+/// against `MAX_VALUE_SIZE`; the per-CPU callers read `value_size`
+/// straight from the map definition (the guest under test is trusted,
+/// so a hostile-`value_size` allocation bound is out of scope).
+fn read_kva_bytes_with<T: Fn(u64) -> Option<u64>>(
+    mem: &GuestMem,
+    translate: T,
+    target_kva: u64,
+    len: usize,
+) -> Option<Vec<u8>> {
     // `Vec::with_capacity` reserves backing storage without zeroing
     // — the zero-fill that `vec![0u8; len]` would have emitted is
     // wasted because every byte gets overwritten by the
@@ -890,7 +913,7 @@ fn read_kva_bytes(ctx: &AccessorCtx<'_>, target_kva: u64, len: usize) -> Option<
     // see "unreadable" rather than a partial buffer.
     let buf_ptr = buf.as_mut_ptr();
     let mut bytes_filled: usize = 0;
-    let ok = chunked_kva_io(ctx, target_kva, len, |pa, dst_off, chunk_len| {
+    let ok = super::kva_io::chunked_kva_io(translate, target_kva, len, |pa, dst_off, chunk_len| {
         // SAFETY: dst_off + chunk_len <= len <= buf.capacity(); the
         // slice borrows the heap-allocated Vec whose backing storage
         // is live for the duration of this call (the Vec is pinned in
@@ -902,11 +925,10 @@ fn read_kva_bytes(ctx: &AccessorCtx<'_>, target_kva: u64, len: usize) -> Option<
         let slice =
             unsafe { std::slice::from_raw_parts_mut(buf_ptr.add(dst_off as usize), chunk_len) };
         // GuestMem::read_bytes returns the count actually copied; the
-        // caller has bounds-checked the value region and translate_kva
-        // has confirmed the page is mapped, so a short read here means
-        // the page crosses end-of-DRAM, which the original byte loop
-        // would also have silently short-copied.
-        let n = ctx.mem.read_bytes(pa, slice);
+        // page was confirmed mapped by `translate`, so a short read
+        // here means the page crosses end-of-DRAM, which the original
+        // byte loop would also have silently short-copied.
+        let n = mem.read_bytes(pa, slice);
         // `saturating_add` so a pathological accumulation past
         // `usize::MAX` clamps and the `bytes_filled != len` check
         // below still surfaces the short read instead of wrapping
@@ -926,6 +948,66 @@ fn read_kva_bytes(ctx: &AccessorCtx<'_>, target_kva: u64, len: usize) -> Option<
     Some(buf)
 }
 
+/// Page-walk `len` bytes from a `.bss`/ARRAY value-region KVA via the
+/// PTE-only `translate_kva` (the value region is vmalloc'd, never in
+/// the direct mapping).
+///
+/// Shared by [`read_bpf_map_value`] (byte-range reads bounded by one
+/// entry's `value_size`) and [`read_bpf_map_array_value`] (per-entry
+/// reads into a multi-entry ARRAY bounded by `max_entries * stride`).
+/// Performs NO semantic bounds check — see [`read_kva_bytes_with`].
+fn read_kva_bytes(ctx: &AccessorCtx<'_>, target_kva: u64, len: usize) -> Option<Vec<u8>> {
+    read_kva_bytes_with(
+        ctx.mem,
+        |kva| {
+            ctx.mem
+                .translate_kva(ctx.cr3_pa.0, Kva(kva), ctx.l5, ctx.tcr_el1)
+        },
+        target_kva,
+        len,
+    )
+}
+
+/// Page-walk `len` bytes of one CPU's per-CPU value via
+/// `translate_any_kva` (direct-mapping-first, then a page-table walk
+/// for vmalloc'd per-CPU memory).
+///
+/// Per-CPU values come from the kernel's dynamic per-CPU allocator:
+/// the embedded first chunk lives in the direct mapping, while larger
+/// allocations are vmalloc-backed (`mm/percpu-vm.c` hands out order-0
+/// pages via `pcpu_get_vm_areas`, so the frames are physically
+/// discontiguous). Walking page-by-page — [`read_kva_bytes_with`]'s
+/// core behavior — is therefore required for any value that crosses a
+/// page boundary; a single translate + bulk read would copy garbage
+/// past the first page.
+///
+/// Returns `None` if any page is unmapped or the read short-reads at
+/// end-of-DRAM. The end-of-DRAM bound the single-read path checked
+/// explicitly (`cpu_pa + value_size <= mem.size()`) is subsumed:
+/// [`GuestMem::read_bytes`] returns 0 for a PA past `mem.size()`, so
+/// `bytes_filled != len` drops the slot to `None`.
+fn read_percpu_value_bytes(
+    ctx: &AccessorCtx<'_>,
+    target_kva: u64,
+    len: usize,
+) -> Option<Vec<u8>> {
+    read_kva_bytes_with(
+        ctx.mem,
+        |kva| {
+            translate_any_kva(
+                ctx.mem,
+                ctx.cr3_pa.0,
+                ctx.page_offset.0,
+                kva,
+                ctx.l5,
+                ctx.tcr_el1,
+            )
+        },
+        target_kva,
+        len,
+    )
+}
+
 /// Read a u32 from a BPF map's value region at `offset`.
 pub(crate) fn read_bpf_map_value_u32(
     ctx: &AccessorCtx<'_>,
@@ -941,12 +1023,12 @@ pub(crate) fn read_bpf_map_value_u32(
 /// `bpf_array.pptrs[key]` holds a `__percpu` pointer. Adding
 /// `__per_cpu_offset[cpu]` yields the per-CPU KVA, which may live
 /// either in the direct mapping (static percpu, kmalloc'd percpu)
-/// or in vmalloc'd memory (large dynamic per-CPU allocations).
-/// Address translation goes through [`translate_any_kva`], which
-/// tries direct mapping first and falls through to a page-table
-/// walk for vmalloc'd percpu — so a per-CPU value that misses the
-/// direct mapping no longer reads as `None` simply because the
-/// underlying allocation lives in vmalloc.
+/// or in vmalloc'd memory (large dynamic per-CPU allocations). The
+/// value is read via [`read_percpu_value_bytes`], which walks it
+/// page-by-page through [`translate_any_kva`] (direct-mapping-first,
+/// vmalloc fallback) so a value that misses the direct mapping — or
+/// that straddles physically discontiguous vmalloc frames — is read
+/// correctly rather than reading as `None` or copying garbage.
 ///
 /// Returns one entry per CPU, indexed by CPU number. `Some(bytes)`
 /// when the per-CPU PA falls within guest memory; `None` when it
@@ -1014,48 +1096,13 @@ fn read_percpu_array_value(
         // mapping (per-CPU __percpu allocations from the static
         // percpu region or kmalloc'd percpu blocks) or vmalloc'd
         // percpu memory (large dynamic per-CPU allocations served
-        // from pcpu_get_vm_areas). `translate_any_kva` tries direct
-        // mapping first and falls through to a page-table walk for
-        // vmalloc'd percpu, so it covers both.
-        match translate_any_kva(
-            ctx.mem,
-            ctx.cr3_pa.0,
-            ctx.page_offset.0,
-            cpu_kva,
-            ctx.l5,
-            ctx.tcr_el1,
-        ) {
-            Some(cpu_pa)
-                if cpu_pa
-                    .checked_add(value_size as u64)
-                    .is_some_and(|end| end <= ctx.mem.size()) =>
-            {
-                // `Vec::with_capacity` skips the zero-fill that
-                // `vec![0u8; value_size]` would emit; every byte is
-                // overwritten by `read_bytes` on the success path,
-                // and a short read drops the slot to `None` rather
-                // than handing a partial buffer to the renderer.
-                // Same with-capacity-then-set-len pattern used by
-                // [`htab::iter_htab_entries`] and
-                // [`local_storage::iter_local_storage_entries`].
-                let mut buf: Vec<u8> = Vec::with_capacity(value_size);
-                // SAFETY: capacity == value_size; we set_len only
-                // after `read_bytes` returns value_size, mirroring
-                // the htab walker's invariant.
-                let slice = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), value_size) };
-                let n = ctx.mem.read_bytes(cpu_pa, slice);
-                if n == value_size {
-                    // SAFETY: read_bytes filled value_size bytes.
-                    unsafe {
-                        buf.set_len(value_size);
-                    }
-                    result.push(Some(buf));
-                } else {
-                    result.push(None);
-                }
-            }
-            _ => result.push(None),
-        }
+        // from pcpu_get_vm_areas). `read_percpu_value_bytes` walks the
+        // value page-by-page through `translate_any_kva` (direct
+        // mapping first, page-table walk for vmalloc'd percpu), so a
+        // value straddling physically discontiguous vmalloc frames is
+        // read correctly; it drops the slot to `None` on any unmapped
+        // page or end-of-DRAM short read.
+        result.push(read_percpu_value_bytes(ctx, cpu_kva, value_size));
     }
 
     result

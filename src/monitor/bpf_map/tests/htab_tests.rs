@@ -1338,3 +1338,314 @@ fn iter_percpu_htab_entries_lru_variant() {
     assert_eq!(entries[0].0, key);
     assert_eq!(entries[0].1[0].as_ref().unwrap(), &cpu0_val);
 }
+
+// -- per-CPU value-fidelity regression: a value that crosses a
+// page boundary lives in physically NON-ADJACENT vmalloc frames.
+// A single translate + bulk read copies the frame physically after
+// the first page (garbage) for every byte past the boundary; the
+// fixed reader walks page-by-page so each page resolves to its own
+// frame. Each test plants 0xCC "poison" in the physically-adjacent
+// frame — the bytes the buggy single-read would have returned — so
+// the assertion FAILS on the old code and passes on the fix.
+
+/// Map a `value_size`-byte per-CPU value at `value_kva` (a vmalloc
+/// KVA, forcing `translate_any_kva`'s page-table-walk path) across the
+/// physically non-adjacent frames in `frames` — `frames[i]` is the
+/// frame page `i` of the value maps to. `frames.len()` MUST equal
+/// `ceil(value_size / 0x1000)` and be `>= 2`. For every interior page
+/// `i` (`0..n-1`) the slot physically after frame `i`
+/// (`frames[i] + 0x1000`) is filled with `0xCC` poison — exactly the
+/// bytes a buggy single translate + bulk read starting at frame `i`
+/// would copy for page `i+1`. Page `i` is filled with a distinct
+/// non-poison byte. Builds an x86-64 4-level page table at
+/// `pt_base_pa` (four pages) also covering each `(kva, pa)` in
+/// `extra`. Every mapped KVA MUST share the PGD/PUD/PMD indices of
+/// `value_kva` (same 2 MiB region) so one PTE table suffices.
+///
+/// Caller guarantees the frames AND their `+0x1000` poison slots do
+/// not overlap each other, the page-table pages, or the `extra`
+/// targets (a later frame fill would otherwise clobber an earlier
+/// poison slot). Returns `(cr3_pa, expected_value_bytes)`.
+#[cfg(target_arch = "x86_64")]
+fn plant_multipage_percpu_value(
+    buf: &mut [u8],
+    value_kva: u64,
+    value_size: usize,
+    pt_base_pa: u64,
+    frames: &[u64],
+    extra: &[(u64, u64)],
+) -> (u64, Vec<u8>) {
+    const POISON: u8 = 0xCC;
+    let n_pages = value_size.div_ceil(0x1000);
+    assert!(value_size > 0x1000 && n_pages >= 2, "multipage helper needs >= 2 pages");
+    assert_eq!(frames.len(), n_pages, "one frame PA per page");
+    let pgd_pa = pt_base_pa;
+    let pud_pa = pt_base_pa + 0x1000;
+    let pmd_pa = pt_base_pa + 0x2000;
+    let pte_pa = pt_base_pa + 0x3000;
+    let w64 = |b: &mut [u8], pa: u64, v: u64| {
+        b[pa as usize..pa as usize + 8].copy_from_slice(&v.to_ne_bytes());
+    };
+    // All value pages share the PGD/PUD/PMD of value_kva (one 2 MiB region).
+    let pgd_idx = (value_kva >> 39) & 0x1FF;
+    let pud_idx = (value_kva >> 30) & 0x1FF;
+    let pmd_idx = (value_kva >> 21) & 0x1FF;
+    w64(buf, pgd_pa + pgd_idx * 8, (pud_pa + PTE_BASE) | 0x63);
+    w64(buf, pud_pa + pud_idx * 8, (pmd_pa + PTE_BASE) | 0x63);
+    w64(buf, pmd_pa + pmd_idx * 8, (pte_pa + PTE_BASE) | 0x63);
+    let map_pte = |b: &mut [u8], kva: u64, pa: u64| {
+        let pte_idx = (kva >> 12) & 0x1FF;
+        w64(b, pte_pa + pte_idx * 8, (pa + PTE_BASE) | 0x63);
+    };
+    for (i, &frame) in frames.iter().enumerate() {
+        map_pte(buf, value_kva + (i as u64) * 0x1000, frame);
+    }
+    for &(kva, pa) in extra {
+        map_pte(buf, kva, pa);
+    }
+    // Per-page distinct fill byte, never equal to the poison byte.
+    let fill = |i: usize| -> u8 {
+        let b = (0x11u8).wrapping_mul((i as u8) + 1);
+        assert_ne!(b, POISON, "page fill collided with poison byte");
+        b
+    };
+    let mut expected = Vec::with_capacity(value_size);
+    for (i, &frame) in frames.iter().enumerate() {
+        let bytes_in_page = if i + 1 < n_pages {
+            0x1000
+        } else {
+            value_size - i * 0x1000
+        };
+        for j in 0..0x1000usize {
+            buf[frame as usize + j] = fill(i);
+        }
+        // Poison the slot physically after this frame for every
+        // interior page: it is what a single bulk read starting at
+        // frame `i` would wrongly return for page `i+1`. A reader that
+        // walks pages 0..i correctly but then bulk-reads the remainder
+        // from frame `i` is caught here.
+        if i + 1 < n_pages {
+            for j in 0..0x1000usize {
+                buf[frame as usize + 0x1000 + j] = POISON;
+            }
+        }
+        for _ in 0..bytes_in_page {
+            expected.push(fill(i));
+        }
+    }
+    (pgd_pa, expected)
+}
+
+/// Leaf reader: a 2-page value on non-adjacent frames reads the
+/// correct bytes from each frame, not the poison physically after
+/// page 0. Both production sites call this shared reader.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn read_percpu_value_bytes_spans_nonadjacent_frames() {
+    let page_offset: u64 = crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
+    let value_kva: u64 = 0xFFFF_C900_0000_5000; // vmalloc range
+    let value_size = 0x1800usize;
+    let mut buf = vec![0u8; 0x10000];
+    let (cr3_pa, expected) = plant_multipage_percpu_value(
+        &mut buf, value_kva, value_size, 0x1000, &[0x6000, 0x9000], &[],
+    );
+    // SAFETY: buf is a live local buffer whose storage outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let offsets = test_htab_map_offsets();
+    let got = read_percpu_value_bytes(
+        &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),
+        value_kva,
+        value_size,
+    );
+    assert_eq!(got.as_deref(), Some(expected.as_slice()));
+    // The poison the buggy single-read would have returned for page 1.
+    assert_ne!(got.unwrap()[0x1000], 0xCC);
+}
+
+/// PERCPU_ARRAY production chain: pptr indirection → per-CPU value
+/// spanning non-adjacent frames reads correctly.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn read_percpu_array_value_spans_nonadjacent_frames() {
+    let page_offset: u64 = crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
+    let map_kva: u64 = 0xFFFF_C900_0000_0000;
+    let cpu_kva: u64 = 0xFFFF_C900_0000_5000; // page-table slot 5
+    let value_size = 0x1800usize;
+    let array_pa: u64 = 0x5000;
+    let mut buf = vec![0u8; 0x10000];
+    // pptrs[0] = percpu base = cpu_kva, at array_pa + array_value(256).
+    buf[(array_pa as usize) + 256..(array_pa as usize) + 256 + 8]
+        .copy_from_slice(&cpu_kva.to_ne_bytes());
+    let (cr3_pa, expected) = plant_multipage_percpu_value(
+        &mut buf,
+        cpu_kva,
+        value_size,
+        0x1000,
+        &[0x6000, 0x9000],
+        &[(map_kva, array_pa)],
+    );
+    let offsets = test_htab_map_offsets(); // array_value = 256
+    let info = BpfMapInfo {
+        map_pa: array_pa,
+        map_kva,
+        name_bytes: super::name_from_str("test_percpu").0,
+        name_len: super::name_from_str("test_percpu").1,
+        map_type: BPF_MAP_TYPE_PERCPU_ARRAY,
+        map_flags: 0,
+        key_size: 4,
+        value_size: value_size as u32,
+        max_entries: 1,
+        value_kva: None,
+        btf_kva: 0,
+        btf_value_type_id: 0,
+        btf_vmlinux_value_type_id: 0,
+        btf_key_type_id: 0,
+    };
+    // SAFETY: buf is a live local buffer whose storage outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let result = read_percpu_array_value(
+        &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),
+        &info,
+        0,
+        &[0u64], // single CPU, cpu_off 0
+    );
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].as_deref(), Some(expected.as_slice()));
+}
+
+/// PERCPU_ARRAY production chain across THREE non-adjacent frames:
+/// pins that EVERY interior page resolves to its own frame, not just
+/// the first page→page-1 boundary. Poison after frame A AND after
+/// frame B catches both the single-bulk-read bug and a reader that
+/// walks pages 0-1 then bulk-reads the remainder from frame B.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn read_percpu_array_value_spans_three_nonadjacent_frames() {
+    let page_offset: u64 = crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
+    let map_kva: u64 = 0xFFFF_C900_0000_0000;
+    let cpu_kva: u64 = 0xFFFF_C900_0000_5000; // pages at slots 5,6,7
+    let value_size = 0x2800usize; // 2 full pages + 0x800 tail → 3 pages
+    let array_pa: u64 = 0x5000;
+    let mut buf = vec![0u8; 0x10000];
+    buf[(array_pa as usize) + 256..(array_pa as usize) + 256 + 8]
+        .copy_from_slice(&cpu_kva.to_ne_bytes());
+    // Frames A/B/C non-adjacent; poison lands at A+0x1000 (0x7000) and
+    // B+0x1000 (0xA000), both free between the chosen frames.
+    let (cr3_pa, expected) = plant_multipage_percpu_value(
+        &mut buf,
+        cpu_kva,
+        value_size,
+        0x1000,
+        &[0x6000, 0x9000, 0xC000],
+        &[(map_kva, array_pa)],
+    );
+    let offsets = test_htab_map_offsets();
+    let info = BpfMapInfo {
+        map_pa: array_pa,
+        map_kva,
+        name_bytes: super::name_from_str("test_percpu").0,
+        name_len: super::name_from_str("test_percpu").1,
+        map_type: BPF_MAP_TYPE_PERCPU_ARRAY,
+        map_flags: 0,
+        key_size: 4,
+        value_size: value_size as u32,
+        max_entries: 1,
+        value_kva: None,
+        btf_kva: 0,
+        btf_value_type_id: 0,
+        btf_vmlinux_value_type_id: 0,
+        btf_key_type_id: 0,
+    };
+    // SAFETY: buf is a live local buffer whose storage outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let result = read_percpu_array_value(
+        &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),
+        &info,
+        0,
+        &[0u64],
+    );
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].as_deref(), Some(expected.as_slice()));
+    // No poison anywhere in the result: every interior page resolved
+    // to its own frame, not the bytes physically following frame A/B.
+    assert!(
+        !result[0].as_ref().unwrap().contains(&0xCC),
+        "poison leaked: an interior page was bulk-read from the wrong frame"
+    );
+}
+
+/// PERCPU_HASH production chain: htab elem → pptr → per-CPU value
+/// spanning non-adjacent frames reads correctly. htab struct, bucket,
+/// and elem are direct-mapped; only the vmalloc per-CPU value walks
+/// the page table.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn iter_percpu_htab_entries_spans_nonadjacent_frames() {
+    let htab = test_htab_offsets();
+    let offsets = test_htab_map_offsets();
+    let page_offset: u64 = crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
+    let pa_to_kva = |pa: u64| -> u64 { page_offset.wrapping_add(pa) };
+    let cpu_kva: u64 = 0xFFFF_C900_0000_0000; // vmalloc; PTE slot 0/1
+    let value_size = 0x1800usize;
+    let key = 0xAAu32.to_ne_bytes();
+
+    let htab_pa: u64 = 0x0000;
+    let buckets_pa: u64 = 0x1000;
+    let elem_pa: u64 = 0x2000;
+    let mut buf = vec![0u8; 0x60000];
+    let w32 = |b: &mut [u8], pa: u64, v: u32| {
+        b[pa as usize..pa as usize + 4].copy_from_slice(&v.to_ne_bytes());
+    };
+    let w64 = |b: &mut [u8], pa: u64, v: u64| {
+        b[pa as usize..pa as usize + 8].copy_from_slice(&v.to_ne_bytes());
+    };
+    // bpf_htab fields.
+    w32(&mut buf, htab_pa + offsets.map_type as u64, BPF_MAP_TYPE_PERCPU_HASH);
+    w32(&mut buf, htab_pa + offsets.key_size as u64, 4);
+    w32(&mut buf, htab_pa + offsets.value_size as u64, value_size as u32);
+    w64(&mut buf, htab_pa + htab.htab_buckets as u64, pa_to_kva(buckets_pa));
+    w32(&mut buf, htab_pa + htab.htab_n_buckets as u64, 1);
+    // Bucket 0 head → elem; other buckets absent (n_buckets = 1).
+    w64(
+        &mut buf,
+        buckets_pa + htab.bucket_head as u64 + htab.hlist_nulls_head_first as u64,
+        pa_to_kva(elem_pa),
+    );
+    // elem: hlist next = nulls end marker; key; pptr at value slot.
+    w64(&mut buf, elem_pa + htab.hlist_nulls_node_next as u64, 1);
+    let key_off = elem_pa + htab.htab_elem_size_base as u64;
+    buf[key_off as usize..key_off as usize + 4].copy_from_slice(&key);
+    let value_off_in_elem = htab.htab_elem_size_base as u64 + 8; // round_up(4,8)
+    w64(&mut buf, elem_pa + value_off_in_elem, cpu_kva); // percpu base
+
+    let (cr3_pa, expected) = plant_multipage_percpu_value(
+        &mut buf, cpu_kva, value_size, 0x40000, &[0x50000, 0x53000], &[],
+    );
+    // SAFETY: buf is a live local buffer whose storage outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let map = BpfMapInfo {
+        map_pa: htab_pa,
+        map_kva: pa_to_kva(htab_pa),
+        name_bytes: super::name_from_str("test_percpu_hash").0,
+        name_len: super::name_from_str("test_percpu_hash").1,
+        map_type: BPF_MAP_TYPE_PERCPU_HASH,
+        map_flags: 0,
+        key_size: 4,
+        value_size: value_size as u32,
+        max_entries: 0,
+        value_kva: None,
+        btf_kva: 0,
+        btf_value_type_id: 0,
+        btf_vmlinux_value_type_id: 0,
+        btf_key_type_id: 0,
+    };
+    let entries = iter_percpu_htab_entries(
+        &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),
+        &map,
+        &[0u64],
+    );
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, key);
+    assert_eq!(entries[0].1.len(), 1);
+    assert_eq!(entries[0].1[0].as_deref(), Some(expected.as_slice()));
+}

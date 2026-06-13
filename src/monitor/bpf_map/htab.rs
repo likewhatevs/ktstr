@@ -191,46 +191,16 @@ pub(super) fn iter_percpu_htab_entries(
                     continue;
                 }
                 let cpu_kva = percpu_base.wrapping_add(cpu_off);
-                match translate_any_kva(
-                    ctx.mem,
-                    ctx.cr3_pa.0,
-                    ctx.page_offset.0,
-                    cpu_kva,
-                    ctx.l5,
-                    ctx.tcr_el1,
-                ) {
-                    // `checked_add` against a pathological cpu_pa
-                    // + value_size that would wrap u64 — without
-                    // the guard, a wrap would silently make
-                    // `<= mem.size()` true and the read_bytes call
-                    // would walk past end-of-DRAM.
-                    Some(cpu_pa)
-                        if cpu_pa
-                            .checked_add(value_size as u64)
-                            .is_some_and(|end| end <= ctx.mem.size()) =>
-                    {
-                        // Same with-capacity-then-set-len trick as
-                        // the key buffer; a short read leaves the
-                        // slot as `None` so the renderer never sees a
-                        // partially-zeroed value.
-                        let mut buf: Vec<u8> = Vec::with_capacity(value_size);
-                        // SAFETY: capacity == value_size; gated by
-                        // the read returning value_size.
-                        let slice =
-                            unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), value_size) };
-                        let n = ctx.mem.read_bytes(cpu_pa, slice);
-                        if n == value_size {
-                            // SAFETY: read_bytes filled value_size bytes.
-                            unsafe {
-                                buf.set_len(value_size);
-                            }
-                            per_cpu.push(Some(buf));
-                        } else {
-                            per_cpu.push(None);
-                        }
-                    }
-                    _ => per_cpu.push(None),
-                }
+                // A per-CPU value straddling physically discontiguous
+                // vmalloc frames must be read page-by-page; share the
+                // array map's reader, which translates each page via
+                // `translate_any_kva` (direct mapping first, page-table
+                // walk for vmalloc'd percpu) and drops the slot to
+                // `None` on any unmapped page or end-of-DRAM short
+                // read. The single-read path's explicit
+                // `cpu_pa + value_size <= mem.size()` bound is subsumed
+                // by the per-page translate + short-read detection.
+                per_cpu.push(super::read_percpu_value_bytes(ctx, cpu_kva, value_size));
             }
             Some((key_buf, per_cpu))
         },
