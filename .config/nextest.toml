@@ -23,7 +23,7 @@ path = "junit.xml"
 
 [profile.ci]
 slow-timeout = { period = "90s", terminate-after = 3 }
-retries = { backoff = "exponential", count = 30, delay = "1s", jitter = true, max-delay = "3s" }
+retries = { backoff = "exponential", count = 6, delay = "1s", jitter = true, max-delay = "3s" }
 failure-output = "final"
 fail-fast = false
 
@@ -59,10 +59,11 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 # can slip and the run reports no result. The additive boot-budget
 # scaling widens that window in-VM; these retries absorb the residual
 # host-load jitter so a transient slow boot recovers instead of failing
-# the job. Count is bounded (vs the profile's 30) for a faster failure
-# signal on a genuine break — the flake has been observed recovering by
-# attempt 4, so 12 keeps a ~3x margin — and the longer inter-retry
-# delay lets concurrent VM load subside before each retry. Slow-timeout
+# the job. Count is 12, above the profile's 6 base, because this nested
+# boot is more load-sensitive than the rest of the suite: the flake has
+# been observed recovering by attempt 4, so 12 keeps a ~3x margin, and
+# the longer inter-retry delay lets concurrent VM load subside before
+# each retry. Slow-timeout
 # is generous for the nested template-build + scenario boot, especially
 # under the coverage job's llvm-cov instrumentation.
 [[profile.ci.overrides]]
