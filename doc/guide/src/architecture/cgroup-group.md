@@ -41,7 +41,8 @@ removed before their parents (a parent still holding child
 directories would fail with `ENOTEMPTY`).
 
 `ENOENT` is the one errno the drop swallows silently — it indicates
-the directory is already gone (the post-condition cleanup owes), which
+the directory is already gone (the post-condition — no dir — already
+holds, so no cleanup is owed), which
 can legitimately happen via a TOCTOU race between the inner
 `exists()` check and `remove_dir`. Every other error (`EBUSY` from a
 surviving task, `EACCES`, a broken `cgroupfs` mount, etc.) is emitted

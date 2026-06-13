@@ -84,7 +84,9 @@ default (`MonitorThresholds::new()`) is `enforce: false` — monitor
 evaluations record observations but do NOT fail the test on threshold
 violations. Test authors opt in to enforcement by either setting
 `enforce: true` on a custom `MonitorThresholds`, or using
-`MonitorThresholds::with_monitor_defaults()` which flips it. Setting
+`Assert::with_monitor_defaults()` (an Assert-builder method that fills
+unset threshold fields and sets `enforce`, which propagates into the
+produced `MonitorThresholds`). Setting
 fields like `fail_on_stall: true` without flipping `enforce` is a
 no-op for the violation path — every violation will appear in the
 monitor report but the verdict will pass.
@@ -136,7 +138,8 @@ return uninitialized data. Two layers handle this:
 ## BPF map introspection
 
 The monitor module also provides host-side BPF map discovery and
-read/write access via `bpf_map::BpfMapAccessor`. The host reads and
+read/write access via the `GuestMemMapAccessor` (which implements the
+`bpf_map::BpfMapAccessor` trait). The host reads and
 writes guest BPF maps directly through the physical memory mapping
 — no guest cooperation or BPF syscalls are needed.
 
@@ -170,17 +173,19 @@ Three address translation modes are supported:
 - **Vmalloc/vmap**: Page table walk via CR3. For BPF maps, vmalloc'd
   memory, module text (`read_kva_*`, `write_kva_*`).
 
-### BpfMapAccessor
+### GuestMemMapAccessor
 
-`BpfMapAccessor` resolves BTF offsets for BPF map kernel structures
-(`struct bpf_map`, `struct bpf_array`, `struct xa_node`, `struct idr`)
-and provides map discovery and value read/write. It borrows a
-`GuestKernel` for address translation.
+`GuestMemMapAccessor` is the concrete guest-physical-memory accessor:
+it resolves BTF offsets for BPF map kernel structures (`struct bpf_map`,
+`struct bpf_array`, `struct xa_node`, `struct idr`), borrows a
+`GuestKernel` for address translation, and implements the
+`bpf_map::BpfMapAccessor` trait that provides map discovery and value
+read/write.
 
-`BpfMapAccessorOwned` is a convenience wrapper that owns the
-`GuestKernel` internally. Use `BpfMapAccessor::from_guest_kernel`
-when you already have a `GuestKernel`; use `BpfMapAccessorOwned::new`
-when you want a self-contained accessor.
+`GuestMemMapAccessorOwned` is a convenience wrapper that owns the
+`GuestKernel` internally. Use `GuestMemMapAccessor::from_guest_kernel`
+when you already have a `GuestKernel`; use
+`GuestMemMapAccessorOwned::new` when you want a self-contained accessor.
 
 Map discovery walks the kernel's `map_idr` xarray:
 
@@ -206,12 +211,13 @@ a `__percpu` pointer (at the same union offset as `value`). Adding
 `read_percpu_array` returns one `Option<Vec<u8>>` per CPU: `Some`
 when the per-CPU PA falls within guest memory, `None` when it does not.
 
-### Typed field access
+### Program BTF
 
-When a map has BTF metadata (`btf_kva != 0`), `resolve_value_layout`
-reads the guest's `struct btf` and its `data` blob, parses it with
-`btf_rs`, and resolves the value struct's fields. This enables
-`read_field` / `write_field` with type-checked `BpfValue` variants.
+When a map carries program BTF (`btf_kva != 0`), the accessor loads
+the guest's program BTF (`load_program_btf_kva`) so the dump renderer
+can resolve the value struct's field types for rendering. There is no
+typed `read_field` / `write_field` / `BpfValue` API; value access is by
+byte offset (`read_value_*` / `write_value_*`).
 
 ### Usage example
 
@@ -219,7 +225,7 @@ Find a scheduler's `.bss` map and write a crash variable:
 
 ```rust,ignore
 let offsets = BpfMapOffsets::from_vmlinux(vmlinux)?;
-let accessor = BpfMapAccessor::from_guest_kernel(&kernel, &offsets)?;
+let accessor = GuestMemMapAccessor::from_guest_kernel(&kernel, &offsets)?;
 let bss = accessor.find_map(".bss").expect(".bss map not found");
 accessor.write_value_u32(&bss, crash_offset, 1);
 ```
@@ -231,22 +237,16 @@ execution. The test runner waits for the scheduler to load (map
 becomes discoverable), writes the value, then signals the guest via
 SHM to start the scenario.
 
-```rust,ignore
-pub struct BpfMapWrite {
-    pub map_name_suffix: &'static str,  // e.g. ".bss"
-    pub offset: usize,                  // byte offset in the map value
-    pub value: u32,                     // value to write
-}
-```
+`BpfMapWrite::new(map_name_suffix, offset, value)` takes a validated
+map-name suffix (e.g. `".bss"`), a byte offset within the map value
+region, and the `u32` to write. Its fields are crate-private, so it is
+constructed only through this const constructor (which const-asserts
+the suffix format) — direct struct-literal construction is rejected.
 
 Use with `#[ktstr_test]` via the `bpf_map_write` attribute:
 
 ```rust,ignore
-const BPF_CRASH: BpfMapWrite = BpfMapWrite {
-    map_name_suffix: ".bss",
-    offset: 42,
-    value: 1,
-};
+const BPF_CRASH: BpfMapWrite = BpfMapWrite::new(".bss", 42, 1);
 
 #[ktstr_test(bpf_map_write = BPF_CRASH, expect_err = true)]
 fn crash_test(ctx: &Ctx) -> Result<AssertResult> {
@@ -254,7 +254,7 @@ fn crash_test(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-The map is discovered by name suffix via `BpfMapAccessor::find_map`.
+The map is discovered by name suffix via `GuestMemMapAccessor::find_map`.
 Only `BPF_MAP_TYPE_ARRAY` maps are supported. The write targets a
 u32 at the specified byte offset within the map's value region.
 
@@ -281,8 +281,8 @@ from the dump-dispatch path; subsequent dumps in the same VM hit the
 per-VM cache, and a process-wide content-hash cache dedupes across
 VMs that share the same scheduler binary. The analyzer pipeline:
 
-1. The host loads the scheduler binary and locates each `.bpf.o`
-   ELF in the build artifacts.
+1. The host reads the scheduler binary and locates each embedded BPF
+   object ELF in its `.bpf.objs` PROGBITS section.
 2. Each program section is decoded through
    `cast_analysis::BpfInsn::from_le_bytes` into a flat `&[BpfInsn]`
    slab; relocations against `.bss` / `.data` / `.rodata` annotate
@@ -357,7 +357,7 @@ index keeps the first-seen entry. Anonymous types and `Typedef`
 are not indexed (no name to key on, and typedefs add no body —
 the chase peels through them via `peel_modifiers_with_id` before
 consulting the index). The index is threaded through
-`DumpContext::cross_btf` and exposed to the renderer via
+`DumpContext::cross_btf_fwd_index` and exposed to the renderer via
 `MemReader::cross_btf_resolve_fwd`. When `chase_arena_pointer` /
 `render_cast_pointer` peel a chase target through
 `peel_modifiers_resolving_fwd` and the local same-BTF sibling

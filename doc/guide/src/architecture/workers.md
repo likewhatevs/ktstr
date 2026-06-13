@@ -141,24 +141,35 @@ Three fields worth calling out explicitly:
   runs exactly once per outer iteration, so the effective period
   in outer iterations is
   `1024 / gcd(units_per_iter, 1024)`. Default parameters assumed
-  unless noted:
+  unless noted. The buckets below cover the common variants; other
+  composite work types (ThunderingHerd, PriorityInversion,
+  ProducerConsumerImbalance, RtStarvation, AsymmetricWaker, WakeChain,
+  NumaWorkingSetSweep, NumaMigrationChurn, SignalStorm, PreemptStorm,
+  EpollStorm, IdleChurn, CgroupChurn) follow the same
+  `1024 / gcd(units_per_iter, 1024)` rule with their own per-iteration
+  `work_units` contributions:
   - **Every outer iteration (period = 1 iter)**: SpinWait (1024),
     Mixed (1024), Bursty (each outer iter runs `spin_burst(1024)`
     some number of times inside the `burst_ms` loop — always a
     multiple of 1024), PipeIo (`burst_iters`=1024), FutexPingPong
     (`spin_iters`=1024), CachePressure (1024 strided RMW steps),
     CacheYield (1024 strided RMW steps), CachePipe
-    (`burst_iters`=1024), FutexFanOut messenger AND receiver
-    (both call `spin_burst(spin_iters)` before splitting roles;
-    default 1024), AffinityChurn (`spin_iters`=1024), PolicyChurn
-    (`spin_iters`=1024).
+    (`burst_iters`=1024), FutexFanOut receiver
+    (`spin_burst(spin_iters)`, default 1024), AffinityChurn
+    (`spin_iters`=1024), CrossAffinityChurn (`spin_iters`=1024),
+    PolicyChurn (`spin_iters`=1024), AluHot (`ALU_HOT_CHAIN_STEPS`=1024),
+    SmtSiblingSpin (`spin_burst(1024)`), IpcVariance
+    (`period_iters`×(`hot_iters`+`cold_iters`)).
   - **Every 2 iterations**: NiceSweep (`spin_burst(512)` per iter
     → `gcd(512, 1024) = 512`).
   - **Every 4 iterations**: MutexContention
     (`work_iters`=1024 + `hold_iters`=256 = 1280 per acquire+
     release → `gcd(1280, 1024) = 256`, period = 4 iters).
     FanOutCompute messenger (`spin_burst(256)` per wake cycle
-    → same 256-unit gcd).
+    → same 256-unit gcd). FutexFanOut messenger
+    (`spin_burst(spin_iters)`=1024 before the role split +
+    `spin_burst(FAN_OUT_POST_WAKE_SPIN_ITERS)`=256 = 1280 per iter
+    → `gcd(1280, 1024) = 256`).
   - **Every 16 iterations**: PageFaultChurn — one persistent
     `MAP_PRIVATE | MAP_ANONYMOUS` region per worker (default
     4 MiB via `region_kib`=4096), re-faulted each outer
@@ -175,14 +186,16 @@ Three fields worth calling out explicitly:
     them trips a build-time assertion.
   - **Every 64 iterations**: IoSyncWrite (16 4-KiB writes per
     iteration ending in `fdatasync` → `gcd(16, 1024) = 16`).
-    IoRandRead (1 unit/iter via `wrapping_add(1)`) and FanOutCompute
-    worker fall under the 1024-iteration bucket below; IoConvoy
-    increments `work_units` by 2 per iter
-    (`gcd(2, 1024) = 2` → period 512 iters).
+  - **Every 512 iterations**: IoConvoy (`work_units` += 2 per iter
+    → `gcd(2, 1024) = 2`).
   - **Every 1024 iterations**: YieldHeavy (1 unit per yield),
-    ForkExit (1 unit per fork+wait), FanOutCompute worker
-    (`operations`=5 matrix multiplies per wake, one `work_units`
-    tick per multiply → `gcd(5, 1024) = 1`).
+    ForkExit (1 unit per fork+wait), IoRandRead (1 unit/iter via
+    `wrapping_add(1)`), FanOutCompute worker (`operations`=5 matrix
+    multiplies per wake; each `matrix_multiply` folds its C-region
+    accumulator into `work_units` plus a `wrapping_add(1)`, so the
+    per-iter delta is data-dependent — generally >1 rather than a
+    clean 5 — and the worker reaches the 1024 checkpoint at an
+    irregular cadence).
   - **Phase-inherited**: Sequence inherits whichever phase is
     currently active — Spin / Yield / Io / AluHot use the same
     per-unit accounting as the SpinWait / YieldHeavy / IoSyncWrite /

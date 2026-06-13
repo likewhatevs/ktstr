@@ -46,8 +46,8 @@ optional HMAT attributes (`latency_ns`, `bandwidth_mbs`,
 memory-only node.
 
 `NumaDistance` is an NxN inter-node distance matrix. Diagonal entries
-must be 10, off-diagonal > 10, and the matrix must be symmetric (ACPI
-SLIT requirements).
+must be 10 and off-diagonal > 10 (ACPI SLIT requirements); ktstr
+additionally requires the matrix to be symmetric.
 
 Use `Topology::new(numa_nodes, llcs, cores, threads)` for uniform
 topologies, or `Topology::with_nodes(cores, threads, &nodes)` for
@@ -61,14 +61,20 @@ The VMM builds a cpio initramfs containing:
 - Optional scheduler binary (as `/scheduler`)
 - Shared library dependencies (resolved via ELF DT_NEEDED parsing)
 
-The initramfs is cached based on a cache key derived from the binary
-contents. A compressed SHM segment enables COW overlay into guest
-memory, sharing physical pages across concurrent VMs.
+The initramfs is split into a cached base plus a per-run suffix. The
+base cache key is derived from the payload's shared-library set (its
+ELF DT_NEEDED closure plus interpreter) and the content hashes of the
+packed scheduler/probe/worker binaries and include files — not the
+test binary's own bytes, which ride the per-run suffix. So a payload
+recompile that keeps the same library set is a base-cache hit. A
+compressed SHM segment enables COW overlay into guest memory, sharing
+physical pages across concurrent VMs.
 
 ## Guest-host communication
 
-**Serial console** -- COM2 carries guest stdout/stderr, the
-canonical crash diagnostic transport. The guest panic hook writes
+**Serial console** -- COM2 is the canonical crash-diagnostic
+transport (guest stdout/stderr travels over the virtio-console port-1
+bulk stream as `MsgType::Stdout`/`Stderr` frames). The guest panic hook writes
 `PANIC: <info>\n<bt>\n` to COM2; the host parses it via
 `extract_panic_message` and surfaces the backtrace in test failure
 output. The legacy COM2 result / exit-code fallback (delimited
@@ -174,7 +180,7 @@ that built it.
    because each vCPU pays the alloc + TSC-sync cost serially within
    its own thread. See [Performance Mode](../concepts/performance-mode.md).
 3. Build and load initramfs.
-4. Set up serial devices (COM1 for console, COM2 for results).
+4. Set up serial devices (COM1 for kernel console, COM2 for crash diagnostics).
 5. Boot the kernel.
 6. Kernel starts `/init` (the test binary).
 7. PID 1 detected: the guest init path mounts filesystems, starts the
