@@ -66,8 +66,11 @@ dependencies — no manual `.so` lists or `LD_LIBRARY_PATH` hacks.
 `cargo ktstr export` packages a registered test as a self-extracting
 `.run` script that reproduces the scenario on bare metal without
 a VM. The runfile validates host topology and sched_ext support,
-then dispatches the test directly under whatever scheduler is
-already active. Config files declared via `Scheduler::config_file`
+checks that no other sched_ext scheduler is already attached (it
+errors out rather than displacing one), then launches the test's
+bundled scheduler (the binary frozen at registration) and runs the
+scenario under it; non-scheduler (EEVDF) tests run under the kernel
+default. Config files declared via `Scheduler::config_file`
 or `config_content` (paired with `config_file_def`) are packed into
 the archive and the scheduler launch line includes the matching
 `--config`/`{file}` arg, so a layered/lavd-class test reproduces
