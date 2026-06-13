@@ -293,3 +293,24 @@ fn derive_payload_accepts_fully_qualified_check_path() {
         MetricCheck::ExitCodeEq(0),
     ));
 }
+
+/// `#[include_files(...)]` registers the variadic string literals into
+/// the emitted const's `include_files` slice, in declaration order.
+/// Regression: the derive body parsed `include_files` but the
+/// attribute was not in the derive's `attributes(...)` list, so
+/// `#[include_files(...)]` on a `#[derive(Payload)]` struct failed to
+/// compile ("cannot find attribute include_files in this scope") —
+/// this test only compiles because the helper attribute is registered.
+#[derive(ktstr::Payload)]
+#[payload(binary = "bench_with_includes")]
+#[include_files("bench-helper", "config.json")]
+#[allow(dead_code)]
+struct BenchWithIncludesPayload;
+
+#[test]
+fn derive_payload_include_files_registered_in_order() {
+    assert_eq!(
+        BENCH_WITH_INCLUDES.include_files,
+        &["bench-helper", "config.json"],
+    );
+}

@@ -4164,7 +4164,7 @@ fn bool_from_lit_expr(expr: &syn::Expr) -> Option<bool> {
 /// #[metric(name = "jobs.0.read.iops", polarity = HigherBetter, unit = "iops")]
 /// struct FioPayload;
 /// ```
-#[proc_macro_derive(Payload, attributes(payload, default_args, default_check, metric))]
+#[proc_macro_derive(Payload, attributes(payload, default_args, default_check, metric, include_files))]
 pub fn derive_payload(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match derive_payload_inner(input) {
