@@ -17,8 +17,8 @@ fairness, throughput parity, and cpuset isolation.
 
 > **Need a kernel first?** Before any `#[ktstr_test]` can run you
 > need a bootable kernel. Run `cargo ktstr kernel build` to fetch
-> and build the default kernel, or use `--kernel ../linux` to point
-> at a source tree. See
+> and build the default kernel, or point at a source tree with
+> `cargo ktstr test --kernel ../linux`. See
 > [Getting Started: Build a kernel](getting-started.md#build-a-kernel)
 > for the full kernel-management workflow.
 
@@ -314,17 +314,17 @@ longer / heavier runs:
 
 | Attribute | Default | What it does |
 |---|---|---|
-| `duration_s` | `2` | Per-scenario wall-clock seconds. The framework keeps both cgroups running for `duration_s` seconds, then signals workers to stop and collects reports. |
-| `watchdog_timeout_s` | `4` | sched_ext watchdog fire threshold. Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels and the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override logs a `tracing::warn!` and continues without overriding. |
+| `duration_s` | `12` | Per-scenario wall-clock seconds. The framework keeps both cgroups running for `duration_s` seconds, then signals workers to stop and collects reports. |
+| `watchdog_timeout_s` | `5` | sched_ext watchdog fire threshold. Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels and the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override logs a `tracing::warn!` and continues without overriding. |
 | `memory_mib` | `2048` | VM memory in MiB. |
 
 `watchdog_timeout_s` is sched_ext's per-task stall threshold — if
 a runnable task is not picked for `watchdog_timeout_s` seconds,
 the scheduler exits with `SCX_EXIT_ERROR_STALL`. The scenario
-duration and watchdog are independent; a 12 s scenario with a 4 s
+duration and watchdog are independent; a 12 s scenario with a 5 s
 watchdog is normal. Tune the watchdog only when the scheduler
 under test is expected to legitimately leave a runnable task
-parked longer than the default 4 s.
+parked longer than the default 5 s.
 
 For the run we're building, set the duration to 20 s (so each
 phase iteration repeats many times):

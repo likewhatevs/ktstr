@@ -125,7 +125,7 @@ catalog aggregator.)
 - `CpusetSpec` — topology-relative cpuset (LLC-aligned, disjoint, overlapping, range, exact)
 - `HoldSpec` — hold duration (fractional, fixed, or looped)
 - `AffinityIntent` — per-worker affinity (inherit, random subset, LLC-aligned, SMT-sibling-pair, cross-cgroup, single CPU, exact)
-- `SchedPolicy` — Linux scheduling policy (Normal, Batch, Idle, FIFO, RoundRobin, Deadline)
+- `SchedPolicy` — Linux scheduling policy (Normal, Batch, Idle, Fifo, RoundRobin, Deadline)
 - `WorkSpec` — workload definition for a group of workers
 - `Backdrop` — long-lived cgroups, payloads, and ops that span the whole scenario; the framework applies them before any Step runs and tears them down after the last Step completes
 
@@ -177,14 +177,14 @@ readiness gates between host and guest.
 </details>
 
 <details>
-<summary><b>38 work types</b> — configurable workload profiles for different scheduling pressures</summary>
+<summary><b>39 work types</b> — configurable workload profiles for different scheduling pressures</summary>
 
 Workers are `fork()`ed processes placed in cgroups:
 
 - `SpinWait` — tight CPU spin loop
 - `YieldHeavy` — repeated sched_yield with minimal CPU work
 - `Mixed` — CPU spin burst followed by sched_yield
-- `AluHot` — dependent integer multiply chain at high IPC (≥ 2.0)
+- `AluHot` — independent integer multiply chains at high IPC (≥ 2.0)
 - `SmtSiblingSpin` — paired PAUSE-spin pinned across two SMT siblings
 - `IpcVariance` — alternating high-IPC (multiplies) / low-IPC (cache touches) phases
 - `IoSyncWrite` — 16 × 4 KB pwrites + fdatasync per iteration (O_SYNC)
@@ -202,6 +202,7 @@ Workers are `fork()`ed processes placed in cgroups:
 - `ForkExit` — rapid fork+_exit cycling
 - `NiceSweep` — cycle nice level from -20 to 19
 - `AffinityChurn` — rapid self-directed sched_setaffinity
+- `CrossAffinityChurn` — each worker rewrites its cgroup-siblings' affinity via sched_setaffinity (distinct from `AffinityChurn`, which churns the worker's own affinity)
 - `PolicyChurn` — cycle SCHED_OTHER → BATCH → IDLE (→ FIFO/RR with CAP_SYS_NICE)
 - `NumaMigrationChurn` — rotate sched_setaffinity across NUMA nodes
 - `CgroupChurn` — cycle cgroup membership between sibling cgroups
@@ -405,9 +406,9 @@ and [Performance Mode](concepts/performance-mode.md#tier-2-no-perf-mode-with-cpu
 </details>
 
 <details>
-<summary><b>Statistical regression detection</b> — Polars-powered analysis across combinatoric test matrices</summary>
+<summary><b>Statistical regression detection</b> — cross-run analysis across combinatoric test matrices</summary>
 
-[Polars](https://pola.rs)-powered aggregation computes scheduling
+Cross-run aggregation computes scheduling
 metrics across runs. Run-to-run compare with dual-gate
 significance thresholds (absolute and relative) catches regressions
 that single-run assertions miss.
