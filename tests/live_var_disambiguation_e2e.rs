@@ -14,8 +14,9 @@
 //! - **Walker populates `active_map_kvas`.** Post-swap, both
 //!   `bpf_bpf.bss` map instances coexist in the kernel briefly.
 //!   The struct_ops walker (`identify_active_obj_from_struct_ops`)
-//!   finds the LIVE instance via `*scx_root` and records the set of
-//!   map KVAs in `report.active_map_kvas`.
+//!   finds the LIVE instance via the target-free `prog_idr` walk
+//!   (no `scx_root` dependency) and records the set of map KVAs in
+//!   `report.active_map_kvas`.
 //! - **`Snapshot::active()` filters by combined (obj-name + KVA)**.
 //!   The same-binary case — both bss maps named `bpf_bpf.bss` —
 //!   resolves to ONLY the live instance's KVA set.

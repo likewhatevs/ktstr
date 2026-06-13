@@ -184,16 +184,23 @@ pub(crate) fn find_struct_ops_progs(
 /// scheduler's prog satisfies the filter. Two reinforcing reasons:
 ///
 /// 1. Sched_ext is the only struct_ops subsystem ktstr loads.
-/// 2. The kernel enforces single-attach for sched_ext via the
-///    `scx_enable_state() != SCX_DISABLED` gate at
-///    `kernel/sched/ext.c:6621` — at most one sched_ext STRUCT_OPS
-///    prog is in the ENABLED state at any time. Post-`Op::ReplaceScheduler`,
-///    `kill_current_scheduler` waits for `SCX_DISABLED` before the
-///    new scheduler's load proceeds, and the OLD prog's
-///    `bpf_prog_put_deferred` (invoked synchronously from process
-///    context via `__bpf_prog_put`'s fast path at
-///    `kernel/bpf/syscall.c:2420`) removes the OLD prog from
-///    `prog_idr` before the NEW prog is added.
+/// 2. The kernel enforces single-ENABLE for sched_ext: the enable
+///    path rejects a second scheduler while one is already enabled
+///    (pre-6.16: `scx_ops_enable_state() != SCX_OPS_DISABLED` ->
+///    `-EBUSY`; the accessor and states were renamed on later
+///    kernels -- 6.16's `scx_enable_state()`/`SCX_DISABLED`), so at
+///    most one sched_ext STRUCT_OPS prog is ENABLED at a time.
+///    This does NOT by itself guarantee the OLD prog has left
+///    `prog_idr` before the NEW prog is added: a detached struct_ops
+///    prog leaves `prog_idr` only when its owning struct_ops MAP's
+///    last userspace fd closes AND an RCU grace elapses (map free is
+///    RCU-deferred, see `kernel/bpf/bpf_struct_ops.c`), and the
+///    kernel does not serialize old-removal before new-add. The
+///    single-alive-prog property this walker relies on is therefore
+///    ktstr's swap sequencing -- `Op::ReplaceScheduler` kills the
+///    outgoing scheduler and waits for its process to exit (closing
+///    the outgoing map's fds) before loading the next -- not a kernel
+///    ordering invariant.
 ///
 /// If a future setup loads non-sched_ext libbpf-named STRUCT_OPS
 /// progs (e.g. `tcp_congestion_ops`), this filter would need to also
@@ -667,16 +674,23 @@ pub trait BpfProgAccessor {
     /// directly.
     ///
     /// **Uniqueness via ktstr threat model.** This walker returns
-    /// the FIRST match — it does not assert uniqueness. ktstr's guest
+    /// the FIRST match -- it does not assert uniqueness. ktstr's guest
     /// VM is single-tenant (only scx-ktstr runs), and the kernel
-    /// enforces single-attach for sched_ext via the
-    /// `scx_enable_state() != SCX_DISABLED` gate at
-    /// `kernel/sched/ext.c:6621`. So at most one sched_ext STRUCT_OPS
-    /// prog is alive in `prog_idr` at any time, and no other
-    /// struct_ops subsystem (e.g. `tcp_congestion_ops`) ever loads
-    /// in ktstr-managed guests. If a future setup loads non-sched_ext
-    /// libbpf STRUCT_OPS progs, this filter would need to also gate
-    /// on `aux->btf` matching the sched_ext_ops btf type id.
+    /// enforces single-ENABLE for sched_ext: the enable path rejects a
+    /// second scheduler while one is already enabled (pre-6.16:
+    /// `scx_ops_enable_state() != SCX_OPS_DISABLED` -> `-EBUSY`;
+    /// renamed to `scx_enable_state()`/`SCX_DISABLED` on 6.16+), so at
+    /// most one sched_ext prog is ENABLED at a time. That does NOT
+    /// guarantee one prog alive in `prog_idr`: a detached prog lingers
+    /// until its owning struct_ops map's last fd closes and an RCU
+    /// grace elapses, so the single-alive-in-`prog_idr` property this
+    /// walker's FIRST-match relies on rests on ktstr's swap sequencing
+    /// (kill the outgoing scheduler, wait for its process to exit
+    /// before loading the next), not a kernel invariant. No other
+    /// struct_ops subsystem (e.g. `tcp_congestion_ops`) ever loads in
+    /// ktstr-managed guests. If a future setup loads non-sched_ext
+    /// libbpf STRUCT_OPS progs, this filter would need to also gate on
+    /// `aux->btf` matching the sched_ext_ops btf type id.
     ///
     /// Returns `None` when no live STRUCT_OPS prog has global-section
     /// maps (no scheduler attached, or only non-sched_ext struct_ops

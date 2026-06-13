@@ -7428,13 +7428,6 @@ fn synthetic_struct_ops_map(
     }
 }
 
-fn synthetic_sched_state(sched_kva: u64) -> Option<super::super::scx_walker::ScxSchedState> {
-    Some(super::super::scx_walker::ScxSchedState {
-        sched_kva: Some(sched_kva),
-        ..Default::default()
-    })
-}
-
 /// Single libbpf-named struct_ops scenario: struct_ops map name
 /// is `ktstr_ops` (no obj prefix), so the prefix cross-check at
 /// the top of identify_active_obj_from_struct_ops fails; the
@@ -7448,7 +7441,6 @@ fn identify_active_obj_libbpf_named_single_scheduler_via_walker() {
         synthetic_struct_ops_map(struct_ops_map_kva, "ktstr_ops", sched_kva),
         synthetic_global_section_map(0xffff_0000_0000_c000, "ktstr.bss"),
     ];
-    let scx = synthetic_sched_state(sched_kva);
     let map_offsets = super::super::btf_offsets::BpfMapOffsets::EMPTY;
     // Walker returns a realistic used_map_kvas set including the
     // matched struct_ops map and the sibling bss — Phase 2 requires
@@ -7457,8 +7449,7 @@ fn identify_active_obj_libbpf_named_single_scheduler_via_walker() {
     // defense and never reach the cross-check this test exists for.
     let live_kvas = vec![struct_ops_map_kva, 0xffff_0000_0000_c000];
     let accessor = TestProgAccessor::returning_with_kvas("ktstr", live_kvas.clone());
-    let result =
-        super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
+    let result = super::identify_active_obj_from_struct_ops(&maps, Some((&accessor, &map_offsets)));
     assert_eq!(
         result,
         Some(("ktstr".to_string(), live_kvas)),
@@ -7467,9 +7458,10 @@ fn identify_active_obj_libbpf_named_single_scheduler_via_walker() {
     );
 }
 
-/// Two libbpf-named struct_ops scenario: the walker disambiguates
-/// by matching against scx_sched_state.sched_kva so the result
-/// names the active (not staged) scheduler.
+/// Two libbpf-named struct_ops scenario. The target-free walker
+/// returns the live scheduler's obj prefix + used_map_kvas (here the
+/// stubbed `TestProgAccessor` supplies them); the result names the
+/// active (not staged) scheduler.
 #[test]
 fn identify_active_obj_libbpf_named_two_schedulers_picks_active() {
     let active_sched_kva = 0xffff_0000_0000_a000;
@@ -7483,19 +7475,17 @@ fn identify_active_obj_libbpf_named_two_schedulers_picks_active() {
         synthetic_global_section_map(0xffff_0000_0000_c000, "ktstr.bss"),
         synthetic_global_section_map(0xffff_0000_0000_d000, "scx_simple.bss"),
     ];
-    let scx = synthetic_sched_state(active_sched_kva);
     let map_offsets = super::super::btf_offsets::BpfMapOffsets::EMPTY;
     // Walker returns a realistic used_map_kvas including the active
     // struct_ops map and its sibling bss; Phase 2 requires non-empty
     // kvas to publish.
     let live_kvas = vec![active_struct_ops_kva, 0xffff_0000_0000_c000];
     let accessor = TestProgAccessor::returning_with_kvas("ktstr", live_kvas.clone());
-    let result =
-        super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
+    let result = super::identify_active_obj_from_struct_ops(&maps, Some((&accessor, &map_offsets)));
     assert_eq!(
         result,
         Some(("ktstr".to_string(), live_kvas)),
-        "walker disambiguates to the scheduler whose struct_ops map matches sched_kva",
+        "walker resolves the live scheduler's obj prefix + used_map_kvas (not the staged one)",
     );
 }
 
@@ -7511,11 +7501,9 @@ fn identify_active_obj_walker_returns_none_propagates_none() {
         synthetic_struct_ops_map(struct_ops_map_kva, "ktstr_ops", sched_kva),
         synthetic_global_section_map(0xffff_0000_0000_c000, "ktstr.bss"),
     ];
-    let scx = synthetic_sched_state(sched_kva);
     let map_offsets = super::super::btf_offsets::BpfMapOffsets::EMPTY;
     let accessor = TestProgAccessor::none();
-    let result =
-        super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
+    let result = super::identify_active_obj_from_struct_ops(&maps, Some((&accessor, &map_offsets)));
     assert_eq!(
         result, None,
         "walker None propagates — heuristic fallback fires upstream",
@@ -7535,7 +7523,6 @@ fn identify_active_obj_walker_result_validated_against_captured_maps() {
         synthetic_struct_ops_map(struct_ops_map_kva, "ktstr_ops", sched_kva),
         synthetic_global_section_map(0xffff_0000_0000_c000, "ktstr.bss"),
     ];
-    let scx = synthetic_sched_state(sched_kva);
     let map_offsets = super::super::btf_offsets::BpfMapOffsets::EMPTY;
     // Walker returns "garbage" with a non-empty kvas list — no
     // `garbage.bss/.data/.rodata` in captured maps[], so the prefix
@@ -7543,8 +7530,7 @@ fn identify_active_obj_walker_result_validated_against_captured_maps() {
     // the validation rejection (not the unrelated empty-kvas
     // rejection that Phase 2 also enforces).
     let accessor = TestProgAccessor::returning_with_kvas("garbage", vec![struct_ops_map_kva]);
-    let result =
-        super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
+    let result = super::identify_active_obj_from_struct_ops(&maps, Some((&accessor, &map_offsets)));
     assert_eq!(
         result, None,
         "validation must reject walker result not backed by a captured global-section map",
@@ -7567,8 +7553,7 @@ fn identify_active_obj_libbpf_named_without_walker_returns_none() {
         synthetic_struct_ops_map(struct_ops_map_kva, "ktstr_ops", sched_kva),
         synthetic_global_section_map(0xffff_0000_0000_c000, "ktstr.bss"),
     ];
-    let scx = synthetic_sched_state(sched_kva);
-    let result = super::identify_active_obj_from_struct_ops(&maps, &scx, None);
+    let result = super::identify_active_obj_from_struct_ops(&maps, None);
     assert_eq!(
         result, None,
         "libbpf-named struct_ops + walker tuple None must return None — \
@@ -7588,8 +7573,7 @@ fn identify_active_obj_legacy_path_works_without_walker() {
         synthetic_struct_ops_map(0xffff_0000_0000_b000, "ktstr.ops", sched_kva),
         synthetic_global_section_map(0xffff_0000_0000_c000, "ktstr.bss"),
     ];
-    let scx = synthetic_sched_state(sched_kva);
-    let result = super::identify_active_obj_from_struct_ops(&maps, &scx, None);
+    let result = super::identify_active_obj_from_struct_ops(&maps, None);
     assert_eq!(
         result,
         Some(("ktstr".to_string(), Vec::new())),
@@ -7615,14 +7599,12 @@ fn identify_active_obj_walker_with_empty_kvas_falls_back_to_prefix_grouping() {
         synthetic_struct_ops_map(struct_ops_map_kva, "ktstr.ops", sched_kva),
         synthetic_global_section_map(0xffff_0000_0000_c000, "ktstr.bss"),
     ];
-    let scx = synthetic_sched_state(sched_kva);
     let map_offsets = super::super::btf_offsets::BpfMapOffsets::EMPTY;
     // Walker returns "other" with EMPTY kvas — primary path's
     // `!is_empty()` guard rejects, fallback fires and returns the
     // prefix-grouped "ktstr" result.
     let accessor = TestProgAccessor::returning("other");
-    let result =
-        super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
+    let result = super::identify_active_obj_from_struct_ops(&maps, Some((&accessor, &map_offsets)));
     assert_eq!(
         result,
         Some(("ktstr".to_string(), Vec::new())),
@@ -7653,15 +7635,13 @@ fn identify_active_obj_walker_publishes_multi_copy_kvas_for_downstream_filter() 
         synthetic_global_section_map(active_bss_kva, "bpf_bpf.bss"),
         synthetic_global_section_map(stale_bss_kva, "bpf_bpf.bss"),
     ];
-    let scx = synthetic_sched_state(active_sched_kva);
     let map_offsets = super::super::btf_offsets::BpfMapOffsets::EMPTY;
     // Walker returns ONLY the active scheduler's kvas (the OLD
     // prog is gone from prog_idr, so the walker has no way to
     // include the stale bss).
     let live_kvas = vec![active_struct_ops_kva, active_bss_kva];
     let accessor = TestProgAccessor::returning_with_kvas("bpf_bpf", live_kvas.clone());
-    let result =
-        super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
+    let result = super::identify_active_obj_from_struct_ops(&maps, Some((&accessor, &map_offsets)));
     assert_eq!(
         result,
         Some(("bpf_bpf".to_string(), live_kvas)),
@@ -7696,8 +7676,7 @@ fn identify_active_obj_fallback_with_two_distinct_schedulers_returns_first_itera
     // Either scheduler could be the "live" one per scx_sched_state;
     // walker is None so primary-path is skipped. Fallback picks
     // the FIRST struct_ops in maps[] iteration order.
-    let scx = synthetic_sched_state(beta_sched_kva);
-    let result = super::identify_active_obj_from_struct_ops(&maps, &scx, None);
+    let result = super::identify_active_obj_from_struct_ops(&maps, None);
     assert_eq!(
         result,
         Some(("alpha".to_string(), Vec::new())),
@@ -7743,7 +7722,6 @@ fn identify_active_obj_same_binary_swap_falls_through_to_walker_for_kva_disambig
         synthetic_global_section_map(active_data_kva, "bpf_bpf.data"),
         synthetic_global_section_map(old_data_kva, "bpf_bpf.data"),
     ];
-    let scx = synthetic_sched_state(active_sched_kva);
     let map_offsets = super::super::btf_offsets::BpfMapOffsets::EMPTY;
     // Walker resolves the live scheduler via the prog whose
     // used_maps contains active_struct_ops_kva. Synthetic walker
@@ -7752,8 +7730,7 @@ fn identify_active_obj_same_binary_swap_falls_through_to_walker_for_kva_disambig
     // aux->used_maps array).
     let live_kvas = vec![active_struct_ops_kva, active_bss_kva, active_data_kva];
     let accessor = TestProgAccessor::returning_with_kvas("bpf_bpf", live_kvas.clone());
-    let result =
-        super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
+    let result = super::identify_active_obj_from_struct_ops(&maps, Some((&accessor, &map_offsets)));
     assert_eq!(
         result,
         Some(("bpf_bpf".to_string(), live_kvas)),
@@ -7791,8 +7768,7 @@ fn identify_active_obj_same_binary_swap_without_walker_returns_none() {
         synthetic_global_section_map(0xffff_0000_0000_c000, "bpf_bpf.bss"),
         synthetic_global_section_map(0xffff_0000_0000_d000, "bpf_bpf.bss"),
     ];
-    let scx = synthetic_sched_state(active_sched_kva);
-    let result = super::identify_active_obj_from_struct_ops(&maps, &scx, None);
+    let result = super::identify_active_obj_from_struct_ops(&maps, None);
     assert_eq!(
         result, None,
         "ambiguous prefix without walker must NOT short-circuit to \
@@ -7822,12 +7798,10 @@ fn identify_active_obj_ambiguous_data_section_forces_walker() {
         synthetic_global_section_map(live_data_kva, "bpf_bpf.data"),
         synthetic_global_section_map(0xffff_0000_0000_d000, "bpf_bpf.data"),
     ];
-    let scx = synthetic_sched_state(active_sched_kva);
     let map_offsets = super::super::btf_offsets::BpfMapOffsets::EMPTY;
     let live_kvas = vec![active_struct_ops_kva, live_data_kva];
     let accessor = TestProgAccessor::returning_with_kvas("bpf_bpf", live_kvas.clone());
-    let result =
-        super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
+    let result = super::identify_active_obj_from_struct_ops(&maps, Some((&accessor, &map_offsets)));
     assert_eq!(
         result,
         Some(("bpf_bpf".to_string(), live_kvas)),
@@ -7849,12 +7823,10 @@ fn identify_active_obj_ambiguous_rodata_section_forces_walker() {
         synthetic_global_section_map(live_rodata_kva, "bpf_bpf.rodata"),
         synthetic_global_section_map(0xffff_0000_0000_d000, "bpf_bpf.rodata"),
     ];
-    let scx = synthetic_sched_state(active_sched_kva);
     let map_offsets = super::super::btf_offsets::BpfMapOffsets::EMPTY;
     let live_kvas = vec![active_struct_ops_kva, live_rodata_kva];
     let accessor = TestProgAccessor::returning_with_kvas("bpf_bpf", live_kvas.clone());
-    let result =
-        super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
+    let result = super::identify_active_obj_from_struct_ops(&maps, Some((&accessor, &map_offsets)));
     assert_eq!(
         result,
         Some(("bpf_bpf".to_string(), live_kvas)),
@@ -7885,8 +7857,7 @@ fn identify_active_obj_section_counter_rejects_non_canonical_names() {
         // strict equality must not.
         synthetic_global_section_map(0xffff_0000_0000_d000, "ktstr.bss.shared"),
     ];
-    let scx = synthetic_sched_state(sched_kva);
-    let result = super::identify_active_obj_from_struct_ops(&maps, &scx, None);
+    let result = super::identify_active_obj_from_struct_ops(&maps, None);
     assert_eq!(
         result,
         Some(("ktstr".to_string(), Vec::new())),
@@ -7912,12 +7883,10 @@ fn identify_active_obj_walker_used_map_kvas_published_to_caller() {
         synthetic_struct_ops_map(struct_ops_map_kva, "ktstr_ops", sched_kva),
         synthetic_global_section_map(0xffff_0000_0000_c000, "ktstr.bss"),
     ];
-    let scx = synthetic_sched_state(sched_kva);
     let map_offsets = super::super::btf_offsets::BpfMapOffsets::EMPTY;
     let kvas = vec![0xdead_beef_0000_0001, 0xdead_beef_0000_0002];
     let accessor = TestProgAccessor::returning_with_kvas("ktstr", kvas.clone());
-    let result =
-        super::identify_active_obj_from_struct_ops(&maps, &scx, Some((&accessor, &map_offsets)));
+    let result = super::identify_active_obj_from_struct_ops(&maps, Some((&accessor, &map_offsets)));
     assert_eq!(
         result,
         Some(("ktstr".to_string(), kvas)),
