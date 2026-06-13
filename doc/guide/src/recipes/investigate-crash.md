@@ -113,15 +113,23 @@ corpus, opt in with the inline `(?m)` flag (e.g. `(?m)^apply_cell_config$`);
 for `.` to span line breaks, use `(?s)`. Whitespace in the pattern
 is matched byte-for-byte — no trim or normalization.
 
-Empty patterns, invalid regex syntax, and any pattern satisfying
+Through the programmatic builder
+(`Assert::NO_OVERRIDES.expect_scx_bpf_error_matches(...)`), empty
+patterns, invalid regex syntax, and any pattern satisfying
 `is_match("")` all panic at construction. `is_match("")` catches
 two no-op classes with one check: patterns that match every
 position (e.g. `a?`, `.*`, `(?:)`) trivially pass against any
 corpus, and patterns that match only the empty string (e.g. `^$`)
 trivially fail against any non-empty corpus — every real captured
 scheduler-output corpus is non-empty, so both are equally useless
-pins. Bare `\b` (word boundary) slips this gate because the empty
-string contains no word characters; use a substring of the
-expected error text instead of a bare boundary assertion. See the
+pins. Through the `#[ktstr_test(expect_scx_bpf_error_matches = …)]`
+attribute the macro emits the pattern as a plain field (it cannot
+call the validating builder or compile the regex at expand time), so
+an empty / `is_match("")` pattern becomes a SILENT no-op pin and
+invalid syntax surfaces as a test-eval failure rather than a
+construction panic. Bare `\b` (word boundary) slips even the builder
+gate because the empty string contains no word characters; use a
+substring of the expected error text instead of a bare boundary
+assertion. See the
 [`#[ktstr_test]` reference](../writing-tests/ktstr-test-macro.md#checking)
 for the full attribute list.

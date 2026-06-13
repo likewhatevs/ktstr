@@ -155,7 +155,7 @@ one — silent regressions become visible).
 The test author defines a `BpfMapWrite` constant naming the
 scheduler-side `.bss` slot to write, then names it in the
 `bpf_map_write` macro attribute. The scheduler under test must
-expose the slot AND emit a deterministic `scx_bpf_error_str(...)`
+expose the slot AND emit a deterministic `scx_bpf_error(...)`
 when it sees the host-written value:
 
 ```rust,ignore
@@ -164,7 +164,7 @@ use ktstr::prelude::*;
 // User-defined trigger: ".bss" suffix matches the libbpf-named
 // .bss map; offset and value name the slot + payload the host
 // writes after the scheduler loads. The scheduler reads this slot
-// in its error path and calls scx_bpf_error_str(...).
+// in its error path and calls scx_bpf_error(...).
 static BPF_CRASH: BpfMapWrite = BpfMapWrite::new(".bss", 4, 1);
 
 #[ktstr_test(
@@ -180,7 +180,7 @@ fn crash_path_emits_expected_error(ctx: &Ctx) -> Result<AssertResult> {
 
 The host writes the trigger value into the scheduler's `.bss` slot
 after the scheduler loads. The scheduler-side error path reads the
-slot and calls `scx_bpf_error_str(...)` with a message containing
+slot and calls `scx_bpf_error(...)` with a message containing
 the documented substring (`"ktstr: host-triggered crash"` is the
 convention used by the scx-ktstr fixture). The substring contract
 is yours to define for your scheduler — the framework only enforces

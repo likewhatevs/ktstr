@@ -419,8 +419,8 @@ cargo ktstr stats                                          # aggregate gauntlet 
 cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15  # diff sidecar partitions across kernels
 cargo ktstr stats show-host --run <key>                    # print archived HostContext for a run
 cargo ktstr stats list-metrics                             # discover the metric vocabulary in archived sidecars
-cargo ktstr stats list-values <metric>                     # dump every recorded value for one metric
-cargo ktstr stats explain-sidecar <path>                   # print the per-file aggregation explanation for one sidecar
+cargo ktstr stats list-values                              # list distinct values per filterable dimension in the sidecar pool
+cargo ktstr stats explain-sidecar --run <key>              # explain per-field None causes across a run's sidecars
 cargo ktstr show-host                                      # print current host context
 cargo ktstr show-thresholds my_test                        # print resolved Assert thresholds for a test
 cargo ktstr export my_test                                 # write a self-contained .run for bare-metal repro

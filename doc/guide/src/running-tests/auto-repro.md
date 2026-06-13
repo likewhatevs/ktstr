@@ -169,6 +169,7 @@ A demo test in this shape (reduced from
 
 ```rust,ignore
 use ktstr::prelude::*;
+use std::time::Duration;
 
 fn scenario_yield_heavy(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(

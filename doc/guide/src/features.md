@@ -418,8 +418,8 @@ that single-run assertions miss.
 - `worst_gap_ms` — longest scheduling gap
 - `total_migrations` / `worst_migration_ratio` — cross-CPU migration volume
 - `max_imbalance_ratio` — runqueue length imbalance
-- `p99_wake_latency_us` — tail wake-to-run latency
-- `mean_run_delay_us` — mean schedstat run delay
+- `worst_p99_wake_latency_us` — tail wake-to-run latency
+- `worst_mean_run_delay_us` — mean schedstat run delay
 - `total_iterations` — throughput
 
 </details>

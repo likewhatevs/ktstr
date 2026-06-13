@@ -131,7 +131,7 @@ rest of the snapshot still populates.
 | `-o`, `--output PATH` | required | Destination path (convention: `.ctprof.zst`). Existing files are overwritten. |
 
 **`compare`** joins two snapshots on the selected grouping
-axis (`pcomm` by default) and renders a per-metric
+axis (`all` by default) and renders a per-metric
 baseline/candidate/delta table. The join key survives across
 captures taken on different hosts or after process restarts, so
 deltas reflect the behavior of the named workload rather than a
@@ -182,10 +182,11 @@ ktstr ctprof show snapshot.ctprof.zst --sections taskstats-delay
 | `--wrap` | off | Same as `compare`. |
 | `--limit N` | `500` | Same as `compare`. |
 
-**`metric-list`** prints every registered metric (primary +
-derived) with its description, unit, kconfig gate, and
-sched_class scope. Use this to discover the vocabulary
-`--sort-by` and `--metrics` accept.
+**`metric-list`** prints every registered metric in two tables:
+primary metrics with their tags (kconfig gate + sched_class scope)
+and description, and derived metrics with their unit, inputs, and
+description. Use this to discover the vocabulary `--sort-by` and
+`--metrics` accept.
 
 ```sh
 ktstr ctprof metric-list

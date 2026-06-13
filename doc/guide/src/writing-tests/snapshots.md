@@ -78,11 +78,15 @@ for the scope of the scenario — a bare `let _ = bridge.set_thread_local()`
 drops the guard immediately and clears the bridge before any op runs.
 `must_use` will warn if the return value is discarded entirely.
 
-If no bridge is installed, `Op::capture_snapshot` is a no-op with a
-`tracing::warn!` and the scenario continues. If the capture callback
-returns `None` (capture pipeline unavailable), the bridge stays empty
-and the scenario continues. Existing scenarios that never declare
-snapshot ops keep working unchanged.
+If no bridge is installed, `Op::capture_snapshot` fails loudly (per
+the no-silent-drops policy): a guest run issues a host-coordinator
+snapshot request over the SHM/port-1 transport (bailing on a
+transport/host error), and a host-only / test-fixture context with no
+`SnapshotBridge` installed returns an error naming the missing bridge.
+Only a capture callback that returns `None` (capture pipeline
+unavailable) leaves the bridge empty and lets the scenario continue.
+Existing scenarios that never declare snapshot ops keep working
+unchanged.
 
 ## Reading the captured report
 

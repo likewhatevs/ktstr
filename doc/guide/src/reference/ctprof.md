@@ -182,9 +182,10 @@ values.
 
 The top-level `CtprofSnapshot` also embeds a `HostContext`
 (the same structure `show-host` prints — kernel, CPU, memory,
-sched_\* tunables, cmdline). Older tools or synthetic fixtures
-that omit the context render `(host context unavailable)` rather
-than failing the compare.
+sched_\* tunables, cmdline) for round-trip/tooling use. The `compare`
+diff output does not render the embedded host context, so a snapshot
+that omits it is simply absent from the output rather than failing the
+compare.
 
 ### Cgroup namespace caveat
 

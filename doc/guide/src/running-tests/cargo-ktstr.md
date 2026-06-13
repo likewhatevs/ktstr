@@ -1192,14 +1192,16 @@ The compare output renders per-phase tables in addition to the
 scalar findings table. The flags below tune that rendering. They
 are mutually exclusive with each other only where noted —
 `--no-phases` is the global suppress switch and conflicts with
-every other phase flag; the other four compose.
+every other phase flag, and `--steps-only` and `--phase` are also
+mutually exclusive; the remaining pairings among `--phases-only` /
+`--steps-only` / `--phase` / `--phase-threshold` compose.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--no-phases` | off | Suppress the per-phase tables entirely; render only the scalar findings table. Mutually exclusive with every other `--phase…` flag below. |
 | `--phases-only` | off | Render ONLY the per-phase tables; suppress the scalar findings table and the scalar summary footer. The host-context delta still renders. Composes with `--steps-only`, `--phase`, `--phase-threshold`. |
-| `--steps-only` | off | Inside each per-phase table, suppress the BASELINE / CANDIDATE / DELTA / % numeric columns and render only the steps column for that phase. Useful for surveying which phases fired without numerical detail. Composes with `--phase` and `--phase-threshold`. |
-| `--phase N` (repeatable) | every phase | Render only the named phase indices. Repeatable. Indices match the `phase_index` recorded in sidecars. |
+| `--steps-only` | off | Within the per-phase tables, suppress the BASELINE bucket (`step_index` 0) and render only scenario Step buckets. Useful when the BASELINE settle window is dominated by scheduler startup transients. Mutually exclusive with `--phase`; composes with `--phases-only` and `--phase-threshold`. |
+| `--phase N` | every phase | Render only the named phase index (single value, not repeatable). `0` selects BASELINE; `1..=N` select scenario Step ordinals (matched against `step_index`). Mutually exclusive with `--steps-only`. |
 | `--phase-threshold PCT` | inherits `--threshold` | Per-phase significance threshold in percent. Lets per-phase tables use a different threshold from the scalar comparison (e.g. tighter scalar gate but a looser per-phase gate for noisy boundary effects). Inherits the scalar `--threshold` (or registry `default_rel`) when unset. |
 
 ### Prerequisites

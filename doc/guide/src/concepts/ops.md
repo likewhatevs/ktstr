@@ -28,7 +28,7 @@ stay compatible across ktstr version bumps that add new variants:
 | `KillPayload` | SIGKILL the named payload, reap the child, evaluate checks, and record metrics. Same `(name, cgroup)` lookup rules as `WaitPayload`. Mirrors step-teardown drain for an explicitly-targeted payload. |
 | `FreezeCgroup` | Freeze every task in the named cgroup via `cgroup.freeze` (kernel-side asynchronous freeze; not a SIGSTOP). Idempotent for already-frozen cgroups. Pair with `UnfreezeCgroup` to release; teardown auto-unfreezes. See [Snapshots](../writing-tests/snapshots.md) for the observer-cgroup deadlock warning. |
 | `UnfreezeCgroup` | Unfreeze every task in the named cgroup via `cgroup.freeze`. Inverse of `FreezeCgroup`. Idempotent. |
-| `CaptureSnapshot` | Capture a host-side diagnostic snapshot under `name` via the freeze coordinator: pauses every vCPU, reads BPF map state, vCPU registers, and per-CPU counters into a `FailureDumpReport`, then resumes. The report is keyed by `name` on the active `SnapshotBridge`. No active bridge is a no-op with `tracing::warn!`. See [Snapshots](../writing-tests/snapshots.md). |
+| `CaptureSnapshot` | Capture a host-side diagnostic snapshot under `name` via the freeze coordinator: pauses every vCPU, reads BPF map state, vCPU registers, and per-CPU counters into a `FailureDumpReport`, then resumes. The report is keyed by `name` on the active `SnapshotBridge`. With no bridge installed it fails loudly (a guest run issues a host-coordinator snapshot request; a host-only context errors) per the no-silent-drops policy. See [Snapshots](../writing-tests/snapshots.md). |
 | `WatchSnapshot` | Capture a snapshot whenever the guest writes to the named kernel symbol; one fire = one capture tagged with the symbol path. Symbol resolution at op execution time looks the name up by **verbatim vmlinux ELF symbol-table match** — the requested name must appear in the guest kernel's static symbol table exactly as written (no path expansion, no BTF descent). Maximum 3 watch ops per scenario (the KVM hardware-watchpoint plumbing exposes 4 debug slots; slot 0 is reserved for the error-class `exit_kind` trigger, leaving 3 user slots). See [Watch Snapshots](../writing-tests/watch-snapshots.md). |
 | `ReadKernelHot` / `ReadKernelCold` | Read a kernel-memory location (symbol, KVA, per-CPU field, or task field) via the freeze coordinator. `Hot` runs live against the running vCPU; `Cold` requires a freeze rendezvous. See [`KernelTarget`](#kerneltarget--kernelvalue) for the target enum. |
 | `WriteKernelHot` / `WriteKernelCold` | Write a kernel-memory location. Same target shape as the read ops. Cold-path writes are auto-merged when adjacent ops target the same address to amortize freeze cost. |
@@ -318,10 +318,11 @@ setup and a hold period. The primary constructor for steps that
 create cgroups with workers.
 
 **`Step::with_payload(payload, hold)`** -- creates a step that runs
-a single binary-kind `Payload` to completion (or for `hold`). Sets
-up a one-shot `Op::RunPayload` + `Op::WaitPayload` pair and an
-empty `Setup`. Use for inline payload-driven steps without the
-`CgroupDef` ceremony.
+a single binary-kind `Payload` for `hold`. Sets up a single
+`Op::RunPayload` and an empty `Setup`; the payload runs in the
+background for `hold` and is drained at step teardown (no
+`Op::WaitPayload` is emitted, so nothing blocks on the child exiting).
+Use for inline payload-driven steps without the `CgroupDef` ceremony.
 
 **`Step::set_ops(self, ops)`** -- REPLACES the ops on a step
 (builder method). Chain after `with_defs` to add dynamic operations
@@ -411,7 +412,7 @@ Equivalent to `execute_steps(ctx, vec![Step::with_defs(defs, HoldSpec::FULL)])`.
    ops repeat at the specified interval.
 2. Check scheduler liveness between steps.
 3. After all steps: collect worker reports and run checks.
-4. Writes stimulus events to the SHM ring buffer for timeline analysis.
+4. Writes stimulus events over the virtio-console port-1 bulk channel for timeline analysis.
 
 ## execute_steps_with
 

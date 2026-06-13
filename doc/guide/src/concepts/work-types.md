@@ -193,6 +193,7 @@ time via `WorkType::ipc_variance`.
 | Task creation/destruction pressure | `ForkExit` |
 | Priority reweighting / nice dynamics | `NiceSweep` |
 | Rapid CPU migration / affinity churn | `AffinityChurn` |
+| Cross-task (sibling) affinity churn | `CrossAffinityChurn` |
 | Scheduling class transitions | `PolicyChurn` |
 | Page fault / TLB pressure | `PageFaultChurn` |
 | Lock contention / convoy effect | `MutexContention` |
@@ -309,6 +310,12 @@ iteration: `spin_iters` spin burst, `sched_setaffinity` to a random CPU
 from the effective cpuset, then `sched_yield`. Exercises
 `affine_move_task` and `migration_cpu_stop`. Records per-yield wake
 latency.
+
+**`CrossAffinityChurn`** -- like `AffinityChurn`, but each worker
+rewrites its cgroup-SIBLINGS' affinity (not its own) via
+`sched_setaffinity`, then `sched_yield`. Must run in a dedicated
+`CgroupDef` so it only churns its own group's workers; records
+per-yield wake latency.
 
 **`PolicyChurn`** -- cycles through scheduling policies each iteration.
 Each iteration: `spin_iters` spin burst, `sched_setscheduler` to the
@@ -455,14 +462,11 @@ is per-task, not per-tgid.
 
 `WorkType::from_name()` resolves each parameterised variant to a
 default instance via the constants in the `ktstr::workload::defaults`
-module (one `pub const` per variant — `BURSTY`, `PIPE_IO`,
-`FUTEX_PING_PONG`, `CACHE_PRESSURE`, `CACHE_YIELD`, `CACHE_PIPE`,
-`FUTEX_FAN_OUT`, `AFFINITY_CHURN`, `POLICY_CHURN`, `FAN_OUT_COMPUTE`,
-`PAGE_FAULT_CHURN`, `MUTEX_CONTENTION`, `THUNDERING_HERD`,
-`PRIORITY_INVERSION`, `PRODUCER_CONSUMER`, `RT_STARVATION`,
-`ASYMMETRIC_WAKER`, `WAKE_CHAIN`, `NUMA_WORKING_SET_SWEEP`,
-`CGROUP_CHURN`, `SIGNAL_STORM`, `PREEMPT_STORM`, `EPOLL_STORM`,
-`NUMA_MIGRATION_CHURN`, `IDLE_CHURN`, `ALU_HOT`, `IPC_VARIANCE`, …).
+module (one `pub const` per parameter, named `{VARIANT}_{FIELD}` —
+e.g. `BURSTY_BURST_DURATION` + `BURSTY_SLEEP_DURATION`,
+`CACHE_PRESSURE_SIZE_KIB` + `CACHE_PRESSURE_STRIDE`,
+`MUTEX_CONTENTION_CONTENDERS`, and the four `FAN_OUT_COMPUTE_*`
+knobs, …).
 A few representative defaults are shown below; see the
 `defaults` module rustdoc for the authoritative per-variant values.
 
@@ -475,6 +479,7 @@ A few representative defaults are shown below; see the
 - `FutexFanOut`: `fan_out=4`, `spin_iters=1024`
 - `FanOutCompute`: `fan_out=4`, `cache_footprint_kib=256`, `operations=5`, `sleep_usec=100`
 - `AffinityChurn`: `spin_iters=1024`
+- `CrossAffinityChurn`: `spin_iters=1024`
 - `PolicyChurn`: `spin_iters=1024`
 - `PageFaultChurn`: `region_kib=4096`, `touches_per_cycle=256`, `spin_iters=64`
 - `MutexContention`: `contenders=4`, `hold_iters=256`, `work_iters=1024`
@@ -562,7 +567,7 @@ validate at construction time.
 
 ## Overriding work types
 
-The work-type override (gauntlet `--work-type`, exposed as
+The work-type override (gauntlet `--ktstr-work-type=NAME`, exposed as
 `Ctx.work_type_override`) replaces a WorkSpec's work type only when
 that WorkSpec's owning `CgroupDef` is marked `swappable(true)`
 (default false), and only when the override's group size divides

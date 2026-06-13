@@ -98,8 +98,8 @@ generation, and inter-node distance queries. See
 **`sched_pid`** -- scheduler process ID (`Option<libc::pid_t>`) for
 liveness checks. `None` when the test runs without an scx scheduler
 (the EEVDF default path has no userspace scheduler binary). Unwrap
-or `is_some_and(...)` before passing to `process_alive` or
-`kill(Pid::from_raw(pid), None)`.
+or `is_some_and(...)` before passing to a liveness check such as
+`kill(Pid::from_raw(pid), None)` (nix).
 
 **`settle`** -- time to wait after cgroup creation for the scheduler
 to stabilize.

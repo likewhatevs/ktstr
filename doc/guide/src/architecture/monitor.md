@@ -235,7 +235,8 @@ accessor.write_value_u32(&bss, crash_offset, 1);
 `BpfMapWrite` specifies a host-side write to a BPF map during VM
 execution. The test runner waits for the scheduler to load (map
 becomes discoverable), writes the value, then signals the guest via
-SHM to start the scenario.
+the virtio-console RX queue (`SIGNAL_BPF_WRITE_DONE`) to start the
+scenario.
 
 `BpfMapWrite::new(map_name_suffix, offset, value)` takes a validated
 map-name suffix (e.g. `".bss"`), a byte offset within the map value
@@ -479,7 +480,7 @@ The output formatter decodes field values based on their key name:
 - `dsq_id` -> `SCX_DSQ_INVALID`, `SCX_DSQ_GLOBAL`, `SCX_DSQ_LOCAL`, `SCX_DSQ_BYPASS`, `SCX_DSQ_LOCAL_ON|{cpu}`, `BUILTIN({v})`, `DSQ(0x{hex})`
 - `cpumask_0..3` -> coalesced into one `cpus_ptr` field rendered as
   `0x{hex}({cpu-list})` — the masked hex of the cpumask words
-  (low-order word first; multi-word masks join with `_` between
+  (high-order word first; multi-word masks join with `_` between
   64-bit chunks) followed by the run-length-collapsed CPU range
   list (e.g. `0xf(0-3)`, `0x1_00000000000000ff(0-7,64)`)
 - `enq_flags` -> `WAKEUP|HEAD|PREEMPT`

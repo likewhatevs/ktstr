@@ -321,10 +321,12 @@ in their authoritative attribute-table context.
 ## Cgroup parent
 
 `Scheduler.cgroup_parent` specifies a cgroup subtree under
-`/sys/fs/cgroup` for the scheduler to manage. When set, the VM
-init creates the directory before starting the scheduler, and
-`--cell-parent-cgroup <path>` is injected into the scheduler
-args. The field is `Option<CgroupPath>`. `CgroupPath::new()` is
+`/sys/fs/cgroup` for the scheduler to manage. When set, the guest
+init creates the directory (enabling the cpuset/cpu controllers on its
+ancestors) before starting the scheduler. It does NOT pass
+`--cell-parent-cgroup` to the scheduler — a cell-aware scheduler that
+needs the flag must include it explicitly in `sched_args` (or per-test
+`extra_sched_args`). The field is `Option<CgroupPath>`. `CgroupPath::new()` is
 a const constructor that panics at compile time if the path
 does not begin with `/` or is `"/"` alone. The
 `Scheduler::cgroup_parent()` builder and the
@@ -340,16 +342,17 @@ declare_scheduler!(MITOSIS, {
 });
 ```
 
-This creates `/sys/fs/cgroup/ktstr` in the guest and passes
-`--cell-parent-cgroup /ktstr` to the scheduler binary.
+This creates `/sys/fs/cgroup/ktstr` in the guest before the scheduler
+starts. It does not pass `--cell-parent-cgroup /ktstr` to the
+scheduler; add that to `sched_args` if `scx_mitosis` needs the flag.
 
 If the scheduler-def's `sched_args` or a test's `extra_sched_args`
-already contains `--cell-parent-cgroup` (either as
+contains `--cell-parent-cgroup` (either as
 `["--cell-parent-cgroup", "/path"]` or
-`["--cell-parent-cgroup=/path"]`), the framework's auto-inject is
-suppressed so the scheduler binary doesn't reject a duplicate flag.
-The user's value wins, and the guest-side cgroup directory is
-created at the user-specified path.
+`["--cell-parent-cgroup=/path"]`), it flows through to the scheduler
+as-is, and the guest-side init also creates the cgroup directory at
+that path. (The framework never adds its own copy of the flag, so
+there is no duplicate to suppress.)
 
 Supplying `--cell-parent-cgroup` with a value that does not name a
 valid per-test cgroup sub-path is rejected at test setup with a
@@ -367,9 +370,10 @@ sources (the per-test `extra_sched_args` and the scheduler-def
 default `cgroup_parent`. The gate mirrors the const-eval check in
 `CgroupPath::new`, so runtime values share the validation contract
 that compile-time `cgroup_parent = "..."` declarations already
-pass. To opt into the auto-inject path, omit the flag entirely; to
-override, supply an absolute path under `/` with at least one
-segment beyond the root like `"/ktstr"`.
+pass. To let the scheduler manage a cgroup without passing the flag,
+set the scheduler's `cgroup_parent` instead; to pass the flag, supply
+an absolute path under `/` with at least one segment beyond the root
+like `"/ktstr"`.
 
 A bare `--cell-parent-cgroup` with no following value
 (`["--cell-parent-cgroup"]` as the trailing token) is also
@@ -426,8 +430,10 @@ declare_scheduler!(MITOSIS, {
 });
 ```
 
-Merge order: `config_file` injection, then `cgroup_parent`
-injection, then `sched_args`, then per-test `extra_sched_args`.
+Merge order: `config_file` (`--config <path>`) injection, then
+`sched_args`, then per-test `extra_sched_args`. (No
+`--cell-parent-cgroup` is injected; `cgroup_parent` only creates the
+guest cgroup directory.)
 
 ## Default topology
 

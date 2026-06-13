@@ -193,9 +193,11 @@ let ticks: SeriesField<f64> = series.bpf("ticks",
 ticks.rate_within(&mut v, 0.5, 2.0);
 ```
 
+A zero-time delta between adjacent samples records an inconclusive
+detail (zero denominator) naming the offending pair — the rate is
+neither pass nor fail.
+
 Failure modes:
-- A zero-time delta between adjacent samples records a structured
-  detail naming the offending pair.
 - A non-finite rate (NaN / Inf endpoints, or a finite difference
   that overflows f64) records a `non-finite rate` detail rather
   than silently slipping past the band check.
