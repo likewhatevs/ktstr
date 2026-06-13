@@ -25,9 +25,13 @@ ktstr ctprof capture --output baseline.ctprof.zst
 ktstr ctprof capture --output candidate.ctprof.zst
 ```
 
-`capture` walks `/proc` once and writes the snapshot. It is
-read-only — no kprobes, no tracing — so the act of capturing
-does not perturb the measurement. The default capture covers
+`capture` walks `/proc` once and writes the snapshot. The
+scheduling, I/O, and taskstats delay data are read from procfs and
+netlink (genetlink) with no kernel tracing. The jemalloc memory
+counters require a `ptrace(PTRACE_SEIZE)` attach that briefly (a
+handful of ms) stops each probed thread — an observer effect bounded
+per thread; every counter is cumulative-from-birth, so the recorded
+values are unbiased by attach timing. The default capture covers
 every live tgid; on a busy host this is hundreds of threads.
 The snapshot is zstd-compressed JSON, typically a few MB.
 
@@ -47,8 +51,10 @@ ktstr ctprof compare baseline.ctprof.zst candidate.ctprof.zst \
 ```
 
 The `--sort-by total_offcpu_delay_ns:desc` puts the processes
-with the largest absolute off-CPU growth at the top. Each row
-gives `baseline | candidate | delta | %`; large positive deltas
+with the largest absolute off-CPU growth at the top. Each row gives a
+`baseline → candidate` arrow cell, `delta`, `%`, and a `%uptime`
+column (the default `arrow` layout; `--display-format full` splits
+baseline and candidate into separate columns); large positive deltas
 on a process that should not have moved are the suspects.
 
 The `total_offcpu_delay_ns` derivation is:
@@ -139,7 +145,8 @@ per-snapshot tally written into the snapshot itself):
 - `eperm_count > 0` — the capturing process lacked
   `CAP_NET_ADMIN`. Re-run as root, or grant
   `cap_net_admin+eip` via `setcap`.
-- `esrch_count` near `tids_walked` — every tid raced exit
+- `esrch_count` (on `taskstats_summary`) near
+  `parse_summary.tids_walked` — every tid raced exit
   before the per-tid query landed. Lengthen the workload's
   steady-state window and re-capture.
 - `ok_count == 0` AND `eperm_count == 0` — the netlink open

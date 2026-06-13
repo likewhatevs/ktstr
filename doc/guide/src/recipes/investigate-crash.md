@@ -20,8 +20,8 @@ self-dies. It also enables verbose VM console output (equivalent to
 
 ## Reading failure output
 
-A test failure message contains up to eight sections, each present
-only when relevant:
+A test failure message contains several sections, each present only
+when relevant; the most common are:
 
 | Section | Content |
 |---|---|
@@ -30,7 +30,7 @@ only when relevant:
 | `--- diagnostics ---` | Init stage classification, VM exit code, last 20 lines of kernel console. |
 | `--- timeline ---` | Kernel version, topology, scheduler, scenario duration, phase breakdown with monitor samples. |
 | `--- scheduler log ---` | Scheduler process stdout+stderr (cycle-collapsed). |
-| `--- monitor ---` | Host-side monitor: sample count, max imbalance ratio, max local-DSQ depth, sustained-violation flag, SCX event counters (`select_cpu_fallback`, `dispatch_keep_last`, `enq_skip_exiting`, `enq_skip_migration_disabled`), per-sched_domain load-balance rates, per-BPF-program `verified_insns`, and the merged threshold verdict. |
+| `--- monitor ---` | Host-side monitor: sample count, max imbalance ratio, max local-DSQ depth, stuck-CPU flag, average imbalance/nr_running/dsq-per-cpu, SCX event counters (`fallback`, `keep_last`, `offline`, plus conditional extras such as `reenq_immed`, `bypass_*`, `insert_not_owned`, `sub_bypass_dispatch`), optional schedstat deltas, per-BPF-program call count and ns/call, and the merged threshold verdict. |
 | `--- sched_ext dump ---` | `sched_ext_dump` trace lines from the guest kernel. |
 | `--- auto-repro ---` | BPF probe data from a second VM run, plus repro VM duration, scheduler log, sched_ext dump, and dmesg tails. |
 

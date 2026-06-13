@@ -72,12 +72,17 @@ passing vacuously.
 
 Use `expect_err = true` on `#[ktstr_test]` to assert that the test
 fails. The macro wraps the test in a `match` that requires an
-`Err(_)` return: `Ok(_)` panics with "expected error", `Err(_)`
-returns success. Two error classes are treated as SKIP rather than
-FAIL — kernel-unavailable (`/dev/kvm` missing, KVM disabled) and
-resource-contention (host overload, cpuset acquisition failure) —
-so a negative test that can't even boot doesn't pass vacuously.
-Auto-repro is also disabled automatically.
+`Err(_)` return: `Ok(_)` panics with "expected test to fail but it
+passed", `Err(_)` returns success. Two error classes are treated as
+SKIP rather than FAIL — kernel-unavailable (no bootable kernel image
+found: the harness was invoked outside `cargo ktstr test` with
+`KTSTR_TEST_KERNEL` unset) and resource-contention (host overload,
+cpuset acquisition failure) — so a negative test that can't even boot
+doesn't pass vacuously. A missing or disabled `/dev/kvm`
+(`ENOENT`/`EACCES`/`EINVAL` on open) is a HARD failure, not a skip;
+only transient KVM-open pressure (`ENOMEM`/`EBUSY`/`EMFILE`/`ENFILE`/
+`EAGAIN`) skips as resource-contention. Auto-repro is also disabled
+automatically.
 
 ```rust,ignore
 use ktstr::declare_scheduler;
@@ -264,9 +269,9 @@ fn bench_driver_runs_with_declared_helpers(ctx: &Ctx) -> Result<AssertResult> {
     // Both land in the guest initramfs at `/include-files/` and are
     // on the worker's `PATH` during execution. The test body itself
     // does not touch the include set — it runs through `ctx.payload`.
-    // `.run()` returns `(AssertResult, PayloadMetrics)`; the test
-    // body only wants the AssertResult here, so discard the metrics
-    // half of the tuple.
+    // `.run()` returns `Result<(AssertResult, PayloadMetrics)>`; the
+    // test body only wants the AssertResult here, so `.map()` over the
+    // Ok tuple and discard the metrics half.
     ctx.payload(&BENCH_DRIVER)
         .run()
         .map(|(assert_result, _metrics)| assert_result)

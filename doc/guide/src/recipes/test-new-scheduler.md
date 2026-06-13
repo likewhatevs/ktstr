@@ -77,8 +77,9 @@ for version selection and local source builds.
 
 `cargo ktstr test` resolves the kernel from `KTSTR_KERNEL`, the cache,
 or an explicit `--kernel <spec>` (a version like `6.14`, a cache key
-from `cargo ktstr kernel list`, or a path to a kernel source tree or
-prebuilt `bzImage`/`Image`). Step 3 populated the cache with the
+from `cargo ktstr kernel list`, or a path to a kernel source tree).
+`cargo ktstr test` does not accept a prebuilt `bzImage`/`Image` (only
+`cargo ktstr shell` does). Step 3 populated the cache with the
 declared kernels, so the bare form is sufficient when a single kernel
 is available:
 
