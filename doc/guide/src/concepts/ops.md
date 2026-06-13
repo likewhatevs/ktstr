@@ -19,10 +19,9 @@ stay compatible across ktstr version bumps that add new variants:
 | `SetCpuset` | Set a cgroup's cpuset via `CpusetSpec` |
 | `ClearCpuset` | Remove cpuset constraints |
 | `SwapCpusets` | Swap cpusets between two cgroups |
-| `SpawnWorkers` | Fork workers into a cgroup |
+| `Spawn` | Spawn workers with a `SpawnPlacement`: `SpawnPlacement::Cgroup(name)` forks them into a named cgroup; `SpawnPlacement::RunnerCgroup` spawns them in the test runner's own cgroup (typically the guest root, cgid=1). Constructor sugar: `Op::spawn_workers` / `Op::spawn_host`. |
 | `StopCgroup` | Stop a cgroup's workers (see [RemoveCgroup / StopCgroup against Backdrop targets](#removecgroup--stopcgroup-against-backdrop-targets) for the permissive-stop contract) |
 | `SetAffinity` | Set worker affinity via `AffinityIntent` |
-| `SpawnHost` | Spawn workers in the parent cgroup |
 | `MoveAllTasks` | Move all tasks from one cgroup to another |
 | `RunPayload` | Spawn a binary-kind [`Payload`](../writing-tests/scheduler-definitions.md#derive-payload) in the background and track its `PayloadHandle` under the step's payload set. Subsequent `WaitPayload` / `KillPayload` address it by `(payload.name, cgroup)`. Scheduler-kind payloads are rejected at apply time. |
 | `WaitPayload` | Block until the named payload exits naturally, evaluate its checks, and record metrics to the per-test sidecar. Target lookup is by `(name, cgroup)` composite key; `cgroup: None` resolves to the unique live copy. No timeout — pair with a bounded `HoldSpec` or the payload's own `--runtime` for time-boxed runs. |
@@ -33,8 +32,9 @@ stay compatible across ktstr version bumps that add new variants:
 | `WatchSnapshot` | Capture a snapshot whenever the guest writes to the named kernel symbol; one fire = one capture tagged with the symbol path. Symbol resolution at op execution time looks the name up by **verbatim vmlinux ELF symbol-table match** — the requested name must appear in the guest kernel's static symbol table exactly as written (no path expansion, no BTF descent). Maximum 3 watch ops per scenario (the KVM hardware-watchpoint plumbing exposes 4 debug slots; slot 0 is reserved for the error-class `exit_kind` trigger, leaving 3 user slots). See [Watch Snapshots](../writing-tests/watch-snapshots.md). |
 | `ReadKernelHot` / `ReadKernelCold` | Read a kernel-memory location (symbol, KVA, per-CPU field, or task field) via the freeze coordinator. `Hot` runs live against the running vCPU; `Cold` requires a freeze rendezvous. See [`KernelTarget`](#kerneltarget--kernelvalue) for the target enum. |
 | `WriteKernelHot` / `WriteKernelCold` | Write a kernel-memory location. Same target shape as the read ops. Cold-path writes are auto-merged when adjacent ops target the same address to amortize freeze cost. |
-| `TaskField` | Read or write a `struct task_struct` field for a named task via the cold-path freeze rendezvous. Convenience over `KernelTarget::TaskField`. |
 | `AttachScheduler` / `DetachScheduler` / `RestartScheduler` / `ReplaceScheduler` | Manage the live scheduler in the guest mid-scenario. `ReplaceScheduler` swaps to a different staged scheduler binary (declared via the `#[ktstr_test(staged_schedulers = [...])]` attribute). |
+| `PinBpfMap` | Open a BPF map fd by name and hold a refcount for the scenario lifetime (keeps a same-binary-swap window's `.bss` alive across `ReplaceScheduler`) |
+| `CaptureCgroupProcs` | Read a cgroup's `cgroup.procs` (thread-group-leader PIDs) and store them on the active `SnapshotBridge` under a tag |
 
 Op constructors accept string literals directly (no `.into()` needed):
 
@@ -52,9 +52,10 @@ Op::capture_snapshot("after_spawn")
 Op::watch_snapshot("jiffies_64")
 ```
 
-`SpawnHost` creates workers in the parent cgroup, not in a managed
-cgroup. Use this to simulate host-level CPU contention alongside
-managed cgroups.
+`Op::spawn_host` (sugar for `SpawnPlacement::RunnerCgroup`) creates
+workers in the test runner's own cgroup — typically the guest root
+(cgid=1) — not in a managed cgroup. Use this to simulate host-level
+CPU contention alongside managed cgroups.
 
 ### RemoveCgroup / StopCgroup against Backdrop targets
 
@@ -85,23 +86,25 @@ docstring at `Op::MoveAllTasks` for the asymmetric-ownership table.
 
 `OpKind` is a payload-free discriminant enum generated from `Op` via
 `#[strum_discriminants]`. It carries the same variant set as `Op`
-(every variant in the table above — `AddCgroup`, `AddCgroupDef`,
-`RemoveCgroup`, `SetCpuset`, `ClearCpuset`, `SwapCpusets`,
-`SpawnWorkers`, `StopCgroup`, `SetAffinity`, `SpawnHost`,
+(`AddCgroup`, `AddCgroupDef`, `RemoveCgroup`, `SetCpuset`,
+`ClearCpuset`, `SwapCpusets`, `Spawn`, `StopCgroup`, `SetAffinity`,
 `MoveAllTasks`, `RunPayload`, `WaitPayload`, `KillPayload`,
 `FreezeCgroup`, `UnfreezeCgroup`, `CaptureSnapshot`, `WatchSnapshot`,
-`ReadKernelHot`, `ReadKernelCold`, `WriteKernelHot`, `WriteKernelCold`,
-`TaskField`, `AttachScheduler`, `DetachScheduler`, `RestartScheduler`,
-`ReplaceScheduler`) with none of the inner fields, so it is cheap to
-copy and use as a map key. Framework code uses `OpKind` when it
+`WriteKernelHot`, `WriteKernelCold`, `ReadKernelHot`, `ReadKernelCold`,
+`AttachScheduler`, `DetachScheduler`, `RestartScheduler`,
+`ReplaceScheduler`, `PinBpfMap`, `CaptureCgroupProcs`) with none of the
+inner fields, so it is cheap to copy and use as a map key. Framework code uses `OpKind` when it
 only cares WHICH operation ran (per-op statistics, stimulus-event
 tagging, verifier/monitor bookkeeping) without the payload. Test
 authors rarely spell `OpKind` directly — the `strum::EnumIter`
 derive also lets tooling enumerate every `OpKind` variant for
 coverage checks.
 
-`OpKind` shares `Op`'s `#[non_exhaustive]` attribute: external
-pattern matches over `OpKind` must end with `..`.
+`OpKind` is NOT `#[non_exhaustive]` — `strum_discriminants` does not
+propagate `Op`'s `#[non_exhaustive]` to the generated discriminant
+enum, so exhaustive matches over `OpKind` compile. Adding a new `Op`
+variant requires updating any local exhaustive `OpKind` match (e.g.
+`OpKind::bit_index`).
 
 ## CpusetSpec
 
@@ -255,24 +258,19 @@ node 0 fails at setup time. Policies without a node set (`Default`,
 
 ### WorkSpec type overrides and swappable
 
-`CgroupDef` has a `swappable` flag (default: `false`). When `true`
-and a work type override is active (`Ctx.work_type_override`), the
-override replaces this def's work type.
+`CgroupDef` has a `swappable` flag (default: `false`). The gauntlet
+work-type override (`Ctx.work_type_override`) is applied only to a
+`CgroupDef` marked `.swappable(true)`. When active, it replaces the
+def's work type with the override — any base type, not just
+`SpinWait` — and is skipped when the override is a grouped work type
+whose group size does not divide the resolved worker count
+(`resolve_work_type` in `src/workload/config/mod.rs`). There is no
+`SpinWait`-specific override path.
 
-In contrast, the `Scenario`-level override (in `run_scenario()`) only
-replaces `SpinWait` work types. The two mechanisms serve different
-scopes:
-
-- **Scenario-level**: replaces `SpinWait` in `WorkSpec.work_type`
-- **CgroupDef-level**: replaces the work type when `swappable = true`
-
-Both skip overrides to grouped work types when `num_workers` is not
-divisible by the work type's group size.
-
-WorkSpec type overrides apply only to `CgroupDef` setup, not to raw
-`Op::SpawnWorkers`. `Op::SpawnWorkers` always uses the work type as
-given. Use `CgroupDef` with `.swappable(true)` when the work type
-should participate in gauntlet overrides.
+Work-type overrides apply only to `CgroupDef`-based setup. `Op::Spawn`
+(and its sugar `Op::spawn_workers` / `Op::spawn_host`) always uses the
+work type as given. Use `CgroupDef` with `.swappable(true)` when the
+work type should participate in gauntlet overrides.
 
 ## Step
 

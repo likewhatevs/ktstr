@@ -68,8 +68,7 @@ executor entry points (all in the prelude):
   `execute_scenario_with(ctx, Backdrop, Vec<Step>, Option<&Assert>)`
   — full composition. Use when a `Backdrop` (long-lived cgroups,
   persistent payloads, kernel-write seeds) must coexist with
-  per-step ops; see the [Backdrop](../writing-tests/custom-scenarios.md)
-  guide.
+  per-step ops; see the [Backdrop](ops.md) guide.
 
 Custom scenarios receive a `Ctx` reference; see
 [Custom Scenarios](../writing-tests/custom-scenarios.md) for the

@@ -36,8 +36,8 @@ are local to the CPUs executing vCPU threads, avoiding cross-node
 memory access latency. `MPOL_BIND` is strict: the kernel allocator
 does not fall back to non-mask nodes when the bound nodes are
 exhausted, failing the allocation with `-ENOMEM` instead (see
-`do_mbind` at `mm/mempolicy.c:1480` for the policy entry point and
-`policy_nodemask` at `mm/mempolicy.c:2263` for the allocator-side
+`do_mbind` at `mm/mempolicy.c` for the policy entry point and
+`policy_nodemask` at `mm/mempolicy.c` for the allocator-side
 mask restriction). Contrast `MPOL_PREFERRED`, which expresses a
 preference but falls back silently — undocumented locality drift
 would defeat the noise-reduction purpose, so `MPOL_BIND` is the
@@ -94,9 +94,9 @@ haltpoll cpuidle driver (enabled by KVM_HINTS_REALTIME above)
 handles polling inside the guest and writes `MSR_KVM_POLL_CONTROL=0`
 to disable host-side polling via `kvm_arch_no_poll()`.
 Non-performance-mode VMs set `KVM_CAP_HALT_POLL` to 200µs (matching
-the x86 kernel default `KVM_HALT_POLL_NS_DEFAULT` at
-`arch/x86/include/asm/kvm_host.h:73`; aarch64's kernel default is
-500µs at `arch/arm64/include/asm/kvm_host.h:34`), or 0 when vCPUs
+the x86 kernel default `KVM_HALT_POLL_NS_DEFAULT` in
+`arch/x86/include/asm/kvm_host.h`; aarch64's kernel default is
+500µs in `arch/arm64/include/asm/kvm_host.h`), or 0 when vCPUs
 exceed host CPUs.
 
 ## Prerequisites
@@ -141,7 +141,7 @@ levels of checks:
 - Insufficient free hugepages -- regular page allocation is used.
 - Host load is high -- `procs_running` from `/proc/stat` exceeds
   half the vCPU count, results may be noisy. `procs_running` is
-  `nr_running()` summed across online CPUs (`kernel/sched/core.c:5302`),
+  `nr_running()` summed across online CPUs (`kernel/sched/core.c`),
   i.e. the total count of runnable tasks system-wide including
   currently-running ones. (No-perf-mode VMs use the
   [Resource Budget](resource-budget.md) `CpuCap` mechanism instead
@@ -175,7 +175,7 @@ Via the builder API:
 let vm = vmm::KtstrVm::builder()
     .kernel(&kernel_path)
     .init_binary(&ktstr_binary)
-    .topology(1, 2, 4, 2)
+    .topology(Topology::new(1, 2, 4, 2))
     .memory_mib(4096)
     .performance_mode(true)
     .build()?
@@ -246,7 +246,7 @@ via `#[ktstr_test(performance_mode = true)]`). Acquires `LOCK_EX`
 on each selected LLC's `/tmp/ktstr-llc-{N}.lock` — the LLC-level
 exclusive lock already covers every CPU in the group, so per-CPU
 `/tmp/ktstr-cpu-{C}.lock` files are NOT touched
-(`try_acquire_all` in `vmm/host_topology.rs` short-circuits the
+(`try_acquire_all` in `vmm/host_topology/mod.rs` short-circuits the
 per-CPU loop when `LlcLockMode == Exclusive`). Applies every
 isolation feature listed under "What it does": vCPU pinning via
 `sched_setaffinity`, 2 MB hugepages, NUMA mbind, RT `SCHED_FIFO`
@@ -306,7 +306,7 @@ Selected when neither `performance_mode=true` nor
 `--no-perf-mode`/`KTSTR_NO_PERF_MODE` is set — the default path
 for `#[ktstr_test]` entries that don't declare `performance_mode`
 (entry.rs `KtstrTestEntry::DEFAULT` sets `performance_mode:
-false`). `acquire_cpu_locks` (in `vmm/host_topology.rs`) walks a
+false`). `acquire_cpu_locks` (in `vmm/host_topology/mod.rs`) walks a
 contiguous CPU window, takes `LOCK_EX` on each window CPU's
 `/tmp/ktstr-cpu-{C}.lock`, then additionally takes `LOCK_SH` on
 the LLC lockfiles covering those CPUs so a perf-mode (tier 1)
@@ -333,7 +333,7 @@ relative to tier 1 are:
   exclusive holder blocks every shared acquirer and vice-versa.
 - **Per-CPU flocks** — tier 1 relies on LLC-level `LOCK_EX` for
   exclusivity; per-CPU `/tmp/ktstr-cpu-{C}.lock` files are skipped
-  (`try_acquire_all` in `vmm/host_topology.rs` short-circuits the
+  (`try_acquire_all` in `vmm/host_topology/mod.rs` short-circuits the
   per-CPU loop when `LlcLockMode == Exclusive` because the LLC
   lock already covers every CPU in the group). Tier 2 also skips
   them — the cgroup cpuset is the enforcement layer.

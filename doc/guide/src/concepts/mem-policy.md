@@ -117,8 +117,12 @@ policy. Returns the node set for `Bind`, `Interleave`,
 Page locality and migration results from workers using `MemPolicy` are
 checked by the [NUMA checking
 assertions](checking.md#numa-checks). The expected node set for
-locality checks is derived from the worker's `MemPolicy` at evaluation
-time.
+locality checks is derived from the cgroup's cpuset (via
+`TestTopology::numa_nodes_for_cpuset`) at evaluation time, not from the
+worker's `MemPolicy`. In the common case where memory is bound to the
+same node(s) the cpuset pins, the two coincide; a policy bound outside
+the cpuset (e.g. via `MpolFlags::STATIC_NODES`) is still checked
+against the cpuset's nodes.
 
 ## Example: NUMA-aware test
 
