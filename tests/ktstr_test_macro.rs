@@ -18,7 +18,11 @@ const MACRO_TEST_DISK: DiskConfig = DiskConfig::DEFAULT.with_name("macro-test");
 ///
 /// The generated `#[test]` wrapper calls `run_ktstr_test`, which requires
 /// KVM and a kernel image — it errors if either is unavailable.
-#[ktstr_test(llcs = 1, cores = 2, threads = 1, memory_mib = 2048)]
+/// `#[ignore]`d: the macro-compile + linkme registration is asserted
+/// VM-free by `find_registered_tests` / `entry_fields_match_attrs`; the
+/// guest `total_cpus` check is covered by `topology_matches_vm_spec`, so
+/// the VM boot adds no unique coverage.
+#[ktstr_test(llcs = 1, cores = 2, threads = 1, memory_mib = 2048, ignore = true)]
 fn basic_topology_check(ctx: &Ctx) -> Result<AssertResult> {
     let total = ctx.topo.total_cpus();
     if total == 0 {
@@ -875,14 +879,15 @@ ktstr::declare_scheduler!(CFG_PAIRING_SCHED, {
 /// Inline-literal form: `config = "..."` lands as `Some("...")` in the
 /// emitted entry's `config_content` field, paired with a scheduler that
 /// declares `config_file_def`. Fixture registers an entry that
-/// `entry_config_literal_propagates` looks up via `find_test`; the
-/// fixture body itself is never invoked because there's no test runner
-/// that selects it by name in this file's #[test] set. Omitting
-/// `host_only = true` here keeps the entry compile-time-clean against
-/// the macro's host_only-scheduler mutex check.
+/// `entry_config_literal_propagates` looks up via `find_test`. It is
+/// `#[ignore]`d: the generated #[test] wrapper would boot a VM, but the
+/// value here is the compile + entry-wiring (asserted VM-free by that
+/// #[test]), not a VM run. Omitting `host_only = true` keeps the entry
+/// compile-time-clean against the macro's host_only-scheduler mutex check.
 #[ktstr_test(
     scheduler = CFG_PAIRING_SCHED,
     config = "{\"layers\":[]}",
+    ignore = true,
 )]
 fn config_literal_compiles(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;
@@ -895,9 +900,13 @@ fn config_literal_compiles(ctx: &Ctx) -> Result<AssertResult> {
 /// flow through the parser arm.
 const PATH_CONFIG: &str = "{\"path\":true}";
 
+/// `#[ignore]`d: compile + entry-wiring only (asserted VM-free by
+/// `entry_config_path_propagates`); the generated wrapper's VM boot is
+/// skipped overhead.
 #[ktstr_test(
     scheduler = CFG_PAIRING_SCHED,
     config = PATH_CONFIG,
+    ignore = true,
 )]
 fn config_path_compiles(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;

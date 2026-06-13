@@ -1715,7 +1715,7 @@ impl KtstrVm {
         const INIT_KILL: &str = "Attempted to kill init";
         // The echoed line is attacker-influenced guest console output:
         // `lines()` splits on '\n', so a newline-free line can run up to
-        // the console's OUTPUT_CAP_BYTES (16 MiB) cap. Bound it so a
+        // the console's OUTPUT_CAP_BYTES (4 MiB) cap. Bound it so a
         // pathological guest cannot bloat the error string to megabytes;
         // the marker sits near the line start, so the head is the
         // informative part. char-boundary-safe (no byte slicing).

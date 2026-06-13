@@ -103,6 +103,17 @@ pub struct Serial {
     /// console is COM1 (the default cmdline); a test that reroutes it (e.g.
     /// `console=hvc0` to the virtio-console) would bypass the latch.
     panic_latch: Option<String>,
+    /// Captured-output cap in bytes. Initialized to
+    /// [`OUTPUT_CAP_BYTES`] by every constructor; a test-only
+    /// constructor (`new_with_cap`) overrides it so the
+    /// cap/trim logic can be exercised at KiB scale without filling
+    /// the production 4 MiB cap one byte at a time. Read by
+    /// [`Self::enforce_output_cap`].
+    output_cap_bytes: usize,
+    /// Trim target in bytes -- the writer is drained back to this
+    /// length when it exceeds [`Self::output_cap_bytes`].
+    /// Initialized to [`OUTPUT_TRIM_TARGET`] by every constructor.
+    output_trim_target: usize,
 }
 
 impl Default for Serial {
@@ -127,7 +138,25 @@ impl Serial {
             data_evt: None,
             contains_cursor: None,
             panic_latch: None,
+            output_cap_bytes: OUTPUT_CAP_BYTES,
+            output_trim_target: OUTPUT_TRIM_TARGET,
         }
+    }
+
+    /// Test-only constructor with an overridable output cap + trim
+    /// target, so the cap/trim/cursor logic can be validated at KiB
+    /// scale instead of filling the production [`OUTPUT_CAP_BYTES`]
+    /// (4 MiB) one byte per `handle_out`. The cap math is
+    /// threshold-independent (relative drain to `trim_target`), so a
+    /// small cap exercises the identical code path. `cap > trim` must
+    /// hold (the same invariant the prod consts satisfy).
+    #[cfg(test)]
+    fn new_with_cap(base: u16, cap: usize, trim: usize) -> Self {
+        debug_assert!(cap > trim, "cap must exceed trim target");
+        let mut s = Self::new(base);
+        s.output_cap_bytes = cap;
+        s.output_trim_target = trim;
+        s
     }
 
     /// Install (or replace) the captured-output notifier. The returned
@@ -195,18 +224,20 @@ impl Serial {
     /// `OUTPUT_CAP_BYTES - OUTPUT_TRIM_TARGET` bytes of overflow.
     #[inline]
     fn enforce_output_cap(&mut self) {
+        let cap = self.output_cap_bytes;
+        let target = self.output_trim_target;
         let writer = self.inner.writer_mut();
         let len = writer.len();
-        if len <= OUTPUT_CAP_BYTES {
+        if len <= cap {
             return;
         }
-        let drop_count = len - OUTPUT_TRIM_TARGET;
+        let drop_count = len - target;
         writer.drain(0..drop_count);
         self.contains_cursor = None;
         tracing::debug!(
             base = self.base,
-            cap = OUTPUT_CAP_BYTES,
-            target = OUTPUT_TRIM_TARGET,
+            cap = cap,
+            target = target,
             dropped = drop_count,
             "captured-output buffer exceeded cap; oldest bytes dropped",
         );
@@ -1153,53 +1184,48 @@ mod tests {
         assert!(s.output_contains(b"MARKER"));
     }
 
-    /// Writer length must stay bounded by `OUTPUT_CAP_BYTES` no matter
+    /// Writer length must stay bounded by its cap no matter
     /// how many bytes the guest pushes. Drives `handle_out` past the
     /// cap and asserts the post-write length never exceeds the cap.
     /// Pre-fix, the inner `Vec<u8>` would grow to the full byte count
-    /// the test loop wrote — a hostile guest in production would push
+    /// the test loop wrote -- a hostile guest in production would push
     /// the host into OOM.
     #[test]
     fn output_cap_bounds_writer_length() {
-        let mut s = Serial::default();
+        // Small cap (4:3 ratio mirrors the prod 4MiB:3MiB) so the
+        // threshold-independent trim logic is exercised in ~6K writes
+        // instead of filling the 4 MiB prod cap one byte at a time.
+        const CAP: usize = 4096;
+        const TRIM: usize = 3072;
+        let mut s = Serial::new_with_cap(COM1_BASE, CAP, TRIM);
         // Push enough bytes to trigger several drain cycles. Crossing
         // the cap twice exercises the case where the trimmed writer
         // grows back up to the cap and trims again. Each handle_out
         // call writes a single DATA byte through the THR path.
-        let total = OUTPUT_CAP_BYTES + 2 * (OUTPUT_CAP_BYTES - OUTPUT_TRIM_TARGET);
-        // Sample the writer length on a coarse interval to keep the
-        // test fast while still pinning the post-condition. The cap
-        // enforcement runs on every write, so any growth past the cap
-        // would only be visible immediately after the offending write
-        // — but `Vec::drain(0..N)` is O(N), so a missing trim would
-        // leave the writer permanently above the cap.
-        let sample_every = 1024;
+        let total = CAP + 2 * (CAP - TRIM);
         for i in 0..total {
             assert!(s.handle_out(COM1_BASE, b"x"));
-            if i % sample_every == 0 {
-                assert!(
-                    s.inner.writer().len() <= OUTPUT_CAP_BYTES,
-                    "writer must never exceed OUTPUT_CAP_BYTES; got {} at iter {}",
-                    s.inner.writer().len(),
-                    i,
-                );
-            }
+            assert!(
+                s.inner.writer().len() <= CAP,
+                "writer must never exceed cap; got {} at iter {}",
+                s.inner.writer().len(),
+                i,
+            );
         }
-        // After the burst, the writer is between OUTPUT_TRIM_TARGET and
-        // OUTPUT_CAP_BYTES — the most recent trim left exactly
-        // OUTPUT_TRIM_TARGET bytes, then we wrote some more.
+        // After the burst, the writer is between TRIM and CAP -- the
+        // most recent trim left exactly TRIM bytes, then we wrote more.
         let final_len = s.inner.writer().len();
         assert!(
-            final_len >= OUTPUT_TRIM_TARGET,
+            final_len >= TRIM,
             "final length {} below trim target {}",
             final_len,
-            OUTPUT_TRIM_TARGET,
+            TRIM,
         );
         assert!(
-            final_len <= OUTPUT_CAP_BYTES,
+            final_len <= CAP,
             "final length {} above cap {}",
             final_len,
-            OUTPUT_CAP_BYTES,
+            CAP,
         );
     }
 
@@ -1210,31 +1236,33 @@ mod tests {
     /// must remain.
     #[test]
     fn output_cap_drops_oldest_bytes() {
-        let mut s = Serial::default();
-        // Head marker — write OUTPUT_CAP_BYTES - OUTPUT_TRIM_TARGET
-        // bytes of "H" so a single drain will remove all of them.
-        let head_count = OUTPUT_CAP_BYTES - OUTPUT_TRIM_TARGET;
+        const CAP: usize = 4096;
+        const TRIM: usize = 3072;
+        let mut s = Serial::new_with_cap(COM1_BASE, CAP, TRIM);
+        // Head marker -- write CAP - TRIM bytes of "H" so a single
+        // drain will remove all of them.
+        let head_count = CAP - TRIM;
         for _ in 0..head_count {
             assert!(s.handle_out(COM1_BASE, b"H"));
         }
-        // Body filler — write OUTPUT_TRIM_TARGET bytes of "B" so the
-        // writer is exactly at OUTPUT_CAP_BYTES afterwards.
-        for _ in 0..OUTPUT_TRIM_TARGET {
+        // Body filler -- write TRIM bytes of "B" so the writer is
+        // exactly at CAP afterwards.
+        for _ in 0..TRIM {
             assert!(s.handle_out(COM1_BASE, b"B"));
         }
         assert_eq!(
             s.inner.writer().len(),
-            OUTPUT_CAP_BYTES,
+            CAP,
             "writer should be exactly at the cap before the trigger byte",
         );
-        // One more byte triggers the trim. After the trim,
-        // OUTPUT_TRIM_TARGET - 1 of the "B"s have been drained off the
-        // front along with all "H"s; the remaining buffer is the tail
-        // of "B"s plus the trigger byte.
+        // One more byte triggers the trim: len is now CAP+1, so the
+        // drain removes len-TRIM bytes off the front -- all the "H"s
+        // plus one "B" -- leaving TRIM bytes: the tail of "B"s plus
+        // the trigger byte.
         assert!(s.handle_out(COM1_BASE, b"T"));
         let writer = s.inner.writer();
         assert!(
-            writer.len() <= OUTPUT_CAP_BYTES,
+            writer.len() <= CAP,
             "post-trim length must be bounded by cap",
         );
         assert!(
@@ -1256,7 +1284,9 @@ mod tests {
     /// could miss a needle that lives in the retained tail.
     #[test]
     fn output_cap_invalidates_contains_cursor() {
-        let mut s = Serial::default();
+        const CAP: usize = 4096;
+        const TRIM: usize = 3072;
+        let mut s = Serial::new_with_cap(COM1_BASE, CAP, TRIM);
         // Prime the cursor with a miss so it caches scanned_len.
         for c in b"prelude " {
             s.handle_out(COM1_BASE, &[*c]);
@@ -1271,7 +1301,7 @@ mod tests {
         // trim, the writer's leading bytes are different content but
         // the same absolute offsets, so the stale cursor would skip
         // the wrong region. Cap enforcement clears the cursor.
-        let total = OUTPUT_CAP_BYTES + (OUTPUT_CAP_BYTES - OUTPUT_TRIM_TARGET);
+        let total = CAP + (CAP - TRIM);
         for _ in 0..total {
             assert!(s.handle_out(COM1_BASE, b"x"));
         }
@@ -1318,18 +1348,16 @@ mod tests {
     fn panic_latch_survives_output_cap_trim() {
         // Cap-immunity (the load-bearing claim): the latch is set at
         // ingest BEFORE enforce_output_cap, so a panic that later scrolls
-        // past the OUTPUT_CAP_BYTES window is still recoverable even after
+        // past the cap window is still recoverable even after
         // the writer trims the panic bytes away.
-        let mut s = Serial::default();
+        let mut s = Serial::new_with_cap(COM1_BASE, 4096, 3072);
         for &b in b"Kernel panic - not syncing: early oops\n" {
             assert!(s.handle_out(COM1_BASE, &[b]));
         }
-        // Grow the writer past the cap (bulk — handle_out is 1-byte/call)
+        // Grow the writer past the cap (bulk -- handle_out is 1-byte/call)
         // then trim; the trim drops the OLDEST bytes (the panic line at
         // the front), proving the writer no longer holds it.
-        s.inner
-            .writer_mut()
-            .extend(std::iter::repeat_n(b'.', OUTPUT_CAP_BYTES + 1));
+        s.inner.writer_mut().extend(std::iter::repeat_n(b'.', 4097));
         s.enforce_output_cap();
         assert!(
             !s.output().contains("Kernel panic"),

@@ -142,7 +142,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::sync::MutexExt;
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 /// Top-level serialized artifact produced by `ktstr ctprof`.
 ///
@@ -3549,9 +3549,7 @@ fn capture_pid_with(
 /// [`CtprofSnapshot::write`] so CLI code can stay a single
 /// call.
 pub fn capture_to(path: &Path) -> Result<()> {
-    let snap = capture();
-    snap.write(path)
-        .with_context(|| format!("write ctprof snapshot to {}", path.display()))
+    capture().write(path)
 }
 
 // Test modules — alphabetized.
