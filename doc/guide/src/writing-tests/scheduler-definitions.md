@@ -83,13 +83,14 @@ declare_scheduler!(RT_TUNED, {
 });
 ```
 
-The framework applies each `Sysctl` in declaration order at
-scenario start and reverts to the pre-test value at scenario
-teardown.
+The framework injects each `Sysctl` into the guest kernel command
+line as `sysctl.<key>=<value>` in declaration order; the kernel
+applies them at boot. Each test boots a fresh VM, so there is no
+separate per-scenario apply/revert step.
 
 `kargs` is the extra GUEST KERNEL command-line (not the scheduler
 binary's CLI — use `sched_args` for that). Do not override the
-kargs ktstr injects itself (`console=`, `loglevel=`, `init=`):
+kargs ktstr injects itself (`console=`, `loglevel=`, `rdinit=`):
 those break guest-side init and leave the VM unable to run tests.
 
 `kernels` is the **per-scheduler filter** on the
@@ -288,8 +289,9 @@ const MITOSIS: Scheduler = Scheduler::named("scx_mitosis")
 ```
 
 The common discover-by-name case has sugar:
-`Scheduler::named("foo").binary_discover()` is shorthand for
-`Scheduler::named("foo").binary(SchedulerSpec::Discover("foo"))`.
+`Scheduler::named("foo").binary_discover("scx_foo")` is shorthand for
+`Scheduler::named("foo").binary(SchedulerSpec::Discover("scx_foo"))`
+(the argument is the binary name to discover, not the scheduler name).
 
 A manually-defined `Scheduler` is not registered in
 `KTSTR_SCHEDULERS` automatically; the verifier sweep does not

@@ -111,9 +111,11 @@ let nr_cpus = snap.var("nr_cpus_onln").as_u64()?;
 `Snapshot::var(name)` walks every `*.bss`, `*.data`, and `*.rodata`
 global-section map for a top-level member named `name` and returns
 the unique match as a [`SnapshotField`](#terminal-accessors).
-Multiple matches yield
+Multiple matches first trigger an automatic active-scheduler
+resolution; only when that cannot narrow to a single live scheduler
+copy does `var` yield
 `SnapshotError::AmbiguousVar { requested, found_in }` —
-disambiguate via `Snapshot::map(name)`. A miss yields
+disambiguate explicitly via `Snapshot::map(name)`. A miss yields
 `SnapshotError::VarNotFound { requested, available }` with the
 union of every section's top-level member names.
 
@@ -213,7 +215,7 @@ The dotted-path walker:
 
 Type mismatches surface as `SnapshotError::TypeMismatch { expected,
 actual, requested }` — for example, `as_str()` on a `Uint` reports
-`expected: "Enum"`, `actual: "Uint"`.
+`expected: "str (enum variant name)"`, `actual: "Uint"`.
 
 ### Cast-recovered pointers
 
@@ -376,10 +378,7 @@ fn snapshot_then_inspect(ctx: &Ctx) -> Result<AssertResult> {
 
     // Top-level scalar.
     if let Ok(nr_cpus) = snap.var("nr_cpus_onln").as_u64() {
-        result.details.push(AssertDetail::new(
-            DetailKind::Other,
-            format!("captured nr_cpus_onln = {nr_cpus}"),
-        ));
+        result.note(format!("captured nr_cpus_onln = {nr_cpus}"));
     }
 
     Ok(result)

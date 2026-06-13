@@ -61,6 +61,7 @@ blocking IO does not drown the scenario.
 Custom scenarios receive a `Ctx` reference:
 
 ```rust,ignore
+#[non_exhaustive]
 pub struct Ctx<'a> {
     pub cgroups: &'a dyn CgroupOps,
     pub topo: &'a TestTopology,
@@ -72,6 +73,7 @@ pub struct Ctx<'a> {
     pub assert: Assert,
     pub wait_for_map_write: bool,
     pub current_step: Arc<AtomicU16>,
+    pub entry_name: Option<&'static str>,
 }
 ```
 
