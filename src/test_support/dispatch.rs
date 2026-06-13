@@ -861,6 +861,8 @@ fn coverage_skip_under_instrumented_init(name: &str) -> bool {
         "live_var_resolves_across_same_binary_swap"
             | "snapshot_real_capture_op_snapshot"
             | "snapshot_real_capture_op_watch_snapshot"
+            | "snapshot_real_capture_wide_smp"
+            | "principled_active_scheduler_walker_resolves_active_obj"
             | "stats_bridge_round_trip"
             | "op_spawn_cgroup_empty_string_bails_with_actionable_diagnostic"
     )
@@ -881,10 +883,11 @@ pub fn run_ktstr_test(entry: &KtstrTestEntry) -> Result<AssertResult> {
 
     // Host-side coverage skip for VM-booting tests whose guest /init
     // trips an AP-kill exit under coverage-instrumented `current_exe`
-    // binaries. Per-test in-body skip checks are inert for these tests
-    // because the test body never runs — the guest dies during boot
-    // before reaching `(entry.func)(ctx)`. Catching the case here, on
-    // host, before any VM is built, lets nextest surface a clean SKIP
+    // binaries. Per-test in-body skip checks cannot save these tests:
+    // the guest either dies during boot before the body runs, or boots
+    // and the body returns Skip but the always-honored host-side post_vm
+    // callback then fails on the absent capture. Catching the case here,
+    // on host, before any VM is built, lets nextest surface a clean SKIP
     // instead of burning the 31-retry budget on a doomed boot path.
     // The hardcoded list mirrors the coverage-skip surface other
     // sites guard locally; deferral until a non-instrumented /init
@@ -2042,12 +2045,13 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
     // verbatim either way.
     let bare_for_lookup = test_name.strip_prefix("ktstr/").unwrap_or(test_name);
 
-    // Coverage-skip guard, mirroring run_ktstr_test:962-971: a VM-booting
+    // Coverage-skip guard, mirroring run_ktstr_test's: a VM-booting
     // test whose guest /init trips an AP-kill exit under a
     // coverage-instrumented `current_exe` must skip cleanly here too, or
     // the ctor -> run_named_test dispatch burns the retry budget on a
-    // doomed boot (the per-test in-body skip never runs — the guest dies
-    // during boot before the test body executes).
+    // doomed boot (the per-test in-body skip cannot prevent it: the
+    // guest dies during boot, or its body's Skip is overridden by the
+    // honored host-side post_vm check).
     if let Some(entry) = find_test(bare_for_lookup)
         && !entry.host_only
         && crate::test_support::current_binary_is_coverage_instrumented()
@@ -3561,20 +3565,19 @@ mod tests {
     }
 
     /// Stub func for the host_only listing-test entry. The listers
-    /// never invoke `func` — they only iterate `KTSTR_TESTS` to
-    /// emit names — so an Err-returning stub is sufficient and
-    /// matches the pattern `default_test_func` uses in
-    /// `entry::DEFAULT`. If a future regression accidentally drove
-    /// dispatch through this entry, the bail message would surface
-    /// the misroute rather than silently passing.
+    /// (`list_tests_all` / `list_tests_budget`) only iterate
+    /// `KTSTR_TESTS` to emit names and never call `func` — but every
+    /// `KTSTR_TESTS` entry is ALSO reachable by the run dispatcher: a
+    /// full `cargo ktstr test` run executes it, exactly like the sibling
+    /// `__unit_test_dummy__` sentinel. So the func must be a harmless
+    /// pass, not an error. `host_only = true` runs it on the host with
+    /// no VM and it asserts nothing. (An earlier Err-bailing stub
+    /// assumed the entry was never dispatched, which made every full
+    /// run fail when the dispatcher reached it.)
     fn host_only_listing_stub(
         _ctx: &crate::scenario::Ctx,
     ) -> anyhow::Result<crate::assert::AssertResult> {
-        anyhow::bail!(
-            "host_only_listing_test_entry::func called — entry exists \
-             only to drive the host_only kernel-suffix skip tests in \
-             list_tests_all / list_tests_budget; func should never run"
-        )
+        Ok(crate::assert::AssertResult::pass())
     }
 
     /// Distinct sentinel name so the listing-output filters in the

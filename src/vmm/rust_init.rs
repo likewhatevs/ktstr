@@ -992,8 +992,17 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // sees every byte even on a wedged guest.
     install_fatal_signal_handlers();
     std::panic::set_hook(Box::new(|info| {
+        // Write the `PANIC:` header FIRST — cheap, no symbolization —
+        // so the diagnostic reaches the host even when the subsequent
+        // backtrace symbolization (which faults in the binary's DWARF,
+        // hundreds of MiB for a debuginfo-heavy test binary) allocates
+        // beyond a memory-pressured guest's headroom and aborts. The
+        // host's `extract_panic_message` keys on this `PANIC:` prefix.
+        let head = format!("PANIC: {info}\n");
+        let _ = fs::write(COM2, &head);
+        let _ = fs::write(COM1, &head);
         let bt = std::backtrace::Backtrace::force_capture();
-        let msg = format!("PANIC: {info}\n{bt}\n");
+        let msg = format!("{bt}\n");
         // COM2 / COM1 serial. COM2 is the canonical crash log
         // destination for the host's serial-capture path; the
         // host parses the `PANIC:` prefix via
@@ -3305,7 +3314,11 @@ const SCHED_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// the kill doesn't truncate that output (`dump_sched_output` reads it).
 /// Bounded so a userspace hang can't wedge teardown; returns early the
 /// moment the scheduler exits. Only applied on a crash (dump_started).
-const SCHED_KILL_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
+/// Sized for the USERSPACE flush, not the kernel dump: the kernel's scx
+/// exit dump is bounded and truncated in-kernel, but the scheduler's
+/// userspace flush of it to stderr (plus libbpf teardown) can run past a
+/// shorter window, and the SIGKILL then truncates the tail of THAT output.
+const SCHED_KILL_GRACE: std::time::Duration = std::time::Duration::from_millis(3000);
 
 /// Wait up to `timeout` for `child` to exit (evented via `pidfd_open` +
 /// `poll`), then reap it. Does NOT send a signal — callers drive the

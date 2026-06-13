@@ -1,0 +1,7 @@
+error: cpu_budget requires no_perf_mode — the budget sizes the no-perf vCPU-thread mask; under performance_mode vCPUs are pinned 1:1 and cpu_budget would be silently ignored. Add no_perf_mode (or drop cpu_budget).
+ --> tests/compile_fail/ktstr_test_cpu_budget_requires_no_perf.rs:5:1
+  |
+5 | #[ktstr_test(cpu_budget = 4)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -316,6 +316,7 @@ fn fixture_entry(tag: &str, step_index: u16, elapsed_ms: u64) -> DrainedSnapshot
         report: fixture_report(),
         stats: Err(MissingStatsReason::NoSchedulerBinary),
         elapsed_ms: Some(elapsed_ms),
+        boundary_offset_ms: None,
         step_index: Some(step_index),
     }
 }
@@ -418,6 +419,7 @@ fn build_phase_buckets_unstamped_samples_cluster_under_baseline() {
         report: fixture_report(),
         stats: Err(MissingStatsReason::NoSchedulerBinary),
         elapsed_ms: Some(50),
+        boundary_offset_ms: None,
         step_index: None,
     };
     let samples = SampleSeries::from_drained_typed(vec![unstamped], None);
@@ -527,6 +529,7 @@ fn build_phase_buckets_extracts_wired_metric_arms_end_to_end() {
             report: report_with(dsq_depths, fallback, keep_last),
             stats: Err(MissingStatsReason::NoSchedulerBinary),
             elapsed_ms: Some(elapsed_ms),
+            boundary_offset_ms: None,
             step_index: Some(step_index),
         }
     }
@@ -1032,6 +1035,7 @@ fn build_phase_buckets_avg_dsq_depth_from_snapshot_dsq_states() {
         },
         stats: Err(MissingStatsReason::NoSchedulerBinary),
         elapsed_ms: Some(ms),
+        boundary_offset_ms: None,
         step_index: Some(1),
     };
     let drained = vec![mk_entry("periodic_000", 100), mk_entry("periodic_001", 200)];
@@ -1081,6 +1085,7 @@ fn build_phase_buckets_with_stimulus_populates_iteration_rate() {
         report: fixture_report(),
         stats: Err(MissingStatsReason::NoSchedulerBinary),
         elapsed_ms: Some(ms),
+        boundary_offset_ms: None,
         step_index: Some(step),
     };
     let drained = vec![
@@ -1097,6 +1102,7 @@ fn build_phase_buckets_with_stimulus_populates_iteration_rate() {
             op_kind: None,
             detail: None,
             total_iterations: Some(0),
+            step_index: None,
         },
         StimulusEvent {
             elapsed_ms: 1100,
@@ -1104,6 +1110,7 @@ fn build_phase_buckets_with_stimulus_populates_iteration_rate() {
             op_kind: None,
             detail: None,
             total_iterations: Some(1000),
+            step_index: None,
         },
         StimulusEvent {
             elapsed_ms: 2100,
@@ -1111,6 +1118,7 @@ fn build_phase_buckets_with_stimulus_populates_iteration_rate() {
             op_kind: None,
             detail: None,
             total_iterations: Some(3000),
+            step_index: None,
         },
     ];
     let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
@@ -1126,6 +1134,175 @@ fn build_phase_buckets_with_stimulus_populates_iteration_rate() {
     assert!(
         (rate - 2000.0).abs() < f64::EPSILON,
         "expected iteration_rate=2000.0 iter/s, got {rate}",
+    );
+}
+
+/// The deferred-fire fix. When the dump-prerequisite gate holds the
+/// periodic boundaries until the accessor adopts, they fire in a burst
+/// and every capture reads the same late `CURRENT_STEP`, so the stamped
+/// step_index collapses to one value (the `phases.len() == 1` bug). The
+/// workload-relative `boundary_offset_ms` — computed from the boundary
+/// schedule, not the fire time — must instead drive attribution. Four
+/// captures all stamped step_index=3 but scheduled across BASELINE +
+/// three step windows must land in four distinct buckets.
+#[test]
+fn build_phase_buckets_with_stimulus_remaps_by_boundary_offset_over_stamped_step() {
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    // All four stamp step_index=3 (the burst bug) and share a ~uniform
+    // run-relative fire time (elapsed_ms), but their SCHEDULED offsets
+    // fall before step 1 (BASELINE) and inside steps 1, 2, 3.
+    let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(9_000),
+        boundary_offset_ms: Some(offset_ms),
+        step_index: Some(3),
+    };
+    let drained = vec![
+        mk("periodic_base", 500),  // before step 1 start (1000) -> BASELINE
+        mk("periodic_000", 1_500), // step 1 window [1000, 2000)
+        mk("periodic_001", 2_500), // step 2 window [2000, 3000)
+        mk("periodic_002", 3_500), // step 3 window [3000, ..)
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    // Step-start timeline (scenario-relative): step k starts at k*1000 ms.
+    let stim = |elapsed_ms: u64, k: u16| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepStart[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: None,
+        step_index: Some(k),
+    };
+    let stimulus = vec![stim(1000, 1), stim(2000, 2), stim(3000, 3)];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let idxs: Vec<u16> = phases.iter().map(|p| p.step_index).collect();
+    assert_eq!(
+        idxs,
+        vec![0, 1, 2, 3],
+        "boundary_offset_ms must drive grouping (BASELINE + one capture \
+         per step), NOT the uniformly-wrong stamped step_index=3 which \
+         would collapse all four into a single bucket; got {idxs:?}",
+    );
+    for p in &phases {
+        assert_eq!(
+            p.sample_count, 1,
+            "each remapped bucket holds exactly its one scheduled capture; \
+             step_index={} count={}",
+            p.step_index, p.sample_count,
+        );
+    }
+}
+
+/// Fallback: a capture with no `boundary_offset_ms` (on-demand /
+/// fixture) keeps its stamped step_index even when a stimulus timeline
+/// is present — the offset remap only overrides captures that carry a
+/// scheduled offset, so legacy / non-periodic entries are untouched.
+#[test]
+fn build_phase_buckets_with_stimulus_none_offset_falls_back_to_stamped_step() {
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    let mk = |tag: &str, step: u16| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(100),
+        boundary_offset_ms: None,
+        step_index: Some(step),
+    };
+    let drained = vec![mk("periodic_000", 1), mk("periodic_001", 2)];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    // A step-5 stimulus is present but must NOT pull the None-offset
+    // captures to step 5 — they keep their stamped 1 / 2.
+    let stimulus = vec![StimulusEvent {
+        elapsed_ms: 0,
+        label: "StepStart[5]".to_string(),
+        op_kind: None,
+        detail: None,
+        total_iterations: None,
+        step_index: Some(5),
+    }];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let idxs: Vec<u16> = phases.iter().map(|p| p.step_index).collect();
+    assert_eq!(
+        idxs,
+        vec![1, 2],
+        "None-offset captures keep their stamped step_index (1, 2), not \
+         remapped to the step-5 stimulus; got {idxs:?}",
+    );
+}
+
+/// Iteration-rate attribution regression: in the production shape (periodic captures carry
+/// workload-relative boundary offsets in the step INTERIOR + stimulus
+/// events carry step_index), iteration_rate must attach to the step the
+/// rate was measured DURING — by step_index, NOT by a timestamp-window
+/// match against the capture-derived (interior) bucket window. The
+/// step-START (prev.elapsed_ms) falls in the inter-step gap, inside no
+/// interior bucket window, so the old window match dropped every rate.
+/// This pins the step_index attribution; it FAILS on the window match.
+#[test]
+fn build_phase_buckets_with_stimulus_iteration_rate_attaches_by_step_not_interior_window() {
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    // One capture per step, each at the step INTERIOR (offset strictly
+    // greater than the step-start), mirroring compute_periodic_boundaries_ns
+    // (10-90% interior). Stamped step_index intentionally wrong (all 9) so
+    // the OFFSET drives grouping and the stimulus event's step_index drives
+    // rate attribution.
+    let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(9_000),
+        boundary_offset_ms: Some(offset_ms),
+        step_index: Some(9),
+    };
+    let drained = vec![
+        mk("periodic_000", 1_500), // step 1 interior (window [1000,2000))
+        mk("periodic_001", 2_500), // step 2 interior (window [2000,3000))
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    // Step-starts at 1000/2000/3000; cumulative iterations 0/1000/3000.
+    let stim = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepStart[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+    };
+    let stimulus = vec![stim(1000, 1, 0), stim(2000, 2, 1000), stim(3000, 3, 3000)];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    // Step 1 bucket (step_index==1): rate for (step1@1000 -> step2@2000),
+    // iters 0->1000 over 1s = 1000/s. Its window is the single interior
+    // capture [1500,1500], which does NOT contain the step-start 1000 —
+    // the old window match dropped this rate.
+    let step1 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("Step[0] bucket present");
+    assert_eq!(
+        step1.metrics.get("iteration_rate").copied(),
+        Some(1000.0),
+        "step 1 iteration_rate must attach by step_index to the interior \
+         bucket; got {:?} (start_ms={}, end_ms={})",
+        step1.metrics.get("iteration_rate"),
+        step1.start_ms,
+        step1.end_ms,
+    );
+    // Step 2 bucket: rate for (step2@2000 -> step3@3000), iters
+    // 1000->3000 over 1s = 2000/s.
+    let step2 = phases
+        .iter()
+        .find(|p| p.step_index == 2)
+        .expect("Step[1] bucket present");
+    assert_eq!(
+        step2.metrics.get("iteration_rate").copied(),
+        Some(2000.0),
+        "step 2 iteration_rate must attach by step_index; got {:?}",
+        step2.metrics.get("iteration_rate"),
     );
 }
 
@@ -1151,6 +1328,7 @@ fn populate_run_ext_metrics_populated_series_inserts_expected_keys() {
         },
         stats: Err(MissingStatsReason::NoSchedulerBinary),
         elapsed_ms: Some(ms),
+        boundary_offset_ms: None,
         step_index: Some(0),
     };
     let drained = vec![mk_entry("periodic_000", 100), mk_entry("periodic_001", 200)];

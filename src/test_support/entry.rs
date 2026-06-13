@@ -1171,6 +1171,17 @@ pub struct KtstrTestEntry {
     /// Guest memory in MiB (binary mebibytes; conversion at
     /// VM-launch is `value << 20` bytes, not `value * 1_000_000`).
     pub memory_mib: u32,
+    /// Host-CPU budget for the no-perf vCPU mask — the number of host
+    /// CPUs the VM's vCPU threads share. `None` auto-sizes to the vCPU
+    /// count (so a wide VM's parallel AP bringup isn't throttled);
+    /// `Some(n)` with `n` < vCPU count forces CPU overcommit for
+    /// contention testing. `Some(0)` is rejected (a zero budget cannot
+    /// run a VM). Requires `no_perf_mode`: the budget sizes only the
+    /// no-perf vCPU-thread mask, so setting it without `no_perf_mode` is
+    /// rejected (by the `#[ktstr_test]` macro and by `validate`) rather
+    /// than silently ignored. An explicit `--cpu-cap` / `KTSTR_CPU_CAP`
+    /// overrides it. Set by `#[ktstr_test(cpu_budget = N)]`.
+    pub cpu_budget: Option<u32>,
     /// Primary scheduler that drives the test. Defaults to
     /// [`Scheduler::EEVDF`] (the no-scx-scheduler placeholder; tests
     /// then run under the kernel's default scheduling class).
@@ -1414,12 +1425,20 @@ pub struct KtstrTestEntry {
     /// `crate::vmm::KtstrVmBuilder::disk` in
     /// `crate::test_support::runtime::build_vm_builder_base` so the
     /// guest sees a raw block device sized per `cfg.capacity_mib`.
-    /// The `#[ktstr_test]` macro does not currently surface this
-    /// slot — direct construction via `..KtstrTestEntry::DEFAULT`
-    /// is the only path. Mutually exclusive with `host_only`:
-    /// `validate` rejects the combination because `host_only`
-    /// skips the VM boot that owns the disk lifecycle.
+    /// Surfaced by `#[ktstr_test(disk = PATH)]`, `with_disk`, or direct
+    /// construction via `..KtstrTestEntry::DEFAULT`. Mutually exclusive
+    /// with `host_only`: `validate` rejects the combination because
+    /// `host_only` skips the VM boot that owns the disk lifecycle.
     pub disk: Option<crate::vmm::disk_config::DiskConfig>,
+    /// Optional virtio-net device attached to the VM (in-VMM loopback
+    /// backend). `None` (the default) boots without a NIC; `Some(cfg)`
+    /// calls `crate::vmm::KtstrVmBuilder::network` in
+    /// `crate::test_support::runtime::build_vm_builder_base`. Surfaced by
+    /// `#[ktstr_test(network = PATH)]`, `with_network`, or direct
+    /// construction. Mutually exclusive with `host_only`: `validate`
+    /// rejects the combination because `host_only` skips the VM boot that
+    /// owns the virtio-net device.
+    pub network: Option<crate::vmm::net_config::NetConfig>,
     /// Host-side callback invoked after `vm.run()` returns, with
     /// access to the full `VmResult`. Runs on the HOST, not inside
     /// the guest. Use for assertions that need host-side state
@@ -1700,6 +1719,7 @@ impl KtstrTestEntry {
         },
         constraints: TopologyConstraints::DEFAULT,
         memory_mib: 2048,
+        cpu_budget: None,
         scheduler: &crate::test_support::Scheduler::EEVDF,
         staged_schedulers: &[],
         payload: None,
@@ -1722,6 +1742,7 @@ impl KtstrTestEntry {
         cleanup_budget: None,
         config_content: None,
         disk: None,
+        network: None,
         post_vm: None,
         post_vm_unconditional: None,
         num_snapshots: 0,
@@ -1808,6 +1829,15 @@ impl KtstrTestEntry {
                 self.name,
             );
         }
+        if self.host_only && self.network.is_some() {
+            anyhow::bail!(
+                "KtstrTestEntry '{}'.host_only=true with network=Some(..) — \
+                 host_only skips the VM boot that owns the virtio-net \
+                 device lifecycle, so the NIC would never be attached. \
+                 Drop one of host_only or network.",
+                self.name,
+            );
+        }
         // staged_schedulers names must (a) pass the per-name shape
         // checks (non-empty, no path separators, no NUL bytes, no
         // leading dot, not a reserved framework slot — see
@@ -1888,6 +1918,39 @@ impl KtstrTestEntry {
                  (\"I want pinning\" vs. \"I explicitly don't want \
                  pinning\"). Drop one of them.",
                 self.name,
+            );
+        }
+        // `cpu_budget` of zero cannot run a VM. The builder would
+        // otherwise clamp it to 1 (builder.rs effective_cap), silently
+        // running with a budget the author never asked for. Reject
+        // explicitly — mirrors the macro's compile-time reject and the
+        // memory_mib / cleanup_budget_ms zero-rejects in
+        // validate_cross_attr.
+        if self.cpu_budget == Some(0) {
+            anyhow::bail!(
+                "KtstrTestEntry '{}'.cpu_budget=Some(0) — a zero host-CPU \
+                 budget cannot run a VM. Use a positive budget, or drop \
+                 cpu_budget to auto-size the no-perf mask to the vCPU count.",
+                self.name,
+            );
+        }
+        // `cpu_budget` is consulted only on the no_perf_mode path
+        // (builder.rs sizes the shared vCPU-thread mask from it). A
+        // budget set without no_perf_mode is a silent no-op — the VM
+        // runs with the default mask and the requested overcommit never
+        // happens, so a contention test would quietly run un-contended.
+        // Reject at validate time (nextest discovery) for the
+        // programmatic-construction path; ktstr-macros enforces the same
+        // gate at compile time for the `#[ktstr_test]` path.
+        if self.cpu_budget.is_some() && !self.no_perf_mode {
+            anyhow::bail!(
+                "KtstrTestEntry '{}'.cpu_budget={:?} with no_perf_mode=false \
+                 — cpu_budget sizes the no-perf vCPU-thread mask and is \
+                 ignored unless no_perf_mode is set (under performance_mode \
+                 vCPUs are pinned 1:1). Set no_perf_mode=true or drop \
+                 cpu_budget.",
+                self.name,
+                self.cpu_budget,
             );
         }
         if (self.assert.expect_scx_bpf_error_contains.is_some()
@@ -2129,6 +2192,24 @@ impl KtstrTestEntry {
         self
     }
 
+    /// Override `cpu_budget` (the no-perf host-CPU budget; `n` below the
+    /// vCPU count forces overcommit). Sets `Some(n)`; the default is
+    /// `None` (auto-size to the vCPU count). `validate` rejects `Some(0)`
+    /// and rejects a budget set without `no_perf_mode`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_cpu_budget(mut self, cpu_budget: u32) -> Self {
+        self.cpu_budget = Some(cpu_budget);
+        self
+    }
+
+    /// Clear `cpu_budget` (auto-size the no-perf vCPU mask to the vCPU
+    /// count).
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn without_cpu_budget(mut self) -> Self {
+        self.cpu_budget = None;
+        self
+    }
+
     /// Override `scheduler`.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn with_scheduler(mut self, scheduler: &'static crate::test_support::Scheduler) -> Self {
@@ -2315,6 +2396,25 @@ impl KtstrTestEntry {
     #[must_use = "builder methods consume self; bind the result"]
     pub fn with_disk(mut self, disk: crate::vmm::disk_config::DiskConfig) -> Self {
         self.disk = Some(disk);
+        self
+    }
+
+    /// Override `network`.
+    ///
+    /// Pairs with the `host_only = false` requirement enforced by
+    /// [`Self::validate`] — `host_only = true` with a `Some(..)` network
+    /// is rejected because host-only skips the VM boot that owns the
+    /// virtio-net device.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_network(mut self, network: crate::vmm::net_config::NetConfig) -> Self {
+        self.network = Some(network);
+        self
+    }
+
+    /// Clear `network` (boot without a virtio-net device).
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn without_network(mut self) -> Self {
+        self.network = None;
         self
     }
 
@@ -2874,6 +2974,24 @@ mod tests {
         entry.validate().expect("chained entry must validate");
     }
 
+    /// `with_cpu_budget` chains and produces a validating overcommit
+    /// entry. cpu_budget requires no_perf_mode (it sizes the no-perf
+    /// vCPU mask), so the two are set together — pinning the setter pair
+    /// against the validate gate. (cpu_budget is kept out of the
+    /// performance_mode chain above because the two are contradictory.)
+    #[test]
+    fn ktstr_test_entry_with_cpu_budget_chains_with_no_perf_mode() {
+        let entry = KtstrTestEntry::DEFAULT
+            .with_name("cpu_budget_chain")
+            .with_cpu_budget(16)
+            .with_no_perf_mode(true);
+        assert_eq!(entry.cpu_budget, Some(16));
+        assert!(entry.no_perf_mode);
+        entry
+            .validate()
+            .expect("cpu_budget + no_perf_mode chain must validate");
+    }
+
     /// `without_<field>` returns the original Option<T> field to
     /// `None`. The chain symmetry pin: `with_X(v).without_X() ==
     /// DEFAULT-state for that field`.
@@ -2896,10 +3014,13 @@ mod tests {
             .with_name("clear_test")
             .with_payload(&FIO)
             .with_cleanup_budget(Duration::from_secs(10))
+            .with_cpu_budget(8)
             .without_payload()
-            .without_cleanup_budget();
+            .without_cleanup_budget()
+            .without_cpu_budget();
         assert!(entry.payload.is_none());
         assert!(entry.cleanup_budget.is_none());
+        assert!(entry.cpu_budget.is_none());
     }
 
     #[test]
@@ -3298,6 +3419,150 @@ mod tests {
         entry
             .validate()
             .expect("host_only=false + disk=Some must validate");
+    }
+
+    /// `host_only=true` with `network=Some(..)` is rejected for the same
+    /// reason as disk: host_only skips the VM boot that owns the virtio-net
+    /// device lifecycle, so the NIC would never attach. Mirrors the disk
+    /// gate so the macro-surfaced `network =` attribute can't silently
+    /// pair with `host_only`.
+    #[test]
+    fn validate_rejects_host_only_with_network() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "host_only_with_network",
+            func: good_test_func,
+            host_only: true,
+            network: Some(crate::vmm::net_config::NetConfig::default()),
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("host_only=true + network=Some must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("host_only=true") && msg.contains("network"),
+            "expected host_only+network diagnostic, got: {msg}",
+        );
+        assert!(
+            msg.contains("host_only_with_network"),
+            "error must name the offending entry, got: {msg}",
+        );
+    }
+
+    /// `host_only=true` with `network=None` is the legitimate host-side
+    /// shape (no NIC). Pins the happy path so a future edit to the gate
+    /// doesn't flip polarity and reject legitimate host-only tests.
+    #[test]
+    fn validate_accepts_host_only_without_network() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "host_only_no_network",
+            func: good_test_func,
+            host_only: true,
+            network: None,
+            ..KtstrTestEntry::DEFAULT
+        };
+        entry
+            .validate()
+            .expect("host_only=true + network=None must validate");
+    }
+
+    /// `host_only=false` (the default) with `network=Some(..)` is the
+    /// canonical NIC-attached VM test. Pins that the gate fires only on
+    /// the host_only conflict, not on every `network=Some(..)` entry.
+    #[test]
+    fn validate_accepts_vm_with_network() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "vm_with_network",
+            func: good_test_func,
+            host_only: false,
+            network: Some(crate::vmm::net_config::NetConfig::default()),
+            ..KtstrTestEntry::DEFAULT
+        };
+        entry
+            .validate()
+            .expect("host_only=false + network=Some must validate");
+    }
+
+    /// `validate()` rejects `cpu_budget = Some(0)` — a zero host-CPU
+    /// budget cannot run a VM (the builder would otherwise silently
+    /// clamp it to 1). Pins the programmatic-construction guard that
+    /// mirrors the macro's compile-time zero-reject.
+    #[test]
+    fn validate_rejects_cpu_budget_zero() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "cpu_budget_zero",
+            func: good_test_func,
+            cpu_budget: Some(0),
+            no_perf_mode: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("cpu_budget=Some(0) must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("cpu_budget") && msg.contains("cpu_budget_zero"),
+            "expected cpu_budget zero diagnostic naming the entry, got: {msg}",
+        );
+    }
+
+    /// `validate()` rejects `cpu_budget` set without `no_perf_mode` —
+    /// the budget sizes only the no-perf vCPU mask, so it would be a
+    /// silent no-op under performance/default mode. Pins the
+    /// programmatic-construction guard mirroring the macro's gate.
+    #[test]
+    fn validate_rejects_cpu_budget_without_no_perf_mode() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "cpu_budget_no_no_perf",
+            func: good_test_func,
+            cpu_budget: Some(4),
+            no_perf_mode: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("cpu_budget without no_perf_mode must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("cpu_budget") && msg.contains("no_perf_mode"),
+            "expected cpu_budget/no_perf_mode diagnostic, got: {msg}",
+        );
+    }
+
+    /// `cpu_budget` with `no_perf_mode = true` is the legitimate
+    /// overcommit shape — pins the happy path against the two rejection
+    /// paths so a future edit can't flip polarity and reject every
+    /// valid overcommit test.
+    #[test]
+    fn validate_accepts_cpu_budget_with_no_perf_mode() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "cpu_budget_with_no_perf",
+            func: good_test_func,
+            cpu_budget: Some(4),
+            no_perf_mode: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        entry
+            .validate()
+            .expect("cpu_budget + no_perf_mode must validate");
     }
 
     /// `validate()` rejects `num_snapshots` greater than the bridge

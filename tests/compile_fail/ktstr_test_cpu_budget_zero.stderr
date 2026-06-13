@@ -1,0 +1,7 @@
+error: cpu_budget must be > 0 (a zero host-CPU budget cannot run a VM; omit the attribute to auto-size the no-perf mask to the vCPU count)
+ --> tests/compile_fail/ktstr_test_cpu_budget_zero.rs:5:1
+  |
+5 | #[ktstr_test(cpu_budget = 0, no_perf_mode)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)

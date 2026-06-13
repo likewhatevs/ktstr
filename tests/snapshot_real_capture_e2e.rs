@@ -16,9 +16,17 @@ use ktstr::test_support::{Scheduler, SchedulerSpec};
 const KTSTR_SCHED: Scheduler =
     Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
-/// Host-side content assertion: verify the bridge has a capture
-/// with the scheduler's .bss containing real BTF-rendered globals.
-fn assert_bridge_has_real_capture(result: &VmResult) -> Result<()> {
+/// Host-side content assertion: verify the bridge has a capture with the
+/// scheduler's .bss containing real BTF-rendered globals. When
+/// `expect_vcpus` is `Some(n)`, additionally pin (1) that the report
+/// enumerated exactly `n` `vcpu_regs` slots — the freeze coordinator pushes
+/// one slot per booted vCPU regardless of outcome (`collect_vcpu_regs` =
+/// 1 BSP + AP reg snapshots), so the count is the vCPU count — and (2) that
+/// all `n` slots are populated (`Some`), which proves the freeze rendezvous
+/// reached, parked, and captured every AP (a stalled vCPU leaves a `None`
+/// slot). all-`Some` is the direct >255 N-of-N freeze pin; the count alone
+/// is only satisfied by thread enumeration.
+fn assert_bridge_capture(result: &VmResult, expect_vcpus: Option<usize>) -> Result<()> {
     let captured = result.snapshot_bridge.drain();
     anyhow::ensure!(
         !captured.is_empty(),
@@ -55,8 +63,45 @@ fn assert_bridge_has_real_capture(result: &VmResult) -> Result<()> {
              capture did not produce real scheduler state",
             bss.name
         );
+        if let Some(n) = expect_vcpus {
+            // The slot COUNT pins the vCPU count: one slot per booted vCPU
+            // is enumerated regardless of capture outcome...
+            anyhow::ensure!(
+                report.vcpu_regs.len() == n,
+                "snapshot '{tag}' enumerated {} vcpu_regs slots, expected {n} \
+                 (one slot per booted vCPU) — wrong vCPU count",
+                report.vcpu_regs.len()
+            );
+            // ...and the count of POPULATED (Some) slots pins that the
+            // freeze rendezvous reached, parked, and captured every one. A
+            // vCPU that stalled past the rendezvous leaves a None slot
+            // (freeze_coord collect_vcpu_regs), so all-Some proves the >255
+            // N-of-N freeze succeeded — a Degraded/partial freeze fails here.
+            let captured = report.vcpu_regs.iter().filter(|r| r.is_some()).count();
+            anyhow::ensure!(
+                captured == n,
+                "snapshot '{tag}' captured regs for {captured} of {n} vCPUs \
+                 (None slots = vCPUs the freeze rendezvous did not reach + \
+                 capture at the split-irqchip ceiling)",
+            );
+        }
     }
     Ok(())
+}
+
+/// `post_vm` for the default-topology capture tests: real content, no
+/// vCPU-cardinality requirement.
+fn assert_bridge_has_real_capture(result: &VmResult) -> Result<()> {
+    assert_bridge_capture(result, None)
+}
+
+/// `post_vm` for the 256-vCPU wide-SMP capture: real content AND all 256
+/// `vcpu_regs` slots populated (`Some`), pinning that the freeze coordinator
+/// reached, parked, and captured every one of the 256 vCPUs (16 LLCs x 16
+/// cores x 1 thread) at the split-irqchip ceiling — not merely that the 256
+/// slots were enumerated or that "some real data" landed.
+fn assert_bridge_has_real_capture_wide_smp(result: &VmResult) -> Result<()> {
+    assert_bridge_capture(result, Some(256))
 }
 
 #[ktstr_test(
@@ -207,5 +252,50 @@ fn principled_active_scheduler_walker_resolves_active_obj(
         "Op::capture_snapshot('active_walker_probe') succeeded; \
          post_vm verifies active_obj_name and Snapshot::active() round-trip",
     );
+    Ok(result)
+}
+
+/// Snapshot capture at the xAPIC ceiling: a 256-vCPU (16 LLCs x 16 cores,
+/// top APIC ID 255 > 254 -> split-irqchip / userspace-IOAPIC path) guest
+/// fires `Op::capture_snapshot`, and the host asserts the bridge captured
+/// real BTF-rendered BPF state AND all 256 `vcpu_regs` slots populated.
+/// Proves the snapshot pipeline works at >255 vCPUs: the freeze
+/// coordinator's rendezvous kicks all 256 vCPU threads (SIGRTMIN to every
+/// AP) — all 256 `vcpu_regs` slots being `Some` is the direct pin that the
+/// rendezvous reached, parked, and captured every AP (a partial freeze
+/// leaves `None` slots) — the BPF-map walk reads scx-ktstr's state, and
+/// serialization round-trips through SHM, none of which is otherwise
+/// exercised above the 254-APIC-ID split-irqchip boundary.
+#[ktstr_test(
+    scheduler = KTSTR_SCHED,
+    llcs = 16,
+    cores = 16,
+    threads = 1,
+    no_perf_mode,
+    duration_s = 10,
+    watchdog_timeout_s = 60,
+    auto_repro = false,
+    post_vm = assert_bridge_has_real_capture_wide_smp,
+)]
+fn snapshot_real_capture_wide_smp(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
+    if ktstr::test_support::current_binary_is_coverage_instrumented() {
+        return Ok(AssertResult::skip(
+            "coverage-instrumented /init AP-kill — same surface as the \
+             sibling captures; deferred until a non-instrumented init binary",
+        ));
+    }
+    let total = ctx.topo.total_cpus();
+    anyhow::ensure!(
+        total > 254,
+        "need a >254-vCPU topology to exercise the split-irqchip snapshot \
+         path (got {total})"
+    );
+    let steps = vec![Step {
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
+        ops: vec![Op::capture_snapshot("wide_smp")],
+        hold: HoldSpec::FULL,
+    }];
+    let mut result = execute_steps(ctx, steps)?;
+    result.note("256-vCPU Op::capture_snapshot('wide_smp') SHM request succeeded");
     Ok(result)
 }

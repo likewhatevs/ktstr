@@ -35,27 +35,33 @@ pub struct NetConfig {
     pub mac: [u8; 6],
 }
 
-impl Default for NetConfig {
-    /// Default MAC: `02:00:00:00:00:01`. The leading `0x02` sets the
-    /// locally-administered bit per IEEE 802 (bit 1 of the first
-    /// octet), keeping the address out of the IEEE OUI namespace.
-    /// The trailing `0x01` distinguishes the default from the
-    /// guest-host pair convention (host-side might use `0x02`); v0
-    /// runs a single device, so the value is informational.
-    fn default() -> Self {
-        NetConfig {
-            mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
-        }
+impl NetConfig {
+    /// Const default — MAC `02:00:00:00:00:01`. The leading `0x02` sets
+    /// the locally-administered bit per IEEE 802 (bit 1 of the first
+    /// octet), keeping the address out of the IEEE OUI namespace; the
+    /// trailing `0x01` is informational (v0 runs a single device).
+    /// `const` so it can seed a `const NetConfig` for the
+    /// `#[ktstr_test(network = ...)]` attribute, matching
+    /// [`super::disk_config::DiskConfig`]'s `DEFAULT`.
+    pub const DEFAULT: NetConfig = NetConfig {
+        mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+    };
+
+    /// Override the advertised MAC. Returns `self` for chained
+    /// configuration. `const fn` so a `const NetConfig` can be built via
+    /// `NetConfig::DEFAULT.mac(...)`, matching `DiskConfig`'s const-fn
+    /// builder style.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub const fn mac(mut self, mac: [u8; 6]) -> Self {
+        self.mac = mac;
+        self
     }
 }
 
-impl NetConfig {
-    /// Override the advertised MAC. Returns `self` for chained
-    /// configuration matching [`super::disk_config::DiskConfig`]'s
-    /// builder style.
-    pub fn mac(mut self, mac: [u8; 6]) -> Self {
-        self.mac = mac;
-        self
+impl Default for NetConfig {
+    /// Delegates to [`Self::DEFAULT`] (MAC `02:00:00:00:00:01`).
+    fn default() -> Self {
+        Self::DEFAULT
     }
 }
 

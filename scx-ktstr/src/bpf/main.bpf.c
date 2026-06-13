@@ -393,8 +393,15 @@ void BPF_STRUCT_OPS(ktstr_dispatch, s32 cpu, struct task_struct *prev)
 		 * copies linearly (no back-edges to prune). After
 		 * normalize_for_cycle_detection strips instruction addresses,
 		 * all copies look identical, so detect_cycle finds the
-		 * pattern. The trailing while(1) forces a verifier rejection
-		 * so libbpf prints the full trace to stderr. */
+		 * pattern. A trailing null-pointer store forces a clean,
+		 * deterministic verifier rejection so libbpf prints the full
+		 * trace to stderr.
+		 *
+		 * NOT a `while(1)`: the verifier's infinite-loop analysis
+		 * could keep scx_ops_load from returning within the host's
+		 * 10s scheduler-attach poll, so no rejection trace was emitted
+		 * and verifier_stats came back empty — flaky on cold vs warm
+		 * runs. The null store rejects immediately. */
 		volatile u32 acc = 0;
 		#pragma unroll
 		for (int i = 0; i < 8; i++) {
@@ -405,8 +412,11 @@ void BPF_STRUCT_OPS(ktstr_dispatch, s32 cpu, struct task_struct *prev)
 			acc *= 7;
 			acc += 1;
 		}
-		while (1)
-			acc += 1;
+		/* Store acc (keeps the unrolled writes live) through a null
+		 * pointer — invalid access, rejected by the verifier.
+		 * Mirrors fail_verify below. */
+		volatile int *p = (volatile int *)0;
+		*p = (int)acc;
 	}
 	if (fail_verify) {
 		/* Null pointer dereference — verifier rejects this. */

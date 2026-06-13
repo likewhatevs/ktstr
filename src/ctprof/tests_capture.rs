@@ -1178,20 +1178,23 @@ fn capture_with_v1_only_cgroup_yields_empty_cgroup_string() {
     );
 }
 
-/// `capture_to` propagates write errors through anyhow with the
-/// destination path in the context chain so an operator who
-/// passed an unwritable target sees the path in the diagnostic
-/// rather than a bare I/O error. Pins the `with_context` wrapper
-/// at the public-API boundary; without it, the error message
-/// loses the path and operators can't tell which target failed.
+/// `CtprofSnapshot::write` propagates the underlying `std::fs::write`
+/// error through anyhow with the destination path in the context
+/// chain, so an operator who passed an unwritable target sees the
+/// path in the diagnostic rather than a bare I/O error. `capture_to`
+/// delegates the write to it and inherits this context. Pins the
+/// `with_context` wrapper; without it the message loses the path and
+/// operators can't tell which target failed. Drives `write` on a
+/// default snapshot rather than `capture_to` so the error path is
+/// exercised without a full /proc capture pass.
 #[test]
-fn capture_to_returns_err_on_unwritable_path() {
-    // A path under a directory that does not exist — std::fs::write
-    // returns ENOENT for the parent; capture_to's with_context
-    // wraps it with the destination path.
+fn write_returns_err_on_unwritable_path() {
+    // A path under a directory that does not exist: std::fs::write
+    // returns ENOENT for the parent; write's with_context wraps it
+    // with the destination path.
     let scratch = tempfile::TempDir::new().unwrap();
     let unwritable = scratch.path().join("missing-dir").join("snap.ctprof.zst");
-    let err = capture_to(&unwritable).unwrap_err();
+    let err = CtprofSnapshot::default().write(&unwritable).unwrap_err();
     let chain = format!("{err:#}");
     assert!(
         chain.contains(unwritable.to_string_lossy().as_ref()),

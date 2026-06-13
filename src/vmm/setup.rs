@@ -17,7 +17,7 @@ use std::time::Instant;
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use super::KtstrVm;
-use super::initramfs_cache::{BaseKey, BaseRef, get_or_build_base};
+use super::initramfs_cache::{BaseKey, BaseRef, get_or_build_base, get_or_compress_base_shm};
 use super::memory_budget::{MemoryBudget, initramfs_min_memory_mib, read_kernel_init_size};
 use super::pi_mutex::PiMutex;
 use super::{disk_config, disk_template, host_topology, initramfs, virtio_blk, virtio_net};
@@ -50,12 +50,24 @@ const INITRD_ADDR: u64 = 0x800_0000; // 128 MiB
 /// the overlay path reaches `mmap` with a valid alignment regardless
 /// of host page size.
 #[cfg(target_arch = "aarch64")]
-fn aarch64_initrd_addr(memory_mib: u32, initrd_max_size: u64) -> u64 {
-    let fdt_addr = aarch64::fdt::fdt_address(memory_mib);
+fn aarch64_initrd_addr(memory_mib: u32, total_cpus: u32, initrd_max_size: u64) -> u64 {
+    // Ceiling is the PVTIME carve base, NOT the FDT address. setup_pvtime
+    // registers the per-vCPU steal-time IPAs in [pvtime_base, fdt_addr) and
+    // write_memory shrinks the advertised /memory to END at pvtime_base. An
+    // initrd whose top enters that carve is corrupted two independent ways:
+    // (1) on the FIRST KVM_RUN, before any guest code executes, the host
+    // writes the 8-byte stolen_time field at steal_base+8 (the kvm_update_
+    // stolen_time call from check_vcpu_requests) — the full 64-byte struct
+    // is zeroed later, guest-triggered via the PV_TIME_ST hypercall, after
+    // initrd unpack; and (2) the carve is outside advertised RAM, so the
+    // guest kernel never memblock-reserves those pages. Either clobbers the
+    // initramfs and the guest's /init never starts. Anchor the whole initrd
+    // below pvtime_base so it stays in advertised RAM, clear of the carve.
+    let ceiling = aarch64::fdt::pvtime_base(memory_mib, total_cpus);
     let page_size = host_page_size();
     let mask = !(page_size - 1);
-    // Place initrd just below FDT, host-page-aligned.
-    let load_addr = (fdt_addr - initrd_max_size) & mask;
+    // Place initrd just below the PVTIME carve, host-page-aligned.
+    let load_addr = (ceiling - initrd_max_size) & mask;
     assert!(
         load_addr >= kvm::DRAM_START,
         "initrd load address underflows DRAM_START"
@@ -120,6 +132,45 @@ pub(crate) fn disk_auto_mount_cmdline_tokens(disk: &disk_config::DiskConfig) -> 
         s.push_str(" KTSTR_DISK0_RO=1");
     }
     s
+}
+
+/// Guest kernel cmdline flags common to both arches, with the
+/// arch-specific tail spliced in. Centralized so a flag added once
+/// applies to x86_64 AND aarch64: a per-arch drift here previously left
+/// `sysctl.vm.overcommit_memory=1` on x86 only, OOM-ing the aarch64
+/// guest /init on its allocator reservation.
+///
+/// `arch_extra` is the per-arch tail (x86_64: no_timer_check /
+/// clocksource / i8042 / pci=off / reboot=k; aarch64: kfence). Callers
+/// append dynamic tokens (earlycon, loglevel, rdinit, disk auto-mount,
+/// numa, wprof, cmdline_extra) after this base. Cmdline params are
+/// order-independent, so the common-then-arch ordering is irrelevant.
+fn base_guest_cmdline(arch_extra: &str) -> String {
+    // KASLR is ON by default — ktstr.kconfig pins CONFIG_RANDOMIZE_BASE=y
+    // (text-image slide; x86 also CONFIG_RANDOMIZE_MEMORY=y for the
+    // direct-map slides). The host derives the runtime virt-KASLR offset
+    // (x86: MSR_LSTAR readback + KERN_ADDRS _text; aarch64: KERN_ADDRS
+    // _text only — no MSR_LSTAR) and threads it via coord_kaslr_offset()
+    // into every kaslr-aware site. Tests opt out via
+    // #[ktstr_test(kaslr = false)] / Scheduler::kargs(&["nokaslr"]).
+    //
+    // vm.overcommit_memory=1 (OVERCOMMIT_ALWAYS): the guest /init is a
+    // jemalloc-backed test binary that maps more virtual address space
+    // than its resident set. Under the default heuristic (mode 0)
+    // __vm_enough_memory rejects a single mapping larger than free RAM,
+    // so on a deferred-sized guest the /init aborts with "memory
+    // allocation of N bytes failed" before the workload runs. ALWAYS mode
+    // admits the mapping; the small resident set stays within guest RAM
+    // so no OOM-kill follows. (arm64's arch_mm_preinit auto-enables
+    // ALWAYS only for PAGE_SIZE>=16K with <=128 physpages.)
+    format!(
+        "console=ttyS0 nomodules mitigations=off random.trust_cpu=on \
+         swiotlb=noforce panic=-1 lockdown=none \
+         sysctl.kernel.unprivileged_bpf_disabled=0 \
+         sysctl.kernel.sched_schedstats=1 delayacct \
+         sysctl.kernel.task_delayacct=1 sysctl.vm.overcommit_memory=1 \
+         {arch_extra} KTSTR_GUEST=1"
+    )
 }
 
 /// Pure helper: assemble the `extras` slice and the [`BaseKey`] from
@@ -407,37 +458,15 @@ impl KtstrVm {
         blk.set_mem((*vm.guest_mem).clone());
         let blk_arc = Arc::new(PiMutex::new(blk));
 
-        // irqfd registration. On x86_64 with split irqchip, IOAPIC
-        // routing is unavailable: the kernel's split-irqchip mode
-        // emulates the LAPIC in-kernel and leaves PIC/IOAPIC to
-        // userspace. The framework does not implement userspace IOAPIC
-        // dispatch for virtio-mmio, and the kernel virtio_blk driver
-        // has no `mq_ops->timeout` (drivers/block/virtio_blk.c) and no
-        // polling fallback — without an IRQ delivery path, blk-mq
-        // hangs on every request until the hung-task watchdog fires
-        // (default 120 s). Reject loudly here so a topology that
-        // exceeds the 8-bit xAPIC limit (max APIC ID > 254) surfaces
-        // immediately instead of producing a silent guest hang.
-        #[cfg(target_arch = "x86_64")]
-        if vm.split_irqchip {
-            anyhow::bail!(
-                "virtio-blk requires irqfd; split-irqchip mode has no \
-                 IOAPIC and the kernel virtio_mmio driver has no polling \
-                 fallback — reduce topology so all APIC IDs are at or below 254 (MAX_XAPIC_ID)",
-            );
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            vm.vm_fd
-                .register_irqfd(blk_arc.lock().irq_evt(), kvm::VIRTIO_BLK_IRQ)
-                .context("register virtio-blk irqfd")?;
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            vm.vm_fd
-                .register_irqfd(blk_arc.lock().irq_evt(), kvm::VIRTIO_BLK_IRQ)
-                .context("register virtio-blk irqfd")?;
-        }
+        // irqfd registration. On x86's split-irqchip path (max APIC ID > 254)
+        // the device IRQ is delivered via the userspace IOAPIC: register_irqfd
+        // binds the GSI's eventfd, and the guest's IOAPIC RTE write installs
+        // the matching MSI route (see super::x86_64::ioapic + IoapicHandle).
+        // On the in-kernel-irqchip (x86 <=254) and aarch64 (GIC) paths the
+        // kernel routes the GSI directly. The call is identical on both arches.
+        vm.vm_fd
+            .register_irqfd(blk_arc.lock().irq_evt(), kvm::VIRTIO_BLK_IRQ)
+            .context("register virtio-blk irqfd")?;
 
         Ok(Some(blk_arc))
     }
@@ -450,8 +479,8 @@ impl KtstrVm {
     ///   - the configured MAC baked into config space,
     ///   - guest memory set so subsequent `process_tx_loopback` calls
     ///     can read TX descriptor data and write into RX descriptors,
-    ///   - the irqfd registered with the VM (rejected on x86 split
-    ///     irqchip via `bail!()` below, matching virtio-blk).
+    ///   - the irqfd registered with the VM (delivered via the userspace
+    ///     IOAPIC on x86 split-irqchip, the in-kernel IOAPIC/GIC otherwise).
     ///
     /// The framework reserves a single MMIO base + IRQ pair
     /// (`VIRTIO_NET_MMIO_BASE` / `VIRTIO_NET_IRQ`); the builder's
@@ -468,31 +497,13 @@ impl KtstrVm {
         dev.set_mem((*vm.guest_mem).clone());
         let net_arc = Arc::new(PiMutex::new(dev));
 
-        // irqfd registration. Same split-irqchip rejection rationale
-        // as virtio-blk above: the kernel virtio_net driver depends
-        // on IRQ-driven NAPI to wake on RX, and an undelivered IRQ
-        // produces a silent guest hang. Reject loudly so the test
-        // setup is caught here.
-        #[cfg(target_arch = "x86_64")]
-        if vm.split_irqchip {
-            anyhow::bail!(
-                "virtio-net requires irqfd; split-irqchip mode has no \
-                 IOAPIC and the kernel virtio_mmio driver has no polling \
-                 fallback — reduce topology so all APIC IDs are at or below 254 (MAX_XAPIC_ID)",
-            );
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            vm.vm_fd
-                .register_irqfd(net_arc.lock().irq_evt(), kvm::VIRTIO_NET_IRQ)
-                .context("register virtio-net irqfd")?;
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            vm.vm_fd
-                .register_irqfd(net_arc.lock().irq_evt(), kvm::VIRTIO_NET_IRQ)
-                .context("register virtio-net irqfd")?;
-        }
+        // irqfd registration. On x86's split-irqchip path (>254 APIC IDs) the
+        // device IRQ routes through the userspace IOAPIC (the guest's RTE write
+        // installs the MSI route); on the in-kernel-irqchip (x86 <=254) and
+        // aarch64 (GIC) paths the kernel routes the GSI. Identical on both.
+        vm.vm_fd
+            .register_irqfd(net_arc.lock().irq_evt(), kvm::VIRTIO_NET_IRQ)
+            .context("register virtio-net irqfd")?;
 
         Ok(Some(net_arc))
     }
@@ -921,51 +932,11 @@ impl KtstrVm {
         }
     }
 
-    /// Get or build the compressed base. Checks LZ4 SHM first, then
-    /// compresses and stores.
+    /// Get or build the compressed base, delegating to the SHM
+    /// one-compressor election in `initramfs_cache`. Thin wrapper: the
+    /// SHM logic uses no builder state, only the content hash.
     fn get_or_compress_base(&self, base_bytes: &[u8], key: &BaseKey) -> Result<Vec<u8>> {
-        // Try loading compressed base from LZ4 SHM.
-        if let Some((fd, len)) = initramfs::shm_open_lz4(key.0) {
-            use std::os::fd::AsRawFd;
-            let mut buf = vec![0u8; len];
-            unsafe {
-                let ptr = libc::mmap(
-                    std::ptr::null_mut(),
-                    len,
-                    libc::PROT_READ,
-                    libc::MAP_SHARED,
-                    fd.as_raw_fd(),
-                    0,
-                );
-                if ptr != libc::MAP_FAILED {
-                    std::ptr::copy_nonoverlapping(ptr as *const u8, buf.as_mut_ptr(), len);
-                    libc::munmap(ptr, len);
-                    initramfs::shm_close_fd(fd);
-
-                    // Validate LZ4 legacy magic. Stale segments from a
-                    // previous compression format (zstd) must be discarded.
-                    if buf.len() >= 4 && buf[..4] == initramfs::LZ4_LEGACY_MAGIC {
-                        tracing::debug!(bytes = len, "lz4_base cache hit (shm)");
-                        return Ok(buf);
-                    }
-                    tracing::warn!(
-                        bytes = len,
-                        magic = format!("{:02x}{:02x}{:02x}{:02x}", buf[0], buf[1], buf[2], buf[3]),
-                        "stale compressed shm segment (wrong magic), recompressing"
-                    );
-                } else {
-                    initramfs::shm_close_fd(fd);
-                }
-            }
-        }
-
-        // Compress with LZ4 legacy format.
-        let lz4 = initramfs::lz4_legacy_compress(base_bytes);
-
-        if let Err(e) = initramfs::shm_store_lz4(key.0, &lz4) {
-            tracing::warn!("shm_store_lz4: {e:#}");
-        }
-        Ok(lz4)
+        Ok(get_or_compress_base_shm(key.0, base_bytes))
     }
 
     /// Try to COW-overlay the compressed base from LZ4 SHM into guest
@@ -1220,40 +1191,10 @@ impl KtstrVm {
         //                                              zero on every kernel built with
         //                                              CONFIG_TASK_DELAY_ACCT=y but boot-time
         //                                              off (the upstream default since v5.14).
-        let mut cmdline = concat!(
-            "console=ttyS0 nomodules mitigations=off ",
-            "no_timer_check clocksource=kvm-clock ",
-            "random.trust_cpu=on swiotlb=noforce ",
-            "i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd ",
-            "pci=off reboot=k panic=-1 lockdown=none ",
-            "sysctl.kernel.unprivileged_bpf_disabled=0 ",
-            "sysctl.kernel.sched_schedstats=1 ",
-            "delayacct ",
-            "sysctl.kernel.task_delayacct=1 ",
-            // KASLR is ON by default — `ktstr.kconfig` pins
-            // `CONFIG_RANDOMIZE_BASE=y` (text-image slide) and
-            // `CONFIG_RANDOMIZE_MEMORY=y` (page_offset_base /
-            // vmalloc_base / vmemmap_base direct-map slides). The
-            // host's monitor + dump + freeze_coord consumers derive
-            // the runtime virt-KASLR offset via the
-            // [BSP MSR_LSTAR readback](src/vmm/x86_64/msr_kaslr.rs)
-            // PLUS the [KERN_ADDRS guest-channel `_text` path](src/vmm/guest_comms.rs::send_kern_addrs)
-            // and thread it through `coord_kaslr_offset()` into
-            // every kaslr-aware site (monitor::symbols::per_cpu_kva,
-            // monitor::dump::collect_per_cpu_time, capture_scx::
-            // compute_owned, kernel_op_dispatch::resolve_per_cpu_field_pa).
-            // The runtime `page_offset_base` is read host-side from
-            // /proc/kallsyms (see `vmm::rust_init::build_kern_addrs`)
-            // and shipped via `wire::KernAddrs.page_offset_base` for
-            // `monitor::symbols::kva_to_pa`. Tests that need
-            // determinism opt out via `#[ktstr_test(kaslr = false)]`
-            // or `Scheduler::kargs(&["nokaslr"])` — both re-add the
-            // `nokaslr` token through `runtime::build_cmdline_extra`.
-            // The `kaslr_offset_nonzero_post_boot` + sibling e2e
-            // regression tests guard the derivation chain.
-            "KTSTR_GUEST=1",
-        )
-        .to_string();
+        let mut cmdline = base_guest_cmdline(
+            "no_timer_check clocksource=kvm-clock i8042.noaux i8042.nomux \
+             i8042.nopnp i8042.dumbkbd pci=off reboot=k",
+        );
         let verbose = std::env::var(crate::KTSTR_VERBOSE_ENV)
             .map(|v| v == "1")
             .unwrap_or(false)
@@ -1420,7 +1361,7 @@ impl KtstrVm {
     /// NUMA-aware placement.
     ///
     /// Uses the same LZ4 SHM compress cache and COW overlay path as the
-    /// x86_64 [`Self::setup_memory`] flow. The shared helpers
+    /// x86_64 `Self::setup_memory` flow. The shared helpers
     /// ([`Self::get_or_compress_base`], [`Self::compress_and_load_initrd`],
     /// [`Self::try_cow_overlay`]) are arch-neutral; this function differs
     /// from the x86_64 driver only in (a) computing the initrd load
@@ -1545,7 +1486,11 @@ impl KtstrVm {
             );
         }
 
-        let load_addr = aarch64_initrd_addr(memory_mib, compressed_size as u64);
+        let load_addr = aarch64_initrd_addr(
+            memory_mib,
+            self.topology.total_cpus(),
+            compressed_size as u64,
+        );
         let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
         Ok((Some(load_addr), Some(size)))
     }
@@ -1610,9 +1555,14 @@ impl KtstrVm {
         vm.allocate_and_register_memory(memory_mib)
             .with_context(|| format!("allocate deferred memory ({memory_mib}MiB, aarch64)"))?;
 
-        // Compute load_addr only AFTER memory_mib is known (it determines
-        // the FDT position, and the initrd sits just below FDT).
-        let load_addr = aarch64_initrd_addr(memory_mib, compressed_size as u64);
+        // Compute load_addr only AFTER memory_mib is known: it determines
+        // the FDT position and thus pvtime_base, and the initrd now sits
+        // just below pvtime_base (the PVTIME carve), not the FDT.
+        let load_addr = aarch64_initrd_addr(
+            memory_mib,
+            self.topology.total_cpus(),
+            compressed_size as u64,
+        );
 
         let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
         Ok((Some(load_addr), Some(size)))
@@ -1636,35 +1586,17 @@ impl KtstrVm {
         //                              driver faults to catch in the
         //                              test VM, and KFENCE adds boot-time
         //                              page-allocation pressure.
-        let mut cmdline = concat!(
-            "console=ttyS0 ",
-            "nomodules mitigations=off ",
-            "random.trust_cpu=on swiotlb=noforce ",
-            "panic=-1 lockdown=none ",
-            "sysctl.kernel.unprivileged_bpf_disabled=0 ",
-            "sysctl.kernel.sched_schedstats=1 ",
-            "delayacct sysctl.kernel.task_delayacct=1 ",
-            "kfence.sample_interval=0 ",
-            // KASLR is ON by default — see x86_64 cmdline above for
-            // the full host-side derivation chain rationale. On
-            // aarch64 the only KASLR axis is `CONFIG_RANDOMIZE_BASE`
-            // (kernel-image slide); arm64 has no
-            // `CONFIG_RANDOMIZE_MEMORY` equivalent (the kernel
-            // direct-map base is fixed by `VA_BITS` —
-            // `arch/arm64/include/asm/memory.h:43-45`). The
-            // KERN_ADDRS `_text` guest-channel path is the SOLE
-            // virt-KASLR derive on this arch (no MSR_LSTAR equivalent
-            // — MSR_LSTAR is x86 SYSCALL infrastructure). Tests opt
-            // out via `#[ktstr_test(kaslr = false)]` or
-            // `Scheduler::kargs(&["nokaslr"])` — same shape as x86.
-            "KTSTR_GUEST=1",
-        )
-        .to_string();
+        let mut cmdline = base_guest_cmdline("kfence.sample_interval=0");
         // earlycon is always enabled so the kernel has a console from
         // the earliest boot stage. Without it, stdout-path auto-detection
         // is the only path to early output — and that can fail silently
         // if the FDT node isn't matched by OF_EARLYCON_DECLARE.
-        cmdline.push_str(" earlycon=uart,mmio,0x09000000");
+        // earlycon base is derived from SERIAL_MMIO_BASE so it tracks the
+        // device-window placement (aarch64/kvm.rs) and can never drift.
+        cmdline.push_str(&format!(
+            " earlycon=uart,mmio,{:#x}",
+            aarch64::kvm::SERIAL_MMIO_BASE
+        ));
         let verbose = std::env::var(crate::KTSTR_VERBOSE_ENV)
             .map(|v| v == "1")
             .unwrap_or(false)
@@ -1709,6 +1641,22 @@ impl KtstrVm {
         boot::validate_cmdline(&cmdline)?;
 
         let fdt_addr = aarch64::fdt::fdt_address(memory_mib);
+
+        // Wire KVM PV stolen-time so the guest's /proc/stat steal
+        // advances under cpu_budget overcommit. The region is carved
+        // from the top of guest RAM (just below the FDT); create_fdt
+        // below shrinks the /memory node to pvtime_base via the same
+        // helper so the guest never reuses it. setup_pvtime gates on
+        // host support (has_device_attr) and skips cleanly otherwise.
+        let pvtime_base = aarch64::fdt::pvtime_base(memory_mib, self.topology.total_cpus());
+        anyhow::ensure!(
+            pvtime_base >= aarch64::kvm::DRAM_START && pvtime_base < fdt_addr,
+            "guest RAM too small to carve the PVTIME region \
+             (pvtime_base={pvtime_base:#x}, fdt_addr={fdt_addr:#x})"
+        );
+        vm.setup_pvtime(pvtime_base)
+            .context("wire KVM PV stolen-time")?;
+
         let mpidrs =
             aarch64::topology::read_mpidrs(&vm.vcpus).context("read vCPU MPIDRs for FDT")?;
         let hw_cache_level = aarch64::topology::host_cache_levels();
@@ -1761,6 +1709,36 @@ impl KtstrVm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for the PVTIME/initrd overlap: the initrd top
+    /// must stay below pvtime_base, never entering the steal-time carve
+    /// `[pvtime_base, fdt_addr)`. Otherwise the host clobbers the initramfs
+    /// before the guest unpacks it — kvm_update_stolen_time writes the
+    /// 8-byte stolen_time field (steal_base+8) from check_vcpu_requests on
+    /// the FIRST KVM_RUN, before guest code executes — and, independently,
+    /// the carve is outside advertised /memory so the guest never reserves
+    /// those pages; either way /init never starts. The earlier PVTIME tests only
+    /// checked the /memory math, never the initrd-vs-carve relationship.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn aarch64_initrd_stays_below_pvtime_carve() {
+        use crate::vmm::{aarch64::fdt::pvtime_base, kvm::DRAM_START};
+        for &(mem, cpus) in &[(512u32, 2u32), (512, 8), (2048, 256), (4096, 512)] {
+            let pvt = pvtime_base(mem, cpus);
+            // A near-max initrd that still fits below the carve.
+            let max = pvt - DRAM_START - (1 << 20);
+            let load = aarch64_initrd_addr(mem, cpus, max);
+            assert!(
+                load >= DRAM_START,
+                "initrd underflows DRAM_START (mem={mem} cpus={cpus} load={load:#x})"
+            );
+            assert!(
+                load + max <= pvt,
+                "initrd top {:#x} entered the PVTIME carve at {pvt:#x} (mem={mem} cpus={cpus})",
+                load + max
+            );
+        }
+    }
 
     /// `Filesystem::Raw` disks emit no auto-mount cmdline tokens.
     /// The host has nothing to advertise: no on-disk fs to mount,

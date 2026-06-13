@@ -1,4 +1,4 @@
-use kvm_bindings::kvm_cpuid_entry2;
+use kvm_bindings::{KVM_CPUID_FLAG_SIGNIFCANT_INDEX, kvm_cpuid_entry2};
 
 use crate::vmm::topology::Topology;
 
@@ -101,6 +101,29 @@ pub fn core_shift(topo: &Topology) -> u32 {
     bits_needed(topo.threads_per_core) + bits_needed(topo.cores_per_llc)
 }
 
+/// Build one Extended-Topology (leaf 0xB/0x1F) subleaf entry.
+/// `shift_to_next` is the x2APIC-ID right-shift that yields the next
+/// level's id; `level_type` is 1=SMT, 2=Core, 0=invalid (terminator).
+fn topo_subleaf(
+    function: u32,
+    index: u32,
+    shift_to_next: u32,
+    count: u32,
+    level_type: u32,
+    apic: u32,
+) -> kvm_cpuid_entry2 {
+    kvm_cpuid_entry2 {
+        function,
+        index,
+        flags: KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+        eax: shift_to_next,
+        ebx: count & 0xffff,
+        ecx: (level_type << 8) | (index & 0xff),
+        edx: apic,
+        ..Default::default()
+    }
+}
+
 /// Patch cache topology fields in a CPUID EAX register (leaf 0x4 or 0x8000001D).
 /// Sets `EAX\[25:14\]` (num_threads_sharing) and `EAX\[31:26\]` (num_cores_on_die)
 /// based on the cache level and VM topology.
@@ -115,6 +138,70 @@ fn patch_cache_topology_eax(entry: &mut kvm_cpuid_entry2, smt: u32, core: u32, c
     let core_bits = bits_needed(cores_per_llc);
     let max_core_ids = (1u32 << core_bits).saturating_sub(1);
     entry.eax = (entry.eax & 0x03ffffff) | ((max_core_ids & 0x3f) << 26);
+}
+
+/// AMD cache geometry for the synthesized cache leaves (0x8000001D and
+/// 0x80000006), modeled on qemu's `legacy_amd_cache_info`
+/// (target/i386/cpu.c): 64-byte lines, 1 partition per cache. The guest
+/// kernel derives `llc_id` solely from `num_threads_sharing` (computed
+/// per-level from the VM topology), via
+/// `get_cache_id = apicid >> order(num_threads_sharing + 1)`, so these
+/// sizes/associativities are informational — they shape only the cache
+/// sizes the guest reports in `/sys`, not the LLC grouping.
+const CACHE_LINE_SIZE: u32 = 64;
+const L1_CACHE_SIZE_KIB: u32 = 64;
+const L1_CACHE_WAYS: u32 = 2;
+const L2_CACHE_SIZE_KIB: u32 = 512;
+const L2_CACHE_WAYS: u32 = 16;
+const L3_CACHE_SIZE_KIB: u32 = 16 * 1024;
+const L3_CACHE_WAYS: u32 = 16;
+/// AMD 0x80000006 ECX/EDX associativity encoding for 16-way (qemu
+/// `X86_ENC_ASSOC` / AMD APM): 16-way -> 0x8.
+const ASSOC_ENC_16WAY: u32 = 0x8;
+/// Leaf 0x80000006 ECX (L2) / EDX (L3) descriptors, matching the
+/// 0x8000001D L2/L3 geometry. EDX\[31:18\]=L3 size/512KiB nonzero is the AMD
+/// L3-detection gate (cpuid_amd_hygon_has_l3_cache). ECX\[31:16\]=L2 size KiB.
+const L80000006_ECX: u32 =
+    (L2_CACHE_SIZE_KIB << 16) | (ASSOC_ENC_16WAY << 12) | (1 << 8) | CACHE_LINE_SIZE;
+const L80000006_EDX: u32 =
+    ((L3_CACHE_SIZE_KIB / 512) << 18) | (ASSOC_ENC_16WAY << 12) | (1 << 8) | CACHE_LINE_SIZE;
+
+/// Build one AMD cache-topology subleaf (leaf 0x8000001D), encoded per the
+/// AMD APM / qemu `encode_cache_cpuid8000001d`. `cache_type` is 1=data,
+/// 2=instruction, 3=unified. `num_threads_sharing` is the count MINUS ONE
+/// of logical CPUs sharing this cache (EAX\[25:14\]) — the field the guest
+/// kernel reads to compute llc_id. EAX\[31:26\] (num_cores) and EAX\[9\]
+/// (fully-associative) are left 0, matching qemu's 0x8000001D (only the
+/// Intel leaf 0x4 encodes num_cores). EBX\[11:0\]=line-1, \[21:12\]=partitions-1
+/// (0, one partition), \[31:22\]=ways-1; ECX=sets-1; EDX=property flags.
+#[allow(clippy::too_many_arguments)]
+fn amd_cache_subleaf(
+    index: u32,
+    cache_type: u32,
+    level: u32,
+    self_init: bool,
+    size_kib: u32,
+    ways: u32,
+    num_threads_sharing: u32,
+    flags: u32,
+) -> kvm_cpuid_entry2 {
+    // size = line * ways * partitions(1) * sets  =>  sets = size / (line * ways)
+    let sets = (size_kib * 1024) / (CACHE_LINE_SIZE * ways);
+    let eax = cache_type
+        | (level << 5)
+        | (u32::from(self_init) << 8)
+        | ((num_threads_sharing & 0xfff) << 14);
+    let ebx = (CACHE_LINE_SIZE - 1) | ((ways - 1) << 22);
+    kvm_cpuid_entry2 {
+        function: 0x8000_001d,
+        index,
+        flags: KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+        eax,
+        ebx,
+        ecx: sets - 1,
+        edx: flags,
+        ..Default::default()
+    }
 }
 
 /// Generate CPUID entries for a specific vCPU with topology information.
@@ -142,7 +229,15 @@ pub fn generate_cpuid(
     let apic = apic_id(topo, cpu_id);
     let smt = smt_shift(topo);
     let core = core_shift(topo);
-    let threads_per_llc = topo.cores_per_llc * topo.threads_per_core;
+    // The whole machine is one package: the LLCs are sub-domains carved by
+    // the cache leaf (0x4 / 0x8000001D), not separate packages. `pkg_shift`
+    // is the APIC-ID width below the package, so `apic >> pkg_shift == 0`
+    // for every CPU -> the guest kernel groups all CPUs into one package.
+    // One multi-core package is the precondition for the kernel to build
+    // multi-core sibling masks at all (has_mp); the LLC sub-domain within it
+    // is then carved by llc_id from the cache leaf, not by the package id.
+    let total_cpus = topo.total_cpus();
+    let pkg_shift = bits_needed(max_apic_id(topo) + 1);
 
     for entry in entries.iter_mut() {
         match entry.function {
@@ -150,12 +245,18 @@ pub fn generate_cpuid(
             0x1 => {
                 // EBX[31:24] = initial APIC ID (8-bit)
                 entry.ebx = (entry.ebx & 0x00ffffff) | ((apic & 0xff) << 24);
-                // EBX[23:16] = max addressable logical processors per LLC
-                entry.ebx = (entry.ebx & 0xff00ffff) | ((threads_per_llc.min(255)) << 16);
+                // EBX[23:16] = max addressable logical processors in the
+                // package (all CPUs, rounded up to a power of two, clamped to
+                // the field's 8-bit max of 255). LLC-scoped here would tell
+                // the guest the package is one LLC. For >255 CPUs the guest
+                // uses leaf 0xB EDX (32-bit) under x2APIC, not this legacy
+                // field.
+                let lpc = total_cpus.next_power_of_two().min(255);
+                entry.ebx = (entry.ebx & 0xff00ffff) | (lpc << 16);
                 // EBX[15:8] = CLFLUSH line size — preserved from KVM
                 // ECX.31 = hypervisor — preserved from KVM
                 // EDX bit 28 = HTT
-                if threads_per_llc > 1 {
+                if total_cpus > 1 {
                     entry.edx |= 1 << 28;
                 }
             }
@@ -165,41 +266,18 @@ pub fn generate_cpuid(
                 patch_cache_topology_eax(entry, smt, core, topo.cores_per_llc);
             }
 
-            // Leaves 0xB and 0x1F: Extended Topology Enumeration.
-            // 0x1F is a superset of 0xB; both enumerate identical
-            // SMT and Core levels in this topology model.
-            0xb | 0x1f => match entry.index {
-                // Subleaf 0: SMT level
-                0 => {
-                    entry.eax = smt;
-                    entry.ebx = topo.threads_per_core & 0xffff;
-                    entry.ecx = (1 << 8) | (entry.index & 0xff); // type=SMT
-                    entry.edx = apic;
-                }
-                // Subleaf 1: Core level (threads within one LLC)
-                1 => {
-                    entry.eax = core;
-                    entry.ebx = threads_per_llc & 0xffff;
-                    entry.ecx = (2 << 8) | (entry.index & 0xff); // type=Core
-                    entry.edx = apic;
-                }
-                // Subleaf 2+: invalid level (terminate enumeration)
-                _ => {
-                    entry.eax = 0;
-                    entry.ebx = 0;
-                    entry.ecx = entry.index & 0xff; // type=0 (invalid)
-                    entry.edx = apic;
-                }
-            },
+            // Leaves 0xB / 0x1F (Extended Topology) are SYNTHESIZED after
+            // this loop, not patched here: KVM's get_supported_cpuid zeroes
+            // these leaves (eax=ebx=ecx=0, no Core subleaf 1 — KVM leaves a
+            // "valid topology ... subleaf 1" for the VMM to populate), so
+            // patching in place cannot add the Core-level subleaf the guest
+            // needs to form a single package. See below.
 
-            // Leaf 0x8000001D: AMD Cache Topology (AMD equivalent of leaf 0x4)
-            // EAX layout matches leaf 0x4: [4:0]=type, [7:5]=level,
-            // [25:14]=num_threads_sharing, [31:26]=num_cores_on_die.
-            // Without patching, host values pass through and the guest
-            // kernel sees all vCPUs sharing one L3 regardless of LLC count.
-            0x8000_001d if vendor == CpuVendor::Amd => {
-                patch_cache_topology_eax(entry, smt, core, topo.cores_per_llc);
-            }
+            // Leaf 0x8000001D (AMD Cache Topology) is SYNTHESIZED after this
+            // loop, not patched here: patching only rewrites host-provided
+            // subleaves, so a host whose 0x8000001D omits the L3 (type=3,
+            // level=3) subleaf would leave the guest's llc_id unset and
+            // collapse every CPU into one LLC. See the synthesis block below.
 
             // Leaf 0xA: Architectural Performance Monitoring (Intel SDM,
             // Architectural Performance Monitoring). Synthesized to a
@@ -230,19 +308,41 @@ pub fn generate_cpuid(
             }
 
             // Leaf 0x80000001: AMD extended feature identification (AMD only)
-            0x8000_0001 if vendor == CpuVendor::Amd && threads_per_llc > 1 => {
+            0x8000_0001 if vendor == CpuVendor::Amd && total_cpus > 1 => {
                 // ECX bit 1 = CmpLegacy: multi-core chip
                 // ECX bit 22 = TopologyExtensions: enables leaves 0x8000001D/1E
                 entry.ecx |= (1 << 1) | (1 << 22);
+            }
+
+            // Leaf 0x80000006: AMD L2 (ECX) and L3 (EDX) cache descriptors.
+            // EDX MUST be non-zero: the guest kernel gates AMD L3 detection
+            // on cpuid_amd_hygon_has_l3_cache() == (cpuid_edx(0x80000006) != 0)
+            // (arch/x86/include/asm/cpuid/api.h). KVM passes the host value
+            // through; a host that masks the L3-size field to 0 makes the
+            // guest see no L3 and collapse every CPU into its own LLC.
+            // Synthesize L2/L3 to match the 0x8000001D geometry below so the
+            // gate holds host-independently; EAX/EBX (TLB) are left as the
+            // host reported them. 16-way associativity encodes to 0x8.
+            0x8000_0006 if vendor == CpuVendor::Amd => {
+                entry.ecx = L80000006_ECX; // L2: size KiB<<16 | assoc<<12 | lines/tag<<8 | line
+                entry.edx = L80000006_EDX; // L3: size/512KiB<<18 | assoc<<12 | lines/tag<<8 | line
             }
 
             // Leaf 0x80000008: virtual/physical address sizes (vendor-independent)
             // ECX[7:0] = number of physical threads - 1
             // ECX[15:12] = APIC ID size (bits needed for thread IDs in package)
             0x8000_0008 => {
-                if threads_per_llc > 1 {
-                    let apic_id_size = core;
-                    entry.ecx = (apic_id_size << 12) | (threads_per_llc - 1);
+                if total_cpus > 1 {
+                    // ECX[15:12] = APIC-ID bits covering all CPUs in the
+                    // package (= the CORE domain shift the AMD topology
+                    // parser uses for the package boundary, apic >> shift).
+                    // ECX[7:0] = threads-per-package - 1, SATURATED to the
+                    // 8-bit field: a >256-CPU package would otherwise wrap to
+                    // a small NC and collapse the package. NC is only the
+                    // AMD fallback when leaf 0xB is absent (we always emit
+                    // 0xB), but saturating avoids advertising a wrong, small
+                    // count. Both must be package-scoped, not LLC-scoped.
+                    entry.ecx = (pkg_shift << 12) | ((total_cpus - 1).min(0xff));
                 } else {
                     entry.ecx = 0;
                 }
@@ -268,6 +368,116 @@ pub fn generate_cpuid(
         }
     }
 
+    // Synthesize the Extended-Topology leaves (0xB, and 0x1F for Intel).
+    // KVM's get_supported_cpuid zeroes these leaves (eax=ebx=ecx=0, no Core
+    // subleaf 1 — it leaves a "valid topology ... subleaf 1" for the VMM to
+    // populate) — so a Core-level subleaf whose shift spans the WHOLE
+    // package must be EMITTED (patching can't add a missing subleaf), else
+    // the guest kernel leaves every CPU in its own package and
+    // cpu_llc_shared_mask collapses to per-CPU (per-CPU L3). The LLC
+    // sub-domain within the package is carved by the cache leaf
+    // (0x4 / 0x8000001D). 0x1F is emitted only for Intel guests; AMD does
+    // not enumerate it and the kernel falls through to 0xB.
+    let topo_leaves: &[u32] = if vendor == CpuVendor::Intel {
+        &[0xb, 0x1f]
+    } else {
+        &[0xb]
+    };
+    entries.retain(|e| e.function != 0xb && e.function != 0x1f);
+    for &func in topo_leaves {
+        // Subleaf 0: SMT level — shift to the Core id is the SMT width.
+        entries.push(topo_subleaf(func, 0, smt, topo.threads_per_core, 1, apic));
+        // Subleaf 1: Core level — shift to the Package id spans the whole
+        // package, so apic >> pkg_shift == 0 for every CPU (one package).
+        entries.push(topo_subleaf(func, 1, pkg_shift, total_cpus, 2, apic));
+        // Subleaf 2: terminator (level type 0 ends enumeration).
+        entries.push(topo_subleaf(func, 2, 0, 0, 0, apic));
+    }
+
+    // Synthesize the AMD cache-topology leaf 0x8000001D (host-independent).
+    // The old code PATCHED the host's 0x8000001D subleaves in place, which
+    // depends on the host exposing a complete L1/L2/L3 chain; a host whose
+    // 0x8000001D lacks an L3 (type=3, level=3) subleaf would leave the
+    // guest's llc_id unset (BAD_APICID) and collapse every CPU into one
+    // LLC. Emit the full L1d/L1i/L2/L3 chain + a type-0 terminator so
+    // find_num_cache_leaves (arch/x86/kernel/cpu/cacheinfo.c) always finds
+    // L3 as the highest subleaf and amd_fill_cpuid4_info reads its
+    // num_threads_sharing. L1/L2 share at the SMT level ((1<<smt)-1); L3
+    // spans the LLC ((1<<core_shift)-1) — the span that makes get_cache_id
+    // (apicid >> order(num_threads_sharing+1)) place each LLC on its own
+    // cache id. Subleaf ORDER matters: L3 must be the highest non-null
+    // index. AMD only — Intel uses leaf 0x4 (patched above) and 0x80000006
+    // EDX is reserved on Intel.
+    if vendor == CpuVendor::Amd {
+        let smt_sharing = (1u32 << smt).saturating_sub(1);
+        let llc_sharing = (1u32 << core).saturating_sub(1);
+        entries.retain(|e| e.function != 0x8000_001d);
+        // args: (index, type, level, self_init, size_kib, ways, sharing, flags).
+        // EDX flags per qemu legacy_amd_cache_info: L1d/L1i=no-invd(0x1),
+        // L2=none(0x0), L3=inclusive|complex(0x6). The kernel reads only
+        // EAX/EBX/ECX from 0x8000001D, so EDX flags are informational.
+        entries.push(amd_cache_subleaf(
+            0,
+            1,
+            1,
+            true,
+            L1_CACHE_SIZE_KIB,
+            L1_CACHE_WAYS,
+            smt_sharing,
+            0x1,
+        )); // L1 data
+        entries.push(amd_cache_subleaf(
+            1,
+            2,
+            1,
+            true,
+            L1_CACHE_SIZE_KIB,
+            L1_CACHE_WAYS,
+            smt_sharing,
+            0x1,
+        )); // L1 instruction
+        entries.push(amd_cache_subleaf(
+            2,
+            3,
+            2,
+            false,
+            L2_CACHE_SIZE_KIB,
+            L2_CACHE_WAYS,
+            smt_sharing,
+            0x0,
+        )); // L2 unified
+        entries.push(amd_cache_subleaf(
+            3,
+            3,
+            3,
+            true,
+            L3_CACHE_SIZE_KIB,
+            L3_CACHE_WAYS,
+            llc_sharing,
+            0x6,
+        )); // L3 unified (the LLC)
+        // Terminator: type 0 (EAX[4:0]=0) ends the kernel's subleaf walk.
+        entries.push(kvm_cpuid_entry2 {
+            function: 0x8000_001d,
+            index: 4,
+            flags: KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            ..Default::default()
+        });
+        // 0x80000006 is patched in-loop when present (preserving the host's
+        // L2-TLB EAX/EBX); if the base omits it entirely, push a synthesized
+        // one so the L3 gate (EDX != 0) still holds — symmetric with the
+        // 0x8000001D synthesis. (Real KVM always enumerates 0x80000006; this
+        // guards a base that omits an architectural leaf.)
+        if !entries.iter().any(|e| e.function == 0x8000_0006) {
+            entries.push(kvm_cpuid_entry2 {
+                function: 0x8000_0006,
+                ecx: L80000006_ECX,
+                edx: L80000006_EDX,
+                ..Default::default()
+            });
+        }
+    }
+
     // Add hypervisor identification leaf (0x40000000) if not present.
     // Guest OS uses leaf 0x1 ECX.31 to detect hypervisor, then reads
     // 0x40000000 for the hypervisor signature. KVM's supported CPUID
@@ -286,21 +496,51 @@ pub fn generate_cpuid(
         });
     }
 
+    // Topologies above the xAPIC limit (max APIC ID > 254 — the same
+    // threshold that switches the VMM to split-irqchip) need x2APIC with
+    // extended MSI destination IDs to address CPUs above 255.
+    // KVM_FEATURE_MSI_EXT_DEST_ID (0x40000001 EAX bit 15) makes the guest's
+    // try_to_enable_x2apic raise apic_limit from 255 to 32767
+    // (arch/x86/kernel/apic/apic.c) and pack the high destination bits into
+    // the IOAPIC RTE / MSI address; host KVM decodes them via
+    // x86_msi_msg_get_destid. Without it the guest refuses to online any CPU
+    // whose APIC ID exceeds 255. Gated on the topology so smaller guests'
+    // CPUID is byte-identical to before.
+    let wide_smp = max_apic_id(topo) > crate::vmm::x86_64::kvm::MAX_XAPIC_ID;
+    if wide_smp {
+        if let Some(entry) = entries.iter_mut().find(|e| e.function == 0x4000_0001) {
+            entry.eax |= 1 << 15; // KVM_FEATURE_MSI_EXT_DEST_ID
+        } else {
+            // Defensive: KVM always enumerates 0x40000001 (its PV-features
+            // leaf), but a base CPUID that omitted it would otherwise drop
+            // the bit silently.
+            entries.push(kvm_cpuid_entry2 {
+                function: 0x4000_0001,
+                eax: 1 << 15,
+                ..Default::default()
+            });
+        }
+    }
+
     // KVM_HINTS_REALTIME: CPUID leaf 0x40000001 EDX bit 0.
     // Disables PV spinlocks, PV TLB flush, and PV sched_yield in the
     // guest, and enables haltpoll cpuidle. PV spinlocks require
     // CONFIG_PARAVIRT_SPINLOCKS (not in ktstr.kconfig, so no-op for ktstr
     // guests). Only set in performance_mode to avoid disabling PV
     // optimizations in functional tests.
-    if performance_mode {
-        if let Some(entry) = entries.iter_mut().find(|e| e.function == 0x4000_0001) {
-            entry.edx |= 1;
-        }
+    if performance_mode && let Some(entry) = entries.iter_mut().find(|e| e.function == 0x4000_0001)
+    {
+        entry.edx |= 1;
+    }
 
-        // Bump max hypervisor leaf so the guest enumerates 0x40000001.
-        if let Some(entry) = entries.iter_mut().find(|e| e.function == 0x4000_0000) {
-            entry.eax = entry.eax.max(0x4000_0001);
-        }
+    // Both paths above populate leaf 0x40000001 (wide_smp -> EAX
+    // MSI_EXT_DEST_ID; performance_mode -> EDX HINTS_REALTIME); the guest
+    // only enumerates it if 0x40000000 advertises it as the max hypervisor
+    // leaf. Bump once for whichever ran.
+    if (wide_smp || performance_mode)
+        && let Some(entry) = entries.iter_mut().find(|e| e.function == 0x4000_0000)
+    {
+        entry.eax = entry.eax.max(0x4000_0001);
     }
 
     entries
@@ -704,7 +944,7 @@ mod tests {
     }
 
     #[test]
-    fn leaf1_threads_per_llc_not_total() {
+    fn leaf1_lpc_is_package_total() {
         let kvm = match kvm_ioctls::Kvm::new() {
             Ok(k) => k,
             Err(_) => return,
@@ -728,11 +968,12 @@ mod tests {
         );
         let leaf1 = cpuid.iter().find(|e| e.function == 1);
         if let Some(entry) = leaf1 {
-            let threads_per_llc = (entry.ebx >> 16) & 0xff;
+            let lpc = (entry.ebx >> 16) & 0xff;
             assert_eq!(
-                threads_per_llc,
-                8, // cores_per_llc * threads_per_core, not total
-                "EBX[23:16] should be threads per LLC (8), not total CPUs (32)"
+                lpc,
+                32, // logical processors in the package = all CPUs (pow2)
+                "EBX[23:16] is the package logical-processor count (all 32 CPUs), \
+                 not one LLC's worth"
             );
         }
     }
@@ -807,7 +1048,7 @@ mod tests {
     }
 
     #[test]
-    fn leaf0b_subleaf1_ebx_is_threads_per_llc() {
+    fn leaf0b_subleaf1_core_spans_package() {
         let kvm = match kvm_ioctls::Kvm::new() {
             Ok(k) => k,
             Err(_) => return,
@@ -832,13 +1073,13 @@ mod tests {
         if let Some(entry) = leaf_b_1 {
             assert_eq!(
                 entry.ebx & 0xffff,
-                8, // cores_per_llc * threads_per_core
-                "leaf 0xB subleaf 1 EBX should be threads per LLC"
+                topo.total_cpus(),
+                "leaf 0xB Core subleaf EBX is the whole package's logical CPUs"
             );
             assert_eq!(
                 entry.eax,
-                core_shift(&topo),
-                "leaf 0xB subleaf 1 EAX should be core_shift"
+                bits_needed(max_apic_id(&topo) + 1),
+                "leaf 0xB Core subleaf EAX is the package shift (apic >> it == 0)"
             );
         }
     }
@@ -1429,12 +1670,20 @@ mod tests {
         );
         let leaf = cpuid.iter().find(|e| e.function == 0x8000_0008);
         if let Some(entry) = leaf {
-            // ECX[7:0] = threads per package - 1
+            // ECX[7:0] = CPUs per package - 1 (all CPUs, package-scoped)
             let nc = entry.ecx & 0xff;
-            assert_eq!(nc, 7, "NC should be threads_per_package - 1");
-            // ECX[15:12] = APIC ID size
+            assert_eq!(
+                nc,
+                topo.total_cpus() - 1,
+                "NC should be cpus_per_package - 1"
+            );
+            // ECX[15:12] = APIC-ID core-id size = the package shift
             let apic_id_size = (entry.ecx >> 12) & 0xf;
-            assert_eq!(apic_id_size, core_shift(&topo), "APIC ID size = core_shift");
+            assert_eq!(
+                apic_id_size,
+                bits_needed(max_apic_id(&topo) + 1),
+                "ApicIdCoreIdSize is the package shift"
+            );
         }
     }
 
@@ -1757,21 +2006,21 @@ mod tests {
             );
             let leaf = cpuid.iter().find(|e| e.function == 0x8000_0008);
             if let Some(entry) = leaf {
-                let threads_per_llc = cores * threads;
+                let total_cpus = llcs * cores * threads;
                 let apic_id_size = (entry.ecx >> 12) & 0xf;
                 let nc = entry.ecx & 0xff;
 
-                if threads_per_llc > 1 {
+                if total_cpus > 1 {
                     assert!(
-                        (1u32 << apic_id_size) >= threads_per_llc,
+                        (1u32 << apic_id_size) >= total_cpus,
                         "{llcs}l/{cores}c/{threads}t: ApicIdSize {apic_id_size} too small \
-                         for {threads_per_llc} threads (2^{apic_id_size} = {})",
+                         for {total_cpus} cpus (2^{apic_id_size} = {})",
                         1u32 << apic_id_size
                     );
                     assert_eq!(
                         nc,
-                        threads_per_llc - 1,
-                        "{llcs}l/{cores}c/{threads}t: NC should be threads_per_llc - 1"
+                        (total_cpus - 1) & 0xff,
+                        "{llcs}l/{cores}c/{threads}t: NC should be total_cpus - 1"
                     );
                 } else {
                     assert_eq!(
@@ -2010,24 +2259,24 @@ mod tests {
             0,
             false,
         );
-        let l3 = cpuid
+        let entry = cpuid
             .iter()
-            .find(|e| e.function == 0x8000_001d && ((e.eax >> 5) & 0x7) == 3);
-        if let Some(entry) = l3 {
-            let max_sharing = (entry.eax >> 14) & 0xfff;
-            assert_eq!(
-                max_sharing,
-                (1u32 << core_shift(&topo)) - 1,
-                "AMD leaf 0x8000001D L3 sharing should be patched to LLC scope"
-            );
-            let max_core_ids = (entry.eax >> 26) & 0x3f;
-            let core_bits = bits_needed(topo.cores_per_llc);
-            assert_eq!(
-                max_core_ids,
-                (1u32 << core_bits) - 1,
-                "AMD leaf 0x8000001D core IDs should match topology"
-            );
-        }
+            .find(|e| e.function == 0x8000_001d && ((e.eax >> 5) & 0x7) == 3)
+            .expect("synthesized AMD L3 subleaf (type=3) must be present");
+        let max_sharing = (entry.eax >> 14) & 0xfff;
+        assert_eq!(
+            max_sharing,
+            (1u32 << core_shift(&topo)) - 1,
+            "AMD leaf 0x8000001D L3 sharing spans the LLC (core_shift scope)"
+        );
+        // EAX[31:26] (num_cores) is left 0 on 0x8000001D, matching qemu's
+        // encode_cache_cpuid8000001d (only the Intel leaf 0x4 encodes it;
+        // the guest kernel reads only num_threads_sharing[25:14] for llc_id).
+        assert_eq!(
+            (entry.eax >> 26) & 0x3f,
+            0,
+            "0x8000001D leaves EAX[31:26] num_cores = 0 (qemu parity)"
+        );
     }
 
     #[test]
@@ -2061,17 +2310,16 @@ mod tests {
         );
         // L1 and L2 should share at core level (SMT siblings only)
         for level in [1u32, 2] {
-            let leaf = cpuid
+            let entry = cpuid
                 .iter()
-                .find(|e| e.function == 0x8000_001d && ((e.eax >> 5) & 0x7) == level);
-            if let Some(entry) = leaf {
-                let max_sharing = (entry.eax >> 14) & 0xfff;
-                assert_eq!(
-                    max_sharing,
-                    (1u32 << smt_shift(&topo)) - 1,
-                    "AMD leaf 0x8000001D L{level} sharing should be per-core (SMT level)"
-                );
-            }
+                .find(|e| e.function == 0x8000_001d && ((e.eax >> 5) & 0x7) == level)
+                .unwrap_or_else(|| panic!("synthesized AMD cache subleaf for level {level}"));
+            let max_sharing = (entry.eax >> 14) & 0xfff;
+            assert_eq!(
+                max_sharing,
+                (1u32 << smt_shift(&topo)) - 1,
+                "AMD leaf 0x8000001D L{level} sharing is per-core (SMT level)"
+            );
         }
     }
 
@@ -2113,13 +2361,15 @@ mod tests {
             4,
             false,
         );
-        let l3_0 = cpuid0
+        let e0 = cpuid0
             .iter()
-            .find(|e| e.function == 0x8000_001d && ((e.eax >> 5) & 0x7) == 3);
-        let l3_4 = cpuid4
+            .find(|e| e.function == 0x8000_001d && ((e.eax >> 5) & 0x7) == 3)
+            .expect("synthesized AMD L3 subleaf for cpu 0");
+        let e4 = cpuid4
             .iter()
-            .find(|e| e.function == 0x8000_001d && ((e.eax >> 5) & 0x7) == 3);
-        if let (Some(e0), Some(e4)) = (l3_0, l3_4) {
+            .find(|e| e.function == 0x8000_001d && ((e.eax >> 5) & 0x7) == 3)
+            .expect("synthesized AMD L3 subleaf for cpu 4");
+        {
             // Both should have the same sharing field (per-LLC scope)
             let sharing0 = (e0.eax >> 14) & 0xfff;
             let sharing4 = (e4.eax >> 14) & 0xfff;
@@ -2212,6 +2462,235 @@ mod tests {
                 cache_ids.len(),
             );
         }
+    }
+
+    /// Host-independent (synthetic base): the synthesized 0xB Core
+    /// subleaf (index 1) must EXIST — the exact regression this fix prevents
+    /// (an absent Core subleaf collapses every CPU into its own package).
+    /// Also asserts exactly one entry per (function, index) and the vendor
+    /// 0x1F split (Intel emits it, AMD does not).
+    #[test]
+    fn leaf0b_core_subleaf_emitted_both_vendors() {
+        // (label, leaf-0 ebx, edx, ecx) — the vendor string.
+        for (vendor, ebx, edx, ecx) in [
+            ("intel", 0x756e_6547u32, 0x4965_6e69u32, 0x6c65_746eu32),
+            ("amd", 0x6874_7541u32, 0x6974_6e65u32, 0x444d_4163u32),
+        ] {
+            let base = vec![kvm_cpuid_entry2 {
+                function: 0,
+                ebx,
+                edx,
+                ecx,
+                ..Default::default()
+            }];
+            let topo = Topology {
+                llcs: 2,
+                cores_per_llc: 4,
+                threads_per_core: 1,
+                numa_nodes: 1,
+                nodes: None,
+                distances: None,
+            };
+            let cpuid = generate_cpuid(&base, &topo, 0, false);
+            // The Core (index 1) subleaf MUST be present (not vacuous).
+            let core_sub = cpuid
+                .iter()
+                .find(|e| e.function == 0xb && e.index == 1)
+                .unwrap_or_else(|| {
+                    panic!("{vendor}: 0xB Core subleaf (index 1) must be synthesized")
+                });
+            assert_eq!(
+                (core_sub.ecx >> 8) & 0xff,
+                2,
+                "{vendor}: 0xB index 1 must be the Core level (type 2)"
+            );
+            // Exactly one entry per (function, index) — no host subleaf leaks.
+            for idx in 0..3u32 {
+                let n = cpuid
+                    .iter()
+                    .filter(|e| e.function == 0xb && e.index == idx)
+                    .count();
+                assert_eq!(
+                    n, 1,
+                    "{vendor}: exactly one 0xB subleaf at index {idx}, got {n}"
+                );
+            }
+            // 0x1F is emitted for Intel guests only; AMD falls through to 0xB.
+            let has_1f = cpuid.iter().any(|e| e.function == 0x1f);
+            if vendor == "intel" {
+                assert!(has_1f, "intel: 0x1F must be emitted");
+                assert!(
+                    cpuid.iter().any(|e| e.function == 0x1f && e.index == 1),
+                    "intel: 0x1F Core subleaf (index 1) must be present"
+                );
+            } else {
+                assert!(!has_1f, "amd: 0x1F must NOT be emitted");
+            }
+        }
+    }
+
+    /// Host-independence (synthetic base): on a forced-AMD base that
+    /// OMITS 0x8000001D and masks the 0x80000006 L3-size field to 0,
+    /// generate_cpuid must still emit a full L1/L2/L3 chain + a nonzero
+    /// L3-detection gate, so the guest's llc_id is correct regardless of the
+    /// host CPUID. (The 0x80000006-absent case is covered separately by
+    /// leaf_80000006_synthesized_when_absent.)
+    #[test]
+    fn amd_cache_leaves_synthesized_host_independent() {
+        let base = vec![
+            kvm_cpuid_entry2 {
+                function: 0,
+                ebx: 0x6874_7541, // "Auth"
+                edx: 0x6974_6e65, // "enti"
+                ecx: 0x444d_4163, // "cAMD"
+                ..Default::default()
+            },
+            // Host 0x80000006 present but the L3-size field masked to 0.
+            kvm_cpuid_entry2 {
+                function: 0x8000_0006,
+                ..Default::default()
+            },
+            // No 0x8000001D in the base — the host omits the cache chain.
+        ];
+        let topo = Topology {
+            llcs: 2,
+            cores_per_llc: 4,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let cpuid = generate_cpuid(&base, &topo, 0, false);
+        // L1d(0), L1i(1), L2(2), L3(3) chain must be emitted in order.
+        let chain: Vec<(u32, u32)> = (0..4)
+            .map(|i| {
+                let e = cpuid
+                    .iter()
+                    .find(|e| e.function == 0x8000_001d && e.index == i)
+                    .unwrap_or_else(|| panic!("0x8000001D subleaf {i} must be synthesized"));
+                (e.eax & 0x1f, (e.eax >> 5) & 0x7) // (type, level)
+            })
+            .collect();
+        assert_eq!(
+            chain,
+            vec![(1, 1), (2, 1), (3, 2), (3, 3)],
+            "0x8000001D must emit L1d, L1i, L2, L3 (type,level) in order"
+        );
+        // Index 4 is the type-0 terminator; L3 (index 3) is the highest
+        // non-null subleaf the kernel's find_num_cache_leaves stops after.
+        let term = cpuid
+            .iter()
+            .find(|e| e.function == 0x8000_001d && e.index == 4)
+            .expect("0x8000001D terminator subleaf");
+        assert_eq!(
+            term.eax & 0x1f,
+            0,
+            "0x8000001D index 4 must be the type-0 terminator"
+        );
+        // L3 num_threads_sharing spans the LLC (the field driving llc_id).
+        let l3 = cpuid
+            .iter()
+            .find(|e| e.function == 0x8000_001d && e.index == 3)
+            .unwrap();
+        assert_eq!(
+            (l3.eax >> 14) & 0xfff,
+            (1u32 << core_shift(&topo)) - 1,
+            "L3 num_threads_sharing must span the LLC (core_shift scope)"
+        );
+        // The L3-detection gate: 0x80000006 EDX must be nonzero despite the
+        // host reporting 0 (cpuid_amd_hygon_has_l3_cache checks EDX != 0).
+        let l6 = cpuid
+            .iter()
+            .find(|e| e.function == 0x8000_0006)
+            .expect("0x80000006 must be present");
+        assert_ne!(
+            l6.edx, 0,
+            "0x80000006 EDX (the AMD L3-detection gate) must be synthesized nonzero"
+        );
+    }
+
+    /// qemu-parity guard (host-independent, synthetic AMD base): pin the EDX
+    /// cache-property flags the synthesized 0x8000001D subleaves carry. These
+    /// mirror qemu's `legacy_amd_cache_info` (target/i386/cpu.c): L1d/L1i =
+    /// no-write-invalidate (0x1), L2 = none (0x0), L3 = inclusive|complex
+    /// (0x6). The kernel reads only EAX/EBX/ECX from 0x8000001D, so EDX is
+    /// informational — but a regression in these flag bytes would silently
+    /// diverge from qemu's emitted CPUID. Asserting the subleaf ORDER (index
+    /// 0=L1d, 1=L1i, 2=L2, 3=L3, by type/level) catches a reorder that would
+    /// mis-attribute the flags. (EAX/EBX/ECX geometry and the chain order are
+    /// covered by amd_cache_leaves_synthesized_host_independent.)
+    #[test]
+    fn amd_cache_0x8000001d_edx_flags_pinned() {
+        let base = vec![kvm_cpuid_entry2 {
+            function: 0,
+            ebx: 0x6874_7541, // "Auth"
+            edx: 0x6974_6e65, // "enti"
+            ecx: 0x444d_4163, // "cAMD"
+            ..Default::default()
+        }];
+        let topo = Topology {
+            llcs: 2,
+            cores_per_llc: 4,
+            threads_per_core: 2,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let cpuid = generate_cpuid(&base, &topo, 0, false);
+        // (type, level, edx) per subleaf index 0..3 — type from EAX[4:0],
+        // level from EAX[7:5], edx = the cache-property flags.
+        let subleaves: Vec<(u32, u32, u32)> = (0..4)
+            .map(|i| {
+                let e = cpuid
+                    .iter()
+                    .find(|e| e.function == 0x8000_001d && e.index == i)
+                    .unwrap_or_else(|| panic!("0x8000001D subleaf {i} must be synthesized"));
+                (e.eax & 0x1f, (e.eax >> 5) & 0x7, e.edx)
+            })
+            .collect();
+        assert_eq!(
+            subleaves,
+            vec![
+                (1, 1, 0x1), // index 0: L1d, level 1, no-write-invalidate
+                (2, 1, 0x1), // index 1: L1i, level 1, no-write-invalidate
+                (3, 2, 0x0), // index 2: L2 unified, level 2, no flags
+                (3, 3, 0x6), // index 3: L3 unified, level 3, inclusive|complex
+            ],
+            "0x8000001D subleaves must emit L1d/L1i/L2/L3 in order with qemu \
+             legacy_amd_cache_info EDX flags (0x1/0x1/0x0/0x6)"
+        );
+    }
+
+    /// Host-independence: on a forced-AMD base that OMITS 0x80000006
+    /// entirely (vs masking its EDX to 0), the synthesis must PUSH the leaf
+    /// so the L3-detection gate (cpuid_amd_hygon_has_l3_cache = EDX != 0)
+    /// still holds — symmetric with the 0x8000001D synthesis.
+    #[test]
+    fn leaf_80000006_synthesized_when_absent() {
+        let base = vec![kvm_cpuid_entry2 {
+            function: 0,
+            ebx: 0x6874_7541, // "Auth"
+            edx: 0x6974_6e65, // "enti"
+            ecx: 0x444d_4163, // "cAMD"
+            ..Default::default()
+        }];
+        let topo = Topology {
+            llcs: 2,
+            cores_per_llc: 4,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let cpuid = generate_cpuid(&base, &topo, 0, false);
+        let l6 = cpuid
+            .iter()
+            .find(|e| e.function == 0x8000_0006)
+            .expect("0x80000006 must be synthesized when absent from the base");
+        assert_ne!(
+            l6.edx, 0,
+            "0x80000006 EDX (the L3-detection gate) must be nonzero when synthesized"
+        );
     }
 
     #[test]
@@ -2369,6 +2848,108 @@ mod tests {
                 "KVM_HINTS_REALTIME should not be set without performance_mode"
             );
         }
+    }
+
+    #[test]
+    fn msi_ext_dest_id_set_for_wide_topology() {
+        // A topology whose max APIC ID exceeds the xAPIC limit (>254) must
+        // advertise KVM_FEATURE_MSI_EXT_DEST_ID (0x40000001 EAX bit 15) so
+        // the guest raises its APIC limit and can address CPUs above 255.
+        let base = vec![
+            kvm_cpuid_entry2 {
+                function: 0,
+                ebx: 0x756e_6547, // "Genu"
+                edx: 0x4965_6e69, // "ineI"
+                ecx: 0x6c65_746e, // "ntel"
+                ..Default::default()
+            },
+            kvm_cpuid_entry2 {
+                function: 0x4000_0000,
+                eax: 0x4000_0000, // max leaf = 0x40000000 initially
+                ..Default::default()
+            },
+            kvm_cpuid_entry2 {
+                function: 0x4000_0001,
+                ..Default::default()
+            },
+        ];
+        let wide = Topology {
+            llcs: 16,
+            cores_per_llc: 16,
+            threads_per_core: 2,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        // Precondition: this topology actually exceeds the xAPIC limit.
+        assert!(
+            max_apic_id(&wide) > crate::vmm::x86_64::kvm::MAX_XAPIC_ID,
+            "test topology must exceed the xAPIC limit; max_apic_id={}",
+            max_apic_id(&wide),
+        );
+        let cpuid = generate_cpuid(&base, &wide, 0, false);
+        let entry = cpuid
+            .iter()
+            .find(|e| e.function == 0x4000_0001)
+            .expect("leaf 0x40000001 should exist");
+        assert_ne!(
+            entry.eax & (1 << 15),
+            0,
+            "MSI_EXT_DEST_ID (EAX bit 15) must be set for >254 APIC IDs"
+        );
+        // The guest enumerates 0x40000001 only if 0x40000000 advertises it.
+        let leaf40 = cpuid
+            .iter()
+            .find(|e| e.function == 0x4000_0000)
+            .expect("leaf 0x40000000 should exist");
+        assert!(
+            leaf40.eax >= 0x4000_0001,
+            "0x40000000.EAX must advertise 0x40000001, got {:#x}",
+            leaf40.eax,
+        );
+    }
+
+    #[test]
+    fn msi_ext_dest_id_absent_for_narrow_topology() {
+        // A topology within the xAPIC limit (<=254) must NOT advertise
+        // MSI_EXT_DEST_ID — its 0x40000001 EAX is unchanged from the base.
+        let base = vec![
+            kvm_cpuid_entry2 {
+                function: 0,
+                ebx: 0x756e_6547,
+                edx: 0x4965_6e69,
+                ecx: 0x6c65_746e,
+                ..Default::default()
+            },
+            kvm_cpuid_entry2 {
+                function: 0x4000_0000,
+                eax: 0x4000_0000,
+                ..Default::default()
+            },
+            kvm_cpuid_entry2 {
+                function: 0x4000_0001,
+                ..Default::default()
+            },
+        ];
+        let narrow = Topology {
+            llcs: 1,
+            cores_per_llc: 2,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        assert!(max_apic_id(&narrow) <= crate::vmm::x86_64::kvm::MAX_XAPIC_ID);
+        let cpuid = generate_cpuid(&base, &narrow, 0, false);
+        let entry = cpuid
+            .iter()
+            .find(|e| e.function == 0x4000_0001)
+            .expect("leaf 0x40000001 should exist");
+        assert_eq!(
+            entry.eax & (1 << 15),
+            0,
+            "MSI_EXT_DEST_ID must not be set for <=254 APIC IDs"
+        );
     }
 
     #[test]

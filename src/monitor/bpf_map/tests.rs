@@ -47,9 +47,12 @@ pub(super) fn lookup_ctx<'a>(
 }
 
 // On aarch64, page table entries contain GPAs starting at DRAM_START.
-// The walker subtracts DRAM_START to produce GuestMem offsets. Test
-// page table entries must include this base so the subtraction yields
-// the correct buffer offset.
+// The walker subtracts DRAM_START to produce GuestMem offsets — both
+// for descriptor payloads AND for the initial TTBR1/cr3 root-table
+// base (mirroring production, where read_cr3 returns the absolute
+// TTBR1_EL1 GPA). Test page table entries, and the cr3_pa each setup
+// returns, must include this base so the subtraction yields the
+// correct buffer offset.
 #[cfg(target_arch = "x86_64")]
 pub(super) const PTE_BASE: u64 = 0;
 #[cfg(target_arch = "aarch64")]
@@ -3253,7 +3256,7 @@ fn setup_page_table_vmalloc_64k() -> (Vec<u8>, u64, u64, u64) {
     buf[data_pa as usize..data_pa as usize + 8]
         .copy_from_slice(&0x1234_5678_ABCD_EF00u64.to_ne_bytes());
 
-    (buf, pgd_pa, kva, data_pa)
+    (buf, pgd_pa + PTE_BASE, kva, data_pa)
 }
 
 #[test]
@@ -3335,7 +3338,7 @@ fn setup_page_table_4k() -> (Vec<u8>, u64, u64, u64) {
     buf[data_pa as usize..data_pa as usize + 8]
         .copy_from_slice(&0xDEAD_BEEF_CAFE_1234u64.to_ne_bytes());
 
-    (buf, pgd_pa, kva, data_pa)
+    (buf, pgd_pa + PTE_BASE, kva, data_pa)
 }
 
 #[test]
@@ -3405,7 +3408,7 @@ fn setup_page_table_16k() -> (Vec<u8>, u64, u64, u64) {
     buf[data_pa as usize..data_pa as usize + 8]
         .copy_from_slice(&0xFEED_FACE_C0DE_BABEu64.to_ne_bytes());
 
-    (buf, l1_pa, kva, data_pa)
+    (buf, l1_pa + PTE_BASE, kva, data_pa)
 }
 
 #[test]
@@ -3505,7 +3508,7 @@ fn setup_page_table_4k_huge_pmd() -> (Vec<u8>, u64, u64, u64) {
     buf[huge_page_pa as usize..huge_page_pa as usize + 8]
         .copy_from_slice(&0xCAFE_BABE_1234_5678u64.to_ne_bytes());
 
-    (buf, pgd_pa, kva, huge_page_pa)
+    (buf, pgd_pa + PTE_BASE, kva, huge_page_pa)
 }
 
 #[test]
@@ -3589,6 +3592,7 @@ fn walk_aarch64_rejects_levels_overflow() {
 /// TG1 dispatch.
 #[test]
 #[cfg(target_arch = "aarch64")]
+#[allow(clippy::identity_op)]
 fn walk_aarch64_rejects_tg1_reserved_zero() {
     let (buf, cr3_pa, kva, _) = setup_page_table_4k();
     // SAFETY: buf outlives mem.

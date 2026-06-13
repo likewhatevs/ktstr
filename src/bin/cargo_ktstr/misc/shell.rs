@@ -99,7 +99,16 @@ fn resolve_shell_from_test_entry(test: &str) -> Result<ShellTestDescriptor, Stri
         Ok((bin.to_path_buf(), desc))
     };
 
-    match probe_collect(None, false, configure_cmd, on_success) {
+    // Match cargo-ktstr's own build profile so the fixture-resolution
+    // `cargo build --tests` is a fingerprint hit against the test
+    // artifacts the operator already built — a cold mismatch recompiles
+    // the whole test set. cargo exposes no profile NAME at runtime;
+    // debug_assertions tracks the release axis (on for dev/test, off for
+    // release) and the workspace defines no custom profiles, so
+    // dev/test↔release is the full space. (The e2e path sets
+    // KTSTR_TEST_BINARY and skips this build entirely.)
+    let release = !cfg!(debug_assertions);
+    match probe_collect(None, release, configure_cmd, on_success) {
         Ok(matches) => {
             if matches.len() > 1 {
                 let names: Vec<String> = matches
@@ -151,6 +160,7 @@ pub(crate) fn run_shell(
     memory_mib: Option<u32>,
     dmesg: bool,
     exec: Option<String>,
+    exec_timeout: std::time::Duration,
     no_perf_mode: bool,
     cpu_cap: Option<usize>,
     disk: Option<String>,
@@ -325,6 +335,7 @@ pub(crate) fn run_shell(
         resolved_memory,
         dmesg,
         exec.as_deref(),
+        exec_timeout,
         disk_cfg,
         wprof_args.as_deref(),
         performance_mode,

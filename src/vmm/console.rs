@@ -90,6 +90,30 @@ pub struct Serial {
     /// iteration of the grace-window loop — O(N²) over the buffer
     /// growth pattern produced by a guest spamming COM2.
     contains_cursor: Option<(Vec<u8>, usize)>,
+    /// First guest kernel-panic line, latched at ingest. Set by
+    /// [`Self::latch_panic_if_present`] the instant a "Kernel panic" /
+    /// "Attempted to kill init" marker appears in a DATA store — BEFORE
+    /// [`Self::enforce_output_cap`] can trim it — so a panic that later
+    /// scrolls past the cap is never lost. Polled+taken by `run_bsp_loop`
+    /// (via [`Self::take_panic`]) to abort the run fast with the cause,
+    /// instead of waiting out the watchdog or the 24h interactive-shell
+    /// timeout (which produced cryptic "test timed out" failures on guest
+    /// OOM). Only COM1 (the kernel console, `console=ttyS0`) latches this;
+    /// COM2 carries app output, not kernel panics. This assumes the kernel
+    /// console is COM1 (the default cmdline); a test that reroutes it (e.g.
+    /// `console=hvc0` to the virtio-console) would bypass the latch.
+    panic_latch: Option<String>,
+    /// Captured-output cap in bytes. Initialized to
+    /// [`OUTPUT_CAP_BYTES`] by every constructor; a test-only
+    /// constructor (`new_with_cap`) overrides it so the
+    /// cap/trim logic can be exercised at KiB scale without filling
+    /// the production 4 MiB cap one byte at a time. Read by
+    /// [`Self::enforce_output_cap`].
+    output_cap_bytes: usize,
+    /// Trim target in bytes -- the writer is drained back to this
+    /// length when it exceeds [`Self::output_cap_bytes`].
+    /// Initialized to [`OUTPUT_TRIM_TARGET`] by every constructor.
+    output_trim_target: usize,
 }
 
 impl Default for Serial {
@@ -113,7 +137,26 @@ impl Serial {
             inner: vm_superio::Serial::new(EventFdTrigger(evt), Vec::new()),
             data_evt: None,
             contains_cursor: None,
+            panic_latch: None,
+            output_cap_bytes: OUTPUT_CAP_BYTES,
+            output_trim_target: OUTPUT_TRIM_TARGET,
         }
+    }
+
+    /// Test-only constructor with an overridable output cap + trim
+    /// target, so the cap/trim/cursor logic can be validated at KiB
+    /// scale instead of filling the production [`OUTPUT_CAP_BYTES`]
+    /// (4 MiB) one byte per `handle_out`. The cap math is
+    /// threshold-independent (relative drain to `trim_target`), so a
+    /// small cap exercises the identical code path. `cap > trim` must
+    /// hold (the same invariant the prod consts satisfy).
+    #[cfg(test)]
+    fn new_with_cap(base: u16, cap: usize, trim: usize) -> Self {
+        debug_assert!(cap > trim, "cap must exceed trim target");
+        let mut s = Self::new(base);
+        s.output_cap_bytes = cap;
+        s.output_trim_target = trim;
+        s
     }
 
     /// Install (or replace) the captured-output notifier. The returned
@@ -181,21 +224,121 @@ impl Serial {
     /// `OUTPUT_CAP_BYTES - OUTPUT_TRIM_TARGET` bytes of overflow.
     #[inline]
     fn enforce_output_cap(&mut self) {
+        let cap = self.output_cap_bytes;
+        let target = self.output_trim_target;
         let writer = self.inner.writer_mut();
         let len = writer.len();
-        if len <= OUTPUT_CAP_BYTES {
+        if len <= cap {
             return;
         }
-        let drop_count = len - OUTPUT_TRIM_TARGET;
+        let drop_count = len - target;
         writer.drain(0..drop_count);
         self.contains_cursor = None;
         tracing::debug!(
             base = self.base,
-            cap = OUTPUT_CAP_BYTES,
-            target = OUTPUT_TRIM_TARGET,
+            cap = cap,
+            target = target,
             dropped = drop_count,
             "captured-output buffer exceeded cap; oldest bytes dropped",
         );
+    }
+
+    /// Latch the first guest kernel-panic line seen in freshly-captured
+    /// output. Called from both DATA-store paths (`handle_out` on
+    /// x86, `inner_write` on aarch64) AFTER the byte is appended
+    /// and BEFORE [`Self::enforce_output_cap`] — so the latch is set at
+    /// ingest and a panic that later scrolls past the cap is never lost.
+    ///
+    /// Scans only the recent tail: a kernel panic banner is emitted in one
+    /// printk burst, so the marker lands in the freshly-written bytes. The
+    /// scan is therefore a bounded constant per byte (not O(buffer)), and
+    /// a no-op once latched. Matches "Kernel panic - not syncing" (the
+    /// `panic()` banner prefix from kernel/panic.c — covers every kernel
+    /// panic) or "Attempted to kill init" (the init-death case, typically
+    /// guest OOM); the canonical OOM banner "Kernel panic - not syncing:
+    /// Attempted to kill init! exitcode=0x…" contains both (`do_exit` in
+    /// kernel/exit.c appends the ` exitcode=0x%08x` tail before the '\n').
+    /// The first marker is anchored to the `- not syncing` form so an
+    /// unrelated log line mentioning the bare words "Kernel panic" cannot
+    /// false-trigger an abort.
+    ///
+    /// We scrape the console for the cause rather than emulating a pvpanic
+    /// device (cloud-hypervisor's mechanism): pvpanic signals only a binary
+    /// panic event — not the cause STRING this harness reports — does not
+    /// self-abort the VM, and would add a guest `CONFIG_PVPANIC` dependency.
+    /// Reusing the serial console already wired needs none of that.
+    ///
+    /// Only a newline-TERMINATED marker line is latched. The guest emits the
+    /// console one byte per exit, so the byte at which the marker first
+    /// completes has only the line prefix in the buffer — latching there
+    /// would record "Kernel panic - not syncing" and drop the actionable
+    /// "Attempted to kill init" tail of the OOM banner. `run_bsp_loop` polls
+    /// `take_panic` every exit and aborts on the first `Some`, so that prefix
+    /// would become the reported cause. Waiting for the following '\n'
+    /// captures the whole line. A panic that emits the marker but no trailing
+    /// '\n' (e.g. a fault mid-printk) is not fast-latched — the run falls
+    /// back to the watchdog timeout.
+    ///
+    /// Bound: the marker AND its terminating '\n' must lie within the same
+    /// ~256 B tail. A panic line longer than that (marker >256 B before its
+    /// '\n') is NOT fast-latched — by the time the '\n' is buffered the
+    /// marker has scrolled out of the tail, so no terminated marker segment
+    /// is found and the run falls back to the watchdog. The canonical OOM
+    /// banner is ~70 B, well under 256 B, so only a pathological panic
+    /// message hits this.
+    #[inline]
+    fn latch_panic_if_present(&mut self, pre_len: usize) {
+        if self.panic_latch.is_some() {
+            return;
+        }
+        let writer = self.inner.writer();
+        // No DATA byte was appended (a register/DLAB store) — nothing new
+        // to scan. Mirrors the writer-grew gate in `signal_if_writer_grew`.
+        if writer.len() <= pre_len {
+            return;
+        }
+        const TAIL: usize = 256;
+        const MARKERS: [&[u8]; 2] = [b"Kernel panic - not syncing", b"Attempted to kill init"];
+        let start = writer.len().saturating_sub(TAIL);
+        let tail = &writer[start..];
+        let hit = MARKERS
+            .iter()
+            .any(|m| tail.windows(m.len()).any(|w| w == *m));
+        if !hit {
+            return;
+        }
+        // Latch the marker line for a human-readable cause, but only once it
+        // is newline-TERMINATED (see doc): the byte completing the marker has
+        // only the line prefix ("...not syncing") buffered, and
+        // `run_bsp_loop` would report that truncated cause. A marker segment
+        // followed by another segment has its terminating '\n' in the tail —
+        // capture the whole line then; otherwise wait for the rest.
+        let mut segs = tail.split(|&b| b == b'\n').peekable();
+        while let Some(seg) = segs.next() {
+            if !MARKERS
+                .iter()
+                .any(|m| seg.windows(m.len()).any(|w| w == *m))
+            {
+                continue;
+            }
+            let terminated = segs.peek().is_some();
+            if terminated {
+                let line = String::from_utf8_lossy(seg).trim().to_string();
+                self.panic_latch = Some(if line.is_empty() {
+                    "guest kernel panic".to_string()
+                } else {
+                    line
+                });
+            }
+            return;
+        }
+    }
+
+    /// Take the latched guest kernel-panic line, if any (clears the latch).
+    /// Polled by `run_bsp_loop` each iteration to abort the run fast with
+    /// the cause rather than waiting out the timeout.
+    pub fn take_panic(&mut self) -> Option<String> {
+        self.panic_latch.take()
     }
 
     /// Handle a port I/O write from the guest. Returns true if the port
@@ -279,6 +422,7 @@ impl Serial {
         // call here.
         let _ = self.inner.write(offset, data[0]);
         self.signal_if_writer_grew(pre);
+        self.latch_panic_if_present(pre);
         self.enforce_output_cap();
         true
     }
@@ -361,6 +505,7 @@ impl Serial {
         // re-observe on the next interrupt poll.
         let _ = self.inner.write(offset, byte);
         self.signal_if_writer_grew(pre);
+        self.latch_panic_if_present(pre);
         self.enforce_output_cap();
     }
 
@@ -1039,53 +1184,48 @@ mod tests {
         assert!(s.output_contains(b"MARKER"));
     }
 
-    /// Writer length must stay bounded by `OUTPUT_CAP_BYTES` no matter
+    /// Writer length must stay bounded by its cap no matter
     /// how many bytes the guest pushes. Drives `handle_out` past the
     /// cap and asserts the post-write length never exceeds the cap.
     /// Pre-fix, the inner `Vec<u8>` would grow to the full byte count
-    /// the test loop wrote — a hostile guest in production would push
+    /// the test loop wrote -- a hostile guest in production would push
     /// the host into OOM.
     #[test]
     fn output_cap_bounds_writer_length() {
-        let mut s = Serial::default();
+        // Small cap (4:3 ratio mirrors the prod 4MiB:3MiB) so the
+        // threshold-independent trim logic is exercised in ~6K writes
+        // instead of filling the 4 MiB prod cap one byte at a time.
+        const CAP: usize = 4096;
+        const TRIM: usize = 3072;
+        let mut s = Serial::new_with_cap(COM1_BASE, CAP, TRIM);
         // Push enough bytes to trigger several drain cycles. Crossing
         // the cap twice exercises the case where the trimmed writer
         // grows back up to the cap and trims again. Each handle_out
         // call writes a single DATA byte through the THR path.
-        let total = OUTPUT_CAP_BYTES + 2 * (OUTPUT_CAP_BYTES - OUTPUT_TRIM_TARGET);
-        // Sample the writer length on a coarse interval to keep the
-        // test fast while still pinning the post-condition. The cap
-        // enforcement runs on every write, so any growth past the cap
-        // would only be visible immediately after the offending write
-        // — but `Vec::drain(0..N)` is O(N), so a missing trim would
-        // leave the writer permanently above the cap.
-        let sample_every = 1024;
+        let total = CAP + 2 * (CAP - TRIM);
         for i in 0..total {
             assert!(s.handle_out(COM1_BASE, b"x"));
-            if i % sample_every == 0 {
-                assert!(
-                    s.inner.writer().len() <= OUTPUT_CAP_BYTES,
-                    "writer must never exceed OUTPUT_CAP_BYTES; got {} at iter {}",
-                    s.inner.writer().len(),
-                    i,
-                );
-            }
+            assert!(
+                s.inner.writer().len() <= CAP,
+                "writer must never exceed cap; got {} at iter {}",
+                s.inner.writer().len(),
+                i,
+            );
         }
-        // After the burst, the writer is between OUTPUT_TRIM_TARGET and
-        // OUTPUT_CAP_BYTES — the most recent trim left exactly
-        // OUTPUT_TRIM_TARGET bytes, then we wrote some more.
+        // After the burst, the writer is between TRIM and CAP -- the
+        // most recent trim left exactly TRIM bytes, then we wrote more.
         let final_len = s.inner.writer().len();
         assert!(
-            final_len >= OUTPUT_TRIM_TARGET,
+            final_len >= TRIM,
             "final length {} below trim target {}",
             final_len,
-            OUTPUT_TRIM_TARGET,
+            TRIM,
         );
         assert!(
-            final_len <= OUTPUT_CAP_BYTES,
+            final_len <= CAP,
             "final length {} above cap {}",
             final_len,
-            OUTPUT_CAP_BYTES,
+            CAP,
         );
     }
 
@@ -1096,31 +1236,33 @@ mod tests {
     /// must remain.
     #[test]
     fn output_cap_drops_oldest_bytes() {
-        let mut s = Serial::default();
-        // Head marker — write OUTPUT_CAP_BYTES - OUTPUT_TRIM_TARGET
-        // bytes of "H" so a single drain will remove all of them.
-        let head_count = OUTPUT_CAP_BYTES - OUTPUT_TRIM_TARGET;
+        const CAP: usize = 4096;
+        const TRIM: usize = 3072;
+        let mut s = Serial::new_with_cap(COM1_BASE, CAP, TRIM);
+        // Head marker -- write CAP - TRIM bytes of "H" so a single
+        // drain will remove all of them.
+        let head_count = CAP - TRIM;
         for _ in 0..head_count {
             assert!(s.handle_out(COM1_BASE, b"H"));
         }
-        // Body filler — write OUTPUT_TRIM_TARGET bytes of "B" so the
-        // writer is exactly at OUTPUT_CAP_BYTES afterwards.
-        for _ in 0..OUTPUT_TRIM_TARGET {
+        // Body filler -- write TRIM bytes of "B" so the writer is
+        // exactly at CAP afterwards.
+        for _ in 0..TRIM {
             assert!(s.handle_out(COM1_BASE, b"B"));
         }
         assert_eq!(
             s.inner.writer().len(),
-            OUTPUT_CAP_BYTES,
+            CAP,
             "writer should be exactly at the cap before the trigger byte",
         );
-        // One more byte triggers the trim. After the trim,
-        // OUTPUT_TRIM_TARGET - 1 of the "B"s have been drained off the
-        // front along with all "H"s; the remaining buffer is the tail
-        // of "B"s plus the trigger byte.
+        // One more byte triggers the trim: len is now CAP+1, so the
+        // drain removes len-TRIM bytes off the front -- all the "H"s
+        // plus one "B" -- leaving TRIM bytes: the tail of "B"s plus
+        // the trigger byte.
         assert!(s.handle_out(COM1_BASE, b"T"));
         let writer = s.inner.writer();
         assert!(
-            writer.len() <= OUTPUT_CAP_BYTES,
+            writer.len() <= CAP,
             "post-trim length must be bounded by cap",
         );
         assert!(
@@ -1142,7 +1284,9 @@ mod tests {
     /// could miss a needle that lives in the retained tail.
     #[test]
     fn output_cap_invalidates_contains_cursor() {
-        let mut s = Serial::default();
+        const CAP: usize = 4096;
+        const TRIM: usize = 3072;
+        let mut s = Serial::new_with_cap(COM1_BASE, CAP, TRIM);
         // Prime the cursor with a miss so it caches scanned_len.
         for c in b"prelude " {
             s.handle_out(COM1_BASE, &[*c]);
@@ -1157,7 +1301,7 @@ mod tests {
         // trim, the writer's leading bytes are different content but
         // the same absolute offsets, so the stale cursor would skip
         // the wrong region. Cap enforcement clears the cursor.
-        let total = OUTPUT_CAP_BYTES + (OUTPUT_CAP_BYTES - OUTPUT_TRIM_TARGET);
+        let total = CAP + (CAP - TRIM);
         for _ in 0..total {
             assert!(s.handle_out(COM1_BASE, b"x"));
         }
@@ -1165,5 +1309,74 @@ mod tests {
             s.contains_cursor.is_none(),
             "cap enforcement must clear the contains_cursor",
         );
+    }
+
+    // ---- guest panic latch (BspExitReason::GuestPanic surface) -------
+
+    #[test]
+    fn panic_latch_captures_oom_banner() {
+        // The canonical guest-OOM banner contains both markers; the latch
+        // must capture the marker line verbatim (trimmed).
+        let mut s = Serial::default();
+        // Mirror the real wire: do_exit() appends " exitcode=0x%08x" before
+        // the '\n' (kernel/exit.c), so the line the latch sees is the full
+        // banner including the exitcode tail.
+        for &b in
+            b"[ 0.5] Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000009\n"
+        {
+            assert!(s.handle_out(COM1_BASE, &[b]));
+        }
+        assert_eq!(
+            s.take_panic().as_deref(),
+            Some("[ 0.5] Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000009"),
+        );
+    }
+
+    #[test]
+    fn panic_latch_anchor_rejects_bare_words() {
+        // A log line mentioning the bare words "Kernel panic" (without
+        // "- not syncing") must NOT latch — the anchor prevents a false
+        // abort of a healthy run.
+        let mut s = Serial::default();
+        for &b in b"note: the Kernel panic handler was registered\n" {
+            assert!(s.handle_out(COM1_BASE, &[b]));
+        }
+        assert_eq!(s.take_panic(), None);
+    }
+
+    #[test]
+    fn panic_latch_survives_output_cap_trim() {
+        // Cap-immunity (the load-bearing claim): the latch is set at
+        // ingest BEFORE enforce_output_cap, so a panic that later scrolls
+        // past the cap window is still recoverable even after
+        // the writer trims the panic bytes away.
+        let mut s = Serial::new_with_cap(COM1_BASE, 4096, 3072);
+        for &b in b"Kernel panic - not syncing: early oops\n" {
+            assert!(s.handle_out(COM1_BASE, &[b]));
+        }
+        // Grow the writer past the cap (bulk -- handle_out is 1-byte/call)
+        // then trim; the trim drops the OLDEST bytes (the panic line at
+        // the front), proving the writer no longer holds it.
+        s.inner.writer_mut().extend(std::iter::repeat_n(b'.', 4097));
+        s.enforce_output_cap();
+        assert!(
+            !s.output().contains("Kernel panic"),
+            "the panic bytes must have been trimmed out of the writer",
+        );
+        assert_eq!(
+            s.take_panic().as_deref(),
+            Some("Kernel panic - not syncing: early oops"),
+            "the latch must survive the cap trim",
+        );
+    }
+
+    #[test]
+    fn panic_latch_take_clears() {
+        let mut s = Serial::default();
+        for &b in b"Kernel panic - not syncing: boom\n" {
+            assert!(s.handle_out(COM1_BASE, &[b]));
+        }
+        assert!(s.take_panic().is_some());
+        assert_eq!(s.take_panic(), None, "take clears the latch");
     }
 }

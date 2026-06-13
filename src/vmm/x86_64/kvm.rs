@@ -1,16 +1,21 @@
 use anyhow::{Context, Result};
 use kvm_bindings::{
     KVM_CAP_HALT_POLL, KVM_CAP_SPLIT_IRQCHIP, KVM_CAP_X2APIC_API, KVM_CAP_X86_DISABLE_EXITS,
-    KVM_CLOCK_TSC_STABLE, KVM_PIT_SPEAKER_DUMMY, KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK,
-    KVM_X2APIC_API_USE_32BIT_IDS, KVM_X86_DISABLE_EXITS_HLT, KVM_X86_DISABLE_EXITS_PAUSE,
-    kvm_enable_cap, kvm_pit_config,
+    KVM_CLOCK_TSC_STABLE, KVM_IRQ_ROUTING_MSI, KVM_PIT_SPEAKER_DUMMY,
+    KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK, KVM_X2APIC_API_USE_32BIT_IDS,
+    KVM_X86_DISABLE_EXITS_HLT, KVM_X86_DISABLE_EXITS_PAUSE, KvmIrqRouting, kvm_enable_cap,
+    kvm_irq_routing, kvm_irq_routing_entry, kvm_irq_routing_entry__bindgen_ty_1,
+    kvm_irq_routing_msi, kvm_irq_routing_msi__bindgen_ty_1, kvm_pit_config,
 };
 use kvm_ioctls::{Cap, Kvm, VcpuFd, VmFd};
 use std::mem::ManuallyDrop;
+use std::sync::Arc;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
-use super::topology::{generate_cpuid, max_apic_id};
+use super::ioapic::{IOAPIC_BASE, IOAPIC_SIZE, Ioapic, MsiRoute};
+use super::topology::{apic_id, generate_cpuid, max_apic_id};
 use crate::vmm::numa_mem::{NumaMemoryLayout, ReservationGuard};
+use crate::vmm::pi_mutex::PiMutex;
 use crate::vmm::topology::Topology;
 
 /// Physical address where the kernel is loaded.
@@ -50,20 +55,19 @@ pub(crate) const VIRTIO_BLK_MMIO_BASE: u64 = MMIO_GAP_START + 0x1000;
 /// Each virtio-mmio device occupies `VIRTIO_MMIO_SIZE = 0x1000`.
 pub(crate) const VIRTIO_NET_MMIO_BASE: u64 = MMIO_GAP_START + 0x2000;
 
-/// IRQ for virtio-console (GSI routed through IOAPIC).
-/// Uses IRQ 5 — available with full IRQ chip. With split IRQ chip
-/// (no IOAPIC), MSI would be needed; not supported for now.
+/// GSI for virtio-console. On the in-kernel-irqchip path the in-kernel
+/// IOAPIC routes this GSI; on split-irqchip (>254 APIC IDs) the userspace
+/// IOAPIC translates the guest's RTE for it into an MSI route.
 pub(crate) const VIRTIO_CONSOLE_IRQ: u32 = 5;
 
-/// IRQ for virtio-block (GSI 6, full IRQ chip). Same constraints as
-/// virtio-console — split-irqchip not supported. IOAPIC GSI ≤23
-/// limit leaves ample free slots for additional virtio devices
-/// after COM1=4, COM2=3, virtio-console=5, virtio-blk=6.
+/// GSI for virtio-block. Routed via the in-kernel IOAPIC (<=254) or the
+/// userspace IOAPIC (split-irqchip, >254). The IOAPIC's 24-line cap leaves
+/// ample free slots after COM1=4, COM2=3, virtio-console=5, virtio-blk=6.
 pub(crate) const VIRTIO_BLK_IRQ: u32 = 6;
 
-/// IRQ for virtio-net (GSI 7, full IRQ chip). Same constraints as
-/// virtio-blk — split-irqchip not supported. Still well within the
-/// IOAPIC's 24-line cap.
+/// GSI for virtio-net. Routed via the in-kernel IOAPIC (<=254) or the
+/// userspace IOAPIC (split-irqchip, >254); well within the IOAPIC's
+/// 24-line cap.
 pub(crate) const VIRTIO_NET_IRQ: u32 = 7;
 
 /// E820 memory type: usable RAM.
@@ -83,7 +87,7 @@ const KVM_IDENTITY_MAP_ADDRESS: u64 = KVM_TSS_ADDRESS + 3 * 4096;
 const NUM_IOAPIC_PINS: u64 = 24;
 
 /// APIC IDs above this require x2APIC mode (8-bit xAPIC limit).
-const MAX_XAPIC_ID: u32 = 254;
+pub(crate) const MAX_XAPIC_ID: u32 = 254;
 
 /// Per-VM halt poll interval (nanoseconds) for non-performance_mode VMs.
 /// Matches the x86 kernel default (KVM_HALT_POLL_NS_DEFAULT in
@@ -125,6 +129,11 @@ pub struct KtstrKvm {
     /// Split IRQ chip mode: LAPIC in kernel, PIC/IOAPIC emulated in userspace.
     /// Enabled when any APIC ID exceeds the 8-bit xAPIC limit (254).
     pub(crate) split_irqchip: bool,
+    /// Userspace IOAPIC device, present only on the split-irqchip path.
+    /// The run loops wrap it in an [`IoapicHandle`] (device + raw VM fd) to
+    /// service IOAPIC MMIO and reprogram MSI routes; `None` for <=254-vCPU
+    /// guests, which use the in-kernel IOAPIC.
+    pub(crate) ioapic: Option<Arc<PiMutex<Ioapic>>>,
     /// Whether hugepages were requested at construction time.
     /// Stored so deferred memory allocation uses the same backing.
     use_hugepages: bool,
@@ -208,7 +217,12 @@ impl KtstrKvm {
     /// memory_mib was unknown at construction time and `use_hugepages`
     /// may have been false.
     pub fn allocate_and_register_memory(&mut self, memory_mib: u32) -> Result<()> {
-        let layout = NumaMemoryLayout::compute(&self.topology, memory_mib, 0)?;
+        let layout = NumaMemoryLayout::compute(
+            &self.topology,
+            memory_mib,
+            0,
+            Some((MMIO_GAP_START, MMIO_GAP_END)),
+        )?;
         let alloc =
             layout.allocate_and_register(&self.vm_fd, self.use_hugepages, self.performance_mode)?;
         // SAFETY: this is the only call to ManuallyDrop::drop on
@@ -305,6 +319,12 @@ impl KtstrKvm {
                 .map_err(|e| crate::vmm::map_transient_to_contention(e, "create PIT"))?;
         }
 
+        // Userspace IOAPIC device for the split-irqchip path (no in-kernel
+        // IOAPIC there). `None` for <=254-vCPU guests. The run loops build an
+        // IoapicHandle around this to translate guest RTE writes into MSI
+        // routes; see `super::ioapic` and `IoapicHandle`.
+        let ioapic = split_irqchip.then(|| Arc::new(PiMutex::new(Ioapic::new())));
+
         // Disable PAUSE and HLT VM exits in performance mode.
         // Two separate enable_cap calls: kvm_disable_exits() uses |=
         // (additive), so multiple calls accumulate. Separate calls
@@ -371,7 +391,8 @@ impl KtstrKvm {
 
         let (guest_mem, numa_layout, reservation) = match memory_mib {
             Some(mb) => {
-                let layout = NumaMemoryLayout::compute(&topo, mb, 0)?;
+                let layout =
+                    NumaMemoryLayout::compute(&topo, mb, 0, Some((MMIO_GAP_START, MMIO_GAP_END)))?;
                 let alloc =
                     layout.allocate_and_register(&vm_fd, use_hugepages, performance_mode)?;
                 (alloc.guest_mem, Some(layout), Some(alloc.reservation))
@@ -388,16 +409,100 @@ impl KtstrKvm {
             .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
             .context("get_supported_cpuid")?;
 
+        // Reject (rather than silently truncate) a VM whose RAM relocates
+        // above the guest's addressable physical space. generate_cpuid leaves
+        // CPUID leaf 0x8000_0008 EAX = the host's MAXPHYADDR (it patches only
+        // ECX), so the guest's phys-addr width is the host's. If the relocated
+        // RAM top exceeds 1<<phys_bits, the guest kernel silently caps
+        // last_pfn at max_arch_pfn (e820__end_ram_pfn) and boots with less RAM
+        // than advertised — a silent data drop. Surface it as a
+        // host-capability skip, same class as the max_vcpus check below.
+        //
+        // Reference note: qemu likewise rejects (its phys-bits-too-low
+        // hard-fail), never truncates. cloud-hypervisor instead caps the
+        // guest MAXPHYADDR at 46 and sizes the MMIO/device area from it (migration
+        // portability); ktstr has no migration, so it exposes the host's
+        // MAXPHYADDR and rejects. libkrun and firecracker also leave the
+        // host's MAXPHYADDR but lack this RAM bound, so the check is a
+        // correct superset. Bounds the RAM top only; widen to max(RAM, MMIO)
+        // top if a high MMIO window above RAM is ever added.
+        if let Some(layout) = &numa_layout {
+            let phys_bits = base_cpuid
+                .as_slice()
+                .iter()
+                .find(|e| e.function == 0x8000_0008)
+                .map(|e| e.eax & 0xff)
+                .unwrap_or(36);
+            if let Some(top) = layout.ram_top_exceeds_phys_bits(phys_bits) {
+                return Err(anyhow::Error::new(
+                    crate::vmm::host_topology::ResourceContention {
+                        reason: format!(
+                            "guest RAM top {top:#x} exceeds the guest MAXPHYADDR \
+                             (1<<{phys_bits}); this host's physical-address \
+                             width cannot back a VM this large without the guest \
+                             silently truncating RAM"
+                        ),
+                    },
+                ));
+            }
+        }
+
         // Create vCPUs with topology-specific CPUID. KVM_CREATE_VCPU
         // allocates per-vCPU kernel memory (struct kvm_vcpu, kvm_run
         // page, posted-interrupt descriptor); EMFILE / ENOMEM here is
         // host-resource pressure, not a test fault — route through
         // the contention classifier so the macro SKIPs cleanly.
         let total = topo.total_cpus();
+        // A topology wider than the host's KVM_CAP_MAX_VCPUS cannot run
+        // here; surface it as a clean skip (a host-capability limit, same
+        // SKIP class as overcommit) before the per-vCPU create loop, rather
+        // than a mid-loop create_vcpu errno. KVM_CAP_MAX_VCPUS is
+        // host-dependent (commonly 1024; CONFIG_KVM_MAX_NR_VCPUS,
+        // arch/x86/kvm/Kconfig).
+        let max_vcpus = kvm.get_max_vcpus();
+        if total as usize > max_vcpus {
+            return Err(anyhow::Error::new(
+                crate::vmm::host_topology::ResourceContention {
+                    reason: format!(
+                        "topology requires {total} vCPUs but this host's \
+                     KVM_CAP_MAX_VCPUS is {max_vcpus}; cannot run a VM this wide"
+                    ),
+                },
+            ));
+        }
+        // The vcpu_id passed below is apic_id(topo, cpu_id), whose sparse
+        // range can exceed the vCPU count; KVM_CREATE_VCPU requires the id be
+        // < KVM_CAP_MAX_VCPU_ID. Skip cleanly if the host's cap is too low,
+        // same class as the max_vcpus check above.
+        // `max_apic_id` is the u32 already bound above for the split-irqchip
+        // decision; reuse it.
+        let max_vcpu_id = kvm.get_max_vcpu_id();
+        if (max_apic_id as usize) >= max_vcpu_id {
+            return Err(anyhow::Error::new(
+                crate::vmm::host_topology::ResourceContention {
+                    reason: format!(
+                        "topology's max APIC ID {max_apic_id} (the KVM vcpu_id) is \
+                         >= this host's KVM_CAP_MAX_VCPU_ID {max_vcpu_id}; cannot \
+                         create a vCPU at that ID"
+                    ),
+                },
+            ));
+        }
         let mut vcpus = Vec::with_capacity(total as usize);
         for cpu_id in 0..total {
-            let vcpu = vm_fd.create_vcpu(cpu_id as u64).map_err(|e| {
-                crate::vmm::map_transient_to_contention(e, format!("create vCPU {cpu_id}"))
+            // vcpu_id = apic_id, not cpu_id: KVM hardwires the in-kernel LAPIC
+            // x2apic_id to vcpu_id (arch/x86/kvm/lapic.c kvm_apic_set_x2apic_id,
+            // read-only), and an MSI/IPI dest plus the guest's read_apic_id()
+            // resolve against it. The CPUID/MADT advertise the sparse apic_id,
+            // so vcpu_id must equal it or sparse APIC IDs are unrouteable. The
+            // vcpus Vec stays indexed by cpu_id (push order); only the KVM
+            // vcpu_id changes (a no-op for dense topologies where apic==cpu_id).
+            let aid = apic_id(&topo, cpu_id);
+            let vcpu = vm_fd.create_vcpu(aid as u64).map_err(|e| {
+                crate::vmm::map_transient_to_contention(
+                    e,
+                    format!("create vCPU cpu_id={cpu_id} apic_id={aid}"),
+                )
             })?;
 
             let cpuid_entries =
@@ -481,6 +586,7 @@ impl KtstrKvm {
             numa_layout,
             has_immediate_exit,
             split_irqchip,
+            ioapic,
             use_hugepages,
             performance_mode,
             _reservation: reservation,
@@ -583,9 +689,373 @@ pub(crate) fn kvm_set_clock_via_raw_fd(
     }
 }
 
+/// Call `KVM_SET_GSI_ROUTING` via a raw VM fd (libc::ioctl direct).
+/// Sibling of [`kvm_set_clock_via_raw_fd`] for the userspace-IOAPIC
+/// (split-irqchip / >255-vCPU) path: an AP run loop holds only a cached
+/// Copy raw vm fd, not `&vm.vm_fd`, and reprograms the device MSI routes
+/// when the guest writes the IOAPIC redirection table. Mirrors
+/// `kvm_ioctls::VmFd::set_gsi_routing` — same ioctl, same `kvm_irq_routing`
+/// FAM payload. `KVM_SET_GSI_ROUTING` is a whole-table replace
+/// (virt/kvm/irqchip.c `kvm_set_irq_routing`, under `kvm->irq_lock` plus an
+/// SRCU grace period), so the caller passes the COMPLETE route set.
+pub(crate) fn kvm_set_gsi_routing_via_raw_fd(
+    vm_fd: i32,
+    routing: &KvmIrqRouting,
+) -> std::io::Result<()> {
+    // ioctl_iow_nr!(KVM_SET_GSI_ROUTING, KVMIO=0xAE, 0x6a, kvm_irq_routing)
+    // = _IOW(0xAE, 0x6a, size_of::<kvm_irq_routing>()) = 0x4008_AE6A. The
+    // encoded size is the FAM HEADER (nr:u32 + flags:u32 = 8); the kernel
+    // reads `nr` entries past the pointer.
+    const _: () = assert!(std::mem::size_of::<kvm_irq_routing>() == 8);
+    const KVM_SET_GSI_ROUTING_IOCTL: libc::c_ulong = 0x4008_AE6A;
+    // SAFETY: `vm_fd` is a live kvm vm fd (cached from vm.vm_fd.as_raw_fd(),
+    // valid for the run loop's lifetime). `as_fam_struct_ref()` points at a
+    // `kvm_irq_routing` whose `nr` matches the entries the kernel reads.
+    let rc = unsafe {
+        libc::ioctl(
+            vm_fd,
+            KVM_SET_GSI_ROUTING_IOCTL,
+            routing.as_fam_struct_ref() as *const kvm_irq_routing,
+        )
+    };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Build a `KVM_SET_GSI_ROUTING` table from the IOAPIC's `(gsi, MsiRoute)`
+/// set. Each entry is a `KVM_IRQ_ROUTING_MSI` route carrying the
+/// extended-destination MSI the IOAPIC translated the guest's RTE into.
+fn build_device_msi_routing(routes: &[(u32, MsiRoute)]) -> Result<KvmIrqRouting> {
+    let mut routing = KvmIrqRouting::new(routes.len()).map_err(|e| {
+        anyhow::anyhow!(
+            "allocate kvm_irq_routing for {} routes: {e:?}",
+            routes.len()
+        )
+    })?;
+    let slice = routing.as_mut_slice();
+    for (i, (gsi, msi)) in routes.iter().enumerate() {
+        slice[i] = kvm_irq_routing_entry {
+            gsi: *gsi,
+            type_: KVM_IRQ_ROUTING_MSI,
+            flags: 0,
+            pad: 0,
+            u: kvm_irq_routing_entry__bindgen_ty_1 {
+                msi: kvm_irq_routing_msi {
+                    address_lo: msi.address_lo,
+                    address_hi: msi.address_hi,
+                    data: msi.data,
+                    __bindgen_anon_1: kvm_irq_routing_msi__bindgen_ty_1 { pad: 0 },
+                },
+            },
+        };
+    }
+    Ok(routing)
+}
+
+/// Owns the userspace IOAPIC device plus the cached raw VM fd needed to
+/// reprogram KVM's MSI routing table. Cloned (via `Arc`) into each AP run
+/// loop on the split-irqchip path; `None` on the in-kernel-irqchip path
+/// (<=254 vCPUs), where the kernel IOAPIC delivers device IRQs directly.
+pub(crate) struct IoapicHandle {
+    ioapic: Arc<PiMutex<Ioapic>>,
+    vm_fd_raw: i32,
+    /// Count of failed `KVM_SET_GSI_ROUTING` installs. A failure leaves a
+    /// guest-programmed device IRQ unrouted — it will not deliver and the
+    /// device hangs on first use. Bumped in `mmio_write`, read at teardown
+    /// (`routing_failures`) so a hung-device test reports the count instead of
+    /// an opaque timeout.
+    routing_failures: std::sync::atomic::AtomicU64,
+    /// The route set most recently installed via `KVM_SET_GSI_ROUTING`.
+    /// `mmio_write` skips the install ioctl (which waits an SRCU grace
+    /// period) when the freshly-computed `gsi_routes()` set is byte-identical
+    /// — the guest programs each 64-bit RTE as two 32-bit MMIO writes, and
+    /// the high-word write of a still-masked entry yields the same
+    /// `is_masked`-filtered route set as before it, so roughly half the
+    /// per-RTE installs are redundant. Guarded by its own mutex, not the
+    /// `ioapic` lock: the compare + ioctl + cache update run as one critical
+    /// section so the cache can never diverge from KVM's actual routing table
+    /// under concurrent IOAPIC programming, while the `ioapic` lock is
+    /// released first so a slow install never stalls another vCPU's IOAPIC
+    /// MMIO access.
+    ///
+    /// This dedup is intentionally stronger than the reference userspace
+    /// IOAPICs: qemu, cloud-hypervisor, and libkrun all re-issue
+    /// `KVM_SET_GSI_ROUTING` on every redtbl write (qemu's change-counting
+    /// dedup applies only to its PCI-MSI path, not the IOAPIC). Skipping an
+    /// unchanged table is safe because the ioctl is a whole-table replace
+    /// KVM applies idempotently -- an identical re-install only burns an
+    /// SRCU grace period (virt/kvm/irqchip.c `kvm_set_irq_routing` has no
+    /// unchanged-table early-out).
+    last_installed: PiMutex<Option<Vec<(u32, MsiRoute)>>>,
+}
+
+impl IoapicHandle {
+    pub(crate) fn new(ioapic: Arc<PiMutex<Ioapic>>, vm_fd_raw: i32) -> Self {
+        IoapicHandle {
+            ioapic,
+            vm_fd_raw,
+            routing_failures: std::sync::atomic::AtomicU64::new(0),
+            last_installed: PiMutex::new(None),
+        }
+    }
+
+    /// Service a guest MMIO read of the IOAPIC window.
+    pub(crate) fn mmio_read(&self, offset: u64, data: &mut [u8]) {
+        self.ioapic.lock().mmio_read(offset, data);
+    }
+
+    /// Service a guest MMIO write of the IOAPIC window. If the write changed
+    /// a redirection entry, rebuild the full MSI routing table and install it
+    /// — unless it is byte-identical to the last install, in which case the
+    /// (SRCU-grace-period) ioctl is skipped (see the `last_installed` cache).
+    ///
+    /// The route snapshot is taken under the `ioapic` lock, which is then
+    /// released; the compare + ioctl + cache update run under the separate
+    /// `last_installed` lock. So a slow install never stalls another vCPU's
+    /// IOAPIC MMIO access (the `ioapic` lock is free during the ioctl), and
+    /// the cache stays consistent with KVM's table — installs serialize on
+    /// `last_installed` (one whole-table replace at a time) and the cache is
+    /// updated in the same critical section as each install.
+    ///
+    /// Cross-vCPU atomicity is traded for that latency, diverging from every
+    /// reference userspace IOAPIC: qemu (one BQL across redtbl-write →
+    /// route-commit), cloud-hypervisor (one device mutex across the install),
+    /// and libkrun (device mutex held across a synchronous worker-hop install)
+    /// are all single-lock atomic and accept the peer-vCPU IOAPIC-MMIO stall
+    /// for the SRCU-grace-period ioctl; we release the `ioapic` lock first to
+    /// keep that ioctl off the vCPU blocking budget. The resulting window —
+    /// two vCPUs racing the IOAPIC, an older snapshot installing after a newer
+    /// one and leaving KVM's table briefly stale — is unreachable for a
+    /// spec-compliant guest: Linux serializes every IOAPIC RTE program under
+    /// one global `ioapic_lock` (the `ioapic_write_entry`,
+    /// `ioapic_set_affinity`, and `eoi_ioapic_pin` paths in
+    /// arch/x86/kernel/apic/io_apic.c), so only one vCPU programs the IOAPIC
+    /// at a time. A guest that races its own IOAPIC can transiently install a
+    /// stale-but-valid whole-table replace built only from its own programmed
+    /// routes; it self-corrects on the next RTE write (which re-snapshots the
+    /// current register file) and can only mis-route its own device IRQs to
+    /// its own APICs — no host memory is touched and no unprogrammed route is
+    /// installable.
+    ///
+    /// Delegates to [`Self::mmio_write_with`] passing the real
+    /// `KVM_SET_GSI_ROUTING` installer; the seam exists only so a host-side
+    /// test can inject a counting/failing installer.
+    pub(crate) fn mmio_write(&self, offset: u64, data: &[u8]) -> Result<()> {
+        let fd = self.vm_fd_raw;
+        self.mmio_write_with(offset, data, move |routing| {
+            kvm_set_gsi_routing_via_raw_fd(fd, routing)
+        })
+    }
+
+    /// [`Self::mmio_write`] with the routing install injected as `install`,
+    /// so a host-side test drives the dedup + cache-on-success logic with a
+    /// counting/failing closure instead of a live KVM fd. The production
+    /// caller passes the real `KVM_SET_GSI_ROUTING` installer. `install` runs
+    /// at most once per call — only when the write changed a route AND the
+    /// set differs from `last_installed` — hence `FnOnce`. (No reference VMM
+    /// exposes such a seam or unit-tests this path; they re-install
+    /// unconditionally — see the `last_installed` divergence note.)
+    fn mmio_write_with(
+        &self,
+        offset: u64,
+        data: &[u8],
+        install: impl FnOnce(&KvmIrqRouting) -> std::io::Result<()>,
+    ) -> Result<()> {
+        let routes = {
+            let mut io = self.ioapic.lock();
+            if io.mmio_write(offset, data) {
+                Some(io.gsi_routes())
+            } else {
+                None
+            }
+        };
+        if let Some(routes) = routes {
+            let mut last = self.last_installed.lock();
+            if last.as_deref() == Some(routes.as_slice()) {
+                // Unchanged from the last successful install — skip the
+                // whole-table replace and its SRCU grace period.
+                return Ok(());
+            }
+            let routing = build_device_msi_routing(&routes)?;
+            if let Err(e) = install(&routing) {
+                self.routing_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(anyhow::anyhow!("KVM_SET_GSI_ROUTING: {e}"));
+            }
+            // Cache only after a successful install so a failed ioctl never
+            // makes a later identical attempt skip a needed retry.
+            *last = Some(routes);
+        }
+        Ok(())
+    }
+
+    /// Service a `KVM_EXIT_IOAPIC_EOI` for `vector` (clears remote-IRR on a
+    /// matching level entry; a no-op for the edge device pins of v0).
+    pub(crate) fn eoi(&self, vector: u8) {
+        // v0 is edge-only, so end_of_interrupt's returned pending-pins Vec is
+        // always empty (edge entries never set remote-IRR, and this IOAPIC is a
+        // register-file + MSI translator that never *services* a pin, so
+        // remote-IRR is never set at all). The Vec is intentionally dropped;
+        // the debug_assert is a tripwire so that adding a level-triggered
+        // device WITHOUT completing level re-injection fails loudly in tests
+        // instead of silently dropping the re-assert and wedging the line.
+        let pending = self.ioapic.lock().end_of_interrupt(vector);
+        debug_assert!(
+            pending.is_empty(),
+            "v0 IOAPIC is edge-only but EOI returned {} pin(s) needing level \
+             re-injection — a level-triggered device was added without \
+             completing level support (re-injection is dropped here)",
+            pending.len()
+        );
+    }
+
+    /// Number of failed `KVM_SET_GSI_ROUTING` installs since VM start. Read at
+    /// teardown to surface routing failures into the result (a nonzero count
+    /// explains a device that never delivered IRQs).
+    pub(crate) fn routing_failures(&self) -> u64 {
+        self.routing_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// If `addr` lies in the IOAPIC MMIO window, the offset within it;
+    /// otherwise `None`. Lets the run-loop dispatcher route an MMIO exit
+    /// without importing the device's base/size constants.
+    pub(crate) fn in_range(&self, addr: u64) -> Option<u64> {
+        (IOAPIC_BASE..IOAPIC_BASE + IOAPIC_SIZE)
+            .contains(&addr)
+            .then(|| addr - IOAPIC_BASE)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `IoapicHandle` dedups a redundant GSI-routing install (skips the
+    /// ioctl when the route set is byte-identical to the last successful
+    /// install) AND caches only on success (a failed install must not poison
+    /// a later identical retry). Drives the real `mmio_write_with` dedup path
+    /// with an injected counting/failing installer — no live KVM fd. No
+    /// reference VMM unit-tests this path (they re-install unconditionally).
+    #[test]
+    fn ioapic_handle_dedups_install_and_caches_on_success_only() {
+        use crate::vmm::x86_64::ioapic::{IOREGSEL, IOWIN, REG_REDTBL_BASE};
+        use std::cell::Cell;
+
+        let handle = IoapicHandle::new(std::sync::Arc::new(PiMutex::new(Ioapic::new())), -1);
+        // Pin 6's low-dword redtbl register (entry i lo = REG_REDTBL_BASE + 2i).
+        let lo_reg = (REG_REDTBL_BASE + 2 * 6) as u8;
+        let installs = Cell::new(0u32);
+
+        // Drive one IOAPIC MMIO write through the dedup path with an injected
+        // installer that bumps `installs` and returns Ok/Err per `ok`.
+        let step = |off: u64, data: &[u8], ok: bool| -> Result<()> {
+            handle.mmio_write_with(off, data, |_routing| {
+                installs.set(installs.get() + 1);
+                if ok {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other("injected install failure"))
+                }
+            })
+        };
+
+        // Program pin 6's RTE: select the lo reg (not a route change → no
+        // install), then write vector 0x40 with the mask bit clear (an
+        // unmasked route) → route change → install #1.
+        step(IOREGSEL, &[lo_reg], true).unwrap();
+        step(IOWIN, &0x40u32.to_le_bytes(), true).unwrap();
+        assert_eq!(
+            installs.get(),
+            1,
+            "programming an unmasked RTE installs once"
+        );
+
+        // Rewrite the identical lo dword: the register file reports dirty, but
+        // the route set is byte-identical → dedup SKIPS the install ioctl.
+        step(IOREGSEL, &[lo_reg], true).unwrap();
+        step(IOWIN, &0x40u32.to_le_bytes(), true).unwrap();
+        assert_eq!(
+            installs.get(),
+            1,
+            "a redundant RTE rewrite must dedup (no second install)"
+        );
+
+        // Cache-on-success-only: change the vector (0x50) with a FAILING
+        // installer → the install is attempted (count 2) but errors, so
+        // `last_installed` must NOT be updated to the 0x50 route set.
+        step(IOREGSEL, &[lo_reg], true).unwrap();
+        assert!(
+            step(IOWIN, &0x50u32.to_le_bytes(), false).is_err(),
+            "an injected install failure propagates as an error"
+        );
+        assert_eq!(installs.get(), 2, "the changed RTE attempts an install");
+        assert_eq!(
+            handle.routing_failures(),
+            1,
+            "the failed install is counted"
+        );
+
+        // Retry the SAME changed RTE with a succeeding installer. Because the
+        // failed install did not cache 0x50, this must install AGAIN (count 3)
+        // rather than dedup-skip — proving a failed install never wedges a
+        // device behind a poisoned cache.
+        step(IOREGSEL, &[lo_reg], true).unwrap();
+        step(IOWIN, &0x50u32.to_le_bytes(), true).unwrap();
+        assert_eq!(
+            installs.get(),
+            3,
+            "a failed install must not poison the cache — the identical retry re-installs"
+        );
+    }
+
+    #[test]
+    fn build_device_msi_routing_lays_out_fam_entries() {
+        let routes = vec![
+            (
+                4u32,
+                MsiRoute {
+                    address_lo: 0xFEE0_1004,
+                    address_hi: 0x0000_0100,
+                    data: 0x0000_8030,
+                },
+            ),
+            (
+                6u32,
+                MsiRoute {
+                    address_lo: 0xFEE0_2000,
+                    address_hi: 0x0000_0000,
+                    data: 0x0000_0040,
+                },
+            ),
+        ];
+        let mut routing = build_device_msi_routing(&routes).expect("build routing");
+        let entries = routing.as_mut_slice();
+        assert_eq!(entries.len(), 2, "one FAM entry per route");
+        for (i, (gsi, msi)) in routes.iter().enumerate() {
+            let e = &entries[i];
+            assert_eq!(e.gsi, *gsi, "entry {i} gsi");
+            assert_eq!(e.type_, KVM_IRQ_ROUTING_MSI, "entry {i} type is MSI");
+            assert_eq!(e.flags, 0, "entry {i} flags");
+            // SAFETY: every entry was built as the `.msi` union variant above.
+            let m = unsafe { e.u.msi };
+            assert_eq!(m.address_lo, msi.address_lo, "entry {i} address_lo");
+            assert_eq!(m.address_hi, msi.address_hi, "entry {i} address_hi");
+            assert_eq!(m.data, msi.data, "entry {i} data");
+        }
+    }
+
+    #[test]
+    fn build_device_msi_routing_empty_is_valid() {
+        // All-masked IOAPIC -> empty route set -> nr=0 table (the re-mask-all
+        // case the kernel reviewer verified: FamStructWrapper::new(0) yields a
+        // valid header-only kvm_irq_routing{nr:0}).
+        let mut routing = build_device_msi_routing(&[]).expect("empty routing");
+        assert_eq!(routing.as_mut_slice().len(), 0, "no entries for empty set");
+    }
     use std::os::fd::AsRawFd;
     use vm_memory::GuestMemory;
 

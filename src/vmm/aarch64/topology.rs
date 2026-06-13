@@ -249,7 +249,7 @@ pub fn host_cache_levels() -> u32 {
 }
 
 /// Mask for the affinity fields used in FDT cpu node `reg` property.
-/// Bits [23:0] of MPIDR: Aff0 [7:0], Aff1 [15:8], Aff2 [23:16].
+/// Bits \[23:0\] of MPIDR: Aff0 \[7:0\], Aff1 \[15:8\], Aff2 \[23:16\].
 pub const MPIDR_AFF_MASK: u64 = 0xFF_FFFF;
 
 /// Read MPIDR_EL1 from a vCPU after vcpu_init.

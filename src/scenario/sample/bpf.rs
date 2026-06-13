@@ -1171,6 +1171,7 @@ mod tests {
             report,
             stats: Err(crate::scenario::snapshot::MissingStatsReason::NoSchedulerBinary),
             elapsed_ms: Some(elapsed_ms),
+            boundary_offset_ms: None,
             step_index,
         }
     }

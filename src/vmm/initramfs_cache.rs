@@ -1,11 +1,13 @@
 //! Two-tier initramfs cache: per-process HashMap + cross-process POSIX
 //! shm.
 //!
-//! Each VM run produces an initramfs blob keyed by the content hashes
-//! of the payload binary, optional scheduler / probe / worker
-//! binaries, include files, and shell-mode flags. Building the blob
-//! is expensive (10s of MB of cpio assembly + LZ4 compression), so
-//! the cache amortises the cost across:
+//! Each VM run produces an initramfs base blob keyed on the payload's
+//! shared-lib SET (not the payload's own content — its /init bytes ride
+//! the per-run suffix) plus the content hashes of the optional
+//! scheduler / probe / worker binaries packed into the base, include
+//! files, and shell-mode flags. Building the blob is expensive (10s of
+//! MB of cpio assembly + LZ4 compression), so the cache amortises the
+//! cost across:
 //!
 //! - **Same-process tests**: a `HashMap<BaseKey, Arc<Vec<u8>>>`
 //!   keeps the in-flight blob hot without a syscall.
@@ -14,11 +16,14 @@
 //!   a single builder; losers `LOCK_SH`-block on the segment until
 //!   the winner finishes, then `mmap` it zero-copy.
 //!
-//! The `BaseKey` content-hash spans every byte the build consumes
-//! (binary content + shared-lib content) so a recompile invalidates
-//! the cache without operator intervention. Stale segments from a
-//! previous compression format are GC'd once per process on the first
-//! `get_or_build_base` call via a `LOCK_EX | LOCK_NB` probe.
+//! The `BaseKey` hashes the payload's shared-lib set + interpreter (the
+//! bytes the base packs FROM the payload — not the payload itself) and
+//! the full content of the scheduler / probe / worker binaries written
+//! into the base. So a scheduler/probe/worker recompile invalidates the
+//! cache, while a payload recompile that keeps the same lib set is a HIT
+//! (the payload's content lives only in the per-run suffix). Stale
+//! segments from a previous compression format are GC'd once per process
+//! on the first `get_or_build_base` call via a `LOCK_EX | LOCK_NB` probe.
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -32,11 +37,13 @@ use ahash::AHasher;
 
 use super::initramfs;
 
-/// Cache key for base initramfs. Derived from content hashes of the
-/// payload binary and its shared libs, plus the optional scheduler
-/// binary and its shared libs. Shell mode additionally mixes in a
-/// sentinel, include files, and the busybox flag; see [`Self::new`]
-/// and [`Self::new_shell`] for per-constructor inputs.
+/// Cache key for base initramfs. Derived from the payload's shared-lib
+/// SET + interpreter (NOT the payload's content — its /init bytes ride
+/// the per-run suffix), plus the content hashes of the optional
+/// scheduler / probe / worker binaries packed into the base and their
+/// shared libs. Shell mode additionally mixes in a sentinel, include
+/// files, and the busybox flag; see [`Self::new`] and [`Self::new_shell`]
+/// for per-constructor inputs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BaseKey(pub(crate) u64);
 
@@ -99,11 +106,14 @@ pub(crate) fn hash_file(path: &Path) -> Result<u64> {
 }
 
 impl BaseKey {
-    /// Hashes the payload binary content, payload shared libs, and
-    /// the optional scheduler / probe / alloc-worker binary content
-    /// and shared libs. Each optional input participates
-    /// symmetrically because each changes the bytes written into
-    /// the initramfs. Explicit parameters keep the cache key
+    /// Hashes the payload's shared-lib SET — NOT its content: `/init`
+    /// lives in the per-run suffix (`build_suffix`), so the base archive
+    /// depends only on which libraries the payload pulls in, not on the
+    /// payload bytes. A payload recompile that keeps the same libs is a
+    /// base-cache hit. The optional scheduler / probe / alloc-worker
+    /// binaries DO have their content hashed — they are written into the
+    /// base, so each changes the base bytes. Each optional input
+    /// participates symmetrically. Explicit parameters keep the cache key
     /// sensitive to these inputs regardless of the routing choice —
     /// the probe currently rides the extras path (stripped) while
     /// the worker rides `include_files` (verbatim), but the hash
@@ -122,7 +132,19 @@ impl BaseKey {
     ) -> Result<Self> {
         let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
 
-        hash_file(payload)?.hash(&mut hasher);
+        // Payload CONTENT is not hashed: /init lives in the per-run
+        // suffix, not the base. Only the payload's shared-lib SET shapes
+        // the base, so a payload recompile that keeps the same libs is a
+        // base-cache hit. Still fail fast if the payload is missing or
+        // not a regular file — `hash_shared_libs` swallows resolve errors,
+        // and the base build would fail later anyway.
+        let payload_meta = std::fs::metadata(payload)
+            .with_context(|| format!("stat payload for cache key: {}", payload.display()))?;
+        anyhow::ensure!(
+            payload_meta.is_file(),
+            "payload for cache key is not a regular file: {}",
+            payload.display()
+        );
         Self::hash_shared_libs(payload, &mut hasher);
 
         match scheduler {
@@ -160,7 +182,7 @@ impl BaseKey {
     /// Shell mode key: hashes a sentinel, include files, and the
     /// busybox flag so different shell configurations get distinct
     /// cache keys. Include file archive paths and content are hashed
-    /// so the same payload + same includes = cache hit, while
+    /// so the same payload libs + same includes = cache hit, while
     /// different includes = cache miss. `probe` and `worker` are
     /// hashed for the same reasons as [`BaseKey::new`].
     pub(crate) fn new_shell(
@@ -191,7 +213,18 @@ impl BaseKey {
             }
             None => 0u8.hash(&mut hasher),
         }
-        hash_file(payload)?.hash(&mut hasher);
+        // Payload CONTENT is not hashed (see `BaseKey::new`): /init is in
+        // the per-run suffix; only the payload's shared-lib SET shapes the
+        // base, so a recompile keeping the same libs is a cache hit. Fail
+        // fast if the payload is missing or not a regular file (see
+        // `BaseKey::new`).
+        let payload_meta = std::fs::metadata(payload)
+            .with_context(|| format!("stat payload for cache key: {}", payload.display()))?;
+        anyhow::ensure!(
+            payload_meta.is_file(),
+            "payload for cache key is not a regular file: {}",
+            payload.display()
+        );
         Self::hash_shared_libs(payload, &mut hasher);
 
         match scheduler {
@@ -264,7 +297,30 @@ impl BaseKey {
     /// the cache key changes when any shared lib is updated on the host.
     fn hash_shared_libs(binary: &Path, hasher: &mut AHasher) {
         if let Ok(result) = initramfs::resolve_shared_libs(binary) {
+            // The payload's DT_NEEDED closure; the interp's own deps (below)
+            // are folded in before the single sorted hash pass.
             let mut entries: Vec<_> = result.found.iter().map(|(_, p)| p.clone()).collect();
+            // The PT_INTERP (dynamic linker) is packed into the base by
+            // build_initramfs_base but is NOT a DT_NEEDED entry, so it's
+            // absent from `found`. Hash its path + content: the base
+            // depends on it, and the payload's own content is no
+            // longer hashed, so an interp swap with an unchanged DT_NEEDED
+            // set would otherwise serve a stale base.
+            if let Some(interp) = &result.interpreter {
+                interp.as_bytes().hash(hasher);
+                if let Ok(sample) = hash_file(Path::new(interp)) {
+                    sample.hash(hasher);
+                }
+                // A non-standard interp (custom toolchain linker) can itself
+                // be dynamically linked; build_initramfs_base packs its own
+                // dep chain, so fold those host paths into the hashed set too
+                // — else an interp-dep change (interp binary unchanged) would
+                // serve a stale base. resolve_interpreter_deps is the same
+                // resolution the base packer uses (empty for a standard ld.so).
+                if let Ok(interp_deps) = initramfs::resolve_interpreter_deps(interp) {
+                    entries.extend(interp_deps.found.into_iter().map(|(_, p)| p));
+                }
+            }
             entries.sort();
             for p in &entries {
                 // `to_str()` loses every non-UTF-8 path (Linux
@@ -443,6 +499,80 @@ pub(crate) fn get_or_build_base(
     Ok(BaseRef::Owned(arc))
 }
 
+/// Get or build the LZ4-compressed base, electing a single compressor
+/// via the same `O_EXCL` race gate as [`get_or_build_base`] -- rather
+/// than letting every cold-cache worker recompress and race to write.
+///
+/// Fast path: load the cached compressed segment. On a miss, `O_EXCL`
+/// elects one Winner to compress + write; losers block on the Winner's
+/// `LOCK_EX` (via `shm_open_lz4`'s blocking `LOCK_SH`) and then load the
+/// result. Every failure path falls back to local compression and
+/// always yields bytes -- there is no fatal error.
+///
+/// `KTSTR_CARGO_TEST_MODE` skips the SHM coordination entirely, like
+/// `get_or_build_base`: under bare `cargo test` each invocation is
+/// independent and the `O_EXCL` gate would only surface as confusing
+/// flock contention.
+pub(crate) fn get_or_compress_base_shm(content_hash: u64, base_bytes: &[u8]) -> Vec<u8> {
+    // Bare `cargo test`: skip the SHM layer entirely, compress locally.
+    if crate::cargo_test_mode::cargo_test_mode_active() {
+        return initramfs::lz4_legacy_compress(base_bytes);
+    }
+
+    let seg_name = initramfs::shm_lz4_segment_name(content_hash);
+
+    // Fast path: an already-written compressed segment. Pin it so a
+    // peer's cleanup_stale_shm cannot unlink it before try_cow_overlay.
+    if let Some(lz4) = initramfs::shm_load_lz4(content_hash) {
+        hold_shm_lock(&seg_name);
+        return lz4;
+    }
+
+    // SHM race gate: O_EXCL elects a single compressor.
+    match shm_try_create_excl(&seg_name) {
+        ShmCreateResult::Winner(fd) => {
+            tracing::debug!("lz4_base: compressor (O_EXCL won)");
+            let lz4 = initramfs::lz4_legacy_compress(base_bytes);
+            shm_write_and_release(fd, &lz4, &seg_name);
+            // Pin the segment for the process lifetime so a peer's
+            // cleanup_stale_shm cannot unlink it before this VM's
+            // try_cow_overlay re-opens it by hash for the COW mapping.
+            hold_shm_lock(&seg_name);
+            return lz4;
+        }
+        ShmCreateResult::Exists => {
+            tracing::debug!("lz4_base: waiting for compressor (EEXIST)");
+            // Blocks on the Winner's LOCK_EX inside shm_open_lz4, so by
+            // the time the read is granted the Winner has written; on
+            // Winner failure the segment is unlinked/zeroed and the
+            // load misses, falling through to the fallback.
+            if let Some(lz4) = initramfs::shm_load_lz4(content_hash) {
+                hold_shm_lock(&seg_name);
+                return lz4;
+            }
+        }
+        ShmCreateResult::Error => {
+            if let Some(lz4) = initramfs::shm_load_lz4(content_hash) {
+                hold_shm_lock(&seg_name);
+                return lz4;
+            }
+        }
+    }
+
+    // Fallback: the Winner failed (write error -> segment unlinked) or
+    // the post-wait load missed. Compress locally and best-effort store
+    // so a later reader still finds it. Mirrors get_or_build_base's
+    // fallback (the store is the non-blocking-skip writer).
+    let lz4 = initramfs::lz4_legacy_compress(base_bytes);
+    match initramfs::shm_store_lz4(content_hash, &lz4) {
+        // Stored (or skipped because a peer holds it) -- pin so it
+        // survives cleanup until try_cow_overlay.
+        Ok(()) => hold_shm_lock(&seg_name),
+        Err(e) => tracing::warn!("shm_store_lz4: {e:#}"),
+    }
+    lz4
+}
+
 /// Remove stale SHM segments from `/dev/shm` that don't match `current`.
 /// Only unlinks segments not held by any process (`LOCK_EX | LOCK_NB`).
 /// Parallel nextest workers hold `LOCK_SH` on their segments for the
@@ -507,19 +637,20 @@ fn cleanup_stale_shm(current: &BaseKey) {
 /// segments this process built or loaded.
 static HELD_SHM_LOCKS: Mutex<Vec<rustix::fd::OwnedFd>> = Mutex::new(Vec::new());
 
+/// Pin one SHM segment with a process-lifetime `LOCK_SH` so a peer's
+/// `cleanup_stale_shm` cannot unlink it. Best-effort: a miss (segment
+/// absent, or `LOCK_SH` contended by a writer's `LOCK_EX`) is a no-op.
+/// The base and lz4 segments are pinned separately, each after its own
+/// segment exists -- `get_or_build_base` pins the base, and
+/// `get_or_compress_base_shm` pins the lz4 once it has been written.
 fn hold_shm_lock(shm_name: &str) {
-    for name in [
-        shm_name.to_string(),
-        shm_name.replace("ktstr-base-", "ktstr-lz4-"),
-    ] {
-        if let Ok(fd) = rustix::shm::open(
-            name.as_str(),
-            rustix::shm::OFlags::RDONLY,
-            rustix::fs::Mode::empty(),
-        ) && rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockShared).is_ok()
-        {
-            HELD_SHM_LOCKS.lock().unwrap().push(fd);
-        }
+    if let Ok(fd) = rustix::shm::open(
+        shm_name,
+        rustix::shm::OFlags::RDONLY,
+        rustix::fs::Mode::empty(),
+    ) && rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockShared).is_ok()
+    {
+        HELD_SHM_LOCKS.lock().unwrap().push(fd);
     }
 }
 
@@ -703,23 +834,42 @@ mod tests {
     }
 
     #[test]
-    fn base_key_different_content_differs() {
-        let _tempdir_keep_alive = tempfile::Builder::new()
-            .prefix("ktstr-cache-content-test-")
+    fn base_key_same_libs_content_change_matches() {
+        // /init lives in the per-run suffix now, so the base key tracks
+        // the payload's shared-lib SET, not its content. Two payloads with
+        // the same libs but different bytes must produce the SAME base key
+        // — that is the cache-hit-across-recompile property the lib-set keying buys.
+        let exe = crate::resolve_current_exe().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("ktstr-cache-libs-test-")
             .tempdir()
             .unwrap();
-        let tmp = _tempdir_keep_alive.path();
-        let bin = tmp.join("payload");
+        let a = dir.path().join("payload_a");
+        let b = dir.path().join("payload_b");
 
-        std::fs::write(&bin, b"content_v1").unwrap();
-        let k1 = BaseKey::new(&bin, None, None, None, &[]).unwrap();
-
-        std::fs::write(&bin, b"content_v2").unwrap();
-        let k2 = BaseKey::new(&bin, None, None, None, &[]).unwrap();
-
+        // Both are copies of the same real ELF (identical DT_NEEDED), so
+        // they resolve to the same lib set. `b` gets trailing bytes
+        // appended so its CONTENT differs; goblin parses by header/section
+        // offset, leaving the resolved libs unchanged.
+        std::fs::copy(&exe, &a).unwrap();
+        std::fs::copy(&exe, &b).unwrap();
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&b).unwrap();
+            f.write_all(b"\x00ktstr-distinct-trailing-bytes").unwrap();
+        }
         assert_ne!(
-            k1, k2,
-            "different file content should produce different key"
+            std::fs::read(&a).unwrap(),
+            std::fs::read(&b).unwrap(),
+            "test setup: payload bytes must differ"
+        );
+
+        let ka = BaseKey::new(&a, None, None, None, &[]).unwrap();
+        let kb = BaseKey::new(&b, None, None, None, &[]).unwrap();
+        assert_eq!(
+            ka, kb,
+            "payload content change with an unchanged lib set must NOT \
+             change the base key (else the base cache misses every recompile)"
         );
     }
 
@@ -1008,5 +1158,44 @@ mod tests {
         // Clean up so this test does not leak state into siblings
         // (shared `base_cache()` Mutex outlives the test).
         base_cache().lock().unwrap().remove(&key);
+    }
+
+    /// Regression: get_or_compress_base_shm pins the lz4 segment via
+    /// hold_shm_lock so a peer's cleanup_stale_shm cannot unlink it.
+    /// cleanup only unlinks a segment it can grab LOCK_EX on (its
+    /// NonBlockingLockExclusive unlink-gate); a held LOCK_SH makes that
+    /// probe return EWOULDBLOCK, so cleanup skips the segment. This pins
+    /// that gate deterministically and single-process (same two-fd flock
+    /// independence as shm_load_base_holds_lock_until_drop).
+    #[test]
+    fn held_lz4_segment_survives_cleanup_lock_probe() {
+        let hash = 0x9EED_C0DE_9EED_C0DEu64;
+        let name = initramfs::shm_lz4_segment_name(hash);
+        let _ = rustix::shm::unlink(name.as_str()); // clean any stale segment
+
+        // Create the lz4 segment, then pin it (process-lifetime LOCK_SH).
+        let mut data = initramfs::LZ4_LEGACY_MAGIC.to_vec();
+        data.extend_from_slice(&[0x33u8; 64]);
+        initramfs::shm_store_lz4(hash, &data).unwrap();
+        hold_shm_lock(&name);
+
+        // cleanup_stale_shm's unlink gate is a NonBlockingLockExclusive
+        // probe; from a fresh fd it must fail while our LOCK_SH is held,
+        // so cleanup would `continue` past this segment instead of
+        // unlinking it.
+        let fd = rustix::shm::open(
+            name.as_str(),
+            rustix::shm::OFlags::RDONLY,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("open the pinned lz4 segment");
+        let probe = rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive);
+        assert!(
+            matches!(probe, Err(e) if e == rustix::io::Errno::WOULDBLOCK),
+            "cleanup's LOCK_EX probe must be blocked by the held LOCK_SH (got {probe:?})",
+        );
+        drop(fd);
+
+        let _ = rustix::shm::unlink(name.as_str());
     }
 }

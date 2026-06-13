@@ -96,7 +96,7 @@ pub fn validate_cmdline(cmdline: &str) -> Result<()> {
 /// arch/arm64/include/uapi/asm/kvm.h.
 const REG_CORE_BASE: u64 = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE as u64;
 
-/// Register ID for x0 (regs.regs[0]).
+/// Register ID for x0 (`regs.regs[0]`).
 const REG_X0: u64 = REG_CORE_BASE;
 
 /// Register ID for PC (regs.pc, offset = 256/4 = 64 in u32 units).

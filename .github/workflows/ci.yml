@@ -67,6 +67,11 @@ jobs:
         with:
           tool: cargo-nextest
       - run: just compile-fail
+      # ktstr-macros host unit tests — host-side + needs cargo-nextest
+      # (installed above), so they ride the compile-fail job rather than
+      # spinning a separate runner. cargo-ktstr's VM runner never discovers
+      # this proc-macro crate, so this is the only place they run in CI.
+      - run: just test-macros
 
   # Pins Cargo's `[dev-dependencies]` isolation contract: a downstream
   # consumer adding ktstr as a dev-dep MUST NOT get ktstr compiled into

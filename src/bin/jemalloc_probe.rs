@@ -83,17 +83,11 @@
 //! It cannot escalate to adjacent processes — each invocation names
 //! exactly one target and exits when that target is detached.
 
-// Link jemalloc as the global allocator for binary-homogeneity
-// across ktstr bins — the probe does NOT read its own TSD, so the
-// choice here is not a correctness requirement. Matching the
-// `#[global_allocator]` declaration in src/bin/ktstr.rs and
-// src/bin/cargo-ktstr.rs keeps allocator policy uniform across the
-// workspace's shipped binaries: the same allocator runs when a user
-// invokes any ktstr tool, and future cross-binary comparisons stay
-// apples-to-apples.
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
+// The global allocator (jemalloc) is provided centrally by the ktstr
+// library crate (`extern crate self as ktstr` in src/lib.rs). This probe
+// links ktstr (for `ktstr::test_support` / `ktstr::cli` / `ktstr::assert`),
+// so it inherits jemalloc without declaring its own `#[global_allocator]`,
+// keeping allocator policy uniform across the workspace's shipped binaries.
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};

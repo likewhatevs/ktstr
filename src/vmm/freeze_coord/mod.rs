@@ -904,25 +904,34 @@ impl KtstrVm {
     ) -> Result<VmRunState> {
         let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
         let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
+        // Userspace IOAPIC handle for the split-irqchip path: the device + the
+        // (Copy) raw VM fd, so each run loop reprograms MSI routes on a guest
+        // RTE write without borrowing `&vm.vm_fd`. Created here, in the same
+        // scope as the device handles, so it is visible to both the BSP loop
+        // and the per-AP spawn. The raw fd is alive for `run_vm`; the APs only
+        // touch the IOAPIC while the VM runs (at shutdown `kill` stops them
+        // before vm drops), so the post-drop window is held-but-unused. `None`
+        // for <=254-vCPU guests (in-kernel IOAPIC).
+        // x86-only: `vm.ioapic` (the device) and `IoapicHandle::new` exist
+        // only on the split-irqchip path. On aarch64 `IoapicHandle` is the
+        // uninhabited placeholder and KtstrKvm has no `ioapic` field (the GIC
+        // routes device IRQs), so the handle is always `None` there.
+        #[cfg(target_arch = "x86_64")]
+        let ioapic_handle: Option<Arc<crate::vmm::IoapicHandle>> = vm.ioapic.as_ref().map(|io| {
+            Arc::new(crate::vmm::IoapicHandle::new(
+                io.clone(),
+                vm.vm_fd.as_raw_fd(),
+            ))
+        });
+        #[cfg(not(target_arch = "x86_64"))]
+        let ioapic_handle: Option<Arc<crate::vmm::IoapicHandle>> = None;
 
         // Register serial EventFds with KVM's irqfd for interrupt-driven TX.
-        // Split-irqchip mode lacks IOAPIC routing (LAPIC-only kernel
-        // emulation; PIC/IOAPIC live in userspace and the framework
-        // does not implement the userspace IOAPIC dispatch). Without
-        // an IRQ delivery path the guest's serial driver hangs on the
-        // first TX/RX wake — the kernel uart driver has no polling
-        // fallback. Reject loudly so test setups exceeding the
-        // 8-bit xAPIC limit (max APIC ID > 254) are caught here
-        // instead of producing a silent guest hang.
-        #[cfg(target_arch = "x86_64")]
-        if vm.split_irqchip {
-            anyhow::bail!(
-                "serial COM1/COM2 require irqfd; split-irqchip mode \
-                 has no IOAPIC and the kernel uart driver has no \
-                 polling fallback — reduce topology so all APIC IDs \
-                 are at or below 254 (MAX_XAPIC_ID)",
-            );
-        }
+        // On x86 split-irqchip (>254 APIC IDs) the serial IRQ routes through
+        // the userspace IOAPIC (ioapic_handle above is threaded into the run
+        // loops; the guest's RTE write installs the MSI route); on the
+        // in-kernel-irqchip (x86 <=254) and aarch64 (GIC) paths the kernel
+        // routes the GSI directly.
         #[cfg(target_arch = "x86_64")]
         {
             vm.vm_fd
@@ -1082,9 +1091,13 @@ impl KtstrVm {
         let mut vc = virtio_console::VirtioConsole::new();
         vc.set_mem((*vm.guest_mem).clone());
         let virtio_con = Arc::new(PiMutex::new(vc));
-        // x86_64: split_irqchip bailed above (line ~137); reaching
-        // here implies a unified kernel irqchip, so irqfd registration
-        // is safe. aarch64: GICv3 is always kernel-side.
+        // Register the virtio-console irqfd. On x86 split-irqchip (>254 APIC
+        // IDs) the route is installed by the userspace IOAPIC when the guest
+        // programs the RTE — the irqfd is inert until then, and
+        // kvm_irq_routing_update rebinds it on the KVM_SET_GSI_ROUTING that
+        // the RTE write triggers. On the in-kernel-irqchip (x86 <=254) and
+        // aarch64 (GICv3) paths the kernel routes the GSI directly.
+        // register_irqfd works in all three modes (irqchip_in_kernel).
         vm.vm_fd
             .register_irqfd(virtio_con.lock().irq_evt(), kvm::VIRTIO_CONSOLE_IRQ)
             .context("register virtio-console irqfd")?;
@@ -1259,6 +1272,7 @@ impl KtstrVm {
             Some(&virtio_con),
             virtio_blk.as_ref(),
             virtio_net.as_ref(),
+            ioapic_handle.as_ref(),
             &kill,
             &kill_evt,
             &freeze,
@@ -2367,48 +2381,69 @@ impl KtstrVm {
                                 };
                                 let mut first_init = true;
                                 'reinit: loop {
-                                    // First init honours the 60 s
-                                    // boot-budget; subsequent re-inits
-                                    // (after a scheduler swap) skip the
-                                    // budget — the guest is already
-                                    // booted and the only reason init
-                                    // could fail is a transient slab-
-                                    // reuse race that resolves within a
-                                    // handful of retries.
-                                    let deadline = if first_init {
-                                        Some(Instant::now() + Duration::from_secs(60))
+                                    // First init honours the 60 s boot
+                                    // budget. Re-inits (after a scheduler
+                                    // swap) get a shorter 30 s budget: the
+                                    // guest is already booted, so a
+                                    // transient slab-reuse race resolves
+                                    // within a handful of retries; a wedged
+                                    // swap that never rebuilds must still
+                                    // stop retrying (the prior deadline=None
+                                    // busy-looped every ~100-200 ms until
+                                    // kill).
+                                    let is_first_init = first_init;
+                                    let deadline = if is_first_init {
+                                        Instant::now() + Duration::from_secs(60)
                                     } else {
-                                        None
+                                        Instant::now() + Duration::from_secs(30)
                                     };
                                     first_init = false;
                                     let publish: Option<AccessorPair> = loop {
                                         if kill_for_worker.load(Ordering::Acquire) {
                                             return;
                                         }
-                                        if let Some(dl) = deadline
-                                            && Instant::now() >= dl
-                                        {
+                                        if Instant::now() >= deadline {
+                                            if is_first_init {
+                                                tracing::warn!(
+                                                    "freeze-coord accessor-init worker: \
+                                                     60s first-init deadline exceeded; \
+                                                     coordinator will run without an \
+                                                     owned-accessor pair (freeze dump \
+                                                     path unavailable)"
+                                                );
+                                                // First-init budget burned
+                                                // without ever publishing —
+                                                // no accessor exists. Mark
+                                                // FAILED_PERMANENTLY so the
+                                                // dispatch wait sees the
+                                                // terminal state instead of
+                                                // blocking the full deadline
+                                                // on a worker that gave up.
+                                                worker_state_for_worker.store(
+                                                    crate::scenario::snapshot::bridge::accessor_worker_state::FAILED_PERMANENTLY,
+                                                    Ordering::Release,
+                                                );
+                                                let _ = dispatcher_wake_for_worker.write(1);
+                                                break None;
+                                            }
+                                            // Re-init budget exceeded — a
+                                            // wedged scheduler swap that did
+                                            // not settle. Do NOT mark
+                                            // FAILED_PERMANENTLY: a prior
+                                            // accessor is still in the slot
+                                            // and a later swap may rebuild
+                                            // cleanly. Stop busy-spinning —
+                                            // break to the park loop below,
+                                            // wait for the next reinit_evt,
+                                            // and keep the prior accessor
+                                            // usable.
                                             tracing::warn!(
                                                 "freeze-coord accessor-init worker: \
-                                                 60s deadline exceeded; coordinator \
-                                                 will run without owned-accessor \
-                                                 pair (freeze dump path unavailable)"
+                                                 30s re-init deadline exceeded \
+                                                 (scheduler swap did not settle); \
+                                                 keeping the prior accessor and \
+                                                 parking for the next reset"
                                             );
-                                            // First-init 60s budget
-                                            // burned without a publish
-                                            // — worker exits after
-                                            // surfacing the break path.
-                                            // Mark FAILED_PERMANENTLY
-                                            // so the dispatch wait sees
-                                            // the terminal state rather
-                                            // than blocking the full
-                                            // deadline on a worker
-                                            // that's already given up.
-                                            worker_state_for_worker.store(
-                                                crate::scenario::snapshot::bridge::accessor_worker_state::FAILED_PERMANENTLY,
-                                                Ordering::Release,
-                                            );
-                                            let _ = dispatcher_wake_for_worker.write(1);
                                             break None;
                                         }
                                         // Use the guest-reported phys_base
@@ -2418,8 +2453,55 @@ impl KtstrVm {
                                         // failing page-table walk.
                                         let biased = kern_phys_base_for_worker
                                             .load(Ordering::Acquire);
+                                        let tcr_val = tcr_for_worker
+                                            .as_ref()
+                                            .map(|c| c.load(Ordering::Acquire))
+                                            .unwrap_or(0);
+                                        let cr3_val = cr3_for_worker.load(Ordering::Acquire);
                                         let pb_hint = if biased != 0 {
                                             biased.wrapping_sub(1)
+                                        } else if cfg!(target_arch = "aarch64")
+                                            && tcr_val != 0
+                                            && cr3_val != 0
+                                        {
+                                            // aarch64 accessor decouple: phys_base =
+                                            // code_start - ram_start = text_offset = 0 for a
+                                            // relocatable kernel (CONFIG_RANDOMIZE_BASE pinned
+                                            // in ktstr.kconfig; KERNEL_LOAD_ADDR == DRAM_START,
+                                            // aarch64/kvm.rs:22/90), so from_elf_with_hint with
+                                            // hint=0 yields the IDENTICAL accessor as the
+                                            // eventual KERN_ADDRS hint (which also resolves
+                                            // phys_base to 0 via wrapping_sub(1)). Build the
+                                            // accessor the moment the MMU is up (tcr_el1 + cr3
+                                            // programmed, early boot) instead of blocking on
+                                            // KERN_ADDRS, whose delivery waits on the guest's
+                                            // slow bulk-port-1 virtio_console handshake (~9s
+                                            // post-attach) and otherwise defers every periodic
+                                            // capture into the final scenario step (collapsing
+                                            // the per-phase pipeline to one bucket). The KASLR
+                                            // text offset still arrives via KERN_ADDRS for the
+                                            // kaslr publish gate (~L7751); only the map-accessor
+                                            // build is unblocked here. The host runs the guest
+                                            // same-arch under KVM, so cfg!(target_arch) is the
+                                            // guest arch. x86_64 keeps waiting for the real
+                                            // phys_base (no fixed-zero guarantee there).
+                                            //
+                                            // cr3 stability: the cached cr3 (TTBR1, read by the
+                                            // BSP loop) is swapper_pg_dir here, NOT the transient
+                                            // init_pg_dir. map_kernel installs init_pg_dir then
+                                            // switches to swapper_pg_dir inside the PI stub
+                                            // (arch/arm64/kernel/pi/map_kernel.c) while the MMU
+                                            // comes online — no MMIO/interrupt occurs, so the vCPU
+                                            // never exits to userspace in that window and the BSP
+                                            // loop's first non-zero TTBR1 read is already
+                                            // swapper_pg_dir (a stable .bss symbol, never freed).
+                                            // A future change adding any very-early guest exit
+                                            // could latch init_pg_dir (reclaimed by free_initmem)
+                                            // → the cached cr3 would then walk garbage; validating
+                                            // cr3 == swapper_pg_dir's PA before accepting this
+                                            // early build would catch that (deferred — the PA
+                                            // derivation is VA_BITS-sensitive).
+                                            0
                                         } else {
                                             let pb_evt_fd = {
                                                 use std::os::unix::io::AsRawFd;
@@ -2432,11 +2514,6 @@ impl KtstrVm {
                                             unsafe { libc::poll(pfds.as_mut_ptr(), 2, 200) };
                                             continue;
                                         };
-                                        let tcr_val = tcr_for_worker
-                                            .as_ref()
-                                            .map(|c| c.load(Ordering::Acquire))
-                                            .unwrap_or(0);
-                                        let cr3_val = cr3_for_worker.load(Ordering::Acquire);
                                         let map_res = crate::monitor::bpf_map::GuestMemMapAccessorOwned
                                             ::from_elf_with_hint(
                                                 mem_for_worker.clone(),
@@ -2475,22 +2552,27 @@ impl KtstrVm {
                                                     Ordering::Release,
                                                     Ordering::Relaxed,
                                                 );
-                                            let prog_res = {
-                                                let shared_syms = map.guest_kernel().symbols_arc();
-                                                let kernel = crate::monitor::guest::GuestKernel
-                                                    ::from_elf_with_symbols(
-                                                        mem_for_worker.clone(),
-                                                        shared_syms,
-                                                        &elf,
-                                                        tcr_val,
-                                                        cr3_val,
-                                                        pb_hint,
-                                                    );
-                                                kernel.and_then(|k| {
-                                                    crate::monitor::bpf_prog::GuestMemProgAccessorOwned
-                                                        ::finish(k, &elf, &data_for_worker, &vmlinux_for_worker)
-                                                })
-                                            };
+                                            // Reuse the map accessor's already-built
+                                            // GuestKernel for the prog accessor instead of
+                                            // rebuilding it. The kernel image (symbols,
+                                            // TTBR1/TCR/phys_base, page_offset) is identical
+                                            // for both accessors — only prog_idr_kva +
+                                            // prog offsets differ. Rebuilding via
+                                            // from_elf_with_symbols re-parsed the full
+                                            // vmlinux symtab and re-walked the page tables
+                                            // (~7 s on aarch64), which delayed the accessor
+                                            // publish past the periodic-capture window so
+                                            // no snapshot ever fired (periodic_fired=0).
+                                            // Cloning shares the Arc-backed `mem` +
+                                            // `symbols` — cheap — and `finish` only adds the
+                                            // prog IDR symbol + BTF offsets.
+                                            let prog_res =
+                                                crate::monitor::bpf_prog::GuestMemProgAccessorOwned::finish(
+                                                    map.guest_kernel().clone(),
+                                                    &elf,
+                                                    &data_for_worker,
+                                                    &vmlinux_for_worker,
+                                                );
                                             break Some((map, prog_res.ok()));
                                         }
                                         // Wait on kill_evt with 200ms
@@ -3191,6 +3273,15 @@ impl KtstrVm {
                 // a subsequent iteration finds the gate clear — the
                 // 10% buffer is the slack budget for this wait.
                 let mut periodic_boundaries_ns: Option<Vec<u64>> = None;
+                // Anchor (`scenario_start_ns` or the derived fallback) the
+                // boundaries were computed against; retained at loop scope
+                // so each periodic-fire store can derive its capture's
+                // workload-relative `boundary_offset_ms` = boundary_ns -
+                // anchor_ns, which `build_phase_buckets_with_stimulus` maps
+                // onto the guest step timeline (the run_start-relative fire
+                // time is ~uniform across the deferred burst and useless
+                // for per-phase attribution).
+                let mut periodic_anchor_ns: u64 = 0;
                 let mut next_periodic_idx: u32 = 0;
                 // Consecutive parked-vCPU rendezvous failures during
                 // periodic capture. Reset to 0 on every successful
@@ -7624,6 +7715,7 @@ impl KtstrVm {
                                     workload_duration_ns = workload_d.as_nanos() as u64,
                                     "freeze-coord: periodic snapshot boundaries computed"
                                 );
+                                periodic_anchor_ns = scenario_anchor;
                                 periodic_boundaries_ns = Some(boundaries);
                             }
                         }
@@ -7926,6 +8018,11 @@ impl KtstrVm {
                                         report,
                                         stats_value,
                                         Some(sample_elapsed_ms_anchor),
+                                        Some(
+                                            boundaries[next_periodic_idx as usize]
+                                                .saturating_sub(periodic_anchor_ns)
+                                                / 1_000_000,
+                                        ),
                                         phase_step_index,
                                     );
                                     // Successful capture resets the
@@ -8002,6 +8099,11 @@ impl KtstrVm {
                                             placeholder,
                                             stats_value,
                                             Some(sample_elapsed_ms_anchor),
+                                            Some(
+                                                boundaries[next_periodic_idx as usize]
+                                                    .saturating_sub(periodic_anchor_ns)
+                                                    / 1_000_000,
+                                            ),
                                             degraded_phase_step_index,
                                         );
                                         periodic_consecutive_timeouts =
@@ -8037,6 +8139,11 @@ impl KtstrVm {
                                             placeholder,
                                             stats_value,
                                             Some(sample_elapsed_ms_anchor),
+                                            Some(
+                                                boundaries[next_periodic_idx as usize]
+                                                    .saturating_sub(periodic_anchor_ns)
+                                                    / 1_000_000,
+                                            ),
                                             suppressed_phase_step_index,
                                         );
                                     }
@@ -8237,6 +8344,10 @@ impl KtstrVm {
                                 report,
                                 None,
                                 None,
+                                // On-demand watchpoint: no periodic boundary,
+                                // so no workload-relative offset; the trip
+                                // phase below is authoritative.
+                                None,
                                 trip_phase_step_index,
                             );
                             }
@@ -8297,6 +8408,10 @@ impl KtstrVm {
                                     placeholder,
                                     None,
                                     None,
+                                    // On-demand watchpoint: no periodic
+                                    // boundary, so no workload-relative
+                                    // offset; the trip phase is authoritative.
+                                    None,
                                     trip_phase_step_index,
                                 );
                             }
@@ -8327,6 +8442,10 @@ impl KtstrVm {
                                     &tag,
                                     placeholder,
                                     None,
+                                    None,
+                                    // On-demand watchpoint: no periodic
+                                    // boundary, so no workload-relative
+                                    // offset; the trip phase is authoritative.
                                     None,
                                     trip_phase_step_index,
                                 );
@@ -9867,6 +9986,7 @@ impl KtstrVm {
                     Some(&virtio_con),
                     virtio_blk.as_ref(),
                     virtio_net.as_ref(),
+                    ioapic_handle.as_ref(),
                     &kill,
                     &freeze,
                     &watchpoint,
@@ -9922,6 +10042,25 @@ impl KtstrVm {
             "BSP: exited run loop, code={exit_code} timed_out={timed_out} \
              (run-loop sentinel — final exit code comes from bulk port / COM2 in collect_results)"
         );
+
+        // Surface IOAPIC routing-install failures (split-irqchip path). A
+        // nonzero count means a guest-programmed device IRQ never got its MSI
+        // route, so the device hung on first use — report it loudly so a
+        // hung-device test shows the cause instead of an opaque timeout.
+        // Per-failure errors are already logged in classify_exit; this is the
+        // run-level summary. Fires on both clean-exit and watchdog-timeout
+        // paths (run_bsp_loop returns from both before reaching here).
+        #[cfg(target_arch = "x86_64")]
+        if let Some(io) = ioapic_handle.as_ref() {
+            let n = io.routing_failures();
+            if n > 0 {
+                tracing::error!(
+                    count = n,
+                    "ioapic: {n} KVM_SET_GSI_ROUTING install(s) failed this run — \
+                     device IRQs for those pins did not deliver"
+                );
+            }
+        }
 
         // Join the watchdog before dropping `bsp`. The watchdog holds an
         // ImmediateExitHandle pointing into bsp's kvm_run mmap. If bsp is
@@ -10097,6 +10236,7 @@ impl KtstrVm {
         virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
         virtio_blk: Option<&Arc<PiMutex<virtio_blk::VirtioBlk>>>,
         virtio_net: Option<&Arc<PiMutex<virtio_net::VirtioNet>>>,
+        ioapic: Option<&Arc<crate::vmm::IoapicHandle>>,
         kill: &Arc<AtomicBool>,
         kill_evt: &Arc<EventFd>,
         freeze: &Arc<AtomicBool>,
@@ -10132,6 +10272,7 @@ impl KtstrVm {
             let vc_clone = virtio_con.cloned();
             let vblk_clone = virtio_blk.cloned();
             let vnet_clone = virtio_net.cloned();
+            let ioapic_clone = ioapic.cloned();
             let exited = Arc::new(AtomicBool::new(false));
             let exited_clone = exited.clone();
             let parked = Arc::new(AtomicBool::new(false));
@@ -10245,6 +10386,7 @@ impl KtstrVm {
                             vc_clone.as_ref(),
                             vblk_clone.as_ref(),
                             vnet_clone.as_ref(),
+                            ioapic_clone.as_ref(),
                             &kill_clone,
                             &kill_evt_clone,
                             &freeze_clone,
@@ -10610,17 +10752,18 @@ impl KtstrVm {
                 // PA derivation (pco_pa, scx_root_pa,
                 // page_offset_base_pa) into an out-of-DRAM address;
                 // every subsequent monitor read returns 0 and
-                // `data_valid` never latches. Brief retry-until-
-                // non-zero closes the window: by the time SYS_RDY
-                // fires the BSP has been in the run loop for
+                // `data_valid` never latches. The guest-reported-
+                // phys_base wait below closes the window: by the time
+                // SYS_RDY fires the BSP has been in the run loop for
                 // hundreds of ms in steady state, so the vast
-                // majority of paths return on the first load. The
-                // 500-iteration cap (500 ms total) handles the
-                // pathological case where the BSP genuinely never
-                // populated the cache (early-boot crash, kill
-                // before first iteration); in that case `phys_base`
-                // falls back to 0 and the downstream `data_valid`
-                // gate keeps every walk safe.
+                // majority of paths resolve on the first poll. Its
+                // bounded budget (30 iterations x 100 ms = 3 s) handles
+                // the pathological case where neither the guest-
+                // reported value nor the cr3-derived resolve ever
+                // returns (early-boot crash, kill before first
+                // iteration); in that case `phys_base` falls back to 0
+                // and the downstream `data_valid` gate keeps every
+                // walk safe.
                 // Wait for guest-reported phys_base. The guest
                 // reads it from /proc/iomem and writes
                 // `phys_base + 1` (biased +1 so the AtomicU64's
@@ -10686,49 +10829,17 @@ impl KtstrVm {
                     let _ = kern_phys_base_evt.write(1);
                 }
 
-                // Virt-KASLR offset published by either the BSP
-                // MSR_LSTAR readback
-                // (`src/vmm/x86_64/msr_kaslr::read_and_derive`
-                // invoked from `run_bsp_loop`) or the guest-channel
-                // KERN_ADDRS handler
-                // (`src/vmm/freeze_coord/dispatch.rs`'s KERN_ADDRS
-                // arm). Both writers CAS-publish the SAME offset
-                // (KASLR is a single boot-time slot pick) into
-                // `kern_virt_kaslr_shared` with `+1` bias; first
-                // writer wins, second observes the existing value
-                // via CAS-fail and is a no-op. By the time this
-                // line executes the sys_rdy wait above has already
-                // returned, so the guest has run far past
-                // `setup_per_cpu_areas` + `idt_syscall_init` and at
-                // least one of the two publishers has typically
-                // observed a non-zero value. The 0 sentinel below
-                // matches the nokaslr state — added per-test via
-                // `#[ktstr_test(kaslr = false)]` or
-                // `Scheduler::kargs(&["nokaslr"])`; absent on the
-                // default KASLR-on path. When the cmdline pinned
-                // KASLR off, neither publisher produces a non-zero
-                // offset because the kernel ran with
-                // `nokaslr` and disabled the slide at boot — the
-                // consumer uses a literal 0 and the per-CPU
-                // template arithmetic in
-                // `monitor::symbols::per_cpu_kva` lands on the
-                // compile-time base.
-                let kaslr_offset: u64 = kern_virt_kaslr_shared
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    .saturating_sub(1);
-                // `saturating_sub(1)` folds the `+1` bias:
-                //   stored == 0 (no publisher fired)    → 0
-                //   stored == 1 (KASLR off, offset=0)   → 0
-                //   stored == N (offset N-1)            → N-1
-                // The two 0 cases collapse to the same observable
-                // behaviour: the per-CPU template arithmetic in
-                // `monitor::symbols::per_cpu_kva` lands on the
-                // compile-time base, which is correct for both
-                // "KASLR off" and "no publisher yet" — the latter
-                // is rare (sys_rdy already fired) and the worst
-                // outcome is a single early sample reading a
-                // pre-KASLR PA that fails the BSS-zero gate in
-                // `monitor::reader`.
+                // The KASLR slide is published into `kern_virt_kaslr_shared`
+                // (`+1`-biased) by the BSP MSR_LSTAR readback
+                // (`src/vmm/x86_64/msr_kaslr::read_and_derive`, x86_64-only)
+                // or the guest-channel KERN_ADDRS handler
+                // (`src/vmm/freeze_coord/dispatch.rs`, both arches). It is
+                // NOT snapshotted here: the monitor re-reads the Arc every
+                // sample iteration via `RqRefresh::kaslr_offset` (the clone
+                // below). A once-captured value would be 0 — mis-sliding
+                // every per-CPU KVA for the run — whenever the monitor's
+                // sys_rdy wait resolves via timeout before the (single,
+                // no-retry on aarch64) publisher fires.
 
                 // Kill check between sys_rdy wait and the long-tail
                 // setup work below (page-table walks, watchdog override
@@ -10914,7 +11025,7 @@ impl KtstrVm {
                 let rq_refresh = monitor::reader::RqRefresh {
                     pco_pa,
                     runqueues_kva: symbols.runqueues,
-                    kaslr_offset,
+                    kaslr_offset: kern_virt_kaslr_shared.clone(),
                     num_cpus,
                     page_offset_base_pa,
                     event: event_refresh,
@@ -11436,6 +11547,7 @@ impl KtstrVm {
         virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
         virtio_blk: Option<&Arc<PiMutex<virtio_blk::VirtioBlk>>>,
         virtio_net: Option<&Arc<PiMutex<virtio_net::VirtioNet>>>,
+        ioapic: Option<&Arc<crate::vmm::IoapicHandle>>,
         kill: &Arc<AtomicBool>,
         freeze: &Arc<AtomicBool>,
         watchpoint: &Arc<WatchpointArm>,
@@ -11725,6 +11837,7 @@ impl KtstrVm {
                         virtio_con.map(|a| a.as_ref()),
                         virtio_blk.map(|a| a.as_ref()),
                         virtio_net.map(|a| a.as_ref()),
+                        ioapic.map(|a| a.as_ref()),
                         &mut exit,
                     ) {
                         Some(ExitAction::Continue) | None => {}
@@ -11757,6 +11870,27 @@ impl KtstrVm {
                             exit_reason = BspExitReason::Fatal;
                             break;
                         }
+                    }
+                    // Guest kernel panic latched on COM1 at ingest (e.g.
+                    // OOM → "...Attempted to kill init! exitcode=0x…")? The
+                    // latch fires only once the banner line is newline-
+                    // terminated, so classify_exit just drained the '\n'
+                    // that completed it.
+                    // Abort fast with the cause rather than spinning to the
+                    // watchdog / 24h interactive timeout. Propagate kill so
+                    // peers + the freeze coordinator tear down promptly,
+                    // like the Fatal arm.
+                    if let Some(line) = com1.lock().take_panic() {
+                        eprintln!(
+                            "BSP: guest kernel panic — aborting run: {line} \
+                             (if OOM: raise memory_mib or shrink the initramfs)"
+                        );
+                        kill.store(true, Ordering::Release);
+                        if let Some(kev) = kill_evt {
+                            let _ = kev.write(1);
+                        }
+                        exit_reason = BspExitReason::GuestPanic;
+                        break;
                     }
                 }
                 Err(e) => {

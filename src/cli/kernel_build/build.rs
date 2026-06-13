@@ -18,8 +18,8 @@ use super::super::kernel_cmd::{
 };
 use super::super::util::{Spinner, success, warn};
 use super::kconfig::{
-    configure_kernel, has_sched_ext, validate_kernel_config, warn_dropped_extra_kconfig_lines,
-    warn_extra_kconfig_overrides_baked_in,
+    all_fragment_lines_present, configure_kernel, validate_kernel_config,
+    warn_dropped_extra_kconfig_lines, warn_extra_kconfig_overrides_baked_in,
 };
 use super::make::{build_make_args, make_kernel_with_output, run_make, run_make_with_output};
 
@@ -596,14 +596,14 @@ pub fn kernel_build_pipeline(
     // ordering kbuild's last-wins rule operates on.
     let merged_fragment = crate::merge_kconfig_fragments(EMBEDDED_KCONFIG, extra_kconfig);
 
-    // Forced re-configure when extra-kconfig is supplied. The
-    // `has_sched_ext` short-circuit was tuned for the EMBEDDED_KCONFIG
-    // path: `has_sched_ext` is a probe for the primary option;
-    // olddefconfig fills the rest. With user-supplied extras, an
-    // existing `.config` (e.g. a stale build state) can satisfy the
-    // sched_ext probe yet miss every user line, producing a kernel
-    // that silently ignored the extras. Always run the merged
-    // configure when extras are present so the user's symbols land.
+    // Reconfigure when any merged-fragment line is missing from the current
+    // `.config`. The prior `has_sched_ext` probe was a proxy for
+    // "configured" — but a stale `.config` from an earlier build can carry
+    // sched_ext while MISSING a changed baked-in value (e.g. an edited
+    // CONFIG_NR_CPUS in ktstr.kconfig) or every user `--extra-kconfig` line,
+    // silently ignoring the edit. `all_fragment_lines_present` checks the
+    // actual merged fragment (exact-line) instead, so an edited baked-in
+    // symbol or a user extra both trigger the merged configure.
     // Surface a `tracing::warn!` for each user fragment line that
     // overrides a baked-in symbol from `EMBEDDED_KCONFIG`. The build
     // proceeds with the user value winning (last-wins is the design
@@ -617,7 +617,9 @@ pub fn kernel_build_pipeline(
         warn_extra_kconfig_overrides_baked_in(extra, cli_label);
     }
 
-    let needs_configure = extra_kconfig.is_some() || !has_sched_ext(source_dir);
+    let config_now = std::fs::read_to_string(source_dir.join(".config")).unwrap_or_default();
+    let needs_configure =
+        extra_kconfig.is_some() || !all_fragment_lines_present(&merged_fragment, &config_now);
     if needs_configure {
         let configure_result =
             Spinner::with_progress("Configuring kernel...", "Kernel configured", |_| {

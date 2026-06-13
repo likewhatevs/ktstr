@@ -139,6 +139,39 @@ fn resolve_shared_libs_with_extra_interp_hints(
     resolve_shared_libs_inner(binary, extra_interp_hints)
 }
 
+/// Resolve a non-standard interpreter's *own* shared-library dependencies.
+///
+/// A standard system linker (glibc/musl `ld.so`) is statically linked with no
+/// deps, so this returns an empty set for it (`is_standard_interpreter`). A
+/// custom-toolchain linker can instead be dynamically linked with its own
+/// `libA -> libB` chain alongside it; `build_initramfs_base` packs that chain
+/// into the base and `BaseKey::hash_shared_libs` hashes it, so both go through
+/// this one helper and the cache key covers exactly the set the base packs.
+///
+/// Seeds the BFS with the linker's parent and sibling lib dirs (the linker has
+/// no PT_INTERP of its own, so the auto-derived hint set would be empty) so the
+/// linker's toolchain-local deps resolve against the same dirs the parent
+/// binary's resolution used.
+pub(crate) fn resolve_interpreter_deps(interp: &str) -> Result<SharedLibs> {
+    if is_standard_interpreter(interp) {
+        return Ok(SharedLibs {
+            found: vec![],
+            missing: vec![],
+            interpreter: None,
+        });
+    }
+    let interp_path = Path::new(interp);
+    let mut interp_hints: Vec<PathBuf> = Vec::new();
+    if let Some(parent) = interp_path.parent() {
+        interp_hints.push(parent.to_path_buf());
+        if let Some(grandparent) = parent.parent() {
+            interp_hints.push(grandparent.join("lib"));
+            interp_hints.push(grandparent.join("lib64"));
+        }
+    }
+    resolve_shared_libs_with_extra_interp_hints(interp_path, &interp_hints)
+}
+
 #[tracing::instrument(skip_all, fields(binary = %binary.display(), extra_hints = extra_interp_hints.len()))]
 fn resolve_shared_libs_inner(binary: &Path, extra_interp_hints: &[PathBuf]) -> Result<SharedLibs> {
     // Cache results by canonical path AND extra-hint set — avoids
@@ -671,21 +704,6 @@ fn is_deleted_self(path: &Path) -> bool {
         && target_str.trim_end_matches(" (deleted)") == path.to_string_lossy().as_ref()
 }
 
-/// Build the base cpio archive: /init binary, extra binaries, and shared
-/// libraries. Does NOT include /args, trailer, or 512-byte padding. The
-/// returned bytes are a valid cpio prefix that `build_suffix` can complete
-/// with per-invocation args.
-///
-/// The test binary is packed as `/init` (the kernel's rdinit entry point).
-/// Init setup (mounts, scheduler start, etc.) is handled by the Rust init
-/// code in `vmm::rust_init`, which runs when the binary detects PID 1.
-///
-/// When `busybox_bytes` is `Some`, embeds the provided bytes at
-/// `bin/busybox` for shell mode. Bytes are sourced from
-/// [`crate::vmm::blobs::load_busybox_bytes`] (which reads the
-/// `KTSTR_BUSYBOX_PATH` env var that `cargo-ktstr` sets at startup);
-/// the library does not embed busybox itself.
-///
 /// Expand `guest_path`'s parent into every ancestor directory component
 /// and insert each into `dirs`. No-op when the path has no parent
 /// (e.g. top-level files like `init`). The component walk produces every
@@ -702,17 +720,33 @@ fn register_parent_dirs(dirs: &mut BTreeSet<String>, guest_path: &str) {
     }
 }
 
+/// Build the base cpio archive: directories, `bin/busybox` (shell mode),
+/// extra binaries, include files, and shared libraries. Does NOT include
+/// `/init`, `/args`, the sentinel, trailer, or 512-byte padding — those
+/// are the per-run suffix ([`build_suffix`]). The returned bytes are a
+/// valid cpio prefix `build_suffix` completes. `/init` is deliberately
+/// NOT here: keeping the payload's bytes out of the base means a payload
+/// recompile that leaves the shared-lib set unchanged hits the base cache
+/// (the base depends only on the lib SET, resolved from `payload`, not
+/// its content).
+///
+/// When `busybox_bytes` is `Some`, embeds the provided bytes at
+/// `bin/busybox` for shell mode. Bytes are sourced from
+/// [`crate::vmm::blobs::load_busybox_bytes`] (which reads the
+/// `KTSTR_BUSYBOX_PATH` env var that `cargo-ktstr` sets at startup);
+/// the library does not embed busybox itself.
+///
 /// `include_files` adds files verbatim to the archive (no strip_debug).
 /// Each entry is `(archive_path, host_path)`. ELF files get shared library
 /// resolution; non-ELF files are copied as-is. Symlinks are followed to
 /// their target; the target must be a regular file (FIFOs, device nodes,
-/// and sockets are rejected). Archive
-/// paths must not contain `..` components. Callers expand directories into
-/// individual file entries before calling this function (see
-/// `cli::resolve_include_files`).
+/// and sockets are rejected). Archive paths must not contain `..`
+/// components. Callers expand directories into individual file entries
+/// before calling this function (see `cli::resolve_include_files`).
 ///
-/// The init binary is `strip_debug`'d before being written into the
-/// archive. Extras are stripped the same way.
+/// Extra binaries are `strip_debug`'d before being written. `payload` is
+/// read only for shared-lib resolution (its `/init` bytes are written by
+/// [`build_suffix`]).
 #[tracing::instrument(skip_all, fields(payload = %payload.display(), includes = include_files.len()))]
 pub fn build_initramfs_base(
     payload: &Path,
@@ -762,10 +796,6 @@ pub fn build_initramfs_base(
         validated_includes.push((archive_path, host_path, meta.permissions().mode()));
     }
 
-    let binary = {
-        let _s = tracing::debug_span!("strip_debug").entered();
-        strip_debug(payload).with_context(|| format!("strip/read binary: {}", payload.display()))?
-    };
     let mut archive = Vec::new();
 
     // Collect directory entries needed for shared libraries and includes.
@@ -853,32 +883,18 @@ pub fn build_initramfs_base(
                     tracing::debug!("interpreter original path matches canonical, no alias needed");
                 }
 
-                // Non-standard interpreters may have their own shared lib
-                // deps (custom toolchain linkers alongside their libs).
-                // The linker has no PT_INTERP itself, so calling
-                // resolve_shared_libs without extra hints would BFS its
-                // DT_NEEDED only against system search paths and miss
-                // toolchain-local libs (and their transitive deps). Feed
-                // the linker's parent and sibling lib dirs in as extra
-                // interp-relative hints so the linker's own libA→libB
-                // chain is discovered against the same toolchain dirs
-                // the parent binary's BFS already used.
-                if !is_standard_interpreter(interp) {
-                    let mut interp_hints: Vec<PathBuf> = Vec::new();
-                    if let Some(parent) = interp_path.parent() {
-                        interp_hints.push(parent.to_path_buf());
-                        if let Some(grandparent) = parent.parent() {
-                            interp_hints.push(grandparent.join("lib"));
-                            interp_hints.push(grandparent.join("lib64"));
-                        }
-                    }
-                    if let Ok(interp_result) =
-                        resolve_shared_libs_with_extra_interp_hints(interp_path, &interp_hints)
-                    {
-                        for (g, h) in interp_result.found {
-                            register_parent_dirs(&mut dirs, &g);
-                            shared_libs.push((g, h));
-                        }
+                // A non-standard interpreter (custom toolchain linker) can
+                // itself be dynamically linked with its own libA->libB chain
+                // alongside it; resolve_interpreter_deps walks that chain
+                // (seeding the linker's parent + sibling lib dirs, since the
+                // linker has no PT_INTERP of its own) and returns empty for a
+                // standard, statically-linked ld.so. The cache key hashes the
+                // same set (BaseKey::hash_shared_libs) so an interp-dep change
+                // invalidates the base.
+                if let Ok(interp_result) = resolve_interpreter_deps(interp) {
+                    for (g, h) in interp_result.found {
+                        register_parent_dirs(&mut dirs, &g);
+                        shared_libs.push((g, h));
                     }
                 }
             }
@@ -936,10 +952,6 @@ pub fn build_initramfs_base(
         write_entry(&mut archive, dir, &[], 0o40755)?;
     }
 
-    // Test binary as /init — the Rust init code detects PID 1 and performs
-    // all setup (mounts, scheduler, etc.) before running the test function.
-    write_entry(&mut archive, "init", &binary, 0o100755)?;
-
     // Shell mode: embed busybox bytes provided by the caller. The
     // ktstr library does not own the bytes — they come from the
     // `KTSTR_BUSYBOX_PATH` env var that cargo-ktstr sets at startup
@@ -992,10 +1004,6 @@ pub fn build_initramfs_base(
         }
     }
 
-    // Sentinel: last entry before the suffix. The guest init checks for
-    // this file to detect incomplete initramfs extraction.
-    write_entry(&mut archive, ".ktstr_init_ok", &[], 0o100644)?;
-
     drop(_s_write);
 
     Ok(archive)
@@ -1006,6 +1014,12 @@ pub fn build_initramfs_base(
 /// `SuffixParams` without copying `Vec<String>` fields.
 #[derive(Default)]
 pub struct SuffixParams<'a> {
+    /// The test binary, packed as `/init` (the kernel's rdinit entry).
+    /// `strip_debug`'d into the suffix — not the cached base — so a
+    /// payload recompile that leaves the shared-lib set unchanged is a
+    /// base-cache hit. `None` only in suffix-shape unit tests; every
+    /// real boot path sets it from the VM's `init_binary`.
+    pub payload: Option<&'a Path>,
     /// `/args` contents — one entry per line.
     pub args: &'a [String],
     /// `/sched_args` contents, or empty to skip the entry.
@@ -1054,13 +1068,28 @@ pub struct SuffixParams<'a> {
     pub scheduler_cgroup_parent: Option<&'a str>,
 }
 
-/// Build the suffix that completes a base archive: `/args` and
-/// `/sched_args` entries, optional `/sched_enable` and `/sched_disable`
-/// shell scripts for kernel-built schedulers, optional `/exec_cmd`,
-/// trailer, and 512-byte padding. `base_len` is needed to compute the
-/// padding. The returned Vec is typically ~200 bytes.
+/// Build the suffix that completes a base archive: `/init` (the
+/// `strip_debug`'d test binary), `/args` and `/sched_args` entries,
+/// optional `/sched_enable` and `/sched_disable` shell scripts for
+/// kernel-built schedulers, optional `/exec_cmd`, the `.ktstr_init_ok`
+/// sentinel (last entry — its absence flags incomplete extraction),
+/// trailer, and 512-byte
+/// padding. `base_len` is needed to compute the padding. `/init` lives
+/// here, not the base, so a payload recompile is a base-cache hit; it
+/// dominates the suffix size (the other entries are ~200 bytes total).
 pub fn build_suffix(base_len: usize, params: &SuffixParams<'_>) -> Result<Vec<u8>> {
     let mut suffix = Vec::new();
+
+    // Test binary as /init — detects PID 1 and runs all setup before the
+    // test (see `vmm::rust_init`). It lives in the per-run suffix, not the
+    // cached base, so the base archive is independent of payload
+    // recompiles; `strip_debug` here is the per-run cost. `None` only in
+    // suffix-shape unit tests.
+    if let Some(payload) = params.payload {
+        let binary = strip_debug(payload)
+            .with_context(|| format!("strip/read init binary: {}", payload.display()))?;
+        write_entry(&mut suffix, "init", &binary, 0o100755)?;
+    }
 
     // Args file
     let args_data = params.args.join("\n");
@@ -1145,6 +1174,13 @@ pub fn build_suffix(base_len: usize, params: &SuffixParams<'_>) -> Result<Vec<u8
         let data = args.join("\n");
         write_entry(&mut suffix, &archive_path, data.as_bytes(), 0o100644)?;
     }
+
+    // Sentinel: the LAST entry before the trailer. The kernel extracts the
+    // whole initramfs before exec'ing /init, so this file's ABSENCE means
+    // the kernel silently dropped late cpio entries under memory pressure
+    // (do_name's filp_open ENOMEM returns without error — skips the entry
+    // but keeps consuming the stream). The guest's `rust_init` checks for it.
+    write_entry(&mut suffix, ".ktstr_init_ok", &[], 0o100644)?;
 
     // Trailer
     cpio::newc::trailer(&mut suffix as &mut dyn Write).context("write cpio trailer")?;
@@ -1336,11 +1372,24 @@ pub(crate) fn shm_load_base(content_hash: u64) -> Option<MappedShm> {
 /// takes an exclusive flock, `ftruncate`s to `data.len()`, `mmap`s
 /// `PROT_WRITE | MAP_SHARED`, copies, and cleans up.
 ///
-/// Concurrency: `LOCK_EX` blocks while any reader holds `LOCK_SH` on
-/// the same segment (e.g. a live `MappedShm` or `CowOverlayGuard`).
-/// The writer thus waits for in-flight VMs before truncating — which
-/// is what prevents the `SIGBUS` class of bug addressed by the
-/// reader-side flock lifetime in `shm_load_base` and `cow_overlay`.
+/// Concurrency: the write takes a NON-BLOCKING `LOCK_EX`
+/// (`NonBlockingLockExclusive`); on contention it SKIPS rather than
+/// blocking. This preserves the `SIGBUS`-prevention invariant (never
+/// `ftruncate` a segment a reader has COW-mapped) by construction:
+/// `LOCK_EX` is granted only when no reader holds `LOCK_SH`, so a
+/// successful acquire guarantees no live mapping, and on contention we
+/// skip (never truncate). The reader-side flock lifetime lives in
+/// `shm_load_base` (via `MappedShm`), `shm_open_lz4`, and
+/// `cow_overlay`.
+///
+/// A blocking `LOCK_EX` here starved indefinitely: Linux flock grants
+/// no writer preference, so under sustained host concurrency fresh
+/// `LOCK_SH` readers (each held for a VM's lifetime) perpetually jump
+/// ahead of the waiting writer, wedging the suite. Skipping is correct
+/// because writes are content-addressed (below): a held segment has
+/// the same hash, hence the same bytes, so the skipped rewrite was
+/// redundant; `try_cow_overlay` re-opens by hash, so a peer's write is
+/// still COW-shared.
 ///
 /// Writes are content-addressed at the caller: callers hash `data`
 /// to form the segment name. When two callers write the same content
@@ -1360,14 +1409,6 @@ fn shm_store(name: &str, data: &[u8]) -> Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("shm_open: {e}"))?;
 
-    // Surfaces the wait explicitly: with readers holding LOCK_SH
-    // for VM lifetime, concurrent test runs can block here for
-    // seconds. Without this, the user sees silent hang.
-    tracing::info!(
-        segment = name,
-        data_len = data.len(),
-        "shm_store: waiting for LOCK_EX"
-    );
     // Post-flock error paths (ftruncate/mmap failure) call shm_unlink
     // before the OwnedFd drop so a half-initialized segment (empty /
     // corrupt / wrong size) does not persist in /dev/shm where the
@@ -1378,15 +1419,32 @@ fn shm_store(name: &str, data: &[u8]) -> Result<()> {
     // just opened then failed to rewrite; content-addressing makes
     // recovery cheap — the next writer re-creates with the same hash.
     //
-    // Pre-flock (shm_open succeeded, flock failed) does NOT unlink:
-    // the segment may be a pre-existing valid one that a peer writer
-    // holds LOCK_EX on, and we must not destroy another process's
-    // cache entry on our own flock error.
+    // Flock failure (shm_open succeeded, LOCK_EX not acquired) does
+    // NOT unlink: the segment may be a pre-existing valid one a peer
+    // holds (a LOCK_SH reader via a live COW overlay, or a LOCK_EX
+    // writer), and we must not destroy another process's cache entry
+    // on our own contention (EWOULDBLOCK) or flock error.
     //
     // Success path does NOT unlink — the segment IS the cache. The
     // OwnedFd's drop handles close() on every path.
-    rustix::fs::flock(&fd, rustix::fs::FlockOperation::LockExclusive)
-        .map_err(|e| anyhow::anyhow!("flock: {e}"))?;
+    match rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {}
+        Err(e) if e == rustix::io::Errno::WOULDBLOCK => {
+            // A reader holds LOCK_SH (live COW overlay / MappedShm) or
+            // a peer holds LOCK_EX. The segment is in use or being
+            // written by the peer; skip the write. Content-addressing
+            // makes our rewrite redundant, and try_cow_overlay re-opens
+            // by hash so the peer's segment is still COW-shared. Do NOT
+            // unlink: the segment may be a valid one a peer is reading.
+            tracing::debug!(
+                segment = name,
+                data_len = data.len(),
+                "shm_store: LOCK_EX contended, skipping cache write"
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(anyhow::anyhow!("flock: {e}")),
+    }
 
     let raw_fd = fd.as_raw_fd();
     unsafe {
@@ -1453,7 +1511,7 @@ pub(crate) fn shm_unlink_base(content_hash: u64) {
 /// previous compression formats (zstd, gzip). The target arch tag
 /// keeps cross-arch caches separate on hosts where both ktstr
 /// binaries share `/dev/shm`.
-fn shm_lz4_segment_name(content_hash: u64) -> String {
+pub(crate) fn shm_lz4_segment_name(content_hash: u64) -> String {
     format!("/ktstr-lz4-{SHM_ARCH_TAG}-{content_hash:016x}")
 }
 
@@ -1481,6 +1539,56 @@ pub(crate) fn shm_open_lz4(content_hash: u64) -> Option<(std::os::fd::OwnedFd, u
 /// Store compressed initramfs data into an LZ4 SHM segment.
 pub(crate) fn shm_store_lz4(content_hash: u64, data: &[u8]) -> Result<()> {
     shm_store(&shm_lz4_segment_name(content_hash), data)
+}
+
+/// Load + copy the LZ4-compressed base from its SHM segment into an
+/// owned `Vec`, validating the LZ4 legacy magic. Returns `None` on
+/// miss, mmap failure, or a stale/wrong-format segment (rejecting
+/// data written by a previous compression format, e.g. zstd/gzip, or
+/// a truncated write). The shared flock taken by [`shm_open_lz4`] is
+/// released before returning; the bytes are copied out, so the
+/// segment need not stay pinned. This is the owned-`Vec` analog of
+/// [`shm_load_base`] (which returns a borrowed `MappedShm`); the LZ4
+/// GET path hands the bytes back to the caller and does not retain
+/// the fd.
+pub(crate) fn shm_load_lz4(content_hash: u64) -> Option<Vec<u8>> {
+    use std::os::fd::AsRawFd;
+    let (fd, len) = shm_open_lz4(content_hash)?;
+    let mut buf = vec![0u8; len];
+    // SAFETY: `fd` is a live RDONLY shm fd from shm_open_lz4 holding a
+    // shared flock; the segment is at least `len` bytes (its fstat).
+    // The mmap is PROT_READ/MAP_SHARED over exactly `len` bytes, fully
+    // copied out before munmap; no pointer escapes the block.
+    unsafe {
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd.as_raw_fd(),
+            0,
+        );
+        if ptr == libc::MAP_FAILED {
+            shm_close_fd(fd);
+            return None;
+        }
+        std::ptr::copy_nonoverlapping(ptr as *const u8, buf.as_mut_ptr(), len);
+        libc::munmap(ptr, len);
+    }
+    shm_close_fd(fd);
+
+    if buf.len() >= 4 && buf[..4] == LZ4_LEGACY_MAGIC {
+        tracing::debug!(bytes = len, "lz4_base cache hit (shm)");
+        Some(buf)
+    } else {
+        let head = &buf[..buf.len().min(8)];
+        tracing::warn!(
+            bytes = len,
+            ?head,
+            "stale/truncated compressed shm segment (bad LZ4 magic), recompressing"
+        );
+        None
+    }
 }
 
 /// RAII guard for a live COW-overlay mapping.

@@ -196,6 +196,16 @@ pub use aarch64::boot;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::kvm;
 
+/// Arch-neutral handle for the userspace IOAPIC. On x86_64 it is the real
+/// device handle ([`x86_64::kvm::IoapicHandle`], the split-irqchip /
+/// \>255-vCPU path); on other targets it is uninhabited, so the run loop's
+/// `Option<&IoapicHandle>` is always `None` and the (x86-only) IOAPIC
+/// dispatch arms are never compile-reached.
+#[cfg(target_arch = "x86_64")]
+pub(crate) use x86_64::kvm::IoapicHandle;
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) enum IoapicHandle {}
+
 pub use topology::Topology;
 
 use anyhow::{Context, Result};
@@ -430,6 +440,11 @@ pub struct KtstrVm {
     /// Command to execute non-interactively in shell mode (--exec).
     /// Passed to the guest via /exec_cmd in the initramfs.
     pub(crate) exec_cmd: Option<String>,
+    /// Wall-clock bound for a shell `--exec` payload before the VM is
+    /// force-killed. A panic-less guest hang otherwise blocks the BSP
+    /// run loop ~forever; the `run_interactive` watchdog kicks the vCPU
+    /// after this deadline. Consulted only in exec_mode runs.
+    pub(crate) exec_timeout: Duration,
     /// Optional host path to `ktstr-jemalloc-probe`. When `Some`, the
     /// probe is packed into the guest initramfs as an extra binary at
     /// `bin/ktstr-jemalloc-probe`. Consumed by `spawn_initramfs_resolve`.
@@ -560,6 +575,28 @@ struct RunLocks {
     pinning_plan: Option<host_topology::PinningPlan>,
 }
 
+/// Human-readable summary of the userspace IOAPIC's device-IRQ routing
+/// failures, for `run_interactive`'s teardown. `None` when there were none.
+/// `n` is `IoapicHandle::routing_failures()` — the count of
+/// `KVM_SET_GSI_ROUTING` installs that errored, each leaving a
+/// guest-programmed device IRQ unrouted (the device hangs on first use).
+/// Surfaced in interactive mode because the operator's terminal shows the
+/// guest console, not the host's per-failure tracing, so an unrouted IRQ
+/// would otherwise be a silent device hang. x86-only: the userspace IOAPIC
+/// (and `IoapicHandle::routing_failures`) is split-irqchip-specific; on
+/// aarch64 `IoapicHandle` is an empty-enum placeholder (the GIC routes
+/// device IRQs directly), so there is nothing to summarize.
+#[cfg(target_arch = "x86_64")]
+fn routing_failure_summary(n: u64) -> Option<String> {
+    (n > 0).then(|| {
+        format!(
+            "WARNING: {n} device-IRQ routing failure(s) during this run \
+             (KVM_SET_GSI_ROUTING errored) — affected devices' interrupts \
+             were not delivered, so those devices may have hung"
+        )
+    })
+}
+
 impl KtstrVm {
     pub fn builder() -> KtstrVmBuilder {
         KtstrVmBuilder::default()
@@ -577,7 +614,16 @@ impl KtstrVm {
     /// without exposing the [`crate::vmm::builder::StagedScheduler`]
     /// type into the `pub` `SuffixParams` field signature.
     fn suffix_params(&self) -> initramfs::SuffixParams<'_> {
+        // Production invariant: the initramfs path is reached only with an
+        // init_binary (spawn_initramfs_resolve bails otherwise), so payload
+        // is always Some here. A None would make build_suffix emit an
+        // /init-less, unbootable image silently — trip it in debug/test.
+        debug_assert!(
+            self.init_binary.is_some(),
+            "suffix_params: production initramfs path requires init_binary (the /init payload)"
+        );
         initramfs::SuffixParams {
+            payload: self.init_binary.as_deref(),
             args: &self.run_args,
             sched_args: &self.sched_args,
             sched_enable: &self.sched_enable_cmds,
@@ -836,23 +882,34 @@ impl KtstrVm {
         let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
         let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
 
+        // Userspace IOAPIC handle for the split-irqchip path (>254 vCPUs),
+        // mirroring run_vm: the device + the raw VM fd, threaded into
+        // spawn_ap_threads + run_bsp_loop so the interactive shell's serial /
+        // virtio-console IRQs route via the userspace IOAPIC. `None` for
+        // <=254 vCPUs (in-kernel IOAPIC).
+        // x86-only (mirrors run_vm): aarch64 has no userspace IOAPIC — the
+        // GIC routes device IRQs and `IoapicHandle` is the uninhabited
+        // placeholder — so the handle is always `None` there.
+        #[cfg(target_arch = "x86_64")]
+        let ioapic_handle: Option<Arc<crate::vmm::IoapicHandle>> = vm.ioapic.as_ref().map(|io| {
+            Arc::new(crate::vmm::IoapicHandle::new(
+                io.clone(),
+                std::os::unix::io::AsRawFd::as_raw_fd(&*vm.vm_fd),
+            ))
+        });
+        #[cfg(not(target_arch = "x86_64"))]
+        let ioapic_handle: Option<Arc<crate::vmm::IoapicHandle>> = None;
+
         // Virtio-console for shell I/O via /dev/hvc0.
         let mut vc = virtio_console::VirtioConsole::new();
         vc.set_mem((*vm.guest_mem).clone());
         let virtio_con = Arc::new(PiMutex::new(vc));
 
-        // Split-irqchip rejection: see freeze_coord.rs run_vm for the
-        // full rationale. Without an IOAPIC, COM1/COM2/virtio-console
-        // have no IRQ delivery path and the guest hangs on first I/O.
-        #[cfg(target_arch = "x86_64")]
-        if vm.split_irqchip {
-            anyhow::bail!(
-                "interactive shell requires irqfd; split-irqchip mode \
-                 has no IOAPIC and the guest's serial / virtio-console \
-                 drivers have no polling fallback — reduce topology \
-                 so all APIC IDs are at or below 254 (MAX_XAPIC_ID)",
-            );
-        }
+        // Register serial + virtio-console irqfds. On x86 split-irqchip
+        // (>254 APIC IDs) the routes are installed by the userspace IOAPIC
+        // when the guest programs its RTEs (ioapic_handle above is threaded
+        // into the run loops); on the in-kernel-irqchip (x86 <=254) and
+        // aarch64 (GIC) paths the kernel routes the GSIs directly.
         #[cfg(target_arch = "x86_64")]
         {
             vm.vm_fd
@@ -986,6 +1043,7 @@ impl KtstrVm {
             Some(&virtio_con),
             virtio_blk.as_ref(),
             virtio_net.as_ref(),
+            ioapic_handle.as_ref(),
             &kill,
             &kill_evt,
             &freeze,
@@ -1010,6 +1068,98 @@ impl KtstrVm {
             None
         };
         let bsp_tid = unsafe { libc::pthread_self() };
+
+        // Bound a `--exec` payload's wall-clock. A panic-less guest
+        // hang leaves the guest halted, so the BSP `bsp.run()` blocks in
+        // KVM_RUN indefinitely — flipping `kill` alone never unblocks it
+        // (the loop only re-checks kill after a vCPU exit). The watchdog
+        // mirrors the stdin Ctrl+A X kick (kill + immediate_exit +
+        // SIGRTMIN) on a deadline. Gated on exec_mode — interactive
+        // sessions have no deadline (the human drives Ctrl+A X). Joined in
+        // the teardown below BEFORE `bsp` drops, so its `ImmediateExitHandle`
+        // (a Copy of `bsp_ie_for_stdin`, pointing into `bsp`'s kvm_run
+        // mmap) never writes through a freed mapping.
+        let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exec_watchdog = if exec_mode {
+            let bsp_ie_for_wd = bsp_ie_for_stdin;
+            let kill_for_wd = kill.clone();
+            let timed_out_for_wd = timed_out.clone();
+            let deadline = self.exec_timeout;
+            Some(
+                std::thread::Builder::new()
+                    .name("interactive-exec-watchdog".into())
+                    .spawn(move || {
+                        let start = std::time::Instant::now();
+                        loop {
+                            // Normal completion / Ctrl+A X flips `kill`.
+                            if kill_for_wd.load(Ordering::Acquire) {
+                                return;
+                            }
+                            if start.elapsed() >= deadline {
+                                // Re-check: the payload may have completed
+                                // in the poll gap; only kick if still live.
+                                if kill_for_wd.load(Ordering::Acquire) {
+                                    return;
+                                }
+                                timed_out_for_wd.store(true, Ordering::Release);
+                                kill_for_wd.store(true, Ordering::Release);
+                                if let Some(ref ie) = bsp_ie_for_wd {
+                                    ie.set(1);
+                                    std::sync::atomic::fence(Ordering::Release);
+                                }
+                                // SAFETY: bsp_tid is the BSP thread (this
+                                // function's own thread); the watchdog is
+                                // joined before the function returns, so the
+                                // tid is live for the kick.
+                                unsafe {
+                                    libc::pthread_kill(bsp_tid, vcpu_signal());
+                                }
+                                return;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                    })
+                    .context("spawn interactive-exec-watchdog thread")?,
+            )
+        } else {
+            None
+        };
+
+        // UAF safety: the watchdog AND the stdin thread (spawned
+        // below) each hold a Copy of `bsp_ie_for_stdin` — a raw pointer
+        // into `bsp`'s kvm_run mmap (vcpu::ImmediateExitHandle) — plus
+        // `bsp_tid`, and each kicks the BSP (ie.set(1) + pthread_kill) on
+        // its trigger (watchdog deadline / Ctrl+A X). Both MUST be joined
+        // before `bsp` drops, on EVERY exit path: the normal teardown, the
+        // `?` early-returns below (stdin/stdout/dmesg spawn + eventfds),
+        // and a panic-unwind (the test profile unwinds). A bare teardown
+        // join covers only the normal path, so wrap both handles in an RAII
+        // guard whose Drop sets `kill` (each thread re-checks it within its
+        // <=100ms poll/sleep and returns WITHOUT kicking) then joins.
+        // Declared after `bsp` (above) so it drops — and joins — BEFORE
+        // bsp's kvm_run unmaps, on the normal path AND every early-return /
+        // unwind.
+        struct CrossThreadKickGuard {
+            watchdog: Option<std::thread::JoinHandle<()>>,
+            stdin: Option<std::thread::JoinHandle<()>>,
+            kill: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Drop for CrossThreadKickGuard {
+            fn drop(&mut self) {
+                self.kill.store(true, std::sync::atomic::Ordering::Release);
+                if let Some(h) = self.watchdog.take() {
+                    let _ = h.join();
+                }
+                if let Some(h) = self.stdin.take() {
+                    let _ = h.join();
+                }
+            }
+        }
+        let mut kick_guard = CrossThreadKickGuard {
+            watchdog: exec_watchdog,
+            stdin: None,
+            kill: kill.clone(),
+        };
 
         // Stdin reader thread: host stdin -> virtio-console RX queue.
         // The guest reads stdin from /dev/hvc0 (virtio-console), never
@@ -1129,6 +1279,11 @@ impl KtstrVm {
                 }
             })
             .context("spawn stdin reader thread")?;
+        // Hand the stdin handle to the kick guard so it is joined before
+        // `bsp` drops on every path (see CrossThreadKickGuard above). Any
+        // `?` after this point (stdout/dmesg spawn + eventfds) now joins
+        // both cross-thread holders via the guard's Drop.
+        kick_guard.stdin = Some(stdin_thread);
 
         // Stdout writer thread: virtio-console TX -> host stdout.
         // Polls tx_evt for zero-latency wakeup when guest writes data.
@@ -1340,6 +1495,7 @@ impl KtstrVm {
             Some(&virtio_con),
             virtio_blk.as_ref(),
             virtio_net.as_ref(),
+            ioapic_handle.as_ref(),
             &kill,
             &freeze,
             &watchpoint,
@@ -1405,7 +1561,11 @@ impl KtstrVm {
         }
 
         let stdout_wrote = stdout_thread.join().unwrap_or(false);
-        let _ = stdin_thread.join();
+        // The stdin reader and the exec watchdog are joined by
+        // `kick_guard`'s Drop (which also covers the `?` early-returns +
+        // panic-unwind); `kill` set above makes each return without
+        // kicking. The guard drops before `bsp` (declared earlier), so
+        // the joins precede the kvm_run unmap on every path.
         if let Some(dt) = dmesg_thread {
             let _ = dt.join();
         }
@@ -1413,6 +1573,21 @@ impl KtstrVm {
 
         // _raw_guard drops here, restoring terminal and signal handlers.
         drop(_raw_guard);
+
+        // Surface any device-IRQ routing failures the userspace IOAPIC hit
+        // during the run. The operator's terminal showed the guest console,
+        // not the host's per-failure tracing, so an unrouted IRQ would
+        // otherwise be a silent device hang. Printed after the raw-mode
+        // restore so it lands on the operator's terminal. x86-only: the
+        // userspace IOAPIC exists only on the split-irqchip path (aarch64
+        // routes device IRQs via the GIC, and `IoapicHandle` is an
+        // empty-enum placeholder there with no `routing_failures`).
+        #[cfg(target_arch = "x86_64")]
+        if let Some(io) = &ioapic_handle
+            && let Some(msg) = routing_failure_summary(io.routing_failures())
+        {
+            eprintln!("{msg}");
+        }
 
         // Exec mode fallback: if virtio-console produced no output
         // (kernel lacks CONFIG_VIRTIO_CONSOLE, guest fell back to
@@ -1471,12 +1646,33 @@ impl KtstrVm {
             // rebooted before send_exec_exit). Fail loud rather than
             // masking it as exit 0 — that silent default is the exact
             // regression this consumer closes.
-            None => anyhow::bail!(
-                "shell --exec '{}' finished but the guest delivered no CRC-valid \
-                 MSG_TYPE_EXEC_EXIT frame; the payload's exit code is unknown (the \
-                 guest may have panicked or rebooted before send_exec_exit)",
-                self.exec_cmd.as_deref().unwrap_or("?")
-            ),
+            None => {
+                // A watchdog timeout is the most likely cause of a
+                // missing EXEC_EXIT frame (the guest was force-killed
+                // mid-payload) — report it distinctly and actionably.
+                if timed_out.load(Ordering::Acquire) {
+                    anyhow::bail!(
+                        "shell --exec '{}' exceeded the {:?} exec-timeout and \
+                         was force-killed; the payload's exit code is unknown. \
+                         Raise --exec-timeout for a legitimately long-running \
+                         payload.",
+                        self.exec_cmd.as_deref().unwrap_or("?"),
+                        self.exec_timeout,
+                    )
+                }
+                // Surface the likely cause from the captured guest
+                // console rather than a bare frame-missing error — the
+                // OOM/panic/abort line is in COM1/COM2 even when no
+                // EXEC_EXIT frame arrived.
+                let com1_out = com1.lock().output();
+                let com2_out = com2.lock().output();
+                anyhow::bail!(
+                    "shell --exec '{}' finished but the guest delivered no CRC-valid \
+                     MSG_TYPE_EXEC_EXIT frame; the payload's exit code is unknown.{}",
+                    self.exec_cmd.as_deref().unwrap_or("?"),
+                    Self::detect_guest_failure(&com1_out, &com2_out)
+                )
+            }
         }
     }
 
@@ -1500,11 +1696,115 @@ impl KtstrVm {
             })
             .map(|e| i32::from_le_bytes(e.payload[..4].try_into().unwrap()))
     }
+
+    /// Scan captured guest console output (COM1 kernel console + COM2
+    /// init/app stderr) for a failure signature, returning a cause
+    /// suffix for the no-EXEC_EXIT-frame error. Falls back to the
+    /// generic panic/reboot hint when no known signature matches.
+    ///
+    /// Markers, in priority order: the Rust alloc-error
+    /// ("memory allocation of N bytes failed" — the guest /init aborting
+    /// on a failed allocation; lands on COM2 in shell mode), then a
+    /// kernel panic ("Kernel panic - not syncing" / "Attempted to kill
+    /// init", anchored so a log line mentioning the bare words cannot
+    /// false-match). The returned string is appended verbatim to the
+    /// error and so begins with a space.
+    fn detect_guest_failure(com1: &str, com2: &str) -> String {
+        const ALLOC_FAIL: &str = "memory allocation of";
+        const PANIC: &str = "Kernel panic - not syncing";
+        const INIT_KILL: &str = "Attempted to kill init";
+        // The echoed line is attacker-influenced guest console output:
+        // `lines()` splits on '\n', so a newline-free line can run up to
+        // the console's OUTPUT_CAP_BYTES (4 MiB) cap. Bound it so a
+        // pathological guest cannot bloat the error string to megabytes;
+        // the marker sits near the line start, so the head is the
+        // informative part. char-boundary-safe (no byte slicing).
+        fn trunc(line: &str) -> String {
+            const MAX_CHARS: usize = 200;
+            let t = line.trim();
+            if t.chars().count() > MAX_CHARS {
+                let head: String = t.chars().take(MAX_CHARS).collect();
+                format!("{head}…")
+            } else {
+                t.to_string()
+            }
+        }
+        // COM2 first: the Rust alloc-error is the most actionable and
+        // lands there in shell mode (init stdio is dup2'd to COM2).
+        for hay in [com2, com1] {
+            if let Some(line) = hay.lines().find(|l| l.contains(ALLOC_FAIL)) {
+                return format!(
+                    " The guest /init aborted on a failed allocation: '{}'. The \
+                     /init is the test binary itself — raise memory_mib or check \
+                     the guest overcommit policy (vm.overcommit_memory).",
+                    trunc(line)
+                );
+            }
+        }
+        for hay in [com1, com2] {
+            if let Some(line) = hay
+                .lines()
+                .find(|l| l.contains(PANIC) || l.contains(INIT_KILL))
+            {
+                return format!(" Guest kernel panic: '{}'.", trunc(line));
+            }
+        }
+        " (the guest may have panicked or rebooted before send_exec_exit)".to_string()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn routing_failure_summary_none_when_zero_else_counts() {
+        assert!(
+            routing_failure_summary(0).is_none(),
+            "no routing failures → no summary"
+        );
+        let msg = routing_failure_summary(3).expect("n>0 → summary");
+        assert!(
+            msg.contains("3 device-IRQ routing failure"),
+            "summary names the count: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn detect_guest_failure_surfaces_alloc_oom_panic_and_generic() {
+        // Rust alloc-error on COM2 → actionable OOM cause, echoing the line.
+        let c = KtstrVm::detect_guest_failure(
+            "[    0.000000] Booting Linux\n",
+            "memory allocation of 24 bytes failed\n",
+        );
+        assert!(c.contains("failed allocation"), "alloc cause: {c:?}");
+        assert!(
+            c.contains("memory allocation of 24 bytes failed"),
+            "echoes the line: {c:?}"
+        );
+        // Kernel panic on COM1 → panic cause.
+        let c = KtstrVm::detect_guest_failure(
+            "Kernel panic - not syncing: Attempted to kill init!\n",
+            "",
+        );
+        assert!(c.contains("Guest kernel panic"), "panic cause: {c:?}");
+        // No marker → generic hint (preserves the original wording so the
+        // error reads identically when the cause is unknown).
+        let c = KtstrVm::detect_guest_failure("nothing here\n", "benign output\n");
+        assert!(
+            c.contains("may have panicked or rebooted"),
+            "generic: {c:?}"
+        );
+        // Alloc (COM2) wins over a co-occurring panic (COM1): the failed
+        // allocation is the root cause; the "Attempted to kill init" panic
+        // is its downstream consequence.
+        let c = KtstrVm::detect_guest_failure(
+            "Kernel panic - not syncing: Attempted to kill init!\n",
+            "memory allocation of 8 bytes failed\n",
+        );
+        assert!(c.contains("failed allocation"), "alloc-priority: {c:?}");
+    }
 
     #[test]
     fn exec_exit_from_entries_decodes_last_crc_valid_frame() {
@@ -1743,14 +2043,29 @@ mod tests {
                 .init_binary(&exe)
                 .topology(Topology::new(1, 1, 2, 1))
                 .memory_deferred()
-                .timeout(Duration::from_secs(5))
-                .watchdog_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(15))
                 .build()
         );
         let result = skip_on_contention!(vm.run());
         let Some(ref report) = result.monitor else {
             return;
         };
+        // Skip (not fail) when the boot wait did not observe a sys_rdy wake
+        // (boot_wait_outcome != Fired): a slow cold-cache guest boot or a
+        // kill-evt race kills the monitor-setup closure before its sample
+        // loop runs, yielding zero samples — inconclusive, not a monitor-data
+        // regression. Mirrors the sys_rdy_releases_monitor_before_5s_timeout
+        // sibling; with Fired confirmed the assertions below pin the real path.
+        if report.boot_wait_outcome != crate::monitor::BootWaitOutcome::Fired {
+            skip!(
+                "boot wait did not observe a sys_rdy wake (boot_wait_outcome={:?}) \
+                 — inconclusive (slow guest boot or kill-evt race); not a \
+                 monitor-data regression. Total samples: {}, run duration: {:?}.",
+                report.boot_wait_outcome,
+                report.summary.total_samples,
+                result.duration,
+            );
+        }
         assert!(
             report.summary.total_samples > 0,
             "monitor should have collected at least one sample"
@@ -2100,13 +2415,33 @@ mod tests {
                 .topology(Topology::new(1, 1, 2, 1))
                 .memory_deferred()
                 .timeout(Duration::from_secs(15))
-                .watchdog_timeout(Duration::from_secs(2))
                 .build()
         );
         let result = skip_on_contention!(vm.run());
         let Some(ref report) = result.monitor else {
             return;
         };
+        // Skip (not fail) when the boot wait did not observe a sys_rdy
+        // wake (boot_wait_outcome != Fired): a slow guest boot that
+        // emitted sys_rdy past the host's 5 s ceiling, a kill-evt race,
+        // or the wait not running — all inconclusive for the FIRST-sample
+        // rq_clock contract this test pins, which requires a confirmed
+        // wake. Mirrors sys_rdy_releases_monitor_before_5s_timeout; the
+        // boot_wait_outcome discriminator (monitor::BootWaitOutcome)
+        // exists for exactly this distinction. Without it, a debug-init
+        // boot slower than the 5 s ceiling produces zero samples and
+        // looks like a regression (the original "intermittent
+        // no-samples"), when it is just inconclusive.
+        if report.boot_wait_outcome != crate::monitor::BootWaitOutcome::Fired {
+            skip!(
+                "boot wait did not observe a sys_rdy wake before the host's \
+                 5 s ceiling (boot_wait_outcome={:?}) — inconclusive (slow \
+                 guest boot / kill-evt race), not the FIRST-sample rq_clock \
+                 contract this test pins. total_samples={}",
+                report.boot_wait_outcome,
+                report.summary.total_samples,
+            );
+        }
         assert!(
             report.summary.total_samples > 0,
             "monitor produced no samples — cannot evaluate \

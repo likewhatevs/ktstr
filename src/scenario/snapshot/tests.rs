@@ -2021,6 +2021,7 @@ fn snapshot_bridge_store_with_stats_and_step_round_trips() {
         FailureDumpReport::default(),
         Some(Ok(serde_json::json!({"phase": "warmup"}))),
         Some(123),
+        Some(456),
         7,
     );
     let drained = bridge.drain_ordered_with_stats();
@@ -2032,6 +2033,12 @@ fn snapshot_bridge_store_with_stats_and_step_round_trips() {
         "step-stamped path surfaces step_index Some(N) to the drain consumer",
     );
     assert_eq!(drained[0].elapsed_ms, Some(123));
+    assert_eq!(
+        drained[0].boundary_offset_ms,
+        Some(456),
+        "boundary_offset_ms round-trips through the stamped store path \
+         alongside step_index/elapsed_ms",
+    );
 }
 
 /// Legacy unstamped `store_with_stats` path drains with
@@ -2073,6 +2080,7 @@ fn snapshot_bridge_store_with_stats_and_step_evicts_step_index_in_lockstep() {
             FailureDumpReport::default(),
             Some(Ok(serde_json::json!({"i": i}))),
             Some(i as u64),
+            None,
             (i as u16) % 8 + 1,
         );
     }
@@ -2082,6 +2090,7 @@ fn snapshot_bridge_store_with_stats_and_step_evicts_step_index_in_lockstep() {
         FailureDumpReport::default(),
         Some(Ok(serde_json::json!({"overflow": true}))),
         Some(9_999),
+        None,
         42,
     );
     let drained = bridge.drain_ordered_with_stats();
@@ -2096,13 +2105,90 @@ fn snapshot_bridge_store_with_stats_and_step_evicts_step_index_in_lockstep() {
         Some(42),
         "newest survives with its step_index — eviction sweep did not strand the parallel slot",
     );
-    let stranded = drained
-        .iter()
-        .any(|e| e.tag == "tag_0000" || (e.tag.as_str() < "tag_0001" && e.step_index.is_some()));
-    assert!(
-        !stranded,
-        "no stranded step_index entry survives an evicted report",
+    // Every loop-stored survivor kept its own step_index ((i%8)+1) —
+    // exercises the lock-step sweep across ALL survivors, not just the
+    // newest (pinned above). A stranded step_index whose report was
+    // evicted is invisible post-drain (drain_ordered_with_stats emits no
+    // row for an evicted tag), so that path is covered by the
+    // store_internal eviction sweep, verified by review.
+    for e in drained.iter().filter(|e| e.tag != overflow_tag) {
+        let i: u64 = e
+            .tag
+            .strip_prefix("tag_")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("unexpected survivor tag {}", e.tag));
+        assert_eq!(
+            e.step_index,
+            Some((i as u16 % 8) + 1),
+            "survivor {} must keep its own step_index ((i%8)+1), proving \
+             the parallel map was not cross-wired during eviction",
+            e.tag,
+        );
+    }
+}
+
+/// FIFO eviction at `MAX_STORED_SNAPSHOTS` must sweep the
+/// `boundary_offset_ms` map in lock-step with the parallel reports /
+/// stats / elapsed / step_index maps — the same parallel-map invariant
+/// the step_index eviction test pins. A stranded `boundary_offset_ms`
+/// whose paired report was evicted would silently mis-attribute the
+/// next drain's phase remap: exactly the silent-data-loss class this
+/// field exists to guard against.
+#[test]
+fn snapshot_bridge_store_with_stats_and_step_evicts_boundary_offset_in_lockstep() {
+    let cb: CaptureCallback = Arc::new(|_| None);
+    let bridge = SnapshotBridge::new(cb);
+    for i in 0..MAX_STORED_SNAPSHOTS {
+        bridge.store_with_stats_and_step(
+            &format!("tag_{i:04}"),
+            FailureDumpReport::default(),
+            Some(Ok(serde_json::json!({"i": i}))),
+            Some(i as u64),
+            Some((i as u64) * 10),
+            (i as u16) % 8 + 1,
+        );
+    }
+    let overflow_tag = format!("tag_{MAX_STORED_SNAPSHOTS:04}");
+    bridge.store_with_stats_and_step(
+        &overflow_tag,
+        FailureDumpReport::default(),
+        Some(Ok(serde_json::json!({"overflow": true}))),
+        Some(9_999),
+        Some(99_990),
+        42,
     );
+    let drained = bridge.drain_ordered_with_stats();
+    let names: Vec<&str> = drained.iter().map(|e| e.tag.as_str()).collect();
+    assert!(!names.contains(&"tag_0000"), "tag_0000 evicted");
+    let last = drained
+        .iter()
+        .find(|e| e.tag == overflow_tag)
+        .expect("overflow tag resident after evict");
+    assert_eq!(
+        last.boundary_offset_ms,
+        Some(99_990),
+        "newest survives with its boundary_offset_ms — eviction sweep did not strand the parallel slot",
+    );
+    // Every loop-stored survivor kept its own boundary_offset (i*10) —
+    // exercises the lock-step sweep across ALL survivors, not just the
+    // newest (pinned above). A stranded offset whose report was evicted
+    // is invisible post-drain (drain_ordered_with_stats emits no row for
+    // an evicted tag), so that path is covered by the store_internal
+    // eviction sweep, verified by review.
+    for e in drained.iter().filter(|e| e.tag != overflow_tag) {
+        let i: u64 = e
+            .tag
+            .strip_prefix("tag_")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("unexpected survivor tag {}", e.tag));
+        assert_eq!(
+            e.boundary_offset_ms,
+            Some(i * 10),
+            "survivor {} must keep its own boundary_offset (i*10), proving \
+             the parallel map was not cross-wired during eviction",
+            e.tag,
+        );
+    }
 }
 
 // ---------- stats_path JSON accessor ----------

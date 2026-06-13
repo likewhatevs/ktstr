@@ -355,6 +355,7 @@ struct AttrValues {
     post_vm: Option<syn::Path>,
     post_vm_unconditional: Option<syn::Path>,
     disk: Option<syn::Path>,
+    network: Option<syn::Path>,
     // -- Assert overrides (Option<T>) --
     not_starved: Option<bool>,
     isolation: Option<bool>,
@@ -390,6 +391,8 @@ struct AttrValues {
     max_numa_nodes_set: bool,
     max_cpus: Option<u32>,
     max_cpus_set: bool,
+    // -- Resource budget: explicit no-perf host-CPU mask size override --
+    cpu_budget: Option<u32>,
     // -- Bool attrs (per BOOL_ATTR_NAMES) --
     auto_repro: bool,
     auto_repro_set: bool,
@@ -452,6 +455,7 @@ impl Default for AttrValues {
             post_vm: None,
             post_vm_unconditional: None,
             disk: None,
+            network: None,
             // Assert overrides
             not_starved: None,
             isolation: None,
@@ -487,6 +491,7 @@ impl Default for AttrValues {
             max_numa_nodes_set: false,
             max_cpus: Some(192),
             max_cpus_set: false,
+            cpu_budget: None,
             // Bool attrs — auto_repro + kaslr default TRUE; others false
             auto_repro: true,
             auto_repro_set: false,
@@ -724,6 +729,11 @@ impl AttrValues {
 ///     `host_only` skips the VM boot that owns the device lifecycle,
 ///     so a `disk` attached under `host_only` would never bind;
 ///     `KtstrTestEntry::validate` rejects the pairing at runtime.
+///   - `network = PATH` — path to a `const NetConfig` attaching a
+///     virtio-net device (in-VMM loopback backend). Construct via
+///     `NetConfig::DEFAULT.mac(...)` or `NetConfig::DEFAULT` (const-fn
+///     chain). Maps onto `KtstrTestEntry::network`. Default: `None`
+///     (no NIC). Like `disk`, mutually exclusive with `host_only`.
 ///   - `config = EXPR` — inline scheduler config content, written
 ///     into the guest at the path declared by the scheduler's
 ///     `config_file_def`. `EXPR` is either a string literal or a
@@ -997,6 +1007,14 @@ fn validate_cross_attr(attrs: &AttrValues) -> syn::Result<()> {
              disable the check.",
         ));
     }
+    if attrs.cpu_budget == Some(0) {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "cpu_budget must be > 0 (a zero host-CPU budget cannot run a \
+             VM; omit the attribute to auto-size the no-perf mask to the \
+             vCPU count)",
+        ));
+    }
     // `performance_mode = true` and `no_perf_mode = true` are
     // mutually exclusive — the macro docstring (Mutually exclusive
     // with `performance_mode = true`) is the only previous guard and
@@ -1012,6 +1030,24 @@ fn validate_cross_attr(attrs: &AttrValues) -> syn::Result<()> {
             "performance_mode = true and no_perf_mode = true are mutually \
              exclusive — one disables what the other enables. Set at most \
              one of the two; remove the other or set it to `false`.",
+        ));
+    }
+    // `cpu_budget` only sizes the no-perf vCPU-thread mask; under
+    // `performance_mode` (vCPUs pinned 1:1) or the default LLC mode the
+    // budget is never read, so a `cpu_budget` set without `no_perf_mode`
+    // would be a silent no-op (a contention test that quietly runs
+    // un-contended). Require `no_perf_mode` so the knob always takes
+    // effect — same compile-time cross-attr shape as the
+    // `performance_mode` ↔ `no_perf_mode` mutex above. The
+    // programmatic-construction path (bypassing the macro) is guarded at
+    // runtime in `src/test_support/entry.rs::validate`.
+    if attrs.cpu_budget.is_some() && !(attrs.no_perf_mode_set && attrs.no_perf_mode) {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "cpu_budget requires no_perf_mode — the budget sizes the \
+             no-perf vCPU-thread mask; under performance_mode vCPUs are \
+             pinned 1:1 and cpu_budget would be silently ignored. Add \
+             no_perf_mode (or drop cpu_budget).",
         ));
     }
     // `host_only = true` short-circuits the VM-boot pipeline before
@@ -1323,6 +1359,15 @@ fn ktstr_test_impl(
                              or similar const-fn chain",
                         )?);
                     }
+                    "network" => {
+                        attrs.network = Some(expect_path_value(
+                            value,
+                            "expected path for network (e.g. MY_NET \
+                             where MY_NET is a `const NetConfig`); \
+                             construct via `NetConfig::DEFAULT.mac(...)` \
+                             or similar const-fn chain",
+                        )?);
+                    }
                     "config" => {
                         let tokens = expect_string_or_path_tokens(
                             value,
@@ -1465,6 +1510,7 @@ fn ktstr_test_impl(
                     | "max_llcs"
                     | "max_numa_nodes"
                     | "max_cpus"
+                    | "cpu_budget"
                     | "max_p99_wake_latency_ns"
                     | "cleanup_budget_ms"
                     | "num_snapshots" => {
@@ -1492,6 +1538,9 @@ fn ktstr_test_impl(
                             }
                             "sustained_samples" => {
                                 attrs.sustained_samples = Some(lit_int.base10_parse()?);
+                            }
+                            "cpu_budget" => {
+                                attrs.cpu_budget = Some(lit_int.base10_parse()?);
                             }
                             "max_gap_ms" => {
                                 attrs.max_gap_ms = Some(lit_int.base10_parse()?);
@@ -1609,7 +1658,7 @@ fn ktstr_test_impl(
                         return Err(syn::Error::new_spanned(
                             path,
                             format!(
-                                "unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mib, scheduler, staged_schedulers, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, expect_scx_bpf_error_contains, expect_scx_bpf_error_matches, extra_sched_args, extra_include_files, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, bpf_map_write, expect_err, allow_inconclusive, host_only, ignore, cleanup_budget_ms, post_vm, post_vm_unconditional, config, disk, num_snapshots, wprof, wprof_args"
+                                "unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mib, scheduler, staged_schedulers, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, expect_scx_bpf_error_contains, expect_scx_bpf_error_matches, extra_sched_args, extra_include_files, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, cpu_budget, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, bpf_map_write, expect_err, allow_inconclusive, host_only, ignore, cleanup_budget_ms, post_vm, post_vm_unconditional, config, disk, network, num_snapshots, wprof, wprof_args"
                             ),
                         ));
                     }
@@ -1753,6 +1802,7 @@ fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2::TokenStre
         post_vm,
         post_vm_unconditional,
         disk,
+        network,
         not_starved,
         isolation,
         max_gap_ms,
@@ -1786,6 +1836,7 @@ fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2::TokenStre
         max_numa_nodes_set,
         max_cpus,
         max_cpus_set,
+        cpu_budget,
         auto_repro,
         auto_repro_set,
         expect_auto_repro,
@@ -1958,6 +2009,14 @@ fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2::TokenStre
         quote! { memory_mib },
         quote! { #memory_mib },
     );
+    // cpu_budget is Option<u32>: emit `cpu_budget: Some(N),` only when the
+    // attr was supplied, else fall through to KtstrTestEntry::DEFAULT (None).
+    // entry_field can't express this — it wraps the value verbatim, not in
+    // Some(_) — so use the wprof_args Some/None match pattern.
+    let cpu_budget_field = match cpu_budget {
+        Some(n) => quote! { cpu_budget: Some(#n), },
+        None => quote! {},
+    };
     let payload_field = entry_field(
         payload.is_some(),
         quote! { payload },
@@ -2135,6 +2194,7 @@ fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2::TokenStre
     // at emission. The struct is `Clone` so spreading a const ref
     // into a `static` initializer works.
     let disk_field = some_wrapped_entry_field(&disk, quote! { disk });
+    let network_field = some_wrapped_entry_field(&network, quote! { network });
 
     // `workload_root_cgroup = "/path"` lands in
     // `KtstrTestEntry::workload_root_cgroup` as
@@ -2331,6 +2391,7 @@ fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2::TokenStre
             },
             scheduler: #scheduler_tokens,
             #memory_mib_field
+            #cpu_budget_field
             #payload_field
             #workloads_field
             #staged_schedulers_tokens
@@ -2356,6 +2417,7 @@ fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2::TokenStre
             #post_vm_unconditional_field
             #config_content_field
             #disk_field
+            #network_field
             #workload_root_cgroup_field
             ..::ktstr::test_support::KtstrTestEntry::DEFAULT
         };
@@ -5002,6 +5064,7 @@ mod tests {
         assert!(d.post_vm.is_none());
         assert!(d.post_vm_unconditional.is_none());
         assert!(d.disk.is_none());
+        assert!(d.network.is_none());
 
         // -- Assert overrides --
         assert_eq!(d.not_starved, None);
@@ -5039,6 +5102,7 @@ mod tests {
         assert!(!d.max_numa_nodes_set);
         assert_eq!(d.max_cpus, Some(192));
         assert!(!d.max_cpus_set);
+        assert_eq!(d.cpu_budget, None);
 
         // -- Bool attrs (auto_repro + kaslr default TRUE; others false) --
         assert!(d.auto_repro);
@@ -5261,7 +5325,11 @@ mod tests {
     /// `#[ktstr_test(expect_auto_repro)]` (bare form) emits
     /// `expect_auto_repro: true` as a field on the
     /// `KtstrTestEntry` struct literal. Pins the bare-flag arm of
-    /// the macro's bool-slot parser.
+    /// the macro's bool-slot parser. Gated on the `wprof` feature: the
+    /// attr pairs `wprof` with `expect_auto_repro` (the latter requires the
+    /// former), and the macro only accepts `wprof` when the feature is on —
+    /// so this case can only parse successfully under `--features wprof`.
+    #[cfg(feature = "wprof")]
     #[test]
     fn macro_parses_expect_auto_repro_bare_to_true() {
         let attr = quote! { scheduler = SCHED, wprof, expect_auto_repro };
@@ -5279,7 +5347,10 @@ mod tests {
     }
 
     /// `#[ktstr_test(expect_auto_repro = true)]` emits
-    /// `expect_auto_repro: true`. Pins the explicit-true arm.
+    /// `expect_auto_repro: true`. Pins the explicit-true arm. Gated on the
+    /// `wprof` feature (the attr requires `wprof`, accepted only with the
+    /// feature on).
+    #[cfg(feature = "wprof")]
     #[test]
     fn macro_parses_expect_auto_repro_explicit_true() {
         let attr = quote! { scheduler = SCHED, wprof, expect_auto_repro = true };

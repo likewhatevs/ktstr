@@ -401,14 +401,15 @@ impl<'a> Snapshot<'a> {
     /// "Active" comes from two fields the freeze coordinator
     /// populates at capture time:
     /// - [`crate::monitor::dump::FailureDumpReport::active_obj_name`]
-    ///   — set by the principled `*scx_root → struct_ops map →
-    ///   bpf_prog.aux→used_maps` walker (see
-    ///   `monitor/dump/mod.rs` `identify_active_obj_from_struct_ops`).
+    ///   -- set by the target-free `prog_idr` walker (no `scx_root`
+    ///   dependency; works pre-6.16) that finds the live
+    ///   struct_ops prog's obj prefix (see `monitor/dump/mod.rs`
+    ///   `identify_active_obj_from_struct_ops`).
     /// - [`crate::monitor::dump::FailureDumpReport::active_map_kvas`]
-    ///   — the live scheduler's `prog.aux->used_maps` KVA set
-    ///   that the same walker publishes. Non-empty iff the walker
-    ///   succeeded via the Phase 2 used_maps path (the
-    ///   same-binary disambiguation case).
+    ///   -- the live scheduler's `prog.aux->used_maps` KVA set that
+    ///   the same walker publishes. Non-empty iff the walker resolved
+    ///   a global-section-bearing prog (the same-binary
+    ///   disambiguation case).
     ///
     /// When the walker resolved both fields, `active()` uses them
     /// directly and the obj-prefix scan below is a sanity cross-

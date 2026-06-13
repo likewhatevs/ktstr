@@ -9,7 +9,7 @@ repository = "https://github.com/likewhatevs/ktstr"
 
 [package]
 name = "ktstr"
-version = "0.12.0"
+version = "0.14.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -93,7 +93,7 @@ virtio-queue = "0.17"
 vm-superio = "0.8.1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 linkme = "0.3"
-ktstr-macros = { version = "0.12.0", path = "ktstr-macros" }
+ktstr-macros = { version = "0.14.0", path = "ktstr-macros" }
 goblin = { version = "0.10.5", features = ["elf64"] }
 # Memory-map /proc/self/exe in `try_flush_profraw` instead of reading
 # the whole binary into a Vec<u8>. Coverage-instrumented test binaries
@@ -327,7 +327,15 @@ debug = "line-tables-only"
 
 [features]
 default = ["llm", "cli-bins"]
-integration = []
+# `integration` pulls `cli-bins` because the jemalloc introspection
+# fixtures (`ktstr-jemalloc-{probe,alloc-worker}`, gated on cli-bins +
+# integration) are `env!(CARGO_BIN_EXE_…)`'d by their e2es, and cargo
+# resolves features per-build — so the whole e2e suite needs cli-bins for
+# those fixtures to build. (The guest-`/init` memory-constrained OOM is
+# fixed by `vm.overcommit_memory=1` on the guest cmdline, NOT the
+# allocator, so the e2e `/init`'s jemalloc is incidental.) lib.rs
+# `compile_error!`s if this implication is ever broken.
+integration = ["cli-bins"]
 # Dependencies for the `src/bin/*.rs` entry points. The two
 # user-facing bins (`ktstr`, `cargo-ktstr`) carry
 # `required-features = ["cli-bins"]`; the two jemalloc test fixtures
@@ -345,7 +353,7 @@ integration = []
 # `default-features = false`:
 #
 #   [dev-dependencies]
-#   ktstr = { version = "0.12", default-features = false, features = ["llm"] }
+#   ktstr = { version = "0.13", default-features = false, features = ["llm"] }
 cli-bins = [
     "dep:tikv-jemallocator",
     "dep:clap_complete",

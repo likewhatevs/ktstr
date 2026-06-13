@@ -21,10 +21,11 @@ fn build_suffix_args(base_len: usize, args: &[String], sched_args: &[String]) ->
 }
 
 /// Thin test wrapper that produces a complete cpio newc archive by
-/// concatenating [`build_initramfs_base`] and [`build_suffix_args`]
-/// output. Production callers build base and suffix separately so
-/// they can stream the parts into guest memory without an
-/// intermediate `Vec`; the monolithic form is only needed for
+/// concatenating [`build_initramfs_base`] and [`build_suffix`] output.
+/// Passes `payload` to the suffix so the assembled archive carries
+/// `/init` (the base no longer does). Production callers build base and
+/// suffix separately so they can stream the parts into guest memory
+/// without an intermediate `Vec`; the monolithic form is only needed for
 /// round-trip archive-shape assertions in tests.
 fn build_initramfs(
     payload: &Path,
@@ -32,7 +33,14 @@ fn build_initramfs(
     args: &[String],
 ) -> Result<Vec<u8>> {
     let base = build_initramfs_base(payload, extra_binaries, &[], None)?;
-    let suffix = build_suffix_args(base.len(), args, &[])?;
+    let suffix = build_suffix(
+        base.len(),
+        &SuffixParams {
+            payload: Some(payload),
+            args,
+            ..Default::default()
+        },
+    )?;
     let mut archive = Vec::with_capacity(base.len() + suffix.len());
     archive.extend_from_slice(&base);
     archive.extend_from_slice(&suffix);
@@ -70,6 +78,23 @@ fn cpio_entries(archive: &[u8]) -> Vec<(String, u32, u32, u32)> {
         remaining = reader.finish().unwrap();
     }
     entries
+}
+
+/// Extract a single cpio entry's data bytes by name (None if absent).
+fn cpio_entry_data(archive: &[u8], target: &str) -> Option<Vec<u8>> {
+    let mut remaining: &[u8] = archive;
+    while let Ok(mut reader) = cpio::newc::Reader::new(remaining) {
+        if reader.entry().is_trailer() {
+            break;
+        }
+        if reader.entry().name() == target {
+            let mut data = Vec::new();
+            std::io::Read::read_to_end(&mut reader, &mut data).ok()?;
+            return Some(data);
+        }
+        remaining = reader.finish().unwrap();
+    }
+    None
 }
 
 #[test]
@@ -167,7 +192,15 @@ fn split_matches_monolithic() {
     let args = vec!["run".into(), "--json".into(), "scenario".into()];
     let monolithic = build_initramfs(&exe, &[], &args).unwrap();
     let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
-    let suffix = build_suffix_args(base.len(), &args, &[]).unwrap();
+    let suffix = build_suffix(
+        base.len(),
+        &SuffixParams {
+            payload: Some(&exe),
+            args: &args,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let mut split = Vec::with_capacity(base.len() + suffix.len());
     split.extend_from_slice(&base);
     split.extend_from_slice(&suffix);
@@ -541,6 +574,53 @@ fn resolve_shared_libs_dynamic_binary() {
 }
 
 #[test]
+fn resolve_interpreter_deps_walks_nonstandard_interp_deps() {
+    // The cache key (BaseKey::hash_shared_libs) and the base packer
+    // (build_initramfs_base) both fold a non-standard interpreter's OWN
+    // shared-lib deps in via resolve_interpreter_deps. A standard ld.so is
+    // statically linked (no deps) and must resolve to an EMPTY set so the
+    // common case adds nothing. A custom-toolchain linker can itself be
+    // dynamically linked; its dep chain must be resolved so the base packs
+    // it and the key hashes it (else an interp-dep change serves a stale
+    // base). Model the non-standard interp with a copy of a real dynamic
+    // binary at a non-standard path — it presents a DT_NEEDED chain (libc)
+    // exactly like a toolchain linker would.
+    let sh = Path::new("/bin/sh");
+    if !sh.exists() || !is_elf(sh) {
+        skip!("/bin/sh not an ELF");
+    }
+    let sh_libs = resolve_shared_libs(sh).unwrap();
+    if sh_libs.found.is_empty() {
+        skip!("/bin/sh statically linked on this host");
+    }
+
+    // The host's own (standard) ld.so is statically linked, so its dep set
+    // is empty — the common case adds nothing to the hashed set.
+    if let Some(std_interp) = &sh_libs.interpreter {
+        let deps = resolve_interpreter_deps(std_interp).unwrap();
+        assert!(
+            deps.found.is_empty(),
+            "standard interp {std_interp} (statically linked) must resolve to \
+             no deps, got {:?}",
+            deps.found
+        );
+    }
+
+    // A non-standard interp (a copy of the dynamic /bin/sh at a
+    // toolchain-like path) -> its own DT_NEEDED chain is walked.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fake_ld = tmp.path().join("ld-fake-toolchain.so");
+    std::fs::copy(sh, &fake_ld).unwrap();
+    let deps = resolve_interpreter_deps(fake_ld.to_str().unwrap()).unwrap();
+    assert!(
+        deps.found.iter().any(|(g, _)| g.contains("libc")),
+        "a non-standard interpreter's own deps (libc) must be resolved so the \
+         base packs them and the cache key hashes them; got {:?}",
+        deps.found
+    );
+}
+
+#[test]
 fn elf_dynamic_needed_extracts_sonames() {
     let sh = Path::new("/bin/sh");
     if !sh.exists() || !is_elf(sh) {
@@ -812,6 +892,81 @@ fn shm_load_base_holds_lock_until_drop() {
 }
 
 #[test]
+fn shm_store_skips_write_when_reader_holds_lock_sh() {
+    // Regression (x86 CI wedge): shm_store takes a NON-BLOCKING
+    // LOCK_EX and SKIPS the write when a reader holds LOCK_SH (a live
+    // MappedShm / COW overlay). A blocking LOCK_EX starved indefinitely
+    // under sustained host concurrency: Linux flock grants no writer
+    // preference, so VM-lifetime LOCK_SH readers perpetually jumped the
+    // queue and wedged the suite. The skip also preserves the SIGBUS
+    // invariant: it never ftruncates a segment a reader is mapping.
+    //
+    // Same-process flock conflict: the reader's fd holds LOCK_SH and
+    // shm_store opens a second fd for LOCK_EX; flock(2) treats the two
+    // fds independently, so the writer genuinely contends.
+    let hash = 0x5117_F10C_5117_F10Cu64;
+    shm_unlink_base(hash); // clean any stale segment
+
+    let original = [0x55u8; 256];
+    shm_store_base(hash, &original).unwrap();
+    let reader = shm_load_base(hash).expect("load must succeed");
+
+    // Writer with DIFFERENT content while the reader holds LOCK_SH:
+    // must return Ok WITHOUT blocking (a blocking LOCK_EX would
+    // self-deadlock this thread and hang) and WITHOUT rewriting the
+    // live segment.
+    shm_store_base(hash, &[0xAAu8; 512]).expect("shm_store must skip (Ok), not block");
+
+    // The reader's mapped view is untouched: the write was skipped.
+    assert!(
+        reader.as_ref().iter().all(|&b| b == 0x55),
+        "reader bytes must be unchanged: shm_store skipped, did not rewrite/truncate",
+    );
+    drop(reader);
+
+    // Once the reader releases LOCK_SH, the cache is not wedged: a
+    // writer acquires LOCK_EX and the write takes effect.
+    shm_store_base(hash, &[0xCCu8; 128]).expect("shm_store must write after reader drops");
+    let reloaded = shm_load_base(hash).expect("reload after write");
+    assert!(
+        reloaded.as_ref().len() == 128 && reloaded.as_ref().iter().all(|&b| b == 0xCC),
+        "post-drop write must take effect",
+    );
+    drop(reloaded);
+    shm_unlink_base(hash);
+}
+
+#[test]
+fn shm_load_lz4_roundtrips_and_rejects_non_lz4() {
+    // shm_load_lz4 (the #2 shared loader): round-trips an LZ4-magic
+    // segment, and rejects a segment whose first bytes are not the LZ4
+    // legacy magic (a stale zstd/gzip segment or a truncated write).
+    let hash = 0x0CA5_E1F2_0CA5_E1F2u64;
+    let lz4_name = shm_lz4_segment_name(hash);
+    let _ = rustix::shm::unlink(lz4_name.as_str()); // clean any stale segment
+
+    // LZ4-magic-prefixed bytes round-trip store -> load.
+    let mut data = LZ4_LEGACY_MAGIC.to_vec();
+    data.extend_from_slice(&[0x11u8; 64]);
+    shm_store_lz4(hash, &data).unwrap();
+    assert_eq!(
+        shm_load_lz4(hash).as_deref(),
+        Some(data.as_slice()),
+        "LZ4-magic segment must round-trip",
+    );
+
+    // A segment lacking the LZ4 legacy magic is rejected as stale.
+    let _ = rustix::shm::unlink(lz4_name.as_str());
+    shm_store_lz4(hash, &[0xDEu8; 64]).unwrap();
+    assert!(
+        shm_load_lz4(hash).is_none(),
+        "segment lacking the LZ4 legacy magic must be rejected",
+    );
+
+    let _ = rustix::shm::unlink(lz4_name.as_str());
+}
+
+#[test]
 fn strip_debug_current_exe() {
     let exe = crate::resolve_current_exe().unwrap();
     let data = strip_debug(&exe).unwrap();
@@ -827,11 +982,55 @@ fn strip_debug_nonexistent_fails() {
 }
 
 #[test]
-fn build_initramfs_base_contains_init() {
+fn init_lives_in_suffix_not_base() {
     let exe = crate::resolve_current_exe().unwrap();
     let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
-    let s = String::from_utf8_lossy(&base);
-    assert!(s.contains("init"), "base should contain init entry");
+
+    // The base must NOT carry /init or the sentinel — keeping the
+    // payload's bytes out of the base is what makes it cacheable across
+    // payload recompiles.
+    let base_names = cpio_entry_names(&base);
+    assert!(
+        !base_names.iter().any(|n| n == "init"),
+        "base must not contain an init entry (got {base_names:?})"
+    );
+    assert!(
+        !base_names.iter().any(|n| n == ".ktstr_init_ok"),
+        "sentinel must be in the suffix, not the base (got {base_names:?})"
+    );
+
+    // The assembled archive (base ++ suffix) carries exactly one /init,
+    // mode 0755, content == strip_debug(payload).
+    let suffix = build_suffix(
+        base.len(),
+        &SuffixParams {
+            payload: Some(&exe),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut archive = base.clone();
+    archive.extend_from_slice(&suffix);
+
+    let inits: Vec<_> = cpio_entries(&archive)
+        .into_iter()
+        .filter(|(name, ..)| name == "init")
+        .collect();
+    assert_eq!(inits.len(), 1, "exactly one init entry; got {inits:?}");
+    assert_eq!(inits[0].2 & 0o777, 0o755, "/init must be mode 0755");
+
+    let want = strip_debug(&exe).unwrap();
+    let got = cpio_entry_data(&archive, "init").expect("init entry data");
+    assert_eq!(got, want, "/init content must equal strip_debug(payload)");
+
+    // The sentinel is the LAST non-trailer entry, so its presence proves
+    // the whole archive extracted without truncation.
+    let names = cpio_entry_names(&archive);
+    assert_eq!(
+        names.last().map(String::as_str),
+        Some(".ktstr_init_ok"),
+        "sentinel must be the last entry (got {names:?})"
+    );
 }
 
 #[test]
@@ -841,12 +1040,25 @@ fn build_initramfs_base_includes_extra_shared_libs() {
     let extras: Vec<(&str, &Path)> = vec![("scheduler", sched.as_path())];
     let base = build_initramfs_base(&exe, &extras, &[], None).unwrap();
     let s = String::from_utf8_lossy(&base);
+
+    // Every shared lib the extra resolves to must be packed into the base.
+    // Assert the resolved SET rather than a hardcoded soname: whether the
+    // scheduler static- or dynamic-links libbpf/libelf is a property of
+    // the scx-ktstr build, not of build_initramfs_base's lib-packing
+    // (which is what this test guards).
+    let resolved = resolve_shared_libs(sched.as_path()).unwrap();
     assert!(
-        s.contains("lib64/libelf"),
-        "initramfs with scx-ktstr extra should contain libelf; \
-             resolved libs: {:?}",
-        resolve_shared_libs(sched.as_path()).unwrap().found
+        !resolved.found.is_empty(),
+        "scx-ktstr should resolve at least its C-runtime libs"
     );
+    for (guest_path, _host) in &resolved.found {
+        assert!(
+            s.contains(guest_path.as_str()),
+            "base must contain extra's resolved lib {guest_path}; \
+             resolved set: {:?}",
+            resolved.found
+        );
+    }
 }
 
 #[test]

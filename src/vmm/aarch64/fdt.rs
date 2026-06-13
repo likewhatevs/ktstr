@@ -29,6 +29,16 @@ const GIC_PPI: u32 = 1;
 const IRQ_TYPE_EDGE_RISING: u32 = 1;
 
 /// IRQ_TYPE_LEVEL_LOW for timer PPIs (active-low per arm spec).
+///
+/// cloud-hypervisor, firecracker, AND qemu all emit LEVEL_HIGH (4) for the
+/// arch-timer PPIs; ktstr's LEVEL_LOW is nonetheless correct and the
+/// divergence is benign. arm arch-timer PPIs are architecturally
+/// active-low; the kernel's check_ppi_trigger (drivers/clocksource/
+/// arm_arch_timer.c) accepts either polarity as-is (only out-of-range
+/// values are forced + warned), and KVM's vgic forces all PPIs to
+/// VGIC_CONFIG_LEVEL with no polarity dimension — so HIGH vs LOW is
+/// cosmetic for these PPIs under KVM. Do NOT "correct" this to HIGH to
+/// match the reference VMMs.
 const IRQ_TYPE_LEVEL_LOW: u32 = 8;
 
 /// IRQ_TYPE_LEVEL_HIGH for the PMU PPI. Matches qemu virt
@@ -185,6 +195,38 @@ pub fn fdt_address(memory_mib: u32) -> u64 {
     (dram_end - FDT_MAX_SIZE) & !7
 }
 
+/// Base IPA of the per-vCPU KVM PV stolen-time region, carved from the
+/// top of guest RAM just below the FDT and 64 KB-aligned (the max
+/// aarch64 granule, so the `/memory` shrink lands on a page boundary
+/// for every granule). [`write_memory`] excludes `[pvtime_base,
+/// dram_end)` from `/memory`, and
+/// [`super::kvm::KtstrKvm::setup_pvtime`] points each vCPU's PVTIME IPA
+/// at `pvtime_base + cpu_id * PVTIME_SIZE_PER_CPU`. Computed in one
+/// place so the host IPAs and the FDT carve-out agree exactly.
+///
+/// Divergence: qemu places PV-stolen-time in a separate fixed region in
+/// device-IO space below DRAM (VIRT_PVTIME = 0x090a0000, hw/arm/virt.c;
+/// VIRT_MEM starts at 1 GiB), with its own RAM-backed MemoryRegion. ktstr
+/// instead carves from the top of guest RAM so the IPA stays inside the
+/// registered guest-RAM memslots — no extra device region or memslot.
+/// The cost of that choice: the carve overlaps the address range the
+/// initrd would otherwise use, so `aarch64_initrd_addr` anchors the initrd
+/// below `pvtime_base` (qemu needs no such bound — its region is below DRAM).
+///
+/// firecracker uses the SAME carve-and-exclude ktstr does: it reserves a
+/// general in-RAM system region (SYSTEM_MEM, at the bottom of DRAM, shared
+/// with VMGenID), allocates the steal-time IPA from it
+/// (allocate_pvtime_region), and drops the region from `/memory`
+/// (create_memory_node starts the node SYSTEM_MEM_SIZE above DRAM_MEM_START),
+/// differing from us only in placement (its bottom-of-RAM vs our top-of-RAM).
+/// So carve-and-exclude is the
+/// mainstream pattern and only qemu's separate-device-region diverges;
+/// cloud-hypervisor and libkrun have no aarch64 pvtime at all.
+pub(crate) fn pvtime_base(memory_mib: u32, total_cpus: u32) -> u64 {
+    let pvtime_size = total_cpus as u64 * super::kvm::PVTIME_SIZE_PER_CPU;
+    (fdt_address(memory_mib) - pvtime_size) & !0xFFFF
+}
+
 fn write_chosen(
     fdt: &mut FdtWriter,
     cmdline: &str,
@@ -196,6 +238,28 @@ fn write_chosen(
         .context("bootargs")?;
     fdt.property_string("stdout-path", &format!("/serial0@{:x}", SERIAL_MMIO_BASE))
         .context("stdout-path")?;
+
+    // KASLR seed. arm64 kernel-image KASLR seeds from `/chosen/kaslr-seed`
+    // (an 8-byte property the kernel consumes-and-zeroes in
+    // `kaslr_early_init`), falling back to the CPU RNG (FEAT_RNG / RNDR)
+    // when the DT seed is absent. KVM does not expose RNDR to the guest
+    // here, so without a DT seed the guest boots "KASLR disabled due to
+    // lack of seed" and `kern_kaslr_offset` is 0 — defeating the KASLR-on
+    // default and its e2e coverage. Provide a random DT seed so KASLR
+    // enables deterministically regardless of guest RNDR. This matches
+    // qemu (hw/arm/virt.c `create_randomness` writes an 8-byte BE
+    // `kaslr-seed`, default-on) and DIVERGES from cloud-hypervisor,
+    // firecracker, and libkrun, whose aarch64 /chosen carries only
+    // bootargs + initrd bounds (no seed): they rely on guest FEAT_RNG /
+    // RNDR or EFI-stub seeding, which our KVM guest lacks. `property_u64`
+    // writes the value big-endian, which `fdt64_to_cpu` in `get_kaslr_seed`
+    // reads back correctly. Omitted under `nokaslr` (e.g.
+    // `#[ktstr_test(kaslr = false)]`) so the disabled-KASLR path stays
+    // genuinely seedless.
+    if !cmdline.split_whitespace().any(|tok| tok == "nokaslr") {
+        fdt.property_u64("kaslr-seed", rand::random::<u64>())
+            .context("kaslr-seed")?;
+    }
 
     if let (Some(addr), Some(size)) = (initrd_addr, initrd_size) {
         fdt.property_u64("linux,initrd-start", addr)
@@ -215,8 +279,16 @@ fn write_memory(
     numa_layout: &NumaMemoryLayout,
 ) -> Result<()> {
     let mem_size = (memory_mib as u64) << 20;
+    // Top of guest-usable RAM. The PVTIME steal region is carved just
+    // below the FDT (see `pvtime_base`) and MUST be excluded from
+    // /memory: the guest memremaps the SMCCC-returned IPA itself, so if
+    // these pages stayed in /memory the guest could allocate them while
+    // the host writes steal-time into them (silent corruption). The
+    // host PVTIME IPAs point here (aarch64/kvm.rs setup_pvtime).
+    let pvt = pvtime_base(memory_mib, topo.total_cpus());
 
     if topo.numa_nodes <= 1 {
+        let usable = pvt - DRAM_START;
         let name = format!("memory@{DRAM_START:x}");
         let mem = fdt.begin_node(&name).context("begin memory")?;
         fdt.property_string("device_type", "memory")
@@ -226,18 +298,31 @@ fn write_memory(
             &[
                 (DRAM_START >> 32) as u32,
                 DRAM_START as u32,
-                (mem_size >> 32) as u32,
-                mem_size as u32,
+                (usable >> 32) as u32,
+                usable as u32,
             ],
         )
         .context("memory reg")?;
         fdt.end_node(mem).context("end memory")?;
     } else {
-        // Multi-NUMA: one memory node per NumaMemoryLayout region.
+        // Multi-NUMA: one memory node per NumaMemoryLayout region. The
+        // PVTIME carve lives in the top region (the one ending at
+        // dram_end, where the FDT also sits), so shrink that region to
+        // end at `pvt`; the others keep their full size.
+        let dram_end = DRAM_START + mem_size;
         let regions = numa_layout.regions();
         for region in regions {
             let base = region.gpa_start;
-            let length = region.size;
+            let length = if base + region.size == dram_end {
+                anyhow::ensure!(
+                    pvt > base,
+                    "PVTIME carve (pvtime_base={pvt:#x}) underflows the top NUMA \
+                     region base ({base:#x}); top node too small for the carve"
+                );
+                pvt - base
+            } else {
+                region.size
+            };
             let name = format!("memory@{base:x}");
             let mem = fdt.begin_node(&name).context("begin memory")?;
             fdt.property_string("device_type", "memory")
@@ -439,6 +524,21 @@ fn write_serial(fdt: &mut FdtWriter, base: u64, alias: &str, irq: u32) -> Result
     Ok(())
 }
 
+/// Emit a `virtio_mmio` device-tree node (compatible / reg / interrupts /
+/// interrupt-parent).
+///
+/// Intentionally NO `dma-coherent` property: none of ktstr's virtio
+/// devices (blk, net, console) negotiate VIRTIO_F_ACCESS_PLATFORM
+/// (bit 33). Without that bit the
+/// guest virtio_ring takes the DMA-quirk path (vring_use_map_api ==
+/// false, drivers/virtio/virtio_ring.c): guest-physical addresses + a
+/// plain write-back-cacheable ring (alloc_pages_exact, not
+/// dma_alloc_coherent), so the DMA API — hence `dma-coherent` /
+/// of_dma_is_coherent — is never consulted. Under KVM same-arch the host
+/// maps the same physical guest RAM, so no coherency gap exists. We
+/// diverge from firecracker (which emits `dma-coherent`) deliberately:
+/// for a no-ACCESS_PLATFORM feature set the property is inert, not
+/// load-bearing.
 fn write_virtio_mmio(fdt: &mut FdtWriter, base: u64, size: u64, irq: u32) -> Result<()> {
     let name = format!("virtio_mmio@{base:x}");
     let node = fdt.begin_node(&name).context("begin virtio_mmio")?;
@@ -575,9 +675,10 @@ mod tests {
     }
 
     fn test_layout(topo: &Topology, mib: u32) -> NumaMemoryLayout {
-        NumaMemoryLayout::compute(topo, mib, DRAM_START).unwrap()
+        NumaMemoryLayout::compute(topo, mib, DRAM_START, None).unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn test_fdt(
         topo: &Topology,
         mpidrs: &[u64],
@@ -921,7 +1022,12 @@ mod tests {
     /// Check multi-NUMA memory nodes: numa-node-id, reg, contiguity, total size.
     fn check_memory_nodes(topo: &Topology, props: &[(String, String, Vec<u8>)], memory_mib: u32) {
         let mem_size = (memory_mib as u64) << 20;
-        let layout = NumaMemoryLayout::compute(topo, memory_mib, DRAM_START).unwrap();
+        let dram_end = DRAM_START + mem_size;
+        // The top region (the one ending at dram_end) is shrunk to
+        // exclude the PVTIME+FDT carve [pvtime_base, dram_end); every
+        // other region keeps its full size. See `write_memory`.
+        let pvt = pvtime_base(memory_mib, topo.total_cpus());
+        let layout = NumaMemoryLayout::compute(topo, memory_mib, DRAM_START, None).unwrap();
         let regions = layout.regions();
 
         let mut prev_end: Option<u64> = None;
@@ -946,7 +1052,16 @@ mod tests {
             assert_eq!(reg_base, base, "memory region {i}: wrong base address");
 
             let reg_size = ((reg[2] as u64) << 32) | reg[3] as u64;
-            assert_eq!(reg_size, region.size, "memory region {i}: wrong size");
+            // The top region carries the carve; all others are full size.
+            let expected_size = if base + region.size == dram_end {
+                pvt - base
+            } else {
+                region.size
+            };
+            assert_eq!(
+                reg_size, expected_size,
+                "memory region {i}: wrong size (carve-adjusted)"
+            );
 
             if let Some(prev) = prev_end {
                 assert_eq!(
@@ -959,9 +1074,20 @@ mod tests {
             total_size += reg_size;
         }
 
+        // Advertised RAM is exactly [DRAM_START, pvtime_base): the
+        // PVTIME+FDT carve at the top is excluded so the guest never
+        // reuses the steal-time region (kvm.rs setup_pvtime points each
+        // vCPU's PVTIME IPA there).
         assert_eq!(
-            total_size, mem_size,
-            "total memory {total_size:#x} != mem_size {mem_size:#x}"
+            total_size,
+            pvt - DRAM_START,
+            "total advertised memory {total_size:#x} != pvtime_base-DRAM_START {:#x}",
+            pvt - DRAM_START
+        );
+        assert_eq!(
+            prev_end,
+            Some(pvt),
+            "highest /memory region must end at pvtime_base {pvt:#x}"
         );
     }
 
@@ -990,6 +1116,74 @@ mod tests {
         )
         .unwrap();
         check_memory_nodes(&topo, &parse_dtb_props(&dtb), memory_mib);
+    }
+
+    #[test]
+    fn fdt_memory_single_numa_excludes_pvtime_carve() {
+        // Single-NUMA: the sole /memory node must end at pvtime_base, not
+        // dram_end. The PVTIME+FDT carve [pvtime_base, dram_end) is
+        // excluded so the guest never allocates the steal-time region the
+        // host writes into (kvm.rs setup_pvtime points each vCPU's PVTIME
+        // IPA at pvtime_base + cpu_id * PVTIME_SIZE_PER_CPU).
+        let topo = Topology {
+            llcs: 2,
+            cores_per_llc: 4,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let mpidrs = fake_mpidrs(topo.total_cpus());
+        let memory_mib: u32 = 512;
+        let dtb = test_fdt(
+            &topo,
+            &mpidrs,
+            memory_mib,
+            "console=ttyS0",
+            None,
+            None,
+            2,
+            false,
+        )
+        .unwrap();
+        let props = parse_dtb_props(&dtb);
+
+        let pvt = pvtime_base(memory_mib, topo.total_cpus());
+        let node = format!("memory@{DRAM_START:x}");
+        let reg = prop_u32_array(&props, &node, "reg").expect("single-NUMA memory reg");
+        assert_eq!(reg.len(), 4, "memory reg must have 4 cells");
+        let reg_base = ((reg[0] as u64) << 32) | reg[1] as u64;
+        let reg_size = ((reg[2] as u64) << 32) | reg[3] as u64;
+        assert_eq!(reg_base, DRAM_START, "single-NUMA memory base");
+        assert_eq!(
+            reg_base + reg_size,
+            pvt,
+            "single-NUMA /memory must end at pvtime_base (carve excluded)"
+        );
+    }
+
+    #[test]
+    fn pvtime_base_carve_below_fdt_and_fits_all_vcpus() {
+        // pvtime_base must be 64KB-aligned (the max aarch64 granule, so
+        // the /memory shrink lands on a page boundary for every granule),
+        // strictly below the FDT, and leave room for one
+        // PVTIME_SIZE_PER_CPU slot per vCPU between it and the FDT — so no
+        // per-vCPU PVTIME IPA spills into the FDT region.
+        let memory_mib: u32 = 512;
+        let per_cpu = crate::vmm::aarch64::kvm::PVTIME_SIZE_PER_CPU;
+        for total_cpus in [1u32, 8, 64, 256] {
+            let pvt = pvtime_base(memory_mib, total_cpus);
+            let fdt = fdt_address(memory_mib);
+            assert_eq!(pvt & 0xFFFF, 0, "pvtime_base {pvt:#x} must be 64KB-aligned");
+            assert!(
+                pvt >= DRAM_START && pvt < fdt,
+                "pvtime_base {pvt:#x} must be in [DRAM_START, fdt_address={fdt:#x})"
+            );
+            assert!(
+                fdt - pvt >= total_cpus as u64 * per_cpu,
+                "carve [{pvt:#x},{fdt:#x}) too small for {total_cpus} vCPUs * {per_cpu}B"
+            );
+        }
     }
 
     #[test]
@@ -1215,36 +1409,6 @@ mod tests {
             pmu_intr.is_none(),
             "pmu interrupts property must be absent when has_pmu=false; found={:?}",
             pmu_intr,
-        );
-    }
-
-    /// PMU_PPI lives in the GIC PPI namespace (0..15), distinct from the
-    /// global intid namespace KVM_ARM_VCPU_PMU_V3_IRQ takes. The FDT's
-    /// `interrupts` cell carries the PPI form (cell[1]); the in-kernel
-    /// vCPU init in `kvm.rs::init_pmuv3` writes the intid form
-    /// (PMU_INTID = PPI + 16). Pin the relationship between the two
-    /// constants here so a regression that drifts either form trips
-    /// before the kernel rejects the IRQ via pmu_irq_is_valid.
-    #[test]
-    fn fdt_pmu_ppi_matches_intid_namespace_relationship() {
-        use crate::vmm::aarch64::kvm::PMU_INTID;
-        // PMU_PPI is the FDT cell value; PMU_INTID is the global intid
-        // (PPI + VGIC_NR_SGIS where VGIC_NR_SGIS = 16). Crossing into
-        // the SPI range (intid 32+) would mis-route the IRQ.
-        assert_eq!(
-            PMU_INTID,
-            PMU_PPI + 16,
-            "PMU_INTID must equal PMU_PPI + 16 (VGIC_NR_SGIS)",
-        );
-        assert!(
-            PMU_PPI < 16,
-            "PMU_PPI must be in the PPI namespace (0..16); got {}",
-            PMU_PPI,
-        );
-        assert!(
-            (16..32).contains(&PMU_INTID),
-            "PMU_INTID must land in the PPI intid range (16..32); got {}",
-            PMU_INTID,
         );
     }
 

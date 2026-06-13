@@ -845,7 +845,7 @@ pub(crate) fn read_per_cpu_offsets(
 /// - `kaslr_offset` is the runtime kernel-image virt slide,
 ///   sourced from the shared `kern_virt_kaslr` Arc populated by
 ///   the BSP MSR_LSTAR derive at
-///   [`crate::vmm::x86_64::msr_kaslr::read_and_derive`] on
+///   `crate::vmm::x86_64::msr_kaslr::read_and_derive` on
 ///   x86_64 OR the guest-channel KERN_ADDRS `_text` subtraction
 ///   at `crate::vmm::freeze_coord::dispatch` on both arches.
 /// - `per_cpu_off` is the runtime value read from
@@ -944,7 +944,7 @@ pub(crate) fn per_cpu_kva(template_kva: u64, kaslr_offset: u64, per_cpu_off: u64
 /// `kaslr_offset` is the runtime kernel-image virt-KASLR slide,
 /// sourced from the shared `kern_virt_kaslr` Arc populated by the
 /// BSP MSR_LSTAR derive at
-/// [`crate::vmm::x86_64::msr_kaslr::read_and_derive`] (x86_64) OR
+/// `crate::vmm::x86_64::msr_kaslr::read_and_derive` (x86_64) OR
 /// the guest-channel KERN_ADDRS `_text` subtraction at
 /// `crate::vmm::freeze_coord::dispatch` (both arches).  Production
 /// callers in `crate::vmm::freeze_coord` thread the snapshot via
@@ -1093,6 +1093,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
+    #[allow(clippy::identity_op)]
     fn start_kernel_map_for_tcr_aarch64_rejects_reserved_tg1() {
         // TG1=0b00 is reserved per Arm ARM D17.2.139; without a
         // valid granule the VA_BITS_MIN derivation cannot pick the

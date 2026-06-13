@@ -123,7 +123,7 @@ const TASK_DEAD: u32 = 0x80;
 /// unmapped or non-canonical addresses (page-walk safety net).
 ///
 /// INTENTIONALLY DIFFERS from
-/// [`crate::vmm::x86_64::msr_kaslr::KERNEL_HALF_CANONICAL_4LEVEL`]
+/// `crate::vmm::x86_64::msr_kaslr::KERNEL_HALF_CANONICAL_4LEVEL`
 /// (value `0xFFFF_8000_0000_0000`, shared by `freeze_coord::dispatch`
 /// via the same import). That constant checks the 4-level x86_64
 /// canonical-bits invariant on the LSTAR MSR + kernel-text-link KVA

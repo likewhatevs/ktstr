@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 use kvm_bindings::{
     KVM_ARM_VCPU_PMU_V3_CTRL, KVM_ARM_VCPU_PMU_V3_INIT, KVM_ARM_VCPU_PMU_V3_IRQ,
-    KVM_DEV_ARM_VGIC_CTRL_INIT, KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_DEV_ARM_VGIC_GRP_CTRL,
-    KVM_DEV_ARM_VGIC_GRP_NR_IRQS, KVM_IRQ_ROUTING_IRQCHIP, KVM_VGIC_V3_ADDR_TYPE_DIST,
-    KVM_VGIC_V3_ADDR_TYPE_REDIST, KvmIrqRouting, kvm_create_device, kvm_device_attr,
-    kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3, kvm_irq_routing_entry,
-    kvm_irq_routing_entry__bindgen_ty_1, kvm_irq_routing_irqchip,
+    KVM_ARM_VCPU_PVTIME_CTRL, KVM_ARM_VCPU_PVTIME_IPA, KVM_DEV_ARM_VGIC_CTRL_INIT,
+    KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_DEV_ARM_VGIC_GRP_CTRL, KVM_DEV_ARM_VGIC_GRP_NR_IRQS,
+    KVM_IRQ_ROUTING_IRQCHIP, KVM_VGIC_V3_ADDR_TYPE_DIST, KVM_VGIC_V3_ADDR_TYPE_REDIST,
+    KvmIrqRouting, kvm_create_device, kvm_device_attr, kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3,
+    kvm_irq_routing_entry, kvm_irq_routing_entry__bindgen_ty_1, kvm_irq_routing_irqchip,
 };
 use kvm_ioctls::{Cap, DeviceFd, Kvm, VcpuFd, VmFd};
 use std::mem::ManuallyDrop;
@@ -34,8 +34,27 @@ pub(crate) const GIC_REDIST_BASE: u64 = GIC_DIST_BASE + GIC_DIST_SIZE;
 /// Size per redistributor: 128 KB (RD_base + SGI_base).
 pub(crate) const GIC_REDIST_SIZE_PER_CPU: u64 = 0x2_0000;
 
-/// ns16550a serial MMIO base address. SPI 33.
-pub(crate) const SERIAL_MMIO_BASE: u64 = 0x0900_0000;
+/// Maximum vCPUs the VMM places GIC redistributors for. Pinned to the
+/// guest kernel's CONFIG_NR_CPUS (ktstr.kconfig) — the guest brings up
+/// at most this many CPUs, so the redistributor region never needs to
+/// hold more than this.
+pub(crate) const MAX_VCPUS: u32 = 512;
+
+/// Worst-case end of the redistributor region: MAX_VCPUS redistributors
+/// from GIC_REDIST_BASE. The device MMIO window starts here so the
+/// redistributor (sized to the actual vCPU count, <= MAX_VCPUS) can
+/// never grow into a device region.
+pub(crate) const GIC_REDIST_MAX_END: u64 =
+    GIC_REDIST_BASE + MAX_VCPUS as u64 * GIC_REDIST_SIZE_PER_CPU;
+
+/// ns16550a serial MMIO base address. SPI 33. Placed at GIC_REDIST_MAX_END
+/// (above the worst-case redistributor region), NOT just below DRAM: the
+/// GICv3 redistributor grows from GIC_REDIST_BASE with vCPU count, and a
+/// redistributor frame landing on a device page would shadow that device
+/// (KVM's in-kernel vGIC claims the GPA on the MMIO bus, so the guest's
+/// accesses never reach the userspace device). All other device bases are
+/// chained off this one, so they relocate with it.
+pub(crate) const SERIAL_MMIO_BASE: u64 = GIC_REDIST_MAX_END;
 
 /// ns16550a serial MMIO size: one 4 KB page covering the 8-byte register
 /// window. KVM/OS accesses are 4-byte aligned; the page-sized region
@@ -89,6 +108,13 @@ pub(crate) const SERIAL2_IRQ: u32 = 34;
 /// arch/arm64/kvm/pmu-emul.c pmu_irq_is_valid.
 pub(crate) const PMU_PPI: u32 = 7;
 pub(crate) const PMU_INTID: u32 = PMU_PPI + 16;
+
+/// Per-vCPU KVM PV stolen-time region size. The kernel's
+/// `struct pvclock_vcpu_stolen_time` is 64 bytes and
+/// `KVM_ARM_VCPU_PVTIME_IPA` requires a 64-byte-aligned IPA
+/// (`arch/arm64/kvm/pvtime.c` `kvm_arm_pvtime_set_attr`:
+/// `IS_ALIGNED(ipa, 64)`). Each vCPU gets one such slot.
+pub(crate) const PVTIME_SIZE_PER_CPU: u64 = 64;
 
 /// Number of IRQs for the GIC. Must be a multiple of 32 and >= 64.
 /// 128 covers SPIs 0-95, sufficient for serial + headroom.
@@ -197,7 +223,7 @@ impl KtstrKvm {
     /// since memory_mib was unknown at construction time and
     /// `use_hugepages` may have been false.
     pub fn allocate_and_register_memory(&mut self, memory_mib: u32) -> Result<()> {
-        let layout = NumaMemoryLayout::compute(&self.topology, memory_mib, DRAM_START)?;
+        let layout = NumaMemoryLayout::compute(&self.topology, memory_mib, DRAM_START, None)?;
         let alloc =
             layout.allocate_and_register(&self.vm_fd, self.use_hugepages, self.performance_mode)?;
         // SAFETY: guest_mem is ManuallyDrop — explicit drop before
@@ -223,7 +249,7 @@ impl KtstrKvm {
 
         let (guest_mem, numa_layout, reservation) = match memory_mib {
             Some(mb) => {
-                let layout = NumaMemoryLayout::compute(&topo, mb, DRAM_START)?;
+                let layout = NumaMemoryLayout::compute(&topo, mb, DRAM_START, None)?;
                 let alloc =
                     layout.allocate_and_register(&vm_fd, use_hugepages, performance_mode)?;
                 (alloc.guest_mem, Some(layout), Some(alloc.reservation))
@@ -386,11 +412,14 @@ impl KtstrKvm {
         let redist_addr: u64 = GIC_REDIST_BASE;
         let redist_size = num_cpus as u64 * GIC_REDIST_SIZE_PER_CPU;
         anyhow::ensure!(
-            GIC_REDIST_BASE + redist_size <= DRAM_START,
-            "GIC redistributor region (ends at {:#x}) overlaps DRAM at {:#x} for {} CPUs",
+            GIC_REDIST_BASE + redist_size <= SERIAL_MMIO_BASE,
+            "GIC redistributor region (ends at {:#x}) overlaps the device MMIO \
+             window at {:#x} for {} CPUs (max {}); a redistributor frame on a \
+             device page would shadow that device",
             GIC_REDIST_BASE + redist_size,
-            DRAM_START,
+            SERIAL_MMIO_BASE,
             num_cpus,
+            MAX_VCPUS,
         );
         let redist_attr = kvm_device_attr {
             group: KVM_DEV_ARM_VGIC_GRP_ADDR,
@@ -463,6 +492,7 @@ impl KtstrKvm {
     ///   1. KVM_ARM_VCPU_PMU_V3_IRQ — programs vcpu->arch.pmu.irq_num
     ///   2. KVM_ARM_VCPU_PMU_V3_INIT — checks irq is initialised, marks
     ///      pmu.created = true (further attr writes return -EBUSY).
+    ///
     /// PMU_INTID is a PPI in the global intid namespace (16..32), so
     /// the same value is used for every vcpu per pmu_irq_is_valid.
     fn init_pmuv3(vcpus: &[VcpuFd]) -> Result<()> {
@@ -485,6 +515,65 @@ impl KtstrKvm {
             };
             vcpu.set_device_attr(&init_attr)
                 .with_context(|| format!("init PMU on vcpu {cpu_id}"))?;
+        }
+        Ok(())
+    }
+
+    /// Wire KVM PV stolen-time on each vCPU so the guest's
+    /// `/proc/stat` steal advances under overcommit (the arm64 analog
+    /// of x86's guest-MSR-driven `KVM_FEATURE_STEAL_TIME`). Without
+    /// this, `vcpu->arch.steal.base` stays `INVALID_GPA`
+    /// (`arch/arm64/include/asm/kvm_host.h`), `kvm_hypercall_pv_features`
+    /// returns `SMCCC_RET_NOT_SUPPORTED` (`arch/arm64/kvm/pvtime.c`),
+    /// and the guest's `pv_time` driver never enables steal accounting.
+    ///
+    /// `pvtime_base` is a guest IPA the caller carves from the top of
+    /// guest RAM (just below the FDT) and EXCLUDES from the FDT
+    /// `/memory` node, so the guest never reuses those pages while the
+    /// host writes steal-time into them. Each vCPU gets a 64-byte slot
+    /// at `pvtime_base + cpu_id * PVTIME_SIZE_PER_CPU` — 64-byte
+    /// aligned (the kernel's `IS_ALIGNED(ipa, 64)` requirement) and
+    /// inside the already-registered top-DRAM memslot, so the kernel's
+    /// `gfn_to_hva` check at set-attr time
+    /// (`kvm_arm_pvtime_set_attr`) passes without a new memslot.
+    ///
+    /// Gated on host support: KVM advertises the PVTIME vCPU attr only
+    /// when `kvm_arm_pvtime_supported()` (= `!!sched_info_on()`, i.e.
+    /// the host kernel has `CONFIG_SCHED_INFO`). When unsupported the
+    /// `has_device_attr` probe fails and we skip cleanly — guest steal
+    /// then cannot advance and the cpu_budget overcommit test reports
+    /// it.
+    pub(crate) fn setup_pvtime(&self, pvtime_base: u64) -> Result<()> {
+        // KVM_HAS_DEVICE_ATTR support probe on vcpu 0 (addr ignored for
+        // the HAS query); kvm_arm_pvtime_has_attr returns 0 only when
+        // kvm_arm_pvtime_supported().
+        let probe = kvm_device_attr {
+            group: KVM_ARM_VCPU_PVTIME_CTRL,
+            attr: KVM_ARM_VCPU_PVTIME_IPA as u64,
+            addr: 0,
+            flags: 0,
+        };
+        let supported = self
+            .vcpus
+            .first()
+            .is_some_and(|v| v.has_device_attr(&probe).is_ok());
+        if !supported {
+            tracing::warn!(
+                "host KVM lacks the PVTIME vcpu attribute (CONFIG_SCHED_INFO off?); \
+                 guest steal-time will not advance"
+            );
+            return Ok(());
+        }
+        for (cpu_id, vcpu) in self.vcpus.iter().enumerate() {
+            let ipa: u64 = pvtime_base + (cpu_id as u64) * PVTIME_SIZE_PER_CPU;
+            let attr = kvm_device_attr {
+                group: KVM_ARM_VCPU_PVTIME_CTRL,
+                attr: KVM_ARM_VCPU_PVTIME_IPA as u64,
+                addr: &ipa as *const u64 as u64,
+                flags: 0,
+            };
+            vcpu.set_device_attr(&attr)
+                .with_context(|| format!("set PVTIME IPA on vcpu {cpu_id}"))?;
         }
         Ok(())
     }
@@ -593,12 +682,18 @@ mod tests {
     }
 
     #[test]
-    fn gic_redist_does_not_overlap_dram() {
-        // Maximum vCPUs that fit: (DRAM_START - GIC_REDIST_BASE) / GIC_REDIST_SIZE_PER_CPU
-        let max_cpus = (DRAM_START - GIC_REDIST_BASE) / GIC_REDIST_SIZE_PER_CPU;
+    fn gic_redist_fits_max_vcpus_below_devices() {
+        // The redistributor region grows from GIC_REDIST_BASE with vCPU
+        // count; the first obstacle above it is the device MMIO window at
+        // SERIAL_MMIO_BASE (NOT DRAM_START, far above — bounding there was
+        // the original bug: the redist could grow through serial/virtio).
+        // Real capacity is bounded at the device window and must cover
+        // MAX_VCPUS redistributors.
+        let max_cpus = (SERIAL_MMIO_BASE - GIC_REDIST_BASE) / GIC_REDIST_SIZE_PER_CPU;
         assert!(
-            max_cpus >= 128,
-            "layout should support at least 128 vCPUs, got {max_cpus}"
+            max_cpus >= MAX_VCPUS as u64,
+            "device window must sit above MAX_VCPUS={} redistributors; fits only {max_cpus}",
+            MAX_VCPUS
         );
     }
 
@@ -619,6 +714,11 @@ mod tests {
         const { assert!(VIRTIO_BLK_MMIO_BASE + crate::vmm::virtio_blk::VIRTIO_MMIO_SIZE <= DRAM_START) };
         const { assert!(VIRTIO_NET_MMIO_BASE < DRAM_START) };
         const { assert!(VIRTIO_NET_MMIO_BASE + crate::vmm::virtio_net::VIRTIO_MMIO_SIZE <= DRAM_START) };
+        // The redistributor region for MAX_VCPUS vCPUs must end at or below
+        // the device window, so no redistributor frame can shadow a device.
+        // SERIAL_MMIO_BASE = GIC_REDIST_MAX_END by construction; this guard
+        // catches a future literal base set below the redistributor max.
+        const { assert!(SERIAL_MMIO_BASE >= GIC_REDIST_MAX_END) };
     }
 
     /// PMU_PPI must reside in the GIC PPI namespace (0..15). Values

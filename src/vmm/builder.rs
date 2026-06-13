@@ -61,6 +61,10 @@ pub struct KtstrVmBuilder {
     pub(crate) topology: Topology,
     pub(crate) memory_mib: Option<u32>,
     memory_min_mib: u32,
+    /// Per-test no-perf host-CPU budget override (`#[ktstr_test(cpu_budget)]`).
+    /// `None` auto-sizes to the vCPU count; `Some(n)` forces that budget
+    /// (n < vcpus → overcommit). An explicit `--cpu-cap` still wins.
+    pub(crate) cpu_budget: Option<u32>,
     pub(crate) cmdline_extra: String,
     pub(crate) timeout: Duration,
     pub(crate) monitor_thresholds: Option<crate::monitor::MonitorThresholds>,
@@ -94,6 +98,11 @@ pub struct KtstrVmBuilder {
     pub(crate) wprof: Option<crate::vmm::wprof::WprofConfig>,
     dmesg: bool,
     exec_cmd: Option<String>,
+    /// Wall-clock bound for a shell `--exec` payload. A panic-less
+    /// guest hang otherwise blocks the BSP run loop ~forever; the
+    /// `run_interactive` watchdog kicks the vCPU after this deadline.
+    /// Default 120s; consulted only in `--exec` (exec_mode) runs.
+    exec_timeout: Duration,
     /// Optional host path to the `ktstr-jemalloc-probe` binary.
     /// When `Some`, the probe is packed into the guest initramfs at
     /// `bin/ktstr-jemalloc-probe` and becomes spawnable by bare name
@@ -225,6 +234,7 @@ impl Default for KtstrVmBuilder {
             },
             memory_mib: Some(256),
             memory_min_mib: 0,
+            cpu_budget: None,
             cmdline_extra: String::new(),
             timeout: Duration::from_secs(12),
             monitor_thresholds: None,
@@ -243,6 +253,7 @@ impl Default for KtstrVmBuilder {
             wprof: None,
             dmesg: false,
             exec_cmd: None,
+            exec_timeout: Duration::from_secs(120),
             jemalloc_probe_binary: None,
             jemalloc_alloc_worker_binary: None,
             failure_dump_path: None,
@@ -381,6 +392,19 @@ impl KtstrVmBuilder {
     pub fn memory_deferred_min(mut self, min_mib: u32) -> Self {
         self.memory_mib = None;
         self.memory_min_mib = min_mib;
+        self
+    }
+
+    /// Override the no-perf host-CPU budget — the number of host CPUs the
+    /// VM's vCPU threads share. The default (unset) auto-sizes to the VM's
+    /// vCPU count; setting `budget` < vcpus forces CPU overcommit (used by
+    /// `#[ktstr_test(cpu_budget = N)]` for contention tests). Only takes
+    /// effect on the no-perf path; an explicit `--cpu-cap` / `KTSTR_CPU_CAP`
+    /// overrides it. A `budget` of 0 is floored to 1 here so this low-level
+    /// setter never produces a zero-CPU mask; the `#[ktstr_test]` macro and
+    /// `KtstrTestEntry::validate` reject 0 before it reaches this setter.
+    pub fn cpu_budget(mut self, budget: u32) -> Self {
+        self.cpu_budget = Some(budget);
         self
     }
 
@@ -685,16 +709,12 @@ impl KtstrVmBuilder {
     /// virtio device.
     ///
     /// v0 supports a single device; calling this method twice
-    /// overwrites the prior `NetConfig`.
-    ///
-    /// `dead_code` allow: kept as the public builder entry point
-    /// for attaching a virtio-net device; the production VM-bring-up
-    /// path in [`super::setup`] currently never enables networking
-    /// for a test, but the device, builder field, and config type
-    /// are all wired so a scenario can opt in.
-    #[allow(dead_code)]
-    pub fn network(mut self, config: net_config::NetConfig) -> Self {
-        self.network = Some(config);
+    /// overwrites the prior `NetConfig`. Reached via the
+    /// `#[ktstr_test(network = ...)]` attribute
+    /// (`test_support::runtime::build_vm_builder_base` calls this when the
+    /// entry sets `network`), or directly by raw-library callers.
+    pub fn network(mut self, network: net_config::NetConfig) -> Self {
+        self.network = Some(network);
         self
     }
 
@@ -804,6 +824,16 @@ impl KtstrVmBuilder {
         self
     }
 
+    /// Wall-clock bound for a `--exec` payload before the VM is
+    /// force-killed (a panic-less guest hang otherwise blocks the BSP
+    /// run loop ~forever). Default 120s. Consulted only in `--exec`
+    /// runs; interactive shell sessions are unbounded.
+    #[allow(dead_code)]
+    pub fn exec_timeout(mut self, t: Duration) -> Self {
+        self.exec_timeout = t;
+        self
+    }
+
     /// Validate the builder configuration and materialise a [`super::KtstrVm`].
     ///
     /// Returns `Err` for missing required inputs (kernel, init binary),
@@ -905,13 +935,40 @@ impl KtstrVmBuilder {
                 (None, Vec::new(), None)
             } else if let Ok(host_topo) = host_topology::HostTopology::cached() {
                 let test_topo = crate::topology::TestTopology::from_system()?;
+                // Effective budget: an explicit --cpu-cap / KTSTR_CPU_CAP
+                // wins; otherwise size the budget to the VM's own vCPU count
+                // so a wide VM's boot-time parallel AP bringup is not
+                // throttled by the 30% default mask (the "8 vs 200" boot
+                // oversubscription). Computed here rather than folded into
+                // `cpu_cap` so the bypass-conflict check above still keys on
+                // the *explicit* cap only.
+                let effective_cap = match cpu_cap {
+                    Some(c) => Some(c),
+                    None => {
+                        let allowed = host_topology::host_allowed_cpus().len();
+                        let vcpus = (self.topology.llcs
+                            * self.topology.cores_per_llc
+                            * self.topology.threads_per_core)
+                            as usize;
+                        // A per-test `cpu_budget` (#[ktstr_test]) overrides the
+                        // auto-size: clamp to [1, allowed] so a test can force
+                        // overcommit (budget < vcpus) without exceeding the host
+                        // allowance. Absent → size to the vCPU count.
+                        let budget = match self.cpu_budget {
+                            Some(n) => (n as usize).clamp(1, allowed.max(1)),
+                            None => host_topology::no_perf_cpu_budget(allowed, vcpus),
+                        };
+                        Some(host_topology::CpuCap::new(budget)?)
+                    }
+                };
                 // Compute the plan and immediately drop the flocks:
                 // we want the plan SHAPE on KtstrVm but not the
                 // RAII fds. `run()` re-takes fresh `LOCK_SH` on
                 // `plan.locked_llcs` via `acquire_resource_locks`
                 // just before vCPU spawn so the build-to-run
                 // setup window holds no flocks.
-                let mut plan = host_topology::acquire_llc_plan(&host_topo, &test_topo, cpu_cap)?;
+                let mut plan =
+                    host_topology::acquire_llc_plan(&host_topo, &test_topo, effective_cap)?;
                 host_topology::warn_if_cross_node_spill(&plan, &host_topo);
                 // Strip the flock fds — they release on drop. The
                 // plan's `cpus` / `locked_llcs` / `mems` fields
@@ -1059,6 +1116,7 @@ impl KtstrVmBuilder {
             wprof: self.wprof,
             dmesg: self.dmesg,
             exec_cmd: self.exec_cmd,
+            exec_timeout: self.exec_timeout,
             jemalloc_probe_binary: self.jemalloc_probe_binary,
             jemalloc_alloc_worker_binary: self.jemalloc_alloc_worker_binary,
             failure_dump_path: self.failure_dump_path,
@@ -1255,6 +1313,13 @@ mod tests {
     }
 
     #[test]
+    fn builder_cpu_budget_setter() {
+        assert_eq!(KtstrVmBuilder::default().cpu_budget, None);
+        let b = KtstrVmBuilder::default().cpu_budget(16);
+        assert_eq!(b.cpu_budget, Some(16));
+    }
+
+    #[test]
     fn builder_requires_kernel() {
         let result = KtstrVmBuilder::default().build();
         assert!(result.is_err());
@@ -1363,6 +1428,18 @@ mod tests {
     fn builder_rendezvous_timeout_override() {
         let b = KtstrVmBuilder::default().rendezvous_timeout(Duration::from_millis(100));
         assert_eq!(b.rendezvous_timeout, Some(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn builder_exec_timeout_default() {
+        let b = KtstrVmBuilder::default();
+        assert_eq!(b.exec_timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn builder_exec_timeout_override() {
+        let b = KtstrVmBuilder::default().exec_timeout(Duration::from_secs(30));
+        assert_eq!(b.exec_timeout, Duration::from_secs(30));
     }
 
     #[test]

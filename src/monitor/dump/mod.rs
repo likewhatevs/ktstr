@@ -1330,140 +1330,94 @@ impl FailureDumpReport {
     }
 }
 
-/// Identify the obj name of the currently-attached scheduler by
-/// matching each `BPF_MAP_TYPE_STRUCT_OPS` map's `value_kva` against
-/// the dereferenced `*scx_root` value carried in `scx_sched_state`.
+/// Identify the obj name (libbpf `<obj>` prefix) of the
+/// currently-attached scheduler from the captured BPF state, plus
+/// the live scheduler's `used_maps` KVA set when available.
 ///
-/// **Mechanism.** `*scx_root` derefs to the active `struct scx_sched`;
-/// the embedded `struct sched_ext_ops ops` member sits at offset 0 so
-/// the dereferenced pointer is also `&scx_sched.ops` — i.e. the same
-/// guest KVA the matching struct_ops map exposes via its `value_kva`
-/// (`&kvalue.data` per `bpf_struct_ops.c`'s
-/// `bpf_struct_ops_map_value`). When the comparison succeeds, the
-/// map's name carries the obj prefix (libbpf convention:
-/// `<obj>.<struct_ops_var>`); split at the first `.` and return the
-/// prefix.
+/// **No `*scx_root` dependency -- works on every supported kernel.**
+/// `scx_root` (the global pointer to the active `struct scx_sched`)
+/// only exists on v6.16+ (added by commit 48e126777386); pre-6.16
+/// kernels track the active scheduler via the global `scx_ops`
+/// (`struct sched_ext_ops`) plus the atomic enable-state instead, so
+/// any `*scx_root`-based identification is blind on 6.14/6.15. Both
+/// paths below read only `prog_idr` / struct_ops map names /
+/// global-section map names, which are present and BTF-offset-stable
+/// across the whole range, so this helper resolves the active obj
+/// uniformly regardless of kernel version.
 ///
-/// **Kernel-version stability.** This walker works on v6.16 (LTS) AND
-/// v7.0+ kernels because it does NOT depend on the v7.0-only
-/// `bpf_prog_aux::st_ops_assoc` field. The compared values come from
-/// per-map state (`bpf_struct_ops_map::kvalue.data`) and the global
-/// `*scx_root`, both of which existed in v6.16 — see
-/// kernel/bpf/bpf_struct_ops.c on either branch.
+/// **PRIMARY: target-free `prog_idr` walk.** Delegates to
+/// `prog_accessor.find_active_struct_ops_obj_no_target` (see
+/// `monitor::bpf_prog`), which walks `prog_idr` for an alive
+/// `BPF_PROG_TYPE_STRUCT_OPS` prog whose `aux->used_maps` carries a
+/// sibling `<obj>.bss/.data/.rodata` global-section map, and returns
+/// that prog's obj prefix + full `used_map_kvas` snapshot. The
+/// returned prefix is cross-checked against the captured `maps[]`
+/// (a `<prefix>.bss/.data/.rodata` must exist) so a torn `used_maps`
+/// read cannot publish a garbage prefix. The walk takes no target
+/// and reads live guest memory, so it produces the correct live
+/// scheduler even mid-swap and on pre-6.16 kernels. Used only when
+/// the walker returns a NON-EMPTY `used_map_kvas`; an empty
+/// whitelist cannot disambiguate two same-prefix copies downstream.
 ///
-/// **Why this is more principled than the prefix-grouping heuristic
-/// alone.** The heuristic at [`crate::scenario::snapshot::Snapshot::active`] groups global-section
-/// maps by `<obj>.` prefix and disambiguates "exactly one" → that obj.
-/// Multiple obj prefixes (a scheduler swap that left both old and new
-/// BPF objects' maps in the report, or a side-by-side dual scheduler
-/// scenario) collapse to `NoActiveScheduler` because the heuristic
-/// cannot point at the correct obj. This walker resolves the ambiguity
-/// using the kernel's own ground truth (`*scx_root`), so consumers get
-/// the right obj even mid-swap.
+/// The walker matches the FIRST such prog and does not gate on the
+/// kernel enable-state, so uniqueness rests on ktstr's swap
+/// sequencing (kill the outgoing scheduler and wait for its process
+/// to exit before loading the next), NOT on a kernel
+/// old-prog-removed-before-new-prog-added guarantee: the kernel
+/// does not serialize those (a detached struct_ops prog leaves
+/// `prog_idr` only when its owning map's last fd closes and an RCU
+/// grace elapses). See `find_active_struct_ops_obj_no_target` for
+/// the single-tenant threat model.
 ///
-/// Returns `Some((obj, kvas))` in one of two shapes:
+/// **FALLBACK: prefix grouping over struct_ops map names.** Runs
+/// when `prog_walker` is `None` (the prog accessor has not published
+/// yet) OR the walker found no global-section-bearing prog OR its
+/// whitelist was empty. Picks the first `BPF_MAP_TYPE_STRUCT_OPS`
+/// map whose name prefix has an UNAMBIGUOUS global-section sibling
+/// set (each of `.bss/.data/.rodata` count <= 1) and returns
+/// `(prefix, vec![])`. Section counts use full-name equality so they
+/// stay in lockstep with the consumer's classifier at
+/// [`crate::scenario::snapshot::Snapshot::active`] and the walker's
+/// `strip_suffix` in
+/// `monitor::bpf_prog::extract_global_section_obj_prefix` (private
+/// helper, cited by path rather than intra-doc link). A multi-copy
+/// prefix (the same-binary `Op::ReplaceScheduler` swap window leaves
+/// the dying scheduler's globals beside the new scheduler's) is
+/// skipped here: the empty-whitelist `(prefix, vec![])` cannot
+/// disambiguate downstream, so the helper instead returns `None` and
+/// the consumer surfaces an actionable `NoActiveScheduler`.
 ///
-/// 1. **Phase 1 short-circuit**: derive `<obj>` from the matched
-///    struct_ops map's name (everything before the first `.`), then
-///    count by full-name equality how many captured maps are named
-///    exactly `<obj>.bss`, `<obj>.data`, `<obj>.rodata`. Short-
-///    circuit when AT LEAST ONE of the three counts is positive
-///    AND NO count exceeds 1. Returns `(obj, vec![])` — the
-///    obj-prefix filter alone identifies the active scheduler's
-///    maps unambiguously. Matching uses full-name equality (not
-///    prefix matching) so it aligns with the consumer's strict
-///    classifier at
-///    [`crate::scenario::snapshot::Snapshot::active`] and the
-///    walker's `strip_suffix(".bss")` in
-///    `monitor::bpf_prog::extract_global_section_obj_prefix`
-///    (private helper, cited by path rather than intra-doc link).
-///
-/// 2. **Phase 2 walk (`used_maps` disambiguation)**: either the
-///    matched struct_ops map's name lacks an obj prefix (libbpf
-///    default naming: `ktstr_ops`, not `ktstr.ops`) OR multiple
-///    copies of `<prefix>.bss` / `.data` / `.rodata` coexist with
-///    the same prefix (the same-binary `Op::ReplaceScheduler`
-///    swap window leaves the dying scheduler's globals adjacent
-///    to the new scheduler's). Walks `bpf_prog.aux->used_maps`
-///    for the prog whose used_maps array contains the matched
-///    struct_ops map; returns the obj prefix derived from a
-///    sibling global-section map AND the full set of used_maps
-///    KVAs. The KVA set is the only way to disambiguate two
-///    same-prefix `<prefix>.bss` maps — the consumer pairs
-///    obj-prefix match with KVA-in-whitelist to pin the live
-///    scheduler's bss. Phase 2 only succeeds when the walker
-///    returns a non-empty `used_map_kvas`; an empty whitelist
-///    cannot disambiguate downstream, so the helper returns
-///    `None` instead of publishing a vacuous prefix.
-///
-/// Returns `None` when:
-/// - `scx_sched_state` is unavailable (no scheduler attached, BTF
-///   missing the `scx_sched` type, or `*scx_root` could not be
-///   resolved at capture time).
-/// - No `BPF_MAP_TYPE_STRUCT_OPS` map had `value_kva` matching the
-///   active sched_kva (capture race during a mid-attach window, or
-///   the struct_ops map's value_kva was not yet populated).
-/// - The matched struct_ops map's `map_kva` is `0` — defensive
-///   guard against a corrupt-capture sentinel that would otherwise
-///   match every zero entry in any prog's used_maps array during
-///   the Phase 2 walk.
-/// - Phase 2 was required (ambiguous prefix or libbpf-named
-///   struct_ops) but `prog_walker` was unavailable, or the walker
-///   found no matching prog, or its returned obj prefix had no
-///   sibling `<prefix>.bss/.data/.rodata` in the captured maps,
-///   or its returned `used_map_kvas` was empty.
-///
-/// Callers fall back to [`crate::scenario::snapshot::Snapshot::active`]'s prefix-grouping
-/// path on `None`. That path's own per-section-count check enforces
-/// the same multi-copy detection the helper performs here, so a
-/// helper-`None` does not silently downgrade into the prefix-only
-/// AmbiguousVar surface even when the walker is unavailable.
+/// Returns `None` when neither path resolves: the walker was absent
+/// / found nothing / returned an unbacked or empty result, AND no
+/// struct_ops map had an unambiguous global-section sibling set. On
+/// `None`, callers fall back to
+/// [`crate::scenario::snapshot::Snapshot::active`]'s own
+/// prefix-grouping, whose per-section-count check enforces the same
+/// multi-copy detection, so a helper-`None` does not silently
+/// downgrade into the prefix-only `AmbiguousVar` surface.
 fn identify_active_obj_from_struct_ops(
     maps: &[super::bpf_map::BpfMapInfo],
-    scx_sched_state: &Option<super::scx_walker::ScxSchedState>,
     prog_walker: Option<(
         &dyn super::bpf_prog::BpfProgAccessor,
         &super::btf_offsets::BpfMapOffsets,
     )>,
 ) -> Option<(String, Vec<u64>)> {
-    // Confirm SOME scheduler is attached before bothering with the
-    // walker. `scx_sched_state.sched_kva == Some(_)` proves `*scx_root`
-    // is non-zero AND `read_scx_sched_state` translated the resulting
-    // KVA successfully — i.e. the kernel has a live `struct scx_sched`.
-    // The exact address is unused below: we cannot equate it to any
-    // struct_ops map's `kvalue.data` because the kernel allocates
-    // `scx_sched` freshly and copies `sched_ext_ops` into its embedded
-    // `ops` field — so `*scx_root` (== `&scx_sched.ops`) is a
-    // kernel-side address distinct from the user-side
-    // `struct_ops_map.kvalue.data`. The presence of `Some` is the
-    // load-bearing precondition.
-    scx_sched_state.as_ref()?.sched_kva?;
-
-    // PRIMARY PATH: target-free prog_idr walk. Returns the UNIQUE
+    // PRIMARY PATH: target-free prog_idr walk. Returns the first
     // alive `BPF_PROG_TYPE_STRUCT_OPS` prog whose `aux->used_maps`
-    // contains a sibling `<obj>.bss/.data/.rodata` global-section map.
-    // In ktstr scenarios only one such prog exists at a time — the
-    // OLD scheduler's prog is freed synchronously by
-    // `__bpf_prog_put`'s process-context fast path
-    // (kernel/bpf/syscall.c:2420 invokes `bpf_prog_put_deferred`
-    // directly when not in_hardirq, vs scheduling the deferred work
-    // queue), so by the time `kill_current_scheduler` returns and
-    // the new scheduler spawns, the OLD prog is OUT of `prog_idr`.
-    // Only the NEW scheduler's prog satisfies the filter.
-    // The walker returns that prog's obj prefix + full
-    // `used_map_kvas` snapshot; the prefix is cross-checked against
-    // the captured `maps[]` so a torn walker read can't publish
-    // garbage.
-    //
-    // Historical Phase 0 note. The legacy Phase 0 here tried to
-    // identify the active struct_ops map via
-    // `m.value_kva == Some(sched_kva)` equality. That equality was
-    // structurally broken on current kernels — Phase 0 always
-    // returned None, and the test suite passed because the consumer's
-    // prefix-grouping fallback at `Snapshot::active` handled the
-    // single-bss case. With `Op::pin_bpf_map` forcing the same-binary
-    // multi-bss case, that fallback collapsed to `NoActiveScheduler`.
-    // The target-free walker bypasses the broken equality entirely.
+    // contains a sibling `<obj>.bss/.data/.rodata` global-section map,
+    // with that prog's obj prefix + full `used_map_kvas` snapshot.
+    // Reads live guest memory and takes no target, so it resolves the
+    // live scheduler on every supported kernel -- including pre-6.16,
+    // where `scx_root` does not exist. In ktstr scenarios only one
+    // matching prog is alive at a time: ktstr's swap sequence kills
+    // the outgoing scheduler and waits for its process to exit before
+    // loading the next, which closes the outgoing struct_ops map's
+    // last fd and lets the RCU-deferred map+prog free remove the OLD
+    // prog from `prog_idr`. (The kernel does NOT serialize
+    // old-prog-removal before new-prog-add; the single-alive-prog
+    // property is ktstr's sequencing, not a kernel invariant.) The
+    // returned prefix is cross-checked against the captured `maps[]`
+    // so a torn `used_maps` read can't publish a garbage prefix.
     if let Some((prog_accessor, map_offsets)) = prog_walker
         && let Some(walker_match) = prog_accessor.find_active_struct_ops_obj_no_target(map_offsets)
         && !walker_match.used_map_kvas.is_empty()
@@ -1479,21 +1433,18 @@ fn identify_active_obj_from_struct_ops(
         }
     }
 
-    // FALLBACK PATH: prefix grouping by struct_ops map name. Useful
+    // FALLBACK PATH: prefix grouping by struct_ops map name. Runs
     // when the prog walker is unavailable (`prog_walker` is `None`,
-    // e.g. when `owned_prog_accessor` hasn't published yet at boot)
-    // OR when the live STRUCT_OPS prog has no global-section maps in
-    // its used_maps (libbpf-named struct_ops case without `.bss/
-    // .data/.rodata` sibling, observed when the scheduler keeps all
-    // its state in non-libbpf-named maps).
+    // e.g. `owned_prog_accessor` hasn't published yet at boot) OR the
+    // live STRUCT_OPS prog has no global-section maps in its
+    // used_maps (libbpf-named struct_ops case without a `.bss/.data/
+    // .rodata` sibling, observed when the scheduler keeps all its
+    // state in non-libbpf-named maps).
     //
-    // The fallback grouping requires identifying a struct_ops map in
-    // `maps[]` whose name prefix matches a global-section map. We
-    // can't use the broken `value_kva == sched_kva` filter, so pick
-    // the first STRUCT_OPS map whose prefix has an unambiguous global-
-    // section sibling set (each section ≤ 1). Multi-copy collisions
-    // skip — the consumer surfaces NoActiveScheduler with an
-    // actionable diagnostic, matching the historical behavior.
+    // Pick the first STRUCT_OPS map whose prefix has an unambiguous
+    // global-section sibling set (each section ≤ 1). Multi-copy
+    // collisions skip -- the consumer surfaces NoActiveScheduler with
+    // an actionable diagnostic.
     for active_struct_ops in maps
         .iter()
         .filter(|m| m.map_type == super::bpf_map::BPF_MAP_TYPE_STRUCT_OPS)
@@ -2980,14 +2931,11 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     // still surfaces the raw bytes.
     let probe_counters = decode_probe_counters_snapshot(accessor, btf);
 
-    // Resolve the principled active-scheduler obj name BEFORE the
-    // FailureDumpReport struct literal moves `scx_sched_state`.
-    // `identify_active_obj_from_struct_ops` borrows both `maps` and
-    // `scx_sched_state` non-destructively so both are still owned for
-    // the subsequent move into the report. The prog accessor +
-    // BpfMapOffsets pair powers the used_maps walker fallback for the
-    // libbpf-named struct_ops case (`ktstr_ops` etc.) — when absent,
-    // the helper degrades to the prefix-grouping heuristic only.
+    // Resolve the active-scheduler obj name. The prog accessor +
+    // BpfMapOffsets pair powers the target-free `prog_idr` walker
+    // (the primary path; needs no `scx_root`, so it works on
+    // pre-6.16 kernels too) -- when absent, the helper degrades to the
+    // prefix-grouping fallback over struct_ops map names.
     let prog_walker = prog_capture.map(|cap| {
         (
             cap.accessor as &dyn super::bpf_prog::BpfProgAccessor,
@@ -2995,7 +2943,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         )
     });
     let (active_obj_name, active_map_kvas) =
-        match identify_active_obj_from_struct_ops(&maps, &scx_sched_state, prog_walker) {
+        match identify_active_obj_from_struct_ops(&maps, prog_walker) {
             Some((name, kvas)) => (Some(name), kvas),
             None => (None, Vec::new()),
         };

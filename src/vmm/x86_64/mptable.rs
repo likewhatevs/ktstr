@@ -4,7 +4,8 @@
 use anyhow::{Context, Result};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
-use super::topology::apic_id;
+use super::kvm::MAX_XAPIC_ID;
+use super::topology::{apic_id, max_apic_id};
 use crate::vmm::topology::Topology;
 
 const MPTABLE_START: u64 = 0x9fc00;
@@ -29,10 +30,29 @@ const APIC_VERSION: u8 = 0x14;
 const IO_APIC_ID: u8 = 0xfe;
 const IO_APIC_ADDR: u32 = 0xfec0_0000;
 
+/// Whether the legacy MP table applies to this topology.
+///
+/// The MP table stores each processor's APIC ID in a single byte, so it
+/// can only describe APIC IDs up to 254 (`MAX_XAPIC_ID`). Above that the
+/// IDs truncate and collide (256 -> 0 aliases the BSP), making the table a
+/// spec-lie. MADT is the SMP authority on an ACPI guest regardless, so for
+/// wide topologies the MP table is suppressed and the guest boots SMP from
+/// MADT alone; below the limit it stays a valid `acpi=off` SMP fallback.
+pub fn mptable_applies(topo: &Topology) -> bool {
+    max_apic_id(topo) <= MAX_XAPIC_ID
+}
+
 /// Write an MP table describing the given topology into guest memory.
 /// Each CPU entry uses the topology-computed APIC ID so the kernel
 /// sees the correct LLC/core/thread structure.
+///
+/// No-op when `mptable_applies(topo)` is false (max APIC ID > 254): the
+/// MP table's u8 APIC ID can't address those CPUs, and MADT is the SMP
+/// authority on an ACPI guest, so the table is suppressed there.
 pub fn setup_mptable(mem: &GuestMemoryMmap, topo: &Topology) -> Result<()> {
+    if !mptable_applies(topo) {
+        return Ok(());
+    }
     let num_cpus = topo.total_cpus();
     let mut addr = GuestAddress(MPTABLE_START);
 
@@ -64,10 +84,9 @@ pub fn setup_mptable(mem: &GuestMemoryMmap, topo: &Topology) -> Result<()> {
     // CPU entries (20 bytes each)
     let cpu_entry_size = 20u64;
     for cpu_id in 0..num_cpus {
-        // MP table spec uses 8-bit APIC IDs. For topologies with IDs > 255,
-        // the kernel uses ACPI MADT (which handles x2APIC) as authoritative.
-        // APIC IDs are truncated to u8 here — intentional because MADT takes
-        // precedence for large topologies.
+        // MP table spec uses 8-bit APIC IDs. The early return above
+        // guarantees max APIC ID <= 254 here, so `as u8` is exact for
+        // every CPU — no truncation.
         let apic_id = apic_id(topo, cpu_id) as u8;
         let mut entry = [0u8; 20];
         entry[0] = MP_PROCESSOR;
@@ -342,13 +361,54 @@ mod tests {
             distances: None,
         };
         assert_eq!(topo.total_cpus(), 240);
-        // Should succeed — MP table uses u8 APIC IDs but max here is < 255
-        assert!(setup_mptable(&mem, &topo).is_ok());
+        // max APIC ID = apic_id(239) = 14<<4 | 7<<1 | 1 = 239 <= 254, so the
+        // MP table applies and is emitted with a valid signature.
+        assert!(max_apic_id(&topo) <= MAX_XAPIC_ID);
+        assert!(mptable_applies(&topo));
+        setup_mptable(&mem, &topo).unwrap();
+        let mut magic = [0u8; 4];
+        mem.read_slice(&mut magic, GuestAddress(MPTABLE_START))
+            .unwrap();
+        assert_eq!(&magic, b"_MP_");
+    }
+
+    /// `mptable_applies` is exactly the negation of the split-irqchip
+    /// condition (`max_apic_id > MAX_XAPIC_ID`), so it tracks `setup_mptable`
+    /// suppression. Verified at the boundary and above it.
+    #[test]
+    fn mptable_applies_matches_xapic_limit() {
+        // 15 LLCs x 8 cores x 2 threads: max APIC ID = 239 <= 254 -> applies.
+        let at_limit = Topology {
+            llcs: 15,
+            cores_per_llc: 8,
+            threads_per_core: 2,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        assert!(max_apic_id(&at_limit) <= MAX_XAPIC_ID);
+        assert!(mptable_applies(&at_limit));
+
+        // 14 LLCs x 9 cores x 2 threads: max APIC ID = 433 > 254 -> suppressed.
+        let wide = Topology {
+            llcs: 14,
+            cores_per_llc: 9,
+            threads_per_core: 2,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        assert!(max_apic_id(&wide) > MAX_XAPIC_ID);
+        assert!(!mptable_applies(&wide));
     }
 
     #[test]
-    fn mptable_large_topology() {
+    fn mptable_suppressed_above_xapic_limit() {
         let mem = test_mem(4096);
+        // 14 LLCs x 9 cores x 2 threads = 252 vCPUs, max APIC ID = 433 > 254.
+        // The MP table's u8 APIC ID can't address those CPUs; setup_mptable
+        // must be a no-op so no spec-lie table is left in guest memory (MADT
+        // is the SMP authority on this path).
         let topo = Topology {
             llcs: 14,
             cores_per_llc: 9,
@@ -358,6 +418,21 @@ mod tests {
             distances: None,
         };
         assert_eq!(topo.total_cpus(), 252);
-        assert!(setup_mptable(&mem, &topo).is_ok());
+        assert!(max_apic_id(&topo) > MAX_XAPIC_ID);
+        assert!(!mptable_applies(&topo));
+
+        // Pre-fill the MP-table region with a sentinel so a no-op is provable
+        // independent of the backing's initial contents: if setup_mptable
+        // wrote anything (e.g. the _MP_ signature) the sentinel would change.
+        let sentinel = [0xABu8; 16];
+        mem.write_slice(&sentinel, GuestAddress(MPTABLE_START))
+            .unwrap();
+
+        setup_mptable(&mem, &topo).unwrap();
+
+        let mut after = [0u8; 16];
+        mem.read_slice(&mut after, GuestAddress(MPTABLE_START))
+            .unwrap();
+        assert_eq!(&after, &sentinel, "no MP table should be written");
     }
 }
