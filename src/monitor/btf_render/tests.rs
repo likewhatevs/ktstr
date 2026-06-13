@@ -2641,6 +2641,10 @@ const CAST_BTF_KIND_TYPEDEF: u32 = 8;
 /// `BTF_KIND_CONST` per `btf-rs::obj::resolve` — kind 10 maps to
 /// `Type::Const`. Used by the modifier-chain integration test.
 const CAST_BTF_KIND_CONST: u32 = 10;
+/// `BTF_KIND_TYPE_TAG` per `btf-rs::obj::resolve` — kind 18 maps to
+/// `Type::TypeTag`. Models a `__kptr` tag wrapping a pointer, the
+/// realistic shape of a `struct bpf_cpumask __kptr *` member/global.
+const CAST_BTF_KIND_TYPE_TAG: u32 = 18;
 
 /// Build a minimal BTF blob containing `types` (id=1..) and a
 /// string-section payload `strings` (must start with `\0`). The
@@ -2701,6 +2705,16 @@ fn cast_build_btf(types: &[CastSynType], strings: &[u8]) -> Vec<u8> {
                 let name_off: u32 = 0;
                 type_section.extend_from_slice(&name_off.to_le_bytes());
                 let info = (CAST_BTF_KIND_CONST << 24) & 0x1f00_0000;
+                type_section.extend_from_slice(&info.to_le_bytes());
+                type_section.extend_from_slice(&type_id.to_le_bytes());
+            }
+            CastSynType::TypeTag { name_off, type_id } => {
+                // BTF_KIND_TYPE_TAG wire layout: name_off (4) + info (4)
+                // + type (4, the tagged type id). Same shape as
+                // Typedef; the kind byte selects TypeTag. Models a
+                // `__kptr` tag wrapping a pointer.
+                type_section.extend_from_slice(&name_off.to_le_bytes());
+                let info = (CAST_BTF_KIND_TYPE_TAG << 24) & 0x1f00_0000;
                 type_section.extend_from_slice(&info.to_le_bytes());
                 type_section.extend_from_slice(&type_id.to_le_bytes());
             }
@@ -2784,6 +2798,10 @@ enum CastSynType {
     /// anonymous), but the field is still emitted for wire-format
     /// completeness.
     Const { type_id: u32 },
+    /// `BTF_KIND_TYPE_TAG` (kind=18). Named tag wrapping `type_id`.
+    /// Models `__kptr` on a pointer (`struct bpf_cpumask __kptr *`);
+    /// `peel_modifiers_with_id` peels it to reach the wrapped Ptr.
+    TypeTag { name_off: u32, type_id: u32 },
     /// `BTF_KIND_PTR` (kind=2). Anonymous pointer-to-`type_id`. Used
     /// to model a Type::Ptr field whose pointee is a forward-
     /// declared aggregate (the scenario the Fwd chase test exercises).
@@ -9308,6 +9326,100 @@ fn cpumask_kptr_all_ones_word_decodes_not_rejected() {
         Some(RenderedValue::CpuList { cpus }) => assert_eq!(cpus, "0-63"),
         other => panic!(
             "all-ones mask must decode to cpus 0-63, got {other:?} \
+             (skip reason {deref_skipped_reason:?})"
+        ),
+    }
+}
+
+/// Realistic kptr shape: `struct bpf_cpumask __kptr *` is a
+/// btf_type_tag("kptr") wrapping a Ptr, NOT a bare Ptr (which the
+/// other cpumask_kptr tests use). The render path must peel the
+/// TypeTag to reach the Ptr cpumask arm. This is the shape a datasec
+/// global like scx_mitosis's `all_cpumask` carries; render_datasec
+/// routes each variable through the same render_value_inner exercised
+/// here (after try_cast_intercept returns None for a non-u64 Ptr
+/// type), so this pins the datasec-kptr value-decode link.
+#[test]
+fn cpumask_kptr_through_kptr_typetag_chases_to_cpu_list() {
+    let mut strings: Vec<u8> = vec![0];
+    let mut push = |name: &str| -> u32 {
+        let off = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        off
+    };
+    let n_u64 = push("u64");
+    let n_cpumask = push("bpf_cpumask");
+    let n_bits = push("bits");
+    let n_kptr = push("kptr");
+    let n_outer = push("outer");
+    let n_mask = push("mask");
+    let types = vec![
+        // id 1: u64
+        CastSynType::Int {
+            name_off: n_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        // id 2: struct bpf_cpumask { u64 bits; }
+        CastSynType::Struct {
+            name_off: n_cpumask,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_bits,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+        // id 3: *bpf_cpumask
+        CastSynType::Ptr { type_id: 2 },
+        // id 4: __kptr tag wrapping the pointer (the realistic shape)
+        CastSynType::TypeTag {
+            name_off: n_kptr,
+            type_id: 3,
+        },
+        // id 5: struct outer { bpf_cpumask __kptr *mask; }
+        CastSynType::Struct {
+            name_off: n_outer,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_mask,
+                type_id: 4,
+                byte_offset: 0,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic kptr-typetag BTF parses");
+    let val: u64 = 0xFFFF_8000_0010_0000;
+    let outer_bytes = val.to_le_bytes().to_vec();
+    let mut kva = std::collections::HashMap::new();
+    kva.insert(val, cpumask_read_bytes(0b0000_1011)); // bits 0,1,3
+    let reader = CastStubReader {
+        kva_bytes_at: kva,
+        ..Default::default()
+    };
+    let v = render_value_with_mem(&btf, 5, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        ref deref,
+        ref deref_skipped_reason,
+        ..
+    } = members[0].value
+    else {
+        panic!(
+            "kptr-tagged mask field must render as Ptr; got {:?}",
+            members[0].value
+        );
+    };
+    match deref.as_deref() {
+        Some(RenderedValue::CpuList { cpus }) => assert_eq!(cpus, "0-1,3"),
+        other => panic!(
+            "kptr TypeTag must peel to the Ptr cpumask chase; got {other:?} \
              (skip reason {deref_skipped_reason:?})"
         ),
     }
