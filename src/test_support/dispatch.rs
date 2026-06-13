@@ -861,6 +861,8 @@ fn coverage_skip_under_instrumented_init(name: &str) -> bool {
         "live_var_resolves_across_same_binary_swap"
             | "snapshot_real_capture_op_snapshot"
             | "snapshot_real_capture_op_watch_snapshot"
+            | "snapshot_real_capture_wide_smp"
+            | "principled_active_scheduler_walker_resolves_active_obj"
             | "stats_bridge_round_trip"
             | "op_spawn_cgroup_empty_string_bails_with_actionable_diagnostic"
     )
@@ -881,10 +883,11 @@ pub fn run_ktstr_test(entry: &KtstrTestEntry) -> Result<AssertResult> {
 
     // Host-side coverage skip for VM-booting tests whose guest /init
     // trips an AP-kill exit under coverage-instrumented `current_exe`
-    // binaries. Per-test in-body skip checks are inert for these tests
-    // because the test body never runs — the guest dies during boot
-    // before reaching `(entry.func)(ctx)`. Catching the case here, on
-    // host, before any VM is built, lets nextest surface a clean SKIP
+    // binaries. Per-test in-body skip checks cannot save these tests:
+    // the guest either dies during boot before the body runs, or boots
+    // and the body returns Skip but the always-honored host-side post_vm
+    // callback then fails on the absent capture. Catching the case here,
+    // on host, before any VM is built, lets nextest surface a clean SKIP
     // instead of burning the 31-retry budget on a doomed boot path.
     // The hardcoded list mirrors the coverage-skip surface other
     // sites guard locally; deferral until a non-instrumented /init
@@ -2042,12 +2045,13 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
     // verbatim either way.
     let bare_for_lookup = test_name.strip_prefix("ktstr/").unwrap_or(test_name);
 
-    // Coverage-skip guard, mirroring run_ktstr_test:962-971: a VM-booting
+    // Coverage-skip guard, mirroring run_ktstr_test's: a VM-booting
     // test whose guest /init trips an AP-kill exit under a
     // coverage-instrumented `current_exe` must skip cleanly here too, or
     // the ctor -> run_named_test dispatch burns the retry budget on a
-    // doomed boot (the per-test in-body skip never runs — the guest dies
-    // during boot before the test body executes).
+    // doomed boot (the per-test in-body skip cannot prevent it: the
+    // guest dies during boot, or its body's Skip is overridden by the
+    // honored host-side post_vm check).
     if let Some(entry) = find_test(bare_for_lookup)
         && !entry.host_only
         && crate::test_support::current_binary_is_coverage_instrumented()
