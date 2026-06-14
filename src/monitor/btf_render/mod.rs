@@ -1579,15 +1579,17 @@ fn try_render_cpumask_bits(bytes: &[u8], max_cpus: u32) -> Option<RenderedValue>
         if word == 0 {
             continue;
         }
-        // Pointer-shape heuristic: values larger than 2^32 with
-        // more than 64 CPUs already collected likely indicate
-        // we've walked past the bitmap end into adjacent data
-        // (a kernel address is much larger than a sensible
-        // CPU-bit pattern). Apply the gate BEFORE pushing this
-        // word's bits — pushing then bailing would have already
-        // contaminated `set_cpus` with up to 64 garbage entries
-        // from the suspect word.
-        if word > 0xFFFF_FFFF && set_cpus.len() > 64 {
+        // Pointer-shape gate (mirrors the kptr-cpumask path below):
+        // slab garbage in trailing words can appear as a high-bit-set
+        // u64 that would enumerate phantom CPU IDs; bail when a later
+        // word looks like a kernel address (top byte 0xff). An all-ones
+        // word is a fully-online 64-CPU chunk, NOT a pointer, so it is
+        // decoded. The previous `word > 0xFFFF_FFFF && set_cpus.len() >
+        // 64` gate wrongly bailed on those all-ones words, silently
+        // dropping CPUs 128+ on a fully-online >128-CPU host. Apply
+        // BEFORE pushing this word's bits so a suspect word never
+        // contaminates `set_cpus`.
+        if word != u64::MAX && word >> 56 == 0xff {
             break;
         }
         for bit in 0..64 {
@@ -2155,19 +2157,24 @@ fn render_value_inner(
             } else {
                 raw as i64
             };
-            // BTF_KIND_ENUM members hold 32-bit values
-            // (`btf_rs::EnumMember::val()` returns `u32`); mask with
-            // `as u32 as u64` so the comparison stays width-truncated
-            // even if a future btf-rs API change widens the return
-            // type. Without the explicit width mask a signed-typed
-            // enum-member value sign-extended to u64 would never match
-            // the zero-extended `raw` for negative variants. Resolved
-            // variant name is best-effort: an unknown raw value yields
-            // `None` rather than failing the render.
+            // Width-truncate the member value to the enum's actual byte
+            // width before comparing. `raw` is read from `needed` bytes
+            // (zero-extended into a u64), but a member's stored value for
+            // a signed variant is the full 32-bit value (e.g. -1 →
+            // 0xFFFF_FFFF). For a sub-4-byte signed enum the member value
+            // would never match the narrower `raw` without masking, so
+            // the variant name would be silently lost. Resolved name is
+            // best-effort: an unknown raw value yields `None` rather than
+            // failing the render.
+            let val_mask: u64 = if needed * 8 >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << (needed * 8)) - 1
+            };
             let variant = e
                 .members
                 .iter()
-                .find(|m| m.val() as u64 == raw)
+                .find(|m| (m.val() as u64) & val_mask == raw)
                 .and_then(|m| btf.resolve_name(m).ok());
             RenderedValue::Enum {
                 bits: (needed * 8) as u32,
@@ -2194,10 +2201,18 @@ fn render_value_inner(
             } else {
                 raw as i64
             };
+            // Width-truncate the member value to the enum's byte width
+            // (see the Enum32 arm) so sub-8-byte signed variants resolve
+            // their name instead of falling back to the bare integer.
+            let val_mask: u64 = if needed * 8 >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << (needed * 8)) - 1
+            };
             let variant = e
                 .members
                 .iter()
-                .find(|m| m.val() == raw)
+                .find(|m| (m.val() & val_mask) == raw)
                 .and_then(|m| btf.resolve_name(m).ok());
             RenderedValue::Enum {
                 bits: (needed * 8) as u32,

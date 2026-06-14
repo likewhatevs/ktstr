@@ -1007,6 +1007,25 @@ fn try_render_cpumask_bits_single_word_high_bit() {
 }
 
 #[test]
+fn try_render_cpumask_bits_fully_online_above_128_cpus() {
+    // Four all-ones u64 words = CPUs 0-255 fully online. The old
+    // `word > 0xFFFF_FFFF && set_cpus.len() > 64` gate bailed at word 2,
+    // silently dropping CPUs 128-255; the all-ones-exempting gate (mirror
+    // of the kptr path) must render the full set.
+    let bytes = [0xFFu8; 32];
+    let v = try_render_cpumask_bits(&bytes, 256);
+    match v {
+        Some(RenderedValue::CpuList { cpus }) => {
+            assert_eq!(
+                cpus, "0-255",
+                "fully-online 256-CPU mask must render all CPUs, got {cpus}"
+            );
+        }
+        other => panic!("expected CpuList 0-255, got {other:?}"),
+    }
+}
+
+#[test]
 fn try_render_cpumask_bits_caps_at_nr_cpu_ids() {
     // 8 CPUs: bits 0..=7 are real, bits 8..=63 are slab padding
     // / freelist garbage. With max_cpus=8, only bits 0..=7
@@ -1106,6 +1125,37 @@ fn try_render_cpumask_bits_garbage_capped_at_max_cpus() {
             );
         }
         other => panic!("expected CpuList 0-3, got {other:?}"),
+    }
+}
+
+/// A multi-word inline cpumask whose trailing word carries the
+/// canonical kernel-pointer top byte (`0xff..`) but is NOT all-ones
+/// must trigger the per-word plausibility break (mod.rs:1592,
+/// `word != u64::MAX && word >> 56 == 0xff`) — that word is slab /
+/// pointer garbage, not online CPUs. word0 = 0b11 (cpus 0,1); word1 =
+/// 0xff00_0000_0000_0000 (top byte 0xff; bits 120-127 if trusted).
+/// max_cpus = 256 is well past word1, so the cap is NOT what stops the
+/// walk (that path is pinned by
+/// `try_render_cpumask_bits_garbage_capped_at_max_cpus`) — only the
+/// 0xff break can drop word1, so the result is "0-1", never
+/// "0-1,120-127". The all-ones EXEMPTION side (a fully-online >128-CPU
+/// host) is pinned by `try_render_cpumask_bits_fully_online_above_128_cpus`.
+#[test]
+fn try_render_cpumask_bits_kptr_pattern_word_breaks_walk() {
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&0b11u64.to_le_bytes());
+    // Top byte 0xff, rest zero: a kernel-pointer-class word, distinct
+    // from all-ones (a legitimately fully-online 64-CPU chunk).
+    let w1: u64 = 0xff00_0000_0000_0000;
+    bytes[8..16].copy_from_slice(&w1.to_le_bytes());
+    let v = try_render_cpumask_bits(&bytes, 256);
+    match v {
+        Some(RenderedValue::CpuList { cpus }) => assert_eq!(
+            cpus, "0-1",
+            "0xff-top-byte word must break the walk; only cpus 0,1 from \
+             word0 may surface (the cap is well past word1), got: {cpus}",
+        ),
+        other => panic!("expected CpuList 0-1, got {other:?}"),
     }
 }
 
@@ -3087,6 +3137,94 @@ fn render_bitfield_signed_enum_base_decodes_negative_int() {
         sole_member_value(&v),
         &RenderedValue::Int { bits: 8, value: -1 }
     );
+}
+
+#[test]
+fn render_sub_byte_signed_enum_resolves_negative_variant_name() {
+    // A 1-byte signed enum E { NEG = -1 } rendered directly. `raw` reads
+    // 1 byte (0xFF); the member's stored value is the full 0xFFFF_FFFF.
+    // Width-truncating the member value to the enum's byte width before
+    // compare resolves the variant name — without it the name was
+    // silently dropped (the value rendered correctly as -1, but the
+    // human-readable "NEG" was lost on sub-4-byte signed enums).
+    let mut strings: Vec<u8> = vec![0];
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let n_e = push(&mut strings, "E");
+    let n_neg = push(&mut strings, "NEG");
+    let types = vec![CastSynType::Enum {
+        name_off: n_e,
+        size: 1,
+        signed: true,
+        members: vec![(n_neg, 0xFFFF_FFFFu32)],
+    }];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let v = render_value(&btf, 1, &[0xFF]);
+    assert_eq!(v, enum_v(8, -1, Some("NEG"), true));
+}
+
+#[test]
+fn render_sub_byte_signed_enum64_resolves_negative_variant_name() {
+    // BTF_KIND_ENUM64 mirror of the Enum32 sub-byte case: a 4-byte
+    // signed enum64 E { NEG = -1 } whose member is stored as the full
+    // u64 (u64::MAX for -1). `raw` reads `needed`=4 bytes (0xFFFF_FFFF);
+    // the Enum64 width-mask (mod.rs val_mask, needed*8=32 < 64 →
+    // (1<<32)-1) truncates the member before compare so "NEG" resolves.
+    // Without the mask the member u64::MAX != raw 0xFFFF_FFFF and the
+    // variant name was silently dropped on sub-8-byte signed enum64s.
+    let mut strings: Vec<u8> = vec![0];
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let n_e = push(&mut strings, "E64");
+    let n_neg = push(&mut strings, "NEG");
+    let types = vec![CastSynType::Enum64 {
+        name_off: n_e,
+        size: 4,
+        signed: true,
+        members: vec![(n_neg, u64::MAX)],
+    }];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let v = render_value(&btf, 1, &[0xFF, 0xFF, 0xFF, 0xFF]);
+    assert_eq!(v, enum_v(32, -1, Some("NEG"), true));
+}
+
+#[test]
+fn render_full_width_signed_enum64_resolves_negative_variant_name() {
+    // size=8 enum64: `needed`=8 → needed*8 == 64 ≥ 64, so val_mask is
+    // u64::MAX — the branch that avoids `1u64 << 64` UB. member u64::MAX,
+    // raw 8×0xFF (u64::MAX) → value -1, (member & u64::MAX) == raw →
+    // "NEG" resolves. Pins the needed=8 boundary distinct from the
+    // sub-byte path; the only other size=8 enum64 test goes through the
+    // bitfield path and asserts the Int value, never the variant name.
+    let mut strings: Vec<u8> = vec![0];
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let n_e = push(&mut strings, "E64");
+    let n_neg = push(&mut strings, "NEG");
+    let types = vec![CastSynType::Enum64 {
+        name_off: n_e,
+        size: 8,
+        signed: true,
+        members: vec![(n_neg, u64::MAX)],
+    }];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let v = render_value(&btf, 1, &[0xFF; 8]);
+    assert_eq!(v, enum_v(64, -1, Some("NEG"), true));
 }
 
 #[test]
