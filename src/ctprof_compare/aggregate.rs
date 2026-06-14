@@ -280,7 +280,14 @@ impl fmt::Display for Aggregated {
 pub(super) fn merge_aggregated_into(existing: &mut Aggregated, val: &Aggregated) {
     match (existing, val) {
         (Aggregated::Sum(s), Aggregated::Sum(v)) => {
-            *s += v;
+            // saturating_add to match the canonical aggregation
+            // (`Summable::sum_across`, metric_types.rs): a corrupt or
+            // hostile reading that would push the merged sum past
+            // u64::MAX saturates rather than wrapping (release) or
+            // panicking (debug). This N:1 fudge merge composes
+            // already-aggregated Sum values, so the overflow is
+            // reachable on adversarial input.
+            *s = (*s).saturating_add(*v);
         }
         (Aggregated::Max(m), Aggregated::Max(v)) => {
             *m = (*m).max(*v);
@@ -302,9 +309,16 @@ pub(super) fn merge_aggregated_into(existing: &mut Aggregated, val: &Aggregated)
                 total: vtot,
             },
         ) => {
-            *total += vtot;
+            // saturating_add on the tally totals/counts for parity
+            // with the codebase's other counter merges (frac_pair's
+            // saturating_add, aggregate_finite's checked_add) — a
+            // tally is bounded by the sample population today, but
+            // unchecked `+=` would panic in debug / wrap in release if
+            // that ever changed, inconsistent with sibling sites.
+            *total = (*total).saturating_add(*vtot);
             for (k, c) in vt {
-                *et.entry(k.clone()).or_insert(0) += c;
+                let e = et.entry(k.clone()).or_insert(0);
+                *e = (*e).saturating_add(*c);
             }
         }
         (Aggregated::Affinity(es), Aggregated::Affinity(vs)) => {
@@ -361,4 +375,22 @@ pub(super) fn format_cpu_range(cpus: &[u32]) -> String {
         out.push_str(&format!("{start}-{prev}"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The N:1 fudge merge composes already-aggregated `Sum(u64)`
+    /// values; merging two `u64::MAX` must saturate (matching
+    /// `Summable::sum_across`), not wrap in release or panic in debug.
+    #[test]
+    fn merge_sum_saturates_at_u64_max() {
+        let mut existing = Aggregated::Sum(u64::MAX);
+        merge_aggregated_into(&mut existing, &Aggregated::Sum(u64::MAX));
+        let Aggregated::Sum(s) = existing else {
+            panic!("expected Sum variant");
+        };
+        assert_eq!(s, u64::MAX, "merged Sum must saturate, not wrap");
+    }
 }
