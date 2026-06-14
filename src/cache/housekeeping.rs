@@ -133,6 +133,54 @@ pub(crate) fn atomic_swap_dirs(src: &Path, dst: &Path) -> anyhow::Result<()> {
     })
 }
 
+/// Flush a fully-populated staging directory to stable storage before
+/// it is published via a rename(2). fsyncs every regular file directly
+/// in `dir` (their data + metadata), then fsyncs `dir` itself (its
+/// directory entries). Pairs with [`fsync_parent`] — called on the
+/// published path AFTER the rename — to form the crash-consistent
+/// atomic-publish idiom: the same fsync → rename → parent-fsync
+/// sequence the freeze coordinator uses for single files, extended to
+/// a directory rename.
+///
+/// `dir` is treated as flat: both cache layers that publish a directory
+/// — [`super::cache_dir::CacheDir::store`] and
+/// `vmm::disk_template::store_atomic` — stage flat directories (a kernel
+/// image plus optional vmlinux plus metadata.json, or a single template
+/// image). Nested subdirectories are not recursed into.
+///
+/// Durability here is opportunistic: callers log and continue on error
+/// rather than failing the publish. Each cache layer validates on read
+/// and rebuilds the common crash-torn cases (a zeroed or truncated entry
+/// fails validation → cache miss → rebuild), so a failed fsync usually
+/// costs only a redundant post-crash rebuild. The narrow residual it
+/// does NOT cover — a crash leaving a layer's validation bytes durable
+/// but later blocks torn — surfaces loudly at the consumer (see each
+/// call site), never as silent host-side data loss: the published
+/// artifact is a per-test scratch disk or a boot/probe input, never a
+/// host-parsed or shared file.
+pub(crate) fn fsync_staging_dir(dir: &Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            fs::File::open(entry.path())?.sync_all()?;
+        }
+    }
+    // Open the directory read-only and fsync it so the dentries written
+    // into it are durable before the directory is renamed into place.
+    fs::File::open(dir)?.sync_all()
+}
+
+/// fsync the parent directory of `path` so a rename(2) that placed
+/// `path` into it is durable across a host crash. No-op when `path`
+/// has no parent. See [`fsync_staging_dir`] for the publish-durability
+/// contract and why callers treat failure as non-fatal.
+pub(crate) fn fsync_parent(path: &Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(parent) => fs::File::open(parent)?.sync_all(),
+        None => Ok(()),
+    }
+}
+
 /// Read and deserialize metadata.json from a cache entry directory.
 ///
 /// On failure returns a human-readable reason with a distinct prefix
@@ -515,6 +563,93 @@ mod tests {
             b"must-not-be-deleted",
             "target file content must be unchanged",
         );
+    }
+
+    // -- fsync_staging_dir / fsync_parent durability primitives --
+    //
+    // These flush a staged cache entry + the cache root before/after
+    // the publish rename. fsync's crash-survival effect can't be
+    // unit-tested (needs a real power loss), so coverage verifies the
+    // functional contract: the calls succeed over the shapes both cache
+    // layers produce, leave content intact (fsync flushes, never
+    // mutates), honor the flat-dir contract (no recursion), and surface
+    // I/O errors rather than silently succeeding.
+
+    /// fsyncs a populated flat staging dir without error and leaves
+    /// file contents intact.
+    #[test]
+    fn fsync_staging_dir_flushes_flat_dir_contents_intact() {
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("image"), b"image-bytes").unwrap();
+        std::fs::write(staging.join("metadata.json"), b"{}").unwrap();
+
+        fsync_staging_dir(&staging).expect("fsync of a populated flat dir must succeed");
+        assert_eq!(
+            std::fs::read(staging.join("image")).unwrap(),
+            b"image-bytes",
+            "fsync must not mutate file contents",
+        );
+        assert_eq!(std::fs::read(staging.join("metadata.json")).unwrap(), b"{}");
+    }
+
+    /// An empty staging dir fsyncs the directory itself with no files
+    /// to flush.
+    #[test]
+    fn fsync_staging_dir_empty_dir_ok() {
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join("empty");
+        std::fs::create_dir_all(&staging).unwrap();
+        fsync_staging_dir(&staging).expect("fsync of an empty dir must succeed");
+    }
+
+    /// A nested subdirectory is not recursed into (the helper documents
+    /// a flat contract): the subdir is skipped via `is_file()`, the call
+    /// still succeeds, and the subdir's contents are untouched.
+    #[test]
+    fn fsync_staging_dir_skips_subdirs() {
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join("staging");
+        std::fs::create_dir_all(staging.join("subdir")).unwrap();
+        std::fs::write(staging.join("subdir/inner"), b"inner").unwrap();
+        std::fs::write(staging.join("top"), b"top").unwrap();
+        fsync_staging_dir(&staging)
+            .expect("flat fsync over a dir containing a subdir must succeed");
+        assert_eq!(
+            std::fs::read(staging.join("subdir/inner")).unwrap(),
+            b"inner",
+            "the un-recursed subdir's contents must be untouched",
+        );
+    }
+
+    /// A nonexistent staging dir surfaces the `read_dir` error rather
+    /// than silently succeeding.
+    #[test]
+    fn fsync_staging_dir_missing_dir_errs() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("never-created");
+        assert!(
+            fsync_staging_dir(&missing).is_err(),
+            "fsync of a nonexistent dir must surface the read_dir error",
+        );
+    }
+
+    /// fsync_parent fsyncs the containing directory of a path that has
+    /// an existing parent.
+    #[test]
+    fn fsync_parent_flushes_containing_dir() {
+        let tmp = TempDir::new().unwrap();
+        let child = tmp.path().join("entry");
+        std::fs::create_dir_all(&child).unwrap();
+        fsync_parent(&child).expect("fsync_parent on a path with an existing parent must succeed");
+    }
+
+    /// fsync_parent on a parent-less path is a no-op `Ok` — it never
+    /// errors trying to open a missing parent.
+    #[test]
+    fn fsync_parent_no_parent_is_ok() {
+        fsync_parent(Path::new("/")).expect("root path has no parent → no-op Ok");
     }
 
     // -- validate_cache_key unit tests --

@@ -727,6 +727,26 @@ pub(crate) fn store_atomic(fs: Filesystem, key: &str, src_path: &Path) -> Result
         let _ = std::fs::remove_dir_all(&staging);
         return Err(e).with_context(|| format!("rename {src_path:?} -> {staging_image:?}"));
     }
+    // Durability: fsync the staged image data + the staging directory
+    // before the publish rename so a host crash is less likely to leave
+    // the cache pointing at a torn image. Best-effort — lookup re-checks
+    // the 8-byte superblock magic on every read, so a zeroed/truncated
+    // image re-detects as a cache miss and rebuilds. The residual it
+    // does NOT catch is a crash leaving the magic bytes durable but
+    // later blocks torn: that image passes the magic check and is
+    // reflinked, but the corruption surfaces at guest mount (kernel
+    // superblock/mount validation + fs metadata checksums) — a loud
+    // test failure on a per-test scratch disk, never silent (the host
+    // never parses the image content).
+    if let Err(e) = crate::cache::fsync_staging_dir(&staging) {
+        tracing::warn!(
+            err = %e,
+            staging = %staging.display(),
+            "fsync of staged template before publish failed; entry will be \
+             published without the durability barrier (validate-on-read \
+             remains the correctness backstop)",
+        );
+    }
     // Final atomic publish. On failure the staging directory now
     // contains `staging_image` (the first rename moved src_path into
     // it and is not reversible). Without the cleanup arm below the
@@ -739,6 +759,16 @@ pub(crate) fn store_atomic(fs: Filesystem, key: &str, src_path: &Path) -> Result
         return Err(e).with_context(|| {
             format!("publish staging {staging:?} -> {final_dir:?} (cache key {key})",)
         });
+    }
+    // Persist the publish rename itself: fsync the cache root so the new
+    // entry name survives a crash. Best-effort, same rationale.
+    if let Err(e) = crate::cache::fsync_parent(&final_dir) {
+        tracing::warn!(
+            err = %e,
+            final_dir = %final_dir.display(),
+            "fsync of cache root after publish failed; the rename may not \
+             survive a crash (validate-on-read backstop)",
+        );
     }
     Ok(final_dir.join(TEMPLATE_FILENAME))
 }
