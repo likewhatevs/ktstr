@@ -2645,13 +2645,19 @@ const CAST_BTF_KIND_CONST: u32 = 10;
 /// `Type::TypeTag`. Models a `__kptr` tag wrapping a pointer, the
 /// realistic shape of a `struct bpf_cpumask __kptr *` member/global.
 const CAST_BTF_KIND_TYPE_TAG: u32 = 18;
+/// `BTF_KIND_ENUM` per `btf-rs` — kind 6 maps to `Type::Enum`. Used
+/// by the bitfield tests with a signed-enum base.
+const CAST_BTF_KIND_ENUM: u32 = 6;
+/// `BTF_KIND_ENUM64` per `btf-rs` — kind 19 maps to `Type::Enum64`.
+/// Used by the bitfield tests with a signed-enum64 base.
+const CAST_BTF_KIND_ENUM64: u32 = 19;
 
 /// Build a minimal BTF blob containing `types` (id=1..) and a
 /// string-section payload `strings` (must start with `\0`). The
 /// header layout matches `cast_analysis::tests::build_btf`:
-/// 24-byte header, type section, string section. Only the kinds
-/// the renderer's cast intercept exercises (Int, Struct) are
-/// supported here.
+/// 24-byte header, type section, string section. Supports the BTF
+/// kinds the renderer tests exercise: Int, Struct, BitfieldStruct,
+/// Enum, Enum64, Typedef, Const, TypeTag, Ptr, Fwd.
 fn cast_build_btf(types: &[CastSynType], strings: &[u8]) -> Vec<u8> {
     let mut type_section = Vec::new();
     for ty in types {
@@ -2740,6 +2746,73 @@ fn cast_build_btf(types: &[CastSynType], strings: &[u8]) -> Vec<u8> {
                 type_section.extend_from_slice(&info.to_le_bytes());
                 type_section.extend_from_slice(&0u32.to_le_bytes());
             }
+            CastSynType::BitfieldStruct {
+                name_off,
+                size,
+                members,
+            } => {
+                // A BTF_KIND_STRUCT emitted with kind_flag == 1 (info
+                // bit 31): btf-rs then decodes each member offset word
+                // as bitfield_size<<24 | (bit_offset & 0xffffff) and
+                // Member::bitfield_size returns Some.
+                type_section.extend_from_slice(&name_off.to_le_bytes());
+                let vlen = members.len() as u32;
+                let info = ((CAST_BTF_KIND_STRUCT << 24) & 0x1f00_0000)
+                    | (vlen & 0xffff)
+                    | (1u32 << 31);
+                type_section.extend_from_slice(&info.to_le_bytes());
+                type_section.extend_from_slice(&size.to_le_bytes());
+                for m in members {
+                    type_section.extend_from_slice(&m.name_off.to_le_bytes());
+                    type_section.extend_from_slice(&m.type_id.to_le_bytes());
+                    let off_word = (m.bitfield_size << 24) | (m.bit_offset & 0x00ff_ffff);
+                    type_section.extend_from_slice(&off_word.to_le_bytes());
+                }
+            }
+            CastSynType::Enum {
+                name_off,
+                size,
+                signed,
+                members,
+            } => {
+                // BTF_KIND_ENUM: name_off + info + size_type, then vlen *
+                // btf_enum{ name_off(4), val(4) }. `signed` sets info
+                // bit 31, which btf-rs Enum::is_signed reads.
+                type_section.extend_from_slice(&name_off.to_le_bytes());
+                let vlen = members.len() as u32;
+                let kf = if *signed { 1u32 << 31 } else { 0 };
+                let info = ((CAST_BTF_KIND_ENUM << 24) & 0x1f00_0000) | (vlen & 0xffff) | kf;
+                type_section.extend_from_slice(&info.to_le_bytes());
+                type_section.extend_from_slice(&size.to_le_bytes());
+                for (m_name_off, val) in members {
+                    type_section.extend_from_slice(&m_name_off.to_le_bytes());
+                    type_section.extend_from_slice(&val.to_le_bytes());
+                }
+            }
+            CastSynType::Enum64 {
+                name_off,
+                size,
+                signed,
+                members,
+            } => {
+                // BTF_KIND_ENUM64: name_off + info + size_type, then
+                // vlen * btf_enum64{ name_off(4), val_lo32(4),
+                // val_hi32(4) }. `signed` sets info bit 31
+                // (Enum64::is_signed); val() reconstructs (hi<<32)|lo.
+                type_section.extend_from_slice(&name_off.to_le_bytes());
+                let vlen = members.len() as u32;
+                let kf = if *signed { 1u32 << 31 } else { 0 };
+                let info = ((CAST_BTF_KIND_ENUM64 << 24) & 0x1f00_0000) | (vlen & 0xffff) | kf;
+                type_section.extend_from_slice(&info.to_le_bytes());
+                type_section.extend_from_slice(&size.to_le_bytes());
+                for (m_name_off, val) in members {
+                    type_section.extend_from_slice(&m_name_off.to_le_bytes());
+                    let lo = (*val & 0xffff_ffff) as u32;
+                    let hi = (*val >> 32) as u32;
+                    type_section.extend_from_slice(&lo.to_le_bytes());
+                    type_section.extend_from_slice(&hi.to_le_bytes());
+                }
+            }
         }
     }
 
@@ -2768,6 +2841,20 @@ struct CastSynMember {
     name_off: u32,
     type_id: u32,
     byte_offset: u32,
+}
+
+/// A bitfield member for [`CastSynType::BitfieldStruct`]. The parent
+/// struct is emitted with `kind_flag == 1`, so `btf-rs`
+/// `Member::bitfield_size` returns `Some(bitfield_size)` and
+/// `Member::bit_offset` returns `bit_offset` (the low 24 bits of the
+/// packed offset word). `bit_offset` is a RAW bit offset (not bytes);
+/// `bitfield_size` is the field width in bits.
+#[derive(Clone, Copy)]
+struct CastSynBitMember {
+    name_off: u32,
+    type_id: u32,
+    bit_offset: u32,
+    bitfield_size: u32,
 }
 
 enum CastSynType {
@@ -2814,6 +2901,370 @@ enum CastSynType {
     /// program only references it via pointer; the program's BTF
     /// then carries `Fwd` rather than the full `Struct`.
     Fwd { name_off: u32, is_union: bool },
+    /// A `BTF_KIND_STRUCT` emitted with `kind_flag == 1` so its members
+    /// are bitfields: `btf-rs` decodes each member offset word as
+    /// `bitfield_size << 24 | bit_offset` and `Member::bitfield_size`
+    /// returns `Some`. The plain [`Struct`](Self::Struct) variant keeps
+    /// `kind_flag == 0` (byte-aligned members); this variant isolates
+    /// the bitfield encoding so non-bitfield tests stay noise-free.
+    BitfieldStruct {
+        name_off: u32,
+        size: u32,
+        members: Vec<CastSynBitMember>,
+    },
+    /// `BTF_KIND_ENUM` (kind=6). 32-bit-valued enum. `signed` sets the
+    /// info-word `kind_flag` (bit 31), which `btf-rs` `Enum::is_signed`
+    /// reads. Each `(name_off, val)` is a `btf_enum` record.
+    Enum {
+        name_off: u32,
+        size: u32,
+        signed: bool,
+        members: Vec<(u32, u32)>,
+    },
+    /// `BTF_KIND_ENUM64` (kind=19). 64-bit-valued enum. `signed` sets
+    /// the info-word `kind_flag` (bit 31), read by `Enum64::is_signed`.
+    /// Each `(name_off, val)` is a `btf_enum64` record (val split into
+    /// lo/hi 32-bit halves on the wire).
+    Enum64 {
+        name_off: u32,
+        size: u32,
+        signed: bool,
+        members: Vec<(u32, u64)>,
+    },
+}
+
+// -- render_bitfield coverage --
+//
+// render_bitfield (mod.rs ~4490) decodes a struct bitfield member. It
+// is reached from render_member only when the owning struct has
+// kind_flag == 1 and the member width > 0, which the synthetic builder
+// expresses via CastSynType::BitfieldStruct + CastSynBitMember. The
+// width == 0 branch is unreachable through render_value (render_member
+// filters width == 0), so it is exercised by a direct render_bitfield
+// call.
+
+/// Pull the sole member's value out of a rendered single-member
+/// struct, transparently peeling the `Truncated` wrapper that
+/// `render_struct` adds when `bytes.len() < struct size`.
+fn sole_member_value(v: &RenderedValue) -> &RenderedValue {
+    match v {
+        RenderedValue::Struct { members, .. } => {
+            assert_eq!(members.len(), 1, "expected exactly one member");
+            &members[0].value
+        }
+        RenderedValue::Truncated { partial, .. } => sole_member_value(partial),
+        other => panic!("expected Struct/Truncated, got {other:?}"),
+    }
+}
+
+#[test]
+fn render_bitfield_unsigned_multibit_at_nonzero_offset_decodes_exact() {
+    // struct B { u64 f : 12; } with the field placed at bit offset 4.
+    // 8 bytes little-endian = 0x0000_0000_0000_ABC0 -> (val>>4)&0xFFF = 0xABC.
+    let mut strings: Vec<u8> = vec![0];
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let n_u64 = push(&mut strings, "u64");
+    let n_b = push(&mut strings, "B");
+    let n_f = push(&mut strings, "f");
+    let types = vec![
+        CastSynType::Int {
+            name_off: n_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        CastSynType::BitfieldStruct {
+            name_off: n_b,
+            size: 8,
+            members: vec![CastSynBitMember {
+                name_off: n_f,
+                type_id: 1,
+                bit_offset: 4,
+                bitfield_size: 12,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let bytes = 0xABC0u64.to_le_bytes();
+    let v = render_value(&btf, 2, &bytes);
+    assert_eq!(
+        sole_member_value(&v),
+        &RenderedValue::Uint {
+            bits: 12,
+            value: 0xABC,
+        }
+    );
+}
+
+#[test]
+fn render_bitfield_signed_int_base_decodes_negative() {
+    // struct B { int f : 4; } at bit offset 0; byte 0x0F -> raw 0xF ->
+    // sign_extend(0xF, 4) = -1.
+    let mut strings: Vec<u8> = vec![0];
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let n_int = push(&mut strings, "int");
+    let n_b = push(&mut strings, "B");
+    let n_f = push(&mut strings, "f");
+    let types = vec![
+        // encoding=1 sets BTF_INT_SIGNED.
+        CastSynType::Int {
+            name_off: n_int,
+            size: 4,
+            encoding: 1,
+            offset: 0,
+            bits: 32,
+        },
+        CastSynType::BitfieldStruct {
+            name_off: n_b,
+            size: 4,
+            members: vec![CastSynBitMember {
+                name_off: n_f,
+                type_id: 1,
+                bit_offset: 0,
+                bitfield_size: 4,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let v = render_value(&btf, 2, &[0x0F, 0x00, 0x00, 0x00]);
+    assert_eq!(
+        sole_member_value(&v),
+        &RenderedValue::Int {
+            bits: 4,
+            value: -1,
+        }
+    );
+}
+
+#[test]
+fn render_bitfield_signed_enum_base_decodes_negative_int() {
+    // struct B { enum E f : 8; } where E is signed (a negative variant).
+    // render_bitfield routes signed enum bases through the Int arm, so
+    // the result is Int{-1}, NOT Enum.
+    let mut strings: Vec<u8> = vec![0];
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let n_e = push(&mut strings, "E");
+    let n_neg = push(&mut strings, "NEG");
+    let n_b = push(&mut strings, "B");
+    let n_f = push(&mut strings, "f");
+    let types = vec![
+        // id 1: signed enum E { NEG = -1 } size 4.
+        CastSynType::Enum {
+            name_off: n_e,
+            size: 4,
+            signed: true,
+            members: vec![(n_neg, 0xFFFF_FFFFu32)],
+        },
+        CastSynType::BitfieldStruct {
+            name_off: n_b,
+            size: 4,
+            members: vec![CastSynBitMember {
+                name_off: n_f,
+                type_id: 1,
+                bit_offset: 0,
+                bitfield_size: 8,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let v = render_value(&btf, 2, &[0xFF, 0x00, 0x00, 0x00]);
+    assert_eq!(
+        sole_member_value(&v),
+        &RenderedValue::Int {
+            bits: 8,
+            value: -1,
+        }
+    );
+}
+
+#[test]
+fn render_bitfield_signed_enum64_base_decodes_negative_int() {
+    // Same as the Enum case but with a BTF_KIND_ENUM64 (kind 19) base.
+    let mut strings: Vec<u8> = vec![0];
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let n_e = push(&mut strings, "E64");
+    let n_neg = push(&mut strings, "NEG");
+    let n_b = push(&mut strings, "B");
+    let n_f = push(&mut strings, "f");
+    let types = vec![
+        CastSynType::Enum64 {
+            name_off: n_e,
+            size: 8,
+            signed: true,
+            members: vec![(n_neg, u64::MAX)],
+        },
+        CastSynType::BitfieldStruct {
+            name_off: n_b,
+            size: 8,
+            members: vec![CastSynBitMember {
+                name_off: n_f,
+                type_id: 1,
+                bit_offset: 0,
+                bitfield_size: 8,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let v = render_value(&btf, 2, &[0xFF, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        sole_member_value(&v),
+        &RenderedValue::Int {
+            bits: 8,
+            value: -1,
+        }
+    );
+}
+
+#[test]
+fn render_bitfield_width_over_64_is_unsupported() {
+    // width=65 reaches render_bitfield (render_member passes any width>0)
+    // and is rejected by the width>64 guard.
+    let mut strings: Vec<u8> = vec![0];
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let n_u64 = push(&mut strings, "u64");
+    let n_b = push(&mut strings, "B");
+    let n_f = push(&mut strings, "f");
+    let types = vec![
+        CastSynType::Int {
+            name_off: n_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        CastSynType::BitfieldStruct {
+            name_off: n_b,
+            size: 16,
+            members: vec![CastSynBitMember {
+                name_off: n_f,
+                type_id: 1,
+                bit_offset: 0,
+                bitfield_size: 65,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let v = render_value(&btf, 2, &[0u8; 16]);
+    match sole_member_value(&v) {
+        RenderedValue::Unsupported { reason } => {
+            assert!(
+                reason.contains("out of range"),
+                "unexpected reason: {reason}"
+            );
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+#[test]
+fn render_bitfield_width_zero_is_unsupported_direct() {
+    // render_member filters width==0 before calling render_bitfield, so
+    // exercise render_bitfield's own width==0 rejection directly.
+    // render_bitfield is module-private; the tests submodule reaches it
+    // via super::. A 1-type BTF (just a u64) supplies member_type_id.
+    let mut strings: Vec<u8> = vec![0];
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let n_u64 = push(&mut strings, "u64");
+    let types = vec![CastSynType::Int {
+        name_off: n_u64,
+        size: 8,
+        encoding: 0,
+        offset: 0,
+        bits: 64,
+    }];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let v = super::render_bitfield(&btf, 1, &[0u8; 8], 0, 0);
+    match v {
+        RenderedValue::Unsupported { reason } => {
+            assert!(
+                reason.contains("out of range"),
+                "unexpected reason: {reason}"
+            );
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+#[test]
+fn render_bitfield_straddling_end_of_bytes_is_truncated() {
+    // struct B { u64 f : 64; } size 8, but only 1 byte supplied. The
+    // member byte_off (0) is < bytes.len() (1) so render_struct does NOT
+    // skip it; render_bitfield needs 8 bytes -> Truncated.
+    let mut strings: Vec<u8> = vec![0];
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let n_u64 = push(&mut strings, "u64");
+    let n_b = push(&mut strings, "B");
+    let n_f = push(&mut strings, "f");
+    let types = vec![
+        CastSynType::Int {
+            name_off: n_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        CastSynType::BitfieldStruct {
+            name_off: n_b,
+            size: 8,
+            members: vec![CastSynBitMember {
+                name_off: n_f,
+                type_id: 1,
+                bit_offset: 0,
+                bitfield_size: 64,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let v = render_value(&btf, 2, &[0xAB]);
+    match sole_member_value(&v) {
+        RenderedValue::Truncated { needed, had, .. } => {
+            assert_eq!((*needed, *had), (8, 1));
+        }
+        other => panic!("expected Truncated, got {other:?}"),
+    }
 }
 
 /// Helper: build a string section + name offsets for the names
