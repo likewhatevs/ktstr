@@ -7371,7 +7371,7 @@ mod tests {
     /// false-positive — each gate is searched across all call sites.
     #[test]
     fn placeholder_dump_production_call_sites_are_failure_gated() {
-        let src = include_str!("eval.rs");
+        let src = include_str!("mod.rs");
         let lines: Vec<&str> = src.lines().collect();
         // Stop scanning at this test's own fn line so the
         // include_str! self-reference (the filter literal below)
@@ -7502,7 +7502,7 @@ mod tests {
 
     #[test]
     fn bug_summary_line_immediately_follows_fingerprint_line_in_all_failure_messages() {
-        let src = include_str!("eval.rs");
+        let src = include_str!("mod.rs");
         let lines: Vec<&str> = src.lines().collect();
         // Stop at this test's own fn so the include_str! self-
         // reference doesn't double-count the literal pattern below.
@@ -7610,7 +7610,7 @@ mod tests {
     /// rendering it.
     #[test]
     fn bug_summary_line_renders_bug_summary_prefix_in_both_arms() {
-        let src = include_str!("eval.rs");
+        let src = include_str!("mod.rs");
         let lines: Vec<&str> = src.lines().collect();
         let opener_idx = lines
             .iter()
@@ -7693,7 +7693,7 @@ mod tests {
     /// migrate to the E2E mock harness in that case.
     #[test]
     fn matcher_dispatch_and_mismatch_marker_wiring_pinned() {
-        let src = include_str!("eval.rs");
+        let src = include_str!("mod.rs");
         let lines: Vec<&str> = src.lines().collect();
         let test_fn_marker = "fn matcher_dispatch_and_mismatch_marker_wiring_pinned";
         let scan_end = lines
