@@ -580,7 +580,7 @@ pub(crate) fn find_all_bpf_maps(ctx: &AccessorCtx<'_>, map_idr_kva: u64) -> Vec<
 /// PERCPU_HASH, RINGBUF, ARENA, …) alongside the small set of ARRAY
 /// maps the failure-dump renderer reaches through, so the savings
 /// are proportional to the reject rate.
-// Production callers go through [`GuestMemMapAccessor::find_map`] /
+// Production callers go through [`GuestMemMapAccessor::find_array_map`] /
 // [`BpfMapAccessor::maps`]; this single-shot variant is preserved
 // for the `bpf_map::tests` suite that exercises the IDR walk
 // directly.
@@ -634,7 +634,7 @@ pub(crate) fn find_bpf_map(
         // [`find_bpf_map`] is reached only by direct callers (tests
         // today; future single-shot probes that don't want to pay the
         // [`find_all_bpf_maps`] IDR walk). The freeze hot path in
-        // production goes through [`GuestMemMapAccessor::find_map`] /
+        // production goes through [`GuestMemMapAccessor::find_array_map`] /
         // [`BpfMapAccessor::maps`], which build and consult the
         // per-accessor [`maps_cache`] populated by
         // [`find_all_bpf_maps`]; that path does the full bulk read
@@ -1549,11 +1549,18 @@ impl<'a> GuestMemMapAccessor<'a> {
 
     /// Find the first BPF ARRAY map whose name ends with `name_suffix`.
     ///
-    /// Only returns `BPF_MAP_TYPE_ARRAY` maps. Use
+    /// Only returns `BPF_MAP_TYPE_ARRAY` maps — distinct from the
+    /// suffix-only [`BpfMapAccessor::find_map`] trait method. The
+    /// distinct name keeps inherent-over-trait method resolution
+    /// honest: a concrete-receiver caller that wants the ARRAY
+    /// filter (value-region read/write needs `value_kva`, which is
+    /// `Some` only for ARRAY maps) names it explicitly here, and the
+    /// compiler errors instead of silently shadowing the trait
+    /// method when the receiver type changes. Use
     /// [`BpfMapAccessor::maps`] to enumerate maps of all types.
     /// Goes through the per-accessor maps cache so repeat
-    /// `find_map` calls within one dump amortize the IDR walk.
-    pub fn find_map(&self, name_suffix: &str) -> Option<BpfMapInfo> {
+    /// `find_array_map` calls within one dump amortize the IDR walk.
+    pub fn find_array_map(&self, name_suffix: &str) -> Option<BpfMapInfo> {
         let mut guard = self.maps_cache.lock_unpoisoned();
         if guard.is_none() {
             *guard = Some(std::sync::Arc::new(find_all_bpf_maps(

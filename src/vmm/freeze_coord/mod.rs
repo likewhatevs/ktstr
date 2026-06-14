@@ -3882,7 +3882,7 @@ impl KtstrVm {
                         && let Some(owned) = owned_accessor.as_ref()
                     {
                         let accessor = owned.as_accessor();
-                        let still_valid = match accessor.find_map("probe_bp.bss") {
+                        let still_valid = match accessor.find_array_map("probe_bp.bss") {
                             Some(m) => m.value_kva == cached_bss_value_kva,
                             None => false,
                         };
@@ -3920,7 +3920,7 @@ impl KtstrVm {
                         // (vmalloc-backed) to PA via the existing
                         // GuestMem page-walk and cache the result so
                         // subsequent polls are pure DRAM reads.
-                        if let Some(map) = accessor.find_map("probe_bp.bss")
+                        if let Some(map) = accessor.find_array_map("probe_bp.bss")
                             && let Some(value_kva) = map.value_kva
                         {
                             // Bind kernel once and reuse — pre-fix
@@ -11416,7 +11416,7 @@ impl KtstrVm {
                     let mut attempt = 0u32;
                     let map_info = loop {
                         attempt += 1;
-                        if let Some(info) = accessor.find_map(&params.map_name_suffix) {
+                        if let Some(info) = accessor.find_array_map(&params.map_name_suffix) {
                             let _ = probes_ready_evt.write(1);
                             break info;
                         }
