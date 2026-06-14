@@ -153,6 +153,15 @@ pub(crate) const VIRTIO_BLK_SEG_MAX: u32 = 128;
 /// length as unbounded — host OOM hazard on a hostile guest.
 pub(crate) const VIRTIO_BLK_SIZE_MAX: u32 = 1 << 20;
 
+/// Linux's maximum iovec count (`UIO_MAXIOV`) for a single
+/// `preadv`/`pwritev`: passing `iovcnt > IOV_MAX` returns `EINVAL`.
+/// The vectored-IO paths build at most `SEG_MAX * 2 = 256` iovecs
+/// (see the SAFETY comments at the preadv/pwritev sites for the
+/// structural derivation), well under this cap; the `debug_assert`s
+/// there trip in test/debug builds if a future change ever breaks
+/// that bound.
+const IOV_MAX: usize = 1024;
+
 /// Device serial number returned by `VIRTIO_BLK_T_GET_ID`. Per
 /// virtio-v1.2 §5.2.6.4 (and `virtio_blk.h` `VIRTIO_BLK_ID_BYTES`)
 /// the kernel driver passes a 20-byte buffer (`virtblk_get_id` →
@@ -1364,6 +1373,18 @@ impl VirtioBlk {
             }
         }
 
+        // Tripwire for the structural iovec-count bound derived in the
+        // SAFETY comment below (SEG_MAX * 2 = 256 <= IOV_MAX). Debug-
+        // only (zero release cost); a future change that broke the
+        // bound trips the proptest fuzzers here instead of surfacing as
+        // a runtime `preadv` EINVAL.
+        debug_assert!(
+            iovecs.len() <= IOV_MAX,
+            "blk preadv iovcnt {} exceeds IOV_MAX {} — structural bound broke (see SAFETY comment)",
+            iovecs.len(),
+            IOV_MAX,
+        );
+
         // Empty iovec means data_len == 0 — every data descriptor in
         // the chain had len == 0. The upstream zero-data gate in
         // drain.rs gates on `data_segments.is_empty()`, NOT on
@@ -1386,20 +1407,32 @@ impl VirtioBlk {
             // the `File` which the caller (`drain_bracket_impl`)
             // owns for the duration of the drain.
             //
-            // `iovecs.len()` upper bound: `data_segments` has at
-            // most `VIRTIO_BLK_SEG_MAX` (128) entries (enforced
-            // upstream in drain.rs); `mem.get_slices(addr, len)`
-            // can return MULTIPLE slices per descriptor when its
-            // `[addr, addr+len)` range crosses one or more
-            // `GuestMemoryMmap` region boundaries. With multi-region
-            // guest memory each segment can fragment into K slices
-            // (K bounded by the number of regions the segment spans).
-            // The realistic worst case is well under `IOV_MAX = 1024`
-            // (Linux): a 1 MiB SIZE_MAX descriptor over typical
-            // GiB-scale regions produces 1 slice, and even a
-            // pathological boundary-straddle produces 2 — total
-            // bound `~SEG_MAX * regions_per_segment`, kept below
-            // 1024 by realistic region sizing.
+            // `iovecs.len()` is structurally bounded at <= 256 — a
+            // quarter of Linux's `IOV_MAX` (UIO_MAXIOV = 1024) — so
+            // `preadv` never sees `iovcnt > IOV_MAX`. Derived from
+            // three enforced/structural facts:
+            //   - at most `VIRTIO_BLK_SEG_MAX` (128) data segments:
+            //     drain.rs rejects `chain_len > SEG_MAX + 2` before
+            //     this loop runs;
+            //   - each segment is <= `VIRTIO_BLK_SIZE_MAX` (1 MiB):
+            //     drain.rs rejects `any(len > SIZE_MAX)` before this
+            //     loop runs;
+            //   - every `GuestMemoryMmap` region is >= 1 MiB and
+            //     MiB-granular: numa_mem allocates per-node memory in
+            //     whole MiB (a 0-MiB node is omitted) and the MMIO-gap
+            //     split is GiB-aligned, so even the split pieces are
+            //     MiB-granular (numa_mem.rs `push_node_regions`).
+            // `mem.get_slices(addr, len)` returns one slice per
+            // `GuestMemoryMmap` region the `[addr, addr+len)` range
+            // spans. A <= 1 MiB segment over >= 1 MiB regions crosses
+            // at most one region boundary -> at most 2 slices, so the
+            // total is at most `SEG_MAX * 2 = 256`. This is a
+            // STRUCTURAL invariant (the three facts above), NOT a
+            // code-enforced cap: if a future change lowers the minimum
+            // region size, raises SEG_MAX/SIZE_MAX, or makes
+            // `get_slices` fragment more finely (e.g. per-page),
+            // re-derive this bound or add an explicit
+            // `iovcnt <= IOV_MAX` chunking loop.
             // `base_offset` is a `u64` validated above to fit in
             // `[0, capacity_bytes]`; `capacity_bytes` is host-trusted
             // (constructed in `with_options`) so it cannot exceed
@@ -1601,6 +1634,17 @@ impl VirtioBlk {
             }
         }
 
+        // Tripwire for the structural iovec-count bound (SEG_MAX * 2 =
+        // 256 <= IOV_MAX); see the pwritev SAFETY comment below.
+        // Debug-only; a future change that broke the bound trips the
+        // proptest fuzzers here instead of a runtime `pwritev` EINVAL.
+        debug_assert!(
+            iovecs.len() <= IOV_MAX,
+            "blk pwritev iovcnt {} exceeds IOV_MAX {} — structural bound broke (see SAFETY comment)",
+            iovecs.len(),
+            IOV_MAX,
+        );
+
         if iovecs.is_empty() {
             // data_len == 0 — every data descriptor in the chain had
             // len == 0. The upstream zero-data gate in drain.rs
@@ -1619,12 +1663,11 @@ impl VirtioBlk {
         // SAFETY: identical to the preadv site above. iovecs is
         // built from live `PtrGuard`s held in `_guards`; the
         // backing fd is valid for the call (caller owns the File).
-        // `iovecs.len()` upper bound: see the preadv SAFETY comment
-        // — `data_segments` has at most SEG_MAX (128) entries and
-        // `mem.get_slices` may fragment each across region
-        // boundaries, with the realistic worst case well under
-        // `IOV_MAX = 1024` for any sane GuestMemoryMmap region
-        // sizing.
+        // `iovecs.len() <= 256 < IOV_MAX (1024)` by the same
+        // structural bound derived at the preadv SAFETY comment
+        // (SEG_MAX 128 * at most 2 region-straddles per <= 1 MiB
+        // segment over >= 1 MiB regions), so `pwritev` never sees
+        // `iovcnt > IOV_MAX`.
         let r = unsafe {
             libc::pwritev(
                 backing.as_raw_fd(),
