@@ -195,6 +195,163 @@ fn process_requests_full_write_chain() {
     assert_eq!(c.io_errors.load(Ordering::Relaxed), 0);
 }
 
+/// All-zero-length data segments on a T_OUT chain: the chain HAS
+/// data descriptors (so `data_segments` is non-empty), but every one
+/// has `len == 0`. A conforming Linux guest never emits this shape
+/// (`blk_rq_map_sg` yields only non-zero data segments), so it is a
+/// malformed/hostile chain — but the virtio-blk spec does not forbid
+/// a 0-byte data area, so the device accepts it as a 0-byte op rather
+/// than crashing. The drain's zero-data reject gates on
+/// `data_segments.is_empty()` (segment COUNT, drain.rs), so this
+/// chain PASSES the gate and reaches the vectored write helper, where
+/// the empty iovec list triggers the `record_write(0)` early-return
+/// (device.rs). Pins that such a chain is ACCEPTED as a 0-byte write
+/// (S_OK), NOT rejected — a refactor that re-gated the reject on
+/// `data_len == 0` would silently start IOERR-ing it, and this test
+/// would catch the change.
+#[test]
+fn process_requests_write_chain_all_zero_len_segments_is_zero_byte_ok() {
+    let cap = 4096u64;
+    let f = make_backed_file_with_pattern(cap, 0x00);
+    let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+    let mem = make_chain_test_mem();
+    let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+    let header_addr = GuestAddress(0x4000);
+    let data0_addr = GuestAddress(0x5000);
+    let data1_addr = GuestAddress(0x5100);
+    let status_addr = GuestAddress(0x6000);
+    write_blk_header(&mem, header_addr, VIRTIO_BLK_T_OUT, 1);
+    // header (RO) + 2 zero-length data descs (RO — T_OUT data is
+    // device-readable) + status (WRITE). Two segments make the
+    // "non-empty but every len==0" case unambiguous.
+    let descs = [
+        RawDescriptor::from(SplitDescriptor::new(
+            header_addr.0,
+            VIRTIO_BLK_OUTHDR_SIZE as u32,
+            0,
+            0,
+        )),
+        RawDescriptor::from(SplitDescriptor::new(data0_addr.0, 0, 0, 0)),
+        RawDescriptor::from(SplitDescriptor::new(data1_addr.0, 0, 0, 0)),
+        RawDescriptor::from(SplitDescriptor::new(
+            status_addr.0,
+            1,
+            VRING_DESC_F_WRITE as u16,
+            0,
+        )),
+    ];
+    mock.build_desc_chain(&descs).expect("build chain");
+    dev.set_mem(mem.clone());
+    wire_device_to_mock(&mut dev, &mock);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+    let mut status_buf = [0u8; 1];
+    mem.read_slice(&mut status_buf, status_addr).unwrap();
+    assert_eq!(
+        status_buf[0], VIRTIO_BLK_S_OK as u8,
+        "all-zero-len T_OUT must complete S_OK, not be rejected",
+    );
+    let used_idx: u16 = mem
+        .read_obj(mock.used_addr().checked_add(2).unwrap())
+        .expect("read used.idx");
+    assert_eq!(used_idx, 1, "chain marked used exactly once");
+    let c = dev.counters();
+    assert_eq!(
+        c.writes_completed.load(Ordering::Relaxed),
+        1,
+        "a 0-byte write counts as one completed write",
+    );
+    assert_eq!(
+        c.bytes_written.load(Ordering::Relaxed),
+        0,
+        "zero bytes written",
+    );
+    assert_eq!(
+        c.io_errors.load(Ordering::Relaxed),
+        0,
+        "all-zero-len chain is NOT an IO error",
+    );
+}
+
+/// Mirror of `process_requests_write_chain_all_zero_len_segments_is_zero_byte_ok`
+/// on the T_IN read path: a malformed/hostile chain whose data
+/// segments are all `len == 0` (a conforming guest never emits it)
+/// reaches the read vectored helper, where empty iovecs trigger the
+/// 0-byte early-return (device.rs) → S_OK, 0 bytes. Pins the read
+/// side of the same accepted-as-0-byte branch.
+#[test]
+fn process_requests_read_chain_all_zero_len_segments_is_zero_byte_ok() {
+    let cap = 4096u64;
+    let f = make_backed_file_with_pattern(cap, 0xAB);
+    let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+    let mem = make_chain_test_mem();
+    let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+    let header_addr = GuestAddress(0x4000);
+    let data0_addr = GuestAddress(0x5000);
+    let data1_addr = GuestAddress(0x5100);
+    let status_addr = GuestAddress(0x6000);
+    write_blk_header(&mem, header_addr, VIRTIO_BLK_T_IN, 0);
+    // header (RO) + 2 zero-length data descs (WRITE-only — T_IN data
+    // is device-writable) + status (WRITE).
+    let descs = [
+        RawDescriptor::from(SplitDescriptor::new(
+            header_addr.0,
+            VIRTIO_BLK_OUTHDR_SIZE as u32,
+            0,
+            0,
+        )),
+        RawDescriptor::from(SplitDescriptor::new(
+            data0_addr.0,
+            0,
+            VRING_DESC_F_WRITE as u16,
+            0,
+        )),
+        RawDescriptor::from(SplitDescriptor::new(
+            data1_addr.0,
+            0,
+            VRING_DESC_F_WRITE as u16,
+            0,
+        )),
+        RawDescriptor::from(SplitDescriptor::new(
+            status_addr.0,
+            1,
+            VRING_DESC_F_WRITE as u16,
+            0,
+        )),
+    ];
+    mock.build_desc_chain(&descs).expect("build chain");
+    dev.set_mem(mem.clone());
+    wire_device_to_mock(&mut dev, &mock);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+    let mut status_buf = [0u8; 1];
+    mem.read_slice(&mut status_buf, status_addr).unwrap();
+    assert_eq!(
+        status_buf[0], VIRTIO_BLK_S_OK as u8,
+        "all-zero-len T_IN must complete S_OK, not be rejected",
+    );
+    let used_idx: u16 = mem
+        .read_obj(mock.used_addr().checked_add(2).unwrap())
+        .expect("read used.idx");
+    assert_eq!(used_idx, 1, "chain marked used exactly once");
+    let c = dev.counters();
+    assert_eq!(
+        c.reads_completed.load(Ordering::Relaxed),
+        1,
+        "a 0-byte read counts as one completed read",
+    );
+    assert_eq!(
+        c.bytes_read.load(Ordering::Relaxed),
+        0,
+        "zero bytes read",
+    );
+    assert_eq!(
+        c.io_errors.load(Ordering::Relaxed),
+        0,
+        "all-zero-len chain is NOT an IO error",
+    );
+}
+
 /// Drive a chain with an UNKNOWN request type through
 /// `process_requests`. The dispatch table pre-classifies any
 /// req_type outside `T_IN`/`T_OUT`/`T_FLUSH` as
