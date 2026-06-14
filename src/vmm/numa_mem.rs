@@ -119,6 +119,66 @@ fn push_node_regions(
     }
 }
 
+/// Split `total_mib` across `nodes` nodes so every node's size is a
+/// whole 2 MiB hugepage multiple (the last node absorbs a sub-2 MiB
+/// remainder when `total_mib` is odd), the sum is exactly `total_mib`,
+/// and the split is as even as possible. Returns per-node MiB.
+///
+/// Hugepage-aligned per-node sizes keep both the guest GPA and the host
+/// VA on 2 MiB boundaries. KVM installs a 2 MiB EPT entry only when a
+/// slot's base GPA, end GPA, and the GPA-vs-HVA remainder are all 2 MiB
+/// congruent (arch/x86/kvm/x86.c `kvm_alloc_memslot_metadata`); a
+/// non-2 MiB node base/end or a GPA/HVA incongruence drops the WHOLE
+/// node slot to 4 KiB EPT, defeating the hugepage backing the perf path
+/// requested. Snapping the (approximate) even split to hugepage
+/// boundaries keeps every node fully 2 MiB-backed.
+///
+/// When `total_mib < 2 * nodes` a node cannot get even one hugepage, so
+/// the plain even split is returned unsnapped: hugepages are pointless
+/// at that size and snapping would zero out nodes.
+fn hugepage_even_split_mib(total_mib: u32, nodes: u32) -> Vec<u32> {
+    let plain_even_split = || -> Vec<u32> {
+        let per = total_mib / nodes;
+        (0..nodes)
+            .map(|i| {
+                if i == nodes - 1 {
+                    total_mib - per * (nodes - 1)
+                } else {
+                    per
+                }
+            })
+            .collect()
+    };
+    if nodes <= 1 {
+        return vec![total_mib];
+    }
+    if total_mib < 2 * nodes {
+        // Tripwire: total_mib < nodes makes the plain even split zero out
+        // non-last nodes (per = 0), silently dropping declared NUMA nodes
+        // from the layout. Unreachable in practice (the memory budget
+        // floors per-node RAM well above 1 MiB), but fail loud if it ever
+        // becomes reachable rather than silently losing nodes.
+        debug_assert!(
+            total_mib >= nodes,
+            "total_mib ({total_mib}) < numa_nodes ({nodes}): even split would zero-size nodes"
+        );
+        return plain_even_split();
+    }
+    let total_hp = total_mib / 2; // whole 2 MiB hugepages
+    let leftover_mib = total_mib % 2; // 0 or 1 MiB sub-hugepage tail
+    let base_hp = total_hp / nodes;
+    let extra = total_hp % nodes; // first `extra` nodes get one more hugepage
+    (0..nodes)
+        .map(|i| {
+            let hp = base_hp + u32::from(i < extra);
+            // The last node absorbs the sub-2 MiB tail (its end GPA is
+            // then non-2 MiB, costing only its final hugepage, not the
+            // whole slot).
+            hp * 2 + if i == nodes - 1 { leftover_mib } else { 0 }
+        })
+        .collect()
+}
+
 impl NumaMemoryLayout {
     /// Compute per-node GPA ranges from a topology and total memory.
     ///
@@ -189,15 +249,24 @@ impl NumaMemoryLayout {
                         mmio_gap,
                     );
                 } else {
-                    let per_node_mib = total_memory_mib / numa_nodes;
-                    for i in 0..numa_nodes {
-                        let mib = if i == numa_nodes - 1 {
-                            total_memory_mib - per_node_mib * (numa_nodes - 1)
-                        } else {
-                            per_node_mib
-                        };
+                    // Even split, snapped to 2 MiB hugepage multiples so
+                    // a perf-mode hugepage backing gets full 2 MiB EPT
+                    // per node (see hugepage_even_split_mib). The sum is
+                    // preserved, so e820/SRAT advertised RAM is unchanged.
+                    for (i, mib) in
+                        hugepage_even_split_mib(total_memory_mib, numa_nodes)
+                            .into_iter()
+                            .enumerate()
+                    {
                         let size = (mib as u64) << 20;
-                        push_node_regions(&mut regions, i, size, &mut linear, dram_base, mmio_gap);
+                        push_node_regions(
+                            &mut regions,
+                            i as u32,
+                            size,
+                            &mut linear,
+                            dram_base,
+                            mmio_gap,
+                        );
                     }
                 }
             }
@@ -221,7 +290,11 @@ impl NumaMemoryLayout {
         &self.regions
     }
 
-    /// Total guest memory in bytes (sum of all node regions).
+    /// Test helper — total guest memory in bytes (sum of all node
+    /// regions). Production code derives per-region hugepage counts
+    /// directly in `allocate_and_register`'s gate, so the layout total is
+    /// only needed by tests asserting the advertised RAM.
+    #[cfg(test)]
     pub fn total_bytes(&self) -> u64 {
         self.regions.iter().map(|r| r.size).sum()
     }
@@ -301,19 +374,66 @@ impl NumaMemoryLayout {
         use_hugepages: bool,
         performance_mode: bool,
     ) -> Result<AllocatedMemory> {
-        let total = self.total_bytes() as usize;
-        let memory_mib = (total >> 20) as u32;
-
+        // Gate hugepages on what the per-node mmaps will actually
+        // reserve: each node's MAP_HUGETLB span is round_up(region.size,
+        // 2 MiB), so the count is the sum of per-region div_ceil, not
+        // div_ceil(total_mib). They coincide for the snapped even-split
+        // path, but a with_nodes topology with multiple non-2 MiB nodes
+        // reserves more (per-region rounding), so gating on the global
+        // total would under-count and let a MAP_HUGETLB mmap fail on a
+        // short pool (it routes to a clean contention SKIP, but the gate
+        // should be accurate).
+        let hugepages_needed: u64 = self
+            .regions
+            .iter()
+            .map(|r| r.size.div_ceil(2 * 1024 * 1024))
+            .sum();
         let use_hugepages = use_hugepages
             || (performance_mode
-                && super::host_topology::hugepages_free()
-                    >= super::host_topology::hugepages_needed(memory_mib));
+                && super::host_topology::hugepages_free() >= hugepages_needed);
+
+        // Hugepage host-VA layout. MAP_HUGETLB | MAP_FIXED rejects
+        // (EINVAL, fs/hugetlbfs/inode.c hugetlb_get_unmapped_area) any
+        // mapping whose ADDR is not 2 MiB-aligned, so every per-node
+        // MAP_FIXED base must land on a 2 MiB boundary. The kernel
+        // auto-rounds the anonymous MAP_HUGETLB mmap LENGTH up, but a
+        // cumulative base only stays aligned if each node's VA span is a
+        // 2 MiB multiple -- so the host-VA layout is rounded up per node
+        // and the reservation base is 2 MiB-aligned. The KVM slot
+        // memory_size + the MmapRegion keep the exact region.size, so the
+        // guest topology is unchanged: a rounded tail is mapped-but-
+        // unregistered (KVM permits a userspace mapping larger than
+        // memory_size -- virt/kvm/kvm_main.c access_ok spans only
+        // memory_size). For the snapped even-split path region.size is
+        // already a 2 MiB multiple so the round is a no-op. A caller-
+        // declared (with_nodes) non-2 MiB node size also maps cleanly --
+        // its host-VA base is aligned here -- but a non-2 MiB size
+        // misaligns that node's end GPA AND, cumulatively, every later
+        // node's base GPA, so that node and all subsequent nodes drop to
+        // 4 KiB EPT (arch/x86/kvm/x86.c kvm_alloc_memslot_metadata
+        // GPA/HVA congruence). A sub-2 MiB node (a tiny total, or a tiny
+        // declared node) is likewise permitted at 4 KiB EPT rather than
+        // rejected -- an intentional divergence from qemu, which errors
+        // on a region smaller than one huge page (system/physmem.c
+        // file_ram_alloc) -- so a caller's declared topology stays
+        // bootable. Base 4 KiB pages need no rounding (align 1).
+        const HUGE_2MB: usize = 2 * 1024 * 1024;
+        let va_align = if use_hugepages { HUGE_2MB } else { 1 };
+        let round_up = |n: usize| (n + va_align - 1) & !(va_align - 1);
+        // Per-node host-VA span: hugepage-rounded when hugepages are
+        // used, exact otherwise. Drives the MAP_FIXED layout only; the
+        // KVM/MmapRegion sizes below stay at the exact region.size.
+        let va_spans: Vec<usize> = self.regions.iter().map(|r| round_up(r.size as usize)).collect();
+        // Over-reserve by one alignment unit so the reservation base
+        // (a NULL-addr mmap is only PAGE_SIZE-aligned) can be rounded up
+        // to a 2 MiB boundary without spilling past the reservation end.
+        let reserve_size: usize = va_spans.iter().sum::<usize>() + (va_align - 1);
 
         // Step 1: Reserve contiguous VA with PROT_NONE.
         let reservation = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                total,
+                reserve_size,
                 libc::PROT_NONE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
                 -1,
@@ -332,14 +452,18 @@ impl NumaMemoryLayout {
             let errno = io_err.raw_os_error().unwrap_or(0);
             return Err(super::map_transient_to_contention(
                 kvm_ioctls::Error::new(errno),
-                format!("mmap VA reservation ({} bytes) failed", total),
+                format!("mmap VA reservation ({} bytes) failed", reserve_size),
             ));
         }
 
         let guard = ReservationGuard {
             addr: reservation,
-            size: total,
+            size: reserve_size,
         };
+
+        // 2 MiB-align the layout base within the over-reserved span when
+        // using hugepages (no-op for base pages: va_align == 1).
+        let base = round_up(reservation as usize) as *mut libc::c_void;
 
         let mut guest_regions: Vec<GuestRegionMmap> = Vec::with_capacity(self.regions.len());
 
@@ -351,11 +475,14 @@ impl NumaMemoryLayout {
         // The KVM slot still pairs guest_phys_addr = gpa_start (gapped)
         // with this packed userspace_addr below.
         let mut va_offset = 0usize;
-        for region in &self.regions {
+        for (i, region) in self.regions.iter().enumerate() {
             let offset = va_offset;
+            // va_span drives the host-VA layout (hugepage-rounded);
+            // node_size is the exact size for the KVM slot + MmapRegion.
+            let va_span = va_spans[i];
             let node_size = region.size as usize;
-            va_offset += node_size;
-            let node_addr = unsafe { (reservation as *mut u8).add(offset) as *mut libc::c_void };
+            va_offset += va_span;
+            let node_addr = unsafe { (base as *mut u8).add(offset) as *mut libc::c_void };
 
             // Step 2: Per-node MAP_FIXED mmap.
             let mut flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED;
@@ -366,7 +493,7 @@ impl NumaMemoryLayout {
             let node_ptr = unsafe {
                 libc::mmap(
                     node_addr,
-                    node_size,
+                    va_span,
                     libc::PROT_READ | libc::PROT_WRITE,
                     flags,
                     -1,
@@ -386,7 +513,7 @@ impl NumaMemoryLayout {
                     kvm_ioctls::Error::new(errno),
                     format!(
                         "MAP_FIXED mmap for node {} ({} bytes) failed",
-                        region.node_id, node_size
+                        region.node_id, va_span
                     ),
                 ));
             }
@@ -567,14 +694,65 @@ mod tests {
 
     #[test]
     fn uniform_multi_numa_remainder() {
+        // 100 MiB / 3 nodes: the even split is snapped to whole 2 MiB
+        // hugepages (34/34/32, not 33/33/34) so a perf-mode hugepage
+        // backing gets full 2 MiB EPT per node; the sum is preserved.
         let topo = Topology::new(3, 3, 2, 1);
         let layout = NumaMemoryLayout::compute(&topo, 100, 0, None).unwrap();
         assert_eq!(layout.regions().len(), 3);
         let sizes: Vec<u64> = layout.regions().iter().map(|r| r.size).collect();
-        assert_eq!(sizes[0], 33 << 20);
-        assert_eq!(sizes[1], 33 << 20);
-        assert_eq!(sizes[2], 34 << 20);
+        assert_eq!(sizes, vec![34 << 20, 34 << 20, 32 << 20]);
         assert_eq!(layout.total_bytes(), 100 << 20);
+        // Every node base GPA + size is 2 MiB-aligned (the snap's whole
+        // purpose: GPA/HVA 2 MiB-congruence so KVM keeps 2 MiB EPT).
+        const TWO_MIB: u64 = 2 << 20;
+        for r in layout.regions() {
+            assert_eq!(r.gpa_start % TWO_MIB, 0, "node {} GPA not 2 MiB-aligned", r.node_id);
+            assert_eq!(r.size % TWO_MIB, 0, "node {} size not a 2 MiB multiple", r.node_id);
+        }
+    }
+
+    #[test]
+    fn hugepage_even_split_preserves_sum_and_snaps_to_2mib() {
+        // For each (total, nodes): node count preserved, sum exact, and
+        // every node a 2 MiB multiple (the last node may carry a sub-2
+        // MiB remainder for odd totals — checked separately below).
+        for (total, nodes) in [(100u32, 3u32), (512, 2), (96, 4), (200, 3), (64, 1)] {
+            let split = hugepage_even_split_mib(total, nodes);
+            assert_eq!(split.len(), nodes as usize, "{total}/{nodes}: node count");
+            assert_eq!(split.iter().sum::<u32>(), total, "{total}/{nodes}: sum changed");
+            for (i, &mib) in split.iter().enumerate() {
+                assert!(mib > 0, "{total}/{nodes}: node {i} zero-sized");
+                if i != nodes as usize - 1 {
+                    assert_eq!(mib % 2, 0, "{total}/{nodes}: node {i} ({mib}) not a 2 MiB multiple");
+                }
+            }
+            // Even totals snap with no remainder -> last node also even.
+            if total % 2 == 0 {
+                assert_eq!(split[nodes as usize - 1] % 2, 0, "{total}/{nodes}: even total, last node odd");
+            }
+        }
+    }
+
+    #[test]
+    fn hugepage_even_split_odd_total_tail_on_last_node() {
+        // Odd total: the 1 MiB sub-hugepage remainder lands on the last
+        // node only; earlier nodes stay whole 2 MiB multiples.
+        let split = hugepage_even_split_mib(101, 3);
+        assert_eq!(split.iter().sum::<u32>(), 101);
+        assert_eq!(split[0] % 2, 0);
+        assert_eq!(split[1] % 2, 0);
+        assert_eq!(split[2] % 2, 1, "odd remainder must land on the last node");
+    }
+
+    #[test]
+    fn hugepage_even_split_tiny_falls_back_to_plain_even() {
+        // total_mib < 2 * nodes: a node can't get even one hugepage, so
+        // the plain even split is returned rather than snapping nodes to
+        // zero. 4 / 3 = 1,1,2.
+        let split = hugepage_even_split_mib(4, 3);
+        assert_eq!(split.iter().sum::<u32>(), 4);
+        assert_eq!(split, vec![1, 1, 2]);
     }
 
     static TWO_NODES: [NumaNode; 2] = [NumaNode::new(2, 256), NumaNode::new(2, 256)];
@@ -759,6 +937,112 @@ mod tests {
         assert_eq!(total, 512 << 20);
         // Per-node MAP_FIXED: one GuestMemoryMmap region per node.
         assert_eq!(alloc.guest_mem.iter().count(), 2);
+    }
+
+    #[test]
+    fn allocate_hugepages_snapped_split_aligns_and_succeeds() {
+        // Coverage gap: use_hugepages=true had ZERO coverage.
+        // The snapped odd split (100 MiB / 3 -> 34/34/32) mmapped with
+        // MAP_HUGETLB | MAP_FIXED must NOT EINVAL (the bug), and every
+        // node's host VA + GPA must be 2 MiB-aligned (GPA/HVA congruence
+        // keeps full 2 MiB EPT). Host-gated on free 2 MiB hugepages; the
+        // CI-runnable guarantee is uniform_multi_numa_remainder's
+        // GPA-alignment assertion, so a skip here cannot mask the bug.
+        let topo = Topology::new(3, 3, 2, 1);
+        let layout = NumaMemoryLayout::compute(&topo, 100, 0, None).unwrap();
+        if crate::vmm::host_topology::hugepages_free()
+            < crate::vmm::host_topology::hugepages_needed(100)
+        {
+            eprintln!(
+                "SKIP allocate_hugepages_snapped_split: host has < 100 MiB of free 2 MiB hugepages"
+            );
+            return;
+        }
+        let kvm = kvm_ioctls::Kvm::new().unwrap();
+        let vm_fd = kvm.create_vm().unwrap();
+        // The bug manifested as a hard EINVAL from the MAP_HUGETLB |
+        // MAP_FIXED mmap; .expect() pins the fix.
+        let alloc = layout
+            .allocate_and_register(&vm_fd, true, false)
+            .expect("hugepage MAP_FIXED allocate must not EINVAL on a snapped odd split");
+        const TWO_MIB: usize = 2 << 20;
+        for r in layout.regions() {
+            let hva = alloc
+                .guest_mem
+                .get_host_address(GuestAddress(r.gpa_start))
+                .unwrap();
+            assert_eq!(
+                hva as usize % TWO_MIB,
+                0,
+                "node {} host VA not 2 MiB-aligned",
+                r.node_id
+            );
+            assert_eq!(
+                r.gpa_start as usize % TWO_MIB,
+                0,
+                "node {} GPA not 2 MiB-aligned",
+                r.node_id
+            );
+        }
+    }
+
+    static ODD_NODES: [NumaNode; 2] = [NumaNode::new(2, 33), NumaNode::new(2, 33)];
+
+    #[test]
+    fn allocate_hugepages_with_nodes_nonaligned_size() {
+        // Coverage: a with_nodes topology declares EXACT
+        // per-node sizes (a hard contract — they are NOT snapped). A
+        // non-2 MiB declared size (33 MiB) under use_hugepages takes the
+        // A-degradation path: the host-VA base is 2 MiB-aligned (va_span
+        // = round_up) so the MAP_HUGETLB | MAP_FIXED mmap does NOT EINVAL,
+        // while the KVM slot keeps the exact 33 MiB memory_size (the
+        // rounded tail is mapped-but-unregistered). This is the only
+        // shape where va_span != node_size on the hugepage path. Host-
+        // gated on free 2 MiB hugepages; the CI-runnable invariants are
+        // the helper + uniform_multi_numa_remainder tests above.
+        let topo = Topology::with_nodes(4, 2, &ODD_NODES);
+        let layout = NumaMemoryLayout::compute(&topo, 66, 0, None).unwrap();
+        // Declared (non-2 MiB) sizes are preserved exactly — not snapped.
+        assert_eq!(layout.regions()[0].size, 33 << 20);
+        assert_eq!(layout.regions()[1].size, 33 << 20);
+        let needed: u64 = layout
+            .regions()
+            .iter()
+            .map(|r| r.size.div_ceil(2 * 1024 * 1024))
+            .sum();
+        if crate::vmm::host_topology::hugepages_free() < needed {
+            eprintln!(
+                "SKIP allocate_hugepages_with_nodes_nonaligned_size: < {needed} free 2 MiB hugepages"
+            );
+            return;
+        }
+        let kvm = kvm_ioctls::Kvm::new().unwrap();
+        let vm_fd = kvm.create_vm().unwrap();
+        // The non-2 MiB declared size must still map (host VA base
+        // aligned) — no EINVAL. .expect() pins the A-degradation path.
+        let alloc = layout
+            .allocate_and_register(&vm_fd, true, false)
+            .expect("non-2 MiB with_nodes hugepage allocate must not EINVAL (host VA base aligned)");
+        use vm_memory::GuestMemoryRegion;
+        // memory_size stays the exact declared 66 MiB total (contract).
+        let total: u64 = alloc.guest_mem.iter().map(|r| r.len()).sum();
+        assert_eq!(total, 66 << 20);
+        // Every node's host VA base is 2 MiB-aligned (the EINVAL fix);
+        // the GPAs are NOT (node1's declared base is 33 MiB) — the
+        // intentional A-degradation for caller-exact sizes.
+        const TWO_MIB: usize = 2 << 20;
+        for r in layout.regions() {
+            let hva = alloc
+                .guest_mem
+                .get_host_address(GuestAddress(r.gpa_start))
+                .unwrap();
+            assert_eq!(
+                hva as usize % TWO_MIB,
+                0,
+                "node {} host VA not 2 MiB-aligned",
+                r.node_id
+            );
+        }
     }
 
     #[test]
