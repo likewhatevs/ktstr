@@ -2260,3 +2260,9 @@ fn evaluate_vm_result(
 
 #[cfg(test)]
 mod eval_tests;
+#[cfg(test)]
+mod eval_tests_eval;
+#[cfg(test)]
+mod eval_tests_llm;
+#[cfg(test)]
+mod eval_tests_reporting;
