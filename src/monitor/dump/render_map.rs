@@ -710,7 +710,7 @@ struct AccessorMemReader<'a> {
     rendered_slot_addrs: Option<&'a std::collections::HashSet<u32>>,
     /// Unique alloc_sizes from all Arena CastHits in the CastMap.
     /// Fallback for deferred-resolve chases with alloc_size=None.
-    alloc_size_types: Vec<(u64, String)>,
+    alloc_size_types: &'a [(u64, String)],
     /// Kernel virtual address of the program BTF the current per-map
     /// renderer is using. Threaded into the
     /// [`MemReader::resolve_arena_type`] gate so the sdt_alloc
@@ -866,7 +866,7 @@ impl MemReader for AccessorMemReader<'_> {
         set.contains(&(addr as u32))
     }
     fn alloc_size_types(&self) -> &[(u64, String)] {
-        &self.alloc_size_types
+        self.alloc_size_types
     }
 }
 
@@ -1027,7 +1027,7 @@ impl<'a> GuestMemMapAccessor<'a> {
             cross_btf_fwd_index,
             scx_static_index,
             rendered_slot_addrs,
-            alloc_size_types: alloc_size_types.to_vec(),
+            alloc_size_types,
             requesting_btf_kva,
         }
     }
