@@ -1720,8 +1720,9 @@ impl BpfMapAccessor for GuestMemMapAccessor<'_> {
     /// `(owner_kva_le_bytes, value_bytes)` per entry — see
     /// [`iter_local_storage_entries`] for the kernel-side walk
     /// shape (`bpf_local_storage_map.buckets[i].list` — regular
-    /// hlist, NULL termination — followed by `container_of` math
-    /// from `map_node` back to the elem base).
+    /// hlist, NULL termination — with `map_node` at offset 0 of the
+    /// elem, so the node KVA is the elem base and no `container_of`
+    /// subtraction is needed).
     fn iter_task_storage(&self, map: &BpfMapInfo) -> Vec<(Vec<u8>, Vec<u8>)> {
         iter_local_storage_entries(&self.ctx(), map)
     }
