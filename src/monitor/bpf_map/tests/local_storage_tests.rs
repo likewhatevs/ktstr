@@ -641,21 +641,59 @@ fn iter_local_storage_value_size_cap_returns_empty() {
         BPF_MAP_TYPE_TASK_STORAGE,
     );
     // Build a fresh BpfMapInfo declaring a value_size beyond
-    // MAX_VALUE_SIZE. The walker must early-return BEFORE
-    // touching the bucket array (the hostile-guest safety
-    // bound).
-    let mut hostile = scene.map.clone();
-    hostile.value_size = (super::super::MAX_VALUE_SIZE + 1) as u32;
+    // MAX_VALUE_SIZE (as a torn / mis-offset read of value_size
+    // would). The walker must early-return BEFORE touching the
+    // bucket array (the live-read robustness bound).
+    let mut oversized = scene.map.clone();
+    oversized.value_size = (super::super::MAX_VALUE_SIZE + 1) as u32;
     // SAFETY: scene.buf is a live local Vec<u8> whose backing
     // storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(scene.buf.as_ptr() as *mut u8, scene.buf.len() as u64) };
     let entries = iter_local_storage_entries(
         &lookup_ctx(&mem, 0, scene.page_offset, &scene.offsets, false),
-        &hostile,
+        &oversized,
     );
     assert!(
         entries.is_empty(),
         "value_size > MAX_VALUE_SIZE must short-circuit"
+    );
+}
+
+// -- cycle cap --
+
+/// A corrupted `hlist_node.next` that points back into the chain (here:
+/// an elem pointing at itself) must terminate at the per-walk visit cap
+/// (`ctx.iter_max`) rather than spin the freeze hot path. The
+/// local-storage walker breaks only on a NULL next, so a non-zero
+/// self-pointer loops. A small `iter_max` keeps the test cheap;
+/// production (`MAP_WALK_ITER_MAX`) would spin ~1M times on this cycle.
+#[test]
+fn iter_local_storage_self_cycle_terminates_at_iter_cap() {
+    let mut scene = build_storage_scene(
+        1,
+        0,
+        &[vec![(vec![1u8, 2, 3, 4], 0x1111u64, None)]],
+        4,
+        BPF_MAP_TYPE_TASK_STORAGE,
+    );
+    // Repoint elem 0's hlist_node.next at its OWN kva → a self-cycle.
+    let ts = test_task_storage_offsets();
+    let elem0_pa = scene.elem_pas[0];
+    let next_off = elem0_pa as usize + ts.hlist_node_next;
+    let self_kva = scene.page_offset.wrapping_add(elem0_pa);
+    scene.buf[next_off..next_off + 8].copy_from_slice(&self_kva.to_ne_bytes());
+    // SAFETY: scene.buf is a live local Vec<u8> whose backing storage
+    // outlives the GuestMem use.
+    let mem = unsafe { GuestMem::new(scene.buf.as_ptr() as *mut u8, scene.buf.len() as u64) };
+    let mut ctx = lookup_ctx(&mem, 0, scene.page_offset, &scene.offsets, false);
+    ctx.iter_max = 16;
+    let entries = iter_local_storage_entries(&ctx, &scene.map);
+    // Guard is `total_visited > iter_max`, incremented before push:
+    // visits 1..=16 each push, visit 17 returns → exactly iter_max.
+    assert_eq!(
+        entries.len(),
+        16,
+        "self-cycle must terminate at iter_max, not hang"
     );
 }
 

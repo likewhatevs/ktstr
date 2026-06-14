@@ -496,6 +496,38 @@ fn iter_htab_entries_value_size_cap_returns_empty() {
     );
 }
 
+/// A corrupted `hlist_nulls_node.next` that points back into the chain
+/// (here: an elem pointing at itself) must terminate at the per-walk
+/// visit cap (`ctx.iter_max`) rather than spin the freeze hot path.
+/// Covers the shared `walk_htab` guard used by both the HASH and
+/// PERCPU-HASH walkers. A small `iter_max` keeps the test cheap;
+/// production (`MAP_WALK_ITER_MAX`) would spin ~1M times on this cycle.
+#[test]
+fn iter_htab_entries_self_cycle_terminates_at_iter_cap() {
+    let key = 7u32.to_ne_bytes();
+    let val = 0xABCD_u64.to_ne_bytes();
+    let (mut buf, page_offset, map, offsets) = setup_htab_direct(4, 8, &[(&key, &val)], 4);
+    // setup leaves elem 0's next at the nulls marker (odd → terminates);
+    // repoint it at the elem's OWN kva (even, non-zero → self-loop).
+    let htab = test_htab_offsets();
+    let elem_pa: usize = 0x2000;
+    let elem_kva = page_offset.wrapping_add(elem_pa as u64);
+    let next_off = elem_pa + htab.hlist_nulls_node_next;
+    buf[next_off..next_off + 8].copy_from_slice(&elem_kva.to_ne_bytes());
+    // SAFETY: buf is a live local buffer whose storage outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let mut ctx = lookup_ctx(&mem, 0, page_offset, &offsets, false);
+    ctx.iter_max = 16;
+    let entries = iter_htab_entries(&ctx, &map);
+    // Guard is `total_visited > iter_max`, incremented before extract:
+    // visits 1..=16 each push, visit 17 returns → exactly iter_max.
+    assert_eq!(
+        entries.len(),
+        16,
+        "self-cycle must terminate at iter_max, not hang"
+    );
+}
+
 /// key_size declared past MAX_VALUE_SIZE short-circuits identically,
 /// bounding the per-element key `Vec::with_capacity(key_size)`. The
 /// cap (`key_size > MAX_VALUE_SIZE`) is the key-side twin of the
@@ -684,6 +716,33 @@ fn read_percpu_array_key_out_of_bounds() {
         &per_cpu_offsets,
     );
     assert!(result.is_empty());
+}
+
+/// value_size declared past MAX_VALUE_SIZE short-circuits before the
+/// per-CPU loop, which would otherwise allocate value_size bytes PER
+/// CPU. The cap reads `map.value_size`, so override the BpfMapInfo
+/// field. Per-CPU twin of `iter_htab_entries_value_size_cap_returns_empty`
+/// — read_percpu_array_value was the lone value_size->alloc site that
+/// previously lacked the bound.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn read_percpu_array_value_size_cap_returns_empty() {
+    let (buf, cr3_pa, page_offset, mut info, offsets, per_cpu_offsets) =
+        setup_percpu_array(2, 1, 8);
+    info.value_size = (super::super::MAX_VALUE_SIZE + 1) as u32;
+    // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+    // whose backing storage outlives the GuestMem use.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let result = read_percpu_array_value(
+        &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),
+        &info,
+        0,
+        &per_cpu_offsets,
+    );
+    assert!(
+        result.is_empty(),
+        "value_size > MAX_VALUE_SIZE must short-circuit before the per-CPU loop"
+    );
 }
 
 #[test]

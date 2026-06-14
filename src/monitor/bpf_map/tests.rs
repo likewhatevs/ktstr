@@ -24,6 +24,7 @@ fn value_ctx<'a>(mem: &'a GuestMem, cr3_pa: u64, l5: bool) -> AccessorCtx<'a> {
         tcr_el1: 0,
         start_kernel_map: START_KERNEL_MAP,
         phys_base: 0,
+        iter_max: MAP_WALK_ITER_MAX,
     }
 }
 
@@ -43,6 +44,7 @@ pub(super) fn lookup_ctx<'a>(
         tcr_el1: 0,
         start_kernel_map: START_KERNEL_MAP,
         phys_base: 0,
+        iter_max: MAP_WALK_ITER_MAX,
     }
 }
 

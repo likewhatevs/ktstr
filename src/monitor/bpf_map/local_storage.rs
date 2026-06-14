@@ -34,7 +34,7 @@
 //!    `map_node` is at offset 0, the link is at the elem base + the
 //!    `next` offset within `hlist_node`).
 //!
-//! Hostile-input handling: untranslatable buckets are skipped (the
+//! Malformed-input handling: untranslatable buckets are skipped (the
 //! per-bucket chain breaks); untranslatable elems break the current
 //! chain. A null `local_storage` pointer surfaces as `owner=0` rather
 //! than dropping the entry — the value bytes are still useful even
@@ -52,18 +52,11 @@ use super::{
 /// Production maps size buckets to
 /// `roundup_pow_of_two(num_possible_cpus())`, so even a 4096-CPU
 /// machine produces only 12 levels of `bucket_log`. This 16-bit cap
-/// is a hostile-guest safety bound: a corrupted (uninitialized) u32
-/// read of `bucket_log` could yield up to 31, which would otherwise
-/// attempt to walk 2^31 buckets on the freeze hot path.
+/// is a live-read robustness bound: `bucket_log` is read live from
+/// kernel memory, so a torn or mis-offset read could yield up to 31,
+/// which would otherwise attempt to walk 2^31 buckets on the freeze
+/// hot path.
 const TASK_STORAGE_BUCKETS_MAX: u32 = 1 << 16;
-
-/// Maximum total selem visits across all buckets.
-///
-/// Mirrors the `HTAB_ITER_MAX` cycle defense in the bpf_htab walker:
-/// a corrupted `next` pointer that loops back into the same chain
-/// would otherwise hang the freeze hot path until the rendezvous
-/// timeout.
-const TASK_STORAGE_ITER_MAX: usize = 1_000_000;
 
 /// Iterate every `bpf_local_storage_elem` registered against `map`.
 ///
@@ -194,7 +187,7 @@ pub(super) fn iter_local_storage_entries(
                 break;
             }
             total_visited += 1;
-            if total_visited > TASK_STORAGE_ITER_MAX {
+            if total_visited > ctx.iter_max {
                 return out;
             }
 

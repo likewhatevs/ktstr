@@ -41,6 +41,14 @@ use local_storage::iter_local_storage_entries;
 /// helpers in [`htab`].
 pub(crate) type PerCpuHashEntries = Vec<(Vec<u8>, Vec<Option<Vec<u8>>>)>;
 
+/// Maximum chain-element visits per map walk — the production value of
+/// [`AccessorCtx::iter_max`]. A corrupted `next` pointer that forms a
+/// cycle is bounded here so a hash-bucket or local-storage walk can't
+/// spin the freeze hot path until the rendezvous timeout. Shared by
+/// the bucket walker [`htab::walk_htab`] and the local-storage walker
+/// [`local_storage::iter_local_storage_entries`].
+pub(crate) const MAP_WALK_ITER_MAX: usize = 1_000_000;
+
 /// Bundle of borrow-held state every map-access routine threads
 /// through the page-table walk, bounds check, and byte read/write path.
 ///
@@ -73,6 +81,13 @@ pub(crate) struct AccessorCtx<'a> {
     /// text/data symbols correctly. See
     /// [`super::guest::GuestKernel::phys_base`].
     pub phys_base: u64,
+    /// Maximum chain-element visits per map walk (hash buckets,
+    /// local-storage chains). A corrupted `next` pointer that loops
+    /// back into a chain would otherwise spin the walker on the freeze
+    /// hot path; this bounds the walk. Production sets
+    /// [`MAP_WALK_ITER_MAX`]; tests override it with a small value to
+    /// exercise the cap cheaply.
+    pub iter_max: usize,
 }
 
 // Map type discriminants from `enum bpf_map_type` in
@@ -349,8 +364,8 @@ impl std::fmt::Display for BpfMapInfo {
 /// `struct bpf_map`. The struct itself is ~250 bytes on 6.16+
 /// kernels (verified against include/linux/bpf.h `struct bpf_map`),
 /// and every field [`find_all_bpf_maps`] touches falls within this
-/// span. The cap is a hostile-guest safety bound (`map_pa` could
-/// straddle end-of-DRAM) — `read_bytes` already truncates short, so
+/// span. The bound keeps the batched read to a fixed scratch size; if
+/// `map_pa` straddles end-of-DRAM `read_bytes` truncates short, so
 /// any field whose end exceeds the actual copy length falls through
 /// to the scalar read path via `MapMetadata::u32_at` / `u64_at`.
 const MAP_METADATA_SPAN: usize = 384;
@@ -692,14 +707,17 @@ pub(crate) fn find_bpf_map(
     None
 }
 
-/// Hostile-guest cap on a single value-region read. Bounds the
-/// `vec![0u8; len]` allocation before it reaches the heap so a
-/// corrupted (uninitialized) `bpf_map.value_size` read can't
-/// induce a multi-gigabyte allocation on the freeze hot path.
-/// 16 MiB covers every realistic BPF map's per-entry size; a
-/// global-section ARRAY (`.bss` etc.) is the largest practical
-/// value at scheduler scale, and the kernel itself caps `value_size`
-/// well below this for ordinary map types.
+/// Robustness bound on a single value-region allocation. `value_size`
+/// is read live from kernel memory via page-table translation, so a
+/// torn read mid-update, a stale/wrong offset-table entry for the
+/// running kernel, or a corrupted-pointer chase could yield a garbage
+/// `value_size` — up to ~4 GiB, the u32 max. Capping before the
+/// `vec![0u8; len]` allocation keeps a mis-read from driving a
+/// multi-gigabyte allocation on the freeze hot path. 16 MiB covers
+/// every realistic scheduler-scale map (a global-section `.bss` ARRAY
+/// is the largest practical value, KiB–low-MiB); kernel-legal
+/// non-percpu ARRAYs can exceed it (up to INT_MAX), so the cap is a
+/// robustness heuristic, not a kernel limit.
 const MAX_VALUE_SIZE: usize = 16 * 1024 * 1024;
 
 /// BPF-map I/O wrapper around [`super::kva_io::chunked_kva_io`] that
@@ -806,9 +824,10 @@ pub(crate) fn read_bpf_map_value(
     if end > map_info.value_size as usize {
         return None;
     }
-    // Hostile-guest size cap before allocation: a corrupted
-    // `value_size` (or a caller passing a huge `len`) would
-    // otherwise allocate up to 4 GiB inside `vec![0u8; len]`.
+    // Live-read robustness cap before allocation (see MAX_VALUE_SIZE):
+    // a garbage `value_size` (torn / stale-offset read) or a caller
+    // passing a huge `len` would otherwise allocate up to 4 GiB inside
+    // `vec![0u8; len]`.
     if len > MAX_VALUE_SIZE {
         return None;
     }
@@ -850,8 +869,8 @@ pub(crate) fn read_bpf_map_array_value(
         return None;
     }
     let value_size = map_info.value_size as usize;
-    // Hostile-guest size cap before any allocation, matching
-    // `read_bpf_map_value`.
+    // Live-read robustness cap before any allocation, matching
+    // `read_bpf_map_value` (see MAX_VALUE_SIZE).
     if value_size > MAX_VALUE_SIZE {
         return None;
     }
@@ -890,10 +909,13 @@ pub(crate) fn read_bpf_map_array_value(
 /// than the chunk at end-of-DRAM); the buffer is adopted via
 /// `set_len` only once every byte is proven written. Performs NO
 /// semantic bounds check: `target_kva` must lie in the value region.
-/// The `.bss`/ARRAY value-region callers additionally cap `len`
-/// against `MAX_VALUE_SIZE`; the per-CPU callers read `value_size`
-/// straight from the map definition (the guest under test is trusted,
-/// so a hostile-`value_size` allocation bound is out of scope).
+/// Every value-region caller caps `len`/`value_size` against
+/// `MAX_VALUE_SIZE` before allocating — the `.bss`/ARRAY paths
+/// ([`read_bpf_map_value`], [`read_bpf_map_array_value`]) and the
+/// per-CPU paths ([`read_percpu_array_value`] and the PERCPU-HASH
+/// walker via `walk_htab`) alike — because `value_size` is read live
+/// from kernel memory and a mis-read could otherwise drive a huge
+/// allocation (per CPU, in the per-CPU case).
 fn read_kva_bytes_with<T: Fn(u64) -> Option<u64>>(
     mem: &GuestMem,
     translate: T,
@@ -1066,6 +1088,17 @@ fn read_percpu_array_value(
     }
 
     let value_size = map.value_size as usize;
+    // Robustness cap mirroring read_bpf_map_value / read_bpf_map_array_value
+    // (and htab.rs's walk_htab): value_size is read live from kernel memory,
+    // so a torn read mid-update, a stale offset-table entry for the running
+    // kernel, or a corrupted-pointer chase could yield a garbage size — and
+    // here it would allocate value_size bytes PER CPU across the loop below.
+    // The kernel bounds PERCPU value_size well under 16 MiB (map create
+    // rejects round_up(value_size, 8) > PCPU_MIN_UNIT_SIZE), so this never
+    // rejects a legal map; it only fires on a mis-read.
+    if value_size > MAX_VALUE_SIZE {
+        return Vec::new();
+    }
     let mut result = Vec::with_capacity(per_cpu_offsets.len());
 
     for (cpu_index, &cpu_off) in per_cpu_offsets.iter().enumerate() {
@@ -1524,6 +1557,7 @@ impl<'a> GuestMemMapAccessor<'a> {
             tcr_el1: self.kernel.tcr_el1(),
             start_kernel_map: self.kernel.start_kernel_map(),
             phys_base: self.kernel.phys_base(),
+            iter_max: MAP_WALK_ITER_MAX,
         }
     }
 

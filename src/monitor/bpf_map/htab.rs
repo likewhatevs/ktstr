@@ -18,18 +18,14 @@ use super::{
     BPF_MAP_TYPE_PERCPU_HASH, BpfMapInfo,
 };
 
-/// Maximum number of entries to iterate when walking a hash map.
-/// Prevents unbounded iteration on corrupted or very large maps.
-pub(super) const HTAB_ITER_MAX: usize = 1_000_000;
-
 /// Maximum number of buckets walked per hash map.
 ///
 /// Production maps cap n_buckets at `roundup_pow_of_two(max_entries)`
 /// where `max_entries` is bounded by the kernel's BPF_MAP_CREATE
-/// validation. This 16-bit cap is a hostile-guest safety bound:
-/// a corrupted (uninitialized) u32 read of `bpf_htab.n_buckets`
-/// could yield up to `u32::MAX`, which would otherwise attempt to
-/// walk billions of buckets on the freeze hot path. Mirror of the
+/// validation. This 16-bit cap is a live-read robustness bound:
+/// `bpf_htab.n_buckets` is read live from kernel memory, so a torn or
+/// mis-offset read could yield up to `u32::MAX`, which would otherwise
+/// attempt to walk billions of buckets on the freeze hot path. Mirror of the
 /// matching `TASK_STORAGE_BUCKETS_MAX` cap in
 /// `bpf_map::local_storage`.
 pub(super) const HTAB_BUCKETS_MAX: u32 = 1 << 16;
@@ -211,7 +207,7 @@ pub(super) fn iter_percpu_htab_entries(
 /// `htab_elem`, collecting whatever the closure returns.
 ///
 /// Centralizes the bucket-array translation, hlist_nulls chain walk,
-/// and the [`HTAB_ITER_MAX`] cap so plain-HASH and PERCPU-HASH
+/// and the per-walk visit cap ([`super::AccessorCtx::iter_max`]) so plain-HASH and PERCPU-HASH
 /// variants share one traversal — the only difference between them
 /// is what the per-element extractor reads.
 fn walk_htab<T, F>(ctx: &AccessorCtx<'_>, map: &BpfMapInfo, mut extract: F) -> Vec<T>
@@ -279,7 +275,7 @@ where
                 break;
             }
             total_visited += 1;
-            if total_visited > HTAB_ITER_MAX {
+            if total_visited > ctx.iter_max {
                 return out;
             }
 
