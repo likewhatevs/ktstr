@@ -3679,6 +3679,29 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, Resol
                 return Ok((Some(found), ResolveSource::PathLookup));
             }
 
+            // 1c. Orchestrated (non-cargo-test-mode) flow: prefer a
+            // fresh workspace build. `cargo build -p {name}` rebuilds
+            // the scheduler when its sources (incl. src/bpf/*.bpf.c via
+            // its build.rs) changed and is a fast no-op when
+            // up-to-date, so an edited scheduler never runs stale. The
+            // sibling / target-dir cascade below returns a pre-built
+            // binary AS-IS with no staleness check — which silently
+            // served a stale scheduler after a source edit. Fall
+            // through to that cascade only when the build cannot run
+            // (cargo or sources unavailable, e.g. a packaged standalone
+            // test binary). cargo-test-mode is excluded: it targets an
+            // installed scheduler (PATH lookup above) without a
+            // workspace build.
+            if !crate::cargo_test_mode::cargo_test_mode_active() {
+                match crate::build_and_find_binary(name) {
+                    Ok(path) => return Ok((Some(path), ResolveSource::AutoBuilt)),
+                    Err(e) => eprintln!(
+                        "ktstr_test: workspace build of scheduler '{name}' failed \
+                         ({e:#}); falling back to a pre-built binary if present"
+                    ),
+                }
+            }
+
             // 2. Sibling of current executable (or parent of deps/)
             if let Ok(exe) = crate::resolve_current_exe()
                 && let Some(dir) = exe.parent()
@@ -3712,7 +3735,11 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, Resol
                 return Ok((Some(candidate), ResolveSource::TargetRelease));
             }
 
-            // 5. Build the scheduler package on demand.
+            // 5. Build the scheduler package on demand. Reached in
+            // cargo-test-mode (which skips the build-first step 1c) when
+            // the PATH / sibling / target-dir lookups all miss; in the
+            // non-cargo-test-mode flow step 1c already attempted the
+            // build, so this is a last-resort retry before bailing.
             match crate::build_and_find_binary(name) {
                 Ok(path) => return Ok((Some(path), ResolveSource::AutoBuilt)),
                 Err(e) => eprintln!("ktstr_test: auto-build scheduler '{name}' failed: {e:#}"),

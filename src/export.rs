@@ -168,10 +168,11 @@ pub fn export_test(test_name: &str, output: Option<PathBuf>) -> Result<()> {
 /// EEVDF / kernel-builtin payloads (which don't ship a binary).
 ///
 /// Reuses `crate::test_support::eval::resolve_scheduler` so the
-/// resolution cascade matches the in-guest path: `KTSTR_SCHEDULER`
-/// env → sibling exe → target/debug → target/release → auto-build.
-/// The cascade walks both target dirs regardless of which build
-/// profile invoked cargo-ktstr.
+/// resolution matches the in-guest path: `KTSTR_SCHEDULER` env wins;
+/// then, outside cargo-test-mode, a fresh `cargo build -p {name}` so an
+/// edited scheduler is never exported stale, falling back to a
+/// pre-built sibling-exe / target/debug / target/release binary when
+/// the build cannot run. cargo-test-mode resolves via `$PATH` first.
 fn resolve_scheduler_for_export(entry: &KtstrTestEntry) -> Result<Option<PathBuf>> {
     let (path, _source) = resolve_scheduler(&entry.scheduler.binary)
         .with_context(|| format!("resolve scheduler binary for test '{}'", entry.name))?;
