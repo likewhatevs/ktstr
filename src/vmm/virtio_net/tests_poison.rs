@@ -387,6 +387,16 @@ fn rx_hostile_avail_idx_poisons_queue_and_signals() {
         "TX add_used succeeded before the poison-signal bail; \
          tx_packets must bump",
     );
+    // The captured TX frame was dropped because RX poisoned on this
+    // kick (JustRxPoisoned arm). Recorded distinctly from the
+    // empty-RX-queue back-pressure counter so an operator can tell
+    // "RX wedged on a guest violation" from "RX simply empty".
+    assert_eq!(
+        dev.counters().tx_dropped_rx_poisoned(),
+        1,
+        "JustRxPoisoned arm must record the dropped TX frame via \
+         tx_dropped_rx_poisoned",
+    );
     // RX delivery did NOT happen — the chain was poisoned before
     // pop.
     assert_eq!(
@@ -427,6 +437,13 @@ fn rx_hostile_avail_idx_poisons_queue_and_signals() {
         dev.irq_evt().read().is_err(),
         "re-kick of a poisoned queue MUST NOT re-fire the irqfd",
     );
+    // The re-kick popped no new TX chain (TX avail.idx unchanged), so
+    // no additional frame was captured or dropped.
+    assert_eq!(
+        dev.counters().tx_dropped_rx_poisoned(),
+        1,
+        "re-kick with no new TX chain must not record another drop",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -456,13 +473,16 @@ fn rx_poison_does_not_halt_tx_progress() {
     // coalesce into one irq_evt write; consume it.
     assert_eq!(dev.counters().tx_packets(), 1);
     assert_eq!(dev.counters().invalid_avail_idx_count(), 1);
+    // Phase 1's captured frame was dropped by the JustRxPoisoned arm.
+    assert_eq!(dev.counters().tx_dropped_rx_poisoned(), 1);
     let _ = dev.irq_evt().read();
 
     // Phase 2: re-kick TX with another well-formed chain. RX is
-    // still poisoned — try_loopback_to_rx returns
-    // RxAlreadyPoisoned (gate short-circuits, no counter bump,
-    // no signal). TX side still pops the chain and add_used's
-    // it. tx_packets must advance.
+    // still poisoned — try_loopback_to_rx returns RxAlreadyPoisoned
+    // (gate short-circuits: no invalid_avail_idx_count bump, no
+    // signal). The captured TX frame is still dropped and recorded
+    // via tx_dropped_rx_poisoned. The TX side still pops the chain
+    // and add_used's it, so tx_packets must advance.
     //
     // To plant a second TX chain at ring[1], idx=2: the queue's
     // next_avail is now 1 (one chain consumed). Append a second
@@ -474,6 +494,7 @@ fn rx_poison_does_not_halt_tx_progress() {
 
     let pre_tx = dev.counters().tx_packets();
     let pre_invalid = dev.counters().invalid_avail_idx_count();
+    let pre_dropped = dev.counters().tx_dropped_rx_poisoned();
     write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, TXQ as u32);
 
     assert_eq!(
@@ -487,6 +508,12 @@ fn rx_poison_does_not_halt_tx_progress() {
         pre_invalid,
         "RxAlreadyPoisoned arm must NOT re-bump invalid_avail_idx_count \
          — counter is event-once per false→true transition",
+    );
+    assert_eq!(
+        dev.counters().tx_dropped_rx_poisoned(),
+        pre_dropped + 1,
+        "RxAlreadyPoisoned arm must record the dropped TX frame via \
+         tx_dropped_rx_poisoned",
     );
     // signal_queue_poisoned must NOT re-fire (RX poison flag was
     // already true). signal_used DOES fire (TX completion is a new

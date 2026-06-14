@@ -73,8 +73,9 @@
 //! the vCPU thread inside `mmio_write(QUEUE_NOTIFY)`. The work is
 //! a guest-memory read and write — no host syscalls, no backing
 //! file, no blocking. The round-trip latency is bounded by the
-//! frame size (≤64 KiB per chain by the per-descriptor cap) and
-//! the irqfd write. Bounded vCPU thread work below the
+//! frame size (capped at `MAX_FRAME_SIZE` per chain — an over-size
+//! chain is dropped before any copy) and the irqfd write. Bounded
+//! vCPU thread work below the
 //! freeze-rendezvous timeout means no worker is needed; future
 //! upgrade to a TAP/AF_PACKET backend would migrate the loopback
 //! to a worker thread without changing the device state machine.

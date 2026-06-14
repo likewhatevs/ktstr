@@ -13,8 +13,9 @@
 //      via vcpu_panic::install_once and tears down the VM mid-test.
 //   2. Forward progress: for every TX kick, at least one of
 //      `used.idx` advance (TX or RX), `tx_packets`, `rx_packets`,
-//      `tx_chain_invalid`, `rx_chain_invalid`, `rx_write_failed`,
-//      `tx_dropped_no_rx_buffer`, `tx_add_used_failures`, or
+//      `tx_chain_invalid`, `tx_oversize_dropped`, `rx_chain_invalid`,
+//      `rx_write_failed`, `tx_dropped_no_rx_buffer`,
+//      `tx_dropped_rx_poisoned`, `tx_add_used_failures`, or
 //      `rx_add_used_failures` shows movement. A silent stall (no
 //      advance, no counter) would let a hostile guest pin the
 //      queue indefinitely.
@@ -106,7 +107,7 @@ struct FuzzDesc {
 /// panic. `0..2^24` covers the entire 1 MiB region in-range plus 15 MiB
 /// beyond it (unmapped) — roughly 1:15 valid-to-invalid ratio.
 ///
-/// `len` ranges past `TX_DESC_MAX = 64 KiB` so the per-descriptor cap is
+/// `len` ranges past `MAX_FRAME_SIZE` so the frame-size cap is
 /// exercised, plus `0` (zero-length descriptor). 0..=8 MiB generates
 /// enough over-cap descriptors without making every chain trivially over-cap.
 ///
@@ -308,7 +309,9 @@ struct CounterSnapshot {
     rx_packets: u64,
     rx_bytes: u64,
     tx_dropped_no_rx_buffer: u64,
+    tx_dropped_rx_poisoned: u64,
     tx_chain_invalid: u64,
+    tx_oversize_dropped: u64,
     rx_chain_invalid: u64,
     rx_write_failed: u64,
     tx_add_used_failures: u64,
@@ -324,7 +327,9 @@ fn snapshot_counters(dev: &VirtioNet) -> CounterSnapshot {
         rx_packets: c.rx_packets.load(Ordering::Relaxed),
         rx_bytes: c.rx_bytes.load(Ordering::Relaxed),
         tx_dropped_no_rx_buffer: c.tx_dropped_no_rx_buffer.load(Ordering::Relaxed),
+        tx_dropped_rx_poisoned: c.tx_dropped_rx_poisoned.load(Ordering::Relaxed),
         tx_chain_invalid: c.tx_chain_invalid.load(Ordering::Relaxed),
+        tx_oversize_dropped: c.tx_oversize_dropped.load(Ordering::Relaxed),
         rx_chain_invalid: c.rx_chain_invalid.load(Ordering::Relaxed),
         rx_write_failed: c.rx_write_failed.load(Ordering::Relaxed),
         tx_add_used_failures: c.tx_add_used_failures.load(Ordering::Relaxed),
@@ -344,7 +349,9 @@ fn counter_delta(before: &CounterSnapshot, after: &CounterSnapshot) -> u64 {
     (after.tx_packets - before.tx_packets)
         + (after.rx_packets - before.rx_packets)
         + (after.tx_dropped_no_rx_buffer - before.tx_dropped_no_rx_buffer)
+        + (after.tx_dropped_rx_poisoned - before.tx_dropped_rx_poisoned)
         + (after.tx_chain_invalid - before.tx_chain_invalid)
+        + (after.tx_oversize_dropped - before.tx_oversize_dropped)
         + (after.rx_chain_invalid - before.rx_chain_invalid)
         + (after.rx_write_failed - before.rx_write_failed)
         + (after.tx_add_used_failures - before.tx_add_used_failures)
@@ -365,7 +372,9 @@ fn assert_counter_monotonicity(
     prop_assert!(after.rx_packets >= before.rx_packets);
     prop_assert!(after.rx_bytes >= before.rx_bytes);
     prop_assert!(after.tx_dropped_no_rx_buffer >= before.tx_dropped_no_rx_buffer);
+    prop_assert!(after.tx_dropped_rx_poisoned >= before.tx_dropped_rx_poisoned);
     prop_assert!(after.tx_chain_invalid >= before.tx_chain_invalid);
+    prop_assert!(after.tx_oversize_dropped >= before.tx_oversize_dropped);
     prop_assert!(after.rx_chain_invalid >= before.rx_chain_invalid);
     prop_assert!(after.rx_write_failed >= before.rx_write_failed);
     prop_assert!(after.tx_add_used_failures >= before.tx_add_used_failures);
@@ -393,8 +402,9 @@ proptest! {
     /// Random TX descriptor chains with a well-formed RX target MUST
     /// produce forward progress: for every notify, at least one of
     /// `used.idx` advance (TX or RX), `tx_packets`, `rx_packets`,
-    /// `tx_chain_invalid`, `rx_chain_invalid`, `rx_write_failed`,
-    /// `tx_dropped_no_rx_buffer`, `tx_add_used_failures`,
+    /// `tx_chain_invalid`, `tx_oversize_dropped`, `rx_chain_invalid`,
+    /// `rx_write_failed`, `tx_dropped_no_rx_buffer`,
+    /// `tx_dropped_rx_poisoned`, `tx_add_used_failures`,
     /// `rx_add_used_failures`, or `invalid_avail_idx_count` must
     /// show movement. A chain that left every counter and used.idx
     /// static would represent a silent stall — the guest's
@@ -590,17 +600,19 @@ proptest! {
         );
     }
 
-    /// Random `len` on the TX descriptor — fuzz the per-descriptor cap
-    /// (`TX_DESC_MAX = 64 KiB`) and the total-frame cap
-    /// (`MAX_FRAME_SIZE = 64 KiB`). The device caps each descriptor at
-    /// `TX_DESC_MAX` and the cumulative captured bytes at
-    /// `MAX_FRAME_SIZE`; a regression that didn't apply either cap
-    /// would let a hostile guest force an attacker-sized scratch
-    /// allocation. The 0..=8 MiB strategy generates well over the
-    /// caps so the boundary is exercised without making every chain
-    /// trivially over-cap.
+    /// Random `len` on the TX descriptor — fuzz the frame-size cap
+    /// (`MAX_FRAME_SIZE`). A chain whose post-header data exceeds the
+    /// cap is DROPPED (not truncated): `pop_and_capture_tx` bumps
+    /// `tx_oversize_dropped` and returns `frame_len: None`. A
+    /// regression that silently truncated instead would corrupt a real
+    /// frame the guest believes it transmitted intact; a regression
+    /// that didn't bound the read at all would let a hostile guest
+    /// force an attacker-sized scratch allocation. The 0..=8 MiB
+    /// strategy generates lengths well over the cap so the over-size
+    /// drop path is exercised, plus the in-bounds and short-header
+    /// (`len < 12`) cases.
     #[test]
-    fn random_tx_desc_len_either_truncates_or_records_failure(
+    fn random_tx_desc_len_drops_or_records_failure(
         len in 0u32..(8u32 * 1024 * 1024),
     ) {
         let (mut dev, mem) = build_fuzz_fixture();
@@ -609,8 +621,9 @@ proptest! {
         // sized to the smaller of `len` and the remaining guest-mem
         // window. We can't write `8 MiB` of bytes since the guest mem
         // is only 1 MiB, but the descriptor's `len` can claim
-        // arbitrary values — the device's cap must reject the read
-        // before the cap-imposed read fails on the unmapped pages.
+        // arbitrary values — the device's over-cap check must drop the
+        // chain (before any read) when the claimed length exceeds the
+        // frame-size cap, rather than reading from unmapped pages.
         let safe_fill_len = (len as usize).min(0x10_000); // up to 64 KiB
         let zero_hdr = [0u8; 12];
         mem.write_slice(&zero_hdr, GuestAddress(TX_FRAME_BUF_BASE))
@@ -648,21 +661,32 @@ proptest! {
             len,
         );
 
-        // Either tx_packets bumped (chain was processable, even if
-        // truncated) OR tx_chain_invalid bumped (chain was malformed
-        // because hdr_remaining > 0 from too-short descriptor at len < 12).
-        // The two are mutually exclusive: a successfully-captured frame
-        // bumps tx_packets, a malformed shape bumps tx_chain_invalid.
+        // Exactly one of three mutually-exclusive outcomes bumps per
+        // popped TX chain:
+        //   - tx_packets: well-formed and in-bounds (post-header data
+        //     <= MAX_FRAME_SIZE) — captured fully. The full 1 MiB
+        //     fixture window is mapped, so an in-bounds read never
+        //     fails here.
+        //   - tx_oversize_dropped: well-formed but post-header data
+        //     > MAX_FRAME_SIZE — DROPPED, not truncated. This is the
+        //     silent-truncation fix this test pins; the 8 MiB strategy
+        //     makes this the dominant case.
+        //   - tx_chain_invalid: malformed shape — for len < 12 the
+        //     chain is shorter than the 12-byte virtio header so
+        //     hdr_remaining > 0.
         let tx_pkt_delta = after.tx_packets - before.tx_packets;
         let tx_inv_delta = after.tx_chain_invalid - before.tx_chain_invalid;
+        let tx_oversize_delta = after.tx_oversize_dropped - before.tx_oversize_dropped;
         prop_assert_eq!(
-            tx_pkt_delta + tx_inv_delta,
+            tx_pkt_delta + tx_inv_delta + tx_oversize_delta,
             1,
-            "exactly one of tx_packets/tx_chain_invalid must bump per \
-             popped TX chain; len={} pkt_delta={} inv_delta={}",
+            "exactly one of tx_packets/tx_chain_invalid/tx_oversize_dropped \
+             must bump per popped TX chain; len={} pkt_delta={} inv_delta={} \
+             oversize_delta={}",
             len,
             tx_pkt_delta,
             tx_inv_delta,
+            tx_oversize_delta,
         );
     }
 

@@ -390,6 +390,13 @@ const RX_DESC_TABLE_BASE: u64 = 0x6000;
 const RX_AVAIL_RING_BASE: u64 = 0x7000;
 const RX_USED_RING_BASE: u64 = 0x8000;
 const RX_BUF: u64 = 0x9000;
+// Regions are packed at 0x1000 (4 KiB) spacing, so a frame at or near
+// MAX_FRAME_SIZE (~64 KiB) read from / written to TX_FRAME_BUF spans
+// well past RX_DESC_TABLE_BASE. Benign for the over-size tests below:
+// TX capture only READS guest memory (it never corrupts the RX rings),
+// and an over-size chain drops before any RX loopback. A future
+// near-cap test exercising actual LOOPBACK delivery must relocate
+// TX_FRAME_BUF above RX_BUF or grow the fixture.
 
 struct TestLayout {
     tx_desc: u64,
@@ -1263,8 +1270,8 @@ fn tx_chain_with_address_overflow_dropped_gracefully() {
 
     // Descriptor at addr = u64::MAX - 11, len = 24. The first 12
     // bytes are the virtio header (skip path → checked_add(skip)
-    // tries u64::MAX - 11 + 12 = wrap). desc.len cap of TX_DESC_MAX
-    // doesn't matter here — overflow is on addr arithmetic.
+    // tries u64::MAX - 11 + 12 = wrap). The frame-size cap doesn't
+    // matter here — overflow is on addr arithmetic.
     write_desc(
         &mem,
         layout.tx_desc,
@@ -1288,6 +1295,176 @@ fn tx_chain_with_address_overflow_dropped_gracefully() {
     );
     assert_eq!(counters.tx_packets(), 0, "no TX completion on overflow");
     assert_eq!(counters.rx_packets(), 0, "no RX delivery on dropped chain");
+}
+
+// ---------------------------------------------------------------------------
+// MAX_FRAME_SIZE over-cap drop (silent-truncation fix)
+// ---------------------------------------------------------------------------
+
+/// Read the TX used-ring `idx` (used layout: flags u16 | idx u16 |
+/// ring[...]). Used by the over-cap tests to assert the dropped chain
+/// is still marked used so the guest doesn't hang on the slot.
+fn read_tx_used_idx(mem: &GuestMemoryMmap, layout: &TestLayout) -> u16 {
+    let mut buf = [0u8; 2];
+    mem.read_slice(&mut buf, GuestAddress(layout.tx_used + 2))
+        .unwrap();
+    u16::from_le_bytes(buf)
+}
+
+/// A single TX descriptor whose post-header data is exactly
+/// `MAX_FRAME_SIZE` (the largest L2 frame the guest's `max_mtu`
+/// permits) is CAPTURED in full — the boundary is inclusive. Pins the
+/// strict `>` comparison in `pop_and_capture_tx`: a regression to `>=`
+/// would drop this legitimate at-cap frame. No RX chain is posted (a
+/// `MAX_FRAME_SIZE` read window overlaps the RX regions); the test
+/// asserts the TX-side capture decision, not loopback delivery.
+#[test]
+fn tx_frame_exactly_at_cap_is_captured() {
+    let (mem, layout) = build_test_memory();
+    let mut dev = VirtioNet::new(NetConfig::default());
+    dev.set_mem(mem.clone());
+    init_until_features_ok(&mut dev);
+    program_queues(&mut dev, &layout);
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_OK);
+
+    // 12-byte header + exactly MAX_FRAME_SIZE data bytes in one
+    // descriptor. The 1 MiB fixture maps the whole read window, so the
+    // read of MAX_FRAME_SIZE bytes from TX_FRAME_BUF+12 succeeds
+    // (zero-filled). No filler is planted — the byte count, not the
+    // contents, is what the capture/drop decision turns on.
+    let total = (VIRTIO_NET_HDR_LEN + MAX_FRAME_SIZE) as u32;
+    write_desc(&mem, layout.tx_desc, 0, layout.tx_frame_buf, total, 0, 0);
+    publish_avail(&mem, layout.tx_avail, 0, 0);
+
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, TXQ as u32);
+
+    let counters = dev.counters();
+    assert_eq!(
+        counters.tx_packets(),
+        1,
+        "a frame exactly at MAX_FRAME_SIZE must be captured (boundary inclusive)",
+    );
+    assert_eq!(
+        counters.tx_bytes(),
+        MAX_FRAME_SIZE as u64,
+        "the full MAX_FRAME_SIZE bytes must be captured, not truncated",
+    );
+    assert_eq!(
+        counters.tx_oversize_dropped(),
+        0,
+        "an at-cap frame must NOT be dropped as oversize",
+    );
+}
+
+/// A single TX descriptor whose post-header data is `MAX_FRAME_SIZE +
+/// 1` is DROPPED (not truncated): `tx_oversize_dropped` bumps,
+/// `tx_packets`/`rx_packets` stay zero, and the chain is still marked
+/// used so the guest doesn't hang. Mirror of the at-cap capture test —
+/// pins the over-side of the strict `>` boundary. The over-cap check
+/// fires before any guest-memory read, so the oversized data need not
+/// be mapped or planted.
+#[test]
+fn tx_frame_one_over_cap_is_dropped() {
+    let (mem, layout) = build_test_memory();
+    let mut dev = VirtioNet::new(NetConfig::default());
+    dev.set_mem(mem.clone());
+    init_until_features_ok(&mut dev);
+    program_queues(&mut dev, &layout);
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_OK);
+
+    let total = (VIRTIO_NET_HDR_LEN + MAX_FRAME_SIZE + 1) as u32;
+    write_desc(&mem, layout.tx_desc, 0, layout.tx_frame_buf, total, 0, 0);
+    publish_avail(&mem, layout.tx_avail, 0, 0);
+    // RX buffer IS posted: proves the frame is dropped on the TX side
+    // (oversize) before any RX delivery is attempted, not merely
+    // because RX was unavailable.
+    place_rx_chain(&mem, &layout);
+
+    let before_used = read_tx_used_idx(&mem, &layout);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, TXQ as u32);
+    let after_used = read_tx_used_idx(&mem, &layout);
+
+    let counters = dev.counters();
+    assert_eq!(
+        counters.tx_oversize_dropped(),
+        1,
+        "a frame one byte over MAX_FRAME_SIZE must be dropped as oversize",
+    );
+    assert_eq!(
+        counters.tx_packets(),
+        0,
+        "an over-cap frame must NOT count as a completed TX packet",
+    );
+    assert_eq!(
+        counters.rx_packets(),
+        0,
+        "an over-cap frame must NOT be delivered to RX",
+    );
+    assert_eq!(
+        counters.tx_chain_invalid(),
+        0,
+        "an over-cap (but well-formed) chain is distinct from a malformed one",
+    );
+    assert_eq!(
+        after_used.wrapping_sub(before_used),
+        1,
+        "the over-cap chain must still be marked used so the guest doesn't hang",
+    );
+}
+
+/// A multi-descriptor TX chain whose post-header data SUMS past
+/// `MAX_FRAME_SIZE` is DROPPED as oversize — the cap is enforced on
+/// the running total, not per-descriptor. The first descriptor's data
+/// is in-bounds on its own and is read; the second pushes the total
+/// over the cap and the chain is dropped before that descriptor is
+/// read. Pins that the over-cap check sees the cumulative byte count.
+#[test]
+fn tx_multi_desc_sum_over_cap_is_dropped() {
+    let (mem, layout) = build_test_memory();
+    let mut dev = VirtioNet::new(NetConfig::default());
+    dev.set_mem(mem.clone());
+    init_until_features_ok(&mut dev);
+    program_queues(&mut dev, &layout);
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_OK);
+
+    // desc0: 12-byte header + 40_000 data bytes (in-bounds alone),
+    // chained (NEXT=1) to desc1. desc1: 30_000 data bytes — the
+    // running total 70_000 exceeds MAX_FRAME_SIZE (65_557), so the
+    // chain is dropped before desc1 is read. desc0's 40_000-byte read
+    // lands within the 1 MiB window (zero-filled). VRING_DESC_F_NEXT
+    // = 1.
+    let desc0_len = (VIRTIO_NET_HDR_LEN + 40_000) as u32;
+    write_desc(&mem, layout.tx_desc, 0, layout.tx_frame_buf, desc0_len, 1, 1);
+    let desc1_addr = layout.tx_frame_buf + desc0_len as u64;
+    write_desc(&mem, layout.tx_desc, 1, desc1_addr, 30_000, 0, 0);
+    publish_avail(&mem, layout.tx_avail, 0, 0);
+    place_rx_chain(&mem, &layout);
+
+    let before_used = read_tx_used_idx(&mem, &layout);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, TXQ as u32);
+    let after_used = read_tx_used_idx(&mem, &layout);
+
+    let counters = dev.counters();
+    assert_eq!(
+        counters.tx_oversize_dropped(),
+        1,
+        "a chain whose descriptor lengths SUM past the cap must be dropped",
+    );
+    assert_eq!(
+        counters.tx_packets(),
+        0,
+        "no TX completion for an over-cap chain",
+    );
+    assert_eq!(
+        counters.rx_packets(),
+        0,
+        "no RX delivery for an over-cap chain",
+    );
+    assert_eq!(
+        after_used.wrapping_sub(before_used),
+        1,
+        "the over-cap chain must still be marked used",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1394,6 +1571,12 @@ fn snapshot_captures_every_field_independently() {
     for _ in 0..10 {
         c.record_invalid_avail_idx();
     }
+    for _ in 0..11 {
+        c.record_tx_dropped_rx_poisoned();
+    }
+    for _ in 0..12 {
+        c.record_tx_oversize_dropped();
+    }
 
     let s = c.snapshot();
     assert_eq!(s.tx_packets, 2, "tx_packets source-of-truth check");
@@ -1431,6 +1614,14 @@ fn snapshot_captures_every_field_independently() {
         s.invalid_avail_idx_count, 10,
         "invalid_avail_idx_count source-of-truth check"
     );
+    assert_eq!(
+        s.tx_dropped_rx_poisoned, 11,
+        "tx_dropped_rx_poisoned source-of-truth check"
+    );
+    assert_eq!(
+        s.tx_oversize_dropped, 12,
+        "tx_oversize_dropped source-of-truth check"
+    );
 }
 
 /// Pin the all-zero Default snapshot: a future field added to
@@ -1446,7 +1637,9 @@ fn default_snapshot_is_all_zero() {
     assert_eq!(s.rx_packets, 0);
     assert_eq!(s.rx_bytes, 0);
     assert_eq!(s.tx_dropped_no_rx_buffer, 0);
+    assert_eq!(s.tx_dropped_rx_poisoned, 0);
     assert_eq!(s.tx_chain_invalid, 0);
+    assert_eq!(s.tx_oversize_dropped, 0);
     assert_eq!(s.rx_chain_invalid, 0);
     assert_eq!(s.rx_write_failed, 0);
     assert_eq!(s.tx_add_used_failures, 0);
@@ -1499,7 +1692,9 @@ fn snapshot_roundtrips_through_json() {
         rx_packets: 33,
         rx_bytes: 44,
         tx_dropped_no_rx_buffer: 55,
+        tx_dropped_rx_poisoned: 60,
         tx_chain_invalid: 66,
+        tx_oversize_dropped: 70,
         rx_chain_invalid: 77,
         rx_write_failed: 88,
         tx_add_used_failures: 99,
@@ -1529,7 +1724,9 @@ fn snapshot_roundtrips_u64_max_precision() {
         rx_packets: (1u64 << 53),
         rx_bytes: (1u64 << 53) + 1,
         tx_dropped_no_rx_buffer: (1u64 << 60),
+        tx_dropped_rx_poisoned: u64::MAX / 17,
         tx_chain_invalid: u64::MAX / 2,
+        tx_oversize_dropped: u64::MAX / 19,
         rx_chain_invalid: u64::MAX / 3,
         rx_write_failed: u64::MAX / 5,
         tx_add_used_failures: u64::MAX / 7,

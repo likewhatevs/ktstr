@@ -57,18 +57,36 @@ pub(crate) const TXQ: usize = 1;
 /// emits it); on TX the guest writes a copy that the device strips.
 pub const VIRTIO_NET_HDR_LEN: usize = 12;
 
-/// Maximum L2 frame size the device accepts on TX or emits on RX.
-/// 64 KiB is the largest standard MTU + jumbo headroom; bounds the
-/// per-request scratch allocation against a hostile guest constructing
-/// a chain that totals 4 GiB worth of descriptor lengths. Frames
-/// longer than this are dropped (TX path) or refused (RX path).
-pub(crate) const MAX_FRAME_SIZE: usize = 65_536;
-
-/// Maximum bytes accepted from a single descriptor on TX. Mirrors the
-/// virtio-console `TX_DESC_MAX` cap. A guest sending one descriptor
-/// of `len = 0xFFFF_FFFF` would otherwise force the device to size a
-/// `Vec<u8>` against an attacker-controlled value.
-pub(crate) const TX_DESC_MAX: usize = MAX_FRAME_SIZE;
+/// Maximum L2 frame size (bytes, excluding the 12-byte virtio-net
+/// header) the device accepts on TX or emits on RX. Sized to the
+/// largest Ethernet frame the guest can legitimately emit:
+///
+/// - v0 advertises no `VIRTIO_NET_F_MTU`, so the guest driver keeps
+///   `dev->max_mtu = MAX_MTU = ETH_MAX_MTU = 65535`
+///   (`drivers/net/virtio_net.c::virtnet_probe` sets `dev->max_mtu =
+///   MAX_MTU` unconditionally, overriding only when `VIRTIO_NET_F_MTU`
+///   is negotiated).
+/// - That 65535-byte L3 payload can ride two stacked VLAN tags
+///   (802.1ad QinQ) without MTU reduction: a VLAN device drops
+///   `VLAN_HLEN` from its MTU only when `netif_reduces_vlan_mtu`
+///   (= `netif_is_macsec`, `include/linux/netdevice.h`) holds for the
+///   lower device (`net/8021q/vlan_dev.c::vlan_dev_change_mtu`), which
+///   is false for virtio-net. v0 advertises no HW VLAN offload, so both
+///   tags land in the linear skb data the guest hands us.
+///
+/// Worst case is therefore `ETH_HLEN (14) + 2 * VLAN_HLEN (8) +
+/// max_mtu (65535) = 65557` — the 802.1ad double-tagged frame. Deeper,
+/// non-standard VLAN nesting exceeds this and is dropped as oversize.
+///
+/// A TX chain whose post-header data exceeds the cap is DROPPED, not
+/// truncated: `pop_and_capture_tx` bumps `tx_oversize_dropped` and
+/// returns `frame_len: None` (the chain is still marked used so the
+/// guest doesn't hang). Silent truncation would corrupt a real frame
+/// the guest emitted — a length the guest believes was transmitted
+/// intact. An RX frame longer than this cannot arise in v0's
+/// pure-loopback backend: the RX source is always a captured TX frame,
+/// itself already bounded by this cap.
+pub(crate) const MAX_FRAME_SIZE: usize = 65_557;
 
 /// Status bits required before each phase. Mirrors virtio_console.
 pub(crate) const S_ACK: u32 = VIRTIO_CONFIG_S_ACKNOWLEDGE;
@@ -233,6 +251,20 @@ pub struct VirtioNetCounters {
     /// bump). Distinct from `tx_chain_invalid` (TX chain shape
     /// rejected before any RX delivery was attempted).
     pub(crate) tx_dropped_no_rx_buffer: AtomicU64,
+    /// Cumulative count of successfully-captured TX frames the device
+    /// dropped because the RX queue was POISONED — a prior structural
+    /// `Error::InvalidAvailRingIndex` left `queue_poisoned[RXQ]` set.
+    /// Per-event counter. Like `tx_dropped_no_rx_buffer`, the TX chain
+    /// is still marked used (the guest sees TX completion via
+    /// `tx_packets`); the frame never reaches RX (no `rx_packets`
+    /// bump). Distinct from `tx_dropped_no_rx_buffer` so an operator
+    /// can tell "RX queue was simply empty (transient back-pressure)"
+    /// from "RX queue is wedged on a guest avail-ring violation" —
+    /// the latter does not clear until the guest issues a virtio
+    /// reset. Bumped on BOTH RX-poison loopback outcomes: the queue
+    /// was just poisoned this drain (`JustRxPoisoned`) or was already
+    /// poisoned from a prior kick (`RxAlreadyPoisoned`).
+    pub(crate) tx_dropped_rx_poisoned: AtomicU64,
     /// Cumulative count of TX chains rejected for malformed shape:
     /// missing header, write-only descriptor in TX (TX descriptors
     /// must be device-readable), header-read failure. The TX chain
@@ -241,6 +273,21 @@ pub struct VirtioNetCounters {
     /// neither `tx_packets` nor `rx_packets` is bumped. Per-event
     /// counter.
     pub(crate) tx_chain_invalid: AtomicU64,
+    /// Cumulative count of TX chains DROPPED because the captured
+    /// post-header frame data exceeded `MAX_FRAME_SIZE` (the largest
+    /// L2 frame the guest's `max_mtu` permits). The TX chain is still
+    /// marked used so the guest doesn't hang, but the frame is dropped
+    /// — NOT truncated — and neither `tx_packets` nor `rx_packets` is
+    /// bumped (mutually exclusive with `tx_packets` per chain, like
+    /// `tx_chain_invalid`). Per-event counter. Distinct from
+    /// `tx_chain_invalid`: the chain shape was well-formed (readable
+    /// descriptors, full 12-byte header) — it was simply too large.
+    /// Silently truncating an over-size frame would corrupt traffic
+    /// the guest believes it transmitted intact, so the device drops
+    /// the whole frame and surfaces the event here. A non-zero value
+    /// means the guest emitted a frame larger than its advertised
+    /// `max_mtu` allows — a guest bug or a hostile descriptor chain.
+    pub(crate) tx_oversize_dropped: AtomicU64,
     /// Cumulative count of RX chains rejected for malformed shape on
     /// the loopback delivery side: read-only descriptor in RX (RX
     /// descriptors must be device-writable) or attacker-controlled
@@ -365,12 +412,34 @@ impl VirtioNetCounters {
         self.tx_dropped_no_rx_buffer.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one successfully-captured TX frame dropped because the
+    /// RX queue is poisoned (the TX-side still completes via
+    /// [`Self::record_tx_completed`] when its `add_used` succeeds;
+    /// this counter records the RX-delivery failure). Distinct from
+    /// [`Self::record_tx_dropped_no_rx_buffer`] (empty RX queue,
+    /// transient) — a poisoned RX queue stays wedged until the guest
+    /// resets the device.
+    pub(crate) fn record_tx_dropped_rx_poisoned(&self) {
+        self.tx_dropped_rx_poisoned.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record one TX chain rejected for malformed shape (short
     /// header, wrong direction, header-read failure). The TX chain
     /// is marked used but neither `tx_packets` nor `rx_packets` is
     /// bumped — this is the protocol-violation path.
     pub(crate) fn record_tx_chain_invalid(&self) {
         self.tx_chain_invalid.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one TX chain dropped because its post-header frame data
+    /// exceeded `MAX_FRAME_SIZE`. The TX chain is marked used but
+    /// neither `tx_packets` nor `rx_packets` is bumped — the frame is
+    /// dropped, not truncated. Distinct from
+    /// [`Self::record_tx_chain_invalid`]: the chain shape was valid,
+    /// it was simply over the maximum frame size the guest's `max_mtu`
+    /// permits.
+    pub(crate) fn record_tx_oversize_dropped(&self) {
+        self.tx_oversize_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record one RX chain rejected for malformed shape on the
@@ -459,11 +528,27 @@ impl VirtioNetCounters {
         self.tx_dropped_no_rx_buffer.load(Ordering::Relaxed)
     }
 
+    /// Read the cumulative count of successfully-captured TX frames
+    /// dropped because the RX queue was poisoned. Distinct from
+    /// [`Self::tx_dropped_no_rx_buffer`] (empty RX queue): a poisoned
+    /// RX queue is wedged until a guest virtio reset.
+    pub fn tx_dropped_rx_poisoned(&self) -> u64 {
+        self.tx_dropped_rx_poisoned.load(Ordering::Relaxed)
+    }
+
     /// Read the cumulative count of TX chains rejected for malformed
     /// shape (missing/short header, wrong direction, header read
     /// failure).
     pub fn tx_chain_invalid(&self) -> u64 {
         self.tx_chain_invalid.load(Ordering::Relaxed)
+    }
+
+    /// Read the cumulative count of TX chains dropped for exceeding
+    /// `MAX_FRAME_SIZE`. Distinct from [`Self::tx_chain_invalid`]
+    /// (malformed shape): an over-size chain was well-formed but too
+    /// large, and is dropped rather than truncated.
+    pub fn tx_oversize_dropped(&self) -> u64 {
+        self.tx_oversize_dropped.load(Ordering::Relaxed)
     }
 
     /// Read the cumulative count of RX chains rejected for malformed
@@ -530,7 +615,9 @@ impl VirtioNetCounters {
             rx_packets: self.rx_packets(),
             rx_bytes: self.rx_bytes(),
             tx_dropped_no_rx_buffer: self.tx_dropped_no_rx_buffer(),
+            tx_dropped_rx_poisoned: self.tx_dropped_rx_poisoned(),
             tx_chain_invalid: self.tx_chain_invalid(),
+            tx_oversize_dropped: self.tx_oversize_dropped(),
             rx_chain_invalid: self.rx_chain_invalid(),
             rx_write_failed: self.rx_write_failed(),
             tx_add_used_failures: self.tx_add_used_failures(),
@@ -561,7 +648,9 @@ pub struct VirtioNetCountersSnapshot {
     pub rx_packets: u64,
     pub rx_bytes: u64,
     pub tx_dropped_no_rx_buffer: u64,
+    pub tx_dropped_rx_poisoned: u64,
     pub tx_chain_invalid: u64,
+    pub tx_oversize_dropped: u64,
     pub rx_chain_invalid: u64,
     pub rx_write_failed: u64,
     pub tx_add_used_failures: u64,
@@ -1095,20 +1184,27 @@ impl VirtioNet {
                         // a prior poison, OR a prior iteration of
                         // this drain already triggered the
                         // false→true transition for RX). Drop the
-                        // captured frame; do NOT re-bump counter,
-                        // do NOT re-fire signal. TX add_used below
-                        // still runs.
+                        // captured frame and record the drop. Do NOT
+                        // re-bump `invalid_avail_idx_count` (the
+                        // poison event was already counted on its
+                        // false→true transition) and do NOT re-fire
+                        // the signal. TX add_used below still runs,
+                        // so `tx_packets` still bumps for this chain.
+                        self.counters.record_tx_dropped_rx_poisoned();
                     }
                     LoopbackOutcome::JustRxPoisoned => {
                         // RX-side `iter()` first-time error.
                         // `try_loopback_to_rx` performed the
                         // false→true RX poison transition, bumped
-                        // the counter, and set `queue_poisoned[RXQ]
-                        // = true`. The TX-captured frame is dropped
-                        // (nothing to deliver into). TX add_used
-                        // below still runs so the in-flight TX
-                        // request doesn't hang. RX poison signal is
-                        // fired post-loop after the used-ring kick.
+                        // `invalid_avail_idx_count`, and set
+                        // `queue_poisoned[RXQ] = true`. The
+                        // TX-captured frame is dropped (nothing to
+                        // deliver into) — record the drop. TX
+                        // add_used below still runs so the in-flight
+                        // TX request doesn't hang (and `tx_packets`
+                        // still bumps). RX poison signal is fired
+                        // post-loop after the used-ring kick.
+                        self.counters.record_tx_dropped_rx_poisoned();
                         rx_just_poisoned = true;
                     }
                     LoopbackOutcome::NoRxBuffer => {
@@ -1150,13 +1246,19 @@ impl VirtioNet {
 
             // Mark the TX chain used. TX descriptors are
             // device-readable, so used_len is 0 — the device wrote
-            // nothing back to guest memory on the TX side. tx_packets
-            // is bumped ONLY on TX add_used success — calling
-            // `record_tx_completed` before this point would let the
-            // counter lie if the publish fails (the guest never sees
-            // the completion). Failed TX add_used bumps
-            // `tx_add_used_failures` instead, keeping the per-event
-            // counter taxonomy 1:1 with observable events.
+            // nothing back to guest memory on the TX side, and
+            // virtio-v1.2 §2.7.8.2 counts only device-WRITABLE bytes in
+            // used.len. (Reference divergence: cloud-hypervisor passes
+            // the bytes written to its tap as the TX used.len — a
+            // bytes-read value the spec does not sanction; the guest's
+            // virtnet driver ignores TX used.len so both work in
+            // practice, but 0 is the spec-correct value for a wholly
+            // device-readable chain.) tx_packets is bumped ONLY on TX
+            // add_used success — calling `record_tx_completed` before
+            // this point would let the counter lie if the publish fails
+            // (the guest never sees the completion). Failed TX add_used
+            // bumps `tx_add_used_failures` instead, keeping the
+            // per-event counter taxonomy 1:1 with observable events.
             let q = &mut self.queues[TXQ];
             match q.add_used(mem, head, 0) {
                 Ok(()) => {
@@ -1367,6 +1469,7 @@ impl VirtioNet {
         let mut hdr_remaining: usize = VIRTIO_NET_HDR_LEN;
         let mut total_data_bytes: usize = 0;
         let mut chain_invalid = false;
+        let mut chain_oversize = false;
 
         for desc in chain {
             if desc.is_write_only() {
@@ -1377,7 +1480,12 @@ impl VirtioNet {
                 chain_invalid = true;
                 break;
             }
-            let mut desc_len = (desc.len() as usize).min(TX_DESC_MAX);
+            // The TRUE descriptor length — NOT pre-capped. The
+            // over-cap check below uses this exact value to detect a
+            // frame exceeding MAX_FRAME_SIZE and DROP it (vs silently
+            // capping it). A `u32` always widens into `usize` without
+            // loss; the size cap is enforced before any allocation.
+            let mut desc_len = desc.len() as usize;
             let mut desc_addr = desc.addr();
 
             // Skip / consume any remaining header bytes from this
@@ -1405,20 +1513,27 @@ impl VirtioNet {
                 continue;
             }
 
-            // Cap total captured bytes at MAX_FRAME_SIZE so a hostile
-            // chain summing to gigabytes is bounded. Any overflow is
-            // dropped silently (the chain is still marked used).
-            let remaining = MAX_FRAME_SIZE.saturating_sub(total_data_bytes);
-            let take = desc_len.min(remaining);
-            if take == 0 {
-                // Frame already at MAX_FRAME_SIZE; ignore tail.
+            // Enforce MAX_FRAME_SIZE on the post-header data BEFORE any
+            // allocation or guest-memory read. A frame whose data
+            // exceeds the cap is DROPPED (not truncated) — silently
+            // capping would corrupt a real frame the guest emitted.
+            // `desc_len` is the TRUE descriptor length, so this single
+            // check catches BOTH a single over-size descriptor and a
+            // multi-descriptor chain whose lengths sum past the cap.
+            // No overflow: `total_data_bytes <= MAX_FRAME_SIZE` from
+            // prior iterations and `desc_len <= u32::MAX as usize`, so
+            // the sum stays far below `usize::MAX`. Breaking here
+            // (before the resize) is the hostile-guest defense: a
+            // multi-GiB descriptor never forces a scratch allocation.
+            if total_data_bytes + desc_len > MAX_FRAME_SIZE {
+                chain_oversize = true;
                 break;
             }
 
             let start = self.tx_frame_scratch.len();
-            self.tx_frame_scratch.resize(start + take, 0);
+            self.tx_frame_scratch.resize(start + desc_len, 0);
             if mem
-                .read_slice(&mut self.tx_frame_scratch[start..start + take], desc_addr)
+                .read_slice(&mut self.tx_frame_scratch[start..start + desc_len], desc_addr)
                 .is_err()
             {
                 // Guest-memory read failed (unmapped GPA). Drop the
@@ -1428,7 +1543,42 @@ impl VirtioNet {
                 chain_invalid = true;
                 break;
             }
-            total_data_bytes += take;
+            total_data_bytes += desc_len;
+        }
+
+        if chain_oversize {
+            // The post-header data exceeds MAX_FRAME_SIZE — larger than
+            // any standard-conformant frame the guest can emit (max_mtu
+            // plus up to 802.1ad QinQ double-tagging; see
+            // MAX_FRAME_SIZE). Drop it rather than truncate; the caller
+            // still marks the chain used so the guest doesn't hang on
+            // the slot. Distinct from `tx_chain_invalid` (malformed
+            // shape) so an operator can tell "guest sent an over-size
+            // frame" from "guest sent a malformed chain".
+            // `chain_oversize` is only ever set after the header was
+            // fully consumed, so it is mutually exclusive with the
+            // `hdr_remaining != 0` (short-header) path below.
+            //
+            // Reference-VMM divergence (over-size TX handling): qemu
+            // drops SILENTLY with no stat (rejects frames over its
+            // max-buffer bound, then pushes the chain used with len 0);
+            // firecracker drops, bumps a malformed-frames stat, and
+            // marks used (its bound measures the whole chain including
+            // the 12-byte header, vs our post-header L2 cap, so the two
+            // numbers are intentionally different); libkrun TRUNCATES
+            // the frame and marks success
+            // (a silent-corruption bug — the prior behavior here);
+            // cloud-hypervisor never copies into a bounded buffer
+            // (zero-copy writev to its backend) so it has no cap. We
+            // drop, bump the dedicated `tx_oversize_dropped` (distinct
+            // from the malformed-chain counter), and mark used —
+            // firecracker's shape with finer counter taxonomy, and
+            // deliberately NOT libkrun's truncate.
+            self.counters.record_tx_oversize_dropped();
+            return TxPopOutcome::Chain(TxChainOutcome {
+                head,
+                frame_len: None,
+            });
         }
 
         if chain_invalid || hdr_remaining != 0 {
