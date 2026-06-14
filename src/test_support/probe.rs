@@ -325,16 +325,17 @@ fn label_repro_verdict_when_workload_not_reached(
 ///
 /// 1. `timed_out` — VM wall clock exceeded. No further signals are
 ///    meaningful; the run never reached a natural exit.
-/// 2. `SCHEDULER_NOT_ATTACHED` in `output` — the scheduler process
-///    stayed alive but never completed attachment (BPF verifier
-///    reject, ops mismatch, sysfs absent). `rust_init` emits this
-///    sentinel with a reason suffix then force-reboots, which is
-///    distinct from a scheduler crash. Checked *before* the crash
-///    branch because the emission path prevents a subsequent
-///    SCHEDULER_DIED write in the same run.
-/// 3. `crash_message.is_some()` or `SCHEDULER_DIED` in `output` —
-///    the scheduler process crashed or was reported dead by the
-///    guest's sched_exit monitor.
+/// 2. A `SchedulerNotAttached` lifecycle frame in `guest_messages`
+///    (matched by `extract_not_attached_reason`) — the scheduler
+///    process stayed alive but never completed attachment (BPF
+///    verifier reject, ops mismatch, sysfs absent). `rust_init` emits
+///    this lifecycle frame with a reason suffix then force-reboots,
+///    which is distinct from a scheduler crash. Checked *before* the
+///    crash branch because the emission path prevents a subsequent
+///    `SchedulerDied` frame in the same run.
+/// 3. `has_crash_message`, or a `SchedulerDied` lifecycle frame in
+///    `guest_messages` — the scheduler process crashed or was
+///    reported dead by the guest's sched_exit monitor.
 /// 4. Nonzero exit code — something exited abnormally, but the
 ///    guest did not emit a classification sentinel.
 /// 5. Clean exit — scheduler ran to completion; the first VM's
@@ -342,7 +343,6 @@ fn label_repro_verdict_when_workload_not_reached(
 fn classify_repro_vm_status(
     timed_out: bool,
     has_crash_message: bool,
-    _output: &str,
     exit_code: i32,
     guest_messages: Option<&crate::vmm::host_comms::BulkDrainResult>,
 ) -> String {
@@ -364,8 +364,9 @@ fn classify_repro_vm_status(
         })
         .unwrap_or(false);
     if has_crash_message || scheduler_died {
-        // Describe qemu's exit disposition precisely: a crash sentinel
-        // in `output` can coincide with qemu itself exiting 0 (guest
+        // Describe qemu's exit disposition precisely: a detected crash
+        // (crash_message, or a SchedulerDied lifecycle frame in
+        // guest_messages) can coincide with qemu itself exiting 0 (guest
         // panic handler + orderly reboot), >0 (propagated non-zero),
         // -1 (VMM internal sentinel — the boot CPU's run loop seeds
         // `VmResult::exit_code = -1` and leaves it at -1 on error
@@ -961,7 +962,6 @@ pub(crate) fn attempt_auto_repro(
         let verdict = classify_repro_vm_status(
             repro_result.timed_out,
             repro_result.crash_message.is_some(),
-            &repro_result.output,
             repro_result.exit_code,
             repro_result.guest_messages.as_ref(),
         );
@@ -2455,22 +2455,6 @@ pub(crate) fn finalize_probe_after_unwind() {
     collect_and_print_probe_data(deferred.stop, deferred.handle);
 }
 
-/// Flush profraw, publish the assert result to guest stdout, then
-/// either STASH the probe stop+handle for deferred collection (when
-/// running as the guest VM's PID 1, where Phase 6 scheduler
-/// teardown lives) or collect-and-emit immediately (ctor path on
-/// the host, where there is no Phase 6).
-///
-/// The deferred path is what keeps the `tp_btf/sched_ext_exit`
-/// listener attached while the kernel fires the trigger from
-/// `scx_claim_exit` during scheduler unwind — without it, the probe
-/// is detached before `child.kill()` runs and the stall-class
-/// trigger fires into a void (146 captured kprobe events, 0
-/// trigger fires, 0 after stitch).
-///
-/// The deferred collection runs from
-/// [`finalize_probe_after_unwind`] in `ktstr_guest_init` Phase 6
-/// after `child.wait()` + `/sched_disable`.
 /// Map an [`AssertResult`] to a probe-dispatch exit code per the
 /// `Fail > Inconclusive > Pass > Skip` lattice: Pass → 0, Inconclusive
 /// → 2, every other state → 1 (Skip degenerates to 1 in the probe
@@ -2488,6 +2472,22 @@ fn exit_code_for_result(result: &AssertResult) -> i32 {
     }
 }
 
+/// Flush profraw, publish the assert result to guest stdout, then
+/// either STASH the probe stop+handle for deferred collection (when
+/// running as the guest VM's PID 1, where Phase 6 scheduler
+/// teardown lives) or collect-and-emit immediately (ctor path on
+/// the host, where there is no Phase 6).
+///
+/// The deferred path is what keeps the `tp_btf/sched_ext_exit`
+/// listener attached while the kernel fires the trigger from
+/// `scx_claim_exit` during scheduler unwind — without it, the probe
+/// is detached before `child.kill()` runs and the stall-class
+/// trigger fires into a void (146 captured kprobe events, 0
+/// trigger fires, 0 after stitch).
+///
+/// The deferred collection runs from
+/// [`finalize_probe_after_unwind`] in `ktstr_guest_init` Phase 6
+/// after `child.wait()` + `/sched_disable`.
 fn publish_result_and_collect(
     result: &AssertResult,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -3575,7 +3575,6 @@ mod tests {
         let status = classify_repro_vm_status(
             /*timed_out*/ true,
             /*has_crash_message*/ true,
-            "",
             137,
             Some(&drain),
         );
@@ -3585,7 +3584,7 @@ mod tests {
     #[test]
     fn classify_repro_vm_status_not_attached_with_reason() {
         let drain = not_attached_drain("sched_ext sysfs absent");
-        let status = classify_repro_vm_status(false, false, "", 1, Some(&drain));
+        let status = classify_repro_vm_status(false, false, 1, Some(&drain));
         assert_eq!(
             status,
             "repro VM: scheduler did not attach (sched_ext sysfs absent) (exit code 1)",
@@ -3602,7 +3601,7 @@ mod tests {
         drain
             .entries
             .push(not_attached_drain("timeout").entries.pop().unwrap());
-        let status = classify_repro_vm_status(false, true, "", 1, Some(&drain));
+        let status = classify_repro_vm_status(false, true, 1, Some(&drain));
         assert_eq!(
             status,
             "repro VM: scheduler did not attach (timeout) (exit code 1)",
@@ -3615,7 +3614,7 @@ mod tests {
         // propagated a non-zero exit alongside the guest crash
         // sentinel. Clause format: "exited with non-zero status (N)".
         let drain = died_drain();
-        let status = classify_repro_vm_status(false, false, "", 139, Some(&drain));
+        let status = classify_repro_vm_status(false, false, 139, Some(&drain));
         assert_eq!(
             status,
             "repro VM: scheduler crashed — exited with non-zero status (139)",
@@ -3628,7 +3627,7 @@ mod tests {
         // (e.g. a guest-side panic captured from COM2 by
         // `extract_panic_message`) still routes to the crashed
         // branch. Positive exit code → non-zero-status clause.
-        let status = classify_repro_vm_status(false, true, "no sentinels here", 134, None);
+        let status = classify_repro_vm_status(false, true, 134, None);
         assert_eq!(
             status,
             "repro VM: scheduler crashed — exited with non-zero status (134)",
@@ -3643,7 +3642,7 @@ mod tests {
     #[test]
     fn classify_repro_vm_status_crashed_from_sentinel_qemu_clean_exit() {
         let drain = died_drain();
-        let status = classify_repro_vm_status(false, false, "", 0, Some(&drain));
+        let status = classify_repro_vm_status(false, false, 0, Some(&drain));
         assert_eq!(status, "repro VM: scheduler crashed — exited cleanly");
     }
 
@@ -3659,7 +3658,7 @@ mod tests {
     #[test]
     fn classify_repro_vm_status_crashed_from_sentinel_killed_by_signal() {
         let drain = died_drain();
-        let status = classify_repro_vm_status(false, false, "", -9, Some(&drain));
+        let status = classify_repro_vm_status(false, false, -9, Some(&drain));
         assert_eq!(
             status,
             "repro VM: scheduler crashed — killed by signal (-9)",
@@ -3683,7 +3682,7 @@ mod tests {
     #[test]
     fn classify_repro_vm_status_crashed_from_sentinel_vmm_exit_code_unset() {
         let drain = died_drain();
-        let status = classify_repro_vm_status(false, false, "", -1, Some(&drain));
+        let status = classify_repro_vm_status(false, false, -1, Some(&drain));
         assert_eq!(
             status,
             "repro VM: scheduler crashed — VM host reported no final exit \
@@ -3709,13 +3708,13 @@ mod tests {
 
     #[test]
     fn classify_repro_vm_status_abnormal_exit() {
-        let status = classify_repro_vm_status(false, false, "clean output", 2, None);
+        let status = classify_repro_vm_status(false, false, 2, None);
         assert_eq!(status, "repro VM: exited abnormally (exit code 2)");
     }
 
     #[test]
     fn classify_repro_vm_status_clean_run() {
-        let status = classify_repro_vm_status(false, false, "clean output", 0, None);
+        let status = classify_repro_vm_status(false, false, 0, None);
         assert_eq!(
             status,
             "repro VM: scheduler ran normally (crash did not reproduce)",
@@ -3730,7 +3729,7 @@ mod tests {
         // abnormal-exit branch, not a NotAttached branch with an
         // empty reason.
         let drain = not_attached_drain("");
-        let status = classify_repro_vm_status(false, false, "", 1, Some(&drain));
+        let status = classify_repro_vm_status(false, false, 1, Some(&drain));
         assert_eq!(status, "repro VM: exited abnormally (exit code 1)");
     }
 

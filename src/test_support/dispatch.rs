@@ -35,6 +35,15 @@ use super::{
     run_ktstr_test_inner, sidecar_dir, try_flush_profraw,
 };
 
+/// Check if an error is a host topology mismatch (e.g. test
+/// requests 2 LLCs but host has 1). String-match because the
+/// error is a plain `anyhow::Error`, not a typed error.
+#[doc(hidden)]
+pub fn is_topology_insufficient(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:#}");
+    msg.contains("need") && (msg.contains("LLC") || msg.contains("CPU"))
+}
+
 /// Check if an `anyhow::Error` carries a [`ResourceContention`].
 ///
 /// Walks the FULL error chain via `e.chain().any(...)` so a
@@ -55,15 +64,6 @@ use super::{
 /// of rustdoc's public surface — it is plumbing, not user API.
 ///
 /// [`ResourceContention`]: crate::vmm::host_topology::ResourceContention
-/// Check if an error is a host topology mismatch (e.g. test
-/// requests 2 LLCs but host has 1). String-match because the
-/// error is a plain `anyhow::Error`, not a typed error.
-#[doc(hidden)]
-pub fn is_topology_insufficient(e: &anyhow::Error) -> bool {
-    let msg = format!("{e:#}");
-    msg.contains("need") && (msg.contains("LLC") || msg.contains("CPU"))
-}
-
 #[doc(hidden)]
 pub fn is_resource_contention(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| {

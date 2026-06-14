@@ -1051,6 +1051,12 @@ pub enum MetricSource {
 /// filtering on it without a schema change — but no production
 /// consumer reads it yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+// `#[non_exhaustive]`: kept so a future probe-authored stream source
+// (e.g. a BPF-map reader) can land without a sidecar wire-format
+// migration, and so downstream matches must retain a `_ =>` arm. The
+// forward-compat guarantee is independent of the current variant count
+// — do not strip this on the grounds that the enum has only two
+// variants today.
 #[non_exhaustive]
 pub enum MetricStream {
     /// Extracted from the payload's stdout (the happy path for
@@ -1061,35 +1067,6 @@ pub enum MetricStream {
     /// stderr — e.g. schbench's `show_latencies` →
     /// `fprintf(stderr, ...)`).
     Stderr,
-    /// Synthesized by a host-side probe rather than parsed from a
-    /// child process's output streams. Used by payloads whose
-    /// "metrics" are derived from external observation — currently
-    /// the `ktstr-jemalloc-probe` family, which emits JSON
-    /// describing TID-keyed jemalloc counter values read via
-    /// `process_vm_readv` on the target process's address space,
-    /// not by the target process's own stdout/stderr.
-    ///
-    /// This variant is orthogonal to [`Stdout`](Self::Stdout) and
-    /// [`Stderr`](Self::Stderr): it does NOT mean "probe wrote to
-    /// stdout/stderr" (which would be stamped `Stdout` via the
-    /// usual extraction pipeline). It means the metric's ultimate
-    /// SOURCE is external introspection rather than a channel
-    /// emission by the measured process. Downstream review
-    /// tooling that filters on `MetricStream` can use `Synthesized`
-    /// to identify probe-authored metrics where the "keep stdout
-    /// canonical" convention does not apply — a probe's output
-    /// channel is an implementation detail of the probe binary,
-    /// not a claim about the subject process's channel hygiene.
-    ///
-    /// # `#[non_exhaustive]` migration note
-    ///
-    /// `MetricStream` gained this variant after `Stdout` / `Stderr`
-    /// were already serialized in on-disk sidecars; the enum is
-    /// `#[non_exhaustive]` so downstream pattern matches must
-    /// include a wildcard `_ =>` arm, and future probe-authored
-    /// stream sources (e.g. a BPF-map reader) can land without
-    /// a wire-format migration.
-    Synthesized,
 }
 
 /// A single extracted metric from a payload's output.

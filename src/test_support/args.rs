@@ -172,28 +172,6 @@ pub(crate) enum CellParentCgroupArg<'a> {
     MissingValue,
 }
 
-/// Find the value passed to `--cell-parent-cgroup` in an argv stream,
-/// accepting both the two-token form (`["--cell-parent-cgroup",
-/// "/path"]`) and the combined form (`["--cell-parent-cgroup=/path"]`).
-/// First match wins. Returns [`CellParentCgroupArg::Absent`] when the
-/// flag is not present, [`CellParentCgroupArg::Value`] for a found
-/// value (whose contents callers must independently validate), or
-/// [`CellParentCgroupArg::MissingValue`] when the bare flag appears
-/// as the last token with no following value.
-///
-/// Caveat — positional-naive: this walker treats every token equal to
-/// the canonical flag (or with the `=` prefix) as our flag without
-/// regard for whether the preceding token was a flag-with-value
-/// expecting a positional value. If an upstream scheduler argv
-/// contains a value-taking flag followed by `--cell-parent-cgroup` as
-/// that value (e.g. `["--prev-flag", "--cell-parent-cgroup",
-/// "/user"]` where `--prev-flag` consumes the next token), this
-/// parser would still grab `/user` as if our flag had been written.
-/// A fully correct parse would need a scheduler-flag-spec table; the
-/// auto-inject and guest-side resolver intentionally stay flag-spec-
-/// agnostic, accepting the false-positive risk for arg shapes that
-/// the in-tree schedulers don't currently produce. The combined-form
-/// branch (`--cell-parent-cgroup=...`) is unambiguous and unaffected.
 /// True iff `path` is a valid `--cell-parent-cgroup` value: absolute,
 /// non-trivial, and contains no `..` components that would normalize
 /// back to (or escape) `/sys/fs/cgroup`.
@@ -247,6 +225,28 @@ pub(crate) fn cell_parent_path_is_valid(path: &str) -> bool {
     has_normal
 }
 
+/// Find the value passed to `--cell-parent-cgroup` in an argv stream,
+/// accepting both the two-token form (`["--cell-parent-cgroup",
+/// "/path"]`) and the combined form (`["--cell-parent-cgroup=/path"]`).
+/// First match wins. Returns [`CellParentCgroupArg::Absent`] when the
+/// flag is not present, [`CellParentCgroupArg::Value`] for a found
+/// value (whose contents callers must independently validate), or
+/// [`CellParentCgroupArg::MissingValue`] when the bare flag appears
+/// as the last token with no following value.
+///
+/// Caveat — positional-naive: this walker treats every token equal to
+/// the canonical flag (or with the `=` prefix) as our flag without
+/// regard for whether the preceding token was a flag-with-value
+/// expecting a positional value. If an upstream scheduler argv
+/// contains a value-taking flag followed by `--cell-parent-cgroup` as
+/// that value (e.g. `["--prev-flag", "--cell-parent-cgroup",
+/// "/user"]` where `--prev-flag` consumes the next token), this
+/// parser would still grab `/user` as if our flag had been written.
+/// A fully correct parse would need a scheduler-flag-spec table; the
+/// auto-inject and guest-side resolver intentionally stay flag-spec-
+/// agnostic, accepting the false-positive risk for arg shapes that
+/// the in-tree schedulers don't currently produce. The combined-form
+/// branch (`--cell-parent-cgroup=...`) is unambiguous and unaffected.
 pub(crate) fn parse_cell_parent_cgroup<'a>(
     args: impl IntoIterator<Item = &'a str>,
 ) -> CellParentCgroupArg<'a> {
