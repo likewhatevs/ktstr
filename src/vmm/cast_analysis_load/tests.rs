@@ -4129,3 +4129,107 @@ fn cached_cast_analysis_concurrent_callers_share_one_oncelock_init() {
         );
     }
 }
+
+// ---- recover_alloc_size_from_r1 backward scan ----------------------
+//
+// The scan must stop at the MOST RECENT write to R1: a `MOV r1, imm`
+// yields the surviving sizeof; any OTHER write to r1 (ALU/LDX/MOV-from-
+// reg/LD into r1, an atomic-fetch into r1, or a BPF_CALL clobbering
+// caller-saved r1-r5) must miss conservatively rather than return a
+// stale immediate from an earlier MOV. The clobber cases fail on the
+// pre-fix code (which scanned past the clobber and returned the stale
+// value).
+
+const MOV_R1_CODE: u8 = super::BPF_MOV64_IMM_CODE;
+fn call_insn() -> BpfInsn {
+    BpfInsn::new(super::cast_analysis_load_consts::BPF_JMP_CALL_CODE, 0, 0, 0, 0)
+}
+
+/// `MOV r1, imm` directly before the call → recovered.
+#[test]
+fn recover_alloc_size_adjacent_mov_returns_imm() {
+    let text = vec![BpfInsn::new(MOV_R1_CODE, 1, 0, 0, 4096), call_insn()];
+    assert_eq!(super::recover_alloc_size_from_r1(&text, 1), Some(4096));
+}
+
+/// A BPF_CALL between the MOV and the target call clobbers r1-r5, so
+/// the earlier immediate is stale → None (pre-fix returned 4096).
+#[test]
+fn recover_alloc_size_stops_at_call_clobber_returns_none() {
+    let text = vec![
+        BpfInsn::new(MOV_R1_CODE, 1, 0, 0, 4096),
+        call_insn(), // helper call clobbers r1
+        call_insn(), // target static-alloc call
+    ];
+    assert_eq!(super::recover_alloc_size_from_r1(&text, 2), None);
+}
+
+/// An ALU64 write to r1 between the MOV and the call invalidates the
+/// immediate → None (pre-fix returned the stale 4096).
+#[test]
+fn recover_alloc_size_stops_at_alu_clobber_returns_none() {
+    let text = vec![
+        BpfInsn::new(MOV_R1_CODE, 1, 0, 0, 4096),
+        // BPF_ALU64 | BPF_ADD | BPF_K (0x07), dst r1: r1 += 0.
+        BpfInsn::new(0x07, 1, 0, 0, 0),
+        call_insn(),
+    ];
+    assert_eq!(super::recover_alloc_size_from_r1(&text, 2), None);
+}
+
+/// An atomic XCHG with src==r1 (`r1 = xchg(*dst, r1)`) writes r1 even
+/// though it is class BPF_STX with dst==base, so the scan must stop
+/// (None), not return the stale MOV. A dst-only writer check misses
+/// this; kernel check_atomic_rmw confirms the src-register write.
+#[test]
+fn recover_alloc_size_stops_at_atomic_fetch_clobber_returns_none() {
+    // BPF_STX(0x03) | BPF_DW(0x18) | BPF_ATOMIC(0xc0) = 0xdb;
+    // imm BPF_XCHG = 0xe1 (0xe0 | BPF_FETCH). dst=base (r10/fp), src=r1.
+    let text = vec![
+        BpfInsn::new(MOV_R1_CODE, 1, 0, 0, 4096),
+        BpfInsn::new(0xdb, 10, 1, -8, 0xe1),
+        call_insn(),
+    ];
+    assert_eq!(super::recover_alloc_size_from_r1(&text, 2), None);
+}
+
+/// No MOV r1 in the window (a MOV to r2 does not write r1) → None.
+#[test]
+fn recover_alloc_size_no_mov_returns_none() {
+    let text = vec![
+        BpfInsn::new(MOV_R1_CODE, 2, 0, 0, 4096), // MOV r2, not r1
+        call_insn(),
+    ];
+    assert_eq!(super::recover_alloc_size_from_r1(&text, 1), None);
+}
+
+/// call_pc == 0 has no predecessors → None.
+#[test]
+fn recover_alloc_size_call_pc_zero_returns_none() {
+    let text = vec![BpfInsn::new(MOV_R1_CODE, 1, 0, 0, 4096)];
+    assert_eq!(super::recover_alloc_size_from_r1(&text, 0), None);
+}
+
+/// A MOV exactly ALLOC_SIZE_LOOKBACK instructions back is in-window
+/// (found); one further back is out-of-window (None).
+#[test]
+fn recover_alloc_size_lookback_window_boundary() {
+    let lb = super::ALLOC_SIZE_LOOKBACK;
+    let mov_r2 = || BpfInsn::new(MOV_R1_CODE, 2, 0, 0, 0); // non-r1 filler
+
+    // In-window: MOV r1 @0, (lb-1) fillers, call @lb → found at distance lb.
+    let mut text = vec![BpfInsn::new(MOV_R1_CODE, 1, 0, 0, 4096)];
+    for _ in 0..(lb - 1) {
+        text.push(mov_r2());
+    }
+    text.push(call_insn());
+    assert_eq!(super::recover_alloc_size_from_r1(&text, lb), Some(4096));
+
+    // Out-of-window: one extra filler pushes the MOV to distance lb+1.
+    let mut text = vec![BpfInsn::new(MOV_R1_CODE, 1, 0, 0, 4096)];
+    for _ in 0..lb {
+        text.push(mov_r2());
+    }
+    text.push(call_insn());
+    assert_eq!(super::recover_alloc_size_from_r1(&text, lb + 1), None);
+}

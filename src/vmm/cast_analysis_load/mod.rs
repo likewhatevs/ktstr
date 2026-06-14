@@ -1406,15 +1406,16 @@ const BPF_MOV64_IMM_CODE: u8 = (libbpf_rs::libbpf_sys::BPF_ALU64
 /// [`ALLOC_SIZE_LOOKBACK`] instructions, when `call_pc` is `0`
 /// (no predecessors to scan), or when `call_pc` is out of bounds.
 ///
-/// The scanner stops at the first match — the most recent write to
-/// R1 is the one that survived to the call site. Other instructions
-/// (ALU on R1, LDX into R1, helper-call clobbers) are NOT modeled
-/// here: the host-side loader is intentionally simpler than the
-/// analyzer's full register-state walk, and a complex sequence
-/// elides into `None` (lookback misses) rather than a wrong
-/// capture. False negatives surface as `alloc_size: None` — the
-/// chase falls back to the bridge (no static-alloc match), which
-/// is the safe direction.
+/// The scan stops at the MOST RECENT write to R1. If that write is
+/// `MOV r1, imm`, its immediate is the value that survived to the
+/// call site. If it is any OTHER write to R1 — an ALU/ALU64/LDX/LD
+/// into R1 (including MOV-from-register and `LD_IMM64`), or a
+/// `BPF_CALL` clobbering caller-saved r1-r5 — the scan returns `None`:
+/// an earlier `MOV r1, imm` did not survive that write, so returning
+/// its immediate would capture a STALE value. Conservative misses
+/// surface as `alloc_size: None` and the chase falls back to the
+/// bridge (no static-alloc match), the safe direction. (See
+/// [`insn_writes_r1`] for the write classification.)
 ///
 /// `imm` is sign-extended to `u64` via the `i32 -> i64 -> u64`
 /// chain so a negative `i32` would surface as a very large `u64`.
@@ -1428,8 +1429,11 @@ fn recover_alloc_size_from_r1(text: &[BpfInsn], call_pc: usize) -> Option<u64> {
         return None;
     }
     let start = call_pc.saturating_sub(ALLOC_SIZE_LOOKBACK);
-    // Walk from `call_pc - 1` down to `start` (inclusive), stopping
-    // at the first MOV r1, imm.
+    // Walk from `call_pc - 1` down to `start` (inclusive). The most
+    // recent write to R1 decides the result: a `MOV r1, imm` yields
+    // the surviving sizeof; any other write to R1 invalidates an
+    // earlier immediate, so stop and miss conservatively (bridge
+    // fallback) rather than returning a stale value.
     let mut idx = call_pc;
     while idx > start {
         idx -= 1;
@@ -1437,8 +1441,65 @@ fn recover_alloc_size_from_r1(text: &[BpfInsn], call_pc: usize) -> Option<u64> {
         if insn.code == BPF_MOV64_IMM_CODE && insn.dst_reg() == 1 {
             return Some(insn.imm as i64 as u64);
         }
+        if insn_writes_r1(insn) {
+            return None;
+        }
     }
     None
+}
+
+/// True if `insn` writes register R1. Used by
+/// [`recover_alloc_size_from_r1`] to stop its backward scan at any R1
+/// write that is NOT the `MOV r1, imm` it searches for (the caller
+/// checks the MOV-imm case first). Covers:
+/// - `ALU`/`ALU64`/`LDX`/`LD` with `dst == r1` — MOV-from-register,
+///   arithmetic, `LDX`, and `LD_IMM64`;
+/// - any `BPF_CALL`, which clobbers caller-saved r1-r5 regardless of
+///   its dst field;
+/// - `BPF_STX | BPF_ATOMIC` fetch ops (`XCHG` / fetch-arithmetic) that
+///   write the pre-op memory value into `src_reg == r1` (kernel
+///   `check_atomic_rmw`, include/uapi/linux/bpf.h; the cast analyzer
+///   models the same atomic clobber in
+///   [`crate::monitor::cast_analysis`]'s `step`). `CMPXCHG` writes r0,
+///   and plain (non-FETCH) atomics write only memory, so neither
+///   touches r1.
+///
+/// `BPF_ST` and non-fetch `BPF_STX` write memory, and non-call
+/// `BPF_JMP`/`BPF_JMP32` write no GPR, so none stop the scan.
+fn insn_writes_r1(insn: &BpfInsn) -> bool {
+    use libbpf_rs::libbpf_sys as bs;
+    // A call clobbers caller-saved r1-r5 regardless of its dst field.
+    if insn.code == cast_analysis_load_consts::BPF_JMP_CALL_CODE {
+        return true;
+    }
+    // BPF instruction class is the low 3 bits of the opcode byte.
+    let class = insn.code & 0x07;
+    // Atomic read-modify-write with the FETCH bit writes the pre-op
+    // value into a register: XCHG / fetch-arithmetic write `src_reg`,
+    // CMPXCHG writes r0. So a fetch atomic that is not CMPXCHG with
+    // `src == r1` writes r1 — and `src_reg`, not `dst_reg`, carries
+    // the written register, so this is checked before the dst gate.
+    // Kernel values: BPF_STX=0x03 (class), BPF_ATOMIC=0xc0 (mode
+    // bits), BPF_FETCH=0x01 (imm bit), BPF_CMPXCHG imm=0xf1.
+    const BPF_ATOMIC_MODE: u8 = 0xc0;
+    const BPF_FETCH_BIT: i32 = 0x01;
+    const BPF_CMPXCHG_IMM: i32 = 0xf1;
+    if class == bs::BPF_STX as u8
+        && (insn.code & 0xe0) == BPF_ATOMIC_MODE
+        && (insn.imm & BPF_FETCH_BIT) != 0
+        && insn.imm != BPF_CMPXCHG_IMM
+        && insn.src_reg() == 1
+    {
+        return true;
+    }
+    // Register-writing classes with dst == r1.
+    if insn.dst_reg() != 1 {
+        return false;
+    }
+    class == bs::BPF_ALU as u8
+        || class == bs::BPF_ALU64 as u8
+        || class == bs::BPF_LDX as u8
+        || class == bs::BPF_LD as u8
 }
 
 /// Walk every ELF relocation section in `elf` and emit a
