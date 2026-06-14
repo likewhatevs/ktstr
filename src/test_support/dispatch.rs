@@ -868,6 +868,25 @@ fn coverage_skip_under_instrumented_init(name: &str) -> bool {
     )
 }
 
+/// Whether a resolved test entry must be coverage-skipped on host
+/// before any VM boots: the binary is coverage-instrumented AND the
+/// entry is a VM-booting (non-`host_only`) test on the
+/// [`coverage_skip_under_instrumented_init`] list (those trip an
+/// AP-kill exit in the guest /init under an instrumented `current_exe`).
+///
+/// Takes the resolved `entry`, not a name string, so a caller cannot
+/// pass a decorated `{name}/{kernel_label}` form by mistake — the
+/// lookup key is always `entry.name`, the bare name the list matches
+/// on. (Passing the decorated form was the bug this gate had in
+/// `run_named_test`: exact-match `find_test` never resolved it, so the
+/// guard silently never fired for multi-kernel runs.) `instrumented`
+/// is injected rather than read from
+/// `current_binary_is_coverage_instrumented`'s `OnceLock` detector so
+/// the decision is unit-testable without an ELF-symtab seam.
+fn should_coverage_skip(instrumented: bool, entry: &KtstrTestEntry) -> bool {
+    instrumented && !entry.host_only && coverage_skip_under_instrumented_init(entry.name)
+}
+
 /// Host-side entry point: build a VM, boot it with `--ktstr-test-fn=NAME`,
 /// extract profraw from SHM, and return the test result.
 ///
@@ -892,10 +911,10 @@ pub fn run_ktstr_test(entry: &KtstrTestEntry) -> Result<AssertResult> {
     // The hardcoded list mirrors the coverage-skip surface other
     // sites guard locally; deferral until a non-instrumented /init
     // binary is wired stays the principled fix.
-    if !entry.host_only
-        && crate::test_support::current_binary_is_coverage_instrumented()
-        && coverage_skip_under_instrumented_init(entry.name)
-    {
+    if should_coverage_skip(
+        crate::test_support::current_binary_is_coverage_instrumented(),
+        entry,
+    ) {
         return Ok(AssertResult::skip(format!(
             "coverage-instrumented /init AP-kill — {}; deferred until \
              non-instrumented /init binary is wired",
@@ -2045,27 +2064,6 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
     // verbatim either way.
     let bare_for_lookup = test_name.strip_prefix("ktstr/").unwrap_or(test_name);
 
-    // Coverage-skip guard, mirroring run_ktstr_test's: a VM-booting
-    // test whose guest /init trips an AP-kill exit under a
-    // coverage-instrumented `current_exe` must skip cleanly here too, or
-    // the ctor -> run_named_test dispatch burns the retry budget on a
-    // doomed boot (the per-test in-body skip cannot prevent it: the
-    // guest dies during boot, or its body's Skip is overridden by the
-    // honored host-side post_vm check).
-    if let Some(entry) = find_test(bare_for_lookup)
-        && !entry.host_only
-        && crate::test_support::current_binary_is_coverage_instrumented()
-        && coverage_skip_under_instrumented_init(entry.name)
-    {
-        crate::report::test_skip(format_args!(
-            "coverage-instrumented /init AP-kill — {}; deferred until \
-             non-instrumented /init binary is wired",
-            entry.name,
-        ));
-        record_skip_sidecar(entry);
-        return EXIT_PASS;
-    }
-
     if let Some(entry) = find_test(bare_for_lookup)
         && entry.host_only
     {
@@ -2102,6 +2100,29 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
     // pre-strip form but does after the suffix peel).
     if entry.host_only {
         return run_host_only_test(entry);
+    }
+
+    // Coverage-skip guard, mirroring run_ktstr_test's: a VM-booting test
+    // whose guest /init trips an AP-kill exit under a coverage-
+    // instrumented `current_exe` must skip cleanly here too, or the
+    // ctor -> run_named_test dispatch burns the retry budget on a doomed
+    // boot (the per-test in-body skip cannot prevent it: the guest dies
+    // during boot, or its body's Skip is overridden by the honored
+    // host-side post_vm check). Runs against the suffix-peeled `entry`:
+    // the pre-peel lookup misses multi-kernel names
+    // (`{name}/{kernel_label}`) because find_test is exact-match on the
+    // bare name, so the guard never fired for multi-kernel runs.
+    if should_coverage_skip(
+        crate::test_support::current_binary_is_coverage_instrumented(),
+        entry,
+    ) {
+        crate::report::test_skip(format_args!(
+            "coverage-instrumented /init AP-kill — {}; deferred until \
+             non-instrumented /init binary is wired",
+            entry.name,
+        ));
+        record_skip_sidecar(entry);
+        return EXIT_PASS;
     }
 
     if entry.performance_mode && super::runtime::no_perf_mode_active() {
@@ -2324,10 +2345,10 @@ pub(crate) fn run_gauntlet_test(rest: &str) -> i32 {
     // old DEFERRED_DISPATCH path reached run_ktstr_test's guard before
     // gauntlet topology resolution; the new direct
     // run_named_test -> run_gauntlet_test path needs its own.
-    if !entry.host_only
-        && crate::test_support::current_binary_is_coverage_instrumented()
-        && coverage_skip_under_instrumented_init(entry.name)
-    {
+    if should_coverage_skip(
+        crate::test_support::current_binary_is_coverage_instrumented(),
+        entry,
+    ) {
         crate::report::test_skip(format_args!(
             "coverage-instrumented /init AP-kill — {}; deferred until \
              non-instrumented /init binary is wired",
@@ -4328,5 +4349,69 @@ mod tests {
             "PostVmAssertionFailure arm must win over ExpectAutoReproSatisfied by match-order \
              positioning (ExpectAutoReproSatisfied alone would return EXIT_PASS)"
         );
+    }
+
+    /// Pins the [`coverage_skip_under_instrumented_init`] name list: all
+    /// seven listed tests match, an unlisted name does not, and the
+    /// decorated multi-kernel form (`{name}/{kernel_label}`) does not.
+    /// The list had zero tests; a rename of any listed test or a typo'd
+    /// addition would silently stop the host-side coverage skip,
+    /// re-exposing the doomed boot path it guards.
+    #[test]
+    fn coverage_skip_list_matches_exactly_the_seven_listed_tests() {
+        for name in [
+            "live_var_resolves_across_same_binary_swap",
+            "snapshot_real_capture_op_snapshot",
+            "snapshot_real_capture_op_watch_snapshot",
+            "snapshot_real_capture_wide_smp",
+            "principled_active_scheduler_walker_resolves_active_obj",
+            "stats_bridge_round_trip",
+            "op_spawn_cgroup_empty_string_bails_with_actionable_diagnostic",
+        ] {
+            assert!(
+                coverage_skip_under_instrumented_init(name),
+                "{name} must be on the coverage-skip list",
+            );
+        }
+        assert!(
+            !coverage_skip_under_instrumented_init("a_normal_vm_test"),
+            "an unlisted test must NOT be coverage-skipped",
+        );
+        // The decorated multi-kernel form must NOT match — the gate keys
+        // on the bare name. Feeding the decorated form was the bug
+        // run_named_test had pre-peel; should_coverage_skip's
+        // entry-typed signature now structurally prevents it.
+        assert!(
+            !coverage_skip_under_instrumented_init("stats_bridge_round_trip/v6_15"),
+            "decorated {{name}}/{{kernel_label}} form must not match the bare-name list",
+        );
+    }
+
+    /// [`should_coverage_skip`] fires only when ALL hold: binary
+    /// instrumented, entry on the skip list, AND entry not `host_only`.
+    /// Drives the full decision matrix. The live gate's
+    /// `current_binary_is_coverage_instrumented` detector is a
+    /// non-injectable `OnceLock` ELF-symtab walk, so the boolean is
+    /// injected here to make the decision unit-testable.
+    #[test]
+    fn should_coverage_skip_requires_instrumented_listed_and_not_host_only() {
+        let listed = |host_only: bool| KtstrTestEntry {
+            name: "stats_bridge_round_trip",
+            host_only,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let unlisted = KtstrTestEntry {
+            name: "a_normal_vm_test",
+            host_only: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        // Instrumented + listed + VM-booting → skip.
+        assert!(should_coverage_skip(true, &listed(false)));
+        // Not instrumented → never skip, even if listed.
+        assert!(!should_coverage_skip(false, &listed(false)));
+        // host_only listed test → never skip (no VM boot, no AP-kill).
+        assert!(!should_coverage_skip(true, &listed(true)));
+        // Instrumented but unlisted → no skip.
+        assert!(!should_coverage_skip(true, &unlisted));
     }
 }
