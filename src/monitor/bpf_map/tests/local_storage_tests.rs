@@ -697,6 +697,29 @@ fn iter_local_storage_self_cycle_terminates_at_iter_cap() {
     );
 }
 
+/// The walker stops materializing one past MAP_MATERIALIZE_MAX so the
+/// renderer's `len > MAX_HASH_ENTRIES` truncation check still fires.
+#[test]
+fn iter_local_storage_materialize_cap_stops_one_past() {
+    let n = (super::super::MAP_MATERIALIZE_MAX + 2) as u64;
+    let entries: Vec<(Vec<u8>, u64, Option<u64>)> = (0..n)
+        .map(|i| (vec![1u8, 2, 3, 4], 0x1000 + i, None))
+        .collect();
+    let scene = build_storage_scene(1, 0, &[entries], 4, BPF_MAP_TYPE_TASK_STORAGE);
+    // SAFETY: scene.buf is a live local Vec<u8> whose backing storage
+    // outlives the GuestMem use.
+    let mem = unsafe { GuestMem::new(scene.buf.as_ptr() as *mut u8, scene.buf.len() as u64) };
+    let out = iter_local_storage_entries(
+        &lookup_ctx(&mem, 0, scene.page_offset, &scene.offsets, false),
+        &scene.map,
+    );
+    assert_eq!(
+        out.len(),
+        super::super::MAP_MATERIALIZE_MAX + 1,
+        "walker must stop one past the materialize cap"
+    );
+}
+
 // -- owner==0 cache --
 //
 // `iter_local_storage_entries` caches `local_storage_kva ->

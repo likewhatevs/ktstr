@@ -43,7 +43,7 @@ use super::super::bpf_map::{
     BPF_MAP_TYPE_REUSEPORT_SOCKARRAY, BPF_MAP_TYPE_RINGBUF, BPF_MAP_TYPE_SK_STORAGE,
     BPF_MAP_TYPE_SOCKHASH, BPF_MAP_TYPE_SOCKMAP, BPF_MAP_TYPE_STACK, BPF_MAP_TYPE_STACK_TRACE,
     BPF_MAP_TYPE_STRUCT_OPS, BPF_MAP_TYPE_TASK_STORAGE, BPF_MAP_TYPE_USER_RINGBUF,
-    BPF_MAP_TYPE_XSKMAP, BpfMapAccessor, BpfMapInfo, GuestMemMapAccessor,
+    BPF_MAP_TYPE_XSKMAP, BpfMapAccessor, BpfMapInfo, GuestMemMapAccessor, MAP_MATERIALIZE_MAX,
 };
 use super::super::btf_render::{
     ArenaResolveHit, CastHit, CrossBtfRef, FwdKind, MemReader, RenderedValue, render_value_with_mem,
@@ -72,9 +72,14 @@ pub(super) const MAX_PERCPU_KEYS: u32 = 256;
 /// HASH map with millions of live entries would OOM the host
 /// renderer if iterated unbounded, so the dump caps at 4096 and
 /// surfaces an `error` describing the truncation. The unrendered
-/// tail is silently dropped — recording it would itself require
-/// unbounded memory.
-pub(super) const MAX_HASH_ENTRIES: usize = 4096;
+/// tail is dropped (the truncation `error` reports it) — recording it
+/// would itself require unbounded memory.
+///
+/// Aliases [`MAP_MATERIALIZE_MAX`]: the bpf_map walkers stop
+/// materializing one past this value, so the render cap and the walker
+/// materialize cap are intentionally one const — a drift between them
+/// would silently lose the `len > MAX_HASH_ENTRIES` truncation signal.
+pub(super) const MAX_HASH_ENTRIES: usize = MAP_MATERIALIZE_MAX;
 
 /// Maximum entries the dump path will render from a multi-entry
 /// `BPF_MAP_TYPE_ARRAY` map.

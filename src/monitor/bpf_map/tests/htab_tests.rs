@@ -528,6 +528,30 @@ fn iter_htab_entries_self_cycle_terminates_at_iter_cap() {
     );
 }
 
+/// The walker stops materializing one past MAP_MATERIALIZE_MAX so the
+/// renderer's `len > MAX_HASH_ENTRIES` truncation check still fires.
+/// Build cap+2 entries and assert the returned vec is exactly cap+1 —
+/// not cap (which would lose the truncation signal) and not all cap+2.
+#[test]
+fn iter_htab_entries_materialize_cap_stops_one_past() {
+    let n = (super::super::MAP_MATERIALIZE_MAX + 2) as u32;
+    let keys: Vec<[u8; 4]> = (0..n).map(|i| i.to_ne_bytes()).collect();
+    let val = 0xABCD_u64.to_ne_bytes();
+    let entries: Vec<(&[u8], &[u8])> = keys
+        .iter()
+        .map(|k| (k.as_slice(), val.as_slice()))
+        .collect();
+    let (buf, page_offset, map, offsets) = setup_htab_direct(4, 8, &entries, 16);
+    // SAFETY: buf is a live local buffer whose storage outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let out = iter_htab_entries(&lookup_ctx(&mem, 0, page_offset, &offsets, false), &map);
+    assert_eq!(
+        out.len(),
+        super::super::MAP_MATERIALIZE_MAX + 1,
+        "walker must stop one past the materialize cap so render's truncation check fires"
+    );
+}
+
 /// key_size declared past MAX_VALUE_SIZE short-circuits identically,
 /// bounding the per-element key `Vec::with_capacity(key_size)`. The
 /// cap (`key_size > MAX_VALUE_SIZE`) is the key-side twin of the

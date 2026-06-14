@@ -250,6 +250,12 @@ pub(super) fn iter_local_storage_entries(
                 }
                 out.push((owner_kva.to_le_bytes().to_vec(), val_buf));
             }
+            // Bound materialization at the renderer's cap, one-past so
+            // render's `len > MAX_HASH_ENTRIES` still flags truncation
+            // (see super::MAP_MATERIALIZE_MAX).
+            if out.len() > super::MAP_MATERIALIZE_MAX {
+                return out;
+            }
 
             // Advance via the hlist link. With map_node at offset 0
             // of the elem, the chain `next` pointer is at

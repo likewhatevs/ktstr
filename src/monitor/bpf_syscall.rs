@@ -59,7 +59,7 @@ use super::arena::{ArenaPage, ArenaSnapshot, BpfArenaOffsets};
 use super::bpf_map::{
     BPF_MAP_TYPE_ARENA, BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_LRU_HASH,
     BPF_MAP_TYPE_LRU_PERCPU_HASH, BPF_MAP_TYPE_PERCPU_ARRAY, BPF_MAP_TYPE_PERCPU_HASH,
-    BPF_MAP_TYPE_STRUCT_OPS, BpfMapAccessor, BpfMapInfo,
+    BPF_MAP_TYPE_STRUCT_OPS, BpfMapAccessor, BpfMapInfo, MAP_MATERIALIZE_MAX,
 };
 
 /// `BPF_MAP_LOOKUP_ELEM` — read one map value into a userspace buffer.
@@ -686,6 +686,11 @@ impl BpfMapAccessor for BpfSyscallAccessor {
             if lret >= 0 {
                 out.push((next_key.clone(), value));
             }
+            // Bound materialization at the renderer's cap (one-past so
+            // render's truncation check fires); see MAP_MATERIALIZE_MAX.
+            if out.len() > MAP_MATERIALIZE_MAX {
+                break;
+            }
             // Advance cursor — even when lookup failed (the key
             // disappeared between get_next_key and lookup_elem; a
             // concurrent delete is inherent to live-host walking).
@@ -826,6 +831,11 @@ impl BpfMapAccessor for BpfSyscallAccessor {
                     }
                 }
                 out.push((next_key.clone(), per_cpu));
+            }
+            // Bound materialization at the renderer's cap (one-past so
+            // render's truncation check fires); see MAP_MATERIALIZE_MAX.
+            if out.len() > MAP_MATERIALIZE_MAX {
+                break;
             }
             cur_key.copy_from_slice(&next_key);
         }

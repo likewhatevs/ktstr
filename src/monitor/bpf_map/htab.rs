@@ -303,6 +303,13 @@ where
             ) {
                 out.push(item);
             }
+            // Bound materialization at the renderer's cap, one-past so
+            // render's `len > MAX_HASH_ENTRIES` still flags truncation
+            // (see super::MAP_MATERIALIZE_MAX). Without this a large map
+            // materializes up to ctx.iter_max entries before the take.
+            if out.len() > super::MAP_MATERIALIZE_MAX {
+                return out;
+            }
 
             node_ptr = ctx.mem.read_u64(elem_pa, htab.hlist_nulls_node_next);
         }

@@ -49,6 +49,17 @@ pub(crate) type PerCpuHashEntries = Vec<(Vec<u8>, Vec<Option<Vec<u8>>>)>;
 /// [`local_storage::iter_local_storage_entries`].
 pub(crate) const MAP_WALK_ITER_MAX: usize = 1_000_000;
 
+/// Maximum chain entries a walker materializes into its result `Vec`
+/// before the renderer's per-map `.take`. One-past
+/// (`out.len() > MAP_MATERIALIZE_MAX`) so the renderer's
+/// `len > MAX_HASH_ENTRIES` truncation check still fires on a truncated
+/// map. Without it the guest-memory walker materializes up to
+/// [`MAP_WALK_ITER_MAX`] entries (×num_cpus for per-CPU values) before
+/// the renderer truncates to 4096 — a freeze-hot-path memory spike.
+/// `dump::render_map::MAX_HASH_ENTRIES` aliases this so the render cap
+/// and the walker materialize cap are one value.
+pub(crate) const MAP_MATERIALIZE_MAX: usize = 4096;
+
 /// Bundle of borrow-held state every map-access routine threads
 /// through the page-table walk, bounds check, and byte read/write path.
 ///
